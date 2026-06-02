@@ -632,6 +632,7 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
 int code_generator_emit_binary_global_variable(CodeGenerator *generator, VarDeclaration *var_data);
 int code_generator_generate_program_binary_object(CodeGenerator *generator, ASTNode *program);
 int simd_emit_xmm_mem_disp(BinaryCodeBuffer *b, unsigned char opcode, int xmm, int gpr, int displacement);
+int simd_emit_prefixed_xmm_mem_disp(BinaryCodeBuffer *b, unsigned char prefix, unsigned char opcode, int xmm, int gpr, int displacement);
 int simd_movdqu_mem_xmm_disp(BinaryCodeBuffer *b, int gpr, int displacement, int xmm);
 int simd_movdqu_xmm_mem_disp(BinaryCodeBuffer *b, int xmm, int gpr, int displacement);
 int wcs_accumulate_xmm0_i32_to_rax(BinaryCodeBuffer *b);

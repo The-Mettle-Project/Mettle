@@ -2798,13 +2798,19 @@ try {
   }
 
   $disasm = & objdump -d $objPath 2>&1 | Out-String
+  # These assert that the binary backend's fast-path instruction selection fires
+  # (cmp-with-imm, shift-by-imm, power-of-two multiply -> shl, mov $0, the &1
+  # mask, and the fused multiply). They are register-agnostic: the MIR + linear-
+  # scan allocator places these leaf integer
+  # functions' values in allocator-chosen registers rather than always RAX, so
+  # the opcodes/immediates are pinned but the registers are not.
   $requiredPatterns = @(
-    'cmp\s+\$0xc,%rax',
-    'shl\s+\$0x2,%rax',
-    '(?s)<scale_by_eight>.*shl\s+\$0x3,%rax',
+    'cmp\s+\$0xc,%\w+',
+    'shl\s+\$0x2,%\w+',
+    '(?s)<scale_by_eight>.*shl\s+\$0x3,%\w+',
     '(?s)<zero_const>.*mov\s+\$0x0,',
-    '(?s)<even_branch>.*(?:and\s+\$0x1,%rax.*test\s+%rax,%rax|test\s+\$0x1,%rax).*(?:jne)',
-    '(?s)<fused_mul_add>.*%r12'
+    '(?s)<even_branch>.*and\s+\$0x1,%\w+.*j(?:e|ne)',
+    '(?s)<fused_mul_add>.*imul\s+%\w+,%\w+.*add\s+\$0x5,'
   )
   foreach ($pattern in $requiredPatterns) {
     if ($disasm -notmatch $pattern) {

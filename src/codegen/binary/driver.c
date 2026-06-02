@@ -1,4 +1,5 @@
 #include "codegen/binary/internal.h"
+#include "codegen/binary/mir.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -64,6 +65,20 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
             generator, function_declaration
                                  ? function_declaration->location.filename
                                  : NULL));
+  }
+
+  /* Route fully-supported leaf integer functions through the MIR + linear-scan
+   * register allocator The MIR path fills context.code
+   * with a complete prologue..epilogue and resolves its own label fixups; all
+   * downstream emission (.text append, relocations, debug symbols) is shared. */
+  if (mir_function_is_eligible(generator, function_data, ir_function)) {
+    if (!code_generator_binary_emit_function_via_mir(generator, function_data,
+                                                     ir_function, &context)) {
+      binary_function_context_destroy(&context);
+      return 0;
+    }
+    return_offset = context.code.size;
+    goto mir_shared_append;
   }
 
   if (!code_generator_binary_emit_prologue(generator, &context, function_data)) {
@@ -229,6 +244,7 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
     return 0;
   }
 
+mir_shared_append:
   emitter = code_generator_get_binary_emitter(generator);
   if (!emitter) {
     code_generator_set_error(generator, "Binary emitter is not initialized");
