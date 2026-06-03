@@ -37,17 +37,18 @@ __declspec(dllimport) int __stdcall QueryPerformanceCounter(MettleQpcTicks *coun
 #include <limits.h>
 #include <sys/stat.h>
 #include <unistd.h>
+/* waitpid lives in <sys/wait.h>, but that header transitively pulls in
+ * <sys/ucontext.h>, whose REG_R8.. enumerators collide with the compiler's
+ * own register enum in semantic/register_allocator.h. Forward-declare the one
+ * function we need instead (mirroring the manual QueryPerformanceCounter decls
+ * used on Windows to dodge the windows.h/lexer.h clash). The wait-status
+ * encoding decoded at the call site is the stable Linux/musl layout. */
+extern pid_t waitpid(pid_t pid, int *wstatus, int options);
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
 #endif
 
-/* Compiler version string. Release builds stamp the real tag by defining
- * the version at compile time. Two forms are accepted:
- *   -DMETTLE_VERSION_RAW=v0.3.0      (bare token, stringified here)
- *   -DMETTLE_VERSION=\"v0.3.0\"      (pre-quoted string literal)
- * The raw form avoids fragile quote escaping through shell -> make -> gcc.
- * Local and dev builds report the default below. */
 #define METTLE_STRINGIFY_(x) #x
 #define METTLE_STRINGIFY(x) METTLE_STRINGIFY_(x)
 #ifndef METTLE_VERSION
@@ -565,14 +566,12 @@ static int mettle_link_elf_executable(const char *object_filename,
                                       const char *executable_filename,
                                       const CompilerOptions *options,
                                       const char *runtime_directory) {
-  char *command = NULL;
+  char **argv_list = NULL;
   char *posix_helpers_object = NULL;
   char *atomics_object = NULL;
   char *crash_handler_object = NULL;
   char *profile_object = NULL;
   const char *cc = (options && options->musl_link) ? "musl-gcc" : "gcc";
-  size_t capacity = 0;
-  size_t length = 0;
   int result = 1;
   int profile_runtime =
       options && compiler_options_use_profile_runtime(options) ? 1 : 0;
@@ -625,144 +624,89 @@ static int mettle_link_elf_executable(const char *object_filename,
     return 1;
   }
 
-  capacity = strlen(cc) + strlen(object_filename) +
-             strlen(executable_filename) + 256u;
-  if (posix_helpers_object) capacity += strlen(posix_helpers_object) + 4u;
-  if (atomics_object) capacity += strlen(atomics_object) + 4u;
-  if (crash_handler_object) capacity += strlen(crash_handler_object) + 4u;
-  if (profile_object) capacity += strlen(profile_object) + 4u;
-  if (options) {
-    for (size_t i = 0; i < options->link_argument_count; i++) {
-      const char *arg = options->link_arguments[i];
-      capacity += (arg ? strlen(arg) : 0u) + 1u;
-    }
-  }
-  command = malloc(capacity);
-  if (!command) {
-    fprintf(stderr, "Error: Failed to allocate ELF link command\n");
-    free(posix_helpers_object);
-    free(atomics_object);
-    free(crash_handler_object);
-    free(profile_object);
-    return 1;
-  }
-
-  length = (size_t)snprintf(command, capacity, "%s -no-pie%s \"%s\"", cc,
-                            (options && (options->static_link ||
-                                         options->musl_link))
-                                ? " -static"
-                                : "",
-                            object_filename);
-  if (length >= capacity) {
-    fprintf(stderr, "Error: Failed to build ELF link command\n");
-    free(command);
-    free(posix_helpers_object);
-    free(atomics_object);
-    free(crash_handler_object);
-    free(profile_object);
-    return 1;
-  }
-
-  if (posix_helpers_object) {
-    int written = snprintf(command + length, capacity - length, " \"%s\"",
-                           posix_helpers_object);
-    if (written < 0 || (size_t)written >= capacity - length) {
-      fprintf(stderr, "Error: Failed to append posix_helpers.o\n");
-      free(command);
-      free(posix_helpers_object);
-      free(atomics_object);
-      free(crash_handler_object);
-      free(profile_object);
-      return 1;
-    }
-    length += (size_t)written;
-  }
-  if (atomics_object) {
-    int written = snprintf(command + length, capacity - length, " \"%s\"",
-                           atomics_object);
-    if (written < 0 || (size_t)written >= capacity - length) {
-      fprintf(stderr, "Error: Failed to append atomics.o\n");
-      free(command);
-      free(posix_helpers_object);
-      free(atomics_object);
-      free(crash_handler_object);
-      free(profile_object);
-      return 1;
-    }
-    length += (size_t)written;
-  }
-  if (crash_handler_object) {
-    int written = snprintf(command + length, capacity - length, " \"%s\"",
-                           crash_handler_object);
-    if (written < 0 || (size_t)written >= capacity - length) {
-      fprintf(stderr, "Error: Failed to append crash_handler.o\n");
-      free(command);
-      free(posix_helpers_object);
-      free(atomics_object);
-      free(crash_handler_object);
-      free(profile_object);
-      return 1;
-    }
-    length += (size_t)written;
-  }
-  if (profile_object) {
-    int written = snprintf(command + length, capacity - length, " \"%s\"",
-                           profile_object);
-    if (written < 0 || (size_t)written >= capacity - length) {
-      fprintf(stderr, "Error: Failed to append profile.o\n");
-      free(command);
-      free(posix_helpers_object);
-      free(atomics_object);
-      free(crash_handler_object);
-      free(profile_object);
-      return 1;
-    }
-    length += (size_t)written;
-  }
-
+  /* Build the argv vector directly and exec the compiler via fork/execvp
+   * instead of handing a constructed command string to system(). Because no
+   * shell ever interprets the arguments, none of the caller-controlled
+   * strings — the object/executable filenames or the user-supplied
+   * --link-arg values — can inject shell commands (CWE-78) or be word-split
+   * into unintended options (CWE-88). Each --link-arg is forwarded as exactly
+   * one argv element, matching how it was collected at parse time. */
   {
-    int written = snprintf(command + length, capacity - length,
-                           " -o \"%s\" -lpthread", executable_filename);
-    if (written < 0 || (size_t)written >= capacity - length) {
-      fprintf(stderr, "Error: Failed to append output + -lpthread\n");
-      free(command);
+    /* Upper bound: cc, -no-pie, -static, object, -o, executable, -lpthread
+     * (7) + up to 4 runtime objects + every link argument + NULL terminator. */
+    size_t max_args = 7u + 4u + 1u +
+                      (options ? options->link_argument_count : 0u);
+    size_t argc_used = 0u;
+    pid_t pid;
+    int status = 0;
+
+    argv_list = malloc(sizeof(*argv_list) * max_args);
+    if (!argv_list) {
+      fprintf(stderr, "Error: Failed to allocate ELF link argv\n");
       free(posix_helpers_object);
       free(atomics_object);
       free(crash_handler_object);
       free(profile_object);
       return 1;
     }
-    length += (size_t)written;
-  }
 
-  if (options) {
-    for (size_t i = 0; i < options->link_argument_count; i++) {
-      const char *arg = options->link_arguments[i];
-      int written;
-      if (!arg || arg[0] == '\0') {
-        continue;
+    /* execvp does not modify argv contents; the const casts are safe. */
+    argv_list[argc_used++] = (char *)cc;
+    argv_list[argc_used++] = (char *)"-no-pie";
+    if (options && (options->static_link || options->musl_link)) {
+      argv_list[argc_used++] = (char *)"-static";
+    }
+    argv_list[argc_used++] = (char *)object_filename;
+    if (posix_helpers_object) {
+      argv_list[argc_used++] = posix_helpers_object;
+    }
+    if (atomics_object) {
+      argv_list[argc_used++] = atomics_object;
+    }
+    if (crash_handler_object) {
+      argv_list[argc_used++] = crash_handler_object;
+    }
+    if (profile_object) {
+      argv_list[argc_used++] = profile_object;
+    }
+    argv_list[argc_used++] = (char *)"-o";
+    argv_list[argc_used++] = (char *)executable_filename;
+    argv_list[argc_used++] = (char *)"-lpthread";
+    if (options) {
+      for (size_t i = 0; i < options->link_argument_count; i++) {
+        const char *arg = options->link_arguments[i];
+        if (!arg || arg[0] == '\0') {
+          continue;
+        }
+        argv_list[argc_used++] = (char *)arg;
       }
-      written = snprintf(command + length, capacity - length, " %s", arg);
-      if (written < 0 || (size_t)written >= capacity - length) {
-        fprintf(stderr, "Error: Failed to append ELF link argument\n");
-        free(command);
-        free(posix_helpers_object);
-        free(atomics_object);
-        free(crash_handler_object);
-        free(profile_object);
-        return 1;
-      }
-      length += (size_t)written;
+    }
+    argv_list[argc_used] = NULL;
+
+    pid = fork();
+    if (pid < 0) {
+      fprintf(stderr, "Error: Failed to fork to run %s: %s\n", cc,
+              strerror(errno));
+    } else if (pid == 0) {
+      execvp(cc, argv_list);
+      /* Reached only if exec failed. */
+      fprintf(stderr, "Error: Failed to execute %s: %s\n", cc,
+              strerror(errno));
+      _exit(127);
+    } else if (waitpid(pid, &status, 0) < 0) {
+      fprintf(stderr, "Error: Failed to wait for %s: %s\n", cc,
+              strerror(errno));
+    } else if ((status & 0x7f) == 0 && ((status >> 8) & 0xff) == 0) {
+      /* (status & 0x7f) == 0 means a normal exit (no terminating signal);
+       * (status >> 8) & 0xff is the exit code — i.e. WIFEXITED && WEXITSTATUS
+       * == 0 without pulling in <sys/wait.h>. */
+      result = 0;
+    } else {
+      fprintf(stderr, "Error: %s failed to produce an ELF executable\n", cc);
     }
   }
 
-  if (system(command) == 0) {
-    result = 0;
-  } else {
-    fprintf(stderr, "Error: %s failed to produce an ELF executable\n", cc);
-  }
-
-  free(command);
+  free(argv_list);
   free(posix_helpers_object);
   free(atomics_object);
   free(crash_handler_object);
