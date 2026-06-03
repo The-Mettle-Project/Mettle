@@ -892,9 +892,22 @@ int wcs_avx_vpbroadcastd_ymm(BinaryCodeBuffer *b, int dst, int src_xmm) {
              b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (src_xmm & 7)));
 }
 
+/* vmovd xmm, r/m32 — VEX.128.66.0F.W0 6E /r. The VEX form is mandatory inside
+ * AVX hot loops: a legacy (66 0F 6E) movd next to VEX-256 ops makes Golden Cove
+ * P-cores take the AVX<->SSE transition penalty (upper-YMM save/restore) every
+ * iteration — a ~30x slowdown that Gracemont E-cores don't exhibit, so it hides
+ * behind hybrid-core scheduling. Keep every in-loop xmm<-gpr move VEX-encoded. */
+int wcs_avx_vmovd_xmm_reg(BinaryCodeBuffer *b, int xmm, int gpr) {
+  return wcs_vex3(b, 1, 1, 0, 0, xmm, gpr, 0) &&
+         binary_code_buffer_append_u8(b, 0x6E) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((xmm & 7) << 3) | (gpr & 7)));
+}
+
 /* Broadcast a 32-bit GPR value across all eight lanes of a ymm register. */
 int wcs_broadcast_i32_to_ymm(BinaryCodeBuffer *b, int ymm, int gpr) {
-  return wcs_movd_xmm_reg(b, ymm, gpr) && wcs_avx_vpbroadcastd_ymm(b, ymm, ymm);
+  return wcs_avx_vmovd_xmm_reg(b, ymm, gpr) &&
+         wcs_avx_vpbroadcastd_ymm(b, ymm, ymm);
 }
 
 int wcs_reduce_ymm_i32_sum_to_rax(BinaryCodeBuffer *b, int src) {
