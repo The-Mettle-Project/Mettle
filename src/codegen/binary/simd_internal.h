@@ -110,6 +110,7 @@ int simd_emit_prefixed_xmm_mem_disp(BinaryCodeBuffer *b, unsigned char prefix,
                                     int displacement);
 
 /* ---- broadcasts & horizontal reductions ---- */
+int wcs_avx_vmovd_xmm_reg(BinaryCodeBuffer *b, int xmm, int gpr);
 int wcs_broadcast_i32_to_ymm(BinaryCodeBuffer *b, int ymm, int gpr);
 int wcs_reduce_ymm_i32_sum_to_rax(BinaryCodeBuffer *b, int src);
 int wcs_reduce_pd_acc_to_rax(BinaryCodeBuffer *b);
