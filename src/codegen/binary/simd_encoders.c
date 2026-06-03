@@ -502,6 +502,68 @@ int wcs_avx_vpxor_ymm(BinaryCodeBuffer *b, int dst, int src1,
              b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (src2 & 7)));
 }
 
+/* vpsadbw ymm_dst, ymm_src1, ymm_src2 — VEX.256.66.0F.WIG F6 /r. Sum of
+ * absolute byte differences; against a zeroed src2 it yields, per 64-bit lane,
+ * the unsigned sum of that lane's 8 bytes (0..2040) in the low word. */
+int wcs_avx_vpsadbw_ymm(BinaryCodeBuffer *b, int dst, int src1, int src2) {
+  return wcs_vex3(b, 1, 1, 1, 0, dst, src2, src1) &&
+         binary_code_buffer_append_u8(b, 0xF6) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (src2 & 7)));
+}
+
+/* ---- VEX.128 packed-byte/word ops for the uint8 element-wise map kernel ---- */
+/* All are VEX.128.66.0F.WIG <op> /r, reg-reg form: dst = src1 <op> src2, with
+ * vvvv=src1 and ModRM.rm=src2. */
+static int wcs_avx128_66_0f_rr(BinaryCodeBuffer *b, unsigned char opcode,
+                               int dst, int src1, int src2) {
+  return wcs_vex3(b, 1, 1, 0, 0, dst, src2, src1) &&
+         binary_code_buffer_append_u8(b, opcode) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (src2 & 7)));
+}
+
+int wcs_avx_vpaddb_xmm(BinaryCodeBuffer *b, int d, int s1, int s2) {
+  return wcs_avx128_66_0f_rr(b, 0xFC, d, s1, s2);
+}
+int wcs_avx_vpsubb_xmm(BinaryCodeBuffer *b, int d, int s1, int s2) {
+  return wcs_avx128_66_0f_rr(b, 0xF8, d, s1, s2);
+}
+int wcs_avx_vpand_xmm(BinaryCodeBuffer *b, int d, int s1, int s2) {
+  return wcs_avx128_66_0f_rr(b, 0xDB, d, s1, s2);
+}
+int wcs_avx_vpor_xmm(BinaryCodeBuffer *b, int d, int s1, int s2) {
+  return wcs_avx128_66_0f_rr(b, 0xEB, d, s1, s2);
+}
+int wcs_avx_vpxor_xmm(BinaryCodeBuffer *b, int d, int s1, int s2) {
+  return wcs_avx128_66_0f_rr(b, 0xEF, d, s1, s2);
+}
+int wcs_avx_vpmullw_xmm(BinaryCodeBuffer *b, int d, int s1, int s2) {
+  return wcs_avx128_66_0f_rr(b, 0xD5, d, s1, s2);
+}
+int wcs_avx_vpunpcklbw_xmm(BinaryCodeBuffer *b, int d, int s1, int s2) {
+  return wcs_avx128_66_0f_rr(b, 0x60, d, s1, s2);
+}
+int wcs_avx_vpunpckhbw_xmm(BinaryCodeBuffer *b, int d, int s1, int s2) {
+  return wcs_avx128_66_0f_rr(b, 0x68, d, s1, s2);
+}
+int wcs_avx_vpackuswb_xmm(BinaryCodeBuffer *b, int d, int s1, int s2) {
+  return wcs_avx128_66_0f_rr(b, 0x67, d, s1, s2);
+}
+
+/* vmovdqu xmm, [base+disp] — VEX.128.F3.0F.WIG 6F /r. */
+int wcs_avx_vmovdqu_xmm_mem(BinaryCodeBuffer *b, int dst, int base, int disp) {
+  return wcs_vex3(b, 1, 2, 0, 0, dst, base, 0) &&
+         binary_code_buffer_append_u8(b, 0x6F) &&
+         wcs_avx_modrm_mem_disp(b, dst, base, disp);
+}
+/* vmovdqu [base+disp], xmm — VEX.128.F3.0F.WIG 7F /r. */
+int wcs_avx_vmovdqu_mem_xmm(BinaryCodeBuffer *b, int base, int disp, int src) {
+  return wcs_vex3(b, 1, 2, 0, 0, src, base, 0) &&
+         binary_code_buffer_append_u8(b, 0x7F) &&
+         wcs_avx_modrm_mem_disp(b, src, base, disp);
+}
+
 int wcs_avx_vpmuldq_ymm(BinaryCodeBuffer *b, int dst, int src1,
                                int src2) {
   return wcs_vex3(b, 2, 1, 1, 0, dst, src2, src1) &&

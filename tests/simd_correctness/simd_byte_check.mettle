@@ -1,0 +1,119 @@
+// Correctness harness for the uint8 SIMD kernels (IR_OP_SIMD_BYTE_MAP and
+// IR_OP_SIMD_SUM_U8). For every length around the 16-byte vector/tail
+// boundary, fill a buffer with a deterministic PRNG, run each fused kernel,
+// and check against a reference computed with a loop that does NOT match any
+// recognizer (per-element scalar work into a local, plus comparisons), so the
+// reference stays trusted. Lengths are adversarial w.r.t. the 16-byte width.
+
+import "std/io";
+import "std/mem";
+
+var g_seed: int64 = 2246822519;
+function rnd_byte() -> int32 {
+  g_seed = (g_seed * 1103515245 + 12345) & 0x7FFFFFFF;
+  return (int32)((g_seed >> 7) & 255);
+}
+
+// ---- fused kernels (the exact in-place / reduction shapes recognized) ----
+function map_a(buf: uint8*, n: int32) -> void {
+  var i: int32 = 0;
+  while (i < n) {
+    buf[i] = buf[i] * 3 + 7;
+    buf[i] = buf[i] ^ 0xA5;
+    i = i + 1;
+  }
+}
+function map_b(buf: uint8*, n: int32) -> void {
+  var i: int32 = 0;
+  while (i < n) {
+    buf[i] = buf[i] - 5;
+    buf[i] = buf[i] & 0x3C;
+    buf[i] = buf[i] | 0x01;
+    i = i + 1;
+  }
+}
+function map_c(buf: uint8*, n: int32) -> void {
+  var i: int32 = 0;
+  while (i < n) {
+    buf[i] = buf[i] * 13;
+    buf[i] = buf[i] ^ 0xFF;
+    buf[i] = buf[i] + 100;
+    i = i + 1;
+  }
+}
+function sum_u8(buf: uint8*, n: int32) -> int64 {
+  var s: int64 = 0;
+  var i: int32 = 0;
+  while (i < n) { s = s + (int64)buf[i]; i = i + 1; }
+  return s;
+}
+
+var g_fail: int32 = 0;
+function fail(label: cstring, len: int32) -> void {
+  print(label);
+  print(cstr(" failed at len="));
+  print_int((int64)len);
+  println(cstr(""));
+  g_fail = g_fail + 1;
+}
+
+function main() -> int32 {
+  var a: uint8* = (uint8*)malloc(512);
+  var b: uint8* = (uint8*)malloc(512);
+
+  var n: int32 = 0;
+  while (n <= 200) {
+    // ---- chain A: *3 +7 ^0xA5 ----
+    var i: int32 = 0;
+    while (i < n) { var v: int32 = rnd_byte(); a[i] = (uint8)v; b[i] = (uint8)v; i = i + 1; }
+    map_a(a, n);
+    var rsum: int64 = 0;
+    var j: int32 = 0;
+    while (j < n) {
+      // Reference in int32 with explicit byte truncation after each step,
+      // mirroring the uint8 array-store semantics exactly.
+      var x: int32 = (int32)b[j];
+      x = (x * 3 + 7) & 0xFF;
+      x = (x ^ 0xA5) & 0xFF;
+      if ((int32)a[j] != x) { fail(cstr("byte_map A"), n); j = n; }
+      else { rsum = rsum + (int64)x; j = j + 1; }
+    }
+    if (g_fail == 0 && sum_u8(a, n) != rsum) { fail(cstr("sum_u8 A"), n); }
+
+    // ---- chain B: -5 &0x3C |0x01 ----
+    i = 0;
+    while (i < n) { var v2: int32 = rnd_byte(); a[i] = (uint8)v2; b[i] = (uint8)v2; i = i + 1; }
+    map_b(a, n);
+    j = 0;
+    while (j < n) {
+      var y: int32 = (int32)b[j];
+      y = (y - 5) & 0xFF;
+      y = (y & 0x3C) & 0xFF;
+      y = (y | 0x01) & 0xFF;
+      if ((int32)a[j] != y) { fail(cstr("byte_map B"), n); j = n; }
+      else { j = j + 1; }
+    }
+
+    // ---- chain C: *13 ^0xFF +100 ----
+    i = 0;
+    while (i < n) { var v3: int32 = rnd_byte(); a[i] = (uint8)v3; b[i] = (uint8)v3; i = i + 1; }
+    map_c(a, n);
+    j = 0;
+    while (j < n) {
+      var z: int32 = (int32)b[j];
+      z = (z * 13) & 0xFF;
+      z = (z ^ 0xFF) & 0xFF;
+      z = (z + 100) & 0xFF;
+      if ((int32)a[j] != z) { fail(cstr("byte_map C"), n); j = n; }
+      else { j = j + 1; }
+    }
+
+    n = n + 1;
+  }
+
+  free((cstring)a);
+  free((cstring)b);
+  if (g_fail == 0) { println(cstr("BYTE SIMD: ALL OK")); return 0; }
+  print(cstr("BYTE SIMD FAILURES: ")); print_int((int64)g_fail); println(cstr(""));
+  return 1;
+}

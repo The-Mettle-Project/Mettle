@@ -708,6 +708,8 @@ static const char *ir_opcode_name(IROpcode op) {
   case IR_OP_COUNT_WORD_STARTS: return "count_word_starts";
   case IR_OP_MEMCPY_INLINE: return "memcpy_inline";
   case IR_OP_SIMD_SUM_I32: return "simd_sum_i32";
+  case IR_OP_SIMD_SUM_U8: return "simd_sum_u8";
+  case IR_OP_SIMD_BYTE_MAP: return "simd_byte_map";
   case IR_OP_SIMD_MATMUL_N32: return "simd_matmul_n32";
   case IR_OP_SIMD_INSERTION_SORT_I32: return "simd_insertion_sort_i32";
   case IR_OP_SIMD_DOT_I32: return "simd_dot_i32";
@@ -885,6 +887,15 @@ static int ir_format_instruction_line(const IRInstruction *instruction,
   case IR_OP_SIMD_SUM_I32:
     written = snprintf(buffer, buffer_size, "%s += simd_sum_i32(base=%s, len=%s)",
                        dest, lhs, rhs);
+    break;
+  case IR_OP_SIMD_SUM_U8:
+    written = snprintf(buffer, buffer_size, "%s += simd_sum_u8(base=%s, len=%s)",
+                       dest, lhs, rhs);
+    break;
+  case IR_OP_SIMD_BYTE_MAP:
+    written = snprintf(buffer, buffer_size,
+                       "simd_byte_map(base=%s, len=%s, steps=%zu)", lhs, rhs,
+                       instruction->argument_count / 2);
     break;
   case IR_OP_SIMD_MATMUL_N32:
     written = snprintf(buffer, buffer_size, "%s = matmul_n32(c=%s, a=%s, b=%s)",

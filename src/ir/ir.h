@@ -69,6 +69,15 @@ typedef enum {
   /* Horizontal sum of int32 array into int64 accumulator. dest = sum symbol
    * (added to prior value), lhs = base pointer, rhs = element count. */
   IR_OP_SIMD_SUM_I32,
+  /* Horizontal sum of a uint8 array into an int64 accumulator. dest = sum
+   * symbol (added to prior value), lhs = base pointer, rhs = element count.
+   * Bytes are summed as unsigned (vpsadbw), matching (int64)(uint8)load. */
+  IR_OP_SIMD_SUM_U8,
+  /* In-place element-wise map of a uint8 buffer: for each byte b, apply a chain
+   * of constant byte operations (mod 256). lhs = base pointer, rhs = element
+   * count, dest = NONE. arguments hold the chain as (op_code INT, const INT)
+   * pairs in application order; op_code is an IRByteMapOp. */
+  IR_OP_SIMD_BYTE_MAP,
   /* Fixed 32x32 int32 matrix multiply. dest = c, lhs = a, rhs = b (pointers). */
   /* Reserved for an explicit 32x32 int32 SIMD matmul API. Do not introduce
    * this from ordinary source by function name or benchmark-shaped matching. */
@@ -149,6 +158,18 @@ typedef enum {
    * rhs = inner trip count N. Direct-object backend only. */
   IR_OP_SIMD_OUTER_LANE_F64
 } IROpcode;
+
+/* Chain operation codes for IR_OP_SIMD_BYTE_MAP arguments. Each step applies
+ * `b = b <op> k` in uint8 (mod 256) arithmetic. The numeric values are part of
+ * the IR contract between the recognizer and the backend kernel. */
+typedef enum {
+  IR_BYTE_MAP_ADD = 0,
+  IR_BYTE_MAP_SUB = 1,
+  IR_BYTE_MAP_MUL = 2,
+  IR_BYTE_MAP_XOR = 3,
+  IR_BYTE_MAP_AND = 4,
+  IR_BYTE_MAP_OR = 5
+} IRByteMapOp;
 
 typedef struct {
   IROpcode op;

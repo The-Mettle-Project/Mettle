@@ -35,6 +35,18 @@ int wcs_avx_0f38_ymm(BinaryCodeBuffer *b, unsigned char op, int dst, int src1,
 
 /* ---- packed-integer AVX2 (ymm) ops ---- */
 int wcs_avx_vpxor_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);
+int wcs_avx_vpsadbw_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);
+int wcs_avx_vpaddb_xmm(BinaryCodeBuffer *b, int d, int s1, int s2);
+int wcs_avx_vpsubb_xmm(BinaryCodeBuffer *b, int d, int s1, int s2);
+int wcs_avx_vpand_xmm(BinaryCodeBuffer *b, int d, int s1, int s2);
+int wcs_avx_vpor_xmm(BinaryCodeBuffer *b, int d, int s1, int s2);
+int wcs_avx_vpxor_xmm(BinaryCodeBuffer *b, int d, int s1, int s2);
+int wcs_avx_vpmullw_xmm(BinaryCodeBuffer *b, int d, int s1, int s2);
+int wcs_avx_vpunpcklbw_xmm(BinaryCodeBuffer *b, int d, int s1, int s2);
+int wcs_avx_vpunpckhbw_xmm(BinaryCodeBuffer *b, int d, int s1, int s2);
+int wcs_avx_vpackuswb_xmm(BinaryCodeBuffer *b, int d, int s1, int s2);
+int wcs_avx_vmovdqu_xmm_mem(BinaryCodeBuffer *b, int dst, int base, int disp);
+int wcs_avx_vmovdqu_mem_xmm(BinaryCodeBuffer *b, int base, int disp, int src);
 int wcs_avx_vpaddq_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);
 int wcs_avx_vpaddd_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);
 int wcs_avx_vpmulld_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);

@@ -611,9 +611,12 @@ int ir_copy_and_constant_propagation_pass(IRFunction *function,
         }
       }
 
-      if (instruction->op == IR_OP_STORE || instruction->op == IR_OP_CALL ||
-          instruction->op == IR_OP_CALL_INDIRECT ||
-          instruction->op == IR_OP_INLINE_ASM) {
+      if (instruction->op == IR_OP_STORE) {
+        ir_temp_value_map_invalidate_after_store(&map, function);
+        ir_temp_value_map_invalidate_after_store(&symbol_map, function);
+      } else if (instruction->op == IR_OP_CALL ||
+                 instruction->op == IR_OP_CALL_INDIRECT ||
+                 instruction->op == IR_OP_INLINE_ASM) {
         ir_temp_value_map_remove_symbol_values(&map, NULL);
         ir_temp_value_map_clear(&symbol_map);
       }
@@ -1996,6 +1999,8 @@ int ir_instruction_has_side_effect(const IRInstruction *instruction) {
   case IR_OP_MEMCPY_INLINE:
   case IR_OP_COUNT_WORD_STARTS:
   case IR_OP_SIMD_SUM_I32:
+  case IR_OP_SIMD_SUM_U8:
+  case IR_OP_SIMD_BYTE_MAP:
   case IR_OP_SIMD_MATMUL_N32:
   case IR_OP_SIMD_INSERTION_SORT_I32:
   case IR_OP_SIMD_DOT_I32:

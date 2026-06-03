@@ -236,6 +236,8 @@ typedef struct {
   X(MEMCPY_INLINE, "memcpy_inline")                                          \
   X(ELIMINATE_LOAD_SYMBOL_COPY, "eliminate_load_symbol_copy")                \
   X(SIMD_SUM_I32, "simd_sum_i32")                                            \
+  X(SIMD_SUM_U8, "simd_sum_u8")                                              \
+  X(SIMD_BYTE_MAP, "simd_byte_map")                                          \
   X(SIMD_DOT_I32, "simd_dot_i32")                                            \
   X(SIMD_INSERTION_SORT_I32, "simd_insertion_sort_i32")                      \
   X(SROA, "sroa")
@@ -453,6 +455,8 @@ int ir_simd_memory_map_pass(IRFunction *function, int *changed);
 int ir_simd_minmax_i32_pass(IRFunction *function, int *changed);
 int ir_simd_sum_float_pass(IRFunction *function, int *changed);
 int ir_simd_sum_i32_pass(IRFunction *function, int *changed);
+int ir_simd_sum_u8_pass(IRFunction *function, int *changed);
+int ir_simd_byte_map_pass(IRFunction *function, int *changed);
 int ir_sroa_pass(IRFunction *function, int *changed);
 int ir_strength_reduce_rotate_loops_pass(IRFunction *function, int *changed);
 int ir_symbol_address_taken(const IRFunction *function,
@@ -480,6 +484,8 @@ const IROperand *ir_temp_value_map_lookup(const IRTempValueMap *map,
 void ir_temp_value_map_remove(IRTempValueMap *map, const char *name);
 void ir_temp_value_map_remove_symbol_values(IRTempValueMap *map,
                                                    const char *symbol_name);
+void ir_temp_value_map_invalidate_after_store(IRTempValueMap *map,
+                                              const IRFunction *function);
 int ir_temp_value_map_set(IRTempValueMap *map, const char *name,
                                  const IROperand *value);
 int ir_thread_jump_targets_pass(IRFunction *function, int *changed);

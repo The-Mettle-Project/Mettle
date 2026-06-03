@@ -4443,6 +4443,8 @@ static int code_generator_emit_ir_instruction(CodeGenerator *generator,
 
   case IR_OP_MEMCPY_INLINE:
   case IR_OP_SIMD_SUM_I32:
+  case IR_OP_SIMD_SUM_U8:
+  case IR_OP_SIMD_BYTE_MAP:
   case IR_OP_SIMD_MATMUL_N32:
   case IR_OP_SIMD_INSERTION_SORT_I32:
   case IR_OP_SIMD_DOT_I32:

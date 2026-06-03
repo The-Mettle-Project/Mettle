@@ -5354,6 +5354,14 @@ int code_generator_binary_emit_instruction(
     return code_generator_binary_emit_simd_sum_i32(generator, context,
                                                    instruction);
 
+  case IR_OP_SIMD_SUM_U8:
+    return code_generator_binary_emit_simd_sum_u8(generator, context,
+                                                  instruction);
+
+  case IR_OP_SIMD_BYTE_MAP:
+    return code_generator_binary_emit_simd_byte_map(generator, context,
+                                                    instruction);
+
   case IR_OP_SIMD_DOT_I32:
     return code_generator_binary_emit_simd_dot_i32(generator, context,
                                                    instruction);

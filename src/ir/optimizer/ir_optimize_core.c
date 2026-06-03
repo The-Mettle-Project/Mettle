@@ -210,6 +210,7 @@ int ir_instruction_writes_symbol(const IRInstruction *instruction) {
   case IR_OP_COUNT_WORD_STARTS:
   case IR_OP_MEMCPY_INLINE:
   case IR_OP_SIMD_SUM_I32:
+  case IR_OP_SIMD_SUM_U8:
   case IR_OP_SIMD_MATMUL_N32:
   case IR_OP_SIMD_INSERTION_SORT_I32:
   case IR_OP_SIMD_DOT_I32:
@@ -253,6 +254,7 @@ int ir_instruction_writes_destination(const IRInstruction *instruction) {
   case IR_OP_COUNT_WORD_STARTS:
   case IR_OP_MEMCPY_INLINE:
   case IR_OP_SIMD_SUM_I32:
+  case IR_OP_SIMD_SUM_U8:
   case IR_OP_SIMD_MATMUL_N32:
   case IR_OP_SIMD_INSERTION_SORT_I32:
   case IR_OP_SIMD_DOT_I32:
@@ -582,6 +584,51 @@ void ir_temp_value_map_remove_symbol_values(IRTempValueMap *map,
       if (!symbol_name || strcmp(entry->value.name, symbol_name) == 0) {
         remove = 1;
       }
+    }
+
+    if (remove) {
+      free(entry->name);
+      ir_operand_destroy(&entry->value);
+      continue;
+    }
+
+    if (write != read) {
+      map->items[write] = map->items[read];
+    }
+    write++;
+  }
+
+  map->count = write;
+}
+
+/* Store-aware invalidation for copy-propagation's temp and symbol value maps.
+ * A store writes memory; it cannot change a mapping unless the mapped key is an
+ * address-taken symbol (the store may overwrite its storage) or the mapped
+ * value embeds an address-taken symbol (that value may now be stale). Constants,
+ * temps, and non-escaped symbol copies such as `%t <- @i` survive, so copy
+ * propagation can see through `buf[i] = ...; ... buf[i] ...`.
+ *
+ * Works for both the temp map (keys are temps, never address-taken) and the
+ * symbol map (keys are symbols). Matches the old clear-on-store for escaped
+ * symbols while preserving non-escaped ones. */
+void ir_temp_value_map_invalidate_after_store(IRTempValueMap *map,
+                                              const IRFunction *function) {
+  if (!map) {
+    return;
+  }
+
+  size_t write = 0;
+  for (size_t read = 0; read < map->count; read++) {
+    IRTempValueEntry *entry = &map->items[read];
+    int remove = 0;
+
+    if (entry->name && ir_symbol_address_taken(function, entry->name)) {
+      remove = 1;
+    }
+    if (!remove && entry->value.kind == IR_OPERAND_SYMBOL &&
+        entry->value.name &&
+        ir_symbol_address_taken(function, entry->value.name)) {
+      remove = 1;
     }
 
     if (remove) {
@@ -1101,6 +1148,52 @@ static void ir_expression_map_invalidate_named(IRExpressionMap *map,
   map->count = write;
 }
 
+/* True if @operand names a symbol whose address is taken in @function (and so
+ * could be aliased by a store/call through a pointer). Temps, constants, and
+ * symbols that never escape cannot be reached by such a store. */
+static int ir_operand_is_aliasable_symbol(const IRFunction *function,
+                                          const IROperand *operand) {
+  return operand && operand->kind == IR_OPERAND_SYMBOL && operand->name &&
+         ir_symbol_address_taken(function, operand->name);
+}
+
+/* A STORE writes memory but cannot change the value of a pure arithmetic
+ * expression unless one of its operands is a symbol whose address has escaped.
+ * Rather than clearing the whole CSE map on every store, drop only the entries
+ * that could actually be invalidated; pointer arithmetic such as `@buf + @i`
+ * (over non-escaped symbols) then survives across the store in `buf[i] = ...`.
+ *
+ * ADDRESS_OF entries cache `&@sym`, whose value never changes, but @sym is by
+ * definition address-taken, so they are conservatively dropped here exactly as
+ * the old clear-on-store did -- no regression. */
+static void ir_expression_map_invalidate_after_store(IRExpressionMap *map,
+                                                     const IRFunction *function) {
+  if (!map) {
+    return;
+  }
+
+  size_t write = 0;
+  for (size_t read = 0; read < map->count; read++) {
+    IRExpressionEntry *entry = &map->items[read];
+    if (ir_operand_is_aliasable_symbol(function, &entry->lhs) ||
+        ir_operand_is_aliasable_symbol(function, &entry->rhs)) {
+      ir_expression_entry_destroy(entry);
+      continue;
+    }
+
+    if (write != read) {
+      map->items[write] = map->items[read];
+      map->items[read].op_text = NULL;
+      map->items[read].lhs = ir_operand_none();
+      map->items[read].rhs = ir_operand_none();
+      map->items[read].value = ir_operand_none();
+    }
+    write++;
+  }
+
+  map->count = write;
+}
+
 int ir_common_subexpression_elimination_pass(IRFunction *function,
                                                     int *changed) {
   if (!function) {
@@ -1140,7 +1233,11 @@ int ir_common_subexpression_elimination_pass(IRFunction *function,
       }
     }
 
-    if (instruction->op == IR_OP_STORE || instruction->op == IR_OP_CALL ||
+    if (instruction->op == IR_OP_STORE) {
+      ir_expression_map_invalidate_after_store(&map, function);
+    }
+
+    if (instruction->op == IR_OP_CALL ||
         instruction->op == IR_OP_CALL_INDIRECT ||
         instruction->op == IR_OP_INLINE_ASM) {
       ir_expression_map_clear(&map);
@@ -1325,6 +1422,8 @@ int ir_collect_instruction_temp_uses(IRTempUseMap *uses,
   case IR_OP_MEMCPY_INLINE:
   case IR_OP_COUNT_WORD_STARTS:
   case IR_OP_SIMD_SUM_I32:
+  case IR_OP_SIMD_SUM_U8:
+  case IR_OP_SIMD_BYTE_MAP:
   case IR_OP_SIMD_MATMUL_N32:
   case IR_OP_SIMD_INSERTION_SORT_I32:
   case IR_OP_SIMD_DOT_I32:

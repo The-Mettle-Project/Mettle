@@ -314,6 +314,8 @@ static int ir_profile_instruction_op_class(const IRInstruction *instruction,
     *op_class_out = METTLE_PROFILE_OP_POPCNT;
     return 1;
   case IR_OP_SIMD_SUM_I32:
+  case IR_OP_SIMD_SUM_U8:
+  case IR_OP_SIMD_BYTE_MAP:
   case IR_OP_SIMD_MATMUL_N32:
   case IR_OP_SIMD_INSERTION_SORT_I32:
   case IR_OP_SIMD_DOT_I32:
