@@ -36,6 +36,78 @@ static const BinaryGpRegister MIR_GP_POOL[] = {
     BINARY_GP_R10, BINARY_GP_R11, BINARY_GP_RBX, BINARY_GP_R12,
     BINARY_GP_R13, BINARY_GP_R14, BINARY_GP_R15};
 #define MIR_GP_POOL_COUNT (sizeof(MIR_GP_POOL) / sizeof(MIR_GP_POOL[0]))
+/* Reclaimable arg-capable registers, tried after the base pool. */
+static const BinaryGpRegister MIR_GP_EXTRA[] = {
+    BINARY_GP_RSI, BINARY_GP_RDI, BINARY_GP_R8, BINARY_GP_R9};
+#define MIR_GP_EXTRA_COUNT (sizeof(MIR_GP_EXTRA) / sizeof(MIR_GP_EXTRA[0]))
+/* Upper bound on the leaf pool: the static base plus every extra. */
+#define MIR_GP_LEAF_POOL_MAX (MIR_GP_POOL_COUNT + MIR_GP_EXTRA_COUNT)
+
+/* True if the function makes any call (so caller-saved regs are unsafe to hold
+ * values across, and outgoing-arg registers must not be reclaimed). */
+static int mir_fn_has_calls(const MirFunction *fn) {
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    if (fn->insns[i].op == MIR_CALL) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Integer argument-register index of `reg` under the active ABI, or -1 if it is
+ * not an argument register at all. */
+static int mir_reg_arg_index(BinaryGpRegister reg) {
+  const BinaryAbi *abi = code_generator_binary_active_abi();
+  if (abi && abi->int_param_registers) {
+    for (size_t i = 0; i < abi->int_param_count; i++) {
+      if (abi->int_param_registers[i] == reg) {
+        return (int)i;
+      }
+    }
+  }
+  return -1;
+}
+
+/* Whether `reg` may join the leaf allocatable pool given this function's shape.
+ * An arg register is poolable only when it carries NO incoming parameter (its
+ * arg index >= param_count, so homing never reads it) AND, if it is an arg
+ * register at all, the function is a leaf (otherwise outgoing-call marshalling
+ * would clobber it). Non-arg callee-saved registers (RSI/RDI on Win64) are
+ * always poolable. This keeps parameter homing a plain sequential copy — no
+ * arg register is ever both a homing source and an allocation target. */
+static int mir_reg_poolable(BinaryGpRegister reg, size_t param_count,
+                            int is_leaf) {
+  int ai = mir_reg_arg_index(reg);
+  if (ai < 0) {
+    return 1; /* not an arg register: safe on both ABIs */
+  }
+  if ((size_t)ai < param_count) {
+    return 0; /* holds a live incoming parameter -> homing source */
+  }
+  return is_leaf; /* dead arg reg: usable only without outgoing calls */
+}
+
+/* Build the leaf (non-cross-call) GP pool: the universally-safe base, then any
+ * arg-capable register the function does not need for its own parameters or
+ * outgoing calls. On Win64 this reclaims RSI/RDI (callee-saved, never args)
+ * plus the trailing unused arg registers (e.g. R9 for a 3-arg leaf, R8+R9 for
+ * <=2 args) — the difference between holding an unrolled matmul's accumulators
+ * AND base pointers in registers versus reloading them every access. Reclaimed
+ * nonvolatiles are saved by the used-nonvolatile machinery; reclaimed volatiles
+ * (R8/R9) need no save in a leaf. */
+static size_t mir_build_gp_leaf_pool(BinaryGpRegister *out, size_t param_count,
+                                     int is_leaf) {
+  size_t n = 0;
+  for (size_t i = 0; i < MIR_GP_POOL_COUNT; i++) {
+    out[n++] = MIR_GP_POOL[i];
+  }
+  for (size_t i = 0; i < MIR_GP_EXTRA_COUNT; i++) {
+    if (mir_reg_poolable(MIR_GP_EXTRA[i], param_count, is_leaf)) {
+      out[n++] = MIR_GP_EXTRA[i];
+    }
+  }
+  return n;
+}
 
 /* Registers a value may occupy across a call. Restricted to those that are
  * callee-saved under BOTH Win64 and SysV (RBX, R12..R15), so cross-call
@@ -228,6 +300,58 @@ static MirVregId *mir_order_by_start(MirFunction *fn, size_t *count_out) {
   return order;
 }
 
+/* Compute two-address coalescing hints: for each commutative 2-address op whose
+ * result is a GP vreg, if a source operand is a GP vreg that DIES at this op,
+ * record it as the destination's coalesce hint. The allocator then tries to
+ * place the destination in that dying source's register, after which the
+ * encoder emits the op in place (no `mov dst, a` copy). SUB is non-commutative,
+ * so only its minuend (a) qualifies; IMUL-by-immediate is 3-operand already. */
+static void mir_compute_coalesce_hints(MirFunction *fn) {
+  for (size_t v = 0; v < fn->vreg_count; v++) {
+    fn->vregs[v].coalesce_hint = MIR_VREG_NONE;
+  }
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    const MirInst *in = &fn->insns[i];
+    int commutative;
+    switch (in->op) {
+    case MIR_ADD:
+    case MIR_AND:
+    case MIR_OR:
+    case MIR_XOR:
+    case MIR_IMUL:
+      commutative = 1;
+      break;
+    case MIR_SUB:
+      commutative = 0;
+      break;
+    default:
+      continue;
+    }
+    if (in->dst.kind != MIR_OPK_VREG ||
+        fn->vregs[in->dst.vreg].rclass != MIR_RC_GP) {
+      continue;
+    }
+    if (in->op == MIR_IMUL && in->b.kind == MIR_OPK_IMM) {
+      continue; /* imul r, a, imm32 needs no copy */
+    }
+    MirVregId d = in->dst.vreg;
+    MirVregId cand = MIR_VREG_NONE;
+    /* Prefer b for commutative ops (matches the encoder's first elision check),
+     * otherwise the (only legal for SUB) operand a. A candidate must be a GP
+     * vreg, distinct from dst, whose last use is exactly this instruction. */
+    if (commutative && in->b.kind == MIR_OPK_VREG && in->b.vreg != d &&
+        fn->vregs[in->b.vreg].rclass == MIR_RC_GP &&
+        fn->vregs[in->b.vreg].live_end == (int)i) {
+      cand = in->b.vreg;
+    } else if (in->a.kind == MIR_OPK_VREG && in->a.vreg != d &&
+               fn->vregs[in->a.vreg].rclass == MIR_RC_GP &&
+               fn->vregs[in->a.vreg].live_end == (int)i) {
+      cand = in->a.vreg;
+    }
+    fn->vregs[d].coalesce_hint = cand;
+  }
+}
+
 int mir_regalloc(MirFunction *fn) {
   if (!fn) {
     return 0;
@@ -237,6 +361,7 @@ int mir_regalloc(MirFunction *fn) {
   }
 
   mir_compute_liveness(fn);
+  mir_compute_coalesce_hints(fn);
 
   /* A value is "cross-call" if its live interval strictly spans a MIR_CALL
    * (defined before the call, used after it). Such values must survive the
@@ -276,18 +401,20 @@ int mir_regalloc(MirFunction *fn) {
   /* XMM4/XMM5 are encoder scratch (see MIR_XMM_POOL) — never allocate them. */
   xmm_held_by[BINARY_XMM4] = -2;
   xmm_held_by[BINARY_XMM5] = -2;
-  /* Mark non-allocatable GP regs as permanently busy so they are never handed
-   * out: RAX/RCX/RDX (scratch), RSP/RBP (stack/frame). -2 = reserved. */
-  gp_held_by[BINARY_GP_RAX] = -2;
-  gp_held_by[BINARY_GP_RCX] = -2;
-  gp_held_by[BINARY_GP_RDX] = -2;
-  gp_held_by[BINARY_GP_RSP] = -2;
-  gp_held_by[BINARY_GP_RBP] = -2;
-  /* Argument registers on Win64/SysV (see MIR_GP_POOL): never allocate. */
-  gp_held_by[BINARY_GP_R8] = -2;
-  gp_held_by[BINARY_GP_R9] = -2;
-  gp_held_by[BINARY_GP_RSI] = -2;
-  gp_held_by[BINARY_GP_RDI] = -2;
+  /* Leaf pool for this ABI/shape (base + any arg-capable reg this function does
+   * not need for its own params or outgoing calls). */
+  BinaryGpRegister gp_leaf_pool[MIR_GP_LEAF_POOL_MAX];
+  size_t gp_leaf_pool_count = mir_build_gp_leaf_pool(
+      gp_leaf_pool, fn->param_count, !mir_fn_has_calls(fn));
+  /* Start every GP register reserved, then open exactly the leaf-pool members.
+   * RAX/RCX/RDX (encoder scratch) and RSP/RBP (stack/frame) are never in the
+   * pool, so they stay reserved. */
+  for (int r = 0; r < 16; r++) {
+    gp_held_by[r] = -2;
+  }
+  for (size_t i = 0; i < gp_leaf_pool_count; i++) {
+    gp_held_by[gp_leaf_pool[i]] = -1;
+  }
 
   /* Spill slots grow downward below the existing frame. The encoder adds
    * fn->spill_bytes to the prologue allocation; slot k lives at
@@ -328,11 +455,35 @@ int mir_regalloc(MirFunction *fn) {
     }
     active_count = w;
 
+    /* Two-address coalescing: reuse the register of a source that dies exactly
+     * here, so the encoder writes the result in place. Only for non-cross-call
+     * GP values (a cross-call dst needs a callee-saved reg, which the dying
+     * source may not be in). The source is still `active` (its live_end == this
+     * point, so the expire above kept it); steal its register and drop it from
+     * the active set so the next expire does not free what is now ours. */
+    int got_reg = 0;
+    if (cv->rclass == MIR_RC_GP && !cv->crosses_call &&
+        cv->coalesce_hint != MIR_VREG_NONE) {
+      MirVreg *hv = &fn->vregs[cv->coalesce_hint];
+      if (hv->in_register && hv->rclass == MIR_RC_GP &&
+          hv->live_end == point && gp_held_by[hv->phys] == cv->coalesce_hint) {
+        cv->phys = hv->phys;
+        cv->assigned = 1;
+        cv->in_register = 1;
+        gp_held_by[hv->phys] = cur;
+        for (size_t r = 0; r < active_count; r++) {
+          if (active[r] == cv->coalesce_hint) {
+            active[r] = active[--active_count];
+            break;
+          }
+        }
+        got_reg = 1;
+      }
+    }
     /* Try to grab a free physical register. Cross-call values may only use the
      * callee-saved pool (GP), or must spill (XMM has no callee-saved lane in our
      * allocatable set). */
-    int got_reg = 0;
-    if (cv->rclass == MIR_RC_XMM) {
+    if (!got_reg && cv->rclass == MIR_RC_XMM) {
       if (!cv->crosses_call) {
         for (size_t p = 0; p < MIR_XMM_POOL_COUNT; p++) {
           BinaryXmmRegister reg = MIR_XMM_POOL[p];
@@ -358,11 +509,11 @@ int mir_regalloc(MirFunction *fn) {
           }
         }
       }
-    } else {
+    } else if (!got_reg) {
       const BinaryGpRegister *pool =
-          cv->crosses_call ? MIR_GP_CROSSCALL_POOL : MIR_GP_POOL;
+          cv->crosses_call ? MIR_GP_CROSSCALL_POOL : gp_leaf_pool;
       size_t pool_n =
-          cv->crosses_call ? MIR_GP_CROSSCALL_POOL_COUNT : MIR_GP_POOL_COUNT;
+          cv->crosses_call ? MIR_GP_CROSSCALL_POOL_COUNT : gp_leaf_pool_count;
       for (size_t p = 0; p < pool_n; p++) {
         BinaryGpRegister reg = pool[p];
         if (gp_held_by[reg] == -1) {

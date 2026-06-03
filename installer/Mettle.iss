@@ -2,7 +2,7 @@
 ;
 ; Build locally:
 ;   iscc Mettle.iss
-; Stamp a version: iscc /DMyAppVersion=0.9.2 Mettle.iss
+; Stamp a version: iscc /DMyAppVersion=0.9.3 Mettle.iss
 ; CI builds this in release.yml and attaches Mettle-Setup.exe to the Release.
 ;
 ; WizardStyle uses Inno Setup 6's built-in modern UI (HiDPI, light/dark aware).
@@ -14,7 +14,7 @@
 ; constants and the HKA registry root.
 
 #ifndef MyAppVersion
-  #define MyAppVersion "v0.9.2"
+  #define MyAppVersion "v0.9.3"
 #endif
 
 #define MyAppName "Mettle"

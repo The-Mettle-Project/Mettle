@@ -355,6 +355,56 @@ int binary_emit_memory_access_ex(BinaryCodeBuffer *buffer,
       base, displacement, 0);
 }
 
+/* Like binary_emit_memory_access_ex but with a scaled-index SIB address
+ * [base + index*scale + disp]. `reg` is the ModRM.reg operand (load dest or
+ * store source). scale must be 1/2/4/8 and index must not be RSP. */
+int binary_emit_memory_access_sib(BinaryCodeBuffer *buffer,
+                                  int operand_size_prefix, int rex_w,
+                                  unsigned char opcode1, int has_opcode2,
+                                  unsigned char opcode2, BinaryGpRegister reg,
+                                  BinaryGpRegister base, BinaryGpRegister index,
+                                  int scale, int displacement) {
+  if (!buffer || index == BINARY_GP_RSP) {
+    return 0;
+  }
+  unsigned char scale_bits;
+  switch (scale) {
+  case 1: scale_bits = 0; break;
+  case 2: scale_bits = 1; break;
+  case 4: scale_bits = 2; break;
+  case 8: scale_bits = 3; break;
+  default: return 0;
+  }
+  /* mod==00 has no displacement, but base low-3 == 5 (RBP/R13) forces disp8. */
+  int use_disp8 = displacement >= -128 && displacement <= 127;
+  unsigned char mod;
+  if (displacement == 0 && (base & 7) != (BINARY_GP_RBP & 7)) {
+    mod = 0;
+  } else {
+    mod = use_disp8 ? 1 : 2;
+  }
+  if ((operand_size_prefix && !binary_code_buffer_append_u8(buffer, 0x66)) ||
+      !binary_emit_rex(buffer, rex_w, reg >> 3, index >> 3, base >> 3) ||
+      !binary_code_buffer_append_u8(buffer, opcode1) ||
+      (has_opcode2 && !binary_code_buffer_append_u8(buffer, opcode2)) ||
+      !binary_code_buffer_append_u8(
+          buffer, (unsigned char)((mod << 6) | ((reg & 7) << 3) | 4)) ||
+      !binary_code_buffer_append_u8(
+          buffer, (unsigned char)((scale_bits << 6) | ((index & 7) << 3) |
+                                  (base & 7)))) {
+    return 0;
+  }
+  if (mod == 1) {
+    return binary_code_buffer_append_u8(buffer,
+                                        (unsigned char)(int8_t)displacement);
+  }
+  if (mod == 2) {
+    return binary_code_buffer_append_u32(buffer,
+                                         (uint32_t)(int32_t)displacement);
+  }
+  return 1;
+}
+
 int binary_emit_memory_access(BinaryCodeBuffer *buffer,
                                      unsigned char opcode,
                                      BinaryGpRegister reg,

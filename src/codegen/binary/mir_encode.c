@@ -1,4 +1,6 @@
 #include "codegen/binary/mir.h"
+#include "codegen/code_generator_internal.h"
+#include "semantic/symbol_table.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -685,6 +687,53 @@ static int encode_cvtf2f(MirFunction *fn, const MirInst *in) {
                                 : 1;
 }
 
+/* Load `size` bytes from [base (+ index*scale) + disp] straight into `target`,
+ * sign/zero-extending to 64 bits in the SAME instruction (movsxd/movsx/movzx
+ * from memory, or a plain mov for 8 bytes / unsigned 4). This is the general
+ * shape win: every signed sub-word array read drops a separate movsx, and any
+ * load whose destination already has a register skips the scratch bounce. */
+static int emit_ext_load(BinaryCodeBuffer *code, BinaryGpRegister target,
+                         BinaryGpRegister base, int has_index,
+                         BinaryGpRegister index, int scale, int disp, int size,
+                         int is_signed) {
+  int rexw = 0, has2 = 0;
+  unsigned char op1 = 0, op2 = 0;
+  switch (size) {
+  case 1:
+    rexw = 1;
+    has2 = 1;
+    op1 = 0x0F;
+    op2 = is_signed ? 0xBE : 0xB6; /* movsx/movzx r64, m8 */
+    break;
+  case 2:
+    rexw = 1;
+    has2 = 1;
+    op1 = 0x0F;
+    op2 = is_signed ? 0xBF : 0xB7; /* movsx/movzx r64, m16 */
+    break;
+  case 4:
+    if (is_signed) {
+      rexw = 1;
+      op1 = 0x63; /* movsxd r64, m32 */
+    } else {
+      op1 = 0x8B; /* mov r32, m32 (zero-extends to 64) */
+    }
+    break;
+  case 8:
+    rexw = 1;
+    op1 = 0x8B; /* mov r64, m64 */
+    break;
+  default:
+    return 0;
+  }
+  if (has_index) {
+    return binary_emit_memory_access_sib(code, 0, rexw, op1, has2, op2, target,
+                                         base, index, scale, disp);
+  }
+  return binary_emit_memory_access_ex(code, 0, rexw, op1, has2, op2, target,
+                                      base, disp);
+}
+
 static int encode_mov(MirFunction *fn, const MirInst *in) {
   CodeGenerator *g = fn->generator;
   BinaryFunctionContext *ctx = fn->context;
@@ -737,42 +786,96 @@ static int encode_mov(MirFunction *fn, const MirInst *in) {
     return xmm_store(fn, &in->dst, sval, w);
   }
 
-  /* LOAD: dst <- [base], width bytes. */
+  /* LOAD: dst <- [base (+ index*scale + disp)], width bytes. Load straight into
+   * dst's register (extending in the same instruction); only bounce through
+   * SCRATCH_A when dst is spilled. */
   if (in->a.kind == MIR_OPK_MEM) {
     int ok;
-    MirOperand base = mir_op_vreg(in->a.mem.base);
-    BinaryGpRegister addr = value_reg(fn, &base, SCRATCH_B, &ok);
-    if (!ok) {
-      return 0;
-    }
-    if (!code_generator_binary_emit_load_from_address(g, ctx, addr, in->width,
-                                                      SCRATCH_A)) {
-      return enc_err(fn, "out of memory in load");
-    }
-    /* is_unsigned==0 means a signed load needing sign-extension to 64 bits. */
-    if (!in->is_unsigned && in->width < 8) {
-      int ok2 = 1;
-      if (in->width == 1) {
-        ok2 = binary_emit_movsx_rax_al(&ctx->code);
-      } else if (in->width == 2) {
-        ok2 = binary_emit_movsx_rax_ax(&ctx->code);
-      } else if (in->width == 4) {
-        ok2 = binary_emit_movsxd_rax_eax(&ctx->code);
+    int is_signed = !in->is_unsigned;
+    BinaryGpRegister D;
+    int dst_in_reg = dst_is_reg(fn, &in->dst, &D);
+    BinaryGpRegister target = dst_in_reg ? D : SCRATCH_A;
+    if (in->a.mem.index != MIR_VREG_NONE) {
+      MirOperand bop = mir_op_vreg(in->a.mem.base);
+      MirOperand iop = mir_op_vreg(in->a.mem.index);
+      BinaryGpRegister base_reg = value_reg(fn, &bop, SCRATCH_B, &ok);
+      if (!ok) {
+        return 0;
       }
-      if (!ok2) {
-        return enc_err(fn, "out of memory sign-extending load");
+      /* Stage a spilled index in RDX, unless RDX is the load target. */
+      BinaryGpRegister idx_scratch =
+          (target == BINARY_GP_RDX) ? SCRATCH_B : BINARY_GP_RDX;
+      BinaryGpRegister index_reg = value_reg(fn, &iop, idx_scratch, &ok);
+      if (!ok) {
+        return 0;
+      }
+      if (!emit_ext_load(&ctx->code, target, base_reg, 1, index_reg,
+                         in->a.mem.scale, in->a.mem.disp, in->width,
+                         is_signed)) {
+        return enc_err(fn, "out of memory in scaled load");
+      }
+    } else {
+      MirOperand base = mir_op_vreg(in->a.mem.base);
+      BinaryGpRegister base_reg = value_reg(fn, &base, SCRATCH_B, &ok);
+      if (!ok) {
+        return 0;
+      }
+      if (!emit_ext_load(&ctx->code, target, base_reg, 0, BINARY_GP_RSP, 1,
+                         0, in->width, is_signed)) {
+        return enc_err(fn, "out of memory in load");
       }
     }
-    return store_from(fn, &in->dst, SCRATCH_A);
+    if (!dst_in_reg) {
+      return store_from(fn, &in->dst, SCRATCH_A);
+    }
+    return 1;
   }
 
-  /* STORE: [base] <- a, width bytes. */
+  /* STORE: [base (+ index*scale + disp)] <- a, width bytes. */
   if (in->dst.kind == MIR_OPK_MEM) {
     int ok1, ok2;
+    if (in->dst.mem.index != MIR_VREG_NONE) {
+      /* Stage base in RCX and index in RDX, value in RAX. For 4/8-byte stores
+       * emit one direct SIB `mov [base+idx*scale], val`; narrower widths lea
+       * the address into RCX and store through it. RAX/RCX/RDX are all free
+       * scratch inside a store encoding. */
+      MirOperand bop = mir_op_vreg(in->dst.mem.base);
+      MirOperand iop = mir_op_vreg(in->dst.mem.index);
+      BinaryGpRegister base_reg = value_reg(fn, &bop, SCRATCH_B, &ok1);
+      BinaryGpRegister index_reg = value_reg(fn, &iop, BINARY_GP_RDX, &ok2);
+      if (!ok1 || !ok2) {
+        return 0;
+      }
+      BinaryGpRegister val = value_reg(fn, &in->a, SCRATCH_A, &ok1);
+      if (!ok1) {
+        return 0;
+      }
+      if (in->width == 4 || in->width == 8) {
+        if (!binary_emit_memory_access_sib(
+                &ctx->code, 0, in->width == 8 ? 1 : 0, 0x89, 0, 0, val,
+                base_reg, index_reg, in->dst.mem.scale, in->dst.mem.disp)) {
+          return enc_err(fn, "out of memory in scaled store");
+        }
+        return 1;
+      }
+      if (!binary_emit_lea_reg_base_index_scale_disp(
+              &ctx->code, SCRATCH_B, base_reg, index_reg, in->dst.mem.scale,
+              in->dst.mem.disp)) {
+        return enc_err(fn, "out of memory in scaled store address");
+      }
+      if (!code_generator_binary_emit_store_to_address(g, ctx, SCRATCH_B,
+                                                       in->width, val)) {
+        return enc_err(fn, "out of memory in store");
+      }
+      return 1;
+    }
     MirOperand base = mir_op_vreg(in->dst.mem.base);
     BinaryGpRegister addr = value_reg(fn, &base, SCRATCH_B, &ok1);
+    if (!ok1) {
+      return 0;
+    }
     BinaryGpRegister val = value_reg(fn, &in->a, SCRATCH_A, &ok2);
-    if (!ok1 || !ok2) {
+    if (!ok2) {
       return 0;
     }
     if (!code_generator_binary_emit_store_to_address(g, ctx, addr, in->width,
@@ -1079,6 +1182,72 @@ static int mir_emit_epilogue(MirFunction *fn) {
   return 1;
 }
 
+/* MIR_LOAD_GLOBAL: dst <- value of the read-only global named by in->a (SYMBOL).
+ * Uses the const-table immediate when the global folds to a constant, otherwise
+ * a RIP-relative load (which sign/zero-extends to the dst register width). */
+static int encode_load_global(MirFunction *fn, const MirInst *in) {
+  CodeGenerator *g = fn->generator;
+  BinaryFunctionContext *ctx = fn->context;
+  const char *name = in->a.sym;
+  if (!name) {
+    return enc_err(fn, "MIR_LOAD_GLOBAL without a symbol");
+  }
+  BinaryGpRegister D;
+  int dst_in_reg = dst_is_reg(fn, &in->dst, &D);
+  BinaryGpRegister target = dst_in_reg ? D : SCRATCH_A;
+
+  uint64_t cval = 0;
+  if (binary_global_const_table_get(name, &cval)) {
+    if (!binary_emit_mov_reg_imm64(&ctx->code, target, cval)) {
+      return enc_err(fn, "out of memory loading global constant");
+    }
+  } else {
+    const char *link = code_generator_get_link_symbol_name(g, name);
+    Symbol *s =
+        (g && g->symbol_table) ? symbol_table_lookup(g->symbol_table, name)
+                               : NULL;
+    if (!link || !link[0] || !s) {
+      return enc_err(fn, "unresolved global in MIR_LOAD_GLOBAL");
+    }
+    if (!code_generator_binary_emit_global_symbol_load(g, ctx, link, s->type,
+                                                       s->is_extern, target)) {
+      return enc_err(fn, "out of memory loading global");
+    }
+  }
+  if (!dst_in_reg) {
+    return store_from(fn, &in->dst, target);
+  }
+  return 1;
+}
+
+/* MIR_STORE_GLOBAL: global named by in->a (SYMBOL) <- value in in->b (vreg).
+ * Writes a register-promoted global back to memory via a RIP-relative store of
+ * the low `width` bytes. Symmetric to encode_load_global. */
+static int encode_store_global(MirFunction *fn, const MirInst *in) {
+  CodeGenerator *g = fn->generator;
+  BinaryFunctionContext *ctx = fn->context;
+  const char *name = in->a.sym;
+  if (!name) {
+    return enc_err(fn, "MIR_STORE_GLOBAL without a symbol");
+  }
+  int rok = 1;
+  BinaryGpRegister src = value_reg(fn, &in->b, SCRATCH_A, &rok);
+  if (!rok) {
+    return 0;
+  }
+  const char *link = code_generator_get_link_symbol_name(g, name);
+  Symbol *s = (g && g->symbol_table) ? symbol_table_lookup(g->symbol_table, name)
+                                     : NULL;
+  if (!link || !link[0] || !s) {
+    return enc_err(fn, "unresolved global in MIR_STORE_GLOBAL");
+  }
+  if (!code_generator_binary_emit_global_symbol_store(g, ctx, link, s->type,
+                                                      s->is_extern, src)) {
+    return enc_err(fn, "out of memory storing global");
+  }
+  return 1;
+}
+
 int mir_encode(MirFunction *fn) {
   if (!fn || !fn->context) {
     return 0;
@@ -1119,6 +1288,12 @@ int mir_encode(MirFunction *fn) {
     case MIR_MOVZX:
     case MIR_MOVSX:
       ok = encode_extend(fn, in);
+      break;
+    case MIR_LOAD_GLOBAL:
+      ok = encode_load_global(fn, in);
+      break;
+    case MIR_STORE_GLOBAL:
+      ok = encode_store_global(fn, in);
       break;
     case MIR_FADD:
     case MIR_FSUB:

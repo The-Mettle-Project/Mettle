@@ -51,6 +51,10 @@ typedef struct {
    * kept in a register the callee preserves (or spilled), since a call clobbers
    * the caller-saved registers. */
   int crosses_call;
+  /* Two-address coalescing hint: a source vreg of this value's defining op that
+   * dies exactly at the def, so this value can reuse its register and the
+   * encoder elides the `mov dst, a` copy. -1 (MIR_VREG_NONE) when absent. */
+  int coalesce_hint;
 } MirVreg;
 #define MIR_LIVE_NONE (-1)
 
@@ -105,6 +109,12 @@ typedef enum {
   MIR_LEA,        /* dst(reg) <- address of a(mem) */
   MIR_MOVZX,      /* dst <- zero-extend a (width from a.mem/src width to dst) */
   MIR_MOVSX,      /* dst <- sign-extend a */
+  MIR_LOAD_GLOBAL,/* dst <- value of global scalar a(SYMBOL); width/is_unsigned
+                     give the load size and signedness. Emitted once at entry to
+                     cache a global in a register (leaf fns only). */
+  MIR_STORE_GLOBAL,/* global scalar a(SYMBOL) <- b(value vreg); width gives the
+                      store size. Emitted before each return to write a
+                      register-promoted global back to memory (leaf fns only). */
 
   /* integer ALU: dst = dst OP a   (two-address; lowering pre-copies into dst) */
   MIR_ADD,

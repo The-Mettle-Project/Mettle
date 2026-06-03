@@ -73,7 +73,7 @@ Installs to `~/.mettle` (Linux) or `%LOCALAPPDATA%\Mettle` (Windows), updates us
 mettle --version
 ```
 
-Dev builds from source report `v0.9.2` unless `METTLE_VERSION_RAW` is set at compile time.
+Dev builds from source report `v0.9.3` unless `METTLE_VERSION_RAW` is set at compile time.
 
 ## Build from source
 

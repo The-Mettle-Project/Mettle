@@ -27,6 +27,8 @@ param(
     [switch]$Quiet,
     [switch]$NoReport,
     [switch]$OpenReport,
+    [switch]$Gcc,
+    [switch]$Clang,
     [string]$ConfigPath = "docs/benchmarks/harness.json",
     [string]$CompilerPath = "",
     [string[]]$Benchmark = @(),
@@ -248,7 +250,8 @@ function Get-GeometricMean {
 function Get-BenchmarkHostInfo {
     param(
         [string]$CompilerFullPath,
-        [string]$GccVersion
+        [string]$GccVersion,
+        [string]$CCompilerName = "gcc"
     )
 
     $osCaption = $null
@@ -282,7 +285,8 @@ function Get-BenchmarkHostInfo {
         cpu = $cpuName
         logical_processors = $logicalProcessors
         ram_gb = $ramGb
-        gcc_version = $GccVersion
+        c_compiler = $CCompilerName
+        c_compiler_version = $GccVersion
         compiler = $CompilerFullPath
     }
 }
@@ -511,7 +515,8 @@ function Compile-CBenchmarkWithFlags {
         [string]$SourcePath,
         [string]$ExePath,
         [string]$BenchmarkName,
-        [string[]]$Flags
+        [string[]]$Flags,
+        [string]$CCompiler = "gcc"
     )
 
     $exeDir = Split-Path -Parent $ExePath
@@ -524,7 +529,7 @@ function Compile-CBenchmarkWithFlags {
     }
 
     $args = @($Flags) + @("-o", $ExePath, $SourcePath)
-    $compile = Invoke-CapturedProcess -FilePath "gcc" -Arguments $args -WorkingDirectory $Root
+    $compile = Invoke-CapturedProcess -FilePath $CCompiler -Arguments $args -WorkingDirectory $Root
     if ($compile.ExitCode -ne 0) {
         throw "C compile failed for ${BenchmarkName}:`n$($compile.Output)"
     }
@@ -558,7 +563,8 @@ function Compile-CBenchmark {
         [string]$SourcePath,
         [string]$ExePath,
         [string]$BenchmarkName,
-        [object]$Config
+        [object]$Config,
+        [string]$CCompiler = "gcc"
     )
 
     $exeDir = Split-Path -Parent $ExePath
@@ -571,7 +577,7 @@ function Compile-CBenchmark {
     }
 
     $args = Get-CCompileArgs -Config $Config -SourcePath $SourcePath -ExePath $ExePath
-    $compile = Invoke-CapturedProcess -FilePath "gcc" -Arguments $args -WorkingDirectory $Root
+    $compile = Invoke-CapturedProcess -FilePath $CCompiler -Arguments $args -WorkingDirectory $Root
     if ($compile.ExitCode -ne 0) {
         throw "C compile failed for ${BenchmarkName}:`n$($compile.Output)"
     }
@@ -711,15 +717,22 @@ if (-not (Test-Path $compilerFullPath)) {
     exit 1
 }
 
-$gccCommand = Get-Command gcc -CommandType Application -ErrorAction SilentlyContinue
-if (-not $gccCommand) {
-    Write-Error "gcc is required for the C benchmark builds but was not found on PATH."
+if ($Clang -and $Gcc) {
+    Write-Error "-Clang and -Gcc are mutually exclusive."
     exit 1
 }
 
-$gccVersionOutput = (& gcc --version 2>&1 | Out-String).Trim()
-$gccVersionLine = ($gccVersionOutput -split "`r?`n")[0]
-$hostInfo = Get-BenchmarkHostInfo -CompilerFullPath $compilerFullPath -GccVersion $gccVersionLine
+$cCompiler = if ($Clang) { "clang" } else { "gcc" }
+
+$cCompilerCommand = Get-Command $cCompiler -CommandType Application -ErrorAction SilentlyContinue
+if (-not $cCompilerCommand) {
+    Write-Error "$cCompiler is required for the C benchmark builds but was not found on PATH."
+    exit 1
+}
+
+$cVersionOutput = (& $cCompiler --version 2>&1 | Out-String).Trim()
+$cVersionLine = ($cVersionOutput -split "`r?`n")[0]
+$hostInfo = Get-BenchmarkHostInfo -CompilerFullPath $compilerFullPath -GccVersion $cVersionLine -CCompilerName $cCompiler
 
 $results = @()
 $compileResults = @()
@@ -749,7 +762,7 @@ if ($null -ne $config.benchmarks -and $config.benchmarks.Count -gt 0) {
             }
 
             $mettleCompileMs = Compile-MettleBenchmark -CompilerPath $compilerFullPath -SourcePath $mettleSource -ExePath $mettleExe -BenchmarkName $name -Config $config -Bench $bench
-            $cCompileMs = Compile-CBenchmark -SourcePath $cSource -ExePath $cExe -BenchmarkName $name -Config $config
+            $cCompileMs = Compile-CBenchmark -SourcePath $cSource -ExePath $cExe -BenchmarkName $name -Config $config -CCompiler $cCompiler
 
             if ($bench.track_asm -eq $true) {
                 Export-MettleAsmSnapshot -CompilerPath $compilerFullPath -SourcePath $mettleSource -BenchmarkName $name -Config $config -Bench $bench
@@ -781,7 +794,7 @@ if ($null -ne $config.benchmarks -and $config.benchmarks.Count -gt 0) {
                 if ($name -eq "matrix_mul" -and $CFlags.Count -eq 0) {
                     $cNoinlineExe = Get-FullPath ($cExe -replace "_c\.exe$", "_c_noinline.exe")
                     try {
-                        Compile-CBenchmarkWithFlags -SourcePath $cSource -ExePath $cNoinlineExe -BenchmarkName "${name}_noinline" -Flags @("-O3", "-fno-inline", "-lkernel32") | Out-Null
+                        Compile-CBenchmarkWithFlags -SourcePath $cSource -ExePath $cNoinlineExe -BenchmarkName "${name}_noinline" -Flags @("-O3", "-fno-inline", "-lkernel32") -CCompiler $cCompiler | Out-Null
                         $cNoinlineMeasure = Measure-BenchmarkExe -ExePath $cNoinlineExe -WarmupCount $effectiveWarmup -RunCount $effectiveRuns
                         if ($null -ne $cNoinlineMeasure) {
                             $cNoinlineUs = $cNoinlineMeasure.median_us
@@ -903,6 +916,7 @@ $payload = [ordered]@{
         warmup = $effectiveWarmup
         compile_only = [bool]$CompileOnly
         compiler = $compilerFullPath
+        c_compiler = $cCompiler
         mettle_flags = @($mettleFlags)
         c_flags = if ($CFlags.Count -gt 0) { @($CFlags) } elseif ($null -ne $config.defaults.c_flags) { @($config.defaults.c_flags) } else { @("-O3", "-lkernel32") }
     }

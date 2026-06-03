@@ -1,7 +1,23 @@
 #include "codegen/binary/mir.h"
 
+#include "semantic/symbol_table.h"
+
 #include <stdlib.h>
 #include <string.h>
+
+/* True if `name` resolves to a read-accessible global scalar — a value we can
+ * cache in a register at function entry (used by both the eligibility gate and
+ * the entry-load emitter, so they agree exactly on what counts as cacheable). */
+static int mir_name_is_global_scalar(CodeGenerator *g, const char *name) {
+  if (!g || !g->symbol_table || !name) {
+    return 0;
+  }
+  Symbol *s = symbol_table_lookup(g->symbol_table, name);
+  if (!s || !s->scope || s->scope->type != SCOPE_GLOBAL) {
+    return 0;
+  }
+  return code_generator_binary_symbol_is_scalar_accessible(g, name);
+}
 
 /* IR -> MIR lowering for the Stage 2 scalar-integer subset, plus the
  * per-function eligibility gate and the MIR emit entry point.
@@ -59,6 +75,24 @@ static MirVregId mir_name_map_get_or_add(MirNameMap *m, MirFunction *fn,
   m->count++;
   return v;
 }
+
+/* True if `name` already has a vreg binding (param/local/cached global). */
+static int mir_name_map_has(const MirNameMap *m, const char *name) {
+  for (size_t i = 0; i < m->count; i++) {
+    if (strcmp(m->items[i].name, name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* The set of register-promoted globals written by a function: each is loaded
+ * once at entry (MIR_LOAD_GLOBAL) and stored back before every return
+ * (MIR_STORE_GLOBAL). Names are borrowed interned IR strings. */
+typedef struct {
+  const char **names;
+  size_t count;
+} MirGlobalWriteback;
 
 /* ---- operand mapping ---------------------------------------------------- */
 
@@ -344,19 +378,53 @@ int mir_function_is_eligible(CodeGenerator *generator,
     mir_function_destroy(&scratch_fn);
     return 0;
   }
+  /* Globals may be cached in a register only if no call can mutate them between
+   * the entry load and a use. */
+  int has_calls = 0;
+  for (size_t i = 0; i < ir_function->instruction_count; i++) {
+    if (ir_function->instructions[i].op == IR_OP_CALL) {
+      has_calls = 1;
+      break;
+    }
+  }
   for (size_t i = 0; i < ir_function->instruction_count && globals_ok; i++) {
     const IRInstruction *in = &ir_function->instructions[i];
-    const IROperand *ops[3] = {&in->dest, &in->lhs, &in->rhs};
-    for (int k = 0; k < 3; k++) {
-      if (ops[k]->kind == IR_OPERAND_SYMBOL && ops[k]->name) {
+    /* An undefined SYMBOL written here is a global STORE. We promote it: cache
+     * the global in a register at entry and write it back before each return.
+     * That is only sound when no call can observe the stale memory between the
+     * entry load and the write-back, so restrict to leaf functions writing a
+     * plain global scalar. (Address-of of the global would make a separate
+     * IR_OP_ADDRESS_OF instruction, which is already rejected below, so no
+     * aliasing pointer can reach the promoted value.) */
+    if (in->dest.kind == IR_OPERAND_SYMBOL && in->dest.name) {
+      int found = 0;
+      for (size_t j = 0; j < defined.count; j++) {
+        if (strcmp(defined.items[j].name, in->dest.name) == 0) {
+          found = 1;
+          break;
+        }
+      }
+      if (!found &&
+          (has_calls ||
+           !mir_name_is_global_scalar(generator, in->dest.name))) {
+        globals_ok = 0;
+        break;
+      }
+    }
+    /* An undefined SYMBOL read must be a read-only global scalar in a leaf fn. */
+    const IROperand *reads[2] = {&in->lhs, &in->rhs};
+    for (int k = 0; k < 2; k++) {
+      if (reads[k]->kind == IR_OPERAND_SYMBOL && reads[k]->name) {
         int found = 0;
         for (size_t j = 0; j < defined.count; j++) {
-          if (strcmp(defined.items[j].name, ops[k]->name) == 0) {
+          if (strcmp(defined.items[j].name, reads[k]->name) == 0) {
             found = 1;
             break;
           }
         }
-        if (!found) {
+        if (!found &&
+            (has_calls ||
+             !mir_name_is_global_scalar(generator, reads[k]->name))) {
           globals_ok = 0;
           break;
         }
@@ -494,6 +562,35 @@ static int mir_emit1(MirFunction *fn, MirOpcode op, MirOperand dst,
   in.cc = cc;
   in.ir_index = -1;
   return mir_emit(fn, &in);
+}
+
+/* Emit a MIR_STORE_GLOBAL for each promoted global, writing its cached vreg back
+ * to memory. Called immediately before each MIR_RET so memory is consistent on
+ * every exit path. */
+static int mir_emit_global_writebacks(MirFunction *fn, CodeGenerator *g,
+                                      MirNameMap *map,
+                                      const MirGlobalWriteback *wb) {
+  if (!wb) {
+    return 1;
+  }
+  for (size_t i = 0; i < wb->count; i++) {
+    const char *name = wb->names[i];
+    Symbol *s = symbol_table_lookup(g->symbol_table, name);
+    int size = s ? code_generator_binary_resolved_type_scalar_size(s->type) : 0;
+    if (size != 1 && size != 2 && size != 4 && size != 8) {
+      fn->has_error = 1;
+      return 0;
+    }
+    MirVregId v = mir_name_map_get_or_add(map, fn, name, MIR_RC_GP, 8);
+    if (v == MIR_VREG_NONE) {
+      return 0;
+    }
+    if (!mir_emit1(fn, MIR_STORE_GLOBAL, mir_op_none(), mir_op_symbol(name),
+                   mir_op_vreg(v), size, 0, 0)) {
+      return 0;
+    }
+  }
+  return 1;
 }
 
 /* A width-tagged float register move (xmm copy). */
@@ -704,10 +801,69 @@ static int mir_build_const_pool(MirFunction *fn, CodeGenerator *g,
   return ok;
 }
 
+/* If `op` is an integer constant usable as a 32-bit compare immediate, return 1
+ * and set *out to its sign-extended value. Recognizes a literal INT directly, or
+ * a temp whose single definition is a CAST of an integer literal to an integer
+ * type (the shape a loop bound like `i < (int64)N` takes). The cast value is
+ * recomputed at the destination width/signedness so a narrowing cast cannot fold
+ * to the wrong number, and only values fitting signed-32 are accepted. This lets
+ * a counted-loop bound become `cmp reg, imm32` instead of being rematerialized
+ * into a register every iteration. */
+static int mir_fused_cmp_imm(CodeGenerator *g, BinaryFunctionContext *ctx,
+                             const IRFunction *f, const IROperand *op,
+                             long long *out) {
+  long long v;
+  if (op->kind == IR_OPERAND_INT) {
+    v = op->int_value;
+  } else if (op->kind == IR_OPERAND_TEMP && op->name) {
+    const IRInstruction *def = NULL;
+    int defs = 0;
+    for (size_t i = 0; i < f->instruction_count; i++) {
+      const IRInstruction *in = &f->instructions[i];
+      if (in->dest.kind == IR_OPERAND_TEMP && in->dest.name &&
+          strcmp(in->dest.name, op->name) == 0) {
+        def = in;
+        defs++;
+      }
+    }
+    if (defs != 1 || !def || def->op != IR_OP_CAST ||
+        def->lhs.kind != IR_OPERAND_INT || !def->text) {
+      return 0;
+    }
+    /* The cast target type is named by def->text (e.g. "int64"); the temp's dest
+     * type is not registered in this context, so resolve from the name. */
+    Type *dt = code_generator_binary_get_resolved_type(g, def->text, 0);
+    if (!dt || code_generator_binary_resolved_type_float_bits(dt)) {
+      return 0;
+    }
+    (void)ctx;
+    int sz = code_generator_binary_resolved_type_scalar_size(dt);
+    int sgn = code_generator_binary_resolved_type_is_signed_integer(dt);
+    v = def->lhs.int_value;
+    if (sz == 1) {
+      v = sgn ? (long long)(signed char)v : (long long)(unsigned char)v;
+    } else if (sz == 2) {
+      v = sgn ? (long long)(short)v : (long long)(unsigned short)v;
+    } else if (sz == 4) {
+      v = sgn ? (long long)(int)v : (long long)(unsigned int)v;
+    } else if (sz != 8) {
+      return 0;
+    }
+  } else {
+    return 0;
+  }
+  if (v < -2147483648LL || v > 2147483647LL) {
+    return 0;
+  }
+  *out = v;
+  return 1;
+}
+
 /* Fuse `%t = a CMP b; branch_zero %t -> L` into a compare-and-branch: integer
  * `cmp a,b; j<!CMP> L`, or float `ucomis a,b; j<!CMP> L`. */
 static int mir_lower_compare_branch(MirFunction *fn, CodeGenerator *g,
                                     BinaryFunctionContext *ctx, MirNameMap *map,
+                                    const IRFunction *ir_function,
                                     const IRInstruction *cmp,
                                     const IRInstruction *br) {
   if (cmp->is_float) {
@@ -725,9 +881,18 @@ static int mir_lower_compare_branch(MirFunction *fn, CodeGenerator *g,
     return mir_emit1(fn, MIR_FCMPBR, mir_op_label(br->text), a, b, w, 0, cc);
   }
   MirOperand a = mir_value_operand(fn, g, ctx, map, &cmp->lhs);
-  MirOperand b = mir_value_operand(fn, g, ctx, map, &cmp->rhs);
   int uns = mir_operand_is_unsigned(g, ctx, &cmp->lhs) ||
             mir_operand_is_unsigned(g, ctx, &cmp->rhs);
+  /* Fold a constant right-hand bound into the compare as an imm32 so the loop
+   * does not rematerialize it into a register every iteration. The producer is
+   * dropped separately (mir_compute_const_compare_skips). */
+  long long imm;
+  MirOperand b;
+  if (mir_fused_cmp_imm(g, ctx, ir_function, &cmp->rhs, &imm)) {
+    b = mir_op_imm(imm);
+  } else {
+    b = mir_value_operand(fn, g, ctx, map, &cmp->rhs);
+  }
   unsigned char cc = 0;
   if (!mir_false_jcc(cmp->text, uns, &cc)) {
     fn->has_error = 1;
@@ -767,7 +932,8 @@ static int mir_fuses_compare_branch(CodeGenerator *g, IRFunction *function,
 
 static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
                                  BinaryFunctionContext *ctx, MirNameMap *map,
-                                 const IRInstruction *in) {
+                                 const IRInstruction *in,
+                                 const MirGlobalWriteback *wb) {
   switch (in->op) {
   case IR_OP_NOP:
   case IR_OP_DECLARE_LOCAL:
@@ -949,6 +1115,10 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
         return 0;
       }
     }
+    /* Flush register-promoted globals to memory before returning. */
+    if (!mir_emit_global_writebacks(fn, g, map, wb)) {
+      return 0;
+    }
     return mir_emit1(fn, MIR_RET, mir_op_none(), mir_op_none(), mir_op_none(), 8,
                      0, 0);
   }
@@ -1005,6 +1175,222 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
   }
 }
 
+/* ---- scaled-address (SIB) folding --------------------------------------- *
+ * An array access lowers to three IR ops: a shift/multiply that scales the
+ * index, an add that offsets the base pointer, and the load/store itself. x86
+ * addresses that whole thing in one [base + index*scale] memory operand, so we
+ * detect the pattern and let the load/store carry a SIB MirMem, dropping the
+ * two address-computation instructions. This is the single biggest scalar
+ * codegen win for index-heavy loops (e.g. matmul): it removes a shift, an add,
+ * and (when the base would otherwise spill) a reload every memory access. */
+
+typedef struct {
+  int valid;
+  IROperand base;
+  IROperand index;
+  int scale;
+} MirAddrFold;
+
+/* Number of instructions that READ temp `name`: any lhs/rhs operand, plus a
+ * STORE's dest (its address). A producer's own dest is a definition, not a
+ * read, so it is excluded. Used to confirm an address sub-expression feeds
+ * nothing but the access before its producer is dropped. */
+static int mir_temp_read_count(const IRFunction *f, const char *name) {
+  int n = 0;
+  for (size_t i = 0; i < f->instruction_count; i++) {
+    const IRInstruction *in = &f->instructions[i];
+    if (in->lhs.kind == IR_OPERAND_TEMP && in->lhs.name &&
+        strcmp(in->lhs.name, name) == 0) {
+      n++;
+    }
+    if (in->rhs.kind == IR_OPERAND_TEMP && in->rhs.name &&
+        strcmp(in->rhs.name, name) == 0) {
+      n++;
+    }
+    if (in->op == IR_OP_STORE && in->dest.kind == IR_OPERAND_TEMP &&
+        in->dest.name && strcmp(in->dest.name, name) == 0) {
+      n++;
+    }
+  }
+  return n;
+}
+
+/* Index of the instruction whose dest defines temp `name`, or -1. */
+static long mir_temp_def_index(const IRFunction *f, const char *name) {
+  for (size_t i = 0; i < f->instruction_count; i++) {
+    const IRInstruction *in = &f->instructions[i];
+    if (in->dest.kind == IR_OPERAND_TEMP && in->dest.name &&
+        strcmp(in->dest.name, name) == 0) {
+      return (long)i;
+    }
+  }
+  return -1;
+}
+
+/* If `p` scales an index by a legal SIB factor (`idx << k`, k in 0..3, or
+ * `idx * c`, c in {1,2,4,8}), fill *index/*scale and return 1. */
+static int mir_decode_scale(const IRInstruction *p, IROperand *index,
+                            int *scale) {
+  if (p->op != IR_OP_BINARY || p->is_float || !p->text) {
+    return 0;
+  }
+  if (strcmp(p->text, "<<") == 0 && p->rhs.kind == IR_OPERAND_INT) {
+    long long k = p->rhs.int_value;
+    if (k < 0 || k > 3) {
+      return 0;
+    }
+    *index = p->lhs;
+    *scale = 1 << k;
+    return 1;
+  }
+  if (strcmp(p->text, "*") == 0) {
+    const IROperand *konst = NULL, *var = NULL;
+    if (p->rhs.kind == IR_OPERAND_INT) {
+      konst = &p->rhs;
+      var = &p->lhs;
+    } else if (p->lhs.kind == IR_OPERAND_INT) {
+      konst = &p->lhs;
+      var = &p->rhs;
+    } else {
+      return 0;
+    }
+    long long c = konst->int_value;
+    if (c == 1 || c == 2 || c == 4 || c == 8) {
+      *index = *var;
+      *scale = (int)c;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Scan for `LOAD/STORE [ base + (index<<k|index*c) ]` and record a SIB fold for
+ * each, marking the two address-producer instructions to be skipped. Only
+ * integer accesses fold (the float encoder path does not read mem.index). */
+/* Mark for skipping the producer of any loop-bound constant that the fused
+ * compare-branch will fold into an imm32 (see mir_fused_cmp_imm). Without this
+ * the CAST that materializes the bound stays in the loop as a dead `mov reg,
+ * imm` every iteration. Only drops a producer whose temp is read solely by that
+ * compare. */
+static void mir_compute_const_compare_skips(CodeGenerator *g,
+                                            BinaryFunctionContext *ctx,
+                                            IRFunction *f, char *skip) {
+  for (size_t i = 0; i + 1 < f->instruction_count; i++) {
+    if (!mir_fuses_compare_branch(g, f, i)) {
+      continue;
+    }
+    const IRInstruction *cmp = &f->instructions[i];
+    if (cmp->is_float || cmp->rhs.kind != IR_OPERAND_TEMP || !cmp->rhs.name) {
+      continue;
+    }
+    long long imm;
+    if (!mir_fused_cmp_imm(g, ctx, f, &cmp->rhs, &imm)) {
+      continue;
+    }
+    if (mir_temp_read_count(f, cmp->rhs.name) != 1) {
+      continue; /* bound temp feeds something else; keep its producer */
+    }
+    for (size_t j = 0; j < f->instruction_count; j++) {
+      const IRInstruction *in = &f->instructions[j];
+      if (in->dest.kind == IR_OPERAND_TEMP && in->dest.name &&
+          strcmp(in->dest.name, cmp->rhs.name) == 0) {
+        skip[j] = 1;
+        break;
+      }
+    }
+  }
+}
+
+static void mir_compute_address_folds(const IRFunction *f, char *skip,
+                                      MirAddrFold *folds) {
+  for (size_t i = 0; i < f->instruction_count; i++) {
+    const IRInstruction *in = &f->instructions[i];
+    const IROperand *addr;
+    if (in->op == IR_OP_LOAD) {
+      addr = &in->lhs;
+    } else if (in->op == IR_OP_STORE) {
+      addr = &in->dest;
+    } else {
+      continue;
+    }
+    if (in->is_float || addr->kind != IR_OPERAND_TEMP || !addr->name) {
+      continue;
+    }
+    /* The address must feed only this access, or dropping its producer would
+     * lose a value another instruction needs. */
+    if (mir_temp_read_count(f, addr->name) != 1) {
+      continue;
+    }
+    long ai = mir_temp_def_index(f, addr->name);
+    if (ai < 0) {
+      continue;
+    }
+    const IRInstruction *padd = &f->instructions[ai];
+    if (padd->op != IR_OP_BINARY || padd->is_float || !padd->text ||
+        strcmp(padd->text, "+") != 0) {
+      continue;
+    }
+    /* One operand is the base pointer, the other the scaled index (a temp whose
+     * sole use is this add). Try both orderings. */
+    const IROperand *order[2][2] = {{&padd->lhs, &padd->rhs},
+                                    {&padd->rhs, &padd->lhs}};
+    for (int t = 0; t < 2; t++) {
+      const IROperand *base = order[t][0];
+      const IROperand *scaled = order[t][1];
+      if (scaled->kind != IR_OPERAND_TEMP || !scaled->name) {
+        continue;
+      }
+      if (mir_temp_read_count(f, scaled->name) != 1) {
+        continue;
+      }
+      long si = mir_temp_def_index(f, scaled->name);
+      if (si < 0) {
+        continue;
+      }
+      IROperand index;
+      int scale;
+      if (!mir_decode_scale(&f->instructions[si], &index, &scale)) {
+        continue;
+      }
+      folds[i].valid = 1;
+      folds[i].base = *base;
+      folds[i].index = index;
+      folds[i].scale = scale;
+      skip[ai] = 1; /* the base+scaled add */
+      skip[si] = 1; /* the index scale */
+      break;
+    }
+  }
+}
+
+/* Lower a LOAD/STORE whose address folded into a [base + index*scale] SIB. */
+static int mir_lower_folded_access(MirFunction *fn, CodeGenerator *g,
+                                   BinaryFunctionContext *ctx, MirNameMap *map,
+                                   const IRInstruction *in,
+                                   const MirAddrFold *fold) {
+  MirOperand baseo = mir_value_operand(fn, g, ctx, map, &fold->base);
+  MirOperand idxo = mir_value_operand(fn, g, ctx, map, &fold->index);
+  if (baseo.kind != MIR_OPK_VREG || idxo.kind != MIR_OPK_VREG) {
+    fn->has_error = 1;
+    return 0;
+  }
+  MirOperand mem = mir_op_mem_vreg(baseo.vreg, idxo.vreg, fold->scale, 0);
+  int size = code_generator_binary_get_access_size(g, ctx, &in->rhs);
+  if (size <= 0) {
+    fn->has_error = 1;
+    return 0;
+  }
+  if (in->op == IR_OP_LOAD) {
+    MirOperand dst = mir_value_operand(fn, g, ctx, map, &in->dest);
+    int sign_ext =
+        code_generator_binary_load_needs_sign_extend(g, ctx, &in->dest, size);
+    return mir_emit1(fn, MIR_MOV, dst, mem, mir_op_none(), size,
+                     sign_ext ? 0 : 1, 0);
+  }
+  MirOperand val = mir_value_operand(fn, g, ctx, map, &in->lhs);
+  return mir_emit1(fn, MIR_MOV, mem, val, mir_op_none(), size, 0, 0);
+}
+
 /* ---- emit entry --------------------------------------------------------- */
 
 int code_generator_binary_emit_function_via_mir(
@@ -1015,6 +1401,12 @@ int code_generator_binary_emit_function_via_mir(
   mir_function_init(&fn, context);
   fn.generator = generator;
   memset(&map, 0, sizeof(map));
+
+  /* Globals this function writes: register-promoted (cached at entry, written
+   * back before each return). Eligibility has proven these are leaf-function
+   * scalar-global writes with no aliasing pointer in scope. */
+  MirGlobalWriteback wb = {0};
+  size_t wb_cap = 0;
 
   /* MIR owns saved registers and the frame; discard anything the legacy
    * promoter left in the context. */
@@ -1054,28 +1446,127 @@ int code_generator_binary_emit_function_via_mir(
     fn.param_count++;
   }
 
+  /* Cache global scalars: load each referenced global once at entry into a vreg
+   * so body references (reads AND writes) resolve to that register instead of a
+   * per-use RIP-relative memory access. A read-only global is just cached; a
+   * written global is additionally recorded for write-back before each return.
+   * Eligibility has proven every global access here is a leaf-function scalar
+   * global with no aliasing pointer in scope. Emitted before the body so the
+   * cache vreg is defined at index 0 (live across the whole function, like a
+   * parameter); the loop-extension in the allocator then keeps it live across
+   * loop back-edges. */
+  for (size_t i = 0; i < ir_function->instruction_count; i++) {
+    const IRInstruction *in = &ir_function->instructions[i];
+    /* Record a written global scalar for write-back (deduped). */
+    if (in->dest.kind == IR_OPERAND_SYMBOL && in->dest.name &&
+        mir_name_is_global_scalar(generator, in->dest.name)) {
+      int present = 0;
+      for (size_t j = 0; j < wb.count; j++) {
+        if (strcmp(wb.names[j], in->dest.name) == 0) {
+          present = 1;
+          break;
+        }
+      }
+      if (!present) {
+        if (wb.count >= wb_cap) {
+          size_t nc = wb_cap ? wb_cap * 2 : 4;
+          const char **grown =
+              (const char **)realloc(wb.names, nc * sizeof(*grown));
+          if (!grown) {
+            goto oom;
+          }
+          wb.names = grown;
+          wb_cap = nc;
+        }
+        wb.names[wb.count++] = in->dest.name;
+      }
+    }
+    /* Load each global (read or written) into its cache vreg once at entry. */
+    const IROperand *ops[3] = {&in->dest, &in->lhs, &in->rhs};
+    for (int k = 0; k < 3; k++) {
+      const IROperand *op = ops[k];
+      if (op->kind != IR_OPERAND_SYMBOL || !op->name ||
+          mir_name_map_has(&map, op->name) ||
+          !mir_name_is_global_scalar(generator, op->name)) {
+        continue;
+      }
+      Symbol *s = symbol_table_lookup(generator->symbol_table, op->name);
+      int size = s ? code_generator_binary_resolved_type_scalar_size(s->type) : 0;
+      if (size != 1 && size != 2 && size != 4 && size != 8) {
+        continue;
+      }
+      int is_signed =
+          code_generator_binary_resolved_type_is_signed_integer(s->type);
+      MirVregId v =
+          mir_name_map_get_or_add(&map, &fn, op->name, MIR_RC_GP, 8);
+      if (v == MIR_VREG_NONE) {
+        goto oom;
+      }
+      if (!mir_emit1(&fn, MIR_LOAD_GLOBAL, mir_op_vreg(v),
+                     mir_op_symbol(op->name), mir_op_none(), size,
+                     is_signed ? 0 : 1, 0)) {
+        goto oom;
+      }
+    }
+  }
+
   /* Hoist loop-invariant float constants (materializes them at entry, so this
    * must precede body lowering). */
   if (!mir_build_const_pool(&fn, generator, context, ir_function)) {
     goto oom;
   }
 
+  /* Detect [base + index*scale] address folds before lowering: the producers
+   * are marked to skip and each access carries its SIB descriptor. */
+  char *fold_skip = NULL;
+  MirAddrFold *folds = NULL;
+  if (ir_function->instruction_count > 0) {
+    fold_skip = (char *)calloc(ir_function->instruction_count, sizeof(char));
+    folds = (MirAddrFold *)calloc(ir_function->instruction_count,
+                                  sizeof(MirAddrFold));
+    if (!fold_skip || !folds) {
+      free(fold_skip);
+      free(folds);
+      goto oom;
+    }
+    mir_compute_address_folds(ir_function, fold_skip, folds);
+    mir_compute_const_compare_skips(generator, context, ir_function, fold_skip);
+  }
+
   for (size_t i = 0; i < ir_function->instruction_count; i++) {
-    if (mir_fuses_compare_branch(generator, ir_function, i)) {
-      if (!mir_lower_compare_branch(&fn, generator, context, &map,
+    if (fold_skip[i]) {
+      continue; /* address sub-expression folded into a SIB access */
+    }
+    if (folds[i].valid) {
+      if (!mir_lower_folded_access(&fn, generator, context, &map,
+                                   &ir_function->instructions[i], &folds[i])) {
+        free(fold_skip);
+        free(folds);
+        goto oom;
+      }
+    } else if (mir_fuses_compare_branch(generator, ir_function, i)) {
+      if (!mir_lower_compare_branch(&fn, generator, context, &map, ir_function,
                                     &ir_function->instructions[i],
                                     &ir_function->instructions[i + 1])) {
+        free(fold_skip);
+        free(folds);
         goto oom;
       }
       i++; /* consumed the branch_zero too */
     } else if (!mir_lower_instruction(&fn, generator, context, &map,
-                                      &ir_function->instructions[i])) {
+                                      &ir_function->instructions[i], &wb)) {
+      free(fold_skip);
+      free(folds);
       goto oom;
     }
     if (fn.has_error) {
+      free(fold_skip);
+      free(folds);
       goto oom;
     }
   }
+  free(fold_skip);
+  free(folds);
 
   if (!mir_regalloc(&fn) || fn.has_error) {
     goto oom;
@@ -1087,6 +1578,7 @@ int code_generator_binary_emit_function_via_mir(
     goto oom;
   }
 
+  free(wb.names);
   mir_name_map_destroy(&map);
   mir_function_destroy(&fn);
   return 1;
@@ -1098,6 +1590,7 @@ oom:
                              "emitting MIR for function '%s'",
                              function_data->name ? function_data->name : "?");
   }
+  free(wb.names);
   mir_name_map_destroy(&map);
   mir_function_destroy(&fn);
   return 0;
