@@ -27,15 +27,17 @@ typedef int MirVregId;
 #define MIR_VREG_NONE (-1)
 
 typedef enum {
-  MIR_RC_GP = 0, /* general-purpose integer/pointer */
-  MIR_RC_XMM = 1 /* scalar float/double in an XMM lane */
+  MIR_RC_GP = 0,  /* general-purpose integer/pointer */
+  MIR_RC_XMM = 1, /* scalar float/double in an XMM lane */
+  MIR_RC_VEC = 2  /* packed SIMD vector in a YMM register (auto-vectorizer) */
 } MirRegClass;
 
 /* One virtual register: its class, byte width (1/2/4/8), and — filled in by the
  * allocator — either an assigned physical register or a spill-slot rbp offset. */
 typedef struct {
   MirRegClass rclass;
-  int width; /* 1,2,4,8 (GP) or 4,8 (XMM single/double) */
+  int width; /* 1,2,4,8 (GP); 4,8 (XMM); per-lane byte width for VEC */
+  int lanes; /* VEC only: number of packed lanes (e.g. 4 for f64x4 in YMM) */
   /* Allocation result (set by mir_regalloc). */
   int assigned;      /* 1 once allocated */
   int in_register;   /* 1 = physical register, 0 = spilled to stack */
@@ -149,8 +151,24 @@ typedef enum {
   MIR_CVTF2SI,    /* gp dst  <- float a (truncating) */
   MIR_CVTF2F,     /* float width convert (sd<->ss) */
   MIR_UCOMIS,     /* float compare -> flags */
+  MIR_FSETCC,     /* dst <- (a CMP b) as 0/1: ucomis a,b; setcc; movzx (cc set) */
+  MIR_FCMPBR,     /* ucomis a,b; jcc -> label (fused float compare-and-branch) */
   MIR_MOVD_TO_XMM,
   MIR_MOVD_TO_GP,
+
+  /* packed SIMD (auto-vectorizer; see VECTORIZER_DESIGN.md). width = per-lane
+   * bytes, lane count from the vreg. */
+  MIR_VADD,        /* vaddpd/vaddps */
+  MIR_VSUB,
+  MIR_VMUL,
+  MIR_VDIV,
+  MIR_VCVTSI2F,    /* vcvtdq2pd: int32 lanes -> f64 lanes */
+  MIR_VCVTF2SI,    /* vcvttpd2dq: f64 lanes -> int32 lanes (truncating) */
+  MIR_VLOAD,       /* vmovupd dst <- [mem] */
+  MIR_VSTORE,      /* vmovupd [mem] <- a */
+  MIR_VBROADCAST,  /* vbroadcastsd: scalar/imm -> all lanes */
+  MIR_VIOTA,       /* lane i <- base + i (induction vector) */
+  MIR_VHREDUCE,    /* horizontal add/min/max of all lanes -> scalar xmm */
 
   MIR_OPCODE_COUNT
 } MirOpcode;

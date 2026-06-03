@@ -54,6 +54,19 @@ static const BinaryXmmRegister MIR_XMM_POOL[] = {
     BINARY_XMM0, BINARY_XMM1, BINARY_XMM2, BINARY_XMM3};
 #define MIR_XMM_POOL_COUNT (sizeof(MIR_XMM_POOL) / sizeof(MIR_XMM_POOL[0]))
 
+/* Second-tier XMM pool: xmm8..xmm15. These are callee-saved on Win64 (the
+ * prologue saves/restores the ones used) and caller-saved on SysV; either way a
+ * value placed here that does NOT live across a call is correct. They are
+ * argument registers on neither ABI (Win64 floats: xmm0-3; SysV: xmm0-7), so no
+ * parameter-homing or call-marshalling hazard arises. Tried only after the
+ * volatile xmm0-3 are exhausted, so leaf code with light float pressure pays no
+ * save/restore. */
+static const BinaryXmmRegister MIR_XMM_NONVOL_POOL[] = {
+    BINARY_XMM8,  BINARY_XMM9,  BINARY_XMM10, BINARY_XMM11,
+    BINARY_XMM12, BINARY_XMM13, BINARY_XMM14, BINARY_XMM15};
+#define MIR_XMM_NONVOL_POOL_COUNT \
+  (sizeof(MIR_XMM_NONVOL_POOL) / sizeof(MIR_XMM_NONVOL_POOL[0]))
+
 static int mir_gp_is_nonvolatile(BinaryGpRegister reg) {
   return code_generator_binary_gp_register_is_win64_nonvolatile(reg);
 }
@@ -332,6 +345,18 @@ int mir_regalloc(MirFunction *fn) {
             break;
           }
         }
+        /* Spill to the callee-saved xmm8..15 tier before the stack. */
+        for (size_t p = 0; !got_reg && p < MIR_XMM_NONVOL_POOL_COUNT; p++) {
+          BinaryXmmRegister reg = MIR_XMM_NONVOL_POOL[p];
+          if (xmm_held_by[reg] == -1) {
+            xmm_held_by[reg] = cur;
+            cv->assigned = 1;
+            cv->in_register = 1;
+            cv->phys = reg;
+            got_reg = 1;
+            break;
+          }
+        }
       }
     } else {
       const BinaryGpRegister *pool =
@@ -434,6 +459,27 @@ int mir_regalloc(MirFunction *fn) {
       if (used_nonvol[reg] &&
           !code_generator_binary_context_add_saved_register(
               fn->context, (BinaryGpRegister)reg)) {
+        free(order);
+        free(active);
+        fn->has_error = 1;
+        return 0;
+      }
+    }
+
+    /* Callee-saved XMM (xmm8..15) the allocation used: the prologue/epilogue
+     * preserve them (a no-op cost on SysV where they are caller-saved). */
+    int used_xmm[16];
+    memset(used_xmm, 0, sizeof(used_xmm));
+    for (size_t i = 0; i < fn->vreg_count; i++) {
+      MirVreg *vr = &fn->vregs[i];
+      if (vr->in_register && vr->rclass == MIR_RC_XMM && vr->phys >= 8) {
+        used_xmm[vr->phys] = 1;
+      }
+    }
+    for (int reg = 8; reg < 16; reg++) {
+      if (used_xmm[reg] &&
+          !code_generator_binary_context_add_saved_xmm_register(
+              fn->context, (BinaryXmmRegister)reg)) {
         free(order);
         free(active);
         fn->has_error = 1;

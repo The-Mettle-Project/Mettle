@@ -58,6 +58,20 @@ int wcs_avx_vzeroupper(BinaryCodeBuffer *b);
 /* ---- packed-FP AVX2 (ymm) ops ---- */
 int wcs_avx_vaddpd_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);
 int wcs_avx_vmulpd_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);
+int wcs_avx_vsubpd_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);
+int wcs_avx_vdivpd_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);
+int wcs_avx_vcvtdq2pd_ymm_xmm(BinaryCodeBuffer *b, int dst, int src);
+int wcs_avx_vcvttpd2dq_xmm_ymm(BinaryCodeBuffer *b, int dst, int src);
+int wcs_avx_vpmovsxdq_ymm_xmm(BinaryCodeBuffer *b, int dst, int src);
+int wcs_avx_vpunpcklqdq_xmm(BinaryCodeBuffer *b, int dst, int src1, int src2);
+int wcs_avx_vaddsd(BinaryCodeBuffer *b, int dst, int s1, int s2);
+int wcs_avx_vsubsd(BinaryCodeBuffer *b, int dst, int s1, int s2);
+int wcs_avx_vmulsd(BinaryCodeBuffer *b, int dst, int s1, int s2);
+int wcs_avx_vdivsd(BinaryCodeBuffer *b, int dst, int s1, int s2);
+int wcs_avx_vcvtsi2sd(BinaryCodeBuffer *b, int dst, int s1, int gpr);
+int wcs_avx_vmovsd_xmm_mem(BinaryCodeBuffer *b, int dst, int base, int disp);
+int wcs_avx_vmovsd_mem_xmm(BinaryCodeBuffer *b, int base, int disp, int src);
+int wcs_avx_vunpckhpd_xmm(BinaryCodeBuffer *b, int dst, int s1, int s2);
 int wcs_avx_vaddps_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);
 int wcs_avx_vmulps_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);
 /* Fused multiply-add: dst = (s1 * s2) + dst. 231 form keeps the accumulator in

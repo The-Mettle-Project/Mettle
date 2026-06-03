@@ -723,6 +723,9 @@ static const char *ir_opcode_name(IROpcode op) {
   case IR_OP_SIMD_DOT_F32: return "simd_dot_f32";
   case IR_OP_SIMD_AFFINE_MAP_F64: return "simd_affine_map_f64";
   case IR_OP_SIMD_AFFINE_MAP_F32: return "simd_affine_map_f32";
+  case IR_OP_SIMD_I2F_REDUCE_F64: return "simd_i2f_reduce_f64";
+  case IR_OP_SIMD_VLOOP_F64: return "simd_vloop_f64";
+  case IR_OP_SIMD_OUTER_LANE_F64: return "simd_outer_lane_f64";
   default:
     return "unknown";
   }
@@ -987,6 +990,38 @@ static int ir_format_instruction_line(const IRInstruction *instruction,
                        ir_opcode_name(instruction->op), lhs, rhs, len);
     break;
   }
+  case IR_OP_SIMD_I2F_REDUCE_F64: {
+    char trip[128];
+    ir_format_operand(instruction->argument_count > 0 ? &instruction->arguments[0]
+                                                      : NULL,
+                      trip, sizeof(trip));
+    written = snprintf(buffer, buffer_size, "%s += %s(n=%s, steps=%zu)", dest,
+                       ir_opcode_name(instruction->op), trip,
+                       instruction->argument_count > 0
+                           ? (instruction->argument_count - 1) / 2
+                           : 0);
+    break;
+  }
+  case IR_OP_SIMD_VLOOP_F64: {
+    long long reduce_op = (instruction->argument_count > 0 &&
+                           instruction->arguments[0].kind == IR_OPERAND_INT)
+                              ? instruction->arguments[0].int_value
+                              : -1;
+    long long n_nodes = (instruction->argument_count > 2 &&
+                         instruction->arguments[2].kind == IR_OPERAND_INT)
+                            ? instruction->arguments[2].int_value
+                            : -1;
+    written = snprintf(buffer, buffer_size, "%s %s %s(%s nodes=%lld)", dest,
+                       reduce_op == 1 ? "+=" : "<-",
+                       ir_opcode_name(instruction->op),
+                       reduce_op == 1 ? "reduce" : "map", n_nodes);
+    break;
+  }
+  case IR_OP_SIMD_OUTER_LANE_F64:
+    written = snprintf(buffer, buffer_size, "%s += %s(outerP=%s, args=%zu)", dest,
+                       ir_opcode_name(instruction->op), lhs,
+                       instruction->argument_count);
+    break;
   case IR_OP_SIMD_AFFINE_MAP_F64:
   case IR_OP_SIMD_AFFINE_MAP_F32: {
     char len[128];

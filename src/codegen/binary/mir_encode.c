@@ -453,8 +453,17 @@ static int xmm_mov(BinaryCodeBuffer *code, BinaryXmmRegister dst,
   if (dst == src) {
     return 1;
   }
-  return binary_emit_sse_reg_reg(code, width == 4 ? 0xF3 : 0xF2, 0, 0x0F, 0x10,
-                                 dst, src);
+  /* movaps dst, src (0F 28 /r). A reg-reg movss/movsd MERGES into the
+   * destination's upper lanes, creating a false dependency on its prior value
+   * and defeating the rename-stage move-elimination; movaps copies the whole
+   * register, so the copy is dependency-free and typically eliminated. We only
+   * use the low lane, so copying all 128 bits is semantically irrelevant. */
+  (void)width;
+  return binary_emit_rex(code, 0, dst >> 3, 0, src >> 3) &&
+         binary_code_buffer_append_u8(code, 0x0F) &&
+         binary_code_buffer_append_u8(code, 0x28) &&
+         binary_code_buffer_append_u8(
+             code, (unsigned char)(0xC0 | ((dst & 7) << 3) | (src & 7)));
 }
 
 /* Load a float immediate's raw bits into an XMM register via a GP staging reg. */
@@ -804,7 +813,12 @@ static int mir_layout_frame(MirFunction *fn) {
   for (size_t i = 0; i < ctx->saved_register_count; i++) {
     ctx->saved_register_offsets[i] = spill + (int)((i + 1) * 8);
   }
-  int raw = spill + (int)(ctx->saved_register_count * 8);
+  int after_gp = spill + (int)(ctx->saved_register_count * 8);
+  /* Saved XMM nonvolatiles sit below the GP saves, 16 bytes (full movdqu) each. */
+  for (size_t i = 0; i < ctx->saved_xmm_count; i++) {
+    ctx->saved_xmm_offsets[i] = after_gp + (int)((i + 1) * 16);
+  }
+  int raw = after_gp + (int)(ctx->saved_xmm_count * 16);
   if (mir_has_calls(fn)) {
     raw += 32; /* shadow space at the bottom; spills/saves never reach it */
   }
@@ -1028,6 +1042,13 @@ static int mir_emit_prologue(MirFunction *fn) {
       return enc_err(fn, "out of memory saving callee registers");
     }
   }
+  for (size_t i = 0; i < ctx->saved_xmm_count; i++) {
+    if (!simd_movdqu_mem_xmm_disp(code, BINARY_GP_RBP,
+                                  -ctx->saved_xmm_offsets[i],
+                                  ctx->saved_xmm_registers[i])) {
+      return enc_err(fn, "out of memory saving callee xmm registers");
+    }
+  }
   if (!mir_home_parameters(fn)) {
     return 0;
   }
@@ -1037,6 +1058,13 @@ static int mir_emit_prologue(MirFunction *fn) {
 static int mir_emit_epilogue(MirFunction *fn) {
   BinaryFunctionContext *ctx = fn->context;
   BinaryCodeBuffer *code = &ctx->code;
+  for (size_t i = ctx->saved_xmm_count; i > 0; i--) {
+    size_t j = i - 1;
+    if (!simd_movdqu_xmm_mem_disp(code, ctx->saved_xmm_registers[j],
+                                  BINARY_GP_RBP, -ctx->saved_xmm_offsets[j])) {
+      return enc_err(fn, "out of memory restoring callee xmm registers");
+    }
+  }
   for (size_t i = ctx->saved_register_count; i > 0; i--) {
     size_t j = i - 1;
     if (!binary_emit_mov_reg_mem(code, ctx->saved_registers[j], BINARY_GP_RBP,
@@ -1107,6 +1135,39 @@ int mir_encode(MirFunction *fn) {
     case MIR_CVTF2F:
       ok = encode_cvtf2f(fn, in);
       break;
+    case MIR_FSETCC: {
+      int rok;
+      BinaryXmmRegister av = xmm_value(fn, &in->a, FSCRATCH_A, in->width, &rok);
+      if (!rok) { ok = 0; break; }
+      BinaryXmmRegister bv = xmm_value(fn, &in->b, FSCRATCH_B, in->width, &rok);
+      if (!rok) { ok = 0; break; }
+      int cmp = (in->width == 4)
+                    ? binary_emit_ucomiss_xmm_xmm(&ctx->code, av, bv)
+                    : binary_emit_ucomisd_xmm_xmm(&ctx->code, av, bv);
+      if (!cmp || !binary_emit_setcc_reg8(&ctx->code, in->cc, BINARY_GP_RAX) ||
+          !binary_emit_movzx_eax_al(&ctx->code)) {
+        ok = enc_err(fn, "out of memory in fsetcc");
+        break;
+      }
+      ok = store_from(fn, &in->dst, SCRATCH_A);
+      break;
+    }
+    case MIR_FCMPBR: {
+      int rok;
+      BinaryXmmRegister av = xmm_value(fn, &in->a, FSCRATCH_A, in->width, &rok);
+      if (!rok) { ok = 0; break; }
+      BinaryXmmRegister bv = xmm_value(fn, &in->b, FSCRATCH_B, in->width, &rok);
+      if (!rok) { ok = 0; break; }
+      int cmp = (in->width == 4)
+                    ? binary_emit_ucomiss_xmm_xmm(&ctx->code, av, bv)
+                    : binary_emit_ucomisd_xmm_xmm(&ctx->code, av, bv);
+      size_t off = 0;
+      if (!cmp || !binary_emit_jcc_placeholder(&ctx->code, in->cc, &off) ||
+          !binary_label_fixup_table_add(&ctx->label_fixups, in->dst.sym, off)) {
+        ok = enc_err(fn, "out of memory in fcmpbr");
+      }
+      break;
+    }
     case MIR_LABEL:
       if (!binary_label_table_define(&ctx->labels, in->dst.sym,
                                      ctx->code.size)) {

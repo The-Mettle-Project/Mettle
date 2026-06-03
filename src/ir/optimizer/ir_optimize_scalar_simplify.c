@@ -2011,6 +2011,9 @@ int ir_instruction_has_side_effect(const IRInstruction *instruction) {
   case IR_OP_SIMD_DOT_F32:
   case IR_OP_SIMD_AFFINE_MAP_F64:
   case IR_OP_SIMD_AFFINE_MAP_F32:
+  case IR_OP_SIMD_I2F_REDUCE_F64:
+  case IR_OP_SIMD_VLOOP_F64:
+  case IR_OP_SIMD_OUTER_LANE_F64:
   case IR_OP_RETURN:
   case IR_OP_INLINE_ASM:
     return 1;

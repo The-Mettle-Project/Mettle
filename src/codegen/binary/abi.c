@@ -332,6 +332,27 @@ int code_generator_binary_context_add_saved_register(
   return 1;
 }
 
+int code_generator_binary_context_add_saved_xmm_register(
+    BinaryFunctionContext *context, BinaryXmmRegister reg) {
+  if (!context) {
+    return 0;
+  }
+
+  for (size_t i = 0; i < context->saved_xmm_count; i++) {
+    if (context->saved_xmm_registers[i] == reg) {
+      return 1;
+    }
+  }
+
+  if (context->saved_xmm_count >= sizeof(context->saved_xmm_registers) /
+                                      sizeof(context->saved_xmm_registers[0])) {
+    return 0;
+  }
+
+  context->saved_xmm_registers[context->saved_xmm_count++] = reg;
+  return 1;
+}
+
 int code_generator_binary_type_is_gp_promotable(Type *type) {
   if (!type || !code_generator_binary_resolved_type_is_supported(type, 0)) {
     return 0;

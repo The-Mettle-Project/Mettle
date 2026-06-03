@@ -192,8 +192,21 @@ static const char *mir_opcode_name(MirOpcode op) {
   case MIR_CVTF2SI: return "cvtf2si";
   case MIR_CVTF2F: return "cvtf2f";
   case MIR_UCOMIS: return "ucomis";
+  case MIR_FSETCC: return "fsetcc";
+  case MIR_FCMPBR: return "fcmpbr";
   case MIR_MOVD_TO_XMM: return "movd2xmm";
   case MIR_MOVD_TO_GP: return "movd2gp";
+  case MIR_VADD: return "vadd";
+  case MIR_VSUB: return "vsub";
+  case MIR_VMUL: return "vmul";
+  case MIR_VDIV: return "vdiv";
+  case MIR_VCVTSI2F: return "vcvtsi2f";
+  case MIR_VCVTF2SI: return "vcvtf2si";
+  case MIR_VLOAD: return "vload";
+  case MIR_VSTORE: return "vstore";
+  case MIR_VBROADCAST: return "vbroadcast";
+  case MIR_VIOTA: return "viota";
+  case MIR_VHREDUCE: return "vhreduce";
   case MIR_OPCODE_COUNT: break;
   }
   return "?";

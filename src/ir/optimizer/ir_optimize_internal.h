@@ -443,6 +443,9 @@ int ir_run_fixpoint_pass(IRFunction *function, IROptPassId pass_id,
                          unsigned long long *version,
                          unsigned long long *clean_version, int *changed);
 int ir_simd_affine_map_float_pass(IRFunction *function, int *changed);
+int ir_simd_i2f_reduce_pass(IRFunction *function, int *changed);
+int ir_auto_vectorize_pass(IRFunction *function, int *changed);
+int ir_outer_vectorize_pass(IRFunction *function, int *changed);
 int ir_simd_dot_float_pass(IRFunction *function, int *changed);
 int ir_simd_dot_i32_pass(IRFunction *function, int *changed);
 int ir_simd_insertion_sort_i32_pass(IRFunction *function, int *changed);

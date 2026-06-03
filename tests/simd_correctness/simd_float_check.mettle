@@ -50,6 +50,21 @@ function ka_f32(src: float32*, dst: float32*, n: int64) -> int32 {
   return 0;
 }
 
+/* General auto-vectorizer (IR_OP_SIMD_VLOOP_F64) shapes the per-shape
+ * recognizers do not claim: a multi-array element-wise map and a sum-of-DAG
+ * reduction. Integer-valued in-range inputs keep == exact. */
+function vmap_combo(out: float64*, a: float64*, b: float64*, c: float64*,
+                    n: int64) -> int32 {
+  var i: int64 = 0;
+  while (i < n) { out[i] = (a[i] + b[i]) * c[i]; i = i + 1; }
+  return 0;
+}
+function vred_ssq(a: float64*, b: float64*, n: int64) -> float64 {
+  var acc: float64 = 0.0; var i: int64 = 0;
+  while (i < n) { acc = acc + (a[i] * a[i] + b[i]); i = i + 1; }
+  return acc;
+}
+
 var g_fail: int32 = 0;
 function fail(label: cstring, len: int64) -> int32 {
   print(cstr("FAIL ")); print(label); print(cstr(" n=")); print_int(len);
@@ -62,21 +77,28 @@ function run_len(n: int64) -> int32 {
   var cap: int64 = n; if (cap < 1) { cap = 1; }
   var a64: float64* = (float64*)malloc(cap * 8);
   var b64: float64* = (float64*)malloc(cap * 8);
+  var c64: float64* = (float64*)malloc(cap * 8);
+  var o64: float64* = (float64*)malloc(cap * 8);
   var a32: float32* = (float32*)malloc(cap * 4);
   var b32: float32* = (float32*)malloc(cap * 4);
 
   var ref_sum: float64 = 0.0;
   var ref_dot: float64 = 0.0;
   var ref_affine: float64 = 0.0;
+  var ref_combo: float64 = 0.0;
+  var ref_ssq: float64 = 0.0;
   var i: int64 = 0;
   while (i < n) {
     var x: int32 = rnd_small();
     var y: int32 = rnd_small();
-    a64[i] = (float64)x; b64[i] = (float64)y;
+    var z: int32 = rnd_small();
+    a64[i] = (float64)x; b64[i] = (float64)y; c64[i] = (float64)z;
     a32[i] = (float32)x; b32[i] = (float32)y;
     ref_sum = ref_sum + (float64)x;
     ref_dot = ref_dot + (float64)x * (float64)y;
     ref_affine = ref_affine + (float64)(2 * x + 3 * y + 5);
+    ref_combo = ref_combo + (float64)((x + y) * z);
+    ref_ssq = ref_ssq + (float64)(x * x + y);
     i = i + 1;
   }
 
@@ -86,12 +108,21 @@ function run_len(n: int64) -> int32 {
   // exact integer reference (values are integers, so the f32 sum is exact).
   if ((float64)ks_f32(a32, n) != ref_sum) { fail(cstr("sum_f32"), n); }
   if ((float64)kd_f32(a32, b32, n) != ref_dot) { fail(cstr("dot_f32"), n); }
+
+  // General auto-vectorizer checks run BEFORE the affine map below, which
+  // overwrites b64 in place. map out[i]=(a[i]+b[i])*c[i] then sum the outputs;
+  // and the sum-of-squares-plus reduction.
+  vmap_combo(o64, a64, b64, c64, n);
+  if (ks_f64(o64, n) != ref_combo) { fail(cstr("vloop_map_combo"), n); }
+  if (vred_ssq(a64, b64, n) != ref_ssq) { fail(cstr("vloop_reduce_ssq"), n); }
+
   ka_f64(a64, b64, n);
   ka_f32(a32, b32, n);
   if (ks_f64(b64, n) != ref_affine) { fail(cstr("affine_f64"), n); }
   if ((float64)ks_f32(b32, n) != ref_affine) { fail(cstr("affine_f32"), n); }
 
-  free((cstring)a64); free((cstring)b64); free((cstring)a32); free((cstring)b32);
+  free((cstring)a64); free((cstring)b64); free((cstring)c64); free((cstring)o64);
+  free((cstring)a32); free((cstring)b32);
   return 0;
 }
 

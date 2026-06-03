@@ -131,6 +131,22 @@ static int mir_false_jcc(const char *op, int is_unsigned, unsigned char *out) {
   return 0;
 }
 
+/* Ordered float comparison via ucomis. Because ucomis sets CF on "unordered"
+ * (NaN), we pick the operand order so the single condition code is NaN-correct
+ * (a comparison involving NaN must be false). `swap` requests ucomis(rhs,lhs).
+ * For fused branches `cc` is the jcc taken when the comparison is FALSE
+ * (branch_zero semantics); otherwise it is the setcc taken when TRUE.
+ * Only the ordering operators are handled here; == / != need extra PF handling
+ * and are left to the legacy path. */
+static int mir_float_cmp_info(const char *op, int fused, int *swap,
+                              unsigned char *cc) {
+  if (strcmp(op, ">") == 0)  { *swap = 0; *cc = fused ? 0x86 : 0x97; return 1; }
+  if (strcmp(op, ">=") == 0) { *swap = 0; *cc = fused ? 0x82 : 0x93; return 1; }
+  if (strcmp(op, "<") == 0)  { *swap = 1; *cc = fused ? 0x86 : 0x97; return 1; }
+  if (strcmp(op, "<=") == 0) { *swap = 1; *cc = fused ? 0x82 : 0x93; return 1; }
+  return 0;
+}
+
 /* Float arithmetic operator -> MIR opcode (divide is supported for floats). */
 static int mir_float_arith_opcode(const char *op, MirOpcode *out) {
   if (strcmp(op, "+") == 0) { *out = MIR_FADD; return 1; }
@@ -391,9 +407,11 @@ int mir_function_is_eligible(CodeGenerator *generator,
         return 0;
       }
       if (in->is_float) {
-        /* Float arithmetic only; float compares are deferred to a later
-         * increment (they need ucomis + NaN-correct setcc). */
-        if (!mir_float_arith_opcode(in->text, &tmp)) {
+        /* Float arithmetic, or an ordered float comparison (<,<=,>,>=). */
+        int sw;
+        unsigned char fcc;
+        if (!mir_float_arith_opcode(in->text, &tmp) &&
+            !mir_float_cmp_info(in->text, 0, &sw, &fcc)) {
           return 0;
         }
       } else if (!mir_arith_opcode(in->text, &tmp) &&
@@ -594,6 +612,16 @@ static MirOperand coerce_float_operand(MirFunction *fn, CodeGenerator *g,
   return v;
 }
 
+/* Operand (compute) width in bytes of a float comparison's operands. */
+static int mir_float_cmp_width(CodeGenerator *g, BinaryFunctionContext *ctx,
+                               const IRInstruction *in) {
+  int fb = code_generator_binary_operand_float_bits(g, ctx, &in->lhs);
+  if (!fb) {
+    fb = code_generator_binary_operand_float_bits(g, ctx, &in->rhs);
+  }
+  return fb ? fb / 8 : 8;
+}
+
 /* IR index of a label definition by name, or SIZE_MAX. */
 static size_t mir_ir_label_index(IRFunction *function, const char *name) {
   if (!name) {
@@ -676,11 +704,26 @@ static int mir_build_const_pool(MirFunction *fn, CodeGenerator *g,
   return ok;
 }
 
-/* Fuse `%t = a CMP b; branch_zero %t -> L` into `cmp a,b; j<!CMP> L`. */
+/* Fuse `%t = a CMP b; branch_zero %t -> L` into a compare-and-branch: integer
+ * `cmp a,b; j<!CMP> L`, or float `ucomis a,b; j<!CMP> L`. */
 static int mir_lower_compare_branch(MirFunction *fn, CodeGenerator *g,
                                     BinaryFunctionContext *ctx, MirNameMap *map,
                                     const IRInstruction *cmp,
                                     const IRInstruction *br) {
+  if (cmp->is_float) {
+    int swap;
+    unsigned char cc = 0;
+    if (!mir_float_cmp_info(cmp->text, 1, &swap, &cc)) {
+      fn->has_error = 1;
+      return 0;
+    }
+    int w = mir_float_cmp_width(g, ctx, cmp);
+    const IROperand *lo = swap ? &cmp->rhs : &cmp->lhs;
+    const IROperand *ro = swap ? &cmp->lhs : &cmp->rhs;
+    MirOperand a = coerce_float_operand(fn, g, ctx, map, lo, w);
+    MirOperand b = coerce_float_operand(fn, g, ctx, map, ro, w);
+    return mir_emit1(fn, MIR_FCMPBR, mir_op_label(br->text), a, b, w, 0, cc);
+  }
   MirOperand a = mir_value_operand(fn, g, ctx, map, &cmp->lhs);
   MirOperand b = mir_value_operand(fn, g, ctx, map, &cmp->rhs);
   int uns = mir_operand_is_unsigned(g, ctx, &cmp->lhs) ||
@@ -693,8 +736,8 @@ static int mir_lower_compare_branch(MirFunction *fn, CodeGenerator *g,
   return mir_emit1(fn, MIR_CMPBR, mir_op_label(br->text), a, b, 8, uns, cc);
 }
 
-/* True when instruction i is a single-use integer comparison whose result is
- * consumed only by an immediately-following branch_zero (the if/while shape). */
+/* True when instruction i is a single-use comparison (integer or ordered float)
+ * whose result is consumed only by an immediately-following branch_zero. */
 static int mir_fuses_compare_branch(CodeGenerator *g, IRFunction *function,
                                     size_t i) {
   if (i + 1 >= function->instruction_count) {
@@ -702,9 +745,15 @@ static int mir_fuses_compare_branch(CodeGenerator *g, IRFunction *function,
   }
   const IRInstruction *cmp = &function->instructions[i];
   const IRInstruction *br = &function->instructions[i + 1];
-  if (cmp->op != IR_OP_BINARY || cmp->is_float || !cmp->text ||
-      !mir_is_comparison(cmp->text) || cmp->dest.kind != IR_OPERAND_TEMP ||
-      !cmp->dest.name) {
+  if (cmp->op != IR_OP_BINARY || !cmp->text ||
+      cmp->dest.kind != IR_OPERAND_TEMP || !cmp->dest.name) {
+    return 0;
+  }
+  int sw;
+  unsigned char fcc;
+  int ok_cmp = cmp->is_float ? mir_float_cmp_info(cmp->text, 1, &sw, &fcc)
+                             : mir_is_comparison(cmp->text);
+  if (!ok_cmp) {
     return 0;
   }
   if (br->op != IR_OP_BRANCH_ZERO || br->lhs.kind != IR_OPERAND_TEMP ||
@@ -766,16 +815,27 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
     MirOperand b = mir_value_operand(fn, g, ctx, map, &in->rhs);
     if (in->is_float) {
       MirOpcode fop = MIR_FADD;
-      if (!mir_float_arith_opcode(in->text, &fop)) {
+      if (mir_float_arith_opcode(in->text, &fop)) {
+        int fb = code_generator_binary_instruction_result_float_bits(g, ctx, in);
+        int w = fb ? fb / 8 : 8;
+        /* Coerce each operand to the operation width (implicit promotion). */
+        MirOperand fa = coerce_float_operand(fn, g, ctx, map, &in->lhs, w);
+        MirOperand fbop = coerce_float_operand(fn, g, ctx, map, &in->rhs, w);
+        return mir_emit1(fn, fop, dst, fa, fbop, w, 0, 0);
+      }
+      /* Non-fused ordered float comparison -> 0/1 via ucomis + setcc. */
+      int swap;
+      unsigned char cc = 0;
+      if (!mir_float_cmp_info(in->text, 0, &swap, &cc)) {
         fn->has_error = 1;
         return 0;
       }
-      int fb = code_generator_binary_instruction_result_float_bits(g, ctx, in);
-      int w = fb ? fb / 8 : 8;
-      /* Coerce each operand to the operation width (implicit promotion). */
-      MirOperand fa = coerce_float_operand(fn, g, ctx, map, &in->lhs, w);
-      MirOperand fbop = coerce_float_operand(fn, g, ctx, map, &in->rhs, w);
-      return mir_emit1(fn, fop, dst, fa, fbop, w, 0, 0);
+      int w = mir_float_cmp_width(g, ctx, in);
+      const IROperand *lo = swap ? &in->rhs : &in->lhs;
+      const IROperand *ro = swap ? &in->lhs : &in->rhs;
+      MirOperand fa = coerce_float_operand(fn, g, ctx, map, lo, w);
+      MirOperand fbop = coerce_float_operand(fn, g, ctx, map, ro, w);
+      return mir_emit1(fn, MIR_FSETCC, dst, fa, fbop, w, 0, cc);
     }
     if (mir_is_comparison(in->text)) {
       int uns = mir_operand_is_unsigned(g, ctx, &in->lhs) ||
@@ -959,6 +1019,7 @@ int code_generator_binary_emit_function_via_mir(
   /* MIR owns saved registers and the frame; discard anything the legacy
    * promoter left in the context. */
   context->saved_register_count = 0;
+  context->saved_xmm_count = 0;
   context->raw_frame_size = 0;
   context->frame_size = 0;
   context->return_float_bits = 0;

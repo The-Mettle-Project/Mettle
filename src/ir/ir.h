@@ -108,7 +108,46 @@ typedef enum {
    * rhs[i] = arguments[1] * lhs[i] + arguments[2] * rhs[i] + arguments[3].
    * lhs = src, rhs = dst, arguments[0] = element count. */
   IR_OP_SIMD_AFFINE_MAP_F64,
-  IR_OP_SIMD_AFFINE_MAP_F32
+  IR_OP_SIMD_AFFINE_MAP_F32,
+  /* Counted-loop reduction where each iteration adds (int64)trunc(CHAIN) to the
+   * dest accumulator, with CHAIN a straight-line float64 expression in the loop
+   * counter: x0 = (float64)i, then a sequence of {x*=k, x+=k, x-=k, x=k-x, x/=k}
+   * steps. dest = int64 accumulator symbol; arguments[0] = trip count (a
+   * compile-time INT constant); the remaining arguments are alternating
+   * (op-code INT, constant FLOAT64) pairs describing the chain, applied to
+   * (float64)i in order. Emitted only by ir_simd_i2f_reduce_pass after it proves
+   * every per-element value fits int32 and the integer sum stays < 2^53, so an
+   * AVX2 f64-lane kernel is bit-identical to the scalar loop. Direct-object
+   * backend only. */
+  IR_OP_SIMD_I2F_REDUCE_F64,
+  /* General auto-vectorized counted unit-stride loop over a straight-line
+   * float64 DAG. Emitted by ir_auto_vectorize_pass for loops the per-shape
+   * recognizers above did not claim. The body DAG is serialized into
+   * arguments[]:
+   *   header (6 INT): [0] reduce_op (0 = element-wise map, 1 = '+' reduction)
+   *                   [1] n_arrays  [2] n_nodes  [3] root_node
+   *                   [4] n_consts  [5] max_live (peak simultaneous live ymm)
+   *   then n_arrays SYMBOL array-base operands (index k),
+   *   then n_nodes nodes, each 3 INT operands (tag, op0, op1):
+   *       tag 0=LOAD(op0=array idx) 1=IOTA 2=CONST(op0=const idx)
+   *           3=ADD 4=SUB 5=MUL 6=DIV (op0,op1 = earlier node indices),
+   *   then n_consts FLOAT64 operands.
+   * dest = reduction accumulator symbol (reduce_op==1) or stored array base
+   * (reduce_op==0); lhs = trip count (SYMBOL or INT). Direct-object backend
+   * only. The kernel replays the DAG over f64x4 lanes with stack-hoisted
+   * constants + a scalar remainder; element-wise maps are bit-identical to the
+   * scalar loop, '+' reductions reassociate like the sum/dot kernels. */
+  IR_OP_SIMD_VLOOP_F64,
+  /* Outer-loop lane vectorization of a reduction over an outer-IV-INVARIANT
+   * inner counted loop carrying one float64 accumulator (a serial recurrence,
+   * e.g. a divide chain). The outer loop `while(p<P){ inner; total += iacc; p++ }`
+   * has identical independent iterations; this runs 4 of them in lockstep f64x4
+   * lanes to hide the inner recurrence's latency (genuinely running all the
+   * inner work, 4-wide), then accumulates the (lane-identical) result into total
+   * with exact scalar adds. Serialized into arguments[]; see
+   * ir_outer_vectorize_pass. dest = total accumulator; lhs = outer trip count P;
+   * rhs = inner trip count N. Direct-object backend only. */
+  IR_OP_SIMD_OUTER_LANE_F64
 } IROpcode;
 
 typedef struct {

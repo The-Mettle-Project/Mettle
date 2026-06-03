@@ -584,6 +584,98 @@ int wcs_avx_vaddpd_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
 int wcs_avx_vmulpd_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
   return wcs_avx_vpd_ymm(b, 0x59, dst, s1, s2);
 }
+int wcs_avx_vsubpd_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
+  return wcs_avx_vpd_ymm(b, 0x5C, dst, s1, s2);
+}
+int wcs_avx_vdivpd_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
+  return wcs_avx_vpd_ymm(b, 0x5E, dst, s1, s2);
+}
+
+/* vcvtdq2pd ymm, xmm/m128 — VEX.256.F3.0F.WIG E6 /r: 4 int32 -> 4 f64. */
+int wcs_avx_vcvtdq2pd_ymm_xmm(BinaryCodeBuffer *b, int dst, int src) {
+  return wcs_vex3(b, 1, 2, 1, 0, dst, src, 0) &&
+         binary_code_buffer_append_u8(b, 0xE6) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (src & 7)));
+}
+
+/* vcvttpd2dq xmm, ymm — VEX.256.66.0F.WIG E6 /r: 4 f64 -> 4 int32 (truncate). */
+int wcs_avx_vcvttpd2dq_xmm_ymm(BinaryCodeBuffer *b, int dst, int src) {
+  return wcs_vex3(b, 1, 1, 1, 0, dst, src, 0) &&
+         binary_code_buffer_append_u8(b, 0xE6) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (src & 7)));
+}
+
+/* vpmovsxdq ymm, xmm — VEX.256.66.0F38.W0 25 /r: sign-extend 4 int32 -> 4 int64. */
+int wcs_avx_vpmovsxdq_ymm_xmm(BinaryCodeBuffer *b, int dst, int src) {
+  return wcs_vex3(b, 2, 1, 1, 0, dst, src, 0) &&
+         binary_code_buffer_append_u8(b, 0x25) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (src & 7)));
+}
+
+/* vpunpcklqdq xmm, xmm, xmm/m128 — VEX.128.66.0F.WIG 6C /r. Interleaves the low
+ * quadwords: dst = { src1.q0, src2.q0 }. Used to assemble the int32 lane vector
+ * [0,1,2,3] from two movq halves for the counter-reduction iota. */
+int wcs_avx_vpunpcklqdq_xmm(BinaryCodeBuffer *b, int dst, int src1, int src2) {
+  return wcs_vex3(b, 1, 1, 0, 0, dst, src2, src1) &&
+         binary_code_buffer_append_u8(b, 0x6C) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (src2 & 7)));
+}
+
+/* VEX.LIG.F2.0F scalar-double 3-operand ops (dst = s1 OP s2, low lane). Using
+ * these instead of legacy-SSE addsd/etc. inside an AVX loop avoids the AVX<->SSE
+ * transition penalty. */
+static int wcs_avx_vsd(BinaryCodeBuffer *b, unsigned char op, int dst, int s1,
+                       int s2) {
+  return wcs_vex3(b, 1, 3, 0, 0, dst, s2, s1) &&
+         binary_code_buffer_append_u8(b, op) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (s2 & 7)));
+}
+int wcs_avx_vaddsd(BinaryCodeBuffer *b, int dst, int s1, int s2) {
+  return wcs_avx_vsd(b, 0x58, dst, s1, s2);
+}
+int wcs_avx_vsubsd(BinaryCodeBuffer *b, int dst, int s1, int s2) {
+  return wcs_avx_vsd(b, 0x5C, dst, s1, s2);
+}
+int wcs_avx_vmulsd(BinaryCodeBuffer *b, int dst, int s1, int s2) {
+  return wcs_avx_vsd(b, 0x59, dst, s1, s2);
+}
+int wcs_avx_vdivsd(BinaryCodeBuffer *b, int dst, int s1, int s2) {
+  return wcs_avx_vsd(b, 0x5E, dst, s1, s2);
+}
+/* vcvtsi2sd xmm_dst, xmm_s1, r64 — VEX.LIG.F2.0F.W1 2A /r (W1 = 64-bit source);
+ * s1 supplies the merged upper lane (pass dst to self-merge). */
+int wcs_avx_vcvtsi2sd(BinaryCodeBuffer *b, int dst, int s1, int gpr) {
+  return wcs_vex3(b, 1, 3, 0, 1, dst, gpr, s1) &&
+         binary_code_buffer_append_u8(b, 0x2A) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (gpr & 7)));
+}
+/* vmovsd xmm, [base+disp] — VEX.LIG.F2.0F.WIG 10 /r (scalar-double load). */
+int wcs_avx_vmovsd_xmm_mem(BinaryCodeBuffer *b, int dst, int base, int disp) {
+  return wcs_vex3(b, 1, 3, 0, 0, dst, base, 0) &&
+         binary_code_buffer_append_u8(b, 0x10) &&
+         wcs_avx_modrm_mem_disp(b, dst, base, disp);
+}
+/* vmovsd [base+disp], xmm — VEX.LIG.F2.0F.WIG 11 /r (scalar-double store). */
+int wcs_avx_vmovsd_mem_xmm(BinaryCodeBuffer *b, int base, int disp, int src) {
+  return wcs_vex3(b, 1, 3, 0, 0, src, base, 0) &&
+         binary_code_buffer_append_u8(b, 0x11) &&
+         wcs_avx_modrm_mem_disp(b, src, base, disp);
+}
+/* vunpckhpd xmm, s1, s2 — VEX.128.66.0F.WIG 15 /r: dst = { s1.hi, s2.hi }.
+ * vunpckhpd dst, a, a moves a's high double into dst's low lane (lane extract). */
+int wcs_avx_vunpckhpd_xmm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
+  return wcs_vex3(b, 1, 1, 0, 0, dst, s2, s1) &&
+         binary_code_buffer_append_u8(b, 0x15) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (s2 & 7)));
+}
+
 int wcs_avx_vaddps_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
   return wcs_avx_vps_ymm(b, 0x58, dst, s1, s2);
 }

@@ -44,6 +44,14 @@ typedef enum {
   BINARY_XMM5 = 5,
   BINARY_XMM6 = 6,
   BINARY_XMM7 = 7,
+  BINARY_XMM8 = 8,
+  BINARY_XMM9 = 9,
+  BINARY_XMM10 = 10,
+  BINARY_XMM11 = 11,
+  BINARY_XMM12 = 12,
+  BINARY_XMM13 = 13,
+  BINARY_XMM14 = 14,
+  BINARY_XMM15 = 15,
 } BinaryXmmRegister;
 
 typedef struct {
@@ -148,6 +156,13 @@ typedef struct {
   BinaryGpRegister saved_registers[7];
   int saved_register_offsets[7];
   size_t saved_register_count;
+  /* Callee-saved XMM registers (xmm8..xmm15 on Win64) the MIR allocator used and
+   * the prologue must preserve. Stored as 16-byte movdqu slots below the GP
+   * saves. xmm8..15 are argument registers on neither Win64 nor SysV, so adding
+   * them to the float pool needs no parameter/call-marshalling special-casing. */
+  BinaryXmmRegister saved_xmm_registers[8];
+  int saved_xmm_offsets[8];
+  size_t saved_xmm_count;
   int raw_frame_size;
   int frame_size;
   /* IEEE-754 width of the function's float return (0/32/64). 0 = not float. */
@@ -441,6 +456,7 @@ int code_generator_binary_collect_symbol_aliases( CodeGenerator *generator, Bina
 int code_generator_binary_compare_false_jcc(const char *op, unsigned char *opcode_out);
 int code_generator_binary_compare_true_cmov(const char *op, unsigned char *opcode_out);
 int code_generator_binary_context_add_saved_register( BinaryFunctionContext *context, BinaryGpRegister reg);
+int code_generator_binary_context_add_saved_xmm_register( BinaryFunctionContext *context, BinaryXmmRegister reg);
 int code_generator_binary_declare_external_symbol( CodeGenerator *generator, const char *symbol_name);
 int code_generator_binary_emit_address_add_to_rax( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *address);
 int code_generator_binary_emit_address_of( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
@@ -525,6 +541,9 @@ int code_generator_binary_emit_simd_dot_f64( CodeGenerator *generator, BinaryFun
 int code_generator_binary_emit_simd_dot_f32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_affine_map_f64( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_affine_map_f32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
+int code_generator_binary_emit_simd_i2f_reduce_f64( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
+int code_generator_binary_emit_simd_vloop_f64( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
+int code_generator_binary_emit_simd_outer_lane_f64( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_store(CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_store_to_address( CodeGenerator *generator, BinaryFunctionContext *context, BinaryGpRegister address_register, int size, BinaryGpRegister source_register);
 int code_generator_binary_emit_string_literal_value_address( CodeGenerator *generator, BinaryFunctionContext *context, const char *value, BinaryGpRegister target_register);
