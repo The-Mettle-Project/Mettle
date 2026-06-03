@@ -1,137 +1,166 @@
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="mettle-syntax/icons/mettle-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="mettle.svg">
-    <img src="mettle.svg" alt="Mettle" width="128" height="128">
-  </picture>
-</p>
 
-<h1 align="center">Mettle</h1>
+# Mettle
 
-<p align="center">
-  <b>A statically typed systems language that compiles straight to x86-64.</b>
-</p>
+A statically typed systems language that compiles to native x86-64.
 
-<p align="center">
-  <img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0">
-  <img src="https://img.shields.io/badge/target-x86--64-orange.svg" alt="Target: x86-64">
-  <img src="https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-success.svg" alt="Platforms: Windows | Linux">
-  <img src="https://img.shields.io/badge/runtime-none-lightgrey.svg" alt="Runtime: none">
-</p>
+[GitHub](https://github.com/The-Mettle-Project/Mettle) | [Releases](https://github.com/The-Mettle-Project/Mettle/releases) | Language reference | Apache-2.0
 
-Mettle is a low-level language with a compiler it owns end to end: source, IR,
-optimization, and x86-64 codegen with native object output. COFF plus a
-built-in PE linker on Windows, and ELF with a self-contained `_start` on Linux.
+Mettle compiles `.mettle` source to native x86-64. On Windows, `mettle --build` produces a PE executable using a built-in linker. On Linux, it produces ELF and links with the system toolchain. There is no LLVM dependency, no VM, and no managed runtime.
 
-No LLVM. No C backend. No managed runtime.
+## Features
 
-## Why It Exists
+- Static types, pointers, structs, and enums
+- Direct calls to C and OS APIs; a bundled stdlib for I/O, memory, math, and more
+- `defer` / `errdefer` for scope cleanup; compile errors with source snippets
+- Optional Tracy profiling, runtime timing, and debug stack traces
 
-- Direct x86-64 output you can reason about
-- Static types, pointers, structs, enums, generics, and function pointers
-- `defer` and `errdefer` for simple, reliable cleanup
-- C interop through `extern` and `cstring`, with no FFI runtime
-- A bundled standard library for I/O, conversion, networking, processes, and threads
-- Strong diagnostics with source snippets, stable error codes, and typo suggestions
-- `--build` mode that produces native executables directly: COFF and the
-  built-in PE linker on Windows, ELF and `ld` on Linux, with no NASM, gcc, or
-  `link.exe` needed
+Windows is the most complete target (internal PE linker, Win32 GUI via `std/ui`). Linux supports builds, a libc-backed stdlib, and compiler development. See [known limitations](docs/known-limitations.md) for caveats.
+
+## Example
+
+Save as `hello.mettle`:
+
+```mettle
+import "std/io";
+
+function fib(n: int32) -> int64 {
+  if (n <= 1) { return n; }
+  var a: int64 = 0;
+  var b: int64 = 1;
+  var i: int32 = 2;
+  while (i <= n) {
+    var next = a + b;
+    a = b;
+    b = next;
+    i = i + 1;
+  }
+  return b;
+}
+
+function main() -> int32 {
+  print("fib(10) = ");
+  print_int(fib(10));
+  newline();
+  return 0;
+}
+```
+
+```bash
+mettle --build hello.mettle -o hello
+./hello          # Windows: .\hello.exe
+```
+
+Pass `--prelude` to pull in common stdlib modules without explicit imports. Import networking yourself when you need it (`std/net` on Windows; `std/net` or `std/net_posix` on Linux).
 
 ## Install
 
-Linux (x86-64):
+**Linux (x86-64)**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/install.sh | sh
 ```
 
-Windows (x86-64), in PowerShell:
+**Windows (x86-64), PowerShell**
 
 ```powershell
 irm https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/install.ps1 | iex
 ```
 
-The installer downloads the latest release for your platform, installs it to a
-per-user directory (`~/.mettle` on Linux, `%LOCALAPPDATA%\Mettle` on Windows),
-adds the compiler to your PATH, and checks for the C toolchain Mettle links
-with. No root or administrator rights required. Pin a version with
-`--version v0.3.0` (or `-Version v0.3.0` on Windows).
-
-After installing, open a new terminal and confirm:
+Installs to `~/.mettle` (Linux) or `%LOCALAPPDATA%\Mettle` (Windows), updates user PATH, and checks for a C toolchain when linking stdlib programs. No root or admin required. Pin a release: `--version v0.3.0` (Linux) or `-Version v0.3.0` (Windows).
 
 ```bash
 mettle --version
 ```
 
-## Quick Start
-
-Compile and run a program:
-
-```bash
-echo 'function main() -> int32 { return 0; }' > hello.mettle
-mettle --build hello.mettle -o hello
-./hello          # on Windows: .\hello.exe
-```
-
-The Linux `--build` path emits a native ELF object with the compiler's own
-`_start` and links it with `ld` into a statically linked executable, with no
-libc, CRT, or assembler. Programs that use the standard library (`std/io`,
-`std/bench`) are not yet supported on Linux and fail at link time.
+Dev builds from source report `v0.9.2` unless `METTLE_VERSION_RAW` is set at compile time.
 
 ## Build from source
 
+**Windows** (gcc or clang):
+
 ```powershell
-.\build.bat        # Windows
+.\build.bat          # default: gcc
+.\build.bat clang
 ```
+
+**Linux / macOS** (build the compiler on the host; codegen targets x86-64 Windows and Linux):
 
 ```bash
-make               # Linux
+make                 # bin/mettle + bundled stdlib/ and runtime/
+make install         # optional: /usr/local/bin, stdlib, runtime
 ```
 
-Production build:
+Typical release build:
 
 ```powershell
 .\bin\mettle.exe --build --release hello.mettle -o hello.exe
 ```
 
-## Help
-
-```powershell
-.\bin\mettle.exe help
-.\bin\mettle.exe help build
-.\bin\mettle.exe help runtime
-.\bin\mettle.exe docs
+```bash
+./bin/mettle --build --release hello.mettle -o hello
 ```
+
+Useful flags: `--build` (executable), `--release` / `-O` (optimized), `--emit-asm` (legacy NASM path on Windows), `-d` / `-s` / `-g` (debug and stack traces), `--profile-runtime`, `--tracy`. Full list: `mettle --help` and `mettle help build`.
 
 ## Documentation
 
 - [Language reference](docs/LANGUAGE.md)
+- [Compilation](docs/compilation.md) (CLI, link pipelines, Tracy, profiling)
+- [Imports](docs/imports.md)
 - [Runtime model](docs/runtime-model.md)
-- [Compilation pipeline](docs/compilation.md)
 - [Standard library](docs/standard-library.md)
+- [C interop](docs/c-interop.md)
 - [Known limitations](docs/known-limitations.md)
 
-## Repository
+`mettle docs` prints paths to these files next to the compiler binary.
 
-- `src/` - compiler, codegen, linker, diagnostics, and runtime helpers
-- `stdlib/` - standard library modules
-- `tests/` - compiler, linker, and runtime tests
-- `docs/` - language and tooling documentation
+## Repository layout
+
+```
+src/            compiler (lexer through codegen, linker, diagnostics)
+stdlib/         standard library
+src/runtime/    optional helper objects (crash traces, atomics, ...)
+tests/          regression tests; run_tests.ps1 on Windows
+examples/       benchmarks and demos
+tools/          ELF tests, benchmarks, fuzz scripts
+mettle-syntax/  VS Code / Cursor extension
+docs/           language and tooling reference
+```
+
+## Examples and benchmarks
+
+Runnable samples live under `[examples/](examples/)`. Benchmark suites pair Mettle, C, and Rust; run them with:
+
+```powershell
+.\tools\benchmark\run-benchmarks.ps1
+```
+
+See `[examples/README.md](examples/README.md)` for `fib`, `grep`, `ui_demo`, `tracy_demo`, and others.
 
 ## Development
 
-Run the test suite (Windows):
+**Windows** (primary CI: full test suite):
 
 ```powershell
-.\build.bat                        # build + full suite
-.\tests\run_tests.ps1              # suite against the current bin\mettle.exe
+.\build.bat
+.\tests\run_tests.ps1
 .\tests\run_tests.ps1 -BuildCompiler
 ```
 
-Native ELF backend tests (Linux):
+**Linux** (native ELF backend):
 
 ```bash
-make
+make -j"$(nproc)"
 bash tools/test-elf-native.sh
 ```
+
+Optional: `tools/fuzz/` (nightly workflow). Crash-handler unit test: `make test`.
+
+## Editor support
+
+Install the `[mettle-syntax](mettle-syntax/)` extension for `.mettle` syntax highlighting, snippets, and compiler-backed diagnostics in VS Code or Cursor.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).

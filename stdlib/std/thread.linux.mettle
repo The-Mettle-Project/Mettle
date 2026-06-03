@@ -1,0 +1,132 @@
+// Mettle standard library: Threading (native ELF / Linux)
+//
+// Linux counterpart to std/thread. Exposes the SAME public API as std/thread
+// (CreateThread/WaitForSingleObject/CloseHandle/Sleep/CreateMutexA/etc.) so a
+// single `import "std/thread"` works on both Windows and Linux. Underneath it
+// calls pthreads via thin C trampolines in src/runtime/posix_helpers.c, which
+// the compiler auto-links along with -lpthread when std/thread is imported on
+// Linux. Interlocked* atomics use the same cross-platform mettle_atomic_*
+// runtime symbols as the Windows module.
+//
+// The import resolver picks this file over thread.mettle automatically on the
+// native ELF target.
+
+// ─── Wait constants (Win32 values, exposed identically on Linux) ────────────
+export function INFINITE() -> uint32 { return 0xFFFFFFFF; }
+export function WAIT_OBJECT_0() -> uint32 { return 0; }
+export function WAIT_TIMEOUT() -> uint32 { return 258; }
+export function WAIT_FAILED() -> uint32 { return 0xFFFFFFFF; }
+
+// ─── Thread lifecycle ────────────────────────────────────────────────────────
+// Win32-shape signatures bound to pthreads-backed C helpers.
+export extern function CreateThread(lpThreadAttributes: cstring, dwStackSize: uint64, lpStartAddress: fn(cstring) -> uint32, lpParameter: cstring, dwCreationFlags: uint32, lpThreadId: uint32*) -> int64 = "mettle_thread_create";
+export extern function CloseHandle(hObject: int64) -> int32 = "mettle_thread_close";
+export extern function WaitForSingleObject(hHandle: int64, dwMilliseconds: uint32) -> uint32 = "mettle_thread_wait";
+export extern function GetCurrentThreadId() -> uint32 = "mettle_thread_current_id";
+export extern function Sleep(dwMilliseconds: uint32) = "mettle_thread_sleep_ms";
+
+// ─── Mutex (CRITICAL_SECTION-like) ──────────────────────────────────────────
+export extern function CreateMutexA(lpMutexAttributes: cstring, bInitialOwner: int32, lpName: cstring) -> int64 = "mettle_mutex_create";
+export extern function ReleaseMutex(hMutex: int64) -> int32 = "mettle_mutex_release";
+
+// ─── Interlocked atomics ────────────────────────────────────────────────────
+// Shared cross-platform runtime symbols (src/runtime/atomics.c).
+export extern function InterlockedCompareExchange(target: int32*, exchange: int32, comparand: int32) -> int32 = "mettle_atomic_compare_exchange_i32";
+export extern function InterlockedExchange(target: int32*, value: int32) -> int32 = "mettle_atomic_exchange_i32";
+export extern function InterlockedIncrement(target: int32*) -> int32 = "mettle_atomic_inc_i32";
+export extern function InterlockedDecrement(target: int32*) -> int32 = "mettle_atomic_dec_i32";
+
+// posix_yield drives the spin-lock contention path (sched_yield underneath).
+extern function posix_yield() = "posix_yield";
+
+// ─── Thread convenience wrappers (mirror std/thread) ────────────────────────
+export function thread_close(handle: int64) -> int32 {
+  return CloseHandle(handle);
+}
+
+export function thread_join(handle: int64, timeout_ms: uint32) -> uint32 {
+  return WaitForSingleObject(handle, timeout_ms);
+}
+
+export function thread_join_infinite(handle: int64) -> uint32 {
+  return WaitForSingleObject(handle, INFINITE());
+}
+
+export function thread_detach(handle: int64) -> int32 {
+  return CloseHandle(handle);
+}
+
+export function thread_sleep_ms(milliseconds: uint32) {
+  Sleep(milliseconds);
+}
+
+// ─── Mutex wrappers ─────────────────────────────────────────────────────────
+export function mutex_create() -> int64 {
+  return CreateMutexA(0, 0, 0);
+}
+
+export function mutex_create_owned() -> int64 {
+  return CreateMutexA(0, 1, 0);
+}
+
+// Win32-style wait-with-timeout for a mutex handle.
+extern function mettle_mutex_wait(handle: int64, ms: uint32) -> uint32 = "mettle_mutex_wait";
+
+export function mutex_lock(mutex: int64, timeout_ms: uint32) -> int32 {
+  var result: uint32 = mettle_mutex_wait(mutex, timeout_ms);
+  if (result == WAIT_OBJECT_0()) {
+    return 1;
+  }
+  return 0;
+}
+
+export function mutex_lock_infinite(mutex: int64) -> int32 {
+  return mutex_lock(mutex, INFINITE());
+}
+
+export function mutex_unlock(mutex: int64) -> int32 {
+  return ReleaseMutex(mutex);
+}
+
+extern function mettle_mutex_close(handle: int64) -> int32 = "mettle_mutex_close";
+
+export function mutex_close(mutex: int64) -> int32 {
+  return mettle_mutex_close(mutex);
+}
+
+// ─── Atomic wrappers (identical to std/thread) ──────────────────────────────
+export function atomic_compare_exchange_i32(target: int32*, exchange: int32, comparand: int32) -> int32 {
+  return InterlockedCompareExchange(target, exchange, comparand);
+}
+
+export function atomic_exchange_i32(target: int32*, value: int32) -> int32 {
+  return InterlockedExchange(target, value);
+}
+
+export function atomic_inc_i32(target: int32*) -> int32 {
+  return InterlockedIncrement(target);
+}
+
+export function atomic_dec_i32(target: int32*) -> int32 {
+  return InterlockedDecrement(target);
+}
+
+// ─── Spin lock helpers ──────────────────────────────────────────────────────
+// lock_var must be a shared int32 initialized to 0. Same API as std/thread.
+// The contention path yields via sched_yield on Linux (Sleep(0) on Windows).
+export function spin_try_lock(lock_var: int32*) -> int32 {
+  if (InterlockedCompareExchange(lock_var, 1, 0) == 0) {
+    return 1;
+  }
+  return 0;
+}
+
+export function spin_lock(lock_var: int32*) {
+  while (spin_try_lock(lock_var) == 0) {
+    posix_yield();
+  }
+}
+
+export function spin_unlock(lock_var: int32*) {
+  InterlockedExchange(lock_var, 0);
+}

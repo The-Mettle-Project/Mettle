@@ -1,0 +1,67 @@
+// Mettle Mandelbrot benchmark.
+//
+// Escape-time Mandelbrot over a 600x400 grid, max 256 iterations, summing the
+// escape counts. This is float64-heavy with a tight branchy inner loop --
+// exactly what GCC -O3 schedules and partially vectorizes well, and where
+// Mettle's scalar FP codegen is expected to lag.
+//
+// Build: build.bat   Run: mandelbrot.exe
+
+import "std/io";
+import "std/bench";
+
+const W = 600;
+const H = 400;
+const MAXIT = 256;
+
+function mandel_sum() -> int64 {
+  var total: int64 = 0;
+  var py: int32 = 0;
+  while (py < H) {
+    var y0: float64 = ((float64)py / (float64)H) * 2.0 - 1.0;
+    var px: int32 = 0;
+    while (px < W) {
+      var x0: float64 = ((float64)px / (float64)W) * 3.0 - 2.0;
+      var x: float64 = 0.0;
+      var y: float64 = 0.0;
+      var it: int32 = 0;
+      while (it < MAXIT) {
+        var x2: float64 = x * x;
+        var y2: float64 = y * y;
+        if (x2 + y2 > 4.0) {
+          it = MAXIT;
+        } else {
+          var xt: float64 = x2 - y2 + x0;
+          y = 2.0 * x * y + y0;
+          x = xt;
+          it = it + 1;
+          total = total + 1;
+        }
+      }
+      px = px + 1;
+    }
+    py = py + 1;
+  }
+  return total;
+}
+
+function main() -> int32 {
+  var passes: int32 = 30;
+  println("Mandelbrot 600x400, 256 iters x 30 passes");
+
+  var t0: uint64 = bench_time_us();
+  var acc: int64 = 0;
+  var p: int32 = 0;
+  while (p < passes) {
+    acc = acc + mandel_sum();
+    p = p + 1;
+  }
+  var elapsed_us: uint64 = bench_time_us() - t0;
+
+  print("Checksum = ");
+  println_int(acc);
+  print("Time: ");
+  print_int(elapsed_us);
+  println(" us");
+  return 0;
+}

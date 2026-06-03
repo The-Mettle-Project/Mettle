@@ -875,6 +875,20 @@ int binary_emit_idiv_reg(BinaryCodeBuffer *buffer,
   return binary_emit_unary_reg(buffer, 7, divisor);
 }
 
+/* Unsigned one-operand DIV (F7 /6): RAX = RDX:RAX / src, RDX = remainder.
+ * Caller must zero RDX (xor edx,edx) first. */
+int binary_emit_div_reg(BinaryCodeBuffer *buffer, BinaryGpRegister divisor) {
+  return binary_emit_unary_reg(buffer, 6, divisor);
+}
+
+int binary_emit_mul_reg(BinaryCodeBuffer *buffer, BinaryGpRegister src) {
+  return binary_emit_unary_reg(buffer, 4, src);
+}
+
+int binary_emit_imul_reg(BinaryCodeBuffer *buffer, BinaryGpRegister src) {
+  return binary_emit_unary_reg(buffer, 5, src);
+}
+
 int binary_emit_shift_reg_cl(BinaryCodeBuffer *buffer,
                                     unsigned char subopcode,
                                     BinaryGpRegister reg) {

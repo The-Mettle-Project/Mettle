@@ -2,8 +2,8 @@ name: Nightly differential fuzz
 
 # Heavy differential miscompile sweep: builds each generated program at debug
 # and release and flags exit-code divergence (a silent optimizer/backend bug).
-# See tools/fuzz/README.md. The start offset rotates by day-of-year so each
-# night explores a fresh seed window rather than re-running 1..N.
+# See tools/fuzz/README.md. Four shards run in parallel. The base start offset
+# rotates by day-of-year so each night explores a fresh seed window.
 
 on:
   schedule:
@@ -11,8 +11,8 @@ on:
   workflow_dispatch:
     inputs:
       count:
-        description: "Number of seeds to fuzz"
-        default: "3000"
+        description: "Number of seeds to fuzz per shard"
+        default: "1000"
         required: false
       start:
         description: "Start seed (blank = rotate by day-of-year)"
@@ -24,9 +24,13 @@ permissions:
 
 jobs:
   fuzz:
-    name: Fuzz sweep (windows)
+    name: Fuzz sweep (windows shard ${{ matrix.shard }})
     runs-on: windows-latest
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v4
 
@@ -40,7 +44,7 @@ jobs:
         env:
           METTLE_NO_CODEVIEW: "1"
         run: |
-          & cmd /c "build.bat gcc"
+          & cmd /c "build.bat gcc --skip-tests"
           if (-not (Test-Path "bin\mettle.exe")) { throw "compiler build failed" }
 
       - name: Compute seed window
@@ -48,16 +52,18 @@ jobs:
         shell: pwsh
         run: |
           $count = "${{ github.event.inputs.count }}"
-          if ([string]::IsNullOrWhiteSpace($count)) { $count = "3000" }
+          if ([string]::IsNullOrWhiteSpace($count)) { $count = "1000" }
           $start = "${{ github.event.inputs.start }}"
           if ([string]::IsNullOrWhiteSpace($start)) {
             # Rotate the window so consecutive nights cover different seeds.
             $doy = (Get-Date).DayOfYear
-            $start = (1 + $doy * [int]$count).ToString()
+            $start = (1 + $doy * [int]$count * 4).ToString()
           }
+          $start = ([int]$start + ([int]"${{ matrix.shard }}" * [int]$count)).ToString()
           echo "count=$count" >> $env:GITHUB_OUTPUT
           echo "start=$start" >> $env:GITHUB_OUTPUT
-          Write-Host "Fuzzing $count seeds starting at $start"
+          echo "shard=${{ matrix.shard }}" >> $env:GITHUB_OUTPUT
+          Write-Host "Fuzzing $count seeds starting at $start on shard ${{ matrix.shard }}"
 
       - name: Run differential fuzzer
         id: fuzz
@@ -85,13 +91,14 @@ jobs:
           script: |
             const start = '${{ steps.window.outputs.start }}';
             const count = '${{ steps.window.outputs.count }}';
+            const shard = '${{ steps.window.outputs.shard }}';
             const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
             const title = `Nightly fuzz: miscompile divergence (seeds ${start}..)`;
             const body = [
               `The nightly differential fuzzer found an exit-code divergence between`,
               `debug and release builds (a silent miscompile).`,
               ``,
-              `- Seed window: start=${start}, count=${count}`,
+              `- Seed window: start=${start}, count=${count}, shard=${shard}`,
               `- Failing repros are attached to the run as the \`fuzz-repros-${start}\` artifact.`,
               `- Replay any case with \`python tools/fuzz/genprog.py <seed>\`, then bisect`,
               `  the pass with \`METTLE_SKIP_PASS\` (see tools/fuzz/README.md).`,
@@ -100,6 +107,18 @@ jobs:
             ].join('\n');
             // Avoid duplicate issues: reuse an open one with the same label.
             const label = 'fuzz-divergence';
+            try {
+              await github.rest.issues.getLabel({
+                owner: context.repo.owner, repo: context.repo.repo, name: label,
+              });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              await github.rest.issues.createLabel({
+                owner: context.repo.owner, repo: context.repo.repo,
+                name: label, color: 'b60205',
+                description: 'Nightly differential fuzzer found a compiler divergence',
+              });
+            }
             const existing = await github.rest.issues.listForRepo({
               owner: context.repo.owner, repo: context.repo.repo,
               state: 'open', labels: label,

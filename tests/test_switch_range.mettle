@@ -1,0 +1,27 @@
+// Switch range cases `case lo..hi:` match any value in the inclusive interval.
+// Exercises: single value coexisting with ranges, inclusive lower/upper bounds,
+// adjacent ranges, and default fallthrough. Returns 42 on full success.
+
+function classify(n: int32) -> int32 {
+  switch (n) {
+    case 0:
+      return 100;
+    case 1..5:
+      return 200;
+    case 6..10:
+      return 300;
+    default:
+      return 0;
+  }
+  return -1;
+}
+
+function main() -> int32 {
+  if (classify(0) != 100) { return 1; }   // single value still works
+  if (classify(1) != 200) { return 2; }   // inclusive lower bound
+  if (classify(5) != 200) { return 3; }   // inclusive upper bound
+  if (classify(6) != 300) { return 4; }   // adjacent range, lower edge
+  if (classify(10) != 300) { return 5; }  // adjacent range, upper edge
+  if (classify(11) != 0) { return 6; }    // outside all ranges -> default
+  return 42;
+}

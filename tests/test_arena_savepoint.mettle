@@ -1,0 +1,54 @@
+// arena_save / arena_restore rolls back to a captured position. Allocations
+// made before the save survive; allocations made after are released and
+// their chunks recycled.
+import "std/arena";
+
+function main() -> int32 {
+  var a: Arena* = arena_init((int64)1024);
+  if (a == 0) { return 1; }
+
+  var keep: cstring = arena_alloc(a, (int64)32);
+  if (keep == 0) { return 2; }
+  keep[0] = (uint8)55;
+
+  var save: ArenaSave = arena_save(a);
+
+  // Spew enough small allocations to span multiple chunks.
+  var i: int32 = 0;
+  while (i < 80) {
+    var p: cstring = arena_alloc(a, (int64)128);
+    if (p == 0) { return 3; }
+    p[0] = (uint8)((int32)i & 255);
+    i = i + 1;
+  }
+
+  var before: ArenaStats = arena_stats(a);
+  arena_restore(a, save);
+  var after: ArenaStats = arena_stats(a);
+
+  // After restore: total_used must be no greater than it was at save time.
+  if (after.total_used > before.total_used) { return 4; }
+
+  // The pre-save allocation must still hold its data.
+  if ((int32)keep[0] != 55) { return 5; }
+
+  // Freed chunks should now be on the freelist.
+  if (after.free_chunk_count <= 0) { return 6; }
+
+  // A fresh post-restore alloc should succeed and reuse a freelist chunk
+  // rather than malloc'ing a new one. Confirm by comparing chunk counts.
+  var stats_before_realloc: ArenaStats = arena_stats(a);
+  var reused: cstring = arena_alloc(a, (int64)64);
+  if (reused == 0) { return 7; }
+  var stats_after_realloc: ArenaStats = arena_stats(a);
+
+  // The freelist should have shrunk by exactly one (or the active count grew
+  // without a new chunk being malloc'd — both manifest as the total chunk
+  // count staying constant).
+  var total_before: int32 = stats_before_realloc.chunk_count + stats_before_realloc.free_chunk_count;
+  var total_after: int32 = stats_after_realloc.chunk_count + stats_after_realloc.free_chunk_count;
+  if (total_after != total_before) { return 8; }
+
+  arena_free(a);
+  return 0;
+}

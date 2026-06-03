@@ -47,6 +47,8 @@
 #define SHT_STRTAB 3
 #define SHT_RELA 4
 #define SHT_NOBITS 8
+#define SHT_INIT_ARRAY 14
+#define SHT_FINI_ARRAY 15
 
 #define SHF_WRITE 0x1
 #define SHF_ALLOC 0x2
@@ -140,14 +142,27 @@ static uint32_t elf_section_flags(BinarySectionKind kind) {
     return SHF_ALLOC;
   case BINARY_SECTION_DATA:
   case BINARY_SECTION_BSS:
+  case BINARY_SECTION_INIT_ARRAY:
+  case BINARY_SECTION_FINI_ARRAY:
     return SHF_ALLOC | SHF_WRITE;
+  case BINARY_SECTION_DEBUG:
+    return 0;
   default:
     return SHF_ALLOC;
   }
 }
 
 static uint32_t elf_section_type(BinarySectionKind kind) {
-  return kind == BINARY_SECTION_BSS ? SHT_NOBITS : SHT_PROGBITS;
+  switch (kind) {
+  case BINARY_SECTION_BSS:
+    return SHT_NOBITS;
+  case BINARY_SECTION_INIT_ARRAY:
+    return SHT_INIT_ARRAY;
+  case BINARY_SECTION_FINI_ARRAY:
+    return SHT_FINI_ARRAY;
+  default:
+    return SHT_PROGBITS;
+  }
 }
 
 /* Translates an abstract relocation kind into an ELF x86-64 relocation type and

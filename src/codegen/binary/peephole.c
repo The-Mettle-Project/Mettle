@@ -343,6 +343,336 @@ int code_generator_binary_emit_compare_false_branch(
   return 1;
 }
 
+int code_generator_binary_try_emit_reg_multiply_immediate(
+    BinaryFunctionContext *context, BinaryGpRegister target_register,
+    long long immediate, int *handled_out) {
+  unsigned long long magnitude = 0;
+  int negate = 0;
+  BinaryGpRegister scratch =
+      target_register == BINARY_GP_R10 ? BINARY_GP_R11 : BINARY_GP_R10;
+
+  if (handled_out) {
+    *handled_out = 0;
+  }
+  if (!context || !handled_out) {
+    return 0;
+  }
+
+  if (immediate == 0) {
+    *handled_out = 1;
+    return binary_emit_mov_reg_imm64(&context->code, target_register, 0);
+  }
+  if (immediate == 1) {
+    *handled_out = 1;
+    return 1;
+  }
+  if (immediate == -1) {
+    *handled_out = 1;
+    return binary_emit_neg_reg(&context->code, target_register);
+  }
+
+  if (immediate < 0) {
+    negate = 1;
+    magnitude = (unsigned long long)(-(immediate + 1)) + 1ull;
+  } else {
+    magnitude = (unsigned long long)immediate;
+  }
+
+  if ((magnitude & (magnitude - 1ull)) == 0ull) {
+    unsigned char shift = 0;
+    while ((1ull << shift) != magnitude) {
+      shift++;
+    }
+    *handled_out = 1;
+    return binary_emit_shift_reg_imm8(&context->code, 4, target_register,
+                                      shift) &&
+           (!negate || binary_emit_neg_reg(&context->code, target_register));
+  }
+
+  if (magnitude == 3 || magnitude == 5 || magnitude == 9) {
+    int scale = magnitude == 3 ? 2 : (magnitude == 5 ? 4 : 8);
+    *handled_out = 1;
+    return binary_emit_lea_reg_base_index_scale_disp(
+               &context->code, target_register, target_register,
+               target_register, scale, 0) &&
+           (!negate || binary_emit_neg_reg(&context->code, target_register));
+  }
+
+  for (unsigned char shift = 4; shift < 63; shift++) {
+    unsigned long long power = 1ull << shift;
+    int add_original = 0;
+    if (magnitude == power + 1ull) {
+      add_original = 1;
+    } else if (magnitude != power - 1ull) {
+      continue;
+    }
+
+    *handled_out = 1;
+    if (!binary_emit_mov_reg_reg(&context->code, scratch, target_register) ||
+        !binary_emit_shift_reg_imm8(&context->code, 4, target_register,
+                                    shift)) {
+      return 0;
+    }
+
+    if (add_original) {
+      if (!binary_emit_lea_reg_reg(&context->code, target_register,
+                                   target_register, scratch) &&
+          !binary_emit_alu_reg_reg(&context->code, 0x01, target_register,
+                                   scratch)) {
+        return 0;
+      }
+    } else if (!binary_emit_alu_reg_reg(&context->code, 0x29, target_register,
+                                        scratch)) {
+      return 0;
+    }
+
+    return !negate || binary_emit_neg_reg(&context->code, target_register);
+  }
+
+  return 1;
+}
+
+/* Unsigned division-by-constant magic (Hacker's Delight Fig. 10-2, 64-bit).
+ * Produces (magic, shift, add) such that n/d == ((n*magic)>>64 corrected)>>shift,
+ * where `add` signals the overflow-correction path is needed. Returns 0 to
+ * decline (divisor out of range), 1 on success. */
+static int binary_unsigned_divisor_magic(unsigned long long divisor,
+                                          unsigned long long *magic_out,
+                                          unsigned char *shift_out,
+                                          int *add_out) {
+  typedef unsigned __int128 BinaryU128;
+
+  if (!magic_out || !shift_out || !add_out || divisor < 2) {
+    return 0;
+  }
+
+  BinaryU128 d = (BinaryU128)divisor;
+  BinaryU128 two64 = (BinaryU128)1 << 64;
+  BinaryU128 nc = two64 - 1 - (two64 - d) % d; /* largest n with n%d == d-1, mod 2^64 */
+  BinaryU128 q1 = (two64 >> 1) / nc;           /* 2^63 / nc */
+  BinaryU128 r1 = (two64 >> 1) - q1 * nc;
+  BinaryU128 q2 = ((two64 >> 1) - 1) / d;      /* (2^63 - 1) / d */
+  BinaryU128 r2 = ((two64 >> 1) - 1) - q2 * d;
+  unsigned int p = 63;
+  int add = 0;
+
+  for (;;) {
+    BinaryU128 delta;
+    p++;
+
+    if (r1 >= nc - r1) {
+      q1 = 2 * q1 + 1;
+      r1 = 2 * r1 - nc;
+    } else {
+      q1 = 2 * q1;
+      r1 = 2 * r1;
+    }
+
+    if (r2 + 1 >= d - r2) {
+      if (q2 >= ((two64 >> 1) - 1)) {
+        add = 1;
+      }
+      q2 = 2 * q2 + 1;
+      r2 = 2 * r2 + 1 - d;
+    } else {
+      if (q2 >= (two64 >> 1)) {
+        add = 1;
+      }
+      q2 = 2 * q2;
+      r2 = 2 * r2 + 1;
+    }
+
+    delta = d - 1 - r2;
+    if (p >= 128 || !(q1 < delta || (q1 == delta && r1 == 0))) {
+      break;
+    }
+  }
+
+  *magic_out = (unsigned long long)(q2 + 1);
+  *shift_out = (unsigned char)(p - 64);
+  *add_out = add;
+  return 1;
+}
+
+/* Emit unsigned n/d or n%d for a constant divisor d, with n already in RAX.
+ * Mirrors the signed variant but uses MUL (high half) and the add-correction
+ * sequence when the multiplier overflows 64 bits. Sets *handled_out=1 on
+ * success. RAX/RCX/RDX/R10/R11 are scratch; final result lands in RAX. */
+int code_generator_binary_try_emit_unsigned_const_divmod(
+    BinaryFunctionContext *context, const char *op, unsigned long long divisor,
+    int *handled_out) {
+  unsigned long long magic = 0;
+  unsigned char shift = 0;
+  int add = 0;
+
+  if (handled_out) {
+    *handled_out = 0;
+  }
+  if (!context || !op || !handled_out) {
+    return 0;
+  }
+  if ((strcmp(op, "/") != 0 && strcmp(op, "%") != 0) ||
+      !binary_unsigned_divisor_magic(divisor, &magic, &shift, &add)) {
+    return 1;
+  }
+
+  *handled_out = 1;
+  /* R11 = n (preserved for the remainder and add-correction). RAX*R10 -> RDX:RAX,
+   * the quotient estimate is in RDX. */
+  if (!binary_emit_mov_reg_reg(&context->code, BINARY_GP_R11, BINARY_GP_RAX) ||
+      !binary_emit_mov_reg_imm64(&context->code, BINARY_GP_R10, magic) ||
+      !binary_emit_mul_reg(&context->code, BINARY_GP_R10)) {
+    return 0;
+  }
+
+  if (!add) {
+    /* q = high >> shift. */
+    if (shift != 0 &&
+        !binary_emit_shift_reg_imm8(&context->code, 5, BINARY_GP_RDX, shift)) {
+      return 0;
+    }
+    if (!binary_emit_mov_reg_reg(&context->code, BINARY_GP_RAX,
+                                 BINARY_GP_RDX)) {
+      return 0;
+    }
+  } else {
+    /* t = high; q = ((n - t) >> 1 + t) >> (shift - 1).  (shift >= 1 here) */
+    if (!binary_emit_mov_reg_reg(&context->code, BINARY_GP_RAX, BINARY_GP_R11) ||
+        !binary_emit_alu_reg_reg(&context->code, 0x29, BINARY_GP_RAX,
+                                 BINARY_GP_RDX) ||            /* RAX = n - t */
+        !binary_emit_shift_reg_imm8(&context->code, 5, BINARY_GP_RAX, 1) ||
+        !binary_emit_alu_reg_reg(&context->code, 0x01, BINARY_GP_RAX,
+                                 BINARY_GP_RDX)) {            /* RAX += t */
+      return 0;
+    }
+    if (shift > 1 &&
+        !binary_emit_shift_reg_imm8(&context->code, 5, BINARY_GP_RAX,
+                                    (unsigned char)(shift - 1))) {
+      return 0;
+    }
+  }
+
+  /* RAX now holds the quotient. For modulo, r = n - q*d. */
+  if (strcmp(op, "%") == 0) {
+    if (!binary_emit_mov_reg_imm64(&context->code, BINARY_GP_R10, divisor) ||
+        !binary_emit_imul_reg_reg(&context->code, BINARY_GP_RAX,
+                                  BINARY_GP_R10) ||           /* RAX = q*d (low 64) */
+        !binary_emit_mov_reg_reg(&context->code, BINARY_GP_R10, BINARY_GP_R11) ||
+        !binary_emit_alu_reg_reg(&context->code, 0x29, BINARY_GP_R10,
+                                 BINARY_GP_RAX) ||            /* R10 = n - q*d */
+        !binary_emit_mov_reg_reg(&context->code, BINARY_GP_RAX,
+                                 BINARY_GP_R10)) {
+      return 0;
+    }
+  }
+
+  return 1;
+}
+
+static int binary_signed_divisor_magic(long long divisor, long long *magic_out,
+                                       unsigned char *shift_out) {
+  typedef unsigned __int128 BinaryU128;
+
+  if (!magic_out || !shift_out || divisor <= 1 || divisor > INT32_MAX) {
+    return 0;
+  }
+
+  BinaryU128 ad = (BinaryU128)(unsigned long long)divisor;
+  BinaryU128 two63 = (BinaryU128)1 << 63;
+  BinaryU128 anc = two63 - 1 - ((two63 - 1) % ad);
+  BinaryU128 q1 = two63 / anc;
+  BinaryU128 r1 = two63 - q1 * anc;
+  BinaryU128 q2 = two63 / ad;
+  BinaryU128 r2 = two63 - q2 * ad;
+  unsigned int p = 63;
+
+  for (;;) {
+    BinaryU128 delta;
+    p++;
+
+    q1 *= 2;
+    r1 *= 2;
+    if (r1 >= anc) {
+      q1++;
+      r1 -= anc;
+    }
+
+    q2 *= 2;
+    r2 *= 2;
+    if (r2 >= ad) {
+      q2++;
+      r2 -= ad;
+    }
+
+    delta = ad - r2;
+    if (q1 > delta || (q1 == delta && r1 != 0)) {
+      break;
+    }
+  }
+
+  *magic_out = (long long)(unsigned long long)(q2 + 1);
+  *shift_out = (unsigned char)(p - 64);
+  return 1;
+}
+
+int code_generator_binary_try_emit_signed_const_divmod(
+    BinaryFunctionContext *context, const char *op, long long divisor,
+    int *handled_out) {
+  long long magic = 0;
+  unsigned char shift = 0;
+
+  if (handled_out) {
+    *handled_out = 0;
+  }
+  if (!context || !op || !handled_out) {
+    return 0;
+  }
+  if ((strcmp(op, "/") != 0 && strcmp(op, "%") != 0) ||
+      !binary_signed_divisor_magic(divisor, &magic, &shift)) {
+    return 1;
+  }
+
+  *handled_out = 1;
+  if (!binary_emit_mov_reg_reg(&context->code, BINARY_GP_R11, BINARY_GP_RAX) ||
+      !binary_emit_mov_reg_imm64(&context->code, BINARY_GP_R10,
+                                 (uint64_t)magic) ||
+      !binary_emit_imul_reg(&context->code, BINARY_GP_R10) ||
+      !binary_emit_mov_reg_reg(&context->code, BINARY_GP_RAX,
+                               BINARY_GP_RDX)) {
+    return 0;
+  }
+
+  if (magic < 0 &&
+      !binary_emit_alu_reg_reg(&context->code, 0x01, BINARY_GP_RAX,
+                               BINARY_GP_R11)) {
+    return 0;
+  }
+  if (shift != 0 &&
+      !binary_emit_shift_reg_imm8(&context->code, 7, BINARY_GP_RAX, shift)) {
+    return 0;
+  }
+  if (!binary_emit_mov_reg_reg(&context->code, BINARY_GP_RCX, BINARY_GP_R11) ||
+      !binary_emit_shift_reg_imm8(&context->code, 7, BINARY_GP_RCX, 63) ||
+      !binary_emit_alu_reg_reg(&context->code, 0x29, BINARY_GP_RAX,
+                               BINARY_GP_RCX)) {
+    return 0;
+  }
+
+  if (strcmp(op, "%") == 0) {
+    if (!binary_emit_imul_reg_reg_imm32(&context->code, BINARY_GP_RAX,
+                                        BINARY_GP_RAX,
+                                        (uint32_t)(int32_t)divisor) ||
+        !binary_emit_alu_reg_reg(&context->code, 0x29, BINARY_GP_R11,
+                                 BINARY_GP_RAX) ||
+        !binary_emit_mov_reg_reg(&context->code, BINARY_GP_RAX,
+                                 BINARY_GP_R11)) {
+      return 0;
+    }
+  }
+
+  return 1;
+}
+
 int code_generator_binary_emit_integer_binary_to_rax(
     CodeGenerator *generator, BinaryFunctionContext *context,
     const IRInstruction *instruction) {
@@ -421,6 +751,57 @@ int code_generator_binary_emit_integer_binary_to_rax(
       }
       return 1;
     }
+
+    /* Signedness of the division is the dividend's type. The signed magic and
+     * the unsigned magic are distinct algorithms; picking the wrong one
+     * silently miscompiles high-bit-set values, so only take the unsigned path
+     * when the dividend type is provably unsigned. A divisor that fits in a
+     * signed 64-bit value is required for the unsigned multiplier math here. */
+    Type *dividend_type = code_generator_binary_get_operand_type_in_context(
+        generator, context, &instruction->lhs);
+    int dividend_unsigned =
+        dividend_type &&
+        (dividend_type->kind == TYPE_UINT8 ||
+         dividend_type->kind == TYPE_UINT16 ||
+         dividend_type->kind == TYPE_UINT32 ||
+         dividend_type->kind == TYPE_UINT64);
+
+    int handled = 0;
+    if (!code_generator_binary_emit_operand_load(generator, context,
+                                                 &instruction->lhs,
+                                                 BINARY_GP_RAX)) {
+      code_generator_set_error(
+          generator,
+          "Out of memory while emitting integer expression chain in function "
+          "'%s'",
+          context->function_name);
+      return 0;
+    }
+    if (dividend_unsigned && instruction->rhs.int_value >= 2) {
+      if (!code_generator_binary_try_emit_unsigned_const_divmod(
+              context, op, (unsigned long long)instruction->rhs.int_value,
+              &handled)) {
+        code_generator_set_error(
+            generator,
+            "Out of memory while emitting integer expression chain in function "
+            "'%s'",
+            context->function_name);
+        return 0;
+      }
+    } else if (!dividend_unsigned) {
+      if (!code_generator_binary_try_emit_signed_const_divmod(
+              context, op, instruction->rhs.int_value, &handled)) {
+        code_generator_set_error(
+            generator,
+            "Out of memory while emitting integer expression chain in function "
+            "'%s'",
+            context->function_name);
+        return 0;
+      }
+    }
+    if (handled) {
+      return 1;
+    }
   }
 
   if (instruction->rhs.kind == IR_OPERAND_INT &&
@@ -451,6 +832,14 @@ int code_generator_binary_emit_integer_binary_to_rax(
                                        (uint32_t)(int32_t)immediate);
     }
     if (strcmp(op, "*") == 0) {
+      int handled = 0;
+      if (!code_generator_binary_try_emit_reg_multiply_immediate(
+              context, BINARY_GP_RAX, immediate, &handled)) {
+        return 0;
+      }
+      if (handled) {
+        return 1;
+      }
       return binary_emit_imul_reg_reg_imm32(&context->code, BINARY_GP_RAX,
                                             BINARY_GP_RAX,
                                             (uint32_t)(int32_t)immediate);
@@ -493,6 +882,14 @@ int code_generator_binary_emit_integer_binary_to_rax(
                                        (uint32_t)(int32_t)immediate);
     }
     if (strcmp(op, "*") == 0) {
+      int handled = 0;
+      if (!code_generator_binary_try_emit_reg_multiply_immediate(
+              context, BINARY_GP_RAX, immediate, &handled)) {
+        return 0;
+      }
+      if (handled) {
+        return 1;
+      }
       return binary_emit_imul_reg_reg_imm32(&context->code, BINARY_GP_RAX,
                                             BINARY_GP_RAX,
                                             (uint32_t)(int32_t)immediate);
@@ -1498,20 +1895,280 @@ int code_generator_binary_try_skip_scaled_address_shift(
   return 1;
 }
 
-int code_generator_binary_emit_scaled_address_to_rax(
+int code_generator_binary_emit_scaled_address_to_rax_disp(
     CodeGenerator *generator, BinaryFunctionContext *context,
-    const IROperand *base, const IROperand *index, int scale) {
+    const IROperand *base, const IROperand *index, int scale, int displacement) {
+  BinaryGpRegister base_reg = BINARY_GP_RAX;
+  BinaryGpRegister index_reg = BINARY_GP_R10;
+  BinaryGpRegister promoted = BINARY_GP_RAX;
+  int base_in_register = 0;
+  int index_in_register = 0;
+
   if (!generator || !context || !base || !index) {
     return 0;
   }
 
-  return code_generator_binary_emit_operand_load(generator, context, index,
-                                                 BINARY_GP_R10) &&
-         code_generator_binary_emit_operand_load(generator, context, base,
-                                                 BINARY_GP_RAX) &&
-         binary_emit_lea_reg_base_index_scale_disp(
-             &context->code, BINARY_GP_RAX, BINARY_GP_RAX, BINARY_GP_R10,
-             scale, 0);
+  /* When base/index are symbols already living in a promoted register, feed
+   * that register straight into the lea instead of copying it through RAX/R10.
+   * symbol_assigned_register only ever reports Win64 non-volatile registers
+   * (the R12-R15/RBX/RSI/RDI promotion pool), none of which alias the RAX
+   * destination or the R10 index scratch, so the survivors can't be clobbered.
+   * This drops a redundant `mov` per fused array access — the dominant overhead
+   * in tight indexing loops like matmul's inner kernel where the base pointer
+   * and induction index are both promoted. */
+  if (base->kind == IR_OPERAND_SYMBOL && base->name &&
+      code_generator_binary_symbol_assigned_register(generator, context,
+                                                     base->name, &promoted)) {
+    base_reg = promoted;
+    base_in_register = 1;
+  }
+  if (index->kind == IR_OPERAND_SYMBOL && index->name &&
+      code_generator_binary_symbol_assigned_register(generator, context,
+                                                     index->name, &promoted)) {
+    index_reg = promoted;
+    index_in_register = 1;
+  }
+
+  /* Materialize only the operands that are not already in a register. Load the
+   * index into R10 first, then the base into RAX, mirroring the original order
+   * so a non-promoted base load cannot disturb an already-loaded index. */
+  if (!index_in_register &&
+      !code_generator_binary_emit_operand_load(generator, context, index,
+                                               BINARY_GP_R10)) {
+    return 0;
+  }
+  if (!base_in_register &&
+      !code_generator_binary_emit_operand_load(generator, context, base,
+                                               BINARY_GP_RAX)) {
+    return 0;
+  }
+
+  return binary_emit_lea_reg_base_index_scale_disp(
+      &context->code, BINARY_GP_RAX, base_reg, index_reg, scale, displacement);
+}
+
+int code_generator_binary_emit_scaled_address_to_rax(
+    CodeGenerator *generator, BinaryFunctionContext *context,
+    const IROperand *base, const IROperand *index, int scale) {
+  return code_generator_binary_emit_scaled_address_to_rax_disp(
+      generator, context, base, index, scale, 0);
+}
+
+/* Match `Td = sym +/- C ; Ts = Td << k ; Ta = base + Ts ; <mem via Ta>` —
+ * an array access at a constant element offset from a symbol index, e.g.
+ * `arr[i + 3]` or matmul's `c[c_idx + 1]` (and the b0_idx+{1,2,3} accesses
+ * once the congruent-IV pass rewrites them). The constant element offset folds
+ * into the x86 address displacement (C * scale), so the whole thing collapses
+ * to a single `lea/mov [base + sym*scale + disp]` with no separate add.
+ *
+ * Returns 1 and fills base/index(sym)/scale/displacement when the four
+ * instructions at `instruction_index` form this shape. Safety mirrors the
+ * other scaled folds: the index is re-read from `sym`'s home, so `sym` must be
+ * a SYMBOL (always materialized), and each intermediate temp must be single-use
+ * so consuming the quartet drops no other consumer. */
+int code_generator_binary_try_match_offset_scaled_address(
+    const IRFunction *function, size_t instruction_index,
+    const IRInstruction **mem_out, const IROperand **base_out,
+    const IROperand **index_out, int *scale_out, int *displacement_out) {
+  const IRInstruction *offset_add = NULL;
+  const IRInstruction *shift = NULL;
+  const IRInstruction *address = NULL;
+  const IROperand *sym = NULL;
+  long long offset_const = 0;
+  int scale = 0;
+
+  if (!function || !mem_out || !base_out || !index_out || !scale_out ||
+      !displacement_out || instruction_index + 3 >= function->instruction_count) {
+    return 0;
+  }
+
+  offset_add = &function->instructions[instruction_index];
+  shift = &function->instructions[instruction_index + 1];
+  address = &function->instructions[instruction_index + 2];
+
+  /* offset_add: Td = sym + C  (or C + sym); Td a single-use temp. */
+  if (!offset_add || offset_add->op != IR_OP_BINARY || offset_add->is_float ||
+      !offset_add->text || strcmp(offset_add->text, "+") != 0 ||
+      offset_add->dest.kind != IR_OPERAND_TEMP || !offset_add->dest.name) {
+    return 0;
+  }
+  if (offset_add->lhs.kind == IR_OPERAND_SYMBOL && offset_add->lhs.name &&
+      offset_add->rhs.kind == IR_OPERAND_INT) {
+    sym = &offset_add->lhs;
+    offset_const = offset_add->rhs.int_value;
+  } else if (offset_add->rhs.kind == IR_OPERAND_SYMBOL && offset_add->rhs.name &&
+             offset_add->lhs.kind == IR_OPERAND_INT) {
+    sym = &offset_add->rhs;
+    offset_const = offset_add->lhs.int_value;
+  } else {
+    return 0;
+  }
+  if (code_generator_binary_function_temp_use_count(
+          function, offset_add->dest.name) != 1) {
+    return 0;
+  }
+
+  /* shift: Ts = Td << k  (scale = 1<<k); single-use, fed by offset_add. */
+  if (!shift || shift->dest.kind != IR_OPERAND_TEMP || !shift->dest.name ||
+      !code_generator_binary_operand_uses_temp(&shift->lhs,
+                                               offset_add->dest.name) ||
+      !code_generator_binary_shift_scale(shift, &scale) ||
+      code_generator_binary_function_temp_use_count(function,
+                                                    shift->dest.name) != 1) {
+    return 0;
+  }
+
+  /* address: Ta = base + Ts (or Ts + base); single-use, base not an immediate. */
+  if (!address || address->op != IR_OP_BINARY || address->is_float ||
+      !address->text || strcmp(address->text, "+") != 0 ||
+      address->dest.kind != IR_OPERAND_TEMP || !address->dest.name ||
+      code_generator_binary_function_temp_use_count(
+          function, address->dest.name) != 1) {
+    return 0;
+  }
+  if (code_generator_binary_operand_uses_temp(&address->lhs,
+                                              shift->dest.name) &&
+      address->rhs.kind != IR_OPERAND_INT) {
+    *base_out = &address->rhs;
+  } else if (code_generator_binary_operand_uses_temp(&address->rhs,
+                                                     shift->dest.name) &&
+             address->lhs.kind != IR_OPERAND_INT) {
+    *base_out = &address->lhs;
+  } else {
+    return 0;
+  }
+
+  /* Displacement = C * scale, must fit a signed 32-bit lea displacement. */
+  {
+    long long disp = offset_const * (long long)scale;
+    if (disp < INT32_MIN || disp > INT32_MAX) {
+      return 0;
+    }
+    *displacement_out = (int)disp;
+  }
+
+  *mem_out = address;
+  *index_out = sym;
+  *scale_out = scale;
+  return 1;
+}
+
+int code_generator_binary_try_emit_offset_scaled_address_load(
+    CodeGenerator *generator, BinaryFunctionContext *context,
+    const IRFunction *function, size_t instruction_index,
+    size_t *consumed_out) {
+  const IRInstruction *address = NULL;
+  const IRInstruction *load = NULL;
+  const IROperand *base = NULL;
+  const IROperand *index = NULL;
+  int scale = 0;
+  int displacement = 0;
+  int size = 0;
+
+  if (consumed_out) {
+    *consumed_out = 0;
+  }
+  if (!generator || !context || !function || !consumed_out ||
+      instruction_index + 3 >= function->instruction_count ||
+      !code_generator_binary_try_match_offset_scaled_address(
+          function, instruction_index, &address, &base, &index, &scale,
+          &displacement)) {
+    return 0;
+  }
+
+  load = &function->instructions[instruction_index + 3];
+  if (!load || load->op != IR_OP_LOAD ||
+      !code_generator_binary_operand_uses_temp(&load->lhs, address->dest.name)) {
+    return 0;
+  }
+
+  size = code_generator_binary_get_access_size(generator, context, &load->rhs);
+  if (size <= 0) {
+    return 0;
+  }
+
+  if (!code_generator_binary_emit_scaled_address_to_rax_disp(
+          generator, context, base, index, scale, displacement) ||
+      !code_generator_binary_emit_load_from_address(generator, context,
+                                                    BINARY_GP_RAX, size,
+                                                    BINARY_GP_RAX)) {
+    return 0;
+  }
+  if (size == 4 && !load->is_float &&
+      code_generator_binary_load_needs_sign_extend(generator, context,
+                                                   &load->dest, size) &&
+      !binary_emit_movsxd_rax_eax(&context->code)) {
+    return 0;
+  }
+  if (!code_generator_binary_emit_destination_store(generator, context,
+                                                    &load->dest,
+                                                    BINARY_GP_RAX)) {
+    return 0;
+  }
+
+  *consumed_out = 4;
+  return 1;
+}
+
+int code_generator_binary_try_emit_offset_scaled_address_store(
+    CodeGenerator *generator, BinaryFunctionContext *context,
+    const IRFunction *function, size_t instruction_index,
+    size_t *consumed_out) {
+  const IRInstruction *address = NULL;
+  const IRInstruction *store = NULL;
+  const IROperand *base = NULL;
+  const IROperand *index = NULL;
+  int scale = 0;
+  int displacement = 0;
+  int size = 0;
+
+  if (consumed_out) {
+    *consumed_out = 0;
+  }
+  if (!generator || !context || !function || !consumed_out ||
+      instruction_index + 3 >= function->instruction_count ||
+      !code_generator_binary_try_match_offset_scaled_address(
+          function, instruction_index, &address, &base, &index, &scale,
+          &displacement)) {
+    return 0;
+  }
+
+  store = &function->instructions[instruction_index + 3];
+  if (!store || store->op != IR_OP_STORE ||
+      !code_generator_binary_operand_uses_temp(&store->dest,
+                                               address->dest.name)) {
+    return 0;
+  }
+
+  size = code_generator_binary_get_access_size(generator, context, &store->rhs);
+  if (size <= 0) {
+    return 0;
+  }
+
+  if (!code_generator_binary_emit_operand_load(generator, context, &store->lhs,
+                                               BINARY_GP_STORE_VALUE)) {
+    return 0;
+  }
+  if (store->is_float && store->float_bits) {
+    int value_bits = code_generator_binary_operand_float_bits(
+        generator, context, &store->lhs);
+    if (value_bits &&
+        !code_generator_binary_emit_float_reg_convert(
+            context, BINARY_GP_STORE_VALUE, value_bits, store->float_bits)) {
+      return 0;
+    }
+  }
+
+  if (!code_generator_binary_emit_scaled_address_to_rax_disp(
+          generator, context, base, index, scale, displacement) ||
+      !code_generator_binary_emit_store_to_address(generator, context,
+                                                   BINARY_GP_RAX, size,
+                                                   BINARY_GP_STORE_VALUE)) {
+    return 0;
+  }
+
+  *consumed_out = 4;
+  return 1;
 }
 
 int code_generator_binary_try_emit_scaled_address_load(
@@ -1734,6 +2391,14 @@ int code_generator_binary_emit_rax_binary_rhs(
                                        (uint32_t)(int32_t)immediate);
     }
     if (strcmp(op, "*") == 0) {
+      int handled = 0;
+      if (!code_generator_binary_try_emit_reg_multiply_immediate(
+              context, BINARY_GP_RAX, immediate, &handled)) {
+        return 0;
+      }
+      if (handled) {
+        return 1;
+      }
       return binary_emit_imul_reg_reg_imm32(&context->code, BINARY_GP_RAX,
                                             BINARY_GP_RAX,
                                             (uint32_t)(int32_t)immediate);
@@ -1871,5 +2536,305 @@ int code_generator_binary_try_emit_binary_expression_chain(
   }
 
   *consumed_out = 2;
+  return 1;
+}
+
+static int code_generator_binary_float_chain_operator_supported(
+    const char *op) {
+  return op && (strcmp(op, "+") == 0 || strcmp(op, "-") == 0 ||
+                strcmp(op, "*") == 0 || strcmp(op, "/") == 0);
+}
+
+static size_t code_generator_binary_next_float_chain_index(
+    const IRFunction *function, size_t index) {
+  if (!function || index >= function->instruction_count) {
+    return function ? function->instruction_count : 0;
+  }
+
+  index++;
+  while (index < function->instruction_count) {
+    const IRInstruction *instruction = &function->instructions[index];
+    if (instruction->op != IR_OP_NOP &&
+        instruction->op != IR_OP_DECLARE_LOCAL) {
+      break;
+    }
+    index++;
+  }
+  return index;
+}
+
+static int code_generator_binary_emit_xmm_float_op(BinaryCodeBuffer *code,
+                                                   const char *op, int fbits,
+                                                   BinaryXmmRegister dst,
+                                                   BinaryXmmRegister src) {
+  if (!code || !op) {
+    return 0;
+  }
+  if (strcmp(op, "+") == 0) {
+    return fbits == 32 ? binary_emit_addss_xmm_xmm(code, dst, src)
+                       : binary_emit_addsd_xmm_xmm(code, dst, src);
+  }
+  if (strcmp(op, "-") == 0) {
+    return fbits == 32 ? binary_emit_subss_xmm_xmm(code, dst, src)
+                       : binary_emit_subsd_xmm_xmm(code, dst, src);
+  }
+  if (strcmp(op, "*") == 0) {
+    return fbits == 32 ? binary_emit_mulss_xmm_xmm(code, dst, src)
+                       : binary_emit_mulsd_xmm_xmm(code, dst, src);
+  }
+  if (strcmp(op, "/") == 0) {
+    return fbits == 32 ? binary_emit_divss_xmm_xmm(code, dst, src)
+                       : binary_emit_divsd_xmm_xmm(code, dst, src);
+  }
+  return 0;
+}
+
+int code_generator_binary_try_emit_float_binary_expression_chain(
+    CodeGenerator *generator, BinaryFunctionContext *context,
+    const IRFunction *function, size_t instruction_index,
+    size_t *consumed_out) {
+  const IRInstruction *producer = NULL;
+  const IRInstruction *consumer = NULL;
+  const IROperand *consumer_rhs = NULL;
+  int fbits = 64;
+
+  if (consumed_out) {
+    *consumed_out = 0;
+  }
+  if (!generator || !context || !function || !consumed_out ||
+      instruction_index + 1 >= function->instruction_count) {
+    return 0;
+  }
+
+  producer = &function->instructions[instruction_index];
+  consumer = &function->instructions[instruction_index + 1];
+  if (!producer || producer->op != IR_OP_BINARY || !producer->is_float ||
+      !code_generator_binary_float_chain_operator_supported(producer->text) ||
+      producer->dest.kind != IR_OPERAND_TEMP || !producer->dest.name ||
+      !consumer || consumer->op != IR_OP_BINARY || !consumer->is_float ||
+      !code_generator_binary_float_chain_operator_supported(consumer->text) ||
+      code_generator_binary_function_temp_use_count(function,
+                                                    producer->dest.name) != 1) {
+    return 0;
+  }
+
+  fbits = (producer->float_bits == 32) ? 32 : 64;
+  if (((consumer->float_bits == 32) ? 32 : 64) != fbits) {
+    return 0;
+  }
+
+  if (code_generator_binary_operand_uses_temp(&consumer->lhs,
+                                              producer->dest.name)) {
+    consumer_rhs = &consumer->rhs;
+  } else if ((strcmp(consumer->text, "+") == 0 ||
+              strcmp(consumer->text, "*") == 0) &&
+             code_generator_binary_operand_uses_temp(&consumer->rhs,
+                                                     producer->dest.name)) {
+    consumer_rhs = &consumer->lhs;
+  } else {
+    return 0;
+  }
+
+  if (!code_generator_binary_emit_float_operand_to_xmm_bits(
+          generator, context, &producer->rhs, BINARY_XMM1, fbits) ||
+      !code_generator_binary_emit_float_operand_to_xmm_bits(
+          generator, context, &producer->lhs, BINARY_XMM0, fbits) ||
+      !code_generator_binary_emit_xmm_float_op(&context->code, producer->text,
+                                               fbits, BINARY_XMM0,
+                                               BINARY_XMM1) ||
+      !code_generator_binary_emit_float_operand_to_xmm_bits(
+          generator, context, consumer_rhs, BINARY_XMM1, fbits) ||
+      !code_generator_binary_emit_xmm_float_op(&context->code, consumer->text,
+                                               fbits, BINARY_XMM0,
+                                               BINARY_XMM1)) {
+    if (!generator->has_error) {
+      code_generator_set_error(
+          generator,
+          "Failed to emit chained float expression in function '%s'",
+          context->function_name);
+    }
+    return 0;
+  }
+
+  if (!((fbits == 32)
+            ? binary_emit_movd_reg_xmm(&context->code, BINARY_GP_RAX,
+                                       BINARY_XMM0)
+            : binary_emit_movq_reg_xmm(&context->code, BINARY_GP_RAX,
+                                       BINARY_XMM0)) ||
+      !code_generator_binary_emit_destination_store(generator, context,
+                                                    &consumer->dest,
+                                                    BINARY_GP_RAX)) {
+    return 0;
+  }
+
+  *consumed_out = 2;
+  return 1;
+}
+
+int code_generator_binary_try_emit_float_cast_binary_chain(
+    CodeGenerator *generator, BinaryFunctionContext *context,
+    const IRFunction *function, size_t instruction_index,
+    size_t *consumed_out) {
+  const IRInstruction *cast = NULL;
+  const IRInstruction *consumer = NULL;
+  const IRInstruction *next = NULL;
+  const IROperand *consumer_rhs = NULL;
+  const IROperand *next_rhs = NULL;
+  const IROperand *final_dest = NULL;
+  size_t consumer_index = 0;
+  size_t final_index = 0;
+  size_t next_index = 0;
+  int fbits = 64;
+  int has_next = 0;
+  int next_temp_is_rhs = 0;
+  BinaryXmmRegister result_register = BINARY_XMM0;
+
+  if (consumed_out) {
+    *consumed_out = 0;
+  }
+  if (!generator || !context || !function || !consumed_out ||
+      instruction_index + 1 >= function->instruction_count) {
+    return 0;
+  }
+
+  cast = &function->instructions[instruction_index];
+  consumer_index =
+      code_generator_binary_next_float_chain_index(function, instruction_index);
+  if (consumer_index >= function->instruction_count) {
+    return 0;
+  }
+  consumer = &function->instructions[consumer_index];
+  if (!cast || cast->op != IR_OP_CAST || cast->is_float || !cast->text ||
+      (strcmp(cast->text, "float32") != 0 &&
+       strcmp(cast->text, "float64") != 0) ||
+      cast->dest.kind != IR_OPERAND_TEMP || !cast->dest.name ||
+      !consumer || consumer->op != IR_OP_BINARY || !consumer->is_float ||
+      !code_generator_binary_float_chain_operator_supported(consumer->text) ||
+      code_generator_binary_function_temp_use_count(function,
+                                                    cast->dest.name) != 1) {
+    return 0;
+  }
+
+  fbits = strcmp(cast->text, "float32") == 0 ? 32 : 64;
+  if (((consumer->float_bits == 32) ? 32 : 64) != fbits) {
+    return 0;
+  }
+
+  if (code_generator_binary_operand_uses_temp(&consumer->lhs,
+                                              cast->dest.name)) {
+    consumer_rhs = &consumer->rhs;
+  } else if ((strcmp(consumer->text, "+") == 0 ||
+              strcmp(consumer->text, "*") == 0) &&
+             code_generator_binary_operand_uses_temp(&consumer->rhs,
+                                                     cast->dest.name)) {
+    consumer_rhs = &consumer->lhs;
+  } else {
+    return 0;
+  }
+
+  final_dest = &consumer->dest;
+  final_index = consumer_index;
+  if (consumer->dest.kind == IR_OPERAND_TEMP && consumer->dest.name &&
+      code_generator_binary_function_temp_use_count(function,
+                                                    consumer->dest.name) == 1 &&
+      consumer_index + 1 < function->instruction_count) {
+    next_index =
+        code_generator_binary_next_float_chain_index(function, consumer_index);
+    if (next_index >= function->instruction_count) {
+      next = NULL;
+    } else {
+      next = &function->instructions[next_index];
+    }
+    if (next && next->op == IR_OP_BINARY && next->is_float &&
+        code_generator_binary_float_chain_operator_supported(next->text) &&
+        ((next->float_bits == 32) ? 32 : 64) == fbits) {
+      if (code_generator_binary_operand_uses_temp(&next->lhs,
+                                                  consumer->dest.name)) {
+        next_rhs = &next->rhs;
+      } else if ((strcmp(next->text, "+") == 0 ||
+                  strcmp(next->text, "*") == 0) &&
+                 code_generator_binary_operand_uses_temp(&next->rhs,
+                                                         consumer->dest.name)) {
+        next_rhs = &next->lhs;
+      } else if ((strcmp(next->text, "-") == 0 ||
+                  strcmp(next->text, "/") == 0) &&
+                 code_generator_binary_operand_uses_temp(&next->rhs,
+                                                         consumer->dest.name)) {
+        next_rhs = &next->lhs;
+        next_temp_is_rhs = 1;
+      }
+      if (next_rhs) {
+        has_next = 1;
+        final_dest = &next->dest;
+        final_index = next_index;
+      }
+    }
+  }
+
+  if (!code_generator_binary_emit_operand_load(generator, context, &cast->lhs,
+                                               BINARY_GP_RAX) ||
+      !((fbits == 32)
+            ? binary_emit_cvtsi2ss_xmm_reg(&context->code, BINARY_XMM0,
+                                           BINARY_GP_RAX)
+            : binary_emit_cvtsi2sd_xmm_reg(&context->code, BINARY_XMM0,
+                                           BINARY_GP_RAX)) ||
+      !code_generator_binary_emit_float_operand_to_xmm_bits(
+          generator, context, consumer_rhs, BINARY_XMM1, fbits) ||
+      !code_generator_binary_emit_xmm_float_op(&context->code, consumer->text,
+                                               fbits, BINARY_XMM0,
+                                               BINARY_XMM1)) {
+    if (!generator->has_error) {
+      code_generator_set_error(
+          generator,
+          "Failed to emit chained int-to-float expression in function '%s'",
+          context->function_name);
+    }
+    return 0;
+  }
+
+  if (has_next) {
+    if (!code_generator_binary_emit_float_operand_to_xmm_bits(
+            generator, context, next_rhs, BINARY_XMM1, fbits)) {
+      if (!generator->has_error) {
+        code_generator_set_error(
+            generator,
+            "Failed to emit extended chained int-to-float expression in "
+            "function '%s'",
+            context->function_name);
+      }
+      return 0;
+    }
+    if (next_temp_is_rhs) {
+      if (!code_generator_binary_emit_xmm_float_op(&context->code, next->text,
+                                                   fbits, BINARY_XMM1,
+                                                   BINARY_XMM0)) {
+        return 0;
+      }
+      result_register = BINARY_XMM1;
+    } else if (!code_generator_binary_emit_xmm_float_op(
+                   &context->code, next->text, fbits, BINARY_XMM0,
+                   BINARY_XMM1)) {
+      if (!generator->has_error) {
+        code_generator_set_error(
+            generator,
+            "Failed to emit extended chained int-to-float expression in "
+            "function '%s'",
+            context->function_name);
+      }
+      return 0;
+    }
+  }
+
+  if (!((fbits == 32)
+            ? binary_emit_movd_reg_xmm(&context->code, BINARY_GP_RAX,
+                                       result_register)
+            : binary_emit_movq_reg_xmm(&context->code, BINARY_GP_RAX,
+                                       result_register)) ||
+      !code_generator_binary_emit_destination_store(generator, context,
+                                                    final_dest, BINARY_GP_RAX)) {
+    return 0;
+  }
+
+  *consumed_out = final_index - instruction_index + 1;
   return 1;
 }

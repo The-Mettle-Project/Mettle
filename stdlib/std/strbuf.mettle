@@ -1,0 +1,250 @@
+// Mettle standard library: String builder
+//
+// Arena-backed byte buffer for incremental string construction. The arena is
+// named once at strbuf_new; after that the builder carries it. Append calls
+// are O(1) amortized via doubling growth (new buffer is allocated in the
+// arena; the old one is left behind as arena garbage that goes away when the
+// arena does).
+//
+// Lifetime: the bytes returned by strbuf_finish_cstr live in the arena. They
+// remain valid until the arena is restored to before strbuf_new, reset, or
+// freed. The caller is responsible for not using the result past that point.
+// There is no read-during-build accessor by design: between appends, interior
+// pointers can be invalidated by a grow, so the API does not hand them out.
+//
+// Footguns the user owns:
+//   - holding the result past arena lifetime → dangling
+//   - appending to a finished builder is allowed; the previously-returned
+//     pointer may or may not remain valid depending on whether the next
+//     append triggers a grow. Don't do this; finish once.
+//   - the builder struct itself lives in the arena. Don't free it manually.
+
+import "std/arena";
+import "std/mem";
+
+// ─── Types ──────────────────────────────────────────────────────────────────
+
+// `data` points into the arena. `len` is bytes written so far (excluding the
+// NUL terminator strbuf_finish_cstr will write). `cap` is the total capacity
+// of the current backing block. `arena` is the arena every alloc comes from.
+export struct StrBuf {
+  arena: Arena*;
+  data: cstring;
+  len: int64;
+  cap: int64;
+}
+
+// ─── Internal ───────────────────────────────────────────────────────────────
+
+function strbuf_default_cap() -> int64 {
+  return (int64)64;
+}
+
+function strbuf_bytes() -> int64 {
+  return (int64)32;
+}
+
+// Ensure the buffer has room for at least `needed` total bytes (excluding the
+// implicit NUL the finish call appends). On growth, allocate a new block in
+// the arena, copy old contents, and switch pointers. The old block is left
+// behind as arena-owned garbage; it will be reclaimed when the arena is.
+function strbuf_grow(b: StrBuf*, needed: int64) -> int32 {
+  if (b == 0 || b->arena == 0) { return 0; }
+  if (needed <= b->cap) { return 1; }
+
+  var new_cap: int64 = b->cap;
+  if (new_cap <= (int64)0) { new_cap = strbuf_default_cap(); }
+  while (new_cap < needed) {
+    new_cap = new_cap * (int64)2;
+  }
+
+  // Allocate +1 so finish can write a NUL inside the same block without
+  // forcing another grow.
+  var new_block: cstring = arena_alloc(b->arena, new_cap + (int64)1);
+  if (new_block == 0) { return 0; }
+
+  if (b->data != 0 && b->len > (int64)0) {
+    memcpy(new_block, b->data, b->len);
+  }
+  b->data = new_block;
+  b->cap = new_cap;
+  return 1;
+}
+
+// ─── Public API ─────────────────────────────────────────────────────────────
+
+// Create a new builder allocated in `arena`. `initial_cap <= 0` selects a
+// sensible default (64 bytes). Returns 0 on OOM.
+export function strbuf_new(arena: Arena*, initial_cap: int64) -> StrBuf* {
+  if (arena == 0) { return 0; }
+  var raw: cstring = arena_alloc(arena, strbuf_bytes());
+  if (raw == 0) { return 0; }
+  var b: StrBuf* = (StrBuf*)raw;
+  b->arena = arena;
+  b->data = 0;
+  b->len = (int64)0;
+  b->cap = (int64)0;
+  var cap: int64 = initial_cap;
+  if (cap <= (int64)0) { cap = strbuf_default_cap(); }
+  if (strbuf_grow(b, cap) == 0) { return 0; }
+  return b;
+}
+
+// Current byte length, excluding the NUL terminator finish will write.
+export function strbuf_len(b: StrBuf*) -> int64 {
+  if (b == 0) { return (int64)0; }
+  return b->len;
+}
+
+// Append a single byte. Returns 1 on success, 0 on OOM (allocation of a
+// larger block failed). The builder's previous contents survive an OOM.
+export function strbuf_append_byte(b: StrBuf*, c: uint8) -> int32 {
+  if (b == 0) { return 0; }
+  if (strbuf_grow(b, b->len + (int64)1) == 0) { return 0; }
+  b->data[b->len] = c;
+  b->len = b->len + (int64)1;
+  return 1;
+}
+
+// Append `n` bytes from `src` verbatim.
+export function strbuf_append_bytes(b: StrBuf*, src: cstring, n: int64) -> int32 {
+  if (b == 0) { return 0; }
+  if (n <= (int64)0 || src == 0) { return 1; }
+  if (strbuf_grow(b, b->len + n) == 0) { return 0; }
+  memcpy((cstring)((int64)b->data + b->len), src, n);
+  b->len = b->len + n;
+  return 1;
+}
+
+// Append a NUL-terminated C string (length determined by scanning).
+export function strbuf_append_cstr(b: StrBuf*, s: cstring) -> int32 {
+  if (b == 0 || s == 0) { return 0; }
+  var n: int64 = (int64)0;
+  while (s[n] != (uint8)0) {
+    n = n + (int64)1;
+  }
+  return strbuf_append_bytes(b, s, n);
+}
+
+// Append a Mettle string. Reads its 16-byte record (chars + length) and
+// appends the bytes; does NOT append the NUL.
+export function strbuf_append_string(b: StrBuf*, s: string) -> int32 {
+  if (b == 0) { return 0; }
+  return strbuf_append_bytes(b, s.chars, (int64)s.length);
+}
+
+// Append a signed 64-bit integer in base 10. Handles INT64_MIN by emitting
+// the digits in two halves to avoid negating a value that overflows int64.
+export function strbuf_append_int(b: StrBuf*, n: int64) -> int32 {
+  if (b == 0) { return 0; }
+  if (n == (int64)0) {
+    return strbuf_append_byte(b, (uint8)48);
+  }
+
+  // Buffer big enough for any int64 in base 10 plus optional '-'.
+  var tmp: uint8[24];
+  var i: int32 = 0;
+
+  var negative: int32 = 0;
+  var v: int64 = n;
+  if (v < (int64)0) {
+    negative = 1;
+    // Avoid overflow on INT64_MIN: peel off one digit before negating.
+    var last_digit: int64 = -(v % (int64)10);
+    if (last_digit < (int64)0) { last_digit = -last_digit; }
+    tmp[i] = (uint8)((int32)last_digit + 48);
+    i = i + 1;
+    v = -(v / (int64)10);
+  }
+
+  while (v > (int64)0) {
+    var d: int64 = v % (int64)10;
+    tmp[i] = (uint8)((int32)d + 48);
+    i = i + 1;
+    v = v / (int64)10;
+  }
+
+  if (negative != 0) {
+    if (strbuf_append_byte(b, (uint8)45) == 0) { return 0; }
+  }
+  // tmp is in reverse order; emit back-to-front.
+  while (i > 0) {
+    i = i - 1;
+    if (strbuf_append_byte(b, tmp[i]) == 0) { return 0; }
+  }
+  return 1;
+}
+
+// Append an unsigned 64-bit integer in base 10.
+export function strbuf_append_uint(b: StrBuf*, n: uint64) -> int32 {
+  if (b == 0) { return 0; }
+  if (n == (uint64)0) {
+    return strbuf_append_byte(b, (uint8)48);
+  }
+  var tmp: uint8[24];
+  var i: int32 = 0;
+  var v: uint64 = n;
+  while (v > (uint64)0) {
+    var d: uint64 = v % (uint64)10;
+    tmp[i] = (uint8)((int32)d + 48);
+    i = i + 1;
+    v = v / (uint64)10;
+  }
+  while (i > 0) {
+    i = i - 1;
+    if (strbuf_append_byte(b, tmp[i]) == 0) { return 0; }
+  }
+  return 1;
+}
+
+// Append an unsigned 64-bit integer in lowercase hex, no "0x" prefix, no
+// leading zeros (except for zero itself, which emits "0").
+export function strbuf_append_hex(b: StrBuf*, n: uint64) -> int32 {
+  if (b == 0) { return 0; }
+  if (n == (uint64)0) {
+    return strbuf_append_byte(b, (uint8)48);
+  }
+  var tmp: uint8[16];
+  var i: int32 = 0;
+  var v: uint64 = n;
+  while (v > (uint64)0) {
+    var d: uint64 = v & (uint64)15;
+    var c: uint8;
+    if (d < (uint64)10) {
+      c = (uint8)((int32)d + 48);     // '0'..'9'
+    } else {
+      c = (uint8)((int32)d + 87);     // 'a'..'f'  (10 -> 'a' = 97)
+    }
+    tmp[i] = c;
+    i = i + 1;
+    v = v >> (uint64)4;
+  }
+  while (i > 0) {
+    i = i - 1;
+    if (strbuf_append_byte(b, tmp[i]) == 0) { return 0; }
+  }
+  return 1;
+}
+
+// Finalize the builder: writes a NUL after the accumulated bytes and returns
+// a pointer to byte zero. The returned cstring is valid until the arena
+// passed to strbuf_new is restored past this point, reset, or freed.
+//
+// Calling finish more than once is supported but discouraged: a subsequent
+// append may grow the buffer, invalidating the pointer returned by the first
+// finish. The intended pattern is build → finish → don't touch.
+export function strbuf_finish_cstr(b: StrBuf*) -> cstring {
+  if (b == 0) { return 0; }
+  // strbuf_grow always allocates cap+1 bytes; the NUL slot is reserved.
+  if (b->data == 0) {
+    // Empty builder that never grew (e.g. strbuf_new with default cap also
+    // grows; this path only triggers if growth has failed). Return a
+    // freshly-zero byte so callers don't dereference null.
+    var z: cstring = arena_alloc(b->arena, (int64)1);
+    if (z == 0) { return 0; }
+    z[0] = (uint8)0;
+    return z;
+  }
+  b->data[b->len] = (uint8)0;
+  return b->data;
+}

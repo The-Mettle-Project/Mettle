@@ -1,0 +1,31 @@
+// arena_init / arena_alloc / arena_free smoke test. Allocates some bytes,
+// writes a sentinel into them, reads it back to confirm the storage is real
+// and stable.
+import "std/arena";
+
+function main() -> int32 {
+  var a: Arena* = arena_init((int64)0);
+  if (a == 0) { return 1; }
+
+  var p1: cstring = arena_alloc(a, (int64)16);
+  if (p1 == 0) { return 2; }
+
+  var p2: cstring = arena_alloc(a, (int64)16);
+  if (p2 == 0) { return 3; }
+
+  // Distinct allocations must produce distinct pointers.
+  if ((int64)p1 == (int64)p2) { return 4; }
+
+  // 8-byte alignment by default.
+  if (((int64)p1 & (int64)7) != (int64)0) { return 5; }
+  if (((int64)p2 & (int64)7) != (int64)0) { return 6; }
+
+  // Round-trip a byte.
+  p1[0] = (uint8)42;
+  p2[0] = (uint8)99;
+  if ((int32)p1[0] != 42) { return 7; }
+  if ((int32)p2[0] != 99) { return 8; }
+
+  arena_free(a);
+  return 0;
+}

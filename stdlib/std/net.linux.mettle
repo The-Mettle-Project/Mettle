@@ -1,0 +1,176 @@
+// Mettle standard library: Networking (native ELF / Linux)
+//
+// Linux counterpart to std/net. Exposes the SAME public API as std/net (the
+// Winsock-flavoured one) so a single `import "std/net"` works on both Windows
+// and Linux without source-level changes. Internally it calls POSIX libc:
+// most BSD-socket function names (socket/bind/listen/accept/send/recv/connect/
+// shutdown/setsockopt/htons/htonl/ntohs/ntohl/inet_addr) are identical between
+// Winsock and POSIX libc and bind directly; the Windows-only names
+// (WSAStartup/WSACleanup/closesocket/WSAGetLastError) become thin wrappers.
+//
+// The import resolver picks this file over net.mettle automatically on the
+// native ELF target. posix_helpers.o (-> posix_get_errno) and -lpthread are
+// auto-appended to the link line by the compiler when net is imported on Linux.
+
+import "std/mem";
+import "std/thread";
+
+// Guard + reference count for thread-safe net_init/net_cleanup. Kept for API
+// parity even though the POSIX socket API needs no global init/cleanup.
+export var net_ref_count: int32 = 0;
+export var net_ref_lock: int32 = 0;
+
+// ─── Address family / socket type / protocol constants ──────────────────────
+// AF_INET/SOCK_*/IPPROTO_* values match between Winsock and POSIX libc.
+// SOL_SOCKET and SO_REUSEADDR differ (Linux: 1 and 2; Windows: 0xFFFF and 4).
+export function AF_INET() -> int32     { return 2; }
+export function SOCK_STREAM() -> int32 { return 1; }
+export function SOCK_DGRAM() -> int32  { return 2; }
+export function IPPROTO_TCP() -> int32 { return 6; }
+export function IPPROTO_UDP() -> int32 { return 17; }
+export function SOL_SOCKET() -> int32 { return 1; }       // Linux value
+export function SO_REUSEADDR() -> int32 { return 2; }     // Linux value
+export function SD_RECEIVE() -> int32 { return 0; }
+export function SD_SEND() -> int32 { return 1; }
+export function SD_BOTH() -> int32 { return 2; }
+export function INADDR_ANY() -> int32 { return 0; }
+export function INVALID_SOCKET() -> int64 { return -1; }
+export function SOCKET_ERROR() -> int32 { return -1; }
+
+// ─── Socket lifecycle ───────────────────────────────────────────────────────
+// On Linux, closesocket() is just close(2).
+extern function close(fd: int64) -> int32 = "close";
+export function closesocket(s: int64) -> int32 {
+  return close(s);
+}
+
+export extern function socket(af: int32, sock_type: int32, protocol: int32) -> int64 = "socket";
+export extern function shutdown(s: int64, how: int32) -> int32 = "shutdown";
+
+// ─── Client / server / data transfer ────────────────────────────────────────
+export extern function connect(s: int64, addr: cstring, addrlen: int32) -> int32 = "connect";
+export extern function bind(s: int64, addr: cstring, addrlen: int32) -> int32 = "bind";
+export extern function listen(s: int64, backlog: int32) -> int32 = "listen";
+export extern function accept(s: int64, addr: cstring, addrlen: cstring) -> int64 = "accept";
+export extern function setsockopt(s: int64, level: int32, optname: int32, optval: cstring, optlen: int32) -> int32 = "setsockopt";
+export extern function send(s: int64, buf: cstring, len: int32, flags: int32) -> int32 = "send";
+export extern function recv(s: int64, buf: cstring, len: int32, flags: int32) -> int32 = "recv";
+
+// ─── Address utilities ──────────────────────────────────────────────────────
+export extern function htons(hostshort: int32) -> int32 = "htons";
+export extern function htonl(hostlong: int32) -> int32 = "htonl";
+export extern function ntohs(netshort: int32) -> int32 = "ntohs";
+export extern function ntohl(netlong: int32) -> int32 = "ntohl";
+export extern function inet_addr(cp: cstring) -> int32 = "inet_addr";
+
+// ─── Windows-only names: no-ops / errno bridges on Linux ────────────────────
+// WSAStartup / WSACleanup: Linux libc needs no global init. Accept and ignore.
+export function WSAStartup(version: int32, wsa_data: cstring) -> int32 { return 0; }
+export function WSACleanup() -> int32 { return 0; }
+
+// On Windows, WSAGetLastError() returns a thread-local Winsock error code.
+// On Linux, the equivalent is errno; posix_get_errno() reads it safely.
+extern function posix_get_errno() -> int32 = "posix_get_errno";
+export function WSAGetLastError() -> int32 { return posix_get_errno(); }
+
+// ─── Convenience wrappers (identical to std/net) ────────────────────────────
+
+export function net_init() -> int32 {
+  spin_lock(&net_ref_lock);
+  if (net_ref_count > 0) {
+    net_ref_count = net_ref_count + 1;
+    spin_unlock(&net_ref_lock);
+    return 0;
+  }
+  net_ref_count = 1;
+  spin_unlock(&net_ref_lock);
+  return 0;
+}
+
+export function net_cleanup() -> int32 {
+  spin_lock(&net_ref_lock);
+  if (net_ref_count <= 0) {
+    spin_unlock(&net_ref_lock);
+    return 0;
+  }
+  net_ref_count = net_ref_count - 1;
+  spin_unlock(&net_ref_lock);
+  return 0;
+}
+
+export function net_last_error() -> int32 {
+  return posix_get_errno();
+}
+
+export function socket_tcp() -> int64 {
+  return socket(AF_INET(), SOCK_STREAM(), IPPROTO_TCP());
+}
+
+export function socket_udp() -> int64 {
+  return socket(AF_INET(), SOCK_DGRAM(), IPPROTO_UDP());
+}
+
+export function net_is_initialized() -> int32 {
+  var ready: int32 = 0;
+  spin_lock(&net_ref_lock);
+  if (net_ref_count > 0) {
+    ready = 1;
+  }
+  spin_unlock(&net_ref_lock);
+  return ready;
+}
+
+// Build a sockaddr_in structure for IPv4. The struct layout is identical
+// between Winsock and POSIX (16 bytes: sin_family u16, sin_port u16,
+// sin_addr u32, padding 8B).
+// Returns a malloc'd 16-byte buffer the caller must free() after use.
+export function sockaddr_in(ip: cstring, port: int32) -> cstring {
+  var buf: cstring = malloc(16);
+  if (buf == 0) { return 0; }
+  memset(buf, 0, 16);
+  buf[0] = 2;     // AF_INET, little-endian
+  buf[1] = 0;
+  var net_port: int32 = htons(port);
+  buf[2] = net_port;
+  buf[3] = net_port / 256;
+  var addr: int32 = inet_addr(ip);
+  buf[4] = addr;
+  buf[5] = addr / 256;
+  buf[6] = addr / 65536;
+  buf[7] = addr / 16777216;
+  return buf;
+}
+
+// Build sockaddr_in for 0.0.0.0:port.
+export function sockaddr_in_any(port: int32) -> cstring {
+  var buf: cstring = malloc(16);
+  if (buf == 0) { return 0; }
+  memset(buf, 0, 16);
+  buf[0] = 2;
+  buf[1] = 0;
+  var net_port: int32 = htons(port);
+  buf[2] = net_port;
+  buf[3] = net_port / 256;
+  return buf;
+}
+
+// Set SO_REUSEADDR to enabled (1) or disabled (0).
+export function set_reuseaddr(sock: int64, enabled: int32) -> int32 {
+  var opt: uint8[4];
+  if (enabled != 0) { opt[0] = 1; } else { opt[0] = 0; }
+  opt[1] = 0;
+  opt[2] = 0;
+  opt[3] = 0;
+  return setsockopt(sock, SOL_SOCKET(), SO_REUSEADDR(), &opt[0], 4);
+}
+
+// Send all bytes in buf[0..len). Returns total sent, or -1 on error.
+export function send_all(sock: int64, buf: cstring, len: int32) -> int32 {
+  var total: int32 = 0;
+  while (total < len) {
+    var sent: int32 = send(sock, &buf[total], len - total, 0);
+    if (sent <= 0) { return -1; }
+    total = total + sent;
+  }
+  return total;
+}

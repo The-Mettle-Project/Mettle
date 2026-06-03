@@ -4443,6 +4443,8 @@ static int code_generator_emit_ir_instruction(CodeGenerator *generator,
 
   case IR_OP_MEMCPY_INLINE:
   case IR_OP_SIMD_SUM_I32:
+  case IR_OP_SIMD_SUM_U8:
+  case IR_OP_SIMD_BYTE_MAP:
   case IR_OP_SIMD_MATMUL_N32:
   case IR_OP_SIMD_INSERTION_SORT_I32:
   case IR_OP_SIMD_DOT_I32:
@@ -4452,6 +4454,15 @@ static int code_generator_emit_ir_instruction(CodeGenerator *generator,
   case IR_OP_LOWER_BOUND_I32:
   case IR_OP_PREFIX_SUM_I32:
   case IR_OP_SIMD_MINMAX_I32:
+  case IR_OP_SIMD_SUM_F64:
+  case IR_OP_SIMD_SUM_F32:
+  case IR_OP_SIMD_DOT_F64:
+  case IR_OP_SIMD_DOT_F32:
+  case IR_OP_SIMD_AFFINE_MAP_F64:
+  case IR_OP_SIMD_AFFINE_MAP_F32:
+  case IR_OP_SIMD_I2F_REDUCE_F64:
+  case IR_OP_SIMD_VLOOP_F64:
+  case IR_OP_SIMD_OUTER_LANE_F64:
     code_generator_set_error(
         generator,
         "IR opcode %d requires the direct object (--emit-obj) backend",

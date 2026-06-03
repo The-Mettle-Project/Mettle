@@ -239,7 +239,7 @@ PASS_NAMES = '''static const char *g_ir_pass_names[IR_OPT_PASS_COUNT] = {
     "remove_redundant_jumps", "eliminate_unreachable_straightline",
     "eliminate_unreachable_blocks", "remove_unused_labels", "memcpy_inline",
     "eliminate_load_symbol_copy", "simd_sum_i32", "simd_dot_i32",
-    "simd_matmul", "simd_insertion_sort_i32",
+    "simd_insertion_sort_i32",
 };
 '''
 
@@ -258,11 +258,6 @@ PROGRAM = r'''int ir_optimize_program(IRProgram *program,
       mettle_compiler_ctx_set_function_name(
           function->name ? function->name : "<anonymous>");
     }
-    mettle_compiler_ctx_set_pass_name("simd_matmul");
-    if (!ir_simd_matmul_pass(function, &pre_changed)) {
-      mettle_compiler_ice("IR optimization pre-inline pass failed");
-    }
-    pre_changed = 0;
     mettle_compiler_ctx_set_pass_name("simd_dot_i32");
     if (!ir_simd_dot_i32_pass(function, &pre_changed)) {
       mettle_compiler_ice("IR optimization pre-inline pass failed");

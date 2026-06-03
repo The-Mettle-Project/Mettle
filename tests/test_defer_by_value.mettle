@@ -1,0 +1,20 @@
+// Deferred calls capture their argument values at the defer point (by value),
+// not at scope exit. Each loop iteration defers note(i) with the current i, so
+// the snapshots are 0, 1, 2 -- giving trace 0 -> 1 -> 12. (By-reference capture
+// would observe i after the increment: 1, 2, 3 -> 123.)
+
+var trace: int32 = 0;
+
+function note(v: int32) -> int32 {
+  trace = trace * 10 + v;
+  return 0;
+}
+
+function main() -> int32 {
+  var i: int32 = 0;
+  while (i < 3) {
+    defer note(i);
+    i = i + 1;
+  }
+  return trace; // 12
+}

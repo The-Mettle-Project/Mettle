@@ -92,9 +92,90 @@ void binary_code_buffer_destroy(BinaryCodeBuffer *buffer) {
   buffer->capacity = 0;
 }
 
+static int binary_index_reserve(size_t **slots, size_t *slot_count,
+                                size_t existing_count, size_t needed,
+                                void *items,
+                                const char *(*name_at)(void *, size_t)) {
+  size_t target = 16;
+  if (!slots || !slot_count || !name_at) {
+    return 0;
+  }
+
+  while (target < needed * 2) {
+    target *= 2;
+  }
+  if (*slots && *slot_count >= target) {
+    return 1;
+  }
+
+  size_t *new_slots = calloc(target, sizeof(size_t));
+  if (!new_slots) {
+    return 0;
+  }
+
+  for (size_t i = 0; i < existing_count; i++) {
+    const char *name = name_at(items, i);
+    if (!name) {
+      continue;
+    }
+    size_t mask = target - 1;
+    size_t h = mettle_fnv1a_hash(name) & mask;
+    while (new_slots[h] != 0) {
+      h = (h + 1) & mask;
+    }
+    new_slots[h] = i + 1;
+  }
+
+  free(*slots);
+  *slots = new_slots;
+  *slot_count = target;
+  return 1;
+}
+
+static int binary_index_find(const size_t *slots, size_t slot_count,
+                             const void *items, const char *name,
+                             const char *(*name_at)(void *, size_t)) {
+  if (!slots || slot_count == 0 || !items || !name || !name_at) {
+    return -1;
+  }
+
+  size_t mask = slot_count - 1;
+  size_t h = mettle_fnv1a_hash(name) & mask;
+  while (slots[h] != 0) {
+    size_t index = slots[h] - 1;
+    const char *candidate = name_at((void *)items, index);
+    if (candidate && strcmp(candidate, name) == 0) {
+      return (int)index;
+    }
+    h = (h + 1) & mask;
+  }
+  return -1;
+}
+
+static const char *binary_named_slot_name_at(void *items, size_t index) {
+  return ((BinaryNamedSlot *)items)[index].name;
+}
+
+static const char *binary_alias_name_at(void *items, size_t index) {
+  return ((BinarySymbolAliasEntry *)items)[index].name;
+}
+
+static const char *binary_label_name_at(void *items, size_t index) {
+  return ((BinaryLabelEntry *)items)[index].name;
+}
+
 int binary_named_slot_table_get_offset(const BinaryNamedSlotTable *table,
                                               const char *name) {
   if (!table || !name) {
+    return -1;
+  }
+
+  int indexed = binary_index_find(table->slots, table->slot_count, table->items,
+                                  name, binary_named_slot_name_at);
+  if (indexed >= 0) {
+    return table->items[indexed].offset;
+  }
+  if (table->slots) {
     return -1;
   }
 
@@ -129,6 +210,12 @@ int binary_named_slot_table_add(BinaryNamedSlotTable *table,
     table->capacity = new_capacity;
   }
 
+  if (!binary_index_reserve(&table->slots, &table->slot_count, table->count,
+                            table->count + 1, table->items,
+                            binary_named_slot_name_at)) {
+    return 0;
+  }
+
   char *name_copy = mettle_strdup(name);
   if (!name_copy) {
     return 0;
@@ -136,6 +223,14 @@ int binary_named_slot_table_add(BinaryNamedSlotTable *table,
 
   table->items[table->count].name = name_copy;
   table->items[table->count].offset = offset;
+  {
+    size_t mask = table->slot_count - 1;
+    size_t h = mettle_fnv1a_hash(name_copy) & mask;
+    while (table->slots[h] != 0) {
+      h = (h + 1) & mask;
+    }
+    table->slots[h] = table->count + 1;
+  }
   table->count++;
   return 1;
 }
@@ -149,15 +244,27 @@ void binary_named_slot_table_destroy(BinaryNamedSlotTable *table) {
     free(table->items[i].name);
   }
   free(table->items);
+  free(table->slots);
   table->items = NULL;
   table->count = 0;
   table->capacity = 0;
+  table->slots = NULL;
+  table->slot_count = 0;
 }
 
 const char *
 binary_symbol_alias_table_get(const BinarySymbolAliasTable *table,
                               const char *name) {
   if (!table || !name) {
+    return NULL;
+  }
+
+  int indexed = binary_index_find(table->slots, table->slot_count, table->items,
+                                  name, binary_alias_name_at);
+  if (indexed >= 0) {
+    return table->items[indexed].target;
+  }
+  if (table->slots) {
     return NULL;
   }
 
@@ -195,8 +302,22 @@ int binary_symbol_alias_table_add(BinarySymbolAliasTable *table,
     table->capacity = new_capacity;
   }
 
+  if (!binary_index_reserve(&table->slots, &table->slot_count, table->count,
+                            table->count + 1, table->items,
+                            binary_alias_name_at)) {
+    return 0;
+  }
+
   table->items[table->count].name = name;
   table->items[table->count].target = target;
+  {
+    size_t mask = table->slot_count - 1;
+    size_t h = mettle_fnv1a_hash(name) & mask;
+    while (table->slots[h] != 0) {
+      h = (h + 1) & mask;
+    }
+    table->slots[h] = table->count + 1;
+  }
   table->count++;
   return 1;
 }
@@ -206,14 +327,26 @@ void binary_symbol_alias_table_destroy(BinarySymbolAliasTable *table) {
     return;
   }
   free(table->items);
+  free(table->slots);
   table->items = NULL;
   table->count = 0;
   table->capacity = 0;
+  table->slots = NULL;
+  table->slot_count = 0;
 }
 
 BinaryLabelEntry *binary_label_table_get(BinaryLabelTable *table,
                                                 const char *name) {
   if (!table || !name) {
+    return NULL;
+  }
+
+  int indexed = binary_index_find(table->slots, table->slot_count,
+                                  table->items, name, binary_label_name_at);
+  if (indexed >= 0) {
+    return &table->items[indexed];
+  }
+  if (table->slots) {
     return NULL;
   }
 
@@ -247,6 +380,12 @@ int binary_label_table_define(BinaryLabelTable *table, const char *name,
     table->capacity = new_capacity;
   }
 
+  if (!binary_index_reserve(&table->slots, &table->slot_count, table->count,
+                            table->count + 1, table->items,
+                            binary_label_name_at)) {
+    return 0;
+  }
+
   char *name_copy = mettle_strdup(name);
   if (!name_copy) {
     return 0;
@@ -254,6 +393,14 @@ int binary_label_table_define(BinaryLabelTable *table, const char *name,
 
   table->items[table->count].name = name_copy;
   table->items[table->count].offset = offset;
+  {
+    size_t mask = table->slot_count - 1;
+    size_t h = mettle_fnv1a_hash(name_copy) & mask;
+    while (table->slots[h] != 0) {
+      h = (h + 1) & mask;
+    }
+    table->slots[h] = table->count + 1;
+  }
   table->count++;
   return 1;
 }
@@ -267,9 +414,12 @@ void binary_label_table_destroy(BinaryLabelTable *table) {
     free(table->items[i].name);
   }
   free(table->items);
+  free(table->slots);
   table->items = NULL;
   table->count = 0;
   table->capacity = 0;
+  table->slots = NULL;
+  table->slot_count = 0;
 }
 
 int binary_label_fixup_table_add(BinaryLabelFixupTable *table,

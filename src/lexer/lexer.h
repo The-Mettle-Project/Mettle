@@ -15,6 +15,7 @@ typedef enum {
   TOKEN_EXTERN,
   TOKEN_EXPORT,
   TOKEN_VAR,
+  TOKEN_CONST,
   TOKEN_FUNCTION,
   TOKEN_STRUCT,
   TOKEN_ENUM,
@@ -96,6 +97,7 @@ typedef enum {
   TOKEN_PERCENT,
   TOKEN_NOT,
   TOKEN_DOT,
+  TOKEN_DOT_DOT,
   TOKEN_NEWLINE,
 
   // Common x86 mnemonics (for backward compatibility)

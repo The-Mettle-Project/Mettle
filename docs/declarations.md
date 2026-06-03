@@ -13,6 +13,18 @@ var msg: string = "hello";
 var buf: uint8[1024];
 ```
 
+## Constants
+
+Constants are declared with `const`, a name, an optional type, and a required initializer that is a compile-time constant integer expression. A top-level `const` is folded directly into the machine code at every use site and occupies no storage. A local `const` is an immutable binding; assigning to it is a compile error.
+
+```mettle
+const MAX: int32 = 100;
+const STEP = 4;            // type inferred as int32
+const BOUND = MAX - STEP;  // may reference earlier constants
+```
+
+Initializers may use integer literals, `sizeof`, other constants, and arithmetic, bitwise, and comparison operators over them. Float, string, and aggregate constants are not yet supported, and a constant must be declared before it is used.
+
 ## Functions
 
 Functions are declared with `function` (or the shorthand `fn`), a name, parameters in parentheses, an optional return type, and a body. The return type can use `->` or `:`. Omitting the return type indicates a void function (no return value).

@@ -1,0 +1,106 @@
+// Differential oracle for constant division/modulo strength reduction.
+//
+// For each divisor, the LITERAL path (`x / 7`, `x % 7`) is magic-multiply
+// strength-reduced by the binary backend, while the REFERENCE path divides by
+// the same value loaded from a heap array (`x / d`) which the compiler cannot
+// fold, so it emits a genuine hardware idiv/div. Comparing the two validates
+// the magic sequence against the CPU's own divider across many dividends,
+// including negatives, zero, and INT64_MIN. Returns 1 on full agreement, 0 on
+// any mismatch (matches the float-ABI test convention: exit 1 == pass).
+
+import "std/io";
+import "std/mem";
+
+// Signed: literal (magic) vs runtime divisor d (idiv). d == the k-th divisor.
+function check_signed(x: int64, k: int32, d: int64) -> int64 {
+  var lq: int64 = 0;
+  var lr: int64 = 0;
+  if (k == 0)      { lq = x / 3;          lr = x % 3; }
+  else if (k == 1) { lq = x / 7;          lr = x % 7; }
+  else if (k == 2) { lq = x / 9;          lr = x % 9; }
+  else if (k == 3) { lq = x / 10;         lr = x % 10; }
+  else if (k == 4) { lq = x / 13;         lr = x % 13; }
+  else if (k == 5) { lq = x / 100;        lr = x % 100; }
+  else if (k == 6) { lq = x / 1000;       lr = x % 1000; }
+  else if (k == 7) { lq = x / 12345;      lr = x % 12345; }
+  else             { lq = x / 1000000007; lr = x % 1000000007; }
+
+  var rq: int64 = x / d;
+  var rr: int64 = x % d;
+  if (lq != rq) { return 1; }
+  if (lr != rr) { return 1; }
+  return 0;
+}
+
+// Unsigned: same divisors, uint64 operands.
+function check_unsigned(x: uint64, k: int32, d: uint64) -> int64 {
+  var lq: uint64 = 0;
+  var lr: uint64 = 0;
+  if (k == 0)      { lq = x / 3;          lr = x % 3; }
+  else if (k == 1) { lq = x / 7;          lr = x % 7; }
+  else if (k == 2) { lq = x / 9;          lr = x % 9; }
+  else if (k == 3) { lq = x / 10;         lr = x % 10; }
+  else if (k == 4) { lq = x / 13;         lr = x % 13; }
+  else if (k == 5) { lq = x / 100;        lr = x % 100; }
+  else if (k == 6) { lq = x / 1000;       lr = x % 1000; }
+  else if (k == 7) { lq = x / 12345;      lr = x % 12345; }
+  else             { lq = x / 1000000007; lr = x % 1000000007; }
+
+  var rq: uint64 = x / d;
+  var rr: uint64 = x % d;
+  if (lq != rq) { return 1; }
+  if (lr != rr) { return 1; }
+  return 0;
+}
+
+function main() -> int32 {
+  // Divisors live on the heap so the reference path can't const-fold them.
+  var ndiv: int32 = 9;
+  var divs: int64* = (int64*)malloc((int64)ndiv * 8);
+  divs[0] = 3; divs[1] = 7; divs[2] = 9; divs[3] = 10; divs[4] = 13;
+  divs[5] = 100; divs[6] = 1000; divs[7] = 12345; divs[8] = 1000000007;
+
+  // Diverse signed dividends incl. negatives, zero, and INT64_MIN.
+  var nx: int32 = 16;
+  var xs: int64* = (int64*)malloc((int64)nx * 8);
+  xs[0] = 0; xs[1] = 1; xs[2] = -1; xs[3] = 2; xs[4] = -2;
+  xs[5] = 100; xs[6] = -100; xs[7] = 99999; xs[8] = -99999;
+  xs[9] = 2147483647; xs[10] = -2147483648;
+  xs[11] = 9223372036854775807; xs[12] = -9223372036854775807 - 1; // INT64_MIN
+  xs[13] = 123456789012345; xs[14] = -123456789012345; xs[15] = 1000000006;
+
+  var fails: int64 = 0;
+
+  // Large unsigned dividends built by arithmetic (literals > INT64_MAX can't be
+  // written directly): UINT64_MAX, 2^63, and a plain large value.
+  var umax: uint64 = (uint64)0 - (uint64)1;
+  var u63: uint64 = (uint64)1 << 63;
+  var ubig: uint64 = (uint64)1000000000000;
+
+  var k: int32 = 0;
+  while (k < ndiv) {
+    var d: int64 = divs[k];
+    var i: int32 = 0;
+    while (i < nx) {
+      fails = fails + check_signed(xs[i], k, d);
+      // Unsigned view of the same bit patterns.
+      fails = fails + check_unsigned((uint64)xs[i], k, (uint64)d);
+      i = i + 1;
+    }
+    fails = fails + check_unsigned(umax, k, (uint64)d);
+    fails = fails + check_unsigned(u63, k, (uint64)d);
+    fails = fails + check_unsigned(ubig, k, (uint64)d);
+    k = k + 1;
+  }
+
+  free((cstring)divs);
+  free((cstring)xs);
+
+  if (fails == 0) {
+    println("const_divmod OK");
+    return 1;
+  }
+  print("const_divmod MISMATCHES: ");
+  println_int(fails);
+  return 0;
+}

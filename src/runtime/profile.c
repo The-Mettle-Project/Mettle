@@ -8,7 +8,8 @@
 #if defined(_WIN32) || defined(_WIN64)
 #include <windows.h>
 #else
-#error "mettle profile runtime is only supported on Windows in v1"
+#include <time.h>
+#include <sys/time.h>
 #endif
 
 extern uint64_t mettle_profile_name_count;
@@ -54,8 +55,10 @@ static size_t g_stack_overflow_exits = 0;
 static MettleProfileEdge *g_edges = NULL;
 static size_t g_edge_count = 0;
 static size_t g_edge_capacity = 0;
+#if defined(_WIN32) || defined(_WIN64)
 static int g_qpc_initialized = 0;
 static LARGE_INTEGER g_qpc_frequency = {0};
+#endif
 
 static void mettle_profile_write_padded_field(const char *text, size_t width) {
   size_t length = text ? strlen(text) : 0;
@@ -181,6 +184,7 @@ static void mettle_profile_write_location(uint32_t fn_id, size_t width) {
   mettle_profile_write_padded_field(buffer, width);
 }
 
+#if defined(_WIN32) || defined(_WIN64)
 static void mettle_profile_init_qpc(void) {
   if (g_qpc_initialized) {
     return;
@@ -188,8 +192,10 @@ static void mettle_profile_init_qpc(void) {
   QueryPerformanceFrequency(&g_qpc_frequency);
   g_qpc_initialized = 1;
 }
+#endif
 
 static uint64_t mettle_profile_now_ns(void) {
+#if defined(_WIN32) || defined(_WIN64)
   LARGE_INTEGER counter = {0};
 
   mettle_profile_init_qpc();
@@ -200,6 +206,20 @@ static uint64_t mettle_profile_now_ns(void) {
   QueryPerformanceCounter(&counter);
   return (uint64_t)((counter.QuadPart * 1000000000ULL) /
                     (uint64_t)g_qpc_frequency.QuadPart);
+#else
+#if defined(CLOCK_MONOTONIC)
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+  }
+#endif
+  {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec * 1000000000ULL +
+           (uint64_t)tv.tv_usec * 1000ULL;
+  }
+#endif
 }
 
 #define METTLE_PROFILE_ENSURE_CAPACITY(ptr, count, capacity, type, needed) do { \

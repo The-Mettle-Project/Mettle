@@ -9,6 +9,11 @@ typedef struct {
   const char **import_directories;
   size_t import_directory_count;
   const char *stdlib_directory;
+  /* When nonzero, the compilation targets the native ELF (Linux) backend. The
+   * resolver then prefers an OS-specific `<name>.linux.mettle` sibling over the
+   * plain `<name>.mettle` for std imports, so Linux gets syscall-based stdlib
+   * variants without any source-level platform branching. */
+  int target_is_elf;
 } ImportResolverOptions;
 
 // Resolves imports by finding AST_IMPORT nodes, lexing/parsing the imported

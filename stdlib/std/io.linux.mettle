@@ -1,0 +1,99 @@
+// Mettle standard library: I/O (native ELF / Linux)
+//
+// Linux counterpart to std/io. Identical libc-backed implementation, except the
+// standard streams come from glibc's `stdin`/`stdout`/`stderr` globals rather
+// than the MSVCRT `__acrt_iob_func` accessor used on Windows. The import
+// resolver picks this file over io.mettle automatically on the native ELF
+// target, so `import "std/io"` works unchanged on both platforms and routes
+// through the same C runtime routines.
+
+// ─── Console output ─────────────────────────────────────────────────────────
+export extern function puts(msg: cstring) -> int32;
+export extern function putchar(c: int32) -> int32;
+export extern function getchar() -> int32 = "getchar";
+
+// Convert a Mettle string to a C string (gets the underlying char pointer)
+export function cstr(s: string) -> cstring {
+  return s.chars;
+}
+
+// Output a null-terminated string exactly as-is (no trailing newline)
+export function print(msg: cstring) {
+  fputs(msg, get_stdout());
+}
+
+// Output a null-terminated string followed by a newline
+export function println(msg: cstring) {
+  puts(msg);
+}
+
+// Print a newline
+export function newline() {
+  putchar(10);
+}
+
+// Print an integer to stdout (base 10, handles negatives)
+export function print_int(n: int64) {
+  var buf: uint8[22];
+  var pos: int32 = 21;
+  var neg: int32 = 0;
+  buf[21] = 0;
+  if (n < 0) {
+    neg = 1;
+    n = 0 - n;
+  }
+  if (n == 0) {
+    buf[0] = 48;
+    buf[1] = 0;
+    fputs(&buf[0], get_stdout());
+    return;
+  }
+  while (n > 0) {
+    pos = pos - 1;
+    buf[pos] = 48 + n - (n / 10) * 10;
+    n = n / 10;
+  }
+  if (neg != 0) {
+    pos = pos - 1;
+    buf[pos] = 45;
+  }
+  fputs(&buf[pos], get_stdout());
+}
+
+// Print an integer followed by a newline
+export function println_int(n: int64) {
+  print_int(n);
+  putchar(10);
+}
+
+// ─── File I/O ───────────────────────────────────────────────────────────────
+// FILE* is represented as cstring (opaque pointer)
+export extern function fopen(filename: cstring, mode: cstring) -> cstring = "fopen";
+export extern function fclose(fp: cstring) -> int32 = "fclose";
+export extern function fread(buf: cstring, size: int64, count: int64, fp: cstring) -> int64 = "fread";
+export extern function fwrite(buf: cstring, size: int64, count: int64, fp: cstring) -> int64 = "fwrite";
+export extern function fputs(s: cstring, fp: cstring) -> int32 = "fputs";
+export extern function fgets(buf: cstring, size: int32, fp: cstring) -> cstring = "fgets";
+export extern function fflush(fp: cstring) -> int32 = "fflush";
+
+// ─── Standard streams ─────────────────────────────────────────────────────────
+// On Linux, glibc exposes stdin/stdout/stderr as FILE* global variables.
+// We bind them directly as extern data symbols (no MSVCRT __acrt_iob_func).
+extern var libc_stdin: cstring = "stdin";
+extern var libc_stdout: cstring = "stdout";
+extern var libc_stderr: cstring = "stderr";
+
+export function get_stdin() -> cstring  { return libc_stdin; }
+export function get_stdout() -> cstring { return libc_stdout; }
+export function get_stderr() -> cstring { return libc_stderr; }
+
+// Write message to stderr (no newline)
+export function print_err(msg: cstring) {
+  fputs(msg, get_stderr());
+}
+
+// Write message to stderr followed by newline
+export function println_err(msg: cstring) {
+  fputs(msg, get_stderr());
+  fputs(cstr("\n"), get_stderr());
+}

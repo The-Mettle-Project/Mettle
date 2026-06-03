@@ -1,0 +1,364 @@
+#include "ir_optimize_internal.h"
+
+typedef struct {
+  IROptPassId id;
+  IROptFunctionPass run;
+  struct {
+    unsigned all;
+    unsigned any;
+  } gate;
+} IROptScheduledPass;
+
+typedef struct {
+  const char *name;
+  const IROptNamedPass *passes;
+  size_t pass_count;
+  const char *failure_message;
+} IROptNamedStage;
+
+typedef struct {
+  const char *name;
+  const IROptScheduledPass *passes;
+  size_t pass_count;
+  int max_iterations;
+} IROptFixpointStage;
+
+typedef enum {
+  IR_OPT_FEATURE_LABEL = 1u << 0,
+  IR_OPT_FEATURE_WHILE_LABEL = 1u << 1,
+  IR_OPT_FEATURE_JUMP = 1u << 2,
+  IR_OPT_FEATURE_BRANCH_ZERO = 1u << 3,
+  IR_OPT_FEATURE_BRANCH_EQ = 1u << 4,
+  IR_OPT_FEATURE_CALL = 1u << 5,
+  IR_OPT_FEATURE_LOAD = 1u << 6,
+  IR_OPT_FEATURE_ASSIGN = 1u << 7,
+  IR_OPT_FEATURE_TEMP_WRITE = 1u << 8,
+  IR_OPT_FEATURE_BINARY = 1u << 9,
+  IR_OPT_FEATURE_DIV = 1u << 10
+} IROptFeatureFlag;
+
+#define IR_OPT_REQUIRE_NONE 0u
+#define IR_OPT_FIXPOINT_MAX_ITERATIONS 8
+#define IR_OPT_LABEL_JUMP (IR_OPT_FEATURE_LABEL | IR_OPT_FEATURE_JUMP)
+#define IR_OPT_BRANCH_TESTS                                                   \
+  (IR_OPT_FEATURE_JUMP | IR_OPT_FEATURE_BRANCH_ZERO | IR_OPT_FEATURE_BRANCH_EQ)
+#define IR_OPT_PASS_ALWAYS(id, fn)                                            \
+  { IR_OPT_PASS_##id, fn, {IR_OPT_REQUIRE_NONE, IR_OPT_REQUIRE_NONE} }
+#define IR_OPT_PASS_WHEN_ALL(id, fn, all_features)                            \
+  { IR_OPT_PASS_##id, fn, {all_features, IR_OPT_REQUIRE_NONE} }
+#define IR_OPT_PASS_WHEN_ALL_ANY(id, fn, all_features, any_features)           \
+  { IR_OPT_PASS_##id, fn, {all_features, any_features} }
+
+static const IROptNamedPass g_ir_pre_inline_passes[] = {
+    {"simd_minmax_i32", ir_simd_minmax_i32_pass},
+    {"prefix_sum_i32", ir_prefix_sum_i32_pass},
+    {"induction_pointer", ir_pointer_induction_pass},
+    {"simd_dot_i32", ir_simd_dot_i32_pass},
+    {"memcmp_byte_loop", ir_memcmp_byte_loop_pass},
+    {"simd_insertion_sort_i32", ir_simd_insertion_sort_i32_pass},
+    {"simd_minmax_i32", ir_simd_minmax_i32_pass},
+    {"lower_bound_i32", ir_lower_bound_i32_pass},
+    {"prefix_sum_i32", ir_prefix_sum_i32_pass},
+};
+
+static const IROptNamedPass g_ir_post_fixpoint_passes[] = {
+    {"induction_pointer", ir_pointer_induction_pass},
+    {"prefix_sum_i32", ir_prefix_sum_i32_pass},
+    {"simd_minmax_i32", ir_simd_minmax_i32_pass},
+    {"simd_affine_map_float", ir_simd_affine_map_float_pass},
+    {"simd_i2f_reduce", ir_simd_i2f_reduce_pass},
+    {"simd_dot_float", ir_simd_dot_float_pass},
+    {"simd_sum_float", ir_simd_sum_float_pass},
+    {"auto_vectorize", ir_auto_vectorize_pass},
+    {"outer_vectorize", ir_outer_vectorize_pass},
+    {"simd_memory_map", ir_simd_memory_map_pass},
+    {"lower_bound_i32", ir_lower_bound_i32_pass},
+    {"detect_shift_loops", ir_detect_shift_loops_pass},
+    {"memcmp_byte_loop", ir_memcmp_byte_loop_pass},
+    {"eliminate_congruent_ivs", ir_eliminate_congruent_ivs_pass},
+};
+
+static const IROptNamedStage g_ir_pre_inline_stage = {
+    "pre-inline canonicalization",
+    g_ir_pre_inline_passes,
+    IR_ARRAY_COUNT(g_ir_pre_inline_passes),
+    "IR optimization pre-inline pass failed",
+};
+
+/* SROA runs after copy/coalesce fold inlined struct copies into clean
+ * symbol-to-symbol form, and before CSE/dead-temp cleanup. */
+static const IROptScheduledPass g_ir_fixpoint_passes[] = {
+    IR_OPT_PASS_WHEN_ALL(REDUCTION_UNROLL, ir_reduction_unroll_pass,
+                         IR_OPT_LABEL_JUMP),
+    IR_OPT_PASS_ALWAYS(COPY_AND_CONSTANT_PROPAGATION,
+                       ir_copy_and_constant_propagation_pass),
+    IR_OPT_PASS_ALWAYS(FUSE_ROTATE_ADD, ir_fuse_rotate_add_pass),
+    IR_OPT_PASS_WHEN_ALL(STRENGTH_REDUCE_ROTATE_LOOPS,
+                         ir_strength_reduce_rotate_loops_pass,
+                         IR_OPT_LABEL_JUMP),
+    IR_OPT_PASS_WHEN_ALL(UNROLL_SMALL_CONST_BOUND_LOOPS,
+                         ir_unroll_small_const_bound_loops_pass,
+                         IR_OPT_LABEL_JUMP),
+    IR_OPT_PASS_WHEN_ALL(POSITIVE_LOOP_DIV2_TO_SHIFT,
+                         ir_positive_loop_div2_to_shift_pass,
+                         IR_OPT_LABEL_JUMP | IR_OPT_FEATURE_DIV),
+    IR_OPT_PASS_WHEN_ALL(FOLD_POPCOUNT_BYTE_LOOP,
+                         ir_fold_popcount_byte_loop_pass,
+                         IR_OPT_LABEL_JUMP | IR_OPT_FEATURE_BRANCH_ZERO |
+                             IR_OPT_FEATURE_BINARY),
+    IR_OPT_PASS_WHEN_ALL(FUSE_POPCOUNT_BUFFER_LOOP,
+                         ir_fuse_popcount_buffer_loop_pass,
+                         IR_OPT_LABEL_JUMP | IR_OPT_FEATURE_BRANCH_ZERO |
+                             IR_OPT_FEATURE_BINARY | IR_OPT_FEATURE_LOAD),
+    IR_OPT_PASS_WHEN_ALL(COLLATZ_ODD_STEP_FOLD,
+                         ir_collatz_odd_step_fold_pass,
+                         IR_OPT_LABEL_JUMP | IR_OPT_FEATURE_BRANCH_ZERO |
+                             IR_OPT_FEATURE_BINARY),
+    IR_OPT_PASS_WHEN_ALL(COALESCE_SINGLE_USE_TEMP_ASSIGN,
+                         ir_coalesce_single_use_temp_assign_pass,
+                         IR_OPT_FEATURE_ASSIGN),
+    IR_OPT_PASS_WHEN_ALL(ELIMINATE_SINGLE_USE_FLOAT_SYMBOL_COPIES,
+                         ir_eliminate_single_use_float_symbol_copies_pass,
+                         IR_OPT_FEATURE_ASSIGN),
+    IR_OPT_PASS_ALWAYS(SROA, ir_sroa_pass),
+    IR_OPT_PASS_ALWAYS(COMMON_SUBEXPRESSION_ELIMINATION,
+                       ir_common_subexpression_elimination_pass),
+    IR_OPT_PASS_ALWAYS(CONSTANT_AND_BRANCH_SIMPLIFY,
+                       ir_constant_and_branch_simplify_pass),
+    IR_OPT_PASS_WHEN_ALL(COUNT_WORD_STARTS, ir_count_word_starts_pass,
+                         IR_OPT_LABEL_JUMP | IR_OPT_FEATURE_BRANCH_ZERO |
+                             IR_OPT_FEATURE_LOAD),
+    IR_OPT_PASS_WHEN_ALL(ELIMINATE_DEAD_TEMP_WRITES,
+                         ir_eliminate_dead_temp_writes_pass,
+                         IR_OPT_FEATURE_TEMP_WRITE),
+    IR_OPT_PASS_WHEN_ALL_ANY(THREAD_JUMP_TARGETS,
+                             ir_thread_jump_targets_pass,
+                             IR_OPT_FEATURE_LABEL, IR_OPT_BRANCH_TESTS),
+    IR_OPT_PASS_WHEN_ALL(NULL_CHECK_LICM, ir_null_check_licm_pass,
+                         IR_OPT_FEATURE_WHILE_LABEL |
+                             IR_OPT_FEATURE_BRANCH_ZERO | IR_OPT_FEATURE_CALL),
+    IR_OPT_PASS_WHEN_ALL_ANY(REMOVE_EMPTY_CONDITIONAL_DIAMONDS,
+                             ir_remove_empty_conditional_diamonds_pass,
+                             IR_OPT_LABEL_JUMP,
+                             IR_OPT_FEATURE_BRANCH_ZERO |
+                                 IR_OPT_FEATURE_BRANCH_EQ),
+    IR_OPT_PASS_WHEN_ALL_ANY(REMOVE_REDUNDANT_FALLTHROUGH_BRANCHES,
+                             ir_remove_redundant_fallthrough_branches_pass,
+                             IR_OPT_FEATURE_LABEL,
+                             IR_OPT_FEATURE_BRANCH_ZERO |
+                                 IR_OPT_FEATURE_BRANCH_EQ),
+    IR_OPT_PASS_WHEN_ALL(REMOVE_REDUNDANT_JUMPS,
+                         ir_remove_redundant_jumps_pass, IR_OPT_LABEL_JUMP),
+    IR_OPT_PASS_ALWAYS(ELIMINATE_UNREACHABLE_STRAIGHTLINE,
+                       ir_eliminate_unreachable_straightline_pass),
+    IR_OPT_PASS_WHEN_ALL_ANY(ELIMINATE_UNREACHABLE_BLOCKS,
+                             ir_eliminate_unreachable_blocks_pass,
+                             IR_OPT_FEATURE_LABEL, IR_OPT_BRANCH_TESTS),
+    IR_OPT_PASS_WHEN_ALL(REMOVE_UNUSED_LABELS, ir_remove_unused_labels_pass,
+                         IR_OPT_FEATURE_LABEL),
+    IR_OPT_PASS_ALWAYS(MEMCPY_INLINE, ir_memcpy_inline_pass),
+    IR_OPT_PASS_ALWAYS(ELIMINATE_LOAD_SYMBOL_COPY,
+                       ir_eliminate_load_symbol_copy_pass),
+    IR_OPT_PASS_WHEN_ALL(SIMD_SUM_I32, ir_simd_sum_i32_pass,
+                         IR_OPT_LABEL_JUMP | IR_OPT_FEATURE_LOAD),
+    IR_OPT_PASS_WHEN_ALL(SIMD_SUM_U8, ir_simd_sum_u8_pass,
+                         IR_OPT_LABEL_JUMP | IR_OPT_FEATURE_LOAD),
+    IR_OPT_PASS_WHEN_ALL(SIMD_BYTE_MAP, ir_simd_byte_map_pass,
+                         IR_OPT_LABEL_JUMP | IR_OPT_FEATURE_LOAD),
+    IR_OPT_PASS_WHEN_ALL(SIMD_DOT_I32, ir_simd_dot_i32_pass,
+                         IR_OPT_LABEL_JUMP | IR_OPT_FEATURE_LOAD),
+    IR_OPT_PASS_WHEN_ALL(SIMD_INSERTION_SORT_I32,
+                         ir_simd_insertion_sort_i32_pass,
+                         IR_OPT_LABEL_JUMP | IR_OPT_FEATURE_LOAD),
+};
+
+static const IROptFixpointStage g_ir_fixpoint_stage = {
+    "main fixpoint",
+    g_ir_fixpoint_passes,
+    IR_ARRAY_COUNT(g_ir_fixpoint_passes),
+    IR_OPT_FIXPOINT_MAX_ITERATIONS,
+};
+
+static const IROptNamedStage g_ir_post_fixpoint_stage = {
+    "post-fixpoint idiom recognition",
+    g_ir_post_fixpoint_passes,
+    IR_ARRAY_COUNT(g_ir_post_fixpoint_passes),
+    "IR optimization pass failed",
+};
+
+static int ir_run_named_stage(IRFunction *function,
+                              const IROptNamedStage *stage) {
+  if (!stage || !stage->passes) {
+    return 0;
+  }
+
+  mettle_compiler_ctx_set_pass_name(stage->name);
+  mettle_compiler_ctx_set_fixpoint_iteration(0);
+  return ir_run_named_pass_sequence(
+      function, stage->passes, stage->pass_count, stage->failure_message);
+}
+
+int ir_optimize_pre_inline_function(IRFunction *function) {
+  return ir_run_named_stage(function, &g_ir_pre_inline_stage);
+}
+
+static unsigned ir_opt_feature_flags(const IROptFunctionFeatures *features) {
+  unsigned flags = 0;
+  if (features->has_label) {
+    flags |= IR_OPT_FEATURE_LABEL;
+  }
+  if (features->has_while_label) {
+    flags |= IR_OPT_FEATURE_WHILE_LABEL;
+  }
+  if (features->has_jump) {
+    flags |= IR_OPT_FEATURE_JUMP;
+  }
+  if (features->has_branch_zero) {
+    flags |= IR_OPT_FEATURE_BRANCH_ZERO;
+  }
+  if (features->has_branch_eq) {
+    flags |= IR_OPT_FEATURE_BRANCH_EQ;
+  }
+  if (features->has_call) {
+    flags |= IR_OPT_FEATURE_CALL;
+  }
+  if (features->has_load) {
+    flags |= IR_OPT_FEATURE_LOAD;
+  }
+  if (features->has_assign) {
+    flags |= IR_OPT_FEATURE_ASSIGN;
+  }
+  if (features->has_temp_write) {
+    flags |= IR_OPT_FEATURE_TEMP_WRITE;
+  }
+  if (features->has_binary) {
+    flags |= IR_OPT_FEATURE_BINARY;
+  }
+  if (features->has_div) {
+    flags |= IR_OPT_FEATURE_DIV;
+  }
+  return flags;
+}
+
+static int ir_scheduled_pass_is_enabled(const IROptScheduledPass *pass,
+                                        unsigned features) {
+  if ((features & pass->gate.all) != pass->gate.all) {
+    return 0;
+  }
+  return pass->gate.any == IR_OPT_REQUIRE_NONE ||
+         (features & pass->gate.any) != 0;
+}
+
+static int ir_run_fixpoint_stage(IRFunction *function,
+                                 const IROptFixpointStage *stage) {
+  if (!stage || !stage->passes || stage->max_iterations <= 0) {
+    return 0;
+  }
+
+  unsigned long long version = 1;
+  unsigned long long clean_version[IR_OPT_PASS_COUNT];
+  for (int i = 0; i < IR_OPT_PASS_COUNT; i++) {
+    clean_version[i] = 0;
+  }
+
+  for (int iteration = 0; iteration < stage->max_iterations; iteration++) {
+    int changed = 0;
+    IROptFunctionFeatures features;
+
+    mettle_compiler_ctx_set_fixpoint_iteration(iteration + 1);
+    ir_collect_function_features(function, &features);
+    unsigned feature_flags = ir_opt_feature_flags(&features);
+
+    for (size_t pass_index = 0; pass_index < stage->pass_count; pass_index++) {
+      const IROptScheduledPass *pass = &stage->passes[pass_index];
+      int enabled = ir_scheduled_pass_is_enabled(pass, feature_flags);
+      if (!ir_run_fixpoint_pass(function, pass->id, pass->run, enabled, &version,
+                                clean_version, &changed)) {
+        return 0;
+      }
+    }
+
+    if (!changed) {
+      break;
+    }
+  }
+
+  mettle_compiler_ctx_set_fixpoint_iteration(0);
+  return 1;
+}
+
+int ir_optimize_function_pipeline(IRFunction *function) {
+  if (!function) {
+    return 0;
+  }
+
+  {
+    int pre_changed = 0;
+    if (!ir_fuse_rotate_add_pass(function, &pre_changed)) {
+      return 0;
+    }
+  }
+
+  if (!ir_run_fixpoint_stage(function, &g_ir_fixpoint_stage)) {
+    return 0;
+  }
+
+  if (!ir_run_named_stage(function, &g_ir_post_fixpoint_stage)) {
+    return 0;
+  }
+
+  return ir_function_rebuild_cfg(function);
+}
+
+static void ir_set_current_function_context(IRFunction *function) {
+  if (function) {
+    mettle_compiler_ctx_set_function_name(
+        function->name ? function->name : "<anonymous>");
+  }
+}
+
+static int ir_run_program_stage_for_each_function(
+    IRProgram *program, int (*run)(IRFunction *function)) {
+  for (size_t i = 0; i < program->function_count; i++) {
+    IRFunction *function = program->functions[i];
+    ir_set_current_function_context(function);
+    if (!run(function)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+int ir_optimize_program_pipeline(IRProgram *program,
+                                 const IROptimizeOptions *options) {
+  if (!program) {
+    return 0;
+  }
+
+  ir_function_index_reset();
+
+  if (!ir_run_program_stage_for_each_function(
+          program, ir_optimize_pre_inline_function)) {
+    ir_function_index_reset();
+    return 0;
+  }
+
+  if (!options || !options->preserve_function_boundaries) {
+    int inlining_changed = 0;
+    mettle_compiler_ctx_set_pass_name("inline_small_functions");
+    mettle_compiler_ctx_set_fixpoint_iteration(0);
+    if (!ir_inline_small_functions_pass(program, &inlining_changed)) {
+      mettle_compiler_ice("IR optimization inlining pass failed");
+    }
+  }
+
+  if (!ir_run_program_stage_for_each_function(
+          program, ir_optimize_function_pipeline)) {
+    mettle_compiler_ice_report("IR optimization failed", NULL);
+    ir_function_index_reset();
+    return 0;
+  }
+
+  ir_function_index_reset();
+  return 1;
+}

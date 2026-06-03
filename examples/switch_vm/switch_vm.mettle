@@ -1,0 +1,84 @@
+// Triangulation: bytecode interpreter with a switch dispatch loop.
+//
+// A 4096-op program of (opcode, operand) pairs run repeatedly through a
+// switch. This is the classic interpreter dispatch pattern: a hard-to-predict
+// indirect branch plus per-op work. Probes how Mettle lowers switch (jump
+// table vs if-chain) and branch density relative to GCC.
+//
+// Build: build.bat   Run: switch_vm.exe
+
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+const PROG = 4096;
+
+function run(ops: int32*, args: int64*) -> int64 {
+  var acc: int64 = 1;
+  var i: int32 = 0;
+  while (i < PROG) {
+    var operand: int64 = args[i];
+    switch (ops[i]) {
+      case 0:
+        acc = acc + operand;
+        break;
+      case 1:
+        acc = acc ^ operand;
+        break;
+      case 2:
+        acc = acc * 3 + operand;
+        break;
+      case 3:
+        acc = acc - operand;
+        break;
+      case 4:
+        acc = (acc << 1) + operand;
+        break;
+      case 5:
+        acc = acc + (operand >> 1);
+        break;
+      case 6:
+        acc = acc ^ (operand + i);
+        break;
+      default:
+        acc = acc + 1;
+    }
+    i = i + 1;
+  }
+  return acc;
+}
+
+function main() -> int32 {
+  var ops: int32* = (int32*)malloc((int64)PROG * 4);
+  var args: int64* = (int64*)malloc((int64)PROG * 8);
+  var seed: int64 = 12345;
+  var k: int32 = 0;
+  while (k < PROG) {
+    seed = seed * 1103515245 + 12345;
+    ops[k] = (int32)((seed >> 16) & 7);
+    args[k] = (seed >> 8) & 1023;
+    k = k + 1;
+  }
+
+  var passes: int32 = 30000;
+  println("Bytecode VM switch dispatch, 4096 ops x 30000 passes");
+
+  var t0: uint64 = bench_time_us();
+  var acc: int64 = 0;
+  var p: int32 = 0;
+  while (p < passes) {
+    acc = acc ^ run(ops, args);
+    p = p + 1;
+  }
+  var elapsed_us: uint64 = bench_time_us() - t0;
+
+  print("Checksum = ");
+  println_int(acc);
+  print("Time: ");
+  print_int(elapsed_us);
+  println(" us");
+
+  free((cstring)ops);
+  free((cstring)args);
+  return 0;
+}

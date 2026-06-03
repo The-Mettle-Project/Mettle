@@ -581,7 +581,10 @@ int code_generator_type_is_aggregate(const Type *type) {
   if (!type) {
     return 0;
   }
-  return type->kind == TYPE_STRUCT || type->kind == TYPE_ARRAY;
+  /* Tagged enums have a fixed struct-like layout (int32 tag + payload union)
+   * and follow the same ABI rules as a struct of the same size/alignment. */
+  return type->kind == TYPE_STRUCT || type->kind == TYPE_ARRAY ||
+         type->kind == TYPE_TAGGED_ENUM;
 }
 
 size_t code_generator_abi_type_size(const Type *type) {

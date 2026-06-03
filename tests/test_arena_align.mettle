@@ -1,0 +1,34 @@
+// arena_alloc_aligned honors explicit alignment requests up to 64.
+import "std/arena";
+
+function check_align(p: cstring, align_mask: int64) -> int32 {
+  if (p == 0) { return 1; }
+  if (((int64)p & align_mask) != (int64)0) { return 1; }
+  return 0;
+}
+
+function main() -> int32 {
+  var a: Arena* = arena_init((int64)4096);
+  if (a == 0) { return 1; }
+
+  // Force misaligned head by allocating a single byte first.
+  var pre: cstring = arena_alloc(a, (int64)1);
+  if (pre == 0) { return 2; }
+
+  var p16: cstring = arena_alloc_aligned(a, (int64)32, (int64)16);
+  if (check_align(p16, (int64)15) != 0) { return 3; }
+
+  var p32: cstring = arena_alloc_aligned(a, (int64)32, (int64)32);
+  if (check_align(p32, (int64)31) != 0) { return 4; }
+
+  var p64: cstring = arena_alloc_aligned(a, (int64)8, (int64)64);
+  if (check_align(p64, (int64)63) != 0) { return 5; }
+
+  // The next default alloc should still be 8-aligned regardless of prior
+  // stronger alignments.
+  var p8: cstring = arena_alloc(a, (int64)1);
+  if (check_align(p8, (int64)7) != 0) { return 6; }
+
+  arena_free(a);
+  return 0;
+}

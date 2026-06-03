@@ -1,0 +1,59 @@
+// New dimension: narrow uint8 arithmetic over a buffer.
+//
+// Reads/writes a 256 KB uint8 buffer doing 8-bit arithmetic (wraps mod 256).
+// Probes narrow-type codegen: does Mettle emit byte ops, or widen to 64-bit
+// and re-mask each time? GCC -O3 packs this into wide SIMD byte lanes.
+//
+// Build: build.bat   Run: byte_arith.exe
+
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+const N = 262144;
+
+function run(buf: uint8*, n: int32) -> int64 {
+  var i: int32 = 0;
+  while (i < n) {
+    buf[i] = buf[i] * 3 + 7;
+    buf[i] = buf[i] ^ 0xA5;
+    i = i + 1;
+  }
+  var acc: int64 = 0;
+  var k: int32 = 0;
+  while (k < n) {
+    acc = acc + (int64)buf[k];
+    k = k + 1;
+  }
+  return acc;
+}
+
+function main() -> int32 {
+  var buf: uint8* = (uint8*)malloc((int64)N);
+  var i: int32 = 0;
+  while (i < N) {
+    buf[i] = (uint8)(i & 255);
+    i = i + 1;
+  }
+
+  var passes: int32 = 2000;
+  println("uint8 buffer arithmetic: 256 KB x 2000 passes");
+
+  var t0: uint64 = bench_time_us();
+  var acc: int64 = 0;
+  var p: int32 = 0;
+  while (p < passes) {
+    acc = acc ^ run(buf, N);
+    p = p + 1;
+  }
+  var elapsed_us: uint64 = bench_time_us() - t0;
+
+  print("Checksum = ");
+  println_int(acc);
+  print("Time: ");
+  print_int(elapsed_us);
+  println(" us");
+
+  free((cstring)buf);
+  return 0;
+}

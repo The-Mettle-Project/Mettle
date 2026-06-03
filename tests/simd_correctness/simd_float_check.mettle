@@ -1,0 +1,143 @@
+// General correctness harness for the float64/float32 SIMD kernels.
+// Uses integer-valued floats kept well inside the exact range (|f64 sums| <
+// 2^53, |f32 sums| < 2^24) so that any summation order — scalar reference vs.
+// 8/4-lane vector reduction — yields the identical exact value, making ==
+// comparison valid without false failures from FP reassociation.
+
+import "std/io";
+import "std/mem";
+
+var g_seed: int64 = 987654321;
+function rnd_small() -> int32 {
+  g_seed = (g_seed * 1103515245 + 12345) & 0x7FFFFFFFFFFF;
+  return (int32)((g_seed % 40) - 20);   // [-20, 19], small to keep f32 exact
+}
+
+function ks_f64(a: float64*, n: int64) -> float64 {
+  var s: float64 = 0.0; var i: int64 = 0;
+  while (i < n) { s = s + a[i]; i = i + 1; }
+  return s;
+}
+function ks_f32(a: float32*, n: int64) -> float32 {
+  var s: float32 = 0.0; var i: int64 = 0;
+  while (i < n) { s = s + a[i]; i = i + 1; }
+  return s;
+}
+function kd_f64(a: float64*, b: float64*, n: int64) -> float64 {
+  var s: float64 = 0.0; var i: int64 = 0;
+  while (i < n) { s = s + a[i] * b[i]; i = i + 1; }
+  return s;
+}
+function kd_f32(a: float32*, b: float32*, n: int64) -> float32 {
+  var s: float32 = 0.0; var i: int64 = 0;
+  while (i < n) { s = s + a[i] * b[i]; i = i + 1; }
+  return s;
+}
+function ka_f64(src: float64*, dst: float64*, n: int64) -> int32 {
+  var i: int64 = 0;
+  while (i < n) {
+    dst[i] = 2.0 * src[i] + 3.0 * dst[i] + 5.0;
+    i = i + 1;
+  }
+  return 0;
+}
+function ka_f32(src: float32*, dst: float32*, n: int64) -> int32 {
+  var i: int64 = 0;
+  while (i < n) {
+    dst[i] = (float32)2.0 * src[i] + (float32)3.0 * dst[i] + (float32)5.0;
+    i = i + 1;
+  }
+  return 0;
+}
+
+/* General auto-vectorizer (IR_OP_SIMD_VLOOP_F64) shapes the per-shape
+ * recognizers do not claim: a multi-array element-wise map and a sum-of-DAG
+ * reduction. Integer-valued in-range inputs keep == exact. */
+function vmap_combo(out: float64*, a: float64*, b: float64*, c: float64*,
+                    n: int64) -> int32 {
+  var i: int64 = 0;
+  while (i < n) { out[i] = (a[i] + b[i]) * c[i]; i = i + 1; }
+  return 0;
+}
+function vred_ssq(a: float64*, b: float64*, n: int64) -> float64 {
+  var acc: float64 = 0.0; var i: int64 = 0;
+  while (i < n) { acc = acc + (a[i] * a[i] + b[i]); i = i + 1; }
+  return acc;
+}
+
+var g_fail: int32 = 0;
+function fail(label: cstring, len: int64) -> int32 {
+  print(cstr("FAIL ")); print(label); print(cstr(" n=")); print_int(len);
+  println(cstr(""));
+  g_fail = g_fail + 1;
+  return 0;
+}
+
+function run_len(n: int64) -> int32 {
+  var cap: int64 = n; if (cap < 1) { cap = 1; }
+  var a64: float64* = (float64*)malloc(cap * 8);
+  var b64: float64* = (float64*)malloc(cap * 8);
+  var c64: float64* = (float64*)malloc(cap * 8);
+  var o64: float64* = (float64*)malloc(cap * 8);
+  var a32: float32* = (float32*)malloc(cap * 4);
+  var b32: float32* = (float32*)malloc(cap * 4);
+
+  var ref_sum: float64 = 0.0;
+  var ref_dot: float64 = 0.0;
+  var ref_affine: float64 = 0.0;
+  var ref_combo: float64 = 0.0;
+  var ref_ssq: float64 = 0.0;
+  var i: int64 = 0;
+  while (i < n) {
+    var x: int32 = rnd_small();
+    var y: int32 = rnd_small();
+    var z: int32 = rnd_small();
+    a64[i] = (float64)x; b64[i] = (float64)y; c64[i] = (float64)z;
+    a32[i] = (float32)x; b32[i] = (float32)y;
+    ref_sum = ref_sum + (float64)x;
+    ref_dot = ref_dot + (float64)x * (float64)y;
+    ref_affine = ref_affine + (float64)(2 * x + 3 * y + 5);
+    ref_combo = ref_combo + (float64)((x + y) * z);
+    ref_ssq = ref_ssq + (float64)(x * x + y);
+    i = i + 1;
+  }
+
+  if (ks_f64(a64, n) != ref_sum) { fail(cstr("sum_f64"), n); }
+  if (kd_f64(a64, b64, n) != ref_dot) { fail(cstr("dot_f64"), n); }
+  // f32 references: compare via float64 widening of the f32 result against the
+  // exact integer reference (values are integers, so the f32 sum is exact).
+  if ((float64)ks_f32(a32, n) != ref_sum) { fail(cstr("sum_f32"), n); }
+  if ((float64)kd_f32(a32, b32, n) != ref_dot) { fail(cstr("dot_f32"), n); }
+
+  // General auto-vectorizer checks run BEFORE the affine map below, which
+  // overwrites b64 in place. map out[i]=(a[i]+b[i])*c[i] then sum the outputs;
+  // and the sum-of-squares-plus reduction.
+  vmap_combo(o64, a64, b64, c64, n);
+  if (ks_f64(o64, n) != ref_combo) { fail(cstr("vloop_map_combo"), n); }
+  if (vred_ssq(a64, b64, n) != ref_ssq) { fail(cstr("vloop_reduce_ssq"), n); }
+
+  ka_f64(a64, b64, n);
+  ka_f32(a32, b32, n);
+  if (ks_f64(b64, n) != ref_affine) { fail(cstr("affine_f64"), n); }
+  if ((float64)ks_f32(b32, n) != ref_affine) { fail(cstr("affine_f32"), n); }
+
+  free((cstring)a64); free((cstring)b64); free((cstring)c64); free((cstring)o64);
+  free((cstring)a32); free((cstring)b32);
+  return 0;
+}
+
+function main() -> int32 {
+  var lens: int64* = (int64*)malloc(32 * 8);
+  lens[0]=1; lens[1]=2; lens[2]=3; lens[3]=4; lens[4]=5; lens[5]=7; lens[6]=8;
+  lens[7]=9; lens[8]=15; lens[9]=16; lens[10]=17; lens[11]=23; lens[12]=31;
+  lens[13]=32; lens[14]=33; lens[15]=40; lens[16]=63; lens[17]=64; lens[18]=65;
+  lens[19]=100; lens[20]=127; lens[21]=128; lens[22]=129; lens[23]=200;
+  lens[24]=255; lens[25]=256; lens[26]=257; lens[27]=512; lens[28]=999;
+  lens[29]=1000; lens[30]=1024; lens[31]=2000;
+  var k: int64 = 0;
+  while (k < 32) { run_len(lens[k]); k = k + 1; }
+
+  if (g_fail == 0) { println(cstr("FLOAT SIMD: ALL OK")); return 0; }
+  print(cstr("FLOAT SIMD FAILURES: ")); print_int((int64)g_fail); println(cstr(""));
+  return 1;
+}

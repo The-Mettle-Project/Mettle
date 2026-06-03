@@ -1,3 +1,6 @@
+// A benchmark-shaped function named matmul must not get a hidden compiler
+// special case. This program should stay scalar unless an explicit SIMD API is
+// used.
 var N: int32 = 32;
 
 function fill_matrix(m: int32*, seed: int32) {

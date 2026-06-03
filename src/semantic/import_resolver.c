@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #endif
 #include "import_resolver.h"
+#include "../codegen/binary_emitter.h"
 #include "../compiler/compiler_context.h"
 #include "../lexer/lexer.h"
 #include "../parser/parser.h"
@@ -1848,6 +1849,33 @@ static char *resolve_import_path_uncached(ImportContext *ctx,
 
   if (ctx && ctx->options && ctx->options->stdlib_directory &&
       import_uses_std_namespace(import_path)) {
+    /* On the native ELF (Linux) target, prefer an OS-specific
+     * `<name>.linux.mettle` sibling so std modules like io/bench/process can
+     * ship syscall-based variants while Windows keeps the plain `.mettle`
+     * file. The import path has no extension (e.g. "std/io"), so we append
+     * ".linux" and let resolve_candidate_path add the ".mettle" extension. */
+    if (ctx->options->target_is_elf && !path_has_extension(import_path)) {
+      size_t base_len = strlen(import_path);
+      /* ".linux.mettle" + NUL. The `.linux` infix makes path_has_extension
+       * true, so resolve_candidate_path would not auto-append `.mettle`; spell
+       * out the full extension here. */
+      char *linux_import = malloc(base_len + 14);
+      if (linux_import) {
+        memcpy(linux_import, import_path, base_len);
+        memcpy(linux_import + base_len, ".linux.mettle", 14);
+        char *linux_candidate =
+            join_paths(ctx->options->stdlib_directory, linux_import);
+        free(linux_import);
+        if (linux_candidate) {
+          char *resolved = resolve_candidate_path(linux_candidate);
+          free(linux_candidate);
+          if (resolved) {
+            return resolved;
+          }
+        }
+      }
+    }
+
     char *std_candidate =
         join_paths(ctx->options->stdlib_directory, import_path);
     if (std_candidate) {
@@ -2519,6 +2547,20 @@ static void process_import_strs_in_node(ImportContext *ctx, ASTNode *node,
   }
 }
 
+// A guarded import (`import "..." if windows|linux;`) is included only when its
+// platform matches the build target. The compiler targets its host, so the
+// active platform follows the host object format (ELF => linux, else windows).
+static int import_platform_matches(const char *guard) {
+  if (!guard) {
+    return 1; // unconditional import
+  }
+  const char *target =
+      (binary_target_format_host_default() == BINARY_TARGET_FORMAT_ELF_X64)
+          ? "linux"
+          : "windows";
+  return strcmp(guard, target) == 0;
+}
+
 static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
                                           const char *current_file_path,
                                           int *had_error, int is_nested) {
@@ -2555,6 +2597,14 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
     ASTNode *decl = prog_data->declarations[i];
     if (decl->type == AST_IMPORT) {
       ImportDeclaration *import_decl = (ImportDeclaration *)decl->data;
+
+      // Drop imports guarded for a different platform before resolving them,
+      // so a platform-specific module is never even looked up off-target.
+      if (!import_platform_matches(import_decl->platform_guard)) {
+        ast_destroy_node(decl);
+        continue;
+      }
+
       char *full_path =
           resolve_import_path(ctx, current_file_path, import_decl->module_name);
 

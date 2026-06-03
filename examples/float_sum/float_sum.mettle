@@ -1,0 +1,59 @@
+// Mettle float64 array reduction benchmark.
+//
+// Sums a 65536-element float64 array, 4000 passes. This is a textbook
+// auto-vectorization target: GCC -O3 packs the doubles into SSE/AVX lanes
+// and reduces with parallel accumulators. Mettle's vectorizer is int-focused,
+// so this is expected to favor C.
+//
+// Build: build.bat   Run: float_sum.exe
+
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+const N = 65536;
+
+function fill(a: float64*, n: int32) {
+  var i: int32 = 0;
+  while (i < n) {
+    a[i] = (float64)i * 0.5 + 1.25;
+    i = i + 1;
+  }
+}
+
+function sum_array(a: float64*, n: int32) -> float64 {
+  var s: float64 = 0.0;
+  var i: int32 = 0;
+  while (i < n) {
+    s = s + a[i];
+    i = i + 1;
+  }
+  return s;
+}
+
+function main() -> int32 {
+  var a: float64* = (float64*)malloc((int64)N * 8);
+  fill(a, N);
+
+  var passes: int32 = 4000;
+  println("float64 sum reduction: 65536 elems x 4000 passes");
+
+  var t0: uint64 = bench_time_us();
+  var acc: float64 = 0.0;
+  var p: int32 = 0;
+  while (p < passes) {
+    acc = acc + sum_array(a, N);
+    p = p + 1;
+  }
+  var elapsed_us: uint64 = bench_time_us() - t0;
+
+  print("Checksum = ");
+  println_int((int64)acc);
+
+  print("Time: ");
+  print_int(elapsed_us);
+  println(" us");
+
+  free((cstring)a);
+  return 0;
+}

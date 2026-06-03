@@ -1,0 +1,62 @@
+// Triangulation: pass and return a 32-byte struct BY VALUE in a hot loop.
+//
+// Each iteration copies a 4-field struct in (as an argument) and out (as a
+// return value). This stresses the aggregate-copy / struct-ABI path, which has
+// historically been a Mettle weak spot. GCC -O3 scalarizes the struct into
+// registers (SROA) and the copies vanish. Probes whether by-value aggregates
+// stay in memory on Mettle.
+//
+// Build: build.bat   Run: struct_byval.exe
+
+import "std/io";
+import "std/bench";
+
+const N = 40000000;
+
+struct V4 {
+  a: int64;
+  b: int64;
+  c: int64;
+  d: int64;
+}
+
+function step(v: V4) -> V4 {
+  var r: V4;
+  r.a = v.a + v.d;
+  r.b = v.b ^ (v.a >> 3);
+  r.c = v.c + v.b + 1;
+  r.d = v.d * 2654435761 + 1;
+  return r;
+}
+
+function run() -> int64 {
+  var s: V4;
+  s.a = 1; s.b = 2; s.c = 3; s.d = 4;
+  var i: int64 = 0;
+  while (i < (int64)N) {
+    s = step(s);
+    i = i + 1;
+  }
+  return s.a ^ s.b ^ s.c ^ s.d;
+}
+
+function main() -> int32 {
+  var passes: int32 = 5;
+  println("Struct-by-value (32B) call, 40M iters x 5 passes");
+
+  var t0: uint64 = bench_time_us();
+  var acc: int64 = 0;
+  var p: int32 = 0;
+  while (p < passes) {
+    acc = acc ^ run();
+    p = p + 1;
+  }
+  var elapsed_us: uint64 = bench_time_us() - t0;
+
+  print("Checksum = ");
+  println_int(acc);
+  print("Time: ");
+  print_int(elapsed_us);
+  println(" us");
+  return 0;
+}

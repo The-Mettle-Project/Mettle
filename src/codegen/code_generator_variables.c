@@ -16,6 +16,11 @@ void code_generator_generate_global_variable(CodeGenerator *generator,
   if (!var_data || !var_data->name) {
     return;
   }
+  // `const` declarations are compile-time values folded at every use site;
+  // they carry no storage, so emit nothing for them.
+  if (var_data->is_const) {
+    return;
+  }
   if (var_data->is_extern) {
     const char *extern_name =
         code_generator_get_link_symbol_name(generator, var_data->name);

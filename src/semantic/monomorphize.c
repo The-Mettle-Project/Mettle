@@ -25,6 +25,7 @@ typedef struct {
   size_t type_arg_count;
   char *mangled_name;
   SourceLocation location;
+  int emitted;
 } Instantiation;
 
 typedef struct {
@@ -651,6 +652,7 @@ static int mono_add_instantiation(MonoContext *ctx, const char *generic_name,
   inst->type_args = malloc(type_arg_count * sizeof(char *));
   inst->mangled_name = mangled;
   inst->location = location;
+  inst->emitted = 0;
 
   if (!inst->generic_name || !inst->type_args) {
     free(inst->generic_name);
@@ -2059,6 +2061,74 @@ static int mono_emit_impl_method_functions(MonoContext *ctx, ASTNode *program) {
   return 1;
 }
 
+static int mono_emit_instantiation(MonoContext *ctx, Program *prog,
+                                   ASTNode *program, size_t index,
+                                   int *success) {
+  ASTNode *mono_node = NULL;
+  GenericDef *def = NULL;
+  Instantiation *inst = NULL;
+  size_t deps_start = 0;
+
+  if (!ctx || !prog || !program || !success || index >= ctx->instance_count) {
+    return 1;
+  }
+
+  inst = &ctx->instances[index];
+  if (inst->emitted) {
+    return 1;
+  }
+
+  def = find_generic_def(ctx, inst->generic_name);
+  if (!def) {
+    return 1;
+  }
+
+  if (!validate_instantiation(def, inst, ctx)) {
+    *success = 0;
+    return 0;
+  }
+
+  deps_start = ctx->instance_count;
+
+  if (def->is_struct) {
+    mono_node = create_monomorphized_struct(def, inst, ctx);
+  } else {
+    mono_node = create_monomorphized_function(def, inst, ctx);
+  }
+
+  if (!mono_node) {
+    return 1;
+  }
+
+  for (size_t j = deps_start; j < ctx->instance_count; j++) {
+    GenericDef *dep_def = find_generic_def(ctx, ctx->instances[j].generic_name);
+    if (!dep_def || !dep_def->is_struct || ctx->instances[j].emitted) {
+      continue;
+    }
+    if (!mono_emit_instantiation(ctx, prog, program, j, success)) {
+      return 0;
+    }
+    if (!*success) {
+      return 0;
+    }
+  }
+
+  prog->declarations =
+      realloc(prog->declarations,
+              (prog->declaration_count + 1) * sizeof(ASTNode *));
+  if (!prog->declarations) {
+    *success = 0;
+    return 0;
+  }
+  prog->declarations[prog->declaration_count] = mono_node;
+  prog->declaration_count++;
+  ast_add_child(program, mono_node);
+
+  inst->emitted = 1;
+  collect_type_instantiations(mono_node, ctx);
+  return 1;
+}
+
 int monomorphize_program(ASTNode *program, ErrorReporter *reporter) {
   if (!program || program->type != AST_PROGRAM)
     return 1;
@@ -2093,34 +2163,11 @@ int monomorphize_program(ASTNode *program, ErrorReporter *reporter) {
     while (processed < ctx.instance_count) {
       size_t current_count = ctx.instance_count;
       for (size_t i = processed; i < current_count; i++) {
-        Instantiation *inst = &ctx.instances[i];
-        GenericDef *def = find_generic_def(&ctx, inst->generic_name);
-        if (!def)
-          continue;
-
-        if (!validate_instantiation(def, inst, &ctx)) {
-          success = 0;
+        if (!mono_emit_instantiation(&ctx, prog, program, i, &success)) {
           goto cleanup;
         }
-
-        ASTNode *mono_node = NULL;
-        if (def->is_struct) {
-          mono_node = create_monomorphized_struct(def, inst, &ctx);
-        } else {
-          mono_node = create_monomorphized_function(def, inst, &ctx);
-        }
-
-        if (mono_node) {
-          prog->declarations =
-              realloc(prog->declarations,
-                      (prog->declaration_count + 1) * sizeof(ASTNode *));
-          prog->declarations[prog->declaration_count] = mono_node;
-          prog->declaration_count++;
-          ast_add_child(program, mono_node);
-
-          // Scan the new node for additional generic instantiations
-          // (e.g., a monomorphized function calling another generic function)
-          collect_type_instantiations(mono_node, &ctx);
+        if (!success) {
+          goto cleanup;
         }
       }
       processed = current_count;

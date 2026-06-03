@@ -60,6 +60,8 @@ typedef struct {
   char *namespace_alias;
   char **selected_names;   // non-NULL when import { a, b } from "mod"
   size_t selected_count;
+  char *platform_guard;    // "windows"/"linux" for `import ... if <platform>`;
+                           // NULL means the import is unconditional
 } ImportDeclaration;
 
 typedef struct {
@@ -72,6 +74,7 @@ typedef struct {
   ASTNode *initializer;
   int is_extern;
   int is_exported;
+  int is_const; // declared with `const`: immutable, compile-time integer value
   char *link_name;
 } VarDeclaration;
 
@@ -259,6 +262,7 @@ typedef struct {
 
 typedef struct {
   ASTNode *value;
+  ASTNode *value_high; // non-NULL for a range case `lo..hi`; `value` holds lo
   ASTNode *body;
   int is_default;
 } CaseClause;

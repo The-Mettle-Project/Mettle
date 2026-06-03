@@ -135,8 +135,12 @@ jobs:
           cp bin/mettle "$out/bin/"
           cp -r bin/stdlib "$out/stdlib"
           cp -r bin/runtime "$out/runtime"
-          [ -f LICENSE ] && cp LICENSE "$out/" || true
-          [ -f README.md ] && cp README.md "$out/" || true
+          if [ -f LICENSE ]; then
+            cp LICENSE "$out/"
+          fi
+          if [ -f README.md ]; then
+            cp README.md "$out/"
+          fi
           tar="$out.tar.gz"
           tar -czf "$tar" "$out"
           echo "tar=$tar" >> "$GITHUB_OUTPUT"
@@ -154,4 +158,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ steps.stage.outputs.tar }}
-          generate_release_notes: true
+          # Notes are generated once by the windows job; regenerating here would
+          # append a duplicate auto-notes block to the release body.
+          generate_release_notes: false

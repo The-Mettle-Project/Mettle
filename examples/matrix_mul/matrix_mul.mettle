@@ -43,16 +43,22 @@ function matmul(a: int32*, b: int32*, c: int32*) {
       var sum2: int32 = 0;
       var sum3: int32 = 0;
       var a_idx: int64 = row_base;
-      var b_idx: int64 = (int64)col;
+      var b0_idx: int64 = (int64)col;
+      var b1_idx: int64 = b0_idx + 1;
+      var b2_idx: int64 = b0_idx + 2;
+      var b3_idx: int64 = b0_idx + 3;
       var k: int32 = 0;
       while (k < N) {
         var av: int32 = a[a_idx];
-        sum0 = sum0 + av * b[b_idx];
-        sum1 = sum1 + av * b[b_idx + 1];
-        sum2 = sum2 + av * b[b_idx + 2];
-        sum3 = sum3 + av * b[b_idx + 3];
+        sum0 = sum0 + av * b[b0_idx];
+        sum1 = sum1 + av * b[b1_idx];
+        sum2 = sum2 + av * b[b2_idx];
+        sum3 = sum3 + av * b[b3_idx];
         a_idx = a_idx + 1;
-        b_idx = b_idx + (int64)N;
+        b0_idx = b0_idx + (int64)N;
+        b1_idx = b1_idx + (int64)N;
+        b2_idx = b2_idx + (int64)N;
+        b3_idx = b3_idx + (int64)N;
         k = k + 1;
       }
       var c_idx: int64 = row_base + (int64)col;

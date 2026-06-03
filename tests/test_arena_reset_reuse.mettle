@@ -1,0 +1,42 @@
+// arena_reset moves all chunks to the freelist. A second burst of allocations
+// must reuse those chunks without malloc'ing new ones.
+import "std/arena";
+
+function burst(a: Arena*, count: int32) -> int32 {
+  var i: int32 = 0;
+  while (i < count) {
+    var p: cstring = arena_alloc(a, (int64)256);
+    if (p == 0) { return 1; }
+    p[0] = (uint8)((int32)i & 255);
+    p[255] = (uint8)((int32)i & 255);
+    i = i + 1;
+  }
+  return 0;
+}
+
+function main() -> int32 {
+  var a: Arena* = arena_init((int64)2048);
+  if (a == 0) { return 1; }
+
+  if (burst(a, 40) != 0) { return 2; }
+  var s1: ArenaStats = arena_stats(a);
+  if (s1.chunk_count <= 1) { return 3; }
+  var malloc_chunks_after_burst1: int32 = s1.chunk_count + s1.free_chunk_count;
+
+  arena_reset(a);
+  var s2: ArenaStats = arena_stats(a);
+  if (s2.total_used != (int64)0) { return 4; }
+  if (s2.chunk_count != 0) { return 5; }
+  if (s2.free_chunk_count <= 0) { return 6; }
+
+  if (burst(a, 40) != 0) { return 7; }
+  var s3: ArenaStats = arena_stats(a);
+
+  // Total chunks must not have grown: every alloc in the second burst was
+  // serviced from the freelist.
+  var malloc_chunks_after_burst2: int32 = s3.chunk_count + s3.free_chunk_count;
+  if (malloc_chunks_after_burst2 > malloc_chunks_after_burst1) { return 8; }
+
+  arena_free(a);
+  return 0;
+}

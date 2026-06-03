@@ -1,0 +1,600 @@
+// =============================================================================
+//  Mettle Orbits — an interactive, real-time N-body gravity sandbox.
+//
+//  A single self-contained Mettle program that compiles straight to a native
+//  Windows x86-64 executable (COFF object + internal PE linker, zero runtime):
+//
+//      mettle --build --release orbits.mettle -o orbits.exe
+//
+//  What it shows off:
+//    * Native Win32 GUI via std/ui  — window, message loop, timers, painting
+//    * Function pointers            — the window procedure is passed by &name
+//    * Structs + fixed-size arrays  — particles carry their own comet trails
+//    * Floating-point simulation    — softened Newtonian gravity, per frame
+//    * C interop via `extern`       — libc sqrt/sin/cos/sprintf, GDI double-buffer
+//    * Manual rendering             — a cached brush palette, flicker-free blit
+//
+//  Controls:
+//    Left-click  : drop a gravity attractor      Right-click : drop a repeller
+//    Space       : pause / resume                R           : reset particles
+//    C           : clear all wells               Esc         : quit
+// =============================================================================
+
+import "std/ui";
+import "std/io";
+import "std/mem";
+import "std/process";
+import "std/win32";
+import "std/bench";   // bench_time_us(): QueryPerformanceCounter high-res clock
+
+// --- Tunables ----------------------------------------------------------------
+const NUM_PARTICLES = 300;
+const MAX_WELLS     = 32;
+const TRAIL         = 9;     // comet-trail samples kept per particle
+const TRAIL_STEP    = 6;     // palette steps each trail sample fades by
+const PAL           = 64;    // gradient brush count
+const NUM_STARS     = 150;
+const WIN_W         = 1180;
+const WIN_H         = 760;
+
+// Fixed-timestep frame pacing (microseconds). Physics advances in discrete
+// FRAME_US chunks via an accumulator, so motion speed is identical regardless
+// of how fast frames actually render. MAX_STEPS caps catch-up after a stall so
+// the sim can't enter a spiral of death.
+const FRAME_US      = 16667;   // 60 simulation steps per second
+const MAX_STEPS     = 5;       // clamp catch-up to 5 physics steps per frame
+
+// Float "constants" (const must be integer, so these are globals).
+var G_SOFTEN: float64    = 260.0;   // softening added to r^2 (avoids singularity)
+var SPEED_CAP: float64   = 18.0;
+var DAMPING: float64     = 0.9995;
+var WELL_ATTRACT: float64 = 9500.0;
+var WELL_REPEL: float64   = -7500.0;
+var CENTER_MASS: float64  = 16000.0;
+var TAU: float64          = 6.28318530718;
+
+// --- C runtime + GDI bindings the stdlib doesn't already expose --------------
+extern function c_sqrt(x: float64) -> float64 = "sqrt";
+extern function c_sin(x: float64) -> float64  = "sin";
+extern function c_cos(x: float64) -> float64  = "cos";
+extern function c_sprintf(buf: cstring, fmt: cstring, a: int64, b: int64, c: int64, d: int64) -> int32 = "sprintf";
+
+extern function Gdi_CreateCompatibleDC(hdc: int64) -> int64 = "CreateCompatibleDC";
+extern function Gdi_CreateCompatibleBitmap(hdc: int64, w: int32, h: int32) -> int64 = "CreateCompatibleBitmap";
+extern function Gdi_BitBlt(dst: int64, x: int32, y: int32, w: int32, h: int32, src: int64, sx: int32, sy: int32, rop: uint32) -> int32 = "BitBlt";
+extern function Gdi_DeleteDC(hdc: int64) -> int32 = "DeleteDC";
+
+// winmm: raise the system timer resolution to 1ms so a short WM_TIMER period is
+// actually honored. Without this, Windows rounds timers up to the ~15.6ms
+// scheduler tick, which caps the sim near 40 fps regardless of how cheap a
+// frame is.
+extern function Win_timeBeginPeriod(ms: uint32) -> uint32 = "timeBeginPeriod";
+extern function Win_timeEndPeriod(ms: uint32) -> uint32   = "timeEndPeriod";
+
+// kernel32 Sleep: yield the rest of a frame's budget so the idle loop paces
+// itself to the target rate without pinning a CPU core (timeBeginPeriod(1)
+// makes the 1ms granularity accurate).
+extern function Win_Sleep(ms: uint32) = "Sleep";
+
+function SRCCOPY() -> uint32 { return 0x00CC0020; }
+
+// --- Data --------------------------------------------------------------------
+struct Particle {
+  x: float64;
+  y: float64;
+  vx: float64;
+  vy: float64;
+  tx: float64[9];
+  ty: float64[9];
+}
+
+struct Well {
+  x: float64;
+  y: float64;
+  strength: float64;   // signed GM: > 0 attracts, < 0 repels
+}
+
+// --- Global state ------------------------------------------------------------
+// The direct object backend keeps globals scalar, so the arrays live on the
+// heap and we hold typed pointers to them (allocated once in alloc_all).
+var particles: Particle* = 0;
+var wells: Well* = 0;
+var well_count: int32 = 0;
+
+var palette: int64* = 0;          // cached solid brushes for the speed gradient
+var star_brush: int64* = 0;
+var star_x: int32* = 0;
+var star_y: int32* = 0;
+var star_b: int32* = 0;
+
+var attract_brush: int64 = 0;
+var repel_brush: int64 = 0;
+var null_pen: int64 = 0;
+var title_font: int64 = 0;
+var hud_font: int64 = 0;
+
+// Cached off-screen back buffer. Recreating a DC + bitmap every frame is the
+// single most expensive thing render() did; we now build it once and only
+// rebuild when the window size changes.
+var back_dc: int64  = 0;
+var back_bmp: int64 = 0;
+var back_old: int64 = 0;   // original bitmap selected into back_dc
+var back_w: int32   = 0;
+var back_h: int32   = 0;
+
+var view_w: int32 = WIN_W;
+var view_h: int32 = WIN_H;
+var paused: int32 = 0;
+var ready: int32 = 0;
+
+var frame_count: int32 = 0;
+var fps: int32 = 0;
+var fps_last_tick: uint64 = 0;
+var fps_last_frame: int32 = 0;
+
+var stats_buf: cstring = 0;
+
+// --- Small helpers -----------------------------------------------------------
+function alloc_all() {
+  particles  = (Particle*)malloc((int64)300 * sizeof(Particle));
+  wells      = (Well*)malloc((int64)32 * sizeof(Well));
+  palette    = (int64*)malloc((int64)64 * 8);
+  star_brush = (int64*)malloc((int64)3 * 8);
+  star_x     = (int32*)malloc((int64)150 * 4);
+  star_y     = (int32*)malloc((int64)150 * 4);
+  star_b     = (int32*)malloc((int64)150 * 4);
+  stats_buf  = malloc(256);
+}
+
+function randf() -> float64 {
+  return (float64)(rand() & 0x7FFF) / 32768.0;
+}
+
+function rand_range(lo: int32, hi: int32) -> int32 {
+  if (hi <= lo) { return lo; }
+  return lo + (int32)(randf() * (float64)(hi - lo));
+}
+
+function lerpf(a: float64, b: float64, t: float64) -> float64 {
+  return a + (b - a) * t;
+}
+
+// Map t in [0,1] to a dark->blue->magenta->orange->white "ember" gradient.
+function grad_color(t: float64) -> uint32 {
+  var r: float64 = 0.0;
+  var g: float64 = 0.0;
+  var b: float64 = 0.0;
+  if (t < 0.25) {
+    var u: float64 = t / 0.25;
+    r = lerpf(12.0, 40.0, u);  g = lerpf(16.0, 70.0, u);  b = lerpf(40.0, 200.0, u);
+  } else if (t < 0.5) {
+    var u: float64 = (t - 0.25) / 0.25;
+    r = lerpf(40.0, 155.0, u); g = lerpf(70.0, 60.0, u);  b = lerpf(200.0, 215.0, u);
+  } else if (t < 0.72) {
+    var u: float64 = (t - 0.5) / 0.22;
+    r = lerpf(155.0, 246.0, u); g = lerpf(60.0, 92.0, u); b = lerpf(215.0, 82.0, u);
+  } else if (t < 0.88) {
+    var u: float64 = (t - 0.72) / 0.16;
+    r = lerpf(246.0, 255.0, u); g = lerpf(92.0, 200.0, u); b = lerpf(82.0, 70.0, u);
+  } else {
+    var u: float64 = (t - 0.88) / 0.12;
+    r = lerpf(255.0, 255.0, u); g = lerpf(200.0, 255.0, u); b = lerpf(70.0, 238.0, u);
+  }
+  return ui_rgb((uint32)r, (uint32)g, (uint32)b);
+}
+
+function build_palette() {
+  var i: int32 = 0;
+  while (i < PAL) {
+    var t: float64 = (float64)i / (float64)(PAL - 1);
+    palette[i] = Ui_CreateSolidBrush(grad_color(t));
+    i = i + 1;
+  }
+}
+
+function build_assets() {
+  star_brush[0] = Ui_CreateSolidBrush(ui_rgb(38, 44, 70));
+  star_brush[1] = Ui_CreateSolidBrush(ui_rgb(72, 82, 116));
+  star_brush[2] = Ui_CreateSolidBrush(ui_rgb(124, 138, 178));
+  attract_brush = Ui_CreateSolidBrush(ui_rgb(255, 214, 96));
+  repel_brush   = Ui_CreateSolidBrush(ui_rgb(110, 224, 255));
+  null_pen      = Ui_GetStockObject(8);   // NULL_PEN
+  title_font    = ui_create_font(30, cstr("Segoe UI Semibold"), UI_FW_SEMIBOLD());
+  hud_font      = ui_create_font(17, cstr("Consolas"), UI_FW_NORMAL());
+}
+
+function build_stars() {
+  var i: int32 = 0;
+  while (i < NUM_STARS) {
+    star_x[i] = rand_range(0, view_w);
+    star_y[i] = rand_range(0, view_h);
+    star_b[i] = rand_range(0, 3);
+    i = i + 1;
+  }
+}
+
+function set_trail(pp: Particle*) {
+  var k: int32 = 0;
+  while (k < TRAIL) {
+    pp->tx[k] = pp->x;
+    pp->ty[k] = pp->y;
+    k = k + 1;
+  }
+}
+
+// Lay particles out as a rotating accretion disk around the screen center.
+function reset_particles() {
+  var cx: float64 = (float64)view_w * 0.5;
+  var cy: float64 = (float64)view_h * 0.5;
+  var i: int32 = 0;
+  while (i < NUM_PARTICLES) {
+    var pp: Particle* = &particles[i];
+    var ang: float64 = randf() * TAU;
+    var rad: float64 = 70.0 + randf() * ((float64)view_h * 0.42);
+    pp->x = cx + c_cos(ang) * rad;
+    pp->y = cy + c_sin(ang) * rad;
+    var v: float64 = c_sqrt(CENTER_MASS / rad) * 0.92;
+    pp->vx = 0.0 - c_sin(ang) * v;
+    pp->vy = c_cos(ang) * v;
+    set_trail(pp);
+    i = i + 1;
+  }
+}
+
+function add_well(x: float64, y: float64, strength: float64) {
+  if (well_count >= MAX_WELLS) { return; }
+  wells[well_count].x = x;
+  wells[well_count].y = y;
+  wells[well_count].strength = strength;
+  well_count = well_count + 1;
+}
+
+function speed_index(pp: Particle*) -> int32 {
+  var sp: float64 = c_sqrt(pp->vx * pp->vx + pp->vy * pp->vy);
+  var t: float64 = sp / SPEED_CAP;
+  if (t > 1.0) { t = 1.0; }
+  var idx: int32 = 6 + (int32)(t * (float64)(PAL - 1 - 6));
+  if (idx < 6) { idx = 6; }
+  if (idx > PAL - 1) { idx = PAL - 1; }
+  return idx;
+}
+
+// --- Simulation step ---------------------------------------------------------
+function update_physics() {
+  var fw: float64 = (float64)view_w;
+  var fh: float64 = (float64)view_h;
+  var i: int32 = 0;
+  while (i < NUM_PARTICLES) {
+    var pp: Particle* = &particles[i];
+
+    var ax: float64 = 0.0;
+    var ay: float64 = 0.0;
+    var w: int32 = 0;
+    while (w < well_count) {
+      var dx: float64 = wells[w].x - pp->x;
+      var dy: float64 = wells[w].y - pp->y;
+      var denom: float64 = dx * dx + dy * dy + G_SOFTEN;
+      var inv: float64 = wells[w].strength / (denom * c_sqrt(denom));
+      ax = ax + inv * dx;
+      ay = ay + inv * dy;
+      w = w + 1;
+    }
+
+    pp->vx = (pp->vx + ax) * DAMPING;
+    pp->vy = (pp->vy + ay) * DAMPING;
+
+    var sp: float64 = c_sqrt(pp->vx * pp->vx + pp->vy * pp->vy);
+    if (sp > SPEED_CAP) {
+      var s: float64 = SPEED_CAP / sp;
+      pp->vx = pp->vx * s;
+      pp->vy = pp->vy * s;
+    }
+
+    pp->x = pp->x + pp->vx;
+    pp->y = pp->y + pp->vy;
+
+    // Toroidal wrap; reset the trail so it doesn't streak across the screen.
+    var wrapped: int32 = 0;
+    if (pp->x < 0.0)  { pp->x = pp->x + fw; wrapped = 1; }
+    if (pp->x >= fw)  { pp->x = pp->x - fw; wrapped = 1; }
+    if (pp->y < 0.0)  { pp->y = pp->y + fh; wrapped = 1; }
+    if (pp->y >= fh)  { pp->y = pp->y - fh; wrapped = 1; }
+
+    if (wrapped != 0) {
+      set_trail(pp);
+    } else {
+      var k: int32 = TRAIL - 1;
+      while (k >= 1) {
+        pp->tx[k] = pp->tx[k - 1];
+        pp->ty[k] = pp->ty[k - 1];
+        k = k - 1;
+      }
+      pp->tx[0] = pp->x;
+      pp->ty[0] = pp->y;
+    }
+
+    i = i + 1;
+  }
+}
+
+// --- Rendering ---------------------------------------------------------------
+function fill_dot(hdc: int64, cx: int32, cy: int32, half: int32, brush: int64) {
+  var r: UiRect = ui_make_rect(cx - half, cy - half, cx + half + 1, cy + half + 1);
+  Ui_FillRect(hdc, &r, brush);
+}
+
+function draw_well(hdc: int64, w: int32) {
+  var x: int32 = (int32)wells[w].x;
+  var y: int32 = (int32)wells[w].y;
+
+  var brush: int64 = attract_brush;
+  var ring: uint32 = ui_rgb(255, 214, 96);
+  if (wells[w].strength < 0.0) {
+    brush = repel_brush;
+    ring = ui_rgb(110, 224, 255);
+  }
+
+  var oldp: int64 = Ui_SelectObject(hdc, null_pen);
+  var oldb: int64 = Ui_SelectObject(hdc, brush);
+  Ui_Ellipse(hdc, x - 6, y - 6, x + 7, y + 7);
+  Ui_SelectObject(hdc, oldb);
+  Ui_SelectObject(hdc, oldp);
+
+  var halo: UiRect = ui_make_rect(x - 12, y - 12, x + 13, y + 13);
+  ui_draw_ellipse_outline(hdc, &halo, ring, 2);
+}
+
+function draw_hud(hdc: int64) {
+  var oldf: int64 = Ui_SelectObject(hdc, title_font);
+  ui_draw_text_transparent(hdc, 24, 16, cstr("Mettle Orbits"), ui_rgb(150, 205, 255));
+
+  Ui_SelectObject(hdc, hud_font);
+
+  var state: cstring = cstr("RUNNING");
+  if (paused != 0) { state = cstr("PAUSED "); }
+  c_sprintf(stats_buf,
+            cstr("particles %d     wells %d     %d fps     %s"),
+            (int64)NUM_PARTICLES, (int64)well_count, (int64)fps, (int64)state);
+  ui_draw_text_transparent(hdc, 25, 54, stats_buf, ui_rgb(196, 208, 230));
+
+  ui_draw_text_transparent(hdc, 25, view_h - 56,
+    cstr("L-click: attractor    R-click: repeller    Space: pause    R: reset    C: clear    Esc: quit"),
+    ui_rgb(120, 135, 165));
+  ui_draw_text_transparent(hdc, 25, view_h - 32,
+    cstr("native x86-64 .exe  -  compiled by Mettle to a COFF object + internal PE linker  -  no runtime"),
+    ui_rgb(92, 104, 134));
+
+  Ui_SelectObject(hdc, oldf);
+}
+
+// Free the cached back buffer (on resize or shutdown).
+function free_back_buffer() {
+  if (back_dc != 0) {
+    Ui_SelectObject(back_dc, back_old);
+    Ui_DeleteObject(back_bmp);
+    Gdi_DeleteDC(back_dc);
+    back_dc = 0;
+    back_bmp = 0;
+    back_old = 0;
+    back_w = 0;
+    back_h = 0;
+  }
+}
+
+// Return a memory DC sized w x h, reusing the cached one when the size matches.
+function get_back_buffer(hdc: int64, w: int32, h: int32) -> int64 {
+  if (back_dc != 0 && back_w == w && back_h == h) {
+    return back_dc;
+  }
+  free_back_buffer();
+  back_dc  = Gdi_CreateCompatibleDC(hdc);
+  back_bmp = Gdi_CreateCompatibleBitmap(hdc, w, h);
+  back_old = Ui_SelectObject(back_dc, back_bmp);
+  back_w = w;
+  back_h = h;
+  return back_dc;
+}
+
+// Draw one full frame into the back buffer and blit it to the given window DC.
+// Shared by the WM_PAINT handler (BeginPaint DC) and the idle loop (GetDC).
+function render_to(hdc: int64, w: int32, h: int32) {
+  // Reuse the off-screen back buffer across frames; rebuilt only on resize.
+  var mem: int64 = get_back_buffer(hdc, w, h);
+
+  ui_fill_rect_color(mem, 0, 0, w, h, ui_rgb(8, 10, 24));
+
+  if (ready != 0) {
+    var s: int32 = 0;
+    while (s < NUM_STARS) {
+      fill_dot(mem, star_x[s], star_y[s], 0, star_brush[star_b[s]]);
+      s = s + 1;
+    }
+
+    var i: int32 = 0;
+    while (i < NUM_PARTICLES) {
+      var pp: Particle* = &particles[i];
+      var hi: int32 = speed_index(pp);
+
+      var k: int32 = TRAIL - 1;
+      while (k >= 1) {
+        var idx: int32 = hi - k * TRAIL_STEP;
+        if (idx > 2) {
+          fill_dot(mem, (int32)pp->tx[k], (int32)pp->ty[k], 0, palette[idx]);
+        }
+        k = k - 1;
+      }
+      fill_dot(mem, (int32)pp->x, (int32)pp->y, 1, palette[hi]);
+      i = i + 1;
+    }
+
+    var wv: int32 = 0;
+    while (wv < well_count) {
+      draw_well(mem, wv);
+      wv = wv + 1;
+    }
+
+    draw_hud(mem);
+  }
+
+  Gdi_BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY());
+  // The back buffer is cached; leave it selected for the next frame.
+}
+
+// Idle-loop frame: paint straight to the window DC (no BeginPaint, which is
+// only valid while handling WM_PAINT).
+function render_frame(hwnd: int64) {
+  var hdc: int64 = Ui_GetDC(hwnd);
+  render_to(hdc, view_w, view_h);
+  Ui_ReleaseDC(hwnd, hdc);
+}
+
+// WM_PAINT frame: satisfy the OS paint request (resize/expose) and validate
+// the region via EndPaint.
+function render(hwnd: int64) {
+  var ps: UiPaintStruct;
+  var hdc: int64 = Ui_BeginPaint(hwnd, &ps);
+  render_to(hdc, view_w, view_h);
+  Ui_EndPaint(hwnd, &ps);
+}
+
+function tick_fps() {
+  frame_count = frame_count + 1;
+  var now: uint64 = win32_tick_count64();
+  var elapsed: uint64 = now - fps_last_tick;
+  if (elapsed >= 500) {
+    fps = (int32)((uint64)(frame_count - fps_last_frame) * 1000 / elapsed);
+    fps_last_tick = now;
+    fps_last_frame = frame_count;
+  }
+}
+
+// --- Window procedure (passed to std/ui as a function pointer) ---------------
+function window_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 {
+  if (msg == UI_WM_ERASEBKGND()) {
+    return 1;   // we paint the whole client area ourselves
+  }
+  if (msg == UI_WM_PAINT()) {
+    // The idle loop drives painting directly via render(); just validate the
+    // region so Windows stops re-posting WM_PAINT (e.g. after a resize/expose).
+    render(hwnd);
+    return 0;
+  }
+  if (msg == UI_WM_LBUTTONDOWN()) {
+    add_well((float64)ui_mouse_x(lparam), (float64)ui_mouse_y(lparam), WELL_ATTRACT);
+    return 0;
+  }
+  if (msg == UI_WM_RBUTTONDOWN()) {
+    add_well((float64)ui_mouse_x(lparam), (float64)ui_mouse_y(lparam), WELL_REPEL);
+    return 0;
+  }
+  if (msg == UI_WM_KEYDOWN()) {
+    if (wparam == 0x20) { paused = 1 - paused; }       // Space
+    if (wparam == 0x52) { reset_particles(); }          // R
+    if (wparam == 0x43) { well_count = 0; }             // C
+    if (wparam == 0x1B) { ui_quit(0); }                 // Esc
+    return 0;
+  }
+  if (msg == UI_WM_SIZE()) {
+    view_w = ui_size_width(lparam);
+    view_h = ui_size_height(lparam);
+    free_back_buffer();   // rebuilt at the new size on the next paint
+    return 0;
+  }
+  if (msg == UI_WM_DESTROY()) {
+    free_back_buffer();
+    ui_quit(0);
+    return 0;
+  }
+  return ui_def_window_proc(hwnd, msg, wparam, lparam);
+}
+
+function main() -> int32 {
+  println("Mettle Orbits - native gravity sandbox");
+  println("  Left-click: attractor   Right-click: repeller");
+  println("  Space: pause   R: reset   C: clear wells   Esc: quit");
+
+  srand((int32)win32_tick_count64());
+  alloc_all();
+  build_palette();
+  build_assets();
+
+  var hwnd: int64 = ui_window_create_centered(
+    cstr("Mettle Orbits  -  native x86-64 gravity sandbox"),
+    WIN_W, WIN_H, &window_proc);
+  if (hwnd == 0) {
+    println("Failed to create window.");
+    return 1;
+  }
+
+  ui_window_show(hwnd);
+
+  view_w = ui_client_width(hwnd);
+  view_h = ui_client_height(hwnd);
+  build_stars();
+  reset_particles();
+  well_count = 0;
+  add_well((float64)view_w * 0.5, (float64)view_h * 0.5, CENTER_MASS);
+
+  fps_last_tick = win32_tick_count64();
+  fps_last_frame = 0;
+  frame_count = 0;
+  ready = 1;
+
+  // 1ms scheduler granularity so the Sleep() at the end of each frame is precise
+  // rather than rounding up to the ~15.6ms tick.
+  Win_timeBeginPeriod(1);
+
+  // --- Fixed-timestep idle loop --------------------------------------------
+  // Instead of WM_TIMER (low priority, jittery delivery, coalesced messages),
+  // we pump messages non-blocking, advance physics in fixed FRAME_US chunks
+  // driven by a high-resolution clock, render once, then sleep off the slack.
+  // Result: steady frame pacing and frame-rate-independent motion.
+  var msg: UiMsg;
+  var running: int32 = 1;
+  var prev_us: uint64 = bench_time_us();
+  var accum_us: uint64 = 0;
+
+  while (running != 0) {
+    // Drain every pending message without blocking.
+    while (Ui_PeekMessageA(&msg, 0, 0, 0, UI_PM_REMOVE()) != 0) {
+      if (msg.message == UI_WM_QUIT()) {
+        running = 0;
+      }
+      Ui_TranslateMessage(&msg);
+      Ui_DispatchMessageA(&msg);
+    }
+    if (running == 0) { break; }
+
+    var now_us: uint64 = bench_time_us();
+    var dt_us: uint64 = now_us - prev_us;
+    prev_us = now_us;
+
+    // Guard against a huge dt after a stall/drag so we don't spiral.
+    if (dt_us > (uint64)(FRAME_US * MAX_STEPS)) {
+      dt_us = (uint64)(FRAME_US * MAX_STEPS);
+    }
+    accum_us = accum_us + dt_us;
+
+    var steps: int32 = 0;
+    while (accum_us >= (uint64)FRAME_US && steps < MAX_STEPS) {
+      if (paused == 0) { update_physics(); }
+      accum_us = accum_us - (uint64)FRAME_US;
+      steps = steps + 1;
+    }
+    // If we hit the step cap, drop the backlog rather than carry it forward.
+    if (steps >= MAX_STEPS) { accum_us = 0; }
+
+    render_frame(hwnd);
+    tick_fps();
+
+    // Yield the rest of the frame budget instead of busy-spinning a core.
+    var spent_us: uint64 = bench_time_us() - now_us;
+    if (spent_us < (uint64)FRAME_US) {
+      var sleep_us: uint64 = (uint64)FRAME_US - spent_us;
+      Win_Sleep((uint32)(sleep_us / 1000));
+    }
+  }
+
+  Win_timeEndPeriod(1);
+  return (int32)msg.wparam;
+}

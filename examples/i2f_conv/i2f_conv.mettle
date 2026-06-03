@@ -1,0 +1,46 @@
+// New dimension: int<->float conversion-heavy loop.
+//
+// Each iteration converts int->float64, does a little FP, then float64->int.
+// fp_div hinted Mettle's per-op FP path is costly; this isolates the
+// cvtsi2sd/cvttsd2si conversion traffic specifically. GCC -O3 keeps values in
+// xmm and can vectorize the conversions.
+//
+// Build: build.bat   Run: i2f_conv.exe
+
+import "std/io";
+import "std/bench";
+
+const N = 30000000;
+
+function run() -> int64 {
+  var acc: int64 = 0;
+  var i: int64 = 0;
+  while (i < (int64)N) {
+    var f: float64 = (float64)i * 0.5 + 1.0;
+    var g: float64 = f * 1.25 - 0.5;
+    acc = acc + (int64)g;
+    i = i + 1;
+  }
+  return acc;
+}
+
+function main() -> int32 {
+  var passes: int32 = 20;
+  println("int<->float64 conversion loop, 30M iters x 20 passes");
+
+  var t0: uint64 = bench_time_us();
+  var acc: int64 = 0;
+  var p: int32 = 0;
+  while (p < passes) {
+    acc = acc + run();
+    p = p + 1;
+  }
+  var elapsed_us: uint64 = bench_time_us() - t0;
+
+  print("Checksum = ");
+  println_int(acc);
+  print("Time: ");
+  print_int(elapsed_us);
+  println(" us");
+  return 0;
+}

@@ -1,0 +1,52 @@
+// Triangulation: float64 SAXPY map with stores -- y[i] = a*x[i] + y[i].
+//
+// Unlike float_sum (a reduction), this writes back to memory every iteration:
+// a fused multiply-add streamed over 65536 doubles. GCC -O3 vectorizes it to
+// packed FMA/mulpd+addpd. Compare against float_sum to see whether Mettle's FP
+// gap is in arithmetic, in stores, or in vectorization specifically.
+//
+// Build: build.bat   Run: saxpy.exe
+
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+const N = 65536;
+
+function main() -> int32 {
+  var x: float64* = (float64*)malloc((int64)N * 8);
+  var y: float64* = (float64*)malloc((int64)N * 8);
+  var i: int32 = 0;
+  while (i < N) {
+    x[i] = (float64)i * 0.25 + 1.0;
+    y[i] = (float64)(N - i) * 0.5;
+    i = i + 1;
+  }
+
+  var a: float64 = 2.5;
+  var passes: int32 = 3000;
+  println("float64 SAXPY y=a*x+y: 65536 elems x 3000 passes");
+
+  var t0: uint64 = bench_time_us();
+  var p: int32 = 0;
+  while (p < passes) {
+    var j: int32 = 0;
+    while (j < N) {
+      y[j] = a * x[j] + y[j];
+      j = j + 1;
+    }
+    a = a * 1.0000001;
+    p = p + 1;
+  }
+  var elapsed_us: uint64 = bench_time_us() - t0;
+
+  print("Checksum = ");
+  println_int((int64)y[0] + (int64)y[N - 1]);
+  print("Time: ");
+  print_int(elapsed_us);
+  println(" us");
+
+  free((cstring)x);
+  free((cstring)y);
+  return 0;
+}

@@ -1,0 +1,20 @@
+// High-resolution timing for benchmarks (native ELF / Linux).
+//
+// Linux counterpart to std/bench. Uses libc clock_gettime(CLOCK_MONOTONIC)
+// instead of Windows' QueryPerformanceCounter. The import resolver picks this
+// file over bench.mettle automatically on the native ELF target, so
+// `import "std/bench"` works unchanged on both platforms.
+
+// clock_gettime(clk_id, timespec*) -> 0 on success. timespec is 16 bytes:
+// tv_sec @0 (int64), tv_nsec @8 (int64). CLOCK_MONOTONIC = 1 on Linux.
+extern function clock_gettime(clk_id: int32, ts: cstring) -> int32 = "clock_gettime";
+
+export function bench_time_us() -> uint64 {
+  var ts: uint8[16];
+  if (clock_gettime(1, &ts[0]) != 0) {
+    return 0;
+  }
+  var sec: int64 = *((int64*)&ts[0]);
+  var nsec: int64 = *((int64*)&ts[8]);
+  return (uint64)(sec * 1000000 + nsec / 1000);
+}

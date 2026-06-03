@@ -27,7 +27,7 @@ Available topics: `build`, `runtime` (aliases `heap`, `gc`), `interop`, `stdlib`
 
 ## Options
 
-`-o <file>` output assembly/object file (default `output.s`, or executable path when used with `--build`). `-i <file>` input file (alternative to positional argument). `-I <dir>` add import search directory (repeatable). `--stdlib <dir>` set stdlib root (default auto-detects bundled stdlib near the compiler binary, then falls back to `./stdlib`). `--build` build a native executable: Windows uses a COFF object + the internal PE linker by default; Linux emits an ELF object with a self-contained `_start` and links it with `ld -static`. `--emit-obj` emit a native object (COFF on Windows, ELF on Linux; default with `--build`). `--emit-asm` with `--build`, emit assembly and use NASM instead of native COFF. `--linker <internal|auto|gcc|msvc>` choose the Windows linker path (**default: `internal`**). `--link-arg <arg>` pass an extra linker argument in `--build` mode for additional DLLs/import libraries. `--tracy` link `std/tracy` with the Tracy profiler (requires `--build`; set `TRACY_DIR` or `--tracy-dir`). `--tracy-dir <dir>` Tracy repo root for `--tracy`. `--prelude` auto-import `std/prelude` (std/io, std/math, std/conv, std/mem, std/process, std/net). `-d`/`--debug` debug mode and embedded runtime crash traceback support. `-g`/`--debug-symbols` generate debug symbols. `-l`/`--line-mapping` source line mapping. `-s`/`--stack-trace` embeds runtime crash traceback support without the rest of debug mode. `-O`/`--optimize` enable optimizations. `-r`/`--release` enables `-O`, strips assembly comments, removes unreachable functions, and disables generated runtime null/bounds checks in IR lowering. `--profile-runtime` emit function-level runtime timing hooks and print a sorted report at process exit (Windows, `--emit-obj` / `--build` only). `--strip-comments` omit emitted assembly comments. `-h`/`--help` print usage. See [Imports](imports.md) for path resolution and `-I`/`--stdlib` details.
+`-o <file>` output assembly/object file (default `output.s`, or executable path when used with `--build`). `-i <file>` input file (alternative to positional argument). `-I <dir>` add import search directory (repeatable). `--stdlib <dir>` set stdlib root (default auto-detects bundled stdlib near the compiler binary, then falls back to `./stdlib`). `--build` build a native executable: Windows uses a COFF object + the internal PE linker by default; Linux emits an ELF object and links it with `gcc -no-pie`. `--static` adds static Linux linking, and `--musl` uses `musl-gcc -static`. `--emit-obj` emit a native object (COFF on Windows, ELF on Linux; default with `--build`). `--emit-asm` with `--build`, emit assembly and use NASM instead of native COFF. `--linker <internal|auto|gcc|msvc>` choose the Windows linker path (**default: `internal`**). `--link-arg <arg>` pass an extra linker argument in `--build` mode for additional DLLs/import libraries. `--tracy` link `std/tracy` with the Tracy profiler (requires `--build`; set `TRACY_DIR` or `--tracy-dir`). `--tracy-dir <dir>` Tracy repo root for `--tracy`. `--prelude` auto-import `std/prelude` (std/io, std/math, std/conv, std/mem, std/process, std/net). `-d`/`--debug` debug mode and embedded runtime crash traceback support. `-g`/`--debug-symbols` generate debug symbols. `-l`/`--line-mapping` source line mapping. `-s`/`--stack-trace` embeds runtime crash traceback support without the rest of debug mode. `-O`/`--optimize` enable optimizations. `-r`/`--release` enables `-O`, strips assembly comments, removes unreachable functions, and disables generated runtime null/bounds checks in IR lowering. `--profile-runtime` emit function-level runtime timing hooks and print a sorted report at process exit (Windows/Linux, `--emit-obj` / `--build` only). `--strip-comments` omit emitted assembly comments. `-h`/`--help` print usage. See [Imports](imports.md) for path resolution and `-I`/`--stdlib` details.
 
 ## Compilation Pipeline
 
@@ -73,9 +73,9 @@ On Linux, `--build` uses the native ELF backend end to end:
 mettle --build main.mettle -o main
 ```
 
-The compiler emits an ELF object plus a self-contained `_start` (it reads `argc`/`argv` off the kernel stack, calls `main`, and exits with the `exit` syscall), then links them with `ld -static`. The result is a statically linked executable with no dependency on libc, a C runtime, or an assembler.
+The compiler emits an ELF object, then links it with the platform C toolchain (`gcc -no-pie` by default). The Linux linker path automatically includes bundled helper objects for POSIX shims, atomics, stack tracebacks, and runtime profiling when the generated object references them. `--static` switches to `gcc -static`; `--musl` switches to `musl-gcc -static`.
 
-The Linux path currently builds pure-compute programs: arithmetic, control flow, recursion, pointers, structs, and direct calls. Programs that import the standard library (`std/io`, `std/bench`, and others) reference libc and Windows-specific symbols and fail at link time. Porting the standard library to Linux is tracked separately. The stack-trace and `--profile-runtime` features are also Windows-only for now and report a clear error on Linux.
+The Linux path supports the syscall-backed standard-library variants (`*.linux.mettle`), runtime stack traces (`-d`/`-s`), `--profile-runtime`, and embedded DWARF sections in ELF objects.
 
 ### Tracy profiling (`--tracy`)
 
@@ -319,9 +319,9 @@ mettle help debug
 Helper scripts live under `tools/debug/` (`dump-compiler-artifacts.ps1`,
 `diff-ir.ps1`, `disasm-obj.ps1`).
 
-With `--emit-obj` or `--build` (internal linker), `-g` embeds binary DWARF 4
+With `--emit-obj` or `--build`, `-g` embeds binary DWARF 4
 sections (`.debug_info`, `.debug_abbrev`, `.debug_line`, `.debug_str`,
-`.debug_frame`) in COFF objects and the linked PE for GDB/LLDB. Locals and
+`.debug_frame`) in native objects (ELF on Linux; COFF/PE on Windows as supported by the active linker path) for GDB/LLDB. Locals and
 parameters kept in GP registers by the optimizer (for example `r12`–`r15`) are
 described with `DW_OP_regN` location expressions; stack-homed symbols use
 `DW_OP_fbreg`. The assembly path still writes a human-readable `.dwarf` sidecar

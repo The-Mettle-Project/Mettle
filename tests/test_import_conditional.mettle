@@ -1,0 +1,11 @@
+// Conditional imports: a guarded import is included only when its platform
+// matches the build target. On this (Windows) build the `if windows` import
+// resolves normally, while the `if linux` import is dropped before resolution
+// -- so the nonexistent Linux-only module is never looked up. Returns 7.
+
+import "std/core" if windows;
+import "std/this_module_does_not_exist_on_purpose" if linux;
+
+function main() -> int32 {
+  return 7;
+}

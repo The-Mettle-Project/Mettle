@@ -88,6 +88,8 @@ for (var i: int32 = 0; i < 10; i = i + 1) {
 
 The `switch` statement evaluates an expression and compares it to each `case` value. Case values must be compile-time constant integer expressions (including enum variants and `true`/`false`). When a case matches, its body runs. Use `break` to exit the switch. Use `continue` inside a loop that contains the switch to continue the loop. Only one `default` clause is allowed.
 
+**Range cases:** A case may match an inclusive interval with `case lo..hi:`, where both bounds are compile-time constant integer expressions and `lo <= hi`. The case runs when the switch value is in `[lo, hi]`. Cases are tested top to bottom and the first match wins, so a single-value case listed before an overlapping range still takes precedence.
+
 **Fall-through:** Unlike some languages, Mettle does not enforce `break`. If you omit it, execution falls through to the next case (C-style behavior). To avoid accidental bugs, always end each case with `break` explicitly unless you intend fall-through.
 
 **Exhaustiveness:** `switch` over raw integers may omit matching cases and continue after the statement if no case matches. `switch` over `enum` or `bool` must be exhaustive unless a `default` clause is present.
@@ -98,6 +100,9 @@ switch (expr) {
     // ...
     break;
   case 2:
+    // ...
+    break;
+  case 3..9:        // inclusive range: matches 3 through 9
     // ...
     break;
   default:
@@ -228,7 +233,7 @@ defer {
 errdefer handle_error_recovery();
 ```
 
-> **Variable capture pitfall:** Deferred statements capture variables **by reference**, not by value. In a loop, `defer print_int(i)` will read `i` when the defer runs—at the end of each iteration—so every deferred call sees the **final** value of `i` after the increment. This causes subtle bugs. Use a temporary: `var current: int32 = i; defer print_int(current);` to capture the value at defer time.
+> **Argument capture:** A deferred **direct call** captures its argument values at the defer point (by value). In a loop, `defer print_int(i)` snapshots `i` as it is on that iteration, so the deferred calls see `0, 1, 2, …`, not the final value of `i`. **Method calls** (`defer obj.m(...)`) and **indirect/function-pointer calls** are the exception: they re-evaluate their operands at scope exit, so snapshot into a local first (`var current: int32 = i; defer obj.m(current);`) if you need the defer-point value.
 
 ### Implementation Details
 
@@ -332,7 +337,7 @@ func demo() {
 
 ### Control Flow Integration
 
-**Loops:** Each iteration gets its own defer scope. Deferred statements run at the end of each iteration. **Beware:** variables used in deferred statements are captured by reference (see pitfall above)—use a temporary if you need the value at defer time.
+**Loops:** Each iteration gets its own defer scope. Deferred statements run at the end of each iteration. A deferred direct call snapshots its arguments by value on each iteration (see the callout above); method and indirect calls re-evaluate at scope exit.
 
 ```mettle
 func loop_example() {
@@ -488,15 +493,16 @@ func example() {
 }
 ```
 
-**Variable capture:** Deferred statements capture variables by reference, not value (see the warning callout above). In a loop, `defer print_int(i)` reads `i` when the defer runs, so you get the value at scope exit—not at defer declaration time. Use a temporary so each iteration has its own variable:
+**Argument capture:** A deferred direct call snapshots its argument values at the defer point, so each iteration's deferred call sees that iteration's value:
 
 ```mettle
 while (i < 3) {
-  var current: int32 = i;
-  defer print_int(current);  // current holds the value from start of iteration
+  defer print_int(i);  // snapshots i = 0, then 1, then 2
   i = i + 1;
 }
 ```
+
+Method calls and indirect/function-pointer calls are the exception — they re-evaluate at scope exit — so copy into a local first if you need the defer-point value there.
 
 **Performance considerations:** Each defer statement adds runtime overhead for stack management and conditional execution. In performance-critical code, consider manual cleanup for simple cases.
 

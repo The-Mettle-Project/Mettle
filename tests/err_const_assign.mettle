@@ -1,0 +1,8 @@
+// Assigning to a constant is a compile error.
+
+const LIMIT: int32 = 10;
+
+function main() -> int32 {
+  LIMIT = 20;
+  return LIMIT;
+}

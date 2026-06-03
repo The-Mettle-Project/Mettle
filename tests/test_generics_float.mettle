@@ -1,0 +1,8 @@
+function add_values<T>(a: T, b: T) -> T {
+    return a + b;
+}
+
+function main() -> int32 {
+    var f: float64 = add_values<float64>(1.5, 2.5);
+    return (int32)f;
+}

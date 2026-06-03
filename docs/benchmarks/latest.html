@@ -446,9 +446,9 @@
         </div>
       </div>
       <div class="meta-pills">
-        <span class="pill"><strong>Generated</strong> May 26, 2026 ap 5:24 pm</span>
+        <span class="pill"><strong>Generated</strong> June 3, 2026 ap 3:01 pm</span>
         <span class="pill"><strong>Runs</strong> 5 (+ 1 warmup)</span>
-        <span class="pill"><strong>Benchmarks</strong> 21 runtime</span>
+        <span class="pill"><strong>Benchmarks</strong> 37 runtime</span>
       </div>
     </header>
 
@@ -459,12 +459,12 @@
     <div class="summary-grid">
       <div class="summary-card">
         <div class="label">Runtime record</div>
-        <div class="value neutral">10 / 21</div>
-        <div class="detail">10 faster Â· 4 parity Â· 7 slower <span style="opacity:0.6">(Â±5%)</span></div>
+        <div class="value neutral">10 / 37</div>
+        <div class="detail">10 faster Â· 9 parity Â· 18 slower <span style="opacity:0.6">(Â±5%)</span></div>
       </div>
       <div class="summary-card">
         <div class="label">Geometric mean runtime</div>
-        <div class="value positive">0.64x</div>
+        <div class="value negative">1.03x</div>
         <div class="detail">&lt;1x means Mettle wins overall on median runtime</div>
       </div>
       <div class="summary-card">
@@ -474,18 +474,18 @@
       </div>
       <div class="summary-card">
         <div class="label">Binary size (geomean)</div>
-        <div class="value positive">0.03x</div>
+        <div class="value positive">0.02x</div>
         <div class="detail">Mettle executables vs GCC-linked C</div>
       </div>
       <div class="summary-card">
         <div class="label">Biggest win</div>
-        <div class="value positive">memcmp_bench</div>
-        <div class="detail">0.08x faster than C</div>
+        <div class="value positive">float_sum</div>
+        <div class="detail">0.18x faster than C</div>
       </div>
       <div class="summary-card">
         <div class="label">Biggest gap</div>
-        <div class="value negative">matrix_mul</div>
-        <div class="detail">1.42x vs C</div>
+        <div class="value negative">byte_arith</div>
+        <div class="detail">7.59x vs C</div>
       </div>
     </div>
 
@@ -504,17 +504,45 @@
   </div>
   <div class="metric-chart">
     <div class="metric-row">
+  <div class="metric-name">aos_sum</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:100%"></div></div>
+  <span class="bar-label">249.67 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:43%"></div></div>
+  <span class="bar-label">107.28 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
   <div class="metric-name">binary_search</div>
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:42%"></div></div>
-  <span class="bar-label">349.04 ms</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:30.3%"></div></div>
+  <span class="bar-label">358.25 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
   <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">831.91 ms</span>
+  <span class="bar-label">1.18 s</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">byte_arith</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:100%"></div></div>
+  <span class="bar-label">534.87 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:13.2%"></div></div>
+  <span class="bar-label">70.472 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -523,12 +551,12 @@
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
   <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:100%"></div></div>
-  <span class="bar-label">46.345 ms</span>
+  <span class="bar-label">46.513 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
-  <div class="bar-shell"><div class="bar-fill bar-c" style="width:74.2%"></div></div>
-  <span class="bar-label">34.371 ms</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:74%"></div></div>
+  <span class="bar-label">34.421 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -536,13 +564,13 @@
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:42.3%"></div></div>
-  <span class="bar-label">1.497 ms</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:37.3%"></div></div>
+  <span class="bar-label">2.179 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
   <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">3.535 ms</span>
+  <span class="bar-label">5.839 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -550,13 +578,27 @@
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:90.4%"></div></div>
-  <span class="bar-label">132.12 ms</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:97.8%"></div></div>
+  <span class="bar-label">148.18 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
   <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">146.14 ms</span>
+  <span class="bar-label">151.46 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">const_mod</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:100%"></div></div>
+  <span class="bar-label">1.07 s</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:60.5%"></div></div>
+  <span class="bar-label">644.05 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -564,13 +606,13 @@
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:29%"></div></div>
-  <span class="bar-label">850 us</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:23.1%"></div></div>
+  <span class="bar-label">2.326 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
   <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">2.929 ms</span>
+  <span class="bar-label">10.085 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -578,13 +620,69 @@
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:96.5%"></div></div>
-  <span class="bar-label">40.340 ms</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:95.5%"></div></div>
+  <span class="bar-label">42.198 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
   <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">41.816 ms</span>
+  <span class="bar-label">44.200 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">float_sum</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:17.8%"></div></div>
+  <span class="bar-label">20.885 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">117.48 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">fp_div</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:57.2%"></div></div>
+  <span class="bar-label">214.59 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">374.99 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">func_ptr</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:100%"></div></div>
+  <span class="bar-label">400.55 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:83%"></div></div>
+  <span class="bar-label">332.29 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">global_acc</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:100%"></div></div>
+  <span class="bar-label">197.85 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:66.1%"></div></div>
+  <span class="bar-label">130.79 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -593,12 +691,40 @@
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
   <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:100%"></div></div>
-  <span class="bar-label">160.94 ms</span>
+  <span class="bar-label">167.41 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
-  <div class="bar-shell"><div class="bar-fill bar-c" style="width:94.7%"></div></div>
-  <span class="bar-label">152.42 ms</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:92.9%"></div></div>
+  <span class="bar-label">155.47 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">i2f_conv</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:100%"></div></div>
+  <span class="bar-label">654.78 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:76.1%"></div></div>
+  <span class="bar-label">498.18 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">int_divmod</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:100%"></div></div>
+  <span class="bar-label">352.08 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:50.1%"></div></div>
+  <span class="bar-label">176.31 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -606,13 +732,41 @@
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:95.8%"></div></div>
-  <span class="bar-label">174.40 ms</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:100%"></div></div>
+  <span class="bar-label">362.07 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:71.2%"></div></div>
+  <span class="bar-label">257.68 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">leaf_call</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:99.9%"></div></div>
+  <span class="bar-label">331.02 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
   <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">182.00 ms</span>
+  <span class="bar-label">331.40 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">mandelbrot</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:100%"></div></div>
+  <span class="bar-label">2.42 s</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:44.6%"></div></div>
+  <span class="bar-label">1.08 s</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -621,12 +775,12 @@
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
   <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:100%"></div></div>
-  <span class="bar-label">1.522 ms</span>
+  <span class="bar-label">3.858 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
-  <div class="bar-shell"><div class="bar-fill bar-c" style="width:70.3%"></div></div>
-  <span class="bar-label">1.070 ms</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:29.2%"></div></div>
+  <span class="bar-label">1.125 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -634,13 +788,13 @@
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:7.7%"></div></div>
-  <span class="bar-label">824 us</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:100%"></div></div>
+  <span class="bar-label">11.775 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
-  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">10.722 ms</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:52%"></div></div>
+  <span class="bar-label">6.119 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -649,12 +803,12 @@
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
   <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:100%"></div></div>
-  <span class="bar-label">857 us</span>
+  <span class="bar-label">913 us</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
-  <div class="bar-shell"><div class="bar-fill bar-c" style="width:92.8%"></div></div>
-  <span class="bar-label">795 us</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:87%"></div></div>
+  <span class="bar-label">794 us</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -662,13 +816,13 @@
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:100%"></div></div>
-  <span class="bar-label">745 us</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:99.9%"></div></div>
+  <span class="bar-label">729 us</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
-  <div class="bar-shell"><div class="bar-fill bar-c" style="width:99.6%"></div></div>
-  <span class="bar-label">742 us</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">730 us</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -676,13 +830,13 @@
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:30.2%"></div></div>
-  <span class="bar-label">935 us</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:29.8%"></div></div>
+  <span class="bar-label">1.222 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
   <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">3.094 ms</span>
+  <span class="bar-label">4.106 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -690,13 +844,13 @@
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:45.4%"></div></div>
-  <span class="bar-label">38.582 ms</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:49.3%"></div></div>
+  <span class="bar-label">78.307 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
   <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">84.947 ms</span>
+  <span class="bar-label">158.91 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -704,13 +858,13 @@
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:100%"></div></div>
-  <span class="bar-label">4.101 ms</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:96.4%"></div></div>
+  <span class="bar-label">8.225 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
-  <div class="bar-shell"><div class="bar-fill bar-c" style="width:72.2%"></div></div>
-  <span class="bar-label">2.962 ms</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">8.530 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -719,12 +873,26 @@
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
   <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:100%"></div></div>
-  <span class="bar-label">477.73 ms</span>
+  <span class="bar-label">492.48 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
-  <div class="bar-shell"><div class="bar-fill bar-c" style="width:97.8%"></div></div>
-  <span class="bar-label">467.40 ms</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:98.4%"></div></div>
+  <span class="bar-label">484.72 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">rec_fib</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:100%"></div></div>
+  <span class="bar-label">93.825 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:30.9%"></div></div>
+  <span class="bar-label">28.956 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -732,13 +900,27 @@
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:48.7%"></div></div>
-  <span class="bar-label">889 us</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:55.1%"></div></div>
+  <span class="bar-label">1.908 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
   <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">1.824 ms</span>
+  <span class="bar-label">3.462 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">saxpy</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:100%"></div></div>
+  <span class="bar-label">30.694 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:69.3%"></div></div>
+  <span class="bar-label">21.274 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -746,13 +928,13 @@
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:54.6%"></div></div>
-  <span class="bar-label">1.119 ms</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:100%"></div></div>
+  <span class="bar-label">2.230 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
-  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">2.048 ms</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:99.2%"></div></div>
+  <span class="bar-label">2.213 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -761,12 +943,26 @@
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
   <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:100%"></div></div>
-  <span class="bar-label">4.115 ms</span>
+  <span class="bar-label">3.996 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
-  <div class="bar-shell"><div class="bar-fill bar-c" style="width:88.6%"></div></div>
-  <span class="bar-label">3.644 ms</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:95.8%"></div></div>
+  <span class="bar-label">3.830 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">struct_byval</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:100%"></div></div>
+  <span class="bar-label">221.48 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:63.4%"></div></div>
+  <span class="bar-label">140.38 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -774,13 +970,41 @@
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:100%"></div></div>
-  <span class="bar-label">7.033 ms</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:70.1%"></div></div>
+  <span class="bar-label">4.722 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
-  <div class="bar-shell"><div class="bar-fill bar-c" style="width:94.6%"></div></div>
-  <span class="bar-label">6.654 ms</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">6.735 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">switch_vm</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:31.9%"></div></div>
+  <span class="bar-label">208.44 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">653.29 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">transpose</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:100%"></div></div>
+  <span class="bar-label">527.90 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:99.3%"></div></div>
+  <span class="bar-label">524.11 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -788,13 +1012,13 @@
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:17.3%"></div></div>
-  <span class="bar-label">3.934 ms</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:100%"></div></div>
+  <span class="bar-label">35.443 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
-  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">22.796 ms</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:65.6%"></div></div>
+  <span class="bar-label">23.242 ms</span>
 </div>
   </div>
 </div>
@@ -807,17 +1031,45 @@
   </div>
   <div class="metric-chart">
     <div class="metric-row">
-  <div class="metric-name">binary_search</div>
+  <div class="metric-name">aos_sum</div>
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:5.2%"></div></div>
-  <span class="bar-label">28 ms</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:4.4%"></div></div>
+  <span class="bar-label">22 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
   <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">538 ms</span>
+  <span class="bar-label">505 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">binary_search</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:4.6%"></div></div>
+  <span class="bar-label">23 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">505 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">byte_arith</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:4%"></div></div>
+  <span class="bar-label">20 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">497 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -825,17 +1077,129 @@
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:5%"></div></div>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:4.4%"></div></div>
+  <span class="bar-label">22 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">503 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">clamp_i32</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.4%"></div></div>
+  <span class="bar-label">32 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">948 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">collatz</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.9%"></div></div>
+  <span class="bar-label">20 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">509 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">const_mod</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.4%"></div></div>
+  <span class="bar-label">18 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">523 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">dot_product</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.4%"></div></div>
+  <span class="bar-label">32 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">943 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">fib</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:5.2%"></div></div>
   <span class="bar-label">26 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
   <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">518 ms</span>
+  <span class="bar-label">500 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
-  <div class="metric-name">clamp_i32</div>
+  <div class="metric-name">float_sum</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.7%"></div></div>
+  <span class="bar-label">32 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">856 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">fp_div</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.7%"></div></div>
+  <span class="bar-label">18 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">491 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">func_ptr</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.6%"></div></div>
+  <span class="bar-label">18 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">497 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">global_acc</div>
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
@@ -849,59 +1213,45 @@
 </div>
   </div>
 </div><div class="metric-row">
-  <div class="metric-name">collatz</div>
+  <div class="metric-name">grep</div>
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.6%"></div></div>
-  <span class="bar-label">19 ms</span>
-</div>
-    <div class="bar-line">
-  <span class="bar-tag c">C</span>
-  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">526 ms</span>
-</div>
-  </div>
-</div><div class="metric-row">
-  <div class="metric-name">dot_product</div>
-  <div class="metric-bars">
-    <div class="bar-line">
-  <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:4%"></div></div>
-  <span class="bar-label">20 ms</span>
-</div>
-    <div class="bar-line">
-  <span class="bar-tag c">C</span>
-  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">495 ms</span>
-</div>
-  </div>
-</div><div class="metric-row">
-  <div class="metric-name">fib</div>
-  <div class="metric-bars">
-    <div class="bar-line">
-  <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:4%"></div></div>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:5.4%"></div></div>
   <span class="bar-label">28 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
   <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">696 ms</span>
+  <span class="bar-label">519 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
-  <div class="metric-name">grep</div>
+  <div class="metric-name">i2f_conv</div>
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:4.1%"></div></div>
-  <span class="bar-label">21 ms</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.4%"></div></div>
+  <span class="bar-label">17 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
   <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">508 ms</span>
+  <span class="bar-label">497 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">int_divmod</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.6%"></div></div>
+  <span class="bar-label">18 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">499 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -909,13 +1259,41 @@
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.5%"></div></div>
-  <span class="bar-label">18 ms</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.9%"></div></div>
+  <span class="bar-label">36 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
   <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">520 ms</span>
+  <span class="bar-label">931 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">leaf_call</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.8%"></div></div>
+  <span class="bar-label">19 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">501 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">mandelbrot</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.8%"></div></div>
+  <span class="bar-label">19 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">501 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -923,13 +1301,13 @@
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.6%"></div></div>
-  <span class="bar-label">19 ms</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.9%"></div></div>
+  <span class="bar-label">22 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
   <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">528 ms</span>
+  <span class="bar-label">558 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -937,13 +1315,13 @@
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.8%"></div></div>
-  <span class="bar-label">20 ms</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:4.2%"></div></div>
+  <span class="bar-label">21 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
   <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">531 ms</span>
+  <span class="bar-label">503 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -951,13 +1329,13 @@
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:4.1%"></div></div>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.9%"></div></div>
   <span class="bar-label">20 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
   <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">492 ms</span>
+  <span class="bar-label">507 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -965,13 +1343,13 @@
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.8%"></div></div>
-  <span class="bar-label">19 ms</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:4%"></div></div>
+  <span class="bar-label">20 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
   <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">498 ms</span>
+  <span class="bar-label">494 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -979,13 +1357,13 @@
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.5%"></div></div>
-  <span class="bar-label">19 ms</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.7%"></div></div>
+  <span class="bar-label">34 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
   <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">540 ms</span>
+  <span class="bar-label">908 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -993,17 +1371,73 @@
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.6%"></div></div>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.9%"></div></div>
+  <span class="bar-label">36 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">929 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">prefix_sum</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:4.5%"></div></div>
+  <span class="bar-label">42 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">937 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">prime_count</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:4%"></div></div>
   <span class="bar-label">20 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
   <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">560 ms</span>
+  <span class="bar-label">503 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
-  <div class="metric-name">prefix_sum</div>
+  <div class="metric-name">rec_fib</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.4%"></div></div>
+  <span class="bar-label">18 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">532 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">reverse_i32</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.5%"></div></div>
+  <span class="bar-label">34 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">964 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">saxpy</div>
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
@@ -1013,39 +1447,39 @@
     <div class="bar-line">
   <span class="bar-tag c">C</span>
   <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">507 ms</span>
-</div>
-  </div>
-</div><div class="metric-row">
-  <div class="metric-name">prime_count</div>
-  <div class="metric-bars">
-    <div class="bar-line">
-  <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.9%"></div></div>
-  <span class="bar-label">20 ms</span>
-</div>
-    <div class="bar-line">
-  <span class="bar-tag c">C</span>
-  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">512 ms</span>
-</div>
-  </div>
-</div><div class="metric-row">
-  <div class="metric-name">reverse_i32</div>
-  <div class="metric-bars">
-    <div class="bar-line">
-  <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:4.1%"></div></div>
-  <span class="bar-label">21 ms</span>
-</div>
-    <div class="bar-line">
-  <span class="bar-tag c">C</span>
-  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">517 ms</span>
+  <span class="bar-label">516 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
   <div class="metric-name">scale_i32</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.5%"></div></div>
+  <span class="bar-label">34 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">969 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">sort_insertion</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:4.4%"></div></div>
+  <span class="bar-label">23 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">524 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">struct_byval</div>
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
@@ -1055,21 +1489,7 @@
     <div class="bar-line">
   <span class="bar-tag c">C</span>
   <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">503 ms</span>
-</div>
-  </div>
-</div><div class="metric-row">
-  <div class="metric-name">sort_insertion</div>
-  <div class="metric-bars">
-    <div class="bar-line">
-  <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.6%"></div></div>
-  <span class="bar-label">20 ms</span>
-</div>
-    <div class="bar-line">
-  <span class="bar-tag c">C</span>
-  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">560 ms</span>
+  <span class="bar-label">495 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -1077,13 +1497,41 @@
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.9%"></div></div>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:4%"></div></div>
   <span class="bar-label">20 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
   <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
-  <span class="bar-label">507 ms</span>
+  <span class="bar-label">505 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">switch_vm</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:3.7%"></div></div>
+  <span class="bar-label">19 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">512 ms</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">transpose</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:4%"></div></div>
+  <span class="bar-label">20 ms</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">498 ms</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -1091,8 +1539,8 @@
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:4.1%"></div></div>
-  <span class="bar-label">21 ms</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:26.8%"></div></div>
+  <span class="bar-label">139 ms</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
@@ -1110,6 +1558,20 @@
   </div>
   <div class="metric-chart">
     <div class="metric-row">
+  <div class="metric-name">aos_sum</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:2.2%"></div></div>
+  <span class="bar-label">5.5 KB</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">253.7 KB</span>
+</div>
+  </div>
+</div><div class="metric-row">
   <div class="metric-name">binary_search</div>
   <div class="metric-bars">
     <div class="bar-line">
@@ -1124,12 +1586,26 @@
 </div>
   </div>
 </div><div class="metric-row">
+  <div class="metric-name">byte_arith</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:2.2%"></div></div>
+  <span class="bar-label">5.5 KB</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">253.7 KB</span>
+</div>
+  </div>
+</div><div class="metric-row">
   <div class="metric-name">byte_hash</div>
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:2.8%"></div></div>
-  <span class="bar-label">7.0 KB</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:2.6%"></div></div>
+  <span class="bar-label">6.5 KB</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
@@ -1166,6 +1642,20 @@
 </div>
   </div>
 </div><div class="metric-row">
+  <div class="metric-name">const_mod</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:2.2%"></div></div>
+  <span class="bar-label">5.5 KB</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">253.2 KB</span>
+</div>
+  </div>
+</div><div class="metric-row">
   <div class="metric-name">dot_product</div>
   <div class="metric-bars">
     <div class="bar-line">
@@ -1194,6 +1684,62 @@
 </div>
   </div>
 </div><div class="metric-row">
+  <div class="metric-name">float_sum</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:2.4%"></div></div>
+  <span class="bar-label">6.0 KB</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">253.2 KB</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">fp_div</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:2%"></div></div>
+  <span class="bar-label">5.0 KB</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">253.7 KB</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">func_ptr</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:2%"></div></div>
+  <span class="bar-label">5.0 KB</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">253.3 KB</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">global_acc</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:2%"></div></div>
+  <span class="bar-label">5.0 KB</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">253.3 KB</span>
+</div>
+  </div>
+</div><div class="metric-row">
   <div class="metric-name">grep</div>
   <div class="metric-bars">
     <div class="bar-line">
@@ -1208,6 +1754,34 @@
 </div>
   </div>
 </div><div class="metric-row">
+  <div class="metric-name">i2f_conv</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:2%"></div></div>
+  <span class="bar-label">5.0 KB</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">253.2 KB</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">int_divmod</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:2%"></div></div>
+  <span class="bar-label">5.0 KB</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">253.2 KB</span>
+</div>
+  </div>
+</div><div class="metric-row">
   <div class="metric-name">lcg_rng</div>
   <div class="metric-bars">
     <div class="bar-line">
@@ -1219,6 +1793,34 @@
   <span class="bar-tag c">C</span>
   <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
   <span class="bar-label">253.6 KB</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">leaf_call</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:2%"></div></div>
+  <span class="bar-label">5.0 KB</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">253.2 KB</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">mandelbrot</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:2.2%"></div></div>
+  <span class="bar-label">5.5 KB</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">253.2 KB</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -1240,8 +1842,8 @@
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:2.8%"></div></div>
-  <span class="bar-label">7.0 KB</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:2.6%"></div></div>
+  <span class="bar-label">6.5 KB</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
@@ -1268,8 +1870,8 @@
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:2.6%"></div></div>
-  <span class="bar-label">6.5 KB</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:2.4%"></div></div>
+  <span class="bar-label">6.0 KB</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
@@ -1334,6 +1936,20 @@
 </div>
   </div>
 </div><div class="metric-row">
+  <div class="metric-name">rec_fib</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:2%"></div></div>
+  <span class="bar-label">5.0 KB</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">254.3 KB</span>
+</div>
+  </div>
+</div><div class="metric-row">
   <div class="metric-name">reverse_i32</div>
   <div class="metric-bars">
     <div class="bar-line">
@@ -1345,6 +1961,20 @@
   <span class="bar-tag c">C</span>
   <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
   <span class="bar-label">253.8 KB</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">saxpy</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:2.4%"></div></div>
+  <span class="bar-label">6.0 KB</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">253.7 KB</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -1376,17 +2006,59 @@
 </div>
   </div>
 </div><div class="metric-row">
-  <div class="metric-name">sum_squares</div>
+  <div class="metric-name">struct_byval</div>
   <div class="metric-bars">
     <div class="bar-line">
   <span class="bar-tag mettle">M</span>
-  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:2.6%"></div></div>
-  <span class="bar-label">6.5 KB</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:2.2%"></div></div>
+  <span class="bar-label">5.5 KB</span>
 </div>
     <div class="bar-line">
   <span class="bar-tag c">C</span>
   <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
   <span class="bar-label">253.2 KB</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">sum_squares</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:2.4%"></div></div>
+  <span class="bar-label">6.0 KB</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">253.2 KB</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">switch_vm</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:2.4%"></div></div>
+  <span class="bar-label">6.0 KB</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">253.2 KB</span>
+</div>
+  </div>
+</div><div class="metric-row">
+  <div class="metric-name">transpose</div>
+  <div class="metric-bars">
+    <div class="bar-line">
+  <span class="bar-tag mettle">M</span>
+  <div class="bar-shell"><div class="bar-fill bar-mettle" style="width:2.2%"></div></div>
+  <span class="bar-label">5.5 KB</span>
+</div>
+    <div class="bar-line">
+  <span class="bar-tag c">C</span>
+  <div class="bar-shell"><div class="bar-fill bar-c" style="width:100%"></div></div>
+  <span class="bar-label">253.7 KB</span>
 </div>
   </div>
 </div><div class="metric-row">
@@ -1435,13 +2107,13 @@
     <div class="bench-name">fib</div>
     <div class="bench-desc">Fibonacci fib(35) x 10M (Mettle unrolled hot loop)</div>
   </td>
-  <td class="num">40.340 ms<div class="sub">39889-41061 us</div></td>
-  <td class="num">41.816 ms<div class="sub">41388-42113 us</div></td>
+  <td class="num">42.198 ms<div class="sub">41729-42655 us</div></td>
+  <td class="num">44.200 ms<div class="sub">42985-45234 us</div></td>
   <td class="num">n/a</td>
-  <td class="num"><span class="badge badge-parity" title="Within ~5%">0.96x</span></td>
-  <td class="num">28 ms</td>
-  <td class="num">696 ms</td>
-  <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
+  <td class="num"><span class="badge badge-parity" title="Within ~5%">0.95x</span></td>
+  <td class="num">26 ms</td>
+  <td class="num">500 ms</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.05x</span></td>
   <td class="num">9.0 KB</td>
   <td class="num">253.9 KB</td>
   <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
@@ -1450,13 +2122,13 @@
     <div class="bench-name">word_count</div>
     <div class="bench-desc">Word count 256 KB buffer x 200</div>
   </td>
-  <td class="num">3.934 ms<div class="sub">3850-4115 us</div></td>
-  <td class="num">22.796 ms<div class="sub">22658-24084 us</div></td>
+  <td class="num">35.443 ms<div class="sub">34966-35885 us</div></td>
+  <td class="num">23.242 ms<div class="sub">23063-24404 us</div></td>
   <td class="num">n/a</td>
-  <td class="num"><span class="badge badge-win" title="Mettle faster">0.17x</span></td>
-  <td class="num">21 ms</td>
+  <td class="num"><span class="badge badge-loss" title="C faster">1.52x</span></td>
+  <td class="num">139 ms</td>
   <td class="num">518 ms</td>
-  <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.27x</span></td>
   <td class="num">7.0 KB</td>
   <td class="num">255.4 KB</td>
   <td class="num"><span class="badge badge-win" title="Mettle faster">0.03x</span></td>
@@ -1465,13 +2137,13 @@
     <div class="bench-name">grep</div>
     <div class="bench-desc">Grep ERROR 1 MiB x 200</div>
   </td>
-  <td class="num">160.94 ms<div class="sub">159984-162338 us</div></td>
-  <td class="num">152.42 ms<div class="sub">151049-153962 us</div></td>
+  <td class="num">167.41 ms<div class="sub">166594-170818 us</div></td>
+  <td class="num">155.47 ms<div class="sub">154289-157432 us</div></td>
   <td class="num">n/a</td>
-  <td class="num"><span class="badge badge-loss" title="C faster">1.06x</span></td>
-  <td class="num">21 ms</td>
-  <td class="num">508 ms</td>
-  <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
+  <td class="num"><span class="badge badge-loss" title="C faster">1.08x</span></td>
+  <td class="num">28 ms</td>
+  <td class="num">519 ms</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.05x</span></td>
   <td class="num">7.5 KB</td>
   <td class="num">254.5 KB</td>
   <td class="num"><span class="badge badge-win" title="Mettle faster">0.03x</span></td>
@@ -1480,27 +2152,27 @@
     <div class="bench-name">sum_squares</div>
     <div class="bench-desc">Sum of squares 1..100000 x 200</div>
   </td>
-  <td class="num">7.033 ms<div class="sub">7008-8814 us</div></td>
-  <td class="num">6.654 ms<div class="sub">6583-6806 us</div></td>
+  <td class="num">4.722 ms<div class="sub">4627-4823 us</div></td>
+  <td class="num">6.735 ms<div class="sub">6674-6776 us</div></td>
   <td class="num">n/a</td>
-  <td class="num"><span class="badge badge-loss" title="C faster">1.06x</span></td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.70x</span></td>
   <td class="num">20 ms</td>
-  <td class="num">507 ms</td>
+  <td class="num">505 ms</td>
   <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
-  <td class="num">6.5 KB</td>
+  <td class="num">6.0 KB</td>
   <td class="num">253.2 KB</td>
-  <td class="num"><span class="badge badge-win" title="Mettle faster">0.03x</span></td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.02x</span></td>
 </tr><tr>
   <td class="name-cell">
     <div class="bench-name">collatz</div>
     <div class="bench-desc">Collatz steps 1..100000 x 10</div>
   </td>
-  <td class="num">132.12 ms<div class="sub">130762-132949 us</div></td>
-  <td class="num">146.14 ms<div class="sub">145359-148916 us</div></td>
+  <td class="num">148.18 ms<div class="sub">146617-149604 us</div></td>
+  <td class="num">151.46 ms<div class="sub">149497-152794 us</div></td>
   <td class="num">n/a</td>
-  <td class="num"><span class="badge badge-win" title="Mettle faster">0.90x</span></td>
-  <td class="num">19 ms</td>
-  <td class="num">526 ms</td>
+  <td class="num"><span class="badge badge-parity" title="Within ~5%">0.98x</span></td>
+  <td class="num">20 ms</td>
+  <td class="num">509 ms</td>
   <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
   <td class="num">6.0 KB</td>
   <td class="num">253.7 KB</td>
@@ -1510,14 +2182,14 @@
     <div class="bench-name">byte_hash</div>
     <div class="bench-desc">djb2 hash 256 KB buffer x 200</div>
   </td>
-  <td class="num">46.345 ms<div class="sub">45925-46806 us</div></td>
-  <td class="num">34.371 ms<div class="sub">33938-34913 us</div></td>
+  <td class="num">46.513 ms<div class="sub">45925-47046 us</div></td>
+  <td class="num">34.421 ms<div class="sub">34327-35395 us</div></td>
   <td class="num">n/a</td>
   <td class="num"><span class="badge badge-loss" title="C faster">1.35x</span></td>
-  <td class="num">26 ms</td>
-  <td class="num">518 ms</td>
-  <td class="num"><span class="badge badge-win" title="Mettle faster">0.05x</span></td>
-  <td class="num">7.0 KB</td>
+  <td class="num">22 ms</td>
+  <td class="num">503 ms</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
+  <td class="num">6.5 KB</td>
   <td class="num">253.9 KB</td>
   <td class="num"><span class="badge badge-win" title="Mettle faster">0.03x</span></td>
 </tr><tr>
@@ -1525,12 +2197,12 @@
     <div class="bench-name">prime_count</div>
     <div class="bench-desc">Prime count up to 50000 x 200</div>
   </td>
-  <td class="num">477.73 ms<div class="sub">475897-481180 us</div></td>
-  <td class="num">467.40 ms<div class="sub">464511-472943 us</div></td>
+  <td class="num">492.48 ms<div class="sub">491379-493937 us</div></td>
+  <td class="num">484.72 ms<div class="sub">482225-487821 us</div></td>
   <td class="num">n/a</td>
   <td class="num"><span class="badge badge-parity" title="Within ~5%">1.02x</span></td>
   <td class="num">20 ms</td>
-  <td class="num">512 ms</td>
+  <td class="num">503 ms</td>
   <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
   <td class="num">6.5 KB</td>
   <td class="num">253.8 KB</td>
@@ -1540,12 +2212,12 @@
     <div class="bench-name">matrix_mul</div>
     <div class="bench-desc">32x32 int32 matrix multiply x 200 (Mettle: 4-unrolled pointers; C: naive mat_idx &#226;€” GCC -O3 vectorizes C heavily)</div>
   </td>
-  <td class="num">1.522 ms<div class="sub">1478-1634 us</div></td>
-  <td class="num">1.070 ms<div class="sub">1053-1097 us</div></td>
-  <td class="num">8.050 ms</td>
-  <td class="num"><span class="badge badge-loss" title="C faster">1.42x</span></td>
-  <td class="num">19 ms</td>
-  <td class="num">528 ms</td>
+  <td class="num">3.858 ms<div class="sub">3785-4043 us</div></td>
+  <td class="num">1.125 ms<div class="sub">1085-1199 us</div></td>
+  <td class="num">8.316 ms</td>
+  <td class="num"><span class="badge badge-loss" title="C faster">3.43x</span></td>
+  <td class="num">22 ms</td>
+  <td class="num">558 ms</td>
   <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
   <td class="num">7.5 KB</td>
   <td class="num">258.8 KB</td>
@@ -1555,12 +2227,12 @@
     <div class="bench-name">sort_insertion</div>
     <div class="bench-desc">Insertion sort 512 int32 values x 200 (Mettle/C structurally similar; gap is memcpy/SIMD/codegen)</div>
   </td>
-  <td class="num">4.115 ms<div class="sub">4047-4544 us</div></td>
-  <td class="num">3.644 ms<div class="sub">3634-4168 us</div></td>
+  <td class="num">3.996 ms<div class="sub">3936-4119 us</div></td>
+  <td class="num">3.830 ms<div class="sub">3737-3869 us</div></td>
   <td class="num">n/a</td>
-  <td class="num"><span class="badge badge-loss" title="C faster">1.13x</span></td>
-  <td class="num">20 ms</td>
-  <td class="num">560 ms</td>
+  <td class="num"><span class="badge badge-parity" title="Within ~5%">1.04x</span></td>
+  <td class="num">23 ms</td>
+  <td class="num">524 ms</td>
   <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
   <td class="num">7.5 KB</td>
   <td class="num">253.8 KB</td>
@@ -1570,12 +2242,12 @@
     <div class="bench-name">memcpy_bench</div>
     <div class="bench-desc">memcpy 256 KB buffer x 200 (memory bandwidth / libc memcpy path)</div>
   </td>
-  <td class="num">857 us<div class="sub">851-916 us</div></td>
-  <td class="num">795 us<div class="sub">766-868 us</div></td>
+  <td class="num">913 us<div class="sub">886-1054 us</div></td>
+  <td class="num">794 us<div class="sub">772-891 us</div></td>
   <td class="num">n/a</td>
-  <td class="num"><span class="badge badge-loss" title="C faster">1.08x</span></td>
+  <td class="num"><span class="badge badge-loss" title="C faster">1.15x</span></td>
   <td class="num">20 ms</td>
-  <td class="num">492 ms</td>
+  <td class="num">507 ms</td>
   <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
   <td class="num">6.5 KB</td>
   <td class="num">254.1 KB</td>
@@ -1585,29 +2257,29 @@
     <div class="bench-name">memset_bench</div>
     <div class="bench-desc">memset 256 KB buffer x 200 (fill bandwidth / libc memset path)</div>
   </td>
-  <td class="num">745 us<div class="sub">735-787 us</div></td>
-  <td class="num">742 us<div class="sub">733-748 us</div></td>
+  <td class="num">729 us<div class="sub">728-740 us</div></td>
+  <td class="num">730 us<div class="sub">728-774 us</div></td>
   <td class="num">n/a</td>
   <td class="num"><span class="badge badge-parity" title="Within ~5%">1.00x</span></td>
-  <td class="num">19 ms</td>
-  <td class="num">498 ms</td>
+  <td class="num">20 ms</td>
+  <td class="num">494 ms</td>
   <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
-  <td class="num">6.5 KB</td>
+  <td class="num">6.0 KB</td>
   <td class="num">253.6 KB</td>
-  <td class="num"><span class="badge badge-win" title="Mettle faster">0.03x</span></td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.02x</span></td>
 </tr><tr>
   <td class="name-cell">
     <div class="bench-name">memcmp_bench</div>
     <div class="bench-desc">Byte-compare 256 KB in 4 KB chunks x 200 (manual compare loop)</div>
   </td>
-  <td class="num">824 us<div class="sub">814-989 us</div></td>
-  <td class="num">10.722 ms<div class="sub">10079-11886 us</div></td>
+  <td class="num">11.775 ms<div class="sub">11580-11973 us</div></td>
+  <td class="num">6.119 ms<div class="sub">5869-6465 us</div></td>
   <td class="num">n/a</td>
-  <td class="num"><span class="badge badge-win" title="Mettle faster">0.08x</span></td>
-  <td class="num">20 ms</td>
-  <td class="num">531 ms</td>
+  <td class="num"><span class="badge badge-loss" title="C faster">1.92x</span></td>
+  <td class="num">21 ms</td>
+  <td class="num">503 ms</td>
   <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
-  <td class="num">7.0 KB</td>
+  <td class="num">6.5 KB</td>
   <td class="num">253.9 KB</td>
   <td class="num"><span class="badge badge-win" title="Mettle faster">0.03x</span></td>
 </tr><tr>
@@ -1615,12 +2287,12 @@
     <div class="bench-name">binary_search</div>
     <div class="bench-desc">Lower-bound search in sorted 65536 int32 array, 50000 queries x 200</div>
   </td>
-  <td class="num">349.04 ms<div class="sub">346066-392127 us</div></td>
-  <td class="num">831.91 ms<div class="sub">814660-832479 us</div></td>
+  <td class="num">358.25 ms<div class="sub">356657-360235 us</div></td>
+  <td class="num">1.18 s<div class="sub">848789-1228655 us</div></td>
   <td class="num">n/a</td>
-  <td class="num"><span class="badge badge-win" title="Mettle faster">0.42x</span></td>
-  <td class="num">28 ms</td>
-  <td class="num">538 ms</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.30x</span></td>
+  <td class="num">23 ms</td>
+  <td class="num">505 ms</td>
   <td class="num"><span class="badge badge-win" title="Mettle faster">0.05x</span></td>
   <td class="num">6.5 KB</td>
   <td class="num">253.8 KB</td>
@@ -1630,13 +2302,13 @@
     <div class="bench-name">dot_product</div>
     <div class="bench-desc">int32 dot product of 65536-element vectors x 200 (SIMD reduction)</div>
   </td>
-  <td class="num">850 us<div class="sub">807-872 us</div></td>
-  <td class="num">2.929 ms<div class="sub">2848-3107 us</div></td>
+  <td class="num">2.326 ms<div class="sub">981-7225 us</div></td>
+  <td class="num">10.085 ms<div class="sub">9817-11197 us</div></td>
   <td class="num">n/a</td>
-  <td class="num"><span class="badge badge-win" title="Mettle faster">0.29x</span></td>
-  <td class="num">20 ms</td>
-  <td class="num">495 ms</td>
-  <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.23x</span></td>
+  <td class="num">32 ms</td>
+  <td class="num">943 ms</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.03x</span></td>
   <td class="num">6.5 KB</td>
   <td class="num">253.8 KB</td>
   <td class="num"><span class="badge badge-win" title="Mettle faster">0.03x</span></td>
@@ -1645,13 +2317,13 @@
     <div class="bench-name">lcg_rng</div>
     <div class="bench-desc">LCG PRNG 1M iterations x 200 (integer mul/add hot loop)</div>
   </td>
-  <td class="num">174.40 ms<div class="sub">171794-175763 us</div></td>
-  <td class="num">182.00 ms<div class="sub">179199-182467 us</div></td>
+  <td class="num">362.07 ms<div class="sub">340767-371017 us</div></td>
+  <td class="num">257.68 ms<div class="sub">236948-264561 us</div></td>
   <td class="num">n/a</td>
-  <td class="num"><span class="badge badge-parity" title="Within ~5%">0.96x</span></td>
-  <td class="num">18 ms</td>
-  <td class="num">520 ms</td>
-  <td class="num"><span class="badge badge-win" title="Mettle faster">0.03x</span></td>
+  <td class="num"><span class="badge badge-loss" title="C faster">1.41x</span></td>
+  <td class="num">36 ms</td>
+  <td class="num">931 ms</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
   <td class="num">5.0 KB</td>
   <td class="num">253.6 KB</td>
   <td class="num"><span class="badge badge-win" title="Mettle faster">0.02x</span></td>
@@ -1660,12 +2332,12 @@
     <div class="bench-name">prefix_sum</div>
     <div class="bench-desc">Inclusive prefix sum over 65536 int32 values x 200 (scan / SIMD)</div>
   </td>
-  <td class="num">4.101 ms<div class="sub">3904-4201 us</div></td>
-  <td class="num">2.962 ms<div class="sub">2873-3051 us</div></td>
+  <td class="num">8.225 ms<div class="sub">3942-10428 us</div></td>
+  <td class="num">8.530 ms<div class="sub">8224-9565 us</div></td>
   <td class="num">n/a</td>
-  <td class="num"><span class="badge badge-loss" title="C faster">1.38x</span></td>
-  <td class="num">19 ms</td>
-  <td class="num">507 ms</td>
+  <td class="num"><span class="badge badge-parity" title="Within ~5%">0.96x</span></td>
+  <td class="num">42 ms</td>
+  <td class="num">937 ms</td>
   <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
   <td class="num">6.5 KB</td>
   <td class="num">253.8 KB</td>
@@ -1675,12 +2347,12 @@
     <div class="bench-name">popcount</div>
     <div class="bench-desc">Population count over 256 KB byte buffer x 200 (bit ops)</div>
   </td>
-  <td class="num">38.582 ms<div class="sub">38210-38990 us</div></td>
-  <td class="num">84.947 ms<div class="sub">81931-107746 us</div></td>
+  <td class="num">78.307 ms<div class="sub">39082-86413 us</div></td>
+  <td class="num">158.91 ms<div class="sub">138219-163700 us</div></td>
   <td class="num">n/a</td>
-  <td class="num"><span class="badge badge-win" title="Mettle faster">0.45x</span></td>
-  <td class="num">20 ms</td>
-  <td class="num">560 ms</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.49x</span></td>
+  <td class="num">36 ms</td>
+  <td class="num">929 ms</td>
   <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
   <td class="num">6.5 KB</td>
   <td class="num">253.8 KB</td>
@@ -1690,12 +2362,12 @@
     <div class="bench-name">reverse_i32</div>
     <div class="bench-desc">Reverse-copy 65536 int32 values x 200 (indexed memory access)</div>
   </td>
-  <td class="num">889 us<div class="sub">877-908 us</div></td>
-  <td class="num">1.824 ms<div class="sub">1780-1918 us</div></td>
+  <td class="num">1.908 ms<div class="sub">1126-2198 us</div></td>
+  <td class="num">3.462 ms<div class="sub">3293-4020 us</div></td>
   <td class="num">n/a</td>
-  <td class="num"><span class="badge badge-win" title="Mettle faster">0.49x</span></td>
-  <td class="num">21 ms</td>
-  <td class="num">517 ms</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.55x</span></td>
+  <td class="num">34 ms</td>
+  <td class="num">964 ms</td>
   <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
   <td class="num">6.5 KB</td>
   <td class="num">253.8 KB</td>
@@ -1705,12 +2377,12 @@
     <div class="bench-name">minmax_scan</div>
     <div class="bench-desc">Min/max scan over 65536 int32 values x 200 (branchy reduction)</div>
   </td>
-  <td class="num">935 us<div class="sub">916-1004 us</div></td>
-  <td class="num">3.094 ms<div class="sub">3080-3273 us</div></td>
+  <td class="num">1.222 ms<div class="sub">1157-2592 us</div></td>
+  <td class="num">4.106 ms<div class="sub">3835-4497 us</div></td>
   <td class="num">n/a</td>
   <td class="num"><span class="badge badge-win" title="Mettle faster">0.30x</span></td>
-  <td class="num">19 ms</td>
-  <td class="num">540 ms</td>
+  <td class="num">34 ms</td>
+  <td class="num">908 ms</td>
   <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
   <td class="num">6.5 KB</td>
   <td class="num">253.8 KB</td>
@@ -1720,12 +2392,12 @@
     <div class="bench-name">scale_i32</div>
     <div class="bench-desc">dst[i] = src[i]*3+7 over 65536 int32 values x 200 (map / vectorize)</div>
   </td>
-  <td class="num">1.119 ms<div class="sub">1106-1492 us</div></td>
-  <td class="num">2.048 ms<div class="sub">2003-2092 us</div></td>
+  <td class="num">2.230 ms<div class="sub">2004-2302 us</div></td>
+  <td class="num">2.213 ms<div class="sub">2061-5101 us</div></td>
   <td class="num">n/a</td>
-  <td class="num"><span class="badge badge-win" title="Mettle faster">0.55x</span></td>
-  <td class="num">19 ms</td>
-  <td class="num">503 ms</td>
+  <td class="num"><span class="badge badge-parity" title="Within ~5%">1.01x</span></td>
+  <td class="num">34 ms</td>
+  <td class="num">969 ms</td>
   <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
   <td class="num">6.5 KB</td>
   <td class="num">253.8 KB</td>
@@ -1735,16 +2407,256 @@
     <div class="bench-name">clamp_i32</div>
     <div class="bench-desc">clamp(src[i], -100, 100) over 65536 int32 values x 200 (branchy map)</div>
   </td>
-  <td class="num">1.497 ms<div class="sub">1422-1759 us</div></td>
-  <td class="num">3.535 ms<div class="sub">3486-3729 us</div></td>
+  <td class="num">2.179 ms<div class="sub">2101-2412 us</div></td>
+  <td class="num">5.839 ms<div class="sub">5558-10624 us</div></td>
   <td class="num">n/a</td>
-  <td class="num"><span class="badge badge-win" title="Mettle faster">0.42x</span></td>
-  <td class="num">20 ms</td>
-  <td class="num">501 ms</td>
-  <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.37x</span></td>
+  <td class="num">32 ms</td>
+  <td class="num">948 ms</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.03x</span></td>
   <td class="num">6.5 KB</td>
   <td class="num">253.8 KB</td>
   <td class="num"><span class="badge badge-win" title="Mettle faster">0.03x</span></td>
+</tr><tr>
+  <td class="name-cell">
+    <div class="bench-name">float_sum</div>
+    <div class="bench-desc">float64 sum reduction 65536 elems x 4000 (FP auto-vectorization gap)</div>
+  </td>
+  <td class="num">20.885 ms<div class="sub">20503-22601 us</div></td>
+  <td class="num">117.48 ms<div class="sub">115773-119814 us</div></td>
+  <td class="num">n/a</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.18x</span></td>
+  <td class="num">32 ms</td>
+  <td class="num">856 ms</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
+  <td class="num">6.0 KB</td>
+  <td class="num">253.2 KB</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.02x</span></td>
+</tr><tr>
+  <td class="name-cell">
+    <div class="bench-name">mandelbrot</div>
+    <div class="bench-desc">Mandelbrot 600x400, 256 iters x 30 (float64-heavy branchy inner loop)</div>
+  </td>
+  <td class="num">2.42 s<div class="sub">2423186-2429467 us</div></td>
+  <td class="num">1.08 s<div class="sub">1077373-1082674 us</div></td>
+  <td class="num">n/a</td>
+  <td class="num"><span class="badge badge-loss" title="C faster">2.24x</span></td>
+  <td class="num">19 ms</td>
+  <td class="num">501 ms</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
+  <td class="num">5.5 KB</td>
+  <td class="num">253.2 KB</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.02x</span></td>
+</tr><tr>
+  <td class="name-cell">
+    <div class="bench-name">rec_fib</div>
+    <div class="bench-desc">Recursive fib(34) x 5 (raw function-call overhead, no inlining)</div>
+  </td>
+  <td class="num">93.825 ms<div class="sub">93002-94168 us</div></td>
+  <td class="num">28.956 ms<div class="sub">28464-30704 us</div></td>
+  <td class="num">n/a</td>
+  <td class="num"><span class="badge badge-loss" title="C faster">3.24x</span></td>
+  <td class="num">18 ms</td>
+  <td class="num">532 ms</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.03x</span></td>
+  <td class="num">5.0 KB</td>
+  <td class="num">254.3 KB</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.02x</span></td>
+</tr><tr>
+  <td class="name-cell">
+    <div class="bench-name">int_divmod</div>
+    <div class="bench-desc">64-bit div+mod 2M iters x 40 (long-latency DIV throughput)</div>
+  </td>
+  <td class="num">352.08 ms<div class="sub">351160-354461 us</div></td>
+  <td class="num">176.31 ms<div class="sub">175241-178578 us</div></td>
+  <td class="num">n/a</td>
+  <td class="num"><span class="badge badge-loss" title="C faster">2.00x</span></td>
+  <td class="num">18 ms</td>
+  <td class="num">499 ms</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
+  <td class="num">5.0 KB</td>
+  <td class="num">253.2 KB</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.02x</span></td>
+</tr><tr>
+  <td class="name-cell">
+    <div class="bench-name">leaf_call</div>
+    <div class="bench-desc">Direct leaf call 60M x 5 (small-function inlining)</div>
+  </td>
+  <td class="num">331.02 ms<div class="sub">329079-344582 us</div></td>
+  <td class="num">331.40 ms<div class="sub">330716-335649 us</div></td>
+  <td class="num">n/a</td>
+  <td class="num"><span class="badge badge-parity" title="Within ~5%">1.00x</span></td>
+  <td class="num">19 ms</td>
+  <td class="num">501 ms</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
+  <td class="num">5.0 KB</td>
+  <td class="num">253.2 KB</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.02x</span></td>
+</tr><tr>
+  <td class="name-cell">
+    <div class="bench-name">func_ptr</div>
+    <div class="bench-desc">Indirect fn-ptr call 60M x 5 (indirect-call ABI cost)</div>
+  </td>
+  <td class="num">400.55 ms<div class="sub">396862-401046 us</div></td>
+  <td class="num">332.29 ms<div class="sub">331220-332676 us</div></td>
+  <td class="num">n/a</td>
+  <td class="num"><span class="badge badge-loss" title="C faster">1.21x</span></td>
+  <td class="num">18 ms</td>
+  <td class="num">497 ms</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
+  <td class="num">5.0 KB</td>
+  <td class="num">253.3 KB</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.02x</span></td>
+</tr><tr>
+  <td class="name-cell">
+    <div class="bench-name">saxpy</div>
+    <div class="bench-desc">float64 SAXPY map 65536 x 3000 (FP map+store vectorization)</div>
+  </td>
+  <td class="num">30.694 ms<div class="sub">30087-31594 us</div></td>
+  <td class="num">21.274 ms<div class="sub">20882-22442 us</div></td>
+  <td class="num">n/a</td>
+  <td class="num"><span class="badge badge-loss" title="C faster">1.44x</span></td>
+  <td class="num">19 ms</td>
+  <td class="num">516 ms</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
+  <td class="num">6.0 KB</td>
+  <td class="num">253.7 KB</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.02x</span></td>
+</tr><tr>
+  <td class="name-cell">
+    <div class="bench-name">fp_div</div>
+    <div class="bench-desc">float64 serial divide chain 20M x 20 (divsd latency)</div>
+  </td>
+  <td class="num">214.59 ms<div class="sub">212093-215040 us</div></td>
+  <td class="num">374.99 ms<div class="sub">374538-376303 us</div></td>
+  <td class="num">n/a</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.57x</span></td>
+  <td class="num">18 ms</td>
+  <td class="num">491 ms</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
+  <td class="num">5.0 KB</td>
+  <td class="num">253.7 KB</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.02x</span></td>
+</tr><tr>
+  <td class="name-cell">
+    <div class="bench-name">struct_byval</div>
+    <div class="bench-desc">32B struct by-value call 40M x 5 (aggregate-copy / SROA)</div>
+  </td>
+  <td class="num">221.48 ms<div class="sub">220180-222293 us</div></td>
+  <td class="num">140.38 ms<div class="sub">139427-140785 us</div></td>
+  <td class="num">n/a</td>
+  <td class="num"><span class="badge badge-loss" title="C faster">1.58x</span></td>
+  <td class="num">19 ms</td>
+  <td class="num">495 ms</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
+  <td class="num">5.5 KB</td>
+  <td class="num">253.2 KB</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.02x</span></td>
+</tr><tr>
+  <td class="name-cell">
+    <div class="bench-name">switch_vm</div>
+    <div class="bench-desc">Bytecode VM switch dispatch 4096 ops x 30000 (jump-table dispatch)</div>
+  </td>
+  <td class="num">208.44 ms<div class="sub">205140-211735 us</div></td>
+  <td class="num">653.29 ms<div class="sub">652416-658525 us</div></td>
+  <td class="num">n/a</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.32x</span></td>
+  <td class="num">19 ms</td>
+  <td class="num">512 ms</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
+  <td class="num">6.0 KB</td>
+  <td class="num">253.2 KB</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.02x</span></td>
+</tr><tr>
+  <td class="name-cell">
+    <div class="bench-name">aos_sum</div>
+    <div class="bench-desc">Array-of-structs field walk 65536 x 2000 (in-place field load/store, not by-value)</div>
+  </td>
+  <td class="num">249.67 ms<div class="sub">248607-252028 us</div></td>
+  <td class="num">107.28 ms<div class="sub">100112-108348 us</div></td>
+  <td class="num">n/a</td>
+  <td class="num"><span class="badge badge-loss" title="C faster">2.33x</span></td>
+  <td class="num">22 ms</td>
+  <td class="num">505 ms</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
+  <td class="num">5.5 KB</td>
+  <td class="num">253.7 KB</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.02x</span></td>
+</tr><tr>
+  <td class="name-cell">
+    <div class="bench-name">transpose</div>
+    <div class="bench-desc">256x256 int32 transpose x 4000 (2D index arithmetic + strided stores)</div>
+  </td>
+  <td class="num">527.90 ms<div class="sub">525499-529853 us</div></td>
+  <td class="num">524.11 ms<div class="sub">521168-524680 us</div></td>
+  <td class="num">n/a</td>
+  <td class="num"><span class="badge badge-parity" title="Within ~5%">1.01x</span></td>
+  <td class="num">20 ms</td>
+  <td class="num">498 ms</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
+  <td class="num">5.5 KB</td>
+  <td class="num">253.7 KB</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.02x</span></td>
+</tr><tr>
+  <td class="name-cell">
+    <div class="bench-name">const_mod</div>
+    <div class="bench-desc">Constant-divisor div/mod 20M x 20 (magic-multiply strength reduction)</div>
+  </td>
+  <td class="num">1.07 s<div class="sub">1059436-1069046 us</div></td>
+  <td class="num">644.05 ms<div class="sub">641584-647936 us</div></td>
+  <td class="num">n/a</td>
+  <td class="num"><span class="badge badge-loss" title="C faster">1.65x</span></td>
+  <td class="num">18 ms</td>
+  <td class="num">523 ms</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.03x</span></td>
+  <td class="num">5.5 KB</td>
+  <td class="num">253.2 KB</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.02x</span></td>
+</tr><tr>
+  <td class="name-cell">
+    <div class="bench-name">global_acc</div>
+    <div class="bench-desc">Global RMW hot loop 100M x 3 (register promotion of globals)</div>
+  </td>
+  <td class="num">197.85 ms<div class="sub">196496-200031 us</div></td>
+  <td class="num">130.79 ms<div class="sub">130516-133749 us</div></td>
+  <td class="num">n/a</td>
+  <td class="num"><span class="badge badge-loss" title="C faster">1.51x</span></td>
+  <td class="num">20 ms</td>
+  <td class="num">501 ms</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
+  <td class="num">5.0 KB</td>
+  <td class="num">253.3 KB</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.02x</span></td>
+</tr><tr>
+  <td class="name-cell">
+    <div class="bench-name">i2f_conv</div>
+    <div class="bench-desc">int&lt;-&gt;float64 conversion loop 30M x 20 (cvtsi2sd/cvttsd2si traffic)</div>
+  </td>
+  <td class="num">654.78 ms<div class="sub">598710-760425 us</div></td>
+  <td class="num">498.18 ms<div class="sub">395199-567867 us</div></td>
+  <td class="num">n/a</td>
+  <td class="num"><span class="badge badge-loss" title="C faster">1.31x</span></td>
+  <td class="num">17 ms</td>
+  <td class="num">497 ms</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
+  <td class="num">5.0 KB</td>
+  <td class="num">253.2 KB</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.02x</span></td>
+</tr><tr>
+  <td class="name-cell">
+    <div class="bench-name">byte_arith</div>
+    <div class="bench-desc">uint8 buffer arithmetic 256KB x 2000 (narrow-type codegen)</div>
+  </td>
+  <td class="num">534.87 ms<div class="sub">531841-535266 us</div></td>
+  <td class="num">70.472 ms<div class="sub">69538-71524 us</div></td>
+  <td class="num">n/a</td>
+  <td class="num"><span class="badge badge-loss" title="C faster">7.59x</span></td>
+  <td class="num">20 ms</td>
+  <td class="num">497 ms</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.04x</span></td>
+  <td class="num">5.5 KB</td>
+  <td class="num">253.7 KB</td>
+  <td class="num"><span class="badge badge-win" title="Mettle faster">0.02x</span></td>
 </tr>
           </tbody>
         </table>

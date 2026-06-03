@@ -16,7 +16,7 @@ This document lists current limitations of the Mettle language, compiler, and ru
 
 ### Constants
 
-- No top-level constant expressions. Use functions that return constant values instead.
+- `const NAME [: type] = <expr>;` declares a compile-time integer constant. At top level the value is folded at every use site; a local `const` is an immutable variable (reassignment is a compile error). Initializers must be compile-time constant integer expressions (literals, `sizeof`, other constants, and arithmetic/bitwise/comparison operators over them). Float, string, and aggregate constants are not yet supported, and constants must be declared before use.
 
 ### Traits & Generics
 
@@ -29,8 +29,7 @@ Traits and constrained generics support inline bounds, multiple bounds, trailing
 
 ### Switch
 
-- `switch` case values must be compile-time constant integer expressions.
-- Range-style cases (for example, `case 1..10`) are not supported.
+- `switch` case values must be compile-time constant integer expressions. Inclusive range cases (`case lo..hi:`) are supported; both bounds must also be compile-time constant integers.
 
 ---
 
@@ -93,7 +92,7 @@ Arrays follow the same rule as in [Types - Array Types](types.md#array-types): t
 
 ### Deferred Calls
 
-- Deferred calls capture variables by reference, not by value. In loops, copy the current value into a temporary first if the deferred call should see the declaration-time value.
+- A deferred direct call `defer fn(args...)` captures its **argument values at the defer point** (by value); the snapshots are replayed at scope exit. Deferred **method calls** (`defer obj.m(...)`) and **indirect/function-pointer calls** still re-evaluate their operands at scope exit (by reference); snapshot into a local first if you need the defer-point value.
 
 ### Error Defer
 
@@ -105,7 +104,7 @@ Arrays follow the same rule as in [Types - Array Types](types.md#array-types): t
 
 ### Imports
 
-- No conditional imports. All `import` directives are unconditional; there is no platform- or flag-based import.
+- Imports may carry a platform guard: `import "..." if windows;` or `import "..." if linux;`. A guarded import is included only when its platform matches the build target (the compiler targets its host), and an off-target guarded module is never looked up. Unguarded imports are unconditional. The guard predicate is limited to `windows` and `linux`.
 
 ### Platform Support
 

@@ -91,6 +91,7 @@ ASTNode *ast_clone_node(ASTNode *node) {
     dst->type_name = ast_intern_string(src->type_name);
     dst->is_extern = src->is_extern;
     dst->is_exported = src->is_exported;
+    dst->is_const = src->is_const;
     dst->link_name = ast_copy_string(src->link_name);
     dst->initializer =
         src->initializer ? ast_clone_node(src->initializer) : NULL;
@@ -548,10 +549,13 @@ ASTNode *ast_clone_node(ASTNode *node) {
       return NULL;
     }
     dst->value = src->value ? ast_clone_node(src->value) : NULL;
+    dst->value_high = src->value_high ? ast_clone_node(src->value_high) : NULL;
     dst->body = src->body ? ast_clone_node(src->body) : NULL;
     dst->is_default = src->is_default;
     if (dst->value)
       ast_add_child(clone, dst->value);
+    if (dst->value_high)
+      ast_add_child(clone, dst->value_high);
     if (dst->body)
       ast_add_child(clone, dst->body);
     clone->data = dst;
@@ -591,6 +595,7 @@ ASTNode *ast_clone_node(ASTNode *node) {
     }
     dst->module_name = ast_copy_string(src->module_name);
     dst->namespace_alias = ast_copy_string(src->namespace_alias);
+    dst->platform_guard = ast_copy_string(src->platform_guard);
     dst->selected_names = NULL;
     dst->selected_count = 0;
     if (src->selected_names && src->selected_count > 0) {
@@ -686,6 +691,7 @@ void ast_destroy_node(ASTNode *node) {
     if (import_decl) {
       ast_free_string(import_decl->module_name);
       ast_free_string(import_decl->namespace_alias);
+      ast_free_string(import_decl->platform_guard);
       for (size_t i = 0; i < import_decl->selected_count; i++) {
         ast_free_string(import_decl->selected_names[i]);
       }
@@ -1072,6 +1078,7 @@ ASTNode *ast_create_import_declaration(const char *module_name,
   import_decl->namespace_alias = ast_copy_string(namespace_alias);
   import_decl->selected_names = NULL;
   import_decl->selected_count = 0;
+  import_decl->platform_guard = NULL;
 
   if (selected_names && selected_count > 0) {
     import_decl->selected_names = malloc(selected_count * sizeof(char *));
@@ -1127,6 +1134,7 @@ ASTNode *ast_create_var_declaration(const char *name, const char *type_name,
   var_decl->initializer = initializer;
   var_decl->is_extern = 0;
   var_decl->is_exported = 0;
+  var_decl->is_const = 0;
   var_decl->link_name = NULL;
   node->data = var_decl;
 
@@ -1807,6 +1815,7 @@ ASTNode *ast_create_case_clause(ASTNode *value, ASTNode *body, int is_default,
   }
 
   case_clause->value = value;
+  case_clause->value_high = NULL;
   case_clause->body = body;
   case_clause->is_default = is_default;
   node->data = case_clause;

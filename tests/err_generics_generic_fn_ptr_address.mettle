@@ -1,0 +1,11 @@
+function identity<T>(x: T) -> T {
+    return x;
+}
+
+function apply<T>(f: fn(T) -> T, x: T) -> T {
+    return f(x);
+}
+
+function main() -> int32 {
+    return apply<int32>(&identity<int32>, 41);
+}

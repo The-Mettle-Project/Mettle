@@ -1,0 +1,87 @@
+// Regression / correctness oracle for Scalar Replacement of Aggregates (SROA).
+//
+// Each section is self-contained and self-checking against a hand-computed or
+// plain-scalar reference, so a miscompiled split (wrong offset, lost float
+// width, dropped field copy) changes the output. Run both --release (SROA
+// active) and -O0 (SROA inactive) in the suite; the two must agree and the
+// program must return 1. Sections are kept independent so the oracle validates
+// SROA itself rather than unrelated aggregate codegen.
+
+import "std/io";
+
+struct V4 { a: int64; b: int64; c: int64; d: int64; }
+struct FP { x: float64; y: float64; }
+
+function step(v: V4) -> V4 {
+  var r: V4;
+  r.a = v.a + v.d;
+  r.b = v.b ^ (v.a >> 3);
+  r.c = v.c + v.b + 1;
+  r.d = v.d * 2654435761 + 1;
+  return r;
+}
+
+function main() -> int32 {
+  var fails: int64 = 0;
+
+  // 1. By-value struct round-trip in a loop (the struct_byval shape: SROA must
+  // scalarize `s` and the inlined return `r`, and rewrite the per-iteration
+  // whole-struct copy field-wise). Checked against a fully-scalar mirror.
+  var s: V4;
+  s.a = 1; s.b = 2; s.c = 3; s.d = 4;
+  var ra: int64 = 1; var rb: int64 = 2; var rc: int64 = 3; var rd: int64 = 4;
+  var i: int64 = 0;
+  while (i < 1000) {
+    s = step(s);
+    var na: int64 = ra + rd;
+    var nb: int64 = rb ^ (ra >> 3);
+    var nc: int64 = rc + rb + 1;
+    var nd: int64 = rd * 2654435761 + 1;
+    ra = na; rb = nb; rc = nc; rd = nd;
+    i = i + 1;
+  }
+  if (s.a != ra) { fails = fails + 1; }
+  if (s.b != rb) { fails = fails + 1; }
+  if (s.c != rc) { fails = fails + 1; }
+  if (s.d != rd) { fails = fails + 1; }
+
+  // 2. Whole-struct copy after the by-value loop. This used to corrupt the
+  // offset-16 field under --release, making benchmark checksums untrustworthy.
+  var t: V4;
+  t = s;
+  if (t.a != ra) { fails = fails + 1; }
+  if (t.b != rb) { fails = fails + 1; }
+  if (t.c != rc) { fails = fails + 1; }
+  if (t.d != rd) { fails = fails + 1; }
+
+  // 3. Per-field read/modify/write in a hot loop (basic scalarization +
+  // register promotion). p.x accumulates p.y; checked by closed form.
+  var p: V4;
+  p.a = 10; p.b = 7; p.c = 0; p.d = 0;
+  var k: int64 = 0;
+  while (k < 500) {
+    p.a = p.a + p.b;
+    p.c = p.c + 1;
+    k = k + 1;
+  }
+  if (p.a != 10 + 7 * 500) { fails = fails + 1; }
+  if (p.c != 500) { fails = fails + 1; }
+  if (p.b != 7) { fails = fails + 1; }
+
+  // 4. Float-field struct: the scalar must carry float width (movsd, not movq).
+  var f: FP;
+  f.x = 2.5;
+  f.y = 4.0;
+  var sum: float64 = f.x + f.y;   // 6.5
+  var prod: float64 = f.x * f.y;  // 10.0
+  if ((int64)(sum * 2.0) != 13) { fails = fails + 1; }
+  if ((int64)prod != 10) { fails = fails + 1; }
+
+  if (fails == 0) {
+    println("sroa OK");
+    return 1;
+  }
+  print("sroa MISMATCHES: ");
+  println_int(fails);
+  return 0;
+}

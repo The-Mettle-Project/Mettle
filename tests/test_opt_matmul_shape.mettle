@@ -1,4 +1,4 @@
-// matmul() should lower to simd_matmul_n32 without a call under --release.
+// matmul() should not lower to a hidden simd_matmul_n32 special case.
 function matmul(a: int32*, b: int32*, c: int32*) {
   var row: int32 = 0;
   var row_base: int64 = 0;

@@ -778,7 +778,7 @@ int code_generator_binary_collect_global_constants(
 }
 
 int code_generator_declare_binary_externs(CodeGenerator *generator,
-                                                 Program *program_data) {
+                                          Program *program_data) {
   BinaryEmitter *emitter = NULL;
 
   if (!generator || !program_data) {
@@ -815,6 +815,18 @@ int code_generator_declare_binary_externs(CodeGenerator *generator,
       extern_name =
           code_generator_get_link_symbol_name(generator, var_data->name);
     } else {
+      continue;
+    }
+
+    if (code_generator_binary_active_abi()->shadow_space_size > 0 &&
+        (strcmp(extern_name, "malloc") == 0 ||
+         strcmp(extern_name, "calloc") == 0 ||
+         strcmp(extern_name, "realloc") == 0 ||
+         strcmp(extern_name, "free") == 0 ||
+         strcmp(extern_name, "memset") == 0 ||
+         strcmp(extern_name, "memcpy") == 0 ||
+         strcmp(extern_name, "memmove") == 0 ||
+         strcmp(extern_name, "memcmp") == 0)) {
       continue;
     }
 

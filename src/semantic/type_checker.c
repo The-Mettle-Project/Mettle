@@ -1,6 +1,7 @@
 #include "type_checker.h"
 #include "../common.h"
 #include "../error/error_reporter.h"
+#include "../string_intern.h"
 #include "symbol_table.h"
 #include <ctype.h>
 #include <errno.h>
@@ -1724,6 +1725,25 @@ static Type *type_checker_infer_type_internal(TypeChecker *checker,
 
     }
 
+    /* Qualified tagged-enum constructor `EnumName.Variant(args)`: the parser
+     * shapes this as a method call whose receiver is the enum-name identifier.
+     * Strip the receiver so downstream code treats it as a direct constructor
+     * call on `Variant` — the variant constructor symbol already exists in the
+     * global scope (registered at enum-decl time). */
+    if (call && call->object && call->object->type == AST_IDENTIFIER &&
+        call->function_name) {
+      Identifier *recv_id = (Identifier *)call->object->data;
+      if (recv_id && recv_id->name) {
+        Symbol *recv_sym =
+            symbol_table_lookup(checker->symbol_table, recv_id->name);
+        if (recv_sym && recv_sym->kind == SYMBOL_ENUM) {
+          /* Drop the receiver — leak-free: the identifier node is owned by
+           * the AST tree and freed when the program is freed. */
+          call->object = NULL;
+        }
+      }
+    }
+
     // Method calls on threading types:
     // Thread.join(), Mutex.new(), mutex.lock(), guard (unlock via drop),
     // Atomic.new(), atomic.load/store/fetch_add/fetch_sub/cas(),
@@ -1941,6 +1961,57 @@ static Type *type_checker_infer_type_internal(TypeChecker *checker,
 
   case AST_MEMBER_ACCESS: {
     MemberAccess *member = (MemberAccess *)expression->data;
+
+    /* Qualified enum access: `EnumName.Variant`.
+     *  - Plain enum:  yields the variant's integer value, typed as the enum.
+     *  - Tagged enum, nullary variant: yields a tagged-enum value.
+     *  - Tagged enum, payloadful variant: only valid as the callee of a
+     *    CallExpression (handled by the call type-checker, which sees the
+     *    member-access and looks up the constructor symbol). Here we still
+     *    return the enum type so downstream code keeps making progress; the
+     *    constructor arity is enforced at call-check time.
+     * The object must be an identifier naming an ENUM symbol. */
+    if (member->object && member->object->type == AST_IDENTIFIER) {
+      Identifier *obj_id = (Identifier *)member->object->data;
+      if (obj_id && obj_id->name) {
+        Symbol *enum_sym =
+            symbol_table_lookup(checker->symbol_table, obj_id->name);
+        if (enum_sym && enum_sym->kind == SYMBOL_ENUM && enum_sym->type) {
+          Type *enum_ty = enum_sym->type;
+          if (enum_ty->kind == TYPE_ENUM) {
+            /* Plain enum variants live as global SYMBOL_CONSTANTs of the enum
+             * type. Look up the variant by its bare name and confirm it
+             * belongs to this enum. */
+            Symbol *variant_sym =
+                symbol_table_lookup(checker->symbol_table, member->member);
+            if (variant_sym && variant_sym->kind == SYMBOL_CONSTANT &&
+                variant_sym->type == enum_ty) {
+              return enum_ty;
+            }
+            type_checker_set_error_at_location(
+                checker, expression->location,
+                "Enum '%s' has no variant '%s'", obj_id->name, member->member);
+            return NULL;
+          }
+          if (enum_ty->kind == TYPE_TAGGED_ENUM) {
+            for (size_t i = 0; i < enum_ty->tagged_variant_count; i++) {
+              if (enum_ty->tagged_variant_names &&
+                  enum_ty->tagged_variant_names[i] &&
+                  strcmp(enum_ty->tagged_variant_names[i], member->member) ==
+                      0) {
+                return enum_ty;
+              }
+            }
+            type_checker_set_error_at_location(
+                checker, expression->location,
+                "Tagged enum '%s' has no variant '%s'", obj_id->name,
+                member->member);
+            return NULL;
+          }
+        }
+      }
+    }
+
     Type *object_type = type_checker_infer_type(checker, member->object);
     if (object_type && (object_type->kind == TYPE_STRUCT ||
                         object_type->kind == TYPE_STRING)) {
@@ -2853,10 +2924,33 @@ int type_checker_process_struct_declaration(TypeChecker *checker,
     return 0;
   }
 
-  // Resolve field types
-  Type **field_types = malloc(decl->field_count * sizeof(Type *));
-  if (!field_types)
+  /* Self-referential structs (e.g. `next: Foo*` inside `struct Foo`) need
+   * `Foo` resolvable as a base type while its own fields are being processed.
+   * Register an empty placeholder struct type + symbol first; the pointer-type
+   * parser only requires the base Type pointer to exist, not for its fields
+   * to be populated. We fill in the field information in place once the
+   * field types have all resolved. */
+  Type *struct_type = type_create(TYPE_STRUCT, decl->name);
+  if (!struct_type) {
     return 0;
+  }
+
+  Symbol *struct_symbol = symbol_create(decl->name, SYMBOL_STRUCT, struct_type);
+  if (!struct_symbol) {
+    type_destroy(struct_type);
+    return 0;
+  }
+
+  if (!symbol_table_declare(checker->symbol_table, struct_symbol)) {
+    symbol_destroy(struct_symbol);
+    return 0;
+  }
+
+  // Resolve field types now that the placeholder is visible.
+  Type **field_types = malloc(decl->field_count * sizeof(Type *));
+  if (!field_types) {
+    return 0;
+  }
 
   for (size_t i = 0; i < decl->field_count; i++) {
     field_types[i] =
@@ -2872,27 +2966,45 @@ int type_checker_process_struct_declaration(TypeChecker *checker,
     }
   }
 
-  // Create struct type
-  Type *struct_type = type_create_struct(decl->name, decl->field_names,
-                                         field_types, decl->field_count);
-  if (!struct_type) {
+  // Populate the placeholder in place: copy field names, attach field types,
+  // and compute offsets/size/alignment. Mirrors type_create_struct, but
+  // operates on the already-registered placeholder so that any pointers
+  // captured during field resolution remain valid.
+  struct_type->field_count = decl->field_count;
+  struct_type->field_names = malloc(decl->field_count * sizeof(char *));
+  struct_type->field_types = malloc(decl->field_count * sizeof(Type *));
+  struct_type->field_offsets = malloc(decl->field_count * sizeof(size_t));
+  if (!struct_type->field_names || !struct_type->field_types ||
+      !struct_type->field_offsets) {
     free(field_types);
     return 0;
   }
 
-  // Create and register struct symbol
-  Symbol *struct_symbol = symbol_create(decl->name, SYMBOL_STRUCT, struct_type);
-  if (!struct_symbol) {
-    type_destroy(struct_type);
-    free(field_types);
-    return 0;
+  size_t current_offset = 0;
+  size_t max_alignment = 1;
+  for (size_t i = 0; i < decl->field_count; i++) {
+    struct_type->field_names[i] = (char *)string_intern(decl->field_names[i]);
+    struct_type->field_types[i] = field_types[i];
+    size_t field_alignment = field_types[i]->alignment;
+    if (field_alignment == 0) {
+      /* A pointer to a not-yet-populated struct still has pointer size and
+       * alignment because pointers are sized independently of their pointee.
+       * Other zero-alignment cases shouldn't happen for first-class types. */
+      field_alignment = 1;
+    }
+    if (field_alignment > max_alignment) {
+      max_alignment = field_alignment;
+    }
+    size_t padding = (field_alignment - (current_offset % field_alignment)) %
+                     field_alignment;
+    current_offset += padding;
+    struct_type->field_offsets[i] = current_offset;
+    current_offset += field_types[i]->size;
   }
-
-  if (!symbol_table_declare(checker->symbol_table, struct_symbol)) {
-    symbol_destroy(struct_symbol);
-    free(field_types);
-    return 0;
-  }
+  size_t final_padding =
+      (max_alignment - (current_offset % max_alignment)) % max_alignment;
+  struct_type->size = current_offset + final_padding;
+  struct_type->alignment = max_alignment;
 
   free(field_types);
   return 1;
@@ -3653,6 +3765,57 @@ int type_checker_process_declaration(TypeChecker *checker,
       return 0;
     }
 
+    // A `const` declaration binds an immutable compile-time integer value.
+    // At global scope it is folded at every use site (SYMBOL_CONSTANT) and
+    // needs no storage. A local `const` is registered as an immutable variable
+    // (it gets normal storage below) because IR lowering cannot resolve local
+    // scopes to fold it; reassignment is rejected via the immutable flag.
+    if (var_decl->is_const) {
+      if (!type_checker_is_integer_type(var_type)) {
+        type_checker_report_type_mismatch(checker,
+                                          var_decl->initializer->location,
+                                          "integer type", var_type->name);
+        return 0;
+      }
+      long long const_value = 0;
+      if (!type_checker_eval_integer_constant_with_checker(
+              checker, var_decl->initializer, &const_value)) {
+        type_checker_set_error_at_location(
+            checker, var_decl->initializer->location,
+            "Constant '%s' initializer must be a compile-time integer "
+            "constant expression",
+            var_decl->name);
+        return 0;
+      }
+      if (current_scope && current_scope->type == SCOPE_GLOBAL) {
+        if (symbol_table_lookup_current_scope(checker->symbol_table,
+                                              var_decl->name)) {
+          type_checker_report_duplicate_declaration(
+              checker, declaration->location, var_decl->name);
+          return 0;
+        }
+        Symbol *const_symbol =
+            symbol_create(var_decl->name, SYMBOL_CONSTANT, var_type);
+        if (!const_symbol) {
+          type_checker_set_error_at_location(
+              checker, declaration->location,
+              "Failed to create symbol for constant '%s'", var_decl->name);
+          return 0;
+        }
+        const_symbol->data.constant.value = const_value;
+        const_symbol->is_initialized = 1;
+        if (!symbol_table_declare(checker->symbol_table, const_symbol)) {
+          type_checker_report_duplicate_declaration(
+              checker, declaration->location, var_decl->name);
+          symbol_destroy(const_symbol);
+          return 0;
+        }
+        return 1;
+      }
+      // Local const: fall through to normal variable registration; the symbol
+      // is marked immutable where it is created below.
+    }
+
     // Check for duplicate declaration in current scope.
     Symbol *existing = symbol_table_lookup_current_scope(checker->symbol_table,
                                                          var_decl->name);
@@ -3705,6 +3868,7 @@ int type_checker_process_declaration(TypeChecker *checker,
     }
 
     var_symbol->is_extern = var_decl->is_extern;
+    var_symbol->is_immutable = var_decl->is_const;
     if (var_decl->is_extern) {
       const char *effective_link_name = type_checker_decl_link_name(
           var_decl->name, var_decl->is_extern, var_decl->link_name);
@@ -4275,14 +4439,23 @@ int type_checker_process_declaration(TypeChecker *checker,
         var_symbol->kind != SYMBOL_PARAMETER) {
       char error_msg[512];
       const char *symbol_type =
-          (var_symbol->kind == SYMBOL_FUNCTION) ? "function"
-          : (var_symbol->kind == SYMBOL_STRUCT) ? "struct"
-                                                : "symbol";
+          (var_symbol->kind == SYMBOL_FUNCTION)   ? "function"
+          : (var_symbol->kind == SYMBOL_STRUCT)   ? "struct"
+          : (var_symbol->kind == SYMBOL_CONSTANT) ? "constant"
+                                                  : "symbol";
       snprintf(error_msg, sizeof(error_msg),
                "'%s' is a %s and cannot be assigned to",
                assignment->variable_name, symbol_type);
       type_checker_set_error_at_location(checker, declaration->location,
                                          error_msg);
+      return 0;
+    }
+
+    if (var_symbol->is_immutable) {
+      type_checker_set_error_at_location(
+          checker, declaration->location,
+          "'%s' is a constant and cannot be assigned to",
+          assignment->variable_name);
       return 0;
     }
 
@@ -4766,6 +4939,27 @@ static int type_checker_check_switch_statement(TypeChecker *checker,
           case_eval_ok = 1;
         }
       }
+      /* Qualified plain-enum variant in a case: `case EnumName.Variant:`. */
+      if (!case_eval_ok &&
+          case_clause->value->type == AST_MEMBER_ACCESS) {
+        MemberAccess *cma = (MemberAccess *)case_clause->value->data;
+        if (cma && cma->object && cma->object->type == AST_IDENTIFIER &&
+            cma->member) {
+          Identifier *cma_obj = (Identifier *)cma->object->data;
+          if (cma_obj && cma_obj->name) {
+            Symbol *enum_sym =
+                symbol_table_lookup(checker->symbol_table, cma_obj->name);
+            if (enum_sym && enum_sym->kind == SYMBOL_ENUM) {
+              Symbol *vsym =
+                  symbol_table_lookup(checker->symbol_table, cma->member);
+              if (vsym && vsym->kind == SYMBOL_CONSTANT) {
+                case_value = vsym->data.constant.value;
+                case_eval_ok = 1;
+              }
+            }
+          }
+        }
+      }
       if (!case_eval_ok) {
         type_checker_set_error_at_location(
             checker, case_clause->value->location,
@@ -4776,18 +4970,77 @@ static int type_checker_check_switch_statement(TypeChecker *checker,
         return 0;
       }
 
-      for (size_t j = 0; j < case_value_count; j++) {
-        if (case_values[j] == case_value) {
-          type_checker_set_error_at_location(
-              checker, case_clause->value->location,
-              "Duplicate case value '%lld' in switch", case_value);
+      // Range case `lo..hi`: validate the upper bound the same way as the
+      // lower bound, require it be a compile-time integer constant, and ensure
+      // lo <= hi. First-match-wins dispatch makes overlapping ranges harmless,
+      // so they are not tracked for duplicate detection.
+      if (case_clause->value_high) {
+        Type *high_type =
+            type_checker_infer_type(checker, case_clause->value_high);
+        if (!high_type) {
           checker->switch_depth--;
           free(init_snapshot);
           free(case_values);
           return 0;
         }
+        if (!type_checker_is_integer_type(high_type) ||
+            !type_checker_is_assignable(checker, switch_type, high_type)) {
+          type_checker_report_type_mismatch(
+              checker, case_clause->value_high->location, switch_type->name,
+              high_type->name);
+          checker->switch_depth--;
+          free(init_snapshot);
+          free(case_values);
+          return 0;
+        }
+
+        long long case_high_value = 0;
+        int high_eval_ok = type_checker_eval_integer_constant(
+            case_clause->value_high, &case_high_value);
+        if (!high_eval_ok &&
+            case_clause->value_high->type == AST_IDENTIFIER) {
+          Identifier *hid = (Identifier *)case_clause->value_high->data;
+          Symbol *hsym =
+              symbol_table_lookup(checker->symbol_table, hid->name);
+          if (hsym && hsym->kind == SYMBOL_CONSTANT) {
+            case_high_value = hsym->data.constant.value;
+            high_eval_ok = 1;
+          }
+        }
+        if (!high_eval_ok) {
+          type_checker_set_error_at_location(
+              checker, case_clause->value_high->location,
+              "Range upper bound must be a compile-time integer constant "
+              "expression");
+          checker->switch_depth--;
+          free(init_snapshot);
+          free(case_values);
+          return 0;
+        }
+        if (case_value > case_high_value) {
+          type_checker_set_error_at_location(
+              checker, case_clause->value->location,
+              "Range lower bound '%lld' exceeds upper bound '%lld'",
+              case_value, case_high_value);
+          checker->switch_depth--;
+          free(init_snapshot);
+          free(case_values);
+          return 0;
+        }
+      } else {
+        for (size_t j = 0; j < case_value_count; j++) {
+          if (case_values[j] == case_value) {
+            type_checker_set_error_at_location(
+                checker, case_clause->value->location,
+                "Duplicate case value '%lld' in switch", case_value);
+            checker->switch_depth--;
+            free(init_snapshot);
+            free(case_values);
+            return 0;
+          }
+        }
+        case_values[case_value_count++] = case_value;
       }
-      case_values[case_value_count++] = case_value;
     }
 
     if (!case_clause->body) {

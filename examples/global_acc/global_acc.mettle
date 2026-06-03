@@ -1,0 +1,48 @@
+// New dimension: heavy read-modify-write of GLOBAL variables in a hot loop.
+//
+// The direct-object backend keeps globals scalar/in-memory. C -O3 promotes
+// these to registers across the loop (they don't escape). If Mettle reloads
+// and stores each global every iteration instead of keeping it in a register,
+// this loop pays a memory round-trip per op and should lag badly.
+//
+// Build: build.bat   Run: global_acc.exe
+
+import "std/io";
+import "std/bench";
+
+const N = 100000000;
+
+var g_a: int64 = 1;
+var g_b: int64 = 2;
+var g_c: int64 = 3;
+
+function run() {
+  var i: int64 = 0;
+  while (i < (int64)N) {
+    g_a = g_a + i;
+    g_b = g_b ^ (g_a >> 3);
+    g_c = g_c + g_a - g_b;
+    i = i + 1;
+  }
+}
+
+function main() -> int32 {
+  var passes: int32 = 3;
+  println("Global RMW hot loop, 100M iters x 3 passes");
+
+  var t0: uint64 = bench_time_us();
+  var p: int32 = 0;
+  while (p < passes) {
+    g_a = 1; g_b = 2; g_c = 3;
+    run();
+    p = p + 1;
+  }
+  var elapsed_us: uint64 = bench_time_us() - t0;
+
+  print("Checksum = ");
+  println_int(g_a ^ g_b ^ g_c);
+  print("Time: ");
+  print_int(elapsed_us);
+  println(" us");
+  return 0;
+}

@@ -612,6 +612,7 @@ ASTNode *parser_parse_declaration(Parser *parser) {
     return decl;
   }
   case TOKEN_VAR:
+  case TOKEN_CONST:
     return parser_parse_var_declaration(parser);
   case TOKEN_DEFER:
     return parser_parse_defer_statement(parser);
@@ -769,6 +770,7 @@ ASTNode *parser_parse_statement(Parser *parser) {
   case TOKEN_EXTERN:
     return parser_parse_declaration(parser);
   case TOKEN_VAR:
+  case TOKEN_CONST:
     return parser_parse_var_declaration(parser);
   case TOKEN_RETURN:
     return parser_parse_return_statement(parser);
@@ -2079,6 +2081,36 @@ ASTNode *parser_parse_binary_expression(Parser *parser, int min_precedence) {
   return left;
 }
 
+// Parse an optional platform guard on an import: `import "..." if windows;`
+// (or `if linux`). On success writes a heap-allocated platform name to
+// *out_guard (or NULL when there is no guard) and returns 1; returns 0 on error.
+static int parser_parse_import_guard(Parser *parser, char **out_guard) {
+  *out_guard = NULL;
+  if (parser->current_token.type != TOKEN_IF) {
+    return 1;
+  }
+  parser_advance(parser); // consume 'if'
+  if (!parser_is_identifier_like(parser->current_token.type) ||
+      !parser->current_token.value) {
+    parser_set_error(parser,
+                     "Expected platform name after 'if' in import guard");
+    return 0;
+  }
+  const char *name = parser->current_token.value;
+  if (strcmp(name, "windows") != 0 && strcmp(name, "linux") != 0) {
+    parser_set_error(parser,
+                     "Import guard platform must be 'windows' or 'linux'");
+    return 0;
+  }
+  *out_guard = strdup(name);
+  parser_advance(parser); // consume platform name
+  if (!*out_guard) {
+    parser_set_error(parser, "Out of memory parsing import guard");
+    return 0;
+  }
+  return 1;
+}
+
 ASTNode *parser_parse_import_declaration(Parser *parser) {
   if (!parser)
     return NULL;
@@ -2155,7 +2187,16 @@ ASTNode *parser_parse_import_declaration(Parser *parser) {
     char *module_name = strdup(parser->current_token.value);
     parser_advance(parser); // consume string
 
+    char *guard = NULL;
+    if (!parser_parse_import_guard(parser, &guard)) {
+      free(module_name);
+      for (size_t i = 0; i < selected_count; i++) free(selected[i]);
+      free(selected);
+      return NULL;
+    }
+
     if (!parser_expect_statement_end(parser)) {
+      free(guard);
       free(module_name);
       for (size_t i = 0; i < selected_count; i++) free(selected[i]);
       free(selected);
@@ -2164,6 +2205,11 @@ ASTNode *parser_parse_import_declaration(Parser *parser) {
 
     ASTNode *node = ast_create_import_declaration(
         module_name, NULL, (const char **)selected, selected_count, location);
+    if (node && node->data && guard) {
+      ((ImportDeclaration *)node->data)->platform_guard = guard; // transfer
+    } else {
+      free(guard);
+    }
     free(module_name);
     for (size_t i = 0; i < selected_count; i++) free(selected[i]);
     free(selected);
@@ -2193,7 +2239,15 @@ ASTNode *parser_parse_import_declaration(Parser *parser) {
     parser_advance(parser); // consume alias
   }
 
+  char *guard = NULL;
+  if (!parser_parse_import_guard(parser, &guard)) {
+    free(module_name);
+    free(namespace_alias);
+    return NULL;
+  }
+
   if (!parser_expect_statement_end(parser)) {
+    free(guard);
     free(module_name);
     free(namespace_alias);
     return NULL;
@@ -2201,6 +2255,11 @@ ASTNode *parser_parse_import_declaration(Parser *parser) {
 
   ASTNode *node =
       ast_create_import_declaration(module_name, namespace_alias, NULL, 0, location);
+  if (node && node->data && guard) {
+    ((ImportDeclaration *)node->data)->platform_guard = guard; // transfer
+  } else {
+    free(guard);
+  }
   free(module_name);
   free(namespace_alias);
 
@@ -2303,14 +2362,19 @@ ASTNode *parser_parse_var_declaration(Parser *parser) {
     return NULL;
 
   SourceLocation location = parser_current_location(parser);
-  // Expect 'var' keyword
-  if (!parser_expect(parser, TOKEN_VAR)) {
+  // Expect 'var' or 'const' keyword
+  int is_const = (parser->current_token.type == TOKEN_CONST);
+  if (is_const) {
+    parser_advance(parser); // consume 'const'
+  } else if (!parser_expect(parser, TOKEN_VAR)) {
     return NULL;
   }
 
   // Expect identifier
   if (!parser_is_identifier_like(parser->current_token.type)) {
-    parser_set_error(parser, "Expected identifier after 'var'");
+    parser_set_error(parser,
+                     is_const ? "Expected identifier after 'const'"
+                              : "Expected identifier after 'var'");
     return NULL;
   }
 
@@ -2346,6 +2410,14 @@ ASTNode *parser_parse_var_declaration(Parser *parser) {
     }
   }
 
+  // A constant must always have a value to fold at compile time.
+  if (is_const && !initializer) {
+    parser_set_error(parser, "Constant declaration requires an initializer");
+    free(var_name);
+    free(type_name);
+    return NULL;
+  }
+
   // For type inference, if no type is specified but there's an initializer,
   // we'll leave type_name as NULL and let the semantic analyzer infer it
   if (!type_name && !initializer) {
@@ -2360,6 +2432,9 @@ ASTNode *parser_parse_var_declaration(Parser *parser) {
 
   ASTNode *var_decl =
       ast_create_var_declaration(var_name, type_name, initializer, location);
+  if (var_decl && var_decl->data) {
+    ((VarDeclaration *)var_decl->data)->is_const = is_const;
+  }
 
   free(var_name);
   free(type_name);
@@ -3024,6 +3099,7 @@ ASTNode *parser_parse_enum_declaration(Parser *parser) {
       decl->type_params = type_params;
       decl->type_param_count = type_param_count;
       type_params = NULL; // ownership transferred
+      type_param_count = 0;
     }
   }
 
@@ -3728,6 +3804,7 @@ ASTNode *parser_parse_switch_statement(Parser *parser) {
 
     int is_default = 0;
     ASTNode *case_value = NULL;
+    ASTNode *case_high = NULL;
     SourceLocation case_loc = parser_current_location(parser);
 
     if (parser->current_token.type == TOKEN_CASE) {
@@ -3736,6 +3813,17 @@ ASTNode *parser_parse_switch_statement(Parser *parser) {
       if (!case_value) {
         parser_set_error(parser, "Expected constant expression after 'case'");
         break;
+      }
+      // Range case: `case lo..hi:` matches any value in [lo, hi].
+      if (parser->current_token.type == TOKEN_DOT_DOT) {
+        parser_advance(parser);
+        case_high = parser_parse_expression(parser);
+        if (!case_high) {
+          parser_set_error(parser,
+                           "Expected upper bound expression after '..'");
+          ast_destroy_node(case_value);
+          break;
+        }
       }
     } else if (parser->current_token.type == TOKEN_DEFAULT) {
       if (seen_default) {
@@ -3753,6 +3841,8 @@ ASTNode *parser_parse_switch_statement(Parser *parser) {
     if (!parser_expect(parser, TOKEN_COLON)) {
       if (case_value)
         ast_destroy_node(case_value);
+      if (case_high)
+        ast_destroy_node(case_high);
       break;
     }
 
@@ -3760,6 +3850,8 @@ ASTNode *parser_parse_switch_statement(Parser *parser) {
     if (!case_body) {
       if (case_value)
         ast_destroy_node(case_value);
+      if (case_high)
+        ast_destroy_node(case_high);
       parser_set_error(parser, "Memory allocation failed for switch case");
       break;
     }
@@ -3780,6 +3872,8 @@ ASTNode *parser_parse_switch_statement(Parser *parser) {
         ast_destroy_node(case_body);
         if (case_value)
           ast_destroy_node(case_value);
+        if (case_high)
+          ast_destroy_node(case_high);
         for (size_t i = 0; i < case_count; i++)
           ast_destroy_node(cases[i]);
         free(cases);
@@ -3800,8 +3894,15 @@ ASTNode *parser_parse_switch_statement(Parser *parser) {
       ast_destroy_node(case_body);
       if (case_value)
         ast_destroy_node(case_value);
+      if (case_high)
+        ast_destroy_node(case_high);
       parser_set_error(parser, "Failed to create switch case clause");
       break;
+    }
+
+    if (case_high) {
+      ((CaseClause *)case_node->data)->value_high = case_high;
+      ast_add_child(case_node, case_high);
     }
 
     cases = realloc(cases, (case_count + 1) * sizeof(ASTNode *));

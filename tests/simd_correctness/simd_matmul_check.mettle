@@ -1,0 +1,96 @@
+// General correctness harness for the AVX2-widened matmul_n32 kernel.
+// Fills two 32x32 int32 matrices with random values (including negatives via
+// wraparound), multiplies with the fused kernel, and compares every one of the
+// 1024 result cells against an independent reference computed with a runtime
+// loop bound (so the matmul recognizer, which keys on the literal N=32 shape,
+// does NOT fuse the reference — it stays scalar).
+
+import "std/io";
+import "std/mem";
+
+var N: int32 = 32;
+
+// Exact shape the matmul recognizer fuses (4-way column unroll, global N=32).
+function matmul(a: int32*, b: int32*, c: int32*) {
+  var row: int32 = 0;
+  var row_base: int64 = 0;
+  while (row < N) {
+    var col: int32 = 0;
+    while (col < N) {
+      var sum0: int32 = 0; var sum1: int32 = 0;
+      var sum2: int32 = 0; var sum3: int32 = 0;
+      var a_idx: int64 = row_base;
+      var b_idx: int64 = (int64)col;
+      var k: int32 = 0;
+      while (k < N) {
+        var av: int32 = a[a_idx];
+        sum0 = sum0 + av * b[b_idx];
+        sum1 = sum1 + av * b[b_idx + 1];
+        sum2 = sum2 + av * b[b_idx + 2];
+        sum3 = sum3 + av * b[b_idx + 3];
+        a_idx = a_idx + 1;
+        b_idx = b_idx + (int64)N;
+        k = k + 1;
+      }
+      var c_idx: int64 = row_base + (int64)col;
+      c[c_idx] = sum0; c[c_idx + 1] = sum1;
+      c[c_idx + 2] = sum2; c[c_idx + 3] = sum3;
+      col = col + 4;
+    }
+    row_base = row_base + (int64)N;
+    row = row + 1;
+  }
+}
+
+// Reference with a RUNTIME bound m (not the literal 32 the recognizer needs),
+// so it compiles to a plain scalar triple loop.
+function matmul_ref(a: int32*, b: int32*, c: int32*, m: int64) {
+  var i: int64 = 0;
+  while (i < m) {
+    var j: int64 = 0;
+    while (j < m) {
+      var s: int32 = 0;
+      var k: int64 = 0;
+      while (k < m) {
+        s = s + a[i * m + k] * b[k * m + j];
+        k = k + 1;
+      }
+      c[i * m + j] = s;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+}
+
+var g_seed: int64 = 99887766;
+function rnd() -> int32 {
+  g_seed = (g_seed * 1103515245 + 12345) & 0x7FFFFFFFFFFF;
+  return (int32)((g_seed % 600) - 300);   // [-300, 299]
+}
+
+function main() -> int32 {
+  var a: int32* = (int32*)malloc(1024 * 4);
+  var b: int32* = (int32*)malloc(1024 * 4);
+  var c: int32* = (int32*)malloc(1024 * 4);
+  var cref: int32* = (int32*)malloc(1024 * 4);
+
+  var i: int64 = 0;
+  while (i < 1024) { a[i] = rnd(); b[i] = rnd(); i = i + 1; }
+
+  matmul(a, b, c);          // fused AVX2 kernel
+  matmul_ref(a, b, cref, 32); // scalar reference
+
+  var fails: int32 = 0;
+  i = 0;
+  while (i < 1024) {
+    if (c[i] != cref[i]) { fails = fails + 1; }
+    i = i + 1;
+  }
+
+  if (fails == 0) { println(cstr("MATMUL SIMD: ALL OK (1024 cells)")); }
+  else { print(cstr("MATMUL FAILURES: ")); print_int((int64)fails); println(cstr("")); }
+
+  free((cstring)a); free((cstring)b); free((cstring)c); free((cstring)cref);
+  if (fails == 0) { return 0; }
+  return 1;
+}

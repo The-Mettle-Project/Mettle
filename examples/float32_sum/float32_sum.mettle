@@ -1,0 +1,53 @@
+// New dimension: single-precision float32 reduction + map.
+//
+// float_sum showed float64 loses 3.4x. This asks whether float32 is handled
+// natively (packed ss/ps, 2x the lanes) or just promoted to float64 / done
+// scalar. A big gap vs the float64 result would point at missing f32 codegen.
+//
+// Build: build.bat   Run: float32_sum.exe
+
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+const N = 65536;
+
+function sum_f32(a: float32*, n: int32) -> float32 {
+  var s: float32 = 0.0;
+  var i: int32 = 0;
+  while (i < n) {
+    s = s + a[i] * 1.5;
+    i = i + 1;
+  }
+  return s;
+}
+
+function main() -> int32 {
+  var a: float32* = (float32*)malloc((int64)N * 4);
+  var i: int32 = 0;
+  while (i < N) {
+    a[i] = (float32)i * 0.5 + 1.25;
+    i = i + 1;
+  }
+
+  var passes: int32 = 4000;
+  println("float32 sum+scale: 65536 elems x 4000 passes");
+
+  var t0: uint64 = bench_time_us();
+  var acc: float32 = 0.0;
+  var p: int32 = 0;
+  while (p < passes) {
+    acc = acc + sum_f32(a, N);
+    p = p + 1;
+  }
+  var elapsed_us: uint64 = bench_time_us() - t0;
+
+  print("Checksum = ");
+  println_int((int64)acc);
+  print("Time: ");
+  print_int(elapsed_us);
+  println(" us");
+
+  free((cstring)a);
+  return 0;
+}

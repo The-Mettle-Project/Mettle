@@ -1,10 +1,12 @@
 name: CI
 
-# Builds the Mettle compiler and runs the full test suite on every push and PR.
-# The suite (tests/run_tests.ps1) asserts MS x64 ABI codegen, so it runs on
-# Windows. build.bat compiles + links bin\mettle.exe, bundles stdlib/runtime,
-# then runs the suite - which ends with a light 60-seed differential-fuzz gate.
-# The heavy fuzz sweep lives in fuzz-nightly.yml.
+# Fast PR signal plus deeper compiler guards:
+# - workflow/script/package hygiene catches broken automation and editor support;
+# - Windows GCC runs the full ABI/runtime/regression suite and deterministic fuzz gate;
+# - Windows Clang compile-only catches compiler portability warnings quickly;
+# - Linux GCC/Clang exercise the ELF/SysV backend;
+# - Linux sanitizers run the compiler under ASan/UBSan while compiling ELF programs.
+# The heavy differential fuzz sweep lives in fuzz-nightly.yml.
 
 on:
   push:
@@ -21,8 +23,61 @@ permissions:
   contents: read
 
 jobs:
+  quality:
+    name: Quality gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Validate GitHub Actions workflows
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="1.7.7"
+          curl -fsSL -o "$RUNNER_TEMP/actionlint.tar.gz" \
+            "https://github.com/rhysd/actionlint/releases/download/v${version}/actionlint_${version}_linux_amd64.tar.gz"
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -color
+
+      - name: Validate shell scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n install.sh
+          bash -n tools/test-elf-native.sh
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck install.sh tools/test-elf-native.sh
+          else
+            echo "::warning::shellcheck is not installed on this runner; bash -n completed"
+          fi
+
+      - name: Validate PowerShell scripts parse
+        shell: pwsh
+        run: |
+          $failed = $false
+          Get-ChildItem -Recurse -File -Include *.ps1 | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $failed = $true
+              Write-Error "$($_.FullName): $($errors[0].Message)"
+            }
+          }
+          if ($failed) { exit 1 }
+
+      - name: Validate VS Code extension package
+        working-directory: mettle-syntax
+        run: npm run check
+
   build-and-test:
-    name: Build & test (windows)
+    name: Build & test (windows gcc)
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -69,25 +124,97 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  # Exercises the native ELF/SysV backend: builds the compiler on Linux, then
-  # compiles small Mettle programs to standalone statically-linked executables
-  # (the compiler's own _start, no libc) and asserts their exit codes. This is
-  # the regression net for the Linux codegen path the Windows suite can't cover.
+  windows-clang:
+    name: Build (windows clang)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSYS2 Clang
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: true
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-binutils
+
+      - name: Show toolchain versions
+        shell: pwsh
+        run: |
+          $env:Path = "C:\msys64\clang64\bin;$env:Path"
+          clang --version
+          $PSVersionTable.PSVersion
+
+      - name: Compile compiler with Clang
+        shell: pwsh
+        env:
+          METTLE_NO_CODEVIEW: "1"
+        run: |
+          $env:Path = "C:\msys64\clang64\bin;$env:Path"
+          cmd /c build.bat clang --skip-tests
+
+      - name: Smoke compiler
+        shell: pwsh
+        run: |
+          $env:Path = "C:\msys64\clang64\bin;$env:Path"
+          .\bin\mettle.exe --version
+          .\bin\mettle.exe tests\ok_global_int.mettle -o "$env:TEMP\ok_global_int.s"
+          if (-not (Test-Path "$env:TEMP\ok_global_int.s")) { throw "smoke assembly was not produced" }
+
+  # Exercises the native ELF/SysV backend on both major Linux compilers.
   elf-native:
-    name: Build & test (linux ELF)
+    name: Build & test (linux ELF ${{ matrix.cc }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
     steps:
       - uses: actions/checkout@v4
 
       - name: Show toolchain versions
         run: |
-          gcc --version
+          ${{ matrix.cc }} --version
           ld --version | head -1
           make --version | head -1
 
       - name: Build compiler
-        run: make -j"$(nproc)"
+        run: |
+          make clean
+          make -j"$(nproc)" CC=${{ matrix.cc }}
+
+      - name: Runtime C harness
+        run: make test CC=${{ matrix.cc }}
 
       - name: Native ELF backend tests
         run: bash tools/test-elf-native.sh
+
+  sanitize:
+    name: Sanitizers (linux gcc)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build compiler with ASan/UBSan
+        run: |
+          make clean
+          make -j"$(nproc)" \
+            EXTRA_CFLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all" \
+            LDFLAGS="-rdynamic -fsanitize=address,undefined"
+          # Keep the compiler binary instrumented, but bundle normal runtime
+          # objects for programs the compiler builds. Generated executables do
+          # not link the sanitizer runtimes, so sanitized helper objects would
+          # fail at link time before the compiler itself gets exercised.
+          make bundle-runtime EXTRA_CFLAGS=""
+
+      - name: Exercise sanitized compiler
+        run: |
+          ./bin/mettle --version
+          bash tools/test-elf-native.sh

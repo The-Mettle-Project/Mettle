@@ -1,0 +1,32 @@
+// Allocations larger than chunk_size get their own dedicated chunk and don't
+// disturb subsequent small allocations.
+import "std/arena";
+
+function main() -> int32 {
+  var a: Arena* = arena_init((int64)1024);
+  if (a == 0) { return 1; }
+
+  var small_before: cstring = arena_alloc(a, (int64)16);
+  if (small_before == 0) { return 2; }
+  small_before[0] = (uint8)7;
+
+  // 10x the chunk size - must succeed via the dedicated-chunk path.
+  var big: cstring = arena_alloc(a, (int64)10240);
+  if (big == 0) { return 3; }
+  big[0] = (uint8)1;
+  big[10239] = (uint8)2;
+
+  if ((int32)big[0] != 1) { return 4; }
+  if ((int32)big[10239] != 2) { return 5; }
+
+  // Subsequent small alloc should still work and remain stable.
+  var small_after: cstring = arena_alloc(a, (int64)16);
+  if (small_after == 0) { return 6; }
+  small_after[0] = (uint8)9;
+
+  // The pre-existing small allocation must not have been disturbed.
+  if ((int32)small_before[0] != 7) { return 7; }
+
+  arena_free(a);
+  return 0;
+}

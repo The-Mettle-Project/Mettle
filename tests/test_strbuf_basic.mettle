@@ -1,0 +1,34 @@
+// Append bytes, cstrings, and finalize; verify byte-by-byte content.
+import "std/arena";
+import "std/strbuf";
+
+function cstr_eq(a: cstring, b: cstring) -> int32 {
+  var i: int64 = (int64)0;
+  while (true) {
+    if (a[i] != b[i]) { return 0; }
+    if (a[i] == (uint8)0) { return 1; }
+    i = i + (int64)1;
+  }
+  return 0;
+}
+
+function main() -> int32 {
+  var arena: Arena* = arena_init((int64)0);
+  if (arena == 0) { return 1; }
+
+  var b: StrBuf* = strbuf_new(arena, (int64)0);
+  if (b == 0) { return 2; }
+
+  if (strbuf_append_cstr(b, "hello") == 0) { return 3; }
+  if (strbuf_append_byte(b, (uint8)32) == 0) { return 4; }     // space
+  if (strbuf_append_cstr(b, "world") == 0) { return 5; }
+
+  if (strbuf_len(b) != (int64)11) { return 6; }
+
+  var out: cstring = strbuf_finish_cstr(b);
+  if (out == 0) { return 7; }
+  if (cstr_eq(out, "hello world") == 0) { return 8; }
+
+  arena_free(arena);
+  return 0;
+}

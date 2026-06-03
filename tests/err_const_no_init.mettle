@@ -1,0 +1,7 @@
+// A constant must have an initializer.
+
+const MAX: int32;
+
+function main() -> int32 {
+  return MAX;
+}

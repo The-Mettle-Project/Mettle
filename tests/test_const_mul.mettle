@@ -1,0 +1,92 @@
+// Differential oracle for constant-multiply strength reduction.
+//
+// The LITERAL path (`x * C`) may be lowered to a shift+add/sub sequence by the
+// binary backend; the REFERENCE path multiplies by the same value loaded from a
+// heap array (`x * r`), which the compiler can't fold, so it emits a genuine
+// imul. Comparing the two validates the shift-add shapes (2^a+2^b, 2^k-1) and
+// the imul fallback (dense constants) across signed and unsigned operands.
+// Returns 1 on full agreement, 0 on any mismatch.
+
+import "std/io";
+import "std/mem";
+
+function check_signed(x: int64, k: int32, r: int64) -> int64 {
+  var lit: int64 = 0;
+  if (k == 0)       { lit = x * 3; }
+  else if (k == 1)  { lit = x * 5; }
+  else if (k == 2)  { lit = x * 6; }
+  else if (k == 3)  { lit = x * 7; }
+  else if (k == 4)  { lit = x * 9; }
+  else if (k == 5)  { lit = x * 10; }
+  else if (k == 6)  { lit = x * 15; }
+  else if (k == 7)  { lit = x * 17; }
+  else if (k == 8)  { lit = x * 24; }
+  else if (k == 9)  { lit = x * 63; }
+  else if (k == 10) { lit = x * 255; }
+  else if (k == 11) { lit = x * 1000; }
+  else if (k == 12) { lit = x * 65537; }
+  else              { lit = x * 1103515245; }
+  if (lit != x * r) { return 1; }
+  return 0;
+}
+
+function check_unsigned(x: uint64, k: int32, r: uint64) -> int64 {
+  var lit: uint64 = 0;
+  if (k == 0)       { lit = x * 3; }
+  else if (k == 1)  { lit = x * 5; }
+  else if (k == 2)  { lit = x * 6; }
+  else if (k == 3)  { lit = x * 7; }
+  else if (k == 4)  { lit = x * 9; }
+  else if (k == 5)  { lit = x * 10; }
+  else if (k == 6)  { lit = x * 15; }
+  else if (k == 7)  { lit = x * 17; }
+  else if (k == 8)  { lit = x * 24; }
+  else if (k == 9)  { lit = x * 63; }
+  else if (k == 10) { lit = x * 255; }
+  else if (k == 11) { lit = x * 1000; }
+  else if (k == 12) { lit = x * 65537; }
+  else              { lit = x * 1103515245; }
+  if (lit != x * r) { return 1; }
+  return 0;
+}
+
+function main() -> int32 {
+  var nm: int32 = 14;
+  var muls: int64* = (int64*)malloc((int64)nm * 8);
+  muls[0] = 3; muls[1] = 5; muls[2] = 6; muls[3] = 7; muls[4] = 9;
+  muls[5] = 10; muls[6] = 15; muls[7] = 17; muls[8] = 24; muls[9] = 63;
+  muls[10] = 255; muls[11] = 1000; muls[12] = 65537; muls[13] = 1103515245;
+
+  var nx: int32 = 14;
+  var xs: int64* = (int64*)malloc((int64)nx * 8);
+  xs[0] = 0; xs[1] = 1; xs[2] = -1; xs[3] = 2; xs[4] = -2;
+  xs[5] = 12345; xs[6] = -12345; xs[7] = 2147483647; xs[8] = -2147483648;
+  xs[9] = 9223372036854775807; xs[10] = -9223372036854775807 - 1;
+  xs[11] = 1000000007; xs[12] = -1000000007; xs[13] = 87654321;
+
+  var fails: int64 = 0;
+  var umax: uint64 = (uint64)0 - (uint64)1; // UINT64_MAX (literal > INT64_MAX)
+  var k: int32 = 0;
+  while (k < nm) {
+    var r: int64 = muls[k];
+    var i: int32 = 0;
+    while (i < nx) {
+      fails = fails + check_signed(xs[i], k, r);
+      fails = fails + check_unsigned((uint64)xs[i], k, (uint64)r);
+      i = i + 1;
+    }
+    fails = fails + check_unsigned(umax, k, (uint64)r);
+    k = k + 1;
+  }
+
+  free((cstring)muls);
+  free((cstring)xs);
+
+  if (fails == 0) {
+    println("const_mul OK");
+    return 1;
+  }
+  print("const_mul MISMATCHES: ");
+  println_int(fails);
+  return 0;
+}

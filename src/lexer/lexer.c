@@ -453,7 +453,11 @@ static Token lexer_lex_number(Lexer *lexer) {
   } else {
     while (lexer->position < lexer->length &&
            (isdigit(lexer->source[lexer->position]) ||
-            lexer->source[lexer->position] == '.')) {
+            // A '.' is a decimal point only when it is not the start of a `..`
+            // range operator, so `1..5` lexes as 1, .., 5 rather than `1.`.
+            (lexer->source[lexer->position] == '.' &&
+             !(lexer->position + 1 < lexer->length &&
+               lexer->source[lexer->position + 1] == '.')))) {
       lexer->position++;
       lexer->column++;
     }
@@ -505,6 +509,8 @@ static Token lexer_lex_identifier_or_keyword(Lexer *lexer) {
     token.type = TOKEN_EXPORT;
   else if (strcmp(token.value, "var") == 0)
     token.type = TOKEN_VAR;
+  else if (strcmp(token.value, "const") == 0)
+    token.type = TOKEN_CONST;
   else if (strcmp(token.value, "function") == 0)
     token.type = TOKEN_FUNCTION;
   else if (strcmp(token.value, "struct") == 0)
@@ -1020,6 +1026,15 @@ Token lexer_next_token(Lexer *lexer) {
     token.type = TOKEN_PERCENT;
     break;
   case '.':
+    if (lexer->position + 1 < lexer->length &&
+        lexer->source[lexer->position + 1] == '.') {
+      token.type = TOKEN_DOT_DOT;
+      token_set_static_value(&token, "..");
+      token_set_lexeme(&token, &lexer->source[lexer->position], 2);
+      lexer->position += 2;
+      lexer->column += 2;
+      return token;
+    }
     token.type = TOKEN_DOT;
     break;
   default:

@@ -243,6 +243,150 @@
       "c_source": "examples/clamp_i32/clamp_i32.c",
       "c_exe": "examples/clamp_i32/clamp_i32_c.exe",
       "build_script": "examples/clamp_i32/build.bat"
+    },
+    {
+      "name": "float_sum",
+      "kind": "runtime",
+      "description": "float64 sum reduction 65536 elems x 4000 (FP auto-vectorization gap)",
+      "mettle_source": "examples/float_sum/float_sum.mettle",
+      "mettle_exe": "examples/float_sum/float_sum.exe",
+      "c_source": "examples/float_sum/float_sum.c",
+      "c_exe": "examples/float_sum/float_sum_c.exe"
+    },
+    {
+      "name": "mandelbrot",
+      "kind": "runtime",
+      "description": "Mandelbrot 600x400, 256 iters x 30 (float64-heavy branchy inner loop)",
+      "mettle_source": "examples/mandelbrot/mandelbrot.mettle",
+      "mettle_exe": "examples/mandelbrot/mandelbrot.exe",
+      "c_source": "examples/mandelbrot/mandelbrot.c",
+      "c_exe": "examples/mandelbrot/mandelbrot_c.exe"
+    },
+    {
+      "name": "rec_fib",
+      "kind": "runtime",
+      "description": "Recursive fib(34) x 5 (raw function-call overhead, no inlining)",
+      "mettle_source": "examples/rec_fib/rec_fib.mettle",
+      "mettle_exe": "examples/rec_fib/rec_fib.exe",
+      "c_source": "examples/rec_fib/rec_fib.c",
+      "c_exe": "examples/rec_fib/rec_fib_c.exe"
+    },
+    {
+      "name": "int_divmod",
+      "kind": "runtime",
+      "description": "64-bit div+mod 2M iters x 40 (long-latency DIV throughput)",
+      "mettle_source": "examples/int_divmod/int_divmod.mettle",
+      "mettle_exe": "examples/int_divmod/int_divmod.exe",
+      "c_source": "examples/int_divmod/int_divmod.c",
+      "c_exe": "examples/int_divmod/int_divmod_c.exe"
+    },
+    {
+      "name": "leaf_call",
+      "kind": "runtime",
+      "description": "Direct leaf call 60M x 5 (small-function inlining)",
+      "mettle_source": "examples/leaf_call/leaf_call.mettle",
+      "mettle_exe": "examples/leaf_call/leaf_call.exe",
+      "c_source": "examples/leaf_call/leaf_call.c",
+      "c_exe": "examples/leaf_call/leaf_call_c.exe"
+    },
+    {
+      "name": "func_ptr",
+      "kind": "runtime",
+      "description": "Indirect fn-ptr call 60M x 5 (indirect-call ABI cost)",
+      "mettle_source": "examples/func_ptr/func_ptr.mettle",
+      "mettle_exe": "examples/func_ptr/func_ptr.exe",
+      "c_source": "examples/func_ptr/func_ptr.c",
+      "c_exe": "examples/func_ptr/func_ptr_c.exe"
+    },
+    {
+      "name": "saxpy",
+      "kind": "runtime",
+      "description": "float64 SAXPY map 65536 x 3000 (FP map+store vectorization)",
+      "mettle_source": "examples/saxpy/saxpy.mettle",
+      "mettle_exe": "examples/saxpy/saxpy.exe",
+      "c_source": "examples/saxpy/saxpy.c",
+      "c_exe": "examples/saxpy/saxpy_c.exe"
+    },
+    {
+      "name": "fp_div",
+      "kind": "runtime",
+      "description": "float64 serial divide chain 20M x 20 (divsd latency)",
+      "mettle_source": "examples/fp_div/fp_div.mettle",
+      "mettle_exe": "examples/fp_div/fp_div.exe",
+      "c_source": "examples/fp_div/fp_div.c",
+      "c_exe": "examples/fp_div/fp_div_c.exe"
+    },
+    {
+      "name": "struct_byval",
+      "kind": "runtime",
+      "description": "32B struct by-value call 40M x 5 (aggregate-copy / SROA)",
+      "mettle_source": "examples/struct_byval/struct_byval.mettle",
+      "mettle_exe": "examples/struct_byval/struct_byval.exe",
+      "c_source": "examples/struct_byval/struct_byval.c",
+      "c_exe": "examples/struct_byval/struct_byval_c.exe"
+    },
+    {
+      "name": "switch_vm",
+      "kind": "runtime",
+      "description": "Bytecode VM switch dispatch 4096 ops x 30000 (jump-table dispatch)",
+      "mettle_source": "examples/switch_vm/switch_vm.mettle",
+      "mettle_exe": "examples/switch_vm/switch_vm.exe",
+      "c_source": "examples/switch_vm/switch_vm.c",
+      "c_exe": "examples/switch_vm/switch_vm_c.exe"
+    },
+    {
+      "name": "aos_sum",
+      "kind": "runtime",
+      "description": "Array-of-structs field walk 65536 x 2000 (in-place field load/store, not by-value)",
+      "mettle_source": "examples/aos_sum/aos_sum.mettle",
+      "mettle_exe": "examples/aos_sum/aos_sum.exe",
+      "c_source": "examples/aos_sum/aos_sum.c",
+      "c_exe": "examples/aos_sum/aos_sum_c.exe"
+    },
+    {
+      "name": "transpose",
+      "kind": "runtime",
+      "description": "256x256 int32 transpose x 4000 (2D index arithmetic + strided stores)",
+      "mettle_source": "examples/transpose/transpose.mettle",
+      "mettle_exe": "examples/transpose/transpose.exe",
+      "c_source": "examples/transpose/transpose.c",
+      "c_exe": "examples/transpose/transpose_c.exe"
+    },
+    {
+      "name": "const_mod",
+      "kind": "runtime",
+      "description": "Constant-divisor div/mod 20M x 20 (magic-multiply strength reduction)",
+      "mettle_source": "examples/const_mod/const_mod.mettle",
+      "mettle_exe": "examples/const_mod/const_mod.exe",
+      "c_source": "examples/const_mod/const_mod.c",
+      "c_exe": "examples/const_mod/const_mod_c.exe"
+    },
+    {
+      "name": "global_acc",
+      "kind": "runtime",
+      "description": "Global RMW hot loop 100M x 3 (register promotion of globals)",
+      "mettle_source": "examples/global_acc/global_acc.mettle",
+      "mettle_exe": "examples/global_acc/global_acc.exe",
+      "c_source": "examples/global_acc/global_acc.c",
+      "c_exe": "examples/global_acc/global_acc_c.exe"
+    },
+    {
+      "name": "i2f_conv",
+      "kind": "runtime",
+      "description": "int<->float64 conversion loop 30M x 20 (cvtsi2sd/cvttsd2si traffic)",
+      "mettle_source": "examples/i2f_conv/i2f_conv.mettle",
+      "mettle_exe": "examples/i2f_conv/i2f_conv.exe",
+      "c_source": "examples/i2f_conv/i2f_conv.c",
+      "c_exe": "examples/i2f_conv/i2f_conv_c.exe"
+    },
+    {
+      "name": "byte_arith",
+      "kind": "runtime",
+      "description": "uint8 buffer arithmetic 256KB x 2000 (narrow-type codegen)",
+      "mettle_source": "examples/byte_arith/byte_arith.mettle",
+      "mettle_exe": "examples/byte_arith/byte_arith.exe",
+      "c_source": "examples/byte_arith/byte_arith.c",
+      "c_exe": "examples/byte_arith/byte_arith_c.exe"
     }
   ],
   "compile_benchmarks": [

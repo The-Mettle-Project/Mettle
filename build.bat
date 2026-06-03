@@ -1,14 +1,41 @@
 @echo off
 REM Windows build script for Mettle
-REM Usage: build.bat [gcc|clang]
+REM Usage: build.bat [gcc|clang] [--skip-tests]
 REM   Or set CC=clang before invoking (defaults to gcc).
 
 setlocal
 
-REM Select compiler: first arg overrides CC env var; default gcc.
-if /I "%~1"=="clang" set "CC=clang"
-if /I "%~1"=="gcc" set "CC=gcc"
+REM Select compiler: args override CC env var; default gcc.
+set "SKIP_TESTS="
+:parse_args
+if "%~1"=="" goto args_done
+if /I "%~1"=="clang" (
+    set "CC=clang"
+    shift
+    goto parse_args
+)
+if /I "%~1"=="gcc" (
+    set "CC=gcc"
+    shift
+    goto parse_args
+)
+if /I "%~1"=="--skip-tests" (
+    set "SKIP_TESTS=1"
+    shift
+    goto parse_args
+)
+if /I "%~1"=="--no-tests" (
+    set "SKIP_TESTS=1"
+    shift
+    goto parse_args
+)
+echo Error: unknown argument '%~1'
+echo Usage: build.bat [gcc^|clang] [--skip-tests]
+exit /b 1
+
+:args_done
 if not defined CC set "CC=gcc"
+if defined METTLE_SKIP_TESTS set "SKIP_TESTS=1"
 
 set CFLAGS=-Wall -Wextra -std=c99 -g -O2 -D_GNU_SOURCE -Isrc -fno-omit-frame-pointer
 if /I "%CC%"=="clang" set "CFLAGS=%CFLAGS% -D_CRT_NONSTDC_NO_DEPRECATE -D_CRT_SECURE_NO_WARNINGS"
@@ -48,6 +75,7 @@ if not exist obj\lexer mkdir obj\lexer
 if not exist obj\parser mkdir obj\parser
 if not exist obj\semantic mkdir obj\semantic
 if not exist obj\ir mkdir obj\ir
+if not exist obj\ir\optimizer mkdir obj\ir\optimizer
 if not exist obj\codegen mkdir obj\codegen
 if not exist obj\codegen\binary mkdir obj\codegen\binary
 if not exist obj\linker mkdir obj\linker
@@ -93,6 +121,11 @@ echo Compiling IR...
 for %%f in (src\ir\*.c) do (
     echo   %%~nxf
     %CC% %CFLAGS% -c %%f -o obj\ir\%%~nf.o
+    if errorlevel 1 exit /b 1
+)
+for %%f in (src\ir\optimizer\*.c) do (
+    echo   optimizer\%%~nxf
+    %CC% %CFLAGS% -c %%f -o obj\ir\optimizer\%%~nf.o
     if errorlevel 1 exit /b 1
 )
 
@@ -156,7 +189,7 @@ echo Compiling main...
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
 echo Linking...
-%CC% obj\common.o obj\lexer\lexer.o obj\parser\ast.o obj\parser\parser.o obj\semantic\symbol_table.o obj\semantic\type_checker.o obj\semantic\register_allocator.o obj\semantic\import_resolver.o obj\semantic\monomorphize.o obj\ir\*.o obj\\codegen\\*.o obj\\codegen\\binary\\*.o obj\\linker\\*.o obj\debug\debug_info.o obj\error\error_reporter.o obj\compiler\compiler_context.o obj\compiler\compiler_crash.o obj\runtime\crash_handler.o obj\tracy_build.o obj\main.o -o bin\mettle.exe %LDFLAGS%
+%CC% obj\common.o obj\lexer\lexer.o obj\parser\ast.o obj\parser\parser.o obj\semantic\symbol_table.o obj\semantic\type_checker.o obj\semantic\register_allocator.o obj\semantic\import_resolver.o obj\semantic\monomorphize.o obj\ir\*.o obj\ir\optimizer\*.o obj\\codegen\\*.o obj\\codegen\\binary\\*.o obj\\linker\\*.o obj\debug\debug_info.o obj\error\error_reporter.o obj\compiler\compiler_context.o obj\compiler\compiler_crash.o obj\runtime\crash_handler.o obj\tracy_build.o obj\main.o -o bin\mettle.exe %LDFLAGS%
 
 if %ERRORLEVEL% NEQ 0 (
     echo Build failed!
@@ -182,6 +215,10 @@ copy /Y obj\runtime\tracy_helpers.o bin\runtime\tracy_helpers.obj >nul
 if exist installer\mettle-build.bat copy /Y installer\mettle-build.bat bin\mettle-build.bat >nul
 
 echo Build successful! Executable created at bin\mettle.exe
+if defined SKIP_TESTS (
+    echo Tests skipped.
+    exit /b 0
+)
 echo.
 echo Running tests...
 powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1

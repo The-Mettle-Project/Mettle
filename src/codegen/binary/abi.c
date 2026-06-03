@@ -332,6 +332,27 @@ int code_generator_binary_context_add_saved_register(
   return 1;
 }
 
+int code_generator_binary_context_add_saved_xmm_register(
+    BinaryFunctionContext *context, BinaryXmmRegister reg) {
+  if (!context) {
+    return 0;
+  }
+
+  for (size_t i = 0; i < context->saved_xmm_count; i++) {
+    if (context->saved_xmm_registers[i] == reg) {
+      return 1;
+    }
+  }
+
+  if (context->saved_xmm_count >= sizeof(context->saved_xmm_registers) /
+                                      sizeof(context->saved_xmm_registers[0])) {
+    return 0;
+  }
+
+  context->saved_xmm_registers[context->saved_xmm_count++] = reg;
+  return 1;
+}
+
 int code_generator_binary_type_is_gp_promotable(Type *type) {
   if (!type || !code_generator_binary_resolved_type_is_supported(type, 0)) {
     return 0;
@@ -618,13 +639,14 @@ int code_generator_binary_symbol_assigned_register(
     return 0;
   }
 
-  if (code_generator_binary_get_symbol_offset(context, name) <= 0) {
-    return 0;
-  }
-
   symbol = generator->symbol_table
                ? symbol_table_lookup(generator->symbol_table, name)
                : NULL;
+  if (code_generator_binary_get_symbol_offset(context, name) <= 0 &&
+      !(symbol && symbol->scope && symbol->scope->type == SCOPE_GLOBAL)) {
+    return 0;
+  }
+
   if (symbol && symbol->type &&
       (!code_generator_binary_resolved_type_is_supported(symbol->type, 0) ||
        code_generator_binary_resolved_type_float_bits(symbol->type) != 0 ||
@@ -675,6 +697,18 @@ int code_generator_binary_function_can_promote_rsi_rdi(
   }
 
   if (code_generator_abi_classify(return_type) == ABI_PASS_INDIRECT) {
+    return 0;
+  }
+
+  /* RSI/RDI are callee-saved (non-volatile) only under the MS-x64 ABI, where a
+   * value promoted into them survives a call because the callee preserves them.
+   * Under SysV (Linux/ELF) RSI/RDI are CALLER-saved: any call clobbers them, so
+   * a hot local promoted there would be silently destroyed across the call.
+   * On SysV, therefore, allow RSI/RDI promotion only when the function makes no
+   * calls at all. (The promoter has a separate no-calls fast path; this guard
+   * covers the with-calls case.) */
+  if (code_generator_binary_active_abi()->counts_classes_separately &&
+      code_generator_binary_function_has_calls(function)) {
     return 0;
   }
 
@@ -888,6 +922,72 @@ int code_generator_binary_promote_hot_symbols(
         if (score > best_score) {
           best_score = score;
           best_name = name;
+        }
+      }
+    }
+
+    if (function_has_no_calls) {
+      for (size_t i = 0; i < ir_function->instruction_count; i++) {
+        const IRInstruction *instruction = &ir_function->instructions[i];
+        const IROperand *operands[3];
+        if (!instruction) {
+          continue;
+        }
+        operands[0] = &instruction->dest;
+        operands[1] = &instruction->lhs;
+        operands[2] = &instruction->rhs;
+        for (size_t op_i = 0; op_i < 3; op_i++) {
+          const char *name = operands[op_i]->name;
+          Symbol *symbol = NULL;
+          size_t score = 0;
+          if (operands[op_i]->kind != IR_OPERAND_SYMBOL || !name ||
+              code_generator_binary_symbol_already_promoted(context, name) ||
+              binary_symbol_alias_table_get(&context->symbol_aliases, name) ||
+              binary_named_slot_table_get_offset(&context->address_taken_symbols,
+                                                 name) >= 0) {
+            continue;
+          }
+          symbol = generator->symbol_table
+                       ? symbol_table_lookup(generator->symbol_table, name)
+                       : NULL;
+          if (!symbol || !symbol->scope ||
+              symbol->scope->type != SCOPE_GLOBAL || symbol->is_extern ||
+              !code_generator_binary_type_is_gp_promotable(symbol->type)) {
+            continue;
+          }
+          score = code_generator_binary_function_symbol_score(
+              context, ir_function, name, loop_weights);
+          if (score > best_score) {
+            best_score = score;
+            best_name = name;
+          }
+        }
+        for (size_t arg_i = 0; arg_i < instruction->argument_count; arg_i++) {
+          const IROperand *operand = &instruction->arguments[arg_i];
+          const char *name = operand->name;
+          Symbol *symbol = NULL;
+          size_t score = 0;
+          if (operand->kind != IR_OPERAND_SYMBOL || !name ||
+              code_generator_binary_symbol_already_promoted(context, name) ||
+              binary_symbol_alias_table_get(&context->symbol_aliases, name) ||
+              binary_named_slot_table_get_offset(&context->address_taken_symbols,
+                                                 name) >= 0) {
+            continue;
+          }
+          symbol = generator->symbol_table
+                       ? symbol_table_lookup(generator->symbol_table, name)
+                       : NULL;
+          if (!symbol || !symbol->scope ||
+              symbol->scope->type != SCOPE_GLOBAL || symbol->is_extern ||
+              !code_generator_binary_type_is_gp_promotable(symbol->type)) {
+            continue;
+          }
+          score = code_generator_binary_function_symbol_score(
+              context, ir_function, name, loop_weights);
+          if (score > best_score) {
+            best_score = score;
+            best_name = name;
+          }
         }
       }
     }

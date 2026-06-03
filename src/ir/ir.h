@@ -69,7 +69,18 @@ typedef enum {
   /* Horizontal sum of int32 array into int64 accumulator. dest = sum symbol
    * (added to prior value), lhs = base pointer, rhs = element count. */
   IR_OP_SIMD_SUM_I32,
+  /* Horizontal sum of a uint8 array into an int64 accumulator. dest = sum
+   * symbol (added to prior value), lhs = base pointer, rhs = element count.
+   * Bytes are summed as unsigned (vpsadbw), matching (int64)(uint8)load. */
+  IR_OP_SIMD_SUM_U8,
+  /* In-place element-wise map of a uint8 buffer: for each byte b, apply a chain
+   * of constant byte operations (mod 256). lhs = base pointer, rhs = element
+   * count, dest = NONE. arguments hold the chain as (op_code INT, const INT)
+   * pairs in application order; op_code is an IRByteMapOp. */
+  IR_OP_SIMD_BYTE_MAP,
   /* Fixed 32x32 int32 matrix multiply. dest = c, lhs = a, rhs = b (pointers). */
+  /* Reserved for an explicit 32x32 int32 SIMD matmul API. Do not introduce
+   * this from ordinary source by function name or benchmark-shaped matching. */
   IR_OP_SIMD_MATMUL_N32,
   /* In-place signed int32 insertion sort. dest = base pointer, rhs = len. */
   IR_OP_SIMD_INSERTION_SORT_I32,
@@ -93,8 +104,72 @@ typedef enum {
   IR_OP_PREFIX_SUM_I32,
   /* Min/max scan over arr[1..n-1] updating dest=minv and arguments[0]=maxv;
    * caller initializes both from arr[0]. lhs=arr, rhs=n. */
-  IR_OP_SIMD_MINMAX_I32
+  IR_OP_SIMD_MINMAX_I32,
+  /* Horizontal sum of a float64/float32 array into the dest float accumulator
+   * (added to dest's prior value). lhs = base pointer, rhs = element count. */
+  IR_OP_SIMD_SUM_F64,
+  IR_OP_SIMD_SUM_F32,
+  /* Float64/float32 dot product into the dest float accumulator (added to
+   * dest's prior value). lhs = a, rhs = b, arguments[0] = element count. */
+  IR_OP_SIMD_DOT_F64,
+  IR_OP_SIMD_DOT_F32,
+  /* Float affine memory map:
+   * rhs[i] = arguments[1] * lhs[i] + arguments[2] * rhs[i] + arguments[3].
+   * lhs = src, rhs = dst, arguments[0] = element count. */
+  IR_OP_SIMD_AFFINE_MAP_F64,
+  IR_OP_SIMD_AFFINE_MAP_F32,
+  /* Counted-loop reduction where each iteration adds (int64)trunc(CHAIN) to the
+   * dest accumulator, with CHAIN a straight-line float64 expression in the loop
+   * counter: x0 = (float64)i, then a sequence of {x*=k, x+=k, x-=k, x=k-x, x/=k}
+   * steps. dest = int64 accumulator symbol; arguments[0] = trip count (a
+   * compile-time INT constant); the remaining arguments are alternating
+   * (op-code INT, constant FLOAT64) pairs describing the chain, applied to
+   * (float64)i in order. Emitted only by ir_simd_i2f_reduce_pass after it proves
+   * every per-element value fits int32 and the integer sum stays < 2^53, so an
+   * AVX2 f64-lane kernel is bit-identical to the scalar loop. Direct-object
+   * backend only. */
+  IR_OP_SIMD_I2F_REDUCE_F64,
+  /* General auto-vectorized counted unit-stride loop over a straight-line
+   * float64 DAG. Emitted by ir_auto_vectorize_pass for loops the per-shape
+   * recognizers above did not claim. The body DAG is serialized into
+   * arguments[]:
+   *   header (6 INT): [0] reduce_op (0 = element-wise map, 1 = '+' reduction)
+   *                   [1] n_arrays  [2] n_nodes  [3] root_node
+   *                   [4] n_consts  [5] max_live (peak simultaneous live ymm)
+   *   then n_arrays SYMBOL array-base operands (index k),
+   *   then n_nodes nodes, each 3 INT operands (tag, op0, op1):
+   *       tag 0=LOAD(op0=array idx) 1=IOTA 2=CONST(op0=const idx)
+   *           3=ADD 4=SUB 5=MUL 6=DIV (op0,op1 = earlier node indices),
+   *   then n_consts FLOAT64 operands.
+   * dest = reduction accumulator symbol (reduce_op==1) or stored array base
+   * (reduce_op==0); lhs = trip count (SYMBOL or INT). Direct-object backend
+   * only. The kernel replays the DAG over f64x4 lanes with stack-hoisted
+   * constants + a scalar remainder; element-wise maps are bit-identical to the
+   * scalar loop, '+' reductions reassociate like the sum/dot kernels. */
+  IR_OP_SIMD_VLOOP_F64,
+  /* Outer-loop lane vectorization of a reduction over an outer-IV-INVARIANT
+   * inner counted loop carrying one float64 accumulator (a serial recurrence,
+   * e.g. a divide chain). The outer loop `while(p<P){ inner; total += iacc; p++ }`
+   * has identical independent iterations; this runs 4 of them in lockstep f64x4
+   * lanes to hide the inner recurrence's latency (genuinely running all the
+   * inner work, 4-wide), then accumulates the (lane-identical) result into total
+   * with exact scalar adds. Serialized into arguments[]; see
+   * ir_outer_vectorize_pass. dest = total accumulator; lhs = outer trip count P;
+   * rhs = inner trip count N. Direct-object backend only. */
+  IR_OP_SIMD_OUTER_LANE_F64
 } IROpcode;
+
+/* Chain operation codes for IR_OP_SIMD_BYTE_MAP arguments. Each step applies
+ * `b = b <op> k` in uint8 (mod 256) arithmetic. The numeric values are part of
+ * the IR contract between the recognizer and the backend kernel. */
+typedef enum {
+  IR_BYTE_MAP_ADD = 0,
+  IR_BYTE_MAP_SUB = 1,
+  IR_BYTE_MAP_MUL = 2,
+  IR_BYTE_MAP_XOR = 3,
+  IR_BYTE_MAP_AND = 4,
+  IR_BYTE_MAP_OR = 5
+} IRByteMapOp;
 
 typedef struct {
   IROpcode op;

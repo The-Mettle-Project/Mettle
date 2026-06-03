@@ -47,6 +47,17 @@ var n: int32 = count_threads(mutex);
 
 Selective imports work regardless of whether the module uses `export`. When the module does use `export`, only exported names may be selected (private helpers are still excluded unless they are transitively required by a selected name).
 
+### Conditional Imports
+
+An import may carry a platform guard so it applies to only one target:
+
+```mettle
+import "std/net" if windows;        // resolved only on a Windows build
+import "std/net.linux" if linux;    // resolved only on a Linux build
+```
+
+A guarded import is included only when its platform matches the build target, and an off-target guarded module is never looked up — so a platform-specific module that does not exist on the other OS is safe to reference. The guard applies to plain, namespaced, and selective imports; the predicate must be `windows` or `linux`. Imports without a guard are unconditional. The compiler targets its host, so the active platform follows the host (ELF/Linux versus COFF/Windows).
+
 ### What Can Be Imported
 
 For plain `import "…"` and `import "…" as alias`, only **exported** declarations are visible when a module uses `export`. If a module does not use `export`, all of its declarations are visible (backward compatibility). See [Modules](modules.md) for export rules.

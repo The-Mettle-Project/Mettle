@@ -34,6 +34,14 @@ typedef struct {
   struct {
     ASTNode *node;
     int is_err;
+    /* By-value capture for `defer fn(args...)`: when capture_call_name is
+     * non-NULL, the argument values were snapshotted into the named temp
+     * locals at the defer point, and the deferred call is replayed against
+     * those temps instead of re-evaluating the original argument expressions
+     * (which would observe their later, scope-exit values). */
+    char *capture_call_name;
+    char **capture_arg_temps;
+    size_t capture_arg_count;
   } *entries;
   size_t count;
   size_t capacity;
@@ -135,6 +143,12 @@ static int ir_lower_tagged_enum_constructor_call(IRLoweringContext *context,
                                                  ASTNode *expression,
                                                  Symbol *constructor_symbol,
                                                  IROperand *out_value);
+static int ir_emit_tagged_enum_construct(IRLoweringContext *context,
+                                         IRFunction *function,
+                                         Symbol *constructor_symbol,
+                                         ASTNode *payload_arg,
+                                         SourceLocation location,
+                                         IROperand *out_value);
 static int ir_emit_jump_instruction(IRLoweringContext *context,
                                     IRFunction *function, const char *label,
                                     SourceLocation location) {
@@ -441,6 +455,92 @@ static int ir_emit_address_with_offset(IRLoweringContext *context,
   return 1;
 }
 
+// Emit the dispatch test for a range case `lo..hi`: if the switch value lies
+// in [lo, hi], jump to case_label; otherwise fall through to the next test.
+// Lowered with the existing comparison/branch primitives:
+//   ge = (sv >= lo); if (!ge) goto skip;
+//   le = (sv <= hi); if (!le) goto skip;
+//   goto case_label;
+//   skip:
+static int ir_emit_switch_range_dispatch(IRLoweringContext *context,
+                                         IRFunction *function,
+                                         const IROperand *switch_value,
+                                         ASTNode *lo_node, ASTNode *hi_node,
+                                         const char *case_label,
+                                         SourceLocation loc) {
+  IROperand lo = ir_operand_none();
+  IROperand hi = ir_operand_none();
+  IROperand ge = ir_operand_none();
+  IROperand le = ir_operand_none();
+  char *skip_label = ir_new_label_name(context, "switch_range_skip");
+  int ok = 0;
+  if (!skip_label) {
+    return 0;
+  }
+
+  if (!ir_lower_expression(context, function, lo_node, &lo) ||
+      !ir_make_temp_operand(context, &ge)) {
+    goto done;
+  }
+  IRInstruction cmp_lo = {0};
+  cmp_lo.op = IR_OP_BINARY;
+  cmp_lo.location = loc;
+  cmp_lo.dest = ge;
+  cmp_lo.lhs = *switch_value;
+  cmp_lo.rhs = lo;
+  cmp_lo.text = ">=";
+  IRInstruction br_lo = {0};
+  br_lo.op = IR_OP_BRANCH_ZERO;
+  br_lo.location = loc;
+  br_lo.lhs = ge;
+  br_lo.text = skip_label;
+  if (!ir_emit(context, function, &cmp_lo) ||
+      !ir_emit(context, function, &br_lo)) {
+    goto done;
+  }
+
+  if (!ir_lower_expression(context, function, hi_node, &hi) ||
+      !ir_make_temp_operand(context, &le)) {
+    goto done;
+  }
+  IRInstruction cmp_hi = {0};
+  cmp_hi.op = IR_OP_BINARY;
+  cmp_hi.location = loc;
+  cmp_hi.dest = le;
+  cmp_hi.lhs = *switch_value;
+  cmp_hi.rhs = hi;
+  cmp_hi.text = "<=";
+  IRInstruction br_hi = {0};
+  br_hi.op = IR_OP_BRANCH_ZERO;
+  br_hi.location = loc;
+  br_hi.lhs = le;
+  br_hi.text = skip_label;
+  if (!ir_emit(context, function, &cmp_hi) ||
+      !ir_emit(context, function, &br_hi)) {
+    goto done;
+  }
+
+  if (!ir_emit_jump_instruction(context, function, case_label, loc)) {
+    goto done;
+  }
+  IRInstruction skip = {0};
+  skip.op = IR_OP_LABEL;
+  skip.location = loc;
+  skip.text = skip_label;
+  if (!ir_emit(context, function, &skip)) {
+    goto done;
+  }
+  ok = 1;
+
+done:
+  ir_operand_destroy(&lo);
+  ir_operand_destroy(&hi);
+  ir_operand_destroy(&ge);
+  ir_operand_destroy(&le);
+  free(skip_label);
+  return ok;
+}
+
 static int ir_lower_switch_statement(IRLoweringContext *context,
                                      IRFunction *function, ASTNode *statement) {
   if (!context || !function || !statement ||
@@ -517,6 +617,22 @@ static int ir_lower_switch_statement(IRLoweringContext *context,
       continue;
     }
     if (!clause->value) {
+      continue;
+    }
+
+    // Range case `lo..hi`: emit a two-sided bounds test instead of equality.
+    if (clause->value_high) {
+      if (!ir_emit_switch_range_dispatch(context, function, &switch_value,
+                                         clause->value, clause->value_high,
+                                         case_labels[i], statement->location)) {
+        for (size_t j = 0; j < switch_data->case_count; j++) {
+          free(case_labels[j]);
+        }
+        free(case_labels);
+        ir_operand_destroy(&switch_value);
+        free(end_label);
+        return 0;
+      }
       continue;
     }
 
@@ -1223,27 +1339,35 @@ cleanup:
   return ok;
 }
 
-static int ir_lower_tagged_enum_constructor_call(IRLoweringContext *context,
-                                                 IRFunction *function,
-                                                 ASTNode *expression,
-                                                 Symbol *constructor_symbol,
-                                                 IROperand *out_value) {
-  CallExpression *call = NULL;
+static int ir_emit_tagged_enum_construct(IRLoweringContext *context,
+                                         IRFunction *function,
+                                         Symbol *constructor_symbol,
+                                         ASTNode *payload_arg,
+                                         SourceLocation location,
+                                         IROperand *out_value) {
   Type *enum_type = NULL;
   Type *payload_type = NULL;
   char *local_name = NULL;
   IROperand enum_address = ir_operand_none();
 
-  if (!context || !function || !expression || !constructor_symbol ||
-      !out_value) {
+  if (!context || !function || !constructor_symbol || !out_value) {
     return 0;
   }
 
-  call = (CallExpression *)expression->data;
   enum_type = constructor_symbol->data.constructor.enum_type;
   payload_type = constructor_symbol->data.constructor.payload_type;
-  if (!call || !enum_type || !enum_type->name) {
-    ir_set_error(context, "Malformed tagged-enum constructor call");
+  if (!enum_type || !enum_type->name) {
+    ir_set_error(context, "Malformed tagged-enum constructor");
+    return 0;
+  }
+
+  /* Nullary constructor referenced bare (e.g. `var x: Option = None`) reaches
+   * here with payload_arg == NULL and payload_type == NULL; that is valid. A
+   * payload_arg without a payload_type, or vice versa, is a type-checker bug. */
+  if ((payload_type != NULL) != (payload_arg != NULL)) {
+    ir_set_error(context,
+                 "Tagged-enum constructor arity mismatch (variant '%s')",
+                 constructor_symbol->name ? constructor_symbol->name : "?");
     return 0;
   }
 
@@ -1255,9 +1379,9 @@ static int ir_lower_tagged_enum_constructor_call(IRLoweringContext *context,
   }
 
   if (!ir_emit_local_declaration(context, function, local_name, enum_type->name,
-                                 expression->location) ||
+                                 location) ||
       !ir_emit_address_of_symbol(context, function, local_name,
-                                 expression->location, &enum_address)) {
+                                 location, &enum_address)) {
     ir_operand_destroy(&enum_address);
     free(local_name);
     return 0;
@@ -1266,7 +1390,7 @@ static int ir_lower_tagged_enum_constructor_call(IRLoweringContext *context,
   {
     IRInstruction store_tag = {0};
     store_tag.op = IR_OP_STORE;
-    store_tag.location = expression->location;
+    store_tag.location = location;
     store_tag.dest = enum_address;
     store_tag.lhs =
         ir_operand_int((long long)constructor_symbol->data.constructor.tag_value);
@@ -1287,12 +1411,11 @@ static int ir_lower_tagged_enum_constructor_call(IRLoweringContext *context,
     IROperand payload_source = ir_operand_none();
     char *payload_temp_name = NULL;
 
-    if (call->argument_count != 1 ||
-        !ir_lower_expression(context, function, call->arguments[0],
+    if (!ir_lower_expression(context, function, payload_arg,
                              &payload_value) ||
         !ir_emit_address_with_offset(context, function, &enum_address,
                                      enum_type->tagged_data_offset,
-                                     expression->location, &payload_address)) {
+                                     location, &payload_address)) {
       ir_operand_destroy(&payload_address);
       ir_operand_destroy(&payload_value);
       ir_operand_destroy(&enum_address);
@@ -1304,11 +1427,11 @@ static int ir_lower_tagged_enum_constructor_call(IRLoweringContext *context,
       payload_temp_name = ir_new_label_name(context, "tagged_payload");
       if (!payload_temp_name ||
           !ir_emit_local_declaration(context, function, payload_temp_name,
-                                     payload_type->name, expression->location) ||
+                                     payload_type->name, location) ||
           !ir_emit_symbol_assignment(context, function, payload_temp_name,
-                                     &payload_value, expression->location) ||
+                                     &payload_value, location) ||
           !ir_emit_address_of_symbol(context, function, payload_temp_name,
-                                     expression->location, &payload_source)) {
+                                     location, &payload_source)) {
         free(payload_temp_name);
         ir_operand_destroy(&payload_source);
         ir_operand_destroy(&payload_address);
@@ -1324,7 +1447,7 @@ static int ir_lower_tagged_enum_constructor_call(IRLoweringContext *context,
     {
       IRInstruction store_payload = {0};
       store_payload.op = IR_OP_STORE;
-      store_payload.location = expression->location;
+      store_payload.location = location;
       store_payload.dest = payload_address;
       store_payload.lhs = payload_source;
       store_payload.rhs = ir_operand_int(payload_size);
@@ -1357,6 +1480,48 @@ static int ir_lower_tagged_enum_constructor_call(IRLoweringContext *context,
   }
 
   return 1;
+}
+
+static int ir_lower_tagged_enum_constructor_call(IRLoweringContext *context,
+                                                 IRFunction *function,
+                                                 ASTNode *expression,
+                                                 Symbol *constructor_symbol,
+                                                 IROperand *out_value) {
+  CallExpression *call = NULL;
+  Type *payload_type = NULL;
+  ASTNode *payload_arg = NULL;
+
+  if (!context || !function || !expression || !constructor_symbol ||
+      !out_value) {
+    return 0;
+  }
+
+  call = (CallExpression *)expression->data;
+  payload_type = constructor_symbol->data.constructor.payload_type;
+  if (!call) {
+    ir_set_error(context, "Malformed tagged-enum constructor call");
+    return 0;
+  }
+
+  if (payload_type) {
+    if (call->argument_count != 1 || !call->arguments ||
+        !call->arguments[0]) {
+      ir_set_error(context,
+                   "Tagged-enum variant '%s' expects exactly one payload argument",
+                   constructor_symbol->name ? constructor_symbol->name : "?");
+      return 0;
+    }
+    payload_arg = call->arguments[0];
+  } else if (call->argument_count != 0) {
+    ir_set_error(context,
+                 "Tagged-enum variant '%s' is nullary; pass no arguments",
+                 constructor_symbol->name ? constructor_symbol->name : "?");
+    return 0;
+  }
+
+  return ir_emit_tagged_enum_construct(context, function, constructor_symbol,
+                                       payload_arg, expression->location,
+                                       out_value);
 }
 
 static int ir_emit_deferred_calls(IRLoweringContext *context,
@@ -1857,8 +2022,133 @@ static int ir_defer_stack_push(IRLoweringContext *context, IRDeferStack *stack,
   }
   stack->entries[stack->count].node = node;
   stack->entries[stack->count].is_err = is_err;
+  stack->entries[stack->count].capture_call_name = NULL;
+  stack->entries[stack->count].capture_arg_temps = NULL;
+  stack->entries[stack->count].capture_arg_count = 0;
   stack->count++;
   return 1;
+}
+
+// Release a defer stack's entries along with any by-value capture metadata.
+static void ir_defer_stack_free(IRDeferStack *stack) {
+  if (!stack) {
+    return;
+  }
+  for (size_t i = 0; i < stack->count; i++) {
+    if (stack->entries[i].capture_arg_temps) {
+      for (size_t j = 0; j < stack->entries[i].capture_arg_count; j++) {
+        free(stack->entries[i].capture_arg_temps[j]);
+      }
+      free(stack->entries[i].capture_arg_temps);
+    }
+    free(stack->entries[i].capture_call_name);
+  }
+  free(stack->entries);
+  stack->entries = NULL;
+  stack->count = 0;
+  stack->capacity = 0;
+}
+
+// If `defer_node` defers a direct function call with arguments, snapshot each
+// argument value into a fresh temp local at the current (defer-point) position
+// and record the call name + temp names for by-value replay. Returns 1 when the
+// call was captured; 0 means the deferred statement should be replayed by
+// re-lowering its AST (no arguments, a method/indirect call, or an argument
+// whose type we cannot snapshot). Returns -1 if a real error occurred while
+// emitting the snapshots (an error has been set on the context).
+static int ir_defer_capture_call(IRLoweringContext *context,
+                                 IRFunction *function, ASTNode *defer_node,
+                                 char **out_call_name, char ***out_temps,
+                                 size_t *out_count) {
+  *out_call_name = NULL;
+  *out_temps = NULL;
+  *out_count = 0;
+
+  DeferStatement *defer_stmt = (DeferStatement *)defer_node->data;
+  if (!defer_stmt || !defer_stmt->statement ||
+      defer_stmt->statement->type != AST_FUNCTION_CALL) {
+    return 0;
+  }
+  CallExpression *call = (CallExpression *)defer_stmt->statement->data;
+  if (!call || !call->function_name || call->argument_count == 0) {
+    return 0;
+  }
+  // Method calls (with a receiver) and indirect calls keep by-reference replay.
+  if (call->object || call->is_indirect_call) {
+    return 0;
+  }
+  if (strcmp(call->function_name, "sizeof") == 0 ||
+      strcmp(call->function_name, "static_assert") == 0) {
+    return 0;
+  }
+  // Each argument needs a concrete resolved type so the snapshot local can be
+  // declared with an explicit type (required by the binary backend).
+  for (size_t i = 0; i < call->argument_count; i++) {
+    if (!call->arguments[i] || !call->arguments[i]->resolved_type ||
+        !call->arguments[i]->resolved_type->name) {
+      return 0;
+    }
+  }
+
+  char **temps = calloc(call->argument_count, sizeof(char *));
+  if (!temps) {
+    ir_set_error(context, "Out of memory capturing deferred call arguments");
+    return -1;
+  }
+
+  for (size_t i = 0; i < call->argument_count; i++) {
+    const char *type_name = call->arguments[i]->resolved_type->name;
+    char *temp_name = ir_new_label_name(context, "defer_cap");
+    if (!temp_name) {
+      goto fail;
+    }
+    temps[i] = temp_name;
+
+    IRInstruction decl = {0};
+    decl.op = IR_OP_DECLARE_LOCAL;
+    decl.location = defer_node->location;
+    decl.dest = ir_operand_symbol(temp_name);
+    decl.text = (char *)type_name;
+    if (!decl.dest.name || !ir_emit(context, function, &decl)) {
+      ir_operand_destroy(&decl.dest);
+      goto fail;
+    }
+    ir_operand_destroy(&decl.dest);
+
+    IROperand value = ir_operand_none();
+    if (!ir_lower_expression(context, function, call->arguments[i], &value)) {
+      goto fail;
+    }
+    IRInstruction assign = {0};
+    assign.op = IR_OP_ASSIGN;
+    assign.location = defer_node->location;
+    assign.dest = ir_operand_symbol(temp_name);
+    assign.lhs = value;
+    ir_assign_apply_float_bits(&assign, &assign.lhs,
+                               ir_named_type_float_bits(context, type_name));
+    if (!assign.dest.name || !ir_emit(context, function, &assign)) {
+      ir_operand_destroy(&assign.dest);
+      ir_operand_destroy(&value);
+      goto fail;
+    }
+    ir_operand_destroy(&assign.dest);
+    ir_operand_destroy(&value);
+  }
+
+  *out_call_name = strdup(call->function_name);
+  if (!*out_call_name) {
+    goto fail;
+  }
+  *out_temps = temps;
+  *out_count = call->argument_count;
+  return 1;
+
+fail:
+  for (size_t i = 0; i < call->argument_count; i++) {
+    free(temps[i]);
+  }
+  free(temps);
+  return -1;
 }
 
 static int ir_emit_deferred_calls_filtered(IRLoweringContext *context,
@@ -1878,6 +2168,47 @@ static int ir_emit_deferred_calls_filtered(IRLoweringContext *context,
                         defer_node->type != AST_ERRDEFER_STATEMENT)) {
       continue;
     }
+
+    // By-value capture: replay the call against the argument snapshots taken at
+    // the defer point instead of re-evaluating the original argument exprs.
+    if (stack->entries[i - 1].capture_call_name) {
+      size_t argc = stack->entries[i - 1].capture_arg_count;
+      char **temps = stack->entries[i - 1].capture_arg_temps;
+      IROperand dest = ir_operand_none();
+      if (!ir_make_temp_operand(context, &dest)) {
+        return 0;
+      }
+      IROperand *args = NULL;
+      if (argc > 0) {
+        args = calloc(argc, sizeof(IROperand));
+        if (!args) {
+          ir_operand_destroy(&dest);
+          ir_set_error(context, "Out of memory replaying deferred call");
+          return 0;
+        }
+        for (size_t a = 0; a < argc; a++) {
+          args[a] = ir_operand_symbol(temps[a]);
+        }
+      }
+      IRInstruction call_inst = {0};
+      call_inst.op = IR_OP_CALL;
+      call_inst.location = defer_node->location;
+      call_inst.dest = dest;
+      call_inst.text = stack->entries[i - 1].capture_call_name;
+      call_inst.arguments = args;
+      call_inst.argument_count = argc;
+      int ok = ir_emit(context, function, &call_inst);
+      for (size_t a = 0; a < argc; a++) {
+        ir_operand_destroy(&args[a]);
+      }
+      free(args);
+      ir_operand_destroy(&dest);
+      if (!ok) {
+        return 0;
+      }
+      continue;
+    }
+
     DeferStatement *defer_stmt = (DeferStatement *)defer_node->data;
     if (!defer_stmt || !defer_stmt->statement) {
       continue;
@@ -1903,7 +2234,7 @@ static int ir_lower_deferred_statement(IRLoweringContext *context,
   if (ok) {
     ok = ir_emit_deferred_scopes_non_err(context, function, &deferred_scope);
   }
-  free(deferred_scope.stack.entries);
+  ir_defer_stack_free(&deferred_scope.stack);
   return ok;
 }
 
@@ -1982,6 +2313,28 @@ static int ir_symbol_float_bits(IRLoweringContext *context, const char *name) {
     return 0;
   }
   return ir_type_float_bits(symbol->type);
+}
+
+/* Recover a local's declared float width (0/32/64) from the DECLARE_LOCAL the
+ * lowering already emitted for it. The function-body symbol-table scope is
+ * usually popped by lowering time, so symbol_table_lookup misses locals; the
+ * emitted IR is the reliable record of a local's declared type name. Caller
+ * should gate this on a floating RHS to avoid an O(n) scan on every assign. */
+static int ir_local_declared_float_bits(IRLoweringContext *context,
+                                        const IRFunction *function,
+                                        const char *name) {
+  if (!context || !function || !name) {
+    return 0;
+  }
+  for (size_t i = function->instruction_count; i-- > 0;) {
+    const IRInstruction *insn = &function->instructions[i];
+    if (insn->op == IR_OP_DECLARE_LOCAL &&
+        insn->dest.kind == IR_OPERAND_SYMBOL && insn->dest.name &&
+        insn->text && strcmp(insn->dest.name, name) == 0) {
+      return ir_named_type_float_bits(context, insn->text);
+    }
+  }
+  return 0;
 }
 
 /* Record, on an ASSIGN/STORE, the TARGET float precision (bits = 32/64) of the
@@ -2982,6 +3335,16 @@ static int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
       return 1;
     }
 
+    /* A bare nullary tagged-enum variant (e.g. `var a: Option = None`) names
+     * a constructor symbol, not a runtime value. Construct an enum local with
+     * just the tag set; payloadful variants must use call syntax `Some(x)`. */
+    if (symbol && symbol->kind == SYMBOL_TAGGED_ENUM_CONSTRUCTOR &&
+        symbol->data.constructor.payload_type == NULL) {
+      return ir_emit_tagged_enum_construct(context, function, symbol,
+                                           NULL, expression->location,
+                                           out_value);
+    }
+
     *out_value = ir_operand_symbol(identifier->name);
     if (!out_value->name) {
       ir_set_error(context, "Out of memory while lowering identifier");
@@ -3417,7 +3780,35 @@ static int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
     return 1;
   }
 
-  case AST_MEMBER_ACCESS:
+  case AST_MEMBER_ACCESS: {
+    MemberAccess *m = (MemberAccess *)expression->data;
+    /* Qualified enum variant: `EnumName.Variant` lowers to either an integer
+     * constant (plain enum) or a tagged-enum construction (tagged enum). */
+    if (m && m->object && m->object->type == AST_IDENTIFIER && m->member) {
+      Identifier *obj_id = (Identifier *)m->object->data;
+      if (obj_id && obj_id->name && context->symbol_table) {
+        Symbol *enum_sym =
+            symbol_table_lookup(context->symbol_table, obj_id->name);
+        if (enum_sym && enum_sym->kind == SYMBOL_ENUM) {
+          Symbol *variant_sym =
+              symbol_table_lookup(context->symbol_table, m->member);
+          if (variant_sym && variant_sym->kind == SYMBOL_CONSTANT) {
+            *out_value = ir_operand_int(variant_sym->data.constant.value);
+            return 1;
+          }
+          if (variant_sym &&
+              variant_sym->kind == SYMBOL_TAGGED_ENUM_CONSTRUCTOR &&
+              variant_sym->data.constructor.payload_type == NULL) {
+            return ir_emit_tagged_enum_construct(context, function, variant_sym,
+                                                 NULL, expression->location,
+                                                 out_value);
+          }
+        }
+      }
+    }
+    /* Fall through to the lvalue-load path for struct/array member access. */
+  }
+  /* fallthrough */
   case AST_INDEX_EXPRESSION: {
     IROperand address = ir_operand_none();
     Type *value_type = NULL;
@@ -3705,14 +4096,14 @@ static int ir_lower_statement_with_defers(IRLoweringContext *context,
     for (size_t i = 0; i < program->declaration_count; i++) {
       if (!ir_lower_statement_with_defers(
               context, function, program->declarations[i], &block_scope)) {
-        free(block_scope.stack.entries);
+        ir_defer_stack_free(&block_scope.stack);
         return 0;
       }
     }
 
     int ok =
         ir_emit_deferred_calls_non_err(context, function, &block_scope.stack);
-    free(block_scope.stack.entries);
+    ir_defer_stack_free(&block_scope.stack);
     return ok;
   }
 
@@ -3723,11 +4114,26 @@ static int ir_lower_statement_with_defers(IRLoweringContext *context,
       return 0;
     }
 
+    // Top-level `const` is folded at use sites (SYMBOL_CONSTANT) and never
+    // reaches this local-statement path. A local `const` is an immutable local
+    // variable: it gets normal storage and initialization here, and the type
+    // checker rejects reassignment.
+
     IRInstruction local = {0};
     local.op = IR_OP_DECLARE_LOCAL;
     local.location = statement->location;
     local.dest = ir_operand_symbol(declaration->name);
     local.text = declaration->type_name;
+    // For inferred-type locals (`var x = expr;`) the declaration carries no
+    // type_name. The binary/direct-object backend resolves a local's type from
+    // this textual payload, so fall back to the name of the type the checker
+    // inferred for the initializer. The Type (and its name) outlives codegen,
+    // matching the lifetime of the type_name pointer used above, and `text` is
+    // never freed by the IR. Leaving it NULL is harmless for the asm backend.
+    if (!local.text && declaration->initializer &&
+        declaration->initializer->resolved_type) {
+      local.text = declaration->initializer->resolved_type->name;
+    }
     if (!local.dest.name) {
       ir_set_error(context,
                    "Out of memory while lowering variable declaration");
@@ -3827,9 +4233,22 @@ static int ir_lower_statement_with_defers(IRLoweringContext *context,
         assign.location = statement->location;
         assign.dest = ir_operand_symbol(assignment->variable_name);
         assign.lhs = value;
-        ir_assign_apply_float_bits(
-            &assign, &assign.lhs,
-            ir_symbol_float_bits(context, assignment->variable_name));
+        /* Target float width for the narrowing/widening on store. Prefer the
+         * symbol table, but its function scope is usually popped by lowering
+         * time, so fall back to the declared type recorded on the emitted
+         * DECLARE_LOCAL. Without this, a float64 expression assigned into a
+         * float32 local kept the float64 width and stored the wrong 4 bytes.
+         * Gate the IR scan on a floating RHS so non-float assigns stay O(1). */
+        int target_float_bits =
+            ir_symbol_float_bits(context, assignment->variable_name);
+        if (target_float_bits == 0 && assignment->value &&
+            assignment->value->resolved_type &&
+            (assignment->value->resolved_type->kind == TYPE_FLOAT32 ||
+             assignment->value->resolved_type->kind == TYPE_FLOAT64)) {
+          target_float_bits = ir_local_declared_float_bits(
+              context, function, assignment->variable_name);
+        }
+        ir_assign_apply_float_bits(&assign, &assign.lhs, target_float_bits);
         if (!assign.dest.name) {
           ir_operand_destroy(&value);
           ir_set_error(context, "Out of memory while lowering assignment target");
@@ -4232,9 +4651,30 @@ static int ir_lower_statement_with_defers(IRLoweringContext *context,
     if (!defers) {
       return 1;
     }
+    // Snapshot argument values now so the deferred call captures them by value
+    // rather than re-reading the variables at scope exit.
+    char *cap_name = NULL;
+    char **cap_temps = NULL;
+    size_t cap_count = 0;
+    int captured = ir_defer_capture_call(context, function, statement,
+                                         &cap_name, &cap_temps, &cap_count);
+    if (captured < 0) {
+      return 0;
+    }
     if (!ir_defer_stack_push(context, &defers->stack, statement, 0)) {
+      for (size_t i = 0; i < cap_count; i++) {
+        free(cap_temps[i]);
+      }
+      free(cap_temps);
+      free(cap_name);
       ir_set_error(context, "Out of memory while recording defer statement");
       return 0;
+    }
+    if (captured > 0) {
+      size_t idx = defers->stack.count - 1;
+      defers->stack.entries[idx].capture_call_name = cap_name;
+      defers->stack.entries[idx].capture_arg_temps = cap_temps;
+      defers->stack.entries[idx].capture_arg_count = cap_count;
     }
     return 1;
   }
@@ -4315,7 +4755,7 @@ static IRFunction *ir_lower_function(IRLoweringContext *context,
   if (function_data->body &&
       !ir_lower_statement_with_defers(context, function, function_data->body,
                                       &defers)) {
-    free(defers.stack.entries);
+    ir_defer_stack_free(&defers.stack);
     ir_function_destroy(function);
     return NULL;
   }
@@ -4328,14 +4768,14 @@ static IRFunction *ir_lower_function(IRLoweringContext *context,
     if (!ir_emit_return_with_defers(context, function, &defers, &implicit_value,
                                     declaration->location)) {
       ir_operand_destroy(&implicit_value);
-      free(defers.stack.entries);
+      ir_defer_stack_free(&defers.stack);
       ir_function_destroy(function);
       return NULL;
     }
     ir_operand_destroy(&implicit_value);
   }
 
-  free(defers.stack.entries);
+  ir_defer_stack_free(&defers.stack);
   if (!ir_function_rebuild_cfg(function)) {
     ir_set_error(context, "Out of memory while building IR control-flow graph");
     ir_function_destroy(function);

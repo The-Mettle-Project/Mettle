@@ -2,6 +2,11 @@ function cold_path() -> int32 {
   return 9;
 }
 
+function unsigned_load_cast_chain(buf: cstring) -> int64 {
+  var b: int64 = (int64)(uint8)buf[0];
+  return b;
+}
+
 function main() -> int32 {
   var folded: int32 = 6 * 7;
   var result: int32 = folded;
@@ -12,6 +17,11 @@ function main() -> int32 {
   result = result + 42;
   var bits: int32 = folded ^ folded;
   result = result + bits;
+  var bool_sink: int32 = same && 0;
+  result = result + bool_sink;
+  bool_sink = 1 || same;
+  result = result + bool_sink;
+  result = result - 1;
 
   if (0) {
     result = cold_path();

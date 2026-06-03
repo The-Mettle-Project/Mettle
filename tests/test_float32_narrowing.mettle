@@ -1,0 +1,52 @@
+// Regression: float32 narrowing must survive both the inliner and the
+// single-use assign coalescer.
+//
+// Two distinct miscompiles this guards:
+//   1. -O0 assignment statement: `s = s + x * 1.5` where s is float32 and the
+//      RHS evaluates at float64. The store must narrow (cvtsd2ss); a prior bug
+//      stored the low 4 bytes of the float64 pattern (-> 0.0f) because the
+//      function scope was popped and the destination's float32 width was lost.
+//   2. --release inlining: a float32-returning function inlined into a caller
+//      narrows on the return ABI. The inliner's synthesized assign dropped that
+//      narrowing and a later single-use coalesce folded the float64 producer
+//      straight into the float32 destination.
+//
+// Self-checks; returns 1 on success, 0 on any mismatch (matches the float ABI
+// test convention).
+
+import "std/io";
+
+function scale(x: float32) -> float32 {
+  return x * 1.5 + 0.5;   // computed at float64, narrowed to float32 on return
+}
+
+function main() -> int32 {
+  // Path 1: float32 accumulation with a float64 RHS subexpression.
+  var s: float32 = 0.0;
+  var x: float32 = 4.0;
+  s = s + x * 1.5;        // 6.0
+  s = s + x * 1.5;        // 12.0
+  if ((int64)s != 12) {
+    return 0;
+  }
+
+  // Path 2: inlined float32 return narrowing (non-constant arg).
+  var seed: int32 = 4;
+  var r: float32 = scale((float32)seed);   // 4*1.5+0.5 = 6.5
+  if ((int64)r != 6) {
+    return 0;
+  }
+
+  // Path 3: float32 array load * float64 literal, accumulated into float32.
+  var sum: float32 = 0.0;
+  var i: int32 = 0;
+  while (i < 10) {
+    sum = sum + (float32)i * 2.0;   // 2*(0+1+...+9) = 90
+    i = i + 1;
+  }
+  if ((int64)sum != 90) {
+    return 0;
+  }
+
+  return 1;
+}

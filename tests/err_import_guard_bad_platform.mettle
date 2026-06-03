@@ -1,0 +1,7 @@
+// An import guard platform must be 'windows' or 'linux'.
+
+import "std/core" if solaris;
+
+function main() -> int32 {
+  return 0;
+}

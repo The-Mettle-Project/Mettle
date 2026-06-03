@@ -1,0 +1,12 @@
+// Top-level constants: compile-time integer values folded at use sites.
+// Exercises annotated and inferred consts, const-of-const arithmetic, a local
+// const referencing a top-level const, and use in an expression. Returns 42.
+
+const WIDTH: int32 = 4;
+const HEIGHT = 5;
+const AREA = WIDTH * HEIGHT;     // references other constants + arithmetic
+
+function main() -> int32 {
+  const LOCAL: int32 = AREA + 22; // local const referencing a top-level const
+  return LOCAL;                   // 4 * 5 + 22 = 42
+}

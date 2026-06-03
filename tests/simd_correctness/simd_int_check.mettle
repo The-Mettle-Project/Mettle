@@ -1,0 +1,169 @@
+// General correctness harness for the AVX2 integer SIMD kernels.
+// For every length around the vector/tail boundaries, fill arrays with a
+// deterministic PRNG (values include negatives), run each fused kernel, and
+// check the result against a reference computed with read-only loops that do
+// NOT match any vectorizer recognizer. No benchmark-shaped data: lengths and
+// values are adversarial w.r.t. the 8-lane vector width + scalar tail.
+
+import "std/io";
+import "std/mem";
+
+var g_seed: int64 = 123456789;
+function rnd() -> int32 {
+  // LCG; take a signed 32-bit window so negatives appear.
+  g_seed = (g_seed * 1103515245 + 12345) & 0x7FFFFFFFFFFF;
+  return (int32)((g_seed % 4000) - 2000);   // [-2000, 1999]
+}
+
+// ---- kernels (each is the exact loop shape the recognizers fuse) ----
+function k_sum(a: int32*, n: int64) -> int64 {
+  var s: int64 = 0; var i: int64 = 0;
+  while (i < n) { s = s + (int64)a[i]; i = i + 1; }
+  return s;
+}
+function k_dot(a: int32*, b: int32*, n: int64) -> int64 {
+  var s: int64 = 0; var i: int64 = 0;
+  while (i < n) { s = s + (int64)a[i] * (int64)b[i]; i = i + 1; }
+  return s;
+}
+// Constant mul/add — the scale recognizer only fires when they are literals.
+function k_scale(src: int32*, dst: int32*, n: int64) -> int64 {
+  var s: int64 = 0; var i: int64 = 0;
+  while (i < n) {
+    var v: int32 = src[i] * 3 + 7;
+    dst[i] = v;
+    s = s + (int64)v;
+    i = i + 1;
+  }
+  return s;
+}
+// Constant lo/hi via an inlined clamp helper (mirrors the clamp_i32 example).
+function clamp1(v: int32, lo: int32, hi: int32) -> int32 {
+  if (v < lo) { return lo; }
+  if (v > hi) { return hi; }
+  return v;
+}
+function k_clamp(src: int32*, dst: int32*, n: int64) -> int64 {
+  var s: int64 = 0; var i: int64 = 0;
+  while (i < n) {
+    var v: int32 = clamp1(src[i], -500, 500);
+    dst[i] = v;
+    s = s + (int64)v;
+    i = i + 1;
+  }
+  return s;
+}
+function k_reverse(src: int32*, dst: int32*, n: int64) -> int64 {
+  var s: int64 = 0; var i: int64 = 0;
+  while (i < n) {
+    var v: int32 = src[n - 1 - i];
+    dst[i] = v;
+    s = s + (int64)v;
+    i = i + 1;
+  }
+  return s;
+}
+function k_min(arr: int32*, n: int64) -> int32 {
+  var minv: int32 = arr[0]; var maxv: int32 = arr[0];
+  var i: int64 = 1;
+  while (i < n) {
+    var v: int32 = arr[i];
+    if (v < minv) { minv = v; }
+    if (v > maxv) { maxv = v; }
+    i = i + 1;
+  }
+  return minv;
+}
+
+var g_fail: int32 = 0;
+
+function fail(label: cstring, len: int64) -> int32 {
+  print(cstr("FAIL ")); print(label); print(cstr(" n=")); print_int(len);
+  println(cstr(""));
+  g_fail = g_fail + 1;
+  return 0;
+}
+
+function run_len(n: int64) -> int32 {
+  var cap: int64 = n; if (cap < 1) { cap = 1; }
+  var a: int32* = (int32*)malloc(cap * 4);
+  var b: int32* = (int32*)malloc(cap * 4);
+  var dst: int32* = (int32*)malloc(cap * 4);
+
+  // Fill + compute references in the SAME loop (the store of a[i] means this
+  // loop is not a pure reduction/scan, so no recognizer fuses it).
+  var ref_sum: int64 = 0;
+  var ref_dot: int64 = 0;
+  var ref_min: int32 = 0;
+  var ref_max: int32 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    var x: int32 = rnd();
+    var y: int32 = rnd();
+    a[i] = x; b[i] = y;
+    ref_sum = ref_sum + (int64)x;
+    ref_dot = ref_dot + (int64)x * (int64)y;
+    if (i == 0) { ref_min = x; ref_max = x; }
+    if (x < ref_min) { ref_min = x; }
+    if (x > ref_max) { ref_max = x; }
+    i = i + 1;
+  }
+
+  if (k_sum(a, n) != ref_sum) { fail(cstr("sum_i32"), n); }
+  if (k_dot(a, b, n) != ref_dot) { fail(cstr("dot_i32"), n); }
+
+  // scale: dst[i] = a[i]*3 + 7; check elementwise (read-only) + returned sum.
+  var ssum: int64 = k_scale(a, dst, n);
+  var esum: int64 = 0; i = 0;
+  while (i < n) {
+    if (dst[i] != a[i] * 3 + 7) { fail(cstr("scale val"), n); i = n; }
+    else { esum = esum + (int64)(a[i] * 3 + 7); i = i + 1; }
+  }
+  if (ssum != esum) { fail(cstr("scale sum"), n); }
+
+  // clamp to [-500, 500]
+  var csum: int64 = k_clamp(a, dst, n);
+  var ecsum: int64 = 0; i = 0;
+  while (i < n) {
+    var cv: int32 = a[i];
+    if (cv < -500) { cv = -500; }
+    if (cv > 500) { cv = 500; }
+    if (dst[i] != cv) { fail(cstr("clamp val"), n); i = n; }
+    else { ecsum = ecsum + (int64)cv; i = i + 1; }
+  }
+  if (csum != ecsum) { fail(cstr("clamp sum"), n); }
+
+  // reverse
+  var rsum: int64 = k_reverse(a, dst, n);
+  i = 0;
+  while (i < n) {
+    if (dst[i] != a[n - 1 - i]) { fail(cstr("reverse val"), n); i = n; }
+    else { i = i + 1; }
+  }
+  if (rsum != ref_sum) { fail(cstr("reverse sum"), n); }
+
+  // minmax (needs n >= 1)
+  if (n >= 1) {
+    if (k_min(a, n) != ref_min) { fail(cstr("minmax"), n); }
+  }
+
+  free((cstring)a); free((cstring)b); free((cstring)dst);
+  return 0;
+}
+
+function main() -> int32 {
+  // Lengths chosen to straddle the 8-lane vector width and scalar tails.
+  var lens: int64* = (int64*)malloc(32 * 8);
+  lens[0]=1; lens[1]=2; lens[2]=3; lens[3]=4; lens[4]=5; lens[5]=7; lens[6]=8;
+  lens[7]=9; lens[8]=15; lens[9]=16; lens[10]=17; lens[11]=23; lens[12]=31;
+  lens[13]=32; lens[14]=33; lens[15]=40; lens[16]=63; lens[17]=64; lens[18]=65;
+  lens[19]=100; lens[20]=127; lens[21]=128; lens[22]=129; lens[23]=200;
+  lens[24]=255; lens[25]=256; lens[26]=257; lens[27]=512; lens[28]=999;
+  lens[29]=1000; lens[30]=1024; lens[31]=2000;
+  var k: int64 = 0;
+  while (k < 32) { run_len(lens[k]); k = k + 1; }
+
+  if (g_fail == 0) { println(cstr("INT SIMD: ALL OK")); return 0; }
+  print(cstr("INT SIMD FAILURES: ")); print_int((int64)g_fail); println(cstr(""));
+  return 1;
+}

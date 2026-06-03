@@ -615,6 +615,7 @@ Symbol *symbol_create(const char *name, SymbolKind kind, Type *type) {
   symbol->is_initialized = 0;
   symbol->is_forward_declaration = 0;
   symbol->is_extern = 0;
+  symbol->is_immutable = 0;
   symbol->link_name = NULL;
 
   // Initialize union data based on symbol kind

@@ -1,4 +1,5 @@
 #include "codegen/binary/internal.h"
+#include "codegen/binary/mir.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -66,6 +67,20 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
                                  : NULL));
   }
 
+  /* Route fully-supported leaf integer functions through the MIR + linear-scan
+   * register allocator The MIR path fills context.code
+   * with a complete prologue..epilogue and resolves its own label fixups; all
+   * downstream emission (.text append, relocations, debug symbols) is shared. */
+  if (mir_function_is_eligible(generator, function_data, ir_function)) {
+    if (!code_generator_binary_emit_function_via_mir(generator, function_data,
+                                                     ir_function, &context)) {
+      binary_function_context_destroy(&context);
+      return 0;
+    }
+    return_offset = context.code.size;
+    goto mir_shared_append;
+  }
+
   if (!code_generator_binary_emit_prologue(generator, &context, function_data)) {
     binary_function_context_destroy(&context);
     return 0;
@@ -86,6 +101,18 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
     }
 
     if (code_generator_binary_try_emit_compare_assign_diamond(
+            generator, &context, ir_function, i, &consumed)) {
+      i += consumed;
+      continue;
+    }
+
+    if (code_generator_binary_try_emit_offset_scaled_address_load(
+            generator, &context, ir_function, i, &consumed)) {
+      i += consumed;
+      continue;
+    }
+
+    if (code_generator_binary_try_emit_offset_scaled_address_store(
             generator, &context, ir_function, i, &consumed)) {
       i += consumed;
       continue;
@@ -116,6 +143,18 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
     }
 
     if (code_generator_binary_try_emit_binary_cast_chain(
+            generator, &context, ir_function, i, &consumed)) {
+      i += consumed;
+      continue;
+    }
+
+    if (code_generator_binary_try_emit_float_cast_binary_chain(
+            generator, &context, ir_function, i, &consumed)) {
+      i += consumed;
+      continue;
+    }
+
+    if (code_generator_binary_try_emit_float_binary_expression_chain(
             generator, &context, ir_function, i, &consumed)) {
       i += consumed;
       continue;
@@ -168,6 +207,11 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
     return 0;
   }
 
+  if (!code_generator_binary_emit_promoted_global_stores(generator, &context)) {
+    binary_function_context_destroy(&context);
+    return 0;
+  }
+
   for (size_t i = context.saved_register_count; i > 0; i--) {
     size_t slot = i - 1;
     if (!binary_emit_mov_reg_mem(&context.code, context.saved_registers[slot],
@@ -200,6 +244,7 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
     return 0;
   }
 
+mir_shared_append:
   emitter = code_generator_get_binary_emitter(generator);
   if (!emitter) {
     code_generator_set_error(generator, "Binary emitter is not initialized");
@@ -290,14 +335,6 @@ int code_generator_generate_program_binary_object(CodeGenerator *generator,
                              "IR program not attached to code generator");
     return 0;
   }
-  if (generator->generate_debug_info) {
-    code_generator_set_error(
-        generator,
-        "Direct object backend does not yet support debug info sidecar "
-        "emission (DWARF/stabs/debug-map)");
-    return 0;
-  }
-
   /* Pin the calling convention to the target object format before emitting any
    * code: COFF -> MS-x64, ELF -> SysV. */
   code_generator_binary_select_abi(generator->binary_emitter->target_format);
@@ -367,6 +404,10 @@ int code_generator_generate_program_binary_object(CodeGenerator *generator,
       if (var_data->is_extern) {
         break;
       }
+      // `const` declarations are folded at use sites and carry no storage.
+      if (var_data->is_const) {
+        break;
+      }
       if (!code_generator_emit_binary_global_variable(generator, var_data)) {
         return 0;
       }
@@ -398,6 +439,16 @@ int code_generator_generate_program_binary_object(CodeGenerator *generator,
 
   if (generator->generate_stack_trace_support &&
       !code_generator_binary_emit_crash_startup(generator)) {
+    return 0;
+  }
+
+  if ((generator->generate_stack_trace_support || generator->profile_runtime) &&
+      !code_generator_binary_emit_elf_runtime_hooks(generator)) {
+    return 0;
+  }
+
+  if (generator->generate_debug_info &&
+      !code_generator_binary_emit_dwarf_debug_sections(generator)) {
     return 0;
   }
 

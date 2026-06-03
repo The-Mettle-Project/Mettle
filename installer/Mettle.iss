@@ -1,10 +1,12 @@
 ; Mettle GUI installer (Inno Setup).
 ;
 ; Build locally:
-;   powershell -File build-assets.ps1   (when icons change; needs ImageMagick)
 ;   iscc Mettle.iss
-; Stamp a version: iscc /DMyAppVersion=0.3.0 Mettle.iss
+; Stamp a version: iscc /DMyAppVersion=0.9.2 Mettle.iss
 ; CI builds this in release.yml and attaches Mettle-Setup.exe to the Release.
+;
+; WizardStyle uses Inno Setup 6's built-in modern UI (HiDPI, light/dark aware).
+; No custom bitmap assets — branding comes from SetupIconFile and copy in [Messages].
 ;
 ; The installer lets the user choose a per-user or all-users install at launch
 ; (PrivilegesRequiredOverridesAllowed=dialog). Install location, PATH scope, and
@@ -12,7 +14,7 @@
 ; constants and the HKA registry root.
 
 #ifndef MyAppVersion
-  #define MyAppVersion "v0.9.0-dev"
+  #define MyAppVersion "v0.9.2"
 #endif
 
 #define MyAppName "Mettle"
@@ -35,10 +37,9 @@ ChangesAssociations=yes
 UsePreviousAppDir=no
 UsePreviousGroup=no
 UsePreviousTasks=no
-WizardStyle=modern dynamic
-WizardImageFile=assets\wizard-large.bmp
-WizardSmallImageFile=assets\wizard-small.bmp
-WizardImageBackColor=$0A0B0D
+WizardStyle=modern dynamic windows11
+LicenseFile=..\LICENSE
+UninstallDisplayName=Mettle {#MyAppVersion}
 Compression=lzma2
 SolidCompression=yes
 ArchitecturesAllowed=x64compatible
@@ -55,20 +56,22 @@ DisableWelcomePage=no
 DisableFinishedPage=no
 
 [Messages]
-SetupAppTitle=Mettle Setup
-SetupWindowTitle=Mettle Setup
+SetupAppTitle=Mettle {#MyAppVersion} Setup
+SetupWindowTitle=Mettle {#MyAppVersion} Setup
 BeveledLabel=Mettle {#MyAppVersion}
-WelcomeLabel1=Install Mettle {#MyAppVersion}
-WelcomeLabel2=This sets up the Mettle compiler, standard library, runtime helpers, and documentation.%n%nNative x86-64 output. No LLVM. No managed runtime.
-SelectDirLabel3=Mettle will be installed in the following folder.
-SelectTasksLabel2=Optional setup tasks (recommended options are pre-selected):
-FinishedHeadingLabel=Mettle is installed
-FinishedLabelNoIcons=Mettle is ready. Open a new terminal and run: mettle --version%n%nDocs are installed with the compiler.
-FinishedLabel=Mettle is ready. Open a new terminal and run: mettle --version%n%nDocs are installed with the compiler.
+WelcomeLabel1=Welcome to the Mettle {#MyAppVersion} Setup Wizard
+WelcomeLabel2=This will install Mettle on your computer.%n%nMettle is a native x86-64 compiler with standard library, runtime helpers, and documentation.%n%nIt is recommended that you close other applications before continuing.%n%nClick Next to continue, or Cancel to exit Setup.
+SelectDirLabel3=Setup will install Mettle in the following folder.
+SelectTasksLabel2=Select the additional tasks you would like Setup to perform:
+FinishedHeadingLabel=Completing the Mettle {#MyAppVersion} Setup Wizard
+FinishedLabelNoIcons=Mettle has been installed on your computer.%n%nOpen a new Command Prompt or PowerShell window and run:%n%n    mettle --version%n%nDocumentation is available via mettle help and from the Start menu shortcuts.
+FinishedLabel=Mettle has been installed on your computer.%n%nOpen a new Command Prompt or PowerShell window and run:%n%n    mettle --version%n%nDocumentation is available via mettle help and from the Start menu shortcuts.
+LicenseLabel=Mettle is distributed under the Apache License 2.0. If you accept the terms of the agreement, click I Agree to continue.
+LicenseLabel3=Please read the following license agreement. You must accept the terms of the agreement before continuing with the installation.
 
 [Tasks]
-Name: "addtopath"; Description: "Add Mettle to the {code:PathScopeLabel} PATH so you can run &mettle from any terminal"; GroupDescription: "After install:"; Flags: checkedonce
-Name: "associate"; Description: "Register .&mettle files to open with Mettle"; GroupDescription: "After install:"
+Name: "addtopath"; Description: "Add Mettle to the {code:PathScopeLabel} &PATH (recommended)"; GroupDescription: "Additional tasks:"; Flags: checkedonce
+Name: "associate"; Description: "Associate &.mettle files with Mettle"; GroupDescription: "Additional tasks:"
 
 [Files]
 Source: "..\bin\mettle.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
@@ -93,7 +96,7 @@ Root: HKA; Subkey: "Software\Classes\MettleFile\DefaultIcon"; ValueType: string;
 Root: HKA; Subkey: "Software\Classes\MettleFile\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\bin\mettle.exe"" ""%1"""; Tasks: associate
 
 [Run]
-Filename: "{cmd}"; Parameters: "/K ""{app}\bin\mettle.exe"" --version & echo. & echo Get started: mettle --build your_file.mettle -o your_file.exe & echo Docs: mettle help build"; WorkingDir: "{app}"; Description: "Open a terminal and try &mettle --version"; Flags: postinstall nowait skipifsilent
+Filename: "{cmd}"; Parameters: "/K ""{app}\bin\mettle.exe"" --version & echo. & echo Get started: mettle --build your_file.mettle -o your_file.exe & echo Docs: mettle help build"; WorkingDir: "{app}"; Description: "&Launch a terminal to verify the installation"; Flags: postinstall nowait skipifsilent unchecked
 
 [Code]
 var
@@ -237,21 +240,21 @@ begin
       UpgradeText := UpgradeText + ' ' + Version;
     UpgradeText := UpgradeText + ' in ' + Dir + ' for the ' + Scope + ' install.';
 
-    WizardForm.WelcomeLabel1.Caption := 'Upgrade Mettle to {#MyAppVersion}';
+    WizardForm.WelcomeLabel1.Caption := 'Welcome to the Mettle {#MyAppVersion} Setup Wizard';
     WizardForm.WelcomeLabel2.Caption :=
       UpgradeText + #13#10 + #13#10 +
-      'This upgrade keeps the existing install location and refreshes the compiler, standard library, runtime helpers, and documentation.';
+      'Setup will refresh the compiler, standard library, runtime helpers, and documentation in the existing location.';
   end
   else if ExistingInstallFound then
   begin
-    WizardForm.WelcomeLabel1.Caption := 'Install Mettle {#MyAppVersion}';
+    WizardForm.WelcomeLabel1.Caption := 'Welcome to the Mettle {#MyAppVersion} Setup Wizard';
     WizardForm.WelcomeLabel2.Caption :=
       'Setup found an existing ' + ExistingInstallScope + ' Mettle install in ' + ExistingInstallDir + '.' + #13#10 + #13#10 +
       'This run is using the ' + Scope + ' install mode, so it will use a separate clean Mettle folder. Restart setup and choose the matching install mode if you want to upgrade that existing install in place.';
   end
   else if LegacyInstallFound then
   begin
-    WizardForm.WelcomeLabel1.Caption := 'Install Mettle {#MyAppVersion}';
+    WizardForm.WelcomeLabel1.Caption := 'Welcome to the Mettle {#MyAppVersion} Setup Wizard';
     WizardForm.WelcomeLabel2.Caption :=
       'Setup found an older Methlang-era install in ' + LegacyInstallDir + '.' + #13#10 + #13#10 +
       'Mettle will install to a clean Mettle folder and remove stale Methlang shortcuts, PATH entries, and file associations when it finishes.';

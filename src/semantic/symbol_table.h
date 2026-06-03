@@ -89,6 +89,7 @@ typedef struct Symbol {
   int is_initialized;
   int is_forward_declaration; // For functions that are declared but not defined
   int is_extern;              // For extern declarations (C interop)
+  int is_immutable;           // For local `const`: reassignment is rejected
   char *link_name;            // Link-time symbol name for extern declarations
   union {
     struct {

@@ -1,42 +1,43 @@
 # Mettle Installer
 
-This directory contains the files needed to build a native Windows installer (`.exe`) for Mettle.
+Native Windows setup wizard built with [Inno Setup 6](https://jrsoftware.org/isinfo.php). Produces a single `Mettle-Setup.exe` — no PowerShell required to run it.
 
 ## Features
-- Copies `mettle.exe`, `stdlib\`, and `runtime\` to the installation directory (`C:\Program Files\Mettle`).
-- Installs the two opt-in helper objects (`crash_handler.o` and `atomics.o`) so `--build` can link them on demand when a program uses crash tracebacks or `std/thread` interlocked atomics. Heap allocation and `main(argc, argv)` startup require no Mettle helper object.
+- Copies `mettle.exe`, `stdlib\`, and `runtime\` to the installation directory.
+- Installs opt-in helper objects (`crash_handler.o`, `atomics.o`, etc.) so `--build` can link them on demand.
 - Installs `mettle-build.bat` as a thin wrapper over `mettle --build`.
-- Optionally adds Mettle's `bin\` directory to the system `%PATH%` (installer task, enabled by default).
-- Optionally registers the `.mettle` file extension with Mettle's icon and open command.
-- Provides a clean uninstaller that removes Mettle and cleans up your `%PATH%`.
+- Per-user or all-users install (chosen at launch; UAC only when needed).
+- Optional PATH and `.mettle` file association tasks.
+- Built-in uninstaller registered in Windows Settings.
+- Modern Inno 6 wizard UI (HiDPI, Windows light/dark aware) — no custom bitmap assets.
 
-## How to Build the Installer
-1. Download and install [Inno Setup](https://jrsoftware.org/isinfo.php) (the QuickStart Pack or the standard installer).
-2. If you changed `mettle-syntax/icons/*.svg`, regenerate wizard artwork (requires [ImageMagick](https://imagemagick.org)):
-   ```powershell
-   cd installer
-   .\build-assets.ps1
+## Build the installer
+
+1. Build the compiler first: `build.bat gcc` from the repo root.
+2. Install [Inno Setup 6](https://jrsoftware.org/isinfo.php).
+3. Compile:
+   ```bat
+   "C:\Path\To\Inno Setup 6\ISCC.exe" installer\Mettle.iss
    ```
-3. Open `Mettle.iss` in the Inno Setup Compiler (or run `iscc Mettle.iss`).
-4. A `out\Mettle-Setup.exe` file will be generated in `installer/out`.
+   Or stamp a version explicitly:
+   ```bat
+   ISCC.exe /DMyAppVersion=0.9.2 installer\Mettle.iss
+   ```
+4. Output: `installer\out\Mettle-Setup.exe`
 
-Branding uses `mettle-dark.svg` on the installer sidebar and `mettle-light.svg` in the wizard header chip. Committed `assets/*.bmp` files are what CI compiles; rerun the script when icons change.
+CI builds the same way in `.github/workflows/release.yml`.
 
-You can now distribute `Mettle-Setup.exe`!
+## After installation
 
-## Usage after installation
-Once installed, users can simply run this command from anywhere:
 ```bat
+mettle --version
 mettle --build my_program.mettle
+mettle help
 ```
-This automatically leverages `Mettle`, `nasm`, and then `gcc` or `link.exe` to produce `my_program.exe` cleanly.
 
 `mettle-build.bat my_program.mettle` forwards to `mettle --build`.
 
-For quick discovery from the installed CLI:
+## Other install paths
 
-```bat
-mettle help
-mettle help runtime
-mettle docs
-```
+- **GUI (this installer):** `Mettle-Setup.exe` — full wizard, uninstaller, file associations.
+- **Script (download latest release):** `install.ps1` at the repo root — one-liner for `%LOCALAPPDATA%\Mettle`, no admin.

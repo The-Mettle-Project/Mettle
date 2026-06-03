@@ -18,7 +18,7 @@ RUNTIMEDIR = src/runtime
 LEXER_SOURCES = $(SRCDIR)/lexer/lexer.c
 PARSER_SOURCES = $(SRCDIR)/parser/parser.c $(SRCDIR)/parser/ast.c
 SEMANTIC_SOURCES = $(SRCDIR)/semantic/symbol_table.c $(SRCDIR)/semantic/type_checker.c $(SRCDIR)/semantic/register_allocator.c $(SRCDIR)/semantic/import_resolver.c $(SRCDIR)/semantic/monomorphize.c
-IR_SOURCES = $(wildcard $(SRCDIR)/ir/*.c)
+IR_SOURCES = $(wildcard $(SRCDIR)/ir/*.c) $(wildcard $(SRCDIR)/ir/optimizer/*.c)
 CODEGEN_SOURCES = $(wildcard $(SRCDIR)/codegen/*.c) $(wildcard $(SRCDIR)/codegen/binary/*.c)
 LINKER_SOURCES = $(wildcard $(SRCDIR)/linker/*.c)
 ERROR_SOURCES = $(SRCDIR)/error/error_reporter.c
@@ -49,13 +49,21 @@ bundle-runtime: | $(BINDIR)
 	$(CC) $(CFLAGS) -c $(STDLIBDIR)/tracy_helpers.c -o $(OBJDIR)/runtime/tracy_helpers.o
 	cp $(OBJDIR)/runtime/tracy_helpers.o $(BINDIR)/runtime/tracy_helpers.o
 	cp $(OBJDIR)/runtime/tracy_helpers.o $(BINDIR)/runtime/tracy_helpers.obj
+	$(CC) $(CFLAGS) -c $(RUNTIMEDIR)/atomics.c       -o $(OBJDIR)/runtime/atomics.o
+	$(CC) $(CFLAGS) -c $(RUNTIMEDIR)/crash_handler.c -o $(OBJDIR)/runtime/crash_handler.o
+	$(CC) $(CFLAGS) -c $(RUNTIMEDIR)/profile.c       -o $(OBJDIR)/runtime/profile.o
+	$(CC) $(CFLAGS) -c $(RUNTIMEDIR)/posix_helpers.c -o $(OBJDIR)/runtime/posix_helpers.o
+	cp $(OBJDIR)/runtime/atomics.o       $(BINDIR)/runtime/atomics.o
+	cp $(OBJDIR)/runtime/crash_handler.o $(BINDIR)/runtime/crash_handler.o
+	cp $(OBJDIR)/runtime/profile.o       $(BINDIR)/runtime/profile.o
+	cp $(OBJDIR)/runtime/posix_helpers.o $(BINDIR)/runtime/posix_helpers.o
 
 $(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(OBJDIR):
-	mkdir -p $(OBJDIR)/lexer $(OBJDIR)/parser $(OBJDIR)/semantic $(OBJDIR)/ir $(OBJDIR)/codegen $(OBJDIR)/codegen/binary $(OBJDIR)/linker $(OBJDIR)/error $(OBJDIR)/debug $(OBJDIR)/compiler $(OBJDIR)/runtime
+	mkdir -p $(OBJDIR)/lexer $(OBJDIR)/parser $(OBJDIR)/semantic $(OBJDIR)/ir $(OBJDIR)/ir/optimizer $(OBJDIR)/codegen $(OBJDIR)/codegen/binary $(OBJDIR)/linker $(OBJDIR)/error $(OBJDIR)/debug $(OBJDIR)/compiler $(OBJDIR)/runtime
 
 $(BINDIR):
 	mkdir -p $(BINDIR)

@@ -708,6 +708,8 @@ static const char *ir_opcode_name(IROpcode op) {
   case IR_OP_COUNT_WORD_STARTS: return "count_word_starts";
   case IR_OP_MEMCPY_INLINE: return "memcpy_inline";
   case IR_OP_SIMD_SUM_I32: return "simd_sum_i32";
+  case IR_OP_SIMD_SUM_U8: return "simd_sum_u8";
+  case IR_OP_SIMD_BYTE_MAP: return "simd_byte_map";
   case IR_OP_SIMD_MATMUL_N32: return "simd_matmul_n32";
   case IR_OP_SIMD_INSERTION_SORT_I32: return "simd_insertion_sort_i32";
   case IR_OP_SIMD_DOT_I32: return "simd_dot_i32";
@@ -717,6 +719,15 @@ static const char *ir_opcode_name(IROpcode op) {
   case IR_OP_LOWER_BOUND_I32: return "lower_bound_i32";
   case IR_OP_PREFIX_SUM_I32: return "prefix_sum_i32";
   case IR_OP_SIMD_MINMAX_I32: return "simd_minmax_i32";
+  case IR_OP_SIMD_SUM_F64: return "simd_sum_f64";
+  case IR_OP_SIMD_SUM_F32: return "simd_sum_f32";
+  case IR_OP_SIMD_DOT_F64: return "simd_dot_f64";
+  case IR_OP_SIMD_DOT_F32: return "simd_dot_f32";
+  case IR_OP_SIMD_AFFINE_MAP_F64: return "simd_affine_map_f64";
+  case IR_OP_SIMD_AFFINE_MAP_F32: return "simd_affine_map_f32";
+  case IR_OP_SIMD_I2F_REDUCE_F64: return "simd_i2f_reduce_f64";
+  case IR_OP_SIMD_VLOOP_F64: return "simd_vloop_f64";
+  case IR_OP_SIMD_OUTER_LANE_F64: return "simd_outer_lane_f64";
   default:
     return "unknown";
   }
@@ -877,6 +888,15 @@ static int ir_format_instruction_line(const IRInstruction *instruction,
     written = snprintf(buffer, buffer_size, "%s += simd_sum_i32(base=%s, len=%s)",
                        dest, lhs, rhs);
     break;
+  case IR_OP_SIMD_SUM_U8:
+    written = snprintf(buffer, buffer_size, "%s += simd_sum_u8(base=%s, len=%s)",
+                       dest, lhs, rhs);
+    break;
+  case IR_OP_SIMD_BYTE_MAP:
+    written = snprintf(buffer, buffer_size,
+                       "simd_byte_map(base=%s, len=%s, steps=%zu)", lhs, rhs,
+                       instruction->argument_count / 2);
+    break;
   case IR_OP_SIMD_MATMUL_N32:
     written = snprintf(buffer, buffer_size, "%s = matmul_n32(c=%s, a=%s, b=%s)",
                        dest, dest, lhs, rhs);
@@ -964,6 +984,77 @@ static int ir_format_instruction_line(const IRInstruction *instruction,
     written = snprintf(buffer, buffer_size,
                        "%s = minmax_i32(arr=%s, n=%s, max=%s)", dest, lhs, rhs,
                        maxv);
+    break;
+  }
+  case IR_OP_SIMD_SUM_F64:
+  case IR_OP_SIMD_SUM_F32:
+    written = snprintf(buffer, buffer_size, "%s += %s(base=%s, len=%s)", dest,
+                       ir_opcode_name(instruction->op), lhs, rhs);
+    break;
+  case IR_OP_SIMD_DOT_F64:
+  case IR_OP_SIMD_DOT_F32: {
+    char len[128];
+    ir_format_operand(instruction->argument_count > 0 ? &instruction->arguments[0]
+                                                      : NULL,
+                      len, sizeof(len));
+    written = snprintf(buffer, buffer_size, "%s += %s(a=%s, b=%s, len=%s)", dest,
+                       ir_opcode_name(instruction->op), lhs, rhs, len);
+    break;
+  }
+  case IR_OP_SIMD_I2F_REDUCE_F64: {
+    char trip[128];
+    ir_format_operand(instruction->argument_count > 0 ? &instruction->arguments[0]
+                                                      : NULL,
+                      trip, sizeof(trip));
+    written = snprintf(buffer, buffer_size, "%s += %s(n=%s, steps=%zu)", dest,
+                       ir_opcode_name(instruction->op), trip,
+                       instruction->argument_count > 0
+                           ? (instruction->argument_count - 1) / 2
+                           : 0);
+    break;
+  }
+  case IR_OP_SIMD_VLOOP_F64: {
+    long long reduce_op = (instruction->argument_count > 0 &&
+                           instruction->arguments[0].kind == IR_OPERAND_INT)
+                              ? instruction->arguments[0].int_value
+                              : -1;
+    long long n_nodes = (instruction->argument_count > 2 &&
+                         instruction->arguments[2].kind == IR_OPERAND_INT)
+                            ? instruction->arguments[2].int_value
+                            : -1;
+    written = snprintf(buffer, buffer_size, "%s %s %s(%s nodes=%lld)", dest,
+                       reduce_op == 1 ? "+=" : "<-",
+                       ir_opcode_name(instruction->op),
+                       reduce_op == 1 ? "reduce" : "map", n_nodes);
+    break;
+  }
+  case IR_OP_SIMD_OUTER_LANE_F64:
+    written = snprintf(buffer, buffer_size, "%s += %s(outerP=%s, args=%zu)", dest,
+                       ir_opcode_name(instruction->op), lhs,
+                       instruction->argument_count);
+    break;
+  case IR_OP_SIMD_AFFINE_MAP_F64:
+  case IR_OP_SIMD_AFFINE_MAP_F32: {
+    char len[128];
+    char src_scale[128];
+    char dst_scale[128];
+    char bias[128];
+    ir_format_operand(instruction->argument_count > 0 ? &instruction->arguments[0]
+                                                      : NULL,
+                      len, sizeof(len));
+    ir_format_operand(instruction->argument_count > 1 ? &instruction->arguments[1]
+                                                      : NULL,
+                      src_scale, sizeof(src_scale));
+    ir_format_operand(instruction->argument_count > 2 ? &instruction->arguments[2]
+                                                      : NULL,
+                      dst_scale, sizeof(dst_scale));
+    ir_format_operand(instruction->argument_count > 3 ? &instruction->arguments[3]
+                                                      : NULL,
+                      bias, sizeof(bias));
+    written = snprintf(buffer, buffer_size,
+                       "%s = %s(src=%s, dst=%s, len=%s, a=%s, b=%s, c=%s)",
+                       dest, ir_opcode_name(instruction->op), lhs, rhs, len,
+                       src_scale, dst_scale, bias);
     break;
   }
   case IR_OP_NOP:
