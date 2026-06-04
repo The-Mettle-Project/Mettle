@@ -2149,11 +2149,8 @@ int code_generator_binary_validate_call(CodeGenerator *generator,
     return 1;
   }
 
-  if (!code_generator_binary_type_is_abi_supported(
-          generator, symbol->data.function.return_type
-                         ? symbol->data.function.return_type->name
-                         : "int64",
-          1)) {
+  if (!code_generator_binary_resolved_type_is_abi_supported(
+          symbol->data.function.return_type, 1)) {
     code_generator_set_error(
         generator,
         "Direct object backend only supports integer/pointer/string/float64 call "

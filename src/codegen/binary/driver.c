@@ -394,6 +394,18 @@ int code_generator_generate_program_binary_object(CodeGenerator *generator,
     case AST_STRUCT_DECLARATION:
     case AST_ENUM_DECLARATION:
       break;
+    case AST_FUNCTION_CALL: {
+      CallExpression *call = (CallExpression *)declaration->data;
+      if (call && call->function_name &&
+          strcmp(call->function_name, "static_assert") == 0) {
+        break;
+      }
+      code_generator_set_error(
+          generator,
+          "Direct object backend encountered unsupported top-level call '%s'",
+          (call && call->function_name) ? call->function_name : "<unknown>");
+      return 0;
+    }
     case AST_VAR_DECLARATION: {
       VarDeclaration *var_data = (VarDeclaration *)declaration->data;
       if (!var_data || !var_data->name) {
