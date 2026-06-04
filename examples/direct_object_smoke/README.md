@@ -1,7 +1,6 @@
 # Direct-Object Smoke Example
 
-This example uses the experimental `--emit-obj` backend instead of the normal
-NASM assembly path.
+This example uses the native object backend.
 
 It stays inside the currently supported direct-object subset:
 

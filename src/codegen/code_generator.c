@@ -35,7 +35,6 @@ CodeGenerator *code_generator_create(SymbolTable *symbol_table,
   generator->control_flow_stack_capacity = 0;
   generator->generate_debug_info = 0;
   generator->generate_stack_trace_support = 0;
-  generator->emit_asm_comments = 1;
   generator->eliminate_unreachable_functions = 0;
   generator->has_error = 0;
   generator->error_message = NULL;
@@ -45,7 +44,6 @@ CodeGenerator *code_generator_create(SymbolTable *symbol_table,
   generator->extern_symbol_capacity = 0;
   generator->last_runtime_location_line = 0;
   generator->last_runtime_location_column = 0;
-  generator->backend_mode = CODEGEN_BACKEND_TEXT_ASSEMBLY;
   generator->emit_seq = 0;
   generator->rax_cached_temp_offset = 0;
   generator->rax_cached_emit_seq = 0;
@@ -134,15 +132,6 @@ void code_generator_set_ir_program(CodeGenerator *generator,
   generator->ir_program = ir_program;
 }
 
-void code_generator_set_backend_mode(CodeGenerator *generator,
-                                     CodegenBackendMode mode) {
-  if (!generator) {
-    return;
-  }
-
-  generator->backend_mode = mode;
-}
-
 void code_generator_set_error(CodeGenerator *generator,
                                      const char *format, ...) {
   if (!generator || !format) {
@@ -178,13 +167,6 @@ void code_generator_set_error(CodeGenerator *generator,
   }
 
   va_end(args);
-}
-
-void code_generator_set_emit_asm_comments(CodeGenerator *generator, int enable) {
-  if (!generator) {
-    return;
-  }
-  generator->emit_asm_comments = enable ? 1 : 0;
 }
 
 void code_generator_set_stack_trace_support(CodeGenerator *generator,
@@ -286,75 +268,6 @@ void code_generator_set_profile_runtime(CodeGenerator *generator, int enable) {
     return;
   }
   generator->profile_runtime = enable ? 1 : 0;
-}
-
-static char *code_generator_strip_asm_comments(const char *text) {
-  if (!text) {
-    return NULL;
-  }
-
-  size_t length = strlen(text);
-  char *clean = malloc(length + 1);
-  if (!clean) {
-    return NULL;
-  }
-
-  size_t src = 0;
-  size_t dst = 0;
-  while (src < length) {
-    size_t line_start = src;
-    size_t line_end = src;
-    while (line_end < length && text[line_end] != '\n') {
-      line_end++;
-    }
-
-    size_t first_non_space = line_start;
-    while (first_non_space < line_end &&
-           (text[first_non_space] == ' ' || text[first_non_space] == '\t')) {
-      first_non_space++;
-    }
-
-    if (!(first_non_space < line_end && text[first_non_space] == ';')) {
-      int in_quotes = 0;
-      size_t comment_start = line_end;
-      int has_comment = 0;
-      for (size_t i = line_start; i < line_end; i++) {
-        if (text[i] == '"') {
-          in_quotes = !in_quotes;
-          continue;
-        }
-        if (!in_quotes && text[i] == ';') {
-          comment_start = i;
-          has_comment = 1;
-          break;
-        }
-      }
-
-      size_t copy_end = comment_start;
-      if (has_comment) {
-        while (copy_end > line_start &&
-               (text[copy_end - 1] == ' ' || text[copy_end - 1] == '\t')) {
-          copy_end--;
-        }
-      }
-
-      if (copy_end > line_start) {
-        size_t chunk = copy_end - line_start;
-        memcpy(clean + dst, text + line_start, chunk);
-        dst += chunk;
-      }
-    }
-
-    if (line_end < length && text[line_end] == '\n') {
-      clean[dst++] = '\n';
-      src = line_end + 1;
-    } else {
-      src = line_end;
-    }
-  }
-
-  clean[dst] = '\0';
-  return clean;
 }
 
 static int code_generator_append_text(CodeGenerator *generator, const char *text,
@@ -461,27 +374,13 @@ void code_generator_emit(CodeGenerator *generator, const char *format, ...) {
     return;
   }
 
-  const char *to_append = rendered;
-  char *cleaned = NULL;
-  if (!generator->emit_asm_comments) {
-    cleaned = code_generator_strip_asm_comments(rendered);
-    if (!cleaned) {
-      free(rendered);
-      code_generator_set_error(generator,
-                               "Out of memory while stripping assembly comments");
-      return;
-    }
-    to_append = cleaned;
-  }
-
   /* Every emitted chunk advances the sequence counter. The redundant-spill
    * peephole relies on this to detect whether anything was emitted between a
    * store_ir_destination spill and a subsequent load_ir_operand. */
   generator->emit_seq++;
 
-  code_generator_append_text(generator, to_append, strlen(to_append), 0);
+  code_generator_append_text(generator, rendered, strlen(rendered), 0);
 
-  free(cleaned);
   free(rendered);
 }
 

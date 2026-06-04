@@ -564,7 +564,7 @@ int code_generator_binary_emit_struct_destination_address(
 
 /* Load the address of an INDIRECT struct operand (arg or return) into
  * `target_register`. Mirrors `code_generator_emit_ir_indirect_arg_source_address`
- * from the text-asm path. */
+ * from the old text-emission path. */
 int code_generator_binary_emit_indirect_source_address(
     CodeGenerator *generator, BinaryFunctionContext *context,
     const IROperand *operand, BinaryGpRegister target_register) {

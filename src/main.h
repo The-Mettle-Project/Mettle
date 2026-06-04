@@ -26,7 +26,6 @@ typedef struct {
   int dump_ir;
   int optimize;
   int release;
-  int strip_asm_comments;
   int emit_object;
   int generate_debug_symbols;
   int generate_line_mapping;

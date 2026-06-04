@@ -182,7 +182,7 @@ typedef struct {
   size_t indirect_return_slot_cursor;
   /* Side-table: which IR temps currently hold a POINTER to an indirect-
    * returned struct, with the byte size of that struct. Same role as
-   * ir_indirect_temp_table in the text-asm path. Names are interned IR
+   * the old text-emission path. Names are interned IR
    * strings (borrowed). */
   char **indirect_temp_names;
   size_t *indirect_temp_sizes;

@@ -118,7 +118,7 @@ On Windows, both `/` and `\` are accepted. Use `/` for portability across platfo
 **Example:**
 
 ```bash
-mettle -I tests/lib -I vendor main.mettle -o output.s
+mettle -I tests/lib -I vendor main.mettle -o output.obj
 ```
 
 This allows `import "shared_math"` to resolve to `tests/lib/shared_math.mettle` when `tests/lib` is on the search path.

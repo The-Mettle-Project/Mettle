@@ -150,7 +150,7 @@ v.magnitude();
 
 ## Inline Assembly
 
-The `asm` block embeds raw assembly. The contents use NASM syntax. Use with care; the compiler does not validate or optimize inline assembly.
+The `asm` block syntax is reserved, but native object code generation does not currently support inline assembly.
 
 ```mettle
 function get_rax() -> int64 {

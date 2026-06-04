@@ -79,7 +79,7 @@ function main() -> int32 {
 Compile with `-I lib` so the compiler can find `lib/math.mettle`:
 
 ```bash
-mettle -i main.mettle -I lib -o output.s
+mettle -i main.mettle -I lib -o output.obj
 ```
 
 If the module cannot be resolved, compilation fails with an error such as:

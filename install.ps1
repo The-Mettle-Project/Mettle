@@ -149,8 +149,8 @@ try {
     Ok 'Found gcc'
   } else {
     Warn 'gcc was not found on PATH.'
-    Write-Host '  Mettle uses the internal PE linker by default, but gcc is needed for'
-    Write-Host '  the --emit-asm path and as a linker fallback. Install one of:'
+    Write-Host '  Mettle uses the internal PE linker by default, but gcc is useful as'
+    Write-Host '  an external linker fallback. Install one of:'
     if (Get-Command winget -ErrorAction SilentlyContinue) {
       Write-Host '    winget install -e --id BrechtSanders.WinLibs.POSIX.UCRT' -ForegroundColor White
     }

@@ -147,9 +147,9 @@ POSIX socket bindings for Linux and macOS. Does not work on Windows. Socket func
 Link command:
 ```bash
 # Linux
-gcc -o myapp output.s stdlib/posix_helpers.c -lpthread
+gcc -o myapp output.o stdlib/posix_helpers.c -lpthread
 # macOS  
-gcc -o myapp output.s stdlib/posix_helpers.c
+gcc -o myapp output.o stdlib/posix_helpers.c
 ```
 
 Constants include address/socket/protocol values (`AF_INET_POSIX`, `SOCK_STREAM_POSIX`, `IPPROTO_TCP_POSIX`) and socket options (`SOL_SOCKET_POSIX`, `SO_REUSEADDR_POSIX`). Note: macOS uses different values for `SOL_SOCKET` (0xFFFF) and `SO_REUSEADDR` (4) than Linux (1 and 2).

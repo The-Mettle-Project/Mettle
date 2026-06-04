@@ -14,11 +14,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef enum {
-  CODEGEN_BACKEND_TEXT_ASSEMBLY = 0,
-  CODEGEN_BACKEND_BINARY_OBJECT,
-} CodegenBackendMode;
-
 typedef struct {
   SymbolTable *symbol_table;
   TypeChecker *type_checker;
@@ -42,7 +37,6 @@ typedef struct {
   size_t control_flow_stack_capacity;
   int generate_debug_info;
   int generate_stack_trace_support;
-  int emit_asm_comments;
   int eliminate_unreachable_functions;
   int has_error;
   char *error_message;
@@ -52,7 +46,6 @@ typedef struct {
   size_t extern_symbol_capacity;
   size_t last_runtime_location_line;
   size_t last_runtime_location_column;
-  CodegenBackendMode backend_mode;
   BinaryEmitter *binary_emitter;
   /* Redundant-spill peephole for the IR backend. When
    * store_ir_destination spills rax into an IR temp's stack slot, it records
@@ -117,8 +110,6 @@ CodeGenerator *code_generator_create_with_debug(SymbolTable *symbol_table,
 void code_generator_destroy(CodeGenerator *generator);
 void code_generator_set_ir_program(CodeGenerator *generator,
                                    IRProgram *ir_program);
-void code_generator_set_backend_mode(CodeGenerator *generator,
-                                     CodegenBackendMode mode);
 int code_generator_generate_program(CodeGenerator *generator, ASTNode *program);
 void code_generator_generate_function(CodeGenerator *generator,
                                       ASTNode *function);
@@ -126,7 +117,6 @@ void code_generator_generate_statement(CodeGenerator *generator,
                                        ASTNode *statement);
 void code_generator_generate_expression(CodeGenerator *generator,
                                         ASTNode *expression);
-void code_generator_set_emit_asm_comments(CodeGenerator *generator, int enable);
 void code_generator_set_stack_trace_support(CodeGenerator *generator,
                                             int enable);
 void code_generator_set_debug_sidecar_emission(CodeGenerator *generator,

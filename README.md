@@ -101,7 +101,7 @@ Typical release build:
 ./bin/mettle --build --release hello.mettle -o hello
 ```
 
-Useful flags: `--build` (executable), `--release` / `-O` (optimized), `--emit-asm` (legacy NASM path on Windows), `-d` / `-s` / `-g` (debug and stack traces), `--profile-runtime`, `--tracy`, `--native-heap` (route `new`/`malloc`/`calloc`/`realloc`/`free` through Mettle's own allocator in `std/alloc` instead of the OS heap manager). Full list: `mettle --help` and `mettle help build`.
+Useful flags: `--build` (executable), `--release` / `-O` (optimized), `--emit-obj` (native object, the default), `-d` / `-s` / `-g` (debug and stack traces), `--profile-runtime`, `--tracy`, `--native-heap` (route `new`/`malloc`/`calloc`/`realloc`/`free` through Mettle's own allocator in `std/alloc` instead of the OS heap manager). Full list: `mettle --help` and `mettle help build`.
 
 ## Documentation
 

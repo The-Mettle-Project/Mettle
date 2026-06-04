@@ -1600,32 +1600,14 @@ catch {
   Write-CaseResult -Name "mettle_deps_package_resolution" -Passed $false -Reason $_.Exception.Message
 }
 
-# Function pointer test: compile, assemble, link, and run
+# Function pointer test: build and run
 $total++
 try {
-  $fpAsm = Join-Path $tmpDir "test_function_pointer.s"
-  $fpObj = Join-Path $tmpDir "test_function_pointer.o"
-  $fpCrash = Join-Path $tmpDir "test_function_pointer_crash.o"
   $fpExe = Join-Path $tmpDir "test_function_pointer.exe"
 
-  $fpOut = & $CompilerPath tests\test_function_pointer.mettle -o $fpAsm 2>&1 | Out-String
+  $fpOut = & $CompilerPath --build tests\test_function_pointer.mettle -o $fpExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
-    throw "Function pointer compile failed: $fpOut"
-  }
-
-  & nasm -f win64 $fpAsm -o $fpObj 2>&1 | Out-Null
-  if ($LASTEXITCODE -ne 0) {
-    throw "Function pointer NASM assembly failed"
-  }
-
-  & gcc -c src\runtime\crash_handler.c -o $fpCrash -Isrc 2>&1 | Out-Null
-  if ($LASTEXITCODE -ne 0) {
-    throw "Function pointer crash_handler.c compile failed"
-  }
-
-  & gcc -nostartfiles $fpObj $fpCrash -o $fpExe -lkernel32 2>&1 | Out-Null
-  if ($LASTEXITCODE -ne 0) {
-    throw "Function pointer link failed (use -nostartfiles like web server)"
+    throw "Function pointer build failed: $fpOut"
   }
 
   $fpResult = & $fpExe 2>&1
@@ -2113,7 +2095,7 @@ try {
   $asmExePath = Join-Path $tmpDir "internal_link_float_negative_comparison.exe"
   $objExePath = Join-Path $tmpDir "internal_link_emit_obj_float_negative_comparison.exe"
 
-  $buildOut = & $CompilerPath --build --emit-asm --linker internal tests\test_float_negative_comparison.mettle -o $asmExePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --linker internal tests\test_float_negative_comparison.mettle -o $asmExePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Internal linker float-negative asm build failed: $buildOut"
   }
@@ -2151,7 +2133,7 @@ catch {
 $total++
 try {
   $exePath = Join-Path $tmpDir "internal_link_abi_float_return.exe"
-  $buildOut = & $CompilerPath --build --emit-asm --linker internal tests\test_abi_float_return.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --linker internal tests\test_abi_float_return.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Internal linker ABI float-return build failed: $buildOut"
   }
@@ -2195,7 +2177,7 @@ foreach ($mode in @("asm", "emitobj")) {
   try {
     $exePath = Join-Path $tmpDir "$caseName.exe"
     if ($mode -eq "asm") {
-      $buildOut = & $CompilerPath --build --emit-asm --linker internal tests\test_struct_copy.mettle -o $exePath 2>&1 | Out-String
+      $buildOut = & $CompilerPath --build --linker internal tests\test_struct_copy.mettle -o $exePath 2>&1 | Out-String
     }
     else {
       $buildOut = & $CompilerPath --build --linker internal tests\test_struct_copy.mettle -o $exePath 2>&1 | Out-String
@@ -2243,7 +2225,7 @@ foreach ($mode in @("asm", "emitobj")) {
   try {
     $exePath = Join-Path $tmpDir "$caseName.exe"
     if ($mode -eq "asm") {
-      $buildOut = & $CompilerPath --build --emit-asm --linker internal tests\test_struct_pass_by_value.mettle -o $exePath 2>&1 | Out-String
+      $buildOut = & $CompilerPath --build --linker internal tests\test_struct_pass_by_value.mettle -o $exePath 2>&1 | Out-String
     }
     else {
       $buildOut = & $CompilerPath --build --linker internal tests\test_struct_pass_by_value.mettle -o $exePath 2>&1 | Out-String
@@ -2273,7 +2255,7 @@ foreach ($mode in @("asm", "emitobj")) {
 
 # Indirect-return ABI: a struct larger than 8 bytes returned by value must
 # arrive at the caller with every field intact. Validates the hidden
-# out-pointer convention for IR-path text-asm builds.
+# out-pointer convention for binary object builds.
 $structReturnByValueExpected = @(
   "struct return by value",
   "three_a 11",
@@ -2294,7 +2276,7 @@ foreach ($mode in @("asm", "emitobj")) {
   try {
     $exePath = Join-Path $tmpDir "$caseName.exe"
     if ($mode -eq "asm") {
-      $buildOut = & $CompilerPath --build --emit-asm --linker internal tests\test_struct_return_by_value.mettle -o $exePath 2>&1 | Out-String
+      $buildOut = & $CompilerPath --build --linker internal tests\test_struct_return_by_value.mettle -o $exePath 2>&1 | Out-String
     }
     else {
       $buildOut = & $CompilerPath --build --linker internal tests\test_struct_return_by_value.mettle -o $exePath 2>&1 | Out-String
@@ -2340,7 +2322,7 @@ foreach ($mode in @("asm", "emitobj")) {
   try {
     $exePath = Join-Path $tmpDir "$caseName.exe"
     if ($mode -eq "asm") {
-      $buildOut = & $CompilerPath --build --emit-asm --linker internal tests\test_struct_abi_matrix.mettle -o $exePath 2>&1 | Out-String
+      $buildOut = & $CompilerPath --build --linker internal tests\test_struct_abi_matrix.mettle -o $exePath 2>&1 | Out-String
     }
     else {
       $buildOut = & $CompilerPath --build --linker internal tests\test_struct_abi_matrix.mettle -o $exePath 2>&1 | Out-String
@@ -2396,7 +2378,7 @@ foreach ($mode in @("asm", "emitobj")) {
 
     $exePath = Join-Path $tmpDir "$caseName.exe"
     if ($mode -eq "asm") {
-      $buildOut = & $CompilerPath --build --emit-asm --linker internal tests\test_struct_abi_extern_c.mettle -o $exePath --link-arg $cObjPath 2>&1 | Out-String
+      $buildOut = & $CompilerPath --build --linker internal tests\test_struct_abi_extern_c.mettle -o $exePath --link-arg $cObjPath 2>&1 | Out-String
     }
     else {
       $buildOut = & $CompilerPath --build --linker internal tests\test_struct_abi_extern_c.mettle -o $exePath --link-arg $cObjPath 2>&1 | Out-String
@@ -2434,7 +2416,7 @@ foreach ($mode in @("asm", "emitobj")) {
   try {
     $exePath = Join-Path $tmpDir "$caseName.exe"
     if ($mode -eq "asm") {
-      $buildOut = & $CompilerPath --build --emit-asm --linker internal tests\test_struct_float.mettle -o $exePath 2>&1 | Out-String
+      $buildOut = & $CompilerPath --build --linker internal tests\test_struct_float.mettle -o $exePath 2>&1 | Out-String
     }
     else {
       $buildOut = & $CompilerPath --build --linker internal tests\test_struct_float.mettle -o $exePath 2>&1 | Out-String
@@ -2619,31 +2601,16 @@ catch {
   Write-CaseResult -Name "internal_link_thread_atomics" -Passed $false -Reason $_.Exception.Message
 }
 
-# Auto linker PATH isolation test: auto mode should succeed with only NASM on PATH
+# Auto linker PATH isolation test: auto mode should succeed without external linkers on PATH
 $total++
 try {
   $exePath = Join-Path $tmpDir "auto_link_internal_only.exe"
-  $wrapperDir = Join-Path $tmpDir "phase6_auto_path_bin"
-  $wrapperPath = Join-Path $wrapperDir "nasm.cmd"
   $compilerFullPath = (Resolve-Path $CompilerPath).Path
   $system32Dir = Join-Path $env:SystemRoot "System32"
-  $gccBinDir = Split-Path -Parent ((Get-Command gcc -CommandType Application -ErrorAction Stop).Source)
-  $nasmCommand = Get-Command nasm -CommandType Application -ErrorAction Stop
-
-  if (-not (Test-Path $wrapperDir)) {
-    New-Item -Path $wrapperDir -ItemType Directory | Out-Null
-  }
-
-  Get-ChildItem -Path $gccBinDir -Filter *.dll | Copy-Item -Destination $wrapperDir -Force
-
-  @(
-    "@echo off"
-    "`"$($nasmCommand.Source)`" %*"
-  ) | Set-Content -Path $wrapperPath -Encoding ASCII
 
   $originalPath = $env:PATH
   try {
-    $env:PATH = "$wrapperDir;$system32Dir"
+    $env:PATH = $system32Dir
     $buildOut = & $compilerFullPath --build --emit-obj tests\test_direct_object_return_const.mettle -o $exePath 2>&1 | Out-String
   }
   finally {
@@ -3595,32 +3562,19 @@ catch {
   Write-CaseResult -Name "runtime_access_violation_trace_coff" -Passed $false -Reason $_.Exception.Message
 }
 
-# main(argc, argv) test: emitted startup calls CRT __getmainargs directly.
+# main(argc, argv) test: startup calls CRT __getmainargs directly.
 $total++
 try {
-  $avAsm = Join-Path $tmpDir "test_main_argc_argv.s"
-  $avObj = Join-Path $tmpDir "test_main_argc_argv.o"
   $avExe = Join-Path $tmpDir "test_main_argc_argv.exe"
 
-  $avOut = & $CompilerPath tests\test_main_argc_argv.mettle -o $avAsm 2>&1 | Out-String
+  $avOut = & $CompilerPath --build tests\test_main_argc_argv.mettle -o $avExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
-    throw "main(argc,argv) compile failed: $avOut"
+    throw "main(argc,argv) build failed: $avOut"
   }
 
-  & nasm -f win64 $avAsm -o $avObj 2>&1 | Out-Null
-  if ($LASTEXITCODE -ne 0) {
-    throw "main(argc,argv) NASM assembly failed"
-  }
-
-  $avAsmText = Get-Content -Raw $avAsm
-  if ($avAsmText -notmatch "\bextern __getmainargs\b" -or
-      $avAsmText -match "\bmettle_entry_get_args\b") {
-    throw "main(argc,argv) assembly did not use direct __getmainargs startup"
-  }
-
-  & gcc -nostartfiles $avObj -o $avExe -lkernel32 2>&1 | Out-Null
-  if ($LASTEXITCODE -ne 0) {
-    throw "main(argc,argv) link failed"
+  $avImports = & objdump -p $avExe 2>&1 | Out-String
+  if ($avImports -notmatch "__getmainargs") {
+    throw "main(argc,argv) executable missing __getmainargs import"
   }
 
   $avResult = & $avExe 2>&1
@@ -3664,29 +3618,11 @@ catch {
 
 $total++
 try {
-  $nullAsm = Join-Path $tmpDir "test_runtime_null_trace.s"
-  $nullObj = Join-Path $tmpDir "test_runtime_null_trace.o"
-  $nullCrash = Join-Path $tmpDir "test_runtime_null_trace_crash.o"
   $nullExe = Join-Path $tmpDir "test_runtime_null_trace.exe"
 
-  $nullOut = & $CompilerPath -s tests\test_runtime_null_deref_check.mettle -o $nullAsm 2>&1 | Out-String
+  $nullOut = & $CompilerPath --build -s tests\test_runtime_null_deref_check.mettle -o $nullExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
-    throw "Runtime null trace compile failed: $nullOut"
-  }
-
-  & nasm -f win64 $nullAsm -o $nullObj 2>&1 | Out-Null
-  if ($LASTEXITCODE -ne 0) {
-    throw "Runtime null trace NASM assembly failed"
-  }
-
-  & gcc -c src\runtime\crash_handler.c -o $nullCrash -Isrc 2>&1 | Out-Null
-  if ($LASTEXITCODE -ne 0) {
-    throw "Runtime null trace crash_handler.c compile failed"
-  }
-
-  & gcc -nostartfiles $nullObj $nullCrash -o $nullExe -lkernel32 2>&1 | Out-Null
-  if ($LASTEXITCODE -ne 0) {
-    throw "Runtime null trace link failed"
+    throw "Runtime null trace build failed: $nullOut"
   }
 
   $nullRuntime = & $nullExe 2>&1 | Out-String
@@ -3712,29 +3648,11 @@ catch {
 
 $total++
 try {
-  $avAsm = Join-Path $tmpDir "test_runtime_av_trace.s"
-  $avObj2 = Join-Path $tmpDir "test_runtime_av_trace.o"
-  $avCrash2 = Join-Path $tmpDir "test_runtime_av_trace_crash.o"
   $avExe2 = Join-Path $tmpDir "test_runtime_av_trace.exe"
 
-  $avTraceOut = & $CompilerPath -s tests\test_runtime_access_violation_trace.mettle -o $avAsm 2>&1 | Out-String
+  $avTraceOut = & $CompilerPath --build -s tests\test_runtime_access_violation_trace.mettle -o $avExe2 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
-    throw "Runtime access-violation trace compile failed: $avTraceOut"
-  }
-
-  & nasm -f win64 $avAsm -o $avObj2 2>&1 | Out-Null
-  if ($LASTEXITCODE -ne 0) {
-    throw "Runtime access-violation trace NASM assembly failed"
-  }
-
-  & gcc -c src\runtime\crash_handler.c -o $avCrash2 -Isrc 2>&1 | Out-Null
-  if ($LASTEXITCODE -ne 0) {
-    throw "Runtime access-violation trace crash_handler.c compile failed"
-  }
-
-  & gcc -nostartfiles $avObj2 $avCrash2 -o $avExe2 -lkernel32 2>&1 | Out-Null
-  if ($LASTEXITCODE -ne 0) {
-    throw "Runtime access-violation trace link failed"
+    throw "Runtime access-violation trace build failed: $avTraceOut"
   }
 
   $avRuntime = & $avExe2 2>&1 | Out-String

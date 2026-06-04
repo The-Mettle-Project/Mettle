@@ -10,7 +10,7 @@ mettle help [topic]
 mettle docs [topic]
 ```
 
-The input file is the main source file. Imports are resolved relative to it. By default the compiler produces assembly (`output.s`). `--build` produces a native executable directly: on Windows it emits a COFF object and links with the built-in PE linker; on Linux it emits an ELF object with the compiler's own `_start` and links it with `ld` into a statically linked binary (no libc, CRT, or assembler). On Windows, `--emit-asm` selects the legacy NASM assembly path instead.
+The input file is the main source file. Imports are resolved relative to it. By default the compiler produces a native object (`output.obj` on Windows, `output.o` on Linux). `--build` produces a native executable directly: on Windows it emits a COFF object and links with the built-in PE linker; on Linux it emits an ELF object and links it with the platform C toolchain.
 
 `std/...` imports use the stdlib bundled with the compiler by default. You do not need to copy `stdlib/` into every project directory. Use `--stdlib <dir>` only when you want to override the bundled stdlib.
 
@@ -27,7 +27,7 @@ Available topics: `build`, `runtime` (aliases `heap`, `gc`), `interop`, `stdlib`
 
 ## Options
 
-`-o <file>` output assembly/object file (default `output.s`, or executable path when used with `--build`). `-i <file>` input file (alternative to positional argument). `-I <dir>` add import search directory (repeatable). `--stdlib <dir>` set stdlib root (default auto-detects bundled stdlib near the compiler binary, then falls back to `./stdlib`). `--build` build a native executable: Windows uses a COFF object + the internal PE linker by default; Linux emits an ELF object and links it with `gcc -no-pie`. `--static` adds static Linux linking, and `--musl` uses `musl-gcc -static`. `--emit-obj` emit a native object (COFF on Windows, ELF on Linux; default with `--build`). `--emit-asm` with `--build`, emit assembly and use NASM instead of native COFF. `--linker <internal|auto|gcc|msvc>` choose the Windows linker path (**default: `internal`**). `--link-arg <arg>` pass an extra linker argument in `--build` mode for additional DLLs/import libraries. `--tracy` link `std/tracy` with the Tracy profiler (requires `--build`; set `TRACY_DIR` or `--tracy-dir`). `--tracy-dir <dir>` Tracy repo root for `--tracy`. `--prelude` auto-import `std/prelude` (std/io, std/math, std/conv, std/mem, std/process, std/net). `-d`/`--debug` debug mode and embedded runtime crash traceback support. `-g`/`--debug-symbols` generate debug symbols. `-l`/`--line-mapping` source line mapping. `-s`/`--stack-trace` embeds runtime crash traceback support without the rest of debug mode. `-O`/`--optimize` enable optimizations. `-r`/`--release` enables `-O`, strips assembly comments, removes unreachable functions, and disables generated runtime null/bounds checks in IR lowering. `--profile-runtime` emit function-level runtime timing hooks and print a sorted report at process exit (Windows/Linux, `--emit-obj` / `--build` only). `--strip-comments` omit emitted assembly comments. `-h`/`--help` print usage. See [Imports](imports.md) for path resolution and `-I`/`--stdlib` details.
+`-o <file>` output object file (default `output.obj` / `output.o`, or executable path when used with `--build`). `-i <file>` input file (alternative to positional argument). `-I <dir>` add import search directory (repeatable). `--stdlib <dir>` set stdlib root (default auto-detects bundled stdlib near the compiler binary, then falls back to `./stdlib`). `--build` build a native executable: Windows uses a COFF object + the internal PE linker by default; Linux emits an ELF object and links it with `gcc -no-pie`. `--static` adds static Linux linking, and `--musl` uses `musl-gcc -static`. `--emit-obj` emit a native object (the default). `--linker <internal|auto|gcc|msvc>` choose the Windows linker path (**default: `internal`**). `--link-arg <arg>` pass an extra linker argument in `--build` mode for additional DLLs/import libraries. `--tracy` link `std/tracy` with the Tracy profiler (requires `--build`; set `TRACY_DIR` or `--tracy-dir`). `--tracy-dir <dir>` Tracy repo root for `--tracy`. `--prelude` auto-import `std/prelude` (std/io, std/math, std/conv, std/mem, std/process, std/net). `-d`/`--debug` debug mode and embedded runtime crash traceback support. `-g`/`--debug-symbols` generate debug symbols. `-l`/`--line-mapping` source line mapping. `-s`/`--stack-trace` embeds runtime crash traceback support without the rest of debug mode. `-O`/`--optimize` enable optimizations. `-r`/`--release` enables `-O`, removes unreachable functions, and disables generated runtime null/bounds checks in IR lowering. `--profile-runtime` emit function-level runtime timing hooks and print a sorted report at process exit. `-h`/`--help` print usage. See [Imports](imports.md) for path resolution and `-I`/`--stdlib` details.
 
 ## Compilation Pipeline
 
@@ -40,7 +40,7 @@ The compiler runs these phases in order:
 5. **Type checking** - semantic analysis and symbol resolution
 6. **IR lowering** - convert AST to intermediate representation
 7. **Optimization** (optional, `-O`) - copy/constant propagation, integer folding/simplification, branch cleanup, unreachable IR cleanup, and control-flow/codegen branch peepholes
-8. **Code generation** - emit x86-64 assembly, or with `--emit-obj` a native object (COFF on Windows, ELF on Linux)
+8. **Code generation** - emit a native object (COFF on Windows, ELF on Linux)
 
 `--release` uses the same optimization pipeline as `-O` and additionally lowers without runtime null/bounds trap checks. Use `-O` for optimized builds that still keep those generated checks.
 
@@ -60,10 +60,9 @@ The AST and symbol/type metadata intern name-bearing strings (identifier names, 
 
 1. Default end-to-end build: `mettle --build main.mettle -o main.exe`
 2. Optional extra libraries: `mettle --build main.mettle -o main.exe --link-arg -lcustomdll`
-3. Legacy assembly path: `mettle --build --emit-asm main.mettle -o main.exe`
-4. External linker fallback: `mettle --build --linker auto main.mettle -o main.exe`
+3. External linker fallback: `mettle --build --linker auto main.mettle -o main.exe`
 
-`--build` keeps compilation inside Mettle's COFF object emitter, bundled runtime objects, and internal PE linker. That path does not require `NASM`, `gcc`, or `link.exe` for the target executable. The internal linker probes common Win32 DLLs directly (`kernel32`, `user32`, `gdi32`, `advapi32`, `ws2_32`, `ucrtbase`, and `msvcrt`), so `std/win32`, `std/thread`, and `std/net` work without hand-written C bridge objects or default import-library flags. `--linker auto` tries the internal linker first and falls back to external linkers if needed. `--emit-asm` selects the NASM assembly path instead. Four optional helper objects ship with the Mettle installation: `crash_handler.o` (linked only for `-d`/`-s`/`-g` or IR null/bounds traps), `atomics.o` (linked only when `std/thread` interlocked atomics are referenced), `profile.o` (linked when `--profile-runtime` is used), and `tracy_helpers.o` (no-op stub when `std/tracy` is referenced without `--tracy`). `--build` pulls them in automatically when needed.
+`--build` keeps compilation inside Mettle's COFF object emitter, bundled runtime objects, and internal PE linker. That path does not require `NASM`, `gcc`, or `link.exe` for the target executable. The internal linker probes common Win32 DLLs directly (`kernel32`, `user32`, `gdi32`, `advapi32`, `ws2_32`, `ucrtbase`, and `msvcrt`), so `std/win32`, `std/thread`, and `std/net` work without hand-written C bridge objects or default import-library flags. `--linker auto` tries the internal linker first and falls back to external linkers if needed. Four optional helper objects ship with the Mettle installation: `crash_handler.o` (linked only for `-d`/`-s`/`-g` or IR null/bounds traps), `atomics.o` (linked only when `std/thread` interlocked atomics are referenced), `profile.o` (linked when `--profile-runtime` is used), and `tracy_helpers.o` (no-op stub when `std/tracy` is referenced without `--tracy`). `--build` pulls them in automatically when needed.
 
 ### Linux Flow
 
@@ -157,11 +156,10 @@ Please rerun with:
 
 `--debug-compiler` enables fine-grained last-action tracking and writes an IR snapshot (`<input>.ice.ir`) when an ICE occurs.
 
-### Manual Assembly/Link Flow
+### Manual Object Link Flow
 
-1. Compile: `mettle main.mettle -o main.s`
-2. Assemble: `nasm -f win64 main.s -o main.o` (or `-f elf64` on Linux)
-3. Link: `gcc -nostartfiles main.o -o main -lkernel32` (plus libraries such as `-lws2_32` for networking). Use `-nostartfiles` so Mettle's entry point (`mainCRTStartup`) is used instead of the C runtime's.
+1. Compile: `mettle main.mettle -o main.obj` (or `main.o` on Linux)
+2. Link: `gcc -nostartfiles main.obj -o main.exe -lkernel32` on Windows, or use the platform linker on Linux. Use `-nostartfiles` on Windows when linking compiler-emitted startup yourself.
 
 The emitted entry point does not call any Mettle runtime initialization. Programs that do not use `-d`/`-s` crash tracebacks or `std/thread` interlocked atomics link **zero** Mettle runtime objects, even when they use `new` or string concatenation.
 
@@ -182,9 +180,7 @@ Omit either object when the corresponding symbols are not referenced.
 
 For concurrency, import `std/thread` (Windows) or `std/thread_posix` and call `CreateThread`/`pthread_create` directly — Mettle no longer has built-in `async`/`spawn`/`Channel<T>` keywords.
 
-**Programs with `main(argc, argv)`:** If your entry point has the signature `function main(argc: int32, argv: cstring*) -> int32`, Windows startup (both the emitted assembly entry stub and the internal `--build` `.startup.obj`) calls CRT `__getmainargs` before `main`. No Mettle argv shim is required.
-
-The output format depends on the target. Use `-f win64` for Windows, `-f elf64` for Linux. NASM is required for assembly; install from [https://www.nasm.us/](https://www.nasm.us/) if needed. On Linux and macOS, use `make` to build the compiler and run tests. The web server example in `web/` is Windows-only (Winsock). See [Standard Library](standard-library.md#platform-support) for Linux support details.
+**Programs with `main(argc, argv)`:** If your entry point has the signature `function main(argc: int32, argv: cstring*) -> int32`, Windows startup calls CRT `__getmainargs` before `main`. No Mettle argv shim is required.
 
 ## Compiler Diagnostics
 
@@ -238,8 +234,6 @@ Fatal error: Null pointer dereference
 Stack trace:
   #0 main at tests\test_runtime_null_deref_check.mettle:9:10 (0x000000014000106A)
 ```
-
-The assembly path (`--emit-asm` or default `-o` without `--build`) wires the same tables and startup hooks through NASM `_start` / `mainCRTStartup` text emission instead.
 
 - `-s` enables embedded runtime crash tracebacks without the rest of debug mode.
 - `-d` enables debug output and also implies embedded runtime crash tracebacks.
@@ -309,23 +303,22 @@ parameter types. `-d`/`--debug` also enables `--dump-ir=before,after` plus debug
 symbol generation.
 
 ```powershell
-mettle --dump-ir -O app.mettle -o app.s
-mettle --dump-ir-passes -O app.mettle -o app.s
-mettle --dump-ast app.mettle -o app.s
-mettle --dump-mono tests/test_generics_multiple_instantiations.mettle -o out.s
+mettle --dump-ir -O app.mettle -o app.obj
+mettle --dump-ir-passes -O app.mettle -o app.obj
+mettle --dump-ast app.mettle -o app.obj
+mettle --dump-mono tests/test_generics_multiple_instantiations.mettle -o out.obj
 mettle help debug
 ```
 
 Helper scripts live under `tools/debug/` (`dump-compiler-artifacts.ps1`,
 `diff-ir.ps1`, `disasm-obj.ps1`).
 
-With `--emit-obj` or `--build`, `-g` embeds binary DWARF 4
+With object emission or `--build`, `-g` embeds binary DWARF 4
 sections (`.debug_info`, `.debug_abbrev`, `.debug_line`, `.debug_str`,
 `.debug_frame`) in native objects (ELF on Linux; COFF/PE on Windows as supported by the active linker path) for GDB/LLDB. Locals and
 parameters kept in GP registers by the optimizer (for example `r12`–`r15`) are
 described with `DW_OP_regN` location expressions; stack-homed symbols use
-`DW_OP_fbreg`. The assembly path still writes a human-readable `.dwarf` sidecar
-when `-g` is used without `--emit-obj`. Runtime stack-trace tables (`-s`) are embedded in COFF objects on the default `--build` / `--emit-obj` path (`.rdata` symbols `mettle_debug_functions`, `mettle_debug_locations`, plus `mettle_crash_startup`). They are separate from `-g` DWARF sidecar/embedded debug sections: `-s` alone enables tracebacks without emitting `.debug_*`.
+`DW_OP_fbreg`. Runtime stack-trace tables (`-s`) are embedded in COFF objects on the default object / `--build` path (`.rdata` symbols `mettle_debug_functions`, `mettle_debug_locations`, plus `mettle_crash_startup`). They are separate from `-g` DWARF sections: `-s` alone enables tracebacks without emitting `.debug_*`.
 
 ## Testing
 
