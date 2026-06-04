@@ -1360,6 +1360,29 @@ static void mir_compute_address_folds(const IRFunction *f, char *skip,
       skip[si] = 1; /* the index scale */
       break;
     }
+
+    /* Scale-1 fallback: a plain `base + index` with no explicit scaling, i.e.
+     * the unit-stride access `a[i]` on a byte/char/pointer-sized-by-1 buffer
+     * (and any loop walking an int8/uint8 array). Both operands must be
+     * register-resident values (TEMP or SYMBOL); fold them straight into
+     * [op0 + op1*1]. base/index are symmetric at scale 1, so either ordering
+     * encodes identically. Unlike the scaled path this consumes no separate
+     * producer and leaves both operands live (the index is typically the loop
+     * induction variable, still needed by the increment), so only the add
+     * itself is dropped. */
+    if (!folds[i].valid) {
+      const IROperand *o0 = &padd->lhs;
+      const IROperand *o1 = &padd->rhs;
+      int o0_reg = (o0->kind == IR_OPERAND_TEMP || o0->kind == IR_OPERAND_SYMBOL);
+      int o1_reg = (o1->kind == IR_OPERAND_TEMP || o1->kind == IR_OPERAND_SYMBOL);
+      if (o0_reg && o1_reg) {
+        folds[i].valid = 1;
+        folds[i].base = *o0;
+        folds[i].index = *o1;
+        folds[i].scale = 1;
+        skip[ai] = 1; /* fold the base+index add into the memory operand */
+      }
+    }
   }
 }
 

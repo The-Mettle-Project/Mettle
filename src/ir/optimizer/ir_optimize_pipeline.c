@@ -54,7 +54,6 @@ static const IROptNamedPass g_ir_pre_inline_passes[] = {
     {"prefix_sum_i32", ir_prefix_sum_i32_pass},
     {"induction_pointer", ir_pointer_induction_pass},
     {"simd_dot_i32", ir_simd_dot_i32_pass},
-    {"memcmp_byte_loop", ir_memcmp_byte_loop_pass},
     {"simd_insertion_sort_i32", ir_simd_insertion_sort_i32_pass},
     {"simd_minmax_i32", ir_simd_minmax_i32_pass},
     {"lower_bound_i32", ir_lower_bound_i32_pass},
@@ -74,7 +73,6 @@ static const IROptNamedPass g_ir_post_fixpoint_passes[] = {
     {"simd_memory_map", ir_simd_memory_map_pass},
     {"lower_bound_i32", ir_lower_bound_i32_pass},
     {"detect_shift_loops", ir_detect_shift_loops_pass},
-    {"memcmp_byte_loop", ir_memcmp_byte_loop_pass},
     {"eliminate_congruent_ivs", ir_eliminate_congruent_ivs_pass},
 };
 

@@ -120,11 +120,32 @@ export function mem_equal(a: cstring, b: cstring, n: int64) -> int32 {
 // Lexicographic byte comparison of the first `n` bytes, like C memcmp:
 // negative if a < b, 0 if equal, positive if a > b. Bytes are compared as
 // unsigned values.
+//
+// Scans 8 bytes at a time: an int64 load + compare clears whole equal words in
+// one step, and only the word that first differs is re-scanned byte-by-byte to
+// locate the differing position. On little-endian x86-64 the lowest-address
+// byte is the low-order byte of the word, so the byte rescan walks memory order
+// and reports the same first-difference C memcmp would.
 export function mem_compare(a: cstring, b: cstring, n: int64) -> int32 {
   if (n <= (int64)0 || a == b) { return 0; }
   var pa: int64 = (int64)a;
   var pb: int64 = (int64)b;
   var i: int64 = (int64)0;
+  var words: int64 = n & ~(int64)7;
+  while (i < words) {
+    if (*((int64*)(pa + i)) != *((int64*)(pb + i))) {
+      var end: int64 = i + (int64)8;
+      while (i < end) {
+        var wa: int32 = (int32)(*((int8*)(pa + i))) & 0xFF;
+        var wb: int32 = (int32)(*((int8*)(pb + i))) & 0xFF;
+        if (wa != wb) {
+          return wa - wb;
+        }
+        i = i + (int64)1;
+      }
+    }
+    i = i + (int64)8;
+  }
   while (i < n) {
     var ca: int32 = (int32)(*((int8*)(pa + i))) & 0xFF;
     var cb: int32 = (int32)(*((int8*)(pb + i))) & 0xFF;
