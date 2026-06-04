@@ -107,6 +107,10 @@ typedef enum {
   /* data movement */
   MIR_MOV,        /* dst <- a (reg/imm/mem load/mem store depending on kinds) */
   MIR_LEA,        /* dst(reg) <- address of a(mem) */
+  MIR_LEA_CSTR,   /* dst(reg) <- address of the string literal a.sym (RIP-relative
+                     lea into a .rdata cstring). Carries no vreg source, so the
+                     allocator ignores it. Used to pass a string-literal call
+                     argument. */
   MIR_MOVZX,      /* dst <- zero-extend a (width from a.mem/src width to dst) */
   MIR_MOVSX,      /* dst <- sign-extend a */
   MIR_LOAD_GLOBAL,/* dst <- value of global scalar a(SYMBOL); width/is_unsigned

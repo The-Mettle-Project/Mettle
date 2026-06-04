@@ -1489,6 +1489,23 @@ int mir_encode(MirFunction *fn) {
       }
       break;
     }
+    case MIR_LEA_CSTR: {
+      /* dst <- address of the string literal a.sym (RIP-relative lea into a
+       * .rdata cstring). dst is typically an ABI argument register. */
+      const char *s = in->a.sym ? in->a.sym : "";
+      BinaryGpRegister D;
+      int dst_in_reg = dst_is_reg(fn, &in->dst, &D);
+      BinaryGpRegister target = dst_in_reg ? D : SCRATCH_A;
+      if (!code_generator_binary_emit_cstring_literal_address(fn->generator, ctx,
+                                                              s, target)) {
+        ok = enc_err(fn, "out of memory emitting cstring argument");
+        break;
+      }
+      if (!dst_in_reg) {
+        ok = store_from(fn, &in->dst, SCRATCH_A);
+      }
+      break;
+    }
     case MIR_TRAP: {
       /* Terminal abort for a failed safety check. MIR only runs without
        * stack-trace support, so this is the degraded path: puts(message) +

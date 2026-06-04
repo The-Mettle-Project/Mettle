@@ -350,8 +350,17 @@ static int mir_call_is_supported(CodeGenerator *g, const IRInstruction *in) {
     }
     const IROperand *arg = &in->arguments[a];
     if (arg->kind != IR_OPERAND_TEMP && arg->kind != IR_OPERAND_SYMBOL &&
-        arg->kind != IR_OPERAND_INT) {
+        arg->kind != IR_OPERAND_INT && arg->kind != IR_OPERAND_STRING) {
       mir_call_trace("arg_operand_kind");
+      return 0;
+    }
+    if (arg->kind == IR_OPERAND_STRING &&
+        !code_generator_binary_type_is_cstring(pt)) {
+      /* A string literal is only lowered to a bare cstring (char* in one GP
+       * register) when the parameter is itself a cstring — matching the fallback
+       * emitter (emit_call_argument_load). A `string` fat-pointer parameter
+       * ({chars,length}) needs the struct ABI, which MIR does not build yet. */
+      mir_call_trace("arg_string_non_cstring");
       return 0;
     }
   }
@@ -1342,8 +1351,18 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
         fn->has_error = 1;
         return 0;
       }
-      MirOperand arg = mir_value_operand(fn, g, ctx, map, &in->arguments[a]);
       BinaryGpRegister reg = abi->int_param_registers[a];
+      if (in->arguments[a].kind == IR_OPERAND_STRING) {
+        /* A string-literal argument is passed as the address of its .rdata
+         * cstring (lea directly into the ABI argument register). */
+        const char *s = in->arguments[a].name ? in->arguments[a].name : "";
+        if (!mir_emit1(fn, MIR_LEA_CSTR, mir_op_phys(reg, MIR_RC_GP),
+                       mir_op_symbol(s), mir_op_none(), 8, 0, 0)) {
+          return 0;
+        }
+        continue;
+      }
+      MirOperand arg = mir_value_operand(fn, g, ctx, map, &in->arguments[a]);
       if (!mir_emit1(fn, MIR_MOV, mir_op_phys(reg, MIR_RC_GP), arg,
                      mir_op_none(), 8, 0, 0)) {
         return 0;
