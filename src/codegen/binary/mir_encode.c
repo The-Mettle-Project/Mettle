@@ -202,6 +202,31 @@ static int emit_op_eq(MirFunction *fn, MirOpcode mop, unsigned char opc,
              : enc_err(fn, "out of memory in ALU");
 }
 
+/* dst = -a (MIR_NEG) or dst = ~a (MIR_NOT). One-source two-address: stage a in
+ * the destination register (or RAX scratch for a spilled dst), then neg/not in
+ * place. */
+static int encode_neg_not(MirFunction *fn, const MirInst *in) {
+  BinaryCodeBuffer *code = &fn->context->code;
+  BinaryGpRegister D;
+  if (dst_is_reg(fn, &in->dst, &D)) {
+    if (!operand_in_phys(fn, &in->a, D) && !materialize_into(fn, &in->a, D)) {
+      return 0;
+    }
+    int ok = (in->op == MIR_NEG) ? binary_emit_neg_reg(code, D)
+                                 : binary_emit_not_reg(code, D);
+    return ok ? 1 : enc_err(fn, "out of memory in neg/not");
+  }
+  if (!materialize_into(fn, &in->a, SCRATCH_A)) {
+    return 0;
+  }
+  int ok = (in->op == MIR_NEG) ? binary_emit_neg_reg(code, SCRATCH_A)
+                               : binary_emit_not_reg(code, SCRATCH_A);
+  if (!ok) {
+    return enc_err(fn, "out of memory in neg/not");
+  }
+  return store_from(fn, &in->dst, SCRATCH_A);
+}
+
 static int encode_alu(MirFunction *fn, const MirInst *in) {
   BinaryCodeBuffer *code = &fn->context->code;
   unsigned char opc;
@@ -1276,6 +1301,10 @@ int mir_encode(MirFunction *fn) {
       break;
     case MIR_IMUL:
       ok = encode_imul(fn, in);
+      break;
+    case MIR_NEG:
+    case MIR_NOT:
+      ok = encode_neg_not(fn, in);
       break;
     case MIR_SHL:
     case MIR_SHR:

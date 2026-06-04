@@ -2,8 +2,20 @@
 
 #include "semantic/symbol_table.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* TEMPORARY instrumentation: with METTLE_MIR_TRACE set, log why a function is
+ * rejected by the MIR eligibility gate, so the spill-everything-fallback work
+ * list can be prioritized by real frequency. Returns 0 (ineligible). */
+static int mir_trace_bail(FunctionDeclaration *fd, const char *reason) {
+  if (getenv("METTLE_MIR_TRACE")) {
+    fprintf(stderr, "MIR-BAIL\t%s\n", reason);
+    (void)fd;
+  }
+  return 0;
+}
 
 /* True if `name` resolves to a read-accessible global scalar — a value we can
  * cache in a register at function entry (used by both the eligibility gate and
@@ -337,19 +349,19 @@ int mir_function_is_eligible(CodeGenerator *generator,
   }
   /* Signature: <=4 GP params, GP-or-void return, no indirect return. */
   if (function_data->parameter_count > MIR_MAX_PARAMS) {
-    return 0;
+    return mir_trace_bail(function_data, "sig:params>4");
   }
   for (size_t i = 0; i < function_data->parameter_count; i++) {
     const char *pt =
         function_data->parameter_types ? function_data->parameter_types[i] : NULL;
     if (!mir_type_is_numeric_scalar(generator, pt)) {
-      return 0; /* GP or float scalar params (float arrives in XMM) */
+      return mir_trace_bail(function_data, "sig:param_nonscalar");
     }
   }
   if (function_data->return_type && function_data->return_type[0] &&
       strcmp(function_data->return_type, "void") != 0 &&
       !mir_type_is_numeric_scalar(generator, function_data->return_type)) {
-    return 0; /* GP or float scalar return (float lands in XMM0) */
+    return mir_trace_bail(function_data, "sig:return_nonscalar");
   }
 
   /* Collect the names that are defined inside the function: parameters and
@@ -434,7 +446,7 @@ int mir_function_is_eligible(CodeGenerator *generator,
   mir_name_map_destroy(&defined);
   mir_function_destroy(&scratch_fn);
   if (!globals_ok) {
-    return 0;
+    return mir_trace_bail(function_data, "global_access");
   }
 
   for (size_t i = 0; i < ir_function->instruction_count; i++) {
@@ -484,7 +496,7 @@ int mir_function_is_eligible(CodeGenerator *generator,
         }
       } else if (!mir_arith_opcode(in->text, &tmp) &&
                  !mir_is_comparison(in->text)) {
-        return 0; /* integer divide/modulo/other -> fall back */
+        return mir_trace_bail(function_data, "binary:divmod_or_other");
       }
       if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
         return 0;
@@ -502,6 +514,22 @@ int mir_function_is_eligible(CodeGenerator *generator,
       /* Any scalar numeric cast: int<->int, int<->float, float<->float. The
        * direction is resolved from operand types during lowering, which is
        * exhaustive for these, so it cannot fail mid-function. */
+      if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
+        return 0;
+      }
+      if (in->lhs.kind != IR_OPERAND_TEMP && in->lhs.kind != IR_OPERAND_SYMBOL &&
+          in->lhs.kind != IR_OPERAND_INT && in->lhs.kind != IR_OPERAND_FLOAT) {
+        return 0;
+      }
+      break;
+    case IR_OP_UNARY:
+      /* Integer unary `-`, `~`, `+`, `!` only. Float unary (negate/plus on
+       * xmm) and popcnt are deferred to the fallback for now. */
+      if (in->is_float || !in->text ||
+          (strcmp(in->text, "-") != 0 && strcmp(in->text, "~") != 0 &&
+           strcmp(in->text, "+") != 0 && strcmp(in->text, "!") != 0)) {
+        return mir_trace_bail(function_data, "unary:float_or_unsupported");
+      }
       if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
         return 0;
       }
@@ -535,13 +563,19 @@ int mir_function_is_eligible(CodeGenerator *generator,
       break;
     case IR_OP_CALL:
       if (!mir_call_is_supported(generator, in)) {
-        return 0;
+        return mir_trace_bail(function_data, "call_unsupported");
       }
       break;
-    default:
+    default: {
       /* ADDRESS_OF, UNARY, NEW, CALL_INDIRECT, SIMD ops, ROTATE_ADD: not yet. */
-      return 0;
+      char buf[40];
+      snprintf(buf, sizeof(buf), "op:%d", (int)in->op);
+      return mir_trace_bail(function_data, buf);
     }
+    }
+  }
+  if (getenv("METTLE_MIR_TRACE")) {
+    fprintf(stderr, "MIR-OK\teligible\n");
   }
   return 1;
 }
@@ -1024,6 +1058,30 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
     return mir_emit1(fn, op, dst, a, b, 8, uns, 0);
   }
 
+  case IR_OP_UNARY: {
+    /* Integer unary only (float unary is gated out in eligibility). */
+    MirOperand dst = mir_value_operand(fn, g, ctx, map, &in->dest);
+    MirOperand a = mir_value_operand(fn, g, ctx, map, &in->lhs);
+    const char *op = in->text ? in->text : "";
+    if (strcmp(op, "-") == 0) {
+      return mir_emit1(fn, MIR_NEG, dst, a, mir_op_none(), 8, 0, 0);
+    }
+    if (strcmp(op, "~") == 0) {
+      return mir_emit1(fn, MIR_NOT, dst, a, mir_op_none(), 8, 0, 0);
+    }
+    if (strcmp(op, "+") == 0) {
+      return mir_emit1(fn, MIR_MOV, dst, a, mir_op_none(), 8, 0, 0);
+    }
+    if (strcmp(op, "!") == 0) {
+      /* !x == (x == 0) as 0/1: SETCC does cmp a,0; sete; movzx. */
+      unsigned char cc = 0;
+      mir_setcc_opcode("==", 0, &cc);
+      return mir_emit1(fn, MIR_SETCC, dst, a, mir_op_imm(0), 8, 0, cc);
+    }
+    fn->has_error = 1;
+    return 0;
+  }
+
   case IR_OP_CAST: {
     MirOperand dst = mir_value_operand(fn, g, ctx, map, &in->dest);
     MirOperand a = mir_value_operand(fn, g, ctx, map, &in->lhs);
@@ -1044,8 +1102,16 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
       }
       return mir_emit1(fn, MIR_CVTF2F, dst, a, mir_op_none(), dfb / 8, 0, 0);
     }
-    Type *dt = code_generator_binary_get_operand_type_in_context(g, ctx,
-                                                                 &in->dest);
+    /* The cast's target type is named on the instruction (in->text) and is
+     * always resolvable; the dest operand's type is not (a temp has no
+     * resolved type at -O0, which would silently drop a narrowing cast). Prefer
+     * in->text, matching the fallback emitter, and fall back to the operand. */
+    Type *dt = (in->text && g->type_checker)
+                   ? type_checker_get_type_by_name(g->type_checker, in->text)
+                   : NULL;
+    if (!dt) {
+      dt = code_generator_binary_get_operand_type_in_context(g, ctx, &in->dest);
+    }
     int dw = dt ? code_generator_binary_resolved_type_scalar_size(dt) : 8;
     int dsigned = dt ? code_generator_binary_resolved_type_is_signed_integer(dt)
                      : 1;
