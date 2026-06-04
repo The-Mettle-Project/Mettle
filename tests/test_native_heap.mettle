@@ -1,0 +1,72 @@
+// Runtime check for --native-heap: `new` and the malloc/calloc/realloc/free
+// intercepts must route through std/alloc's Mettle allocator (mettle_heap_*)
+// instead of the OS heap manager, and stay correct. The runner builds this with
+// --native-heap and asserts the "NATIVE-HEAP OK" marker plus a balanced
+// allocator (every alloc accounted for) via mx_stats.
+
+import "std/io";
+import "std/mem";
+import "std/alloc";
+
+struct Vec3 {
+  x: int64;
+  y: int64;
+  z: int64;
+}
+
+function main() -> int32 {
+  // `new` -> mettle_heap_zeroed: zeroed object allocation.
+  var v: Vec3* = new Vec3;
+  if (v->x != (int64)0 || v->y != (int64)0 || v->z != (int64)0) {
+    println("new not zeroed"); return 1;
+  }
+  v->x = (int64)11;
+  v->y = (int64)22;
+  v->z = (int64)33;
+  if (v->x + v->y + v->z != (int64)66) { println("new FAIL"); return 1; }
+
+  // malloc -> mettle_heap_alloc.
+  var buf: cstring = malloc((int64)256);
+  if (buf == 0) { println("malloc FAIL"); return 1; }
+  mem_fill(buf, (int32)0x7E, (int64)256);
+  if (((int32)(*((int8*)((int64)buf + (int64)255))) & 0xFF) != 0x7E) {
+    println("malloc data FAIL"); return 1;
+  }
+
+  // calloc -> mettle_heap_zeroed (count*size).
+  var z: cstring = calloc((int64)64, (int64)4);
+  var i: int64 = 0;
+  var ok: int32 = 1;
+  while (i < (int64)256) {
+    if (((int32)(*((int8*)((int64)z + i))) & 0xFF) != 0) { ok = 0; }
+    i = i + (int64)1;
+  }
+  if (ok == 0) { println("calloc FAIL"); return 1; }
+
+  // realloc -> mettle_heap_realloc: grow + preserve.
+  var r: cstring = malloc((int64)16);
+  i = 0;
+  while (i < (int64)16) { *((int8*)((int64)r + i)) = (int8)(i + (int64)1); i = i + (int64)1; }
+  r = realloc(r, (int64)4096);
+  ok = 1;
+  i = 0;
+  while (i < (int64)16) {
+    if (((int32)(*((int8*)((int64)r + i))) & 0xFF) != (int32)(i + (int64)1)) { ok = 0; }
+    i = i + (int64)1;
+  }
+  if (ok == 0) { println("realloc FAIL"); return 1; }
+
+  free(buf);
+  free(z);
+  free(r);
+  free((cstring)v);
+
+  var st: MemStats = mx_stats();
+  if (st.total_allocs < (int64)4) { println("not routed to native heap"); return 1; }
+  if ((st.total_allocs - st.total_frees) != st.live_allocs) {
+    println("allocator counters unbalanced"); return 1;
+  }
+
+  println("NATIVE-HEAP OK");
+  return 0;
+}

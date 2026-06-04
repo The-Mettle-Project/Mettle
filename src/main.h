@@ -41,6 +41,7 @@ typedef struct {
   int profile;
   int profile_runtime;
   int profile_runtime_ops;
+  int native_heap;
   int tracy;
   int static_link;
   int musl_link;

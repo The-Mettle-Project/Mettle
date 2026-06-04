@@ -16,6 +16,7 @@
 // the caller is expected to check.
 
 import "std/mem";
+import "std/alloc";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -48,6 +49,11 @@ export struct ArenaChunk {
 //
 // `next_chunk_id` ticks once per chunk-ever-allocated for stable savepoints.
 // `total_used` and `total_cap` are bookkeeping for stats.
+//
+// `heap` is the arena's own private native heap (std/alloc), from which chunk
+// headers and chunk storage are carved. The arena therefore touches no C
+// runtime allocator at all — it bottoms out on OS pages via std/osmem — and is
+// self-contained: destroying the arena releases the heap and everything in it.
 export struct Arena {
   head: ArenaChunk*;
   free_list: ArenaChunk*;
@@ -55,6 +61,7 @@ export struct Arena {
   next_chunk_id: int64;
   total_used: int64;
   total_cap: int64;
+  heap: MemHeap*;
 }
 
 // Opaque savepoint. Encodes (chunk_id, used_at_save) so a later restore can
@@ -79,24 +86,24 @@ function arena_chunk_bytes() -> int64 {
 }
 
 function arena_bytes() -> int64 {
-  return (int64)48;
+  return (int64)56;
 }
 
-// Allocate the chunk header plus `cap` bytes of storage. The header lives in
-// its own small allocation so chunk objects can be moved between active and
-// freelist lists without touching their backing storage.
-function arena_chunk_new(cap: int64, id: int64) -> ArenaChunk* {
-  if (cap <= (int64)0) {
+// Allocate the chunk header plus `cap` bytes of storage from the arena's heap.
+// The header lives in its own small allocation so chunk objects can be moved
+// between active and freelist lists without touching their backing storage.
+function arena_chunk_new(h: MemHeap*, cap: int64, id: int64) -> ArenaChunk* {
+  if (h == 0 || cap <= (int64)0) {
     return 0;
   }
-  var raw: cstring = calloc((int64)1, arena_chunk_bytes());
+  var raw: cstring = mem_calloc(h, (int64)1, arena_chunk_bytes());
   if (raw == 0) {
     return 0;
   }
   var ch: ArenaChunk* = (ArenaChunk*)raw;
-  ch->base = malloc(cap);
+  ch->base = mem_alloc(h, cap);
   if (ch->base == 0) {
-    free((cstring)ch);
+    mem_free(h, (cstring)ch);
     return 0;
   }
   ch->next = 0;
@@ -106,15 +113,15 @@ function arena_chunk_new(cap: int64, id: int64) -> ArenaChunk* {
   return ch;
 }
 
-function arena_chunk_destroy(ch: ArenaChunk*) {
+function arena_chunk_destroy(h: MemHeap*, ch: ArenaChunk*) {
   if (ch == 0) {
     return;
   }
   if (ch->base != 0) {
-    free(ch->base);
+    mem_free(h, ch->base);
     ch->base = 0;
   }
-  free((cstring)ch);
+  mem_free(h, (cstring)ch);
 }
 
 // Pop a chunk from the freelist that has at least `min_cap` bytes. Returns 0
@@ -160,11 +167,17 @@ function arena_push_free_chunk(a: Arena*, ch: ArenaChunk*) {
 // (64 KiB). The first chunk is allocated lazily on the first bump that needs
 // one, so an arena that's never used costs only one small allocation.
 export function arena_init(default_chunk_size: int64) -> Arena* {
-  var raw: cstring = calloc((int64)1, arena_bytes());
+  var heap: MemHeap* = mem_heap_create();
+  if (heap == 0) {
+    return 0;
+  }
+  var raw: cstring = mem_calloc(heap, (int64)1, arena_bytes());
   if (raw == 0) {
+    mem_heap_destroy(heap);
     return 0;
   }
   var a: Arena* = (Arena*)raw;
+  a->heap = heap;
   a->head = 0;
   a->free_list = 0;
   if (default_chunk_size <= (int64)0) {
@@ -220,7 +233,7 @@ export function arena_alloc_aligned(a: Arena*, n: int64, align: int64) -> cstrin
   // standard chunk.
   if (n > a->chunk_size) {
     var dedicated_cap: int64 = n + effective_align;
-    var dedicated: ArenaChunk* = arena_chunk_new(dedicated_cap, a->next_chunk_id);
+    var dedicated: ArenaChunk* = arena_chunk_new(a->heap, dedicated_cap, a->next_chunk_id);
     if (dedicated == 0) {
       return 0;
     }
@@ -257,7 +270,7 @@ export function arena_alloc_aligned(a: Arena*, n: int64, align: int64) -> cstrin
   if (reused != 0) {
     arena_install_chunk(a, reused);
   } else {
-    var fresh: ArenaChunk* = arena_chunk_new(a->chunk_size, a->next_chunk_id);
+    var fresh: ArenaChunk* = arena_chunk_new(a->heap, a->chunk_size, a->next_chunk_id);
     if (fresh == 0) {
       return 0;
     }
@@ -286,7 +299,7 @@ export function arena_alloc_zeroed(a: Arena*, n: int64) -> cstring {
   if (p == 0 || n <= (int64)0) {
     return p;
   }
-  memset(p, 0, n);
+  mem_zero(p, n);
   return p;
 }
 
@@ -355,17 +368,20 @@ export function arena_free(a: Arena*) {
   if (a == 0) {
     return;
   }
+  var heap: MemHeap* = a->heap;
   while (a->head != 0) {
     var next_active: ArenaChunk* = a->head->next;
-    arena_chunk_destroy(a->head);
+    arena_chunk_destroy(heap, a->head);
     a->head = next_active;
   }
   while (a->free_list != 0) {
     var next_free: ArenaChunk* = a->free_list->next;
-    arena_chunk_destroy(a->free_list);
+    arena_chunk_destroy(heap, a->free_list);
     a->free_list = next_free;
   }
-  free((cstring)a);
+  // `a` itself was carved from `heap`; tearing the heap down releases the arena
+  // struct, every chunk header's slab, and the heap page in one shot.
+  mem_heap_destroy(heap);
 }
 
 // Snapshot of arena occupancy. Useful for instrumentation and budgeting; the

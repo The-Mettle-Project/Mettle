@@ -1242,6 +1242,48 @@ foreach ($case in $simdRuntimeCases) {
   }
 }
 
+# Native heap: build with --native-heap and confirm new/malloc/calloc/realloc/
+# free route through std/alloc's Mettle allocator (mettle_heap_*), stay correct
+# at runtime, and do NOT emit the Win32 HeapAlloc/calloc path for `new`.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "native_heap.exe"
+  $objPath = [System.IO.Path]::ChangeExtension($exePath, ".obj")
+  $irPath = "$objPath.ir"
+  foreach ($artifactPath in @($exePath, $objPath, $irPath)) {
+    if (Test-Path $artifactPath) {
+      Remove-Item -Path $artifactPath -Force -ErrorAction SilentlyContinue
+    }
+  }
+
+  $buildOut = & $CompilerPath --build --linker internal --release --native-heap --dump-ir "tests\test_native_heap.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "native-heap build failed: $buildOut"
+  }
+  if (-not (Test-Path $exePath)) {
+    throw "native-heap build did not produce an executable"
+  }
+  if (Test-Path $irPath) {
+    $irText = Get-Content -Path $irPath -Raw
+    if ($irText -notmatch "mettle_heap_zeroed") {
+      throw "native-heap IR missing mettle_heap_zeroed (new not rerouted)"
+    }
+  }
+
+  $runOut = & $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "native-heap executable exited with $LASTEXITCODE`: $runOut"
+  }
+  if ($runOut -notmatch "NATIVE-HEAP OK") {
+    throw "native-heap output missing expected marker: $runOut"
+  }
+  Write-CaseResult -Name "native_heap" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "native_heap" -Passed $false -Reason $_.Exception.Message
+}
+
 # Generics runtime: compile with --build and verify monomorphized return values.
 $total++
 try {

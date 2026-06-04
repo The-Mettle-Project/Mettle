@@ -2520,6 +2520,8 @@ int main(int argc, char *argv[]) {
       options.profile_runtime = 1;
     } else if (strcmp(argv[i], "--profile-runtime-ops") == 0) {
       options.profile_runtime_ops = 1;
+    } else if (strcmp(argv[i], "--native-heap") == 0) {
+      options.native_heap = 1;
     } else if (strcmp(argv[i], "--static") == 0) {
       options.static_link = 1;
     } else if (strcmp(argv[i], "--musl") == 0) {
@@ -2991,6 +2993,7 @@ int compile_file(const char *input_filename, const char *output_filename,
                                      compiler_options_use_profile_runtime(options)
                                          ? 1
                                          : 0);
+  code_generator_set_native_heap(code_generator, options->native_heap ? 1 : 0);
   compiler_profile_add(&profile, PROFILE_PHASE_INIT, phase_start);
 
   int result = 0;
@@ -3002,6 +3005,20 @@ int compile_file(const char *input_filename, const char *output_filename,
     fprintf(stderr,
             "Error: --profile-runtime/--profile-runtime-ops require the direct "
             "object backend (use --build or --emit-obj)\n");
+    result = 1;
+    goto cleanup;
+  }
+
+  /* --native-heap reroutes new/malloc/calloc/realloc/free onto the Mettle
+   * allocator via the Win64 malloc-family interception point. The SysV path
+   * does not intercept these, so enabling it there would route `new` to the
+   * native heap while `free` still hit libc — a cross-allocator mismatch.
+   * Restrict to the Win64 target until the SysV interception lands. */
+  if (options->native_heap &&
+      binary_target_format_host_default() == BINARY_TARGET_FORMAT_ELF_X64) {
+    fprintf(stderr,
+            "Error: --native-heap is currently supported only on the Win64 "
+            "target\n");
     result = 1;
     goto cleanup;
   }
@@ -3034,28 +3051,40 @@ int compile_file(const char *input_filename, const char *output_filename,
       (binary_target_format_host_default() == BINARY_TARGET_FORMAT_ELF_X64) ? 1
                                                                             : 0;
 
-  // Auto-inject the standard prelude only when --prelude was specified.
+  // Auto-inject the standard prelude only when --prelude was specified, and
+  // std/alloc when --native-heap was specified (it provides the mettle_heap_*
+  // shims the backend rewrites new/malloc/calloc/realloc/free to call).
   compiler_set_phase(PROFILE_PHASE_PRELUDE);
   phase_start = compiler_profile_begin(&profile);
-  if (options->prelude) {
-    Program *prog_data = (Program *)program->data;
-    SourceLocation prelude_loc = {0, 0, NULL};
-    ASTNode *prelude_import =
-        ast_create_import_declaration("std/prelude", NULL, NULL, 0, prelude_loc);
-    if (prelude_import) {
-      // Prepend the prelude import before all user declarations.
-      ASTNode **grown =
-          realloc(prog_data->declarations,
-                  (prog_data->declaration_count + 1) * sizeof(ASTNode *));
-      if (grown) {
-        memmove(grown + 1, grown,
-                prog_data->declaration_count * sizeof(ASTNode *));
-        grown[0] = prelude_import;
-        prog_data->declarations = grown;
-        prog_data->declaration_count++;
-        ast_add_child(program, prelude_import);
-      } else {
-        ast_destroy_node(prelude_import);
+  {
+    const char *auto_imports[2];
+    size_t auto_import_count = 0;
+    if (options->prelude) {
+      auto_imports[auto_import_count++] = "std/prelude";
+    }
+    if (options->native_heap) {
+      auto_imports[auto_import_count++] = "std/alloc";
+    }
+    for (size_t ai = 0; ai < auto_import_count; ai++) {
+      Program *prog_data = (Program *)program->data;
+      SourceLocation auto_loc = {0, 0, NULL};
+      ASTNode *auto_import = ast_create_import_declaration(
+          auto_imports[ai], NULL, NULL, 0, auto_loc);
+      if (auto_import) {
+        // Prepend the import before all user declarations.
+        ASTNode **grown =
+            realloc(prog_data->declarations,
+                    (prog_data->declaration_count + 1) * sizeof(ASTNode *));
+        if (grown) {
+          memmove(grown + 1, grown,
+                  prog_data->declaration_count * sizeof(ASTNode *));
+          grown[0] = auto_import;
+          prog_data->declarations = grown;
+          prog_data->declaration_count++;
+          ast_add_child(program, auto_import);
+        } else {
+          ast_destroy_node(auto_import);
+        }
       }
     }
   }
@@ -3337,6 +3366,8 @@ void print_usage(const char *program_name) {
          "(disables inlining)\n");
   printf("  --profile-runtime-ops  Emit runtime op-class counters per function "
          "(after optimization)\n");
+  printf("  --native-heap       Route new/malloc/calloc/realloc/free through "
+         "the Mettle allocator (std/alloc, Win64 only)\n");
   printf("  --static            On Linux, link executable statically\n");
   printf("  --musl              On Linux, link statically with musl-gcc\n");
   printf("  --debug-compiler    Track compiler context for internal error reports\n");

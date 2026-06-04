@@ -101,6 +101,10 @@ typedef struct {
   int current_fn_returns_indirect;
   size_t current_fn_indirect_return_size;
   int profile_runtime;
+  /* When set (via --native-heap), `new`/`delete` and the malloc/calloc/realloc/
+   * free intercepts are emitted as calls to the std/alloc native allocator
+   * shims (mettle_heap_*) instead of the OS heap manager. */
+  int native_heap;
   char **profile_function_names;
   size_t profile_function_count;
   size_t profile_function_capacity;
@@ -134,6 +138,7 @@ void code_generator_set_debug_sidecar_emission(CodeGenerator *generator,
 void code_generator_set_eliminate_unreachable_functions(CodeGenerator *generator,
                                                         int enable);
 void code_generator_set_profile_runtime(CodeGenerator *generator, int enable);
+void code_generator_set_native_heap(CodeGenerator *generator, int enable);
 int code_generator_register_profile_function(CodeGenerator *generator,
                                              const char *name,
                                              uint32_t *id_out);

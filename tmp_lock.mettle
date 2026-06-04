@@ -1,0 +1,13 @@
+import "std/io";
+import "std/thread";
+
+var g_lock: int32 = 0;
+
+function main() -> int32 {
+  spin_lock(&g_lock);
+  var x: int32 = 42;
+  spin_unlock(&g_lock);
+  if (x != 42) { println("FAIL"); return 1; }
+  println("LOCK OK");
+  return 0;
+}

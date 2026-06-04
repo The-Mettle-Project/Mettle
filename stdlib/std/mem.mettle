@@ -13,6 +13,145 @@ export extern function memcpy(dest: cstring, src: cstring, size: int64) -> cstri
 export extern function memmove(dest: cstring, src: cstring, size: int64) -> cstring = "memmove";
 export extern function memcmp(a: cstring, b: cstring, size: int64) -> int32 = "memcmp";
 
+// ─── Native memory operations ───────────────────────────────────────────────
+//
+// Pure-Mettle byte operations, independent of the C runtime. They move 8 bytes
+// at a time on the bulk of the range and clean up the unaligned tail one byte
+// at a time, so they are competitive with libc memcpy/memset on hot paths and
+// give Mettle a self-contained primitive surface that the auto-vectorizer can
+// pick up. `byte` arguments use only the low 8 bits.
+
+// Set `n` bytes at `p` to zero. Returns `p`.
+export function mem_zero(p: cstring, n: int64) -> cstring {
+  if (n <= (int64)0) { return p; }
+  var d: int64 = (int64)p;
+  var i: int64 = (int64)0;
+  var words: int64 = n & ~(int64)7;
+  while (i < words) {
+    *((int64*)(d + i)) = (int64)0;
+    i = i + (int64)8;
+  }
+  while (i < n) {
+    *((int8*)(d + i)) = (int8)0;
+    i = i + (int64)1;
+  }
+  return p;
+}
+
+// Set `n` bytes at `p` to the low byte of `value`. Returns `p`.
+export function mem_fill(p: cstring, value: int32, n: int64) -> cstring {
+  if (n <= (int64)0) { return p; }
+  var b: int64 = (int64)value & (int64)0xFF;
+  var word: int64 = b | (b << (int64)8) | (b << (int64)16) | (b << (int64)24) | (b << (int64)32) | (b << (int64)40) | (b << (int64)48) | (b << (int64)56);
+  var d: int64 = (int64)p;
+  var i: int64 = (int64)0;
+  var words: int64 = n & ~(int64)7;
+  while (i < words) {
+    *((int64*)(d + i)) = word;
+    i = i + (int64)8;
+  }
+  while (i < n) {
+    *((int8*)(d + i)) = (int8)b;
+    i = i + (int64)1;
+  }
+  return p;
+}
+
+// Copy `n` bytes from `src` to `dst`. The ranges must not overlap; use
+// mem_move when they might. Returns `dst`.
+export function mem_copy(dst: cstring, src: cstring, n: int64) -> cstring {
+  if (n <= (int64)0 || dst == src) { return dst; }
+  var d: int64 = (int64)dst;
+  var s: int64 = (int64)src;
+  var i: int64 = (int64)0;
+  var words: int64 = n & ~(int64)7;
+  while (i < words) {
+    *((int64*)(d + i)) = *((int64*)(s + i));
+    i = i + (int64)8;
+  }
+  while (i < n) {
+    *((int8*)(d + i)) = *((int8*)(s + i));
+    i = i + (int64)1;
+  }
+  return dst;
+}
+
+// Copy `n` bytes from `src` to `dst`, handling overlap correctly. Copies
+// backward when `dst` is above `src` so an overlapping forward copy can't
+// clobber not-yet-read source bytes. Returns `dst`.
+export function mem_move(dst: cstring, src: cstring, n: int64) -> cstring {
+  if (n <= (int64)0 || dst == src) { return dst; }
+  var d: int64 = (int64)dst;
+  var s: int64 = (int64)src;
+  if (d < s) {
+    return mem_copy(dst, src, n);
+  }
+  // Overlapping (or safe) high-to-low copy.
+  var i: int64 = n;
+  while (i >= (int64)8) {
+    i = i - (int64)8;
+    *((int64*)(d + i)) = *((int64*)(s + i));
+  }
+  while (i > (int64)0) {
+    i = i - (int64)1;
+    *((int8*)(d + i)) = *((int8*)(s + i));
+  }
+  return dst;
+}
+
+// Return 1 if the first `n` bytes of `a` and `b` are equal, else 0.
+export function mem_equal(a: cstring, b: cstring, n: int64) -> int32 {
+  if (n <= (int64)0 || a == b) { return 1; }
+  var pa: int64 = (int64)a;
+  var pb: int64 = (int64)b;
+  var i: int64 = (int64)0;
+  var words: int64 = n & ~(int64)7;
+  while (i < words) {
+    if (*((int64*)(pa + i)) != *((int64*)(pb + i))) { return 0; }
+    i = i + (int64)8;
+  }
+  while (i < n) {
+    if (*((int8*)(pa + i)) != *((int8*)(pb + i))) { return 0; }
+    i = i + (int64)1;
+  }
+  return 1;
+}
+
+// Lexicographic byte comparison of the first `n` bytes, like C memcmp:
+// negative if a < b, 0 if equal, positive if a > b. Bytes are compared as
+// unsigned values.
+export function mem_compare(a: cstring, b: cstring, n: int64) -> int32 {
+  if (n <= (int64)0 || a == b) { return 0; }
+  var pa: int64 = (int64)a;
+  var pb: int64 = (int64)b;
+  var i: int64 = (int64)0;
+  while (i < n) {
+    var ca: int32 = (int32)(*((int8*)(pa + i))) & 0xFF;
+    var cb: int32 = (int32)(*((int8*)(pb + i))) & 0xFF;
+    if (ca != cb) {
+      return ca - cb;
+    }
+    i = i + (int64)1;
+  }
+  return 0;
+}
+
+// Return the index of the first byte in the first `n` bytes of `p` equal to
+// the low byte of `value`, or -1 if not present.
+export function mem_find_byte(p: cstring, value: int32, n: int64) -> int64 {
+  if (n <= (int64)0) { return (int64)-1; }
+  var target: int32 = value & 0xFF;
+  var base: int64 = (int64)p;
+  var i: int64 = (int64)0;
+  while (i < n) {
+    if (((int32)(*((int8*)(base + i))) & 0xFF) == target) {
+      return i;
+    }
+    i = i + (int64)1;
+  }
+  return (int64)-1;
+}
+
 // ─── Buffer helpers ─────────────────────────────────────────────────────────
 
 // Allocate a zero-initialized buffer of `n` bytes.

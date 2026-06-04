@@ -60,6 +60,7 @@ CodeGenerator *code_generator_create(SymbolTable *symbol_table,
   generator->current_fn_returns_indirect = 0;
   generator->current_fn_indirect_return_size = 0;
   generator->profile_runtime = 0;
+  generator->native_heap = 0;
   generator->profile_function_names = NULL;
   generator->profile_function_count = 0;
   generator->profile_function_capacity = 0;
@@ -286,6 +287,13 @@ void code_generator_set_profile_runtime(CodeGenerator *generator, int enable) {
     return;
   }
   generator->profile_runtime = enable ? 1 : 0;
+}
+
+void code_generator_set_native_heap(CodeGenerator *generator, int enable) {
+  if (!generator) {
+    return;
+  }
+  generator->native_heap = enable ? 1 : 0;
 }
 
 static char *code_generator_strip_asm_comments(const char *text) {
