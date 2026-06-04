@@ -422,6 +422,20 @@ int mir_regalloc(MirFunction *fn) {
    * store each vreg's own positive offset. */
   int next_spill_offset = fn->context ? fn->context->raw_frame_size : 0;
 
+  /* Address-taken values must be memory-resident; give each a stack slot up
+   * front (independent of liveness — one may be written only through its alias
+   * pointer and never appear in the interval order). The main scan then skips
+   * them so they never occupy a register. */
+  for (size_t v = 0; v < fn->vreg_count; v++) {
+    MirVreg *vr = &fn->vregs[v];
+    if (vr->address_taken) {
+      next_spill_offset += 8;
+      vr->assigned = 1;
+      vr->in_register = 0;
+      vr->spill_offset = next_spill_offset;
+    }
+  }
+
   /* Active intervals, kept as a simple array we scan/expire each step. */
   MirVregId *active = (MirVregId *)malloc(order_count * sizeof(MirVregId));
   if (!active && order_count > 0) {
@@ -454,6 +468,14 @@ int mir_regalloc(MirFunction *fn) {
       }
     }
     active_count = w;
+
+    /* Address-taken values are memory-resident (their stack slot was assigned
+     * up front, below): never give them a register, so every use loads and
+     * every def stores through the home, keeping a by-name access and an
+     * aliasing-pointer access on the same memory. */
+    if (cv->address_taken) {
+      continue;
+    }
 
     /* Two-address coalescing: reuse the register of a source that dies exactly
      * here, so the encoder writes the result in place. Only for non-cross-call

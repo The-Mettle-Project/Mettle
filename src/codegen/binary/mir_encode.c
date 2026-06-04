@@ -992,7 +992,10 @@ static int mir_layout_frame(MirFunction *fn) {
   }
   int raw = after_gp + (int)(ctx->saved_xmm_count * 16);
   if (mir_has_calls(fn)) {
-    raw += 32; /* shadow space at the bottom; spills/saves never reach it */
+    /* Outgoing call region at the very bottom of the frame: 32B Win64 shadow
+     * space plus any outgoing stack-argument bytes (calls with more GP args
+     * than argument registers). Spills/saves sit above and never reach it. */
+    raw += 32 + fn->outgoing_stack_bytes;
   }
   if (!binary_align_up_int(raw, 16, &ctx->frame_size)) {
     return enc_err(fn, "stack frame too large");
@@ -1486,6 +1489,64 @@ int mir_encode(MirFunction *fn) {
       if (!link || !binary_emit_call_placeholder(&ctx->code, &off) ||
           !binary_call_relocation_table_add(&ctx->call_relocations, link, off)) {
         ok = enc_err(fn, "out of memory emitting call");
+      }
+      break;
+    }
+    case MIR_STORE_OUTARG: {
+      /* Store an outgoing stack call argument to [rsp + b.imm]. rsp is fixed
+       * after the prologue and the outgoing region is reserved there, so this
+       * is a plain rsp-relative store. */
+      int ok;
+      BinaryGpRegister r = value_reg(fn, &in->a, SCRATCH_A, &ok);
+      if (!ok) {
+        break;
+      }
+      if (!binary_emit_mov_mem_reg(&ctx->code, BINARY_GP_RSP, (int)in->b.imm,
+                                   r)) {
+        ok = enc_err(fn, "out of memory storing outgoing call argument");
+      }
+      break;
+    }
+    case MIR_LEA_GLOBAL: {
+      /* dst <- RIP-relative address of global symbol a.sym. is_unsigned carries
+       * the declare-external flag (set by lowering from the symbol). */
+      const char *name = in->a.sym ? in->a.sym : "";
+      const char *link = code_generator_get_link_symbol_name(fn->generator, name);
+      if (!link || link[0] == '\0') {
+        ok = enc_err(fn, "invalid global symbol in address-of");
+        break;
+      }
+      BinaryGpRegister D;
+      int dst_in_reg = dst_is_reg(fn, &in->dst, &D);
+      BinaryGpRegister target = dst_in_reg ? D : SCRATCH_A;
+      if (!code_generator_binary_emit_symbol_address(fn->generator, ctx, link,
+                                                     in->is_unsigned, target)) {
+        ok = enc_err(fn, "out of memory emitting global address");
+        break;
+      }
+      if (!dst_in_reg) {
+        ok = store_from(fn, &in->dst, SCRATCH_A);
+      }
+      break;
+    }
+    case MIR_LEA_LOCAL: {
+      /* dst <- address of local vreg a's stack home. The allocator forces an
+       * address-taken value to spill, so a is always memory-resident. */
+      const MirVreg *lv = &fn->vregs[in->a.vreg];
+      if (lv->in_register) {
+        ok = enc_err(fn, "address-taken value was not spilled");
+        break;
+      }
+      BinaryGpRegister D;
+      int dst_in_reg = dst_is_reg(fn, &in->dst, &D);
+      BinaryGpRegister target = dst_in_reg ? D : SCRATCH_A;
+      if (!binary_emit_lea_reg_mem(&ctx->code, target, BINARY_GP_RBP,
+                                   -lv->spill_offset)) {
+        ok = enc_err(fn, "out of memory emitting local address");
+        break;
+      }
+      if (!dst_in_reg) {
+        ok = store_from(fn, &in->dst, SCRATCH_A);
       }
       break;
     }

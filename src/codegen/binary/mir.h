@@ -55,6 +55,11 @@ typedef struct {
    * dies exactly at the def, so this value can reuse its register and the
    * encoder elides the `mov dst, a` copy. -1 (MIR_VREG_NONE) when absent. */
   int coalesce_hint;
+  /* Set when this value's address is taken (IR_OP_ADDRESS_OF): it must be
+   * memory-resident — the allocator never assigns it a register, so every use
+   * loads and every def stores through its stack home, and a store through an
+   * aliasing pointer is visible to a later by-name read. */
+  int address_taken;
 } MirVreg;
 #define MIR_LIVE_NONE (-1)
 
@@ -107,6 +112,12 @@ typedef enum {
   /* data movement */
   MIR_MOV,        /* dst <- a (reg/imm/mem load/mem store depending on kinds) */
   MIR_LEA,        /* dst(reg) <- address of a(mem) */
+  MIR_LEA_LOCAL,  /* dst(reg) <- address of the spill home of local vreg a. The
+                     local is forced memory-resident (address_taken) so its
+                     stack slot is its canonical storage; this leas that slot. */
+  MIR_LEA_GLOBAL, /* dst(reg) <- address of global symbol a.sym (RIP-relative).
+                     The global stays cached, but is flushed/reloaded around
+                     pointer memory ops since the alias can read/write it. */
   MIR_LEA_CSTR,   /* dst(reg) <- address of the string literal a.sym (RIP-relative
                      lea into a .rdata cstring). Carries no vreg source, so the
                      allocator ignores it. Used to pass a string-literal call
@@ -154,6 +165,9 @@ typedef enum {
 
   /* calls / return (Stage 3 for full ABI; declared now for completeness) */
   MIR_CALL,       /* call sym; clobbers volatiles */
+  MIR_STORE_OUTARG,/* store outgoing stack call argument a to [rsp + b.imm].
+                      Used for the 5th+ GP argument (beyond the ABI's argument
+                      registers); the prologue reserves the outgoing region. */
   MIR_TRAP,       /* terminal runtime trap: puts(a.sym)+exit(1). a.sym is the
                      abort message. Reached only on a cold guard-fail path and
                      never returns, so it needs no vreg operands and the
@@ -261,6 +275,12 @@ typedef struct {
   /* Bytes of spill area the allocator appended below the existing frame; the
    * encoder grows the prologue allocation by this much. */
   int spill_bytes;
+
+  /* Max bytes of outgoing stack-argument space any call in this function needs
+   * (for calls with more GP arguments than the ABI has argument registers).
+   * Reserved once at the bottom of the frame, above the shadow space, so calls
+   * write stack args at a fixed rsp offset without adjusting rsp in-body. */
+  int outgoing_stack_bytes;
 
   int has_error;
 } MirFunction;

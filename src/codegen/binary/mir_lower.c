@@ -111,6 +111,10 @@ typedef struct {
   size_t count;
   const char **all; /* every cached global (reload-after-call) */
   size_t all_count;
+  const char **at;  /* address-taken globals (aliasable via &g): flush before a
+                       pointer LOAD/STORE, reload after a pointer STORE, so a
+                       store through the alias and a by-name access stay coherent */
+  size_t at_count;
 } MirGlobalWriteback;
 
 /* ---- operand mapping ---------------------------------------------------- */
@@ -308,6 +312,38 @@ static int mir_call_is_runtime_trap(const IRInstruction *in) {
                       strcmp(in->text, "mettle_crash_trap") == 0);
 }
 
+/* Classify an IR_OP_ADDRESS_OF target. */
+typedef enum {
+  MIR_ADDROF_UNSUPPORTED = 0, /* function/string/other: deferred */
+  MIR_ADDROF_LOCAL,           /* scalar local or parameter */
+  MIR_ADDROF_GLOBAL           /* scalar global */
+} MirAddrofKind;
+
+static MirAddrofKind mir_addressof_kind(CodeGenerator *g,
+                                        const IRInstruction *in) {
+  if (in->lhs.kind != IR_OPERAND_SYMBOL || !in->lhs.name) {
+    return MIR_ADDROF_UNSUPPORTED;
+  }
+  if (code_generator_find_ir_function_binary(g, in->lhs.name)) {
+    return MIR_ADDROF_UNSUPPORTED; /* function address */
+  }
+  Symbol *s =
+      g->symbol_table ? symbol_table_lookup(g->symbol_table, in->lhs.name) : NULL;
+  if (!s || s->kind == SYMBOL_FUNCTION) {
+    return MIR_ADDROF_UNSUPPORTED;
+  }
+  if (s->type && s->type->kind == TYPE_STRING) {
+    return MIR_ADDROF_UNSUPPORTED; /* string symbol has its own address form */
+  }
+  if (s->scope && s->scope->type == SCOPE_GLOBAL) {
+    /* &global: only a plain scalar global (one we cache, hence can keep
+     * coherent via flush/reload around memory ops). */
+    return mir_name_is_global_scalar(g, in->lhs.name) ? MIR_ADDROF_GLOBAL
+                                                      : MIR_ADDROF_UNSUPPORTED;
+  }
+  return MIR_ADDROF_LOCAL; /* local or parameter */
+}
+
 static int mir_call_is_supported(CodeGenerator *g, const IRInstruction *in) {
   if (!in->text || in->text[0] == '\0') {
     mir_call_trace("no_name");
@@ -318,8 +354,8 @@ static int mir_call_is_supported(CodeGenerator *g, const IRInstruction *in) {
   if (mir_call_is_runtime_trap(in)) {
     return 1;
   }
-  if (in->argument_count > 4) {
-    mir_call_trace("args>4");
+  if (in->argument_count > MIR_MAX_PARAMS) {
+    mir_call_trace("args>max");
     return 0;
   }
   Symbol *callee =
@@ -643,8 +679,19 @@ int mir_function_is_eligible(CodeGenerator *generator,
         return mir_trace_bail(function_data, "call_unsupported");
       }
       break;
+    case IR_OP_ADDRESS_OF:
+      /* &local/&param (made memory-resident via forced spill) or &global (kept
+       * cached but coherent via flush/reload around pointer memory ops).
+       * Functions/strings have their own address forms and are deferred. */
+      if (mir_addressof_kind(generator, in) == MIR_ADDROF_UNSUPPORTED) {
+        return mir_trace_bail(function_data, "addressof:unsupported");
+      }
+      if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
+        return mir_trace_bail(function_data, "addressof:dest");
+      }
+      break;
     default: {
-      /* ADDRESS_OF, UNARY, NEW, CALL_INDIRECT, SIMD ops, ROTATE_ADD: not yet. */
+      /* UNARY, NEW, CALL_INDIRECT, SIMD ops, ROTATE_ADD: not yet. */
       char buf[40];
       snprintf(buf, sizeof(buf), "op:%d", (int)in->op);
       return mir_trace_bail(function_data, buf);
@@ -675,17 +722,13 @@ static int mir_emit1(MirFunction *fn, MirOpcode op, MirOperand dst,
   return mir_emit(fn, &in);
 }
 
-/* Emit a MIR_STORE_GLOBAL for each promoted global, writing its cached vreg back
- * to memory. Called immediately before each MIR_RET so memory is consistent on
- * every exit path. */
-static int mir_emit_global_writebacks(MirFunction *fn, CodeGenerator *g,
-                                      MirNameMap *map,
-                                      const MirGlobalWriteback *wb) {
-  if (!wb) {
-    return 1;
-  }
-  for (size_t i = 0; i < wb->count; i++) {
-    const char *name = wb->names[i];
+/* Emit a MIR_STORE_GLOBAL for each named global, writing its cached vreg back to
+ * memory (Vg -> [g]). */
+static int mir_emit_global_flush_names(MirFunction *fn, CodeGenerator *g,
+                                       MirNameMap *map, const char **names,
+                                       size_t count) {
+  for (size_t i = 0; i < count; i++) {
+    const char *name = names[i];
     Symbol *s = symbol_table_lookup(g->symbol_table, name);
     int size = s ? code_generator_binary_resolved_type_scalar_size(s->type) : 0;
     if (size != 1 && size != 2 && size != 4 && size != 8) {
@@ -704,18 +747,13 @@ static int mir_emit_global_writebacks(MirFunction *fn, CodeGenerator *g,
   return 1;
 }
 
-/* Reload every cached global from memory into its cache vreg. Emitted right
- * after a MIR_CALL: the callee may have written any global, so the cached
- * registers are stale. (The written set was flushed before the call via
- * mir_emit_global_writebacks, so memory was current going in.) */
-static int mir_emit_global_reloads(MirFunction *fn, CodeGenerator *g,
-                                   MirNameMap *map,
-                                   const MirGlobalWriteback *wb) {
-  if (!wb) {
-    return 1;
-  }
-  for (size_t i = 0; i < wb->all_count; i++) {
-    const char *name = wb->all[i];
+/* Emit a MIR_LOAD_GLOBAL for each named global, refreshing its cache vreg from
+ * memory ([g] -> Vg). */
+static int mir_emit_global_reload_names(MirFunction *fn, CodeGenerator *g,
+                                        MirNameMap *map, const char **names,
+                                        size_t count) {
+  for (size_t i = 0; i < count; i++) {
+    const char *name = names[i];
     Symbol *s = symbol_table_lookup(g->symbol_table, name);
     int size = s ? code_generator_binary_resolved_type_scalar_size(s->type) : 0;
     if (size != 1 && size != 2 && size != 4 && size != 8) {
@@ -734,6 +772,30 @@ static int mir_emit_global_reloads(MirFunction *fn, CodeGenerator *g,
     }
   }
   return 1;
+}
+
+/* Flush the written cached globals back to memory. Called before each MIR_RET
+ * (so memory is consistent on every exit) and before a call (so the callee sees
+ * current values). */
+static int mir_emit_global_writebacks(MirFunction *fn, CodeGenerator *g,
+                                      MirNameMap *map,
+                                      const MirGlobalWriteback *wb) {
+  if (!wb) {
+    return 1;
+  }
+  return mir_emit_global_flush_names(fn, g, map, wb->names, wb->count);
+}
+
+/* Reload every cached global from memory into its cache vreg. Emitted after a
+ * MIR_CALL: the callee may have written any global, so the cached registers are
+ * stale. (The written set was flushed before the call, so memory was current.) */
+static int mir_emit_global_reloads(MirFunction *fn, CodeGenerator *g,
+                                   MirNameMap *map,
+                                   const MirGlobalWriteback *wb) {
+  if (!wb) {
+    return 1;
+  }
+  return mir_emit_global_reload_names(fn, g, map, wb->all, wb->all_count);
 }
 
 /* A width-tagged float register move (xmm copy). */
@@ -1341,17 +1403,58 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
         return 0;
       }
     }
-    /* Marshal GP arguments into the ABI's positional argument registers. With
-     * all-GP args the positional index equals the argument index on both
-     * conventions, and the target registers are never allocatable, so the moves
-     * cannot clobber one another. */
+    /* Marshal GP arguments per the ABI layout. Arguments up to the ABI's
+     * argument-register count go into registers; the rest are stored into the
+     * outgoing stack-argument region (reserved once in the prologue). All call
+     * args are GP here (float/struct args bail in eligibility). */
     const BinaryAbi *abi = code_generator_binary_active_abi();
+    int arg_is_float[MIR_MAX_PARAMS] = {0};
+    BinaryArgLocation locs[MIR_MAX_PARAMS];
+    int stack_bytes = 0;
+    if (in->argument_count > 0 &&
+        !code_generator_binary_compute_arg_layout(abi, arg_is_float,
+                                                  in->argument_count, locs,
+                                                  &stack_bytes)) {
+      fn->has_error = 1;
+      return 0;
+    }
+    if (stack_bytes > fn->outgoing_stack_bytes) {
+      fn->outgoing_stack_bytes = stack_bytes;
+    }
+    /* Stack args first: they read their source vregs before any argument
+     * register is written, so a reg-move below can never clobber a stack arg's
+     * source. The slot is above the shadow space at a fixed rsp offset. */
     for (size_t a = 0; a < in->argument_count; a++) {
-      if (a >= abi->int_param_count) {
-        fn->has_error = 1;
+      if (locs[a].kind != BINARY_ARG_ON_STACK) {
+        continue;
+      }
+      int slot = abi->shadow_space_size + locs[a].stack_offset;
+      MirOperand val;
+      if (in->arguments[a].kind == IR_OPERAND_STRING) {
+        /* Stage the cstring address in a temp, then store it to the slot. */
+        const char *s = in->arguments[a].name ? in->arguments[a].name : "";
+        MirVregId t = mir_new_vreg(fn, MIR_RC_GP, 8);
+        if (t == MIR_VREG_NONE ||
+            !mir_emit1(fn, MIR_LEA_CSTR, mir_op_vreg(t), mir_op_symbol(s),
+                       mir_op_none(), 8, 0, 0)) {
+          return 0;
+        }
+        val = mir_op_vreg(t);
+      } else {
+        val = mir_value_operand(fn, g, ctx, map, &in->arguments[a]);
+      }
+      if (!mir_emit1(fn, MIR_STORE_OUTARG, mir_op_none(), val,
+                     mir_op_imm(slot), 8, 0, 0)) {
         return 0;
       }
-      BinaryGpRegister reg = abi->int_param_registers[a];
+    }
+    /* Register args. The target registers are never allocatable, so these moves
+     * cannot clobber one another's sources. */
+    for (size_t a = 0; a < in->argument_count; a++) {
+      if (locs[a].kind != BINARY_ARG_IN_GP_REGISTER) {
+        continue;
+      }
+      BinaryGpRegister reg = locs[a].gp_register;
       if (in->arguments[a].kind == IR_OPERAND_STRING) {
         /* A string-literal argument is passed as the address of its .rdata
          * cstring (lea directly into the ABI argument register). */
@@ -1385,6 +1488,30 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
                        0, 0);
     }
     return 1;
+  }
+
+  case IR_OP_ADDRESS_OF: {
+    MirOperand dst = mir_value_operand(fn, g, ctx, map, &in->dest);
+    if (mir_addressof_kind(g, in) == MIR_ADDROF_GLOBAL) {
+      /* &global: lea its RIP-relative address (is_unsigned carries the
+       * declare-external flag for the encoder). The global stays cached; the
+       * main loop flushes/reloads address-taken globals around pointer memory
+       * ops so the alias and the cache vreg stay coherent. */
+      Symbol *s = g->symbol_table
+                      ? symbol_table_lookup(g->symbol_table, in->lhs.name)
+                      : NULL;
+      int is_extern = (s && s->is_extern) ? 1 : 0;
+      return mir_emit1(fn, MIR_LEA_GLOBAL, dst, mir_op_symbol(in->lhs.name),
+                       mir_op_none(), 8, is_extern, 0);
+    }
+    /* &local / &param: mark the target memory-resident and lea its stack home. */
+    MirOperand src = mir_value_operand(fn, g, ctx, map, &in->lhs);
+    if (src.kind != MIR_OPK_VREG) {
+      fn->has_error = 1;
+      return 0;
+    }
+    fn->vregs[src.vreg].address_taken = 1;
+    return mir_emit1(fn, MIR_LEA_LOCAL, dst, src, mir_op_none(), 8, 0, 0);
   }
 
   default:
@@ -1666,6 +1793,7 @@ int code_generator_binary_emit_function_via_mir(
   MirGlobalWriteback wb = {0};
   size_t wb_cap = 0;
   size_t wb_all_cap = 0;
+  size_t wb_at_cap = 0;
 
   /* MIR owns saved registers and the frame; discard anything the legacy
    * promoter left in the context. */
@@ -1781,6 +1909,39 @@ int code_generator_binary_emit_function_via_mir(
     }
   }
 
+  /* Address-taken globals (&g): a pointer can read/write their memory, so the
+   * cache vreg must be flushed before a pointer LOAD/STORE and reloaded after a
+   * pointer STORE. Collect them once (deduped). They are a subset of the cached
+   * globals above, so reads/writes still hit the fast register cache between
+   * pointer accesses. */
+  for (size_t i = 0; i < ir_function->instruction_count; i++) {
+    const IRInstruction *in = &ir_function->instructions[i];
+    if (in->op != IR_OP_ADDRESS_OF || in->lhs.kind != IR_OPERAND_SYMBOL ||
+        !in->lhs.name || !mir_name_is_global_scalar(generator, in->lhs.name)) {
+      continue;
+    }
+    int present = 0;
+    for (size_t j = 0; j < wb.at_count; j++) {
+      if (strcmp(wb.at[j], in->lhs.name) == 0) {
+        present = 1;
+        break;
+      }
+    }
+    if (present) {
+      continue;
+    }
+    if (wb.at_count >= wb_at_cap) {
+      size_t nc = wb_at_cap ? wb_at_cap * 2 : 4;
+      const char **grown = (const char **)realloc(wb.at, nc * sizeof(*grown));
+      if (!grown) {
+        goto oom;
+      }
+      wb.at = grown;
+      wb_at_cap = nc;
+    }
+    wb.at[wb.at_count++] = in->lhs.name;
+  }
+
   /* Hoist loop-invariant float constants (materializes them at entry, so this
    * must precede body lowering). */
   if (!mir_build_const_pool(&fn, generator, context, ir_function)) {
@@ -1807,6 +1968,19 @@ int code_generator_binary_emit_function_via_mir(
   for (size_t i = 0; i < ir_function->instruction_count; i++) {
     if (fold_skip[i]) {
       continue; /* address sub-expression folded into a SIB access */
+    }
+    /* A pointer LOAD/STORE may alias an address-taken global: flush the cached
+     * address-taken globals to memory first (so the access sees pending by-name
+     * writes), and reload them after a STORE (so a later by-name read sees what
+     * the store wrote through the alias). Empty set => no overhead. */
+    int mem_op = ir_function->instructions[i].op == IR_OP_LOAD ||
+                 ir_function->instructions[i].op == IR_OP_STORE;
+    int store_op = ir_function->instructions[i].op == IR_OP_STORE;
+    if (mem_op && wb.at_count > 0 &&
+        !mir_emit_global_flush_names(&fn, generator, &map, wb.at, wb.at_count)) {
+      free(fold_skip);
+      free(folds);
+      goto oom;
     }
     if (folds[i].valid) {
       if (!mir_lower_folded_access(&fn, generator, context, &map,
@@ -1848,6 +2022,13 @@ int code_generator_binary_emit_function_via_mir(
         goto oom;
       }
     }
+    if (store_op && wb.at_count > 0 &&
+        !mir_emit_global_reload_names(&fn, generator, &map, wb.at,
+                                      wb.at_count)) {
+      free(fold_skip);
+      free(folds);
+      goto oom;
+    }
     if (fn.has_error) {
       free(fold_skip);
       free(folds);
@@ -1869,6 +2050,7 @@ int code_generator_binary_emit_function_via_mir(
 
   free(wb.names);
   free(wb.all);
+  free(wb.at);
   mir_name_map_destroy(&map);
   mir_function_destroy(&fn);
   return 1;
@@ -1882,6 +2064,7 @@ oom:
   }
   free(wb.names);
   free(wb.all);
+  free(wb.at);
   mir_name_map_destroy(&map);
   mir_function_destroy(&fn);
   return 0;
