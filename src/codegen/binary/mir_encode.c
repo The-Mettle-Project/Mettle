@@ -404,8 +404,17 @@ static int encode_setcc(MirFunction *fn, const MirInst *in) {
   if (!ok) {
     return 0;
   }
-  if (in->b.kind == MIR_OPK_IMM &&
-      code_generator_binary_immediate_fits_signed_32(in->b.imm)) {
+  /* A 4-byte (int32/uint32) compare must be 32-bit: MIR computes in 64-bit, so a
+   * narrow operand can carry garbage in its high 32 bits; a 32-bit cmp ignores
+   * them (the low 32 bits are the true value). An immediate is staged into a
+   * register first since the 64-bit cmp-imm would sign-extend it. */
+  if (in->width == 4) {
+    BinaryGpRegister breg = value_reg(fn, &in->b, SCRATCH_B, &ok);
+    if (!ok || !binary_emit_cmp_reg_reg32(code, areg, breg)) {
+      return enc_err(fn, "out of memory in cmp32");
+    }
+  } else if (in->b.kind == MIR_OPK_IMM &&
+             code_generator_binary_immediate_fits_signed_32(in->b.imm)) {
     if (!binary_emit_cmp_reg_imm32(code, areg, (uint32_t)in->b.imm)) {
       return enc_err(fn, "out of memory in cmp imm");
     }
@@ -1171,16 +1180,33 @@ static int mir_home_float_params(MirFunction *fn, MirXmmMove *mv, int n) {
 /* Home all parameters from their ABI incoming locations into their vregs. */
 static int mir_home_parameters(MirFunction *fn) {
   size_t pc = fn->param_count;
+  const BinaryAbi *abi = code_generator_binary_active_abi();
+  /* An INDIRECT struct return prepends a hidden integer out-pointer argument
+   * (Win64: RCX, SysV: RDI); home it into the reserved vreg and shift every
+   * user parameter up one ABI slot in the layout. */
+  size_t hidden = fn->returns_indirect ? 1 : 0;
+  if (hidden) {
+    if (fn->indirect_return_vreg != MIR_VREG_NONE &&
+        fn->vregs[fn->indirect_return_vreg].assigned) {
+      MirOperand dst = mir_op_vreg(fn->indirect_return_vreg);
+      if (!store_from(fn, &dst, abi->indirect_return_register)) {
+        return enc_err(fn, "out of memory homing indirect-return pointer");
+      }
+    }
+  }
   if (pc == 0) {
     return 1;
   }
-  const BinaryAbi *abi = code_generator_binary_active_abi();
-  int is_float[MIR_MAX_PARAMS];
-  BinaryArgLocation locs[MIR_MAX_PARAMS];
-  for (size_t i = 0; i < pc; i++) {
-    is_float[i] = fn->params[i].is_float;
+  int is_float[MIR_MAX_PARAMS + 1];
+  BinaryArgLocation locs[MIR_MAX_PARAMS + 1];
+  if (hidden) {
+    is_float[0] = 0; /* hidden out-pointer is an integer arg */
   }
-  if (!code_generator_binary_compute_arg_layout(abi, is_float, pc, locs, NULL)) {
+  for (size_t i = 0; i < pc; i++) {
+    is_float[i + hidden] = fn->params[i].is_float;
+  }
+  if (!code_generator_binary_compute_arg_layout(abi, is_float, pc + hidden, locs,
+                                                NULL)) {
     return enc_err(fn, "failed to compute parameter layout");
   }
 
@@ -1191,7 +1217,7 @@ static int mir_home_parameters(MirFunction *fn) {
     if (!fn->vregs[p->vreg].assigned) {
       continue; /* unused parameter */
     }
-    const BinaryArgLocation *loc = &locs[i];
+    const BinaryArgLocation *loc = &locs[i + hidden];
     if (!p->is_float) {
       if (loc->kind == BINARY_ARG_IN_GP_REGISTER) {
         if (!mir_home_gp_param(fn, p, loc->gp_register)) {
@@ -1615,8 +1641,17 @@ int mir_encode(MirFunction *fn) {
         ok = 0;
         break;
       }
-      if (in->b.kind == MIR_OPK_IMM &&
-          code_generator_binary_immediate_fits_signed_32(in->b.imm)) {
+      if (in->width == 4) {
+        /* 4-byte (int32/uint32) compare: 32-bit cmp ignores garbage high bits a
+         * 64-bit MIR value may carry (see encode_setcc). The immediate is staged
+         * into a register since the 64-bit cmp-imm would sign-extend it. */
+        BinaryGpRegister breg = value_reg(fn, &in->b, SCRATCH_B, &rok);
+        if (!rok || !binary_emit_cmp_reg_reg32(&ctx->code, areg, breg)) {
+          ok = enc_err(fn, "out of memory in cmpbr32");
+          break;
+        }
+      } else if (in->b.kind == MIR_OPK_IMM &&
+                 code_generator_binary_immediate_fits_signed_32(in->b.imm)) {
         if (!binary_emit_cmp_reg_imm32(&ctx->code, areg, (uint32_t)in->b.imm)) {
           ok = enc_err(fn, "out of memory in cmpbr");
           break;

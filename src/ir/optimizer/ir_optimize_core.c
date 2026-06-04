@@ -1006,6 +1006,16 @@ static int ir_expression_map_store_value_for_instruction(
     return 0;
   }
 
+  /* Refuse self-referential definitions such as `@i = @i + 1`, where the
+   * destination is also one of the source operands. Recording `@i + 1 -> @i`
+   * is invalid: this instruction redefines @i, so the operand named in the key
+   * now holds a different value than when the expression was evaluated. A later
+   * textual `@i + 1` (using the new @i) would wrongly be rewritten to @i. */
+  if (ir_operand_equals(&instruction->dest, &instruction->lhs) ||
+      ir_operand_equals(&instruction->dest, &instruction->rhs)) {
+    return 1;
+  }
+
   int existing_index =
       ir_expression_map_find_matching_instruction(map, instruction);
   if (existing_index >= 0) {

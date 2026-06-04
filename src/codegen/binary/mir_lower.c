@@ -11,8 +11,8 @@
  * list can be prioritized by real frequency. Returns 0 (ineligible). */
 static int mir_trace_bail(FunctionDeclaration *fd, const char *reason) {
   if (getenv("METTLE_MIR_TRACE")) {
-    fprintf(stderr, "MIR-BAIL\t%s\n", reason);
-    (void)fd;
+    fprintf(stderr, "MIR-BAIL\t%s\t%s\n", reason,
+            (fd && fd->name) ? fd->name : "?");
   }
   return 0;
 }
@@ -236,6 +236,47 @@ static int mir_operand_is_unsigned(CodeGenerator *g, BinaryFunctionContext *ctx,
   return !code_generator_binary_resolved_type_is_signed_integer(t);
 }
 
+/* Byte width that constrains an integer comparison operand: its scalar size for
+ * a known <=4-byte integer, 8 for a 64-bit integer / pointer / unknown type, and
+ * 0 for an INT literal (it constrains nothing — it follows the other operand). */
+static int mir_cmp_operand_width(CodeGenerator *g, BinaryFunctionContext *ctx,
+                                 const IROperand *op) {
+  if (op->kind == IR_OPERAND_INT) {
+    return 0;
+  }
+  Type *t = code_generator_binary_get_operand_type_in_context(g, ctx, op);
+  if (!t || code_generator_type_is_aggregate(t) ||
+      code_generator_binary_resolved_type_float_bits(t) != 0) {
+    return 8;
+  }
+  int s = code_generator_binary_resolved_type_scalar_size(t);
+  return (s == 1 || s == 2 || s == 4) ? s : 8;
+}
+
+/* Width at which to compare two integer operands. MIR computes in 64-bit, so a
+ * narrow value (e.g. a uint32 product) can carry garbage in its high bits; a
+ * full 64-bit compare would then see that garbage and give the wrong answer.
+ *
+ * We narrow to a 32-bit compare ONLY for an EQUALITY test (== / !=) of an exact
+ * 4-byte (int32/uint32) pair: equality is signedness-agnostic, so a 32-bit cmp
+ * that ignores the high bits is unambiguously correct and fixes the garbage-bit
+ * miscompile. ORDERING tests (< <= > >=) keep the 64-bit compare: their result
+ * depends on signedness, and a narrow operand's canonical low bits already
+ * compare correctly once both operands are zero/sign-extended to 64 bits (the
+ * usual case), so narrowing them would risk a regression where the operand
+ * signedness is imperfectly recovered. 8 otherwise (the conservative default). */
+static int mir_int_compare_width(CodeGenerator *g, BinaryFunctionContext *ctx,
+                                 const char *op, const IROperand *lhs,
+                                 const IROperand *rhs) {
+  if (!op || (strcmp(op, "==") != 0 && strcmp(op, "!=") != 0)) {
+    return 8;
+  }
+  int wl = mir_cmp_operand_width(g, ctx, lhs);
+  int wr = mir_cmp_operand_width(g, ctx, rhs);
+  int m = wl > wr ? wl : wr;
+  return m == 4 ? 4 : 8;
+}
+
 /* ---- eligibility -------------------------------------------------------- */
 
 static int mir_type_is_gp_scalar(CodeGenerator *g, const char *type_name) {
@@ -310,6 +351,70 @@ static int mir_type_is_param_value(CodeGenerator *g, const char *type_name) {
          mir_type_is_indirect_aggregate(g, type_name);
 }
 
+/* Resolve the type of a NAME that is a parameter or a declared local of this IR
+ * function. The symbol table has popped function scope by codegen time, so a
+ * direct symbol_table_lookup returns NULL for locals/params; instead read the
+ * function signature and DECLARE_LOCAL instructions, exactly as
+ * code_generator_binary_get_operand_type_in_context does. *is_param_out (if
+ * given) is set when the name is a parameter. Returns NULL for globals/unknown
+ * names (which the caller resolves through the global symbol table). */
+static Type *mir_local_or_param_type(CodeGenerator *g,
+                                     const IRFunction *ir_function,
+                                     const char *name, int *is_param_out) {
+  if (is_param_out) {
+    *is_param_out = 0;
+  }
+  if (!g || !ir_function || !name) {
+    return NULL;
+  }
+  for (size_t i = 0; i < ir_function->parameter_count; i++) {
+    if (ir_function->parameter_names && ir_function->parameter_names[i] &&
+        strcmp(ir_function->parameter_names[i], name) == 0) {
+      if (is_param_out) {
+        *is_param_out = 1;
+      }
+      return code_generator_binary_get_resolved_type(
+          g, ir_function->parameter_types ? ir_function->parameter_types[i]
+                                          : NULL,
+          0);
+    }
+  }
+  for (size_t i = 0; i < ir_function->instruction_count; i++) {
+    const IRInstruction *in = &ir_function->instructions[i];
+    if (in->op == IR_OP_DECLARE_LOCAL && in->dest.name &&
+        strcmp(in->dest.name, name) == 0 && in->text) {
+      return code_generator_binary_get_resolved_type(g, in->text, 0);
+    }
+  }
+  return NULL;
+}
+
+/* True if NAME is an INDIRECT aggregate local or by-reference parameter of this
+ * function. MIR only touches such a value through its ADDRESS (field LOAD/STORE
+ * off &@sym); a by-NAME use of the whole aggregate (assign, return, call
+ * argument) would be miscompiled as an 8-byte MOV, so the eligibility gate
+ * forbids it (except `return @local`, handled by Link 2). */
+static int mir_name_is_indirect_aggregate(CodeGenerator *g,
+                                          const IRFunction *ir_function,
+                                          const char *name) {
+  Type *t = mir_local_or_param_type(g, ir_function, name, NULL);
+  return t && code_generator_type_is_aggregate(t) &&
+         code_generator_abi_classify(t) == ABI_PASS_INDIRECT;
+}
+
+/* True if NAME is a struct LOCAL (not a by-reference parameter): one that owns a
+ * stack home holding the struct itself. `return @local` for an INDIRECT return
+ * copies from that home; a by-ref PARAMETER's home holds a pointer, not the
+ * struct, so it is excluded (deferred to the fallback). */
+static int mir_name_is_indirect_struct_local(CodeGenerator *g,
+                                             const IRFunction *ir_function,
+                                             const char *name) {
+  int is_param = 0;
+  Type *t = mir_local_or_param_type(g, ir_function, name, &is_param);
+  return t && !is_param && code_generator_type_is_aggregate(t) &&
+         code_generator_abi_classify(t) == ABI_PASS_INDIRECT;
+}
+
 /* True if temp `name` holds a float value, judged from the producing
  * instruction's is_float flag (transitively through assign chains and call
  * return types). Uses IR structure only, so it is safe in eligibility (no
@@ -370,6 +475,7 @@ typedef enum {
 } MirAddrofKind;
 
 static MirAddrofKind mir_addressof_kind(CodeGenerator *g,
+                                        const IRFunction *ir_function,
                                         const IRInstruction *in) {
   if (in->lhs.kind != IR_OPERAND_SYMBOL || !in->lhs.name) {
     return MIR_ADDROF_UNSUPPORTED;
@@ -377,27 +483,27 @@ static MirAddrofKind mir_addressof_kind(CodeGenerator *g,
   if (code_generator_find_ir_function_binary(g, in->lhs.name)) {
     return MIR_ADDROF_UNSUPPORTED; /* function address */
   }
-  Symbol *s =
-      g->symbol_table ? symbol_table_lookup(g->symbol_table, in->lhs.name) : NULL;
-  if (!s || s->kind == SYMBOL_FUNCTION) {
-    return MIR_ADDROF_UNSUPPORTED;
-  }
-  if (s->type && s->type->kind == TYPE_STRING) {
-    return MIR_ADDROF_UNSUPPORTED; /* string symbol has its own address form */
-  }
-  if (s->scope && s->scope->type == SCOPE_GLOBAL) {
-    /* &global: only a plain scalar global (one we cache, hence can keep
-     * coherent via flush/reload around memory ops). */
+  /* Resolve the target as a local/parameter of this function from the IR (the
+   * symbol table has popped function scope by codegen time, so a direct lookup
+   * fails for locals/params). A NULL type means the name is a global/external. */
+  int is_param = 0;
+  Type *t = mir_local_or_param_type(g, ir_function, in->lhs.name, &is_param);
+  if (!t) {
+    /* Not a local/param: a global (or extern). Only a plain scalar global is
+     * supported (cached, kept coherent via flush/reload around pointer ops). */
     return mir_name_is_global_scalar(g, in->lhs.name) ? MIR_ADDROF_GLOBAL
                                                       : MIR_ADDROF_UNSUPPORTED;
   }
+  if (t->kind == TYPE_STRING) {
+    return MIR_ADDROF_UNSUPPORTED; /* string has its own (fat-pointer) address form */
+  }
   /* An INDIRECT-aggregate parameter is passed by reference: the parameter value
    * already IS the struct's address, so &@p just yields that pointer. */
-  if (s->kind == SYMBOL_PARAMETER && s->type &&
-      code_generator_abi_classify(s->type) == ABI_PASS_INDIRECT) {
+  if (is_param && code_generator_type_is_aggregate(t) &&
+      code_generator_abi_classify(t) == ABI_PASS_INDIRECT) {
     return MIR_ADDROF_INDIRECT_PARAM;
   }
-  return MIR_ADDROF_LOCAL; /* scalar/DIRECT-agg local or parameter (lea home) */
+  return MIR_ADDROF_LOCAL; /* scalar/DIRECT/INDIRECT-agg local or param: lea home */
 }
 
 static int mir_call_is_supported(CodeGenerator *g, const IRInstruction *in) {
@@ -504,24 +610,46 @@ int mir_function_is_eligible(CodeGenerator *generator,
     }
     /* GP params beyond the ABI's argument registers are homed from the caller's
      * stack frame (handled below). A FLOAT param landing on the stack is not
-     * homed yet, so defer those functions to the fallback. */
+     * homed yet, so defer those functions to the fallback. An INDIRECT struct
+     * return consumes the first integer argument slot as a hidden out-pointer,
+     * shifting every user parameter up by one — model that here so the on-stack
+     * detection matches the prologue's homing exactly. */
+    int hidden = mir_type_is_indirect_aggregate(generator,
+                                                function_data->return_type)
+                     ? 1
+                     : 0;
     if (function_data->parameter_count > 0) {
       const BinaryAbi *abi = code_generator_binary_active_abi();
-      BinaryArgLocation locs[MIR_MAX_PARAMS];
-      if (!code_generator_binary_compute_arg_layout(
-              abi, pis_float, function_data->parameter_count, locs, NULL)) {
+      int aug_float[MIR_MAX_PARAMS + 1];
+      BinaryArgLocation locs[MIR_MAX_PARAMS + 1];
+      size_t n = function_data->parameter_count + (size_t)hidden;
+      if (n > MIR_MAX_PARAMS) {
+        return mir_trace_bail(function_data, "sig:params>max");
+      }
+      if (hidden) {
+        aug_float[0] = 0; /* hidden out-pointer is an integer arg */
+      }
+      for (size_t i = 0; i < function_data->parameter_count; i++) {
+        aug_float[i + (size_t)hidden] = pis_float[i];
+      }
+      if (!code_generator_binary_compute_arg_layout(abi, aug_float, n, locs,
+                                                    NULL)) {
         return mir_trace_bail(function_data, "sig:arg_layout");
       }
       for (size_t i = 0; i < function_data->parameter_count; i++) {
-        if (pis_float[i] && locs[i].kind == BINARY_ARG_ON_STACK) {
+        if (pis_float[i] &&
+            locs[i + (size_t)hidden].kind == BINARY_ARG_ON_STACK) {
           return mir_trace_bail(function_data, "sig:float_stack_param");
         }
       }
     }
   }
+  /* A non-void return must be a register value (scalar / DIRECT small agg) OR an
+   * INDIRECT aggregate returned via the hidden out-pointer (handled at RETURN). */
   if (function_data->return_type && function_data->return_type[0] &&
       strcmp(function_data->return_type, "void") != 0 &&
-      !mir_type_is_mir_value(generator, function_data->return_type)) {
+      !mir_type_is_mir_value(generator, function_data->return_type) &&
+      !mir_type_is_indirect_aggregate(generator, function_data->return_type)) {
     return mir_trace_bail(function_data, "sig:return_nonscalar");
   }
 
@@ -599,6 +727,37 @@ int mir_function_is_eligible(CodeGenerator *generator,
 
   for (size_t i = 0; i < ir_function->instruction_count; i++) {
     const IRInstruction *in = &ir_function->instructions[i];
+    /* Whole-struct by-name guard: an INDIRECT aggregate (struct local or
+     * by-reference param) may only be DECLARED or have its ADDRESS taken; MIR
+     * reaches its fields exclusively through &@sym + offset memory ops. Any
+     * other by-name appearance (assign/return/call-arg/store value) would copy
+     * just the low 8 bytes, so defer such a function to the fallback. */
+    {
+      const IROperand *whole[3] = {&in->dest, &in->lhs, &in->rhs};
+      for (int k = 0; k < 3; k++) {
+        const IROperand *o = whole[k];
+        if (o->kind != IR_OPERAND_SYMBOL || !o->name ||
+            !mir_name_is_indirect_aggregate(generator, ir_function, o->name)) {
+          continue;
+        }
+        int allowed =
+            (in->op == IR_OP_DECLARE_LOCAL && o == &in->dest) ||
+            (in->op == IR_OP_ADDRESS_OF && o == &in->lhs) ||
+            (in->op == IR_OP_RETURN && o == &in->lhs &&
+             mir_name_is_indirect_struct_local(generator, ir_function, o->name));
+        if (!allowed) {
+          return mir_trace_bail(function_data, "indirect_agg_byname");
+        }
+      }
+      for (size_t a = 0; a < in->argument_count; a++) {
+        if (in->arguments[a].kind == IR_OPERAND_SYMBOL &&
+            in->arguments[a].name &&
+            mir_name_is_indirect_aggregate(generator, ir_function,
+                                           in->arguments[a].name)) {
+          return mir_trace_bail(function_data, "indirect_agg_byname");
+        }
+      }
+    }
     switch (in->op) {
     case IR_OP_NOP:
     case IR_OP_LABEL:
@@ -607,9 +766,14 @@ int mir_function_is_eligible(CodeGenerator *generator,
     case IR_OP_DECLARE_LOCAL:
       /* A DIRECT small-aggregate local is allowed: field access lowers to
        * &local + offset + LOAD/STORE (all supported), and when its address is
-       * taken it becomes memory-resident with an 8-byte home covering it. */
-      if (in->text && !mir_type_is_mir_value(generator, in->text)) {
-        return 0;
+       * taken it becomes memory-resident with an 8-byte home covering it. An
+       * INDIRECT struct local is also allowed: it gets a multi-slot home sized
+       * to the whole struct (home_bytes), and the same &local + offset + memory
+       * machinery reaches every field. Whole-struct by-name uses of it are
+       * rejected by the guard below, so only field access ever touches it. */
+      if (in->text && !mir_type_is_mir_value(generator, in->text) &&
+          !mir_type_is_indirect_aggregate(generator, in->text)) {
+        return mir_trace_bail(function_data, "declare_local:nonscalar");
       }
       break;
     case IR_OP_BRANCH_ZERO:
@@ -732,6 +896,17 @@ int mir_function_is_eligible(CodeGenerator *generator,
           in->lhs.kind != IR_OPERAND_SYMBOL && in->lhs.kind != IR_OPERAND_INT) {
         return 0;
       }
+      /* An INDIRECT-returning function only handles `return @struct_local`: the
+       * RETURN lowering copies from the local's home into the hidden slot. Any
+       * other shape (returning a temp, a by-ref param, or a struct-returning
+       * call result) is deferred to the fallback. */
+      if (mir_type_is_indirect_aggregate(generator,
+                                         function_data->return_type) &&
+          !(in->lhs.kind == IR_OPERAND_SYMBOL &&
+            mir_name_is_indirect_struct_local(generator, ir_function,
+                                              in->lhs.name))) {
+        return mir_trace_bail(function_data, "return:indirect_nonlocal");
+      }
       break;
     case IR_OP_CALL:
       if (!mir_call_is_supported(generator, in)) {
@@ -742,7 +917,8 @@ int mir_function_is_eligible(CodeGenerator *generator,
       /* &local/&param (made memory-resident via forced spill) or &global (kept
        * cached but coherent via flush/reload around pointer memory ops).
        * Functions/strings have their own address forms and are deferred. */
-      if (mir_addressof_kind(generator, in) == MIR_ADDROF_UNSUPPORTED) {
+      if (mir_addressof_kind(generator, ir_function, in) ==
+          MIR_ADDROF_UNSUPPORTED) {
         return mir_trace_bail(function_data, "addressof:unsupported");
       }
       if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
@@ -855,6 +1031,35 @@ static int mir_emit_global_reloads(MirFunction *fn, CodeGenerator *g,
     return 1;
   }
   return mir_emit_global_reload_names(fn, g, map, wb->all, wb->all_count);
+}
+
+/* Emit a fixed-size byte copy of `size` bytes from [src_base] to [dst_base],
+ * where both bases are pointer vregs. Lowered as a straight-line sequence of
+ * load/store pairs through a fresh GP temp (8 bytes at a time, then a 4/2/1
+ * tail) — exactly the [base + disp] memory MOVs the field-access path already
+ * uses, so it needs no new encoder support and the allocator schedules the
+ * pointers and temps normally. Used to copy an INDIRECT struct into a caller's
+ * hidden return slot (and, later, for whole-struct assignment and arguments). */
+static int mir_emit_struct_copy(MirFunction *fn, MirVregId dst_base,
+                                MirVregId src_base, int size) {
+  for (int k = 0; k < size;) {
+    int rem = size - k;
+    int w = rem >= 8 ? 8 : (rem >= 4 ? 4 : (rem >= 2 ? 2 : 1));
+    MirVregId tmp = mir_new_vreg(fn, MIR_RC_GP, 8);
+    if (tmp == MIR_VREG_NONE) {
+      return 0;
+    }
+    MirOperand src_mem = mir_op_mem_vreg(src_base, MIR_VREG_NONE, 1, k);
+    MirOperand dst_mem = mir_op_mem_vreg(dst_base, MIR_VREG_NONE, 1, k);
+    if (!mir_emit1(fn, MIR_MOV, mir_op_vreg(tmp), src_mem, mir_op_none(), w, 1,
+                   0) ||
+        !mir_emit1(fn, MIR_MOV, dst_mem, mir_op_vreg(tmp), mir_op_none(), w, 1,
+                   0)) {
+      return 0;
+    }
+    k += w;
+  }
+  return 1;
 }
 
 /* A width-tagged float register move (xmm copy). */
@@ -1162,7 +1367,8 @@ static int mir_lower_compare_branch(MirFunction *fn, CodeGenerator *g,
     fn->has_error = 1;
     return 0;
   }
-  return mir_emit1(fn, MIR_CMPBR, mir_op_label(br->text), a, b, 8, uns, cc);
+  int w = mir_int_compare_width(g, ctx, cmp->text, &cmp->lhs, &cmp->rhs);
+  return mir_emit1(fn, MIR_CMPBR, mir_op_label(br->text), a, b, w, uns, cc);
 }
 
 /* True when instruction i is a single-use comparison (integer or ordered float)
@@ -1283,7 +1489,8 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
                 mir_operand_is_unsigned(g, ctx, &in->rhs);
       unsigned char cc = 0;
       mir_setcc_opcode(in->text, uns, &cc);
-      return mir_emit1(fn, MIR_SETCC, dst, a, b, 8, uns, cc);
+      int w = mir_int_compare_width(g, ctx, in->text, &in->lhs, &in->rhs);
+      return mir_emit1(fn, MIR_SETCC, dst, a, b, w, uns, cc);
     }
     if (strcmp(in->text, "/") == 0 || strcmp(in->text, "%") == 0) {
       /* idiv/div: signedness is the dividend's (lhs) type; cc carries the
@@ -1415,6 +1622,39 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
   }
 
   case IR_OP_RETURN: {
+    if (fn->returns_indirect && in->lhs.kind == IR_OPERAND_SYMBOL) {
+      /* INDIRECT struct return: copy the struct local into the caller's hidden
+       * slot (whose pointer the prologue homed into indirect_return_vreg), then
+       * leave that pointer in RAX as the Win64/SysV ABI requires. The source is
+       * the struct local's stack home; LEA it like any &@local. */
+      MirOperand structv = mir_value_operand(fn, g, ctx, map, &in->lhs);
+      if (structv.kind != MIR_OPK_VREG ||
+          fn->indirect_return_vreg == MIR_VREG_NONE) {
+        fn->has_error = 1;
+        return 0;
+      }
+      fn->vregs[structv.vreg].address_taken = 1;
+      if (fn->vregs[structv.vreg].home_bytes < fn->indirect_return_size) {
+        fn->vregs[structv.vreg].home_bytes =
+            (fn->indirect_return_size + 7) & ~7;
+      }
+      MirVregId src_base = mir_new_vreg(fn, MIR_RC_GP, 8);
+      if (src_base == MIR_VREG_NONE ||
+          !mir_emit1(fn, MIR_LEA_LOCAL, mir_op_vreg(src_base), structv,
+                     mir_op_none(), 8, 0, 0) ||
+          !mir_emit_struct_copy(fn, fn->indirect_return_vreg, src_base,
+                                fn->indirect_return_size) ||
+          !mir_emit1(fn, MIR_MOV, mir_op_phys(BINARY_GP_RAX, MIR_RC_GP),
+                     mir_op_vreg(fn->indirect_return_vreg), mir_op_none(), 8, 0,
+                     0)) {
+        return 0;
+      }
+      if (!mir_emit_global_writebacks(fn, g, map, wb)) {
+        return 0;
+      }
+      return mir_emit1(fn, MIR_RET, mir_op_none(), mir_op_none(), mir_op_none(),
+                       8, 0, 0);
+    }
     if (in->lhs.kind != IR_OPERAND_NONE) {
       MirOperand src = mir_value_operand(fn, g, ctx, map, &in->lhs);
       int rfb = code_generator_binary_operand_float_bits(g, ctx, &in->lhs);
@@ -1450,7 +1690,8 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
           in->arguments[msg_idx].name) {
         msg = in->arguments[msg_idx].name;
       }
-      return mir_emit1(fn, MIR_TRAP, mir_op_symbol(msg), mir_op_none(),
+      /* The abort message goes in operand `a` (MIR_TRAP reads in->a.sym). */
+      return mir_emit1(fn, MIR_TRAP, mir_op_none(), mir_op_symbol(msg),
                        mir_op_none(), 8, 0, 0);
     }
     /* Declare external callees so the linker resolves the relocation. */
@@ -1551,7 +1792,11 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
 
   case IR_OP_ADDRESS_OF: {
     MirOperand dst = mir_value_operand(fn, g, ctx, map, &in->dest);
-    MirAddrofKind ak = mir_addressof_kind(g, in);
+    const IRFunction *irf =
+        ctx && ctx->function_name
+            ? code_generator_find_ir_function_binary(g, ctx->function_name)
+            : NULL;
+    MirAddrofKind ak = mir_addressof_kind(g, irf, in);
     if (ak == MIR_ADDROF_INDIRECT_PARAM) {
       /* &@p of a by-reference (INDIRECT) struct param: the param already holds
        * the struct's address, so the address-of is just a copy of the pointer. */
@@ -1577,6 +1822,20 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
       return 0;
     }
     fn->vregs[src.vreg].address_taken = 1;
+    /* An INDIRECT struct local needs a home large enough for the whole struct,
+     * since field stores reach past the first 8 bytes. Size it to the struct
+     * size rounded up to an 8-byte slot. (Scalars and DIRECT small aggregates
+     * keep home_bytes == 0, i.e. the default single slot.) The type is resolved
+     * from the IR (function scope has popped from the symbol table by now). */
+    {
+      int is_param = 0;
+      Type *lt = mir_local_or_param_type(g, irf, in->lhs.name, &is_param);
+      if (lt && !is_param && code_generator_type_is_aggregate(lt) &&
+          code_generator_abi_classify(lt) == ABI_PASS_INDIRECT) {
+        size_t sz = code_generator_abi_type_size(lt);
+        fn->vregs[src.vreg].home_bytes = (int)((sz + 7) & ~(size_t)7);
+      }
+    }
     return mir_emit1(fn, MIR_LEA_LOCAL, dst, src, mir_op_none(), 8, 0, 0);
   }
 
@@ -1902,6 +2161,24 @@ int code_generator_binary_emit_function_via_mir(
             ? code_generator_binary_resolved_type_is_signed_integer(pt)
             : 0;
     fn.param_count++;
+  }
+
+  /* INDIRECT struct return: the caller passes a hidden out-pointer (Win64: RCX,
+   * SysV: RDI) ahead of the user arguments. Reserve a vreg for it; the prologue
+   * homes that register into it (shifting user params up one ABI slot) and each
+   * RETURN copies the struct there and returns the pointer in RAX. */
+  {
+    Type *rt = code_generator_binary_get_resolved_type(
+        generator, function_data->return_type, 1);
+    if (rt && code_generator_type_is_aggregate(rt) &&
+        code_generator_abi_classify(rt) == ABI_PASS_INDIRECT) {
+      fn.returns_indirect = 1;
+      fn.indirect_return_size = (int)code_generator_abi_type_size(rt);
+      fn.indirect_return_vreg = mir_new_vreg(&fn, MIR_RC_GP, 8);
+      if (fn.indirect_return_vreg == MIR_VREG_NONE) {
+        goto oom;
+      }
+    }
   }
 
   /* Cache global scalars: load each referenced global once at entry into a vreg

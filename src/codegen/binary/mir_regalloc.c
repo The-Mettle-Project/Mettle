@@ -210,6 +210,14 @@ static void mir_compute_liveness(MirFunction *fn) {
       pv->live_start = 0;
     }
   }
+  /* The hidden INDIRECT-return out-pointer is also defined by the prologue, so
+   * it is live from entry to its last use (the struct copy at each RETURN). */
+  if (fn->returns_indirect && fn->indirect_return_vreg != MIR_VREG_NONE) {
+    MirVreg *rv = &fn->vregs[fn->indirect_return_vreg];
+    if (rv->live_end != MIR_LIVE_NONE) {
+      rv->live_start = 0;
+    }
+  }
 
   /* Conservatively extend intervals across backward branches (loops) to a
    * fixpoint. For each branch at B targeting a label at L < B, any vreg whose
@@ -429,7 +437,11 @@ int mir_regalloc(MirFunction *fn) {
   for (size_t v = 0; v < fn->vreg_count; v++) {
     MirVreg *vr = &fn->vregs[v];
     if (vr->address_taken) {
-      next_spill_offset += 8;
+      /* A struct local owns a multi-slot home (home_bytes); the slot offset is
+       * the FAR (highest) end since homes grow downward from rbp, so the home
+       * spans [rbp - offset .. rbp - offset + home_bytes). */
+      int home = vr->home_bytes > 0 ? vr->home_bytes : 8;
+      next_spill_offset += home;
       vr->assigned = 1;
       vr->in_register = 0;
       vr->spill_offset = next_spill_offset;

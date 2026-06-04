@@ -60,6 +60,12 @@ typedef struct {
    * loads and every def stores through its stack home, and a store through an
    * aliasing pointer is visible to a later by-name read. */
   int address_taken;
+  /* Byte size of this value's stack home when address_taken. 0 means the
+   * default single 8-byte slot (scalars and DIRECT small aggregates). An
+   * INDIRECT struct local sets this to its struct size rounded up to 8 so the
+   * home covers the whole aggregate (field stores reach past the first 8
+   * bytes). Always a multiple of 8. */
+  int home_bytes;
 } MirVreg;
 #define MIR_LIVE_NONE (-1)
 
@@ -266,6 +272,14 @@ typedef struct {
    * to move ABI arg registers into the param vregs with correct extension. */
   MirParam params[MIR_MAX_PARAMS];
   size_t param_count;
+
+  /* INDIRECT struct return (Win64: hidden out-pointer in RCX, SysV: RDI). When
+   * set, the prologue homes that register into indirect_return_vreg (shifting
+   * every user parameter up one ABI slot), and each RETURN copies the struct
+   * into [indirect_return_vreg] and leaves the pointer in RAX. */
+  int returns_indirect;
+  int indirect_return_size;       /* struct size in bytes (>8, INDIRECT) */
+  MirVregId indirect_return_vreg; /* holds the hidden out-pointer */
 
   /* Loop-invariant float constants materialized once at entry (see mir_lower). */
   MirFConst *fconsts;

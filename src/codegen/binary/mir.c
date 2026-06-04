@@ -10,6 +10,7 @@ void mir_function_init(MirFunction *fn, BinaryFunctionContext *context) {
   }
   memset(fn, 0, sizeof(*fn));
   fn->context = context;
+  fn->indirect_return_vreg = MIR_VREG_NONE;
 }
 
 void mir_function_destroy(MirFunction *fn) {
