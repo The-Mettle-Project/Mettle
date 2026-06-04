@@ -1,0 +1,32 @@
+// Reliability: the native allocator must reject double-frees and frees of
+// bogus/interior pointers (rather than corrupting its free list and crashing
+// later), counting them in invalid_frees, and stay fully usable afterward.
+
+import "std/io";
+import "std/mem";
+import "std/alloc";
+
+function main() -> int32 {
+  var a: cstring = mx_alloc((int64)64);
+  mx_free(a);
+  mx_free(a);                            // double free -> rejected
+  mx_free((cstring)0);                   // null free -> no-op (not counted)
+  var b: cstring = mx_alloc((int64)64);
+  var c: cstring = mx_alloc((int64)64);
+  if (b == 0 || c == 0 || b == c) { println("DF FAIL: free list corrupted"); return 1; }
+
+  mx_free((cstring)((int64)b + (int64)8)); // interior pointer -> rejected
+  mx_free(b);                            // legitimate
+  mx_free(b);                            // double free -> rejected
+
+  var st: MemStats = mx_stats();
+  if (st.invalid_frees != (int64)3) { println("DF FAIL: invalid_frees count"); return 1; }
+
+  var d: cstring = mx_alloc((int64)128);
+  if (d == 0) { println("DF FAIL: heap unusable"); return 1; }
+  mem_fill(d, (int32)0x55, (int64)128);
+  mx_free(d);
+
+  println("DOUBLEFREE OK");
+  return 0;
+}

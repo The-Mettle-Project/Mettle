@@ -1087,6 +1087,104 @@ static void ir_dump_block_edges(FILE *output, const char *label,
   }
 }
 
+/* Replace insn->text with a copy of `name`, freeing the old text. */
+static int ir_retarget_call(IRInstruction *insn, const char *name) {
+  char *copy = mettle_strdup(name);
+  if (!copy) {
+    return 0;
+  }
+  free(insn->text);
+  insn->text = copy;
+  return 1;
+}
+
+int ir_program_route_to_native_heap(IRProgram *program) {
+  if (!program) {
+    return 0;
+  }
+  for (size_t f = 0; f < program->function_count; f++) {
+    IRFunction *fn = program->functions[f];
+    if (!fn) {
+      continue;
+    }
+    /* Never rewrite inside the allocator shims themselves. They bottom out on
+     * the OS page layer (never malloc/free/new), so no rewrite is needed
+     * today; the guard makes that invariant robust against a future shim edit
+     * that would otherwise turn a literal free or malloc call into
+     * self-recursion. The "mettle_heap_" prefix is distinctive enough not to
+     * collide with user code, and the allocator core calls no allocation
+     * surface either, so it needs no guard. */
+    if (fn->name && strncmp(fn->name, "mettle_heap_", 12) == 0) {
+      continue;
+    }
+    for (size_t i = 0; i < fn->instruction_count; i++) {
+      IRInstruction *insn = &fn->instructions[i];
+
+      if (insn->op == IR_OP_NEW) {
+        /* new T  ->  mettle_heap_zeroed(sizeof T). The size is in rhs. An
+         * absent or non-positive constant size means a default object (8
+         * bytes), the same fallback the backend's original new lowering used.
+         * Any other operand (the normal case is an INT constant; TEMP/SYMBOL
+         * are copied faithfully, duplicating an owned name) is forwarded. */
+        IROperand size_arg;
+        memset(&size_arg, 0, sizeof(size_arg));
+        if (insn->rhs.kind == IR_OPERAND_NONE ||
+            (insn->rhs.kind == IR_OPERAND_INT && insn->rhs.int_value <= 0)) {
+          size_arg.kind = IR_OPERAND_INT;
+          size_arg.int_value = 8;
+        } else {
+          size_arg = insn->rhs;
+          if (insn->rhs.name) {
+            size_arg.name = mettle_strdup(insn->rhs.name);
+            if (!size_arg.name) {
+              return 0;
+            }
+          }
+        }
+
+        IROperand *args = (IROperand *)calloc(1, sizeof(IROperand));
+        char *callee = mettle_strdup("mettle_heap_zeroed");
+        if (!args || !callee) {
+          free(args);
+          free(callee);
+          return 0;
+        }
+        args[0] = size_arg;
+        free(insn->text);
+        insn->text = callee;
+        insn->arguments = args;
+        insn->argument_count = 1;
+        insn->op = IR_OP_CALL;
+        /* rhs ownership moved into args[0] (TEMP name re-duplicated above), so
+         * detach it from the instruction to avoid a double free. */
+        memset(&insn->rhs, 0, sizeof(insn->rhs));
+        insn->rhs.kind = IR_OPERAND_NONE;
+        continue;
+      }
+
+      if (insn->op == IR_OP_CALL && insn->text) {
+        if (strcmp(insn->text, "malloc") == 0 && insn->argument_count == 1) {
+          if (!ir_retarget_call(insn, "mettle_heap_alloc")) return 0;
+        } else if (strcmp(insn->text, "calloc") == 0 &&
+                   insn->argument_count == 2) {
+          if (!ir_retarget_call(insn, "mettle_heap_calloc")) return 0;
+        } else if (strcmp(insn->text, "realloc") == 0 &&
+                   insn->argument_count == 2) {
+          if (!ir_retarget_call(insn, "mettle_heap_realloc")) return 0;
+        } else if (strcmp(insn->text, "free") == 0 &&
+                   insn->argument_count == 1) {
+          if (!ir_retarget_call(insn, "mettle_heap_free")) return 0;
+        }
+      }
+    }
+    /* Calls were added/retyped; the cached CFG (if any) is unaffected in shape,
+     * but mark it stale so any later consumer rebuilds rather than trusting
+     * per-op metadata. */
+    ir_function_clear_cfg(fn);
+  }
+  return 1;
+}
+
 int ir_program_dump(IRProgram *program, FILE *output) {
   if (!program || !output) {
     return 0;

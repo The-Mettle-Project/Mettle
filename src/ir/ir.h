@@ -268,4 +268,16 @@ int ir_program_dump(IRProgram *program, FILE *output);
 int ir_instruction_dump(const IRInstruction *instruction,
                         char *buffer, size_t capacity);
 
+/* --native-heap: retarget the allocation surface onto std/alloc's Mettle
+ * allocator at the IR level, so the rewritten calls flow through the normal,
+ * fully-optimized call path on every backend (MIR and legacy) instead of a
+ * fragile backend-injected call. Rewrites, in every function:
+ *   - IR_OP_NEW          -> IR_OP_CALL "mettle_heap_zeroed"(size)
+ *   - call "malloc"      -> call "mettle_heap_alloc"
+ *   - call "calloc"      -> call "mettle_heap_calloc"
+ *   - call "realloc"     -> call "mettle_heap_realloc"
+ *   - call "free"        -> call "mettle_heap_free"
+ * Returns 1 on success, 0 on allocation failure. */
+int ir_program_route_to_native_heap(IRProgram *program);
+
 #endif // IR_H

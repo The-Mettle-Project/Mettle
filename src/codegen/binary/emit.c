@@ -2807,132 +2807,6 @@ static int binary_emit_windows_zeroed_heap_alloc(
   return binary_emit_windows_heap_alloc(generator, context, size_register, 8);
 }
 
-/* ── --native-heap: route allocation through std/alloc's Mettle allocator ──
- *
- * When generator->native_heap is set, `new` and the malloc/calloc/realloc/free
- * intercepts call the fixed-name shims (mettle_heap_*) defined in std/alloc
- * (auto-injected by the driver) instead of the OS heap manager. The shims are
- * ordinary exported Mettle functions, so they are resolved by the same call
- * relocation path used for runtime helpers like mettle_crash_install and are
- * kept alive by the reachability pass (export == root).
- *
- * Calling convention: arguments must already be in the ABI argument registers.
- * Win64 shadow space (a multiple of 16) is reserved around the call to preserve
- * the 16-byte stack alignment invariant, exactly as the HeapAlloc inlines do;
- * SysV needs no adjustment because rsp is aligned at the emit point. This whole
- * feature is gated to the Win64 ABI (see the dispatch sites), because the SysV
- * path does not intercept malloc/free and mixing allocators would be unsafe. */
-static int binary_emit_native_heap_call(CodeGenerator *generator,
-                                         BinaryFunctionContext *context,
-                                         const char *symbol) {
-  const BinaryAbi *abi = code_generator_binary_active_abi();
-  int shadow = abi->shadow_space_size;
-  size_t disp = 0;
-  (void)generator;
-  if (shadow > 0 && !binary_emit_sub_rsp_imm32(&context->code, shadow)) {
-    return 0;
-  }
-  if (!binary_emit_call_placeholder(&context->code, &disp) ||
-      !binary_call_relocation_table_add(&context->call_relocations, symbol,
-                                        disp)) {
-    return 0;
-  }
-  if (shadow > 0 && !binary_emit_add_rsp_imm32(&context->code, shadow)) {
-    return 0;
-  }
-  return 1;
-}
-
-/* malloc(size): mettle_heap_alloc(size) -> dest. */
-static int code_generator_binary_emit_native_malloc(
-    CodeGenerator *generator, BinaryFunctionContext *context,
-    const IRInstruction *instruction) {
-  const BinaryAbi *abi = code_generator_binary_active_abi();
-  if (instruction->argument_count != 1 || !instruction->arguments) {
-    return 0;
-  }
-  if (!code_generator_binary_emit_operand_load(generator, context,
-                                               &instruction->arguments[0],
-                                               BINARY_GP_R10) ||
-      !binary_emit_mov_reg_reg(&context->code, abi->int_param_registers[0],
-                               BINARY_GP_R10) ||
-      !binary_emit_native_heap_call(generator, context, "mettle_heap_alloc")) {
-    return 0;
-  }
-  return code_generator_binary_emit_destination_store(generator, context,
-                                                      &instruction->dest,
-                                                      BINARY_GP_RAX);
-}
-
-/* calloc(count, size): mettle_heap_zeroed(count*size) -> dest. */
-static int code_generator_binary_emit_native_calloc(
-    CodeGenerator *generator, BinaryFunctionContext *context,
-    const IRInstruction *instruction) {
-  const BinaryAbi *abi = code_generator_binary_active_abi();
-  if (instruction->argument_count != 2 || !instruction->arguments) {
-    return 0;
-  }
-  if (!code_generator_binary_emit_operand_load(generator, context,
-                                               &instruction->arguments[0],
-                                               BINARY_GP_R10) ||
-      !code_generator_binary_emit_operand_load(generator, context,
-                                               &instruction->arguments[1],
-                                               BINARY_GP_R11) ||
-      !binary_emit_imul_reg_reg(&context->code, BINARY_GP_R10, BINARY_GP_R11) ||
-      !binary_emit_mov_reg_reg(&context->code, abi->int_param_registers[0],
-                               BINARY_GP_R10) ||
-      !binary_emit_native_heap_call(generator, context, "mettle_heap_zeroed")) {
-    return 0;
-  }
-  return code_generator_binary_emit_destination_store(generator, context,
-                                                      &instruction->dest,
-                                                      BINARY_GP_RAX);
-}
-
-/* realloc(ptr, size): mettle_heap_realloc(ptr, size) -> dest. */
-static int code_generator_binary_emit_native_realloc(
-    CodeGenerator *generator, BinaryFunctionContext *context,
-    const IRInstruction *instruction) {
-  const BinaryAbi *abi = code_generator_binary_active_abi();
-  if (instruction->argument_count != 2 || !instruction->arguments) {
-    return 0;
-  }
-  if (!code_generator_binary_emit_operand_load(generator, context,
-                                               &instruction->arguments[0],
-                                               BINARY_GP_R10) ||
-      !code_generator_binary_emit_operand_load(generator, context,
-                                               &instruction->arguments[1],
-                                               BINARY_GP_R11) ||
-      !binary_emit_mov_reg_reg(&context->code, abi->int_param_registers[0],
-                               BINARY_GP_R10) ||
-      !binary_emit_mov_reg_reg(&context->code, abi->int_param_registers[1],
-                               BINARY_GP_R11) ||
-      !binary_emit_native_heap_call(generator, context,
-                                    "mettle_heap_realloc")) {
-    return 0;
-  }
-  return code_generator_binary_emit_destination_store(generator, context,
-                                                      &instruction->dest,
-                                                      BINARY_GP_RAX);
-}
-
-/* free(ptr): mettle_heap_free(ptr). mem_free tolerates a null pointer, so no
- * null guard is emitted here. No destination. */
-static int code_generator_binary_emit_native_free(
-    CodeGenerator *generator, BinaryFunctionContext *context,
-    const IRInstruction *instruction) {
-  const BinaryAbi *abi = code_generator_binary_active_abi();
-  if (instruction->argument_count != 1 || !instruction->arguments) {
-    return 0;
-  }
-  return code_generator_binary_emit_operand_load(generator, context,
-                                                 &instruction->arguments[0],
-                                                 BINARY_GP_R10) &&
-         binary_emit_mov_reg_reg(&context->code, abi->int_param_registers[0],
-                                 BINARY_GP_R10) &&
-         binary_emit_native_heap_call(generator, context, "mettle_heap_free");
-}
-
 int code_generator_binary_emit_new(CodeGenerator *generator,
                                            BinaryFunctionContext *context,
                                            const IRInstruction *instruction) {
@@ -2947,44 +2821,6 @@ int code_generator_binary_emit_new(CodeGenerator *generator,
 
   if (!generator || !context || !instruction) {
     return 0;
-  }
-
-  /* --native-heap (Win64 only): zero-initialized allocation via the Mettle
-   * allocator. Load the byte size into arg0 and call mettle_heap_zeroed. */
-  if (generator->native_heap && abi->shadow_space_size > 0) {
-    BinaryGpRegister arg0 = abi->int_param_registers[0];
-    if (instruction->rhs.kind == IR_OPERAND_INT &&
-        instruction->rhs.int_value > 0) {
-      if (!binary_emit_mov_reg_imm64(&context->code, arg0,
-                                     (uint64_t)instruction->rhs.int_value)) {
-        code_generator_set_error(generator,
-                                 "Out of memory while emitting allocation size");
-        return 0;
-      }
-    } else if (instruction->rhs.kind == IR_OPERAND_NONE ||
-               (instruction->rhs.kind == IR_OPERAND_INT &&
-                instruction->rhs.int_value <= 0)) {
-      if (!binary_emit_mov_reg_imm64(&context->code, arg0, 8)) {
-        code_generator_set_error(generator,
-                                 "Out of memory while emitting allocation size");
-        return 0;
-      }
-    } else if (!code_generator_binary_emit_operand_load(
-                   generator, context, &instruction->rhs, arg0)) {
-      return 0;
-    }
-    if (!binary_emit_native_heap_call(generator, context,
-                                      "mettle_heap_zeroed")) {
-      if (!generator->has_error) {
-        code_generator_set_error(generator,
-                                 "Out of memory while emitting native-heap new "
-                                 "in function '%s'",
-                                 context->function_name);
-      }
-      return 0;
-    }
-    return code_generator_binary_emit_destination_store(
-        generator, context, &instruction->dest, BINARY_GP_RAX);
   }
 
   if (abi->shadow_space_size == 0 &&
@@ -3300,38 +3136,26 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
   if (code_generator_binary_active_abi()->shadow_space_size > 0) {
     if (strcmp(instruction->text, "malloc") == 0 &&
         instruction->argument_count == 1) {
-      return generator->native_heap
-                 ? code_generator_binary_emit_native_malloc(generator, context,
-                                                             instruction)
-                 : code_generator_binary_emit_malloc_call_inline(
-                       generator, context, instruction);
+      return code_generator_binary_emit_malloc_call_inline(generator, context,
+                                                          instruction);
     }
 
     if (strcmp(instruction->text, "calloc") == 0 &&
         instruction->argument_count == 2) {
-      return generator->native_heap
-                 ? code_generator_binary_emit_native_calloc(generator, context,
-                                                             instruction)
-                 : code_generator_binary_emit_calloc_call_inline(
-                       generator, context, instruction);
+      return code_generator_binary_emit_calloc_call_inline(generator, context,
+                                                          instruction);
     }
 
     if (strcmp(instruction->text, "realloc") == 0 &&
         instruction->argument_count == 2) {
-      return generator->native_heap
-                 ? code_generator_binary_emit_native_realloc(generator, context,
-                                                             instruction)
-                 : code_generator_binary_emit_realloc_call_inline(
-                       generator, context, instruction);
+      return code_generator_binary_emit_realloc_call_inline(generator, context,
+                                                           instruction);
     }
 
     if (strcmp(instruction->text, "free") == 0 &&
         instruction->argument_count == 1) {
-      return generator->native_heap
-                 ? code_generator_binary_emit_native_free(generator, context,
-                                                          instruction)
-                 : code_generator_binary_emit_free_call_inline(
-                       generator, context, instruction);
+      return code_generator_binary_emit_free_call_inline(generator, context,
+                                                        instruction);
     }
   }
 

@@ -2993,7 +2993,6 @@ int compile_file(const char *input_filename, const char *output_filename,
                                      compiler_options_use_profile_runtime(options)
                                          ? 1
                                          : 0);
-  code_generator_set_native_heap(code_generator, options->native_heap ? 1 : 0);
   compiler_profile_add(&profile, PROFILE_PHASE_INIT, phase_start);
 
   int result = 0;
@@ -3005,20 +3004,6 @@ int compile_file(const char *input_filename, const char *output_filename,
     fprintf(stderr,
             "Error: --profile-runtime/--profile-runtime-ops require the direct "
             "object backend (use --build or --emit-obj)\n");
-    result = 1;
-    goto cleanup;
-  }
-
-  /* --native-heap reroutes new/malloc/calloc/realloc/free onto the Mettle
-   * allocator via the Win64 malloc-family interception point. The SysV path
-   * does not intercept these, so enabling it there would route `new` to the
-   * native heap while `free` still hit libc — a cross-allocator mismatch.
-   * Restrict to the Win64 target until the SysV interception lands. */
-  if (options->native_heap &&
-      binary_target_format_host_default() == BINARY_TARGET_FORMAT_ELF_X64) {
-    fprintf(stderr,
-            "Error: --native-heap is currently supported only on the Win64 "
-            "target\n");
     result = 1;
     goto cleanup;
   }
@@ -3133,6 +3118,15 @@ int compile_file(const char *input_filename, const char *output_filename,
   }
 
   mettle_compiler_ctx_set_ir_program(ir_program);
+
+  /* --native-heap: retarget new/malloc/calloc/realloc/free onto the std/alloc
+   * Mettle allocator at the IR level (before optimization, so the rewritten
+   * calls inline/optimize like any other). std/alloc is auto-injected above. */
+  if (options->native_heap && !ir_program_route_to_native_heap(ir_program)) {
+    fprintf(stderr, "Error: Failed to route allocation to the native heap\n");
+    result = 1;
+    goto cleanup;
+  }
 
   if (compiler_options_use_profile_runtime(options)) {
     if (!ir_profile_instrument_program(ir_program)) {
@@ -3367,7 +3361,7 @@ void print_usage(const char *program_name) {
   printf("  --profile-runtime-ops  Emit runtime op-class counters per function "
          "(after optimization)\n");
   printf("  --native-heap       Route new/malloc/calloc/realloc/free through "
-         "the Mettle allocator (std/alloc, Win64 only)\n");
+         "the Mettle allocator (std/alloc)\n");
   printf("  --static            On Linux, link executable statically\n");
   printf("  --musl              On Linux, link statically with musl-gcc\n");
   printf("  --debug-compiler    Track compiler context for internal error reports\n");

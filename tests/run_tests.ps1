@@ -1284,6 +1284,105 @@ catch {
   Write-CaseResult -Name "native_heap" -Passed $false -Reason $_.Exception.Message
 }
 
+# Native heap thread-safety: four threads hammer the shared global heap; the
+# per-heap spinlock must keep every allocation counted (20000) with no leak.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "native_heap_threads.exe"
+  $objPath = [System.IO.Path]::ChangeExtension($exePath, ".obj")
+  foreach ($artifactPath in @($exePath, $objPath)) {
+    if (Test-Path $artifactPath) {
+      Remove-Item -Path $artifactPath -Force -ErrorAction SilentlyContinue
+    }
+  }
+
+  $buildOut = & $CompilerPath --build --linker internal --release "tests\test_native_heap_threads.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "native-heap threads build failed: $buildOut"
+  }
+  $runOut = & $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "native-heap threads executable exited with $LASTEXITCODE`: $runOut"
+  }
+  if ($runOut -notmatch "THREADS OK") {
+    throw "native-heap threads output missing expected marker: $runOut"
+  }
+  Write-CaseResult -Name "native_heap_threads" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "native_heap_threads" -Passed $false -Reason $_.Exception.Message
+}
+
+# Allocator reliability: double-free / bogus-free rejection (no free-list
+# corruption). Exercises std/alloc directly; no flag needed.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "alloc_doublefree.exe"
+  if (Test-Path $exePath) { Remove-Item -Path $exePath -Force -ErrorAction SilentlyContinue }
+  $buildOut = & $CompilerPath --build --linker internal --release "tests\test_alloc_doublefree.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "alloc doublefree build failed: $buildOut" }
+  $runOut = & $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "alloc doublefree exited with $LASTEXITCODE`: $runOut" }
+  if ($runOut -notmatch "DOUBLEFREE OK") { throw "alloc doublefree marker missing: $runOut" }
+  Write-CaseResult -Name "alloc_doublefree" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "alloc_doublefree" -Passed $false -Reason $_.Exception.Message
+}
+
+# Native-heap behavioral parity: a broad set of allocation-using programs must
+# produce the IDENTICAL exit code whether built normally (OS heap) or with
+# --native-heap (Mettle allocator). These exit codes are computed from data
+# that lived on the heap, so a divergence would mean the rewrite changed
+# observable behavior. This is the broad reliability proof that the rewrite is
+# correct across many real programs, not just the dedicated cases above.
+$nativeHeapParityPrograms = @(
+  "tests\test_gc_alloc.mettle",
+  "tests\test_gc_alloc_fixed.mettle",
+  "tests\test_generics_new_heap.mettle",
+  "tests\test_generics_full.mettle",
+  "tests\test_generics_return_struct.mettle",
+  "tests\test_generics_nested_struct.mettle",
+  "tests\test_generics_in_control_flow.mettle",
+  "tests\test_generics_float.mettle",
+  "tests\test_large_db_cache_loop.mettle",
+  "tests\test_arena_basic.mettle",
+  "tests\test_arena_oversized.mettle",
+  "tests\test_arena_savepoint.mettle",
+  "tests\test_arena_reset_reuse.mettle",
+  "tests\test_arena_align.mettle"
+)
+foreach ($prog in $nativeHeapParityPrograms) {
+  $total++
+  $caseName = "native_heap_parity_" + [System.IO.Path]::GetFileNameWithoutExtension($prog).Replace("test_", "")
+  try {
+    $baseExe = Join-Path $tmpDir ("nhp_base_{0}.exe" -f [System.IO.Path]::GetFileNameWithoutExtension($prog))
+    $nhExe   = Join-Path $tmpDir ("nhp_nh_{0}.exe"   -f [System.IO.Path]::GetFileNameWithoutExtension($prog))
+    foreach ($e in @($baseExe, $nhExe)) { if (Test-Path $e) { Remove-Item -Path $e -Force -ErrorAction SilentlyContinue } }
+
+    $bOut = & $CompilerPath --build --linker internal --release $prog -o $baseExe 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "baseline build failed: $bOut" }
+    & $baseExe *> $null
+    $baseCode = $LASTEXITCODE
+
+    $nOut = & $CompilerPath --build --linker internal --release --native-heap $prog -o $nhExe 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "native-heap build failed: $nOut" }
+    & $nhExe *> $null
+    $nhCode = $LASTEXITCODE
+
+    if ($baseCode -ne $nhCode) {
+      throw "exit code differs: baseline=$baseCode native-heap=$nhCode"
+    }
+    Write-CaseResult -Name $caseName -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name $caseName -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # Generics runtime: compile with --build and verify monomorphized return values.
 $total++
 try {
