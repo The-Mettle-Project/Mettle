@@ -262,6 +262,35 @@ static int mir_type_is_numeric_scalar(CodeGenerator *g, const char *type_name) {
   return t && code_generator_binary_resolved_type_float_bits(t) != 0;
 }
 
+/* A DIRECT small aggregate (struct/array by value, size 1/2/4/8): the Win64 ABI
+ * passes and returns it in a single GP register exactly like an integer, so MIR
+ * can carry it as an 8-byte value. Its memory home (when its address is taken
+ * for field access) is 8 bytes, which covers the whole struct. Larger or
+ * non-power-of-2 aggregates are INDIRECT (hidden pointer) and still bail. */
+static int mir_type_is_direct_small_aggregate(CodeGenerator *g,
+                                              const char *type_name) {
+  Type *t = code_generator_binary_get_resolved_type(g, type_name, 0);
+  if (!t || !code_generator_type_is_aggregate(t)) {
+    return 0;
+  }
+  if (code_generator_binary_resolved_type_float_bits(t) != 0) {
+    return 0;
+  }
+  if (code_generator_abi_classify(t) != ABI_PASS_DIRECT) {
+    return 0;
+  }
+  size_t sz = code_generator_abi_type_size(t);
+  return sz == 1 || sz == 2 || sz == 4 || sz == 8;
+}
+
+/* A type MIR can carry as a register-or-home value at a signature/local
+ * boundary: a numeric scalar, or a DIRECT small aggregate (treated as 8 bytes).
+ */
+static int mir_type_is_mir_value(CodeGenerator *g, const char *type_name) {
+  return mir_type_is_numeric_scalar(g, type_name) ||
+         mir_type_is_direct_small_aggregate(g, type_name);
+}
+
 /* True if temp `name` holds a float value, judged from the producing
  * instruction's is_float flag (transitively through assign chains and call
  * return types). Uses IR structure only, so it is safe in eligibility (no
@@ -439,7 +468,7 @@ int mir_function_is_eligible(CodeGenerator *generator,
       const char *pt = function_data->parameter_types
                            ? function_data->parameter_types[i]
                            : NULL;
-      if (!mir_type_is_numeric_scalar(generator, pt)) {
+      if (!mir_type_is_mir_value(generator, pt)) {
         return mir_trace_bail(function_data, "sig:param_nonscalar");
       }
       Type *rt = code_generator_binary_get_resolved_type(generator, pt, 0);
@@ -465,7 +494,7 @@ int mir_function_is_eligible(CodeGenerator *generator,
   }
   if (function_data->return_type && function_data->return_type[0] &&
       strcmp(function_data->return_type, "void") != 0 &&
-      !mir_type_is_numeric_scalar(generator, function_data->return_type)) {
+      !mir_type_is_mir_value(generator, function_data->return_type)) {
     return mir_trace_bail(function_data, "sig:return_nonscalar");
   }
 
@@ -549,7 +578,10 @@ int mir_function_is_eligible(CodeGenerator *generator,
     case IR_OP_JUMP:
       break;
     case IR_OP_DECLARE_LOCAL:
-      if (in->text && !mir_type_is_numeric_scalar(generator, in->text)) {
+      /* A DIRECT small-aggregate local is allowed: field access lowers to
+       * &local + offset + LOAD/STORE (all supported), and when its address is
+       * taken it becomes memory-resident with an 8-byte home covering it. */
+      if (in->text && !mir_type_is_mir_value(generator, in->text)) {
         return 0;
       }
       break;
@@ -1814,8 +1846,11 @@ int code_generator_binary_emit_function_via_mir(
                        : NULL,
         0);
     int pfb = pt ? code_generator_binary_resolved_type_float_bits(pt) : 0;
+    int is_agg = pt && code_generator_type_is_aggregate(pt);
     int w = pfb ? pfb / 8 : (pt ? code_generator_binary_resolved_type_scalar_size(pt) : 8);
-    if (!pfb && w != 1 && w != 2 && w != 4 && w != 8) {
+    if (is_agg || (!pfb && w != 1 && w != 2 && w != 4 && w != 8)) {
+      /* A DIRECT small aggregate arrives in a full GP register; home all 8 bytes
+       * with no integer extension (field access reads within the struct size). */
       w = 8;
     }
     MirVregId v = mir_name_map_get_or_add(&map, &fn, pname,
@@ -1829,7 +1864,9 @@ int code_generator_binary_emit_function_via_mir(
     fn.params[fn.param_count].width = w;
     fn.params[fn.param_count].is_float = pfb ? 1 : 0;
     fn.params[fn.param_count].is_signed =
-        pt ? code_generator_binary_resolved_type_is_signed_integer(pt) : 1;
+        (!is_agg && pt)
+            ? code_generator_binary_resolved_type_is_signed_integer(pt)
+            : 0;
     fn.param_count++;
   }
 
