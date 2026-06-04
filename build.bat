@@ -130,7 +130,10 @@ for %%f in (src\ir\optimizer\*.c) do (
 )
 
 echo Compiling code generator modules...
-for %%f in (src\\codegen\\*.c) do (
+for %%f in (code_generator_calls code_generator_flow code_generator_inline_debug code_generator_ir code_generator_ops code_generator_stack code_generator_variables) do (
+    if exist obj\codegen\%%f.o del /Q obj\codegen\%%f.o
+)
+for %%f in (src\codegen\binary_emitter.c src\codegen\code_generator.c src\codegen\elf_emitter.c src\codegen\program_entry.c) do (
     echo   %%~nxf
     %CC% %CFLAGS% -c %%f -o obj\\codegen\\%%~nf.o
     if errorlevel 1 exit /b 1
@@ -189,7 +192,7 @@ echo Compiling main...
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
 echo Linking...
-%CC% obj\common.o obj\lexer\lexer.o obj\parser\ast.o obj\parser\parser.o obj\semantic\symbol_table.o obj\semantic\type_checker.o obj\semantic\register_allocator.o obj\semantic\import_resolver.o obj\semantic\monomorphize.o obj\ir\*.o obj\ir\optimizer\*.o obj\\codegen\\*.o obj\\codegen\\binary\\*.o obj\\linker\\*.o obj\debug\debug_info.o obj\error\error_reporter.o obj\compiler\compiler_context.o obj\compiler\compiler_crash.o obj\runtime\crash_handler.o obj\tracy_build.o obj\main.o -o bin\mettle.exe %LDFLAGS%
+%CC% obj\common.o obj\lexer\lexer.o obj\parser\ast.o obj\parser\parser.o obj\semantic\symbol_table.o obj\semantic\type_checker.o obj\semantic\register_allocator.o obj\semantic\import_resolver.o obj\semantic\monomorphize.o obj\ir\*.o obj\ir\optimizer\*.o obj\codegen\binary_emitter.o obj\codegen\code_generator.o obj\codegen\elf_emitter.o obj\codegen\program_entry.o obj\\codegen\\binary\\*.o obj\\linker\\*.o obj\debug\debug_info.o obj\error\error_reporter.o obj\compiler\compiler_context.o obj\compiler\compiler_crash.o obj\runtime\crash_handler.o obj\tracy_build.o obj\main.o -o bin\mettle.exe %LDFLAGS%
 
 if %ERRORLEVEL% NEQ 0 (
     echo Build failed!

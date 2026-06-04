@@ -61,7 +61,7 @@ typedef enum {
    * added to dest's prior value (the scalar code initializes count=0, so the
    * pass only matches when that holds). lhs = buffer base symbol, rhs = length
    * symbol/operand, dest = count symbol. Codegen lowers this to an SSE2
-   * 16-bytes/iteration scan plus a scalar tail; see code_generator_ir.c. */
+   * 16-bytes/iteration scan plus a scalar tail. */
   IR_OP_COUNT_WORD_STARTS,
   /* Inline memory copy: dest = dst pointer, lhs = src pointer, rhs = byte count
    * (INT). Produced by ir_memcpy_inline_pass for constant-size memcpy calls. */
