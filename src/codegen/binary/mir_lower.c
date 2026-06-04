@@ -98,12 +98,19 @@ static int mir_name_map_has(const MirNameMap *m, const char *name) {
   return 0;
 }
 
-/* The set of register-promoted globals written by a function: each is loaded
- * once at entry (MIR_LOAD_GLOBAL) and stored back before every return
- * (MIR_STORE_GLOBAL). Names are borrowed interned IR strings. */
+/* Register-promoted globals. Each referenced global scalar is loaded once at
+ * entry (MIR_LOAD_GLOBAL) into a cache vreg; `all` lists every cached global and
+ * `names` the subset that is written (stored back before every return). In a
+ * function that makes calls, memory — not the cache vreg — is authoritative
+ * across a call boundary: the written set is flushed before each call (so the
+ * callee sees current values) and the full cached set is reloaded after (so we
+ * observe any value the callee changed). Names are borrowed interned IR
+ * strings. */
 typedef struct {
-  const char **names;
+  const char **names; /* written globals (write-back / flush-before-call) */
   size_t count;
+  const char **all; /* every cached global (reload-after-call) */
+  size_t all_count;
 } MirGlobalWriteback;
 
 /* ---- operand mapping ---------------------------------------------------- */
@@ -390,24 +397,15 @@ int mir_function_is_eligible(CodeGenerator *generator,
     mir_function_destroy(&scratch_fn);
     return 0;
   }
-  /* Globals may be cached in a register only if no call can mutate them between
-   * the entry load and a use. */
-  int has_calls = 0;
-  for (size_t i = 0; i < ir_function->instruction_count; i++) {
-    if (ir_function->instructions[i].op == IR_OP_CALL) {
-      has_calls = 1;
-      break;
-    }
-  }
+  /* Any SYMBOL operand not defined in this function is a global access. It is
+   * eligible iff it is a plain scalar global (no address-of in scope — an
+   * IR_OP_ADDRESS_OF would be rejected below, so no aliasing pointer can reach
+   * it). Calls are fine: the lowering flushes written globals before each call
+   * and reloads cached globals after, keeping memory authoritative across the
+   * call boundary. */
   for (size_t i = 0; i < ir_function->instruction_count && globals_ok; i++) {
     const IRInstruction *in = &ir_function->instructions[i];
-    /* An undefined SYMBOL written here is a global STORE. We promote it: cache
-     * the global in a register at entry and write it back before each return.
-     * That is only sound when no call can observe the stale memory between the
-     * entry load and the write-back, so restrict to leaf functions writing a
-     * plain global scalar. (Address-of of the global would make a separate
-     * IR_OP_ADDRESS_OF instruction, which is already rejected below, so no
-     * aliasing pointer can reach the promoted value.) */
+    /* An undefined SYMBOL written here is a global STORE. */
     if (in->dest.kind == IR_OPERAND_SYMBOL && in->dest.name) {
       int found = 0;
       for (size_t j = 0; j < defined.count; j++) {
@@ -416,14 +414,12 @@ int mir_function_is_eligible(CodeGenerator *generator,
           break;
         }
       }
-      if (!found &&
-          (has_calls ||
-           !mir_name_is_global_scalar(generator, in->dest.name))) {
+      if (!found && !mir_name_is_global_scalar(generator, in->dest.name)) {
         globals_ok = 0;
         break;
       }
     }
-    /* An undefined SYMBOL read must be a read-only global scalar in a leaf fn. */
+    /* An undefined SYMBOL read must be a global scalar. */
     const IROperand *reads[2] = {&in->lhs, &in->rhs};
     for (int k = 0; k < 2; k++) {
       if (reads[k]->kind == IR_OPERAND_SYMBOL && reads[k]->name) {
@@ -434,9 +430,7 @@ int mir_function_is_eligible(CodeGenerator *generator,
             break;
           }
         }
-        if (!found &&
-            (has_calls ||
-             !mir_name_is_global_scalar(generator, reads[k]->name))) {
+        if (!found && !mir_name_is_global_scalar(generator, reads[k]->name)) {
           globals_ok = 0;
           break;
         }
@@ -472,6 +466,26 @@ int mir_function_is_eligible(CodeGenerator *generator,
         return 0;
       }
       break;
+    case IR_OP_BRANCH_EQ: {
+      /* if (lhs == rhs) goto label: integer equality (switch/match dispatch).
+       * Both operands must be register-resident or an int literal; float
+       * equality would need ucomis, so defer it. */
+      const IROperand *eq[2] = {&in->lhs, &in->rhs};
+      for (int k = 0; k < 2; k++) {
+        if (eq[k]->kind != IR_OPERAND_TEMP && eq[k]->kind != IR_OPERAND_SYMBOL &&
+            eq[k]->kind != IR_OPERAND_INT) {
+          return mir_trace_bail(function_data, "branch_eq:operand_kind");
+        }
+        if (eq[k]->kind == IR_OPERAND_TEMP &&
+            mir_temp_is_float(generator, ir_function, eq[k]->name, 0)) {
+          return mir_trace_bail(function_data, "branch_eq:float");
+        }
+      }
+      if (in->is_float) {
+        return mir_trace_bail(function_data, "branch_eq:float");
+      }
+      break;
+    }
     case IR_OP_ASSIGN:
       if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
         return 0;
@@ -621,6 +635,38 @@ static int mir_emit_global_writebacks(MirFunction *fn, CodeGenerator *g,
     }
     if (!mir_emit1(fn, MIR_STORE_GLOBAL, mir_op_none(), mir_op_symbol(name),
                    mir_op_vreg(v), size, 0, 0)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+/* Reload every cached global from memory into its cache vreg. Emitted right
+ * after a MIR_CALL: the callee may have written any global, so the cached
+ * registers are stale. (The written set was flushed before the call via
+ * mir_emit_global_writebacks, so memory was current going in.) */
+static int mir_emit_global_reloads(MirFunction *fn, CodeGenerator *g,
+                                   MirNameMap *map,
+                                   const MirGlobalWriteback *wb) {
+  if (!wb) {
+    return 1;
+  }
+  for (size_t i = 0; i < wb->all_count; i++) {
+    const char *name = wb->all[i];
+    Symbol *s = symbol_table_lookup(g->symbol_table, name);
+    int size = s ? code_generator_binary_resolved_type_scalar_size(s->type) : 0;
+    if (size != 1 && size != 2 && size != 4 && size != 8) {
+      fn->has_error = 1;
+      return 0;
+    }
+    int is_signed =
+        code_generator_binary_resolved_type_is_signed_integer(s->type);
+    MirVregId v = mir_name_map_get_or_add(map, fn, name, MIR_RC_GP, 8);
+    if (v == MIR_VREG_NONE) {
+      return 0;
+    }
+    if (!mir_emit1(fn, MIR_LOAD_GLOBAL, mir_op_vreg(v), mir_op_symbol(name),
+                   mir_op_none(), size, is_signed ? 0 : 1, 0)) {
       return 0;
     }
   }
@@ -986,6 +1032,17 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
     MirOperand cond = mir_value_operand(fn, g, ctx, map, &in->lhs);
     return mir_emit1(fn, MIR_JCC, mir_op_label(in->text), cond, mir_op_none(), 8,
                      0, 0x84 /* je */);
+  }
+
+  case IR_OP_BRANCH_EQ: {
+    /* if (lhs == rhs) goto label  ->  cmp lhs,rhs; je label. Equality, so
+     * signedness is irrelevant and a constant rhs (the common switch/match
+     * case value) folds into the cmp's imm32 (or a scratch reg if it doesn't
+     * fit) inside the MIR_CMPBR encoder. */
+    MirOperand a = mir_value_operand(fn, g, ctx, map, &in->lhs);
+    MirOperand b = mir_value_operand(fn, g, ctx, map, &in->rhs);
+    return mir_emit1(fn, MIR_CMPBR, mir_op_label(in->text), a, b, 8, 0,
+                     0x84 /* je */);
   }
 
   case IR_OP_ASSIGN: {
@@ -1496,6 +1553,7 @@ int code_generator_binary_emit_function_via_mir(
    * scalar-global writes with no aliasing pointer in scope. */
   MirGlobalWriteback wb = {0};
   size_t wb_cap = 0;
+  size_t wb_all_cap = 0;
 
   /* MIR owns saved registers and the frame; discard anything the legacy
    * promoter left in the context. */
@@ -1596,6 +1654,18 @@ int code_generator_binary_emit_function_via_mir(
                      is_signed ? 0 : 1, 0)) {
         goto oom;
       }
+      /* Record this cached global for reload-after-call. The map-has guard
+       * above means each global is loaded (and recorded) exactly once. */
+      if (wb.all_count >= wb_all_cap) {
+        size_t nc = wb_all_cap ? wb_all_cap * 2 : 4;
+        const char **grown = (const char **)realloc(wb.all, nc * sizeof(*grown));
+        if (!grown) {
+          goto oom;
+        }
+        wb.all = grown;
+        wb_all_cap = nc;
+      }
+      wb.all[wb.all_count++] = op->name;
     }
   }
 
@@ -1642,11 +1712,29 @@ int code_generator_binary_emit_function_via_mir(
         goto oom;
       }
       i++; /* consumed the branch_zero too */
-    } else if (!mir_lower_instruction(&fn, generator, context, &map,
-                                      &ir_function->instructions[i], &wb)) {
-      free(fold_skip);
-      free(folds);
-      goto oom;
+    } else {
+      /* Around a call, memory is the source of truth for cached globals: flush
+       * the written ones first (the callee may read them), lower the call, then
+       * reload every cached global (the callee may have written any of them). */
+      int is_call = ir_function->instructions[i].op == IR_OP_CALL;
+      if (is_call && wb.all_count > 0 &&
+          !mir_emit_global_writebacks(&fn, generator, &map, &wb)) {
+        free(fold_skip);
+        free(folds);
+        goto oom;
+      }
+      if (!mir_lower_instruction(&fn, generator, context, &map,
+                                 &ir_function->instructions[i], &wb)) {
+        free(fold_skip);
+        free(folds);
+        goto oom;
+      }
+      if (is_call && wb.all_count > 0 &&
+          !mir_emit_global_reloads(&fn, generator, &map, &wb)) {
+        free(fold_skip);
+        free(folds);
+        goto oom;
+      }
     }
     if (fn.has_error) {
       free(fold_skip);
@@ -1668,6 +1756,7 @@ int code_generator_binary_emit_function_via_mir(
   }
 
   free(wb.names);
+  free(wb.all);
   mir_name_map_destroy(&map);
   mir_function_destroy(&fn);
   return 1;
@@ -1680,6 +1769,7 @@ oom:
                              function_data->name ? function_data->name : "?");
   }
   free(wb.names);
+  free(wb.all);
   mir_name_map_destroy(&map);
   mir_function_destroy(&fn);
   return 0;
