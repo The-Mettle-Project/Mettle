@@ -150,6 +150,11 @@ typedef enum {
 
   /* calls / return (Stage 3 for full ABI; declared now for completeness) */
   MIR_CALL,       /* call sym; clobbers volatiles */
+  MIR_TRAP,       /* terminal runtime trap: puts(a.sym)+exit(1). a.sym is the
+                     abort message. Reached only on a cold guard-fail path and
+                     never returns, so it needs no vreg operands and the
+                     allocator treats it as a non-call (its volatile clobbers
+                     never reach the normal path). */
   MIR_RET,        /* function return (epilogue emitted separately) */
 
   /* float scalar (Stage 3) */
@@ -218,7 +223,11 @@ typedef struct {
   int is_float;  /* arrives in an XMM register (float32/float64) */
 } MirParam;
 
-#define MIR_MAX_PARAMS 4
+/* Upper bound on parameters a MIR function can take. The first few arrive in
+ * ABI registers; the rest are homed from the caller's stack frame. 16 covers
+ * essentially all real signatures while keeping the fixed per-function param
+ * arrays small. */
+#define MIR_MAX_PARAMS 16
 
 typedef struct {
   MirVreg *vregs;

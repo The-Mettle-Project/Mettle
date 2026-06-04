@@ -321,6 +321,38 @@ static int encode_imul(MirFunction *fn, const MirInst *in) {
   return store_from(fn, &in->dst, SCRATCH_A);
 }
 
+/* dst = a / b (quotient) or a % b (remainder when in->cc != 0). Signedness is
+ * in->is_unsigned (the dividend's type): signed uses CQO + IDIV, unsigned uses
+ * XOR(RDX) + DIV. Always 64-bit on the sign/zero-extended operands, which gives
+ * the same result as a narrower divide. The dividend goes in RAX and the divisor
+ * in any register that is not RAX/RDX; RAX/RCX/RDX are all non-allocatable
+ * scratch, so clobbering them is safe and no live value can occupy them. */
+static int encode_div(MirFunction *fn, const MirInst *in) {
+  BinaryCodeBuffer *code = &fn->context->code;
+  if (!materialize_into(fn, &in->a, SCRATCH_A)) {
+    return 0;
+  }
+  int rok;
+  /* value_reg returns the divisor's own register (a pool reg, never RAX/RDX) or
+   * stages an immediate/spill into SCRATCH_B (RCX) -- always idiv-safe. */
+  BinaryGpRegister divisor = value_reg(fn, &in->b, SCRATCH_B, &rok);
+  if (!rok) {
+    return 0;
+  }
+  if (in->is_unsigned) {
+    if (!binary_emit_xor_reg_reg32(code, BINARY_GP_RDX) ||
+        !binary_emit_div_reg(code, divisor)) {
+      return enc_err(fn, "out of memory in div");
+    }
+  } else {
+    if (!binary_emit_cqo(code) || !binary_emit_idiv_reg(code, divisor)) {
+      return enc_err(fn, "out of memory in idiv");
+    }
+  }
+  BinaryGpRegister result = in->cc ? BINARY_GP_RDX : SCRATCH_A;
+  return store_from(fn, &in->dst, result);
+}
+
 static int encode_shift(MirFunction *fn, const MirInst *in) {
   BinaryCodeBuffer *code = &fn->context->code;
   unsigned char sub = (in->op == MIR_SHL) ? 4 : (in->op == MIR_SHR) ? 5 : 7;
@@ -846,7 +878,7 @@ static int encode_mov(MirFunction *fn, const MirInst *in) {
         return 0;
       }
       if (!emit_ext_load(&ctx->code, target, base_reg, 0, BINARY_GP_RSP, 1,
-                         0, in->width, is_signed)) {
+                         in->a.mem.disp, in->width, is_signed)) {
         return enc_err(fn, "out of memory in load");
       }
     }
@@ -903,6 +935,16 @@ static int encode_mov(MirFunction *fn, const MirInst *in) {
     if (!ok2) {
       return 0;
     }
+    if (in->dst.mem.disp != 0) {
+      /* Constant-index access: fold the byte displacement into the address.
+       * lea into SCRATCH_B so a base held in a live vreg register is preserved
+       * (value_reg returns that register directly when the base is not spilled). */
+      if (!binary_emit_lea_reg_mem(&ctx->code, SCRATCH_B, addr,
+                                   in->dst.mem.disp)) {
+        return enc_err(fn, "out of memory in store address");
+      }
+      addr = SCRATCH_B;
+    }
     if (!code_generator_binary_emit_store_to_address(g, ctx, addr, in->width,
                                                      val)) {
       return enc_err(fn, "out of memory in store");
@@ -923,7 +965,9 @@ static int encode_mov(MirFunction *fn, const MirInst *in) {
 
 static int mir_has_calls(const MirFunction *fn) {
   for (size_t i = 0; i < fn->insn_count; i++) {
-    if (fn->insns[i].op == MIR_CALL) {
+    /* MIR_TRAP also emits calls (puts/exit), so it needs outgoing shadow space
+     * reserved at the bottom of the frame just like a MIR_CALL. */
+    if (fn->insns[i].op == MIR_CALL || fn->insns[i].op == MIR_TRAP) {
       return 1;
     }
   }
@@ -1002,6 +1046,26 @@ static int mir_home_gp_param(MirFunction *fn, const MirParam *p,
     return enc_err(fn, "out of memory extending parameter");
   }
   return 1;
+}
+
+/* Home one GP parameter passed on the caller's stack into its vreg. The slot is
+ * a full 8-byte slot above saved-rbp+return-address (16) and the callee's shadow
+ * space; the caller stored the (already-extended) value there, so an 8-byte load
+ * matches the fallback emitter exactly. */
+static int mir_home_gp_stack_param(MirFunction *fn, const MirParam *p,
+                                   int rbp_offset) {
+  BinaryCodeBuffer *code = &fn->context->code;
+  MirOperand dst = mir_op_vreg(p->vreg);
+  BinaryGpRegister D;
+  if (dst_is_reg(fn, &dst, &D)) {
+    return binary_emit_mov_reg_mem(code, D, BINARY_GP_RBP, rbp_offset)
+               ? 1
+               : enc_err(fn, "out of memory homing stack parameter");
+  }
+  if (!binary_emit_mov_reg_mem(code, SCRATCH_A, BINARY_GP_RBP, rbp_offset)) {
+    return enc_err(fn, "out of memory homing stack parameter");
+  }
+  return store_from(fn, &dst, SCRATCH_A);
 }
 
 /* A pending XMM->home move for float-parameter homing. */
@@ -1126,11 +1190,17 @@ static int mir_home_parameters(MirFunction *fn) {
     }
     const BinaryArgLocation *loc = &locs[i];
     if (!p->is_float) {
-      if (loc->kind != BINARY_ARG_IN_GP_REGISTER) {
+      if (loc->kind == BINARY_ARG_IN_GP_REGISTER) {
+        if (!mir_home_gp_param(fn, p, loc->gp_register)) {
+          return 0;
+        }
+      } else if (loc->kind == BINARY_ARG_ON_STACK) {
+        int rbp_offset = 16 + abi->shadow_space_size + loc->stack_offset;
+        if (!mir_home_gp_stack_param(fn, p, rbp_offset)) {
+          return 0;
+        }
+      } else {
         return enc_err(fn, "unsupported parameter location");
-      }
-      if (!mir_home_gp_param(fn, p, loc->gp_register)) {
-        return 0;
       }
     } else {
       if (loc->kind != BINARY_ARG_IN_XMM_REGISTER) {
@@ -1306,6 +1376,9 @@ int mir_encode(MirFunction *fn) {
     case MIR_NOT:
       ok = encode_neg_not(fn, in);
       break;
+    case MIR_IDIV:
+      ok = encode_div(fn, in);
+      break;
     case MIR_SHL:
     case MIR_SHR:
     case MIR_SAR:
@@ -1413,6 +1486,46 @@ int mir_encode(MirFunction *fn) {
       if (!link || !binary_emit_call_placeholder(&ctx->code, &off) ||
           !binary_call_relocation_table_add(&ctx->call_relocations, link, off)) {
         ok = enc_err(fn, "out of memory emitting call");
+      }
+      break;
+    }
+    case MIR_TRAP: {
+      /* Terminal abort for a failed safety check. MIR only runs without
+       * stack-trace support, so this is the degraded path: puts(message) +
+       * exit(1) (matching code_generator_binary_emit_runtime_trap_call). rsp
+       * already sits on the reserved shadow space (mir_has_calls counts
+       * MIR_TRAP), so the calls need no rsp adjustment. The sequence never
+       * returns; it is reached only on the cold guard-fail branch. */
+      const BinaryAbi *abi = code_generator_binary_active_abi();
+      BinaryGpRegister arg0 = abi->int_param_registers[0];
+      const char *msg = in->a.sym ? in->a.sym : "";
+      size_t off = 0;
+      if (!code_generator_binary_declare_external_symbol(fn->generator, "puts") ||
+          !code_generator_binary_declare_external_symbol(fn->generator, "exit")) {
+        ok = enc_err(fn, "out of memory declaring trap externals");
+        break;
+      }
+      if (!code_generator_binary_emit_cstring_literal_address(fn->generator, ctx,
+                                                              msg, arg0)) {
+        ok = enc_err(fn, "out of memory emitting trap message");
+        break;
+      }
+      if (!binary_emit_call_placeholder(&ctx->code, &off) ||
+          !binary_call_relocation_table_add(&ctx->call_relocations, "puts",
+                                            off)) {
+        ok = enc_err(fn, "out of memory emitting trap puts");
+        break;
+      }
+      if (!binary_emit_mov_reg_imm64(&ctx->code, arg0, 1)) {
+        ok = enc_err(fn, "out of memory emitting trap exit arg");
+        break;
+      }
+      off = 0;
+      if (!binary_emit_call_placeholder(&ctx->code, &off) ||
+          !binary_call_relocation_table_add(&ctx->call_relocations, "exit",
+                                            off)) {
+        ok = enc_err(fn, "out of memory emitting trap exit");
+        break;
       }
       break;
     }

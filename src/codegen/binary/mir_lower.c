@@ -294,22 +294,49 @@ static int mir_temp_is_float(CodeGenerator *g, IRFunction *function,
 /* A direct call MIR can lower: a known function, <=4 register arguments all of
  * GP-scalar type (float args are deferred), a non-INDIRECT (register) return,
  * and simple argument/destination operands. */
+static void mir_call_trace(const char *sub) {
+  if (getenv("METTLE_MIR_TRACE")) {
+    fprintf(stderr, "MIR-CALLBAIL\t%s\n", sub);
+  }
+}
+
+/* The runtime abort traps the compiler injects for failed safety checks
+ * (bounds, overflow, null, ...). They never return (puts+exit / handler abort),
+ * so MIR can lower them as a self-contained terminal sequence. */
+static int mir_call_is_runtime_trap(const IRInstruction *in) {
+  return in->text && (strcmp(in->text, "mettle_crash_trap_ex") == 0 ||
+                      strcmp(in->text, "mettle_crash_trap") == 0);
+}
+
 static int mir_call_is_supported(CodeGenerator *g, const IRInstruction *in) {
-  if (!in->text || in->text[0] == '\0' || in->argument_count > 4) {
+  if (!in->text || in->text[0] == '\0') {
+    mir_call_trace("no_name");
+    return 0;
+  }
+  /* Runtime safety-check traps are terminal and lowered specially (MIR_TRAP),
+   * so they bypass the normal known-function / argument-shape requirements. */
+  if (mir_call_is_runtime_trap(in)) {
+    return 1;
+  }
+  if (in->argument_count > 4) {
+    mir_call_trace("args>4");
     return 0;
   }
   Symbol *callee =
       g->symbol_table ? symbol_table_lookup(g->symbol_table, in->text) : NULL;
   if (!callee || callee->kind != SYMBOL_FUNCTION) {
+    mir_call_trace("not_known_function");
     return 0;
   }
   Type *ret = callee->data.function.return_type
                   ? callee->data.function.return_type
                   : callee->type;
   if (ret && code_generator_abi_classify(ret) == ABI_PASS_INDIRECT) {
+    mir_call_trace("ret_indirect");
     return 0; /* struct-by-value return uses a hidden pointer: not yet */
   }
   if (callee->data.function.parameter_count != in->argument_count) {
+    mir_call_trace("arity_mismatch");
     return 0; /* variadic / arity mismatch: not yet */
   }
   for (size_t a = 0; a < in->argument_count; a++) {
@@ -318,16 +345,19 @@ static int mir_call_is_supported(CodeGenerator *g, const IRInstruction *in) {
                    : NULL;
     if (!pt || code_generator_binary_resolved_type_float_bits(pt) != 0 ||
         code_generator_abi_classify(pt) == ABI_PASS_INDIRECT) {
+      mir_call_trace("arg_float_or_struct");
       return 0; /* float arg or struct-by-value arg: deferred */
     }
     const IROperand *arg = &in->arguments[a];
     if (arg->kind != IR_OPERAND_TEMP && arg->kind != IR_OPERAND_SYMBOL &&
         arg->kind != IR_OPERAND_INT) {
+      mir_call_trace("arg_operand_kind");
       return 0;
     }
   }
   if (in->dest.kind != IR_OPERAND_NONE && in->dest.kind != IR_OPERAND_TEMP &&
       in->dest.kind != IR_OPERAND_SYMBOL) {
+    mir_call_trace("dest_kind");
     return 0;
   }
   return 1;
@@ -356,13 +386,36 @@ int mir_function_is_eligible(CodeGenerator *generator,
   }
   /* Signature: <=4 GP params, GP-or-void return, no indirect return. */
   if (function_data->parameter_count > MIR_MAX_PARAMS) {
-    return mir_trace_bail(function_data, "sig:params>4");
+    return mir_trace_bail(function_data, "sig:params>max");
   }
-  for (size_t i = 0; i < function_data->parameter_count; i++) {
-    const char *pt =
-        function_data->parameter_types ? function_data->parameter_types[i] : NULL;
-    if (!mir_type_is_numeric_scalar(generator, pt)) {
-      return mir_trace_bail(function_data, "sig:param_nonscalar");
+  {
+    int pis_float[MIR_MAX_PARAMS];
+    for (size_t i = 0; i < function_data->parameter_count; i++) {
+      const char *pt = function_data->parameter_types
+                           ? function_data->parameter_types[i]
+                           : NULL;
+      if (!mir_type_is_numeric_scalar(generator, pt)) {
+        return mir_trace_bail(function_data, "sig:param_nonscalar");
+      }
+      Type *rt = code_generator_binary_get_resolved_type(generator, pt, 0);
+      pis_float[i] =
+          (rt && code_generator_binary_resolved_type_float_bits(rt) != 0) ? 1 : 0;
+    }
+    /* GP params beyond the ABI's argument registers are homed from the caller's
+     * stack frame (handled below). A FLOAT param landing on the stack is not
+     * homed yet, so defer those functions to the fallback. */
+    if (function_data->parameter_count > 0) {
+      const BinaryAbi *abi = code_generator_binary_active_abi();
+      BinaryArgLocation locs[MIR_MAX_PARAMS];
+      if (!code_generator_binary_compute_arg_layout(
+              abi, pis_float, function_data->parameter_count, locs, NULL)) {
+        return mir_trace_bail(function_data, "sig:arg_layout");
+      }
+      for (size_t i = 0; i < function_data->parameter_count; i++) {
+        if (pis_float[i] && locs[i].kind == BINARY_ARG_ON_STACK) {
+          return mir_trace_bail(function_data, "sig:float_stack_param");
+        }
+      }
     }
   }
   if (function_data->return_type && function_data->return_type[0] &&
@@ -509,8 +562,9 @@ int mir_function_is_eligible(CodeGenerator *generator,
           return 0;
         }
       } else if (!mir_arith_opcode(in->text, &tmp) &&
-                 !mir_is_comparison(in->text)) {
-        return mir_trace_bail(function_data, "binary:divmod_or_other");
+                 !mir_is_comparison(in->text) &&
+                 strcmp(in->text, "/") != 0 && strcmp(in->text, "%") != 0) {
+        return mir_trace_bail(function_data, "binary:other");
       }
       if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
         return 0;
@@ -1101,6 +1155,13 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
       mir_setcc_opcode(in->text, uns, &cc);
       return mir_emit1(fn, MIR_SETCC, dst, a, b, 8, uns, cc);
     }
+    if (strcmp(in->text, "/") == 0 || strcmp(in->text, "%") == 0) {
+      /* idiv/div: signedness is the dividend's (lhs) type; cc carries the
+       * quotient-vs-remainder choice (1 == remainder, the `%` case). */
+      int uns = mir_operand_is_unsigned(g, ctx, &in->lhs);
+      unsigned char mod = (in->text[0] == '%') ? 1 : 0;
+      return mir_emit1(fn, MIR_IDIV, dst, a, b, 8, uns, mod);
+    }
     MirOpcode op = MIR_ADD;
     mir_arith_opcode(in->text, &op);
     int uns = 0;
@@ -1247,6 +1308,21 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
   }
 
   case IR_OP_CALL: {
+    /* A failed-safety-check trap: lower to a terminal MIR_TRAP carrying the
+     * abort message (the STRING argument). MIR only runs without stack-trace
+     * support, so the trap degrades to puts(message)+exit(1); the remaining
+     * trap arguments (kind, pc, rbp) are unused on that path. */
+    if (mir_call_is_runtime_trap(in)) {
+      int msg_idx = strcmp(in->text, "mettle_crash_trap_ex") == 0 ? 1 : 0;
+      const char *msg = "";
+      if ((size_t)msg_idx < in->argument_count &&
+          in->arguments[msg_idx].kind == IR_OPERAND_STRING &&
+          in->arguments[msg_idx].name) {
+        msg = in->arguments[msg_idx].name;
+      }
+      return mir_emit1(fn, MIR_TRAP, mir_op_symbol(msg), mir_op_none(),
+                       mir_op_none(), 8, 0, 0);
+    }
     /* Declare external callees so the linker resolves the relocation. */
     IRFunction *target = code_generator_find_ir_function_binary(g, in->text);
     if (!target) {
@@ -1515,12 +1591,29 @@ static int mir_lower_folded_access(MirFunction *fn, CodeGenerator *g,
                                    const IRInstruction *in,
                                    const MirAddrFold *fold) {
   MirOperand baseo = mir_value_operand(fn, g, ctx, map, &fold->base);
-  MirOperand idxo = mir_value_operand(fn, g, ctx, map, &fold->index);
-  if (baseo.kind != MIR_OPK_VREG || idxo.kind != MIR_OPK_VREG) {
+  if (baseo.kind != MIR_OPK_VREG) {
     fn->has_error = 1;
     return 0;
   }
-  MirOperand mem = mir_op_mem_vreg(baseo.vreg, idxo.vreg, fold->scale, 0);
+  MirOperand mem;
+  if (fold->index.kind == IR_OPERAND_INT) {
+    /* A constant index (e.g. `p[0]`, `arr[5]`) folds into the displacement:
+     * [base + index*scale]. mir_decode_scale yields the literal index when the
+     * scaled-offset expression is itself constant. */
+    long long disp = fold->index.int_value * (long long)fold->scale;
+    if (disp < -2147483648LL || disp > 2147483647LL) {
+      fn->has_error = 1;
+      return 0;
+    }
+    mem = mir_op_mem_vreg(baseo.vreg, MIR_VREG_NONE, 0, (int)disp);
+  } else {
+    MirOperand idxo = mir_value_operand(fn, g, ctx, map, &fold->index);
+    if (idxo.kind != MIR_OPK_VREG) {
+      fn->has_error = 1;
+      return 0;
+    }
+    mem = mir_op_mem_vreg(baseo.vreg, idxo.vreg, fold->scale, 0);
+  }
   int size = code_generator_binary_get_access_size(g, ctx, &in->rhs);
   if (size <= 0) {
     fn->has_error = 1;

@@ -1149,6 +1149,22 @@ Type *code_generator_binary_get_operand_type_in_context(
     return NULL;
   }
 
+  /* Parameters carry no IR_OP_DECLARE_LOCAL, and the param symbol is often out
+   * of scope in the symbol table by codegen time, so resolve them from the
+   * function signature. Without this a uint64/int32/etc. parameter used as a
+   * divide/shift/compare operand falls back to "signed", miscompiling unsigned
+   * arithmetic at -O0 (where copy-prop hasn't replaced the symbol with a typed
+   * temp). */
+  for (size_t i = 0; i < ir_function->parameter_count; i++) {
+    if (ir_function->parameter_names && ir_function->parameter_names[i] &&
+        strcmp(ir_function->parameter_names[i], operand->name) == 0) {
+      return code_generator_binary_get_resolved_type(
+          generator,
+          ir_function->parameter_types ? ir_function->parameter_types[i] : NULL,
+          0);
+    }
+  }
+
   for (size_t i = 0; i < ir_function->instruction_count; i++) {
     const IRInstruction *instruction = &ir_function->instructions[i];
     if (instruction->op == IR_OP_DECLARE_LOCAL && instruction->dest.name &&

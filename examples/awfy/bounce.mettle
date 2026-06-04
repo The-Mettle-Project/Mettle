@@ -1,0 +1,70 @@
+// are-we-fast-yet :: Bounce  (ported from rochus-keller/are-we-fast-yet C port)
+// 100 balls, 50 steps. Verified result 1331. AWFY config: iters 1500.
+
+import "std/io";
+import "std/bench";
+import "std/math";
+
+struct Ball { x: int32; y: int32; xVel: int32; yVel: int32; }
+
+var rnd_seed: int32 = 74755;
+function rnd_reset() { rnd_seed = 74755; }
+function rnd_next() -> int32 {
+  rnd_seed = ((rnd_seed * 1309) + 13849) & 65535;
+  return rnd_seed;
+}
+
+function ball_init(b: Ball*) {
+  b->x = rnd_next() % 500;
+  b->y = rnd_next() % 500;
+  b->xVel = (rnd_next() % 300) - 150;
+  b->yVel = (rnd_next() % 300) - 150;
+}
+
+function ball_bounce(b: Ball*) -> int32 {
+  var xLimit: int32 = 500;
+  var yLimit: int32 = 500;
+  var bounced: int32 = 0;
+  b->x = b->x + b->xVel;
+  b->y = b->y + b->yVel;
+  if (b->x > xLimit) { b->x = xLimit; b->xVel = 0 - abs(b->xVel); bounced = 1; }
+  if (b->x < 0)      { b->x = 0;      b->xVel = abs(b->xVel);     bounced = 1; }
+  if (b->y > yLimit) { b->y = yLimit; b->yVel = 0 - abs(b->yVel); bounced = 1; }
+  if (b->y < 0)      { b->y = 0;      b->yVel = abs(b->yVel);     bounced = 1; }
+  return bounced;
+}
+
+function benchmark(balls: Ball*) -> int32 {
+  rnd_reset();
+  var ballCount: int32 = 100;
+  var bounces: int32 = 0;
+  var i: int32 = 0;
+  while (i < ballCount) { ball_init(&balls[i]); i = i + 1; }
+  i = 0;
+  while (i < 50) {
+    var j: int32 = 0;
+    while (j < ballCount) {
+      if (ball_bounce(&balls[j]) != 0) { bounces = bounces + 1; }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return bounces;
+}
+
+function main() -> int32 {
+  var passes: int32 = 1500;
+  var balls: Ball[100];
+  var last: int32 = 0;
+  var t0: uint64 = bench_time_us();
+  var it: int32 = 0;
+  while (it < passes) { last = benchmark(&balls[0]); it = it + 1; }
+  var elapsed: uint64 = bench_time_us() - t0;
+  println("Bounce");
+  print("  result   = "); println_int((int64)last);
+  println("  expected = 1331");
+  print("  iters    = "); println_int((int64)passes);
+  print("  time_us  = "); println_int((int64)elapsed);
+  if (last != 1331) { println("  FAILED"); return 1; }
+  return 0;
+}
