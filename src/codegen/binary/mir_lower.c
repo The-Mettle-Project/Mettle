@@ -291,6 +291,25 @@ static int mir_type_is_mir_value(CodeGenerator *g, const char *type_name) {
          mir_type_is_direct_small_aggregate(g, type_name);
 }
 
+/* An INDIRECT aggregate (struct/array by value, size>8 or non-power-of-2): the
+ * Win64 ABI passes it BY REFERENCE — the caller copies it to a temp and passes
+ * the address in a GP register. A parameter of this type therefore arrives as a
+ * pointer, which MIR can hold as an 8-byte value; the body accesses fields
+ * through that pointer (&@p yields the pointer, not a stack home). */
+static int mir_type_is_indirect_aggregate(CodeGenerator *g,
+                                          const char *type_name) {
+  Type *t = code_generator_binary_get_resolved_type(g, type_name, 0);
+  return t && code_generator_type_is_aggregate(t) &&
+         code_generator_abi_classify(t) == ABI_PASS_INDIRECT;
+}
+
+/* A type acceptable as a PARAMETER: a MIR value (scalar / DIRECT small agg) or
+ * an INDIRECT aggregate (received by reference as a pointer). */
+static int mir_type_is_param_value(CodeGenerator *g, const char *type_name) {
+  return mir_type_is_mir_value(g, type_name) ||
+         mir_type_is_indirect_aggregate(g, type_name);
+}
+
 /* True if temp `name` holds a float value, judged from the producing
  * instruction's is_float flag (transitively through assign chains and call
  * return types). Uses IR structure only, so it is safe in eligibility (no
@@ -344,8 +363,10 @@ static int mir_call_is_runtime_trap(const IRInstruction *in) {
 /* Classify an IR_OP_ADDRESS_OF target. */
 typedef enum {
   MIR_ADDROF_UNSUPPORTED = 0, /* function/string/other: deferred */
-  MIR_ADDROF_LOCAL,           /* scalar local or parameter */
-  MIR_ADDROF_GLOBAL           /* scalar global */
+  MIR_ADDROF_LOCAL,           /* scalar/DIRECT-agg local or parameter (lea home) */
+  MIR_ADDROF_GLOBAL,          /* scalar global (lea RIP-relative) */
+  MIR_ADDROF_INDIRECT_PARAM   /* INDIRECT-aggregate param: &@p IS the by-ref
+                                 pointer, so copy the param value (no home) */
 } MirAddrofKind;
 
 static MirAddrofKind mir_addressof_kind(CodeGenerator *g,
@@ -370,7 +391,13 @@ static MirAddrofKind mir_addressof_kind(CodeGenerator *g,
     return mir_name_is_global_scalar(g, in->lhs.name) ? MIR_ADDROF_GLOBAL
                                                       : MIR_ADDROF_UNSUPPORTED;
   }
-  return MIR_ADDROF_LOCAL; /* local or parameter */
+  /* An INDIRECT-aggregate parameter is passed by reference: the parameter value
+   * already IS the struct's address, so &@p just yields that pointer. */
+  if (s->kind == SYMBOL_PARAMETER && s->type &&
+      code_generator_abi_classify(s->type) == ABI_PASS_INDIRECT) {
+    return MIR_ADDROF_INDIRECT_PARAM;
+  }
+  return MIR_ADDROF_LOCAL; /* scalar/DIRECT-agg local or parameter (lea home) */
 }
 
 static int mir_call_is_supported(CodeGenerator *g, const IRInstruction *in) {
@@ -468,7 +495,7 @@ int mir_function_is_eligible(CodeGenerator *generator,
       const char *pt = function_data->parameter_types
                            ? function_data->parameter_types[i]
                            : NULL;
-      if (!mir_type_is_mir_value(generator, pt)) {
+      if (!mir_type_is_param_value(generator, pt)) {
         return mir_trace_bail(function_data, "sig:param_nonscalar");
       }
       Type *rt = code_generator_binary_get_resolved_type(generator, pt, 0);
@@ -1524,7 +1551,14 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
 
   case IR_OP_ADDRESS_OF: {
     MirOperand dst = mir_value_operand(fn, g, ctx, map, &in->dest);
-    if (mir_addressof_kind(g, in) == MIR_ADDROF_GLOBAL) {
+    MirAddrofKind ak = mir_addressof_kind(g, in);
+    if (ak == MIR_ADDROF_INDIRECT_PARAM) {
+      /* &@p of a by-reference (INDIRECT) struct param: the param already holds
+       * the struct's address, so the address-of is just a copy of the pointer. */
+      MirOperand ptr = mir_value_operand(fn, g, ctx, map, &in->lhs);
+      return mir_emit1(fn, MIR_MOV, dst, ptr, mir_op_none(), 8, 0, 0);
+    }
+    if (ak == MIR_ADDROF_GLOBAL) {
       /* &global: lea its RIP-relative address (is_unsigned carries the
        * declare-external flag for the encoder). The global stays cached; the
        * main loop flushes/reloads address-taken globals around pointer memory
