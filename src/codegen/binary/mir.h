@@ -173,7 +173,12 @@ typedef enum {
   MIR_CALL,       /* call sym; clobbers volatiles */
   MIR_STORE_OUTARG,/* store outgoing stack call argument a to [rsp + b.imm].
                       Used for the 5th+ GP argument (beyond the ABI's argument
-                      registers); the prologue reserves the outgoing region. */
+                      registers); the prologue reserves the outgoing region. The
+                      encoder adds outgoing_indirect_bytes (the struct-arg copy
+                      region sits below the shadow/stack-arg area). */
+  MIR_LEA_OUTARG, /* dst <- lea [rsp + a.imm]: address of a slot in the outgoing
+                     INDIRECT struct-argument copy region (at the bottom of the
+                     frame, rsp-relative). Used to pass a struct by value. */
   MIR_TRAP,       /* terminal runtime trap: puts(a.sym)+exit(1). a.sym is the
                      abort message. Reached only on a cold guard-fail path and
                      never returns, so it needs no vreg operands and the
@@ -281,6 +286,12 @@ typedef struct {
   int indirect_return_size;       /* struct size in bytes (>8, INDIRECT) */
   MirVregId indirect_return_vreg; /* holds the hidden out-pointer */
 
+  /* A sub-64-bit integer return type: its byte width (1/2/4) and signedness.
+   * RETURN canonicalizes the value to 64 bits (sign/zero-extend) before `mov
+   * rax` so callers using the full register read no garbage. 0 = not narrow. */
+  int scalar_return_width;
+  int scalar_return_signed;
+
   /* Loop-invariant float constants materialized once at entry (see mir_lower). */
   MirFConst *fconsts;
   size_t fconst_count;
@@ -295,6 +306,12 @@ typedef struct {
    * Reserved once at the bottom of the frame, above the shadow space, so calls
    * write stack args at a fixed rsp offset without adjusting rsp in-body. */
   int outgoing_stack_bytes;
+
+  /* Max bytes any single call needs for copying INDIRECT (by-value) struct
+   * arguments. The Win64/SysV ABI passes such a struct as a pointer to a
+   * caller-made copy; this region (at the very bottom of the frame, below the
+   * shadow space) holds those copies. 16-aligned. */
+  int outgoing_indirect_bytes;
 
   int has_error;
 } MirFunction;

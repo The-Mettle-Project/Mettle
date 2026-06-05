@@ -1001,10 +1001,11 @@ static int mir_layout_frame(MirFunction *fn) {
   }
   int raw = after_gp + (int)(ctx->saved_xmm_count * 16);
   if (mir_has_calls(fn)) {
-    /* Outgoing call region at the very bottom of the frame: 32B Win64 shadow
-     * space plus any outgoing stack-argument bytes (calls with more GP args
+    /* Outgoing call region at the very bottom of the frame: the INDIRECT
+     * struct-argument copy region (lowest, rsp-relative), then 32B Win64 shadow
+     * space, then any outgoing stack-argument bytes (calls with more GP args
      * than argument registers). Spills/saves sit above and never reach it. */
-    raw += 32 + fn->outgoing_stack_bytes;
+    raw += fn->outgoing_indirect_bytes + 32 + fn->outgoing_stack_bytes;
   }
   if (!binary_align_up_int(raw, 16, &ctx->frame_size)) {
     return enc_err(fn, "stack frame too large");
@@ -1530,6 +1531,26 @@ int mir_encode(MirFunction *fn) {
       if (!binary_emit_mov_mem_reg(&ctx->code, BINARY_GP_RSP, (int)in->b.imm,
                                    r)) {
         ok = enc_err(fn, "out of memory storing outgoing call argument");
+      }
+      break;
+    }
+    case MIR_LEA_OUTARG: {
+      /* dst <- lea &slot in the INDIRECT struct-arg copy region. That region
+       * sits ABOVE the Win64 shadow space and the outgoing stack args (so a
+       * callee writing its shadow at [rsp..rsp+32] cannot clobber the copies),
+       * hence the absolute rsp offset is shadow + outgoing_stack_bytes + the
+       * per-arg slot offset (in->a.imm). rsp is fixed after the prologue. */
+      const BinaryAbi *oa = code_generator_binary_active_abi();
+      int off = oa->shadow_space_size + fn->outgoing_stack_bytes + (int)in->a.imm;
+      BinaryGpRegister D;
+      int dst_in_reg = dst_is_reg(fn, &in->dst, &D);
+      BinaryGpRegister target = dst_in_reg ? D : SCRATCH_A;
+      if (!binary_emit_lea_reg_mem(&ctx->code, target, BINARY_GP_RSP, off)) {
+        ok = enc_err(fn, "out of memory in lea outarg");
+        break;
+      }
+      if (!dst_in_reg) {
+        ok = store_from(fn, &in->dst, SCRATCH_A);
       }
       break;
     }
