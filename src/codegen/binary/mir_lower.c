@@ -712,6 +712,22 @@ int mir_function_is_eligible(CodeGenerator *generator,
     if (off && off[0] == '0') {
       return 0;
     }
+    /* Bisect: comma-separated list of function names forced to fallback. */
+    const char *skip = getenv("METTLE_MIR_SKIPFN");
+    if (skip && function_data->name) {
+      const char *nm = function_data->name;
+      size_t nl = strlen(nm);
+      const char *p = skip;
+      while (*p) {
+        const char *c = strchr(p, ',');
+        size_t seg = c ? (size_t)(c - p) : strlen(p);
+        if (seg == nl && strncmp(p, nm, nl) == 0) {
+          return 0;
+        }
+        if (!c) break;
+        p = c + 1;
+      }
+    }
   }
   /* Stage 2 targets plain --release codegen only: no debug line markers,
    * stack-trace ranges, or profiling instrumentation. */
@@ -844,6 +860,26 @@ int mir_function_is_eligible(CodeGenerator *generator,
           globals_ok = 0;
           break;
         }
+      }
+    }
+    /* Undefined SYMBOL call arguments are global reads too (e.g. f(g)). They
+     * must be scalar globals so the entry-load pass can cache them; otherwise
+     * the value path would map them to an undefined vreg. */
+    for (size_t a = 0; a < in->argument_count && globals_ok; a++) {
+      const IROperand *arg = &in->arguments[a];
+      if (arg->kind != IR_OPERAND_SYMBOL || !arg->name) {
+        continue;
+      }
+      int found = 0;
+      for (size_t j = 0; j < defined.count; j++) {
+        if (strcmp(defined.items[j].name, arg->name) == 0) {
+          found = 1;
+          break;
+        }
+      }
+      if (!found && !mir_name_is_global_scalar(generator, arg->name)) {
+        globals_ok = 0;
+        break;
       }
     }
   }
@@ -1081,7 +1117,8 @@ int mir_function_is_eligible(CodeGenerator *generator,
     }
   }
   if (getenv("METTLE_MIR_TRACE")) {
-    fprintf(stderr, "MIR-OK\teligible\n");
+    fprintf(stderr, "MIR-OK\t%s\n",
+            function_data->name ? function_data->name : "?");
   }
   return 1;
 }
@@ -1178,6 +1215,30 @@ static int mir_emit_global_reloads(MirFunction *fn, CodeGenerator *g,
     return 1;
   }
   return mir_emit_global_reload_names(fn, g, map, wb->all, wb->all_count);
+}
+
+/* Reload every cached global EXCEPT `except` (borrowed name). Used after a call
+ * whose result is assigned straight to a global (`@g = f()`, which the optimizer
+ * fuses into one CALL with dest=@g): the call lowering has already captured the
+ * return value into @g's cache vreg, and C semantics discard any write the
+ * callee made to @g's memory, so reloading @g from (still-stale) memory would
+ * wrongly clobber the fresh result with the old value. */
+static int mir_emit_global_reloads_except(MirFunction *fn, CodeGenerator *g,
+                                          MirNameMap *map,
+                                          const MirGlobalWriteback *wb,
+                                          const char *except) {
+  if (!wb) {
+    return 1;
+  }
+  for (size_t i = 0; i < wb->all_count; i++) {
+    if (except && wb->all[i] && strcmp(wb->all[i], except) == 0) {
+      continue;
+    }
+    if (!mir_emit_global_reload_names(fn, g, map, &wb->all[i], 1)) {
+      return 0;
+    }
+  }
+  return 1;
 }
 
 /* Emit a fixed-size byte copy of `size` bytes from [src_base] to [dst_base],
@@ -1920,17 +1981,29 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
           !mir_emit1(fn, MIR_LEA_LOCAL, mir_op_vreg(src_base), structv,
                      mir_op_none(), 8, 0, 0) ||
           !mir_emit_struct_copy(fn, fn->indirect_return_vreg, src_base,
-                                fn->indirect_return_size) ||
-          !mir_emit1(fn, MIR_MOV, mir_op_phys(BINARY_GP_RAX, MIR_RC_GP),
+                                fn->indirect_return_size)) {
+        return 0;
+      }
+      /* Writeback before the RAX move (the flush uses RAX as scratch). */
+      if (!mir_emit_global_writebacks(fn, g, map, wb)) {
+        return 0;
+      }
+      if (!mir_emit1(fn, MIR_MOV, mir_op_phys(BINARY_GP_RAX, MIR_RC_GP),
                      mir_op_vreg(fn->indirect_return_vreg), mir_op_none(), 8, 0,
                      0)) {
         return 0;
       }
-      if (!mir_emit_global_writebacks(fn, g, map, wb)) {
-        return 0;
-      }
       return mir_emit1(fn, MIR_RET, mir_op_none(), mir_op_none(), mir_op_none(),
                        8, 0, 0);
+    }
+    /* Flush register-promoted globals to memory BEFORE materializing the return
+     * value. The writeback uses RAX as scratch to store spilled (memory-homed)
+     * global caches, so doing it after the return value is placed in RAX would
+     * clobber that value (e.g. `return some_global` corrupted by a later cache
+     * flush). The writeback only reads cache vregs and stores to memory, so the
+     * return source vreg is still valid afterwards. */
+    if (!mir_emit_global_writebacks(fn, g, map, wb)) {
+      return 0;
     }
     if (in->lhs.kind != IR_OPERAND_NONE) {
       MirOperand src = mir_value_operand(fn, g, ctx, map, &in->lhs);
@@ -1956,10 +2029,6 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
                             src, mir_op_none(), 8, 0, 0)) {
         return 0;
       }
-    }
-    /* Flush register-promoted globals to memory before returning. */
-    if (!mir_emit_global_writebacks(fn, g, map, wb)) {
-      return 0;
     }
     return mir_emit1(fn, MIR_RET, mir_op_none(), mir_op_none(), mir_op_none(), 8,
                      0, 0);
@@ -2640,10 +2709,23 @@ int code_generator_binary_emit_function_via_mir(
         wb.names[wb.count++] = in->dest.name;
       }
     }
-    /* Load each global (read or written) into its cache vreg once at entry. */
-    const IROperand *ops[3] = {&in->dest, &in->lhs, &in->rhs};
-    for (int k = 0; k < 3; k++) {
-      const IROperand *op = ops[k];
+    /* Load each global (read or written) into its cache vreg once at entry.
+     * Scans dest/lhs/rhs AND call arguments — a global used only as a call
+     * argument (f(g)) must still be loaded, or the value path would resolve it
+     * to an undefined vreg holding a stale register. */
+    for (int k = 0;; k++) {
+      const IROperand *op;
+      if (k == 0) {
+        op = &in->dest;
+      } else if (k == 1) {
+        op = &in->lhs;
+      } else if (k == 2) {
+        op = &in->rhs;
+      } else if ((size_t)(k - 3) < in->argument_count) {
+        op = &in->arguments[k - 3];
+      } else {
+        break;
+      }
       if (op->kind != IR_OPERAND_SYMBOL || !op->name ||
           mir_name_map_has(&map, op->name) ||
           !mir_name_is_global_scalar(generator, op->name)) {
@@ -2787,11 +2869,21 @@ int code_generator_binary_emit_function_via_mir(
         free(folds);
         goto oom;
       }
-      if (is_call && wb.all_count > 0 &&
-          !mir_emit_global_reloads(&fn, generator, &map, &wb)) {
-        free(fold_skip);
-        free(folds);
-        goto oom;
+      if (is_call && wb.all_count > 0) {
+        /* If the call's result is assigned straight to a global (@g = f()), the
+         * call lowering already captured RAX into @g's cache vreg; don't reload
+         * @g from its stale memory (that would drop the just-stored result). */
+        const IROperand *cd = &ir_function->instructions[i].dest;
+        const char *except =
+            (cd->kind == IR_OPERAND_SYMBOL && cd->name &&
+             mir_name_is_global_scalar(generator, cd->name))
+                ? cd->name
+                : NULL;
+        if (!mir_emit_global_reloads_except(&fn, generator, &map, &wb, except)) {
+          free(fold_skip);
+          free(folds);
+          goto oom;
+        }
       }
     }
     if (store_op && wb.at_count > 0 &&
