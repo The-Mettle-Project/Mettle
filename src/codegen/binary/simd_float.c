@@ -349,6 +349,15 @@ int code_generator_binary_emit_simd_affine_map_f64(
   }
   b = &context->code;
 
+  /* Identity-fold the affine coefficients when they are compile-time constants:
+   * b == 1 means the dst term is just +dst[i] (no scale), and c == 0 means no
+   * bias add. The common saxpy form `dst = a*src + dst` (b==1, c==0) then
+   * collapses to a single fused multiply-add per vector instead of mul+fma+add. */
+  int b_is_one = instruction->arguments[2].kind == IR_OPERAND_FLOAT &&
+                 instruction->arguments[2].float_value == 1.0;
+  int c_is_zero = instruction->arguments[3].kind == IR_OPERAND_FLOAT &&
+                  instruction->arguments[3].float_value == 0.0;
+
   /* rcx=src walk, rdx=dst walk, r9=src_end, r10=bytes remaining.
    * ymm4=a, ymm5=b, ymm3=c; ymm0/ymm1 are vector scratch. */
   if (!code_generator_binary_emit_operand_load(generator, context,
@@ -394,12 +403,28 @@ int code_generator_binary_emit_simd_affine_map_f64(
 
   if (!wcs_patch_here(b, j_vec) ||
       !wcs_avx_vmovups_ymm_mem(b, 0, BINARY_GP_RCX, 0) ||
-      !wcs_avx_vmovups_ymm_mem(b, 1, BINARY_GP_RDX, 0) ||
-      !wcs_avx_vmulpd_ymm(b, 0, 0, 4) ||
-      !wcs_avx_vfmadd231pd_ymm(b, 0, 5, 1) ||
-      !wcs_avx_vaddpd_ymm(b, 0, 0, 3) ||
-      !wcs_avx_vmovups_mem_ymm(b, BINARY_GP_RDX, 0, 0) ||
-      !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 32) ||
+      !wcs_avx_vmovups_ymm_mem(b, 1, BINARY_GP_RDX, 0)) {
+    return 0;
+  }
+  if (b_is_one && c_is_zero) {
+    /* dst += a*src (one fma into the dst vector). */
+    if (!wcs_avx_vfmadd231pd_ymm(b, 1, 0, 4) ||
+        !wcs_avx_vmovups_mem_ymm(b, BINARY_GP_RDX, 0, 1)) {
+      return 0;
+    }
+  } else {
+    if (!wcs_avx_vmulpd_ymm(b, 0, 0, 4) ||
+        !wcs_avx_vfmadd231pd_ymm(b, 0, 5, 1)) {
+      return 0;
+    }
+    if (!c_is_zero && !wcs_avx_vaddpd_ymm(b, 0, 0, 3)) {
+      return 0;
+    }
+    if (!wcs_avx_vmovups_mem_ymm(b, BINARY_GP_RDX, 0, 0)) {
+      return 0;
+    }
+  }
+  if (!wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 32) ||
       !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 32)) {
     return 0;
   }
@@ -412,12 +437,27 @@ int code_generator_binary_emit_simd_affine_map_f64(
 
   if (!wcs_patch_here(b, j_scalar) ||
       !wcs_movsd_xmm_mem(b, 0, BINARY_GP_RCX, 0) ||
-      !wcs_movsd_xmm_mem(b, 1, BINARY_GP_RDX, 0) ||
-      !binary_emit_mulsd_xmm_xmm(b, BINARY_XMM0, BINARY_XMM4) ||
-      !wcs_fmadd231sd(b, 0, 5, 1) ||
-      !binary_emit_addsd_xmm_xmm(b, BINARY_XMM0, BINARY_XMM3) ||
-      !wcs_movsd_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM0) ||
-      !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 8) ||
+      !wcs_movsd_xmm_mem(b, 1, BINARY_GP_RDX, 0)) {
+    return 0;
+  }
+  if (b_is_one && c_is_zero) {
+    if (!wcs_fmadd231sd(b, 1, 0, 4) ||
+        !wcs_movsd_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM1)) {
+      return 0;
+    }
+  } else {
+    if (!binary_emit_mulsd_xmm_xmm(b, BINARY_XMM0, BINARY_XMM4) ||
+        !wcs_fmadd231sd(b, 0, 5, 1)) {
+      return 0;
+    }
+    if (!c_is_zero && !binary_emit_addsd_xmm_xmm(b, BINARY_XMM0, BINARY_XMM3)) {
+      return 0;
+    }
+    if (!wcs_movsd_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM0)) {
+      return 0;
+    }
+  }
+  if (!wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 8) ||
       !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 8)) {
     return 0;
   }
@@ -448,6 +488,13 @@ int code_generator_binary_emit_simd_affine_map_f32(
     return 0;
   }
   b = &context->code;
+
+  /* See the f64 variant: fold b==1 (no dst scale) and c==0 (no bias); the saxpy
+   * form b==1,c==0 collapses mul+fma+add into a single fused multiply-add. */
+  int b_is_one = instruction->arguments[2].kind == IR_OPERAND_FLOAT &&
+                 instruction->arguments[2].float_value == 1.0;
+  int c_is_zero = instruction->arguments[3].kind == IR_OPERAND_FLOAT &&
+                  instruction->arguments[3].float_value == 0.0;
 
   if (!code_generator_binary_emit_operand_load(generator, context,
                                                &instruction->lhs,
@@ -492,12 +539,27 @@ int code_generator_binary_emit_simd_affine_map_f32(
 
   if (!wcs_patch_here(b, j_vec) ||
       !wcs_avx_vmovups_ymm_mem(b, 0, BINARY_GP_RCX, 0) ||
-      !wcs_avx_vmovups_ymm_mem(b, 1, BINARY_GP_RDX, 0) ||
-      !wcs_avx_vmulps_ymm(b, 0, 0, 4) ||
-      !wcs_avx_vfmadd231ps_ymm(b, 0, 5, 1) ||
-      !wcs_avx_vaddps_ymm(b, 0, 0, 3) ||
-      !wcs_avx_vmovups_mem_ymm(b, BINARY_GP_RDX, 0, 0) ||
-      !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 32) ||
+      !wcs_avx_vmovups_ymm_mem(b, 1, BINARY_GP_RDX, 0)) {
+    return 0;
+  }
+  if (b_is_one && c_is_zero) {
+    if (!wcs_avx_vfmadd231ps_ymm(b, 1, 0, 4) ||
+        !wcs_avx_vmovups_mem_ymm(b, BINARY_GP_RDX, 0, 1)) {
+      return 0;
+    }
+  } else {
+    if (!wcs_avx_vmulps_ymm(b, 0, 0, 4) ||
+        !wcs_avx_vfmadd231ps_ymm(b, 0, 5, 1)) {
+      return 0;
+    }
+    if (!c_is_zero && !wcs_avx_vaddps_ymm(b, 0, 0, 3)) {
+      return 0;
+    }
+    if (!wcs_avx_vmovups_mem_ymm(b, BINARY_GP_RDX, 0, 0)) {
+      return 0;
+    }
+  }
+  if (!wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 32) ||
       !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 32)) {
     return 0;
   }
@@ -510,12 +572,22 @@ int code_generator_binary_emit_simd_affine_map_f32(
 
   if (!wcs_patch_here(b, j_scalar) ||
       !wcs_movss_xmm_mem(b, 0, BINARY_GP_RCX, 0) ||
-      !wcs_movss_xmm_mem(b, 1, BINARY_GP_RDX, 0) ||
-      !binary_emit_mulss_xmm_xmm(b, BINARY_XMM0, BINARY_XMM4) ||
-      !wcs_fmadd231ss(b, 0, 5, 1) ||
-      !binary_emit_addss_xmm_xmm(b, BINARY_XMM0, BINARY_XMM3) ||
-      !wcs_movss_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM0) ||
-      !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 4) ||
+      !wcs_movss_xmm_mem(b, 1, BINARY_GP_RDX, 0)) {
+    return 0;
+  }
+  if (b_is_one && c_is_zero) {
+    if (!wcs_fmadd231ss(b, 1, 0, 4) ||
+        !wcs_movss_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM1)) {
+      return 0;
+    }
+  } else if (!binary_emit_mulss_xmm_xmm(b, BINARY_XMM0, BINARY_XMM4) ||
+             !wcs_fmadd231ss(b, 0, 5, 1) ||
+             (!c_is_zero &&
+              !binary_emit_addss_xmm_xmm(b, BINARY_XMM0, BINARY_XMM3)) ||
+             !wcs_movss_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM0)) {
+    return 0;
+  }
+  if (!wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 4) ||
       !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 4)) {
     return 0;
   }
