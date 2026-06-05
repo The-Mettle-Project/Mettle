@@ -413,6 +413,101 @@ static int mir_name_is_indirect_struct_local(CodeGenerator *g,
          code_generator_abi_classify(t) == ABI_PASS_INDIRECT;
 }
 
+/* roundup8 byte size of an INDIRECT aggregate type, or 0 if `t` isn't one. */
+static int mir_indirect_type_home_bytes(CodeGenerator *g, Type *t) {
+  if (!t || !code_generator_type_is_aggregate(t) ||
+      code_generator_abi_classify(t) != ABI_PASS_INDIRECT) {
+    return 0;
+  }
+  (void)g;
+  return (int)((code_generator_abi_type_size(t) + 7) & ~(size_t)7);
+}
+
+/* If TEMP `name` holds an INDIRECT struct VALUE, return its home byte size
+ * (roundup8), else 0. The IR routes struct call results and intermediates
+ * through temps; a temp's struct size is recovered from its context: the
+ * INDIRECT return type of the call that defines it, the INDIRECT param type of
+ * a call that consumes it, or the type of a struct SYMBOL it is whole-struct
+ * assigned to/from. (Resolution is via calls/symbols only — never transitively
+ * through another temp — so it cannot recurse.) */
+static int mir_struct_temp_size(CodeGenerator *g, const IRFunction *irf,
+                                const char *name) {
+  if (!g || !irf || !name || !g->symbol_table) {
+    return 0;
+  }
+  for (size_t i = 0; i < irf->instruction_count; i++) {
+    const IRInstruction *in = &irf->instructions[i];
+    if (in->op == IR_OP_CALL && in->text) {
+      Symbol *cal = symbol_table_lookup(g->symbol_table, in->text);
+      if (cal && cal->kind == SYMBOL_FUNCTION) {
+        /* defined by a struct-returning call */
+        if (in->dest.kind == IR_OPERAND_TEMP && in->dest.name &&
+            strcmp(in->dest.name, name) == 0) {
+          Type *r = cal->data.function.return_type ? cal->data.function.return_type
+                                                   : cal->type;
+          int hb = mir_indirect_type_home_bytes(g, r);
+          if (hb) {
+            return hb;
+          }
+        }
+        /* consumed as a struct-by-value argument */
+        if (cal->data.function.parameter_types) {
+          for (size_t a = 0; a < in->argument_count &&
+                             a < cal->data.function.parameter_count;
+               a++) {
+            if (in->arguments[a].kind == IR_OPERAND_TEMP &&
+                in->arguments[a].name &&
+                strcmp(in->arguments[a].name, name) == 0) {
+              int hb = mir_indirect_type_home_bytes(
+                  g, cal->data.function.parameter_types[a]);
+              if (hb) {
+                return hb;
+              }
+            }
+          }
+        }
+      }
+    }
+    if (in->op == IR_OP_ASSIGN) {
+      const IROperand *other = NULL;
+      if (in->dest.kind == IR_OPERAND_TEMP && in->dest.name &&
+          strcmp(in->dest.name, name) == 0) {
+        other = &in->lhs;
+      } else if (in->lhs.kind == IR_OPERAND_TEMP && in->lhs.name &&
+                 strcmp(in->lhs.name, name) == 0) {
+        other = &in->dest;
+      }
+      if (other && other->kind == IR_OPERAND_SYMBOL && other->name) {
+        Type *t = mir_local_or_param_type(g, irf, other->name, NULL);
+        int hb = mir_indirect_type_home_bytes(g, t);
+        if (hb) {
+          return hb;
+        }
+      }
+    }
+  }
+  return 0;
+}
+
+/* Home byte size of an operand that holds an INDIRECT struct VALUE in a stack
+ * home we can LEA (a struct LOCAL symbol or a struct TEMP), else 0. A by-ref
+ * struct PARAMETER is excluded (its home holds a pointer, not the struct). */
+static int mir_operand_struct_home_size(CodeGenerator *g,
+                                        const IRFunction *irf,
+                                        const IROperand *op) {
+  if (op->kind == IR_OPERAND_SYMBOL && op->name) {
+    if (!mir_name_is_indirect_struct_local(g, irf, op->name)) {
+      return 0;
+    }
+    Type *t = mir_local_or_param_type(g, irf, op->name, NULL);
+    return mir_indirect_type_home_bytes(g, t);
+  }
+  if (op->kind == IR_OPERAND_TEMP && op->name) {
+    return mir_struct_temp_size(g, irf, op->name);
+  }
+  return 0;
+}
+
 /* True if temp `name` holds a float value, judged from the producing
  * instruction's is_float flag (transitively through assign chains and call
  * return types). Uses IR structure only, so it is safe in eligibility (no
@@ -531,11 +626,9 @@ static int mir_call_is_supported(CodeGenerator *g,
                   : callee->type;
   if (ret && code_generator_abi_classify(ret) == ABI_PASS_INDIRECT) {
     /* struct-by-value return: the caller passes a hidden out-pointer as the
-     * first integer arg. We point it at the destination struct LOCAL's home, so
-     * the callee writes the result directly there. Only that shape is handled;
-     * an INDIRECT return into a temp/non-local is deferred. */
-    if (in->dest.kind != IR_OPERAND_SYMBOL ||
-        !mir_name_is_indirect_struct_local(g, ir_function, in->dest.name)) {
+     * first integer arg, pointed at the destination struct's home (a struct
+     * LOCAL or a struct TEMP), so the callee writes the result directly there. */
+    if (mir_operand_struct_home_size(g, ir_function, &in->dest) == 0) {
       mir_call_trace("ret_indirect");
       return 0;
     }
@@ -555,11 +648,10 @@ static int mir_call_is_supported(CodeGenerator *g,
     }
     if (code_generator_abi_classify(pt) == ABI_PASS_INDIRECT) {
       /* struct passed BY VALUE: the caller copies it to an outgoing temp and
-       * passes the temp's address. Only a struct LOCAL is supported as the
-       * source (copied from its stack home); a by-ref param or temp source is
-       * deferred. */
-      if (arg->kind != IR_OPERAND_SYMBOL ||
-          !mir_name_is_indirect_struct_local(g, ir_function, arg->name)) {
+       * passes the temp's address. The source must hold the struct in a LEA-able
+       * home — a struct LOCAL or a struct TEMP; a by-ref param source is
+       * deferred (its home holds a pointer, not the struct). */
+      if (mir_operand_struct_home_size(g, ir_function, arg) == 0) {
         mir_call_trace("arg_struct_nonlocal");
         return 0;
       }
@@ -768,7 +860,14 @@ int mir_function_is_eligible(CodeGenerator *generator,
              * pointer (mir_call_is_supported validates the callee returns
              * INDIRECT). */
             (in->op == IR_OP_CALL && o == &in->dest &&
-             mir_name_is_indirect_struct_local(generator, ir_function, o->name));
+             mir_name_is_indirect_struct_local(generator, ir_function, o->name)) ||
+            /* Whole-struct ASSIGN `@a <- @b` / `@a <- %t` / `%t <- @a`: a struct
+             * COPY between two LEA-able struct homes (lowered via rep-movsb), so
+             * both operands may name a struct symbol. */
+            (in->op == IR_OP_ASSIGN && (o == &in->dest || o == &in->lhs) &&
+             mir_operand_struct_home_size(generator, ir_function, &in->dest) >
+                 0 &&
+             mir_operand_struct_home_size(generator, ir_function, &in->lhs) > 0);
         if (!allowed) {
           return mir_trace_bail(function_data, "indirect_agg_byname");
         }
@@ -1466,6 +1565,43 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
   }
 
   case IR_OP_ASSIGN: {
+    /* Whole-struct copy `@a <- @b` / `@a <- %t` / `%t <- @a`: both operands hold
+     * an INDIRECT struct in a LEA-able home, so copy the bytes (rep movsb via the
+     * struct-copy helper) instead of an 8-byte MOV that would truncate. */
+    {
+      const IRFunction *airf =
+          ctx && ctx->function_name
+              ? code_generator_find_ir_function_binary(g, ctx->function_name)
+              : NULL;
+      int ssz = mir_operand_struct_home_size(g, airf, &in->dest);
+      if (ssz > 0) {
+        MirOperand dsym = mir_value_operand(fn, g, ctx, map, &in->dest);
+        MirOperand ssym = mir_value_operand(fn, g, ctx, map, &in->lhs);
+        if (dsym.kind != MIR_OPK_VREG || ssym.kind != MIR_OPK_VREG) {
+          fn->has_error = 1;
+          return 0;
+        }
+        fn->vregs[dsym.vreg].address_taken = 1;
+        if (fn->vregs[dsym.vreg].home_bytes < ssz) {
+          fn->vregs[dsym.vreg].home_bytes = ssz;
+        }
+        fn->vregs[ssym.vreg].address_taken = 1;
+        if (fn->vregs[ssym.vreg].home_bytes < ssz) {
+          fn->vregs[ssym.vreg].home_bytes = ssz;
+        }
+        MirVregId db = mir_new_vreg(fn, MIR_RC_GP, 8);
+        MirVregId sb = mir_new_vreg(fn, MIR_RC_GP, 8);
+        if (db == MIR_VREG_NONE || sb == MIR_VREG_NONE ||
+            !mir_emit1(fn, MIR_LEA_LOCAL, mir_op_vreg(db), dsym, mir_op_none(), 8,
+                       0, 0) ||
+            !mir_emit1(fn, MIR_LEA_LOCAL, mir_op_vreg(sb), ssym, mir_op_none(), 8,
+                       0, 0) ||
+            !mir_emit_struct_copy(fn, db, sb, ssz)) {
+          return 0;
+        }
+        return 1;
+      }
+    }
     MirOperand dst = mir_value_operand(fn, g, ctx, map, &in->dest);
     int dfb = code_generator_binary_operand_float_bits(g, ctx, &in->dest);
     if (dfb) {
@@ -1780,7 +1916,8 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
                                                         : rc->type)
                        : NULL;
       if (rret && code_generator_abi_classify(rret) == ABI_PASS_INDIRECT &&
-          in->dest.kind == IR_OPERAND_SYMBOL) {
+          (in->dest.kind == IR_OPERAND_SYMBOL ||
+           in->dest.kind == IR_OPERAND_TEMP)) {
         ret_indirect = 1;
       }
     }
@@ -1927,12 +2064,15 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
         return 0;
       }
       fn->vregs[dstsym.vreg].address_taken = 1;
-      Type *dt = mir_local_or_param_type(g, code_generator_find_ir_function_binary(
-                                                g, ctx->function_name),
-                                         in->dest.name, NULL);
-      if (dt) {
-        int hb = (int)((code_generator_abi_type_size(dt) + 7) & ~(size_t)7);
-        if (fn->vregs[dstsym.vreg].home_bytes < hb) {
+      /* Size the dest's home to the whole struct (a struct LOCAL or struct TEMP
+       * — mir_operand_struct_home_size resolves a temp's size from the IR). */
+      {
+        const IRFunction *dirf =
+            ctx && ctx->function_name
+                ? code_generator_find_ir_function_binary(g, ctx->function_name)
+                : NULL;
+        int hb = mir_operand_struct_home_size(g, dirf, &in->dest);
+        if (hb > 0 && fn->vregs[dstsym.vreg].home_bytes < hb) {
           fn->vregs[dstsym.vreg].home_bytes = hb;
         }
       }
