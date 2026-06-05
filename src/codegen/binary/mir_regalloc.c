@@ -228,7 +228,10 @@ static void mir_compute_liveness(MirFunction *fn) {
     for (size_t i = 0; i < fn->insn_count; i++) {
       const MirInst *in = &fn->insns[i];
       const MirOperand *target = NULL;
-      if (in->op == MIR_JMP || in->op == MIR_JCC) {
+      if (in->op == MIR_JMP || in->op == MIR_JCC || in->op == MIR_CMPBR ||
+          in->op == MIR_FCMPBR) {
+        /* All carry the branch-target label in dst. A backward target makes this
+         * a loop back-edge (e.g. a rotated loop's bottom-test CMPBR). */
         target = &in->dst;
       }
       if (!target || target->kind != MIR_OPK_LABEL) {

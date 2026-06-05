@@ -2887,6 +2887,83 @@ static int mir_lower_folded_access(MirFunction *fn, CodeGenerator *g,
   return mir_emit1(fn, MIR_MOV, mem, val, mir_op_none(), size, 0, 0);
 }
 
+/* ---- loop rotation ------------------------------------------------------ */
+
+/* Rotate top-tested loops to bottom-tested ones. The lowering emits a while
+ * loop as `label H; CMPBR cc -> Lexit; <body>; JMP H` — a fall-through test at
+ * the top plus an unconditional back-jump every iteration (two branches/iter).
+ * This rewrites it to `CMPBR cc -> Lexit (guard); H: <body>; CMPBR !cc -> H`,
+ * so the back-edge is a single conditional branch and the top test runs once.
+ *
+ * Done by (1) converting each backward `JMP H` into a `CMPBR` with the header's
+ * compare operands and the inverted condition (x86: cc ^ 1 flips the test),
+ * targeting H, and (2) swapping `label H` with its following CMPBR so H now
+ * marks the body start. Only safe when H is immediately followed by its CMPBR:
+ * then the compare operands are loop-stable live values (a counter and a bound),
+ * not temps computed by the header's condition evaluation — so re-testing them
+ * at the back-edge (after the body's update) is exactly the loop condition. */
+static void mir_rotate_loops(MirFunction *fn) {
+  if (!fn || fn->insn_count < 3) {
+    return;
+  }
+  for (size_t j = 0; j + 1 < fn->insn_count; j++) {
+    /* A rotatable header is `label H` immediately followed by its `CMPBR cc ->
+     * E`. (Immediate adjacency means the compare operands are loop-stable live
+     * values, not header-computed temps.) */
+    if (fn->insns[j].op != MIR_LABEL ||
+        fn->insns[j].dst.kind != MIR_OPK_LABEL || !fn->insns[j].dst.sym ||
+        fn->insns[j + 1].op != MIR_CMPBR ||
+        fn->insns[j + 1].dst.kind != MIR_OPK_LABEL ||
+        !fn->insns[j + 1].dst.sym) {
+      continue;
+    }
+    const char *hname = fn->insns[j].dst.sym;     /* header / body-start label */
+    const char *ename = fn->insns[j + 1].dst.sym; /* loop exit target          */
+
+    /* Require exactly one backward edge: a `JMP H` after the header. (A loop
+     * with extra back-edges from `continue` is left unrotated.) */
+    size_t be = 0;
+    int nbe = 0;
+    for (size_t k = j + 2; k < fn->insn_count; k++) {
+      if (fn->insns[k].op == MIR_JMP &&
+          fn->insns[k].dst.kind == MIR_OPK_LABEL && fn->insns[k].dst.sym &&
+          strcmp(fn->insns[k].dst.sym, hname) == 0) {
+        be = k;
+        nbe++;
+      }
+    }
+    if (nbe != 1) {
+      continue;
+    }
+    /* The instruction right after the back-edge must be the header's exit label.
+     * Otherwise the rotated loop's fall-through (the not-taken bottom test) would
+     * land on the wrong block — e.g. when the loop is the last statement in an
+     * `if` and its exit is the enclosing block's end, not a `while_end` here. */
+    if (be + 1 >= fn->insn_count || fn->insns[be + 1].op != MIR_LABEL ||
+        fn->insns[be + 1].dst.kind != MIR_OPK_LABEL ||
+        !fn->insns[be + 1].dst.sym ||
+        strcmp(fn->insns[be + 1].dst.sym, ename) != 0) {
+      continue;
+    }
+
+    /* Convert the back-edge `JMP H` into the bottom test `CMPBR !cc -> H` (loop
+     * while the condition still holds; fall through to the exit label when it
+     * fails). cc ^ 1 inverts the x86 condition. dst already targets H. */
+    fn->insns[be].op = MIR_CMPBR;
+    fn->insns[be].a = fn->insns[j + 1].a;
+    fn->insns[be].b = fn->insns[j + 1].b;
+    fn->insns[be].width = fn->insns[j + 1].width;
+    fn->insns[be].is_unsigned = fn->insns[j + 1].is_unsigned;
+    fn->insns[be].cc = (unsigned char)(fn->insns[j + 1].cc ^ 1u);
+
+    /* Swap `label H` with its CMPBR so H marks the body and the CMPBR is a
+     * one-time entry guard. */
+    MirInst tmp = fn->insns[j];
+    fn->insns[j] = fn->insns[j + 1];
+    fn->insns[j + 1] = tmp;
+  }
+}
+
 /* ---- emit entry --------------------------------------------------------- */
 
 int code_generator_binary_emit_function_via_mir(
@@ -3209,6 +3286,8 @@ int code_generator_binary_emit_function_via_mir(
   }
   free(fold_skip);
   free(folds);
+
+  mir_rotate_loops(&fn);
 
   if (!mir_regalloc(&fn) || fn.has_error) {
     goto oom;
