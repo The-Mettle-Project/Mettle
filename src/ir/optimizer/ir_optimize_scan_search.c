@@ -1311,6 +1311,405 @@ int ir_memcmp_byte_loop_pass(IRFunction *function, int *changed) {
   return ir_try_memcmp_byte_loop_function(function, changed);
 }
 
+/* For a LOAD at `load_index` whose address temp is `addr = base + (index << 2)`,
+ * recover the base symbol and the index. The index is either a symbol directly
+ * (then *lane_base = that symbol, *lane = 0) or a temp `sym + C` for a small
+ * constant C (then *lane_base = sym, *lane = C). Returns 1 on a clean match. */
+static int ir_slp_load_base_index(const IRFunction *function, size_t load_index,
+                                  const char *addr_temp, const char **base_out,
+                                  const char **lane_base_out, long long *lane_out) {
+  const IRInstruction *addp = ir_find_temp_producer_before(function, load_index,
+                                                           addr_temp);
+  if (!addp || addp->op != IR_OP_BINARY || !addp->text ||
+      strcmp(addp->text, "+") != 0 || addp->is_float ||
+      addp->lhs.kind != IR_OPERAND_SYMBOL || !addp->lhs.name ||
+      addp->rhs.kind != IR_OPERAND_TEMP || !addp->rhs.name) {
+    return 0;
+  }
+  *base_out = addp->lhs.name;
+  const IRInstruction *shl = ir_find_temp_producer_before(
+      function, load_index, addp->rhs.name);
+  if (!shl || shl->op != IR_OP_BINARY || !shl->text ||
+      strcmp(shl->text, "<<") != 0 || shl->rhs.kind != IR_OPERAND_INT ||
+      shl->rhs.int_value != 2) {
+    return 0;
+  }
+  /* shl->lhs is the index: a symbol (lane 0) or a temp `sym + C`. */
+  if (shl->lhs.kind == IR_OPERAND_SYMBOL && shl->lhs.name) {
+    *lane_base_out = shl->lhs.name;
+    *lane_out = 0;
+    return 1;
+  }
+  if (shl->lhs.kind == IR_OPERAND_TEMP && shl->lhs.name) {
+    const IRInstruction *off = ir_find_temp_producer_before(function, load_index,
+                                                            shl->lhs.name);
+    if (off && off->op == IR_OP_BINARY && off->text &&
+        strcmp(off->text, "+") == 0 && !off->is_float &&
+        off->lhs.kind == IR_OPERAND_SYMBOL && off->lhs.name &&
+        off->rhs.kind == IR_OPERAND_INT) {
+      *lane_base_out = off->lhs.name;
+      *lane_out = off->rhs.int_value;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Initial value (a symbol or int) assigned to `sym` by the nearest ASSIGN before
+ * `before_index`. Returns a cloned operand in *out, or 0 if not found/clean. */
+static int ir_slp_find_init(const IRFunction *function, size_t before_index,
+                            const char *sym, IROperand *out) {
+  for (size_t i = before_index; i-- > 0;) {
+    const IRInstruction *in = &function->instructions[i];
+    if ((in->op == IR_OP_ASSIGN || in->op == IR_OP_CAST) &&
+        in->dest.kind == IR_OPERAND_SYMBOL && in->dest.name &&
+        strcmp(in->dest.name, sym) == 0) {
+      /* Use the source symbol/value directly (a cast of a symbol just renames
+       * its integer value for indexing). */
+      if (in->lhs.kind == IR_OPERAND_SYMBOL || in->lhs.kind == IR_OPERAND_INT) {
+        return ir_operand_clone(&in->lhs, out);
+      }
+      return 0;
+    }
+    /* A non-NOP redefinition we don't understand: stop. */
+    if (in->op == IR_OP_BINARY && in->dest.kind == IR_OPERAND_SYMBOL &&
+        in->dest.name && strcmp(in->dest.name, sym) == 0) {
+      return 0;
+    }
+  }
+  return 0;
+}
+
+/* SLP-vectorize a group of K parallel int32 multiply-accumulate reductions in a
+ * counted loop: K isomorphic chains `sumJ = sumJ + (av * b[idxJ])` sharing one
+ * broadcast scalar `av = a[a_idx]`, with contiguous loads (idxJ = b_base + J) and
+ * K contiguous post-loop stores `c[out_idx + J] = sumJ`. Pattern-based: matches
+ * the instruction-level parallelism, not any function or nest shape. */
+#define IR_SLP_MAX_LANES 8
+
+/* Find the K contiguous output stores `c[out_idx + lane] = sum_by_lane[lane]`
+ * just after the loop-exit label. Fills c_base/out_idx_sym/store_idx, returns 1
+ * if all K are found and consistent. */
+static int ir_slp_find_stores(IRFunction *function, size_t exit_label_index,
+                              int K, const char *const *sum_by_lane,
+                              const char **c_base_out,
+                              const char **out_idx_out, size_t *store_idx) {
+  const char *c_base = NULL, *out_idx_sym = NULL;
+  int found = 0;
+  for (int wanted = 0; wanted < K; wanted++) {
+    int got = 0;
+    for (size_t i = exit_label_index + 1;
+         i < function->instruction_count && i < exit_label_index + 80; i++) {
+      const IRInstruction *in = &function->instructions[i];
+      if (in->op == IR_OP_LABEL || in->op == IR_OP_JUMP ||
+          in->op == IR_OP_BRANCH_ZERO) {
+        break;
+      }
+      if (in->op != IR_OP_STORE || in->dest.kind != IR_OPERAND_TEMP ||
+          !in->dest.name ||
+          !ir_operand_is_symbol_named(&in->lhs, sum_by_lane[wanted])) {
+        continue;
+      }
+      const char *cb = NULL, *ci = NULL;
+      long long lane = 0;
+      int r = ir_slp_load_base_index(function, i, in->dest.name, &cb, &ci, &lane);
+      if (!r || lane != wanted) {
+        continue;
+      }
+      if (wanted == 0) {
+        c_base = cb;
+        out_idx_sym = ci;
+      } else if (strcmp(cb, c_base) != 0 || strcmp(ci, out_idx_sym) != 0) {
+        continue;
+      }
+      store_idx[wanted] = i;
+      got = 1;
+      found++;
+      break;
+    }
+    if (!got) {
+      return 0;
+    }
+  }
+  *c_base_out = c_base;
+  *out_idx_out = out_idx_sym;
+  return found == K && c_base && out_idx_sym;
+}
+
+static int ir_try_vectorize_slp_mac_i32_at(IRFunction *function,
+                                           size_t header_index, int *changed) {
+  if (!function || header_index + 4 >= function->instruction_count) {
+    return 1;
+  }
+  IRInstruction *header = &function->instructions[header_index];
+  if (header->op != IR_OP_LABEL || !ir_label_is_while_header(header->text)) {
+    return 1;
+  }
+  const char *loop_label = header->text;
+  size_t compare_index = 0, branch_index = 0;
+  if (!ir_find_next_non_nop(function, header_index + 1, &compare_index) ||
+      !ir_find_next_non_nop(function, compare_index + 1, &branch_index)) {
+    return 1;
+  }
+  IRInstruction *compare = &function->instructions[compare_index];
+  IRInstruction *branch = &function->instructions[branch_index];
+  if (compare->op != IR_OP_BINARY || compare->is_float || !compare->text ||
+      strcmp(compare->text, "<") != 0 ||
+      compare->lhs.kind != IR_OPERAND_SYMBOL || !compare->lhs.name ||
+      branch->op != IR_OP_BRANCH_ZERO ||
+      !ir_operand_is_temp_named(&branch->lhs, compare->dest.name) ||
+      !branch->text) {
+    return 1;
+  }
+  const char *iv_symbol = compare->lhs.name;
+
+  /* Back-edge jump to the header. */
+  size_t jump_index = (size_t)-1;
+  for (size_t i = branch_index + 1; i < function->instruction_count; i++) {
+    if (function->instructions[i].op == IR_OP_JUMP &&
+        function->instructions[i].text &&
+        strcmp(function->instructions[i].text, loop_label) == 0) {
+      jump_index = i;
+      break;
+    }
+    if (function->instructions[i].op == IR_OP_LABEL) {
+      break;
+    }
+  }
+  if (jump_index == (size_t)-1 ||
+      ir_loop_body_has_nested_while(function, branch_index + 1, jump_index)) {
+    return 1;
+  }
+
+  /* Collect accumulator chains: `S = S + T` where T = av * bload. The shared
+   * broadcast `av` is a symbol (a named local); each `bload` is a temp. */
+  const char *sum_sym[IR_SLP_MAX_LANES];
+  const char *bload_temp[IR_SLP_MAX_LANES];
+  const char *av_sym = NULL;
+  int K = 0;
+  for (size_t i = branch_index + 1; i < jump_index; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op != IR_OP_BINARY || in->is_float || !in->text ||
+        strcmp(in->text, "+") != 0 || in->dest.kind != IR_OPERAND_SYMBOL ||
+        !in->dest.name || !ir_operand_is_symbol_named(&in->lhs, in->dest.name) ||
+        in->rhs.kind != IR_OPERAND_TEMP || !in->rhs.name) {
+      continue;
+    }
+    const IRInstruction *mul =
+        ir_find_temp_producer_before(function, i, in->rhs.name);
+    if (!mul || mul->op != IR_OP_BINARY || !mul->text ||
+        strcmp(mul->text, "*") != 0 || mul->is_float) {
+      continue;
+    }
+    /* One operand is the shared symbol (av), the other the per-lane load temp. */
+    const char *cand_av = NULL, *cand_ld = NULL;
+    if (mul->lhs.kind == IR_OPERAND_SYMBOL && mul->lhs.name &&
+        mul->rhs.kind == IR_OPERAND_TEMP && mul->rhs.name) {
+      cand_av = mul->lhs.name;
+      cand_ld = mul->rhs.name;
+    } else if (mul->rhs.kind == IR_OPERAND_SYMBOL && mul->rhs.name &&
+               mul->lhs.kind == IR_OPERAND_TEMP && mul->lhs.name) {
+      cand_av = mul->rhs.name;
+      cand_ld = mul->lhs.name;
+    } else {
+      continue;
+    }
+    if (K >= IR_SLP_MAX_LANES) {
+      return 1;
+    }
+    if (av_sym) {
+      if (strcmp(cand_av, av_sym) != 0) {
+        return 1;
+      }
+    } else {
+      av_sym = cand_av;
+    }
+    sum_sym[K] = in->dest.name;
+    bload_temp[K] = cand_ld;
+    K++;
+  }
+  if ((K != 4 && K != 8) || !av_sym) {
+    return 1;
+  }
+
+  /* av = a[a_idx]: a load into the symbol av, address a_base + (a_idx << 2). */
+  const IRInstruction *avld = NULL;
+  for (size_t i = branch_index + 1; i < jump_index; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op == IR_OP_LOAD && ir_operand_is_symbol_named(&in->dest, av_sym)) {
+      avld = in;
+      break;
+    }
+  }
+  const char *a_base = NULL, *a_idx_sym = NULL;
+  long long a_lane = 0;
+  if (!avld || avld->lhs.kind != IR_OPERAND_TEMP || !avld->lhs.name ||
+      !ir_slp_load_base_index(function, (size_t)(avld - function->instructions),
+                              avld->lhs.name, &a_base, &a_idx_sym, &a_lane) ||
+      a_lane != 0) {
+    return 1;
+  }
+
+  /* Each bload: b_base + ((b_idx_sym + lane) << 2), lanes 0..K-1 (a permutation);
+   * build sum_by_lane[lane] = that chain's accumulator. */
+  const char *b_base = NULL, *b_idx_sym = NULL;
+  const char *sum_by_lane[IR_SLP_MAX_LANES] = {0};
+  for (int j = 0; j < K; j++) {
+    const IRInstruction *ld = NULL;
+    for (size_t i = branch_index + 1; i < jump_index; i++) {
+      const IRInstruction *in = &function->instructions[i];
+      if (in->op == IR_OP_LOAD &&
+          ir_operand_is_temp_named(&in->dest, bload_temp[j])) {
+        ld = in;
+        break;
+      }
+    }
+    const char *bb = NULL, *bi = NULL;
+    long long lane = 0;
+    int rok = ld && ld->lhs.kind == IR_OPERAND_TEMP && ld->lhs.name &&
+              ir_slp_load_base_index(function,
+                                     (size_t)(ld - function->instructions),
+                                     ld->lhs.name, &bb, &bi, &lane);
+    if (!rok || lane < 0 || lane >= K) {
+      return 1;
+    }
+    if (j == 0) {
+      b_base = bb;
+      b_idx_sym = bi;
+    } else if (strcmp(bb, b_base) != 0 || strcmp(bi, b_idx_sym) != 0) {
+      return 1;
+    }
+    if (sum_by_lane[lane]) {
+      return 1; /* duplicate lane */
+    }
+    sum_by_lane[lane] = sum_sym[j];
+  }
+  if (!a_base || !b_base || strcmp(a_base, b_base) == 0) {
+    return 1;
+  }
+
+  /* Loop IV increments: iv (k) += 1, a_idx += 1, b_idx += stride. */
+  const char *stride_sym = NULL;
+  int a_inc_ok = 0, b_inc_ok = 0;
+  for (size_t i = branch_index + 1; i < jump_index; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op != IR_OP_BINARY || !in->text || strcmp(in->text, "+") != 0 ||
+        in->dest.kind != IR_OPERAND_SYMBOL || !in->dest.name ||
+        !ir_operand_is_symbol_named(&in->lhs, in->dest.name)) {
+      continue;
+    }
+    if (strcmp(in->dest.name, a_idx_sym) == 0 &&
+        in->rhs.kind == IR_OPERAND_INT && in->rhs.int_value == 1) {
+      a_inc_ok = 1;
+    } else if (strcmp(in->dest.name, b_idx_sym) == 0) {
+      if (in->rhs.kind == IR_OPERAND_SYMBOL && in->rhs.name) {
+        stride_sym = in->rhs.name;
+        b_inc_ok = 1;
+      } else if (in->rhs.kind == IR_OPERAND_TEMP && in->rhs.name) {
+        const IRInstruction *p =
+            ir_find_temp_producer_before(function, i, in->rhs.name);
+        if (p && p->op == IR_OP_CAST && p->lhs.kind == IR_OPERAND_SYMBOL &&
+            p->lhs.name) {
+          stride_sym = p->lhs.name;
+          b_inc_ok = 1;
+        }
+      }
+    }
+  }
+  if (!a_inc_ok || !b_inc_ok || !stride_sym) {
+    return 1;
+  }
+
+  /* Initial index values (before the loop). */
+  IROperand a_off = {0}, b_off = {0};
+  if (!ir_slp_find_init(function, header_index, a_idx_sym, &a_off) ||
+      !ir_slp_find_init(function, header_index, b_idx_sym, &b_off)) {
+    ir_operand_destroy(&a_off);
+    ir_operand_destroy(&b_off);
+    return 1;
+  }
+
+  /* Post-loop: K contiguous stores `c[out_idx + lane] = sum_by_lane[lane]` right
+   * after the loop-exit label. */
+  size_t exit_label_index = (size_t)-1;
+  for (size_t i = jump_index + 1; i < function->instruction_count; i++) {
+    if (function->instructions[i].op == IR_OP_LABEL &&
+        function->instructions[i].text &&
+        strcmp(function->instructions[i].text, branch->text) == 0) {
+      exit_label_index = i;
+      break;
+    }
+  }
+  if (exit_label_index == (size_t)-1) {
+    ir_operand_destroy(&a_off);
+    ir_operand_destroy(&b_off);
+    return 1;
+  }
+  const char *c_base = NULL, *out_idx_sym = NULL;
+  size_t store_idx[IR_SLP_MAX_LANES];
+  int sfound = ir_slp_find_stores(function, exit_label_index, K, sum_by_lane,
+                                  &c_base, &out_idx_sym, store_idx);
+  if (!sfound || strcmp(c_base, a_base) == 0) {
+    ir_operand_destroy(&a_off);
+    ir_operand_destroy(&b_off);
+    return 1;
+  }
+
+  /* Build the op at the first store; out_idx is live there. */
+  IRInstruction fused = {0};
+  fused.op = IR_OP_SIMD_SLP_MAC_I32;
+  fused.location = header->location;
+  fused.dest = ir_operand_symbol(c_base);
+  fused.lhs = ir_operand_symbol(a_base);
+  fused.rhs = ir_operand_symbol(b_base);
+  fused.arguments = calloc(6, sizeof(IROperand));
+  if (!fused.arguments) {
+    ir_operand_destroy(&a_off);
+    ir_operand_destroy(&b_off);
+    return 0;
+  }
+  fused.argument_count = 6;
+  fused.arguments[0] = ir_operand_int(K);
+  fused.arguments[1] = ir_operand_symbol(compare->rhs.name); /* count */
+  fused.arguments[2] = a_off;                                /* a_off */
+  fused.arguments[3] = b_off;                                /* b_off */
+  fused.arguments[4] = ir_operand_symbol(stride_sym);        /* b stride */
+  fused.arguments[5] = ir_operand_symbol(out_idx_sym);       /* out_off */
+
+  size_t place = store_idx[0];
+  ir_instruction_destroy_storage(&function->instructions[place]);
+  function->instructions[place] = fused;
+  /* NOP the loop (header..jump) and the other stores. */
+  for (size_t i = header_index; i <= jump_index; i++) {
+    ir_instruction_make_nop(&function->instructions[i]);
+  }
+  for (int j = 1; j < K; j++) {
+    ir_instruction_make_nop(&function->instructions[store_idx[j]]);
+  }
+  if (changed) {
+    *changed = 1;
+  }
+  return 1;
+}
+
+int ir_simd_slp_mac_i32_pass(IRFunction *function, int *changed) {
+  if (!function) {
+    return 0;
+  }
+  if (getenv("NO_SLP")) {
+    return 0;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    if (function->instructions[i].op == IR_OP_LABEL &&
+        ir_label_is_while_header(function->instructions[i].text)) {
+      if (!ir_try_vectorize_slp_mac_i32_at(function, i, changed)) {
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
 int ir_simd_dot_i32_pass(IRFunction *function, int *changed) {
   if (!function) {
     return 0;

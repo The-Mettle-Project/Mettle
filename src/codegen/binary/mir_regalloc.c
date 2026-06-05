@@ -33,12 +33,19 @@
  * Windows or Linux. The remaining pool is R10/R11 (volatile) plus the
  * universally callee-saved RBX/R12..R15. */
 static const BinaryGpRegister MIR_GP_POOL[] = {
-    BINARY_GP_R10, BINARY_GP_R11, BINARY_GP_RBX, BINARY_GP_R12,
-    BINARY_GP_R13, BINARY_GP_R14, BINARY_GP_R15};
+    BINARY_GP_RBX, BINARY_GP_R12, BINARY_GP_R13, BINARY_GP_R14, BINARY_GP_R15};
 #define MIR_GP_POOL_COUNT (sizeof(MIR_GP_POOL) / sizeof(MIR_GP_POOL[0]))
-/* Reclaimable arg-capable registers, tried after the base pool. */
+/* Reclaimable registers, tried after the callee-saved base pool. RAX/RCX/RDX
+ * are now allocatable (the encoder scratch moved to R10/R11): they are volatile
+ * — so a cross-call value never lands in them (it uses MIR_GP_CROSSCALL_POOL) —
+ * and they carry implicit clobbers from the divide family, setcc, and variable
+ * shifts, which mir_reg_clobbered_in_range keeps a live value out of. RAX is not
+ * an ABI argument register (poolable even in non-leaf functions); RCX/RDX/R8/R9
+ * are, so they are reclaimed only in leaf functions (mir_reg_poolable). RSI/RDI
+ * are callee-saved on Win64. */
 static const BinaryGpRegister MIR_GP_EXTRA[] = {
-    BINARY_GP_RSI, BINARY_GP_RDI, BINARY_GP_R8, BINARY_GP_R9};
+    BINARY_GP_RAX, BINARY_GP_RCX, BINARY_GP_RDX, BINARY_GP_RSI,
+    BINARY_GP_RDI, BINARY_GP_R8,  BINARY_GP_R9};
 #define MIR_GP_EXTRA_COUNT (sizeof(MIR_GP_EXTRA) / sizeof(MIR_GP_EXTRA[0]))
 /* Upper bound on the leaf pool: the static base plus every extra. */
 #define MIR_GP_LEAF_POOL_MAX (MIR_GP_POOL_COUNT + MIR_GP_EXTRA_COUNT)
@@ -47,7 +54,11 @@ static const BinaryGpRegister MIR_GP_EXTRA[] = {
  * values across, and outgoing-arg registers must not be reclaimed). */
 static int mir_fn_has_calls(const MirFunction *fn) {
   for (size_t i = 0; i < fn->insn_count; i++) {
-    if (fn->insns[i].op == MIR_CALL) {
+    /* The inline SLP kernel clobbers the ABI argument/caller-saved registers, so
+     * the function must be treated as non-leaf: RCX/RDX/R8/R9 are unsafe to
+     * reclaim into the general pool (the kernel marshalling overwrites them). */
+    if (fn->insns[i].op == MIR_CALL ||
+        fn->insns[i].op == MIR_SIMD_SLP_MAC) {
       return 1;
     }
   }
@@ -363,6 +374,63 @@ static void mir_compute_coalesce_hints(MirFunction *fn) {
   }
 }
 
+/* True if a value occupying `reg` would be clobbered by an instruction strictly
+ * inside the interval (s, e). Only RAX/RCX/RDX carry implicit clobbers: the
+ * divide family (IDIV/DIV/MULHI) writes RAX:RDX, setcc writes RAX, and a
+ * variable-count shift routes its count through CL (RCX). Boundary instructions
+ * (k == s or k == e) are the value's own def/last-use as a div/shift operand or
+ * result, which the encoder places correctly, so they are not clobbers. Calls
+ * are handled separately by crosses_call (a value spanning a call is barred from
+ * all volatiles, including these three). */
+static int mir_reg_clobbered_in_range(const MirFunction *fn,
+                                      BinaryGpRegister reg, int s, int e) {
+  int constrained = (reg == BINARY_GP_RAX || reg == BINARY_GP_RCX ||
+                     reg == BINARY_GP_RDX);
+  for (int k = s + 1; k < e; k++) {
+    const MirInst *in = &fn->insns[k];
+    /* An explicit write to this physical register (return value into RAX, ABI
+     * argument setup, hidden-return pointer, ...) clobbers a value held there. */
+    if (in->dst.kind == MIR_OPK_PHYS && in->dst.rclass == MIR_RC_GP &&
+        in->dst.phys == (int)reg) {
+      return 1;
+    }
+    if (!constrained) {
+      continue;
+    }
+    switch (in->op) {
+    case MIR_IDIV:
+    case MIR_DIV:
+    case MIR_MULHI:
+      if (reg == BINARY_GP_RAX || reg == BINARY_GP_RDX) {
+        return 1;
+      }
+      break;
+    case MIR_CQO:
+    case MIR_XOR_RDX:
+      if (reg == BINARY_GP_RDX) {
+        return 1;
+      }
+      break;
+    case MIR_SETCC:
+    case MIR_FSETCC:
+      if (reg == BINARY_GP_RAX) {
+        return 1;
+      }
+      break;
+    case MIR_SHL:
+    case MIR_SHR:
+    case MIR_SAR:
+      if (reg == BINARY_GP_RCX && in->b.kind != MIR_OPK_IMM) {
+        return 1;
+      }
+      break;
+    default:
+      break;
+    }
+  }
+  return 0;
+}
+
 int mir_regalloc(MirFunction *fn) {
   if (!fn) {
     return 0;
@@ -382,7 +450,11 @@ int mir_regalloc(MirFunction *fn) {
     fn->vregs[v].crosses_call = 0;
   }
   for (size_t i = 0; i < fn->insn_count; i++) {
-    if (fn->insns[i].op != MIR_CALL) {
+    /* MIR_SIMD_SLP_MAC clobbers the caller-saved set (RAX/RCX/RDX/R8/R9/R10/R11
+     * + xmm0..3) exactly like a call, so a value spanning it must also live in a
+     * callee-saved register or spill. */
+    if (fn->insns[i].op != MIR_CALL &&
+        fn->insns[i].op != MIR_SIMD_SLP_MAC) {
       continue;
     }
     int c = (int)i;
@@ -503,7 +575,9 @@ int mir_regalloc(MirFunction *fn) {
         cv->coalesce_hint != MIR_VREG_NONE) {
       MirVreg *hv = &fn->vregs[cv->coalesce_hint];
       if (hv->in_register && hv->rclass == MIR_RC_GP &&
-          hv->live_end == point && gp_held_by[hv->phys] == cv->coalesce_hint) {
+          hv->live_end == point && gp_held_by[hv->phys] == cv->coalesce_hint &&
+          !mir_reg_clobbered_in_range(fn, (BinaryGpRegister)hv->phys,
+                                      cv->live_start, cv->live_end)) {
         cv->phys = hv->phys;
         cv->assigned = 1;
         cv->in_register = 1;
@@ -553,7 +627,9 @@ int mir_regalloc(MirFunction *fn) {
           cv->crosses_call ? MIR_GP_CROSSCALL_POOL_COUNT : gp_leaf_pool_count;
       for (size_t p = 0; p < pool_n; p++) {
         BinaryGpRegister reg = pool[p];
-        if (gp_held_by[reg] == -1) {
+        if (gp_held_by[reg] == -1 &&
+            !mir_reg_clobbered_in_range(fn, reg, cv->live_start,
+                                        cv->live_end)) {
           gp_held_by[reg] = cur;
           cv->assigned = 1;
           cv->in_register = 1;
@@ -587,6 +663,12 @@ int mir_regalloc(MirFunction *fn) {
       MirVregId a = active[r];
       MirVreg *av = &fn->vregs[a];
       if (av->rclass != cv->rclass || !av->in_register) {
+        continue;
+      }
+      /* Don't steal a register that would be clobbered inside cur's interval. */
+      if (av->rclass == MIR_RC_GP &&
+          mir_reg_clobbered_in_range(fn, (BinaryGpRegister)av->phys,
+                                     cv->live_start, cv->live_end)) {
         continue;
       }
       if (av->live_end > victim_end) {

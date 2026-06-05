@@ -212,6 +212,7 @@ static const char *mir_opcode_name(MirOpcode op) {
   case MIR_VBROADCAST: return "vbroadcast";
   case MIR_VIOTA: return "viota";
   case MIR_VHREDUCE: return "vhreduce";
+  case MIR_SIMD_SLP_MAC: return "simd_slp_mac";
   case MIR_OPCODE_COUNT: break;
   }
   return "?";

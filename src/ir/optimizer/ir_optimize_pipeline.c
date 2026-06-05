@@ -74,6 +74,8 @@ static const IROptNamedPass g_ir_post_fixpoint_passes[] = {
     {"lower_bound_i32", ir_lower_bound_i32_pass},
     {"detect_shift_loops", ir_detect_shift_loops_pass},
     {"eliminate_congruent_ivs", ir_eliminate_congruent_ivs_pass},
+    /* After congruent-IV merge so parallel lane indices appear as base+J. */
+    {"simd_slp_mac_i32", ir_simd_slp_mac_i32_pass},
 };
 
 static const IROptNamedStage g_ir_pre_inline_stage = {

@@ -22,3 +22,4 @@ examples/tracy_demo/tracy_dir.local.bat
 !.elfwork/build_and_test.sh
 __pycache__/
 *.pyc
+_tmp/

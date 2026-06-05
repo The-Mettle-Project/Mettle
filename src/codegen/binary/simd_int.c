@@ -1028,6 +1028,195 @@ int code_generator_binary_emit_simd_dot_i32(
                                                       BINARY_GP_RAX);
 }
 
+/* IR_OP_SIMD_SLP_MAC_I32: K (4 or 8) parallel int32 multiply-accumulate
+ * reductions sharing a broadcast scalar. For lane j: out[out_off+j] =
+ * sum_{k} a[a_off+k] * b[b_off + k*b_stride + j]. One vector accumulator,
+ * per-iteration broadcast of a[k] against K contiguous b lanes. Registers:
+ * rcx=a ptr, rdx=b ptr, r8=out ptr, r9=k count, r10=b_stride*8(bytes); ymm0=av,
+ * ymm1=b, ymm2=product, ymm3=accumulator. */
+int code_generator_binary_emit_simd_slp_mac_i32(
+    CodeGenerator *generator, BinaryFunctionContext *context,
+    const IRInstruction *instruction) {
+  BinaryCodeBuffer *b = NULL;
+  size_t loop_top = 0;
+  size_t j_done = 0;
+
+  if (!generator || !context || !instruction ||
+      instruction->argument_count < 6 || !instruction->arguments ||
+      instruction->arguments[0].kind != IR_OPERAND_INT) {
+    code_generator_set_error(generator, "Malformed simd_slp_mac_i32");
+    return 0;
+  }
+  long long K = instruction->arguments[0].int_value;
+  int wide = (K == 8);
+  if (K != 4 && K != 8) {
+    code_generator_set_error(generator, "slp_mac_i32: K must be 4 or 8");
+    return 0;
+  }
+  b = &context->code;
+
+  /* Base pointers: out->r8, a->rcx, b->rdx. */
+  if (!code_generator_binary_emit_operand_load(generator, context,
+                                               &instruction->dest,
+                                               BINARY_GP_R8) ||
+      !code_generator_binary_emit_operand_load(generator, context,
+                                               &instruction->lhs,
+                                               BINARY_GP_RCX) ||
+      !code_generator_binary_emit_operand_load(generator, context,
+                                               &instruction->rhs,
+                                               BINARY_GP_RDX)) {
+    return 0;
+  }
+  /* Add element offsets (in elements; *4 to bytes) using RAX as scratch. */
+  struct {
+    int arg;
+    BinaryGpRegister base;
+  } offs[] = {{2, BINARY_GP_RCX}, {3, BINARY_GP_RDX}, {5, BINARY_GP_R8}};
+  for (int i = 0; i < 3; i++) {
+    if (!code_generator_binary_emit_operand_load(
+            generator, context, &instruction->arguments[offs[i].arg],
+            BINARY_GP_RAX) ||
+        !binary_emit_shift_reg_imm8(b, 4, BINARY_GP_RAX, 2) ||
+        !wcs_add_reg_reg64(b, offs[i].base, BINARY_GP_RAX)) {
+      return 0;
+    }
+  }
+  /* b_stride*4 (bytes) -> r10 ; count -> r9. */
+  if (!code_generator_binary_emit_operand_load(generator, context,
+                                               &instruction->arguments[4],
+                                               BINARY_GP_R10) ||
+      !binary_emit_shift_reg_imm8(b, 4, BINARY_GP_R10, 2) ||
+      !code_generator_binary_emit_operand_load(generator, context,
+                                               &instruction->arguments[1],
+                                               BINARY_GP_R9) ||
+      !wcs_avx_vpxor_ymm(b, 3, 3, 3)) {
+    return 0;
+  }
+
+  loop_top = b->size;
+  if (!binary_emit_cmp_reg_imm32(b, BINARY_GP_R9, 0) ||
+      !wcs_jcc(b, 0x84 /* je */, &j_done) ||
+      /* broadcast a[k] straight from memory (VEX, no legacy movd). */
+      !wcs_avx_vpbroadcastd_ymm_mem(b, 0, BINARY_GP_RCX, 0) ||
+      (wide ? !wcs_avx_vmovdqu_ymm_mem(b, 1, BINARY_GP_RDX, 0)
+            : !wcs_avx_vmovdqu_xmm_mem(b, 1, BINARY_GP_RDX, 0)) ||
+      !wcs_avx_vpmulld_ymm(b, 2, 0, 1) || !wcs_avx_vpaddd_ymm(b, 3, 3, 2) ||
+      !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 4) ||
+      !wcs_add_reg_reg64(b, BINARY_GP_RDX, BINARY_GP_R10) ||
+      !binary_emit_sub_reg_imm32(b, BINARY_GP_R9, 1)) {
+    return 0;
+  }
+  {
+    size_t j_back = 0;
+    if (!wcs_jcc(b, 0, &j_back) || !wcs_patch_to(b, j_back, loop_top)) {
+      return 0;
+    }
+  }
+  if (!wcs_patch_here(b, j_done)) {
+    return 0;
+  }
+  if (wide ? !wcs_avx_vmovdqu_mem_ymm(b, BINARY_GP_R8, 0, 3)
+           : !wcs_avx_vmovdqu_mem_xmm(b, BINARY_GP_R8, 0, 3)) {
+    return 0;
+  }
+  return wcs_avx_vzeroupper(b);
+}
+
+/* Pure inner loop for the SLP MAC kernel, emitted INLINE inside a MIR
+ * register-allocated function (see MIR_SIMD_SLP_MAC). The caller (the MIR
+ * encoder) has already marshalled the operands into fixed registers:
+ *   RCX = a element pointer (already offset to a[a_off])
+ *   RDX = b element pointer (already offset to b[b_off])
+ *   R8  = out element pointer (already offset to out[out_off])
+ *   R9  = k iteration count
+ *   RAX = b row stride in BYTES (b advances by this each k)
+ * K is 4 or 8 (lanes). Clobbers RCX/RDX/R8/R9/RAX and ymm0..3; leaves the result
+ * stored at [R8]. Unlike the fallback entry point above it performs NO operand
+ * loads, so it is safe to run with no coherent fallback stack homes. */
+int code_generator_binary_emit_vzeroupper(BinaryCodeBuffer *b) {
+  return wcs_avx_vzeroupper(b);
+}
+
+/* One unrolled multiply-accumulate step: acc_ymm += broadcast(a[rcx+a_disp]) *
+ * b[rdx], then advance rdx by the row stride in RAX. ymm0 is the broadcast temp,
+ * ymm1 the load/product temp (both Win64-volatile). `wide` selects ymm (K=8) vs
+ * xmm (K=4) b loads; an xmm load zero-extends the upper lanes so the ymm
+ * multiply/add leave the accumulator's upper half untouched. */
+static int slp_mac_step(BinaryCodeBuffer *b, int wide, int a_disp, int acc_ymm) {
+  return wcs_avx_vpbroadcastd_ymm_mem(b, 0, BINARY_GP_RCX, a_disp) &&
+         (wide ? wcs_avx_vmovdqu_ymm_mem(b, 1, BINARY_GP_RDX, 0)
+               : wcs_avx_vmovdqu_xmm_mem(b, 1, BINARY_GP_RDX, 0)) &&
+         wcs_avx_vpmulld_ymm(b, 1, 0, 1) &&
+         wcs_avx_vpaddd_ymm(b, acc_ymm, acc_ymm, 1) &&
+         wcs_add_reg_reg64(b, BINARY_GP_RDX, BINARY_GP_RAX);
+}
+
+int code_generator_binary_emit_simd_slp_mac_i32_loop(BinaryCodeBuffer *b,
+                                                      long long K) {
+  size_t main_top = 0, after_main = 0, tail_top = 0, j_done = 0;
+  int wide = (K == 8);
+  if ((K != 4 && K != 8) || !b) {
+    return 0;
+  }
+  /* Four independent accumulators (ymm2..5, all Win64-volatile) so the serial
+   * vpmulld->vpaddd dependency is hidden by 4-way ILP: a single-accumulator loop
+   * is latency-bound (~10-cycle multiply) and loses to the scalar code's four
+   * independent MAC chains. The main loop consumes 4 k-iterations at a time
+   * (advancing rdx by the stride after each step, rcx by 16 at the end); a tail
+   * loop handles a k-count that is not a multiple of 4. */
+  if (!wcs_avx_vpxor_ymm(b, 2, 2, 2) || !wcs_avx_vpxor_ymm(b, 3, 3, 3) ||
+      !wcs_avx_vpxor_ymm(b, 4, 4, 4) || !wcs_avx_vpxor_ymm(b, 5, 5, 5)) {
+    return 0;
+  }
+  main_top = b->size;
+  if (!binary_emit_cmp_reg_imm32(b, BINARY_GP_R9, 4) ||
+      !wcs_jcc(b, 0x8C /* jl (signed) */, &after_main) ||
+      !slp_mac_step(b, wide, 0, 2) || !slp_mac_step(b, wide, 4, 3) ||
+      !slp_mac_step(b, wide, 8, 4) || !slp_mac_step(b, wide, 12, 5) ||
+      !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 16) ||
+      !binary_emit_sub_reg_imm32(b, BINARY_GP_R9, 4)) {
+    return 0;
+  }
+  {
+    size_t j_back = 0;
+    if (!wcs_jcc(b, 0, &j_back) || !wcs_patch_to(b, j_back, main_top)) {
+      return 0;
+    }
+  }
+  /* Reduce the four accumulators into ymm2. */
+  if (!wcs_patch_here(b, after_main) || !wcs_avx_vpaddd_ymm(b, 2, 2, 3) ||
+      !wcs_avx_vpaddd_ymm(b, 4, 4, 5) || !wcs_avx_vpaddd_ymm(b, 2, 2, 4)) {
+    return 0;
+  }
+  /* Tail: remaining (k mod 4) iterations, one at a time, into ymm2. */
+  tail_top = b->size;
+  if (!binary_emit_cmp_reg_imm32(b, BINARY_GP_R9, 0) ||
+      !wcs_jcc(b, 0x84 /* je */, &j_done) || !slp_mac_step(b, wide, 0, 2) ||
+      !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 4) ||
+      !binary_emit_sub_reg_imm32(b, BINARY_GP_R9, 1)) {
+    return 0;
+  }
+  {
+    size_t j_back = 0;
+    if (!wcs_jcc(b, 0, &j_back) || !wcs_patch_to(b, j_back, tail_top)) {
+      return 0;
+    }
+  }
+  if (!wcs_patch_here(b, j_done)) {
+    return 0;
+  }
+  if (wide ? !wcs_avx_vmovdqu_mem_ymm(b, BINARY_GP_R8, 0, 2)
+           : !wcs_avx_vmovdqu_mem_xmm(b, BINARY_GP_R8, 0, 2)) {
+    return 0;
+  }
+  /* No vzeroupper here: this kernel runs inline, often many times per function
+   * (once per output tile), so a per-invocation vzeroupper is pure overhead. The
+   * MIR encoder emits a SINGLE vzeroupper in the epilogue of any function that
+   * used an inline vector kernel, guarding the AVX->legacy-SSE transition once at
+   * the function boundary. */
+  return 1;
+}
+
 int code_generator_binary_emit_prefix_sum_i32(
     CodeGenerator *generator, BinaryFunctionContext *context,
     const IRInstruction *instruction) {

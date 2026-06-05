@@ -391,6 +391,8 @@ int binary_emit_movsx_reg_reg16(BinaryCodeBuffer *buffer, BinaryGpRegister desti
 int binary_emit_movsx_reg_reg8(BinaryCodeBuffer *buffer, BinaryGpRegister destination, BinaryGpRegister source);
 int binary_emit_movsxd_rax_eax(BinaryCodeBuffer *buffer);
 int binary_emit_movsxd_reg_reg32(BinaryCodeBuffer *buffer, BinaryGpRegister destination, BinaryGpRegister source);
+int binary_emit_movzx_reg_reg8(BinaryCodeBuffer *buffer, BinaryGpRegister destination, BinaryGpRegister source);
+int binary_emit_movzx_reg_reg16(BinaryCodeBuffer *buffer, BinaryGpRegister destination, BinaryGpRegister source);
 int binary_emit_movzx_eax_al(BinaryCodeBuffer *buffer);
 int binary_emit_movzx_eax_ax(BinaryCodeBuffer *buffer);
 int binary_emit_movzx_reg_mem16(BinaryCodeBuffer *buffer, BinaryGpRegister destination, BinaryGpRegister base, int displacement);
@@ -528,6 +530,15 @@ int code_generator_binary_try_emit_offset_scaled_address_load( CodeGenerator *ge
 int code_generator_binary_try_emit_offset_scaled_address_store( CodeGenerator *generator, BinaryFunctionContext *context, const IRFunction *function, size_t instruction_index, size_t *consumed_out);
 int code_generator_binary_emit_simd_clamp_i32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_dot_i32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
+int code_generator_binary_emit_simd_slp_mac_i32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
+/* Pure inner loop of the SLP MAC kernel for the MIR pass-through path. Assumes
+ * RCX/RDX/R8 = a/b/out element pointers (offsets already applied), R9 = k count,
+ * and RAX = b row stride in bytes (advances b each iteration). K is 4 or 8. */
+int code_generator_binary_emit_simd_slp_mac_i32_loop(BinaryCodeBuffer *b, long long K);
+/* Emit a single vzeroupper (clears YMM upper halves). Used by the MIR epilogue
+ * to guard the AVX->legacy-SSE transition once per function that ran an inline
+ * vector kernel. */
+int code_generator_binary_emit_vzeroupper(BinaryCodeBuffer *b);
 int code_generator_binary_emit_simd_insertion_sort_i32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_matmul_n32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_reverse_copy_i32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);

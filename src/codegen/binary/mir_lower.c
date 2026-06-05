@@ -1108,8 +1108,39 @@ int mir_function_is_eligible(CodeGenerator *generator,
         return mir_trace_bail(function_data, "addressof:dest");
       }
       break;
+    case IR_OP_SIMD_SLP_MAC_I32: {
+      /* SLP MAC kernel run INLINE inside the MIR function (so the surrounding
+       * outer loops keep register-allocated codegen). The lowering marshals the
+       * three base pointers + count + byte stride into RCX/RDX/R8/R9/RAX, so the
+       * only compile-time-constant requirement is the lane count K (it selects
+       * the xmm-vs-ymm kernel width); the bases, offsets, count, and stride may
+       * each be a runtime temp/symbol resolved via mir_value_operand. */
+      if (in->argument_count < 6 || !in->arguments ||
+          in->arguments[0].kind != IR_OPERAND_INT ||
+          (in->arguments[0].int_value != 4 &&
+           in->arguments[0].int_value != 8)) {
+        return mir_trace_bail(function_data, "slp_mac:nonconst_K");
+      }
+      const IROperand *bases[3] = {&in->dest, &in->lhs, &in->rhs};
+      for (int k = 0; k < 3; k++) {
+        if (bases[k]->kind != IR_OPERAND_TEMP &&
+            bases[k]->kind != IR_OPERAND_SYMBOL) {
+          return mir_trace_bail(function_data, "slp_mac:base_kind");
+        }
+      }
+      /* count, a_off, b_off, b_stride, out_off */
+      const int run_args[5] = {1, 2, 3, 4, 5};
+      for (int k = 0; k < 5; k++) {
+        const IROperand *o = &in->arguments[run_args[k]];
+        if (o->kind != IR_OPERAND_TEMP && o->kind != IR_OPERAND_SYMBOL &&
+            o->kind != IR_OPERAND_INT) {
+          return mir_trace_bail(function_data, "slp_mac:arg_kind");
+        }
+      }
+      break;
+    }
     default: {
-      /* UNARY, NEW, CALL_INDIRECT, SIMD ops, ROTATE_ADD: not yet. */
+      /* UNARY, NEW, CALL_INDIRECT, other SIMD ops, ROTATE_ADD: not yet. */
       char buf[40];
       snprintf(buf, sizeof(buf), "op:%d", (int)in->op);
       return mir_trace_bail(function_data, buf);
@@ -2574,6 +2605,92 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
                        0, 0);
     }
     return 1;
+  }
+
+  case IR_OP_SIMD_SLP_MAC_I32: {
+    /* Inline SLP MAC kernel. Marshal the three effective element pointers
+     * (base + offset*4), the k count, and the byte row stride into
+     * RCX/RDX/R8/R9/RAX — like call-argument setup — then emit the pure-loop MIR
+     * op. The lane count K is a compile-time constant (validated in
+     * eligibility); the kernel advances b by the RAX stride each iteration. The
+     * op is treated like a call by the allocator, so no live value occupies a
+     * volatile across it.
+     *
+     * Compute every value into a vreg FIRST, then do all the fixed-register MOVs
+     * LAST: the MIR_LEA encoder stages spilled base/index through RDX/R11, which
+     * would otherwise clobber a kernel argument already parked in RDX. */
+    long long K = in->arguments[0].int_value;
+    const IROperand *bases[3] = {&in->lhs, &in->rhs, &in->dest}; /* a, b, out */
+    const int off_arg[3] = {2, 3, 5};
+    MirVregId ptr_vreg[3];
+    for (int p = 0; p < 3; p++) {
+      MirOperand base = mir_value_operand(fn, g, ctx, map, bases[p]);
+      MirOperand off = mir_value_operand(fn, g, ctx, map, &in->arguments[off_arg[p]]);
+      if (base.kind != MIR_OPK_VREG) {
+        fn->has_error = 1;
+        return 0;
+      }
+      ptr_vreg[p] = mir_new_vreg(fn, MIR_RC_GP, 8);
+      if (ptr_vreg[p] == MIR_VREG_NONE) {
+        return 0;
+      }
+      MirOperand mem;
+      if (off.kind == MIR_OPK_IMM) {
+        mem = mir_op_mem_vreg(base.vreg, MIR_VREG_NONE, 0, (int)(off.imm * 4));
+      } else if (off.kind == MIR_OPK_VREG) {
+        mem = mir_op_mem_vreg(base.vreg, off.vreg, 4, 0);
+      } else {
+        fn->has_error = 1;
+        return 0;
+      }
+      if (!mir_emit1(fn, MIR_LEA, mir_op_vreg(ptr_vreg[p]), mem, mir_op_none(),
+                     8, 0, 0)) {
+        return 0;
+      }
+    }
+    /* byte row stride into a vreg (stride_elems << 2). */
+    MirOperand stride = mir_value_operand(fn, g, ctx, map, &in->arguments[4]);
+    MirVregId stride_vreg = mir_new_vreg(fn, MIR_RC_GP, 8);
+    if (stride_vreg == MIR_VREG_NONE) {
+      return 0;
+    }
+    if (stride.kind == MIR_OPK_IMM) {
+      if (!mir_emit1(fn, MIR_MOV, mir_op_vreg(stride_vreg),
+                     mir_op_imm(stride.imm * 4), mir_op_none(), 8, 0, 0)) {
+        return 0;
+      }
+    } else if (stride.kind == MIR_OPK_VREG) {
+      if (!mir_emit1(fn, MIR_SHL, mir_op_vreg(stride_vreg), stride,
+                     mir_op_imm(2), 8, 0, 0)) {
+        return 0;
+      }
+    } else {
+      fn->has_error = 1;
+      return 0;
+    }
+    MirOperand cnt = mir_value_operand(fn, g, ctx, map, &in->arguments[1]);
+    MirVregId cnt_vreg = mir_new_vreg(fn, MIR_RC_GP, 8);
+    if (cnt_vreg == MIR_VREG_NONE ||
+        !mir_emit1(fn, MIR_MOV, mir_op_vreg(cnt_vreg), cnt, mir_op_none(), 8, 0,
+                   0)) {
+      return 0;
+    }
+    /* Now park each computed value in its kernel register (no LEAs left to
+     * clobber them). RCX=a, RDX=b, R8=out, R9=count, RAX=byte stride. */
+    if (!mir_emit1(fn, MIR_MOV, mir_op_phys(BINARY_GP_RCX, MIR_RC_GP),
+                   mir_op_vreg(ptr_vreg[0]), mir_op_none(), 8, 0, 0) ||
+        !mir_emit1(fn, MIR_MOV, mir_op_phys(BINARY_GP_RDX, MIR_RC_GP),
+                   mir_op_vreg(ptr_vreg[1]), mir_op_none(), 8, 0, 0) ||
+        !mir_emit1(fn, MIR_MOV, mir_op_phys(BINARY_GP_R8, MIR_RC_GP),
+                   mir_op_vreg(ptr_vreg[2]), mir_op_none(), 8, 0, 0) ||
+        !mir_emit1(fn, MIR_MOV, mir_op_phys(BINARY_GP_R9, MIR_RC_GP),
+                   mir_op_vreg(cnt_vreg), mir_op_none(), 8, 0, 0) ||
+        !mir_emit1(fn, MIR_MOV, mir_op_phys(BINARY_GP_RAX, MIR_RC_GP),
+                   mir_op_vreg(stride_vreg), mir_op_none(), 8, 0, 0)) {
+      return 0;
+    }
+    return mir_emit1(fn, MIR_SIMD_SLP_MAC, mir_op_imm(K), mir_op_none(),
+                     mir_op_none(), 8, 0, 0);
   }
 
   case IR_OP_ADDRESS_OF: {

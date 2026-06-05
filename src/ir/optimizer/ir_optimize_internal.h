@@ -239,6 +239,7 @@ typedef struct {
   X(SIMD_SUM_U8, "simd_sum_u8")                                              \
   X(SIMD_BYTE_MAP, "simd_byte_map")                                          \
   X(SIMD_DOT_I32, "simd_dot_i32")                                            \
+  X(SIMD_SLP_MAC_I32, "simd_slp_mac_i32")                                    \
   X(SIMD_INSERTION_SORT_I32, "simd_insertion_sort_i32")                      \
   X(SROA, "sroa")
 
@@ -450,6 +451,7 @@ int ir_auto_vectorize_pass(IRFunction *function, int *changed);
 int ir_outer_vectorize_pass(IRFunction *function, int *changed);
 int ir_simd_dot_float_pass(IRFunction *function, int *changed);
 int ir_simd_dot_i32_pass(IRFunction *function, int *changed);
+int ir_simd_slp_mac_i32_pass(IRFunction *function, int *changed);
 int ir_simd_insertion_sort_i32_pass(IRFunction *function, int *changed);
 int ir_simd_memory_map_pass(IRFunction *function, int *changed);
 int ir_simd_minmax_i32_pass(IRFunction *function, int *changed);

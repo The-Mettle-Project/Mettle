@@ -87,6 +87,16 @@ typedef enum {
   /* Signed int32 dot product into int64. dest = sum/result, lhs = a, rhs = b,
    * arguments[0] = element count. */
   IR_OP_SIMD_DOT_I32,
+  /* SLP-vectorized group of K parallel int32 multiply-accumulate reductions
+   * (K in {4,8}). For lane j in 0..K-1:
+   *     out[out_off + j] += sum_{k=0..count-1} a[a_off + k] * b[b_off + k*bstr + j]
+   * i.e. one shared scalar a[k] broadcast against K contiguous b lanes, K
+   * independent accumulators stored to K contiguous outputs. Matched from the
+   * instruction-level parallelism of K isomorphic accumulator chains (broadcast
+   * scalar x contiguous loads) -- NOT from matmul's shape or names.
+   * dest=out base ptr, lhs=a base ptr, rhs=b base ptr; arguments:
+   * [0]=K, [1]=count, [2]=a_off, [3]=b_off, [4]=b_stride, [5]=out_off. */
+  IR_OP_SIMD_SLP_MAC_I32,
   /* dst[i] = src[i]*mul+add; dest += sum of outputs. lhs=src, rhs=dst,
    * arguments[0]=len, [1]=mul, [2]=add (int32). */
   IR_OP_SIMD_SCALE_I32,

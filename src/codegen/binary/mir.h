@@ -217,6 +217,17 @@ typedef enum {
   MIR_VIOTA,       /* lane i <- base + i (induction vector) */
   MIR_VHREDUCE,    /* horizontal add/min/max of all lanes -> scalar xmm */
 
+  /* SLP multiply-accumulate kernel, emitted inline inside an otherwise
+   * register-allocated function (so the surrounding outer loops keep MIR-quality
+   * codegen instead of dropping the whole function to the spill-everything
+   * fallback). Call-like: the lowering marshals a_ptr->RCX, b_ptr->RDX,
+   * out_ptr->R8, count->R9 with preceding MIR_MOVs (exactly like call args), and
+   * this op emits the pure inner loop. dst.imm = K (4 or 8); a.imm = row stride
+   * in BYTES (baked as an imm32 b-advance). Clobbers RAX/RCX/RDX/R8/R9/R10/R11 +
+   * xmm0..3, so the allocator treats it like a call (no live value crosses it in
+   * a volatile register). */
+  MIR_SIMD_SLP_MAC,
+
   MIR_OPCODE_COUNT
 } MirOpcode;
 
@@ -340,6 +351,13 @@ typedef struct {
    * caller-made copy; this region (at the very bottom of the frame, below the
    * shadow space) holds those copies. 16-aligned. */
   int outgoing_indirect_bytes;
+
+  /* Set by the encoder when it emits an inline vector kernel (MIR_SIMD_SLP_MAC).
+   * Such a kernel leaves the YMM upper halves dirty; the epilogue emits one
+   * vzeroupper before returning so a caller using legacy SSE pays no AVX->SSE
+   * transition penalty. Doing it once per function (not per kernel invocation)
+   * keeps tiled inner loops cheap. */
+  int used_inline_vector;
 
   int has_error;
 } MirFunction;

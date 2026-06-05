@@ -15,8 +15,12 @@
  * extra reg-reg moves vs an optimal in-place scheme are cheap and removable
  * later; correctness first. */
 
-#define SCRATCH_A BINARY_GP_RAX
-#define SCRATCH_B BINARY_GP_RCX
+/* Encoder scratch registers. R10/R11 are pure scratch — not allocatable, and
+ * not ABI argument registers on EITHER Win64 or SysV — so RAX/RCX/RDX are freed
+ * for the register allocator. Ops that need a HARDWARE register (divide's
+ * RDX:RAX, variable shift's CL, setcc's byte target) name it explicitly. */
+#define SCRATCH_A BINARY_GP_R10
+#define SCRATCH_B BINARY_GP_R11
 /* Float scratch (see MIR_XMM_POOL): XMM4 primary, XMM5 secondary. */
 #define FSCRATCH_A BINARY_XMM4
 #define FSCRATCH_B BINARY_XMM5
@@ -324,19 +328,25 @@ static int encode_imul(MirFunction *fn, const MirInst *in) {
 /* dst = a / b (quotient) or a % b (remainder when in->cc != 0). Signedness is
  * in->is_unsigned (the dividend's type): signed uses CQO + IDIV, unsigned uses
  * XOR(RDX) + DIV. Always 64-bit on the sign/zero-extended operands, which gives
- * the same result as a narrower divide. The dividend goes in RAX and the divisor
- * in any register that is not RAX/RDX; RAX/RCX/RDX are all non-allocatable
- * scratch, so clobbering them is safe and no live value can occupy them. */
+ * the same result as a narrower divide. The dividend goes in RAX, RDX is the
+ * high half, so the divisor must be staged out of RAX/RDX (now allocatable)
+ * into a scratch register BEFORE the dividend is loaded into RAX. */
 static int encode_div(MirFunction *fn, const MirInst *in) {
   BinaryCodeBuffer *code = &fn->context->code;
-  if (!materialize_into(fn, &in->a, SCRATCH_A)) {
-    return 0;
-  }
   int rok;
-  /* value_reg returns the divisor's own register (a pool reg, never RAX/RDX) or
-   * stages an immediate/spill into SCRATCH_B (RCX) -- always idiv-safe. */
+  /* Resolve the divisor first (it might currently live in RAX or RDX, which the
+   * dividend/high-half are about to overwrite); force it into SCRATCH_B then. */
   BinaryGpRegister divisor = value_reg(fn, &in->b, SCRATCH_B, &rok);
   if (!rok) {
+    return 0;
+  }
+  if (divisor == BINARY_GP_RAX || divisor == BINARY_GP_RDX) {
+    if (!binary_emit_mov_reg_reg(code, SCRATCH_B, divisor)) {
+      return enc_err(fn, "out of memory staging divisor");
+    }
+    divisor = SCRATCH_B;
+  }
+  if (!materialize_into(fn, &in->a, BINARY_GP_RAX)) {
     return 0;
   }
   if (in->is_unsigned) {
@@ -349,19 +359,16 @@ static int encode_div(MirFunction *fn, const MirInst *in) {
       return enc_err(fn, "out of memory in idiv");
     }
   }
-  BinaryGpRegister result = in->cc ? BINARY_GP_RDX : SCRATCH_A;
+  BinaryGpRegister result = in->cc ? BINARY_GP_RDX : BINARY_GP_RAX;
   return store_from(fn, &in->dst, result);
 }
 
 /* dst = high 64 bits of (a * b). The multiplicand goes in RAX; the one-operand
  * mul/imul writes the full 128-bit product to RDX:RAX and we keep RDX. b is the
- * magic constant (IMM, staged into RCX) or a register. RAX/RCX/RDX are all
- * non-allocatable scratch, mirroring encode_div. is_unsigned selects mul. */
+ * magic constant (IMM) or a register staged out of RAX/RDX (now allocatable)
+ * into SCRATCH_B before RAX is loaded. is_unsigned selects mul. */
 static int encode_mulhi(MirFunction *fn, const MirInst *in) {
   BinaryCodeBuffer *code = &fn->context->code;
-  if (!materialize_into(fn, &in->a, SCRATCH_A)) {
-    return 0;
-  }
   BinaryGpRegister mreg;
   if (in->b.kind == MIR_OPK_IMM) {
     if (!binary_emit_mov_reg_imm64(code, SCRATCH_B, (uint64_t)in->b.imm)) {
@@ -374,6 +381,15 @@ static int encode_mulhi(MirFunction *fn, const MirInst *in) {
     if (!rok) {
       return 0;
     }
+    if (mreg == BINARY_GP_RAX || mreg == BINARY_GP_RDX) {
+      if (!binary_emit_mov_reg_reg(code, SCRATCH_B, mreg)) {
+        return enc_err(fn, "out of memory staging multiplier");
+      }
+      mreg = SCRATCH_B;
+    }
+  }
+  if (!materialize_into(fn, &in->a, BINARY_GP_RAX)) {
+    return 0;
   }
   if (in->is_unsigned ? !binary_emit_mul_reg(code, mreg)
                       : !binary_emit_imul_reg(code, mreg)) {
@@ -399,28 +415,29 @@ static int encode_shift(MirFunction *fn, const MirInst *in) {
                                     (unsigned char)(in->b.imm & 63))) {
       return enc_err(fn, "out of memory in shift imm");
     }
-  } else {
-    /* Variable count must be in CL. Load the count into RCX FIRST (before the
-     * value lands in `work`), so a count that happens to live in `work` is not
-     * clobbered by staging the shifted value. RCX is never allocatable. */
-    int ok;
-    BinaryGpRegister breg = value_reg(fn, &in->b, SCRATCH_A, &ok);
-    if (!ok) {
-      return 0;
-    }
-    if (breg != BINARY_GP_RCX &&
-        !binary_emit_mov_reg_reg(code, BINARY_GP_RCX, breg)) {
-      return enc_err(fn, "out of memory moving shift count");
-    }
-    if (!operand_in_phys(fn, &in->a, work) &&
-        !materialize_into(fn, &in->a, work)) {
-      return 0;
-    }
-    if (!binary_emit_shift_reg_cl(code, sub, work)) {
-      return enc_err(fn, "out of memory in shift");
-    }
+    return dst_reg ? 1 : store_from(fn, &in->dst, work);
   }
-  return dst_reg ? 1 : store_from(fn, &in->dst, SCRATCH_A);
+  /* Variable count: it must end up in CL (RCX). RCX is now allocatable, so the
+   * value `a` may itself live in RCX, and the count may live anywhere. Stage the
+   * value into SCRATCH_A first (reading it from wherever, RCX included), then
+   * move the count into RCX (the value is already safe in SCRATCH_A), shift, and
+   * store. The MIR layer marks a variable shift as an RCX clobber. */
+  int ok;
+  BinaryGpRegister cnt = value_reg(fn, &in->b, SCRATCH_B, &ok);
+  if (!ok) {
+    return 0;
+  }
+  if (!materialize_into(fn, &in->a, SCRATCH_A)) {
+    return 0;
+  }
+  if (cnt != BINARY_GP_RCX &&
+      !binary_emit_mov_reg_reg(code, BINARY_GP_RCX, cnt)) {
+    return enc_err(fn, "out of memory moving shift count");
+  }
+  if (!binary_emit_shift_reg_cl(code, sub, SCRATCH_A)) {
+    return enc_err(fn, "out of memory in shift");
+  }
+  return store_from(fn, &in->dst, SCRATCH_A);
 }
 
 static int encode_setcc(MirFunction *fn, const MirInst *in) {
@@ -465,7 +482,9 @@ static int encode_setcc(MirFunction *fn, const MirInst *in) {
       !binary_emit_movzx_eax_al(code)) {
     return enc_err(fn, "out of memory in setcc");
   }
-  return store_from(fn, &in->dst, SCRATCH_A);
+  /* setcc/movzx target AL/EAX specifically; the allocator marks SETCC as an RAX
+   * clobber so no live value sits in RAX across it. */
+  return store_from(fn, &in->dst, BINARY_GP_RAX);
 }
 
 /* dst <- extend(low `width` bytes of a) per signedness. Signed extensions emit
@@ -494,23 +513,25 @@ static int encode_extend(MirFunction *fn, const MirInst *in) {
     return done ? 1 : enc_err(fn, "out of memory in extend");
   }
 
-  /* RAX path. */
+  /* Scratch path (unsigned, or a spilled destination): extend in SCRATCH_A using
+   * the general reg-reg forms (no RAX dependency), then store. */
   if (!materialize_into(fn, &in->a, SCRATCH_A)) {
     return 0;
   }
+  BinaryGpRegister S = SCRATCH_A;
   int ok = 1;
   switch (in->width) {
   case 4:
-    ok = signed_ext ? binary_emit_movsxd_rax_eax(code)
-                    : binary_emit_mov_eax_eax(code);
+    ok = signed_ext ? binary_emit_movsxd_reg_reg32(code, S, S)
+                    : binary_emit_mov_reg_reg32(code, S, S);
     break;
   case 2:
-    ok = signed_ext ? binary_emit_movsx_rax_ax(code)
-                    : binary_emit_movzx_eax_ax(code);
+    ok = signed_ext ? binary_emit_movsx_reg_reg16(code, S, S)
+                    : binary_emit_movzx_reg_reg16(code, S, S);
     break;
   case 1:
-    ok = signed_ext ? binary_emit_movsx_rax_al(code)
-                    : binary_emit_movzx_eax_al(code);
+    ok = signed_ext ? binary_emit_movsx_reg_reg8(code, S, S)
+                    : binary_emit_movzx_reg_reg8(code, S, S);
     break;
   default:
     return enc_err(fn, "bad extend width");
@@ -518,7 +539,7 @@ static int encode_extend(MirFunction *fn, const MirInst *in) {
   if (!ok) {
     return enc_err(fn, "out of memory in extend");
   }
-  return store_from(fn, &in->dst, SCRATCH_A);
+  return store_from(fn, &in->dst, S);
 }
 
 /* ---- float (XMM) operand plumbing -------------------------------------- */
@@ -1071,28 +1092,26 @@ static int mir_home_gp_param(MirFunction *fn, const MirParam *p,
     } else if (p->width == 1 && p->is_signed) {
       ok = binary_emit_movsx_reg_reg8(code, D, arg);
     } else {
-      ok = binary_emit_mov_reg_reg(code, SCRATCH_A, arg) &&
-           (p->width == 2 ? binary_emit_movzx_eax_ax(code)
-                          : binary_emit_movzx_eax_al(code)) &&
-           binary_emit_mov_reg_reg(code, D, SCRATCH_A);
+      ok = (p->width == 2) ? binary_emit_movzx_reg_reg16(code, D, arg)
+                           : binary_emit_movzx_reg_reg8(code, D, arg);
     }
     return ok ? 1 : enc_err(fn, "out of memory extending parameter");
   }
-  if (!binary_emit_mov_reg_reg(code, SCRATCH_A, arg)) {
-    return enc_err(fn, "out of memory homing parameter");
-  }
+  /* Spilled destination: extend arg into SCRATCH_A (general reg-reg forms), then
+   * store. */
+  BinaryGpRegister S = SCRATCH_A;
   int ok = 1;
   if (p->width == 4) {
-    ok = p->is_signed ? binary_emit_movsxd_rax_eax(code)
-                      : binary_emit_mov_eax_eax(code);
+    ok = p->is_signed ? binary_emit_movsxd_reg_reg32(code, S, arg)
+                      : binary_emit_mov_reg_reg32(code, S, arg);
   } else if (p->width == 2) {
-    ok = p->is_signed ? binary_emit_movsx_rax_ax(code)
-                      : binary_emit_movzx_eax_ax(code);
+    ok = p->is_signed ? binary_emit_movsx_reg_reg16(code, S, arg)
+                      : binary_emit_movzx_reg_reg16(code, S, arg);
   } else if (p->width == 1) {
-    ok = p->is_signed ? binary_emit_movsx_rax_al(code)
-                      : binary_emit_movzx_eax_al(code);
+    ok = p->is_signed ? binary_emit_movsx_reg_reg8(code, S, arg)
+                      : binary_emit_movzx_reg_reg8(code, S, arg);
   }
-  if (!ok || !store_from(fn, &dst, SCRATCH_A)) {
+  if (!ok || !store_from(fn, &dst, S)) {
     return enc_err(fn, "out of memory extending parameter");
   }
   return 1;
@@ -1323,6 +1342,12 @@ static int mir_emit_prologue(MirFunction *fn) {
 static int mir_emit_epilogue(MirFunction *fn) {
   BinaryFunctionContext *ctx = fn->context;
   BinaryCodeBuffer *code = &ctx->code;
+  /* An inline vector kernel (e.g. MIR_SIMD_SLP_MAC) left the YMM upper halves
+   * dirty; clear them once here so a caller running legacy SSE pays no AVX->SSE
+   * transition penalty. Emitted per RET, but functions typically have one. */
+  if (fn->used_inline_vector && !code_generator_binary_emit_vzeroupper(code)) {
+    return enc_err(fn, "out of memory emitting epilogue vzeroupper");
+  }
   for (size_t i = ctx->saved_xmm_count; i > 0; i--) {
     size_t j = i - 1;
     if (!simd_movdqu_xmm_mem_disp(code, ctx->saved_xmm_registers[j],
@@ -1496,7 +1521,7 @@ int mir_encode(MirFunction *fn) {
         ok = enc_err(fn, "out of memory in fsetcc");
         break;
       }
-      ok = store_from(fn, &in->dst, SCRATCH_A);
+      ok = store_from(fn, &in->dst, BINARY_GP_RAX); /* result in RAX (movzx) */
       break;
     }
     case MIR_FCMPBR: {
@@ -1559,6 +1584,18 @@ int mir_encode(MirFunction *fn) {
       }
       break;
     }
+    case MIR_SIMD_SLP_MAC: {
+      /* Inline SLP MAC kernel. The preceding MIR_MOVs marshalled a/b/out element
+       * pointers into RCX/RDX/R8, the k count into R9, and the byte row stride
+       * into RAX; emit the pure inner loop (no operand loads, so it needs no
+       * coherent fallback stack homes). dst.imm = K (4/8). */
+      if (!code_generator_binary_emit_simd_slp_mac_i32_loop(&ctx->code,
+                                                            in->dst.imm)) {
+        ok = enc_err(fn, "out of memory emitting inline SLP MAC kernel");
+      }
+      fn->used_inline_vector = 1;
+      break;
+    }
     case MIR_STORE_OUTARG: {
       /* Store an outgoing stack call argument to [rsp + b.imm]. rsp is fixed
        * after the prologue and the outgoing region is reserved there, so this
@@ -1571,6 +1608,48 @@ int mir_encode(MirFunction *fn) {
       if (!binary_emit_mov_mem_reg(&ctx->code, BINARY_GP_RSP, (int)in->b.imm,
                                    r)) {
         ok = enc_err(fn, "out of memory storing outgoing call argument");
+      }
+      break;
+    }
+    case MIR_LEA: {
+      /* dst <- address of [base + index*scale + disp]. base/index are vregs
+       * (index optional). Mirrors the scaled-LOAD address staging but
+       * materializes the address instead of dereferencing it. Emitted by the
+       * SLP-kernel lowering to form effective element pointers. */
+      if (in->a.kind != MIR_OPK_MEM) {
+        ok = enc_err(fn, "MIR_LEA expects a memory operand");
+        break;
+      }
+      int rok;
+      BinaryGpRegister D;
+      int dst_in_reg = dst_is_reg(fn, &in->dst, &D);
+      BinaryGpRegister target = dst_in_reg ? D : SCRATCH_A;
+      MirOperand bop = mir_op_vreg(in->a.mem.base);
+      BinaryGpRegister base_reg = value_reg(fn, &bop, SCRATCH_B, &rok);
+      if (!rok) {
+        break;
+      }
+      if (in->a.mem.index != MIR_VREG_NONE) {
+        MirOperand iop = mir_op_vreg(in->a.mem.index);
+        BinaryGpRegister idx_scratch =
+            (target == BINARY_GP_RDX) ? SCRATCH_B : BINARY_GP_RDX;
+        BinaryGpRegister index_reg = value_reg(fn, &iop, idx_scratch, &rok);
+        if (!rok) {
+          break;
+        }
+        if (!binary_emit_lea_reg_base_index_scale_disp(
+                &ctx->code, target, base_reg, index_reg, in->a.mem.scale,
+                in->a.mem.disp)) {
+          ok = enc_err(fn, "out of memory in scaled lea");
+          break;
+        }
+      } else if (!binary_emit_lea_reg_mem(&ctx->code, target, base_reg,
+                                          in->a.mem.disp)) {
+        ok = enc_err(fn, "out of memory in lea");
+        break;
+      }
+      if (!dst_in_reg) {
+        ok = store_from(fn, &in->dst, SCRATCH_A);
       }
       break;
     }

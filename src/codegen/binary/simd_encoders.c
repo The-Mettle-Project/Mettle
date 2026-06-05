@@ -892,6 +892,16 @@ int wcs_avx_vpbroadcastd_ymm(BinaryCodeBuffer *b, int dst, int src_xmm) {
              b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (src_xmm & 7)));
 }
 
+/* vpbroadcastd ymm, m32 — VEX.256.66.0F38.W0 58 /r with a memory operand. Loads
+ * 32 bits and broadcasts to all 8 lanes in ONE VEX op (no legacy movd, so no
+ * AVX<->SSE transition penalty inside a hot loop). */
+int wcs_avx_vpbroadcastd_ymm_mem(BinaryCodeBuffer *b, int dst, int base,
+                                 int displacement) {
+  return wcs_vex3(b, 2, 1, 1, 0, dst, base, 0) &&
+         binary_code_buffer_append_u8(b, 0x58) &&
+         wcs_avx_modrm_mem_disp(b, dst, base, displacement);
+}
+
 /* vmovd xmm, r/m32 — VEX.128.66.0F.W0 6E /r. The VEX form is mandatory inside
  * AVX hot loops: a legacy (66 0F 6E) movd next to VEX-256 ops makes Golden Cove
  * P-cores take the AVX<->SSE transition penalty (upper-YMM save/restore) every

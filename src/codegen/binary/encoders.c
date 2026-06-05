@@ -1138,6 +1138,42 @@ int binary_emit_movsx_reg_reg16(BinaryCodeBuffer *buffer,
   return 1;
 }
 
+/* dst(64) <- zero-extend(low byte of source). 0F B6 /r with REX.W. */
+int binary_emit_movzx_reg_reg8(BinaryCodeBuffer *buffer,
+                               BinaryGpRegister destination,
+                               BinaryGpRegister source) {
+  if (!buffer) {
+    return 0;
+  }
+  if (!binary_emit_rex(buffer, 1, destination >> 3, 0, source >> 3) ||
+      !binary_code_buffer_append_u8(buffer, 0x0F) ||
+      !binary_code_buffer_append_u8(buffer, 0xB6) ||
+      !binary_code_buffer_append_u8(
+          buffer,
+          (unsigned char)(0xC0 | ((destination & 7) << 3) | (source & 7)))) {
+    return 0;
+  }
+  return 1;
+}
+
+/* dst(64) <- zero-extend(low word of source). 0F B7 /r with REX.W. */
+int binary_emit_movzx_reg_reg16(BinaryCodeBuffer *buffer,
+                                BinaryGpRegister destination,
+                                BinaryGpRegister source) {
+  if (!buffer) {
+    return 0;
+  }
+  if (!binary_emit_rex(buffer, 1, destination >> 3, 0, source >> 3) ||
+      !binary_code_buffer_append_u8(buffer, 0x0F) ||
+      !binary_code_buffer_append_u8(buffer, 0xB7) ||
+      !binary_code_buffer_append_u8(
+          buffer,
+          (unsigned char)(0xC0 | ((destination & 7) << 3) | (source & 7)))) {
+    return 0;
+  }
+  return 1;
+}
+
 int binary_emit_movsxd_rax_eax(BinaryCodeBuffer *buffer) {
   if (!buffer) {
     return 0;
