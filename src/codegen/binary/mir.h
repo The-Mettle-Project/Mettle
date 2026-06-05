@@ -292,6 +292,16 @@ typedef struct {
   int scalar_return_width;
   int scalar_return_signed;
 
+  /* Divmod fusion: when `x / d` and `x % d` appear together, one div produces
+   * both quotient (RAX) and remainder (RDX). Lowering the first of the pair
+   * captures both and records the sibling's IR dest name -> the vreg holding the
+   * result it needs, so the sibling lowers to a plain move (no second div). */
+  struct {
+    const char *name; /* sibling IR dest temp/symbol name (borrowed) */
+    MirVregId vreg;   /* vreg already holding its quotient/remainder */
+  } divmod_precomp[16];
+  size_t divmod_precomp_count;
+
   /* Loop-invariant float constants materialized once at entry (see mir_lower). */
   MirFConst *fconsts;
   size_t fconst_count;

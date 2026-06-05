@@ -227,6 +227,24 @@ static int mir_arith_opcode(const char *op, MirOpcode *out) {
   return 0;
 }
 
+/* Structural equality of two IR operands (for divmod-pair matching). Only the
+ * operand kinds that can be a div dividend/divisor are compared; anything else
+ * (float/string/none) is treated as unequal. */
+static int mir_ir_operand_equal(const IROperand *a, const IROperand *b) {
+  if (a->kind != b->kind) {
+    return 0;
+  }
+  switch (a->kind) {
+  case IR_OPERAND_TEMP:
+  case IR_OPERAND_SYMBOL:
+    return a->name && b->name && strcmp(a->name, b->name) == 0;
+  case IR_OPERAND_INT:
+    return a->int_value == b->int_value;
+  default:
+    return 0;
+  }
+}
+
 static int mir_operand_is_unsigned(CodeGenerator *g, BinaryFunctionContext *ctx,
                                    const IROperand *op) {
   Type *t = code_generator_binary_get_operand_type_in_context(g, ctx, op);
@@ -1663,6 +1681,81 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
        * quotient-vs-remainder choice (1 == remainder, the `%` case). */
       int uns = mir_operand_is_unsigned(g, ctx, &in->lhs);
       unsigned char mod = (in->text[0] == '%') ? 1 : 0;
+
+      /* Divmod fusion. If a sibling `x op d` already did the divide and captured
+       * BOTH results, this op is just a move of the value it needs. */
+      if (in->dest.name) {
+        for (size_t k = 0; k < fn->divmod_precomp_count; k++) {
+          if (fn->divmod_precomp[k].name &&
+              strcmp(fn->divmod_precomp[k].name, in->dest.name) == 0) {
+            return mir_emit1(fn, MIR_MOV, dst,
+                             mir_op_vreg(fn->divmod_precomp[k].vreg),
+                             mir_op_none(), 8, 0, 0);
+          }
+        }
+      }
+
+      /* Otherwise look ahead in this basic block for the complementary op (`/`
+       * paired with `%`, same operands) so a single divide serves both. The
+       * scan stops at a block boundary / call (clobbers RAX:RDX) or any
+       * redefinition of the dividend or divisor (would make the cached results
+       * stale). */
+      const IRFunction *irf =
+          ctx && ctx->function_name
+              ? code_generator_find_ir_function_binary(g, ctx->function_name)
+              : NULL;
+      const IRInstruction *sibling = NULL;
+      if (irf && in >= irf->instructions &&
+          in < irf->instructions + irf->instruction_count &&
+          fn->divmod_precomp_count < 16 && in->dest.kind == IR_OPERAND_TEMP) {
+        size_t idx = (size_t)(in - irf->instructions);
+        for (size_t j = idx + 1; j < irf->instruction_count; j++) {
+          const IRInstruction *nx = &irf->instructions[j];
+          if (nx->op == IR_OP_LABEL || nx->op == IR_OP_JUMP ||
+              nx->op == IR_OP_BRANCH_ZERO || nx->op == IR_OP_BRANCH_EQ ||
+              nx->op == IR_OP_CALL || nx->op == IR_OP_RETURN) {
+            break;
+          }
+          if (mir_ir_operand_equal(&nx->dest, &in->lhs) ||
+              mir_ir_operand_equal(&nx->dest, &in->rhs)) {
+            break;
+          }
+          if (nx->op == IR_OP_BINARY && nx->text && !nx->is_float &&
+              nx->dest.kind == IR_OPERAND_TEMP && nx->dest.name &&
+              ((mod && strcmp(nx->text, "/") == 0) ||
+               (!mod && strcmp(nx->text, "%") == 0)) &&
+              mir_ir_operand_equal(&nx->lhs, &in->lhs) &&
+              mir_ir_operand_equal(&nx->rhs, &in->rhs)) {
+            sibling = nx;
+            break;
+          }
+        }
+      }
+
+      if (sibling) {
+        /* One divide; capture quotient (RAX) into qv and remainder (RDX) into
+         * rv. The MOV reading RDX must immediately follow the divide (nothing
+         * between can clobber RDX, which is non-allocatable scratch). */
+        MirVregId qv = mir_new_vreg(fn, MIR_RC_GP, 8);
+        MirVregId rv = mir_new_vreg(fn, MIR_RC_GP, 8);
+        if (qv == MIR_VREG_NONE || rv == MIR_VREG_NONE) {
+          return 0;
+        }
+        if (!mir_emit1(fn, MIR_IDIV, mir_op_vreg(qv), a, b, 8, uns, 0) ||
+            !mir_emit1(fn, MIR_MOV, mir_op_vreg(rv),
+                       mir_op_phys(BINARY_GP_RDX, MIR_RC_GP), mir_op_none(), 8, 0,
+                       0)) {
+          return 0;
+        }
+        MirVregId mine = mod ? rv : qv;     /* this op's result */
+        MirVregId theirs = mod ? qv : rv;   /* the sibling's result */
+        fn->divmod_precomp[fn->divmod_precomp_count].name = sibling->dest.name;
+        fn->divmod_precomp[fn->divmod_precomp_count].vreg = theirs;
+        fn->divmod_precomp_count++;
+        return mir_emit1(fn, MIR_MOV, dst, mir_op_vreg(mine), mir_op_none(), 8, 0,
+                         0);
+      }
+
       return mir_emit1(fn, MIR_IDIV, dst, a, b, 8, uns, mod);
     }
     MirOpcode op = MIR_ADD;
