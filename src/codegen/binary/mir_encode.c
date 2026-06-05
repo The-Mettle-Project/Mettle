@@ -353,6 +353,35 @@ static int encode_div(MirFunction *fn, const MirInst *in) {
   return store_from(fn, &in->dst, result);
 }
 
+/* dst = high 64 bits of (a * b). The multiplicand goes in RAX; the one-operand
+ * mul/imul writes the full 128-bit product to RDX:RAX and we keep RDX. b is the
+ * magic constant (IMM, staged into RCX) or a register. RAX/RCX/RDX are all
+ * non-allocatable scratch, mirroring encode_div. is_unsigned selects mul. */
+static int encode_mulhi(MirFunction *fn, const MirInst *in) {
+  BinaryCodeBuffer *code = &fn->context->code;
+  if (!materialize_into(fn, &in->a, SCRATCH_A)) {
+    return 0;
+  }
+  BinaryGpRegister mreg;
+  if (in->b.kind == MIR_OPK_IMM) {
+    if (!binary_emit_mov_reg_imm64(code, SCRATCH_B, (uint64_t)in->b.imm)) {
+      return enc_err(fn, "out of memory in mulhi imm");
+    }
+    mreg = SCRATCH_B;
+  } else {
+    int rok;
+    mreg = value_reg(fn, &in->b, SCRATCH_B, &rok);
+    if (!rok) {
+      return 0;
+    }
+  }
+  if (in->is_unsigned ? !binary_emit_mul_reg(code, mreg)
+                      : !binary_emit_imul_reg(code, mreg)) {
+    return enc_err(fn, "out of memory in mulhi");
+  }
+  return store_from(fn, &in->dst, BINARY_GP_RDX);
+}
+
 static int encode_shift(MirFunction *fn, const MirInst *in) {
   BinaryCodeBuffer *code = &fn->context->code;
   unsigned char sub = (in->op == MIR_SHL) ? 4 : (in->op == MIR_SHR) ? 5 : 7;
@@ -1416,6 +1445,9 @@ int mir_encode(MirFunction *fn) {
       break;
     case MIR_IDIV:
       ok = encode_div(fn, in);
+      break;
+    case MIR_MULHI:
+      ok = encode_mulhi(fn, in);
       break;
     case MIR_SHL:
     case MIR_SHR:

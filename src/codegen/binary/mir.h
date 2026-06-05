@@ -156,6 +156,9 @@ typedef enum {
   MIR_XOR_RDX,    /* zero RDX (unsigned divide) */
   MIR_IDIV,       /* signed divide RDX:RAX / a */
   MIR_DIV,        /* unsigned divide */
+  MIR_MULHI,      /* dst = high 64 bits of (a * b); is_unsigned picks mul vs
+                     imul. b is the magic IMM (or a reg). Uses RAX:RDX like a
+                     divide; emitted by constant-divisor strength reduction. */
 
   /* compares + materialization */
   MIR_CMP,        /* flags = a - b */
