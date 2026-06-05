@@ -244,6 +244,15 @@ typedef struct {
   MirVregId vreg;
 } MirFConst;
 
+/* A pooled (loop-invariant) 64-bit integer constant: its raw value and the GP
+ * vreg it is materialized into once at function entry (one movabs), reused at
+ * every use. Used to hoist the div/mod magic-multiply constant out of a loop so
+ * it is not re-materialized with a 10-byte movabs every iteration. */
+typedef struct {
+  int64_t value;
+  MirVregId vreg;
+} MirIConst;
+
 /* An incoming parameter: which vreg it lives in, its ABI argument index, and
  * how it must be extended from the (possibly narrow) incoming register to the
  * 64-bit value MIR computes with. */
@@ -309,6 +318,12 @@ typedef struct {
   MirFConst *fconsts;
   size_t fconst_count;
   size_t fconst_capacity;
+
+  /* Loop-invariant 64-bit integer constants (div/mod magic numbers) materialized
+   * once at entry, kept live across the loop instead of re-emitted per iter. */
+  MirIConst *iconsts;
+  size_t iconst_count;
+  size_t iconst_capacity;
 
   /* Bytes of spill area the allocator appended below the existing frame; the
    * encoder grows the prologue allocation by this much. */

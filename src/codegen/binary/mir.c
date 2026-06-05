@@ -20,6 +20,7 @@ void mir_function_destroy(MirFunction *fn) {
   free(fn->vregs);
   free(fn->insns);
   free(fn->fconsts);
+  free(fn->iconsts);
   memset(fn, 0, sizeof(*fn));
 }
 

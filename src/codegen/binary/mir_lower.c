@@ -1197,6 +1197,80 @@ static void mir_magic_u64(uint64_t d, uint64_t *Mout, int *sout, int *addout) {
   *sout = p - 64;
 }
 
+/* The pooled GP vreg for a loop-invariant 64-bit integer constant, or NONE. */
+static MirVregId mir_iconst_lookup(MirFunction *fn, int64_t value) {
+  for (size_t i = 0; i < fn->iconst_count; i++) {
+    if (fn->iconsts[i].value == value) {
+      return fn->iconsts[i].vreg;
+    }
+  }
+  return MIR_VREG_NONE;
+}
+
+/* Add `value` to the integer-constant pool and materialize it once (at the
+ * current end of the instruction stream — called before the body is lowered, so
+ * it lands at function entry via a single movabs). No-op if already pooled. */
+static int mir_iconst_add(MirFunction *fn, int64_t value) {
+  if (mir_iconst_lookup(fn, value) != MIR_VREG_NONE) {
+    return 1;
+  }
+  if (fn->iconst_count >= fn->iconst_capacity) {
+    size_t nc = fn->iconst_capacity ? fn->iconst_capacity * 2 : 8;
+    MirIConst *grown =
+        (MirIConst *)realloc(fn->iconsts, nc * sizeof(MirIConst));
+    if (!grown) {
+      fn->has_error = 1;
+      return 0;
+    }
+    fn->iconsts = grown;
+    fn->iconst_capacity = nc;
+  }
+  MirVregId v = mir_new_vreg(fn, MIR_RC_GP, 8);
+  if (v == MIR_VREG_NONE) {
+    return 0;
+  }
+  fn->iconsts[fn->iconst_count].value = value;
+  fn->iconsts[fn->iconst_count].vreg = v;
+  fn->iconst_count++;
+  return mir_emit1(fn, MIR_MOV, mir_op_vreg(v), mir_op_imm(value),
+                   mir_op_none(), 8, 0, 0);
+}
+
+/* An integer-constant operand: the hoisted pool vreg if `value` was pooled,
+ * otherwise an inline immediate. */
+static MirOperand mir_iconst_operand(MirFunction *fn, int64_t value) {
+  MirVregId v = mir_iconst_lookup(fn, value);
+  return (v != MIR_VREG_NONE) ? mir_op_vreg(v) : mir_op_imm(value);
+}
+
+/* If `a / C` or `a % C` (compile-time constant C, dividend signedness `uns`)
+ * lowers via a magic-multiply MULHI, return 1 and set *Mout to the 64-bit magic
+ * constant the MULHI multiplies by; return 0 for the forms that emit no MULHI
+ * (C in {0, 1, -1} or |C| a power of two). Mirrors the magic selection inside
+ * mir_emit_const_divmod so the magic can be pre-pooled and hoisted out of a
+ * loop. */
+static int mir_divmod_magic(int64_t C, int uns, int64_t *Mout) {
+  if (C == 0 || C == 1 || (!uns && C == -1)) {
+    return 0;
+  }
+  uint64_t ad = uns ? (uint64_t)C : (uint64_t)(C < 0 ? -C : C);
+  if ((ad & (ad - 1)) == 0) {
+    return 0; /* power of two -> shift, no MULHI */
+  }
+  if (uns) {
+    uint64_t M;
+    int s, add;
+    mir_magic_u64(ad, &M, &s, &add);
+    *Mout = (int64_t)M;
+  } else {
+    int64_t M;
+    int s;
+    mir_magic_s64(C, &M, &s);
+    *Mout = M;
+  }
+  return 1;
+}
+
 /* Strength-reduce `dst = a / C` or `dst = a % C` for a compile-time constant C
  * into a magic-number multiply (+ shifts), avoiding the long-latency divide.
  * Returns 1 if it emitted the reduced form, 0 to fall back to a real divide
@@ -1207,14 +1281,24 @@ static int mir_emit_const_divmod(MirFunction *fn, MirOperand dst, MirOperand a,
   if (C == 0) {
     return 0;
   }
-  /* Copy the dividend into a fresh vreg so it can be read repeatedly even if
-   * `a` is an immediate or a value a later op would consume. */
-  MirVregId av = mir_new_vreg(fn, MIR_RC_GP, 8);
-  if (av == MIR_VREG_NONE ||
-      !mir_emit1(fn, MIR_MOV, mir_op_vreg(av), a, mir_op_none(), 8, 0, 0)) {
-    return 0;
+  /* The dividend is read repeatedly (MULHI, then the remainder/sign-correction
+   * ops). A vreg is safe to re-read directly: it never lives in RAX/RDX (those
+   * are non-allocatable encoder scratch), so MULHI's RAX:RDX clobber cannot
+   * corrupt it, and this function never writes `a` before its last read. Only an
+   * immediate (or other non-vreg) needs a fresh-vreg snapshot — copying it once
+   * avoids re-emitting a 10-byte movabs at each use. Skipping the copy for the
+   * common register dividend removes one mov per div/mod in hot loops. */
+  MirOperand A;
+  if (a.kind == MIR_OPK_VREG) {
+    A = a;
+  } else {
+    MirVregId av = mir_new_vreg(fn, MIR_RC_GP, 8);
+    if (av == MIR_VREG_NONE ||
+        !mir_emit1(fn, MIR_MOV, mir_op_vreg(av), a, mir_op_none(), 8, 0, 0)) {
+      return 0;
+    }
+    A = mir_op_vreg(av);
   }
-  MirOperand A = mir_op_vreg(av);
 
   if (C == 1) {
     return mir_emit1(fn, MIR_MOV, dst, mod ? mir_op_imm(0) : A, mir_op_none(), 8,
@@ -1267,8 +1351,8 @@ static int mir_emit_const_divmod(MirFunction *fn, MirOperand dst, MirOperand a,
     mir_magic_u64(ad, &M, &s, &add);
     MirVregId tv = mir_new_vreg(fn, MIR_RC_GP, 8);
     if (tv == MIR_VREG_NONE ||
-        !mir_emit1(fn, MIR_MULHI, mir_op_vreg(tv), A, mir_op_imm((int64_t)M), 8,
-                   1, 0)) {
+        !mir_emit1(fn, MIR_MULHI, mir_op_vreg(tv), A,
+                   mir_iconst_operand(fn, (int64_t)M), 8, 1, 0)) {
       return 0;
     }
     if (!add) {
@@ -1294,7 +1378,7 @@ static int mir_emit_const_divmod(MirFunction *fn, MirOperand dst, MirOperand a,
     int64_t M;
     int s;
     mir_magic_s64(C, &M, &s);
-    if (!mir_emit1(fn, MIR_MULHI, Q, A, mir_op_imm(M), 8, 0, 0)) {
+    if (!mir_emit1(fn, MIR_MULHI, Q, A, mir_iconst_operand(fn, M), 8, 0, 0)) {
       return 0;
     }
     if (C > 0 && M < 0) {
@@ -1611,10 +1695,12 @@ static size_t mir_ir_label_index(IRFunction *function, const char *name) {
   return SIZE_MAX;
 }
 
-/* Build the float-constant pool: every distinct float literal used INSIDE a
- * loop (a backward jump/branch range) is hoisted to a vreg materialized once at
- * entry. Constants outside loops are left inline (no register pressure benefit).
- * Must run before the body is lowered so the materializations land first. */
+/* Build the constant pools: every distinct float literal used INSIDE a loop (a
+ * backward jump/branch range), plus the 64-bit magic-multiply constant of every
+ * in-loop `x / C` / `x % C` with a constant divisor, is hoisted to a vreg
+ * materialized once at entry. Constants outside loops are left inline (no
+ * register-pressure benefit). Must run before the body is lowered so the
+ * materializations land first. */
 static int mir_build_const_pool(MirFunction *fn, CodeGenerator *g,
                                 BinaryFunctionContext *ctx,
                                 IRFunction *function) {
@@ -1649,6 +1735,19 @@ static int mir_build_const_pool(MirFunction *fn, CodeGenerator *g,
       continue;
     }
     const IRInstruction *in = &function->instructions[j];
+    /* Pool the div/mod magic-multiply constant for `x / C` / `x % C` (a
+     * compile-time-constant divisor) so the 64-bit magic is materialized once at
+     * entry instead of with a 10-byte movabs every loop iteration. */
+    if (in->op == IR_OP_BINARY && !in->is_float && in->text &&
+        (in->text[0] == '/' || in->text[0] == '%') && in->text[1] == '\0' &&
+        in->rhs.kind == IR_OPERAND_INT) {
+      int uns = mir_operand_is_unsigned(g, ctx, &in->lhs);
+      int64_t M;
+      if (mir_divmod_magic(in->rhs.int_value, uns, &M) && !mir_iconst_add(fn, M)) {
+        ok = 0;
+        break;
+      }
+    }
     const IROperand *ops[2] = {NULL, NULL};
     int w = 0;
     if (in->op == IR_OP_BINARY && in->is_float) {
