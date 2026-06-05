@@ -491,7 +491,15 @@ int code_generator_binary_emit_lower_bound_i32(
   }
   b = &context->code;
 
-  /* r10=lo, r11=hi, rsi=arr, r9d=key, rax=mid, rcx=arr[mid] */
+  /* r10=lo, r11=hi, rsi=arr, r9d=key, rax=mid, rcx=arr[mid]. All Win64 volatile
+   * GPs (rax/rcx/rdx/r8..r11) are already in use, so the array base must live in
+   * a callee-saved register; RSI is nonvolatile on Win64, so save/restore it
+   * here (the function prologue does not know this special codegen uses it).
+   * On SysV RSI is caller-saved, so the push/pop is merely harmless there. */
+  if (!binary_emit_push_reg(b, BINARY_GP_RSI)) {
+    return 0;
+  }
+
   if (!code_generator_binary_emit_operand_load(generator, context,
                                                &instruction->dest,
                                                BINARY_GP_R10) ||
@@ -534,6 +542,11 @@ int code_generator_binary_emit_lower_bound_i32(
       !code_generator_binary_emit_destination_store(generator, context,
                                                     &instruction->dest,
                                                     BINARY_GP_R10)) {
+    return 0;
+  }
+  /* Restore the caller's RSI (saved above). The destination store used R10, not
+   * RSI, so it is safe to pop here on the single success path. */
+  if (!binary_emit_pop_reg(b, BINARY_GP_RSI)) {
     return 0;
   }
   return 1;
