@@ -335,6 +335,7 @@ int binary_emit_cmovcc_reg_reg(BinaryCodeBuffer *buffer, unsigned char opcode, B
 int binary_emit_cmp_reg_imm32(BinaryCodeBuffer *buffer, BinaryGpRegister reg, uint32_t immediate);
 int binary_emit_cmp_reg_reg(BinaryCodeBuffer *buffer, BinaryGpRegister lhs, BinaryGpRegister rhs);
 int binary_emit_cmp_reg_reg32(BinaryCodeBuffer *buffer, BinaryGpRegister lhs, BinaryGpRegister rhs);
+int binary_emit_cmp_reg_imm_w32(BinaryCodeBuffer *buffer, BinaryGpRegister reg, uint32_t immediate);
 int binary_emit_cqo(BinaryCodeBuffer *buffer);
 int binary_emit_cvtsd2ss_xmm_xmm(BinaryCodeBuffer *buffer, BinaryXmmRegister destination, BinaryXmmRegister source);
 int binary_emit_cvtsi2sd_xmm_reg(BinaryCodeBuffer *buffer, BinaryXmmRegister destination, BinaryGpRegister source);

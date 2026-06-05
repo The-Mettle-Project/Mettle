@@ -264,6 +264,30 @@ int binary_emit_cmp_reg_imm32(BinaryCodeBuffer *buffer,
   return binary_emit_alu_reg_imm32(buffer, 7, reg, immediate);
 }
 
+/* 32-bit `cmp r/m32, imm` (no REX.W), so a 4-byte int32/uint32 value is compared
+ * against an immediate without the 64-bit sign-extension of the W=1 form -- and
+ * without staging the constant through a scratch register. Uses the imm8 short
+ * form (0x83 /7) when the value fits, else the imm32 form (0x81 /7). */
+int binary_emit_cmp_reg_imm_w32(BinaryCodeBuffer *buffer, BinaryGpRegister reg,
+                                uint32_t immediate) {
+  if (!buffer) {
+    return 0;
+  }
+  int32_t s = (int32_t)immediate;
+  if (s >= INT8_MIN && s <= INT8_MAX) {
+    return binary_emit_rex(buffer, 0, 0, 0, reg >> 3) &&
+           binary_code_buffer_append_u8(buffer, 0x83) &&
+           binary_code_buffer_append_u8(
+               buffer, (unsigned char)(0xC0 | (7 << 3) | (reg & 7))) &&
+           binary_code_buffer_append_u8(buffer, (unsigned char)(int8_t)s);
+  }
+  return binary_emit_rex(buffer, 0, 0, 0, reg >> 3) &&
+         binary_code_buffer_append_u8(buffer, 0x81) &&
+         binary_code_buffer_append_u8(
+             buffer, (unsigned char)(0xC0 | (7 << 3) | (reg & 7))) &&
+         binary_code_buffer_append_u32(buffer, immediate);
+}
+
 int binary_emit_mov_reg_imm64(BinaryCodeBuffer *buffer,
                                      BinaryGpRegister destination,
                                      uint64_t immediate) {

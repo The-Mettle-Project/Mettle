@@ -409,9 +409,17 @@ static int encode_setcc(MirFunction *fn, const MirInst *in) {
    * them (the low 32 bits are the true value). An immediate is staged into a
    * register first since the 64-bit cmp-imm would sign-extend it. */
   if (in->width == 4) {
-    BinaryGpRegister breg = value_reg(fn, &in->b, SCRATCH_B, &ok);
-    if (!ok || !binary_emit_cmp_reg_reg32(code, areg, breg)) {
-      return enc_err(fn, "out of memory in cmp32");
+    /* A 32-bit immediate folds straight into the 32-bit cmp (no scratch reg);
+     * the low 32 bits are the int32/uint32 constant being compared. */
+    if (in->b.kind == MIR_OPK_IMM) {
+      if (!binary_emit_cmp_reg_imm_w32(code, areg, (uint32_t)in->b.imm)) {
+        return enc_err(fn, "out of memory in cmp32 imm");
+      }
+    } else {
+      BinaryGpRegister breg = value_reg(fn, &in->b, SCRATCH_B, &ok);
+      if (!ok || !binary_emit_cmp_reg_reg32(code, areg, breg)) {
+        return enc_err(fn, "out of memory in cmp32");
+      }
     }
   } else if (in->b.kind == MIR_OPK_IMM &&
              code_generator_binary_immediate_fits_signed_32(in->b.imm)) {
@@ -1664,12 +1672,21 @@ int mir_encode(MirFunction *fn) {
       }
       if (in->width == 4) {
         /* 4-byte (int32/uint32) compare: 32-bit cmp ignores garbage high bits a
-         * 64-bit MIR value may carry (see encode_setcc). The immediate is staged
-         * into a register since the 64-bit cmp-imm would sign-extend it. */
-        BinaryGpRegister breg = value_reg(fn, &in->b, SCRATCH_B, &rok);
-        if (!rok || !binary_emit_cmp_reg_reg32(&ctx->code, areg, breg)) {
-          ok = enc_err(fn, "out of memory in cmpbr32");
-          break;
+         * 64-bit MIR value may carry (see encode_setcc). An immediate folds into
+         * the 32-bit cmp directly (its low 32 bits are the constant); only a
+         * register operand needs the reg-reg form. */
+        if (in->b.kind == MIR_OPK_IMM) {
+          if (!binary_emit_cmp_reg_imm_w32(&ctx->code, areg,
+                                           (uint32_t)in->b.imm)) {
+            ok = enc_err(fn, "out of memory in cmpbr32 imm");
+            break;
+          }
+        } else {
+          BinaryGpRegister breg = value_reg(fn, &in->b, SCRATCH_B, &rok);
+          if (!rok || !binary_emit_cmp_reg_reg32(&ctx->code, areg, breg)) {
+            ok = enc_err(fn, "out of memory in cmpbr32");
+            break;
+          }
         }
       } else if (in->b.kind == MIR_OPK_IMM &&
                  code_generator_binary_immediate_fits_signed_32(in->b.imm)) {
