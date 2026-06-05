@@ -23,3 +23,5 @@ examples/tracy_demo/tracy_dir.local.bat
 __pycache__/
 *.pyc
 _tmp/
+docs/benchmarks/latest.html
+docs/benchmarks/latest.json
