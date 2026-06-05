@@ -61,6 +61,11 @@ int wcs_avx_vperm2i128(BinaryCodeBuffer *b, int dst, int s1, int s2,
                        unsigned char imm);
 int wcs_avx_vpbroadcastd_ymm(BinaryCodeBuffer *b, int dst, int src_xmm);
 int wcs_avx_vpbroadcastd_ymm_mem(BinaryCodeBuffer *b, int dst, int base, int displacement);
+int wcs_avx_vpmaddwd_ymm(BinaryCodeBuffer *b, int dst, int src1, int src2);
+int wcs_avx_vpmovsxbw_ymm_mem(BinaryCodeBuffer *b, int dst, int base, int displacement);
+int wcs_avx_vpmovzxbw_ymm_mem(BinaryCodeBuffer *b, int dst, int base, int displacement);
+int wcs_avx_vpmovzxbd_xmm_mem(BinaryCodeBuffer *b, int dst, int base, int displacement);
+int wcs_avx_vpmovzxbd_ymm_mem(BinaryCodeBuffer *b, int dst, int base, int displacement);
 int wcs_avx_vbroadcastsd_ymm_xmm(BinaryCodeBuffer *b, int dst, int src_xmm);
 int wcs_avx_vextracti128(BinaryCodeBuffer *b, int dst_xmm, int src_ymm,
                          unsigned char lane);

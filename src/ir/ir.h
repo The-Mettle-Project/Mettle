@@ -87,6 +87,10 @@ typedef enum {
   /* Signed int32 dot product into int64. dest = sum/result, lhs = a, rhs = b,
    * arguments[0] = element count. */
   IR_OP_SIMD_DOT_I32,
+  /* Signed int8 x int8 -> int32 dot product (the quantized GEMM/GEMV inner
+   * loop). dest = int32 sum, lhs = a (int8*), rhs = b (int8*), arguments[0] =
+   * element count. AVX2 vpmaddwd kernel. */
+  IR_OP_SIMD_DOT_I8,
   /* SLP-vectorized group of K parallel int32 multiply-accumulate reductions
    * (K in {4,8}). For lane j in 0..K-1:
    *     out[out_off + j] += sum_{k=0..count-1} a[a_off + k] * b[b_off + k*bstr + j]
@@ -97,6 +101,11 @@ typedef enum {
    * dest=out base ptr, lhs=a base ptr, rhs=b base ptr; arguments:
    * [0]=K, [1]=count, [2]=a_off, [3]=b_off, [4]=b_stride, [5]=out_off. */
   IR_OP_SIMD_SLP_MAC_I32,
+  /* int8 x int8 -> int32 variant of SLP_MAC: the quantized GEMM tile. Same
+   * operand/argument layout, but a and b are int8 arrays (byte loads, widened to
+   * int32) while c (out) is int32. Same AVX2 broadcast-MAC kernel with int8
+   * widening. */
+  IR_OP_SIMD_SLP_MAC_I8,
   /* dst[i] = src[i]*mul+add; dest += sum of outputs. lhs=src, rhs=dst,
    * arguments[0]=len, [1]=mul, [2]=add (int32). */
   IR_OP_SIMD_SCALE_I32,

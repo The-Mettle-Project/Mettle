@@ -1,0 +1,41 @@
+// Quantized int8 dot-product microbenchmark.
+// int8 x int8 -> int32 accumulate: the inner loop of quantized GEMM/GEMV,
+// the dominant compute in CPU LLM inference (llama.cpp Q8 style).
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+function qdot(a: int8*, b: int8*, n: int64) -> int32 {
+  var sum: int32 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    sum = sum + (int32)a[i] * (int32)b[i];
+    i = i + 1;
+  }
+  return sum;
+}
+
+function main() -> int32 {
+  var n: int64 = 4096;
+  var passes: int32 = 100000;
+  var a: int8* = (int8*)malloc(n);
+  var b: int8* = (int8*)malloc(n);
+  var i: int64 = 0;
+  while (i < n) {
+    a[i] = (int8)((i * 7 + 3) % 127 - 63);
+    b[i] = (int8)((i * 5 + 1) % 127 - 63);
+    i = i + 1;
+  }
+  println(cstr("Quantized int8 dot: 4096 elems x 100000 passes"));
+  var t0: uint64 = bench_time_us();
+  var acc: int64 = 0;
+  var p: int32 = 0;
+  while (p < passes) {
+    acc = acc + (int64)qdot(a, b, n);
+    p = p + 1;
+  }
+  var elapsed: uint64 = bench_time_us() - t0;
+  print(cstr("qdot sum = ")); println_int(acc);
+  print(cstr("Time: ")); print_int(elapsed); println(cstr(" us"));
+  return 0;
+}

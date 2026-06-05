@@ -1108,13 +1108,16 @@ int mir_function_is_eligible(CodeGenerator *generator,
         return mir_trace_bail(function_data, "addressof:dest");
       }
       break;
+    case IR_OP_SIMD_SLP_MAC_I8:
     case IR_OP_SIMD_SLP_MAC_I32: {
       /* SLP MAC kernel run INLINE inside the MIR function (so the surrounding
        * outer loops keep register-allocated codegen). The lowering marshals the
        * three base pointers + count + byte stride into RCX/RDX/R8/R9/RAX, so the
        * only compile-time-constant requirement is the lane count K (it selects
        * the xmm-vs-ymm kernel width); the bases, offsets, count, and stride may
-       * each be a runtime temp/symbol resolved via mir_value_operand. */
+       * each be a runtime temp/symbol resolved via mir_value_operand. The I8
+       * variant (int8 a/b, int32 c) uses the same shape with different element
+       * scaling, handled in lowering. */
       if (in->argument_count < 6 || !in->arguments ||
           in->arguments[0].kind != IR_OPERAND_INT ||
           (in->arguments[0].int_value != 4 &&
@@ -2607,6 +2610,7 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
     return 1;
   }
 
+  case IR_OP_SIMD_SLP_MAC_I8:
   case IR_OP_SIMD_SLP_MAC_I32: {
     /* Inline SLP MAC kernel. Marshal the three effective element pointers
      * (base + offset*4), the k count, and the byte row stride into
@@ -2620,6 +2624,13 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
      * LAST: the MIR_LEA encoder stages spilled base/index through RDX/R11, which
      * would otherwise clobber a kernel argument already parked in RDX. */
     long long K = in->arguments[0].int_value;
+    /* Element size per pointer. int32 SLP: a/b/out all 4-byte. int8 SLP: a and
+     * b are int8 arrays (1-byte), out (c) is int32 (4-byte). The stride (b's
+     * per-k row advance) is in the same units as b, so it scales by b's element
+     * size. The MIR op's `width` carries b's element size so the encoder picks
+     * the int8-widening kernel. */
+    int is_i8 = (in->op == IR_OP_SIMD_SLP_MAC_I8);
+    const int elem[3] = {is_i8 ? 1 : 4, is_i8 ? 1 : 4, 4}; /* a, b, out */
     const IROperand *bases[3] = {&in->lhs, &in->rhs, &in->dest}; /* a, b, out */
     const int off_arg[3] = {2, 3, 5};
     MirVregId ptr_vreg[3];
@@ -2636,9 +2647,10 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
       }
       MirOperand mem;
       if (off.kind == MIR_OPK_IMM) {
-        mem = mir_op_mem_vreg(base.vreg, MIR_VREG_NONE, 0, (int)(off.imm * 4));
+        mem = mir_op_mem_vreg(base.vreg, MIR_VREG_NONE, 0,
+                              (int)(off.imm * elem[p]));
       } else if (off.kind == MIR_OPK_VREG) {
-        mem = mir_op_mem_vreg(base.vreg, off.vreg, 4, 0);
+        mem = mir_op_mem_vreg(base.vreg, off.vreg, elem[p], 0);
       } else {
         fn->has_error = 1;
         return 0;
@@ -2648,7 +2660,8 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
         return 0;
       }
     }
-    /* byte row stride into a vreg (stride_elems << 2). */
+    /* byte row stride into a vreg (stride_elems * b's element size). */
+    int stride_elem = elem[1];
     MirOperand stride = mir_value_operand(fn, g, ctx, map, &in->arguments[4]);
     MirVregId stride_vreg = mir_new_vreg(fn, MIR_RC_GP, 8);
     if (stride_vreg == MIR_VREG_NONE) {
@@ -2656,12 +2669,18 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
     }
     if (stride.kind == MIR_OPK_IMM) {
       if (!mir_emit1(fn, MIR_MOV, mir_op_vreg(stride_vreg),
-                     mir_op_imm(stride.imm * 4), mir_op_none(), 8, 0, 0)) {
+                     mir_op_imm(stride.imm * stride_elem), mir_op_none(), 8, 0,
+                     0)) {
         return 0;
       }
-    } else if (stride.kind == MIR_OPK_VREG) {
+    } else if (stride.kind == MIR_OPK_VREG && stride_elem == 4) {
       if (!mir_emit1(fn, MIR_SHL, mir_op_vreg(stride_vreg), stride,
                      mir_op_imm(2), 8, 0, 0)) {
+        return 0;
+      }
+    } else if (stride.kind == MIR_OPK_VREG) { /* stride_elem == 1: no scaling */
+      if (!mir_emit1(fn, MIR_MOV, mir_op_vreg(stride_vreg), stride,
+                     mir_op_none(), 8, 0, 0)) {
         return 0;
       }
     } else {
@@ -2689,8 +2708,9 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
                    mir_op_vreg(stride_vreg), mir_op_none(), 8, 0, 0)) {
       return 0;
     }
+    /* width = b's element size (1 = int8-widening kernel, 4 = int32 kernel). */
     return mir_emit1(fn, MIR_SIMD_SLP_MAC, mir_op_imm(K), mir_op_none(),
-                     mir_op_none(), 8, 0, 0);
+                     mir_op_none(), elem[1], 0, 0);
   }
 
   case IR_OP_ADDRESS_OF: {

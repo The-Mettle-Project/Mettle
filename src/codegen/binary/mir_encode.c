@@ -1588,9 +1588,13 @@ int mir_encode(MirFunction *fn) {
       /* Inline SLP MAC kernel. The preceding MIR_MOVs marshalled a/b/out element
        * pointers into RCX/RDX/R8, the k count into R9, and the byte row stride
        * into RAX; emit the pure inner loop (no operand loads, so it needs no
-       * coherent fallback stack homes). dst.imm = K (4/8). */
-      if (!code_generator_binary_emit_simd_slp_mac_i32_loop(&ctx->code,
-                                                            in->dst.imm)) {
+       * coherent fallback stack homes). dst.imm = K (4/8); width = b's element
+       * size (1 = int8-widening kernel, 4 = int32 kernel). */
+      if (in->width == 1
+              ? !code_generator_binary_emit_simd_slp_mac_i8_loop(&ctx->code,
+                                                                 in->dst.imm)
+              : !code_generator_binary_emit_simd_slp_mac_i32_loop(&ctx->code,
+                                                                  in->dst.imm)) {
         ok = enc_err(fn, "out of memory emitting inline SLP MAC kernel");
       }
       fn->used_inline_vector = 1;

@@ -5362,9 +5362,17 @@ int code_generator_binary_emit_instruction(
     return code_generator_binary_emit_simd_dot_i32(generator, context,
                                                    instruction);
 
+  case IR_OP_SIMD_DOT_I8:
+    return code_generator_binary_emit_simd_dot_i8(generator, context,
+                                                  instruction);
+
   case IR_OP_SIMD_SLP_MAC_I32:
     return code_generator_binary_emit_simd_slp_mac_i32(generator, context,
                                                        instruction);
+
+  case IR_OP_SIMD_SLP_MAC_I8:
+    return code_generator_binary_emit_simd_slp_mac_i8(generator, context,
+                                                      instruction);
 
   case IR_OP_SIMD_MATMUL_N32:
     return code_generator_binary_emit_simd_matmul_n32(generator, context,

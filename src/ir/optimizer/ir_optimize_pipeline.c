@@ -54,6 +54,7 @@ static const IROptNamedPass g_ir_pre_inline_passes[] = {
     {"prefix_sum_i32", ir_prefix_sum_i32_pass},
     {"induction_pointer", ir_pointer_induction_pass},
     {"simd_dot_i32", ir_simd_dot_i32_pass},
+    {"simd_dot_i8", ir_simd_dot_i8_pass},
     {"simd_insertion_sort_i32", ir_simd_insertion_sort_i32_pass},
     {"simd_minmax_i32", ir_simd_minmax_i32_pass},
     {"lower_bound_i32", ir_lower_bound_i32_pass},
@@ -76,6 +77,7 @@ static const IROptNamedPass g_ir_post_fixpoint_passes[] = {
     {"eliminate_congruent_ivs", ir_eliminate_congruent_ivs_pass},
     /* After congruent-IV merge so parallel lane indices appear as base+J. */
     {"simd_slp_mac_i32", ir_simd_slp_mac_i32_pass},
+    {"simd_slp_mac_i8", ir_simd_slp_mac_i8_pass},
 };
 
 static const IROptNamedStage g_ir_pre_inline_stage = {
@@ -166,6 +168,8 @@ static const IROptScheduledPass g_ir_fixpoint_passes[] = {
     IR_OPT_PASS_WHEN_ALL(SIMD_BYTE_MAP, ir_simd_byte_map_pass,
                          IR_OPT_LABEL_JUMP | IR_OPT_FEATURE_LOAD),
     IR_OPT_PASS_WHEN_ALL(SIMD_DOT_I32, ir_simd_dot_i32_pass,
+                         IR_OPT_LABEL_JUMP | IR_OPT_FEATURE_LOAD),
+    IR_OPT_PASS_WHEN_ALL(SIMD_DOT_I8, ir_simd_dot_i8_pass,
                          IR_OPT_LABEL_JUMP | IR_OPT_FEATURE_LOAD),
     IR_OPT_PASS_WHEN_ALL(SIMD_INSERTION_SORT_I32,
                          ir_simd_insertion_sort_i32_pass,

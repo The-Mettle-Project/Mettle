@@ -1094,6 +1094,167 @@ static int ir_try_vectorize_dot_i32_at(IRFunction *function, size_t header_index
   return 1;
 }
 
+/* int8 x int8 -> int32 dot product: the quantized-GEMM inner loop
+ *   sum(int32) += (int32)a[i] * (int32)b[i]
+ * over a unit-stride counted loop, where a and b are int8 arrays. Recognized by
+ * the same shape as the int32 dot but with BYTE loads (load width 1) and an
+ * int32 accumulator; emits IR_OP_SIMD_DOT_I8. Matched by instruction pattern
+ * (byte loads feeding a multiply-accumulate reduction), not by name. */
+static int ir_try_vectorize_dot_i8_at(IRFunction *function, size_t header_index,
+                                      int *changed) {
+  size_t compare_index = 0, branch_index = 0, jump_index = (size_t)-1;
+  size_t increment_index = 0;
+  const char *iv_symbol = NULL, *sum_symbol = NULL;
+  const char *a_symbol = NULL, *b_symbol = NULL, *sum_type = NULL;
+  const char *loop_label = NULL;
+  IRInstruction fused = {0};
+  IROperand len = {0};
+  int has_mul_add = 0;
+
+  if (!function || header_index + 4 >= function->instruction_count) {
+    return 1;
+  }
+  IRInstruction *header = &function->instructions[header_index];
+  if (header->op != IR_OP_LABEL || !ir_label_is_while_header(header->text)) {
+    return 1;
+  }
+  loop_label = header->text;
+
+  if (!ir_find_next_non_nop(function, header_index + 1, &compare_index) ||
+      !ir_find_next_non_nop(function, compare_index + 1, &branch_index)) {
+    return 1;
+  }
+  IRInstruction *compare = &function->instructions[compare_index];
+  IRInstruction *branch = &function->instructions[branch_index];
+  if (compare->op != IR_OP_BINARY || compare->is_float || !compare->text ||
+      strcmp(compare->text, "<") != 0 ||
+      compare->dest.kind != IR_OPERAND_TEMP || !compare->dest.name ||
+      compare->lhs.kind != IR_OPERAND_SYMBOL || !compare->lhs.name ||
+      compare->rhs.kind != IR_OPERAND_SYMBOL || !compare->rhs.name ||
+      branch->op != IR_OP_BRANCH_ZERO ||
+      !ir_operand_is_temp_named(&branch->lhs, compare->dest.name) ||
+      !branch->text) {
+    return 1;
+  }
+  iv_symbol = compare->lhs.name;
+  if (!ir_operand_clone(&compare->rhs, &len)) {
+    return 0;
+  }
+  if (!ir_symbol_is_sum_loop_bound(function, compare->rhs.name)) {
+    ir_operand_destroy(&len);
+    return 1;
+  }
+
+  for (size_t i = branch_index + 1; i < function->instruction_count; i++) {
+    if (function->instructions[i].op == IR_OP_JUMP &&
+        function->instructions[i].text &&
+        strcmp(function->instructions[i].text, loop_label) == 0) {
+      jump_index = i;
+      break;
+    }
+    if (function->instructions[i].op == IR_OP_LABEL &&
+        function->instructions[i].text &&
+        strcmp(function->instructions[i].text, branch->text) == 0) {
+      break;
+    }
+  }
+  if (jump_index == (size_t)-1) {
+    ir_operand_destroy(&len);
+    return 1;
+  }
+  if (ir_loop_body_has_nested_while(function, branch_index + 1, jump_index)) {
+    ir_operand_destroy(&len);
+    return 1;
+  }
+
+  increment_index = jump_index;
+  while (increment_index > branch_index + 1) {
+    increment_index--;
+    if (function->instructions[increment_index].op != IR_OP_NOP) {
+      break;
+    }
+  }
+  if (!ir_try_parse_direct_unit_increment(
+          &function->instructions[increment_index], iv_symbol)) {
+    ir_operand_destroy(&len);
+    return 1;
+  }
+
+  for (size_t i = branch_index + 1; i < jump_index; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_NOP || ins->op == IR_OP_DECLARE_LOCAL ||
+        ins->op == IR_OP_ASSIGN || ins->op == IR_OP_CAST) {
+      continue;
+    }
+    /* Require BYTE loads (width 1): this is what distinguishes an int8 dot from
+     * the int32 dot (width 4). */
+    if (ins->op == IR_OP_LOAD && ins->lhs.kind == IR_OPERAND_TEMP &&
+        ins->lhs.name && ins->rhs.kind == IR_OPERAND_INT &&
+        ins->rhs.int_value == 1) {
+      const char *base = NULL;
+      if (ir_resolve_indexed_address_temp(function, i, iv_symbol, NULL,
+                                          ins->lhs.name, &base, NULL, NULL)) {
+        if (!a_symbol) {
+          a_symbol = base;
+        } else if (!b_symbol && strcmp(base, a_symbol) != 0) {
+          b_symbol = base;
+        }
+      }
+    }
+    if (ins->op == IR_OP_BINARY && ins->text && strcmp(ins->text, "+") == 0 &&
+        !ins->is_float && ins->dest.kind == IR_OPERAND_SYMBOL &&
+        ins->dest.name && ins->lhs.kind == IR_OPERAND_SYMBOL &&
+        ir_operand_is_symbol_named(&ins->lhs, ins->dest.name)) {
+      const IRInstruction *mul =
+          ir_find_temp_producer_before(function, i, ins->rhs.name);
+      if (mul && mul->op == IR_OP_BINARY && mul->text &&
+          strcmp(mul->text, "*") == 0 && !mul->is_float) {
+        has_mul_add = 1;
+        sum_symbol = ins->dest.name;
+      }
+    }
+  }
+
+  if (!has_mul_add || !sum_symbol || !a_symbol || !b_symbol) {
+    ir_operand_destroy(&len);
+    return 1;
+  }
+  sum_type = ir_function_local_declared_type(function, sum_symbol);
+  if (!sum_type || strcmp(sum_type, "int32") != 0) {
+    ir_operand_destroy(&len);
+    return 1;
+  }
+  if (!ir_symbol_is_sum_array_base(function, a_symbol) ||
+      !ir_symbol_is_sum_array_base(function, b_symbol)) {
+    ir_operand_destroy(&len);
+    return 1;
+  }
+
+  fused.op = IR_OP_SIMD_DOT_I8;
+  fused.location = header->location;
+  fused.dest = ir_operand_symbol(sum_symbol);
+  fused.lhs = ir_operand_symbol(a_symbol);
+  fused.rhs = ir_operand_symbol(b_symbol);
+  fused.arguments = calloc(1, sizeof(IROperand));
+  if (!fused.arguments) {
+    ir_operand_destroy(&len);
+    ir_instruction_destroy_storage(&fused);
+    return 0;
+  }
+  fused.argument_count = 1;
+  fused.arguments[0] = len;
+
+  ir_instruction_destroy_storage(header);
+  *header = fused;
+  for (size_t i = header_index + 1; i <= jump_index; i++) {
+    ir_instruction_make_nop(&function->instructions[i]);
+  }
+  if (changed) {
+    *changed = 1;
+  }
+  return 1;
+}
+
 static int ir_memcmp_byte_loop_is_indexed_load(const IRFunction *function,
                                                size_t load_index,
                                                const IRInstruction *load,
@@ -1710,6 +1871,326 @@ int ir_simd_slp_mac_i32_pass(IRFunction *function, int *changed) {
   return 1;
 }
 
+/* int8 variant of the SLP MAC value resolver. The multiply operand `val_name`
+ * (the broadcast symbol `av`, or a per-lane bload temp) is the result of a
+ * `(int32)` cast of a BYTE load: follow cast -> byte load (width 1) -> address
+ * temp, then resolve the address as `base + index` with NO <<2 shift (int8
+ * arrays are 1-byte-indexed, unlike the int32 path's base + (index<<2)). The
+ * index is a symbol (lane 0) or a temp `sym + C` (lane C, a congruent-IV form).
+ * val_is_temp selects whether val_name is a temp (bload) or symbol (av). */
+static int ir_slp_i8_resolve(IRFunction *fn, size_t lo, size_t hi,
+                             int val_is_temp, const char *val_name,
+                             const char **base_out, const char **lane_base_out,
+                             long long *lane_out) {
+  const IRInstruction *cast = NULL;
+  for (size_t i = lo; i < hi; i++) {
+    const IRInstruction *in = &fn->instructions[i];
+    if (in->op != IR_OP_CAST) {
+      continue;
+    }
+    int m = val_is_temp ? ir_operand_is_temp_named(&in->dest, val_name)
+                        : ir_operand_is_symbol_named(&in->dest, val_name);
+    if (m) {
+      cast = in;
+      break;
+    }
+  }
+  if (!cast || cast->lhs.kind != IR_OPERAND_TEMP || !cast->lhs.name) {
+    return 0;
+  }
+  size_t load_idx = (size_t)-1;
+  const IRInstruction *ld = NULL;
+  for (size_t i = lo; i < hi; i++) {
+    const IRInstruction *in = &fn->instructions[i];
+    if (in->op == IR_OP_LOAD && ir_operand_is_temp_named(&in->dest, cast->lhs.name) &&
+        in->rhs.kind == IR_OPERAND_INT && in->rhs.int_value == 1 &&
+        in->lhs.kind == IR_OPERAND_TEMP && in->lhs.name) {
+      ld = in;
+      load_idx = i;
+      break;
+    }
+  }
+  if (!ld) {
+    return 0;
+  }
+  const IRInstruction *addp =
+      ir_find_temp_producer_before(fn, load_idx, ld->lhs.name);
+  if (!addp || addp->op != IR_OP_BINARY || !addp->text ||
+      strcmp(addp->text, "+") != 0 || addp->is_float ||
+      addp->lhs.kind != IR_OPERAND_SYMBOL || !addp->lhs.name) {
+    return 0;
+  }
+  *base_out = addp->lhs.name;
+  if (addp->rhs.kind == IR_OPERAND_SYMBOL && addp->rhs.name) {
+    *lane_base_out = addp->rhs.name;
+    *lane_out = 0;
+    return 1;
+  }
+  if (addp->rhs.kind == IR_OPERAND_TEMP && addp->rhs.name) {
+    const IRInstruction *off =
+        ir_find_temp_producer_before(fn, load_idx, addp->rhs.name);
+    if (off && off->op == IR_OP_BINARY && off->text &&
+        strcmp(off->text, "+") == 0 && !off->is_float &&
+        off->lhs.kind == IR_OPERAND_SYMBOL && off->lhs.name &&
+        off->rhs.kind == IR_OPERAND_INT) {
+      *lane_base_out = off->lhs.name;
+      *lane_out = off->rhs.int_value;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* int8 x int8 -> int32 SLP MAC: the quantized-GEMM tile. Same K-parallel
+ * broadcast-MAC shape as ir_try_vectorize_slp_mac_i32_at, but a/b are int8
+ * arrays (byte loads + (int32) casts, scale-1 indexing) while c is int32
+ * (scale-4 stores, resolved by the shared ir_slp_find_stores). Emits
+ * IR_OP_SIMD_SLP_MAC_I8. */
+static int ir_try_vectorize_slp_mac_i8_at(IRFunction *function,
+                                          size_t header_index, int *changed) {
+  if (!function || header_index + 4 >= function->instruction_count) {
+    return 1;
+  }
+  IRInstruction *header = &function->instructions[header_index];
+  if (header->op != IR_OP_LABEL || !ir_label_is_while_header(header->text)) {
+    return 1;
+  }
+  const char *loop_label = header->text;
+  size_t compare_index = 0, branch_index = 0;
+  if (!ir_find_next_non_nop(function, header_index + 1, &compare_index) ||
+      !ir_find_next_non_nop(function, compare_index + 1, &branch_index)) {
+    return 1;
+  }
+  IRInstruction *compare = &function->instructions[compare_index];
+  IRInstruction *branch = &function->instructions[branch_index];
+  if (compare->op != IR_OP_BINARY || compare->is_float || !compare->text ||
+      strcmp(compare->text, "<") != 0 ||
+      compare->lhs.kind != IR_OPERAND_SYMBOL || !compare->lhs.name ||
+      branch->op != IR_OP_BRANCH_ZERO ||
+      !ir_operand_is_temp_named(&branch->lhs, compare->dest.name) ||
+      !branch->text) {
+    return 1;
+  }
+  const char *iv_symbol = compare->lhs.name;
+
+  size_t jump_index = (size_t)-1;
+  for (size_t i = branch_index + 1; i < function->instruction_count; i++) {
+    if (function->instructions[i].op == IR_OP_JUMP &&
+        function->instructions[i].text &&
+        strcmp(function->instructions[i].text, loop_label) == 0) {
+      jump_index = i;
+      break;
+    }
+    if (function->instructions[i].op == IR_OP_LABEL) {
+      break;
+    }
+  }
+  if (jump_index == (size_t)-1 ||
+      ir_loop_body_has_nested_while(function, branch_index + 1, jump_index)) {
+    return 1;
+  }
+
+  /* Collect chains `S = S + (av * bload)`, av a symbol, bload a temp. */
+  const char *sum_sym[IR_SLP_MAX_LANES];
+  const char *bload_temp[IR_SLP_MAX_LANES];
+  const char *av_sym = NULL;
+  int K = 0;
+  for (size_t i = branch_index + 1; i < jump_index; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op != IR_OP_BINARY || in->is_float || !in->text ||
+        strcmp(in->text, "+") != 0 || in->dest.kind != IR_OPERAND_SYMBOL ||
+        !in->dest.name || !ir_operand_is_symbol_named(&in->lhs, in->dest.name) ||
+        in->rhs.kind != IR_OPERAND_TEMP || !in->rhs.name) {
+      continue;
+    }
+    const IRInstruction *mul =
+        ir_find_temp_producer_before(function, i, in->rhs.name);
+    if (!mul || mul->op != IR_OP_BINARY || !mul->text ||
+        strcmp(mul->text, "*") != 0 || mul->is_float) {
+      continue;
+    }
+    const char *cand_av = NULL, *cand_ld = NULL;
+    if (mul->lhs.kind == IR_OPERAND_SYMBOL && mul->lhs.name &&
+        mul->rhs.kind == IR_OPERAND_TEMP && mul->rhs.name) {
+      cand_av = mul->lhs.name;
+      cand_ld = mul->rhs.name;
+    } else if (mul->rhs.kind == IR_OPERAND_SYMBOL && mul->rhs.name &&
+               mul->lhs.kind == IR_OPERAND_TEMP && mul->lhs.name) {
+      cand_av = mul->rhs.name;
+      cand_ld = mul->lhs.name;
+    } else {
+      continue;
+    }
+    if (K >= IR_SLP_MAX_LANES) {
+      return 1;
+    }
+    if (av_sym) {
+      if (strcmp(cand_av, av_sym) != 0) {
+        return 1;
+      }
+    } else {
+      av_sym = cand_av;
+    }
+    sum_sym[K] = in->dest.name;
+    bload_temp[K] = cand_ld;
+    K++;
+  }
+  if ((K != 4 && K != 8) || !av_sym) {
+    return 1;
+  }
+
+  /* av = (int32)a[a_idx] (byte load, scale-1 address). */
+  const char *a_base = NULL, *a_idx_sym = NULL;
+  long long a_lane = 0;
+  if (!ir_slp_i8_resolve(function, branch_index + 1, jump_index, 0, av_sym,
+                         &a_base, &a_idx_sym, &a_lane) ||
+      a_lane != 0) {
+    return 1;
+  }
+
+  /* Each bload = (int32)b[b_idx + lane] (byte load, scale-1). */
+  const char *b_base = NULL, *b_idx_sym = NULL;
+  const char *sum_by_lane[IR_SLP_MAX_LANES] = {0};
+  for (int j = 0; j < K; j++) {
+    const char *bb = NULL, *bi = NULL;
+    long long lane = 0;
+    if (!ir_slp_i8_resolve(function, branch_index + 1, jump_index, 1,
+                           bload_temp[j], &bb, &bi, &lane) ||
+        lane < 0 || lane >= K) {
+      return 1;
+    }
+    if (j == 0) {
+      b_base = bb;
+      b_idx_sym = bi;
+    } else if (strcmp(bb, b_base) != 0 || strcmp(bi, b_idx_sym) != 0) {
+      return 1;
+    }
+    if (sum_by_lane[lane]) {
+      return 1;
+    }
+    sum_by_lane[lane] = sum_sym[j];
+  }
+  if (!a_base || !b_base || strcmp(a_base, b_base) == 0) {
+    return 1;
+  }
+
+  /* IV increments: a_idx += 1, b_idx += stride. */
+  const char *stride_sym = NULL;
+  int a_inc_ok = 0, b_inc_ok = 0;
+  for (size_t i = branch_index + 1; i < jump_index; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op != IR_OP_BINARY || !in->text || strcmp(in->text, "+") != 0 ||
+        in->dest.kind != IR_OPERAND_SYMBOL || !in->dest.name ||
+        !ir_operand_is_symbol_named(&in->lhs, in->dest.name)) {
+      continue;
+    }
+    if (strcmp(in->dest.name, a_idx_sym) == 0 &&
+        in->rhs.kind == IR_OPERAND_INT && in->rhs.int_value == 1) {
+      a_inc_ok = 1;
+    } else if (strcmp(in->dest.name, b_idx_sym) == 0) {
+      if (in->rhs.kind == IR_OPERAND_SYMBOL && in->rhs.name) {
+        stride_sym = in->rhs.name;
+        b_inc_ok = 1;
+      } else if (in->rhs.kind == IR_OPERAND_TEMP && in->rhs.name) {
+        const IRInstruction *p =
+            ir_find_temp_producer_before(function, i, in->rhs.name);
+        if (p && p->op == IR_OP_CAST && p->lhs.kind == IR_OPERAND_SYMBOL &&
+            p->lhs.name) {
+          stride_sym = p->lhs.name;
+          b_inc_ok = 1;
+        }
+      }
+    }
+  }
+  if (!a_inc_ok || !b_inc_ok || !stride_sym) {
+    return 1;
+  }
+
+  IROperand a_off = {0}, b_off = {0};
+  if (!ir_slp_find_init(function, header_index, a_idx_sym, &a_off) ||
+      !ir_slp_find_init(function, header_index, b_idx_sym, &b_off)) {
+    ir_operand_destroy(&a_off);
+    ir_operand_destroy(&b_off);
+    return 1;
+  }
+
+  size_t exit_label_index = (size_t)-1;
+  for (size_t i = jump_index + 1; i < function->instruction_count; i++) {
+    if (function->instructions[i].op == IR_OP_LABEL &&
+        function->instructions[i].text &&
+        strcmp(function->instructions[i].text, branch->text) == 0) {
+      exit_label_index = i;
+      break;
+    }
+  }
+  if (exit_label_index == (size_t)-1) {
+    ir_operand_destroy(&a_off);
+    ir_operand_destroy(&b_off);
+    return 1;
+  }
+  const char *c_base = NULL, *out_idx_sym = NULL;
+  size_t store_idx[IR_SLP_MAX_LANES];
+  int sfound = ir_slp_find_stores(function, exit_label_index, K, sum_by_lane,
+                                  &c_base, &out_idx_sym, store_idx);
+  if (!sfound || strcmp(c_base, a_base) == 0) {
+    ir_operand_destroy(&a_off);
+    ir_operand_destroy(&b_off);
+    return 1;
+  }
+
+  IRInstruction fused = {0};
+  fused.op = IR_OP_SIMD_SLP_MAC_I8;
+  fused.location = header->location;
+  fused.dest = ir_operand_symbol(c_base);
+  fused.lhs = ir_operand_symbol(a_base);
+  fused.rhs = ir_operand_symbol(b_base);
+  fused.arguments = calloc(6, sizeof(IROperand));
+  if (!fused.arguments) {
+    ir_operand_destroy(&a_off);
+    ir_operand_destroy(&b_off);
+    return 0;
+  }
+  fused.argument_count = 6;
+  fused.arguments[0] = ir_operand_int(K);
+  fused.arguments[1] = ir_operand_symbol(compare->rhs.name);
+  fused.arguments[2] = a_off;
+  fused.arguments[3] = b_off;
+  fused.arguments[4] = ir_operand_symbol(stride_sym);
+  fused.arguments[5] = ir_operand_symbol(out_idx_sym);
+
+  size_t place = store_idx[0];
+  ir_instruction_destroy_storage(&function->instructions[place]);
+  function->instructions[place] = fused;
+  for (size_t i = header_index; i <= jump_index; i++) {
+    ir_instruction_make_nop(&function->instructions[i]);
+  }
+  for (int j = 1; j < K; j++) {
+    ir_instruction_make_nop(&function->instructions[store_idx[j]]);
+  }
+  if (changed) {
+    *changed = 1;
+  }
+  return 1;
+}
+
+int ir_simd_slp_mac_i8_pass(IRFunction *function, int *changed) {
+  if (!function) {
+    return 0;
+  }
+  if (getenv("NO_SLP")) {
+    return 0;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    if (function->instructions[i].op == IR_OP_LABEL &&
+        ir_label_is_while_header(function->instructions[i].text)) {
+      if (!ir_try_vectorize_slp_mac_i8_at(function, i, changed)) {
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
 int ir_simd_dot_i32_pass(IRFunction *function, int *changed) {
   if (!function) {
     return 0;
@@ -1718,6 +2199,21 @@ int ir_simd_dot_i32_pass(IRFunction *function, int *changed) {
     if (function->instructions[i].op == IR_OP_LABEL &&
         ir_label_is_while_header(function->instructions[i].text)) {
       if (!ir_try_vectorize_dot_i32_at(function, i, changed)) {
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
+int ir_simd_dot_i8_pass(IRFunction *function, int *changed) {
+  if (!function) {
+    return 0;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    if (function->instructions[i].op == IR_OP_LABEL &&
+        ir_label_is_while_header(function->instructions[i].text)) {
+      if (!ir_try_vectorize_dot_i8_at(function, i, changed)) {
         return 0;
       }
     }

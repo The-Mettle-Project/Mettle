@@ -319,7 +319,9 @@ static int ir_profile_instruction_op_class(const IRInstruction *instruction,
   case IR_OP_SIMD_MATMUL_N32:
   case IR_OP_SIMD_INSERTION_SORT_I32:
   case IR_OP_SIMD_DOT_I32:
+  case IR_OP_SIMD_DOT_I8:
   case IR_OP_SIMD_SLP_MAC_I32:
+  case IR_OP_SIMD_SLP_MAC_I8:
   case IR_OP_SIMD_SCALE_I32:
   case IR_OP_SIMD_CLAMP_I32:
   case IR_OP_SIMD_REVERSE_COPY_I32:

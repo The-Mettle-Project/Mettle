@@ -713,7 +713,9 @@ static const char *ir_opcode_name(IROpcode op) {
   case IR_OP_SIMD_MATMUL_N32: return "simd_matmul_n32";
   case IR_OP_SIMD_INSERTION_SORT_I32: return "simd_insertion_sort_i32";
   case IR_OP_SIMD_DOT_I32: return "simd_dot_i32";
+  case IR_OP_SIMD_DOT_I8: return "simd_dot_i8";
   case IR_OP_SIMD_SLP_MAC_I32: return "simd_slp_mac_i32";
+  case IR_OP_SIMD_SLP_MAC_I8: return "simd_slp_mac_i8";
   case IR_OP_SIMD_SCALE_I32: return "simd_scale_i32";
   case IR_OP_SIMD_CLAMP_I32: return "simd_clamp_i32";
   case IR_OP_SIMD_REVERSE_COPY_I32: return "simd_reverse_copy_i32";
@@ -915,9 +917,23 @@ static int ir_format_instruction_line(const IRInstruction *instruction,
                        dest, lhs, rhs, len);
     break;
   }
+  case IR_OP_SIMD_DOT_I8: {
+    char len[128];
+    ir_format_operand(instruction->argument_count > 0 ? &instruction->arguments[0]
+                                                      : NULL,
+                      len, sizeof(len));
+    written = snprintf(buffer, buffer_size, "%s = dot_i8(a=%s, b=%s, len=%s)",
+                       dest, lhs, rhs, len);
+    break;
+  }
   case IR_OP_SIMD_SLP_MAC_I32:
     written = snprintf(buffer, buffer_size,
                        "slp_mac_i32(out=%s, a=%s, b=%s, K/n/aoff/boff/str/ooff)",
+                       dest, lhs, rhs);
+    break;
+  case IR_OP_SIMD_SLP_MAC_I8:
+    written = snprintf(buffer, buffer_size,
+                       "slp_mac_i8(out=%s, a=%s, b=%s, K/n/aoff/boff/str/ooff)",
                        dest, lhs, rhs);
     break;
   case IR_OP_SIMD_SCALE_I32: {
