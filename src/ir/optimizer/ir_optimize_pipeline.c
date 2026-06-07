@@ -66,6 +66,7 @@ static const IROptNamedPass g_ir_post_fixpoint_passes[] = {
     {"prefix_sum_i32", ir_prefix_sum_i32_pass},
     {"simd_minmax_i32", ir_simd_minmax_i32_pass},
     {"simd_affine_map_float", ir_simd_affine_map_float_pass},
+    {"simd_exp_f32", ir_simd_exp_f32_pass},
     {"simd_i2f_reduce", ir_simd_i2f_reduce_pass},
     {"simd_dot_float", ir_simd_dot_float_pass},
     {"simd_sum_float", ir_simd_sum_float_pass},

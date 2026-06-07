@@ -6,6 +6,7 @@
 #include "codegen/binary/startup.h"
 #include "codegen/binary_emitter.h"
 #include "codegen/program_entry.h"
+#include "codegen/ptx_emitter.h"
 #include "linker/pe_emitter.h"
 #include "string_intern.h"
 #include "compiler/compiler_context.h"
@@ -2096,6 +2097,8 @@ int main(int argc, char *argv[]) {
       options.generate_stack_trace_support = 1;
     } else if (strcmp(argv[i], "--dump-ir") == 0) {
       options.dump_ir = 1;
+    } else if (strcmp(argv[i], "--emit-ptx") == 0) {
+      options.emit_ptx = 1;
     } else if (strcmp(argv[i], "-g") == 0 ||
                strcmp(argv[i], "--debug-symbols") == 0) {
       options.generate_debug_symbols = 1;
@@ -2671,7 +2674,7 @@ int compile_file(const char *input_filename, const char *output_filename,
     goto cleanup;
   }
 
-  int emit_runtime_checks = options->release ? 0 : 1;
+  int emit_runtime_checks = (options->release || options->emit_ptx) ? 0 : 1;
   compiler_set_phase(PROFILE_PHASE_IR_LOWERING);
   phase_start = compiler_profile_begin(&profile);
   int ir_ok = compile_lower_to_ir(program, type_checker, symbol_table,
@@ -2684,6 +2687,33 @@ int compile_file(const char *input_filename, const char *output_filename,
   }
 
   mettle_compiler_ctx_set_ir_program(ir_program);
+
+  /* --emit-ptx: lower every function to a PTX `.visible .entry` and write the
+   * PTX text to the output file. No optimization (keeps the IR shape the PTX
+   * emitter expects), no object, no link -- the GPU kernels are JIT-compiled by
+   * the CUDA driver at runtime from this text. */
+  if (options->emit_ptx) {
+    FILE *ptx_out = fopen(output_filename, "w");
+    if (!ptx_out) {
+      fprintf(stderr, "Error: could not open PTX output '%s'\n",
+              output_filename);
+      result = 1;
+      goto cleanup;
+    }
+    char *ptx_err = NULL;
+    int ok = ptx_emit_program(ir_program, code_generator, ptx_out, &ptx_err);
+    fclose(ptx_out);
+    if (!ok) {
+      fprintf(stderr, "Error: PTX emission failed: %s\n",
+              ptx_err ? ptx_err : "unknown");
+      free(ptx_err);
+      result = 1;
+      goto cleanup;
+    }
+    printf("Generated PTX: %s\n", output_filename);
+    result = 0;
+    goto cleanup;
+  }
 
   /* --native-heap: retarget new/malloc/calloc/realloc/free onto the std/alloc
    * Mettle allocator at the IR level (before optimization, so the rewritten

@@ -1,0 +1,165 @@
+// ============================================================================
+// A minimal quantized neural-network inference engine, in Mettle.
+//
+// It runs the forward pass of a small int8-quantized multi-layer perceptron:
+//
+//     x (int8) --[Linear 16->8]--> ReLU --[Linear 8->4]--> argmax -> class
+//
+// Everything is integer math. Weights and activations are unsigned bytes
+// (Mettle's int8 is byte-unsigned) quantized with a zero-point of 128, i.e. the
+// "real" value of a stored byte q is (q - 128), giving the range [-128, 127].
+//
+// The hot path of every layer is a dot product of two int8 vectors accumulated
+// into int32 -- exactly the pattern the compiler auto-vectorizes into an AVX2
+// vpmaddwd kernel. The zero-point bookkeeping is done at the int32 level so the
+// inner loop stays a clean, vectorizable `sum += a[i]*b[i]`:
+//
+//   sum_real = SUM (a_i - 128)(w_i - 128)
+//            = SUM a_i*w_i  -  128*SUM(w_i)  -  128*SUM(a_i)  +  128*128*n
+//             \_____________/
+//              the int8 dot (vectorized); the rest are cheap per-layer scalars.
+//
+// Weights here are produced by a deterministic PRNG so the run is reproducible;
+// a real engine would load trained weights instead. Build with --release.
+// ============================================================================
+
+import "std/io";
+import "std/mem";
+
+// ---- deterministic byte source (LCG) -------------------------------------
+var rng_state: int64 = 1;
+
+function next_byte() -> int32 {
+  rng_state = (rng_state * 1103515245 + 12345) & 2147483647;
+  return (int32)((rng_state >> 16) & 255);
+}
+
+// ---- the vectorized kernel: int8 x int8 -> int32 dot ---------------------
+// This exact shape (int32 accumulator, byte loads, unit stride) is recognized
+// and lowered to the AVX2 vpmaddwd int8 dot kernel under --release.
+function qdot(a: int8*, b: int8*, n: int64) -> int32 {
+  var sum: int32 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    sum = sum + (int32)a[i] * (int32)b[i];
+    i = i + 1;
+  }
+  return sum;
+}
+
+// Sum of unsigned bytes (the per-vector zero-point correction term).
+function bsum(a: int8*, n: int64) -> int32 {
+  var sum: int32 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    sum = sum + (int32)a[i];
+    i = i + 1;
+  }
+  return sum;
+}
+
+// ---- a fully-connected layer: out[j] = real-dot(x, W[j]) + bias[j] -------
+// W is row-major, out_n rows of in_n int8 weights each. Outputs are int32
+// "real" logits (zero-point already removed).
+function linear(inp: int8*, in_n: int64, w: int8*, bias: int32*, out_n: int64,
+                out: int32*) {
+  var asum: int32 = bsum(inp, in_n);
+  var corr_a: int32 = 128 * asum;
+  var zp_const: int32 = 16384 * (int32)in_n; // 128*128*n
+  var j: int64 = 0;
+  while (j < out_n) {
+    var wrow: int8* = &w[j * in_n];
+    var raw: int32 = qdot(inp, wrow, in_n);  // <- vectorized int8 dot
+    var wsum: int32 = bsum(wrow, in_n);
+    out[j] = raw - 128 * wsum - corr_a + zp_const + bias[j];
+    j = j + 1;
+  }
+}
+
+// ReLU + requantize int32 logits back to unsigned int8 (zero-point 128) so the
+// next layer's input is in the same domain. `shift` rescales the accumulator.
+function requantize_relu(logits: int32*, n: int64, shift: int32, out_q: int8*) {
+  var i: int64 = 0;
+  while (i < n) {
+    var v: int32 = logits[i];
+    if (v < 0) { v = 0; }            // ReLU
+    v = v >> shift;                  // rescale toward int8 range
+    if (v > 127) { v = 127; }        // clamp
+    out_q[i] = (int8)(v + 128);      // store as unsigned byte (zp 128)
+    i = i + 1;
+  }
+}
+
+// Index of the largest logit (the predicted class). Softmax is unnecessary --
+// it is monotonic, so it does not change the argmax.
+function argmax(logits: int32*, n: int64) -> int32 {
+  var best: int32 = 0;
+  var bestv: int32 = logits[0];
+  var i: int64 = 1;
+  while (i < n) {
+    if (logits[i] > bestv) {
+      bestv = logits[i];
+      best = (int32)i;
+    }
+    i = i + 1;
+  }
+  return best;
+}
+
+function main() -> int32 {
+  var IN: int64 = 16;
+  var H: int64 = 8;
+  var OUT: int64 = 4;
+
+  // Model parameters (random but reproducible; a real engine loads these).
+  var w1: int8* = (int8*)malloc(H * IN);
+  var b1: int32* = (int32*)malloc(H * 4);
+  var w2: int8* = (int8*)malloc(OUT * H);
+  var b2: int32* = (int32*)malloc(OUT * 4);
+
+  var i: int64 = 0;
+  while (i < H * IN) { w1[i] = (int8)next_byte(); i = i + 1; }
+  i = 0;
+  while (i < H) { b1[i] = next_byte() - 128; i = i + 1; }
+  i = 0;
+  while (i < OUT * H) { w2[i] = (int8)next_byte(); i = i + 1; }
+  i = 0;
+  while (i < OUT) { b2[i] = next_byte() - 128; i = i + 1; }
+
+  // Activation buffers.
+  var x: int8* = (int8*)malloc(IN);
+  var h_logits: int32* = (int32*)malloc(H * 4);
+  var h_q: int8* = (int8*)malloc(H);
+  var out_logits: int32* = (int32*)malloc(OUT * 4);
+
+  println(cstr("minimal quantized MLP inference (16 -> 8 -> 4)"));
+
+  var sample: int32 = 0;
+  while (sample < 4) {
+    // A fresh deterministic input vector.
+    i = 0;
+    while (i < IN) { x[i] = (int8)next_byte(); i = i + 1; }
+
+    // Forward pass.
+    linear(x, IN, w1, b1, H, h_logits);
+    requantize_relu(h_logits, H, 6, h_q);
+    linear(h_q, H, w2, b2, OUT, out_logits);
+    var cls: int32 = argmax(out_logits, OUT);
+
+    print(cstr("sample "));
+    print_int((int64)sample);
+    print(cstr(": logits [ "));
+    var c: int64 = 0;
+    while (c < OUT) {
+      print_int((int64)out_logits[c]);
+      print(cstr(" "));
+      c = c + 1;
+    }
+    print(cstr("] -> class "));
+    println_int((int64)cls);
+
+    sample = sample + 1;
+  }
+
+  return 0;
+}

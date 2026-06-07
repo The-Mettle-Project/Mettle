@@ -1927,16 +1927,41 @@ int code_generator_binary_emit_float_call_argument(
     CodeGenerator *generator, BinaryFunctionContext *context,
     const IROperand *operand, Type *parameter_type, int param_fbits,
     BinaryXmmRegister xmm_register) {
+  /* The argument may be stored at a DIFFERENT precision than the parameter
+   * expects. In particular every float binary-op result is tracked as float64
+   * (instruction_result_is_float64), so `f32_param(a / b)` produces a double
+   * temp; movd-ing its low 32 bits reads 0 for values like 1.25/2.0/8.0 (whose
+   * double low word is zero). Move the raw bits into the xmm at the OPERAND's
+   * stored precision, then convert to the parameter's precision. */
+  int operand_fbits =
+      code_generator_binary_operand_float_bits(generator, context, operand);
+  if (operand_fbits != 32 && operand_fbits != 64) {
+    operand_fbits = param_fbits; /* unknown: assume it matches the parameter */
+  }
   if (!code_generator_binary_emit_call_argument_load(
           generator, context, operand, parameter_type, BINARY_GP_RAX)) {
     return 0;
   }
-  if (param_fbits == 32) {
-    return binary_emit_movd_xmm_reg(&context->code, xmm_register,
-                                    BINARY_GP_RAX);
+  if (operand_fbits == 32) {
+    if (!binary_emit_movd_xmm_reg(&context->code, xmm_register,
+                                  BINARY_GP_RAX)) {
+      return 0;
+    }
+    if (param_fbits == 64) {
+      return binary_emit_cvtss2sd_xmm_xmm(&context->code, xmm_register,
+                                          xmm_register);
+    }
+    return 1;
   }
-  return binary_emit_movq_xmm_reg(&context->code, xmm_register,
-                                  BINARY_GP_RAX);
+  /* operand is stored as a 64-bit double */
+  if (!binary_emit_movq_xmm_reg(&context->code, xmm_register, BINARY_GP_RAX)) {
+    return 0;
+  }
+  if (param_fbits == 32) {
+    return binary_emit_cvtsd2ss_xmm_xmm(&context->code, xmm_register,
+                                        xmm_register);
+  }
+  return 1;
 }
 
 int code_generator_binary_emit_local_string_store(
@@ -5421,6 +5446,10 @@ int code_generator_binary_emit_instruction(
   case IR_OP_SIMD_AFFINE_MAP_F64:
     return code_generator_binary_emit_simd_affine_map_f64(generator, context,
                                                           instruction);
+  case IR_OP_SIMD_EXP_F32:
+    return code_generator_binary_emit_simd_exp_f32(generator, context,
+                                                   instruction);
+
   case IR_OP_SIMD_AFFINE_MAP_F32:
     return code_generator_binary_emit_simd_affine_map_f32(generator, context,
                                                           instruction);

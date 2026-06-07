@@ -421,6 +421,14 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
     return 1;
   }
 
+  /* Set when an iv-indexed access cannot be converted to a pointer-walk (its
+   * base is not an i32 ptr param — e.g. a local pointer like (int32*)&G[off]).
+   * Such an access keeps the induction variable (and its `iv << 2` byte-offset
+   * shift) live, but the transform unconditionally drops the iv increment and
+   * shift. Half-converting would leave the surviving access referencing a
+   * deleted index temp, so we must bail out entirely instead. */
+  int has_unconvertible_iv_access = 0;
+
   for (size_t i = body_start; i < body_end; i++) {
     const IRInstruction *ins = &function->instructions[i];
     if (ins->op == IR_OP_LOAD && ins->lhs.kind == IR_OPERAND_TEMP &&
@@ -431,6 +439,7 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
         continue;
       }
       if (!ir_symbol_is_i32_ptr_param(function, base)) {
+        has_unconvertible_iv_access = 1;
         continue;
       }
       if (!ir_ptr_binding_add(bindings, &binding_count, header_index, base,
@@ -447,6 +456,7 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
         continue;
       }
       if (!ir_symbol_is_i32_ptr_param(function, base)) {
+        has_unconvertible_iv_access = 1;
         continue;
       }
       if (!ir_ptr_binding_add(bindings, &binding_count, header_index, base,
@@ -455,6 +465,11 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
         return 0;
       }
     }
+  }
+
+  if (has_unconvertible_iv_access) {
+    ir_ptr_bindings_destroy(bindings, binding_count);
+    return 1;
   }
 
   if (binding_count == 0) {

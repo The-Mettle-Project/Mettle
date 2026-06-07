@@ -1,0 +1,12 @@
+// Regression: a float64 temp (every float binary-op result is tracked as f64)
+// passed to a float32 parameter must be CONVERTED (movq+cvtsd2ss), not movd'd
+// (low 32 bits). For round values like 1.25 the double low-word is 0, so the
+// buggy movd passed 0 -> rsqrt(0) -> NaN. See float-temp-call-arg-miscompile.
+extern function sqrtf(x: float32) -> float32 = "sqrtf";
+function rsqrt(x: float32) -> float32 { return 1.0 / sqrtf(x); }
+function main() -> int32 {
+  var p: float32 = 5.0;
+  var r: float32 = rsqrt(p / 4.0);   // arg 1.25; rsqrt(1.25) = 0.894427
+  if (r > 0.89 && r < 0.90) { return 1; }
+  return 0;
+}

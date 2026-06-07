@@ -24,6 +24,7 @@ typedef struct {
   const char *output_filename;
   int debug_mode;
   int dump_ir;
+  int emit_ptx; /* --emit-ptx: lower every function to a PTX .entry, no object */
   int optimize;
   int release;
   int emit_object;

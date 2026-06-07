@@ -137,6 +137,9 @@ typedef enum {
    * lhs = src, rhs = dst, arguments[0] = element count. */
   IR_OP_SIMD_AFFINE_MAP_F64,
   IR_OP_SIMD_AFFINE_MAP_F32,
+  /* In-place a[i] = exp(a[i]) over a float32 array (vectorized libm exp).
+   * dest = array base, arguments[0] = element count. */
+  IR_OP_SIMD_EXP_F32,
   /* Counted-loop reduction where each iteration adds (int64)trunc(CHAIN) to the
    * dest accumulator, with CHAIN a straight-line float64 expression in the loop
    * counter: x0 = (float64)i, then a sequence of {x*=k, x+=k, x-=k, x=k-x, x/=k}

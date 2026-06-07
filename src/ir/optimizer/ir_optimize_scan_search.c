@@ -2191,6 +2191,163 @@ int ir_simd_slp_mac_i8_pass(IRFunction *function, int *changed) {
   return 1;
 }
 
+/* In-place vectorization of `a[i] = expf(a[i])` over a float32 array: a counted
+ * unit-stride loop whose body loads a float, calls the libc `expf`, and stores
+ * the result back to the same element. Like a compiler's libm vectorizer
+ * (libmvec/SVML), it replaces the call loop with an AVX2 polynomial exp
+ * (IR_OP_SIMD_EXP_F32). Matched by the math-function call + element-wise map
+ * shape, not a benchmark. The result tracks libc expf within tolerance. */
+static int ir_try_vectorize_exp_f32_at(IRFunction *function, size_t header_index,
+                                       int *changed) {
+  if (!function || header_index + 4 >= function->instruction_count) {
+    return 1;
+  }
+  IRInstruction *header = &function->instructions[header_index];
+  if (header->op != IR_OP_LABEL || !ir_label_is_while_header(header->text)) {
+    return 1;
+  }
+  const char *loop_label = header->text;
+  size_t compare_index = 0, branch_index = 0;
+  if (!ir_find_next_non_nop(function, header_index + 1, &compare_index) ||
+      !ir_find_next_non_nop(function, compare_index + 1, &branch_index)) {
+    return 1;
+  }
+  IRInstruction *compare = &function->instructions[compare_index];
+  IRInstruction *branch = &function->instructions[branch_index];
+  if (compare->op != IR_OP_BINARY || compare->is_float || !compare->text ||
+      strcmp(compare->text, "<") != 0 ||
+      compare->lhs.kind != IR_OPERAND_SYMBOL || !compare->lhs.name ||
+      compare->rhs.kind != IR_OPERAND_SYMBOL || !compare->rhs.name ||
+      compare->dest.kind != IR_OPERAND_TEMP || !compare->dest.name ||
+      branch->op != IR_OP_BRANCH_ZERO ||
+      !ir_operand_is_temp_named(&branch->lhs, compare->dest.name)) {
+    return 1;
+  }
+  const char *iv_symbol = compare->lhs.name;
+
+  size_t jump_index = (size_t)-1;
+  for (size_t i = branch_index + 1; i < function->instruction_count; i++) {
+    if (function->instructions[i].op == IR_OP_JUMP &&
+        function->instructions[i].text &&
+        strcmp(function->instructions[i].text, loop_label) == 0) {
+      jump_index = i;
+      break;
+    }
+    if (function->instructions[i].op == IR_OP_LABEL) {
+      break;
+    }
+  }
+  if (jump_index == (size_t)-1 ||
+      ir_loop_body_has_nested_while(function, branch_index + 1, jump_index)) {
+    return 1;
+  }
+
+  /* The expf call: r = expf(v), with v and r temps. */
+  const char *call_arg = NULL, *call_res = NULL;
+  for (size_t i = branch_index + 1; i < jump_index; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op == IR_OP_CALL && in->text && strcmp(in->text, "expf") == 0 &&
+        in->argument_count == 1 && in->arguments &&
+        in->arguments[0].kind == IR_OPERAND_TEMP && in->arguments[0].name &&
+        in->dest.kind == IR_OPERAND_TEMP && in->dest.name) {
+      call_arg = in->arguments[0].name;
+      call_res = in->dest.name;
+      break;
+    }
+  }
+  if (!call_arg || !call_res) {
+    return 1;
+  }
+
+  /* The load that feeds the call: v = a[i] (float32, base+(i<<2), lane 0). */
+  const char *a_base = NULL, *a_idx = NULL;
+  long long lane = 0;
+  int found_load = 0;
+  for (size_t i = branch_index + 1; i < jump_index; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op == IR_OP_LOAD && ir_operand_is_temp_named(&in->dest, call_arg) &&
+        in->lhs.kind == IR_OPERAND_TEMP && in->lhs.name &&
+        ir_slp_load_base_index(function, i, in->lhs.name, &a_base, &a_idx,
+                               &lane) &&
+        lane == 0) {
+      found_load = 1;
+      break;
+    }
+  }
+  if (!found_load || !a_base || !a_idx || strcmp(a_idx, iv_symbol) != 0) {
+    return 1;
+  }
+
+  /* The store of the result back to a[i] (same base, in-place). */
+  int found_store = 0;
+  for (size_t i = branch_index + 1; i < jump_index; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    const char *sb = NULL, *si = NULL;
+    long long sl = 0;
+    if (in->op == IR_OP_STORE &&
+        ir_operand_is_temp_named(&in->lhs, call_res) &&
+        in->dest.kind == IR_OPERAND_TEMP && in->dest.name &&
+        ir_slp_load_base_index(function, i, in->dest.name, &sb, &si, &sl) &&
+        sl == 0 && sb && si && strcmp(sb, a_base) == 0 &&
+        strcmp(si, iv_symbol) == 0) {
+      found_store = 1;
+      break;
+    }
+  }
+  if (!found_store) {
+    return 1;
+  }
+
+  /* i increments by 1. */
+  int inc_ok = 0;
+  for (size_t i = branch_index + 1; i < jump_index; i++) {
+    if (ir_try_parse_direct_unit_increment(&function->instructions[i],
+                                           iv_symbol)) {
+      inc_ok = 1;
+      break;
+    }
+  }
+  if (!inc_ok) {
+    return 1;
+  }
+
+  IRInstruction fused = {0};
+  fused.op = IR_OP_SIMD_EXP_F32;
+  fused.location = header->location;
+  fused.dest = ir_operand_symbol(a_base);
+  fused.arguments = calloc(1, sizeof(IROperand));
+  if (!fused.arguments) {
+    return 0;
+  }
+  fused.argument_count = 1;
+  fused.arguments[0] = ir_operand_symbol(compare->rhs.name); /* count n */
+
+  ir_instruction_destroy_storage(header);
+  *header = fused;
+  for (size_t i = header_index + 1; i <= jump_index; i++) {
+    ir_instruction_make_nop(&function->instructions[i]);
+  }
+  if (changed) {
+    *changed = 1;
+  }
+  return 1;
+}
+
+int ir_simd_exp_f32_pass(IRFunction *function, int *changed) {
+  if (!function) {
+    return 0;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    if (function->instructions[i].op == IR_OP_LABEL &&
+        ir_label_is_while_header(function->instructions[i].text)) {
+      if (!ir_try_vectorize_exp_f32_at(function, i, changed)) {
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
 int ir_simd_dot_i32_pass(IRFunction *function, int *changed) {
   if (!function) {
     return 0;

@@ -531,6 +531,7 @@ int code_generator_binary_try_emit_offset_scaled_address_store( CodeGenerator *g
 int code_generator_binary_emit_simd_clamp_i32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_dot_i32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_dot_i8( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
+int code_generator_binary_emit_simd_exp_f32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_slp_mac_i32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 /* Pure inner loop of the SLP MAC kernel for the MIR pass-through path. Assumes
  * RCX/RDX/R8 = a/b/out element pointers (offsets already applied), R9 = k count,

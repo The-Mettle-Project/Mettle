@@ -728,6 +728,7 @@ static const char *ir_opcode_name(IROpcode op) {
   case IR_OP_SIMD_DOT_F32: return "simd_dot_f32";
   case IR_OP_SIMD_AFFINE_MAP_F64: return "simd_affine_map_f64";
   case IR_OP_SIMD_AFFINE_MAP_F32: return "simd_affine_map_f32";
+  case IR_OP_SIMD_EXP_F32: return "simd_exp_f32";
   case IR_OP_SIMD_I2F_REDUCE_F64: return "simd_i2f_reduce_f64";
   case IR_OP_SIMD_VLOOP_F64: return "simd_vloop_f64";
   case IR_OP_SIMD_OUTER_LANE_F64: return "simd_outer_lane_f64";
@@ -1055,6 +1056,14 @@ static int ir_format_instruction_line(const IRInstruction *instruction,
                        ir_opcode_name(instruction->op), lhs,
                        instruction->argument_count);
     break;
+  case IR_OP_SIMD_EXP_F32: {
+    char len[128];
+    ir_format_operand(instruction->argument_count > 0 ? &instruction->arguments[0]
+                                                      : NULL,
+                      len, sizeof(len));
+    written = snprintf(buffer, buffer_size, "exp_f32(a=%s, len=%s)", dest, len);
+    break;
+  }
   case IR_OP_SIMD_AFFINE_MAP_F64:
   case IR_OP_SIMD_AFFINE_MAP_F32: {
     char len[128];
