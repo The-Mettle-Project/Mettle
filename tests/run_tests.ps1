@@ -3671,6 +3671,38 @@ catch {
   Write-CaseResult -Name "compiler_ice_report" -Passed $false -Reason $_.Exception.Message
 }
 
+# PTX backend validity gate. Emits the real GPU kernel corpus and the stress
+# corpus to PTX and round-trips each through ptxas (NVIDIA's assembler) -- the
+# authoritative check that the emitted PTX is well-formed. Catches emitter
+# regressions that produce syntactically/typed-invalid PTX. Skipped when the
+# CUDA toolkit (ptxas) is absent. Semantic (GPU-execution) checks live in
+# examples/llm/qwen3/gpu/dgpu_check.mettle (needs a GPU, so not in this gate).
+$ptxas = Get-Command ptxas -ErrorAction SilentlyContinue
+if (-not $ptxas) {
+  Write-Host "[SKIP] ptx_emit_validate (ptxas not found)"
+}
+else {
+  foreach ($src in @("examples/llm/qwen3/gpu/kernels.mettle",
+                     "examples/llm/qwen3/gpu/ptx_stress.mettle")) {
+    $total++
+    $name = "ptx_emit_" + [System.IO.Path]::GetFileNameWithoutExtension($src)
+    try {
+      $ptxPath = Join-Path $tmpDir ($name + ".ptx")
+      $cubin = Join-Path $tmpDir ($name + ".cubin")
+      $emitOut = & $CompilerPath --emit-ptx $src -o $ptxPath 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) { throw "emit failed: $emitOut" }
+      if (-not (Test-Path $ptxPath)) { throw "no PTX produced" }
+      $asmOut = & $ptxas.Source -arch=sm_90 $ptxPath -o $cubin 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) { throw "ptxas rejected emitted PTX: $asmOut" }
+      Write-CaseResult -Name $name -Passed $true
+    }
+    catch {
+      $failed++
+      Write-CaseResult -Name $name -Passed $false -Reason $_.Exception.Message
+    }
+  }
+}
+
 # Differential miscompile fuzzer gate. Generates UB-free programs, builds each
 # at debug and release, and fails on any exit-code divergence (a silent
 # miscompile). See tools/fuzz/README.md. Skipped if Python is unavailable or

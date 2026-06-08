@@ -16,7 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef enum { PC_NONE, PC_PRED, PC_B32, PC_B64, PC_F32, PC_F64 } PtxClass;
+typedef enum { PC_NONE, PC_PRED, PC_B16, PC_B32, PC_B64, PC_F32, PC_F64 } PtxClass;
 
 typedef struct {
   PtxClass cls;
@@ -39,7 +39,7 @@ typedef struct {
 
 typedef struct {
   Sb body;
-  int count[6]; /* register counts indexed by PtxClass */
+  int count[8]; /* register counts indexed by PtxClass */
   PtxBinding *binds;
   size_t nbinds, capbinds;
   char *error;
@@ -97,6 +97,8 @@ static const char *cls_prefix(PtxClass c) {
   switch (c) {
   case PC_PRED:
     return "%p";
+  case PC_B16:
+    return "%rs";
   case PC_B32:
     return "%r";
   case PC_B64:
@@ -113,6 +115,8 @@ static const char *cls_regtype(PtxClass c) {
   switch (c) {
   case PC_PRED:
     return ".pred";
+  case PC_B16:
+    return ".b16";
   case PC_B32:
     return ".b32";
   case PC_B64:
@@ -624,9 +628,14 @@ static void emit_function(IRProgram *program, size_t fi, CodeGenerator *gen,
       reg_name(PC_PRED, p, pn);
       if (cv.cls == PC_F32 || cv.cls == PC_F64) {
         use_as(&fn, &in->lhs, cv.cls, r);
-        sb_printf(&fn.body, "\tsetp.eq.%s %s, %s, 0%s;\n",
-                  cv.cls == PC_F32 ? "f32" : "f64", pn, r,
-                  cv.cls == PC_F32 ? "f0000000" : "d0000000000000000");
+        /* Zero immediate as a hex bit-pattern: f32 needs 0f + 8 digits, f64
+         * needs 0d + 16. (Hand-written literals are an easy off-by-one;
+         * formatting from the bits is not.) */
+        if (cv.cls == PC_F32) {
+          sb_printf(&fn.body, "\tsetp.eq.f32 %s, %s, 0f%08X;\n", pn, r, 0u);
+        } else {
+          sb_printf(&fn.body, "\tsetp.eq.f64 %s, %s, 0d%016llX;\n", pn, r, 0ull);
+        }
       } else {
         PtxClass c = (cv.cls == PC_B64) ? PC_B64 : PC_B32;
         use_as(&fn, &in->lhs, c, r);
@@ -826,6 +835,38 @@ static void emit_function(IRProgram *program, size_t fi, CodeGenerator *gen,
         }
       } else if (callee && !strcmp(callee, "gpu_barrier")) {
         sb_puts(&fn.body, "\tbar.sync 0;\n");
+      } else if (callee && in->argument_count >= 1 && !strcmp(callee, "h2f")) {
+        /* h2f(bits): reinterpret a uint16 fp16 bit-pattern as float32. The arg
+         * arrives as a 32-bit int (zero-extended u16 load); truncate to .b16 and
+         * cvt.f32.f16. Lets prefill keep fp16-resident weights and convert on
+         * the fly with one PTX instruction. */
+        char a[24];
+        use_as(&fn, &in->arguments[0], PC_B32, a);
+        int hidx = new_reg(&fn, PC_B16);
+        char hn[24];
+        reg_name(PC_B16, hidx, hn);
+        sb_printf(&fn.body, "\tcvt.u16.u32 %s, %s;\n", hn, a);
+        PtxVal dv = {.cls = PC_F32, .idx = new_reg(&fn, PC_F32)};
+        char dn[24];
+        reg_name(PC_F32, dv.idx, dn);
+        sb_printf(&fn.body, "\tcvt.f32.f16 %s, %s;\n", dn, hn);
+        if (in->dest.name)
+          bind_value(&fn, in->dest.name, dv);
+      } else if (callee && in->argument_count >= 1 && !strcmp(callee, "f2h")) {
+        /* f2h(x): float32 -> uint16 fp16 bit-pattern (cvt.rn.f16.f32), returned
+         * zero-extended in a 32-bit int so a uint16 store writes the low 16. */
+        char a[24];
+        use_as(&fn, &in->arguments[0], PC_F32, a);
+        int hidx = new_reg(&fn, PC_B16);
+        char hn[24];
+        reg_name(PC_B16, hidx, hn);
+        sb_printf(&fn.body, "\tcvt.rn.f16.f32 %s, %s;\n", hn, a);
+        PtxVal dv = {.cls = PC_B32, .is_unsigned = 1, .idx = new_reg(&fn, PC_B32)};
+        char dn[24];
+        reg_name(PC_B32, dv.idx, dn);
+        sb_printf(&fn.body, "\tcvt.u32.u16 %s, %s;\n", dn, hn);
+        if (in->dest.name)
+          bind_value(&fn, in->dest.name, dv);
       } else if (callee && in->argument_count >= 1 &&
                  (!strcmp(callee, "sqrtf") || !strcmp(callee, "expf") ||
                   !strcmp(callee, "sinf") || !strcmp(callee, "cosf") ||
@@ -902,8 +943,9 @@ static void emit_function(IRProgram *program, size_t fi, CodeGenerator *gen,
   /* --- assemble: signature { reg-decls body } --- */
   fputs(sig.data, out);
   fputs("{\n", out);
-  static const PtxClass classes[5] = {PC_PRED, PC_B32, PC_B64, PC_F32, PC_F64};
-  for (int c = 0; c < 5; c++) {
+  static const PtxClass classes[6] = {PC_PRED, PC_B16, PC_B32,
+                                      PC_B64,  PC_F32, PC_F64};
+  for (int c = 0; c < 6; c++) {
     PtxClass cc = classes[c];
     if (fn.count[cc] > 0) {
       fprintf(out, "\t.reg %s %s<%d>;\n", cls_regtype(cc), cls_prefix(cc),
@@ -945,7 +987,10 @@ static void emit_binary(PtxFn *fn, const IRInstruction *in) {
       c = PC_B64;
     }
     if (!is_float) {
-      is_unsigned = la.is_unsigned && ra.is_unsigned;
+      /* C "usual arithmetic conversions": if either operand is unsigned the
+       * comparison is unsigned. (Integer literals carry is_unsigned=0, so `&&`
+       * here would wrongly make `unsigned_var < 10` a signed compare.) */
+      is_unsigned = la.is_unsigned || ra.is_unsigned;
     }
     char a[24], b[24];
     use_as(fn, &in->lhs, c, a);
@@ -981,7 +1026,11 @@ static void emit_binary(PtxFn *fn, const IRInstruction *in) {
     dv.elem = la.is_ptr ? la.elem : ra.elem;
   } else {
     dv.cls = (la.cls == PC_B64 || ra.cls == PC_B64) ? PC_B64 : PC_B32;
-    dv.is_unsigned = la.is_unsigned && ra.is_unsigned;
+    /* Unsigned if either operand is unsigned (C usual arithmetic conversions).
+     * `&&` is wrong: integer literals are is_unsigned=0, so `unsigned_var / 7`
+     * or `unsigned_var >> 3` would emit signed div/shr and miscompute for
+     * high-bit-set values. */
+    dv.is_unsigned = la.is_unsigned || ra.is_unsigned;
   }
 
   char a[24], b[24];
@@ -1026,9 +1075,12 @@ static void emit_binary(PtxFn *fn, const IRInstruction *in) {
     use_as(fn, &in->rhs, PC_B32, sh);
     sb_printf(&fn->body, "\tshl.%s %s, %s, %s;\n", bts, dn, a, sh);
   } else if (!strcmp(t, ">>")) {
+    /* Arithmetic (signed) vs logical (unsigned) shift is decided by the value
+     * being shifted -- the left operand -- not the shift count. */
     char sh[24];
     use_as(fn, &in->rhs, PC_B32, sh);
-    sb_printf(&fn->body, "\tshr.%s %s, %s, %s;\n", ts, dn, a, sh);
+    sb_printf(&fn->body, "\tshr.%s %s, %s, %s;\n",
+              type_suffix_for_class(dv.cls, la.is_unsigned), dn, a, sh);
   } else {
     fn_error(fn, "PTX: unsupported binary op '%s'", t);
   }
