@@ -10,6 +10,16 @@
 
 #define IR_PROFILE_ID_NONE UINT32_MAX
 
+/* `@simd` loop markers. A marker is an IR_OP_NOP whose `text` is
+ * "@@simd:B:<id>:<mode>" (emitted just before a vectorization-requested loop)
+ * or "@@simd:E:<id>:0" (just after it); <mode> is a SimdAttr. NOP is skipped by
+ * every recognizer and is a no-op in every backend, so the marker never
+ * perturbs vectorization or codegen. The release-stage contract verifier
+ * (ir_optimize_simd_contract.c) pairs B/E by nesting, checks whether a SIMD
+ * intrinsic landed between them, enforces the contract, and clears the
+ * markers. Emitted by ir_lowering.c. */
+#define IR_SIMD_MARKER_PREFIX "@@simd:"
+
 typedef enum {
   IR_OPERAND_NONE,
   IR_OPERAND_TEMP,
@@ -287,6 +297,9 @@ IRProgram *ir_lower_program(ASTNode *program, TypeChecker *type_checker,
                             SymbolTable *symbol_table, char **error_message,
                             int emit_runtime_checks);
 int ir_program_dump(IRProgram *program, FILE *output);
+/* Human-readable mnemonic for an opcode (e.g. "simd_dot_i8"), used by dumps and
+ * the `--simd-report` diagnostics. */
+const char *ir_opcode_name(IROpcode op);
 int ir_instruction_dump(const IRInstruction *instruction,
                         char *buffer, size_t capacity);
 

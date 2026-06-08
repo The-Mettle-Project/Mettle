@@ -735,6 +735,41 @@ ASTNode *parser_parse_statement(Parser *parser) {
   if (!parser)
     return NULL;
 
+  // Vectorization attribute on a loop: `@simd` / `@simd!`.
+  //   @simd  for i in 0..n { ... }   -> best-effort hint (warn if not vectorized)
+  //   @simd! for i in 0..n { ... }   -> hard contract (compile error otherwise)
+  // The attribute may sit in front of a label too: `@simd outer: for ...`.
+  if (parser->current_token.type == TOKEN_AT) {
+    parser_advance(parser); // consume '@'
+    if (!parser_is_identifier_like(parser->current_token.type) ||
+        strcmp(parser->current_token.value, "simd") != 0) {
+      parser_set_error(parser, "Expected 'simd' after '@'");
+      return NULL;
+    }
+    parser_advance(parser); // consume 'simd'
+
+    int simd_mode = SIMD_ATTR_HINT;
+    if (parser->current_token.type == TOKEN_NOT) {
+      simd_mode = SIMD_ATTR_CONTRACT;
+      parser_advance(parser); // consume '!'
+    }
+
+    ASTNode *loop = parser_parse_statement(parser);
+    if (!loop)
+      return NULL;
+    if (loop->type == AST_FOR_STATEMENT) {
+      ((ForStatement *)loop->data)->simd_mode = simd_mode;
+    } else if (loop->type == AST_WHILE_STATEMENT) {
+      ((WhileStatement *)loop->data)->simd_mode = simd_mode;
+    } else {
+      parser_set_error(parser,
+                       "'@simd' must be applied to a 'for' or 'while' loop");
+      ast_destroy_node(loop);
+      return NULL;
+    }
+    return loop;
+  }
+
   // Labeled loop: IDENT ':' (while | for)
   if (parser->current_token.type == TOKEN_IDENTIFIER &&
       parser->peek_token.type == TOKEN_COLON) {
@@ -3618,6 +3653,7 @@ ASTNode *parser_parse_while_statement(Parser *parser) {
   while_data->condition = condition;
   while_data->body = body;
   while_data->label = NULL;
+  while_data->simd_mode = SIMD_ATTR_NONE;
   while_node->data = while_data;
 
   ast_add_child(while_node, condition);
@@ -3658,6 +3694,124 @@ ASTNode *parser_parse_continue_statement(Parser *parser) {
   return parser_parse_break_or_continue(parser, TOKEN_CONTINUE);
 }
 
+// Range-based for: `for i [: type] in start ..|..= end { body }`.
+// Desugars at parse time into a classic counted ForStatement so every
+// downstream stage (type checker, IR lowering, the counted-loop vectorizer)
+// sees the exact shape it already handles:
+//
+//   for i in lo..hi   =>  var i = lo;  i <  hi;  i = i + 1
+//   for i in lo..=hi  =>  var i = lo;  i <= hi;  i = i + 1
+//
+// The `start` bound is evaluated once (the loop initializer); the `end` bound
+// is re-evaluated in the condition each iteration, matching Mettle's C-style
+// `for`/`while` semantics. Hoist a call-valued bound yourself if that matters.
+// `in` is a contextual keyword (a plain identifier elsewhere), so adding this
+// form breaks no existing program that uses `in` as a name.
+static ASTNode *parser_parse_range_for(Parser *parser, SourceLocation location) {
+  if (!parser_is_identifier_like(parser->current_token.type)) {
+    parser_set_error(parser, "Expected '(' or a loop variable after 'for'");
+    return NULL;
+  }
+  char *var_name = strdup(parser->current_token.value);
+  parser_advance(parser);
+
+  // Optional type annotation: `for i: int64 in ...`. Without one, the variable
+  // type is inferred from the start bound (same rule as `var i = <expr>`).
+  char *type_name = NULL;
+  if (parser->current_token.type == TOKEN_COLON) {
+    parser_advance(parser);
+    type_name = parser_parse_type_annotation(parser);
+    if (!type_name) {
+      if (!parser->has_error)
+        parser_set_error(parser, "Expected type after ':'");
+      free(var_name);
+      return NULL;
+    }
+  }
+
+  // Contextual `in`.
+  if (!parser_is_identifier_like(parser->current_token.type) ||
+      strcmp(parser->current_token.value, "in") != 0) {
+    parser_set_error(parser, "Expected 'in' in range-based for loop");
+    free(var_name);
+    free(type_name);
+    return NULL;
+  }
+  parser_advance(parser);
+
+  ASTNode *start = parser_parse_expression(parser);
+  if (!start) {
+    free(var_name);
+    free(type_name);
+    return NULL;
+  }
+
+  if (parser->current_token.type != TOKEN_DOT_DOT) {
+    parser_set_error(parser, "Expected '..' or '..=' in range-based for loop");
+    free(var_name);
+    free(type_name);
+    ast_destroy_node(start);
+    return NULL;
+  }
+  parser_advance(parser); // consume '..'
+  int inclusive = 0;
+  if (parser->current_token.type == TOKEN_EQUALS) {
+    inclusive = 1;
+    parser_advance(parser); // consume '=' of '..='
+  }
+
+  ASTNode *end = parser_parse_expression(parser);
+  if (!end) {
+    free(var_name);
+    free(type_name);
+    ast_destroy_node(start);
+    return NULL;
+  }
+
+  ASTNode *body = (parser->current_token.type == TOKEN_LBRACE)
+                      ? parser_parse_block(parser)
+                      : parser_parse_statement(parser);
+  if (!body) {
+    free(var_name);
+    free(type_name);
+    ast_destroy_node(start);
+    ast_destroy_node(end);
+    return NULL;
+  }
+
+  // initializer: var <name>[: type] = <start>
+  ASTNode *initializer =
+      ast_create_var_declaration(var_name, type_name, start, location);
+  // condition: <name> <  <end>   (exclusive)
+  //            <name> <= <end>   (inclusive)
+  ASTNode *condition = ast_create_binary_expression(
+      ast_create_identifier(var_name, location), inclusive ? "<=" : "<", end,
+      location);
+  // increment: <name> = <name> + 1
+  ASTNode *step_value = ast_create_binary_expression(
+      ast_create_identifier(var_name, location), "+",
+      ast_create_number_literal(1, location, 10), location);
+  ASTNode *increment = ast_create_assignment(var_name, step_value, location);
+
+  free(var_name);
+  free(type_name);
+
+  if (!initializer || !condition || !increment) {
+    if (initializer)
+      ast_destroy_node(initializer);
+    if (condition)
+      ast_destroy_node(condition);
+    if (increment)
+      ast_destroy_node(increment);
+    ast_destroy_node(body);
+    parser_set_error(parser, "Out of memory desugaring range-based for loop");
+    return NULL;
+  }
+
+  return ast_create_for_statement(initializer, condition, increment, body,
+                                  location);
+}
+
 ASTNode *parser_parse_for_statement(Parser *parser) {
   if (!parser)
     return NULL;
@@ -3665,6 +3819,12 @@ ASTNode *parser_parse_for_statement(Parser *parser) {
   SourceLocation location = parser_current_location(parser);
   if (!parser_expect(parser, TOKEN_FOR)) {
     return NULL;
+  }
+
+  // The classic C-style form always opens with '('. Anything else starts a
+  // range-based loop: `for i in lo..hi { ... }`.
+  if (parser->current_token.type != TOKEN_LPAREN) {
+    return parser_parse_range_for(parser, location);
   }
 
   if (!parser_expect(parser, TOKEN_LPAREN)) {

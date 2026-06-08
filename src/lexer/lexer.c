@@ -810,6 +810,9 @@ Token lexer_next_token(Lexer *lexer) {
   case ';':
     token.type = TOKEN_SEMICOLON;
     break;
+  case '@':
+    token.type = TOKEN_AT;
+    break;
   case ',':
     token.type = TOKEN_COMMA;
     break;

@@ -98,6 +98,7 @@ typedef enum {
   TOKEN_NOT,
   TOKEN_DOT,
   TOKEN_DOT_DOT,
+  TOKEN_AT,
   TOKEN_NEWLINE,
 
   // Common x86 mnemonics (for backward compatibility)

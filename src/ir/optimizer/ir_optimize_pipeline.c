@@ -312,6 +312,12 @@ int ir_optimize_function_pipeline(IRFunction *function) {
     return 0;
   }
 
+  /* Enforce `@simd` contracts now that every vectorizer has had its chance,
+   * then strip the markers before CFG rebuild / codegen. */
+  if (!ir_verify_simd_contracts(function)) {
+    return 0;
+  }
+
   return ir_function_rebuild_cfg(function);
 }
 
@@ -340,6 +346,8 @@ int ir_optimize_program_pipeline(IRProgram *program,
     return 0;
   }
 
+  ir_optimize_reset_user_error();
+  ir_optimize_set_simd_report(options && options->simd_report);
   ir_function_index_reset();
 
   if (!ir_run_program_stage_for_each_function(
@@ -359,7 +367,11 @@ int ir_optimize_program_pipeline(IRProgram *program,
 
   if (!ir_run_program_stage_for_each_function(
           program, ir_optimize_function_pipeline)) {
-    mettle_compiler_ice_report("IR optimization failed", NULL);
+    /* A violated `@simd!` contract already printed a user diagnostic; don't
+     * dress it up as an internal compiler error. */
+    if (!ir_optimize_had_user_error()) {
+      mettle_compiler_ice_report("IR optimization failed", NULL);
+    }
     ir_function_index_reset();
     return 0;
   }

@@ -1,0 +1,25 @@
+// Range-based for loops: exclusive `..`, inclusive `..=`, typed induction
+// variable, variable bound, and a labeled range-for with break.
+import "std/io";
+
+function main() -> int32 {
+  var a: int32 = 0;
+  for i in 0..5 { a = a + i; }          // 0+1+2+3+4 = 10
+
+  var b: int32 = 0;
+  for i in 0..=5 { b = b + i; }         // 0+..+5 = 15
+
+  var n: int64 = 4;
+  var c: int64 = 0;
+  for i: int64 in 0..n { c = c + i; }   // 0+1+2+3 = 6
+
+  var d: int32 = 0;
+  outer: for i in 0..100 {
+    if (i == 10) { break outer; }
+    d = d + 1;
+  }                                      // 10
+
+  print_int((int64)(a + b) + c + (int64)d); // 10+15+6+10 = 41
+  println("");
+  return 0;
+}

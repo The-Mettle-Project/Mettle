@@ -143,6 +143,28 @@ $cases = @(
   @{ Name = "switch_const_expr"; Path = "tests/test_switch_const_expr.mettle"; ShouldSucceed = $true },
   @{ Name = "switch_continue_loop"; Path = "tests/test_switch_continue_loop.mettle"; ShouldSucceed = $true },
   @{ Name = "switch_range"; Path = "tests/test_switch_range.mettle"; ShouldSucceed = $true },
+  @{ Name = "range_for"; Path = "tests/test_range_for.mettle"; ShouldSucceed = $true },
+  @{
+    Name          = "simd_contract"
+    Path          = "tests/test_simd_contract.mettle"
+    ShouldSucceed = $true
+    Args          = @("-O")
+    IrMustMatch   = @("dot_i8\(")
+  },
+  @{
+    Name          = "err_simd_contract"
+    Path          = "tests/err_simd_contract.mettle"
+    ShouldSucceed = $false
+    Args          = @("-O")
+    Pattern       = "@simd! loop was not vectorized: the loop body contains a function call"
+  },
+  @{
+    Name          = "err_simd_contract_cf"
+    Path          = "tests/err_simd_contract_cf.mettle"
+    ShouldSucceed = $false
+    Args          = @("-O")
+    Pattern       = "@simd! loop was not vectorized: the loop body has its own control flow"
+  },
   @{ Name = "const_top_level"; Path = "tests/test_const_top_level.mettle"; ShouldSucceed = $true },
   @{ Name = "err_const_no_init"; Path = "tests/err_const_no_init.mettle"; ShouldSucceed = $false; Pattern = "Constant declaration requires an initializer" },
   @{ Name = "err_const_assign"; Path = "tests/err_const_assign.mettle"; ShouldSucceed = $false; Pattern = "is a constant and cannot be assigned to" },
@@ -830,7 +852,9 @@ foreach ($case in $cases) {
       $caseArgs += "--dump-ir"
     }
 
-    $output = & $CompilerPath @caseArgs $case.Path -o $outFile 2>&1 | Out-String
+    # -Width 4096: keep each diagnostic on one logical line so multi-word
+    # Pattern matches aren't broken by console-width line wrapping.
+    $output = & $CompilerPath @caseArgs $case.Path -o $outFile 2>&1 | Out-String -Width 4096
     $exitCode = $LASTEXITCODE
 
     $passed = $true

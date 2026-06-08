@@ -511,6 +511,17 @@ static int ir_inline_call_instruction(IRInstructionVector *vector,
     const IRInstruction *source = &callee->instructions[i];
     IRInstruction emitted = {0};
 
+    /* `@simd` contracts are enforced at the loop's definition site (the
+     * standalone callee, which the function pipeline verifies independently).
+     * Don't carry the markers into an inlined copy: after inlining the loop may
+     * no longer satisfy a recognizer's preconditions (e.g. dot_i8 requires the
+     * array bases to be parameters), and the user never wrote that copy. */
+    if (source->op == IR_OP_NOP && source->text &&
+        strncmp(source->text, IR_SIMD_MARKER_PREFIX,
+                strlen(IR_SIMD_MARKER_PREFIX)) == 0) {
+      continue;
+    }
+
     if (source->op == IR_OP_RETURN) {
       if (source->lhs.kind != IR_OPERAND_NONE &&
           call_instruction->dest.kind != IR_OPERAND_NONE) {

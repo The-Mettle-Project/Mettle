@@ -665,7 +665,7 @@ int ir_program_add_function(IRProgram *program, IRFunction *function) {
   return 1;
 }
 
-static const char *ir_opcode_name(IROpcode op) {
+const char *ir_opcode_name(IROpcode op) {
   switch (op) {
   case IR_OP_NOP:
     return "nop";

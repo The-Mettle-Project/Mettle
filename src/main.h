@@ -27,6 +27,7 @@ typedef struct {
   int emit_ptx; /* --emit-ptx: lower every function to a PTX .entry, no object */
   int optimize;
   int release;
+  int simd_report; /* --simd-report: note what each `@simd` loop became */
   int emit_object;
   int generate_debug_symbols;
   int generate_line_mapping;

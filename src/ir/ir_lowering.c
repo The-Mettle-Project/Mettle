@@ -28,6 +28,9 @@ typedef struct {
    * single/double precision (literals always infer to float64 otherwise). */
   const char *current_return_type_name;
   const char *current_function_name;
+  /* Monotonic id handed to each `@simd` loop's begin/end marker pair so the
+   * release-stage contract verifier can match them. */
+  int next_simd_request_id;
 } IRLoweringContext;
 
 typedef struct {
@@ -172,6 +175,31 @@ static int ir_emit_label_instruction(IRLoweringContext *context,
   instruction.op = IR_OP_LABEL;
   instruction.location = location;
   instruction.text = (char *)label;
+  return ir_emit(context, function, &instruction);
+}
+
+// `@simd` loop markers. A marker is an IR_OP_NOP carrying a sentinel string in
+// `text`: "@@simd:B:<id>:<mode>" before a vectorization-requested loop and
+// "@@simd:E:<id>:0" after it. NOP is transparent to every recognizer (they skip
+// NOPs) and a no-op in every backend, so the marker never disturbs codegen or
+// vectorization; the release-stage contract verifier (see ir_optimize) pairs
+// B/E by id, checks whether a SIMD intrinsic landed between them, and then
+// clears the markers. `which` is 'B' or 'E'; `mode` is a SimdAttr.
+// (IR_SIMD_MARKER_PREFIX and the text format live in ir.h.)
+
+static int ir_emit_simd_marker(IRLoweringContext *context, IRFunction *function,
+                               char which, int id, int mode,
+                               SourceLocation location) {
+  if (!context || !function) {
+    return 0;
+  }
+  char buffer[48];
+  snprintf(buffer, sizeof(buffer), IR_SIMD_MARKER_PREFIX "%c:%d:%d", which, id,
+           mode);
+  IRInstruction instruction = {0};
+  instruction.op = IR_OP_NOP;
+  instruction.location = location;
+  instruction.text = buffer; // ir_emit deep-copies text
   return ir_emit(context, function, &instruction);
 }
 
@@ -4456,6 +4484,17 @@ static int ir_lower_statement_with_defers(IRLoweringContext *context,
       return 0;
     }
 
+    int while_simd_id = -1;
+    if (while_data->simd_mode != SIMD_ATTR_NONE) {
+      while_simd_id = context->next_simd_request_id++;
+      if (!ir_emit_simd_marker(context, function, 'B', while_simd_id,
+                               while_data->simd_mode, statement->location)) {
+        free(loop_start);
+        free(loop_end);
+        return 0;
+      }
+    }
+
     if (!ir_emit_label_instruction(context, function, loop_start,
                                    statement->location)) {
       free(loop_start);
@@ -4495,6 +4534,14 @@ static int ir_lower_statement_with_defers(IRLoweringContext *context,
       return 0;
     }
 
+    if (while_simd_id >= 0 &&
+        !ir_emit_simd_marker(context, function, 'E', while_simd_id, 0,
+                             statement->location)) {
+      free(loop_start);
+      free(loop_end);
+      return 0;
+    }
+
     free(loop_start);
     free(loop_end);
     return 1;
@@ -4516,6 +4563,18 @@ static int ir_lower_statement_with_defers(IRLoweringContext *context,
       free(end_label);
       ir_set_error(context, "Out of memory while allocating for-loop labels");
       return 0;
+    }
+
+    int for_simd_id = -1;
+    if (for_data->simd_mode != SIMD_ATTR_NONE) {
+      for_simd_id = context->next_simd_request_id++;
+      if (!ir_emit_simd_marker(context, function, 'B', for_simd_id,
+                               for_data->simd_mode, statement->location)) {
+        free(condition_label);
+        free(step_label);
+        free(end_label);
+        return 0;
+      }
     }
 
     if (!ir_lower_statement_or_expression(context, function,
@@ -4582,6 +4641,15 @@ static int ir_lower_statement_with_defers(IRLoweringContext *context,
                                   statement->location) ||
         !ir_emit_label_instruction(context, function, end_label,
                                    statement->location)) {
+      free(condition_label);
+      free(step_label);
+      free(end_label);
+      return 0;
+    }
+
+    if (for_simd_id >= 0 &&
+        !ir_emit_simd_marker(context, function, 'E', for_simd_id, 0,
+                             statement->location)) {
       free(condition_label);
       free(step_label);
       free(end_label);

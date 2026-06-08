@@ -82,7 +82,18 @@ int ir_label_is_while_header(const char *label) {
   if (strncmp(label, "ir_while_", 9) == 0) {
     return 1;
   }
-  return strstr(label, "_lbl_ir_while_") != NULL;
+  if (strstr(label, "_lbl_ir_while_") != NULL) {
+    return 1;
+  }
+  /* Counted `for` loops (including desugared range-for, `for i in lo..hi`)
+   * lower to the same header/compare/branch_zero/body/increment/back-jump shape
+   * as a `while` once the unused step label is cleaned up. Treat their cond
+   * header as a loop header too so every vectorizer considers them; each
+   * recognizer still fully validates the loop's structure before firing. */
+  if (strncmp(label, "ir_for_cond_", 12) == 0) {
+    return 1;
+  }
+  return strstr(label, "_lbl_ir_for_cond_") != NULL;
 }
 
 int ir_loop_body_has_nested_while(IRFunction *function, size_t start,

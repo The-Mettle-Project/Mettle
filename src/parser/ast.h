@@ -246,10 +246,18 @@ typedef struct {
   ASTNode *else_branch;
 } IfStatement;
 
+// SIMD vectorization attribute on a loop (`@simd` / `@simd!`).
+typedef enum {
+  SIMD_ATTR_NONE = 0,     // no attribute
+  SIMD_ATTR_HINT = 1,     // `@simd`  : best-effort; warn if it can't vectorize
+  SIMD_ATTR_CONTRACT = 2  // `@simd!` : hard contract; compile error if it can't
+} SimdAttr;
+
 typedef struct {
   ASTNode *condition;
   ASTNode *body;
   char *label; // Optional label for labeled break/continue; NULL if unlabeled
+  int simd_mode; // SimdAttr: vectorization attribute requested on this loop
 } WhileStatement;
 
 typedef struct {
@@ -258,6 +266,7 @@ typedef struct {
   ASTNode *increment;
   ASTNode *body;
   char *label; // Optional label
+  int simd_mode; // SimdAttr: vectorization attribute requested on this loop
 } ForStatement;
 
 typedef struct {

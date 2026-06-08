@@ -486,6 +486,7 @@ ASTNode *ast_clone_node(ASTNode *node) {
     dst->condition = src->condition ? ast_clone_node(src->condition) : NULL;
     dst->body = src->body ? ast_clone_node(src->body) : NULL;
     dst->label = ast_copy_string(src->label);
+    dst->simd_mode = src->simd_mode;
     if (dst->condition)
       ast_add_child(clone, dst->condition);
     if (dst->body)
@@ -506,6 +507,7 @@ ASTNode *ast_clone_node(ASTNode *node) {
     dst->increment = src->increment ? ast_clone_node(src->increment) : NULL;
     dst->body = src->body ? ast_clone_node(src->body) : NULL;
     dst->label = ast_copy_string(src->label);
+    dst->simd_mode = src->simd_mode;
     if (dst->initializer)
       ast_add_child(clone, dst->initializer);
     if (dst->condition)
@@ -1788,6 +1790,7 @@ ASTNode *ast_create_for_statement(ASTNode *initializer, ASTNode *condition,
   for_stmt->increment = increment;
   for_stmt->body = body;
   for_stmt->label = NULL;
+  for_stmt->simd_mode = SIMD_ATTR_NONE;
   node->data = for_stmt;
 
   if (initializer)

@@ -412,6 +412,17 @@ int ir_operand_resolve_symbol_int(const IRSymbolValueMap *symbol_map,
 int ir_optimize_function_pipeline(IRFunction *function);
 int ir_optimize_program_pipeline(IRProgram *program,
                                  const IROptimizeOptions *options);
+/* Enforce `@simd` / `@simd!` loop attributes after vectorization has run.
+ * Returns 1 if every contract was honored (and clears all `@simd` markers),
+ * 0 if a `@simd!` contract was violated (after printing a diagnostic). */
+int ir_verify_simd_contracts(IRFunction *function);
+/* Resets/queries the "a @simd! contract was violated" flag so the driver can
+ * distinguish a user error from an internal compiler error.
+ * (ir_optimize_had_user_error is also declared in the public ir_optimize.h.) */
+void ir_optimize_reset_user_error(void);
+int ir_optimize_had_user_error(void);
+/* --simd-report: emit a note for every `@simd` loop (vectorized or not). */
+void ir_optimize_set_simd_report(int enabled);
 int ir_optimize_pre_inline_function(IRFunction *function);
 int ir_pass_is_skipped(IROptPassId pass_id);
 int ir_pointer_induction_pass(IRFunction *function, int *changed);
