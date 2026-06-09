@@ -113,6 +113,24 @@ static int ir_float_sum_type_matches(const char *sum_type, int width_bits) {
   return strcmp(sum_type, "float32") == 0;
 }
 
+/* Declared type of a function parameter by name, or NULL. (Locals come from
+ * ir_function_local_declared_type, which does not see params -- they aren't
+ * DECLARE_LOCAL'd.) */
+static const char *ir_function_param_declared_type(const IRFunction *function,
+                                                   const char *name) {
+  if (!function || !name || !function->parameter_names ||
+      !function->parameter_types) {
+    return NULL;
+  }
+  for (size_t i = 0; i < function->parameter_count; i++) {
+    if (function->parameter_names[i] &&
+        strcmp(function->parameter_names[i], name) == 0) {
+      return function->parameter_types[i];
+    }
+  }
+  return NULL;
+}
+
 static int ir_float_scalar_operand_matches(IRFunction *function,
                                            const IROperand *operand,
                                            int width_bits) {
@@ -123,8 +141,14 @@ static int ir_float_scalar_operand_matches(IRFunction *function,
     return operand->float_bits == width_bits;
   }
   if (operand->kind == IR_OPERAND_SYMBOL && operand->name) {
-    return ir_float_sum_type_matches(
-        ir_function_local_declared_type(function, operand->name), width_bits);
+    /* A scalar coefficient may be a local OR a parameter (e.g. saxpy's `a` in
+     * `y[i] = a*x[i] + y[i]` when `a` is a function arg). The kernel reads it as
+     * a symbol either way; only the float width must match. */
+    const char *ty = ir_function_local_declared_type(function, operand->name);
+    if (!ty) {
+      ty = ir_function_param_declared_type(function, operand->name);
+    }
+    return ir_float_sum_type_matches(ty, width_bits);
   }
   return 0;
 }

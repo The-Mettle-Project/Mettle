@@ -2907,6 +2907,26 @@ catch {
   Write-CaseResult -Name "direct_object_uint32_signed_in_large_fn_release" -Passed $false -Reason $_.Exception.Message
 }
 
+# Vectorizer coverage: saxpy with a parameter scale now lowers to
+# simd_affine_map_f32; verify the vectorized output matches a scalar reference
+# at --release (exit 0 == within f32 tolerance).
+$total++
+try {
+  $exePath = Join-Path $tmpDir "saxpy_vectorized.exe"
+  $buildOut = & $CompilerPath --build --release "tests/test_saxpy_vectorized.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "release build failed: $buildOut" }
+  if (-not (Test-Path $exePath)) { throw "release build produced no executable" }
+  & $exePath 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "vectorized saxpy diverged from scalar reference (exit $LASTEXITCODE)"
+  }
+  Write-CaseResult -Name "simd_saxpy_vectorized" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "simd_saxpy_vectorized" -Passed $false -Reason $_.Exception.Message
+}
+
 # Direct object backend globals: scalar definitions plus extern-global symbol emission
 $total++
 try {

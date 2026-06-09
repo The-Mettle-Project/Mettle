@@ -1,0 +1,22 @@
+// Coverage + correctness: saxpy with a PARAMETER scale `a` now vectorizes
+// (simd_affine_map_f32). Verify the vectorized result matches a scalar CPU
+// reference within f32 tolerance (the kernel fuses to FMA, ~1 ULP from
+// separate mul+add). Returns 0 on success.
+function saxpy(y: float32*, x: float32*, a: float32, n: int32) {
+  for i in 0..n { y[i] = a * x[i] + y[i]; }
+}
+function main() -> int32 {
+  var n: int32 = 1000;
+  var x: float32[1000];
+  var y: float32[1000];
+  for i in 0..n { x[i] = (float32)i * 0.5; y[i] = (float32)(n - i); }
+  saxpy(&y[0], &x[0], 3.0, n);
+  var bad: int32 = 0;
+  for i in 0..n {
+    var ref: float32 = (float32)3.0 * ((float32)i * 0.5) + (float32)(n - i);
+    var d: float32 = y[i] - ref;
+    if (d < 0.0) { d = 0.0 - d; }
+    if (d > 0.05) { bad = bad + 1; }
+  }
+  return bad;
+}
