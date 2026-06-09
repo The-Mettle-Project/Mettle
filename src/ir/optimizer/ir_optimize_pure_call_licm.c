@@ -82,14 +82,40 @@ static int pure_licm_operand_invariant(const IRFunction *function, size_t lo,
   }
 }
 
-/* Every instruction between the header and the back-edge must be free of side
- * effects that could perturb a pure callee's memory reads or be unsafe to
- * evaluate once up front. A pure call is itself allowed (it is what we may
- * hoist, and a second pure call does not invalidate the first). */
-static int pure_licm_body_hoist_safe(const IRFunction *function,
-                                     IRProgram *program, size_t lo, size_t hi) {
+/* A write to a symbol that is neither a parameter nor a declared local of
+ * `function` targets a global. A `@pure` callee may read globals, so a global
+ * write inside the loop body -- or inside the callee itself -- can change what a
+ * hoisted call observes; the arg-invariance test only covers the call's explicit
+ * arguments. Treat such a write as a side effect. (A global write lowers to an
+ * ASSIGN to a `@name` symbol, not an IR_OP_STORE, so the no-store rule below
+ * would not catch it on its own -- this was a real `@pure`-LICM miscompile.) */
+static int pure_licm_writes_global(const IRFunction *function,
+                                   const IRInstruction *inst) {
+  if (!ir_instruction_writes_symbol(inst) || !inst->dest.name) {
+    return 0;
+  }
+  if (ir_function_symbol_is_parameter(function, inst->dest.name)) {
+    return 0;
+  }
+  return ir_function_local_declared_type(function, inst->dest.name) == NULL;
+}
+
+/* Every instruction in [lo, hi) of `function` must be free of side effects that
+ * could perturb a pure callee's memory reads or be unsafe to evaluate once up
+ * front: no memory STORE, allocation, inline-asm, indirect call, call to a
+ * non-pure function, and no write to a global. A pure call is itself allowed (it
+ * is what we may hoist, and a second pure call does not invalidate the first),
+ * as is a noreturn trap guard. Used both for the caller's loop body and -- to
+ * sanity-check the unverified `@pure` contract before trusting it -- for the
+ * candidate callee's own body. */
+static int pure_licm_range_side_effect_free(IRProgram *program,
+                                            const IRFunction *function,
+                                            size_t lo, size_t hi) {
   for (size_t k = lo; k < hi; k++) {
     const IRInstruction *inst = &function->instructions[k];
+    if (pure_licm_writes_global(function, inst)) {
+      return 0;
+    }
     switch (inst->op) {
     case IR_OP_NOP:
     case IR_OP_LABEL:
@@ -126,6 +152,18 @@ static int pure_licm_body_hoist_safe(const IRFunction *function,
   return 1;
 }
 
+/* The callee carries `@pure`, but that contract is unverified. Before relying on
+ * it to lift a call out of a loop, confirm the callee's body has no observable
+ * side effect of its own. This rejects a function mislabeled `@pure` that, e.g.,
+ * mutates a global: hoisting its call would change how many times that effect
+ * runs (a real miscompile). The check trusts nested `@pure` callees one level
+ * deep (it does not recurse), matching the loop-body rule. */
+static int pure_licm_callee_hoistable(IRProgram *program,
+                                      const IRFunction *callee) {
+  return callee && pure_licm_range_side_effect_free(
+                       program, callee, 0, callee->instruction_count);
+}
+
 /* This loop's back-edge is the LAST `jump <loop_label>` in the function. Using
  * the last (not the first) jump guarantees [header, backedge) spans the whole
  * body even when a `continue` also jumps back to the header from the middle. */
@@ -156,7 +194,7 @@ static int pure_licm_hoist_one(IRProgram *program, IRFunction *function) {
     if (backedge == (size_t)-1 || backedge <= i + 1) {
       continue;
     }
-    if (!pure_licm_body_hoist_safe(function, program, i + 1, backedge)) {
+    if (!pure_licm_range_side_effect_free(program, function, i + 1, backedge)) {
       continue;
     }
 
@@ -171,6 +209,12 @@ static int pure_licm_hoist_one(IRProgram *program, IRFunction *function) {
       }
       IRFunction *callee = ir_program_find_function(program, call->text);
       if (!callee || !callee->is_pure) {
+        continue;
+      }
+      /* Don't trust `@pure` blindly: if the callee's own body has a side
+       * effect (notably a global mutation), hoisting changes how often it
+       * runs. Keep the call in the loop. */
+      if (!pure_licm_callee_hoistable(program, callee)) {
         continue;
       }
       int all_invariant = 1;

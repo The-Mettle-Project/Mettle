@@ -27,13 +27,46 @@ import genprog  # noqa: E402
 REPRO_DIR = os.path.join(HERE, "repros")
 DEFAULT_COMPILER = os.path.join(HERE, "..", "..", "bin", "mettle.exe")
 
+# Pass lists for failure-time attribution (METTLE_SKIP_PASS bisection).
+# Names must match src/ir/optimizer (fixpoint list + named-sequence stages).
+SIMD_PASSES = [
+    "simd_sum_i32", "simd_sum_u8", "simd_byte_map", "simd_dot_i32",
+    "simd_dot_i8", "simd_slp_mac_i32", "simd_slp_mac_i8",
+    "simd_insertion_sort_i32", "simd_minmax_i32", "simd_affine_map_float",
+    "simd_exp_f32", "simd_i2f_reduce", "simd_dot_float", "simd_sum_float",
+    "auto_vectorize", "outer_vectorize", "simd_memory_map",
+]
+OTHER_PASSES = [
+    "inline_small_functions",
+    "reduction_unroll", "copy_and_constant_propagation",
+    "unroll_small_const_bound_loops", "coalesce_single_use_temp_assign",
+    "eliminate_single_use_float_symbol_copies", "sroa",
+    "common_subexpression_elimination", "constant_and_branch_simplify",
+    "eliminate_dead_temp_writes", "thread_jump_targets", "null_check_licm",
+    "hoist_pure_calls", "induction_pointer", "prefix_sum_i32",
+    "lower_bound_i32", "detect_shift_loops", "eliminate_congruent_ivs",
+    "positive_loop_div2_to_shift", "memcpy_inline",
+    "eliminate_load_symbol_copy", "fuse_rotate_add",
+    "strength_reduce_rotate_loops",
+]
 
-def build(compiler, src, out, release):
+
+def build(compiler, src, out, release, skip=None, no_mir=False):
     args = [compiler, "--build", "--emit-obj", "--linker", "internal"]
     if release:
         args.append("--release")
     args += [src, "-o", out]
-    p = subprocess.run(args, capture_output=True, text=True, timeout=120)
+    env = dict(os.environ)
+    if skip:
+        env["METTLE_SKIP_PASS"] = ",".join(skip)
+    else:
+        env.pop("METTLE_SKIP_PASS", None)
+    if no_mir:
+        env["METTLE_MIR"] = "0"
+    else:
+        env.pop("METTLE_MIR", None)
+    p = subprocess.run(args, capture_output=True, text=True, timeout=120,
+                       env=env)
     return p.returncode, (p.stdout + p.stderr)
 
 
@@ -48,6 +81,26 @@ def run(exe):
 def is_crash(code):
     # Windows fault exit codes are large negatives / 0xC0000005-style values.
     return isinstance(code, int) and (code < 0 or code > 255)
+
+
+def attribute(compiler, src, rel_exe, debug_rc):
+    """Bisect a divergence to an optimizer pass via METTLE_SKIP_PASS.
+    Returns a short human-readable attribution string."""
+    def rc_with(skip):
+        bc, _ = build(compiler, src, rel_exe, release=True, skip=skip)
+        if bc != 0:
+            return None
+        rc, _ = run(rel_exe)
+        return rc
+
+    for group_name, group in (("SIMD", SIMD_PASSES), ("other", OTHER_PASSES)):
+        if rc_with(SIMD_PASSES if group_name == "SIMD"
+                   else SIMD_PASSES + OTHER_PASSES) == debug_rc:
+            for name in group:
+                if rc_with([name]) == debug_rc:
+                    return f"pass={name}"
+            return f"pass-group={group_name} (no single pass; interaction?)"
+    return "backend/codegen (persists with all IR passes skipped)"
 
 
 def main():
@@ -95,8 +148,20 @@ def main():
         dbg_rc, _ = run(dbg)
         rel_rc, _ = run(rel)
 
+        # Backend-vs-backend oracle: the same unoptimized IR through the MIR
+        # and fallback backends must agree. A mismatch is a definite codegen
+        # bug in one of them, independent of (and invisible to) the
+        # debug-vs-release comparison when the buggy backend wins both.
+        fbk_bc, _ = build(args.compiler, src, dbg, release=False, no_mir=True)
+        fbk_rc = run(dbg)[0] if fbk_bc == 0 else None
+
         if dbg_rc != rel_rc:
-            save_repro(f"EXIT DIVERGENCE: debug={dbg_rc}, release={rel_rc}")
+            attr = attribute(args.compiler, src, rel, dbg_rc)
+            save_repro(f"EXIT DIVERGENCE: debug={dbg_rc}, release={rel_rc}"
+                       f" [{attr}]")
+        elif fbk_rc is not None and fbk_rc != dbg_rc:
+            save_repro(f"BACKEND DIVERGENCE at -O0: mir={dbg_rc},"
+                       f" fallback={fbk_rc}")
         elif is_crash(dbg_rc) and is_crash(rel_rc):
             save_repro(f"both crash (rc={dbg_rc}) -- possible UB in generator")
         elif args.keep:

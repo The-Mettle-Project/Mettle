@@ -201,6 +201,7 @@ $cases = @(
   @{ Name = "err_decorator_unknown"; Path = "tests/err_decorator_unknown.mettle"; ShouldSucceed = $false; Pattern = "Unknown decorator after" },
   @{ Name = "err_decorator_conflict"; Path = "tests/err_decorator_conflict.mettle"; ShouldSucceed = $false; Pattern = "mutually exclusive" },
   @{ Name = "err_decorator_on_struct"; Path = "tests/err_decorator_on_struct.mettle"; ShouldSucceed = $false; Pattern = "may only precede a function declaration" },
+  @{ Name = "err_decorator_after_export"; Path = "tests/err_decorator_after_export.mettle"; ShouldSucceed = $false; Pattern = "Decorators must precede 'export'" },
   @{ Name = "const_top_level"; Path = "tests/test_const_top_level.mettle"; ShouldSucceed = $true },
   @{ Name = "err_const_no_init"; Path = "tests/err_const_no_init.mettle"; ShouldSucceed = $false; Pattern = "Constant declaration requires an initializer" },
   @{ Name = "err_const_assign"; Path = "tests/err_const_assign.mettle"; ShouldSucceed = $false; Pattern = "is a constant and cannot be assigned to" },
@@ -1116,7 +1117,7 @@ $simdRuntimeCases = @(
     Name            = "simd_correctness_float"
     Path            = "tests\simd_correctness\simd_float_check.mettle"
     OutputMustMatch = "FLOAT SIMD: ALL OK"
-    IrMustMatch     = @("simd_sum_f64", "simd_sum_f32", "simd_dot_f64", "simd_dot_f32", "simd_affine_map_f64", "simd_affine_map_f32")
+    IrMustMatch     = @("simd_sum_f64", "simd_sum_f32", "simd_dot_f64", "simd_dot_f32", "simd_affine_map_f64", "simd_affine_map_f32", "simd_vloop_f64")
   },
   @{
     Name            = "simd_correctness_byte"
@@ -1781,6 +1782,81 @@ foreach ($relFlag in @($true, $false)) {
   catch {
     $failed++
     Write-CaseResult -Name "float32_narrowing_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# Float narrowing paths: the three sites that must cvtsd2ss a float64-tracked
+# value into a float32 destination (MIR store, MIR return, inliner param
+# assign) — each was a distinct silent miscompile found by the v2 fuzzer.
+# Built debug AND release: the store bug fired at -O0, the return bug at
+# release, the param bug in the fallback backend.
+foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")) {
+  $total++
+  try {
+    $exePath = Join-Path $tmpDir "test_float_narrowing_paths_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($variant -like "release*") { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_float_narrowing_paths.mettle", "-o", $exePath)
+
+    # *_fallback routes every function to the legacy backend; the
+    # inliner-param shape only miscompiled there (release_fallback = the
+    # inliner runs AND the fallback backend consumes its output).
+    if ($variant -like "*_fallback") { $env:METTLE_MIR = "0" }
+    try {
+      $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    }
+    finally {
+      if ($variant -like "*_fallback") { Remove-Item Env:\METTLE_MIR -ErrorAction SilentlyContinue }
+    }
+    if ($LASTEXITCODE -ne 0) {
+      throw "float-narrowing-paths build ($variant) failed: $buildOut"
+    }
+
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 1) {
+      throw "float-narrowing-paths ($variant) miscompiled (exit $LASTEXITCODE)"
+    }
+
+    Write-CaseResult -Name "float_narrowing_paths_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "float_narrowing_paths_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# Odd-sized struct copy: whole-struct assign of a 3-byte struct must copy
+# exactly 3 bytes; the fallback backend's 8-byte round-trip clobbered the
+# adjacent local. Run debug/release/fallback like the narrowing test.
+foreach ($variant in @("release", "debug", "debug_fallback")) {
+  $total++
+  try {
+    $exePath = Join-Path $tmpDir "test_struct_copy_odd_size_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($variant -eq "release") { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_struct_copy_odd_size.mettle", "-o", $exePath)
+
+    if ($variant -eq "debug_fallback") { $env:METTLE_MIR = "0" }
+    try {
+      $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    }
+    finally {
+      if ($variant -eq "debug_fallback") { Remove-Item Env:\METTLE_MIR -ErrorAction SilentlyContinue }
+    }
+    if ($LASTEXITCODE -ne 0) {
+      throw "struct-copy-odd-size build ($variant) failed: $buildOut"
+    }
+
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 1) {
+      throw "struct-copy-odd-size ($variant) miscompiled (exit $LASTEXITCODE)"
+    }
+
+    Write-CaseResult -Name "struct_copy_odd_size_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "struct_copy_odd_size_$variant" -Passed $false -Reason $_.Exception.Message
   }
 }
 

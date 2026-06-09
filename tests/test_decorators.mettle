@@ -80,11 +80,59 @@ function aliased_no_hoist() -> int32 {
   return sum;
 }
 
+// SOUNDNESS GUARD 2: a @pure function that READS a global, hoisted out of a
+// loop whose body MUTATES that global, would read a stale value. A global write
+// lowers to an ASSIGN (not a STORE), so the body's no-store rule alone misses
+// it; the LICM must additionally refuse to hoist when the body writes a global.
+// Correct (not hoisted): g_read sees 1,2,3,4,5 ->
+//   (10+1)+(10+2)+(10+3)+(10+4)+(10+5) = 50 + 15 = 65.
+var g_read: int32 = 0;
+
+@pure @noinline function read_plus_global(x: int32) -> int32 {
+  return x + g_read;
+}
+
+function global_read_no_hoist() -> int32 {
+  g_read = 0;
+  var total: int32 = 0;
+  var i: int32 = 0;
+  while (i < 5) {
+    g_read = g_read + 1;
+    total = total + read_plus_global(10);
+    i = i + 1;
+  }
+  return total;
+}
+
+// SOUNDNESS GUARD 3: a function mislabeled @pure that MUTATES a global is not
+// observationally pure. Hoisting its call out of a loop would change how many
+// times the side effect runs, so the LICM inspects the callee's body and
+// declines. Correct (called 5x): g_writes == 5.
+var g_writes: int32 = 0;
+
+@pure @noinline function bump_global(x: int32) -> int32 {
+  g_writes = g_writes + 1;
+  return x;
+}
+
+function global_write_no_hoist() -> int32 {
+  g_writes = 0;
+  var s: int32 = 0;
+  var i: int32 = 0;
+  while (i < 5) {
+    s = s + bump_global(1);
+    i = i + 1;
+  }
+  return g_writes;
+}
+
 function main() -> int32 {
   var ps: int32 = pure_sum();
   var mc: int32 = many_calls();
   var pps: int32 = pure_ptr_sum();
   var anh: int32 = aliased_no_hoist();
+  var grn: int32 = global_read_no_hoist();
+  var gwn: int32 = global_write_no_hoist();
 
   var buf: int32[8];
   var j: int32 = 0;
@@ -95,9 +143,12 @@ function main() -> int32 {
   print(cstr("mc=")); print_int((int64)mc); println(cstr(""));
   print(cstr("pps=")); print_int((int64)pps); println(cstr(""));
   print(cstr("anh=")); print_int((int64)anh); println(cstr(""));
+  print(cstr("grn=")); print_int((int64)grn); println(cstr(""));
+  print(cstr("gwn=")); print_int((int64)gwn); println(cstr(""));
   print(cstr("sum=")); print_int(total); println(cstr(""));
 
-  if (ps == 49000 && mc == 3 && pps == 60 && anh == 10 && total == 36) {
+  if (ps == 49000 && mc == 3 && pps == 60 && anh == 10 && grn == 65 &&
+      gwn == 5 && total == 36) {
     println(cstr("DECORATORS OK"));
     return 0;
   }

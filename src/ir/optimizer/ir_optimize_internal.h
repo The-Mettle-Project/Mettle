@@ -430,6 +430,7 @@ int ir_optimize_had_user_error(void);
 void ir_optimize_set_simd_report(int enabled);
 int ir_optimize_pre_inline_function(IRFunction *function);
 int ir_pass_is_skipped(IROptPassId pass_id);
+int ir_pass_name_is_skipped(const char *pass_name);
 int ir_pointer_induction_pass(IRFunction *function, int *changed);
 int ir_positive_loop_div2_to_shift_pass(IRFunction *function,
                                                int *changed);

@@ -602,11 +602,15 @@ int code_generator_binary_emit_simd_affine_map_f32(
 }
 
 /* General auto-vectorized loop kernel (IR_OP_SIMD_VLOOP_F64). Decodes the
- * serialized float64 body DAG (see the opcode doc in ir.h) and emits a packed
+ * serialized float body DAG (see the opcode doc in ir.h) and emits a packed
  * AVX2 loop + scalar remainder. A2: element-wise maps out[i] = DAG(a_k[i],
- * (float64)i, consts). Replays the DAG over f64x4 lanes via a stack-machine of
- * up to VLOOP_KERNEL_REGS ymm registers; constants are broadcast once to a stack
- * array and re-read; array bases walk by 32B (vector) / 8B (scalar). */
+ * (float)i, consts) and '+' reductions. The element width is carried in
+ * instruction->float_bits: 64 replays over f64x4 lanes (pd ops, 8B elements),
+ * 32 over f32x8 lanes (ps ops, 4B elements) — both walk array bases by 32B per
+ * vector iteration. The DAG is replayed via a stack-machine of up to
+ * VLOOP_KERNEL_REGS ymm registers; constants are broadcast once to a stack
+ * array and re-read. Maps are bit-identical to the scalar loop (each lane is an
+ * independent IEEE op); '+' reductions reassociate like the sum/dot kernels. */
 #define VLOOP_K_LOAD 0
 #define VLOOP_K_IOTA 1
 #define VLOOP_K_CONST 2
@@ -636,7 +640,16 @@ int code_generator_binary_emit_simd_vloop_f64(
     code_generator_set_error(generator, "Malformed simd_vloop_f64");
     return 0;
   }
+  if (instruction->float_bits != 32 && instruction->float_bits != 64) {
+    code_generator_set_error(generator, "simd_vloop bad float width");
+    return 0;
+  }
   b = &context->code;
+  /* f32 = single precision: f32x8 lanes (ps ops, 4-byte elements); otherwise
+   * f64x4 (pd ops, 8-byte elements). Both stride 32 bytes per vector iter. */
+  const int f32 = (instruction->float_bits == 32);
+  const int lanes = f32 ? 8 : 4;
+  const int elem_bytes = f32 ? 4 : 8;
 
   const IROperand *args = instruction->arguments;
   long long reduce_op = args[0].int_value;
@@ -729,11 +742,20 @@ int code_generator_binary_emit_simd_vloop_f64(
     return 0;
   }
 
-  /* Broadcast each constant once into its stack slot. */
+  /* Broadcast each constant once into its stack slot. For f32 the value is
+   * packed into both halves of a 64-bit word so the shared vbroadcastsd path
+   * yields 8 identical f32 lanes; the scalar tail's movss reads the low 4. */
   for (int c = 0; c < n_consts; c++) {
     double dv = args[consts_off + c].float_value;
     uint64_t bits = 0;
-    memcpy(&bits, &dv, sizeof(bits));
+    if (f32) {
+      float fv = (float)dv;
+      uint32_t fb = 0;
+      memcpy(&fb, &fv, sizeof(fb));
+      bits = (uint64_t)fb | ((uint64_t)fb << 32);
+    } else {
+      memcpy(&bits, &dv, sizeof(bits));
+    }
     if (!binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, bits) ||
         !binary_emit_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) ||
         !wcs_avx_vbroadcastsd_ymm_xmm(b, 0, 0) ||
@@ -741,32 +763,56 @@ int code_generator_binary_emit_simd_vloop_f64(
       return 0;
     }
   }
-  /* iota constant [0,1,2,3] in ymm5 (int32 lanes), if needed. */
+  /* iota constant in ymm5 (int32 lanes), if needed: [0,1,2,3] for f64 (only the
+   * low xmm feeds vcvtdq2pd), [0,1,2,3,4,5,6,7] for f32. */
   if (has_iota) {
-    if (!binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, 0x0000000100000000ULL) ||
-        !binary_emit_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) ||
-        !binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, 0x0000000300000002ULL) ||
-        !binary_emit_movq_xmm_reg(b, BINARY_XMM1, BINARY_GP_RAX) ||
-        !wcs_avx_vpunpcklqdq_xmm(b, IOTA_CONST, 0, 1)) {
+    if (f32) {
+      /* Build [0,1,2,3] in xmm0 and [4,5,6,7] in xmm1, then splice xmm1 into the
+       * high 128-bit lane via vperm2i128 (imm 0x20: dst.lo<-src1.lo,
+       * dst.hi<-src2.lo). The source ymms' high lanes are unread, so any prior
+       * garbage there is harmless. */
+      if (!binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, 0x0000000100000000ULL) ||
+          !binary_emit_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) ||
+          !binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, 0x0000000300000002ULL) ||
+          !binary_emit_movq_xmm_reg(b, BINARY_XMM2, BINARY_GP_RAX) ||
+          !wcs_avx_vpunpcklqdq_xmm(b, 0, 0, 2) ||
+          !binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, 0x0000000500000004ULL) ||
+          !binary_emit_movq_xmm_reg(b, BINARY_XMM1, BINARY_GP_RAX) ||
+          !binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, 0x0000000700000006ULL) ||
+          !binary_emit_movq_xmm_reg(b, BINARY_XMM2, BINARY_GP_RAX) ||
+          !wcs_avx_vpunpcklqdq_xmm(b, 1, 1, 2) ||
+          !wcs_avx_vperm2i128(b, IOTA_CONST, 0, 1, 0x20)) {
+        return 0;
+      }
+    } else if (!binary_emit_mov_reg_imm64(b, BINARY_GP_RAX,
+                                          0x0000000100000000ULL) ||
+               !binary_emit_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) ||
+               !binary_emit_mov_reg_imm64(b, BINARY_GP_RAX,
+                                          0x0000000300000002ULL) ||
+               !binary_emit_movq_xmm_reg(b, BINARY_XMM1, BINARY_GP_RAX) ||
+               !wcs_avx_vpunpcklqdq_xmm(b, IOTA_CONST, 0, 1)) {
       return 0;
     }
   }
 
-  /* Reduction: xmm3 = prior accumulator value, ymm2 = packed accumulator = 0. */
+  /* Reduction: xmm3 = prior accumulator value, ymm2 = packed accumulator = 0.
+   * f32 keeps the prior value in the low dword (movd); f64 the low qword. */
   if (is_reduce) {
     if (!code_generator_binary_emit_operand_load(generator, context,
                                                  &instruction->dest,
                                                  BINARY_GP_RAX) ||
-        !binary_emit_movq_xmm_reg(b, BINARY_XMM3, BINARY_GP_RAX) ||
+        !(f32 ? binary_emit_movd_xmm_reg(b, BINARY_XMM3, BINARY_GP_RAX)
+              : binary_emit_movq_xmm_reg(b, BINARY_XMM3, BINARY_GP_RAX)) ||
         !wcs_avx_vpxor_ymm(b, 2, 2, 2)) {
       return 0;
     }
   }
 
-  /* ---- vector loop: while (count >= 4) ---- */
+  /* ---- vector loop: while (count >= lanes) ---- */
   size_t vec_top = b->size;
   size_t j_tail = 0;
-  if (!wcs_cmp_reg_imm8(b, BINARY_GP_R10, 4) || !wcs_jcc(b, 0x82 /* jb */, &j_tail)) {
+  if (!wcs_cmp_reg_imm8(b, BINARY_GP_R10, lanes) ||
+      !wcs_jcc(b, 0x82 /* jb */, &j_tail)) {
     return 0;
   }
   {
@@ -792,10 +838,11 @@ int code_generator_binary_emit_simd_vloop_f64(
           ok = wcs_avx_vmovups_ymm_mem(b, R, arr_reg[op0], 0);
         } else if (tag == VLOOP_K_CONST) {
           ok = wcs_avx_vmovups_ymm_mem(b, R, BINARY_GP_RSP, 32 * op0);
-        } else { /* IOTA: R = (f64)[i, i+1, i+2, i+3] */
+        } else { /* IOTA: R = (float)[i, i+1, ...] over `lanes` lanes */
           ok = wcs_broadcast_i32_to_ymm(b, R, BINARY_GP_R11) &&
                wcs_avx_vpaddd_ymm(b, R, R, IOTA_CONST) &&
-               wcs_avx_vcvtdq2pd_ymm_xmm(b, R, R);
+               (f32 ? wcs_avx_vcvtdq2ps_ymm(b, R, R)
+                    : wcs_avx_vcvtdq2pd_ymm_xmm(b, R, R));
         }
         if (!ok) {
           return 0;
@@ -810,10 +857,22 @@ int code_generator_binary_emit_simd_vloop_f64(
         int ra = vstk[--nv];
         int ok = 0;
         switch (tag) {
-        case VLOOP_K_ADD: ok = wcs_avx_vaddpd_ymm(b, ra, ra, rb); break;
-        case VLOOP_K_SUB: ok = wcs_avx_vsubpd_ymm(b, ra, ra, rb); break;
-        case VLOOP_K_MUL: ok = wcs_avx_vmulpd_ymm(b, ra, ra, rb); break;
-        case VLOOP_K_DIV: ok = wcs_avx_vdivpd_ymm(b, ra, ra, rb); break;
+        case VLOOP_K_ADD:
+          ok = f32 ? wcs_avx_vaddps_ymm(b, ra, ra, rb)
+                   : wcs_avx_vaddpd_ymm(b, ra, ra, rb);
+          break;
+        case VLOOP_K_SUB:
+          ok = f32 ? wcs_avx_vsubps_ymm(b, ra, ra, rb)
+                   : wcs_avx_vsubpd_ymm(b, ra, ra, rb);
+          break;
+        case VLOOP_K_MUL:
+          ok = f32 ? wcs_avx_vmulps_ymm(b, ra, ra, rb)
+                   : wcs_avx_vmulpd_ymm(b, ra, ra, rb);
+          break;
+        case VLOOP_K_DIV:
+          ok = f32 ? wcs_avx_vdivps_ymm(b, ra, ra, rb)
+                   : wcs_avx_vdivpd_ymm(b, ra, ra, rb);
+          break;
         default: code_generator_set_error(generator, "vloop op"); return 0;
         }
         if (!ok) {
@@ -830,7 +889,8 @@ int code_generator_binary_emit_simd_vloop_f64(
       return 0;
     }
     if (is_reduce) {
-      if (!wcs_avx_vaddpd_ymm(b, 2, 2, vstk[0])) { /* acc += lanes */
+      if (!(f32 ? wcs_avx_vaddps_ymm(b, 2, 2, vstk[0]) /* acc += lanes */
+                : wcs_avx_vaddpd_ymm(b, 2, 2, vstk[0]))) {
         return 0;
       }
     } else if (!wcs_avx_vmovups_mem_ymm(b, dst_reg, 0, vstk[0])) {
@@ -842,10 +902,10 @@ int code_generator_binary_emit_simd_vloop_f64(
       return 0;
     }
   }
-  if (has_iota && !wcs_addsub_reg_imm8(b, BINARY_GP_R11, 0, 4)) {
+  if (has_iota && !wcs_addsub_reg_imm8(b, BINARY_GP_R11, 0, lanes)) {
     return 0;
   }
-  if (!wcs_addsub_reg_imm8(b, BINARY_GP_R10, 1, 4)) {
+  if (!wcs_addsub_reg_imm8(b, BINARY_GP_R10, 1, lanes)) {
     return 0;
   }
   {
@@ -879,12 +939,16 @@ int code_generator_binary_emit_simd_vloop_f64(
         int R = pool[--nfree];
         int ok = 0;
         if (tag == VLOOP_K_LOAD) {
-          ok = wcs_movsd_xmm_mem(b, R, arr_reg[op0], 0);
+          ok = f32 ? wcs_movss_xmm_mem(b, R, arr_reg[op0], 0)
+                   : wcs_movsd_xmm_mem(b, R, arr_reg[op0], 0);
         } else if (tag == VLOOP_K_CONST) {
-          ok = wcs_movsd_xmm_mem(b, R, BINARY_GP_RSP, 32 * op0);
-        } else { /* IOTA scalar: (f64)i */
-          ok = binary_emit_cvtsi2sd_xmm_reg(b, (BinaryXmmRegister)R,
-                                            BINARY_GP_R11);
+          ok = f32 ? wcs_movss_xmm_mem(b, R, BINARY_GP_RSP, 32 * op0)
+                   : wcs_movsd_xmm_mem(b, R, BINARY_GP_RSP, 32 * op0);
+        } else { /* IOTA scalar: (float)i */
+          ok = f32 ? binary_emit_cvtsi2ss_xmm_reg(b, (BinaryXmmRegister)R,
+                                                  BINARY_GP_R11)
+                   : binary_emit_cvtsi2sd_xmm_reg(b, (BinaryXmmRegister)R,
+                                                  BINARY_GP_R11);
         }
         if (!ok) {
           return 0;
@@ -894,22 +958,24 @@ int code_generator_binary_emit_simd_vloop_f64(
         int rb = vstk[--nv];
         int ra = vstk[--nv];
         int ok = 0;
+        BinaryXmmRegister A = (BinaryXmmRegister)ra;
+        BinaryXmmRegister B = (BinaryXmmRegister)rb;
         switch (tag) {
         case VLOOP_K_ADD:
-          ok = binary_emit_addsd_xmm_xmm(b, (BinaryXmmRegister)ra,
-                                         (BinaryXmmRegister)rb);
+          ok = f32 ? binary_emit_addss_xmm_xmm(b, A, B)
+                   : binary_emit_addsd_xmm_xmm(b, A, B);
           break;
         case VLOOP_K_SUB:
-          ok = binary_emit_subsd_xmm_xmm(b, (BinaryXmmRegister)ra,
-                                         (BinaryXmmRegister)rb);
+          ok = f32 ? binary_emit_subss_xmm_xmm(b, A, B)
+                   : binary_emit_subsd_xmm_xmm(b, A, B);
           break;
         case VLOOP_K_MUL:
-          ok = binary_emit_mulsd_xmm_xmm(b, (BinaryXmmRegister)ra,
-                                         (BinaryXmmRegister)rb);
+          ok = f32 ? binary_emit_mulss_xmm_xmm(b, A, B)
+                   : binary_emit_mulsd_xmm_xmm(b, A, B);
           break;
         case VLOOP_K_DIV:
-          ok = binary_emit_divsd_xmm_xmm(b, (BinaryXmmRegister)ra,
-                                         (BinaryXmmRegister)rb);
+          ok = f32 ? binary_emit_divss_xmm_xmm(b, A, B)
+                   : binary_emit_divsd_xmm_xmm(b, A, B);
           break;
         default: return 0;
         }
@@ -921,15 +987,19 @@ int code_generator_binary_emit_simd_vloop_f64(
       }
     }
     if (is_reduce) {
-      if (!binary_emit_addsd_xmm_xmm(b, BINARY_XMM3, (BinaryXmmRegister)vstk[0])) {
+      if (!(f32 ? binary_emit_addss_xmm_xmm(b, BINARY_XMM3,
+                                            (BinaryXmmRegister)vstk[0])
+                : binary_emit_addsd_xmm_xmm(b, BINARY_XMM3,
+                                            (BinaryXmmRegister)vstk[0]))) {
         return 0;
       }
-    } else if (!wcs_movsd_mem_xmm(b, dst_reg, 0, vstk[0])) {
+    } else if (!(f32 ? wcs_movss_mem_xmm(b, dst_reg, 0, vstk[0])
+                     : wcs_movsd_mem_xmm(b, dst_reg, 0, vstk[0]))) {
       return 0;
     }
   }
   for (int j = 0; j < n_dist; j++) {
-    if (!wcs_addsub_reg_imm8(b, kGp[j], 0, 8)) {
+    if (!wcs_addsub_reg_imm8(b, kGp[j], 0, elem_bytes)) {
       return 0;
     }
   }
@@ -950,11 +1020,11 @@ int code_generator_binary_emit_simd_vloop_f64(
     return 0;
   }
   if (is_reduce) {
-    /* Fold ymm2 + xmm3 -> RAX (a double's bits) and store to the accumulator.
-     * wcs_reduce_pd_acc_to_rax does its own vextractf128 + vzeroupper, so it
+    /* Fold ymm2 + xmm3 -> RAX (the float's bits) and store to the accumulator.
+     * wcs_reduce_p{d,s}_acc_to_rax does its own vextractf128 + vzeroupper, so it
      * MUST run before any standalone vzeroupper (which would zero ymm2's upper
-     * lanes and drop two accumulator lanes). */
-    if (!wcs_reduce_pd_acc_to_rax(b)) {
+     * lanes and drop accumulator lanes). */
+    if (!(f32 ? wcs_reduce_ps_acc_to_rax(b) : wcs_reduce_pd_acc_to_rax(b))) {
       return 0;
     }
     if (cbytes && !binary_emit_add_rsp_imm32(b, cbytes)) {

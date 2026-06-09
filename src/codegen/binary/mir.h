@@ -315,6 +315,11 @@ typedef struct {
   int scalar_return_width;
   int scalar_return_signed;
 
+  /* A float return type: declared width in bits (32/64). RETURN converts the
+   * value to this width before placing it in XMM0 — a float64-tracked temp
+   * returned from a float32 function must cvtsd2ss, not pass through raw. */
+  int float_return_bits;
+
   /* Divmod fusion: when `x / d` and `x % d` appear together, one div produces
    * both quotient (RAX) and remainder (RDX). Lowering the first of the pair
    * captures both and records the sibling's IR dest name -> the vreg holding the

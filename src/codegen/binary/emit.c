@@ -5087,7 +5087,13 @@ int code_generator_binary_emit_instruction(
           }
           return 1;
         }
-        if (struct_bytes > 8 && instruction->dest.kind == IR_OPERAND_SYMBOL &&
+        /* Exact-size copy for any aggregate that is not exactly one register
+         * wide. A small struct whose size is not 1/2/4/8 (e.g. 3 uint8
+         * fields) is allocated EXACTLY its size with alignment 1, so the
+         * default 8-byte RAX round-trip below would write past the
+         * destination slot and silently clobber whatever local is adjacent
+         * (the copy SOURCE itself, in `var copy = orig` layouts). */
+        if (struct_bytes != 8 && instruction->dest.kind == IR_OPERAND_SYMBOL &&
             instruction->dest.name) {
           Symbol *dest_sym = symbol_table_lookup(generator->symbol_table,
                                                  instruction->dest.name);

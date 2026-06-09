@@ -162,9 +162,11 @@ typedef enum {
    * backend only. */
   IR_OP_SIMD_I2F_REDUCE_F64,
   /* General auto-vectorized counted unit-stride loop over a straight-line
-   * float64 DAG. Emitted by ir_auto_vectorize_pass for loops the per-shape
-   * recognizers above did not claim. The body DAG is serialized into
-   * arguments[]:
+   * float DAG. Emitted by ir_auto_vectorize_pass for loops the per-shape
+   * recognizers above did not claim. The element width is carried in
+   * instruction->float_bits (64 = f64x4 lanes / 8-byte elements, 32 = f32x8
+   * lanes / 4-byte elements); both stride 32 bytes per vector iteration. The
+   * body DAG is serialized into arguments[]:
    *   header (6 INT): [0] reduce_op (0 = element-wise map, 1 = '+' reduction)
    *                   [1] n_arrays  [2] n_nodes  [3] root_node
    *                   [4] n_consts  [5] max_live (peak simultaneous live ymm)
@@ -172,10 +174,11 @@ typedef enum {
    *   then n_nodes nodes, each 3 INT operands (tag, op0, op1):
    *       tag 0=LOAD(op0=array idx) 1=IOTA 2=CONST(op0=const idx)
    *           3=ADD 4=SUB 5=MUL 6=DIV (op0,op1 = earlier node indices),
-   *   then n_consts FLOAT64 operands.
+   *   then n_consts FLOAT64 operands (the kernel narrows them to f32 when
+   *   float_bits==32).
    * dest = reduction accumulator symbol (reduce_op==1) or stored array base
    * (reduce_op==0); lhs = trip count (SYMBOL or INT). Direct-object backend
-   * only. The kernel replays the DAG over f64x4 lanes with stack-hoisted
+   * only. The kernel replays the DAG over the packed lanes with stack-hoisted
    * constants + a scalar remainder; element-wise maps are bit-identical to the
    * scalar loop, '+' reductions reassociate like the sum/dot kernels. */
   IR_OP_SIMD_VLOOP_F64,

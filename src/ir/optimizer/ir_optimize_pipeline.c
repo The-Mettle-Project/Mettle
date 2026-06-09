@@ -356,7 +356,8 @@ int ir_optimize_program_pipeline(IRProgram *program,
     return 0;
   }
 
-  if (!options || !options->preserve_function_boundaries) {
+  if ((!options || !options->preserve_function_boundaries) &&
+      !ir_pass_name_is_skipped("inline_small_functions")) {
     int inlining_changed = 0;
     mettle_compiler_ctx_set_pass_name("inline_small_functions");
     mettle_compiler_ctx_set_fixpoint_iteration(0);
@@ -368,7 +369,7 @@ int ir_optimize_program_pipeline(IRProgram *program,
   /* `@pure` loop-invariant call hoisting. Program-level (resolves callees by
    * name) and run after inlining so an inlined pure body is hoisted as ordinary
    * loop-invariant code; the per-function fixpoint below then cleans up. */
-  {
+  if (!ir_pass_name_is_skipped("hoist_pure_calls")) {
     int pure_licm_changed = 0;
     mettle_compiler_ctx_set_pass_name("hoist_pure_calls");
     mettle_compiler_ctx_set_fixpoint_iteration(0);

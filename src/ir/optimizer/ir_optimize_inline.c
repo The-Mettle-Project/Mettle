@@ -425,6 +425,19 @@ static int ir_append_parameter_materialization(
     assign.op = IR_OP_ASSIGN;
     assign.location = call_instruction->location;
     assign.dest = ir_operand_symbol(mapped_name);
+    /* A float parameter carries the narrowing contract on the assign
+     * (float_bits = declared parameter width), mirroring the RETURN path
+     * below. Without it the backend skips the precision conversion and a
+     * float64-tracked argument temp is bit-truncated into a float32
+     * parameter local (low dword of the double, 0 for round values). */
+    if (strcmp(type_name, "float32") == 0) {
+      assign.is_float = 1;
+      assign.float_bits = 32;
+    } else if (strcmp(type_name, "float64") == 0 ||
+               strcmp(type_name, "float") == 0) {
+      assign.is_float = 1;
+      assign.float_bits = 64;
+    }
     if (!assign.dest.name ||
         !ir_operand_clone(&call_instruction->arguments[i], &assign.lhs) ||
         !ir_instruction_vector_append_move(vector, &assign)) {

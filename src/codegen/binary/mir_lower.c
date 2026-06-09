@@ -2284,7 +2284,6 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
 
   case IR_OP_STORE: {
     MirOperand addr = mir_value_operand(fn, g, ctx, map, &in->dest);
-    MirOperand val = mir_value_operand(fn, g, ctx, map, &in->lhs);
     int size = code_generator_binary_get_access_size(g, ctx, &in->rhs);
     if (size <= 0) {
       fn->has_error = 1;
@@ -2292,13 +2291,15 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
     }
     MirOperand mem = mir_op_mem_vreg(addr.vreg, MIR_VREG_NONE, 1, 0);
     if (in->is_float) {
-      /* A literal value must be materialized at the store width. */
-      MirOperand fval = (in->lhs.kind == IR_OPERAND_FLOAT)
-                            ? mir_op_fimm(mir_float_bits_at(in->lhs.float_value,
-                                                            size))
-                            : val;
+      /* Coerce the value to the store width: a literal is materialized at
+       * that width, and a float64-tracked arithmetic result narrows via
+       * cvtsd2ss before a 4-byte store (a raw movss of a double's low dword
+       * silently stores garbage — 0 for round values). */
+      MirOperand fval =
+          coerce_float_operand(fn, g, ctx, map, &in->lhs, size);
       return mir_emit_fmov(fn, mem, fval, size);
     }
+    MirOperand val = mir_value_operand(fn, g, ctx, map, &in->lhs);
     return mir_emit1(fn, MIR_MOV, mem, val, mir_op_none(), size, 0, 0);
   }
 
@@ -2352,9 +2353,22 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
       MirOperand src = mir_value_operand(fn, g, ctx, map, &in->lhs);
       int rfb = code_generator_binary_operand_float_bits(g, ctx, &in->lhs);
       if (rfb) {
-        /* Float return value goes in XMM0. */
+        /* Float return value goes in XMM0, converted to the DECLARED return
+         * width: a float64-tracked temp returned from a float32 function
+         * narrows via cvtsd2ss (a raw movss would hand the caller the low
+         * dword of a double). */
+        int want = fn->float_return_bits ? fn->float_return_bits : rfb;
+        if (want != rfb) {
+          MirVregId tmp = mir_new_vreg(fn, MIR_RC_XMM, want / 8);
+          if (tmp == MIR_VREG_NONE ||
+              !mir_emit1(fn, MIR_CVTF2F, mir_op_vreg(tmp), src, mir_op_none(),
+                         want / 8, 0, 0)) {
+            return 0;
+          }
+          src = mir_op_vreg(tmp);
+        }
         if (!mir_emit_fmov(fn, mir_op_phys(BINARY_XMM0, MIR_RC_XMM), src,
-                           rfb / 8)) {
+                           want / 8)) {
           return 0;
         }
       } else if (fn->scalar_return_width == 1 || fn->scalar_return_width == 2 ||
@@ -3180,6 +3194,8 @@ int code_generator_binary_emit_function_via_mir(
       if (fn.indirect_return_vreg == MIR_VREG_NONE) {
         goto oom;
       }
+    } else if (rt && code_generator_binary_resolved_type_float_bits(rt) != 0) {
+      fn.float_return_bits = code_generator_binary_resolved_type_float_bits(rt);
     } else if (rt && code_generator_binary_resolved_type_float_bits(rt) == 0 &&
                !code_generator_type_is_aggregate(rt)) {
       /* A narrow integer return (int32/uint32/int16/...) must be canonicalized

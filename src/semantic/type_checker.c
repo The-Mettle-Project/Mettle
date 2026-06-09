@@ -4227,6 +4227,24 @@ int type_checker_process_declaration(TypeChecker *checker,
       return 0;
     }
 
+    // A function with a non-void return type must contain at least one
+    // return statement. This is a simple body-walk (a missing return on
+    // some paths is not yet diagnosed); a function with no return at all
+    // would otherwise compile and return garbage from RAX/XMM0.
+    if (func_decl->body && return_type &&
+        return_type->kind != TYPE_VOID &&
+        !type_checker_ast_contains_node_type(func_decl->body,
+                                             AST_RETURN_STATEMENT)) {
+      type_checker_set_error_at_location(
+          checker, declaration->location,
+          "Function '%s' has non-void return type '%s' but contains no return "
+          "statement",
+          func_decl->name, return_type->name);
+      type_checker_init_tracker_reset(checker);
+      symbol_table_exit_scope(checker->symbol_table);
+      return 0;
+    }
+
     type_checker_init_tracker_exit_scope(checker);
     type_checker_init_tracker_reset(checker);
 

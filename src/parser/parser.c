@@ -711,6 +711,11 @@ ASTNode *parser_parse_declaration(Parser *parser) {
                          "Expected 'function' or 'var' after 'export extern'");
         return NULL;
       }
+    } else if (parser->current_token.type == TOKEN_AT) {
+      parser_set_error(parser,
+                       "Decorators must precede 'export' (write "
+                       "'@inline export function', not 'export @inline ...')");
+      return NULL;
     } else {
       parser_set_error(parser, "Expected 'function', 'var', 'struct', 'enum', "
                                "'trait', or 'extern' after 'export'");

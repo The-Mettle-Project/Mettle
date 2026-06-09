@@ -747,6 +747,9 @@ int wcs_avx_vmulps_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
 int wcs_avx_vsubps_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
   return wcs_avx_vps_ymm(b, 0x5C, dst, s1, s2);
 }
+int wcs_avx_vdivps_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
+  return wcs_avx_vps_ymm(b, 0x5E, dst, s1, s2);
+}
 int wcs_avx_vminps_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
   return wcs_avx_vps_ymm(b, 0x5D, dst, s1, s2);
 }
