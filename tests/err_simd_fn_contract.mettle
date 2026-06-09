@@ -1,0 +1,21 @@
+// Function-level `@simd!` is a hard contract on every counted loop in the body.
+// This loop has its own control flow, so no vectorizer can claim it and the
+// contract is a compile error (only fires under optimization).
+function main() -> int32 {
+  var a: int32[10];
+  var i: int32 = 0;
+  while (i < 10) { a[i] = i; i = i + 1; }
+  return (int32)count_pos(&a[0], 10);
+}
+
+@simd! function count_pos(a: int32*, n: int64) -> int64 {
+  var s: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    if (a[i] > 0) {
+      s = s + 1;
+    }
+    i = i + 1;
+  }
+  return s;
+}

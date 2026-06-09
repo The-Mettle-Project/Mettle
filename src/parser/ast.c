@@ -1171,6 +1171,10 @@ ASTNode *ast_create_function_declaration(const char *name, char **param_names,
   func_decl->type_params = NULL;
   func_decl->type_param_traits = NULL;
   func_decl->type_param_count = 0;
+  func_decl->is_inline = 0;
+  func_decl->is_noinline = 0;
+  func_decl->is_pure = 0;
+  func_decl->simd_mode = SIMD_ATTR_NONE;
 
   if (param_count > 0) {
     func_decl->parameter_names = malloc(param_count * sizeof(char *));

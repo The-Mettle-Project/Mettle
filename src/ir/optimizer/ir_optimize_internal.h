@@ -343,6 +343,11 @@ int ir_fuse_while_loop_to_insn(IRFunction *function, size_t header_index,
 int ir_index_vector_append(IRIndexVector *vector, size_t value);
 void ir_index_vector_destroy(IRIndexVector *vector);
 int ir_inline_small_functions_pass(IRProgram *program, int *changed);
+/* Resolve a function by name within the program (hashed lookup with a linear
+ * fallback). Defined in ir_optimize_inline.c. */
+IRFunction *ir_program_find_function(IRProgram *program, const char *name);
+/* `@pure` loop-invariant call hoisting (program-level; runs after inlining). */
+int ir_hoist_pure_calls_pass(IRProgram *program, int *changed);
 void ir_instruction_clear_arguments(IRInstruction *instruction);
 void ir_instruction_destroy_storage(IRInstruction *instruction);
 int ir_instruction_has_side_effect(const IRInstruction *instruction);

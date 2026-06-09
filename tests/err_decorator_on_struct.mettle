@@ -1,0 +1,9 @@
+// Decorators may only precede a function declaration, not a struct.
+@pure struct Point {
+  x: int32;
+  y: int32;
+}
+
+function main() -> int32 {
+  return 0;
+}

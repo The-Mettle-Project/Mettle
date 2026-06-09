@@ -252,6 +252,10 @@ typedef struct {
   size_t block_count;
   size_t entry_block;
   int cfg_valid;
+  // Function-decorator flags propagated from the AST (see ast.h):
+  int is_inline;   // `@inline`  : force inline past the heuristic gate
+  int is_noinline; // `@noinline`: never inline this function
+  int is_pure;     // `@pure`    : side-effect-free; enables pure-call LICM
 } IRFunction;
 
 typedef struct {

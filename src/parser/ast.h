@@ -91,6 +91,11 @@ typedef struct {
   char **type_params;
   char **type_param_traits;
   size_t type_param_count;
+  // Function decorators (`@inline` / `@noinline` / `@pure` / `@simd`):
+  int is_inline;    // `@inline`  : force past the inliner's size/heuristic gate
+  int is_noinline;  // `@noinline`: never inline this function
+  int is_pure;      // `@pure`    : side-effect-free; enables loop-invariant call hoisting
+  int simd_mode;    // SimdAttr applied as the default to every counted body loop
 } FunctionDeclaration;
 
 typedef struct {

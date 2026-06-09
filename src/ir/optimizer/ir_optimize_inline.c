@@ -69,8 +69,7 @@ static int ir_function_index_ensure(const IRProgram *program) {
   return 1;
 }
 
-static IRFunction *ir_program_find_function(IRProgram *program,
-                                            const char *name) {
+IRFunction *ir_program_find_function(IRProgram *program, const char *name) {
   if (!program || !name) {
     return NULL;
   }
@@ -110,10 +109,25 @@ static int ir_function_name_is_inline_denylisted(const char *name) {
 }
 
 static int ir_function_is_inline_candidate(const IRFunction *function) {
-  if (!function || !function->name || function->instruction_count == 0 ||
-      ir_function_name_is_inline_denylisted(function->name) ||
-      function->parameter_count > IR_INLINE_MAX_PARAMETERS ||
-      (function->parameter_count > 0 && !function->parameter_names)) {
+  if (!function || !function->name || function->instruction_count == 0) {
+    return 0;
+  }
+  /* `@noinline` is an absolute veto. */
+  if (function->is_noinline) {
+    return 0;
+  }
+  /* `@inline` forces the function past the discretionary heuristics below
+   * (the name denylist, the parameter/size/call-count caps), but never past
+   * the structural correctness guards: inline-asm, the loop-shape guards that
+   * work around a latent optimizer bug, and the must-have-a-return rule still
+   * apply. */
+  int forced = function->is_inline;
+
+  if (!forced && (ir_function_name_is_inline_denylisted(function->name) ||
+                  function->parameter_count > IR_INLINE_MAX_PARAMETERS)) {
+    return 0;
+  }
+  if (function->parameter_count > 0 && !function->parameter_names) {
     return 0;
   }
 
@@ -132,7 +146,7 @@ static int ir_function_is_inline_candidate(const IRFunction *function) {
     }
 
     non_nop_count++;
-    if (non_nop_count > IR_INLINE_MAX_NON_NOP_INSTRUCTIONS) {
+    if (!forced && non_nop_count > IR_INLINE_MAX_NON_NOP_INSTRUCTIONS) {
       return 0;
     }
 
@@ -171,7 +185,7 @@ static int ir_function_is_inline_candidate(const IRFunction *function) {
     if (instruction->op == IR_OP_CALL ||
         instruction->op == IR_OP_CALL_INDIRECT) {
       call_count++;
-      if (call_count > 2) {
+      if (!forced && call_count > 2) {
         return 0;
       }
     }

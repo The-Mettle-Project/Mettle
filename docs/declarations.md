@@ -41,6 +41,54 @@ fn greet() {  // void return
 
 A function named `main` with signature `() -> int32` serves as the program entry point when present. The compiler emits `_start` which calls `main` and passes its return value to the runtime.
 
+## Function decorators
+
+A function declaration may be prefixed with one or more `@` decorators that
+steer the optimizer. Decorators stack and may appear in any order; they attach
+to the `function` (or `export function`) that follows.
+
+```mettle
+@inline function fast(x: int32) -> int32 { return x * 3 + 1; }
+@pure @noinline function hash(p: int32*, n: int64) -> int64 { /* ... */ }
+```
+
+| Decorator | Meaning |
+|-----------|---------|
+| `@inline` | Force the function past the inliner's size, parameter-count, and call-count heuristics (and the built-in benchmark denylist). Structural blockers — most importantly inline assembly — still prevent inlining. |
+| `@noinline` | Never inline this function. This is the user-facing way to keep a hot helper as its own call. |
+| `@pure` | Assert the function is free of side effects **and** safe to evaluate speculatively (it neither writes observable state nor traps in a way that depends on being reached). The optimizer may then evaluate a call once before a loop and reuse the result — see below. |
+| `@simd` / `@simd!` | Apply a vectorization contract to every counted loop in the body — see [Vectorization contracts](control-flow.md#vectorization-contracts). |
+
+`@inline` and `@noinline` are mutually exclusive. Applying `@inline`,
+`@noinline`, or `@pure` to anything other than a function — a loop, a struct, an
+`extern` function — is a compile error. Decorators have effect only under `-O` /
+`--release`.
+
+### `@pure` and loop-invariant call hoisting
+
+When a `@pure` function is called inside a loop with arguments that do not
+change across iterations, the optimizer hoists the call into the loop preheader
+and reuses the single result:
+
+```mettle
+@pure @noinline function weight(table: int32*, k: int32) -> int32 { /* ... */ }
+
+function score(table: int32*, k: int32, items: int32*, n: int64) -> int64 {
+  var total: int64 = 0;
+  for i in 0..n {
+    total = total + (int64)(items[i] * weight(table, k));  // weight(table,k) hoisted
+  }
+  return total;
+}
+```
+
+Hoisting is conservative: it fires only when every argument is loop-invariant
+**and** the loop body performs no memory store (a pure callee may read memory
+through a pointer argument, so a store in the loop could change what it reads).
+`@pure` is a *trusted* contract — the compiler does not verify purity, exactly as
+`@simd!` trusts the vectorizability claim. Marking an impure or
+non-speculation-safe function `@pure` is a program error.
+
 ## Generic Functions
 
 Functions can declare type parameters in angle brackets before the parameter list. Call sites must provide type arguments: `f<T>(args)` or `f<int32>(args)`.

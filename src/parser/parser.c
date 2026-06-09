@@ -526,9 +526,114 @@ ASTNode *parser_parse_program(Parser *parser) {
 
 static ASTNode *parser_parse_extern_var_declaration(Parser *parser);
 
+// Flags collected from a run of `@ident[!]` decorators.
+typedef struct {
+  int is_inline;   // `@inline`
+  int is_noinline; // `@noinline`
+  int is_pure;     // `@pure`
+  int simd_mode;   // SimdAttr from `@simd` / `@simd!` (SIMD_ATTR_NONE if absent)
+} ParsedDecorators;
+
+// Consume a run of `@ident[!]` decorators into `out`. Assumes the current token
+// is TOKEN_AT. Returns 1 on success (parser positioned on the decorated
+// construct), 0 on error (a parser error is set). Recognizes `@inline`,
+// `@noinline`, `@pure`, and `@simd` / `@simd!`; rejects unknown names,
+// duplicates, and the `@inline`+`@noinline` conflict.
+static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
+  out->is_inline = 0;
+  out->is_noinline = 0;
+  out->is_pure = 0;
+  out->simd_mode = SIMD_ATTR_NONE;
+
+  while (parser->current_token.type == TOKEN_AT) {
+    parser_advance(parser); // consume '@'
+    if (!parser_is_identifier_like(parser->current_token.type)) {
+      parser_set_error(parser, "Expected a decorator name after '@' (one of "
+                               "'inline', 'noinline', 'pure', 'simd')");
+      return 0;
+    }
+    const char *name = parser->current_token.value;
+    if (strcmp(name, "inline") == 0) {
+      if (out->is_inline) {
+        parser_set_error(parser, "Duplicate '@inline' decorator");
+        return 0;
+      }
+      out->is_inline = 1;
+      parser_advance(parser);
+    } else if (strcmp(name, "noinline") == 0) {
+      if (out->is_noinline) {
+        parser_set_error(parser, "Duplicate '@noinline' decorator");
+        return 0;
+      }
+      out->is_noinline = 1;
+      parser_advance(parser);
+    } else if (strcmp(name, "pure") == 0) {
+      if (out->is_pure) {
+        parser_set_error(parser, "Duplicate '@pure' decorator");
+        return 0;
+      }
+      out->is_pure = 1;
+      parser_advance(parser);
+    } else if (strcmp(name, "simd") == 0) {
+      if (out->simd_mode != SIMD_ATTR_NONE) {
+        parser_set_error(parser, "Duplicate '@simd' decorator");
+        return 0;
+      }
+      parser_advance(parser); // consume 'simd'
+      out->simd_mode = SIMD_ATTR_HINT;
+      if (parser->current_token.type == TOKEN_NOT) {
+        out->simd_mode = SIMD_ATTR_CONTRACT;
+        parser_advance(parser); // consume '!'
+      }
+    } else {
+      parser_set_error(parser, "Unknown decorator after '@' (expected "
+                               "'inline', 'noinline', 'pure', or 'simd')");
+      return 0;
+    }
+  }
+
+  if (out->is_inline && out->is_noinline) {
+    parser_set_error(parser,
+                     "'@inline' and '@noinline' are mutually exclusive");
+    return 0;
+  }
+  return 1;
+}
+
 ASTNode *parser_parse_declaration(Parser *parser) {
   if (!parser)
     return NULL;
+
+  // Function decorators: `@inline` / `@noinline` / `@pure` / `@simd` may
+  // prefix a (possibly `export`-qualified) function declaration. Parse the
+  // chain, then stamp the flags onto the function it decorates.
+  if (parser->current_token.type == TOKEN_AT) {
+    ParsedDecorators decos;
+    if (!parser_parse_decorator_chain(parser, &decos))
+      return NULL;
+    ASTNode *decl = parser_parse_declaration(parser);
+    if (!decl)
+      return NULL;
+    if (decl->type != AST_FUNCTION_DECLARATION) {
+      parser_set_error(parser,
+                       "Decorators (@inline/@noinline/@pure/@simd) may only "
+                       "precede a function declaration");
+      ast_destroy_node(decl);
+      return NULL;
+    }
+    FunctionDeclaration *fd = (FunctionDeclaration *)decl->data;
+    if (fd->is_extern) {
+      parser_set_error(parser,
+                       "Decorators cannot be applied to extern functions");
+      ast_destroy_node(decl);
+      return NULL;
+    }
+    fd->is_inline = decos.is_inline;
+    fd->is_noinline = decos.is_noinline;
+    fd->is_pure = decos.is_pure;
+    fd->simd_mode = decos.simd_mode;
+    return decl;
+  }
 
   switch (parser->current_token.type) {
   case TOKEN_IMPORT:
@@ -744,28 +849,28 @@ ASTNode *parser_parse_statement(Parser *parser) {
   //   @simd  for i in 0..n { ... }   -> best-effort hint (warn if not vectorized)
   //   @simd! for i in 0..n { ... }   -> hard contract (compile error otherwise)
   // The attribute may sit in front of a label too: `@simd outer: for ...`.
+  // Only `@simd` is meaningful on a loop; the other decorators are function-only.
   if (parser->current_token.type == TOKEN_AT) {
-    parser_advance(parser); // consume '@'
-    if (!parser_is_identifier_like(parser->current_token.type) ||
-        strcmp(parser->current_token.value, "simd") != 0) {
-      parser_set_error(parser, "Expected 'simd' after '@'");
+    ParsedDecorators decos;
+    if (!parser_parse_decorator_chain(parser, &decos))
+      return NULL;
+    if (decos.is_inline || decos.is_noinline || decos.is_pure) {
+      parser_set_error(parser, "'@inline', '@noinline', and '@pure' apply to a "
+                               "function, not a loop");
       return NULL;
     }
-    parser_advance(parser); // consume 'simd'
-
-    int simd_mode = SIMD_ATTR_HINT;
-    if (parser->current_token.type == TOKEN_NOT) {
-      simd_mode = SIMD_ATTR_CONTRACT;
-      parser_advance(parser); // consume '!'
+    if (decos.simd_mode == SIMD_ATTR_NONE) {
+      parser_set_error(parser, "Expected a '@simd' decorator before a loop");
+      return NULL;
     }
 
     ASTNode *loop = parser_parse_statement(parser);
     if (!loop)
       return NULL;
     if (loop->type == AST_FOR_STATEMENT) {
-      ((ForStatement *)loop->data)->simd_mode = simd_mode;
+      ((ForStatement *)loop->data)->simd_mode = decos.simd_mode;
     } else if (loop->type == AST_WHILE_STATEMENT) {
-      ((WhileStatement *)loop->data)->simd_mode = simd_mode;
+      ((WhileStatement *)loop->data)->simd_mode = decos.simd_mode;
     } else {
       parser_set_error(parser,
                        "'@simd' must be applied to a 'for' or 'while' loop");

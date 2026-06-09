@@ -196,6 +196,9 @@ IRFunction *ir_function_create(const char *name) {
   function->block_count = 0;
   function->entry_block = 0;
   function->cfg_valid = 0;
+  function->is_inline = 0;
+  function->is_noinline = 0;
+  function->is_pure = 0;
   return function;
 }
 

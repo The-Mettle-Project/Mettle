@@ -365,6 +365,18 @@ int ir_optimize_program_pipeline(IRProgram *program,
     }
   }
 
+  /* `@pure` loop-invariant call hoisting. Program-level (resolves callees by
+   * name) and run after inlining so an inlined pure body is hoisted as ordinary
+   * loop-invariant code; the per-function fixpoint below then cleans up. */
+  {
+    int pure_licm_changed = 0;
+    mettle_compiler_ctx_set_pass_name("hoist_pure_calls");
+    mettle_compiler_ctx_set_fixpoint_iteration(0);
+    if (!ir_hoist_pure_calls_pass(program, &pure_licm_changed)) {
+      mettle_compiler_ice("IR optimization pure-call hoisting pass failed");
+    }
+  }
+
   if (!ir_run_program_stage_for_each_function(
           program, ir_optimize_function_pipeline)) {
     /* A violated `@simd!` contract already printed a user diagnostic; don't

@@ -31,6 +31,9 @@ typedef struct {
   /* Monotonic id handed to each `@simd` loop's begin/end marker pair so the
    * release-stage contract verifier can match them. */
   int next_simd_request_id;
+  /* Default SimdAttr from a function-level `@simd` decorator. A counted loop in
+   * the body with no `@simd` of its own inherits this mode. */
+  int current_function_simd_default;
 } IRLoweringContext;
 
 typedef struct {
@@ -4500,11 +4503,14 @@ static int ir_lower_statement_with_defers(IRLoweringContext *context,
       return 0;
     }
 
+    int while_simd_mode = while_data->simd_mode != SIMD_ATTR_NONE
+                              ? while_data->simd_mode
+                              : context->current_function_simd_default;
     int while_simd_id = -1;
-    if (while_data->simd_mode != SIMD_ATTR_NONE) {
+    if (while_simd_mode != SIMD_ATTR_NONE) {
       while_simd_id = context->next_simd_request_id++;
       if (!ir_emit_simd_marker(context, function, 'B', while_simd_id,
-                               while_data->simd_mode, statement->location)) {
+                               while_simd_mode, statement->location)) {
         free(loop_start);
         free(loop_end);
         return 0;
@@ -4581,11 +4587,14 @@ static int ir_lower_statement_with_defers(IRLoweringContext *context,
       return 0;
     }
 
+    int for_simd_mode = for_data->simd_mode != SIMD_ATTR_NONE
+                            ? for_data->simd_mode
+                            : context->current_function_simd_default;
     int for_simd_id = -1;
-    if (for_data->simd_mode != SIMD_ATTR_NONE) {
+    if (for_simd_mode != SIMD_ATTR_NONE) {
       for_simd_id = context->next_simd_request_id++;
       if (!ir_emit_simd_marker(context, function, 'B', for_simd_id,
-                               for_data->simd_mode, statement->location)) {
+                               for_simd_mode, statement->location)) {
         free(condition_label);
         free(step_label);
         free(end_label);
@@ -4810,6 +4819,12 @@ static IRFunction *ir_lower_function(IRLoweringContext *context,
     ir_set_error(context, "Out of memory while creating IR function");
     return NULL;
   }
+  function->is_inline = function_data->is_inline;
+  function->is_noinline = function_data->is_noinline;
+  function->is_pure = function_data->is_pure;
+  /* A function-level `@simd` decorator becomes the default mode for every
+   * counted loop in the body that has no `@simd` of its own. */
+  context->current_function_simd_default = function_data->simd_mode;
   if (!ir_function_set_parameters(function,
                                   (const char **)function_data->parameter_names,
                                   (const char **)function_data->parameter_types,
