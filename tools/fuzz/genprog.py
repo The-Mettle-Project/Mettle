@@ -137,9 +137,11 @@ class Gen:
             self.emit(f"var {ut}: uint64 = (uint64){base};")
             self.emit(f"{ut} = {ut} {op} {rhs};")
             expr = f"({expr} + (int64){ut})"
-        # NOTE: never emit `(bareident) & ...` — the parser mis-reads a
-        # parenthesized single identifier followed by `&` as a cast applied
-        # to an address-of. Atoms are bare or already parenthesized binops.
+        # `(bareident) & ...` used to be mis-parsed as a cast of an address-of
+        # (parser fix 2026-06-09, regression tests/test_paren_ident_binop.mettle);
+        # deliberately emit that shape sometimes so the fuzzer keeps it covered.
+        elif self.live_vars and self.rng.random() < 0.30:
+            expr = f"({self.pick_var()})"
         self.emit(f"{target} = {expr} & {MASK};")
 
     # ---- statement dispatch -----------------------------------------------

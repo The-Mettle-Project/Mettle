@@ -1,0 +1,39 @@
+// Regression: `(ident) <op> x` where <op> is an operator that is BOTH unary
+// and binary (`&`, `*`, `+`, `-`) was mis-parsed as a cast of a unary
+// expression — `(a) & 255` committed to "cast to type `a` of address-of 255"
+// and failed with error[E0003] "Unknown target type for cast" — instead of a
+// parenthesized expression `a` followed by a binary operator. `(a + b) & 255`
+// always worked (the inside isn't a valid type), only the bare single
+// identifier broke. Casts that genuinely name a type — built-in keywords and
+// pointer/array/generic/qualified types — must still parse as casts.
+// Found 2026-06-09 by the differential fuzzer generator work.
+//
+// Self-checking: exits 0 iff every expectation holds, else a distinct code.
+
+function main() -> int32 {
+  var a: int64 = 100;
+  var b: int64 = 5;
+
+  // The exact repro and the other ambiguous prefix operators.
+  if (((a) & 255) != 100) { return 11; }   // bitwise-AND, not cast+address-of
+  if (((a) * 3) != 300) { return 12; }      // multiply, not cast+deref
+  if (((a) + b) != 105) { return 13; }      // add, not cast+unary-plus
+  if (((a) - b) != 95) { return 14; }       // subtract, not cast+negate
+
+  // Non-ambiguous binary operators after a parenthesized identifier already
+  // worked, but keep them honest.
+  if (((a) | 7) != 103) { return 15; }
+  if (((a) ^ 1) != 101) { return 16; }
+
+  // A parenthesized compound expression must still bind correctly.
+  if (((a + b) & 255) != 105) { return 17; }
+
+  // Genuine casts must still be casts. Cast to a built-in keyword type, even
+  // when followed by an ambiguous prefix operator, stays a cast.
+  if ((int64)&a == 0) { return 18; }        // (int64)(&a): address as integer
+  var pa: int64* = (int64*)&a;              // pointer-type cast, '*' in type
+  if (*pa != 100) { return 19; }
+  if ((int32)a != 100) { return 20; }       // plain cast still works
+
+  return 0;
+}

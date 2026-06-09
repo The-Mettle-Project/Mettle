@@ -1820,6 +1820,15 @@ ASTNode *parser_parse_cast_expression(Parser *parser) {
 
   parser_advance(parser); // consume '('
 
+  // Remember whether the parenthesized type begins with a built-in type
+  // keyword (int32, int64, float64, ...). The parser keeps no registry of
+  // user-defined type names, so this is its only reliable signal that the
+  // parenthesized token is genuinely a type rather than a value. We use it
+  // below to disambiguate `(name) <op> x` where <op> is both a unary and a
+  // binary operator (`&`, `*`, `+`, `-`).
+  int type_starts_with_keyword =
+      parser_is_type_keyword(parser->current_token.type);
+
   char *type_name = parser_parse_type_annotation(parser);
   if (!type_name || parser->has_error ||
       parser->current_token.type != TOKEN_RPAREN) {
@@ -1833,13 +1842,25 @@ ASTNode *parser_parse_cast_expression(Parser *parser) {
 
   parser_advance(parser); // consume ')'
 
+  // A bare single identifier (no built-in keyword, and no pointer/array/
+  // generic/qualified structure such as `*`, `[`, `<` or `.`) gives the parser
+  // no reason to believe it names a type. `(MyStruct*)`, `(Vec<T>)`,
+  // `(mod.Type)` and the like are structurally types and stay casts.
+  int looks_like_type =
+      type_starts_with_keyword || strpbrk(type_name, "*[<.(") != NULL;
+
   // Check if it's a grouped expression instead
   int is_binary = parser_is_binary_operator(parser->current_token.type);
+  int is_unary = parser_is_unary_operator(parser->current_token.type);
   if (parser->current_token.type == TOKEN_RPAREN ||
       parser->current_token.type == TOKEN_COMMA ||
       parser->current_token.type == TOKEN_SEMICOLON ||
       parser->current_token.type == TOKEN_EOF ||
-      (is_binary && !parser_is_unary_operator(parser->current_token.type))) {
+      (is_binary && !is_unary) ||
+      // Ambiguous prefix operator (`&`/`*`/`+`/`-`) after a token that does not
+      // look like a type: treat `(name) <op> x` as a parenthesized expression
+      // followed by a binary operator, not a cast of a unary expression.
+      (is_binary && is_unary && !looks_like_type)) {
     free(type_name);
     parser_restore_state(parser, &saved);
     parser_discard_saved_state(&saved);

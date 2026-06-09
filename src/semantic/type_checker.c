@@ -4230,9 +4230,11 @@ int type_checker_process_declaration(TypeChecker *checker,
     // A function with a non-void return type must contain at least one
     // return statement. This is a simple body-walk (a missing return on
     // some paths is not yet diagnosed); a function with no return at all
-    // would otherwise compile and return garbage from RAX/XMM0.
+    // would otherwise compile and return garbage from RAX/XMM0. `main` is
+    // exempt: the entry point falls through to an implicit `return 0`.
     if (func_decl->body && return_type &&
         return_type->kind != TYPE_VOID &&
+        strcmp(func_decl->name, "main") != 0 &&
         !type_checker_ast_contains_node_type(func_decl->body,
                                              AST_RETURN_STATEMENT)) {
       type_checker_set_error_at_location(
