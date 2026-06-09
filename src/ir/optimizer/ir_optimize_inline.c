@@ -263,6 +263,10 @@ int ir_clone_instruction_plain(const IRInstruction *source,
   out->location = source->location;
   out->is_float = source->is_float;
   out->float_bits = source->float_bits;
+  /* is_unsigned carries codegen-critical signedness: unsigned div/rem/shr and
+   * zero-extending uint8/16/32 loads. Dropping it here (it only runs at -O)
+   * silently reverts those to signed -- a uint32-as-signed miscompile. */
+  out->is_unsigned = source->is_unsigned;
   out->ast_ref = source->ast_ref;
 
   if (!ir_operand_clone(&source->dest, &out->dest) ||
@@ -314,6 +318,7 @@ static int ir_clone_instruction_for_inline(const IRInstruction *source,
   out->location = source->location;
   out->is_float = source->is_float;
   out->float_bits = source->float_bits;
+  out->is_unsigned = source->is_unsigned; /* unsigned div/shr + zero-ext loads */
   out->ast_ref = NULL;
 
   if (!ir_inline_rewrite_operand(&source->dest, &out->dest, symbol_map,
