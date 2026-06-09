@@ -66,6 +66,19 @@ static int ir_region_vectorized_op(const IRFunction *function, size_t begin,
   return -1;
 }
 
+/* A branch/jump whose target is one of the runtime-check labels the lowerer
+ * injects (null-check, bounds-check). These appear per pointer/array access at
+ * -O (they're absent at --release), so they must NOT count as user control flow
+ * -- otherwise every loop that touches a pointer is misreported as having "its
+ * own control flow". */
+static int ir_label_is_runtime_check(const char *label) {
+  if (!label) {
+    return 0;
+  }
+  return strstr(label, "trap_null") != NULL || strstr(label, "nonnull") != NULL ||
+         strstr(label, "trap_bounds") != NULL || strstr(label, "in_bounds") != NULL;
+}
+
 /* Best-effort explanation of why a loop the user marked `@simd` did not
  * vectorize, derived from the surviving scalar IR between the markers. A clean
  * counted loop has exactly one exit test (branch) and one back-edge (jump);
@@ -95,10 +108,14 @@ static const char *ir_simd_bail_reason(const IRFunction *function, size_t begin,
       break;
     case IR_OP_BRANCH_ZERO:
     case IR_OP_BRANCH_EQ:
-      branch_count++;
+      if (!ir_label_is_runtime_check(ins->text)) {
+        branch_count++;
+      }
       break;
     case IR_OP_JUMP:
-      jump_count++;
+      if (!ir_label_is_runtime_check(ins->text)) {
+        jump_count++;
+      }
       break;
     default:
       break;

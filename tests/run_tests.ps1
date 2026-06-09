@@ -171,6 +171,15 @@ $cases = @(
     Args          = @("-O")
     Pattern       = "@simd! loop was not vectorized: the loop body has its own control flow"
   },
+  @{
+    # A pointer-deref loop with no user control flow must NOT be misreported as
+    # "control flow" at -O (the null-check branch is excluded from the heuristic).
+    Name          = "err_simd_contract_stride"
+    Path          = "tests/err_simd_contract_stride.mettle"
+    ShouldSucceed = $false
+    Args          = @("-O")
+    Pattern       = "@simd! loop was not vectorized: the loop shape is not vectorizable"
+  },
   @{ Name = "const_top_level"; Path = "tests/test_const_top_level.mettle"; ShouldSucceed = $true },
   @{ Name = "err_const_no_init"; Path = "tests/err_const_no_init.mettle"; ShouldSucceed = $false; Pattern = "Constant declaration requires an initializer" },
   @{ Name = "err_const_assign"; Path = "tests/err_const_assign.mettle"; ShouldSucceed = $false; Pattern = "is a constant and cannot be assigned to" },
