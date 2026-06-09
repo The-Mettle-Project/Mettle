@@ -189,6 +189,18 @@ $cases = @(
     Args          = @("-O")
     Pattern       = "@simd! loop was not vectorized: the loop accesses 64-bit integers"
   },
+  @{
+    # Function-level `@simd!` is a hard contract on every counted body loop.
+    Name          = "err_simd_fn_contract"
+    Path          = "tests/err_simd_fn_contract.mettle"
+    ShouldSucceed = $false
+    Args          = @("-O")
+    Pattern       = "@simd! loop was not vectorized"
+  },
+  @{ Name = "err_decorator_on_loop"; Path = "tests/err_decorator_on_loop.mettle"; ShouldSucceed = $false; Pattern = "apply to a function, not a loop" },
+  @{ Name = "err_decorator_unknown"; Path = "tests/err_decorator_unknown.mettle"; ShouldSucceed = $false; Pattern = "Unknown decorator after" },
+  @{ Name = "err_decorator_conflict"; Path = "tests/err_decorator_conflict.mettle"; ShouldSucceed = $false; Pattern = "mutually exclusive" },
+  @{ Name = "err_decorator_on_struct"; Path = "tests/err_decorator_on_struct.mettle"; ShouldSucceed = $false; Pattern = "may only precede a function declaration" },
   @{ Name = "const_top_level"; Path = "tests/test_const_top_level.mettle"; ShouldSucceed = $true },
   @{ Name = "err_const_no_init"; Path = "tests/err_const_no_init.mettle"; ShouldSucceed = $false; Pattern = "Constant declaration requires an initializer" },
   @{ Name = "err_const_assign"; Path = "tests/err_const_assign.mettle"; ShouldSucceed = $false; Pattern = "is a constant and cannot be assigned to" },
@@ -330,6 +342,12 @@ $cases = @(
   @{
     Name          = "import_namespaced"
     Path          = "tests/test_import_namespaced.mettle"
+    ShouldSucceed = $true
+    Args          = @("-I", "tests/lib")
+  },
+  @{
+    Name          = "import_selective"
+    Path          = "tests/test_import_selective.mettle"
     ShouldSucceed = $true
     Args          = @("-I", "tests/lib")
   },
@@ -829,6 +847,34 @@ $cases = @(
     Args          = @("-I", "tests/lib")
   },
   @{
+    Name          = "err_import_namespaced_private"
+    Path          = "tests/err_import_namespaced_private.mettle"
+    ShouldSucceed = $false
+    Pattern       = "Undefined variable|private_bonus"
+    Args          = @("-I", "tests/lib")
+  },
+  @{
+    Name          = "err_import_selective_missing"
+    Path          = "tests/err_import_selective_missing.mettle"
+    ShouldSucceed = $false
+    Pattern       = "missing_symbol|no top-level declaration"
+    Args          = @("-I", "tests/lib")
+  },
+  @{
+    Name          = "err_import_selective_private"
+    Path          = "tests/err_import_selective_private.mettle"
+    ShouldSucceed = $false
+    Pattern       = "private_bonus|not exported"
+    Args          = @("-I", "tests/lib")
+  },
+  @{
+    Name          = "err_import_selective_private_dependency"
+    Path          = "tests/err_import_selective_private_dependency.mettle"
+    ShouldSucceed = $false
+    Pattern       = "Undefined variable|private_bonus"
+    Args          = @("-I", "tests/lib")
+  },
+  @{
     Name               = "err_import_bad_syntax_location"
     Path               = "tests/test_import_bad_syntax_location.mettle"
     ShouldSucceed      = $false
@@ -1122,6 +1168,56 @@ foreach ($case in $simdRuntimeCases) {
     $failed++
     Write-CaseResult -Name $case.Name -Passed $false -Reason $_.Exception.Message
   }
+}
+
+# Function decorators: build a release binary exercising @pure + @noinline
+# (loop-invariant pure-call hoisting), @inline (forced past the call-count
+# heuristic), and @simd! on a function (per-body-loop vectorization contract).
+# Confirm the IR shows each transform and that the program is still correct.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "decorators.exe"
+  $objPath = [System.IO.Path]::ChangeExtension($exePath, ".obj")
+  $irPath = "$objPath.ir"
+  foreach ($artifactPath in @($exePath, $objPath, $irPath)) {
+    if (Test-Path $artifactPath) {
+      Remove-Item -Path $artifactPath -Force -ErrorAction SilentlyContinue
+    }
+  }
+
+  $buildOut = & $CompilerPath --build --linker internal --release --dump-ir "tests\test_decorators.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "decorators build failed: $buildOut"
+  }
+  if (-not (Test-Path $exePath)) {
+    throw "decorators build did not produce an executable"
+  }
+  if (-not (Test-Path $irPath)) {
+    throw "decorators IR output file not produced"
+  }
+  $irText = Get-Content -Path $irPath -Raw
+  if ($irText -notmatch "licm_pure_") {
+    throw "decorators IR missing 'licm_pure_' (pure-call LICM did not fire)"
+  }
+  if ($irText -notmatch "sum_i32") {
+    throw "decorators IR missing 'sum_i32' (@simd! function did not vectorize)"
+  }
+  if ($irText -match "many_calls\(") {
+    throw "decorators IR still calls 'many_calls' (@inline did not force inlining)"
+  }
+
+  $runOut = & $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "decorators executable exited with $LASTEXITCODE`: $runOut"
+  }
+  if ($runOut -notmatch "DECORATORS OK") {
+    throw "decorators output missing expected marker: $runOut"
+  }
+  Write-CaseResult -Name "decorators" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "decorators" -Passed $false -Reason $_.Exception.Message
 }
 
 # Native heap: build with --native-heap and confirm new/malloc/calloc/realloc/
