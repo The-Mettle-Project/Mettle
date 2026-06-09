@@ -178,7 +178,16 @@ $cases = @(
     Path          = "tests/err_simd_contract_stride.mettle"
     ShouldSucceed = $false
     Args          = @("-O")
-    Pattern       = "@simd! loop was not vectorized: the loop shape is not vectorizable"
+    Pattern       = "@simd! loop was not vectorized: no vectorizer recognized this loop's shape"
+  },
+  @{
+    # Element-type detection: a 64-bit-int loop reports the precise cause, not
+    # the generic shape fallback.
+    Name          = "err_simd_contract_i64"
+    Path          = "tests/err_simd_contract_i64.mettle"
+    ShouldSucceed = $false
+    Args          = @("-O")
+    Pattern       = "@simd! loop was not vectorized: the loop accesses 64-bit integers"
   },
   @{ Name = "const_top_level"; Path = "tests/test_const_top_level.mettle"; ShouldSucceed = $true },
   @{ Name = "err_const_no_init"; Path = "tests/err_const_no_init.mettle"; ShouldSucceed = $false; Pattern = "Constant declaration requires an initializer" },

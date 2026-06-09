@@ -88,6 +88,7 @@ static const char *ir_simd_bail_reason(const IRFunction *function, size_t begin,
                                        size_t end) {
   int has_call = 0, has_new = 0, has_asm = 0;
   int branch_count = 0, jump_count = 0;
+  int has_i16 = 0, has_i64 = 0; /* unsupported memory element widths */
   for (size_t i = begin + 1; i < end; i++) {
     const IRInstruction *ins = &function->instructions[i];
     switch (ins->op) {
@@ -117,6 +118,21 @@ static const char *ir_simd_bail_reason(const IRFunction *function, size_t begin,
         jump_count++;
       }
       break;
+    case IR_OP_LOAD:
+    case IR_OP_STORE: {
+      /* Vectorizable element widths: 1 (int8/uint8), 4 (int32/float32),
+       * 8-float (float64). 16-bit ints and 64-bit ints have no kernel. The
+       * load/store size lives in rhs; is_float distinguishes f64 from i64. */
+      long long sz = (ins->rhs.kind == IR_OPERAND_INT) ? ins->rhs.int_value : 4;
+      if (!ins->is_float) {
+        if (sz == 2) {
+          has_i16 = 1;
+        } else if (sz == 8) {
+          has_i64 = 1;
+        }
+      }
+      break;
+    }
     default:
       break;
     }
@@ -135,8 +151,19 @@ static const char *ir_simd_bail_reason(const IRFunction *function, size_t begin,
     return "the loop body has its own control flow (a nested loop or a "
            "data-dependent branch); only straight-line loop bodies vectorize";
   }
-  return "the loop shape is not vectorizable (check for a non-unit stride, a "
-         "loop-carried dependence, or an unsupported element type)";
+  if (has_i16) {
+    return "the loop accesses 16-bit integers, which have no vectorizer "
+           "(use int32/int8, or float32/float64)";
+  }
+  if (has_i64) {
+    return "the loop accesses 64-bit integers, which have no vectorizer "
+           "(use int32/int8, or float32/float64)";
+  }
+  /* Honest fallback: we've ruled out the disqualifiers we can detect, so the
+   * truthful statement is that no kernel claimed this shape -- NOT an assertion
+   * of a specific cause we haven't verified. */
+  return "no vectorizer recognized this loop's shape (e.g. a non-unit stride, "
+         "a loop-carried dependence, or a reduction/operation no kernel covers)";
 }
 
 static void ir_clear_simd_markers(IRFunction *function) {
