@@ -1,0 +1,72 @@
+// Differential/correctness coverage for the float vectorizers (no fuzzer
+// coverage today). Each kernel is @simd! so the --release BUILD asserts it
+// vectorized; main checks the vectorized result against a closed-form value.
+// Inputs are chosen so reductions are exact regardless of reassociation.
+// Returns the number of failures (0 = all correct).
+
+function vmap_f64(out: float64*, a: float64*, n: int32) {
+  @simd! for i in 0..n { out[i] = a[i] * 2.0 + 1.0; }
+}
+function vscale_f64(a: float64*, n: int32) {
+  @simd! for i in 0..n { a[i] = a[i] * 3.0; }
+}
+function vsum_f64(a: float64*, n: int32) -> float64 {
+  var s: float64 = 0.0;
+  @simd! for i in 0..n { s = s + a[i]; }
+  return s;
+}
+function vsum_f32(a: float32*, n: int32) -> float32 {
+  var s: float32 = 0.0;
+  @simd! for i in 0..n { s = s + a[i]; }
+  return s;
+}
+function vdot_f64(a: float64*, b: float64*, n: int32) -> float64 {
+  var s: float64 = 0.0;
+  @simd! for i in 0..n { s = s + a[i] * b[i]; }
+  return s;
+}
+function vdot_f32(a: float32*, b: float32*, n: int32) -> float32 {
+  var s: float32 = 0.0;
+  @simd! for i in 0..n { s = s + a[i] * b[i]; }
+  return s;
+}
+
+function fabs64(x: float64) -> float64 { if (x < 0.0) { return 0.0 - x; } return x; }
+
+function main() -> int32 {
+  var n: int32 = 1024;
+  var bad: int32 = 0;
+  var a: float64[1024];
+  var b: float64[1024];
+  var out: float64[1024];
+  var af: float32[1024];
+  var bf: float32[1024];
+
+  // vmap_f64: a[i]=i -> out[i] = 2i+1
+  for i in 0..n { a[i] = (float64)i; }
+  vmap_f64(&out[0], &a[0], n);
+  for i in 0..n { if (fabs64(out[i] - ((float64)i * 2.0 + 1.0)) > 0.0001) { bad = bad + 1; } }
+
+  // vscale_f64: a[i]=i -> a[i] = 3i
+  for i in 0..n { a[i] = (float64)i; }
+  vscale_f64(&a[0], n);
+  for i in 0..n { if (fabs64(a[i] - (float64)i * 3.0) > 0.0001) { bad = bad + 1; } }
+
+  // vsum_f64: a[i]=1.0 -> sum = n  (exact)
+  for i in 0..n { a[i] = 1.0; }
+  if (fabs64(vsum_f64(&a[0], n) - (float64)n) > 0.0001) { bad = bad + 1; }
+
+  // vsum_f32: a[i]=1.0 -> sum = n
+  for i in 0..n { af[i] = 1.0; }
+  if (fabs64((float64)vsum_f32(&af[0], n) - (float64)n) > 0.01) { bad = bad + 1; }
+
+  // vdot_f64: a[i]=2, b[i]=3 -> sum = 6n  (exact)
+  for i in 0..n { a[i] = 2.0; b[i] = 3.0; }
+  if (fabs64(vdot_f64(&a[0], &b[0], n) - (float64)n * 6.0) > 0.0001) { bad = bad + 1; }
+
+  // vdot_f32: a[i]=2, b[i]=3 -> sum = 6n
+  for i in 0..n { af[i] = 2.0; bf[i] = 3.0; }
+  if (fabs64((float64)vdot_f32(&af[0], &bf[0], n) - (float64)n * 6.0) > 0.1) { bad = bad + 1; }
+
+  return bad;
+}

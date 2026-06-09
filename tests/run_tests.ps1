@@ -2927,6 +2927,27 @@ catch {
   Write-CaseResult -Name "simd_saxpy_vectorized" -Passed $false -Reason $_.Exception.Message
 }
 
+# Float vectorizer correctness coverage (the differential fuzzer is integer-only,
+# so these recognizers had no continuous coverage). Each kernel is @simd!, so the
+# --release build asserts it vectorized; the run checks the vectorized result vs
+# a closed-form value. Covers affine map, in-place scale, and sum/dot for f32+f64.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "float_vectorizers.exe"
+  $buildOut = & $CompilerPath --build --release "tests/test_float_vectorizers.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "release build failed (a @simd! kernel stopped vectorizing?): $buildOut" }
+  if (-not (Test-Path $exePath)) { throw "release build produced no executable" }
+  & $exePath 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "a vectorized float kernel diverged from its closed-form result ($LASTEXITCODE failures)"
+  }
+  Write-CaseResult -Name "simd_float_vectorizers" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "simd_float_vectorizers" -Passed $false -Reason $_.Exception.Message
+}
+
 # Direct object backend globals: scalar definitions plus extern-global symbol emission
 $total++
 try {
