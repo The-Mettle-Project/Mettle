@@ -421,6 +421,34 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
     return 1;
   }
 
+  /* Leave PURE reductions (a self-accumulate `acc = acc OP <loaded>`, acc != iv,
+   * and NO array store) alone: the SIMD sum/dot recognizers handle them far
+   * better but need the loop in INDEXED form, and walking the load pointer here
+   * would hide that shape. A loop that ALSO stores to an array is a real map
+   * (sum_i32 etc. won't claim it anyway), so pointer-induction must still run.
+   * Safe -- this only declines an optimization, never changes results. */
+  {
+    int loop_has_reduction = 0;
+    int loop_has_store = 0;
+    for (size_t i = body_start; i < body_end; i++) {
+      const IRInstruction *ins = &function->instructions[i];
+      if (ins->op == IR_OP_STORE) {
+        loop_has_store = 1;
+      }
+      if (ins->op == IR_OP_BINARY && ins->text &&
+          (strcmp(ins->text, "+") == 0 || strcmp(ins->text, "-") == 0) &&
+          ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name &&
+          (!iv_symbol || strcmp(ins->dest.name, iv_symbol) != 0) &&
+          (ir_operand_is_symbol_named(&ins->lhs, ins->dest.name) ||
+           ir_operand_is_symbol_named(&ins->rhs, ins->dest.name))) {
+        loop_has_reduction = 1;
+      }
+    }
+    if (loop_has_reduction && !loop_has_store) {
+      return 1;
+    }
+  }
+
   /* Set when an iv-indexed access cannot be converted to a pointer-walk (its
    * base is not an i32 ptr param — e.g. a local pointer like (int32*)&G[off]).
    * Such an access keeps the induction variable (and its `iv << 2` byte-offset

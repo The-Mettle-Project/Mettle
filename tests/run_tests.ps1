@@ -2948,6 +2948,25 @@ catch {
   Write-CaseResult -Name "simd_float_vectorizers" -Passed $false -Reason $_.Exception.Message
 }
 
+# Coverage: the cast-free int32->int64 reduction `s += a[i]` now vectorizes
+# (pointer-induction leaves reductions indexed; sum_i32 admits the implicit
+# widen). Verify the vectorized result matches the closed form (negative inputs
+# stress the signed widening).
+$total++
+try {
+  $exePath = Join-Path $tmpDir "int_sum_nocast.exe"
+  $buildOut = & $CompilerPath --build --release "tests/test_int_sum_nocast.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "release build failed: $buildOut" }
+  if (-not (Test-Path $exePath)) { throw "release build produced no executable" }
+  & $exePath 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "vectorized cast-free int sum diverged from closed form (exit $LASTEXITCODE)" }
+  Write-CaseResult -Name "simd_int_sum_nocast" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "simd_int_sum_nocast" -Passed $false -Reason $_.Exception.Message
+}
+
 # Direct object backend globals: scalar definitions plus extern-global symbol emission
 $total++
 try {
