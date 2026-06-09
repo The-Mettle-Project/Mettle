@@ -1423,8 +1423,17 @@ int code_generator_binary_emit_operand_load(
           operand->name ? operand->name : "<unnamed>", context->function_name);
       return 0;
     }
+    /* A local's symbol is usually out of scope in the symbol table by codegen
+     * time (the scope was popped), so symbol_table_lookup returns NULL and the
+     * stack load would default to a signed 8-byte read — sign-extending a
+     * narrow unsigned local (e.g. uint32) and corrupting its value. Resolve the
+     * type from the IR (parameter signature / DECLARE_LOCAL) so the load uses
+     * the correct width and signedness. */
+    Type *load_type = symbol ? symbol->type
+                             : code_generator_binary_get_operand_type_in_context(
+                                   generator, context, operand);
     return code_generator_binary_emit_symbol_stack_load(
-        generator, context, symbol, offset, target_register);
+        generator, context, load_type, offset, target_register);
   }
 
   default:
@@ -2649,8 +2658,10 @@ int code_generator_binary_emit_load(CodeGenerator *generator,
   }
   /* x86-64: 32-bit integer loads into the low half zero-extend the register.
    * Signed int32 must sign-extend to int64 when held in a 64-bit slot/register.
-   * Skip when dest is int32. */
-  if (size == 4 && !instruction->is_float &&
+   * Skip when dest is int32. A load tagged is_unsigned (uint8/16/32 pointee, set
+   * at lowering) must stay zero-extended -- without this its high bits get sign-
+   * extended and 64-bit ops (compare/divide/(int64) widening) read garbage. */
+  if (size == 4 && !instruction->is_float && !instruction->is_unsigned &&
       code_generator_binary_load_needs_sign_extend(generator, context,
                                                    &instruction->dest, size) &&
       !binary_emit_movsxd_reg_reg32(&context->code, value_register,

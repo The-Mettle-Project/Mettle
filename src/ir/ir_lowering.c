@@ -2404,6 +2404,20 @@ static void ir_load_apply_float_type(IRInstruction *load, Type *loaded_type) {
   load->dest.float_bits = load->float_bits;
 }
 
+/* Record that a load reads an UNSIGNED integer, so the backend zero-extends it
+ * (instead of the default sign-extension for a 4-byte load into a temp). Without
+ * this a uint32 loaded from a uint32* lands in the register sign-extended, and
+ * later 64-bit ops (compare/divide/(int64) widening) read the wrong value. */
+static void ir_load_apply_unsigned(IRInstruction *load, Type *loaded_type) {
+  if (!load || !loaded_type) {
+    return;
+  }
+  if (loaded_type->kind == TYPE_UINT8 || loaded_type->kind == TYPE_UINT16 ||
+      loaded_type->kind == TYPE_UINT32 || loaded_type->kind == TYPE_UINT64) {
+    load->is_unsigned = 1;
+  }
+}
+
 /* Resolve the float width of an expression via the type checker. Returns 0
  * when the expression is not floating, else 32 or 64. */
 static int ir_expression_float_bits(IRLoweringContext *context,
@@ -3758,6 +3772,7 @@ static int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
       load.lhs = address;
       load.rhs = ir_operand_int(ir_type_storage_size(target_type));
       ir_load_apply_float_type(&load, target_type);
+      ir_load_apply_unsigned(&load, target_type);
       if (!ir_emit(context, function, &load)) {
         ir_operand_destroy(&destination);
         ir_operand_destroy(&address);
@@ -3863,6 +3878,7 @@ static int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
     load.lhs = address;
     load.rhs = ir_operand_int(ir_type_storage_size(value_type));
     ir_load_apply_float_type(&load, value_type);
+    ir_load_apply_unsigned(&load, value_type);
     if (!ir_emit(context, function, &load)) {
       ir_operand_destroy(&destination);
       ir_operand_destroy(&address);

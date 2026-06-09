@@ -1822,7 +1822,7 @@ int code_generator_binary_emit_temp_stack_store(
 }
 
 int code_generator_binary_emit_symbol_stack_load(
-    CodeGenerator *generator, BinaryFunctionContext *context, Symbol *symbol,
+    CodeGenerator *generator, BinaryFunctionContext *context, Type *type,
     int stack_offset, BinaryGpRegister target_register) {
   int size = 8;
   int is_signed = 0;
@@ -1831,9 +1831,9 @@ int code_generator_binary_emit_symbol_stack_load(
     return 0;
   }
 
-  if (symbol && symbol->type) {
-    size = code_generator_binary_resolved_type_scalar_size(symbol->type);
-    is_signed = code_generator_binary_resolved_type_is_signed_integer(symbol->type);
+  if (type) {
+    size = code_generator_binary_resolved_type_scalar_size(type);
+    is_signed = code_generator_binary_resolved_type_is_signed_integer(type);
   }
 
   switch (size) {

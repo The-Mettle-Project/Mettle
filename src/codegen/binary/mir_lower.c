@@ -2275,7 +2275,8 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
       int fb = code_generator_binary_instruction_result_float_bits(g, ctx, in);
       return mir_emit_fmov(fn, dst, mem, fb ? fb / 8 : size);
     }
-    int sign_ext = code_generator_binary_load_needs_sign_extend(g, ctx,
+    int sign_ext = !in->is_unsigned &&
+                   code_generator_binary_load_needs_sign_extend(g, ctx,
                                                                &in->dest, size);
     return mir_emit1(fn, MIR_MOV, dst, mem, mir_op_none(), size,
                      sign_ext ? 0 : 1, 0);
@@ -3015,8 +3016,9 @@ static int mir_lower_folded_access(MirFunction *fn, CodeGenerator *g,
   }
   if (in->op == IR_OP_LOAD) {
     MirOperand dst = mir_value_operand(fn, g, ctx, map, &in->dest);
-    int sign_ext =
-        code_generator_binary_load_needs_sign_extend(g, ctx, &in->dest, size);
+    int sign_ext = !in->is_unsigned &&
+                   code_generator_binary_load_needs_sign_extend(g, ctx,
+                                                               &in->dest, size);
     return mir_emit1(fn, MIR_MOV, dst, mem, mir_op_none(), size,
                      sign_ext ? 0 : 1, 0);
   }

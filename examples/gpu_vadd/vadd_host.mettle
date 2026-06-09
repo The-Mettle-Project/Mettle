@@ -1,0 +1,54 @@
+// Host program that drives the GPU through std/gpu (the CUDA Driver API) and
+// launches the Mettle-emitted vadd kernel with the `dispatch` statement.
+//
+// Build (links the CUDA driver import stub; adjust the path to your toolkit):
+//   mettle --emit-ptx vadd_kernel.mettle -o vadd_kernel.ptx
+//   mettle --build vadd_host.mettle -o vadd_host.exe \
+//     --link-arg "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.9/lib/x64/cuda.lib"
+import "std/io";
+import "std/mem";
+import "std/gpu";
+
+function main() -> int32 {
+  if (gpu_init() == 0) { println(cstr("GPU init failed")); return 1; }
+
+  // load the emitted PTX module and resolve the kernel
+  var fp: cstring = fopen(cstr("G:/Projects/Mettle/examples/gpu_vadd/vadd_kernel.ptx"), cstr("rb"));
+  if (fp == 0) { println(cstr("open vadd_kernel.ptx failed (emit it first)")); return 1; }
+  var ptx: uint8* = (uint8*)malloc(65536);
+  var pl: int64 = fread((cstring)ptx, 1, 65535, fp); fclose(fp); ptx[pl] = 0;
+  var mod: int64 = gpu_module(ptx);
+  var vadd: int64 = gpu_func(mod, cstr("vadd"));
+  if (vadd == 0) { println(cstr("kernel 'vadd' not found")); return 1; }
+
+  // host data: a[i]=i, b[i]=2i  ->  expect c[i]=3i
+  var n: int32 = 1 << 20;
+  var bytes: int64 = (int64)n * 4;
+  var ha: float32* = (float32*)malloc(bytes);
+  var hb: float32* = (float32*)malloc(bytes);
+  var hc: float32* = (float32*)malloc(bytes);
+  var i: int32 = 0;
+  while (i < n) { ha[i] = (float32)i; hb[i] = (float32)(2 * i); i = i + 1; }
+
+  // device buffers (explicit -- you own VRAM)
+  var da: int64 = gpu_malloc(bytes);
+  var db: int64 = gpu_malloc(bytes);
+  var dc: int64 = gpu_malloc(bytes);
+  gpu_to_device(da, (uint8*)ha, bytes);
+  gpu_to_device(db, (uint8*)hb, bytes);
+
+  // launch: one line instead of param-packing + cuLaunchKernel + sync
+  dispatch vadd[(n + 255) / 256, 256](da, db, dc, n);
+
+  gpu_to_host((uint8*)hc, dc, bytes);
+
+  var ok: int32 = 1; i = 0;
+  while (i < n) { if (hc[i] != (float32)(3 * i)) { ok = 0; } i = i + 1; }
+  print(cstr("c[1]=")); print_int((int64)hc[1]);
+  print(cstr("  c[n-1]=")); print_int((int64)hc[n - 1]); println(cstr(""));
+  if (ok == 1) { println(cstr("GPU vadd correct (kernel + dispatch)")); }
+  else { println(cstr("MISMATCH")); }
+
+  gpu_free(da); gpu_free(db); gpu_free(dc);
+  return 0;
+}

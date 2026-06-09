@@ -145,6 +145,12 @@ $cases = @(
   @{ Name = "switch_range"; Path = "tests/test_switch_range.mettle"; ShouldSucceed = $true },
   @{ Name = "range_for"; Path = "tests/test_range_for.mettle"; ShouldSucceed = $true },
   @{
+    Name          = "gpu_dispatch"
+    Path          = "tests/test_gpu_dispatch.mettle"
+    ShouldSucceed = $true
+    Args          = @("--emit-obj")
+  },
+  @{
     Name          = "simd_contract"
     Path          = "tests/test_simd_contract.mettle"
     ShouldSucceed = $true
@@ -2824,7 +2830,8 @@ $directObjectScalarCases = @(
   @{ Name = "direct_object_cast_expression"; Path = "tests/test_cast_expression.mettle"; ExitCode = 0; Label = "cast-expression" },
   @{ Name = "direct_object_int32_load_sign_ext"; Path = "tests/test_direct_object_int32_load_sign_ext.mettle"; ExitCode = 0; Label = "int32-load-sign-ext" },
   @{ Name = "direct_object_int32_call_return_compare"; Path = "tests/test_int32_call_return_compare.mettle"; ExitCode = 1; Label = "int32-call-return-compare" },
-  @{ Name = "direct_object_uint32_cross_lineage_eq"; Path = "tests/test_uint32_cross_lineage_eq.mettle"; ExitCode = 0; Label = "uint32-cross-lineage-eq" }
+  @{ Name = "direct_object_uint32_cross_lineage_eq"; Path = "tests/test_uint32_cross_lineage_eq.mettle"; ExitCode = 0; Label = "uint32-cross-lineage-eq" },
+  @{ Name = "direct_object_uint32_signed_in_large_fn"; Path = "tests/test_uint32_signed_in_large_fn.mettle"; ExitCode = 0; Label = "uint32-signed-in-large-fn" }
 )
 
 foreach ($case in $directObjectScalarCases) {
@@ -3683,7 +3690,8 @@ if (-not $ptxas) {
 }
 else {
   foreach ($src in @("examples/llm/qwen3/gpu/kernels.mettle",
-                     "examples/llm/qwen3/gpu/ptx_stress.mettle")) {
+                     "examples/llm/qwen3/gpu/ptx_stress.mettle",
+                     "examples/gpu_vadd/vadd_kernel.mettle")) {
     $total++
     $name = "ptx_emit_" + [System.IO.Path]::GetFileNameWithoutExtension($src)
     try {

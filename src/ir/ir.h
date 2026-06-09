@@ -217,6 +217,14 @@ typedef struct {
    * unspecified and is treated as 64 (double) for backward compatibility with
    * code paths that only ever produced float64. */
   int float_bits;
+  /* Set on an IR_OP_LOAD whose loaded scalar is an UNSIGNED integer (uint8/16/32),
+   * recorded from the pointee type at lowering time. A 32-bit load zero-extends
+   * into the 64-bit register on x86-64, but the backend otherwise sign-extends a
+   * 4-byte load into a temp (it cannot recover the load's signedness from the
+   * untyped destination temp). Honoring this flag keeps an unsigned value's high
+   * bits clean, so the 64-bit ops the fallback emits (compare, divide, (int64)
+   * widening) see the true value instead of a sign-extended one. */
+  int is_unsigned;
   ASTNode *ast_ref;
 } IRInstruction;
 

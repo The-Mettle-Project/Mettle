@@ -2497,6 +2497,10 @@ int compile_file(const char *input_filename, const char *output_filename,
   }
 
   parser = parser_create_with_error_reporter(lexer, error_reporter);
+  if (parser) {
+    /* Enable kernel index built-ins (thread.x etc.) for GPU compiles. */
+    parser->gpu_mode = options->emit_ptx;
+  }
   type_checker =
       type_checker_create_with_error_reporter(symbol_table, error_reporter);
   if (!parser || !type_checker) {

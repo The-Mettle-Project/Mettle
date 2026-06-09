@@ -71,6 +71,8 @@ Parser *parser_create_with_error_reporter(Lexer *lexer,
   parser->error_reporter = error_reporter;
   parser->error_recovery_mode = 0;
   parser->source_filename = error_reporter_current_filename(error_reporter);
+  parser->gpu_mode = 0;
+  parser->dispatch_counter = 0;
 
   if (parser->current_token.type == TOKEN_ERROR) {
     parser_report_lexer_token_error(parser, &parser->current_token);
@@ -619,6 +621,7 @@ ASTNode *parser_parse_declaration(Parser *parser) {
   case TOKEN_ERRDEFER:
     return parser_parse_errdefer_statement(parser);
   case TOKEN_FUNCTION:
+  case TOKEN_KERNEL:
     return parser_parse_function_declaration(parser);
   case TOKEN_STRUCT:
     return parser_parse_struct_declaration(parser);
@@ -731,6 +734,8 @@ static ASTNode *parser_parse_assignment_from_target(Parser *parser,
   return ast_create_field_assignment(target, value, target->location);
 }
 
+static ASTNode *parser_parse_dispatch_statement(Parser *parser);
+
 ASTNode *parser_parse_statement(Parser *parser) {
   if (!parser)
     return NULL;
@@ -815,6 +820,8 @@ ASTNode *parser_parse_statement(Parser *parser) {
     return parser_parse_while_statement(parser);
   case TOKEN_FOR:
     return parser_parse_for_statement(parser);
+  case TOKEN_DISPATCH:
+    return parser_parse_dispatch_statement(parser);
   case TOKEN_SWITCH:
     return parser_parse_switch_statement(parser);
   case TOKEN_MATCH:
@@ -1835,6 +1842,40 @@ static int parser_try_parse_generic_call_type_args(Parser *parser,
   return 0;
 }
 
+// Kernel index built-ins: maps `<obj>.<axis>` to its GPU sreg intrinsic
+// link-name (gpu_tid_x etc.), or NULL if not a built-in. Mirrors CUDA:
+//   thread.x     -> gpu_tid_x     (threadIdx.x)
+//   block.x      -> gpu_ctaid_x   (blockIdx.x)
+//   block_dim.x  -> gpu_ntid_x    (blockDim.x)
+//   grid_dim.x   -> gpu_nctaid_x  (gridDim.x)
+// Only consulted in --emit-ptx (gpu_mode) compiles. Returns a pointer into a
+// static buffer (single-threaded parse; copied immediately by the caller).
+static const char *parser_gpu_index_intrinsic(const char *obj,
+                                              const char *axis) {
+  if (!obj || !axis || axis[0] == 0 || axis[1] != 0) {
+    return NULL;
+  }
+  char a = axis[0];
+  if (a != 'x' && a != 'y' && a != 'z') {
+    return NULL;
+  }
+  const char *base = NULL;
+  if (strcmp(obj, "thread") == 0) {
+    base = "gpu_tid_";
+  } else if (strcmp(obj, "block") == 0) {
+    base = "gpu_ctaid_";
+  } else if (strcmp(obj, "block_dim") == 0) {
+    base = "gpu_ntid_";
+  } else if (strcmp(obj, "grid_dim") == 0) {
+    base = "gpu_nctaid_";
+  } else {
+    return NULL;
+  }
+  static char buf[24];
+  snprintf(buf, sizeof(buf), "%s%c", base, a);
+  return buf;
+}
+
 ASTNode *parser_parse_postfix_expression(Parser *parser) {
   if (!parser)
     return NULL;
@@ -2034,8 +2075,25 @@ ASTNode *parser_parse_postfix_expression(Parser *parser) {
       char *member = strdup(parser->current_token.value);
       parser_advance(parser);
 
-      expr = ast_create_member_access(expr, member, location);
-      free(member);
+      // GPU kernel index built-ins: `thread.x` etc. desugar to a call to the
+      // corresponding gpu_* intrinsic (only in --emit-ptx compiles).
+      const char *gpu_intr = NULL;
+      if (parser->gpu_mode && expr->type == AST_IDENTIFIER && expr->data) {
+        gpu_intr =
+            parser_gpu_index_intrinsic(((Identifier *)expr->data)->name, member);
+      }
+      if (gpu_intr) {
+        ASTNode *call = ast_create_call_expression(gpu_intr, NULL, 0, location);
+        ast_destroy_node(expr);
+        free(member);
+        if (!call) {
+          return NULL;
+        }
+        expr = call;
+      } else {
+        expr = ast_create_member_access(expr, member, location);
+        free(member);
+      }
 
     } else if (parser->current_token.type == TOKEN_ARROW) {
       // Pointer member access: p->field == (*p).field
@@ -2544,10 +2602,13 @@ ASTNode *parser_parse_function_declaration(Parser *parser) {
 
   SourceLocation location = parser_current_location(parser);
   if (parser->current_token.type != TOKEN_FUNCTION &&
-      parser->current_token.type != TOKEN_FN) {
-    parser_set_error(parser, "Expected 'function' or 'fn'");
+      parser->current_token.type != TOKEN_FN &&
+      parser->current_token.type != TOKEN_KERNEL) {
+    parser_set_error(parser, "Expected 'function', 'fn', or 'kernel'");
     return NULL;
   }
+  // `kernel` is the GPU-facing spelling of a top-level function; it parses
+  // identically and is emitted as a PTX .entry by --emit-ptx.
   parser_advance(parser);
 
   // Expect function name
@@ -3810,6 +3871,176 @@ static ASTNode *parser_parse_range_for(Parser *parser, SourceLocation location) 
 
   return ast_create_for_statement(initializer, condition, increment, body,
                                   location);
+}
+
+static void parser_block_add(ASTNode *block, ASTNode *stmt) {
+  if (!block || !stmt) {
+    return;
+  }
+  Program *bd = (Program *)block->data;
+  ASTNode **grown =
+      realloc(bd->declarations, (bd->declaration_count + 1) * sizeof(ASTNode *));
+  if (!grown) {
+    return;
+  }
+  bd->declarations = grown;
+  bd->declarations[bd->declaration_count++] = stmt;
+  ast_add_child(block, stmt);
+}
+
+// GPU kernel launch: `dispatch K[grid, block](a0, a1, ...)`.
+// Desugars (launch-only) at parse time into a block that marshals the args into
+// a CUDA-style void** params array and calls std/gpu's gpu_launch:
+//   { var __a0 = a0; ...; var __p: int64[N];
+//     __p[0] = (int64)&__a0; ...;
+//     gpu_launch(K, grid, block, &__p[0], N); }
+// Each arg lives in a naturally-typed (inferred) local, so &__ai yields a
+// correctly-typed pointer and the kernel reads the right bytes -- no manual
+// per-arg type juggling. Device memory stays explicit (the user's call).
+static ASTNode *parser_parse_dispatch_statement(Parser *parser) {
+  SourceLocation loc = parser_current_location(parser);
+  parser_advance(parser); // consume 'dispatch'
+
+  if (parser->current_token.type != TOKEN_IDENTIFIER) {
+    parser_set_error(parser,
+                     "Expected a kernel handle (identifier) after 'dispatch'");
+    return NULL;
+  }
+  char *kernel_name = strdup(parser->current_token.value);
+  parser_advance(parser);
+
+  ASTNode *grid = NULL;
+  ASTNode *block = NULL;
+  ASTNode *args[64];
+  size_t nargs = 0;
+
+#define DISP_FAIL()                                                            \
+  do {                                                                         \
+    free(kernel_name);                                                         \
+    if (grid)                                                                  \
+      ast_destroy_node(grid);                                                  \
+    if (block)                                                                 \
+      ast_destroy_node(block);                                                 \
+    for (size_t _i = 0; _i < nargs; _i++)                                      \
+      ast_destroy_node(args[_i]);                                              \
+    return NULL;                                                               \
+  } while (0)
+
+  // [ grid , block ]
+  if (!parser_expect(parser, TOKEN_LBRACKET)) {
+    parser_set_error(parser, "Expected '[grid, block]' after the dispatch kernel");
+    DISP_FAIL();
+  }
+  grid = parser_parse_expression(parser);
+  if (!grid || !parser_expect(parser, TOKEN_COMMA)) {
+    if (grid && !parser->has_error)
+      parser_set_error(parser, "Expected ',' between grid and block in dispatch");
+    DISP_FAIL();
+  }
+  block = parser_parse_expression(parser);
+  if (!block || !parser_expect(parser, TOKEN_RBRACKET)) {
+    DISP_FAIL();
+  }
+
+  // ( args )
+  if (!parser_expect(parser, TOKEN_LPAREN)) {
+    parser_set_error(parser, "Expected '(' before dispatch arguments");
+    DISP_FAIL();
+  }
+  if (parser->current_token.type != TOKEN_RPAREN) {
+    while (1) {
+      if (nargs >= 64) {
+        parser_set_error(parser, "too many dispatch arguments (max 64)");
+        DISP_FAIL();
+      }
+      ASTNode *a = parser_parse_expression(parser);
+      if (!a) {
+        DISP_FAIL();
+      }
+      args[nargs++] = a;
+      if (parser->current_token.type == TOKEN_COMMA) {
+        parser_advance(parser);
+        continue;
+      }
+      break;
+    }
+  }
+  if (!parser_expect(parser, TOKEN_RPAREN)) {
+    DISP_FAIL();
+  }
+#undef DISP_FAIL
+
+  int uid = parser->dispatch_counter++;
+  char pname[32];
+  snprintf(pname, sizeof(pname), "__mdsp%d_p", uid);
+
+  ASTNode *blk = ast_create_program();
+  if (!blk) {
+    goto oom;
+  }
+
+  // var __mdsp<uid>_a<i> = arg_i;   (type inferred from the argument)
+  for (size_t i = 0; i < nargs; i++) {
+    char an[32];
+    snprintf(an, sizeof(an), "__mdsp%d_a%zu", uid, i);
+    parser_block_add(blk, ast_create_var_declaration(an, NULL, args[i], loc));
+    args[i] = NULL; // ownership moved into the var decl
+  }
+
+  if (nargs > 0) {
+    // var __mdsp<uid>_p: int64[N];
+    char ptype[24];
+    snprintf(ptype, sizeof(ptype), "int64[%zu]", nargs);
+    parser_block_add(blk, ast_create_var_declaration(pname, ptype, NULL, loc));
+    // __mdsp<uid>_p[i] = (int64)&__mdsp<uid>_a<i>;
+    for (size_t i = 0; i < nargs; i++) {
+      char an[32];
+      snprintf(an, sizeof(an), "__mdsp%d_a%zu", uid, i);
+      ASTNode *target = ast_create_array_index_expression(
+          ast_create_identifier(pname, loc), ast_create_number_literal((long long)i, loc, 10), loc);
+      ASTNode *addr =
+          ast_create_unary_expression("&", ast_create_identifier(an, loc), loc);
+      ASTNode *castv = ast_create_cast_expression("int64", addr, loc);
+      parser_block_add(blk, ast_create_field_assignment(target, castv, loc));
+    }
+  }
+
+  // gpu_launch(K, grid, block, &__p[0] | (int64*)0, N);
+  ASTNode *params_ptr;
+  if (nargs > 0) {
+    params_ptr = ast_create_unary_expression(
+        "&",
+        ast_create_array_index_expression(
+            ast_create_identifier(pname, loc),
+            ast_create_number_literal(0, loc, 10), loc),
+        loc);
+  } else {
+    params_ptr = ast_create_cast_expression(
+        "int64*", ast_create_number_literal(0, loc, 10), loc);
+  }
+  ASTNode *call_args[5];
+  call_args[0] = ast_create_identifier(kernel_name, loc);
+  call_args[1] = grid;
+  call_args[2] = block;
+  call_args[3] = params_ptr;
+  call_args[4] = ast_create_number_literal((long long)nargs, loc, 10);
+  parser_block_add(blk,
+                   ast_create_call_expression("gpu_launch", call_args, 5, loc));
+
+  free(kernel_name);
+  return blk;
+
+oom:
+  free(kernel_name);
+  if (grid)
+    ast_destroy_node(grid);
+  if (block)
+    ast_destroy_node(block);
+  for (size_t i = 0; i < nargs; i++)
+    if (args[i])
+      ast_destroy_node(args[i]);
+  parser_set_error(parser, "Out of memory desugaring dispatch");
+  return NULL;
 }
 
 ASTNode *parser_parse_for_statement(Parser *parser) {
