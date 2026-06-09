@@ -84,6 +84,82 @@ for (var i: int32 = 0; i < 10; i = i + 1) {
 
 **Infinite loop:** Use `for (;;)` when all three parts are omitted. This is idiomatic in systems code.
 
+### Range-based for
+
+`for i in lo..hi { ... }` iterates `i` over a half-open range. `lo..hi` is
+**exclusive** of `hi`; `lo..=hi` is **inclusive**:
+
+```mettle
+for i in 0..n      { sum = sum + a[i]; }   // i = 0, 1, ..., n-1
+for i in 0..=n     { /* i = 0, 1, ..., n */ }
+for i: int64 in 0..count { /* loop variable typed explicitly */ }
+```
+
+The loop variable's type is inferred from the start bound, or you may annotate
+it (`for i: int64 in ...`). A range-based `for` desugars at parse time into the
+ordinary counted `for` above: the start bound is evaluated once, the end bound
+is re-evaluated each iteration (so hoist a call-valued bound yourself if that
+matters). Labels work as usual: `outer: for i in 0..n { ... }`.
+
+> The `..`/`..=` distinction here is exclusive/inclusive. Note that switch-case
+> ranges (`case lo..hi:`) use `..` as **inclusive**, a historical inconsistency
+> to be aware of.
+
+## Vectorization contracts
+
+A counted loop may carry a `@simd` attribute that asks the optimizer to
+vectorize it. This only has effect under `-O` / `--release` (the auto-vectorizer
+runs only when optimizing); plain debug builds print one note that the contracts
+were not checked.
+
+```mettle
+@simd  for i in 0..n { c[i] = a[i] + b[i]; }   // best-effort: warn if not vectorized
+@simd! for i in 0..n { c[i] = a[i] + b[i]; }   // contract: compile ERROR if not vectorized
+```
+
+- **`@simd`** is a hint. If the loop vectorizes, nothing is printed; if it does
+  not, the compiler emits a *warning* explaining why and keeps the scalar loop.
+- **`@simd!`** is a hard contract. If the loop does not vectorize, compilation
+  **fails** with an error and a precise reason; the performance guarantee
+  cannot silently regress.
+
+Both attributes also apply to `while` loops. The diagnostic names the cause when
+it can determine it: a function call in the body, control flow (a nested loop or
+data-dependent branch), an unsupported element width (16- or 64-bit integers
+have no kernel), or, when none of those apply, that no vectorizer recognized
+the loop's shape.
+
+`@simd` may also sit on a **function**, where it becomes the default contract
+for *every* counted loop in the body that does not carry its own `@simd`:
+
+```mettle
+@simd! function sum(a: int32*, n: int64) -> int64 {
+  var s: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) { s = s + (int64)a[i]; i = i + 1; }   // inherits @simd! from the function
+  return s;
+}
+```
+
+A per-loop attribute always wins over the function default, so you can place a
+function-wide `@simd` and still relax (or tighten) an individual loop. Note that
+`@simd!` on a function is a hard contract on *all* its counted loops — if the
+body mixes vectorizable and non-vectorizable loops, annotate the loops
+individually instead. See [Function decorators](declarations.md#function-decorators).
+
+### `--simd-report`
+
+Pass `--simd-report` (with `-O`/`--release`) to have the compiler report what
+each `@simd` loop became:
+
+```
+kernels.mettle:10:10: note: @simd loop vectorized (simd_dot_i8)
+kernels.mettle:21:9:  warning: @simd loop was not vectorized: the loop body contains a function call
+```
+
+This makes the optimizer's decision legible instead of a black box: you can see
+exactly which kernel a loop lowered to, or why it stayed scalar.
+
 ## Switch
 
 The `switch` statement evaluates an expression and compares it to each `case` value. Case values must be compile-time constant integer expressions (including enum variants and `true`/`false`). When a case matches, its body runs. Use `break` to exit the switch. Use `continue` inside a loop that contains the switch to continue the loop. Only one `default` clause is allowed.

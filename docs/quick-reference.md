@@ -92,6 +92,56 @@ function main() -> int32 {
 }
 ```
 
+## Range-based for and `@simd`
+
+```mettle
+function dot(a: int8*, b: int8*, n: int32) -> int32 {
+  var s: int32 = 0;
+  @simd! for i in 0..n {              // 0..n exclusive; 0..=n inclusive
+    s = s + (int32)a[i] * (int32)b[i];
+  }
+  return s;                           // @simd! = compile error if it can't vectorize
+}
+```
+
+`@simd` is a best-effort hint (warns if not vectorized); `@simd!` is a hard
+contract. Both are checked under `-O`/`--release`; add `--simd-report` to see
+what each loop became. See [Control Flow](control-flow.md#vectorization-contracts).
+
+## Function decorators
+
+```mettle
+@inline   function f(x: int32) -> int32 { return x * 3; }   // force inline
+@noinline function g() -> int32 { return 1; }               // never inline
+@pure @noinline function w(t: int32*, k: int32) -> int32 { /* ... */ }
+@simd!    function s(a: int32*, n: int64) -> int64 { /* every body loop must vectorize */ }
+```
+
+Prefix a function with `@inline`/`@noinline` (inlining control), `@pure`
+(side-effect-free → loop-invariant calls hoisted out of loops), or
+`@simd`/`@simd!` (vectorization contract on every body loop). Decorators stack,
+take effect under `-O`/`--release`, and apply to functions only. See
+[Declarations](declarations.md#function-decorators).
+
+## GPU kernel and dispatch
+
+```mettle
+// kernels.mettle  ->  mettle --emit-ptx kernels.mettle -o kernels.ptx
+kernel vadd(a: float32*, b: float32*, c: float32*, n: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < n) { c[i] = a[i] + b[i]; }
+}
+```
+
+```mettle
+// host.mettle  ->  mettle --build host.mettle -o host --link-arg .../cuda.lib
+import "std/gpu";
+// ... gpu_init, gpu_module, gpu_func, gpu_malloc, gpu_to_device ...
+dispatch vadd[(n + 255) / 256, 256](da, db, dc, n);
+```
+
+See [GPU Offload](gpu.md).
+
 ## With Generics
 
 Generic functions and structs with compile-time monomorphization. See [Declarations](declarations.md#generic-functions) and [Types](types.md#generic-type-parameters).

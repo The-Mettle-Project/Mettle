@@ -215,3 +215,30 @@ The prelude re-exports `std/io`, `std/math`, `std/conv`, `std/mem`, `std/process
 ```bash
 mettle --prelude main.mettle -o main.s
 ```
+
+## std/gpu
+
+NVIDIA CUDA Driver API bindings plus ergonomic helpers for running PTX kernels
+on the GPU. Thin bindings over `nvcuda` (the OS driver, no `cudart`, no `nvcc`).
+Link the driver import stub at build time (`--link-arg <CUDA>/lib/x64/cuda.lib`
+on Windows; `-lcuda` on Linux).
+
+Raw bindings: `cuInit`, `cuDeviceGet`, `cuCtxCreate_v2`, `cuModuleLoadData`,
+`cuModuleGetFunction`, `cuMemAlloc_v2`, `cuMemFree_v2`, `cuMemcpyHtoD_v2`,
+`cuMemcpyDtoH_v2`, `cuLaunchKernel`, `cuCtxSynchronize`.
+
+Helpers (return handles directly; `0` on failure):
+
+- `gpu_init() -> int64`: initialize CUDA on device 0 and create a context.
+- `gpu_module(ptx_image: uint8*) -> int64`: load a module from a
+  null-terminated PTX image in host memory.
+- `gpu_func(mod: int64, name: cstring) -> int64`: resolve a kernel by name.
+- `gpu_malloc(bytes: int64) -> int64`, `gpu_free(dptr: int64)`.
+- `gpu_to_device(dst: int64, src: uint8*, bytes: int64)`,
+  `gpu_to_host(dst: uint8*, src: int64, bytes: int64)`.
+- `gpu_sync()`: wraps `cuCtxSynchronize`.
+- `gpu_launch(f, grid, block, params, nargs)`: the primitive the
+  [`dispatch`](gpu.md) statement lowers to (1-D `cuLaunchKernel` + synchronize).
+
+See [GPU Offload](gpu.md) for kernel syntax (`kernel`, `thread.x`, `dispatch`)
+and a complete example.
