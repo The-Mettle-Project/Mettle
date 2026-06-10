@@ -16,6 +16,11 @@
 #define IR_INLINE_MAX_PARAMETERS 16
 #define IR_INLINE_MAX_ROUNDS 4
 #define IR_INLINE_MAX_CALLER_NON_NOP_INSTRUCTIONS 512
+/* Callees this small (and call-free) stay inlinable into callers that are
+ * over the caller-size budget: the budget exists to stop runaway growth, and
+ * a tiny leaf's body costs about as much caller growth as the call sequence
+ * it replaces. */
+#define IR_INLINE_TINY_LEAF_NON_NOP_INSTRUCTIONS 16
 /* Self-recursion inlining: expand direct self-call sites with the current
  * body up to MAX_DEPTH rounds, stopping early once the body outgrows the
  * instruction cap (so the depth is effectively size-bounded). */
@@ -467,6 +472,22 @@ void ir_explain_remark(const char *function_name, const char *entity,
 IRFunction *ir_explain_clone_function(const IRFunction *src);
 void ir_explain_set_hypothesis(int active);
 int ir_optimize_function_revectorize(IRFunction *function);
+/* Program access for program-level fix simulations (the call-in-body
+ * hypothesis re-runs the INLINER on a caller clone, which needs callee
+ * lookup). Set by the program pipeline around the per-function stage; NULL
+ * outside it. */
+void ir_explain_set_program(IRProgram *program);
+/* --explain hypothesis (ir_optimize_inline.c): pretend `callee_name` is
+ * inline-eligible (@noinline removed, @inline added; *was_noinline_out says
+ * which pretend the verified message should describe) and run inliner rounds
+ * over `caller` (a scratch clone). Returns 1 when at least one call site
+ * actually expanded. The pretend flags are restored; the inliner's structural
+ * guards still apply, so this cannot "verify" advice that the decorator
+ * change would not in fact deliver. */
+int ir_inline_explain_simulate_force_inline(IRProgram *program,
+                                            IRFunction *caller,
+                                            const char *callee_name,
+                                            int *was_noinline_out);
 
 /* Machine-readable ids for every vectorization-bail diagnosis the --explain
  * analyzer can make (ir_optimize_simd_contract.c). This list is the schema:
@@ -486,6 +507,7 @@ typedef enum {
   IR_SIMD_BAIL_SERIAL_RECURRENCE,  /* float '*'/'/' chain across iterations */
   IR_SIMD_BAIL_MIXED_FLOAT_WIDTHS, /* f32 and f64 elements in one loop */
   IR_SIMD_BAIL_BYTE_SUM_NARROW_ACC,/* byte sum into an int32 accumulator */
+  IR_SIMD_BAIL_I32_SUM_NARROW_ACC, /* int32 sum into a non-int64 accumulator */
   IR_SIMD_BAIL_INLINED_PARAM_LOCAL,/* leftover __inl_* param copy in body */
   IR_SIMD_BAIL_BODY_LOCAL,         /* user local declared inside the body */
   IR_SIMD_BAIL_DOT_SHAPE_ADDRESS,  /* float MAC, address pattern unmatched */

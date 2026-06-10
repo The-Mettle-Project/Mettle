@@ -216,18 +216,50 @@ $cases = @(
       'NOT vectorized',
       'vpsadbw kernel accumulates into int64',
       'declare the accumulator as int64',
-      'reason: the callee is marked @noinline',
       'hoist invariant index math into a pointer',
       # the unroller's definitive remark supersedes the verifier's
       # "no loop remains" guess
       'fully unrolled \(8 iterations',
-      'hoisted out of the loop \(runs once',
-      'verified @noalloc',
       # verified fix suggestions: the compiler SIMULATES the fix on a clone,
       # re-runs the optimizer, and only then claims it works
       'verified: simulated that fix and re-ran the optimizer: this loop then vectorizes -> vpsadbw',
-      'verified: re-checked with @inline pretend-applied: the structural guards pass',
+      # int32 sum into an int32 accumulator: diagnosis + proven int64 fix
+      'int32 reduction kernel accumulates into int64',
+      'verified: simulated that fix and re-ran the optimizer: this loop then vectorizes -> vpaddd',
+      # int16 elements into an int64 accumulator: retyping the elements is the
+      # whole fix (the no-op (int32) cast is accepted by the sum recognizer),
+      # and the simulation proves exactly that advice
+      'fix: use int32 elements',
+      # dot-product address pattern: the row-pointer hoist is simulated and the
+      # FMA dot kernel itself confirms it
+      'verified: simulated that fix and re-ran the optimizer: this loop then vectorizes -> vfmadd231ps, 8-wide float32 FMA dot product',
+      # proven-inapplicable advice is REPLACED, never printed: skew''s index
+      # half mutates every iteration, so the hoist advice would be wrong
+      'none via hoisting -- re-checked: the index half that is not the loop counter changes every iteration',
       'backend report: explain_demo\.mettle'
+    )
+  },
+  @{
+    # --explain remarks that depend on function decorators: @noinline
+    # refusals, @pure LICM hoisting, @noalloc verification, and the verified
+    # inlining advice (pretend-applied @inline / pretend-removed @noinline).
+    Name          = "explain_contracts_report"
+    Path          = "tests/explain_contracts_demo.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--explain")
+    OutputMustMatch = @(
+      'optimization report: explain_contracts_demo\.mettle',
+      'reason: the callee is marked @noinline',
+      'hoisted out of the loop \(runs once',
+      'verified @noalloc',
+      # call-in-body: program-level simulation (pretend-remove @noinline,
+      # re-run the INLINER on a caller clone, revectorize)
+      'verified: simulated removing `@noinline` from `damp`',
+      'verified: re-checked with @inline pretend-applied: the structural guards pass',
+      # int16 elements + int32 accumulator: the fix honestly names BOTH
+      # required changes
+      'use int32 elements and declare the accumulator as int64',
+      'verified: simulated that fix and re-ran the optimizer: this loop then vectorizes -> vpaddd'
     )
   },
   @{
@@ -275,6 +307,35 @@ $cases = @(
     Path          = "tests/test_noalloc.mettle"
     ShouldSucceed = $true
     Args          = @("-O")
+  },
+  @{
+    # Repeated identical call refusals (an over-budget main refusing every
+    # call site for the same reason) fold into ONE entry with a line range
+    # and a deduplicated callee census -- not a wall of identical remarks.
+    Name          = "explain_fold_repeated_refusals"
+    Path          = "tests/explain_fold_demo.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--explain")
+    OutputMustMatch = @(
+      # cold one-shot call sites in an over-budget caller fold into ONE calm
+      # entry that explains why NOT inlining is the right call -- and hands
+      # out no fix advice (there is nothing worth fixing)
+      'main \(8 calls, lines \d+-\d+\): NOT inlined',
+      'reason: the calling function is over the 512-instruction caller budget, and this call site is not inside a loop',
+      'calls: f1 \(x3\), f2 \(x2\), f3 \(x2\), f4',
+      # tiny call-free callees are exempt from the caller budget: the
+      # accessor still inlines into the over-budget main
+      'main \(call to `tiny` @ line \d+\): inlined',
+      # loop-resident call sites are exempt too: the same f1 that is refused
+      # at the cold sites inlines at the hot one
+      'main \(call to `f1` @ line \d+\): inlined'
+    )
+    OutputMustNotMatch = @(
+      # no per-site cold refusals survive the fold, and no @inline advice is
+      # handed out for calls where inlining would buy nothing
+      'main \(call to `f2`',
+      'fix: mark the callee @inline'
+    )
   },
   @{
     # --explain remarks are limited to the main input file: a program importing

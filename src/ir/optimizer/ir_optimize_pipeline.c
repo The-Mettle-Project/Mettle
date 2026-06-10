@@ -410,8 +410,13 @@ int ir_optimize_program_pipeline(IRProgram *program,
     }
   }
 
+  /* Give the per-function contract verifier program access for the duration
+   * of the stage: the call-in-body fix simulation re-runs the inliner on a
+   * caller clone, which needs callee lookup. */
+  ir_explain_set_program(program);
   if (!ir_run_program_stage_for_each_function(
           program, ir_optimize_function_pipeline)) {
+    ir_explain_set_program(NULL);
     /* A violated `@simd!` contract already printed a user diagnostic; don't
      * dress it up as an internal compiler error. */
     if (!ir_optimize_had_user_error()) {
@@ -420,6 +425,7 @@ int ir_optimize_program_pipeline(IRProgram *program,
     ir_function_index_reset();
     return 0;
   }
+  ir_explain_set_program(NULL);
 
   /* Function-level contracts, now that every optimization that could satisfy
    * them has run. `@inline!` is skipped when function boundaries are pinned

@@ -656,16 +656,67 @@ cleanup:
   return ok;
 }
 
+/* True when instruction `site` sits inside a loop body of `function`:
+ * between a loop header label and a back-jump to that label. A loop-resident
+ * call pays its overhead every iteration -- those sites keep full inlining
+ * eligibility even in an over-budget caller, because that is exactly where
+ * inlining still buys runtime. A site outside every loop runs at most once
+ * per call of the function; refusing it costs nothing measurable. */
+static int ir_call_site_is_in_loop(const IRFunction *function, size_t site) {
+  for (size_t h = 0; h < site; h++) {
+    const IRInstruction *header = &function->instructions[h];
+    if (header->op != IR_OP_LABEL || !header->text ||
+        !ir_label_is_while_header(header->text)) {
+      continue;
+    }
+    for (size_t j = site + 1; j < function->instruction_count; j++) {
+      const IRInstruction *jmp = &function->instructions[j];
+      if (jmp->op == IR_OP_JUMP && jmp->text &&
+          strcmp(jmp->text, header->text) == 0) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+/* A "tiny leaf": at most IR_INLINE_TINY_LEAF_NON_NOP_INSTRUCTIONS non-nop
+ * instructions and no calls of its own. Inlining one into ANY caller is
+ * (nearly) free -- the body is about the size of the call sequence it
+ * replaces, and with no nested calls the growth cannot cascade. */
+static int ir_function_is_tiny_leaf(const IRFunction *callee) {
+  size_t non_nop = 0;
+  for (size_t i = 0; i < callee->instruction_count; i++) {
+    IROpcode op = callee->instructions[i].op;
+    if (op == IR_OP_NOP) {
+      continue;
+    }
+    if (op == IR_OP_CALL || op == IR_OP_CALL_INDIRECT) {
+      return 0;
+    }
+    if (++non_nop > IR_INLINE_TINY_LEAF_NON_NOP_INSTRUCTIONS) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
                                        size_t *inline_counter, int *changed) {
   if (!program || !function || !inline_counter) {
     return 0;
   }
 
-  if (ir_function_non_nop_instruction_count(function) >
-      IR_INLINE_MAX_CALLER_NON_NOP_INSTRUCTIONS) {
-    return 1;
-  }
+  /* An over-budget caller may not GROW further, but freezing it entirely
+   * would refuse free wins. Three exemptions still go in: tiny leaf callees
+   * (accessors, predicates -- cannot cause runaway growth), @inline-forced
+   * callees (the user explicitly overriding the heuristic), and calls at
+   * LOOP-RESIDENT sites (the only places where call overhead multiplies --
+   * the budget exists to bound code size, not to leave per-iteration call
+   * overhead in hot loops). What stays refused: cold one-shot call sites,
+   * which cost nothing measurable as real calls. */
+  int caller_over_budget = ir_function_non_nop_instruction_count(function) >
+                           IR_INLINE_MAX_CALLER_NON_NOP_INSTRUCTIONS;
 
   IRInstructionVector vector = {0};
   int local_changed = 0;
@@ -679,6 +730,9 @@ static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
       IRFunction *callee = ir_program_find_function(program, instruction->text);
       if (callee && callee != function &&
           instruction->argument_count == callee->parameter_count &&
+          (!caller_over_budget || callee->is_inline ||
+           ir_function_is_tiny_leaf(callee) ||
+           ir_call_site_is_in_loop(function, i)) &&
           ir_function_is_inline_candidate(callee, NULL, NULL)) {
         if (ir_explain_enabled()) {
           char entity[160];
@@ -897,9 +951,22 @@ static void ir_inline_site_reason(IRFunction *caller,
     *fix = "bounded self-recursion expansion applies automatically (depth 3); "
            "rewrite as a loop for full control";
   } else if (ir_function_non_nop_instruction_count(caller) >
-             IR_INLINE_MAX_CALLER_NON_NOP_INSTRUCTIONS) {
-    *reason = "the calling function is already over the 512-instruction "
-              "caller budget and may not grow further";
+                 IR_INLINE_MAX_CALLER_NON_NOP_INSTRUCTIONS &&
+             !callee->is_inline && !ir_function_is_tiny_leaf(callee) &&
+             instruction >= caller->instructions &&
+             !ir_call_site_is_in_loop(
+                 caller, (size_t)(instruction - caller->instructions))) {
+    /* Mirrors the gate in ir_inline_calls_in_function: tiny leaves,
+     * @inline-forced callees, and loop-resident sites are exempt from the
+     * caller budget, so only cold one-shot sites can be refused for this
+     * reason -- and for those, NOT inlining is the right call, so there is
+     * deliberately no fix advice to hand out. */
+    *reason = "the calling function is over the 512-instruction caller "
+              "budget, and this call site is not inside a loop -- it runs "
+              "at most once per call of the function, so keeping it a real "
+              "call costs nothing measurable (loop-resident calls, tiny "
+              "call-free callees, and @inline-marked callees still inline "
+              "here)";
   } else if (instruction->argument_count > IR_INLINE_MAX_PARAMETERS ||
              instruction->argument_count != callee->parameter_count) {
     *reason = "the call's argument count doesn't match what the inliner "
@@ -1048,6 +1115,58 @@ int ir_inline_enforce_contracts(IRProgram *program) {
     ir_optimize_note_user_error();
   }
   return ok;
+}
+
+int ir_inline_explain_simulate_force_inline(IRProgram *program,
+                                            IRFunction *caller,
+                                            const char *callee_name,
+                                            int *was_noinline_out) {
+  if (!program || !caller || !callee_name) {
+    return 0;
+  }
+  IRFunction *callee = ir_program_find_function(program, callee_name);
+  if (!callee || callee == caller) {
+    return 0;
+  }
+
+  /* Two pretends, reported distinctly: a `@noinline` callee simulates the
+   * user REMOVING that decorator (the veto precedes everything, so forcing
+   * is_inline alone would never fire); anything else simulates ADDING
+   * @inline. */
+  int saved_is_inline = callee->is_inline;
+  int saved_is_noinline = callee->is_noinline;
+  if (was_noinline_out) {
+    *was_noinline_out = callee->is_noinline;
+  }
+  callee->is_inline = 1;
+  callee->is_noinline = 0;
+  int candidate = ir_function_is_inline_candidate(callee, NULL, NULL);
+  int changed = 0;
+  if (candidate) {
+    /* High counter base so the clone's fresh __inl_* names cannot collide
+     * with names the real inlining rounds already left in the caller.
+     * Multiple rounds: when the forced callee was declined for making calls
+     * of its own (the glue-function cap), those inner calls land in the
+     * caller on round 1 and -- when their targets are ordinary inline
+     * candidates -- disappear on the next round, exactly as the real
+     * pipeline's rounds would once the user adds @inline. */
+    size_t inline_counter = 900000;
+    for (int round = 0; round < IR_INLINE_MAX_ROUNDS; round++) {
+      int round_changed = 0;
+      if (!ir_inline_calls_in_function(program, caller, &inline_counter,
+                                       &round_changed)) {
+        changed = 0;
+        break;
+      }
+      if (!round_changed) {
+        break;
+      }
+      changed = 1;
+    }
+  }
+  callee->is_inline = saved_is_inline;
+  callee->is_noinline = saved_is_noinline;
+  return candidate && changed;
 }
 
 int ir_inline_small_functions_pass(IRProgram *program, int *changed) {

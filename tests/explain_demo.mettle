@@ -4,7 +4,7 @@ function scale(x: float32) -> float32 {
     return x * 2.5;
 }
 
-@noinline function opaque(x: int32) -> int32 {
+function opaque(x: int32) -> int32 {
     return x + 1;
 }
 
@@ -52,7 +52,7 @@ function tiny_fixed() -> int32 {
 
 // `@pure` + loop-invariant argument: the call is hoisted out of the loop
 // (`@noinline` keeps it a real call so LICM, not the inliner, handles it).
-@noinline @pure function bias(k: int32) -> int32 {
+function bias(k: int32) -> int32 {
     return k * 3 + 1;
 }
 
@@ -65,11 +65,55 @@ function apply_bias(a: int32*, n: int32, k: int32) -> int32 {
 }
 
 // `@noalloc`: proven allocation-free over everything it can reach.
-@noalloc function norm2(x: float32, y: float32) -> float32 {
+function norm2(x: float32, y: float32) -> float32 {
     return x * x + y * y;
 }
 
-@noinline function step1(x: float32) -> float32 {
+// int32 sum into an int32 accumulator: the kernel needs int64; the fix is
+// simulated and proven (-> vpaddd).
+function sum_ints(a: int32*, n: int32) -> int32 {
+    var s: int32 = 0;
+    for i in 0..n {
+        s = s + a[i];
+    }
+    return s;
+}
+
+// int16 elements have no kernel; "use int32 + int64 accumulator" is simulated
+// and proven.
+function sum_shorts(a: int16*, n: int32) -> int32 {
+    var s: int64 = 0;
+    for i in 0..n {
+        s = s + (int32)a[i];
+    }
+    return s;
+}
+
+// `@noinline` on the callee blocks the loop; the report simulates REMOVING
+// the veto, re-runs the inliner, and proves the loop then vectorizes.
+function damp(x: float32) -> float32 {
+    return x * 0.5;
+}
+
+function apply_damp(a: float32*, n: int32) {
+    for i in 0..n {
+        a[i] = damp(a[i]);
+    }
+}
+
+// The non-counter index half mutates each iteration: the row-pointer advice
+// is provably unwritable, so the report REPLACES it instead of printing it.
+function skew(m: float32*, v: float32*, n: int32) -> float32 {
+    var acc: float32 = 0.0;
+    var k: int32 = 0;
+    for c in 0..n {
+        acc = acc + m[k + c] * v[c];
+        k = k + 2;
+    }
+    return acc;
+}
+
+function step1(x: float32) -> float32 {
     return x + 1.0;
 }
 
@@ -103,7 +147,12 @@ function main() -> int32 {
     i = 0;
     while (i < 64) { iv[i] = i; i = i + 1; }
     var t: int32 = sum_bytes(&bs[0], 64) + apply_bias(&iv[0], 64, 7);
-    var nf: float32 = norm2(3.0, 4.0) + chain(1.0);
+    var sh: int16[64];
+    i = 0;
+    while (i < 64) { sh[i] = (int16)i; i = i + 1; }
+    t = t + sum_ints(&iv[0], 64) + sum_shorts(&sh[0], 64);
+    apply_damp(&ys[0], 64);
+    var nf: float32 = norm2(3.0, 4.0) + chain(1.0) + skew(&mm[0], &xs[0], 32);
     var u: int32 = opaque(t + tiny_fixed() + (int32)nf);
     return u - u;
 }

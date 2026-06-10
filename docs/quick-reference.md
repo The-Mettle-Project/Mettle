@@ -142,6 +142,16 @@ The same applies to inlining advice: "mark it @inline" is re-checked with the
 decorator pretend-applied, and when a hidden structural guard means it would
 NOT help, the report says that instead of giving advice that won't work.
 
+The verified library covers element-width fixes (int16/int64 → int32),
+accumulator widening (int32 and byte sums need an int64 accumulator), the
+dot-product row-pointer hoist, and call-in-the-loop fixes — for those the
+compiler pretend-applies the decorator change, re-runs its own **inliner** on
+a clone of the caller, and proves lines like `simulated removing @noinline
+from damp ... this loop then vectorizes → vfmadd231ps`. And when a simulation
+proves the standard advice is *unwritable* (e.g. the index math genuinely
+changes every iteration — a real non-unit-stride access), the advice is
+replaced with that finding rather than printed.
+
 ## Function decorators
 
 ```mettle

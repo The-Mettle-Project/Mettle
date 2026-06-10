@@ -346,6 +346,111 @@ static int ir_explain_remark_compare(const void *a, const void *b) {
   return 0;
 }
 
+/* ---- repeated-refusal aggregation ------------------------------------------
+ * Real-world functions (a setup-heavy main, an init routine) produce WALLS of
+ * identical call refusals -- one fact ("main is over the caller budget")
+ * repeated for every call site, drowning the remarks that matter. Identical
+ * (caller, headline, reason, fix) call remarks are folded into one entry with
+ * the line range and a deduplicated callee list. Remarks carrying a verified
+ * line are never folded: each is a per-site proof. */
+
+#define IR_EXPLAIN_GROUP_MIN 4
+#define IR_EXPLAIN_GROUP_LIST_MAX 6
+
+static int ir_explain_str_eq(const char *a, const char *b) {
+  if (!a || !b) {
+    return a == b;
+  }
+  return strcmp(a, b) == 0;
+}
+
+/* A call remark eligible for folding: "call to `f`" entity with a reason
+ * (the repeated-refusal shape). */
+static int ir_explain_remark_foldable(const IRExplainRemark *r) {
+  return r->entity && strncmp(r->entity, "call to ", 8) == 0 && r->reason;
+}
+
+/* Verified text participates in the key: a generic per-group claim ("with
+ * @inline this will inline") folds with its group, while per-site proofs
+ * that differ in wording keep their own entries. */
+static int ir_explain_remarks_groupable(const IRExplainRemark *a,
+                                        const IRExplainRemark *b) {
+  return ir_explain_str_eq(a->function_name, b->function_name) &&
+         ir_explain_str_eq(a->headline, b->headline) &&
+         ir_explain_str_eq(a->reason, b->reason) &&
+         ir_explain_str_eq(a->fix, b->fix) &&
+         ir_explain_str_eq(a->verified, b->verified);
+}
+
+/* The callee name inside a "call to `f`" entity; "?" when unparsable. */
+static void ir_explain_entity_callee(const char *entity, char *buf,
+                                     size_t cap) {
+  const char *open = entity ? strchr(entity, '`') : NULL;
+  const char *close = open ? strchr(open + 1, '`') : NULL;
+  if (!open || !close || (size_t)(close - open) >= cap) {
+    snprintf(buf, cap, "?");
+    return;
+  }
+  size_t n = (size_t)(close - open - 1);
+  memcpy(buf, open + 1, n);
+  buf[n] = '\0';
+}
+
+/* Build the group's deduplicated callee list ("a, b (x9), c ... and N more")
+ * into `out`. Membership is determined by the same predicate the flush loop
+ * groups by, starting at the group leader `first`. */
+static void ir_explain_group_callee_list(const IRExplainRemark *remarks,
+                                         size_t first, char *out, size_t cap) {
+  char names[64][96];
+  size_t name_counts[64];
+  size_t n_names = 0;
+
+  for (size_t j = first; j < g_remark_count; j++) {
+    if (!ir_explain_remark_foldable(&remarks[j]) ||
+        !ir_explain_remarks_groupable(&remarks[first], &remarks[j])) {
+      continue;
+    }
+    char callee[96];
+    ir_explain_entity_callee(remarks[j].entity, callee, sizeof(callee));
+    size_t k = 0;
+    for (; k < n_names; k++) {
+      if (strcmp(names[k], callee) == 0) {
+        name_counts[k]++;
+        break;
+      }
+    }
+    if (k == n_names && n_names < 64) {
+      snprintf(names[n_names], sizeof(names[0]), "%s", callee);
+      name_counts[n_names] = 1;
+      n_names++;
+    }
+  }
+
+  size_t written = 0;
+  out[0] = '\0';
+  size_t shown = n_names < IR_EXPLAIN_GROUP_LIST_MAX
+                     ? n_names
+                     : IR_EXPLAIN_GROUP_LIST_MAX;
+  for (size_t k = 0; k < shown; k++) {
+    int n;
+    if (name_counts[k] > 1) {
+      n = snprintf(out + written, cap - written, "%s%s (x%zu)",
+                   k ? ", " : "", names[k], name_counts[k]);
+    } else {
+      n = snprintf(out + written, cap - written, "%s%s", k ? ", " : "",
+                   names[k]);
+    }
+    if (n < 0 || (size_t)n >= cap - written) {
+      return;
+    }
+    written += (size_t)n;
+  }
+  if (n_names > shown) {
+    snprintf(out + written, cap - written, " ... and %zu more",
+             n_names - shown);
+  }
+}
+
 static void ir_explain_print_header(const char *what) {
   const char *file = g_explain_focus_file
                          ? ir_explain_path_basename(g_explain_focus_file)
@@ -367,8 +472,56 @@ void ir_explain_flush(void) {
   } else {
     qsort(g_remarks, g_remark_count, sizeof(IRExplainRemark),
           ir_explain_remark_compare);
+    char *suppressed = calloc(g_remark_count, 1);
     for (size_t i = 0; i < g_remark_count; i++) {
       const IRExplainRemark *r = &g_remarks[i];
+      if (suppressed && suppressed[i]) {
+        continue;
+      }
+
+      /* Fold a run of identical call refusals into one entry. */
+      if (suppressed && ir_explain_remark_foldable(r)) {
+        size_t group_count = 0;
+        size_t last_line = r->line;
+        for (size_t j = i; j < g_remark_count; j++) {
+          if (ir_explain_remark_foldable(&g_remarks[j]) &&
+              ir_explain_remarks_groupable(r, &g_remarks[j])) {
+            group_count++;
+            last_line = g_remarks[j].line;
+          }
+        }
+        if (group_count >= IR_EXPLAIN_GROUP_MIN) {
+          char callees[512];
+          ir_explain_group_callee_list(g_remarks, i, callees,
+                                       sizeof(callees));
+          fprintf(stderr, "  %s%s%s (%zu calls, lines %zu-%zu): %s%s%s\n",
+                  clr(EXPLAIN_BOLD), r->function_name, clr(EXPLAIN_RESET),
+                  group_count, r->line, last_line,
+                  clr(r->positive ? EXPLAIN_GREEN : EXPLAIN_RED), r->headline,
+                  clr(EXPLAIN_RESET));
+          fprintf(stderr, "      %s%s reason: %s%s\n", clr(EXPLAIN_DIM),
+                  glyph_elbow(), r->reason, clr(EXPLAIN_RESET));
+          if (r->fix) {
+            fprintf(stderr, "      %s%s fix: %s%s\n", clr(EXPLAIN_DIM),
+                    glyph_elbow(), r->fix, clr(EXPLAIN_RESET));
+          }
+          if (r->verified) {
+            fprintf(stderr, "      %s%s verified: %s%s%s\n", clr(EXPLAIN_DIM),
+                    glyph_elbow(), clr(EXPLAIN_GREEN), r->verified,
+                    clr(EXPLAIN_RESET));
+          }
+          fprintf(stderr, "      %s%s calls: %s%s\n", clr(EXPLAIN_DIM),
+                  glyph_elbow(), callees, clr(EXPLAIN_RESET));
+          for (size_t j = i; j < g_remark_count; j++) {
+            if (ir_explain_remark_foldable(&g_remarks[j]) &&
+                ir_explain_remarks_groupable(r, &g_remarks[j])) {
+              suppressed[j] = 1;
+            }
+          }
+          continue;
+        }
+      }
+
       fprintf(stderr, "  %s%s%s (%s @ line %zu): %s%s%s\n", clr(EXPLAIN_BOLD),
               r->function_name, clr(EXPLAIN_RESET), r->entity, r->line,
               clr(r->positive ? EXPLAIN_GREEN : EXPLAIN_RED), r->headline,
@@ -387,6 +540,7 @@ void ir_explain_flush(void) {
                 clr(EXPLAIN_RESET));
       }
     }
+    free(suppressed);
     fprintf(stderr, "\n");
   }
 
