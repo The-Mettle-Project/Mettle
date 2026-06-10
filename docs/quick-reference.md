@@ -129,8 +129,14 @@ register-allocating backend (and why the rest fell back).
 
 ```mettle
 @inline   function f(x: int32) -> int32 { return x * 3; }   // force inline
+@inline!  function l(a: float32, b: float32) -> float32 {   // CONTRACT: every call
+  return a + b;                                             // inlines, or compile error
+}
 @noinline function g() -> int32 { return 1; }               // never inline
 @pure @noinline function w(t: int32*, k: int32) -> int32 { /* ... */ }
+@noalloc  function hot(x: float32) -> float32 {             // CONTRACT: proven
+  return x * x;                                             // allocation-free
+}
 @simd!    function s(a: int32*, n: int64) -> int64 { /* every body loop must vectorize */ }
 ```
 
@@ -139,6 +145,15 @@ Prefix a function with `@inline`/`@noinline` (inlining control), `@pure`
 `@simd`/`@simd!` (vectorization contract on every body loop). Decorators stack,
 take effect under `-O`/`--release`, and apply to functions only. See
 [Declarations](declarations.md#function-decorators).
+
+The `!` decorators are **contracts**: the compiler either delivers the
+optimization or fails the build with the precise reason. `@inline!` errors on
+any call site that survives inlining (e.g. recursion, the caller's growth
+budget). `@noalloc` proves the function — and everything it can reach through
+direct calls — performs zero heap allocations: `new`, string `+`, allocator
+calls, unprovable externs, and function-pointer calls inside the reachable
+graph are all compile errors pointing at the offending site. Verified
+`@noalloc` functions are reported in `--explain`.
 
 ## GPU kernel and dispatch
 

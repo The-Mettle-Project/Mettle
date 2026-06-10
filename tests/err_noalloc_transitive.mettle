@@ -1,0 +1,17 @@
+// `@noalloc` violated transitively: hot() itself is clean, but it calls
+// helper(), which allocates.
+struct Node {
+    v: int32;
+}
+@noinline function helper(v: int32) -> Node* {
+    var n: Node* = new Node;
+    n->v = v;
+    return n;
+}
+@noalloc function hot(v: int32) -> int32 {
+    var n: Node* = helper(v);
+    return n->v;
+}
+function main() -> int32 {
+    return hot(0);
+}

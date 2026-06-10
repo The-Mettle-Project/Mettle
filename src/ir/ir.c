@@ -197,8 +197,10 @@ IRFunction *ir_function_create(const char *name) {
   function->entry_block = 0;
   function->cfg_valid = 0;
   function->is_inline = 0;
+  function->is_inline_contract = 0;
   function->is_noinline = 0;
   function->is_pure = 0;
+  function->is_noalloc = 0;
   return function;
 }
 

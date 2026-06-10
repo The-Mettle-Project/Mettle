@@ -31,6 +31,10 @@ void ir_optimize_reset_user_error(void) { g_simd_contract_user_error = 0; }
 
 int ir_optimize_had_user_error(void) { return g_simd_contract_user_error; }
 
+/* Other contract checkers (`@inline!`, `@noalloc`) report through the same
+ * "user error, not ICE" channel `@simd!` uses. */
+void ir_optimize_note_user_error(void) { g_simd_contract_user_error = 1; }
+
 void ir_optimize_set_simd_report(int enabled) { g_simd_report = enabled; }
 
 static int ir_instruction_is_simd_marker(const IRInstruction *instruction) {
@@ -113,8 +117,22 @@ static const char *ir_simd_bail_reason(const IRFunction *function, size_t begin,
   int has_call = 0, has_new = 0, has_asm = 0;
   int branch_count = 0, jump_count = 0;
   int has_i16 = 0, has_i64 = 0; /* unsupported memory element widths */
+  int past_header = 0;
   for (size_t i = begin + 1; i < end; i++) {
     const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_LABEL) {
+      if (ins->text && (strstr(ins->text, "ir_while_") != NULL ||
+                        strstr(ins->text, "ir_for_cond_") != NULL)) {
+        past_header = 1;
+      }
+      continue;
+    }
+    /* Skip the once-only preamble between the begin marker and the header
+     * label (a for-loop's initializer, hoisted pure calls): it is not the
+     * loop and must not drive the diagnosis. */
+    if (!past_header) {
+      continue;
+    }
     switch (ins->op) {
     case IR_OP_CALL:
     case IR_OP_CALL_INDIRECT:
@@ -214,13 +232,21 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
 
   for (size_t i = begin + 1; i < end; i++) {
     const IRInstruction *ins = &function->instructions[i];
-    switch (ins->op) {
-    case IR_OP_LABEL:
+    if (ins->op == IR_OP_LABEL) {
       if (ins->text && (strstr(ins->text, "ir_while_") != NULL ||
                         strstr(ins->text, "ir_for_cond_") != NULL)) {
         past_header = 1;
       }
-      break;
+      continue;
+    }
+    /* The marker region starts BEFORE a for-loop's initializer, and hoisted
+     * preamble code (pure-call LICM results, pointer setup) lands there too.
+     * Everything before the header label runs ONCE -- it is not the loop, so
+     * it must not drive the diagnosis. */
+    if (!past_header) {
+      continue;
+    }
+    switch (ins->op) {
     case IR_OP_DECLARE_LOCAL:
       /* A local declared INSIDE the loop body (after the header label -- a
        * range-for's induction local sits between the markers but BEFORE the
@@ -561,10 +587,14 @@ static void ir_explain_report_loops(const IRFunction *function,
       ir_explain_remark(function->name, "loop", L->location, 0,
                         "NOT vectorized", reason, NULL);
     } else if (!ir_region_has_loop_label(function, L->begin, L->end)) {
-      ir_explain_remark(function->name, "loop", L->location, 1,
-                        "eliminated \xE2\x80\x94 no loop remains after "
-                        "optimization (fully unrolled or folded away)",
-                        NULL, NULL);
+      /* The unroller records a definitive "fully unrolled (N iterations)"
+       * remark when it was the cause; only guess when nothing claimed it. */
+      if (!ir_explain_has_remark_at(L->location.line, "loop")) {
+        ir_explain_remark(function->name, "loop", L->location, 1,
+                          "eliminated \xE2\x80\x94 no loop remains after "
+                          "optimization (fully unrolled or folded away)",
+                          NULL, NULL);
+      }
     } else {
       ir_simd_explain_bail(function, L->begin, L->end, reason, sizeof(reason),
                            fix, sizeof(fix));
@@ -700,5 +730,19 @@ void ir_note_simd_contracts_unverified(IRProgram *program) {
             "note: %d `@simd` loop%s present but not verified; vectorization "
             "contracts are only checked with -O/--release\n",
             marker_count, marker_count == 1 ? "" : "s");
+  }
+
+  int contract_count = 0;
+  for (size_t f = 0; f < program->function_count; f++) {
+    IRFunction *function = program->functions[f];
+    if (function && (function->is_inline_contract || function->is_noalloc)) {
+      contract_count++;
+    }
+  }
+  if (contract_count > 0) {
+    fprintf(stderr,
+            "note: %d `@inline!`/`@noalloc` contract%s present but not "
+            "verified; contracts are only checked with -O/--release\n",
+            contract_count, contract_count == 1 ? "" : "s");
   }
 }

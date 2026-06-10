@@ -228,6 +228,12 @@ typedef struct {
    * bits clean, so the 64-bit ops the fallback emits (compare, divide, (int64)
    * widening) see the true value instead of a sign-extended one. */
   int is_unsigned;
+  /* This instruction allocates heap memory at runtime even though its opcode
+   * doesn't say so (today: string '+' concatenation, which codegen lowers to a
+   * heap-allocating kernel). Set by ir_lowering, consumed by the `@noalloc`
+   * contract checker. IR_OP_NEW and allocator calls are recognized by opcode/
+   * name and don't need it. */
+  int allocates;
   ASTNode *ast_ref;
 } IRInstruction;
 
@@ -256,9 +262,11 @@ typedef struct {
   size_t entry_block;
   int cfg_valid;
   // Function-decorator flags propagated from the AST (see ast.h):
-  int is_inline;   // `@inline`  : force inline past the heuristic gate
-  int is_noinline; // `@noinline`: never inline this function
-  int is_pure;     // `@pure`    : side-effect-free; enables pure-call LICM
+  int is_inline;          // `@inline`  : force inline past the heuristic gate
+  int is_inline_contract; // `@inline!` : every call inlines or compile error
+  int is_noinline;        // `@noinline`: never inline this function
+  int is_pure;            // `@pure`    : side-effect-free; enables call LICM
+  int is_noalloc;         // `@noalloc` : proven allocation-free or error
 } IRFunction;
 
 typedef struct {

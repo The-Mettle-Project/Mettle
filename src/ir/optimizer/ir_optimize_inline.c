@@ -316,6 +316,7 @@ int ir_clone_instruction_plain(const IRInstruction *source,
    * zero-extending uint8/16/32 loads. Dropping it here (it only runs at -O)
    * silently reverts those to signed -- a uint32-as-signed miscompile. */
   out->is_unsigned = source->is_unsigned;
+  out->allocates = source->allocates; /* string-concat heap allocation marker */
   out->ast_ref = source->ast_ref;
 
   if (!ir_operand_clone(&source->dest, &out->dest) ||
@@ -368,6 +369,7 @@ static int ir_clone_instruction_for_inline(const IRInstruction *source,
   out->is_float = source->is_float;
   out->float_bits = source->float_bits;
   out->is_unsigned = source->is_unsigned; /* unsigned div/shr + zero-ext loads */
+  out->allocates = source->allocates;     /* string-concat allocation marker */
   out->ast_ref = NULL;
 
   if (!ir_inline_rewrite_operand(&source->dest, &out->dest, symbol_map,
@@ -862,6 +864,54 @@ int ir_inline_self_recursion_pass(IRProgram *program, int *changed) {
   return 1;
 }
 
+/* Why did this specific call site survive inlining? Shared by the --explain
+ * refusal remarks and the `@inline!` contract enforcement so the report and
+ * the error always agree. */
+/* True when the callee's body now contains a SIMD kernel op -- its loops were
+ * vectorized after inlining decisions were made, so the historical refusal
+ * reason (usually the loop-shape guard) no longer describes the body. */
+static int ir_function_contains_simd_kernel(const IRFunction *function) {
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    IROpcode op = function->instructions[i].op;
+    if (op >= IR_OP_COUNT_WORD_STARTS && op <= IR_OP_SIMD_OUTER_LANE_F64) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void ir_inline_site_reason(IRFunction *caller,
+                                  const IRInstruction *instruction,
+                                  IRFunction *callee, const char **reason,
+                                  const char **fix) {
+  *reason = NULL;
+  *fix = NULL;
+  if (callee != caller && ir_function_contains_simd_kernel(callee)) {
+    *reason = "the callee's loops were vectorized into SIMD kernels after "
+              "inlining ran; it stays a real call (the kernel runs the same "
+              "either way)";
+    return;
+  }
+  if (callee == caller) {
+    *reason = "the call is directly recursive";
+    *fix = "bounded self-recursion expansion applies automatically (depth 3); "
+           "rewrite as a loop for full control";
+  } else if (ir_function_non_nop_instruction_count(caller) >
+             IR_INLINE_MAX_CALLER_NON_NOP_INSTRUCTIONS) {
+    *reason = "the calling function is already over the 512-instruction "
+              "caller budget and may not grow further";
+  } else if (instruction->argument_count > IR_INLINE_MAX_PARAMETERS ||
+             instruction->argument_count != callee->parameter_count) {
+    *reason = "the call's argument count doesn't match what the inliner "
+              "handles for this callee";
+  } else if (ir_function_is_inline_candidate(callee, reason, fix)) {
+    /* Candidate-eligible but still here: the call site appeared late (a
+     * nested inline in the final round) or rounds hit their cap. */
+    *reason = "inlining rounds reached their limit before this call could "
+              "be revisited";
+  }
+}
+
 /* --explain: record every call that SURVIVED all inlining rounds, with the
  * reason it was not inlined. Successful inlines are recorded at the moment
  * they happen (the call instruction no longer exists afterwards); refusals are
@@ -879,10 +929,6 @@ void ir_inline_explain_report_remaining(IRProgram *program) {
     if (!function) {
       continue;
     }
-    int caller_full =
-        ir_function_non_nop_instruction_count(function) >
-        IR_INLINE_MAX_CALLER_NON_NOP_INSTRUCTIONS;
-
     for (size_t i = 0; i < function->instruction_count; i++) {
       const IRInstruction *instruction = &function->instructions[i];
       if (instruction->op != IR_OP_CALL || !instruction->text) {
@@ -895,32 +941,85 @@ void ir_inline_explain_report_remaining(IRProgram *program) {
       if (!callee) {
         continue;
       }
-
       const char *reason = NULL;
       const char *fix = NULL;
-      if (callee == function) {
-        reason = "the call is directly recursive";
-        fix = "bounded self-recursion expansion applies automatically (depth "
-              "3); rewrite as a loop for full control";
-      } else if (caller_full) {
-        reason = "the calling function is already over the 512-instruction "
-                 "caller budget and may not grow further";
-      } else if (instruction->argument_count > IR_INLINE_MAX_PARAMETERS ||
-                 instruction->argument_count != callee->parameter_count) {
-        reason = "the call's argument count doesn't match what the inliner "
-                 "handles for this callee";
-      } else if (ir_function_is_inline_candidate(callee, &reason, &fix)) {
-        /* Candidate-eligible but still here: the call site appeared late (a
-         * nested inline in the final round) or rounds hit their cap. */
-        reason = "inlining rounds reached their limit before this call could "
-                 "be revisited";
-      }
+      ir_inline_site_reason(function, instruction, callee, &reason, &fix);
       char entity[160];
       snprintf(entity, sizeof(entity), "call to `%s`", instruction->text);
       ir_explain_remark(function->name, entity, instruction->location, 0,
                         "NOT inlined", reason, fix);
     }
   }
+}
+
+/* `@inline!` contract: after every inlining round has run, any surviving call
+ * to a contract function is a hard compile error carrying the same reason the
+ * --explain report would give. Not focus-filtered -- a contract holds across
+ * the whole program. Returns 1 when every contract held. */
+int ir_inline_enforce_contracts(IRProgram *program) {
+  if (!program) {
+    return 1;
+  }
+  /* Inlining clones call sites (each clone keeps the original source
+   * location), so one offending line can surface several times; report each
+   * (location, callee) once. */
+  struct {
+    size_t line, column;
+    const char *callee;
+  } reported[64];
+  size_t reported_count = 0;
+  int ok = 1;
+  for (size_t f = 0; f < program->function_count; f++) {
+    IRFunction *function = program->functions[f];
+    if (!function) {
+      continue;
+    }
+    for (size_t i = 0; i < function->instruction_count; i++) {
+      const IRInstruction *instruction = &function->instructions[i];
+      if (instruction->op != IR_OP_CALL || !instruction->text) {
+        continue;
+      }
+      IRFunction *callee = ir_program_find_function(program, instruction->text);
+      if (!callee || !callee->is_inline_contract) {
+        continue;
+      }
+      int already_reported = 0;
+      for (size_t r = 0; r < reported_count; r++) {
+        if (reported[r].line == instruction->location.line &&
+            reported[r].column == instruction->location.column &&
+            strcmp(reported[r].callee, instruction->text) == 0) {
+          already_reported = 1;
+          break;
+        }
+      }
+      if (already_reported) {
+        ok = 0; /* still a violation, just not re-printed */
+        continue;
+      }
+      if (reported_count < 64) {
+        reported[reported_count].line = instruction->location.line;
+        reported[reported_count].column = instruction->location.column;
+        reported[reported_count].callee = instruction->text;
+        reported_count++;
+      }
+      const char *reason = NULL;
+      const char *fix = NULL;
+      ir_inline_site_reason(function, instruction, callee, &reason, &fix);
+      fprintf(stderr,
+              "%s:%zu:%zu: error: @inline! call to `%s` was not inlined: "
+              "%s%s%s\n",
+              instruction->location.filename ? instruction->location.filename
+                                             : "<input>",
+              instruction->location.line, instruction->location.column,
+              instruction->text, reason ? reason : "unknown",
+              fix ? "; " : "", fix ? fix : "");
+      ok = 0;
+    }
+  }
+  if (!ok) {
+    ir_optimize_note_user_error();
+  }
+  return ok;
 }
 
 int ir_inline_small_functions_pass(IRProgram *program, int *changed) {

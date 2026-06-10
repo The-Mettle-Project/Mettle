@@ -316,6 +316,16 @@ void ir_explain_remark(const char *function_name, const char *entity,
   r->fix = ir_explain_text_dup(fix);
 }
 
+int ir_explain_has_remark_at(size_t line, const char *entity) {
+  for (size_t i = 0; i < g_remark_count; i++) {
+    if (g_remarks[i].line == line && g_remarks[i].entity && entity &&
+        strcmp(g_remarks[i].entity, entity) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static int ir_explain_remark_compare(const void *a, const void *b) {
   const IRExplainRemark *ra = a, *rb = b;
   if (ra->line != rb->line) {

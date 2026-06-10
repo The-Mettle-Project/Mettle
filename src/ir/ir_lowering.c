@@ -3441,6 +3441,9 @@ static int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
         instruction.rhs = right;
         instruction.text = binary->operator;
         instruction.ast_ref = expression;
+        /* String '+' becomes a heap-allocating concat kernel in codegen; mark
+         * it so the `@noalloc` contract checker can see the allocation. */
+        instruction.allocates = 1;
         if (!ir_emit(context, function, &instruction)) {
           ir_operand_destroy(&right);
           ir_operand_destroy(&left);
@@ -4832,8 +4835,10 @@ static IRFunction *ir_lower_function(IRLoweringContext *context,
     return NULL;
   }
   function->is_inline = function_data->is_inline;
+  function->is_inline_contract = function_data->is_inline_contract;
   function->is_noinline = function_data->is_noinline;
   function->is_pure = function_data->is_pure;
+  function->is_noalloc = function_data->is_noalloc;
   /* A function-level `@simd` decorator becomes the default mode for every
    * counted loop in the body that has no `@simd` of its own. */
   context->current_function_simd_default = function_data->simd_mode;

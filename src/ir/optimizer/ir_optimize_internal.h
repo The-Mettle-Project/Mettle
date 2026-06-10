@@ -433,6 +433,15 @@ int ir_verify_simd_contracts(IRFunction *function);
  * (ir_optimize_had_user_error is also declared in the public ir_optimize.h.) */
 void ir_optimize_reset_user_error(void);
 int ir_optimize_had_user_error(void);
+/* Lets the `@inline!` / `@noalloc` contract checkers report through the same
+ * "user error, not ICE" channel `@simd!` uses. */
+void ir_optimize_note_user_error(void);
+/* `@inline!`: error for every surviving call to a contract function, with the
+ * inliner's reason. Returns 1 when all contracts held. */
+int ir_inline_enforce_contracts(IRProgram *program);
+/* `@noalloc`: transitive allocation-freedom proof per contract function
+ * (ir_optimize_contracts.c). Returns 1 when all contracts held. */
+int ir_enforce_noalloc_contracts(IRProgram *program);
 /* --simd-report: emit a note for every `@simd` loop (vectorized or not). */
 void ir_optimize_set_simd_report(int enabled);
 /* --explain: optimization-decision remarks (state and report rendering live in
@@ -452,6 +461,10 @@ void ir_explain_remark(const char *function_name, const char *entity,
                        const char *fix);
 /* Print the sorted optimization report (loops + calls) and clear the store. */
 void ir_explain_flush(void);
+/* True when a remark for this (line, entity) is already recorded -- lets a
+ * later pass skip a weaker guess when a definitive remark exists (e.g. the
+ * unroller's "fully unrolled" beats the verifier's "no loop remains"). */
+int ir_explain_has_remark_at(size_t line, const char *entity);
 /* Instruction-level description of a vectorized kernel op for headlines. */
 void ir_explain_kernel_desc(const IRInstruction *ins, char *buf, size_t cap);
 /* --explain: after all inlining rounds, record a remark for every surviving

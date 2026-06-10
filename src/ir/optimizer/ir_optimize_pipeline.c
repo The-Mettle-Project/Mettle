@@ -407,6 +407,17 @@ int ir_optimize_program_pipeline(IRProgram *program,
     return 0;
   }
 
+  /* Function-level contracts, now that every optimization that could satisfy
+   * them has run. `@inline!` is skipped when function boundaries are pinned
+   * (--profile-runtime disables inlining entirely; failing every contract
+   * there would be noise, not information). Check both before deciding the
+   * outcome so a build with several violations reports them all. */
+  int contracts_ok = 1;
+  if (!options || !options->preserve_function_boundaries) {
+    contracts_ok &= ir_inline_enforce_contracts(program);
+  }
+  contracts_ok &= ir_enforce_noalloc_contracts(program);
+
   /* --explain: every inline that happened was recorded as it happened; record
    * each surviving call with the reason it was refused, then print the whole
    * sorted report. (No-ops unless explain is enabled.) */
@@ -414,5 +425,5 @@ int ir_optimize_program_pipeline(IRProgram *program,
   ir_explain_flush();
 
   ir_function_index_reset();
-  return 1;
+  return contracts_ok;
 }

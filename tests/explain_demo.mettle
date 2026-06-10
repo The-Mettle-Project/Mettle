@@ -50,6 +50,25 @@ function tiny_fixed() -> int32 {
     return s;
 }
 
+// `@pure` + loop-invariant argument: the call is hoisted out of the loop
+// (`@noinline` keeps it a real call so LICM, not the inliner, handles it).
+@noinline @pure function bias(k: int32) -> int32 {
+    return k * 3 + 1;
+}
+
+function apply_bias(a: int32*, n: int32, k: int32) -> int32 {
+    var s: int32 = 0;
+    for i in 0..n {
+        s = s + a[i] + bias(k);
+    }
+    return s;
+}
+
+// `@noalloc`: proven allocation-free over everything it can reach.
+@noalloc function norm2(x: float32, y: float32) -> float32 {
+    return x * x + y * y;
+}
+
 function main() -> int32 {
     var xs: float32[64];
     var ys: float32[64];
@@ -70,7 +89,11 @@ function main() -> int32 {
     saxpy(2.0, &xs[0], &ys[0], 64);
     with_call(&ys[0], 64);
     matvec(&mm[0], &xs[0], &ys[0], 4, 64);
-    var t: int32 = sum_bytes(&bs[0], 64);
-    var u: int32 = opaque(t + tiny_fixed());
+    var iv: int32[64];
+    i = 0;
+    while (i < 64) { iv[i] = i; i = i + 1; }
+    var t: int32 = sum_bytes(&bs[0], 64) + apply_bias(&iv[0], 64, 7);
+    var nf: float32 = norm2(3.0, 4.0);
+    var u: int32 = opaque(t + tiny_fixed() + (int32)nf);
     return u - u;
 }

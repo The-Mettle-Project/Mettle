@@ -117,6 +117,16 @@ ASTNode *ast_clone_node(ASTNode *node) {
     dst->type_params = ast_copy_string_array(src->type_params, src->type_param_count);
     dst->type_param_traits =
         ast_copy_string_array(src->type_param_traits, src->type_param_count);
+    /* Decorator flags. These were never copied (the struct is malloc'd, so
+     * clones -- notably monomorphized generics -- carried UNINITIALIZED
+     * decorator flags). Mostly latent until `@inline!`/`@noalloc` made a
+     * garbage flag a hard compile error. */
+    dst->is_inline = src->is_inline;
+    dst->is_inline_contract = src->is_inline_contract;
+    dst->is_noinline = src->is_noinline;
+    dst->is_pure = src->is_pure;
+    dst->is_noalloc = src->is_noalloc;
+    dst->simd_mode = src->simd_mode;
     if (src->parameter_count > 0) {
       dst->parameter_names = malloc(src->parameter_count * sizeof(char *));
       dst->parameter_types = malloc(src->parameter_count * sizeof(char *));
@@ -1172,8 +1182,10 @@ ASTNode *ast_create_function_declaration(const char *name, char **param_names,
   func_decl->type_param_traits = NULL;
   func_decl->type_param_count = 0;
   func_decl->is_inline = 0;
+  func_decl->is_inline_contract = 0;
   func_decl->is_noinline = 0;
   func_decl->is_pure = 0;
+  func_decl->is_noalloc = 0;
   func_decl->simd_mode = SIMD_ATTR_NONE;
 
   if (param_count > 0) {

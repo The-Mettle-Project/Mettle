@@ -218,9 +218,59 @@ $cases = @(
       'declare the accumulator as int64',
       'reason: the callee is marked @noinline',
       'hoist invariant index math into a pointer',
-      'no loop remains after optimization',
+      # the unroller's definitive remark supersedes the verifier's
+      # "no loop remains" guess
+      'fully unrolled \(8 iterations',
+      'hoisted out of the loop \(runs once',
+      'verified @noalloc',
       'backend report: explain_demo\.mettle'
     )
+  },
+  @{
+    # `@inline!` contract: a recursive function can never have every call
+    # inlined away, so the build must fail with the inliner's reason.
+    Name          = "err_inline_contract"
+    Path          = "tests/err_inline_contract.mettle"
+    ShouldSucceed = $false
+    Args          = @("-O")
+    Pattern       = '@inline! call to `fact` was not inlined: the call is directly recursive'
+  },
+  @{
+    Name          = "inline_contract"
+    Path          = "tests/test_inline_contract.mettle"
+    ShouldSucceed = $true
+    Args          = @("-O")
+  },
+  @{
+    # `@noalloc` violated directly by a `new` expression.
+    Name          = "err_noalloc"
+    Path          = "tests/err_noalloc.mettle"
+    ShouldSucceed = $false
+    Args          = @("-O")
+    Pattern       = '@noalloc function `make_point` allocates: a `new` expression'
+  },
+  @{
+    # `@noalloc` is transitive: the allocation is inside a reachable callee.
+    Name          = "err_noalloc_transitive"
+    Path          = "tests/err_noalloc_transitive.mettle"
+    ShouldSucceed = $false
+    Args          = @("-O")
+    Pattern       = 'inside reachable function `helper`, a `new` expression'
+  },
+  @{
+    # `@noalloc` is a proof: an unknown extern cannot be proven clean.
+    Name          = "err_noalloc_extern"
+    Path          = "tests/err_noalloc_extern.mettle"
+    ShouldSucceed = $false
+    Args          = @("-O")
+    Pattern       = 'calls the external function `mystery`, which cannot be proven allocation-free'
+  },
+  @{
+    # `@noalloc` succeeding: arithmetic + known-clean libm externs verify.
+    Name          = "noalloc"
+    Path          = "tests/test_noalloc.mettle"
+    ShouldSucceed = $true
+    Args          = @("-O")
   },
   @{
     # --explain remarks are limited to the main input file: a program importing

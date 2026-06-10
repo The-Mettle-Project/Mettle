@@ -1,0 +1,9 @@
+// `@noalloc` is a proof: an extern we cannot see into cannot be proven
+// allocation-free, so calling it violates the contract.
+extern function mystery(x: int32) -> int32 = "rand";
+@noalloc function hot(x: int32) -> int32 {
+    return mystery(x) + 1;
+}
+function main() -> int32 {
+    return hot(1) - hot(1);
+}
