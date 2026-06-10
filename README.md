@@ -38,7 +38,7 @@ Mettle compiles `.mettle` source to native x86-64. On Windows, `mettle --build` 
 - Direct calls to C and OS APIs; a bundled stdlib for I/O, memory, math, and more
 - `defer` / `errdefer` for scope cleanup; compile errors with source snippets
 - Range-based `for` (`for i in 0..n`) and **`@simd` / `@simd!` vectorization contracts**: ask the optimizer to vectorize a loop, and with `@simd!` fail the build if it can't. An auto-vectorizer (AVX2) backs them, beating `gcc -O3` on several kernels; `--simd-report` shows what each loop became.
-- **`--explain` — the optimizer as a collaborator, not an oracle**: compile with `--explain` and the compiler reports every optimization decision in your file — which loops vectorized (and into what), which didn't (and why), which calls inlined, which were refused (and what to change). No annotations, no disassembly.
+- `--explain` the optimizer as a collaborator: compile with `--explain` and the compiler reports every optimization decision in your file, which loops vectorized (and into what), which didn't (and why), which calls inlined, which were refused (and what to change). No annotations, no disassembly.
 - **GPU offload to NVIDIA** via a native CUDA/PTX backend: write `kernel` functions, launch them with `dispatch K[grid, block](args)`, no LLVM or `nvcc`. See [GPU offload](docs/gpu.md).
 - Optional Tracy profiling, runtime timing, and debug stack traces
 
