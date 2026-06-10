@@ -49,6 +49,11 @@ typedef struct {
   const char *tracy_directory;
   int debug_compiler;
   int main_wants_argc_argv;
+  /* Set when this compile feeds a --build executable link (as opposed to a
+   * bare --emit-obj library object). Gates whole-program transforms that are
+   * only sound when `main` is the single entry point, e.g. dead-function
+   * elimination. */
+  int building_executable;
   LinkerMode linker_mode;
 } CompilerOptions;
 

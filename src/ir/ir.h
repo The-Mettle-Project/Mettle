@@ -274,6 +274,11 @@ typedef struct {
   IRProfileEntry *profile_entries;
   size_t profile_entry_count;
   size_t profile_entry_capacity;
+  /* Set once ir_program_eliminate_dead_functions has run. The binary backend
+   * walks AST function declarations and treats a missing IR body as an
+   * internal error; this flag tells it a missing body means "eliminated as
+   * unreachable", which is expected, not a lowering bug. */
+  int dead_functions_eliminated;
 } IRProgram;
 
 IROperand ir_operand_none(void);
@@ -329,5 +334,14 @@ int ir_instruction_dump(const IRInstruction *instruction,
  *   - call "free"        -> call "mettle_heap_free"
  * Returns 1 on success, 0 on allocation failure. */
 int ir_program_route_to_native_heap(IRProgram *program);
+
+/* Executable-build dead code elimination: drops every function unreachable
+ * from `main`. A function is considered referenced when any instruction of a
+ * live function names it in `text` (direct calls), a SYMBOL operand
+ * (function-pointer uses), or a STRING operand (dispatch-by-name). Programs
+ * without a `main` (library objects) are left untouched. Run it after
+ * inlining so fully-inlined helpers are swept too. Returns 1 on success
+ * (including no-op), 0 on allocation failure. */
+int ir_program_eliminate_dead_functions(IRProgram *program);
 
 #endif // IR_H

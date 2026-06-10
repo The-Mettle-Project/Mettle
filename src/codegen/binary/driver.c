@@ -380,6 +380,12 @@ int code_generator_generate_program_binary_object(CodeGenerator *generator,
       ir_function = code_generator_find_ir_function_binary(generator,
                                                            function_data->name);
       if (!ir_function) {
+        /* After dead-function elimination a missing IR body means the
+         * function was unreachable from main — skip it. Without that pass a
+         * missing body is a real lowering bug and stays a hard error. */
+        if (generator->ir_program->dead_functions_eliminated) {
+          continue;
+        }
         code_generator_set_error(generator,
                                  "No IR body found for function '%s'",
                                  function_data->name);

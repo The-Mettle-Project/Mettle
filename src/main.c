@@ -559,6 +559,195 @@ static int parse_linker_mode(const char *text, LinkerMode *mode_out) {
 }
 
 #ifndef _WIN32
+#define METTLE_ELF_DYNAMIC_LINKER "/lib64/ld-linux-x86-64.so.2"
+
+/* Runs `gcc -print-file-name=<file>` and returns the strdup'd path, or NULL
+ * when gcc is missing or does not ship the file (gcc echoes the bare name
+ * back, without a '/', when it has no path for it). <file> is always a
+ * compiled-in literal, so the popen command cannot be influenced by user
+ * input. */
+static char *mettle_gcc_print_file_name(const char *file) {
+  char command[256];
+  char line[1024];
+  FILE *pipe;
+  size_t len;
+
+  if (snprintf(command, sizeof(command), "gcc -print-file-name=%s 2>/dev/null",
+               file) >= (int)sizeof(command)) {
+    return NULL;
+  }
+  pipe = popen(command, "r");
+  if (!pipe) {
+    return NULL;
+  }
+  if (!fgets(line, sizeof(line), pipe)) {
+    pclose(pipe);
+    return NULL;
+  }
+  pclose(pipe);
+  len = strlen(line);
+  while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+    line[--len] = '\0';
+  }
+  if (!strchr(line, '/')) {
+    return NULL;
+  }
+  return strdup(line);
+}
+
+/* Returns dirname(reference) + "/" + file (file may be "" to get the bare
+ * directory prefix for -L). */
+static char *mettle_sibling_path(const char *reference, const char *file) {
+  const char *slash = strrchr(reference, '/');
+  size_t dir_len;
+  char *out;
+
+  if (!slash) {
+    return NULL;
+  }
+  dir_len = (size_t)(slash - reference) + 1u;
+  out = malloc(dir_len + strlen(file) + 1u);
+  if (!out) {
+    return NULL;
+  }
+  memcpy(out, reference, dir_len);
+  strcpy(out + dir_len, file);
+  return out;
+}
+
+/* Plain builds get their ELF symbol table stripped at link: .symtab/.strtab
+ * (every function and string-literal label) are dead weight at runtime and
+ * outweigh the program's actual section content several times over for small
+ * binaries. This matches the Windows internal PE linker, which never emits a
+ * symbol table. Debug/trace/profile builds keep symbols for tooling. */
+static int mettle_elf_keep_symbols(const CompilerOptions *options) {
+  return options &&
+         (options->debug_mode || options->generate_debug_symbols ||
+          options->generate_line_mapping ||
+          options->generate_stack_trace_support || options->tracy ||
+          compiler_options_use_profile_runtime(options));
+}
+
+/* Links the ELF executable by invoking ld directly, reproducing the link line
+ * the gcc driver would build (crt1/crti/crtbegin + objects + -lc -lpthread +
+ * crtend/crtn against the glibc dynamic linker). The gcc driver itself costs
+ * ~140ms per link in spec processing and collect2 while ld links these
+ * programs in under 10ms; with mettle's own compile around 10ms the driver
+ * would otherwise dominate total build time. Quiet on failure (stderr is
+ * dropped in the child): the caller falls back to the gcc driver, which
+ * reports any real link error. Returns 0 on success. */
+static int mettle_link_elf_direct(const char *object_filename,
+                                  const char *executable_filename,
+                                  const char *posix_helpers_object,
+                                  const char *atomics_object,
+                                  const char *crash_handler_object,
+                                  const char *profile_object,
+                                  int strip_symbols) {
+  char *crt1 = NULL;
+  char *crti = NULL;
+  char *crtn = NULL;
+  char *crtbegin = NULL;
+  char *crtend = NULL;
+  char *libc_dir = NULL;
+  char *gcc_lib_dir = NULL;
+  const char *argv_list[32];
+  size_t argc_used = 0u;
+  int result = 1;
+  pid_t pid;
+  int status = 0;
+
+  /* Non-glibc layouts (e.g. musl) keep using the gcc driver. */
+  if (access(METTLE_ELF_DYNAMIC_LINKER, F_OK) != 0) {
+    return 1;
+  }
+
+  crt1 = mettle_gcc_print_file_name("crt1.o");
+  crtbegin = mettle_gcc_print_file_name("crtbegin.o");
+  if (!crt1 || !crtbegin) {
+    goto cleanup;
+  }
+  crti = mettle_sibling_path(crt1, "crti.o");
+  crtn = mettle_sibling_path(crt1, "crtn.o");
+  crtend = mettle_sibling_path(crtbegin, "crtend.o");
+  libc_dir = mettle_sibling_path(crt1, "");
+  gcc_lib_dir = mettle_sibling_path(crtbegin, "");
+  if (!crti || !crtn || !crtend || !libc_dir || !gcc_lib_dir) {
+    goto cleanup;
+  }
+  if (access(crti, F_OK) != 0 || access(crtn, F_OK) != 0 ||
+      access(crtend, F_OK) != 0) {
+    goto cleanup;
+  }
+
+  argv_list[argc_used++] = "ld";
+  argv_list[argc_used++] = "--eh-frame-hdr";
+  argv_list[argc_used++] = "--gc-sections";
+  /* Merge the read-only and executable LOAD segments (the pre-binutils-2.31
+   * layout): separate-code spends up to two 4K pages of file padding per
+   * binary for page-exact W^X mapping, a poor trade for small executables
+   * whose code is non-PIE at a fixed base to begin with. */
+  argv_list[argc_used++] = "-z";
+  argv_list[argc_used++] = "noseparate-code";
+  if (strip_symbols) {
+    argv_list[argc_used++] = "-s";
+  }
+  argv_list[argc_used++] = "-dynamic-linker";
+  argv_list[argc_used++] = METTLE_ELF_DYNAMIC_LINKER;
+  argv_list[argc_used++] = "-o";
+  argv_list[argc_used++] = executable_filename;
+  argv_list[argc_used++] = crt1;
+  argv_list[argc_used++] = crti;
+  argv_list[argc_used++] = crtbegin;
+  argv_list[argc_used++] = object_filename;
+  if (posix_helpers_object) {
+    argv_list[argc_used++] = posix_helpers_object;
+  }
+  if (atomics_object) {
+    argv_list[argc_used++] = atomics_object;
+  }
+  if (crash_handler_object) {
+    argv_list[argc_used++] = crash_handler_object;
+  }
+  if (profile_object) {
+    argv_list[argc_used++] = profile_object;
+  }
+  argv_list[argc_used++] = "-L";
+  argv_list[argc_used++] = libc_dir;
+  argv_list[argc_used++] = "-L";
+  argv_list[argc_used++] = gcc_lib_dir;
+  argv_list[argc_used++] = "-lc";
+  argv_list[argc_used++] = "-lpthread";
+  argv_list[argc_used++] = crtend;
+  argv_list[argc_used++] = crtn;
+  argv_list[argc_used] = NULL;
+
+  pid = fork();
+  if (pid == 0) {
+    /* Errors from a failed direct link would be confusing noise: the caller
+     * retries through the gcc driver, which reports anything real. A failed
+     * redirect only makes a failed link noisier, so it is not checked. */
+    if (!freopen("/dev/null", "w", stdout) ||
+        !freopen("/dev/null", "w", stderr)) {
+    }
+    execvp("ld", (char *const *)argv_list);
+    _exit(127);
+  }
+  if (pid > 0 && waitpid(pid, &status, 0) >= 0 && (status & 0x7f) == 0 &&
+      ((status >> 8) & 0xff) == 0) {
+    result = 0;
+  }
+
+cleanup:
+  free(crt1);
+  free(crti);
+  free(crtn);
+  free(crtbegin);
+  free(crtend);
+  free(libc_dir);
+  free(gcc_lib_dir);
+  return result;
+}
+
 /* Links a native ELF executable by invoking the system C compiler (gcc). gcc
  * supplies the C runtime startup (crt1.o/crti.o/crtn.o, hence `_start`), the
  * dynamic linker, and libc, so the program runs on the same C runtime routines
@@ -629,6 +818,19 @@ static int mettle_link_elf_executable(const char *object_filename,
     return 1;
   }
 
+  /* Fast path: link with ld directly. --static/--musl builds (library group
+   * ordering and musl specs are the driver's job) and builds with user
+   * --link-arg values (gcc-flavoured flags like -Wl,...) keep the driver;
+   * everything else only falls back to it when the direct link fails. */
+  if (!(options && (options->static_link || options->musl_link)) &&
+      !(options && options->link_argument_count > 0) &&
+      mettle_link_elf_direct(object_filename, executable_filename,
+                             posix_helpers_object, atomics_object,
+                             crash_handler_object, profile_object,
+                             !mettle_elf_keep_symbols(options)) == 0) {
+    result = 0;
+  }
+
   /* Build the argv vector directly and exec the compiler via fork/execvp
    * instead of handing a constructed command string to system(). Because no
    * shell ever interprets the arguments, none of the caller-controlled
@@ -636,10 +838,11 @@ static int mettle_link_elf_executable(const char *object_filename,
    * --link-arg values — can inject shell commands (CWE-78) or be word-split
    * into unintended options (CWE-88). Each --link-arg is forwarded as exactly
    * one argv element, matching how it was collected at parse time. */
-  {
-    /* Upper bound: cc, -no-pie, -static, object, -o, executable, -lpthread
-     * (7) + up to 4 runtime objects + every link argument + NULL terminator. */
-    size_t max_args = 7u + 4u + 1u +
+  if (result != 0) {
+    /* Upper bound: cc, -no-pie, -Wl,--gc-sections, -s, -static, object, -o,
+     * executable, -lpthread (9) + up to 4 runtime objects + every link
+     * argument + NULL terminator. */
+    size_t max_args = 9u + 4u + 1u +
                       (options ? options->link_argument_count : 0u);
     size_t argc_used = 0u;
     pid_t pid;
@@ -658,6 +861,10 @@ static int mettle_link_elf_executable(const char *object_filename,
     /* execvp does not modify argv contents; the const casts are safe. */
     argv_list[argc_used++] = (char *)cc;
     argv_list[argc_used++] = (char *)"-no-pie";
+    argv_list[argc_used++] = (char *)"-Wl,--gc-sections";
+    if (!mettle_elf_keep_symbols(options)) {
+      argv_list[argc_used++] = (char *)"-s";
+    }
     if (options && (options->static_link || options->musl_link)) {
       argv_list[argc_used++] = (char *)"-static";
     }
@@ -2250,6 +2457,8 @@ int main(int argc, char *argv[]) {
     options.output_filename = object_output_filename;
   }
 
+  options.building_executable = build_executable;
+
   double command_profile_start =
       options.profile ? compiler_profile_now_ms() : 0.0;
   int result =
@@ -2757,6 +2966,20 @@ int compile_file(const char *input_filename, const char *output_filename,
      * -O/--release. Tell the user their `@simd` loops went unchecked and strip
      * the markers so they never reach codegen. */
     ir_note_simd_contracts_unverified(ir_program);
+  }
+
+  /* Executable builds: drop functions unreachable from main. Importing a
+   * stdlib module emits the whole module, so without this every binary
+   * carries the unused siblings of each function it actually calls. Runs
+   * after the optimizer so functions the inliner fully absorbed are swept
+   * too. Skipped for profile/tracy builds, whose instrumentation tables
+   * enumerate every function. */
+  if (options->building_executable && !options->tracy &&
+      !compiler_options_use_profile_runtime(options) &&
+      !ir_program_eliminate_dead_functions(ir_program)) {
+    fprintf(stderr, "Error: Failed to eliminate dead functions\n");
+    result = 1;
+    goto cleanup;
   }
 
   if (options->profile_runtime_ops) {
