@@ -678,6 +678,149 @@ static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
   return 1;
 }
 
+/* --- Self-recursion inlining -------------------------------------------
+ *
+ * The regular inliner never inlines a function into itself (callee !=
+ * function), so a recursive function pays full call overhead at every level
+ * of the recursion tree. Inlining the body into its own self-call sites a
+ * bounded number of times (the gcc "max-inline-recursive-depth" idea)
+ * multiplies the work done per real call: depth 1 turns each call into ~the
+ * work of a small subtree, cutting the dynamic call count by the subtree
+ * size. Growth is bounded by a body-size cap, so deep expansion stops on its
+ * own. Loop-bearing recursive functions are excluded: the inliner's
+ * structural loop guards exist to sidestep a latent optimizer bug, and the
+ * combination is rare enough not to be worth the risk. */
+static int ir_function_is_self_inline_candidate(const IRFunction *function,
+                                                size_t *self_call_count_out) {
+  if (!function || !function->name || function->instruction_count == 0 ||
+      function->is_noinline) {
+    return 0;
+  }
+  if (function->parameter_count > IR_INLINE_MAX_PARAMETERS ||
+      (function->parameter_count > 0 && !function->parameter_names)) {
+    return 0;
+  }
+
+  size_t self_calls = 0;
+  int has_return = 0;
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    if (instruction->op == IR_OP_NOP) {
+      continue;
+    }
+    if (instruction->op == IR_OP_INLINE_ASM ||
+        instruction->op == IR_OP_CALL_INDIRECT) {
+      return 0;
+    }
+    if (instruction->op == IR_OP_LABEL && instruction->text &&
+        (strncmp(instruction->text, "ir_while_", 9) == 0 ||
+         strstr(instruction->text, "_lbl_ir_while_") != NULL)) {
+      return 0;
+    }
+    if (instruction->op == IR_OP_CALL && instruction->text &&
+        strcmp(instruction->text, function->name) == 0) {
+      if (instruction->argument_count != function->parameter_count) {
+        return 0;
+      }
+      self_calls++;
+      if (self_calls > IR_SELF_INLINE_MAX_SELF_CALLS) {
+        return 0;
+      }
+    }
+    if (instruction->op == IR_OP_RETURN) {
+      has_return = 1;
+    }
+  }
+
+  if (self_call_count_out) {
+    *self_call_count_out = self_calls;
+  }
+  return has_return && self_calls > 0;
+}
+
+/* One depth level: rebuild the function, expanding every direct self-call
+ * site with a clone of the CURRENT body (the clone's own self-calls stay as
+ * real calls, to be expanded by the next round or executed at runtime). */
+static int ir_inline_self_calls_once(IRFunction *function,
+                                     size_t *inline_counter, int *changed) {
+  IRInstructionVector vector = {0};
+  int local_changed = 0;
+
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    IRInstruction cloned = {0};
+
+    if (instruction->op == IR_OP_CALL && instruction->text &&
+        strcmp(instruction->text, function->name) == 0 &&
+        instruction->argument_count == function->parameter_count) {
+      if (!ir_inline_call_instruction(&vector, instruction, function,
+                                      (*inline_counter)++)) {
+        ir_instruction_vector_destroy(&vector);
+        return 0;
+      }
+      local_changed = 1;
+      continue;
+    }
+
+    if (!ir_clone_instruction_plain(instruction, &cloned) ||
+        !ir_instruction_vector_append_move(&vector, &cloned)) {
+      ir_instruction_destroy_storage(&cloned);
+      ir_instruction_vector_destroy(&vector);
+      return 0;
+    }
+  }
+
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    ir_instruction_destroy_storage(&function->instructions[i]);
+  }
+  free(function->instructions);
+  function->instructions = vector.items;
+  function->instruction_count = vector.count;
+  function->instruction_capacity = vector.capacity;
+  vector.items = NULL;
+  vector.count = 0;
+  vector.capacity = 0;
+
+  if (local_changed && changed) {
+    *changed = 1;
+  }
+  return 1;
+}
+
+int ir_inline_self_recursion_pass(IRProgram *program, int *changed) {
+  if (!program) {
+    return 0;
+  }
+
+  size_t inline_counter = 0;
+  for (size_t i = 0; i < program->function_count; i++) {
+    IRFunction *function = program->functions[i];
+    size_t self_calls = 0;
+    if (!ir_function_is_self_inline_candidate(function, &self_calls)) {
+      continue;
+    }
+    for (int depth = 0; depth < IR_SELF_INLINE_MAX_DEPTH; depth++) {
+      if (ir_function_non_nop_instruction_count(function) >
+          IR_SELF_INLINE_MAX_BODY_INSTRUCTIONS) {
+        break;
+      }
+      int round_changed = 0;
+      if (!ir_inline_self_calls_once(function, &inline_counter,
+                                     &round_changed)) {
+        return 0;
+      }
+      if (!round_changed) {
+        break;
+      }
+      if (changed) {
+        *changed = 1;
+      }
+    }
+  }
+
+  return 1;
+}
+
 int ir_inline_small_functions_pass(IRProgram *program, int *changed) {
   if (!program) {
     return 0;

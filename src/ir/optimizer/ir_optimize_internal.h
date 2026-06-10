@@ -16,6 +16,12 @@
 #define IR_INLINE_MAX_PARAMETERS 16
 #define IR_INLINE_MAX_ROUNDS 4
 #define IR_INLINE_MAX_CALLER_NON_NOP_INSTRUCTIONS 512
+/* Self-recursion inlining: expand direct self-call sites with the current
+ * body up to MAX_DEPTH rounds, stopping early once the body outgrows the
+ * instruction cap (so the depth is effectively size-bounded). */
+#define IR_SELF_INLINE_MAX_DEPTH 3
+#define IR_SELF_INLINE_MAX_SELF_CALLS 4
+#define IR_SELF_INLINE_MAX_BODY_INSTRUCTIONS 320
 #define IR_UNROLL_MAX_TRIP_COUNT 64
 
 typedef struct {
@@ -343,6 +349,7 @@ int ir_fuse_while_loop_to_insn(IRFunction *function, size_t header_index,
 int ir_index_vector_append(IRIndexVector *vector, size_t value);
 void ir_index_vector_destroy(IRIndexVector *vector);
 int ir_inline_small_functions_pass(IRProgram *program, int *changed);
+int ir_inline_self_recursion_pass(IRProgram *program, int *changed);
 /* Resolve a function by name within the program (hashed lookup with a linear
  * fallback). Defined in ir_optimize_inline.c. */
 IRFunction *ir_program_find_function(IRProgram *program, const char *name);

@@ -366,6 +366,22 @@ int ir_optimize_program_pipeline(IRProgram *program,
     }
   }
 
+  /* Bounded recursive inlining: expand a recursive function's direct
+   * self-call sites into copies of its own body (depth- and size-capped), so
+   * each remaining real call amortizes prologue/epilogue and argument-passing
+   * overhead across a subtree of the recursion. Runs after the regular
+   * inliner so a self-recursive helper is first inlined into callers where
+   * possible, then expanded in place. */
+  if ((!options || !options->preserve_function_boundaries) &&
+      !ir_pass_name_is_skipped("inline_self_recursion")) {
+    int self_inline_changed = 0;
+    mettle_compiler_ctx_set_pass_name("inline_self_recursion");
+    mettle_compiler_ctx_set_fixpoint_iteration(0);
+    if (!ir_inline_self_recursion_pass(program, &self_inline_changed)) {
+      mettle_compiler_ice("IR optimization self-recursion inlining failed");
+    }
+  }
+
   /* `@pure` loop-invariant call hoisting. Program-level (resolves callees by
    * name) and run after inlining so an inlined pure body is hoisted as ordinary
    * loop-invariant code; the per-function fixpoint below then cleans up. */

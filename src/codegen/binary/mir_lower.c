@@ -542,6 +542,12 @@ static int mir_temp_is_float(CodeGenerator *g, IRFunction *function,
       continue;
     }
     if (in->is_float) {
+      /* A comparison's is_float flag describes its OPERANDS; the RESULT is an
+       * integer 0/1 (ucomis + setcc / fused jcc), so it is a GP value and is
+       * fine as a branch condition. */
+      if (in->op == IR_OP_BINARY && in->text && mir_is_comparison(in->text)) {
+        return 0;
+      }
       return 1;
     }
     if (in->op == IR_OP_ASSIGN && in->lhs.kind == IR_OPERAND_TEMP) {
@@ -1058,11 +1064,27 @@ int mir_function_is_eligible(CodeGenerator *generator,
       }
       break;
     case IR_OP_LOAD:
+      /* `%t <- *"literal" [8]` reads the data-pointer field of a string
+       * literal's fat struct: the value IS the address of a NUL-terminated
+       * .rdata cstring, so it lowers to MIR_LEA_CSTR (the same materialization
+       * used for string-literal call arguments). Any other width/shape on a
+       * STRING operand is deferred. */
+      if (in->lhs.kind == IR_OPERAND_STRING) {
+        if (in->is_float || in->rhs.kind != IR_OPERAND_INT ||
+            in->rhs.int_value != 8) {
+          return mir_trace_bail(function_data, "load:string_shape");
+        }
+        if (in->dest.kind != IR_OPERAND_TEMP &&
+            in->dest.kind != IR_OPERAND_SYMBOL) {
+          return mir_trace_bail(function_data, "load:dest");
+        }
+        break;
+      }
       if (in->lhs.kind != IR_OPERAND_TEMP && in->lhs.kind != IR_OPERAND_SYMBOL) {
-        return 0; /* address must be a register-resident pointer */
+        return mir_trace_bail(function_data, "load:address_kind");
       }
       if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
-        return 0;
+        return mir_trace_bail(function_data, "load:dest");
       }
       break;
     case IR_OP_STORE:
@@ -2263,6 +2285,15 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
   }
 
   case IR_OP_LOAD: {
+    if (in->lhs.kind == IR_OPERAND_STRING) {
+      /* Data-pointer field of a string literal: materialize the .rdata
+       * cstring address directly (validated to be the 8-byte pointer load by
+       * the eligibility gate). */
+      MirOperand dst = mir_value_operand(fn, g, ctx, map, &in->dest);
+      const char *s = in->lhs.name ? in->lhs.name : "";
+      return mir_emit1(fn, MIR_LEA_CSTR, dst, mir_op_symbol(s), mir_op_none(),
+                       8, 0, 0);
+    }
     MirOperand dst = mir_value_operand(fn, g, ctx, map, &in->dest);
     MirOperand addr = mir_value_operand(fn, g, ctx, map, &in->lhs);
     int size = code_generator_binary_get_access_size(g, ctx, &in->rhs);
