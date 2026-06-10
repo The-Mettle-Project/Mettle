@@ -33,6 +33,12 @@
 
 static int g_explain = 0;
 static const char *g_explain_focus_file = NULL;
+/* Set while a fix hypothesis is being simulated on a scratch clone: the
+ * re-run optimizer passes must not pollute the report with the clone's
+ * remarks (the unroller, for one, records remarks from inside the stages). */
+static int g_explain_hypothesis = 0;
+
+void ir_explain_set_hypothesis(int active) { g_explain_hypothesis = active; }
 
 /* One remark: an entity ("loop", "call to `f`") in a function, a colored
  * headline, and optional reason/fix detail lines. */
@@ -43,8 +49,9 @@ typedef struct {
   size_t column;
   int positive; /* 1 = the optimizer did something good (green), 0 = declined */
   char *headline;
-  char *reason; /* may be NULL */
-  char *fix;    /* may be NULL */
+  char *reason;   /* may be NULL */
+  char *fix;      /* may be NULL */
+  char *verified; /* may be NULL: the fix was SIMULATED and proven to work */
 } IRExplainRemark;
 
 static IRExplainRemark *g_remarks = NULL;
@@ -277,8 +284,9 @@ static char *ir_explain_text_dup(const char *s) {
 void ir_explain_remark(const char *function_name, const char *entity,
                        SourceLocation location, int positive,
                        const char *headline, const char *reason,
-                       const char *fix) {
-  if (!g_explain || !headline || !ir_explain_location_enabled(&location)) {
+                       const char *fix, const char *verified) {
+  if (!g_explain || g_explain_hypothesis || !headline ||
+      !ir_explain_location_enabled(&location)) {
     return;
   }
 
@@ -314,6 +322,7 @@ void ir_explain_remark(const char *function_name, const char *entity,
   r->headline = ir_explain_text_dup(headline);
   r->reason = ir_explain_text_dup(reason);
   r->fix = ir_explain_text_dup(fix);
+  r->verified = ir_explain_text_dup(verified);
 }
 
 int ir_explain_has_remark_at(size_t line, const char *entity) {
@@ -372,6 +381,11 @@ void ir_explain_flush(void) {
         fprintf(stderr, "      %s%s fix: %s%s\n", clr(EXPLAIN_DIM),
                 glyph_elbow(), r->fix, clr(EXPLAIN_RESET));
       }
+      if (r->verified) {
+        fprintf(stderr, "      %s%s verified: %s%s%s\n", clr(EXPLAIN_DIM),
+                glyph_elbow(), clr(EXPLAIN_GREEN), r->verified,
+                clr(EXPLAIN_RESET));
+      }
     }
     fprintf(stderr, "\n");
   }
@@ -382,6 +396,7 @@ void ir_explain_flush(void) {
     free(g_remarks[i].headline);
     free(g_remarks[i].reason);
     free(g_remarks[i].fix);
+    free(g_remarks[i].verified);
   }
   free(g_remarks);
   g_remarks = NULL;
@@ -433,7 +448,13 @@ static void ir_explain_backend_reason(const IRExplainBackendEntry *e, char *buf,
              ir_opcode_name((IROpcode)op));
     return;
   }
-  snprintf(buf, cap, "eligibility gate said: %s", e->detail);
+  if (strcmp(e->detail, "call_unsupported") == 0) {
+    snprintf(buf, cap, "contains a call form the register allocator doesn't "
+                       "support yet");
+    return;
+  }
+  snprintf(buf, cap, "declined by the eligibility gate (reason code: %s)",
+           e->detail);
 }
 
 void ir_explain_backend_flush(void) {
@@ -478,6 +499,40 @@ void ir_explain_backend_flush(void) {
   g_backend = NULL;
   g_backend_count = 0;
   g_backend_capacity = 0;
+}
+
+/* ---- hypothesis clone ------------------------------------------------------
+ * A scratch deep copy of a function for simulating a suggested fix: the
+ * caller mutates the clone, re-runs the vectorization stages on it, inspects
+ * the result, and destroys it. Parameter names/types are copied because the
+ * recognizers consult them (e.g. the uint8* gate on the byte-sum kernel). */
+
+IRFunction *ir_explain_clone_function(const IRFunction *src) {
+  if (!src) {
+    return NULL;
+  }
+  IRFunction *clone = ir_function_create(src->name ? src->name : "?");
+  if (!clone) {
+    return NULL;
+  }
+  if (src->parameter_count > 0 &&
+      !ir_function_set_parameters(clone,
+                                  (const char **)src->parameter_names,
+                                  (const char **)src->parameter_types,
+                                  src->parameter_count)) {
+    ir_function_destroy(clone);
+    return NULL;
+  }
+  clone->is_inline = src->is_inline;
+  clone->is_noinline = src->is_noinline;
+  clone->is_pure = src->is_pure;
+  for (size_t i = 0; i < src->instruction_count; i++) {
+    if (!ir_function_append_instruction(clone, &src->instructions[i])) {
+      ir_function_destroy(clone);
+      return NULL;
+    }
+  }
+  return clone;
 }
 
 /* ---- kernel descriptions --------------------------------------------------

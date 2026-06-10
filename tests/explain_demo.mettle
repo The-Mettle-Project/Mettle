@@ -69,6 +69,16 @@ function apply_bias(a: int32*, n: int32, k: int32) -> int32 {
     return x * x + y * y;
 }
 
+@noinline function step1(x: float32) -> float32 {
+    return x + 1.0;
+}
+
+// Refused by the call-count cap -- but the report re-checks with @inline
+// pretend-applied and proves the suggestion before printing it.
+function chain(x: float32) -> float32 {
+    return step1(step1(step1(x)));
+}
+
 function main() -> int32 {
     var xs: float32[64];
     var ys: float32[64];
@@ -93,7 +103,7 @@ function main() -> int32 {
     i = 0;
     while (i < 64) { iv[i] = i; i = i + 1; }
     var t: int32 = sum_bytes(&bs[0], 64) + apply_bias(&iv[0], 64, 7);
-    var nf: float32 = norm2(3.0, 4.0);
+    var nf: float32 = norm2(3.0, 4.0) + chain(1.0);
     var u: int32 = opaque(t + tiny_fixed() + (int32)nf);
     return u - u;
 }

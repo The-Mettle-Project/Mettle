@@ -454,11 +454,46 @@ int ir_explain_enabled(void);
 int ir_explain_location_enabled(const SourceLocation *location);
 int ir_explain_file_enabled(const char *filename);
 /* Record one remark: `entity` is "loop" / "call to `f`"; `positive` colors the
- * headline (1 = the optimizer did something good); reason/fix may be NULL. */
+ * headline (1 = the optimizer did something good); reason/fix/verified may be
+ * NULL. `verified` is reserved for claims PROVEN by simulating the fix on a
+ * clone -- never for guesses. */
 void ir_explain_remark(const char *function_name, const char *entity,
                        SourceLocation location, int positive,
                        const char *headline, const char *reason,
-                       const char *fix);
+                       const char *fix, const char *verified);
+/* Hypothesis testing: deep-copy a function for fix simulation, suppress
+ * remark recording while the cloned stages run, and re-run the optimization
+ * stages on the clone (ir_optimize_pipeline.c). */
+IRFunction *ir_explain_clone_function(const IRFunction *src);
+void ir_explain_set_hypothesis(int active);
+int ir_optimize_function_revectorize(IRFunction *function);
+
+/* Machine-readable ids for every vectorization-bail diagnosis the --explain
+ * analyzer can make (ir_optimize_simd_contract.c). This list is the schema:
+ * fix-hypothesis transforms key off these ids, and a future --explain=json
+ * emits them as stable names (ir_simd_bail_id_name). One id per prose branch
+ * in ir_simd_explain_bail -- a new diagnosis MUST add an id, not hide under
+ * UNRECOGNIZED_SHAPE. */
+typedef enum {
+  IR_SIMD_BAIL_NONE = 0,           /* no diagnosis ran / loop vectorized */
+  IR_SIMD_BAIL_CALL_IN_BODY,       /* calls a named function every iteration */
+  IR_SIMD_BAIL_INDIRECT_CALL,      /* calls through a function pointer */
+  IR_SIMD_BAIL_ALLOC_IN_BODY,      /* allocates (`new`) every iteration */
+  IR_SIMD_BAIL_INLINE_ASM,         /* body contains inline assembly */
+  IR_SIMD_BAIL_CONTROL_FLOW,       /* data-dependent branch / early exit */
+  IR_SIMD_BAIL_INT16_ELEMENTS,     /* 16-bit integer memory, no kernel */
+  IR_SIMD_BAIL_INT64_ELEMENTS,     /* 64-bit integer memory, no kernel */
+  IR_SIMD_BAIL_SERIAL_RECURRENCE,  /* float '*'/'/' chain across iterations */
+  IR_SIMD_BAIL_MIXED_FLOAT_WIDTHS, /* f32 and f64 elements in one loop */
+  IR_SIMD_BAIL_BYTE_SUM_NARROW_ACC,/* byte sum into an int32 accumulator */
+  IR_SIMD_BAIL_INLINED_PARAM_LOCAL,/* leftover __inl_* param copy in body */
+  IR_SIMD_BAIL_BODY_LOCAL,         /* user local declared inside the body */
+  IR_SIMD_BAIL_DOT_SHAPE_ADDRESS,  /* float MAC, address pattern unmatched */
+  IR_SIMD_BAIL_STORE_ONLY_FILL,    /* writes-only fill/init pattern */
+  IR_SIMD_BAIL_UNRECOGNIZED_SHAPE  /* honest fallback: no cause identified */
+} IRSimdBailId;
+/* Stable lowercase-kebab name for an id (e.g. "byte-sum-narrow-acc"). */
+const char *ir_simd_bail_id_name(int id);
 /* Print the sorted optimization report (loops + calls) and clear the store. */
 void ir_explain_flush(void);
 /* True when a remark for this (line, entity) is already recorded -- lets a

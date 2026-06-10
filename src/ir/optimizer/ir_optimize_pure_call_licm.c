@@ -281,7 +281,7 @@ static int pure_licm_hoist_one(IRProgram *program, IRFunction *function) {
             "hoisted out of the loop (runs once, not every iteration)",
             "`@pure` + loop-invariant arguments enable loop-invariant code "
             "motion",
-            NULL);
+            NULL, NULL);
       }
       return 1;
     }

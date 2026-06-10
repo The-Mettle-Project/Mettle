@@ -432,7 +432,7 @@ static int ir_try_unroll_loop_at(IRFunction *function, size_t header_index,
              "fully unrolled (%lld iteration%s, constant trip count)", trips,
              trips == 1 ? "" : "s");
     ir_explain_remark(function->name, "loop", header_location, 1, headline,
-                      NULL, NULL);
+                      NULL, NULL, NULL);
   }
 
   ir_temp_value_map_destroy(&symbol_map);

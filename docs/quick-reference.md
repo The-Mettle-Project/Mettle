@@ -125,6 +125,23 @@ Nests are summarized (`vectorized inner, scalar outer`), fully unrolled loops
 say so, and a backend section reports which functions got the
 register-allocating backend (and why the rest fell back).
 
+Fix suggestions are **verified, not guessed**, where the compiler can prove
+them: it applies the suggested change to an internal clone, re-runs its own
+optimizer on it, and only then prints a `verified:` line —
+
+```
+sum_bytes (loop @ line 27): NOT vectorized
+    └ reason: this is a byte-sum loop, but the vpsadbw kernel accumulates
+      into int64 and this loop's accumulator is narrower
+    └ fix: declare the accumulator as int64
+    └ verified: simulated that fix and re-ran the optimizer: this loop
+      then vectorizes → vpsadbw, 32-wide byte sum (AVX2)
+```
+
+The same applies to inlining advice: "mark it @inline" is re-checked with the
+decorator pretend-applied, and when a hidden structural guard means it would
+NOT help, the report says that instead of giving advice that won't work.
+
 ## Function decorators
 
 ```mettle

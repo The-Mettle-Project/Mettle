@@ -684,7 +684,7 @@ static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
           char entity[160];
           snprintf(entity, sizeof(entity), "call to `%s`", instruction->text);
           ir_explain_remark(function->name, entity, instruction->location, 1,
-                            "inlined", NULL, NULL);
+                            "inlined", NULL, NULL, NULL);
         }
         if (!ir_inline_call_instruction(&vector, instruction, callee,
                                         (*inline_counter)++)) {
@@ -944,10 +944,38 @@ void ir_inline_explain_report_remaining(IRProgram *program) {
       const char *reason = NULL;
       const char *fix = NULL;
       ir_inline_site_reason(function, instruction, callee, &reason, &fix);
+
+      /* When the fix is "mark it @inline", PROVE it: re-run the candidate
+       * check with the decorator pretend-applied. A pass means the call
+       * really will inline; a fail means the suggestion is wrong (a
+       * structural guard hides behind the discretionary cap that fired
+       * first), so the fix is corrected rather than printed as-is. */
+      const char *verified = NULL;
+      char corrected_fix[320];
+      if (fix && strstr(fix, "@inline") && !callee->is_inline &&
+          !callee->is_noinline) {
+        int saved = callee->is_inline;
+        callee->is_inline = 1;
+        const char *forced_reason = NULL;
+        const char *unused_fix = NULL;
+        if (ir_function_is_inline_candidate(callee, &forced_reason,
+                                            &unused_fix)) {
+          verified = "re-checked with @inline pretend-applied: the structural "
+                     "guards pass, so this call will inline";
+        } else {
+          snprintf(corrected_fix, sizeof(corrected_fix),
+                   "none \xE2\x80\x94 re-checked with @inline "
+                   "pretend-applied and it still won't inline: %s",
+                   forced_reason ? forced_reason : "a structural guard");
+          fix = corrected_fix;
+        }
+        callee->is_inline = saved;
+      }
+
       char entity[160];
       snprintf(entity, sizeof(entity), "call to `%s`", instruction->text);
       ir_explain_remark(function->name, entity, instruction->location, 0,
-                        "NOT inlined", reason, fix);
+                        "NOT inlined", reason, fix, verified);
     }
   }
 }

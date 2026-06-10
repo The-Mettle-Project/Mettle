@@ -321,6 +321,20 @@ int ir_optimize_function_pipeline(IRFunction *function) {
   return ir_function_rebuild_cfg(function);
 }
 
+/* --explain hypothesis testing: re-run the optimization stages (including
+ * every vectorizer) on a scratch clone that carries a simulated fix. No
+ * contract verification, no CFG rebuild -- the caller inspects the clone's
+ * marker regions itself and then throws it away. */
+int ir_optimize_function_revectorize(IRFunction *function) {
+  if (!function) {
+    return 0;
+  }
+  if (!ir_run_fixpoint_stage(function, &g_ir_fixpoint_stage)) {
+    return 0;
+  }
+  return ir_run_named_stage(function, &g_ir_post_fixpoint_stage);
+}
+
 static void ir_set_current_function_context(IRFunction *function) {
   if (function) {
     mettle_compiler_ctx_set_function_name(

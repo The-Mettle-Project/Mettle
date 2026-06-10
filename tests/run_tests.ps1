@@ -223,6 +223,10 @@ $cases = @(
       'fully unrolled \(8 iterations',
       'hoisted out of the loop \(runs once',
       'verified @noalloc',
+      # verified fix suggestions: the compiler SIMULATES the fix on a clone,
+      # re-runs the optimizer, and only then claims it works
+      'verified: simulated that fix and re-ran the optimizer: this loop then vectorizes -> vpsadbw',
+      'verified: re-checked with @inline pretend-applied: the structural guards pass',
       'backend report: explain_demo\.mettle'
     )
   },
