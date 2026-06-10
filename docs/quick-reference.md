@@ -108,6 +108,23 @@ function dot(a: int8*, b: int8*, n: int32) -> int32 {
 contract. Both are checked under `-O`/`--release`; add `--simd-report` to see
 what each loop became. See [Control Flow](control-flow.md#vectorization-contracts).
 
+To see what the optimizer decided about **every** loop and call in your file —
+no annotations needed — compile with `--explain` (`-O`/`--release`):
+
+```
+saxpy (loop @ line 12): vectorized → vfmadd231ps, 8-wide float32 affine map
+matvec (loop @ line 38): NOT vectorized
+    └ reason: this is a float multiply-accumulate (dot-product shape), but no
+      kernel matched its address pattern
+    └ fix: hoist invariant index math into a pointer before the loop
+main (call to `opaque` @ line 74): NOT inlined
+    └ reason: the callee is marked @noinline
+```
+
+Nests are summarized (`vectorized inner, scalar outer`), fully unrolled loops
+say so, and a backend section reports which functions got the
+register-allocating backend (and why the rest fell back).
+
 ## Function decorators
 
 ```mettle

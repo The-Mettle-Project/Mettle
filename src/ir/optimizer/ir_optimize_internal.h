@@ -435,6 +435,28 @@ void ir_optimize_reset_user_error(void);
 int ir_optimize_had_user_error(void);
 /* --simd-report: emit a note for every `@simd` loop (vectorized or not). */
 void ir_optimize_set_simd_report(int enabled);
+/* --explain: optimization-decision remarks (state and report rendering live in
+ * ir_optimize_explain.c). The loop verifier, the inliner, and the codegen MIR
+ * gate record remarks; the pipeline flushes them as one sorted, tree-formatted
+ * report. `focus_file` (NULL = no filter) limits remarks to that file so
+ * imported modules don't flood the report. */
+void ir_optimize_set_explain(int enabled, const char *focus_file);
+int ir_explain_enabled(void);
+int ir_explain_location_enabled(const SourceLocation *location);
+int ir_explain_file_enabled(const char *filename);
+/* Record one remark: `entity` is "loop" / "call to `f`"; `positive` colors the
+ * headline (1 = the optimizer did something good); reason/fix may be NULL. */
+void ir_explain_remark(const char *function_name, const char *entity,
+                       SourceLocation location, int positive,
+                       const char *headline, const char *reason,
+                       const char *fix);
+/* Print the sorted optimization report (loops + calls) and clear the store. */
+void ir_explain_flush(void);
+/* Instruction-level description of a vectorized kernel op for headlines. */
+void ir_explain_kernel_desc(const IRInstruction *ins, char *buf, size_t cap);
+/* --explain: after all inlining rounds, record a remark for every surviving
+ * call to a program-defined function with the reason it was not inlined. */
+void ir_inline_explain_report_remaining(IRProgram *program);
 int ir_optimize_pre_inline_function(IRFunction *function);
 int ir_pass_is_skipped(IROptPassId pass_id);
 int ir_pass_name_is_skipped(const char *pass_name);

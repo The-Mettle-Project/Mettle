@@ -28,6 +28,8 @@ typedef struct {
   int optimize;
   int release;
   int simd_report; /* --simd-report: note what each `@simd` loop became */
+  int explain;     /* --explain: report optimization decisions (vectorization,
+                      inlining) for the main input file, with reasons */
   int emit_object;
   int generate_debug_symbols;
   int generate_line_mapping;

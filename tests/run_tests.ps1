@@ -197,6 +197,47 @@ $cases = @(
     Args          = @("-O")
     Pattern       = "@simd! loop was not vectorized"
   },
+  @{
+    # --explain: the grouped optimization report. Per loop: vectorized (into
+    # which kernel, instruction-level) or NOT, with reason and fix lines; per
+    # call: inlined or NOT with reason; nests summarized; plus the backend
+    # (MIR vs baseline) section.
+    Name          = "explain_report"
+    Path          = "tests/explain_demo.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--explain")
+    OutputMustMatch = @(
+      'optimization report: explain_demo\.mettle',
+      '8-wide float32 affine map',
+      # the inlined-call map: the param-copy fold + dead-local sweep must leave
+      # a body the affine recognizer matches (regression for the
+      # __inl_*_param_x "cannot see through it" refusal)
+      'with_call \(loop @ line 19\): vectorized',
+      'NOT vectorized',
+      'vpsadbw kernel accumulates into int64',
+      'declare the accumulator as int64',
+      'reason: the callee is marked @noinline',
+      'hoist invariant index math into a pointer',
+      'no loop remains after optimization',
+      'backend report: explain_demo\.mettle'
+    )
+  },
+  @{
+    # --explain remarks are limited to the main input file: a program importing
+    # std/io must not report stdlib-internal decisions, but a refusal AT a user
+    # call site into the stdlib is still reported.
+    Name          = "explain_focus_filter"
+    Path          = "tests/explain_stdlib_demo.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--explain")
+    OutputMustMatch = @(
+      'call to `print_int` .* NOT inlined'
+    )
+    OutputMustNotMatch = @(
+      'print_int \(loop',
+      'print_int \(call to'
+    )
+  },
   @{ Name = "err_decorator_on_loop"; Path = "tests/err_decorator_on_loop.mettle"; ShouldSucceed = $false; Pattern = "apply to a function, not a loop" },
   @{ Name = "err_decorator_unknown"; Path = "tests/err_decorator_unknown.mettle"; ShouldSucceed = $false; Pattern = "Unknown decorator after" },
   @{ Name = "err_decorator_conflict"; Path = "tests/err_decorator_conflict.mettle"; ShouldSucceed = $false; Pattern = "mutually exclusive" },

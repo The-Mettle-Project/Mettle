@@ -2306,6 +2306,8 @@ int main(int argc, char *argv[]) {
       options.dump_ir = 1;
     } else if (strcmp(argv[i], "--simd-report") == 0) {
       options.simd_report = 1;
+    } else if (strcmp(argv[i], "--explain") == 0) {
+      options.explain = 1;
     } else if (strcmp(argv[i], "--emit-ptx") == 0) {
       options.emit_ptx = 1;
     } else if (strcmp(argv[i], "-g") == 0 ||
@@ -2598,6 +2600,8 @@ static int compile_optimize_ir(IRProgram *ir_program,
   ir_optimize_options.preserve_function_boundaries =
       options->profile_runtime ? 1 : 0;
   ir_optimize_options.simd_report = options->simd_report;
+  ir_optimize_options.explain = options->explain;
+  ir_optimize_options.explain_focus_file = options->input_filename;
   if (!ir_optimize_program(ir_program, &ir_optimize_options)) {
     /* A violated `@simd!` contract is a user error already printed with a
      * source location; don't bury it under a generic internal-error report. */
@@ -2894,6 +2898,16 @@ int compile_file(const char *input_filename, const char *output_filename,
     goto cleanup;
   }
 
+  /* --explain reports optimizer decisions, so it only means something when the
+   * optimizer runs; lowering then brackets every loop with report-only markers
+   * for the verifier to report on. */
+  if (options->explain && !options->optimize) {
+    fprintf(stderr, "note: --explain has no effect without -O/--release (it "
+                    "reports optimization decisions)\n");
+  }
+  ir_lowering_set_explain(options->explain && options->optimize &&
+                          !options->emit_ptx);
+
   int emit_runtime_checks = (options->release || options->emit_ptx) ? 0 : 1;
   compiler_set_phase(PROFILE_PHASE_IR_LOWERING);
   phase_start = compiler_profile_begin(&profile);
@@ -3030,6 +3044,13 @@ int compile_file(const char *input_filename, const char *output_filename,
     goto cleanup;
   }
 
+  /* --explain: the MIR eligibility gate recorded, per function, whether it got
+   * the register-allocating backend; print that section now that codegen ran.
+   * (No-op unless --explain is on.) */
+  if (options->explain && options->optimize) {
+    ir_explain_backend_flush();
+  }
+
   compiler_set_phase(PROFILE_PHASE_WRITE_OUTPUT);
   phase_start = compiler_profile_begin(&profile);
   BinaryEmitter *binary_emitter =
@@ -3161,6 +3182,9 @@ void print_usage(const char *program_name) {
   printf("  -d, --debug         Enable debug output and symbols\n");
   printf("  --dump-ir           Write optimized IR sidecar (.ir) without debug metadata\n");
   printf("  --simd-report       Report what each @simd loop became (needs -O/--release)\n");
+  printf("  --explain           Report every optimization decision in the input file --\n"
+         "                      loop vectorization and call inlining, with the reason\n"
+         "                      whenever the optimizer declined (needs -O/--release)\n");
   printf("  -g, --debug-symbols Generate debug symbols\n");
   printf("  -l, --line-mapping  Generate source line mapping\n");
   printf("  -s, --stack-trace   Embed runtime crash traceback support\n");

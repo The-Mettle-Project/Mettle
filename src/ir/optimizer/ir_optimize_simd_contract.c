@@ -46,11 +46,13 @@ static int ir_op_is_vectorized(IROpcode op) {
   return op >= IR_OP_COUNT_WORD_STARTS && op <= IR_OP_SIMD_OUTER_LANE_F64;
 }
 
-/* If the loop body in (begin, end) was vectorized at this nesting depth (i.e.
- * the op is not one belonging to a nested `@simd` loop), return that opcode;
- * otherwise return -1. */
-static int ir_region_vectorized_op(const IRFunction *function, size_t begin,
-                                   size_t end) {
+/* First vectorized instruction in (begin, end). With any_depth == 0 only ops
+ * at this loop's own nesting level count (ops inside a nested marked loop
+ * belong to that loop); with any_depth == 1 the whole region counts. Returns
+ * NULL when nothing vectorized. */
+static const IRInstruction *ir_region_vectorized_ins(const IRFunction *function,
+                                                     size_t begin, size_t end,
+                                                     int any_depth) {
   int depth = 0;
   for (size_t i = begin + 1; i < end; i++) {
     const IRInstruction *instruction = &function->instructions[i];
@@ -59,11 +61,33 @@ static int ir_region_vectorized_op(const IRFunction *function, size_t begin,
                                                                          : -1;
       continue;
     }
-    if (depth == 0 && ir_op_is_vectorized(instruction->op)) {
-      return (int)instruction->op;
+    if ((any_depth || depth == 0) && ir_op_is_vectorized(instruction->op)) {
+      return instruction;
     }
   }
-  return -1;
+  return NULL;
+}
+
+static int ir_region_vectorized_op(const IRFunction *function, size_t begin,
+                                   size_t end) {
+  const IRInstruction *ins = ir_region_vectorized_ins(function, begin, end, 0);
+  return ins ? (int)ins->op : -1;
+}
+
+/* True when (begin, end) still contains a loop header label -- i.e. an actual
+ * loop survived optimization. A region with markers but no loop label was
+ * fully unrolled (constant trip count) or removed outright. */
+static int ir_region_has_loop_label(const IRFunction *function, size_t begin,
+                                    size_t end) {
+  for (size_t i = begin + 1; i < end; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_LABEL && ins->text &&
+        (strstr(ins->text, "ir_while_") != NULL ||
+         strstr(ins->text, "ir_for_cond_") != NULL)) {
+      return 1;
+    }
+  }
+  return 0;
 }
 
 /* A branch/jump whose target is one of the runtime-check labels the lowerer
@@ -166,6 +190,299 @@ static const char *ir_simd_bail_reason(const IRFunction *function, size_t begin,
          "a loop-carried dependence, or a reduction/operation no kernel covers)";
 }
 
+/* --explain: a deeper diagnosis than ir_simd_bail_reason, split into a reason
+ * (what blocked vectorization) and a fix (what the user can change). Both are
+ * best-effort but never speculative: each claim is derived from instructions
+ * actually present in the region. Empty fix = nothing actionable. */
+static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
+                                 size_t end, char *reason, size_t reason_cap,
+                                 char *fix, size_t fix_cap) {
+  reason[0] = '\0';
+  fix[0] = '\0';
+
+  const char *callee = NULL;
+  int has_indirect_call = 0, has_new = 0, has_asm = 0;
+  int branch_count = 0, jump_count = 0;
+  int has_i16 = 0, has_i64 = 0, has_f32 = 0, has_f64 = 0;
+  int has_byte_load = 0, has_int_accum = 0;
+  int has_float_accum = 0, has_float_mul = 0;
+  int load_count = 0, store_count = 0;
+  int past_header = 0; /* seen the loop's own header label yet? */
+  const char *body_local = NULL;
+  const char *recur_symbol = NULL;
+  char recur_op = 0;
+
+  for (size_t i = begin + 1; i < end; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    switch (ins->op) {
+    case IR_OP_LABEL:
+      if (ins->text && (strstr(ins->text, "ir_while_") != NULL ||
+                        strstr(ins->text, "ir_for_cond_") != NULL)) {
+        past_header = 1;
+      }
+      break;
+    case IR_OP_DECLARE_LOCAL:
+      /* A local declared INSIDE the loop body (after the header label -- a
+       * range-for's induction local sits between the markers but BEFORE the
+       * header and is fine) is one no recognizer's load->compute->store
+       * matching can see through. The common source is an inlined callee's
+       * parameter copy that copy-propagation couldn't fold (float32 narrowing
+       * keeps the copy alive). */
+      if (past_header && !body_local && ins->dest.kind == IR_OPERAND_SYMBOL &&
+          ins->dest.name) {
+        body_local = ins->dest.name;
+      }
+      break;
+    case IR_OP_CALL:
+      if (!(ins->text && strstr(ins->text, "crash_trap")) && !callee) {
+        callee = ins->text ? ins->text : "?";
+      }
+      break;
+    case IR_OP_CALL_INDIRECT:
+      has_indirect_call = 1;
+      break;
+    case IR_OP_NEW:
+      has_new = 1;
+      break;
+    case IR_OP_INLINE_ASM:
+      has_asm = 1;
+      break;
+    case IR_OP_BRANCH_ZERO:
+    case IR_OP_BRANCH_EQ:
+      if (!ir_label_is_runtime_check(ins->text)) {
+        branch_count++;
+      }
+      break;
+    case IR_OP_JUMP:
+      if (!ir_label_is_runtime_check(ins->text)) {
+        jump_count++;
+      }
+      break;
+    case IR_OP_LOAD:
+    case IR_OP_STORE: {
+      if (ins->op == IR_OP_LOAD) {
+        load_count++;
+      } else {
+        store_count++;
+      }
+      long long sz = (ins->rhs.kind == IR_OPERAND_INT) ? ins->rhs.int_value : 4;
+      if (ins->is_float) {
+        if (sz == 4) {
+          has_f32 = 1;
+        } else if (sz == 8) {
+          has_f64 = 1;
+        }
+      } else {
+        if (sz == 1 && ins->op == IR_OP_LOAD) {
+          has_byte_load = 1;
+        } else if (sz == 2) {
+          has_i16 = 1;
+        } else if (sz == 8) {
+          has_i64 = 1;
+        }
+      }
+      break;
+    }
+    case IR_OP_BINARY: {
+      /* Integer '+' accumulation of a computed value into a symbol
+       * (`total = total + %t`): together with byte loads this identifies the
+       * vpsadbw byte-sum shape, whose kernel requires an int64 accumulator.
+       * The added operand must be a temp -- `i = i + 1` (a constant) is an
+       * induction variable, not a data sum. */
+      if (!ins->is_float && ins->text && ins->text[0] == '+' &&
+          !ins->text[1] && ins->dest.kind == IR_OPERAND_SYMBOL &&
+          ins->dest.name &&
+          ((ins->lhs.kind == IR_OPERAND_SYMBOL && ins->lhs.name &&
+            strcmp(ins->lhs.name, ins->dest.name) == 0 &&
+            ins->rhs.kind == IR_OPERAND_TEMP) ||
+           (ins->rhs.kind == IR_OPERAND_SYMBOL && ins->rhs.name &&
+            strcmp(ins->rhs.name, ins->dest.name) == 0 &&
+            ins->lhs.kind == IR_OPERAND_TEMP))) {
+        has_int_accum = 1;
+      }
+      /* Float multiply + float '+' accumulation = a dot-product-shaped
+       * reduction (used below to give an address-pattern diagnosis when no
+       * kernel claimed it). */
+      if (ins->is_float && ins->text && ins->text[0] == '*' && !ins->text[1]) {
+        has_float_mul = 1;
+      }
+      if (ins->is_float && ins->text && ins->text[0] == '+' &&
+          !ins->text[1] &&
+          ((ins->lhs.kind == IR_OPERAND_SYMBOL && ins->lhs.name) ||
+           (ins->rhs.kind == IR_OPERAND_SYMBOL && ins->rhs.name))) {
+        has_float_accum = 1;
+      }
+      /* Serial recurrence through a float symbol: `s = s * x` / `s = s / x`,
+       * either directly (dest is the symbol) or via the usual temp+ASSIGN
+       * pair. '+'/'-' accumulations are NOT flagged -- those reassociate and
+       * have reduction kernels; '*' and '/' chains are genuinely serial. */
+      if (recur_symbol || !ins->is_float || !ins->text ||
+          (ins->text[0] != '*' && ins->text[0] != '/') || ins->text[1]) {
+        break;
+      }
+      const char *lhs_sym =
+          ins->lhs.kind == IR_OPERAND_SYMBOL ? ins->lhs.name : NULL;
+      const char *rhs_sym =
+          ins->rhs.kind == IR_OPERAND_SYMBOL ? ins->rhs.name : NULL;
+      if (ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name) {
+        if ((lhs_sym && strcmp(lhs_sym, ins->dest.name) == 0) ||
+            (rhs_sym && strcmp(rhs_sym, ins->dest.name) == 0)) {
+          recur_symbol = ins->dest.name;
+          recur_op = ins->text[0];
+        }
+      } else if (ins->dest.kind == IR_OPERAND_TEMP && ins->dest.name) {
+        for (size_t j = i + 1; j < end && j < i + 9; j++) {
+          const IRInstruction *later = &function->instructions[j];
+          if (later->op == IR_OP_ASSIGN &&
+              later->dest.kind == IR_OPERAND_SYMBOL && later->dest.name &&
+              later->lhs.kind == IR_OPERAND_TEMP && later->lhs.name &&
+              strcmp(later->lhs.name, ins->dest.name) == 0) {
+            if ((lhs_sym && strcmp(lhs_sym, later->dest.name) == 0) ||
+                (rhs_sym && strcmp(rhs_sym, later->dest.name) == 0)) {
+              recur_symbol = later->dest.name;
+              recur_op = ins->text[0];
+            }
+            break;
+          }
+        }
+      }
+      break;
+    }
+    default:
+      break;
+    }
+  }
+
+  if (callee) {
+    snprintf(reason, reason_cap,
+             "each iteration calls `%s`; loops vectorize only after every "
+             "call in the body has been inlined away",
+             callee);
+    snprintf(fix, fix_cap,
+             "make `%s` inline-eligible (small body, or mark it @inline), or "
+             "hoist the call out of the loop",
+             callee);
+    return;
+  }
+  if (has_indirect_call) {
+    snprintf(reason, reason_cap,
+             "each iteration calls through a function pointer, which can "
+             "never be inlined away");
+    snprintf(fix, fix_cap,
+             "call the target directly if it is known at compile time");
+    return;
+  }
+  if (has_new) {
+    snprintf(reason, reason_cap, "the loop body allocates memory (`new`) "
+                                 "every iteration");
+    snprintf(fix, fix_cap, "hoist the allocation out of the loop");
+    return;
+  }
+  if (has_asm) {
+    snprintf(reason, reason_cap,
+             "the loop body contains inline assembly, which is opaque to the "
+             "vectorizer");
+    return;
+  }
+  if (branch_count > 1 || jump_count > 1) {
+    snprintf(reason, reason_cap,
+             "the loop body branches (an `if`, `&&`/`||`, or an early exit); "
+             "only straight-line bodies vectorize");
+    snprintf(fix, fix_cap,
+             "compute both arms and select arithmetically (branchless), or "
+             "split the work into two simpler loops");
+    return;
+  }
+  if (has_i16) {
+    snprintf(reason, reason_cap,
+             "the loop reads/writes 16-bit integers, and no 16-bit kernels "
+             "exist");
+    snprintf(fix, fix_cap, "use int32 (or int8 if the values fit)");
+    return;
+  }
+  if (has_i64) {
+    snprintf(reason, reason_cap,
+             "the loop reads/writes 64-bit integer arrays, and no 64-bit "
+             "integer kernels exist");
+    snprintf(fix, fix_cap, "use int32 arrays if the values fit");
+    return;
+  }
+  if (recur_symbol) {
+    snprintf(reason, reason_cap,
+             "`%s` carries a serial `%c` recurrence -- every iteration needs "
+             "the previous iteration's value, so lanes cannot run "
+             "independently",
+             recur_symbol, recur_op);
+    snprintf(fix, fix_cap,
+             "'+' reductions vectorize (they reassociate); serial '*'/'/' "
+             "chains generally cannot -- if the recurrence is the point, this "
+             "loop is at its scalar floor");
+    return;
+  }
+  if (has_f32 && has_f64) {
+    snprintf(reason, reason_cap,
+             "the loop mixes float32 and float64 elements; each kernel "
+             "handles one width");
+    snprintf(fix, fix_cap, "keep the loop in a single float width");
+    return;
+  }
+  if (has_byte_load && has_int_accum) {
+    snprintf(reason, reason_cap,
+             "this is a byte-sum loop, but the vpsadbw kernel accumulates "
+             "into int64 and this loop's accumulator is narrower");
+    snprintf(fix, fix_cap,
+             "declare the accumulator as int64 (sum bytes as "
+             "`total = total + (int64)data[i]`)");
+    return;
+  }
+  if (body_local) {
+    if (strstr(body_local, "__inl_") != NULL) {
+      snprintf(reason, reason_cap,
+               "the body's data flow passes through the local `%s`, left over "
+               "from an inlined call; the recognizers' "
+               "load\xE2\x86\x92" "compute\xE2\x86\x92" "store matching "
+               "cannot see through it",
+               body_local);
+      snprintf(fix, fix_cap,
+               "a compiler limitation, not a code problem; write the "
+               "expression directly in the loop body to vectorize today");
+    } else {
+      snprintf(reason, reason_cap,
+               "the body declares the local `%s` each iteration; the "
+               "recognizers' load\xE2\x86\x92" "compute\xE2\x86\x92" "store "
+               "matching cannot see through it",
+               body_local);
+      snprintf(fix, fix_cap,
+               "declare `%s` before the loop, or fold the expression in "
+               "directly",
+               body_local);
+    }
+    return;
+  }
+  if (has_float_mul && has_float_accum && load_count >= 2) {
+    snprintf(reason, reason_cap,
+             "this is a float multiply-accumulate (dot-product shape), but no "
+             "kernel matched its address pattern -- the bases must be plain "
+             "pointers indexed by the loop counter (base[i])");
+    snprintf(fix, fix_cap,
+             "hoist invariant index math into a pointer before the loop "
+             "(e.g. `var row: float32* = &m[r * cols];` then `row[c]`)");
+    return;
+  }
+  if (store_count > 0 && load_count == 0) {
+    snprintf(reason, reason_cap,
+             "the loop only writes (a fill/init pattern, no array reads); the "
+             "recognizers cover maps, reductions, and dot products over "
+             "loaded data, and no constant-fill kernel exists yet");
+    return;
+  }
+  snprintf(reason, reason_cap, "no vectorizer recognized this loop's shape");
+  snprintf(fix, fix_cap,
+           "vectorizable shapes are unit-stride accesses (a[i], not a[i*k]) "
+           "over int8/int32/float32/float64 with a straight-line body: maps "
+           "(a[i] = expr), '+' reductions (s = s + expr), and dot products");
+}
+
 static void ir_clear_simd_markers(IRFunction *function) {
   for (size_t i = 0; i < function->instruction_count; i++) {
     IRInstruction *instruction = &function->instructions[i];
@@ -177,6 +494,85 @@ static void ir_clear_simd_markers(IRFunction *function) {
 }
 
 #define IR_SIMD_MAX_NESTING 64
+#define IR_SIMD_MAX_LOOPS 256
+
+/* One marker-bracketed loop region, collected during the contract walk so the
+ * --explain pass can reason about nests (which loop contains which). */
+typedef struct {
+  size_t begin;
+  size_t end;
+  int mode;
+  SourceLocation location;
+} IRSimdLoopRecord;
+
+/* --explain: one remark per recorded loop, nest-aware:
+ *   - vectorized at its own level        -> "vectorized -> <kernel>"
+ *   - scalar but a nested loop vectorized -> "vectorized inner, scalar outer"
+ *   - scalar with a scalar nested loop    -> NOT vectorized (points inward)
+ *   - no loop left between the markers    -> fully unrolled / removed
+ *   - scalar leaf                         -> NOT vectorized + reason + fix */
+static void ir_explain_report_loops(const IRFunction *function,
+                                    const IRSimdLoopRecord *loops,
+                                    size_t loop_count) {
+  for (size_t k = 0; k < loop_count; k++) {
+    const IRSimdLoopRecord *L = &loops[k];
+    const IRInstruction *own =
+        ir_region_vectorized_ins(function, L->begin, L->end, 0);
+    const IRInstruction *any =
+        own ? own : ir_region_vectorized_ins(function, L->begin, L->end, 1);
+
+    int has_inner = 0;
+    size_t inner_line = 0;
+    for (size_t m = 0; m < loop_count; m++) {
+      if (m == k || loops[m].begin <= L->begin || loops[m].end >= L->end) {
+        continue;
+      }
+      has_inner = 1;
+      if (inner_line == 0) {
+        inner_line = loops[m].location.line;
+      }
+      /* Point the message at a vectorized inner loop when one exists. */
+      if (!own && any &&
+          ir_region_vectorized_ins(function, loops[m].begin, loops[m].end, 1)) {
+        inner_line = loops[m].location.line;
+      }
+    }
+
+    char headline[192], reason[320], fix[320];
+    if (own) {
+      char desc[128];
+      ir_explain_kernel_desc(own, desc, sizeof(desc));
+      snprintf(headline, sizeof(headline), "vectorized \xE2\x86\x92 %s", desc);
+      ir_explain_remark(function->name, "loop", L->location, 1, headline, NULL,
+                        NULL);
+    } else if (any) {
+      snprintf(reason, sizeof(reason),
+               "only the innermost loop of a nest is vectorized; this loop "
+               "drives the vectorized inner loop (line %zu)",
+               inner_line);
+      ir_explain_remark(function->name, "loop", L->location, 1,
+                        "vectorized inner, scalar outer", reason, NULL);
+    } else if (has_inner) {
+      snprintf(reason, sizeof(reason),
+               "the body contains a nested loop (line %zu), and only "
+               "innermost loops are vectorized; the inner loop did not "
+               "vectorize either -- see its remark",
+               inner_line);
+      ir_explain_remark(function->name, "loop", L->location, 0,
+                        "NOT vectorized", reason, NULL);
+    } else if (!ir_region_has_loop_label(function, L->begin, L->end)) {
+      ir_explain_remark(function->name, "loop", L->location, 1,
+                        "eliminated \xE2\x80\x94 no loop remains after "
+                        "optimization (fully unrolled or folded away)",
+                        NULL, NULL);
+    } else {
+      ir_simd_explain_bail(function, L->begin, L->end, reason, sizeof(reason),
+                           fix, sizeof(fix));
+      ir_explain_remark(function->name, "loop", L->location, 0,
+                        "NOT vectorized", reason, fix[0] ? fix : NULL);
+    }
+  }
+}
 
 int ir_verify_simd_contracts(IRFunction *function) {
   if (!function || function->instruction_count == 0) {
@@ -188,6 +584,8 @@ int ir_verify_simd_contracts(IRFunction *function) {
     size_t begin_index;
     SourceLocation location;
   } open[IR_SIMD_MAX_NESTING];
+  IRSimdLoopRecord loops[IR_SIMD_MAX_LOOPS];
+  size_t loop_count = 0;
   int depth = 0;
   int had_fatal = 0;
 
@@ -227,8 +625,20 @@ int ir_verify_simd_contracts(IRFunction *function) {
     int loop_mode = open[depth].mode;
     SourceLocation loc = open[depth].location;
     const char *file = loc.filename ? loc.filename : "<input>";
-    int vec_op = ir_region_vectorized_op(function, begin_index, i);
 
+    if (loop_count < IR_SIMD_MAX_LOOPS) {
+      loops[loop_count].begin = begin_index;
+      loops[loop_count].end = i;
+      loops[loop_count].mode = loop_mode;
+      loops[loop_count].location = loc;
+      loop_count++;
+    }
+
+    if (loop_mode == SIMD_ATTR_REPORT) {
+      continue; /* --explain bookkeeping only; no contract to enforce */
+    }
+
+    int vec_op = ir_region_vectorized_op(function, begin_index, i);
     if (vec_op >= 0) {
       if (g_simd_report) {
         fprintf(stderr, "%s:%zu:%zu: note: @simd loop vectorized (%s)\n", file,
@@ -250,6 +660,10 @@ int ir_verify_simd_contracts(IRFunction *function) {
     }
   }
 
+  if (ir_explain_enabled()) {
+    ir_explain_report_loops(function, loops, loop_count);
+  }
+
   ir_clear_simd_markers(function);
   return had_fatal ? 0 : 1;
 }
@@ -265,8 +679,17 @@ void ir_note_simd_contracts_unverified(IRProgram *program) {
       continue;
     }
     for (size_t i = 0; i < function->instruction_count; i++) {
-      if (ir_instruction_is_simd_marker(&function->instructions[i]) &&
-          function->instructions[i].text[strlen(IR_SIMD_MARKER_PREFIX)] == 'B') {
+      if (!ir_instruction_is_simd_marker(&function->instructions[i])) {
+        continue;
+      }
+      char which = 0;
+      int id = 0, mode = 0;
+      if (sscanf(function->instructions[i].text +
+                     strlen(IR_SIMD_MARKER_PREFIX),
+                 "%c:%d:%d", &which, &id, &mode) == 3 &&
+          which == 'B' && mode != SIMD_ATTR_REPORT) {
+        /* Report-only markers come from --explain, not from a user `@simd`;
+         * they don't represent an unverified contract. */
         marker_count++;
       }
     }

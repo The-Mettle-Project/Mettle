@@ -255,7 +255,10 @@ typedef struct {
 typedef enum {
   SIMD_ATTR_NONE = 0,     // no attribute
   SIMD_ATTR_HINT = 1,     // `@simd`  : best-effort; warn if it can't vectorize
-  SIMD_ATTR_CONTRACT = 2  // `@simd!` : hard contract; compile error if it can't
+  SIMD_ATTR_CONTRACT = 2, // `@simd!` : hard contract; compile error if it can't
+  SIMD_ATTR_REPORT = 3    // internal: `--explain` marks every unannotated loop
+                          // so the verifier can report what became of it;
+                          // never warns or errors, only emits notes
 } SimdAttr;
 
 typedef struct {

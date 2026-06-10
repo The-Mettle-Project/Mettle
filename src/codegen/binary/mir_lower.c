@@ -1,18 +1,28 @@
 #include "codegen/binary/mir.h"
 
+#include "ir/ir_optimize.h"
 #include "semantic/symbol_table.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+/* Source file a function was declared in (for the --explain focus filter). */
+static const char *mir_function_filename(FunctionDeclaration *fd) {
+  return (fd && fd->body) ? fd->body->location.filename : NULL;
+}
+
 /* TEMPORARY instrumentation: with METTLE_MIR_TRACE set, log why a function is
  * rejected by the MIR eligibility gate, so the spill-everything-fallback work
- * list can be prioritized by real frequency. Returns 0 (ineligible). */
+ * list can be prioritized by real frequency. Returns 0 (ineligible). Also
+ * feeds the --explain backend report (a no-op when --explain is off). */
 static int mir_trace_bail(FunctionDeclaration *fd, const char *reason) {
   if (getenv("METTLE_MIR_TRACE")) {
     fprintf(stderr, "MIR-BAIL\t%s\t%s\n", reason,
             (fd && fd->name) ? fd->name : "?");
+  }
+  if (ir_explain_enabled() && fd && fd->name) {
+    ir_explain_backend_function(fd->name, mir_function_filename(fd), 0, reason);
   }
   return 0;
 }
@@ -1175,6 +1185,10 @@ int mir_function_is_eligible(CodeGenerator *generator,
   if (getenv("METTLE_MIR_TRACE")) {
     fprintf(stderr, "MIR-OK\t%s\n",
             function_data->name ? function_data->name : "?");
+  }
+  if (ir_explain_enabled() && function_data->name) {
+    ir_explain_backend_function(function_data->name,
+                                mir_function_filename(function_data), 1, NULL);
   }
   return 1;
 }

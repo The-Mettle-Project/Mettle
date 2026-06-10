@@ -190,6 +190,12 @@ static int ir_emit_label_instruction(IRLoweringContext *context,
 // clears the markers. `which` is 'B' or 'E'; `mode` is a SimdAttr.
 // (IR_SIMD_MARKER_PREFIX and the text format live in ir.h.)
 
+/* --explain: bracket every loop with report-only markers so the optimizer can
+ * tell the user what became of it. Off by default; set by the driver. */
+static int g_ir_lowering_explain = 0;
+
+void ir_lowering_set_explain(int enabled) { g_ir_lowering_explain = enabled; }
+
 static int ir_emit_simd_marker(IRLoweringContext *context, IRFunction *function,
                                char which, int id, int mode,
                                SourceLocation location) {
@@ -4506,6 +4512,9 @@ static int ir_lower_statement_with_defers(IRLoweringContext *context,
     int while_simd_mode = while_data->simd_mode != SIMD_ATTR_NONE
                               ? while_data->simd_mode
                               : context->current_function_simd_default;
+    if (while_simd_mode == SIMD_ATTR_NONE && g_ir_lowering_explain) {
+      while_simd_mode = SIMD_ATTR_REPORT;
+    }
     int while_simd_id = -1;
     if (while_simd_mode != SIMD_ATTR_NONE) {
       while_simd_id = context->next_simd_request_id++;
@@ -4590,6 +4599,9 @@ static int ir_lower_statement_with_defers(IRLoweringContext *context,
     int for_simd_mode = for_data->simd_mode != SIMD_ATTR_NONE
                             ? for_data->simd_mode
                             : context->current_function_simd_default;
+    if (for_simd_mode == SIMD_ATTR_NONE && g_ir_lowering_explain) {
+      for_simd_mode = SIMD_ATTR_REPORT;
+    }
     int for_simd_id = -1;
     if (for_simd_mode != SIMD_ATTR_NONE) {
       for_simd_id = context->next_simd_request_id++;

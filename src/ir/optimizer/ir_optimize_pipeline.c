@@ -348,6 +348,8 @@ int ir_optimize_program_pipeline(IRProgram *program,
 
   ir_optimize_reset_user_error();
   ir_optimize_set_simd_report(options && options->simd_report);
+  ir_optimize_set_explain(options && options->explain,
+                          options ? options->explain_focus_file : NULL);
   ir_function_index_reset();
 
   if (!ir_run_program_stage_for_each_function(
@@ -404,6 +406,12 @@ int ir_optimize_program_pipeline(IRProgram *program,
     ir_function_index_reset();
     return 0;
   }
+
+  /* --explain: every inline that happened was recorded as it happened; record
+   * each surviving call with the reason it was refused, then print the whole
+   * sorted report. (No-ops unless explain is enabled.) */
+  ir_inline_explain_report_remaining(program);
+  ir_explain_flush();
 
   ir_function_index_reset();
   return 1;

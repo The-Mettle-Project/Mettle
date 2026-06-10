@@ -138,7 +138,19 @@ static int ir_float_scalar_operand_matches(IRFunction *function,
     return 0;
   }
   if (operand->kind == IR_OPERAND_FLOAT) {
-    return operand->float_bits == width_bits;
+    if (operand->float_bits == width_bits) {
+      return 1;
+    }
+    /* A literal used in float32 context usually still carries the default
+     * float64 tag (`2.5` lowers as a double). The kernel broadcasts the
+     * constant at its own lane width, so accept the mismatch whenever that
+     * narrowing is exact -- then the kernel's coefficient is bit-identical to
+     * the one the scalar loop multiplies by. */
+    if (width_bits == 32 &&
+        (double)(float)operand->float_value == operand->float_value) {
+      return 1;
+    }
+    return 0;
   }
   if (operand->kind == IR_OPERAND_SYMBOL && operand->name) {
     /* A scalar coefficient may be a local OR a parameter (e.g. saxpy's `a` in
@@ -165,6 +177,12 @@ static int ir_try_clone_float_scalar_operand(IRFunction *function,
   }
   *out = ir_operand_none();
   if (ir_float_scalar_operand_matches(function, operand, width_bits)) {
+    if (operand->kind == IR_OPERAND_FLOAT) {
+      /* Normalize the tag to the kernel's lane width (the match may have
+       * accepted an exactly-narrowable float64-tagged literal). */
+      *out = ir_operand_float_sized(operand->float_value, width_bits);
+      return 1;
+    }
     return ir_operand_clone(operand, out);
   }
   if (!operand || operand->kind != IR_OPERAND_TEMP || !operand->name) {

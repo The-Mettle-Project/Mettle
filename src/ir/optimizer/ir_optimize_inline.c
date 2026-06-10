@@ -1,5 +1,7 @@
 #include "ir_optimize_internal.h"
 
+#include <stdio.h>
+
 /* Name -> IRFunction index for the optimizer.
  *
  * ir_program_find_function used to linear-scan every function (strcmp each) and
@@ -108,12 +110,29 @@ static int ir_function_name_is_inline_denylisted(const char *name) {
          strcmp(name, "bench_unrolled") == 0;
 }
 
-static int ir_function_is_inline_candidate(const IRFunction *function) {
+/* When `why_not`/`fix` are non-NULL they receive a user-facing reason and an
+ * actionable suggestion (static strings) every time this returns 0; --explain
+ * reports them verbatim. A NULL fix means there is nothing actionable. */
+static int ir_function_is_inline_candidate(const IRFunction *function,
+                                           const char **why_not,
+                                           const char **fix) {
+  const char *unused;
+  if (!why_not) {
+    why_not = &unused;
+  }
+  if (!fix) {
+    fix = &unused;
+  }
+  *why_not = NULL;
+  *fix = NULL;
   if (!function || !function->name || function->instruction_count == 0) {
+    *why_not = "the callee has no body available to the inliner";
     return 0;
   }
   /* `@noinline` is an absolute veto. */
   if (function->is_noinline) {
+    *why_not = "the callee is marked @noinline";
+    *fix = "remove @noinline if inlining is wanted here";
     return 0;
   }
   /* `@inline` forces the function past the discretionary heuristics below
@@ -123,11 +142,18 @@ static int ir_function_is_inline_candidate(const IRFunction *function) {
    * apply. */
   int forced = function->is_inline;
 
-  if (!forced && (ir_function_name_is_inline_denylisted(function->name) ||
-                  function->parameter_count > IR_INLINE_MAX_PARAMETERS)) {
+  if (!forced && ir_function_name_is_inline_denylisted(function->name)) {
+    *why_not = "the callee is on the compiler's inline denylist "
+               "(a compile-time-blowup guard)";
+    return 0;
+  }
+  if (!forced && function->parameter_count > IR_INLINE_MAX_PARAMETERS) {
+    *why_not = "the callee has more than 16 parameters";
+    *fix = "pass a struct instead of a long parameter list";
     return 0;
   }
   if (function->parameter_count > 0 && !function->parameter_names) {
+    *why_not = "the callee's parameter names are unavailable to the inliner";
     return 0;
   }
 
@@ -147,10 +173,13 @@ static int ir_function_is_inline_candidate(const IRFunction *function) {
 
     non_nop_count++;
     if (!forced && non_nop_count > IR_INLINE_MAX_NON_NOP_INSTRUCTIONS) {
+      *why_not = "the callee's body is over the 128-instruction inline budget";
+      *fix = "mark the callee @inline to override the budget";
       return 0;
     }
 
     if (instruction->op == IR_OP_INLINE_ASM) {
+      *why_not = "the callee contains inline assembly";
       return 0;
     }
 
@@ -186,6 +215,9 @@ static int ir_function_is_inline_candidate(const IRFunction *function) {
         instruction->op == IR_OP_CALL_INDIRECT) {
       call_count++;
       if (!forced && call_count > 2) {
+        *why_not = "the callee makes more than 2 calls of its own (inlining "
+                   "glue functions bloats callers without runtime gain)";
+        *fix = "mark the callee @inline to override the call-count cap";
         return 0;
       }
     }
@@ -199,16 +231,19 @@ static int ir_function_is_inline_candidate(const IRFunction *function) {
    * (notably pattern_matches inside the grep loop). The labels and branches
    * inline correctly via the generic label-rename map; the cap was just
    * working around a latent bug elsewhere in the optimizer. */
-  if (has_while_label && has_less_compare && has_greater_compare) {
+  if ((has_while_label && has_less_compare && has_greater_compare) ||
+      (has_while_label && has_subtract) || (has_while_label && has_multiply)) {
+    *why_not = "the callee contains a loop shape the inliner declines (a "
+               "guard against a known bad interaction with later loop passes)";
+    *fix = "none \xE2\x80\x94 this is a compiler-internal guard; even @inline "
+           "cannot override it";
     return 0;
   }
-  if (has_while_label && has_subtract) {
+  if (!has_return) {
+    *why_not = "the callee has no return instruction the inliner can rewrite";
     return 0;
   }
-  if (has_while_label && has_multiply) {
-    return 0;
-  }
-  return has_return;
+  return 1;
 }
 
 static size_t ir_function_non_nop_instruction_count(const IRFunction *function) {
@@ -642,7 +677,13 @@ static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
       IRFunction *callee = ir_program_find_function(program, instruction->text);
       if (callee && callee != function &&
           instruction->argument_count == callee->parameter_count &&
-          ir_function_is_inline_candidate(callee)) {
+          ir_function_is_inline_candidate(callee, NULL, NULL)) {
+        if (ir_explain_enabled()) {
+          char entity[160];
+          snprintf(entity, sizeof(entity), "call to `%s`", instruction->text);
+          ir_explain_remark(function->name, entity, instruction->location, 1,
+                            "inlined", NULL, NULL);
+        }
         if (!ir_inline_call_instruction(&vector, instruction, callee,
                                         (*inline_counter)++)) {
           ir_instruction_vector_destroy(&vector);
@@ -819,6 +860,67 @@ int ir_inline_self_recursion_pass(IRProgram *program, int *changed) {
   }
 
   return 1;
+}
+
+/* --explain: record every call that SURVIVED all inlining rounds, with the
+ * reason it was not inlined. Successful inlines are recorded at the moment
+ * they happen (the call instruction no longer exists afterwards); refusals are
+ * recorded here, once, after the dust settles -- doing it inside the round
+ * loop would repeat each refusal once per round. Calls to functions not
+ * defined in the program (runtime/extern) are skipped: the inliner could never
+ * touch them, so there is no decision to explain. */
+void ir_inline_explain_report_remaining(IRProgram *program) {
+  if (!program || !ir_explain_enabled()) {
+    return;
+  }
+
+  for (size_t f = 0; f < program->function_count; f++) {
+    IRFunction *function = program->functions[f];
+    if (!function) {
+      continue;
+    }
+    int caller_full =
+        ir_function_non_nop_instruction_count(function) >
+        IR_INLINE_MAX_CALLER_NON_NOP_INSTRUCTIONS;
+
+    for (size_t i = 0; i < function->instruction_count; i++) {
+      const IRInstruction *instruction = &function->instructions[i];
+      if (instruction->op != IR_OP_CALL || !instruction->text) {
+        continue;
+      }
+      if (!ir_explain_location_enabled(&instruction->location)) {
+        continue;
+      }
+      IRFunction *callee = ir_program_find_function(program, instruction->text);
+      if (!callee) {
+        continue;
+      }
+
+      const char *reason = NULL;
+      const char *fix = NULL;
+      if (callee == function) {
+        reason = "the call is directly recursive";
+        fix = "bounded self-recursion expansion applies automatically (depth "
+              "3); rewrite as a loop for full control";
+      } else if (caller_full) {
+        reason = "the calling function is already over the 512-instruction "
+                 "caller budget and may not grow further";
+      } else if (instruction->argument_count > IR_INLINE_MAX_PARAMETERS ||
+                 instruction->argument_count != callee->parameter_count) {
+        reason = "the call's argument count doesn't match what the inliner "
+                 "handles for this callee";
+      } else if (ir_function_is_inline_candidate(callee, &reason, &fix)) {
+        /* Candidate-eligible but still here: the call site appeared late (a
+         * nested inline in the final round) or rounds hit their cap. */
+        reason = "inlining rounds reached their limit before this call could "
+                 "be revisited";
+      }
+      char entity[160];
+      snprintf(entity, sizeof(entity), "call to `%s`", instruction->text);
+      ir_explain_remark(function->name, entity, instruction->location, 0,
+                        "NOT inlined", reason, fix);
+    }
+  }
 }
 
 int ir_inline_small_functions_pass(IRProgram *program, int *changed) {

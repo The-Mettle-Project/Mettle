@@ -316,6 +316,11 @@ int ir_program_add_function(IRProgram *program, IRFunction *function);
 IRProgram *ir_lower_program(ASTNode *program, TypeChecker *type_checker,
                             SymbolTable *symbol_table, char **error_message,
                             int emit_runtime_checks);
+/* --explain: when enabled, lowering brackets EVERY loop (not just `@simd` ones)
+ * with report-only markers (SIMD_ATTR_REPORT) so the optimizer can report what
+ * became of each one. Set by the driver before ir_lower_program; only
+ * meaningful when optimization will run. */
+void ir_lowering_set_explain(int enabled);
 int ir_program_dump(IRProgram *program, FILE *output);
 /* Human-readable mnemonic for an opcode (e.g. "simd_dot_i8"), used by dumps and
  * the `--simd-report` diagnostics. */

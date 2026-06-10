@@ -8,6 +8,12 @@ typedef struct {
   int preserve_function_boundaries;
   /* --simd-report: emit a note describing what each `@simd` loop became. */
   int simd_report;
+  /* --explain: report every optimization decision (loop vectorization, call
+   * inlining) as a note, with a reason whenever the optimizer declined. */
+  int explain;
+  /* When set, --explain remarks are limited to source locations in this file
+   * (the main input), so imported stdlib modules don't flood the report. */
+  const char *explain_focus_file;
 } IROptimizeOptions;
 
 // Runs optimization passes on the generated IR program.
@@ -27,6 +33,15 @@ int ir_optimize_program(IRProgram *program,
 // stderr), as opposed to an internal compiler error. Lets the driver skip the
 // generic ICE report in that case.
 int ir_optimize_had_user_error(void);
+
+/* --explain (see ir_optimize_explain.c). The codegen MIR gate records, per
+ * focus-file function, whether it got the register-allocating backend; the
+ * driver flushes that section after codegen. No-ops unless --explain is on. */
+int ir_explain_enabled(void);
+void ir_explain_backend_function(const char *function_name,
+                                 const char *filename, int ok,
+                                 const char *detail);
+void ir_explain_backend_flush(void);
 
 // When optimization is NOT run (no -O/--release), `@simd` markers are never
 // verified. This prints one note saying so (if any are present) and strips the
