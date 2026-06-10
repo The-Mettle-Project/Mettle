@@ -6,6 +6,7 @@
 #include "codegen/binary/startup.h"
 #include "codegen/binary_emitter.h"
 #include "codegen/program_entry.h"
+#include "codegen/ptx_emitter.h"
 #include "linker/pe_emitter.h"
 #include "string_intern.h"
 #include "compiler/compiler_context.h"
@@ -55,7 +56,7 @@ extern pid_t waitpid(pid_t pid, int *wstatus, int options);
 #ifdef METTLE_VERSION_RAW
 #define METTLE_VERSION METTLE_STRINGIFY(METTLE_VERSION_RAW)
 #else
-#define METTLE_VERSION "v0.9.2"
+#define METTLE_VERSION "v0.9.3"
 #endif
 #endif
 
@@ -377,12 +378,10 @@ static int print_help_topic(const char *program_name, const char *argv0,
     printf("    mettle --build app.mettle -o app.exe\n");
     printf("    mettle --build --release app.mettle -o app.exe              "
            "   (optimized, stripped)\n");
-    printf("    mettle --build --emit-asm app.mettle -o app.exe             "
-           "   (legacy NASM assembly path)\n\n");
+    printf("\n");
     printf("  Notes:\n");
     printf("    --build emits a COFF object and links with the internal PE "
            "linker by default (no NASM/gcc/link.exe needed).\n");
-    printf("    --emit-asm selects the legacy NASM assembly backend instead.\n");
     printf("    --linker auto tries internal, then gcc, then link.exe.\n");
     printf("    --linker internal forces the native PE linker and probes "
            "common Win32 DLLs directly.\n");
@@ -512,6 +511,12 @@ static char *default_executable_filename(const char *input_filename) {
   }
 
   return replace_extension(input_filename, ".exe");
+}
+
+static const char *default_object_output_filename(void) {
+  return binary_target_format_host_default() == BINARY_TARGET_FORMAT_ELF_X64
+             ? "output.o"
+             : "output.obj";
 }
 
 static const char *linker_mode_name(LinkerMode mode) {
@@ -1236,156 +1241,6 @@ static int windows_tool_exists(const char *tool_name) {
   return result == 0;
 }
 
-static int run_nasm_assemble(const char *asm_filename,
-                             const char *object_filename) {
-  size_t nasm_len = strlen(asm_filename) + strlen(object_filename) + 64;
-  char *nasm_command = malloc(nasm_len);
-  if (!nasm_command) {
-    fprintf(stderr, "Error: Failed to allocate NASM command\n");
-    return 1;
-  }
-
-  snprintf(nasm_command, nasm_len, "nasm -f win64 \"%s\" -o \"%s\"",
-           asm_filename, object_filename);
-  int result = run_system_command(nasm_command);
-  free(nasm_command);
-  if (result != 0) {
-    fprintf(stderr, "Error: NASM assembly step failed\n");
-    return 1;
-  }
-  return 0;
-}
-
-static int mettle_build_with_gcc(const char *object_filename,
-                                    const char *executable_filename,
-                                    const char *const *runtime_objects,
-                                    size_t runtime_object_count,
-                                    const CompilerOptions *options) {
-  size_t gcc_len = strlen(object_filename) + strlen(executable_filename) + 192;
-  for (size_t i = 0; i < runtime_object_count; i++) {
-    if (runtime_objects[i] && runtime_objects[i][0] != '\0') {
-      gcc_len += strlen(runtime_objects[i]) + 1;
-    }
-  }
-  if (options) {
-    for (size_t i = 0; i < options->link_argument_count; i++) {
-      if (options->link_arguments[i]) {
-        gcc_len += strlen(options->link_arguments[i]) + 1;
-      }
-    }
-  }
-
-  char *gcc_command = malloc(gcc_len);
-  if (!gcc_command) {
-    fprintf(stderr, "Error: Failed to allocate GCC command\n");
-    return 1;
-  }
-
-  size_t offset = 0;
-  if (!append_argument_text(gcc_command, gcc_len, &offset,
-                            "gcc -nostartfiles ") ||
-      !append_quoted_argument(gcc_command, gcc_len, &offset, object_filename)) {
-    free(gcc_command);
-    fprintf(stderr, "Error: Failed to build GCC command\n");
-    return 1;
-  }
-  for (size_t i = 0; i < runtime_object_count; i++) {
-    if (!runtime_objects[i] || runtime_objects[i][0] == '\0') {
-      continue;
-    }
-    if (!append_argument_text(gcc_command, gcc_len, &offset, " ") ||
-        !append_quoted_argument(gcc_command, gcc_len, &offset,
-                                runtime_objects[i])) {
-      free(gcc_command);
-      fprintf(stderr, "Error: Failed to build GCC command\n");
-      return 1;
-    }
-  }
-  if (!append_argument_text(gcc_command, gcc_len, &offset, " -o ") ||
-      !append_quoted_argument(gcc_command, gcc_len, &offset,
-                              executable_filename) ||
-      !append_argument_text(gcc_command, gcc_len, &offset, " -lkernel32") ||
-      !append_gcc_link_arguments(gcc_command, gcc_len, &offset, options)) {
-    free(gcc_command);
-    fprintf(stderr, "Error: Failed to build GCC command\n");
-    return 1;
-  }
-
-  int result = run_system_command(gcc_command);
-  free(gcc_command);
-  if (result != 0) {
-    fprintf(stderr, "Warning: GCC link step failed\n");
-    return 1;
-  }
-  return 0;
-}
-
-static int mettle_build_with_link(const char *object_filename,
-                                     const char *executable_filename,
-                                     const char *const *runtime_objects,
-                                     size_t runtime_object_count,
-                                     const CompilerOptions *options) {
-  size_t link_len = strlen(object_filename) + strlen(executable_filename) + 320;
-  for (size_t i = 0; i < runtime_object_count; i++) {
-    if (runtime_objects[i] && runtime_objects[i][0] != '\0') {
-      link_len += strlen(runtime_objects[i]) + 16;
-    }
-  }
-  if (options) {
-    for (size_t i = 0; i < options->link_argument_count; i++) {
-      if (options->link_arguments[i]) {
-        link_len += strlen(options->link_arguments[i]) + 16;
-      }
-    }
-  }
-
-  char *link_command = malloc(link_len);
-  if (!link_command) {
-    fprintf(stderr, "Error: Failed to allocate MSVC link command\n");
-    return 1;
-  }
-
-  size_t offset = 0;
-  if (!append_argument_text(
-          link_command, link_len, &offset,
-          "link.exe /nologo /entry:mainCRTStartup /subsystem:console /out:") ||
-      !append_quoted_argument(link_command, link_len, &offset,
-                              executable_filename) ||
-      !append_argument_text(link_command, link_len, &offset, " ") ||
-      !append_quoted_argument(link_command, link_len, &offset, object_filename)) {
-    free(link_command);
-    fprintf(stderr, "Error: Failed to build MSVC link command\n");
-    return 1;
-  }
-  for (size_t i = 0; i < runtime_object_count; i++) {
-    if (!runtime_objects[i] || runtime_objects[i][0] == '\0') {
-      continue;
-    }
-    if (!append_argument_text(link_command, link_len, &offset, " ") ||
-        !append_quoted_argument(link_command, link_len, &offset,
-                                runtime_objects[i])) {
-      free(link_command);
-      fprintf(stderr, "Error: Failed to build MSVC link command\n");
-      return 1;
-    }
-  }
-  if (!append_argument_text(link_command, link_len, &offset,
-                            " kernel32.lib msvcrt.lib") ||
-      !append_msvc_link_arguments(link_command, link_len, &offset, options)) {
-    free(link_command);
-    fprintf(stderr, "Error: Failed to build MSVC link command\n");
-    return 1;
-  }
-
-  int result = run_system_command(link_command);
-  free(link_command);
-  if (result != 0) {
-    fprintf(stderr, "Warning: MSVC link.exe step failed\n");
-    return 1;
-  }
-  return 0;
-}
-
 static int write_internal_startup_object(const char *path, int profile_runtime,
                                          int stack_trace_init,
                                          int main_wants_argc_argv) {
@@ -1534,8 +1389,6 @@ static int mettle_link_object_with_gcc(const char *object_filename,
                                           const char *const *runtime_objects,
                                           size_t runtime_object_count,
                                           const CompilerOptions *options) {
-  /* Keep flags aligned with mettle_build_with_gcc (asm path):
-   * -nostartfiles and kernel32. See docs/linker-build-pipelines.md. */
   size_t gcc_len = strlen(object_filename) + strlen(executable_filename) + 192;
   for (size_t i = 0; i < runtime_object_count; i++) {
     if (runtime_objects[i] && runtime_objects[i][0] != '\0') {
@@ -1658,255 +1511,6 @@ static int mettle_link_object_with_link(const char *object_filename,
     return 1;
   }
   return 0;
-}
-
-static int mettle_build_executable(const char *asm_filename,
-                                     const char *executable_filename,
-                                     const char *runtime_directory,
-                                     const CompilerOptions *options) {
-  LinkerMode linker_mode =
-      options ? options->linker_mode : LINKER_MODE_AUTO;
-  int has_gcc = 0;
-  int has_link = 0;
-
-  if (!asm_filename || !executable_filename || !runtime_directory) {
-    fprintf(stderr, "Error: Missing build inputs for executable generation\n");
-    return 1;
-  }
-
-  if (!windows_tool_exists("nasm")) {
-    fprintf(stderr, "Error: nasm not found in PATH. Please install NASM.\n");
-    return 1;
-  }
-
-  has_gcc = (linker_mode == LINKER_MODE_AUTO || linker_mode == LINKER_MODE_GCC)
-                ? windows_tool_exists("gcc")
-                : 0;
-  has_link =
-      (linker_mode == LINKER_MODE_AUTO || linker_mode == LINKER_MODE_MSVC)
-          ? windows_tool_exists("link.exe")
-          : 0;
-  if (linker_mode == LINKER_MODE_GCC && !has_gcc) {
-    fprintf(stderr, "Error: gcc was requested with --linker gcc but was not found.\n");
-    return 1;
-  }
-  if (linker_mode == LINKER_MODE_MSVC && !has_link) {
-    fprintf(stderr,
-            "Error: link.exe was requested with --linker msvc but was not found.\n");
-    return 1;
-  }
-  char *gcc_object_filename = replace_extension(executable_filename, ".o");
-  char *msvc_object_filename = replace_extension(executable_filename, ".obj");
-  char *crash_gcc_object = join_paths(runtime_directory, "crash_handler.o");
-  char *crash_msvc_object = join_paths(runtime_directory, "crash_handler.obj");
-  char *atomics_gcc_object = join_paths(runtime_directory, "atomics.o");
-  char *atomics_msvc_object = join_paths(runtime_directory, "atomics.obj");
-  char *profile_gcc_object = join_paths(runtime_directory, "profile.o");
-  char *profile_msvc_object = join_paths(runtime_directory, "profile.obj");
-  if (!gcc_object_filename || !msvc_object_filename || !crash_gcc_object ||
-      !crash_msvc_object || !atomics_gcc_object || !atomics_msvc_object ||
-      !profile_gcc_object || !profile_msvc_object) {
-    fprintf(stderr, "Error: Failed to allocate build paths\n");
-    free(gcc_object_filename);
-    free(msvc_object_filename);
-    free(crash_gcc_object);
-    free(crash_msvc_object);
-    free(atomics_gcc_object);
-    free(atomics_msvc_object);
-    free(profile_gcc_object);
-    free(profile_msvc_object);
-    return 1;
-  }
-
-  int build_result = 1;
-
-  if (linker_mode == LINKER_MODE_INTERNAL || linker_mode == LINKER_MODE_AUTO) {
-    size_t object_capacity =
-        4u + (options ? options->link_argument_count : 0u);
-    const char **object_paths = calloc(object_capacity, sizeof(const char *));
-    size_t object_count = 0u;
-    const char *crash_object = NULL;
-    const char *atomics_object = NULL;
-    const char *profile_object = NULL;
-
-    if (!object_paths) {
-      fprintf(stderr, "Error: Failed to allocate internal-linker object list\n");
-      goto cleanup;
-    }
-
-    if (run_nasm_assemble(asm_filename, msvc_object_filename) != 0) {
-      free(object_paths);
-      goto cleanup;
-    }
-    if (object_needs_crash_handler(msvc_object_filename)) {
-      crash_object = (_access(crash_msvc_object, 0) == 0) ? crash_msvc_object
-                                                          : crash_gcc_object;
-      if (_access(crash_object, 0) != 0) {
-        fprintf(stderr,
-                "Error: Bundled crash-handler runtime object not found in '%s'\n",
-                runtime_directory);
-        free(object_paths);
-        goto cleanup;
-      }
-    }
-    if (object_needs_atomics(msvc_object_filename)) {
-      atomics_object = (_access(atomics_msvc_object, 0) == 0)
-                           ? atomics_msvc_object
-                           : atomics_gcc_object;
-      if (_access(atomics_object, 0) != 0) {
-        fprintf(stderr,
-                "Error: Bundled atomics runtime object not found in '%s'\n",
-                runtime_directory);
-        free(object_paths);
-        goto cleanup;
-      }
-    }
-    if (object_needs_profile_runtime(msvc_object_filename) ||
-        (options && compiler_options_use_profile_runtime(options))) {
-      profile_object = (_access(profile_msvc_object, 0) == 0)
-                           ? profile_msvc_object
-                           : profile_gcc_object;
-      if (_access(profile_object, 0) != 0) {
-        fprintf(stderr,
-                "Error: Bundled profile runtime object not found in '%s'\n",
-                runtime_directory);
-        free(object_paths);
-        goto cleanup;
-      }
-    }
-    if (profile_object && !crash_object) {
-      crash_object = (_access(crash_msvc_object, 0) == 0) ? crash_msvc_object
-                                                          : crash_gcc_object;
-      if (_access(crash_object, 0) != 0) {
-        fprintf(stderr,
-                "Error: Bundled crash-handler runtime object not found in '%s'\n",
-                runtime_directory);
-        free(object_paths);
-        goto cleanup;
-      }
-    }
-
-    object_paths[object_count++] = msvc_object_filename;
-    if (crash_object) {
-      object_paths[object_count++] = crash_object;
-    }
-    if (atomics_object) {
-      object_paths[object_count++] = atomics_object;
-    }
-    if (profile_object) {
-      object_paths[object_count++] = profile_object;
-    }
-    if (!append_internal_link_object_args(options, object_paths, object_capacity,
-                                          &object_count)) {
-      fprintf(stderr, "Error: Too many internal-linker object arguments\n");
-      free(object_paths);
-      goto cleanup;
-    }
-
-    if (mettle_link_internal(object_paths, object_count, executable_filename,
-                               0, options) == 0) {
-      build_result = 0;
-      free(object_paths);
-      goto cleanup;
-    }
-    free(object_paths);
-
-    if (linker_mode == LINKER_MODE_INTERNAL) {
-      fprintf(stderr, "Error: Internal linker failed to produce an executable\n");
-      goto cleanup;
-    }
-    if (!has_gcc && !has_link) {
-      fprintf(stderr,
-              "Error: Internal linker failed and no external fallback linker is "
-              "available.\n");
-      goto cleanup;
-    }
-    fprintf(stderr,
-            "Warning: Internal linker failed in auto mode, falling back to "
-            "external linkers\n");
-  }
-
-  if (has_gcc && linker_mode != LINKER_MODE_MSVC) {
-    if (run_nasm_assemble(asm_filename, gcc_object_filename) == 0) {
-      const char *runtime_objects[2] = {NULL, NULL};
-      size_t runtime_object_count = 0u;
-      if (object_needs_crash_handler(gcc_object_filename)) {
-        if (_access(crash_gcc_object, 0) != 0) {
-          fprintf(stderr,
-                  "Error: Bundled crash-handler runtime object not found in '%s'\n",
-                  runtime_directory);
-          goto cleanup;
-        }
-        runtime_objects[runtime_object_count++] = crash_gcc_object;
-      }
-      if (object_needs_atomics(gcc_object_filename)) {
-        if (_access(atomics_gcc_object, 0) != 0) {
-          fprintf(stderr,
-                  "Error: Bundled atomics runtime object not found in '%s'\n",
-                  runtime_directory);
-          goto cleanup;
-        }
-        runtime_objects[runtime_object_count++] = atomics_gcc_object;
-      }
-      if (mettle_build_with_gcc(gcc_object_filename, executable_filename,
-                                   runtime_objects, runtime_object_count,
-                                   options) == 0) {
-        build_result = 0;
-        goto cleanup;
-      }
-    }
-  }
-
-  if (has_link && linker_mode != LINKER_MODE_GCC) {
-    if (run_nasm_assemble(asm_filename, msvc_object_filename) == 0) {
-      const char *runtime_objects[2] = {NULL, NULL};
-      size_t runtime_object_count = 0u;
-      if (object_needs_crash_handler(msvc_object_filename)) {
-        const char *crash_object = (_access(crash_msvc_object, 0) == 0)
-                                       ? crash_msvc_object
-                                       : crash_gcc_object;
-        if (_access(crash_object, 0) != 0) {
-          fprintf(stderr,
-                  "Error: Bundled crash-handler runtime object not found in '%s'\n",
-                  runtime_directory);
-          goto cleanup;
-        }
-        runtime_objects[runtime_object_count++] = crash_object;
-      }
-      if (object_needs_atomics(msvc_object_filename)) {
-        const char *atomics_object = (_access(atomics_msvc_object, 0) == 0)
-                                         ? atomics_msvc_object
-                                         : atomics_gcc_object;
-        if (_access(atomics_object, 0) != 0) {
-          fprintf(stderr,
-                  "Error: Bundled atomics runtime object not found in '%s'\n",
-                  runtime_directory);
-          goto cleanup;
-        }
-        runtime_objects[runtime_object_count++] = atomics_object;
-      }
-      if (mettle_build_with_link(msvc_object_filename, executable_filename,
-                                    runtime_objects, runtime_object_count,
-                                    options) == 0) {
-        build_result = 0;
-        goto cleanup;
-      }
-    }
-  }
-
-  fprintf(stderr,
-          "Error: Failed to link executable with the available linker backends\n");
-
-cleanup:
-  free(gcc_object_filename);
-  free(msvc_object_filename);
-  free(crash_gcc_object);
-  free(crash_msvc_object);
-  free(atomics_gcc_object);
-  free(atomics_msvc_object);
-  free(profile_gcc_object);
-  free(profile_msvc_object);
-  return build_result;
 }
 
 static int mettle_link_object_file(const char *object_filename,
@@ -2403,13 +2007,12 @@ int main(int argc, char *argv[]) {
   char *auto_stdlib_directory = NULL;
   char *auto_runtime_directory = NULL;
   char *build_output_filename = NULL;
-  char *assembly_output_filename = NULL;
   char *object_output_filename = NULL;
   int build_executable = 0;
-  int emit_asm = 0;
   int linker_mode_explicit = 0;
   int output_filename_explicit = 0;
-  options.output_filename = "output.s"; // Default output filename
+  options.emit_object = 1;
+  options.output_filename = default_object_output_filename();
   options.debug_format = "dwarf";
 
   if (argc >= 2) {
@@ -2465,7 +2068,10 @@ int main(int argc, char *argv[]) {
     } else if (strcmp(argv[i], "--build") == 0) {
       build_executable = 1;
     } else if (strcmp(argv[i], "--emit-asm") == 0) {
-      emit_asm = 1;
+      fprintf(stderr,
+              "Error: --emit-asm has been removed; Mettle only emits native "
+              "objects now.\n");
+      return 1;
     } else if (strcmp(argv[i], "--emit-obj") == 0) {
       options.emit_object = 1;
     } else if (strcmp(argv[i], "--linker") == 0 && i + 1 < argc) {
@@ -2491,6 +2097,10 @@ int main(int argc, char *argv[]) {
       options.generate_stack_trace_support = 1;
     } else if (strcmp(argv[i], "--dump-ir") == 0) {
       options.dump_ir = 1;
+    } else if (strcmp(argv[i], "--simd-report") == 0) {
+      options.simd_report = 1;
+    } else if (strcmp(argv[i], "--emit-ptx") == 0) {
+      options.emit_ptx = 1;
     } else if (strcmp(argv[i], "-g") == 0 ||
                strcmp(argv[i], "--debug-symbols") == 0) {
       options.generate_debug_symbols = 1;
@@ -2509,9 +2119,11 @@ int main(int argc, char *argv[]) {
                strcmp(argv[i], "--release") == 0) {
       options.release = 1;
       options.optimize = 1;
-      options.strip_asm_comments = 1;
     } else if (strcmp(argv[i], "--strip-comments") == 0) {
-      options.strip_asm_comments = 1;
+      fprintf(stderr,
+              "Error: --strip-comments has been removed; Mettle no longer "
+              "emits text assembly.\n");
+      return 1;
     } else if (strcmp(argv[i], "--prelude") == 0) {
       options.prelude = 1;
     } else if (strcmp(argv[i], "--profile") == 0) {
@@ -2520,6 +2132,8 @@ int main(int argc, char *argv[]) {
       options.profile_runtime = 1;
     } else if (strcmp(argv[i], "--profile-runtime-ops") == 0) {
       options.profile_runtime_ops = 1;
+    } else if (strcmp(argv[i], "--native-heap") == 0) {
+      options.native_heap = 1;
     } else if (strcmp(argv[i], "--static") == 0) {
       options.static_link = 1;
     } else if (strcmp(argv[i], "--musl") == 0) {
@@ -2562,18 +2176,10 @@ int main(int argc, char *argv[]) {
   }
 
   if (build_executable) {
-    if (emit_asm) {
-      options.emit_object = 0;
-    } else {
-      options.emit_object = 1;
-    }
+    options.emit_object = 1;
     if (!linker_mode_explicit) {
       options.linker_mode = LINKER_MODE_INTERNAL;
     }
-  }
-
-  if (!output_filename_explicit && options.emit_object) {
-    options.output_filename = "output.obj";
   }
 
   if (!options.stdlib_directory) {
@@ -2629,33 +2235,19 @@ int main(int argc, char *argv[]) {
       return 1;
     }
 
-    if (options.emit_object) {
-      /* ELF objects conventionally use .o; COFF uses .obj. */
-      object_output_filename = replace_extension(
-          build_output_filename, elf_build ? ".o" : ".obj");
-      if (!object_output_filename) {
-        fprintf(stderr, "Error: Failed to determine object output path\n");
-        free(build_output_filename);
-        free((void *)options.import_directories);
-        free((void *)options.link_arguments);
-        free(auto_stdlib_directory);
-        free(auto_runtime_directory);
-        return 1;
-      }
-      options.output_filename = object_output_filename;
-    } else {
-      assembly_output_filename = replace_extension(build_output_filename, ".s");
-      if (!assembly_output_filename) {
-        fprintf(stderr, "Error: Failed to determine assembly output path\n");
-        free(build_output_filename);
-        free((void *)options.import_directories);
-        free((void *)options.link_arguments);
-        free(auto_stdlib_directory);
-        free(auto_runtime_directory);
-        return 1;
-      }
-      options.output_filename = assembly_output_filename;
+    /* ELF objects conventionally use .o; COFF uses .obj. */
+    object_output_filename = replace_extension(
+        build_output_filename, elf_build ? ".o" : ".obj");
+    if (!object_output_filename) {
+      fprintf(stderr, "Error: Failed to determine object output path\n");
+      free(build_output_filename);
+      free((void *)options.import_directories);
+      free((void *)options.link_arguments);
+      free(auto_stdlib_directory);
+      free(auto_runtime_directory);
+      return 1;
     }
+    options.output_filename = object_output_filename;
   }
 
   double command_profile_start =
@@ -2672,15 +2264,9 @@ int main(int argc, char *argv[]) {
                                         build_output_filename, &options,
                                         auto_runtime_directory);
 #else
-    if (options.emit_object) {
-      result = mettle_link_object_file(options.output_filename,
-                                         build_output_filename,
-                                         auto_runtime_directory, &options);
-    } else {
-      result = mettle_build_executable(options.output_filename,
-                                         build_output_filename,
-                                         auto_runtime_directory, &options);
-    }
+    result = mettle_link_object_file(options.output_filename,
+                                     build_output_filename,
+                                     auto_runtime_directory, &options);
 #endif
     if (result == 0) {
       printf("Built executable '%s'\n", build_output_filename);
@@ -2709,7 +2295,6 @@ int main(int argc, char *argv[]) {
   free(auto_stdlib_directory);
   free(auto_runtime_directory);
   free(build_output_filename);
-  free(assembly_output_filename);
   free(object_output_filename);
   string_intern_clear();
   return result;
@@ -2803,8 +2388,13 @@ static int compile_optimize_ir(IRProgram *ir_program,
   IROptimizeOptions ir_optimize_options = {0};
   ir_optimize_options.preserve_function_boundaries =
       options->profile_runtime ? 1 : 0;
+  ir_optimize_options.simd_report = options->simd_report;
   if (!ir_optimize_program(ir_program, &ir_optimize_options)) {
-    mettle_compiler_ice_report("IR optimization failed", NULL);
+    /* A violated `@simd!` contract is a user error already printed with a
+     * source location; don't bury it under a generic internal-error report. */
+    if (!ir_optimize_had_user_error()) {
+      mettle_compiler_ice_report("IR optimization failed", NULL);
+    }
     return 0;
   }
   return 1;
@@ -2907,6 +2497,10 @@ int compile_file(const char *input_filename, const char *output_filename,
   }
 
   parser = parser_create_with_error_reporter(lexer, error_reporter);
+  if (parser) {
+    /* Enable kernel index built-ins (thread.x etc.) for GPU compiles. */
+    parser->gpu_mode = options->emit_ptx;
+  }
   type_checker =
       type_checker_create_with_error_reporter(symbol_table, error_reporter);
   if (!parser || !type_checker) {
@@ -2973,8 +2567,6 @@ int compile_file(const char *input_filename, const char *output_filename,
     return 1;
   }
 
-  code_generator_set_emit_asm_comments(code_generator,
-                                       options->strip_asm_comments ? 0 : 1);
   if (debug_info) {
     code_generator_set_debug_sidecar_emission(
         code_generator,
@@ -2994,17 +2586,7 @@ int compile_file(const char *input_filename, const char *output_filename,
   compiler_profile_add(&profile, PROFILE_PHASE_INIT, phase_start);
 
   int result = 0;
-
-  if (options->emit_object) {
-    code_generator_set_backend_mode(code_generator,
-                                    CODEGEN_BACKEND_BINARY_OBJECT);
-  } else if (compiler_options_use_profile_runtime(options)) {
-    fprintf(stderr,
-            "Error: --profile-runtime/--profile-runtime-ops require the direct "
-            "object backend (use --build or --emit-obj)\n");
-    result = 1;
-    goto cleanup;
-  }
+  options->emit_object = 1;
 
   compiler_set_phase(PROFILE_PHASE_PARSE);
   phase_start = compiler_profile_begin(&profile);
@@ -3034,28 +2616,40 @@ int compile_file(const char *input_filename, const char *output_filename,
       (binary_target_format_host_default() == BINARY_TARGET_FORMAT_ELF_X64) ? 1
                                                                             : 0;
 
-  // Auto-inject the standard prelude only when --prelude was specified.
+  // Auto-inject the standard prelude only when --prelude was specified, and
+  // std/alloc when --native-heap was specified (it provides the mettle_heap_*
+  // shims the backend rewrites new/malloc/calloc/realloc/free to call).
   compiler_set_phase(PROFILE_PHASE_PRELUDE);
   phase_start = compiler_profile_begin(&profile);
-  if (options->prelude) {
-    Program *prog_data = (Program *)program->data;
-    SourceLocation prelude_loc = {0, 0, NULL};
-    ASTNode *prelude_import =
-        ast_create_import_declaration("std/prelude", NULL, NULL, 0, prelude_loc);
-    if (prelude_import) {
-      // Prepend the prelude import before all user declarations.
-      ASTNode **grown =
-          realloc(prog_data->declarations,
-                  (prog_data->declaration_count + 1) * sizeof(ASTNode *));
-      if (grown) {
-        memmove(grown + 1, grown,
-                prog_data->declaration_count * sizeof(ASTNode *));
-        grown[0] = prelude_import;
-        prog_data->declarations = grown;
-        prog_data->declaration_count++;
-        ast_add_child(program, prelude_import);
-      } else {
-        ast_destroy_node(prelude_import);
+  {
+    const char *auto_imports[2];
+    size_t auto_import_count = 0;
+    if (options->prelude) {
+      auto_imports[auto_import_count++] = "std/prelude";
+    }
+    if (options->native_heap) {
+      auto_imports[auto_import_count++] = "std/alloc";
+    }
+    for (size_t ai = 0; ai < auto_import_count; ai++) {
+      Program *prog_data = (Program *)program->data;
+      SourceLocation auto_loc = {0, 0, NULL};
+      ASTNode *auto_import = ast_create_import_declaration(
+          auto_imports[ai], NULL, NULL, 0, auto_loc);
+      if (auto_import) {
+        // Prepend the import before all user declarations.
+        ASTNode **grown =
+            realloc(prog_data->declarations,
+                    (prog_data->declaration_count + 1) * sizeof(ASTNode *));
+        if (grown) {
+          memmove(grown + 1, grown,
+                  prog_data->declaration_count * sizeof(ASTNode *));
+          grown[0] = auto_import;
+          prog_data->declarations = grown;
+          prog_data->declaration_count++;
+          ast_add_child(program, auto_import);
+        } else {
+          ast_destroy_node(auto_import);
+        }
       }
     }
   }
@@ -3091,7 +2685,7 @@ int compile_file(const char *input_filename, const char *output_filename,
     goto cleanup;
   }
 
-  int emit_runtime_checks = options->release ? 0 : 1;
+  int emit_runtime_checks = (options->release || options->emit_ptx) ? 0 : 1;
   compiler_set_phase(PROFILE_PHASE_IR_LOWERING);
   phase_start = compiler_profile_begin(&profile);
   int ir_ok = compile_lower_to_ir(program, type_checker, symbol_table,
@@ -3104,6 +2698,42 @@ int compile_file(const char *input_filename, const char *output_filename,
   }
 
   mettle_compiler_ctx_set_ir_program(ir_program);
+
+  /* --emit-ptx: lower every function to a PTX `.visible .entry` and write the
+   * PTX text to the output file. No optimization (keeps the IR shape the PTX
+   * emitter expects), no object, no link -- the GPU kernels are JIT-compiled by
+   * the CUDA driver at runtime from this text. */
+  if (options->emit_ptx) {
+    FILE *ptx_out = fopen(output_filename, "w");
+    if (!ptx_out) {
+      fprintf(stderr, "Error: could not open PTX output '%s'\n",
+              output_filename);
+      result = 1;
+      goto cleanup;
+    }
+    char *ptx_err = NULL;
+    int ok = ptx_emit_program(ir_program, code_generator, ptx_out, &ptx_err);
+    fclose(ptx_out);
+    if (!ok) {
+      fprintf(stderr, "Error: PTX emission failed: %s\n",
+              ptx_err ? ptx_err : "unknown");
+      free(ptx_err);
+      result = 1;
+      goto cleanup;
+    }
+    printf("Generated PTX: %s\n", output_filename);
+    result = 0;
+    goto cleanup;
+  }
+
+  /* --native-heap: retarget new/malloc/calloc/realloc/free onto the std/alloc
+   * Mettle allocator at the IR level (before optimization, so the rewritten
+   * calls inline/optimize like any other). std/alloc is auto-injected above. */
+  if (options->native_heap && !ir_program_route_to_native_heap(ir_program)) {
+    fprintf(stderr, "Error: Failed to route allocation to the native heap\n");
+    result = 1;
+    goto cleanup;
+  }
 
   if (compiler_options_use_profile_runtime(options)) {
     if (!ir_profile_instrument_program(ir_program)) {
@@ -3122,6 +2752,11 @@ int compile_file(const char *input_filename, const char *output_filename,
       result = 1;
       goto cleanup;
     }
+  } else {
+    /* Vectorization (and thus `@simd` contract verification) only runs under
+     * -O/--release. Tell the user their `@simd` loops went unchecked and strip
+     * the markers so they never reach codegen. */
+    ir_note_simd_contracts_unverified(ir_program);
   }
 
   if (options->profile_runtime_ops) {
@@ -3174,33 +2809,17 @@ int compile_file(const char *input_filename, const char *output_filename,
 
   compiler_set_phase(PROFILE_PHASE_WRITE_OUTPUT);
   phase_start = compiler_profile_begin(&profile);
-  if (options->emit_object) {
-    BinaryEmitter *binary_emitter =
-        code_generator_get_binary_emitter(code_generator);
-    if (!binary_emitter_write_object_file(binary_emitter, output_filename)) {
-      compiler_profile_add(&profile, PROFILE_PHASE_WRITE_OUTPUT, phase_start);
-      fprintf(stderr, "Error: Could not create object file '%s': %s\n",
-              output_filename,
-              binary_emitter_get_error(binary_emitter)
-                  ? binary_emitter_get_error(binary_emitter)
-                  : "Unknown error");
-      result = 1;
-      goto cleanup;
-    }
-  } else {
-    // Write output file
-    FILE *output_file = fopen(output_filename, "w");
-    if (!output_file) {
-      compiler_profile_add(&profile, PROFILE_PHASE_WRITE_OUTPUT, phase_start);
-      fprintf(stderr, "Error: Could not create output file '%s': %s\n",
-              output_filename, strerror(errno));
-      result = 1;
-      goto cleanup;
-    }
-
-    char *generated_code = code_generator_get_output(code_generator);
-    fprintf(output_file, "%s", generated_code);
-    fclose(output_file);
+  BinaryEmitter *binary_emitter =
+      code_generator_get_binary_emitter(code_generator);
+  if (!binary_emitter_write_object_file(binary_emitter, output_filename)) {
+    compiler_profile_add(&profile, PROFILE_PHASE_WRITE_OUTPUT, phase_start);
+    fprintf(stderr, "Error: Could not create object file '%s': %s\n",
+            output_filename,
+            binary_emitter_get_error(binary_emitter)
+                ? binary_emitter_get_error(binary_emitter)
+                : "Unknown error");
+    result = 1;
+    goto cleanup;
   }
   compiler_profile_add(&profile, PROFILE_PHASE_WRITE_OUTPUT, phase_start);
 
@@ -3299,17 +2918,14 @@ void print_usage(const char *program_name) {
   printf("       %s docs [topic]\n", program_name);
   printf("Options:\n");
   printf("  -i <file>           Input file\n");
-  printf("  -o <file>           Output file (default: output.s, or output.obj "
-         "with --emit-obj)\n");
+  printf("  -o <file>           Output file (default: output.obj/output.o, or "
+         "executable path with --build)\n");
   printf("  -I <dir>            Add import search directory (repeatable)\n");
   printf("  --stdlib <dir>      Set stdlib root directory (default: auto-detect "
          "bundled stdlib, then ./stdlib)\n");
   printf("  --build             Compile and link to an executable (COFF/PE on "
          "Windows, ELF on Linux)\n");
-  printf("  --emit-obj          Emit a native object directly "
-         "(default with --build)\n");
-  printf("  --emit-asm          Emit NASM assembly instead of COFF "
-         "(legacy; use with --build)\n");
+  printf("  --emit-obj          Emit a native object directly (default)\n");
   printf("  --linker <mode>     Linker backend: auto, internal, gcc, or msvc "
          "(default: internal with --build, otherwise %s)\n",
          linker_mode_name(LINKER_MODE_AUTO));
@@ -3321,6 +2937,7 @@ void print_usage(const char *program_name) {
          ".mettle\\tracy_dir)\n");
   printf("  -d, --debug         Enable debug output and symbols\n");
   printf("  --dump-ir           Write optimized IR sidecar (.ir) without debug metadata\n");
+  printf("  --simd-report       Report what each @simd loop became (needs -O/--release)\n");
   printf("  -g, --debug-symbols Generate debug symbols\n");
   printf("  -l, --line-mapping  Generate source line mapping\n");
   printf("  -s, --stack-trace   Embed runtime crash traceback support\n");
@@ -3329,7 +2946,6 @@ void print_usage(const char *program_name) {
   printf("  -O, --optimize      Enable optimizations\n");
   printf("  -r, --release       Optimize for size (enables -O, strips comments, "
          "and drops unreachable functions)\n");
-  printf("  --strip-comments    Omit emitted assembly comments\n");
   printf("  --prelude           Auto-import the standard prelude (std/io, "
          "std/net, etc.)\n");
   printf("  --profile           Print per-phase compilation timings\n");
@@ -3337,17 +2953,17 @@ void print_usage(const char *program_name) {
          "(disables inlining)\n");
   printf("  --profile-runtime-ops  Emit runtime op-class counters per function "
          "(after optimization)\n");
+  printf("  --native-heap       Route new/malloc/calloc/realloc/free through "
+         "the Mettle allocator (std/alloc)\n");
   printf("  --static            On Linux, link executable statically\n");
   printf("  --musl              On Linux, link statically with musl-gcc\n");
   printf("  --debug-compiler    Track compiler context for internal error reports\n");
   printf("  -h, --help          Show this help message\n");
   printf("\nExamples:\n");
-  printf("  %s app.mettle -o app.s\n", program_name);
-  printf("      Compile to x86-64 assembly only.\n");
+  printf("  %s app.mettle -o app.obj\n", program_name);
+  printf("      Compile to a native object file.\n");
   printf("  %s --build app.mettle -o app.exe\n", program_name);
   printf("      Self-contained build: COFF object + internal PE linker.\n");
-  printf("  %s --build --emit-asm app.mettle -o app.exe\n", program_name);
-  printf("      Legacy build: NASM assembly + selected linker.\n");
   printf("  %s --build --release app.mettle -o app.exe\n", program_name);
   printf("      Optimized, comment-stripped release build.\n");
   printf("  %s --build --tracy app.mettle -o app.exe\n", program_name);

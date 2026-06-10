@@ -53,24 +53,15 @@ static void ir_trace_pass_event(const char *pass_name, const char *event,
 }
 
 /* Diagnostic: METTLE_SKIP_PASS="sroa,16" disables the listed pass names or
- * numeric pass IDs so a miscompile can be bisected to a single pass. */
-int ir_pass_is_skipped(IROptPassId pass_id) {
+ * numeric pass IDs so a miscompile can be bisected to a single pass. Names
+ * cover both fixpoint passes and named-sequence passes (the pre-inline and
+ * post-fixpoint stages: vectorizers, SLP, induction-pointer, ...). */
+static int ir_skip_spec_matches(const char *id_text, const char *pass_name) {
   const char *spec = getenv("METTLE_SKIP_PASS");
   if (!spec || !*spec) {
     return 0;
   }
 
-  if (pass_id < 0 || pass_id >= IR_OPT_PASS_COUNT) {
-    return 0;
-  }
-
-  char id_text[16];
-  int id_len = snprintf(id_text, sizeof(id_text), "%d", (int)pass_id);
-  if (id_len <= 0) {
-    return 0;
-  }
-
-  const char *pass_name = ir_opt_pass_name(pass_id);
   const char *p = spec;
   while (*p) {
     while (ir_skip_delimiter(*p)) {
@@ -92,12 +83,35 @@ int ir_pass_is_skipped(IROptPassId pass_id) {
   return 0;
 }
 
+int ir_pass_name_is_skipped(const char *pass_name) {
+  return ir_skip_spec_matches(NULL, pass_name);
+}
+
+int ir_pass_is_skipped(IROptPassId pass_id) {
+  if (pass_id < 0 || pass_id >= IR_OPT_PASS_COUNT) {
+    return 0;
+  }
+
+  char id_text[16];
+  int id_len = snprintf(id_text, sizeof(id_text), "%d", (int)pass_id);
+  if (id_len <= 0) {
+    return 0;
+  }
+
+  return ir_skip_spec_matches(id_text, ir_opt_pass_name(pass_id));
+}
+
 static int ir_run_named_pass(IRFunction *function, const IROptNamedPass *pass,
                              const char *failure_message) {
   int changed = 0;
 
   if (!pass || !pass->name || !pass->run) {
     return 0;
+  }
+
+  if (ir_pass_name_is_skipped(pass->name)) {
+    ir_trace_pass_event(pass->name, "skipped", NULL, -1);
+    return 1;
   }
 
   mettle_compiler_ctx_set_pass_name(pass->name);

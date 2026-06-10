@@ -41,7 +41,30 @@ def build_and_run(compiler, text, release):
         return "TIMEOUT"
 
 
+def structurally_sane(text):
+    """Reject candidates where deletion created a value-returning function
+    with no `return` in its body: the compiler accepts those (missing-return
+    is currently undiagnosed) and the garbage return value produces fake
+    debug-vs-release 'divergences' that aren't miscompiles."""
+    import re
+    for m in re.finditer(r"->\s*\w+\s*\{", text):
+        depth = 1
+        i = m.end()
+        body_start = i
+        while i < len(text) and depth:
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+            i += 1
+        if "return" not in text[body_start:i]:
+            return False
+    return True
+
+
 def diverges(compiler, text, pinned_debug=None):
+    if not structurally_sane(text):
+        return False
     """A program 'diverges' if it builds at both levels, debug != release, AND
     (when pinned_debug is given) the debug result still equals the original
     program's debug result. Pinning is what keeps reduction semantics-preserving:

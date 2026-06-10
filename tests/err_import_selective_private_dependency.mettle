@@ -1,0 +1,5 @@
+import { answer } from "namespaced_math";
+
+function main() -> int32 {
+  return private_bonus();
+}

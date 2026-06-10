@@ -45,6 +45,7 @@ Run the full Mettle-vs-C suite:
 | [`hexdump/`](hexdump/) | Hex dump utility |
 | [`ui_demo/`](ui_demo/) | Win32 UI demo (`std/ui`); see [ui_demo/README.md](ui_demo/README.md) |
 | [`tracy_demo/`](tracy_demo/) | Tracy profiler demo (`std/tracy`); see [tracy_demo/README.md](tracy_demo/README.md) |
+| [`gpu_vadd/`](gpu_vadd/) | GPU offload demo: a `kernel` compiled to PTX and launched with `dispatch` (`std/gpu`); see [docs/gpu.md](../docs/gpu.md) |
 | [`guessing-game/`](guessing-game/) | Simple interactive game |
 | [`direct_object_smoke/`](direct_object_smoke/) | Direct object backend smoke test |
 

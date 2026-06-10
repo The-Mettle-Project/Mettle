@@ -1,0 +1,32 @@
+import "std/io";
+import "std/mem";
+import "std/bench";
+extern function expf(x: float32) -> float32 = "expf";
+
+function exp_array(a: float32*, n: int64) {
+  var i: int64 = 0;
+  while (i < n) {
+    a[i] = expf(a[i]);
+    i = i + 1;
+  }
+}
+function fill(a: float32*, n: int64, v: float32) {
+  var i: int64 = 0;
+  while (i < n) { a[i] = v; i = i + 1; }
+}
+
+function main() -> int32 {
+  var n: int64 = 65536;
+  var a: float32* = (float32*)malloc(n * 4);
+  var t0: uint64 = bench_time_us();
+  var p: int32 = 0;
+  while (p < 4000) {
+    fill(a, n, 0.3);
+    exp_array(a, n);
+    p = p + 1;
+  }
+  var elapsed: uint64 = bench_time_us() - t0;
+  print(cstr("a0 x1e6 = ")); println_int((int64)(a[0] * 1000000.0));
+  print(cstr("Time: ")); print_int(elapsed); println(cstr(" us"));
+  return 0;
+}

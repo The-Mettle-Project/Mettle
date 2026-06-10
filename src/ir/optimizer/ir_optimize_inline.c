@@ -69,8 +69,7 @@ static int ir_function_index_ensure(const IRProgram *program) {
   return 1;
 }
 
-static IRFunction *ir_program_find_function(IRProgram *program,
-                                            const char *name) {
+IRFunction *ir_program_find_function(IRProgram *program, const char *name) {
   if (!program || !name) {
     return NULL;
   }
@@ -110,10 +109,25 @@ static int ir_function_name_is_inline_denylisted(const char *name) {
 }
 
 static int ir_function_is_inline_candidate(const IRFunction *function) {
-  if (!function || !function->name || function->instruction_count == 0 ||
-      ir_function_name_is_inline_denylisted(function->name) ||
-      function->parameter_count > IR_INLINE_MAX_PARAMETERS ||
-      (function->parameter_count > 0 && !function->parameter_names)) {
+  if (!function || !function->name || function->instruction_count == 0) {
+    return 0;
+  }
+  /* `@noinline` is an absolute veto. */
+  if (function->is_noinline) {
+    return 0;
+  }
+  /* `@inline` forces the function past the discretionary heuristics below
+   * (the name denylist, the parameter/size/call-count caps), but never past
+   * the structural correctness guards: inline-asm, the loop-shape guards that
+   * work around a latent optimizer bug, and the must-have-a-return rule still
+   * apply. */
+  int forced = function->is_inline;
+
+  if (!forced && (ir_function_name_is_inline_denylisted(function->name) ||
+                  function->parameter_count > IR_INLINE_MAX_PARAMETERS)) {
+    return 0;
+  }
+  if (function->parameter_count > 0 && !function->parameter_names) {
     return 0;
   }
 
@@ -132,7 +146,7 @@ static int ir_function_is_inline_candidate(const IRFunction *function) {
     }
 
     non_nop_count++;
-    if (non_nop_count > IR_INLINE_MAX_NON_NOP_INSTRUCTIONS) {
+    if (!forced && non_nop_count > IR_INLINE_MAX_NON_NOP_INSTRUCTIONS) {
       return 0;
     }
 
@@ -171,7 +185,7 @@ static int ir_function_is_inline_candidate(const IRFunction *function) {
     if (instruction->op == IR_OP_CALL ||
         instruction->op == IR_OP_CALL_INDIRECT) {
       call_count++;
-      if (call_count > 2) {
+      if (!forced && call_count > 2) {
         return 0;
       }
     }
@@ -263,6 +277,10 @@ int ir_clone_instruction_plain(const IRInstruction *source,
   out->location = source->location;
   out->is_float = source->is_float;
   out->float_bits = source->float_bits;
+  /* is_unsigned carries codegen-critical signedness: unsigned div/rem/shr and
+   * zero-extending uint8/16/32 loads. Dropping it here (it only runs at -O)
+   * silently reverts those to signed -- a uint32-as-signed miscompile. */
+  out->is_unsigned = source->is_unsigned;
   out->ast_ref = source->ast_ref;
 
   if (!ir_operand_clone(&source->dest, &out->dest) ||
@@ -314,6 +332,7 @@ static int ir_clone_instruction_for_inline(const IRInstruction *source,
   out->location = source->location;
   out->is_float = source->is_float;
   out->float_bits = source->float_bits;
+  out->is_unsigned = source->is_unsigned; /* unsigned div/shr + zero-ext loads */
   out->ast_ref = NULL;
 
   if (!ir_inline_rewrite_operand(&source->dest, &out->dest, symbol_map,
@@ -406,6 +425,19 @@ static int ir_append_parameter_materialization(
     assign.op = IR_OP_ASSIGN;
     assign.location = call_instruction->location;
     assign.dest = ir_operand_symbol(mapped_name);
+    /* A float parameter carries the narrowing contract on the assign
+     * (float_bits = declared parameter width), mirroring the RETURN path
+     * below. Without it the backend skips the precision conversion and a
+     * float64-tracked argument temp is bit-truncated into a float32
+     * parameter local (low dword of the double, 0 for round values). */
+    if (strcmp(type_name, "float32") == 0) {
+      assign.is_float = 1;
+      assign.float_bits = 32;
+    } else if (strcmp(type_name, "float64") == 0 ||
+               strcmp(type_name, "float") == 0) {
+      assign.is_float = 1;
+      assign.float_bits = 64;
+    }
     if (!assign.dest.name ||
         !ir_operand_clone(&call_instruction->arguments[i], &assign.lhs) ||
         !ir_instruction_vector_append_move(vector, &assign)) {
@@ -510,6 +542,17 @@ static int ir_inline_call_instruction(IRInstructionVector *vector,
   for (size_t i = 0; i < callee->instruction_count; i++) {
     const IRInstruction *source = &callee->instructions[i];
     IRInstruction emitted = {0};
+
+    /* `@simd` contracts are enforced at the loop's definition site (the
+     * standalone callee, which the function pipeline verifies independently).
+     * Don't carry the markers into an inlined copy: after inlining the loop may
+     * no longer satisfy a recognizer's preconditions (e.g. dot_i8 requires the
+     * array bases to be parameters), and the user never wrote that copy. */
+    if (source->op == IR_OP_NOP && source->text &&
+        strncmp(source->text, IR_SIMD_MARKER_PREFIX,
+                strlen(IR_SIMD_MARKER_PREFIX)) == 0) {
+      continue;
+    }
 
     if (source->op == IR_OP_RETURN) {
       if (source->lhs.kind != IR_OPERAND_NONE &&

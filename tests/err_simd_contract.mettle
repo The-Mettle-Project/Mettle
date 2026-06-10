@@ -1,0 +1,11 @@
+// `@simd!` vectorization contract, violated: the loop body contains a function
+// call, so no vectorizer can claim it and the hard contract is a compile error
+// (only fires under optimization, where vectorization runs).
+import "std/io";
+
+function main() -> int32 {
+  @simd! for i in 0..10 {
+    print_int(i);
+  }
+  return 0;
+}

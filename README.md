@@ -1,10 +1,34 @@
 
 
+<div align="center">
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/The-Mettle-Project/Mettle/development/mettle-syntax/icons/mettle-dark.svg" />
+  <img src="https://raw.githubusercontent.com/The-Mettle-Project/Mettle/development/mettle-syntax/icons/mettle-light.svg" alt="Mettle" width="120" height="120" />
+</picture>
+
 # Mettle
 
-A statically typed systems language that compiles to native x86-64.
+**A from-scratch systems language that compiles straight to native x86-64.**
 
-[GitHub](https://github.com/The-Mettle-Project/Mettle) | [Releases](https://github.com/The-Mettle-Project/Mettle/releases) | Language reference | Apache-2.0
+Its own backend and linker. An auto-vectorizer that beats `gcc -O3` on key kernels.
+A native NVIDIA GPU path. No LLVM, no VM, no managed runtime.
+
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+&nbsp;![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-2b6cb0.svg)
+&nbsp;![Codegen](https://img.shields.io/badge/codegen-native%20x86--64-2f855a.svg)
+&nbsp;![Dependencies](https://img.shields.io/badge/dependencies-no%20LLVM%20%C2%B7%20no%20VM-c53030.svg)
+&nbsp;![GPU](https://img.shields.io/badge/GPU-CUDA%20%2F%20PTX-805ad5.svg)
+
+[**Documentation**](docs/LANGUAGE.md)
+&nbsp;·&nbsp; [**Install**](#install)
+&nbsp;·&nbsp; [**Examples**](examples/)
+&nbsp;·&nbsp; [**GitHub**](https://github.com/The-Mettle-Project/Mettle)
+&nbsp;·&nbsp; [**Releases**](https://github.com/The-Mettle-Project/Mettle/releases)
+
+</div>
+
+---
 
 Mettle compiles `.mettle` source to native x86-64. On Windows, `mettle --build` produces a PE executable using a built-in linker. On Linux, it produces ELF and links with the system toolchain. There is no LLVM dependency, no VM, and no managed runtime.
 
@@ -13,6 +37,8 @@ Mettle compiles `.mettle` source to native x86-64. On Windows, `mettle --build` 
 - Static types, pointers, structs, and enums
 - Direct calls to C and OS APIs; a bundled stdlib for I/O, memory, math, and more
 - `defer` / `errdefer` for scope cleanup; compile errors with source snippets
+- Range-based `for` (`for i in 0..n`) and **`@simd` / `@simd!` vectorization contracts**: ask the optimizer to vectorize a loop, and with `@simd!` fail the build if it can't. An auto-vectorizer (AVX2) backs them, beating `gcc -O3` on several kernels; `--simd-report` shows what each loop became.
+- **GPU offload to NVIDIA** via a native CUDA/PTX backend: write `kernel` functions, launch them with `dispatch K[grid, block](args)`, no LLVM or `nvcc`. See [GPU offload](docs/gpu.md).
 - Optional Tracy profiling, runtime timing, and debug stack traces
 
 Windows is the most complete target (internal PE linker, Win32 GUI via `std/ui`). Linux supports builds, a libc-backed stdlib, and compiler development. See [known limitations](docs/known-limitations.md) for caveats.
@@ -73,7 +99,7 @@ Installs to `~/.mettle` (Linux) or `%LOCALAPPDATA%\Mettle` (Windows), updates us
 mettle --version
 ```
 
-Dev builds from source report `v0.9.2` unless `METTLE_VERSION_RAW` is set at compile time.
+Dev builds from source report `v0.9.3` unless `METTLE_VERSION_RAW` is set at compile time.
 
 ## Build from source
 
@@ -101,11 +127,13 @@ Typical release build:
 ./bin/mettle --build --release hello.mettle -o hello
 ```
 
-Useful flags: `--build` (executable), `--release` / `-O` (optimized), `--emit-asm` (legacy NASM path on Windows), `-d` / `-s` / `-g` (debug and stack traces), `--profile-runtime`, `--tracy`. Full list: `mettle --help` and `mettle help build`.
+Useful flags: `--build` (executable), `--release` / `-O` (optimized), `--emit-obj` (native object, the default), `-d` / `-s` / `-g` (debug and stack traces), `--profile-runtime`, `--tracy`, `--native-heap` (route `new`/`malloc`/`calloc`/`realloc`/`free` through Mettle's own allocator in `std/alloc` instead of the OS heap manager). Full list: `mettle --help` and `mettle help build`.
 
 ## Documentation
 
 - [Language reference](docs/LANGUAGE.md)
+- [Control flow](docs/control-flow.md) (range-`for`, `@simd` vectorization contracts)
+- [GPU offload](docs/gpu.md) (`kernel` / `dispatch`, CUDA/PTX backend)
 - [Compilation](docs/compilation.md) (CLI, link pipelines, Tracy, profiling)
 - [Imports](docs/imports.md)
 - [Runtime model](docs/runtime-model.md)

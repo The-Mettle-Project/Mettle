@@ -349,6 +349,15 @@ int code_generator_binary_emit_simd_affine_map_f64(
   }
   b = &context->code;
 
+  /* Identity-fold the affine coefficients when they are compile-time constants:
+   * b == 1 means the dst term is just +dst[i] (no scale), and c == 0 means no
+   * bias add. The common saxpy form `dst = a*src + dst` (b==1, c==0) then
+   * collapses to a single fused multiply-add per vector instead of mul+fma+add. */
+  int b_is_one = instruction->arguments[2].kind == IR_OPERAND_FLOAT &&
+                 instruction->arguments[2].float_value == 1.0;
+  int c_is_zero = instruction->arguments[3].kind == IR_OPERAND_FLOAT &&
+                  instruction->arguments[3].float_value == 0.0;
+
   /* rcx=src walk, rdx=dst walk, r9=src_end, r10=bytes remaining.
    * ymm4=a, ymm5=b, ymm3=c; ymm0/ymm1 are vector scratch. */
   if (!code_generator_binary_emit_operand_load(generator, context,
@@ -394,12 +403,28 @@ int code_generator_binary_emit_simd_affine_map_f64(
 
   if (!wcs_patch_here(b, j_vec) ||
       !wcs_avx_vmovups_ymm_mem(b, 0, BINARY_GP_RCX, 0) ||
-      !wcs_avx_vmovups_ymm_mem(b, 1, BINARY_GP_RDX, 0) ||
-      !wcs_avx_vmulpd_ymm(b, 0, 0, 4) ||
-      !wcs_avx_vfmadd231pd_ymm(b, 0, 5, 1) ||
-      !wcs_avx_vaddpd_ymm(b, 0, 0, 3) ||
-      !wcs_avx_vmovups_mem_ymm(b, BINARY_GP_RDX, 0, 0) ||
-      !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 32) ||
+      !wcs_avx_vmovups_ymm_mem(b, 1, BINARY_GP_RDX, 0)) {
+    return 0;
+  }
+  if (b_is_one && c_is_zero) {
+    /* dst += a*src (one fma into the dst vector). */
+    if (!wcs_avx_vfmadd231pd_ymm(b, 1, 0, 4) ||
+        !wcs_avx_vmovups_mem_ymm(b, BINARY_GP_RDX, 0, 1)) {
+      return 0;
+    }
+  } else {
+    if (!wcs_avx_vmulpd_ymm(b, 0, 0, 4) ||
+        !wcs_avx_vfmadd231pd_ymm(b, 0, 5, 1)) {
+      return 0;
+    }
+    if (!c_is_zero && !wcs_avx_vaddpd_ymm(b, 0, 0, 3)) {
+      return 0;
+    }
+    if (!wcs_avx_vmovups_mem_ymm(b, BINARY_GP_RDX, 0, 0)) {
+      return 0;
+    }
+  }
+  if (!wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 32) ||
       !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 32)) {
     return 0;
   }
@@ -412,12 +437,27 @@ int code_generator_binary_emit_simd_affine_map_f64(
 
   if (!wcs_patch_here(b, j_scalar) ||
       !wcs_movsd_xmm_mem(b, 0, BINARY_GP_RCX, 0) ||
-      !wcs_movsd_xmm_mem(b, 1, BINARY_GP_RDX, 0) ||
-      !binary_emit_mulsd_xmm_xmm(b, BINARY_XMM0, BINARY_XMM4) ||
-      !wcs_fmadd231sd(b, 0, 5, 1) ||
-      !binary_emit_addsd_xmm_xmm(b, BINARY_XMM0, BINARY_XMM3) ||
-      !wcs_movsd_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM0) ||
-      !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 8) ||
+      !wcs_movsd_xmm_mem(b, 1, BINARY_GP_RDX, 0)) {
+    return 0;
+  }
+  if (b_is_one && c_is_zero) {
+    if (!wcs_fmadd231sd(b, 1, 0, 4) ||
+        !wcs_movsd_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM1)) {
+      return 0;
+    }
+  } else {
+    if (!binary_emit_mulsd_xmm_xmm(b, BINARY_XMM0, BINARY_XMM4) ||
+        !wcs_fmadd231sd(b, 0, 5, 1)) {
+      return 0;
+    }
+    if (!c_is_zero && !binary_emit_addsd_xmm_xmm(b, BINARY_XMM0, BINARY_XMM3)) {
+      return 0;
+    }
+    if (!wcs_movsd_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM0)) {
+      return 0;
+    }
+  }
+  if (!wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 8) ||
       !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 8)) {
     return 0;
   }
@@ -448,6 +488,13 @@ int code_generator_binary_emit_simd_affine_map_f32(
     return 0;
   }
   b = &context->code;
+
+  /* See the f64 variant: fold b==1 (no dst scale) and c==0 (no bias); the saxpy
+   * form b==1,c==0 collapses mul+fma+add into a single fused multiply-add. */
+  int b_is_one = instruction->arguments[2].kind == IR_OPERAND_FLOAT &&
+                 instruction->arguments[2].float_value == 1.0;
+  int c_is_zero = instruction->arguments[3].kind == IR_OPERAND_FLOAT &&
+                  instruction->arguments[3].float_value == 0.0;
 
   if (!code_generator_binary_emit_operand_load(generator, context,
                                                &instruction->lhs,
@@ -492,12 +539,27 @@ int code_generator_binary_emit_simd_affine_map_f32(
 
   if (!wcs_patch_here(b, j_vec) ||
       !wcs_avx_vmovups_ymm_mem(b, 0, BINARY_GP_RCX, 0) ||
-      !wcs_avx_vmovups_ymm_mem(b, 1, BINARY_GP_RDX, 0) ||
-      !wcs_avx_vmulps_ymm(b, 0, 0, 4) ||
-      !wcs_avx_vfmadd231ps_ymm(b, 0, 5, 1) ||
-      !wcs_avx_vaddps_ymm(b, 0, 0, 3) ||
-      !wcs_avx_vmovups_mem_ymm(b, BINARY_GP_RDX, 0, 0) ||
-      !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 32) ||
+      !wcs_avx_vmovups_ymm_mem(b, 1, BINARY_GP_RDX, 0)) {
+    return 0;
+  }
+  if (b_is_one && c_is_zero) {
+    if (!wcs_avx_vfmadd231ps_ymm(b, 1, 0, 4) ||
+        !wcs_avx_vmovups_mem_ymm(b, BINARY_GP_RDX, 0, 1)) {
+      return 0;
+    }
+  } else {
+    if (!wcs_avx_vmulps_ymm(b, 0, 0, 4) ||
+        !wcs_avx_vfmadd231ps_ymm(b, 0, 5, 1)) {
+      return 0;
+    }
+    if (!c_is_zero && !wcs_avx_vaddps_ymm(b, 0, 0, 3)) {
+      return 0;
+    }
+    if (!wcs_avx_vmovups_mem_ymm(b, BINARY_GP_RDX, 0, 0)) {
+      return 0;
+    }
+  }
+  if (!wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 32) ||
       !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 32)) {
     return 0;
   }
@@ -510,12 +572,22 @@ int code_generator_binary_emit_simd_affine_map_f32(
 
   if (!wcs_patch_here(b, j_scalar) ||
       !wcs_movss_xmm_mem(b, 0, BINARY_GP_RCX, 0) ||
-      !wcs_movss_xmm_mem(b, 1, BINARY_GP_RDX, 0) ||
-      !binary_emit_mulss_xmm_xmm(b, BINARY_XMM0, BINARY_XMM4) ||
-      !wcs_fmadd231ss(b, 0, 5, 1) ||
-      !binary_emit_addss_xmm_xmm(b, BINARY_XMM0, BINARY_XMM3) ||
-      !wcs_movss_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM0) ||
-      !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 4) ||
+      !wcs_movss_xmm_mem(b, 1, BINARY_GP_RDX, 0)) {
+    return 0;
+  }
+  if (b_is_one && c_is_zero) {
+    if (!wcs_fmadd231ss(b, 1, 0, 4) ||
+        !wcs_movss_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM1)) {
+      return 0;
+    }
+  } else if (!binary_emit_mulss_xmm_xmm(b, BINARY_XMM0, BINARY_XMM4) ||
+             !wcs_fmadd231ss(b, 0, 5, 1) ||
+             (!c_is_zero &&
+              !binary_emit_addss_xmm_xmm(b, BINARY_XMM0, BINARY_XMM3)) ||
+             !wcs_movss_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM0)) {
+    return 0;
+  }
+  if (!wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 4) ||
       !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 4)) {
     return 0;
   }
@@ -530,11 +602,15 @@ int code_generator_binary_emit_simd_affine_map_f32(
 }
 
 /* General auto-vectorized loop kernel (IR_OP_SIMD_VLOOP_F64). Decodes the
- * serialized float64 body DAG (see the opcode doc in ir.h) and emits a packed
+ * serialized float body DAG (see the opcode doc in ir.h) and emits a packed
  * AVX2 loop + scalar remainder. A2: element-wise maps out[i] = DAG(a_k[i],
- * (float64)i, consts). Replays the DAG over f64x4 lanes via a stack-machine of
- * up to VLOOP_KERNEL_REGS ymm registers; constants are broadcast once to a stack
- * array and re-read; array bases walk by 32B (vector) / 8B (scalar). */
+ * (float)i, consts) and '+' reductions. The element width is carried in
+ * instruction->float_bits: 64 replays over f64x4 lanes (pd ops, 8B elements),
+ * 32 over f32x8 lanes (ps ops, 4B elements) — both walk array bases by 32B per
+ * vector iteration. The DAG is replayed via a stack-machine of up to
+ * VLOOP_KERNEL_REGS ymm registers; constants are broadcast once to a stack
+ * array and re-read. Maps are bit-identical to the scalar loop (each lane is an
+ * independent IEEE op); '+' reductions reassociate like the sum/dot kernels. */
 #define VLOOP_K_LOAD 0
 #define VLOOP_K_IOTA 1
 #define VLOOP_K_CONST 2
@@ -564,7 +640,16 @@ int code_generator_binary_emit_simd_vloop_f64(
     code_generator_set_error(generator, "Malformed simd_vloop_f64");
     return 0;
   }
+  if (instruction->float_bits != 32 && instruction->float_bits != 64) {
+    code_generator_set_error(generator, "simd_vloop bad float width");
+    return 0;
+  }
   b = &context->code;
+  /* f32 = single precision: f32x8 lanes (ps ops, 4-byte elements); otherwise
+   * f64x4 (pd ops, 8-byte elements). Both stride 32 bytes per vector iter. */
+  const int f32 = (instruction->float_bits == 32);
+  const int lanes = f32 ? 8 : 4;
+  const int elem_bytes = f32 ? 4 : 8;
 
   const IROperand *args = instruction->arguments;
   long long reduce_op = args[0].int_value;
@@ -657,11 +742,20 @@ int code_generator_binary_emit_simd_vloop_f64(
     return 0;
   }
 
-  /* Broadcast each constant once into its stack slot. */
+  /* Broadcast each constant once into its stack slot. For f32 the value is
+   * packed into both halves of a 64-bit word so the shared vbroadcastsd path
+   * yields 8 identical f32 lanes; the scalar tail's movss reads the low 4. */
   for (int c = 0; c < n_consts; c++) {
     double dv = args[consts_off + c].float_value;
     uint64_t bits = 0;
-    memcpy(&bits, &dv, sizeof(bits));
+    if (f32) {
+      float fv = (float)dv;
+      uint32_t fb = 0;
+      memcpy(&fb, &fv, sizeof(fb));
+      bits = (uint64_t)fb | ((uint64_t)fb << 32);
+    } else {
+      memcpy(&bits, &dv, sizeof(bits));
+    }
     if (!binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, bits) ||
         !binary_emit_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) ||
         !wcs_avx_vbroadcastsd_ymm_xmm(b, 0, 0) ||
@@ -669,32 +763,56 @@ int code_generator_binary_emit_simd_vloop_f64(
       return 0;
     }
   }
-  /* iota constant [0,1,2,3] in ymm5 (int32 lanes), if needed. */
+  /* iota constant in ymm5 (int32 lanes), if needed: [0,1,2,3] for f64 (only the
+   * low xmm feeds vcvtdq2pd), [0,1,2,3,4,5,6,7] for f32. */
   if (has_iota) {
-    if (!binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, 0x0000000100000000ULL) ||
-        !binary_emit_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) ||
-        !binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, 0x0000000300000002ULL) ||
-        !binary_emit_movq_xmm_reg(b, BINARY_XMM1, BINARY_GP_RAX) ||
-        !wcs_avx_vpunpcklqdq_xmm(b, IOTA_CONST, 0, 1)) {
+    if (f32) {
+      /* Build [0,1,2,3] in xmm0 and [4,5,6,7] in xmm1, then splice xmm1 into the
+       * high 128-bit lane via vperm2i128 (imm 0x20: dst.lo<-src1.lo,
+       * dst.hi<-src2.lo). The source ymms' high lanes are unread, so any prior
+       * garbage there is harmless. */
+      if (!binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, 0x0000000100000000ULL) ||
+          !binary_emit_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) ||
+          !binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, 0x0000000300000002ULL) ||
+          !binary_emit_movq_xmm_reg(b, BINARY_XMM2, BINARY_GP_RAX) ||
+          !wcs_avx_vpunpcklqdq_xmm(b, 0, 0, 2) ||
+          !binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, 0x0000000500000004ULL) ||
+          !binary_emit_movq_xmm_reg(b, BINARY_XMM1, BINARY_GP_RAX) ||
+          !binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, 0x0000000700000006ULL) ||
+          !binary_emit_movq_xmm_reg(b, BINARY_XMM2, BINARY_GP_RAX) ||
+          !wcs_avx_vpunpcklqdq_xmm(b, 1, 1, 2) ||
+          !wcs_avx_vperm2i128(b, IOTA_CONST, 0, 1, 0x20)) {
+        return 0;
+      }
+    } else if (!binary_emit_mov_reg_imm64(b, BINARY_GP_RAX,
+                                          0x0000000100000000ULL) ||
+               !binary_emit_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) ||
+               !binary_emit_mov_reg_imm64(b, BINARY_GP_RAX,
+                                          0x0000000300000002ULL) ||
+               !binary_emit_movq_xmm_reg(b, BINARY_XMM1, BINARY_GP_RAX) ||
+               !wcs_avx_vpunpcklqdq_xmm(b, IOTA_CONST, 0, 1)) {
       return 0;
     }
   }
 
-  /* Reduction: xmm3 = prior accumulator value, ymm2 = packed accumulator = 0. */
+  /* Reduction: xmm3 = prior accumulator value, ymm2 = packed accumulator = 0.
+   * f32 keeps the prior value in the low dword (movd); f64 the low qword. */
   if (is_reduce) {
     if (!code_generator_binary_emit_operand_load(generator, context,
                                                  &instruction->dest,
                                                  BINARY_GP_RAX) ||
-        !binary_emit_movq_xmm_reg(b, BINARY_XMM3, BINARY_GP_RAX) ||
+        !(f32 ? binary_emit_movd_xmm_reg(b, BINARY_XMM3, BINARY_GP_RAX)
+              : binary_emit_movq_xmm_reg(b, BINARY_XMM3, BINARY_GP_RAX)) ||
         !wcs_avx_vpxor_ymm(b, 2, 2, 2)) {
       return 0;
     }
   }
 
-  /* ---- vector loop: while (count >= 4) ---- */
+  /* ---- vector loop: while (count >= lanes) ---- */
   size_t vec_top = b->size;
   size_t j_tail = 0;
-  if (!wcs_cmp_reg_imm8(b, BINARY_GP_R10, 4) || !wcs_jcc(b, 0x82 /* jb */, &j_tail)) {
+  if (!wcs_cmp_reg_imm8(b, BINARY_GP_R10, lanes) ||
+      !wcs_jcc(b, 0x82 /* jb */, &j_tail)) {
     return 0;
   }
   {
@@ -720,10 +838,11 @@ int code_generator_binary_emit_simd_vloop_f64(
           ok = wcs_avx_vmovups_ymm_mem(b, R, arr_reg[op0], 0);
         } else if (tag == VLOOP_K_CONST) {
           ok = wcs_avx_vmovups_ymm_mem(b, R, BINARY_GP_RSP, 32 * op0);
-        } else { /* IOTA: R = (f64)[i, i+1, i+2, i+3] */
+        } else { /* IOTA: R = (float)[i, i+1, ...] over `lanes` lanes */
           ok = wcs_broadcast_i32_to_ymm(b, R, BINARY_GP_R11) &&
                wcs_avx_vpaddd_ymm(b, R, R, IOTA_CONST) &&
-               wcs_avx_vcvtdq2pd_ymm_xmm(b, R, R);
+               (f32 ? wcs_avx_vcvtdq2ps_ymm(b, R, R)
+                    : wcs_avx_vcvtdq2pd_ymm_xmm(b, R, R));
         }
         if (!ok) {
           return 0;
@@ -738,10 +857,22 @@ int code_generator_binary_emit_simd_vloop_f64(
         int ra = vstk[--nv];
         int ok = 0;
         switch (tag) {
-        case VLOOP_K_ADD: ok = wcs_avx_vaddpd_ymm(b, ra, ra, rb); break;
-        case VLOOP_K_SUB: ok = wcs_avx_vsubpd_ymm(b, ra, ra, rb); break;
-        case VLOOP_K_MUL: ok = wcs_avx_vmulpd_ymm(b, ra, ra, rb); break;
-        case VLOOP_K_DIV: ok = wcs_avx_vdivpd_ymm(b, ra, ra, rb); break;
+        case VLOOP_K_ADD:
+          ok = f32 ? wcs_avx_vaddps_ymm(b, ra, ra, rb)
+                   : wcs_avx_vaddpd_ymm(b, ra, ra, rb);
+          break;
+        case VLOOP_K_SUB:
+          ok = f32 ? wcs_avx_vsubps_ymm(b, ra, ra, rb)
+                   : wcs_avx_vsubpd_ymm(b, ra, ra, rb);
+          break;
+        case VLOOP_K_MUL:
+          ok = f32 ? wcs_avx_vmulps_ymm(b, ra, ra, rb)
+                   : wcs_avx_vmulpd_ymm(b, ra, ra, rb);
+          break;
+        case VLOOP_K_DIV:
+          ok = f32 ? wcs_avx_vdivps_ymm(b, ra, ra, rb)
+                   : wcs_avx_vdivpd_ymm(b, ra, ra, rb);
+          break;
         default: code_generator_set_error(generator, "vloop op"); return 0;
         }
         if (!ok) {
@@ -758,7 +889,8 @@ int code_generator_binary_emit_simd_vloop_f64(
       return 0;
     }
     if (is_reduce) {
-      if (!wcs_avx_vaddpd_ymm(b, 2, 2, vstk[0])) { /* acc += lanes */
+      if (!(f32 ? wcs_avx_vaddps_ymm(b, 2, 2, vstk[0]) /* acc += lanes */
+                : wcs_avx_vaddpd_ymm(b, 2, 2, vstk[0]))) {
         return 0;
       }
     } else if (!wcs_avx_vmovups_mem_ymm(b, dst_reg, 0, vstk[0])) {
@@ -770,10 +902,10 @@ int code_generator_binary_emit_simd_vloop_f64(
       return 0;
     }
   }
-  if (has_iota && !wcs_addsub_reg_imm8(b, BINARY_GP_R11, 0, 4)) {
+  if (has_iota && !wcs_addsub_reg_imm8(b, BINARY_GP_R11, 0, lanes)) {
     return 0;
   }
-  if (!wcs_addsub_reg_imm8(b, BINARY_GP_R10, 1, 4)) {
+  if (!wcs_addsub_reg_imm8(b, BINARY_GP_R10, 1, lanes)) {
     return 0;
   }
   {
@@ -807,12 +939,16 @@ int code_generator_binary_emit_simd_vloop_f64(
         int R = pool[--nfree];
         int ok = 0;
         if (tag == VLOOP_K_LOAD) {
-          ok = wcs_movsd_xmm_mem(b, R, arr_reg[op0], 0);
+          ok = f32 ? wcs_movss_xmm_mem(b, R, arr_reg[op0], 0)
+                   : wcs_movsd_xmm_mem(b, R, arr_reg[op0], 0);
         } else if (tag == VLOOP_K_CONST) {
-          ok = wcs_movsd_xmm_mem(b, R, BINARY_GP_RSP, 32 * op0);
-        } else { /* IOTA scalar: (f64)i */
-          ok = binary_emit_cvtsi2sd_xmm_reg(b, (BinaryXmmRegister)R,
-                                            BINARY_GP_R11);
+          ok = f32 ? wcs_movss_xmm_mem(b, R, BINARY_GP_RSP, 32 * op0)
+                   : wcs_movsd_xmm_mem(b, R, BINARY_GP_RSP, 32 * op0);
+        } else { /* IOTA scalar: (float)i */
+          ok = f32 ? binary_emit_cvtsi2ss_xmm_reg(b, (BinaryXmmRegister)R,
+                                                  BINARY_GP_R11)
+                   : binary_emit_cvtsi2sd_xmm_reg(b, (BinaryXmmRegister)R,
+                                                  BINARY_GP_R11);
         }
         if (!ok) {
           return 0;
@@ -822,22 +958,24 @@ int code_generator_binary_emit_simd_vloop_f64(
         int rb = vstk[--nv];
         int ra = vstk[--nv];
         int ok = 0;
+        BinaryXmmRegister A = (BinaryXmmRegister)ra;
+        BinaryXmmRegister B = (BinaryXmmRegister)rb;
         switch (tag) {
         case VLOOP_K_ADD:
-          ok = binary_emit_addsd_xmm_xmm(b, (BinaryXmmRegister)ra,
-                                         (BinaryXmmRegister)rb);
+          ok = f32 ? binary_emit_addss_xmm_xmm(b, A, B)
+                   : binary_emit_addsd_xmm_xmm(b, A, B);
           break;
         case VLOOP_K_SUB:
-          ok = binary_emit_subsd_xmm_xmm(b, (BinaryXmmRegister)ra,
-                                         (BinaryXmmRegister)rb);
+          ok = f32 ? binary_emit_subss_xmm_xmm(b, A, B)
+                   : binary_emit_subsd_xmm_xmm(b, A, B);
           break;
         case VLOOP_K_MUL:
-          ok = binary_emit_mulsd_xmm_xmm(b, (BinaryXmmRegister)ra,
-                                         (BinaryXmmRegister)rb);
+          ok = f32 ? binary_emit_mulss_xmm_xmm(b, A, B)
+                   : binary_emit_mulsd_xmm_xmm(b, A, B);
           break;
         case VLOOP_K_DIV:
-          ok = binary_emit_divsd_xmm_xmm(b, (BinaryXmmRegister)ra,
-                                         (BinaryXmmRegister)rb);
+          ok = f32 ? binary_emit_divss_xmm_xmm(b, A, B)
+                   : binary_emit_divsd_xmm_xmm(b, A, B);
           break;
         default: return 0;
         }
@@ -849,15 +987,19 @@ int code_generator_binary_emit_simd_vloop_f64(
       }
     }
     if (is_reduce) {
-      if (!binary_emit_addsd_xmm_xmm(b, BINARY_XMM3, (BinaryXmmRegister)vstk[0])) {
+      if (!(f32 ? binary_emit_addss_xmm_xmm(b, BINARY_XMM3,
+                                            (BinaryXmmRegister)vstk[0])
+                : binary_emit_addsd_xmm_xmm(b, BINARY_XMM3,
+                                            (BinaryXmmRegister)vstk[0]))) {
         return 0;
       }
-    } else if (!wcs_movsd_mem_xmm(b, dst_reg, 0, vstk[0])) {
+    } else if (!(f32 ? wcs_movss_mem_xmm(b, dst_reg, 0, vstk[0])
+                     : wcs_movsd_mem_xmm(b, dst_reg, 0, vstk[0]))) {
       return 0;
     }
   }
   for (int j = 0; j < n_dist; j++) {
-    if (!wcs_addsub_reg_imm8(b, kGp[j], 0, 8)) {
+    if (!wcs_addsub_reg_imm8(b, kGp[j], 0, elem_bytes)) {
       return 0;
     }
   }
@@ -878,11 +1020,11 @@ int code_generator_binary_emit_simd_vloop_f64(
     return 0;
   }
   if (is_reduce) {
-    /* Fold ymm2 + xmm3 -> RAX (a double's bits) and store to the accumulator.
-     * wcs_reduce_pd_acc_to_rax does its own vextractf128 + vzeroupper, so it
+    /* Fold ymm2 + xmm3 -> RAX (the float's bits) and store to the accumulator.
+     * wcs_reduce_p{d,s}_acc_to_rax does its own vextractf128 + vzeroupper, so it
      * MUST run before any standalone vzeroupper (which would zero ymm2's upper
-     * lanes and drop two accumulator lanes). */
-    if (!wcs_reduce_pd_acc_to_rax(b)) {
+     * lanes and drop accumulator lanes). */
+    if (!(f32 ? wcs_reduce_ps_acc_to_rax(b) : wcs_reduce_pd_acc_to_rax(b))) {
       return 0;
     }
     if (cbytes && !binary_emit_add_rsp_imm32(b, cbytes)) {
@@ -1584,4 +1726,225 @@ int code_generator_binary_emit_simd_dot_f32(
   return code_generator_binary_emit_destination_store(generator, context,
                                                       &instruction->dest,
                                                       BINARY_GP_RAX);
+}
+
+/* ===================== vectorized exp() (float32) ========================= */
+/* AVX2 Cephes single-precision exp, 8 lanes at a time. exp(x) = 2^k * exp(r)
+ * with k = floor(x/ln2 + 0.5) and r = x - k*ln2 reduced into a small interval,
+ * exp(r) a degree-6 polynomial. Constants are broadcast on demand from a GP
+ * register (VEX vmovd + vpbroadcastd) so the kernel touches only the Win64
+ * volatile xmm0..5, with no callee-saved vector registers to preserve. The
+ * scalar exp_f32 the recognizer matches uses the identical polynomial, so the
+ * vectorized result tracks it (validated within tolerance and against libm). */
+
+static uint32_t exp_f32_bits(float f) {
+  uint32_t u;
+  memcpy(&u, &f, 4);
+  return u;
+}
+
+/* Constant pool laid out at [rsp + EXP_POOL_OFF]; 14 float32 slots. The kernel
+ * fills it once, and exp_compute broadcasts each constant from there per use
+ * (vbroadcastss, a single L1 op) -- far cheaper than re-materializing constants
+ * through a GP register every iteration, and it leaves the callee-saved vector
+ * registers untouched. */
+#define EXP_POOL_OFF 32
+#define EXP_C(i) (EXP_POOL_OFF + (i) * 4)
+/* slot 0=clamp_hi 1=clamp_lo 2=LOG2EF 3=0.5 4=ln2_hi 5=ln2_lo 6..11=p0..p5
+ * 12=1.0 13=127(int). */
+static const float exp_pool_consts[13] = {
+    88.3762626647949f,    -88.3762626647949f,  1.44269504088896341f,
+    0.5f,                 0.693359375f,        -2.12194440e-4f,
+    1.9875691500E-4f,     1.3981999507E-3f,    8.3334519073E-3f,
+    4.1665795894E-2f,     1.6666665459E-1f,    5.0000001201E-1f,
+    1.0f};
+
+/* x in ymm0 -> exp(x) in ymm2. Constants from the [rsp] pool. Clobbers
+ * ymm0..5 (RAX is untouched). */
+static int exp_compute(BinaryCodeBuffer *b) {
+  if (!wcs_avx_vbroadcastss_ymm_mem(b, 4, BINARY_GP_RSP, EXP_C(0)) ||
+      !wcs_avx_vminps_ymm(b, 0, 0, 4) ||
+      !wcs_avx_vbroadcastss_ymm_mem(b, 4, BINARY_GP_RSP, EXP_C(1)) ||
+      !wcs_avx_vmaxps_ymm(b, 0, 0, 4)) {
+    return 0;
+  }
+  /* fx = floor(x * LOG2EF + 0.5) */
+  if (!wcs_avx_vbroadcastss_ymm_mem(b, 1, BINARY_GP_RSP, EXP_C(2)) ||
+      !wcs_avx_vmulps_ymm(b, 1, 0, 1) ||
+      !wcs_avx_vbroadcastss_ymm_mem(b, 4, BINARY_GP_RSP, EXP_C(3)) ||
+      !wcs_avx_vaddps_ymm(b, 1, 1, 4) ||
+      !wcs_avx_vroundps_ymm(b, 1, 1, 1 /* floor */)) {
+    return 0;
+  }
+  /* r = x - fx*ln2_hi - fx*ln2_lo  (Cody-Waite split) */
+  if (!wcs_avx_vbroadcastss_ymm_mem(b, 4, BINARY_GP_RSP, EXP_C(4)) ||
+      !wcs_avx_vmulps_ymm(b, 5, 1, 4) || !wcs_avx_vsubps_ymm(b, 0, 0, 5) ||
+      !wcs_avx_vbroadcastss_ymm_mem(b, 4, BINARY_GP_RSP, EXP_C(5)) ||
+      !wcs_avx_vmulps_ymm(b, 5, 1, 4) || !wcs_avx_vsubps_ymm(b, 0, 0, 5)) {
+    return 0;
+  }
+  /* Horner: y = ((((p0*r+p1)*r+p2)*r+p3)*r+p4)*r+p5 */
+  if (!wcs_avx_vbroadcastss_ymm_mem(b, 2, BINARY_GP_RSP, EXP_C(6)) ||
+      !wcs_avx_vmulps_ymm(b, 2, 2, 0) ||
+      !wcs_avx_vbroadcastss_ymm_mem(b, 4, BINARY_GP_RSP, EXP_C(7)) ||
+      !wcs_avx_vaddps_ymm(b, 2, 2, 4)) {
+    return 0;
+  }
+  for (int i = 8; i <= 11; i++) {
+    if (!wcs_avx_vmulps_ymm(b, 2, 2, 0) ||
+        !wcs_avx_vbroadcastss_ymm_mem(b, 4, BINARY_GP_RSP, EXP_C(i)) ||
+        !wcs_avx_vaddps_ymm(b, 2, 2, 4)) {
+      return 0;
+    }
+  }
+  /* y = y*r*r + r + 1 */
+  if (!wcs_avx_vmulps_ymm(b, 3, 0, 0) || !wcs_avx_vmulps_ymm(b, 2, 2, 3) ||
+      !wcs_avx_vaddps_ymm(b, 2, 2, 0) ||
+      !wcs_avx_vbroadcastss_ymm_mem(b, 4, BINARY_GP_RSP, EXP_C(12)) ||
+      !wcs_avx_vaddps_ymm(b, 2, 2, 4)) {
+    return 0;
+  }
+  /* 2^fx via ((int)fx + 127) << 23 reinterpreted as float; y *= 2^fx */
+  if (!wcs_avx_vcvttps2dq_ymm(b, 1, 1) ||
+      !wcs_avx_vbroadcastss_ymm_mem(b, 4, BINARY_GP_RSP, EXP_C(13)) ||
+      !wcs_avx_vpaddd_ymm(b, 1, 1, 4) || !wcs_avx_vpslld_ymm_imm(b, 1, 1, 23) ||
+      !wcs_avx_vmulps_ymm(b, 2, 2, 1)) {
+    return 0;
+  }
+  return 1;
+}
+
+/* Fill the [rsp + EXP_POOL_OFF] constant pool (called once after the kernel's
+ * stack reservation). */
+static int exp_fill_pool(BinaryCodeBuffer *b) {
+  for (int i = 0; i < 14; i++) {
+    uint32_t bits = (i == 13) ? 127u : exp_f32_bits(exp_pool_consts[i]);
+    if (!binary_emit_mov_reg_imm32_zero_extend(b, BINARY_GP_RAX, bits) ||
+        !binary_emit_mov_mem_reg32(b, BINARY_GP_RSP, EXP_C(i), BINARY_GP_RAX)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+/* IR_OP_SIMD_EXP_F32: in-place a[i] = exp(a[i]) over a float32 array.
+ * dest = array base, arguments[0] = element count. */
+int code_generator_binary_emit_simd_exp_f32(CodeGenerator *generator,
+                                            BinaryFunctionContext *context,
+                                            const IRInstruction *instruction) {
+  BinaryCodeBuffer *b = NULL;
+  size_t loop_top = 0, done_main = 0, small = 0, fin = 0, noclamp = 0;
+  if (!generator || !context || !instruction ||
+      instruction->argument_count < 1 || !instruction->arguments) {
+    code_generator_set_error(generator, "Malformed simd_exp_f32");
+    return 0;
+  }
+  b = &context->code;
+
+  if (!code_generator_binary_emit_operand_load(generator, context,
+                                               &instruction->dest,
+                                               BINARY_GP_RCX) ||
+      !code_generator_binary_emit_operand_load(generator, context,
+                                               &instruction->arguments[0],
+                                               BINARY_GP_R8) ||
+      !binary_emit_mov_reg_reg(b, BINARY_GP_R9, BINARY_GP_R8) ||
+      !binary_emit_shift_reg_imm8(b, 4, BINARY_GP_R9, 2) ||
+      !wcs_add_reg_reg64(b, BINARY_GP_R9, BINARY_GP_RCX)) {
+    return 0;
+  }
+  /* Reserve 96 bytes once: [rsp+0..31] = the n<8 scratch buffer, [rsp+32..87] =
+   * the constant pool. rsp stays put for the whole kernel (no calls), so both
+   * the pool and the buffer are at fixed offsets. R9 (end) is a heap pointer,
+   * unaffected by the stack reservation. */
+  if (!binary_emit_sub_rsp_imm32(b, 96) || !exp_fill_pool(b)) {
+    return 0;
+  }
+  if (!wcs_cmp_reg_imm32(b, BINARY_GP_R8, 8) ||
+      !wcs_jcc(b, 0x82 /* jb */, &small)) {
+    return 0;
+  }
+  /* R9 = last8 = end - 32; 8-wide loop overlapping the final vector. */
+  if (!wcs_addsub_reg_imm8(b, BINARY_GP_R9, 1 /* sub */, 32)) {
+    return 0;
+  }
+  loop_top = b->size;
+  if (!wcs_avx_vmovups_ymm_mem(b, 0, BINARY_GP_RCX, 0) || !exp_compute(b) ||
+      !wcs_avx_vmovups_mem_ymm(b, BINARY_GP_RCX, 0, 2) ||
+      !binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9) ||
+      !wcs_jcc(b, 0x83 /* jae */, &done_main) ||
+      !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 32) ||
+      !binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9) ||
+      !wcs_jcc(b, 0x86 /* jbe */, &noclamp) ||
+      !binary_emit_mov_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9)) {
+    return 0;
+  }
+  if (!wcs_patch_here(b, noclamp)) {
+    return 0;
+  }
+  {
+    size_t jb = 0;
+    if (!wcs_jcc(b, 0, &jb) || !wcs_patch_to(b, jb, loop_top)) {
+      return 0;
+    }
+  }
+  if (!wcs_patch_here(b, done_main) || !wcs_jcc(b, 0, &fin)) {
+    return 0;
+  }
+
+  /* n < 8: copy n floats into the [rsp+0] scratch buffer (already reserved),
+   * exp it 8-wide, copy the n results back. R9 saves the base; RCX/R10/R11/RAX
+   * are scratch. */
+  if (!wcs_patch_here(b, small) ||
+      !binary_emit_mov_reg_reg(b, BINARY_GP_R9, BINARY_GP_RCX) ||
+      !binary_emit_mov_reg_reg(b, BINARY_GP_R11, BINARY_GP_RSP) ||
+      !binary_emit_mov_reg_reg(b, BINARY_GP_R10, BINARY_GP_R8)) {
+    return 0;
+  }
+  {
+    size_t ci = b->size, di = 0;
+    if (!binary_emit_test_reg_reg(b, BINARY_GP_R10) ||
+        !wcs_jcc(b, 0x84 /* jz */, &di) ||
+        !binary_emit_mov_reg_mem32(b, BINARY_GP_RAX, BINARY_GP_RCX, 0) ||
+        !binary_emit_mov_mem_reg32(b, BINARY_GP_R11, 0, BINARY_GP_RAX) ||
+        !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 4) ||
+        !wcs_addsub_reg_imm8(b, BINARY_GP_R11, 0, 4) ||
+        !binary_emit_sub_reg_imm32(b, BINARY_GP_R10, 1)) {
+      return 0;
+    }
+    size_t jb = 0;
+    if (!wcs_jcc(b, 0, &jb) || !wcs_patch_to(b, jb, ci) ||
+        !wcs_patch_here(b, di)) {
+      return 0;
+    }
+  }
+  if (!wcs_avx_vmovups_ymm_mem(b, 0, BINARY_GP_RSP, 0) || !exp_compute(b) ||
+      !wcs_avx_vmovups_mem_ymm(b, BINARY_GP_RSP, 0, 2) ||
+      !binary_emit_mov_reg_reg(b, BINARY_GP_R11, BINARY_GP_RSP) ||
+      !binary_emit_mov_reg_reg(b, BINARY_GP_R10, BINARY_GP_R8)) {
+    return 0;
+  }
+  {
+    size_t co = b->size, dout = 0;
+    if (!binary_emit_test_reg_reg(b, BINARY_GP_R10) ||
+        !wcs_jcc(b, 0x84 /* jz */, &dout) ||
+        !binary_emit_mov_reg_mem32(b, BINARY_GP_RAX, BINARY_GP_R11, 0) ||
+        !binary_emit_mov_mem_reg32(b, BINARY_GP_R9, 0, BINARY_GP_RAX) ||
+        !wcs_addsub_reg_imm8(b, BINARY_GP_R9, 0, 4) ||
+        !wcs_addsub_reg_imm8(b, BINARY_GP_R11, 0, 4) ||
+        !binary_emit_sub_reg_imm32(b, BINARY_GP_R10, 1)) {
+      return 0;
+    }
+    size_t jb = 0;
+    if (!wcs_jcc(b, 0, &jb) || !wcs_patch_to(b, jb, co) ||
+        !wcs_patch_here(b, dout)) {
+      return 0;
+    }
+  }
+  if (!wcs_patch_here(b, fin)) {
+    return 0;
+  }
+  if (!binary_emit_add_rsp_imm32(b, 96)) {
+    return 0;
+  }
+  return wcs_avx_vzeroupper(b);
 }

@@ -16,6 +16,13 @@ typedef struct {
   ErrorReporter *error_reporter;
   int error_recovery_mode;
   const char *source_filename;
+  /* Set when compiling for the GPU (--emit-ptx). Enables the kernel index
+   * built-ins (thread/block/block_dim/grid_dim member access on x/y/z) to
+   * desugar to the gpu_* intrinsics. Off for normal CPU compiles, so member
+   * access on an ordinary struct named e.g. `block` is unaffected. */
+  int gpu_mode;
+  /* Monotonic id for synthesizing unique local names in `dispatch` desugaring. */
+  int dispatch_counter;
 } Parser;
 
 // Function declarations

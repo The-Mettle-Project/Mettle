@@ -54,7 +54,7 @@ static const IROptNamedPass g_ir_pre_inline_passes[] = {
     {"prefix_sum_i32", ir_prefix_sum_i32_pass},
     {"induction_pointer", ir_pointer_induction_pass},
     {"simd_dot_i32", ir_simd_dot_i32_pass},
-    {"memcmp_byte_loop", ir_memcmp_byte_loop_pass},
+    {"simd_dot_i8", ir_simd_dot_i8_pass},
     {"simd_insertion_sort_i32", ir_simd_insertion_sort_i32_pass},
     {"simd_minmax_i32", ir_simd_minmax_i32_pass},
     {"lower_bound_i32", ir_lower_bound_i32_pass},
@@ -66,6 +66,7 @@ static const IROptNamedPass g_ir_post_fixpoint_passes[] = {
     {"prefix_sum_i32", ir_prefix_sum_i32_pass},
     {"simd_minmax_i32", ir_simd_minmax_i32_pass},
     {"simd_affine_map_float", ir_simd_affine_map_float_pass},
+    {"simd_exp_f32", ir_simd_exp_f32_pass},
     {"simd_i2f_reduce", ir_simd_i2f_reduce_pass},
     {"simd_dot_float", ir_simd_dot_float_pass},
     {"simd_sum_float", ir_simd_sum_float_pass},
@@ -74,8 +75,10 @@ static const IROptNamedPass g_ir_post_fixpoint_passes[] = {
     {"simd_memory_map", ir_simd_memory_map_pass},
     {"lower_bound_i32", ir_lower_bound_i32_pass},
     {"detect_shift_loops", ir_detect_shift_loops_pass},
-    {"memcmp_byte_loop", ir_memcmp_byte_loop_pass},
     {"eliminate_congruent_ivs", ir_eliminate_congruent_ivs_pass},
+    /* After congruent-IV merge so parallel lane indices appear as base+J. */
+    {"simd_slp_mac_i32", ir_simd_slp_mac_i32_pass},
+    {"simd_slp_mac_i8", ir_simd_slp_mac_i8_pass},
 };
 
 static const IROptNamedStage g_ir_pre_inline_stage = {
@@ -166,6 +169,8 @@ static const IROptScheduledPass g_ir_fixpoint_passes[] = {
     IR_OPT_PASS_WHEN_ALL(SIMD_BYTE_MAP, ir_simd_byte_map_pass,
                          IR_OPT_LABEL_JUMP | IR_OPT_FEATURE_LOAD),
     IR_OPT_PASS_WHEN_ALL(SIMD_DOT_I32, ir_simd_dot_i32_pass,
+                         IR_OPT_LABEL_JUMP | IR_OPT_FEATURE_LOAD),
+    IR_OPT_PASS_WHEN_ALL(SIMD_DOT_I8, ir_simd_dot_i8_pass,
                          IR_OPT_LABEL_JUMP | IR_OPT_FEATURE_LOAD),
     IR_OPT_PASS_WHEN_ALL(SIMD_INSERTION_SORT_I32,
                          ir_simd_insertion_sort_i32_pass,
@@ -307,6 +312,12 @@ int ir_optimize_function_pipeline(IRFunction *function) {
     return 0;
   }
 
+  /* Enforce `@simd` contracts now that every vectorizer has had its chance,
+   * then strip the markers before CFG rebuild / codegen. */
+  if (!ir_verify_simd_contracts(function)) {
+    return 0;
+  }
+
   return ir_function_rebuild_cfg(function);
 }
 
@@ -335,6 +346,8 @@ int ir_optimize_program_pipeline(IRProgram *program,
     return 0;
   }
 
+  ir_optimize_reset_user_error();
+  ir_optimize_set_simd_report(options && options->simd_report);
   ir_function_index_reset();
 
   if (!ir_run_program_stage_for_each_function(
@@ -343,7 +356,8 @@ int ir_optimize_program_pipeline(IRProgram *program,
     return 0;
   }
 
-  if (!options || !options->preserve_function_boundaries) {
+  if ((!options || !options->preserve_function_boundaries) &&
+      !ir_pass_name_is_skipped("inline_small_functions")) {
     int inlining_changed = 0;
     mettle_compiler_ctx_set_pass_name("inline_small_functions");
     mettle_compiler_ctx_set_fixpoint_iteration(0);
@@ -352,9 +366,25 @@ int ir_optimize_program_pipeline(IRProgram *program,
     }
   }
 
+  /* `@pure` loop-invariant call hoisting. Program-level (resolves callees by
+   * name) and run after inlining so an inlined pure body is hoisted as ordinary
+   * loop-invariant code; the per-function fixpoint below then cleans up. */
+  if (!ir_pass_name_is_skipped("hoist_pure_calls")) {
+    int pure_licm_changed = 0;
+    mettle_compiler_ctx_set_pass_name("hoist_pure_calls");
+    mettle_compiler_ctx_set_fixpoint_iteration(0);
+    if (!ir_hoist_pure_calls_pass(program, &pure_licm_changed)) {
+      mettle_compiler_ice("IR optimization pure-call hoisting pass failed");
+    }
+  }
+
   if (!ir_run_program_stage_for_each_function(
           program, ir_optimize_function_pipeline)) {
-    mettle_compiler_ice_report("IR optimization failed", NULL);
+    /* A violated `@simd!` contract already printed a user diagnostic; don't
+     * dress it up as an internal compiler error. */
+    if (!ir_optimize_had_user_error()) {
+      mettle_compiler_ice_report("IR optimization failed", NULL);
+    }
     ir_function_index_reset();
     return 0;
   }

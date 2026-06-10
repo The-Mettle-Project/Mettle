@@ -24,9 +24,10 @@ typedef struct {
   const char *output_filename;
   int debug_mode;
   int dump_ir;
+  int emit_ptx; /* --emit-ptx: lower every function to a PTX .entry, no object */
   int optimize;
   int release;
-  int strip_asm_comments;
+  int simd_report; /* --simd-report: note what each `@simd` loop became */
   int emit_object;
   int generate_debug_symbols;
   int generate_line_mapping;
@@ -41,6 +42,7 @@ typedef struct {
   int profile;
   int profile_runtime;
   int profile_runtime_ops;
+  int native_heap;
   int tracy;
   int static_link;
   int musl_link;

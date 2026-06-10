@@ -47,7 +47,9 @@ Vector3
 
 The following words are reserved and cannot be used as identifiers.
 
-Declarations: `import`, `extern`, `export`, `var`, `function`, `fn`, `struct`, `enum`, `method`. Control flow: `if`, `else`, `while`, `for`, `switch`, `case`, `default`, `break`, `continue`, `return`. Other: `asm`, `this`, `new`. Types: `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float32`, `float64`, `string`.
+Declarations: `import`, `extern`, `export`, `var`, `function`, `fn`, `kernel`, `struct`, `enum`, `method`. Control flow: `if`, `else`, `while`, `for`, `switch`, `case`, `default`, `break`, `continue`, `return`, `dispatch`. Other: `asm`, `this`, `new`. Types: `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float32`, `float64`, `string`.
+
+`kernel` declares a GPU entry point (parses like `function`; emitted as PTX under `--emit-ptx`) and `dispatch` launches one; see [GPU Offload](gpu.md). `in` (used in range-based `for i in lo..hi`) is a *contextual* keyword: it is only special in that position and remains usable as an ordinary identifier elsewhere.
 
 `this` is only valid inside method bodies; it refers to the receiver. Using `this` as a variable name outside a method produces an error. `new` is an expression keyword, not a statement keyword; it appears in expressions like `var p: T* = new T` and cannot start a statement by itself. `cstring` is a type alias, not a keyword; it is available as a built-in name.
 
@@ -71,7 +73,7 @@ Multiline strings are supported. A newline inside the quotes is stored as a lite
 
 ## Operators and Punctuation
 
-Assignment `=`. Compound assignment `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`. Comparison `==`, `!=`, `<`, `>`, `<=`, `>=`. Logical `&&`, `||`. Arithmetic `+`, `-`, `*`, `/`, `%`. Unary `-` (negation), `*` (dereference), `&` (address-of). Member access `.`. Arrow `->`. Brackets `( )`, `{ }`, `[ ]`. Delimiters `:`, `;`, `,`.
+Assignment `=`. Compound assignment `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`. Comparison `==`, `!=`, `<`, `>`, `<=`, `>=`. Logical `&&`, `||`. Arithmetic `+`, `-`, `*`, `/`, `%`. Unary `-` (negation), `*` (dereference), `&` (address-of). Member access `.`. Arrow `->`. Range `..` (exclusive) and `..=` (inclusive), used in `for i in lo..hi`. Brackets `( )`, `{ }`, `[ ]`. Delimiters `:`, `;`, `,`. The `@` sigil introduces a loop attribute (`@simd` / `@simd!`); see [Control Flow](control-flow.md#vectorization-contracts).
 
 **Compound assignment:** `target OP= value` is exact syntactic sugar for `target = target OP value`, where `OP` is one of `+ - * / % & | ^ << >>`. The target is evaluated as an ordinary assignment target (identifier, struct field, array element, or pointer dereference) and must be a valid lvalue. For example, `count += 1` is identical to `count = count + 1`, and `mask &= 0xFF` is identical to `mask = mask & 0xFF`. Compound assignment is a statement (also valid as a `for`-loop initializer or increment), not an expression, so it does not produce a value. See [Expressions](expressions.md).
 

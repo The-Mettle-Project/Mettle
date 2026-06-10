@@ -5,6 +5,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* An unsigned integer type (uint8/16/32/64). Drives DIV vs IDIV and SHR vs SAR
+ * in the fallback expression-chain emitters, which must match the signedness
+ * choice binary_emit_binary_integer makes. NULL/pointer/float/signed -> 0. */
+static int binary_type_is_unsigned_integer(const Type *type) {
+  return type && (type->kind == TYPE_UINT8 || type->kind == TYPE_UINT16 ||
+                  type->kind == TYPE_UINT32 || type->kind == TYPE_UINT64);
+}
+
 int code_generator_binary_is_compare_operator(const char *op) {
   return op &&
          (strcmp(op, "==") == 0 || strcmp(op, "!=") == 0 ||
@@ -684,11 +692,27 @@ int code_generator_binary_emit_integer_binary_to_rax(
   }
 
   op = instruction->text;
+
+  /* Signedness of the left operand drives div/mod (DIV vs IDIV), right shift
+   * (SHR vs SAR), and the constant power-of-two divide trick. This chain
+   * emitter is the fallback (non-MIR) path; it must make the SAME signedness
+   * choice as binary_emit_binary_integer or an unsigned value used here (e.g. a
+   * uint32 local in a large function that bailed MIR) silently miscompiles to
+   * signed arithmetic. */
+  Type *lhs_type = code_generator_binary_get_operand_type_in_context(
+      generator, context, &instruction->lhs);
+  int lhs_unsigned = binary_type_is_unsigned_integer(lhs_type);
+
   if ((strcmp(op, "/") == 0 || strcmp(op, "%") == 0) &&
       instruction->rhs.kind == IR_OPERAND_INT) {
     unsigned int shift = 0;
     unsigned long long mask = 0;
-    if (code_generator_binary_extract_positive_power_of_two(
+    /* The power-of-two fast path below is the SIGNED truncation-toward-zero
+     * sequence (sign-bias + SAR). An unsigned dividend instead falls through to
+     * the unsigned magic path, which divides a power of two with a plain
+     * logical shift. */
+    if (!lhs_unsigned &&
+        code_generator_binary_extract_positive_power_of_two(
             instruction->rhs.int_value, &shift, &mask)) {
       if (!code_generator_binary_emit_operand_load(generator, context,
                                                    &instruction->lhs,
@@ -752,19 +776,13 @@ int code_generator_binary_emit_integer_binary_to_rax(
       return 1;
     }
 
-    /* Signedness of the division is the dividend's type. The signed magic and
-     * the unsigned magic are distinct algorithms; picking the wrong one
-     * silently miscompiles high-bit-set values, so only take the unsigned path
-     * when the dividend type is provably unsigned. A divisor that fits in a
-     * signed 64-bit value is required for the unsigned multiplier math here. */
-    Type *dividend_type = code_generator_binary_get_operand_type_in_context(
-        generator, context, &instruction->lhs);
-    int dividend_unsigned =
-        dividend_type &&
-        (dividend_type->kind == TYPE_UINT8 ||
-         dividend_type->kind == TYPE_UINT16 ||
-         dividend_type->kind == TYPE_UINT32 ||
-         dividend_type->kind == TYPE_UINT64);
+    /* Signedness of the division is the dividend's type (resolved once as
+     * lhs_unsigned above). The signed magic and the unsigned magic are distinct
+     * algorithms; picking the wrong one silently miscompiles high-bit-set
+     * values, so only take the unsigned path when the dividend type is provably
+     * unsigned. A divisor that fits in a signed 64-bit value is required for the
+     * unsigned multiplier math here. */
+    int dividend_unsigned = lhs_unsigned;
 
     int handled = 0;
     if (!code_generator_binary_emit_operand_load(generator, context,
@@ -856,8 +874,11 @@ int code_generator_binary_emit_integer_binary_to_rax(
       return binary_emit_xor_reg_imm32(&context->code, BINARY_GP_RAX,
                                        (uint32_t)(int32_t)immediate);
     }
+    /* Right shift is SHR (logical) for an unsigned left operand, SAR
+     * (arithmetic) for a signed one; left shift is the same either way. */
     return binary_emit_shift_reg_imm8(
-        &context->code, strcmp(op, "<<") == 0 ? 4 : 7, BINARY_GP_RAX,
+        &context->code,
+        strcmp(op, "<<") == 0 ? 4 : (lhs_unsigned ? 5 : 7), BINARY_GP_RAX,
         (unsigned char)immediate);
   }
 
@@ -930,8 +951,13 @@ int code_generator_binary_emit_integer_binary_to_rax(
                                     BINARY_GP_R10);
   }
   if (strcmp(op, "/") == 0 || strcmp(op, "%") == 0) {
-    if (!binary_emit_cqo(&context->code) ||
-        !binary_emit_idiv_reg(&context->code, BINARY_GP_R10)) {
+    if (lhs_unsigned) {
+      if (!binary_emit_xor_reg_reg32(&context->code, BINARY_GP_RDX) ||
+          !binary_emit_div_reg(&context->code, BINARY_GP_R10)) {
+        return 0;
+      }
+    } else if (!binary_emit_cqo(&context->code) ||
+               !binary_emit_idiv_reg(&context->code, BINARY_GP_R10)) {
       return 0;
     }
     if (strcmp(op, "%") == 0) {
@@ -955,9 +981,9 @@ int code_generator_binary_emit_integer_binary_to_rax(
   if (strcmp(op, "<<") == 0 || strcmp(op, ">>") == 0) {
     return binary_emit_mov_reg_reg(&context->code, BINARY_GP_RCX,
                                    BINARY_GP_R10) &&
-           binary_emit_shift_reg_cl(&context->code,
-                                    strcmp(op, "<<") == 0 ? 4 : 7,
-                                    BINARY_GP_RAX);
+           binary_emit_shift_reg_cl(
+               &context->code, strcmp(op, "<<") == 0 ? 4 : (lhs_unsigned ? 5 : 7),
+               BINARY_GP_RAX);
   }
 
   return 0;
@@ -1564,7 +1590,7 @@ int code_generator_binary_try_emit_address_add_load(
                                                     BINARY_GP_RAX)) {
     return 0;
   }
-  if (size == 4 && !load->is_float &&
+  if (size == 4 && !load->is_float && !load->is_unsigned &&
       code_generator_binary_load_needs_sign_extend(generator, context,
                                                    &load->dest, size) &&
       !binary_emit_movsxd_rax_eax(&context->code)) {
@@ -2094,7 +2120,7 @@ int code_generator_binary_try_emit_offset_scaled_address_load(
                                                     BINARY_GP_RAX)) {
     return 0;
   }
-  if (size == 4 && !load->is_float &&
+  if (size == 4 && !load->is_float && !load->is_unsigned &&
       code_generator_binary_load_needs_sign_extend(generator, context,
                                                    &load->dest, size) &&
       !binary_emit_movsxd_rax_eax(&context->code)) {
@@ -2370,7 +2396,7 @@ int code_generator_binary_operator_is_commutative(const char *op) {
 
 int code_generator_binary_emit_rax_binary_rhs(
     CodeGenerator *generator, BinaryFunctionContext *context, const char *op,
-    const IROperand *rhs) {
+    const IROperand *rhs, int lhs_unsigned) {
   if (!generator || !context || !op || !rhs) {
     return 0;
   }
@@ -2418,7 +2444,8 @@ int code_generator_binary_emit_rax_binary_rhs(
     if ((strcmp(op, "<<") == 0 || strcmp(op, ">>") == 0) &&
         immediate >= 0 && immediate < 64) {
       return binary_emit_shift_reg_imm8(
-          &context->code, strcmp(op, "<<") == 0 ? 4 : 7, BINARY_GP_RAX,
+          &context->code,
+          strcmp(op, "<<") == 0 ? 4 : (lhs_unsigned ? 5 : 7), BINARY_GP_RAX,
           (unsigned char)immediate);
     }
   }
@@ -2516,10 +2543,22 @@ int code_generator_binary_try_emit_binary_expression_chain(
     return 0;
   }
 
+  /* The consumer's left operand is the producer temp (RAX holds it after the
+   * first emit). For a signedness-sensitive consumer op (div/mod/>>) that temp
+   * is the dividend/shiftee, so its signedness — the result type of the
+   * producer expression — decides DIV vs IDIV / SHR vs SAR. (div/mod/>> are
+   * non-commutative, so the commutative branch above never lands here with one
+   * of them.) */
+  int consumer_lhs_unsigned = binary_type_is_unsigned_integer(
+      producer->ast_ref
+          ? code_generator_infer_expression_type(generator, producer->ast_ref)
+          : NULL);
+
   if (!code_generator_binary_emit_integer_binary_to_rax(generator, context,
                                                         producer) ||
       !code_generator_binary_emit_rax_binary_rhs(generator, context,
-                                                 consumer->text, rhs)) {
+                                                 consumer->text, rhs,
+                                                 consumer_lhs_unsigned)) {
     if (!generator->has_error) {
       code_generator_set_error(
           generator,

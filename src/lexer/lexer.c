@@ -559,6 +559,10 @@ static Token lexer_lex_identifier_or_keyword(Lexer *lexer) {
     token.type = TOKEN_FN;
   else if (strcmp(token.value, "match") == 0)
     token.type = TOKEN_MATCH;
+  else if (strcmp(token.value, "kernel") == 0)
+    token.type = TOKEN_KERNEL;
+  else if (strcmp(token.value, "dispatch") == 0)
+    token.type = TOKEN_DISPATCH;
   else if (strcmp(token.value, "int8") == 0)
     token.type = TOKEN_INT8;
   else if (strcmp(token.value, "int16") == 0)
@@ -809,6 +813,9 @@ Token lexer_next_token(Lexer *lexer) {
     break;
   case ';':
     token.type = TOKEN_SEMICOLON;
+    break;
+  case '@':
+    token.type = TOKEN_AT;
     break;
   case ',':
     token.type = TOKEN_COMMA;

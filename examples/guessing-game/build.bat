@@ -10,26 +10,10 @@ if not exist bin\mettle.exe (
     if %ERRORLEVEL% NEQ 0 exit /b 1
 )
 
-echo Compiling guessing_game.mettle...
-bin\mettle.exe examples\guessing-game\guessing_game.mettle -o examples\guessing-game\guessing_game.s
+echo Building guessing_game.mettle...
+bin\mettle.exe --build examples\guessing-game\guessing_game.mettle -o examples\guessing-game\guessing_game.exe
 if %ERRORLEVEL% NEQ 0 (
-    echo Mettle compilation failed.
-    exit /b 1
-)
-
-echo Assembling and linking...
-where nasm >nul 2>&1
-if %ERRORLEVEL% EQU 0 (
-    nasm -f win64 examples\guessing-game\guessing_game.s -o examples\guessing-game\guessing_game.o
-    if %ERRORLEVEL% NEQ 0 (
-        echo NASM assembly failed.
-        exit /b 1
-    )
-    gcc -c src\runtime\crash_handler.c -o examples\guessing-game\crash_handler.o -Isrc
-    if %ERRORLEVEL% NEQ 0 exit /b 1
-    gcc -nostartfiles examples\guessing-game\guessing_game.o examples\guessing-game\crash_handler.o -o examples\guessing-game\guessing_game.exe -lkernel32
-) else (
-    echo NASM required. Install from https://www.nasm.us/
+    echo Mettle build failed.
     exit /b 1
 )
 

@@ -1,0 +1,9 @@
+// A function with a non-void return type must contain at least one return
+// statement. An empty body would otherwise compile and return garbage from
+// RAX/XMM0. (Found by the fuzz reducer deleting function bodies.)
+function f(x: float32, y: float32) -> float64 {
+}
+
+function main() -> int32 {
+  return 0;
+}

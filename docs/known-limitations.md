@@ -56,17 +56,17 @@ Structs work normally as **locals**: field access, whole-struct assignment, and 
 
 | Scenario                                                              | Behavior                                                                                                                                                                                       |
 | --------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Parameter `fn(s: Big)` with `sizeof(Big) > 8`                         | Supported in text-asm and `--emit-obj` modes.                                                                                                                                                  |
-| Returning `-> Big` with `sizeof(Big) > 8`                             | Supported in text-asm and `--emit-obj` modes. Hidden out-pointer; result lives in the caller's frame.                                                                                          |
+| Parameter `fn(s: Big)` with `sizeof(Big) > 8`                         | Supported in the native object backend.                                                                                                                                                        |
+| Returning `-> Big` with `sizeof(Big) > 8`                             | Supported in the native object backend. Hidden out-pointer; result lives in the caller's frame.                                                                                                |
 | Chained pattern `f(g())` where both are struct-by-value               | Supported. The returned struct survives passage into the next call.                                                                                                                            |
 | Mettle calling C functions with struct-by-value args/returns          | Supported on Windows when the C object uses the Microsoft x64 ABI and the final link uses Mettle's internal linker.                                                                            |
 | C calling exported Mettle functions with struct-by-value args/returns | Not yet covered by tests or documented as supported.                                                                                                                                           |
-| Float-typed return values from Mettle-to-Mettle calls                 | Supported in text-asm and `--emit-obj` modes. Callees return through `xmm0` per the Win64 ABI; the text IR path still mirrors the bits into `rax` after calls for its internal value pipeline. |
+| Float-typed return values from Mettle-to-Mettle calls                 | Supported in the native object backend. Callees return through `xmm0` per the Win64 ABI.                                                                                                      |
 
 
 **Practical guidance:**
 
-- Struct-by-value **arguments and returns** are safe in the text-asm backend and in `--emit-obj` mode.
+- Struct-by-value **arguments and returns** are safe in the native object backend.
 - For C interop, the backend follows the platform C ABI: Microsoft x64 on Windows (COFF) and System V AMD64 on Linux (ELF). Scalar and pointer arguments, return values, register-and-stack argument passing, and the hidden struct-return pointer all match the target convention. Struct-by-value passing and returning is covered for the Mettle-calls-C direction. See [C Interoperability - Passing Structs to C](c-interop.md).
 - With `--linker internal`, raw COFF `.o` / `.obj` files can be supplied through `--link-arg`; the final executable link remains inside Mettle.
 
@@ -109,4 +109,3 @@ Arrays follow the same rule as in [Types - Array Types](types.md#array-types): t
 ### Platform Support
 
 - `std/net` and the web server example are Windows-only (Winsock2). Use POSIX socket externs for networking on Linux.
-

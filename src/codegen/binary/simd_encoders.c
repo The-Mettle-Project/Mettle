@@ -744,6 +744,57 @@ int wcs_avx_vaddps_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
 int wcs_avx_vmulps_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
   return wcs_avx_vps_ymm(b, 0x59, dst, s1, s2);
 }
+int wcs_avx_vsubps_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
+  return wcs_avx_vps_ymm(b, 0x5C, dst, s1, s2);
+}
+int wcs_avx_vdivps_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
+  return wcs_avx_vps_ymm(b, 0x5E, dst, s1, s2);
+}
+int wcs_avx_vminps_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
+  return wcs_avx_vps_ymm(b, 0x5D, dst, s1, s2);
+}
+int wcs_avx_vmaxps_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
+  return wcs_avx_vps_ymm(b, 0x5F, dst, s1, s2);
+}
+
+/* vroundps ymm,ymm,imm8 — VEX.256.66.0F3A.WIG 08 /r ib. imm bit1:0 select the
+ * rounding mode; 1 = round toward -inf (floor), what the exp range-reduction
+ * needs. */
+int wcs_avx_vroundps_ymm(BinaryCodeBuffer *b, int dst, int src,
+                         unsigned char imm) {
+  return wcs_vex3(b, 3, 1, 1, 0, dst, src, 0) &&
+         binary_code_buffer_append_u8(b, 0x08) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (src & 7))) &&
+         binary_code_buffer_append_u8(b, imm);
+}
+
+/* vcvttps2dq ymm,ymm — VEX.256.F3.0F.WIG 5B /r. Truncating float32 -> int32. */
+int wcs_avx_vcvttps2dq_ymm(BinaryCodeBuffer *b, int dst, int src) {
+  return wcs_vex3(b, 1, 2, 1, 0, dst, src, 0) &&
+         binary_code_buffer_append_u8(b, 0x5B) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (src & 7)));
+}
+
+/* vcvtdq2ps ymm,ymm — VEX.256.0F.WIG 5B /r. int32 -> float32. */
+int wcs_avx_vcvtdq2ps_ymm(BinaryCodeBuffer *b, int dst, int src) {
+  return wcs_vex3(b, 1, 0, 1, 0, dst, src, 0) &&
+         binary_code_buffer_append_u8(b, 0x5B) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (src & 7)));
+}
+
+/* vpslld ymm,ymm,imm8 — VEX.256.66.0F 72 /6 ib. Shift int32 lanes left. Used
+ * in-place (dst == src) to build 2^n exponents. */
+int wcs_avx_vpslld_ymm_imm(BinaryCodeBuffer *b, int dst, int src,
+                           unsigned char imm) {
+  return wcs_vex3(b, 1, 1, 1, 0, 6, dst, src) &&
+         binary_code_buffer_append_u8(b, 0x72) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | (6 << 3) | (dst & 7))) &&
+         binary_code_buffer_append_u8(b, imm);
+}
 
 /* vmovups ymm, [base+disp] (load) — VEX.256.0F.WIG 10. A 256-bit load is
  * data-agnostic, so this serves both pd and ps. */
@@ -890,6 +941,79 @@ int wcs_avx_vpbroadcastd_ymm(BinaryCodeBuffer *b, int dst, int src_xmm) {
          binary_code_buffer_append_u8(b, 0x58) &&
          binary_code_buffer_append_u8(
              b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (src_xmm & 7)));
+}
+
+/* vpbroadcastd ymm, m32 — VEX.256.66.0F38.W0 58 /r with a memory operand. Loads
+ * 32 bits and broadcasts to all 8 lanes in ONE VEX op (no legacy movd, so no
+ * AVX<->SSE transition penalty inside a hot loop). */
+int wcs_avx_vpbroadcastd_ymm_mem(BinaryCodeBuffer *b, int dst, int base,
+                                 int displacement) {
+  return wcs_vex3(b, 2, 1, 1, 0, dst, base, 0) &&
+         binary_code_buffer_append_u8(b, 0x58) &&
+         wcs_avx_modrm_mem_disp(b, dst, base, displacement);
+}
+
+/* vbroadcastss ymm, m32 — VEX.256.66.0F38.W0 18 /r. Broadcast a 32-bit float
+ * (or any 32-bit pattern) from memory to all 8 lanes. The exp kernel keeps its
+ * constants in a small stack pool and broadcasts each on use, avoiding a
+ * per-iteration GP->XMM round-trip. */
+int wcs_avx_vbroadcastss_ymm_mem(BinaryCodeBuffer *b, int dst, int base,
+                                 int displacement) {
+  return wcs_vex3(b, 2, 1, 1, 0, dst, base, 0) &&
+         binary_code_buffer_append_u8(b, 0x18) &&
+         wcs_avx_modrm_mem_disp(b, dst, base, displacement);
+}
+
+/* vpmaddwd ymm_dst, ymm_src1, ymm_src2 — VEX.256.66.0F.WIG F5 /r. Multiplies
+ * signed int16 lanes and horizontally adds adjacent pairs into signed int32
+ * lanes: dst[j] = src1[2j]*src2[2j] + src1[2j+1]*src2[2j+1]. The int8 dot kernel
+ * feeds it sign-extended bytes, so each int32 lane holds two int8 products and
+ * cannot overflow (2*127*127 < 2^31). */
+int wcs_avx_vpmaddwd_ymm(BinaryCodeBuffer *b, int dst, int src1, int src2) {
+  return wcs_vex3(b, 1, 1, 1, 0, dst, src2, src1) &&
+         binary_code_buffer_append_u8(b, 0xF5) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (src2 & 7)));
+}
+
+/* vpmovsxbw ymm_dst, [mem] — VEX.256.66.0F38.WIG 20 /r. Loads 16 bytes and
+ * sign-extends each to a 16-bit lane (16 int8 -> 16 int16 in a ymm), fusing the
+ * load and widening the int8 dot kernel needs before vpmaddwd. */
+int wcs_avx_vpmovsxbw_ymm_mem(BinaryCodeBuffer *b, int dst, int base,
+                              int displacement) {
+  return wcs_vex3(b, 2, 1, 1, 0, dst, base, 0) &&
+         binary_code_buffer_append_u8(b, 0x20) &&
+         wcs_avx_modrm_mem_disp(b, dst, base, displacement);
+}
+
+/* vpmovzxbw ymm_dst, [mem] — VEX.256.66.0F38.WIG 30 /r. ZERO-extends each of 16
+ * bytes to a 16-bit lane. Mettle's `int8`->`int32` cast zero-extends (the type
+ * is byte-unsigned), so the int8 dot kernel uses this form to match the scalar
+ * semantics exactly. */
+int wcs_avx_vpmovzxbw_ymm_mem(BinaryCodeBuffer *b, int dst, int base,
+                              int displacement) {
+  return wcs_vex3(b, 2, 1, 1, 0, dst, base, 0) &&
+         binary_code_buffer_append_u8(b, 0x30) &&
+         wcs_avx_modrm_mem_disp(b, dst, base, displacement);
+}
+
+/* vpmovzxbd xmm_dst, [mem] — VEX.128.66.0F38.WIG 31 /r. Zero-extends 4 bytes to
+ * 4 int32 lanes. Used by the int8 SLP-MAC kernel (K=4) to widen b's contiguous
+ * bytes to int32 before the int32 multiply/accumulate. */
+int wcs_avx_vpmovzxbd_xmm_mem(BinaryCodeBuffer *b, int dst, int base,
+                              int displacement) {
+  return wcs_vex3(b, 2, 1, 0, 0, dst, base, 0) &&
+         binary_code_buffer_append_u8(b, 0x31) &&
+         wcs_avx_modrm_mem_disp(b, dst, base, displacement);
+}
+
+/* vpmovzxbd ymm_dst, [mem] — VEX.256.66.0F38.WIG 31 /r. Zero-extends 8 bytes to
+ * 8 int32 lanes (the K=8 int8 SLP-MAC form). */
+int wcs_avx_vpmovzxbd_ymm_mem(BinaryCodeBuffer *b, int dst, int base,
+                              int displacement) {
+  return wcs_vex3(b, 2, 1, 1, 0, dst, base, 0) &&
+         binary_code_buffer_append_u8(b, 0x31) &&
+         wcs_avx_modrm_mem_disp(b, dst, base, displacement);
 }
 
 /* vmovd xmm, r/m32 — VEX.128.66.0F.W0 6E /r. The VEX form is mandatory inside

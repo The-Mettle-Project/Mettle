@@ -214,6 +214,9 @@ int ir_instruction_writes_symbol(const IRInstruction *instruction) {
   case IR_OP_SIMD_MATMUL_N32:
   case IR_OP_SIMD_INSERTION_SORT_I32:
   case IR_OP_SIMD_DOT_I32:
+  case IR_OP_SIMD_DOT_I8:
+  case IR_OP_SIMD_SLP_MAC_I32:
+  case IR_OP_SIMD_SLP_MAC_I8:
   case IR_OP_SIMD_SCALE_I32:
   case IR_OP_SIMD_CLAMP_I32:
   case IR_OP_SIMD_REVERSE_COPY_I32:
@@ -226,6 +229,7 @@ int ir_instruction_writes_symbol(const IRInstruction *instruction) {
   case IR_OP_SIMD_DOT_F32:
   case IR_OP_SIMD_AFFINE_MAP_F64:
   case IR_OP_SIMD_AFFINE_MAP_F32:
+  case IR_OP_SIMD_EXP_F32:
   case IR_OP_SIMD_I2F_REDUCE_F64:
   case IR_OP_SIMD_VLOOP_F64:
   case IR_OP_SIMD_OUTER_LANE_F64:
@@ -258,6 +262,9 @@ int ir_instruction_writes_destination(const IRInstruction *instruction) {
   case IR_OP_SIMD_MATMUL_N32:
   case IR_OP_SIMD_INSERTION_SORT_I32:
   case IR_OP_SIMD_DOT_I32:
+  case IR_OP_SIMD_DOT_I8:
+  case IR_OP_SIMD_SLP_MAC_I32:
+  case IR_OP_SIMD_SLP_MAC_I8:
   case IR_OP_SIMD_SCALE_I32:
   case IR_OP_SIMD_CLAMP_I32:
   case IR_OP_SIMD_REVERSE_COPY_I32:
@@ -270,6 +277,7 @@ int ir_instruction_writes_destination(const IRInstruction *instruction) {
   case IR_OP_SIMD_DOT_F32:
   case IR_OP_SIMD_AFFINE_MAP_F64:
   case IR_OP_SIMD_AFFINE_MAP_F32:
+  case IR_OP_SIMD_EXP_F32:
   case IR_OP_SIMD_I2F_REDUCE_F64:
   case IR_OP_SIMD_VLOOP_F64:
   case IR_OP_SIMD_OUTER_LANE_F64:
@@ -1006,6 +1014,16 @@ static int ir_expression_map_store_value_for_instruction(
     return 0;
   }
 
+  /* Refuse self-referential definitions such as `@i = @i + 1`, where the
+   * destination is also one of the source operands. Recording `@i + 1 -> @i`
+   * is invalid: this instruction redefines @i, so the operand named in the key
+   * now holds a different value than when the expression was evaluated. A later
+   * textual `@i + 1` (using the new @i) would wrongly be rewritten to @i. */
+  if (ir_operand_equals(&instruction->dest, &instruction->lhs) ||
+      ir_operand_equals(&instruction->dest, &instruction->rhs)) {
+    return 1;
+  }
+
   int existing_index =
       ir_expression_map_find_matching_instruction(map, instruction);
   if (existing_index >= 0) {
@@ -1427,6 +1445,9 @@ int ir_collect_instruction_temp_uses(IRTempUseMap *uses,
   case IR_OP_SIMD_MATMUL_N32:
   case IR_OP_SIMD_INSERTION_SORT_I32:
   case IR_OP_SIMD_DOT_I32:
+  case IR_OP_SIMD_DOT_I8:
+  case IR_OP_SIMD_SLP_MAC_I32:
+  case IR_OP_SIMD_SLP_MAC_I8:
   case IR_OP_SIMD_SCALE_I32:
   case IR_OP_SIMD_CLAMP_I32:
   case IR_OP_SIMD_REVERSE_COPY_I32:
@@ -1439,6 +1460,7 @@ int ir_collect_instruction_temp_uses(IRTempUseMap *uses,
   case IR_OP_SIMD_DOT_F32:
   case IR_OP_SIMD_AFFINE_MAP_F64:
   case IR_OP_SIMD_AFFINE_MAP_F32:
+  case IR_OP_SIMD_EXP_F32:
   case IR_OP_SIMD_I2F_REDUCE_F64:
   case IR_OP_SIMD_VLOOP_F64:
   case IR_OP_SIMD_OUTER_LANE_F64:

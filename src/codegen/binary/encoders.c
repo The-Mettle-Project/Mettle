@@ -264,6 +264,30 @@ int binary_emit_cmp_reg_imm32(BinaryCodeBuffer *buffer,
   return binary_emit_alu_reg_imm32(buffer, 7, reg, immediate);
 }
 
+/* 32-bit `cmp r/m32, imm` (no REX.W), so a 4-byte int32/uint32 value is compared
+ * against an immediate without the 64-bit sign-extension of the W=1 form -- and
+ * without staging the constant through a scratch register. Uses the imm8 short
+ * form (0x83 /7) when the value fits, else the imm32 form (0x81 /7). */
+int binary_emit_cmp_reg_imm_w32(BinaryCodeBuffer *buffer, BinaryGpRegister reg,
+                                uint32_t immediate) {
+  if (!buffer) {
+    return 0;
+  }
+  int32_t s = (int32_t)immediate;
+  if (s >= INT8_MIN && s <= INT8_MAX) {
+    return binary_emit_rex(buffer, 0, 0, 0, reg >> 3) &&
+           binary_code_buffer_append_u8(buffer, 0x83) &&
+           binary_code_buffer_append_u8(
+               buffer, (unsigned char)(0xC0 | (7 << 3) | (reg & 7))) &&
+           binary_code_buffer_append_u8(buffer, (unsigned char)(int8_t)s);
+  }
+  return binary_emit_rex(buffer, 0, 0, 0, reg >> 3) &&
+         binary_code_buffer_append_u8(buffer, 0x81) &&
+         binary_code_buffer_append_u8(
+             buffer, (unsigned char)(0xC0 | (7 << 3) | (reg & 7))) &&
+         binary_code_buffer_append_u32(buffer, immediate);
+}
+
 int binary_emit_mov_reg_imm64(BinaryCodeBuffer *buffer,
                                      BinaryGpRegister destination,
                                      uint64_t immediate) {
@@ -353,6 +377,56 @@ int binary_emit_memory_access_ex(BinaryCodeBuffer *buffer,
   return binary_emit_memory_access_ex_internal(
       buffer, operand_size_prefix, rex_w, opcode1, has_opcode2, opcode2, reg,
       base, displacement, 0);
+}
+
+/* Like binary_emit_memory_access_ex but with a scaled-index SIB address
+ * [base + index*scale + disp]. `reg` is the ModRM.reg operand (load dest or
+ * store source). scale must be 1/2/4/8 and index must not be RSP. */
+int binary_emit_memory_access_sib(BinaryCodeBuffer *buffer,
+                                  int operand_size_prefix, int rex_w,
+                                  unsigned char opcode1, int has_opcode2,
+                                  unsigned char opcode2, BinaryGpRegister reg,
+                                  BinaryGpRegister base, BinaryGpRegister index,
+                                  int scale, int displacement) {
+  if (!buffer || index == BINARY_GP_RSP) {
+    return 0;
+  }
+  unsigned char scale_bits;
+  switch (scale) {
+  case 1: scale_bits = 0; break;
+  case 2: scale_bits = 1; break;
+  case 4: scale_bits = 2; break;
+  case 8: scale_bits = 3; break;
+  default: return 0;
+  }
+  /* mod==00 has no displacement, but base low-3 == 5 (RBP/R13) forces disp8. */
+  int use_disp8 = displacement >= -128 && displacement <= 127;
+  unsigned char mod;
+  if (displacement == 0 && (base & 7) != (BINARY_GP_RBP & 7)) {
+    mod = 0;
+  } else {
+    mod = use_disp8 ? 1 : 2;
+  }
+  if ((operand_size_prefix && !binary_code_buffer_append_u8(buffer, 0x66)) ||
+      !binary_emit_rex(buffer, rex_w, reg >> 3, index >> 3, base >> 3) ||
+      !binary_code_buffer_append_u8(buffer, opcode1) ||
+      (has_opcode2 && !binary_code_buffer_append_u8(buffer, opcode2)) ||
+      !binary_code_buffer_append_u8(
+          buffer, (unsigned char)((mod << 6) | ((reg & 7) << 3) | 4)) ||
+      !binary_code_buffer_append_u8(
+          buffer, (unsigned char)((scale_bits << 6) | ((index & 7) << 3) |
+                                  (base & 7)))) {
+    return 0;
+  }
+  if (mod == 1) {
+    return binary_code_buffer_append_u8(buffer,
+                                        (unsigned char)(int8_t)displacement);
+  }
+  if (mod == 2) {
+    return binary_code_buffer_append_u32(buffer,
+                                         (uint32_t)(int32_t)displacement);
+  }
+  return 1;
 }
 
 int binary_emit_memory_access(BinaryCodeBuffer *buffer,
@@ -1061,6 +1135,42 @@ int binary_emit_movsx_reg_reg16(BinaryCodeBuffer *buffer,
     return 0;
   }
 
+  return 1;
+}
+
+/* dst(64) <- zero-extend(low byte of source). 0F B6 /r with REX.W. */
+int binary_emit_movzx_reg_reg8(BinaryCodeBuffer *buffer,
+                               BinaryGpRegister destination,
+                               BinaryGpRegister source) {
+  if (!buffer) {
+    return 0;
+  }
+  if (!binary_emit_rex(buffer, 1, destination >> 3, 0, source >> 3) ||
+      !binary_code_buffer_append_u8(buffer, 0x0F) ||
+      !binary_code_buffer_append_u8(buffer, 0xB6) ||
+      !binary_code_buffer_append_u8(
+          buffer,
+          (unsigned char)(0xC0 | ((destination & 7) << 3) | (source & 7)))) {
+    return 0;
+  }
+  return 1;
+}
+
+/* dst(64) <- zero-extend(low word of source). 0F B7 /r with REX.W. */
+int binary_emit_movzx_reg_reg16(BinaryCodeBuffer *buffer,
+                                BinaryGpRegister destination,
+                                BinaryGpRegister source) {
+  if (!buffer) {
+    return 0;
+  }
+  if (!binary_emit_rex(buffer, 1, destination >> 3, 0, source >> 3) ||
+      !binary_code_buffer_append_u8(buffer, 0x0F) ||
+      !binary_code_buffer_append_u8(buffer, 0xB7) ||
+      !binary_code_buffer_append_u8(
+          buffer,
+          (unsigned char)(0xC0 | ((destination & 7) << 3) | (source & 7)))) {
+    return 0;
+  }
   return 1;
 }
 

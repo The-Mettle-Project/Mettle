@@ -1,0 +1,86 @@
+// Quantized int8 matrix multiply: int8 x int8 -> int32 (the quantized GEMM
+// that dominates CPU LLM inference). 32x32, col-unrolled by 4 (SLP shape).
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+var N: int32 = 32;
+
+function qmatmul(a: int8*, b: int8*, c: int32*) {
+  var row: int32 = 0;
+  var row_base: int64 = 0;
+  while (row < N) {
+    var col: int32 = 0;
+    while (col < N) {
+      var sum0: int32 = 0;
+      var sum1: int32 = 0;
+      var sum2: int32 = 0;
+      var sum3: int32 = 0;
+      var a_idx: int64 = row_base;
+      var b0_idx: int64 = (int64)col;
+      var b1_idx: int64 = b0_idx + 1;
+      var b2_idx: int64 = b0_idx + 2;
+      var b3_idx: int64 = b0_idx + 3;
+      var k: int32 = 0;
+      while (k < N) {
+        var av: int32 = (int32)a[a_idx];
+        sum0 = sum0 + av * (int32)b[b0_idx];
+        sum1 = sum1 + av * (int32)b[b1_idx];
+        sum2 = sum2 + av * (int32)b[b2_idx];
+        sum3 = sum3 + av * (int32)b[b3_idx];
+        a_idx = a_idx + 1;
+        b0_idx = b0_idx + (int64)N;
+        b1_idx = b1_idx + (int64)N;
+        b2_idx = b2_idx + (int64)N;
+        b3_idx = b3_idx + (int64)N;
+        k = k + 1;
+      }
+      var c_idx: int64 = row_base + (int64)col;
+      c[c_idx] = sum0;
+      c[c_idx + 1] = sum1;
+      c[c_idx + 2] = sum2;
+      c[c_idx + 3] = sum3;
+      col = col + 4;
+    }
+    row_base = row_base + (int64)N;
+    row = row + 1;
+  }
+}
+
+function trace_c(c: int32*) -> int64 {
+  var sum: int64 = 0;
+  var i: int32 = 0;
+  var idx: int64 = 0;
+  while (i < N) {
+    sum = sum + (int64)c[idx];
+    idx = idx + (int64)N + 1;
+    i = i + 1;
+  }
+  return sum;
+}
+
+function main() -> int32 {
+  var a: int8* = (int8*)malloc(1024);
+  var b: int8* = (int8*)malloc(1024);
+  var c: int32* = (int32*)malloc(1024 * 4);
+  var i: int64 = 0;
+  while (i < 1024) {
+    a[i] = (int8)((i * 7 + 3) % 127 - 63);
+    b[i] = (int8)((i * 5 + 1) % 127 - 63);
+    i = i + 1;
+  }
+  qmatmul(a, b, c);
+  print(cstr("Trace = ")); println_int(trace_c(c));
+  var t0: uint64 = bench_time_us();
+  var bench_sum: int64 = 0;
+  var p: int32 = 0;
+  while (p < 20000) {
+    qmatmul(a, b, c);
+    bench_sum = bench_sum + trace_c(c);
+    p = p + 1;
+  }
+  var elapsed: uint64 = bench_time_us() - t0;
+  print(cstr("Bench sum = ")); println_int(bench_sum);
+  print(cstr("Time: ")); print_int(elapsed); println(cstr(" us"));
+  return 0;
+}

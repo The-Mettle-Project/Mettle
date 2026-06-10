@@ -10,11 +10,11 @@ This page covers what gets emitted, the two optional helper objects in `src/runt
 
 | Mettle feature | Compiler output | Linked at build time |
 |---|---|---|
-| `main` / `main(argc, argv)` | Entry stub (`mainCRTStartup`) calls `__getmainargs` on Windows (assembly path and internal `--build` startup object) or reads `argc`/`argv` from the stack (Linux), then `main`, then `ExitProcess` / `sys_exit` | libc |
+| `main` / `main(argc, argv)` | Startup object calls `__getmainargs` on Windows or reads `argc`/`argv` from the stack on Linux, then calls `main` and exits | libc |
 | `new T`, array literals, `string + string` | `extern calloc`; `call calloc` with `(1, size)` | libc `calloc` |
 | `std/win32` / `std/net` / `std/thread` | `extern` to DLL symbols (`CreateFileA`, etc.) | Win32 DLLs |
 | `std/thread` interlocked atomics | `extern mettle_atomic_*`; `call mettle_atomic_*` | `atomics.o` |
-| Null/bounds traps (normal build), `-d` / `-s` | `extern mettle_crash_trap_ex` (or `mettle_crash_trap`); startup via `mettle_crash_startup` (COFF `--build`) or `mettle_crash_install` at `_start` (NASM path) | `crash_handler.o` |
+| Null/bounds traps (normal build), `-d` / `-s` | `extern mettle_crash_trap_ex` (or `mettle_crash_trap`); startup via `mettle_crash_startup` | `crash_handler.o` |
 | `-g` / `--debug-symbols` alone | No crash hooks unless `-s`/`-d` or IR traps reference `mettle_crash_*` | usually nothing extra |
 | `--release` | Traps off; startup skips crash-handler init | nothing extra |
 
@@ -102,7 +102,7 @@ mettle --build -s hello.mettle -o hello.exe   (crash traces + atomics)
   → libc + crash_handler.o + atomics.o
 ```
 
-## Manual NASM + gcc link
+## Manual gcc link
 
 With `-nostartfiles` (Mettle supplies `mainCRTStartup` / `_start`, not the CRT entry):
 

@@ -1,0 +1,5 @@
+import { missing_symbol } from "namespaced_math";
+
+function main() -> int32 {
+  return 0;
+}

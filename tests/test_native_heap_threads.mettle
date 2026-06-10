@@ -1,0 +1,45 @@
+// Thread-safety check for the native allocator backing --native-heap. Four
+// threads hammer the shared process-global heap with alloc/free cycles. If the
+// per-heap spinlock is correct, every counter increment is preserved (exactly
+// 4*5000 = 20000 total allocations) and nothing leaks; a broken lock loses
+// counter updates or corrupts the free lists. Prints THREADS OK / FAIL.
+
+import "std/io";
+import "std/mem";
+import "std/alloc";
+import "std/thread";
+
+function worker(arg: cstring) -> uint32 {
+  var i: int64 = 0;
+  while (i < (int64)5000) {
+    var sz: int64 = ((i * (int64)13) % (int64)2000) + (int64)1;
+    var p: cstring = mx_alloc(sz);
+    if (p != 0) {
+      *((int8*)p) = (int8)0x7F;
+      *((int8*)((int64)p + sz - (int64)1)) = (int8)0x7F;
+      mx_free(p);
+    }
+    i = i + (int64)1;
+  }
+  return 0;
+}
+
+function main() -> int32 {
+  var tid: uint32 = 0;
+  var h1: int64 = CreateThread(0, (uint64)0, &worker, 0, (uint32)0, &tid);
+  var h2: int64 = CreateThread(0, (uint64)0, &worker, 0, (uint32)0, &tid);
+  var h3: int64 = CreateThread(0, (uint64)0, &worker, 0, (uint32)0, &tid);
+  var h4: int64 = CreateThread(0, (uint64)0, &worker, 0, (uint32)0, &tid);
+  if (h1 == 0 || h2 == 0 || h3 == 0 || h4 == 0) { println("THREADS FAIL: spawn"); return 1; }
+  thread_join_infinite(h1);
+  thread_join_infinite(h2);
+  thread_join_infinite(h3);
+  thread_join_infinite(h4);
+
+  var st: MemStats = mx_stats();
+  if (st.total_allocs != (int64)20000) { println("THREADS FAIL: lost allocs (lock race)"); return 1; }
+  if (st.total_allocs - st.total_frees != st.live_allocs) { println("THREADS FAIL: counter imbalance"); return 1; }
+  if (st.live_allocs != (int64)0) { println("THREADS FAIL: leak"); return 1; }
+  println("THREADS OK");
+  return 0;
+}

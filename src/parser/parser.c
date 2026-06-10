@@ -71,6 +71,8 @@ Parser *parser_create_with_error_reporter(Lexer *lexer,
   parser->error_reporter = error_reporter;
   parser->error_recovery_mode = 0;
   parser->source_filename = error_reporter_current_filename(error_reporter);
+  parser->gpu_mode = 0;
+  parser->dispatch_counter = 0;
 
   if (parser->current_token.type == TOKEN_ERROR) {
     parser_report_lexer_token_error(parser, &parser->current_token);
@@ -524,9 +526,114 @@ ASTNode *parser_parse_program(Parser *parser) {
 
 static ASTNode *parser_parse_extern_var_declaration(Parser *parser);
 
+// Flags collected from a run of `@ident[!]` decorators.
+typedef struct {
+  int is_inline;   // `@inline`
+  int is_noinline; // `@noinline`
+  int is_pure;     // `@pure`
+  int simd_mode;   // SimdAttr from `@simd` / `@simd!` (SIMD_ATTR_NONE if absent)
+} ParsedDecorators;
+
+// Consume a run of `@ident[!]` decorators into `out`. Assumes the current token
+// is TOKEN_AT. Returns 1 on success (parser positioned on the decorated
+// construct), 0 on error (a parser error is set). Recognizes `@inline`,
+// `@noinline`, `@pure`, and `@simd` / `@simd!`; rejects unknown names,
+// duplicates, and the `@inline`+`@noinline` conflict.
+static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
+  out->is_inline = 0;
+  out->is_noinline = 0;
+  out->is_pure = 0;
+  out->simd_mode = SIMD_ATTR_NONE;
+
+  while (parser->current_token.type == TOKEN_AT) {
+    parser_advance(parser); // consume '@'
+    if (!parser_is_identifier_like(parser->current_token.type)) {
+      parser_set_error(parser, "Expected a decorator name after '@' (one of "
+                               "'inline', 'noinline', 'pure', 'simd')");
+      return 0;
+    }
+    const char *name = parser->current_token.value;
+    if (strcmp(name, "inline") == 0) {
+      if (out->is_inline) {
+        parser_set_error(parser, "Duplicate '@inline' decorator");
+        return 0;
+      }
+      out->is_inline = 1;
+      parser_advance(parser);
+    } else if (strcmp(name, "noinline") == 0) {
+      if (out->is_noinline) {
+        parser_set_error(parser, "Duplicate '@noinline' decorator");
+        return 0;
+      }
+      out->is_noinline = 1;
+      parser_advance(parser);
+    } else if (strcmp(name, "pure") == 0) {
+      if (out->is_pure) {
+        parser_set_error(parser, "Duplicate '@pure' decorator");
+        return 0;
+      }
+      out->is_pure = 1;
+      parser_advance(parser);
+    } else if (strcmp(name, "simd") == 0) {
+      if (out->simd_mode != SIMD_ATTR_NONE) {
+        parser_set_error(parser, "Duplicate '@simd' decorator");
+        return 0;
+      }
+      parser_advance(parser); // consume 'simd'
+      out->simd_mode = SIMD_ATTR_HINT;
+      if (parser->current_token.type == TOKEN_NOT) {
+        out->simd_mode = SIMD_ATTR_CONTRACT;
+        parser_advance(parser); // consume '!'
+      }
+    } else {
+      parser_set_error(parser, "Unknown decorator after '@' (expected "
+                               "'inline', 'noinline', 'pure', or 'simd')");
+      return 0;
+    }
+  }
+
+  if (out->is_inline && out->is_noinline) {
+    parser_set_error(parser,
+                     "'@inline' and '@noinline' are mutually exclusive");
+    return 0;
+  }
+  return 1;
+}
+
 ASTNode *parser_parse_declaration(Parser *parser) {
   if (!parser)
     return NULL;
+
+  // Function decorators: `@inline` / `@noinline` / `@pure` / `@simd` may
+  // prefix a (possibly `export`-qualified) function declaration. Parse the
+  // chain, then stamp the flags onto the function it decorates.
+  if (parser->current_token.type == TOKEN_AT) {
+    ParsedDecorators decos;
+    if (!parser_parse_decorator_chain(parser, &decos))
+      return NULL;
+    ASTNode *decl = parser_parse_declaration(parser);
+    if (!decl)
+      return NULL;
+    if (decl->type != AST_FUNCTION_DECLARATION) {
+      parser_set_error(parser,
+                       "Decorators (@inline/@noinline/@pure/@simd) may only "
+                       "precede a function declaration");
+      ast_destroy_node(decl);
+      return NULL;
+    }
+    FunctionDeclaration *fd = (FunctionDeclaration *)decl->data;
+    if (fd->is_extern) {
+      parser_set_error(parser,
+                       "Decorators cannot be applied to extern functions");
+      ast_destroy_node(decl);
+      return NULL;
+    }
+    fd->is_inline = decos.is_inline;
+    fd->is_noinline = decos.is_noinline;
+    fd->is_pure = decos.is_pure;
+    fd->simd_mode = decos.simd_mode;
+    return decl;
+  }
 
   switch (parser->current_token.type) {
   case TOKEN_IMPORT:
@@ -604,6 +711,11 @@ ASTNode *parser_parse_declaration(Parser *parser) {
                          "Expected 'function' or 'var' after 'export extern'");
         return NULL;
       }
+    } else if (parser->current_token.type == TOKEN_AT) {
+      parser_set_error(parser,
+                       "Decorators must precede 'export' (write "
+                       "'@inline export function', not 'export @inline ...')");
+      return NULL;
     } else {
       parser_set_error(parser, "Expected 'function', 'var', 'struct', 'enum', "
                                "'trait', or 'extern' after 'export'");
@@ -619,6 +731,7 @@ ASTNode *parser_parse_declaration(Parser *parser) {
   case TOKEN_ERRDEFER:
     return parser_parse_errdefer_statement(parser);
   case TOKEN_FUNCTION:
+  case TOKEN_KERNEL:
     return parser_parse_function_declaration(parser);
   case TOKEN_STRUCT:
     return parser_parse_struct_declaration(parser);
@@ -731,9 +844,46 @@ static ASTNode *parser_parse_assignment_from_target(Parser *parser,
   return ast_create_field_assignment(target, value, target->location);
 }
 
+static ASTNode *parser_parse_dispatch_statement(Parser *parser);
+
 ASTNode *parser_parse_statement(Parser *parser) {
   if (!parser)
     return NULL;
+
+  // Vectorization attribute on a loop: `@simd` / `@simd!`.
+  //   @simd  for i in 0..n { ... }   -> best-effort hint (warn if not vectorized)
+  //   @simd! for i in 0..n { ... }   -> hard contract (compile error otherwise)
+  // The attribute may sit in front of a label too: `@simd outer: for ...`.
+  // Only `@simd` is meaningful on a loop; the other decorators are function-only.
+  if (parser->current_token.type == TOKEN_AT) {
+    ParsedDecorators decos;
+    if (!parser_parse_decorator_chain(parser, &decos))
+      return NULL;
+    if (decos.is_inline || decos.is_noinline || decos.is_pure) {
+      parser_set_error(parser, "'@inline', '@noinline', and '@pure' apply to a "
+                               "function, not a loop");
+      return NULL;
+    }
+    if (decos.simd_mode == SIMD_ATTR_NONE) {
+      parser_set_error(parser, "Expected a '@simd' decorator before a loop");
+      return NULL;
+    }
+
+    ASTNode *loop = parser_parse_statement(parser);
+    if (!loop)
+      return NULL;
+    if (loop->type == AST_FOR_STATEMENT) {
+      ((ForStatement *)loop->data)->simd_mode = decos.simd_mode;
+    } else if (loop->type == AST_WHILE_STATEMENT) {
+      ((WhileStatement *)loop->data)->simd_mode = decos.simd_mode;
+    } else {
+      parser_set_error(parser,
+                       "'@simd' must be applied to a 'for' or 'while' loop");
+      ast_destroy_node(loop);
+      return NULL;
+    }
+    return loop;
+  }
 
   // Labeled loop: IDENT ':' (while | for)
   if (parser->current_token.type == TOKEN_IDENTIFIER &&
@@ -780,6 +930,8 @@ ASTNode *parser_parse_statement(Parser *parser) {
     return parser_parse_while_statement(parser);
   case TOKEN_FOR:
     return parser_parse_for_statement(parser);
+  case TOKEN_DISPATCH:
+    return parser_parse_dispatch_statement(parser);
   case TOKEN_SWITCH:
     return parser_parse_switch_statement(parser);
   case TOKEN_MATCH:
@@ -1668,6 +1820,15 @@ ASTNode *parser_parse_cast_expression(Parser *parser) {
 
   parser_advance(parser); // consume '('
 
+  // Remember whether the parenthesized type begins with a built-in type
+  // keyword (int32, int64, float64, ...). The parser keeps no registry of
+  // user-defined type names, so this is its only reliable signal that the
+  // parenthesized token is genuinely a type rather than a value. We use it
+  // below to disambiguate `(name) <op> x` where <op> is both a unary and a
+  // binary operator (`&`, `*`, `+`, `-`).
+  int type_starts_with_keyword =
+      parser_is_type_keyword(parser->current_token.type);
+
   char *type_name = parser_parse_type_annotation(parser);
   if (!type_name || parser->has_error ||
       parser->current_token.type != TOKEN_RPAREN) {
@@ -1681,13 +1842,25 @@ ASTNode *parser_parse_cast_expression(Parser *parser) {
 
   parser_advance(parser); // consume ')'
 
+  // A bare single identifier (no built-in keyword, and no pointer/array/
+  // generic/qualified structure such as `*`, `[`, `<` or `.`) gives the parser
+  // no reason to believe it names a type. `(MyStruct*)`, `(Vec<T>)`,
+  // `(mod.Type)` and the like are structurally types and stay casts.
+  int looks_like_type =
+      type_starts_with_keyword || strpbrk(type_name, "*[<.(") != NULL;
+
   // Check if it's a grouped expression instead
   int is_binary = parser_is_binary_operator(parser->current_token.type);
+  int is_unary = parser_is_unary_operator(parser->current_token.type);
   if (parser->current_token.type == TOKEN_RPAREN ||
       parser->current_token.type == TOKEN_COMMA ||
       parser->current_token.type == TOKEN_SEMICOLON ||
       parser->current_token.type == TOKEN_EOF ||
-      (is_binary && !parser_is_unary_operator(parser->current_token.type))) {
+      (is_binary && !is_unary) ||
+      // Ambiguous prefix operator (`&`/`*`/`+`/`-`) after a token that does not
+      // look like a type: treat `(name) <op> x` as a parenthesized expression
+      // followed by a binary operator, not a cast of a unary expression.
+      (is_binary && is_unary && !looks_like_type)) {
     free(type_name);
     parser_restore_state(parser, &saved);
     parser_discard_saved_state(&saved);
@@ -1798,6 +1971,40 @@ static int parser_try_parse_generic_call_type_args(Parser *parser,
   parser_discard_saved_state(&saved);
 
   return 0;
+}
+
+// Kernel index built-ins: maps `<obj>.<axis>` to its GPU sreg intrinsic
+// link-name (gpu_tid_x etc.), or NULL if not a built-in. Mirrors CUDA:
+//   thread.x     -> gpu_tid_x     (threadIdx.x)
+//   block.x      -> gpu_ctaid_x   (blockIdx.x)
+//   block_dim.x  -> gpu_ntid_x    (blockDim.x)
+//   grid_dim.x   -> gpu_nctaid_x  (gridDim.x)
+// Only consulted in --emit-ptx (gpu_mode) compiles. Returns a pointer into a
+// static buffer (single-threaded parse; copied immediately by the caller).
+static const char *parser_gpu_index_intrinsic(const char *obj,
+                                              const char *axis) {
+  if (!obj || !axis || axis[0] == 0 || axis[1] != 0) {
+    return NULL;
+  }
+  char a = axis[0];
+  if (a != 'x' && a != 'y' && a != 'z') {
+    return NULL;
+  }
+  const char *base = NULL;
+  if (strcmp(obj, "thread") == 0) {
+    base = "gpu_tid_";
+  } else if (strcmp(obj, "block") == 0) {
+    base = "gpu_ctaid_";
+  } else if (strcmp(obj, "block_dim") == 0) {
+    base = "gpu_ntid_";
+  } else if (strcmp(obj, "grid_dim") == 0) {
+    base = "gpu_nctaid_";
+  } else {
+    return NULL;
+  }
+  static char buf[24];
+  snprintf(buf, sizeof(buf), "%s%c", base, a);
+  return buf;
 }
 
 ASTNode *parser_parse_postfix_expression(Parser *parser) {
@@ -1999,8 +2206,25 @@ ASTNode *parser_parse_postfix_expression(Parser *parser) {
       char *member = strdup(parser->current_token.value);
       parser_advance(parser);
 
-      expr = ast_create_member_access(expr, member, location);
-      free(member);
+      // GPU kernel index built-ins: `thread.x` etc. desugar to a call to the
+      // corresponding gpu_* intrinsic (only in --emit-ptx compiles).
+      const char *gpu_intr = NULL;
+      if (parser->gpu_mode && expr->type == AST_IDENTIFIER && expr->data) {
+        gpu_intr =
+            parser_gpu_index_intrinsic(((Identifier *)expr->data)->name, member);
+      }
+      if (gpu_intr) {
+        ASTNode *call = ast_create_call_expression(gpu_intr, NULL, 0, location);
+        ast_destroy_node(expr);
+        free(member);
+        if (!call) {
+          return NULL;
+        }
+        expr = call;
+      } else {
+        expr = ast_create_member_access(expr, member, location);
+        free(member);
+      }
 
     } else if (parser->current_token.type == TOKEN_ARROW) {
       // Pointer member access: p->field == (*p).field
@@ -2509,10 +2733,13 @@ ASTNode *parser_parse_function_declaration(Parser *parser) {
 
   SourceLocation location = parser_current_location(parser);
   if (parser->current_token.type != TOKEN_FUNCTION &&
-      parser->current_token.type != TOKEN_FN) {
-    parser_set_error(parser, "Expected 'function' or 'fn'");
+      parser->current_token.type != TOKEN_FN &&
+      parser->current_token.type != TOKEN_KERNEL) {
+    parser_set_error(parser, "Expected 'function', 'fn', or 'kernel'");
     return NULL;
   }
+  // `kernel` is the GPU-facing spelling of a top-level function; it parses
+  // identically and is emitted as a PTX .entry by --emit-ptx.
   parser_advance(parser);
 
   // Expect function name
@@ -3618,6 +3845,7 @@ ASTNode *parser_parse_while_statement(Parser *parser) {
   while_data->condition = condition;
   while_data->body = body;
   while_data->label = NULL;
+  while_data->simd_mode = SIMD_ATTR_NONE;
   while_node->data = while_data;
 
   ast_add_child(while_node, condition);
@@ -3658,6 +3886,294 @@ ASTNode *parser_parse_continue_statement(Parser *parser) {
   return parser_parse_break_or_continue(parser, TOKEN_CONTINUE);
 }
 
+// Range-based for: `for i [: type] in start ..|..= end { body }`.
+// Desugars at parse time into a classic counted ForStatement so every
+// downstream stage (type checker, IR lowering, the counted-loop vectorizer)
+// sees the exact shape it already handles:
+//
+//   for i in lo..hi   =>  var i = lo;  i <  hi;  i = i + 1
+//   for i in lo..=hi  =>  var i = lo;  i <= hi;  i = i + 1
+//
+// The `start` bound is evaluated once (the loop initializer); the `end` bound
+// is re-evaluated in the condition each iteration, matching Mettle's C-style
+// `for`/`while` semantics. Hoist a call-valued bound yourself if that matters.
+// `in` is a contextual keyword (a plain identifier elsewhere), so adding this
+// form breaks no existing program that uses `in` as a name.
+static ASTNode *parser_parse_range_for(Parser *parser, SourceLocation location) {
+  if (!parser_is_identifier_like(parser->current_token.type)) {
+    parser_set_error(parser, "Expected '(' or a loop variable after 'for'");
+    return NULL;
+  }
+  char *var_name = strdup(parser->current_token.value);
+  parser_advance(parser);
+
+  // Optional type annotation: `for i: int64 in ...`. Without one, the variable
+  // type is inferred from the start bound (same rule as `var i = <expr>`).
+  char *type_name = NULL;
+  if (parser->current_token.type == TOKEN_COLON) {
+    parser_advance(parser);
+    type_name = parser_parse_type_annotation(parser);
+    if (!type_name) {
+      if (!parser->has_error)
+        parser_set_error(parser, "Expected type after ':'");
+      free(var_name);
+      return NULL;
+    }
+  }
+
+  // Contextual `in`.
+  if (!parser_is_identifier_like(parser->current_token.type) ||
+      strcmp(parser->current_token.value, "in") != 0) {
+    parser_set_error(parser, "Expected 'in' in range-based for loop");
+    free(var_name);
+    free(type_name);
+    return NULL;
+  }
+  parser_advance(parser);
+
+  ASTNode *start = parser_parse_expression(parser);
+  if (!start) {
+    free(var_name);
+    free(type_name);
+    return NULL;
+  }
+
+  if (parser->current_token.type != TOKEN_DOT_DOT) {
+    parser_set_error(parser, "Expected '..' or '..=' in range-based for loop");
+    free(var_name);
+    free(type_name);
+    ast_destroy_node(start);
+    return NULL;
+  }
+  parser_advance(parser); // consume '..'
+  int inclusive = 0;
+  if (parser->current_token.type == TOKEN_EQUALS) {
+    inclusive = 1;
+    parser_advance(parser); // consume '=' of '..='
+  }
+
+  ASTNode *end = parser_parse_expression(parser);
+  if (!end) {
+    free(var_name);
+    free(type_name);
+    ast_destroy_node(start);
+    return NULL;
+  }
+
+  ASTNode *body = (parser->current_token.type == TOKEN_LBRACE)
+                      ? parser_parse_block(parser)
+                      : parser_parse_statement(parser);
+  if (!body) {
+    free(var_name);
+    free(type_name);
+    ast_destroy_node(start);
+    ast_destroy_node(end);
+    return NULL;
+  }
+
+  // initializer: var <name>[: type] = <start>
+  ASTNode *initializer =
+      ast_create_var_declaration(var_name, type_name, start, location);
+  // condition: <name> <  <end>   (exclusive)
+  //            <name> <= <end>   (inclusive)
+  ASTNode *condition = ast_create_binary_expression(
+      ast_create_identifier(var_name, location), inclusive ? "<=" : "<", end,
+      location);
+  // increment: <name> = <name> + 1
+  ASTNode *step_value = ast_create_binary_expression(
+      ast_create_identifier(var_name, location), "+",
+      ast_create_number_literal(1, location, 10), location);
+  ASTNode *increment = ast_create_assignment(var_name, step_value, location);
+
+  free(var_name);
+  free(type_name);
+
+  if (!initializer || !condition || !increment) {
+    if (initializer)
+      ast_destroy_node(initializer);
+    if (condition)
+      ast_destroy_node(condition);
+    if (increment)
+      ast_destroy_node(increment);
+    ast_destroy_node(body);
+    parser_set_error(parser, "Out of memory desugaring range-based for loop");
+    return NULL;
+  }
+
+  return ast_create_for_statement(initializer, condition, increment, body,
+                                  location);
+}
+
+static void parser_block_add(ASTNode *block, ASTNode *stmt) {
+  if (!block || !stmt) {
+    return;
+  }
+  Program *bd = (Program *)block->data;
+  ASTNode **grown =
+      realloc(bd->declarations, (bd->declaration_count + 1) * sizeof(ASTNode *));
+  if (!grown) {
+    return;
+  }
+  bd->declarations = grown;
+  bd->declarations[bd->declaration_count++] = stmt;
+  ast_add_child(block, stmt);
+}
+
+// GPU kernel launch: `dispatch K[grid, block](a0, a1, ...)`.
+// Desugars (launch-only) at parse time into a block that marshals the args into
+// a CUDA-style void** params array and calls std/gpu's gpu_launch:
+//   { var __a0 = a0; ...; var __p: int64[N];
+//     __p[0] = (int64)&__a0; ...;
+//     gpu_launch(K, grid, block, &__p[0], N); }
+// Each arg lives in a naturally-typed (inferred) local, so &__ai yields a
+// correctly-typed pointer and the kernel reads the right bytes -- no manual
+// per-arg type juggling. Device memory stays explicit (the user's call).
+static ASTNode *parser_parse_dispatch_statement(Parser *parser) {
+  SourceLocation loc = parser_current_location(parser);
+  parser_advance(parser); // consume 'dispatch'
+
+  if (parser->current_token.type != TOKEN_IDENTIFIER) {
+    parser_set_error(parser,
+                     "Expected a kernel handle (identifier) after 'dispatch'");
+    return NULL;
+  }
+  char *kernel_name = strdup(parser->current_token.value);
+  parser_advance(parser);
+
+  ASTNode *grid = NULL;
+  ASTNode *block = NULL;
+  ASTNode *args[64];
+  size_t nargs = 0;
+
+#define DISP_FAIL()                                                            \
+  do {                                                                         \
+    free(kernel_name);                                                         \
+    if (grid)                                                                  \
+      ast_destroy_node(grid);                                                  \
+    if (block)                                                                 \
+      ast_destroy_node(block);                                                 \
+    for (size_t _i = 0; _i < nargs; _i++)                                      \
+      ast_destroy_node(args[_i]);                                              \
+    return NULL;                                                               \
+  } while (0)
+
+  // [ grid , block ]
+  if (!parser_expect(parser, TOKEN_LBRACKET)) {
+    parser_set_error(parser, "Expected '[grid, block]' after the dispatch kernel");
+    DISP_FAIL();
+  }
+  grid = parser_parse_expression(parser);
+  if (!grid || !parser_expect(parser, TOKEN_COMMA)) {
+    if (grid && !parser->has_error)
+      parser_set_error(parser, "Expected ',' between grid and block in dispatch");
+    DISP_FAIL();
+  }
+  block = parser_parse_expression(parser);
+  if (!block || !parser_expect(parser, TOKEN_RBRACKET)) {
+    DISP_FAIL();
+  }
+
+  // ( args )
+  if (!parser_expect(parser, TOKEN_LPAREN)) {
+    parser_set_error(parser, "Expected '(' before dispatch arguments");
+    DISP_FAIL();
+  }
+  if (parser->current_token.type != TOKEN_RPAREN) {
+    while (1) {
+      if (nargs >= 64) {
+        parser_set_error(parser, "too many dispatch arguments (max 64)");
+        DISP_FAIL();
+      }
+      ASTNode *a = parser_parse_expression(parser);
+      if (!a) {
+        DISP_FAIL();
+      }
+      args[nargs++] = a;
+      if (parser->current_token.type == TOKEN_COMMA) {
+        parser_advance(parser);
+        continue;
+      }
+      break;
+    }
+  }
+  if (!parser_expect(parser, TOKEN_RPAREN)) {
+    DISP_FAIL();
+  }
+#undef DISP_FAIL
+
+  int uid = parser->dispatch_counter++;
+  char pname[32];
+  snprintf(pname, sizeof(pname), "__mdsp%d_p", uid);
+
+  ASTNode *blk = ast_create_program();
+  if (!blk) {
+    goto oom;
+  }
+
+  // var __mdsp<uid>_a<i> = arg_i;   (type inferred from the argument)
+  for (size_t i = 0; i < nargs; i++) {
+    char an[32];
+    snprintf(an, sizeof(an), "__mdsp%d_a%zu", uid, i);
+    parser_block_add(blk, ast_create_var_declaration(an, NULL, args[i], loc));
+    args[i] = NULL; // ownership moved into the var decl
+  }
+
+  if (nargs > 0) {
+    // var __mdsp<uid>_p: int64[N];
+    char ptype[24];
+    snprintf(ptype, sizeof(ptype), "int64[%zu]", nargs);
+    parser_block_add(blk, ast_create_var_declaration(pname, ptype, NULL, loc));
+    // __mdsp<uid>_p[i] = (int64)&__mdsp<uid>_a<i>;
+    for (size_t i = 0; i < nargs; i++) {
+      char an[32];
+      snprintf(an, sizeof(an), "__mdsp%d_a%zu", uid, i);
+      ASTNode *target = ast_create_array_index_expression(
+          ast_create_identifier(pname, loc), ast_create_number_literal((long long)i, loc, 10), loc);
+      ASTNode *addr =
+          ast_create_unary_expression("&", ast_create_identifier(an, loc), loc);
+      ASTNode *castv = ast_create_cast_expression("int64", addr, loc);
+      parser_block_add(blk, ast_create_field_assignment(target, castv, loc));
+    }
+  }
+
+  // gpu_launch(K, grid, block, &__p[0] | (int64*)0, N);
+  ASTNode *params_ptr;
+  if (nargs > 0) {
+    params_ptr = ast_create_unary_expression(
+        "&",
+        ast_create_array_index_expression(
+            ast_create_identifier(pname, loc),
+            ast_create_number_literal(0, loc, 10), loc),
+        loc);
+  } else {
+    params_ptr = ast_create_cast_expression(
+        "int64*", ast_create_number_literal(0, loc, 10), loc);
+  }
+  ASTNode *call_args[5];
+  call_args[0] = ast_create_identifier(kernel_name, loc);
+  call_args[1] = grid;
+  call_args[2] = block;
+  call_args[3] = params_ptr;
+  call_args[4] = ast_create_number_literal((long long)nargs, loc, 10);
+  parser_block_add(blk,
+                   ast_create_call_expression("gpu_launch", call_args, 5, loc));
+
+  free(kernel_name);
+  return blk;
+
+oom:
+  free(kernel_name);
+  if (grid)
+    ast_destroy_node(grid);
+  if (block)
+    ast_destroy_node(block);
+  for (size_t i = 0; i < nargs; i++)
+    if (args[i])
+      ast_destroy_node(args[i]);
+  parser_set_error(parser, "Out of memory desugaring dispatch");
+  return NULL;
+}
+
 ASTNode *parser_parse_for_statement(Parser *parser) {
   if (!parser)
     return NULL;
@@ -3665,6 +4181,12 @@ ASTNode *parser_parse_for_statement(Parser *parser) {
   SourceLocation location = parser_current_location(parser);
   if (!parser_expect(parser, TOKEN_FOR)) {
     return NULL;
+  }
+
+  // The classic C-style form always opens with '('. Anything else starts a
+  // range-based loop: `for i in lo..hi { ... }`.
+  if (parser->current_token.type != TOKEN_LPAREN) {
+    return parser_parse_range_for(parser, location);
   }
 
   if (!parser_expect(parser, TOKEN_LPAREN)) {

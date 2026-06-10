@@ -1,0 +1,8 @@
+// `@inline` is a function decorator; applying it to a loop is an error.
+function main() -> int32 {
+  var s: int32 = 0;
+  @inline for i in 0..10 {
+    s = s + i;
+  }
+  return s;
+}

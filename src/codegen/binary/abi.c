@@ -1064,8 +1064,9 @@ int code_generator_binary_resolved_type_is_supported(Type *type,
   case TYPE_FLOAT64:
   case TYPE_POINTER:
   case TYPE_ENUM:
-  case TYPE_FUNCTION_POINTER:
     return type->size <= 8;
+  case TYPE_FUNCTION_POINTER:
+    return 1;
   case TYPE_VOID:
     return allow_void;
   default:
@@ -1148,6 +1149,22 @@ Type *code_generator_binary_get_operand_type_in_context(
     return NULL;
   }
 
+  /* Parameters carry no IR_OP_DECLARE_LOCAL, and the param symbol is often out
+   * of scope in the symbol table by codegen time, so resolve them from the
+   * function signature. Without this a uint64/int32/etc. parameter used as a
+   * divide/shift/compare operand falls back to "signed", miscompiling unsigned
+   * arithmetic at -O0 (where copy-prop hasn't replaced the symbol with a typed
+   * temp). */
+  for (size_t i = 0; i < ir_function->parameter_count; i++) {
+    if (ir_function->parameter_names && ir_function->parameter_names[i] &&
+        strcmp(ir_function->parameter_names[i], operand->name) == 0) {
+      return code_generator_binary_get_resolved_type(
+          generator,
+          ir_function->parameter_types ? ir_function->parameter_types[i] : NULL,
+          0);
+    }
+  }
+
   for (size_t i = 0; i < ir_function->instruction_count; i++) {
     const IRInstruction *instruction = &ir_function->instructions[i];
     if (instruction->op == IR_OP_DECLARE_LOCAL && instruction->dest.name &&
@@ -1176,8 +1193,20 @@ int code_generator_binary_validate_signature(CodeGenerator *generator,
     return 0;
   }
 
-  if (!code_generator_binary_type_is_abi_supported(generator,
-                                                   function_data->return_type, 1)) {
+  Type *return_type = NULL;
+  Symbol *function_symbol =
+      generator->symbol_table && function_data->name
+          ? symbol_table_lookup(generator->symbol_table, function_data->name)
+          : NULL;
+  if (function_symbol && function_symbol->kind == SYMBOL_FUNCTION &&
+      function_symbol->data.function.return_type) {
+    return_type = function_symbol->data.function.return_type;
+  } else {
+    return_type = code_generator_binary_get_resolved_type(
+        generator, function_data->return_type, 1);
+  }
+
+  if (!code_generator_binary_resolved_type_is_abi_supported(return_type, 1)) {
     code_generator_set_error(
         generator,
         "Direct object backend only supports integer/pointer/string/float64 "
@@ -1793,7 +1822,7 @@ int code_generator_binary_emit_temp_stack_store(
 }
 
 int code_generator_binary_emit_symbol_stack_load(
-    CodeGenerator *generator, BinaryFunctionContext *context, Symbol *symbol,
+    CodeGenerator *generator, BinaryFunctionContext *context, Type *type,
     int stack_offset, BinaryGpRegister target_register) {
   int size = 8;
   int is_signed = 0;
@@ -1802,9 +1831,9 @@ int code_generator_binary_emit_symbol_stack_load(
     return 0;
   }
 
-  if (symbol && symbol->type) {
-    size = code_generator_binary_resolved_type_scalar_size(symbol->type);
-    is_signed = code_generator_binary_resolved_type_is_signed_integer(symbol->type);
+  if (type) {
+    size = code_generator_binary_resolved_type_scalar_size(type);
+    is_signed = code_generator_binary_resolved_type_is_signed_integer(type);
   }
 
   switch (size) {

@@ -10,6 +10,16 @@
 
 #define IR_PROFILE_ID_NONE UINT32_MAX
 
+/* `@simd` loop markers. A marker is an IR_OP_NOP whose `text` is
+ * "@@simd:B:<id>:<mode>" (emitted just before a vectorization-requested loop)
+ * or "@@simd:E:<id>:0" (just after it); <mode> is a SimdAttr. NOP is skipped by
+ * every recognizer and is a no-op in every backend, so the marker never
+ * perturbs vectorization or codegen. The release-stage contract verifier
+ * (ir_optimize_simd_contract.c) pairs B/E by nesting, checks whether a SIMD
+ * intrinsic landed between them, enforces the contract, and clears the
+ * markers. Emitted by ir_lowering.c. */
+#define IR_SIMD_MARKER_PREFIX "@@simd:"
+
 typedef enum {
   IR_OPERAND_NONE,
   IR_OPERAND_TEMP,
@@ -61,7 +71,7 @@ typedef enum {
    * added to dest's prior value (the scalar code initializes count=0, so the
    * pass only matches when that holds). lhs = buffer base symbol, rhs = length
    * symbol/operand, dest = count symbol. Codegen lowers this to an SSE2
-   * 16-bytes/iteration scan plus a scalar tail; see code_generator_ir.c. */
+   * 16-bytes/iteration scan plus a scalar tail. */
   IR_OP_COUNT_WORD_STARTS,
   /* Inline memory copy: dest = dst pointer, lhs = src pointer, rhs = byte count
    * (INT). Produced by ir_memcpy_inline_pass for constant-size memcpy calls. */
@@ -87,6 +97,25 @@ typedef enum {
   /* Signed int32 dot product into int64. dest = sum/result, lhs = a, rhs = b,
    * arguments[0] = element count. */
   IR_OP_SIMD_DOT_I32,
+  /* Signed int8 x int8 -> int32 dot product (the quantized GEMM/GEMV inner
+   * loop). dest = int32 sum, lhs = a (int8*), rhs = b (int8*), arguments[0] =
+   * element count. AVX2 vpmaddwd kernel. */
+  IR_OP_SIMD_DOT_I8,
+  /* SLP-vectorized group of K parallel int32 multiply-accumulate reductions
+   * (K in {4,8}). For lane j in 0..K-1:
+   *     out[out_off + j] += sum_{k=0..count-1} a[a_off + k] * b[b_off + k*bstr + j]
+   * i.e. one shared scalar a[k] broadcast against K contiguous b lanes, K
+   * independent accumulators stored to K contiguous outputs. Matched from the
+   * instruction-level parallelism of K isomorphic accumulator chains (broadcast
+   * scalar x contiguous loads) -- NOT from matmul's shape or names.
+   * dest=out base ptr, lhs=a base ptr, rhs=b base ptr; arguments:
+   * [0]=K, [1]=count, [2]=a_off, [3]=b_off, [4]=b_stride, [5]=out_off. */
+  IR_OP_SIMD_SLP_MAC_I32,
+  /* int8 x int8 -> int32 variant of SLP_MAC: the quantized GEMM tile. Same
+   * operand/argument layout, but a and b are int8 arrays (byte loads, widened to
+   * int32) while c (out) is int32. Same AVX2 broadcast-MAC kernel with int8
+   * widening. */
+  IR_OP_SIMD_SLP_MAC_I8,
   /* dst[i] = src[i]*mul+add; dest += sum of outputs. lhs=src, rhs=dst,
    * arguments[0]=len, [1]=mul, [2]=add (int32). */
   IR_OP_SIMD_SCALE_I32,
@@ -118,6 +147,9 @@ typedef enum {
    * lhs = src, rhs = dst, arguments[0] = element count. */
   IR_OP_SIMD_AFFINE_MAP_F64,
   IR_OP_SIMD_AFFINE_MAP_F32,
+  /* In-place a[i] = exp(a[i]) over a float32 array (vectorized libm exp).
+   * dest = array base, arguments[0] = element count. */
+  IR_OP_SIMD_EXP_F32,
   /* Counted-loop reduction where each iteration adds (int64)trunc(CHAIN) to the
    * dest accumulator, with CHAIN a straight-line float64 expression in the loop
    * counter: x0 = (float64)i, then a sequence of {x*=k, x+=k, x-=k, x=k-x, x/=k}
@@ -130,9 +162,11 @@ typedef enum {
    * backend only. */
   IR_OP_SIMD_I2F_REDUCE_F64,
   /* General auto-vectorized counted unit-stride loop over a straight-line
-   * float64 DAG. Emitted by ir_auto_vectorize_pass for loops the per-shape
-   * recognizers above did not claim. The body DAG is serialized into
-   * arguments[]:
+   * float DAG. Emitted by ir_auto_vectorize_pass for loops the per-shape
+   * recognizers above did not claim. The element width is carried in
+   * instruction->float_bits (64 = f64x4 lanes / 8-byte elements, 32 = f32x8
+   * lanes / 4-byte elements); both stride 32 bytes per vector iteration. The
+   * body DAG is serialized into arguments[]:
    *   header (6 INT): [0] reduce_op (0 = element-wise map, 1 = '+' reduction)
    *                   [1] n_arrays  [2] n_nodes  [3] root_node
    *                   [4] n_consts  [5] max_live (peak simultaneous live ymm)
@@ -140,10 +174,11 @@ typedef enum {
    *   then n_nodes nodes, each 3 INT operands (tag, op0, op1):
    *       tag 0=LOAD(op0=array idx) 1=IOTA 2=CONST(op0=const idx)
    *           3=ADD 4=SUB 5=MUL 6=DIV (op0,op1 = earlier node indices),
-   *   then n_consts FLOAT64 operands.
+   *   then n_consts FLOAT64 operands (the kernel narrows them to f32 when
+   *   float_bits==32).
    * dest = reduction accumulator symbol (reduce_op==1) or stored array base
    * (reduce_op==0); lhs = trip count (SYMBOL or INT). Direct-object backend
-   * only. The kernel replays the DAG over f64x4 lanes with stack-hoisted
+   * only. The kernel replays the DAG over the packed lanes with stack-hoisted
    * constants + a scalar remainder; element-wise maps are bit-identical to the
    * scalar loop, '+' reductions reassociate like the sum/dot kernels. */
   IR_OP_SIMD_VLOOP_F64,
@@ -185,6 +220,14 @@ typedef struct {
    * unspecified and is treated as 64 (double) for backward compatibility with
    * code paths that only ever produced float64. */
   int float_bits;
+  /* Set on an IR_OP_LOAD whose loaded scalar is an UNSIGNED integer (uint8/16/32),
+   * recorded from the pointee type at lowering time. A 32-bit load zero-extends
+   * into the 64-bit register on x86-64, but the backend otherwise sign-extends a
+   * 4-byte load into a temp (it cannot recover the load's signedness from the
+   * untyped destination temp). Honoring this flag keeps an unsigned value's high
+   * bits clean, so the 64-bit ops the fallback emits (compare, divide, (int64)
+   * widening) see the true value instead of a sign-extended one. */
+  int is_unsigned;
   ASTNode *ast_ref;
 } IRInstruction;
 
@@ -212,6 +255,10 @@ typedef struct {
   size_t block_count;
   size_t entry_block;
   int cfg_valid;
+  // Function-decorator flags propagated from the AST (see ast.h):
+  int is_inline;   // `@inline`  : force inline past the heuristic gate
+  int is_noinline; // `@noinline`: never inline this function
+  int is_pure;     // `@pure`    : side-effect-free; enables pure-call LICM
 } IRFunction;
 
 typedef struct {
@@ -265,7 +312,22 @@ IRProgram *ir_lower_program(ASTNode *program, TypeChecker *type_checker,
                             SymbolTable *symbol_table, char **error_message,
                             int emit_runtime_checks);
 int ir_program_dump(IRProgram *program, FILE *output);
+/* Human-readable mnemonic for an opcode (e.g. "simd_dot_i8"), used by dumps and
+ * the `--simd-report` diagnostics. */
+const char *ir_opcode_name(IROpcode op);
 int ir_instruction_dump(const IRInstruction *instruction,
                         char *buffer, size_t capacity);
+
+/* --native-heap: retarget the allocation surface onto std/alloc's Mettle
+ * allocator at the IR level, so the rewritten calls flow through the normal,
+ * fully-optimized call path on every backend (MIR and legacy) instead of a
+ * fragile backend-injected call. Rewrites, in every function:
+ *   - IR_OP_NEW          -> IR_OP_CALL "mettle_heap_zeroed"(size)
+ *   - call "malloc"      -> call "mettle_heap_alloc"
+ *   - call "calloc"      -> call "mettle_heap_calloc"
+ *   - call "realloc"     -> call "mettle_heap_realloc"
+ *   - call "free"        -> call "mettle_heap_free"
+ * Returns 1 on success, 0 on allocation failure. */
+int ir_program_route_to_native_heap(IRProgram *program);
 
 #endif // IR_H

@@ -1,0 +1,43 @@
+// Mettle standard library: OS page-level memory (Windows)
+//
+// The lowest layer of Mettle's native memory subsystem. It hands raw,
+// page-aligned, read/write memory back from the operating system with no C
+// runtime allocator (malloc/HeapAlloc) in between. `std/alloc` builds Mettle's
+// own general-purpose allocator on top of these primitives.
+//
+// The Linux sibling `osmem.linux.mettle` implements the same surface over
+// mmap/munmap, so `import "std/osmem"` works unchanged on both platforms.
+
+// ─── Win32 virtual-memory bindings ──────────────────────────────────────────
+export extern function VirtualAlloc(addr: cstring, size: int64, alloc_type: uint32, protect: uint32) -> cstring = "VirtualAlloc";
+export extern function VirtualFree(addr: cstring, size: int64, free_type: uint32) -> int32 = "VirtualFree";
+
+// ─── Public API ─────────────────────────────────────────────────────────────
+
+// Allocation granularity / page size. Windows commits in 4 KiB pages.
+export function os_page_size() -> int64 {
+  return (int64)4096;
+}
+
+// Reserve and commit `n` bytes of zero-filled, read/write memory directly from
+// the OS. The result is page-aligned. Returns 0 on failure. The caller passes
+// the size back to os_mem_unmap, though Windows ignores it (see below).
+export function os_mem_map(n: int64) -> cstring {
+  if (n <= (int64)0) {
+    return 0;
+  }
+  // MEM_COMMIT | MEM_RESERVE = 0x3000, PAGE_READWRITE = 0x04
+  return VirtualAlloc(0, n, (uint32)0x3000, (uint32)0x04);
+}
+
+// Release a region previously returned by os_mem_map. On Windows, MEM_RELEASE
+// frees the entire original reservation, so `n` is required to be 0 and the
+// region size is unused here; it is part of the signature for parity with the
+// Linux (munmap) variant, which needs the length.
+export function os_mem_unmap(p: cstring, n: int64) {
+  if (p == 0) {
+    return;
+  }
+  // MEM_RELEASE = 0x8000 (dwSize must be 0).
+  VirtualFree(p, (int64)0, (uint32)0x8000);
+}

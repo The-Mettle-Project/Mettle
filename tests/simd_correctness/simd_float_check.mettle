@@ -65,6 +65,36 @@ function vred_ssq(a: float64*, b: float64*, n: int64) -> float64 {
   return acc;
 }
 
+/* float32 counterparts: the same general-vectorizer shapes at single precision
+ * (IR_OP_SIMD_VLOOP_F64 with float_bits==32, f32x8 lanes). vmap_div_f32
+ * additionally exercises the packed vdivps / scalar divss path — (a*6)/3 == 2*a
+ * is exact for integer-valued a and the two constants are not adjacent, so they
+ * cannot be folded into a single multiply. */
+function vmap_combo_f32(out: float32*, a: float32*, b: float32*, c: float32*,
+                        n: int64) -> int32 {
+  var i: int64 = 0;
+  while (i < n) { out[i] = (a[i] + b[i]) * c[i]; i = i + 1; }
+  return 0;
+}
+function vred_ssq_f32(a: float32*, b: float32*, n: int64) -> float32 {
+  var acc: float32 = 0.0; var i: int64 = 0;
+  while (i < n) { acc = acc + (a[i] * a[i] + b[i]); i = i + 1; }
+  return acc;
+}
+function vmap_div_f32(out: float32*, a: float32*, n: int64) -> int32 {
+  var i: int64 = 0;
+  while (i < n) { out[i] = a[i] * (float32)6.0 / (float32)3.0; i = i + 1; }
+  return 0;
+}
+/* iota map: exercises the f32 (float32)i path (packed [0..7] build +
+ * vcvtdq2ps, scalar cvtsi2ss tail). out[i] = 3*i + 1, exact in f32 for the
+ * lengths tested. */
+function vmap_iota_f32(out: float32*, n: int64) -> int32 {
+  var i: int64 = 0;
+  while (i < n) { out[i] = (float32)i * (float32)3.0 + (float32)1.0; i = i + 1; }
+  return 0;
+}
+
 var g_fail: int32 = 0;
 function fail(label: cstring, len: int64) -> int32 {
   print(cstr("FAIL ")); print(label); print(cstr(" n=")); print_int(len);
@@ -81,6 +111,8 @@ function run_len(n: int64) -> int32 {
   var o64: float64* = (float64*)malloc(cap * 8);
   var a32: float32* = (float32*)malloc(cap * 4);
   var b32: float32* = (float32*)malloc(cap * 4);
+  var c32: float32* = (float32*)malloc(cap * 4);
+  var o32: float32* = (float32*)malloc(cap * 4);
 
   var ref_sum: float64 = 0.0;
   var ref_dot: float64 = 0.0;
@@ -93,7 +125,7 @@ function run_len(n: int64) -> int32 {
     var y: int32 = rnd_small();
     var z: int32 = rnd_small();
     a64[i] = (float64)x; b64[i] = (float64)y; c64[i] = (float64)z;
-    a32[i] = (float32)x; b32[i] = (float32)y;
+    a32[i] = (float32)x; b32[i] = (float32)y; c32[i] = (float32)z;
     ref_sum = ref_sum + (float64)x;
     ref_dot = ref_dot + (float64)x * (float64)y;
     ref_affine = ref_affine + (float64)(2 * x + 3 * y + 5);
@@ -116,13 +148,25 @@ function run_len(n: int64) -> int32 {
   if (ks_f64(o64, n) != ref_combo) { fail(cstr("vloop_map_combo"), n); }
   if (vred_ssq(a64, b64, n) != ref_ssq) { fail(cstr("vloop_reduce_ssq"), n); }
 
+  // float32 general-vectorizer checks (run before ka_f32 overwrites b32).
+  vmap_combo_f32(o32, a32, b32, c32, n);
+  if ((float64)ks_f32(o32, n) != ref_combo) { fail(cstr("vloop_map_combo_f32"), n); }
+  if ((float64)vred_ssq_f32(a32, b32, n) != ref_ssq) { fail(cstr("vloop_reduce_ssq_f32"), n); }
+  vmap_div_f32(o32, a32, n);
+  if ((float64)ks_f32(o32, n) != 2.0 * ref_sum) { fail(cstr("vloop_map_div_f32"), n); }
+  // iota map: sum_{i=0}^{n-1} (3i+1) = 3*n*(n-1)/2 + n (exact int -> f32 here).
+  vmap_iota_f32(o32, n);
+  if ((float64)ks_f32(o32, n) != (float64)(3 * n * (n - 1) / 2 + n)) {
+    fail(cstr("vloop_map_iota_f32"), n);
+  }
+
   ka_f64(a64, b64, n);
   ka_f32(a32, b32, n);
   if (ks_f64(b64, n) != ref_affine) { fail(cstr("affine_f64"), n); }
   if ((float64)ks_f32(b32, n) != ref_affine) { fail(cstr("affine_f32"), n); }
 
   free((cstring)a64); free((cstring)b64); free((cstring)c64); free((cstring)o64);
-  free((cstring)a32); free((cstring)b32);
+  free((cstring)a32); free((cstring)b32); free((cstring)c32); free((cstring)o32);
   return 0;
 }
 

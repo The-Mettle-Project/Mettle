@@ -181,8 +181,7 @@ typedef struct {
   size_t indirect_return_slot_capacity;
   size_t indirect_return_slot_cursor;
   /* Side-table: which IR temps currently hold a POINTER to an indirect-
-   * returned struct, with the byte size of that struct. Same role as
-   * ir_indirect_temp_table in the text-asm path. Names are interned IR
+   * returned struct, with the byte size of that struct. Names are interned IR
    * strings (borrowed). */
   char **indirect_temp_names;
   size_t *indirect_temp_sizes;
@@ -336,6 +335,7 @@ int binary_emit_cmovcc_reg_reg(BinaryCodeBuffer *buffer, unsigned char opcode, B
 int binary_emit_cmp_reg_imm32(BinaryCodeBuffer *buffer, BinaryGpRegister reg, uint32_t immediate);
 int binary_emit_cmp_reg_reg(BinaryCodeBuffer *buffer, BinaryGpRegister lhs, BinaryGpRegister rhs);
 int binary_emit_cmp_reg_reg32(BinaryCodeBuffer *buffer, BinaryGpRegister lhs, BinaryGpRegister rhs);
+int binary_emit_cmp_reg_imm_w32(BinaryCodeBuffer *buffer, BinaryGpRegister reg, uint32_t immediate);
 int binary_emit_cqo(BinaryCodeBuffer *buffer);
 int binary_emit_cvtsd2ss_xmm_xmm(BinaryCodeBuffer *buffer, BinaryXmmRegister destination, BinaryXmmRegister source);
 int binary_emit_cvtsi2sd_xmm_reg(BinaryCodeBuffer *buffer, BinaryXmmRegister destination, BinaryGpRegister source);
@@ -363,6 +363,7 @@ int binary_emit_lea_reg_reg(BinaryCodeBuffer *buffer, BinaryGpRegister destinati
 int binary_emit_lea_reg_rip_placeholder(BinaryCodeBuffer *buffer, BinaryGpRegister destination, size_t *displacement_offset_out);
 int binary_emit_memory_access(BinaryCodeBuffer *buffer, unsigned char opcode, BinaryGpRegister reg, BinaryGpRegister base, int displacement);
 int binary_emit_memory_access_ex(BinaryCodeBuffer *buffer, int operand_size_prefix, int rex_w, unsigned char opcode1, int has_opcode2, unsigned char opcode2, BinaryGpRegister reg, BinaryGpRegister base, int displacement);
+int binary_emit_memory_access_sib(BinaryCodeBuffer *buffer, int operand_size_prefix, int rex_w, unsigned char opcode1, int has_opcode2, unsigned char opcode2, BinaryGpRegister reg, BinaryGpRegister base, BinaryGpRegister index, int scale, int displacement);
 int binary_emit_mov_eax_eax(BinaryCodeBuffer *buffer);
 int binary_emit_mov_mem_reg(BinaryCodeBuffer *buffer, BinaryGpRegister base, int displacement, BinaryGpRegister source);
 int binary_emit_mov_mem_reg16(BinaryCodeBuffer *buffer, BinaryGpRegister base, int displacement, BinaryGpRegister source);
@@ -390,6 +391,8 @@ int binary_emit_movsx_reg_reg16(BinaryCodeBuffer *buffer, BinaryGpRegister desti
 int binary_emit_movsx_reg_reg8(BinaryCodeBuffer *buffer, BinaryGpRegister destination, BinaryGpRegister source);
 int binary_emit_movsxd_rax_eax(BinaryCodeBuffer *buffer);
 int binary_emit_movsxd_reg_reg32(BinaryCodeBuffer *buffer, BinaryGpRegister destination, BinaryGpRegister source);
+int binary_emit_movzx_reg_reg8(BinaryCodeBuffer *buffer, BinaryGpRegister destination, BinaryGpRegister source);
+int binary_emit_movzx_reg_reg16(BinaryCodeBuffer *buffer, BinaryGpRegister destination, BinaryGpRegister source);
 int binary_emit_movzx_eax_al(BinaryCodeBuffer *buffer);
 int binary_emit_movzx_eax_ax(BinaryCodeBuffer *buffer);
 int binary_emit_movzx_reg_mem16(BinaryCodeBuffer *buffer, BinaryGpRegister destination, BinaryGpRegister base, int displacement);
@@ -515,7 +518,7 @@ int code_generator_binary_record_debug_label_export(
 int code_generator_binary_export_debug_symbols(
     CodeGenerator *generator, BinaryFunctionContext *context,
     size_t text_section, size_t function_offset, size_t end_offset);
-int code_generator_binary_emit_rax_binary_rhs( CodeGenerator *generator, BinaryFunctionContext *context, const char *op, const IROperand *rhs);
+int code_generator_binary_emit_rax_binary_rhs( CodeGenerator *generator, BinaryFunctionContext *context, const char *op, const IROperand *rhs, int lhs_unsigned);
 int code_generator_binary_emit_rep_movsb( CodeGenerator *generator, BinaryFunctionContext *context, BinaryGpRegister src_addr_reg, BinaryGpRegister dst_addr_reg, size_t size);
 int code_generator_binary_emit_rep_movsq( CodeGenerator *generator, BinaryFunctionContext *context, BinaryGpRegister src_addr_reg, BinaryGpRegister dst_addr_reg, size_t qword_count);
 int code_generator_binary_emit_rotate_add( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
@@ -527,6 +530,19 @@ int code_generator_binary_try_emit_offset_scaled_address_load( CodeGenerator *ge
 int code_generator_binary_try_emit_offset_scaled_address_store( CodeGenerator *generator, BinaryFunctionContext *context, const IRFunction *function, size_t instruction_index, size_t *consumed_out);
 int code_generator_binary_emit_simd_clamp_i32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_dot_i32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
+int code_generator_binary_emit_simd_dot_i8( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
+int code_generator_binary_emit_simd_exp_f32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
+int code_generator_binary_emit_simd_slp_mac_i32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
+/* Pure inner loop of the SLP MAC kernel for the MIR pass-through path. Assumes
+ * RCX/RDX/R8 = a/b/out element pointers (offsets already applied), R9 = k count,
+ * and RAX = b row stride in bytes (advances b each iteration). K is 4 or 8. */
+int code_generator_binary_emit_simd_slp_mac_i32_loop(BinaryCodeBuffer *b, long long K);
+int code_generator_binary_emit_simd_slp_mac_i8_loop(BinaryCodeBuffer *b, long long K);
+int code_generator_binary_emit_simd_slp_mac_i8( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
+/* Emit a single vzeroupper (clears YMM upper halves). Used by the MIR epilogue
+ * to guard the AVX->legacy-SSE transition once per function that ran an inline
+ * vector kernel. */
+int code_generator_binary_emit_vzeroupper(BinaryCodeBuffer *b);
 int code_generator_binary_emit_simd_insertion_sort_i32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_matmul_n32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_reverse_copy_i32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
@@ -618,7 +634,7 @@ int code_generator_binary_instruction_compare_width( CodeGenerator *generator, B
 int code_generator_binary_emit_reg_reg_compare( BinaryCodeBuffer *buffer, BinaryGpRegister lhs, BinaryGpRegister rhs, int width);
 int code_generator_binary_emit_reg_reg_move( BinaryCodeBuffer *buffer, BinaryGpRegister destination, BinaryGpRegister source, Type *type);
 int code_generator_binary_try_emit_reg_multiply_immediate( BinaryFunctionContext *context, BinaryGpRegister target_register, long long immediate, int *handled_out);
-int code_generator_binary_emit_symbol_stack_load( CodeGenerator *generator, BinaryFunctionContext *context, Symbol *symbol, int stack_offset, BinaryGpRegister target_register);
+int code_generator_binary_emit_symbol_stack_load( CodeGenerator *generator, BinaryFunctionContext *context, Type *type, int stack_offset, BinaryGpRegister target_register);
 int code_generator_binary_emit_symbol_stack_store( CodeGenerator *generator, BinaryFunctionContext *context, Symbol *symbol, int stack_offset, BinaryGpRegister source_register);
 size_t code_generator_binary_symbol_write_count( const IRFunction *function, const char *name);
 int code_generator_binary_try_emit_address_add_load( CodeGenerator *generator, BinaryFunctionContext *context, const IRFunction *function, size_t instruction_index, size_t *consumed_out);

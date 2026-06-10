@@ -239,6 +239,9 @@ typedef struct {
   X(SIMD_SUM_U8, "simd_sum_u8")                                              \
   X(SIMD_BYTE_MAP, "simd_byte_map")                                          \
   X(SIMD_DOT_I32, "simd_dot_i32")                                            \
+  X(SIMD_DOT_I8, "simd_dot_i8")                                              \
+  X(SIMD_SLP_MAC_I32, "simd_slp_mac_i32")                                    \
+  X(SIMD_SLP_MAC_I8, "simd_slp_mac_i8")                                      \
   X(SIMD_INSERTION_SORT_I32, "simd_insertion_sort_i32")                      \
   X(SROA, "sroa")
 
@@ -340,6 +343,11 @@ int ir_fuse_while_loop_to_insn(IRFunction *function, size_t header_index,
 int ir_index_vector_append(IRIndexVector *vector, size_t value);
 void ir_index_vector_destroy(IRIndexVector *vector);
 int ir_inline_small_functions_pass(IRProgram *program, int *changed);
+/* Resolve a function by name within the program (hashed lookup with a linear
+ * fallback). Defined in ir_optimize_inline.c. */
+IRFunction *ir_program_find_function(IRProgram *program, const char *name);
+/* `@pure` loop-invariant call hoisting (program-level; runs after inlining). */
+int ir_hoist_pure_calls_pass(IRProgram *program, int *changed);
 void ir_instruction_clear_arguments(IRInstruction *instruction);
 void ir_instruction_destroy_storage(IRInstruction *instruction);
 int ir_instruction_has_side_effect(const IRInstruction *instruction);
@@ -409,8 +417,20 @@ int ir_operand_resolve_symbol_int(const IRSymbolValueMap *symbol_map,
 int ir_optimize_function_pipeline(IRFunction *function);
 int ir_optimize_program_pipeline(IRProgram *program,
                                  const IROptimizeOptions *options);
+/* Enforce `@simd` / `@simd!` loop attributes after vectorization has run.
+ * Returns 1 if every contract was honored (and clears all `@simd` markers),
+ * 0 if a `@simd!` contract was violated (after printing a diagnostic). */
+int ir_verify_simd_contracts(IRFunction *function);
+/* Resets/queries the "a @simd! contract was violated" flag so the driver can
+ * distinguish a user error from an internal compiler error.
+ * (ir_optimize_had_user_error is also declared in the public ir_optimize.h.) */
+void ir_optimize_reset_user_error(void);
+int ir_optimize_had_user_error(void);
+/* --simd-report: emit a note for every `@simd` loop (vectorized or not). */
+void ir_optimize_set_simd_report(int enabled);
 int ir_optimize_pre_inline_function(IRFunction *function);
 int ir_pass_is_skipped(IROptPassId pass_id);
+int ir_pass_name_is_skipped(const char *pass_name);
 int ir_pointer_induction_pass(IRFunction *function, int *changed);
 int ir_positive_loop_div2_to_shift_pass(IRFunction *function,
                                                int *changed);
@@ -445,11 +465,15 @@ int ir_run_fixpoint_pass(IRFunction *function, IROptPassId pass_id,
                          unsigned long long *version,
                          unsigned long long *clean_version, int *changed);
 int ir_simd_affine_map_float_pass(IRFunction *function, int *changed);
+int ir_simd_exp_f32_pass(IRFunction *function, int *changed);
 int ir_simd_i2f_reduce_pass(IRFunction *function, int *changed);
 int ir_auto_vectorize_pass(IRFunction *function, int *changed);
 int ir_outer_vectorize_pass(IRFunction *function, int *changed);
 int ir_simd_dot_float_pass(IRFunction *function, int *changed);
 int ir_simd_dot_i32_pass(IRFunction *function, int *changed);
+int ir_simd_dot_i8_pass(IRFunction *function, int *changed);
+int ir_simd_slp_mac_i32_pass(IRFunction *function, int *changed);
+int ir_simd_slp_mac_i8_pass(IRFunction *function, int *changed);
 int ir_simd_insertion_sort_i32_pass(IRFunction *function, int *changed);
 int ir_simd_memory_map_pass(IRFunction *function, int *changed);
 int ir_simd_minmax_i32_pass(IRFunction *function, int *changed);

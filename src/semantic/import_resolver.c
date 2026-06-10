@@ -486,6 +486,9 @@ typedef struct {
 
 typedef struct {
   char *alias;
+  char **members;
+  size_t member_count;
+  size_t member_capacity;
 } NamespaceBinding;
 
 typedef struct RewriteScope {
@@ -496,6 +499,7 @@ typedef struct RewriteScope {
 } RewriteScope;
 
 static const char *get_declaration_name(ASTNode *decl);
+static int is_declaration_exported(ASTNode *decl);
 
 static int replace_interned_string(char **slot, const char *value) {
   char *replacement = NULL;
@@ -706,19 +710,32 @@ static void free_name_rewrites(NameRewrite *rewrites, size_t rewrite_count) {
   free(rewrites);
 }
 
-static int has_namespace_binding(const NamespaceBinding *bindings,
-                                 size_t binding_count, const char *alias) {
+static NamespaceBinding *find_namespace_binding(NamespaceBinding *bindings,
+                                                size_t binding_count,
+                                                const char *alias) {
   if (!bindings || !alias) {
-    return 0;
+    return NULL;
   }
 
   for (size_t i = 0; i < binding_count; i++) {
     if (strcmp(bindings[i].alias, alias) == 0) {
-      return 1;
+      return &bindings[i];
     }
   }
 
-  return 0;
+  return NULL;
+}
+
+static const NamespaceBinding *
+find_namespace_binding_const(const NamespaceBinding *bindings,
+                             size_t binding_count, const char *alias) {
+  return find_namespace_binding((NamespaceBinding *)bindings, binding_count,
+                                alias);
+}
+
+static int has_namespace_binding(const NamespaceBinding *bindings,
+                                 size_t binding_count, const char *alias) {
+  return find_namespace_binding_const(bindings, binding_count, alias) != NULL;
 }
 
 static int add_namespace_binding(NamespaceBinding **bindings,
@@ -748,8 +765,76 @@ static int add_namespace_binding(NamespaceBinding **bindings,
   if (!(*bindings)[*binding_count].alias) {
     return 0;
   }
+  (*bindings)[*binding_count].members = NULL;
+  (*bindings)[*binding_count].member_count = 0;
+  (*bindings)[*binding_count].member_capacity = 0;
 
   (*binding_count)++;
+  return 1;
+}
+
+static int namespace_binding_allows_member(const NamespaceBinding *bindings,
+                                           size_t binding_count,
+                                           const char *alias,
+                                           const char *member) {
+  const NamespaceBinding *binding =
+      find_namespace_binding_const(bindings, binding_count, alias);
+  if (!binding || !member) {
+    return 0;
+  }
+
+  for (size_t i = 0; i < binding->member_count; i++) {
+    if (strcmp(binding->members[i], member) == 0) {
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+static int add_namespace_binding_member(NamespaceBinding **bindings,
+                                        size_t *binding_count,
+                                        size_t *binding_capacity,
+                                        const char *alias,
+                                        const char *member) {
+  if (!bindings || !binding_count || !binding_capacity || !alias || !member) {
+    return 0;
+  }
+
+  if (!add_namespace_binding(bindings, binding_count, binding_capacity,
+                             alias)) {
+    return 0;
+  }
+
+  NamespaceBinding *binding =
+      find_namespace_binding(*bindings, *binding_count, alias);
+  if (!binding) {
+    return 0;
+  }
+
+  for (size_t i = 0; i < binding->member_count; i++) {
+    if (strcmp(binding->members[i], member) == 0) {
+      return 1;
+    }
+  }
+
+  if (binding->member_count >= binding->member_capacity) {
+    size_t new_capacity =
+        binding->member_capacity == 0 ? 8 : binding->member_capacity * 2;
+    char **grown =
+        realloc(binding->members, new_capacity * sizeof(char *));
+    if (!grown) {
+      return 0;
+    }
+    binding->members = grown;
+    binding->member_capacity = new_capacity;
+  }
+
+  binding->members[binding->member_count] = strdup(member);
+  if (!binding->members[binding->member_count]) {
+    return 0;
+  }
+  binding->member_count++;
   return 1;
 }
 
@@ -760,6 +845,7 @@ static void free_namespace_bindings(NamespaceBinding *bindings,
   }
   for (size_t i = 0; i < binding_count; i++) {
     free(bindings[i].alias);
+    free_string_array(bindings[i].members, bindings[i].member_count);
   }
   free(bindings);
 }
@@ -932,7 +1018,8 @@ static char *rewrite_type_string(const char *type_name,
           return NULL;
         }
 
-        if (has_namespace_binding(bindings, binding_count, alias)) {
+        if (namespace_binding_allows_member(bindings, binding_count, alias,
+                                            member)) {
           qualified = build_qualified_name(alias, member);
           if (!qualified ||
               !append_text_fragment(&rewritten, &length, &capacity, qualified,
@@ -1352,7 +1439,9 @@ static int rewrite_node_names(ASTNode *node, const NameRewrite *rewrites,
       Identifier *object_ident = (Identifier *)call->object->data;
       if (object_ident && object_ident->name &&
           !scope_contains(scope, object_ident->name) &&
-          has_namespace_binding(bindings, binding_count, object_ident->name)) {
+          namespace_binding_allows_member(bindings, binding_count,
+                                          object_ident->name,
+                                          call->function_name)) {
         char *qualified =
             build_qualified_name(object_ident->name, call->function_name);
         if (!qualified) {
@@ -1428,7 +1517,9 @@ static int rewrite_node_names(ASTNode *node, const NameRewrite *rewrites,
       Identifier *object_ident = (Identifier *)member->object->data;
       if (object_ident && object_ident->name &&
           !scope_contains(scope, object_ident->name) &&
-          has_namespace_binding(bindings, binding_count, object_ident->name)) {
+          namespace_binding_allows_member(bindings, binding_count,
+                                          object_ident->name,
+                                          member->member)) {
         Identifier *identifier = NULL;
         char *qualified = build_qualified_name(object_ident->name, member->member);
         if (!qualified) {
@@ -1658,6 +1749,55 @@ static int rewrite_node_names(ASTNode *node, const NameRewrite *rewrites,
     return 1;
   }
 
+  case AST_MATCH_STATEMENT: {
+    MatchStatement *match = (MatchStatement *)node->data;
+    if (!match) {
+      return 1;
+    }
+
+    if (match->expression &&
+        !rewrite_node_names(match->expression, rewrites, rewrite_count,
+                            bindings, binding_count, scope, 1)) {
+      return 0;
+    }
+
+    for (size_t i = 0; i < match->arm_count; i++) {
+      RewriteScope arm_scope;
+      RewriteScope *body_scope = scope;
+
+      if (!match->arms[i].is_default && match->arms[i].variant_name &&
+          !rename_string_if_needed(&match->arms[i].variant_name, rewrites,
+                                   rewrite_count)) {
+        return 0;
+      }
+
+      if (match->arms[i].binding_name) {
+        memset(&arm_scope, 0, sizeof(arm_scope));
+        arm_scope.parent = scope;
+        body_scope = &arm_scope;
+        if (!scope_add_name(&arm_scope, match->arms[i].binding_name)) {
+          scope_cleanup(&arm_scope);
+          return 0;
+        }
+      }
+
+      if (match->arms[i].body &&
+          !rewrite_node_names(match->arms[i].body, rewrites, rewrite_count,
+                              bindings, binding_count, body_scope, 1)) {
+        if (body_scope == &arm_scope) {
+          scope_cleanup(&arm_scope);
+        }
+        return 0;
+      }
+
+      if (body_scope == &arm_scope) {
+        scope_cleanup(&arm_scope);
+      }
+    }
+
+    return 1;
+  }
+
   case AST_DEFER_STATEMENT:
   case AST_ERRDEFER_STATEMENT: {
     DeferStatement *defer_stmt = (DeferStatement *)node->data;
@@ -1709,6 +1849,132 @@ static int collect_namespaced_rewrites(NameRewrite **rewrites,
           return 0;
         }
         free(qualified_name);
+      }
+    }
+  }
+
+  return 1;
+}
+
+static int add_namespace_members_for_declaration(
+    NamespaceBinding **bindings, size_t *binding_count,
+    size_t *binding_capacity, ASTNode *decl, const char *alias) {
+  const char *decl_name = NULL;
+
+  if (!decl || !alias) {
+    return 1;
+  }
+
+  decl_name = get_declaration_name(decl);
+  if (decl_name && !add_namespace_binding_member(bindings, binding_count,
+                                                 binding_capacity, alias,
+                                                 decl_name)) {
+    return 0;
+  }
+
+  if (decl->type == AST_ENUM_DECLARATION) {
+    EnumDeclaration *enum_decl = (EnumDeclaration *)decl->data;
+    if (enum_decl) {
+      for (size_t i = 0; i < enum_decl->variant_count; i++) {
+        if (!add_namespace_binding_member(bindings, binding_count,
+                                          binding_capacity, alias,
+                                          enum_decl->variants[i].name)) {
+          return 0;
+        }
+      }
+    }
+  }
+
+  return 1;
+}
+
+static char *build_private_import_name(const char *module_path,
+                                       const char *name) {
+  if (!name) {
+    return NULL;
+  }
+
+  unsigned long long hash =
+      (unsigned long long)mettle_fnv1a_hash(module_path ? module_path : "");
+  size_t capacity = strlen(name) + 64;
+  char *private_name = malloc(capacity);
+  if (!private_name) {
+    return NULL;
+  }
+
+  snprintf(private_name, capacity, "__import_%llx_%s", hash, name);
+  return private_name;
+}
+
+static int import_selected_name(const ImportDeclaration *import_decl,
+                                const char *name) {
+  if (!import_decl || !name) {
+    return 0;
+  }
+
+  for (size_t i = 0; i < import_decl->selected_count; i++) {
+    if (strcmp(import_decl->selected_names[i], name) == 0) {
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+static int declaration_is_public_for_import(
+    const ImportDeclaration *import_decl, ASTNode *decl, int has_any_export) {
+  const char *name = get_declaration_name(decl);
+
+  if (!name) {
+    return 1;
+  }
+
+  if (import_decl && import_decl->selected_count > 0) {
+    return import_selected_name(import_decl, name);
+  }
+
+  if (has_any_export) {
+    return is_declaration_exported(decl);
+  }
+
+  return 1;
+}
+
+static int collect_private_dependency_rewrites(
+    NameRewrite **rewrites, size_t *rewrite_count, size_t *rewrite_capacity,
+    ASTNode *decl, const char *module_path) {
+  const char *decl_name = NULL;
+  char *private_name = NULL;
+
+  if (!decl) {
+    return 1;
+  }
+
+  decl_name = get_declaration_name(decl);
+  if (decl_name) {
+    private_name = build_private_import_name(module_path, decl_name);
+    if (!private_name ||
+        !add_name_rewrite(rewrites, rewrite_count, rewrite_capacity, decl_name,
+                          private_name)) {
+      free(private_name);
+      return 0;
+    }
+    free(private_name);
+  }
+
+  if (decl->type == AST_ENUM_DECLARATION) {
+    EnumDeclaration *enum_decl = (EnumDeclaration *)decl->data;
+    if (enum_decl) {
+      for (size_t i = 0; i < enum_decl->variant_count; i++) {
+        private_name =
+            build_private_import_name(module_path, enum_decl->variants[i].name);
+        if (!private_name ||
+            !add_name_rewrite(rewrites, rewrite_count, rewrite_capacity,
+                              enum_decl->variants[i].name, private_name)) {
+          free(private_name);
+          return 0;
+        }
+        free(private_name);
       }
     }
   }
@@ -2027,6 +2293,7 @@ static const char *get_declaration_name(ASTNode *decl) {
 //  -1: internal failure (e.g. allocation failure)
 static int path_set_add(char ***paths, size_t *count, size_t *capacity,
                         const char *path);
+static char *format_import_chain(ImportContext *ctx);
 
 /* Open-addressing name -> declaration-index map, used by the export
  * dependency closure to resolve a called name to its declaration in O(1)
@@ -2097,8 +2364,35 @@ static void decl_name_map_destroy(DeclNameMap *m) {
   m->bucket_count = 0;
 }
 
-static void collect_called_function_names(ASTNode *node, char ***names,
-                                          size_t *count, size_t *capacity) {
+static void collect_type_name_dependencies(const char *type_name,
+                                           char ***names, size_t *count,
+                                           size_t *capacity) {
+  if (!type_name || !names || !count || !capacity) {
+    return;
+  }
+
+  for (size_t i = 0; type_name[i] != '\0';) {
+    if (!is_identifier_start_char(type_name[i])) {
+      i++;
+      continue;
+    }
+
+    size_t start = i;
+    i++;
+    while (is_identifier_char(type_name[i])) {
+      i++;
+    }
+
+    char *name = duplicate_string_slice(type_name + start, i - start);
+    if (name) {
+      (void)path_set_add(names, count, capacity, name);
+      free(name);
+    }
+  }
+}
+
+static void collect_dependency_names(ASTNode *node, char ***names,
+                                     size_t *count, size_t *capacity) {
   if (!node || !names || !count || !capacity) {
     return;
   }
@@ -2110,15 +2404,17 @@ static void collect_called_function_names(ASTNode *node, char ***names,
       return;
     }
     for (size_t i = 0; i < prog->declaration_count; i++) {
-      collect_called_function_names(prog->declarations[i], names, count,
-                                    capacity);
+      collect_dependency_names(prog->declarations[i], names, count, capacity);
     }
     return;
   }
   case AST_VAR_DECLARATION: {
     VarDeclaration *var = (VarDeclaration *)node->data;
-    if (var && var->initializer) {
-      collect_called_function_names(var->initializer, names, count, capacity);
+    if (var) {
+      collect_type_name_dependencies(var->type_name, names, count, capacity);
+      if (var->initializer) {
+        collect_dependency_names(var->initializer, names, count, capacity);
+      }
     }
     return;
   }
@@ -2129,10 +2425,83 @@ static void collect_called_function_names(ASTNode *node, char ***names,
     }
     return;
   }
-  case AST_FUNCTION_DECLARATION: {
+  case AST_FUNCTION_DECLARATION:
+  case AST_METHOD_DECLARATION: {
     FunctionDeclaration *func = (FunctionDeclaration *)node->data;
-    if (func && func->body) {
-      collect_called_function_names(func->body, names, count, capacity);
+    if (!func) {
+      return;
+    }
+    collect_type_name_dependencies(func->return_type, names, count, capacity);
+    for (size_t i = 0; i < func->parameter_count; i++) {
+      collect_type_name_dependencies(func->parameter_types[i], names, count,
+                                     capacity);
+    }
+    for (size_t i = 0; i < func->type_param_count; i++) {
+      if (func->type_param_traits) {
+        collect_type_name_dependencies(func->type_param_traits[i], names,
+                                       count, capacity);
+      }
+    }
+    if (func->body) {
+      collect_dependency_names(func->body, names, count, capacity);
+    }
+    return;
+  }
+  case AST_STRUCT_DECLARATION: {
+    StructDeclaration *strct = (StructDeclaration *)node->data;
+    if (!strct) {
+      return;
+    }
+    for (size_t i = 0; i < strct->field_count; i++) {
+      collect_type_name_dependencies(strct->field_types[i], names, count,
+                                     capacity);
+    }
+    for (size_t i = 0; i < strct->type_param_count; i++) {
+      if (strct->type_param_traits) {
+        collect_type_name_dependencies(strct->type_param_traits[i], names,
+                                       count, capacity);
+      }
+    }
+    for (size_t i = 0; i < strct->method_count; i++) {
+      collect_dependency_names(strct->methods[i], names, count, capacity);
+    }
+    return;
+  }
+  case AST_ENUM_DECLARATION: {
+    EnumDeclaration *enm = (EnumDeclaration *)node->data;
+    if (!enm) {
+      return;
+    }
+    for (size_t i = 0; i < enm->variant_count; i++) {
+      collect_type_name_dependencies(enm->variants[i].payload_type, names,
+                                     count, capacity);
+      if (enm->variants[i].value) {
+        collect_dependency_names(enm->variants[i].value, names, count,
+                                 capacity);
+      }
+    }
+    return;
+  }
+  case AST_TRAIT_DECLARATION: {
+    TraitDeclaration *trait = (TraitDeclaration *)node->data;
+    if (!trait) {
+      return;
+    }
+    for (size_t i = 0; i < trait->method_count; i++) {
+      collect_dependency_names(trait->methods[i], names, count, capacity);
+    }
+    return;
+  }
+  case AST_IMPL_DECLARATION: {
+    ImplDeclaration *impl = (ImplDeclaration *)node->data;
+    if (!impl) {
+      return;
+    }
+    collect_type_name_dependencies(impl->trait_name, names, count, capacity);
+    collect_type_name_dependencies(impl->for_type_name, names, count,
+                                   capacity);
+    for (size_t i = 0; i < impl->method_count; i++) {
+      collect_dependency_names(impl->methods[i], names, count, capacity);
     }
     return;
   }
@@ -2144,11 +2513,15 @@ static void collect_called_function_names(ASTNode *node, char ***names,
     if (call->function_name && call->function_name[0] != '\0') {
       (void)path_set_add(names, count, capacity, call->function_name);
     }
+    for (size_t i = 0; i < call->type_arg_count; i++) {
+      collect_type_name_dependencies(call->type_args[i], names, count,
+                                     capacity);
+    }
     if (call->object) {
-      collect_called_function_names(call->object, names, count, capacity);
+      collect_dependency_names(call->object, names, count, capacity);
     }
     for (size_t i = 0; i < call->argument_count; i++) {
-      collect_called_function_names(call->arguments[i], names, count, capacity);
+      collect_dependency_names(call->arguments[i], names, count, capacity);
     }
     return;
   }
@@ -2158,10 +2531,10 @@ static void collect_called_function_names(ASTNode *node, char ***names,
       return;
     }
     if (call->function) {
-      collect_called_function_names(call->function, names, count, capacity);
+      collect_dependency_names(call->function, names, count, capacity);
     }
     for (size_t i = 0; i < call->argument_count; i++) {
-      collect_called_function_names(call->arguments[i], names, count, capacity);
+      collect_dependency_names(call->arguments[i], names, count, capacity);
     }
     return;
   }
@@ -2171,63 +2544,80 @@ static void collect_called_function_names(ASTNode *node, char ***names,
       return;
     }
     if (assign->target) {
-      collect_called_function_names(assign->target, names, count, capacity);
+      collect_dependency_names(assign->target, names, count, capacity);
     }
     if (assign->value) {
-      collect_called_function_names(assign->value, names, count, capacity);
+      collect_dependency_names(assign->value, names, count, capacity);
     }
     return;
   }
   case AST_RETURN_STATEMENT:
     if (node->child_count > 0) {
-      collect_called_function_names(node->children[0], names, count, capacity);
+      collect_dependency_names(node->children[0], names, count, capacity);
     }
     return;
   case AST_BINARY_EXPRESSION: {
     BinaryExpression *bin = (BinaryExpression *)node->data;
     if (bin) {
-      collect_called_function_names(bin->left, names, count, capacity);
-      collect_called_function_names(bin->right, names, count, capacity);
+      collect_dependency_names(bin->left, names, count, capacity);
+      collect_dependency_names(bin->right, names, count, capacity);
     }
     return;
   }
   case AST_UNARY_EXPRESSION: {
     UnaryExpression *un = (UnaryExpression *)node->data;
     if (un && un->operand) {
-      collect_called_function_names(un->operand, names, count, capacity);
+      collect_dependency_names(un->operand, names, count, capacity);
     }
     return;
   }
   case AST_MEMBER_ACCESS: {
     MemberAccess *member = (MemberAccess *)node->data;
     if (member && member->object) {
-      collect_called_function_names(member->object, names, count, capacity);
+      collect_dependency_names(member->object, names, count, capacity);
     }
     return;
   }
   case AST_INDEX_EXPRESSION: {
     ArrayIndexExpression *idx = (ArrayIndexExpression *)node->data;
     if (idx) {
-      collect_called_function_names(idx->array, names, count, capacity);
-      collect_called_function_names(idx->index, names, count, capacity);
+      collect_dependency_names(idx->array, names, count, capacity);
+      collect_dependency_names(idx->index, names, count, capacity);
     }
+    return;
+  }
+  case AST_NEW_EXPRESSION: {
+    NewExpression *new_expr = (NewExpression *)node->data;
+    if (new_expr) {
+      collect_type_name_dependencies(new_expr->type_name, names, count,
+                                     capacity);
+    }
+    return;
+  }
+  case AST_CAST_EXPRESSION: {
+    CastExpression *cast = (CastExpression *)node->data;
+    if (!cast) {
+      return;
+    }
+    collect_type_name_dependencies(cast->type_name, names, count, capacity);
+    collect_dependency_names(cast->operand, names, count, capacity);
     return;
   }
   case AST_IF_STATEMENT:
   case AST_WHILE_STATEMENT:
   case AST_FOR_STATEMENT:
     for (size_t i = 0; i < node->child_count; i++) {
-      collect_called_function_names(node->children[i], names, count, capacity);
+      collect_dependency_names(node->children[i], names, count, capacity);
     }
     return;
   case AST_SWITCH_STATEMENT: {
     SwitchStatement *sw = (SwitchStatement *)node->data;
     if (sw) {
       if (sw->expression) {
-        collect_called_function_names(sw->expression, names, count, capacity);
+        collect_dependency_names(sw->expression, names, count, capacity);
       }
       for (size_t i = 0; i < sw->case_count; i++) {
-        collect_called_function_names(sw->cases[i], names, count, capacity);
+        collect_dependency_names(sw->cases[i], names, count, capacity);
       }
     }
     return;
@@ -2236,17 +2626,143 @@ static void collect_called_function_names(ASTNode *node, char ***names,
     CaseClause *cc = (CaseClause *)node->data;
     if (cc) {
       if (cc->value) {
-        collect_called_function_names(cc->value, names, count, capacity);
+        collect_dependency_names(cc->value, names, count, capacity);
+      }
+      if (cc->value_high) {
+        collect_dependency_names(cc->value_high, names, count, capacity);
       }
       if (cc->body) {
-        collect_called_function_names(cc->body, names, count, capacity);
+        collect_dependency_names(cc->body, names, count, capacity);
       }
+    }
+    return;
+  }
+  case AST_MATCH_STATEMENT: {
+    MatchStatement *match = (MatchStatement *)node->data;
+    if (!match) {
+      return;
+    }
+    collect_dependency_names(match->expression, names, count, capacity);
+    for (size_t i = 0; i < match->arm_count; i++) {
+      if (match->arms[i].variant_name && !match->arms[i].is_default) {
+        (void)path_set_add(names, count, capacity,
+                           match->arms[i].variant_name);
+      }
+      collect_dependency_names(match->arms[i].body, names, count, capacity);
+    }
+    return;
+  }
+  case AST_DEFER_STATEMENT:
+  case AST_ERRDEFER_STATEMENT: {
+    DeferStatement *defer = (DeferStatement *)node->data;
+    if (defer) {
+      collect_dependency_names(defer->statement, names, count, capacity);
     }
     return;
   }
   default:
     return;
   }
+}
+
+static int expand_import_dependency_closure(Program *prog_data,
+                                            int *include_flags,
+                                            char ***required_names,
+                                            size_t *required_count,
+                                            size_t *required_capacity) {
+  if (!prog_data || !include_flags || !required_names || !required_count ||
+      !required_capacity) {
+    return 0;
+  }
+
+  size_t decl_count = prog_data->declaration_count;
+  DeclNameMap name_map;
+  decl_name_map_init(&name_map, decl_count);
+  if (decl_count > 0 && name_map.bucket_count == 0) {
+    return 0;
+  }
+
+  for (size_t i = 0; i < decl_count; i++) {
+    const char *name = get_declaration_name(prog_data->declarations[i]);
+    if (name) {
+      decl_name_map_put(&name_map, name, i);
+    }
+  }
+
+  size_t *worklist =
+      malloc(decl_count ? decl_count * sizeof(size_t) : sizeof(size_t));
+  if (!worklist) {
+    decl_name_map_destroy(&name_map);
+    return 0;
+  }
+
+  size_t worklist_len = 0;
+  for (size_t i = 0; i < decl_count; i++) {
+    if (include_flags[i]) {
+      worklist[worklist_len++] = i;
+    }
+  }
+
+  while (worklist_len > 0) {
+    size_t decl_index = worklist[--worklist_len];
+    size_t names_before = *required_count;
+
+    collect_dependency_names(prog_data->declarations[decl_index],
+                             required_names, required_count,
+                             required_capacity);
+
+    for (size_t n = names_before; n < *required_count; n++) {
+      size_t target = 0;
+      if (decl_name_map_get(&name_map, (*required_names)[n], &target) &&
+          !include_flags[target]) {
+        include_flags[target] = 1;
+        worklist[worklist_len++] = target;
+      }
+    }
+  }
+
+  free(worklist);
+  decl_name_map_destroy(&name_map);
+  return 1;
+}
+
+static int find_declaration_index(Program *prog_data, const char *name,
+                                  size_t *out_index) {
+  if (!prog_data || !name) {
+    return 0;
+  }
+
+  for (size_t i = 0; i < prog_data->declaration_count; i++) {
+    const char *decl_name = get_declaration_name(prog_data->declarations[i]);
+    if (decl_name && strcmp(decl_name, name) == 0) {
+      if (out_index) {
+        *out_index = i;
+      }
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+static void report_selective_import_error(ImportContext *ctx,
+                                          ASTNode *import_node,
+                                          const char *module_name,
+                                          const char *selected_name,
+                                          const char *reason) {
+  if (!ctx || !ctx->reporter || !import_node || !selected_name || !reason) {
+    return;
+  }
+
+  char *chain = format_import_chain(ctx);
+  char message[1024];
+  snprintf(message, sizeof(message),
+           "Could not import '%s' from '%s': %s (import chain: %s)",
+           selected_name, module_name ? module_name : "<unknown>", reason,
+           chain ? chain : "");
+  error_reporter_add_error(ctx->reporter, ERROR_SEMANTIC,
+                           import_node->location, message);
+  free(chain);
 }
 
 static int path_set_contains(char **paths, size_t count, const char *path) {
@@ -2451,7 +2967,8 @@ static void process_import_strs_in_node(ImportContext *ctx, ASTNode *node,
     }
     break;
   }
-  case AST_FUNCTION_DECLARATION: {
+  case AST_FUNCTION_DECLARATION:
+  case AST_METHOD_DECLARATION: {
     FunctionDeclaration *func = (FunctionDeclaration *)node->data;
     if (func && func->body) {
       process_import_strs_in_node(ctx, func->body, current_file_path,
@@ -2459,9 +2976,69 @@ static void process_import_strs_in_node(ImportContext *ctx, ASTNode *node,
     }
     break;
   }
+  case AST_STRUCT_DECLARATION: {
+    StructDeclaration *strct = (StructDeclaration *)node->data;
+    if (strct) {
+      for (size_t i = 0; i < strct->method_count; i++) {
+        process_import_strs_in_node(ctx, strct->methods[i], current_file_path,
+                                    had_error);
+      }
+    }
+    break;
+  }
+  case AST_ENUM_DECLARATION: {
+    EnumDeclaration *enm = (EnumDeclaration *)node->data;
+    if (enm) {
+      for (size_t i = 0; i < enm->variant_count; i++) {
+        if (enm->variants[i].value) {
+          process_import_strs_in_node(ctx, enm->variants[i].value,
+                                      current_file_path, had_error);
+        }
+      }
+    }
+    break;
+  }
+  case AST_TRAIT_DECLARATION: {
+    TraitDeclaration *trait = (TraitDeclaration *)node->data;
+    if (trait) {
+      for (size_t i = 0; i < trait->method_count; i++) {
+        process_import_strs_in_node(ctx, trait->methods[i], current_file_path,
+                                    had_error);
+      }
+    }
+    break;
+  }
+  case AST_IMPL_DECLARATION: {
+    ImplDeclaration *impl = (ImplDeclaration *)node->data;
+    if (impl) {
+      for (size_t i = 0; i < impl->method_count; i++) {
+        process_import_strs_in_node(ctx, impl->methods[i], current_file_path,
+                                    had_error);
+      }
+    }
+    break;
+  }
   case AST_FUNCTION_CALL: {
     CallExpression *call = (CallExpression *)node->data;
     if (call) {
+      if (call->object) {
+        process_import_strs_in_node(ctx, call->object, current_file_path,
+                                    had_error);
+      }
+      for (size_t i = 0; i < call->argument_count; i++) {
+        process_import_strs_in_node(ctx, call->arguments[i], current_file_path,
+                                    had_error);
+      }
+    }
+    break;
+  }
+  case AST_FUNC_PTR_CALL: {
+    FuncPtrCall *call = (FuncPtrCall *)node->data;
+    if (call) {
+      if (call->function) {
+        process_import_strs_in_node(ctx, call->function, current_file_path,
+                                    had_error);
+      }
       for (size_t i = 0; i < call->argument_count; i++) {
         process_import_strs_in_node(ctx, call->arguments[i], current_file_path,
                                     had_error);
@@ -2471,9 +3048,15 @@ static void process_import_strs_in_node(ImportContext *ctx, ASTNode *node,
   }
   case AST_ASSIGNMENT: {
     Assignment *assign = (Assignment *)node->data;
-    if (assign && assign->value) {
-      process_import_strs_in_node(ctx, assign->value, current_file_path,
-                                  had_error);
+    if (assign) {
+      if (assign->target) {
+        process_import_strs_in_node(ctx, assign->target, current_file_path,
+                                    had_error);
+      }
+      if (assign->value) {
+        process_import_strs_in_node(ctx, assign->value, current_file_path,
+                                    had_error);
+      }
     }
     break;
   }
@@ -2498,6 +3081,36 @@ static void process_import_strs_in_node(ImportContext *ctx, ASTNode *node,
     UnaryExpression *un = (UnaryExpression *)node->data;
     if (un && un->operand) {
       process_import_strs_in_node(ctx, un->operand, current_file_path,
+                                  had_error);
+    }
+    break;
+  }
+  case AST_MEMBER_ACCESS: {
+    MemberAccess *member = (MemberAccess *)node->data;
+    if (member && member->object) {
+      process_import_strs_in_node(ctx, member->object, current_file_path,
+                                  had_error);
+    }
+    break;
+  }
+  case AST_INDEX_EXPRESSION: {
+    ArrayIndexExpression *idx = (ArrayIndexExpression *)node->data;
+    if (idx) {
+      if (idx->array) {
+        process_import_strs_in_node(ctx, idx->array, current_file_path,
+                                    had_error);
+      }
+      if (idx->index) {
+        process_import_strs_in_node(ctx, idx->index, current_file_path,
+                                    had_error);
+      }
+    }
+    break;
+  }
+  case AST_CAST_EXPRESSION: {
+    CastExpression *cast = (CastExpression *)node->data;
+    if (cast && cast->operand) {
+      process_import_strs_in_node(ctx, cast->operand, current_file_path,
                                   had_error);
     }
     break;
@@ -2533,10 +3146,39 @@ static void process_import_strs_in_node(ImportContext *ctx, ASTNode *node,
         process_import_strs_in_node(ctx, cc->value, current_file_path,
                                     had_error);
       }
+      if (cc->value_high) {
+        process_import_strs_in_node(ctx, cc->value_high, current_file_path,
+                                    had_error);
+      }
       if (cc->body) {
         process_import_strs_in_node(ctx, cc->body, current_file_path,
                                     had_error);
       }
+    }
+    break;
+  }
+  case AST_MATCH_STATEMENT: {
+    MatchStatement *match = (MatchStatement *)node->data;
+    if (match) {
+      if (match->expression) {
+        process_import_strs_in_node(ctx, match->expression, current_file_path,
+                                    had_error);
+      }
+      for (size_t i = 0; i < match->arm_count; i++) {
+        if (match->arms[i].body) {
+          process_import_strs_in_node(ctx, match->arms[i].body,
+                                      current_file_path, had_error);
+        }
+      }
+    }
+    break;
+  }
+  case AST_DEFER_STATEMENT:
+  case AST_ERRDEFER_STATEMENT: {
+    DeferStatement *defer = (DeferStatement *)node->data;
+    if (defer && defer->statement) {
+      process_import_strs_in_node(ctx, defer->statement, current_file_path,
+                                  had_error);
     }
     break;
   }
@@ -2781,70 +3423,79 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
           size_t name_rewrite_count = 0;
           size_t name_rewrite_capacity = 0;
 
+          for (size_t j = 0; j < imported_prog_data->declaration_count; j++) {
+            if (is_declaration_exported(imported_prog_data->declarations[j])) {
+              has_any_export = 1;
+              break;
+            }
+          }
+
           if (import_decl->selected_count > 0) {
-            // Selective import: include only the named declarations plus their
-            // transitive internal dependencies.
             include_flags =
                 calloc(imported_prog_data->declaration_count, sizeof(int));
             if (!include_flags) {
-              include_all = 1;
               *had_error = 1;
+              import_succeeded = 0;
               if (ctx->reporter) {
                 error_reporter_add_error(
                     ctx->reporter, ERROR_INTERNAL, decl->location,
                     "Failed to process selective import (out of memory)");
               }
             } else {
-              // Seed required_names from the explicit list.
               for (size_t s = 0; s < import_decl->selected_count; s++) {
-                path_set_add(&required_names, &required_count,
-                             &required_capacity, import_decl->selected_names[s]);
-              }
-              // Mark seed declarations and collect their dependencies.
-              for (size_t j = 0; j < imported_prog_data->declaration_count; j++) {
-                ASTNode *imp_decl = imported_prog_data->declarations[j];
-                const char *name = get_declaration_name(imp_decl);
-                if (!name || !path_set_contains(required_names, required_count,
-                                                name)) {
+                const char *selected_name = import_decl->selected_names[s];
+                size_t selected_index = 0;
+
+                if (!find_declaration_index(imported_prog_data, selected_name,
+                                            &selected_index)) {
+                  report_selective_import_error(
+                      ctx, decl, import_decl->module_name, selected_name,
+                      "no top-level declaration with that name exists");
+                  *had_error = 1;
+                  import_succeeded = 0;
                   continue;
                 }
-                include_flags[j] = 1;
-                collect_called_function_names(imp_decl, &required_names,
-                                              &required_count,
-                                              &required_capacity);
-              }
-              // Propagate to transitive dependencies.
-              int changed = 1;
-              while (changed) {
-                changed = 0;
-                for (size_t j = 0; j < imported_prog_data->declaration_count;
-                     j++) {
-                  if (include_flags[j]) {
-                    continue;
-                  }
-                  ASTNode *imp_decl = imported_prog_data->declarations[j];
-                  const char *name = get_declaration_name(imp_decl);
-                  if (!name || !path_set_contains(required_names, required_count,
-                                                  name)) {
-                    continue;
-                  }
-                  include_flags[j] = 1;
-                  changed = 1;
-                  collect_called_function_names(imp_decl, &required_names,
-                                                &required_count,
-                                                &required_capacity);
+
+                if (has_any_export &&
+                    !is_declaration_exported(
+                        imported_prog_data->declarations[selected_index])) {
+                  report_selective_import_error(
+                      ctx, decl, import_decl->module_name, selected_name,
+                      "the declaration is not exported by that module");
+                  *had_error = 1;
+                  import_succeeded = 0;
+                  continue;
                 }
+
+                if (path_set_add(&required_names, &required_count,
+                                 &required_capacity, selected_name) < 0) {
+                  if (ctx->reporter) {
+                    error_reporter_add_error(
+                        ctx->reporter, ERROR_INTERNAL, decl->location,
+                        "Failed to process selective import (out of memory)");
+                  }
+                  *had_error = 1;
+                  import_succeeded = 0;
+                  break;
+                }
+
+                include_flags[selected_index] = 1;
+              }
+
+              if (import_succeeded &&
+                  !expand_import_dependency_closure(
+                      imported_prog_data, include_flags, &required_names,
+                      &required_count, &required_capacity)) {
+                if (ctx->reporter) {
+                  error_reporter_add_error(
+                      ctx->reporter, ERROR_INTERNAL, decl->location,
+                      "Failed to process selective import dependencies");
+                }
+                *had_error = 1;
+                import_succeeded = 0;
               }
             }
           } else {
-            // Check if the module uses export at all
-            for (size_t j = 0; j < imported_prog_data->declaration_count; j++) {
-              if (is_declaration_exported(imported_prog_data->declarations[j])) {
-                has_any_export = 1;
-                break;
-              }
-            }
-
             if (has_any_export) {
               include_flags =
                   calloc(imported_prog_data->declaration_count, sizeof(int));
@@ -2861,16 +3512,16 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
                  *
                  * Previous implementation: a `while(changed)` fixpoint that
                  * rescanned every declaration each pass and tested membership
-                 * with a linear strcmp over the (large) required-names set —
+                 * with a linear strcmp over the large required-names set,
                  * O(D^2 * names) per module, the dominant import-phase cost on
                  * real projects.
                  *
                  * New implementation: build a name -> declaration-index map
                  * once (O(D)), then drive a worklist. Each declaration is
-                 * processed at most once; every name produced by
-                 * collect_called_function_names is looked up O(1) in the map
+                 * processed at most once; every dependency name is looked up
+                 * O(1) in the map
                  * to discover the next declaration to pull in. Net cost is
-                 * O(D + total_called_names). The result (which declarations
+                 * O(D + total_dependency_names). The result (which declarations
                  * end up included) is identical to the fixpoint. */
                 size_t decl_count = imported_prog_data->declaration_count;
                 DeclNameMap name_map;
@@ -2912,7 +3563,7 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
                   while (worklist_len > 0) {
                     size_t j = worklist[--worklist_len];
                     size_t names_before = required_count;
-                    collect_called_function_names(
+                    collect_dependency_names(
                         imported_prog_data->declarations[j], &required_names,
                         &required_count, &required_capacity);
                     /* Only the freshly added names can unlock new
@@ -2936,7 +3587,56 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
             }
           }
 
-          if (import_decl->namespace_alias) {
+          if (import_succeeded && !import_decl->namespace_alias &&
+              (import_decl->selected_count > 0 || has_any_export)) {
+            NameRewrite *private_rewrites = NULL;
+            size_t private_rewrite_count = 0;
+            size_t private_rewrite_capacity = 0;
+
+            for (size_t j = 0; j < imported_prog_data->declaration_count; j++) {
+              int include_decl = include_all;
+              if (!include_decl && include_flags) {
+                include_decl = include_flags[j];
+              }
+              if (!include_decl ||
+                  declaration_is_public_for_import(
+                      import_decl, imported_prog_data->declarations[j],
+                      has_any_export)) {
+                continue;
+              }
+
+              if (!collect_private_dependency_rewrites(
+                      &private_rewrites, &private_rewrite_count,
+                      &private_rewrite_capacity,
+                      imported_prog_data->declarations[j], full_path)) {
+                if (ctx->reporter) {
+                  error_reporter_add_error(
+                      ctx->reporter, ERROR_INTERNAL, decl->location,
+                      "Failed to isolate private import dependencies");
+                }
+                *had_error = 1;
+                import_succeeded = 0;
+                break;
+              }
+            }
+
+            if (import_succeeded && private_rewrite_count > 0 &&
+                !rewrite_program_names(imported_program, private_rewrites,
+                                       private_rewrite_count, NULL, 0, NULL,
+                                       0)) {
+              if (ctx->reporter) {
+                error_reporter_add_error(
+                    ctx->reporter, ERROR_INTERNAL, decl->location,
+                    "Failed to rewrite private import dependencies");
+              }
+              *had_error = 1;
+              import_succeeded = 0;
+            }
+
+            free_name_rewrites(private_rewrites, private_rewrite_count);
+          }
+
+          if (import_succeeded && import_decl->namespace_alias) {
             for (size_t j = 0; j < imported_prog_data->declaration_count; j++) {
               int include_decl = include_all;
               if (!include_decl && include_flags) {
@@ -2954,6 +3654,24 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
                   error_reporter_add_error(
                       ctx->reporter, ERROR_INTERNAL, decl->location,
                       "Failed to build namespaced import bindings");
+                }
+                *had_error = 1;
+                import_succeeded = 0;
+                break;
+              }
+
+              if ((!has_any_export ||
+                   is_declaration_exported(
+                       imported_prog_data->declarations[j])) &&
+                  !add_namespace_members_for_declaration(
+                      &namespace_bindings, &namespace_binding_count,
+                      &namespace_binding_capacity,
+                      imported_prog_data->declarations[j],
+                      import_decl->namespace_alias)) {
+                if (ctx->reporter) {
+                  error_reporter_add_error(
+                      ctx->reporter, ERROR_INTERNAL, decl->location,
+                      "Failed to record namespace import member");
                 }
                 *had_error = 1;
                 import_succeeded = 0;
@@ -2991,7 +3709,7 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
           for (size_t j = 0; j < imported_prog_data->declaration_count; j++) {
             ASTNode *imp_decl = imported_prog_data->declarations[j];
             int include_decl = import_succeeded ? include_all : 0;
-            if (!include_decl && include_flags) {
+            if (import_succeeded && !include_decl && include_flags) {
               include_decl = include_flags[j];
             }
 

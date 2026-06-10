@@ -60,6 +60,13 @@ int wcs_avx_vpshufd_ymm(BinaryCodeBuffer *b, int dst, int src,
 int wcs_avx_vperm2i128(BinaryCodeBuffer *b, int dst, int s1, int s2,
                        unsigned char imm);
 int wcs_avx_vpbroadcastd_ymm(BinaryCodeBuffer *b, int dst, int src_xmm);
+int wcs_avx_vpbroadcastd_ymm_mem(BinaryCodeBuffer *b, int dst, int base, int displacement);
+int wcs_avx_vbroadcastss_ymm_mem(BinaryCodeBuffer *b, int dst, int base, int displacement);
+int wcs_avx_vpmaddwd_ymm(BinaryCodeBuffer *b, int dst, int src1, int src2);
+int wcs_avx_vpmovsxbw_ymm_mem(BinaryCodeBuffer *b, int dst, int base, int displacement);
+int wcs_avx_vpmovzxbw_ymm_mem(BinaryCodeBuffer *b, int dst, int base, int displacement);
+int wcs_avx_vpmovzxbd_xmm_mem(BinaryCodeBuffer *b, int dst, int base, int displacement);
+int wcs_avx_vpmovzxbd_ymm_mem(BinaryCodeBuffer *b, int dst, int base, int displacement);
 int wcs_avx_vbroadcastsd_ymm_xmm(BinaryCodeBuffer *b, int dst, int src_xmm);
 int wcs_avx_vextracti128(BinaryCodeBuffer *b, int dst_xmm, int src_ymm,
                          unsigned char lane);
@@ -86,6 +93,14 @@ int wcs_avx_vmovsd_mem_xmm(BinaryCodeBuffer *b, int base, int disp, int src);
 int wcs_avx_vunpckhpd_xmm(BinaryCodeBuffer *b, int dst, int s1, int s2);
 int wcs_avx_vaddps_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);
 int wcs_avx_vmulps_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);
+int wcs_avx_vsubps_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);
+int wcs_avx_vdivps_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);
+int wcs_avx_vminps_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);
+int wcs_avx_vmaxps_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);
+int wcs_avx_vroundps_ymm(BinaryCodeBuffer *b, int dst, int src, unsigned char imm);
+int wcs_avx_vcvttps2dq_ymm(BinaryCodeBuffer *b, int dst, int src);
+int wcs_avx_vcvtdq2ps_ymm(BinaryCodeBuffer *b, int dst, int src);
+int wcs_avx_vpslld_ymm_imm(BinaryCodeBuffer *b, int dst, int src, unsigned char imm);
 /* Fused multiply-add: dst = (s1 * s2) + dst. 231 form keeps the accumulator in
  * the destination, which is what every reduction/affine kernel wants. */
 int wcs_avx_vfmadd231pd_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);

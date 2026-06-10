@@ -113,6 +113,24 @@ static int ir_float_sum_type_matches(const char *sum_type, int width_bits) {
   return strcmp(sum_type, "float32") == 0;
 }
 
+/* Declared type of a function parameter by name, or NULL. (Locals come from
+ * ir_function_local_declared_type, which does not see params -- they aren't
+ * DECLARE_LOCAL'd.) */
+static const char *ir_function_param_declared_type(const IRFunction *function,
+                                                   const char *name) {
+  if (!function || !name || !function->parameter_names ||
+      !function->parameter_types) {
+    return NULL;
+  }
+  for (size_t i = 0; i < function->parameter_count; i++) {
+    if (function->parameter_names[i] &&
+        strcmp(function->parameter_names[i], name) == 0) {
+      return function->parameter_types[i];
+    }
+  }
+  return NULL;
+}
+
 static int ir_float_scalar_operand_matches(IRFunction *function,
                                            const IROperand *operand,
                                            int width_bits) {
@@ -123,8 +141,14 @@ static int ir_float_scalar_operand_matches(IRFunction *function,
     return operand->float_bits == width_bits;
   }
   if (operand->kind == IR_OPERAND_SYMBOL && operand->name) {
-    return ir_float_sum_type_matches(
-        ir_function_local_declared_type(function, operand->name), width_bits);
+    /* A scalar coefficient may be a local OR a parameter (e.g. saxpy's `a` in
+     * `y[i] = a*x[i] + y[i]` when `a` is a function arg). The kernel reads it as
+     * a symbol either way; only the float width must match. */
+    const char *ty = ir_function_local_declared_type(function, operand->name);
+    if (!ty) {
+      ty = ir_function_param_declared_type(function, operand->name);
+    }
+    return ir_float_sum_type_matches(ty, width_bits);
   }
   return 0;
 }
@@ -1183,11 +1207,12 @@ int ir_simd_i2f_reduce_pass(IRFunction *function, int *changed) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* General auto-vectorizer: float64 straight-line-DAG counted loops            */
-/*   -> IR_OP_SIMD_VLOOP_F64                                                    */
+/* General auto-vectorizer: float32/float64 straight-line-DAG counted loops    */
+/*   -> IR_OP_SIMD_VLOOP_F64 (width carried in float_bits: 64 or 32)           */
 /*                                                                             */
 /* Runs AFTER the per-shape recognizers (sum/dot/affine/i2f) so it only claims */
-/* loops they did not. A2 (this stage): element-wise maps out[iv] = DAG(...).  */
+/* loops they did not. Handles element-wise maps out[iv] = DAG(...) and '+'    */
+/* reductions over either float width; the store/accumulator type pins it.     */
 /* -------------------------------------------------------------------------- */
 
 /* Node tags — must match the kernel decoder in simd_float.c. */
@@ -1451,16 +1476,17 @@ static int ir_try_vectorize_map_at(IRFunction *function, size_t header_index,
   if (store->dest.kind != IR_OPERAND_TEMP || !store->dest.name ||
       (store->lhs.kind != IR_OPERAND_TEMP && store->lhs.kind != IR_OPERAND_SYMBOL &&
        store->lhs.kind != IR_OPERAND_FLOAT) ||
-      store->rhs.kind != IR_OPERAND_INT || store->rhs.int_value != 8 ||
+      store->rhs.kind != IR_OPERAND_INT ||
+      (store->rhs.int_value != 4 && store->rhs.int_value != 8) ||
       !ir_decode_float_indexed_address(function, store_index, store->dest.name,
                                        iv_symbol, &dst_base, &store_bits) ||
-      store_bits != 64) {
+      store_bits != store->rhs.int_value * 8) {
     ir_operand_destroy(&bound);
     return 1;
   }
 
   memset(&d, 0, sizeof(d));
-  d.width_bits = 64;
+  d.width_bits = store_bits; /* 64 (float64) or 32 (float32) */
   root = vloop_build(function, store_index, &store->lhs, iv_symbol, &d);
   if (root < 0 || d.overflow) {
     ir_operand_destroy(&bound);
@@ -1492,7 +1518,7 @@ static int ir_try_vectorize_map_at(IRFunction *function, size_t header_index,
   fused.op = IR_OP_SIMD_VLOOP_F64;
   fused.location = function->instructions[header_index].location;
   fused.is_float = 1;
-  fused.float_bits = 64;
+  fused.float_bits = store_bits;
   fused.dest = ir_operand_symbol(dst_base);
   fused.lhs = bound; /* take ownership of the cloned bound operand */
   if (!vloop_serialize_into(&fused, &d, /*reduce_op=*/0, root, depth)) {
@@ -1521,6 +1547,7 @@ static int ir_try_vectorize_reduce_at(IRFunction *function, size_t header_index,
   VLoopDag d;
   int root = -1;
   int depth = 0;
+  int width_bits = 0;
   IRInstruction fused = {0};
 
   if (!ir_float_reduction_frame(function, header_index, &iv_symbol,
@@ -1555,7 +1582,11 @@ static int ir_try_vectorize_reduce_at(IRFunction *function, size_t header_index,
   }
   {
     const char *acc_type = ir_function_local_declared_type(function, acc_symbol);
-    if (!acc_type || strcmp(acc_type, "float64") != 0) {
+    if (acc_type && strcmp(acc_type, "float64") == 0) {
+      width_bits = 64;
+    } else if (acc_type && strcmp(acc_type, "float32") == 0) {
+      width_bits = 32;
+    } else {
       ir_operand_destroy(&bound);
       return 1;
     }
@@ -1571,7 +1602,7 @@ static int ir_try_vectorize_reduce_at(IRFunction *function, size_t header_index,
   }
 
   memset(&d, 0, sizeof(d));
-  d.width_bits = 64;
+  d.width_bits = width_bits; /* 64 (float64) or 32 (float32) */
   root = vloop_build(function, reduce_index, addend, iv_symbol, &d);
   if (root < 0 || d.overflow) {
     ir_operand_destroy(&bound);
@@ -1597,7 +1628,7 @@ static int ir_try_vectorize_reduce_at(IRFunction *function, size_t header_index,
   fused.op = IR_OP_SIMD_VLOOP_F64;
   fused.location = function->instructions[header_index].location;
   fused.is_float = 1;
-  fused.float_bits = 64;
+  fused.float_bits = width_bits;
   fused.dest = ir_operand_symbol(acc_symbol);
   fused.lhs = bound; /* take ownership */
   if (!vloop_serialize_into(&fused, &d, /*reduce_op=*/1, root, depth)) {

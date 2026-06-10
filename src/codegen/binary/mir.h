@@ -51,6 +51,21 @@ typedef struct {
    * kept in a register the callee preserves (or spilled), since a call clobbers
    * the caller-saved registers. */
   int crosses_call;
+  /* Two-address coalescing hint: a source vreg of this value's defining op that
+   * dies exactly at the def, so this value can reuse its register and the
+   * encoder elides the `mov dst, a` copy. -1 (MIR_VREG_NONE) when absent. */
+  int coalesce_hint;
+  /* Set when this value's address is taken (IR_OP_ADDRESS_OF): it must be
+   * memory-resident — the allocator never assigns it a register, so every use
+   * loads and every def stores through its stack home, and a store through an
+   * aliasing pointer is visible to a later by-name read. */
+  int address_taken;
+  /* Byte size of this value's stack home when address_taken. 0 means the
+   * default single 8-byte slot (scalars and DIRECT small aggregates). An
+   * INDIRECT struct local sets this to its struct size rounded up to 8 so the
+   * home covers the whole aggregate (field stores reach past the first 8
+   * bytes). Always a multiple of 8. */
+  int home_bytes;
 } MirVreg;
 #define MIR_LIVE_NONE (-1)
 
@@ -103,8 +118,24 @@ typedef enum {
   /* data movement */
   MIR_MOV,        /* dst <- a (reg/imm/mem load/mem store depending on kinds) */
   MIR_LEA,        /* dst(reg) <- address of a(mem) */
+  MIR_LEA_LOCAL,  /* dst(reg) <- address of the spill home of local vreg a. The
+                     local is forced memory-resident (address_taken) so its
+                     stack slot is its canonical storage; this leas that slot. */
+  MIR_LEA_GLOBAL, /* dst(reg) <- address of global symbol a.sym (RIP-relative).
+                     The global stays cached, but is flushed/reloaded around
+                     pointer memory ops since the alias can read/write it. */
+  MIR_LEA_CSTR,   /* dst(reg) <- address of the string literal a.sym (RIP-relative
+                     lea into a .rdata cstring). Carries no vreg source, so the
+                     allocator ignores it. Used to pass a string-literal call
+                     argument. */
   MIR_MOVZX,      /* dst <- zero-extend a (width from a.mem/src width to dst) */
   MIR_MOVSX,      /* dst <- sign-extend a */
+  MIR_LOAD_GLOBAL,/* dst <- value of global scalar a(SYMBOL); width/is_unsigned
+                     give the load size and signedness. Emitted once at entry to
+                     cache a global in a register (leaf fns only). */
+  MIR_STORE_GLOBAL,/* global scalar a(SYMBOL) <- b(value vreg); width gives the
+                      store size. Emitted before each return to write a
+                      register-promoted global back to memory (leaf fns only). */
 
   /* integer ALU: dst = dst OP a   (two-address; lowering pre-copies into dst) */
   MIR_ADD,
@@ -125,6 +156,9 @@ typedef enum {
   MIR_XOR_RDX,    /* zero RDX (unsigned divide) */
   MIR_IDIV,       /* signed divide RDX:RAX / a */
   MIR_DIV,        /* unsigned divide */
+  MIR_MULHI,      /* dst = high 64 bits of (a * b); is_unsigned picks mul vs
+                     imul. b is the magic IMM (or a reg). Uses RAX:RDX like a
+                     divide; emitted by constant-divisor strength reduction. */
 
   /* compares + materialization */
   MIR_CMP,        /* flags = a - b */
@@ -140,6 +174,19 @@ typedef enum {
 
   /* calls / return (Stage 3 for full ABI; declared now for completeness) */
   MIR_CALL,       /* call sym; clobbers volatiles */
+  MIR_STORE_OUTARG,/* store outgoing stack call argument a to [rsp + b.imm].
+                      Used for the 5th+ GP argument (beyond the ABI's argument
+                      registers); the prologue reserves the outgoing region. The
+                      encoder adds outgoing_indirect_bytes (the struct-arg copy
+                      region sits below the shadow/stack-arg area). */
+  MIR_LEA_OUTARG, /* dst <- lea [rsp + a.imm]: address of a slot in the outgoing
+                     INDIRECT struct-argument copy region (at the bottom of the
+                     frame, rsp-relative). Used to pass a struct by value. */
+  MIR_TRAP,       /* terminal runtime trap: puts(a.sym)+exit(1). a.sym is the
+                     abort message. Reached only on a cold guard-fail path and
+                     never returns, so it needs no vreg operands and the
+                     allocator treats it as a non-call (its volatile clobbers
+                     never reach the normal path). */
   MIR_RET,        /* function return (epilogue emitted separately) */
 
   /* float scalar (Stage 3) */
@@ -170,6 +217,17 @@ typedef enum {
   MIR_VIOTA,       /* lane i <- base + i (induction vector) */
   MIR_VHREDUCE,    /* horizontal add/min/max of all lanes -> scalar xmm */
 
+  /* SLP multiply-accumulate kernel, emitted inline inside an otherwise
+   * register-allocated function (so the surrounding outer loops keep MIR-quality
+   * codegen instead of dropping the whole function to the spill-everything
+   * fallback). Call-like: the lowering marshals a_ptr->RCX, b_ptr->RDX,
+   * out_ptr->R8, count->R9 with preceding MIR_MOVs (exactly like call args), and
+   * this op emits the pure inner loop. dst.imm = K (4 or 8); a.imm = row stride
+   * in BYTES (baked as an imm32 b-advance). Clobbers RAX/RCX/RDX/R8/R9/R10/R11 +
+   * xmm0..3, so the allocator treats it like a call (no live value crosses it in
+   * a volatile register). */
+  MIR_SIMD_SLP_MAC,
+
   MIR_OPCODE_COUNT
 } MirOpcode;
 
@@ -197,6 +255,15 @@ typedef struct {
   MirVregId vreg;
 } MirFConst;
 
+/* A pooled (loop-invariant) 64-bit integer constant: its raw value and the GP
+ * vreg it is materialized into once at function entry (one movabs), reused at
+ * every use. Used to hoist the div/mod magic-multiply constant out of a loop so
+ * it is not re-materialized with a 10-byte movabs every iteration. */
+typedef struct {
+  int64_t value;
+  MirVregId vreg;
+} MirIConst;
+
 /* An incoming parameter: which vreg it lives in, its ABI argument index, and
  * how it must be extended from the (possibly narrow) incoming register to the
  * 64-bit value MIR computes with. */
@@ -208,7 +275,11 @@ typedef struct {
   int is_float;  /* arrives in an XMM register (float32/float64) */
 } MirParam;
 
-#define MIR_MAX_PARAMS 4
+/* Upper bound on parameters a MIR function can take. The first few arrive in
+ * ABI registers; the rest are homed from the caller's stack frame. 16 covers
+ * essentially all real signatures while keeping the fixed per-function param
+ * arrays small. */
+#define MIR_MAX_PARAMS 16
 
 typedef struct {
   MirVreg *vregs;
@@ -230,14 +301,68 @@ typedef struct {
   MirParam params[MIR_MAX_PARAMS];
   size_t param_count;
 
+  /* INDIRECT struct return (Win64: hidden out-pointer in RCX, SysV: RDI). When
+   * set, the prologue homes that register into indirect_return_vreg (shifting
+   * every user parameter up one ABI slot), and each RETURN copies the struct
+   * into [indirect_return_vreg] and leaves the pointer in RAX. */
+  int returns_indirect;
+  int indirect_return_size;       /* struct size in bytes (>8, INDIRECT) */
+  MirVregId indirect_return_vreg; /* holds the hidden out-pointer */
+
+  /* A sub-64-bit integer return type: its byte width (1/2/4) and signedness.
+   * RETURN canonicalizes the value to 64 bits (sign/zero-extend) before `mov
+   * rax` so callers using the full register read no garbage. 0 = not narrow. */
+  int scalar_return_width;
+  int scalar_return_signed;
+
+  /* A float return type: declared width in bits (32/64). RETURN converts the
+   * value to this width before placing it in XMM0 — a float64-tracked temp
+   * returned from a float32 function must cvtsd2ss, not pass through raw. */
+  int float_return_bits;
+
+  /* Divmod fusion: when `x / d` and `x % d` appear together, one div produces
+   * both quotient (RAX) and remainder (RDX). Lowering the first of the pair
+   * captures both and records the sibling's IR dest name -> the vreg holding the
+   * result it needs, so the sibling lowers to a plain move (no second div). */
+  struct {
+    const char *name; /* sibling IR dest temp/symbol name (borrowed) */
+    MirVregId vreg;   /* vreg already holding its quotient/remainder */
+  } divmod_precomp[16];
+  size_t divmod_precomp_count;
+
   /* Loop-invariant float constants materialized once at entry (see mir_lower). */
   MirFConst *fconsts;
   size_t fconst_count;
   size_t fconst_capacity;
 
+  /* Loop-invariant 64-bit integer constants (div/mod magic numbers) materialized
+   * once at entry, kept live across the loop instead of re-emitted per iter. */
+  MirIConst *iconsts;
+  size_t iconst_count;
+  size_t iconst_capacity;
+
   /* Bytes of spill area the allocator appended below the existing frame; the
    * encoder grows the prologue allocation by this much. */
   int spill_bytes;
+
+  /* Max bytes of outgoing stack-argument space any call in this function needs
+   * (for calls with more GP arguments than the ABI has argument registers).
+   * Reserved once at the bottom of the frame, above the shadow space, so calls
+   * write stack args at a fixed rsp offset without adjusting rsp in-body. */
+  int outgoing_stack_bytes;
+
+  /* Max bytes any single call needs for copying INDIRECT (by-value) struct
+   * arguments. The Win64/SysV ABI passes such a struct as a pointer to a
+   * caller-made copy; this region (at the very bottom of the frame, below the
+   * shadow space) holds those copies. 16-aligned. */
+  int outgoing_indirect_bytes;
+
+  /* Set by the encoder when it emits an inline vector kernel (MIR_SIMD_SLP_MAC).
+   * Such a kernel leaves the YMM upper halves dirty; the epilogue emits one
+   * vzeroupper before returning so a caller using legacy SSE pays no AVX->SSE
+   * transition penalty. Doing it once per function (not per kernel invocation)
+   * keeps tiled inner loops cheap. */
+  int used_inline_vector;
 
   int has_error;
 } MirFunction;

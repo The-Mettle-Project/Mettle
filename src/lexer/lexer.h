@@ -40,6 +40,8 @@ typedef enum {
   TOKEN_WHERE,
   TOKEN_FN,
   TOKEN_MATCH,
+  TOKEN_KERNEL,
+  TOKEN_DISPATCH,
 
   // Type keywords
   TOKEN_INT8,
@@ -98,6 +100,7 @@ typedef enum {
   TOKEN_NOT,
   TOKEN_DOT,
   TOKEN_DOT_DOT,
+  TOKEN_AT,
   TOKEN_NEWLINE,
 
   // Common x86 mnemonics (for backward compatibility)

@@ -1,0 +1,55 @@
+// Regression: three sites that must narrow a float64-tracked value to
+// float32 (cvtsd2ss) instead of bit-truncating it (movss of a double's low
+// dword stores 0 for round values). Each was a distinct silent miscompile
+// found by the v2 differential fuzzer (2026-06-09):
+//
+//   1. MIR STORE: `a[i] = a[i] * 2.0 + 3.0` through a float32* param — the
+//      arithmetic result is f64-tracked, the 4-byte store must convert
+//      (was: mir_lower.c IR_OP_STORE stored the raw low dword; broke at -O0).
+//   2. MIR RETURN: a float32 function returning an f64-tracked temp must
+//      convert before XMM0 (was: returned the raw double; broke at release
+//      once coalescing removed the intermediate assign).
+//   3. INLINER PARAM: a float binop temp bound to an inlined callee's
+//      float32 parameter — the inliner's param ASSIGN must carry
+//      is_float/float_bits so the backend converts (was: flags unset, the
+//      fallback backend bit-truncated; fired in big functions that bail
+//      MIR -> fallback).
+//
+// Exit code 1 = all OK, 0 = some path miscompiled.
+
+function map_f32(a: float32*, n: int64) {
+  var i: int64 = 0;
+  while (i < n) {
+    a[i] = a[i] * 2.0 + 3.0;
+    i = i + 1;
+  }
+}
+
+@noinline function ret_f32(x: float32) -> float32 {
+  return x * 3.0 + 1.0;
+}
+
+function param_f32(x: float32, y: float32) -> float64 {
+  var r: float64 = (float64)x * 5.0 + (float64)y * 6.0;
+  return r + 3.0;
+}
+
+function main() -> int32 {
+  // 1. MIR float32 store of an arithmetic result
+  var fa: float32[4];
+  fa[0] = 5.0; fa[1] = 8.0; fa[2] = 11.0; fa[3] = 14.0;
+  map_f32(&fa[0], 4);
+  if ((int64)fa[0] != 13 || (int64)fa[3] != 31) { return 0; }
+
+  // 2. MIR float32 return of an f64-tracked temp
+  var a: float32 = 9.0;
+  var r: float32 = ret_f32(a);            // 28.0
+  if ((int64)r != 28) { return 0; }
+
+  // 3. inlined float32 param bound to a float binop temp
+  var fx: float32 = 923.0;
+  var v: float64 = param_f32(fx * 1.0 + 7.0, fx);  // 930*5 + 923*6 + 3 = 10191
+  if ((int64)v != 10191) { return 0; }
+
+  return 1;
+}

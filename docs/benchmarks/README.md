@@ -70,7 +70,6 @@ These are timed with `mettle --profile` (total compile ms).
 | Script | Compares |
 |--------|----------|
 | `compare-rust.ps1` | Rust vs C on the runtime matrix |
-| `compare-backends.ps1` | Mettle COFF vs NASM assembly backend |
 | `compare-mettle-versions.ps1` | Two Mettle compiler builds |
 
 ## Output

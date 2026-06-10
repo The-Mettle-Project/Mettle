@@ -1,0 +1,27 @@
+// `@simd!` vectorization contract, honored: the int8 dot-product range-for is
+// claimed by the SIMD_DOT_I8 recognizer, so the loop lowers to `dot_i8` and the
+// hard contract compiles cleanly. Built with -O; the runner asserts the
+// optimized IR contains dot_i8.
+import "std/io";
+import "std/mem";
+
+function qdot(a: int8*, b: int8*, n: int64) -> int32 {
+  var sum: int32 = 0;
+  @simd! for i: int64 in 0..n {
+    sum = sum + (int32)a[i] * (int32)b[i];
+  }
+  return sum;
+}
+
+function main() -> int32 {
+  var n: int64 = 64;
+  var a: int8* = (int8*)malloc(n);
+  var b: int8* = (int8*)malloc(n);
+  for i: int64 in 0..n {
+    a[i] = (int8)2;
+    b[i] = (int8)3;
+  }
+  print_int((int64)qdot(a, b, n)); // 64 * 6 = 384
+  println("");
+  return 0;
+}

@@ -82,7 +82,18 @@ int ir_label_is_while_header(const char *label) {
   if (strncmp(label, "ir_while_", 9) == 0) {
     return 1;
   }
-  return strstr(label, "_lbl_ir_while_") != NULL;
+  if (strstr(label, "_lbl_ir_while_") != NULL) {
+    return 1;
+  }
+  /* Counted `for` loops (including desugared range-for, `for i in lo..hi`)
+   * lower to the same header/compare/branch_zero/body/increment/back-jump shape
+   * as a `while` once the unused step label is cleaned up. Treat their cond
+   * header as a loop header too so every vectorizer considers them; each
+   * recognizer still fully validates the loop's structure before firing. */
+  if (strncmp(label, "ir_for_cond_", 12) == 0) {
+    return 1;
+  }
+  return strstr(label, "_lbl_ir_for_cond_") != NULL;
 }
 
 int ir_loop_body_has_nested_while(IRFunction *function, size_t start,
@@ -99,6 +110,15 @@ int ir_loop_body_has_nested_while(IRFunction *function, size_t start,
   }
 
   return 0;
+}
+
+/* True if the reduction accumulator `sym` is declared int64 (a local). Used to
+ * admit the cast-free widening sum `s += a[i]` only when `s` is genuinely 64-bit
+ * (so summing int32 into int64 cannot overflow-diverge from the scalar loop). */
+static int ir_sum_accumulator_is_int64(const IRFunction *function,
+                                       const char *sym) {
+  const char *t = ir_function_local_declared_type(function, sym);
+  return t && strcmp(t, "int64") == 0;
 }
 
 static int ir_try_vectorize_sum_i32_at(IRFunction *function, size_t header_index,
@@ -202,10 +222,24 @@ static int ir_try_vectorize_sum_i32_at(IRFunction *function, size_t header_index
         !ins->is_float && ins->dest.kind == IR_OPERAND_SYMBOL &&
         ins->dest.name && ins->rhs.kind == IR_OPERAND_TEMP &&
         ir_operand_is_symbol_named(&ins->lhs, ins->dest.name)) {
-      const IRInstruction *cast =
+      const IRInstruction *prod =
           ir_find_temp_producer_before(function, i, ins->rhs.name);
-      if (!cast || cast->op != IR_OP_CAST || !cast->text ||
-          strcmp(cast->text, "int64") != 0) {
+      int ok = 0;
+      if (prod && prod->op == IR_OP_CAST && prod->text &&
+          strcmp(prod->text, "int64") == 0) {
+        ok = 1; /* s += (int64)a[i] */
+      } else if (prod && prod->op == IR_OP_LOAD &&
+                 prod->rhs.kind == IR_OPERAND_INT &&
+                 prod->rhs.int_value == 4 && !prod->is_float &&
+                 !prod->is_unsigned &&
+                 ir_sum_accumulator_is_int64(function, ins->dest.name)) {
+        /* s += a[i] : a signed int32 load widened directly into an int64
+         * accumulator -- semantically identical to the (int64)-cast form (the
+         * kernel sums int32 into int64 with sign-extension). Lets the natural
+         * cast-free reduction vectorize. */
+        ok = 1;
+      }
+      if (!ok) {
         continue;
       }
       has_int64_cast = 1;

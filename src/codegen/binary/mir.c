@@ -10,6 +10,7 @@ void mir_function_init(MirFunction *fn, BinaryFunctionContext *context) {
   }
   memset(fn, 0, sizeof(*fn));
   fn->context = context;
+  fn->indirect_return_vreg = MIR_VREG_NONE;
 }
 
 void mir_function_destroy(MirFunction *fn) {
@@ -19,6 +20,7 @@ void mir_function_destroy(MirFunction *fn) {
   free(fn->vregs);
   free(fn->insns);
   free(fn->fconsts);
+  free(fn->iconsts);
   memset(fn, 0, sizeof(*fn));
 }
 
@@ -44,6 +46,7 @@ MirVregId mir_new_vreg(MirFunction *fn, MirRegClass rclass, int width) {
   v->spill_offset = 0;
   v->live_start = MIR_LIVE_NONE;
   v->live_end = MIR_LIVE_NONE;
+  v->coalesce_hint = MIR_VREG_NONE;
   return (MirVregId)(fn->vreg_count++);
 }
 
@@ -159,6 +162,8 @@ static const char *mir_opcode_name(MirOpcode op) {
   case MIR_LEA: return "lea";
   case MIR_MOVZX: return "movzx";
   case MIR_MOVSX: return "movsx";
+  case MIR_LOAD_GLOBAL: return "ldglobal";
+  case MIR_STORE_GLOBAL: return "stglobal";
   case MIR_ADD: return "add";
   case MIR_SUB: return "sub";
   case MIR_AND: return "and";
@@ -207,6 +212,7 @@ static const char *mir_opcode_name(MirOpcode op) {
   case MIR_VBROADCAST: return "vbroadcast";
   case MIR_VIOTA: return "viota";
   case MIR_VHREDUCE: return "vhreduce";
+  case MIR_SIMD_SLP_MAC: return "simd_slp_mac";
   case MIR_OPCODE_COUNT: break;
   }
   return "?";

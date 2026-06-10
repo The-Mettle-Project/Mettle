@@ -1,0 +1,215 @@
+// ============================================================================
+// A GGUF model reader, in Mettle.
+//
+// GGUF is the llama.cpp model container. This parses the header, all metadata
+// key/value pairs, and the tensor table of a real .gguf file -- the first step
+// any inference engine needs. It reads only the leading metadata region (a few
+// MB), never the multi-GB tensor data, so it is fast even on a 12B model.
+//
+// Format (all little-endian):
+//   magic "GGUF" | u32 version | u64 tensor_count | u64 metadata_kv_count
+//   metadata_kv_count x { string key; u32 value_type; value }
+//   tensor_count    x { string name; u32 n_dims; u64 dims[n_dims];
+//                       u32 ggml_type; u64 offset }
+// A gguf string is { u64 length; bytes }. value_type 9 is an array
+// { u32 elem_type; u64 count; elements }.
+// ============================================================================
+
+import "std/io";
+import "std/mem";
+
+// ---- little-endian decoders ----------------------------------------------
+function le_u32(b: uint8*) -> int64 {
+  return (int64)b[0] | ((int64)b[1] << 8) | ((int64)b[2] << 16) | ((int64)b[3] << 24);
+}
+function le_u64(b: uint8*) -> int64 {
+  return le_u32(b) | (le_u32(&b[4]) << 32);
+}
+
+// Consume n bytes from the stream without keeping them (chunked through scr,
+// which must be >= 64 bytes).
+function skip_bytes(fp: cstring, scr: uint8*, n: int64) {
+  var left: int64 = n;
+  while (left > 0) {
+    var c: int64 = left;
+    if (c > 64) { c = 64; }
+    fread(scr, 1, c, fp);
+    left = left - c;
+  }
+}
+
+// Read a gguf string: u64 length then bytes. Store up to cap-1 bytes into out
+// (null-terminated for printing); skip any remainder. Returns the full length.
+function read_str(fp: cstring, lenbuf: uint8*, scr: uint8*, out: uint8*,
+                  cap: int64) -> int64 {
+  fread(lenbuf, 1, 8, fp);
+  var len: int64 = le_u64(lenbuf);
+  var take: int64 = len;
+  if (take > cap - 1) { take = cap - 1; }
+  fread(out, 1, take, fp);
+  out[take] = 0;
+  if (len - take > 0) { skip_bytes(fp, scr, len - take); }
+  return len;
+}
+
+function read_u32v(fp: cstring, b: uint8*) -> int64 {
+  fread(b, 1, 4, fp);
+  return le_u32(b);
+}
+function read_u64v(fp: cstring, b: uint8*) -> int64 {
+  fread(b, 1, 8, fp);
+  return le_u64(b);
+}
+
+// Byte size of a scalar GGUF metadata value type (0..12); strings/arrays are 0.
+function scalar_size(t: int64) -> int64 {
+  if (t == 0 || t == 1 || t == 7) { return 1; }  // u8 / i8 / bool
+  if (t == 2 || t == 3) { return 2; }            // u16 / i16
+  if (t == 4 || t == 5 || t == 6) { return 4; }  // u32 / i32 / f32
+  if (t == 10 || t == 11 || t == 12) { return 8; } // u64 / i64 / f64
+  return 0;
+}
+function is_int_type(t: int64) -> int32 {
+  if (t == 0 || t == 1 || t == 2 || t == 3 || t == 4 || t == 5 || t == 7 || t == 10 || t == 11) { return 1; }
+  return 0;
+}
+
+// Print a known ggml tensor type name (the dtype of the weights), else the id.
+function print_ggml_type(t: int64) {
+  if (t == 0) { print(cstr("F32")); return; }
+  if (t == 1) { print(cstr("F16")); return; }
+  if (t == 8) { print(cstr("Q8_0")); return; }
+  if (t == 12) { print(cstr("Q4_K")); return; }
+  if (t == 14) { print(cstr("Q6_K")); return; }
+  if (t == 15) { print(cstr("Q8_K")); return; }
+  print(cstr("type#")); print_int(t);
+}
+
+function main() -> int32 {
+  var path: cstring = cstr("C:/Users/Marquis/.lmstudio/models/lmstudio-community/gemma-4-12B-it-GGUF/gemma-4-12B-it-Q4_K_M.gguf");
+  var fp: cstring = fopen(path, cstr("rb"));
+  if (fp == 0) {
+    println(cstr("could not open file"));
+    return 1;
+  }
+
+  // scratch buffers
+  var b: uint8* = (uint8*)malloc(16);     // small int reads
+  var scr: uint8* = (uint8*)malloc(128);  // skip chunks
+  var key: uint8* = (uint8*)malloc(128);  // metadata keys / tensor names
+  var val: uint8* = (uint8*)malloc(256);  // string values
+
+  // ---- header ----
+  fread(b, 1, 4, fp);
+  if (b[0] != 71 || b[1] != 71 || b[2] != 85 || b[3] != 70) { // "GGUF"
+    println(cstr("not a GGUF file"));
+    fclose(fp);
+    return 1;
+  }
+  var version: int64 = read_u32v(fp, b);
+  var n_tensors: int64 = read_u64v(fp, b);
+  var n_kv: int64 = read_u64v(fp, b);
+
+  print(cstr("GGUF version ")); print_int(version);
+  print(cstr(",  ")); print_int(n_tensors);
+  print(cstr(" tensors,  ")); print_int(n_kv);
+  println(cstr(" metadata entries"));
+  println(cstr("------------------------------------------------------------"));
+
+  // ---- metadata key/value pairs ----
+  var i: int64 = 0;
+  while (i < n_kv) {
+    read_str(fp, b, scr, key, 128);
+    var vtype: int64 = read_u32v(fp, b);
+
+    print(cstr("  "));
+    print((cstring)key);
+    print(cstr(" = "));
+
+    if (vtype == 8) {                       // string
+      read_str(fp, b, scr, val, 256);
+      println((cstring)val);
+    } else if (vtype == 9) {                // array
+      var et: int64 = read_u32v(fp, b);
+      var cnt: int64 = read_u64v(fp, b);
+      print(cstr("[array of ")); print_int(cnt);
+      print(cstr(" x type#")); print_int(et); println(cstr("]"));
+      // skip the elements
+      if (et == 8) {
+        var k: int64 = 0;
+        while (k < cnt) {
+          var sl: int64 = read_u64v(fp, b);
+          skip_bytes(fp, scr, sl);
+          k = k + 1;
+        }
+      } else {
+        skip_bytes(fp, scr, cnt * scalar_size(et));
+      }
+    } else if (is_int_type(vtype) == 1) {   // integer scalar
+      var sz: int64 = scalar_size(vtype);
+      fread(b, 1, sz, fp);
+      var v: int64 = 0;
+      if (sz == 8) { v = le_u64(b); }
+      else if (sz == 4) { v = le_u32(b); }
+      else if (sz == 2) { v = (int64)b[0] | ((int64)b[1] << 8); }
+      else { v = (int64)b[0]; }
+      println_int(v);
+    } else {                                // float scalar (f32/f64)
+      skip_bytes(fp, scr, scalar_size(vtype));
+      println(cstr("(float)"));
+    }
+    i = i + 1;
+  }
+
+  // ---- tensor table ----
+  println(cstr("------------------------------------------------------------"));
+  println(cstr("tensors (first 12):"));
+  var hist: int64* = (int64*)malloc(40 * 8);
+  var z: int64 = 0;
+  while (z < 40) { hist[z] = 0; z = z + 1; }
+
+  var t: int64 = 0;
+  while (t < n_tensors) {
+    read_str(fp, b, scr, key, 128);
+    var ndim: int64 = read_u32v(fp, b);
+    var d0: int64 = 1; var d1: int64 = 1;
+    var dd: int64 = 0;
+    while (dd < ndim) {
+      var dv: int64 = read_u64v(fp, b);
+      if (dd == 0) { d0 = dv; }
+      if (dd == 1) { d1 = dv; }
+      dd = dd + 1;
+    }
+    var gt: int64 = read_u32v(fp, b);
+    read_u64v(fp, b);  // data offset (unused here)
+    if (gt >= 0 && gt < 40) { hist[gt] = hist[gt] + 1; }
+
+    if (t < 12) {
+      print(cstr("  "));
+      print((cstring)key);
+      print(cstr("  ["));
+      print_int(d0);
+      if (ndim > 1) { print(cstr(" x ")); print_int(d1); }
+      print(cstr("]  "));
+      print_ggml_type(gt);
+      println(cstr(""));
+    }
+    t = t + 1;
+  }
+
+  println(cstr("------------------------------------------------------------"));
+  println(cstr("tensor dtype histogram:"));
+  var h: int64 = 0;
+  while (h < 40) {
+    if (hist[h] > 0) {
+      print(cstr("  "));
+      print_ggml_type(h);
+      print(cstr(": "));
+      println_int(hist[h]);
+    }
+    h = h + 1;
+  }
+
+  fclose(fp);
+  return 0;
+}

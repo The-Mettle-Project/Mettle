@@ -50,9 +50,8 @@ var greeting: string = "Hello, " + name;
 If you build manually:
 
 ```bash
-mettle main.mettle -o main.s
-nasm -f win64 main.s -o main.o
-gcc -nostartfiles main.o -o main -lkernel32
+mettle main.mettle -o main.obj
+gcc -nostartfiles main.obj -o main.exe -lkernel32
 ```
 
 For the rules around the two opt-in helper objects, see [Runtime Model — Helper objects](runtime-model.md#helper-objects).

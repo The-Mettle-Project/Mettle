@@ -563,8 +563,7 @@ int code_generator_binary_emit_struct_destination_address(
 }
 
 /* Load the address of an INDIRECT struct operand (arg or return) into
- * `target_register`. Mirrors `code_generator_emit_ir_indirect_arg_source_address`
- * from the text-asm path. */
+ * `target_register`. */
 int code_generator_binary_emit_indirect_source_address(
     CodeGenerator *generator, BinaryFunctionContext *context,
     const IROperand *operand, BinaryGpRegister target_register) {
@@ -1424,8 +1423,17 @@ int code_generator_binary_emit_operand_load(
           operand->name ? operand->name : "<unnamed>", context->function_name);
       return 0;
     }
+    /* A local's symbol is usually out of scope in the symbol table by codegen
+     * time (the scope was popped), so symbol_table_lookup returns NULL and the
+     * stack load would default to a signed 8-byte read — sign-extending a
+     * narrow unsigned local (e.g. uint32) and corrupting its value. Resolve the
+     * type from the IR (parameter signature / DECLARE_LOCAL) so the load uses
+     * the correct width and signedness. */
+    Type *load_type = symbol ? symbol->type
+                             : code_generator_binary_get_operand_type_in_context(
+                                   generator, context, operand);
     return code_generator_binary_emit_symbol_stack_load(
-        generator, context, symbol, offset, target_register);
+        generator, context, load_type, offset, target_register);
   }
 
   default:
@@ -1928,16 +1936,41 @@ int code_generator_binary_emit_float_call_argument(
     CodeGenerator *generator, BinaryFunctionContext *context,
     const IROperand *operand, Type *parameter_type, int param_fbits,
     BinaryXmmRegister xmm_register) {
+  /* The argument may be stored at a DIFFERENT precision than the parameter
+   * expects. In particular every float binary-op result is tracked as float64
+   * (instruction_result_is_float64), so `f32_param(a / b)` produces a double
+   * temp; movd-ing its low 32 bits reads 0 for values like 1.25/2.0/8.0 (whose
+   * double low word is zero). Move the raw bits into the xmm at the OPERAND's
+   * stored precision, then convert to the parameter's precision. */
+  int operand_fbits =
+      code_generator_binary_operand_float_bits(generator, context, operand);
+  if (operand_fbits != 32 && operand_fbits != 64) {
+    operand_fbits = param_fbits; /* unknown: assume it matches the parameter */
+  }
   if (!code_generator_binary_emit_call_argument_load(
           generator, context, operand, parameter_type, BINARY_GP_RAX)) {
     return 0;
   }
-  if (param_fbits == 32) {
-    return binary_emit_movd_xmm_reg(&context->code, xmm_register,
-                                    BINARY_GP_RAX);
+  if (operand_fbits == 32) {
+    if (!binary_emit_movd_xmm_reg(&context->code, xmm_register,
+                                  BINARY_GP_RAX)) {
+      return 0;
+    }
+    if (param_fbits == 64) {
+      return binary_emit_cvtss2sd_xmm_xmm(&context->code, xmm_register,
+                                          xmm_register);
+    }
+    return 1;
   }
-  return binary_emit_movq_xmm_reg(&context->code, xmm_register,
-                                  BINARY_GP_RAX);
+  /* operand is stored as a 64-bit double */
+  if (!binary_emit_movq_xmm_reg(&context->code, xmm_register, BINARY_GP_RAX)) {
+    return 0;
+  }
+  if (param_fbits == 32) {
+    return binary_emit_cvtsd2ss_xmm_xmm(&context->code, xmm_register,
+                                        xmm_register);
+  }
+  return 1;
 }
 
 int code_generator_binary_emit_local_string_store(
@@ -2150,11 +2183,8 @@ int code_generator_binary_validate_call(CodeGenerator *generator,
     return 1;
   }
 
-  if (!code_generator_binary_type_is_abi_supported(
-          generator, symbol->data.function.return_type
-                         ? symbol->data.function.return_type->name
-                         : "int64",
-          1)) {
+  if (!code_generator_binary_resolved_type_is_abi_supported(
+          symbol->data.function.return_type, 1)) {
     code_generator_set_error(
         generator,
         "Direct object backend only supports integer/pointer/string/float64 call "
@@ -2628,8 +2658,10 @@ int code_generator_binary_emit_load(CodeGenerator *generator,
   }
   /* x86-64: 32-bit integer loads into the low half zero-extend the register.
    * Signed int32 must sign-extend to int64 when held in a 64-bit slot/register.
-   * Skip when dest is int32. */
-  if (size == 4 && !instruction->is_float &&
+   * Skip when dest is int32. A load tagged is_unsigned (uint8/16/32 pointee, set
+   * at lowering) must stay zero-extended -- without this its high bits get sign-
+   * extended and 64-bit ops (compare/divide/(int64) widening) read garbage. */
+  if (size == 4 && !instruction->is_float && !instruction->is_unsigned &&
       code_generator_binary_load_needs_sign_extend(generator, context,
                                                    &instruction->dest, size) &&
       !binary_emit_movsxd_reg_reg32(&context->code, value_register,
@@ -5055,7 +5087,13 @@ int code_generator_binary_emit_instruction(
           }
           return 1;
         }
-        if (struct_bytes > 8 && instruction->dest.kind == IR_OPERAND_SYMBOL &&
+        /* Exact-size copy for any aggregate that is not exactly one register
+         * wide. A small struct whose size is not 1/2/4/8 (e.g. 3 uint8
+         * fields) is allocated EXACTLY its size with alignment 1, so the
+         * default 8-byte RAX round-trip below would write past the
+         * destination slot and silently clobber whatever local is adjacent
+         * (the copy SOURCE itself, in `var copy = orig` layouts). */
+        if (struct_bytes != 8 && instruction->dest.kind == IR_OPERAND_SYMBOL &&
             instruction->dest.name) {
           Symbol *dest_sym = symbol_table_lookup(generator->symbol_table,
                                                  instruction->dest.name);
@@ -5366,6 +5404,18 @@ int code_generator_binary_emit_instruction(
     return code_generator_binary_emit_simd_dot_i32(generator, context,
                                                    instruction);
 
+  case IR_OP_SIMD_DOT_I8:
+    return code_generator_binary_emit_simd_dot_i8(generator, context,
+                                                  instruction);
+
+  case IR_OP_SIMD_SLP_MAC_I32:
+    return code_generator_binary_emit_simd_slp_mac_i32(generator, context,
+                                                       instruction);
+
+  case IR_OP_SIMD_SLP_MAC_I8:
+    return code_generator_binary_emit_simd_slp_mac_i8(generator, context,
+                                                      instruction);
+
   case IR_OP_SIMD_MATMUL_N32:
     return code_generator_binary_emit_simd_matmul_n32(generator, context,
                                                       instruction);
@@ -5413,6 +5463,10 @@ int code_generator_binary_emit_instruction(
   case IR_OP_SIMD_AFFINE_MAP_F64:
     return code_generator_binary_emit_simd_affine_map_f64(generator, context,
                                                           instruction);
+  case IR_OP_SIMD_EXP_F32:
+    return code_generator_binary_emit_simd_exp_f32(generator, context,
+                                                   instruction);
+
   case IR_OP_SIMD_AFFINE_MAP_F32:
     return code_generator_binary_emit_simd_affine_map_f32(generator, context,
                                                           instruction);

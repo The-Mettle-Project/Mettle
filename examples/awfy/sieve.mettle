@@ -1,0 +1,63 @@
+// are-we-fast-yet :: Sieve  (ported from rochus-keller/are-we-fast-yet C port)
+//
+// Sieve of Eratosthenes over 5000 flags, counting primes. Verified result 669.
+// Config from the AWFY C main.c runAll(): numIterations = 3000, inner = 1.
+//
+// Build/run: examples\awfy\run.ps1 sieve
+
+import "std/io";
+import "std/bench";
+import "std/mem";
+
+const SIZE = 5000;
+
+function sieve(flags: uint8*, size: int32) -> int32 {
+  var primeCount: int32 = 0;
+  var i: int32 = 2;
+  while (i <= size) {
+    if (flags[i - 1] != 0) {
+      primeCount = primeCount + 1;
+      var k: int32 = i + i;
+      while (k <= size) {
+        flags[k - 1] = 0;
+        k = k + i;
+      }
+    }
+    i = i + 1;
+  }
+  return primeCount;
+}
+
+function benchmark(flags: uint8*) -> int32 {
+  var i: int32 = 0;
+  while (i < SIZE) {
+    flags[i] = 1;
+    i = i + 1;
+  }
+  return sieve(flags, SIZE);
+}
+
+function main() -> int32 {
+  var passes: int32 = 3000;
+  var flags: uint8[5000];
+
+  var last: int32 = 0;
+  var t0: uint64 = bench_time_us();
+  var it: int32 = 0;
+  while (it < passes) {
+    last = benchmark(&flags[0]);
+    it = it + 1;
+  }
+  var elapsed: uint64 = bench_time_us() - t0;
+
+  println("Sieve");
+  print("  result   = "); println_int((int64)last);
+  println("  expected = 669");
+  print("  iters    = "); println_int((int64)passes);
+  print("  time_us  = "); println_int((int64)elapsed);
+  if (last != 669) {
+    println("  FAILED");
+    return 1;
+  }
+  return 0;
+}

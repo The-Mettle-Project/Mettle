@@ -19,7 +19,13 @@ LEXER_SOURCES = $(SRCDIR)/lexer/lexer.c
 PARSER_SOURCES = $(SRCDIR)/parser/parser.c $(SRCDIR)/parser/ast.c
 SEMANTIC_SOURCES = $(SRCDIR)/semantic/symbol_table.c $(SRCDIR)/semantic/type_checker.c $(SRCDIR)/semantic/register_allocator.c $(SRCDIR)/semantic/import_resolver.c $(SRCDIR)/semantic/monomorphize.c
 IR_SOURCES = $(wildcard $(SRCDIR)/ir/*.c) $(wildcard $(SRCDIR)/ir/optimizer/*.c)
-CODEGEN_SOURCES = $(wildcard $(SRCDIR)/codegen/*.c) $(wildcard $(SRCDIR)/codegen/binary/*.c)
+CODEGEN_SOURCES = \
+	$(SRCDIR)/codegen/binary_emitter.c \
+	$(SRCDIR)/codegen/code_generator.c \
+	$(SRCDIR)/codegen/elf_emitter.c \
+	$(SRCDIR)/codegen/program_entry.c \
+	$(SRCDIR)/codegen/ptx_emitter.c \
+	$(wildcard $(SRCDIR)/codegen/binary/*.c)
 LINKER_SOURCES = $(wildcard $(SRCDIR)/linker/*.c)
 ERROR_SOURCES = $(SRCDIR)/error/error_reporter.c
 DEBUG_SOURCES = $(SRCDIR)/debug/debug_info.c

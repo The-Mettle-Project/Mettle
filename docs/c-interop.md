@@ -84,10 +84,10 @@ For networking on Linux or macOS, use `stdlib/std/net_posix.mettle`. This module
 
 ```bash
 # Linux
-gcc -o myapp output.s stdlib/posix_helpers.c -lpthread
+gcc -o myapp output.o stdlib/posix_helpers.c -lpthread
 
 # macOS
-gcc -o myapp output.s stdlib/posix_helpers.c
+gcc -o myapp output.o stdlib/posix_helpers.c
 ```
 
 The helper file provides:

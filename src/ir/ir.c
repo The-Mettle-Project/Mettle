@@ -196,6 +196,9 @@ IRFunction *ir_function_create(const char *name) {
   function->block_count = 0;
   function->entry_block = 0;
   function->cfg_valid = 0;
+  function->is_inline = 0;
+  function->is_noinline = 0;
+  function->is_pure = 0;
   return function;
 }
 
@@ -665,7 +668,7 @@ int ir_program_add_function(IRProgram *program, IRFunction *function) {
   return 1;
 }
 
-static const char *ir_opcode_name(IROpcode op) {
+const char *ir_opcode_name(IROpcode op) {
   switch (op) {
   case IR_OP_NOP:
     return "nop";
@@ -713,6 +716,9 @@ static const char *ir_opcode_name(IROpcode op) {
   case IR_OP_SIMD_MATMUL_N32: return "simd_matmul_n32";
   case IR_OP_SIMD_INSERTION_SORT_I32: return "simd_insertion_sort_i32";
   case IR_OP_SIMD_DOT_I32: return "simd_dot_i32";
+  case IR_OP_SIMD_DOT_I8: return "simd_dot_i8";
+  case IR_OP_SIMD_SLP_MAC_I32: return "simd_slp_mac_i32";
+  case IR_OP_SIMD_SLP_MAC_I8: return "simd_slp_mac_i8";
   case IR_OP_SIMD_SCALE_I32: return "simd_scale_i32";
   case IR_OP_SIMD_CLAMP_I32: return "simd_clamp_i32";
   case IR_OP_SIMD_REVERSE_COPY_I32: return "simd_reverse_copy_i32";
@@ -725,6 +731,7 @@ static const char *ir_opcode_name(IROpcode op) {
   case IR_OP_SIMD_DOT_F32: return "simd_dot_f32";
   case IR_OP_SIMD_AFFINE_MAP_F64: return "simd_affine_map_f64";
   case IR_OP_SIMD_AFFINE_MAP_F32: return "simd_affine_map_f32";
+  case IR_OP_SIMD_EXP_F32: return "simd_exp_f32";
   case IR_OP_SIMD_I2F_REDUCE_F64: return "simd_i2f_reduce_f64";
   case IR_OP_SIMD_VLOOP_F64: return "simd_vloop_f64";
   case IR_OP_SIMD_OUTER_LANE_F64: return "simd_outer_lane_f64";
@@ -914,6 +921,25 @@ static int ir_format_instruction_line(const IRInstruction *instruction,
                        dest, lhs, rhs, len);
     break;
   }
+  case IR_OP_SIMD_DOT_I8: {
+    char len[128];
+    ir_format_operand(instruction->argument_count > 0 ? &instruction->arguments[0]
+                                                      : NULL,
+                      len, sizeof(len));
+    written = snprintf(buffer, buffer_size, "%s = dot_i8(a=%s, b=%s, len=%s)",
+                       dest, lhs, rhs, len);
+    break;
+  }
+  case IR_OP_SIMD_SLP_MAC_I32:
+    written = snprintf(buffer, buffer_size,
+                       "slp_mac_i32(out=%s, a=%s, b=%s, K/n/aoff/boff/str/ooff)",
+                       dest, lhs, rhs);
+    break;
+  case IR_OP_SIMD_SLP_MAC_I8:
+    written = snprintf(buffer, buffer_size,
+                       "slp_mac_i8(out=%s, a=%s, b=%s, K/n/aoff/boff/str/ooff)",
+                       dest, lhs, rhs);
+    break;
   case IR_OP_SIMD_SCALE_I32: {
     char len[128], mul[128], add[128];
     ir_format_operand(instruction->argument_count > 0 ? &instruction->arguments[0]
@@ -1033,6 +1059,14 @@ static int ir_format_instruction_line(const IRInstruction *instruction,
                        ir_opcode_name(instruction->op), lhs,
                        instruction->argument_count);
     break;
+  case IR_OP_SIMD_EXP_F32: {
+    char len[128];
+    ir_format_operand(instruction->argument_count > 0 ? &instruction->arguments[0]
+                                                      : NULL,
+                      len, sizeof(len));
+    written = snprintf(buffer, buffer_size, "exp_f32(a=%s, len=%s)", dest, len);
+    break;
+  }
   case IR_OP_SIMD_AFFINE_MAP_F64:
   case IR_OP_SIMD_AFFINE_MAP_F32: {
     char len[128];
@@ -1085,6 +1119,104 @@ static void ir_dump_block_edges(FILE *output, const char *label,
   for (size_t i = 0; i < count; i++) {
     fprintf(output, "%s%zu", i == 0 ? " " : ",", items[i]);
   }
+}
+
+/* Replace insn->text with a copy of `name`, freeing the old text. */
+static int ir_retarget_call(IRInstruction *insn, const char *name) {
+  char *copy = mettle_strdup(name);
+  if (!copy) {
+    return 0;
+  }
+  free(insn->text);
+  insn->text = copy;
+  return 1;
+}
+
+int ir_program_route_to_native_heap(IRProgram *program) {
+  if (!program) {
+    return 0;
+  }
+  for (size_t f = 0; f < program->function_count; f++) {
+    IRFunction *fn = program->functions[f];
+    if (!fn) {
+      continue;
+    }
+    /* Never rewrite inside the allocator shims themselves. They bottom out on
+     * the OS page layer (never malloc/free/new), so no rewrite is needed
+     * today; the guard makes that invariant robust against a future shim edit
+     * that would otherwise turn a literal free or malloc call into
+     * self-recursion. The "mettle_heap_" prefix is distinctive enough not to
+     * collide with user code, and the allocator core calls no allocation
+     * surface either, so it needs no guard. */
+    if (fn->name && strncmp(fn->name, "mettle_heap_", 12) == 0) {
+      continue;
+    }
+    for (size_t i = 0; i < fn->instruction_count; i++) {
+      IRInstruction *insn = &fn->instructions[i];
+
+      if (insn->op == IR_OP_NEW) {
+        /* new T  ->  mettle_heap_zeroed(sizeof T). The size is in rhs. An
+         * absent or non-positive constant size means a default object (8
+         * bytes), the same fallback the backend's original new lowering used.
+         * Any other operand (the normal case is an INT constant; TEMP/SYMBOL
+         * are copied faithfully, duplicating an owned name) is forwarded. */
+        IROperand size_arg;
+        memset(&size_arg, 0, sizeof(size_arg));
+        if (insn->rhs.kind == IR_OPERAND_NONE ||
+            (insn->rhs.kind == IR_OPERAND_INT && insn->rhs.int_value <= 0)) {
+          size_arg.kind = IR_OPERAND_INT;
+          size_arg.int_value = 8;
+        } else {
+          size_arg = insn->rhs;
+          if (insn->rhs.name) {
+            size_arg.name = mettle_strdup(insn->rhs.name);
+            if (!size_arg.name) {
+              return 0;
+            }
+          }
+        }
+
+        IROperand *args = (IROperand *)calloc(1, sizeof(IROperand));
+        char *callee = mettle_strdup("mettle_heap_zeroed");
+        if (!args || !callee) {
+          free(args);
+          free(callee);
+          return 0;
+        }
+        args[0] = size_arg;
+        free(insn->text);
+        insn->text = callee;
+        insn->arguments = args;
+        insn->argument_count = 1;
+        insn->op = IR_OP_CALL;
+        /* rhs ownership moved into args[0] (TEMP name re-duplicated above), so
+         * detach it from the instruction to avoid a double free. */
+        memset(&insn->rhs, 0, sizeof(insn->rhs));
+        insn->rhs.kind = IR_OPERAND_NONE;
+        continue;
+      }
+
+      if (insn->op == IR_OP_CALL && insn->text) {
+        if (strcmp(insn->text, "malloc") == 0 && insn->argument_count == 1) {
+          if (!ir_retarget_call(insn, "mettle_heap_alloc")) return 0;
+        } else if (strcmp(insn->text, "calloc") == 0 &&
+                   insn->argument_count == 2) {
+          if (!ir_retarget_call(insn, "mettle_heap_calloc")) return 0;
+        } else if (strcmp(insn->text, "realloc") == 0 &&
+                   insn->argument_count == 2) {
+          if (!ir_retarget_call(insn, "mettle_heap_realloc")) return 0;
+        } else if (strcmp(insn->text, "free") == 0 &&
+                   insn->argument_count == 1) {
+          if (!ir_retarget_call(insn, "mettle_heap_free")) return 0;
+        }
+      }
+    }
+    /* Calls were added/retyped; the cached CFG (if any) is unaffected in shape,
+     * but mark it stale so any later consumer rebuilds rather than trusting
+     * per-op metadata. */
+    ir_function_clear_cfg(fn);
+  }
+  return 1;
 }
 
 int ir_program_dump(IRProgram *program, FILE *output) {

@@ -91,6 +91,11 @@ typedef struct {
   char **type_params;
   char **type_param_traits;
   size_t type_param_count;
+  // Function decorators (`@inline` / `@noinline` / `@pure` / `@simd`):
+  int is_inline;    // `@inline`  : force past the inliner's size/heuristic gate
+  int is_noinline;  // `@noinline`: never inline this function
+  int is_pure;      // `@pure`    : side-effect-free; enables loop-invariant call hoisting
+  int simd_mode;    // SimdAttr applied as the default to every counted body loop
 } FunctionDeclaration;
 
 typedef struct {
@@ -246,10 +251,18 @@ typedef struct {
   ASTNode *else_branch;
 } IfStatement;
 
+// SIMD vectorization attribute on a loop (`@simd` / `@simd!`).
+typedef enum {
+  SIMD_ATTR_NONE = 0,     // no attribute
+  SIMD_ATTR_HINT = 1,     // `@simd`  : best-effort; warn if it can't vectorize
+  SIMD_ATTR_CONTRACT = 2  // `@simd!` : hard contract; compile error if it can't
+} SimdAttr;
+
 typedef struct {
   ASTNode *condition;
   ASTNode *body;
   char *label; // Optional label for labeled break/continue; NULL if unlabeled
+  int simd_mode; // SimdAttr: vectorization attribute requested on this loop
 } WhileStatement;
 
 typedef struct {
@@ -258,6 +271,7 @@ typedef struct {
   ASTNode *increment;
   ASTNode *body;
   char *label; // Optional label
+  int simd_mode; // SimdAttr: vectorization attribute requested on this loop
 } ForStatement;
 
 typedef struct {
