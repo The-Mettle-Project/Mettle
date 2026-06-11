@@ -6,7 +6,11 @@ EXTRA_CFLAGS =
 CFLAGS = -Wall -Wextra -std=c99 -g -O2 -D_GNU_SOURCE -Isrc -fno-omit-frame-pointer $(EXTRA_CFLAGS)
 LDFLAGS =
 ifneq ($(filter Linux linux-gnu,$(shell uname -s 2>/dev/null)),)
-LDFLAGS = -rdynamic
+# glibc < 2.34 (e.g. Rocky 8 / glibc 2.28) ships pthread + dl as separate
+# libraries, so link them explicitly for compiler_context.c's pthread TLS and
+# compiler_crash.c's dladdr. No-op on glibc >= 2.34, where libc absorbed both.
+CFLAGS += -pthread
+LDFLAGS = -rdynamic -pthread -ldl
 endif
 SRCDIR = src
 OBJDIR = obj
