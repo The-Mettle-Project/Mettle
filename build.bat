@@ -108,6 +108,30 @@ if %ERRORLEVEL% NEQ 0 exit /b 1
 %CC% %CFLAGS% -c src\semantic\type_checker.c -o obj\semantic\type_checker.o
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
+%CC% %CFLAGS% -c src\semantic\type_checker_types.c -o obj\semantic\type_checker_types.o
+if %ERRORLEVEL% NEQ 0 exit /b 1
+
+%CC% %CFLAGS% -c src\semantic\type_checker_errors.c -o obj\semantic\type_checker_errors.o
+if %ERRORLEVEL% NEQ 0 exit /b 1
+
+%CC% %CFLAGS% -c src\semantic\type_checker_safety.c -o obj\semantic\type_checker_safety.o
+if %ERRORLEVEL% NEQ 0 exit /b 1
+
+%CC% %CFLAGS% -c src\semantic\type_checker_init_tracker.c -o obj\semantic\type_checker_init_tracker.o
+if %ERRORLEVEL% NEQ 0 exit /b 1
+
+%CC% %CFLAGS% -c src\semantic\type_checker_decl.c -o obj\semantic\type_checker_decl.o
+if %ERRORLEVEL% NEQ 0 exit /b 1
+
+%CC% %CFLAGS% -c src\semantic\type_checker_match.c -o obj\semantic\type_checker_match.o
+if %ERRORLEVEL% NEQ 0 exit /b 1
+
+%CC% %CFLAGS% -c src\semantic\type_checker_stmt.c -o obj\semantic\type_checker_stmt.o
+if %ERRORLEVEL% NEQ 0 exit /b 1
+
+%CC% %CFLAGS% -c src\semantic\type_checker_expr.c -o obj\semantic\type_checker_expr.o
+if %ERRORLEVEL% NEQ 0 exit /b 1
+
 %CC% %CFLAGS% -c src\semantic\register_allocator.c -o obj\semantic\register_allocator.o
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
@@ -192,7 +216,7 @@ echo Compiling main...
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
 echo Linking...
-%CC% obj\common.o obj\lexer\lexer.o obj\parser\ast.o obj\parser\parser.o obj\semantic\symbol_table.o obj\semantic\type_checker.o obj\semantic\register_allocator.o obj\semantic\import_resolver.o obj\semantic\monomorphize.o obj\ir\*.o obj\ir\optimizer\*.o obj\codegen\binary_emitter.o obj\codegen\code_generator.o obj\codegen\elf_emitter.o obj\codegen\program_entry.o obj\codegen\ptx_emitter.o obj\\codegen\\binary\\*.o obj\\linker\\*.o obj\debug\debug_info.o obj\error\error_reporter.o obj\compiler\compiler_context.o obj\compiler\compiler_crash.o obj\runtime\crash_handler.o obj\tracy_build.o obj\main.o -o bin\mettle.exe %LDFLAGS%
+%CC% obj\common.o obj\lexer\lexer.o obj\parser\ast.o obj\parser\parser.o obj\semantic\symbol_table.o obj\semantic\type_checker.o obj\semantic\type_checker_types.o obj\semantic\type_checker_errors.o obj\semantic\type_checker_safety.o obj\semantic\type_checker_init_tracker.o obj\semantic\type_checker_decl.o obj\semantic\type_checker_match.o obj\semantic\type_checker_stmt.o obj\semantic\type_checker_expr.o obj\semantic\register_allocator.o obj\semantic\import_resolver.o obj\semantic\monomorphize.o obj\ir\*.o obj\ir\optimizer\*.o obj\codegen\binary_emitter.o obj\codegen\code_generator.o obj\codegen\elf_emitter.o obj\codegen\program_entry.o obj\codegen\ptx_emitter.o obj\\codegen\\binary\\*.o obj\\linker\\*.o obj\debug\debug_info.o obj\error\error_reporter.o obj\compiler\compiler_context.o obj\compiler\compiler_crash.o obj\runtime\crash_handler.o obj\tracy_build.o obj\main.o -o bin\mettle.exe %LDFLAGS%
 
 if %ERRORLEVEL% NEQ 0 (
     echo Build failed!
