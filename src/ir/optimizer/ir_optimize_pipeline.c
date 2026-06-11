@@ -314,11 +314,16 @@ int ir_optimize_function_pipeline(IRFunction *function) {
 
   /* Enforce `@simd` contracts now that every vectorizer has had its chance,
    * then strip the markers before CFG rebuild / codegen. */
+  double t0 = ir_pass_time_begin();
   if (!ir_verify_simd_contracts(function)) {
     return 0;
   }
+  ir_pass_time_end("verify_simd_contracts [stage]", t0);
 
-  return ir_function_rebuild_cfg(function);
+  t0 = ir_pass_time_begin();
+  int ok = ir_function_rebuild_cfg(function);
+  ir_pass_time_end("rebuild_cfg [stage]", t0);
+  return ok;
 }
 
 /* --explain hypothesis testing: re-run the optimization stages (including
@@ -366,10 +371,14 @@ int ir_optimize_program_pipeline(IRProgram *program,
                           options ? options->explain_focus_file : NULL);
   ir_function_index_reset();
 
-  if (!ir_run_program_stage_for_each_function(
-          program, ir_optimize_pre_inline_function)) {
-    ir_function_index_reset();
-    return 0;
+  {
+    double t0 = ir_pass_time_begin();
+    if (!ir_run_program_stage_for_each_function(
+            program, ir_optimize_pre_inline_function)) {
+      ir_function_index_reset();
+      return 0;
+    }
+    ir_pass_time_end("pre_inline [stage]", t0);
   }
 
   if ((!options || !options->preserve_function_boundaries) &&
@@ -377,9 +386,11 @@ int ir_optimize_program_pipeline(IRProgram *program,
     int inlining_changed = 0;
     mettle_compiler_ctx_set_pass_name("inline_small_functions");
     mettle_compiler_ctx_set_fixpoint_iteration(0);
+    double t0 = ir_pass_time_begin();
     if (!ir_inline_small_functions_pass(program, &inlining_changed)) {
       mettle_compiler_ice("IR optimization inlining pass failed");
     }
+    ir_pass_time_end("inline_small_functions [program]", t0);
   }
 
   /* Bounded recursive inlining: expand a recursive function's direct
@@ -393,9 +404,11 @@ int ir_optimize_program_pipeline(IRProgram *program,
     int self_inline_changed = 0;
     mettle_compiler_ctx_set_pass_name("inline_self_recursion");
     mettle_compiler_ctx_set_fixpoint_iteration(0);
+    double t0 = ir_pass_time_begin();
     if (!ir_inline_self_recursion_pass(program, &self_inline_changed)) {
       mettle_compiler_ice("IR optimization self-recursion inlining failed");
     }
+    ir_pass_time_end("inline_self_recursion [program]", t0);
   }
 
   /* `@pure` loop-invariant call hoisting. Program-level (resolves callees by
@@ -405,9 +418,11 @@ int ir_optimize_program_pipeline(IRProgram *program,
     int pure_licm_changed = 0;
     mettle_compiler_ctx_set_pass_name("hoist_pure_calls");
     mettle_compiler_ctx_set_fixpoint_iteration(0);
+    double t0 = ir_pass_time_begin();
     if (!ir_hoist_pure_calls_pass(program, &pure_licm_changed)) {
       mettle_compiler_ice("IR optimization pure-call hoisting pass failed");
     }
+    ir_pass_time_end("hoist_pure_calls [program]", t0);
   }
 
   /* Give the per-function contract verifier program access for the duration
@@ -443,6 +458,7 @@ int ir_optimize_program_pipeline(IRProgram *program,
    * sorted report. (No-ops unless explain is enabled.) */
   ir_inline_explain_report_remaining(program);
   ir_explain_flush();
+  ir_pass_time_report();
 
   ir_function_index_reset();
   return contracts_ok;

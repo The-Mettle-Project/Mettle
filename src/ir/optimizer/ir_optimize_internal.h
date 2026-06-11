@@ -34,10 +34,24 @@ typedef struct {
   IROperand value;
 } IRTempValueEntry;
 
-typedef struct {
+/* Name -> value map with a lazily maintained open-addressing hash index over
+ * `items`. The array stays the source of truth (passes iterate it directly);
+ * the index makes find/set/remove O(1) so copy-propagation stays linear on
+ * the multi-thousand-instruction functions inlining produces. Code that
+ * compacts `items` in place must call ir_temp_value_map_reindex afterwards. */
+typedef struct IRTempValueMap {
   IRTempValueEntry *items;
   size_t count;
   size_t capacity;
+  unsigned int *ix;     /* buckets: 0 = empty, UINT_MAX = tombstone, else slot+1 */
+  size_t ix_capacity;   /* power of two, 0 until first index build */
+  size_t ix_tombstones;
+  /* Lazily built reverse count: value-symbol name -> how many entries map to
+   * it (int values; itself never carries a reverse count). Lets the
+   * per-symbol-write invalidation in copy-propagation answer "no entry
+   * values this symbol" in O(1) instead of scanning every entry. NULL until
+   * ir_temp_value_map_remove_symbol_values first needs it. */
+  struct IRTempValueMap *vsym_counts;
 } IRTempValueMap;
 
 /* Block-local known values for stack locals (@symbol operands). */
@@ -53,6 +67,9 @@ typedef struct {
   IRLabelValueEntry *items;
   size_t count;
   size_t capacity;
+  /* label -> slot index (int values); copy-propagation consults this map per
+   * label/jump/branch, and inlined functions carry thousands of labels. */
+  IRTempValueMap index;
 } IRLabelValueMap;
 
 typedef struct {
@@ -530,6 +547,11 @@ void ir_inline_explain_report_remaining(IRProgram *program);
 int ir_optimize_pre_inline_function(IRFunction *function);
 int ir_pass_is_skipped(IROptPassId pass_id);
 int ir_pass_name_is_skipped(const char *pass_name);
+/* METTLE_TIME_IR_PASSES=1: cumulative per-pass wall-time table, dumped at the
+ * end of optimization. begin/end bracket program-level passes by name. */
+double ir_pass_time_begin(void);
+void ir_pass_time_end(const char *name, double begin_ms);
+void ir_pass_time_report(void);
 int ir_pointer_induction_pass(IRFunction *function, int *changed);
 int ir_positive_loop_div2_to_shift_pass(IRFunction *function,
                                                int *changed);
@@ -607,10 +629,24 @@ const IROperand *ir_temp_value_map_lookup(const IRTempValueMap *map,
 void ir_temp_value_map_remove(IRTempValueMap *map, const char *name);
 void ir_temp_value_map_remove_symbol_values(IRTempValueMap *map,
                                                    const char *symbol_name);
+/* `addr_taken` is the function's address-taken symbol set, precomputed once
+ * per pass with ir_addr_taken_set_build (scanning the function per entry per
+ * store was a cubic term on large functions). */
 void ir_temp_value_map_invalidate_after_store(IRTempValueMap *map,
-                                              const IRFunction *function);
+                                              const IRTempValueMap *addr_taken);
+int ir_addr_taken_set_build(const IRFunction *function, IRTempValueMap *set);
 int ir_temp_value_map_set(IRTempValueMap *map, const char *name,
                                  const IROperand *value);
+/* Rebuild the hash index after compacting `items` in place. */
+int ir_temp_value_map_reindex(IRTempValueMap *map);
+/* True when some entry's VALUE is `symbol_name` (lazily builds the reverse
+ * count); a 0 lets per-symbol-write invalidation skip its scan. Compactors
+ * that remove entries in place must report each removed value via
+ * ir_temp_value_map_note_value_removed to keep the counts true. */
+int ir_temp_value_map_any_value_symbol(IRTempValueMap *map,
+                                       const char *symbol_name);
+void ir_temp_value_map_note_value_removed(IRTempValueMap *map,
+                                          const IROperand *value);
 int ir_thread_jump_targets_pass(IRFunction *function, int *changed);
 int ir_try_parse_direct_unit_increment(const IRInstruction *instruction,
                                               const char *iv_symbol);

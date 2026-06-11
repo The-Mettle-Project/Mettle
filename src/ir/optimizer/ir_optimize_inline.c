@@ -680,6 +680,44 @@ static int ir_call_site_is_in_loop(const IRFunction *function, size_t site) {
   return 0;
 }
 
+/* Bitmap form of ir_call_site_is_in_loop for the inliner's walk over an
+ * over-budget caller: marks every [header, last back-jump] range once,
+ * instead of re-deriving loop membership per call site (which was quadratic
+ * on machine-generated functions with hundreds of loops and calls). Returns
+ * NULL on allocation failure or when the function has no loops -- callers
+ * fall back to the per-site scan. */
+static char *ir_build_in_loop_bitmap(const IRFunction *function) {
+  char *in_loop = NULL;
+  for (size_t h = 0; h < function->instruction_count; h++) {
+    const IRInstruction *header = &function->instructions[h];
+    if (header->op != IR_OP_LABEL || !header->text ||
+        !ir_label_is_while_header(header->text)) {
+      continue;
+    }
+    size_t last = 0;
+    int found = 0;
+    for (size_t j = h + 1; j < function->instruction_count; j++) {
+      const IRInstruction *jmp = &function->instructions[j];
+      if (jmp->op == IR_OP_JUMP && jmp->text &&
+          strcmp(jmp->text, header->text) == 0) {
+        last = j;
+        found = 1;
+      }
+    }
+    if (!found) {
+      continue;
+    }
+    if (!in_loop) {
+      in_loop = calloc(function->instruction_count, 1);
+      if (!in_loop) {
+        return NULL;
+      }
+    }
+    memset(in_loop + h, 1, last - h + 1);
+  }
+  return in_loop;
+}
+
 /* A "tiny leaf": at most IR_INLINE_TINY_LEAF_NON_NOP_INSTRUCTIONS non-nop
  * instructions and no calls of its own. Inlining one into ANY caller is
  * (nearly) free -- the body is about the size of the call sequence it
@@ -717,6 +755,7 @@ static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
    * which cost nothing measurable as real calls. */
   int caller_over_budget = ir_function_non_nop_instruction_count(function) >
                            IR_INLINE_MAX_CALLER_NON_NOP_INSTRUCTIONS;
+  char *in_loop = caller_over_budget ? ir_build_in_loop_bitmap(function) : NULL;
 
   IRInstructionVector vector = {0};
   int local_changed = 0;
@@ -731,8 +770,7 @@ static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
       if (callee && callee != function &&
           instruction->argument_count == callee->parameter_count &&
           (!caller_over_budget || callee->is_inline ||
-           ir_function_is_tiny_leaf(callee) ||
-           ir_call_site_is_in_loop(function, i)) &&
+           ir_function_is_tiny_leaf(callee) || (in_loop && in_loop[i])) &&
           ir_function_is_inline_candidate(callee, NULL, NULL)) {
         if (ir_explain_enabled()) {
           char entity[160];
@@ -754,9 +792,11 @@ static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
         !ir_instruction_vector_append_move(&vector, &cloned)) {
       ir_instruction_destroy_storage(&cloned);
       ir_instruction_vector_destroy(&vector);
+      free(in_loop);
       return 0;
     }
   }
+  free(in_loop);
 
   for (size_t i = 0; i < function->instruction_count; i++) {
     ir_instruction_destroy_storage(&function->instructions[i]);

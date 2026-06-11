@@ -291,6 +291,12 @@ static void ir_symbol_value_map_invalidate_name(IRSymbolValueMap *map,
 
   ir_temp_value_map_remove(map, symbol_name);
 
+  /* O(1) fast path: no surviving entry values this symbol, so the compaction
+   * scan below would remove nothing. */
+  if (!ir_temp_value_map_any_value_symbol(map, symbol_name)) {
+    return;
+  }
+
   size_t write = 0;
   for (size_t read = 0; read < map->count; read++) {
     IRTempValueEntry *entry = &map->items[read];
@@ -304,6 +310,7 @@ static void ir_symbol_value_map_invalidate_name(IRSymbolValueMap *map,
     }
 
     if (remove) {
+      ir_temp_value_map_note_value_removed(map, &entry->value);
       free(entry->name);
       ir_operand_destroy(&entry->value);
       continue;
@@ -314,7 +321,10 @@ static void ir_symbol_value_map_invalidate_name(IRSymbolValueMap *map,
     }
     write++;
   }
-  map->count = write;
+  if (map->count != write) {
+    map->count = write;
+    ir_temp_value_map_reindex(map);
+  }
 }
 
 static int ir_resolve_propagated_value(const IRTempValueMap *temp_map,
@@ -473,6 +483,79 @@ static int ir_propagate_instruction_operands(IRTempValueMap *temp_map,
   return 1;
 }
 
+/* Record `i` as the last position reading each temp/symbol operand of the
+ * instruction. dest is included: for stores it is an address read, and for
+ * writes the entry gets invalidated anyway, so overcounting is harmless. */
+static int ir_cp_note_operand_uses(const IRInstruction *ins, size_t i,
+                                   IRTempValueMap *temp_last,
+                                   IRTempValueMap *sym_last) {
+  const IROperand *ops[3] = {&ins->lhs, &ins->rhs, &ins->dest};
+  IROperand pos = {.kind = IR_OPERAND_INT, .int_value = (long long)i};
+  for (int k = 0; k < 3; k++) {
+    if (!ops[k]->name) {
+      continue;
+    }
+    if (ops[k]->kind == IR_OPERAND_TEMP) {
+      if (!ir_temp_value_map_set(temp_last, ops[k]->name, &pos)) {
+        return 0;
+      }
+    } else if (ops[k]->kind == IR_OPERAND_SYMBOL) {
+      if (!ir_temp_value_map_set(sym_last, ops[k]->name, &pos)) {
+        return 0;
+      }
+    }
+  }
+  for (size_t a = 0; a < ins->argument_count; a++) {
+    const IROperand *op = &ins->arguments[a];
+    if (!op->name) {
+      continue;
+    }
+    if (op->kind == IR_OPERAND_TEMP) {
+      if (!ir_temp_value_map_set(temp_last, op->name, &pos)) {
+        return 0;
+      }
+    } else if (op->kind == IR_OPERAND_SYMBOL) {
+      if (!ir_temp_value_map_set(sym_last, op->name, &pos)) {
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
+/* Drop entries whose key is not read anywhere past `i`: they can never be
+ * looked up again, but without pruning every label SNAPSHOT copies them --
+ * which made this pass O(labels x live-entries), the dominant compile cost
+ * on big inlined functions (4M cloned entries per iteration on a 4000-call
+ * main). Pruning loses no soundness: it only removes facts. */
+static void ir_cp_prune_dead_entries(IRTempValueMap *map,
+                                     const IRTempValueMap *last_use,
+                                     size_t i) {
+  if (!map || map->count == 0) {
+    return;
+  }
+  size_t write = 0;
+  for (size_t read = 0; read < map->count; read++) {
+    IRTempValueEntry *entry = &map->items[read];
+    const IROperand *lu =
+        entry->name ? ir_temp_value_map_lookup(last_use, entry->name) : NULL;
+    if (!lu || lu->int_value <= (long long)i) {
+      ir_temp_value_map_note_value_removed(map, &entry->value);
+      free(entry->name);
+      ir_operand_destroy(&entry->value);
+      continue;
+    }
+    if (write != read) {
+      map->items[write] = map->items[read];
+    }
+    write++;
+  }
+  if (map->count != write) {
+    map->count = write;
+    ir_temp_value_map_reindex(map);
+  }
+}
+
 int ir_copy_and_constant_propagation_pass(IRFunction *function,
                                                  int *changed) {
   if (!function) {
@@ -494,16 +577,57 @@ int ir_copy_and_constant_propagation_pass(IRFunction *function,
     return 0;
   }
 
+  /* Address-taken symbol set for store invalidation, built once: this pass
+   * never introduces ADDRESS_OF instructions, so it stays valid across every
+   * iteration. (Per-store function rescans were a cubic term here.) Last-use
+   * indexes (name -> last instruction position reading it) power the dead-
+   * entry pruning at labels; rebuilt per iteration because propagation
+   * rewrites operands. */
+  IRTempValueMap addr_taken, temp_last_use, sym_last_use;
+  if (!ir_temp_value_map_init(&addr_taken) ||
+      !ir_temp_value_map_init(&temp_last_use) ||
+      !ir_temp_value_map_init(&sym_last_use) ||
+      !ir_addr_taken_set_build(function, &addr_taken)) {
+    ir_label_value_map_destroy(&label_in);
+    ir_temp_value_map_destroy(&map);
+    ir_temp_value_map_destroy(&symbol_map);
+    ir_temp_value_map_destroy(&addr_taken);
+    ir_temp_value_map_destroy(&temp_last_use);
+    ir_temp_value_map_destroy(&sym_last_use);
+    return 0;
+  }
+
   int any_changed = 0;
   for (int iteration = 0; iteration < 8; iteration++) {
     int flow_changed = 0;
     ir_temp_value_map_clear(&map);
     ir_temp_value_map_clear(&symbol_map);
+    ir_temp_value_map_clear(&temp_last_use);
+    ir_temp_value_map_clear(&sym_last_use);
+    for (size_t i = 0; i < function->instruction_count; i++) {
+      if (!ir_cp_note_operand_uses(&function->instructions[i], i,
+                                   &temp_last_use, &sym_last_use)) {
+        ir_label_value_map_destroy(&label_in);
+        ir_temp_value_map_destroy(&map);
+        ir_temp_value_map_destroy(&symbol_map);
+        ir_temp_value_map_destroy(&addr_taken);
+        ir_temp_value_map_destroy(&temp_last_use);
+        ir_temp_value_map_destroy(&sym_last_use);
+        return 0;
+      }
+    }
 
     for (size_t i = 0; i < function->instruction_count; i++) {
       IRInstruction *instruction = &function->instructions[i];
 
       if (instruction->op == IR_OP_LABEL && instruction->text) {
+        /* Entries nobody reads past this point would only bloat the label
+         * snapshots below (every label clones the live map; unpruned, that
+         * was O(labels x entries) -- the dominant compile cost on big
+         * inlined functions). */
+        ir_cp_prune_dead_entries(&map, &temp_last_use, i);
+        ir_cp_prune_dead_entries(&symbol_map, &sym_last_use, i);
+
         /* The label is reachable from explicit jumps/branches *and* from
          * fall-through if the previous non-nop instruction is not a JUMP or
          * RETURN. Merge the fall-through map into label_in[L] first so the
@@ -532,6 +656,9 @@ int ir_copy_and_constant_propagation_pass(IRFunction *function,
             ir_label_value_map_destroy(&label_in);
             ir_temp_value_map_destroy(&map);
             ir_temp_value_map_destroy(&symbol_map);
+            ir_temp_value_map_destroy(&addr_taken);
+    ir_temp_value_map_destroy(&temp_last_use);
+    ir_temp_value_map_destroy(&sym_last_use);
             return 0;
           }
         }
@@ -543,6 +670,9 @@ int ir_copy_and_constant_propagation_pass(IRFunction *function,
             ir_label_value_map_destroy(&label_in);
             ir_temp_value_map_destroy(&map);
             ir_temp_value_map_destroy(&symbol_map);
+            ir_temp_value_map_destroy(&addr_taken);
+    ir_temp_value_map_destroy(&temp_last_use);
+    ir_temp_value_map_destroy(&sym_last_use);
             return 0;
           }
         } else {
@@ -556,8 +686,12 @@ int ir_copy_and_constant_propagation_pass(IRFunction *function,
         ir_label_value_map_destroy(&label_in);
         ir_temp_value_map_destroy(&map);
         ir_temp_value_map_destroy(&symbol_map);
+        ir_temp_value_map_destroy(&addr_taken);
+    ir_temp_value_map_destroy(&temp_last_use);
+    ir_temp_value_map_destroy(&sym_last_use);
         return 0;
       }
+
 
       if (ir_instruction_writes_temp(instruction) && instruction->dest.name) {
         ir_temp_value_map_remove(&map, instruction->dest.name);
@@ -573,6 +707,9 @@ int ir_copy_and_constant_propagation_pass(IRFunction *function,
             ir_label_value_map_destroy(&label_in);
             ir_temp_value_map_destroy(&map);
             ir_temp_value_map_destroy(&symbol_map);
+            ir_temp_value_map_destroy(&addr_taken);
+    ir_temp_value_map_destroy(&temp_last_use);
+    ir_temp_value_map_destroy(&sym_last_use);
             return 0;
           }
         }
@@ -596,6 +733,9 @@ int ir_copy_and_constant_propagation_pass(IRFunction *function,
             ir_label_value_map_destroy(&label_in);
             ir_temp_value_map_destroy(&map);
             ir_temp_value_map_destroy(&symbol_map);
+            ir_temp_value_map_destroy(&addr_taken);
+    ir_temp_value_map_destroy(&temp_last_use);
+    ir_temp_value_map_destroy(&sym_last_use);
             return 0;
           }
         }
@@ -612,8 +752,8 @@ int ir_copy_and_constant_propagation_pass(IRFunction *function,
       }
 
       if (instruction->op == IR_OP_STORE) {
-        ir_temp_value_map_invalidate_after_store(&map, function);
-        ir_temp_value_map_invalidate_after_store(&symbol_map, function);
+        ir_temp_value_map_invalidate_after_store(&map, &addr_taken);
+        ir_temp_value_map_invalidate_after_store(&symbol_map, &addr_taken);
       } else if (instruction->op == IR_OP_CALL ||
                  instruction->op == IR_OP_CALL_INDIRECT ||
                  instruction->op == IR_OP_INLINE_ASM) {
@@ -621,14 +761,20 @@ int ir_copy_and_constant_propagation_pass(IRFunction *function,
         ir_temp_value_map_clear(&symbol_map);
       }
 
+
       if ((instruction->op == IR_OP_JUMP || instruction->op == IR_OP_BRANCH_ZERO ||
            instruction->op == IR_OP_BRANCH_EQ) &&
           instruction->text) {
+        /* Same reasoning as the label prune: don't snapshot dead entries. */
+        ir_cp_prune_dead_entries(&map, &temp_last_use, i);
         if (!ir_label_value_map_merge_incoming(&label_in, instruction->text,
                                                &map, &flow_changed)) {
           ir_label_value_map_destroy(&label_in);
           ir_temp_value_map_destroy(&map);
           ir_temp_value_map_destroy(&symbol_map);
+          ir_temp_value_map_destroy(&addr_taken);
+    ir_temp_value_map_destroy(&temp_last_use);
+    ir_temp_value_map_destroy(&sym_last_use);
           return 0;
         }
       }
@@ -651,6 +797,9 @@ int ir_copy_and_constant_propagation_pass(IRFunction *function,
   ir_label_value_map_destroy(&label_in);
   ir_temp_value_map_destroy(&map);
   ir_temp_value_map_destroy(&symbol_map);
+  ir_temp_value_map_destroy(&addr_taken);
+  ir_temp_value_map_destroy(&temp_last_use);
+  ir_temp_value_map_destroy(&sym_last_use);
   return 1;
 }
 
