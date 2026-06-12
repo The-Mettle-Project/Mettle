@@ -497,24 +497,36 @@ static int encode_extend(MirFunction *fn, const MirInst *in) {
   int signed_ext = (in->op == MIR_MOVSX);
   BinaryGpRegister D;
 
-  if (signed_ext && dst_is_reg(fn, &in->dst, &D)) {
+  if (dst_is_reg(fn, &in->dst, &D)) {
     int ok;
     BinaryGpRegister areg = value_reg(fn, &in->a, SCRATCH_A, &ok);
     if (!ok) {
       return 0;
     }
     int done = 1;
+    /* The width-4 unsigned form must be the ALWAYS-emitting 32-bit mov: the
+     * canonicalizing `mov D32, D32` has dst == src, and the skip-when-equal
+     * mov_reg_reg32 would silently drop the zero-extension. */
     switch (in->width) {
-    case 4: done = binary_emit_movsxd_reg_reg32(code, D, areg); break;
-    case 2: done = binary_emit_movsx_reg_reg16(code, D, areg); break;
-    case 1: done = binary_emit_movsx_reg_reg8(code, D, areg); break;
+    case 4:
+      done = signed_ext ? binary_emit_movsxd_reg_reg32(code, D, areg)
+                        : binary_emit_movzx_reg_reg32(code, D, areg);
+      break;
+    case 2:
+      done = signed_ext ? binary_emit_movsx_reg_reg16(code, D, areg)
+                        : binary_emit_movzx_reg_reg16(code, D, areg);
+      break;
+    case 1:
+      done = signed_ext ? binary_emit_movsx_reg_reg8(code, D, areg)
+                        : binary_emit_movzx_reg_reg8(code, D, areg);
+      break;
     default: return enc_err(fn, "bad extend width");
     }
     return done ? 1 : enc_err(fn, "out of memory in extend");
   }
 
-  /* Scratch path (unsigned, or a spilled destination): extend in SCRATCH_A using
-   * the general reg-reg forms (no RAX dependency), then store. */
+  /* Scratch path (spilled destination): extend in SCRATCH_A using the general
+   * reg-reg forms (no RAX dependency), then store. */
   if (!materialize_into(fn, &in->a, SCRATCH_A)) {
     return 0;
   }
@@ -523,7 +535,7 @@ static int encode_extend(MirFunction *fn, const MirInst *in) {
   switch (in->width) {
   case 4:
     ok = signed_ext ? binary_emit_movsxd_reg_reg32(code, S, S)
-                    : binary_emit_mov_reg_reg32(code, S, S);
+                    : binary_emit_movzx_reg_reg32(code, S, S);
     break;
   case 2:
     ok = signed_ext ? binary_emit_movsx_reg_reg16(code, S, S)
@@ -1085,8 +1097,11 @@ static int mir_home_gp_param(MirFunction *fn, const MirParam *p,
   if (dst_is_reg(fn, &dst, &D)) {
     int ok = 1;
     if (p->width == 4) {
+      /* movzx_reg_reg32: must emit even when D == arg (the regalloc often
+       * coalesces a param into its incoming register) — the skip-when-equal
+       * mov would silently drop the uint32 canonicalization. */
       ok = p->is_signed ? binary_emit_movsxd_reg_reg32(code, D, arg)
-                        : binary_emit_mov_reg_reg32(code, D, arg);
+                        : binary_emit_movzx_reg_reg32(code, D, arg);
     } else if (p->width == 2 && p->is_signed) {
       ok = binary_emit_movsx_reg_reg16(code, D, arg);
     } else if (p->width == 1 && p->is_signed) {
@@ -1103,7 +1118,7 @@ static int mir_home_gp_param(MirFunction *fn, const MirParam *p,
   int ok = 1;
   if (p->width == 4) {
     ok = p->is_signed ? binary_emit_movsxd_reg_reg32(code, S, arg)
-                      : binary_emit_mov_reg_reg32(code, S, arg);
+                      : binary_emit_movzx_reg_reg32(code, S, arg);
   } else if (p->width == 2) {
     ok = p->is_signed ? binary_emit_movsx_reg_reg16(code, S, arg)
                       : binary_emit_movzx_reg_reg16(code, S, arg);

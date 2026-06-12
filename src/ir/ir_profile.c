@@ -338,6 +338,7 @@ static int ir_profile_instruction_op_class(const IRInstruction *instruction,
   case IR_OP_SIMD_EXP_F32:
   case IR_OP_SIMD_I2F_REDUCE_F64:
   case IR_OP_SIMD_VLOOP_F64:
+  case IR_OP_SIMD_VLOOP_I32:
   case IR_OP_SIMD_OUTER_LANE_F64:
     *op_class_out = METTLE_PROFILE_OP_SIMD;
     return 1;

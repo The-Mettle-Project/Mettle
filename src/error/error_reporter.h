@@ -100,6 +100,11 @@ void error_reporter_add_warning(ErrorReporter *reporter, ErrorType type,
                                 SourceLocation location, const char *message);
 void error_reporter_add_warning_with_span(ErrorReporter *reporter, ErrorType type,
                                           SourceSpan span, const char *message);
+void error_reporter_add_warning_with_suggestion(ErrorReporter *reporter,
+                                                ErrorType type,
+                                                SourceLocation location,
+                                                const char *message,
+                                                const char *suggestion);
 
 void error_reporter_print_errors(ErrorReporter *reporter);
 void error_reporter_print_error(ErrorReporter *reporter,

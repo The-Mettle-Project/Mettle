@@ -1,0 +1,104 @@
+// Interprocedural memory diagnostics: ownership summaries are inferred over
+// the call graph, so these bugs cross function boundaries.
+import "std/io";
+import "std/mem";
+
+// Summary: frees its parameter (via the spine defer).
+function consume(p: cstring) {
+    defer free(p);
+    p[0] = 1;
+}
+
+// Summary: returns a fresh allocation (wrapper allocator).
+function make_buffer() -> cstring {
+    var p: cstring = malloc(64);
+    p[0] = 0;
+    return p;
+}
+
+// Summary: pure borrow (reads through the pointer, keeps nothing).
+function checksum(p: cstring, n: int64) -> int32 {
+    var total: int32 = 0;
+    var i: int64 = 0;
+    while (i < n) {
+        total = total + (int32)p[i];
+        i = i + 1;
+    }
+    return total;
+}
+
+// Summary: keeps a reference (stores into a global).
+var KEPT: cstring = 0;
+function keep(p: cstring) {
+    KEPT = p;
+}
+
+// Summary: keeps a reference by forwarding to another keeper.
+function keep_through_helper(p: cstring) {
+    keep(p);
+}
+
+// Cross-call use-after-free: consume() freed it.
+function use_after_consume() -> int32 {
+    var p: cstring = malloc(32);
+    consume(p);
+    return (int32)p[0];
+}
+
+// Cross-call double free: consume() already freed it.
+function free_after_consume() {
+    var p: cstring = malloc(32);
+    consume(p);
+    free(p);
+}
+
+// Leak THROUGH a borrowing helper: checksum() gives the pointer back.
+function leak_past_borrow() -> int32 {
+    var p: cstring = malloc(64);
+    return checksum(p, 64);
+}
+
+// Leak of a wrapper allocator's result.
+function leak_from_wrapper() -> int32 {
+    var p: cstring = make_buffer();
+    return (int32)p[0];
+}
+
+// Clean control group: every function below must produce NO diagnostics.
+function clean_consume_once() {
+    var p: cstring = malloc(32);
+    consume(p);
+}
+
+function clean_borrow_then_free() -> int32 {
+    var p: cstring = malloc(64);
+    var total: int32 = checksum(p, 64);
+    free(p);
+    return total;
+}
+
+function clean_kept_elsewhere() {
+    var p: cstring = malloc(32);
+    keep(p);
+}
+
+function clean_kept_through_helper() {
+    var p: cstring = malloc(32);
+    keep_through_helper(p);
+}
+
+function clean_wrapper_freed() -> int32 {
+    var p: cstring = make_buffer();
+    defer free(p);
+    return (int32)p[0];
+}
+
+function main() -> int32 {
+    var total: int32 = use_after_consume() + leak_past_borrow() + leak_from_wrapper() + clean_borrow_then_free() + clean_wrapper_freed();
+    free_after_consume();
+    clean_consume_once();
+    clean_kept_elsewhere();
+    clean_kept_through_helper();
+    println_int(total);
+    return 0;
+}

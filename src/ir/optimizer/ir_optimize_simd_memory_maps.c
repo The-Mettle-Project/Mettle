@@ -58,35 +58,77 @@ int ir_symbol_contains(const char *symbol, const char *needle) {
   return symbol && needle && strstr(symbol, needle) != NULL;
 }
 
+/* The base a walking pointer was initialized from. The fused kernels replay
+ * the walk from base[0], so the init must be the pointer's ONLY write before
+ * the loop: with multiple writes (a reassignment, a previous loop's advance,
+ * an if/else init) the entering value is not provably the base. */
 const char *ir_find_ptr_init_base(const IRFunction *function, size_t before,
                                          const char *ptr_symbol) {
+  const char *base = NULL;
   size_t i = 0;
   if (!function || !ptr_symbol) {
     return NULL;
   }
   for (i = 0; i < before; i++) {
     const IRInstruction *ins = &function->instructions[i];
-    if (ins->op == IR_OP_ASSIGN &&
-        ir_operand_is_symbol_named(&ins->dest, ptr_symbol) &&
-        ins->lhs.kind == IR_OPERAND_SYMBOL && ins->lhs.name) {
-      return ins->lhs.name;
+    if (!ir_instruction_writes_destination(ins) ||
+        !ir_operand_is_symbol_named(&ins->dest, ptr_symbol)) {
+      continue;
     }
+    if (base || ins->op != IR_OP_ASSIGN ||
+        ins->lhs.kind != IR_OPERAND_SYMBOL || !ins->lhs.name) {
+      return NULL;
+    }
+    base = ins->lhs.name;
   }
-  return NULL;
+  return base;
 }
 
 int ir_find_ptr_loop_len_operand(const IRFunction *function,
                                         size_t header_index,
-                                        const char *end_ptr, IROperand *out_len) {
+                                        const char *end_ptr, const char *base,
+                                        IROperand *out_len) {
   size_t i = 0;
-  if (!function || !end_ptr || !out_len) {
+  if (!function || !end_ptr || !base || !out_len) {
     return 0;
   }
   for (i = 0; i < header_index; i++) {
     const IRInstruction *ins = &function->instructions[i];
+    int anchored = 0;
+    /* end = base + (n << 2): anchored to the SAME base the walk starts from,
+     * so the kernel's n iterations equal the scalar walk's (end-base)/4. An
+     * end computed off a different/offset pointer would make `n` a lie. The
+     * add's lhs is the base directly, or the end pointer itself when the IR
+     * staged it as `end <- base; end = end + t` -- then the staging assign
+     * must be the only prior write and must read the base. */
     if (ins->op != IR_OP_BINARY || !ins->text || strcmp(ins->text, "+") != 0 ||
         !ir_operand_is_symbol_named(&ins->dest, end_ptr) ||
         ins->rhs.kind != IR_OPERAND_TEMP || !ins->rhs.name) {
+      continue;
+    }
+    if (ir_operand_is_symbol_named(&ins->lhs, base)) {
+      anchored = 1;
+    } else if (ir_operand_is_symbol_named(&ins->lhs, end_ptr)) {
+      const IRInstruction *stage = NULL;
+      anchored = 1;
+      for (size_t j = 0; j < i; j++) {
+        const IRInstruction *prev = &function->instructions[j];
+        if (!ir_instruction_writes_destination(prev) ||
+            !ir_operand_is_symbol_named(&prev->dest, end_ptr)) {
+          continue;
+        }
+        if (stage || prev->op != IR_OP_ASSIGN ||
+            !ir_operand_is_symbol_named(&prev->lhs, base)) {
+          anchored = 0;
+          break;
+        }
+        stage = prev;
+      }
+      if (!stage) {
+        anchored = 0;
+      }
+    }
+    if (!anchored) {
       continue;
     }
     const IRInstruction *scale = ir_find_temp_producer_before(
@@ -389,7 +431,7 @@ static int ir_try_vectorize_simd_scale_i32_at(IRFunction *function,
     return 1;
   }
   if (!ir_find_ptr_loop_len_operand(function, bounds.compare_index,
-                                    compare->rhs.name, &len)) {
+                                    compare->rhs.name, src_base, &len)) {
     return 1;
   }
 
@@ -507,7 +549,7 @@ static int ir_try_vectorize_simd_reverse_copy_i32_at(IRFunction *function,
       return 1;
     }
     if (!ir_find_ptr_loop_len_operand(function, bounds.compare_index,
-                                      compare->rhs.name, &len)) {
+                                      compare->rhs.name, dst_base, &len)) {
       return 1;
     }
 
@@ -520,6 +562,11 @@ static int ir_try_vectorize_simd_reverse_copy_i32_at(IRFunction *function,
       }
     }
     if (!iv_symbol) {
+      return 1;
+    }
+    /* The kernel reads src[len-1-iv] for iv = 0..len-1: the counter must
+     * provably start at 0 or the reversed indexes are shifted. */
+    if (!ir_iv_zero_at_header(function, header_index, iv_symbol)) {
       return 1;
     }
 
@@ -617,7 +664,7 @@ static int ir_try_vectorize_simd_reverse_copy_i32_at(IRFunction *function,
     return 1;
   }
   if (!ir_find_ptr_loop_len_operand(function, bounds.compare_index,
-                                    compare->rhs.name, &len)) {
+                                    compare->rhs.name, dst_base, &len)) {
     return 1;
   }
 
@@ -751,6 +798,11 @@ static int ir_try_vectorize_simd_clamp_i32_at(IRFunction *function,
   }
   if (!ir_try_parse_direct_unit_increment(
           &function->instructions[increment_index], iv_symbol)) {
+    return 1;
+  }
+  /* The kernel clamps src[0..len) into dst[0..len): the loop must provably
+   * start at iv == 0. */
+  if (!ir_iv_zero_at_header(function, header_index, iv_symbol)) {
     return 1;
   }
 
@@ -924,22 +976,12 @@ static int ir_try_vectorize_simd_clamp_ptr_at(IRFunction *function,
       !ir_symbol_is_i32_ptr_param(function, dst_base)) {
     return 1;
   }
+  /* No unanchored fallback here: a `<<2` of some bound param floating before
+   * the loop proves nothing about (end - base)/4, which is the kernel's
+   * actual trip count. */
   if (!ir_find_ptr_loop_len_operand(function, bounds.compare_index,
-                                    compare->rhs.name, &len)) {
-    for (size_t i = 0; i < bounds.compare_index; i++) {
-      const IRInstruction *ins = &function->instructions[i];
-      if (ins->op == IR_OP_BINARY && ins->text &&
-          strcmp(ins->text, "<<") == 0 &&
-          ir_operand_is_int_value(&ins->rhs, 2) &&
-          ins->lhs.kind == IR_OPERAND_SYMBOL && ins->lhs.name &&
-          ir_symbol_is_sum_loop_bound(function, ins->lhs.name)) {
-        len = ir_operand_symbol(ins->lhs.name);
-        break;
-      }
-    }
-    if (len.kind != IR_OPERAND_SYMBOL || !len.name) {
-      return 1;
-    }
+                                    compare->rhs.name, src_base, &len)) {
+    return 1;
   }
 
   for (size_t i = bounds.branch_index + 1; i < bounds.jump_index; i++) {

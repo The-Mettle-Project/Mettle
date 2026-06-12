@@ -1632,6 +1632,12 @@ void ir_explain_kernel_desc(const IRInstruction *ins, char *buf, size_t cap) {
              reduce ? "'+' reduction" : "element-wise map");
     return;
   }
+  case IR_OP_SIMD_VLOOP_I32: {
+    int reduce = ins->argument_count > 0 && ins->arguments[0].int_value == 1;
+    snprintf(buf, cap, "8-wide int32 %s (AVX2 general vectorizer, bit-exact)",
+             reduce ? "'+' reduction" : "element-wise map");
+    return;
+  }
   case IR_OP_SIMD_OUTER_LANE_F64:
     snprintf(buf, cap, "vdivpd, 4 outer iterations in 4-wide float64 lockstep "
                        "(hides the inner recurrence's latency)");

@@ -1,0 +1,11 @@
+// M0103: returning the address of a stack local is always a dangling pointer.
+function make_point() -> int32* {
+    var values: int32[4];
+    values[0] = 7;
+    return &values[0];
+}
+
+function main() -> int32 {
+    var p: int32* = make_point();
+    return p[0];
+}

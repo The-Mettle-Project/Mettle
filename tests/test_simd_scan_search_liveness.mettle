@@ -1,0 +1,125 @@
+// Regression coverage for scan-search SIMD recognizers that rewrite whole loops.
+// SLP MAC kernels must not fuse when k/a_idx/b_idx are read after the matched
+// post-loop stores, and the byte-compare-to-memcmp recognizer must not erase
+// arbitrary code after the loop exit. Returns 0 on success.
+
+function slp_i32_live_after(a: int32*, b: int32*, c: int32*, n: int32,
+                            stride: int32, out_idx: int32) -> int32 {
+  var s0: int32 = 0;
+  var s1: int32 = 0;
+  var s2: int32 = 0;
+  var s3: int32 = 0;
+  var ai: int32 = 0;
+  var bi: int32 = 0;
+  var k: int32 = 0;
+  while (k < n) {
+    var av: int32 = a[ai];
+    s0 = s0 + av * b[bi + 0];
+    s1 = s1 + av * b[bi + 1];
+    s2 = s2 + av * b[bi + 2];
+    s3 = s3 + av * b[bi + 3];
+    ai = ai + 1;
+    bi = bi + stride;
+    k = k + 1;
+  }
+
+  c[out_idx + 0] = s0;
+  c[out_idx + 1] = s1;
+  c[out_idx + 2] = s2;
+  c[out_idx + 3] = s3;
+
+  var bad: int32 = 0;
+  if (k != n) { bad = bad + 1; }
+  if (ai != n) { bad = bad + 2; }
+  if (bi != n * stride) { bad = bad + 4; }
+  return bad;
+}
+
+function slp_i8_live_after(a: int8*, b: int8*, c: int32*, n: int32,
+                           stride: int32, out_idx: int32) -> int32 {
+  var s0: int32 = 0;
+  var s1: int32 = 0;
+  var s2: int32 = 0;
+  var s3: int32 = 0;
+  var ai: int32 = 0;
+  var bi: int32 = 0;
+  var k: int32 = 0;
+  while (k < n) {
+    var av: int32 = (int32)a[ai];
+    s0 = s0 + av * (int32)b[bi + 0];
+    s1 = s1 + av * (int32)b[bi + 1];
+    s2 = s2 + av * (int32)b[bi + 2];
+    s3 = s3 + av * (int32)b[bi + 3];
+    ai = ai + 1;
+    bi = bi + stride;
+    k = k + 1;
+  }
+
+  c[out_idx + 0] = s0;
+  c[out_idx + 1] = s1;
+  c[out_idx + 2] = s2;
+  c[out_idx + 3] = s3;
+
+  var bad: int32 = 0;
+  if (k != n) { bad = bad + 1; }
+  if (ai != n) { bad = bad + 2; }
+  if (bi != n * stride) { bad = bad + 4; }
+  return bad;
+}
+
+function byte_compare_with_tail(a: cstring, b: cstring, len: int64) -> int64 {
+  var i: int64 = 0;
+  while (i < len) {
+    var av_i: int32 = (int32)a[i];
+    var av: uint8 = (uint8)av_i;
+    var bv_i: int32 = (int32)b[i];
+    var bv: uint8 = (uint8)bv_i;
+    if (av != bv) {
+      return (int64)av - (int64)bv;
+    }
+    i = i + 1;
+  }
+
+  var checksum: int64 = 0;
+  var j: int64 = 0;
+  while (j < len) {
+    checksum = checksum + (int64)(uint8)a[j];
+    j = j + 1;
+  }
+  if (checksum == 597) {
+    return 42;
+  }
+  return 0;
+}
+
+function main() -> int32 {
+  var a32: int32[64];
+  var b32: int32[64];
+  var c32: int32[4];
+  var a8: int8[64];
+  var b8: int8[64];
+  var c8: int32[4];
+  var n: int32 = 9;
+  var stride: int32 = 2;
+  var out_idx: int32 = 0;
+  var bad: int32 = 0;
+
+  for i in 0..64 {
+    a32[i] = 1;
+    b32[i] = 1;
+    a8[i] = (int8)1;
+    b8[i] = (int8)1;
+  }
+
+  if (slp_i32_live_after(&a32[0], &b32[0], &c32[0], n, stride, out_idx) != 0) {
+    bad = bad + 1;
+  }
+  if (slp_i8_live_after(&a8[0], &b8[0], &c8[0], n, stride, out_idx) != 0) {
+    bad = bad + 2;
+  }
+  if (byte_compare_with_tail("abcdef", "abcdef", 6) != 42) {
+    bad = bad + 4;
+  }
+
+  return bad;
+}

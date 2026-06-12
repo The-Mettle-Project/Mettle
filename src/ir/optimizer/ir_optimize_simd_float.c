@@ -226,8 +226,9 @@ static int ir_try_clone_float_scalar_operand(IRFunction *function,
 }
 
 /* Shared loop-frame matcher for the float reductions. Confirms `header_index`
- * begins a `while (iv < bound)` loop with a unit increment of `iv`, no nested
- * while, and a back-jump, returning the body bounds and key symbols. Returns 1
+ * begins a `while (iv < bound)` loop starting at iv == 0 with a unit increment
+ * of `iv`, no nested while, and a back-jump, returning the body bounds and key
+ * symbols. Returns 1
  * with *matched=1 on a clean frame; *matched=0 means "not this shape, skip". */
 static int ir_float_reduction_frame(IRFunction *function, size_t header_index,
                                     const char **iv_out, size_t *branch_out,
@@ -319,6 +320,13 @@ static int ir_float_reduction_frame(IRFunction *function, size_t header_index,
   }
   if (!ir_try_parse_direct_unit_increment(
           &function->instructions[increment_index], compare->lhs.name)) {
+    return 1;
+  }
+  /* Every fused kernel walks its array bases from element 0 and treats the
+   * compare bound as the element COUNT, so the loop must provably start at
+   * iv == 0. Catches `j = 3; while (j < n)` and `for i in 1..n` reductions
+   * that previously vectorized as 0..n. */
+  if (!ir_iv_zero_at_header(function, header_index, compare->lhs.name)) {
     return 1;
   }
 
@@ -1144,17 +1152,10 @@ static int ir_try_vectorize_i2f_reduce_at(IRFunction *function,
           &function->instructions[increment_index], iv_symbol)) {
     return 1;
   }
-  {
-    size_t init_index = 0;
-    if (!ir_find_last_writer_before(function, header_index, IR_OPERAND_SYMBOL,
-                                    iv_symbol, &init_index)) {
-      return 1;
-    }
-    IRInstruction *init = &function->instructions[init_index];
-    if (init->op != IR_OP_ASSIGN || init->lhs.kind != IR_OPERAND_INT ||
-        init->lhs.int_value != 0) {
-      return 1;
-    }
+  /* ir_iv_zero_at_header refuses at the first control-flow join, unlike a
+   * textual last-writer scan that an if/else init upstream could fool. */
+  if (!ir_iv_zero_at_header(function, header_index, iv_symbol)) {
+    return 1;
   }
 
   /* Find the reduction: acc = acc + t, acc an int64 local, t = (int64)CHAIN. */
@@ -1271,16 +1272,22 @@ int ir_simd_i2f_reduce_pass(IRFunction *function, int *changed) {
 
 /* Node tags — must match the kernel decoder in simd_float.c. */
 #define VLOOP_VN_LOAD 0  /* op0 = loaded-array index */
-#define VLOOP_VN_IOTA 1  /* (float64)iv */
+#define VLOOP_VN_IOTA 1  /* (float64)iv, or the raw iv for int lanes */
 #define VLOOP_VN_CONST 2 /* op0 = constant index */
 #define VLOOP_VN_ADD 3
 #define VLOOP_VN_SUB 4
 #define VLOOP_VN_MUL 5
 #define VLOOP_VN_DIV 6
+#define VLOOP_VN_SCALAR 7 /* op0 = runtime loop-invariant scalar index */
+#define VLOOP_VN_AND 8    /* int lanes only */
+#define VLOOP_VN_OR 9     /* int lanes only */
+#define VLOOP_VN_XOR 10   /* int lanes only */
+#define VLOOP_VN_SHL 11   /* int lanes only; op0 = node, op1 = literal count */
 
 #define VLOOP_MAX_NODES 48
 #define VLOOP_MAX_ARRAYS 4 /* loaded bases; +dst must keep distinct bases <= 4 */
 #define VLOOP_MAX_CONSTS 16
+#define VLOOP_MAX_SCALARS 8
 #define VLOOP_REG_BUDGET 4 /* ymm node-eval stack depth the kernel supports */
 
 typedef struct {
@@ -1294,12 +1301,23 @@ typedef struct {
   int n_nodes;
   const char *arrays[VLOOP_MAX_ARRAYS]; /* loaded base symbols (deduped) */
   int n_arrays;
-  double consts[VLOOP_MAX_CONSTS]; /* deduped (bit-compare) */
+  double consts[VLOOP_MAX_CONSTS];      /* deduped (bit-compare); float DAGs */
+  long long iconsts[VLOOP_MAX_CONSTS];  /* deduped; int DAGs */
   int n_consts;
+  const char *scalars[VLOOP_MAX_SCALARS]; /* invariant scalar symbols (deduped) */
+  int n_scalars;
   int width_bits;
+  int is_int; /* 0 = float lanes (width_bits 32/64), 1 = int32 lanes */
+  size_t body_lo; /* loop body region, for symbol-invariance checks */
+  size_t body_hi;
   int has_iota;
   int overflow; /* a table limit was exceeded -> refuse */
 } VLoopDag;
+
+static int vloop_tag_is_leaf(int tag) {
+  return tag == VLOOP_VN_LOAD || tag == VLOOP_VN_IOTA ||
+         tag == VLOOP_VN_CONST || tag == VLOOP_VN_SCALAR;
+}
 
 static int vloop_intern_array(VLoopDag *d, const char *base) {
   for (int i = 0; i < d->n_arrays; i++) {
@@ -1327,6 +1345,51 @@ static int vloop_intern_const(VLoopDag *d, double v) {
   }
   d->consts[d->n_consts] = v;
   return d->n_consts++;
+}
+
+static int vloop_intern_iconst(VLoopDag *d, long long v) {
+  for (int i = 0; i < d->n_consts; i++) {
+    if (d->iconsts[i] == v) {
+      return i;
+    }
+  }
+  if (d->n_consts >= VLOOP_MAX_CONSTS) {
+    d->overflow = 1;
+    return -1;
+  }
+  d->iconsts[d->n_consts] = v;
+  return d->n_consts++;
+}
+
+static int vloop_intern_scalar(VLoopDag *d, const char *name) {
+  for (int i = 0; i < d->n_scalars; i++) {
+    if (strcmp(d->scalars[i], name) == 0) {
+      return i;
+    }
+  }
+  if (d->n_scalars >= VLOOP_MAX_SCALARS) {
+    d->overflow = 1;
+    return -1;
+  }
+  d->scalars[d->n_scalars] = name;
+  return d->n_scalars++;
+}
+
+/* A symbol written anywhere in the loop body is not a single value across
+ * iterations (the accumulator, a rotating local): it can be neither broadcast
+ * nor producer-chased (the chase would bake the loop-ENTRY value into every
+ * lane). */
+static int vloop_symbol_written_in_body(const IRFunction *function,
+                                        const VLoopDag *d, const char *name) {
+  for (size_t i = d->body_lo; i < d->body_hi; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ir_instruction_writes_destination(ins) &&
+        ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name &&
+        strcmp(ins->dest.name, name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
 }
 
 static int vloop_add_node(VLoopDag *d, int tag, int op0, int op1) {
@@ -1411,6 +1474,20 @@ static int vloop_build(IRFunction *function, size_t before, const IROperand *op,
       return ai < 0 ? -1 : vloop_add_node(d, VLOOP_VN_LOAD, ai, 0);
     }
   }
+  if (op->kind == IR_OPERAND_SYMBOL) {
+    if (vloop_symbol_written_in_body(function, d, op->name)) {
+      return -1;
+    }
+    /* Loop-invariant float scalar of the lane width (a local or parameter,
+     * e.g. saxpy's runtime `a`): read once at loop entry and broadcast.
+     * Preferred over chasing its pre-loop producer -- one slot beats
+     * re-evaluating an invariant expression per lane. */
+    if (ir_float_scalar_operand_matches(function, op, d->width_bits) &&
+        !ir_symbol_address_taken(function, op->name)) {
+      int si = vloop_intern_scalar(d, op->name);
+      return si < 0 ? -1 : vloop_add_node(d, VLOOP_VN_SCALAR, si, 0);
+    }
+  }
   const IRInstruction *p = ir_i2f_resolve_producer(function, before, op);
   if (!p) {
     return -1;
@@ -1447,8 +1524,11 @@ static int vloop_build(IRFunction *function, size_t before, const IROperand *op,
  * then combine. */
 static int vloop_eval_depth(const VLoopDag *d, int node) {
   const VLoopNode *n = &d->nodes[node];
-  if (n->tag <= VLOOP_VN_CONST) {
-    return 1; /* leaf: LOAD / IOTA / CONST */
+  if (vloop_tag_is_leaf(n->tag)) {
+    return 1; /* leaf: LOAD / IOTA / CONST / SCALAR */
+  }
+  if (n->tag == VLOOP_VN_SHL) {
+    return vloop_eval_depth(d, n->op0); /* unary, evaluated in place */
   }
   int da = vloop_eval_depth(d, n->op0);
   int db = vloop_eval_depth(d, n->op1);
@@ -1470,7 +1550,8 @@ static int vloop_distinct_bases(const VLoopDag *d, const char *dst_base) {
 
 static int vloop_serialize_into(IRInstruction *fused, const VLoopDag *d,
                                 int reduce_op, int root, int depth) {
-  size_t argc = (size_t)(6 + d->n_arrays + 3 * d->n_nodes + d->n_consts);
+  size_t argc = (size_t)(7 + d->n_arrays + d->n_scalars + 3 * d->n_nodes +
+                         d->n_consts);
   fused->arguments = calloc(argc, sizeof(IROperand));
   if (!fused->arguments) {
     return 0;
@@ -1482,9 +1563,13 @@ static int vloop_serialize_into(IRInstruction *fused, const VLoopDag *d,
   fused->arguments[k++] = ir_operand_int(d->n_nodes);
   fused->arguments[k++] = ir_operand_int(root);
   fused->arguments[k++] = ir_operand_int(d->n_consts);
+  fused->arguments[k++] = ir_operand_int(d->n_scalars);
   fused->arguments[k++] = ir_operand_int(depth);
   for (int i = 0; i < d->n_arrays; i++) {
     fused->arguments[k++] = ir_operand_symbol(d->arrays[i]);
+  }
+  for (int i = 0; i < d->n_scalars; i++) {
+    fused->arguments[k++] = ir_operand_symbol(d->scalars[i]);
   }
   for (int i = 0; i < d->n_nodes; i++) {
     fused->arguments[k++] = ir_operand_int(d->nodes[i].tag);
@@ -1492,7 +1577,9 @@ static int vloop_serialize_into(IRInstruction *fused, const VLoopDag *d,
     fused->arguments[k++] = ir_operand_int(d->nodes[i].op1);
   }
   for (int i = 0; i < d->n_consts; i++) {
-    fused->arguments[k++] = ir_operand_float_sized(d->consts[i], 64);
+    fused->arguments[k++] = d->is_int
+                                ? ir_operand_int(d->iconsts[i])
+                                : ir_operand_float_sized(d->consts[i], 64);
   }
   return 1;
 }
@@ -1541,6 +1628,8 @@ static int ir_try_vectorize_map_at(IRFunction *function, size_t header_index,
 
   memset(&d, 0, sizeof(d));
   d.width_bits = store_bits; /* 64 (float64) or 32 (float32) */
+  d.body_lo = branch_index + 1;
+  d.body_hi = jump_index;
   root = vloop_build(function, store_index, &store->lhs, iv_symbol, &d);
   if (root < 0 || d.overflow) {
     ir_operand_destroy(&bound);
@@ -1645,11 +1734,15 @@ static int ir_try_vectorize_reduce_at(IRFunction *function, size_t header_index,
       return 1;
     }
   }
-  /* acc must be written only by the single reduction instruction. */
+  /* acc must be written only by the single reduction instruction, and no
+   * OTHER symbol may be written in the body besides the iv increment -- a
+   * rotating local would be lost when the loop is fused away. */
   for (size_t i = branch_index + 1; i < jump_index; i++) {
-    if (i != reduce_index &&
-        ir_operand_is_symbol_named(&function->instructions[i].dest,
-                                   acc_symbol)) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (i != reduce_index && ir_instruction_writes_destination(ins) &&
+        ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name &&
+        (strcmp(ins->dest.name, acc_symbol) == 0 ||
+         strcmp(ins->dest.name, iv_symbol) != 0)) {
       ir_operand_destroy(&bound);
       return 1;
     }
@@ -1657,6 +1750,8 @@ static int ir_try_vectorize_reduce_at(IRFunction *function, size_t header_index,
 
   memset(&d, 0, sizeof(d));
   d.width_bits = width_bits; /* 64 (float64) or 32 (float32) */
+  d.body_lo = branch_index + 1;
+  d.body_hi = jump_index;
   root = vloop_build(function, reduce_index, addend, iv_symbol, &d);
   if (root < 0 || d.overflow) {
     ir_operand_destroy(&bound);
@@ -1711,6 +1806,409 @@ int ir_auto_vectorize_pass(IRFunction *function, int *changed) {
     if (function->instructions[i].op == IR_OP_LABEL &&
         ir_label_is_while_header(function->instructions[i].text)) {
       if (!ir_try_vectorize_reduce_at(function, i, changed)) {
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Integer twin of the general auto-vectorizer -> IR_OP_SIMD_VLOOP_I32         */
+/*                                                                             */
+/* int32/uint32 unit-stride maps and '+' reductions over + - * & | ^ and       */
+/* <<literal DAGs. Every supported op is congruent mod 2^32, intermediates     */
+/* are truncated to the 4-byte store / int32 accumulator anyway, and integer   */
+/* '+' is associative -- so unlike the float form, maps AND reductions are     */
+/* BIT-EXACT against the scalar loop. Division, %, and >> are never taken      */
+/* (not congruent / trapping). Runs after auto_vectorize (a float32 store      */
+/* shape that pass refused has float-tagged BINARYs and refuses here too).     */
+/* -------------------------------------------------------------------------- */
+
+static int vloop_int_scalar_type_ok(const char *ty) {
+  /* Any plain integer type: the kernel uses only the low 32 bits and every
+   * supported op is congruent mod 2^32, so width and signedness don't matter
+   * (operand_load extends per the declared type; bits >= 32 are irrelevant). */
+  return ty && (strcmp(ty, "int8") == 0 || strcmp(ty, "uint8") == 0 ||
+                strcmp(ty, "int16") == 0 || strcmp(ty, "uint16") == 0 ||
+                strcmp(ty, "int32") == 0 || strcmp(ty, "uint32") == 0 ||
+                strcmp(ty, "int64") == 0 || strcmp(ty, "uint64") == 0 ||
+                strcmp(ty, "int") == 0);
+}
+
+/* An int->int cast whose target keeps at least 32 bits only changes bits the
+ * 32-bit lanes never see (trunc-to-32 / sign- or zero-extension), so it is
+ * transparent to the DAG. Casts to int8/int16 fold sign back into the low 32
+ * bits and are refused. */
+static int vloop_int_cast_is_transparent(const char *ty) {
+  return ty && (strcmp(ty, "int32") == 0 || strcmp(ty, "uint32") == 0 ||
+                strcmp(ty, "int64") == 0 || strcmp(ty, "uint64") == 0 ||
+                strcmp(ty, "int") == 0);
+}
+
+static int vloop_int_binop_tag(const char *text) {
+  if (strcmp(text, "+") == 0) return VLOOP_VN_ADD;
+  if (strcmp(text, "-") == 0) return VLOOP_VN_SUB;
+  if (strcmp(text, "*") == 0) return VLOOP_VN_MUL;
+  if (strcmp(text, "&") == 0) return VLOOP_VN_AND;
+  if (strcmp(text, "|") == 0) return VLOOP_VN_OR;
+  if (strcmp(text, "^") == 0) return VLOOP_VN_XOR;
+  return -1;
+}
+
+static int vloop_build_int(IRFunction *function, size_t before,
+                           const IROperand *op, const char *iv, VLoopDag *d) {
+  if (!op || d->overflow) {
+    return -1;
+  }
+  if (op->kind == IR_OPERAND_INT) {
+    int ci = vloop_intern_iconst(d, op->int_value);
+    return ci < 0 ? -1 : vloop_add_node(d, VLOOP_VN_CONST, ci, 0);
+  }
+  if ((op->kind != IR_OPERAND_TEMP && op->kind != IR_OPERAND_SYMBOL) ||
+      !op->name) {
+    return -1;
+  }
+  if (op->kind == IR_OPERAND_SYMBOL) {
+    /* the counter used directly as a value: out[i] = a[i] + i */
+    if (strcmp(op->name, iv) == 0) {
+      d->has_iota = 1;
+      return vloop_add_node(d, VLOOP_VN_IOTA, 0, 0);
+    }
+    if (vloop_symbol_written_in_body(function, d, op->name)) {
+      return -1;
+    }
+    {
+      const char *ty = ir_function_local_declared_type(function, op->name);
+      if (!ty) {
+        ty = ir_function_param_declared_type(function, op->name);
+      }
+      if (vloop_int_scalar_type_ok(ty) &&
+          !ir_symbol_address_taken(function, op->name)) {
+        int si = vloop_intern_scalar(d, op->name);
+        return si < 0 ? -1 : vloop_add_node(d, VLOOP_VN_SCALAR, si, 0);
+      }
+    }
+  }
+  /* array load a[iv]: 4-byte elements only (the shape decoder pins iv<<2) */
+  if (op->kind == IR_OPERAND_TEMP) {
+    const char *base = NULL;
+    int bits = 0;
+    if (ir_decode_float_indexed_load(function, before, op->name, iv, &base,
+                                     &bits) &&
+        bits == 32) {
+      int ai = vloop_intern_array(d, base);
+      return ai < 0 ? -1 : vloop_add_node(d, VLOOP_VN_LOAD, ai, 0);
+    }
+  }
+  const IRInstruction *p = ir_i2f_resolve_producer(function, before, op);
+  if (!p) {
+    return -1;
+  }
+  size_t pidx = (size_t)(p - function->instructions);
+  if (p->op == IR_OP_CAST && !p->is_float && p->text &&
+      vloop_int_cast_is_transparent(p->text)) {
+    return vloop_build_int(function, pidx, &p->lhs, iv, d);
+  }
+  if (p->op == IR_OP_BINARY && !p->is_float && p->text) {
+    if (strcmp(p->text, "<<") == 0 && p->rhs.kind == IR_OPERAND_INT &&
+        p->rhs.int_value >= 0 && p->rhs.int_value <= 31) {
+      int a = vloop_build_int(function, pidx, &p->lhs, iv, d);
+      return a < 0 ? -1
+                   : vloop_add_node(d, VLOOP_VN_SHL, a, (int)p->rhs.int_value);
+    }
+    int tag = vloop_int_binop_tag(p->text);
+    if (tag < 0) {
+      return -1;
+    }
+    int a = vloop_build_int(function, pidx, &p->lhs, iv, d);
+    if (a < 0) {
+      return -1;
+    }
+    int b = vloop_build_int(function, pidx, &p->rhs, iv, d);
+    if (b < 0) {
+      return -1;
+    }
+    return vloop_add_node(d, tag, a, b);
+  }
+  return -1;
+}
+
+/* Shared matcher for the int32 map shape. Fills the DAG and the loop facts;
+ * *claim_out = 1 when every gate passes (the loop WOULD be fused). The bound
+ * operand is cloned into *bound on a successful frame match regardless and
+ * must be destroyed by the caller unless ownership is taken. Returns 0 only
+ * on allocation failure. */
+static int ir_match_int_map_at(IRFunction *function, size_t header_index,
+                               VLoopDag *d, IROperand *bound,
+                               size_t *jump_index_out, const char **dst_base_out,
+                               int *root_out, int *depth_out, int *claim_out) {
+  const char *iv_symbol = NULL;
+  const char *dst_base = NULL;
+  size_t branch_index = 0;
+  size_t jump_index = 0;
+  size_t store_index = 0;
+  int matched = 0;
+  int store_bits = 0;
+  int root = -1;
+  int depth = 0;
+  const IRInstruction *store = NULL;
+
+  *claim_out = 0;
+  if (!ir_float_reduction_frame(function, header_index, &iv_symbol,
+                                &branch_index, &jump_index, bound, &matched)) {
+    return 0;
+  }
+  if (!matched) {
+    return 1;
+  }
+  if (!ir_float_map_body_is_safe(function, branch_index + 1, jump_index,
+                                 iv_symbol, &store_index)) {
+    return 1;
+  }
+
+  store = &function->instructions[store_index];
+  if (store->dest.kind != IR_OPERAND_TEMP || !store->dest.name ||
+      (store->lhs.kind != IR_OPERAND_TEMP &&
+       store->lhs.kind != IR_OPERAND_SYMBOL &&
+       store->lhs.kind != IR_OPERAND_INT) ||
+      store->rhs.kind != IR_OPERAND_INT || store->rhs.int_value != 4 ||
+      !ir_decode_float_indexed_address(function, store_index, store->dest.name,
+                                       iv_symbol, &dst_base, &store_bits) ||
+      store_bits != 32) {
+    return 1;
+  }
+
+  memset(d, 0, sizeof(*d));
+  d->width_bits = 32;
+  d->is_int = 1;
+  d->body_lo = branch_index + 1;
+  d->body_hi = jump_index;
+  root = vloop_build_int(function, store_index, &store->lhs, iv_symbol, d);
+  if (root < 0 || d->overflow) {
+    return 1;
+  }
+  /* Trivial bodies (a plain copy or a constant splat) belong to the tuned
+   * memory-map/fill kernels; claiming them here would only swap one kernel
+   * for a slower one. */
+  if (d->n_nodes < 2) {
+    return 1;
+  }
+
+  if (!ir_symbol_is_float_array_base(function, dst_base)) {
+    return 1;
+  }
+  for (int i = 0; i < d->n_arrays; i++) {
+    if (!ir_symbol_is_float_array_base(function, d->arrays[i])) {
+      return 1;
+    }
+  }
+  if (ir_symbol_live_after_loop(function, jump_index + 1, iv_symbol)) {
+    return 1;
+  }
+  depth = vloop_eval_depth(d, root);
+  if (depth > VLOOP_REG_BUDGET ||
+      vloop_distinct_bases(d, dst_base) > VLOOP_MAX_ARRAYS) {
+    return 1;
+  }
+
+  *jump_index_out = jump_index;
+  *dst_base_out = dst_base;
+  *root_out = root;
+  *depth_out = depth;
+  *claim_out = 1;
+  return 1;
+}
+
+/* Read-only probe for other passes (pointer-induction must not convert a loop
+ * this vectorizer would claim -- the kernel needs the indexed form). */
+int ir_auto_vectorize_int_claimable(IRFunction *function, size_t header_index) {
+  VLoopDag d;
+  IROperand bound = {0};
+  size_t jump_index = 0;
+  const char *dst_base = NULL;
+  int root = -1;
+  int depth = 0;
+  int claim = 0;
+  if (!ir_match_int_map_at(function, header_index, &d, &bound, &jump_index,
+                           &dst_base, &root, &depth, &claim)) {
+    return 0;
+  }
+  ir_operand_destroy(&bound);
+  return claim;
+}
+
+static int ir_try_vectorize_int_map_at(IRFunction *function,
+                                       size_t header_index, int *changed) {
+  VLoopDag d;
+  IROperand bound = {0};
+  size_t jump_index = 0;
+  const char *dst_base = NULL;
+  int root = -1;
+  int depth = 0;
+  int claim = 0;
+  IRInstruction fused = {0};
+
+  if (!ir_match_int_map_at(function, header_index, &d, &bound, &jump_index,
+                           &dst_base, &root, &depth, &claim)) {
+    return 0;
+  }
+  if (!claim) {
+    ir_operand_destroy(&bound);
+    return 1;
+  }
+
+  fused.op = IR_OP_SIMD_VLOOP_I32;
+  fused.location = function->instructions[header_index].location;
+  fused.float_bits = 32;
+  fused.dest = ir_operand_symbol(dst_base);
+  fused.lhs = bound; /* take ownership of the cloned bound operand */
+  if (!vloop_serialize_into(&fused, &d, /*reduce_op=*/0, root, depth)) {
+    ir_instruction_destroy_storage(&fused);
+    return 0;
+  }
+  ir_install_fused_reduction(function, header_index, jump_index, &fused,
+                             changed);
+  return 1;
+}
+
+static int ir_try_vectorize_int_reduce_at(IRFunction *function,
+                                          size_t header_index, int *changed) {
+  const char *iv_symbol = NULL;
+  const char *acc_symbol = NULL;
+  size_t branch_index = 0;
+  size_t jump_index = 0;
+  size_t reduce_index = 0;
+  IROperand bound = {0};
+  int matched = 0;
+  int found = 0;
+  const IROperand *addend = NULL;
+  VLoopDag d;
+  int root = -1;
+  int depth = 0;
+  IRInstruction fused = {0};
+
+  if (!ir_float_reduction_frame(function, header_index, &iv_symbol,
+                                &branch_index, &jump_index, &bound, &matched)) {
+    return 0;
+  }
+  if (!matched) {
+    return 1;
+  }
+  if (!ir_float_body_is_pure_reduction(function, branch_index + 1,
+                                       jump_index)) {
+    ir_operand_destroy(&bound);
+    return 1;
+  }
+
+  for (size_t i = branch_index + 1; i < jump_index; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_BINARY && !ins->is_float && ins->text &&
+        strcmp(ins->text, "+") == 0 && ins->dest.kind == IR_OPERAND_SYMBOL &&
+        ins->dest.name && strcmp(ins->dest.name, iv_symbol) != 0 &&
+        ir_operand_is_symbol_named(&ins->lhs, ins->dest.name) &&
+        (ins->rhs.kind == IR_OPERAND_TEMP ||
+         ins->rhs.kind == IR_OPERAND_SYMBOL)) {
+      acc_symbol = ins->dest.name;
+      addend = &ins->rhs;
+      reduce_index = i;
+      found++;
+    }
+  }
+  if (found != 1 || !acc_symbol) {
+    ir_operand_destroy(&bound);
+    return 1;
+  }
+  {
+    /* The kernel accumulates in 32-bit lanes and stores 32 bits back, which
+     * is only congruent when the accumulator itself is 32-bit. A widening
+     * int64 += int32 sum keeps high bits the lanes never compute -- refuse
+     * (the dedicated sum_i32 kernel handles the bare-load form of that). */
+    const char *acc_type = ir_function_local_declared_type(function, acc_symbol);
+    if (!acc_type) {
+      acc_type = ir_function_param_declared_type(function, acc_symbol);
+    }
+    if (!acc_type || (strcmp(acc_type, "int32") != 0 &&
+                      strcmp(acc_type, "uint32") != 0)) {
+      ir_operand_destroy(&bound);
+      return 1;
+    }
+    /* The kernel re-extends the folded 32-bit sum into the accumulator's
+     * 8-byte stack home, and the extension must match the declared
+     * signedness (homes hold canonically-extended values). */
+    fused.is_unsigned = (strcmp(acc_type, "uint32") == 0);
+  }
+  /* acc written only by the reduction; no other symbol writes besides iv. */
+  for (size_t i = branch_index + 1; i < jump_index; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (i != reduce_index && ir_instruction_writes_destination(ins) &&
+        ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name &&
+        (strcmp(ins->dest.name, acc_symbol) == 0 ||
+         strcmp(ins->dest.name, iv_symbol) != 0)) {
+      ir_operand_destroy(&bound);
+      return 1;
+    }
+  }
+
+  memset(&d, 0, sizeof(d));
+  d.width_bits = 32;
+  d.is_int = 1;
+  d.body_lo = branch_index + 1;
+  d.body_hi = jump_index;
+  root = vloop_build_int(function, reduce_index, addend, iv_symbol, &d);
+  if (root < 0 || d.overflow) {
+    ir_operand_destroy(&bound);
+    return 1;
+  }
+  if (d.n_nodes < 2) { /* a bare-load sum belongs to the tuned sum kernels */
+    ir_operand_destroy(&bound);
+    return 1;
+  }
+  for (int i = 0; i < d.n_arrays; i++) {
+    if (!ir_symbol_is_float_array_base(function, d.arrays[i])) {
+      ir_operand_destroy(&bound);
+      return 1;
+    }
+  }
+  if (ir_symbol_live_after_loop(function, jump_index + 1, iv_symbol)) {
+    ir_operand_destroy(&bound);
+    return 1;
+  }
+  depth = vloop_eval_depth(&d, root);
+  if (depth > VLOOP_REG_BUDGET - 1 /* ymm2 reserved as accumulator */ ||
+      d.n_arrays > VLOOP_MAX_ARRAYS) {
+    ir_operand_destroy(&bound);
+    return 1;
+  }
+
+  fused.op = IR_OP_SIMD_VLOOP_I32;
+  fused.location = function->instructions[header_index].location;
+  fused.float_bits = 32;
+  fused.dest = ir_operand_symbol(acc_symbol);
+  fused.lhs = bound; /* take ownership */
+  if (!vloop_serialize_into(&fused, &d, /*reduce_op=*/1, root, depth)) {
+    ir_instruction_destroy_storage(&fused);
+    return 0;
+  }
+  ir_install_fused_reduction(function, header_index, jump_index, &fused,
+                             changed);
+  return 1;
+}
+
+int ir_auto_vectorize_int_pass(IRFunction *function, int *changed) {
+  if (!function) {
+    return 0;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    if (function->instructions[i].op == IR_OP_LABEL &&
+        ir_label_is_while_header(function->instructions[i].text)) {
+      if (!ir_try_vectorize_int_map_at(function, i, changed)) {
+        return 0;
+      }
+    }
+    if (function->instructions[i].op == IR_OP_LABEL &&
+        ir_label_is_while_header(function->instructions[i].text)) {
+      if (!ir_try_vectorize_int_reduce_at(function, i, changed)) {
         return 0;
       }
     }
@@ -2192,6 +2690,25 @@ static int ir_try_vectorize_outer_lane_at(IRFunction *function,
     ir_operand_destroy(&outerP); ir_operand_destroy(&innerN); return 1;
   }
 
+  /* The kernel replays the outer iterations as p = 0..P-1, so the outer iv
+   * must provably start at 0. */
+  if (!ir_iv_zero_at_header(function, header_index, p_sym)) {
+    OL_DBG("outer iv does not start at 0");
+    ir_operand_destroy(&outerP); ir_operand_destroy(&innerN); return 1;
+  }
+  /* The per-outer-iteration init region (outer branch -> inner header) must be
+   * straight-line: the i0 and iacc-seed scans below take the textually-last
+   * writer, which is only the executed value when no label/jump/branch can
+   * reorder control flow through the region. */
+  for (size_t i = outer_branch + 1; i < inner_header; i++) {
+    IROpcode op = function->instructions[i].op;
+    if (op == IR_OP_LABEL || op == IR_OP_JUMP || op == IR_OP_BRANCH_ZERO ||
+        op == IR_OP_BRANCH_EQ) {
+      OL_DBG("control flow in outer init region");
+      ir_operand_destroy(&outerP); ir_operand_destroy(&innerN); return 1;
+    }
+  }
+
   /* The outer reduction total = total + iacc, after the inner loop. */
   const char *total_sym = NULL;
   const char *iacc_sym = NULL;
@@ -2218,16 +2735,21 @@ static int ir_try_vectorize_outer_lane_at(IRFunction *function,
     ir_operand_destroy(&outerP); ir_operand_destroy(&innerN); return 1;
   }
 
-  /* i init (i0) before the inner header. */
+  /* i init (i0) before the inner header: the LAST write to i in the init
+   * region must be a constant assign (a later non-constant write would make
+   * the recorded i0 stale). */
   long long i0 = 0;
   int found_i0 = 0;
   for (size_t i = outer_branch + 1; i < inner_header; i++) {
     const IRInstruction *ins = &function->instructions[i];
-    if (ins->op == IR_OP_ASSIGN &&
-        ir_operand_is_symbol_named(&ins->dest, i_sym) &&
-        ins->lhs.kind == IR_OPERAND_INT) {
-      i0 = ins->lhs.int_value;
-      found_i0 = 1;
+    if (ir_instruction_writes_destination(ins) &&
+        ir_operand_is_symbol_named(&ins->dest, i_sym)) {
+      if (ins->op == IR_OP_ASSIGN && ins->lhs.kind == IR_OPERAND_INT) {
+        i0 = ins->lhs.int_value;
+        found_i0 = 1;
+      } else {
+        found_i0 = 0;
+      }
     }
   }
   if (!found_i0) {
@@ -2243,8 +2765,12 @@ static int ir_try_vectorize_outer_lane_at(IRFunction *function,
   {
     size_t init_idx = 0;
     if (!ir_find_last_writer_before(function, inner_header, IR_OPERAND_SYMBOL,
-                                    iacc_sym, &init_idx)) {
-      OL_DBG("no iacc init writer");
+                                    iacc_sym, &init_idx) ||
+        init_idx <= outer_branch) {
+      /* The seed must be written INSIDE the per-outer-iteration init region;
+       * a writer before the outer loop would mean iacc carries across outer
+       * iterations (a serial dependence the per-lane reseed would break). */
+      OL_DBG("no iacc init writer in the outer init region");
       ir_operand_destroy(&outerP); ir_operand_destroy(&innerN); return 1;
     }
     const IRInstruction *init_ins = &function->instructions[init_idx];

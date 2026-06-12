@@ -308,9 +308,11 @@ static int ir_fill_try_pointer_walk(IRFunction *function, size_t header_index,
                              &store->lhs, size, &value)) {
     return FILL_NO_MATCH;
   }
+  int p_live_after = ir_symbol_live_after_loop(function, jump_index + 1, p);
   int ok = ir_fill_install(function, header_index, jump_index, /*mode=*/1,
-                           size, &compare->lhs, &compare->rhs, &value, NULL,
-                           NULL, NULL, p, pend, changed);
+                            size, &compare->lhs, &compare->rhs, &value, NULL,
+                            NULL, NULL, p_live_after ? p : NULL,
+                            p_live_after ? pend : NULL, changed);
   ir_operand_destroy(&value);
   return ok;
 }

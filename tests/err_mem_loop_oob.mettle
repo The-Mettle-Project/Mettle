@@ -1,0 +1,14 @@
+// The classic off-by-one: `<=` against the array length runs one iteration
+// too many. The clean loops above it must not interfere.
+function main() -> int32 {
+    var a: int32[8];
+    var i: int32 = 0;
+    while (i < 8) { a[i] = i; i = i + 1; }
+    var total: int32 = 0;
+    var j: int32 = 0;
+    while (j <= 8) {
+        total = total + a[j];
+        j = j + 1;
+    }
+    return total;
+}

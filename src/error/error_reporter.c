@@ -373,6 +373,16 @@ void error_reporter_add_warning_with_span(ErrorReporter *reporter, ErrorType typ
                             message, NULL);
 }
 
+void error_reporter_add_warning_with_suggestion(ErrorReporter *reporter,
+                                                ErrorType type,
+                                                SourceLocation location,
+                                                const char *message,
+                                                const char *suggestion) {
+  SourceSpan span = source_span_from_location(location, 1);
+  error_reporter_add_report(reporter, DIAG_SEVERITY_WARNING, span, type,
+                            message, suggestion);
+}
+
 void error_reporter_print_errors(ErrorReporter *reporter) {
   if (!reporter)
     return;

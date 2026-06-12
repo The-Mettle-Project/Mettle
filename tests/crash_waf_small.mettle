@@ -1,0 +1,23 @@
+// Runtime write-after-free of a small block. Under --native-heap the freed
+// block is poisoned and quarantined; the dangling write corrupts the poison
+// and is reported when the block leaves quarantine (forced here by churning
+// the same size class past the quarantine depth).
+import "std/io";
+import "std/mem";
+
+function main() -> int32 {
+    var p: cstring = malloc(32);
+    p[0] = 1;
+    free(p);
+    p[8] = 99; // dangling write into the poisoned, quarantined block
+
+    var i: int32 = 0;
+    while (i < 40) {
+        var q: cstring = malloc(32);
+        q[0] = (uint8)i;
+        free(q);
+        i = i + 1;
+    }
+    println_int((int32)1);
+    return 0;
+}

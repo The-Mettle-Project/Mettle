@@ -322,6 +322,97 @@ $cases = @(
     Args          = @("-O")
   },
   @{
+    # Memory diagnostics: returning the address of a stack local is an error.
+    Name          = "err_mem_return_stack"
+    Path          = "tests/err_mem_return_stack.mettle"
+    ShouldSucceed = $false
+    Pattern       = 'Returning the address of stack local `values`'
+  },
+  @{
+    # Memory diagnostics: constant index past a stack array's end is an error
+    # (the buffer-extent layer catches the direct form; type_checker_memory
+    # backstops forms it misses).
+    Name          = "err_mem_oob_index"
+    Path          = "tests/err_mem_oob_index.mettle"
+    ShouldSucceed = $false
+    Pattern       = 'Array index 8 is out of bounds'
+  },
+  @{
+    # Memory diagnostics: a constant-size memory op overflowing a stack array.
+    Name          = "err_mem_op_overflow"
+    Path          = "tests/err_mem_op_overflow.mettle"
+    ShouldSucceed = $false
+    Pattern       = '`mem_zero` writes 128 bytes into `buf`, which only has 64'
+  },
+  @{
+    # Loop-bound analysis: `j <= 8` over int32[8] provably reads a[8] on the
+    # final iteration (no break/continue/return can save it).
+    Name          = "err_mem_loop_oob"
+    Path          = "tests/err_mem_loop_oob.mettle"
+    ShouldSucceed = $false
+    Pattern       = 'This loop runs `j` up to 8, but `a` has 8 elements'
+  },
+  @{
+    # Constant arithmetic: division by a literal zero is a guaranteed trap.
+    Name          = "err_mem_div_zero"
+    Path          = "tests/err_mem_div_zero.mettle"
+    ShouldSucceed = $false
+    Pattern       = 'Division by a constant zero'
+  },
+  @{
+    # Constant out-of-bounds THROUGH a pointer alias: p = &a[2], p[6] = a[8].
+    Name          = "err_mem_ptr_alias_oob"
+    Path          = "tests/err_mem_ptr_alias_oob.mettle"
+    ShouldSucceed = $false
+    Pattern       = 'Index 6 through `p` lands at `a\[8\]`, out of bounds'
+  },
+  @{
+    # Memory diagnostics that warn without failing the build: double free,
+    # use-after-free, a stack address stored in a global, and a leak. The
+    # `clean` control function (conditional use + defer free) must add NO
+    # diagnostics of its own.
+    Name          = "warn_mem_diagnostics"
+    Path          = "tests/warn_mem_diagnostics.mettle"
+    ShouldSucceed = $true
+    OutputMustMatch = @(
+      'Double free of `p` \(already freed at line \d+\)',
+      'Use of `p` after it was freed',
+      'Global `STASH` is assigned the address of stack local `slot`',
+      '`scratch` is allocated here but never freed',
+      '`p` is null here \(assigned at line \d+ and never reassigned\)',
+      'Shift by 32 on a 32-bit value',
+      '`p` points at the constant address 64'
+    )
+    OutputMustNotMatch = @(
+      'Use of `scratch`',
+      'warning.*`p` is allocated',
+      'clean_guarded_null',
+      'clean_loop'
+    )
+  },
+  @{
+    # Interprocedural ownership inference: summaries (frees param / returns
+    # fresh / borrows / stores) are computed over the call graph, so these
+    # diagnostics cross function boundaries. The clean control
+    # functions must produce NO diagnostics.
+    Name          = "warn_mem_interproc"
+    Path          = "tests/warn_mem_interproc.mettle"
+    ShouldSucceed = $true
+    OutputMustMatch = @(
+      'Use of `p` after the call to `consume` at line \d+ freed it',
+      'Double free of `p`: already freed by the call to `consume`',
+      '`p` is allocated here but never freed.*leaks when `leak_past_borrow`',
+      '`p` holds the allocation `make_buffer` returns.*leaks when `leak_from_wrapper`'
+    )
+    OutputMustNotMatch = @(
+      'clean_consume_once',
+      'clean_borrow_then_free',
+      'clean_kept_elsewhere',
+      'clean_kept_through_helper',
+      'clean_wrapper_freed'
+    )
+  },
+  @{
     # `@noalloc` violated directly by a `new` expression.
     Name          = "err_noalloc"
     Path          = "tests/err_noalloc.mettle"
@@ -1689,6 +1780,66 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "switch_range_runtime" -Passed $false -Reason $_.Exception.Message
+}
+
+# Crash forensics: an access violation at a small non-null address is
+# classified as a null pointer plus offset (a field/index access through
+# null), with the faulting line and a stack trace.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "crash_null_offset.exe"
+  $buildOut = & $CompilerPath --build "tests\debug_crash.mettle" -o $exePath -s 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "Build failed: $buildOut" }
+  $runOut = & $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -eq 0) { throw "Expected the program to crash" }
+  if ($runOut -notmatch 'null plus offset 16: a field or array access through a null pointer') {
+    throw "Missing null+offset classification. Output: $runOut"
+  }
+  if ($runOut -notmatch 'debug_crash\.mettle:13') { throw "Missing faulting line. Output: $runOut" }
+  Write-CaseResult -Name "crash_classify_null_offset" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "crash_classify_null_offset" -Passed $false -Reason $_.Exception.Message
+}
+
+# Crash forensics: under --native-heap a freed page-backed block keeps its
+# mapping with access revoked, so a use-after-free faults instantly and the
+# crash handler classifies the address as a freed heap block.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "crash_uaf_large.exe"
+  $buildOut = & $CompilerPath --build "tests\crash_uaf_large.mettle" -o $exePath -s --native-heap 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "Build failed: $buildOut" }
+  $runOut = & $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -eq 0) { throw "Expected the program to crash" }
+  if ($runOut -notmatch 'heap block that was already freed: use-after-free') {
+    throw "Missing use-after-free classification. Output: $runOut"
+  }
+  Write-CaseResult -Name "crash_classify_use_after_free" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "crash_classify_use_after_free" -Passed $false -Reason $_.Exception.Message
+}
+
+# Crash forensics: a dangling WRITE into a freed small block corrupts the
+# quarantine poison and is reported when the block leaves quarantine.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "crash_waf_small.exe"
+  $buildOut = & $CompilerPath --build "tests\crash_waf_small.mettle" -o $exePath --native-heap 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "Build failed: $buildOut" }
+  $runOut = & $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 134) { throw "Expected exit 134, got $LASTEXITCODE" }
+  if ($runOut -notmatch 'written through a dangling pointer after it was freed') {
+    throw "Missing write-after-free report. Output: $runOut"
+  }
+  Write-CaseResult -Name "crash_write_after_free_quarantine" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "crash_write_after_free_quarantine" -Passed $false -Reason $_.Exception.Message
 }
 
 # Debugger instrumentation: a --debug-hooks build must run NORMALLY when no
@@ -3519,6 +3670,149 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "simd_float_vectorizers" -Passed $false -Reason $_.Exception.Message
+}
+
+# General-vectorizer extensions: int32 lanes (simd_vloop_i32 maps + reductions,
+# bit-exact mod 2^32, incl. uint32 wraparound and the zero-extended accumulator
+# writeback) and runtime scalar broadcast for f32/f64 (saxpy-style coefficients).
+# Kernels are @simd! so the build asserts they vectorize (this also pins the
+# pointer-induction decline for claimable int maps); results are checked against
+# reversed-order reference loops the vectorizer refuses. Also pins the
+# iv-start-zero fix (a j=3..n reduction must not be replayed as 0..n).
+$total++
+try {
+  $exePath = Join-Path $tmpDir "vloop_general.exe"
+  $buildOut = & $CompilerPath --build --release "tests/test_vloop_general.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "release build failed (a @simd! kernel stopped vectorizing?): $buildOut" }
+  if (-not (Test-Path $exePath)) { throw "release build produced no executable" }
+  & $exePath 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "a general-vectorizer kernel diverged from its scalar reference ($LASTEXITCODE failures)"
+  }
+  Write-CaseResult -Name "simd_vloop_general" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "simd_vloop_general" -Passed $false -Reason $_.Exception.Message
+}
+
+# uint32 canonical-home semantics: unsigned sub-64-bit arithmetic wraps mod
+# 2^width in scalar code (debug AND release), matching SIMD lanes and C. Pins
+# the canonicalization of narrow unsigned locals/params/globals/returns and
+# the dst==src mov32 encoder skip. Self-checking: exit code is a failure mask.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "u32_canonical_dbg.exe"
+  $buildOut = & $CompilerPath --build "tests/test_u32_canonical.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "debug build failed: $buildOut" }
+  if (-not (Test-Path $exePath)) { throw "debug build produced no executable" }
+  & $exePath 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "uint32 wrap semantics diverged in DEBUG scalar code (failure mask $LASTEXITCODE)"
+  }
+  $exePath = Join-Path $tmpDir "u32_canonical_rel.exe"
+  $buildOut = & $CompilerPath --build --release "tests/test_u32_canonical.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "release build failed: $buildOut" }
+  if (-not (Test-Path $exePath)) { throw "release build produced no executable" }
+  & $exePath 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "uint32 wrap semantics diverged in RELEASE code (failure mask $LASTEXITCODE)"
+  }
+  Write-CaseResult -Name "u32_canonical_homes" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "u32_canonical_homes" -Passed $false -Reason $_.Exception.Message
+}
+
+# Signed narrow canonical-home semantics: signed int32/int16/int8 homes wrap to
+# their destination width and are sign-extended before later division/shift.
+# Exercise MIR debug/release and the fallback backend variants explicitly.
+foreach ($variant in @("debug", "release", "debug_fallback", "release_fallback")) {
+  $total++
+  try {
+    $exePath = Join-Path $tmpDir "i32_canonical_$variant.exe"
+    $buildArgs = @("--build")
+    if ($variant -like "release*") { $buildArgs += "--release" }
+    $buildArgs += @("tests/test_i32_canonical.mettle", "-o", $exePath)
+
+    $oldMir = $env:METTLE_MIR
+    try {
+      if ($variant -like "*_fallback") {
+        $env:METTLE_MIR = "0"
+      } else {
+        Remove-Item Env:\METTLE_MIR -ErrorAction SilentlyContinue
+      }
+      $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    }
+    finally {
+      if ($null -ne $oldMir) {
+        $env:METTLE_MIR = $oldMir
+      } else {
+        Remove-Item Env:\METTLE_MIR -ErrorAction SilentlyContinue
+      }
+    }
+
+    if ($LASTEXITCODE -ne 0) { throw "$variant build failed: $buildOut" }
+    if (-not (Test-Path $exePath)) { throw "$variant build produced no executable" }
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "signed narrow wrap semantics diverged in $variant (failure mask $LASTEXITCODE)"
+    }
+    Write-CaseResult -Name "i32_canonical_homes_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "i32_canonical_homes_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# Soundness: per-shape SIMD recognizers must not claim counted loops that
+# start at iv != 0 (the fused kernels replay 0..bound). One kernel per
+# recognizer family (sum_i32/dot_i32/dot_i8/sum_u8/byte_map/fill/exp_f32/
+# i2f/minmax/SLP-MAC/outer-lane) starts at a nonzero index; results are
+# runtime-checked against values a 0-start replay cannot produce.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "nonzero_start_loops.exe"
+  $buildOut = & $CompilerPath --build --release "tests/test_nonzero_start_loops.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "release build failed: $buildOut" }
+  if (-not (Test-Path $exePath)) { throw "release build produced no executable" }
+  & $exePath 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "a nonzero-start loop was replayed from 0 by a SIMD kernel (failure mask $LASTEXITCODE)"
+  }
+  Write-CaseResult -Name "simd_nonzero_start_loops" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "simd_nonzero_start_loops" -Passed $false -Reason $_.Exception.Message
+}
+
+# Scan-search SIMD soundness: SLP MAC must not leave k/a_idx/b_idx stale when
+# they are read after the matched stores, and byte-compare-to-memcmp must not
+# erase arbitrary post-loop code. Build and run both debug and release so the
+# release-only recognizers are checked against the scalar baseline.
+$total++
+try {
+  foreach ($variant in @("debug", "release")) {
+    $exePath = Join-Path $tmpDir ("simd_scan_search_liveness_{0}.exe" -f $variant)
+    $buildArgs = @("--build")
+    if ($variant -eq "release") { $buildArgs += "--release" }
+    $buildArgs += @("tests/test_simd_scan_search_liveness.mettle", "-o", $exePath)
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "$variant build failed: $buildOut" }
+    if (-not (Test-Path $exePath)) { throw "$variant build produced no executable" }
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "$variant executable detected scan-search SIMD stale/destroyed behavior (failure mask $LASTEXITCODE)"
+    }
+  }
+  Write-CaseResult -Name "simd_scan_search_liveness" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "simd_scan_search_liveness" -Passed $false -Reason $_.Exception.Message
 }
 
 # Coverage: the cast-free int32->int64 reduction `s += a[i]` now vectorizes

@@ -1,0 +1,126 @@
+// Correctness coverage for the GENERAL vectorizer's int32 lanes and runtime
+// scalar broadcast (simd_vloop_i32 + the VLOOP scalar leaf). Kernels are
+// @simd! so the --release build asserts they vectorize; results are checked
+// against reference loops the vectorizer refuses (reversed iteration order),
+// i.e. genuinely scalar code in the same binary. Integer kernels are
+// BIT-EXACT by construction (every op congruent mod 2^32), so comparisons
+// are equality even with wrapping inputs. Also pins the iv-start-zero fix:
+// a reduction over j=3..n must NOT be replayed as 0..n.
+// Returns the number of failures (0 = all correct).
+
+function imap(out: int32*, a: int32*, b: int32*, n: int32, k: int32) {
+  @simd! for i in 0..n { out[i] = (a[i] * 3 + b[i]) ^ k; }
+}
+function imap_ref(out: int32*, a: int32*, b: int32*, n: int32, k: int32) {
+  var i: int32 = n - 1;
+  while (i >= 0) { out[i] = (a[i] * 3 + b[i]) ^ k; i = i - 1; }
+}
+
+function imap_shift(out: int32*, a: int32*, n: int32, s: int32) {
+  @simd! for i in 0..n { out[i] = ((a[i] << 2) & 1023) + (a[i] | s) + i; }
+}
+function imap_shift_ref(out: int32*, a: int32*, n: int32, s: int32) {
+  var i: int32 = n - 1;
+  while (i >= 0) { out[i] = ((a[i] << 2) & 1023) + (a[i] | s) + i; i = i - 1; }
+}
+
+function ireduce(a: int32*, b: int32*, n: int32, k: int32) -> int32 {
+  var s: int32 = 12345; // nonzero prior: pins the accumulator seeding
+  @simd! for i in 0..n { s = s + (a[i] * b[i] + k); }
+  return s;
+}
+function ireduce_ref(a: int32*, b: int32*, n: int32, k: int32) -> int32 {
+  var s: int32 = 12345;
+  var i: int32 = n - 1;
+  while (i >= 0) { s = s + (a[i] * b[i] + k); i = i - 1; }
+  return s;
+}
+
+function ureduce(a: uint32*, n: int32, k: uint32) -> uint32 {
+  var s: uint32 = 7; // uint32 acc: pins the zero-extended home writeback
+  @simd! for i in 0..n { s = s + (a[i] ^ k) * 2654435761; }
+  return s;
+}
+function ureduce_ref(a: uint32*, n: int32, k: uint32) -> uint32 {
+  var s: uint32 = 7;
+  var i: int32 = n - 1;
+  while (i >= 0) { s = s + (a[i] ^ k) * 2654435761; i = i - 1; }
+  return s;
+}
+
+// float32 map with TWO runtime scalars (refused before scalar broadcast)
+function fmap32(out: float32*, a: float32*, b: float32*, n: int32, s1: float32, s2: float32) {
+  @simd! for i in 0..n { out[i] = (a[i] * s1 + b[i]) * s2; }
+}
+function fmap32_ref(out: float32*, a: float32*, b: float32*, n: int32, s1: float32, s2: float32) {
+  var i: int32 = n - 1;
+  while (i >= 0) { out[i] = (a[i] * s1 + b[i]) * s2; i = i - 1; }
+}
+
+// float64 reduction with a runtime scalar coefficient; all-equal terms so the
+// reassociated sum is exact.
+function freduce64(a: float64*, n: int32, c: float64) -> float64 {
+  var s: float64 = 0.0;
+  @simd! for i in 0..n { s = s + a[i] * c; }
+  return s;
+}
+
+// iv-start regression: starts at 3, must not vectorize as 0..n (would give
+// 200 instead of 194 for all-ones input).
+function partial_sum(a: float64*, n: int32) -> float64 {
+  var s: float64 = 0.0;
+  var j: int32 = 3;
+  while (j < n) {
+    s = s + a[j] * 2.0;
+    j = j + 1;
+  }
+  return s;
+}
+
+function main() -> int32 {
+  var n: int32 = 1003; // not a multiple of 8: exercises the scalar tail
+  var a: int32[1003];
+  var b: int32[1003];
+  var o1: int32[1003];
+  var o2: int32[1003];
+  var ua: uint32[1003];
+  var fa: float32[1003];
+  var fb: float32[1003];
+  var fo1: float32[1003];
+  var fo2: float32[1003];
+  var da: float64[1003];
+  var bad: int32 = 0;
+
+  for i in 0..n {
+    a[i] = i * 7 - 500;               // negatives included
+    b[i] = 100000 - i * 13;
+    ua[i] = (uint32)(i * 2654435761); // wraps: exercises mod-2^32 congruence
+    fa[i] = (float32)i * 0.5;
+    fb[i] = (float32)(n - i);
+    da[i] = 1.0;
+  }
+
+  imap(&o1[0], &a[0], &b[0], n, 77);
+  imap_ref(&o2[0], &a[0], &b[0], n, 77);
+  for i in 0..n { if (o1[i] != o2[i]) { bad = bad + 1; } }
+
+  imap_shift(&o1[0], &a[0], n, 5);
+  imap_shift_ref(&o2[0], &a[0], n, 5);
+  for i in 0..n { if (o1[i] != o2[i]) { bad = bad + 1; } }
+
+  if (ireduce(&a[0], &b[0], n, 9) != ireduce_ref(&a[0], &b[0], n, 9)) { bad = bad + 100; }
+  if (ureduce(&ua[0], n, 123456789) != ureduce_ref(&ua[0], n, 123456789)) { bad = bad + 1000; }
+
+  fmap32(&fo1[0], &fa[0], &fb[0], n, 1.5, 0.25);
+  fmap32_ref(&fo2[0], &fa[0], &fb[0], n, 1.5, 0.25);
+  for i in 0..n { if (fo1[i] != fo2[i]) { bad = bad + 1; } } // maps are bit-exact
+
+  var fr: float64 = freduce64(&da[0], n, 3.0);
+  if (fr != (float64)n * 3.0) { bad = bad + 10000; }
+
+  var ps: float64 = partial_sum(&da[0], 100);
+  if (ps < 193.9) { bad = bad + 100000; }
+  if (ps > 194.1) { bad = bad + 100000; }
+
+  return bad;
+}

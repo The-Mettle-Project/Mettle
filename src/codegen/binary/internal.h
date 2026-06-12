@@ -380,6 +380,7 @@ int binary_emit_mov_reg_mem(BinaryCodeBuffer *buffer, BinaryGpRegister destinati
 int binary_emit_mov_reg_mem32(BinaryCodeBuffer *buffer, BinaryGpRegister destination, BinaryGpRegister base, int displacement);
 int binary_emit_mov_reg_reg(BinaryCodeBuffer *buffer, BinaryGpRegister destination, BinaryGpRegister source);
 int binary_emit_mov_reg_reg32(BinaryCodeBuffer *buffer, BinaryGpRegister destination, BinaryGpRegister source);
+int binary_emit_movzx_reg_reg32(BinaryCodeBuffer *buffer, BinaryGpRegister destination, BinaryGpRegister source);
 int binary_emit_mov_reg_rip_mem(BinaryCodeBuffer *buffer, BinaryGpRegister destination, size_t *displacement_offset_out);
 int binary_emit_movd_reg_xmm(BinaryCodeBuffer *buffer, BinaryGpRegister destination, BinaryXmmRegister source);
 int binary_emit_movd_xmm_reg(BinaryCodeBuffer *buffer, BinaryXmmRegister destination, BinaryGpRegister source);
@@ -636,7 +637,7 @@ int code_generator_binary_emit_reg_reg_compare( BinaryCodeBuffer *buffer, Binary
 int code_generator_binary_emit_reg_reg_move( BinaryCodeBuffer *buffer, BinaryGpRegister destination, BinaryGpRegister source, Type *type);
 int code_generator_binary_try_emit_reg_multiply_immediate( BinaryFunctionContext *context, BinaryGpRegister target_register, long long immediate, int *handled_out);
 int code_generator_binary_emit_symbol_stack_load( CodeGenerator *generator, BinaryFunctionContext *context, Type *type, int stack_offset, BinaryGpRegister target_register);
-int code_generator_binary_emit_symbol_stack_store( CodeGenerator *generator, BinaryFunctionContext *context, Symbol *symbol, int stack_offset, BinaryGpRegister source_register);
+int code_generator_binary_emit_symbol_stack_store( CodeGenerator *generator, BinaryFunctionContext *context, Type *type, int stack_offset, BinaryGpRegister source_register);
 size_t code_generator_binary_symbol_write_count( const IRFunction *function, const char *name);
 int code_generator_binary_try_emit_address_add_load( CodeGenerator *generator, BinaryFunctionContext *context, const IRFunction *function, size_t instruction_index, size_t *consumed_out);
 int code_generator_binary_try_emit_address_add_store( CodeGenerator *generator, BinaryFunctionContext *context, const IRFunction *function, size_t instruction_index, size_t *consumed_out);
