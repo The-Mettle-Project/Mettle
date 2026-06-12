@@ -204,6 +204,9 @@ static int ir_try_vectorize_sum_i32_at(IRFunction *function, size_t header_index
           &function->instructions[increment_index], iv_symbol)) {
     return 1;
   }
+  if (!ir_iv_zero_at_header(function, header_index, iv_symbol)) {
+    return 1;
+  }
 
   /* Body must be: idx = iv << 2; ptr = base + idx; load; cast (int64); sum += cast. */
   sum_symbol = NULL;
@@ -373,9 +376,12 @@ static int ir_symbol_is_uint8_ptr(const IRFunction *function,
 }
 
 /* True if @iv is provably 0 at the loop header: the nearest preceding write to
- * @iv (in straight-line order) is `iv <- 0`. Bails on any control-flow join
- * before finding it, so a fused kernel only ever touches base[0..len). Shared
- * with the fill recognizer (ir_optimize_simd_fill.c). */
+ * @iv (in straight-line order) is `iv <- 0` (directly, or via an integer
+ * cast-of-0 temp, the shape int64 ivs and inlined inits lower to). Bails on any
+ * control-flow join before finding it, so a fused kernel only ever touches
+ * base[0..len). EVERY recognizer that replays a counted loop as 0..bound must
+ * call this (or prove the start some other way): `var j = 3; while (j < n)`
+ * silently summing/mapping the skipped prefix was a real --release miscompile. */
 int ir_iv_zero_at_header(const IRFunction *function, size_t header_index,
                          const char *iv) {
   for (size_t i = header_index; i-- > 0;) {
@@ -389,8 +395,19 @@ int ir_iv_zero_at_header(const IRFunction *function, size_t header_index,
     }
     if (ir_instruction_writes_destination(ins) &&
         ir_operand_is_symbol_named(&ins->dest, iv)) {
-      return ins->op == IR_OP_ASSIGN && ins->lhs.kind == IR_OPERAND_INT &&
-             ins->lhs.int_value == 0;
+      if (ins->op != IR_OP_ASSIGN) {
+        return 0;
+      }
+      if (ins->lhs.kind == IR_OPERAND_INT) {
+        return ins->lhs.int_value == 0;
+      }
+      if (ins->lhs.kind == IR_OPERAND_TEMP && ins->lhs.name) {
+        const IRInstruction *p =
+            ir_find_temp_producer_before(function, i, ins->lhs.name);
+        return p && p->op == IR_OP_CAST && !p->is_float &&
+               p->lhs.kind == IR_OPERAND_INT && p->lhs.int_value == 0;
+      }
+      return 0;
     }
   }
   return 0;

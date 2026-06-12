@@ -429,6 +429,48 @@ static Type *mir_local_or_param_type(CodeGenerator *g,
   return NULL;
 }
 
+/* If `dest` names a signed/unsigned sub-64-bit integer variable (local, param, or
+ * global scalar), return its byte width (1/2/4), else 0. Used to keep narrow
+ * homes canonical: MIR computes in 64 bits, so an arithmetic result written to
+ * a typed int32/uint32/int16/etc. home can carry bits above the type's width.
+ * Narrow integer homes wrap to their width, so each such write is followed by
+ * sign- or zero-extension of the destination vreg.
+ */
+static int mir_dest_integer_narrow_width(CodeGenerator *g,
+                                         BinaryFunctionContext *ctx,
+                                         const IROperand *dest,
+                                         int *is_signed_out) {
+  if (is_signed_out) {
+    *is_signed_out = 0;
+  }
+  if (!g || !ctx || !ctx->function_name || !dest ||
+      dest->kind != IR_OPERAND_SYMBOL || !dest->name) {
+    return 0;
+  }
+  IRFunction *irf =
+      code_generator_find_ir_function_binary(g, ctx->function_name);
+  if (!irf) {
+    return 0;
+  }
+  Type *t = mir_local_or_param_type(g, irf, dest->name, NULL);
+  if (!t && g->symbol_table) {
+    /* Not a local/param: a global scalar (its symbol never goes out of
+     * scope). The cached-global vreg carries the value across the function
+     * body, so it needs the same canonicalization as a local's vreg. */
+    Symbol *s = symbol_table_lookup(g->symbol_table, dest->name);
+    t = s ? s->type : NULL;
+  }
+  if (!t || code_generator_type_is_aggregate(t) ||
+      code_generator_binary_resolved_type_float_bits(t) != 0) {
+    return 0;
+  }
+  int w = code_generator_binary_resolved_type_scalar_size(t);
+  if (is_signed_out) {
+    *is_signed_out = code_generator_binary_resolved_type_is_signed_integer(t);
+  }
+  return (w == 1 || w == 2 || w == 4) ? w : 0;
+}
+
 /* True if NAME is an INDIRECT aggregate local or by-reference parameter of this
  * function. MIR only touches such a value through its ADDRESS (field LOAD/STORE
  * off &@sym); a by-NAME use of the whole aggregate (assign, return, call
@@ -3493,6 +3535,48 @@ int code_generator_binary_emit_function_via_mir(
           free(fold_skip);
           free(folds);
           goto oom;
+        }
+      }
+      /* Keep narrow integer homes canonical: an ASSIGN/BINARY/UNARY/CALL
+       * result written to an int32/uint32/int16/etc. variable was computed in
+       * 64 bits and may carry garbage above the type's width. LOAD already
+       * extends at the access width, CAST canonicalizes itself, and an
+       * in-range literal is canonical as materialized, so those are skipped. */
+      {
+        const IRInstruction *cin = &ir_function->instructions[i];
+        if (cin->op == IR_OP_ASSIGN || cin->op == IR_OP_BINARY ||
+            cin->op == IR_OP_UNARY || cin->op == IR_OP_CALL ||
+            cin->op == IR_OP_CALL_INDIRECT) {
+          int signed_home = 0;
+          int cw =
+              mir_dest_integer_narrow_width(generator, context, &cin->dest,
+                                            &signed_home);
+          int literal_canonical = 0;
+          if (cw && cin->op == IR_OP_ASSIGN &&
+              cin->lhs.kind == IR_OPERAND_INT) {
+            int bits = cw * 8;
+            if (signed_home) {
+              int64_t minv = -(1ll << (bits - 1));
+              int64_t maxv = (1ll << (bits - 1)) - 1;
+              literal_canonical = cin->lhs.int_value >= minv &&
+                                  cin->lhs.int_value <= maxv;
+            } else {
+              literal_canonical = cin->lhs.int_value >= 0 &&
+                                  (uint64_t)cin->lhs.int_value <
+                                      (1ull << bits);
+            }
+          }
+          if (cw && !literal_canonical && !fn.has_error) {
+            MirOperand cd =
+                mir_value_operand(&fn, generator, context, &map, &cin->dest);
+            if (cd.kind == MIR_OPK_VREG &&
+                !mir_emit1(&fn, signed_home ? MIR_MOVSX : MIR_MOVZX, cd, cd,
+                           mir_op_none(), cw, !signed_home, 0)) {
+              free(fold_skip);
+              free(folds);
+              goto oom;
+            }
+          }
         }
       }
     }

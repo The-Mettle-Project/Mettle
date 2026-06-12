@@ -706,7 +706,7 @@ static int ir_try_vectorize_simd_minmax_ptr_at(IRFunction *function,
   {
     IROperand len = {0};
     if (!ir_find_ptr_loop_len_operand(function, bounds.compare_index,
-                                      compare->rhs.name, &len)) {
+                                      compare->rhs.name, arr_base, &len)) {
       return 1;
     }
     if (!ir_verify_minmax_preloop_init(function, header_index, "@unused_iv",
@@ -772,22 +772,12 @@ static int ir_try_fuse_prefix_sum_ptr_at(IRFunction *function,
       !ir_symbol_is_i32_ptr_param(function, dst_base)) {
     return 1;
   }
+  /* No unanchored fallback here: a `<<2` of some bound param floating before
+   * the loop proves nothing about (end - base)/4, which is the kernel's
+   * actual trip count. */
   if (!ir_find_ptr_loop_len_operand(function, bounds.compare_index,
-                                    compare->rhs.name, &len)) {
-    for (size_t i = 0; i < bounds.compare_index; i++) {
-      const IRInstruction *ins = &function->instructions[i];
-      if (ins->op == IR_OP_BINARY && ins->text &&
-          strcmp(ins->text, "<<") == 0 &&
-          ir_operand_is_int_value(&ins->rhs, 2) &&
-          ins->lhs.kind == IR_OPERAND_SYMBOL && ins->lhs.name &&
-          ir_symbol_is_sum_loop_bound(function, ins->lhs.name)) {
-        len = ir_operand_symbol(ins->lhs.name);
-        break;
-      }
-    }
-    if (len.kind != IR_OPERAND_SYMBOL || !len.name) {
-      return 1;
-    }
+                                    compare->rhs.name, src_base, &len)) {
+    return 1;
   }
 
   for (size_t i = 0; i < bounds.branch_index + 1; i++) {
@@ -1016,6 +1006,13 @@ static int ir_try_vectorize_dot_i32_at(IRFunction *function, size_t header_index
     ir_operand_destroy(&len);
     return 1;
   }
+  /* The kernel replays a[0..len)*b[0..len): the loop must start at iv == 0,
+   * and the iv must be dead after the loop (the fused op drops it). */
+  if (!ir_iv_zero_at_header(function, header_index, iv_symbol) ||
+      ir_symbol_live_after_loop(function, jump_index + 1, iv_symbol)) {
+    ir_operand_destroy(&len);
+    return 1;
+  }
 
   for (size_t i = branch_index + 1; i < jump_index; i++) {
     const IRInstruction *ins = &function->instructions[i];
@@ -1179,6 +1176,13 @@ static int ir_try_vectorize_dot_i8_at(IRFunction *function, size_t header_index,
     ir_operand_destroy(&len);
     return 1;
   }
+  /* The kernel replays a[0..len)*b[0..len): the loop must start at iv == 0,
+   * and the iv must be dead after the loop (the fused op drops it). */
+  if (!ir_iv_zero_at_header(function, header_index, iv_symbol) ||
+      ir_symbol_live_after_loop(function, jump_index + 1, iv_symbol)) {
+    ir_operand_destroy(&len);
+    return 1;
+  }
 
   for (size_t i = branch_index + 1; i < jump_index; i++) {
     const IRInstruction *ins = &function->instructions[i];
@@ -1281,9 +1285,9 @@ static int ir_memcmp_byte_loop_is_indexed_load(const IRFunction *function,
 }
 
 static int ir_memcmp_byte_loop_value_symbol(const IRFunction *function,
-                                            size_t before_index,
-                                            const IROperand *operand,
-                                            const char **out_symbol) {
+                                             size_t before_index,
+                                             const IROperand *operand,
+                                             const char **out_symbol) {
   const IRInstruction *producer = NULL;
   if (!operand || !out_symbol) {
     return 0;
@@ -1304,6 +1308,43 @@ static int ir_memcmp_byte_loop_value_symbol(const IRFunction *function,
   return 0;
 }
 
+static int ir_memcmp_byte_loop_tail_is_zero_return(const IRFunction *function,
+                                                   size_t exit_label_index) {
+  int saw_exit_label = 0;
+  int saw_return = 0;
+
+  if (!function || exit_label_index >= function->instruction_count) {
+    return 0;
+  }
+
+  for (size_t i = exit_label_index; i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_NOP || ins->op == IR_OP_DECLARE_LOCAL) {
+      continue;
+    }
+    if (!saw_exit_label) {
+      if (ins->op != IR_OP_LABEL) {
+        return 0;
+      }
+      saw_exit_label = 1;
+      continue;
+    }
+    if (ins->op == IR_OP_LABEL) {
+      return 0;
+    }
+    if (ins->op == IR_OP_RETURN) {
+      if (saw_return || !ir_operand_is_int_value(&ins->lhs, 0)) {
+        return 0;
+      }
+      saw_return = 1;
+      continue;
+    }
+    return 0;
+  }
+
+  return saw_exit_label && saw_return;
+}
+
 static int ir_try_memcmp_byte_loop_function(IRFunction *function,
                                             int *changed) {
   const char *a_symbol = NULL;
@@ -1313,6 +1354,8 @@ static int ir_try_memcmp_byte_loop_function(IRFunction *function,
   const char *lhs_byte = NULL;
   const char *rhs_byte = NULL;
   size_t header_index = (size_t)-1;
+  size_t exit_label_index = (size_t)-1;
+  IRWhileLoopBounds bounds = {0};
   int saw_a_load = 0;
   int saw_b_load = 0;
   int last_byte_load_base = 0;
@@ -1335,28 +1378,30 @@ static int ir_try_memcmp_byte_loop_function(IRFunction *function,
     return 1;
   }
 
-  for (size_t i = 0; i + 2 < function->instruction_count; i++) {
-    IRInstruction *label = &function->instructions[i];
-    IRInstruction *compare = &function->instructions[i + 1];
-    IRInstruction *branch = &function->instructions[i + 2];
-    if (label->op == IR_OP_LABEL && ir_label_is_while_header(label->text) &&
-        compare->op == IR_OP_BINARY && compare->text &&
-        strcmp(compare->text, "<") == 0 &&
-        compare->lhs.kind == IR_OPERAND_SYMBOL && compare->lhs.name &&
-        ir_operand_is_symbol_named(&compare->rhs, len_symbol) &&
-        branch->op == IR_OP_BRANCH_ZERO &&
-        ir_operand_is_temp_named(&branch->lhs, compare->dest.name)) {
-      header_index = i;
-      iv_symbol = compare->lhs.name;
-      break;
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    IRWhileLoopBounds candidate = {0};
+    if (ir_find_while_loop_bounds(function, i, &candidate)) {
+      IRInstruction *compare = &function->instructions[candidate.compare_index];
+      if (ir_operand_is_symbol_named(&compare->rhs, len_symbol)) {
+        bounds = candidate;
+        header_index = i;
+        iv_symbol = compare->lhs.name;
+        break;
+      }
     }
   }
 
-  if (header_index == (size_t)-1 || !iv_symbol) {
+  if (header_index == (size_t)-1 || !iv_symbol ||
+      !ir_find_label_index(function, bounds.exit_label, &exit_label_index)) {
+    return 1;
+  }
+  /* memcmp compares bytes 0..len: the loop must start at iv == 0 (a loop from
+   * iv == 1 that skips byte 0 is NOT memcmp). */
+  if (!ir_iv_zero_at_header(function, header_index, iv_symbol)) {
     return 1;
   }
 
-  for (size_t i = header_index + 3; i < function->instruction_count; i++) {
+  for (size_t i = bounds.branch_index + 1; i < bounds.jump_index; i++) {
     const IRInstruction *ins = &function->instructions[i];
     if (ins->op == IR_OP_LOAD && ins->dest.kind == IR_OPERAND_TEMP &&
         ins->dest.name) {
@@ -1396,7 +1441,7 @@ static int ir_try_memcmp_byte_loop_function(IRFunction *function,
           ir_memcmp_byte_loop_value_symbol(function, i, &ins->rhs, &right) &&
           left && right && strcmp(left, lhs_byte) == 0 &&
           strcmp(right, rhs_byte) == 0) {
-        for (size_t j = i + 1; j < function->instruction_count; j++) {
+        for (size_t j = i + 1; j < bounds.jump_index; j++) {
           const IRInstruction *ret = &function->instructions[j];
           if (ret->op == IR_OP_RETURN &&
               ir_operand_is_temp_named(&ret->lhs, ins->dest.name)) {
@@ -1408,10 +1453,11 @@ static int ir_try_memcmp_byte_loop_function(IRFunction *function,
           }
         }
       }
-    } else if (ins->op == IR_OP_RETURN && ir_operand_is_int_value(&ins->lhs, 0)) {
-      saw_zero_return = 1;
     }
   }
+
+  saw_zero_return =
+      ir_memcmp_byte_loop_tail_is_zero_return(function, exit_label_index);
 
   if (!saw_a_load || !saw_b_load || !saw_neq || !saw_diff_return ||
       !saw_zero_return) {
@@ -1597,6 +1643,45 @@ static int ir_slp_find_stores(IRFunction *function, size_t exit_label_index,
   return found == K && c_base && out_idx_sym;
 }
 
+/* The SLP MAC kernels run exactly `compare->rhs` iterations from the recorded
+ * a_off/b_off starting indexes, i.e. they replay the loop as iv = 0..bound-1.
+ * That is only the scalar trip count when the iv provably starts at 0, steps
+ * by exactly +1, and the bound symbol is loop-invariant -- none of which the
+ * body scans below establish on their own. */
+static int ir_slp_loop_frame_is_replayable(const IRFunction *function,
+                                           size_t header_index,
+                                           size_t branch_index,
+                                           size_t jump_index,
+                                           const IRInstruction *compare,
+                                           const char *iv_symbol) {
+  if (compare->rhs.kind != IR_OPERAND_SYMBOL || !compare->rhs.name) {
+    return 0;
+  }
+  if (!ir_iv_zero_at_header(function, header_index, iv_symbol)) {
+    return 0;
+  }
+  int iv_inc_ok = 0;
+  for (size_t i = branch_index + 1; i < jump_index; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ir_try_parse_direct_unit_increment(ins, iv_symbol)) {
+      iv_inc_ok = 1;
+      continue;
+    }
+    /* Any other write to the iv (a second increment, a reset) breaks the
+     * trip-count identity. */
+    if (ir_instruction_writes_destination(ins) &&
+        ir_operand_is_symbol_named(&ins->dest, iv_symbol)) {
+      return 0;
+    }
+    /* The bound is read once by the kernel: a write in the body diverges. */
+    if (ir_instruction_writes_destination(ins) &&
+        ir_operand_is_symbol_named(&ins->dest, compare->rhs.name)) {
+      return 0;
+    }
+  }
+  return iv_inc_ok;
+}
+
 static int ir_try_vectorize_slp_mac_i32_at(IRFunction *function,
                                            size_t header_index, int *changed) {
   if (!function || header_index + 4 >= function->instruction_count) {
@@ -1639,6 +1724,10 @@ static int ir_try_vectorize_slp_mac_i32_at(IRFunction *function,
   }
   if (jump_index == (size_t)-1 ||
       ir_loop_body_has_nested_while(function, branch_index + 1, jump_index)) {
+    return 1;
+  }
+  if (!ir_slp_loop_frame_is_replayable(function, header_index, branch_index,
+                                       jump_index, compare, iv_symbol)) {
     return 1;
   }
 
@@ -1811,6 +1900,13 @@ static int ir_try_vectorize_slp_mac_i32_at(IRFunction *function,
   int sfound = ir_slp_find_stores(function, exit_label_index, K, sum_by_lane,
                                   &c_base, &out_idx_sym, store_idx);
   if (!sfound || strcmp(c_base, a_base) == 0) {
+    ir_operand_destroy(&a_off);
+    ir_operand_destroy(&b_off);
+    return 1;
+  }
+  if (ir_symbol_live_after_loop(function, exit_label_index, iv_symbol) ||
+      ir_symbol_live_after_loop(function, exit_label_index, a_idx_sym) ||
+      ir_symbol_live_after_loop(function, exit_label_index, b_idx_sym)) {
     ir_operand_destroy(&a_off);
     ir_operand_destroy(&b_off);
     return 1;
@@ -1989,6 +2085,10 @@ static int ir_try_vectorize_slp_mac_i8_at(IRFunction *function,
       ir_loop_body_has_nested_while(function, branch_index + 1, jump_index)) {
     return 1;
   }
+  if (!ir_slp_loop_frame_is_replayable(function, header_index, branch_index,
+                                       jump_index, compare, iv_symbol)) {
+    return 1;
+  }
 
   /* Collect chains `S = S + (av * bload)`, av a symbol, bload a temp. */
   const char *sum_sym[IR_SLP_MAX_LANES];
@@ -2133,6 +2233,13 @@ static int ir_try_vectorize_slp_mac_i8_at(IRFunction *function,
   int sfound = ir_slp_find_stores(function, exit_label_index, K, sum_by_lane,
                                   &c_base, &out_idx_sym, store_idx);
   if (!sfound || strcmp(c_base, a_base) == 0) {
+    ir_operand_destroy(&a_off);
+    ir_operand_destroy(&b_off);
+    return 1;
+  }
+  if (ir_symbol_live_after_loop(function, exit_label_index, iv_symbol) ||
+      ir_symbol_live_after_loop(function, exit_label_index, a_idx_sym) ||
+      ir_symbol_live_after_loop(function, exit_label_index, b_idx_sym)) {
     ir_operand_destroy(&a_off);
     ir_operand_destroy(&b_off);
     return 1;
@@ -2308,6 +2415,12 @@ static int ir_try_vectorize_exp_f32_at(IRFunction *function, size_t header_index
     }
   }
   if (!inc_ok) {
+    return 1;
+  }
+  /* The kernel maps a[0..n) in place: the loop must start at iv == 0, and the
+   * iv must be dead after the loop (the fused op drops it). */
+  if (!ir_iv_zero_at_header(function, header_index, iv_symbol) ||
+      ir_symbol_live_after_loop(function, jump_index + 1, iv_symbol)) {
     return 1;
   }
 

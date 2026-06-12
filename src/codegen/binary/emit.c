@@ -1318,6 +1318,9 @@ int code_generator_binary_emit_operand_load(
                          ? symbol_table_lookup(generator->symbol_table,
                                                operand->name)
                          : NULL;
+    Type *load_type = symbol ? symbol->type
+                             : code_generator_binary_get_operand_type_in_context(
+                                   generator, context, operand);
     int offset = code_generator_binary_get_symbol_offset(context, operand->name);
     BinaryGpRegister assigned_register = BINARY_GP_RAX;
     if (alias_target) {
@@ -1343,8 +1346,7 @@ int code_generator_binary_emit_operand_load(
         return 1;
       }
       return code_generator_binary_emit_reg_reg_move(
-          &context->code, target_register, assigned_register,
-          symbol ? symbol->type : NULL);
+          &context->code, target_register, assigned_register, load_type);
     }
     if (offset > 0 && symbol &&
         code_generator_binary_type_is_direct_aggregate(symbol->type)) {
@@ -1429,9 +1431,6 @@ int code_generator_binary_emit_operand_load(
      * narrow unsigned local (e.g. uint32) and corrupting its value. Resolve the
      * type from the IR (parameter signature / DECLARE_LOCAL) so the load uses
      * the correct width and signedness. */
-    Type *load_type = symbol ? symbol->type
-                             : code_generator_binary_get_operand_type_in_context(
-                                   generator, context, operand);
     return code_generator_binary_emit_symbol_stack_load(
         generator, context, load_type, offset, target_register);
   }
@@ -2001,6 +2000,9 @@ int code_generator_binary_emit_local_string_store(
   return 1;
 }
 
+static int binary_canonicalize_narrow_reg_for_type(
+    BinaryFunctionContext *context, Type *type, BinaryGpRegister reg);
+
 int code_generator_binary_emit_destination_store(
     CodeGenerator *generator, BinaryFunctionContext *context,
     const IROperand *destination, BinaryGpRegister source_register) {
@@ -2031,6 +2033,15 @@ int code_generator_binary_emit_destination_store(
                          ? symbol_table_lookup(generator->symbol_table,
                                                destination->name)
                          : NULL;
+    /* The symbol table has popped function scope by codegen time, so the
+     * lookup returns NULL for locals/params; fall back to the IR-derived type
+     * (function signature + DECLARE_LOCAL). Without it a narrow local's store
+     * defaults to 8 bytes, losing the type's truncation semantics (and
+     * over-writing a 4-byte stack slot). */
+    Type *dest_type = symbol && symbol->type
+                          ? symbol->type
+                          : code_generator_binary_get_operand_type_in_context(
+                                generator, context, destination);
     int offset =
         code_generator_binary_get_symbol_offset(context, destination->name);
     BinaryGpRegister assigned_register = BINARY_GP_RAX;
@@ -2069,11 +2080,12 @@ int code_generator_binary_emit_destination_store(
     if (code_generator_binary_symbol_assigned_register(
             generator, context, destination->name, &assigned_register)) {
       if (assigned_register == source_register) {
-        return 1;
+        /* Same register: still canonicalize a narrow value in place. */
+        return binary_canonicalize_narrow_reg_for_type(context, dest_type,
+                                                       assigned_register);
       }
       return code_generator_binary_emit_reg_reg_move(
-          &context->code, assigned_register, source_register,
-          symbol ? symbol->type : NULL);
+          &context->code, assigned_register, source_register, dest_type);
     }
     if (offset > 0 && symbol &&
         code_generator_binary_type_is_direct_aggregate(symbol->type)) {
@@ -2154,7 +2166,7 @@ int code_generator_binary_emit_destination_store(
       return 0;
     }
     return code_generator_binary_emit_symbol_stack_store(
-        generator, context, symbol, offset, source_register);
+        generator, context, dest_type, offset, source_register);
   }
 
   default:
@@ -4273,6 +4285,41 @@ static int code_generator_binary_symbol_operand_register(
       generator, context, operand->name, reg_out);
 }
 
+static int binary_canonicalize_narrow_reg_for_type(
+    BinaryFunctionContext *context, Type *type, BinaryGpRegister reg) {
+  if (!context || !type || code_generator_type_is_aggregate(type) ||
+      code_generator_binary_resolved_type_float_bits(type) != 0) {
+    return 1;
+  }
+  int w = code_generator_binary_resolved_type_scalar_size(type);
+  int is_signed = code_generator_binary_resolved_type_is_signed_integer(type);
+  if (w == 4) {
+    return is_signed ? binary_emit_movsxd_reg_reg32(&context->code, reg, reg)
+                     : binary_emit_movzx_reg_reg32(&context->code, reg, reg);
+  }
+  if (w == 2) {
+    return is_signed ? binary_emit_movsx_reg_reg16(&context->code, reg, reg)
+                     : binary_emit_movzx_reg_reg16(&context->code, reg, reg);
+  }
+  if (w == 1) {
+    return is_signed ? binary_emit_movsx_reg_reg8(&context->code, reg, reg)
+                     : binary_emit_movzx_reg_reg8(&context->code, reg, reg);
+  }
+  return 1;
+}
+
+/* If `dest` is a narrow integer variable promoted to `dest_reg`, extend the
+ * register in place: the in-place ALU fast paths compute in 64 bits, and
+ * narrow home semantics wrap to the destination width, so the promoted home
+ * must hold the canonical sign- or zero-extended value (mirrors MIR). */
+static int binary_canonicalize_narrow_dest_reg(
+    CodeGenerator *generator, BinaryFunctionContext *context,
+    const IROperand *dest, BinaryGpRegister dest_reg) {
+  Type *t = code_generator_binary_get_operand_type_in_context(generator,
+                                                              context, dest);
+  return binary_canonicalize_narrow_reg_for_type(context, t, dest_reg);
+}
+
 static int binary_emit_binary_integer(CodeGenerator *generator,
                                       BinaryFunctionContext *context,
                                       const IRInstruction *instruction) {
@@ -4494,6 +4541,10 @@ static int binary_emit_binary_integer(CodeGenerator *generator,
           if (!ok) {
             goto emit_failure;
           }
+          if (!binary_canonicalize_narrow_dest_reg(
+                  generator, context, &instruction->dest, dest_reg)) {
+            goto emit_failure;
+          }
           return 1;
         }
       }
@@ -4634,7 +4685,9 @@ static int binary_emit_binary_integer(CodeGenerator *generator,
       if (lhs_in_reg && lhs_reg == dest_reg && rhs_in_reg &&
           rhs_reg != dest_reg) {
         if (!binary_emit_alu_reg_reg(&context->code, alu_opcode, dest_reg,
-                                     rhs_reg)) {
+                                     rhs_reg) ||
+            !binary_canonicalize_narrow_dest_reg(
+                generator, context, &instruction->dest, dest_reg)) {
           goto emit_failure;
         }
         return 1;
@@ -4643,7 +4696,9 @@ static int binary_emit_binary_integer(CodeGenerator *generator,
       if (commutative_alu && rhs_in_reg && rhs_reg == dest_reg && lhs_in_reg &&
           lhs_reg != dest_reg) {
         if (!binary_emit_alu_reg_reg(&context->code, alu_opcode, dest_reg,
-                                     lhs_reg)) {
+                                     lhs_reg) ||
+            !binary_canonicalize_narrow_dest_reg(
+                generator, context, &instruction->dest, dest_reg)) {
           goto emit_failure;
         }
         return 1;
@@ -4653,7 +4708,9 @@ static int binary_emit_binary_integer(CodeGenerator *generator,
       if (lhs_in_reg && rhs_in_reg && rhs_reg != dest_reg) {
         if (!binary_emit_mov_reg_reg(&context->code, dest_reg, lhs_reg) ||
             !binary_emit_alu_reg_reg(&context->code, alu_opcode, dest_reg,
-                                     rhs_reg)) {
+                                     rhs_reg) ||
+            !binary_canonicalize_narrow_dest_reg(
+                generator, context, &instruction->dest, dest_reg)) {
           goto emit_failure;
         }
         return 1;
@@ -5185,6 +5242,7 @@ int code_generator_binary_emit_instruction(
                                     ? generator->type_checker->builtin_cstring
                                     : NULL);
         int assign_ok = 0;
+        int assign_canonicalized = 0;
         if (instruction->lhs.kind == IR_OPERAND_TEMP &&
             instruction->lhs.name && dest_scalar_width == 4) {
           int offset = code_generator_binary_get_temp_offset(
@@ -5193,6 +5251,7 @@ int code_generator_binary_emit_instruction(
                       code_generator_binary_emit_temp_stack_load(
                           generator, context, offset, assign_dest_reg,
                           assign_dest_type);
+          assign_canonicalized = assign_ok; /* 32-bit load extends */
         } else {
           assign_ok = dest_is_cstring
                           ? code_generator_binary_emit_call_argument_load(
@@ -5207,6 +5266,13 @@ int code_generator_binary_emit_instruction(
             code_generator_set_error(generator,
                                      "Out of memory while emitting assign");
           }
+          return 0;
+        }
+        /* A promoted narrow destination must hold its canonical wrapped value
+         * after assignment, matching stack homes and the MIR backend. */
+        if (!assign_canonicalized &&
+            !binary_canonicalize_narrow_reg_for_type(
+                context, assign_dest_type, assign_dest_reg)) {
           return 0;
         }
         return 1;
@@ -5341,6 +5407,48 @@ int code_generator_binary_emit_instruction(
                                                  &instruction->lhs,
                                                  BINARY_GP_RAX)) {
       return 0;
+    }
+    /* Canonicalize a narrow integer return to 64 bits (mirrors the MIR
+     * backend's scalar_return_width handling): the value may be a 64-bit
+     * arithmetic temp carrying garbage above the return type's width, and a
+     * caller using the full register (e.g. `(int64)narrow_fn()`) would read
+     * that garbage. Zero-extend unsigned / sign-extend signed. */
+    if (instruction->lhs.kind != IR_OPERAND_NONE && !instruction->is_float &&
+        context->function_data) {
+      Type *ret_type = code_generator_binary_get_resolved_type(
+          generator, context->function_data->return_type, 1);
+      if (ret_type && !code_generator_type_is_aggregate(ret_type) &&
+          code_generator_binary_resolved_type_float_bits(ret_type) == 0) {
+        int rw = code_generator_binary_resolved_type_scalar_size(ret_type);
+        int rsigned =
+            code_generator_binary_resolved_type_is_signed_integer(ret_type);
+        int ok = 1;
+        if (rw == 4) {
+          ok = rsigned ? binary_emit_movsxd_reg_reg32(&context->code,
+                                                      BINARY_GP_RAX,
+                                                      BINARY_GP_RAX)
+                       : binary_emit_movzx_reg_reg32(&context->code,
+                                                     BINARY_GP_RAX,
+                                                     BINARY_GP_RAX);
+        } else if (rw == 2) {
+          ok = rsigned ? binary_emit_movsx_reg_reg16(&context->code,
+                                                     BINARY_GP_RAX,
+                                                     BINARY_GP_RAX)
+                       : binary_emit_movzx_reg_reg16(&context->code,
+                                                     BINARY_GP_RAX,
+                                                     BINARY_GP_RAX);
+        } else if (rw == 1) {
+          ok = rsigned ? binary_emit_movsx_reg_reg8(&context->code,
+                                                    BINARY_GP_RAX,
+                                                    BINARY_GP_RAX)
+                       : binary_emit_movzx_reg_reg8(&context->code,
+                                                    BINARY_GP_RAX,
+                                                    BINARY_GP_RAX);
+        }
+        if (!ok) {
+          return 0;
+        }
+      }
     }
     /* Convert the returned value to the function's float return precision
      * (instruction->float_bits set by ir_lowering) so the epilogue's
@@ -5478,6 +5586,7 @@ int code_generator_binary_emit_instruction(
     return code_generator_binary_emit_simd_i2f_reduce_f64(generator, context,
                                                           instruction);
   case IR_OP_SIMD_VLOOP_F64:
+  case IR_OP_SIMD_VLOOP_I32:
     return code_generator_binary_emit_simd_vloop_f64(generator, context,
                                                      instruction);
   case IR_OP_SIMD_OUTER_LANE_F64:

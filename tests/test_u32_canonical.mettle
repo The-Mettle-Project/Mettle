@@ -1,0 +1,91 @@
+// uint32 canonical-home semantics: unsigned sub-64-bit arithmetic wraps mod
+// 2^width when stored into a typed home (local, param, global, return), and
+// the home (stack slot OR promoted register) always holds the zero-extended
+// canonical value. Pins the fix for the debug/release divergence where a
+// register-promoted uint32 accumulator kept 64-bit garbage above bit 31
+// (scalar paths disagreed with SIMD lanes and with C semantics), and the
+// encoder bug where the canonicalizing `mov r32, r32` was silently skipped
+// when dst == src (uint32 returns/casts/params lost their zero-extension).
+// Expected values precomputed with C (uint32_t semantics).
+// Exit code: bitmask of failed checks (0 = all pass). Run in BOTH debug and
+// release: the two modes must agree with each other and with C.
+
+extern function exit2(code: int32) -> int32 = "exit";
+
+var G: uint32 = 0;
+
+// Reversed accumulator (no vectorizer claims it): per-iteration products
+// exceed 2^32; the uint32 home must wrap them mod 2^32.
+function uA(a: uint32*, n: int32) -> uint32 {
+  var s: uint32 = 0;
+  var i: int32 = n - 1;
+  while (i >= 0) { s = s + (a[i] ^ 5) * 3; i = i - 1; }
+  return s;
+}
+
+// Forward accumulator (vectorizable): release SIMD lanes truncate per-lane;
+// the debug scalar path must produce the identical wrapped value.
+function uF(a: uint32*, n: int32) -> uint32 {
+  var s: uint32 = 0;
+  var i: int32 = 0;
+  while (i < n) { s = s + (a[i] ^ 5) * 3; i = i + 1; }
+  return s;
+}
+
+// Non-homomorphic op (divide) on a wrapped local: t must be canonical BEFORE
+// the divide, not just at the return.
+function uDiv(x: uint32) -> uint32 {
+  var t: uint32 = x + 9;
+  var q: uint32 = t / 7;
+  return q;
+}
+
+// Right shift is width-sensitive too.
+function uShr(x: uint32) -> uint32 {
+  var t: uint32 = x + 9;
+  var q: uint32 = t >> 1;
+  return q;
+}
+
+// Register-cached uint32 GLOBAL accumulator (leaf-function global promotion).
+function gAcc(n: int32) -> uint32 {
+  var i: int32 = 0;
+  while (i < n) { G = G + 2654435761; i = i + 1; }
+  return G;
+}
+
+// Explicit narrowing cast then divide: the cast must zero-extend even when
+// the value is already in the destination register (dst == src encoding).
+function castChain(x: int64) -> uint32 {
+  var u: uint32 = (uint32)x;
+  return u / 3;
+}
+
+// uint16 accumulator: sub-4-byte unsigned homes wrap mod 2^16.
+function u16A(a: uint32*, n: int32) -> uint16 {
+  var s: uint16 = 0;
+  var i: int32 = n - 1;
+  while (i >= 0) { s = s + (a[i] ^ 5); i = i - 1; }
+  return s;
+}
+
+function main() -> int32 {
+  var n: int32 = 1003;
+  var ua: uint32[1003];
+  var i: int32 = 0;
+  while (i < n) { ua[i] = (uint32)(i * 2654435761); i = i + 1; }
+
+  var fail: int32 = 0;
+  if (uA(&ua[0], n) != (uint32)3424651852) { fail = fail | 1; }
+  if (uF(&ua[0], n) != (uint32)3424651852) { fail = fail | 2; }
+  if (uDiv((uint32)4294967295) != (uint32)1) { fail = fail | 4; }
+  if (uShr((uint32)4294967295) != (uint32)4) { fail = fail | 8; }
+  if (gAcc(1000) != (uint32)145972072) { fail = fail | 16; }
+  if (castChain(4294967299) != (uint32)1) { fail = fail | 32; }
+  if ((int32)u16A(&ua[0], n) != 22724) { fail = fail | 64; }
+  // (int64) of a uint32 return must be the zero-extended canonical value.
+  if ((int64)uA(&ua[0], n) != 3424651852) { fail = fail | 128; }
+
+  exit2(fail);
+  return 0;
+}

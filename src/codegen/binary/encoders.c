@@ -93,7 +93,20 @@ int binary_emit_mov_reg_reg32(BinaryCodeBuffer *buffer,
   if (destination == source) {
     return 1;
   }
+  return binary_emit_movzx_reg_reg32(buffer, destination, source);
+}
 
+/* 32-bit reg-reg mov that ALWAYS emits, even for destination == source.
+ * `mov r32, r32` zero-extends into the upper half, so the same-register form
+ * is the canonical uint32 zero-extension — callers relying on that zeroing
+ * must use this, not binary_emit_mov_reg_reg32 (whose same-register no-op
+ * would silently skip it). */
+int binary_emit_movzx_reg_reg32(BinaryCodeBuffer *buffer,
+                                BinaryGpRegister destination,
+                                BinaryGpRegister source) {
+  if (!buffer) {
+    return 0;
+  }
   if (!binary_emit_rex(buffer, 0, source >> 3, 0, destination >> 3) ||
       !binary_code_buffer_append_u8(buffer, 0x89) ||
       !binary_code_buffer_append_u8(

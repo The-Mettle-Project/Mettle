@@ -1044,6 +1044,47 @@ int wcs_avx_vmovd_xmm_reg(BinaryCodeBuffer *b, int xmm, int gpr) {
              b, (unsigned char)(0xC0 | ((xmm & 7) << 3) | (gpr & 7)));
 }
 
+/* vmovd xmm, m32 — VEX.128.66.0F.W0 6E /r (memory form). Loads exactly 4 bytes
+ * (no over-read past an array end) and zeroes bits 32..255, which the int
+ * vloop kernel's scalar tail relies on: every tail value carries zeros in
+ * lanes 1..7 so full-width integer ops stay exact in lane 0. */
+int wcs_avx_vmovd_xmm_mem(BinaryCodeBuffer *b, int dst, int base, int disp) {
+  return wcs_vex3(b, 1, 1, 0, 0, dst, base, 0) &&
+         binary_code_buffer_append_u8(b, 0x6E) &&
+         wcs_avx_modrm_mem_disp(b, dst, base, disp);
+}
+
+/* vmovd m32, xmm — VEX.128.66.0F.W0 7E /r. Stores the low 4 bytes. */
+int wcs_avx_vmovd_mem_xmm(BinaryCodeBuffer *b, int base, int disp, int src) {
+  return wcs_vex3(b, 1, 1, 0, 0, src, base, 0) &&
+         binary_code_buffer_append_u8(b, 0x7E) &&
+         wcs_avx_modrm_mem_disp(b, src, base, disp);
+}
+
+/* vpsubd ymm_dst, ymm_src1, ymm_src2 — VEX.256.66.0F.WIG FA /r. */
+int wcs_avx_vpsubd_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
+  return wcs_vex3(b, 1, 1, 1, 0, dst, s2, s1) &&
+         binary_code_buffer_append_u8(b, 0xFA) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (s2 & 7)));
+}
+
+/* vpand ymm_dst, ymm_src1, ymm_src2 — VEX.256.66.0F.WIG DB /r. */
+int wcs_avx_vpand_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
+  return wcs_vex3(b, 1, 1, 1, 0, dst, s2, s1) &&
+         binary_code_buffer_append_u8(b, 0xDB) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (s2 & 7)));
+}
+
+/* vpor ymm_dst, ymm_src1, ymm_src2 — VEX.256.66.0F.WIG EB /r. */
+int wcs_avx_vpor_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
+  return wcs_vex3(b, 1, 1, 1, 0, dst, s2, s1) &&
+         binary_code_buffer_append_u8(b, 0xEB) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (s2 & 7)));
+}
+
 /* Broadcast a 32-bit GPR value across all eight lanes of a ymm register. */
 int wcs_broadcast_i32_to_ymm(BinaryCodeBuffer *b, int ymm, int gpr) {
   return wcs_avx_vmovd_xmm_reg(b, ymm, gpr) &&

@@ -748,6 +748,7 @@ const char *ir_opcode_name(IROpcode op) {
   case IR_OP_SIMD_EXP_F32: return "simd_exp_f32";
   case IR_OP_SIMD_I2F_REDUCE_F64: return "simd_i2f_reduce_f64";
   case IR_OP_SIMD_VLOOP_F64: return "simd_vloop_f64";
+  case IR_OP_SIMD_VLOOP_I32: return "simd_vloop_i32";
   case IR_OP_SIMD_OUTER_LANE_F64: return "simd_outer_lane_f64";
   default:
     return "unknown";
@@ -1075,7 +1076,8 @@ static int ir_format_instruction_line(const IRInstruction *instruction,
                            : 0);
     break;
   }
-  case IR_OP_SIMD_VLOOP_F64: {
+  case IR_OP_SIMD_VLOOP_F64:
+  case IR_OP_SIMD_VLOOP_I32: {
     long long reduce_op = (instruction->argument_count > 0 &&
                            instruction->arguments[0].kind == IR_OPERAND_INT)
                               ? instruction->arguments[0].int_value

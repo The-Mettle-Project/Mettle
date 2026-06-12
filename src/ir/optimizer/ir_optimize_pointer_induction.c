@@ -196,12 +196,25 @@ int ir_ptr_induction_iv_start_value(const IRFunction *function,
     }
   }
 
-  for (size_t i = 0; i < header_index; i++) {
-    const IRInstruction *ins = &function->instructions[i];
-    if (ins->op == IR_OP_ASSIGN &&
-        ir_operand_is_symbol_named(&ins->dest, iv_symbol) &&
-        ins->lhs.kind == IR_OPERAND_INT) {
-      *out_start = ins->lhs.int_value;
+  /* Fallback when straight-line scanning hit a label: the init is only
+   * trustworthy if it is the iv's ONLY write before the header. With several
+   * writes (an if/else init, a previous loop's increment) the first constant
+   * assign found says nothing about the value actually entering the loop. */
+  {
+    const IRInstruction *init = NULL;
+    for (size_t i = 0; i < header_index; i++) {
+      const IRInstruction *ins = &function->instructions[i];
+      if (!ir_instruction_writes_destination(ins) ||
+          !ir_operand_is_symbol_named(&ins->dest, iv_symbol)) {
+        continue;
+      }
+      if (init || ins->op != IR_OP_ASSIGN || ins->lhs.kind != IR_OPERAND_INT) {
+        return 0;
+      }
+      init = ins;
+    }
+    if (init) {
+      *out_start = init->lhs.int_value;
       return 1;
     }
   }
@@ -447,6 +460,16 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
     if (loop_has_reduction && !loop_has_store) {
       return 1;
     }
+  }
+
+  /* Likewise leave unit-stride int32 MAPS that the general int vectorizer
+   * claims (it needs the indexed `iv << 2` form; walking the pointers here
+   * would hide the shape and leave the loop scalar). Probed with the real
+   * matcher so this decline tracks the vectorizer's gates exactly; loops it
+   * refuses (division, casts to narrow ints, over-budget DAGs, ...) still
+   * get the pointer walk. */
+  if (ir_auto_vectorize_int_claimable(function, header_index)) {
+    return 1;
   }
 
   /* Set when an iv-indexed access cannot be converted to a pointer-walk (its

@@ -59,14 +59,15 @@ function sum_shorts_narrow(a: int16*, n: int32) -> int32 {
 
 // A driver loop: each iteration calls a function that CONTAINS a loop the
 // inliner structurally declines (`while` + multiply), and that loop stays
-// scalar (runtime-scalar broadcast has no kernel). The old report suggested
-// "mark it @inline" here; the simulation now runs the inliner with the
-// pretend flag, sees it refuse, and WITHDRAWS the advice instead of printing
-// a one-click fix that cannot work.
+// scalar (the reversed `w` index defeats the unit-stride recognizers; the
+// general vectorizer now handles the plain `w[i]` form via runtime-scalar
+// broadcast). The old report suggested "mark it @inline" here; the
+// simulation now runs the inliner with the pretend flag, sees it refuse, and
+// WITHDRAWS the advice instead of printing a one-click fix that cannot work.
 function row_scale(x: float32*, w: float32*, y: float32*, n: int32, r: float32) {
     var i: int32 = 0;
     while (i < n) {
-        y[i] = x[i] * r * w[i];
+        y[i] = x[i] * r * w[(n - 1) - i];
         i = i + 1;
     }
 }

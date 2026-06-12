@@ -74,6 +74,7 @@ static const IROptNamedPass g_ir_post_fixpoint_passes[] = {
     {"simd_dot_float", ir_simd_dot_float_pass},
     {"simd_sum_float", ir_simd_sum_float_pass},
     {"auto_vectorize", ir_auto_vectorize_pass},
+    {"auto_vectorize_int", ir_auto_vectorize_int_pass},
     {"outer_vectorize", ir_outer_vectorize_pass},
     {"simd_memory_map", ir_simd_memory_map_pass},
     {"lower_bound_i32", ir_lower_bound_i32_pass},
@@ -163,6 +164,9 @@ static const IROptScheduledPass g_ir_fixpoint_passes[] = {
     IR_OPT_PASS_WHEN_ALL(REMOVE_UNUSED_LABELS, ir_remove_unused_labels_pass,
                          IR_OPT_FEATURE_LABEL),
     IR_OPT_PASS_ALWAYS(MEMCPY_INLINE, ir_memcpy_inline_pass),
+    IR_OPT_PASS_WHEN_ALL(MEMCMP_BYTE_LOOP, ir_memcmp_byte_loop_pass,
+                         IR_OPT_LABEL_JUMP | IR_OPT_FEATURE_BRANCH_ZERO |
+                             IR_OPT_FEATURE_LOAD),
     IR_OPT_PASS_ALWAYS(ELIMINATE_LOAD_SYMBOL_COPY,
                        ir_eliminate_load_symbol_copy_pass),
     IR_OPT_PASS_WHEN_ALL(SIMD_SUM_I32, ir_simd_sum_i32_pass,

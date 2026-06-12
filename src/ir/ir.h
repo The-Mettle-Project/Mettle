@@ -187,21 +187,35 @@ typedef enum {
    * instruction->float_bits (64 = f64x4 lanes / 8-byte elements, 32 = f32x8
    * lanes / 4-byte elements); both stride 32 bytes per vector iteration. The
    * body DAG is serialized into arguments[]:
-   *   header (6 INT): [0] reduce_op (0 = element-wise map, 1 = '+' reduction)
+   *   header (7 INT): [0] reduce_op (0 = element-wise map, 1 = '+' reduction)
    *                   [1] n_arrays  [2] n_nodes  [3] root_node
-   *                   [4] n_consts  [5] max_live (peak simultaneous live ymm)
+   *                   [4] n_consts  [5] n_scalars
+   *                   [6] max_live (peak simultaneous live ymm)
    *   then n_arrays SYMBOL array-base operands (index k),
+   *   then n_scalars SYMBOL loop-invariant scalar operands (read once at loop
+   *   entry and broadcast -- a runtime coefficient like saxpy's `a`),
    *   then n_nodes nodes, each 3 INT operands (tag, op0, op1):
    *       tag 0=LOAD(op0=array idx) 1=IOTA 2=CONST(op0=const idx)
-   *           3=ADD 4=SUB 5=MUL 6=DIV (op0,op1 = earlier node indices),
+   *           3=ADD 4=SUB 5=MUL 6=DIV (op0,op1 = earlier node indices)
+   *           7=SCALAR(op0=scalar idx)
+   *           8=AND 9=OR 10=XOR (int lanes only; op0,op1 = node indices)
+   *           11=SHL (int lanes only; op0 = node index, op1 = literal count),
    *   then n_consts FLOAT64 operands (the kernel narrows them to f32 when
-   *   float_bits==32).
+   *   float_bits==32). The int form serializes consts as INT operands instead.
    * dest = reduction accumulator symbol (reduce_op==1) or stored array base
    * (reduce_op==0); lhs = trip count (SYMBOL or INT). Direct-object backend
    * only. The kernel replays the DAG over the packed lanes with stack-hoisted
    * constants + a scalar remainder; element-wise maps are bit-identical to the
    * scalar loop, '+' reductions reassociate like the sum/dot kernels. */
   IR_OP_SIMD_VLOOP_F64,
+  /* Integer twin of IR_OP_SIMD_VLOOP_F64: int32/uint32 lanes (i32x8, 4-byte
+   * elements, 32 bytes per vector iteration), same arguments[] serialization.
+   * Body ops are + - * & | ^ and << by a literal count -- every one congruent
+   * mod 2^32 -- so maps AND '+' reductions are BIT-EXACT against the scalar
+   * loop (integer wraparound is associative; no float reassociation caveat).
+   * Division, %, and >> are never emitted (not congruent / trapping). Emitted
+   * by ir_auto_vectorize_int_pass. Direct-object backend only. */
+  IR_OP_SIMD_VLOOP_I32,
   /* Outer-loop lane vectorization of a reduction over an outer-IV-INVARIANT
    * inner counted loop carrying one float64 accumulator (a serial recurrence,
    * e.g. a divide chain). The outer loop `while(p<P){ inner; total += iacc; p++ }`

@@ -601,16 +601,24 @@ int code_generator_binary_emit_simd_affine_map_f32(
   return wcs_patch_here(b, j_done) && wcs_avx_vzeroupper(b);
 }
 
-/* General auto-vectorized loop kernel (IR_OP_SIMD_VLOOP_F64). Decodes the
- * serialized float body DAG (see the opcode doc in ir.h) and emits a packed
- * AVX2 loop + scalar remainder. A2: element-wise maps out[i] = DAG(a_k[i],
- * (float)i, consts) and '+' reductions. The element width is carried in
- * instruction->float_bits: 64 replays over f64x4 lanes (pd ops, 8B elements),
- * 32 over f32x8 lanes (ps ops, 4B elements) — both walk array bases by 32B per
+/* General auto-vectorized loop kernel (IR_OP_SIMD_VLOOP_F64 and its integer
+ * twin IR_OP_SIMD_VLOOP_I32). Decodes the serialized body DAG (see the opcode
+ * doc in ir.h) and emits a packed AVX2 loop + scalar remainder for element-wise
+ * maps out[i] = DAG(a_k[i], i, consts, scalars) and '+' reductions. The element
+ * kind comes from the opcode + instruction->float_bits: f64x4 lanes (pd ops,
+ * 8B elements), f32x8 lanes (ps ops, 4B), or i32x8 lanes (vpaddd/vpsubd/
+ * vpmulld/vpand/vpor/vpxor/vpslld, 4B) — all walk array bases by 32B per
  * vector iteration. The DAG is replayed via a stack-machine of up to
- * VLOOP_KERNEL_REGS ymm registers; constants are broadcast once to a stack
- * array and re-read. Maps are bit-identical to the scalar loop (each lane is an
- * independent IEEE op); '+' reductions reassociate like the sum/dot kernels. */
+ * VLOOP_KERNEL_REGS ymm registers; constants AND runtime invariant scalars are
+ * broadcast once to a stack array and re-read. Float maps are bit-identical to
+ * the scalar loop (each lane is an independent IEEE op); float '+' reductions
+ * reassociate like the sum/dot kernels. Integer maps and reductions are
+ * bit-exact (every op congruent mod 2^32, '+' associative).
+ *
+ * The integer scalar tail reuses the full-width ymm ALU ops on a zero-upper
+ * invariant: every tail leaf loads via VEX vmovd (zeroes bits 32..255), and
+ * all supported int ops preserve zero lanes, so lane 0 is exact and lanes 1..7
+ * stay zero with no transition penalty and no extra 128-bit encoders. */
 #define VLOOP_K_LOAD 0
 #define VLOOP_K_IOTA 1
 #define VLOOP_K_CONST 2
@@ -618,9 +626,19 @@ int code_generator_binary_emit_simd_affine_map_f32(
 #define VLOOP_K_SUB 4
 #define VLOOP_K_MUL 5
 #define VLOOP_K_DIV 6
+#define VLOOP_K_SCALAR 7
+#define VLOOP_K_AND 8
+#define VLOOP_K_OR 9
+#define VLOOP_K_XOR 10
+#define VLOOP_K_SHL 11
 #define VLOOP_KERNEL_REGS 4
 #define VLOOP_KERNEL_MAX_NODES 48
 #define VLOOP_KERNEL_MAX_BASES 4
+
+static int vloop_kernel_tag_is_leaf(int tag) {
+  return tag == VLOOP_K_LOAD || tag == VLOOP_K_IOTA || tag == VLOOP_K_CONST ||
+         tag == VLOOP_K_SCALAR;
+}
 
 int code_generator_binary_emit_simd_vloop_f64(
     CodeGenerator *generator, BinaryFunctionContext *context,
@@ -635,19 +653,22 @@ int code_generator_binary_emit_simd_vloop_f64(
       BINARY_GP_RCX, BINARY_GP_RDX, BINARY_GP_R8, BINARY_GP_R9};
   const int IOTA_CONST = 5;
 
-  if (!generator || !context || !instruction || instruction->argument_count < 6 ||
+  if (!generator || !context || !instruction || instruction->argument_count < 7 ||
       !instruction->arguments || instruction->dest.kind != IR_OPERAND_SYMBOL) {
-    code_generator_set_error(generator, "Malformed simd_vloop_f64");
+    code_generator_set_error(generator, "Malformed simd_vloop");
     return 0;
   }
-  if (instruction->float_bits != 32 && instruction->float_bits != 64) {
+  const int i32 = (instruction->op == IR_OP_SIMD_VLOOP_I32);
+  if (!i32 && instruction->float_bits != 32 && instruction->float_bits != 64) {
     code_generator_set_error(generator, "simd_vloop bad float width");
     return 0;
   }
   b = &context->code;
-  /* f32 = single precision: f32x8 lanes (ps ops, 4-byte elements); otherwise
-   * f64x4 (pd ops, 8-byte elements). Both stride 32 bytes per vector iter. */
-  const int f32 = (instruction->float_bits == 32);
+  /* f32 = single precision: f32x8 lanes (ps ops, 4-byte elements); f64x4 (pd
+   * ops, 8-byte elements) otherwise. Int lanes are i32x8. All three stride 32
+   * bytes per vector iter, and i32 shares the f32 4-byte layout everywhere a
+   * raw 32-bit pattern is moved (loads, stores, broadcast slots). */
+  const int f32 = i32 || (instruction->float_bits == 32);
   const int lanes = f32 ? 8 : 4;
   const int elem_bytes = f32 ? 4 : 8;
 
@@ -657,21 +678,26 @@ int code_generator_binary_emit_simd_vloop_f64(
   int n_nodes = (int)args[2].int_value;
   int root = (int)args[3].int_value;
   int n_consts = (int)args[4].int_value;
-  int depth = (int)args[5].int_value;
+  int n_scalars = (int)args[5].int_value;
+  int depth = (int)args[6].int_value;
   int is_reduce = (reduce_op == 1);
   const int *kPool = is_reduce ? kPoolReduce : kPoolMap;
   int pool_n = is_reduce ? 3 : 4;
-  size_t expect = (size_t)(6 + n_arrays + 3 * n_nodes + n_consts);
+  size_t expect =
+      (size_t)(7 + n_arrays + n_scalars + 3 * n_nodes + n_consts);
   if ((reduce_op != 0 && reduce_op != 1) || n_arrays < 0 ||
       n_arrays > VLOOP_KERNEL_MAX_BASES || n_nodes <= 0 ||
-      n_nodes > VLOOP_KERNEL_MAX_NODES || n_consts < 0 || depth > pool_n ||
-      root < 0 || root >= n_nodes || instruction->argument_count != expect) {
-    code_generator_set_error(generator, "Bad simd_vloop_f64 encoding");
+      n_nodes > VLOOP_KERNEL_MAX_NODES || n_consts < 0 || n_scalars < 0 ||
+      depth > pool_n || root < 0 || root >= n_nodes ||
+      instruction->argument_count != expect) {
+    code_generator_set_error(generator, "Bad simd_vloop encoding");
     return 0;
   }
 
-  size_t nodes_off = (size_t)(6 + n_arrays);
+  size_t scalars_off = (size_t)(7 + n_arrays);
+  size_t nodes_off = scalars_off + (size_t)n_scalars;
   size_t consts_off = nodes_off + (size_t)(3 * n_nodes);
+  int n_slots = n_consts + n_scalars; /* 32-byte broadcast slots on the stack */
 
   /* Assign a GP walking-pointer register to each distinct base symbol (the
    * destination plus each loaded array not equal to it). arr_reg[k] = the GP
@@ -695,7 +721,7 @@ int code_generator_binary_emit_simd_vloop_f64(
     }
   }
   for (int k = 0; k < n_arrays; k++) {
-    const IROperand *as = &args[nodes_off - n_arrays + k]; /* array base k */
+    const IROperand *as = &args[7 + k]; /* array base k */
     const char *nm = as->name;
     int found = -1;
     for (int j = 0; j < n_dist; j++) {
@@ -720,8 +746,8 @@ int code_generator_binary_emit_simd_vloop_f64(
   int dst_reg = kGp[0];
   /* r10 = element count (decrements), r11 = i (only if IOTA). rax = scratch. */
 
-  /* Stack scratch for broadcast constants: 32 bytes each. */
-  uint32_t cbytes = (uint32_t)(32 * n_consts);
+  /* Stack scratch for broadcast constants and scalars: 32 bytes each. */
+  uint32_t cbytes = (uint32_t)(32 * n_slots);
   if (cbytes && !binary_emit_sub_rsp_imm32(b, cbytes)) {
     return 0;
   }
@@ -742,24 +768,49 @@ int code_generator_binary_emit_simd_vloop_f64(
     return 0;
   }
 
-  /* Broadcast each constant once into its stack slot. For f32 the value is
-   * packed into both halves of a 64-bit word so the shared vbroadcastsd path
-   * yields 8 identical f32 lanes; the scalar tail's movss reads the low 4. */
+  /* Broadcast each constant once into its stack slot. For f32/i32 the 32-bit
+   * pattern is packed into both halves of a 64-bit word so the shared
+   * vbroadcastsd path yields 8 identical lanes; the scalar tail reads the low
+   * 4 bytes. */
   for (int c = 0; c < n_consts; c++) {
-    double dv = args[consts_off + c].float_value;
     uint64_t bits = 0;
-    if (f32) {
-      float fv = (float)dv;
+    if (i32) {
+      uint32_t iv = (uint32_t)(uint64_t)args[consts_off + c].int_value;
+      bits = (uint64_t)iv | ((uint64_t)iv << 32);
+    } else if (f32) {
+      float fv = (float)args[consts_off + c].float_value;
       uint32_t fb = 0;
       memcpy(&fb, &fv, sizeof(fb));
       bits = (uint64_t)fb | ((uint64_t)fb << 32);
     } else {
+      double dv = args[consts_off + c].float_value;
       memcpy(&bits, &dv, sizeof(bits));
     }
     if (!binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, bits) ||
         !binary_emit_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) ||
         !wcs_avx_vbroadcastsd_ymm_xmm(b, 0, 0) ||
         !wcs_avx_vmovups_mem_ymm(b, BINARY_GP_RSP, 32 * c, 0)) {
+      return 0;
+    }
+  }
+  /* Broadcast each runtime invariant scalar once into its slot (after the
+   * literal consts). The recognizer proved the symbol loop-invariant, so one
+   * read at entry is identical to the scalar loop's per-iteration reads. */
+  for (int s = 0; s < n_scalars; s++) {
+    if (!code_generator_binary_emit_operand_load(generator, context,
+                                                 &args[scalars_off + s],
+                                                 BINARY_GP_RAX)) {
+      return 0;
+    }
+    if (f32) { /* 32-bit lanes (f32 or i32): bits live in RAX's low dword */
+      if (!wcs_broadcast_i32_to_ymm(b, 0, BINARY_GP_RAX)) {
+        return 0;
+      }
+    } else if (!binary_emit_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) ||
+               !wcs_avx_vbroadcastsd_ymm_xmm(b, 0, 0)) {
+      return 0;
+    }
+    if (!wcs_avx_vmovups_mem_ymm(b, BINARY_GP_RSP, 32 * (n_consts + s), 0)) {
       return 0;
     }
   }
@@ -795,15 +846,22 @@ int code_generator_binary_emit_simd_vloop_f64(
     }
   }
 
-  /* Reduction: xmm3 = prior accumulator value, ymm2 = packed accumulator = 0.
-   * f32 keeps the prior value in the low dword (movd); f64 the low qword. */
+  /* Reduction: ymm2 = packed accumulator = 0. The floats also park the prior
+   * accumulator value in xmm3 now (low dword for f32, low qword for f64); the
+   * int form instead loads it into RAX at finalize, because
+   * wcs_accumulate_xmm0_i32_to_rax accumulates the lane sum INTO RAX (the
+   * sum_i32 convention). */
   if (is_reduce) {
-    if (!code_generator_binary_emit_operand_load(generator, context,
-                                                 &instruction->dest,
-                                                 BINARY_GP_RAX) ||
-        !(f32 ? binary_emit_movd_xmm_reg(b, BINARY_XMM3, BINARY_GP_RAX)
-              : binary_emit_movq_xmm_reg(b, BINARY_XMM3, BINARY_GP_RAX)) ||
-        !wcs_avx_vpxor_ymm(b, 2, 2, 2)) {
+    if (i32) {
+      if (!wcs_avx_vpxor_ymm(b, 2, 2, 2)) {
+        return 0;
+      }
+    } else if (!code_generator_binary_emit_operand_load(generator, context,
+                                                        &instruction->dest,
+                                                        BINARY_GP_RAX) ||
+               !(f32 ? binary_emit_movd_xmm_reg(b, BINARY_XMM3, BINARY_GP_RAX)
+                     : binary_emit_movq_xmm_reg(b, BINARY_XMM3, BINARY_GP_RAX)) ||
+               !wcs_avx_vpxor_ymm(b, 2, 2, 2)) {
       return 0;
     }
   }
@@ -827,7 +885,7 @@ int code_generator_binary_emit_simd_vloop_f64(
       int tag = (int)args[nodes_off + 3 * i].int_value;
       int op0 = (int)args[nodes_off + 3 * i + 1].int_value;
       int op1 = (int)args[nodes_off + 3 * i + 2].int_value;
-      if (tag <= VLOOP_K_CONST) {
+      if (vloop_kernel_tag_is_leaf(tag)) {
         if (nfree <= 0) {
           code_generator_set_error(generator, "vloop reg budget");
           return 0;
@@ -838,16 +896,29 @@ int code_generator_binary_emit_simd_vloop_f64(
           ok = wcs_avx_vmovups_ymm_mem(b, R, arr_reg[op0], 0);
         } else if (tag == VLOOP_K_CONST) {
           ok = wcs_avx_vmovups_ymm_mem(b, R, BINARY_GP_RSP, 32 * op0);
-        } else { /* IOTA: R = (float)[i, i+1, ...] over `lanes` lanes */
+        } else if (tag == VLOOP_K_SCALAR) {
+          ok = wcs_avx_vmovups_ymm_mem(b, R, BINARY_GP_RSP,
+                                       32 * (n_consts + op0));
+        } else { /* IOTA: R = [i, i+1, ...] over `lanes` lanes (cvt if float) */
           ok = wcs_broadcast_i32_to_ymm(b, R, BINARY_GP_R11) &&
                wcs_avx_vpaddd_ymm(b, R, R, IOTA_CONST) &&
-               (f32 ? wcs_avx_vcvtdq2ps_ymm(b, R, R)
-                    : wcs_avx_vcvtdq2pd_ymm_xmm(b, R, R));
+               (i32 ? 1
+                    : (f32 ? wcs_avx_vcvtdq2ps_ymm(b, R, R)
+                           : wcs_avx_vcvtdq2pd_ymm_xmm(b, R, R)));
         }
         if (!ok) {
           return 0;
         }
         vstk[nv++] = R;
+      } else if (tag == VLOOP_K_SHL) {
+        if (nv < 1 || !i32) {
+          code_generator_set_error(generator, "vloop shl");
+          return 0;
+        }
+        int ra = vstk[nv - 1]; /* unary: shift the stack top in place */
+        if (!wcs_avx_vpslld_ymm_imm(b, ra, ra, (unsigned char)op1)) {
+          return 0;
+        }
       } else {
         if (nv < 2) {
           code_generator_set_error(generator, "vloop stack");
@@ -858,20 +929,39 @@ int code_generator_binary_emit_simd_vloop_f64(
         int ok = 0;
         switch (tag) {
         case VLOOP_K_ADD:
-          ok = f32 ? wcs_avx_vaddps_ymm(b, ra, ra, rb)
-                   : wcs_avx_vaddpd_ymm(b, ra, ra, rb);
+          ok = i32 ? wcs_avx_vpaddd_ymm(b, ra, ra, rb)
+                   : (f32 ? wcs_avx_vaddps_ymm(b, ra, ra, rb)
+                          : wcs_avx_vaddpd_ymm(b, ra, ra, rb));
           break;
         case VLOOP_K_SUB:
-          ok = f32 ? wcs_avx_vsubps_ymm(b, ra, ra, rb)
-                   : wcs_avx_vsubpd_ymm(b, ra, ra, rb);
+          ok = i32 ? wcs_avx_vpsubd_ymm(b, ra, ra, rb)
+                   : (f32 ? wcs_avx_vsubps_ymm(b, ra, ra, rb)
+                          : wcs_avx_vsubpd_ymm(b, ra, ra, rb));
           break;
         case VLOOP_K_MUL:
-          ok = f32 ? wcs_avx_vmulps_ymm(b, ra, ra, rb)
-                   : wcs_avx_vmulpd_ymm(b, ra, ra, rb);
+          ok = i32 ? wcs_avx_vpmulld_ymm(b, ra, ra, rb)
+                   : (f32 ? wcs_avx_vmulps_ymm(b, ra, ra, rb)
+                          : wcs_avx_vmulpd_ymm(b, ra, ra, rb));
           break;
         case VLOOP_K_DIV:
+          if (i32) {
+            code_generator_set_error(generator, "vloop int div");
+            return 0;
+          }
           ok = f32 ? wcs_avx_vdivps_ymm(b, ra, ra, rb)
                    : wcs_avx_vdivpd_ymm(b, ra, ra, rb);
+          break;
+        case VLOOP_K_AND:
+        case VLOOP_K_OR:
+        case VLOOP_K_XOR:
+          if (!i32) {
+            code_generator_set_error(generator, "vloop float bitop");
+            return 0;
+          }
+          ok = tag == VLOOP_K_AND
+                   ? wcs_avx_vpand_ymm(b, ra, ra, rb)
+                   : (tag == VLOOP_K_OR ? wcs_avx_vpor_ymm(b, ra, ra, rb)
+                                        : wcs_avx_vpxor_ymm(b, ra, ra, rb));
           break;
         default: code_generator_set_error(generator, "vloop op"); return 0;
         }
@@ -881,7 +971,6 @@ int code_generator_binary_emit_simd_vloop_f64(
         pool[nfree++] = rb;
         vstk[nv++] = ra;
         (void)op0;
-        (void)op1;
       }
     }
     if (nv != 1) {
@@ -889,8 +978,9 @@ int code_generator_binary_emit_simd_vloop_f64(
       return 0;
     }
     if (is_reduce) {
-      if (!(f32 ? wcs_avx_vaddps_ymm(b, 2, 2, vstk[0]) /* acc += lanes */
-                : wcs_avx_vaddpd_ymm(b, 2, 2, vstk[0]))) {
+      if (!(i32 ? wcs_avx_vpaddd_ymm(b, 2, 2, vstk[0]) /* acc += lanes */
+                : (f32 ? wcs_avx_vaddps_ymm(b, 2, 2, vstk[0])
+                       : wcs_avx_vaddpd_ymm(b, 2, 2, vstk[0])))) {
         return 0;
       }
     } else if (!wcs_avx_vmovups_mem_ymm(b, dst_reg, 0, vstk[0])) {
@@ -935,25 +1025,56 @@ int code_generator_binary_emit_simd_vloop_f64(
     for (int i = 0; i < n_nodes; i++) {
       int tag = (int)args[nodes_off + 3 * i].int_value;
       int op0 = (int)args[nodes_off + 3 * i + 1].int_value;
-      if (tag <= VLOOP_K_CONST) {
+      int op1 = (int)args[nodes_off + 3 * i + 2].int_value;
+      if (vloop_kernel_tag_is_leaf(tag)) {
         int R = pool[--nfree];
         int ok = 0;
         if (tag == VLOOP_K_LOAD) {
-          ok = f32 ? wcs_movss_xmm_mem(b, R, arr_reg[op0], 0)
-                   : wcs_movsd_xmm_mem(b, R, arr_reg[op0], 0);
-        } else if (tag == VLOOP_K_CONST) {
-          ok = f32 ? wcs_movss_xmm_mem(b, R, BINARY_GP_RSP, 32 * op0)
-                   : wcs_movsd_xmm_mem(b, R, BINARY_GP_RSP, 32 * op0);
-        } else { /* IOTA scalar: (float)i */
-          ok = f32 ? binary_emit_cvtsi2ss_xmm_reg(b, (BinaryXmmRegister)R,
-                                                  BINARY_GP_R11)
-                   : binary_emit_cvtsi2sd_xmm_reg(b, (BinaryXmmRegister)R,
-                                                  BINARY_GP_R11);
+          ok = i32 ? wcs_avx_vmovd_xmm_mem(b, R, arr_reg[op0], 0)
+                   : (f32 ? wcs_movss_xmm_mem(b, R, arr_reg[op0], 0)
+                          : wcs_movsd_xmm_mem(b, R, arr_reg[op0], 0));
+        } else if (tag == VLOOP_K_CONST || tag == VLOOP_K_SCALAR) {
+          int disp = 32 * (tag == VLOOP_K_CONST ? op0 : n_consts + op0);
+          ok = i32 ? wcs_avx_vmovd_xmm_mem(b, R, BINARY_GP_RSP, disp)
+                   : (f32 ? wcs_movss_xmm_mem(b, R, BINARY_GP_RSP, disp)
+                          : wcs_movsd_xmm_mem(b, R, BINARY_GP_RSP, disp));
+        } else { /* IOTA scalar: i (cvt to float for the float kinds) */
+          ok = i32 ? wcs_avx_vmovd_xmm_reg(b, R, BINARY_GP_R11)
+                   : (f32 ? binary_emit_cvtsi2ss_xmm_reg(b, (BinaryXmmRegister)R,
+                                                         BINARY_GP_R11)
+                          : binary_emit_cvtsi2sd_xmm_reg(b, (BinaryXmmRegister)R,
+                                                         BINARY_GP_R11));
         }
         if (!ok) {
           return 0;
         }
         vstk[nv++] = R;
+      } else if (tag == VLOOP_K_SHL) {
+        int ra = vstk[nv - 1]; /* unary, in place; int lanes only */
+        if (!i32 || !wcs_avx_vpslld_ymm_imm(b, ra, ra, (unsigned char)op1)) {
+          return 0;
+        }
+      } else if (i32) {
+        /* Integer tail ALU: full-width VEX ops on zero-upper values (every
+         * leaf above loaded via VEX vmovd, and + - * & | ^ << all map zero
+         * lanes to zero), so lane 0 is the exact scalar result. */
+        int rb = vstk[--nv];
+        int ra = vstk[--nv];
+        int ok = 0;
+        switch (tag) {
+        case VLOOP_K_ADD: ok = wcs_avx_vpaddd_ymm(b, ra, ra, rb); break;
+        case VLOOP_K_SUB: ok = wcs_avx_vpsubd_ymm(b, ra, ra, rb); break;
+        case VLOOP_K_MUL: ok = wcs_avx_vpmulld_ymm(b, ra, ra, rb); break;
+        case VLOOP_K_AND: ok = wcs_avx_vpand_ymm(b, ra, ra, rb); break;
+        case VLOOP_K_OR: ok = wcs_avx_vpor_ymm(b, ra, ra, rb); break;
+        case VLOOP_K_XOR: ok = wcs_avx_vpxor_ymm(b, ra, ra, rb); break;
+        default: return 0;
+        }
+        if (!ok) {
+          return 0;
+        }
+        pool[nfree++] = rb;
+        vstk[nv++] = ra;
       } else {
         int rb = vstk[--nv];
         int ra = vstk[--nv];
@@ -987,14 +1108,20 @@ int code_generator_binary_emit_simd_vloop_f64(
       }
     }
     if (is_reduce) {
-      if (!(f32 ? binary_emit_addss_xmm_xmm(b, BINARY_XMM3,
-                                            (BinaryXmmRegister)vstk[0])
-                : binary_emit_addsd_xmm_xmm(b, BINARY_XMM3,
-                                            (BinaryXmmRegister)vstk[0]))) {
+      if (i32) {
+        /* lane 0 carries the addend, lanes 1..7 zeros: fold into ymm2. */
+        if (!wcs_avx_vpaddd_ymm(b, 2, 2, vstk[0])) {
+          return 0;
+        }
+      } else if (!(f32 ? binary_emit_addss_xmm_xmm(b, BINARY_XMM3,
+                                                   (BinaryXmmRegister)vstk[0])
+                       : binary_emit_addsd_xmm_xmm(b, BINARY_XMM3,
+                                                   (BinaryXmmRegister)vstk[0]))) {
         return 0;
       }
-    } else if (!(f32 ? wcs_movss_mem_xmm(b, dst_reg, 0, vstk[0])
-                     : wcs_movsd_mem_xmm(b, dst_reg, 0, vstk[0]))) {
+    } else if (!(i32 ? wcs_avx_vmovd_mem_xmm(b, dst_reg, 0, vstk[0])
+                     : (f32 ? wcs_movss_mem_xmm(b, dst_reg, 0, vstk[0])
+                            : wcs_movsd_mem_xmm(b, dst_reg, 0, vstk[0])))) {
       return 0;
     }
   }
@@ -1020,11 +1147,29 @@ int code_generator_binary_emit_simd_vloop_f64(
     return 0;
   }
   if (is_reduce) {
-    /* Fold ymm2 + xmm3 -> RAX (the float's bits) and store to the accumulator.
-     * wcs_reduce_p{d,s}_acc_to_rax does its own vextractf128 + vzeroupper, so it
-     * MUST run before any standalone vzeroupper (which would zero ymm2's upper
-     * lanes and drop accumulator lanes). */
-    if (!(f32 ? wcs_reduce_ps_acc_to_rax(b) : wcs_reduce_pd_acc_to_rax(b))) {
+    /* Fold the packed accumulator -> RAX and store to the accumulator symbol.
+     * The reduce helpers do their own vextract + vzeroupper, so they MUST run
+     * before any standalone vzeroupper (which would zero ymm2's upper lanes
+     * and drop accumulator lanes). i32 loads the prior accumulator value into
+     * RAX first: wcs_reduce_ymm_i32_sum_to_rax accumulates the lane sum INTO
+     * RAX (and clobbers R10, which the count loop is done with). */
+    if (i32 && !code_generator_binary_emit_operand_load(generator, context,
+                                                        &instruction->dest,
+                                                        BINARY_GP_RAX)) {
+      return 0;
+    }
+    if (!(i32 ? wcs_reduce_ymm_i32_sum_to_rax(b, 2)
+              : (f32 ? wcs_reduce_ps_acc_to_rax(b)
+                     : wcs_reduce_pd_acc_to_rax(b)))) {
+      return 0;
+    }
+    /* The 64-bit fold can carry bits past 32 (the helper sign-extends and
+     * adds); the accumulator's 8-byte home must hold a canonically-extended
+     * 32-bit value, matching its declared signedness. */
+    if (i32 &&
+        !(instruction->is_unsigned
+              ? wcs_mov_reg_reg32(b, BINARY_GP_RAX, BINARY_GP_RAX)
+              : binary_emit_movsxd_reg_reg32(b, BINARY_GP_RAX, BINARY_GP_RAX))) {
       return 0;
     }
     if (cbytes && !binary_emit_add_rsp_imm32(b, cbytes)) {

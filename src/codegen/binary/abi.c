@@ -416,6 +416,8 @@ int code_generator_binary_collect_symbol_aliases(
     const char *target = NULL;
     Symbol *symbol = NULL;
     Symbol *target_symbol = NULL;
+    Type *symbol_type = NULL;
+    Type *target_type = NULL;
 
     if (!instruction || instruction->op != IR_OP_ASSIGN ||
         instruction->dest.kind != IR_OPERAND_SYMBOL ||
@@ -451,10 +453,23 @@ int code_generator_binary_collect_symbol_aliases(
     target_symbol = generator->symbol_table
                         ? symbol_table_lookup(generator->symbol_table, target)
                         : NULL;
-    if ((symbol && symbol->type &&
-         !code_generator_binary_type_is_gp_promotable(symbol->type)) ||
-        (target_symbol && target_symbol->type &&
-         !code_generator_binary_type_is_gp_promotable(target_symbol->type)) ||
+    symbol_type = symbol && symbol->type
+                      ? symbol->type
+                      : code_generator_binary_get_operand_type_in_context(
+                            generator, context, &instruction->dest);
+    target_type = target_symbol && target_symbol->type
+                      ? target_symbol->type
+                      : code_generator_binary_get_operand_type_in_context(
+                            generator, context, &instruction->lhs);
+    if (!symbol_type || !target_type ||
+        !code_generator_binary_type_is_gp_promotable(symbol_type) ||
+        !code_generator_binary_type_is_gp_promotable(target_type) ||
+        code_generator_binary_resolved_type_scalar_size(symbol_type) !=
+            code_generator_binary_resolved_type_scalar_size(target_type) ||
+        code_generator_binary_resolved_type_float_bits(symbol_type) !=
+            code_generator_binary_resolved_type_float_bits(target_type) ||
+        code_generator_binary_resolved_type_is_signed_integer(symbol_type) !=
+            code_generator_binary_resolved_type_is_signed_integer(target_type) ||
         code_generator_binary_marked_symbol_float_bits(context, name) ||
         code_generator_binary_marked_symbol_float_bits(context, target) ||
         !code_generator_binary_symbol_is_scalar_accessible(generator, name) ||
@@ -1757,24 +1772,36 @@ int code_generator_binary_emit_reg_reg_move(
     BinaryGpRegister source, Type *type) {
   int width = 8;
   int is_signed = 0;
+  int is_integer = 0;
 
   if (!buffer) {
     return 0;
   }
-  if (destination == source) {
-    return 1;
-  }
-
   if (type) {
     width = code_generator_binary_resolved_type_scalar_size(type);
     is_signed = code_generator_binary_resolved_type_is_signed_integer(type);
+    is_integer = !code_generator_type_is_aggregate(type) &&
+                 code_generator_binary_resolved_type_float_bits(type) == 0;
   }
 
   if (width == 4) {
     if (is_signed) {
       return binary_emit_movsxd_reg_reg32(buffer, destination, source);
     }
-    return binary_emit_mov_reg_reg32(buffer, destination, source);
+    return binary_emit_movzx_reg_reg32(buffer, destination, source);
+  }
+  /* Sub-4-byte integers extend so the destination holds the canonical wrapped
+   * value for its signedness, matching stack homes and the MIR backend. */
+  if (is_integer && width == 2) {
+    return is_signed ? binary_emit_movsx_reg_reg16(buffer, destination, source)
+                     : binary_emit_movzx_reg_reg16(buffer, destination, source);
+  }
+  if (is_integer && width == 1) {
+    return is_signed ? binary_emit_movsx_reg_reg8(buffer, destination, source)
+                     : binary_emit_movzx_reg_reg8(buffer, destination, source);
+  }
+  if (destination == source) {
+    return 1;
   }
   return binary_emit_mov_reg_reg(buffer, destination, source);
 }
@@ -1877,7 +1904,7 @@ int code_generator_binary_emit_symbol_stack_load(
 }
 
 int code_generator_binary_emit_symbol_stack_store(
-    CodeGenerator *generator, BinaryFunctionContext *context, Symbol *symbol,
+    CodeGenerator *generator, BinaryFunctionContext *context, Type *type,
     int stack_offset, BinaryGpRegister source_register) {
   int size = 8;
 
@@ -1885,8 +1912,8 @@ int code_generator_binary_emit_symbol_stack_store(
     return 0;
   }
 
-  if (symbol && symbol->type) {
-    size = code_generator_binary_resolved_type_scalar_size(symbol->type);
+  if (type) {
+    size = code_generator_binary_resolved_type_scalar_size(type);
   }
 
   switch (size) {

@@ -1,0 +1,235 @@
+// Soundness coverage for the iv-start-zero guards: every per-shape SIMD
+// recognizer fuses a counted loop into a kernel that replays it as 0..bound,
+// so a loop starting at iv != 0 must NOT be claimed (or, for the kernels that
+// support an explicit start, must honor it). Each kernel below starts at a
+// nonzero index; before the guards these silently vectorized as 0..n in
+// --release (sum_i32 returned 100 instead of 97 on the original repro).
+// Results are checked at runtime against values a 0-start replay cannot
+// produce. Returns the number of failures (0 = all correct).
+
+extern function expf(x: float32) -> float32 = "expf";
+
+// sum_i32: the original confirmed repro shape.
+function partial_sum_i32(a: int32*, n: int32) -> int64 {
+  var s: int64 = 0;
+  var j: int32 = 3;
+  while (j < n) {
+    s = s + (int64)a[j];
+    j = j + 1;
+  }
+  return s;
+}
+
+// dot_i32: int64 accumulator, multiply-accumulate over two int32 arrays.
+function partial_dot_i32(a: int32*, b: int32*, n: int32) -> int64 {
+  var s: int64 = 0;
+  var j: int32 = 3;
+  while (j < n) {
+    s = s + (int64)a[j] * (int64)b[j];
+    j = j + 1;
+  }
+  return s;
+}
+
+// dot_i8: int32 accumulator over byte loads (the quantized-GEMM inner loop).
+function partial_dot_i8(a: int8*, b: int8*, n: int32) -> int32 {
+  var s: int32 = 0;
+  var j: int32 = 3;
+  while (j < n) {
+    s = s + (int32)a[j] * (int32)b[j];
+    j = j + 1;
+  }
+  return s;
+}
+
+// sum_u8 (already guarded; pinned here against regression).
+function partial_sum_u8(a: uint8*, n: int32) -> int64 {
+  var s: int64 = 0;
+  var j: int32 = 3;
+  while (j < n) {
+    s = s + (int64)a[j];
+    j = j + 1;
+  }
+  return s;
+}
+
+// byte map (already guarded; pinned): a[0..2] must stay untouched.
+function partial_byte_map(a: uint8*, n: int32) {
+  var j: int32 = 3;
+  while (j < n) {
+    a[j] = a[j] ^ 7;
+    j = j + 1;
+  }
+}
+
+// fill: supports a nonzero start via an explicit start operand -- the prefix
+// must stay untouched and the suffix must be written.
+function partial_fill(a: int32*, n: int32) {
+  var j: int32 = 3;
+  while (j < n) {
+    a[j] = 42;
+    j = j + 1;
+  }
+}
+
+// exp_f32: in-place map; a[0..2] must keep their original bits.
+function partial_exp(a: float32*, n: int64) {
+  var j: int64 = 3;
+  while (j < n) {
+    a[j] = expf(a[j]);
+    j = j + 1;
+  }
+}
+
+// i2f counter reduce: constant bound, chain on (float64)i, starting at 3.
+function partial_i2f() -> int64 {
+  var acc: int64 = 0;
+  var i: int64 = 3;
+  while (i < 1000) {
+    acc = acc + (int64)((float64)i * 0.5);
+    i = i + 1;
+  }
+  return acc;
+}
+function partial_i2f_ref() -> int64 {
+  var acc: int64 = 0;
+  var i: int64 = 999; // reversed: the recognizer refuses, genuinely scalar
+  while (i >= 3) {
+    acc = acc + (int64)((float64)i * 0.5);
+    i = i - 1;
+  }
+  return acc;
+}
+
+// minmax: scan starting at 2 must ignore the global extremes parked in
+// a[0]/a[1] (the recognizer only accepts the canonical init-from-a[0], i=1).
+function partial_minmax(a: int32*, n: int32) -> int64 {
+  var mn: int32 = a[1];
+  var mx: int32 = a[1];
+  var i: int32 = 2;
+  while (i < n) {
+    var v: int32 = a[i];
+    if (v < mn) { mn = v; }
+    if (v > mx) { mx = v; }
+    i = i + 1;
+  }
+  return (int64)mn * 100000 + (int64)mx;
+}
+
+// SLP MAC: 4 parallel accumulator chains, k starting at 3 -> each sum counts
+// n-3 terms, not n.
+function partial_slp(a: int32*, b: int32*, c: int32*, n: int32, stride: int32) {
+  var s0: int32 = 0;
+  var s1: int32 = 0;
+  var s2: int32 = 0;
+  var s3: int32 = 0;
+  var ai: int32 = 0;
+  var bi: int32 = 0;
+  var k: int32 = 3;
+  while (k < n) {
+    var av: int32 = a[ai];
+    s0 = s0 + av * b[bi + 0];
+    s1 = s1 + av * b[bi + 1];
+    s2 = s2 + av * b[bi + 2];
+    s3 = s3 + av * b[bi + 3];
+    ai = ai + 1;
+    bi = bi + stride;
+    k = k + 1;
+  }
+  var ci: int32 = 0;
+  c[ci + 0] = s0;
+  c[ci + 1] = s1;
+  c[ci + 2] = s2;
+  c[ci + 3] = s3;
+}
+
+// outer-lane: outer loop starting at p = 1; the kernel replays p = 0..P-1.
+function partial_outer(P: int32, n: int32) -> float64 {
+  var total: float64 = 0.0;
+  var p: int32 = 1;
+  while (p < P) {
+    var i: int32 = 0;
+    var iacc: float64 = (float64)p;
+    while (i < n) {
+      iacc = iacc / 1.5 + 0.25;
+      i = i + 1;
+    }
+    total = total + iacc;
+    p = p + 1;
+  }
+  return total;
+}
+function partial_outer_ref(P: int32, n: int32) -> float64 {
+  var total: float64 = 0.0;
+  var p: int32 = P - 1; // reversed outer order: refused, genuinely scalar
+  while (p >= 1) {
+    var i: int32 = 0;
+    var iacc: float64 = (float64)p;
+    while (i < n) {
+      iacc = iacc / 1.5 + 0.25;
+      i = i + 1;
+    }
+    total = total + iacc;
+    p = p - 1;
+  }
+  return total;
+}
+
+function main() -> int32 {
+  var n: int32 = 100;
+  var a: int32[100];
+  var b: int32[100];
+  var c: int32[4];
+  var ba: int8[100];
+  var bb: int8[100];
+  var ua: uint8[100];
+  var fa: float32[100];
+  var bad: int32 = 0;
+
+  for i in 0..n {
+    a[i] = 1;
+    b[i] = 1;
+    ba[i] = 1;
+    bb[i] = 1;
+    ua[i] = 2;
+    fa[i] = 1.0;
+  }
+
+  if (partial_sum_i32(&a[0], n) != 97) { bad = bad + 1; }
+  if (partial_dot_i32(&a[0], &b[0], n) != 97) { bad = bad + 2; }
+  if (partial_dot_i8(&ba[0], &bb[0], n) != 97) { bad = bad + 4; }
+  if (partial_sum_u8(&ua[0], n) != 194) { bad = bad + 8; }
+
+  partial_byte_map(&ua[0], n);
+  if (ua[0] != 2 || ua[2] != 2 || ua[3] != 5) { bad = bad + 16; }
+
+  partial_fill(&a[0], n);
+  if (a[0] != 1 || a[2] != 1 || a[3] != 42 || a[99] != 42) { bad = bad + 32; }
+
+  partial_exp(&fa[0], 100);
+  if (fa[0] != 1.0 || fa[2] != 1.0) { bad = bad + 64; }
+  if (fa[3] < 2.7) { bad = bad + 64; } // expf(1) ~ 2.718 must have landed
+
+  if (partial_i2f() != partial_i2f_ref()) { bad = bad + 128; }
+
+  // b[0] holds the global minimum; the scan inits from b[1] and starts at 2,
+  // so -99999 must not appear in the result.
+  b[0] = -99999;
+  for i in 1..n { b[i] = (i * 37) % 1000; }
+  var mm: int64 = partial_minmax(&b[0], n);
+  if (mm / 100000 == -99999) { bad = bad + 256; }
+
+  // All-ones MAC with k = 3..7: each lane must accumulate exactly 5 terms
+  // (a 0-start replay would produce 8).
+  for i in 0..n { a[i] = 1; b[i] = 1; }
+  partial_slp(&a[0], &b[0], &c[0], 8, 0);
+  if (c[0] != 5 || c[1] != 5 || c[2] != 5 || c[3] != 5) { bad = bad + 512; }
+
+  var ot: float64 = partial_outer(6, 30);
+  var otr: float64 = partial_outer_ref(6, 30);
+  var diff: float64 = ot - otr;
+  if (diff < -0.000001) { bad = bad + 1024; }
+  if (diff > 0.000001) { bad = bad + 1024; }
+
+  return bad;
+}

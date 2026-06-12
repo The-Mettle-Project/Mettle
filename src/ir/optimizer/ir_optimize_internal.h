@@ -262,6 +262,7 @@ typedef struct {
   X(ELIMINATE_UNREACHABLE_BLOCKS, "eliminate_unreachable_blocks")            \
   X(REMOVE_UNUSED_LABELS, "remove_unused_labels")                            \
   X(MEMCPY_INLINE, "memcpy_inline")                                          \
+  X(MEMCMP_BYTE_LOOP, "memcmp_byte_loop")                                    \
   X(ELIMINATE_LOAD_SYMBOL_COPY, "eliminate_load_symbol_copy")                \
   X(SIMD_SUM_I32, "simd_sum_i32")                                            \
   X(SIMD_SUM_U8, "simd_sum_u8")                                              \
@@ -338,7 +339,8 @@ const char *ir_find_ptr_init_base(const IRFunction *function, size_t before,
                                          const char *ptr_symbol);
 int ir_find_ptr_loop_len_operand(const IRFunction *function,
                                         size_t header_index,
-                                        const char *end_ptr, IROperand *out_len);
+                                        const char *end_ptr, const char *base,
+                                        IROperand *out_len);
 
 const char *ir_find_ptr_step_with_suffix(const IRFunction *function,
                                                 size_t start, size_t end,
@@ -604,6 +606,11 @@ int ir_simd_affine_map_float_pass(IRFunction *function, int *changed);
 int ir_simd_exp_f32_pass(IRFunction *function, int *changed);
 int ir_simd_i2f_reduce_pass(IRFunction *function, int *changed);
 int ir_auto_vectorize_pass(IRFunction *function, int *changed);
+int ir_auto_vectorize_int_pass(IRFunction *function, int *changed);
+/* Read-only probe: 1 if the int auto-vectorizer would claim the counted loop
+ * whose header label is at header_index (pointer-induction declines those --
+ * the vectorizer needs the indexed form). */
+int ir_auto_vectorize_int_claimable(IRFunction *function, size_t header_index);
 int ir_outer_vectorize_pass(IRFunction *function, int *changed);
 int ir_simd_dot_float_pass(IRFunction *function, int *changed);
 int ir_simd_dot_i32_pass(IRFunction *function, int *changed);

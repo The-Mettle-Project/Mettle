@@ -23,6 +23,10 @@ to a real past bug class or a SIMD recognizer:
   - narrow scalars: uint32/int32 mul/div/mod/shift with constant and
     variable divisors, zero-extending folds (the uint32-as-signed and
     magic-number div classes)
+  - uint32 accumulators that genuinely WRAP mod 2^32 (no re-masking):
+    unsigned sub-64-bit wrap is defined language semantics, and the homes
+    must stay zero-extend-canonical in scalar code (the promoted-register
+    uint32 canonicalization class)
   - small structs by value: struct-returning makers, struct-param folders,
     whole-struct copies + field mutation (SROA / struct-copy / MIR
     struct-chain classes)
@@ -42,7 +46,9 @@ DETERMINISM RULES (why a divergence is always a real miscompile):
     therefore IEEE-exact, so vectorized reduction reordering cannot change
     the result.
   - narrow ints are masked before multiplication so they never wrap; shift
-    counts < width; divisors are nonzero (constants, or `| 1`-forced)
+    counts < width; divisors are nonzero (constants, or `| 1`-forced).
+    Exception: uint32 in stmt_u32wrap wraps freely -- unsigned wrap mod
+    2^width is defined semantics, so it is still deterministic
   - struct fields and arrays are always fully written before any read
 """
 
@@ -85,10 +91,17 @@ class Gen:
             acc = self.live_vars[-1]
         return acc
     
-    def counted_loop(self, lo, hi, body):
+    def counted_loop(self, lo, hi, body, fuzz_start=False):
         """Emit a counted loop over [lo, hi); body(ivar) emits the body.
-        Randomly uses range-for (the ir_for_cond_ vectorizer gate) or while."""
+        Randomly uses range-for (the ir_for_cond_ vectorizer gate) or while.
+        fuzz_start=True (only safe for loops that READ already-initialized
+        data or map it in place -- never for array-init fills) sometimes bumps
+        the start to a small nonzero index: the SIMD recognizers replay
+        counted loops as 0..bound, so a nonzero start that they fail to
+        refuse is a silent miscompile (the iv-start-zero bug class)."""
         i = self.fresh("i")
+        if fuzz_start and self.rng.random() < 0.35:
+            lo = lo + self.rng.randint(1, 3)
         if self.rng.random() < 0.4:
             self.emit(f"for {i}: int64 in {lo}..{hi} {{")
             self.indent += 1
@@ -160,6 +173,7 @@ class Gen:
             (9,  self.stmt_i32_array),
             (8,  self.stmt_byte_array),
             (8,  self.stmt_narrow),
+            (6,  self.stmt_u32wrap),
             (8,  self.stmt_struct),
             (6,  self.stmt_global),
             (5,  self.stmt_matmul),
@@ -223,7 +237,7 @@ class Gen:
         self.counted_loop(0, n, lambda i: self.emit(
             f"{arr}[{i}] = ({i} * {c} + {d}) & {MASK};"))
         self.counted_loop(0, n, lambda j: self.emit(
-            f"{acc} = ({acc} + {arr}[{j}]) & {MASK};"))
+            f"{acc} = ({acc} + {arr}[{j}]) & {MASK};"), fuzz_start=True)
 
     def stmt_call(self):
         if not self.helper_sigs:
@@ -272,7 +286,7 @@ class Gen:
             c = self.rng.randint(0, 9)
             self.emit(f"var {f}: float64 = 0.0;")
             self.counted_loop(1, n + 1, lambda i: self.emit(
-                f"{f} = {f} + (float64){i} * {k}.0 + {c}.0;"))
+                f"{f} = {f} + (float64){i} * {k}.0 + {c}.0;"), fuzz_start=True)
             self.emit(f"{acc} = ({acc} + (int64){f}) & {MASK};")
         else:
             g = self.fresh("fg")
@@ -318,10 +332,10 @@ class Gen:
                 m = 2 if f32 else self.rng.randint(2, 3)
                 a = self.rng.randint(0, dmax)
                 self.counted_loop(0, n, lambda i: self.emit(
-                    f"{arr}[{i}] = {arr}[{i}] * {m}.0 + {a}.0;"))
+                    f"{arr}[{i}] = {arr}[{i}] * {m}.0 + {a}.0;"), fuzz_start=True)
             else:
                 self.counted_loop(0, n, lambda i: self.emit(
-                    f"{arr}[{i}] = {arr}[{i}] / 2.0;"))
+                    f"{arr}[{i}] = {arr}[{i}] / 2.0;"), fuzz_start=True)
         fs = self.fresh("fr")
         self.emit(f"var {fs}: {ty} = 0.0;")
         ksum = self.kernels.get("fsum_" + ty)
@@ -331,7 +345,7 @@ class Gen:
                 self.emit(f"{fs} = {ksum}(&{arr}[0], {n});")
             else:
                 self.counted_loop(0, n, lambda i: self.emit(
-                    f"{fs} = {fs} + {arr}[{i}];"))
+                    f"{fs} = {fs} + {arr}[{i}];"), fuzz_start=True)
         else:                        # dot reduction
             arr2 = self.fresh("fb")
             c2, d2 = self.rng.randint(1, cmax), self.rng.randint(0, dmax)
@@ -342,7 +356,7 @@ class Gen:
                 self.emit(f"{fs} = {kdot}(&{arr}[0], &{arr2}[0], {n});")
             else:
                 self.counted_loop(0, n, lambda i: self.emit(
-                    f"{fs} = {fs} + {arr}[{i}] * {arr2}[{i}];"))
+                    f"{fs} = {fs} + {arr}[{i}] * {arr2}[{i}];"), fuzz_start=True)
         self.emit(f"{acc} = ({acc} + (int64){fs}) & {MASK};")
 
     # ---- int32 / byte array statements -------------------------------------
@@ -365,12 +379,12 @@ class Gen:
                 self.emit(f"{s} = {self.kernels['isum']}(&{arr}[0], {n});")
             else:
                 self.counted_loop(0, n, lambda i: self.emit(
-                    f"{s} = {s} + {arr}[{i}];"))
+                    f"{s} = {s} + {arr}[{i}];"), fuzz_start=True)
             self.emit(f"{acc} = ({acc} + {s}) & {MASK};")
         elif roll < 0.65:
             self.emit(f"var {s}: int64 = 0;")
             self.counted_loop(0, n, lambda i: self.emit(
-                f"{s} = {s} + (int64){arr}[{i}];"))
+                f"{s} = {s} + (int64){arr}[{i}];"), fuzz_start=True)
             self.emit(f"{acc} = ({acc} + {s}) & {MASK};")
         else:
             arr2 = self.fresh("nb")
@@ -386,7 +400,7 @@ class Gen:
             else:
                 self.emit(f"var {s}: int32 = 0;")
                 self.counted_loop(0, n, lambda i: self.emit(
-                    f"{s} = {s} + {arr}[{i}] * {arr2}[{i}];"))
+                    f"{s} = {s} + {arr}[{i}] * {arr2}[{i}];"), fuzz_start=True)
                 self.emit(f"{acc} = ({acc} + (int64){s}) & {MASK};")
 
     def stmt_byte_array(self):
@@ -409,7 +423,7 @@ class Gen:
                         op = self.rng.choice(["*", "+", "-", "^", "&", "|"])
                         k = self.rng.randint(1, 255)
                         self.emit(f"{arr}[{i}] = {arr}[{i}] {op} {k};")
-                self.counted_loop(0, n, map_body)
+                self.counted_loop(0, n, map_body, fuzz_start=True)
         if self.rng.random() < 0.5:  # byte sum
             s = self.fresh("bs")
             self.emit(f"var {s}: int64 = 0;")
@@ -417,7 +431,7 @@ class Gen:
                 self.emit(f"{s} = {self.kernels['bsum']}(&{arr}[0], {n});")
             else:
                 self.counted_loop(0, n, lambda i: self.emit(
-                    f"{s} = {s} + (int64){arr}[{i}];"))
+                    f"{s} = {s} + (int64){arr}[{i}];"), fuzz_start=True)
             self.emit(f"{acc} = ({acc} + {s}) & {MASK};")
         else:                        # byte dot -> int32 accumulator
             arr2 = self.fresh("bb")
@@ -432,7 +446,7 @@ class Gen:
                           f" &{arr2}[0], {n});")
             else:
                 self.counted_loop(0, n, lambda i: self.emit(
-                    f"{s} = {s} + (int32){arr}[{i}] * (int32){arr2}[{i}];"))
+                    f"{s} = {s} + (int32){arr}[{i}] * (int32){arr2}[{i}];"), fuzz_start=True)
             self.emit(f"{acc} = ({acc} + (int64){s}) & {MASK};")
 
     def stmt_matmul(self):
@@ -458,7 +472,7 @@ class Gen:
         s = self.fresh("ms")
         self.emit(f"var {s}: int64 = 0;")
         self.counted_loop(0, nn, lambda i: self.emit(
-            f"{s} = {s} + (int64){cm}[{i}];"))
+            f"{s} = {s} + (int64){cm}[{i}];"), fuzz_start=True)
         self.emit(f"{acc} = ({acc} + {s}) & {MASK};")
 
     # ---- narrow scalar statement -------------------------------------------
@@ -495,6 +509,35 @@ class Gen:
             else:  # divide by a runtime variable, forced nonzero
                 self.emit(f"{u} = {u} / (uint32)(({z} & 15) | 1);")
         self.emit(f"{acc} = ({acc} + (int64){u} + (int64){z}) & {MASK};")
+
+    # ---- wrapping uint32 accumulator statement ------------------------------
+    def stmt_u32wrap(self):
+        """uint32 accumulator that genuinely WRAPS mod 2^32 (no re-masking):
+        unsigned sub-64-bit wrap is defined language semantics, so the home
+        (stack slot or promoted register) must always hold the zero-extended
+        canonical value. Mixes homomorphic wrap ops (+, *, ^) in a loop with
+        width-sensitive consumers (/, >>, !=) reading the wrapped local --
+        the promoted-register canonicalization bug class."""
+        acc = self.ensure_acc()
+        u = self.fresh("uw")
+        self.emit(f"var {u}: uint32 = (uint32)({self.atom(1)} & {MASK});")
+        n = self.rng.randint(1, 12)
+        k = self.rng.choice([2654435761, 2246822519, 3266489917, 668265263])
+        j = self.rng.randint(1, 9999)
+        shift = self.rng.randint(1, 15)
+        use_xor = self.rng.random() < 0.5
+
+        def body(i):
+            self.emit(f"{u} = {u} * {k} + {j};")
+            if use_xor:
+                self.emit(f"{u} = {u} ^ ({u} >> {shift});")
+        self.counted_loop(0, n, body)
+        roll = self.rng.random()
+        if roll < 0.35:
+            self.emit(f"{u} = {u} / {self.rng.randint(2, 97)};")
+        elif roll < 0.6:
+            self.emit(f"{u} = {u} >> {self.rng.randint(1, 15)};")
+        self.emit(f"{acc} = ({acc} + (int64){u}) & {MASK};")
 
     # ---- struct statement ----------------------------------------------------
     def stmt_struct(self):
