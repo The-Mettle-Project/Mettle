@@ -1,0 +1,99 @@
+// Demo for --explain remarks that depend on function decorators: @noinline
+// refusals, @pure LICM hoisting, @noalloc verification, and the verified
+// inlining advice (pretend-applied @inline / pretend-removed @noinline).
+
+@noinline function opaque(x: int32) -> int32 {
+    return x + 1;
+}
+
+// `@pure` + loop-invariant argument: the call is hoisted out of the loop
+// (`@noinline` keeps it a real call so LICM, not the inliner, handles it).
+@noinline @pure function bias(k: int32) -> int32 {
+    return k * 3 + 1;
+}
+
+function apply_bias(a: int32*, n: int32, k: int32) -> int32 {
+    var s: int32 = 0;
+    for i in 0..n {
+        s = s + a[i] + bias(k);
+    }
+    return s;
+}
+
+// `@noalloc`: proven allocation-free over everything it can reach.
+@noalloc function norm2(x: float32, y: float32) -> float32 {
+    return x * x + y * y;
+}
+
+// `@noinline` on the callee blocks the loop; the report simulates REMOVING
+// the veto, re-runs the inliner, and proves the loop then vectorizes.
+@noinline function damp(x: float32) -> float32 {
+    return x * 0.5;
+}
+
+function apply_damp(a: float32*, n: int32) {
+    for i in 0..n {
+        a[i] = damp(a[i]);
+    }
+}
+
+@noinline function step1(x: float32) -> float32 {
+    return x + 1.0;
+}
+
+// Refused by the call-count cap -- but the report re-checks with @inline
+// pretend-applied and proves the suggestion before printing it.
+function chain(x: float32) -> float32 {
+    return step1(step1(step1(x)));
+}
+
+// int16 elements AND an int32 accumulator: the fix must honestly name both
+// required changes, and the simulation proves them together.
+function sum_shorts_narrow(a: int16*, n: int32) -> int32 {
+    var s: int32 = 0;
+    for i in 0..n {
+        s = s + (int32)a[i];
+    }
+    return s;
+}
+
+// A driver loop: each iteration calls a function that CONTAINS a loop the
+// inliner structurally declines (`while` + multiply), and that loop stays
+// scalar (runtime-scalar broadcast has no kernel). The old report suggested
+// "mark it @inline" here; the simulation now runs the inliner with the
+// pretend flag, sees it refuse, and WITHDRAWS the advice instead of printing
+// a one-click fix that cannot work.
+function row_scale(x: float32*, w: float32*, y: float32*, n: int32, r: float32) {
+    var i: int32 = 0;
+    while (i < n) {
+        y[i] = x[i] * r * w[i];
+        i = i + 1;
+    }
+}
+
+function scale_rows(a: float32*, w: float32*, rows: int32, n: int32, r: float32) {
+    var m: int32 = 0;
+    while (m < rows) {
+        row_scale(&a[m * n], w, &a[m * n], n, r);
+        m = m + 1;
+    }
+}
+
+function main() -> int32 {
+    var ys: float32[64];
+    var iv: int32[64];
+    var sh: int16[64];
+    var i: int32 = 0;
+    while (i < 64) {
+        ys[i] = 1.0;
+        iv[i] = i;
+        sh[i] = (int16)i;
+        i = i + 1;
+    }
+    apply_damp(&ys[0], 64);
+    scale_rows(&ys[0], &ys[0], 8, 8, 0.5);
+    var t: int32 = apply_bias(&iv[0], 64, 7) + sum_shorts_narrow(&sh[0], 64);
+    var nf: float32 = norm2(3.0, 4.0) + chain(1.0) + ys[0];
+    var u: int32 = opaque(t + (int32)nf);
+    return u - u;
+}

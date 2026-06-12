@@ -1,0 +1,19 @@
+// Debugger crash-interception fixture: writes through an invalid (non-null)
+// pointer on the third loop iteration -- a genuine hardware access violation.
+// (A null pointer would hit the compiler's SOFTWARE null-check trap instead,
+// which exits before any exception fires.) With a debugger attached the
+// runtime must stop at the faulting line with stack and variables intact.
+import "std/io";
+
+function main() -> int32 {
+    var p: int32* = (int32*)16;
+    var i: int32 = 0;
+    while (i < 10) {
+        if (i == 3) {
+            p[0] = 42;
+        }
+        i = i + 1;
+    }
+    println_int(i);
+    return 0;
+}

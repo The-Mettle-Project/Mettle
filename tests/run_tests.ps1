@@ -197,6 +197,240 @@ $cases = @(
     Args          = @("-O")
     Pattern       = "@simd! loop was not vectorized"
   },
+  @{
+    # --explain: the grouped optimization report. Per loop: vectorized (into
+    # which kernel, instruction-level) or NOT, with reason and fix lines; per
+    # call: inlined or NOT with reason; nests summarized; plus the backend
+    # (MIR vs baseline) section.
+    Name          = "explain_report"
+    Path          = "tests/explain_demo.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--explain")
+    # Content assertions need the report on stderr regardless of its length
+    # (the changes-since-last-build section grows it across the determinism
+    # recompile; sidecar routing has its own dedicated case).
+    Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
+    OutputMustMatch = @(
+      'optimization report: explain_demo\.mettle',
+      '8-wide float32 affine map',
+      # the inlined-call map: the param-copy fold + dead-local sweep must leave
+      # a body the affine recognizer matches (regression for the
+      # __inl_*_param_x "cannot see through it" refusal)
+      'with_call \(loop @ line 19\): vectorized',
+      'NOT vectorized',
+      'vpsadbw kernel accumulates into int64',
+      'declare the accumulator as int64',
+      'hoist invariant index math into a pointer',
+      # the unroller's definitive remark supersedes the verifier's
+      # "no loop remains" guess
+      'fully unrolled \(8 iterations',
+      # verified fix suggestions: the compiler SIMULATES the fix on a clone,
+      # re-runs the optimizer, and only then claims it works
+      'verified: simulated that fix and re-ran the optimizer: this loop then vectorizes -> vpsadbw',
+      # int32 sum into an int32 accumulator: diagnosis + proven int64 fix
+      'int32 reduction kernel accumulates into int64',
+      'verified: simulated that fix and re-ran the optimizer: this loop then vectorizes -> vpaddd',
+      # int16 elements into an int64 accumulator: retyping the elements is the
+      # whole fix (the no-op (int32) cast is accepted by the sum recognizer),
+      # and the simulation proves exactly that advice
+      'fix: use int32 elements',
+      # dot-product address pattern: the row-pointer hoist is simulated and the
+      # FMA dot kernel itself confirms it
+      'verified: simulated that fix and re-ran the optimizer: this loop then vectorizes -> vfmadd231ps, 8-wide float32 FMA dot product',
+      # proven-inapplicable advice is REPLACED, never printed: skew''s index
+      # half mutates every iteration, so the hoist advice would be wrong
+      'none via hoisting -- re-checked: the index half that is not the loop counter changes every iteration',
+      # the expanded backend section: instruction-weighted coverage, bails
+      # grouped by cause with consequence text and sizes
+      'backend report: explain_demo\.mettle',
+      'optimized IR instructions are in register-allocated code',
+      'contains the SIMD kernel `simd_affine_map_f32`',
+      'consequence: the kernel itself runs at full vector speed'
+    )
+  },
+  @{
+    # Past the line threshold, the full --explain report is written to a
+    # `.explain.txt` sidecar next to the output and stderr gets a digest.
+    Name          = "explain_sidecar"
+    Path          = "tests/explain_demo.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--explain")
+    Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "5" }
+    OutputMustMatch = @(
+      'loops: \d+ vectorized, \d+ scalar; \d+ fix suggestions verified',
+      'calls: \d+ inlined, \d+ kept as real calls',
+      'backend: \d+/\d+ functions register-allocated',
+      'full report \(\d+ lines\): .*explain_sidecar\.explain\.txt'
+    )
+    OutputMustNotMatch = @(
+      # the report body must have been diverted, not printed
+      'sum_bytes \(loop'
+    )
+    SidecarMustMatch = @(
+      'optimization report: explain_demo\.mettle',
+      'verified: simulated that fix and re-ran the optimizer',
+      'backend report: explain_demo\.mettle',
+      'consequence: the kernel itself runs at full vector speed'
+    )
+  },
+  @{
+    # --explain remarks that depend on function decorators: @noinline
+    # refusals, @pure LICM hoisting, @noalloc verification, and the verified
+    # inlining advice (pretend-applied @inline / pretend-removed @noinline).
+    Name          = "explain_contracts_report"
+    Path          = "tests/explain_contracts_demo.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--explain")
+    Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
+    OutputMustMatch = @(
+      'optimization report: explain_contracts_demo\.mettle',
+      'reason: the callee is marked @noinline',
+      'hoisted out of the loop \(runs once',
+      'verified @noalloc',
+      # call-in-body: program-level simulation (pretend-remove @noinline,
+      # re-run the INLINER on a caller clone, revectorize)
+      'verified: simulated removing `@noinline` from `damp`',
+      'verified: re-checked with @inline pretend-applied: the structural guards pass',
+      # int16 elements + int32 accumulator: the fix honestly names BOTH
+      # required changes
+      'use int32 elements and declare the accumulator as int64',
+      'verified: simulated that fix and re-ran the optimizer: this loop then vectorizes -> vpaddd',
+      # call-in-body where the advice is DISPROVEN: the callee contains a
+      # loop the inliner structurally declines, so the simulation withdraws
+      # the @inline suggestion and says the driver loop is correctly scalar
+      'each iteration calls `row_scale`, and `@inline` cannot help: the callee contains a loop',
+      'fix: nothing to change on this line: this loop is a driver'
+    )
+    OutputMustNotMatch = @(
+      # the withdrawn advice must not survive anywhere in the report
+      'make `row_scale` inline-eligible'
+    )
+  },
+  @{
+    # `@inline!` contract: a recursive function can never have every call
+    # inlined away, so the build must fail with the inliner's reason.
+    Name          = "err_inline_contract"
+    Path          = "tests/err_inline_contract.mettle"
+    ShouldSucceed = $false
+    Args          = @("-O")
+    Pattern       = '@inline! call to `fact` was not inlined: the call is directly recursive'
+  },
+  @{
+    Name          = "inline_contract"
+    Path          = "tests/test_inline_contract.mettle"
+    ShouldSucceed = $true
+    Args          = @("-O")
+  },
+  @{
+    # `@noalloc` violated directly by a `new` expression.
+    Name          = "err_noalloc"
+    Path          = "tests/err_noalloc.mettle"
+    ShouldSucceed = $false
+    Args          = @("-O")
+    Pattern       = '@noalloc function `make_point` allocates: a `new` expression'
+  },
+  @{
+    # `@noalloc` is transitive: the allocation is inside a reachable callee.
+    Name          = "err_noalloc_transitive"
+    Path          = "tests/err_noalloc_transitive.mettle"
+    ShouldSucceed = $false
+    Args          = @("-O")
+    Pattern       = 'inside reachable function `helper`, a `new` expression'
+  },
+  @{
+    # `@noalloc` is a proof: an unknown extern cannot be proven clean.
+    Name          = "err_noalloc_extern"
+    Path          = "tests/err_noalloc_extern.mettle"
+    ShouldSucceed = $false
+    Args          = @("-O")
+    Pattern       = 'calls the external function `mystery`, which cannot be proven allocation-free'
+  },
+  @{
+    # `@noalloc` succeeding: arithmetic + known-clean libm externs verify.
+    Name          = "noalloc"
+    Path          = "tests/test_noalloc.mettle"
+    ShouldSucceed = $true
+    Args          = @("-O")
+  },
+  @{
+    # The SIMD fill kernel (memset/frame-clear class): all element sizes,
+    # odd tails, zero/negative counts, float bit-pattern fills, rect fills
+    # with nonzero start + invariant row offset, the stdlib mem_zero
+    # byte-offset walk with iv handoff between loops. The .ir sidecar must
+    # show the fused ops; runtime equality with the scalar loops is covered
+    # by the differential fuzzer's debug-vs-release oracle on this same
+    # binary shape.
+    Name          = "simd_fill_parity"
+    Path          = "tests/test_simd_fill_parity.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release")
+    IrMustMatch   = @(
+      'simd_fill\(base=',
+      'simd_fill\(begin='
+    )
+  },
+  @{
+    # Real-application loop shapes from the LLM engine: global array bases
+    # and bounds, induction variables reused across consecutive loops (the
+    # dot/map kernels now treat a straight-line redefinition as killing the
+    # iv), and a fill whose live-after iv gets its exact final value written
+    # back by the kernel.
+    Name          = "simd_llm_shapes"
+    Path          = "tests/test_simd_llm_shapes.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release")
+    IrMustMatch   = @(
+      'dot_f32\(',
+      'simd_fill\('
+    )
+  },
+  @{
+    # Repeated identical call refusals (an over-budget main refusing every
+    # call site for the same reason) fold into ONE entry with a line range
+    # and a deduplicated callee census -- not a wall of identical remarks.
+    Name          = "explain_fold_repeated_refusals"
+    Path          = "tests/explain_fold_demo.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--explain")
+    Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
+    OutputMustMatch = @(
+      # cold one-shot call sites in an over-budget caller fold into ONE calm
+      # entry that explains why NOT inlining is the right call -- and hands
+      # out no fix advice (there is nothing worth fixing)
+      'main \(8 calls, lines \d+-\d+\): NOT inlined',
+      'reason: the calling function is over the 512-instruction caller budget, and this call site is not inside a loop',
+      'calls: f1 \(x3\), f2 \(x2\), f3 \(x2\), f4',
+      # tiny call-free callees are exempt from the caller budget: the
+      # accessor still inlines into the over-budget main
+      'main \(call to `tiny` @ line \d+\): inlined',
+      # loop-resident call sites are exempt too: the same f1 that is refused
+      # at the cold sites inlines at the hot one
+      'main \(call to `f1` @ line \d+\): inlined'
+    )
+    OutputMustNotMatch = @(
+      # no per-site cold refusals survive the fold, and no @inline advice is
+      # handed out for calls where inlining would buy nothing
+      'main \(call to `f2`',
+      'fix: mark the callee @inline'
+    )
+  },
+  @{
+    # --explain remarks are limited to the main input file: a program importing
+    # std/io must not report stdlib-internal decisions, but a refusal AT a user
+    # call site into the stdlib is still reported.
+    Name          = "explain_focus_filter"
+    Path          = "tests/explain_stdlib_demo.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--explain")
+    Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
+    OutputMustMatch = @(
+      'call to `print_int` .* NOT inlined'
+    )
+    OutputMustNotMatch = @(
+      'print_int \(loop',
+      'print_int \(call to'
+    )
+  },
   @{ Name = "err_decorator_on_loop"; Path = "tests/err_decorator_on_loop.mettle"; ShouldSucceed = $false; Pattern = "apply to a function, not a loop" },
   @{ Name = "err_decorator_unknown"; Path = "tests/err_decorator_unknown.mettle"; ShouldSucceed = $false; Pattern = "Unknown decorator after" },
   @{ Name = "err_decorator_conflict"; Path = "tests/err_decorator_conflict.mettle"; ShouldSucceed = $false; Pattern = "mutually exclusive" },
@@ -504,14 +738,14 @@ $cases = @(
     Path          = "tests/test_opt_dead_temp.mettle"
     ShouldSucceed = $true
     Args          = @("-O")
-    IrMustNotMatch = @("%t[0-9]+ <- 123456")
+    IrMustNotMatch = @("%\.?t[0-9]+ <- 123456")
   },
   @{
     Name          = "opt_symbol_temp_forwarding"
     Path          = "tests/test_opt_symbol_temp_forwarding.mettle"
     ShouldSucceed = $true
     Args          = @("-O")
-    IrMustNotMatch = @("%t[0-9]+ <- @x")
+    IrMustNotMatch = @("%\.?t[0-9]+ <- @x")
     IrMustMatch   = @("branch_zero @x ->")
   },
   @{
@@ -534,15 +768,15 @@ $cases = @(
     Path          = "tests/test_opt_mod_even_check.mettle"
     ShouldSucceed = $true
     Args          = @("-O")
-    IrMustMatch   = @("%t[0-9]+ = @n & 1")
-    IrMustNotMatch = @("%t[0-9]+ = @n % 2")
+    IrMustMatch   = @("%\.?t[0-9]+ = @n & 1")
+    IrMustNotMatch = @("%\.?t[0-9]+ = @n % 2")
   },
   @{
     Name          = "opt_collatz_odd_fold"
     Path          = "tests/test_opt_collatz_odd_fold.mettle"
     ShouldSucceed = $true
     Args          = @("-O", "--dump-ir")
-    IrMustMatch   = @("(?s)%t[0-9]+ = 3 \* @x.*@x = %t[0-9]+ \+ 1.*@x = @x >> 1.*@count = @count \+ 2.*jump ir_while_")
+    IrMustMatch   = @("(?s)%\.?t[0-9]+ = 3 \* @x.*@x = %\.?t[0-9]+ \+ 1.*@x = @x >> 1.*@count = @count \+ 2.*jump ir_while_")
   },
   @{
     Name          = "opt_popcount_fold"
@@ -550,7 +784,7 @@ $cases = @(
     ShouldSucceed = $true
     Args          = @("-O", "--dump-ir")
     IrMustMatch   = @(">> 1", "branch_zero @v ->")
-    IrMustNotMatch = @("jump ir_while_", "%t[0-9]+ = @v / 2")
+    IrMustNotMatch = @("jump ir_while_", "%\.?t[0-9]+ = @v / 2")
   },
   @{
     Name          = "opt_popcount_buffer_fuse"
@@ -558,7 +792,7 @@ $cases = @(
     ShouldSucceed = $true
     Args          = @("--build", "--emit-obj", "--linker", "internal", "--release", "--profile-runtime-ops", "--dump-ir")
     IrMustMatch   = @("%pbf[0-9]+_raw <-", "@total = @total \+ %pbf")
-    IrMustNotMatch = @("%t[0-9]+ = popcount_byte", "__inl_popcount_byte", "local_count")
+    IrMustNotMatch = @("%\.?t[0-9]+ = popcount_byte", "__inl_popcount_byte", "local_count")
   },
   @{
     Name          = "opt_popcount_buffer_fuse_release"
@@ -566,7 +800,7 @@ $cases = @(
     ShouldSucceed = $true
     Args          = @("--build", "--emit-obj", "--linker", "internal", "--release", "--dump-ir")
     IrMustMatch   = @("%pbf[0-9]+_raw <-", "@total = @total \+ %pbf")
-    IrMustNotMatch = @("%t[0-9]+ = popcount_byte", "__inl_popcount_byte", "local_count")
+    IrMustNotMatch = @("%\.?t[0-9]+ = popcount_byte", "__inl_popcount_byte", "local_count")
   },
   @{
     Name          = "opt_branch_notzero_forward"
@@ -574,7 +808,7 @@ $cases = @(
     ShouldSucceed = $true
     Args          = @("-O")
     IrMustMatch   = @("branch_zero @x ->")
-    IrMustNotMatch = @("%t[0-9]+ = @x != 0")
+    IrMustNotMatch = @("%\.?t[0-9]+ = @x != 0")
   },
   @{
     Name          = "opt_branch_eq_chain"
@@ -582,7 +816,7 @@ $cases = @(
     ShouldSucceed = $true
     Args          = @("-O")
     IrMustMatch   = @("branch_eq @x, 1 ->", "branch_eq @x, 2 ->")
-    IrMustNotMatch = @("%t[0-9]+ = @x == 1", "%t[0-9]+ = @x == 2")
+    IrMustNotMatch = @("%\.?t[0-9]+ = @x == 1", "%\.?t[0-9]+ = @x == 2")
   },
   @{
     Name            = "opt_cfg_cleanup"
@@ -925,10 +1159,23 @@ foreach ($case in $cases) {
       $caseArgs += "--dump-ir"
     }
 
+    # Per-case environment variables (restored right after the invocation).
+    $savedEnv = @{}
+    if ($case.ContainsKey("Env") -and $case.Env) {
+      foreach ($k in $case.Env.Keys) {
+        $savedEnv[$k] = [Environment]::GetEnvironmentVariable($k)
+        [Environment]::SetEnvironmentVariable($k, $case.Env[$k])
+      }
+    }
+
     # -Width 4096: keep each diagnostic on one logical line so multi-word
     # Pattern matches aren't broken by console-width line wrapping.
     $output = & $CompilerPath @caseArgs $case.Path -o $outFile 2>&1 | Out-String -Width 4096
     $exitCode = $LASTEXITCODE
+
+    foreach ($k in $savedEnv.Keys) {
+      [Environment]::SetEnvironmentVariable($k, $savedEnv[$k])
+    }
 
     $passed = $true
     $reason = ""
@@ -1022,6 +1269,27 @@ foreach ($case in $cases) {
                   $reason = "IR output matched forbidden pattern '$pattern'"
                   break
                 }
+              }
+            }
+          }
+        }
+        if ($passed -and $case.ContainsKey("SidecarMustMatch") -and $case.SidecarMustMatch) {
+          # The --explain sidecar: <output-stem>.explain.txt next to the obj.
+          $sidecar = [System.IO.Path]::ChangeExtension($outFile, $null).TrimEnd('.') + ".explain.txt"
+          if (-not (Test-Path $sidecar)) {
+            $passed = $false
+            $reason = "Expected explain sidecar '$sidecar' was not written"
+          }
+          else {
+            $sidecarText = Get-Content -Path $sidecar -Raw
+            foreach ($pattern in @($case.SidecarMustMatch)) {
+              if ([string]::IsNullOrWhiteSpace($pattern)) {
+                continue
+              }
+              if ($sidecarText -notmatch $pattern) {
+                $passed = $false
+                $reason = "Explain sidecar missing required pattern '$pattern'"
+                break
               }
             }
           }
@@ -1423,6 +1691,95 @@ catch {
   Write-CaseResult -Name "switch_range_runtime" -Passed $false -Reason $_.Exception.Message
 }
 
+# Debugger instrumentation: a --debug-hooks build must run NORMALLY when no
+# debugger is attached (every hook is an early-out; METTLE_DBG_PIPE unset).
+$total++
+try {
+  $exePath = Join-Path $tmpDir "debug_hooks_standalone.exe"
+  $buildOut = & $CompilerPath --build "tests\debug_demo.mettle" -o $exePath --debug-hooks 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "Debug-hooks build failed: $buildOut"
+  }
+  $runOut = & $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "Debug-hooks binary exited with $LASTEXITCODE (expected 0)"
+  }
+  if ($runOut -notmatch 'total=60') {
+    throw "Debug-hooks binary output wrong: $runOut (expected total=60)"
+  }
+  Write-CaseResult -Name "debug_hooks_standalone" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "debug_hooks_standalone" -Passed $false -Reason $_.Exception.Message
+}
+
+# Debugger protocol end-to-end: node hosts the pipe and drives a real session
+# (entry stop, breakpoint, stack, variables, step in/out, eval, and a live
+# variable WRITE asserted on the program's final stdout).
+$total++
+try {
+  $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
+  if (-not $nodeCmd) {
+    Write-CaseResult -Name "debug_protocol" -Passed $true -Reason "skipped (node not found)"
+  } else {
+    $protoOut = & $nodeCmd.Source "mettle-syntax\scripts\test-debug-protocol.js" $CompilerPath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "Protocol test failed: $protoOut"
+    }
+    Write-CaseResult -Name "debug_protocol" -Passed $true
+  }
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "debug_protocol" -Passed $false -Reason $_.Exception.Message
+}
+
+# --explain "since last build" diffing + --explain-json: recompiling unchanged
+# source reports no changes; de-inlining `scale` between builds reports the
+# with_call loop as REGRESSED; the .explain.json sidecar parses and agrees.
+$total++
+try {
+  $exDir = Join-Path $tmpDir "explain_changes"
+  New-Item -ItemType Directory $exDir -Force | Out-Null
+  # the harness tmp dir persists across suite runs: a stale baseline would
+  # make the "first build" assertion see a changes section
+  Get-ChildItem $exDir -File -ErrorAction SilentlyContinue | Remove-Item -Force -Confirm:$false
+  Copy-Item "tests\explain_demo.mettle" "$exDir\demo.mettle" -Force
+  $exOut = Join-Path $exDir "demo.obj"
+  $env:METTLE_EXPLAIN_REPORT_LINES = "0"
+  $run1 = cmd /c "`"$((Resolve-Path $CompilerPath).Path)`" -i `"$exDir\demo.mettle`" -o `"$exOut`" --release --explain-json 2>&1" | Out-String
+  if ($run1 -match 'changes since the last explain build') {
+    throw "First build must not have a changes section"
+  }
+  $run2 = cmd /c "`"$((Resolve-Path $CompilerPath).Path)`" -i `"$exDir\demo.mettle`" -o `"$exOut`" --release --explain-json 2>&1" | Out-String
+  if ($run2 -notmatch 'no optimization changes since the last explain build') {
+    throw "Identical rebuild must report no changes"
+  }
+  (Get-Content "$exDir\demo.mettle" -Raw) -replace 'function scale\(x: float32\)', '@noinline function scale(x: float32)' |
+    Set-Content "$exDir\demo.mettle" -Encoding ascii -NoNewline
+  $run3 = cmd /c "`"$((Resolve-Path $CompilerPath).Path)`" -i `"$exDir\demo.mettle`" -o `"$exOut`" --release --explain-json 2>&1" | Out-String
+  if ($run3 -notmatch 'REGRESSED' -or $run3 -notmatch 'was vectorized, now scalar') {
+    throw "De-inlined scale must report a loop regression. Output: $($run3.Substring(0, [Math]::Min(600, $run3.Length)))"
+  }
+  $json = Get-Content (Join-Path $exDir "demo.explain.json") -Raw | ConvertFrom-Json
+  if ($json.schema -ne 1) { throw "JSON schema field wrong" }
+  if ($json.stats.changesRegressed -lt 1) { throw "JSON regression count missing" }
+  if (@($json.remarks).Count -lt 10) { throw "JSON remarks too few: $(@($json.remarks).Count)" }
+  $regLoop = @($json.changes.entries | Where-Object { $_.direction -eq 'regressed' -and $_.kind -eq 'loop' })
+  if ($regLoop.Count -lt 1 -or -not $regLoop[0].reason) { throw "JSON regressed-loop entry missing reason" }
+  if (-not @($json.remarks | Where-Object { $_.kind -eq 'loop' -and $_.depth -ge 2 }).Count) {
+    throw "JSON nest depth missing (matvec inner loop is depth 2)"
+  }
+  Remove-Item Env:METTLE_EXPLAIN_REPORT_LINES -ErrorAction SilentlyContinue
+  Write-CaseResult -Name "explain_changes_and_json" -Passed $true
+}
+catch {
+  Remove-Item Env:METTLE_EXPLAIN_REPORT_LINES -ErrorAction SilentlyContinue
+  $failed++
+  Write-CaseResult -Name "explain_changes_and_json" -Passed $false -Reason $_.Exception.Message
+}
+
 # Top-level constants: compile with --build and verify folded compile-time value.
 $total++
 try {
@@ -1532,6 +1889,47 @@ function main() -> int32 {
 catch {
   $failed++
   Write-CaseResult -Name "bundled_stdlib_outside_project" -Passed $false -Reason $_.Exception.Message
+}
+
+# UTF-8 BOM test: a source file starting with EF BB BF (PowerShell 5.1
+# Set-Content -Encoding utf8, Notepad default) must compile cleanly.
+$total++
+try {
+  $compilerFullPath = (Resolve-Path $CompilerPath).Path
+  $bomDir = Join-Path $tmpDir "utf8-bom-project"
+  if (Test-Path $bomDir) {
+    Remove-Item -Path $bomDir -Recurse -Force
+  }
+  New-Item -Path $bomDir -ItemType Directory | Out-Null
+
+  $bomSource = Join-Path $bomDir "main.mettle"
+  $bomObj = Join-Path $bomDir "main.obj"
+  @'
+function main() -> int32 {
+  return 0;
+}
+'@ | Set-Content -Path $bomSource -Encoding utf8
+
+  $bomBytes = [System.IO.File]::ReadAllBytes($bomSource)
+  if ($bomBytes.Length -lt 3 -or $bomBytes[0] -ne 0xEF -or $bomBytes[1] -ne 0xBB -or $bomBytes[2] -ne 0xBF) {
+    throw "BOM fixture was written without a UTF-8 BOM; the test cannot exercise the lexer path"
+  }
+
+  $bomOut = & $compilerFullPath $bomSource -o $bomObj 2>&1 | Out-String
+  $bomExit = $LASTEXITCODE
+
+  if ($bomExit -ne 0) {
+    throw "Compile of a UTF-8 BOM source failed (exit $bomExit): $bomOut"
+  }
+  if (-not (Test-Path $bomObj)) {
+    throw "Compile of a UTF-8 BOM source did not produce an object output"
+  }
+
+  Write-CaseResult -Name "utf8_bom_source" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "utf8_bom_source" -Passed $false -Reason $_.Exception.Message
 }
 
 # mettle.deps package resolution test: compile from a temp project using a package alias.
@@ -1789,7 +2187,7 @@ foreach ($relFlag in @($true, $false)) {
 
 # Float narrowing paths: the three sites that must cvtsd2ss a float64-tracked
 # value into a float32 destination (MIR store, MIR return, inliner param
-# assign) — each was a distinct silent miscompile found by the v2 fuzzer.
+# assign) â€” each was a distinct silent miscompile found by the v2 fuzzer.
 # Built debug AND release: the store bug fired at -O0, the return bug at
 # release, the param bug in the fallback backend.
 foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")) {
@@ -3023,7 +3421,8 @@ $directObjectScalarCases = @(
   @{ Name = "direct_object_int32_load_sign_ext"; Path = "tests/test_direct_object_int32_load_sign_ext.mettle"; ExitCode = 0; Label = "int32-load-sign-ext" },
   @{ Name = "direct_object_int32_call_return_compare"; Path = "tests/test_int32_call_return_compare.mettle"; ExitCode = 1; Label = "int32-call-return-compare" },
   @{ Name = "direct_object_uint32_cross_lineage_eq"; Path = "tests/test_uint32_cross_lineage_eq.mettle"; ExitCode = 0; Label = "uint32-cross-lineage-eq" },
-  @{ Name = "direct_object_uint32_signed_in_large_fn"; Path = "tests/test_uint32_signed_in_large_fn.mettle"; ExitCode = 0; Label = "uint32-signed-in-large-fn" }
+  @{ Name = "direct_object_uint32_signed_in_large_fn"; Path = "tests/test_uint32_signed_in_large_fn.mettle"; ExitCode = 0; Label = "uint32-signed-in-large-fn" },
+  @{ Name = "direct_object_temp_local_name_collision"; Path = "tests/test_temp_local_name_collision.mettle"; ExitCode = 0; Label = "temp-local-name-collision" }
 )
 
 foreach ($case in $directObjectScalarCases) {
@@ -4024,4 +4423,5 @@ if ($failed -ne 0) {
 }
 
 exit 0
+
 

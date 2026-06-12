@@ -1,5 +1,6 @@
 #include "ir_optimize_internal.h"
 
+#include <limits.h>
 
 int ir_operand_clone(const IROperand *source, IROperand *out) {
   if (!out) {
@@ -209,6 +210,7 @@ int ir_instruction_writes_symbol(const IRInstruction *instruction) {
   case IR_OP_CAST:
   case IR_OP_COUNT_WORD_STARTS:
   case IR_OP_MEMCPY_INLINE:
+  case IR_OP_SIMD_FILL: /* dest, when set, receives the final byte offset */
   case IR_OP_SIMD_SUM_I32:
   case IR_OP_SIMD_SUM_U8:
   case IR_OP_SIMD_MATMUL_N32:
@@ -257,6 +259,7 @@ int ir_instruction_writes_destination(const IRInstruction *instruction) {
   case IR_OP_CAST:
   case IR_OP_COUNT_WORD_STARTS:
   case IR_OP_MEMCPY_INLINE:
+  case IR_OP_SIMD_FILL: /* dest, when set, receives the final byte offset */
   case IR_OP_SIMD_SUM_I32:
   case IR_OP_SIMD_SUM_U8:
   case IR_OP_SIMD_MATMUL_N32:
@@ -497,21 +500,191 @@ int ir_temp_value_map_init(IRTempValueMap *map) {
   map->items = NULL;
   map->count = 0;
   map->capacity = 0;
+  map->ix = NULL;
+  map->ix_capacity = 0;
+  map->ix_tombstones = 0;
+  map->vsym_counts = NULL;
   return 1;
 }
 
+/* ---- hash index over the entry array --------------------------------------
+ * find/set/remove were linear strcmp scans; on the multi-thousand-entry maps
+ * copy-propagation builds inside post-inlining functions that turned the pass
+ * quadratic (it was 26s of a 29s compile on a 4000-function fixture). The
+ * array remains the storage passes iterate; this index only maps name->slot. */
+
+#define IR_TVM_TOMB UINT_MAX
+
+static unsigned int ir_tvm_hash(const char *s) {
+  unsigned int h = 2166136261u;
+  while (*s) {
+    h ^= (unsigned char)*s++;
+    h *= 16777619u;
+  }
+  return h;
+}
+
+static void ir_tvm_index_insert(IRTempValueMap *map, const char *name,
+                                size_t slot) {
+  size_t mask = map->ix_capacity - 1;
+  size_t b = ir_tvm_hash(name) & mask;
+  while (map->ix[b] != 0 && map->ix[b] != IR_TVM_TOMB) {
+    b = (b + 1) & mask;
+  }
+  if (map->ix[b] == IR_TVM_TOMB && map->ix_tombstones > 0) {
+    map->ix_tombstones--;
+  }
+  map->ix[b] = (unsigned int)(slot + 1);
+}
+
+int ir_temp_value_map_reindex(IRTempValueMap *map) {
+  if (!map) {
+    return 0;
+  }
+  size_t want = 32;
+  while (want < map->count * 2 + 8) {
+    want <<= 1;
+  }
+  if (map->ix_capacity < want) {
+    free(map->ix);
+    map->ix = malloc(want * sizeof(unsigned int));
+    if (!map->ix) {
+      map->ix_capacity = 0;
+      return 0;
+    }
+    map->ix_capacity = want;
+  }
+  memset(map->ix, 0, map->ix_capacity * sizeof(unsigned int));
+  map->ix_tombstones = 0;
+  for (size_t i = 0; i < map->count; i++) {
+    if (map->items[i].name) {
+      ir_tvm_index_insert(map, map->items[i].name, i);
+    }
+  }
+  return 1;
+}
+
+/* Make sure the index exists and is healthy; falls back to "no index" on
+ * allocation failure (find then degrades to the linear scan). */
+static void ir_tvm_index_ensure(IRTempValueMap *map) {
+  if (!map->ix || (map->count + map->ix_tombstones) * 2 >= map->ix_capacity) {
+    ir_temp_value_map_reindex(map);
+  }
+}
+
 static int ir_temp_value_map_find(const IRTempValueMap *map, const char *name) {
-  if (!map || !name) {
+  if (!map || !name || map->count == 0) {
     return -1;
   }
 
-  for (size_t i = 0; i < map->count; i++) {
-    if (map->items[i].name && strcmp(map->items[i].name, name) == 0) {
-      return (int)i;
+  ir_tvm_index_ensure((IRTempValueMap *)map);
+  if (!map->ix) {
+    /* Allocation failed: stay correct via the linear scan. */
+    for (size_t i = 0; i < map->count; i++) {
+      if (map->items[i].name && strcmp(map->items[i].name, name) == 0) {
+        return (int)i;
+      }
     }
+    return -1;
   }
 
+  size_t mask = map->ix_capacity - 1;
+  size_t b = ir_tvm_hash(name) & mask;
+  while (map->ix[b] != 0) {
+    if (map->ix[b] != IR_TVM_TOMB) {
+      size_t slot = (size_t)map->ix[b] - 1;
+      if (slot < map->count && map->items[slot].name &&
+          strcmp(map->items[slot].name, name) == 0) {
+        return (int)slot;
+      }
+    }
+    b = (b + 1) & mask;
+  }
   return -1;
+}
+
+/* Tombstone the bucket that points at `slot` for `name`. */
+static void ir_tvm_index_erase(IRTempValueMap *map, const char *name,
+                               size_t slot) {
+  if (!map->ix) {
+    return;
+  }
+  size_t mask = map->ix_capacity - 1;
+  size_t b = ir_tvm_hash(name) & mask;
+  while (map->ix[b] != 0) {
+    if (map->ix[b] != IR_TVM_TOMB && (size_t)map->ix[b] - 1 == slot) {
+      map->ix[b] = IR_TVM_TOMB;
+      map->ix_tombstones++;
+      return;
+    }
+    b = (b + 1) & mask;
+  }
+}
+
+/* Repoint the bucket of `name` from `old_slot` to `new_slot` (swap-remove
+ * moved it). */
+static void ir_tvm_index_move(IRTempValueMap *map, const char *name,
+                              size_t old_slot, size_t new_slot) {
+  if (!map->ix) {
+    return;
+  }
+  size_t mask = map->ix_capacity - 1;
+  size_t b = ir_tvm_hash(name) & mask;
+  while (map->ix[b] != 0) {
+    if (map->ix[b] != IR_TVM_TOMB && (size_t)map->ix[b] - 1 == old_slot) {
+      map->ix[b] = (unsigned int)(new_slot + 1);
+      return;
+    }
+    b = (b + 1) & mask;
+  }
+}
+
+/* ---- reverse value-symbol counts -------------------------------------------
+ * vsym_counts maps a symbol name to the number of entries whose VALUE is that
+ * symbol, so per-symbol-write invalidation can skip the full-entry scan when
+ * nothing maps to the written symbol (the common case -- this scan per write
+ * was quadratic inside copy-propagation on big inlined functions). Built
+ * lazily on first use, then maintained by set/remove and the compactors. */
+
+static void ir_tvm_vsym_adjust(IRTempValueMap *counts, const char *sym,
+                               long long delta) {
+  if (!counts || !sym) {
+    return;
+  }
+  const IROperand *cur = ir_temp_value_map_lookup(counts, sym);
+  long long v = (cur ? cur->int_value : 0) + delta;
+  if (v <= 0) {
+    ir_temp_value_map_remove(counts, sym);
+    return;
+  }
+  IROperand op = {.kind = IR_OPERAND_INT, .int_value = v};
+  ir_temp_value_map_set(counts, sym, &op);
+}
+
+static void ir_tvm_vsym_note_value(IRTempValueMap *map, const IROperand *value,
+                                   long long delta) {
+  if (map->vsym_counts && value && value->kind == IR_OPERAND_SYMBOL &&
+      value->name) {
+    ir_tvm_vsym_adjust(map->vsym_counts, value->name, delta);
+  }
+}
+
+/* Lazily build the reverse counts; returns 0 (and leaves the map without
+ * counts) on allocation failure, in which case callers use the plain scan. */
+static int ir_tvm_vsym_ensure(IRTempValueMap *map) {
+  if (map->vsym_counts) {
+    return 1;
+  }
+  IRTempValueMap *counts = malloc(sizeof(*counts));
+  if (!counts || !ir_temp_value_map_init(counts)) {
+    free(counts);
+    return 0;
+  }
+  map->vsym_counts = counts;
+  for (size_t i = 0; i < map->count; i++) {
+    ir_tvm_vsym_note_value(map, &map->items[i].value, 1);
+  }
+  return 1;
 }
 
 void ir_temp_value_map_remove(IRTempValueMap *map, const char *name) {
@@ -525,11 +698,18 @@ void ir_temp_value_map_remove(IRTempValueMap *map, const char *name) {
   }
 
   size_t idx = (size_t)index;
+  ir_tvm_index_erase(map, map->items[idx].name, idx);
+  ir_tvm_vsym_note_value(map, &map->items[idx].value, -1);
   free(map->items[idx].name);
   ir_operand_destroy(&map->items[idx].value);
 
-  for (size_t i = idx + 1; i < map->count; i++) {
-    map->items[i - 1] = map->items[i];
+  size_t last = map->count - 1;
+  if (idx != last) {
+    /* Swap-remove; entry order carries no meaning for these maps. */
+    map->items[idx] = map->items[last];
+    if (map->items[idx].name) {
+      ir_tvm_index_move(map, map->items[idx].name, last, idx);
+    }
   }
   map->count--;
 }
@@ -547,8 +727,10 @@ int ir_temp_value_map_set(IRTempValueMap *map, const char *name,
       return 0;
     }
 
+    ir_tvm_vsym_note_value(map, &map->items[existing].value, -1);
     ir_operand_destroy(&map->items[existing].value);
     map->items[existing].value = cloned;
+    ir_tvm_vsym_note_value(map, &map->items[existing].value, 1);
     return 1;
   }
 
@@ -574,12 +756,26 @@ int ir_temp_value_map_set(IRTempValueMap *map, const char *name,
   map->items[map->count].name = name_copy;
   map->items[map->count].value = cloned;
   map->count++;
+  ir_tvm_vsym_note_value(map, &map->items[map->count - 1].value, 1);
+  if (map->ix && (map->count + map->ix_tombstones) * 2 < map->ix_capacity) {
+    ir_tvm_index_insert(map, name_copy, map->count - 1);
+  } else {
+    ir_temp_value_map_reindex(map);
+  }
   return 1;
 }
 
 void ir_temp_value_map_remove_symbol_values(IRTempValueMap *map,
                                                    const char *symbol_name) {
   if (!map) {
+    return;
+  }
+
+  /* O(1) fast path: nothing in the map values this symbol. This call happens
+   * once per symbol WRITE in copy-propagation, so without the reverse count
+   * it was an O(entries) scan per write -- quadratic on inlined functions. */
+  if (symbol_name && ir_tvm_vsym_ensure(map) &&
+      !ir_temp_value_map_lookup(map->vsym_counts, symbol_name)) {
     return;
   }
 
@@ -595,6 +791,7 @@ void ir_temp_value_map_remove_symbol_values(IRTempValueMap *map,
     }
 
     if (remove) {
+      ir_tvm_vsym_note_value(map, &entry->value, -1);
       free(entry->name);
       ir_operand_destroy(&entry->value);
       continue;
@@ -606,7 +803,32 @@ void ir_temp_value_map_remove_symbol_values(IRTempValueMap *map,
     write++;
   }
 
-  map->count = write;
+  if (map->count != write) {
+    map->count = write;
+    ir_temp_value_map_reindex(map);
+  }
+}
+
+/* The set of symbols whose address is taken anywhere in `function`, built in
+ * one scan so store invalidation can test membership in O(1) instead of
+ * rescanning the whole function per map entry per store. The pass that uses
+ * it builds it once: copy-propagation never introduces ADDRESS_OF, so the set
+ * is stable across a pass run. */
+int ir_addr_taken_set_build(const IRFunction *function, IRTempValueMap *set) {
+  static const IROperand one = {.kind = IR_OPERAND_INT, .int_value = 1};
+  if (!function || !set) {
+    return 0;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_ADDRESS_OF && ins->lhs.kind == IR_OPERAND_SYMBOL &&
+        ins->lhs.name) {
+      if (!ir_temp_value_map_set(set, ins->lhs.name, &one)) {
+        return 0;
+      }
+    }
+  }
+  return 1;
 }
 
 /* Store-aware invalidation for copy-propagation's temp and symbol value maps.
@@ -620,7 +842,7 @@ void ir_temp_value_map_remove_symbol_values(IRTempValueMap *map,
  * symbol map (keys are symbols). Matches the old clear-on-store for escaped
  * symbols while preserving non-escaped ones. */
 void ir_temp_value_map_invalidate_after_store(IRTempValueMap *map,
-                                              const IRFunction *function) {
+                                              const IRTempValueMap *addr_taken) {
   if (!map) {
     return;
   }
@@ -630,16 +852,17 @@ void ir_temp_value_map_invalidate_after_store(IRTempValueMap *map,
     IRTempValueEntry *entry = &map->items[read];
     int remove = 0;
 
-    if (entry->name && ir_symbol_address_taken(function, entry->name)) {
+    if (entry->name && ir_temp_value_map_lookup(addr_taken, entry->name)) {
       remove = 1;
     }
     if (!remove && entry->value.kind == IR_OPERAND_SYMBOL &&
         entry->value.name &&
-        ir_symbol_address_taken(function, entry->value.name)) {
+        ir_temp_value_map_lookup(addr_taken, entry->value.name)) {
       remove = 1;
     }
 
     if (remove) {
+      ir_tvm_vsym_note_value(map, &entry->value, -1);
       free(entry->name);
       ir_operand_destroy(&entry->value);
       continue;
@@ -651,7 +874,26 @@ void ir_temp_value_map_invalidate_after_store(IRTempValueMap *map,
     write++;
   }
 
-  map->count = write;
+  if (map->count != write) {
+    map->count = write;
+    ir_temp_value_map_reindex(map);
+  }
+}
+
+int ir_temp_value_map_any_value_symbol(IRTempValueMap *map,
+                                       const char *symbol_name) {
+  if (!map || !symbol_name) {
+    return 1; /* unknown: caller must scan */
+  }
+  if (!ir_tvm_vsym_ensure(map)) {
+    return 1;
+  }
+  return ir_temp_value_map_lookup(map->vsym_counts, symbol_name) != NULL;
+}
+
+void ir_temp_value_map_note_value_removed(IRTempValueMap *map,
+                                          const IROperand *value) {
+  ir_tvm_vsym_note_value(map, value, -1);
 }
 
 const IROperand *ir_temp_value_map_lookup(const IRTempValueMap *map,
@@ -678,6 +920,13 @@ void ir_temp_value_map_clear(IRTempValueMap *map) {
     ir_operand_destroy(&map->items[i].value);
   }
   map->count = 0;
+  if (map->ix) {
+    memset(map->ix, 0, map->ix_capacity * sizeof(unsigned int));
+  }
+  map->ix_tombstones = 0;
+  if (map->vsym_counts) {
+    ir_temp_value_map_clear(map->vsym_counts);
+  }
 }
 
 void ir_temp_value_map_destroy(IRTempValueMap *map) {
@@ -685,10 +934,21 @@ void ir_temp_value_map_destroy(IRTempValueMap *map) {
     return;
   }
 
+  if (map->vsym_counts) {
+    /* Detach first so the recursive destroy (depth 1: counts hold ints,
+     * never their own counts) doesn't see a half-torn map. */
+    IRTempValueMap *counts = map->vsym_counts;
+    map->vsym_counts = NULL;
+    ir_temp_value_map_destroy(counts);
+    free(counts);
+  }
   ir_temp_value_map_clear(map);
   free(map->items);
   map->items = NULL;
   map->capacity = 0;
+  free(map->ix);
+  map->ix = NULL;
+  map->ix_capacity = 0;
 }
 
 int ir_temp_value_map_clone(IRTempValueMap *dest,
@@ -738,7 +998,7 @@ int ir_label_value_map_init(IRLabelValueMap *map) {
   map->items = NULL;
   map->count = 0;
   map->capacity = 0;
-  return 1;
+  return ir_temp_value_map_init(&map->index);
 }
 
 static int ir_label_value_map_find(const IRLabelValueMap *map,
@@ -746,12 +1006,8 @@ static int ir_label_value_map_find(const IRLabelValueMap *map,
   if (!map || !label) {
     return -1;
   }
-  for (size_t i = 0; i < map->count; i++) {
-    if (map->items[i].label && strcmp(map->items[i].label, label) == 0) {
-      return (int)i;
-    }
-  }
-  return -1;
+  const IROperand *slot = ir_temp_value_map_lookup(&map->index, label);
+  return slot ? (int)slot->int_value : -1;
 }
 
 static IRLabelValueEntry *ir_label_value_map_get_or_add(IRLabelValueMap *map,
@@ -785,6 +1041,13 @@ static IRLabelValueEntry *ir_label_value_map_get_or_add(IRLabelValueMap *map,
     return NULL;
   }
   entry->initialized = 0;
+  IROperand slot = {.kind = IR_OPERAND_INT, .int_value = (long long)map->count};
+  if (!ir_temp_value_map_set(&map->index, label, &slot)) {
+    free(entry->label);
+    entry->label = NULL;
+    ir_temp_value_map_destroy(&entry->in_map);
+    return NULL;
+  }
   map->count++;
   return entry;
 }
@@ -840,6 +1103,7 @@ void ir_label_value_map_destroy(IRLabelValueMap *map) {
   map->items = NULL;
   map->count = 0;
   map->capacity = 0;
+  ir_temp_value_map_destroy(&map->index);
 }
 
 int ir_operand_equals(const IROperand *lhs, const IROperand *rhs) {
@@ -1442,6 +1706,7 @@ int ir_collect_instruction_temp_uses(IRTempUseMap *uses,
   case IR_OP_SIMD_SUM_I32:
   case IR_OP_SIMD_SUM_U8:
   case IR_OP_SIMD_BYTE_MAP:
+  case IR_OP_SIMD_FILL:
   case IR_OP_SIMD_MATMUL_N32:
   case IR_OP_SIMD_INSERTION_SORT_I32:
   case IR_OP_SIMD_DOT_I32:

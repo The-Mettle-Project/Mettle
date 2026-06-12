@@ -31,7 +31,17 @@ void ir_optimize_reset_user_error(void) { g_simd_contract_user_error = 0; }
 
 int ir_optimize_had_user_error(void) { return g_simd_contract_user_error; }
 
+/* Other contract checkers (`@inline!`, `@noalloc`) report through the same
+ * "user error, not ICE" channel `@simd!` uses. */
+void ir_optimize_note_user_error(void) { g_simd_contract_user_error = 1; }
+
 void ir_optimize_set_simd_report(int enabled) { g_simd_report = enabled; }
+
+/* Program access for program-level fix simulations (call-in-body re-runs the
+ * inliner, which needs callee lookup). NULL outside the per-function stage. */
+static IRProgram *g_explain_program = NULL;
+
+void ir_explain_set_program(IRProgram *program) { g_explain_program = program; }
 
 static int ir_instruction_is_simd_marker(const IRInstruction *instruction) {
   return instruction && instruction->op == IR_OP_NOP && instruction->text &&
@@ -46,11 +56,13 @@ static int ir_op_is_vectorized(IROpcode op) {
   return op >= IR_OP_COUNT_WORD_STARTS && op <= IR_OP_SIMD_OUTER_LANE_F64;
 }
 
-/* If the loop body in (begin, end) was vectorized at this nesting depth (i.e.
- * the op is not one belonging to a nested `@simd` loop), return that opcode;
- * otherwise return -1. */
-static int ir_region_vectorized_op(const IRFunction *function, size_t begin,
-                                   size_t end) {
+/* First vectorized instruction in (begin, end). With any_depth == 0 only ops
+ * at this loop's own nesting level count (ops inside a nested marked loop
+ * belong to that loop); with any_depth == 1 the whole region counts. Returns
+ * NULL when nothing vectorized. */
+static const IRInstruction *ir_region_vectorized_ins(const IRFunction *function,
+                                                     size_t begin, size_t end,
+                                                     int any_depth) {
   int depth = 0;
   for (size_t i = begin + 1; i < end; i++) {
     const IRInstruction *instruction = &function->instructions[i];
@@ -59,11 +71,33 @@ static int ir_region_vectorized_op(const IRFunction *function, size_t begin,
                                                                          : -1;
       continue;
     }
-    if (depth == 0 && ir_op_is_vectorized(instruction->op)) {
-      return (int)instruction->op;
+    if ((any_depth || depth == 0) && ir_op_is_vectorized(instruction->op)) {
+      return instruction;
     }
   }
-  return -1;
+  return NULL;
+}
+
+static int ir_region_vectorized_op(const IRFunction *function, size_t begin,
+                                   size_t end) {
+  const IRInstruction *ins = ir_region_vectorized_ins(function, begin, end, 0);
+  return ins ? (int)ins->op : -1;
+}
+
+/* True when (begin, end) still contains a loop header label -- i.e. an actual
+ * loop survived optimization. A region with markers but no loop label was
+ * fully unrolled (constant trip count) or removed outright. */
+static int ir_region_has_loop_label(const IRFunction *function, size_t begin,
+                                    size_t end) {
+  for (size_t i = begin + 1; i < end; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_LABEL && ins->text &&
+        (strstr(ins->text, "ir_while_") != NULL ||
+         strstr(ins->text, "ir_for_cond_") != NULL)) {
+      return 1;
+    }
+  }
+  return 0;
 }
 
 /* A branch/jump whose target is one of the runtime-check labels the lowerer
@@ -89,8 +123,22 @@ static const char *ir_simd_bail_reason(const IRFunction *function, size_t begin,
   int has_call = 0, has_new = 0, has_asm = 0;
   int branch_count = 0, jump_count = 0;
   int has_i16 = 0, has_i64 = 0; /* unsupported memory element widths */
+  int past_header = 0;
   for (size_t i = begin + 1; i < end; i++) {
     const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_LABEL) {
+      if (ins->text && (strstr(ins->text, "ir_while_") != NULL ||
+                        strstr(ins->text, "ir_for_cond_") != NULL)) {
+        past_header = 1;
+      }
+      continue;
+    }
+    /* Skip the once-only preamble between the begin marker and the header
+     * label (a for-loop's initializer, hoisted pure calls): it is not the
+     * loop and must not drive the diagnosis. */
+    if (!past_header) {
+      continue;
+    }
     switch (ins->op) {
     case IR_OP_CALL:
     case IR_OP_CALL_INDIRECT:
@@ -166,6 +214,1003 @@ static const char *ir_simd_bail_reason(const IRFunction *function, size_t begin,
          "a loop-carried dependence, or a reduction/operation no kernel covers)";
 }
 
+/* Stable names for the IRSimdBailId schema (internal header). Used by future
+ * structured output; kept in one place so the enum and names stay in sync. */
+const char *ir_simd_bail_id_name(int id) {
+  switch ((IRSimdBailId)id) {
+  case IR_SIMD_BAIL_NONE:                return "none";
+  case IR_SIMD_BAIL_CALL_IN_BODY:        return "call-in-body";
+  case IR_SIMD_BAIL_EXTERN_CALL_IN_BODY: return "extern-call-in-body";
+  case IR_SIMD_BAIL_INDIRECT_CALL:       return "indirect-call";
+  case IR_SIMD_BAIL_ALLOC_IN_BODY:       return "alloc-in-body";
+  case IR_SIMD_BAIL_INLINE_ASM:          return "inline-asm";
+  case IR_SIMD_BAIL_CONTROL_FLOW:        return "control-flow";
+  case IR_SIMD_BAIL_EARLY_EXIT:          return "early-exit";
+  case IR_SIMD_BAIL_INT16_ELEMENTS:      return "int16-elements";
+  case IR_SIMD_BAIL_INT64_ELEMENTS:      return "int64-elements";
+  case IR_SIMD_BAIL_SERIAL_RECURRENCE:   return "serial-recurrence";
+  case IR_SIMD_BAIL_MIXED_FLOAT_WIDTHS:  return "mixed-float-widths";
+  case IR_SIMD_BAIL_BYTE_SUM_NARROW_ACC: return "byte-sum-narrow-acc";
+  case IR_SIMD_BAIL_I32_SUM_NARROW_ACC:  return "int32-sum-narrow-acc";
+  case IR_SIMD_BAIL_INLINED_PARAM_LOCAL: return "inlined-param-local";
+  case IR_SIMD_BAIL_BODY_LOCAL:          return "body-local";
+  case IR_SIMD_BAIL_DOT_SHAPE_ADDRESS:   return "dot-shape-address";
+  case IR_SIMD_BAIL_STORE_ONLY_FILL:     return "store-only-fill";
+  case IR_SIMD_BAIL_UNRECOGNIZED_SHAPE:  return "unrecognized-shape";
+  }
+  return "unknown";
+}
+
+#define IR_SIMD_SET_DIAG(value)                                                \
+  do {                                                                         \
+    if (diagnosis_out) {                                                       \
+      *diagnosis_out = (value);                                                \
+    }                                                                          \
+  } while (0)
+
+/* --explain: a deeper diagnosis than ir_simd_bail_reason, split into a reason
+ * (what blocked vectorization), a fix (what the user can change), and a
+ * machine-readable IRSimdBailId every branch must set. Best-effort but never
+ * speculative: each claim is derived from instructions actually present in
+ * the region. Empty fix = nothing actionable. */
+static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
+                                 size_t end, char *reason, size_t reason_cap,
+                                 char *fix, size_t fix_cap,
+                                 int *diagnosis_out) {
+  reason[0] = '\0';
+  fix[0] = '\0';
+  IR_SIMD_SET_DIAG(IR_SIMD_BAIL_UNRECOGNIZED_SHAPE);
+
+  const char *callee = NULL;
+  int has_indirect_call = 0, has_new = 0, has_asm = 0;
+  int branch_count = 0, jump_count = 0;
+  const char *branch_targets[8];
+  size_t branch_target_count = 0;
+  int has_return_in_body = 0;
+  int has_i16 = 0, has_i64 = 0, has_f32 = 0, has_f64 = 0;
+  int has_byte_load = 0, has_i32_load = 0, has_int_accum = 0;
+  const char *int_accum_sym = NULL;
+  int has_float_accum = 0, has_float_mul = 0;
+  int load_count = 0, store_count = 0;
+  int past_header = 0; /* seen the loop's own header label yet? */
+  const char *body_local = NULL;
+  const char *recur_symbol = NULL;
+  char recur_op = 0;
+
+  for (size_t i = begin + 1; i < end; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_LABEL) {
+      if (ins->text && (strstr(ins->text, "ir_while_") != NULL ||
+                        strstr(ins->text, "ir_for_cond_") != NULL)) {
+        past_header = 1;
+      }
+      continue;
+    }
+    /* The marker region starts BEFORE a for-loop's initializer, and hoisted
+     * preamble code (pure-call LICM results, pointer setup) lands there too.
+     * Everything before the header label runs ONCE -- it is not the loop, so
+     * it must not drive the diagnosis. */
+    if (!past_header) {
+      continue;
+    }
+    switch (ins->op) {
+    case IR_OP_DECLARE_LOCAL:
+      /* A local declared INSIDE the loop body (after the header label -- a
+       * range-for's induction local sits between the markers but BEFORE the
+       * header and is fine) is one no recognizer's load->compute->store
+       * matching can see through. The common source is an inlined callee's
+       * parameter copy that copy-propagation couldn't fold (float32 narrowing
+       * keeps the copy alive). */
+      if (past_header && !body_local && ins->dest.kind == IR_OPERAND_SYMBOL &&
+          ins->dest.name) {
+        body_local = ins->dest.name;
+      }
+      break;
+    case IR_OP_CALL:
+      if (!(ins->text && strstr(ins->text, "crash_trap")) && !callee) {
+        callee = ins->text ? ins->text : "?";
+      }
+      break;
+    case IR_OP_CALL_INDIRECT:
+      has_indirect_call = 1;
+      break;
+    case IR_OP_NEW:
+      has_new = 1;
+      break;
+    case IR_OP_INLINE_ASM:
+      has_asm = 1;
+      break;
+    case IR_OP_BRANCH_ZERO:
+    case IR_OP_BRANCH_EQ:
+      if (!ir_label_is_runtime_check(ins->text)) {
+        branch_count++;
+        if (ins->text && branch_target_count < 8) {
+          branch_targets[branch_target_count++] = ins->text;
+        }
+      }
+      break;
+    case IR_OP_JUMP:
+      if (!ir_label_is_runtime_check(ins->text)) {
+        jump_count++;
+      }
+      break;
+    case IR_OP_RETURN:
+      /* A return INSIDE the loop body is the definitive early-exit marker
+       * (`if (...) return x;` -- the find/compare/parse shape). */
+      has_return_in_body = 1;
+      break;
+    case IR_OP_LOAD:
+    case IR_OP_STORE: {
+      if (ins->op == IR_OP_LOAD) {
+        load_count++;
+      } else {
+        store_count++;
+      }
+      long long sz = (ins->rhs.kind == IR_OPERAND_INT) ? ins->rhs.int_value : 4;
+      if (ins->is_float) {
+        if (sz == 4) {
+          has_f32 = 1;
+        } else if (sz == 8) {
+          has_f64 = 1;
+        }
+      } else {
+        if (sz == 1 && ins->op == IR_OP_LOAD) {
+          has_byte_load = 1;
+        } else if (sz == 2) {
+          has_i16 = 1;
+        } else if (sz == 4 && ins->op == IR_OP_LOAD) {
+          has_i32_load = 1;
+        } else if (sz == 8) {
+          has_i64 = 1;
+        }
+      }
+      break;
+    }
+    case IR_OP_BINARY: {
+      /* Integer '+' accumulation of a computed value into a symbol
+       * (`total = total + %t`): together with byte loads this identifies the
+       * vpsadbw byte-sum shape, whose kernel requires an int64 accumulator.
+       * The added operand must be a temp -- `i = i + 1` (a constant) is an
+       * induction variable, not a data sum. */
+      if (!ins->is_float && ins->text && ins->text[0] == '+' &&
+          !ins->text[1] && ins->dest.kind == IR_OPERAND_SYMBOL &&
+          ins->dest.name &&
+          ((ins->lhs.kind == IR_OPERAND_SYMBOL && ins->lhs.name &&
+            strcmp(ins->lhs.name, ins->dest.name) == 0 &&
+            ins->rhs.kind == IR_OPERAND_TEMP) ||
+           (ins->rhs.kind == IR_OPERAND_SYMBOL && ins->rhs.name &&
+            strcmp(ins->rhs.name, ins->dest.name) == 0 &&
+            ins->lhs.kind == IR_OPERAND_TEMP))) {
+        has_int_accum = 1;
+        int_accum_sym = ins->dest.name;
+      }
+      /* Float multiply + float '+' accumulation = a dot-product-shaped
+       * reduction (used below to give an address-pattern diagnosis when no
+       * kernel claimed it). */
+      if (ins->is_float && ins->text && ins->text[0] == '*' && !ins->text[1]) {
+        has_float_mul = 1;
+      }
+      if (ins->is_float && ins->text && ins->text[0] == '+' &&
+          !ins->text[1] &&
+          ((ins->lhs.kind == IR_OPERAND_SYMBOL && ins->lhs.name) ||
+           (ins->rhs.kind == IR_OPERAND_SYMBOL && ins->rhs.name))) {
+        has_float_accum = 1;
+      }
+      /* Serial recurrence through a float symbol: `s = s * x` / `s = s / x`,
+       * either directly (dest is the symbol) or via the usual temp+ASSIGN
+       * pair. '+'/'-' accumulations are NOT flagged -- those reassociate and
+       * have reduction kernels; '*' and '/' chains are genuinely serial. */
+      if (recur_symbol || !ins->is_float || !ins->text ||
+          (ins->text[0] != '*' && ins->text[0] != '/') || ins->text[1]) {
+        break;
+      }
+      const char *lhs_sym =
+          ins->lhs.kind == IR_OPERAND_SYMBOL ? ins->lhs.name : NULL;
+      const char *rhs_sym =
+          ins->rhs.kind == IR_OPERAND_SYMBOL ? ins->rhs.name : NULL;
+      if (ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name) {
+        if ((lhs_sym && strcmp(lhs_sym, ins->dest.name) == 0) ||
+            (rhs_sym && strcmp(rhs_sym, ins->dest.name) == 0)) {
+          recur_symbol = ins->dest.name;
+          recur_op = ins->text[0];
+        }
+      } else if (ins->dest.kind == IR_OPERAND_TEMP && ins->dest.name) {
+        for (size_t j = i + 1; j < end && j < i + 9; j++) {
+          const IRInstruction *later = &function->instructions[j];
+          if (later->op == IR_OP_ASSIGN &&
+              later->dest.kind == IR_OPERAND_SYMBOL && later->dest.name &&
+              later->lhs.kind == IR_OPERAND_TEMP && later->lhs.name &&
+              strcmp(later->lhs.name, ins->dest.name) == 0) {
+            if ((lhs_sym && strcmp(lhs_sym, later->dest.name) == 0) ||
+                (rhs_sym && strcmp(rhs_sym, later->dest.name) == 0)) {
+              recur_symbol = later->dest.name;
+              recur_op = ins->text[0];
+            }
+            break;
+          }
+        }
+      }
+      break;
+    }
+    default:
+      break;
+    }
+  }
+
+  if (callee) {
+    /* Advice differs fundamentally by what the callee IS: a program-defined
+     * function can be inlined (and that fix can be simulated); an extern has
+     * no body, so "mark it @inline" would be advice that cannot work. */
+    IRFunction *callee_fn =
+        g_explain_program ? ir_program_find_function(g_explain_program, callee)
+                          : NULL;
+    if (g_explain_program && !callee_fn) {
+      snprintf(reason, reason_cap,
+               "each iteration calls `%s`, an external function with no body "
+               "this compiler can see -- it can never be inlined, so this "
+               "loop cannot vectorize as written",
+               callee);
+      snprintf(fix, fix_cap,
+               "none needed if the call IS the work (I/O, OS calls): the "
+               "scalar loop is the right code; if the call is loop-invariant, "
+               "hoist it; if it is hot compute, replace it with Mettle code "
+               "so the inliner can take it");
+      IR_SIMD_SET_DIAG(IR_SIMD_BAIL_EXTERN_CALL_IN_BODY);
+      return;
+    }
+    snprintf(reason, reason_cap,
+             "each iteration calls `%s`; loops vectorize only after every "
+             "call in the body has been inlined away",
+             callee);
+    snprintf(fix, fix_cap,
+             "make `%s` inline-eligible (small body, or mark it @inline), or "
+             "hoist the call out of the loop",
+             callee);
+    IR_SIMD_SET_DIAG(IR_SIMD_BAIL_CALL_IN_BODY);
+    return;
+  }
+  if (has_indirect_call) {
+    snprintf(reason, reason_cap,
+             "each iteration calls through a function pointer, which can "
+             "never be inlined away");
+    snprintf(fix, fix_cap,
+             "call the target directly if it is known at compile time");
+    IR_SIMD_SET_DIAG(IR_SIMD_BAIL_INDIRECT_CALL);
+    return;
+  }
+  if (has_new) {
+    snprintf(reason, reason_cap, "the loop body allocates memory (`new`) "
+                                 "every iteration");
+    snprintf(fix, fix_cap, "hoist the allocation out of the loop");
+    IR_SIMD_SET_DIAG(IR_SIMD_BAIL_ALLOC_IN_BODY);
+    return;
+  }
+  if (has_asm) {
+    snprintf(reason, reason_cap,
+             "the loop body contains inline assembly, which is opaque to the "
+             "vectorizer");
+    IR_SIMD_SET_DIAG(IR_SIMD_BAIL_INLINE_ASM);
+    return;
+  }
+  if (branch_count > 1 || jump_count > 1) {
+    /* Early exit vs internal branching deserve OPPOSITE advice. A branch
+     * whose target label is not inside the region leaves the loop before the
+     * trip count -- a compare/search shape where the early exit IS the
+     * algorithm and scalar code is the right output. A branch that stays
+     * inside the region is a data-dependent diamond, where branchless
+     * rewriting is real advice. (The first body branch is usually the
+     * loop's own exit test, so it is expected to leave the region; only an
+     * ADDITIONAL outward branch marks an early exit.) */
+    int outward_branches = 0;
+    for (size_t t = 0; t < branch_target_count; t++) {
+      int inside = 0;
+      for (size_t i = begin + 1; i < end && !inside; i++) {
+        const IRInstruction *lab = &function->instructions[i];
+        if (lab->op == IR_OP_LABEL && lab->text &&
+            strcmp(lab->text, branch_targets[t]) == 0) {
+          inside = 1;
+        }
+      }
+      if (!inside) {
+        outward_branches++;
+      }
+    }
+    if (has_return_in_body || outward_branches > 1) {
+      snprintf(reason, reason_cap,
+               "the loop can exit before its trip count (a compare/search "
+               "shape); SIMD runs all iterations in lockstep, so an early "
+               "exit defeats it");
+      snprintf(fix, fix_cap,
+               "usually nothing: when the early exit is the point (find, "
+               "compare, parse), the scalar loop is the right code -- "
+               "vectorizing it needs a dedicated kernel, not a source change");
+      IR_SIMD_SET_DIAG(IR_SIMD_BAIL_EARLY_EXIT);
+      return;
+    }
+    snprintf(reason, reason_cap,
+             "the loop body branches on data (an `if` or `&&`/`||` per "
+             "iteration); only straight-line bodies vectorize");
+    snprintf(fix, fix_cap,
+             "compute both arms and select arithmetically (branchless), or "
+             "split the work into two simpler loops");
+    IR_SIMD_SET_DIAG(IR_SIMD_BAIL_CONTROL_FLOW);
+    return;
+  }
+  if (has_i16) {
+    snprintf(reason, reason_cap,
+             "the loop reads/writes 16-bit integers, and no 16-bit kernels "
+             "exist");
+    if (has_int_accum) {
+      /* The int32 sum kernel additionally requires an int64 accumulator, so
+       * for a sum loop the honest fix names every needed change (and the
+       * paired hypothesis transform simulates exactly this). When the
+       * accumulator is already int64, retyping the elements is the whole
+       * fix. */
+      const char *acc_type =
+          int_accum_sym ? ir_function_local_declared_type(function,
+                                                          int_accum_sym)
+                        : NULL;
+      if (acc_type && strcmp(acc_type, "int64") == 0) {
+        snprintf(fix, fix_cap, "use int32 elements");
+      } else {
+        snprintf(fix, fix_cap,
+                 "use int32 elements and declare the accumulator as int64");
+      }
+    } else {
+      snprintf(fix, fix_cap, "use int32 (or int8 if the values fit)");
+    }
+    IR_SIMD_SET_DIAG(IR_SIMD_BAIL_INT16_ELEMENTS);
+    return;
+  }
+  if (has_i64) {
+    snprintf(reason, reason_cap,
+             "the loop reads/writes 64-bit integer arrays, and no 64-bit "
+             "integer kernels exist");
+    snprintf(fix, fix_cap, "use int32 arrays if the values fit");
+    IR_SIMD_SET_DIAG(IR_SIMD_BAIL_INT64_ELEMENTS);
+    return;
+  }
+  if (recur_symbol) {
+    snprintf(reason, reason_cap,
+             "`%s` carries a serial `%c` recurrence -- every iteration needs "
+             "the previous iteration's value, so lanes cannot run "
+             "independently",
+             recur_symbol, recur_op);
+    snprintf(fix, fix_cap,
+             "'+' reductions vectorize (they reassociate); serial '*'/'/' "
+             "chains generally cannot -- if the recurrence is the point, this "
+             "loop is at its scalar floor");
+    IR_SIMD_SET_DIAG(IR_SIMD_BAIL_SERIAL_RECURRENCE);
+    return;
+  }
+  if (has_f32 && has_f64) {
+    snprintf(reason, reason_cap,
+             "the loop mixes float32 and float64 elements; each kernel "
+             "handles one width");
+    snprintf(fix, fix_cap, "keep the loop in a single float width");
+    IR_SIMD_SET_DIAG(IR_SIMD_BAIL_MIXED_FLOAT_WIDTHS);
+    return;
+  }
+  if (has_byte_load && has_int_accum) {
+    snprintf(reason, reason_cap,
+             "this is a byte-sum loop, but the vpsadbw kernel accumulates "
+             "into int64 and this loop's accumulator is narrower");
+    snprintf(fix, fix_cap,
+             "declare the accumulator as int64 (sum bytes as "
+             "`total = total + (int64)data[i]`)");
+    IR_SIMD_SET_DIAG(IR_SIMD_BAIL_BYTE_SUM_NARROW_ACC);
+    return;
+  }
+  if (has_i32_load && int_accum_sym) {
+    const char *acc_type =
+        ir_function_local_declared_type(function, int_accum_sym);
+    if (!acc_type || strcmp(acc_type, "int64") != 0) {
+      snprintf(reason, reason_cap,
+               "this loop sums int32 values into `%s`, but the int32 "
+               "reduction kernel accumulates into int64 (eight lanes are "
+               "summed without overflow only there) and `%s` is %s",
+               int_accum_sym, int_accum_sym, acc_type ? acc_type : "narrower");
+      snprintf(fix, fix_cap, "declare the accumulator `%s` as int64",
+               int_accum_sym);
+      IR_SIMD_SET_DIAG(IR_SIMD_BAIL_I32_SUM_NARROW_ACC);
+      return;
+    }
+  }
+  if (body_local) {
+    if (strstr(body_local, "__inl_") != NULL) {
+      snprintf(reason, reason_cap,
+               "the body's data flow passes through the local `%s`, left over "
+               "from an inlined call; the recognizers' "
+               "load\xE2\x86\x92" "compute\xE2\x86\x92" "store matching "
+               "cannot see through it",
+               body_local);
+      snprintf(fix, fix_cap,
+               "a compiler limitation, not a code problem; write the "
+               "expression directly in the loop body to vectorize today");
+      IR_SIMD_SET_DIAG(IR_SIMD_BAIL_INLINED_PARAM_LOCAL);
+    } else {
+      snprintf(reason, reason_cap,
+               "the body declares the local `%s` each iteration; the "
+               "recognizers' load\xE2\x86\x92" "compute\xE2\x86\x92" "store "
+               "matching cannot see through it",
+               body_local);
+      snprintf(fix, fix_cap,
+               "declare `%s` before the loop, or fold the expression in "
+               "directly",
+               body_local);
+      IR_SIMD_SET_DIAG(IR_SIMD_BAIL_BODY_LOCAL);
+    }
+    return;
+  }
+  if (has_float_mul && has_float_accum && load_count >= 2) {
+    snprintf(reason, reason_cap,
+             "this is a float multiply-accumulate (dot-product shape), but no "
+             "kernel matched its address pattern -- the bases must be plain "
+             "pointers indexed by the loop counter (base[i])");
+    snprintf(fix, fix_cap,
+             "hoist invariant index math into a pointer before the loop "
+             "(e.g. `var row: float32* = &m[r * cols];` then `row[c]`)");
+    IR_SIMD_SET_DIAG(IR_SIMD_BAIL_DOT_SHAPE_ADDRESS);
+    return;
+  }
+  if (store_count > 0 && load_count == 0) {
+    snprintf(reason, reason_cap,
+             "the loop only writes (a fill/init pattern, no array reads); the "
+             "recognizers cover maps, reductions, and dot products over "
+             "loaded data, and no constant-fill kernel exists yet");
+    IR_SIMD_SET_DIAG(IR_SIMD_BAIL_STORE_ONLY_FILL);
+    return;
+  }
+  snprintf(reason, reason_cap, "no vectorizer recognized this loop's shape");
+  snprintf(fix, fix_cap,
+           "vectorizable shapes are unit-stride accesses (a[i], not a[i*k]) "
+           "over int8/int32/float32/float64 with a straight-line body: maps "
+           "(a[i] = expr), '+' reductions (s = s + expr), and dot products");
+}
+
+/* ---- fix hypothesis simulation ---------------------------------------------
+ * "Verified" fix suggestions: apply the suggested source change as an
+ * equivalent IR rewrite on a scratch clone, re-run the real vectorization
+ * stages on it, and check whether a kernel claimed the loop. Only then does
+ * the report print `verified: with that change ...` -- the claim is the
+ * optimizer's own acceptance, not a prediction. */
+
+/* Marker id of the loop beginning at `begin` (-1 when unparsable). The clone's
+ * instruction indexes shift when passes rewrite it, so the loop is re-located
+ * by this id afterwards. */
+static int ir_simd_marker_id_at(const IRFunction *function, size_t begin) {
+  const IRInstruction *marker = &function->instructions[begin];
+  char which = 0;
+  int id = 0, mode = 0;
+  if (!ir_instruction_is_simd_marker(marker) ||
+      sscanf(marker->text + strlen(IR_SIMD_MARKER_PREFIX), "%c:%d:%d", &which,
+             &id, &mode) != 3) {
+    return -1;
+  }
+  return id;
+}
+
+/* Find the B/E marker pair with `id` in `function`; returns 1 and fills the
+ * region bounds on success. */
+static int ir_simd_find_marker_region(const IRFunction *function, int id,
+                                      size_t *begin_out, size_t *end_out) {
+  size_t begin = (size_t)-1;
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    char which = 0;
+    int marker_id = 0, mode = 0;
+    if (!ir_instruction_is_simd_marker(ins) ||
+        sscanf(ins->text + strlen(IR_SIMD_MARKER_PREFIX), "%c:%d:%d", &which,
+               &marker_id, &mode) != 3 ||
+        marker_id != id) {
+      continue;
+    }
+    if (which == 'B') {
+      begin = i;
+    } else if (begin != (size_t)-1) {
+      *begin_out = begin;
+      *end_out = i;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* A fix mutator applies one suggested source fix to the CLONE as the
+ * equivalent IR rewrite, scoped to the loop region [begin, end]. Returns 1
+ * when the rewrite was applied (the simulation may proceed), 0 when the
+ * expected shape wasn't found (no claim is made), and -1 when the mutator
+ * POSITIVELY established the suggested fix cannot be written for this loop
+ * (the report then replaces the advice instead of printing it). The clone is
+ * disposable: it only has to convince the recognizers, not execute -- which
+ * is what keeps mutators small. */
+#define IR_SIMD_FIX_INAPPLICABLE (-1)
+typedef int (*IRSimdFixMutator)(IRFunction *clone, size_t begin, size_t end);
+
+/* Widen the loop's integer accumulator to int64 on the clone, the way the
+ * suggested source fix would: retype its DECLARE_LOCAL, and retarget the
+ * widening cast feeding the accumulation when one exists. The byte-sum kernel
+ * insists on the cast form (`s += (int64)a[i]`); the int32 sum kernel also
+ * accepts the cast-free widening form, so `cast_required` distinguishes them. */
+static int ir_simd_widen_accumulator(IRFunction *clone, size_t begin,
+                                     size_t end, int cast_required) {
+  int rewrote_cast = 0, rewrote_decl = 0;
+  const char *acc_symbol = NULL;
+  /* Locate the accumulation `S = S + %t` in the region. */
+  for (size_t i = begin + 1; i < end && !acc_symbol; i++) {
+    const IRInstruction *ins = &clone->instructions[i];
+    if (ins->op == IR_OP_BINARY && !ins->is_float && ins->text &&
+        strcmp(ins->text, "+") == 0 && ins->dest.kind == IR_OPERAND_SYMBOL &&
+        ins->dest.name && ins->rhs.kind == IR_OPERAND_TEMP && ins->rhs.name &&
+        ins->lhs.kind == IR_OPERAND_SYMBOL && ins->lhs.name &&
+        strcmp(ins->lhs.name, ins->dest.name) == 0) {
+      acc_symbol = ins->dest.name;
+      /* The widening cast that produces %t, scanning backwards. */
+      for (size_t j = i; j-- > begin;) {
+        IRInstruction *cast = &clone->instructions[j];
+        if (cast->op == IR_OP_CAST && cast->dest.kind == IR_OPERAND_TEMP &&
+            cast->dest.name && strcmp(cast->dest.name, ins->rhs.name) == 0) {
+          free(cast->text);
+          cast->text = mettle_strdup("int64");
+          rewrote_cast = cast->text != NULL;
+          break;
+        }
+      }
+    }
+  }
+  if (!acc_symbol) {
+    return 0;
+  }
+  for (size_t i = 0; i < clone->instruction_count; i++) {
+    IRInstruction *decl = &clone->instructions[i];
+    if (decl->op == IR_OP_DECLARE_LOCAL &&
+        decl->dest.kind == IR_OPERAND_SYMBOL && decl->dest.name &&
+        strcmp(decl->dest.name, acc_symbol) == 0) {
+      free(decl->text);
+      decl->text = mettle_strdup("int64");
+      rewrote_decl = decl->text != NULL;
+      break;
+    }
+  }
+  return rewrote_decl && (rewrote_cast || !cast_required);
+}
+
+/* Mutator for IR_SIMD_BAIL_BYTE_SUM_NARROW_ACC ("declare the accumulator as
+ * int64"). */
+static int ir_simd_mutate_byte_sum_int64(IRFunction *clone, size_t begin,
+                                         size_t end) {
+  return ir_simd_widen_accumulator(clone, begin, end, 1);
+}
+
+/* Mutator for IR_SIMD_BAIL_I32_SUM_NARROW_ACC: the int32 sum kernel admits
+ * the cast-free widening form whenever the accumulator is declared int64, so
+ * only the declaration needs retyping. */
+static int ir_simd_mutate_i32_sum_int64(IRFunction *clone, size_t begin,
+                                        size_t end) {
+  return ir_simd_widen_accumulator(clone, begin, end, 0);
+}
+
+/* Retype the loop's integer memory accesses from `from_size` bytes to int32
+ * (loads/stores to size 4, the matching address scale shift to <<2), the IR
+ * image of "use int32 elements". When the loop accumulates, the accumulator
+ * is also widened to int64 (the int32 sum kernel's requirement, and what the
+ * paired fix text tells the user). */
+static int ir_simd_retype_int_elems_to_i32(IRFunction *clone, size_t begin,
+                                           size_t end, long long from_size,
+                                           long long from_shift) {
+  int rewrote = 0;
+  for (size_t i = begin + 1; i < end; i++) {
+    IRInstruction *ins = &clone->instructions[i];
+    if ((ins->op == IR_OP_LOAD || ins->op == IR_OP_STORE) && !ins->is_float &&
+        ins->rhs.kind == IR_OPERAND_INT && ins->rhs.int_value == from_size) {
+      ins->rhs.int_value = 4;
+      rewrote = 1;
+      continue;
+    }
+    if (ins->op == IR_OP_BINARY && !ins->is_float && ins->text &&
+        strcmp(ins->text, "<<") == 0 && ins->rhs.kind == IR_OPERAND_INT &&
+        ins->rhs.int_value == from_shift &&
+        ins->lhs.kind == IR_OPERAND_SYMBOL) {
+      ins->rhs.int_value = 2;
+    }
+  }
+  if (!rewrote) {
+    return 0;
+  }
+  /* Best-effort: maps have no accumulator, sums need theirs widened. */
+  ir_simd_widen_accumulator(clone, begin, end, 0);
+  return 1;
+}
+
+/* Mutator for IR_SIMD_BAIL_INT16_ELEMENTS ("use int32 elements ..."). */
+static int ir_simd_mutate_int16_to_i32(IRFunction *clone, size_t begin,
+                                       size_t end) {
+  return ir_simd_retype_int_elems_to_i32(clone, begin, end, 2, 1);
+}
+
+/* Mutator for IR_SIMD_BAIL_INT64_ELEMENTS ("use int32 arrays ..."). */
+static int ir_simd_mutate_int64_to_i32(IRFunction *clone, size_t begin,
+                                       size_t end) {
+  return ir_simd_retype_int_elems_to_i32(clone, begin, end, 8, 3);
+}
+
+/* True when some instruction in (begin, end) writes the symbol `sym`. */
+static int ir_simd_symbol_written_in_region(const IRFunction *function,
+                                            size_t begin, size_t end,
+                                            const char *sym) {
+  for (size_t i = begin + 1; i < end; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ir_instruction_writes_destination(ins) &&
+        ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name &&
+        strcmp(ins->dest.name, sym) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* True when the value of `sym`/`temp` is invariant across the loop region:
+ * not the iv, and (transitively) reading no symbol the body writes.
+ * Conservative: an unresolvable producer or a chain deeper than the budget
+ * counts as variant, so a "yes" is trustworthy. */
+static int ir_simd_symbol_is_region_invariant(const IRFunction *function,
+                                              size_t begin, size_t end,
+                                              const char *sym,
+                                              const char *iv) {
+  if (!sym || strcmp(sym, iv) == 0) {
+    return 0;
+  }
+  return !ir_simd_symbol_written_in_region(function, begin, end, sym);
+}
+
+static int ir_simd_temp_is_region_invariant(const IRFunction *function,
+                                            size_t begin, size_t end,
+                                            size_t before, const char *temp,
+                                            const char *iv, int depth) {
+  if (depth > 4) {
+    return 0;
+  }
+  const IRInstruction *producer =
+      ir_find_temp_producer_before(function, before, temp);
+  if (!producer) {
+    return 0;
+  }
+  const IROperand *sides[2] = {&producer->lhs, &producer->rhs};
+  for (int s = 0; s < 2; s++) {
+    if (sides[s]->kind == IR_OPERAND_SYMBOL && sides[s]->name &&
+        !ir_simd_symbol_is_region_invariant(function, begin, end,
+                                            sides[s]->name, iv)) {
+      return 0;
+    }
+    if (sides[s]->kind == IR_OPERAND_TEMP &&
+        (!sides[s]->name ||
+         !ir_simd_temp_is_region_invariant(function, begin, end, before,
+                                           sides[s]->name, iv, depth + 1))) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+/* Mutator for IR_SIMD_BAIL_DOT_SHAPE_ADDRESS ("hoist invariant index math
+ * into a pointer before the loop"): for each access whose index is
+ * `invariant + iv`, retarget it to a fresh row-pointer symbol indexed by the
+ * iv alone -- exactly the IR a hoisted `var row: T* = &m[inv];` + `row[iv]`
+ * produces inside the loop. All in place: the scale shift's operand becomes
+ * the iv, the address add's base becomes `__hypo_rowN`, and the dead
+ * index-add slot becomes that symbol's DECLARE_LOCAL (the recognizers consult
+ * only the declared type; the clone never executes). The invariance of the
+ * hoisted half IS checked (conservatively) -- otherwise the simulation could
+ * prove a fix the user cannot actually write. */
+static int ir_simd_mutate_dot_row_pointer(IRFunction *clone, size_t begin,
+                                          size_t end) {
+  const char *iv = NULL;
+  int past_header = 0;
+  int rewrites = 0;
+  int variant_index_seen = 0;
+
+  /* The loop's induction variable: lhs of the header's `iv < bound` compare. */
+  for (size_t i = begin + 1; i < end && !iv; i++) {
+    const IRInstruction *ins = &clone->instructions[i];
+    if (ins->op == IR_OP_LABEL) {
+      if (ins->text && (strstr(ins->text, "ir_while_") != NULL ||
+                        strstr(ins->text, "ir_for_cond_") != NULL)) {
+        past_header = 1;
+      }
+      continue;
+    }
+    if (past_header && ins->op == IR_OP_BINARY && !ins->is_float &&
+        ins->text && strcmp(ins->text, "<") == 0 &&
+        ins->lhs.kind == IR_OPERAND_SYMBOL && ins->lhs.name) {
+      iv = ins->lhs.name;
+    }
+  }
+  if (!iv) {
+    return 0;
+  }
+
+  for (size_t i = begin + 1; i < end; i++) {
+    IRInstruction *shl = &clone->instructions[i];
+    if (!(shl->op == IR_OP_BINARY && !shl->is_float && shl->text &&
+          strcmp(shl->text, "<<") == 0 && shl->rhs.kind == IR_OPERAND_INT &&
+          (shl->rhs.int_value == 2 || shl->rhs.int_value == 3) &&
+          shl->lhs.kind == IR_OPERAND_TEMP && shl->lhs.name &&
+          shl->dest.kind == IR_OPERAND_TEMP && shl->dest.name)) {
+      continue;
+    }
+    /* The shifted index must be `invariant + iv` (either order). */
+    IRInstruction *idx = NULL;
+    for (size_t j = i; j-- > begin;) {
+      IRInstruction *cand = &clone->instructions[j];
+      if (ir_instruction_writes_destination(cand) &&
+          cand->dest.kind == IR_OPERAND_TEMP && cand->dest.name &&
+          strcmp(cand->dest.name, shl->lhs.name) == 0) {
+        idx = cand;
+        break;
+      }
+    }
+    if (!idx || idx->op != IR_OP_BINARY || idx->is_float || !idx->text ||
+        strcmp(idx->text, "+") != 0) {
+      continue;
+    }
+    const IROperand *other = NULL;
+    if (idx->lhs.kind == IR_OPERAND_SYMBOL && idx->lhs.name &&
+        strcmp(idx->lhs.name, iv) == 0) {
+      other = &idx->rhs;
+    } else if (idx->rhs.kind == IR_OPERAND_SYMBOL && idx->rhs.name &&
+               strcmp(idx->rhs.name, iv) == 0) {
+      other = &idx->lhs;
+    } else {
+      continue;
+    }
+    /* The hoisted half must be loop-invariant across this region, or the
+     * verified claim would endorse a rewrite the user cannot make. */
+    if (other->kind == IR_OPERAND_SYMBOL) {
+      if (!ir_simd_symbol_is_region_invariant(clone, begin, end, other->name,
+                                              iv)) {
+        variant_index_seen = 1;
+        continue;
+      }
+    } else if (other->kind == IR_OPERAND_TEMP) {
+      if (!other->name ||
+          !ir_simd_temp_is_region_invariant(clone, begin, end, i, other->name,
+                                            iv, 0)) {
+        variant_index_seen = 1;
+        continue;
+      }
+    } else if (other->kind != IR_OPERAND_INT) {
+      continue;
+    }
+    /* The address add consuming the shifted index: `addr = base + %shifted`. */
+    IRInstruction *addr = NULL;
+    for (size_t k = i + 1; k < end; k++) {
+      IRInstruction *cand = &clone->instructions[k];
+      if (cand->op == IR_OP_BINARY && !cand->is_float && cand->text &&
+          strcmp(cand->text, "+") == 0 &&
+          cand->lhs.kind == IR_OPERAND_SYMBOL && cand->lhs.name &&
+          cand->rhs.kind == IR_OPERAND_TEMP && cand->rhs.name &&
+          strcmp(cand->rhs.name, shl->dest.name) == 0) {
+        addr = cand;
+        break;
+      }
+    }
+    if (!addr) {
+      continue;
+    }
+
+    char row_name[32];
+    snprintf(row_name, sizeof(row_name), "__hypo_row%d", rewrites);
+    const char *elem_type =
+        (shl->rhs.int_value == 3) ? "float64*" : "float32*";
+
+    ir_operand_destroy(&shl->lhs);
+    shl->lhs = ir_operand_symbol(iv);
+    ir_operand_destroy(&addr->lhs);
+    addr->lhs = ir_operand_symbol(row_name);
+    /* The index add is now dead; its slot becomes the row pointer's
+     * DECLARE_LOCAL so ir_symbol_is_float_array_base accepts the base. */
+    ir_instruction_destroy_storage(idx);
+    memset(idx, 0, sizeof(*idx));
+    idx->op = IR_OP_DECLARE_LOCAL;
+    idx->dest = ir_operand_symbol(row_name);
+    idx->text = mettle_strdup(elem_type);
+    rewrites++;
+  }
+  if (rewrites > 0) {
+    return 1;
+  }
+  /* The dot shape was there but its index half changes every iteration:
+   * the suggested hoist is positively unwritable, not merely unmatched. */
+  return variant_index_seen ? IR_SIMD_FIX_INAPPLICABLE : 0;
+}
+
+/* The transform table: which diagnoses have a paired fix simulation. Growing
+ * the hypothesis engine = adding a mutator and one row here.
+ * `inapplicable_fix` (optional) replaces the advice when the mutator returns
+ * IR_SIMD_FIX_INAPPLICABLE -- proven-useless advice must not be printed. */
+static const struct {
+  IRSimdBailId diagnosis;
+  IRSimdFixMutator mutate;
+  const char *inapplicable_fix;
+} g_simd_fix_transforms[] = {
+    {IR_SIMD_BAIL_BYTE_SUM_NARROW_ACC, ir_simd_mutate_byte_sum_int64, NULL},
+    {IR_SIMD_BAIL_I32_SUM_NARROW_ACC, ir_simd_mutate_i32_sum_int64, NULL},
+    {IR_SIMD_BAIL_INT16_ELEMENTS, ir_simd_mutate_int16_to_i32, NULL},
+    {IR_SIMD_BAIL_INT64_ELEMENTS, ir_simd_mutate_int64_to_i32, NULL},
+    {IR_SIMD_BAIL_DOT_SHAPE_ADDRESS, ir_simd_mutate_dot_row_pointer,
+     "none via hoisting -- re-checked: the index half that is not the loop "
+     "counter changes every iteration, so it cannot be hoisted out; this "
+     "access is genuinely non-unit-stride"},
+};
+
+/* The shared simulation driver: clone the function, apply the mutator, re-run
+ * the real optimization stages (remark recording suppressed), re-locate the
+ * loop by marker id (indexes shift), and check whether a kernel claimed it.
+ * On success fills `desc` with the kernel description and returns 1; returns
+ * IR_SIMD_FIX_INAPPLICABLE when the mutator proved the fix unwritable. */
+static int ir_explain_simulate_fix(const IRFunction *function, size_t begin,
+                                   size_t end, IRSimdFixMutator mutate,
+                                   char *desc, size_t desc_cap) {
+  int marker_id = ir_simd_marker_id_at(function, begin);
+  if (marker_id < 0) {
+    return 0;
+  }
+
+  IRFunction *clone = ir_explain_clone_function(function);
+  if (!clone) {
+    return 0;
+  }
+  int mutated = mutate(clone, begin, end);
+  if (mutated <= 0) {
+    ir_function_destroy(clone);
+    return mutated;
+  }
+
+  ir_explain_set_hypothesis(1);
+  int ran = ir_optimize_function_revectorize(clone);
+  ir_explain_set_hypothesis(0);
+
+  int verified = 0;
+  size_t new_begin = 0, new_end = 0;
+  if (ran && ir_simd_find_marker_region(clone, marker_id, &new_begin,
+                                        &new_end)) {
+    const IRInstruction *kernel =
+        ir_region_vectorized_ins(clone, new_begin, new_end, 0);
+    if (kernel) {
+      ir_explain_kernel_desc(kernel, desc, desc_cap);
+      verified = 1;
+    }
+  }
+  ir_function_destroy(clone);
+  return verified;
+}
+
+/* Run the fix simulation paired with `diagnosis`, if any. Returns 1 and fills
+ * `desc` when the simulated fix was accepted by the optimizer; returns
+ * IR_SIMD_FIX_INAPPLICABLE (and sets *inapplicable_fix_out to the replacement
+ * advice) when the mutator proved the suggested fix unwritable. */
+static int ir_explain_try_fix_for_diagnosis(const IRFunction *function,
+                                            size_t begin, size_t end,
+                                            int diagnosis, char *desc,
+                                            size_t desc_cap,
+                                            const char **inapplicable_fix_out) {
+  size_t transform_count =
+      sizeof(g_simd_fix_transforms) / sizeof(g_simd_fix_transforms[0]);
+  for (size_t t = 0; t < transform_count; t++) {
+    if ((int)g_simd_fix_transforms[t].diagnosis == diagnosis) {
+      int result = ir_explain_simulate_fix(
+          function, begin, end, g_simd_fix_transforms[t].mutate, desc,
+          desc_cap);
+      if (result == IR_SIMD_FIX_INAPPLICABLE && inapplicable_fix_out) {
+        *inapplicable_fix_out = g_simd_fix_transforms[t].inapplicable_fix;
+      }
+      return result;
+    }
+  }
+  return 0;
+}
+
+/* The CALL_IN_BODY fix simulation. It has no table row because it is
+ * program-level: pretend the loop's callee is @inline, re-run the INLINER on
+ * a caller clone, then revectorize and check the region. Honesty guards: the
+ * pretend flag cannot bypass the inliner's structural rejections, remark
+ * recording is suppressed for the whole nested run, and the claim requires
+ * the loop itself to have collapsed into a kernel (no surviving loop header
+ * label) -- a vectorized loop INLINED FROM THE CALLEE inside a still-scalar
+ * outer loop must not be passed off as "this loop vectorizes".
+ *
+ * Tri-state result:
+ *   1  verified: the @inline (or @noinline-removal) advice WORKS; `desc` has
+ *      the kernel the loop becomes.
+ *   -1 proven inapplicable: the simulation ran and showed the advice cannot
+ *      help. *decline_reason_out is the inliner's own structural refusal
+ *      when that was the cause (e.g. the callee contains loops), or NULL
+ *      when the callee DID inline but the loop still stayed scalar; in the
+ *      latter case *nest_after_out says whether a loop nest remains (the
+ *      callee's loops landed in the body -- only innermost loops vectorize).
+ *   0  couldn't tell (no program/marker/callee, clone failure, or the forced
+ *      inliner run made no change for reasons the simulation cannot see);
+ *      the caller keeps its generic advice.
+ * Fills `callee_out` (the advice target) and *was_noinline_out (1 = the
+ * simulated change was REMOVING `@noinline`, not adding @inline). */
+static int ir_explain_simulate_inline_fix(const IRFunction *function,
+                                          size_t begin, size_t end,
+                                          char *callee_out, size_t callee_cap,
+                                          char *desc, size_t desc_cap,
+                                          int *was_noinline_out,
+                                          const char **decline_reason_out,
+                                          int *nest_after_out) {
+  *decline_reason_out = NULL;
+  *nest_after_out = 0;
+  if (!g_explain_program) {
+    return 0;
+  }
+  int marker_id = ir_simd_marker_id_at(function, begin);
+  if (marker_id < 0) {
+    return 0;
+  }
+
+  /* The diagnosed callee: first user call past the loop header (the same walk
+   * the diagnosis made). */
+  const char *callee = NULL;
+  int past_header = 0;
+  for (size_t i = begin + 1; i < end && !callee; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_LABEL) {
+      if (ins->text && (strstr(ins->text, "ir_while_") != NULL ||
+                        strstr(ins->text, "ir_for_cond_") != NULL)) {
+        past_header = 1;
+      }
+      continue;
+    }
+    if (past_header && ins->op == IR_OP_CALL && ins->text &&
+        strstr(ins->text, "crash_trap") == NULL) {
+      callee = ins->text;
+    }
+  }
+  if (!callee) {
+    return 0;
+  }
+  snprintf(callee_out, callee_cap, "%s", callee);
+
+  IRFunction *clone = ir_explain_clone_function(function);
+  if (!clone) {
+    return 0;
+  }
+
+  ir_explain_set_hypothesis(1);
+  int verified = 0;
+  if (ir_inline_explain_simulate_force_inline(g_explain_program, clone, callee,
+                                              was_noinline_out,
+                                              decline_reason_out)) {
+    if (ir_optimize_function_revectorize(clone)) {
+      size_t new_begin = 0, new_end = 0;
+      if (ir_simd_find_marker_region(clone, marker_id, &new_begin, &new_end)) {
+        int nest = ir_region_has_loop_label(clone, new_begin, new_end);
+        const IRInstruction *kernel =
+            ir_region_vectorized_ins(clone, new_begin, new_end, 1);
+        if (!nest && kernel) {
+          ir_explain_kernel_desc(kernel, desc, desc_cap);
+          verified = 1;
+        } else {
+          /* The callee inlined cleanly, yet the loop is still scalar: the
+           * @inline advice is disproven. Report whether the body is now a
+           * loop nest so the caller can say WHY it cannot vectorize. */
+          *nest_after_out = nest;
+          verified = -1;
+        }
+      }
+    }
+  } else if (*decline_reason_out) {
+    /* The inliner refused the callee even with the pretend flags set --
+     * structural, so no decorator the user adds can change the outcome. */
+    verified = -1;
+  }
+  ir_explain_set_hypothesis(0);
+  ir_function_destroy(clone);
+  return verified;
+}
+
 static void ir_clear_simd_markers(IRFunction *function) {
   for (size_t i = 0; i < function->instruction_count; i++) {
     IRInstruction *instruction = &function->instructions[i];
@@ -177,6 +1222,192 @@ static void ir_clear_simd_markers(IRFunction *function) {
 }
 
 #define IR_SIMD_MAX_NESTING 64
+#define IR_SIMD_MAX_LOOPS 256
+
+/* One marker-bracketed loop region, collected during the contract walk so the
+ * --explain pass can reason about nests (which loop contains which). */
+typedef struct {
+  size_t begin;
+  size_t end;
+  int mode;
+  SourceLocation location;
+} IRSimdLoopRecord;
+
+/* --explain: one remark per recorded loop, nest-aware:
+ *   - vectorized at its own level        -> "vectorized -> <kernel>"
+ *   - scalar but a nested loop vectorized -> "vectorized inner, scalar outer"
+ *   - scalar with a scalar nested loop    -> NOT vectorized (points inward)
+ *   - no loop left between the markers    -> fully unrolled / removed
+ *   - scalar leaf                         -> NOT vectorized + reason + fix */
+static void ir_explain_report_loops(const IRFunction *function,
+                                    const IRSimdLoopRecord *loops,
+                                    size_t loop_count) {
+  for (size_t k = 0; k < loop_count; k++) {
+    const IRSimdLoopRecord *L = &loops[k];
+    /* Focus filter FIRST: remarks outside the focus file are dropped at
+     * record time anyway, but the fix simulations below (clone + re-run the
+     * optimizer, and for call-in-body the inliner too) are the expensive
+     * part -- without this gate every imported module's loops were being
+     * simulated and then discarded (5+ seconds of --explain on a real
+     * application; ~100ms with it). */
+    if (!ir_explain_location_enabled(&L->location)) {
+      continue;
+    }
+    const IRInstruction *own =
+        ir_region_vectorized_ins(function, L->begin, L->end, 0);
+    const IRInstruction *any =
+        own ? own : ir_region_vectorized_ins(function, L->begin, L->end, 1);
+
+    /* Nest depth (1 = top level): how many recorded loops contain this one.
+     * Stamped on the remark for the JSON sidecar -- a deeply nested scalar
+     * loop is a better optimization target than a top-level one. */
+    size_t nest_depth = 1;
+    for (size_t m = 0; m < loop_count; m++) {
+      if (m != k && loops[m].begin < L->begin && loops[m].end > L->end) {
+        nest_depth++;
+      }
+    }
+
+    int has_inner = 0;
+    size_t inner_line = 0;
+    for (size_t m = 0; m < loop_count; m++) {
+      if (m == k || loops[m].begin <= L->begin || loops[m].end >= L->end) {
+        continue;
+      }
+      has_inner = 1;
+      if (inner_line == 0) {
+        inner_line = loops[m].location.line;
+      }
+      /* Point the message at a vectorized inner loop when one exists. */
+      if (!own && any &&
+          ir_region_vectorized_ins(function, loops[m].begin, loops[m].end, 1)) {
+        inner_line = loops[m].location.line;
+      }
+    }
+
+    char headline[192], reason[320], fix[320];
+    if (own) {
+      char desc[128];
+      ir_explain_kernel_desc(own, desc, sizeof(desc));
+      snprintf(headline, sizeof(headline), "vectorized \xE2\x86\x92 %s", desc);
+      ir_explain_remark(function->name, "loop", L->location, 1, headline, NULL,
+                        NULL, NULL);
+    } else if (any) {
+      snprintf(reason, sizeof(reason),
+               "only the innermost loop of a nest is vectorized; this loop "
+               "drives the vectorized inner loop (line %zu)",
+               inner_line);
+      ir_explain_remark(function->name, "loop", L->location, 1,
+                        "vectorized inner, scalar outer", reason, NULL, NULL);
+    } else if (has_inner) {
+      snprintf(reason, sizeof(reason),
+               "the body contains a nested loop (line %zu), and only "
+               "innermost loops are vectorized; the inner loop did not "
+               "vectorize either -- see its remark",
+               inner_line);
+      ir_explain_remark(function->name, "loop", L->location, 0,
+                        "NOT vectorized", reason, NULL, NULL);
+    } else if (!ir_region_has_loop_label(function, L->begin, L->end)) {
+      /* The unroller records a definitive "fully unrolled (N iterations)"
+       * remark when it was the cause; only guess when nothing claimed it. */
+      if (!ir_explain_has_remark_at(L->location.line, "loop")) {
+        ir_explain_remark(function->name, "loop", L->location, 1,
+                          "eliminated \xE2\x80\x94 no loop remains after "
+                          "optimization (fully unrolled or folded away)",
+                          NULL, NULL, NULL);
+      }
+    } else {
+      int diagnosis = IR_SIMD_BAIL_NONE;
+      ir_simd_explain_bail(function, L->begin, L->end, reason, sizeof(reason),
+                           fix, sizeof(fix), &diagnosis);
+      /* When the diagnosis has a paired hypothesis transform, simulate the
+       * suggested fix and let the vectorizer itself confirm it. A proven-
+       * inapplicable fix is REPLACED, never printed -- bad advice with a
+       * confident tone is the failure mode this whole report exists to end. */
+      char verified[512];
+      verified[0] = '\0';
+      char kernel_desc[128];
+      if (diagnosis == IR_SIMD_BAIL_CALL_IN_BODY) {
+        /* Program-level simulation: pretend-@inline the callee, re-run the
+         * inliner on a clone, revectorize. */
+        char callee[128];
+        int was_noinline = 0;
+        const char *decline_reason = NULL;
+        int nest_after = 0;
+        int sim = ir_explain_simulate_inline_fix(
+            function, L->begin, L->end, callee, sizeof(callee), kernel_desc,
+            sizeof(kernel_desc), &was_noinline, &decline_reason, &nest_after);
+        if (sim == -1) {
+          /* The simulation DISPROVED the @inline advice; printing it anyway
+           * (and letting an editor offer it as a one-click fix) is exactly
+           * the confident-bad-advice failure mode this report exists to end.
+           * Replace reason and fix with what the simulation learned. */
+          if (decline_reason) {
+            snprintf(reason, sizeof(reason),
+                     "each iteration calls `%s`, and `@inline` cannot help: "
+                     "%s",
+                     callee, decline_reason);
+          } else if (nest_after) {
+            snprintf(reason, sizeof(reason),
+                     "each iteration calls `%s`; even with it inlined, its "
+                     "loops would land in this body, making this the outer "
+                     "loop of a nest -- and only innermost loops vectorize",
+                     callee);
+          } else {
+            snprintf(reason, sizeof(reason),
+                     "each iteration calls `%s`; the compiler simulated "
+                     "inlining it, and this loop still does not vectorize, "
+                     "so inlining is not the blocker",
+                     callee);
+          }
+          snprintf(fix, sizeof(fix),
+                   "nothing to change on this line: this loop is a driver "
+                   "and scalar is the right code for it -- the vectorizable "
+                   "work is inside `%s`, so check the remarks on its loops",
+                   callee);
+        } else if (sim == 1) {
+          if (was_noinline) {
+            /* The right advice for a vetoed callee is removing the veto;
+             * also correct the fix line, which suggested @inline. */
+            snprintf(fix, sizeof(fix),
+                     "remove `@noinline` from `%s` (it blocks this loop's "
+                     "vectorization), or hoist the call out of the loop",
+                     callee);
+            snprintf(verified, sizeof(verified),
+                     "simulated removing `@noinline` from `%s` and re-ran "
+                     "the inliner and the optimizer: this loop then "
+                     "vectorizes \xE2\x86\x92 %s",
+                     callee, kernel_desc);
+          } else {
+            snprintf(verified, sizeof(verified),
+                     "simulated marking `%s` @inline and re-ran the inliner "
+                     "and the optimizer: this loop then vectorizes "
+                     "\xE2\x86\x92 %s",
+                     callee, kernel_desc);
+          }
+        }
+      } else {
+        const char *inapplicable_fix = NULL;
+        int sim = ir_explain_try_fix_for_diagnosis(function, L->begin, L->end,
+                                                   diagnosis, kernel_desc,
+                                                   sizeof(kernel_desc),
+                                                   &inapplicable_fix);
+        if (sim == 1) {
+          snprintf(verified, sizeof(verified),
+                   "simulated that fix and re-ran the optimizer: this loop "
+                   "then vectorizes \xE2\x86\x92 %s",
+                   kernel_desc);
+        } else if (sim == IR_SIMD_FIX_INAPPLICABLE && inapplicable_fix) {
+          snprintf(fix, sizeof(fix), "%s", inapplicable_fix);
+        }
+      }
+      ir_explain_remark(function->name, "loop", L->location, 0,
+                        "NOT vectorized", reason, fix[0] ? fix : NULL,
+                        verified[0] ? verified : NULL);
+    }
+    ir_explain_remark_loop_depth(L->location.line, nest_depth);
+  }
+}
 
 int ir_verify_simd_contracts(IRFunction *function) {
   if (!function || function->instruction_count == 0) {
@@ -188,6 +1419,8 @@ int ir_verify_simd_contracts(IRFunction *function) {
     size_t begin_index;
     SourceLocation location;
   } open[IR_SIMD_MAX_NESTING];
+  IRSimdLoopRecord loops[IR_SIMD_MAX_LOOPS];
+  size_t loop_count = 0;
   int depth = 0;
   int had_fatal = 0;
 
@@ -227,8 +1460,20 @@ int ir_verify_simd_contracts(IRFunction *function) {
     int loop_mode = open[depth].mode;
     SourceLocation loc = open[depth].location;
     const char *file = loc.filename ? loc.filename : "<input>";
-    int vec_op = ir_region_vectorized_op(function, begin_index, i);
 
+    if (loop_count < IR_SIMD_MAX_LOOPS) {
+      loops[loop_count].begin = begin_index;
+      loops[loop_count].end = i;
+      loops[loop_count].mode = loop_mode;
+      loops[loop_count].location = loc;
+      loop_count++;
+    }
+
+    if (loop_mode == SIMD_ATTR_REPORT) {
+      continue; /* --explain bookkeeping only; no contract to enforce */
+    }
+
+    int vec_op = ir_region_vectorized_op(function, begin_index, i);
     if (vec_op >= 0) {
       if (g_simd_report) {
         fprintf(stderr, "%s:%zu:%zu: note: @simd loop vectorized (%s)\n", file,
@@ -250,6 +1495,10 @@ int ir_verify_simd_contracts(IRFunction *function) {
     }
   }
 
+  if (ir_explain_enabled()) {
+    ir_explain_report_loops(function, loops, loop_count);
+  }
+
   ir_clear_simd_markers(function);
   return had_fatal ? 0 : 1;
 }
@@ -265,8 +1514,17 @@ void ir_note_simd_contracts_unverified(IRProgram *program) {
       continue;
     }
     for (size_t i = 0; i < function->instruction_count; i++) {
-      if (ir_instruction_is_simd_marker(&function->instructions[i]) &&
-          function->instructions[i].text[strlen(IR_SIMD_MARKER_PREFIX)] == 'B') {
+      if (!ir_instruction_is_simd_marker(&function->instructions[i])) {
+        continue;
+      }
+      char which = 0;
+      int id = 0, mode = 0;
+      if (sscanf(function->instructions[i].text +
+                     strlen(IR_SIMD_MARKER_PREFIX),
+                 "%c:%d:%d", &which, &id, &mode) == 3 &&
+          which == 'B' && mode != SIMD_ATTR_REPORT) {
+        /* Report-only markers come from --explain, not from a user `@simd`;
+         * they don't represent an unverified contract. */
         marker_count++;
       }
     }
@@ -277,5 +1535,19 @@ void ir_note_simd_contracts_unverified(IRProgram *program) {
             "note: %d `@simd` loop%s present but not verified; vectorization "
             "contracts are only checked with -O/--release\n",
             marker_count, marker_count == 1 ? "" : "s");
+  }
+
+  int contract_count = 0;
+  for (size_t f = 0; f < program->function_count; f++) {
+    IRFunction *function = program->functions[f];
+    if (function && (function->is_inline_contract || function->is_noalloc)) {
+      contract_count++;
+    }
+  }
+  if (contract_count > 0) {
+    fprintf(stderr,
+            "note: %d `@inline!`/`@noalloc` contract%s present but not "
+            "verified; contracts are only checked with -O/--release\n",
+            contract_count, contract_count == 1 ? "" : "s");
   }
 }

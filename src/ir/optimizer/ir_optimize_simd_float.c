@@ -93,14 +93,34 @@ static int ir_decode_float_indexed_address(IRFunction *function, size_t before,
   return 1;
 }
 
-/* A symbol is an acceptable float-array base if it is a function parameter or a
- * declared local (covers inlined-callee parameter copies). The strict
- * load-shape decode above already pins element width and float-ness, so this
- * stays permissive like ir_symbol_is_sum_array_base. */
+/* A symbol is an acceptable float-array base if it is a function parameter, a
+ * declared local (covers inlined-callee parameter copies), or a GLOBAL the
+ * function never writes and never takes the address of -- real programs (an
+ * LLM engine's scratch buffers, a game's framebuffer pointer) keep their hot
+ * arrays in global pointers, and rejecting those left every such loop
+ * scalar. The strict load-shape decode above already pins element width and
+ * float-ness. */
 static int ir_symbol_is_float_array_base(IRFunction *function,
                                          const char *symbol_name) {
-  return ir_function_symbol_is_parameter(function, symbol_name) ||
-         ir_function_local_declared_type(function, symbol_name) != NULL;
+  if (ir_function_symbol_is_parameter(function, symbol_name) ||
+      ir_function_local_declared_type(function, symbol_name) != NULL) {
+    return 1;
+  }
+  /* Global: its VALUE must be stable across the loop. The recognizers'
+   * bodies are store/call-free, so only a direct write inside this function
+   * or an escaped address could change it mid-loop. */
+  if (!symbol_name || ir_symbol_address_taken(function, symbol_name)) {
+    return 0;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ir_instruction_writes_destination(ins) &&
+        ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name &&
+        strcmp(ins->dest.name, symbol_name) == 0) {
+      return 0;
+    }
+  }
+  return 1;
 }
 
 static int ir_float_sum_type_matches(const char *sum_type, int width_bits) {
@@ -138,7 +158,19 @@ static int ir_float_scalar_operand_matches(IRFunction *function,
     return 0;
   }
   if (operand->kind == IR_OPERAND_FLOAT) {
-    return operand->float_bits == width_bits;
+    if (operand->float_bits == width_bits) {
+      return 1;
+    }
+    /* A literal used in float32 context usually still carries the default
+     * float64 tag (`2.5` lowers as a double). The kernel broadcasts the
+     * constant at its own lane width, so accept the mismatch whenever that
+     * narrowing is exact -- then the kernel's coefficient is bit-identical to
+     * the one the scalar loop multiplies by. */
+    if (width_bits == 32 &&
+        (double)(float)operand->float_value == operand->float_value) {
+      return 1;
+    }
+    return 0;
   }
   if (operand->kind == IR_OPERAND_SYMBOL && operand->name) {
     /* A scalar coefficient may be a local OR a parameter (e.g. saxpy's `a` in
@@ -165,6 +197,12 @@ static int ir_try_clone_float_scalar_operand(IRFunction *function,
   }
   *out = ir_operand_none();
   if (ir_float_scalar_operand_matches(function, operand, width_bits)) {
+    if (operand->kind == IR_OPERAND_FLOAT) {
+      /* Normalize the tag to the kernel's lane width (the match may have
+       * accepted an exactly-narrowable float64-tagged literal). */
+      *out = ir_operand_float_sized(operand->float_value, width_bits);
+      return 1;
+    }
     return ir_operand_clone(operand, out);
   }
   if (!operand || operand->kind != IR_OPERAND_TEMP || !operand->name) {
@@ -230,10 +268,6 @@ static int ir_float_reduction_frame(IRFunction *function, size_t header_index,
       !branch->text) {
     return 1;
   }
-  if (compare->rhs.kind == IR_OPERAND_SYMBOL &&
-      !ir_symbol_is_sum_loop_bound(function, compare->rhs.name)) {
-    return 1;
-  }
   exit_label = branch->text;
 
   for (size_t i = branch_index + 1; i < function->instruction_count; i++) {
@@ -254,6 +288,26 @@ static int ir_float_reduction_frame(IRFunction *function, size_t header_index,
   }
   if (ir_loop_body_has_nested_while(function, branch_index + 1, jump_index)) {
     return 1;
+  }
+
+  /* Bound: a parameter/inlined-param (always invariant), or any other
+   * symbol -- a local or a GLOBAL (dimension globals like an LLM's D/HD are
+   * the norm in real code) -- that the loop region never writes and whose
+   * address never escapes. The kernel reads it once at entry; invariance
+   * makes that identical to the scalar loop's per-iteration read. */
+  if (compare->rhs.kind == IR_OPERAND_SYMBOL &&
+      !ir_symbol_is_sum_loop_bound(function, compare->rhs.name)) {
+    if (ir_symbol_address_taken(function, compare->rhs.name)) {
+      return 1;
+    }
+    for (size_t i = branch_index + 1; i < jump_index; i++) {
+      const IRInstruction *ins = &function->instructions[i];
+      if (ir_instruction_writes_destination(ins) &&
+          ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name &&
+          strcmp(ins->dest.name, compare->rhs.name) == 0) {
+        return 1;
+      }
+    }
   }
 
   increment_index = jump_index;
@@ -359,7 +413,7 @@ static int ir_try_vectorize_sum_float_at(IRFunction *function,
   sum_type = ir_function_local_declared_type(function, sum_symbol);
   if (!ir_float_sum_type_matches(sum_type, width_bits) ||
       !ir_symbol_is_float_array_base(function, base_symbol) ||
-      ir_symbol_read_after(function, jump_index + 1, iv_symbol)) {
+      ir_symbol_live_after_loop(function, jump_index + 1, iv_symbol)) {
     ir_operand_destroy(&bound);
     return 1;
   }
@@ -462,7 +516,7 @@ static int ir_try_vectorize_dot_float_at(IRFunction *function,
   if (!ir_float_sum_type_matches(sum_type, width_bits) ||
       !ir_symbol_is_float_array_base(function, a_symbol) ||
       !ir_symbol_is_float_array_base(function, b_symbol) ||
-      ir_symbol_read_after(function, jump_index + 1, iv_symbol)) {
+      ir_symbol_live_after_loop(function, jump_index + 1, iv_symbol)) {
     ir_operand_destroy(&bound);
     return 1;
   }
@@ -756,7 +810,7 @@ static int ir_try_vectorize_affine_map_float_at(IRFunction *function,
 
   if (!ir_symbol_is_float_array_base(function, terms.src_base) ||
       !ir_symbol_is_float_array_base(function, dst_base) ||
-      ir_symbol_read_after(function, jump_index + 1, iv_symbol)) {
+      ir_symbol_live_after_loop(function, jump_index + 1, iv_symbol)) {
     ir_operand_destroy(&bound);
     ir_affine_map_terms_destroy(&terms);
     return 1;
@@ -1144,7 +1198,7 @@ static int ir_try_vectorize_i2f_reduce_at(IRFunction *function,
       return 1;
     }
   }
-  if (ir_symbol_read_after(function, jump_index + 1, iv_symbol)) {
+  if (ir_symbol_live_after_loop(function, jump_index + 1, iv_symbol)) {
     return 1;
   }
 
@@ -1504,7 +1558,7 @@ static int ir_try_vectorize_map_at(IRFunction *function, size_t header_index,
       return 1;
     }
   }
-  if (ir_symbol_read_after(function, jump_index + 1, iv_symbol)) {
+  if (ir_symbol_live_after_loop(function, jump_index + 1, iv_symbol)) {
     ir_operand_destroy(&bound);
     return 1;
   }
@@ -1614,7 +1668,7 @@ static int ir_try_vectorize_reduce_at(IRFunction *function, size_t header_index,
       return 1;
     }
   }
-  if (ir_symbol_read_after(function, jump_index + 1, iv_symbol)) {
+  if (ir_symbol_live_after_loop(function, jump_index + 1, iv_symbol)) {
     ir_operand_destroy(&bound);
     return 1;
   }

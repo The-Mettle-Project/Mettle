@@ -416,10 +416,23 @@ static int ir_try_unroll_loop_at(IRFunction *function, size_t header_index,
     }
   }
 
+  /* Capture the loop's source location before the instruction array is
+   * replaced; the --explain remark below points at the original header. */
+  SourceLocation header_location = function->instructions[header_index].location;
+
   if (!ir_function_replace_instructions(function, &vector)) {
     ir_instruction_vector_destroy(&vector);
     ir_temp_value_map_destroy(&symbol_map);
     return 0;
+  }
+
+  if (ir_explain_enabled()) {
+    char headline[96];
+    snprintf(headline, sizeof(headline),
+             "fully unrolled (%lld iteration%s, constant trip count)", trips,
+             trips == 1 ? "" : "s");
+    ir_explain_remark(function->name, "loop", header_location, 1, headline,
+                      NULL, NULL, NULL);
   }
 
   ir_temp_value_map_destroy(&symbol_map);

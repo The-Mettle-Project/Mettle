@@ -1,12 +1,16 @@
 CC = gcc
 # EXTRA_CFLAGS lets release builds stamp the version, e.g.
-#   make EXTRA_CFLAGS='-DMETTLE_VERSION_RAW=v0.3.0'
+#   make EXTRA_CFLAGS='-DMETTLE_VERSION_RAW=v0.11.0'
 # (bare token, stringified in main.c — avoids fragile quote escaping)
 EXTRA_CFLAGS =
 CFLAGS = -Wall -Wextra -std=c99 -g -O2 -D_GNU_SOURCE -Isrc -fno-omit-frame-pointer $(EXTRA_CFLAGS)
 LDFLAGS =
 ifneq ($(filter Linux linux-gnu,$(shell uname -s 2>/dev/null)),)
-LDFLAGS = -rdynamic
+# glibc < 2.34 (e.g. Rocky 8 / glibc 2.28) ships pthread + dl as separate
+# libraries, so link them explicitly for compiler_context.c's pthread TLS and
+# compiler_crash.c's dladdr. No-op on glibc >= 2.34, where libc absorbed both.
+CFLAGS += -pthread
+LDFLAGS = -rdynamic -pthread -ldl
 endif
 SRCDIR = src
 OBJDIR = obj
@@ -17,7 +21,7 @@ RUNTIMEDIR = src/runtime
 # Source files
 LEXER_SOURCES = $(SRCDIR)/lexer/lexer.c
 PARSER_SOURCES = $(SRCDIR)/parser/parser.c $(SRCDIR)/parser/ast.c
-SEMANTIC_SOURCES = $(SRCDIR)/semantic/symbol_table.c $(SRCDIR)/semantic/type_checker.c $(SRCDIR)/semantic/register_allocator.c $(SRCDIR)/semantic/import_resolver.c $(SRCDIR)/semantic/monomorphize.c
+SEMANTIC_SOURCES = $(SRCDIR)/semantic/symbol_table.c $(SRCDIR)/semantic/type_checker.c $(SRCDIR)/semantic/type_checker_types.c $(SRCDIR)/semantic/type_checker_errors.c $(SRCDIR)/semantic/type_checker_safety.c $(SRCDIR)/semantic/type_checker_init_tracker.c $(SRCDIR)/semantic/type_checker_decl.c $(SRCDIR)/semantic/type_checker_match.c $(SRCDIR)/semantic/type_checker_stmt.c $(SRCDIR)/semantic/type_checker_expr.c $(SRCDIR)/semantic/register_allocator.c $(SRCDIR)/semantic/import_resolver.c $(SRCDIR)/semantic/monomorphize.c
 IR_SOURCES = $(wildcard $(SRCDIR)/ir/*.c) $(wildcard $(SRCDIR)/ir/optimizer/*.c)
 CODEGEN_SOURCES = \
 	$(SRCDIR)/codegen/binary_emitter.c \
@@ -49,16 +53,22 @@ bundle-stdlib: | $(BINDIR)
 	rm -rf $(BINDIR)/stdlib
 	cp -r $(STDLIBDIR) $(BINDIR)/stdlib
 
+# Runtime objects are linked into every user program, so build them lean:
+# no debug info (-g0 overrides the -g in CFLAGS) and one section per
+# function/datum so the ELF link's --gc-sections can drop whatever a given
+# program does not use.
+RUNTIME_OBJ_CFLAGS = $(CFLAGS) -g0 -ffunction-sections -fdata-sections
+
 bundle-runtime: | $(BINDIR)
 	rm -rf $(BINDIR)/runtime
 	cp -r $(RUNTIMEDIR) $(BINDIR)/runtime
-	$(CC) $(CFLAGS) -c $(STDLIBDIR)/tracy_helpers.c -o $(OBJDIR)/runtime/tracy_helpers.o
+	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(STDLIBDIR)/tracy_helpers.c -o $(OBJDIR)/runtime/tracy_helpers.o
 	cp $(OBJDIR)/runtime/tracy_helpers.o $(BINDIR)/runtime/tracy_helpers.o
 	cp $(OBJDIR)/runtime/tracy_helpers.o $(BINDIR)/runtime/tracy_helpers.obj
-	$(CC) $(CFLAGS) -c $(RUNTIMEDIR)/atomics.c       -o $(OBJDIR)/runtime/atomics.o
-	$(CC) $(CFLAGS) -c $(RUNTIMEDIR)/crash_handler.c -o $(OBJDIR)/runtime/crash_handler.o
-	$(CC) $(CFLAGS) -c $(RUNTIMEDIR)/profile.c       -o $(OBJDIR)/runtime/profile.o
-	$(CC) $(CFLAGS) -c $(RUNTIMEDIR)/posix_helpers.c -o $(OBJDIR)/runtime/posix_helpers.o
+	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/atomics.c       -o $(OBJDIR)/runtime/atomics.o
+	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/crash_handler.c -o $(OBJDIR)/runtime/crash_handler.o
+	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/profile.c       -o $(OBJDIR)/runtime/profile.o
+	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/posix_helpers.c -o $(OBJDIR)/runtime/posix_helpers.o
 	cp $(OBJDIR)/runtime/atomics.o       $(BINDIR)/runtime/atomics.o
 	cp $(OBJDIR)/runtime/crash_handler.o $(BINDIR)/runtime/crash_handler.o
 	cp $(OBJDIR)/runtime/profile.o       $(BINDIR)/runtime/profile.o

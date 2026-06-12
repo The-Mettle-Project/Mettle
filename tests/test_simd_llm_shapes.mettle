@@ -1,0 +1,49 @@
+extern function printf(fmt: cstring, v: int64) -> int32 = "printf";
+
+var gx: float32* = (float32*)0;
+var gw: float32* = (float32*)0;
+var gy: float32* = (float32*)0;
+var D: int64 = 0;
+
+// iv reuse across loops + global bases + global bound: the LLM shapes
+function rms_like() -> float32 {
+    var ss: float32 = 0.0; var i: int64 = 0;
+    while (i < D) { ss = ss + gx[i] * gx[i]; i = i + 1; }
+    i = 0;
+    while (i < D) { gy[i] = gy[i] + gw[i]; i = i + 1; }
+    return ss;
+}
+
+// fill w/ hoisted h*HD offset, reused+live iv, surrounded by other loops
+var HD: int64 = 16;
+function attn_like(satt: float32*, h: int64, pos: int64) -> int64 {
+    var t2: int64 = 0; var acc: int64 = 0;
+    while (t2 <= pos) { acc = acc + t2; t2 = t2 + 1; }
+    var i: int64 = 0;
+    while (i < HD) { satt[h*HD + i] = 0.0; i = i + 1; }
+    t2 = 0;
+    while (t2 <= pos) { acc = acc + t2 * 3; t2 = t2 + 1; }
+    return acc + i; // i is LIVE: must equal max(0, HD)
+}
+
+function main() -> int32 {
+    var bx: float32[64]; var bw: float32[64]; var by: float32[64];
+    var satt: float32[64];
+    gx = &bx[0]; gw = &bw[0]; gy = &by[0]; D = 50;
+    var k: int32 = 0;
+    while (k < 64) {
+        bx[k] = (float32)(k - 30) * 0.25;
+        bw[k] = (float32)k * 0.5;
+        by[k] = 1.0;
+        satt[k] = 9.0;
+        k = k + 1;
+    }
+    var ss: float32 = rms_like();
+    var total: int64 = (int64)(ss * 100.0);
+    k = 0; while (k < 64) { total = total * 31 + (int64)(by[k] * 4.0); k = k + 1; }
+    var fin: int64 = attn_like(&satt[0], 2, 5);
+    total = total * 1009 + fin;
+    k = 0; while (k < 64) { total = total * 31 + (int64)(satt[k] * 2.0); k = k + 1; }
+    printf("%lld\n", total);
+    return 0;
+}

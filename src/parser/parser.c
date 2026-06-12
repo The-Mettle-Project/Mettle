@@ -528,28 +528,33 @@ static ASTNode *parser_parse_extern_var_declaration(Parser *parser);
 
 // Flags collected from a run of `@ident[!]` decorators.
 typedef struct {
-  int is_inline;   // `@inline`
-  int is_noinline; // `@noinline`
-  int is_pure;     // `@pure`
-  int simd_mode;   // SimdAttr from `@simd` / `@simd!` (SIMD_ATTR_NONE if absent)
+  int is_inline;          // `@inline`
+  int is_inline_contract; // `@inline!` (implies is_inline)
+  int is_noinline;        // `@noinline`
+  int is_pure;            // `@pure`
+  int is_noalloc;         // `@noalloc`
+  int simd_mode; // SimdAttr from `@simd` / `@simd!` (SIMD_ATTR_NONE if absent)
 } ParsedDecorators;
 
 // Consume a run of `@ident[!]` decorators into `out`. Assumes the current token
 // is TOKEN_AT. Returns 1 on success (parser positioned on the decorated
-// construct), 0 on error (a parser error is set). Recognizes `@inline`,
-// `@noinline`, `@pure`, and `@simd` / `@simd!`; rejects unknown names,
-// duplicates, and the `@inline`+`@noinline` conflict.
+// construct), 0 on error (a parser error is set). Recognizes `@inline` /
+// `@inline!`, `@noinline`, `@pure`, `@noalloc`, and `@simd` / `@simd!`;
+// rejects unknown names, duplicates, and the `@inline`+`@noinline` conflict.
 static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
   out->is_inline = 0;
+  out->is_inline_contract = 0;
   out->is_noinline = 0;
   out->is_pure = 0;
+  out->is_noalloc = 0;
   out->simd_mode = SIMD_ATTR_NONE;
 
   while (parser->current_token.type == TOKEN_AT) {
     parser_advance(parser); // consume '@'
     if (!parser_is_identifier_like(parser->current_token.type)) {
-      parser_set_error(parser, "Expected a decorator name after '@' (one of "
-                               "'inline', 'noinline', 'pure', 'simd')");
+      parser_set_error(parser,
+                       "Expected a decorator name after '@' (one of 'inline', "
+                       "'noinline', 'pure', 'noalloc', 'simd')");
       return 0;
     }
     const char *name = parser->current_token.value;
@@ -559,6 +564,17 @@ static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
         return 0;
       }
       out->is_inline = 1;
+      parser_advance(parser);
+      if (parser->current_token.type == TOKEN_NOT) {
+        out->is_inline_contract = 1; // `@inline!`: contract, not just a hint
+        parser_advance(parser);      // consume '!'
+      }
+    } else if (strcmp(name, "noalloc") == 0) {
+      if (out->is_noalloc) {
+        parser_set_error(parser, "Duplicate '@noalloc' decorator");
+        return 0;
+      }
+      out->is_noalloc = 1;
       parser_advance(parser);
     } else if (strcmp(name, "noinline") == 0) {
       if (out->is_noinline) {
@@ -586,8 +602,9 @@ static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
         parser_advance(parser); // consume '!'
       }
     } else {
-      parser_set_error(parser, "Unknown decorator after '@' (expected "
-                               "'inline', 'noinline', 'pure', or 'simd')");
+      parser_set_error(parser,
+                       "Unknown decorator after '@' (expected 'inline', "
+                       "'noinline', 'pure', 'noalloc', or 'simd')");
       return 0;
     }
   }
@@ -629,8 +646,10 @@ ASTNode *parser_parse_declaration(Parser *parser) {
       return NULL;
     }
     fd->is_inline = decos.is_inline;
+    fd->is_inline_contract = decos.is_inline_contract;
     fd->is_noinline = decos.is_noinline;
     fd->is_pure = decos.is_pure;
+    fd->is_noalloc = decos.is_noalloc;
     fd->simd_mode = decos.simd_mode;
     return decl;
   }
@@ -859,9 +878,11 @@ ASTNode *parser_parse_statement(Parser *parser) {
     ParsedDecorators decos;
     if (!parser_parse_decorator_chain(parser, &decos))
       return NULL;
-    if (decos.is_inline || decos.is_noinline || decos.is_pure) {
-      parser_set_error(parser, "'@inline', '@noinline', and '@pure' apply to a "
-                               "function, not a loop");
+    if (decos.is_inline || decos.is_noinline || decos.is_pure ||
+        decos.is_noalloc) {
+      parser_set_error(parser,
+                       "'@inline', '@noinline', '@pure', and '@noalloc' apply "
+                       "to a function, not a loop");
       return NULL;
     }
     if (decos.simd_mode == SIMD_ATTR_NONE) {

@@ -84,7 +84,7 @@ class Gen:
             self.stmt_decl()
             acc = self.live_vars[-1]
         return acc
-
+    
     def counted_loop(self, lo, hi, body):
         """Emit a counted loop over [lo, hi); body(ivar) emits the body.
         Randomly uses range-for (the ir_for_cond_ vectorizer gate) or while."""

@@ -61,6 +61,28 @@ function assertLanguageFeatures() {
     }
   }
 
+  if (!extensionText.includes('registerLanguageFeatures')) {
+    throw new Error('Missing language feature wiring: registerLanguageFeatures');
+  }
+  const languageText = fs.readFileSync(path.join(root, 'language.js'), 'utf8');
+  const requiredProviders = [
+    'registerDefinitionProvider',
+    'registerReferenceProvider',
+    'registerRenameProvider',
+    'registerDocumentSymbolProvider',
+    'registerWorkspaceSymbolProvider',
+    'registerCompletionItemProvider',
+    'registerSignatureHelpProvider',
+    'registerInlayHintsProvider',
+    'registerDocumentLinkProvider',
+    'registerCodeLensProvider',
+  ];
+  for (const needle of requiredProviders) {
+    if (!languageText.includes(needle)) {
+      throw new Error(`Missing navigation provider wiring: ${needle}`);
+    }
+  }
+
   const requiredHoverTopics = [
     'import_str',
     'errdefer',

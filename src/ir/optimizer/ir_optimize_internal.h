@@ -16,6 +16,17 @@
 #define IR_INLINE_MAX_PARAMETERS 16
 #define IR_INLINE_MAX_ROUNDS 4
 #define IR_INLINE_MAX_CALLER_NON_NOP_INSTRUCTIONS 512
+/* Callees this small (and call-free) stay inlinable into callers that are
+ * over the caller-size budget: the budget exists to stop runaway growth, and
+ * a tiny leaf's body costs about as much caller growth as the call sequence
+ * it replaces. */
+#define IR_INLINE_TINY_LEAF_NON_NOP_INSTRUCTIONS 16
+/* Self-recursion inlining: expand direct self-call sites with the current
+ * body up to MAX_DEPTH rounds, stopping early once the body outgrows the
+ * instruction cap (so the depth is effectively size-bounded). */
+#define IR_SELF_INLINE_MAX_DEPTH 3
+#define IR_SELF_INLINE_MAX_SELF_CALLS 4
+#define IR_SELF_INLINE_MAX_BODY_INSTRUCTIONS 320
 #define IR_UNROLL_MAX_TRIP_COUNT 64
 
 typedef struct {
@@ -23,10 +34,24 @@ typedef struct {
   IROperand value;
 } IRTempValueEntry;
 
-typedef struct {
+/* Name -> value map with a lazily maintained open-addressing hash index over
+ * `items`. The array stays the source of truth (passes iterate it directly);
+ * the index makes find/set/remove O(1) so copy-propagation stays linear on
+ * the multi-thousand-instruction functions inlining produces. Code that
+ * compacts `items` in place must call ir_temp_value_map_reindex afterwards. */
+typedef struct IRTempValueMap {
   IRTempValueEntry *items;
   size_t count;
   size_t capacity;
+  unsigned int *ix;     /* buckets: 0 = empty, UINT_MAX = tombstone, else slot+1 */
+  size_t ix_capacity;   /* power of two, 0 until first index build */
+  size_t ix_tombstones;
+  /* Lazily built reverse count: value-symbol name -> how many entries map to
+   * it (int values; itself never carries a reverse count). Lets the
+   * per-symbol-write invalidation in copy-propagation answer "no entry
+   * values this symbol" in O(1) instead of scanning every entry. NULL until
+   * ir_temp_value_map_remove_symbol_values first needs it. */
+  struct IRTempValueMap *vsym_counts;
 } IRTempValueMap;
 
 /* Block-local known values for stack locals (@symbol operands). */
@@ -42,6 +67,9 @@ typedef struct {
   IRLabelValueEntry *items;
   size_t count;
   size_t capacity;
+  /* label -> slot index (int values); copy-propagation consults this map per
+   * label/jump/branch, and inlined functions carry thousands of labels. */
+  IRTempValueMap index;
 } IRLabelValueMap;
 
 typedef struct {
@@ -343,6 +371,7 @@ int ir_fuse_while_loop_to_insn(IRFunction *function, size_t header_index,
 int ir_index_vector_append(IRIndexVector *vector, size_t value);
 void ir_index_vector_destroy(IRIndexVector *vector);
 int ir_inline_small_functions_pass(IRProgram *program, int *changed);
+int ir_inline_self_recursion_pass(IRProgram *program, int *changed);
 /* Resolve a function by name within the program (hashed lookup with a linear
  * fallback). Defined in ir_optimize_inline.c. */
 IRFunction *ir_program_find_function(IRProgram *program, const char *name);
@@ -426,11 +455,118 @@ int ir_verify_simd_contracts(IRFunction *function);
  * (ir_optimize_had_user_error is also declared in the public ir_optimize.h.) */
 void ir_optimize_reset_user_error(void);
 int ir_optimize_had_user_error(void);
+/* Lets the `@inline!` / `@noalloc` contract checkers report through the same
+ * "user error, not ICE" channel `@simd!` uses. */
+void ir_optimize_note_user_error(void);
+/* `@inline!`: error for every surviving call to a contract function, with the
+ * inliner's reason. Returns 1 when all contracts held. */
+int ir_inline_enforce_contracts(IRProgram *program);
+/* `@noalloc`: transitive allocation-freedom proof per contract function
+ * (ir_optimize_contracts.c). Returns 1 when all contracts held. */
+int ir_enforce_noalloc_contracts(IRProgram *program);
 /* --simd-report: emit a note for every `@simd` loop (vectorized or not). */
 void ir_optimize_set_simd_report(int enabled);
+/* --explain: optimization-decision remarks (state and report rendering live in
+ * ir_optimize_explain.c). The loop verifier, the inliner, and the codegen MIR
+ * gate record remarks; the pipeline flushes them as one sorted, tree-formatted
+ * report. `focus_file` (NULL = no filter) limits remarks to that file so
+ * imported modules don't flood the report. */
+void ir_optimize_set_explain(int enabled, const char *focus_file);
+int ir_explain_enabled(void);
+int ir_explain_location_enabled(const SourceLocation *location);
+int ir_explain_file_enabled(const char *filename);
+/* Record one remark: `entity` is "loop" / "call to `f`"; `positive` colors the
+ * headline (1 = the optimizer did something good); reason/fix/verified may be
+ * NULL. `verified` is reserved for claims PROVEN by simulating the fix on a
+ * clone -- never for guesses. */
+void ir_explain_remark(const char *function_name, const char *entity,
+                       SourceLocation location, int positive,
+                       const char *headline, const char *reason,
+                       const char *fix, const char *verified);
+/* Stamp the nest depth (1 = top level) on the most recent loop remark at
+ * `line`; rendered into the JSON sidecar so tooling can rank scalar loops by
+ * how deeply they nest (a static hotness proxy). */
+void ir_explain_remark_loop_depth(size_t line, size_t depth);
+/* Hypothesis testing: deep-copy a function for fix simulation, suppress
+ * remark recording while the cloned stages run, and re-run the optimization
+ * stages on the clone (ir_optimize_pipeline.c). */
+IRFunction *ir_explain_clone_function(const IRFunction *src);
+void ir_explain_set_hypothesis(int active);
+int ir_optimize_function_revectorize(IRFunction *function);
+/* Program access for program-level fix simulations (the call-in-body
+ * hypothesis re-runs the INLINER on a caller clone, which needs callee
+ * lookup). Set by the program pipeline around the per-function stage; NULL
+ * outside it. */
+void ir_explain_set_program(IRProgram *program);
+/* --explain hypothesis (ir_optimize_inline.c): pretend `callee_name` is
+ * inline-eligible (@noinline removed, @inline added; *was_noinline_out says
+ * which pretend the verified message should describe) and run inliner rounds
+ * over `caller` (a scratch clone). Returns 1 when at least one call site
+ * actually expanded. The pretend flags are restored; the inliner's structural
+ * guards still apply, so this cannot "verify" advice that the decorator
+ * change would not in fact deliver. When the inliner refuses the callee even
+ * with the pretend flags set (a STRUCTURAL refusal -- @inline cannot fix it),
+ * *decline_reason_out (may be NULL) receives the inliner's own static reason
+ * string; it stays NULL on success and on couldn't-tell outcomes. */
+int ir_inline_explain_simulate_force_inline(IRProgram *program,
+                                            IRFunction *caller,
+                                            const char *callee_name,
+                                            int *was_noinline_out,
+                                            const char **decline_reason_out);
+
+/* Machine-readable ids for every vectorization-bail diagnosis the --explain
+ * analyzer can make (ir_optimize_simd_contract.c). This list is the schema:
+ * fix-hypothesis transforms key off these ids, and a future --explain=json
+ * emits them as stable names (ir_simd_bail_id_name). One id per prose branch
+ * in ir_simd_explain_bail -- a new diagnosis MUST add an id, not hide under
+ * UNRECOGNIZED_SHAPE. */
+typedef enum {
+  IR_SIMD_BAIL_NONE = 0,           /* no diagnosis ran / loop vectorized */
+  IR_SIMD_BAIL_CALL_IN_BODY,       /* calls a program-defined fn every iteration */
+  IR_SIMD_BAIL_EXTERN_CALL_IN_BODY,/* calls an extern: inlining is impossible */
+  IR_SIMD_BAIL_INDIRECT_CALL,      /* calls through a function pointer */
+  IR_SIMD_BAIL_ALLOC_IN_BODY,      /* allocates (`new`) every iteration */
+  IR_SIMD_BAIL_INLINE_ASM,         /* body contains inline assembly */
+  IR_SIMD_BAIL_CONTROL_FLOW,       /* data-dependent branching inside the body */
+  IR_SIMD_BAIL_EARLY_EXIT,         /* the loop can leave before the trip count */
+  IR_SIMD_BAIL_INT16_ELEMENTS,     /* 16-bit integer memory, no kernel */
+  IR_SIMD_BAIL_INT64_ELEMENTS,     /* 64-bit integer memory, no kernel */
+  IR_SIMD_BAIL_SERIAL_RECURRENCE,  /* float '*'/'/' chain across iterations */
+  IR_SIMD_BAIL_MIXED_FLOAT_WIDTHS, /* f32 and f64 elements in one loop */
+  IR_SIMD_BAIL_BYTE_SUM_NARROW_ACC,/* byte sum into an int32 accumulator */
+  IR_SIMD_BAIL_I32_SUM_NARROW_ACC, /* int32 sum into a non-int64 accumulator */
+  IR_SIMD_BAIL_INLINED_PARAM_LOCAL,/* leftover __inl_* param copy in body */
+  IR_SIMD_BAIL_BODY_LOCAL,         /* user local declared inside the body */
+  IR_SIMD_BAIL_DOT_SHAPE_ADDRESS,  /* float MAC, address pattern unmatched */
+  IR_SIMD_BAIL_STORE_ONLY_FILL,    /* writes-only fill/init pattern */
+  IR_SIMD_BAIL_UNRECOGNIZED_SHAPE  /* honest fallback: no cause identified */
+} IRSimdBailId;
+/* Stable lowercase-kebab name for an id (e.g. "byte-sum-narrow-acc"). */
+const char *ir_simd_bail_id_name(int id);
+/* Render the sorted optimization report (loops + calls) into the report
+ * buffer and clear the store. Routing to stderr or the sidecar file happens
+ * in ir_explain_finalize -- called by the backend flush on the normal path,
+ * or with force_stderr=1 when compilation aborts before codegen (a contract
+ * violation must not eat the report). */
+void ir_explain_flush(void);
+void ir_explain_finalize(int force_stderr);
+/* True when a remark for this (line, entity) is already recorded -- lets a
+ * later pass skip a weaker guess when a definitive remark exists (e.g. the
+ * unroller's "fully unrolled" beats the verifier's "no loop remains"). */
+int ir_explain_has_remark_at(size_t line, const char *entity);
+/* Instruction-level description of a vectorized kernel op for headlines. */
+void ir_explain_kernel_desc(const IRInstruction *ins, char *buf, size_t cap);
+/* --explain: after all inlining rounds, record a remark for every surviving
+ * call to a program-defined function with the reason it was not inlined. */
+void ir_inline_explain_report_remaining(IRProgram *program);
 int ir_optimize_pre_inline_function(IRFunction *function);
 int ir_pass_is_skipped(IROptPassId pass_id);
 int ir_pass_name_is_skipped(const char *pass_name);
+/* METTLE_TIME_IR_PASSES=1: cumulative per-pass wall-time table, dumped at the
+ * end of optimization. begin/end bracket program-level passes by name. */
+double ir_pass_time_begin(void);
+void ir_pass_time_end(const char *name, double begin_ms);
+void ir_pass_time_report(void);
 int ir_pointer_induction_pass(IRFunction *function, int *changed);
 int ir_positive_loop_div2_to_shift_pass(IRFunction *function,
                                                int *changed);
@@ -480,6 +616,9 @@ int ir_simd_minmax_i32_pass(IRFunction *function, int *changed);
 int ir_simd_sum_float_pass(IRFunction *function, int *changed);
 int ir_simd_sum_i32_pass(IRFunction *function, int *changed);
 int ir_simd_sum_u8_pass(IRFunction *function, int *changed);
+int ir_simd_fill_pass(IRFunction *function, int *changed);
+int ir_iv_zero_at_header(const IRFunction *function, size_t header_index,
+                         const char *iv);
 int ir_simd_byte_map_pass(IRFunction *function, int *changed);
 int ir_sroa_pass(IRFunction *function, int *changed);
 int ir_strength_reduce_rotate_loops_pass(IRFunction *function, int *changed);
@@ -494,6 +633,11 @@ int ir_symbol_is_sum_loop_bound(const IRFunction *function,
                                        const char *symbol_name);
 int ir_symbol_read_after(const IRFunction *function, size_t start_index,
                                 const char *symbol_name);
+/* Loop-exit iv liveness for the SIMD recognizers: like read_after, but a
+ * straight-line full redefinition (iv reuse by the next loop) kills the
+ * value instead of blocking vectorization. */
+int ir_symbol_live_after_loop(const IRFunction *function, size_t exit_index,
+                              const char *symbol_name);
 void ir_temp_use_map_destroy(IRTempUseMap *map);
 size_t ir_temp_use_map_get(const IRTempUseMap *map, const char *name);
 int ir_temp_use_map_init(IRTempUseMap *map);
@@ -508,10 +652,24 @@ const IROperand *ir_temp_value_map_lookup(const IRTempValueMap *map,
 void ir_temp_value_map_remove(IRTempValueMap *map, const char *name);
 void ir_temp_value_map_remove_symbol_values(IRTempValueMap *map,
                                                    const char *symbol_name);
+/* `addr_taken` is the function's address-taken symbol set, precomputed once
+ * per pass with ir_addr_taken_set_build (scanning the function per entry per
+ * store was a cubic term on large functions). */
 void ir_temp_value_map_invalidate_after_store(IRTempValueMap *map,
-                                              const IRFunction *function);
+                                              const IRTempValueMap *addr_taken);
+int ir_addr_taken_set_build(const IRFunction *function, IRTempValueMap *set);
 int ir_temp_value_map_set(IRTempValueMap *map, const char *name,
                                  const IROperand *value);
+/* Rebuild the hash index after compacting `items` in place. */
+int ir_temp_value_map_reindex(IRTempValueMap *map);
+/* True when some entry's VALUE is `symbol_name` (lazily builds the reverse
+ * count); a 0 lets per-symbol-write invalidation skip its scan. Compactors
+ * that remove entries in place must report each removed value via
+ * ir_temp_value_map_note_value_removed to keep the counts true. */
+int ir_temp_value_map_any_value_symbol(IRTempValueMap *map,
+                                       const char *symbol_name);
+void ir_temp_value_map_note_value_removed(IRTempValueMap *map,
+                                          const IROperand *value);
 int ir_thread_jump_targets_pass(IRFunction *function, int *changed);
 int ir_try_parse_direct_unit_increment(const IRInstruction *instruction,
                                               const char *iv_symbol);

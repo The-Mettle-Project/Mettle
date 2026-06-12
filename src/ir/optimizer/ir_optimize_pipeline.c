@@ -63,6 +63,9 @@ static const IROptNamedPass g_ir_pre_inline_passes[] = {
 
 static const IROptNamedPass g_ir_post_fixpoint_passes[] = {
     {"induction_pointer", ir_pointer_induction_pass},
+    /* After pointer induction so range-for fills (already converted to the
+     * pointer-walk form) and while-loop fills (still indexed) both match. */
+    {"simd_fill", ir_simd_fill_pass},
     {"prefix_sum_i32", ir_prefix_sum_i32_pass},
     {"simd_minmax_i32", ir_simd_minmax_i32_pass},
     {"simd_affine_map_float", ir_simd_affine_map_float_pass},
@@ -314,11 +317,30 @@ int ir_optimize_function_pipeline(IRFunction *function) {
 
   /* Enforce `@simd` contracts now that every vectorizer has had its chance,
    * then strip the markers before CFG rebuild / codegen. */
+  double t0 = ir_pass_time_begin();
   if (!ir_verify_simd_contracts(function)) {
     return 0;
   }
+  ir_pass_time_end("verify_simd_contracts [stage]", t0);
 
-  return ir_function_rebuild_cfg(function);
+  t0 = ir_pass_time_begin();
+  int ok = ir_function_rebuild_cfg(function);
+  ir_pass_time_end("rebuild_cfg [stage]", t0);
+  return ok;
+}
+
+/* --explain hypothesis testing: re-run the optimization stages (including
+ * every vectorizer) on a scratch clone that carries a simulated fix. No
+ * contract verification, no CFG rebuild -- the caller inspects the clone's
+ * marker regions itself and then throws it away. */
+int ir_optimize_function_revectorize(IRFunction *function) {
+  if (!function) {
+    return 0;
+  }
+  if (!ir_run_fixpoint_stage(function, &g_ir_fixpoint_stage)) {
+    return 0;
+  }
+  return ir_run_named_stage(function, &g_ir_post_fixpoint_stage);
 }
 
 static void ir_set_current_function_context(IRFunction *function) {
@@ -348,12 +370,18 @@ int ir_optimize_program_pipeline(IRProgram *program,
 
   ir_optimize_reset_user_error();
   ir_optimize_set_simd_report(options && options->simd_report);
+  ir_optimize_set_explain(options && options->explain,
+                          options ? options->explain_focus_file : NULL);
   ir_function_index_reset();
 
-  if (!ir_run_program_stage_for_each_function(
-          program, ir_optimize_pre_inline_function)) {
-    ir_function_index_reset();
-    return 0;
+  {
+    double t0 = ir_pass_time_begin();
+    if (!ir_run_program_stage_for_each_function(
+            program, ir_optimize_pre_inline_function)) {
+      ir_function_index_reset();
+      return 0;
+    }
+    ir_pass_time_end("pre_inline [stage]", t0);
   }
 
   if ((!options || !options->preserve_function_boundaries) &&
@@ -361,9 +389,29 @@ int ir_optimize_program_pipeline(IRProgram *program,
     int inlining_changed = 0;
     mettle_compiler_ctx_set_pass_name("inline_small_functions");
     mettle_compiler_ctx_set_fixpoint_iteration(0);
+    double t0 = ir_pass_time_begin();
     if (!ir_inline_small_functions_pass(program, &inlining_changed)) {
       mettle_compiler_ice("IR optimization inlining pass failed");
     }
+    ir_pass_time_end("inline_small_functions [program]", t0);
+  }
+
+  /* Bounded recursive inlining: expand a recursive function's direct
+   * self-call sites into copies of its own body (depth- and size-capped), so
+   * each remaining real call amortizes prologue/epilogue and argument-passing
+   * overhead across a subtree of the recursion. Runs after the regular
+   * inliner so a self-recursive helper is first inlined into callers where
+   * possible, then expanded in place. */
+  if ((!options || !options->preserve_function_boundaries) &&
+      !ir_pass_name_is_skipped("inline_self_recursion")) {
+    int self_inline_changed = 0;
+    mettle_compiler_ctx_set_pass_name("inline_self_recursion");
+    mettle_compiler_ctx_set_fixpoint_iteration(0);
+    double t0 = ir_pass_time_begin();
+    if (!ir_inline_self_recursion_pass(program, &self_inline_changed)) {
+      mettle_compiler_ice("IR optimization self-recursion inlining failed");
+    }
+    ir_pass_time_end("inline_self_recursion [program]", t0);
   }
 
   /* `@pure` loop-invariant call hoisting. Program-level (resolves callees by
@@ -373,13 +421,20 @@ int ir_optimize_program_pipeline(IRProgram *program,
     int pure_licm_changed = 0;
     mettle_compiler_ctx_set_pass_name("hoist_pure_calls");
     mettle_compiler_ctx_set_fixpoint_iteration(0);
+    double t0 = ir_pass_time_begin();
     if (!ir_hoist_pure_calls_pass(program, &pure_licm_changed)) {
       mettle_compiler_ice("IR optimization pure-call hoisting pass failed");
     }
+    ir_pass_time_end("hoist_pure_calls [program]", t0);
   }
 
+  /* Give the per-function contract verifier program access for the duration
+   * of the stage: the call-in-body fix simulation re-runs the inliner on a
+   * caller clone, which needs callee lookup. */
+  ir_explain_set_program(program);
   if (!ir_run_program_stage_for_each_function(
           program, ir_optimize_function_pipeline)) {
+    ir_explain_set_program(NULL);
     /* A violated `@simd!` contract already printed a user diagnostic; don't
      * dress it up as an internal compiler error. */
     if (!ir_optimize_had_user_error()) {
@@ -388,7 +443,31 @@ int ir_optimize_program_pipeline(IRProgram *program,
     ir_function_index_reset();
     return 0;
   }
+  ir_explain_set_program(NULL);
+
+  /* Function-level contracts, now that every optimization that could satisfy
+   * them has run. `@inline!` is skipped when function boundaries are pinned
+   * (--profile-runtime disables inlining entirely; failing every contract
+   * there would be noise, not information). Check both before deciding the
+   * outcome so a build with several violations reports them all. */
+  int contracts_ok = 1;
+  if (!options || !options->preserve_function_boundaries) {
+    contracts_ok &= ir_inline_enforce_contracts(program);
+  }
+  contracts_ok &= ir_enforce_noalloc_contracts(program);
+
+  /* --explain: every inline that happened was recorded as it happened; record
+   * each surviving call with the reason it was refused, then print the whole
+   * sorted report. (No-ops unless explain is enabled.) */
+  ir_inline_explain_report_remaining(program);
+  ir_explain_flush();
+  if (!contracts_ok) {
+    /* Compilation stops before codegen, so the backend flush (the normal
+     * report-routing point) never runs: print the buffered report now. */
+    ir_explain_finalize(1);
+  }
+  ir_pass_time_report();
 
   ir_function_index_reset();
-  return 1;
+  return contracts_ok;
 }

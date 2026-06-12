@@ -1,0 +1,27 @@
+// Regression: user locals named like compiler temps (t0, t1, t2, ...) must
+// not alias the lowering's expression temporaries. The MIR backend's
+// name->vreg map keyed on the bare name, so `%t2 = @acc + @t2` resolved the
+// temp %t2 to local t2's vreg and clobbered the loop counter mid-expression
+// (observed at -O0: nested attention-style loops summed 15 instead of 2912).
+// Temps are now namespaced (".t%d") and the map keys on operand kind.
+
+function nested_sum(NH: int64, pos: int64) -> int64 {
+    var acc: int64 = 0;
+    var h: int64 = 0;
+    while (h < NH) {
+        var t2: int64 = 0;
+        while (t2 <= pos) { acc = acc + t2; t2 = t2 + 1; }
+        var t0: int64 = 0;
+        while (t0 <= pos) { acc = acc + 1; t0 = t0 + 1; }
+        h = h + 1;
+    }
+    return acc;
+}
+
+function main() -> int32 {
+    // 32 * (91 + 14) = 3360
+    if (nested_sum(32, 13) != 3360) {
+        return 1;
+    }
+    return 0;
+}

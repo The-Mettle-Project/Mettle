@@ -28,6 +28,10 @@ typedef struct {
   int optimize;
   int release;
   int simd_report; /* --simd-report: note what each `@simd` loop became */
+  int explain;     /* --explain: report optimization decisions (vectorization,
+                      inlining) for the main input file, with reasons */
+  int explain_all; /* --explain-all: drop the focus filter (whole program) */
+  int explain_json; /* --explain-json: machine-readable .explain.json sidecar */
   int emit_object;
   int generate_debug_symbols;
   int generate_line_mapping;
@@ -42,6 +46,7 @@ typedef struct {
   int profile;
   int profile_runtime;
   int profile_runtime_ops;
+  int debug_hooks; /* --debug-hooks: interactive debugger instrumentation */
   int native_heap;
   int tracy;
   int static_link;
@@ -49,6 +54,11 @@ typedef struct {
   const char *tracy_directory;
   int debug_compiler;
   int main_wants_argc_argv;
+  /* Set when this compile feeds a --build executable link (as opposed to a
+   * bare --emit-obj library object). Gates whole-program transforms that are
+   * only sound when `main` is the single entry point, e.g. dead-function
+   * elimination. */
+  int building_executable;
   LinkerMode linker_mode;
 } CompilerOptions;
 

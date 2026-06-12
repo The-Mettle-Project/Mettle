@@ -100,6 +100,22 @@ int wcs_or_reg_reg(BinaryCodeBuffer *b, int dst, int src) {
              b, (unsigned char)(0xC0 | ((src & 7) << 3) | (dst & 7)));
 }
 
+/* 01 /r — add r32, r32 (dst += src). */
+int wcs_add_reg_reg32(BinaryCodeBuffer *b, int dst, int src) {
+  return binary_emit_rex(b, 0, src >> 3, 0, dst >> 3) &&
+         binary_code_buffer_append_u8(b, 0x01) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((src & 7) << 3) | (dst & 7)));
+}
+
+/* REX.W 29 /r — sub r64, r64 (dst -= src; pointer differences need 64-bit). */
+int wcs_sub_reg_reg64(BinaryCodeBuffer *b, int dst, int src) {
+  return binary_emit_rex(b, 1, src >> 3, 0, dst >> 3) &&
+         binary_code_buffer_append_u8(b, 0x29) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((src & 7) << 3) | (dst & 7)));
+}
+
 /* F7 /2 — not r32. */
 int wcs_not_reg(BinaryCodeBuffer *b, int gpr) {
   return binary_emit_rex(b, 0, 0, 0, gpr >> 3) &&

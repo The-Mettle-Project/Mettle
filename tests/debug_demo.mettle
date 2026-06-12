@@ -1,0 +1,45 @@
+// Debugger end-to-end fixture: locals of several types, a call with
+// parameters, a loop, struct/array/pointer expansion targets, and stdout
+// the harness can assert on.
+import "std/io";
+
+struct Point {
+    x: int32;
+    y: int32;
+}
+
+struct Rect {
+    min: Point;
+    max: Point;
+}
+
+function scale(value: int32, amount: int32) -> int32 {
+    var doubled: int32 = value * 2;
+    var result: int32 = doubled * amount;
+    return result;
+}
+
+function main() -> int32 {
+    var total: int32 = 0;
+    var ratio: float64 = 1.5;
+    var label: string = "checkpoint";
+    var corner: Point;
+    corner.x = 7;
+    corner.y = 9;
+    var box: Rect;
+    box.min.x = 1;
+    box.min.y = 2;
+    box.max.x = 30;
+    box.max.y = 40;
+    var pp: Point* = &corner;
+    var grid: int32[4];
+    grid[0] = 10; grid[1] = 11; grid[2] = 12; grid[3] = 13;
+    var i: int32 = 0;
+    while (i < 5) {
+        total = total + scale(i, 3);
+        i = i + 1;
+    }
+    print(cstr("total="));
+    println_int(total);
+    return corner.x - corner.x;
+}

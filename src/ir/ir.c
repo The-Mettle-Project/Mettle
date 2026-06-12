@@ -197,8 +197,10 @@ IRFunction *ir_function_create(const char *name) {
   function->entry_block = 0;
   function->cfg_valid = 0;
   function->is_inline = 0;
+  function->is_inline_contract = 0;
   function->is_noinline = 0;
   function->is_pure = 0;
+  function->is_noalloc = 0;
   return function;
 }
 
@@ -623,6 +625,10 @@ IRProgram *ir_program_create(void) {
   program->profile_entries = NULL;
   program->profile_entry_count = 0;
   program->profile_entry_capacity = 0;
+  program->debug_local_entries = NULL;
+  program->debug_local_entry_count = 0;
+  program->debug_local_entry_capacity = 0;
+  program->dead_functions_eliminated = 0;
   return program;
 }
 
@@ -643,6 +649,13 @@ void ir_program_destroy(IRProgram *program) {
       free(program->profile_entries[i].filename);
     }
     free(program->profile_entries);
+  }
+  if (program->debug_local_entries) {
+    for (size_t i = 0; i < program->debug_local_entry_count; i++) {
+      free(program->debug_local_entries[i].name);
+      free(program->debug_local_entries[i].type_name);
+    }
+    free(program->debug_local_entries);
   }
   free(program);
 }
@@ -713,6 +726,7 @@ const char *ir_opcode_name(IROpcode op) {
   case IR_OP_SIMD_SUM_I32: return "simd_sum_i32";
   case IR_OP_SIMD_SUM_U8: return "simd_sum_u8";
   case IR_OP_SIMD_BYTE_MAP: return "simd_byte_map";
+  case IR_OP_SIMD_FILL: return "simd_fill";
   case IR_OP_SIMD_MATMUL_N32: return "simd_matmul_n32";
   case IR_OP_SIMD_INSERTION_SORT_I32: return "simd_insertion_sort_i32";
   case IR_OP_SIMD_DOT_I32: return "simd_dot_i32";
@@ -904,6 +918,28 @@ static int ir_format_instruction_line(const IRInstruction *instruction,
                        "simd_byte_map(base=%s, len=%s, steps=%zu)", lhs, rhs,
                        instruction->argument_count / 2);
     break;
+  case IR_OP_SIMD_FILL: {
+    char value[128];
+    ir_format_operand(instruction->argument_count > 2 ? &instruction->arguments[2]
+                                                      : NULL,
+                      value, sizeof(value));
+    written = snprintf(
+        buffer, buffer_size, "simd_fill(%s=%s, %s=%s, size=%lld, value=%s)",
+        (instruction->argument_count > 1 &&
+         instruction->arguments[1].int_value == 1)
+            ? "begin"
+            : "base",
+        lhs,
+        (instruction->argument_count > 1 &&
+         instruction->arguments[1].int_value == 1)
+            ? "end"
+            : "len",
+        rhs,
+        instruction->argument_count > 0 ? instruction->arguments[0].int_value
+                                        : 0,
+        value);
+    break;
+  }
   case IR_OP_SIMD_MATMUL_N32:
     written = snprintf(buffer, buffer_size, "%s = matmul_n32(c=%s, a=%s, b=%s)",
                        dest, dest, lhs, rhs);
@@ -1216,6 +1252,183 @@ int ir_program_route_to_native_heap(IRProgram *program) {
      * per-op metadata. */
     ir_function_clear_cfg(fn);
   }
+  return 1;
+}
+
+/* Open-addressed name -> function-index table for the dead-function sweep.
+ * Lookups happen once per operand of every instruction, so a linear name scan
+ * would go quadratic on large multi-function programs (the same trap as the
+ * historical per-element strcmp compile-speed bugs). */
+typedef struct {
+  const char **names;
+  size_t *indices;
+  size_t capacity; /* power of two */
+} IrFnNameTable;
+
+static size_t ir_fn_name_hash(const char *name) {
+  /* FNV-1a. */
+  size_t hash = 1469598103934665603ull;
+  while (*name) {
+    hash ^= (unsigned char)*name++;
+    hash *= 1099511628211ull;
+  }
+  return hash;
+}
+
+static int ir_fn_table_init(IrFnNameTable *table, size_t function_count) {
+  size_t capacity = 16;
+  while (capacity < function_count * 2) {
+    capacity *= 2;
+  }
+  table->names = (const char **)calloc(capacity, sizeof(*table->names));
+  table->indices = (size_t *)calloc(capacity, sizeof(*table->indices));
+  table->capacity = capacity;
+  if (!table->names || !table->indices) {
+    free(table->names);
+    free(table->indices);
+    return 0;
+  }
+  return 1;
+}
+
+static void ir_fn_table_insert(IrFnNameTable *table, const char *name,
+                               size_t index) {
+  size_t slot = ir_fn_name_hash(name) & (table->capacity - 1);
+  while (table->names[slot]) {
+    if (strcmp(table->names[slot], name) == 0) {
+      return; /* First definition wins; duplicates would be a sema error. */
+    }
+    slot = (slot + 1) & (table->capacity - 1);
+  }
+  table->names[slot] = name;
+  table->indices[slot] = index;
+}
+
+/* Returns the function index for `name`, or (size_t)-1. */
+static size_t ir_fn_table_lookup(const IrFnNameTable *table, const char *name) {
+  size_t slot = ir_fn_name_hash(name) & (table->capacity - 1);
+  while (table->names[slot]) {
+    if (strcmp(table->names[slot], name) == 0) {
+      return table->indices[slot];
+    }
+    slot = (slot + 1) & (table->capacity - 1);
+  }
+  return (size_t)-1;
+}
+
+static void ir_dead_fn_mark(const IrFnNameTable *table, const char *name,
+                            unsigned char *live, size_t *worklist,
+                            size_t *worklist_count) {
+  size_t index;
+
+  if (!name) {
+    return;
+  }
+  index = ir_fn_table_lookup(table, name);
+  if (index != (size_t)-1 && !live[index]) {
+    live[index] = 1;
+    worklist[(*worklist_count)++] = index;
+  }
+}
+
+int ir_program_eliminate_dead_functions(IRProgram *program) {
+  IrFnNameTable table;
+  unsigned char *live = NULL;
+  size_t *worklist = NULL;
+  size_t worklist_count = 0;
+  size_t n;
+  size_t kept = 0;
+  int found_main = 0;
+
+  if (!program || program->function_count == 0) {
+    return 1;
+  }
+  n = program->function_count;
+
+  if (!ir_fn_table_init(&table, n)) {
+    return 0;
+  }
+  live = (unsigned char *)calloc(n, 1);
+  worklist = (size_t *)malloc(n * sizeof(*worklist));
+  if (!live || !worklist) {
+    free(table.names);
+    free(table.indices);
+    free(live);
+    free(worklist);
+    return 0;
+  }
+
+  for (size_t i = 0; i < n; i++) {
+    if (program->functions[i] && program->functions[i]->name) {
+      ir_fn_table_insert(&table, program->functions[i]->name, i);
+      if (strcmp(program->functions[i]->name, "main") == 0) {
+        live[i] = 1;
+        worklist[worklist_count++] = i;
+        found_main = 1;
+      }
+    }
+  }
+
+  /* No main means this is not a normal executable image; touch nothing. */
+  if (!found_main) {
+    free(table.names);
+    free(table.indices);
+    free(live);
+    free(worklist);
+    return 1;
+  }
+
+  /* A function is referenced when any instruction of a live function carries
+   * its name: in `text` (direct calls, defer captures, rewritten intrinsics),
+   * in a SYMBOL operand (function-pointer uses like `run(mix)`), or in a
+   * STRING operand (e.g. `dispatch` kernel-name launches). Local variables
+   * shadowing a function name over-approximate to "live", which only costs
+   * bytes, never correctness. */
+  while (worklist_count > 0) {
+    IRFunction *fn = program->functions[worklist[--worklist_count]];
+    if (!fn) {
+      continue;
+    }
+    for (size_t i = 0; i < fn->instruction_count; i++) {
+      const IRInstruction *insn = &fn->instructions[i];
+      ir_dead_fn_mark(&table, insn->text, live, worklist, &worklist_count);
+      if (insn->dest.kind == IR_OPERAND_SYMBOL) {
+        ir_dead_fn_mark(&table, insn->dest.name, live, worklist,
+                        &worklist_count);
+      }
+      if (insn->lhs.kind == IR_OPERAND_SYMBOL ||
+          insn->lhs.kind == IR_OPERAND_STRING) {
+        ir_dead_fn_mark(&table, insn->lhs.name, live, worklist,
+                        &worklist_count);
+      }
+      if (insn->rhs.kind == IR_OPERAND_SYMBOL ||
+          insn->rhs.kind == IR_OPERAND_STRING) {
+        ir_dead_fn_mark(&table, insn->rhs.name, live, worklist,
+                        &worklist_count);
+      }
+      for (size_t a = 0; a < insn->argument_count; a++) {
+        const IROperand *arg = &insn->arguments[a];
+        if (arg->kind == IR_OPERAND_SYMBOL || arg->kind == IR_OPERAND_STRING) {
+          ir_dead_fn_mark(&table, arg->name, live, worklist, &worklist_count);
+        }
+      }
+    }
+  }
+
+  for (size_t i = 0; i < n; i++) {
+    if (live[i]) {
+      program->functions[kept++] = program->functions[i];
+    } else if (program->functions[i]) {
+      ir_function_destroy(program->functions[i]);
+    }
+  }
+  program->function_count = kept;
+  program->dead_functions_eliminated = 1;
+
+  free(table.names);
+  free(table.indices);
+  free(live);
+  free(worklist);
   return 1;
 }
 

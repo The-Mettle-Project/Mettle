@@ -1,5 +1,7 @@
 #include "ir_optimize_internal.h"
 
+#include <stdio.h>
+
 /* Name -> IRFunction index for the optimizer.
  *
  * ir_program_find_function used to linear-scan every function (strcmp each) and
@@ -108,12 +110,29 @@ static int ir_function_name_is_inline_denylisted(const char *name) {
          strcmp(name, "bench_unrolled") == 0;
 }
 
-static int ir_function_is_inline_candidate(const IRFunction *function) {
+/* When `why_not`/`fix` are non-NULL they receive a user-facing reason and an
+ * actionable suggestion (static strings) every time this returns 0; --explain
+ * reports them verbatim. A NULL fix means there is nothing actionable. */
+static int ir_function_is_inline_candidate(const IRFunction *function,
+                                           const char **why_not,
+                                           const char **fix) {
+  const char *unused;
+  if (!why_not) {
+    why_not = &unused;
+  }
+  if (!fix) {
+    fix = &unused;
+  }
+  *why_not = NULL;
+  *fix = NULL;
   if (!function || !function->name || function->instruction_count == 0) {
+    *why_not = "the callee has no body available to the inliner";
     return 0;
   }
   /* `@noinline` is an absolute veto. */
   if (function->is_noinline) {
+    *why_not = "the callee is marked @noinline";
+    *fix = "remove @noinline if inlining is wanted here";
     return 0;
   }
   /* `@inline` forces the function past the discretionary heuristics below
@@ -123,11 +142,18 @@ static int ir_function_is_inline_candidate(const IRFunction *function) {
    * apply. */
   int forced = function->is_inline;
 
-  if (!forced && (ir_function_name_is_inline_denylisted(function->name) ||
-                  function->parameter_count > IR_INLINE_MAX_PARAMETERS)) {
+  if (!forced && ir_function_name_is_inline_denylisted(function->name)) {
+    *why_not = "the callee is on the compiler's inline denylist "
+               "(a compile-time-blowup guard)";
+    return 0;
+  }
+  if (!forced && function->parameter_count > IR_INLINE_MAX_PARAMETERS) {
+    *why_not = "the callee has more than 16 parameters";
+    *fix = "pass a struct instead of a long parameter list";
     return 0;
   }
   if (function->parameter_count > 0 && !function->parameter_names) {
+    *why_not = "the callee's parameter names are unavailable to the inliner";
     return 0;
   }
 
@@ -147,10 +173,13 @@ static int ir_function_is_inline_candidate(const IRFunction *function) {
 
     non_nop_count++;
     if (!forced && non_nop_count > IR_INLINE_MAX_NON_NOP_INSTRUCTIONS) {
+      *why_not = "the callee's body is over the 128-instruction inline budget";
+      *fix = "mark the callee @inline to override the budget";
       return 0;
     }
 
     if (instruction->op == IR_OP_INLINE_ASM) {
+      *why_not = "the callee contains inline assembly";
       return 0;
     }
 
@@ -186,6 +215,9 @@ static int ir_function_is_inline_candidate(const IRFunction *function) {
         instruction->op == IR_OP_CALL_INDIRECT) {
       call_count++;
       if (!forced && call_count > 2) {
+        *why_not = "the callee makes more than 2 calls of its own (inlining "
+                   "glue functions bloats callers without runtime gain)";
+        *fix = "mark the callee @inline to override the call-count cap";
         return 0;
       }
     }
@@ -199,16 +231,18 @@ static int ir_function_is_inline_candidate(const IRFunction *function) {
    * (notably pattern_matches inside the grep loop). The labels and branches
    * inline correctly via the generic label-rename map; the cap was just
    * working around a latent bug elsewhere in the optimizer. */
-  if (has_while_label && has_less_compare && has_greater_compare) {
+  if ((has_while_label && has_less_compare && has_greater_compare) ||
+      (has_while_label && has_subtract) || (has_while_label && has_multiply)) {
+    *why_not = "the callee contains a loop the inliner currently declines "
+               "(a compiler limitation, not a problem in your code; the call "
+               "itself costs little next to the loop inside it)";
     return 0;
   }
-  if (has_while_label && has_subtract) {
+  if (!has_return) {
+    *why_not = "the callee has no return instruction the inliner can rewrite";
     return 0;
   }
-  if (has_while_label && has_multiply) {
-    return 0;
-  }
-  return has_return;
+  return 1;
 }
 
 static size_t ir_function_non_nop_instruction_count(const IRFunction *function) {
@@ -281,6 +315,7 @@ int ir_clone_instruction_plain(const IRInstruction *source,
    * zero-extending uint8/16/32 loads. Dropping it here (it only runs at -O)
    * silently reverts those to signed -- a uint32-as-signed miscompile. */
   out->is_unsigned = source->is_unsigned;
+  out->allocates = source->allocates; /* string-concat heap allocation marker */
   out->ast_ref = source->ast_ref;
 
   if (!ir_operand_clone(&source->dest, &out->dest) ||
@@ -333,6 +368,7 @@ static int ir_clone_instruction_for_inline(const IRInstruction *source,
   out->is_float = source->is_float;
   out->float_bits = source->float_bits;
   out->is_unsigned = source->is_unsigned; /* unsigned div/shr + zero-ext loads */
+  out->allocates = source->allocates;     /* string-concat allocation marker */
   out->ast_ref = NULL;
 
   if (!ir_inline_rewrite_operand(&source->dest, &out->dest, symbol_map,
@@ -619,16 +655,106 @@ cleanup:
   return ok;
 }
 
+/* True when instruction `site` sits inside a loop body of `function`:
+ * between a loop header label and a back-jump to that label. A loop-resident
+ * call pays its overhead every iteration -- those sites keep full inlining
+ * eligibility even in an over-budget caller, because that is exactly where
+ * inlining still buys runtime. A site outside every loop runs at most once
+ * per call of the function; refusing it costs nothing measurable. */
+static int ir_call_site_is_in_loop(const IRFunction *function, size_t site) {
+  for (size_t h = 0; h < site; h++) {
+    const IRInstruction *header = &function->instructions[h];
+    if (header->op != IR_OP_LABEL || !header->text ||
+        !ir_label_is_while_header(header->text)) {
+      continue;
+    }
+    for (size_t j = site + 1; j < function->instruction_count; j++) {
+      const IRInstruction *jmp = &function->instructions[j];
+      if (jmp->op == IR_OP_JUMP && jmp->text &&
+          strcmp(jmp->text, header->text) == 0) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+/* Bitmap form of ir_call_site_is_in_loop for the inliner's walk over an
+ * over-budget caller: marks every [header, last back-jump] range once,
+ * instead of re-deriving loop membership per call site (which was quadratic
+ * on machine-generated functions with hundreds of loops and calls). Returns
+ * NULL on allocation failure or when the function has no loops -- callers
+ * fall back to the per-site scan. */
+static char *ir_build_in_loop_bitmap(const IRFunction *function) {
+  char *in_loop = NULL;
+  for (size_t h = 0; h < function->instruction_count; h++) {
+    const IRInstruction *header = &function->instructions[h];
+    if (header->op != IR_OP_LABEL || !header->text ||
+        !ir_label_is_while_header(header->text)) {
+      continue;
+    }
+    size_t last = 0;
+    int found = 0;
+    for (size_t j = h + 1; j < function->instruction_count; j++) {
+      const IRInstruction *jmp = &function->instructions[j];
+      if (jmp->op == IR_OP_JUMP && jmp->text &&
+          strcmp(jmp->text, header->text) == 0) {
+        last = j;
+        found = 1;
+      }
+    }
+    if (!found) {
+      continue;
+    }
+    if (!in_loop) {
+      in_loop = calloc(function->instruction_count, 1);
+      if (!in_loop) {
+        return NULL;
+      }
+    }
+    memset(in_loop + h, 1, last - h + 1);
+  }
+  return in_loop;
+}
+
+/* A "tiny leaf": at most IR_INLINE_TINY_LEAF_NON_NOP_INSTRUCTIONS non-nop
+ * instructions and no calls of its own. Inlining one into ANY caller is
+ * (nearly) free -- the body is about the size of the call sequence it
+ * replaces, and with no nested calls the growth cannot cascade. */
+static int ir_function_is_tiny_leaf(const IRFunction *callee) {
+  size_t non_nop = 0;
+  for (size_t i = 0; i < callee->instruction_count; i++) {
+    IROpcode op = callee->instructions[i].op;
+    if (op == IR_OP_NOP) {
+      continue;
+    }
+    if (op == IR_OP_CALL || op == IR_OP_CALL_INDIRECT) {
+      return 0;
+    }
+    if (++non_nop > IR_INLINE_TINY_LEAF_NON_NOP_INSTRUCTIONS) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
                                        size_t *inline_counter, int *changed) {
   if (!program || !function || !inline_counter) {
     return 0;
   }
 
-  if (ir_function_non_nop_instruction_count(function) >
-      IR_INLINE_MAX_CALLER_NON_NOP_INSTRUCTIONS) {
-    return 1;
-  }
+  /* An over-budget caller may not GROW further, but freezing it entirely
+   * would refuse free wins. Three exemptions still go in: tiny leaf callees
+   * (accessors, predicates -- cannot cause runaway growth), @inline-forced
+   * callees (the user explicitly overriding the heuristic), and calls at
+   * LOOP-RESIDENT sites (the only places where call overhead multiplies --
+   * the budget exists to bound code size, not to leave per-iteration call
+   * overhead in hot loops). What stays refused: cold one-shot call sites,
+   * which cost nothing measurable as real calls. */
+  int caller_over_budget = ir_function_non_nop_instruction_count(function) >
+                           IR_INLINE_MAX_CALLER_NON_NOP_INSTRUCTIONS;
+  char *in_loop = caller_over_budget ? ir_build_in_loop_bitmap(function) : NULL;
 
   IRInstructionVector vector = {0};
   int local_changed = 0;
@@ -642,7 +768,15 @@ static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
       IRFunction *callee = ir_program_find_function(program, instruction->text);
       if (callee && callee != function &&
           instruction->argument_count == callee->parameter_count &&
-          ir_function_is_inline_candidate(callee)) {
+          (!caller_over_budget || callee->is_inline ||
+           ir_function_is_tiny_leaf(callee) || (in_loop && in_loop[i])) &&
+          ir_function_is_inline_candidate(callee, NULL, NULL)) {
+        if (ir_explain_enabled()) {
+          char entity[160];
+          snprintf(entity, sizeof(entity), "call to `%s`", instruction->text);
+          ir_explain_remark(function->name, entity, instruction->location, 1,
+                            "inlined", NULL, NULL, NULL);
+        }
         if (!ir_inline_call_instruction(&vector, instruction, callee,
                                         (*inline_counter)++)) {
           ir_instruction_vector_destroy(&vector);
@@ -651,6 +785,117 @@ static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
         local_changed = 1;
         continue;
       }
+    }
+
+    if (!ir_clone_instruction_plain(instruction, &cloned) ||
+        !ir_instruction_vector_append_move(&vector, &cloned)) {
+      ir_instruction_destroy_storage(&cloned);
+      ir_instruction_vector_destroy(&vector);
+      free(in_loop);
+      return 0;
+    }
+  }
+  free(in_loop);
+
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    ir_instruction_destroy_storage(&function->instructions[i]);
+  }
+  free(function->instructions);
+  function->instructions = vector.items;
+  function->instruction_count = vector.count;
+  function->instruction_capacity = vector.capacity;
+  vector.items = NULL;
+  vector.count = 0;
+  vector.capacity = 0;
+
+  if (local_changed && changed) {
+    *changed = 1;
+  }
+  return 1;
+}
+
+/* --- Self-recursion inlining -------------------------------------------
+ *
+ * The regular inliner never inlines a function into itself (callee !=
+ * function), so a recursive function pays full call overhead at every level
+ * of the recursion tree. Inlining the body into its own self-call sites a
+ * bounded number of times (the gcc "max-inline-recursive-depth" idea)
+ * multiplies the work done per real call: depth 1 turns each call into ~the
+ * work of a small subtree, cutting the dynamic call count by the subtree
+ * size. Growth is bounded by a body-size cap, so deep expansion stops on its
+ * own. Loop-bearing recursive functions are excluded: the inliner's
+ * structural loop guards exist to sidestep a latent optimizer bug, and the
+ * combination is rare enough not to be worth the risk. */
+static int ir_function_is_self_inline_candidate(const IRFunction *function,
+                                                size_t *self_call_count_out) {
+  if (!function || !function->name || function->instruction_count == 0 ||
+      function->is_noinline) {
+    return 0;
+  }
+  if (function->parameter_count > IR_INLINE_MAX_PARAMETERS ||
+      (function->parameter_count > 0 && !function->parameter_names)) {
+    return 0;
+  }
+
+  size_t self_calls = 0;
+  int has_return = 0;
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    if (instruction->op == IR_OP_NOP) {
+      continue;
+    }
+    if (instruction->op == IR_OP_INLINE_ASM ||
+        instruction->op == IR_OP_CALL_INDIRECT) {
+      return 0;
+    }
+    if (instruction->op == IR_OP_LABEL && instruction->text &&
+        (strncmp(instruction->text, "ir_while_", 9) == 0 ||
+         strstr(instruction->text, "_lbl_ir_while_") != NULL)) {
+      return 0;
+    }
+    if (instruction->op == IR_OP_CALL && instruction->text &&
+        strcmp(instruction->text, function->name) == 0) {
+      if (instruction->argument_count != function->parameter_count) {
+        return 0;
+      }
+      self_calls++;
+      if (self_calls > IR_SELF_INLINE_MAX_SELF_CALLS) {
+        return 0;
+      }
+    }
+    if (instruction->op == IR_OP_RETURN) {
+      has_return = 1;
+    }
+  }
+
+  if (self_call_count_out) {
+    *self_call_count_out = self_calls;
+  }
+  return has_return && self_calls > 0;
+}
+
+/* One depth level: rebuild the function, expanding every direct self-call
+ * site with a clone of the CURRENT body (the clone's own self-calls stay as
+ * real calls, to be expanded by the next round or executed at runtime). */
+static int ir_inline_self_calls_once(IRFunction *function,
+                                     size_t *inline_counter, int *changed) {
+  IRInstructionVector vector = {0};
+  int local_changed = 0;
+
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    IRInstruction cloned = {0};
+
+    if (instruction->op == IR_OP_CALL && instruction->text &&
+        strcmp(instruction->text, function->name) == 0 &&
+        instruction->argument_count == function->parameter_count) {
+      if (!ir_inline_call_instruction(&vector, instruction, function,
+                                      (*inline_counter)++)) {
+        ir_instruction_vector_destroy(&vector);
+        return 0;
+      }
+      local_changed = 1;
+      continue;
     }
 
     if (!ir_clone_instruction_plain(instruction, &cloned) ||
@@ -676,6 +921,308 @@ static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
     *changed = 1;
   }
   return 1;
+}
+
+int ir_inline_self_recursion_pass(IRProgram *program, int *changed) {
+  if (!program) {
+    return 0;
+  }
+
+  size_t inline_counter = 0;
+  for (size_t i = 0; i < program->function_count; i++) {
+    IRFunction *function = program->functions[i];
+    size_t self_calls = 0;
+    if (!ir_function_is_self_inline_candidate(function, &self_calls)) {
+      continue;
+    }
+    for (int depth = 0; depth < IR_SELF_INLINE_MAX_DEPTH; depth++) {
+      if (ir_function_non_nop_instruction_count(function) >
+          IR_SELF_INLINE_MAX_BODY_INSTRUCTIONS) {
+        break;
+      }
+      int round_changed = 0;
+      if (!ir_inline_self_calls_once(function, &inline_counter,
+                                     &round_changed)) {
+        return 0;
+      }
+      if (!round_changed) {
+        break;
+      }
+      if (changed) {
+        *changed = 1;
+      }
+    }
+  }
+
+  return 1;
+}
+
+/* Why did this specific call site survive inlining? Shared by the --explain
+ * refusal remarks and the `@inline!` contract enforcement so the report and
+ * the error always agree. */
+/* True when the callee's body now contains a SIMD kernel op -- its loops were
+ * vectorized after inlining decisions were made, so the historical refusal
+ * reason (usually the loop-shape guard) no longer describes the body. */
+static int ir_function_contains_simd_kernel(const IRFunction *function) {
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    IROpcode op = function->instructions[i].op;
+    if (op >= IR_OP_COUNT_WORD_STARTS && op <= IR_OP_SIMD_OUTER_LANE_F64) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void ir_inline_site_reason(IRFunction *caller,
+                                  const IRInstruction *instruction,
+                                  IRFunction *callee, const char **reason,
+                                  const char **fix) {
+  *reason = NULL;
+  *fix = NULL;
+  if (callee != caller && ir_function_contains_simd_kernel(callee)) {
+    *reason = "the callee's loops were vectorized into SIMD kernels after "
+              "inlining ran; it stays a real call (the kernel runs the same "
+              "either way)";
+    return;
+  }
+  if (callee == caller) {
+    *reason = "the call is directly recursive";
+    *fix = "bounded self-recursion expansion applies automatically (depth 3); "
+           "rewrite as a loop for full control";
+  } else if (ir_function_non_nop_instruction_count(caller) >
+                 IR_INLINE_MAX_CALLER_NON_NOP_INSTRUCTIONS &&
+             !callee->is_inline && !ir_function_is_tiny_leaf(callee) &&
+             instruction >= caller->instructions &&
+             !ir_call_site_is_in_loop(
+                 caller, (size_t)(instruction - caller->instructions))) {
+    /* Mirrors the gate in ir_inline_calls_in_function: tiny leaves,
+     * @inline-forced callees, and loop-resident sites are exempt from the
+     * caller budget, so only cold one-shot sites can be refused for this
+     * reason -- and for those, NOT inlining is the right call, so there is
+     * deliberately no fix advice to hand out. */
+    *reason = "the calling function is over the 512-instruction caller "
+              "budget, and this call site is not inside a loop -- it runs "
+              "at most once per call of the function, so keeping it a real "
+              "call costs nothing measurable (loop-resident calls, tiny "
+              "call-free callees, and @inline-marked callees still inline "
+              "here)";
+  } else if (instruction->argument_count > IR_INLINE_MAX_PARAMETERS ||
+             instruction->argument_count != callee->parameter_count) {
+    *reason = "the call's argument count doesn't match what the inliner "
+              "handles for this callee";
+  } else if (ir_function_is_inline_candidate(callee, reason, fix)) {
+    /* Candidate-eligible but still here: the call site appeared late (a
+     * nested inline in the final round) or rounds hit their cap. */
+    *reason = "inlining rounds reached their limit before this call could "
+              "be revisited";
+  }
+}
+
+/* --explain: record every call that SURVIVED all inlining rounds, with the
+ * reason it was not inlined. Successful inlines are recorded at the moment
+ * they happen (the call instruction no longer exists afterwards); refusals are
+ * recorded here, once, after the dust settles -- doing it inside the round
+ * loop would repeat each refusal once per round. Calls to functions not
+ * defined in the program (runtime/extern) are skipped: the inliner could never
+ * touch them, so there is no decision to explain. */
+void ir_inline_explain_report_remaining(IRProgram *program) {
+  if (!program || !ir_explain_enabled()) {
+    return;
+  }
+
+  for (size_t f = 0; f < program->function_count; f++) {
+    IRFunction *function = program->functions[f];
+    if (!function) {
+      continue;
+    }
+    for (size_t i = 0; i < function->instruction_count; i++) {
+      const IRInstruction *instruction = &function->instructions[i];
+      if (instruction->op != IR_OP_CALL || !instruction->text) {
+        continue;
+      }
+      if (!ir_explain_location_enabled(&instruction->location)) {
+        continue;
+      }
+      IRFunction *callee = ir_program_find_function(program, instruction->text);
+      if (!callee) {
+        continue;
+      }
+      const char *reason = NULL;
+      const char *fix = NULL;
+      ir_inline_site_reason(function, instruction, callee, &reason, &fix);
+
+      /* When the fix is "mark it @inline", PROVE it: re-run the candidate
+       * check with the decorator pretend-applied. A pass means the call
+       * really will inline; a fail means the suggestion is wrong (a
+       * structural guard hides behind the discretionary cap that fired
+       * first), so the fix is corrected rather than printed as-is. */
+      const char *verified = NULL;
+      char corrected_fix[320];
+      if (fix && strstr(fix, "@inline") && !callee->is_inline &&
+          !callee->is_noinline) {
+        int saved = callee->is_inline;
+        callee->is_inline = 1;
+        const char *forced_reason = NULL;
+        const char *unused_fix = NULL;
+        if (ir_function_is_inline_candidate(callee, &forced_reason,
+                                            &unused_fix)) {
+          verified = "re-checked with @inline pretend-applied: the structural "
+                     "guards pass, so this call will inline";
+        } else if (forced_reason && reason &&
+                   strcmp(forced_reason, reason) == 0) {
+          /* The pretend-apply failed for the reason already printed; a fix
+           * line restating it would be noise. */
+          fix = NULL;
+        } else {
+          snprintf(corrected_fix, sizeof(corrected_fix),
+                   "none \xE2\x80\x94 re-checked with @inline "
+                   "pretend-applied and it still won't inline: %s",
+                   forced_reason ? forced_reason : "a structural guard");
+          fix = corrected_fix;
+        }
+        callee->is_inline = saved;
+      }
+
+      char entity[160];
+      snprintf(entity, sizeof(entity), "call to `%s`", instruction->text);
+      ir_explain_remark(function->name, entity, instruction->location, 0,
+                        "NOT inlined", reason, fix, verified);
+    }
+  }
+}
+
+/* `@inline!` contract: after every inlining round has run, any surviving call
+ * to a contract function is a hard compile error carrying the same reason the
+ * --explain report would give. Not focus-filtered -- a contract holds across
+ * the whole program. Returns 1 when every contract held. */
+int ir_inline_enforce_contracts(IRProgram *program) {
+  if (!program) {
+    return 1;
+  }
+  /* Inlining clones call sites (each clone keeps the original source
+   * location), so one offending line can surface several times; report each
+   * (location, callee) once. */
+  struct {
+    size_t line, column;
+    const char *callee;
+  } reported[64];
+  size_t reported_count = 0;
+  int ok = 1;
+  for (size_t f = 0; f < program->function_count; f++) {
+    IRFunction *function = program->functions[f];
+    if (!function) {
+      continue;
+    }
+    for (size_t i = 0; i < function->instruction_count; i++) {
+      const IRInstruction *instruction = &function->instructions[i];
+      if (instruction->op != IR_OP_CALL || !instruction->text) {
+        continue;
+      }
+      IRFunction *callee = ir_program_find_function(program, instruction->text);
+      if (!callee || !callee->is_inline_contract) {
+        continue;
+      }
+      int already_reported = 0;
+      for (size_t r = 0; r < reported_count; r++) {
+        if (reported[r].line == instruction->location.line &&
+            reported[r].column == instruction->location.column &&
+            strcmp(reported[r].callee, instruction->text) == 0) {
+          already_reported = 1;
+          break;
+        }
+      }
+      if (already_reported) {
+        ok = 0; /* still a violation, just not re-printed */
+        continue;
+      }
+      if (reported_count < 64) {
+        reported[reported_count].line = instruction->location.line;
+        reported[reported_count].column = instruction->location.column;
+        reported[reported_count].callee = instruction->text;
+        reported_count++;
+      }
+      const char *reason = NULL;
+      const char *fix = NULL;
+      ir_inline_site_reason(function, instruction, callee, &reason, &fix);
+      fprintf(stderr,
+              "%s:%zu:%zu: error: @inline! call to `%s` was not inlined: "
+              "%s%s%s\n",
+              instruction->location.filename ? instruction->location.filename
+                                             : "<input>",
+              instruction->location.line, instruction->location.column,
+              instruction->text, reason ? reason : "unknown",
+              fix ? "; " : "", fix ? fix : "");
+      ok = 0;
+    }
+  }
+  if (!ok) {
+    ir_optimize_note_user_error();
+  }
+  return ok;
+}
+
+int ir_inline_explain_simulate_force_inline(IRProgram *program,
+                                            IRFunction *caller,
+                                            const char *callee_name,
+                                            int *was_noinline_out,
+                                            const char **decline_reason_out) {
+  if (decline_reason_out) {
+    *decline_reason_out = NULL;
+  }
+  if (!program || !caller || !callee_name) {
+    return 0;
+  }
+  IRFunction *callee = ir_program_find_function(program, callee_name);
+  if (!callee || callee == caller) {
+    return 0;
+  }
+
+  /* Two pretends, reported distinctly: a `@noinline` callee simulates the
+   * user REMOVING that decorator (the veto precedes everything, so forcing
+   * is_inline alone would never fire); anything else simulates ADDING
+   * @inline. */
+  int saved_is_inline = callee->is_inline;
+  int saved_is_noinline = callee->is_noinline;
+  if (was_noinline_out) {
+    *was_noinline_out = callee->is_noinline;
+  }
+  callee->is_inline = 1;
+  callee->is_noinline = 0;
+  /* With the pretend flags set, any remaining refusal is structural (loops,
+   * inline asm, no return, ...) -- something no decorator can override. Hand
+   * that reason out so --explain can WITHDRAW the @inline advice instead of
+   * printing a suggestion the inliner itself has just proven dead. */
+  const char *why_not = NULL;
+  int candidate = ir_function_is_inline_candidate(callee, &why_not, NULL);
+  if (!candidate && decline_reason_out) {
+    *decline_reason_out = why_not;
+  }
+  int changed = 0;
+  if (candidate) {
+    /* High counter base so the clone's fresh __inl_* names cannot collide
+     * with names the real inlining rounds already left in the caller.
+     * Multiple rounds: when the forced callee was declined for making calls
+     * of its own (the glue-function cap), those inner calls land in the
+     * caller on round 1 and -- when their targets are ordinary inline
+     * candidates -- disappear on the next round, exactly as the real
+     * pipeline's rounds would once the user adds @inline. */
+    size_t inline_counter = 900000;
+    for (int round = 0; round < IR_INLINE_MAX_ROUNDS; round++) {
+      int round_changed = 0;
+      if (!ir_inline_calls_in_function(program, caller, &inline_counter,
+                                       &round_changed)) {
+        changed = 0;
+        break;
+      }
+      if (!round_changed) {
+        break;
+      }
+      changed = 1;
+    }
+  }
+  callee->is_inline = saved_is_inline;
+  callee->is_noinline = saved_is_noinline;
+  return candidate && changed;
 }
 
 int ir_inline_small_functions_pass(IRProgram *program, int *changed) {

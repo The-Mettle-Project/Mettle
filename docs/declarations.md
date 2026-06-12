@@ -54,15 +54,18 @@ to the `function` (or `export function`) that follows.
 
 | Decorator | Meaning |
 |-----------|---------|
-| `@inline` | Force the function past the inliner's size, parameter-count, and call-count heuristics (and the built-in benchmark denylist). Structural blockers — most importantly inline assembly — still prevent inlining. |
+| `@inline` | Force the function past the inliner's size, parameter-count, and call-count heuristics, the built-in benchmark denylist, and the caller-size budget (an over-budget caller normally only accepts tiny call-free callees). Structural blockers — most importantly inline assembly — still prevent inlining. |
+| `@inline!` | **Contract**: every call to this function must inline, or compilation fails at each surviving call site with the inliner's reason (recursion, a structural guard). Implies `@inline`. |
 | `@noinline` | Never inline this function. This is the user-facing way to keep a hot helper as its own call. |
 | `@pure` | Assert the function is free of side effects **and** safe to evaluate speculatively (it neither writes observable state nor traps in a way that depends on being reached). The optimizer may then evaluate a call once before a loop and reuse the result — see below. |
+| `@noalloc` | **Contract**: the function — and everything it can reach through direct calls — performs zero heap allocations, or compilation fails pointing at the allocation. This is a proof, not a lint: `new`, string `+` concatenation, allocator calls (`malloc`/`calloc`/...), calls to externs not known to be allocation-free, and calls through function pointers anywhere in the reachable graph all violate it. Known-clean libm/memory externs (`sqrtf`, `memcpy`, ...) are allowed. |
 | `@simd` / `@simd!` | Apply a vectorization contract to every counted loop in the body — see [Vectorization contracts](control-flow.md#vectorization-contracts). |
 
 `@inline` and `@noinline` are mutually exclusive. Applying `@inline`,
-`@noinline`, or `@pure` to anything other than a function — a loop, a struct, an
-`extern` function — is a compile error. Decorators have effect only under `-O` /
-`--release`.
+`@noinline`, `@pure`, or `@noalloc` to anything other than a function — a loop,
+a struct, an `extern` function — is a compile error. Decorators have effect
+only under `-O` / `--release` (a note reminds you when contracts go
+unverified in a debug build).
 
 ### `@pure` and loop-invariant call hoisting
 

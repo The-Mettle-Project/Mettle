@@ -241,6 +241,12 @@ static int pure_licm_hoist_one(IRProgram *program, IRFunction *function) {
       ir_operand_destroy(&hoisted.dest);
       hoisted.dest = ir_operand_temp(temp_name);
 
+      /* Callee name for the --explain remark, captured before the insert
+       * below takes ownership of `hoisted`'s storage. */
+      char hoisted_callee[128];
+      snprintf(hoisted_callee, sizeof(hoisted_callee), "%s",
+               hoisted.text ? hoisted.text : "?");
+
       /* 2. Rewrite the in-loop call into `dest <- %temp`, keeping dest. */
       IROperand dest_copy = ir_operand_copy(&call->dest);
       int saved_is_float = call->is_float;
@@ -266,6 +272,16 @@ static int pure_licm_hoist_one(IRProgram *program, IRFunction *function) {
       if (!ir_instruction_insert_move(function, insert_idx, &hoisted)) {
         ir_instruction_destroy_storage(&hoisted);
         return 0;
+      }
+      if (ir_explain_enabled()) {
+        char entity[160];
+        snprintf(entity, sizeof(entity), "call to `%s`", hoisted_callee);
+        ir_explain_remark(
+            function->name, entity, saved_loc, 1,
+            "hoisted out of the loop (runs once, not every iteration)",
+            "`@pure` + loop-invariant arguments enable loop-invariant code "
+            "motion",
+            NULL, NULL);
       }
       return 1;
     }
