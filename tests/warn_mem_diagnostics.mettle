@@ -1,0 +1,45 @@
+// Warning-class memory diagnostics: each function below contains one bug the
+// compiler reports without failing the build.
+import "std/io";
+import "std/mem";
+
+var STASH: int32* = 0;
+
+// M0102 double free, then M0101 use-after-free.
+function double_free_then_use() -> int32 {
+    var p: cstring = malloc(64);
+    free(p);
+    free(p);
+    return (int32)p[0];
+}
+
+// M0104: a stack address stored in a global outlives the frame.
+function stash_stack_address() {
+    var slot: int32[2];
+    slot[0] = 1;
+    STASH = (int32*)&slot[0];
+}
+
+// M0107: the allocation neither escapes nor gets freed.
+function leak_sixty_four() -> int32 {
+    var scratch: cstring = malloc(64);
+    scratch[0] = 9;
+    return (int32)scratch[0];
+}
+
+// Clean control group: conditional frees and defers must stay silent.
+function clean(n: int32) -> int32 {
+    var p: cstring = malloc(64);
+    defer free(p);
+    if (n > 0) {
+        p[0] = (uint8)n;
+    }
+    return (int32)p[0];
+}
+
+function main() -> int32 {
+    var total: int32 = double_free_then_use() + leak_sixty_four() + clean(3);
+    stash_stack_address();
+    println_int(total);
+    return 0;
+}

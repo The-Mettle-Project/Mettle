@@ -1034,6 +1034,16 @@ int type_checker_process_declaration(TypeChecker *checker,
       return 0;
     }
 
+    // Memory diagnostics (use-after-free, dangling stack addresses,
+    // constant out-of-bounds accesses, leaks). The scope is still live, so
+    // `const` locals resolve for constant-index evaluation.
+    if (func_decl->body &&
+        !type_checker_check_function_memory(checker, declaration)) {
+      type_checker_init_tracker_reset(checker);
+      symbol_table_exit_scope(checker->symbol_table);
+      return 0;
+    }
+
     // A function with a non-void return type must contain at least one
     // return statement. This is a simple body-walk (a missing return on
     // some paths is not yet diagnosed); a function with no return at all

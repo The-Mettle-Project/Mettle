@@ -322,6 +322,48 @@ $cases = @(
     Args          = @("-O")
   },
   @{
+    # Memory diagnostics: returning the address of a stack local is an error.
+    Name          = "err_mem_return_stack"
+    Path          = "tests/err_mem_return_stack.mettle"
+    ShouldSucceed = $false
+    Pattern       = 'Returning the address of stack local `values`'
+  },
+  @{
+    # Memory diagnostics: constant index past a stack array's end is an error
+    # (the buffer-extent layer catches the direct form; type_checker_memory
+    # backstops forms it misses).
+    Name          = "err_mem_oob_index"
+    Path          = "tests/err_mem_oob_index.mettle"
+    ShouldSucceed = $false
+    Pattern       = 'Array index 8 is out of bounds'
+  },
+  @{
+    # Memory diagnostics: a constant-size memory op overflowing a stack array.
+    Name          = "err_mem_op_overflow"
+    Path          = "tests/err_mem_op_overflow.mettle"
+    ShouldSucceed = $false
+    Pattern       = '`mem_zero` writes 128 bytes into `buf`, which only has 64'
+  },
+  @{
+    # Memory diagnostics that warn without failing the build: double free,
+    # use-after-free, a stack address stored in a global, and a leak. The
+    # `clean` control function (conditional use + defer free) must add NO
+    # diagnostics of its own.
+    Name          = "warn_mem_diagnostics"
+    Path          = "tests/warn_mem_diagnostics.mettle"
+    ShouldSucceed = $true
+    OutputMustMatch = @(
+      'Double free of `p` \(already freed at line \d+\)',
+      'Use of `p` after it was freed',
+      'Global `STASH` is assigned the address of stack local `slot`',
+      '`scratch` is allocated here but never freed'
+    )
+    OutputMustNotMatch = @(
+      'Use of `scratch`',
+      'warning.*`p` is allocated'
+    )
+  },
+  @{
     # `@noalloc` violated directly by a `new` expression.
     Name          = "err_noalloc"
     Path          = "tests/err_noalloc.mettle"

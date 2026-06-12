@@ -23,9 +23,9 @@ function with_call(out: float32*, n: int32) {
 }
 
 function sum_bytes(data: uint8*, n: int32) -> int32 {
-    var total: int32 = 0;
+    var total: int64 = 0;
     for i in 0..n {
-        total = total + (int32)data[i];
+        total = total + (int64)data[i];
     }
     return total;
 }
