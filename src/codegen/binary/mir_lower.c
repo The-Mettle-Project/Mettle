@@ -2401,6 +2401,14 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
       fn->has_error = 1;
       return 0;
     }
+    if (size != 1 && size != 2 && size != 4 && size != 8) {
+      MirOperand src_base = mir_value_operand(fn, g, ctx, map, &in->lhs);
+      if (addr.kind != MIR_OPK_VREG || src_base.kind != MIR_OPK_VREG) {
+        fn->has_error = 1;
+        return 0;
+      }
+      return mir_emit_struct_copy(fn, addr.vreg, src_base.vreg, size);
+    }
     MirOperand mem = mir_op_mem_vreg(addr.vreg, MIR_VREG_NONE, 1, 0);
     if (in->is_float) {
       /* Coerce the value to the store width: a literal is materialized at

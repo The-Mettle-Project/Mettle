@@ -2411,6 +2411,34 @@ foreach ($variant in @("release", "debug", "debug_fallback")) {
   }
 }
 
+# MIR wide-store regression: release inlines a struct-returning helper, then
+# copies a 24-byte struct by value. The executable returns the folded checksum.
+foreach ($variant in @("release", "debug")) {
+  $total++
+  try {
+    $exePath = Join-Path $tmpDir "test_mir_inline_struct_copy_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($variant -eq "release") { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_mir_inline_struct_copy.mettle", "-o", $exePath)
+
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "mir-inline-struct-copy build ($variant) failed: $buildOut"
+    }
+
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 9) {
+      throw "mir-inline-struct-copy ($variant) miscompiled (exit $LASTEXITCODE)"
+    }
+
+    Write-CaseResult -Name "mir_inline_struct_copy_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "mir_inline_struct_copy_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # Constant division/modulo magic-multiply strength reduction. The program is a
 # differential oracle: it compares each literal `x / C` / `x % C` (magic-
 # multiply) against the same division by a heap-loaded divisor (genuine idiv),

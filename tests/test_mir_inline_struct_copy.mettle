@@ -1,0 +1,35 @@
+// MIR regression: a non-scalar IR_OP_STORE must copy bytes, not store the
+// source address. The release path inlines make_big(), then copies the 24-byte
+// struct by value before folding it.
+
+struct Big {
+  a: int64;
+  b: uint8;
+  c: uint32;
+  d: uint32;
+}
+
+@inline function make_big(x: int64) -> Big {
+  var s: Big;
+  s.a = x;
+  s.b = (uint8)((x + 4) & 255);
+  s.c = (uint32)((x * 5) & 65535);
+  s.d = (uint32)((x * 4) & 65535);
+  return s;
+}
+
+function fold_big(s: Big) -> int64 {
+  return (s.a + (int64)s.b + (int64)s.c + (int64)s.d) & 1099511627775;
+}
+
+function main() -> int32 {
+  var acc: int64 = 1;
+  var sv: Big = make_big(6510);
+  acc = (acc + fold_big(sv)) & 1099511627775;
+
+  var sc: Big = sv;
+  sc.b = (uint8)64;
+  acc = (acc + fold_big(sc) + fold_big(sv)) & 1099511627775;
+
+  return (int32)(acc & 255);
+}
