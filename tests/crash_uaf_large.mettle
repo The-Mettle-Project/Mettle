@@ -1,0 +1,11 @@
+// Runtime use-after-free of a page-backed allocation. Under --native-heap the
+// freed mapping is access-revoked and quarantined, so the read faults
+// instantly and the crash handler classifies the address as a freed block.
+import "std/mem";
+
+function main() -> int32 {
+    var p: cstring = malloc(8192);
+    p[0] = 42;
+    free(p);
+    return (int32)p[0];
+}

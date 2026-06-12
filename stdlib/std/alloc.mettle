@@ -76,6 +76,32 @@ export struct BlockHeader {
 function mem_magic_live() -> int32 { return (int32)0x6D4C5645; } // 'mLVE'
 function mem_magic_dead() -> int32 { return (int32)0x6D444544; } // 'mDED'
 
+// ─── Use-after-free detection ────────────────────────────────────────────────
+
+// Freed small blocks are filled with this byte; a block leaving quarantine
+// with any other byte in it was written through a dangling pointer.
+function mem_poison_byte() -> int32 { return (int32)0xDD; }
+function mem_quarantine_slots() -> int64 { return (int64)32; }
+function mem_large_quarantine_slots() -> int64 { return (int64)8; }
+
+// Crash-handler bridge (src/runtime/crash_handler.c owns the hook). The
+// default heap registers its classifier so an access-violation report can
+// say "that address is inside a freed heap block" instead of printing an
+// anonymous pointer.
+extern function mem_crash_set_classifier(f: fn(cstring) -> int64) = "mettle_crash_set_heap_classifier";
+extern function mem_crash_note(msg: cstring) = "mettle_crash_write_stderr";
+extern function mem_uaf_exit(code: int32) = "exit";
+
+// Report a write-after-free found at quarantine exit and stop: the heap's
+// poison was corrupted through a dangling pointer, so free-list metadata can
+// no longer be trusted.
+function mem_report_write_after_free() {
+  mem_crash_note("Fatal error: use-after-free detected\n");
+  mem_crash_note("A heap block was written through a dangling pointer after it was freed\n");
+  mem_crash_note("(caught by --native-heap quarantine poisoning when the block was reused)\n");
+  mem_uaf_exit((int32)134);
+}
+
 // Header at the start of each carved slab, threading slabs into a list so a heap
 // can release every page it mapped on destroy.
 export struct SlabHeader {
@@ -83,9 +109,17 @@ export struct SlabHeader {
   map_size: int64;
 }
 
-// A heap: 256 free-list heads (each a user-pointer-or-0), the slab list, and
-// occupancy counters. Allocated in its own OS page, which the OS zero-fills, so
-// a freshly mapped heap is already in its empty state.
+// A heap: 256 free-list heads (each a user-pointer-or-0), the slab list,
+// occupancy counters, and the use-after-free quarantine. Allocated in its own
+// OS page, which the OS zero-fills, so a freshly mapped heap is already in
+// its empty state.
+//
+// The quarantine is what turns this allocator into a use-after-free detector:
+// freed small blocks are poisoned (0xDD) and parked here before reuse, so a
+// write through a dangling pointer corrupts the poison and is caught the
+// moment the block leaves quarantine. Freed page-backed blocks keep their
+// mapping with all access revoked, so any touch faults instantly; the crash
+// handler asks mem_crash_classify whether a faulting address belongs to one.
 export struct MemHeap {
   free_lists: int64[256];
   slabs: int64;
@@ -95,6 +129,14 @@ export struct MemHeap {
   total_allocs: int64;
   total_frees: int64;
   invalid_frees: int64;
+  quarantine_blocks: int64[32];    // small-block user pointers awaiting reuse
+  quarantine_classes: int64[32];
+  quarantine_head: int64;
+  quarantine_count: int64;
+  large_quarantine_base: int64[8]; // header addresses of revoked mappings
+  large_quarantine_size: int64[8];
+  large_quarantine_head: int64;
+  large_quarantine_count: int64;
   lock: int32;
 }
 
@@ -209,6 +251,57 @@ function mem_alloc_nolock(h: MemHeap*, n: int64) -> cstring {
   return (cstring)user;
 }
 
+// Verify a quarantined block's poison and link it onto its free list. Caller
+// must hold h->lock. A corrupted poison byte means the program wrote through
+// a dangling pointer after free(): report and stop rather than handing out a
+// block whose metadata cannot be trusted.
+function mem_quarantine_release(h: MemHeap*, user: int64, idx: int64) {
+  var size: int64 = mem_class_size(idx);
+  var i: int64 = 0;
+  while (i < size) {
+    if ((int32)*((uint8*)(user + i)) != mem_poison_byte()) {
+      mem_report_write_after_free();
+    }
+    i = i + 1;
+  }
+  *((int64*)user) = h->free_lists[idx];
+  h->free_lists[idx] = user;
+}
+
+// Park a freed (already poisoned) small block. The quarantine is a fixed ring:
+// when full, the oldest block is verified and released for reuse. The delay is
+// what catches dangling writes -- the block is still poison when the write
+// lands, instead of already being someone else's live allocation.
+function mem_quarantine_push(h: MemHeap*, user: int64, idx: int64) {
+  if (h->quarantine_count == mem_quarantine_slots()) {
+    mem_quarantine_release(h, h->quarantine_blocks[h->quarantine_head],
+                           h->quarantine_classes[h->quarantine_head]);
+  } else {
+    h->quarantine_count = h->quarantine_count + (int64)1;
+  }
+  h->quarantine_blocks[h->quarantine_head] = user;
+  h->quarantine_classes[h->quarantine_head] = idx;
+  h->quarantine_head = (h->quarantine_head + (int64)1) % mem_quarantine_slots();
+}
+
+// Park a freed page-backed block with all access revoked: any later read or
+// write of it is an instant access violation the crash handler classifies as
+// use-after-free. The ring keeps the address ranges identifiable; eviction
+// returns the oldest mapping to the OS.
+function mem_large_quarantine_push(h: MemHeap*, base: int64, total: int64) {
+  if (h->large_quarantine_count == mem_large_quarantine_slots()) {
+    var old_base: int64 = h->large_quarantine_base[h->large_quarantine_head];
+    var old_size: int64 = h->large_quarantine_size[h->large_quarantine_head];
+    h->bytes_reserved = h->bytes_reserved - old_size;
+    os_mem_unmap((cstring)old_base, old_size);
+  } else {
+    h->large_quarantine_count = h->large_quarantine_count + (int64)1;
+  }
+  h->large_quarantine_base[h->large_quarantine_head] = base;
+  h->large_quarantine_size[h->large_quarantine_head] = total;
+  h->large_quarantine_head = (h->large_quarantine_head + (int64)1) % mem_large_quarantine_slots();
+}
+
 // Free a block (p != 0). Caller must hold h->lock.
 //
 // Validates the header magic first: a block that is not currently live (a
@@ -225,22 +318,25 @@ function mem_free_nolock(h: MemHeap*, p: cstring) {
     return;
   }
   if (hdr->class_idx < (int32)0) {
-    // Large block: the mapping (and its header) disappears on unmap, so there
-    // is no freed-state magic to leave behind.
+    // Large block: revoke access and quarantine the mapping instead of
+    // unmapping immediately, so a use-after-free faults at the dangling
+    // pointer with the address still classifiable. bytes_reserved stays
+    // counted until the mapping actually leaves the quarantine.
     var total: int64 = hdr->size;
     h->bytes_in_use = h->bytes_in_use - (total - mem_header_bytes());
-    h->bytes_reserved = h->bytes_reserved - total;
     h->live_allocs = h->live_allocs - (int64)1;
     h->total_frees = h->total_frees + (int64)1;
-    os_mem_unmap((cstring)hdr, total);
+    os_mem_protect_noaccess((cstring)hdr, total);
+    mem_large_quarantine_push(h, (int64)hdr, total);
     return;
   }
-  // Small block: mark dead before linking it back, so an immediate re-free is
-  // caught by the magic check above.
+  // Small block: mark dead, poison the payload, and quarantine it. The
+  // dead magic catches an immediate re-free; the poison catches dangling
+  // writes when the block eventually leaves quarantine.
   hdr->magic = mem_magic_dead();
   var idx: int64 = (int64)hdr->class_idx;
-  *((int64*)p) = h->free_lists[idx];
-  h->free_lists[idx] = (int64)p;
+  mem_fill(p, mem_poison_byte(), mem_class_size(idx));
+  mem_quarantine_push(h, (int64)p, idx);
   h->bytes_in_use = h->bytes_in_use - mem_class_size(idx);
   h->live_allocs = h->live_allocs - (int64)1;
   h->total_frees = h->total_frees + (int64)1;
@@ -370,6 +466,15 @@ export function mem_heap_destroy(h: MemHeap*) {
     os_mem_unmap((cstring)slab, sh->map_size);
     slab = next;
   }
+  // Quarantined page-backed blocks hold their own (access-revoked) mappings.
+  var q: int64 = 0;
+  while (q < mem_large_quarantine_slots()) {
+    if (h->large_quarantine_base[q] != (int64)0) {
+      os_mem_unmap((cstring)h->large_quarantine_base[q],
+                   h->large_quarantine_size[q]);
+    }
+    q = q + (int64)1;
+  }
   os_mem_unmap((cstring)h, mem_round_up_page(mem_header_bytes() * (int64)512));
 }
 
@@ -377,6 +482,35 @@ export function mem_heap_destroy(h: MemHeap*) {
 
 var g_mem_default_heap: MemHeap* = 0;
 var g_mem_default_heap_lock: int32 = 0;
+
+// Crash-time classifier: is `addr` inside a quarantined (freed) block of the
+// process-global heap? The crash handler calls this after an access
+// violation, so it takes no lock and only reads. Returns the block's usable
+// byte count when the address belongs to a freed block, 0 otherwise.
+export function mem_crash_classify(addr: cstring) -> int64 {
+  var h: MemHeap* = g_mem_default_heap;
+  if (h == 0) {
+    return (int64)0;
+  }
+  var a: int64 = (int64)addr;
+  var i: int64 = 0;
+  while (i < mem_large_quarantine_slots()) {
+    var base: int64 = h->large_quarantine_base[i];
+    if (base != (int64)0 && a >= base && a < base + h->large_quarantine_size[i]) {
+      return h->large_quarantine_size[i] - mem_header_bytes();
+    }
+    i = i + (int64)1;
+  }
+  i = 0;
+  while (i < mem_quarantine_slots()) {
+    var user: int64 = h->quarantine_blocks[i];
+    if (user != (int64)0 && a >= user && a < user + mem_class_size(h->quarantine_classes[i])) {
+      return mem_class_size(h->quarantine_classes[i]);
+    }
+    i = i + (int64)1;
+  }
+  return (int64)0;
+}
 
 // The lazily-created process-global heap backing the mx_* convenience API.
 // Double-checked under a dedicated init lock so concurrent first-touch from
@@ -387,6 +521,12 @@ export function mem_default_heap() -> MemHeap* {
     spin_lock(&g_mem_default_heap_lock);
     if (g_mem_default_heap == 0) {
       g_mem_default_heap = mem_heap_create();
+      if (g_mem_default_heap != 0) {
+        // Let the crash handler resolve faulting addresses against the
+        // quarantine, so an access violation in freed memory reports as
+        // use-after-free instead of an anonymous pointer.
+        mem_crash_set_classifier(&mem_crash_classify);
+      }
     }
     spin_unlock(&g_mem_default_heap_lock);
   }

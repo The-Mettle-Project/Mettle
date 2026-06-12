@@ -83,6 +83,10 @@ typedef struct {
   const char *points_to_stack; /* stack local whose address it holds, or NULL */
   int is_null;     /* pointer assigned a null constant on the spine */
   SourceLocation null_loc;
+  int is_wild;     /* pointer assigned a small constant address (never mappable) */
+  long long wild_value;
+  SourceLocation wild_loc;
+  long long points_to_offset; /* element offset into points_to_stack; -1 unknown */
   int has_const_value;    /* integer local with a known spine value */
   long long const_value;  /* (drives the loop-bound analysis) */
 } MemLocal;
@@ -285,8 +289,14 @@ static ASTNode *mem_unwrap_cast(ASTNode *node) {
 /* The stack local at the root of `&expr` (e.g. `&buf`, `&buf[i]`,
  * `&point.x`), or NULL when the expression is not an address of frame
  * memory. A dereference anywhere in the chain breaks it: `&p[i]` where p is
- * a pointer addresses the pointee. */
-static MemLocal *mem_addr_of_stack(MemCtx *ctx, ASTNode *expr) {
+ * a pointer addresses the pointee. When `offset_out` is non-NULL it receives
+ * the ELEMENT offset for the two exactly-understood shapes (`&arr` is 0,
+ * `&arr[const]` is the constant) and -1 for everything else. */
+static MemLocal *mem_addr_of_stack_at(MemCtx *ctx, ASTNode *expr,
+                                      long long *offset_out) {
+  if (offset_out) {
+    *offset_out = -1;
+  }
   expr = mem_unwrap_cast(expr);
   if (!expr || expr->type != AST_UNARY_EXPRESSION) {
     return NULL;
@@ -295,6 +305,37 @@ static MemLocal *mem_addr_of_stack(MemCtx *ctx, ASTNode *expr) {
   if (!unary || !unary->operator || strcmp(unary->operator, "&") != 0) {
     return NULL;
   }
+
+  /* the two offset-tracked shapes first */
+  ASTNode *direct = mem_unwrap_cast(unary->operand);
+  if (offset_out && direct && direct->type == AST_IDENTIFIER) {
+    Identifier *id = (Identifier *)direct->data;
+    MemLocal *local = id ? mem_find_local(ctx, id->name) : NULL;
+    if (local && local->is_stack) {
+      *offset_out = 0;
+      return local;
+    }
+    return NULL;
+  }
+  if (offset_out && direct && direct->type == AST_INDEX_EXPRESSION) {
+    ArrayIndexExpression *index = (ArrayIndexExpression *)direct->data;
+    ASTNode *array = index ? mem_unwrap_cast(index->array) : NULL;
+    if (array && array->type == AST_IDENTIFIER) {
+      Identifier *id = (Identifier *)array->data;
+      MemLocal *local = id ? mem_find_local(ctx, id->name) : NULL;
+      long long constant = 0;
+      if (local && local->is_stack) {
+        if (type_checker_eval_integer_constant_with_checker(
+                ctx->checker, index->index, &constant) &&
+            constant >= 0) {
+          *offset_out = constant;
+        }
+        return local;
+      }
+      return NULL;
+    }
+  }
+
   ASTNode *node = unary->operand;
   int guard = 0;
   while (node && guard++ < 16) {
@@ -320,6 +361,10 @@ static MemLocal *mem_addr_of_stack(MemCtx *ctx, ASTNode *expr) {
     return NULL;
   }
   return NULL;
+}
+
+static MemLocal *mem_addr_of_stack(MemCtx *ctx, ASTNode *expr) {
+  return mem_addr_of_stack_at(ctx, expr, NULL);
 }
 
 /* Fresh-allocation classification. Direct allocators always count; in the
@@ -383,19 +428,30 @@ static void mem_check_null_deref(MemCtx *ctx, ASTNode *pointer_expr,
     return;
   }
   MemLocal *local = mem_expr_as_local(ctx, pointer_expr);
-  if (!local || !local->is_pointer || !local->is_null) {
+  if (!local || !local->is_pointer) {
     return;
   }
-  char suggestion[160];
-  snprintf(suggestion, sizeof(suggestion),
-           "Assign a valid address first, or guard the access with "
-           "`if (%s != 0)`",
-           local->name);
-  mem_warn_suggest(ctx, loc, suggestion,
-                   "`%s` is null here (assigned at line %zu and never "
-                   "reassigned); this dereference will trap at runtime",
-                   local->name, local->null_loc.line);
-  local->is_null = 0; /* one report per null assignment */
+  if (local->is_null) {
+    char suggestion[160];
+    snprintf(suggestion, sizeof(suggestion),
+             "Assign a valid address first, or guard the access with "
+             "`if (%s != 0)`",
+             local->name);
+    mem_warn_suggest(ctx, loc, suggestion,
+                     "`%s` is null here (assigned at line %zu and never "
+                     "reassigned); this dereference will trap at runtime",
+                     local->name, local->null_loc.line);
+    local->is_null = 0; /* one report per null assignment */
+    return;
+  }
+  if (local->is_wild) {
+    mem_warn(ctx, loc,
+             "`%s` points at the constant address %lld (assigned at line "
+             "%zu); the low 64K of the address space is never mapped, so "
+             "this dereference will fault",
+             local->name, local->wild_value, local->wild_loc.line);
+    local->is_wild = 0;
+  }
 }
 
 static void mem_check_use(MemCtx *ctx, MemLocal *local, SourceLocation loc) {
@@ -595,19 +651,56 @@ static void mem_check_const_index(MemCtx *ctx, ASTNode *expr) {
   Identifier *id = (Identifier *)array->data;
   MemLocal *local = id ? mem_find_local(ctx, id->name) : NULL;
   long long count = 0, elem_size = 0, value = 0;
-  if (!local || !local->is_stack ||
-      !mem_array_extent(ctx, local->type_name, &count, &elem_size) ||
+  if (!local ||
       !type_checker_eval_integer_constant_with_checker(ctx->checker,
                                                        index->index, &value)) {
     return;
   }
-  if (value < 0 || value >= count) {
-    char suggestion[128];
-    snprintf(suggestion, sizeof(suggestion),
-             "Valid indexes for `%s` are 0..%lld", local->name, count - 1);
-    mem_error(ctx, expr->location, suggestion,
-              "Index %lld is out of bounds for `%s` (%s)", value, local->name,
-              local->type_name);
+  if (local->is_stack &&
+      mem_array_extent(ctx, local->type_name, &count, &elem_size)) {
+    if (value < 0 || value >= count) {
+      char suggestion[128];
+      snprintf(suggestion, sizeof(suggestion),
+               "Valid indexes for `%s` are 0..%lld", local->name, count - 1);
+      mem_error(ctx, expr->location, suggestion,
+                "Index %lld is out of bounds for `%s` (%s)", value,
+                local->name, local->type_name);
+    }
+    return;
+  }
+
+  /* Through a pointer alias with a known target and offset:
+   * `var p = &a[2]; p[6]` lands at a[8]. Requires the pointee and element
+   * types to match (no reinterpreting casts). */
+  if (local->is_pointer && local->points_to_stack &&
+      local->points_to_offset >= 0) {
+    MemLocal *target = mem_find_local(ctx, local->points_to_stack);
+    if (!target ||
+        !mem_array_extent(ctx, target->type_name, &count, &elem_size)) {
+      return;
+    }
+    const char *bracket = strchr(target->type_name, '[');
+    size_t elem_len = bracket ? (size_t)(bracket - target->type_name) : 0;
+    size_t ptr_len = strlen(local->type_name);
+    if (elem_len == 0 || ptr_len == 0 ||
+        local->type_name[ptr_len - 1] != '*' || ptr_len - 1 != elem_len ||
+        strncmp(local->type_name, target->type_name, elem_len) != 0) {
+      return;
+    }
+    long long effective = local->points_to_offset + value;
+    if (effective < 0 || effective >= count) {
+      char suggestion[160];
+      snprintf(suggestion, sizeof(suggestion),
+               "`%s` starts at `%s[%lld]`, so valid indexes through it are "
+               "0..%lld",
+               local->name, target->name, local->points_to_offset,
+               count - 1 - local->points_to_offset);
+      mem_error(ctx, expr->location, suggestion,
+                "Index %lld through `%s` lands at `%s[%lld]`, out of bounds "
+                "for %s",
+                value, local->name, target->name, effective,
+                target->type_name);
+    }
   }
 }
 
@@ -1047,8 +1140,9 @@ static void mem_walk_expr(MemCtx *ctx, ASTNode *expr) {
     mem_check_use(ctx, local, expr->location);
     if (local && local->is_pointer && ctx->in_condition) {
       /* mentioned in a condition: the code is (presumably) checking it, so
-       * definite-null knowledge ends here */
+       * definite-null/wild knowledge ends here */
       local->is_null = 0;
+      local->is_wild = 0;
     }
     return;
   }
@@ -1070,6 +1164,7 @@ static void mem_walk_expr(MemCtx *ctx, ASTNode *expr) {
         local->escaped = 1;
         local->ever_freed = 1; /* could be freed through the alias */
         local->is_null = 0;
+        local->is_wild = 0;
       }
       return;
     }
@@ -1180,11 +1275,24 @@ static void mem_apply_assignment(MemCtx *ctx, const char *name, ASTNode *value,
       local->freed_via = NULL;
       local->holds_alloc = 0;
       local->points_to_stack = NULL;
+      local->points_to_offset = -1;
       local->is_null = 0;
+      local->is_wild = 0;
       if (!ctx->in_defer && ctx->depth == 0 &&
           type_checker_is_null_pointer_constant(value)) {
         local->is_null = 1;
         local->null_loc = loc;
+      } else if (!ctx->in_defer && ctx->depth == 0) {
+        /* a small constant cast to a pointer can never be valid memory
+         * (the low 64K is never mapped on Windows or Linux) */
+        long long constant = 0;
+        if (type_checker_eval_integer_constant_with_checker(
+                ctx->checker, mem_unwrap_cast(value), &constant) &&
+            constant > 0 && constant < 65536) {
+          local->is_wild = 1;
+          local->wild_value = constant;
+          local->wild_loc = loc;
+        }
       }
       const char *via = NULL;
       if (!ctx->in_defer && ctx->depth == 0 &&
@@ -1195,15 +1303,22 @@ static void mem_apply_assignment(MemCtx *ctx, const char *name, ASTNode *value,
         local->escaped = 0;
         local->ever_freed = 0;
       }
-      MemLocal *stack_target = mem_addr_of_stack(ctx, value);
-      if (stack_target) {
+      long long stack_offset = -1;
+      MemLocal *stack_target = mem_addr_of_stack_at(ctx, value, &stack_offset);
+      if (stack_target && ctx->depth == 0 && !ctx->in_defer) {
+        /* spine only: a branch assignment may not have happened, so alias
+         * knowledge from it would make false bounds claims */
         local->points_to_stack = stack_target->name;
+        local->points_to_offset = stack_offset;
       }
       MemLocal *source = mem_expr_as_local(ctx, value);
       if (source && source->is_pointer) {
         /* aliasing: the allocation now has two names; stop tracking both */
         source->escaped = 1;
-        local->points_to_stack = source->points_to_stack;
+        if (ctx->depth == 0 && !ctx->in_defer) {
+          local->points_to_stack = source->points_to_stack;
+          local->points_to_offset = source->points_to_offset;
+        }
       }
     } else {
       /* integer constant tracking (the loop-bound analysis needs the

@@ -360,6 +360,13 @@ $cases = @(
     Pattern       = 'Division by a constant zero'
   },
   @{
+    # Constant out-of-bounds THROUGH a pointer alias: p = &a[2], p[6] = a[8].
+    Name          = "err_mem_ptr_alias_oob"
+    Path          = "tests/err_mem_ptr_alias_oob.mettle"
+    ShouldSucceed = $false
+    Pattern       = 'Index 6 through `p` lands at `a\[8\]`, out of bounds'
+  },
+  @{
     # Memory diagnostics that warn without failing the build: double free,
     # use-after-free, a stack address stored in a global, and a leak. The
     # `clean` control function (conditional use + defer free) must add NO
@@ -373,7 +380,8 @@ $cases = @(
       'Global `STASH` is assigned the address of stack local `slot`',
       '`scratch` is allocated here but never freed',
       '`p` is null here \(assigned at line \d+ and never reassigned\)',
-      'Shift by 32 on a 32-bit value'
+      'Shift by 32 on a 32-bit value',
+      '`p` points at the constant address 64'
     )
     OutputMustNotMatch = @(
       'Use of `scratch`',
@@ -1772,6 +1780,66 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "switch_range_runtime" -Passed $false -Reason $_.Exception.Message
+}
+
+# Crash forensics: an access violation at a small non-null address is
+# classified as a null pointer plus offset (a field/index access through
+# null), with the faulting line and a stack trace.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "crash_null_offset.exe"
+  $buildOut = & $CompilerPath --build "tests\debug_crash.mettle" -o $exePath -s 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "Build failed: $buildOut" }
+  $runOut = & $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -eq 0) { throw "Expected the program to crash" }
+  if ($runOut -notmatch 'null plus offset 16: a field or array access through a null pointer') {
+    throw "Missing null+offset classification. Output: $runOut"
+  }
+  if ($runOut -notmatch 'debug_crash\.mettle:13') { throw "Missing faulting line. Output: $runOut" }
+  Write-CaseResult -Name "crash_classify_null_offset" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "crash_classify_null_offset" -Passed $false -Reason $_.Exception.Message
+}
+
+# Crash forensics: under --native-heap a freed page-backed block keeps its
+# mapping with access revoked, so a use-after-free faults instantly and the
+# crash handler classifies the address as a freed heap block.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "crash_uaf_large.exe"
+  $buildOut = & $CompilerPath --build "tests\crash_uaf_large.mettle" -o $exePath -s --native-heap 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "Build failed: $buildOut" }
+  $runOut = & $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -eq 0) { throw "Expected the program to crash" }
+  if ($runOut -notmatch 'heap block that was already freed: use-after-free') {
+    throw "Missing use-after-free classification. Output: $runOut"
+  }
+  Write-CaseResult -Name "crash_classify_use_after_free" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "crash_classify_use_after_free" -Passed $false -Reason $_.Exception.Message
+}
+
+# Crash forensics: a dangling WRITE into a freed small block corrupts the
+# quarantine poison and is reported when the block leaves quarantine.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "crash_waf_small.exe"
+  $buildOut = & $CompilerPath --build "tests\crash_waf_small.mettle" -o $exePath --native-heap 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "Build failed: $buildOut" }
+  $runOut = & $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 134) { throw "Expected exit 134, got $LASTEXITCODE" }
+  if ($runOut -notmatch 'written through a dangling pointer after it was freed') {
+    throw "Missing write-after-free report. Output: $runOut"
+  }
+  Write-CaseResult -Name "crash_write_after_free_quarantine" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "crash_write_after_free_quarantine" -Passed $false -Reason $_.Exception.Message
 }
 
 # Debugger instrumentation: a --debug-hooks build must run NORMALLY when no

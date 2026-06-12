@@ -8,6 +8,7 @@
 // ─── POSIX virtual-memory bindings ──────────────────────────────────────────
 export extern function mmap(addr: cstring, length: int64, prot: int32, flags: int32, fd: int32, offset: int64) -> cstring = "mmap";
 export extern function munmap(addr: cstring, length: int64) -> int32 = "munmap";
+export extern function mprotect(addr: cstring, length: int64, prot: int32) -> int32 = "mprotect";
 
 // ─── Public API ─────────────────────────────────────────────────────────────
 
@@ -37,4 +38,16 @@ export function os_mem_unmap(p: cstring, n: int64) {
     return;
   }
   munmap(p, n);
+}
+
+// Revoke all access to a mapped region while keeping the address range
+// reserved. Any later read or write of it faults immediately; the allocator
+// uses this to turn use-after-free of page-backed blocks into an instant,
+// classifiable crash.
+export function os_mem_protect_noaccess(p: cstring, n: int64) {
+  if (p == 0 || n <= (int64)0) {
+    return;
+  }
+  // PROT_NONE = 0
+  mprotect(p, n, (int32)0);
 }

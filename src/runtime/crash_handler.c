@@ -124,6 +124,56 @@ static void mettle_crash_write_pointer(const void *value) {
   mettle_crash_write_hex_uintptr((uintptr_t)value, sizeof(uintptr_t) * 2);
 }
 
+static void mettle_crash_write_newline(void);
+
+/* Heap classifier hook: --native-heap's allocator (stdlib/std/alloc.mettle)
+ * registers a function here that answers whether an address lies inside a
+ * quarantined (freed) heap block, returning the block's usable byte count
+ * when it does and 0 otherwise. Lets the access-violation report say
+ * "use-after-free" instead of printing an anonymous pointer. */
+long long (*mettle_crash_heap_classifier)(void *address) = 0;
+
+void mettle_crash_set_heap_classifier(long long (*classifier)(void *)) {
+  mettle_crash_heap_classifier = classifier;
+}
+
+/* One line of insight about WHAT a faulting address is. The raw pointer
+ * value rarely tells the user anything; its neighborhood usually does. */
+static void mettle_crash_classify_fault_address(uintptr_t fault_address,
+                                                uintptr_t stack_low,
+                                                uintptr_t stack_high) {
+  if (fault_address == 0) {
+    return; /* the address line already says "(null pointer)" */
+  }
+  if (fault_address < 4096) {
+    mettle_crash_write_stderr("This address is null plus offset ");
+    mettle_crash_write_decimal_uintptr(fault_address);
+    mettle_crash_write_stderr(
+        ": a field or array access through a null pointer");
+    mettle_crash_write_newline();
+    return;
+  }
+  if (mettle_crash_heap_classifier) {
+    long long freed_size = mettle_crash_heap_classifier((void *)fault_address);
+    if (freed_size > 0) {
+      mettle_crash_write_stderr("This address is inside a ");
+      mettle_crash_write_decimal_uintptr((uintptr_t)freed_size);
+      mettle_crash_write_stderr(
+          "-byte heap block that was already freed: use-after-free");
+      mettle_crash_write_newline();
+      return;
+    }
+  }
+  if (stack_low != 0 && stack_high > stack_low &&
+      fault_address >= stack_low - 0x100000 && fault_address < stack_high) {
+    mettle_crash_write_stderr(
+        "This address is in this thread's stack region: likely a dangling "
+        "pointer to a stack frame that no longer exists, or a stack array "
+        "overrun");
+    mettle_crash_write_newline();
+  }
+}
+
 static void mettle_crash_write_newline(void) {
 #if defined(_WIN32) || defined(_WIN64)
   mettle_crash_write_stderr("\r\n");
@@ -603,6 +653,12 @@ mettle_crash_unhandled_exception_filter(EXCEPTION_POINTERS *exception_info) {
       mettle_crash_write_stderr(" (null pointer)");
     }
     mettle_crash_write_newline();
+    {
+      NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
+      mettle_crash_classify_fault_address(
+          fault_address, tib ? (uintptr_t)tib->StackLimit : 0,
+          tib ? (uintptr_t)tib->StackBase : 0);
+    }
   } else {
     mettle_crash_write_stderr("Exception address: ");
     mettle_crash_write_pointer((void *)program_counter);
@@ -686,6 +742,8 @@ static void mettle_crash_crash_signal_handler(int signo, siginfo_t *info,
       mettle_crash_write_stderr("  (null pointer dereference)");
     }
     mettle_crash_write_stderr("\n");
+    /* no portable stack bounds here: classify null+offset and freed-heap */
+    mettle_crash_classify_fault_address((uintptr_t)info->si_addr, 0, 0);
   }
 
   uintptr_t program_counter = 0;
