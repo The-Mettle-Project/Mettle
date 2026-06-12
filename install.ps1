@@ -10,7 +10,7 @@
     irm https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/install.ps1 | iex
 
   Pin a version or change the location:
-    & ([scriptblock]::Create((irm https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/install.ps1))) -Version v0.10.1
+    & ([scriptblock]::Create((irm https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/install.ps1))) -Version v0.11.0
 
 .PARAMETER Version
   Release tag to install (default: latest).

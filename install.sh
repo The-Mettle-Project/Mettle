@@ -7,7 +7,7 @@
 # ~/.mettle, and adds the compiler to your PATH. No root required.
 #
 # Environment overrides:
-#   METTLE_VERSION      install a specific tag (e.g. v0.10.1) instead of latest
+#   METTLE_VERSION      install a specific tag (e.g. v0.11.0) instead of latest
 #   METTLE_INSTALL_DIR  install location (default: ~/.mettle)
 #   METTLE_NO_MODIFY_PATH=1  install but don't touch shell rc files
 #
