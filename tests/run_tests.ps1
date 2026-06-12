@@ -345,6 +345,21 @@ $cases = @(
     Pattern       = '`mem_zero` writes 128 bytes into `buf`, which only has 64'
   },
   @{
+    # Loop-bound analysis: `j <= 8` over int32[8] provably reads a[8] on the
+    # final iteration (no break/continue/return can save it).
+    Name          = "err_mem_loop_oob"
+    Path          = "tests/err_mem_loop_oob.mettle"
+    ShouldSucceed = $false
+    Pattern       = 'This loop runs `j` up to 8, but `a` has 8 elements'
+  },
+  @{
+    # Constant arithmetic: division by a literal zero is a guaranteed trap.
+    Name          = "err_mem_div_zero"
+    Path          = "tests/err_mem_div_zero.mettle"
+    ShouldSucceed = $false
+    Pattern       = 'Division by a constant zero'
+  },
+  @{
     # Memory diagnostics that warn without failing the build: double free,
     # use-after-free, a stack address stored in a global, and a leak. The
     # `clean` control function (conditional use + defer free) must add NO
@@ -356,11 +371,15 @@ $cases = @(
       'Double free of `p` \(already freed at line \d+\)',
       'Use of `p` after it was freed',
       'Global `STASH` is assigned the address of stack local `slot`',
-      '`scratch` is allocated here but never freed'
+      '`scratch` is allocated here but never freed',
+      '`p` is null here \(assigned at line \d+ and never reassigned\)',
+      'Shift by 32 on a 32-bit value'
     )
     OutputMustNotMatch = @(
       'Use of `scratch`',
-      'warning.*`p` is allocated'
+      'warning.*`p` is allocated',
+      'clean_guarded_null',
+      'clean_loop'
     )
   },
   @{

@@ -81,6 +81,10 @@ typedef struct {
   int escaped;     /* returned, stored, kept by a callee, or address taken */
   int ever_freed;  /* a free of this pointer appears ANYWHERE (defers count) */
   const char *points_to_stack; /* stack local whose address it holds, or NULL */
+  int is_null;     /* pointer assigned a null constant on the spine */
+  SourceLocation null_loc;
+  int has_const_value;    /* integer local with a known spine value */
+  long long const_value;  /* (drives the loop-bound analysis) */
 } MemLocal;
 
 typedef struct {
@@ -94,6 +98,8 @@ typedef struct {
   size_t local_count;
   int depth;      /* 0 = the function's straight-line spine */
   int in_defer;   /* defers run at scope exit: record facts, never report */
+  int in_condition; /* inside an if/while/for condition: a mentioned pointer
+                       counts as guarded, ending definite-null knowledge */
   int fn_returns_pointer;
   int saw_value_return;
   int returns_all_fresh;
@@ -233,6 +239,21 @@ static void mem_warn(MemCtx *ctx, SourceLocation loc, const char *fmt, ...) {
                              message);
 }
 
+static void mem_warn_suggest(MemCtx *ctx, SourceLocation loc,
+                             const char *suggestion, const char *fmt, ...) {
+  char message[512];
+  va_list args;
+  if (ctx->mode == MEM_MODE_SUMMARY) {
+    return;
+  }
+  va_start(args, fmt);
+  vsnprintf(message, sizeof(message), fmt, args);
+  va_end(args);
+  error_reporter_add_warning_with_suggestion(ctx->checker->error_reporter,
+                                             ERROR_SEMANTIC, loc, message,
+                                             suggestion);
+}
+
 static void mem_error(MemCtx *ctx, SourceLocation loc, const char *suggestion,
                       const char *fmt, ...) {
   char message[512];
@@ -352,6 +373,30 @@ static MemLocal *mem_expr_as_local(MemCtx *ctx, ASTNode *expr) {
  * constant-size memory ops against their destination's capacity. */
 
 static void mem_walk_expr(MemCtx *ctx, ASTNode *expr);
+
+/* A dereference of a pointer the spine proved null: `var p: T* = 0;` with no
+ * reassignment and no guard between. The runtime null trap would catch it;
+ * the compiler can say it now. */
+static void mem_check_null_deref(MemCtx *ctx, ASTNode *pointer_expr,
+                                 SourceLocation loc) {
+  if (ctx->mode != MEM_MODE_LOCAL || ctx->in_defer) {
+    return;
+  }
+  MemLocal *local = mem_expr_as_local(ctx, pointer_expr);
+  if (!local || !local->is_pointer || !local->is_null) {
+    return;
+  }
+  char suggestion[160];
+  snprintf(suggestion, sizeof(suggestion),
+           "Assign a valid address first, or guard the access with "
+           "`if (%s != 0)`",
+           local->name);
+  mem_warn_suggest(ctx, loc, suggestion,
+                   "`%s` is null here (assigned at line %zu and never "
+                   "reassigned); this dereference will trap at runtime",
+                   local->name, local->null_loc.line);
+  local->is_null = 0; /* one report per null assignment */
+}
 
 static void mem_check_use(MemCtx *ctx, MemLocal *local, SourceLocation loc) {
   if (!local || ctx->in_defer || local->freed != MEM_FREED_DEFINITE) {
@@ -619,6 +664,378 @@ static void mem_apply_call_arg(MemCtx *ctx, MemLocal *local,
   /* pure borrow: the callee looked at it and gave it back; keep tracking */
 }
 
+/* Constant arithmetic that traps or surprises: division/modulo by a constant
+ * zero (a guaranteed runtime trap) and shifts wider than the value (x86
+ * masks the count, so `x << 32` on an int32 is `x`, which nobody means). */
+static void mem_check_const_arithmetic(MemCtx *ctx, BinaryExpression *binary,
+                                       SourceLocation loc) {
+  if (ctx->mode != MEM_MODE_LOCAL || !binary->operator) {
+    return;
+  }
+  long long value = 0;
+  if (strcmp(binary->operator, "/") == 0 || strcmp(binary->operator, "%") == 0) {
+    if (type_checker_eval_integer_constant_with_checker(ctx->checker,
+                                                        binary->right, &value) &&
+        value == 0) {
+      mem_error(ctx, loc, "Fix the constant, or guard the divisor",
+                "%s by a constant zero; this traps the moment it executes",
+                strcmp(binary->operator, "/") == 0 ? "Division" : "Modulo");
+    }
+    return;
+  }
+  if (strcmp(binary->operator, "<<") == 0 ||
+      strcmp(binary->operator, ">>") == 0) {
+    if (!type_checker_eval_integer_constant_with_checker(ctx->checker,
+                                                         binary->right, &value)) {
+      return;
+    }
+    Type *left_type = binary->left ? binary->left->resolved_type : NULL;
+    if (!left_type || left_type->size == 0 || left_type->size > 8) {
+      return;
+    }
+    switch (left_type->kind) {
+    case TYPE_INT8: case TYPE_UINT8: case TYPE_INT16: case TYPE_UINT16:
+    case TYPE_INT32: case TYPE_UINT32: case TYPE_INT64: case TYPE_UINT64:
+      break;
+    default:
+      return;
+    }
+    long long width = (long long)left_type->size * 8;
+    if (value < 0 || value >= width) {
+      mem_warn(ctx, loc,
+               "Shift by %lld on a %lld-bit value (`%s`); the hardware masks "
+               "the shift count, so this does not produce the zero the code "
+               "reads as",
+               value, width, left_type->name ? left_type->name : "?");
+    }
+  }
+}
+
+/* ---- loop-bound bounds analysis ---------------------------------------------
+ * The classic off-by-one: `var a: T[8]; while (i <= 8) { a[i] = ...; }`.
+ * Proven only when the loop shape is airtight:
+ *   - the condition is `iv < bound` or `iv <= bound` with a constant bound
+ *   - the induction variable has a known constant start >= 0
+ *   - the body modifies it exactly once, as `iv = iv + 1`
+ *   - nothing can leave early (no break/continue/return anywhere inside)
+ * Under those rules the final iteration provably happens, so an `a[iv]`
+ * whose maximum reaches the array length is a hard error. */
+
+static int mem_ast_contains_exit(ASTNode *node) {
+  if (!node) {
+    return 0;
+  }
+  if (node->type == AST_BREAK_STATEMENT ||
+      node->type == AST_CONTINUE_STATEMENT ||
+      node->type == AST_RETURN_STATEMENT) {
+    return 1;
+  }
+  /* statement-bearing payloads the generic child walk does not reach */
+  switch (node->type) {
+  case AST_IF_STATEMENT: {
+    IfStatement *if_stmt = (IfStatement *)node->data;
+    if (if_stmt) {
+      if (mem_ast_contains_exit(if_stmt->then_branch) ||
+          mem_ast_contains_exit(if_stmt->else_branch)) {
+        return 1;
+      }
+      for (size_t i = 0; i < if_stmt->else_if_count; i++) {
+        if (mem_ast_contains_exit(if_stmt->else_ifs[i].body)) {
+          return 1;
+        }
+      }
+    }
+    break;
+  }
+  case AST_WHILE_STATEMENT: {
+    WhileStatement *w = (WhileStatement *)node->data;
+    if (w && mem_ast_contains_exit(w->body)) {
+      return 1;
+    }
+    break;
+  }
+  case AST_FOR_STATEMENT: {
+    ForStatement *f = (ForStatement *)node->data;
+    if (f && mem_ast_contains_exit(f->body)) {
+      return 1;
+    }
+    break;
+  }
+  case AST_SWITCH_STATEMENT:
+  case AST_MATCH_STATEMENT:
+  case AST_DEFER_STATEMENT:
+  case AST_ERRDEFER_STATEMENT:
+    return 1; /* switch breaks are scoped, but stay conservative */
+  default:
+    break;
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    if (mem_ast_contains_exit(node->children[i])) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* `expr` is exactly `iv + 1` (either operand order). */
+static int mem_expr_is_increment_of(ASTNode *expr, const char *iv) {
+  expr = mem_unwrap_cast(expr);
+  if (!expr || expr->type != AST_BINARY_EXPRESSION) {
+    return 0;
+  }
+  BinaryExpression *binary = (BinaryExpression *)expr->data;
+  if (!binary || !binary->operator || strcmp(binary->operator, "+") != 0) {
+    return 0;
+  }
+  ASTNode *left = mem_unwrap_cast(binary->left);
+  ASTNode *right = mem_unwrap_cast(binary->right);
+  ASTNode *ident = NULL, *literal = NULL;
+  if (left && left->type == AST_IDENTIFIER) {
+    ident = left;
+    literal = right;
+  } else if (right && right->type == AST_IDENTIFIER) {
+    ident = right;
+    literal = left;
+  }
+  if (!ident || !literal || literal->type != AST_NUMBER_LITERAL) {
+    return 0;
+  }
+  Identifier *id = (Identifier *)ident->data;
+  NumberLiteral *num = (NumberLiteral *)literal->data;
+  return id && num && !num->is_float && num->int_value == 1 &&
+         strcmp(id->name, iv) == 0;
+}
+
+/* Count assignments to `iv` under `node`; sets *clean_increment when every
+ * one is the `iv = iv + 1` shape. Declarations shadowing `iv` poison it. */
+static void mem_count_iv_writes(ASTNode *node, const char *iv, int *count,
+                                int *clean_increment) {
+  if (!node) {
+    return;
+  }
+  if (node->type == AST_ASSIGNMENT) {
+    Assignment *assign = (Assignment *)node->data;
+    if (assign && !assign->target && assign->variable_name &&
+        strcmp(assign->variable_name, iv) == 0) {
+      (*count)++;
+      if (!mem_expr_is_increment_of(assign->value, iv)) {
+        *clean_increment = 0;
+      }
+    }
+  } else if (node->type == AST_VAR_DECLARATION) {
+    VarDeclaration *decl = (VarDeclaration *)node->data;
+    if (decl && decl->name && strcmp(decl->name, iv) == 0) {
+      *clean_increment = 0; /* shadowed: a different variable now */
+    }
+  } else if (node->type == AST_IF_STATEMENT) {
+    IfStatement *if_stmt = (IfStatement *)node->data;
+    if (if_stmt) {
+      mem_count_iv_writes(if_stmt->then_branch, iv, count, clean_increment);
+      mem_count_iv_writes(if_stmt->else_branch, iv, count, clean_increment);
+      for (size_t i = 0; i < if_stmt->else_if_count; i++) {
+        mem_count_iv_writes(if_stmt->else_ifs[i].body, iv, count,
+                            clean_increment);
+      }
+    }
+  } else if (node->type == AST_WHILE_STATEMENT) {
+    WhileStatement *w = (WhileStatement *)node->data;
+    if (w) {
+      mem_count_iv_writes(w->body, iv, count, clean_increment);
+    }
+  } else if (node->type == AST_FOR_STATEMENT) {
+    ForStatement *f = (ForStatement *)node->data;
+    if (f) {
+      mem_count_iv_writes(f->initializer, iv, count, clean_increment);
+      mem_count_iv_writes(f->body, iv, count, clean_increment);
+      mem_count_iv_writes(f->increment, iv, count, clean_increment);
+    }
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    mem_count_iv_writes(node->children[i], iv, count, clean_increment);
+  }
+}
+
+/* Find `array[iv]` accesses under `node` and report the ones whose maximum
+ * index provably reaches past the array. One report per loop. */
+static void mem_find_oob_iv_indexes(MemCtx *ctx, ASTNode *node, const char *iv,
+                                    long long max_iv, int *reported) {
+  if (!node || *reported) {
+    return;
+  }
+  if (node->type == AST_INDEX_EXPRESSION) {
+    ArrayIndexExpression *index = (ArrayIndexExpression *)node->data;
+    ASTNode *array = index ? mem_unwrap_cast(index->array) : NULL;
+    ASTNode *index_expr = index ? mem_unwrap_cast(index->index) : NULL;
+    if (array && array->type == AST_IDENTIFIER && index_expr &&
+        index_expr->type == AST_IDENTIFIER) {
+      Identifier *array_id = (Identifier *)array->data;
+      Identifier *index_id = (Identifier *)index_expr->data;
+      if (array_id && index_id && strcmp(index_id->name, iv) == 0) {
+        MemLocal *local = mem_find_local(ctx, array_id->name);
+        long long count = 0, elem_size = 0;
+        if (local && local->is_stack &&
+            mem_array_extent(ctx, local->type_name, &count, &elem_size) &&
+            max_iv >= count) {
+          char suggestion[160];
+          if (max_iv == count) {
+            snprintf(suggestion, sizeof(suggestion),
+                     "Use `%s < %lld` (the `<=` runs one iteration too many)",
+                     iv, count);
+          } else {
+            snprintf(suggestion, sizeof(suggestion),
+                     "Valid indexes for `%s` are 0..%lld", local->name,
+                     count - 1);
+          }
+          mem_error(ctx, node->location, suggestion,
+                    "This loop runs `%s` up to %lld, but `%s` has %lld "
+                    "element%s (valid indexes 0..%lld); the final iteration "
+                    "reads or writes past the end",
+                    iv, max_iv, local->name, count, count == 1 ? "" : "s",
+                    count - 1);
+          *reported = 1;
+          return;
+        }
+      }
+    }
+  }
+  switch (node->type) {
+  case AST_IF_STATEMENT: {
+    IfStatement *if_stmt = (IfStatement *)node->data;
+    if (if_stmt) {
+      mem_find_oob_iv_indexes(ctx, if_stmt->condition, iv, max_iv, reported);
+      mem_find_oob_iv_indexes(ctx, if_stmt->then_branch, iv, max_iv, reported);
+      mem_find_oob_iv_indexes(ctx, if_stmt->else_branch, iv, max_iv, reported);
+      for (size_t i = 0; i < if_stmt->else_if_count && !*reported; i++) {
+        mem_find_oob_iv_indexes(ctx, if_stmt->else_ifs[i].condition, iv,
+                                max_iv, reported);
+        mem_find_oob_iv_indexes(ctx, if_stmt->else_ifs[i].body, iv, max_iv,
+                                reported);
+      }
+    }
+    break;
+  }
+  case AST_ASSIGNMENT: {
+    Assignment *assign = (Assignment *)node->data;
+    if (assign) {
+      mem_find_oob_iv_indexes(ctx, assign->target, iv, max_iv, reported);
+      mem_find_oob_iv_indexes(ctx, assign->value, iv, max_iv, reported);
+    }
+    break;
+  }
+  case AST_RETURN_STATEMENT: {
+    ReturnStatement *ret = (ReturnStatement *)node->data;
+    if (ret) {
+      mem_find_oob_iv_indexes(ctx, ret->value, iv, max_iv, reported);
+    }
+    break;
+  }
+  case AST_INDEX_EXPRESSION: {
+    ArrayIndexExpression *index = (ArrayIndexExpression *)node->data;
+    if (index) {
+      mem_find_oob_iv_indexes(ctx, index->array, iv, max_iv, reported);
+      mem_find_oob_iv_indexes(ctx, index->index, iv, max_iv, reported);
+    }
+    break;
+  }
+  case AST_BINARY_EXPRESSION: {
+    BinaryExpression *binary = (BinaryExpression *)node->data;
+    if (binary) {
+      mem_find_oob_iv_indexes(ctx, binary->left, iv, max_iv, reported);
+      mem_find_oob_iv_indexes(ctx, binary->right, iv, max_iv, reported);
+    }
+    break;
+  }
+  case AST_UNARY_EXPRESSION: {
+    UnaryExpression *unary = (UnaryExpression *)node->data;
+    if (unary) {
+      mem_find_oob_iv_indexes(ctx, unary->operand, iv, max_iv, reported);
+    }
+    break;
+  }
+  case AST_CAST_EXPRESSION: {
+    CastExpression *cast = (CastExpression *)node->data;
+    if (cast) {
+      mem_find_oob_iv_indexes(ctx, cast->operand, iv, max_iv, reported);
+    }
+    break;
+  }
+  case AST_FUNCTION_CALL: {
+    CallExpression *call = (CallExpression *)node->data;
+    if (call) {
+      for (size_t i = 0; i < call->argument_count && !*reported; i++) {
+        mem_find_oob_iv_indexes(ctx, call->arguments[i], iv, max_iv, reported);
+      }
+    }
+    break;
+  }
+  default:
+    break;
+  }
+  for (size_t i = 0; i < node->child_count && !*reported; i++) {
+    mem_find_oob_iv_indexes(ctx, node->children[i], iv, max_iv, reported);
+  }
+}
+
+/* Analyze one counted loop for a provable final-iteration overrun.
+ * `increment` is the for-statement increment, or NULL for while loops
+ * (whose increment must then live in the body). */
+static void mem_check_loop_bounds(MemCtx *ctx, ASTNode *condition,
+                                  ASTNode *body, ASTNode *increment) {
+  if (ctx->mode != MEM_MODE_LOCAL || !condition || !body) {
+    return;
+  }
+  if (condition->type != AST_BINARY_EXPRESSION) {
+    return;
+  }
+  BinaryExpression *cmp = (BinaryExpression *)condition->data;
+  if (!cmp || !cmp->operator ||
+      (strcmp(cmp->operator, "<") != 0 && strcmp(cmp->operator, "<=") != 0)) {
+    return;
+  }
+  ASTNode *left = mem_unwrap_cast(cmp->left);
+  if (!left || left->type != AST_IDENTIFIER) {
+    return;
+  }
+  Identifier *iv_id = (Identifier *)left->data;
+  if (!iv_id || !iv_id->name) {
+    return;
+  }
+  const char *iv = iv_id->name;
+
+  long long bound = 0;
+  if (!type_checker_eval_integer_constant_with_checker(ctx->checker,
+                                                       cmp->right, &bound)) {
+    return;
+  }
+  long long max_iv = strcmp(cmp->operator, "<=") == 0 ? bound : bound - 1;
+
+  /* The induction variable needs a known non-negative start. (Scalar locals
+   * classify as is_stack -- frame memory -- so only pointers are excluded.) */
+  MemLocal *iv_local = mem_find_local(ctx, iv);
+  if (!iv_local || iv_local->is_pointer || !iv_local->has_const_value ||
+      iv_local->const_value < 0 || iv_local->const_value > max_iv) {
+    return;
+  }
+
+  /* Nothing may leave the loop early, and the only write to the induction
+   * variable must be a single `iv = iv + 1`. */
+  if (mem_ast_contains_exit(body)) {
+    return;
+  }
+  int writes = 0;
+  int clean = 1;
+  mem_count_iv_writes(body, iv, &writes, &clean);
+  if (increment) {
+    mem_count_iv_writes(increment, iv, &writes, &clean);
+  }
+  if (writes != 1 || !clean) {
+    return;
+  }
+
+  int reported = 0;
+  mem_find_oob_iv_indexes(ctx, body, iv, max_iv, &reported);
+}
+
 static void mem_walk_expr(MemCtx *ctx, ASTNode *expr) {
   if (!expr) {
     return;
@@ -626,8 +1043,13 @@ static void mem_walk_expr(MemCtx *ctx, ASTNode *expr) {
   switch (expr->type) {
   case AST_IDENTIFIER: {
     Identifier *id = (Identifier *)expr->data;
-    mem_check_use(ctx, id ? mem_find_local(ctx, id->name) : NULL,
-                  expr->location);
+    MemLocal *local = id ? mem_find_local(ctx, id->name) : NULL;
+    mem_check_use(ctx, local, expr->location);
+    if (local && local->is_pointer && ctx->in_condition) {
+      /* mentioned in a condition: the code is (presumably) checking it, so
+       * definite-null knowledge ends here */
+      local->is_null = 0;
+    }
     return;
   }
   case AST_CAST_EXPRESSION: {
@@ -641,26 +1063,39 @@ static void mem_walk_expr(MemCtx *ctx, ASTNode *expr) {
       return;
     }
     if (unary->operator && strcmp(unary->operator, "&") == 0) {
-      /* &p makes the pointer reachable elsewhere: it may be freed or kept
-       * through the alias, so all definite knowledge about it ends here. */
+      /* &p makes the pointer reachable elsewhere: it may be freed, kept, or
+       * written through the alias, so all definite knowledge ends here. */
       MemLocal *local = mem_expr_as_local(ctx, unary->operand);
       if (local) {
         local->escaped = 1;
         local->ever_freed = 1; /* could be freed through the alias */
+        local->is_null = 0;
       }
       return;
+    }
+    if (unary->operator && strcmp(unary->operator, "*") == 0) {
+      mem_check_null_deref(ctx, unary->operand, expr->location);
     }
     mem_walk_expr(ctx, unary->operand);
     return;
   }
   case AST_MEMBER_ACCESS: {
     MemberAccess *member = (MemberAccess *)expr->data;
-    mem_walk_expr(ctx, member ? member->object : NULL);
+    if (member) {
+      mem_check_null_deref(ctx, member->object, expr->location);
+      mem_walk_expr(ctx, member->object);
+    }
     return;
   }
   case AST_INDEX_EXPRESSION: {
     ArrayIndexExpression *index = (ArrayIndexExpression *)expr->data;
     mem_check_const_index(ctx, expr);
+    if (index) {
+      MemLocal *base = mem_expr_as_local(ctx, index->array);
+      if (base && base->is_pointer) {
+        mem_check_null_deref(ctx, index->array, expr->location);
+      }
+    }
     mem_walk_expr(ctx, index ? index->array : NULL);
     mem_walk_expr(ctx, index ? index->index : NULL);
     return;
@@ -668,6 +1103,7 @@ static void mem_walk_expr(MemCtx *ctx, ASTNode *expr) {
   case AST_BINARY_EXPRESSION: {
     BinaryExpression *binary = (BinaryExpression *)expr->data;
     if (binary) {
+      mem_check_const_arithmetic(ctx, binary, expr->location);
       mem_walk_expr(ctx, binary->left);
       mem_walk_expr(ctx, binary->right);
     }
@@ -744,6 +1180,12 @@ static void mem_apply_assignment(MemCtx *ctx, const char *name, ASTNode *value,
       local->freed_via = NULL;
       local->holds_alloc = 0;
       local->points_to_stack = NULL;
+      local->is_null = 0;
+      if (!ctx->in_defer && ctx->depth == 0 &&
+          type_checker_is_null_pointer_constant(value)) {
+        local->is_null = 1;
+        local->null_loc = loc;
+      }
       const char *via = NULL;
       if (!ctx->in_defer && ctx->depth == 0 &&
           mem_is_allocation(ctx, value, &via)) {
@@ -762,6 +1204,18 @@ static void mem_apply_assignment(MemCtx *ctx, const char *name, ASTNode *value,
         /* aliasing: the allocation now has two names; stop tracking both */
         source->escaped = 1;
         local->points_to_stack = source->points_to_stack;
+      }
+    } else {
+      /* integer constant tracking (the loop-bound analysis needs the
+       * induction variable's start): a spine assignment of a constant is
+       * known, anything else (or a branch assignment) ends the knowledge */
+      local->has_const_value = 0;
+      long long value_const = 0;
+      if (!ctx->in_defer && ctx->depth == 0 &&
+          type_checker_eval_integer_constant_with_checker(ctx->checker, value,
+                                                          &value_const)) {
+        local->has_const_value = 1;
+        local->const_value = value_const;
       }
     }
     return;
@@ -920,10 +1374,14 @@ static void mem_walk_statement(MemCtx *ctx, ASTNode *statement) {
     if (!if_stmt) {
       return;
     }
+    ctx->in_condition++;
     mem_walk_expr(ctx, if_stmt->condition);
+    ctx->in_condition--;
     mem_walk_branch(ctx, if_stmt->then_branch);
     for (size_t i = 0; i < if_stmt->else_if_count; i++) {
+      ctx->in_condition++;
       mem_walk_expr(ctx, if_stmt->else_ifs[i].condition);
+      ctx->in_condition--;
       mem_walk_branch(ctx, if_stmt->else_ifs[i].body);
     }
     if (if_stmt->else_branch) {
@@ -936,7 +1394,10 @@ static void mem_walk_statement(MemCtx *ctx, ASTNode *statement) {
     if (!while_stmt) {
       return;
     }
+    mem_check_loop_bounds(ctx, while_stmt->condition, while_stmt->body, NULL);
+    ctx->in_condition++;
     mem_walk_expr(ctx, while_stmt->condition);
+    ctx->in_condition--;
     mem_walk_branch(ctx, while_stmt->body);
     return;
   }
@@ -948,7 +1409,11 @@ static void mem_walk_statement(MemCtx *ctx, ASTNode *statement) {
     if (for_stmt->initializer) {
       mem_walk_statement(ctx, for_stmt->initializer);
     }
+    mem_check_loop_bounds(ctx, for_stmt->condition, for_stmt->body,
+                          for_stmt->increment);
+    ctx->in_condition++;
     mem_walk_expr(ctx, for_stmt->condition);
+    ctx->in_condition--;
     ctx->depth++;
     mem_walk_block(ctx, for_stmt->body);
     if (for_stmt->increment) {
@@ -1163,18 +1628,23 @@ int type_checker_check_program_memory(TypeChecker *checker, ASTNode *program) {
         if (!local->holds_alloc || local->ever_freed || local->escaped) {
           continue;
         }
+        char suggestion[160];
+        snprintf(suggestion, sizeof(suggestion),
+                 "Add `defer free(%s);` right after the allocation, or free "
+                 "it on every path out of `%s`",
+                 local->name, fn->name);
         if (local->alloc_via) {
-          mem_warn(&ctx, local->alloc_loc,
-                   "`%s` holds the allocation `%s` returns, but it is never "
-                   "freed, returned, stored, or passed on; the allocation "
-                   "leaks when `%s` returns",
-                   local->name, local->alloc_via, fn->name);
+          mem_warn_suggest(&ctx, local->alloc_loc, suggestion,
+                           "`%s` holds the allocation `%s` returns, but it "
+                           "is never freed, returned, stored, or passed on; "
+                           "the allocation leaks when `%s` returns",
+                           local->name, local->alloc_via, fn->name);
         } else {
-          mem_warn(&ctx, local->alloc_loc,
-                   "`%s` is allocated here but never freed, returned, "
-                   "stored, or passed on; the allocation leaks when `%s` "
-                   "returns",
-                   local->name, fn->name);
+          mem_warn_suggest(&ctx, local->alloc_loc, suggestion,
+                           "`%s` is allocated here but never freed, "
+                           "returned, stored, or passed on; the allocation "
+                           "leaks when `%s` returns",
+                           local->name, fn->name);
         }
       }
     }
