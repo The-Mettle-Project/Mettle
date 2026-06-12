@@ -219,6 +219,14 @@ int type_checker_check_program(TypeChecker *checker, ASTNode *program) {
     }
   }
 
+  // Pass 4: whole-program memory diagnostics. Ownership summaries are
+  // inferred over the call graph, then cross-call use-after-free and leak
+  // analysis runs with them (type_checker_memory.c).
+  if (!getenv("METTLE_NO_MEM_INTERPROC") &&
+      !type_checker_check_program_memory(checker, program)) {
+    return 0;
+  }
+
   return 1;
 }
 

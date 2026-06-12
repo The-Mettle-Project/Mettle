@@ -364,6 +364,28 @@ $cases = @(
     )
   },
   @{
+    # Interprocedural ownership inference: summaries (frees param / returns
+    # fresh / borrows / stores) are computed over the call graph, so these
+    # diagnostics cross function boundaries. The clean control
+    # functions must produce NO diagnostics.
+    Name          = "warn_mem_interproc"
+    Path          = "tests/warn_mem_interproc.mettle"
+    ShouldSucceed = $true
+    OutputMustMatch = @(
+      'Use of `p` after the call to `consume` at line \d+ freed it',
+      'Double free of `p`: already freed by the call to `consume`',
+      '`p` is allocated here but never freed.*leaks when `leak_past_borrow`',
+      '`p` holds the allocation `make_buffer` returns.*leaks when `leak_from_wrapper`'
+    )
+    OutputMustNotMatch = @(
+      'clean_consume_once',
+      'clean_borrow_then_free',
+      'clean_kept_elsewhere',
+      'clean_kept_through_helper',
+      'clean_wrapper_freed'
+    )
+  },
+  @{
     # `@noalloc` violated directly by a `new` expression.
     Name          = "err_noalloc"
     Path          = "tests/err_noalloc.mettle"

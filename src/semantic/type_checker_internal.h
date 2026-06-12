@@ -43,13 +43,20 @@ int type_checker_eval_integer_constant_with_checker(TypeChecker *checker,
                                                            ASTNode *expression,
                                                            long long *out_value);
 
-/* Compile-time memory diagnostics (type_checker_memory.c): use-after-free,
- * double free, dangling stack addresses, constant out-of-bounds indexes,
- * constant-size memory-op overflows, and leaks. Runs per function after the
- * body type-checks, while the function scope is still live. Returns 0 when
+/* Compile-time memory diagnostics (type_checker_memory.c). Phase 1 runs per
+ * function after the body type-checks, while the function scope is still
+ * live: use-after-free, double free, dangling stack addresses, constant
+ * out-of-bounds indexes, constant-size memory-op overflows. Returns 0 when
  * it reported a hard error. */
 int type_checker_check_function_memory(TypeChecker *checker,
                                        ASTNode *declaration);
+
+/* Phase 2 runs once after the whole program type-checks: ownership
+ * summaries (which parameters a function frees or keeps, whether it returns
+ * a fresh allocation) are inferred to fixpoint over the call graph, then
+ * each body is re-analyzed for cross-call use-after-free, cross-call double
+ * free, and leaks that survive borrowing helpers. Warnings only. */
+int type_checker_check_program_memory(TypeChecker *checker, ASTNode *program);
 
 int type_checker_eval_integer_constant(ASTNode *expression,
                                               long long *out_value);
