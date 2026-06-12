@@ -220,10 +220,12 @@ const char *ir_simd_bail_id_name(int id) {
   switch ((IRSimdBailId)id) {
   case IR_SIMD_BAIL_NONE:                return "none";
   case IR_SIMD_BAIL_CALL_IN_BODY:        return "call-in-body";
+  case IR_SIMD_BAIL_EXTERN_CALL_IN_BODY: return "extern-call-in-body";
   case IR_SIMD_BAIL_INDIRECT_CALL:       return "indirect-call";
   case IR_SIMD_BAIL_ALLOC_IN_BODY:       return "alloc-in-body";
   case IR_SIMD_BAIL_INLINE_ASM:          return "inline-asm";
   case IR_SIMD_BAIL_CONTROL_FLOW:        return "control-flow";
+  case IR_SIMD_BAIL_EARLY_EXIT:          return "early-exit";
   case IR_SIMD_BAIL_INT16_ELEMENTS:      return "int16-elements";
   case IR_SIMD_BAIL_INT64_ELEMENTS:      return "int64-elements";
   case IR_SIMD_BAIL_SERIAL_RECURRENCE:   return "serial-recurrence";
@@ -262,6 +264,9 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
   const char *callee = NULL;
   int has_indirect_call = 0, has_new = 0, has_asm = 0;
   int branch_count = 0, jump_count = 0;
+  const char *branch_targets[8];
+  size_t branch_target_count = 0;
+  int has_return_in_body = 0;
   int has_i16 = 0, has_i64 = 0, has_f32 = 0, has_f64 = 0;
   int has_byte_load = 0, has_i32_load = 0, has_int_accum = 0;
   const char *int_accum_sym = NULL;
@@ -319,12 +324,20 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
     case IR_OP_BRANCH_EQ:
       if (!ir_label_is_runtime_check(ins->text)) {
         branch_count++;
+        if (ins->text && branch_target_count < 8) {
+          branch_targets[branch_target_count++] = ins->text;
+        }
       }
       break;
     case IR_OP_JUMP:
       if (!ir_label_is_runtime_check(ins->text)) {
         jump_count++;
       }
+      break;
+    case IR_OP_RETURN:
+      /* A return INSIDE the loop body is the definitive early-exit marker
+       * (`if (...) return x;` -- the find/compare/parse shape). */
+      has_return_in_body = 1;
       break;
     case IR_OP_LOAD:
     case IR_OP_STORE: {
@@ -425,6 +438,26 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
   }
 
   if (callee) {
+    /* Advice differs fundamentally by what the callee IS: a program-defined
+     * function can be inlined (and that fix can be simulated); an extern has
+     * no body, so "mark it @inline" would be advice that cannot work. */
+    IRFunction *callee_fn =
+        g_explain_program ? ir_program_find_function(g_explain_program, callee)
+                          : NULL;
+    if (g_explain_program && !callee_fn) {
+      snprintf(reason, reason_cap,
+               "each iteration calls `%s`, an external function with no body "
+               "this compiler can see -- it can never be inlined, so this "
+               "loop cannot vectorize as written",
+               callee);
+      snprintf(fix, fix_cap,
+               "none needed if the call IS the work (I/O, OS calls): the "
+               "scalar loop is the right code; if the call is loop-invariant, "
+               "hoist it; if it is hot compute, replace it with Mettle code "
+               "so the inliner can take it");
+      IR_SIMD_SET_DIAG(IR_SIMD_BAIL_EXTERN_CALL_IN_BODY);
+      return;
+    }
     snprintf(reason, reason_cap,
              "each iteration calls `%s`; loops vectorize only after every "
              "call in the body has been inlined away",
@@ -460,9 +493,43 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
     return;
   }
   if (branch_count > 1 || jump_count > 1) {
+    /* Early exit vs internal branching deserve OPPOSITE advice. A branch
+     * whose target label is not inside the region leaves the loop before the
+     * trip count -- a compare/search shape where the early exit IS the
+     * algorithm and scalar code is the right output. A branch that stays
+     * inside the region is a data-dependent diamond, where branchless
+     * rewriting is real advice. (The first body branch is usually the
+     * loop's own exit test, so it is expected to leave the region; only an
+     * ADDITIONAL outward branch marks an early exit.) */
+    int outward_branches = 0;
+    for (size_t t = 0; t < branch_target_count; t++) {
+      int inside = 0;
+      for (size_t i = begin + 1; i < end && !inside; i++) {
+        const IRInstruction *lab = &function->instructions[i];
+        if (lab->op == IR_OP_LABEL && lab->text &&
+            strcmp(lab->text, branch_targets[t]) == 0) {
+          inside = 1;
+        }
+      }
+      if (!inside) {
+        outward_branches++;
+      }
+    }
+    if (has_return_in_body || outward_branches > 1) {
+      snprintf(reason, reason_cap,
+               "the loop can exit before its trip count (a compare/search "
+               "shape); SIMD runs all iterations in lockstep, so an early "
+               "exit defeats it");
+      snprintf(fix, fix_cap,
+               "usually nothing: when the early exit is the point (find, "
+               "compare, parse), the scalar loop is the right code -- "
+               "vectorizing it needs a dedicated kernel, not a source change");
+      IR_SIMD_SET_DIAG(IR_SIMD_BAIL_EARLY_EXIT);
+      return;
+    }
     snprintf(reason, reason_cap,
-             "the loop body branches (an `if`, `&&`/`||`, or an early exit); "
-             "only straight-line bodies vectorize");
+             "the loop body branches on data (an `if` or `&&`/`||` per "
+             "iteration); only straight-line bodies vectorize");
     snprintf(fix, fix_cap,
              "compute both arms and select arithmetically (branchless), or "
              "split the work into two simpler loops");
@@ -1051,14 +1118,30 @@ static int ir_explain_try_fix_for_diagnosis(const IRFunction *function,
  * the loop itself to have collapsed into a kernel (no surviving loop header
  * label) -- a vectorized loop INLINED FROM THE CALLEE inside a still-scalar
  * outer loop must not be passed off as "this loop vectorizes".
- * Fills `callee_out` (the advice target), `desc`, and *was_noinline_out (1 =
- * the simulated change was REMOVING `@noinline`, not adding @inline) on
- * success. */
+ *
+ * Tri-state result:
+ *   1  verified: the @inline (or @noinline-removal) advice WORKS; `desc` has
+ *      the kernel the loop becomes.
+ *   -1 proven inapplicable: the simulation ran and showed the advice cannot
+ *      help. *decline_reason_out is the inliner's own structural refusal
+ *      when that was the cause (e.g. the callee contains loops), or NULL
+ *      when the callee DID inline but the loop still stayed scalar; in the
+ *      latter case *nest_after_out says whether a loop nest remains (the
+ *      callee's loops landed in the body -- only innermost loops vectorize).
+ *   0  couldn't tell (no program/marker/callee, clone failure, or the forced
+ *      inliner run made no change for reasons the simulation cannot see);
+ *      the caller keeps its generic advice.
+ * Fills `callee_out` (the advice target) and *was_noinline_out (1 = the
+ * simulated change was REMOVING `@noinline`, not adding @inline). */
 static int ir_explain_simulate_inline_fix(const IRFunction *function,
                                           size_t begin, size_t end,
                                           char *callee_out, size_t callee_cap,
                                           char *desc, size_t desc_cap,
-                                          int *was_noinline_out) {
+                                          int *was_noinline_out,
+                                          const char **decline_reason_out,
+                                          int *nest_after_out) {
+  *decline_reason_out = NULL;
+  *nest_after_out = 0;
   if (!g_explain_program) {
     return 0;
   }
@@ -1098,18 +1181,30 @@ static int ir_explain_simulate_inline_fix(const IRFunction *function,
   ir_explain_set_hypothesis(1);
   int verified = 0;
   if (ir_inline_explain_simulate_force_inline(g_explain_program, clone, callee,
-                                              was_noinline_out) &&
-      ir_optimize_function_revectorize(clone)) {
-    size_t new_begin = 0, new_end = 0;
-    if (ir_simd_find_marker_region(clone, marker_id, &new_begin, &new_end) &&
-        !ir_region_has_loop_label(clone, new_begin, new_end)) {
-      const IRInstruction *kernel =
-          ir_region_vectorized_ins(clone, new_begin, new_end, 1);
-      if (kernel) {
-        ir_explain_kernel_desc(kernel, desc, desc_cap);
-        verified = 1;
+                                              was_noinline_out,
+                                              decline_reason_out)) {
+    if (ir_optimize_function_revectorize(clone)) {
+      size_t new_begin = 0, new_end = 0;
+      if (ir_simd_find_marker_region(clone, marker_id, &new_begin, &new_end)) {
+        int nest = ir_region_has_loop_label(clone, new_begin, new_end);
+        const IRInstruction *kernel =
+            ir_region_vectorized_ins(clone, new_begin, new_end, 1);
+        if (!nest && kernel) {
+          ir_explain_kernel_desc(kernel, desc, desc_cap);
+          verified = 1;
+        } else {
+          /* The callee inlined cleanly, yet the loop is still scalar: the
+           * @inline advice is disproven. Report whether the body is now a
+           * loop nest so the caller can say WHY it cannot vectorize. */
+          *nest_after_out = nest;
+          verified = -1;
+        }
       }
     }
+  } else if (*decline_reason_out) {
+    /* The inliner refused the callee even with the pretend flags set --
+     * structural, so no decorator the user adds can change the outcome. */
+    verified = -1;
   }
   ir_explain_set_hypothesis(0);
   ir_function_destroy(clone);
@@ -1149,10 +1244,29 @@ static void ir_explain_report_loops(const IRFunction *function,
                                     size_t loop_count) {
   for (size_t k = 0; k < loop_count; k++) {
     const IRSimdLoopRecord *L = &loops[k];
+    /* Focus filter FIRST: remarks outside the focus file are dropped at
+     * record time anyway, but the fix simulations below (clone + re-run the
+     * optimizer, and for call-in-body the inliner too) are the expensive
+     * part -- without this gate every imported module's loops were being
+     * simulated and then discarded (5+ seconds of --explain on a real
+     * application; ~100ms with it). */
+    if (!ir_explain_location_enabled(&L->location)) {
+      continue;
+    }
     const IRInstruction *own =
         ir_region_vectorized_ins(function, L->begin, L->end, 0);
     const IRInstruction *any =
         own ? own : ir_region_vectorized_ins(function, L->begin, L->end, 1);
+
+    /* Nest depth (1 = top level): how many recorded loops contain this one.
+     * Stamped on the remark for the JSON sidecar -- a deeply nested scalar
+     * loop is a better optimization target than a top-level one. */
+    size_t nest_depth = 1;
+    for (size_t m = 0; m < loop_count; m++) {
+      if (m != k && loops[m].begin < L->begin && loops[m].end > L->end) {
+        nest_depth++;
+      }
+    }
 
     int has_inner = 0;
     size_t inner_line = 0;
@@ -1210,7 +1324,7 @@ static void ir_explain_report_loops(const IRFunction *function,
        * suggested fix and let the vectorizer itself confirm it. A proven-
        * inapplicable fix is REPLACED, never printed -- bad advice with a
        * confident tone is the failure mode this whole report exists to end. */
-      char verified[320];
+      char verified[512];
       verified[0] = '\0';
       char kernel_desc[128];
       if (diagnosis == IR_SIMD_BAIL_CALL_IN_BODY) {
@@ -1218,10 +1332,40 @@ static void ir_explain_report_loops(const IRFunction *function,
          * inliner on a clone, revectorize. */
         char callee[128];
         int was_noinline = 0;
-        if (ir_explain_simulate_inline_fix(function, L->begin, L->end, callee,
-                                           sizeof(callee), kernel_desc,
-                                           sizeof(kernel_desc),
-                                           &was_noinline)) {
+        const char *decline_reason = NULL;
+        int nest_after = 0;
+        int sim = ir_explain_simulate_inline_fix(
+            function, L->begin, L->end, callee, sizeof(callee), kernel_desc,
+            sizeof(kernel_desc), &was_noinline, &decline_reason, &nest_after);
+        if (sim == -1) {
+          /* The simulation DISPROVED the @inline advice; printing it anyway
+           * (and letting an editor offer it as a one-click fix) is exactly
+           * the confident-bad-advice failure mode this report exists to end.
+           * Replace reason and fix with what the simulation learned. */
+          if (decline_reason) {
+            snprintf(reason, sizeof(reason),
+                     "each iteration calls `%s`, and `@inline` cannot help: "
+                     "%s",
+                     callee, decline_reason);
+          } else if (nest_after) {
+            snprintf(reason, sizeof(reason),
+                     "each iteration calls `%s`; even with it inlined, its "
+                     "loops would land in this body, making this the outer "
+                     "loop of a nest -- and only innermost loops vectorize",
+                     callee);
+          } else {
+            snprintf(reason, sizeof(reason),
+                     "each iteration calls `%s`; the compiler simulated "
+                     "inlining it, and this loop still does not vectorize, "
+                     "so inlining is not the blocker",
+                     callee);
+          }
+          snprintf(fix, sizeof(fix),
+                   "nothing to change on this line: this loop is a driver "
+                   "and scalar is the right code for it -- the vectorizable "
+                   "work is inside `%s`, so check the remarks on its loops",
+                   callee);
+        } else if (sim == 1) {
           if (was_noinline) {
             /* The right advice for a vetoed callee is removing the veto;
              * also correct the fix line, which suggested @inline. */
@@ -1261,6 +1405,7 @@ static void ir_explain_report_loops(const IRFunction *function,
                         "NOT vectorized", reason, fix[0] ? fix : NULL,
                         verified[0] ? verified : NULL);
     }
+    ir_explain_remark_loop_depth(L->location.line, nest_depth);
   }
 }
 

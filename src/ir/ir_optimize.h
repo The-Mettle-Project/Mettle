@@ -35,13 +35,21 @@ int ir_optimize_program(IRProgram *program,
 int ir_optimize_had_user_error(void);
 
 /* --explain (see ir_optimize_explain.c). The codegen MIR gate records, per
- * focus-file function, whether it got the register-allocating backend; the
- * driver flushes that section after codegen. No-ops unless --explain is on. */
+ * focus-file function, whether it got the register-allocating backend (and
+ * its non-nop IR size, so the report can rank where baseline codegen costs);
+ * the driver flushes that section after codegen, which also routes the whole
+ * buffered report: small reports go to stderr, large ones to a
+ * `<output-stem>.explain.txt` sidecar with a digest on stderr. No-ops unless
+ * --explain is on. */
 int ir_explain_enabled(void);
 void ir_explain_backend_function(const char *function_name,
                                  const char *filename, int ok,
-                                 const char *detail);
+                                 const char *detail, size_t instructions);
 void ir_explain_backend_flush(void);
+/* The -o path the sidecar is derived from; set before compilation. */
+void ir_explain_set_output_path(const char *path);
+/* --explain-json: also write a machine-readable <output-stem>.explain.json. */
+void ir_explain_set_json(int enabled);
 
 // When optimization is NOT run (no -O/--release), `@simd` markers are never
 // verified. This prints one note saying so (if any are present) and strips the

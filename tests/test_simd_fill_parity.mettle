@@ -1,0 +1,142 @@
+extern function printf(fmt: cstring, v: int64) -> int32 = "printf";
+
+function fill32(buf: uint32*, n: int32, c: uint32) {
+    var i: int32 = 0;
+    while (i < n) { buf[i] = c; i = i + 1; }
+}
+function fill8(p: uint8*, n: int64, v: uint8) {
+    var i: int64 = 0;
+    while (i < n) { p[i] = v; i = i + 1; }
+}
+function fill16(p: int16*, n: int32, v: int16) {
+    var i: int32 = 0;
+    while (i < n) { p[i] = v; i = i + 1; }
+}
+function fill64(p: int64*, n: int32, v: int64) {
+    var i: int32 = 0;
+    while (i < n) { p[i] = v; i = i + 1; }
+}
+function fillf32(p: float32*, n: int32) {
+    for i in 0..n { p[i] = 2.5; }
+}
+function fillf64(p: float64*, n: int32, v: float64) {
+    for i in 0..n { p[i] = v; }
+}
+function zero32(buf: int32*, n: int32) {
+    for i in 0..n { buf[i] = 0; }
+}
+
+function checksum(p: uint8*, n: int32) -> int64 {
+    var s: int64 = 0;
+    var i: int32 = 0;
+    while (i < n) {
+        s = s * 31 + (int64)p[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+
+function rect_fill(px: uint32*, fw: int32, x0: int32, y0: int32, x1: int32, y1: int32, c: uint32) {
+    var yy: int32 = y0;
+    while (yy < y1) {
+        var row: int32 = yy * fw;
+        var xx: int32 = x0;
+        while (xx < x1) {
+            px[row + xx] = c;
+            xx = xx + 1;
+        }
+        yy = yy + 1;
+    }
+}
+function mz(p: cstring, n: int64) {
+    var d: int64 = (int64)p;
+    var i: int64 = 0;
+    var words: int64 = n & ~(int64)7;
+    while (i < words) {
+        *((int64*)(d + i)) = (int64)0;
+        i = i + (int64)8;
+    }
+    while (i < n) {
+        *((int8*)(d + i)) = (int8)0;
+        i = i + (int64)1;
+    }
+}
+function part2() -> int64 {
+    var fb: uint32[256];
+    var total: int64 = 0;
+    var k: int32 = 0;
+    // 16x16 framebuffer: partial rects incl. empty, edge, single-column
+    var t: int32 = 0;
+    while (t < 5) {
+        k = 0; while (k < 256) { fb[k] = 11111; k = k + 1; }
+        rect_fill(&fb[0], 16, t, t, 16 - t, 9 + t, 305419896);
+        var s: int64 = 0;
+        k = 0; while (k < 256) { s = s * 31 + (int64)fb[k]; k = k + 1; }
+        total = total * 7 + s;
+        t = t + 1;
+    }
+    // mem-zero shapes incl. iv handoff between the two loops
+    var raw: uint8[160];
+    var sz: int32 = 0;
+    while (sz < 4) {
+        var n: int64 = (int64)(sz * 37 + 3);
+        k = 0; while (k < 160) { raw[k] = 200; k = k + 1; }
+        mz(&raw[16], n);
+        var s2: int64 = 0;
+        k = 0; while (k < 160) { s2 = s2 * 31 + (int64)raw[k]; k = k + 1; }
+        total = total * 7 + s2;
+        sz = sz + 1;
+    }
+    return total;
+}
+function main() -> int32 {
+    var b: uint8[1024];
+    var total: int64 = 0;
+    // guard bytes around each region get a sentinel; fills must not touch them
+    var sizes: int32[7];
+    sizes[0] = 0; sizes[1] = 1; sizes[2] = 3; sizes[3] = 15; sizes[4] = 16; sizes[5] = 33; sizes[6] = 100;
+    var t: int32 = 0;
+    while (t < 7) {
+        var n: int32 = sizes[t];
+        var k: int32 = 0;
+        while (k < 1024) { b[k] = 170; k = k + 1; }
+        fill32((uint32*)&b[16], n, 305419896);
+        total = total * 7 + checksum(&b[0], 1024);
+
+        k = 0; while (k < 1024) { b[k] = 170; k = k + 1; }
+        fill8(&b[16], (int64)n, 77);
+        total = total * 7 + checksum(&b[0], 1024);
+
+        k = 0; while (k < 1024) { b[k] = 170; k = k + 1; }
+        fill16((int16*)&b[16], n, -12345);
+        total = total * 7 + checksum(&b[0], 1024);
+
+        k = 0; while (k < 1024) { b[k] = 170; k = k + 1; }
+        fill64((int64*)&b[16], n, -1234567890123);
+        total = total * 7 + checksum(&b[0], 1024);
+
+        k = 0; while (k < 1024) { b[k] = 170; k = k + 1; }
+        fillf32((float32*)&b[16], n);
+        total = total * 7 + checksum(&b[0], 1024);
+
+        k = 0; while (k < 1024) { b[k] = 170; k = k + 1; }
+        fillf64((float64*)&b[16], n, 3.25);
+        total = total * 7 + checksum(&b[0], 1024);
+
+        k = 0; while (k < 1024) { b[k] = 170; k = k + 1; }
+        zero32((int32*)&b[16], n);
+        total = total * 7 + checksum(&b[0], 1024);
+        t = t + 1;
+    }
+    // negative count must fill nothing
+    var g: uint8[64];
+    var k2: int32 = 0;
+    while (k2 < 64) { g[k2] = 9; k2 = k2 + 1; }
+    fill32((uint32*)&g[0], 0 - 5, 1);
+    total = total * 7 + checksum(&g[0], 64);
+    total = total * 13 + part2();
+    printf("%lld\n", total);
+    return 0;
+}
+

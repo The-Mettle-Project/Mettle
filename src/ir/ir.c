@@ -625,6 +625,9 @@ IRProgram *ir_program_create(void) {
   program->profile_entries = NULL;
   program->profile_entry_count = 0;
   program->profile_entry_capacity = 0;
+  program->debug_local_entries = NULL;
+  program->debug_local_entry_count = 0;
+  program->debug_local_entry_capacity = 0;
   program->dead_functions_eliminated = 0;
   return program;
 }
@@ -646,6 +649,13 @@ void ir_program_destroy(IRProgram *program) {
       free(program->profile_entries[i].filename);
     }
     free(program->profile_entries);
+  }
+  if (program->debug_local_entries) {
+    for (size_t i = 0; i < program->debug_local_entry_count; i++) {
+      free(program->debug_local_entries[i].name);
+      free(program->debug_local_entries[i].type_name);
+    }
+    free(program->debug_local_entries);
   }
   free(program);
 }
@@ -716,6 +726,7 @@ const char *ir_opcode_name(IROpcode op) {
   case IR_OP_SIMD_SUM_I32: return "simd_sum_i32";
   case IR_OP_SIMD_SUM_U8: return "simd_sum_u8";
   case IR_OP_SIMD_BYTE_MAP: return "simd_byte_map";
+  case IR_OP_SIMD_FILL: return "simd_fill";
   case IR_OP_SIMD_MATMUL_N32: return "simd_matmul_n32";
   case IR_OP_SIMD_INSERTION_SORT_I32: return "simd_insertion_sort_i32";
   case IR_OP_SIMD_DOT_I32: return "simd_dot_i32";
@@ -907,6 +918,28 @@ static int ir_format_instruction_line(const IRInstruction *instruction,
                        "simd_byte_map(base=%s, len=%s, steps=%zu)", lhs, rhs,
                        instruction->argument_count / 2);
     break;
+  case IR_OP_SIMD_FILL: {
+    char value[128];
+    ir_format_operand(instruction->argument_count > 2 ? &instruction->arguments[2]
+                                                      : NULL,
+                      value, sizeof(value));
+    written = snprintf(
+        buffer, buffer_size, "simd_fill(%s=%s, %s=%s, size=%lld, value=%s)",
+        (instruction->argument_count > 1 &&
+         instruction->arguments[1].int_value == 1)
+            ? "begin"
+            : "base",
+        lhs,
+        (instruction->argument_count > 1 &&
+         instruction->arguments[1].int_value == 1)
+            ? "end"
+            : "len",
+        rhs,
+        instruction->argument_count > 0 ? instruction->arguments[0].int_value
+                                        : 0,
+        value);
+    break;
+  }
   case IR_OP_SIMD_MATMUL_N32:
     written = snprintf(buffer, buffer_size, "%s = matmul_n32(c=%s, a=%s, b=%s)",
                        dest, dest, lhs, rhs);

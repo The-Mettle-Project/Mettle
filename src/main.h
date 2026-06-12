@@ -30,6 +30,8 @@ typedef struct {
   int simd_report; /* --simd-report: note what each `@simd` loop became */
   int explain;     /* --explain: report optimization decisions (vectorization,
                       inlining) for the main input file, with reasons */
+  int explain_all; /* --explain-all: drop the focus filter (whole program) */
+  int explain_json; /* --explain-json: machine-readable .explain.json sidecar */
   int emit_object;
   int generate_debug_symbols;
   int generate_line_mapping;
@@ -44,6 +46,7 @@ typedef struct {
   int profile;
   int profile_runtime;
   int profile_runtime_ops;
+  int debug_hooks; /* --debug-hooks: interactive debugger instrumentation */
   int native_heap;
   int tracy;
   int static_link;

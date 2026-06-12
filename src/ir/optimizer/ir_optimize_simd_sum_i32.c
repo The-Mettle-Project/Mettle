@@ -304,7 +304,7 @@ static int ir_try_vectorize_sum_i32_at(IRFunction *function, size_t header_index
     return 1;
   }
 
-  if (ir_symbol_read_after(function, jump_index + 1, iv_symbol)) {
+  if (ir_symbol_live_after_loop(function, jump_index + 1, iv_symbol)) {
     return 1;
   }
 
@@ -374,9 +374,10 @@ static int ir_symbol_is_uint8_ptr(const IRFunction *function,
 
 /* True if @iv is provably 0 at the loop header: the nearest preceding write to
  * @iv (in straight-line order) is `iv <- 0`. Bails on any control-flow join
- * before finding it, so the fused kernel only ever sums base[0..len). */
-static int ir_iv_zero_at_header(const IRFunction *function, size_t header_index,
-                                const char *iv) {
+ * before finding it, so a fused kernel only ever touches base[0..len). Shared
+ * with the fill recognizer (ir_optimize_simd_fill.c). */
+int ir_iv_zero_at_header(const IRFunction *function, size_t header_index,
+                         const char *iv) {
   for (size_t i = header_index; i-- > 0;) {
     const IRInstruction *ins = &function->instructions[i];
     if (ins->op == IR_OP_NOP || ins->op == IR_OP_DECLARE_LOCAL) {
@@ -537,7 +538,7 @@ static int ir_try_vectorize_sum_u8_at(IRFunction *function, size_t header_index,
   if (!ir_symbol_is_uint8_ptr(function, base_symbol)) {
     return 1;
   }
-  if (ir_symbol_read_after(function, jump_index + 1, iv_symbol)) {
+  if (ir_symbol_live_after_loop(function, jump_index + 1, iv_symbol)) {
     return 1;
   }
 
@@ -771,7 +772,7 @@ static int ir_try_vectorize_byte_map_at(IRFunction *function,
     return 1;
   }
   /* The loop counter must be dead after the loop (the fused op drops it). */
-  if (ir_symbol_read_after(function, jump_index + 1, iv_symbol)) {
+  if (ir_symbol_live_after_loop(function, jump_index + 1, iv_symbol)) {
     return 1;
   }
 

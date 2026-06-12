@@ -233,10 +233,9 @@ static int ir_function_is_inline_candidate(const IRFunction *function,
    * working around a latent bug elsewhere in the optimizer. */
   if ((has_while_label && has_less_compare && has_greater_compare) ||
       (has_while_label && has_subtract) || (has_while_label && has_multiply)) {
-    *why_not = "the callee contains a loop shape the inliner declines (a "
-               "guard against a known bad interaction with later loop passes)";
-    *fix = "none \xE2\x80\x94 this is a compiler-internal guard; even @inline "
-           "cannot override it";
+    *why_not = "the callee contains a loop the inliner currently declines "
+               "(a compiler limitation, not a problem in your code; the call "
+               "itself costs little next to the loop inside it)";
     return 0;
   }
   if (!has_return) {
@@ -1069,6 +1068,11 @@ void ir_inline_explain_report_remaining(IRProgram *program) {
                                             &unused_fix)) {
           verified = "re-checked with @inline pretend-applied: the structural "
                      "guards pass, so this call will inline";
+        } else if (forced_reason && reason &&
+                   strcmp(forced_reason, reason) == 0) {
+          /* The pretend-apply failed for the reason already printed; a fix
+           * line restating it would be noise. */
+          fix = NULL;
         } else {
           snprintf(corrected_fix, sizeof(corrected_fix),
                    "none \xE2\x80\x94 re-checked with @inline "
@@ -1160,7 +1164,11 @@ int ir_inline_enforce_contracts(IRProgram *program) {
 int ir_inline_explain_simulate_force_inline(IRProgram *program,
                                             IRFunction *caller,
                                             const char *callee_name,
-                                            int *was_noinline_out) {
+                                            int *was_noinline_out,
+                                            const char **decline_reason_out) {
+  if (decline_reason_out) {
+    *decline_reason_out = NULL;
+  }
   if (!program || !caller || !callee_name) {
     return 0;
   }
@@ -1180,7 +1188,15 @@ int ir_inline_explain_simulate_force_inline(IRProgram *program,
   }
   callee->is_inline = 1;
   callee->is_noinline = 0;
-  int candidate = ir_function_is_inline_candidate(callee, NULL, NULL);
+  /* With the pretend flags set, any remaining refusal is structural (loops,
+   * inline asm, no return, ...) -- something no decorator can override. Hand
+   * that reason out so --explain can WITHDRAW the @inline advice instead of
+   * printing a suggestion the inliner itself has just proven dead. */
+  const char *why_not = NULL;
+  int candidate = ir_function_is_inline_candidate(callee, &why_not, NULL);
+  if (!candidate && decline_reason_out) {
+    *decline_reason_out = why_not;
+  }
   int changed = 0;
   if (candidate) {
     /* High counter base so the clone's fresh __inl_* names cannot collide

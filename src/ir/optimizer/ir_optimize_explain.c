@@ -1,5 +1,6 @@
 #include "ir_optimize_internal.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,12 +34,142 @@
 
 static int g_explain = 0;
 static const char *g_explain_focus_file = NULL;
+/* Output binary path (-o): a large report is diverted to a `.explain.txt`
+ * sidecar next to it instead of flooding the terminal. */
+static const char *g_explain_output_path = NULL;
 /* Set while a fix hypothesis is being simulated on a scratch clone: the
  * re-run optimizer passes must not pollute the report with the clone's
  * remarks (the unroller, for one, records remarks from inside the stages). */
 static int g_explain_hypothesis = 0;
 
 void ir_explain_set_hypothesis(int active) { g_explain_hypothesis = active; }
+
+void ir_explain_set_output_path(const char *path) {
+  g_explain_output_path = path;
+}
+
+/* ---- machine-readable report (--explain-json) -------------------------------
+ * A `<output-stem>.explain.json` sidecar with the same content as the prose
+ * report, for tooling (the editor panel parses this instead of prose). The
+ * fragments are accumulated here as sections flush, and finalize assembles
+ * the document. */
+
+static int g_explain_json = 0;
+static char *g_json_buf = NULL;
+static size_t g_json_len = 0;
+static size_t g_json_cap = 0;
+
+void ir_explain_set_json(int enabled) { g_explain_json = enabled; }
+
+static void ir_explain_json_raw(const char *fmt, ...) {
+  va_list args;
+  if (!g_explain_json) {
+    return;
+  }
+  va_start(args, fmt);
+  int needed = vsnprintf(NULL, 0, fmt, args);
+  va_end(args);
+  if (needed < 0) {
+    return;
+  }
+  if (g_json_len + (size_t)needed + 1 > g_json_cap) {
+    size_t new_cap = g_json_cap ? g_json_cap * 2 : 4096;
+    while (new_cap < g_json_len + (size_t)needed + 1) {
+      new_cap *= 2;
+    }
+    char *grown = realloc(g_json_buf, new_cap);
+    if (!grown) {
+      return;
+    }
+    g_json_buf = grown;
+    g_json_cap = new_cap;
+  }
+  va_start(args, fmt);
+  vsnprintf(g_json_buf + g_json_len, g_json_cap - g_json_len, fmt, args);
+  va_end(args);
+  g_json_len += (size_t)needed;
+}
+
+/* Append a JSON string literal (quoted, escaped); NULL becomes null. */
+static void ir_explain_json_str(const char *s) {
+  if (!g_explain_json) {
+    return;
+  }
+  if (!s) {
+    ir_explain_json_raw("null");
+    return;
+  }
+  ir_explain_json_raw("\"");
+  for (; *s; s++) {
+    unsigned char c = (unsigned char)*s;
+    switch (c) {
+    case '"': ir_explain_json_raw("\\\""); break;
+    case '\\': ir_explain_json_raw("\\\\"); break;
+    case '\n': ir_explain_json_raw("\\n"); break;
+    case '\r': ir_explain_json_raw("\\r"); break;
+    case '\t': ir_explain_json_raw("\\t"); break;
+    default:
+      if (c < 0x20) {
+        ir_explain_json_raw("\\u%04x", c);
+      } else {
+        ir_explain_json_raw("%c", c);
+      }
+    }
+  }
+  ir_explain_json_raw("\"");
+}
+
+/* ---- report buffer ----------------------------------------------------------
+ * Both report sections render here first (with color codes; they're stripped
+ * if the report goes to a file). Routing happens once, at finalize time, when
+ * the total size is known: small reports print to stderr as before, large
+ * ones are written to the sidecar with a digest on stderr. */
+
+static char *g_report_buf = NULL;
+static size_t g_report_len = 0;
+static size_t g_report_cap = 0;
+
+static void ir_explain_emit(const char *fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+  int needed = vsnprintf(NULL, 0, fmt, args);
+  va_end(args);
+  if (needed < 0) {
+    return;
+  }
+  if (g_report_len + (size_t)needed + 1 > g_report_cap) {
+    size_t new_cap = g_report_cap ? g_report_cap * 2 : 4096;
+    while (new_cap < g_report_len + (size_t)needed + 1) {
+      new_cap *= 2;
+    }
+    char *grown = realloc(g_report_buf, new_cap);
+    if (!grown) {
+      return;
+    }
+    g_report_buf = grown;
+    g_report_cap = new_cap;
+  }
+  va_start(args, fmt);
+  vsnprintf(g_report_buf + g_report_len, g_report_cap - g_report_len, fmt,
+            args);
+  va_end(args);
+  g_report_len += (size_t)needed;
+}
+
+/* Digest stats collected while the sections render, for the one-paragraph
+ * stderr summary that accompanies a file-diverted report. */
+static struct {
+  size_t loops_vectorized;
+  size_t loops_scalar;
+  size_t fixes_verified;
+  size_t calls_inlined;
+  size_t calls_refused;
+  size_t backend_ok;
+  size_t backend_total;
+  size_t changes_improved;
+  size_t changes_regressed;
+  int had_baseline;
+} g_digest;
 
 /* One remark: an entity ("loop", "call to `f`") in a function, a colored
  * headline, and optional reason/fix detail lines. */
@@ -52,6 +183,7 @@ typedef struct {
   char *reason;   /* may be NULL */
   char *fix;      /* may be NULL */
   char *verified; /* may be NULL: the fix was SIMULATED and proven to work */
+  size_t depth;   /* loop nest depth (1 = top level); 0 = not a loop/unknown */
 } IRExplainRemark;
 
 static IRExplainRemark *g_remarks = NULL;
@@ -63,7 +195,8 @@ static size_t g_remark_capacity = 0;
 typedef struct {
   char *function_name;
   int ok;
-  char *detail; /* gate reason code when !ok */
+  char *detail;        /* gate reason code when !ok */
+  size_t instructions; /* non-nop IR size: where baseline codegen COSTS */
 } IRExplainBackendEntry;
 
 static IRExplainBackendEntry *g_backend = NULL;
@@ -224,6 +357,9 @@ static const char *glyph_elbow(void) {
 static const char *glyph_rule(void) {
   return ir_explain_use_unicode() ? "\xE2\x94\x80\xE2\x94\x80" : "--";
 }
+static const char *glyph_arrow(void) {
+  return ir_explain_use_unicode() ? "\xE2\x86\x92" : "->";
+}
 
 /* ---- remark store -------------------------------------------------------- */
 
@@ -323,6 +459,19 @@ void ir_explain_remark(const char *function_name, const char *entity,
   r->reason = ir_explain_text_dup(reason);
   r->fix = ir_explain_text_dup(fix);
   r->verified = ir_explain_text_dup(verified);
+  r->depth = 0;
+}
+
+/* Stamp the nest depth on the most recent loop remark at `line` (the
+ * contract walker computes containment after recording). 1 = top level. */
+void ir_explain_remark_loop_depth(size_t line, size_t depth) {
+  for (size_t i = g_remark_count; i > 0; i--) {
+    IRExplainRemark *r = &g_remarks[i - 1];
+    if (r->line == line && r->entity && strcmp(r->entity, "loop") == 0) {
+      r->depth = depth;
+      return;
+    }
+  }
 }
 
 int ir_explain_has_remark_at(size_t line, const char *entity) {
@@ -451,13 +600,344 @@ static void ir_explain_group_callee_list(const IRExplainRemark *remarks,
   }
 }
 
+/* ---- "since last build" diffing ---------------------------------------------
+ * Each explain build writes a compact baseline of its loop/call outcomes to
+ * `<output-stem>.explain.base`; the next build compares before rendering and
+ * leads the report with what CHANGED -- newly vectorized loops, and (the part
+ * benchmarks find too late) regressions. Entities are matched by (function,
+ * ordinal within the function) so ordinary edits that shift line numbers do
+ * not produce false alarms. */
+
+typedef struct {
+  char function_name[128];
+  char callee[96]; /* calls only; empty for loops */
+  size_t ordinal;
+  size_t line;
+  char status; /* 'V'/'S' for loops, 'I'/'R' for calls */
+  char kind;   /* 'L' or 'C' */
+  const char *reason; /* current-side only: points into g_remarks */
+} IRExplainBaseKey;
+
+/* Status for diffing, or 0 when the remark is not tracked. "vectorized
+ * inner, scalar outer" is intentionally untracked: its own status lives on
+ * the inner loop's remark. */
+static char ir_explain_remark_status(const IRExplainRemark *r, char *kind) {
+  if (!r->entity || !r->headline) {
+    return 0;
+  }
+  if (strcmp(r->entity, "loop") == 0) {
+    *kind = 'L';
+    if (strncmp(r->headline, "vectorized inner", 16) == 0) {
+      return 0;
+    }
+    if (strncmp(r->headline, "vectorized", 10) == 0) {
+      return 'V';
+    }
+    if (strncmp(r->headline, "NOT vectorized", 14) == 0) {
+      return 'S';
+    }
+    return 0;
+  }
+  if (strncmp(r->entity, "call to ", 8) == 0) {
+    *kind = 'C';
+    if (strcmp(r->headline, "inlined") == 0) {
+      return 'I';
+    }
+    if (strcmp(r->headline, "NOT inlined") == 0) {
+      return 'R';
+    }
+    return 0;
+  }
+  return 0;
+}
+
+/* Build the tracked-outcome list from the (already sorted) remarks.
+ * Returns a malloc'd array; count in *count_out. */
+static IRExplainBaseKey *ir_explain_build_keys(size_t *count_out) {
+  IRExplainBaseKey *keys = calloc(g_remark_count ? g_remark_count : 1,
+                                  sizeof(IRExplainBaseKey));
+  size_t count = 0;
+  if (!keys) {
+    *count_out = 0;
+    return NULL;
+  }
+  for (size_t i = 0; i < g_remark_count; i++) {
+    const IRExplainRemark *r = &g_remarks[i];
+    char kind = 0;
+    char status = ir_explain_remark_status(r, &kind);
+    if (!status) {
+      continue;
+    }
+    IRExplainBaseKey *k = &keys[count];
+    snprintf(k->function_name, sizeof(k->function_name), "%s",
+             r->function_name ? r->function_name : "?");
+    k->callee[0] = '\0';
+    if (kind == 'C') {
+      ir_explain_entity_callee(r->entity, k->callee, sizeof(k->callee));
+    }
+    k->kind = kind;
+    k->status = status;
+    k->line = r->line;
+    k->reason = r->reason;
+    /* ordinal: how many earlier tracked entries share (kind, fn, callee) */
+    k->ordinal = 0;
+    for (size_t j = 0; j < count; j++) {
+      if (keys[j].kind == kind &&
+          strcmp(keys[j].function_name, k->function_name) == 0 &&
+          strcmp(keys[j].callee, k->callee) == 0) {
+        k->ordinal++;
+      }
+    }
+    count++;
+  }
+  *count_out = count;
+  return keys;
+}
+
+/* `<dir>/<stem><suffix>` from the output path; caller frees. */
+static char *ir_explain_derived_path(const char *suffix) {
+  if (!g_explain_output_path) {
+    return NULL;
+  }
+  size_t base_len = strlen(g_explain_output_path);
+  const char *last_dot = NULL;
+  for (const char *p = g_explain_output_path; *p; p++) {
+    if (*p == '.') {
+      last_dot = p;
+    } else if (*p == '/' || *p == '\\') {
+      last_dot = NULL;
+    }
+  }
+  size_t stem_len = last_dot ? (size_t)(last_dot - g_explain_output_path)
+                             : base_len;
+  char *path = malloc(stem_len + strlen(suffix) + 1);
+  if (!path) {
+    return NULL;
+  }
+  memcpy(path, g_explain_output_path, stem_len);
+  strcpy(path + stem_len, suffix);
+  return path;
+}
+
+static IRExplainBaseKey *ir_explain_read_baseline(size_t *count_out) {
+  *count_out = 0;
+  char *path = ir_explain_derived_path(".explain.base");
+  if (!path) {
+    return NULL;
+  }
+  FILE *in = fopen(path, "rb");
+  free(path);
+  if (!in) {
+    return NULL;
+  }
+  IRExplainBaseKey *keys = NULL;
+  size_t count = 0, capacity = 0;
+  char line[512];
+  while (fgets(line, sizeof(line), in)) {
+    char kind = line[0];
+    if ((kind != 'L' && kind != 'C') || line[1] != '\t') {
+      continue;
+    }
+    if (count == capacity) {
+      size_t new_capacity = capacity ? capacity * 2 : 64;
+      IRExplainBaseKey *grown =
+          realloc(keys, new_capacity * sizeof(IRExplainBaseKey));
+      if (!grown) {
+        break;
+      }
+      keys = grown;
+      capacity = new_capacity;
+    }
+    IRExplainBaseKey *k = &keys[count];
+    memset(k, 0, sizeof(*k));
+    k->kind = kind;
+    /* L \t fn \t ordinal \t status \t line
+     * C \t fn \t callee \t ordinal \t status \t line */
+    char *cursor = line + 2;
+    char *fields[5] = {0};
+    int n_fields = 0;
+    while (cursor && n_fields < 5) {
+      fields[n_fields++] = cursor;
+      cursor = strchr(cursor, '\t');
+      if (cursor) {
+        *cursor++ = '\0';
+      }
+    }
+    int needed = kind == 'L' ? 4 : 5;
+    if (n_fields < needed) {
+      continue;
+    }
+    snprintf(k->function_name, sizeof(k->function_name), "%s", fields[0]);
+    int field = 1;
+    if (kind == 'C') {
+      snprintf(k->callee, sizeof(k->callee), "%s", fields[field++]);
+    }
+    k->ordinal = (size_t)strtoul(fields[field++], NULL, 10);
+    k->status = fields[field++][0];
+    k->line = (size_t)strtoul(fields[field], NULL, 10);
+    count++;
+  }
+  fclose(in);
+  *count_out = count;
+  return keys;
+}
+
+static void ir_explain_write_baseline(const IRExplainBaseKey *keys,
+                                      size_t count) {
+  char *path = ir_explain_derived_path(".explain.base");
+  if (!path) {
+    return;
+  }
+  FILE *out = fopen(path, "wb");
+  free(path);
+  if (!out) {
+    return;
+  }
+  for (size_t i = 0; i < count; i++) {
+    const IRExplainBaseKey *k = &keys[i];
+    if (k->kind == 'L') {
+      fprintf(out, "L\t%s\t%zu\t%c\t%zu\n", k->function_name, k->ordinal,
+              k->status, k->line);
+    } else {
+      fprintf(out, "C\t%s\t%s\t%zu\t%c\t%zu\n", k->function_name, k->callee,
+              k->ordinal, k->status, k->line);
+    }
+  }
+  fclose(out);
+}
+
+static const IRExplainBaseKey *
+ir_explain_find_key(const IRExplainBaseKey *keys, size_t count,
+                    const IRExplainBaseKey *want) {
+  for (size_t i = 0; i < count; i++) {
+    if (keys[i].kind == want->kind && keys[i].ordinal == want->ordinal &&
+        strcmp(keys[i].function_name, want->function_name) == 0 &&
+        strcmp(keys[i].callee, want->callee) == 0) {
+      return &keys[i];
+    }
+  }
+  return NULL;
+}
+
+/* Compare against the previous build, render the "changes" section, emit the
+ * JSON changes object, update the digest, and rewrite the baseline. Runs on
+ * the SORTED remark list before the main listing renders. */
+static void ir_explain_render_changes(void) {
+  size_t current_count = 0, old_count = 0;
+  IRExplainBaseKey *current = ir_explain_build_keys(&current_count);
+  IRExplainBaseKey *old = ir_explain_read_baseline(&old_count);
+
+  if (current) {
+    if (old) {
+      size_t improved = 0, regressed = 0;
+      ir_explain_json_raw("\"changes\":{\"baseline\":true,\"entries\":[");
+      size_t json_entries = 0;
+      for (size_t i = 0; i < current_count; i++) {
+        const IRExplainBaseKey *was =
+            ir_explain_find_key(old, old_count, &current[i]);
+        if (!was || was->status == current[i].status) {
+          continue;
+        }
+        const char *what = current[i].kind == 'L' ? "loop" : "call";
+        int now_better = current[i].status == 'V' || current[i].status == 'I';
+        if ((improved + regressed) == 0) {
+          ir_explain_emit("  %schanges since the last explain build:%s\n",
+                          clr(EXPLAIN_BOLD), clr(EXPLAIN_RESET));
+        }
+        if (now_better) {
+          improved++;
+          ir_explain_emit(
+              "    %s+ %s (%s @ line %zu): now %s%s\n", clr(EXPLAIN_GREEN),
+              current[i].function_name, what, current[i].line,
+              current[i].kind == 'L' ? "vectorized" : "inlined",
+              clr(EXPLAIN_RESET));
+        } else {
+          regressed++;
+          ir_explain_emit(
+              "    %s%s- %s (%s @ line %zu): REGRESSED %s was %s%s\n",
+              clr(EXPLAIN_BOLD), clr(EXPLAIN_RED), current[i].function_name,
+              what, current[i].line, glyph_arrow(),
+              current[i].kind == 'L' ? "vectorized, now scalar"
+                                     : "inlined, now a real call",
+              clr(EXPLAIN_RESET));
+          if (current[i].reason) {
+            ir_explain_emit("        %s%s reason: %s%s\n", clr(EXPLAIN_DIM),
+                            glyph_elbow(), current[i].reason,
+                            clr(EXPLAIN_RESET));
+          }
+        }
+        ir_explain_json_raw("%s{\"kind\":\"%s\",\"fn\":",
+                            json_entries++ ? "," : "", what);
+        ir_explain_json_str(current[i].function_name);
+        ir_explain_json_raw(",\"line\":%zu,\"direction\":\"%s\",\"reason\":",
+                            current[i].line,
+                            now_better ? "improved" : "regressed");
+        ir_explain_json_str(now_better ? NULL : current[i].reason);
+        ir_explain_json_raw("}");
+      }
+      if ((improved + regressed) == 0) {
+        ir_explain_emit("  %sno optimization changes since the last explain "
+                        "build%s\n",
+                        clr(EXPLAIN_DIM), clr(EXPLAIN_RESET));
+      }
+      ir_explain_emit("\n");
+      ir_explain_json_raw("]},");
+      g_digest.changes_improved = improved;
+      g_digest.changes_regressed = regressed;
+      g_digest.had_baseline = 1;
+    } else {
+      ir_explain_json_raw("\"changes\":{\"baseline\":false,\"entries\":[]},");
+    }
+    ir_explain_write_baseline(current, current_count);
+  }
+  free(current);
+  free(old);
+}
+
 static void ir_explain_print_header(const char *what) {
   const char *file = g_explain_focus_file
                          ? ir_explain_path_basename(g_explain_focus_file)
                          : "<input>";
   const char *rule = glyph_rule();
-  fprintf(stderr, "\n%s%s %s: %s %s%s%s%s%s%s\n", clr(EXPLAIN_BOLD), rule,
-          what, file, rule, rule, rule, rule, rule, clr(EXPLAIN_RESET));
+  ir_explain_emit("\n%s%s %s: %s %s%s%s%s%s%s\n", clr(EXPLAIN_BOLD), rule,
+                  what, file, rule, rule, rule, rule, rule,
+                  clr(EXPLAIN_RESET));
+}
+
+/* One remark as a JSON object in the "remarks" array. `kind` is explicit so
+ * consumers never re-derive it from prose. */
+static void ir_explain_json_remark(const IRExplainRemark *r, const char *kind,
+                                   const char *callee, size_t count,
+                                   size_t line_end, const char *calls,
+                                   size_t *json_count) {
+  if (!g_explain_json) {
+    return;
+  }
+  ir_explain_json_raw("%s{\"kind\":\"%s\",\"fn\":", (*json_count)++ ? "," : "",
+                      kind);
+  ir_explain_json_str(r->function_name);
+  ir_explain_json_raw(",\"entity\":");
+  ir_explain_json_str(r->entity);
+  ir_explain_json_raw(",\"line\":%zu,\"positive\":%s,\"headline\":", r->line,
+                      r->positive ? "true" : "false");
+  ir_explain_json_str(r->headline);
+  ir_explain_json_raw(",\"reason\":");
+  ir_explain_json_str(r->reason);
+  ir_explain_json_raw(",\"fix\":");
+  ir_explain_json_str(r->fix);
+  ir_explain_json_raw(",\"verified\":");
+  ir_explain_json_str(r->verified);
+  ir_explain_json_raw(",\"callee\":");
+  ir_explain_json_str(callee);
+  if (count > 1) {
+    ir_explain_json_raw(",\"count\":%zu,\"lineEnd\":%zu,\"calls\":", count,
+                        line_end);
+    ir_explain_json_str(calls);
+  }
+  if (r->depth > 0) {
+    ir_explain_json_raw(",\"depth\":%zu", r->depth);
+  }
+  ir_explain_json_raw("}");
 }
 
 void ir_explain_flush(void) {
@@ -467,11 +947,18 @@ void ir_explain_flush(void) {
 
   ir_explain_print_header("optimization report");
 
-  if (g_remark_count == 0) {
-    fprintf(stderr, "  (no loops or calls to report)\n\n");
-  } else {
+  if (g_remark_count > 0) {
     qsort(g_remarks, g_remark_count, sizeof(IRExplainRemark),
           ir_explain_remark_compare);
+  }
+  ir_explain_render_changes();
+
+  size_t json_remark_count = 0;
+  ir_explain_json_raw("\"remarks\":[");
+
+  if (g_remark_count == 0) {
+    ir_explain_emit("  (no loops or calls to report)\n\n");
+  } else {
     char *suppressed = calloc(g_remark_count, 1);
     for (size_t i = 0; i < g_remark_count; i++) {
       const IRExplainRemark *r = &g_remarks[i];
@@ -494,24 +981,29 @@ void ir_explain_flush(void) {
           char callees[512];
           ir_explain_group_callee_list(g_remarks, i, callees,
                                        sizeof(callees));
-          fprintf(stderr, "  %s%s%s (%zu calls, lines %zu-%zu): %s%s%s\n",
-                  clr(EXPLAIN_BOLD), r->function_name, clr(EXPLAIN_RESET),
-                  group_count, r->line, last_line,
-                  clr(r->positive ? EXPLAIN_GREEN : EXPLAIN_RED), r->headline,
-                  clr(EXPLAIN_RESET));
-          fprintf(stderr, "      %s%s reason: %s%s\n", clr(EXPLAIN_DIM),
-                  glyph_elbow(), r->reason, clr(EXPLAIN_RESET));
+          ir_explain_emit("  %s%s%s (%zu calls, lines %zu-%zu): %s%s%s\n",
+                          clr(EXPLAIN_BOLD), r->function_name,
+                          clr(EXPLAIN_RESET), group_count, r->line, last_line,
+                          clr(r->positive ? EXPLAIN_GREEN : EXPLAIN_RED),
+                          r->headline, clr(EXPLAIN_RESET));
+          ir_explain_emit("      %s%s reason: %s%s\n", clr(EXPLAIN_DIM),
+                          glyph_elbow(), r->reason, clr(EXPLAIN_RESET));
           if (r->fix) {
-            fprintf(stderr, "      %s%s fix: %s%s\n", clr(EXPLAIN_DIM),
-                    glyph_elbow(), r->fix, clr(EXPLAIN_RESET));
+            ir_explain_emit("      %s%s fix: %s%s\n", clr(EXPLAIN_DIM),
+                            glyph_elbow(), r->fix, clr(EXPLAIN_RESET));
           }
           if (r->verified) {
-            fprintf(stderr, "      %s%s verified: %s%s%s\n", clr(EXPLAIN_DIM),
-                    glyph_elbow(), clr(EXPLAIN_GREEN), r->verified,
-                    clr(EXPLAIN_RESET));
+            ir_explain_emit("      %s%s verified: %s%s%s\n", clr(EXPLAIN_DIM),
+                            glyph_elbow(), clr(EXPLAIN_GREEN), r->verified,
+                            clr(EXPLAIN_RESET));
           }
-          fprintf(stderr, "      %s%s calls: %s%s\n", clr(EXPLAIN_DIM),
-                  glyph_elbow(), callees, clr(EXPLAIN_RESET));
+          ir_explain_emit("      %s%s calls: %s%s\n", clr(EXPLAIN_DIM),
+                          glyph_elbow(), callees, clr(EXPLAIN_RESET));
+          if (strcmp(r->headline, "NOT inlined") == 0) {
+            g_digest.calls_refused += group_count;
+          }
+          ir_explain_json_remark(r, "calls-folded", NULL, group_count,
+                                 last_line, callees, &json_remark_count);
           for (size_t j = i; j < g_remark_count; j++) {
             if (ir_explain_remark_foldable(&g_remarks[j]) &&
                 ir_explain_remarks_groupable(r, &g_remarks[j])) {
@@ -522,27 +1014,54 @@ void ir_explain_flush(void) {
         }
       }
 
-      fprintf(stderr, "  %s%s%s (%s @ line %zu): %s%s%s\n", clr(EXPLAIN_BOLD),
-              r->function_name, clr(EXPLAIN_RESET), r->entity, r->line,
-              clr(r->positive ? EXPLAIN_GREEN : EXPLAIN_RED), r->headline,
-              clr(EXPLAIN_RESET));
+      ir_explain_emit("  %s%s%s (%s @ line %zu): %s%s%s\n", clr(EXPLAIN_BOLD),
+                      r->function_name, clr(EXPLAIN_RESET), r->entity, r->line,
+                      clr(r->positive ? EXPLAIN_GREEN : EXPLAIN_RED),
+                      r->headline, clr(EXPLAIN_RESET));
       if (r->reason) {
-        fprintf(stderr, "      %s%s reason: %s%s\n", clr(EXPLAIN_DIM),
-                glyph_elbow(), r->reason, clr(EXPLAIN_RESET));
+        ir_explain_emit("      %s%s reason: %s%s\n", clr(EXPLAIN_DIM),
+                        glyph_elbow(), r->reason, clr(EXPLAIN_RESET));
       }
       if (r->fix) {
-        fprintf(stderr, "      %s%s fix: %s%s\n", clr(EXPLAIN_DIM),
-                glyph_elbow(), r->fix, clr(EXPLAIN_RESET));
+        ir_explain_emit("      %s%s fix: %s%s\n", clr(EXPLAIN_DIM),
+                        glyph_elbow(), r->fix, clr(EXPLAIN_RESET));
       }
       if (r->verified) {
-        fprintf(stderr, "      %s%s verified: %s%s%s\n", clr(EXPLAIN_DIM),
-                glyph_elbow(), clr(EXPLAIN_GREEN), r->verified,
-                clr(EXPLAIN_RESET));
+        ir_explain_emit("      %s%s verified: %s%s%s\n", clr(EXPLAIN_DIM),
+                        glyph_elbow(), clr(EXPLAIN_GREEN), r->verified,
+                        clr(EXPLAIN_RESET));
+        g_digest.fixes_verified++;
+      }
+      /* Digest tallies (loop/call outcomes by entity + headline). */
+      if (r->entity && strcmp(r->entity, "loop") == 0) {
+        if (strncmp(r->headline, "vectorized", 10) == 0) {
+          g_digest.loops_vectorized++;
+        } else if (strncmp(r->headline, "NOT vectorized", 14) == 0) {
+          g_digest.loops_scalar++;
+        }
+        ir_explain_json_remark(r, "loop", NULL, 1, 0, NULL,
+                               &json_remark_count);
+      } else if (r->entity && strncmp(r->entity, "call to ", 8) == 0) {
+        if (strcmp(r->headline, "inlined") == 0) {
+          g_digest.calls_inlined++;
+        } else if (strcmp(r->headline, "NOT inlined") == 0) {
+          g_digest.calls_refused++;
+        }
+        char callee[96];
+        ir_explain_entity_callee(r->entity, callee, sizeof(callee));
+        ir_explain_json_remark(r, "call", callee, 1, 0, NULL,
+                               &json_remark_count);
+      } else {
+        ir_explain_json_remark(
+            r, r->entity && strcmp(r->entity, "function") == 0 ? "function"
+                                                               : "other",
+            NULL, 1, 0, NULL, &json_remark_count);
       }
     }
     free(suppressed);
-    fprintf(stderr, "\n");
+    ir_explain_emit("\n");
   }
+  ir_explain_json_raw("],");
 
   for (size_t i = 0; i < g_remark_count; i++) {
     free(g_remarks[i].function_name);
@@ -562,7 +1081,7 @@ void ir_explain_flush(void) {
 
 void ir_explain_backend_function(const char *function_name,
                                  const char *filename, int ok,
-                                 const char *detail) {
+                                 const char *detail, size_t instructions) {
   if (!g_explain || !function_name || !ir_explain_file_enabled(filename)) {
     return;
   }
@@ -585,30 +1104,207 @@ void ir_explain_backend_function(const char *function_name,
   e->function_name = ir_explain_strdup(function_name);
   e->ok = ok;
   e->detail = ir_explain_strdup(detail);
+  e->instructions = instructions;
+}
+
+/* ---- report routing ---------------------------------------------------------
+ * Small reports print to stderr exactly as before. Past a line threshold (a
+ * real application produces hundreds of remarks) the full report is written
+ * to `<output-stem>.explain.txt` next to the output binary, and stderr gets a
+ * one-paragraph digest with the path. */
+
+#define IR_EXPLAIN_STDERR_MAX_LINES 200
+
+static size_t ir_explain_report_lines(void) {
+  size_t lines = 0;
+  for (size_t i = 0; i < g_report_len; i++) {
+    lines += (g_report_buf[i] == '\n') ? 1 : 0;
+  }
+  return lines;
+}
+
+/* `<dir>/<stem>.explain.txt` from the output path; caller frees. */
+static char *ir_explain_sidecar_path(void) {
+  return ir_explain_derived_path(".explain.txt");
+}
+
+/* Write the buffer with ANSI color sequences stripped (the report renders
+ * with stderr in mind; a file must stay plain). */
+static int ir_explain_write_plain(FILE *out) {
+  for (size_t i = 0; i < g_report_len; i++) {
+    if (g_report_buf[i] == '\x1b' && i + 1 < g_report_len &&
+        g_report_buf[i + 1] == '[') {
+      i += 2;
+      while (i < g_report_len && g_report_buf[i] != 'm') {
+        i++;
+      }
+      continue;
+    }
+    if (fputc(g_report_buf[i], out) == EOF) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+void ir_explain_finalize(int force_stderr) {
+  if (!g_explain || !g_report_buf || g_report_len == 0) {
+    return;
+  }
+
+  size_t threshold = IR_EXPLAIN_STDERR_MAX_LINES;
+  const char *env = getenv("METTLE_EXPLAIN_REPORT_LINES");
+  if (env && env[0]) {
+    long v = atol(env);
+    threshold = (v <= 0) ? (size_t)-1 : (size_t)v;
+  }
+
+  char *sidecar = NULL;
+  int diverted = 0;
+  if (!force_stderr && ir_explain_report_lines() > threshold &&
+      (sidecar = ir_explain_sidecar_path()) != NULL) {
+    FILE *out = fopen(sidecar, "wb");
+    if (out) {
+      diverted = ir_explain_write_plain(out);
+      fclose(out);
+    }
+  }
+
+  /* The machine-readable sidecar, independent of where the prose went. */
+  if (g_explain_json && g_json_buf) {
+    char *json_path = ir_explain_derived_path(".explain.json");
+    if (json_path) {
+      FILE *out = fopen(json_path, "wb");
+      if (out) {
+        const char *source = g_explain_focus_file
+                                 ? ir_explain_path_basename(g_explain_focus_file)
+                                 : "";
+        fprintf(out, "{\"schema\":1,\"source\":\"%s\",", source);
+        fwrite(g_json_buf, 1, g_json_len, out);
+        fprintf(out,
+                "\"stats\":{\"loopsVectorized\":%zu,\"loopsScalar\":%zu,"
+                "\"fixesVerified\":%zu,\"callsInlined\":%zu,"
+                "\"callsRefused\":%zu,\"changesImproved\":%zu,"
+                "\"changesRegressed\":%zu,\"hadBaseline\":%s}}\n",
+                g_digest.loops_vectorized, g_digest.loops_scalar,
+                g_digest.fixes_verified, g_digest.calls_inlined,
+                g_digest.calls_refused, g_digest.changes_improved,
+                g_digest.changes_regressed,
+                g_digest.had_baseline ? "true" : "false");
+        fclose(out);
+      }
+      free(json_path);
+    }
+  }
+  free(g_json_buf);
+  g_json_buf = NULL;
+  g_json_len = 0;
+  g_json_cap = 0;
+
+  if (!diverted) {
+    fwrite(g_report_buf, 1, g_report_len, stderr);
+  } else {
+    /* The digest: the report's conclusions in five lines, plus the path.
+     * Regressions lead -- they must never hide inside a sidecar. */
+    fprintf(stderr, "\n%s%s optimization report %s%s%s%s%s%s%s\n",
+            clr(EXPLAIN_BOLD), glyph_rule(), glyph_rule(), glyph_rule(),
+            glyph_rule(), glyph_rule(), glyph_rule(), glyph_rule(),
+            clr(EXPLAIN_RESET));
+    if (g_digest.changes_regressed > 0) {
+      fprintf(stderr,
+              "  %s%s%zu optimization%s REGRESSED since the last build%s "
+              "(see the changes section of the report)\n",
+              clr(EXPLAIN_BOLD), clr(EXPLAIN_RED), g_digest.changes_regressed,
+              g_digest.changes_regressed == 1 ? "" : "s", clr(EXPLAIN_RESET));
+    } else if (g_digest.changes_improved > 0) {
+      fprintf(stderr, "  %s%zu optimization%s improved since the last build%s\n",
+              clr(EXPLAIN_GREEN), g_digest.changes_improved,
+              g_digest.changes_improved == 1 ? "" : "s", clr(EXPLAIN_RESET));
+    }
+    fprintf(stderr,
+            "  loops: %s%zu vectorized%s, %zu scalar; %s%zu fix suggestions "
+            "verified by simulation%s\n",
+            clr(EXPLAIN_GREEN), g_digest.loops_vectorized, clr(EXPLAIN_RESET),
+            g_digest.loops_scalar, clr(EXPLAIN_GREEN), g_digest.fixes_verified,
+            clr(EXPLAIN_RESET));
+    fprintf(stderr, "  calls: %zu inlined, %zu kept as real calls\n",
+            g_digest.calls_inlined, g_digest.calls_refused);
+    if (g_digest.backend_total > 0) {
+      fprintf(stderr,
+              "  backend: %zu/%zu functions register-allocated\n",
+              g_digest.backend_ok, g_digest.backend_total);
+    }
+    fprintf(stderr, "  full report (%zu lines): %s%s%s\n\n",
+            ir_explain_report_lines(), clr(EXPLAIN_BOLD), sidecar,
+            clr(EXPLAIN_RESET));
+  }
+
+  free(sidecar);
+  free(g_report_buf);
+  g_report_buf = NULL;
+  g_report_len = 0;
+  g_report_cap = 0;
+  memset(&g_digest, 0, sizeof(g_digest));
 }
 
 /* Translate the MIR gate's terse reason codes ("op:37", "params>4", ...) into
- * a sentence. "op:N" carries an IROpcode -- name it. */
+ * a sentence, plus -- where the family is understood -- what falling back
+ * actually COSTS and what (if anything) the user can do about it. "op:N"
+ * carries an IROpcode; SIMD kernels get their own family because the common
+ * misreading is "my vectorized function is slow now" (it isn't: the kernel
+ * runs at full speed, only surrounding scalar code spills). */
 static void ir_explain_backend_reason(const IRExplainBackendEntry *e, char *buf,
-                                      size_t cap) {
+                                      size_t cap, const char **consequence,
+                                      const char **fix) {
+  *consequence = NULL;
+  *fix = NULL;
   if (!e->detail) {
     snprintf(buf, cap, "declined by the eligibility gate");
     return;
   }
   if (strncmp(e->detail, "op:", 3) == 0) {
     int op = atoi(e->detail + 3);
+    if (op >= (int)IR_OP_COUNT_WORD_STARTS &&
+        op <= (int)IR_OP_SIMD_OUTER_LANE_F64) {
+      snprintf(buf, cap,
+               "contains the SIMD kernel `%s`, which the register allocator "
+               "doesn't cover yet",
+               ir_opcode_name((IROpcode)op));
+      *consequence =
+          "the kernel itself runs at full vector speed; only the scalar code "
+          "around it keeps values on the stack";
+      *fix = "nothing for small functions; if a LARGE function mixes a kernel "
+             "with hot scalar code, move the kernel loop into its own small "
+             "function so the scalar part keeps the register allocator";
+      return;
+    }
     snprintf(buf, cap,
              "contains `%s`, which the register allocator doesn't cover yet",
              ir_opcode_name((IROpcode)op));
+    *consequence = "every value in the function is kept on the stack instead "
+                   "of in registers";
     return;
   }
   if (strcmp(e->detail, "call_unsupported") == 0) {
     snprintf(buf, cap, "contains a call form the register allocator doesn't "
                        "support yet");
+    *consequence = "every value in the function is kept on the stack instead "
+                   "of in registers";
     return;
   }
   snprintf(buf, cap, "declined by the eligibility gate (reason code: %s)",
            e->detail);
+}
+
+/* Sort helper: biggest functions first -- size is where baseline codegen
+ * costs, so the list reads as a priority queue. */
+static int ir_explain_backend_size_compare(const void *a, const void *b) {
+  const IRExplainBackendEntry *ea = a, *eb = b;
+  if (ea->instructions != eb->instructions) {
+    return ea->instructions > eb->instructions ? -1 : 1;
+  }
+  return strcmp(ea->function_name ? ea->function_name : "",
+                eb->function_name ? eb->function_name : "");
 }
 
 void ir_explain_backend_flush(void) {
@@ -617,33 +1313,187 @@ void ir_explain_backend_flush(void) {
   }
 
   size_t ok_count = 0;
+  size_t total_instructions = 0;
+  size_t ok_instructions = 0;
   for (size_t i = 0; i < g_backend_count; i++) {
     ok_count += g_backend[i].ok ? 1 : 0;
+    total_instructions += g_backend[i].instructions;
+    ok_instructions += g_backend[i].ok ? g_backend[i].instructions : 0;
   }
+  g_digest.backend_ok = ok_count;
+  g_digest.backend_total = g_backend_count;
+
+  ir_explain_json_raw(
+      "\"backend\":{\"ok\":%zu,\"total\":%zu,\"instructions\":%zu,"
+      "\"okInstructions\":%zu,\"groups\":[",
+      ok_count, g_backend_count, total_instructions, ok_instructions);
+  size_t json_group_count = 0;
 
   ir_explain_print_header("backend report");
   if (g_backend_count == 0) {
-    fprintf(stderr, "  (no functions reached native codegen)\n\n");
+    ir_explain_emit("  (no functions reached native codegen)\n\n");
   } else {
-    fprintf(stderr,
-            "  %zu/%zu functions reaching codegen (after inlining) compiled "
-            "with the register-allocating backend%s\n",
-            ok_count, g_backend_count,
-            ok_count == g_backend_count ? "" : "; the rest use baseline "
-                                               "(spill-everything) codegen:");
-    for (size_t i = 0; i < g_backend_count; i++) {
-      if (g_backend[i].ok) {
-        continue;
-      }
-      char reason[256];
-      ir_explain_backend_reason(&g_backend[i], reason, sizeof(reason));
-      fprintf(stderr, "      %s%s %s%s%s%s: %s%s\n", clr(EXPLAIN_DIM),
-              glyph_elbow(), clr(EXPLAIN_RESET), clr(EXPLAIN_BOLD),
-              g_backend[i].function_name, clr(EXPLAIN_RESET), reason,
-              clr(EXPLAIN_RESET));
+    ir_explain_emit(
+        "  %zu/%zu functions reaching codegen (after inlining) compiled with "
+        "the register-allocating backend\n",
+        ok_count, g_backend_count);
+    if (total_instructions > 0) {
+      ir_explain_emit(
+          "  %.1f%% of the program's %zu optimized IR instructions are in "
+          "register-allocated code\n",
+          100.0 * (double)ok_instructions / (double)total_instructions,
+          total_instructions);
     }
-    fprintf(stderr, "\n");
+
+    if (ok_count < g_backend_count) {
+      ir_explain_emit(
+          "\n  %zu function%s use%s baseline (spill-everything) codegen, "
+          "grouped by cause, largest first:\n",
+          g_backend_count - ok_count,
+          g_backend_count - ok_count == 1 ? "" : "s",
+          g_backend_count - ok_count == 1 ? "s" : "");
+
+      /* Group the bailed entries by their rendered reason sentence, ordered
+       * by the group's total instruction count (where the cost actually
+       * is). Entries were sorted by size already, so each group's function
+       * list reads largest-first. */
+      qsort(g_backend, g_backend_count, sizeof(IRExplainBackendEntry),
+            ir_explain_backend_size_compare);
+      char *grouped = calloc(g_backend_count, 1);
+      for (;;) {
+        /* Pick the ungrouped reason with the largest remaining total. */
+        char best_reason[256];
+        const char *best_consequence = NULL, *best_fix = NULL;
+        size_t best_total = 0, best_first = (size_t)-1;
+        for (size_t i = 0; i < g_backend_count; i++) {
+          if (g_backend[i].ok || (grouped && grouped[i])) {
+            continue;
+          }
+          char reason_i[256];
+          const char *cons_i, *fix_i;
+          ir_explain_backend_reason(&g_backend[i], reason_i, sizeof(reason_i),
+                                    &cons_i, &fix_i);
+          size_t total_i = 0;
+          for (size_t j = i; j < g_backend_count; j++) {
+            if (g_backend[j].ok || (grouped && grouped[j])) {
+              continue;
+            }
+            char reason_j[256];
+            const char *cj, *fj;
+            ir_explain_backend_reason(&g_backend[j], reason_j,
+                                      sizeof(reason_j), &cj, &fj);
+            if (strcmp(reason_i, reason_j) == 0) {
+              total_i += g_backend[j].instructions;
+            }
+          }
+          if (best_first == (size_t)-1 || total_i > best_total) {
+            snprintf(best_reason, sizeof(best_reason), "%s", reason_i);
+            best_consequence = cons_i;
+            best_fix = fix_i;
+            best_total = total_i;
+            best_first = i;
+          }
+        }
+        if (best_first == (size_t)-1) {
+          break;
+        }
+
+        /* Render the group: header, consequence/fix once, then the largest
+         * members with sizes. */
+        size_t members = 0;
+        for (size_t j = best_first; j < g_backend_count; j++) {
+          if (g_backend[j].ok || (grouped && grouped[j])) {
+            continue;
+          }
+          char reason_j[256];
+          const char *cj, *fj;
+          ir_explain_backend_reason(&g_backend[j], reason_j, sizeof(reason_j),
+                                    &cj, &fj);
+          if (strcmp(best_reason, reason_j) == 0) {
+            members++;
+          }
+        }
+        ir_explain_emit("\n  %s%s%s (%zu function%s, %zu instructions):\n",
+                        clr(EXPLAIN_BOLD), best_reason, clr(EXPLAIN_RESET),
+                        members, members == 1 ? "" : "s", best_total);
+        if (best_consequence) {
+          ir_explain_emit("      %s%s consequence: %s%s\n", clr(EXPLAIN_DIM),
+                          glyph_elbow(), best_consequence,
+                          clr(EXPLAIN_RESET));
+        }
+        if (best_fix) {
+          ir_explain_emit("      %s%s fix: %s%s\n", clr(EXPLAIN_DIM),
+                          glyph_elbow(), best_fix, clr(EXPLAIN_RESET));
+        }
+        ir_explain_json_raw("%s{\"reason\":", json_group_count++ ? "," : "");
+        ir_explain_json_str(best_reason);
+        ir_explain_json_raw(",\"functions\":%zu,\"instructions\":%zu,"
+                            "\"consequence\":",
+                            members, best_total);
+        ir_explain_json_str(best_consequence);
+        ir_explain_json_raw(",\"fix\":");
+        ir_explain_json_str(best_fix);
+        ir_explain_json_raw(",\"members\":[");
+        size_t shown = 0;
+        char list[512];
+        size_t written = 0;
+        list[0] = '\0';
+        for (size_t j = best_first; j < g_backend_count && shown < 6; j++) {
+          if (g_backend[j].ok || (grouped && grouped[j])) {
+            continue;
+          }
+          char reason_j[256];
+          const char *cj, *fj;
+          ir_explain_backend_reason(&g_backend[j], reason_j, sizeof(reason_j),
+                                    &cj, &fj);
+          if (strcmp(best_reason, reason_j) != 0) {
+            continue;
+          }
+          int n = snprintf(list + written, sizeof(list) - written,
+                           "%s%s (%zu)", shown ? ", " : "",
+                           g_backend[j].function_name, g_backend[j].instructions);
+          if (n < 0 || (size_t)n >= sizeof(list) - written) {
+            break;
+          }
+          written += (size_t)n;
+          ir_explain_json_raw("%s{\"fn\":", shown ? "," : "");
+          ir_explain_json_str(g_backend[j].function_name);
+          ir_explain_json_raw(",\"instructions\":%zu}",
+                              g_backend[j].instructions);
+          shown++;
+        }
+        ir_explain_json_raw("]}");
+        ir_explain_emit("      %s%s %s%s%s%s\n", clr(EXPLAIN_DIM),
+                        glyph_elbow(),
+                        members > shown ? "largest: " : "", list,
+                        members > shown ? " ..." : "", clr(EXPLAIN_RESET));
+        if (members > shown) {
+          ir_explain_emit("      %s%s   ... and %zu more%s\n",
+                          clr(EXPLAIN_DIM), glyph_elbow(), members - shown,
+                          clr(EXPLAIN_RESET));
+        }
+        for (size_t j = best_first; j < g_backend_count; j++) {
+          if (g_backend[j].ok || (grouped && grouped[j])) {
+            continue;
+          }
+          char reason_j[256];
+          const char *cj, *fj;
+          ir_explain_backend_reason(&g_backend[j], reason_j, sizeof(reason_j),
+                                    &cj, &fj);
+          if (grouped && strcmp(best_reason, reason_j) == 0) {
+            grouped[j] = 1;
+          }
+        }
+        if (!grouped) {
+          break; /* allocation failed: rendered the largest group, stop */
+        }
+      }
+      free(grouped);
+    }
+    ir_explain_emit("\n");
   }
+
+  ir_explain_json_raw("]},");
 
   for (size_t i = 0; i < g_backend_count; i++) {
     free(g_backend[i].function_name);
@@ -653,6 +1503,8 @@ void ir_explain_backend_flush(void) {
   g_backend = NULL;
   g_backend_count = 0;
   g_backend_capacity = 0;
+
+  ir_explain_finalize(0);
 }
 
 /* ---- hypothesis clone ------------------------------------------------------
@@ -713,6 +1565,9 @@ void ir_explain_kernel_desc(const IRInstruction *ins, char *buf, size_t cap) {
     return;
   case IR_OP_SIMD_BYTE_MAP:
     snprintf(buf, cap, "32-wide byte map (AVX2)");
+    return;
+  case IR_OP_SIMD_FILL:
+    snprintf(buf, cap, "16-byte splat stores (vectorized fill/memset)");
     return;
   case IR_OP_SIMD_DOT_I32:
     snprintf(buf, cap, "vpmulld + vpaddd, 8-wide int32 dot product (AVX2)");

@@ -254,7 +254,11 @@ void ir_set_error(IRLoweringContext *context, const char *format, ...) {
 
 char *ir_new_temp_name(IRLoweringContext *context) {
   char buffer[64];
-  snprintf(buffer, sizeof(buffer), "t%d", context->next_temp_id++);
+  /* The '.' prefix keeps temp names out of the user-identifier namespace.
+   * Several backend tables (the MIR name->vreg map, float-bits marking) key on
+   * the bare name, so a temp named "t2" would alias a user local named "t2"
+   * and share its storage — a silent miscompile. */
+  snprintf(buffer, sizeof(buffer), ".t%d", context->next_temp_id++);
   return mettle_strdup(buffer);
 }
 

@@ -63,6 +63,9 @@ static const IROptNamedPass g_ir_pre_inline_passes[] = {
 
 static const IROptNamedPass g_ir_post_fixpoint_passes[] = {
     {"induction_pointer", ir_pointer_induction_pass},
+    /* After pointer induction so range-for fills (already converted to the
+     * pointer-walk form) and while-loop fills (still indexed) both match. */
+    {"simd_fill", ir_simd_fill_pass},
     {"prefix_sum_i32", ir_prefix_sum_i32_pass},
     {"simd_minmax_i32", ir_simd_minmax_i32_pass},
     {"simd_affine_map_float", ir_simd_affine_map_float_pass},
@@ -458,6 +461,11 @@ int ir_optimize_program_pipeline(IRProgram *program,
    * sorted report. (No-ops unless explain is enabled.) */
   ir_inline_explain_report_remaining(program);
   ir_explain_flush();
+  if (!contracts_ok) {
+    /* Compilation stops before codegen, so the backend flush (the normal
+     * report-routing point) never runs: print the buffered report now. */
+    ir_explain_finalize(1);
+  }
   ir_pass_time_report();
 
   ir_function_index_reset();

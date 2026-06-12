@@ -15,6 +15,7 @@
 #include "ir/ir.h"
 #include "ir/ir_optimize.h"
 #include "ir/ir_profile.h"
+#include "ir/ir_debug_hooks.h"
 #include "semantic/import_resolver.h"
 #include <ctype.h>
 #include <errno.h>
@@ -1316,6 +1317,10 @@ static int object_needs_profile_runtime(const char *object_path) {
   return object_needs_runtime_object(object_path, "mettle_profile_");
 }
 
+static int object_needs_debug_runtime(const char *object_path) {
+  return object_needs_runtime_object(object_path, "mettle_dbg_");
+}
+
 static int object_needs_tracy_helpers(const char *object_path) {
   return object_needs_runtime_object(object_path, "mettle_tracy_");
 }
@@ -1780,6 +1785,18 @@ static int mettle_link_object_file(const char *object_filename,
     needs_crash = 1;
   }
 
+  /* --debug-hooks: the program references mettle_dbg_* hooks resolved by the
+   * bundled debug runtime object (same auto-link pattern as the profiler).
+   * Stack buffers, so the error paths above/below need no extra frees. */
+  char debug_gcc_object[1024];
+  char debug_msvc_object[1024];
+  int needs_debug = object_needs_debug_runtime(object_filename) ||
+                    (options && options->debug_hooks);
+  snprintf(debug_gcc_object, sizeof(debug_gcc_object), "%s/debug.o",
+           runtime_directory);
+  snprintf(debug_msvc_object, sizeof(debug_msvc_object), "%s/debug.obj",
+           runtime_directory);
+
   int use_tracy = compiler_options_use_tracy(options);
   int needs_tracy_helpers =
       use_tracy || object_needs_tracy_helpers(object_filename);
@@ -1927,12 +1944,13 @@ static int mettle_link_object_file(const char *object_filename,
 
   if (linker_mode == LINKER_MODE_INTERNAL || linker_mode == LINKER_MODE_AUTO) {
     size_t object_capacity =
-        5u + (use_tracy ? 2u : (needs_tracy_helpers ? 1u : 0u)) +
+        6u + (use_tracy ? 2u : (needs_tracy_helpers ? 1u : 0u)) +
         (options ? options->link_argument_count : 0u);
     const char **object_paths = calloc(object_capacity, sizeof(const char *));
     const char *crash_object = NULL;
     const char *atomics_object = NULL;
     const char *profile_object = NULL;
+    const char *debug_object = NULL;
     char *startup_object = replace_extension(executable_filename, ".startup.obj");
     size_t object_count = 0u;
     int startup_ready = 0;
@@ -1998,6 +2016,23 @@ static int mettle_link_object_file(const char *object_filename,
           goto cleanup;
         }
       }
+      if (needs_debug) {
+        debug_object = (_access(debug_msvc_object, 0) == 0) ? debug_msvc_object
+                                                            : debug_gcc_object;
+        if (_access(debug_object, 0) != 0) {
+          fprintf(stderr,
+                  "Error: Bundled debug runtime object not found in '%s'\n",
+                  runtime_directory);
+          free(object_paths);
+          if (startup_object) {
+            if (startup_ready) {
+              _unlink(startup_object);
+            }
+            free(startup_object);
+          }
+          goto cleanup;
+        }
+      }
 
       object_paths[object_count++] = startup_object;
       object_paths[object_count++] = object_filename;
@@ -2009,6 +2044,9 @@ static int mettle_link_object_file(const char *object_filename,
       }
       if (profile_object) {
         object_paths[object_count++] = profile_object;
+      }
+      if (debug_object) {
+        object_paths[object_count++] = debug_object;
       }
       if (use_tracy) {
         object_paths[object_count++] = tracy_artifacts.helpers_object;
@@ -2060,7 +2098,7 @@ static int mettle_link_object_file(const char *object_filename,
   }
 
   if (has_gcc && linker_mode != LINKER_MODE_MSVC) {
-    const char *runtime_objects[5] = {NULL, NULL, NULL, NULL, NULL};
+    const char *runtime_objects[6] = {NULL, NULL, NULL, NULL, NULL, NULL};
     size_t runtime_object_count = 0u;
     if (needs_crash) {
       if (_access(crash_gcc_object, 0) != 0) {
@@ -2089,6 +2127,15 @@ static int mettle_link_object_file(const char *object_filename,
       }
       runtime_objects[runtime_object_count++] = profile_gcc_object;
     }
+    if (needs_debug) {
+      if (_access(debug_gcc_object, 0) != 0) {
+        fprintf(stderr,
+                "Error: Bundled debug runtime object not found in '%s'\n",
+                runtime_directory);
+        goto cleanup;
+      }
+      runtime_objects[runtime_object_count++] = debug_gcc_object;
+    }
     if (!use_tracy && needs_tracy_helpers && tracy_helpers_object) {
       runtime_objects[runtime_object_count++] = tracy_helpers_object;
     }
@@ -2101,7 +2148,7 @@ static int mettle_link_object_file(const char *object_filename,
   }
 
   if (has_link && linker_mode != LINKER_MODE_GCC) {
-    const char *runtime_objects[5] = {NULL, NULL, NULL, NULL, NULL};
+    const char *runtime_objects[6] = {NULL, NULL, NULL, NULL, NULL, NULL};
     size_t runtime_object_count = 0u;
     if (needs_crash) {
       const char *crash_object = (_access(crash_msvc_object, 0) == 0)
@@ -2138,6 +2185,18 @@ static int mettle_link_object_file(const char *object_filename,
         goto cleanup;
       }
       runtime_objects[runtime_object_count++] = profile_object;
+    }
+    if (needs_debug) {
+      const char *msvc_debug_object = (_access(debug_msvc_object, 0) == 0)
+                                          ? debug_msvc_object
+                                          : debug_gcc_object;
+      if (_access(msvc_debug_object, 0) != 0) {
+        fprintf(stderr,
+                "Error: Bundled debug runtime object not found in '%s'\n",
+                runtime_directory);
+        goto cleanup;
+      }
+      runtime_objects[runtime_object_count++] = msvc_debug_object;
     }
     if (!use_tracy && needs_tracy_helpers && tracy_helpers_object) {
       const char *stub_object =
@@ -2308,6 +2367,16 @@ int main(int argc, char *argv[]) {
       options.simd_report = 1;
     } else if (strcmp(argv[i], "--explain") == 0) {
       options.explain = 1;
+    } else if (strcmp(argv[i], "--explain-all") == 0) {
+      /* Whole-program report: no focus-file filter, so imported modules'
+       * loops and calls are analyzed too (stdlib included). */
+      options.explain = 1;
+      options.explain_all = 1;
+    } else if (strcmp(argv[i], "--explain-json") == 0) {
+      /* Machine-readable sidecar (<output-stem>.explain.json) alongside the
+       * prose report; implies --explain. */
+      options.explain = 1;
+      options.explain_json = 1;
     } else if (strcmp(argv[i], "--emit-ptx") == 0) {
       options.emit_ptx = 1;
     } else if (strcmp(argv[i], "-g") == 0 ||
@@ -2341,6 +2410,8 @@ int main(int argc, char *argv[]) {
       options.profile_runtime = 1;
     } else if (strcmp(argv[i], "--profile-runtime-ops") == 0) {
       options.profile_runtime_ops = 1;
+    } else if (strcmp(argv[i], "--debug-hooks") == 0) {
+      options.debug_hooks = 1;
     } else if (strcmp(argv[i], "--native-heap") == 0) {
       options.native_heap = 1;
     } else if (strcmp(argv[i], "--static") == 0) {
@@ -2601,7 +2672,11 @@ static int compile_optimize_ir(IRProgram *ir_program,
       options->profile_runtime ? 1 : 0;
   ir_optimize_options.simd_report = options->simd_report;
   ir_optimize_options.explain = options->explain;
-  ir_optimize_options.explain_focus_file = options->input_filename;
+  ir_optimize_options.explain_focus_file =
+      options->explain_all ? NULL : options->input_filename;
+  /* Large --explain reports divert to `<output-stem>.explain.txt`. */
+  ir_explain_set_output_path(options->output_filename);
+  ir_explain_set_json(options->explain_json ? 1 : 0);
   if (!ir_optimize_program(ir_program, &ir_optimize_options)) {
     /* A violated `@simd!` contract is a user error already printed with a
      * source location; don't bury it under a generic internal-error report. */
@@ -2796,6 +2871,7 @@ int compile_file(const char *input_filename, const char *output_filename,
                                      compiler_options_use_profile_runtime(options)
                                          ? 1
                                          : 0);
+  code_generator_set_debug_hooks(code_generator, options->debug_hooks ? 1 : 0);
   compiler_profile_add(&profile, PROFILE_PHASE_INIT, phase_start);
 
   int result = 0;
@@ -2966,6 +3042,32 @@ int compile_file(const char *input_filename, const char *output_filename,
     }
   }
 
+  /* --debug-hooks: interactive debugger instrumentation (enter/exit/line
+   * hooks + live-pointer variable registrations). Mutually exclusive with
+   * the profiler (both own the fn-id registry) and intended for -O0: the
+   * optimizer would move or delete the hooks. */
+  if (options->debug_hooks) {
+    if (compiler_options_use_profile_runtime(options)) {
+      fprintf(stderr,
+              "Error: --debug-hooks and --profile-runtime are mutually "
+              "exclusive\n");
+      result = 1;
+      goto cleanup;
+    }
+    if (options->optimize) {
+      fprintf(stderr,
+              "Error: --debug-hooks requires an unoptimized build (drop "
+              "--release/-O; optimized code moves and deletes the hooks)\n");
+      result = 1;
+      goto cleanup;
+    }
+    if (!ir_debug_hooks_instrument_program(ir_program)) {
+      fprintf(stderr, "Error: Failed to instrument IR for debugging\n");
+      result = 1;
+      goto cleanup;
+    }
+  }
+
   if (options->optimize) {
     compiler_set_phase(PROFILE_PHASE_IR_OPTIMIZATION);
     phase_start = compiler_profile_begin(&profile);
@@ -2989,7 +3091,7 @@ int compile_file(const char *input_filename, const char *output_filename,
    * too. Skipped for profile/tracy builds, whose instrumentation tables
    * enumerate every function. */
   if (options->building_executable && !options->tracy &&
-      !compiler_options_use_profile_runtime(options) &&
+      !compiler_options_use_profile_runtime(options) && !options->debug_hooks &&
       !ir_program_eliminate_dead_functions(ir_program)) {
     fprintf(stderr, "Error: Failed to eliminate dead functions\n");
     result = 1;
@@ -3184,7 +3286,11 @@ void print_usage(const char *program_name) {
   printf("  --simd-report       Report what each @simd loop became (needs -O/--release)\n");
   printf("  --explain           Report every optimization decision in the input file --\n"
          "                      loop vectorization and call inlining, with the reason\n"
-         "                      whenever the optimizer declined (needs -O/--release)\n");
+         "                      whenever the optimizer declined (needs -O/--release).\n"
+         "                      Re-runs lead with what CHANGED since the last build,\n"
+         "                      regressions first\n");
+  printf("  --explain-json      Also write <output-stem>.explain.json (machine-\n"
+         "                      readable report; implies --explain)\n");
   printf("  -g, --debug-symbols Generate debug symbols\n");
   printf("  -l, --line-mapping  Generate source line mapping\n");
   printf("  -s, --stack-trace   Embed runtime crash traceback support\n");
@@ -3200,6 +3306,8 @@ void print_usage(const char *program_name) {
          "(disables inlining)\n");
   printf("  --profile-runtime-ops  Emit runtime op-class counters per function "
          "(after optimization)\n");
+  printf("  --debug-hooks       Instrument for the interactive source-level "
+         "debugger (requires -O0; used by the editor's F5)\n");
   printf("  --native-heap       Route new/malloc/calloc/realloc/free through "
          "the Mettle allocator (std/alloc)\n");
   printf("  --static            On Linux, link executable statically\n");

@@ -12,6 +12,12 @@ static const char *mir_function_filename(FunctionDeclaration *fd) {
   return (fd && fd->body) ? fd->body->location.filename : NULL;
 }
 
+/* Non-nop IR size of the function currently in the eligibility gate, captured
+ * at gate entry so the dozens of bail sites can report it to --explain
+ * without each threading it through (the report ranks bailed functions by
+ * size -- that is where baseline codegen actually costs). */
+static size_t g_mir_gate_fn_size = 0;
+
 /* TEMPORARY instrumentation: with METTLE_MIR_TRACE set, log why a function is
  * rejected by the MIR eligibility gate, so the spill-everything-fallback work
  * list can be prioritized by real frequency. Returns 0 (ineligible). Also
@@ -22,7 +28,8 @@ static int mir_trace_bail(FunctionDeclaration *fd, const char *reason) {
             (fd && fd->name) ? fd->name : "?");
   }
   if (ir_explain_enabled() && fd && fd->name) {
-    ir_explain_backend_function(fd->name, mir_function_filename(fd), 0, reason);
+    ir_explain_backend_function(fd->name, mir_function_filename(fd), 0, reason,
+                                g_mir_gate_fn_size);
   }
   return 0;
 }
@@ -54,6 +61,9 @@ static int mir_name_is_global_scalar(CodeGenerator *g, const char *name) {
 
 typedef struct {
   const char *name; /* borrowed (interned IR string) */
+  int is_temp;      /* TEMP and SYMBOL operands are distinct namespaces: a
+                       compiler temp may share its bare name with a user
+                       local, and conflating them merges their storage */
   MirVregId vreg;
 } MirNameEntry;
 
@@ -70,10 +80,11 @@ static void mir_name_map_destroy(MirNameMap *m) {
 }
 
 static MirVregId mir_name_map_get_or_add(MirNameMap *m, MirFunction *fn,
-                                         const char *name, MirRegClass rclass,
-                                         int width) {
+                                         const char *name, int is_temp,
+                                         MirRegClass rclass, int width) {
   for (size_t i = 0; i < m->count; i++) {
-    if (strcmp(m->items[i].name, name) == 0) {
+    if (m->items[i].is_temp == is_temp &&
+        strcmp(m->items[i].name, name) == 0) {
       return m->items[i].vreg;
     }
   }
@@ -93,15 +104,17 @@ static MirVregId mir_name_map_get_or_add(MirNameMap *m, MirFunction *fn,
     return MIR_VREG_NONE;
   }
   m->items[m->count].name = name;
+  m->items[m->count].is_temp = is_temp;
   m->items[m->count].vreg = v;
   m->count++;
   return v;
 }
 
-/* True if `name` already has a vreg binding (param/local/cached global). */
+/* True if symbol `name` already has a vreg binding (param/local/cached
+ * global). Symbols only — temps live in a separate namespace. */
 static int mir_name_map_has(const MirNameMap *m, const char *name) {
   for (size_t i = 0; i < m->count; i++) {
-    if (strcmp(m->items[i].name, name) == 0) {
+    if (!m->items[i].is_temp && strcmp(m->items[i].name, name) == 0) {
       return 1;
     }
   }
@@ -141,7 +154,8 @@ static MirOperand mir_value_operand(MirFunction *fn, CodeGenerator *g,
     int fb = code_generator_binary_operand_float_bits(g, ctx, op);
     MirRegClass rc = fb ? MIR_RC_XMM : MIR_RC_GP;
     int w = fb ? fb / 8 : 8;
-    MirVregId v = mir_name_map_get_or_add(map, fn, op->name, rc, w);
+    MirVregId v = mir_name_map_get_or_add(map, fn, op->name,
+                                          op->kind == IR_OPERAND_TEMP, rc, w);
     return mir_op_vreg(v);
   }
   case IR_OPERAND_INT:
@@ -722,6 +736,14 @@ int mir_function_is_eligible(CodeGenerator *generator,
   if (!generator || !function_data || !ir_function) {
     return 0;
   }
+  g_mir_gate_fn_size = 0;
+  if (ir_explain_enabled()) {
+    for (size_t i = 0; i < ir_function->instruction_count; i++) {
+      if (ir_function->instructions[i].op != IR_OP_NOP) {
+        g_mir_gate_fn_size++;
+      }
+    }
+  }
   /* Kill switch for bisecting MIR vs legacy regressions. */
   {
     const char *off = getenv("METTLE_MIR");
@@ -824,14 +846,16 @@ int mir_function_is_eligible(CodeGenerator *generator,
   for (size_t i = 0; i < function_data->parameter_count; i++) {
     if (function_data->parameter_names[i]) {
       mir_name_map_get_or_add(&defined, &scratch_fn,
-                              function_data->parameter_names[i], MIR_RC_GP, 8);
+                              function_data->parameter_names[i], 0, MIR_RC_GP,
+                              8);
     }
   }
   for (size_t i = 0; i < ir_function->instruction_count; i++) {
     const IRInstruction *in = &ir_function->instructions[i];
     if (in->op == IR_OP_DECLARE_LOCAL && in->dest.kind == IR_OPERAND_SYMBOL &&
         in->dest.name) {
-      mir_name_map_get_or_add(&defined, &scratch_fn, in->dest.name, MIR_RC_GP, 8);
+      mir_name_map_get_or_add(&defined, &scratch_fn, in->dest.name, 0,
+                              MIR_RC_GP, 8);
     }
   }
   if (scratch_fn.has_error) {
@@ -1188,7 +1212,8 @@ int mir_function_is_eligible(CodeGenerator *generator,
   }
   if (ir_explain_enabled() && function_data->name) {
     ir_explain_backend_function(function_data->name,
-                                mir_function_filename(function_data), 1, NULL);
+                                mir_function_filename(function_data), 1, NULL,
+                                g_mir_gate_fn_size);
   }
   return 1;
 }
@@ -1509,7 +1534,7 @@ static int mir_emit_global_flush_names(MirFunction *fn, CodeGenerator *g,
       fn->has_error = 1;
       return 0;
     }
-    MirVregId v = mir_name_map_get_or_add(map, fn, name, MIR_RC_GP, 8);
+    MirVregId v = mir_name_map_get_or_add(map, fn, name, 0, MIR_RC_GP, 8);
     if (v == MIR_VREG_NONE) {
       return 0;
     }
@@ -1536,7 +1561,7 @@ static int mir_emit_global_reload_names(MirFunction *fn, CodeGenerator *g,
     }
     int is_signed =
         code_generator_binary_resolved_type_is_signed_integer(s->type);
-    MirVregId v = mir_name_map_get_or_add(map, fn, name, MIR_RC_GP, 8);
+    MirVregId v = mir_name_map_get_or_add(map, fn, name, 0, MIR_RC_GP, 8);
     if (v == MIR_VREG_NONE) {
       return 0;
     }
@@ -3207,7 +3232,7 @@ int code_generator_binary_emit_function_via_mir(
        * with no integer extension (field access reads within the struct size). */
       w = 8;
     }
-    MirVregId v = mir_name_map_get_or_add(&map, &fn, pname,
+    MirVregId v = mir_name_map_get_or_add(&map, &fn, pname, 0,
                                           pfb ? MIR_RC_XMM : MIR_RC_GP,
                                           pfb ? w : 8);
     if (v == MIR_VREG_NONE) {
@@ -3324,7 +3349,7 @@ int code_generator_binary_emit_function_via_mir(
       int is_signed =
           code_generator_binary_resolved_type_is_signed_integer(s->type);
       MirVregId v =
-          mir_name_map_get_or_add(&map, &fn, op->name, MIR_RC_GP, 8);
+          mir_name_map_get_or_add(&map, &fn, op->name, 0, MIR_RC_GP, 8);
       if (v == MIR_VREG_NONE) {
         goto oom;
       }

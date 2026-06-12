@@ -193,6 +193,10 @@ echo Compiling profile runtime (opt-in: --profile-runtime)...
 %CC% %CFLAGS% -c src\runtime\profile.c -o obj\runtime\profile.o
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
+echo Compiling debug runtime (opt-in: --debug-hooks)...
+%CC% %CFLAGS% -c src\runtime\debug.c -o obj\runtime\debug.o
+if %ERRORLEVEL% NEQ 0 exit /b 1
+
 echo Compiling Tracy helper stubs (opt-in: std/tracy without --tracy)...
 %CC% %CFLAGS% -c stdlib\tracy_helpers.c -o obj\runtime\tracy_helpers.o
 if %ERRORLEVEL% NEQ 0 exit /b 1
@@ -236,6 +240,8 @@ copy /Y obj\runtime\atomics.o bin\runtime\atomics.o >nul
 copy /Y obj\runtime\atomics.o bin\runtime\atomics.obj >nul
 copy /Y obj\runtime\profile.o bin\runtime\profile.o >nul
 copy /Y obj\runtime\profile.o bin\runtime\profile.obj >nul
+copy /Y obj\runtime\debug.o bin\runtime\debug.o >nul
+copy /Y obj\runtime\debug.o bin\runtime\debug.obj >nul
 copy /Y obj\runtime\tracy_helpers.o bin\runtime\tracy_helpers.o >nul
 copy /Y obj\runtime\tracy_helpers.o bin\runtime\tracy_helpers.obj >nul
 

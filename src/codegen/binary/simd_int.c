@@ -266,6 +266,302 @@ static int byte_map_emit_step_scalar(BinaryCodeBuffer *b, int op, int k) {
   }
 }
 
+/* Store the element in RAX's low bytes to [RCX], sized. */
+static int fill_emit_element_store(BinaryCodeBuffer *b, long long size) {
+  switch (size) {
+  case 1: return binary_emit_mov_mem_reg8(b, BINARY_GP_RCX, 0, BINARY_GP_RAX);
+  case 2: return binary_emit_mov_mem_reg16(b, BINARY_GP_RCX, 0, BINARY_GP_RAX);
+  case 4: return binary_emit_mov_mem_reg32(b, BINARY_GP_RCX, 0, BINARY_GP_RAX);
+  case 8: return binary_emit_mov_mem_reg(b, BINARY_GP_RCX, 0, BINARY_GP_RAX);
+  default: return 0;
+  }
+}
+
+/* Lower IR_OP_SIMD_FILL: store one invariant value into every element.
+ * Value -> 64-bit splat in RAX -> 16-byte pattern in xmm0; main loop stores
+ * 16 bytes per iteration (VEX.128: upper lanes zeroed, no vzeroupper
+ * needed), scalar element tail. Mode 0 counts elements against rhs=len
+ * (32-bit counters, matching every other kernel); mode 1 walks rhs-lhs
+ * bytes, replicating the scalar loop's `p < pend` semantics exactly --
+ * including a possible final partial-stride overshoot store, which the
+ * scalar loop also performs. */
+int code_generator_binary_emit_simd_fill(
+    CodeGenerator *generator, BinaryFunctionContext *context,
+    const IRInstruction *instruction) {
+  BinaryCodeBuffer *b = NULL;
+
+  if (!generator || !context || !instruction ||
+      instruction->argument_count < 5 ||
+      instruction->arguments[0].kind != IR_OPERAND_INT ||
+      instruction->arguments[1].kind != IR_OPERAND_INT) {
+    return 0;
+  }
+  b = &context->code;
+  long long size = instruction->arguments[0].int_value;
+  int mode = (int)instruction->arguments[1].int_value;
+  if (size != 1 && size != 2 && size != 4 && size != 8) {
+    return 0;
+  }
+  const IROperand *start_op = &instruction->arguments[3];
+  const IROperand *offset_op = &instruction->arguments[4];
+  int has_start = !(start_op->kind == IR_OPERAND_INT &&
+                    start_op->int_value == 0);
+  int has_offset = !(offset_op->kind == IR_OPERAND_INT &&
+                     offset_op->int_value == 0);
+
+  /* rcx = base/begin, r8 = bound/end, rax = value. */
+  if (!code_generator_binary_emit_operand_load(generator, context,
+                                               &instruction->lhs,
+                                               BINARY_GP_RCX) ||
+      !code_generator_binary_emit_operand_load(generator, context,
+                                               &instruction->rhs,
+                                               BINARY_GP_R8)) {
+    return 0;
+  }
+
+  if (mode == 0 && (has_start || has_offset)) {
+    /* r10 = start, r11 = offset. Elements = bound - start; first store at
+     * base + (offset + start) * size. Index math runs at the iv's width:
+     * 32-bit for int32 ivs (8-byte homes may carry garbage upper bits, and
+     * the result is sign-extended once for the address), 64-bit when the
+     * recognizer flagged an int64 iv in args[5]. */
+    int wide = instruction->argument_count > 5 &&
+               instruction->arguments[5].kind == IR_OPERAND_INT &&
+               instruction->arguments[5].int_value == 64;
+    if (!code_generator_binary_emit_operand_load(generator, context, start_op,
+                                                 BINARY_GP_R10) ||
+        !code_generator_binary_emit_operand_load(generator, context,
+                                                 offset_op, BINARY_GP_R11)) {
+      return 0;
+    }
+    if (wide) {
+      if (!wcs_sub_reg_reg64(b, BINARY_GP_R8, BINARY_GP_R10) ||
+          !wcs_add_reg_reg64(b, BINARY_GP_R11, BINARY_GP_R10) ||
+          !binary_emit_imul_reg_reg_imm32(b, BINARY_GP_R11, BINARY_GP_R11,
+                                          (uint32_t)size) ||
+          !wcs_add_reg_reg64(b, BINARY_GP_RCX, BINARY_GP_R11)) {
+        return 0;
+      }
+    } else {
+      if (!wcs_sub_reg_reg32(b, BINARY_GP_R8, BINARY_GP_R10) ||
+          !wcs_add_reg_reg32(b, BINARY_GP_R11, BINARY_GP_R10) ||
+          !binary_emit_movsxd_reg_reg32(b, BINARY_GP_R11, BINARY_GP_R11) ||
+          !binary_emit_imul_reg_reg_imm32(b, BINARY_GP_R11, BINARY_GP_R11,
+                                          (uint32_t)size) ||
+          !wcs_add_reg_reg64(b, BINARY_GP_RCX, BINARY_GP_R11)) {
+        return 0;
+      }
+    }
+  } else if (mode == 2) {
+    /* Byte-offset walk: rcx = base + start, r8 = bound - start (bytes,
+     * 64-bit; the int64 locals guarantee clean 8-byte homes). rdx keeps the
+     * starting rcx so a final-offset write-back can recover the distance
+     * walked. */
+    if (!code_generator_binary_emit_operand_load(generator, context, start_op,
+                                                 BINARY_GP_R10)) {
+      return 0;
+    }
+    if (!wcs_add_reg_reg64(b, BINARY_GP_RCX, BINARY_GP_R10) ||
+        !wcs_sub_reg_reg64(b, BINARY_GP_R8, BINARY_GP_R10) ||
+        !binary_emit_mov_reg_reg(b, BINARY_GP_RDX, BINARY_GP_RCX)) {
+      return 0;
+    }
+  }
+
+  if (!code_generator_binary_emit_operand_load(generator, context,
+                                               &instruction->arguments[2],
+                                               BINARY_GP_RAX)) {
+    return 0;
+  }
+
+  /* Build the 64-bit splat in RAX (low element stays the value, so the
+   * scalar tail stores RAX's low bytes directly). */
+  if (size == 1) {
+    if (!binary_emit_and_reg_imm32(b, BINARY_GP_RAX, 0xFF) ||
+        !binary_emit_imul_reg_reg_imm32(b, BINARY_GP_RAX, BINARY_GP_RAX,
+                                        0x01010101u)) {
+      return 0;
+    }
+  } else if (size == 2) {
+    if (!binary_emit_and_reg_imm32(b, BINARY_GP_RAX, 0xFFFF) ||
+        !binary_emit_imul_reg_reg_imm32(b, BINARY_GP_RAX, BINARY_GP_RAX,
+                                        0x00010001u)) {
+      return 0;
+    }
+  } else if (size == 4) {
+    if (!wcs_mov_reg_reg32(b, BINARY_GP_RAX, BINARY_GP_RAX)) {
+      return 0; /* zero-extend to a clean low half */
+    }
+  }
+  if (size != 8) {
+    /* high half = low half: r9 = rax; rax <<= 32; rax += r9. */
+    if (!binary_emit_mov_reg_reg(b, BINARY_GP_R9, BINARY_GP_RAX) ||
+        !binary_emit_shift_reg_imm8(b, 4 /* shl */, BINARY_GP_RAX, 32) ||
+        !wcs_add_reg_reg64(b, BINARY_GP_RAX, BINARY_GP_R9)) {
+      return 0;
+    }
+  }
+  /* xmm0 = the 64-bit pattern twice = the 16-byte fill block. */
+  if (!binary_emit_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) ||
+      !wcs_avx_vpunpcklqdq_xmm(b, 0, 0, 0)) {
+    return 0;
+  }
+
+  if (mode == 0) {
+    /* Element-counted: rdx = i, r8d = len; 16/size elements per vector
+     * store. A signed length guard first: `while (i < n)` with negative n
+     * runs zero iterations. */
+    long long per_vec = 16 / size;
+    size_t j_done_neg = 0, j_done = 0, j_vec = 0, j_scalar = 0;
+    size_t loop_top = 0;
+    /* 32-bit signed guard: counts are int32-ranged (like every kernel), and
+     * `while (i < n)` with n <= 0 runs zero iterations. */
+    if (!wcs_test_reg_reg32(b, BINARY_GP_R8) ||
+        !wcs_jcc(b, 0x8E /* jle */, &j_done_neg) ||
+        !wcs_xor_self32(b, BINARY_GP_RDX)) {
+      return 0;
+    }
+    loop_top = b->size;
+    if (!wcs_cmp_reg_reg32(b, BINARY_GP_RDX, BINARY_GP_R8) ||
+        !wcs_jcc(b, 0x83 /* jae */, &j_done)) {
+      return 0;
+    }
+    if (!wcs_mov_reg_reg32(b, BINARY_GP_R9, BINARY_GP_R8) ||
+        !wcs_sub_reg_reg32(b, BINARY_GP_R9, BINARY_GP_RDX) ||
+        !wcs_cmp_reg_imm32(b, BINARY_GP_R9, (uint32_t)per_vec) ||
+        !wcs_jcc(b, 0x83 /* jae */, &j_vec) ||
+        !wcs_jcc(b, 0, &j_scalar)) {
+      return 0;
+    }
+    if (!wcs_patch_here(b, j_vec) ||
+        !wcs_avx_vmovdqu_mem_xmm(b, BINARY_GP_RCX, 0, 0) ||
+        !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 16) ||
+        !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, (unsigned char)per_vec)) {
+      return 0;
+    }
+    {
+      size_t j_back = 0;
+      if (!wcs_jcc(b, 0, &j_back) || !wcs_patch_to(b, j_back, loop_top)) {
+        return 0;
+      }
+    }
+    if (!wcs_patch_here(b, j_scalar) ||
+        !fill_emit_element_store(b, size) ||
+        !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, (unsigned char)size) ||
+        !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 1)) {
+      return 0;
+    }
+    {
+      size_t j_back = 0;
+      if (!wcs_jcc(b, 0, &j_back) || !wcs_patch_to(b, j_back, loop_top)) {
+        return 0;
+      }
+    }
+    if (!wcs_patch_here(b, j_done) || !wcs_patch_here(b, j_done_neg)) {
+      return 0;
+    }
+    /* Live-after iv: the unit-stride loop leaves iv at max(start, bound);
+     * write that back exactly (correct for empty loops too). */
+    if (instruction->dest.kind == IR_OPERAND_SYMBOL && instruction->dest.name) {
+      int wide = instruction->argument_count > 5 &&
+                 instruction->arguments[5].kind == IR_OPERAND_INT &&
+                 instruction->arguments[5].int_value == 64;
+      if (!code_generator_binary_emit_operand_load(generator, context,
+                                                   &instruction->rhs,
+                                                   BINARY_GP_R9) ||
+          !code_generator_binary_emit_operand_load(generator, context,
+                                                   start_op, BINARY_GP_R10)) {
+        return 0;
+      }
+      if (wide) {
+        if (!binary_emit_cmp_reg_reg(b, BINARY_GP_R9, BINARY_GP_R10)) {
+          return 0;
+        }
+      } else {
+        if (!wcs_cmp_reg_reg32(b, BINARY_GP_R9, BINARY_GP_R10)) {
+          return 0;
+        }
+      }
+      /* r9 = bound; if bound < start, final = start. */
+      if (!binary_emit_cmovcc_reg_reg(b, 0x4C /* cmovl */, BINARY_GP_R9,
+                                      BINARY_GP_R10)) {
+        return 0;
+      }
+      if (!wide &&
+          !binary_emit_movsxd_reg_reg32(b, BINARY_GP_R9, BINARY_GP_R9)) {
+        return 0;
+      }
+      if (!code_generator_binary_emit_destination_store(
+              generator, context, &instruction->dest, BINARY_GP_R9)) {
+        return 0;
+      }
+    }
+    return 1;
+  }
+
+  /* Modes 1 and 2: byte-walked. r8 = byte length (mode 1 computes end -
+   * begin here; mode 2 arrived with it precomputed). 16-byte stores while
+   * at least 16 bytes remain; element tail while any bytes remain (the
+   * final element may overshoot the bound by up to size-1 bytes, exactly as
+   * the scalar `*p <- v; p += size` loop does). */
+  {
+    size_t j_done = 0, j_tail = 0;
+    size_t loop16_top = 0, tail_top = 0;
+    if (mode == 1 && !wcs_sub_reg_reg64(b, BINARY_GP_R8, BINARY_GP_RCX)) {
+      return 0;
+    }
+    loop16_top = b->size;
+    if (!binary_emit_cmp_reg_imm32(b, BINARY_GP_R8, 16) ||
+        !wcs_jcc(b, 0x8C /* jl */, &j_tail)) {
+      return 0;
+    }
+    if (!wcs_avx_vmovdqu_mem_xmm(b, BINARY_GP_RCX, 0, 0) ||
+        !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 16) ||
+        !wcs_addsub_reg_imm8(b, BINARY_GP_R8, 1, 16)) {
+      return 0;
+    }
+    {
+      size_t j_back = 0;
+      if (!wcs_jcc(b, 0, &j_back) || !wcs_patch_to(b, j_back, loop16_top)) {
+        return 0;
+      }
+    }
+    if (!wcs_patch_here(b, j_tail)) {
+      return 0;
+    }
+    tail_top = b->size;
+    if (!binary_emit_test_reg_reg(b, BINARY_GP_R8) ||
+        !wcs_jcc(b, 0x8E /* jle */, &j_done)) {
+      return 0;
+    }
+    if (!fill_emit_element_store(b, size) ||
+        !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, (unsigned char)size) ||
+        !wcs_addsub_reg_imm8(b, BINARY_GP_R8, 1, (unsigned char)size)) {
+      return 0;
+    }
+    {
+      size_t j_back = 0;
+      if (!wcs_jcc(b, 0, &j_back) || !wcs_patch_to(b, j_back, tail_top)) {
+        return 0;
+      }
+    }
+    if (!wcs_patch_here(b, j_done)) {
+      return 0;
+    }
+    /* Mode 2 with a live iv: final offset = start + bytes walked. */
+    if (mode == 2 && instruction->dest.kind == IR_OPERAND_SYMBOL &&
+        instruction->dest.name) {
+      if (!wcs_sub_reg_reg64(b, BINARY_GP_RCX, BINARY_GP_RDX) ||
+          !wcs_add_reg_reg64(b, BINARY_GP_RCX, BINARY_GP_R10) ||
+          !code_generator_binary_emit_destination_store(
+              generator, context, &instruction->dest, BINARY_GP_RCX)) {
+        return 0;
+      }
+    }
+    return 1;
+  }
+}
+
 /* Lower IR_OP_SIMD_BYTE_MAP: in-place apply the constant byte-op chain to
  * base[0..len-1], 16 bytes per VEX.128 iteration plus a scalar tail. */
 int code_generator_binary_emit_simd_byte_map(

@@ -256,6 +256,12 @@ Lexer *lexer_create(const char *source) {
 
   lexer->source = source;
   lexer->position = 0;
+  /* Skip a UTF-8 BOM (EF BB BF) at the very start of the input; Windows
+     editors (Notepad, PowerShell Set-Content -Encoding utf8) emit one. */
+  if ((unsigned char)source[0] == 0xEF && (unsigned char)source[1] == 0xBB &&
+      (unsigned char)source[2] == 0xBF) {
+    lexer->position = 3;
+  }
   lexer->line = 1;
   lexer->column = 1;
   lexer->length = strlen(source);

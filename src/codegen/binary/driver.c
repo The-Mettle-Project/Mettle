@@ -445,7 +445,7 @@ int code_generator_generate_program_binary_object(CodeGenerator *generator,
     }
   }
 
-  if (generator->profile_runtime &&
+  if ((generator->profile_runtime || generator->debug_hooks) &&
       !code_generator_binary_emit_profile_tables(generator)) {
     return 0;
   }

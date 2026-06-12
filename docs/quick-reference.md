@@ -122,8 +122,25 @@ main (call to `opaque` @ line 74): NOT inlined
 ```
 
 Nests are summarized (`vectorized inner, scalar outer`), fully unrolled loops
-say so, and a backend section reports which functions got the
-register-allocating backend (and why the rest fell back).
+say so, and a backend section reports register-allocation coverage weighted by
+instructions — with the fallbacks grouped by cause, largest functions first,
+and a `consequence:`/`fix:` line per cause (e.g. a function containing a SIMD
+kernel still runs the kernel at full vector speed; only its scalar code
+spills):
+
+```
+  1742/1850 functions reaching codegen compiled with the register-allocating backend
+  97.2% of the program's 215,012 optimized IR instructions are in register-allocated code
+
+  contains a call form the register allocator doesn't support yet (39 functions, 8,120 instructions):
+      └ consequence: every value in the function is kept on the stack instead of in registers
+      └ largest: editor_tick (1480), vk_scene_build (912) ...
+```
+
+Reports past ~200 lines (real applications) are written to
+`<output-stem>.explain.txt` next to the output binary, with a five-line digest
+on stderr (`METTLE_EXPLAIN_REPORT_LINES` overrides the threshold; `0` never
+diverts).
 
 Fix suggestions are **verified, not guessed**, where the compiler can prove
 them: it applies the suggested change to an internal clone, re-runs its own

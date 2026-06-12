@@ -5400,6 +5400,10 @@ int code_generator_binary_emit_instruction(
     return code_generator_binary_emit_simd_byte_map(generator, context,
                                                     instruction);
 
+  case IR_OP_SIMD_FILL:
+    return code_generator_binary_emit_simd_fill(generator, context,
+                                                instruction);
+
   case IR_OP_SIMD_DOT_I32:
     return code_generator_binary_emit_simd_dot_i32(generator, context,
                                                    instruction);

@@ -551,6 +551,7 @@ int code_generator_binary_emit_simd_scale_i32( CodeGenerator *generator, BinaryF
 int code_generator_binary_emit_simd_sum_i32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_sum_u8( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_byte_map( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
+int code_generator_binary_emit_simd_fill( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_prefix_sum_i32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_minmax_i32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_sum_f64( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
@@ -708,7 +709,9 @@ int wcs_psrlq_imm(BinaryCodeBuffer *b, int xmm, unsigned char imm);
 int wcs_shift_reg_imm(BinaryCodeBuffer *b, int gpr, int is_shr, unsigned char imm);
 int wcs_sse_66(BinaryCodeBuffer *b, unsigned char op, int dst, int src);
 int wcs_sse_66_38(BinaryCodeBuffer *b, unsigned char op, int dst, int src);
+int wcs_add_reg_reg32(BinaryCodeBuffer *b, int dst, int src);
 int wcs_sub_reg_reg32(BinaryCodeBuffer *b, int dst, int src);
+int wcs_sub_reg_reg64(BinaryCodeBuffer *b, int dst, int src);
 int wcs_test_reg_reg32(BinaryCodeBuffer *b, int gpr);
 int wcs_xor_self32(BinaryCodeBuffer *b, int gpr);
 

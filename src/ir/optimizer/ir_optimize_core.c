@@ -210,6 +210,7 @@ int ir_instruction_writes_symbol(const IRInstruction *instruction) {
   case IR_OP_CAST:
   case IR_OP_COUNT_WORD_STARTS:
   case IR_OP_MEMCPY_INLINE:
+  case IR_OP_SIMD_FILL: /* dest, when set, receives the final byte offset */
   case IR_OP_SIMD_SUM_I32:
   case IR_OP_SIMD_SUM_U8:
   case IR_OP_SIMD_MATMUL_N32:
@@ -258,6 +259,7 @@ int ir_instruction_writes_destination(const IRInstruction *instruction) {
   case IR_OP_CAST:
   case IR_OP_COUNT_WORD_STARTS:
   case IR_OP_MEMCPY_INLINE:
+  case IR_OP_SIMD_FILL: /* dest, when set, receives the final byte offset */
   case IR_OP_SIMD_SUM_I32:
   case IR_OP_SIMD_SUM_U8:
   case IR_OP_SIMD_MATMUL_N32:
@@ -1704,6 +1706,7 @@ int ir_collect_instruction_temp_uses(IRTempUseMap *uses,
   case IR_OP_SIMD_SUM_I32:
   case IR_OP_SIMD_SUM_U8:
   case IR_OP_SIMD_BYTE_MAP:
+  case IR_OP_SIMD_FILL:
   case IR_OP_SIMD_MATMUL_N32:
   case IR_OP_SIMD_INSERTION_SORT_I32:
   case IR_OP_SIMD_DOT_I32:

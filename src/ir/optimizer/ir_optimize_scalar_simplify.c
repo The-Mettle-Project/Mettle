@@ -2150,6 +2150,7 @@ int ir_instruction_has_side_effect(const IRInstruction *instruction) {
   case IR_OP_SIMD_SUM_I32:
   case IR_OP_SIMD_SUM_U8:
   case IR_OP_SIMD_BYTE_MAP:
+  case IR_OP_SIMD_FILL:
   case IR_OP_SIMD_MATMUL_N32:
   case IR_OP_SIMD_INSERTION_SORT_I32:
   case IR_OP_SIMD_DOT_I32:
@@ -2222,6 +2223,54 @@ int ir_symbol_read_after(const IRFunction *function, size_t start_index,
     if (ir_instruction_reads_symbol_operand(&function->instructions[i],
                                             symbol_name)) {
       return 1;
+    }
+  }
+  return 0;
+}
+
+/* Liveness of a loop's induction variable PAST the loop, for the SIMD
+ * recognizers (the fused kernels drop the iv). `exit_index` is the first
+ * instruction after the back jump -- usually the loop's own exit label.
+ * Unlike ir_symbol_read_after, a full redefinition (`i <- 0` starting the
+ * NEXT loop -- iv reuse is everywhere in real code) kills the value: later
+ * reads see the new definition, not the loop's final value. The scan is
+ * conservative: it trusts a redefinition only while control flow is still
+ * straight-line from the exit (one leading label allowed -- the exit label
+ * itself); any further label/branch/jump means other paths could observe
+ * the old value, and the answer falls back to "live". */
+int ir_symbol_live_after_loop(const IRFunction *function, size_t exit_index,
+                              const char *symbol_name) {
+  if (!function || !symbol_name) {
+    return 0;
+  }
+  int labels_seen = 0;
+  for (size_t i = exit_index; i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_NOP) {
+      continue;
+    }
+    if (ir_instruction_reads_symbol_operand(ins, symbol_name)) {
+      return 1;
+    }
+    if (ins->op == IR_OP_ASSIGN &&
+        ir_operand_is_symbol_named(&ins->dest, symbol_name)) {
+      return 0; /* fully redefined before any read: the old value is dead */
+    }
+    if (ins->op == IR_OP_RETURN) {
+      return 0;
+    }
+    if (ins->op == IR_OP_LABEL) {
+      if (labels_seen++ > 0) {
+        /* A join: another path may enter here and read the old value via
+         * code we will not scan in order. Fall back to the whole-function
+         * read scan. */
+        return ir_symbol_read_after(function, i, symbol_name);
+      }
+      continue;
+    }
+    if (ins->op == IR_OP_JUMP || ins->op == IR_OP_BRANCH_ZERO ||
+        ins->op == IR_OP_BRANCH_EQ) {
+      return ir_symbol_read_after(function, i, symbol_name);
     }
   }
   return 0;

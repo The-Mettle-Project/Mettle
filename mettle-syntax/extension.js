@@ -15,6 +15,9 @@ const path = require('path');
 const { execFile } = require('child_process');
 const fs = require('fs');
 const os = require('os');
+const { registerExplain } = require('./explain');
+const { registerLanguageFeatures } = require('./language');
+const { registerDebugAdapter } = require('./debugAdapter');
 
 /** @type {vscode.DiagnosticCollection} */
 let diagnosticCollection;
@@ -800,6 +803,48 @@ function activate(context) {
     }),
     vscode.commands.registerCommand('mettle.showOutput', () => {
       mettleOutputChannel?.show();
+    })
+  );
+
+  // Optimization report panel (+ .explain.txt links, inline loop hints).
+  const explain = registerExplain(context, {
+    findCompiler,
+    log: (line) => mettleOutputChannel?.appendLine(line),
+  });
+  context.subscriptions.push(
+    vscode.commands.registerCommand('mettle.showOptimizationReport', explain.showReport)
+  );
+
+  // Navigation and editing intelligence (definition, references, rename,
+  // symbols, completion, signature help, inlay hints, CodeLens, run/build).
+  const lang = registerLanguageFeatures(context, {
+    findCompiler,
+    log: (line) => mettleOutputChannel?.appendLine(line),
+  });
+  context.subscriptions.push(
+    vscode.commands.registerCommand('mettle.runFile', (uri) => lang.runFile(uri)),
+    vscode.commands.registerCommand('mettle.buildFile', (uri) => lang.buildFile(uri))
+  );
+
+  // Source-level debugger (F5): compiles with --debug-hooks and drives the
+  // instrumented runtime over a named pipe.
+  registerDebugAdapter(context, {
+    findCompiler,
+    log: (line) => mettleOutputChannel?.appendLine(line),
+  });
+  context.subscriptions.push(
+    vscode.commands.registerCommand('mettle.debugFile', (uri) => {
+      const program = uri?.fsPath || vscode.window.activeTextEditor?.document?.uri?.fsPath;
+      if (!program || !program.endsWith('.mettle')) {
+        vscode.window.showInformationMessage('Open a Mettle file to debug it.');
+        return;
+      }
+      vscode.debug.startDebugging(undefined, {
+        type: 'mettle',
+        request: 'launch',
+        name: `Debug ${path.basename(program)}`,
+        program,
+      });
     })
   );
 }

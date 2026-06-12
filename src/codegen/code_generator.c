@@ -146,6 +146,12 @@ void code_generator_set_profile_runtime(CodeGenerator *generator, int enable) {
   }
 }
 
+void code_generator_set_debug_hooks(CodeGenerator *generator, int enable) {
+  if (generator) {
+    generator->debug_hooks = enable ? 1 : 0;
+  }
+}
+
 int code_generator_register_profile_function(CodeGenerator *generator,
                                              const char *name,
                                              uint32_t *id_out) {

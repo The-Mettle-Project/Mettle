@@ -88,6 +88,26 @@ typedef enum {
    * count, dest = NONE. arguments hold the chain as (op_code INT, const INT)
    * pairs in application order; op_code is an IRByteMapOp. */
   IR_OP_SIMD_BYTE_MAP,
+  /* Constant/invariant fill (the memset/frame-clear class): store one value
+   * into every element of a buffer. Address modes, selected by arguments[1]
+   * (INT):
+   *   mode 0: lhs = base pointer, rhs = element BOUND; elements filled =
+   *           bound - start, first element at base + (offset+start)*size.
+   *           arguments[3] = start (the iv's entry value; INT 0 when the iv
+   *           provably starts at zero), arguments[4] = invariant index
+   *           offset (INT 0, a symbol, or a temp materialized just before
+   *           this op). 32-bit index math, like the loops it replaces.
+   *   mode 1: lhs = begin pointer symbol, rhs = end pointer symbol (byte
+   *           length = end - begin; the element tail may overshoot `end` by
+   *           up to size-1 bytes exactly as the scalar loop did)
+   *   mode 2: byte-offset walk `*(base + i) <- v; i += size` with 64-bit
+   *           locals: lhs = base (an int64 local), rhs = byte bound,
+   *           arguments[3] = start byte offset (iv entry value). Same tail
+   *           semantics as mode 1.
+   * arguments[0] = element size in bytes (1/2/4/8), arguments[2] = the fill
+   * value (INT immediate -- float fills carry their raw bit pattern -- or an
+   * invariant SYMBOL). dest = NONE. */
+  IR_OP_SIMD_FILL,
   /* Fixed 32x32 int32 matrix multiply. dest = c, lhs = a, rhs = b (pointers). */
   /* Reserved for an explicit 32x32 int32 SIMD matmul API. Do not introduce
    * this from ordinary source by function name or benchmark-shaped matching. */
@@ -275,6 +295,15 @@ typedef struct {
   uint64_t line;
 } IRProfileEntry;
 
+/* One debugger variable registration site (--debug-hooks): the name and
+ * type are embedded in binary tables and referenced by index, because a
+ * string-literal call argument's ABI differs between the MIR and fallback
+ * backends (flat cstring vs string-struct pointer). */
+typedef struct {
+  char *name;
+  char *type_name;
+} IRDebugLocalEntry;
+
 typedef struct {
   IRFunction **functions;
   size_t function_count;
@@ -282,6 +311,9 @@ typedef struct {
   IRProfileEntry *profile_entries;
   size_t profile_entry_count;
   size_t profile_entry_capacity;
+  IRDebugLocalEntry *debug_local_entries;
+  size_t debug_local_entry_count;
+  size_t debug_local_entry_capacity;
   /* Set once ir_program_eliminate_dead_functions has run. The binary backend
    * walks AST function declarations and treats a missing IR body as an
    * internal error; this flag tells it a missing body means "eliminated as

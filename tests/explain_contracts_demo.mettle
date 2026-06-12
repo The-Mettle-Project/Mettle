@@ -57,6 +57,28 @@ function sum_shorts_narrow(a: int16*, n: int32) -> int32 {
     return s;
 }
 
+// A driver loop: each iteration calls a function that CONTAINS a loop the
+// inliner structurally declines (`while` + multiply), and that loop stays
+// scalar (runtime-scalar broadcast has no kernel). The old report suggested
+// "mark it @inline" here; the simulation now runs the inliner with the
+// pretend flag, sees it refuse, and WITHDRAWS the advice instead of printing
+// a one-click fix that cannot work.
+function row_scale(x: float32*, w: float32*, y: float32*, n: int32, r: float32) {
+    var i: int32 = 0;
+    while (i < n) {
+        y[i] = x[i] * r * w[i];
+        i = i + 1;
+    }
+}
+
+function scale_rows(a: float32*, w: float32*, rows: int32, n: int32, r: float32) {
+    var m: int32 = 0;
+    while (m < rows) {
+        row_scale(&a[m * n], w, &a[m * n], n, r);
+        m = m + 1;
+    }
+}
+
 function main() -> int32 {
     var ys: float32[64];
     var iv: int32[64];
@@ -69,8 +91,9 @@ function main() -> int32 {
         i = i + 1;
     }
     apply_damp(&ys[0], 64);
+    scale_rows(&ys[0], &ys[0], 8, 8, 0.5);
     var t: int32 = apply_bias(&iv[0], 64, 7) + sum_shorts_narrow(&sh[0], 64);
-    var nf: float32 = norm2(3.0, 4.0) + chain(1.0);
+    var nf: float32 = norm2(3.0, 4.0) + chain(1.0) + ys[0];
     var u: int32 = opaque(t + (int32)nf);
     return u - u;
 }
