@@ -124,6 +124,18 @@ int simd_emit_prefixed_xmm_mem_disp(BinaryCodeBuffer *b, unsigned char prefix,
                                     unsigned char opcode, int xmm, int gpr,
                                     int displacement);
 
+/* ---- find/search kernel helpers ---- */
+int wcs_cmp_reg_reg64(BinaryCodeBuffer *b, int dst, int src);
+int wcs_xor_reg_imm32(BinaryCodeBuffer *b, int gpr, uint32_t imm);
+int wcs_bsf_reg_reg32(BinaryCodeBuffer *b, int dst, int src);
+int wcs_movzx_reg_byte_mem(BinaryCodeBuffer *b, int gpr, int base);
+int wcs_avx_vpcmpeqd_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);
+int wcs_avx_vpcmpgtd_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);
+int wcs_avx_vpcmpeqb_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);
+int wcs_avx_vpbroadcastb_ymm(BinaryCodeBuffer *b, int dst, int src_xmm);
+int wcs_avx_vmovmskps_reg_ymm(BinaryCodeBuffer *b, int gpr, int ymm);
+int wcs_avx_vpmovmskb_reg_ymm(BinaryCodeBuffer *b, int gpr, int ymm);
+
 /* ---- broadcasts & horizontal reductions ---- */
 int wcs_avx_vmovd_xmm_reg(BinaryCodeBuffer *b, int xmm, int gpr);
 int wcs_avx_vmovd_xmm_mem(BinaryCodeBuffer *b, int dst, int base, int disp);

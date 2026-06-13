@@ -1085,6 +1085,89 @@ int wcs_avx_vpor_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
              b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (s2 & 7)));
 }
 
+/* REX.W 39 /r — cmp r64, r64 (flags from dst - src). */
+int wcs_cmp_reg_reg64(BinaryCodeBuffer *b, int dst, int src) {
+  return binary_emit_rex(b, 1, src >> 3, 0, dst >> 3) &&
+         binary_code_buffer_append_u8(b, 0x39) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((src & 7) << 3) | (dst & 7)));
+}
+
+/* 81 /6 id — xor r32, imm32 (32-bit op: also zeroes the high dword). */
+int wcs_xor_reg_imm32(BinaryCodeBuffer *b, int gpr, uint32_t imm) {
+  return binary_emit_rex(b, 0, 0, 0, gpr >> 3) &&
+         binary_code_buffer_append_u8(b, 0x81) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | (6 << 3) | (gpr & 7))) &&
+         binary_code_buffer_append_u32(b, imm);
+}
+
+/* 0F BC /r — bsf r32, r32 (index of lowest set bit; src must be nonzero). */
+int wcs_bsf_reg_reg32(BinaryCodeBuffer *b, int dst, int src) {
+  return binary_emit_rex(b, 0, dst >> 3, 0, src >> 3) &&
+         binary_code_buffer_append_u8(b, 0x0F) &&
+         binary_code_buffer_append_u8(b, 0xBC) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (src & 7)));
+}
+
+/* 0F B6 /r — movzx r32, byte [base] (any base; SIB/disp handled). */
+int wcs_movzx_reg_byte_mem(BinaryCodeBuffer *b, int gpr, int base) {
+  return binary_emit_rex(b, 0, gpr >> 3, 0, base >> 3) &&
+         binary_code_buffer_append_u8(b, 0x0F) &&
+         binary_code_buffer_append_u8(b, 0xB6) &&
+         wcs_avx_modrm_mem_disp(b, gpr, base, 0);
+}
+
+/* vpcmpeqd ymm_dst, ymm_s1, ymm_s2 — VEX.256.66.0F.WIG 76 /r. Lane = all-ones
+ * when the int32 lanes are equal. */
+int wcs_avx_vpcmpeqd_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
+  return wcs_vex3(b, 1, 1, 1, 0, dst, s2, s1) &&
+         binary_code_buffer_append_u8(b, 0x76) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (s2 & 7)));
+}
+
+/* vpcmpgtd ymm_dst, ymm_s1, ymm_s2 — VEX.256.66.0F.WIG 66 /r. SIGNED s1 > s2. */
+int wcs_avx_vpcmpgtd_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
+  return wcs_vex3(b, 1, 1, 1, 0, dst, s2, s1) &&
+         binary_code_buffer_append_u8(b, 0x66) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (s2 & 7)));
+}
+
+/* vpcmpeqb ymm_dst, ymm_s1, ymm_s2 — VEX.256.66.0F.WIG 74 /r. */
+int wcs_avx_vpcmpeqb_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
+  return wcs_vex3(b, 1, 1, 1, 0, dst, s2, s1) &&
+         binary_code_buffer_append_u8(b, 0x74) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (s2 & 7)));
+}
+
+/* vpbroadcastb ymm, xmm — VEX.256.66.0F38.W0 78 /r. */
+int wcs_avx_vpbroadcastb_ymm(BinaryCodeBuffer *b, int dst, int src_xmm) {
+  return wcs_vex3(b, 2, 1, 1, 0, dst, src_xmm, 0) &&
+         binary_code_buffer_append_u8(b, 0x78) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (src_xmm & 7)));
+}
+
+/* vmovmskps r32, ymm — VEX.256.0F.WIG 50 /r. One bit per dword lane (8). */
+int wcs_avx_vmovmskps_reg_ymm(BinaryCodeBuffer *b, int gpr, int ymm) {
+  return wcs_vex3(b, 1, 0, 1, 0, gpr, ymm, 0) &&
+         binary_code_buffer_append_u8(b, 0x50) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((gpr & 7) << 3) | (ymm & 7)));
+}
+
+/* vpmovmskb r32, ymm — VEX.256.66.0F.WIG D7 /r. One bit per byte lane (32). */
+int wcs_avx_vpmovmskb_reg_ymm(BinaryCodeBuffer *b, int gpr, int ymm) {
+  return wcs_vex3(b, 1, 1, 1, 0, gpr, ymm, 0) &&
+         binary_code_buffer_append_u8(b, 0xD7) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((gpr & 7) << 3) | (ymm & 7)));
+}
+
 /* Broadcast a 32-bit GPR value across all eight lanes of a ymm register. */
 int wcs_broadcast_i32_to_ymm(BinaryCodeBuffer *b, int ymm, int gpr) {
   return wcs_avx_vmovd_xmm_reg(b, ymm, gpr) &&

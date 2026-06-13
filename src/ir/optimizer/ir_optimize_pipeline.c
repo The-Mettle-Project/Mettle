@@ -75,6 +75,7 @@ static const IROptNamedPass g_ir_post_fixpoint_passes[] = {
     {"simd_sum_float", ir_simd_sum_float_pass},
     {"auto_vectorize", ir_auto_vectorize_pass},
     {"auto_vectorize_int", ir_auto_vectorize_int_pass},
+    {"auto_vectorize_find", ir_auto_vectorize_find_pass},
     {"outer_vectorize", ir_outer_vectorize_pass},
     {"simd_memory_map", ir_simd_memory_map_pass},
     {"lower_bound_i32", ir_lower_bound_i32_pass},

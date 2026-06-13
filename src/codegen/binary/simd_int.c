@@ -1951,3 +1951,248 @@ int code_generator_binary_emit_simd_minmax_i32(
   }
   return 1;
 }
+
+/* -------------------------------------------------------------------------- */
+/* Vectorized search skip-ahead (IR_OP_SIMD_FIND).                             */
+/*                                                                             */
+/* Computes dest(iv) = the exact first index in [0, n) where the loop's exit   */
+/* predicate `a[i] PRED rhs` holds, else n. The original scalar loop survives  */
+/* and re-runs from that index (see the opcode doc in ir.h), so this kernel    */
+/* never reconstructs control flow -- it only fast-forwards the counter.      */
+/*                                                                             */
+/* Structure: a scalar HEAD walks elements until `a` is 32-byte aligned, then  */
+/* the vector loop tests whole ALIGNED 32-byte blocks (8 int32 / 32 bytes per  */
+/* step) with vpcmpeq/vpcmpgt + movemask, stopping at the first hit block and  */
+/* resolving the exact lane with bsf. Alignment is the soundness trick for     */
+/* sentinel searches (n overstates the valid buffer, e.g. strlen with a huge   */
+/* bound): an aligned block never crosses a page boundary, so every block      */
+/* loaded lies in a page the scalar loop itself would touch (all lanes before  */
+/* the hit, plus the hit's own page), and no block after the hit's is read.    */
+/* The remaining sub-block tail is left to the surviving scalar loop.          */
+/*                                                                             */
+/* Registers: RCX walks a, RDX walks b (two-array form), R8 = key (GP),        */
+/* R9 = head element scratch, R10 = n, R11 = i (the result), RAX = scratch /   */
+/* masks. ymm1 = broadcast key, ymm0/ymm2 = blocks. All volatile.              */
+#define VFIND_EQ 0
+#define VFIND_NE 1
+#define VFIND_LT 2
+#define VFIND_GT 3
+#define VFIND_LE 4
+#define VFIND_GE 5
+
+/* jcc condition for `cmp elem32, key32` taking the HIT branch (signed forms
+ * for the ordered predicates; the recognizer gates signedness). */
+static unsigned char vfind_hit_cc(int pred) {
+  switch (pred) {
+  case VFIND_EQ: return 0x84; /* je */
+  case VFIND_NE: return 0x85; /* jne */
+  case VFIND_LT: return 0x8C; /* jl */
+  case VFIND_GT: return 0x8F; /* jg */
+  case VFIND_LE: return 0x8E; /* jle */
+  default: return 0x8D;       /* jge */
+  }
+}
+
+int code_generator_binary_emit_simd_find(CodeGenerator *generator,
+                                         BinaryFunctionContext *context,
+                                         const IRInstruction *instruction) {
+  BinaryCodeBuffer *b = NULL;
+  if (!generator || !context || !instruction ||
+      instruction->argument_count != 4 || !instruction->arguments ||
+      instruction->dest.kind != IR_OPERAND_SYMBOL ||
+      instruction->rhs.kind != IR_OPERAND_SYMBOL) {
+    code_generator_set_error(generator, "Malformed simd_find");
+    return 0;
+  }
+  b = &context->code;
+  const IROperand *args = instruction->arguments;
+  int pred = (int)args[0].int_value;
+  int u8 = (int)args[1].int_value == 1;
+  int rhs_kind = (int)args[2].int_value;
+  const IROperand *rhs = &args[3];
+  const int lanes = u8 ? 32 : 8;
+  const int esz = u8 ? 1 : 4;
+  const int two_arrays = (rhs_kind == 2);
+  const int invert_mask = (pred == VFIND_NE || pred == VFIND_LE ||
+                           pred == VFIND_GE);
+  const uint32_t full_mask = u8 ? 0xFFFFFFFFu : 0xFFu;
+  if (pred < VFIND_EQ || pred > VFIND_GE || rhs_kind < 0 || rhs_kind > 2 ||
+      (u8 && pred != VFIND_EQ && pred != VFIND_NE)) {
+    code_generator_set_error(generator, "Bad simd_find encoding");
+    return 0;
+  }
+
+  /* ---- setup ---- */
+  if (!code_generator_binary_emit_operand_load(generator, context,
+                                               &instruction->lhs,
+                                               BINARY_GP_R10) || /* n */
+      !code_generator_binary_emit_operand_load(generator, context,
+                                               &instruction->rhs,
+                                               BINARY_GP_RCX)) { /* a */
+    return 0;
+  }
+  if (two_arrays) {
+    if (!code_generator_binary_emit_operand_load(generator, context, rhs,
+                                                 BINARY_GP_RDX)) { /* b */
+      return 0;
+    }
+  } else if (rhs_kind == 0) { /* literal key (range-gated by the recognizer) */
+    if (!binary_emit_mov_reg_imm64(b, BINARY_GP_R8,
+                                   (uint64_t)rhs->int_value)) {
+      return 0;
+    }
+  } else { /* invariant scalar key (type-gated: extension matches the width) */
+    if (!code_generator_binary_emit_operand_load(generator, context, rhs,
+                                                 BINARY_GP_R8)) {
+      return 0;
+    }
+  }
+  if (!two_arrays) { /* broadcast the key once: ymm1 */
+    if (u8) {
+      if (!wcs_avx_vmovd_xmm_reg(b, 1, BINARY_GP_R8) ||
+          !wcs_avx_vpbroadcastb_ymm(b, 1, 1)) {
+        return 0;
+      }
+    } else if (!wcs_broadcast_i32_to_ymm(b, 1, BINARY_GP_R8)) {
+      return 0;
+    }
+  }
+  if (!binary_emit_mov_reg_imm64(b, BINARY_GP_R11, 0)) { /* i = 0 */
+    return 0;
+  }
+
+  size_t to_done[3];
+  size_t n_done = 0;
+
+  /* ---- scalar head: until `a` is 32-byte aligned (or i == n / a hit) ---- */
+  size_t head_top = b->size;
+  size_t j_vec = 0;
+  if (!binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, 31) ||
+      !wcs_and_reg_reg(b, BINARY_GP_RAX, BINARY_GP_RCX) ||
+      !wcs_jcc(b, 0x84 /* jz -> vector loop */, &j_vec)) {
+    return 0;
+  }
+  if (!wcs_cmp_reg_reg64(b, BINARY_GP_R11, BINARY_GP_R10) ||
+      !wcs_jcc(b, 0x8D /* jge -> done (i >= n) */, &to_done[n_done])) {
+    return 0;
+  }
+  n_done++;
+  if (u8) {
+    if (!wcs_movzx_reg_byte_mem(b, BINARY_GP_R9, BINARY_GP_RCX)) {
+      return 0;
+    }
+  } else if (!code_generator_binary_emit_load_from_address(
+                 generator, context, BINARY_GP_RCX, 4, BINARY_GP_R9)) {
+    return 0;
+  }
+  if (two_arrays) {
+    int ok = u8 ? wcs_movzx_reg_byte_mem(b, BINARY_GP_RAX, BINARY_GP_RDX)
+                : code_generator_binary_emit_load_from_address(
+                      generator, context, BINARY_GP_RDX, 4, BINARY_GP_RAX);
+    if (!ok || !wcs_cmp_reg_reg32(b, BINARY_GP_R9, BINARY_GP_RAX)) {
+      return 0;
+    }
+  } else if (!wcs_cmp_reg_reg32(b, BINARY_GP_R9, BINARY_GP_R8)) {
+    return 0;
+  }
+  if (!wcs_jcc(b, vfind_hit_cc(pred), &to_done[n_done])) { /* hit at i */
+    return 0;
+  }
+  n_done++;
+  if (!wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, (unsigned char)esz) ||
+      (two_arrays &&
+       !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, (unsigned char)esz)) ||
+      !wcs_addsub_reg_imm8(b, BINARY_GP_R11, 0, 1)) {
+    return 0;
+  }
+  {
+    size_t j_back = 0;
+    if (!wcs_jcc(b, 0, &j_back) || !wcs_patch_to(b, j_back, head_top)) {
+      return 0;
+    }
+  }
+
+  /* ---- vector loop over aligned 32-byte blocks ---- */
+  if (!wcs_patch_here(b, j_vec)) {
+    return 0;
+  }
+  size_t vec_top = b->size;
+  size_t j_hit = 0;
+  if (!binary_emit_mov_reg_reg(b, BINARY_GP_RAX, BINARY_GP_R10) ||
+      !wcs_sub_reg_reg64(b, BINARY_GP_RAX, BINARY_GP_R11) ||
+      !wcs_cmp_reg_imm8(b, BINARY_GP_RAX, (unsigned char)lanes) ||
+      !wcs_jcc(b, 0x8C /* jl -> done (remaining < lanes; n may be < 0) */,
+               &to_done[n_done])) {
+    return 0;
+  }
+  n_done++;
+  if (!wcs_avx_vmovups_ymm_mem(b, 0, BINARY_GP_RCX, 0)) {
+    return 0;
+  }
+  if (two_arrays && !wcs_avx_vmovups_ymm_mem(b, 2, BINARY_GP_RDX, 0)) {
+    return 0;
+  }
+  {
+    int src2 = two_arrays ? 2 : 1;
+    int ok = 0;
+    switch (pred) {
+    case VFIND_EQ:
+    case VFIND_NE:
+      ok = u8 ? wcs_avx_vpcmpeqb_ymm(b, 0, 0, src2)
+              : wcs_avx_vpcmpeqd_ymm(b, 0, 0, src2);
+      break;
+    case VFIND_GT:
+    case VFIND_LE:
+      ok = wcs_avx_vpcmpgtd_ymm(b, 0, 0, src2);
+      break;
+    default: /* LT / GE: src2 > a */
+      ok = wcs_avx_vpcmpgtd_ymm(b, 0, src2, 0);
+      break;
+    }
+    if (!ok) {
+      return 0;
+    }
+  }
+  if (!(u8 ? wcs_avx_vpmovmskb_reg_ymm(b, BINARY_GP_RAX, 0)
+           : wcs_avx_vmovmskps_reg_ymm(b, BINARY_GP_RAX, 0))) {
+    return 0;
+  }
+  if (invert_mask && !wcs_xor_reg_imm32(b, BINARY_GP_RAX, full_mask)) {
+    return 0;
+  }
+  if (!wcs_test_reg_reg32(b, BINARY_GP_RAX) ||
+      !wcs_jcc(b, 0x85 /* jnz -> hit block */, &j_hit)) {
+    return 0;
+  }
+  if (!wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 32) ||
+      (two_arrays && !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 32)) ||
+      !wcs_addsub_reg_imm8(b, BINARY_GP_R11, 0, (unsigned char)lanes)) {
+    return 0;
+  }
+  {
+    size_t j_back = 0;
+    if (!wcs_jcc(b, 0, &j_back) || !wcs_patch_to(b, j_back, vec_top)) {
+      return 0;
+    }
+  }
+
+  /* hit block: resolve the exact first lane. */
+  if (!wcs_patch_here(b, j_hit) ||
+      !wcs_bsf_reg_reg32(b, BINARY_GP_RAX, BINARY_GP_RAX) ||
+      !wcs_add_reg_reg64(b, BINARY_GP_R11, BINARY_GP_RAX)) {
+    return 0;
+  }
+
+  /* done: i is the result (high bits are zero; <= n fits every int home). */
+  for (size_t k = 0; k < n_done; k++) {
+    if (!wcs_patch_here(b, to_done[k])) {
+      return 0;
+    }
+  }
+  if (!wcs_avx_vzeroupper(b)) {
+    return 0;
+  }
+  return code_generator_binary_emit_destination_store(generator, context,
+                                                      &instruction->dest,
+                                                      BINARY_GP_R11);
+}

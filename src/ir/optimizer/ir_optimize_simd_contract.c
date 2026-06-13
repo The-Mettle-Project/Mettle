@@ -84,6 +84,51 @@ static int ir_region_vectorized_op(const IRFunction *function, size_t begin,
   return ins ? (int)ins->op : -1;
 }
 
+/* The find skip-ahead vectorizes a search loop WITHOUT removing it: the
+ * counter's init (which sits BEFORE a while-loop's marker region) becomes an
+ * IR_OP_SIMD_FIND and the surviving scalar loop replays only the hit
+ * iteration. Detect it so @simd contracts and the --explain report credit
+ * the loop as vectorized: find the region's loop counter (the header
+ * compare's lhs) and walk the straight-line code above the region for the
+ * SIMD_FIND that initializes it. */
+static const IRInstruction *ir_region_skipahead_ins(const IRFunction *function,
+                                                    size_t begin, size_t end) {
+  const char *iv = NULL;
+  for (size_t i = begin + 1; i < end && !iv; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op != IR_OP_LABEL || !ir_label_is_while_header(ins->text)) {
+      continue;
+    }
+    for (size_t k = i + 1; k < end; k++) {
+      const IRInstruction *c = &function->instructions[k];
+      if (c->op == IR_OP_NOP) {
+        continue;
+      }
+      if (c->op == IR_OP_BINARY && c->lhs.kind == IR_OPERAND_SYMBOL &&
+          c->lhs.name) {
+        iv = c->lhs.name;
+      }
+      break;
+    }
+  }
+  if (!iv) {
+    return NULL;
+  }
+  for (size_t i = begin + 1; i-- > 0;) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_SIMD_FIND && ins->dest.kind == IR_OPERAND_SYMBOL &&
+        ins->dest.name && strcmp(ins->dest.name, iv) == 0) {
+      return ins;
+    }
+    if (ins->op == IR_OP_LABEL ||
+        (ir_instruction_writes_destination(ins) &&
+         ir_operand_is_symbol_named(&ins->dest, iv))) {
+      return NULL;
+    }
+  }
+  return NULL;
+}
+
 /* True when (begin, end) still contains a loop header label -- i.e. an actual
  * loop survived optimization. A region with markers but no loop label was
  * fully unrolled (constant trip count) or removed outright. */
@@ -517,13 +562,16 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
     }
     if (has_return_in_body || outward_branches > 1) {
       snprintf(reason, reason_cap,
-               "the loop can exit before its trip count (a compare/search "
-               "shape); SIMD runs all iterations in lockstep, so an early "
-               "exit defeats it");
+               "the loop can exit before its trip count, and its body does "
+               "more than test the exit condition; the search skip-ahead "
+               "kernel only covers pure find/mismatch loops (it must be safe "
+               "to skip the iterations before the first hit)");
       snprintf(fix, fix_cap,
-               "usually nothing: when the early exit is the point (find, "
-               "compare, parse), the scalar loop is the right code -- "
-               "vectorizing it needs a dedicated kernel, not a source change");
+               "pure searches DO vectorize: `if (a[i] == key) ...` (or != < > "
+               "<= >=, key a constant/variable, or a[i] != b[i]) with nothing "
+               "else in the body becomes an 8-wide compare+movemask scan -- "
+               "split any per-iteration work out of this loop, or hoist the "
+               "search into its own loop and process from the found index");
       IR_SIMD_SET_DIAG(IR_SIMD_BAIL_EARLY_EXIT);
       return;
     }
@@ -1255,6 +1303,9 @@ static void ir_explain_report_loops(const IRFunction *function,
     }
     const IRInstruction *own =
         ir_region_vectorized_ins(function, L->begin, L->end, 0);
+    if (!own) {
+      own = ir_region_skipahead_ins(function, L->begin, L->end);
+    }
     const IRInstruction *any =
         own ? own : ir_region_vectorized_ins(function, L->begin, L->end, 1);
 
@@ -1474,6 +1525,9 @@ int ir_verify_simd_contracts(IRFunction *function) {
     }
 
     int vec_op = ir_region_vectorized_op(function, begin_index, i);
+    if (vec_op < 0 && ir_region_skipahead_ins(function, begin_index, i)) {
+      vec_op = (int)IR_OP_SIMD_FIND;
+    }
     if (vec_op >= 0) {
       if (g_simd_report) {
         fprintf(stderr, "%s:%zu:%zu: note: @simd loop vectorized (%s)\n", file,

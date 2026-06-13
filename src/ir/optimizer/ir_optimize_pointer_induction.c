@@ -472,6 +472,12 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
     return 1;
   }
 
+  /* Same for early-exit search loops the find skip-ahead claims: it needs the
+   * indexed `a + (iv << 2)` / `a + iv` form to recognize the predicate. */
+  if (ir_auto_vectorize_find_claimable(function, header_index)) {
+    return 1;
+  }
+
   /* Set when an iv-indexed access cannot be converted to a pointer-walk (its
    * base is not an i32 ptr param — e.g. a local pointer like (int32*)&G[off]).
    * Such an access keeps the induction variable (and its `iv << 2` byte-offset

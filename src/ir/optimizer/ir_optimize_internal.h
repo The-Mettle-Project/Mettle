@@ -607,6 +607,8 @@ int ir_simd_exp_f32_pass(IRFunction *function, int *changed);
 int ir_simd_i2f_reduce_pass(IRFunction *function, int *changed);
 int ir_auto_vectorize_pass(IRFunction *function, int *changed);
 int ir_auto_vectorize_int_pass(IRFunction *function, int *changed);
+int ir_auto_vectorize_find_pass(IRFunction *function, int *changed);
+int ir_auto_vectorize_find_claimable(IRFunction *function, size_t header_index);
 /* Read-only probe: 1 if the int auto-vectorizer would claim the counted loop
  * whose header label is at header_index (pointer-induction declines those --
  * the vectorizer needs the indexed form). */

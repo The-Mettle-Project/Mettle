@@ -2411,6 +2411,34 @@ foreach ($variant in @("release", "debug", "debug_fallback")) {
   }
 }
 
+# MIR wide-store regression: release inlines a struct-returning helper, then
+# copies a 24-byte struct by value. The executable returns the folded checksum.
+foreach ($variant in @("release", "debug")) {
+  $total++
+  try {
+    $exePath = Join-Path $tmpDir "test_mir_inline_struct_copy_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($variant -eq "release") { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_mir_inline_struct_copy.mettle", "-o", $exePath)
+
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "mir-inline-struct-copy build ($variant) failed: $buildOut"
+    }
+
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 9) {
+      throw "mir-inline-struct-copy ($variant) miscompiled (exit $LASTEXITCODE)"
+    }
+
+    Write-CaseResult -Name "mir_inline_struct_copy_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "mir_inline_struct_copy_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # Constant division/modulo magic-multiply strength reduction. The program is a
 # differential oracle: it compares each literal `x / C` / `x % C` (magic-
 # multiply) against the same division by a heap-loaded divisor (genuine idiv),
@@ -3694,6 +3722,29 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "simd_vloop_general" -Passed $false -Reason $_.Exception.Message
+}
+
+# Early-exit search skip-ahead (simd_find): find/memchr/mismatch loops keep
+# their scalar body (every exit path replays natively) but fast-forward the
+# counter with an 8-wide int32 / 32-wide byte compare+movemask kernel. The
+# test checks exact first-hit indices across all predicates, both source
+# forms, literal/scalar/two-array right-hand sides, and head/block/tail hit
+# positions; one for-range kernel is @simd! so the build asserts recognition.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "vloop_find.exe"
+  $buildOut = & $CompilerPath --build --release "tests/test_vloop_find.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "release build failed (the @simd! find kernel stopped vectorizing?): $buildOut" }
+  if (-not (Test-Path $exePath)) { throw "release build produced no executable" }
+  & $exePath 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "a search skip-ahead diverged from the exact first-hit index ($LASTEXITCODE failures)"
+  }
+  Write-CaseResult -Name "simd_vloop_find" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "simd_vloop_find" -Passed $false -Reason $_.Exception.Message
 }
 
 # uint32 canonical-home semantics: unsigned sub-64-bit arithmetic wraps mod

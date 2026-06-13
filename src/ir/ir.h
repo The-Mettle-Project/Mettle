@@ -216,6 +216,29 @@ typedef enum {
    * Division, %, and >> are never emitted (not congruent / trapping). Emitted
    * by ir_auto_vectorize_int_pass. Direct-object backend only. */
   IR_OP_SIMD_VLOOP_I32,
+  /* Vectorized SKIP-AHEAD for early-exit search loops (find / memchr /
+   * mismatch). Replaces ONLY the loop counter's zero-init: dest(iv) = the
+   * exact first index in [0, n) where the loop's exit predicate holds, else
+   * n. The original scalar loop is left fully intact and re-runs from that
+   * index, so it executes at most one hit iteration (+ the <lane tail) and
+   * every exit path / side effect replays natively -- the recognizer only
+   * has to prove the SKIPPED iterations are pure (load, compare, increment).
+   * lhs = trip bound n (SYMBOL or INT); rhs = array base `a`.
+   *   arguments[0] = predicate (INT: 0 == , 1 != , 2 < , 3 > , 4 <= , 5 >= ;
+   *                  hit when `a[i] PRED rhs-value` -- ordered forms signed)
+   *   arguments[1] = element kind (INT: 0 = 4-byte int32, 1 = 1-byte u8)
+   *   arguments[2] = rhs kind (INT: 0 = literal, 1 = invariant scalar symbol,
+   *                  2 = second array `b[i]`)
+   *   arguments[3] = the rhs operand (INT literal or SYMBOL)
+   * The kernel walks an align-to-32 scalar head, then 32-byte ALIGNED blocks
+   * with vpcmpeq/vpcmpgt + movemask + bsf. Alignment makes sentinel searches
+   * (an overstated n, e.g. strlen) safe: an aligned block never crosses into
+   * a page the scalar loop would not itself touch, and the kernel stops at
+   * the first hit block. Two-array reads on `b` are bound-limited instead
+   * (both arrays must be valid for n, the memcmp contract). Bit-exact: the
+   * returned index is exactly the scalar loop's first-exit index. Direct-
+   * object backend only. */
+  IR_OP_SIMD_FIND,
   /* Outer-loop lane vectorization of a reduction over an outer-IV-INVARIANT
    * inner counted loop carrying one float64 accumulator (a serial recurrence,
    * e.g. a divide chain). The outer loop `while(p<P){ inner; total += iacc; p++ }`
