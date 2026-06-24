@@ -1,0 +1,469 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Mettle: a native systems language that shows its work</title>
+<meta name="description" content="Mettle is a from-scratch systems language that compiles to native x86-64 through its own backend, linker, and source-level debugger. An auto-vectorizer that beats gcc -O3 on data-parallel kernels, and a compiler that explains every optimization it makes. No LLVM. No VM." />
+<meta name="color-scheme" content="light" />
+<meta name="theme-color" content="#f2ebd8" />
+<meta property="og:title" content="Mettle: straight to the metal" />
+<meta property="og:description" content="A from-scratch systems language: own backend, linker, debugger, auto-vectorizer, and a compiler that explains itself. No LLVM, no VM." />
+<meta property="og:type" content="website" />
+<link rel="icon" href="favicon.svg" type="image/svg+xml" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500&family=Courier+Prime:ital,wght@0,400;0,700;1,400&display=swap" rel="stylesheet" />
+<style>
+  :root{
+    --paper:#f2ebd8;
+    --paper-2:#ece2c9;
+    --paper-3:#e6dabd;
+    --ink:#211c14;
+    --ink-soft:#574e3d;
+    --ink-faint:#897f67;
+    --red:#a3301c;
+    --teal:#2f6a72;
+    --green:#4d7438;
+    --brown:#8a5a2a;
+    --line:#211c14;
+    --line-soft:rgba(33,28,20,.2);
+    --maxw:1140px;
+    --serif:"Crimson Pro",Georgia,"Times New Roman",serif;
+    --mono:"Courier Prime",ui-monospace,"Courier New",monospace;
+  }
+
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0;color:var(--ink);background:var(--paper);font-family:var(--serif);
+    font-size:19px;line-height:1.6;text-rendering:optimizeLegibility;overflow-x:hidden;
+  }
+  body::before{
+    content:"";position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.4;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.38'/%3E%3C/svg%3E");
+    mix-blend-mode:multiply;
+  }
+  a{color:var(--red);text-decoration:none}
+  a:hover{text-decoration:underline}
+  a:focus-visible,button:focus-visible,.tab:focus-visible{outline:2px solid var(--red);outline-offset:2px;border-radius:1px}
+  ::selection{background:var(--ink);color:var(--paper)}
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:0 30px;position:relative;z-index:1}
+  .mono{font-family:var(--mono)}
+
+  header{position:sticky;top:0;z-index:50;background:var(--paper);border-bottom:1px solid var(--line-soft)}
+  .nav{max-width:var(--maxw);margin:0 auto;padding:11px 30px;display:flex;align-items:center;gap:14px}
+  .brand{display:flex;align-items:center;gap:10px}
+  .brand .mark{width:28px;height:28px;display:block}
+  .brand b{font-family:var(--serif);font-weight:700;font-size:25px;letter-spacing:-.01em;line-height:1}
+  .brand .ver{font-family:var(--mono);font-size:11px;color:var(--ink-faint);border:1px solid var(--line-soft);padding:2px 6px;margin-left:2px}
+  .nav .sp{flex:1}
+  .nav-links{display:flex;align-items:center;gap:4px;font-family:var(--mono);font-size:13.5px}
+  .nav-links a{color:var(--ink-soft);padding:7px 11px}
+  .nav-links a:hover{color:var(--red);text-decoration:none;background:var(--paper-2)}
+  .nav-links a.gh{color:var(--paper);background:var(--ink);border:1px solid var(--ink)}
+  .nav-links a.gh:hover{background:var(--red);border-color:var(--red);color:var(--paper)}
+
+  .hero{padding:56px 0 40px}
+  .hero-grid{display:grid;grid-template-columns:1fr 1.08fr;gap:50px;align-items:center}
+  .hero-grid>div{min-width:0}
+  .eyebrow{font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:var(--red)}
+  h1{font-family:var(--serif);font-weight:700;font-size:clamp(40px,5.4vw,62px);line-height:1.04;letter-spacing:-.015em;margin:16px 0 0;text-wrap:balance}
+  h1 em{font-style:italic;color:var(--red)}
+  .lede{font-size:21px;color:var(--ink-soft);max-width:30em;margin:20px 0 0;line-height:1.5}
+  .lede strong{color:var(--ink);font-weight:600}
+  .rule-thin{height:1px;background:var(--line-soft);margin:26px 0}
+  .cmdline{font-family:var(--mono);font-size:15px;color:var(--ink);text-align:left;-webkit-appearance:none;appearance:none;background:var(--paper);border:1px solid var(--line-soft);
+    box-shadow:0 8px 20px -16px rgba(33,28,20,.5);padding:13px 15px;display:flex;align-items:center;gap:11px;cursor:pointer;
+    max-width:30em;transition:border-color .15s,background .15s}
+  .cmdline:hover{background:var(--paper-2);border-color:var(--ink-faint)}
+  .cmdline .d{color:var(--red);font-weight:700}
+  .cmdline .cmd{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .cmdline .cp{margin-left:auto;font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-faint);border-left:1px solid var(--line-soft);padding-left:11px}
+  .cta-row{display:flex;align-items:center;gap:22px;margin-top:16px;flex-wrap:wrap}
+  .cta-row a{font-family:var(--serif);font-size:18px;font-weight:600}
+  .cta-row a.arrow{color:var(--ink);border-bottom:2px solid var(--red);padding-bottom:1px}
+  .cta-row a.arrow:hover{text-decoration:none;color:var(--red)}
+  .proof{display:flex;gap:0;margin-top:30px;font-family:var(--mono);font-size:12.5px}
+  .proof div{padding:0 18px;border-left:1px solid var(--line-soft);line-height:1.4}
+  .proof div:first-child{padding-left:0;border-left:0}
+  .proof b{display:block;font-family:var(--serif);font-weight:700;font-size:23px;color:var(--ink);line-height:1}
+  .proof b.hot{color:var(--red)}
+  .proof span{color:var(--ink-faint);text-transform:uppercase;letter-spacing:.05em;font-size:10.5px}
+
+  .show{border:1px solid var(--line-soft);box-shadow:0 18px 40px -26px rgba(33,28,20,.45);background:var(--paper)}
+  .show-tabs{display:flex;border-bottom:1px solid var(--line-soft);background:var(--paper-3);overflow-x:auto}
+  .tab{font-family:var(--mono);font-size:13px;color:var(--ink-soft);background:transparent;border:0;border-right:1px solid var(--line-soft);
+    padding:9px 16px;cursor:pointer;white-space:nowrap;letter-spacing:.02em}
+  .tab:hover{color:var(--ink)}
+  .tab.on{color:var(--ink);background:var(--paper);font-weight:700;box-shadow:inset 0 -2px 0 var(--red)}
+  .panel{display:none}
+  .panel.on{display:block}
+  .code{font-family:var(--mono);font-size:14px;line-height:1.62;padding:16px 18px 18px;white-space:pre;overflow-x:auto;color:var(--ink)}
+  .code .ln{display:inline-block;width:1.6em;color:var(--ink-faint);user-select:none;text-align:right;margin-right:16px}
+  .c-key{color:var(--red);font-weight:700}
+  .c-at{color:var(--red);font-weight:700}
+  .c-type{color:var(--teal)}
+  .c-str{color:var(--green)}
+  .c-com{color:var(--ink-faint);font-style:italic}
+  .c-num{color:var(--brown)}
+  .out{font-family:var(--mono);font-size:13.5px;line-height:1.62;padding:13px 18px 16px;white-space:pre-wrap;
+    border-top:1px solid var(--line-soft);background:var(--paper-2);color:var(--ink-soft)}
+  .out .pr{color:var(--red);font-weight:700}
+  .out .cmd{color:var(--ink)}
+  .out .ok{color:var(--green);font-weight:700}
+  .out .bad{color:var(--red);font-weight:700}
+  .out .fix{color:var(--teal);font-weight:700}
+  .out .em{color:var(--ink);font-weight:700}
+  .cur{display:inline-block;width:.6ch;height:1em;background:var(--red);vertical-align:-2px}
+
+  .manifesto{border-top:1px solid var(--line-soft);border-bottom:1px solid var(--line-soft);background:var(--paper-2)}
+  .manifesto .wrap{padding:30px 30px}
+  .manifesto p{font-family:var(--serif);font-style:italic;font-size:clamp(22px,3vw,30px);line-height:1.32;margin:0;max-width:26em;text-wrap:balance}
+  .manifesto b{font-style:normal;font-weight:700;color:var(--red)}
+
+  section.block{padding:64px 0}
+  .sec-head{display:flex;align-items:baseline;gap:16px;margin-bottom:8px}
+  .sec-kicker{font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--red)}
+  h2{font-family:var(--serif);font-weight:700;font-size:clamp(28px,3.8vw,42px);line-height:1.08;letter-spacing:-.01em;margin:6px 0 0;text-wrap:balance}
+  .sec-sub{font-size:20px;color:var(--ink-soft);max-width:40em;margin:12px 0 0;line-height:1.45}
+
+  .features{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line-soft);border:1px solid var(--line-soft);margin-top:34px}
+  .feat{position:relative;overflow:hidden;background:var(--paper);padding:26px 22px 30px;transition:background .18s ease,box-shadow .18s ease}
+  .feat::before{content:"";position:absolute;left:0;top:0;height:3px;width:0;background:var(--red);transition:width .24s ease}
+  .feat:hover{background:var(--paper-2);z-index:2;box-shadow:0 22px 46px -30px rgba(33,28,20,.55)}
+  .feat:hover::before{width:100%}
+  .feat .ghost{position:absolute;right:4px;bottom:-26px;font-family:var(--serif);font-weight:700;font-size:108px;line-height:1;color:var(--ink);opacity:.045;pointer-events:none;transition:opacity .2s ease,color .2s ease}
+  .feat:hover .ghost{opacity:.09;color:var(--red)}
+  .feat .fn{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:12px;color:var(--red);font-weight:700;letter-spacing:.08em}
+  .feat .fn::after{content:"";width:20px;height:1px;background:var(--red);opacity:.5;transition:width .24s ease}
+  .feat:hover .fn::after{width:34px}
+  .feat h3{position:relative;font-family:var(--serif);font-weight:700;font-size:23px;margin:11px 0 7px;line-height:1.15}
+  .feat p{position:relative;margin:0;font-size:16.5px;color:var(--ink-soft);line-height:1.46}
+  .feat p code{font-family:var(--mono);font-size:.82em;color:var(--ink);background:var(--paper-3);padding:1px 5px}
+
+  .bench-grid{display:grid;grid-template-columns:.85fr 1.15fr;gap:46px;align-items:center;margin-top:34px}
+  .bars{display:flex;flex-direction:column;gap:12px}
+  .bar-row{display:grid;grid-template-columns:118px 1fr;gap:16px;align-items:center}
+  .bar-row .lab{font-family:var(--mono);font-size:13px;color:var(--ink-soft);text-align:right}
+  .bar-track{position:relative;height:30px;background:var(--paper-2);border:1px solid var(--line-soft)}
+  .bar-fill{height:100%;width:var(--w);background:var(--red);display:flex;align-items:center;justify-content:flex-end}
+  .bar-fill b{font-family:var(--mono);font-weight:700;font-size:12.5px;color:var(--paper);padding-right:8px}
+  .baseline{position:absolute;top:-1px;bottom:-1px;width:0;border-left:1px dashed var(--ink-soft);left:calc(100% / var(--scale));z-index:2}
+  .axis{display:grid;grid-template-columns:118px 1fr;gap:16px;margin-bottom:2px}
+  .axis .t{position:relative;height:15px;font-family:var(--mono);font-size:11px;color:var(--ink-faint)}
+  .axis .b1{position:absolute;left:calc(100% / var(--scale));transform:translateX(-50%);color:var(--ink-soft)}
+  .axis .b2{position:absolute;right:0}
+  .bench-note{font-size:16px;color:var(--ink-soft);line-height:1.5;max-width:30em}
+  .bench-note .mono{font-size:14px}
+
+  .start-grid{display:grid;grid-template-columns:1fr 1fr;gap:46px;align-items:start;margin-top:30px}
+  .start-card{border:1px solid var(--line-soft);box-shadow:0 14px 30px -24px rgba(33,28,20,.4);background:var(--paper)}
+  .start-card .h{font-family:var(--mono);font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-soft);
+    padding:9px 16px;border-bottom:1px solid var(--line-soft);background:var(--paper-3)}
+  .start-card .code{padding:16px 18px}
+  .start-steps{font-family:var(--mono);font-size:15px;line-height:2}
+  .start-steps .n{color:var(--red);font-weight:700;margin-right:10px}
+  .start-links{margin-top:22px;display:flex;flex-direction:column;gap:9px;font-size:18px}
+  .start-links a{font-weight:600}
+
+  footer{border-top:1px solid var(--line-soft);background:var(--paper-2)}
+  .foot{display:grid;grid-template-columns:1.6fr 1fr 1fr 1fr;gap:34px;padding:52px 0 36px}
+  .foot-brand .fb{font-family:var(--serif);font-weight:700;font-size:24px;display:flex;align-items:center;gap:9px;margin-bottom:10px}
+  .foot-brand .mark{width:26px;height:26px}
+  .foot-brand p{font-size:16.5px;color:var(--ink-soft);line-height:1.45;max-width:23em;margin:0}
+  .foot-col h4{font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-faint);margin:0 0 14px}
+  .foot-col ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:10px}
+  .foot-col a{color:var(--ink-soft);font-size:17px}
+  .foot-col a:hover{color:var(--red)}
+  .foot-bot{display:flex;justify-content:space-between;gap:14px;flex-wrap:wrap;font-family:var(--mono);font-size:13px;color:var(--ink-faint);padding:16px 0 40px;border-top:1px solid var(--line-soft)}
+
+  @media (max-width:900px){
+    .hero-grid{grid-template-columns:1fr;gap:34px}
+    .bench-grid{grid-template-columns:1fr;gap:30px}
+    .features{grid-template-columns:repeat(2,1fr)}
+    .start-grid{grid-template-columns:1fr;gap:26px}
+    .foot{grid-template-columns:1fr 1fr;gap:28px}
+    .foot-brand{grid-column:1 / -1}
+  }
+  @media (max-width:560px){
+    body{font-size:18px}
+    .nav{padding:10px 18px}
+    .wrap{padding:0 18px}
+    .nav-links a.docs,.nav-links a.ex,.nav-links a.bm{display:none}
+    .features{grid-template-columns:1fr}
+    .proof b{font-size:20px}
+    .bar-row,.axis{grid-template-columns:84px 1fr;gap:10px}
+  }
+  @media (prefers-reduced-motion:reduce){
+    *{animation:none!important;transition:none!important}
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="nav">
+    <a class="brand" href="#top" aria-label="Mettle home">
+      <svg class="mark" viewBox="0 0 150 150" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <g fill="#211c14"><polygon points="56.4 63.7 69.5 34.8 113.7 32.3 133.5 51 122.3 74.9 130.2 88.3 147.6 48 119.6 20.8 62.4 20.9 42.4 63.7"/><polygon points="60.6 63.7 68.9 57.7 95.6 57.7 108.9 63.6"/><polygon points="47.9 67 109.2 88.8 114.3 97.6 138 109.5 114.2 66.9"/><path d="m140.4 114.6-94.1-45.1-2.9 6 43.7 41.8-23.6 0.1-20.8-40.3-24.2 51.9 129.7-0.1-7.8-14.3z"/><path d="m14.2 63-12.1 5.5 1.4 2.1 23.1 32.4 13.9-29.1-26.3-10.9zm14.7 22.3-17.3-19.9 24.4 10.3-7.1 9.6z"/></g>
+      </svg>
+      <b>Mettle</b><span class="ver">v1.0</span>
+    </a>
+    <span class="sp"></span>
+    <nav class="nav-links">
+      <a class="docs" href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/LANGUAGE.md">Docs</a>
+      <a class="ex" href="https://github.com/The-Mettle-Project/Mettle/tree/main/examples">Examples</a>
+      <a class="bm" href="#benchmarks">Benchmarks</a>
+      <a class="gh" href="https://github.com/The-Mettle-Project/Mettle">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+
+  <section class="hero">
+    <div class="wrap">
+      <div class="hero-grid">
+        <div>
+          <span class="eyebrow">A native systems language</span>
+          <h1>Straight to the metal, and it <em>shows its work</em>.</h1>
+          <p class="lede">Mettle compiles to native x86-64 through its <strong>own backend, linker, and debugger</strong>. The auto-vectorizer beats <strong>gcc -O3</strong> on data-parallel kernels, and the compiler explains every optimization it makes. No LLVM. No VM.</p>
+          <div class="rule-thin"></div>
+          <button class="cmdline" id="install" type="button" aria-label="Copy the install command" data-copy="curl -fsSL https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/install.sh | sh">
+            <span class="d">$</span><span class="cmd">curl -fsSL mettle.sh/install | sh</span><span class="cp" id="cplabel">Copy</span>
+          </button>
+          <div class="cta-row">
+            <a class="arrow" href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/LANGUAGE.md">Get started</a>
+            <a href="https://github.com/The-Mettle-Project/Mettle/tree/main/examples">Browse examples</a>
+          </div>
+          <div class="proof">
+            <div><b>0</b><span>LLVM / VM</span></div>
+            <div><b class="hot">5.9x</b><span>peak vs gcc -O3</span></div>
+            <div><b class="hot">~13x</b><span>faster compiles</span></div>
+            <div><b>2</b><span>OS targets</span></div>
+          </div>
+        </div>
+
+        <div class="show" id="show">
+          <div class="show-tabs" role="tablist" aria-label="Compiler examples">
+            <button class="tab on" id="tab-vec" type="button" role="tab" aria-selected="true" aria-controls="p-vec" data-p="vec">vectorize</button>
+            <button class="tab" id="tab-explain" type="button" role="tab" aria-selected="false" aria-controls="p-explain" tabindex="-1" data-p="explain">explain</button>
+            <button class="tab" id="tab-contract" type="button" role="tab" aria-selected="false" aria-controls="p-contract" tabindex="-1" data-p="contract">contracts</button>
+            <button class="tab" id="tab-safety" type="button" role="tab" aria-selected="false" aria-controls="p-safety" tabindex="-1" data-p="safety">safety</button>
+          </div>
+
+          <div class="panel on" id="p-vec" role="tabpanel" aria-labelledby="tab-vec" tabindex="0">
+<div class="code"><span class="ln">1</span><span class="c-key">function</span> scale(dst: <span class="c-type">int32*</span>, src: <span class="c-type">int32*</span>, n: <span class="c-type">int32</span>) {
+<span class="ln">2</span>    <span class="c-at">@simd!</span> <span class="c-key">for</span> i <span class="c-key">in</span> <span class="c-num">0</span>..n {
+<span class="ln">3</span>        dst[i] = src[i] * <span class="c-num">3</span> + <span class="c-num">7</span>;
+<span class="ln">4</span>    }
+<span class="ln">5</span>}</div>
+<div class="out"><span class="pr">$</span> <span class="cmd">mettle --build --release --explain</span>
+scale <span class="em">(loop @ 2)</span>: <span class="ok">vectorized -&gt; AVX2</span>
+  vpmulld + vpaddd, <span class="em">8 int32 lanes</span> / iteration
+  contract <span class="bad">@simd!</span> satisfied<span class="cur"></span></div>
+          </div>
+
+          <div class="panel" id="p-explain" role="tabpanel" aria-labelledby="tab-explain" tabindex="0">
+<div class="code"><span class="ln">1</span><span class="c-key">function</span> sum(a: <span class="c-type">int32*</span>, n: <span class="c-type">int32</span>) -&gt; <span class="c-type">int64</span> {
+<span class="ln">2</span>    <span class="c-key">var</span> total: <span class="c-type">int32</span> = <span class="c-num">0</span>;
+<span class="ln">3</span>    <span class="c-key">for</span> i <span class="c-key">in</span> <span class="c-num">0</span>..n { total = total + a[i]; }
+<span class="ln">4</span>    <span class="c-key">return</span> total;
+<span class="ln">5</span>}</div>
+<div class="out"><span class="pr">$</span> <span class="cmd">mettle --explain</span>
+sum <span class="em">(loop @ 3)</span>: <span class="bad">not vectorized</span>
+  reason: <span class="c-type">int32</span> accumulator overflows packed lanes
+  <span class="fix">fix (proven)</span>: declare <span class="em">total</span> as <span class="c-type">int64</span><span class="cur"></span></div>
+          </div>
+
+          <div class="panel" id="p-contract" role="tabpanel" aria-labelledby="tab-contract" tabindex="0">
+<div class="code"><span class="ln">1</span><span class="c-at">@noalloc</span> <span class="c-key">function</span> step(s: <span class="c-type">World*</span>) {
+<span class="ln">2</span>    integrate(s);   <span class="c-com">// must run without allocating</span>
+<span class="ln">3</span>}</div>
+<div class="out"><span class="pr">$</span> <span class="cmd">mettle --build</span>
+<span class="bad">error</span>: <span class="bad">@noalloc</span> violated in step()
+  integrate() reaches <span class="em">new Cell</span> at cell.mettle:24
+  the build fails until no reachable path allocates<span class="cur"></span></div>
+          </div>
+
+          <div class="panel" id="p-safety" role="tabpanel" aria-labelledby="tab-safety" tabindex="0">
+<div class="code"><span class="ln">1</span><span class="c-key">function</span> first(n: <span class="c-type">int32</span>) -&gt; <span class="c-type">int32</span> {
+<span class="ln">2</span>    <span class="c-key">var</span> p: <span class="c-type">int32*</span> = (<span class="c-type">int32*</span>)malloc((<span class="c-type">int64</span>)n * <span class="c-num">4</span>);
+<span class="ln">3</span>    free(p);
+<span class="ln">4</span>    <span class="c-key">return</span> p[<span class="c-num">0</span>];      <span class="c-com">// read after free</span>
+<span class="ln">5</span>}</div>
+<div class="out"><span class="pr">$</span> <span class="cmd">mettle --build</span>
+<span class="bad">warning</span>: use-after-free of <span class="em">p</span>
+  freed at line 3, read at line 4
+  <span class="fix">fix</span>: read before the free, or copy the value out<span class="cur"></span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div class="manifesto">
+    <div class="wrap">
+      <p>Most compilers optimize in silence. Mettle tells you <b>what it did, and why</b>, in terms of your own source.</p>
+    </div>
+  </div>
+
+  <section class="block">
+    <div class="wrap">
+      <div class="sec-head"><span class="sec-kicker">// the toolchain</span></div>
+      <h2>A whole compiler, built from scratch.</h2>
+      <p class="sec-sub">No LLVM, no VM, no external assembler. Every part of the path from source to running binary is Mettle's own.</p>
+      <div class="features">
+        <div class="feat"><span class="ghost" aria-hidden="true">01</span><div class="fn">01</div><h3>Native backend &amp; linker</h3><p>Emits x86-64 object code directly and links it with a built-in PE linker on Windows, ELF on Linux. No assembler, no toolchain dependency.</p></div>
+        <div class="feat"><span class="ghost" aria-hidden="true">02</span><div class="fn">02</div><h3>AVX2 auto-vectorizer</h3><p>Maps, reductions, dot products, and search loops become packed SIMD, bit-exact for integers. <code>@simd!</code> makes it a contract.</p></div>
+        <div class="feat"><span class="ghost" aria-hidden="true">03</span><div class="fn">03</div><h3>Source-level debugger</h3><p>Breakpoints, stepping, call stacks, live variable read and write. No gdb, no DWARF. Faults stop at the source line, variables intact.</p></div>
+        <div class="feat"><span class="ghost" aria-hidden="true">04</span><div class="fn">04</div><h3>Compile-time memory safety</h3><p>Use-after-free, double-free, leaks, and null dereferences caught before you run, interprocedurally, with concrete fixes.</p></div>
+        <div class="feat"><span class="ghost" aria-hidden="true">05</span><div class="fn">05</div><h3>Optimization contracts</h3><p><code>@simd!</code>, <code>@inline!</code>, <code>@noalloc</code>: declare intent and the build proves it or fails, pointing at the reason.</p></div>
+        <div class="feat"><span class="ghost" aria-hidden="true">06</span><div class="fn">06</div><h3>GPU offload</h3><p>Write <code>kernel</code> functions, launch with <code>dispatch</code>, and Mettle emits NVIDIA PTX through a native CUDA path. No <code>nvcc</code>.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="block" id="benchmarks" style="border-top:1px solid var(--line-soft);border-bottom:1px solid var(--line-soft);background:var(--paper-2)">
+    <div class="wrap">
+      <div class="sec-head"><span class="sec-kicker">// benchmarks</span></div>
+      <h2>Faster than gcc -O3 where it vectorizes.</h2>
+      <div class="bench-grid">
+        <p class="bench-note">Speedup of <span class="mono">mettle --release</span> over <span class="mono">gcc 13.3 -O3</span> on the same source intent, higher is better. The dashed line marks gcc's pace. Mettle is slower on serial, call-heavy code such as recursion and branchy scans, and it tells you so rather than pretending otherwise.</p>
+        <div class="bars" style="--scale:6.2">
+          <div class="axis" aria-hidden="true"><span></span><div class="t"><span class="b1">gcc -O3 = 1x</span><span class="b2">faster -&gt;</span></div></div>
+          <div class="bar-row"><span class="lab">float_sum</span><div class="bar-track"><div class="bar-fill" style="--w:95%"><b>5.9x</b></div><div class="baseline"></div></div></div>
+          <div class="bar-row"><span class="lab">minmax_scan</span><div class="bar-track"><div class="bar-fill" style="--w:79%"><b>4.9x</b></div><div class="baseline"></div></div></div>
+          <div class="bar-row"><span class="lab">switch_vm</span><div class="bar-track"><div class="bar-fill" style="--w:58%"><b>3.6x</b></div><div class="baseline"></div></div></div>
+          <div class="bar-row"><span class="lab">dot_product</span><div class="bar-track"><div class="bar-fill" style="--w:53%"><b>3.3x</b></div><div class="baseline"></div></div></div>
+          <div class="bar-row"><span class="lab">clamp_i32</span><div class="bar-track"><div class="bar-fill" style="--w:44%"><b>2.7x</b></div><div class="baseline"></div></div></div>
+          <div class="bar-row"><span class="lab">popcount</span><div class="bar-track"><div class="bar-fill" style="--w:36%"><b>2.2x</b></div><div class="baseline"></div></div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="block">
+    <div class="wrap">
+      <div class="sec-head"><span class="sec-kicker">// get started</span></div>
+      <h2>Up and running in a minute.</h2>
+      <div class="start-grid">
+        <div>
+          <div class="start-steps">
+            <div><span class="n">1</span>Install the toolchain (Windows or Linux, x86-64).</div>
+            <div><span class="n">2</span>Save the program on the right as <span class="mono">hello.mettle</span>.</div>
+            <div><span class="n">3</span>Build and run a native binary:</div>
+          </div>
+          <button class="cmdline" id="install2" type="button" aria-label="Copy the build command" data-copy="mettle --build --release hello.mettle" style="margin-top:16px">
+            <span class="d">$</span><span class="cmd">mettle --build --release hello.mettle</span><span class="cp" id="cplabel2">Copy</span>
+          </button>
+          <div class="start-links">
+            <a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/LANGUAGE.md">Read the language guide</a>
+            <a href="https://github.com/The-Mettle-Project/Mettle/tree/main/examples">Browse the examples</a>
+            <a href="https://github.com/The-Mettle-Project/Mettle">Star Mettle on GitHub</a>
+          </div>
+        </div>
+        <div class="start-card">
+          <div class="h">hello.mettle</div>
+<div class="code"><span class="c-key">import</span> <span class="c-str">"std/io"</span>;
+
+<span class="c-key">function</span> main() -&gt; <span class="c-type">int32</span> {
+    println(<span class="c-str">"Hello from the metal."</span>);
+    <span class="c-key">return</span> <span class="c-num">0</span>;
+}</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <div class="wrap">
+      <div class="foot">
+        <div class="foot-brand">
+          <div class="fb">
+            <svg class="mark" viewBox="0 0 150 150" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" fill="#211c14"><polygon points="56.4 63.7 69.5 34.8 113.7 32.3 133.5 51 122.3 74.9 130.2 88.3 147.6 48 119.6 20.8 62.4 20.9 42.4 63.7"/><polygon points="60.6 63.7 68.9 57.7 95.6 57.7 108.9 63.6"/><polygon points="47.9 67 109.2 88.8 114.3 97.6 138 109.5 114.2 66.9"/><path d="m140.4 114.6-94.1-45.1-2.9 6 43.7 41.8-23.6 0.1-20.8-40.3-24.2 51.9 129.7-0.1-7.8-14.3z"/><path d="m14.2 63-12.1 5.5 1.4 2.1 23.1 32.4 13.9-29.1-26.3-10.9zm14.7 22.3-17.3-19.9 24.4 10.3-7.1 9.6z"/></svg>
+            Mettle
+          </div>
+          <p>A from-scratch native systems language. Its own backend, linker, debugger, and an auto-vectorizer that explains every move it makes.</p>
+        </div>
+        <div class="foot-col">
+          <h4>Learn</h4>
+          <ul>
+            <li><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/LANGUAGE.md">Language guide</a></li>
+            <li><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/control-flow.md">Control flow</a></li>
+            <li><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/known-limitations.md">Known limitations</a></li>
+            <li><a href="https://github.com/The-Mettle-Project/Mettle/tree/main/examples">Examples</a></li>
+          </ul>
+        </div>
+        <div class="foot-col">
+          <h4>Performance</h4>
+          <ul>
+            <li><a href="https://github.com/The-Mettle-Project/Mettle/tree/main/docs/benchmarks">Benchmarks</a></li>
+            <li><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/gpu.md">GPU offload</a></li>
+            <li><a href="#top">Optimization contracts</a></li>
+          </ul>
+        </div>
+        <div class="foot-col">
+          <h4>Project</h4>
+          <ul>
+            <li><a href="https://github.com/The-Mettle-Project/Mettle">GitHub</a></li>
+            <li><a href="https://github.com/The-Mettle-Project/Mettle#install">Install</a></li>
+            <li><a href="https://github.com/The-Mettle-Project/Mettle/issues">Issues</a></li>
+            <li><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/LICENSE">License (Apache-2.0)</a></li>
+          </ul>
+        </div>
+      </div>
+      <div class="foot-bot">
+        <span>Copyright (C) 2026 The Mettle Project. Apache-2.0.</span>
+        <span>x86-64 / Windows / Linux / no LLVM / no VM</span>
+      </div>
+    </div>
+  </footer>
+
+</main>
+
+<script>
+(function(){
+  function wireCopy(box){
+    var lab = box.querySelector('.cp'), text = box.getAttribute('data-copy');
+    if (!lab || !text || !navigator.clipboard) return;
+    box.addEventListener('click', function(){
+      navigator.clipboard.writeText(text).then(function(){
+        var t = lab.textContent; lab.textContent='Copied'; lab.style.color='var(--red)';
+        setTimeout(function(){ lab.textContent=t; lab.style.color=''; }, 1500);
+      });
+    });
+  }
+  [].forEach.call(document.querySelectorAll('.cmdline'), wireCopy);
+
+  var show = document.getElementById('show');
+  if (show){
+    var tabs = [].slice.call(show.querySelectorAll('.tab'));
+    function select(tab, focus){
+      tabs.forEach(function(t){
+        var on = t === tab;
+        t.classList.toggle('on', on);
+        t.setAttribute('aria-selected', on ? 'true' : 'false');
+        t.tabIndex = on ? 0 : -1;
+        var panel = document.getElementById('p-' + t.getAttribute('data-p'));
+        if (panel) panel.classList.toggle('on', on);
+      });
+      if (focus) tab.focus();
+    }
+    tabs.forEach(function(tab, i){
+      tab.addEventListener('click', function(){ select(tab, false); });
+      tab.addEventListener('keydown', function(e){
+        var n = null;
+        if (e.key === 'ArrowRight') n = tabs[(i + 1) % tabs.length];
+        else if (e.key === 'ArrowLeft') n = tabs[(i - 1 + tabs.length) % tabs.length];
+        else if (e.key === 'Home') n = tabs[0];
+        else if (e.key === 'End') n = tabs[tabs.length - 1];
+        if (n){ e.preventDefault(); select(n, true); }
+      });
+    });
+  }
+})();
+</script>
+</body>
+</html>

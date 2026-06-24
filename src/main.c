@@ -14,6 +14,7 @@
 #include "tracy_build.h"
 #include "ir/ir.h"
 #include "ir/ir_optimize.h"
+#include "ir/ir_explain_memory.h"
 #include "ir/ir_profile.h"
 #include "ir/ir_debug_hooks.h"
 #include "semantic/import_resolver.h"
@@ -57,7 +58,7 @@ extern pid_t waitpid(pid_t pid, int *wstatus, int options);
 #ifdef METTLE_VERSION_RAW
 #define METTLE_VERSION METTLE_STRINGIFY(METTLE_VERSION_RAW)
 #else
-#define METTLE_VERSION "v0.11.0"
+#define METTLE_VERSION "v0.12.0"
 #endif
 #endif
 
@@ -2964,6 +2965,14 @@ int compile_file(const char *input_filename, const char *output_filename,
     result = 1;
     goto cleanup;
   }
+
+  /* --explain: collect the memory analyzer's diagnostics so the optimization
+   * report can surface them in a "memory" section. Enabled before type-check
+   * (where they fire) and only when the optimizer will run -- the only path
+   * that produces a report. */
+  ir_explain_memory_set_collect(options->explain && options->optimize,
+                                options->explain_all ? NULL
+                                                     : options->input_filename);
 
   compiler_set_phase(PROFILE_PHASE_TYPE_CHECK);
   phase_start = compiler_profile_begin(&profile);

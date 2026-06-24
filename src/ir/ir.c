@@ -749,6 +749,7 @@ const char *ir_opcode_name(IROpcode op) {
   case IR_OP_SIMD_I2F_REDUCE_F64: return "simd_i2f_reduce_f64";
   case IR_OP_SIMD_VLOOP_F64: return "simd_vloop_f64";
   case IR_OP_SIMD_VLOOP_I32: return "simd_vloop_i32";
+  case IR_OP_SIMD_FIND: return "simd_find";
   case IR_OP_SIMD_OUTER_LANE_F64: return "simd_outer_lane_f64";
   default:
     return "unknown";
@@ -1090,6 +1091,13 @@ static int ir_format_instruction_line(const IRInstruction *instruction,
                        reduce_op == 1 ? "+=" : "<-",
                        ir_opcode_name(instruction->op),
                        reduce_op == 1 ? "reduce" : "map", n_nodes);
+    break;
+  }
+  case IR_OP_SIMD_FIND: {
+    char base[128];
+    ir_format_operand(&instruction->rhs, base, sizeof(base));
+    written = snprintf(buffer, buffer_size, "%s <- %s(a=%s, n=%s)", dest,
+                       ir_opcode_name(instruction->op), base, lhs);
     break;
   }
   case IR_OP_SIMD_OUTER_LANE_F64:

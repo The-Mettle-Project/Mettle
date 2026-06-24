@@ -2461,6 +2461,266 @@ int ir_simd_exp_f32_pass(IRFunction *function, int *changed) {
   return 1;
 }
 
+/* In-place SiLU / SwiGLU gate over a float32 array:
+ *   out[i] = silu(g[i])          -> SiLU
+ *   out[i] = silu(g[i]) * u[i]   -> SwiGLU gate (the FFN activation)
+ * where silu(x) = x / (1 + expf(0 - x)). The body (after inlining `silu`) is the
+ * fixed DAG: load g -> `0 - g` -> expf -> `1 + e` -> `g / (1+e)` -> [load u, mul]
+ * -> store g (in-place). Lowered to IR_OP_SIMD_SILU_F32, which reuses the AVX2
+ * exp polynomial. Matched by shape (not a benchmark); the result tracks the
+ * scalar silu within the exp kernel's tolerance. */
+static int ir_try_vectorize_silu_f32_at(IRFunction *function,
+                                        size_t header_index, int *changed) {
+  if (!function || header_index + 4 >= function->instruction_count) {
+    return 1;
+  }
+  IRInstruction *header = &function->instructions[header_index];
+  if (header->op != IR_OP_LABEL || !ir_label_is_while_header(header->text)) {
+    return 1;
+  }
+  const char *loop_label = header->text;
+  size_t compare_index = 0, branch_index = 0;
+  if (!ir_find_next_non_nop(function, header_index + 1, &compare_index) ||
+      !ir_find_next_non_nop(function, compare_index + 1, &branch_index)) {
+    return 1;
+  }
+  IRInstruction *compare = &function->instructions[compare_index];
+  IRInstruction *branch = &function->instructions[branch_index];
+  if (compare->op != IR_OP_BINARY || compare->is_float || !compare->text ||
+      strcmp(compare->text, "<") != 0 ||
+      compare->lhs.kind != IR_OPERAND_SYMBOL || !compare->lhs.name ||
+      compare->rhs.kind != IR_OPERAND_SYMBOL || !compare->rhs.name ||
+      compare->dest.kind != IR_OPERAND_TEMP || !compare->dest.name ||
+      branch->op != IR_OP_BRANCH_ZERO ||
+      !ir_operand_is_temp_named(&branch->lhs, compare->dest.name)) {
+    return 1;
+  }
+  const char *iv_symbol = compare->lhs.name;
+
+  size_t jump_index = (size_t)-1;
+  for (size_t i = branch_index + 1; i < function->instruction_count; i++) {
+    if (function->instructions[i].op == IR_OP_JUMP &&
+        function->instructions[i].text &&
+        strcmp(function->instructions[i].text, loop_label) == 0) {
+      jump_index = i;
+      break;
+    }
+    if (function->instructions[i].op == IR_OP_LABEL) {
+      break;
+    }
+  }
+  if (jump_index == (size_t)-1 ||
+      ir_loop_body_has_nested_while(function, branch_index + 1, jump_index)) {
+    return 1;
+  }
+
+  /* expf call: exp_res = expf(exp_arg). */
+  const char *exp_arg = NULL, *exp_res = NULL;
+  for (size_t i = branch_index + 1; i < jump_index; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op == IR_OP_CALL && in->text && strcmp(in->text, "expf") == 0 &&
+        in->argument_count == 1 && in->arguments &&
+        in->arguments[0].kind == IR_OPERAND_TEMP && in->arguments[0].name &&
+        in->dest.kind == IR_OPERAND_TEMP && in->dest.name) {
+      exp_arg = in->arguments[0].name;
+      exp_res = in->dest.name;
+      break;
+    }
+  }
+  if (!exp_arg || !exp_res) {
+    return 1;
+  }
+
+  /* exp_arg = 0.0 - g_temp  (float negate). */
+  const IRInstruction *neg =
+      ir_find_temp_producer_before(function, jump_index, exp_arg);
+  if (!neg || neg->op != IR_OP_BINARY || !neg->is_float || !neg->text ||
+      strcmp(neg->text, "-") != 0 || neg->lhs.kind != IR_OPERAND_FLOAT ||
+      neg->lhs.float_value != 0.0 || neg->rhs.kind != IR_OPERAND_TEMP ||
+      !neg->rhs.name) {
+    return 1;
+  }
+  const char *g_temp = neg->rhs.name;
+
+  /* g_temp = load base_g[iv] (unit stride, lane 0). */
+  const IRInstruction *gload =
+      ir_find_temp_producer_before(function, jump_index, g_temp);
+  const char *base_g = NULL, *gidx = NULL;
+  long long glane = 0;
+  if (!gload || gload->op != IR_OP_LOAD || gload->lhs.kind != IR_OPERAND_TEMP ||
+      !gload->lhs.name ||
+      !ir_slp_load_base_index(function,
+                              (size_t)(gload - function->instructions),
+                              gload->lhs.name, &base_g, &gidx, &glane) ||
+      glane != 0 || !base_g || !gidx || strcmp(gidx, iv_symbol) != 0) {
+    return 1;
+  }
+
+  /* add_res = 1.0 + exp_res  (commutative). */
+  const char *add_res = NULL;
+  for (size_t i = branch_index + 1; i < jump_index; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op == IR_OP_BINARY && in->is_float && in->text &&
+        strcmp(in->text, "+") == 0 && in->dest.kind == IR_OPERAND_TEMP &&
+        in->dest.name &&
+        ((in->lhs.kind == IR_OPERAND_FLOAT && in->lhs.float_value == 1.0 &&
+          ir_operand_is_temp_named(&in->rhs, exp_res)) ||
+         (in->rhs.kind == IR_OPERAND_FLOAT && in->rhs.float_value == 1.0 &&
+          ir_operand_is_temp_named(&in->lhs, exp_res)))) {
+      add_res = in->dest.name;
+      break;
+    }
+  }
+  if (!add_res) {
+    return 1;
+  }
+
+  /* silu_res = g / add_res. The numerator is g: either the exact temp the negate
+   * used (inlined `silu(v)` loads g once), or a second load of base_g[iv] (a
+   * directly-written `g[i] / (1 + expf(-g[i]))` loads g[i] twice). */
+  const char *silu_res = NULL;
+  for (size_t i = branch_index + 1; i < jump_index; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op != IR_OP_BINARY || !in->is_float || !in->text ||
+        strcmp(in->text, "/") != 0 || in->dest.kind != IR_OPERAND_TEMP ||
+        !in->dest.name || in->lhs.kind != IR_OPERAND_TEMP || !in->lhs.name ||
+        !ir_operand_is_temp_named(&in->rhs, add_res)) {
+      continue;
+    }
+    int num_ok = ir_operand_is_temp_named(&in->lhs, g_temp);
+    if (!num_ok) {
+      const IRInstruction *nload =
+          ir_find_temp_producer_before(function, jump_index, in->lhs.name);
+      const char *nb = NULL, *ni = NULL;
+      long long nl = 0;
+      num_ok = nload && nload->op == IR_OP_LOAD &&
+               nload->lhs.kind == IR_OPERAND_TEMP && nload->lhs.name &&
+               ir_slp_load_base_index(function,
+                                      (size_t)(nload - function->instructions),
+                                      nload->lhs.name, &nb, &ni, &nl) &&
+               nl == 0 && nb && ni && strcmp(nb, base_g) == 0 &&
+               strcmp(ni, iv_symbol) == 0;
+    }
+    if (num_ok) {
+      silu_res = in->dest.name;
+      break;
+    }
+  }
+  if (!silu_res) {
+    return 1;
+  }
+
+  /* Store base_out[iv] = final, base_out == base_g (in-place). final is silu_res
+   * (plain SiLU) or silu_res * u[iv] (SwiGLU gate). */
+  const char *base_u = NULL;
+  int has_mul = 0;
+  int found_store = 0;
+  for (size_t i = branch_index + 1; i < jump_index; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    const char *base_out = NULL, *sidx = NULL;
+    long long slane = 0;
+    if (in->op != IR_OP_STORE || in->lhs.kind != IR_OPERAND_TEMP ||
+        !in->lhs.name || in->dest.kind != IR_OPERAND_TEMP || !in->dest.name ||
+        !ir_slp_load_base_index(function, i, in->dest.name, &base_out, &sidx,
+                                &slane) ||
+        slane != 0 || !base_out || !sidx || strcmp(sidx, iv_symbol) != 0 ||
+        strcmp(base_out, base_g) != 0) {
+      continue;
+    }
+    if (ir_operand_is_temp_named(&in->lhs, silu_res)) {
+      has_mul = 0;
+      found_store = 1;
+      break;
+    }
+    const IRInstruction *mul =
+        ir_find_temp_producer_before(function, jump_index, in->lhs.name);
+    if (mul && mul->op == IR_OP_BINARY && mul->is_float && mul->text &&
+        strcmp(mul->text, "*") == 0) {
+      const IROperand *other = NULL;
+      if (ir_operand_is_temp_named(&mul->lhs, silu_res)) {
+        other = &mul->rhs;
+      } else if (ir_operand_is_temp_named(&mul->rhs, silu_res)) {
+        other = &mul->lhs;
+      }
+      if (other && other->kind == IR_OPERAND_TEMP && other->name) {
+        const IRInstruction *uload =
+            ir_find_temp_producer_before(function, jump_index, other->name);
+        const char *uidx = NULL;
+        long long ulane = 0;
+        if (uload && uload->op == IR_OP_LOAD &&
+            uload->lhs.kind == IR_OPERAND_TEMP && uload->lhs.name &&
+            ir_slp_load_base_index(function,
+                                   (size_t)(uload - function->instructions),
+                                   uload->lhs.name, &base_u, &uidx, &ulane) &&
+            ulane == 0 && base_u && uidx && strcmp(uidx, iv_symbol) == 0) {
+          has_mul = 1;
+          found_store = 1;
+          break;
+        }
+      }
+    }
+  }
+  if (!found_store) {
+    return 1;
+  }
+
+  /* iv increments by 1, starts at 0, and is dead after the loop. */
+  int inc_ok = 0;
+  for (size_t i = branch_index + 1; i < jump_index; i++) {
+    if (ir_try_parse_direct_unit_increment(&function->instructions[i],
+                                           iv_symbol)) {
+      inc_ok = 1;
+      break;
+    }
+  }
+  if (!inc_ok || !ir_iv_zero_at_header(function, header_index, iv_symbol) ||
+      ir_symbol_live_after_loop(function, jump_index + 1, iv_symbol)) {
+    return 1;
+  }
+
+  IRInstruction fused = {0};
+  fused.op = IR_OP_SIMD_SILU_F32;
+  fused.location = header->location;
+  fused.is_float = 1;
+  fused.float_bits = 32;
+  fused.dest = ir_operand_symbol(base_g); /* in-place: out == g */
+  fused.lhs = ir_operand_symbol(base_g);
+  if (has_mul) {
+    fused.rhs = ir_operand_symbol(base_u);
+  }
+  fused.arguments = calloc(1, sizeof(IROperand));
+  if (!fused.arguments) {
+    return 0;
+  }
+  fused.argument_count = 1;
+  fused.arguments[0] = ir_operand_symbol(compare->rhs.name); /* count n */
+
+  ir_instruction_destroy_storage(header);
+  *header = fused;
+  for (size_t i = header_index + 1; i <= jump_index; i++) {
+    ir_instruction_make_nop(&function->instructions[i]);
+  }
+  if (changed) {
+    *changed = 1;
+  }
+  return 1;
+}
+
+int ir_simd_silu_f32_pass(IRFunction *function, int *changed) {
+  if (!function) {
+    return 0;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    if (function->instructions[i].op == IR_OP_LABEL &&
+        ir_label_is_while_header(function->instructions[i].text)) {
+      if (!ir_try_vectorize_silu_f32_at(function, i, changed)) {
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
 int ir_simd_dot_i32_pass(IRFunction *function, int *changed) {
   if (!function) {
     return 0;

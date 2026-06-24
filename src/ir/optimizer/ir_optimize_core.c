@@ -232,9 +232,11 @@ int ir_instruction_writes_symbol(const IRInstruction *instruction) {
   case IR_OP_SIMD_AFFINE_MAP_F64:
   case IR_OP_SIMD_AFFINE_MAP_F32:
   case IR_OP_SIMD_EXP_F32:
+  case IR_OP_SIMD_SILU_F32:
   case IR_OP_SIMD_I2F_REDUCE_F64:
   case IR_OP_SIMD_VLOOP_F64:
   case IR_OP_SIMD_VLOOP_I32:
+  case IR_OP_SIMD_FIND:
   case IR_OP_SIMD_OUTER_LANE_F64:
     return 1;
   default:
@@ -282,9 +284,11 @@ int ir_instruction_writes_destination(const IRInstruction *instruction) {
   case IR_OP_SIMD_AFFINE_MAP_F64:
   case IR_OP_SIMD_AFFINE_MAP_F32:
   case IR_OP_SIMD_EXP_F32:
+  case IR_OP_SIMD_SILU_F32:
   case IR_OP_SIMD_I2F_REDUCE_F64:
   case IR_OP_SIMD_VLOOP_F64:
   case IR_OP_SIMD_VLOOP_I32:
+  case IR_OP_SIMD_FIND:
   case IR_OP_SIMD_OUTER_LANE_F64:
     return 1;
   default:
@@ -1728,9 +1732,11 @@ int ir_collect_instruction_temp_uses(IRTempUseMap *uses,
   case IR_OP_SIMD_AFFINE_MAP_F64:
   case IR_OP_SIMD_AFFINE_MAP_F32:
   case IR_OP_SIMD_EXP_F32:
+  case IR_OP_SIMD_SILU_F32:
   case IR_OP_SIMD_I2F_REDUCE_F64:
   case IR_OP_SIMD_VLOOP_F64:
   case IR_OP_SIMD_VLOOP_I32:
+  case IR_OP_SIMD_FIND:
   case IR_OP_SIMD_OUTER_LANE_F64:
     if (!ir_collect_operand_temp_use(uses, &instruction->dest) ||
         !ir_collect_operand_temp_use(uses, &instruction->lhs) ||

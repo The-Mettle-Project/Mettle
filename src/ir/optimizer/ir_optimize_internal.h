@@ -249,6 +249,7 @@ typedef struct {
     "eliminate_single_use_float_symbol_copies")                              \
   X(COMMON_SUBEXPRESSION_ELIMINATION, "common_subexpression_elimination")    \
   X(CONSTANT_AND_BRANCH_SIMPLIFY, "constant_and_branch_simplify")            \
+  X(REASSOCIATE_CONSTANTS, "reassociate_constants")                          \
   X(COUNT_WORD_STARTS, "count_word_starts")                                  \
   X(ELIMINATE_DEAD_TEMP_WRITES, "eliminate_dead_temp_writes")                \
   X(THREAD_JUMP_TARGETS, "thread_jump_targets")                              \
@@ -533,7 +534,10 @@ typedef enum {
   IR_SIMD_BAIL_EARLY_EXIT,         /* the loop can leave before the trip count */
   IR_SIMD_BAIL_INT16_ELEMENTS,     /* 16-bit integer memory, no kernel */
   IR_SIMD_BAIL_INT64_ELEMENTS,     /* 64-bit integer memory, no kernel */
-  IR_SIMD_BAIL_SERIAL_RECURRENCE,  /* float '*'/'/' chain across iterations */
+  IR_SIMD_BAIL_SERIAL_RECURRENCE,  /* non-reassociable loop-carried recurrence:
+                                      a scalar computed from its own prior value
+                                      through *, /, shift, bitwise, or xor (int
+                                      or float) */
   IR_SIMD_BAIL_MIXED_FLOAT_WIDTHS, /* f32 and f64 elements in one loop */
   IR_SIMD_BAIL_BYTE_SUM_NARROW_ACC,/* byte sum into an int32 accumulator */
   IR_SIMD_BAIL_I32_SUM_NARROW_ACC, /* int32 sum into a non-int64 accumulator */
@@ -578,6 +582,11 @@ int ir_ptr_induction_iv_start_value(const IRFunction *function,
                                            const char *iv_symbol,
                                            long long *out_start);
 int ir_reduction_unroll_pass(IRFunction *function, int *changed);
+/* Declarative algebraic rewrite engine (ir_optimize_rewrite.c): the integer
+ * identity table lives there, so adding an identity is adding one table row. */
+int ir_rewrite_apply_binary_identities(IRInstruction *instruction,
+                                       int *changed);
+int ir_reassociate_constants_pass(IRFunction *function, int *changed);
 int ir_remove_empty_conditional_diamonds_pass(IRFunction *function,
                                                      int *changed);
 int ir_remove_redundant_fallthrough_branches_pass(IRFunction *function,
@@ -604,9 +613,12 @@ int ir_run_fixpoint_pass(IRFunction *function, IROptPassId pass_id,
                          unsigned long long *clean_version, int *changed);
 int ir_simd_affine_map_float_pass(IRFunction *function, int *changed);
 int ir_simd_exp_f32_pass(IRFunction *function, int *changed);
+int ir_simd_silu_f32_pass(IRFunction *function, int *changed);
 int ir_simd_i2f_reduce_pass(IRFunction *function, int *changed);
 int ir_auto_vectorize_pass(IRFunction *function, int *changed);
 int ir_auto_vectorize_int_pass(IRFunction *function, int *changed);
+int ir_auto_vectorize_find_pass(IRFunction *function, int *changed);
+int ir_auto_vectorize_find_claimable(IRFunction *function, size_t header_index);
 /* Read-only probe: 1 if the int auto-vectorizer would claim the counted loop
  * whose header label is at header_index (pointer-induction declines those --
  * the vectorizer needs the indexed form). */
@@ -627,6 +639,7 @@ int ir_simd_fill_pass(IRFunction *function, int *changed);
 int ir_iv_zero_at_header(const IRFunction *function, size_t header_index,
                          const char *iv);
 int ir_simd_byte_map_pass(IRFunction *function, int *changed);
+int ir_simd_lcg_pass(IRFunction *function, int *changed);
 int ir_sroa_pass(IRFunction *function, int *changed);
 int ir_strength_reduce_rotate_loops_pass(IRFunction *function, int *changed);
 int ir_symbol_address_taken(const IRFunction *function,

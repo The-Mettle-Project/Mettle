@@ -907,6 +907,37 @@ int binary_emit_imul_reg_reg_imm32(BinaryCodeBuffer *buffer,
            binary_emit_shift_reg_imm8(buffer, 4, destination, shift) &&
            binary_emit_neg_reg(buffer, destination);
   }
+  /* C = 2^k + 1 (3,5,9,17,33,...): source*(2^k+1) = (source<<k) + source. For
+   * k<=3 a single LEA does it (scale 2/4/8), valid even when dst==src (LEA reads
+   * both inputs before writing). For larger k, mov+shl+add: the mov is
+   * register-renamed to zero latency, so the dependency chain is shl+add -- two
+   * cycles, shorter than imul's 3-cycle latency and off the single multiply
+   * port. The result is bit-identical to imul (both are mod 2^width; the narrow
+   * canonicalization that follows is unchanged). mov+shl+add needs dst != src so
+   * `source` survives the final add. */
+  if (signed_immediate >= 3 &&
+      binary_immediate_positive_power_of_two_i32(signed_immediate - 1, &shift)) {
+    if (shift >= 1 && shift <= 3 && source != BINARY_GP_RSP) {
+      return binary_emit_lea_reg_base_index_scale_disp(
+          buffer, destination, source, source, 1 << shift, 0);
+    }
+    if (destination != source) {
+      return binary_emit_mov_reg_reg(buffer, destination, source) &&
+             binary_emit_shift_reg_imm8(buffer, 4, destination, shift) &&
+             binary_emit_alu_reg_reg(buffer, 0x01 /* ADD */, destination,
+                                     source);
+    }
+  }
+  /* C = 2^k - 1 (7,15,31,63,...): source*(2^k-1) = (source<<k) - source. Same
+   * rationale and constraints (C==3 is already handled above as 2^1+1). */
+  if (signed_immediate >= 7 && destination != source &&
+      binary_immediate_positive_power_of_two_i32(signed_immediate + 1,
+                                                 &shift)) {
+    return binary_emit_mov_reg_reg(buffer, destination, source) &&
+           binary_emit_shift_reg_imm8(buffer, 4, destination, shift) &&
+           binary_emit_alu_reg_reg(buffer, 0x29 /* SUB */, destination, source);
+  }
+
   if (binary_emit_imul_reg_reg_small_imm(buffer, destination, source,
                                          signed_immediate)) {
     return 1;

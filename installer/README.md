@@ -21,7 +21,7 @@ Native Windows setup wizard built with [Inno Setup 6](https://jrsoftware.org/isi
    ```
    Or stamp a version explicitly:
    ```bat
-   ISCC.exe /DMyAppVersion=0.9.2 installer\Mettle.iss
+   ISCC.exe /DMyAppVersion=0.12.0 installer\Mettle.iss
    ```
 4. Output: `installer\out\Mettle-Setup.exe`
 

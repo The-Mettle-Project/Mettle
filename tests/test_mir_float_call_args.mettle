@@ -1,0 +1,57 @@
+// Regression: float arguments passed to a call now go through the MIR
+// register-allocating backend (homed into XMM0-3), instead of bailing the whole
+// caller to spill-everything codegen. Exercises, all @noinline so the calls
+// actually survive to codegen:
+//
+//   1. add2(a,b)=a+b   -- two float params, the minimal shape that exposed the
+//      allocator entry-live interference bug (both params shared one register,
+//      so a+b computed b+b). Also GP iadd checks the same fix for integers.
+//   2. fma4(a,b,c,d)   -- four float args (XMM0..XMM3), the parallel-move case
+//      that needs XMM0-3 excluded from the caller's allocation pool.
+//   3. negf(x)=-x      -- float unary negate (0-x), matching the fallback.
+//   4. scale_f32(p,k)  -- a float* + a scalar float32 (theta-shape from RoPE).
+//   5. narrow(d)       -- a float64 value passed to a float32 parameter
+//      (cvtsd2ss at the call site, not a low-dword bit truncation).
+//
+// Exit code 1 = every result correct, 0 = some path miscompiled. Built debug,
+// release, and *_fallback (METTLE_MIR=0) so MIR and the legacy backend agree.
+
+@noinline function add2(a: float32, b: float32) -> float32 { return a + b; }
+@noinline function iadd(a: int32, b: int32) -> int32 { return a + b; }
+@noinline function isub(a: int32, b: int32) -> int32 { return a - b; }
+@noinline function fma4(a: float32, b: float32, c: float32, d: float32) -> float32 {
+  return a * b + c - d;
+}
+@noinline function negf(x: float32) -> float32 { return 0.0 - x; }
+@noinline function uneg(x: float64) -> float64 { var y: float64 = -x; return y; }
+@noinline function scale_f32(p: float32*, k: float32) -> float32 { return p[0] * k; }
+@noinline function narrow(d: float64) -> float32 { return (float32)d; }
+
+function approx(x: float32, want: int32) -> int32 {
+  // True when (int32)round(x) == want, tolerant of float rounding.
+  var xi: int32 = (int32)(x + 0.5);
+  if (x < 0.0) { xi = (int32)(x - 0.5); }
+  if (xi == want) { return 1; }
+  return 0;
+}
+
+function main() -> int32 {
+  var ok: int32 = 1;
+
+  if (approx(add2(7.0, 3.0), 10) == 0) { ok = 0; }          // entry-live: a+b
+  if (iadd(7, 3) != 10) { ok = 0; }                          // entry-live: GP
+  if (isub(7, 3) != 4) { ok = 0; }                           // entry-live: GP sub
+  if (approx(fma4(2.0, 3.0, 4.0, 5.0), 5) == 0) { ok = 0; }  // 4 XMM args: 6+4-5
+  if (approx(negf(5.0), -5) == 0) { ok = 0; }                // float negate
+  if (approx(uneg(8.0), -8) == 0) { ok = 0; }                // f64 unary negate
+
+  var buf: float32[2];
+  buf[0] = 6.0;
+  buf[1] = 0.0;
+  if (approx(scale_f32((float32*)((int64)(&buf[0])), 4.0), 24) == 0) { ok = 0; } // 6*4
+
+  if (approx(narrow(12.5) * 2.0, 25) == 0) { ok = 0; }       // f64->f32 arg
+
+  if (ok == 1) { return 1; }
+  return 0;
+}

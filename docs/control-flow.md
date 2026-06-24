@@ -126,8 +126,13 @@ were not checked.
 Both attributes also apply to `while` loops. The diagnostic names the cause when
 it can determine it: a function call in the body, control flow (a nested loop or
 data-dependent branch), an unsupported element width (16- or 64-bit integers
-have no kernel), or, when none of those apply, that no vectorizer recognized
-the loop's shape.
+have no kernel), a loop-carried serial recurrence (a scalar computed from its
+own previous value through a non-reassociable operation — `*`, `/`, a shift, or
+a bitwise/xor op — so the iterations form a dependency chain, e.g. a hash, an
+RNG, or an IIR filter), or, when none of those apply, that no vectorizer
+recognized the loop's shape. The recurrence cause is found by backward
+data-flow analysis, and `+`/`-` reductions are excluded from it — those
+reassociate and vectorize.
 
 `@simd` may also sit on a **function**, where it becomes the default contract
 for *every* counted loop in the body that does not carry its own `@simd`:

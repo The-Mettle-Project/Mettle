@@ -1,0 +1,28 @@
+// Borrow-lifetime diagnostics (M0112): an interior pointer into a heap buffer
+// used after the buffer is freed (use-after-free through a distinct name). The
+// buggy function reports; the clean control reads before freeing and is silent.
+import "std/io";
+import "std/mem";
+
+// M0112: `p` borrows into `buf`'s block, used after `buf` is freed.
+function use_after_free_interior() -> int32 {
+    var buf: cstring = malloc(16);
+    buf[2] = 7;
+    var p: cstring = &buf[2];
+    free(buf);
+    return (int32)p[0];
+}
+
+// Clean control: `q` is read before `data` is freed.
+function clean_free() -> int32 {
+    var data: cstring = malloc(16);
+    data[2] = 7;
+    var q: cstring = &data[2];
+    var v: int32 = (int32)q[0];
+    free(data);
+    return v;
+}
+
+function main() -> int32 {
+    return use_after_free_interior() + clean_free();
+}

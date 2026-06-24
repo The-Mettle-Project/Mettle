@@ -19,7 +19,7 @@ VS Code and Cursor support for **Mettle** (`.mettle`) files.
 - Same-file declaration hovers for functions, globals, structs, enums, traits, methods, and impls.
 - Fast editor diagnostics for lexer-level mistakes.
 - Optional compiler-backed diagnostics for real semantic errors.
-- **Optimization Report panel**: an interactive view of the compiler's `--explain` report.
+- **Optimization Report panel**: an interactive view of the compiler's `--explain` report, with an **Optimizations** tab (vectorization, inlining, verified fixes) and a **Memory** tab (use-after-free, leaks, dangling borrows, and more, with fixes).
 - Syntax highlighting and click-to-source links for `.explain.txt` report sidecars.
 - **Source-level debugger** (F5): breakpoints, stepping, call stack, typed locals, hover evaluation, and live variable editing -- see the Debugging section.
 - Commands:
@@ -85,6 +85,8 @@ Apply them from the card's `Apply fix` button, the `Apply all` banner, or the ed
 **What changed since the last compile.** The compiler keeps a baseline of its decisions per output and leads each report with the diff: loops that newly vectorize, calls that newly inline -- and **regressions**, in red, with the reason ("loop @ 19: REGRESSED -- was vectorized, now scalar: each iteration calls `scale`..."). Save the file, and the panel's top section tells you what your edit just did to the optimizer. Performance regressions surface at compile time, before any benchmark runs. Entities are matched by position within their function, so ordinary edits that shift line numbers don't raise false alarms.
 
 The panel parses the compiler's `--explain-json` sidecar (machine-readable, schema-versioned), and scalar loops nested two or more levels deep carry a `nest depth N` chip -- the deepest loops are the ones worth fixing first.
+
+**A Memory tab.** Alongside the optimization view, a second tab surfaces the compiler's compile-time memory analysis from the same `--explain-json` sidecar: use-after-free, double free, leaks, dangling borrows (a borrow that outlives its scope, or an interior pointer used after a `realloc`/`free`), null dereference, and out-of-bounds. Each diagnostic shows its severity, headline, the analyzer's suggested fix, and jumps to the source line on click. A badge on the tab counts the issues (red for errors, gold for warnings); a clean file says so. Because the analyzer speaks only when it can prove the bug, everything in the tab is real -- there is no false-positive noise to triage.
 
 The panel itself:
 

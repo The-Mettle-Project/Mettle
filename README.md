@@ -38,7 +38,7 @@ Mettle compiles `.mettle` source to native x86-64. On Windows, `mettle --build` 
 - Static types, pointers, structs, and enums
 - Direct calls to C and OS APIs; a bundled stdlib for I/O, memory, math, and more
 - `defer` / `errdefer` for scope cleanup; compile errors with source snippets
-- **Compile-time memory diagnostics**: use-after-free, double free, leak detection, definite null dereference, and over-width shifts as warnings with concrete fix suggestions; hard errors for returning the address of a stack local, constant indexes past an array's end, constant-size memory ops that overwrite a stack frame, division by a constant zero, and the classic loop off-by-one (`while (i <= 8)` over an `int32[8]` is rejected with "use `i < 8`", proven because nothing in the loop can exit early). The analysis is interprocedural: it infers per-function ownership (which parameters a function frees, which it keeps, whether it returns a fresh allocation) across the whole program, so `consume(p); p[0]` is caught as use-after-free even when the `free` lives inside `consume`, and a leak is still seen through a helper that only borrows the pointer. It speaks only when certain; anything conditional stays silent.
+- **Compile-time memory diagnostics**: use-after-free, double free, leak detection, definite null dereference, and over-width shifts as warnings with concrete fix suggestions; hard errors for returning the address of a stack local, constant indexes past an array's end, constant-size memory ops that overwrite a stack frame, division by a constant zero, and the classic loop off-by-one (`while (i <= 8)` over an `int32[8]` is rejected with "use `i < 8`", proven because nothing in the loop can exit early). The analysis is interprocedural: it infers per-function ownership (which parameters a function frees, which it keeps, whether it returns a fresh allocation) across the whole program, so `consume(p); p[0]` is caught as use-after-free even when the `free` lives inside `consume`, and a leak is still seen through a helper that only borrows the pointer. It speaks only when certain; anything conditional stays silent. A **borrow-lifetime** layer extends this to dangling references: a pointer that borrows into a stack local (`p = &x[i]`) and is used after that local's `{ }` block exits, or an interior pointer into a heap buffer (`p = &buf[i]`) used after the buffer is `realloc`'d (the block may have moved) or `free`'d, are each reported with a concrete fix. Ownership is tracked **through pointer copies**, so `q = p; free(q); p[0]` is flagged as use-after-free and `free(a); free(b)` (with `b = a`) as a double free — the single-owner discipline Rust enforces in its type system, here on raw pointers where Rust's borrow checker is off, and entirely by inference with no annotations. See the [borrow checker](docs/borrow-checker.md) doc for how this compares to Rust's.
 - Range-based `for` (`for i in 0..n`) and **`@simd` / `@simd!` vectorization contracts**: ask the optimizer to vectorize a loop, and with `@simd!` fail the build if it can't. An auto-vectorizer (AVX2) backs them, beating `gcc -O3` on several kernels; `--simd-report` shows what each loop became.
 - `--explain` the optimizer as a collaborator: compile with `--explain` and the compiler reports every optimization decision in your file, which loops vectorized (and into what), which didn't (and why), which calls inlined, which were refused (and what to change). No annotations, no disassembly.
 - **Suggested fixes are proven**: before printing "declare the accumulator as int64", the compiler applies that change to an internal copy, re-runs the optimizer, and only prints the suggestion when the loop actually vectorizes. Advice the simulation disproves is replaced with the honest reason.
@@ -101,13 +101,13 @@ curl -fsSL https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/inst
 irm https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/install.ps1 | iex
 ```
 
-Installs to `~/.mettle` (Linux) or `%LOCALAPPDATA%\Mettle` (Windows), updates user PATH, and checks for a C toolchain when linking stdlib programs. No root or admin required. Pin a release: `--version v0.11.0` (Linux) or `-Version v0.11.0` (Windows).
+Installs to `~/.mettle` (Linux) or `%LOCALAPPDATA%\Mettle` (Windows), updates user PATH, and checks for a C toolchain when linking stdlib programs. No root or admin required. Pin a release: `--version v0.12.0` (Linux) or `-Version v0.12.0` (Windows).
 
 ```bash
 mettle --version
 ```
 
-Dev builds from source report `v0.9.3` unless `METTLE_VERSION_RAW` is set at compile time.
+Dev builds from source report `v0.12.0` unless `METTLE_VERSION_RAW` is set at compile time.
 
 ## Build from source
 
@@ -140,6 +140,7 @@ Useful flags: `--build` (executable), `--release` / `-O` (optimized), `--emit-ob
 ## Documentation
 
 - [Language reference](docs/LANGUAGE.md)
+- [Borrow checker](docs/borrow-checker.md) (advisory, zero-false-positive, inference-only ownership & lifetime analysis on raw pointers)
 - [Control flow](docs/control-flow.md) (range-`for`, `@simd` vectorization contracts)
 - [GPU offload](docs/gpu.md) (`kernel` / `dispatch`, CUDA/PTX backend)
 - [Compilation](docs/compilation.md) (CLI, link pipelines, Tracy, profiling)
@@ -199,7 +200,7 @@ The `[mettle-syntax](mettle-syntax/)` extension turns VS Code or Cursor into a f
 
 - **Debugging on F5**: breakpoints, conditional breakpoints, logpoints, step in/over/out, call stacks, struct/array/pointer expansion in the Variables pane, hover and watch evaluation of paths like `box.min.x`, and Set Value that genuinely writes program memory. Crashes stop at the faulting line with the stack and variables still inspectable. Hand-written kernel objects next to the source (`extern ... = "symbol"` plus a sibling `.o`) are detected and linked automatically.
 - **Navigation**: go to definition across imports, find references, rename, outline, workspace symbols, completion with struct fields and signature help, CodeLens with Run / Debug / Build above `main`.
-- **Optimization report panel**: the `--explain` report as an interactive dashboard. One-click fixes for suggestions the optimizer has already verified by simulation, inline loop annotations in the editor, and a "since the last compile" section that shows what your edit just did to the optimizer's decisions, regressions first.
+- **Optimization report panel**: the `--explain` report as an interactive dashboard, with an **Optimizations** tab and a **Memory** tab. One-click fixes for suggestions the optimizer has already verified by simulation, inline loop annotations in the editor, and a "since the last compile" section that shows what your edit just did to the optimizer's decisions, regressions first. The Memory tab surfaces the compile-time memory analysis (use-after-free, leaks, dangling borrows, out-of-bounds) with each diagnostic's proven fix.
 - Syntax highlighting, snippets, hover documentation, and compiler-backed diagnostics, as before.
 
 Everything runs against the compiler in your workspace; there is no separate language server to install.

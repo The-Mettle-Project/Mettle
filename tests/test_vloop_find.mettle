@@ -1,0 +1,123 @@
+// Correctness coverage for the early-exit search skip-ahead (simd_find).
+// The kernel replaces only the loop counter's zero-init; the scalar loop
+// survives and replays the hit iteration, so results must be EXACT first-hit
+// indices. Covers: Form A (if+return / if+break+flag), Form B (&&-condition),
+// all six predicates, literal / runtime-scalar / two-array right-hand sides,
+// int32 and byte elements, hits in the alignment head, in aligned blocks, in
+// the sub-block tail, at index 0, and absent. @simd! pins the for-range form
+// at build time. Returns the number of failures (0 = all correct).
+
+function find_eq(a: int32*, n: int32, k: int32) -> int32 {
+  var i: int32 = 0;
+  while (i < n) { if (a[i] == k) { return i; } i = i + 1; }
+  return -1;
+}
+function find_eq_for(a: int32*, n: int32, k: int32) -> int32 {
+  var r: int32 = -1;
+  @simd! for i in 0..n { if (a[i] == k) { r = i; break; } }
+  return r;
+}
+function find_gt(a: int32*, n: int32, k: int32) -> int32 {
+  var i: int32 = 0;
+  while (i < n) { if (a[i] > k) { return i; } i = i + 1; }
+  return -1;
+}
+function find_lt_break(a: int32*, n: int32, k: int32) -> int32 {
+  var i: int32 = 0;
+  var found: int32 = -1;
+  while (i < n) {
+    if (a[i] < k) { found = i; break; }
+    i = i + 1;
+  }
+  return found;
+}
+function find_ge(a: int32*, n: int32, k: int32) -> int32 {
+  var i: int32 = 0;
+  while (i < n) { if (a[i] >= k) { return i; } i = i + 1; }
+  return -1;
+}
+function find_le(a: int32*, n: int32, k: int32) -> int32 {
+  var i: int32 = 0;
+  while (i < n) { if (a[i] <= k) { return i; } i = i + 1; }
+  return -1;
+}
+function find_ne(a: int32*, n: int32, k: int32) -> int32 {
+  var i: int32 = 0;
+  while (i < n) { if (a[i] != k) { return i; } i = i + 1; }
+  return -1;
+}
+// Form B: textbook scan-while; returns n when no hit
+function scan_ne(a: int32*, n: int32, k: int32) -> int32 {
+  var i: int32 = 0;
+  while (i < n && a[i] != k) { i = i + 1; }
+  return i;
+}
+// two-array mismatch (memcmp shape)
+function mismatch(a: int32*, b: int32*, n: int32) -> int32 {
+  var i: int32 = 0;
+  while (i < n) { if (a[i] != b[i]) { return i; } i = i + 1; }
+  return n;
+}
+// byte find (memchr shape) with a runtime scalar key
+function memchr_b(s: uint8*, n: int32, c: int32) -> int32 {
+  var key: uint8 = (uint8)c;
+  var i: int32 = 0;
+  while (i < n) { if (s[i] == key) { return i; } i = i + 1; }
+  return -1;
+}
+// byte Form B over a bounded buffer (strlen shape; folded `!= 0` condition)
+function strlen_b(s: uint8*, n: int32) -> int32 {
+  var i: int32 = 0;
+  while (i < n && s[i] != 0) { i = i + 1; }
+  return i;
+}
+
+function main() -> int32 {
+  var n: int32 = 1003; // odd size: head + aligned blocks + tail all exercised
+  var a: int32[1003];
+  var b: int32[1003];
+  var s: uint8[1003];
+  var bad: int32 = 0;
+
+  for i in 0..n { a[i] = i * 2 - 500; b[i] = a[i]; s[i] = (uint8)(1 + (i & 100)); }
+
+  if (find_eq(&a[0], n, 0 - 500) != 0) { bad = bad + 1; }
+  if (find_eq(&a[0], n, 0 - 490) != 5) { bad = bad + 1; }
+  if (find_eq(&a[0], n, 524) != 512) { bad = bad + 1; }
+  if (find_eq(&a[0], n, 1500) != 1000) { bad = bad + 1; }
+  if (find_eq(&a[0], n, 99999) != 0 - 1) { bad = bad + 1; }
+  if (find_eq_for(&a[0], n, 524) != 512) { bad = bad + 1; }
+  if (find_eq_for(&a[0], n, 99999) != 0 - 1) { bad = bad + 1; }
+
+  if (find_gt(&a[0], n, 0) != 251) { bad = bad + 1; }
+  if (find_lt_break(&a[0], n, 0 - 499) != 0) { bad = bad + 1; }
+  if (find_ge(&a[0], n, 1504) != 1002) { bad = bad + 1; }
+  if (find_ge(&a[0], n, 99999) != 0 - 1) { bad = bad + 1; }
+  if (find_le(&a[0], n, 0 - 500) != 0) { bad = bad + 1; }
+  a[0] = 7;
+  if (find_ne(&a[0], n, 7) != 1) { bad = bad + 1; }
+  a[0] = 0 - 500;
+
+  if (scan_ne(&a[0], n, 0 - 500) != 0) { bad = bad + 1; }
+  if (scan_ne(&a[0], n, 100) != 300) { bad = bad + 1; }
+  if (scan_ne(&a[0], n, 99999) != n) { bad = bad + 1; }
+
+  b[700] = 42;
+  if (mismatch(&a[0], &b[0], n) != 700) { bad = bad + 1; }
+  b[700] = a[700];
+  if (mismatch(&a[0], &b[0], n) != n) { bad = bad + 1; }
+  b[2] = 9;
+  if (mismatch(&a[0], &b[0], n) != 2) { bad = bad + 1; }
+  b[2] = a[2];
+
+  s[777] = 200;
+  if (memchr_b(&s[0], n, 200) != 777) { bad = bad + 1; }
+  if (memchr_b(&s[0], n, 250) != 0 - 1) { bad = bad + 1; }
+  s[400] = 0;
+  if (strlen_b(&s[0], n) != 400) { bad = bad + 1; }
+  s[400] = 9;
+  if (strlen_b(&s[0], n) != n) { bad = bad + 1; }
+  if (strlen_b(&s[0], 0) != 0) { bad = bad + 1; }
+
+  return bad;
+}

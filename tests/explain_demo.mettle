@@ -123,6 +123,20 @@ function chain(x: float32) -> float32 {
     return step1(step1(step1(x)));
 }
 
+// A loop-carried serial recurrence: `h` is computed from its OWN previous
+// value through *, +, >>, ^ (an LCG/hash step). None of those reassociate, so
+// the lanes form a dependency chain -- the dependence-analysis diagnosis reports
+// the scalar floor, NOT a missing kernel.
+function lcg_hash(seed: int64, n: int64) -> int64 {
+    var h: int64 = seed;
+    var i: int64 = 0;
+    while (i < n) {
+        h = (h * 6364136223846793005 + 1442695040888963407) ^ (h >> 13);
+        i = i + 1;
+    }
+    return h;
+}
+
 function main() -> int32 {
     var xs: float32[64];
     var ys: float32[64];
@@ -154,5 +168,6 @@ function main() -> int32 {
     apply_damp(&ys[0], 64);
     var nf: float32 = norm2(3.0, 4.0) + chain(1.0) + skew(&mm[0], &xs[0], 32);
     var u: int32 = opaque(t + tiny_fixed() + (int32)nf);
+    u = u + (int32)lcg_hash((int64)u, 16);
     return u - u;
 }

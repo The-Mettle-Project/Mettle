@@ -51,6 +51,12 @@ typedef struct {
    * kept in a register the callee preserves (or spilled), since a call clobbers
    * the caller-saved registers. */
   int crosses_call;
+  /* Set when this value's live interval spans a loop back-edge (extended across
+   * [label, branch] during liveness): it is reused on every iteration, so the
+   * spill heuristic prefers to evict a NON-loop-carried value instead -- evicting
+   * a loop-carried base pointer / accumulator / induction var reloads it each
+   * iteration, the opposite of what we want. */
+  int loop_carried;
   /* Two-address coalescing hint: a source vreg of this value's defining op that
    * dies exactly at the def, so this value can reuse its register and the
    * encoder elides the `mov dst, a` copy. -1 (MIR_VREG_NONE) when absent. */
@@ -66,6 +72,14 @@ typedef struct {
    * home covers the whole aggregate (field stores reach past the first 8
    * bytes). Always a multiple of 8. */
   int home_bytes;
+  /* Set for values defined by the prologue (parameters and the hidden
+   * indirect-return pointer): they are ALL simultaneously live from function
+   * entry, each arriving in its own incoming ABI register. Two such values must
+   * therefore interfere even when each is used at only a single (shared)
+   * instruction index -- their point-like [i,i] intervals would otherwise be
+   * judged disjoint by the strict-overlap test and wrongly share a register
+   * (the parallel param-homing move would then clobber one with the other). */
+  int entry_live;
 } MirVreg;
 #define MIR_LIVE_NONE (-1)
 
@@ -228,6 +242,32 @@ typedef enum {
    * a volatile register). */
   MIR_SIMD_SLP_MAC,
 
+  /* Inline element-counted memset/fill kernel (IR_OP_SIMD_FILL), run in place so
+   * the surrounding function keeps register-allocated codegen instead of
+   * dropping to the spill-everything fallback. Call-like: the lowering marshals
+   * base->RCX, element_count->R8, value->RAX with preceding MIR_MOVs, and this op
+   * emits the splat-build + 16-byte-store loop + scalar tail. dst.imm = element
+   * size in BYTES (1/2/4/8). Covers only the no-offset, no-live-iv-writeback
+   * subset (the frame-clear / `a[i] = c` shape); other fill forms stay in the
+   * fallback. Clobbers RAX/RCX/RDX/R8/R9 + xmm0, so the allocator treats it like
+   * a call. */
+  MIR_SIMD_FILL,
+
+  /* Inline float32 affine-map kernel (IR_OP_SIMD_AFFINE_MAP_F32, the
+   * `dst[i] = a*src[i] + b*dst[i] + c` / float-copy class) run in place so the
+   * function keeps register-allocated codegen. Call-like: the lowering marshals
+   * src->RCX, dst->RDX, count->R8 with preceding MIR_MOVs; this op materializes
+   * the (compile-time) coefficient broadcasts and emits the AVX2 loop + scalar
+   * tail + vzeroupper. dst.imm/a.imm/b.imm carry the a/b/c float bits; cc carries
+   * b_is_one|b_is_zero<<1|c_is_zero<<2. Clobbers RAX/RCX/RDX/R8/R9/R10 + ymm0-5. */
+  MIR_SIMD_AFFINE_MAP_F32,
+
+  /* Inline float32 SiLU/SwiGLU gate (IR_OP_SIMD_SILU_F32) run in place. Call-like:
+   * the lowering marshals g/out->RCX, u->RDX (SwiGLU only), count->R8; this op
+   * emits the AVX2 exp-poly SiLU loop. dst.imm = has_mul (1 = SwiGLU `* u[i]`).
+   * Clobbers RAX/RCX/RDX/R8/R9/R10/R11 + ymm0-7 and reserves a scratch frame. */
+  MIR_SIMD_SILU_F32,
+
   MIR_OPCODE_COUNT
 } MirOpcode;
 
@@ -363,6 +403,17 @@ typedef struct {
    * transition penalty. Doing it once per function (not per kernel invocation)
    * keeps tiled inner loops cheap. */
   int used_inline_vector;
+
+  /* Set during lowering when this function passes a float argument to a call in
+   * an XMM register (XMM0..XMM3). Those registers are then removed from the
+   * float allocation pool for the whole function (only the callee-saved XMM8..15
+   * remain), exactly as the GP integer arg registers are never allocatable: it
+   * guarantees no allocated value ever sits in an outgoing XMM argument register,
+   * so the sequence of arg-homing moves before a call can never clobber a
+   * not-yet-consumed argument source (the parallel-move hazard for 2+ float
+   * args). Single-float-arg calls are safe regardless, but the exclusion is
+   * applied uniformly for simplicity. */
+  int has_xmm_arg_call;
 
   int has_error;
 } MirFunction;

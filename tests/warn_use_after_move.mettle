@@ -1,0 +1,58 @@
+// Use-after-move through pointer aliases (M0113): `q = p` makes two names for
+// one allocation, so freeing or reallocating either invalidates the other.
+// This is the single-owner / move discipline Rust enforces in its type system,
+// applied to raw pointers where Rust performs no checking at all. The buggy
+// functions report; the clean controls re-point or read first and stay silent.
+import "std/io";
+import "std/mem";
+
+// Free through the alias `q`, then use the original `buf`: use-after-free.
+function uaf_through_alias() -> int32 {
+    var buf: cstring = malloc(16);
+    buf[0] = 7;
+    var q: cstring = buf;
+    free(q);
+    return (int32)buf[0];
+}
+
+// Free the original `block`, then use the alias `mirror`: same block, gone.
+function uaf_reverse() -> int32 {
+    var block: cstring = malloc(16);
+    var mirror: cstring = block;
+    free(block);
+    return (int32)mirror[0];
+}
+
+// Two names for one block, freed twice: a double free.
+function double_free_alias() -> int32 {
+    var a: cstring = malloc(8);
+    var b: cstring = a;
+    free(a);
+    free(b);
+    return 0;
+}
+
+// Clean control: `view` is re-pointed to its own allocation before `keep` is
+// freed, so it no longer aliases `keep` and stays valid.
+function clean_realias() -> int32 {
+    var keep: cstring = malloc(8);
+    var view: cstring = keep;
+    view = malloc(8);
+    free(keep);
+    var v: int32 = (int32)view[0];
+    free(view);
+    return v;
+}
+
+// Clean control: the alias `peek` is read before `owned` is freed.
+function clean_read_first() -> int32 {
+    var owned: cstring = malloc(8);
+    var peek: cstring = owned;
+    var v: int32 = (int32)peek[0];
+    free(owned);
+    return v;
+}
+
+function main() -> int32 {
+    return uaf_through_alias() + uaf_reverse() + double_free_alias() + clean_realias() + clean_read_first();
+}

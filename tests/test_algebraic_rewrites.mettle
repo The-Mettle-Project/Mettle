@@ -1,0 +1,66 @@
+// Correctness coverage for the declarative rewrite engine
+// (ir_optimize_rewrite.c): the Tier-1 algebraic identity table and the Tier-2
+// constant-reassociation pass. `opaque` is @noinline so its result stays a
+// runtime value the optimizer cannot constant-fold -- forcing the identities
+// and reassociation to actually rewrite symbolic arithmetic, then checking the
+// runtime result still matches the hand-computed answer. main returns 0 on
+// success, or the number of the first failing check.
+
+@noinline function opaque(v: int64) -> int64 {
+  return v;
+}
+
+function main() -> int32 {
+  var a: int64 = opaque(10);
+  var c: int64 = opaque(0 - 4);
+
+  // ---- Tier 1: algebraic identities (every operand parenthesized) ----
+  if ((a + 0) != 10) { return 1; }
+  if ((a - 0) != 10) { return 2; }
+  if ((a * 8) != 80) { return 3; }      // * 2^k -> << k
+  if ((a * 0) != 0) { return 4; }
+  if ((a * 1) != 10) { return 5; }
+  if ((a / 1) != 10) { return 6; }
+  if ((a % 1) != 0) { return 7; }
+  if ((a & 0) != 0) { return 8; }
+  if ((a & -1) != 10) { return 9; }
+  if ((a | 0) != 10) { return 10; }
+  if ((a | -1) != -1) { return 11; }    // x | all-ones = all-ones
+  if ((a ^ 0) != 10) { return 12; }
+  if ((a << 0) != 10) { return 13; }
+  if ((a >> 0) != 10) { return 14; }
+  if ((a - a) != 0) { return 15; }
+  if ((a ^ a) != 0) { return 16; }
+  if ((a | a) != 10) { return 17; }
+  if ((a & a) != 10) { return 18; }
+
+  var eq: int64 = 0;
+  if (a == a) { eq = 1; }
+  if (eq != 1) { return 19; }
+  if (a != a) { return 20; }
+  if (a < a) { return 21; }
+  var le: int64 = 0;
+  if (a <= a) { le = 1; }
+  if (le != 1) { return 22; }
+
+  var andz: int64 = 0;
+  if (a && 0) { andz = 1; }
+  if (andz != 0) { return 23; }
+  var ornz: int64 = 0;
+  if (a || 5) { ornz = 1; }
+  if (ornz != 1) { return 24; }
+
+  // ---- Tier 2: constant reassociation (x ∘ c1) ∘ c2 -> x ∘ K ----
+  if (((a + 3) + 4) != 17) { return 25; }
+  if (((a + 10) - 3) != 17) { return 26; }
+  if (((a - 5) + 2) != 7) { return 27; }
+  if (((a - 5) - 2) != 3) { return 28; }
+  if (((3 + a) + 4) != 17) { return 29; }   // const-on-left producer
+  if (((a * 3) * 4) != 120) { return 30; }
+  if (((a << 2) << 3) != 320) { return 31; }
+  if ((((a + 1) + 2) + 3) != 16) { return 32; }  // chained
+  if (((c - 5) - 2) != (0 - 11)) { return 33; }  // negative result
+  if (((c + 2) + 2) != 0) { return 34; }
+
+  return 0;
+}

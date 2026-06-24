@@ -94,6 +94,40 @@ function vmap_iota_f32(out: float32*, n: int64) -> int32 {
   while (i < n) { out[i] = (float32)i * (float32)3.0 + (float32)1.0; i = i + 1; }
   return 0;
 }
+/* BARE float64 literals (2.0/3.0, no (float32) cast) inside a float32 general
+ * vectorizer DAG: a quadratic the affine kernel can't match, so it exercises
+ * the exactly-narrowable-f64-literal path in vloop_operand_is_literal. The
+ * literals narrow to f32 exactly and the inputs are small integers, so the f32
+ * lanes produce the exact integer 2*x*x + 3*x -- == against the int reference. */
+function vmap_lit_quad_f32(out: float32*, a: float32*, n: int64) -> int32 {
+  var i: int64 = 0;
+  while (i < n) { out[i] = a[i] * a[i] * 2.0 + a[i] * 3.0; i = i + 1; }
+  return 0;
+}
+/* REDUCTION counterpart: `s += a[i] * 2.0` with a bare float64 literal. The
+ * f64-narrowing leaves the accumulation in temp+ASSIGN form (`%t = s + X; s <-
+ * %t`); this exercises both the exactly-narrowable-literal admission AND the
+ * temp+ASSIGN reduction match. Sum of 2*x is an exact integer in f32. */
+function vred_lit_f32(a: float32*, n: int64) -> float32 {
+  var s: float32 = 0.0; var i: int64 = 0;
+  while (i < n) { s = s + a[i] * 2.0; i = i + 1; }
+  return s;
+}
+/* Body-local substitution: a single-assignment per-iteration local (`d`) that
+ * the DAG builder substitutes in place of the symbol. Reduction (sum of squared
+ * differences) and map (squared-difference) forms; integer inputs keep ==
+ * exact. These are the SSD / variance / `var x=...; x*x` shapes. */
+function vred_ssd_f32(a: float32*, b: float32*, n: int64) -> float32 {
+  var s: float32 = 0.0; var i: int64 = 0;
+  while (i < n) { var d: float32 = a[i] - b[i]; s = s + d * d; i = i + 1; }
+  return s;
+}
+function vmap_sqdiff_f32(out: float32*, a: float32*, b: float32*,
+                         n: int64) -> int32 {
+  var i: int64 = 0;
+  while (i < n) { var d: float32 = a[i] - b[i]; out[i] = d * d; i = i + 1; }
+  return 0;
+}
 
 var g_fail: int32 = 0;
 function fail(label: cstring, len: int64) -> int32 {
@@ -119,6 +153,8 @@ function run_len(n: int64) -> int32 {
   var ref_affine: float64 = 0.0;
   var ref_combo: float64 = 0.0;
   var ref_ssq: float64 = 0.0;
+  var ref_litquad: float64 = 0.0;
+  var ref_sqdiff: float64 = 0.0;
   var i: int64 = 0;
   while (i < n) {
     var x: int32 = rnd_small();
@@ -131,6 +167,8 @@ function run_len(n: int64) -> int32 {
     ref_affine = ref_affine + (float64)(2 * x + 3 * y + 5);
     ref_combo = ref_combo + (float64)((x + y) * z);
     ref_ssq = ref_ssq + (float64)(x * x + y);
+    ref_litquad = ref_litquad + (float64)(2 * x * x + 3 * x);
+    ref_sqdiff = ref_sqdiff + (float64)((x - y) * (x - y));
     i = i + 1;
   }
 
@@ -159,6 +197,17 @@ function run_len(n: int64) -> int32 {
   if ((float64)ks_f32(o32, n) != (float64)(3 * n * (n - 1) / 2 + n)) {
     fail(cstr("vloop_map_iota_f32"), n);
   }
+  // bare-f64-literal quadratic map (exactly-narrowable literals): sum the
+  // outputs and compare to the exact integer reference sum 2*x*x + 3*x.
+  vmap_lit_quad_f32(o32, a32, n);
+  if ((float64)ks_f32(o32, n) != ref_litquad) { fail(cstr("vloop_lit_quad_f32"), n); }
+  // bare-f64-literal reduction (temp+ASSIGN accumulation form): sum 2*a[i].
+  if ((float64)vred_lit_f32(a32, n) != 2.0 * ref_sum) { fail(cstr("vloop_lit_red_f32"), n); }
+  // body-local substitution: SSD reduction and squared-difference map (run
+  // before ka_f32 overwrites b32).
+  if ((float64)vred_ssd_f32(a32, b32, n) != ref_sqdiff) { fail(cstr("vloop_ssd_f32"), n); }
+  vmap_sqdiff_f32(o32, a32, b32, n);
+  if ((float64)ks_f32(o32, n) != ref_sqdiff) { fail(cstr("vloop_sqdiff_map_f32"), n); }
 
   ka_f64(a64, b64, n);
   ka_f32(a32, b32, n);

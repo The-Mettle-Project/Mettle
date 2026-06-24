@@ -4,6 +4,19 @@
 // Inputs are chosen so reductions are exact regardless of reassociation.
 // Returns the number of failures (0 = all correct).
 
+extern function expf(x: float32) -> float32 = "expf";
+
+// Scalar SiLU reference; @noinline so the loop calling it keeps a real call and
+// is NOT matched by the SiLU recognizer (a true scalar baseline).
+@noinline function ref_silu(x: float32) -> float32 {
+  return x / (1.0 + expf(0.0 - x));
+}
+// SwiGLU gate: in-place g[i] = silu(g[i]) * u[i]. @simd! asserts it vectorizes
+// to IR_OP_SIMD_SILU_F32 at --release.
+function vsilu_gate(g: float32*, u: float32*, n: int32) {
+  @simd! for i in 0..n { g[i] = (g[i] / (1.0 + expf(0.0 - g[i]))) * u[i]; }
+}
+
 function vmap_f64(out: float64*, a: float64*, n: int32) {
   @simd! for i in 0..n { out[i] = a[i] * 2.0 + 1.0; }
 }
@@ -29,6 +42,16 @@ function vdot_f32(a: float32*, b: float32*, n: int32) -> float32 {
   var s: float32 = 0.0;
   @simd! for i in 0..n { s = s + a[i] * b[i]; }
   return s;
+}
+
+// Two loops over the SAME array: the first writes it (and vectorizes, emitting
+// `@out = simd_affine_map_f64(dst=@out, ...)`), the second reads-and-writes it.
+// Regression for the base-poisoning bug: the first loop's fused op made the
+// second loop's @simd! fail to vectorize (the base `out` looked "written").
+// Both must vectorize now (the @simd! on the second asserts it).
+function vtwo_loops_f64(out: float64*, a: float64*, n: int32) {
+  @simd! for i in 0..n { out[i] = a[i]; }            // copy a -> out
+  @simd! for i in 0..n { out[i] = out[i] + a[i]; }   // out += a (was poisoned)
 }
 
 function fabs64(x: float64) -> float64 { if (x < 0.0) { return 0.0 - x; } return x; }
@@ -67,6 +90,21 @@ function main() -> int32 {
   // vdot_f32: a[i]=2, b[i]=3 -> sum = 6n
   for i in 0..n { af[i] = 2.0; bf[i] = 3.0; }
   if (fabs64((float64)vdot_f32(&af[0], &bf[0], n) - (float64)n * 6.0) > 0.1) { bad = bad + 1; }
+
+  // vtwo_loops_f64: out=a then out=out+a => out[i] = 2*a[i] = 2i
+  for i in 0..n { a[i] = (float64)i; }
+  vtwo_loops_f64(&out[0], &a[0], n);
+  for i in 0..n { if (fabs64(out[i] - (float64)i * 2.0) > 0.0001) { bad = bad + 1; } }
+
+  // vsilu_gate: af[i] = silu(g) * u, compared to the scalar ref_silu (the
+  // vectorized exp poly tracks libc expf within tolerance).
+  for i in 0..n { af[i] = (float32)(i % 13) - 6.0; bf[i] = (float32)(i % 5) + 0.5; }
+  vsilu_gate(&af[0], &bf[0], n);
+  for i in 0..n {
+    var x: float32 = (float32)(i % 13) - 6.0;
+    var want: float32 = ref_silu(x) * ((float32)(i % 5) + 0.5);
+    if (fabs64((float64)af[i] - (float64)want) > 0.001) { bad = bad + 1; }
+  }
 
   return bad;
 }

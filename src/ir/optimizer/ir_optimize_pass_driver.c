@@ -154,6 +154,7 @@ static void ir_trace_pass_event(const char *pass_name, const char *event,
     fprintf(stderr, " changed=%d", changed);
   }
   fputc('\n', stderr);
+  fflush(stderr); /* the trace exists to locate hangs; keep it ordered */
 }
 
 /* Diagnostic: METTLE_SKIP_PASS="sroa,16" disables the listed pass names or

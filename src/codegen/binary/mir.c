@@ -46,6 +46,7 @@ MirVregId mir_new_vreg(MirFunction *fn, MirRegClass rclass, int width) {
   v->spill_offset = 0;
   v->live_start = MIR_LIVE_NONE;
   v->live_end = MIR_LIVE_NONE;
+  v->loop_carried = 0;
   v->coalesce_hint = MIR_VREG_NONE;
   return (MirVregId)(fn->vreg_count++);
 }
@@ -213,6 +214,9 @@ static const char *mir_opcode_name(MirOpcode op) {
   case MIR_VIOTA: return "viota";
   case MIR_VHREDUCE: return "vhreduce";
   case MIR_SIMD_SLP_MAC: return "simd_slp_mac";
+  case MIR_SIMD_FILL: return "simd_fill";
+  case MIR_SIMD_AFFINE_MAP_F32: return "simd_affine_map_f32";
+  case MIR_SIMD_SILU_F32: return "simd_silu_f32";
   case MIR_OPCODE_COUNT: break;
   }
   return "?";

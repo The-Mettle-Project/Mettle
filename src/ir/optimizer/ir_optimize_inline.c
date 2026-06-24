@@ -1177,6 +1177,25 @@ int ir_inline_explain_simulate_force_inline(IRProgram *program,
     return 0;
   }
 
+  /* A self-recursive callee can never be inlined AWAY: every expansion
+   * re-creates the same call inside the loop, so the @inline advice is dead
+   * on arrival -- and actually running the forced rounds grows the clone
+   * geometrically (rec_fib: 179 -> 114,839 instructions by round 3, then a
+   * multi-minute re-optimize of the wreckage). Withdraw the advice with the
+   * honest reason instead of simulating it. */
+  for (size_t i = 0; i < callee->instruction_count; i++) {
+    const IRInstruction *ins = &callee->instructions[i];
+    if (ins->op == IR_OP_CALL && ins->text &&
+        strcmp(ins->text, callee_name) == 0) {
+      if (decline_reason_out) {
+        *decline_reason_out =
+            "the callee is recursive (it calls itself), so inlining cannot "
+            "remove the call from the loop body";
+      }
+      return 0;
+    }
+  }
+
   /* Two pretends, reported distinctly: a `@noinline` callee simulates the
    * user REMOVING that decorator (the veto precedes everything, so forcing
    * is_inline alone would never fire); anything else simulates ADDING
@@ -1218,6 +1237,16 @@ int ir_inline_explain_simulate_force_inline(IRProgram *program,
         break;
       }
       changed = 1;
+      /* Runaway-growth guard: the direct self-call refusal above cannot see
+       * mutual recursion (A calls B calls A), where each pretend round
+       * re-introduces the calls it just expanded. A clone this size is no
+       * longer evidence about the user's loop -- abandon the simulation and
+       * let the caller keep its generic advice. */
+      if (caller->instruction_count >
+          16 * IR_INLINE_MAX_CALLER_NON_NOP_INSTRUCTIONS) {
+        changed = 0;
+        break;
+      }
     }
   }
   callee->is_inline = saved_is_inline;

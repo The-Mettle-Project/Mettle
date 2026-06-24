@@ -5500,6 +5500,10 @@ int code_generator_binary_emit_instruction(
     return code_generator_binary_emit_simd_sum_i32(generator, context,
                                                    instruction);
 
+  case IR_OP_SIMD_LCG_U32:
+    return code_generator_binary_emit_simd_lcg_u32(generator, context,
+                                                   instruction);
+
   case IR_OP_SIMD_SUM_U8:
     return code_generator_binary_emit_simd_sum_u8(generator, context,
                                                   instruction);
@@ -5578,6 +5582,9 @@ int code_generator_binary_emit_instruction(
   case IR_OP_SIMD_EXP_F32:
     return code_generator_binary_emit_simd_exp_f32(generator, context,
                                                    instruction);
+  case IR_OP_SIMD_SILU_F32:
+    return code_generator_binary_emit_simd_silu_f32(generator, context,
+                                                    instruction);
 
   case IR_OP_SIMD_AFFINE_MAP_F32:
     return code_generator_binary_emit_simd_affine_map_f32(generator, context,
@@ -5589,6 +5596,9 @@ int code_generator_binary_emit_instruction(
   case IR_OP_SIMD_VLOOP_I32:
     return code_generator_binary_emit_simd_vloop_f64(generator, context,
                                                      instruction);
+  case IR_OP_SIMD_FIND:
+    return code_generator_binary_emit_simd_find(generator, context,
+                                                instruction);
   case IR_OP_SIMD_OUTER_LANE_F64:
     return code_generator_binary_emit_simd_outer_lane_f64(generator, context,
                                                           instruction);

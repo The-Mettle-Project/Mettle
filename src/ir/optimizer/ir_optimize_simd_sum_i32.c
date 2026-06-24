@@ -229,8 +229,20 @@ static int ir_try_vectorize_sum_i32_at(IRFunction *function, size_t header_index
           ir_find_temp_producer_before(function, i, ins->rhs.name);
       int ok = 0;
       if (prod && prod->op == IR_OP_CAST && prod->text &&
-          strcmp(prod->text, "int64") == 0) {
-        ok = 1; /* s += (int64)a[i] */
+          strcmp(prod->text, "int64") == 0 &&
+          prod->lhs.kind == IR_OPERAND_TEMP && prod->lhs.name) {
+        /* s += (int64)a[i]: the cast operand must be a signed int32 (non-float)
+         * load. A FLOAT load here is a float->int CONVERSION the vpaddd kernel
+         * does not perform -- it bit-adds the lanes, summing the raw IEEE bits
+         * (a silent miscompile); an UNSIGNED load would zero-extend, diverging
+         * from the kernel's sign-extending int32->int64 widening. */
+        const IRInstruction *load =
+            ir_find_temp_producer_before(function, i, prod->lhs.name);
+        if (load && load->op == IR_OP_LOAD &&
+            load->rhs.kind == IR_OPERAND_INT && load->rhs.int_value == 4 &&
+            !load->is_float && !load->is_unsigned) {
+          ok = 1; /* s += (int64)a[i] */
+        }
       } else if (prod && prod->op == IR_OP_LOAD &&
                  prod->rhs.kind == IR_OPERAND_INT &&
                  prod->rhs.int_value == 4 && !prod->is_float &&
@@ -831,6 +843,246 @@ int ir_simd_byte_map_pass(IRFunction *function, int *changed) {
     if (function->instructions[i].op == IR_OP_LABEL &&
         ir_label_is_while_header(function->instructions[i].text)) {
       if (!ir_try_vectorize_byte_map_at(function, i, changed)) {
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Linear-congruential recurrence reduction -> IR_OP_SIMD_LCG_U32            */
+/* Matches `state = state*A + C; sum += (int64)(state & MASK); i++` over a    */
+/* counted loop carrying a uint32 state, and replaces it with the 8-lane      */
+/* closed-form kernel (state_{k+8} = A^8*state_k + (A^7+..+1)*C, mod 2^32).   */
+/* -------------------------------------------------------------------------- */
+static int ir_try_vectorize_lcg_at(IRFunction *function, size_t header_index,
+                                   int *changed) {
+  if (!function || header_index + 4 >= function->instruction_count) {
+    return 1;
+  }
+  IRInstruction *header = &function->instructions[header_index];
+  if (header->op != IR_OP_LABEL || !ir_label_is_while_header(header->text)) {
+    return 1;
+  }
+  const char *loop_label = header->text;
+  size_t compare_index = 0, branch_index = 0;
+  if (!ir_find_next_non_nop(function, header_index + 1, &compare_index) ||
+      !ir_find_next_non_nop(function, compare_index + 1, &branch_index)) {
+    return 1;
+  }
+  IRInstruction *compare = &function->instructions[compare_index];
+  IRInstruction *branch = &function->instructions[branch_index];
+  if (compare->op != IR_OP_BINARY || compare->is_float || !compare->text ||
+      strcmp(compare->text, "<") != 0 ||
+      compare->lhs.kind != IR_OPERAND_SYMBOL || !compare->lhs.name ||
+      compare->dest.kind != IR_OPERAND_TEMP || !compare->dest.name ||
+      branch->op != IR_OP_BRANCH_ZERO ||
+      !ir_operand_is_temp_named(&branch->lhs, compare->dest.name)) {
+    return 1;
+  }
+  const char *iv_symbol = compare->lhs.name;
+  if (compare->rhs.kind != IR_OPERAND_SYMBOL &&
+      compare->rhs.kind != IR_OPERAND_INT) {
+    return 1;
+  }
+
+  size_t jump_index = (size_t)-1;
+  for (size_t i = branch_index + 1; i < function->instruction_count; i++) {
+    if (function->instructions[i].op == IR_OP_JUMP &&
+        function->instructions[i].text &&
+        strcmp(function->instructions[i].text, loop_label) == 0) {
+      jump_index = i;
+      break;
+    }
+    if (function->instructions[i].op == IR_OP_LABEL) {
+      break;
+    }
+  }
+  if (jump_index == (size_t)-1 ||
+      ir_loop_body_has_nested_while(function, branch_index + 1, jump_index)) {
+    return 1;
+  }
+
+  const char *state_sym = NULL, *sum_sym = NULL;
+  const char *mul_tmp = NULL, *mask_tmp = NULL, *cast_tmp = NULL;
+  long long A = 0, C = 0, MASK = 0;
+  int have_mul = 0, have_upd = 0, have_mask = 0, have_cast = 0, have_acc = 0;
+  int have_inc = 0;
+
+  for (size_t i = branch_index + 1; i < jump_index; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op == IR_OP_BINARY && !in->is_float && in->text &&
+        strcmp(in->text, "*") == 0 && in->dest.kind == IR_OPERAND_TEMP &&
+        in->dest.name && in->lhs.kind == IR_OPERAND_SYMBOL && in->lhs.name &&
+        in->rhs.kind == IR_OPERAND_INT) {
+      state_sym = in->lhs.name;
+      A = in->rhs.int_value;
+      mul_tmp = in->dest.name;
+      have_mul = 1;
+      break;
+    }
+  }
+  if (!have_mul) {
+    return 1;
+  }
+  {
+    const char *st = ir_function_local_declared_type(function, state_sym);
+    if (!st || strcmp(st, "uint32") != 0) {
+      return 1;
+    }
+  }
+  for (size_t i = branch_index + 1; i < jump_index; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op == IR_OP_BINARY && !in->is_float && in->text &&
+        strcmp(in->text, "+") == 0 && in->dest.kind == IR_OPERAND_SYMBOL &&
+        in->dest.name && strcmp(in->dest.name, state_sym) == 0 &&
+        ir_operand_is_temp_named(&in->lhs, mul_tmp) &&
+        in->rhs.kind == IR_OPERAND_INT) {
+      C = in->rhs.int_value;
+      have_upd = 1;
+      break;
+    }
+  }
+  if (!have_upd) {
+    return 1;
+  }
+  for (size_t i = branch_index + 1; i < jump_index; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op == IR_OP_BINARY && !in->is_float && in->text &&
+        strcmp(in->text, "&") == 0 && in->dest.kind == IR_OPERAND_TEMP &&
+        in->dest.name && ir_operand_is_symbol_named(&in->lhs, state_sym) &&
+        in->rhs.kind == IR_OPERAND_INT) {
+      MASK = in->rhs.int_value;
+      mask_tmp = in->dest.name;
+      have_mask = 1;
+      break;
+    }
+  }
+  if (!have_mask) {
+    return 1;
+  }
+  for (size_t i = branch_index + 1; i < jump_index; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op == IR_OP_CAST && in->dest.kind == IR_OPERAND_TEMP &&
+        in->dest.name && ir_operand_is_temp_named(&in->lhs, mask_tmp)) {
+      cast_tmp = in->dest.name;
+      have_cast = 1;
+      break;
+    }
+  }
+  if (!have_cast) {
+    return 1;
+  }
+  for (size_t i = branch_index + 1; i < jump_index; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op == IR_OP_BINARY && !in->is_float && in->text &&
+        strcmp(in->text, "+") == 0 && in->dest.kind == IR_OPERAND_SYMBOL &&
+        in->dest.name && in->lhs.kind == IR_OPERAND_SYMBOL && in->lhs.name &&
+        strcmp(in->lhs.name, in->dest.name) == 0 &&
+        ir_operand_is_temp_named(&in->rhs, cast_tmp)) {
+      sum_sym = in->dest.name;
+      have_acc = 1;
+      break;
+    }
+  }
+  if (!have_acc) {
+    return 1;
+  }
+  {
+    const char *st = ir_function_local_declared_type(function, sum_sym);
+    if (!st || strcmp(st, "int64") != 0) {
+      return 1;
+    }
+  }
+  for (size_t i = branch_index + 1; i < jump_index; i++) {
+    if (ir_try_parse_direct_unit_increment(&function->instructions[i],
+                                           iv_symbol)) {
+      have_inc = 1;
+      break;
+    }
+  }
+  if (!have_inc) {
+    return 1;
+  }
+
+  /* Every other body instruction must write only a known temp/symbol of the
+   * matched chain (no loads/stores/calls/extra state). */
+  for (size_t i = branch_index + 1; i < jump_index; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op == IR_OP_NOP) {
+      continue;
+    }
+    if (in->op == IR_OP_STORE || in->op == IR_OP_LOAD ||
+        in->op == IR_OP_CALL || in->op == IR_OP_CALL_INDIRECT ||
+        in->op == IR_OP_JUMP || in->op == IR_OP_BRANCH_ZERO ||
+        in->op == IR_OP_BRANCH_EQ) {
+      return 1;
+    }
+    if (!in->dest.name) {
+      return 1;
+    }
+    int known = (in->dest.kind == IR_OPERAND_TEMP &&
+                 ((mul_tmp && strcmp(in->dest.name, mul_tmp) == 0) ||
+                  (mask_tmp && strcmp(in->dest.name, mask_tmp) == 0) ||
+                  (cast_tmp && strcmp(in->dest.name, cast_tmp) == 0) ||
+                  (compare->dest.name &&
+                   strcmp(in->dest.name, compare->dest.name) == 0))) ||
+                (in->dest.kind == IR_OPERAND_SYMBOL &&
+                 (strcmp(in->dest.name, state_sym) == 0 ||
+                  strcmp(in->dest.name, sum_sym) == 0 ||
+                  strcmp(in->dest.name, iv_symbol) == 0));
+    if (!known) {
+      return 1;
+    }
+  }
+
+  if (!ir_iv_zero_at_header(function, header_index, iv_symbol) ||
+      ir_symbol_live_after_loop(function, jump_index + 1, iv_symbol) ||
+      ir_symbol_live_after_loop(function, jump_index + 1, state_sym)) {
+    return 1;
+  }
+
+  IRInstruction fused = {0};
+  fused.op = IR_OP_SIMD_LCG_U32;
+  fused.location = header->location;
+  fused.dest = ir_operand_symbol(sum_sym);
+  /* Duplicate the bound operand: a shallow copy would share compare->rhs.name,
+   * which is freed when the loop body is NOP'd below (double-free). */
+  if (compare->rhs.kind == IR_OPERAND_INT) {
+    fused.lhs = ir_operand_int(compare->rhs.int_value);
+  } else {
+    fused.lhs = ir_operand_symbol(compare->rhs.name);
+  }
+  fused.rhs = ir_operand_symbol(state_sym);
+  fused.arguments = calloc(3, sizeof(IROperand));
+  if (!fused.arguments) {
+    return 0;
+  }
+  fused.argument_count = 3;
+  fused.arguments[0] = ir_operand_int(A);
+  fused.arguments[1] = ir_operand_int(C);
+  fused.arguments[2] = ir_operand_int(MASK);
+
+  ir_instruction_destroy_storage(header);
+  *header = fused;
+  for (size_t i = header_index + 1; i <= jump_index; i++) {
+    ir_instruction_make_nop(&function->instructions[i]);
+  }
+  if (changed) {
+    *changed = 1;
+  }
+  return 1;
+}
+
+int ir_simd_lcg_pass(IRFunction *function, int *changed) {
+  if (!function) {
+    return 0;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    if (function->instructions[i].op == IR_OP_LABEL &&
+        ir_label_is_while_header(function->instructions[i].text)) {
+      if (!ir_try_vectorize_lcg_at(function, i, changed)) {
         return 0;
       }
     }
