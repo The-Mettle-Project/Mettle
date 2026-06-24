@@ -775,13 +775,19 @@ static int binary_emitter_write_coff_object_file(BinaryEmitter *emitter,
     }
     section_reloc_counts[relocation->section_index]++;
   }
+  /* COFF stores a section's relocation count in a 16-bit field. When a section
+   * has more than 0xFFFF relocations we use the IMAGE_SCN_LNK_NRELOC_OVFL
+   * mechanism: the count field is set to 0xFFFF, the flag is set in the section
+   * characteristics, and a synthetic first relocation record carries the real
+   * count (+1, to include itself) in its VirtualAddress. */
+  uint32_t reloc_overflow_max = 0xFFFFu;
   for (size_t i = 0; i < emitter->section_count; i++) {
-    if (section_reloc_counts[i] > 0xFFFFu) {
-      binary_emitter_set_error(emitter,
-                               "Section relocation count exceeds COFF limit");
-      goto cleanup;
+    if (section_reloc_counts[i] > reloc_overflow_max) {
+      reloc_overflow_max = section_reloc_counts[i];
     }
   }
+  /* A section with exactly 0xFFFF real relocations would be ambiguous with the
+   * overflow sentinel, so it must also use the overflow form. */
 
   uint32_t offset = 20u + (uint32_t)(emitter->section_count * 40u);
   for (size_t i = 0; i < emitter->section_count; i++) {
@@ -794,7 +800,11 @@ static int binary_emitter_write_coff_object_file(BinaryEmitter *emitter,
   for (size_t i = 0; i < emitter->section_count; i++) {
     if (section_reloc_counts[i] > 0) {
       section_reloc_offsets[i] = offset;
-      offset += section_reloc_counts[i] * 10u;
+      uint32_t records = section_reloc_counts[i];
+      if (records >= 0xFFFFu) {
+        records += 1u; /* synthetic overflow-count record */
+      }
+      offset += records * 10u;
     }
   }
   uint32_t pointer_to_symbol_table = offset;
@@ -817,6 +827,13 @@ static int binary_emitter_write_coff_object_file(BinaryEmitter *emitter,
       characteristics =
           binary_emitter_default_section_characteristics(section->kind);
     }
+    /* >= 0xFFFF relocations -> overflow form: 0xFFFF in the count field plus the
+     * IMAGE_SCN_LNK_NRELOC_OVFL (0x01000000) flag. */
+    uint16_t reloc_count_field = (uint16_t)section_reloc_counts[i];
+    if (section_reloc_counts[i] >= 0xFFFFu) {
+      reloc_count_field = 0xFFFFu;
+      characteristics |= 0x01000000u;
+    }
     if (!binary_emitter_write_section_name(file, section->name,
                                            section_name_offsets[i]) ||
         !binary_emitter_write_u32(file, 0) ||
@@ -826,7 +843,7 @@ static int binary_emitter_write_coff_object_file(BinaryEmitter *emitter,
         !binary_emitter_write_u32(file, section_raw_offsets[i]) ||
         !binary_emitter_write_u32(file, section_reloc_offsets[i]) ||
         !binary_emitter_write_u32(file, 0) ||
-        !binary_emitter_write_u16(file, (uint16_t)section_reloc_counts[i]) ||
+        !binary_emitter_write_u16(file, reloc_count_field) ||
         !binary_emitter_write_u16(file, 0) ||
         !binary_emitter_write_u32(file, characteristics)) {
       binary_emitter_set_error(emitter,
@@ -888,32 +905,51 @@ static int binary_emitter_write_coff_object_file(BinaryEmitter *emitter,
     }
     free(cursor);
 
+    /* Write relocations per section so an overflow section can be prefixed by
+     * its synthetic count record (VirtualAddress = real count + 1). */
     int order_ok = 1;
-    for (size_t k = 0; k < emitter->relocation_count && order_ok; k++) {
-      const BinaryRelocation *relocation =
-          &emitter->relocations[ordered_relocations[k]];
-
-      int symbol_index =
-          binary_emitter_find_symbol_index(emitter, relocation->symbol_name);
-      if (symbol_index < 0) {
-        char error_buffer[256];
-        snprintf(error_buffer, sizeof(error_buffer),
-                 "Relocation refers to an undefined symbol '%s'",
-                 relocation->symbol_name ? relocation->symbol_name : "<null>");
-        binary_emitter_set_error(emitter, error_buffer);
-        order_ok = 0;
-        break;
+    for (size_t s = 0; s < emitter->section_count && order_ok; s++) {
+      if (section_reloc_counts[s] == 0) {
+        continue;
       }
+      if (section_reloc_counts[s] >= 0xFFFFu) {
+        if (!binary_emitter_write_u32(file, section_reloc_counts[s] + 1u) ||
+            !binary_emitter_write_u32(file, 0) ||
+            !binary_emitter_write_u16(file, 0)) {
+          binary_emitter_set_error(
+              emitter, "Failed while writing COFF relocation overflow record");
+          order_ok = 0;
+          break;
+        }
+      }
+      size_t k = section_reloc_start[s];
+      size_t k_end = section_reloc_start[s + 1];
+      for (; k < k_end && order_ok; k++) {
+        const BinaryRelocation *relocation =
+            &emitter->relocations[ordered_relocations[k]];
 
-      if (!binary_emitter_write_u32(file, (uint32_t)relocation->offset) ||
-          !binary_emitter_write_u32(
-              file, symbol_table_indices[(size_t)symbol_index]) ||
-          !binary_emitter_write_u16(
-              file, binary_emitter_map_relocation_kind(relocation->kind))) {
-        binary_emitter_set_error(emitter,
-                                 "Failed while writing COFF relocations");
-        order_ok = 0;
-        break;
+        int symbol_index =
+            binary_emitter_find_symbol_index(emitter, relocation->symbol_name);
+        if (symbol_index < 0) {
+          char error_buffer[256];
+          snprintf(error_buffer, sizeof(error_buffer),
+                   "Relocation refers to an undefined symbol '%s'",
+                   relocation->symbol_name ? relocation->symbol_name : "<null>");
+          binary_emitter_set_error(emitter, error_buffer);
+          order_ok = 0;
+          break;
+        }
+
+        if (!binary_emitter_write_u32(file, (uint32_t)relocation->offset) ||
+            !binary_emitter_write_u32(
+                file, symbol_table_indices[(size_t)symbol_index]) ||
+            !binary_emitter_write_u16(
+                file, binary_emitter_map_relocation_kind(relocation->kind))) {
+          binary_emitter_set_error(emitter,
+                                   "Failed while writing COFF relocations");
+          order_ok = 0;
+          break;
+        }
       }
     }
 

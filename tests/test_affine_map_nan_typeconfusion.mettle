@@ -1,0 +1,68 @@
+// Regression: two related miscompiles in the float affine-map vectorizer,
+// both found by differential fuzzing the general vectorizer.
+//
+// (1) 0*NaN: the affine model is dst[i] = a*src[i] + b*dst[i] + c. A map that
+//     does not read dst (e.g. out[i] = a[i]*2 + 1) lowers to b == 0, but the
+//     kernel computed `b*dst[i]` = `0 * dst[i]`. dst is the OUTPUT buffer; where
+//     its uninitialized bits formed a NaN/Inf, 0*x is NaN, not 0 -- so the map
+//     wrote NaN. Fixed by dropping the dst term when b is a constant 0.
+//
+// (2) Type confusion: a degenerate integer copy out[i] = a[i] (a bare load,
+//     affine scale 1) has the same base+(i<<2) shape as a float32 map, so the
+//     float recognizer claimed it and emitted `1.0f * x` -- which canonicalizes
+//     the payload of any uint32 whose bits form a float NaN, corrupting the
+//     copy. Fixed by gating the recognizer on store->is_float.
+//
+// Both checks are deterministic (the output buffer is explicitly poisoned with
+// NaN / the inputs are explicit float-NaN bit patterns). Returns 0 on success.
+
+@noinline function poison(z: float64) -> float64 { return z / z; }  // NaN, opaque
+
+@noinline function amap64(out: float64*, a: float64*, n: int32) {
+  var i: int32 = 0;
+  while (i < n) { out[i] = a[i] * 2.0 + 1.0; i = i + 1; }   // b == 0
+}
+@noinline function amap32(out: float32*, a: float32*, n: int32) {
+  var i: int32 = 0;
+  while (i < n) { out[i] = a[i] * 2.0 + 1.0; i = i + 1; }   // b == 0
+}
+@noinline function ucopy(out: uint32*, a: uint32*, n: int32) {
+  var i: int32 = 0;
+  while (i < n) { out[i] = a[i] + 0; i = i + 1; }            // degenerate copy
+}
+
+function main() -> int32 {
+  var bad: int32 = 0;
+  var n: int32 = 200;
+
+  // (1) f64 affine over a NaN-poisoned output buffer
+  var a: float64[200];
+  var o: float64[200];
+  var nan: float64 = poison(0.0);
+  var i: int32 = 0;
+  while (i < n) { a[i] = (float64)(i - 100); o[i] = nan; i = i + 1; }
+  amap64(&o[0], &a[0], n);
+  i = 0;
+  while (i < n) { if (o[i] != (float64)(i - 100) * 2.0 + 1.0) { bad = bad + 1; } i = i + 1; }
+
+  // (1) f32 affine over a NaN-poisoned output buffer
+  var af: float32[200];
+  var of: float32[200];
+  var nanf: float32 = (float32)nan;
+  i = 0;
+  while (i < n) { af[i] = (float32)(i - 100); of[i] = nanf; i = i + 1; }
+  amap32(&of[0], &af[0], n);
+  i = 0;
+  while (i < n) { if (of[i] != (float32)(i - 100) * 2.0 + 1.0) { bad = bad + 1; } i = i + 1; }
+
+  // (2) uint32 copy of float-NaN bit patterns must be exact (not float-laundered)
+  var ua: uint32[200];
+  var uo: uint32[200];
+  i = 0;
+  while (i < n) { ua[i] = (uint32)(2143289344 + i); i = i + 1; } // 0x7FC00000+ = qNaN payloads
+  ucopy(&uo[0], &ua[0], n);
+  i = 0;
+  while (i < n) { if (uo[i] != ua[i]) { bad = bad + 1; } i = i + 1; }
+
+  return bad;
+}

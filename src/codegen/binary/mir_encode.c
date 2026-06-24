@@ -39,6 +39,20 @@ static int enc_err(MirFunction *fn, const char *msg) {
 /* rbp-relative offset of a spilled vreg (mem = [rbp - offset]). */
 static int spill_off(const MirVreg *v) { return v->spill_offset; }
 
+/* Frame base register for stack slots: RSP when the frame pointer is omitted
+ * (rbp is then free for allocation), otherwise RBP. */
+static BinaryGpRegister frame_base(const MirFunction *fn) {
+  return fn->context->omit_frame_pointer ? BINARY_GP_RSP : BINARY_GP_RBP;
+}
+
+/* Translate an rbp-relative displacement to the active frame base. With the
+ * frame pointer omitted, rsp sits frame_size below where rbp would point, so
+ * [rbp+d] == [rsp+frame_size+d]. */
+static int frame_disp(const MirFunction *fn, int rbp_disp) {
+  return fn->context->omit_frame_pointer ? rbp_disp + fn->context->frame_size
+                                         : rbp_disp;
+}
+
 /* Emit: target <- value of `op`. */
 static int materialize_into(MirFunction *fn, const MirOperand *op,
                             BinaryGpRegister target) {
@@ -52,7 +66,8 @@ static int materialize_into(MirFunction *fn, const MirOperand *op,
       }
       return 1;
     }
-    return binary_emit_mov_reg_mem(code, target, BINARY_GP_RBP, -spill_off(v));
+    return binary_emit_mov_reg_mem(code, target, frame_base(fn),
+                                   frame_disp(fn, -spill_off(v)));
   }
   case MIR_OPK_PHYS:
     if ((BinaryGpRegister)op->phys != target) {
@@ -62,7 +77,8 @@ static int materialize_into(MirFunction *fn, const MirOperand *op,
   case MIR_OPK_IMM:
     return binary_emit_mov_reg_imm64(code, target, (uint64_t)op->imm);
   case MIR_OPK_STACKHOME:
-    return binary_emit_mov_reg_mem(code, target, BINARY_GP_RBP, -op->disp);
+    return binary_emit_mov_reg_mem(code, target, frame_base(fn),
+                                   frame_disp(fn, -op->disp));
   default:
     return enc_err(fn, "unsupported MIR operand in materialize");
   }
@@ -79,8 +95,8 @@ static BinaryGpRegister value_reg(MirFunction *fn, const MirOperand *op,
     if (v->in_register) {
       return (BinaryGpRegister)v->phys;
     }
-    *ok = binary_emit_mov_reg_mem(&fn->context->code, scratch, BINARY_GP_RBP,
-                                  -spill_off(v));
+    *ok = binary_emit_mov_reg_mem(&fn->context->code, scratch, frame_base(fn),
+                                  frame_disp(fn, -spill_off(v)));
     return scratch;
   }
   case MIR_OPK_PHYS:
@@ -90,8 +106,8 @@ static BinaryGpRegister value_reg(MirFunction *fn, const MirOperand *op,
                                     (uint64_t)op->imm);
     return scratch;
   case MIR_OPK_STACKHOME:
-    *ok = binary_emit_mov_reg_mem(&fn->context->code, scratch, BINARY_GP_RBP,
-                                  -op->disp);
+    *ok = binary_emit_mov_reg_mem(&fn->context->code, scratch, frame_base(fn),
+                                  frame_disp(fn, -op->disp));
     return scratch;
   default:
     *ok = enc_err(fn, "unsupported MIR operand as value");
@@ -113,7 +129,8 @@ static int store_from(MirFunction *fn, const MirOperand *dst,
       }
       return 1;
     }
-    return binary_emit_mov_mem_reg(code, BINARY_GP_RBP, -spill_off(v), src_phys);
+    return binary_emit_mov_mem_reg(code, frame_base(fn),
+                                   frame_disp(fn, -spill_off(v)), src_phys);
   }
   case MIR_OPK_PHYS:
     if ((BinaryGpRegister)dst->phys != src_phys) {
@@ -161,6 +178,25 @@ static int operand_in_phys(MirFunction *fn, const MirOperand *op,
   }
   if (op->kind == MIR_OPK_PHYS) {
     return (BinaryGpRegister)op->phys == D;
+  }
+  return 0;
+}
+
+/* True (filling *reg) when `op` is already resident in a GP register, with no
+ * spill reload or immediate materialization needed. */
+static int operand_gp_reg(MirFunction *fn, const MirOperand *op,
+                          BinaryGpRegister *reg) {
+  if (op->kind == MIR_OPK_VREG) {
+    const MirVreg *v = &fn->vregs[op->vreg];
+    if (v->in_register && v->rclass == MIR_RC_GP) {
+      *reg = (BinaryGpRegister)v->phys;
+      return 1;
+    }
+    return 0;
+  }
+  if (op->kind == MIR_OPK_PHYS) {
+    *reg = (BinaryGpRegister)op->phys;
+    return 1;
   }
   return 0;
 }
@@ -241,6 +277,30 @@ static int encode_alu(MirFunction *fn, const MirInst *in) {
   BinaryGpRegister D;
 
   if (dst_is_reg(fn, &in->dst, &D)) {
+    /* `D = a + b` with neither operand already in D would otherwise be
+     * `mov D, a; add D, b` (two instructions). When both operands are live in
+     * GP registers, `lea D, [a + b]` does it in one and -- unlike register
+     * coalescing -- changes nothing about allocation (D stays D), so it cannot
+     * lengthen a live range or cause a spill. ADD only (LEA can't subtract);
+     * the SIB index can't be RSP, so swap operands if needed (ADD commutes).
+     * MIR consumes condition flags only through explicit CMP, so LEA not
+     * setting flags is fine. */
+    if (in->op == MIR_ADD && !operand_in_phys(fn, &in->a, D) &&
+        !operand_in_phys(fn, &in->b, D)) {
+      BinaryGpRegister ra, rb;
+      if (operand_gp_reg(fn, &in->a, &ra) && operand_gp_reg(fn, &in->b, &rb)) {
+        BinaryGpRegister base = ra, index = rb;
+        if (index == BINARY_GP_RSP) {
+          base = rb;
+          index = ra;
+        }
+        if (index != BINARY_GP_RSP &&
+            binary_emit_lea_reg_base_index_scale_disp(code, D, base, index, 1,
+                                                      0)) {
+          return 1;
+        }
+      }
+    }
     if (operand_in_phys(fn, &in->b, D)) {
       /* b already occupies the destination register. */
       if (is_sub) {
@@ -623,15 +683,16 @@ static int xmm_spill_load(MirFunction *fn, const MirVreg *v,
                           BinaryXmmRegister target) {
   unsigned char prefix = (v->width == 4) ? 0xF3 : 0xF2;
   return simd_emit_prefixed_xmm_mem_disp(&fn->context->code, prefix, 0x10,
-                                         target, BINARY_GP_RBP,
-                                         -v->spill_offset);
+                                         target, frame_base(fn),
+                                         frame_disp(fn, -v->spill_offset));
 }
 
 static int xmm_spill_store(MirFunction *fn, const MirVreg *v,
                            BinaryXmmRegister src) {
   unsigned char prefix = (v->width == 4) ? 0xF3 : 0xF2;
   return simd_emit_prefixed_xmm_mem_disp(&fn->context->code, prefix, 0x11, src,
-                                         BINARY_GP_RBP, -v->spill_offset);
+                                         frame_base(fn),
+                                         frame_disp(fn, -v->spill_offset));
 }
 
 /* Resolve a float operand to the XMM register holding its value, materializing
@@ -1142,11 +1203,13 @@ static int mir_home_gp_stack_param(MirFunction *fn, const MirParam *p,
   MirOperand dst = mir_op_vreg(p->vreg);
   BinaryGpRegister D;
   if (dst_is_reg(fn, &dst, &D)) {
-    return binary_emit_mov_reg_mem(code, D, BINARY_GP_RBP, rbp_offset)
+    return binary_emit_mov_reg_mem(code, D, frame_base(fn),
+                                   frame_disp(fn, rbp_offset))
                ? 1
                : enc_err(fn, "out of memory homing stack parameter");
   }
-  if (!binary_emit_mov_reg_mem(code, SCRATCH_A, BINARY_GP_RBP, rbp_offset)) {
+  if (!binary_emit_mov_reg_mem(code, SCRATCH_A, frame_base(fn),
+                               frame_disp(fn, rbp_offset))) {
     return enc_err(fn, "out of memory homing stack parameter");
   }
   return store_from(fn, &dst, SCRATCH_A);
@@ -1176,10 +1239,12 @@ static int mir_home_float_params(MirFunction *fn, MirXmmMove *mv, int n) {
     }
     int ok = (mv[i].width == 4)
                  ? (binary_emit_movd_reg_xmm(code, SCRATCH_A, mv[i].src) &&
-                    binary_emit_mov_mem_reg32(code, BINARY_GP_RBP, -mv[i].dst,
+                    binary_emit_mov_mem_reg32(code, frame_base(fn),
+                                              frame_disp(fn, -mv[i].dst),
                                               SCRATCH_A))
                  : (binary_emit_movq_reg_xmm(code, SCRATCH_A, mv[i].src) &&
-                    binary_emit_mov_mem_reg(code, BINARY_GP_RBP, -mv[i].dst,
+                    binary_emit_mov_mem_reg(code, frame_base(fn),
+                                            frame_disp(fn, -mv[i].dst),
                                             SCRATCH_A));
     if (!ok) {
       return enc_err(fn, "out of memory homing float parameter");
@@ -1327,23 +1392,34 @@ static int mir_home_parameters(MirFunction *fn) {
 static int mir_emit_prologue(MirFunction *fn) {
   BinaryFunctionContext *ctx = fn->context;
   BinaryCodeBuffer *code = &ctx->code;
-  if (!binary_emit_push_reg(code, BINARY_GP_RBP) ||
-      !binary_emit_mov_reg_reg(code, BINARY_GP_RBP, BINARY_GP_RSP)) {
-    return enc_err(fn, "out of memory in prologue");
-  }
-  if (!binary_emit_frame_allocation(code, ctx->frame_size)) {
-    return enc_err(fn, "out of memory allocating frame");
+  if (ctx->omit_frame_pointer) {
+    /* No rbp frame: fold the 8 bytes the saved-rbp slot used to occupy into the
+     * allocation so rsp stays 16-aligned at calls (entry rsp == 8 mod 16, and
+     * frame_size is 16-aligned, so +8 realigns to 0). rbp is now an ordinary
+     * allocatable callee-saved register; if the allocator used it, the saved-
+     * register loop below preserves it (caller's value is still intact here). */
+    if (!binary_emit_frame_allocation(code, ctx->frame_size + 8)) {
+      return enc_err(fn, "out of memory allocating frame");
+    }
+  } else {
+    if (!binary_emit_push_reg(code, BINARY_GP_RBP) ||
+        !binary_emit_mov_reg_reg(code, BINARY_GP_RBP, BINARY_GP_RSP)) {
+      return enc_err(fn, "out of memory in prologue");
+    }
+    if (!binary_emit_frame_allocation(code, ctx->frame_size)) {
+      return enc_err(fn, "out of memory allocating frame");
+    }
   }
   for (size_t i = 0; i < ctx->saved_register_count; i++) {
-    if (!binary_emit_mov_mem_reg(code, BINARY_GP_RBP,
-                                 -ctx->saved_register_offsets[i],
+    if (!binary_emit_mov_mem_reg(code, frame_base(fn),
+                                 frame_disp(fn, -ctx->saved_register_offsets[i]),
                                  ctx->saved_registers[i])) {
       return enc_err(fn, "out of memory saving callee registers");
     }
   }
   for (size_t i = 0; i < ctx->saved_xmm_count; i++) {
-    if (!simd_movdqu_mem_xmm_disp(code, BINARY_GP_RBP,
-                                  -ctx->saved_xmm_offsets[i],
+    if (!simd_movdqu_mem_xmm_disp(code, frame_base(fn),
+                                  frame_disp(fn, -ctx->saved_xmm_offsets[i]),
                                   ctx->saved_xmm_registers[i])) {
       return enc_err(fn, "out of memory saving callee xmm registers");
     }
@@ -1366,19 +1442,29 @@ static int mir_emit_epilogue(MirFunction *fn) {
   for (size_t i = ctx->saved_xmm_count; i > 0; i--) {
     size_t j = i - 1;
     if (!simd_movdqu_xmm_mem_disp(code, ctx->saved_xmm_registers[j],
-                                  BINARY_GP_RBP, -ctx->saved_xmm_offsets[j])) {
+                                  frame_base(fn),
+                                  frame_disp(fn, -ctx->saved_xmm_offsets[j]))) {
       return enc_err(fn, "out of memory restoring callee xmm registers");
     }
   }
   for (size_t i = ctx->saved_register_count; i > 0; i--) {
     size_t j = i - 1;
-    if (!binary_emit_mov_reg_mem(code, ctx->saved_registers[j], BINARY_GP_RBP,
-                                 -ctx->saved_register_offsets[j])) {
+    if (!binary_emit_mov_reg_mem(code, ctx->saved_registers[j], frame_base(fn),
+                                 frame_disp(fn,
+                                            -ctx->saved_register_offsets[j]))) {
       return enc_err(fn, "out of memory restoring callee registers");
     }
   }
-  if (!binary_emit_mov_reg_reg(code, BINARY_GP_RSP, BINARY_GP_RBP) ||
-      !binary_emit_pop_reg(code, BINARY_GP_RBP) || !binary_emit_ret(code)) {
+  if (ctx->omit_frame_pointer) {
+    /* Slots are addressed off rsp, which is still at the frame bottom here, so
+     * tear the frame down (the saved-rbp +8) and return. No pop rbp. */
+    if (!binary_emit_add_rsp_imm32(code, (uint32_t)(ctx->frame_size + 8)) ||
+        !binary_emit_ret(code)) {
+      return enc_err(fn, "out of memory in epilogue");
+    }
+  } else if (!binary_emit_mov_reg_reg(code, BINARY_GP_RSP, BINARY_GP_RBP) ||
+             !binary_emit_pop_reg(code, BINARY_GP_RBP) ||
+             !binary_emit_ret(code)) {
     return enc_err(fn, "out of memory in epilogue");
   }
   return 1;
@@ -1450,6 +1536,21 @@ static int encode_store_global(MirFunction *fn, const MirInst *in) {
   return 1;
 }
 
+/* MIR index of the MIR_LABEL defining `name`, or -1. */
+static int mir_encode_label_index(const MirFunction *fn, const char *name) {
+  if (!name) {
+    return -1;
+  }
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    const MirInst *in = &fn->insns[i];
+    if (in->op == MIR_LABEL && in->dst.kind == MIR_OPK_LABEL && in->dst.sym &&
+        strcmp(in->dst.sym, name) == 0) {
+      return (int)i;
+    }
+  }
+  return -1;
+}
+
 int mir_encode(MirFunction *fn) {
   if (!fn || !fn->context) {
     return 0;
@@ -1460,9 +1561,45 @@ int mir_encode(MirFunction *fn) {
     return 0;
   }
 
+  /* Loop-header alignment: a label that is the target of a BACKWARD branch is a
+   * loop top; pad it to a 16-byte boundary (like gcc -falign-loops) so the hot
+   * loop's instruction fetch does not depend on where the function happened to
+   * land. The pad NOPs sit BEFORE the label, so a back-edge (which jumps to the
+   * label, past the pad) never executes them; only a fall-through into the loop
+   * pays them, once. Pure performance -- it cannot change behaviour. */
+  char *align_label = (char *)calloc(fn->insn_count ? fn->insn_count : 1, 1);
+  if (align_label) {
+    for (size_t b = 0; b < fn->insn_count; b++) {
+      const MirInst *in = &fn->insns[b];
+      if (in->op != MIR_JMP && in->op != MIR_JCC && in->op != MIR_CMPBR &&
+          in->op != MIR_FCMPBR) {
+        continue;
+      }
+      if (in->dst.kind != MIR_OPK_LABEL || !in->dst.sym) {
+        continue;
+      }
+      int d = mir_encode_label_index(fn, in->dst.sym);
+      if (d >= 0 && (size_t)d < b) {
+        align_label[d] = 1;
+      }
+    }
+  }
+
   for (size_t i = 0; i < fn->insn_count; i++) {
     const MirInst *in = &fn->insns[i];
     int ok = 1;
+    if (in->op == MIR_LABEL && align_label && align_label[i]) {
+      while (ctx->code.size % 16 != 0) {
+        if (!binary_code_buffer_append_u8(&ctx->code, 0x90)) {
+          ok = 0;
+          break;
+        }
+      }
+    }
+    if (!ok) {
+      free(align_label);
+      return 0;
+    }
     switch (in->op) {
     case MIR_NOP:
       break;
@@ -1615,6 +1752,51 @@ int mir_encode(MirFunction *fn) {
       fn->used_inline_vector = 1;
       break;
     }
+    case MIR_SIMD_FILL: {
+      /* Inline fill kernel. The preceding MIR_MOVs marshalled the base pointer
+       * into RCX, the element count (mode 0) or end pointer (mode 1) into R8, and
+       * the fill value into RAX; emit the splat-build + 16-byte-store loop +
+       * scalar tail (no operand loads, no live-iv write-back). dst.imm = element
+       * size (1/2/4/8); a.imm = mode (0 element-counted, 1 byte-walk). The kernel
+       * uses VEX.128 stores (upper YMM lanes zeroed), so no vzeroupper is needed
+       * and used_inline_vector stays unset. */
+      int fok = code_generator_binary_emit_simd_fill_splat(&ctx->code,
+                                                           in->dst.imm);
+      if (fok) {
+        fok = (in->a.imm == 0)
+                  ? code_generator_binary_emit_simd_fill_loop_mode0(&ctx->code,
+                                                                    in->dst.imm)
+                  : code_generator_binary_emit_simd_fill_loop_bytewalk(
+                        &ctx->code, in->dst.imm, 1);
+      }
+      if (!fok) {
+        ok = enc_err(fn, "out of memory emitting inline fill kernel");
+      }
+      break;
+    }
+    case MIR_SIMD_AFFINE_MAP_F32: {
+      /* Inline float32 affine map. The preceding MIR_MOVs marshalled src->RCX,
+       * dst->RDX, count->R8; dst.imm/a.imm/b.imm hold the a/b/c coefficient float
+       * bits and cc holds b_is_one|b_is_zero<<1|c_is_zero<<2. The kernel emits
+       * its own closing vzeroupper, so used_inline_vector stays unset. */
+      if (!code_generator_binary_emit_simd_affine_map_f32_inline(
+              &ctx->code, (unsigned)in->dst.imm, (unsigned)in->a.imm,
+              (unsigned)in->b.imm, (in->cc & 1) != 0, (in->cc & 2) != 0,
+              (in->cc & 4) != 0)) {
+        ok = enc_err(fn, "out of memory emitting inline affine-map kernel");
+      }
+      break;
+    }
+    case MIR_SIMD_SILU_F32: {
+      /* Inline SiLU/SwiGLU gate. g/out->RCX, u->RDX, count->R8 marshalled by the
+       * preceding MIR_MOVs; dst.imm = has_mul. The kernel emits its own closing
+       * vzeroupper, so used_inline_vector stays unset. */
+      if (!code_generator_binary_emit_simd_silu_f32_inline(&ctx->code,
+                                                           (int)in->dst.imm)) {
+        ok = enc_err(fn, "out of memory emitting inline SiLU kernel");
+      }
+      break;
+    }
     case MIR_STORE_OUTARG: {
       /* Store an outgoing stack call argument to [rsp + b.imm]. rsp is fixed
        * after the prologue and the outgoing region is reserved there, so this
@@ -1725,8 +1907,8 @@ int mir_encode(MirFunction *fn) {
       BinaryGpRegister D;
       int dst_in_reg = dst_is_reg(fn, &in->dst, &D);
       BinaryGpRegister target = dst_in_reg ? D : SCRATCH_A;
-      if (!binary_emit_lea_reg_mem(&ctx->code, target, BINARY_GP_RBP,
-                                   -lv->spill_offset)) {
+      if (!binary_emit_lea_reg_mem(&ctx->code, target, frame_base(fn),
+                                   frame_disp(fn, -lv->spill_offset))) {
         ok = enc_err(fn, "out of memory emitting local address");
         break;
       }
@@ -1846,9 +2028,11 @@ int mir_encode(MirFunction *fn) {
       break;
     }
     if (!ok) {
+      free(align_label);
       return 0;
     }
   }
+  free(align_label);
 
   /* Resolve label/jump rel32 fixups against the defined labels. */
   if (!code_generator_binary_resolve_fixups(fn->generator, ctx,

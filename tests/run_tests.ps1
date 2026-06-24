@@ -245,7 +245,13 @@ $cases = @(
       'backend report: explain_demo\.mettle',
       'optimized IR instructions are in register-allocated code',
       'contains the SIMD kernel `simd_affine_map_f32`',
-      'consequence: the kernel itself runs at full vector speed'
+      'consequence: the kernel itself runs at full vector speed',
+      # dependence analysis: a non-reassociable loop-carried recurrence (the
+      # LCG/hash shape) is diagnosed as a genuine scalar floor, naming the
+      # carried operators -- not the generic "no vectorizer recognized" fallback
+      '`h` carries a loop-carried recurrence',
+      'dependency chain that cannot run as independent SIMD lanes',
+      'multiply, divide, shift, and bitwise/xor recurrences are inherently serial'
     )
   },
   @{
@@ -410,6 +416,84 @@ $cases = @(
       'clean_kept_elsewhere',
       'clean_kept_through_helper',
       'clean_wrapper_freed'
+    )
+  },
+  @{
+    # Borrow-lifetime (M0110): a pointer that outlives the stack storage it
+    # borrows is dangling once the borrowed local's block exits. The clean
+    # control keeps the borrow inside the referent's scope and stays silent.
+    Name          = "warn_borrow_scope"
+    Path          = "tests/warn_borrow_scope.mettle"
+    ShouldSucceed = $true
+    OutputMustMatch = @(
+      'Use of `p` after the scope of `x` ended at line \d+'
+    )
+    OutputMustNotMatch = @(
+      'scope of `y` ended'
+    )
+  },
+  @{
+    # Borrow-lifetime (M0111): an interior pointer into a heap buffer used
+    # after the buffer is realloc'd (the block may have moved). The clean
+    # control re-derives the pointer after the realloc and stays silent.
+    Name          = "warn_borrow_realloc"
+    Path          = "tests/warn_borrow_realloc.mettle"
+    ShouldSucceed = $true
+    OutputMustMatch = @(
+      'Use of `p` after `buf` was reallocated at line \d+'
+    )
+    OutputMustNotMatch = @(
+      '`nb` was reallocated'
+    )
+  },
+  @{
+    # Borrow-lifetime (M0112): an interior pointer into a heap buffer used
+    # after the buffer is freed (use-after-free through a distinct name). The
+    # clean control reads the borrow before the free and stays silent.
+    Name          = "warn_borrow_free"
+    Path          = "tests/warn_borrow_free.mettle"
+    ShouldSucceed = $true
+    OutputMustMatch = @(
+      'Use of `p` after `buf` was freed at line \d+'
+    )
+    OutputMustNotMatch = @(
+      '`data` was freed'
+    )
+  },
+  @{
+    # Use-after-move (M0113): `q = p` aliases one allocation under two names, so
+    # freeing or reallocating either invalidates the other -- ownership tracked
+    # through pointer copies the way Rust tracks moves, but on raw pointers. The
+    # clean controls re-point the alias or read it before the free, and stay
+    # silent.
+    Name          = "warn_use_after_move"
+    Path          = "tests/warn_use_after_move.mettle"
+    ShouldSucceed = $true
+    OutputMustMatch = @(
+      'Use of `buf` after the block it shares with `q` was freed at line \d+',
+      'Use of `mirror` after the block it shares with `block` was freed at line \d+',
+      'Double free of `b`: it aliases `a`, already freed at line \d+'
+    )
+    OutputMustNotMatch = @(
+      'shares with `keep`',
+      'shares with `owned`'
+    )
+  },
+  @{
+    # Zero-false-positive guard: correct ownership code the borrow checker must
+    # stay silent on. Covers the safe realloc idiom, disjoint frees, re-pointed
+    # aliases, and a free through one name of a different block. ANY memory
+    # diagnostic here is a regression.
+    Name          = "no_warn_borrow_clean"
+    Path          = "tests/no_warn_borrow_clean.mettle"
+    ShouldSucceed = $true
+    OutputMustNotMatch = @(
+      'shares with',
+      'after the block',
+      'use-after-free',
+      'Double free',
+      'leaks when',
+      'reallocated'
     )
   },
   @{
@@ -1931,6 +2015,39 @@ catch {
   Write-CaseResult -Name "explain_changes_and_json" -Passed $false -Reason $_.Exception.Message
 }
 
+# --explain memory section: the compile-time memory diagnostics (here a borrow
+# that outlives its scope) are surfaced in the optimization report's prose
+# "memory report" section AND the .explain.json "memory" array, so the editor's
+# Memory tab can render them.
+$total++
+try {
+  $exDir = Join-Path $tmpDir "explain_memory"
+  New-Item -ItemType Directory $exDir -Force | Out-Null
+  $exOut = Join-Path $exDir "borrow.obj"
+  $env:METTLE_EXPLAIN_REPORT_LINES = "0"
+  $memRun = & $CompilerPath -i "tests\warn_borrow_scope.mettle" -o $exOut --release --explain --explain-json 2>&1 | Out-String
+  if ($memRun -notmatch '-- memory report:') {
+    throw "Prose memory report section missing. Output: $($memRun.Substring(0, [Math]::Min(600, $memRun.Length)))"
+  }
+  if ($memRun -notmatch 'after the scope of `x` ended') {
+    throw "Memory report missing the borrow diagnostic"
+  }
+  $memJson = Get-Content (Join-Path $exDir "borrow.explain.json") -Raw | ConvertFrom-Json
+  $memEntries = @($memJson.memory)
+  if ($memEntries.Count -lt 1) { throw "JSON memory array empty" }
+  $borrow = $memEntries | Where-Object { $_.headline -match 'borrows into `x`' }
+  if (-not $borrow) { throw "JSON memory entry for the borrow missing" }
+  if ($borrow.severity -ne 'warning') { throw "JSON memory severity wrong: $($borrow.severity)" }
+  if (-not $borrow.fix) { throw "JSON memory entry missing its fix" }
+  Remove-Item Env:METTLE_EXPLAIN_REPORT_LINES -ErrorAction SilentlyContinue
+  Write-CaseResult -Name "explain_memory_section" -Passed $true
+}
+catch {
+  Remove-Item Env:METTLE_EXPLAIN_REPORT_LINES -ErrorAction SilentlyContinue
+  $failed++
+  Write-CaseResult -Name "explain_memory_section" -Passed $false -Reason $_.Exception.Message
+}
+
 # Top-level constants: compile with --build and verify folded compile-time value.
 $total++
 try {
@@ -2373,6 +2490,117 @@ foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")
   catch {
     $failed++
     Write-CaseResult -Name "float_narrowing_paths_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# MIR float call arguments: a call passing float args now uses the
+# register-allocating backend (XMM0-3 homing) instead of bailing the caller to
+# spill-everything codegen. Also covers the allocator entry-live interference
+# fix (two single-use params no longer share a register) and float unary negate.
+# Built debug + release + *_fallback (METTLE_MIR=0) so MIR and the legacy
+# backend produce identical results.
+foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")) {
+  $total++
+  try {
+    $exePath = Join-Path $tmpDir "test_mir_float_call_args_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($variant -like "release*") { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_mir_float_call_args.mettle", "-o", $exePath)
+
+    if ($variant -like "*_fallback") { $env:METTLE_MIR = "0" }
+    try {
+      $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    }
+    finally {
+      if ($variant -like "*_fallback") { Remove-Item Env:\METTLE_MIR -ErrorAction SilentlyContinue }
+    }
+    if ($LASTEXITCODE -ne 0) {
+      throw "mir-float-call-args build ($variant) failed: $buildOut"
+    }
+
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 1) {
+      throw "mir-float-call-args ($variant) miscompiled (exit $LASTEXITCODE)"
+    }
+
+    Write-CaseResult -Name "mir_float_call_args_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "mir_float_call_args_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# MIR inline fill passthrough: IR_OP_SIMD_FILL runs through the
+# register-allocating backend (mode 0/1, runtime offset folded as base+off*size,
+# live-iv write-back) instead of bailing the function to spill-everything
+# codegen. Built debug + release + *_fallback so MIR and the legacy backend agree.
+foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")) {
+  $total++
+  try {
+    $exePath = Join-Path $tmpDir "test_mir_fill_passthrough_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($variant -like "release*") { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_mir_fill_passthrough.mettle", "-o", $exePath)
+
+    if ($variant -like "*_fallback") { $env:METTLE_MIR = "0" }
+    try {
+      $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    }
+    finally {
+      if ($variant -like "*_fallback") { Remove-Item Env:\METTLE_MIR -ErrorAction SilentlyContinue }
+    }
+    if ($LASTEXITCODE -ne 0) {
+      throw "mir-fill-passthrough build ($variant) failed: $buildOut"
+    }
+
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 1) {
+      throw "mir-fill-passthrough ($variant) miscompiled (exit $LASTEXITCODE)"
+    }
+
+    Write-CaseResult -Name "mir_fill_passthrough_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "mir_fill_passthrough_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# MIR inline float32 affine-map passthrough: IR_OP_SIMD_AFFINE_MAP_F32 (the
+# float-copy / saxpy / `a*x+c` class) runs through the register-allocating
+# backend with its compile-time coefficients baked into the kernel broadcasts,
+# instead of bailing the function. This is what makes the qwen3 engine's
+# load_f32 and process_token register-allocated.
+foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")) {
+  $total++
+  try {
+    $exePath = Join-Path $tmpDir "test_mir_affine_map_passthrough_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($variant -like "release*") { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_mir_affine_map_passthrough.mettle", "-o", $exePath)
+
+    if ($variant -like "*_fallback") { $env:METTLE_MIR = "0" }
+    try {
+      $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    }
+    finally {
+      if ($variant -like "*_fallback") { Remove-Item Env:\METTLE_MIR -ErrorAction SilentlyContinue }
+    }
+    if ($LASTEXITCODE -ne 0) {
+      throw "mir-affine-map-passthrough build ($variant) failed: $buildOut"
+    }
+
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 1) {
+      throw "mir-affine-map-passthrough ($variant) miscompiled (exit $LASTEXITCODE)"
+    }
+
+    Write-CaseResult -Name "mir_affine_map_passthrough_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "mir_affine_map_passthrough_$variant" -Passed $false -Reason $_.Exception.Message
   }
 }
 
@@ -3747,6 +3975,28 @@ catch {
   Write-CaseResult -Name "simd_vloop_find" -Passed $false -Reason $_.Exception.Message
 }
 
+# Regression: two affine-map miscompiles found by differential-fuzzing the
+# general vectorizer. (1) A map not reading dst lowers to b==0, and the kernel's
+# `0*dst[i]` produced NaN where the uninitialized output held NaN/Inf bits.
+# (2) A degenerate integer copy (bare load) has the same base+(i<<2) shape as a
+# float32 map, so the float recognizer claimed it and laundered uint32 NaN
+# payloads through `1.0f*x`. Both checks are deterministic (poisoned output /
+# explicit NaN bit patterns); a clean exit 0 means neither miscompile is present.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "affine_nan_typeconf.exe"
+  $buildOut = & $CompilerPath --build --release "tests/test_affine_map_nan_typeconfusion.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "release build failed: $buildOut" }
+  if (-not (Test-Path $exePath)) { throw "release build produced no executable" }
+  & $exePath 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "affine-map miscompile present ($LASTEXITCODE bad elements: 0*NaN or uint32 type confusion)" }
+  Write-CaseResult -Name "simd_affine_map_nan_typeconf" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "simd_affine_map_nan_typeconf" -Passed $false -Reason $_.Exception.Message
+}
+
 # uint32 canonical-home semantics: unsigned sub-64-bit arithmetic wraps mod
 # 2^width in scalar code (debug AND release), matching SIMD lanes and C. Pins
 # the canonicalization of narrow unsigned locals/params/globals/returns and
@@ -3818,6 +4068,50 @@ foreach ($variant in @("debug", "release", "debug_fallback", "release_fallback")
   }
 }
 
+# Declarative rewrite engine (ir_optimize_rewrite.c): the Tier-1 algebraic
+# identity table and the Tier-2 constant-reassociation pass must preserve the
+# exact integer result of the arithmetic they rewrite. Exercised across
+# MIR/fallback x debug/release so a rewrite that miscompiles on only one backend
+# still trips. Self-checking: exit code is the number of the first failing check.
+foreach ($variant in @("debug", "release", "debug_fallback", "release_fallback")) {
+  $total++
+  try {
+    $exePath = Join-Path $tmpDir "algebraic_rewrites_$variant.exe"
+    $buildArgs = @("--build")
+    if ($variant -like "release*") { $buildArgs += "--release" }
+    $buildArgs += @("tests/test_algebraic_rewrites.mettle", "-o", $exePath)
+
+    $oldMir = $env:METTLE_MIR
+    try {
+      if ($variant -like "*_fallback") {
+        $env:METTLE_MIR = "0"
+      } else {
+        Remove-Item Env:\METTLE_MIR -ErrorAction SilentlyContinue
+      }
+      $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    }
+    finally {
+      if ($null -ne $oldMir) {
+        $env:METTLE_MIR = $oldMir
+      } else {
+        Remove-Item Env:\METTLE_MIR -ErrorAction SilentlyContinue
+      }
+    }
+
+    if ($LASTEXITCODE -ne 0) { throw "$variant build failed: $buildOut" }
+    if (-not (Test-Path $exePath)) { throw "$variant build produced no executable" }
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "an algebraic rewrite changed the result in $variant (first failing check #$LASTEXITCODE)"
+    }
+    Write-CaseResult -Name "algebraic_rewrites_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "algebraic_rewrites_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # Soundness: per-shape SIMD recognizers must not claim counted loops that
 # start at iv != 0 (the fused kernels replay 0..bound). One kernel per
 # recognizer family (sum_i32/dot_i32/dot_i8/sum_u8/byte_map/fill/exp_f32/
@@ -3883,6 +4177,32 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "simd_int_sum_nocast" -Passed $false -Reason $_.Exception.Message
+}
+
+# Coverage: the uint32 linear-congruential recurrence reduction vectorizes
+# (IR_OP_SIMD_LCG_U32, 8-wide closed form). Build at --release (vectorized) and
+# -O0 (scalar); both must produce the same golden checksum across trip counts
+# that exercise every scalar-remainder length.
+$total++
+try {
+  foreach ($variant in @("release", "debug")) {
+    $exePath = Join-Path $tmpDir "lcg_check_$variant.exe"
+    $buildArgs = @("--build")
+    if ($variant -eq "release") { $buildArgs += "--release" }
+    $buildArgs += @("tests/simd_lcg_check.mettle", "-o", $exePath)
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "$variant build failed: $buildOut" }
+    if (-not (Test-Path $exePath)) { throw "$variant build produced no executable" }
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "$variant LCG vectorizer diverged from the golden checksum (exit $LASTEXITCODE)"
+    }
+  }
+  Write-CaseResult -Name "simd_lcg_recurrence" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "simd_lcg_recurrence" -Passed $false -Reason $_.Exception.Message
 }
 
 # Direct object backend globals: scalar definitions plus extern-global symbol emission

@@ -605,6 +605,16 @@ static void mettle_crash_print_trace_from_frame(uintptr_t program_counter,
 }
 
 #if defined(_WIN32) || defined(_WIN64)
+#ifndef DBG_PRINTEXCEPTION_C
+#define DBG_PRINTEXCEPTION_C ((DWORD)0x40010006u)
+#endif
+#ifndef DBG_PRINTEXCEPTION_WIDE_C
+#define DBG_PRINTEXCEPTION_WIDE_C ((DWORD)0x4001000Au)
+#endif
+#ifndef MS_VC_EXCEPTION
+#define MS_VC_EXCEPTION ((DWORD)0x406D1388u)
+#endif
+
 static void mettle_crash_terminate_with_code(UINT exit_code) {
   HANDLE process = GetCurrentProcess();
   TerminateProcess(process, exit_code);
@@ -614,6 +624,14 @@ static LONG WINAPI
 mettle_crash_unhandled_exception_filter(EXCEPTION_POINTERS *exception_info) {
   if (!exception_info || !exception_info->ExceptionRecord) {
     return EXCEPTION_CONTINUE_SEARCH;
+  }
+
+  {
+    DWORD code = exception_info->ExceptionRecord->ExceptionCode;
+    if (code == DBG_PRINTEXCEPTION_C || code == DBG_PRINTEXCEPTION_WIDE_C ||
+        code == MS_VC_EXCEPTION) {
+      return EXCEPTION_CONTINUE_EXECUTION;
+    }
   }
 
   if (InterlockedExchange(&g_runtime_debug_in_handler, 1) != 0) {

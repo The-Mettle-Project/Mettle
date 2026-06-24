@@ -35,7 +35,6 @@ Traits and constrained generics support inline bounds, multiple bounds, trailing
 
 ## Compiler & Optimizations
 
-- Optimization passes are limited. The `-O` flag enables some optimizations but does not cover the full space of possible improvements.
 - Unreachable-code analysis is block-local and conservative; some dead paths in complex control flow may not be diagnosed yet.
 
 ---
@@ -76,6 +75,10 @@ Arrays follow the same rule as in [Types - Array Types](types.md#array-types): t
 
 - **Null dereference:** constant nulls such as `*0` are diagnosed at compile time. Runtime null checks are emitted for dynamic dereference and pointer-based indexing in normal builds, but are disabled in `--release`. Pointers originating from C or inline assembly can still be invalid in ways the compiler cannot prove.
 - **Array indexing:** fixed-size array indexing is checked at compile time for constant indices and guarded at runtime for dynamic indices in normal builds; those runtime guards are disabled in `--release`. Pointer indexing remains unchecked for bounds because the compiler does not know the pointee extent.
+
+### Borrow lifetimes
+
+- The compiler tracks *borrows* (a pointer derived from another object via `&x[i]`) and reports, as warnings, the cases it can prove are dangling: a borrow into a stack local used after that local's `{ }` block exits; and an interior pointer into a heap buffer used after the buffer is `realloc`'d or `free`'d. Analysis is conservative and intra-function: borrows are only tracked along a function's straight-line spine (a borrow taken inside an `if`/`while`/`for` body is not tracked), and a borrow handed across a function-call boundary is not yet followed. There is no ownership/borrow *syntax*; the checker is pure inference, so it never rejects a program. It only points at provable mistakes.
 
 ### Heap
 

@@ -905,6 +905,33 @@ static void emit_function(IRProgram *program, size_t fi, CodeGenerator *gen,
         }
         if (in->dest.name)
           bind_value(&fn, in->dest.name, dv);
+      } else if (callee && in->argument_count >= 3 &&
+                 (!strcmp(callee, "atomic_min_u32") ||
+                  !strcmp(callee, "atomic_min_u64") ||
+                  !strcmp(callee, "atomic_add_u32"))) {
+        /* atomic_{min,add}_uXX(buf, idx, val) -> old: unsigned atomic op into
+         * buf[idx]. Address is computed here (idx*elem + base) so kernels need
+         * no address-of/pointer arithmetic. Returns the previous value. */
+        int is64 = !strcmp(callee, "atomic_min_u64");
+        const char *opn = !strcmp(callee, "atomic_add_u32") ? "add" : "min";
+        PtxClass vc = is64 ? PC_B64 : PC_B32;
+        int elem = is64 ? 8 : 4;
+        char bufr[24], idxr[24], valr[24];
+        use_as(&fn, &in->arguments[0], PC_B64, bufr);
+        use_as(&fn, &in->arguments[1], PC_B32, idxr);
+        use_as(&fn, &in->arguments[2], vc, valr);
+        int addr = new_reg(&fn, PC_B64);
+        char an[24];
+        reg_name(PC_B64, addr, an);
+        sb_printf(&fn.body, "\tmad.wide.s32 %s, %s, %d, %s;\n", an, idxr, elem,
+                  bufr);
+        PtxVal dv = {.cls = vc, .is_unsigned = 1, .idx = new_reg(&fn, vc)};
+        char dn[24];
+        reg_name(vc, dv.idx, dn);
+        sb_printf(&fn.body, "\tatom.global.%s.%s %s, [%s], %s;\n", opn,
+                  is64 ? "u64" : "u32", dn, an, valr);
+        if (in->dest.name)
+          bind_value(&fn, in->dest.name, dv);
       } else {
         fn_error(&fn, "PTX: unsupported call '%s'", callee ? callee : "?");
       }

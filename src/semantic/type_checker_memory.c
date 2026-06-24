@@ -31,6 +31,7 @@
 // trusted, so the false-positive budget is zero.
 
 #include "type_checker_internal.h"
+#include "../ir/ir_explain_memory.h"
 
 #define MEM_MAX_LOCALS 256
 #define MEM_MAX_PARAMS 32
@@ -41,6 +42,15 @@ typedef enum {
   MEM_FREED_DEFINITE = 1, /* freed on the spine: later use IS a bug */
   MEM_FREED_MAYBE = 2     /* freed inside a branch/loop: stay silent */
 } MemFreedState;
+
+/* Why a borrow's referent is gone, set on the spine and reported at the next
+ * use of the borrowing pointer (the borrow-lifetime checker). */
+typedef enum {
+  BORROW_OK = 0,
+  BORROW_SCOPE,   /* the stack referent's lexical block exited        M0110 */
+  BORROW_REALLOC, /* the heap buffer was realloc'd (may have moved)   M0111 */
+  BORROW_FREE     /* the heap buffer was freed (interior pointer)     M0112 */
+} BorrowKill;
 
 typedef enum {
   MEM_MODE_LOCAL = 0,  /* phase 1: direct facts only; any call escapes */
@@ -81,6 +91,16 @@ typedef struct {
   int escaped;     /* returned, stored, kept by a callee, or address taken */
   int ever_freed;  /* a free of this pointer appears ANYWHERE (defers count) */
   const char *points_to_stack; /* stack local whose address it holds, or NULL */
+  int scope_level; /* lexical block depth where this local was declared */
+  const char *borrows_heap;    /* heap-pointer local this points into via
+                                  `&buf[i]`; NULL when not a heap borrow */
+  BorrowKill borrow_dangling;  /* referent gone; report on the next use */
+  SourceLocation borrow_killed_loc; /* where the referent's lifetime ended */
+  const char *borrow_killed_via;    /* referent/buffer name for the message */
+  int alias_group; /* >0: shares a heap block with same-group locals (`q = p`);
+                      0 = singleton. Freeing/realloc'ing one invalidates all. */
+  const char *freed_alias; /* the aliasing name through which the shared block
+                              was freed; NULL = this name was freed directly */
   int is_null;     /* pointer assigned a null constant on the spine */
   SourceLocation null_loc;
   int is_wild;     /* pointer assigned a small constant address (never mappable) */
@@ -101,6 +121,9 @@ typedef struct {
   MemLocal locals[MEM_MAX_LOCALS];
   size_t local_count;
   int depth;      /* 0 = the function's straight-line spine */
+  int scope_level; /* lexical block nesting (0 = function body); independent of
+                      `depth`, which tracks branch conditionality */
+  int next_alias_group; /* monotone id source for pointer alias groups */
   int in_defer;   /* defers run at scope exit: record facts, never report */
   int in_condition; /* inside an if/while/for condition: a mentioned pointer
                        counts as guarded, ending definite-null knowledge */
@@ -225,6 +248,7 @@ static MemLocal *mem_add_local(MemCtx *ctx, const char *name,
   local->is_pointer = mem_type_is_pointer(type_name);
   local->is_stack = param_index < 0 && !local->is_pointer &&
                     strncmp(type_name, "fn", 2) != 0;
+  local->scope_level = ctx->scope_level;
   return local;
 }
 
@@ -241,6 +265,9 @@ static void mem_warn(MemCtx *ctx, SourceLocation loc, const char *fmt, ...) {
   va_end(args);
   error_reporter_add_warning(ctx->checker->error_reporter, ERROR_SEMANTIC, loc,
                              message);
+  ir_explain_memory_note(
+      error_reporter_current_filename(ctx->checker->error_reporter), 0,
+      loc.line, message, NULL);
 }
 
 static void mem_warn_suggest(MemCtx *ctx, SourceLocation loc,
@@ -256,6 +283,9 @@ static void mem_warn_suggest(MemCtx *ctx, SourceLocation loc,
   error_reporter_add_warning_with_suggestion(ctx->checker->error_reporter,
                                              ERROR_SEMANTIC, loc, message,
                                              suggestion);
+  ir_explain_memory_note(
+      error_reporter_current_filename(ctx->checker->error_reporter), 0,
+      loc.line, message, suggestion);
 }
 
 static void mem_error(MemCtx *ctx, SourceLocation loc, const char *suggestion,
@@ -271,6 +301,9 @@ static void mem_error(MemCtx *ctx, SourceLocation loc, const char *suggestion,
   error_reporter_add_error_with_suggestion(ctx->checker->error_reporter,
                                            ERROR_SEMANTIC, loc, message,
                                            suggestion);
+  ir_explain_memory_note(
+      error_reporter_current_filename(ctx->checker->error_reporter), 1,
+      loc.line, message, suggestion);
   ctx->checker->has_error = 1;
   ctx->had_error = 1;
 }
@@ -367,6 +400,48 @@ static MemLocal *mem_addr_of_stack(MemCtx *ctx, ASTNode *expr) {
   return mem_addr_of_stack_at(ctx, expr, NULL);
 }
 
+/* The heap-pointer local at the root of `&buf[i]` (an interior pointer into
+ * the block `buf` points to), or NULL when the expression is not the address
+ * of an element of a pointer local. The stack analogue lives in
+ * `mem_addr_of_stack_at`; the discriminator is `is_pointer` vs `is_stack`, so
+ * the two never both match the same `&...`. */
+static MemLocal *mem_addr_of_heap_at(MemCtx *ctx, ASTNode *expr,
+                                     long long *offset_out) {
+  if (offset_out) {
+    *offset_out = -1;
+  }
+  expr = mem_unwrap_cast(expr);
+  if (!expr || expr->type != AST_UNARY_EXPRESSION) {
+    return NULL;
+  }
+  UnaryExpression *unary = (UnaryExpression *)expr->data;
+  if (!unary || !unary->operator || strcmp(unary->operator, "&") != 0) {
+    return NULL;
+  }
+  ASTNode *direct = mem_unwrap_cast(unary->operand);
+  if (!direct || direct->type != AST_INDEX_EXPRESSION) {
+    return NULL;
+  }
+  ArrayIndexExpression *index = (ArrayIndexExpression *)direct->data;
+  ASTNode *array = index ? mem_unwrap_cast(index->array) : NULL;
+  if (!array || array->type != AST_IDENTIFIER) {
+    return NULL;
+  }
+  Identifier *id = (Identifier *)array->data;
+  MemLocal *local = id ? mem_find_local(ctx, id->name) : NULL;
+  if (!local || !local->is_pointer) {
+    return NULL;
+  }
+  long long constant = 0;
+  if (offset_out &&
+      type_checker_eval_integer_constant_with_checker(ctx->checker,
+                                                       index->index, &constant) &&
+      constant >= 0) {
+    *offset_out = constant;
+  }
+  return local;
+}
+
 /* Fresh-allocation classification. Direct allocators always count; in the
  * summary/interproc modes a call to a function whose every return is fresh
  * counts too (the wrapper-allocator case). `via_out` names the wrapper. */
@@ -454,17 +529,157 @@ static void mem_check_null_deref(MemCtx *ctx, ASTNode *pointer_expr,
   }
 }
 
+/* The borrow-lifetime checker: a pointer whose referent's lifetime ended on
+ * the spine is reported the first time it is used. Like the direct-free and
+ * null-deref diagnostics, these are phase-1 facts, so they only speak in
+ * MEM_MODE_LOCAL and only once per borrow. */
+static void mem_check_borrow_use(MemCtx *ctx, MemLocal *local,
+                                 SourceLocation loc) {
+  if (!local || ctx->in_defer || ctx->mode != MEM_MODE_LOCAL ||
+      local->borrow_dangling == BORROW_OK) {
+    return;
+  }
+  BorrowKill why = local->borrow_dangling;
+  const char *via = local->borrow_killed_via ? local->borrow_killed_via : "it";
+  size_t at = local->borrow_killed_loc.line;
+  local->borrow_dangling = BORROW_OK; /* one report per borrow */
+  if (why == BORROW_SCOPE) {
+    char suggestion[200];
+    snprintf(suggestion, sizeof(suggestion),
+             "Copy the value out before the block ends, or widen `%s`'s scope "
+             "so it outlives `%s`",
+             via, local->name);
+    mem_warn_suggest(ctx, loc, suggestion,
+                     "Use of `%s` after the scope of `%s` ended at line %zu; "
+                     "`%s` borrows into `%s`, whose storage is reclaimed when "
+                     "its block exits, so this pointer is dangling",
+                     local->name, via, at, local->name, via);
+  } else if (why == BORROW_REALLOC) {
+    char suggestion[200];
+    snprintf(suggestion, sizeof(suggestion),
+             "Re-derive `%s` from `%s` after the `realloc`", local->name, via);
+    mem_warn_suggest(ctx, loc, suggestion,
+                     "Use of `%s` after `%s` was reallocated at line %zu; "
+                     "`realloc` may move the block, so this pointer is "
+                     "dangling",
+                     local->name, via, at);
+  } else { /* BORROW_FREE */
+    char suggestion[200];
+    snprintf(suggestion, sizeof(suggestion),
+             "Take the borrow after the last `free`, or copy the value out "
+             "before freeing `%s`",
+             via);
+    mem_warn_suggest(ctx, loc, suggestion,
+                     "Use of `%s` after `%s` was freed at line %zu; `%s` "
+                     "borrows into `%s`'s block, so this is use-after-free "
+                     "through an interior pointer",
+                     local->name, via, at, local->name, via);
+  }
+}
+
+/* When `buf` is freed or realloc'd, every interior pointer borrowed from it
+ * (`p = &buf[i]`) becomes dangling. Spine-only, definite by the C standard
+ * (post-free/post-realloc interior pointers are indeterminate). */
+static void mem_invalidate_heap_borrows(MemCtx *ctx, const char *buf_name,
+                                        BorrowKill why, SourceLocation loc) {
+  if (!buf_name || ctx->mode != MEM_MODE_LOCAL || ctx->depth != 0 ||
+      ctx->in_defer) {
+    return;
+  }
+  for (size_t i = 0; i < ctx->local_count; i++) {
+    MemLocal *p = &ctx->locals[i];
+    if (p->borrows_heap && strcmp(p->borrows_heap, buf_name) == 0) {
+      p->borrow_dangling = why;
+      p->borrow_killed_loc = loc;
+      p->borrow_killed_via = buf_name;
+    }
+  }
+}
+
+/* `q = p` makes two names for one allocation. Put both pointers in one alias
+ * group so that freeing or reallocating either invalidates the other. This is
+ * the ownership/move discipline Rust enforces through the type system, applied
+ * to raw pointers where Rust offers no checking at all. */
+static void mem_alias_join(MemCtx *ctx, MemLocal *a, MemLocal *b) {
+  if (!a || !b || a == b || !a->is_pointer || !b->is_pointer) {
+    return;
+  }
+  int group = b->alias_group;
+  if (group == 0) {
+    group = ctx->next_alias_group++;
+    b->alias_group = group;
+  }
+  if (a->alias_group == group) {
+    return;
+  }
+  if (a->alias_group == 0) {
+    a->alias_group = group;
+    return;
+  }
+  int old = a->alias_group; /* both already grouped: merge into b's group */
+  for (size_t i = 0; i < ctx->local_count; i++) {
+    if (ctx->locals[i].alias_group == old) {
+      ctx->locals[i].alias_group = group;
+    }
+  }
+}
+
+/* A free()/realloc() of `victim` invalidates every OTHER pointer that aliases
+ * the same block. Definite by C semantics (a freed block is gone; a realloc'd
+ * block may have moved, leaving the old pointer indeterminate), spine-only, so
+ * it holds the zero-false-positive budget. Reported at the alias's next use. */
+static void mem_alias_invalidate(MemCtx *ctx, MemLocal *victim, BorrowKill why,
+                                 SourceLocation loc) {
+  if (!victim || victim->alias_group == 0 || ctx->in_defer ||
+      ctx->mode != MEM_MODE_LOCAL) {
+    return;
+  }
+  for (size_t i = 0; i < ctx->local_count; i++) {
+    MemLocal *m = &ctx->locals[i];
+    if (m == victim || m->alias_group != victim->alias_group) {
+      continue;
+    }
+    m->ever_freed = 1;
+    if (why == BORROW_REALLOC) {
+      if (m->borrow_dangling == BORROW_OK) {
+        m->borrow_dangling = BORROW_REALLOC;
+        m->borrow_killed_loc = loc;
+        m->borrow_killed_via = victim->name;
+      }
+    } else if (m->freed != MEM_FREED_DEFINITE) {
+      m->freed = ctx->depth == 0 ? MEM_FREED_DEFINITE : MEM_FREED_MAYBE;
+      m->freed_loc = loc;
+      m->freed_via = NULL;
+      m->freed_alias = victim->name;
+    }
+  }
+}
+
 static void mem_check_use(MemCtx *ctx, MemLocal *local, SourceLocation loc) {
+  mem_check_borrow_use(ctx, local, loc);
   if (!local || ctx->in_defer || local->freed != MEM_FREED_DEFINITE) {
     return;
   }
   /* Phase split: direct-free bugs are phase 1's; bugs where a CALL did the
    * free are phase 2's (phase 1 cannot see them). */
   if (ctx->mode == MEM_MODE_LOCAL && local->freed_via == NULL) {
-    mem_warn(ctx, loc,
-             "Use of `%s` after it was freed (freed at line %zu); this is "
-             "use-after-free",
-             local->name, local->freed_loc.line);
+    if (local->freed_alias) {
+      char suggestion[200];
+      snprintf(suggestion, sizeof(suggestion),
+               "`%s` and `%s` name the same block; free it once, after the "
+               "last use of either",
+               local->name, local->freed_alias);
+      mem_warn_suggest(ctx, loc, suggestion,
+                       "Use of `%s` after the block it shares with `%s` was "
+                       "freed at line %zu; freeing one alias frees the block "
+                       "both names point to, so this is use-after-free",
+                       local->name, local->freed_alias, local->freed_loc.line);
+    } else {
+      mem_warn(ctx, loc,
+               "Use of `%s` after it was freed (freed at line %zu); this is "
+               "use-after-free",
+               local->name, local->freed_loc.line);
+    }
     local->freed = MEM_FREED_MAYBE; /* one report per free site */
   } else if (ctx->mode == MEM_MODE_INTERPROC && local->freed_via != NULL) {
     mem_warn(ctx, loc,
@@ -506,8 +721,15 @@ static void mem_free_event(MemCtx *ctx, MemLocal *local, SourceLocation loc,
      * case where a call performed at least one of the frees. */
     int involves_call = local->freed_via != NULL || via != NULL;
     if (ctx->mode == MEM_MODE_LOCAL && !involves_call) {
-      mem_warn(ctx, loc, "Double free of `%s` (already freed at line %zu)",
-               local->name, local->freed_loc.line);
+      if (local->freed_alias) {
+        mem_warn(ctx, loc,
+                 "Double free of `%s`: it aliases `%s`, already freed at line "
+                 "%zu",
+                 local->name, local->freed_alias, local->freed_loc.line);
+      } else {
+        mem_warn(ctx, loc, "Double free of `%s` (already freed at line %zu)",
+                 local->name, local->freed_loc.line);
+      }
     } else if (ctx->mode == MEM_MODE_INTERPROC && involves_call) {
       if (via && local->freed_via) {
         mem_warn(ctx, loc,
@@ -1217,8 +1439,16 @@ static void mem_walk_expr(MemCtx *ctx, ASTNode *expr) {
          strcmp(call->function_name, "realloc") == 0) &&
         call->argument_count >= 1) {
       /* The pointer argument is CONSUMED, not used; both invalidate it. */
-      mem_free_event(ctx, mem_expr_as_local(ctx, call->arguments[0]),
-                     expr->location, NULL);
+      int is_realloc = strcmp(call->function_name, "realloc") == 0;
+      BorrowKill why = is_realloc ? BORROW_REALLOC : BORROW_FREE;
+      MemLocal *consumed = mem_expr_as_local(ctx, call->arguments[0]);
+      mem_free_event(ctx, consumed, expr->location, NULL);
+      if (consumed) {
+        /* interior pointers borrowed from it (`&buf[i]`) become dangling, and
+         * so does every whole-pointer alias of it (`q = buf`) */
+        mem_invalidate_heap_borrows(ctx, consumed->name, why, expr->location);
+        mem_alias_invalidate(ctx, consumed, why, expr->location);
+      }
       for (size_t i = 1; i < call->argument_count; i++) {
         mem_walk_expr(ctx, call->arguments[i]);
       }
@@ -1227,8 +1457,15 @@ static void mem_walk_expr(MemCtx *ctx, ASTNode *expr) {
     if (call->function_name && !call->object) {
       mem_check_mem_op(ctx, call, expr->location);
     }
+    /* Every argument is evaluated BEFORE the call runs, so check all the uses
+     * first and only then apply the call's ownership effects (free / store).
+     * Interleaving would make a pointer passed twice -- `f(p, p)` where the
+     * callee frees the first parameter -- look like a use-after-free on the
+     * second read, which actually happens before the callee runs. */
     for (size_t i = 0; i < call->argument_count; i++) {
       mem_walk_expr(ctx, call->arguments[i]);
+    }
+    for (size_t i = 0; i < call->argument_count; i++) {
       mem_apply_call_arg(ctx, mem_expr_as_local(ctx, call->arguments[i]),
                          (!call->object && !call->is_indirect_call)
                              ? call->function_name
@@ -1273,9 +1510,13 @@ static void mem_apply_assignment(MemCtx *ctx, const char *name, ASTNode *value,
     if (local->is_pointer) {
       local->freed = MEM_FREED_NO;
       local->freed_via = NULL;
+      local->freed_alias = NULL;
       local->holds_alloc = 0;
       local->points_to_stack = NULL;
       local->points_to_offset = -1;
+      local->borrows_heap = NULL;
+      local->borrow_dangling = BORROW_OK; /* re-derivation clears a stale borrow */
+      local->alias_group = 0; /* re-pointing leaves any alias group */
       local->is_null = 0;
       local->is_wild = 0;
       if (!ctx->in_defer && ctx->depth == 0 &&
@@ -1311,13 +1552,23 @@ static void mem_apply_assignment(MemCtx *ctx, const char *name, ASTNode *value,
         local->points_to_stack = stack_target->name;
         local->points_to_offset = stack_offset;
       }
+      MemLocal *heap_target = mem_addr_of_heap_at(ctx, value, NULL);
+      if (heap_target && ctx->depth == 0 && !ctx->in_defer) {
+        /* an interior pointer into a heap buffer: a later free/realloc of
+         * that buffer leaves this borrow dangling */
+        local->borrows_heap = heap_target->name;
+      }
       MemLocal *source = mem_expr_as_local(ctx, value);
       if (source && source->is_pointer) {
-        /* aliasing: the allocation now has two names; stop tracking both */
+        /* aliasing: the allocation now has two names. The leak analysis can no
+         * longer pin a single owner (escaped), but the ownership analysis
+         * joins them into an alias group so a free/realloc of either is seen
+         * to invalidate both. */
         source->escaped = 1;
         if (ctx->depth == 0 && !ctx->in_defer) {
           local->points_to_stack = source->points_to_stack;
           local->points_to_offset = source->points_to_offset;
+          mem_alias_join(ctx, local, source);
         }
       }
     } else {
@@ -1372,10 +1623,31 @@ static void mem_walk_block(MemCtx *ctx, ASTNode *block) {
   mem_walk_statement(ctx, block);
 }
 
+/* Run when the lexical block at `level` exits: a borrow whose pointer outlives
+ * the block (`scope_level < level`) but whose stack referent was declared in it
+ * (`scope_level >= level`) is now dangling. Reported at the borrow's next use. */
+static void mem_scope_exit_check(MemCtx *ctx, int level) {
+  for (size_t i = 0; i < ctx->local_count; i++) {
+    MemLocal *p = &ctx->locals[i];
+    if (!p->points_to_stack || p->scope_level >= level) {
+      continue;
+    }
+    MemLocal *referent = mem_find_local(ctx, p->points_to_stack);
+    if (referent && referent->is_stack && referent->scope_level >= level) {
+      p->borrow_dangling = BORROW_SCOPE;
+      p->borrow_killed_loc = referent->decl_loc;
+      p->borrow_killed_via = referent->name;
+    }
+  }
+}
+
 static void mem_walk_branch(MemCtx *ctx, ASTNode *body) {
+  int level = ++ctx->scope_level;
   ctx->depth++;
   mem_walk_block(ctx, body);
   ctx->depth--;
+  mem_scope_exit_check(ctx, level);
+  ctx->scope_level--;
 }
 
 static void mem_walk_statement(MemCtx *ctx, ASTNode *statement) {
@@ -1529,12 +1801,15 @@ static void mem_walk_statement(MemCtx *ctx, ASTNode *statement) {
     ctx->in_condition++;
     mem_walk_expr(ctx, for_stmt->condition);
     ctx->in_condition--;
+    int for_level = ++ctx->scope_level;
     ctx->depth++;
     mem_walk_block(ctx, for_stmt->body);
     if (for_stmt->increment) {
       mem_walk_statement(ctx, for_stmt->increment);
     }
     ctx->depth--;
+    mem_scope_exit_check(ctx, for_level);
+    ctx->scope_level--;
     return;
   }
   case AST_SWITCH_STATEMENT: {
@@ -1576,9 +1851,15 @@ static void mem_walk_statement(MemCtx *ctx, ASTNode *statement) {
     ctx->in_defer = saved;
     return;
   }
-  case AST_PROGRAM:
+  case AST_PROGRAM: {
+    /* a bare `{ ... }` block: a new lexical scope, but still on the spine
+     * (unconditional), so borrows recorded inside are definite */
+    int block_level = ++ctx->scope_level;
     mem_walk_block(ctx, statement);
+    mem_scope_exit_check(ctx, block_level);
+    ctx->scope_level--;
     return;
+  }
   case AST_FUNCTION_CALL:
   case AST_FUNC_PTR_CALL:
     mem_walk_expr(ctx, statement);
@@ -1604,6 +1885,7 @@ static void mem_ctx_init(MemCtx *ctx, TypeChecker *checker, ASTNode *decl,
   ctx->mode = mode;
   ctx->summaries = summaries;
   ctx->collect = collect;
+  ctx->next_alias_group = 1;
   ctx->returns_all_fresh = 1;
   ctx->fn_returns_pointer = fn->return_type &&
                             mem_type_is_pointer(fn->return_type);

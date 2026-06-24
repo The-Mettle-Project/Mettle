@@ -135,6 +135,7 @@ function parseReport(raw) {
   const model = {
     sourceName: null,
     remarks: [],
+    memory: [],
     backend: { summary: [], groups: [] },
     stats: {
       vectorized: 0, scalar: 0, verified: 0,
@@ -148,7 +149,7 @@ function parseReport(raw) {
   let currentGroup = null;
 
   for (const line of lines) {
-    const header = line.match(/^-- (optimization|backend) report: (\S+)/);
+    const header = line.match(/^-- (optimization|backend|memory) report: (\S+)/);
     if (header) {
       section = header[1];
       model.sourceName = model.sourceName || header[2];
@@ -252,6 +253,25 @@ function parseReport(raw) {
       }
       continue;
     }
+    if (section === 'memory') {
+      const diag = line.match(/^  (warning|error) \(line (\d+)\): (.+)$/);
+      if (diag) {
+        current = {
+          severity: diag[1],
+          line: parseInt(diag[2], 10),
+          headline: diag[3],
+          fix: null,
+        };
+        model.memory.push(current);
+        continue;
+      }
+      const sub = line.match(/^      \\_ fix: (.+)$/);
+      if (sub && current && current.severity) {
+        current.fix = sub[1];
+        continue;
+      }
+      continue;
+    }
   }
   return model;
 }
@@ -264,6 +284,7 @@ function modelFromJson(json) {
   const model = {
     sourceName: json.source || null,
     remarks: [],
+    memory: [],
     backend: { summary: [], groups: [] },
     changes: null,
     stats: {
@@ -296,6 +317,14 @@ function modelFromJson(json) {
     if (r.kind === 'loop' && /unrolled|eliminated/.test(r.headline || '')) {
       model.stats.unrolled++;
     }
+  }
+  for (const m of json.memory || []) {
+    model.memory.push({
+      severity: m.severity === 'error' ? 'error' : 'warning',
+      line: typeof m.line === 'number' && m.line > 0 ? m.line : null,
+      headline: m.headline || '',
+      fix: m.fix || null,
+    });
   }
   if (json.backend) {
     model.stats.backendOk = json.backend.ok;
@@ -776,6 +805,43 @@ function backendSection(model) {
   return html;
 }
 
+function memoryCard(m) {
+  // Errors share the declined (red) accent; warnings the provable (gold) one.
+  const cls = m.severity === 'error' ? 's-declined' : 's-provable';
+  const jumpLine = m.line !== null ? ` data-line="${m.line}"` : '';
+  const loc = m.line !== null ? `:${m.line}` : '';
+  const detail = m.fix
+    ? `<div class="detail"><div class="sub"><span class="k">fix</span><span>${escapeHtml(m.fix)}</span></div></div>`
+    : '';
+  return `<div class="card ${cls}"${jumpLine}>
+    <div class="head">
+      <span class="meta">${m.severity}${escapeHtml(loc)}</span>
+      <span class="headline">${escapeHtml(m.headline)}</span>
+    </div>
+    ${detail}
+  </div>`;
+}
+
+function memorySection(model) {
+  const mem = model.memory || [];
+  if (mem.length === 0) {
+    return `<div class="empty">No memory diagnostics in this file. The analyzer flags
+      use-after-free, double free, leaks, dangling borrows, null dereference, and
+      out-of-bounds access, but only when it can prove them, so anything here is real.</div>`;
+  }
+  const errors = mem.filter((m) => m.severity === 'error');
+  const warnings = mem.filter((m) => m.severity === 'warning');
+  const parts = [
+    errors.length ? `${errors.length} error${errors.length === 1 ? '' : 's'}` : '',
+    warnings.length ? `${warnings.length} warning${warnings.length === 1 ? '' : 's'}` : '',
+  ].filter(Boolean).join(', ');
+  let html = `<div class="mem-summary">${mem.length} issue${mem.length === 1 ? '' : 's'}: ${parts}.
+    Each is proven; the analyzer stays silent when it isn't certain.</div>`;
+  if (errors.length) html += '<h2>Errors</h2>' + errors.map(memoryCard).join('\n');
+  if (warnings.length) html += '<h2>Warnings</h2>' + warnings.map(memoryCard).join('\n');
+  return html;
+}
+
 function groupByFunction(model) {
   /** @type {Map<string, {remarks: {r: any, index: number}[], vec: number, scalar: number, fixable: number, minLine: number}>} */
   const groups = new Map();
@@ -806,6 +872,13 @@ function renderHtml(model, sourceLabel) {
   const loopFixCount = fixableRemarks.filter((r) => r.kind === 'loop').length;
   const callFixCount = fixableCount - loopFixCount;
   const groups = groupByFunction(model);
+
+  // Memory tab badge: red when any error, gold for warning-only, hidden when clean.
+  const mem = model.memory || [];
+  const memErrors = mem.filter((m) => m.severity === 'error').length;
+  const memBadge = mem.length
+    ? `<span class="tab-badge ${memErrors ? 'err' : 'warn'}">${mem.length}</span>`
+    : '';
 
   const fixSummary = [
     loopFixCount > 0 ? `${loopFixCount} make${loopFixCount === 1 ? 's' : ''} a loop vectorize` : '',
@@ -873,6 +946,17 @@ function renderHtml(model, sourceLabel) {
   ${LOGO_CSS}
   #content { transition: opacity 0.2s ease; }
   .busy #content { opacity: 0.55; pointer-events: none; }
+
+  .tabs { display: flex; gap: 2px; margin: 12px 0 0; border-bottom: 1px solid var(--border); }
+  .tab { background: transparent; border: none; border-bottom: 2px solid transparent; margin-bottom: -1px;
+         color: var(--vscode-foreground); padding: 6px 14px; cursor: pointer; font-size: 0.9em; opacity: 0.65; }
+  .tab:hover { opacity: 1; }
+  .tab.active { opacity: 1; border-bottom-color: var(--vscode-focusBorder); font-weight: 600; }
+  .tab-badge { display: inline-block; margin-left: 7px; font-size: 0.74em; border-radius: 8px; padding: 0 7px;
+               vertical-align: middle; background: color-mix(in srgb, var(--bad) 16%, transparent); color: var(--bad); }
+  .tab-badge.warn { background: color-mix(in srgb, var(--gold) 18%, transparent); color: var(--gold); }
+  .tab-panel.hidden { display: none; }
+  .mem-summary { margin: 14px 0 2px; line-height: 1.45; opacity: 0.85; }
   h2 { font-size: 0.95em; margin-top: 26px; border-top: 1px solid var(--border); padding-top: 16px; opacity: 0.9;
        text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; }
 
@@ -956,6 +1040,11 @@ function renderHtml(model, sourceLabel) {
 <body class="settle">
   <h1>${logoSvg(18)} Optimization report <span class="src">${escapeHtml(sourceLabel)}</span></h1>
   <div id="content">
+  <div class="tabs">
+    <button class="tab active" data-tab="opt">Optimizations</button>
+    <button class="tab" data-tab="mem">Memory${memBadge}</button>
+  </div>
+  <div class="tab-panel" data-panel="opt">
   ${changesHtml}
   ${dashboard(model, loopFixCount, callFixCount)}
   ${banner}
@@ -969,6 +1058,10 @@ function renderHtml(model, sourceLabel) {
   </div>
   <div id="groups">${groupHtml || '<div class="empty">No loops or calls to report.</div>'}</div>
   ${backendSection(model)}
+  </div>
+  <div class="tab-panel hidden" data-panel="mem">
+  ${memorySection(model)}
+  </div>
   </div>
   <script>
     const vscode = acquireVsCodeApi();
@@ -1038,6 +1131,19 @@ function renderHtml(model, sourceLabel) {
         vscode.postMessage({ type: 'jump', line: parseInt(change.dataset.jump, 10) || 1 });
       });
     }
+    // Tab switching between the Optimizations and Memory panels.
+    for (const tab of document.querySelectorAll('.tab')) {
+      tab.addEventListener('click', () => {
+        for (const t of document.querySelectorAll('.tab')) t.classList.toggle('active', t === tab);
+        for (const p of document.querySelectorAll('.tab-panel')) p.classList.toggle('hidden', p.dataset.panel !== tab.dataset.tab);
+      });
+    }
+    // Memory cards jump to the diagnostic's source line, like optimization cards.
+    const memPanel = document.querySelector('.tab-panel[data-panel="mem"]');
+    if (memPanel) memPanel.addEventListener('click', (e) => {
+      const card = e.target.closest('.card');
+      if (card && card.dataset.line) vscode.postMessage({ type: 'jump', line: parseInt(card.dataset.line, 10) });
+    });
   </script>
 </body></html>`;
 }

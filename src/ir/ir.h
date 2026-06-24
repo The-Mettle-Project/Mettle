@@ -170,6 +170,11 @@ typedef enum {
   /* In-place a[i] = exp(a[i]) over a float32 array (vectorized libm exp).
    * dest = array base, arguments[0] = element count. */
   IR_OP_SIMD_EXP_F32,
+  /* SwiGLU gate: out[i] = silu(g[i]) * u[i] = (g[i] / (1 + exp(-g[i]))) * u[i],
+   * over float32 arrays (in-place when out aliases g). dest = out base,
+   * lhs = g base, rhs = u base, arguments[0] = element count. When rhs is the
+   * sentinel "" the multiply is dropped (plain SiLU: out[i] = silu(g[i])). */
+  IR_OP_SIMD_SILU_F32,
   /* Counted-loop reduction where each iteration adds (int64)trunc(CHAIN) to the
    * dest accumulator, with CHAIN a straight-line float64 expression in the loop
    * counter: x0 = (float64)i, then a sequence of {x*=k, x+=k, x-=k, x=k-x, x/=k}
@@ -248,7 +253,17 @@ typedef enum {
    * with exact scalar adds. Serialized into arguments[]; see
    * ir_outer_vectorize_pass. dest = total accumulator; lhs = outer trip count P;
    * rhs = inner trip count N. Direct-object backend only. */
-  IR_OP_SIMD_OUTER_LANE_F64
+  IR_OP_SIMD_OUTER_LANE_F64,
+  /* Vectorized linear-congruential recurrence reduction. Replaces a counted
+   * loop `state = state*A + C; sum += (int64)(state & MASK); i++` whose state is
+   * a uint32 carried serially -- normally unvectorizable -- by advancing 8 lanes
+   * in lockstep via the closed form state_{k+8} = A^8*state_k + (sum_{j<8}A^j)*C
+   * (all mod 2^32, exact under vpmulld), masking + widening each lane to int64,
+   * and accumulating. A scalar remainder finishes iters % 8. Bit-exact vs the
+   * scalar loop. dest = sum accumulator symbol; lhs = trip count (SYMBOL/INT);
+   * rhs = state symbol (its value at loop entry is the seed); arguments[0]=A,
+   * [1]=C, [2]=MASK (all INT, compile-time). Direct-object backend only. */
+  IR_OP_SIMD_LCG_U32
 } IROpcode;
 
 /* Chain operation codes for IR_OP_SIMD_BYTE_MAP arguments. Each step applies

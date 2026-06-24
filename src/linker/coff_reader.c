@@ -323,9 +323,39 @@ static int coff_reader_parse_sections(CoffObject *object,
              section->size_of_raw_data);
     }
 
-    if (section->number_of_relocations > 0u) {
+    /* Relocation-overflow form (IMAGE_SCN_LNK_NRELOC_OVFL): when the 16-bit
+     * count field is 0xFFFF and the flag is set, the true count lives in the
+     * VirtualAddress of a synthetic first relocation record (and includes that
+     * record), so the real relocations start at record index 1. */
+    uint32_t actual_relocations = section->number_of_relocations;
+    uint32_t relocation_base_record = 0u;
+    if ((section->characteristics & 0x01000000u) != 0u &&
+        section->number_of_relocations == 0xFFFFu) {
+      if (!coff_reader_range_ok(file_size, section->pointer_to_relocations,
+                                COFF_RELOCATION_SIZE)) {
+        mettle_set_error(error_message_out,
+                              "Section '%s' overflow relocation header is out "
+                              "of range",
+                              section->name);
+        return 0;
+      }
+      uint32_t stored =
+          linker_read_u32(file_data + section->pointer_to_relocations);
+      if (stored == 0u) {
+        mettle_set_error(error_message_out,
+                              "Section '%s' has an invalid overflow relocation "
+                              "count",
+                              section->name);
+        return 0;
+      }
+      actual_relocations = stored - 1u; /* exclude the synthetic record */
+      relocation_base_record = 1u;
+    }
+
+    if (actual_relocations > 0u) {
       size_t relocation_bytes =
-          (size_t)section->number_of_relocations * COFF_RELOCATION_SIZE;
+          ((size_t)actual_relocations + relocation_base_record) *
+          COFF_RELOCATION_SIZE;
       size_t r = 0;
 
       if (!coff_reader_range_ok(file_size, section->pointer_to_relocations,
@@ -337,7 +367,7 @@ static int coff_reader_parse_sections(CoffObject *object,
       }
 
       section->relocations =
-          calloc(section->number_of_relocations, sizeof(CoffRelocation));
+          calloc(actual_relocations, sizeof(CoffRelocation));
       if (!section->relocations) {
         mettle_set_error(error_message_out,
                               "Out of memory while allocating relocations for "
@@ -346,11 +376,11 @@ static int coff_reader_parse_sections(CoffObject *object,
         return 0;
       }
 
-      section->relocation_count = section->number_of_relocations;
+      section->relocation_count = actual_relocations;
       for (r = 0; r < section->relocation_count; r++) {
         const unsigned char *relocation =
             file_data + section->pointer_to_relocations +
-            (r * COFF_RELOCATION_SIZE);
+            ((r + relocation_base_record) * COFF_RELOCATION_SIZE);
 
         section->relocations[r].virtual_address = linker_read_u32(relocation);
         section->relocations[r].symbol_table_index =

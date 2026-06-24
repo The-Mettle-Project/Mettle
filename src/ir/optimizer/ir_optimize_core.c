@@ -232,6 +232,7 @@ int ir_instruction_writes_symbol(const IRInstruction *instruction) {
   case IR_OP_SIMD_AFFINE_MAP_F64:
   case IR_OP_SIMD_AFFINE_MAP_F32:
   case IR_OP_SIMD_EXP_F32:
+  case IR_OP_SIMD_SILU_F32:
   case IR_OP_SIMD_I2F_REDUCE_F64:
   case IR_OP_SIMD_VLOOP_F64:
   case IR_OP_SIMD_VLOOP_I32:
@@ -283,6 +284,7 @@ int ir_instruction_writes_destination(const IRInstruction *instruction) {
   case IR_OP_SIMD_AFFINE_MAP_F64:
   case IR_OP_SIMD_AFFINE_MAP_F32:
   case IR_OP_SIMD_EXP_F32:
+  case IR_OP_SIMD_SILU_F32:
   case IR_OP_SIMD_I2F_REDUCE_F64:
   case IR_OP_SIMD_VLOOP_F64:
   case IR_OP_SIMD_VLOOP_I32:
@@ -1730,6 +1732,7 @@ int ir_collect_instruction_temp_uses(IRTempUseMap *uses,
   case IR_OP_SIMD_AFFINE_MAP_F64:
   case IR_OP_SIMD_AFFINE_MAP_F32:
   case IR_OP_SIMD_EXP_F32:
+  case IR_OP_SIMD_SILU_F32:
   case IR_OP_SIMD_I2F_REDUCE_F64:
   case IR_OP_SIMD_VLOOP_F64:
   case IR_OP_SIMD_VLOOP_I32:

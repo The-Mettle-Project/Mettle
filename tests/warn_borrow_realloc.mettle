@@ -1,0 +1,32 @@
+// Borrow-lifetime diagnostics (M0111): an interior pointer into a heap buffer
+// used after the buffer is realloc'd (the block may have moved). The buggy
+// function reports; the clean control re-derives the pointer and is silent.
+import "std/io";
+import "std/mem";
+
+// M0111: `p` points into `buf`, used after `realloc` may have moved it.
+function use_after_realloc() -> int32 {
+    var buf: cstring = malloc(16);
+    buf[2] = 5;
+    var p: cstring = &buf[2];
+    buf = realloc(buf, 64);
+    var out: int32 = (int32)p[0];
+    free(buf);
+    return out;
+}
+
+// Clean control: `r` is re-derived from `nb` after the realloc, then used.
+function clean_realloc() -> int32 {
+    var nb: cstring = malloc(16);
+    nb[2] = 5;
+    var r: cstring = &nb[2];
+    nb = realloc(nb, 64);
+    r = &nb[2];
+    var v: int32 = (int32)r[0];
+    free(nb);
+    return v;
+}
+
+function main() -> int32 {
+    return use_after_realloc() + clean_realloc();
+}

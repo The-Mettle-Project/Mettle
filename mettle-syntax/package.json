@@ -2,7 +2,7 @@
   "name": "mettle-syntax",
   "displayName": "Mettle Language Support",
   "description": "Full language support for Mettle (.mettle): source-level debugging (breakpoints, stepping, live variable editing), go to definition, references, rename, outline, completion, signature help, compiler-backed diagnostics, run/build, and an interactive optimization report panel with one-click compiler-verified fixes.",
-  "version": "0.16.0",
+  "version": "0.17.0",
   "publisher": "TheMettleProject",
   "license": "Apache-2.0",
   "repository": {

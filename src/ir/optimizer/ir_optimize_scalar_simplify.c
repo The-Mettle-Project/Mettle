@@ -890,36 +890,6 @@ static int ir_try_get_positive_pow2_shift(long long value, long long *shift) {
   return 1;
 }
 
-static int ir_rewrite_to_shift_left(IRInstruction *instruction,
-                                    const IROperand *value, long long shift,
-                                    int *changed) {
-  if (!instruction || !value || instruction->op != IR_OP_BINARY ||
-      instruction->is_float || shift < 0 || shift >= 64) {
-    return 0;
-  }
-
-  IROperand lhs = ir_operand_none();
-  if (!ir_operand_clone(value, &lhs)) {
-    return 0;
-  }
-
-  ir_operand_destroy(&instruction->lhs);
-  ir_operand_destroy(&instruction->rhs);
-  instruction->lhs = lhs;
-  instruction->rhs = ir_operand_int(shift);
-
-  free(instruction->text);
-  instruction->text = mettle_strdup("<<");
-  if (!instruction->text) {
-    return 0;
-  }
-
-  if (changed) {
-    *changed = 1;
-  }
-  return 1;
-}
-
 static int ir_try_fold_integer_binary(IRInstruction *instruction, int *changed) {
   if (!instruction || instruction->op != IR_OP_BINARY || instruction->is_float ||
       !instruction->text) {
@@ -941,139 +911,9 @@ static int ir_try_fold_integer_binary(IRInstruction *instruction, int *changed) 
     }
   }
 
-  if (ir_operand_equals(&instruction->lhs, &instruction->rhs)) {
-    if (strcmp(instruction->text, "-") == 0 ||
-        strcmp(instruction->text, "^") == 0) {
-      return ir_rewrite_to_assign_int(instruction, 0, changed);
-    }
-    if (strcmp(instruction->text, "|") == 0 ||
-        strcmp(instruction->text, "&") == 0) {
-      return ir_rewrite_to_assign_operand(instruction, &instruction->lhs,
-                                          changed);
-    }
-    if (strcmp(instruction->text, "==") == 0 ||
-        strcmp(instruction->text, "<=") == 0 ||
-        strcmp(instruction->text, ">=") == 0) {
-      return ir_rewrite_to_assign_int(instruction, 1, changed);
-    }
-    if (strcmp(instruction->text, "!=") == 0 ||
-        strcmp(instruction->text, "<") == 0 ||
-        strcmp(instruction->text, ">") == 0) {
-      return ir_rewrite_to_assign_int(instruction, 0, changed);
-    }
-  }
-
-  if (strcmp(instruction->text, "+") == 0) {
-    if (instruction->rhs.kind == IR_OPERAND_INT &&
-        instruction->rhs.int_value == 0) {
-      return ir_rewrite_to_assign_operand(instruction, &instruction->lhs,
-                                          changed);
-    }
-    if (instruction->lhs.kind == IR_OPERAND_INT &&
-        instruction->lhs.int_value == 0) {
-      return ir_rewrite_to_assign_operand(instruction, &instruction->rhs,
-                                          changed);
-    }
-  } else if (strcmp(instruction->text, "-") == 0) {
-    if (instruction->rhs.kind == IR_OPERAND_INT &&
-        instruction->rhs.int_value == 0) {
-      return ir_rewrite_to_assign_operand(instruction, &instruction->lhs,
-                                          changed);
-    }
-  } else if (strcmp(instruction->text, "*") == 0) {
-    long long shift = 0;
-    if (instruction->rhs.kind == IR_OPERAND_INT &&
-        ir_try_get_positive_pow2_shift(instruction->rhs.int_value, &shift) &&
-        shift > 0) {
-      return ir_rewrite_to_shift_left(instruction, &instruction->lhs, shift,
-                                      changed);
-    }
-    if (instruction->lhs.kind == IR_OPERAND_INT &&
-        ir_try_get_positive_pow2_shift(instruction->lhs.int_value, &shift) &&
-        shift > 0) {
-      return ir_rewrite_to_shift_left(instruction, &instruction->rhs, shift,
-                                      changed);
-    }
-    if ((instruction->lhs.kind == IR_OPERAND_INT &&
-         instruction->lhs.int_value == 0) ||
-        (instruction->rhs.kind == IR_OPERAND_INT &&
-         instruction->rhs.int_value == 0)) {
-      return ir_rewrite_to_assign_int(instruction, 0, changed);
-    }
-    if (instruction->rhs.kind == IR_OPERAND_INT &&
-        instruction->rhs.int_value == 1) {
-      return ir_rewrite_to_assign_operand(instruction, &instruction->lhs,
-                                          changed);
-    }
-    if (instruction->lhs.kind == IR_OPERAND_INT &&
-        instruction->lhs.int_value == 1) {
-      return ir_rewrite_to_assign_operand(instruction, &instruction->rhs,
-                                          changed);
-    }
-  } else if (strcmp(instruction->text, "/") == 0) {
-    if (instruction->rhs.kind == IR_OPERAND_INT &&
-        instruction->rhs.int_value == 1) {
-      return ir_rewrite_to_assign_operand(instruction, &instruction->lhs,
-                                          changed);
-    }
-  } else if (strcmp(instruction->text, "%") == 0) {
-    if (instruction->rhs.kind == IR_OPERAND_INT &&
-        instruction->rhs.int_value == 1) {
-      return ir_rewrite_to_assign_int(instruction, 0, changed);
-    }
-  } else if (strcmp(instruction->text, "&") == 0) {
-    if ((instruction->lhs.kind == IR_OPERAND_INT &&
-         instruction->lhs.int_value == 0) ||
-        (instruction->rhs.kind == IR_OPERAND_INT &&
-         instruction->rhs.int_value == 0)) {
-      return ir_rewrite_to_assign_int(instruction, 0, changed);
-    }
-    if (instruction->rhs.kind == IR_OPERAND_INT &&
-        instruction->rhs.int_value == -1) {
-      return ir_rewrite_to_assign_operand(instruction, &instruction->lhs,
-                                          changed);
-    }
-    if (instruction->lhs.kind == IR_OPERAND_INT &&
-        instruction->lhs.int_value == -1) {
-      return ir_rewrite_to_assign_operand(instruction, &instruction->rhs,
-                                          changed);
-    }
-  } else if (strcmp(instruction->text, "|") == 0 ||
-             strcmp(instruction->text, "^") == 0) {
-    if (instruction->rhs.kind == IR_OPERAND_INT &&
-        instruction->rhs.int_value == 0) {
-      return ir_rewrite_to_assign_operand(instruction, &instruction->lhs,
-                                          changed);
-    }
-    if (instruction->lhs.kind == IR_OPERAND_INT &&
-        instruction->lhs.int_value == 0) {
-      return ir_rewrite_to_assign_operand(instruction, &instruction->rhs,
-                                          changed);
-    }
-  } else if (strcmp(instruction->text, "<<") == 0 ||
-             strcmp(instruction->text, ">>") == 0) {
-    if (instruction->rhs.kind == IR_OPERAND_INT &&
-        instruction->rhs.int_value == 0) {
-      return ir_rewrite_to_assign_operand(instruction, &instruction->lhs,
-                                          changed);
-    }
-  } else if (strcmp(instruction->text, "&&") == 0) {
-    if ((instruction->lhs.kind == IR_OPERAND_INT &&
-         instruction->lhs.int_value == 0) ||
-        (instruction->rhs.kind == IR_OPERAND_INT &&
-         instruction->rhs.int_value == 0)) {
-      return ir_rewrite_to_assign_int(instruction, 0, changed);
-    }
-  } else if (strcmp(instruction->text, "||") == 0) {
-    if ((instruction->lhs.kind == IR_OPERAND_INT &&
-         instruction->lhs.int_value != 0) ||
-        (instruction->rhs.kind == IR_OPERAND_INT &&
-         instruction->rhs.int_value != 0)) {
-      return ir_rewrite_to_assign_int(instruction, 1, changed);
-    }
-  }
-
-  return 1;
+  /* Every algebraic identity now lives in the declarative table in
+   * ir_optimize_rewrite.c; add a rule there to teach a new one. */
+  return ir_rewrite_apply_binary_identities(instruction, changed);
 }
 
 static int ir_find_temp_producer_in_block(const IRFunction *function,
@@ -2170,6 +2010,7 @@ int ir_instruction_has_side_effect(const IRInstruction *instruction) {
   case IR_OP_SIMD_AFFINE_MAP_F64:
   case IR_OP_SIMD_AFFINE_MAP_F32:
   case IR_OP_SIMD_EXP_F32:
+  case IR_OP_SIMD_SILU_F32:
   case IR_OP_SIMD_I2F_REDUCE_F64:
   case IR_OP_SIMD_VLOOP_F64:
   case IR_OP_SIMD_VLOOP_I32:

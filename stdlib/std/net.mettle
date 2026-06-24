@@ -76,6 +76,13 @@ export extern function setsockopt(s: int64, level: int32, optname: int32, optval
 export extern function send(s: int64, buf: cstring, len: int32, flags: int32) -> int32 = "send";
 export extern function recv(s: int64, buf: cstring, len: int32, flags: int32) -> int32 = "recv";
 
+// ─── Socket I/O mode ─────────────────────────────────────────────────────────
+// ioctlsocket(s, cmd, argp) controls blocking mode etc. cmd FIONBIO toggles
+// non-blocking I/O (argp points to a u_long: nonzero = non-blocking).
+export extern function ioctlsocket(s: int64, cmd: int32, argp: cstring) -> int32 = "ioctlsocket";
+export function FIONBIO() -> int32 { return 0x8004667E; }   // _IOW('f', 126, u_long)
+export function TCP_NODELAY() -> int32 { return 1; }
+
 // ─── Address utilities ──────────────────────────────────────────────────────
 export extern function htons(hostshort: int32) -> int32 = "htons";
 export extern function htonl(hostlong: int32) -> int32 = "htonl";
@@ -216,6 +223,23 @@ export function set_reuseaddr(sock: int64, enabled: int32) -> int32 {
   opt[2] = 0;
   opt[3] = 0;
   return setsockopt(sock, SOL_SOCKET(), SO_REUSEADDR(), &opt[0], 4);
+}
+
+// Toggle non-blocking I/O on a socket. enabled != 0 => non-blocking (recv/send
+// return immediately, with WSAEWOULDBLOCK when no data / buffer full).
+export function set_nonblocking(sock: int64, enabled: int32) -> int32 {
+  var v: uint32[1];
+  if (enabled != 0) { v[0] = 1; } else { v[0] = 0; }
+  return ioctlsocket(sock, FIONBIO(), (cstring)&v[0]);
+}
+
+// Disable Nagle's algorithm on a TCP socket so small packets go out immediately
+// (lower latency for chatty, latency-sensitive traffic like a game state stream).
+export function set_nodelay(sock: int64, enabled: int32) -> int32 {
+  var opt: uint8[4];
+  if (enabled != 0) { opt[0] = 1; } else { opt[0] = 0; }
+  opt[1] = 0; opt[2] = 0; opt[3] = 0;
+  return setsockopt(sock, IPPROTO_TCP(), TCP_NODELAY(), &opt[0], 4);
 }
 
 // Send all bytes in buf[0..len). Returns total sent, or -1 on error.

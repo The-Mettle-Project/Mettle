@@ -1,0 +1,30 @@
+// Borrow-lifetime diagnostics (M0110): a pointer that outlives the stack
+// storage it borrows. The buggy function reports; the clean control is silent.
+import "std/io";
+
+// M0110: `p` borrows into `x`, whose block exits before `p` is used.
+function dangling_scope() -> int32 {
+    var p: int32* = 0;
+    {
+        var x: int32[4];
+        x[0] = 7;
+        p = &x[0];
+    }
+    return p[0];
+}
+
+// Clean control: the borrow `q` lives and dies inside the same block as `y`.
+function clean_scope() -> int32 {
+    var total: int32 = 0;
+    {
+        var y: int32[4];
+        y[0] = 9;
+        var q: int32* = &y[0];
+        total = q[0];
+    }
+    return total;
+}
+
+function main() -> int32 {
+    return dangling_scope() + clean_scope();
+}

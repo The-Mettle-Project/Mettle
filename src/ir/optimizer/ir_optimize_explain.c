@@ -1,4 +1,5 @@
 #include "ir_optimize_internal.h"
+#include "../ir_explain_memory.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -203,6 +204,20 @@ static IRExplainBackendEntry *g_backend = NULL;
 static size_t g_backend_count = 0;
 static size_t g_backend_capacity = 0;
 
+/* ---- memory diagnostics (--explain surfacing, fed by the type checker) ---- */
+typedef struct {
+  int severity; /* 0 = warning, 1 = error */
+  size_t line;
+  char *headline;
+  char *fix; /* may be NULL */
+} IRExplainMemNote;
+
+static IRExplainMemNote *g_mem = NULL;
+static size_t g_mem_count = 0;
+static size_t g_mem_capacity = 0;
+static int g_mem_collect = 0;
+static char *g_mem_focus = NULL; /* basename to filter by, or NULL */
+
 void ir_optimize_set_explain(int enabled, const char *focus_file) {
   g_explain = enabled;
   g_explain_focus_file = focus_file;
@@ -218,6 +233,45 @@ static const char *ir_explain_path_basename(const char *path) {
     }
   }
   return base;
+}
+
+void ir_explain_memory_set_collect(int enabled, const char *focus_file) {
+  g_mem_collect = enabled;
+  free(g_mem_focus);
+  g_mem_focus = NULL;
+  if (enabled && focus_file) {
+    const char *base = ir_explain_path_basename(focus_file);
+    if (base && *base) {
+      g_mem_focus = strdup(base);
+    }
+  }
+}
+
+void ir_explain_memory_note(const char *file, int severity, size_t line,
+                            const char *headline, const char *fix) {
+  if (!g_mem_collect || !headline) {
+    return;
+  }
+  /* Scope to the focus file when one is known (mirrors optimizer remarks). A
+   * note with an unknown file is kept rather than risk dropping a real one. */
+  if (g_mem_focus && file &&
+      strcmp(ir_explain_path_basename(file), g_mem_focus) != 0) {
+    return;
+  }
+  if (g_mem_count == g_mem_capacity) {
+    size_t new_cap = g_mem_capacity ? g_mem_capacity * 2 : 8;
+    IRExplainMemNote *grown = realloc(g_mem, new_cap * sizeof(*grown));
+    if (!grown) {
+      return;
+    }
+    g_mem = grown;
+    g_mem_capacity = new_cap;
+  }
+  IRExplainMemNote *n = &g_mem[g_mem_count++];
+  n->severity = severity ? 1 : 0;
+  n->line = line;
+  n->headline = strdup(headline);
+  n->fix = fix ? strdup(fix) : NULL;
 }
 
 int ir_explain_file_enabled(const char *filename) {
@@ -940,6 +994,60 @@ static void ir_explain_json_remark(const IRExplainRemark *r, const char *kind,
   ir_explain_json_raw("}");
 }
 
+/* Render the memory diagnostics the type checker handed us: a JSON "memory"
+ * array (always emitted so the document's comma chain stays valid) and a prose
+ * "memory report" section. Called at the tail of ir_explain_flush, so it lands
+ * after "remarks" and before "backend" in the JSON buffer. */
+static void ir_explain_memory_flush(void) {
+  if (g_explain_json) {
+    ir_explain_json_raw("\"memory\":[");
+    for (size_t i = 0; i < g_mem_count; i++) {
+      const IRExplainMemNote *n = &g_mem[i];
+      ir_explain_json_raw("%s{\"severity\":", i ? "," : "");
+      ir_explain_json_str(n->severity ? "error" : "warning");
+      ir_explain_json_raw(",\"line\":%zu,\"headline\":", n->line);
+      ir_explain_json_str(n->headline);
+      ir_explain_json_raw(",\"fix\":");
+      ir_explain_json_str(n->fix);
+      ir_explain_json_raw("}");
+    }
+    ir_explain_json_raw("],");
+  }
+
+  if (!g_explain) {
+    return;
+  }
+  ir_explain_print_header("memory report");
+  if (g_mem_count == 0) {
+    ir_explain_emit("  %sno memory diagnostics in this file%s\n\n",
+                    clr(EXPLAIN_DIM), clr(EXPLAIN_RESET));
+    return;
+  }
+  size_t errors = 0, warnings = 0;
+  for (size_t i = 0; i < g_mem_count; i++) {
+    if (g_mem[i].severity) {
+      errors++;
+    } else {
+      warnings++;
+    }
+  }
+  ir_explain_emit("  %zu issue%s (%zu error%s, %zu warning%s):\n", g_mem_count,
+                  g_mem_count == 1 ? "" : "s", errors, errors == 1 ? "" : "s",
+                  warnings, warnings == 1 ? "" : "s");
+  for (size_t i = 0; i < g_mem_count; i++) {
+    const IRExplainMemNote *n = &g_mem[i];
+    ir_explain_emit("  %s%s%s (line %zu): %s\n",
+                    clr(n->severity ? EXPLAIN_RED : EXPLAIN_BOLD),
+                    n->severity ? "error" : "warning", clr(EXPLAIN_RESET),
+                    n->line, n->headline);
+    if (n->fix) {
+      ir_explain_emit("      %s%s fix: %s%s\n", clr(EXPLAIN_DIM), glyph_elbow(),
+                      n->fix, clr(EXPLAIN_RESET));
+    }
+  }
+  ir_explain_emit("\n");
+}
+
 void ir_explain_flush(void) {
   if (!g_explain) {
     return;
@@ -1075,6 +1183,9 @@ void ir_explain_flush(void) {
   g_remarks = NULL;
   g_remark_count = 0;
   g_remark_capacity = 0;
+
+  /* Memory diagnostics land after "remarks" and before "backend". */
+  ir_explain_memory_flush();
 }
 
 /* ---- backend (codegen) section ------------------------------------------- */
@@ -1201,6 +1312,17 @@ void ir_explain_finalize(int force_stderr) {
   g_json_len = 0;
   g_json_cap = 0;
 
+  for (size_t i = 0; i < g_mem_count; i++) {
+    free(g_mem[i].headline);
+    free(g_mem[i].fix);
+  }
+  free(g_mem);
+  g_mem = NULL;
+  g_mem_count = 0;
+  g_mem_capacity = 0;
+  free(g_mem_focus);
+  g_mem_focus = NULL;
+
   if (!diverted) {
     fwrite(g_report_buf, 1, g_report_len, stderr);
   } else {
@@ -1290,6 +1412,25 @@ static void ir_explain_backend_reason(const IRExplainBackendEntry *e, char *buf,
                        "support yet");
     *consequence = "every value in the function is kept on the stack instead "
                    "of in registers";
+    return;
+  }
+  /* A SIMD kernel whose inline-passthrough subset doesn't yet cover this loop's
+   * exact shape (e.g. a mode-2 fill, or an affine map with a runtime
+   * coefficient). The kernel still vectorizes; only the scalar code around it
+   * keeps values on the stack -- the same consequence as an unsupported op. */
+  if (strncmp(e->detail, "simd_fill:", 10) == 0 ||
+      strncmp(e->detail, "affine_map:", 11) == 0) {
+    const char *kernel =
+        e->detail[0] == 's' ? "simd_fill" : "simd_affine_map_f32";
+    snprintf(buf, cap,
+             "contains the SIMD kernel `%s` in a form the register allocator's "
+             "inline passthrough doesn't cover yet",
+             kernel);
+    *consequence =
+        "the kernel itself runs at full vector speed; only the scalar code "
+        "around it keeps values on the stack";
+    *fix = "nothing needed for a small function; a different shape of the same "
+           "kernel (a simpler fill/map) inlines into register-allocated code";
     return;
   }
   snprintf(buf, cap, "declined by the eligibility gate (reason code: %s)",
@@ -1620,6 +1761,9 @@ void ir_explain_kernel_desc(const IRInstruction *ins, char *buf, size_t cap) {
     return;
   case IR_OP_SIMD_EXP_F32:
     snprintf(buf, cap, "8-wide float32 exp (Cephes polynomial, AVX2)");
+    return;
+  case IR_OP_SIMD_SILU_F32:
+    snprintf(buf, cap, "8-wide float32 SiLU/SwiGLU gate (AVX2 exp poly)");
     return;
   case IR_OP_SIMD_I2F_REDUCE_F64:
     snprintf(buf, cap, "4-wide float64 counter reduction (AVX2)");

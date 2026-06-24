@@ -153,8 +153,10 @@ typedef struct {
   BinaryLabelFixupTable label_fixups;
   BinaryCallRelocationTable call_relocations;
   BinaryOffsetTable return_fixups;
-  BinaryGpRegister saved_registers[7];
-  int saved_register_offsets[7];
+  /* Up to 8 callee-saved GP regs: RBX, RSI, RDI, R12..R15, and RBP (the last
+   * only when the frame pointer is omitted and rbp joins the allocatable pool). */
+  BinaryGpRegister saved_registers[8];
+  int saved_register_offsets[8];
   size_t saved_register_count;
   /* Callee-saved XMM registers (xmm8..xmm15 on Win64) the MIR allocator used and
    * the prologue must preserve. Stored as 16-byte movdqu slots below the GP
@@ -165,6 +167,12 @@ typedef struct {
   size_t saved_xmm_count;
   int raw_frame_size;
   int frame_size;
+  /* When set, the frame pointer is omitted: rbp is not pushed/established, stack
+   * slots are addressed off rsp (which is stable for the whole body), and rbp is
+   * freed for register allocation. Gated off when stack traces / debug info /
+   * debug hooks need a frame-pointer chain. Since rsp sits frame_size below where
+   * rbp would be, an [rbp+d] slot becomes [rsp+frame_size+d]. */
+  int omit_frame_pointer;
   /* IEEE-754 width of the function's float return (0/32/64). 0 = not float. */
   int return_float_bits;
   /* Set when the function's return type classifies INDIRECT (struct >8B or
@@ -533,6 +541,8 @@ int code_generator_binary_emit_simd_clamp_i32( CodeGenerator *generator, BinaryF
 int code_generator_binary_emit_simd_dot_i32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_dot_i8( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_exp_f32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
+int code_generator_binary_emit_simd_silu_f32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
+int code_generator_binary_emit_simd_silu_f32_inline(BinaryCodeBuffer *b, int has_mul);
 int code_generator_binary_emit_simd_slp_mac_i32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 /* Pure inner loop of the SLP MAC kernel for the MIR pass-through path. Assumes
  * RCX/RDX/R8 = a/b/out element pointers (offsets already applied), R9 = k count,
@@ -550,9 +560,20 @@ int code_generator_binary_emit_simd_reverse_copy_i32( CodeGenerator *generator, 
 int code_generator_binary_emit_lower_bound_i32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_scale_i32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_sum_i32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
+int code_generator_binary_emit_simd_lcg_u32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_sum_u8( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_byte_map( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_fill( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
+/* Shared fill primitives (RAX = value in, XMM0 = splat out; loop assumes
+ * RCX = base, R8 = element count): used by both the fallback fill lowering and
+ * the MIR inline-fill passthrough (MIR_SIMD_FILL). */
+int code_generator_binary_emit_simd_fill_splat(BinaryCodeBuffer *b, long long size);
+int code_generator_binary_emit_simd_fill_loop_mode0(BinaryCodeBuffer *b, long long size);
+int code_generator_binary_emit_simd_fill_loop_bytewalk(BinaryCodeBuffer *b, long long size, int mode);
+/* Shared float32 affine-map loop (RCX=src iterated, RDX=dst, R9=src end ptr,
+ * ymm4=a, ymm5=b, ymm3=c broadcasts): fallback + MIR passthrough share it. */
+int code_generator_binary_emit_simd_affine_map_f32_loop(BinaryCodeBuffer *b, int b_is_one, int b_is_zero, int c_is_zero);
+int code_generator_binary_emit_simd_affine_map_f32_inline(BinaryCodeBuffer *b, unsigned a_bits, unsigned b_bits, unsigned c_bits, int b_is_one, int b_is_zero, int c_is_zero);
 int code_generator_binary_emit_prefix_sum_i32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_minmax_i32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_sum_f64( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);

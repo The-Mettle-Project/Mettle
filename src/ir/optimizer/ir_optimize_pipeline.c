@@ -70,6 +70,8 @@ static const IROptNamedPass g_ir_post_fixpoint_passes[] = {
     {"simd_minmax_i32", ir_simd_minmax_i32_pass},
     {"simd_affine_map_float", ir_simd_affine_map_float_pass},
     {"simd_exp_f32", ir_simd_exp_f32_pass},
+    {"simd_silu_f32", ir_simd_silu_f32_pass},
+    {"simd_lcg", ir_simd_lcg_pass},
     {"simd_i2f_reduce", ir_simd_i2f_reduce_pass},
     {"simd_dot_float", ir_simd_dot_float_pass},
     {"simd_sum_float", ir_simd_sum_float_pass},
@@ -133,6 +135,8 @@ static const IROptScheduledPass g_ir_fixpoint_passes[] = {
                        ir_common_subexpression_elimination_pass),
     IR_OPT_PASS_ALWAYS(CONSTANT_AND_BRANCH_SIMPLIFY,
                        ir_constant_and_branch_simplify_pass),
+    IR_OPT_PASS_WHEN_ALL(REASSOCIATE_CONSTANTS, ir_reassociate_constants_pass,
+                         IR_OPT_FEATURE_BINARY),
     IR_OPT_PASS_WHEN_ALL(COUNT_WORD_STARTS, ir_count_word_starts_pass,
                          IR_OPT_LABEL_JUMP | IR_OPT_FEATURE_BRANCH_ZERO |
                              IR_OPT_FEATURE_LOAD),

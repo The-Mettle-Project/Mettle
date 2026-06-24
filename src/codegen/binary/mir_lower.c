@@ -689,6 +689,44 @@ static MirAddrofKind mir_addressof_kind(CodeGenerator *g,
   return MIR_ADDROF_LOCAL; /* scalar/DIRECT/INDIRECT-agg local or param: lea home */
 }
 
+/* Float bit-width (32/64) of a call-argument value operand for the eligibility
+ * gate, which (unlike lowering) has no BinaryFunctionContext. Uses the operand's
+ * own float_bits tag and the symbol table only — the same signals lowering's
+ * code_generator_binary_operand_float_bits treats as authoritative (it returns
+ * the operand's float_bits first), so the gate and lowering agree on which args
+ * are float. Returns 0 for a non-float or undeterminable operand (gate defers). */
+static int mir_arg_float_bits(CodeGenerator *g, const IRFunction *ir_function,
+                              const IROperand *op) {
+  if (!op) {
+    return 0;
+  }
+  if (op->kind == IR_OPERAND_FLOAT) {
+    return op->float_bits == 32 ? 32 : 64;
+  }
+  if (op->kind == IR_OPERAND_TEMP || op->kind == IR_OPERAND_SYMBOL) {
+    if (op->float_bits == 32 || op->float_bits == 64) {
+      return op->float_bits;
+    }
+    if (op->kind == IR_OPERAND_SYMBOL && op->name) {
+      /* A float LOCAL or PARAMETER: resolve its declared type from the IR (the
+       * symbol table holds only globals at codegen time, scope having been
+       * popped). This is exactly the type lowering's mir_value_operand will see,
+       * so the gate and the homing agree on which args are float. */
+      Type *lt = mir_local_or_param_type(g, ir_function, op->name, NULL);
+      if (lt) {
+        return code_generator_binary_resolved_type_float_bits(lt);
+      }
+      if (g && g->symbol_table) {
+        Symbol *s = symbol_table_lookup(g->symbol_table, op->name);
+        if (s) {
+          return code_generator_binary_resolved_type_float_bits(s->type);
+        }
+      }
+    }
+  }
+  return 0;
+}
+
 static int mir_call_is_supported(CodeGenerator *g,
                                  const IRFunction *ir_function,
                                  const IRInstruction *in) {
@@ -714,6 +752,7 @@ static int mir_call_is_supported(CodeGenerator *g,
   Type *ret = callee->data.function.return_type
                   ? callee->data.function.return_type
                   : callee->type;
+  int hidden = 0;
   if (ret && code_generator_abi_classify(ret) == ABI_PASS_INDIRECT) {
     /* struct-by-value return: the caller passes a hidden out-pointer as the
      * first integer arg, pointed at the destination struct's home (a struct
@@ -722,19 +761,56 @@ static int mir_call_is_supported(CodeGenerator *g,
       mir_call_trace("ret_indirect");
       return 0;
     }
+    hidden = 1; /* hidden out-pointer occupies the first positional ABI slot */
   }
   if (callee->data.function.parameter_count != in->argument_count) {
     mir_call_trace("arity_mismatch");
     return 0; /* variadic / arity mismatch: not yet */
   }
+  /* The positional ABI slot count that lands in a register (Win64: 4 shared
+   * int/float; SysV draws int and float from separate larger pools). Float args
+   * are homed only when they fall in an XMM register; a float STACK arg (5th+
+   * positional under Win64) is still deferred to the fallback. */
+  const BinaryAbi *call_abi = code_generator_binary_active_abi();
   for (size_t a = 0; a < in->argument_count; a++) {
     Type *pt = callee->data.function.parameter_types
                    ? callee->data.function.parameter_types[a]
                    : NULL;
     const IROperand *arg = &in->arguments[a];
-    if (!pt || code_generator_binary_resolved_type_float_bits(pt) != 0) {
-      mir_call_trace("arg_float");
-      return 0; /* float arg: deferred (no float arg homing yet) */
+    if (!pt) {
+      mir_call_trace("arg_no_type");
+      return 0;
+    }
+    if (code_generator_binary_resolved_type_float_bits(pt) != 0) {
+      /* Float parameter: homeable when (1) the argument is itself a float value
+       * (a float temp/local/param or a float literal) — an int->float implicit
+       * conversion at the call site is left to the fallback — and (2) it lands in
+       * an XMM register, not a stack slot. */
+      if (mir_arg_float_bits(g, ir_function, arg) == 0) {
+        mir_call_trace("arg_float_nonfloat_src");
+        return 0;
+      }
+      size_t slot = a + (size_t)hidden;
+      if (call_abi->counts_classes_separately) {
+        /* SysV: floats draw from their own register file in argument order. */
+        size_t fbefore = 0;
+        for (size_t b = 0; b < a; b++) {
+          Type *bt = callee->data.function.parameter_types
+                         ? callee->data.function.parameter_types[b]
+                         : NULL;
+          if (bt && code_generator_binary_resolved_type_float_bits(bt) != 0) {
+            fbefore++;
+          }
+        }
+        if (fbefore >= (size_t)call_abi->float_param_count) {
+          mir_call_trace("arg_float_stack");
+          return 0;
+        }
+      } else if (slot >= (size_t)call_abi->int_param_count) {
+        mir_call_trace("arg_float_stack");
+        return 0;
+      }
+      continue;
     }
     if (code_generator_abi_classify(pt) == ABI_PASS_INDIRECT) {
       /* struct passed BY VALUE: the caller copies it to an outgoing temp and
@@ -1124,11 +1200,17 @@ int mir_function_is_eligible(CodeGenerator *generator,
       }
       break;
     case IR_OP_UNARY:
-      /* Integer unary `-`, `~`, `+`, `!` only. Float unary (negate/plus on
-       * xmm) and popcnt are deferred to the fallback for now. */
-      if (in->is_float || !in->text ||
-          (strcmp(in->text, "-") != 0 && strcmp(in->text, "~") != 0 &&
-           strcmp(in->text, "+") != 0 && strcmp(in->text, "!") != 0)) {
+      /* Integer unary `-`, `~`, `+`, `!`; float unary `-` (negate as 0-x) and
+       * `+` (copy). Float `~`/`!` are not valid and popcnt is deferred. */
+      if (!in->text) {
+        return mir_trace_bail(function_data, "unary:float_or_unsupported");
+      }
+      if (in->is_float) {
+        if (strcmp(in->text, "-") != 0 && strcmp(in->text, "+") != 0) {
+          return mir_trace_bail(function_data, "unary:float_or_unsupported");
+        }
+      } else if (strcmp(in->text, "-") != 0 && strcmp(in->text, "~") != 0 &&
+                 strcmp(in->text, "+") != 0 && strcmp(in->text, "!") != 0) {
         return mir_trace_bail(function_data, "unary:float_or_unsupported");
       }
       if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
@@ -1237,6 +1319,122 @@ int mir_function_is_eligible(CodeGenerator *generator,
             o->kind != IR_OPERAND_INT) {
           return mir_trace_bail(function_data, "slp_mac:arg_kind");
         }
+      }
+      break;
+    }
+    case IR_OP_SIMD_FILL: {
+      /* Inline fill passthrough, restricted to the element-counted (mode 0),
+       * no-start, no-offset, no-live-iv-writeback subset with a compile-time
+       * integer value -- the frame-clear / `a[i] = c` shape. Every other fill
+       * form (byte-walk modes, runtime/float value, hoisted offset, or a live
+       * induction variable that needs a final write-back) stays in the fallback,
+       * which handles them all. */
+      if (in->argument_count < 5 ||
+          in->arguments[0].kind != IR_OPERAND_INT ||
+          (in->arguments[0].int_value != 1 && in->arguments[0].int_value != 2 &&
+           in->arguments[0].int_value != 4 &&
+           in->arguments[0].int_value != 8) ||
+          in->arguments[1].kind != IR_OPERAND_INT) {
+        return mir_trace_bail(function_data, "simd_fill:shape");
+      }
+      /* Mode 0 (element-counted) and mode 1 (begin->end byte walk) only; mode 2
+       * (byte-offset walk with a start and a live-iv write-back) defers. */
+      long long fill_mode = in->arguments[1].int_value;
+      if (fill_mode != 0 && fill_mode != 1) {
+        return mir_trace_bail(function_data, "simd_fill:mode");
+      }
+      /* Mode 0 must start the induction variable at 0 (a nonzero start adjusts
+       * both the base and the count; deferred). A nonzero/runtime OFFSET (the
+       * invariant part of `base[offset + i]`) is supported by folding
+       * `base + offset*size` in MIR before the kernel, but only for an int64
+       * (wide) index so the pointer math is plain 64-bit -- an int32 offset would
+       * need the fallback's sign-extension to match exactly. */
+      if (fill_mode == 0) {
+        if (!(in->arguments[3].kind == IR_OPERAND_INT &&
+              in->arguments[3].int_value == 0)) {
+          return mir_trace_bail(function_data, "simd_fill:start");
+        }
+        int offset_zero = (in->arguments[4].kind == IR_OPERAND_INT &&
+                           in->arguments[4].int_value == 0);
+        if (!offset_zero) {
+          int wide = in->argument_count > 5 &&
+                     in->arguments[5].kind == IR_OPERAND_INT &&
+                     in->arguments[5].int_value == 64;
+          if (!wide) {
+            return mir_trace_bail(function_data, "simd_fill:offset_width");
+          }
+          if (in->arguments[4].kind != IR_OPERAND_TEMP &&
+              in->arguments[4].kind != IR_OPERAND_SYMBOL &&
+              in->arguments[4].kind != IR_OPERAND_INT) {
+            return mir_trace_bail(function_data, "simd_fill:offset_kind");
+          }
+        }
+      }
+      /* A live induction variable (dest = the iv symbol) needs a final
+       * write-back. Mode 0 with start 0 leaves iv = max(count, 0), folded in MIR
+       * after the kernel -- but only when the iv is a LOCAL/PARAM (resolvable to
+       * a vreg). Mode 1's pointer iv and a global iv stay in the fallback. */
+      if (in->dest.kind == IR_OPERAND_SYMBOL) {
+        if (fill_mode != 0 ||
+            !mir_local_or_param_type(generator, ir_function, in->dest.name,
+                                     NULL)) {
+          return mir_trace_bail(function_data, "simd_fill:writeback");
+        }
+      }
+      if (in->lhs.kind != IR_OPERAND_TEMP && in->lhs.kind != IR_OPERAND_SYMBOL) {
+        return mir_trace_bail(function_data, "simd_fill:base");
+      }
+      if (in->rhs.kind != IR_OPERAND_TEMP && in->rhs.kind != IR_OPERAND_SYMBOL &&
+          in->rhs.kind != IR_OPERAND_INT) {
+        return mir_trace_bail(function_data, "simd_fill:count");
+      }
+      if (in->arguments[2].kind != IR_OPERAND_INT) {
+        return mir_trace_bail(function_data, "simd_fill:value");
+      }
+      break;
+    }
+    case IR_OP_SIMD_AFFINE_MAP_F32: {
+      /* Inline float32 affine-map passthrough (`dst[i]=a*src[i]+b*dst[i]+c`, the
+       * float-copy/saxpy class). src (lhs) and dst (rhs) must be LEA-able
+       * pointers (TEMP/SYMBOL), the count GP-resolvable, and the a/b/c
+       * coefficients compile-time FLOAT immediates (so the kernel can bake their
+       * broadcasts); a runtime coefficient stays in the fallback. */
+      if (in->argument_count < 4 || !in->arguments) {
+        return mir_trace_bail(function_data, "affine_map:shape");
+      }
+      if ((in->lhs.kind != IR_OPERAND_TEMP && in->lhs.kind != IR_OPERAND_SYMBOL) ||
+          (in->rhs.kind != IR_OPERAND_TEMP && in->rhs.kind != IR_OPERAND_SYMBOL)) {
+        return mir_trace_bail(function_data, "affine_map:ptr");
+      }
+      if (in->arguments[0].kind != IR_OPERAND_TEMP &&
+          in->arguments[0].kind != IR_OPERAND_SYMBOL &&
+          in->arguments[0].kind != IR_OPERAND_INT) {
+        return mir_trace_bail(function_data, "affine_map:count");
+      }
+      for (int k = 1; k <= 3; k++) {
+        if (in->arguments[k].kind != IR_OPERAND_FLOAT) {
+          return mir_trace_bail(function_data, "affine_map:coeff");
+        }
+      }
+      break;
+    }
+    case IR_OP_SIMD_SILU_F32: {
+      /* Inline SiLU/SwiGLU passthrough. g (lhs) must be a LEA-able pointer, the
+       * count GP-resolvable, and (SwiGLU) u (rhs) a pointer too; plain SiLU
+       * leaves rhs NONE/"" (no multiply). */
+      if (in->argument_count < 1 || !in->arguments ||
+          (in->lhs.kind != IR_OPERAND_TEMP &&
+           in->lhs.kind != IR_OPERAND_SYMBOL)) {
+        return mir_trace_bail(function_data, "silu:g");
+      }
+      if (in->arguments[0].kind != IR_OPERAND_TEMP &&
+          in->arguments[0].kind != IR_OPERAND_SYMBOL &&
+          in->arguments[0].kind != IR_OPERAND_INT) {
+        return mir_trace_bail(function_data, "silu:count");
+      }
+      if (in->rhs.kind != IR_OPERAND_NONE && in->rhs.kind != IR_OPERAND_STRING &&
+          in->rhs.kind != IR_OPERAND_TEMP && in->rhs.kind != IR_OPERAND_SYMBOL) {
+        return mir_trace_bail(function_data, "silu:u");
       }
       break;
     }
@@ -2279,10 +2477,22 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
   }
 
   case IR_OP_UNARY: {
-    /* Integer unary only (float unary is gated out in eligibility). */
     MirOperand dst = mir_value_operand(fn, g, ctx, map, &in->dest);
-    MirOperand a = mir_value_operand(fn, g, ctx, map, &in->lhs);
     const char *op = in->text ? in->text : "";
+    if (in->is_float) {
+      /* Float negate `-x` as `0 - x` (pxor zero; subss/subsd), matching the
+       * fallback's emit_unary exactly so 0/NaN signs agree; `+x` is a copy. The
+       * operand is coerced to the result precision first. */
+      int fb = code_generator_binary_instruction_result_float_bits(g, ctx, in);
+      int w = fb ? fb / 8 : 8;
+      MirOperand x = coerce_float_operand(fn, g, ctx, map, &in->lhs, w);
+      if (strcmp(op, "+") == 0) {
+        return mir_emit_fmov(fn, dst, x, w);
+      }
+      MirOperand zero = mir_float_const_operand(fn, 0.0, w);
+      return mir_emit1(fn, MIR_FSUB, dst, zero, x, w, 0, 0);
+    }
+    MirOperand a = mir_value_operand(fn, g, ctx, map, &in->lhs);
     if (strcmp(op, "-") == 0) {
       return mir_emit1(fn, MIR_NEG, dst, a, mir_op_none(), 8, 0, 0);
     }
@@ -2537,10 +2747,11 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
         return 0;
       }
     }
-    /* Marshal GP arguments per the ABI layout. Arguments up to the ABI's
-     * argument-register count go into registers; the rest are stored into the
-     * outgoing stack-argument region (reserved once in the prologue). All call
-     * args are GP here (float/struct args bail in eligibility). */
+    /* Marshal arguments per the ABI layout. Arguments up to the ABI's
+     * argument-register count go into registers (GP, or XMM for float args); the
+     * rest are stored into the outgoing stack-argument region (reserved once in
+     * the prologue). Eligibility guarantees every float arg lands in an XMM
+     * register (float stack args still bail). */
     const BinaryAbi *abi = code_generator_binary_active_abi();
     /* Caller-side INDIRECT return: the callee returns a struct by value, so the
      * ABI passes a hidden out-pointer as the first integer arg, shifting every
@@ -2562,6 +2773,26 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
     }
     int hidden = ret_indirect ? 1 : 0;
     int arg_is_float[MIR_MAX_PARAMS + 1] = {0}; /* slot 0 = hidden ptr if present */
+    /* Tag each positional slot's float class from the callee's parameter types so
+     * the ABI layout routes float args to XMM registers. Without this every arg
+     * defaults to integer and a float arg is homed into a GP register (and a
+     * float immediate then reaches the GP value path — an encoder error). */
+    {
+      Symbol *fc = g->symbol_table
+                       ? symbol_table_lookup(g->symbol_table, in->text)
+                       : NULL;
+      if (fc && fc->kind == SYMBOL_FUNCTION &&
+          fc->data.function.parameter_types) {
+        for (size_t a = 0; a < in->argument_count &&
+                           a < fc->data.function.parameter_count;
+             a++) {
+          Type *pt = fc->data.function.parameter_types[a];
+          if (pt && code_generator_binary_resolved_type_float_bits(pt) != 0) {
+            arg_is_float[a + (size_t)hidden] = 1;
+          }
+        }
+      }
+    }
     BinaryArgLocation locs[MIR_MAX_PARAMS + 1];
     int stack_bytes = 0;
     size_t nlocs = in->argument_count + (size_t)hidden;
@@ -2690,6 +2921,62 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
       MirOperand arg = mir_value_operand(fn, g, ctx, map, &in->arguments[a]);
       if (!mir_emit1(fn, MIR_MOV, mir_op_phys(reg, MIR_RC_GP), arg,
                      mir_op_none(), 8, 0, 0)) {
+        return 0;
+      }
+    }
+    /* Float register args: move each value into its XMM argument register,
+     * converting to the parameter's precision (a float64-tracked temp passed to
+     * a float32 param narrows via cvtsd2ss — mirroring the fallback's
+     * emit_float_call_argument; a raw movss would hand the callee the low dword
+     * of a double, zero for values like 2.0). Setting has_xmm_arg_call removes
+     * XMM0..XMM3 from this function's allocation pool, so no arg source ever sits
+     * in a target register and these moves cannot clobber a not-yet-consumed
+     * source (the parallel-move hazard with 2+ float args). */
+    for (size_t a = 0; a < in->argument_count; a++) {
+      if (locs[a + hidden].kind != BINARY_ARG_IN_XMM_REGISTER) {
+        continue;
+      }
+      fn->has_xmm_arg_call = 1;
+      BinaryXmmRegister xreg = locs[a + hidden].xmm_register;
+      Type *pt = (call_callee && call_callee->kind == SYMBOL_FUNCTION &&
+                  call_callee->data.function.parameter_types)
+                     ? call_callee->data.function.parameter_types[a]
+                     : NULL;
+      int pfb = pt ? code_generator_binary_resolved_type_float_bits(pt) : 0;
+      if (pfb != 32 && pfb != 64) {
+        pfb = 64;
+      }
+      const IROperand *arg_op = &in->arguments[a];
+      int sfb;
+      if (arg_op->kind == IR_OPERAND_FLOAT) {
+        sfb = arg_op->float_bits == 32 ? 32 : 64;
+      } else {
+        sfb = code_generator_binary_operand_float_bits(g, ctx, arg_op);
+        if (sfb != 32 && sfb != 64) {
+          sfb = pfb;
+        }
+      }
+      MirOperand val = mir_value_operand(fn, g, ctx, map, arg_op);
+      if (val.kind == MIR_OPK_FIMM) {
+        /* A float immediate cannot move straight into a physical register; stage
+         * it (at its own precision) in a vreg first. */
+        MirVregId t = mir_new_vreg(fn, MIR_RC_XMM, sfb / 8);
+        if (t == MIR_VREG_NONE ||
+            !mir_emit_fmov(fn, mir_op_vreg(t), val, sfb / 8)) {
+          return 0;
+        }
+        val = mir_op_vreg(t);
+      }
+      if (sfb != pfb) {
+        MirVregId t2 = mir_new_vreg(fn, MIR_RC_XMM, pfb / 8);
+        if (t2 == MIR_VREG_NONE ||
+            !mir_emit1(fn, MIR_CVTF2F, mir_op_vreg(t2), val, mir_op_none(),
+                       pfb / 8, 0, 0)) {
+          return 0;
+        }
+        val = mir_op_vreg(t2);
+      }
+      if (!mir_emit_fmov(fn, mir_op_phys(xreg, MIR_RC_XMM), val, pfb / 8)) {
         return 0;
       }
     }
@@ -2846,6 +3133,132 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
     /* width = b's element size (1 = int8-widening kernel, 4 = int32 kernel). */
     return mir_emit1(fn, MIR_SIMD_SLP_MAC, mir_op_imm(K), mir_op_none(),
                      mir_op_none(), elem[1], 0, 0);
+  }
+
+  case IR_OP_SIMD_FILL: {
+    /* Inline element-counted fill (gated to the mode-0/no-offset/no-writeback,
+     * integer-value subset). Marshal base->RCX, element count->R8, value->RAX,
+     * then emit the kernel. The value is parked into RAX LAST so it cannot
+     * clobber a base/count source that the allocator happened to place in RAX
+     * (the only poolable register among the three targets). */
+    MirOperand base = mir_value_operand(fn, g, ctx, map, &in->lhs);
+    MirOperand cnt = mir_value_operand(fn, g, ctx, map, &in->rhs);
+    MirOperand val = mir_value_operand(fn, g, ctx, map, &in->arguments[2]);
+    long long size = in->arguments[0].int_value;
+    long long mode = in->arguments[1].int_value;
+    /* Mode-0 runtime offset (`base[offset + i]`, start 0, int64 index): fold the
+     * effective base `base + offset*size` here in 64-bit MIR so the kernel runs
+     * the plain element loop. The count (rhs) is the element length unchanged. */
+    if (mode == 0 && !(in->arguments[4].kind == IR_OPERAND_INT &&
+                       in->arguments[4].int_value == 0)) {
+      MirOperand off = mir_value_operand(fn, g, ctx, map, &in->arguments[4]);
+      MirVregId scaled = mir_new_vreg(fn, MIR_RC_GP, 8);
+      if (scaled == MIR_VREG_NONE) {
+        return 0;
+      }
+      int shift = (size == 8) ? 3 : (size == 4) ? 2 : (size == 2) ? 1 : 0;
+      if (shift > 0) {
+        if (!mir_emit1(fn, MIR_SHL, mir_op_vreg(scaled), off, mir_op_imm(shift),
+                       8, 0, 0)) {
+          return 0;
+        }
+      } else if (!mir_emit1(fn, MIR_MOV, mir_op_vreg(scaled), off, mir_op_none(),
+                            8, 0, 0)) {
+        return 0;
+      }
+      MirVregId adj = mir_new_vreg(fn, MIR_RC_GP, 8);
+      if (adj == MIR_VREG_NONE ||
+          !mir_emit1(fn, MIR_ADD, mir_op_vreg(adj), base, mir_op_vreg(scaled), 8,
+                     0, 0)) {
+        return 0;
+      }
+      base = mir_op_vreg(adj);
+    }
+    if (!mir_emit1(fn, MIR_MOV, mir_op_phys(BINARY_GP_RCX, MIR_RC_GP), base,
+                   mir_op_none(), 8, 0, 0) ||
+        !mir_emit1(fn, MIR_MOV, mir_op_phys(BINARY_GP_R8, MIR_RC_GP), cnt,
+                   mir_op_none(), 8, 0, 0) ||
+        !mir_emit1(fn, MIR_MOV, mir_op_phys(BINARY_GP_RAX, MIR_RC_GP), val,
+                   mir_op_none(), 8, 0, 0)) {
+      return 0;
+    }
+    /* dst.imm = element size; a.imm = fill mode (0 element-counted, 1 byte-walk). */
+    if (!mir_emit1(fn, MIR_SIMD_FILL, mir_op_imm(size), mir_op_imm(mode),
+                   mir_op_none(), (int)size, 0, 0)) {
+      return 0;
+    }
+    /* Live induction variable (mode 0, start 0): the unit-stride loop leaves
+     * iv = max(count, 0) (the count for an empty loop, else the bound). Fold it
+     * branchlessly as `cnt & ~(cnt >> 63)` so a later use of the counter reads
+     * the right value -- matching the fallback's cmov write-back exactly. */
+    if (mode == 0 && in->dest.kind == IR_OPERAND_SYMBOL) {
+      MirOperand iv = mir_value_operand(fn, g, ctx, map, &in->dest);
+      MirVregId mask = mir_new_vreg(fn, MIR_RC_GP, 8);
+      if (mask == MIR_VREG_NONE ||
+          !mir_emit1(fn, MIR_SAR, mir_op_vreg(mask), cnt, mir_op_imm(63), 8, 0,
+                     0) ||
+          !mir_emit1(fn, MIR_NOT, mir_op_vreg(mask), mir_op_vreg(mask),
+                     mir_op_none(), 8, 0, 0) ||
+          !mir_emit1(fn, MIR_AND, iv, cnt, mir_op_vreg(mask), 8, 0, 0)) {
+        return 0;
+      }
+    }
+    return 1;
+  }
+
+  case IR_OP_SIMD_AFFINE_MAP_F32: {
+    /* Inline float32 affine map: marshal src->RCX, dst->RDX, count->R8, then emit
+     * the kernel with the (compile-time) a/b/c coefficient bits in dst/a/b.imm
+     * and the b_is_one/b_is_zero/c_is_zero flags in cc. */
+    MirOperand src = mir_value_operand(fn, g, ctx, map, &in->lhs);
+    MirOperand dst = mir_value_operand(fn, g, ctx, map, &in->rhs);
+    MirOperand cnt = mir_value_operand(fn, g, ctx, map, &in->arguments[0]);
+    if (!mir_emit1(fn, MIR_MOV, mir_op_phys(BINARY_GP_RCX, MIR_RC_GP), src,
+                   mir_op_none(), 8, 0, 0) ||
+        !mir_emit1(fn, MIR_MOV, mir_op_phys(BINARY_GP_RDX, MIR_RC_GP), dst,
+                   mir_op_none(), 8, 0, 0) ||
+        !mir_emit1(fn, MIR_MOV, mir_op_phys(BINARY_GP_R8, MIR_RC_GP), cnt,
+                   mir_op_none(), 8, 0, 0)) {
+      return 0;
+    }
+    long long a_bits = (long long)(uint32_t)mir_float_bits_at(
+        in->arguments[1].float_value, 4);
+    long long b_bits = (long long)(uint32_t)mir_float_bits_at(
+        in->arguments[2].float_value, 4);
+    long long c_bits = (long long)(uint32_t)mir_float_bits_at(
+        in->arguments[3].float_value, 4);
+    int b_is_one = in->arguments[2].float_value == 1.0;
+    int b_is_zero = in->arguments[2].float_value == 0.0;
+    int c_is_zero = in->arguments[3].float_value == 0.0;
+    unsigned char flags = (unsigned char)((b_is_one ? 1 : 0) |
+                                          (b_is_zero ? 2 : 0) |
+                                          (c_is_zero ? 4 : 0));
+    return mir_emit1(fn, MIR_SIMD_AFFINE_MAP_F32, mir_op_imm(a_bits),
+                     mir_op_imm(b_bits), mir_op_imm(c_bits), 4, 0, flags);
+  }
+
+  case IR_OP_SIMD_SILU_F32: {
+    /* Inline SiLU/SwiGLU gate: marshal g/out->RCX, count->R8, u->RDX (SwiGLU),
+     * then emit the kernel with has_mul in dst.imm. */
+    int has_mul = (in->rhs.kind == IR_OPERAND_TEMP ||
+                   in->rhs.kind == IR_OPERAND_SYMBOL);
+    MirOperand gbase = mir_value_operand(fn, g, ctx, map, &in->lhs);
+    MirOperand cnt = mir_value_operand(fn, g, ctx, map, &in->arguments[0]);
+    if (!mir_emit1(fn, MIR_MOV, mir_op_phys(BINARY_GP_RCX, MIR_RC_GP), gbase,
+                   mir_op_none(), 8, 0, 0) ||
+        !mir_emit1(fn, MIR_MOV, mir_op_phys(BINARY_GP_R8, MIR_RC_GP), cnt,
+                   mir_op_none(), 8, 0, 0)) {
+      return 0;
+    }
+    if (has_mul) {
+      MirOperand ubase = mir_value_operand(fn, g, ctx, map, &in->rhs);
+      if (!mir_emit1(fn, MIR_MOV, mir_op_phys(BINARY_GP_RDX, MIR_RC_GP), ubase,
+                     mir_op_none(), 8, 0, 0)) {
+        return 0;
+      }
+    }
+    return mir_emit1(fn, MIR_SIMD_SILU_F32, mir_op_imm(has_mul ? 1 : 0),
+                     mir_op_none(), mir_op_none(), 4, 0, 0);
   }
 
   case IR_OP_ADDRESS_OF: {
@@ -3175,6 +3588,37 @@ static int mir_lower_folded_access(MirFunction *fn, CodeGenerator *g,
  * then the compare operands are loop-stable live values (a counter and a bound),
  * not temps computed by the header's condition evaluation — so re-testing them
  * at the back-edge (after the body's update) is exactly the loop condition. */
+/* Fuse `MOV d, s` immediately followed by `MOVSX/MOVZX d, d` into
+ * `MOVSX/MOVZX d, s`: the extend overwrites d with the extension of its low
+ * bytes, so reading s directly is identical and the copy is dead. The narrow-
+ * integer canonicalization emitted after an ASSIGN is exactly this shape
+ * (`MOV cd, b; MOVSX cd, cd`), so this removes a register copy -- and one
+ * short-lived value, easing register pressure -- per narrow copy-assign, which
+ * is common in inlined and recursive code (e.g. rec_fib's `mov r13,r12; movsxd
+ * r13,r13d`). Only vreg->vreg moves (a load/immediate MOV is left alone), and
+ * the two are adjacent so s cannot be redefined between them. */
+static void mir_fuse_mov_then_extend(MirFunction *fn) {
+  if (!fn) {
+    return;
+  }
+  for (size_t i = 1; i < fn->insn_count; i++) {
+    MirInst *ext = &fn->insns[i];
+    if ((ext->op != MIR_MOVSX && ext->op != MIR_MOVZX) || ext->is_float ||
+        ext->dst.kind != MIR_OPK_VREG || ext->a.kind != MIR_OPK_VREG ||
+        ext->dst.vreg != ext->a.vreg) {
+      continue;
+    }
+    MirInst *mov = &fn->insns[i - 1];
+    if (mov->op != MIR_MOV || mov->is_float || mov->dst.kind != MIR_OPK_VREG ||
+        mov->dst.vreg != ext->dst.vreg || mov->a.kind != MIR_OPK_VREG ||
+        mov->a.vreg == ext->dst.vreg) {
+      continue;
+    }
+    ext->a.vreg = mov->a.vreg; /* extend reads the copy's source directly */
+    mov->op = MIR_NOP;         /* the copy is now dead */
+  }
+}
+
 static void mir_rotate_loops(MirFunction *fn) {
   if (!fn || fn->insn_count < 3) {
     return;
@@ -3263,6 +3707,15 @@ int code_generator_binary_emit_function_via_mir(
   context->raw_frame_size = 0;
   context->frame_size = 0;
   context->return_float_bits = 0;
+  /* Frame-pointer omission is DISABLED: a controlled A/B (same C baseline)
+   * showed it is performance-neutral across the benchmark suite (~0% on ~11
+   * benches, +3% on const_mod, but -6% on saxpy and -3% on func_ptr) -- no net
+   * win, with downside on a couple of leaf loops, plus the added rsp-addressing
+   * complexity. The freed rbp rarely binds and rsp-relative slots cost a SIB
+   * byte. Set unconditionally to 0 so the allocator keeps the rbp frame and rbp
+   * stays reserved. (The FPO machinery in mir_encode/mir_regalloc is inert while
+   * this is 0; opt back in via METTLE_FPO if a future change makes it pay off.) */
+  context->omit_frame_pointer = getenv("METTLE_FPO") ? 1 : 0;
 
   /* Bind parameters to vregs and record their incoming extension. */
   const BinaryAbi *abi = code_generator_binary_active_abi();
@@ -3604,6 +4057,7 @@ int code_generator_binary_emit_function_via_mir(
   free(fold_skip);
   free(folds);
 
+  mir_fuse_mov_then_extend(&fn);
   mir_rotate_loops(&fn);
 
   if (!mir_regalloc(&fn) || fn.has_error) {

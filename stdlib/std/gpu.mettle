@@ -16,6 +16,9 @@ export extern function cuModuleLoadData(modOut: int64*, image: uint8*) -> int32 
 export extern function cuModuleGetFunction(kfOut: int64*, mod: int64, name: cstring) -> int32 = "cuModuleGetFunction";
 export extern function cuMemAlloc_v2(dptr: int64*, bytes: int64) -> int32 = "cuMemAlloc_v2";
 export extern function cuMemFree_v2(dptr: int64) -> int32 = "cuMemFree_v2";
+export extern function cuMemHostAlloc(pp: int64*, bytes: int64, flags: uint32) -> int32 = "cuMemHostAlloc";
+export extern function cuMemFreeHost(p: int64) -> int32 = "cuMemFreeHost";
+export extern function cuMemHostGetDevicePointer_v2(dptr: int64*, p: int64, flags: uint32) -> int32 = "cuMemHostGetDevicePointer_v2";
 export extern function cuMemcpyHtoD_v2(dst: int64, src: uint8*, bytes: int64) -> int32 = "cuMemcpyHtoD_v2";
 export extern function cuMemcpyDtoH_v2(dst: uint8*, src: int64, bytes: int64) -> int32 = "cuMemcpyDtoH_v2";
 export extern function cuLaunchKernel(f: int64, gx: uint32, gy: uint32, gz: uint32,
@@ -33,7 +36,7 @@ export function gpu_init() -> int64 {
   var dev: int32 = 0;
   if (cuDeviceGet(&dev, 0) != 0) { return 0; }
   var ctx: int64 = 0;
-  if (cuCtxCreate_v2(&ctx, 0, dev) != 0) { return 0; }
+  if (cuCtxCreate_v2(&ctx, 8, dev) != 0) { return 0; }  // CU_CTX_MAP_HOST
   return ctx;
 }
 
@@ -58,6 +61,19 @@ export function gpu_malloc(bytes: int64) -> int64 {
   return dptr;
 }
 export function gpu_free(dptr: int64) -> int32 { return cuMemFree_v2(dptr); }
+export function gpu_host_mapped_malloc(bytes: int64, dev_ptr_out: int64*) -> uint8* {
+  dev_ptr_out[0] = 0;
+  var hp: int64 = 0;
+  if (cuMemHostAlloc(&hp, bytes, 2) != 0) { return (uint8*)0; } // CU_MEMHOSTALLOC_DEVICEMAP
+  var dp: int64 = 0;
+  if (cuMemHostGetDevicePointer_v2(&dp, hp, 0) != 0) {
+    cuMemFreeHost(hp);
+    return (uint8*)0;
+  }
+  dev_ptr_out[0] = dp;
+  return (uint8*)hp;
+}
+export function gpu_host_free(ptr: uint8*) -> int32 { return cuMemFreeHost((int64)ptr); }
 export function gpu_to_device(dst: int64, src: uint8*, bytes: int64) -> int32 {
   return cuMemcpyHtoD_v2(dst, src, bytes);
 }
@@ -66,13 +82,21 @@ export function gpu_to_host(dst: uint8*, src: int64, bytes: int64) -> int32 {
 }
 export function gpu_sync() -> int32 { return cuCtxSynchronize(); }
 
-// The launch primitive `dispatch` lowers to: launch f over a 1D grid of
-// `grid` blocks x `block` threads with the marshalled `params`, then
-// synchronize. Returns 0 on success, or the first nonzero CUDA error code.
+// The launch primitive `dispatch` lowers to this function. It enqueues a kernel
+// on the default stream and returns after launch validation; subsequent kernels
+// and blocking copies keep their normal CUDA stream ordering. Call gpu_sync()
+// explicitly when host code truly needs a mid-pipeline barrier.
 export function gpu_launch(f: int64, grid: int32, block: int32,
                           params: int64*, nargs: int32) -> int32 {
-  var rc: int32 = cuLaunchKernel(f, (uint32)grid, 1, 1, (uint32)block, 1, 1,
-                                 0, 0, params, (int64*)0);
+  return cuLaunchKernel(f, (uint32)grid, 1, 1, (uint32)block, 1, 1,
+                        0, 0, params, (int64*)0);
+}
+
+// Synchronous launch helper for diagnostics or one-off kernels where immediate
+// completion/error reporting matters more than throughput.
+export function gpu_launch_sync(f: int64, grid: int32, block: int32,
+                                params: int64*, nargs: int32) -> int32 {
+  var rc: int32 = gpu_launch(f, grid, block, params, nargs);
   if (rc != 0) { return rc; }
   return cuCtxSynchronize();
 }

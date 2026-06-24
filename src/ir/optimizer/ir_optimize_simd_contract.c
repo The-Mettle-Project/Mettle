@@ -158,6 +158,13 @@ static int ir_label_is_runtime_check(const char *label) {
          strstr(label, "trap_bounds") != NULL || strstr(label, "in_bounds") != NULL;
 }
 
+/* Forward decl: the dependence-analysis recurrence finder lives further down
+ * (next to the deeper --explain diagnosis that shares it). */
+static const char *ir_region_find_serial_recurrence(const IRFunction *function,
+                                                    size_t begin, size_t end,
+                                                    const char **ops,
+                                                    size_t *n_ops);
+
 /* Best-effort explanation of why a loop the user marked `@simd` did not
  * vectorize, derived from the surviving scalar IR between the markers. A clean
  * counted loop has exactly one exit test (branch) and one back-edge (jump);
@@ -252,6 +259,21 @@ static const char *ir_simd_bail_reason(const IRFunction *function, size_t begin,
     return "the loop accesses 64-bit integers, which have no vectorizer "
            "(use int32/int8, or float32/float64)";
   }
+  {
+    /* A non-reassociable loop-carried recurrence (dependence analysis): a
+     * scalar computed from its own previous value through *, /, a shift, or a
+     * bitwise/xor op. The iterations form a dependency chain -- a genuine
+     * scalar floor, not a missing kernel. */
+    const char *ops[6];
+    size_t n_ops = 0;
+    if (ir_region_find_serial_recurrence(function, begin, end, ops, &n_ops)) {
+      return "the loop carries a serial recurrence: a value is computed from "
+             "its own previous value through a non-reassociable operation "
+             "(`*`, `/`, a shift, or a bitwise/xor op), so the iterations form "
+             "a dependency chain; '+'/'-' reductions vectorize, but these do "
+             "not";
+    }
+  }
   /* Honest fallback: we've ruled out the disqualifiers we can detect, so the
    * truthful statement is that no kernel claimed this shape -- NOT an assertion
    * of a specific cause we haven't verified. */
@@ -293,6 +315,144 @@ const char *ir_simd_bail_id_name(int id) {
     }                                                                          \
   } while (0)
 
+/* ---- loop-carried recurrence detection (dependence analysis) ---------------
+ * A reduction whose only carried operation reassociates ('+'/'-') is NOT a
+ * serial bottleneck -- the lanes can sum partials and combine at the end, and
+ * the reduction kernels do exactly that. Any other carried operation (*, /, %,
+ * the shifts, the bitwise ops, xor, and float '*'/'/') makes each iteration
+ * genuinely depend on the previous result, so no lane can start before the one
+ * before it finishes. That distinction is the whole diagnosis below. */
+static int ir_recur_op_is_reassociable(const char *text) {
+  return text && text[0] && !text[1] && (text[0] == '+' || text[0] == '-');
+}
+
+/* Record a distinct carried operator (for the human-readable "through `*`,
+ * `>>`" list); silently caps the set. The stored pointers are the instruction
+ * texts, valid for the lifetime of the diagnosis. */
+#define IR_RECUR_MAX_OPS 6
+static void ir_recur_note_op(const char **ops, size_t *n_ops, const char *t) {
+  if (!t || !t[0]) {
+    return;
+  }
+  for (size_t i = 0; i < *n_ops; i++) {
+    if (strcmp(ops[i], t) == 0) {
+      return;
+    }
+  }
+  if (*n_ops < IR_RECUR_MAX_OPS) {
+    ops[(*n_ops)++] = t;
+  }
+}
+
+/* Does `op` -- an operand feeding a symbol's in-body definition -- transitively
+ * read the PRIOR-iteration value of `sym`? Walks temp producers backward inside
+ * the loop region; sets *nonreassoc when any operation on a reaching path does
+ * not reassociate, and collects the reaching operators into `ops`. Conservative
+ * by construction: an operand it cannot resolve ends that path as "does not
+ * reach", so a reported recurrence is always a real one (it never invents a
+ * dependence that isn't in the IR). The depth bound also keeps it cheap on the
+ * pathological deeply-nested temp chain. */
+static int ir_recur_operand_reaches(const IRFunction *function, size_t before,
+                                    const IROperand *op, const char *sym,
+                                    int *nonreassoc, const char **ops,
+                                    size_t *n_ops, int depth) {
+  if (!op || depth > 32) {
+    return 0;
+  }
+  if (op->kind == IR_OPERAND_SYMBOL && op->name && strcmp(op->name, sym) == 0) {
+    return 1; /* a read of the symbol's value from before this iteration */
+  }
+  if (op->kind != IR_OPERAND_TEMP || !op->name) {
+    return 0;
+  }
+  const IRInstruction *p =
+      ir_find_temp_producer_before(function, before, op->name);
+  if (!p) {
+    return 0;
+  }
+  /* Only straight-line data ops carry a value chain. A CALL/LOAD result is not
+   * the symbol's prior value (a call-in-body is diagnosed separately; a load is
+   * fresh array data), so those paths correctly do not reach. */
+  if (p->op != IR_OP_BINARY && p->op != IR_OP_CAST && p->op != IR_OP_ASSIGN) {
+    return 0;
+  }
+  size_t pidx = (size_t)(p - function->instructions);
+  int found = 0;
+  if (ir_recur_operand_reaches(function, pidx, &p->lhs, sym, nonreassoc, ops,
+                               n_ops, depth + 1)) {
+    found = 1;
+  }
+  if (ir_recur_operand_reaches(function, pidx, &p->rhs, sym, nonreassoc, ops,
+                               n_ops, depth + 1)) {
+    found = 1;
+  }
+  if (found && p->op == IR_OP_BINARY && p->text) {
+    ir_recur_note_op(ops, n_ops, p->text);
+    if (!ir_recur_op_is_reassociable(p->text)) {
+      *nonreassoc = 1;
+    }
+  }
+  return found;
+}
+
+/* The loop's first non-reassociable loop-carried recurrence: a scalar symbol
+ * whose in-body value is computed from its own previous value through at least
+ * one operation that does not reassociate. Returns the symbol (NULL when none),
+ * filling `ops` with the distinct carried operators for the message. Handles
+ * both the direct form (`s = s <op> x`) and the temp+ASSIGN form
+ * (`%t = s <op> x; s <- %t`). The induction variable's own `i = i + 1` is a
+ * reassociable '+' recurrence and is therefore never reported. */
+static const char *ir_region_find_serial_recurrence(const IRFunction *function,
+                                                    size_t begin, size_t end,
+                                                    const char **ops,
+                                                    size_t *n_ops) {
+  int past_header = 0;
+  *n_ops = 0;
+  for (size_t i = begin + 1; i < end; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_LABEL) {
+      if (ins->text && (strstr(ins->text, "ir_while_") != NULL ||
+                        strstr(ins->text, "ir_for_cond_") != NULL)) {
+        past_header = 1;
+      }
+      continue;
+    }
+    if (!past_header || ins->dest.kind != IR_OPERAND_SYMBOL || !ins->dest.name) {
+      continue;
+    }
+    int nonreassoc = 0, reaches = 0;
+    const char *cand_ops[IR_RECUR_MAX_OPS];
+    size_t cand_n = 0;
+    if (ins->op == IR_OP_BINARY) {
+      if (ir_recur_operand_reaches(function, i, &ins->lhs, ins->dest.name,
+                                   &nonreassoc, cand_ops, &cand_n, 0)) {
+        reaches = 1;
+      }
+      if (ir_recur_operand_reaches(function, i, &ins->rhs, ins->dest.name,
+                                   &nonreassoc, cand_ops, &cand_n, 0)) {
+        reaches = 1;
+      }
+      if (reaches && ins->text) {
+        ir_recur_note_op(cand_ops, &cand_n, ins->text);
+        if (!ir_recur_op_is_reassociable(ins->text)) {
+          nonreassoc = 1;
+        }
+      }
+    } else if (ins->op == IR_OP_ASSIGN && ins->lhs.kind == IR_OPERAND_TEMP) {
+      reaches = ir_recur_operand_reaches(function, i, &ins->lhs, ins->dest.name,
+                                         &nonreassoc, cand_ops, &cand_n, 0);
+    }
+    if (reaches && nonreassoc) {
+      for (size_t k = 0; k < cand_n; k++) {
+        ops[k] = cand_ops[k];
+      }
+      *n_ops = cand_n;
+      return ins->dest.name;
+    }
+  }
+  return NULL;
+}
+
 /* --explain: a deeper diagnosis than ir_simd_bail_reason, split into a reason
  * (what blocked vectorization), a fix (what the user can change), and a
  * machine-readable IRSimdBailId every branch must set. Best-effort but never
@@ -319,8 +479,6 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
   int load_count = 0, store_count = 0;
   int past_header = 0; /* seen the loop's own header label yet? */
   const char *body_local = NULL;
-  const char *recur_symbol = NULL;
-  char recur_op = 0;
 
   for (size_t i = begin + 1; i < end; i++) {
     const IRInstruction *ins = &function->instructions[i];
@@ -440,40 +598,6 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
           ((ins->lhs.kind == IR_OPERAND_SYMBOL && ins->lhs.name) ||
            (ins->rhs.kind == IR_OPERAND_SYMBOL && ins->rhs.name))) {
         has_float_accum = 1;
-      }
-      /* Serial recurrence through a float symbol: `s = s * x` / `s = s / x`,
-       * either directly (dest is the symbol) or via the usual temp+ASSIGN
-       * pair. '+'/'-' accumulations are NOT flagged -- those reassociate and
-       * have reduction kernels; '*' and '/' chains are genuinely serial. */
-      if (recur_symbol || !ins->is_float || !ins->text ||
-          (ins->text[0] != '*' && ins->text[0] != '/') || ins->text[1]) {
-        break;
-      }
-      const char *lhs_sym =
-          ins->lhs.kind == IR_OPERAND_SYMBOL ? ins->lhs.name : NULL;
-      const char *rhs_sym =
-          ins->rhs.kind == IR_OPERAND_SYMBOL ? ins->rhs.name : NULL;
-      if (ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name) {
-        if ((lhs_sym && strcmp(lhs_sym, ins->dest.name) == 0) ||
-            (rhs_sym && strcmp(rhs_sym, ins->dest.name) == 0)) {
-          recur_symbol = ins->dest.name;
-          recur_op = ins->text[0];
-        }
-      } else if (ins->dest.kind == IR_OPERAND_TEMP && ins->dest.name) {
-        for (size_t j = i + 1; j < end && j < i + 9; j++) {
-          const IRInstruction *later = &function->instructions[j];
-          if (later->op == IR_OP_ASSIGN &&
-              later->dest.kind == IR_OPERAND_SYMBOL && later->dest.name &&
-              later->lhs.kind == IR_OPERAND_TEMP && later->lhs.name &&
-              strcmp(later->lhs.name, ins->dest.name) == 0) {
-            if ((lhs_sym && strcmp(lhs_sym, later->dest.name) == 0) ||
-                (rhs_sym && strcmp(rhs_sym, later->dest.name) == 0)) {
-              recur_symbol = later->dest.name;
-              recur_op = ins->text[0];
-            }
-            break;
-          }
-        }
       }
       break;
     }
@@ -618,18 +742,43 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
     IR_SIMD_SET_DIAG(IR_SIMD_BAIL_INT64_ELEMENTS);
     return;
   }
-  if (recur_symbol) {
-    snprintf(reason, reason_cap,
-             "`%s` carries a serial `%c` recurrence -- every iteration needs "
-             "the previous iteration's value, so lanes cannot run "
-             "independently",
-             recur_symbol, recur_op);
-    snprintf(fix, fix_cap,
-             "'+' reductions vectorize (they reassociate); serial '*'/'/' "
-             "chains generally cannot -- if the recurrence is the point, this "
-             "loop is at its scalar floor");
-    IR_SIMD_SET_DIAG(IR_SIMD_BAIL_SERIAL_RECURRENCE);
-    return;
+  {
+    /* Loop-carried serial recurrence (dependence analysis): a scalar computed
+     * from its own previous value through a non-reassociable operation -- the
+     * leaf_call hash/RNG shape (`acc = (acc*K + C) ^ (i + (acc>>7))`), a float
+     * product/quotient chain, an IIR filter. The lanes form a dependency chain
+     * and cannot run independently, so this is a genuine scalar floor, not a
+     * missing kernel. */
+    const char *ops[IR_RECUR_MAX_OPS];
+    size_t n_ops = 0;
+    const char *recur_symbol =
+        ir_region_find_serial_recurrence(function, begin, end, ops, &n_ops);
+    if (recur_symbol) {
+      char op_list[64];
+      size_t w = 0;
+      op_list[0] = '\0';
+      for (size_t i = 0; i < n_ops && w + 10 < sizeof(op_list); i++) {
+        int n = snprintf(op_list + w, sizeof(op_list) - w, "%s`%s`",
+                         i ? ", " : "", ops[i]);
+        if (n < 0) {
+          break;
+        }
+        w += (size_t)n;
+      }
+      snprintf(reason, reason_cap,
+               "`%s` carries a loop-carried recurrence: each iteration computes "
+               "it from its own previous value (through %s), so the iterations "
+               "form a dependency chain that cannot run as independent SIMD "
+               "lanes",
+               recur_symbol, n_ops ? op_list : "a non-reassociable operation");
+      snprintf(fix, fix_cap,
+               "'+'/'-' reductions reassociate and DO vectorize; multiply, "
+               "divide, shift, and bitwise/xor recurrences are inherently "
+               "serial -- if this running state IS the algorithm (a hash, an "
+               "RNG, an IIR filter), the loop is already at its scalar floor");
+      IR_SIMD_SET_DIAG(IR_SIMD_BAIL_SERIAL_RECURRENCE);
+      return;
+    }
   }
   if (has_f32 && has_f64) {
     snprintf(reason, reason_cap,
@@ -703,9 +852,14 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
   }
   if (store_count > 0 && load_count == 0) {
     snprintf(reason, reason_cap,
-             "the loop only writes (a fill/init pattern, no array reads); the "
-             "recognizers cover maps, reductions, and dot products over "
-             "loaded data, and no constant-fill kernel exists yet");
+             "the loop only writes an invariant value (a fill/init pattern), "
+             "but its store address did not match the fill vectorizer's "
+             "shapes: a unit-stride element `a[i]`, `a[c + i]` with `c` a "
+             "loop-invariant scalar, or a pointer walked by a constant stride");
+    snprintf(fix, fix_cap,
+             "hoist the invariant part of the index into a base pointer before "
+             "the loop (`var row = &a[c]; ... row[i] = v;`) so the write is a "
+             "plain unit-stride `row[i]`");
     IR_SIMD_SET_DIAG(IR_SIMD_BAIL_STORE_ONLY_FILL);
     return;
   }
