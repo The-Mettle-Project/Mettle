@@ -101,13 +101,13 @@ curl -fsSL https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/inst
 irm https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/install.ps1 | iex
 ```
 
-Installs to `~/.mettle` (Linux) or `%LOCALAPPDATA%\Mettle` (Windows), updates user PATH, and checks for a C toolchain when linking stdlib programs. No root or admin required. Pin a release: `--version v0.11.0` (Linux) or `-Version v0.11.0` (Windows).
+Installs to `~/.mettle` (Linux) or `%LOCALAPPDATA%\Mettle` (Windows), updates user PATH, and checks for a C toolchain when linking stdlib programs. No root or admin required. Pin a release: `--version v0.12.0` (Linux) or `-Version v0.12.0` (Windows).
 
 ```bash
 mettle --version
 ```
 
-Dev builds from source report `v0.9.3` unless `METTLE_VERSION_RAW` is set at compile time.
+Dev builds from source report `v0.12.0` unless `METTLE_VERSION_RAW` is set at compile time.
 
 ## Build from source
 
