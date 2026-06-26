@@ -1,0 +1,5 @@
+sum 55
+fact 120
+gcd 6
+ifelse 7
+nested 25
