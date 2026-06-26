@@ -5,6 +5,7 @@
 #include "common.h"
 #include "codegen/binary/startup.h"
 #include "codegen/binary_emitter.h"
+#include "codegen/binary/arm64_ir.h"
 #include "codegen/program_entry.h"
 #include "codegen/ptx_emitter.h"
 #include "linker/pe_emitter.h"
@@ -2380,6 +2381,8 @@ int main(int argc, char *argv[]) {
       options.explain_json = 1;
     } else if (strcmp(argv[i], "--emit-ptx") == 0) {
       options.emit_ptx = 1;
+    } else if (strcmp(argv[i], "--emit-arm64") == 0) {
+      options.emit_arm64 = 1;
     } else if (strcmp(argv[i], "-g") == 0 ||
                strcmp(argv[i], "--debug-symbols") == 0) {
       options.generate_debug_symbols = 1;
@@ -2993,7 +2996,8 @@ int compile_file(const char *input_filename, const char *output_filename,
   ir_lowering_set_explain(options->explain && options->optimize &&
                           !options->emit_ptx);
 
-  int emit_runtime_checks = (options->release || options->emit_ptx) ? 0 : 1;
+  int emit_runtime_checks =
+      (options->release || options->emit_ptx || options->emit_arm64) ? 0 : 1;
   compiler_set_phase(PROFILE_PHASE_IR_LOWERING);
   phase_start = compiler_profile_begin(&profile);
   int ir_ok = compile_lower_to_ir(program, type_checker, symbol_table,
@@ -3030,6 +3034,35 @@ int compile_file(const char *input_filename, const char *output_filename,
       goto cleanup;
     }
     printf("Generated PTX: %s\n", output_filename);
+    result = 0;
+    goto cleanup;
+  }
+
+  /* --emit-arm64: lower the scalar-integer subset of every function directly to
+   * an AArch64 ELF executable (from-scratch backend, no external assembler). A
+   * `_start` calls main() and exits with its return value. No optimization (the
+   * direct IR backend consumes the unoptimized IR shape), no x86 object. */
+  if (options->emit_arm64) {
+    Arm64Emit ae;
+    arm64_emit_init(&ae);
+    int ok = arm64_ir_encode_program(&ae, ir_program, "main") &&
+             arm64_emit_finalize(&ae);
+    if (ok) {
+      ok = arm64_write_elf(output_filename, ae.code.data, ae.code.len);
+      if (!ok) {
+        fprintf(stderr, "Error: could not write AArch64 ELF '%s'\n",
+                output_filename);
+      }
+    } else {
+      fprintf(stderr, "Error: AArch64 lowering failed (an op outside the "
+                      "supported scalar subset, or an unresolved call)\n");
+    }
+    arm64_emit_free(&ae);
+    if (!ok) {
+      result = 1;
+      goto cleanup;
+    }
+    printf("Generated AArch64 ELF: %s\n", output_filename);
     result = 0;
     goto cleanup;
   }

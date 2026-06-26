@@ -1,5 +1,7 @@
 #include "codegen/binary/arm64_ir.h"
 
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -35,7 +37,8 @@ static int slot_of(SlotMap *s, const char *name) {
   return s->count++;
 }
 
-/* Label map: IR label name -> emit label id (created on first reference). */
+/* A name -> emit-label-id map, shared use for both branch labels (per function)
+ * and function entry labels (whole program). */
 typedef struct {
   const char **names;
   int *ids;
@@ -43,7 +46,7 @@ typedef struct {
   int cap;
 } LblMap;
 
-static int lbl_of(Arm64Emit *e, LblMap *m, const char *name) {
+static int label_for(Arm64Emit *e, LblMap *m, const char *name) {
   for (int i = 0; i < m->count; i++) {
     if (m->names[i] == name || strcmp(m->names[i], name) == 0) {
       return m->ids[i];
@@ -76,26 +79,26 @@ static void emit_imm(Arm64Emit *e, Arm64Reg rd, uint64_t v) {
     arm64_emit_word(e, arm64_movk(1, rd, (uint16_t)((v >> 48) & 0xFFFF), 3));
 }
 
-/* Load an IR value operand (temp/local/int) into `scratch`. */
-static Arm64Reg load_val(Arm64Emit *e, SlotMap *s, const IROperand *op,
-                         Arm64Reg scratch) {
+/* Load an IR value operand (temp/local/int) into `scratch` (or a chosen reg). */
+static Arm64Reg load_into(Arm64Emit *e, SlotMap *s, const IROperand *op,
+                          Arm64Reg dest) {
   switch (op->kind) {
   case IR_OPERAND_INT:
-    emit_imm(e, scratch, (uint64_t)op->int_value);
-    return scratch;
+    emit_imm(e, dest, (uint64_t)op->int_value);
+    return dest;
   case IR_OPERAND_TEMP:
   case IR_OPERAND_SYMBOL: {
     int slot = slot_of(s, op->name);
     if (slot < 0) {
       e->error = 1;
-      return scratch;
+      return dest;
     }
-    arm64_emit_word(e, arm64_ldr_imm(1, scratch, ARM64_SP, 8 * slot));
-    return scratch;
+    arm64_emit_word(e, arm64_ldr_imm(1, dest, ARM64_SP, 8 * slot));
+    return dest;
   }
   default:
     e->error = 1;
-    return scratch;
+    return dest;
   }
 }
 
@@ -109,8 +112,6 @@ static void store_dest(Arm64Emit *e, SlotMap *s, const IROperand *dst,
   arm64_emit_word(e, arm64_str_imm(1, src, ARM64_SP, 8 * slot));
 }
 
-/* Comparison operator -> AArch64 condition (signed integer forms). Returns -1
- * if `op` is not a comparison. */
 static int cmp_cond(const char *op) {
   if (strcmp(op, "==") == 0) return ARM64_EQ;
   if (strcmp(op, "!=") == 0) return ARM64_NE;
@@ -122,8 +123,8 @@ static int cmp_cond(const char *op) {
 }
 
 static void lower_binary(Arm64Emit *e, SlotMap *s, const IRInstruction *in) {
-  Arm64Reg a = load_val(e, s, &in->lhs, R_LHS);
-  Arm64Reg b = load_val(e, s, &in->rhs, R_RHS);
+  Arm64Reg a = load_into(e, s, &in->lhs, R_LHS);
+  Arm64Reg b = load_into(e, s, &in->rhs, R_RHS);
   const char *op = in->text;
   int cc = cmp_cond(op);
   if (cc >= 0) {
@@ -136,9 +137,11 @@ static void lower_binary(Arm64Emit *e, SlotMap *s, const IRInstruction *in) {
   } else if (strcmp(op, "*") == 0) {
     arm64_emit_word(e, arm64_mul(1, R_RES, a, b));
   } else if (strcmp(op, "/") == 0) {
-    arm64_emit_word(e, arm64_sdiv(1, R_RES, a, b));
+    arm64_emit_word(e, in->is_unsigned ? arm64_udiv(1, R_RES, a, b)
+                                       : arm64_sdiv(1, R_RES, a, b));
   } else if (strcmp(op, "%") == 0) {
-    arm64_emit_word(e, arm64_sdiv(1, R_AUX, a, b));
+    arm64_emit_word(e, in->is_unsigned ? arm64_udiv(1, R_AUX, a, b)
+                                       : arm64_sdiv(1, R_AUX, a, b));
     arm64_emit_word(e, arm64_msub(1, R_RES, R_AUX, b, a));
   } else if (strcmp(op, "&") == 0) {
     arm64_emit_word(e, arm64_and_reg(1, R_RES, a, b));
@@ -159,7 +162,7 @@ static void lower_binary(Arm64Emit *e, SlotMap *s, const IRInstruction *in) {
 }
 
 static void lower_unary(Arm64Emit *e, SlotMap *s, const IRInstruction *in) {
-  Arm64Reg a = load_val(e, s, &in->lhs, R_LHS);
+  Arm64Reg a = load_into(e, s, &in->lhs, R_LHS);
   const char *op = in->text;
   if (strcmp(op, "-") == 0) {
     arm64_emit_word(e, arm64_neg(1, R_RES, a));
@@ -175,12 +178,12 @@ static void lower_unary(Arm64Emit *e, SlotMap *s, const IRInstruction *in) {
   store_dest(e, s, &in->dest, R_RES);
 }
 
-int arm64_ir_encode_function(Arm64Emit *e, const IRFunction *fn) {
+/* Lower one function body. `fns` (if non-NULL) maps callee names to entry
+ * labels so IR_OP_CALL can resolve a cross-function bl. */
+static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns) {
   SlotMap slots = {0};
   LblMap labels = {0};
 
-  /* Pre-pass: assign a slot to every parameter first (so x0.. home to known
-   * slots), then to every temp/local the body references. */
   for (size_t i = 0; i < fn->parameter_count; i++) {
     slot_of(&slots, fn->parameter_names[i]);
   }
@@ -192,11 +195,17 @@ int arm64_ir_encode_function(Arm64Emit *e, const IRFunction *fn) {
         slot_of(&slots, ops[k]->name);
       }
     }
+    for (size_t k = 0; k < in->argument_count; k++) {
+      const IROperand *a = &in->arguments[k];
+      if (a->kind == IR_OPERAND_TEMP || a->kind == IR_OPERAND_SYMBOL) {
+        slot_of(&slots, a->name);
+      }
+    }
   }
 
   int frame = (slots.count * 8 + 15) & ~15;
   if (frame > 4080) {
-    e->error = 1; /* keep within the single sub-immediate prologue for now */
+    e->error = 1;
   }
   if (e->error || !arm64_emit_prologue(e, frame, NULL, 0)) {
     goto done;
@@ -213,26 +222,25 @@ int arm64_ir_encode_function(Arm64Emit *e, const IRFunction *fn) {
     case IR_OP_DECLARE_LOCAL:
       break;
     case IR_OP_LABEL:
-      arm64_bind_label(e, lbl_of(e, &labels, in->text));
+      arm64_bind_label(e, label_for(e, &labels, in->text));
       break;
     case IR_OP_JUMP:
-      arm64_emit_b(e, lbl_of(e, &labels, in->text));
+      arm64_emit_b(e, label_for(e, &labels, in->text));
       break;
-    case IR_OP_BRANCH_ZERO: {
-      Arm64Reg c = load_val(e, &slots, &in->lhs, R_LHS);
-      arm64_emit_cbz(e, 1, c, lbl_of(e, &labels, in->text));
+    case IR_OP_BRANCH_ZERO:
+      arm64_emit_cbz(e, 1, load_into(e, &slots, &in->lhs, R_LHS),
+                     label_for(e, &labels, in->text));
       break;
-    }
     case IR_OP_BRANCH_EQ: {
-      Arm64Reg a = load_val(e, &slots, &in->lhs, R_LHS);
-      Arm64Reg b = load_val(e, &slots, &in->rhs, R_RHS);
+      Arm64Reg a = load_into(e, &slots, &in->lhs, R_LHS);
+      Arm64Reg b = load_into(e, &slots, &in->rhs, R_RHS);
       arm64_emit_word(e, arm64_cmp_reg(1, a, b));
-      arm64_emit_bcond(e, ARM64_EQ, lbl_of(e, &labels, in->text));
+      arm64_emit_bcond(e, ARM64_EQ, label_for(e, &labels, in->text));
       break;
     }
     case IR_OP_ASSIGN:
     case IR_OP_CAST:
-      store_dest(e, &slots, &in->dest, load_val(e, &slots, &in->lhs, R_LHS));
+      store_dest(e, &slots, &in->dest, load_into(e, &slots, &in->lhs, R_LHS));
       break;
     case IR_OP_BINARY:
       lower_binary(e, &slots, in);
@@ -240,9 +248,27 @@ int arm64_ir_encode_function(Arm64Emit *e, const IRFunction *fn) {
     case IR_OP_UNARY:
       lower_unary(e, &slots, in);
       break;
+    case IR_OP_CALL: {
+      if (!fns || !in->text) {
+        e->error = 1;
+        break;
+      }
+      /* Marshal args into x0.. (each loaded straight into its ABI register;
+       * all values live on the stack, so nothing is clobbered across the bl). */
+      size_t na = in->argument_count > 8 ? 8 : in->argument_count;
+      for (size_t k = 0; k < na; k++) {
+        load_into(e, &slots, &in->arguments[k], (Arm64Reg)(ARM64_X0 + k));
+      }
+      arm64_emit_bl(e, label_for(e, fns, in->text));
+      if (in->dest.kind == IR_OPERAND_TEMP ||
+          in->dest.kind == IR_OPERAND_SYMBOL) {
+        store_dest(e, &slots, &in->dest, ARM64_X0);
+      }
+      break;
+    }
     case IR_OP_RETURN:
       if (in->lhs.kind != IR_OPERAND_NONE) {
-        arm64_emit_mov(e, 1, ARM64_X0, load_val(e, &slots, &in->lhs, R_LHS));
+        arm64_emit_mov(e, 1, ARM64_X0, load_into(e, &slots, &in->lhs, R_LHS));
       }
       arm64_emit_epilogue(e, frame, NULL, 0);
       break;
@@ -257,4 +283,70 @@ done:
   free(labels.names);
   free(labels.ids);
   return e->error ? 0 : 1;
+}
+
+int arm64_ir_encode_function(Arm64Emit *e, const IRFunction *fn) {
+  return encode_function(e, fn, NULL);
+}
+
+int arm64_ir_encode_program(Arm64Emit *e, const IRProgram *prog,
+                            const char *entry) {
+  LblMap fns = {0};
+  if (!entry) {
+    entry = "main";
+  }
+  /* Reserve an entry label for every function so any call resolves. */
+  for (size_t i = 0; i < prog->function_count; i++) {
+    label_for(e, &fns, prog->functions[i]->name);
+  }
+
+  /* _start: call the entry function, then exit(x0). */
+  arm64_emit_bl(e, label_for(e, &fns, entry));
+  arm64_emit_word(e, arm64_movz(1, ARM64_X8, 93, 0)); /* exit syscall */
+  arm64_emit_word(e, 0xD4000001u);                    /* svc #0 */
+
+  for (size_t i = 0; i < prog->function_count && !e->error; i++) {
+    const IRFunction *fn = prog->functions[i];
+    arm64_bind_label(e, label_for(e, &fns, fn->name));
+    if (!encode_function(e, fn, &fns)) {
+      break;
+    }
+  }
+
+  free(fns.names);
+  free(fns.ids);
+  return e->error ? 0 : 1;
+}
+
+/* ---- minimal static AArch64 ELF executable ------------------------------ */
+
+#define ELF_BASE 0x400000u
+#define ELF_HDRS 120u
+
+static void w16(unsigned char *p, uint16_t v) { memcpy(p, &v, 2); }
+static void w32(unsigned char *p, uint32_t v) { memcpy(p, &v, 4); }
+static void w64(unsigned char *p, uint64_t v) { memcpy(p, &v, 8); }
+
+int arm64_write_elf(const char *path, const unsigned char *code, size_t len) {
+  unsigned char h[ELF_HDRS];
+  memset(h, 0, sizeof(h));
+  uint64_t total = ELF_HDRS + len;
+  h[0] = 0x7F; h[1] = 'E'; h[2] = 'L'; h[3] = 'F';
+  h[4] = 2; h[5] = 1; h[6] = 1;
+  w16(h + 16, 2); w16(h + 18, 183); w32(h + 20, 1);
+  w64(h + 24, ELF_BASE + ELF_HDRS); w64(h + 32, 64); w64(h + 40, 0);
+  w32(h + 48, 0); w16(h + 52, 64); w16(h + 54, 56); w16(h + 56, 1);
+  unsigned char *ph = h + 64;
+  w32(ph + 0, 1); w32(ph + 4, 5); w64(ph + 8, 0);
+  w64(ph + 16, ELF_BASE); w64(ph + 24, ELF_BASE);
+  w64(ph + 32, total); w64(ph + 40, total); w64(ph + 48, 0x1000);
+
+  FILE *f = fopen(path, "wb");
+  if (!f) {
+    return 0;
+  }
+  int ok = fwrite(h, 1, ELF_HDRS, f) == ELF_HDRS &&
+           fwrite(code, 1, len, f) == len;
+  fclose(f);
+  return ok;
 }

@@ -25,6 +25,7 @@ typedef struct {
   int debug_mode;
   int dump_ir;
   int emit_ptx; /* --emit-ptx: lower every function to a PTX .entry, no object */
+  int emit_arm64; /* --emit-arm64: lower scalar functions to an AArch64 ELF */
   int optimize;
   int release;
   int simd_report; /* --simd-report: note what each `@simd` loop became */

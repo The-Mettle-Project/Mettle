@@ -1,0 +1,11 @@
+// is_even(10) -> 1. Mutual recursion across three functions.
+function is_odd(n: int64) -> int64;
+function is_even(n: int64) -> int64 {
+  if (n == 0) { return 1; }
+  return is_odd(n - 1);
+}
+function is_odd(n: int64) -> int64 {
+  if (n == 0) { return 0; }
+  return is_even(n - 1);
+}
+function main() -> int64 { return is_even(10); }

@@ -3,3 +3,12 @@ fact 120
 gcd 6
 ifelse 7
 nested 25
+fib 55
+rfact 120
+mutual 1
+helper 42
+bitwise 255
+shifts 32
+poly 10
+multiret 2
+int32sum 21

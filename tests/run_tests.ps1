@@ -4944,40 +4944,24 @@ catch {
   Write-CaseResult -Name "arm64_emit" -Passed $false -Reason $_.Exception.Message
 }
 
-# Real-source -> AArch64 gate. Builds the IR->AArch64 harness (which drives the
-# actual Mettle frontend: lexer -> parser -> type checker -> ir_lower_program),
-# compiles the tests/arm64/*.mettle fixtures to ELF via arm64_ir_encode, and (if
-# a qemu-aarch64 emulator is reachable through WSL) runs each and checks the exit
-# code. This proves real Mettle source compiles to AArch64 and executes. Linking
-# the frontend makes this the heaviest gate; execution skips like the ptxas gate.
+# Real-source -> AArch64 gate. Drives the REAL compiler ($CompilerPath
+# --emit-arm64) to lower each tests/arm64/*.mettle fixture to a static AArch64
+# ELF, then (if a qemu-aarch64 emulator is reachable through WSL) runs each and
+# checks the exit code against expected.txt. Proves actual Mettle source --
+# loops, if/else, modulo, recursion, mutual recursion, multi-arg calls --
+# compiles to AArch64 and executes. Execution skips like the ptxas gate.
 $total++
 try {
-  $arm64Harness = "bin\arm64_compile.exe"
-  $srcs = @("src\common.c", "src\lexer\lexer.c", "src\parser\parser.c",
-            "src\parser\ast.c")
-  $srcs += (Get-ChildItem src\semantic\*.c | ForEach-Object FullName)
-  $srcs += (Get-ChildItem src\ir\*.c | ForEach-Object FullName)
-  $srcs += (Get-ChildItem src\ir\optimizer\*.c | ForEach-Object FullName)
-  $srcs += @("src\error\error_reporter.c", "src\debug\debug_info.c",
-             "src\compiler\compiler_context.c",
-             "src\codegen\binary\arm64_ir_encode.c",
-             "src\codegen\binary\arm64_encode.c",
-             "src\codegen\binary\arm64_emit.c", "tests\arm64_compile.c")
-  & gcc -std=c99 -Isrc -O1 -w @srcs -o $arm64Harness
-  if ($LASTEXITCODE -ne 0) {
-    throw "Failed to build the arm64_compile harness"
-  }
-
   $elfDir = Join-Path $tmpDir "arm64src"
   New-Item -ItemType Directory -Force -Path $elfDir | Out-Null
   Copy-Item tests\arm64\expected.txt (Join-Path $elfDir "manifest.txt") -Force
   $names = Get-Content tests\arm64\expected.txt |
     ForEach-Object { ($_ -split ' ')[0] } | Where-Object { $_ }
   foreach ($n in $names) {
-    & $arm64Harness "tests\arm64\$n.mettle" (Join-Path $elfDir "$n.elf") main 2>&1 |
-      Out-Null
-    if ($LASTEXITCODE -ne 0) {
-      throw "arm64_compile failed lowering $n.mettle"
+    $elf = Join-Path $elfDir "$n.elf"
+    & $CompilerPath --emit-arm64 "tests\arm64\$n.mettle" -o $elf 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $elf)) {
+      throw "mettle --emit-arm64 failed on $n.mettle"
     }
   }
 
