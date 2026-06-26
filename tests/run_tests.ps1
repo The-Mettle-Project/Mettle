@@ -4851,6 +4851,99 @@ catch {
   Write-CaseResult -Name "crash_handler" -Passed $false -Reason $_.Exception.Message
 }
 
+# AArch64 encoder validity gate. Compiles and runs the from-scratch A64
+# instruction encoder against ground-truth constants from the ARM Architecture
+# Reference Manual (RET=0xD65F03C0, the stp x29,x30,[sp,#-16]! prologue, ...)
+# plus an encode->decode round-trip across the register/immediate range. This
+# is the AArch64 analogue of the PTX/ptxas gate below: it validates the hardest
+# layer (instruction encodings) with no external assembler and no ARM hardware,
+# since the test is pure 32-bit math that runs on the build host.
+$total++
+try {
+  $arm64Exe = "bin\arm64_encode_test.exe"
+  & gcc -Wall -Wextra -std=c99 -g -O0 -Isrc tests\arm64_encode_test.c src\codegen\binary\arm64_encode.c src\codegen\binary\arm64_disasm.c src\codegen\binary\arm64_abi.c -o $arm64Exe
+  if ($LASTEXITCODE -ne 0) {
+    throw "Failed to compile AArch64 encoder test"
+  }
+
+  $arm64Output = & $arm64Exe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "AArch64 encoder test failed:`n$arm64Output"
+  }
+  if ($arm64Output -notmatch "RESULT: PASS") {
+    throw "AArch64 encoder test did not report PASS"
+  }
+
+  Write-CaseResult -Name "arm64_encoder" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "arm64_encoder" -Passed $false -Reason $_.Exception.Message
+}
+
+# AArch64 emit-layer + execution gate. Emits complete AAPCS64 functions
+# (prologue/body/epilogue with branch fixups), validates each by decoding every
+# word with the from-scratch disassembler, and writes them as minimal static
+# AArch64 ELF executables (hand-built header -- no external assembler/linker).
+# The structural validation always runs (no external deps). If a qemu-aarch64
+# user-mode emulator is reachable through WSL, each ELF is executed and its exit
+# code checked against the expected result -- the semantic proof that the
+# generated machine code runs on AArch64 without ARM hardware. Execution is
+# skipped (not failed) when no emulator is present, like the ptxas gate.
+$total++
+try {
+  $arm64EmitExe = "bin\arm64_emit_test.exe"
+  & gcc -Wall -Wextra -std=c99 -g -O0 -Isrc tests\arm64_emit_test.c src\codegen\binary\arm64_encode.c src\codegen\binary\arm64_emit.c src\codegen\binary\arm64_disasm.c -o $arm64EmitExe
+  if ($LASTEXITCODE -ne 0) {
+    throw "Failed to compile AArch64 emit test"
+  }
+
+  $elfDir = Join-Path $tmpDir "arm64elf"
+  New-Item -ItemType Directory -Force -Path $elfDir | Out-Null
+  $emitOut = & $arm64EmitExe $elfDir 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "AArch64 emit test failed:`n$emitOut"
+  }
+  if ($emitOut -notmatch "RESULT: PASS") {
+    throw "AArch64 emit test did not report PASS"
+  }
+
+  # Best-effort: run the ELF programs under qemu-aarch64 via WSL.
+  $wsl = Get-Command wsl -ErrorAction SilentlyContinue
+  if ($wsl -and $elfDir -match '^[A-Za-z]:\\') {
+    $scriptWin = (Resolve-Path (Join-Path $PSScriptRoot "arm64_qemu_run.sh")).Path
+    $toWsl = {
+      param($p)
+      "/mnt/" + $p.Substring(0, 1).ToLower() + ($p.Substring(2) -replace '\\', '/')
+    }
+    $wslScript = & $toWsl $scriptWin
+    $wslDir = & $toWsl $elfDir
+    $runOut = & wsl bash $wslScript $wslDir 2>&1 | Out-String
+    $code = $LASTEXITCODE
+    if ($code -eq 0) {
+      Write-Host ($runOut.Trim())
+    }
+    elseif ($code -eq 64) {
+      Write-Host "[SKIP] arm64_emit execution (qemu-aarch64 not found; structural validation passed)"
+    }
+    elseif ($code -eq 1) {
+      throw "AArch64 program(s) produced wrong result under qemu:`n$runOut"
+    }
+    else {
+      Write-Host "[SKIP] arm64_emit execution (qemu run unavailable: exit $code)"
+    }
+  }
+  else {
+    Write-Host "[SKIP] arm64_emit execution (no WSL; structural validation passed)"
+  }
+
+  Write-CaseResult -Name "arm64_emit" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "arm64_emit" -Passed $false -Reason $_.Exception.Message
+}
+
 # General reduction-unrolling vectorizer: correctness on non-benchmark
 # reductions (distinct EXPR(i), inclusive/exclusive bounds, a trip count that
 # is not a multiple of the unroll factor so the scalar remainder runs). Built

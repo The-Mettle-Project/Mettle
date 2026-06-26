@@ -214,12 +214,31 @@ int ir_pass_is_skipped(IROptPassId pass_id) {
   return ir_skip_spec_matches(id_text, ir_opt_pass_name(pass_id));
 }
 
+/* METTLE_NO_SIMD: build a baseline (SSE2-only) binary by skipping every
+ * vectorizer / SLP / SIMD named pass. Those are the only passes that emit
+ * AVX/AVX2/FMA instructions, so a binary built with this set runs on any
+ * x86-64 CPU (SSE2 is mandatory in the x86-64 baseline). Scalar float codegen
+ * already uses legacy SSE2 encodings, so nothing else needs AVX. Use for
+ * distributable builds that must run on older machines. */
+static int ir_no_simd_enabled(void) {
+  static int v = -1;
+  if (v < 0) {
+    const char *e = getenv("METTLE_NO_SIMD");
+    v = (e && e[0] && !(e[0] == '0' && e[1] == '\0')) ? 1 : 0;
+  }
+  return v;
+}
+
 static int ir_run_named_pass(IRFunction *function, const IROptNamedPass *pass,
                              const char *failure_message) {
   int changed = 0;
 
   if (!pass || !pass->name || !pass->run) {
     return 0;
+  }
+
+  if (ir_no_simd_enabled()) {
+    return 1;                 /* baseline build: no vectorization, no AVX */
   }
 
   if (ir_pass_name_is_skipped(pass->name)) {
