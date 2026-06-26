@@ -91,6 +91,29 @@ uint32_t arm64_cmp_imm(int is64, Arm64Reg rn, uint32_t imm12, int shift12) {
   return base | (shift12 ? (1u << 22) : 0u) | ((imm12 & 0xFFFu) << 10) |
          (R5(rn) << 5);
 }
+/* TST rn,rm == ANDS XZR,rn,rm (logical shifted register, opc=11, Rd=31). */
+uint32_t arm64_tst(int is64, Arm64Reg rn, Arm64Reg rm) {
+  uint32_t base = is64 ? 0xEA00001Fu : 0x6A00001Fu;
+  return base | (R5(rm) << 16) | (R5(rn) << 5);
+}
+
+/* Extends are UBFM/SBFM aliases: UXTB Wd,Wn=UBFM Wd,Wn,#0,#7; SXTB Xd,Wn=
+ * SBFM Xd,Xn,#0,#7; widths 7/15/31 select byte/half/word. */
+uint32_t arm64_uxtb(Arm64Reg rd, Arm64Reg rn) {
+  return 0x53000000u | (7u << 10) | (R5(rn) << 5) | R5(rd);
+}
+uint32_t arm64_uxth(Arm64Reg rd, Arm64Reg rn) {
+  return 0x53000000u | (15u << 10) | (R5(rn) << 5) | R5(rd);
+}
+uint32_t arm64_sxtb(Arm64Reg rd, Arm64Reg rn) {
+  return 0x93400000u | (7u << 10) | (R5(rn) << 5) | R5(rd);
+}
+uint32_t arm64_sxth(Arm64Reg rd, Arm64Reg rn) {
+  return 0x93400000u | (15u << 10) | (R5(rn) << 5) | R5(rd);
+}
+uint32_t arm64_sxtw(Arm64Reg rd, Arm64Reg rn) {
+  return 0x93400000u | (31u << 10) | (R5(rn) << 5) | R5(rd);
+}
 
 /* Data-processing (3 source): sf|00|11011|op31|Rm|o0|Ra|Rn|Rd.
  * MADD o0=0, MSUB o0=1 (bit 15). */

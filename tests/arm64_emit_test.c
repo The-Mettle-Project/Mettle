@@ -173,6 +173,14 @@ static MirOperand IMM(long long v) {
   o.imm = v;
   return o;
 }
+static MirOperand V(int id) {
+  MirOperand o;
+  memset(&o, 0, sizeof o);
+  o.kind = MIR_OPK_VREG;
+  o.vreg = id;
+  o.rclass = MIR_RC_GP;
+  return o;
+}
 static MirOperand LBL(const char *s) {
   MirOperand o;
   memset(&o, 0, sizeof o);
@@ -242,6 +250,87 @@ static void body_mir_pack(Arm64Emit *e) {
       I(MIR_RET, NONE(), NONE(), NONE()),
   };
   arm64_mir_encode_seq(e, seq, sizeof(seq) / sizeof(seq[0]));
+}
+
+static void body_mir_div(Arm64Emit *e) {
+  MirInst seq[] = {
+      I(MIR_IDIV, P(ARM64_X0), P(ARM64_X0), P(ARM64_X1)),
+      I(MIR_RET, NONE(), NONE(), NONE()),
+  };
+  arm64_mir_encode_seq(e, seq, sizeof(seq) / sizeof(seq[0]));
+}
+
+static void body_mir_mod(Arm64Emit *e) {
+  MirInst seq[] = {
+      I(MIR_IDIV, P(ARM64_X0), P(ARM64_X0), P(ARM64_X1)),
+      I(MIR_RET, NONE(), NONE(), NONE()),
+  };
+  seq[0].cc = 1; /* RDX-result flag: modulo */
+  arm64_mir_encode_seq(e, seq, sizeof(seq) / sizeof(seq[0]));
+}
+
+/* max(a,b) via CMP + conditional move (csel). */
+static void body_mir_max(Arm64Emit *e) {
+  MirInst seq[] = {
+      I(MIR_CMP, NONE(), P(ARM64_X0), P(ARM64_X1)),
+      I(MIR_CMOVCC, P(ARM64_X0), P(ARM64_X1), NONE()),
+      I(MIR_RET, NONE(), NONE(), NONE()),
+  };
+  seq[1].cc = 0x8C; /* x86 JL -> LT: a<b ? b : a */
+  arm64_mir_encode_seq(e, seq, sizeof(seq) / sizeof(seq[0]));
+}
+
+/* zero-extend the low byte (MOVZX width 1). */
+static void body_mir_uxtb(Arm64Emit *e) {
+  MirInst seq[] = {
+      I(MIR_MOVZX, P(ARM64_X0), P(ARM64_X0), NONE()),
+      I(MIR_RET, NONE(), NONE(), NONE()),
+  };
+  seq[0].width = 1;
+  arm64_mir_encode_seq(e, seq, sizeof(seq) / sizeof(seq[0]));
+}
+
+/* is_even(n) via TEST + SETCC. */
+static void body_mir_iseven(Arm64Emit *e) {
+  MirInst seq[] = {
+      I(MIR_MOV, P(ARM64_X9), IMM(1), NONE()),
+      I(MIR_TEST, NONE(), P(ARM64_X0), P(ARM64_X9)),
+      I(MIR_SETCC, P(ARM64_X0), NONE(), NONE()),
+      I(MIR_RET, NONE(), NONE(), NONE()),
+  };
+  seq[2].cc = 0x94; /* x86 SETE -> EQ: (n & 1) == 0 */
+  arm64_mir_encode_seq(e, seq, sizeof(seq) / sizeof(seq[0]));
+}
+
+/* ---- vreg-MIR bodies (Brick 4): the encoder allocates stack slots -------- *
+ * These use MIR_OPK_VREG operands (the form mir_lower emits). The first N vregs
+ * are parameters, homed from x0.. by arm64_mir_encode_vregs. */
+
+/* sum_to_n(n): vregs v0=n(param), v1=acc, v2=i. */
+static void body_vmir_sum(Arm64Emit *e) {
+  MirInst seq[] = {
+      I(MIR_MOV, V(1), IMM(0), NONE()),
+      I(MIR_MOV, V(2), IMM(1), NONE()),
+      I(MIR_LABEL, LBL("Lc"), NONE(), NONE()),
+      I(MIR_CMPBR, LBL("Ld"), V(2), V(0)),
+      I(MIR_ADD, V(1), V(1), V(2)),
+      I(MIR_ADD, V(2), V(2), IMM(1)),
+      I(MIR_JMP, LBL("Lc"), NONE(), NONE()),
+      I(MIR_LABEL, LBL("Ld"), NONE(), NONE()),
+      I(MIR_RET, NONE(), V(1), NONE()),
+  };
+  seq[3].cc = 0x8F; /* JG -> GT */
+  arm64_mir_encode_vregs(e, seq, sizeof(seq) / sizeof(seq[0]), 3, 1);
+}
+
+/* poly(a,b) = a*a + b: v0=a, v1=b (params), v2=tmp. */
+static void body_vmir_poly(Arm64Emit *e) {
+  MirInst seq[] = {
+      I(MIR_IMUL, V(2), V(0), V(0)),
+      I(MIR_ADD, V(2), V(2), V(1)),
+      I(MIR_RET, NONE(), V(2), NONE()),
+  };
+  arm64_mir_encode_vregs(e, seq, sizeof(seq) / sizeof(seq[0]), 3, 2);
 }
 
 /* ---- harness ------------------------------------------------------------ */
@@ -336,6 +425,15 @@ int main(int argc, char **argv) {
   build_case(out_dir, manifest, "mir_sum", 55, 10, 0, 1, body_mir_sum);
   build_case(out_dir, manifest, "mir_isgt", 1, 20, 7, 2, body_mir_isgt);
   build_case(out_dir, manifest, "mir_pack", 35, 2, 3, 2, body_mir_pack);
+  build_case(out_dir, manifest, "mir_div", 3, 17, 5, 2, body_mir_div);
+  build_case(out_dir, manifest, "mir_mod", 2, 17, 5, 2, body_mir_mod);
+  build_case(out_dir, manifest, "mir_max", 20, 7, 20, 2, body_mir_max);
+  build_case(out_dir, manifest, "mir_uxtb", 255, 0x1FF, 0, 1, body_mir_uxtb);
+  build_case(out_dir, manifest, "mir_iseven", 1, 6, 0, 1, body_mir_iseven);
+
+  /* Brick 4: vreg MIR with encoder-driven stack allocation + param homing. */
+  build_case(out_dir, manifest, "vmir_sum", 55, 10, 0, 1, body_vmir_sum);
+  build_case(out_dir, manifest, "vmir_poly", 32, 5, 7, 2, body_vmir_poly);
 
   if (manifest) {
     fclose(manifest);

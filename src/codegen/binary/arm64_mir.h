@@ -22,7 +22,16 @@ Arm64Cond arm64_cond_from_x86_cc(unsigned char x86_cc);
 /* Lower a scalar MIR instruction sequence into a complete AArch64 function:
  * emits the AAPCS64 prologue, translates each instruction, and turns MIR_RET
  * into the epilogue + ret. Branch/label operands use the MIR_OPK_LABEL `dst`
- * slot. Returns 0 (sets e->error) on an unsupported op or emit failure. */
+ * slot. Operands are physical registers (MIR_OPK_PHYS) or immediates. Returns 0
+ * (sets e->error) on an unsupported op or emit failure. */
 int arm64_mir_encode_seq(Arm64Emit *e, const MirInst *insns, size_t count);
+
+/* Lower a vreg-based scalar MIR sequence, doing its own stack-slot allocation:
+ * every vreg gets an 8-byte frame slot, the first `nparams` vregs are homed from
+ * x0.. on entry, and each op loads its sources / stores its result through those
+ * slots -- the simple non-optimizing model that consumes mir_lower's vreg output
+ * directly. MIR_RET returns the vreg named by operand `a` (or void if NONE). */
+int arm64_mir_encode_vregs(Arm64Emit *e, const MirInst *insns, size_t count,
+                           int nvregs, int nparams);
 
 #endif /* CODEGEN_BINARY_ARM64_MIR_H */

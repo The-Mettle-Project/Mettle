@@ -57,6 +57,16 @@ uint32_t arm64_sub_imm(int is64, Arm64Reg rd, Arm64Reg rn, uint32_t imm12,
 
 uint32_t arm64_cmp_reg(int is64, Arm64Reg rn, Arm64Reg rm);
 uint32_t arm64_cmp_imm(int is64, Arm64Reg rn, uint32_t imm12, int shift12);
+/* TST rn, rm == ANDS XZR, rn, rm (flags = rn & rm). */
+uint32_t arm64_tst(int is64, Arm64Reg rn, Arm64Reg rm);
+
+/* Sign/zero extend a narrow value (UXTB/UXTH zero-extend into Wd; SXTB/SXTH/
+ * SXTW sign-extend into Xd). */
+uint32_t arm64_uxtb(Arm64Reg rd, Arm64Reg rn);
+uint32_t arm64_uxth(Arm64Reg rd, Arm64Reg rn);
+uint32_t arm64_sxtb(Arm64Reg rd, Arm64Reg rn);
+uint32_t arm64_sxth(Arm64Reg rd, Arm64Reg rn);
+uint32_t arm64_sxtw(Arm64Reg rd, Arm64Reg rn);
 
 /* MADD: rd = ra + rn*rm ; MSUB: rd = ra - rn*rm. */
 uint32_t arm64_madd(int is64, Arm64Reg rd, Arm64Reg rn, Arm64Reg rm,
