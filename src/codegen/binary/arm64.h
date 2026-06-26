@@ -96,6 +96,27 @@ uint32_t arm64_str_imm(int is64, Arm64Reg rt, Arm64Reg rn, int offset_bytes);
  * unscaled 0..4095). */
 uint32_t arm64_strb_imm(Arm64Reg rt, Arm64Reg rn, int offset);
 uint32_t arm64_ldrb_imm(Arm64Reg rt, Arm64Reg rn, int offset);
+/* Halfword (16-bit) store/load (zero-extending); offset is bytes, scaled by 2. */
+uint32_t arm64_strh_imm(Arm64Reg rt, Arm64Reg rn, int offset_bytes);
+uint32_t arm64_ldrh_imm(Arm64Reg rt, Arm64Reg rn, int offset_bytes);
+
+/* ---- scalar floating point (d = 64-bit double, s = 32-bit single) -------- *
+ * FP registers reuse the 0..31 numbering; `is_double` selects the d/s form. */
+uint32_t arm64_fadd(int is_double, int fd, int fn, int fm);
+uint32_t arm64_fsub(int is_double, int fd, int fn, int fm);
+uint32_t arm64_fmul(int is_double, int fd, int fn, int fm);
+uint32_t arm64_fdiv(int is_double, int fd, int fn, int fm);
+uint32_t arm64_fneg(int is_double, int fd, int fn);
+uint32_t arm64_fcmp(int is_double, int fn, int fm);            /* -> NZCV */
+uint32_t arm64_scvtf(int is_double, int fd, Arm64Reg xn);      /* int64 -> fp */
+uint32_t arm64_fcvtzs(int is_double, Arm64Reg xd, int fn);     /* fp -> int64 trunc */
+uint32_t arm64_fcvt(int to_double, int fd, int fn);            /* single<->double */
+uint32_t arm64_fmov_gp(int is_double, int fd, Arm64Reg xn);    /* bits GP -> FP */
+uint32_t arm64_fmov_to_gp(int is_double, Arm64Reg xd, int fn); /* bits FP -> GP */
+uint32_t arm64_fmov_reg(int is_double, int fd, int fn);        /* FP -> FP copy */
+/* FP load/store of a d/s register; offset is bytes, scaled by 8 (d) / 4 (s). */
+uint32_t arm64_ldr_fp(int is_double, int ft, Arm64Reg rn, int offset_bytes);
+uint32_t arm64_str_fp(int is_double, int ft, Arm64Reg rn, int offset_bytes);
 uint32_t arm64_stp_pre(int is64, Arm64Reg rt, Arm64Reg rt2, Arm64Reg rn,
                        int offset_bytes);
 uint32_t arm64_ldp_post(int is64, Arm64Reg rt, Arm64Reg rt2, Arm64Reg rn,

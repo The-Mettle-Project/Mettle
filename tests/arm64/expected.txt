@@ -12,3 +12,7 @@ shifts 32
 poly 10
 multiret 2
 int32sum 21
+ptr 99
+array 30
+floatcalc 35
+floatfn 110

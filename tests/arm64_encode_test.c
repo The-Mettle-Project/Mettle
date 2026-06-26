@@ -93,6 +93,22 @@ static void test_known_good(void) {
              0x39000020u);
   check_word("ldrb w0, [x1]", arm64_ldrb_imm(ARM64_X0, ARM64_X1, 0),
              0x39400020u);
+  check_word("strh w0, [x1]", arm64_strh_imm(ARM64_X0, ARM64_X1, 0),
+             0x79000020u);
+  check_word("ldrh w0, [x1]", arm64_ldrh_imm(ARM64_X0, ARM64_X1, 0),
+             0x79400020u);
+
+  check_word("fadd d0, d1, d2", arm64_fadd(1, 0, 1, 2), 0x1E622820u);
+  check_word("fmul d0, d1, d2", arm64_fmul(1, 0, 1, 2), 0x1E620820u);
+  check_word("fsub d0, d1, d2", arm64_fsub(1, 0, 1, 2), 0x1E623820u);
+  check_word("fdiv d0, d1, d2", arm64_fdiv(1, 0, 1, 2), 0x1E621820u);
+  check_word("fmov d0, x0", arm64_fmov_gp(1, 0, ARM64_X0), 0x9E670000u);
+  check_word("fmov x0, d0", arm64_fmov_to_gp(1, ARM64_X0, 0), 0x9E660000u);
+  check_word("scvtf d0, x0", arm64_scvtf(1, 0, ARM64_X0), 0x9E620000u);
+  check_word("fcvtzs x0, d0", arm64_fcvtzs(1, ARM64_X0, 0), 0x9E780000u);
+  check_word("fcmp d0, d1", arm64_fcmp(1, 0, 1), 0x1E612000u);
+  check_word("ldr d0, [x1]", arm64_ldr_fp(1, 0, ARM64_X1, 0), 0xFD400020u);
+  check_word("str d0, [x1]", arm64_str_fp(1, 0, ARM64_X1, 0), 0xFD000020u);
   check_word("str x0, [sp, #8]", arm64_str_imm(1, ARM64_X0, ARM64_SP, 8),
              0xF90007E0u);
 

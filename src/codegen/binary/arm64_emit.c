@@ -173,16 +173,27 @@ int arm64_emit_finalize(Arm64Emit *e) {
  * ORR/mov-reg form (reg 31 = XZR). */
 int arm64_emit_prologue(Arm64Emit *e, int frame_bytes, const Arm64Reg *saved,
                         int n_saved) {
-  if (frame_bytes < 0 || frame_bytes > 4095 || (frame_bytes & 15) != 0) {
+  if (frame_bytes < 0 || (frame_bytes & 15) != 0) {
     e->error = 1;
     return 0;
   }
   int ok = arm64_emit_word(e, arm64_stp_pre(1, ARM64_X29, ARM64_X30, ARM64_SP,
                                             -16)) &&
            arm64_emit_word(e, arm64_mov_sp(ARM64_X29, ARM64_SP));
-  if (ok && frame_bytes > 0) {
+  if (ok && frame_bytes > 0 && frame_bytes <= 4095) {
     ok = arm64_emit_word(e, arm64_sub_imm(1, ARM64_SP, ARM64_SP,
                                           (uint32_t)frame_bytes, 0));
+  } else if (ok && frame_bytes > 4095) {
+    /* Large frame: materialize the size in the IP0 scratch (x16) and subtract
+     * via register. The epilogue restores sp from x29, so no symmetric work. */
+    uint32_t v = (uint32_t)frame_bytes;
+    ok = arm64_emit_word(e, arm64_movz(1, ARM64_X16, (uint16_t)(v & 0xFFFF), 0));
+    if (ok && (v >> 16)) {
+      ok = arm64_emit_word(e,
+                           arm64_movk(1, ARM64_X16, (uint16_t)(v >> 16), 1));
+    }
+    ok = ok && arm64_emit_word(e, arm64_sub_reg(1, ARM64_SP, ARM64_SP,
+                                                ARM64_X16));
   }
   for (int i = 0; ok && i < n_saved; i++) {
     ok = arm64_emit_word(e, arm64_str_imm(1, saved[i], ARM64_SP, 8 * i));

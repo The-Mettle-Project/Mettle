@@ -223,6 +223,86 @@ uint32_t arm64_ldrb_imm(Arm64Reg rt, Arm64Reg rn, int offset) {
   return 0x39400000u | (((uint32_t)offset & 0xFFFu) << 10) | (R5(rn) << 5) |
          R5(rt);
 }
+/* STRH/LDRH (unsigned offset): size=01; imm12 scaled by 2. */
+uint32_t arm64_strh_imm(Arm64Reg rt, Arm64Reg rn, int offset_bytes) {
+  uint32_t s = (uint32_t)(offset_bytes / 2) & 0xFFFu;
+  return 0x79000000u | (s << 10) | (R5(rn) << 5) | R5(rt);
+}
+uint32_t arm64_ldrh_imm(Arm64Reg rt, Arm64Reg rn, int offset_bytes) {
+  uint32_t s = (uint32_t)(offset_bytes / 2) & 0xFFFu;
+  return 0x79400000u | (s << 10) | (R5(rn) << 5) | R5(rt);
+}
+
+/* ---- scalar floating point ---------------------------------------------- *
+ * Floating-point data-processing (2 source): the double (ftype=01) bases are
+ * below; the single (ftype=00) form clears bit 22. */
+static uint32_t fp2(int is_double, uint32_t dbase, int fd, int fn, int fm) {
+  uint32_t base = is_double ? dbase : (dbase & ~(1u << 22));
+  return base | (R5(fm) << 16) | (R5(fn) << 5) | R5(fd);
+}
+uint32_t arm64_fmul(int is_double, int fd, int fn, int fm) {
+  return fp2(is_double, 0x1E600800u, fd, fn, fm);
+}
+uint32_t arm64_fdiv(int is_double, int fd, int fn, int fm) {
+  return fp2(is_double, 0x1E601800u, fd, fn, fm);
+}
+uint32_t arm64_fadd(int is_double, int fd, int fn, int fm) {
+  return fp2(is_double, 0x1E602800u, fd, fn, fm);
+}
+uint32_t arm64_fsub(int is_double, int fd, int fn, int fm) {
+  return fp2(is_double, 0x1E603800u, fd, fn, fm);
+}
+/* FNEG (scalar): single-source FP, opcode 000010. */
+uint32_t arm64_fneg(int is_double, int fd, int fn) {
+  uint32_t base = is_double ? 0x1E614000u : 0x1E214000u;
+  return base | (R5(fn) << 5) | R5(fd);
+}
+/* FCMP Dn, Dm: writes NZCV; consume with cset/b.cond. */
+uint32_t arm64_fcmp(int is_double, int fn, int fm) {
+  uint32_t base = is_double ? 0x1E602000u : 0x1E202000u;
+  return base | (R5(fm) << 16) | (R5(fn) << 5);
+}
+/* SCVTF: signed int (Xn) -> fp (Dd). 64-bit source. */
+uint32_t arm64_scvtf(int is_double, int fd, Arm64Reg xn) {
+  uint32_t base = is_double ? 0x9E620000u : 0x9E220000u;
+  return base | (R5(xn) << 5) | R5(fd);
+}
+/* FCVTZS: fp (Dn) -> signed int (Xd), round toward zero. 64-bit dest. */
+uint32_t arm64_fcvtzs(int is_double, Arm64Reg xd, int fn) {
+  uint32_t base = is_double ? 0x9E780000u : 0x9E380000u;
+  return base | (R5(fn) << 5) | R5(xd);
+}
+/* FCVT: convert precision. to_double: s->d (0x1E22C000); else d->s (0x1E624000). */
+uint32_t arm64_fcvt(int to_double, int fd, int fn) {
+  uint32_t base = to_double ? 0x1E22C000u : 0x1E624000u;
+  return base | (R5(fn) << 5) | R5(fd);
+}
+/* FMOV between GP and FP register bit patterns (no conversion). */
+uint32_t arm64_fmov_gp(int is_double, int fd, Arm64Reg xn) {
+  uint32_t base = is_double ? 0x9E670000u : 0x1E270000u; /* GP -> FP */
+  return base | (R5(xn) << 5) | R5(fd);
+}
+uint32_t arm64_fmov_to_gp(int is_double, Arm64Reg xd, int fn) {
+  uint32_t base = is_double ? 0x9E660000u : 0x1E260000u; /* FP -> GP */
+  return base | (R5(fn) << 5) | R5(xd);
+}
+/* FMOV Dd, Dn: FP register copy (single-source FP, opcode 000000). */
+uint32_t arm64_fmov_reg(int is_double, int fd, int fn) {
+  uint32_t base = is_double ? 0x1E604000u : 0x1E204000u;
+  return base | (R5(fn) << 5) | R5(fd);
+}
+/* FP load/store (unsigned offset): V=1; double size=11 scale 8, single size=10
+ * scale 4. */
+uint32_t arm64_ldr_fp(int is_double, int ft, Arm64Reg rn, int offset_bytes) {
+  uint32_t base = is_double ? 0xFD400000u : 0xBD400000u;
+  uint32_t s = (uint32_t)(offset_bytes / (is_double ? 8 : 4)) & 0xFFFu;
+  return base | (s << 10) | (R5(rn) << 5) | R5(ft);
+}
+uint32_t arm64_str_fp(int is_double, int ft, Arm64Reg rn, int offset_bytes) {
+  uint32_t base = is_double ? 0xFD000000u : 0xBD000000u;
+  uint32_t s = (uint32_t)(offset_bytes / (is_double ? 8 : 4)) & 0xFFFu;
+  return base | (s << 10) | (R5(rn) << 5) | R5(ft);
+}
 
 uint32_t arm64_stp_pre(int is64, Arm64Reg rt, Arm64Reg rt2, Arm64Reg rn,
                        int offset_bytes) {

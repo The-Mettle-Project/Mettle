@@ -17,30 +17,90 @@
 #define R_RES ARM64_X11
 #define R_AUX ARM64_X12
 
-/* Stack-slot map: every distinct temp/local/param name gets one 8-byte slot. */
+/* Stack-slot map: each distinct name gets a byte offset into the frame. Scalars
+ * and pointers take 8 bytes; an array local takes count*elem_size (8-aligned)
+ * so &array + i*elem_size addresses its elements. */
 typedef struct {
   const char **names;
+  int *offs;
   int count;
   int cap;
+  int frame; /* running total bytes */
 } SlotMap;
 
-static int slot_of(SlotMap *s, const char *name) {
+/* Byte size of an array element by its type name. */
+static int type_elem_size(const char *t) {
+  if (!t) return 8;
+  if (strchr(t, '*')) return 8; /* pointer */
+  if (strstr(t, "64")) return 8;
+  if (strstr(t, "32")) return 4;
+  if (strstr(t, "16")) return 2;
+  if (strstr(t, "8")) return 1;
+  if (strcmp(t, "bool") == 0) return 1;
+  return 8;
+}
+
+/* Frame bytes a DECLARE_LOCAL needs from its type text (e.g. "int64[4]"). */
+static int local_size_bytes(const char *text) {
+  if (!text) return 8;
+  const char *lb = strchr(text, '[');
+  if (lb) {
+    int count = atoi(lb + 1);
+    char buf[64];
+    size_t n = (size_t)(lb - text);
+    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+    memcpy(buf, text, n);
+    buf[n] = 0;
+    int total = count * type_elem_size(buf);
+    return total > 0 ? total : 8;
+  }
+  return 8;
+}
+
+/* Find or allocate `name`'s slot (size rounded up to 8); returns its offset. */
+static int slot_alloc(SlotMap *s, const char *name, int size_bytes) {
   for (int i = 0; i < s->count; i++) {
     if (s->names[i] == name || strcmp(s->names[i], name) == 0) {
-      return i;
+      return s->offs[i];
     }
   }
   if (s->count == s->cap) {
     int cap = s->cap ? s->cap * 2 : 32;
     const char **n = realloc(s->names, (size_t)cap * sizeof(*n));
-    if (!n) {
+    int *o = realloc(s->offs, (size_t)cap * sizeof(*o));
+    if (n) s->names = n;
+    if (o) s->offs = o;
+    if (!n || !o) {
       return -1;
     }
-    s->names = n;
     s->cap = cap;
   }
+  int sz = size_bytes <= 0 ? 8 : ((size_bytes + 7) & ~7);
+  int off = s->frame;
+  s->frame += sz;
   s->names[s->count] = name;
-  return s->count++;
+  s->offs[s->count] = off;
+  s->count++;
+  return off;
+}
+
+/* Byte offset of a name's slot (default 8-byte scalar if not seen yet). */
+static int slot_off(SlotMap *s, const char *name) {
+  return slot_alloc(s, name, 8);
+}
+
+/* IEEE-754 bit pattern of a FLOAT operand at its declared width. */
+static uint64_t ieee_bits(const IROperand *op) {
+  if (op->float_bits == 32) {
+    float f = (float)op->float_value;
+    uint32_t b;
+    memcpy(&b, &f, 4);
+    return b;
+  }
+  double d = op->float_value;
+  uint64_t b;
+  memcpy(&b, &d, 8);
+  return b;
 }
 
 /* A name -> emit-label-id map, shared use for both branch labels (per function)
@@ -85,21 +145,133 @@ static void emit_imm(Arm64Emit *e, Arm64Reg rd, uint64_t v) {
     arm64_emit_word(e, arm64_movk(1, rd, (uint16_t)((v >> 48) & 0xFFFF), 3));
 }
 
-/* Load an IR value operand (temp/local/int) into `scratch` (or a chosen reg). */
+/* A set of value names known to hold a floating-point value. Needed because the
+ * IR does not reliably tag a float on every operand use, yet the AAPCS64 ABI
+ * passes/returns floats in v-registers -- so calls, returns, and arguments must
+ * know float-ness. */
+typedef struct {
+  const char **names;
+  int count;
+  int cap;
+} StrSet;
+
+static int set_has(const StrSet *s, const char *n) {
+  if (!n) return 0;
+  for (int i = 0; i < s->count; i++) {
+    if (s->names[i] == n || strcmp(s->names[i], n) == 0) return 1;
+  }
+  return 0;
+}
+static void set_add(StrSet *s, const char *n) {
+  if (!n || set_has(s, n)) return;
+  if (s->count == s->cap) {
+    int cap = s->cap ? s->cap * 2 : 32;
+    const char **p = realloc(s->names, (size_t)cap * sizeof(*p));
+    if (!p) return;
+    s->names = p;
+    s->cap = cap;
+  }
+  s->names[s->count++] = n;
+}
+
+static int operand_is_float(const StrSet *fs, const IROperand *op) {
+  if (op->kind == IR_OPERAND_FLOAT || op->float_bits != 0) return 1;
+  if ((op->kind == IR_OPERAND_TEMP || op->kind == IR_OPERAND_SYMBOL))
+    return set_has(fs, op->name);
+  return 0;
+}
+
+static int prog_fn_index(const IRProgram *prog, const char *name) {
+  if (!name) return -1;
+  for (size_t i = 0; i < prog->function_count; i++) {
+    if (strcmp(prog->functions[i]->name, name) == 0) return (int)i;
+  }
+  return -1;
+}
+
+/* Populate `fs` with every value name that holds a float in `fn` (params,
+ * float locals, float-producing instructions). `retf` (callee returns-float
+ * flags) lets a call result be recognized as float. */
+static void build_float_set(const IRFunction *fn, const IRProgram *prog,
+                            const int *retf, StrSet *fs) {
+  for (size_t i = 0; i < fn->parameter_count; i++) {
+    if (fn->parameter_types && fn->parameter_types[i] &&
+        strstr(fn->parameter_types[i], "float")) {
+      set_add(fs, fn->parameter_names[i]);
+    }
+  }
+  for (size_t i = 0; i < fn->instruction_count; i++) {
+    const IRInstruction *in = &fn->instructions[i];
+    if (in->op == IR_OP_DECLARE_LOCAL && in->dest.name && in->text &&
+        strstr(in->text, "float") && !strchr(in->text, '[')) {
+      set_add(fs, in->dest.name);
+    }
+  }
+  for (int pass = 0; pass < 4; pass++) {
+    for (size_t i = 0; i < fn->instruction_count; i++) {
+      const IRInstruction *in = &fn->instructions[i];
+      if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL)
+        continue;
+      switch (in->op) {
+      case IR_OP_BINARY:
+      case IR_OP_UNARY:
+      case IR_OP_LOAD:
+        if (in->is_float) set_add(fs, in->dest.name);
+        break;
+      case IR_OP_CAST:
+        if (in->dest.float_bits != 0) set_add(fs, in->dest.name);
+        break;
+      case IR_OP_ASSIGN:
+        if (operand_is_float(fs, &in->lhs)) set_add(fs, in->dest.name);
+        break;
+      case IR_OP_CALL: {
+        int ci = retf ? prog_fn_index(prog, in->text) : -1;
+        if (ci >= 0 && retf[ci]) set_add(fs, in->dest.name);
+        break;
+      }
+      default:
+        break;
+      }
+    }
+  }
+}
+
+static int fn_returns_float(const IRFunction *fn, const IRProgram *prog,
+                            const int *retf) {
+  StrSet fs = {0};
+  build_float_set(fn, prog, retf, &fs);
+  int rf = 0;
+  for (size_t i = 0; i < fn->instruction_count; i++) {
+    const IRInstruction *in = &fn->instructions[i];
+    if (in->op == IR_OP_RETURN && in->lhs.kind != IR_OPERAND_NONE &&
+        operand_is_float(&fs, &in->lhs)) {
+      rf = 1;
+      break;
+    }
+  }
+  free(fs.names);
+  return rf;
+}
+
+/* Load an IR value operand (temp/local/int/float) into `dest` as raw 64-bit
+ * bits (a float operand yields its IEEE pattern). */
 static Arm64Reg load_into(Arm64Emit *e, SlotMap *s, const IROperand *op,
                           Arm64Reg dest) {
   switch (op->kind) {
   case IR_OPERAND_INT:
     emit_imm(e, dest, (uint64_t)op->int_value);
     return dest;
+  case IR_OPERAND_FLOAT:
+    emit_imm(e, dest, ieee_bits(op));
+    return dest;
   case IR_OPERAND_TEMP:
   case IR_OPERAND_SYMBOL: {
-    int slot = slot_of(s, op->name);
-    if (slot < 0) {
+    int off = slot_off(s, op->name);
+    if (off < 0) {
       e->error = 1;
       return dest;
     }
-    arm64_emit_word(e, arm64_ldr_imm(1, dest, ARM64_SP, 8 * slot));
+    arm64_emit_word(e, arm64_ldr_imm(1, dest, ARM64_SP, off));
     return dest;
   }
   default:
@@ -110,12 +282,23 @@ static Arm64Reg load_into(Arm64Emit *e, SlotMap *s, const IROperand *op,
 
 static void store_dest(Arm64Emit *e, SlotMap *s, const IROperand *dst,
                        Arm64Reg src) {
-  int slot = slot_of(s, dst->name);
-  if (slot < 0) {
+  int off = slot_off(s, dst->name);
+  if (off < 0) {
     e->error = 1;
     return;
   }
-  arm64_emit_word(e, arm64_str_imm(1, src, ARM64_SP, 8 * slot));
+  arm64_emit_word(e, arm64_str_imm(1, src, ARM64_SP, off));
+}
+
+/* rd = sp + off (address of a local's slot), valid for any frame size. */
+static void emit_lea_local(Arm64Emit *e, Arm64Reg rd, int off) {
+  if (off <= 4095) {
+    arm64_emit_word(e, arm64_add_imm(1, rd, ARM64_SP, (uint32_t)off, 0));
+  } else {
+    arm64_emit_word(e, arm64_mov_sp(rd, ARM64_SP));
+    emit_imm(e, R_AUX, (uint64_t)off);
+    arm64_emit_word(e, arm64_add_reg(1, rd, rd, R_AUX));
+  }
 }
 
 static int cmp_cond(const char *op) {
@@ -129,9 +312,39 @@ static int cmp_cond(const char *op) {
 }
 
 static void lower_binary(Arm64Emit *e, SlotMap *s, const IRInstruction *in) {
+  const char *op = in->text;
+
+  /* Floating-point binary: load operand bits into d0/d1, operate, store the
+   * result bits. A comparison yields a 0/1 integer via fcmp + cset. */
+  if (in->is_float) {
+    int d = in->float_bits != 32;
+    arm64_emit_word(e, arm64_fmov_gp(d, 0, load_into(e, s, &in->lhs, R_LHS)));
+    arm64_emit_word(e, arm64_fmov_gp(d, 1, load_into(e, s, &in->rhs, R_RHS)));
+    int fcc = cmp_cond(op);
+    if (fcc >= 0) {
+      arm64_emit_word(e, arm64_fcmp(d, 0, 1));
+      arm64_emit_word(e, arm64_cset(1, R_RES, (Arm64Cond)fcc));
+    } else if (strcmp(op, "+") == 0) {
+      arm64_emit_word(e, arm64_fadd(d, 0, 0, 1));
+    } else if (strcmp(op, "-") == 0) {
+      arm64_emit_word(e, arm64_fsub(d, 0, 0, 1));
+    } else if (strcmp(op, "*") == 0) {
+      arm64_emit_word(e, arm64_fmul(d, 0, 0, 1));
+    } else if (strcmp(op, "/") == 0) {
+      arm64_emit_word(e, arm64_fdiv(d, 0, 0, 1));
+    } else {
+      e->error = 1;
+      return;
+    }
+    if (fcc < 0) {
+      arm64_emit_word(e, arm64_fmov_to_gp(d, R_RES, 0));
+    }
+    store_dest(e, s, &in->dest, R_RES);
+    return;
+  }
+
   Arm64Reg a = load_into(e, s, &in->lhs, R_LHS);
   Arm64Reg b = load_into(e, s, &in->rhs, R_RHS);
-  const char *op = in->text;
   int cc = cmp_cond(op);
   if (cc >= 0) {
     arm64_emit_word(e, arm64_cmp_reg(1, a, b));
@@ -184,41 +397,71 @@ static void lower_unary(Arm64Emit *e, SlotMap *s, const IRInstruction *in) {
   store_dest(e, s, &in->dest, R_RES);
 }
 
-/* Lower one function body. `fns` (if non-NULL) maps callee names to entry
- * labels so IR_OP_CALL can resolve a cross-function bl. */
-static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns) {
+/* Lower one function body. `fns` maps callee names to entry labels so IR_OP_CALL
+ * can resolve a cross-function bl; `prog`/`retf` drive the float ABI (which
+ * callees return floats). All may be NULL for the single-function path. */
+static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
+                           const IRProgram *prog, const int *retf) {
   SlotMap slots = {0};
   LblMap labels = {0};
+  StrSet fs = {0};
+  build_float_set(fn, prog, retf, &fs);
 
+  /* Slot allocation order: parameters first (so x0../v0.. home to known
+   * offsets), then declared locals at their real sizes (arrays!), then any
+   * remaining temps/symbols at 8 bytes. */
   for (size_t i = 0; i < fn->parameter_count; i++) {
-    slot_of(&slots, fn->parameter_names[i]);
+    slot_alloc(&slots, fn->parameter_names[i], 8);
+  }
+  for (size_t i = 0; i < fn->instruction_count; i++) {
+    const IRInstruction *in = &fn->instructions[i];
+    if (in->op == IR_OP_DECLARE_LOCAL && in->dest.kind == IR_OPERAND_SYMBOL &&
+        in->dest.name) {
+      slot_alloc(&slots, in->dest.name, local_size_bytes(in->text));
+    }
   }
   for (size_t i = 0; i < fn->instruction_count; i++) {
     const IRInstruction *in = &fn->instructions[i];
     const IROperand *ops[3] = {&in->dest, &in->lhs, &in->rhs};
     for (int k = 0; k < 3; k++) {
       if (ops[k]->kind == IR_OPERAND_TEMP || ops[k]->kind == IR_OPERAND_SYMBOL) {
-        slot_of(&slots, ops[k]->name);
+        slot_off(&slots, ops[k]->name);
       }
     }
     for (size_t k = 0; k < in->argument_count; k++) {
       const IROperand *a = &in->arguments[k];
       if (a->kind == IR_OPERAND_TEMP || a->kind == IR_OPERAND_SYMBOL) {
-        slot_of(&slots, a->name);
+        slot_off(&slots, a->name);
       }
     }
   }
 
-  int frame = (slots.count * 8 + 15) & ~15;
-  if (frame > 4080) {
-    e->error = 1;
-  }
+  int frame = (slots.frame + 15) & ~15;
   if (e->error || !arm64_emit_prologue(e, frame, NULL, 0)) {
     goto done;
   }
-  for (size_t i = 0; i < fn->parameter_count && i < 8; i++) {
-    arm64_emit_word(e, arm64_str_imm(1, (Arm64Reg)(ARM64_X0 + i), ARM64_SP,
-                                     8 * (int)i));
+  /* Home incoming parameters. GP and FP arguments are counted independently
+   * (AAPCS64): a float param arrives in v<fp>, an integer in x<gp>. */
+  {
+    int gp = 0, fp = 0;
+    for (size_t i = 0; i < fn->parameter_count; i++) {
+      const char *ty = fn->parameter_types ? fn->parameter_types[i] : NULL;
+      int isf = ty && strstr(ty, "float") != NULL;
+      int off = slot_off(&slots, fn->parameter_names[i]);
+      if (isf) {
+        if (fp < 8) {
+          int d = !strstr(ty, "32");
+          arm64_emit_word(e, arm64_str_fp(d, fp, ARM64_SP, off));
+        }
+        fp++;
+      } else {
+        if (gp < 8) {
+          arm64_emit_word(e, arm64_str_imm(1, (Arm64Reg)(ARM64_X0 + gp),
+                                           ARM64_SP, off));
+        }
+        gp++;
+      }
+    }
   }
 
   for (size_t i = 0; i < fn->instruction_count && !e->error; i++) {
@@ -245,9 +488,80 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns) {
       break;
     }
     case IR_OP_ASSIGN:
-    case IR_OP_CAST:
       store_dest(e, &slots, &in->dest, load_into(e, &slots, &in->lhs, R_LHS));
       break;
+    case IR_OP_CAST: {
+      int srcf = in->is_float;
+      int dstf = in->dest.float_bits != 0;
+      if (srcf && !dstf) { /* float -> int (truncating) */
+        int d = in->float_bits != 32;
+        arm64_emit_word(e, arm64_fmov_gp(d, 0, load_into(e, &slots, &in->lhs,
+                                                         R_LHS)));
+        arm64_emit_word(e, arm64_fcvtzs(d, R_RES, 0));
+        store_dest(e, &slots, &in->dest, R_RES);
+      } else if (!srcf && dstf) { /* int -> float */
+        int d = in->dest.float_bits != 32;
+        arm64_emit_word(e, arm64_scvtf(d, 0, load_into(e, &slots, &in->lhs,
+                                                       R_LHS)));
+        arm64_emit_word(e, arm64_fmov_to_gp(d, R_RES, 0));
+        store_dest(e, &slots, &in->dest, R_RES);
+      } else if (srcf && dstf) { /* float -> float */
+        int sd = in->float_bits != 32, dd = in->dest.float_bits != 32;
+        arm64_emit_word(e, arm64_fmov_gp(sd, 0, load_into(e, &slots, &in->lhs,
+                                                          R_LHS)));
+        if (sd != dd) {
+          arm64_emit_word(e, arm64_fcvt(dd, 1, 0));
+          arm64_emit_word(e, arm64_fmov_to_gp(dd, R_RES, 1));
+        } else {
+          arm64_emit_word(e, arm64_fmov_to_gp(sd, R_RES, 0));
+        }
+        store_dest(e, &slots, &in->dest, R_RES);
+      } else { /* int -> int: bit copy */
+        store_dest(e, &slots, &in->dest, load_into(e, &slots, &in->lhs, R_LHS));
+      }
+      break;
+    }
+    case IR_OP_ADDRESS_OF: {
+      emit_lea_local(e, R_RES, slot_off(&slots, in->lhs.name));
+      store_dest(e, &slots, &in->dest, R_RES);
+      break;
+    }
+    case IR_OP_LOAD: {
+      int size = in->rhs.kind == IR_OPERAND_INT ? (int)in->rhs.int_value : 8;
+      Arm64Reg addr = load_into(e, &slots, &in->lhs, R_LHS);
+      int sx = !in->is_unsigned && !in->is_float;
+      switch (size) {
+      case 8:
+        arm64_emit_word(e, arm64_ldr_imm(1, R_RES, addr, 0));
+        break;
+      case 4:
+        arm64_emit_word(e, arm64_ldr_imm(0, R_RES, addr, 0));
+        if (sx) arm64_emit_word(e, arm64_sxtw(R_RES, R_RES));
+        break;
+      case 2:
+        arm64_emit_word(e, arm64_ldrh_imm(R_RES, addr, 0));
+        if (sx) arm64_emit_word(e, arm64_sxth(R_RES, R_RES));
+        break;
+      default:
+        arm64_emit_word(e, arm64_ldrb_imm(R_RES, addr, 0));
+        if (sx) arm64_emit_word(e, arm64_sxtb(R_RES, R_RES));
+        break;
+      }
+      store_dest(e, &slots, &in->dest, R_RES);
+      break;
+    }
+    case IR_OP_STORE: {
+      int size = in->rhs.kind == IR_OPERAND_INT ? (int)in->rhs.int_value : 8;
+      Arm64Reg addr = load_into(e, &slots, &in->dest, R_LHS);
+      Arm64Reg val = load_into(e, &slots, &in->lhs, R_RHS);
+      switch (size) {
+      case 8: arm64_emit_word(e, arm64_str_imm(1, val, addr, 0)); break;
+      case 4: arm64_emit_word(e, arm64_str_imm(0, val, addr, 0)); break;
+      case 2: arm64_emit_word(e, arm64_strh_imm(val, addr, 0)); break;
+      default: arm64_emit_word(e, arm64_strb_imm(val, addr, 0)); break;
+      }
+      break;
+    }
     case IR_OP_BINARY:
       lower_binary(e, &slots, in);
       break;
@@ -277,22 +591,54 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns) {
         }
         break;
       }
-      /* Marshal args into x0.. (each loaded straight into its ABI register;
-       * all values live on the stack, so nothing is clobbered across the bl). */
-      size_t na = in->argument_count > 8 ? 8 : in->argument_count;
-      for (size_t k = 0; k < na; k++) {
-        load_into(e, &slots, &in->arguments[k], (Arm64Reg)(ARM64_X0 + k));
+      /* Marshal args: integers into x0..x7, floats into v0..v7 (counted
+       * independently). All values live on the stack, so nothing is clobbered
+       * across the bl. */
+      {
+        int gp = 0, fp = 0;
+        for (size_t k = 0; k < in->argument_count; k++) {
+          const IROperand *arg = &in->arguments[k];
+          int af = operand_is_float(&fs, arg);
+          if (af) {
+            if (fp < 8) {
+              int d = arg->float_bits != 32;
+              arm64_emit_word(e, arm64_fmov_gp(d, fp,
+                                               load_into(e, &slots, arg,
+                                                         R_LHS)));
+            }
+            fp++;
+          } else {
+            if (gp < 8) {
+              load_into(e, &slots, arg, (Arm64Reg)(ARM64_X0 + gp));
+            }
+            gp++;
+          }
+        }
       }
       arm64_emit_bl(e, label_for(e, fns, in->text));
       if (in->dest.kind == IR_OPERAND_TEMP ||
           in->dest.kind == IR_OPERAND_SYMBOL) {
-        store_dest(e, &slots, &in->dest, ARM64_X0);
+        int ci = (prog && retf) ? prog_fn_index(prog, in->text) : -1;
+        int resf = (ci >= 0 && retf[ci]) || set_has(&fs, in->dest.name);
+        if (resf) { /* float result arrives in d0/s0 */
+          int d = in->dest.float_bits != 32;
+          arm64_emit_word(e, arm64_fmov_to_gp(d, R_RES, 0));
+          store_dest(e, &slots, &in->dest, R_RES);
+        } else {
+          store_dest(e, &slots, &in->dest, ARM64_X0);
+        }
       }
       break;
     }
     case IR_OP_RETURN:
       if (in->lhs.kind != IR_OPERAND_NONE) {
-        arm64_emit_mov(e, 1, ARM64_X0, load_into(e, &slots, &in->lhs, R_LHS));
+        if (operand_is_float(&fs, &in->lhs)) { /* float result goes in d0/s0 */
+          int d = in->lhs.float_bits != 32;
+          arm64_emit_word(e, arm64_fmov_gp(d, 0, load_into(e, &slots, &in->lhs,
+                                                           R_LHS)));
+        } else {
+          arm64_emit_mov(e, 1, ARM64_X0, load_into(e, &slots, &in->lhs, R_LHS));
+        }
       }
       arm64_emit_epilogue(e, frame, NULL, 0);
       break;
@@ -304,13 +650,15 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns) {
 
 done:
   free(slots.names);
+  free(slots.offs);
   free(labels.names);
   free(labels.ids);
+  free(fs.names);
   return e->error ? 0 : 1;
 }
 
 int arm64_ir_encode_function(Arm64Emit *e, const IRFunction *fn) {
-  return encode_function(e, fn, NULL);
+  return encode_function(e, fn, NULL, NULL, NULL);
 }
 
 /* I/O intrinsics we provide as hand-written AArch64 stubs (a direct write(2)
@@ -450,11 +798,26 @@ int arm64_ir_encode_program(Arm64Emit *e, const IRProgram *prog,
   size_t n = prog->function_count;
   char *reach = calloc(n ? n : 1, 1);
   int *queue = malloc((n ? n : 1) * sizeof(int));
-  if (!reach || !queue) {
+  int *retf = calloc(n ? n : 1, sizeof(int));
+  if (!reach || !queue || !retf) {
     free(reach);
     free(queue);
+    free(retf);
     e->error = 1;
     return 0;
+  }
+
+  /* Which functions return a float (fixpoint, since a function can return the
+   * result of another float-returning call). Drives the v-register ABI. */
+  for (size_t iter = 0; iter <= n; iter++) {
+    int changed = 0;
+    for (size_t i = 0; i < n; i++) {
+      if (!retf[i] && fn_returns_float(prog->functions[i], prog, retf)) {
+        retf[i] = 1;
+        changed = 1;
+      }
+    }
+    if (!changed) break;
   }
 
   /* Reachability from `entry` over the call graph, treating I/O intrinsics as
@@ -509,13 +872,14 @@ int arm64_ir_encode_program(Arm64Emit *e, const IRProgram *prog,
       } else {
         emit_int_print(e, with_newline);
       }
-    } else if (!encode_function(e, fn, &fns)) {
+    } else if (!encode_function(e, fn, &fns, prog, retf)) {
       break;
     }
   }
 
   free(reach);
   free(queue);
+  free(retf);
   free(fns.names);
   free(fns.ids);
   return e->error ? 0 : 1;
