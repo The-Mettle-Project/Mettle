@@ -50,6 +50,19 @@ int arm64_emit_mov(Arm64Emit *e, int is64, Arm64Reg rd, Arm64Reg rn) {
   return arm64_emit_word(e, arm64_mov_reg(is64, rd, rn));
 }
 
+int arm64_emit_bytes(Arm64Emit *e, const void *data, size_t len) {
+  size_t pad = (4 - (len & 3)) & 3;
+  if (e->error || !buf_reserve(&e->code, len + pad)) {
+    e->error = 1;
+    return 0;
+  }
+  memcpy(e->code.data + e->code.len, data, len);
+  e->code.len += len;
+  memset(e->code.data + e->code.len, 0, pad);
+  e->code.len += pad;
+  return 1;
+}
+
 int arm64_new_label(Arm64Emit *e) {
   if (e->error) {
     return -1;

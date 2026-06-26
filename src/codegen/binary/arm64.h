@@ -92,6 +92,10 @@ uint32_t arm64_cset(int is64, Arm64Reg rd, Arm64Cond cond);
  * scaled field. Base slot is SP-capable. */
 uint32_t arm64_ldr_imm(int is64, Arm64Reg rt, Arm64Reg rn, int offset_bytes);
 uint32_t arm64_str_imm(int is64, Arm64Reg rt, Arm64Reg rn, int offset_bytes);
+/* Store/load the low byte of rt at [rn, #offset] (STRB/LDRB zero-extending,
+ * unscaled 0..4095). */
+uint32_t arm64_strb_imm(Arm64Reg rt, Arm64Reg rn, int offset);
+uint32_t arm64_ldrb_imm(Arm64Reg rt, Arm64Reg rn, int offset);
 uint32_t arm64_stp_pre(int is64, Arm64Reg rt, Arm64Reg rt2, Arm64Reg rn,
                        int offset_bytes);
 uint32_t arm64_ldp_post(int is64, Arm64Reg rt, Arm64Reg rt2, Arm64Reg rn,

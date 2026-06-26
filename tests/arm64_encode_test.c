@@ -89,6 +89,10 @@ static void test_known_good(void) {
              0xF94007E0u);
   check_word("str x0, [x1]", arm64_str_imm(1, ARM64_X0, ARM64_X1, 0),
              0xF9000020u);
+  check_word("strb w0, [x1]", arm64_strb_imm(ARM64_X0, ARM64_X1, 0),
+             0x39000020u);
+  check_word("ldrb w0, [x1]", arm64_ldrb_imm(ARM64_X0, ARM64_X1, 0),
+             0x39400020u);
   check_word("str x0, [sp, #8]", arm64_str_imm(1, ARM64_X0, ARM64_SP, 8),
              0xF90007E0u);
 

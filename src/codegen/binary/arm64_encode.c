@@ -214,6 +214,15 @@ uint32_t arm64_ldr_imm(int is64, Arm64Reg rt, Arm64Reg rn, int offset_bytes) {
   uint32_t scaled = (uint32_t)(offset_bytes / (is64 ? 8 : 4)) & 0xFFFu;
   return base | (scaled << 10) | (R5(rn) << 5) | R5(rt);
 }
+/* STRB/LDRB (unsigned offset): size=00, opc=00/01; imm12 is a byte count. */
+uint32_t arm64_strb_imm(Arm64Reg rt, Arm64Reg rn, int offset) {
+  return 0x39000000u | (((uint32_t)offset & 0xFFFu) << 10) | (R5(rn) << 5) |
+         R5(rt);
+}
+uint32_t arm64_ldrb_imm(Arm64Reg rt, Arm64Reg rn, int offset) {
+  return 0x39400000u | (((uint32_t)offset & 0xFFFu) << 10) | (R5(rn) << 5) |
+         R5(rt);
+}
 
 uint32_t arm64_stp_pre(int is64, Arm64Reg rt, Arm64Reg rt2, Arm64Reg rn,
                        int offset_bytes) {

@@ -4965,6 +4965,19 @@ try {
     }
   }
 
+  # I/O fixtures: compile and stage each with its expected-stdout .out sidecar.
+  $ioDir = Join-Path $tmpDir "arm64io"
+  New-Item -ItemType Directory -Force -Path $ioDir | Out-Null
+  Get-ChildItem tests\arm64\io\*.mettle | ForEach-Object {
+    $elf = Join-Path $ioDir ($_.BaseName + ".elf")
+    & $CompilerPath --emit-arm64 $_.FullName -o $elf 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $elf)) {
+      throw "mettle --emit-arm64 failed on io/$($_.Name)"
+    }
+    Copy-Item (Join-Path "tests\arm64\io" ($_.BaseName + ".out")) `
+      (Join-Path $ioDir ($_.BaseName + ".out")) -Force
+  }
+
   $wsl = Get-Command wsl -ErrorAction SilentlyContinue
   if ($wsl -and $elfDir -match '^[A-Za-z]:\\') {
     $toWsl = {
@@ -4976,6 +4989,19 @@ try {
     $code = $LASTEXITCODE
     if ($code -eq 0) {
       Write-Host ($runOut.Trim())
+      # I/O: diff each program's stdout against its committed .out
+      $ioScript = & $toWsl (Resolve-Path (Join-Path $PSScriptRoot "arm64_io_run.sh")).Path
+      $ioOut = & wsl bash $ioScript (& $toWsl $ioDir) 2>&1 | Out-String
+      $ioCode = $LASTEXITCODE
+      if ($ioCode -eq 0) {
+        Write-Host ($ioOut.Trim())
+      }
+      elseif ($ioCode -eq 64) {
+        Write-Host "[SKIP] arm64 I/O execution (qemu-aarch64 not found)"
+      }
+      else {
+        throw "real-source AArch64 I/O stdout mismatch:`n$ioOut"
+      }
     }
     elseif ($code -eq 64) {
       Write-Host "[SKIP] arm64_source execution (qemu-aarch64 not found; all fixtures lowered)"

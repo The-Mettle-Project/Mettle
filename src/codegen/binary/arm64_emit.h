@@ -43,6 +43,9 @@ void arm64_emit_init(Arm64Emit *e);
 void arm64_emit_free(Arm64Emit *e);
 size_t arm64_here(const Arm64Emit *e);
 int arm64_emit_word(Arm64Emit *e, uint32_t word);
+/* Append raw bytes (e.g. an embedded string literal), padding to a 4-byte
+ * boundary so following instructions stay aligned. */
+int arm64_emit_bytes(Arm64Emit *e, const void *data, size_t len);
 
 /* Register move that picks the correct encoding automatically: the add-#0 form
  * when either operand is SP (reg 31), the ORR form otherwise. Prefer this over
