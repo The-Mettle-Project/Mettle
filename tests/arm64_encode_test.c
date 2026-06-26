@@ -96,6 +96,15 @@ static void test_known_good(void) {
              arm64_ldp_post(1, ARM64_X29, ARM64_X30, ARM64_SP, 16),
              0xA8C17BFDu);
 
+  /* SP-move trap: mov x29,sp / mov sp,x29 must use the add-#0 form. The ORR
+   * mov form with reg 31 means XZR and would zero the register instead. */
+  check_word("mov x29, sp", arm64_mov_sp(ARM64_X29, ARM64_SP), 0x910003FDu);
+  check_word("mov sp, x29", arm64_mov_sp(ARM64_SP, ARM64_X29), 0x910003BFu);
+  check_int("mov_sp differs from orr-mov",
+            arm64_mov_sp(ARM64_X29, ARM64_SP) !=
+                arm64_mov_reg(1, ARM64_X29, ARM64_SP),
+            1);
+
   check_word("cset x0, eq", arm64_cset(1, ARM64_X0, ARM64_EQ), 0x9A9F17E0u);
   check_word("csel x0,x1,x2,eq",
              arm64_csel(1, ARM64_X0, ARM64_X1, ARM64_X2, ARM64_EQ),

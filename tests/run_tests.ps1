@@ -4893,7 +4893,7 @@ catch {
 $total++
 try {
   $arm64EmitExe = "bin\arm64_emit_test.exe"
-  & gcc -Wall -Wextra -std=c99 -g -O0 -Isrc tests\arm64_emit_test.c src\codegen\binary\arm64_encode.c src\codegen\binary\arm64_emit.c src\codegen\binary\arm64_disasm.c -o $arm64EmitExe
+  & gcc -Wall -Wextra -std=c99 -g -O0 -Isrc tests\arm64_emit_test.c src\codegen\binary\arm64_encode.c src\codegen\binary\arm64_emit.c src\codegen\binary\arm64_disasm.c src\codegen\binary\arm64_mir_encode.c -o $arm64EmitExe
   if ($LASTEXITCODE -ne 0) {
     throw "Failed to compile AArch64 emit test"
   }

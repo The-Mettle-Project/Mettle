@@ -44,6 +44,11 @@ void arm64_emit_free(Arm64Emit *e);
 size_t arm64_here(const Arm64Emit *e);
 int arm64_emit_word(Arm64Emit *e, uint32_t word);
 
+/* Register move that picks the correct encoding automatically: the add-#0 form
+ * when either operand is SP (reg 31), the ORR form otherwise. Prefer this over
+ * raw arm64_mov_reg so an SP operand can never silently become XZR. */
+int arm64_emit_mov(Arm64Emit *e, int is64, Arm64Reg rd, Arm64Reg rn);
+
 int arm64_new_label(Arm64Emit *e);
 void arm64_bind_label(Arm64Emit *e, int label);
 

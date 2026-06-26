@@ -16,6 +16,11 @@ uint32_t arm64_mov_reg(int is64, Arm64Reg rd, Arm64Reg rm) {
   return base | (R5(rm) << 16) | R5(rd);
 }
 
+/* mov to/from SP == ADD rd, rn, #0 (reg 31 = SP in the add-immediate slot). */
+uint32_t arm64_mov_sp(Arm64Reg rd, Arm64Reg rn) {
+  return arm64_add_imm(1, rd, rn, 0, 0);
+}
+
 /* Move wide (immediate): sf|opc|100101|hw(2)|imm16|Rd. */
 uint32_t arm64_movz(int is64, Arm64Reg rd, uint16_t imm16, int hw) {
   uint32_t base = is64 ? 0xD2800000u : 0x52800000u; /* opc=10 */

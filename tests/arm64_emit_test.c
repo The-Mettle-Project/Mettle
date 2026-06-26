@@ -10,6 +10,7 @@
 
 #include "codegen/binary/arm64.h"
 #include "codegen/binary/arm64_emit.h"
+#include "codegen/binary/arm64_mir.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -155,6 +156,94 @@ static void body_max(Arm64Emit *e) {
   arm64_emit_epilogue(e, 0, NULL, 0);
 }
 
+/* ---- MIR-lowered bodies (Brick 3): build scalar MIR, lower to A64 ------- */
+
+static MirOperand P(int r) {
+  MirOperand o;
+  memset(&o, 0, sizeof o);
+  o.kind = MIR_OPK_PHYS;
+  o.phys = r;
+  o.rclass = MIR_RC_GP;
+  return o;
+}
+static MirOperand IMM(long long v) {
+  MirOperand o;
+  memset(&o, 0, sizeof o);
+  o.kind = MIR_OPK_IMM;
+  o.imm = v;
+  return o;
+}
+static MirOperand LBL(const char *s) {
+  MirOperand o;
+  memset(&o, 0, sizeof o);
+  o.kind = MIR_OPK_LABEL;
+  o.sym = s;
+  return o;
+}
+static MirOperand NONE(void) {
+  MirOperand o;
+  memset(&o, 0, sizeof o);
+  o.kind = MIR_OPK_NONE;
+  return o;
+}
+static MirInst I(MirOpcode op, MirOperand dst, MirOperand a, MirOperand b) {
+  MirInst in;
+  memset(&in, 0, sizeof in);
+  in.op = op;
+  in.dst = dst;
+  in.a = a;
+  in.b = b;
+  in.ir_index = -1;
+  return in;
+}
+
+static void body_mir_add(Arm64Emit *e) {
+  MirInst seq[] = {
+      I(MIR_ADD, P(ARM64_X0), P(ARM64_X0), P(ARM64_X1)),
+      I(MIR_RET, NONE(), NONE(), NONE()),
+  };
+  arm64_mir_encode_seq(e, seq, sizeof(seq) / sizeof(seq[0]));
+}
+
+/* sum_to_n(n) lowered from MIR: loop with a fused compare-and-branch. */
+static void body_mir_sum(Arm64Emit *e) {
+  MirInst seq[] = {
+      I(MIR_MOV, P(ARM64_X9), IMM(0), NONE()),
+      I(MIR_MOV, P(ARM64_X10), IMM(1), NONE()),
+      I(MIR_LABEL, LBL("Lcond"), NONE(), NONE()),
+      I(MIR_CMPBR, LBL("Ldone"), P(ARM64_X10), P(ARM64_X0)),
+      I(MIR_ADD, P(ARM64_X9), P(ARM64_X9), P(ARM64_X10)),
+      I(MIR_ADD, P(ARM64_X10), P(ARM64_X10), IMM(1)),
+      I(MIR_JMP, LBL("Lcond"), NONE(), NONE()),
+      I(MIR_LABEL, LBL("Ldone"), NONE(), NONE()),
+      I(MIR_MOV, P(ARM64_X0), P(ARM64_X9), NONE()),
+      I(MIR_RET, NONE(), NONE(), NONE()),
+  };
+  seq[3].cc = 0x8F; /* x86 JG -> AArch64 GT */
+  arm64_mir_encode_seq(e, seq, sizeof(seq) / sizeof(seq[0]));
+}
+
+/* is_gt(a,b) = (a > b) via CMP + SETCC, exercising the x86-cc translation. */
+static void body_mir_isgt(Arm64Emit *e) {
+  MirInst seq[] = {
+      I(MIR_CMP, NONE(), P(ARM64_X0), P(ARM64_X1)),
+      I(MIR_SETCC, P(ARM64_X0), NONE(), NONE()),
+      I(MIR_RET, NONE(), NONE(), NONE()),
+  };
+  seq[1].cc = 0x9F; /* x86 SETG -> AArch64 GT */
+  arm64_mir_encode_seq(e, seq, sizeof(seq) / sizeof(seq[0]));
+}
+
+/* pack(a,b) = (a << 4) | b, exercising shift-immediate + OR. */
+static void body_mir_pack(Arm64Emit *e) {
+  MirInst seq[] = {
+      I(MIR_SHL, P(ARM64_X9), P(ARM64_X0), IMM(4)),
+      I(MIR_OR, P(ARM64_X0), P(ARM64_X9), P(ARM64_X1)),
+      I(MIR_RET, NONE(), NONE(), NONE()),
+  };
+  arm64_mir_encode_seq(e, seq, sizeof(seq) / sizeof(seq[0]));
+}
+
 /* ---- harness ------------------------------------------------------------ */
 
 /* Assemble [entry stub: set args, bl func, exit(x0)] ++ [func body], validate
@@ -241,6 +330,12 @@ int main(int argc, char **argv) {
   build_case(out_dir, manifest, "mod", 2, 17, 5, 2, body_mod);
   build_case(out_dir, manifest, "popcount", 3, 0xB, 0, 1, body_popcount);
   build_case(out_dir, manifest, "max", 20, 7, 20, 2, body_max);
+
+  /* Brick 3: the same shapes, but lowered from real MIR instructions. */
+  build_case(out_dir, manifest, "mir_add", 12, 5, 7, 2, body_mir_add);
+  build_case(out_dir, manifest, "mir_sum", 55, 10, 0, 1, body_mir_sum);
+  build_case(out_dir, manifest, "mir_isgt", 1, 20, 7, 2, body_mir_isgt);
+  build_case(out_dir, manifest, "mir_pack", 35, 2, 3, 2, body_mir_pack);
 
   if (manifest) {
     fclose(manifest);

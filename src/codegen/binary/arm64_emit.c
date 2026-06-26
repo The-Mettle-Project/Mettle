@@ -43,6 +43,13 @@ int arm64_emit_word(Arm64Emit *e, uint32_t word) {
   return 1;
 }
 
+int arm64_emit_mov(Arm64Emit *e, int is64, Arm64Reg rd, Arm64Reg rn) {
+  if (rd == ARM64_SP || rn == ARM64_SP) {
+    return arm64_emit_word(e, arm64_mov_sp(rd, rn));
+  }
+  return arm64_emit_word(e, arm64_mov_reg(is64, rd, rn));
+}
+
 int arm64_new_label(Arm64Emit *e) {
   if (e->error) {
     return -1;
@@ -159,7 +166,7 @@ int arm64_emit_prologue(Arm64Emit *e, int frame_bytes, const Arm64Reg *saved,
   }
   int ok = arm64_emit_word(e, arm64_stp_pre(1, ARM64_X29, ARM64_X30, ARM64_SP,
                                             -16)) &&
-           arm64_emit_word(e, arm64_add_imm(1, ARM64_X29, ARM64_SP, 0, 0));
+           arm64_emit_word(e, arm64_mov_sp(ARM64_X29, ARM64_SP));
   if (ok && frame_bytes > 0) {
     ok = arm64_emit_word(e, arm64_sub_imm(1, ARM64_SP, ARM64_SP,
                                           (uint32_t)frame_bytes, 0));
@@ -181,8 +188,7 @@ int arm64_emit_epilogue(Arm64Emit *e, int frame_bytes, const Arm64Reg *saved,
     ok = arm64_emit_word(e, arm64_ldr_imm(1, saved[i], ARM64_SP, 8 * i));
   }
   /* Restore sp to the FP/LR save slot (mov sp, x29), pop {FP,LR}, return. */
-  ok = ok &&
-       arm64_emit_word(e, arm64_add_imm(1, ARM64_SP, ARM64_X29, 0, 0)) &&
+  ok = ok && arm64_emit_word(e, arm64_mov_sp(ARM64_SP, ARM64_X29)) &&
        arm64_emit_word(e, arm64_ldp_post(1, ARM64_X29, ARM64_X30, ARM64_SP,
                                          16)) &&
        arm64_emit_word(e, arm64_ret(ARM64_X30));

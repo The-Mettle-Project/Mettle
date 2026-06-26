@@ -31,7 +31,12 @@ typedef enum {
 Arm64Cond arm64_invert_cond(Arm64Cond c);
 
 uint32_t arm64_nop(void);
+/* Register-register move (ORR Xd, XZR, Xm). Reg 31 is XZR here, so this CANNOT
+ * move to/from SP -- use arm64_mov_sp (or arm64_emit_mov) when SP is involved. */
 uint32_t arm64_mov_reg(int is64, Arm64Reg rd, Arm64Reg rm);
+/* Move to/from SP (ADD rd, rn, #0). The only correct "mov" when either operand
+ * is SP, since reg 31 reads as SP in the add-immediate slot. Always 64-bit. */
+uint32_t arm64_mov_sp(Arm64Reg rd, Arm64Reg rn);
 uint32_t arm64_movz(int is64, Arm64Reg rd, uint16_t imm16, int hw);
 uint32_t arm64_movn(int is64, Arm64Reg rd, uint16_t imm16, int hw);
 uint32_t arm64_movk(int is64, Arm64Reg rd, uint16_t imm16, int hw);
