@@ -34,37 +34,56 @@ class Func:
         self.labels = {}         # label name -> position in insns
 
 
-def parse(path):
+def parse_lines(lines):
     funcs = {}
     cur = None
-    with open(path) as f:
-        for line in f:
-            line = line.rstrip("\n")
-            m = re.match(r"^function (\S+)", line)
-            if m:
-                cur = Func(m.group(1))
-                funcs[cur.name] = cur
-                continue
-            if cur is None:
-                continue
-            if line.strip() == "}":
-                cur = None
-                continue
-            m = re.match(r"^\s*(\d+):\s+(.*)$", line)
-            if not m:
-                continue
-            text = m.group(2).strip()
-            lm = re.match(r"^label (\S+)$", text)
-            if lm:
-                cur.labels[lm.group(1)] = len(cur.insns)
-            cur.insns.append((int(m.group(1)), text))
+    for line in lines:
+        line = line.rstrip("\n")
+        m = re.match(r"^function (\S+)", line)
+        if m:
+            cur = Func(m.group(1))
+            funcs[cur.name] = cur
+            continue
+        if cur is None:
+            continue
+        if line.strip() == "}":
+            cur = None
+            continue
+        m = re.match(r"^\s*(\d+):\s+(.*)$", line)
+        if not m:
+            continue
+        text = m.group(2).strip()
+        lm = re.match(r"^label (\S+)$", text)
+        if lm:
+            cur.labels[lm.group(1)] = len(cur.insns)
+        cur.insns.append((int(m.group(1)), text))
     return funcs
 
 
+def parse(path):
+    with open(path) as f:
+        return parse_lines(f)
+
+
+def run_text(text, entry="main", max_steps=5_000_000):
+    """In-process evaluation of a dump string. Returns the low byte of the
+    entry's result, or None. Avoids per-call process startup for bulk use.
+    A tight max_steps makes deletion probes that induce infinite loops fail
+    fast (return None) instead of burning the full step budget."""
+    try:
+        result = Machine(parse_lines(text.splitlines()),
+                         max_steps=max_steps).run(entry)
+    except Exception:
+        return None
+    return (result & 0xFF) if result is not None else None
+
+
 class Machine:
-    def __init__(self, funcs, trace=False):
+    def __init__(self, funcs, trace=False, max_steps=5_000_000):
         self.funcs = funcs
         self.trace = trace
+        self.max_steps = max_steps
+        self._steps = 0   # GLOBAL budget across recursive run() calls
 
     def param_symbols(self, fn):
         """Infer parameter @symbols: those read as operands before any local
@@ -108,11 +127,10 @@ class Machine:
 
         pc = 0
         insns = fn.insns
-        steps = 0
         while pc < len(insns):
-            steps += 1
-            if steps > 5_000_000:
-                raise RuntimeError("step limit (infinite loop?)")
+            self._steps += 1
+            if self._steps > self.max_steps:
+                raise RuntimeError("step limit (infinite loop / recursion?)")
             _, t = insns[pc]
 
             # local @x : T  (decl) / local @arr : T[n]

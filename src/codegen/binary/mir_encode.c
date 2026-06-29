@@ -1107,7 +1107,9 @@ static int mir_has_calls(const MirFunction *fn) {
   for (size_t i = 0; i < fn->insn_count; i++) {
     /* MIR_TRAP also emits calls (puts/exit), so it needs outgoing shadow space
      * reserved at the bottom of the frame just like a MIR_CALL. */
-    if (fn->insns[i].op == MIR_CALL || fn->insns[i].op == MIR_TRAP) {
+    if (fn->insns[i].op == MIR_CALL ||
+        fn->insns[i].op == MIR_CALL_INDIRECT ||
+        fn->insns[i].op == MIR_TRAP) {
       return 1;
     }
   }
@@ -1736,6 +1738,17 @@ int mir_encode(MirFunction *fn) {
       }
       break;
     }
+    case MIR_CALL_INDIRECT: {
+      /* Same frame contract as MIR_CALL: the prologue reserved shadow/stack
+       * argument space, and regalloc kept the target out of any argument
+       * register clobbered by the preceding marshalling moves. */
+      int rok;
+      BinaryGpRegister target = value_reg(fn, &in->a, SCRATCH_A, &rok);
+      if (!rok || !binary_emit_call_reg(&ctx->code, target)) {
+        ok = enc_err(fn, "out of memory emitting indirect call");
+      }
+      break;
+    }
     case MIR_SIMD_SLP_MAC: {
       /* Inline SLP MAC kernel. The preceding MIR_MOVs marshalled a/b/out element
        * pointers into RCX/RDX/R8, the k count into R9, and the byte row stride
@@ -1889,6 +1902,29 @@ int mir_encode(MirFunction *fn) {
       if (!code_generator_binary_emit_symbol_address(fn->generator, ctx, link,
                                                      in->is_unsigned, target)) {
         ok = enc_err(fn, "out of memory emitting global address");
+        break;
+      }
+      if (!dst_in_reg) {
+        ok = store_from(fn, &in->dst, SCRATCH_A);
+      }
+      break;
+    }
+    case MIR_LEA_FUNC: {
+      /* dst <- RIP-relative address of function symbol a.sym. This shares the
+       * same relocation path as global addresses; the linker resolves the code
+       * symbol and the function pointer receives that address. */
+      const char *name = in->a.sym ? in->a.sym : "";
+      const char *link = code_generator_get_link_symbol_name(fn->generator, name);
+      if (!link || link[0] == '\0') {
+        ok = enc_err(fn, "invalid function symbol in address-of");
+        break;
+      }
+      BinaryGpRegister D;
+      int dst_in_reg = dst_is_reg(fn, &in->dst, &D);
+      BinaryGpRegister target = dst_in_reg ? D : SCRATCH_A;
+      if (!code_generator_binary_emit_symbol_address(fn->generator, ctx, link,
+                                                     in->is_unsigned, target)) {
+        ok = enc_err(fn, "out of memory emitting function address");
         break;
       }
       if (!dst_in_reg) {

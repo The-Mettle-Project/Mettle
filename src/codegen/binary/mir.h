@@ -138,6 +138,9 @@ typedef enum {
   MIR_LEA_GLOBAL, /* dst(reg) <- address of global symbol a.sym (RIP-relative).
                      The global stays cached, but is flushed/reloaded around
                      pointer memory ops since the alias can read/write it. */
+  MIR_LEA_FUNC,   /* dst(reg) <- address of function symbol a.sym (RIP-relative).
+                     Used to initialize function-pointer values without falling
+                     back to the stack-home backend. */
   MIR_LEA_CSTR,   /* dst(reg) <- address of the string literal a.sym (RIP-relative
                      lea into a .rdata cstring). Carries no vreg source, so the
                      allocator ignores it. Used to pass a string-literal call
@@ -188,6 +191,7 @@ typedef enum {
 
   /* calls / return (Stage 3 for full ABI; declared now for completeness) */
   MIR_CALL,       /* call sym; clobbers volatiles */
+  MIR_CALL_INDIRECT, /* call a(reg); clobbers volatiles */
   MIR_STORE_OUTARG,/* store outgoing stack call argument a to [rsp + b.imm].
                       Used for the 5th+ GP argument (beyond the ABI's argument
                       registers); the prologue reserves the outgoing region. The
@@ -288,7 +292,7 @@ typedef struct {
 } MirInst;
 
 /* A pooled (loop-invariant) float constant: its IEEE bits at `width`, and the
- * vreg it is materialized into once at function entry, reused at every use. */
+ * vreg materialized once near the loop that first uses it. */
 typedef struct {
   uint64_t bits;
   int width;
@@ -296,9 +300,9 @@ typedef struct {
 } MirFConst;
 
 /* A pooled (loop-invariant) 64-bit integer constant: its raw value and the GP
- * vreg it is materialized into once at function entry (one movabs), reused at
- * every use. Used to hoist the div/mod magic-multiply constant out of a loop so
- * it is not re-materialized with a 10-byte movabs every iteration. */
+ * vreg materialized once near the loop that first uses it. Used to hoist the
+ * div/mod magic-multiply constant out of a loop so it is not re-materialized
+ * with a 10-byte movabs every iteration. */
 typedef struct {
   int64_t value;
   MirVregId vreg;
@@ -329,6 +333,13 @@ typedef struct {
   MirInst *insns;
   size_t insn_count;
   size_t insn_capacity;
+
+  /* Owned label-name strings synthesized by layout passes (e.g. cold-block
+   * sinking). The encoder strdups label names into its tables, so these only
+   * need to outlive mir_encode; freed in mir_function_destroy. */
+  char **owned_syms;
+  size_t owned_sym_count;
+  size_t owned_sym_capacity;
 
   /* Borrowed: the function context owning stack homes, ABI, fixup tables, and
    * the output code buffer; and the code generator (for type queries, fixup
@@ -370,13 +381,13 @@ typedef struct {
   } divmod_precomp[16];
   size_t divmod_precomp_count;
 
-  /* Loop-invariant float constants materialized once at entry (see mir_lower). */
+  /* Loop-invariant float constants materialized once near their first hot loop. */
   MirFConst *fconsts;
   size_t fconst_count;
   size_t fconst_capacity;
 
   /* Loop-invariant 64-bit integer constants (div/mod magic numbers) materialized
-   * once at entry, kept live across the loop instead of re-emitted per iter. */
+   * once near their first hot loop instead of re-emitted per iter. */
   MirIConst *iconsts;
   size_t iconst_count;
   size_t iconst_capacity;

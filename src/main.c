@@ -328,6 +328,38 @@ static char *infer_default_runtime_directory(const char *argv0) {
   return infer_default_sibling_directory(argv0, "runtime", NULL);
 }
 
+/* Point the ML optimizer at its bundled model/libraries (bin/mlopt by the exe, or
+ * tools/mlopt in a dev tree) via env vars; a user-set value always wins. */
+static void ml_opt_set_default_paths(const char *argv0) {
+  char *dir = infer_default_sibling_directory(argv0, "mlopt", "tools/mlopt");
+  if (!dir) {
+    return;
+  }
+  static const struct {
+    const char *env;
+    const char *file;
+  } resources[] = {
+      {"METTLE_ML_MODEL", "gnn_genius.bin"},
+      {"METTLE_ML_BWLIB", "bw_lib.txt"},
+      {"METTLE_ML_GF2LIB", "gf2_lib1.txt"},
+  };
+  for (size_t i = 0; i < sizeof(resources) / sizeof(resources[0]); i++) {
+    if (getenv(resources[i].env)) {
+      continue;
+    }
+    char *path = join_paths(dir, resources[i].file);
+    if (path) {
+      char *kv = malloc(strlen(resources[i].env) + strlen(path) + 2);
+      if (kv) {
+        sprintf(kv, "%s=%s", resources[i].env, path);
+        putenv(kv); /* putenv keeps the pointer; intentionally not freed */
+      }
+      free(path);
+    }
+  }
+  free(dir);
+}
+
 static char *infer_default_docs_directory(const char *argv0) {
   return infer_default_sibling_directory(argv0, "docs", NULL);
 }
@@ -2365,6 +2397,9 @@ int main(int argc, char *argv[]) {
       options.generate_stack_trace_support = 1;
     } else if (strcmp(argv[i], "--dump-ir") == 0) {
       options.dump_ir = 1;
+    } else if (strcmp(argv[i], "--ml-opt") == 0) {
+      options.ml_opt = 1;
+      options.optimize = 1;
     } else if (strcmp(argv[i], "--simd-report") == 0) {
       options.simd_report = 1;
     } else if (strcmp(argv[i], "--explain") == 0) {
@@ -2474,6 +2509,10 @@ int main(int argc, char *argv[]) {
   }
 
   auto_runtime_directory = infer_default_runtime_directory(argv[0]);
+
+  if (options.ml_opt) {
+    ml_opt_set_default_paths(argv[0]);
+  }
 
   /* The native ELF backend supports --build on Linux via an ld-based link of
    * the emitted ELF object plus a self-contained _start. On Linux --build
@@ -2669,6 +2708,9 @@ static int compile_lower_to_ir(ASTNode *program, TypeChecker *type_checker,
   return 1;
 }
 
+int ir_apply_ml_opt(IRProgram *program); /* src/ir/ml_opt.c */
+int ir_hoist_constants(IRProgram *program); /* src/ir/ml_opt.c */
+
 static int compile_optimize_ir(IRProgram *ir_program,
                                CompilerOptions *options) {
   IROptimizeOptions ir_optimize_options = {0};
@@ -2688,6 +2730,16 @@ static int compile_optimize_ir(IRProgram *ir_program,
       mettle_compiler_ice_report("IR optimization failed", NULL);
     }
     return 0;
+  }
+  if (options->ml_opt) {
+    int applied = ir_apply_ml_opt(ir_program);
+    int hoisted = ir_hoist_constants(ir_program);
+    fprintf(stderr, "--ml-opt: applied %d model dispositions, hoisted %d "
+            "large constants\n", applied, hoisted);
+    if (options->explain) {
+      /* ml_gnn wrote _mlopt.explain (TSV). Render it styled like the main report. */
+      ir_explain_ml_opt("_mlopt.explain");
+    }
   }
   return 1;
 }
@@ -3333,6 +3385,12 @@ void print_usage(const char *program_name) {
          "                      regressions first\n");
   printf("  --explain-json      Also write <output-stem>.explain.json (machine-\n"
          "                      readable report; implies --explain)\n");
+  printf("  --ml-opt            Run the learned ML IR optimizer after the classical\n"
+         "                      passes (experimental). A GNN flags redundancy/algebra\n"
+         "                      classical missed; sound transforms (GVN, affine,\n"
+         "                      collapse, bitwise/xor-shift superoptimizer) verify and\n"
+         "                      apply each. Enables -O. See docs/ml-opt.md; with\n"
+         "                      --explain it reports each model-driven rewrite.\n");
   printf("  -g, --debug-symbols Generate debug symbols\n");
   printf("  -l, --line-mapping  Generate source line mapping\n");
   printf("  -s, --stack-trace   Embed runtime crash traceback support\n");

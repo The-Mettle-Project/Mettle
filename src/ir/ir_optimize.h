@@ -50,6 +50,9 @@ void ir_explain_backend_flush(void);
 void ir_explain_set_output_path(const char *path);
 /* --explain-json: also write a machine-readable <output-stem>.explain.json. */
 void ir_explain_set_json(int enabled);
+/* Render the --ml-opt model-driven optimizations (from the TSV the native pass
+ * wrote) to stderr, styled like the main report. Called after the ML pass. */
+void ir_explain_ml_opt(const char *path);
 
 // When optimization is NOT run (no -O/--release), `@simd` markers are never
 // verified. This prints one note saying so (if any are present) and strips the

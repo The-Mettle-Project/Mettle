@@ -1,5 +1,6 @@
 #include "codegen/binary/mir.h"
 
+#include "common.h"
 #include "ir/ir_optimize.h"
 #include "semantic/symbol_table.h"
 
@@ -42,7 +43,8 @@ static int mir_name_is_global_scalar(CodeGenerator *g, const char *name) {
     return 0;
   }
   Symbol *s = symbol_table_lookup(g->symbol_table, name);
-  if (!s || !s->scope || s->scope->type != SCOPE_GLOBAL) {
+  if (!s || s->kind != SYMBOL_VARIABLE || !s->scope ||
+      s->scope->type != SCOPE_GLOBAL) {
     return 0;
   }
   return code_generator_binary_symbol_is_scalar_accessible(g, name);
@@ -626,6 +628,23 @@ static int mir_temp_is_float(CodeGenerator *g, IRFunction *function,
                    callee->data.function.return_type) != 0;
       }
     }
+    if (in->op == IR_OP_CALL_INDIRECT && g->symbol_table &&
+        in->lhs.kind == IR_OPERAND_SYMBOL && in->lhs.name) {
+      Type *ft = mir_local_or_param_type(g, function, in->lhs.name, NULL);
+      Symbol *callee = ft ? NULL : symbol_table_lookup(g->symbol_table,
+                                                       in->lhs.name);
+      if (ft && ft->kind != TYPE_FUNCTION_POINTER) {
+        ft = NULL;
+      }
+      if (!ft) {
+        ft = (callee && callee->type &&
+              callee->type->kind == TYPE_FUNCTION_POINTER)
+                 ? callee->type
+                 : NULL;
+      }
+      return code_generator_binary_resolved_type_float_bits(
+                 ft ? ft->fn_return_type : NULL) != 0;
+    }
     return 0;
   }
   return 0;
@@ -648,11 +667,136 @@ static int mir_call_is_runtime_trap(const IRInstruction *in) {
                       strcmp(in->text, "mettle_crash_trap") == 0);
 }
 
+static int mir_arg_float_bits(CodeGenerator *g, const IRFunction *ir_function,
+                              const IROperand *op);
+
+static Type *mir_indirect_call_type(CodeGenerator *g,
+                                    const IRFunction *ir_function,
+                                    const IRInstruction *in) {
+  if (!g || !in || in->lhs.kind != IR_OPERAND_SYMBOL || !in->lhs.name) {
+    return NULL;
+  }
+  Type *local = mir_local_or_param_type(g, ir_function, in->lhs.name, NULL);
+  if (local && local->kind == TYPE_FUNCTION_POINTER) {
+    return local;
+  }
+  Symbol *sym = g->symbol_table ? symbol_table_lookup(g->symbol_table,
+                                                      in->lhs.name)
+                                : NULL;
+  return (sym && sym->type && sym->type->kind == TYPE_FUNCTION_POINTER)
+             ? sym->type
+             : NULL;
+}
+
+static IRFunction *mir_find_ir_function_named(CodeGenerator *g,
+                                              const char *name) {
+  if (!g || !name || !name[0]) {
+    return NULL;
+  }
+  IRFunction *f = code_generator_find_ir_function_binary(g, name);
+  if (!f && name[0] == '@') {
+    f = code_generator_find_ir_function_binary(g, name + 1);
+  }
+  return f;
+}
+
+static int mir_call_indirect_is_supported(CodeGenerator *g,
+                                          const IRFunction *ir_function,
+                                          const IRInstruction *in) {
+  if (!in || in->lhs.kind != IR_OPERAND_SYMBOL || !in->lhs.name) {
+    mir_call_trace("indirect_no_symbol");
+    return 0;
+  }
+  if (in->argument_count > MIR_MAX_PARAMS) {
+    mir_call_trace("indirect_args>max");
+    return 0;
+  }
+  Type *ft = mir_indirect_call_type(g, ir_function, in);
+  if (!ft) {
+    mir_call_trace("indirect_no_type");
+    return 0;
+  }
+  if (in->argument_count != ft->fn_param_count) {
+    mir_call_trace("indirect_arity_mismatch");
+    return 0;
+  }
+  Type *ret = ft->fn_return_type;
+  if (!code_generator_binary_resolved_type_is_abi_supported(ret, 1)) {
+    mir_call_trace("indirect_ret_unsupported");
+    return 0;
+  }
+  if (ret && (code_generator_type_is_aggregate(ret) ||
+              code_generator_binary_type_is_string(ret))) {
+    mir_call_trace("indirect_ret_aggregate");
+    return 0;
+  }
+  if (in->dest.kind != IR_OPERAND_NONE && in->dest.kind != IR_OPERAND_TEMP &&
+      in->dest.kind != IR_OPERAND_SYMBOL) {
+    mir_call_trace("indirect_dest_kind");
+    return 0;
+  }
+
+  const BinaryAbi *call_abi = code_generator_binary_active_abi();
+  for (size_t a = 0; a < in->argument_count; a++) {
+    Type *pt = ft->fn_param_types ? ft->fn_param_types[a] : NULL;
+    const IROperand *arg = &in->arguments[a];
+    if (!pt) {
+      mir_call_trace("indirect_arg_no_type");
+      return 0;
+    }
+    if (!code_generator_binary_resolved_type_is_abi_supported(pt, 0)) {
+      mir_call_trace("indirect_arg_unsupported");
+      return 0;
+    }
+    if (code_generator_type_is_aggregate(pt) ||
+        code_generator_binary_type_is_string(pt) ||
+        code_generator_abi_classify(pt) == ABI_PASS_INDIRECT) {
+      mir_call_trace("indirect_arg_aggregate");
+      return 0;
+    }
+    if (code_generator_binary_resolved_type_float_bits(pt) != 0) {
+      if (mir_arg_float_bits(g, ir_function, arg) == 0) {
+        mir_call_trace("indirect_arg_float_nonfloat_src");
+        return 0;
+      }
+      if (call_abi->counts_classes_separately) {
+        size_t fbefore = 0;
+        for (size_t b = 0; b < a; b++) {
+          Type *bt = ft->fn_param_types ? ft->fn_param_types[b] : NULL;
+          if (bt && code_generator_binary_resolved_type_float_bits(bt) != 0) {
+            fbefore++;
+          }
+        }
+        if (fbefore >= (size_t)call_abi->float_param_count) {
+          mir_call_trace("indirect_arg_float_stack");
+          return 0;
+        }
+      } else if (a >= (size_t)call_abi->int_param_count) {
+        mir_call_trace("indirect_arg_float_stack");
+        return 0;
+      }
+      continue;
+    }
+    if (arg->kind != IR_OPERAND_TEMP && arg->kind != IR_OPERAND_SYMBOL &&
+        arg->kind != IR_OPERAND_INT && arg->kind != IR_OPERAND_STRING) {
+      mir_call_trace("indirect_arg_operand_kind");
+      return 0;
+    }
+    if (arg->kind == IR_OPERAND_STRING &&
+        !code_generator_binary_type_is_cstring(pt)) {
+      mir_call_trace("indirect_arg_string_non_cstring");
+      return 0;
+    }
+  }
+  return 1;
+}
+
 /* Classify an IR_OP_ADDRESS_OF target. */
 typedef enum {
   MIR_ADDROF_UNSUPPORTED = 0, /* function/string/other: deferred */
   MIR_ADDROF_LOCAL,           /* scalar/DIRECT-agg local or parameter (lea home) */
   MIR_ADDROF_GLOBAL,          /* scalar global (lea RIP-relative) */
+  MIR_ADDROF_FUNCTION,        /* function symbol (lea code address) */
   MIR_ADDROF_INDIRECT_PARAM   /* INDIRECT-aggregate param: &@p IS the by-ref
                                  pointer, so copy the param value (no home) */
 } MirAddrofKind;
@@ -663,8 +807,12 @@ static MirAddrofKind mir_addressof_kind(CodeGenerator *g,
   if (in->lhs.kind != IR_OPERAND_SYMBOL || !in->lhs.name) {
     return MIR_ADDROF_UNSUPPORTED;
   }
-  if (code_generator_find_ir_function_binary(g, in->lhs.name)) {
-    return MIR_ADDROF_UNSUPPORTED; /* function address */
+  Symbol *sym = g && g->symbol_table
+                    ? symbol_table_lookup(g->symbol_table, in->lhs.name)
+                    : NULL;
+  if ((sym && sym->kind == SYMBOL_FUNCTION) ||
+      mir_find_ir_function_named(g, in->lhs.name)) {
+    return MIR_ADDROF_FUNCTION;
   }
   /* Resolve the target as a local/parameter of this function from the IR (the
    * symbol table has popped function scope by codegen time, so a direct lookup
@@ -1006,6 +1154,9 @@ int mir_function_is_eligible(CodeGenerator *generator,
     /* An undefined SYMBOL read must be a global scalar. */
     const IROperand *reads[2] = {&in->lhs, &in->rhs};
     for (int k = 0; k < 2; k++) {
+      if (in->op == IR_OP_ADDRESS_OF && reads[k] == &in->lhs) {
+        continue; /* &symbol names an address target, not a by-value read. */
+      }
       if (reads[k]->kind == IR_OPERAND_SYMBOL && reads[k]->name) {
         int found = 0;
         for (size_t j = 0; j < defined.count; j++) {
@@ -1276,6 +1427,11 @@ int mir_function_is_eligible(CodeGenerator *generator,
         return mir_trace_bail(function_data, "call_unsupported");
       }
       break;
+    case IR_OP_CALL_INDIRECT:
+      if (!mir_call_indirect_is_supported(generator, ir_function, in)) {
+        return mir_trace_bail(function_data, "call_indirect_unsupported");
+      }
+      break;
     case IR_OP_ADDRESS_OF:
       /* &local/&param (made memory-resident via forced spill) or &global (kept
        * cached but coherent via flush/reload around pointer memory ops).
@@ -1439,7 +1595,7 @@ int mir_function_is_eligible(CodeGenerator *generator,
       break;
     }
     default: {
-      /* UNARY, NEW, CALL_INDIRECT, other SIMD ops, ROTATE_ADD: not yet. */
+      /* NEW, other SIMD ops, ROTATE_ADD: not yet. */
       char buf[40];
       snprintf(buf, sizeof(buf), "op:%d", (int)in->op);
       return mir_trace_bail(function_data, buf);
@@ -1542,9 +1698,9 @@ static MirVregId mir_iconst_lookup(MirFunction *fn, int64_t value) {
   return MIR_VREG_NONE;
 }
 
-/* Add `value` to the integer-constant pool and materialize it once (at the
- * current end of the instruction stream — called before the body is lowered, so
- * it lands at function entry via a single movabs). No-op if already pooled. */
+/* Add `value` to the integer-constant pool and emit its initial materialization.
+ * A later MIR layout pass moves the movabs to a hot-loop preheader. No-op if
+ * already pooled. */
 static int mir_iconst_add(MirFunction *fn, int64_t value) {
   if (mir_iconst_lookup(fn, value) != MIR_VREG_NONE) {
     return 1;
@@ -1653,11 +1809,13 @@ static int mir_emit_const_divmod(MirFunction *fn, MirOperand dst, MirOperand a,
     k++;
   }
 
-  MirVregId qv = mir_new_vreg(fn, MIR_RC_GP, 8);
+  int q_in_dst = !mod && dst.kind == MIR_OPK_VREG &&
+                 !(A.kind == MIR_OPK_VREG && A.vreg == dst.vreg);
+  MirVregId qv = q_in_dst ? dst.vreg : mir_new_vreg(fn, MIR_RC_GP, 8);
   if (qv == MIR_VREG_NONE) {
     return 0;
   }
-  MirOperand Q = mir_op_vreg(qv);
+  MirOperand Q = q_in_dst ? dst : mir_op_vreg(qv);
 
   if (is_pow2) {
     if (uns) {
@@ -1738,7 +1896,8 @@ static int mir_emit_const_divmod(MirFunction *fn, MirOperand dst, MirOperand a,
   }
 
   if (!mod) {
-    return mir_emit1(fn, MIR_MOV, dst, Q, mir_op_none(), 8, 0, 0);
+    return q_in_dst ? 1
+                    : mir_emit1(fn, MIR_MOV, dst, Q, mir_op_none(), 8, 0, 0);
   }
   /* remainder = a - q * C */
   MirVregId mv = mir_new_vreg(fn, MIR_RC_GP, 8);
@@ -1825,18 +1984,6 @@ static int mir_emit_global_writebacks(MirFunction *fn, CodeGenerator *g,
   return mir_emit_global_flush_names(fn, g, map, wb->names, wb->count);
 }
 
-/* Reload every cached global from memory into its cache vreg. Emitted after a
- * MIR_CALL: the callee may have written any global, so the cached registers are
- * stale. (The written set was flushed before the call, so memory was current.) */
-static int mir_emit_global_reloads(MirFunction *fn, CodeGenerator *g,
-                                   MirNameMap *map,
-                                   const MirGlobalWriteback *wb) {
-  if (!wb) {
-    return 1;
-  }
-  return mir_emit_global_reload_names(fn, g, map, wb->all, wb->all_count);
-}
-
 /* Reload every cached global EXCEPT `except` (borrowed name). Used after a call
  * whose result is assigned straight to a global (`@g = f()`, which the optimizer
  * fuses into one CALL with dest=@g): the call lowering has already captured the
@@ -1859,6 +2006,102 @@ static int mir_emit_global_reloads_except(MirFunction *fn, CodeGenerator *g,
     }
   }
   return 1;
+}
+
+static int mir_instruction_writes_symbol(const IRInstruction *in,
+                                         const char *name) {
+  if (!in || in->op == IR_OP_DECLARE_LOCAL || in->op == IR_OP_NOP) {
+    return 0;
+  }
+  return name && in->dest.kind == IR_OPERAND_SYMBOL && in->dest.name &&
+         strcmp(in->dest.name, name) == 0;
+}
+
+static int mir_address_of_function_target(CodeGenerator *g,
+                                          const IROperand *op) {
+  if (!g || !op || op->kind != IR_OPERAND_SYMBOL || !op->name) {
+    return 0;
+  }
+  Symbol *s = g->symbol_table ? symbol_table_lookup(g->symbol_table, op->name)
+                              : NULL;
+  return (s && s->kind == SYMBOL_FUNCTION) ||
+         mir_find_ir_function_named(g, op->name) != NULL;
+}
+
+static const char *mir_known_function_pointer_target(CodeGenerator *g,
+                                                     const IRFunction *irf,
+                                                     size_t before,
+                                                     const char *name) {
+  if (!g || !irf || !name) {
+    return NULL;
+  }
+  int is_param = 0;
+  Type *ft = mir_local_or_param_type(g, irf, name, &is_param);
+  if (!ft || is_param || ft->kind != TYPE_FUNCTION_POINTER) {
+    return NULL;
+  }
+
+  const char *target = NULL;
+  int writes = 0;
+  for (size_t i = 0; i < before && i < irf->instruction_count; i++) {
+    const IRInstruction *in = &irf->instructions[i];
+    if (!mir_instruction_writes_symbol(in, name)) {
+      continue;
+    }
+    writes++;
+    if (writes > 1 || in->op != IR_OP_ADDRESS_OF ||
+        !mir_address_of_function_target(g, &in->lhs)) {
+      return NULL;
+    }
+    target = in->lhs.name;
+  }
+  return writes == 1 ? target : NULL;
+}
+
+static int mir_ir_function_may_write_global(CodeGenerator *g,
+                                            const IRFunction *irf) {
+  if (!g || !irf) {
+    return 1;
+  }
+  for (size_t i = 0; i < irf->instruction_count; i++) {
+    const IRInstruction *in = &irf->instructions[i];
+    switch (in->op) {
+    case IR_OP_CALL:
+    case IR_OP_CALL_INDIRECT:
+    case IR_OP_INLINE_ASM:
+    case IR_OP_NEW:
+    case IR_OP_STORE:
+      return 1;
+    default:
+      break;
+    }
+    if (in->dest.kind == IR_OPERAND_SYMBOL && in->dest.name &&
+        !mir_local_or_param_type(g, irf, in->dest.name, NULL) &&
+        mir_name_is_global_scalar(g, in->dest.name)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int mir_call_may_write_globals(CodeGenerator *g, const IRFunction *irf,
+                                      size_t index,
+                                      const IRInstruction *in) {
+  if (!g || !irf || !in) {
+    return 1;
+  }
+  const char *target = NULL;
+  if (in->op == IR_OP_CALL) {
+    target = in->text;
+  } else if (in->op == IR_OP_CALL_INDIRECT &&
+             in->lhs.kind == IR_OPERAND_SYMBOL && in->lhs.name) {
+    target = mir_known_function_pointer_target(g, irf, index, in->lhs.name);
+  }
+  if (!target || !target[0]) {
+    return 1;
+  }
+  IRFunction *target_ir = mir_find_ir_function_named(g, target);
+  return !target_ir || mir_ir_function_may_write_global(g, target_ir);
 }
 
 /* Emit a fixed-size byte copy of `size` bytes from [src_base] to [dst_base],
@@ -1927,9 +2170,10 @@ static MirVregId mir_pool_lookup(MirFunction *fn, uint64_t bits, int width) {
   return MIR_VREG_NONE;
 }
 
-/* Add (bits,width) to the float-constant pool and materialize it once (at the
- * current end of the instruction stream — called before the body is lowered, so
- * it lands at function entry). No-op if already pooled. */
+/* Add (bits,width) to the float-constant pool and emit its initial
+ * materialization.
+ * A later MIR layout pass moves it to a hot-loop preheader. No-op if already
+ * pooled. */
 static int mir_pool_add(MirFunction *fn, uint64_t bits, int width) {
   if (mir_pool_lookup(fn, bits, width) != MIR_VREG_NONE) {
     return 1;
@@ -2032,10 +2276,10 @@ static size_t mir_ir_label_index(IRFunction *function, const char *name) {
 
 /* Build the constant pools: every distinct float literal used INSIDE a loop (a
  * backward jump/branch range), plus the 64-bit magic-multiply constant of every
- * in-loop `x / C` / `x % C` with a constant divisor, is hoisted to a vreg
- * materialized once at entry. Constants outside loops are left inline (no
- * register-pressure benefit). Must run before the body is lowered so the
- * materializations land first. */
+ * in-loop `x / C` / `x % C` with a constant divisor, is hoisted to a vreg.
+ * Constants outside loops are left inline (no register-pressure benefit). Must
+ * run before the body is lowered so uses can resolve to pooled vregs; the
+ * materializations are relocated after MIR layout. */
 static int mir_build_const_pool(MirFunction *fn, CodeGenerator *g,
                                 BinaryFunctionContext *ctx,
                                 IRFunction *function) {
@@ -2072,7 +2316,7 @@ static int mir_build_const_pool(MirFunction *fn, CodeGenerator *g,
     const IRInstruction *in = &function->instructions[j];
     /* Pool the div/mod magic-multiply constant for `x / C` / `x % C` (a
      * compile-time-constant divisor) so the 64-bit magic is materialized once at
-     * entry instead of with a 10-byte movabs every loop iteration. */
+     * preheader instead of with a 10-byte movabs every loop iteration. */
     if (in->op == IR_OP_BINARY && !in->is_float && in->text &&
         (in->text[0] == '/' || in->text[0] == '%') && in->text[1] == '\0' &&
         in->rhs.kind == IR_OPERAND_INT) {
@@ -3032,6 +3276,145 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
     return 1;
   }
 
+  case IR_OP_CALL_INDIRECT: {
+    const IRFunction *irf =
+        ctx && ctx->function_name
+            ? code_generator_find_ir_function_binary(g, ctx->function_name)
+            : NULL;
+    Type *ft = mir_indirect_call_type(g, irf, in);
+    if (!ft) {
+      fn->has_error = 1;
+      return 0;
+    }
+    const BinaryAbi *abi = code_generator_binary_active_abi();
+    int arg_is_float[MIR_MAX_PARAMS] = {0};
+    BinaryArgLocation locs[MIR_MAX_PARAMS];
+    int stack_bytes = 0;
+    for (size_t a = 0; a < in->argument_count; a++) {
+      Type *pt = ft->fn_param_types ? ft->fn_param_types[a] : NULL;
+      arg_is_float[a] =
+          code_generator_binary_resolved_type_float_bits(pt) != 0;
+    }
+    if (in->argument_count > 0 &&
+        !code_generator_binary_compute_arg_layout(abi, arg_is_float,
+                                                  in->argument_count, locs,
+                                                  &stack_bytes)) {
+      fn->has_error = 1;
+      return 0;
+    }
+    if (stack_bytes > fn->outgoing_stack_bytes) {
+      fn->outgoing_stack_bytes = stack_bytes;
+    }
+
+    MirOperand callee = mir_value_operand(fn, g, ctx, map, &in->lhs);
+
+    for (size_t a = 0; a < in->argument_count; a++) {
+      if (locs[a].kind != BINARY_ARG_ON_STACK) {
+        continue;
+      }
+      int slot = abi->shadow_space_size + locs[a].stack_offset;
+      MirOperand val;
+      if (in->arguments[a].kind == IR_OPERAND_STRING) {
+        const char *s = in->arguments[a].name ? in->arguments[a].name : "";
+        MirVregId t = mir_new_vreg(fn, MIR_RC_GP, 8);
+        if (t == MIR_VREG_NONE ||
+            !mir_emit1(fn, MIR_LEA_CSTR, mir_op_vreg(t), mir_op_symbol(s),
+                       mir_op_none(), 8, 0, 0)) {
+          return 0;
+        }
+        val = mir_op_vreg(t);
+      } else {
+        val = mir_value_operand(fn, g, ctx, map, &in->arguments[a]);
+      }
+      if (!mir_emit1(fn, MIR_STORE_OUTARG, mir_op_none(), val,
+                     mir_op_imm(slot), 8, 0, 0)) {
+        return 0;
+      }
+    }
+
+    for (size_t a = 0; a < in->argument_count; a++) {
+      if (locs[a].kind != BINARY_ARG_IN_GP_REGISTER) {
+        continue;
+      }
+      BinaryGpRegister reg = locs[a].gp_register;
+      if (in->arguments[a].kind == IR_OPERAND_STRING) {
+        const char *s = in->arguments[a].name ? in->arguments[a].name : "";
+        if (!mir_emit1(fn, MIR_LEA_CSTR, mir_op_phys(reg, MIR_RC_GP),
+                       mir_op_symbol(s), mir_op_none(), 8, 0, 0)) {
+          return 0;
+        }
+        continue;
+      }
+      MirOperand arg = mir_value_operand(fn, g, ctx, map, &in->arguments[a]);
+      if (!mir_emit1(fn, MIR_MOV, mir_op_phys(reg, MIR_RC_GP), arg,
+                     mir_op_none(), 8, 0, 0)) {
+        return 0;
+      }
+    }
+
+    for (size_t a = 0; a < in->argument_count; a++) {
+      if (locs[a].kind != BINARY_ARG_IN_XMM_REGISTER) {
+        continue;
+      }
+      fn->has_xmm_arg_call = 1;
+      BinaryXmmRegister xreg = locs[a].xmm_register;
+      Type *pt = ft->fn_param_types ? ft->fn_param_types[a] : NULL;
+      int pfb = code_generator_binary_resolved_type_float_bits(pt);
+      if (pfb != 32 && pfb != 64) {
+        pfb = 64;
+      }
+      const IROperand *arg_op = &in->arguments[a];
+      int sfb;
+      if (arg_op->kind == IR_OPERAND_FLOAT) {
+        sfb = arg_op->float_bits == 32 ? 32 : 64;
+      } else {
+        sfb = code_generator_binary_operand_float_bits(g, ctx, arg_op);
+        if (sfb != 32 && sfb != 64) {
+          sfb = pfb;
+        }
+      }
+      MirOperand val = mir_value_operand(fn, g, ctx, map, arg_op);
+      if (val.kind == MIR_OPK_FIMM) {
+        MirVregId t = mir_new_vreg(fn, MIR_RC_XMM, sfb / 8);
+        if (t == MIR_VREG_NONE ||
+            !mir_emit_fmov(fn, mir_op_vreg(t), val, sfb / 8)) {
+          return 0;
+        }
+        val = mir_op_vreg(t);
+      }
+      if (sfb != pfb) {
+        MirVregId t2 = mir_new_vreg(fn, MIR_RC_XMM, pfb / 8);
+        if (t2 == MIR_VREG_NONE ||
+            !mir_emit1(fn, MIR_CVTF2F, mir_op_vreg(t2), val, mir_op_none(),
+                       pfb / 8, 0, 0)) {
+          return 0;
+        }
+        val = mir_op_vreg(t2);
+      }
+      if (!mir_emit_fmov(fn, mir_op_phys(xreg, MIR_RC_XMM), val, pfb / 8)) {
+        return 0;
+      }
+    }
+
+    if (!mir_emit1(fn, MIR_CALL_INDIRECT, mir_op_none(),
+                   callee, mir_op_none(), 8, 0, 0)) {
+      return 0;
+    }
+
+    if (in->dest.kind == IR_OPERAND_TEMP || in->dest.kind == IR_OPERAND_SYMBOL) {
+      int rfb = code_generator_binary_resolved_type_float_bits(ft->fn_return_type);
+      MirOperand dst = mir_value_operand(fn, g, ctx, map, &in->dest);
+      if (rfb) {
+        return mir_emit_fmov(fn, dst, mir_op_phys(BINARY_XMM0, MIR_RC_XMM),
+                             rfb / 8);
+      }
+      return mir_emit1(fn, MIR_MOV, dst,
+                       mir_op_phys(BINARY_GP_RAX, MIR_RC_GP), mir_op_none(), 8,
+                       0, 0);
+    }
+    return 1;
+  }
+
   case IR_OP_SIMD_SLP_MAC_I8:
   case IR_OP_SIMD_SLP_MAC_I32: {
     /* Inline SLP MAC kernel. Marshal the three effective element pointers
@@ -3286,6 +3669,14 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
       return mir_emit1(fn, MIR_LEA_GLOBAL, dst, mir_op_symbol(in->lhs.name),
                        mir_op_none(), 8, is_extern, 0);
     }
+    if (ak == MIR_ADDROF_FUNCTION) {
+      Symbol *s = g->symbol_table
+                      ? symbol_table_lookup(g->symbol_table, in->lhs.name)
+                      : NULL;
+      int is_extern = (s && s->is_extern) ? 1 : 0;
+      return mir_emit1(fn, MIR_LEA_FUNC, dst, mir_op_symbol(in->lhs.name),
+                       mir_op_none(), 8, is_extern, 0);
+    }
     /* &local / &param: mark the target memory-resident and lea its stack home. */
     MirOperand src = mir_value_operand(fn, g, ctx, map, &in->lhs);
     if (src.kind != MIR_OPK_VREG) {
@@ -3524,6 +3915,39 @@ static void mir_compute_address_folds(const IRFunction *f, char *skip,
         skip[ai] = 1; /* fold the base+index add into the memory operand */
       }
     }
+
+    /* Constant-displacement fallback: `ptr + const_int` -- a struct-field or
+     * fixed-offset access (`p->field`, `b[i].field`, `*(ptr + k)`) -- folds the
+     * constant straight into the x86 displacement: [base + disp]. The constant
+     * is exactly the displacement (the access size is unchanged, so there is no
+     * width or aliasing concern). Unlike the scaled/scale-1 paths this consumes
+     * no separate producer -- only the add is dropped -- and the base pointer
+     * temp stays live, since it is typically shared across several field
+     * accesses on the same element (folding base+index*scale here instead would
+     * re-derive it per field). mir_lower_folded_access turns an IR_OPERAND_INT
+     * index into the displacement. */
+    if (!folds[i].valid) {
+      const IROperand *o0 = &padd->lhs;
+      const IROperand *o1 = &padd->rhs;
+      const IROperand *base = NULL;
+      const IROperand *cst = NULL;
+      if (o0->kind == IR_OPERAND_TEMP && o0->name && o1->kind == IR_OPERAND_INT) {
+        base = o0;
+        cst = o1;
+      } else if (o1->kind == IR_OPERAND_TEMP && o1->name &&
+                 o0->kind == IR_OPERAND_INT) {
+        base = o1;
+        cst = o0;
+      }
+      if (base && cst->int_value >= -2147483648LL &&
+          cst->int_value <= 2147483647LL) {
+        folds[i].valid = 1;
+        folds[i].base = *base;
+        folds[i].index = *cst;
+        folds[i].scale = 1;
+        skip[ai] = 1; /* fold the ptr+const add into the memory displacement */
+      }
+    }
   }
 }
 
@@ -3679,6 +4103,380 @@ static void mir_rotate_loops(MirFunction *fn) {
     fn->insns[j] = fn->insns[j + 1];
     fn->insns[j + 1] = tmp;
   }
+}
+
+/* MIR index of the LABEL defining `name`, or (size_t)-1. */
+static size_t mir_label_index(const MirFunction *fn, const char *name) {
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    const MirInst *in = &fn->insns[i];
+    if (in->op == MIR_LABEL && in->dst.kind == MIR_OPK_LABEL && in->dst.sym &&
+        strcmp(in->dst.sym, name) == 0) {
+      return i;
+    }
+  }
+  return (size_t)-1;
+}
+
+/* True if MIR index p sits inside a loop body: some JMP/CMPBR back-edge after p
+ * targets a label defined at or before p (it spans p). */
+static int mir_index_in_loop(const MirFunction *fn, size_t p) {
+  for (size_t k = p + 1; k < fn->insn_count; k++) {
+    const MirInst *in = &fn->insns[k];
+    if ((in->op == MIR_JMP || in->op == MIR_CMPBR) &&
+        in->dst.kind == MIR_OPK_LABEL && in->dst.sym) {
+      size_t t = mir_label_index(fn, in->dst.sym);
+      if (t != (size_t)-1 && t <= p) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+static int mir_operand_uses_vreg(const MirOperand *op, MirVregId v) {
+  if (!op || v == MIR_VREG_NONE) {
+    return 0;
+  }
+  if (op->kind == MIR_OPK_VREG) {
+    return op->vreg == v;
+  }
+  if (op->kind == MIR_OPK_MEM) {
+    return op->mem.base == v || op->mem.index == v;
+  }
+  return 0;
+}
+
+static int mir_inst_uses_vreg(const MirInst *in, MirVregId v) {
+  if (!in) {
+    return 0;
+  }
+  if (mir_operand_uses_vreg(&in->a, v) ||
+      mir_operand_uses_vreg(&in->b, v)) {
+    return 1;
+  }
+  return in->dst.kind == MIR_OPK_MEM && mir_operand_uses_vreg(&in->dst, v);
+}
+
+static size_t mir_first_use_index(const MirFunction *fn, MirVregId v,
+                                  size_t def) {
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    if (i == def) {
+      continue;
+    }
+    if (mir_inst_uses_vreg(&fn->insns[i], v)) {
+      return i;
+    }
+  }
+  return (size_t)-1;
+}
+
+static size_t mir_const_def_index(const MirFunction *fn, MirVregId v,
+                                  int is_float) {
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    const MirInst *in = &fn->insns[i];
+    if (in->op != MIR_MOV || in->is_float != is_float ||
+        in->dst.kind != MIR_OPK_VREG || in->dst.vreg != v) {
+      continue;
+    }
+    if (is_float) {
+      if (in->a.kind == MIR_OPK_FIMM) {
+        return i;
+      }
+    } else if (in->a.kind == MIR_OPK_IMM) {
+      return i;
+    }
+  }
+  return (size_t)-1;
+}
+
+static int mir_label_has_forward_target(const MirFunction *fn, const char *name,
+                                        size_t label_index) {
+  if (!name) {
+    return 0;
+  }
+  for (size_t i = 0; i < label_index; i++) {
+    const MirInst *in = &fn->insns[i];
+    if ((in->op == MIR_JMP || in->op == MIR_JCC || in->op == MIR_CMPBR ||
+         in->op == MIR_FCMPBR) &&
+        in->dst.kind == MIR_OPK_LABEL && in->dst.sym &&
+        strcmp(in->dst.sym, name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static size_t mir_const_insert_index(const MirFunction *fn, size_t first_use) {
+  size_t insert = first_use;
+  for (size_t b = 0; b < fn->insn_count; b++) {
+    const MirInst *br = &fn->insns[b];
+    if ((br->op != MIR_JMP && br->op != MIR_JCC && br->op != MIR_CMPBR &&
+         br->op != MIR_FCMPBR) ||
+        br->dst.kind != MIR_OPK_LABEL || !br->dst.sym) {
+      continue;
+    }
+    size_t l = mir_label_index(fn, br->dst.sym);
+    if (l == (size_t)-1 || l >= b || first_use < l || first_use > b) {
+      continue;
+    }
+    if (mir_label_has_forward_target(fn, br->dst.sym, l)) {
+      continue;
+    }
+    if (insert == first_use || l > insert) {
+      insert = l;
+    }
+  }
+  return insert;
+}
+
+/* Loop-pooled constants are discovered before lowering, so their original MOVs
+ * land near function entry. Relocate those materializations to the nearest safe
+ * preheader of the loop that first uses them: back-edges jump to the label, so
+ * an instruction before that label runs once on loop entry and not per
+ * iteration. This keeps magic div/mod constants and pooled float literals out of
+ * unrelated setup calls and gives the allocator much shorter live ranges. */
+static void mir_place_const_pool(MirFunction *fn) {
+  if (!fn || (!fn->fconst_count && !fn->iconst_count) || fn->insn_count == 0) {
+    return;
+  }
+  typedef struct {
+    size_t def;
+    size_t insert;
+    MirInst inst;
+  } ConstMove;
+  size_t max_moves = fn->fconst_count + fn->iconst_count;
+  ConstMove *moves = (ConstMove *)calloc(max_moves, sizeof(ConstMove));
+  char *skip = (char *)calloc(fn->insn_count, 1);
+  if (!moves || !skip) {
+    free(moves);
+    free(skip);
+    return;
+  }
+  size_t nmove = 0;
+
+  for (size_t i = 0; i < fn->iconst_count; i++) {
+    MirVregId v = fn->iconsts[i].vreg;
+    size_t def = mir_const_def_index(fn, v, 0);
+    if (def == (size_t)-1) {
+      continue;
+    }
+    size_t first = mir_first_use_index(fn, v, def);
+    if (first == (size_t)-1) {
+      continue;
+    }
+    size_t insert = mir_const_insert_index(fn, first);
+    if (insert <= def + 1) {
+      continue;
+    }
+    moves[nmove].def = def;
+    moves[nmove].insert = insert;
+    moves[nmove].inst = fn->insns[def];
+    skip[def] = 1;
+    nmove++;
+  }
+  for (size_t i = 0; i < fn->fconst_count; i++) {
+    MirVregId v = fn->fconsts[i].vreg;
+    size_t def = mir_const_def_index(fn, v, 1);
+    if (def == (size_t)-1) {
+      continue;
+    }
+    size_t first = mir_first_use_index(fn, v, def);
+    if (first == (size_t)-1) {
+      continue;
+    }
+    size_t insert = mir_const_insert_index(fn, first);
+    if (insert <= def + 1) {
+      continue;
+    }
+    moves[nmove].def = def;
+    moves[nmove].insert = insert;
+    moves[nmove].inst = fn->insns[def];
+    skip[def] = 1;
+    nmove++;
+  }
+
+  if (nmove == 0) {
+    free(moves);
+    free(skip);
+    return;
+  }
+
+  MirInst *out = (MirInst *)malloc(fn->insn_count * sizeof(MirInst));
+  if (!out) {
+    free(moves);
+    free(skip);
+    return;
+  }
+  size_t w = 0;
+  for (size_t i = 0; i <= fn->insn_count; i++) {
+    for (size_t m = 0; m < nmove; m++) {
+      if (moves[m].insert == i) {
+        out[w++] = moves[m].inst;
+      }
+    }
+    if (i == fn->insn_count) {
+      break;
+    }
+    if (!skip[i]) {
+      out[w++] = fn->insns[i];
+    }
+  }
+  free(fn->insns);
+  fn->insns = out;
+  fn->insn_count = w;
+  fn->insn_capacity = fn->insn_count;
+  free(moves);
+  free(skip);
+}
+
+/* Cold-exit sinking. An in-loop early-return guard lowers to a forward CMPBR
+ * that skips a short straight-line block ending in RET; the loop continuation
+ * is the branch TARGET, so the hot path pays a taken forward branch every
+ * iteration (on top of the back-edge -- two taken branches/iter). Invert the
+ * branch to jump to the return block, sink that block to the function tail, and
+ * fall through to the continuation. The back-edge is then the loop's only taken
+ * branch (matching what gcc/clang do for search/validation loops). The move is
+ * pure relabel + relocate of a straight-line exit block, so it is value- and
+ * control-equivalent regardless of the branch's real probability; the loop gate
+ * only restricts WHERE it pays off. */
+static void mir_sink_cold_exits(MirFunction *fn) {
+  if (!fn || fn->insn_count < 4) {
+    return;
+  }
+  /* An appended tail block must be unreachable by fall-through, so the function
+   * must already end in a terminator. */
+  MirOpcode last = fn->insns[fn->insn_count - 1].op;
+  if (last != MIR_RET && last != MIR_JMP && last != MIR_TRAP) {
+    return;
+  }
+
+  typedef struct {
+    size_t p;      /* the CMPBR to invert */
+    size_t lo, hi; /* sunk region [lo, hi) -- ends in RET */
+    char *label;   /* fresh target name (owned by fn) */
+  } Sink;
+  Sink *sinks = NULL;
+  size_t nsink = 0, cap = 0;
+  char *moved = (char *)calloc(fn->insn_count, 1);
+  if (!moved) {
+    return;
+  }
+
+  for (size_t p = 0; p + 1 < fn->insn_count; p++) {
+    const MirInst *br = &fn->insns[p];
+    if (br->op != MIR_CMPBR || br->dst.kind != MIR_OPK_LABEL || !br->dst.sym) {
+      continue;
+    }
+    size_t q = mir_label_index(fn, br->dst.sym);
+    if (q == (size_t)-1 || q < p + 2) {
+      continue; /* backward branch, or empty fall-through region */
+    }
+    if (q - 1 - p > 16) {
+      continue; /* keep this to short early-exit blocks */
+    }
+    int ok = 1;
+    for (size_t r = p + 1; r < q; r++) {
+      MirOpcode op = fn->insns[r].op;
+      if (op == MIR_LABEL || op == MIR_JMP || op == MIR_JCC ||
+          op == MIR_CMPBR || op == MIR_FCMPBR) {
+        ok = 0;
+        break;
+      }
+      if (op == MIR_RET && r != q - 1) {
+        ok = 0;
+        break;
+      }
+    }
+    if (!ok || fn->insns[q - 1].op != MIR_RET) {
+      continue;
+    }
+    if (!mir_index_in_loop(fn, p)) {
+      continue;
+    }
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), ".mcsink_%zu", nsink);
+    char *name = mettle_strdup(buf);
+    if (!name) {
+      continue;
+    }
+    if (fn->owned_sym_count >= fn->owned_sym_capacity) {
+      size_t nc = fn->owned_sym_capacity ? fn->owned_sym_capacity * 2 : 4;
+      char **grown = (char **)realloc(fn->owned_syms, nc * sizeof(char *));
+      if (!grown) {
+        free(name);
+        continue;
+      }
+      fn->owned_syms = grown;
+      fn->owned_sym_capacity = nc;
+    }
+    fn->owned_syms[fn->owned_sym_count++] = name;
+
+    if (nsink >= cap) {
+      size_t nc = cap ? cap * 2 : 4;
+      Sink *grown = (Sink *)realloc(sinks, nc * sizeof(Sink));
+      if (!grown) {
+        break;
+      }
+      sinks = grown;
+      cap = nc;
+    }
+    sinks[nsink].p = p;
+    sinks[nsink].lo = p + 1;
+    sinks[nsink].hi = q;
+    sinks[nsink].label = name;
+    nsink++;
+    for (size_t r = p + 1; r < q; r++) {
+      moved[r] = 1;
+    }
+  }
+
+  if (nsink == 0) {
+    free(moved);
+    free(sinks);
+    return;
+  }
+
+  size_t total = fn->insn_count + nsink; /* one new label per sunk block */
+  MirInst *out = (MirInst *)malloc(total * sizeof(MirInst));
+  if (!out) {
+    free(moved);
+    free(sinks);
+    return;
+  }
+  size_t w = 0;
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    if (moved[i]) {
+      continue;
+    }
+    out[w] = fn->insns[i];
+    for (size_t s = 0; s < nsink; s++) {
+      if (sinks[s].p == i) {
+        out[w].cc = (unsigned char)(out[w].cc ^ 1u);
+        out[w].dst = mir_op_label(sinks[s].label);
+        break;
+      }
+    }
+    w++;
+  }
+  for (size_t s = 0; s < nsink; s++) {
+    MirInst lbl;
+    memset(&lbl, 0, sizeof(lbl));
+    lbl.op = MIR_LABEL;
+    lbl.dst = mir_op_label(sinks[s].label);
+    lbl.ir_index = -1;
+    out[w++] = lbl;
+    for (size_t r = sinks[s].lo; r < sinks[s].hi; r++) {
+      out[w++] = fn->insns[r];
+    }
+  }
+
+  free(fn->insns);
+  fn->insns = out;
+  fn->insn_count = w;
+  fn->insn_capacity = total;
+  free(moved);
+  free(sinks);
 }
 
 /* ---- emit entry --------------------------------------------------------- */
@@ -3839,6 +4637,9 @@ int code_generator_binary_emit_function_via_mir(
       } else {
         break;
       }
+      if (in->op == IR_OP_ADDRESS_OF && op == &in->lhs) {
+        continue; /* ADDRESS_OF lowers through MIR_LEA_*; no value preload. */
+      }
       if (op->kind != IR_OPERAND_SYMBOL || !op->name ||
           mir_name_map_has(&map, op->name) ||
           !mir_name_is_global_scalar(generator, op->name)) {
@@ -3909,8 +4710,8 @@ int code_generator_binary_emit_function_via_mir(
     wb.at[wb.at_count++] = in->lhs.name;
   }
 
-  /* Hoist loop-invariant float constants (materializes them at entry, so this
-   * must precede body lowering). */
+  /* Hoist loop-invariant constants into pooled vregs. Their materialization
+   * starts here and is relocated to hot-loop preheaders after MIR layout. */
   if (!mir_build_const_pool(&fn, generator, context, ir_function)) {
     goto oom;
   }
@@ -3968,8 +4769,12 @@ int code_generator_binary_emit_function_via_mir(
     } else {
       /* Around a call, memory is the source of truth for cached globals: flush
        * the written ones first (the callee may read them), lower the call, then
-       * reload every cached global (the callee may have written any of them). */
-      int is_call = ir_function->instructions[i].op == IR_OP_CALL;
+       * reload cached globals only when the callee may have written them. */
+      const IRInstruction *cin = &ir_function->instructions[i];
+      int is_call = cin->op == IR_OP_CALL || cin->op == IR_OP_CALL_INDIRECT;
+      int call_writes_globals =
+          is_call ? mir_call_may_write_globals(generator, ir_function, i, cin)
+                  : 0;
       if (is_call && wb.all_count > 0 &&
           !mir_emit_global_writebacks(&fn, generator, &map, &wb)) {
         free(fold_skip);
@@ -3982,11 +4787,11 @@ int code_generator_binary_emit_function_via_mir(
         free(folds);
         goto oom;
       }
-      if (is_call && wb.all_count > 0) {
+      if (is_call && call_writes_globals && wb.all_count > 0) {
         /* If the call's result is assigned straight to a global (@g = f()), the
          * call lowering already captured RAX into @g's cache vreg; don't reload
          * @g from its stale memory (that would drop the just-stored result). */
-        const IROperand *cd = &ir_function->instructions[i].dest;
+        const IROperand *cd = &cin->dest;
         const char *except =
             (cd->kind == IR_OPERAND_SYMBOL && cd->name &&
              mir_name_is_global_scalar(generator, cd->name))
@@ -4004,7 +4809,6 @@ int code_generator_binary_emit_function_via_mir(
        * extends at the access width, CAST canonicalizes itself, and an
        * in-range literal is canonical as materialized, so those are skipped. */
       {
-        const IRInstruction *cin = &ir_function->instructions[i];
         if (cin->op == IR_OP_ASSIGN || cin->op == IR_OP_BINARY ||
             cin->op == IR_OP_UNARY || cin->op == IR_OP_CALL ||
             cin->op == IR_OP_CALL_INDIRECT) {
@@ -4059,6 +4863,8 @@ int code_generator_binary_emit_function_via_mir(
 
   mir_fuse_mov_then_extend(&fn);
   mir_rotate_loops(&fn);
+  mir_sink_cold_exits(&fn);
+  mir_place_const_pool(&fn);
 
   if (!mir_regalloc(&fn) || fn.has_error) {
     goto oom;

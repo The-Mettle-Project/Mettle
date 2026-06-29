@@ -21,6 +21,10 @@ void mir_function_destroy(MirFunction *fn) {
   free(fn->insns);
   free(fn->fconsts);
   free(fn->iconsts);
+  for (size_t i = 0; i < fn->owned_sym_count; i++) {
+    free(fn->owned_syms[i]);
+  }
+  free(fn->owned_syms);
   memset(fn, 0, sizeof(*fn));
 }
 
@@ -161,6 +165,10 @@ static const char *mir_opcode_name(MirOpcode op) {
   case MIR_NOP: return "nop";
   case MIR_MOV: return "mov";
   case MIR_LEA: return "lea";
+  case MIR_LEA_LOCAL: return "lea_local";
+  case MIR_LEA_GLOBAL: return "lea_global";
+  case MIR_LEA_FUNC: return "lea_func";
+  case MIR_LEA_CSTR: return "lea_cstr";
   case MIR_MOVZX: return "movzx";
   case MIR_MOVSX: return "movsx";
   case MIR_LOAD_GLOBAL: return "ldglobal";
@@ -180,6 +188,7 @@ static const char *mir_opcode_name(MirOpcode op) {
   case MIR_XOR_RDX: return "xor_rdx";
   case MIR_IDIV: return "idiv";
   case MIR_DIV: return "div";
+  case MIR_MULHI: return "mulhi";
   case MIR_CMP: return "cmp";
   case MIR_TEST: return "test";
   case MIR_SETCC: return "setcc";
@@ -189,6 +198,10 @@ static const char *mir_opcode_name(MirOpcode op) {
   case MIR_CMPBR: return "cmpbr";
   case MIR_LABEL: return "label";
   case MIR_CALL: return "call";
+  case MIR_CALL_INDIRECT: return "call_indirect";
+  case MIR_STORE_OUTARG: return "store_outarg";
+  case MIR_LEA_OUTARG: return "lea_outarg";
+  case MIR_TRAP: return "trap";
   case MIR_RET: return "ret";
   case MIR_FADD: return "fadd";
   case MIR_FSUB: return "fsub";

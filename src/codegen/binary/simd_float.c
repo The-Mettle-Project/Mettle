@@ -339,7 +339,6 @@ int code_generator_binary_emit_simd_affine_map_f64(
   BinaryCodeBuffer *b = NULL;
   size_t loop_top = 0;
   size_t j_done = 0;
-  size_t j_vec = 0;
   size_t j_scalar = 0;
 
   if (!generator || !context || !instruction ||
@@ -396,19 +395,26 @@ int code_generator_binary_emit_simd_affine_map_f64(
     return 0;
   }
 
-  loop_top = b->size;
-  if (!binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9) ||
-      !wcs_jcc(b, 0x83 /* jae */, &j_done) ||
-      !binary_emit_mov_reg_reg(b, BINARY_GP_R10, BINARY_GP_R9) ||
-      !binary_emit_alu_reg_reg(b, 0x29, BINARY_GP_R10, BINARY_GP_RCX) ||
-      !wcs_cmp_reg_imm32(b, BINARY_GP_R10, 32) ||
-      !wcs_jcc(b, 0x83 /* jae */, &j_vec) ||
-      !wcs_jcc(b, 0, &j_scalar)) {
+  /* vec_end (r11) = src_start + (src_end - src_start) rounded down to a 32-byte
+   * multiple. Hoisting the strip-mine bound out of the loop keeps the hot vector
+   * body free of the per-iteration `remaining = end - src; cmp 32` recompute:
+   * the vector loop runs whole 4-double chunks while src < vec_end, then a
+   * scalar tail finishes the < 4-element remainder up to src_end (r9). */
+  if (!binary_emit_mov_reg_reg(b, BINARY_GP_R11, BINARY_GP_R9) ||
+      !binary_emit_alu_reg_reg(b, 0x29, BINARY_GP_R11, BINARY_GP_RCX) ||
+      !wcs_shift_reg_imm(b, BINARY_GP_R11, 1 /* shr */, 5) ||
+      !wcs_shift_reg_imm(b, BINARY_GP_R11, 0 /* shl */, 5) ||
+      !wcs_add_reg_reg64(b, BINARY_GP_R11, BINARY_GP_RCX)) {
     return 0;
   }
 
-  if (!wcs_patch_here(b, j_vec) ||
-      !wcs_avx_vmovups_ymm_mem(b, 0, BINARY_GP_RCX, 0) ||
+  /* Vector loop: entry guard + bottom-tested body (one taken branch/iter). */
+  if (!binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R11) ||
+      !wcs_jcc(b, 0x83 /* jae */, &j_scalar)) {
+    return 0;
+  }
+  loop_top = b->size;
+  if (!wcs_avx_vmovups_ymm_mem(b, 0, BINARY_GP_RCX, 0) ||
       !wcs_avx_vmovups_ymm_mem(b, 1, BINARY_GP_RDX, 0)) {
     return 0;
   }
@@ -433,48 +439,60 @@ int code_generator_binary_emit_simd_affine_map_f64(
     }
   }
   if (!wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 32) ||
-      !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 32)) {
+      !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 32) ||
+      !binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R11)) {
     return 0;
   }
   {
     size_t j_back = 0;
-    if (!wcs_jcc(b, 0, &j_back) || !wcs_patch_to(b, j_back, loop_top)) {
+    if (!wcs_jcc(b, 0x82 /* jb */, &j_back) ||
+        !wcs_patch_to(b, j_back, loop_top)) {
       return 0;
     }
   }
 
+  /* Scalar tail: 1 double/iter up to src_end (r9), entry guard + bottom test. */
   if (!wcs_patch_here(b, j_scalar) ||
-      !wcs_movsd_xmm_mem(b, 0, BINARY_GP_RCX, 0) ||
-      !wcs_movsd_xmm_mem(b, 1, BINARY_GP_RDX, 0)) {
-    return 0;
-  }
-  if (b_is_one && c_is_zero) {
-    if (!wcs_fmadd231sd(b, 1, 0, 4) ||
-        !wcs_movsd_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM1)) {
-      return 0;
-    }
-  } else {
-    if (!binary_emit_mulsd_xmm_xmm(b, BINARY_XMM0, BINARY_XMM4)) {
-      return 0;
-    }
-    if (!b_is_zero && !wcs_fmadd231sd(b, 0, 5, 1)) {
-      return 0;
-    }
-    if (!c_is_zero && !binary_emit_addsd_xmm_xmm(b, BINARY_XMM0, BINARY_XMM3)) {
-      return 0;
-    }
-    if (!wcs_movsd_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM0)) {
-      return 0;
-    }
-  }
-  if (!wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 8) ||
-      !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 8)) {
+      !binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9) ||
+      !wcs_jcc(b, 0x83 /* jae */, &j_done)) {
     return 0;
   }
   {
-    size_t j_back = 0;
-    if (!wcs_jcc(b, 0, &j_back) || !wcs_patch_to(b, j_back, loop_top)) {
+    size_t scalar_top = b->size;
+    if (!wcs_movsd_xmm_mem(b, 0, BINARY_GP_RCX, 0) ||
+        !wcs_movsd_xmm_mem(b, 1, BINARY_GP_RDX, 0)) {
       return 0;
+    }
+    if (b_is_one && c_is_zero) {
+      if (!wcs_fmadd231sd(b, 1, 0, 4) ||
+          !wcs_movsd_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM1)) {
+        return 0;
+      }
+    } else {
+      if (!binary_emit_mulsd_xmm_xmm(b, BINARY_XMM0, BINARY_XMM4)) {
+        return 0;
+      }
+      if (!b_is_zero && !wcs_fmadd231sd(b, 0, 5, 1)) {
+        return 0;
+      }
+      if (!c_is_zero && !binary_emit_addsd_xmm_xmm(b, BINARY_XMM0, BINARY_XMM3)) {
+        return 0;
+      }
+      if (!wcs_movsd_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM0)) {
+        return 0;
+      }
+    }
+    if (!wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 8) ||
+        !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 8) ||
+        !binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9)) {
+      return 0;
+    }
+    {
+      size_t j_back = 0;
+      if (!wcs_jcc(b, 0x82 /* jb */, &j_back) ||
+          !wcs_patch_to(b, j_back, scalar_top)) {
+        return 0;
+      }
     }
   }
 
@@ -490,19 +508,26 @@ int code_generator_binary_emit_simd_affine_map_f32_loop(BinaryCodeBuffer *b,
                                                         int b_is_one,
                                                         int b_is_zero,
                                                         int c_is_zero) {
-  size_t loop_top = 0, j_done = 0, j_vec = 0, j_scalar = 0;
-  loop_top = b->size;
-  if (!binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9) ||
-      !wcs_jcc(b, 0x83 /* jae */, &j_done) ||
-      !binary_emit_mov_reg_reg(b, BINARY_GP_R10, BINARY_GP_R9) ||
-      !binary_emit_alu_reg_reg(b, 0x29, BINARY_GP_R10, BINARY_GP_RCX) ||
-      !wcs_cmp_reg_imm32(b, BINARY_GP_R10, 32) ||
-      !wcs_jcc(b, 0x83 /* jae */, &j_vec) ||
-      !wcs_jcc(b, 0, &j_scalar)) {
+  size_t loop_top = 0, j_done = 0, j_scalar = 0;
+
+  /* vec_end (r11) = src_start + (src_end - src_start) rounded down to a 32-byte
+   * multiple (8 floats/chunk). Hoisting the strip-mine bound out of the loop
+   * keeps the hot vector body free of the per-iteration remainder recompute. */
+  if (!binary_emit_mov_reg_reg(b, BINARY_GP_R11, BINARY_GP_R9) ||
+      !binary_emit_alu_reg_reg(b, 0x29, BINARY_GP_R11, BINARY_GP_RCX) ||
+      !wcs_shift_reg_imm(b, BINARY_GP_R11, 1 /* shr */, 5) ||
+      !wcs_shift_reg_imm(b, BINARY_GP_R11, 0 /* shl */, 5) ||
+      !wcs_add_reg_reg64(b, BINARY_GP_R11, BINARY_GP_RCX)) {
     return 0;
   }
-  if (!wcs_patch_here(b, j_vec) ||
-      !wcs_avx_vmovups_ymm_mem(b, 0, BINARY_GP_RCX, 0) ||
+
+  /* Vector loop: entry guard + bottom-tested body (one taken branch/iter). */
+  if (!binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R11) ||
+      !wcs_jcc(b, 0x83 /* jae */, &j_scalar)) {
+    return 0;
+  }
+  loop_top = b->size;
+  if (!wcs_avx_vmovups_ymm_mem(b, 0, BINARY_GP_RCX, 0) ||
       !wcs_avx_vmovups_ymm_mem(b, 1, BINARY_GP_RDX, 0)) {
     return 0;
   }
@@ -526,40 +551,53 @@ int code_generator_binary_emit_simd_affine_map_f32_loop(BinaryCodeBuffer *b,
     }
   }
   if (!wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 32) ||
-      !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 32)) {
+      !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 32) ||
+      !binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R11)) {
     return 0;
   }
   {
     size_t j_back = 0;
-    if (!wcs_jcc(b, 0, &j_back) || !wcs_patch_to(b, j_back, loop_top)) {
+    if (!wcs_jcc(b, 0x82 /* jb */, &j_back) ||
+        !wcs_patch_to(b, j_back, loop_top)) {
       return 0;
     }
   }
+
+  /* Scalar tail: 1 float/iter up to src_end (r9), entry guard + bottom test. */
   if (!wcs_patch_here(b, j_scalar) ||
-      !wcs_movss_xmm_mem(b, 0, BINARY_GP_RCX, 0) ||
-      !wcs_movss_xmm_mem(b, 1, BINARY_GP_RDX, 0)) {
-    return 0;
-  }
-  if (b_is_one && c_is_zero) {
-    if (!wcs_fmadd231ss(b, 1, 0, 4) ||
-        !wcs_movss_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM1)) {
-      return 0;
-    }
-  } else if (!binary_emit_mulss_xmm_xmm(b, BINARY_XMM0, BINARY_XMM4) ||
-             (!b_is_zero && !wcs_fmadd231ss(b, 0, 5, 1)) ||
-             (!c_is_zero &&
-              !binary_emit_addss_xmm_xmm(b, BINARY_XMM0, BINARY_XMM3)) ||
-             !wcs_movss_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM0)) {
-    return 0;
-  }
-  if (!wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 4) ||
-      !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 4)) {
+      !binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9) ||
+      !wcs_jcc(b, 0x83 /* jae */, &j_done)) {
     return 0;
   }
   {
-    size_t j_back = 0;
-    if (!wcs_jcc(b, 0, &j_back) || !wcs_patch_to(b, j_back, loop_top)) {
+    size_t scalar_top = b->size;
+    if (!wcs_movss_xmm_mem(b, 0, BINARY_GP_RCX, 0) ||
+        !wcs_movss_xmm_mem(b, 1, BINARY_GP_RDX, 0)) {
       return 0;
+    }
+    if (b_is_one && c_is_zero) {
+      if (!wcs_fmadd231ss(b, 1, 0, 4) ||
+          !wcs_movss_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM1)) {
+        return 0;
+      }
+    } else if (!binary_emit_mulss_xmm_xmm(b, BINARY_XMM0, BINARY_XMM4) ||
+               (!b_is_zero && !wcs_fmadd231ss(b, 0, 5, 1)) ||
+               (!c_is_zero &&
+                !binary_emit_addss_xmm_xmm(b, BINARY_XMM0, BINARY_XMM3)) ||
+               !wcs_movss_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM0)) {
+      return 0;
+    }
+    if (!wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 4) ||
+        !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 4) ||
+        !binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9)) {
+      return 0;
+    }
+    {
+      size_t j_back = 0;
+      if (!wcs_jcc(b, 0x82 /* jb */, &j_back) ||
+          !wcs_patch_to(b, j_back, scalar_top)) {
+        return 0;
+      }
     }
   }
   return wcs_patch_here(b, j_done) && wcs_avx_vzeroupper(b);

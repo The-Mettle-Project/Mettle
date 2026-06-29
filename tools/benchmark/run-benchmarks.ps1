@@ -14,6 +14,7 @@
 #   .\tools\benchmark\run-benchmarks.ps1 -BuildCompiler
 #   .\tools\benchmark\run-benchmarks.ps1 -Runs 7 -Warmup 2
 #   .\tools\benchmark\run-benchmarks.ps1 -Benchmark fib,grep
+#   .\tools\benchmark\run-benchmarks.ps1 -MlOpt        # compile Mettle with --ml-opt
 #   .\tools\benchmark\run-benchmarks.ps1 -CompileOnly
 #   .\tools\benchmark\run-benchmarks.ps1 -SkipCompileBenchmarks
 #   .\tools\benchmark\run-benchmarks.ps1 -Quiet
@@ -29,6 +30,7 @@ param(
     [switch]$OpenReport,
     [switch]$Gcc,
     [switch]$Clang,
+    [switch]$MlOpt,
     [string]$ConfigPath = "docs/benchmarks/harness.json",
     [string]$CompilerPath = "",
     [string[]]$Benchmark = @(),
@@ -413,6 +415,10 @@ function Get-MettleBuildArgs {
         $args = @($Bench.mettle_flags)
     }
 
+    if ($script:MlOpt -and ($args -notcontains "--ml-opt")) {
+        $args += "--ml-opt"
+    }
+
     return $args
 }
 
@@ -730,6 +736,8 @@ if (-not $cCompilerCommand) {
     exit 1
 }
 
+if ($MlOpt) { Write-Log "ML optimizer enabled: compiling Mettle with --ml-opt" }
+
 $cVersionOutput = (& $cCompiler --version 2>&1 | Out-String).Trim()
 $cVersionLine = ($cVersionOutput -split "`r?`n")[0]
 $hostInfo = Get-BenchmarkHostInfo -CompilerFullPath $compilerFullPath -GccVersion $cVersionLine -CCompilerName $cCompiler
@@ -901,6 +909,9 @@ $mettleFlags = if ($null -ne $config.defaults -and $null -ne $config.defaults.me
     @($config.defaults.mettle_flags)
 } else {
     @("--build", "--emit-obj", "--linker", "internal", "--release")
+}
+if ($MlOpt -and ($mettleFlags -notcontains "--ml-opt")) {
+    $mettleFlags += "--ml-opt"
 }
 
 $summary = Get-BenchmarkSummary -RuntimeResults $results

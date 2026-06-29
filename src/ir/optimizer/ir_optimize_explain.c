@@ -1805,3 +1805,86 @@ void ir_explain_kernel_desc(const IRInstruction *ins, char *buf, size_t cap) {
     return;
   }
 }
+
+/* Render the --ml-opt report from the native pass's TSV (fn, gidx, kind, before,
+ * after, saved, line, file), styled like the main report. */
+static const char *glyph_ellipsis(void) {
+  return ir_explain_use_unicode() ? "\xE2\x80\xA6" : "..";
+}
+
+static void ml_fit(const char *s, int width, char *out, size_t cap) {
+  int len = (int)strlen(s);
+  if (len <= width) {
+    snprintf(out, cap, "%-*s", width, s);
+    return;
+  }
+  int keep = width - 2;
+  if (keep < 1) keep = 1;
+  snprintf(out, cap, "%.*s%s", keep, s, glyph_ellipsis());
+}
+
+void ir_explain_ml_opt(const char *path) {
+  FILE *f = fopen(path, "r");
+  if (!f) {
+    return;
+  }
+  const char *rule = glyph_rule();
+  fprintf(stderr, "\n%s%s ml-opt: model-driven IR optimizations %s%s%s%s%s\n\n",
+          clr(EXPLAIN_BOLD), rule, rule, rule, rule, rule, clr(EXPLAIN_RESET));
+
+  char ln[1024];
+  char cur_fn[256] = "";
+  int total = 0, funcs = 0, saved_total = 0;
+  while (fgets(ln, sizeof ln, f)) {
+    char *fn = strtok(ln, "\t");
+    char *gi = fn ? strtok(NULL, "\t") : NULL;
+    char *kind = gi ? strtok(NULL, "\t") : NULL;
+    char *before = kind ? strtok(NULL, "\t") : NULL;
+    char *after = before ? strtok(NULL, "\t") : NULL;
+    char *saved = after ? strtok(NULL, "\t") : NULL;
+    char *line = saved ? strtok(NULL, "\t") : NULL;
+    char *file = line ? strtok(NULL, "\t\n") : NULL;
+    if (!after) {
+      continue;
+    }
+    int sv = saved ? atoi(saved) : 0;
+    long src_line = line ? atol(line) : 0;
+    if (strcmp(fn, cur_fn) != 0) {
+      snprintf(cur_fn, sizeof cur_fn, "%s", fn);
+      funcs++;
+      if (file && file[0]) {
+        fprintf(stderr, "  %sfunction %s%s%s  %s%s%s\n", clr(EXPLAIN_DIM),
+                clr(EXPLAIN_RESET), clr(EXPLAIN_BOLD), fn, clr(EXPLAIN_DIM),
+                file, clr(EXPLAIN_RESET));
+      } else {
+        fprintf(stderr, "  %sfunction %s%s%s%s\n", clr(EXPLAIN_DIM),
+                clr(EXPLAIN_RESET), clr(EXPLAIN_BOLD), fn, clr(EXPLAIN_RESET));
+      }
+    }
+    char kbuf[28], bbuf[34], loc[24];
+    ml_fit(kind, 22, kbuf, sizeof kbuf);
+    ml_fit(before, 30, bbuf, sizeof bbuf);
+    if (src_line > 0) snprintf(loc, sizeof loc, "line %ld", src_line);
+    else snprintf(loc, sizeof loc, "ir#%s", gi ? gi : "?");
+    const char *aft = (after[0] == '@') ? after + 1 : after;   /* drop sigil */
+    fprintf(stderr, "    %s%s %-9s%s %s  %s  %s %s%s%s",
+            clr(EXPLAIN_DIM), glyph_elbow(), loc, clr(EXPLAIN_RESET), kbuf, bbuf,
+            glyph_arrow(), clr(EXPLAIN_GREEN), aft, clr(EXPLAIN_RESET));
+    if (sv > 0) {
+      fprintf(stderr, "  %s-%d op%s%s", clr(EXPLAIN_DIM), sv, sv == 1 ? "" : "s",
+              clr(EXPLAIN_RESET));
+    }
+    fprintf(stderr, "\n");
+    total++;
+    saved_total += sv;
+  }
+  fclose(f);
+  if (total) {
+    fprintf(stderr,
+            "\n  %s%d rewrite%s in %d function%s %s %d IR op%s removed, "
+            "all verified equivalent%s\n",
+            clr(EXPLAIN_DIM), total, total == 1 ? "" : "s", funcs,
+            funcs == 1 ? "" : "s", ir_explain_use_unicode() ? "\xC2\xB7" : "*",
+            saved_total, saved_total == 1 ? "" : "s", clr(EXPLAIN_RESET));
+  }
+}

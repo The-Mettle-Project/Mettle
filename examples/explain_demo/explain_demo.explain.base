@@ -1,0 +1,43 @@
+L	array_sum	0	V	29
+L	step	0	S	43
+C	gcd	gcd	0	R	72
+C	main	println	0	I	81
+C	main	cstr	0	I	81
+C	main	println	1	I	86
+C	main	cstr	1	I	86
+L	main	0	S	90
+C	main	array_sum	0	R	95
+C	main	step	0	R	96
+C	main	bit_blend	0	R	97
+C	main	shuffle	0	R	98
+C	main	gcd	0	I	99
+C	main	lo_byte	0	I	99
+C	main	print	0	I	101
+C	main	cstr	2	I	101
+C	main	println_int	0	I	101
+C	main	print	1	I	102
+C	main	cstr	3	I	102
+C	main	println_int	1	I	102
+C	main	print	2	I	103
+C	main	cstr	4	I	103
+C	main	println_int	2	I	103
+C	main	print	3	I	104
+C	main	cstr	5	I	104
+C	main	println_int	3	I	104
+C	main	print	4	I	105
+C	main	cstr	6	I	105
+C	main	println_int	4	I	105
+C	main	bench_time_us	0	I	109
+L	main	1	S	112
+C	main	shuffle	1	R	113
+C	main	bit_blend	1	R	113
+C	main	step	1	R	113
+C	main	bench_time_us	1	I	116
+C	main	print	5	I	118
+C	main	cstr	7	I	118
+C	main	println_int	5	I	118
+C	main	print	6	I	119
+C	main	cstr	8	I	119
+C	main	print_int	0	R	119
+C	main	println	2	I	119
+C	main	cstr	9	I	119

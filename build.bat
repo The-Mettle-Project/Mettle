@@ -250,6 +250,13 @@ copy /Y obj\runtime\tracy_helpers.o bin\runtime\tracy_helpers.obj >nul
 
 if exist installer\mettle-build.bat copy /Y installer\mettle-build.bat bin\mettle-build.bat >nul
 
+echo Bundling ML optimizer model into bin\mlopt (used by --ml-opt)...
+if exist bin\mlopt rmdir /S /Q bin\mlopt
+mkdir bin\mlopt
+if exist tools\mlopt\gnn_genius.bin copy /Y tools\mlopt\gnn_genius.bin bin\mlopt\gnn_genius.bin >nul
+if exist tools\mlopt\bw_lib.txt copy /Y tools\mlopt\bw_lib.txt bin\mlopt\bw_lib.txt >nul
+if exist tools\mlopt\gf2_lib1.txt copy /Y tools\mlopt\gf2_lib1.txt bin\mlopt\gf2_lib1.txt >nul
+
 echo Build successful! Executable created at bin\mettle.exe
 if defined SKIP_TESTS (
     echo Tests skipped.
