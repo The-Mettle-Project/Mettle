@@ -4206,8 +4206,27 @@ static int mir_label_has_forward_target(const MirFunction *fn, const char *name,
   return 0;
 }
 
-static size_t mir_const_insert_index(const MirFunction *fn, size_t first_use) {
+/* True iff every use of `v` lies within the inclusive instruction range
+ * [lo, hi]. Used to prove a pooled constant is confined to a single loop body
+ * before its materialization is sunk to that loop's header. */
+static int mir_all_uses_in_range(const MirFunction *fn, MirVregId v, size_t lo,
+                                 size_t hi) {
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    if (mir_inst_uses_vreg(&fn->insns[i], v) && (i < lo || i > hi)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+/* Returns the loop header to sink the constant to, and its loop-body end via
+ * *loop_end. Returns first_use (and leaves *loop_end = first_use) when no
+ * enclosing loop encloses first_use -- the caller must not relocate then, since
+ * a non-loop position need not dominate the constant's other uses. */
+static size_t mir_const_insert_index(const MirFunction *fn, size_t first_use,
+                                     size_t *loop_end) {
   size_t insert = first_use;
+  *loop_end = first_use;
   for (size_t b = 0; b < fn->insn_count; b++) {
     const MirInst *br = &fn->insns[b];
     if ((br->op != MIR_JMP && br->op != MIR_JCC && br->op != MIR_CMPBR &&
@@ -4224,6 +4243,7 @@ static size_t mir_const_insert_index(const MirFunction *fn, size_t first_use) {
     }
     if (insert == first_use || l > insert) {
       insert = l;
+      *loop_end = b;
     }
   }
   return insert;
@@ -4264,8 +4284,10 @@ static void mir_place_const_pool(MirFunction *fn) {
     if (first == (size_t)-1) {
       continue;
     }
-    size_t insert = mir_const_insert_index(fn, first);
-    if (insert <= def + 1) {
+    size_t loop_end = first;
+    size_t insert = mir_const_insert_index(fn, first, &loop_end);
+    if (insert <= def + 1 || insert == first ||
+        !mir_all_uses_in_range(fn, v, insert, loop_end)) {
       continue;
     }
     moves[nmove].def = def;
@@ -4284,8 +4306,10 @@ static void mir_place_const_pool(MirFunction *fn) {
     if (first == (size_t)-1) {
       continue;
     }
-    size_t insert = mir_const_insert_index(fn, first);
-    if (insert <= def + 1) {
+    size_t loop_end = first;
+    size_t insert = mir_const_insert_index(fn, first, &loop_end);
+    if (insert <= def + 1 || insert == first ||
+        !mir_all_uses_in_range(fn, v, insert, loop_end)) {
       continue;
     }
     moves[nmove].def = def;
