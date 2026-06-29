@@ -694,6 +694,7 @@ static int aff_rhs_fits40(AffCtx *c, const char *rhs) {
  * arg receives the constant (signed decimal, round-trips through atoll) or name. */
 static int aff_emit(AffCtx *c, const char *dest, const Form *form, int orig_is_mask,
                     const char *orig_rhs, char *arg, size_t acap) {
+  (void)dest;
   int nv = 0; for (int i = 0; i < form->n; i++) if (form->c[i] != 0) nv++;
   if (nv == 0) {
     if (!form->exact) return 0;
@@ -707,7 +708,8 @@ static int aff_emit(AffCtx *c, const char *dest, const Form *form, int orig_is_m
   long long k = form->c[idx];
   char name[256]; const char *hash = strrchr(form->v[idx], '#');
   size_t nl = hash ? (size_t)(hash - form->v[idx]) : strlen(form->v[idx]);
-  if (nl >= sizeof name) return 0; memcpy(name, form->v[idx], nl); name[nl] = 0;
+  if (nl >= sizeof name) return 0;
+  memcpy(name, form->v[idx], nl); name[nl] = 0;
   char *ct = aff_curtok(c, name); int cur = strcmp(ct, form->v[idx]) == 0; free(ct);
   if (!cur) return 0;                                /* value no longer held by this name */
   if (k == 1 && form->cst == 0) {
@@ -1072,7 +1074,8 @@ static const char *gf2_lookup(unsigned long long b, unsigned long long *cols) {
   int lo = 0, hi = g_gf2_n - 1;
   Gf2Ent key; key.b = b; memcpy(key.cols, cols, sizeof key.cols);
   while (lo <= hi) { int mid = (lo + hi) / 2; int c = gf2_cmp(&g_gf2[mid], &key);
-    if (c == 0) return g_gf2[mid].post; if (c < 0) lo = mid + 1; else hi = mid - 1; }
+    if (c == 0) return g_gf2[mid].post;
+    if (c < 0) lo = mid + 1; else hi = mid - 1; }
   return NULL;
 }
 

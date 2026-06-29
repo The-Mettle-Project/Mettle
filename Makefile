@@ -10,7 +10,7 @@ ifneq ($(filter Linux linux-gnu,$(shell uname -s 2>/dev/null)),)
 # libraries, so link them explicitly for compiler_context.c's pthread TLS and
 # compiler_crash.c's dladdr. No-op on glibc >= 2.34, where libc absorbed both.
 CFLAGS += -pthread
-LDFLAGS = -rdynamic -pthread -ldl
+LDFLAGS = -rdynamic -pthread -ldl -lm
 endif
 SRCDIR = src
 OBJDIR = obj
