@@ -1,5 +1,6 @@
 #include "codegen/binary/internal.h"
 #include "codegen/binary/mir.h"
+#include "codegen/binary/mir_annotate.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -81,12 +82,51 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
     goto mir_shared_append;
   }
 
+  /* --annotate-asm: this function uses the BASELINE (fallback) backend, which
+   * works at IR granularity. Open a capture context and record each IR
+   * instruction's emitted byte span. The optimized idioms the MIR gate rejects
+   * (vectorized kernels, the Fibonacci rotate) land here. */
+  int annot = mir_annotate_enabled();
+  size_t annot_base = context.code.size;
+  if (annot) {
+    mir_annotate_begin_function(
+        function_data->name, ir_function,
+        function_data->body ? function_data->body->location.filename : NULL,
+        function_data->body ? function_data->body->location.line : 0);
+    mir_annotate_note_backend("baseline (fallback)", NULL);
+  }
+
   if (!code_generator_binary_emit_prologue(generator, &context, function_data)) {
+    if (annot) mir_annotate_end_function();
     binary_function_context_destroy(&context);
     return 0;
   }
+  if (annot && context.code.size > annot_base) {
+    mir_annotate_record_synthetic("prologue", "frame", 0,
+                                  context.code.size - annot_base,
+                                  context.code.data + annot_base);
+  }
 
+  size_t annot_prev_off = context.code.size;
+  int annot_prev_idx = -1;
   for (size_t i = 0; i < ir_function->instruction_count;) {
+    /* Lazily record the previous instruction's span now that it is fully
+     * emitted; this is robust to the cascade's many `continue` paths because
+     * every one returns here. */
+    if (annot && annot_prev_idx >= 0 && context.code.size > annot_prev_off) {
+      mir_annotate_record_ir(ir_function, annot_prev_idx,
+                             annot_prev_off - annot_base,
+                             context.code.size - annot_prev_off,
+                             context.code.data + annot_prev_off);
+    }
+    annot_prev_off = context.code.size;
+    annot_prev_idx = (int)i;
+    /* Labels emit no bytes, so the lazy span recorder never sees them; record a
+     * zero-byte marker so loop recovery can resolve backward-branch targets. */
+    if (annot && ir_function->instructions[i].op == IR_OP_LABEL) {
+      mir_annotate_record_ir_label(ir_function->instructions[i].text,
+                                   context.code.size - annot_base);
+    }
     size_t consumed = 0;
     if (code_generator_binary_try_skip_scaled_address_shift(ir_function, i,
                                                             &consumed)) {
@@ -189,10 +229,21 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
 
     if (!code_generator_binary_emit_instruction(
             generator, &context, &ir_function->instructions[i])) {
+      if (annot) mir_annotate_end_function();
       binary_function_context_destroy(&context);
       return 0;
     }
     i++;
+  }
+  /* Record the last instruction's span (no further loop top runs). */
+  if (annot && annot_prev_idx >= 0 && context.code.size > annot_prev_off) {
+    mir_annotate_record_ir(ir_function, annot_prev_idx,
+                           annot_prev_off - annot_base,
+                           context.code.size - annot_prev_off,
+                           context.code.data + annot_prev_off);
+  }
+  if (annot) {
+    mir_annotate_end_function();
   }
 
   return_offset = context.code.size;

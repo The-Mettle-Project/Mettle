@@ -8,8 +8,10 @@
 #if defined(_WIN32) || defined(_WIN64)
 #include <windows.h>
 #else
+#include <fcntl.h>
 #include <time.h>
 #include <sys/time.h>
+#include <unistd.h>
 #endif
 
 extern uint64_t mettle_profile_name_count;
@@ -55,6 +57,9 @@ static size_t g_stack_overflow_exits = 0;
 static MettleProfileEdge *g_edges = NULL;
 static size_t g_edge_count = 0;
 static size_t g_edge_capacity = 0;
+static uint64_t *g_block_counts = NULL;
+static size_t g_block_capacity = 0;
+static size_t g_block_max_id = 0; /* highest block id ever seen, + 1 = count */
 #if defined(_WIN32) || defined(_WIN64)
 static int g_qpc_initialized = 0;
 static LARGE_INTEGER g_qpc_frequency = {0};
@@ -362,6 +367,23 @@ void mettle_profile_op(uint32_t op_class, uint64_t amount) {
   g_op_stats[fn_id].counts[op_class] += amount;
 }
 
+void mettle_profile_block(uint32_t block_id) {
+  size_t needed = (size_t)block_id + 1u;
+
+  if (needed > g_block_capacity) {
+    METTLE_PROFILE_ENSURE_CAPACITY(g_block_counts, g_block_capacity,
+                                   g_block_capacity, uint64_t, needed);
+    if (needed > g_block_capacity) {
+      return;
+    }
+  }
+
+  g_block_counts[block_id]++;
+  if (needed > g_block_max_id) {
+    g_block_max_id = needed;
+  }
+}
+
 void mettle_profile_exit(void) {
   uint64_t now = 0;
   uint64_t elapsed = 0;
@@ -655,12 +677,239 @@ static void mettle_profile_report_operations(
   }
 }
 
+/* The runtime deliberately avoids libc stdio (the from-scratch internal linker
+ * for --build resolves no __mingw_fprintf), so the sidecar is built in a
+ * growable byte buffer and written with one OS call. */
+typedef struct {
+  char *data;
+  size_t len;
+  size_t cap;
+  int failed;
+} MProfBuf;
+
+static void mb_putc(MProfBuf *b, char c) {
+  if (b->failed) {
+    return;
+  }
+  if (b->len + 1 > b->cap) {
+    size_t nc = b->cap ? b->cap * 2 : 8192;
+    char *grown = realloc(b->data, nc);
+    if (!grown) {
+      b->failed = 1;
+      return;
+    }
+    b->data = grown;
+    b->cap = nc;
+  }
+  b->data[b->len++] = c;
+}
+
+static void mb_puts(MProfBuf *b, const char *s) {
+  if (!s) {
+    return;
+  }
+  while (*s) {
+    mb_putc(b, *s++);
+  }
+}
+
+static void mb_putu(MProfBuf *b, uint64_t value) {
+  char tmp[32];
+  uint64_to_decimal(value, tmp, sizeof(tmp));
+  mb_puts(b, tmp);
+}
+
+static void mb_escape(MProfBuf *b, const char *s) {
+  if (!s) {
+    return;
+  }
+  for (; *s; s++) {
+    unsigned char c = (unsigned char)*s;
+    switch (c) {
+    case '"':
+      mb_puts(b, "\\\"");
+      break;
+    case '\\':
+      mb_puts(b, "\\\\");
+      break;
+    case '\n':
+      mb_puts(b, "\\n");
+      break;
+    case '\r':
+      mb_puts(b, "\\r");
+      break;
+    case '\t':
+      mb_puts(b, "\\t");
+      break;
+    default:
+      if (c < 0x20) {
+        static const char hexd[] = "0123456789abcdef";
+        mb_puts(b, "\\u00");
+        mb_putc(b, hexd[(c >> 4) & 0xF]);
+        mb_putc(b, hexd[c & 0xF]);
+      } else {
+        mb_putc(b, (char)c);
+      }
+    }
+  }
+}
+
+static int mprof_write_file(const char *path, const char *data, size_t length) {
+#if defined(_WIN32) || defined(_WIN64)
+  HANDLE handle = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, NULL);
+  size_t written_total = 0;
+  if (handle == INVALID_HANDLE_VALUE) {
+    return 0;
+  }
+  while (written_total < length) {
+    DWORD chunk = (DWORD)((length - written_total > 0x40000000u)
+                              ? 0x40000000u
+                              : (length - written_total));
+    DWORD written = 0;
+    if (!WriteFile(handle, data + written_total, chunk, &written, NULL)) {
+      break;
+    }
+    written_total += written;
+  }
+  CloseHandle(handle);
+  return written_total == length;
+#else
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  size_t written_total = 0;
+  if (fd < 0) {
+    return 0;
+  }
+  while (written_total < length) {
+    ssize_t written = write(fd, data + written_total, length - written_total);
+    if (written <= 0) {
+      break;
+    }
+    written_total += (size_t)written;
+  }
+  close(fd);
+  return written_total == length;
+#endif
+}
+
+/* Machine-readable companion to the stderr report: the measured side of the
+ * VTune-style codegen view. The extension joins blocks[] with the static
+ * <stem>.annot.json (per-instruction block ids + port cost) to attribute
+ * real execution frequency onto the microarchitecture model. */
+static void mettle_profile_write_sidecar(void) {
+  const char *path = getenv("METTLE_PROFILE_OUT");
+  size_t function_count = (size_t)mettle_profile_name_count;
+  MProfBuf b = {0};
+  int first = 1;
+
+  if (!path || !path[0]) {
+    path = "mettle.mprof";
+  }
+
+  mb_puts(&b, "{\"version\":1,\"functions\":[");
+  for (size_t i = 0; i < function_count; i++) {
+    MettleProfileStats *stats = (i < g_stats_capacity) ? &g_stats[i] : NULL;
+    const char *fname = NULL;
+
+    if (!stats || stats->call_count == 0) {
+      continue;
+    }
+    fname = (mettle_profile_files && mettle_profile_files[i])
+                ? mettle_profile_files[i]
+                : "?";
+
+    if (!first) {
+      mb_putc(&b, ',');
+    }
+    first = 0;
+    mb_puts(&b, "{\"id\":");
+    mb_putu(&b, (uint64_t)i);
+    mb_puts(&b, ",\"name\":\"");
+    mb_escape(&b, mettle_profile_function_name((uint32_t)i));
+    mb_puts(&b, "\",\"file\":\"");
+    mb_escape(&b, fname);
+    mb_puts(&b, "\",\"line\":");
+    mb_putu(&b, mettle_profile_lines ? mettle_profile_lines[i] : 0);
+    mb_puts(&b, ",\"calls\":");
+    mb_putu(&b, stats->call_count);
+    mb_puts(&b, ",\"total_ns\":");
+    mb_putu(&b, stats->total_ns);
+    mb_puts(&b, ",\"self_ns\":");
+    mb_putu(&b, stats->self_ns);
+    mb_puts(&b, ",\"max_ns\":");
+    mb_putu(&b, stats->max_ns);
+    mb_putc(&b, '}');
+  }
+
+  mb_puts(&b, "],\"edges\":[");
+  for (size_t i = 0; i < g_edge_count; i++) {
+    if (i) {
+      mb_putc(&b, ',');
+    }
+    mb_puts(&b, "{\"caller\":");
+    mb_putu(&b, g_edges[i].caller_id);
+    mb_puts(&b, ",\"callee\":");
+    mb_putu(&b, g_edges[i].callee_id);
+    mb_puts(&b, ",\"calls\":");
+    mb_putu(&b, g_edges[i].call_count);
+    mb_puts(&b, ",\"total_ns\":");
+    mb_putu(&b, g_edges[i].total_ns);
+    mb_putc(&b, '}');
+  }
+
+  mb_puts(&b, "],\"ops\":[");
+  first = 1;
+  for (size_t i = 0; g_op_stats && i < function_count && i < g_op_stats_capacity;
+       i++) {
+    int any = 0;
+    for (uint32_t op = 0; op < METTLE_PROFILE_OP_CLASS_COUNT; op++) {
+      if (g_op_stats[i].counts[op]) {
+        any = 1;
+        break;
+      }
+    }
+    if (!any) {
+      continue;
+    }
+    if (!first) {
+      mb_putc(&b, ',');
+    }
+    first = 0;
+    mb_puts(&b, "{\"fn\":");
+    mb_putu(&b, (uint64_t)i);
+    mb_puts(&b, ",\"counts\":[");
+    for (uint32_t op = 0; op < METTLE_PROFILE_OP_CLASS_COUNT; op++) {
+      if (op) {
+        mb_putc(&b, ',');
+      }
+      mb_putu(&b, g_op_stats[i].counts[op]);
+    }
+    mb_puts(&b, "]}");
+  }
+
+  mb_puts(&b, "],\"blocks\":[");
+  for (size_t i = 0; i < g_block_max_id; i++) {
+    if (i) {
+      mb_putc(&b, ',');
+    }
+    mb_putu(&b, i < g_block_capacity ? g_block_counts[i] : 0);
+  }
+  mb_puts(&b, "]}\n");
+
+  if (!b.failed && b.data) {
+    mprof_write_file(path, b.data, b.len);
+  }
+  free(b.data);
+}
+
 void mettle_profile_report(void) {
   size_t function_count = 0;
   size_t active_count = 0;
   MettleProfileSortEntry *entries = NULL;
   uint64_t root_total_ns = 0;
   size_t i = 0;
+
+  mettle_profile_write_sidecar();
 
   function_count = (size_t)mettle_profile_name_count;
   if (function_count == 0 || !g_stats) {

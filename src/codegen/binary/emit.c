@@ -5595,7 +5595,7 @@ int code_generator_binary_emit_instruction(
   case IR_OP_SIMD_VLOOP_F64:
   case IR_OP_SIMD_VLOOP_I32:
     return code_generator_binary_emit_simd_vloop_f64(generator, context,
-                                                     instruction);
+                                                     instruction, 0);
   case IR_OP_SIMD_FIND:
     return code_generator_binary_emit_simd_find(generator, context,
                                                 instruction);

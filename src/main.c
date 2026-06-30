@@ -4,6 +4,7 @@
 #include "main.h"
 #include "common.h"
 #include "codegen/binary/startup.h"
+#include "codegen/binary/mir_annotate.h"
 #include "codegen/binary_emitter.h"
 #include "codegen/binary/arm64_ir.h"
 #include "codegen/program_entry.h"
@@ -2414,6 +2415,75 @@ int main(int argc, char *argv[]) {
        * prose report; implies --explain. */
       options.explain = 1;
       options.explain_json = 1;
+    } else if (strcmp(argv[i], "--annotate-asm") == 0) {
+      /* Codegen provenance listing + <stem>.annot.json sidecar. Needs the
+       * optimizer's decisions (and remarks) to be interesting, so it implies
+       * -O and collects --explain remarks (retained past optimization for the
+       * codegen join). The default syntax is both Intel and AT&T (toggle). */
+      options.annotate_asm = 1;
+      /* Reflect the codegen users actually ship: --release enables every
+       * vectorizer/idiom, so the annotation matches release output (otherwise a
+       * loop shown "not vectorized" at -O would mislead). */
+      options.optimize = 1;
+      options.release = 1;
+      options.explain = 1;
+      options.asm_syntax = 2; /* both */
+    } else if (strncmp(argv[i], "--annotate-lines=", 17) == 0) {
+      /* Focused codegen report for a source line range (LLM-facing): asm + cost
+       * + covering loops + live registers + decisions for just those lines.
+       * Accepts "A" (single line) or "A-B". Implies --annotate-asm. */
+      const char *v = argv[i] + 17;
+      int a = 0, b = 0;
+      if (sscanf(v, "%d-%d", &a, &b) == 2) {
+        /* range */
+      } else if (sscanf(v, "%d", &a) == 1) {
+        b = a;
+      } else {
+        fprintf(stderr, "Error: --annotate-lines expects A or A-B (got '%s')\n", v);
+        return 1;
+      }
+      if (a <= 0 || b < a) {
+        fprintf(stderr, "Error: --annotate-lines range invalid: %s\n", v);
+        return 1;
+      }
+      options.annotate_q_lo = a;
+      options.annotate_q_hi = b;
+      options.annotate_asm = 1;
+      options.optimize = 1;
+      options.release = 1;
+      options.explain = 1;
+      if (!options.asm_syntax) options.asm_syntax = 0; /* intel-only is terser */
+    } else if (strncmp(argv[i], "--annotate-fn=", 14) == 0) {
+      options.annotate_q_fn = argv[i] + 14;
+      options.annotate_asm = 1;
+      options.optimize = 1;
+      options.release = 1;
+      options.explain = 1;
+    } else if (strcmp(argv[i], "--annotate-hot") == 0 ||
+               strncmp(argv[i], "--annotate-hot=", 15) == 0) {
+      /* Top-N hotspots across the program (LLM-facing "where is the time"). */
+      int n = 8;
+      if (argv[i][14] == '=') n = atoi(argv[i] + 15);
+      if (n <= 0) n = 8;
+      options.annotate_hot = n;
+      options.annotate_asm = 1;
+      options.optimize = 1;
+      options.release = 1;
+      options.explain = 1;
+    } else if (strncmp(argv[i], "--asm-syntax=", 13) == 0) {
+      const char *v = argv[i] + 13;
+      if (strcmp(v, "intel") == 0) {
+        options.asm_syntax = 0;
+      } else if (strcmp(v, "att") == 0) {
+        options.asm_syntax = 1;
+      } else if (strcmp(v, "both") == 0) {
+        options.asm_syntax = 2;
+      } else {
+        fprintf(stderr,
+                "Error: --asm-syntax must be intel, att, or both (got '%s')\n",
+                v);
+        return 1;
+      }
     } else if (strcmp(argv[i], "--emit-ptx") == 0) {
       options.emit_ptx = 1;
     } else if (strcmp(argv[i], "--emit-arm64") == 0) {
@@ -2449,6 +2519,9 @@ int main(int argc, char *argv[]) {
       options.profile_runtime = 1;
     } else if (strcmp(argv[i], "--profile-runtime-ops") == 0) {
       options.profile_runtime_ops = 1;
+    } else if (strcmp(argv[i], "--profile-blocks") == 0) {
+      options.profile_blocks = 1;
+      options.profile_runtime = 1;
     } else if (strcmp(argv[i], "--debug-hooks") == 0) {
       options.debug_hooks = 1;
     } else if (strcmp(argv[i], "--native-heap") == 0) {
@@ -2723,6 +2796,21 @@ static int compile_optimize_ir(IRProgram *ir_program,
   /* Large --explain reports divert to `<output-stem>.explain.txt`. */
   ir_explain_set_output_path(options->output_filename);
   ir_explain_set_json(options->explain_json ? 1 : 0);
+  /* --annotate-asm: arm the codegen annotator before codegen runs, and keep the
+   * optimization remarks alive so it can join them onto the emitted asm. */
+  if (options->annotate_asm) {
+    mir_annotate_set_enabled(1);
+    mir_annotate_set_syntax((MirAnnotSyntax)options->asm_syntax);
+    mir_annotate_set_output_path(options->output_filename);
+    mir_annotate_set_source_file(options->input_filename);
+    if (options->annotate_q_lo)
+      mir_annotate_set_line_query(options->annotate_q_lo, options->annotate_q_hi,
+                                  options->annotate_q_fn);
+    else if (options->annotate_q_fn)
+      mir_annotate_set_line_query(0, 0, options->annotate_q_fn);
+    if (options->annotate_hot) mir_annotate_set_hot_query(options->annotate_hot);
+    ir_explain_set_retain_remarks(1);
+  }
   if (!ir_optimize_program(ir_program, &ir_optimize_options)) {
     /* A violated `@simd!` contract is a user error already printed with a
      * source location; don't bury it under a generic internal-error report. */
@@ -3201,6 +3289,16 @@ int compile_file(const char *input_filename, const char *output_filename,
     }
   }
 
+  if (options->profile_blocks) {
+    if (!ir_profile_instrument_blocks(ir_program)) {
+      fprintf(stderr,
+              "Error: Failed to instrument IR basic-block counters for the "
+              "codegen profile view\n");
+      result = 1;
+      goto cleanup;
+    }
+  }
+
   code_generator_set_ir_program(code_generator, ir_program);
 
   if (options->debug_mode || options->dump_ir) {
@@ -3245,6 +3343,12 @@ int compile_file(const char *input_filename, const char *output_filename,
    * (No-op unless --explain is on.) */
   if (options->explain && options->optimize) {
     ir_explain_backend_flush();
+  }
+
+  /* --annotate-asm: now that every function has been encoded, write the
+   * annotated listing (stdout) and the <stem>.annot.json sidecar. */
+  if (options->annotate_asm) {
+    mir_annotate_flush();
   }
 
   compiler_set_phase(PROFILE_PHASE_WRITE_OUTPUT);
@@ -3385,6 +3489,25 @@ void print_usage(const char *program_name) {
          "                      regressions first\n");
   printf("  --explain-json      Also write <output-stem>.explain.json (machine-\n"
          "                      readable report; implies --explain)\n");
+  printf("  --annotate-asm      Print the emitted assembly annotated with the codegen\n"
+         "                      decision behind each instruction (spill, vectorized\n"
+         "                      kernel, strength-reduced divide, ...), a per-op\n"
+         "                      latency/throughput cost model, recovered loops with\n"
+         "                      their port bottleneck, a register-lifetime map, and an\n"
+         "                      instruction-mix summary; also writes a\n"
+         "                      <output-stem>.annot.json sidecar. Implies -O and joins\n"
+         "                      the --explain remarks. Pair with --asm-syntax=\n");
+  printf("  --asm-syntax=S       Assembly syntax for --annotate-asm: intel, att, or\n"
+         "                      both (default both)\n");
+  printf("  --annotate-lines=A-B Focused codegen report for source lines A..B (or a\n"
+         "                      single line A): the emitted asm, per-op cost, the loops\n"
+         "                      covering the range, the registers live across it, and\n"
+         "                      the optimizer's decisions. Compact, for tools/LLMs.\n");
+  printf("  --annotate-fn=NAME   Restrict --annotate-lines/--annotate-asm to one\n"
+         "                      function\n");
+  printf("  --annotate-hot[=N]  Print the program's top N codegen hotspots (hottest\n"
+         "                      loops by cycles/iteration and functions by weighted\n"
+         "                      cost); default N=8. For tools/LLMs.\n");
   printf("  --ml-opt            Run the learned ML IR optimizer after the classical\n"
          "                      passes (experimental). A GNN flags redundancy/algebra\n"
          "                      classical missed; sound transforms (GVN, affine,\n"
@@ -3406,6 +3529,12 @@ void print_usage(const char *program_name) {
          "(disables inlining)\n");
   printf("  --profile-runtime-ops  Emit runtime op-class counters per function "
          "(after optimization)\n");
+  printf("  --profile-blocks    Emit per-basic-block execution counters to a "
+         ".mprof sidecar\n"
+         "                      (path via METTLE_PROFILE_OUT); fuses with "
+         "--annotate-asm for\n"
+         "                      the VTune-style codegen profile view. Implies "
+         "--profile-runtime\n");
   printf("  --debug-hooks       Instrument for the interactive source-level "
          "debugger (requires -O0; used by the editor's F5)\n");
   printf("  --native-heap       Route new/malloc/calloc/realloc/free through "

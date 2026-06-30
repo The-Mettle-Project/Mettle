@@ -11,6 +11,7 @@ void mir_function_init(MirFunction *fn, BinaryFunctionContext *context) {
   memset(fn, 0, sizeof(*fn));
   fn->context = context;
   fn->indirect_return_vreg = MIR_VREG_NONE;
+  fn->cur_ir_index = -1; /* no IR instruction open yet (annotator) */
 }
 
 void mir_function_destroy(MirFunction *fn) {
@@ -70,6 +71,11 @@ int mir_emit(MirFunction *fn, const MirInst *inst) {
     fn->insn_capacity = new_cap;
   }
   fn->insns[fn->insn_count++] = *inst;
+  /* --annotate-asm: trace each emitted op back to the IR instruction being
+   * lowered, unless the caller already set a specific ir_index. */
+  if (inst->ir_index < 0 && fn->cur_ir_index >= 0) {
+    fn->insns[fn->insn_count - 1].ir_index = fn->cur_ir_index;
+  }
   return 1;
 }
 
@@ -160,7 +166,7 @@ MirOperand mir_op_mem_rbp(int rbp_disp) {
 
 /* ---- dump --------------------------------------------------------------- */
 
-static const char *mir_opcode_name(MirOpcode op) {
+const char *mir_opcode_name(MirOpcode op) {
   switch (op) {
   case MIR_NOP: return "nop";
   case MIR_MOV: return "mov";
@@ -229,7 +235,9 @@ static const char *mir_opcode_name(MirOpcode op) {
   case MIR_SIMD_SLP_MAC: return "simd_slp_mac";
   case MIR_SIMD_FILL: return "simd_fill";
   case MIR_SIMD_AFFINE_MAP_F32: return "simd_affine_map_f32";
+  case MIR_SIMD_AFFINE_MAP_F64: return "simd_affine_map_f64";
   case MIR_SIMD_SILU_F32: return "simd_silu_f32";
+  case MIR_SIMD_VLOOP: return "simd_vloop";
   case MIR_OPCODE_COUNT: break;
   }
   return "?";

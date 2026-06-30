@@ -266,11 +266,30 @@ typedef enum {
    * b_is_one|b_is_zero<<1|c_is_zero<<2. Clobbers RAX/RCX/RDX/R8/R9/R10 + ymm0-5. */
   MIR_SIMD_AFFINE_MAP_F32,
 
+  /* Inline float64 affine-map kernel (IR_OP_SIMD_AFFINE_MAP_F64, the saxpy
+   * `dst[i] = a*src[i] + b*dst[i] + c` class) run in place so the function keeps
+   * register-allocated codegen instead of dropping to the spill-everything
+   * fallback. Identical shape to the F32 variant but 4-wide f64 (vfmadd231pd):
+   * lowering marshals src->RCX, dst->RDX, count->R8; this op materializes the
+   * 64-bit coefficient broadcasts and emits the AVX2 loop + scalar tail +
+   * vzeroupper. dst.imm/a.imm/b.imm carry the a/b/c double bits; cc carries
+   * b_is_one|b_is_zero<<1|c_is_zero<<2. Clobbers RAX/RCX/RDX/R8/R9/R11 + ymm0-5. */
+  MIR_SIMD_AFFINE_MAP_F64,
+
   /* Inline float32 SiLU/SwiGLU gate (IR_OP_SIMD_SILU_F32) run in place. Call-like:
    * the lowering marshals g/out->RCX, u->RDX (SwiGLU only), count->R8; this op
    * emits the AVX2 exp-poly SiLU loop. dst.imm = has_mul (1 = SwiGLU `* u[i]`).
    * Clobbers RAX/RCX/RDX/R8/R9/R10/R11 + ymm0-7 and reserves a scratch frame. */
   MIR_SIMD_SILU_F32,
+
+  /* Inline general auto-vectorized loop kernel (IR_OP_SIMD_VLOOP_F64 maps) run
+   * in place so the function keeps register-allocated codegen. The DAG is too
+   * large for MirOperands, so the op borrows a pointer to the source
+   * IRInstruction in `aux`; the lowering marshals the <=3 distinct base pointers
+   * into RCX/RDX/R8/R9 and the element count into the next arg register (the
+   * kernel moves it to R10 -- R10/R11 are MIR scratch and unsafe to marshal
+   * into). Call-like: clobbers the caller-saved set + ymm0-5. Maps only. */
+  MIR_SIMD_VLOOP,
 
   MIR_OPCODE_COUNT
 } MirOpcode;
@@ -289,6 +308,7 @@ typedef struct {
   int is_unsigned; /* affects shifts, divides, compares, extensions */
   unsigned char cc;/* x86 condition opcode for SETCC/CMOVCC/JCC */
   int ir_index;    /* source IR index, or -1 */
+  const void *aux; /* MIR_SIMD_VLOOP: borrowed const IRInstruction* (the DAG) */
 } MirInst;
 
 /* A pooled (loop-invariant) float constant: its IEEE bits at `width`, and the
@@ -426,6 +446,12 @@ typedef struct {
    * applied uniformly for simplicity. */
   int has_xmm_arg_call;
 
+  /* --annotate-asm: index of the IR instruction currently being lowered. The
+   * mir_emit chokepoint stamps it onto every MirInst whose ir_index is still
+   * unset (-1), so each emitted op can be traced back to its source line. Inert
+   * unless the annotator is enabled. */
+  int cur_ir_index;
+
   int has_error;
 } MirFunction;
 
@@ -455,6 +481,10 @@ MirOperand mir_op_mem_rbp(int rbp_disp);
 
 /* Debug dump of a MIR function to a FILE (used under METTLE_MIR_DUMP). */
 void mir_function_dump(const MirFunction *fn, FILE *out);
+
+/* Human-readable mnemonic for a MIR opcode (e.g. "mov", "simd_fill"). Used by
+ * the dump and by the --annotate-asm codegen annotator. */
+const char *mir_opcode_name(MirOpcode op);
 
 /* ---- passes ------------------------------------------------------------- */
 

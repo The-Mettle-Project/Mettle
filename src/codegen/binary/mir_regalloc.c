@@ -63,7 +63,9 @@ static int mir_fn_has_calls(const MirFunction *fn) {
         fn->insns[i].op == MIR_SIMD_SLP_MAC ||
         fn->insns[i].op == MIR_SIMD_FILL ||
         fn->insns[i].op == MIR_SIMD_AFFINE_MAP_F32 ||
-        fn->insns[i].op == MIR_SIMD_SILU_F32) {
+        fn->insns[i].op == MIR_SIMD_AFFINE_MAP_F64 ||
+        fn->insns[i].op == MIR_SIMD_SILU_F32 ||
+        fn->insns[i].op == MIR_SIMD_VLOOP) {
       return 1;
     }
   }
@@ -80,7 +82,9 @@ static int mir_fn_uses_slp(const MirFunction *fn) {
     if (fn->insns[i].op == MIR_SIMD_SLP_MAC ||
         fn->insns[i].op == MIR_SIMD_FILL ||
         fn->insns[i].op == MIR_SIMD_AFFINE_MAP_F32 ||
-        fn->insns[i].op == MIR_SIMD_SILU_F32) {
+        fn->insns[i].op == MIR_SIMD_AFFINE_MAP_F64 ||
+        fn->insns[i].op == MIR_SIMD_SILU_F32 ||
+        fn->insns[i].op == MIR_SIMD_VLOOP) {
       return 1;
     }
   }
@@ -912,7 +916,9 @@ static int mir_regalloc_color(MirFunction *fn) {
         fn->insns[i].op != MIR_SIMD_SLP_MAC &&
         fn->insns[i].op != MIR_SIMD_FILL &&
         fn->insns[i].op != MIR_SIMD_AFFINE_MAP_F32 &&
-        fn->insns[i].op != MIR_SIMD_SILU_F32) {
+        fn->insns[i].op != MIR_SIMD_AFFINE_MAP_F64 &&
+        fn->insns[i].op != MIR_SIMD_SILU_F32 &&
+        fn->insns[i].op != MIR_SIMD_VLOOP) {
       continue;
     }
     int c = (int)i;
@@ -1130,7 +1136,9 @@ int mir_regalloc(MirFunction *fn) {
         fn->insns[i].op != MIR_SIMD_SLP_MAC &&
         fn->insns[i].op != MIR_SIMD_FILL &&
         fn->insns[i].op != MIR_SIMD_AFFINE_MAP_F32 &&
-        fn->insns[i].op != MIR_SIMD_SILU_F32) {
+        fn->insns[i].op != MIR_SIMD_AFFINE_MAP_F64 &&
+        fn->insns[i].op != MIR_SIMD_SILU_F32 &&
+        fn->insns[i].op != MIR_SIMD_VLOOP) {
       continue;
     }
     int c = (int)i;

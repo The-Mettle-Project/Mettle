@@ -56,6 +56,9 @@ void ir_explain_set_output_path(const char *path) {
  * the document. */
 
 static int g_explain_json = 0;
+/* When set (by --annotate-asm), ir_explain_flush keeps the remark table alive
+ * past optimization so the codegen annotator can join it onto emitted asm. */
+static int g_explain_retain_remarks = 0;
 static char *g_json_buf = NULL;
 static size_t g_json_len = 0;
 static size_t g_json_cap = 0;
@@ -224,6 +227,36 @@ void ir_optimize_set_explain(int enabled, const char *focus_file) {
 }
 
 int ir_explain_enabled(void) { return g_explain; }
+
+void ir_explain_set_retain_remarks(int enabled) {
+  g_explain_retain_remarks = enabled ? 1 : 0;
+}
+
+/* --annotate-asm reads the collected remarks to enrich its codegen listing with
+ * the same verified vectorization/inlining narration. These accessors expose the
+ * remark table read-only without leaking the struct definition. */
+size_t ir_explain_remark_count(void) { return g_remark_count; }
+
+int ir_explain_remark_at(size_t i, const char **function_name,
+                         const char **entity, size_t *line, int *positive,
+                         const char **headline, const char **reason,
+                         const char **fix, const char **verified,
+                         size_t *depth) {
+  if (i >= g_remark_count) {
+    return 0;
+  }
+  const IRExplainRemark *r = &g_remarks[i];
+  if (function_name) *function_name = r->function_name;
+  if (entity) *entity = r->entity;
+  if (line) *line = r->line;
+  if (positive) *positive = r->positive;
+  if (headline) *headline = r->headline;
+  if (reason) *reason = r->reason;
+  if (fix) *fix = r->fix;
+  if (verified) *verified = r->verified;
+  if (depth) *depth = r->depth;
+  return 1;
+}
 
 static const char *ir_explain_path_basename(const char *path) {
   const char *base = path;
@@ -1171,18 +1204,23 @@ void ir_explain_flush(void) {
   }
   ir_explain_json_raw("],");
 
-  for (size_t i = 0; i < g_remark_count; i++) {
-    free(g_remarks[i].function_name);
-    free(g_remarks[i].entity);
-    free(g_remarks[i].headline);
-    free(g_remarks[i].reason);
-    free(g_remarks[i].fix);
-    free(g_remarks[i].verified);
+  /* --annotate-asm reads the remarks during codegen (which runs AFTER this
+   * optimization-stage flush), so when retention is requested we keep them
+   * alive; the one-shot compile leaks them at exit. */
+  if (!g_explain_retain_remarks) {
+    for (size_t i = 0; i < g_remark_count; i++) {
+      free(g_remarks[i].function_name);
+      free(g_remarks[i].entity);
+      free(g_remarks[i].headline);
+      free(g_remarks[i].reason);
+      free(g_remarks[i].fix);
+      free(g_remarks[i].verified);
+    }
+    free(g_remarks);
+    g_remarks = NULL;
+    g_remark_count = 0;
+    g_remark_capacity = 0;
   }
-  free(g_remarks);
-  g_remarks = NULL;
-  g_remark_count = 0;
-  g_remark_capacity = 0;
 
   /* Memory diagnostics land after "remarks" and before "backend". */
   ir_explain_memory_flush();

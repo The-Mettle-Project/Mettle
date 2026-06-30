@@ -414,6 +414,115 @@ static int ir_profile_instrument_function_ops(IRFunction *function) {
   return 1;
 }
 
+static int ir_profile_build_block_instruction(IRInstruction *instruction,
+                                              uint32_t block_id,
+                                              SourceLocation location) {
+  if (!instruction) {
+    return 0;
+  }
+
+  memset(instruction, 0, sizeof(*instruction));
+  instruction->op = IR_OP_CALL;
+  instruction->location = location;
+  instruction->text = mettle_strdup("mettle_profile_block");
+  if (!instruction->text) {
+    return 0;
+  }
+  instruction->argument_count = 1;
+  instruction->arguments = malloc(sizeof(IROperand));
+  if (!instruction->arguments) {
+    free(instruction->text);
+    instruction->text = NULL;
+    return 0;
+  }
+  instruction->arguments[0] = ir_operand_int((long long)block_id);
+  return 1;
+}
+
+int ir_profile_instruction_is_block(const IRInstruction *instruction,
+                                    uint32_t *block_id_out) {
+  if (!instruction || instruction->op != IR_OP_CALL || !instruction->text ||
+      strcmp(instruction->text, "mettle_profile_block") != 0 ||
+      instruction->argument_count != 1 ||
+      instruction->arguments[0].kind != IR_OPERAND_INT) {
+    return 0;
+  }
+  if (block_id_out) {
+    *block_id_out = (uint32_t)instruction->arguments[0].int_value;
+  }
+  return 1;
+}
+
+static int ir_profile_insert_block_marker(IRFunction *function, size_t index,
+                                          uint32_t block_id,
+                                          SourceLocation location) {
+  IRInstruction marker = {0};
+
+  if (!ir_profile_build_block_instruction(&marker, block_id, location) ||
+      !ir_function_insert_instruction(function, index, &marker)) {
+    ir_profile_destroy_op_instruction(&marker);
+    return 0;
+  }
+  ir_profile_destroy_op_instruction(&marker);
+  return 1;
+}
+
+static int ir_profile_instrument_function_blocks(IRFunction *function,
+                                                 uint32_t *next_block_id) {
+  SourceLocation location = {0};
+
+  if (!function) {
+    return 1;
+  }
+
+  /* Entry block. Use the first real instruction's location for line mapping. */
+  if (function->instruction_count > 0) {
+    location = function->instructions[0].location;
+  }
+  if (!ir_profile_insert_block_marker(function, 0, *next_block_id, location)) {
+    return 0;
+  }
+  (*next_block_id)++;
+
+  /* Every label heads a basic block. Insert the counter just after the label
+   * so the label stays the branch target and the counter runs on block entry.
+   * The scan starts past the entry marker we just inserted at index 0. */
+  for (size_t i = 1; i < function->instruction_count; i++) {
+    if (function->instructions[i].op != IR_OP_LABEL) {
+      continue;
+    }
+    location = function->instructions[i].location;
+    if (!ir_profile_insert_block_marker(function, i + 1, *next_block_id,
+                                        location)) {
+      return 0;
+    }
+    (*next_block_id)++;
+    i++; /* skip the marker we just inserted */
+  }
+
+  return 1;
+}
+
+int ir_profile_instrument_blocks(IRProgram *program) {
+  uint32_t next_block_id = 0;
+
+  if (!program) {
+    return 0;
+  }
+
+  for (size_t i = 0; i < program->function_count; i++) {
+    IRFunction *function = program->functions[i];
+    if (!function || !ir_profile_should_instrument(function)) {
+      continue;
+    }
+    if (!ir_profile_instrument_function_blocks(function, &next_block_id)) {
+      return 0;
+    }
+  }
+
+  return 1;
+}
+
 int ir_profile_instrument_operation_counters(IRProgram *program) {
   if (!program) {
     return 0;

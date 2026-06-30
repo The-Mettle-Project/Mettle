@@ -1,4 +1,5 @@
 #include "codegen/binary/mir.h"
+#include "codegen/binary/mir_annotate.h"
 #include "codegen/code_generator_internal.h"
 #include "semantic/symbol_table.h"
 
@@ -1559,8 +1560,18 @@ int mir_encode(MirFunction *fn) {
   }
   BinaryFunctionContext *ctx = fn->context;
 
+  /* --annotate-asm: byte offsets are reported relative to this function's start
+   * (the context's code buffer may already hold earlier functions). */
+  size_t annot_base = ctx->code.size;
+  int annot = mir_annotate_enabled();
+
   if (!mir_layout_frame(fn) || !mir_emit_prologue(fn)) {
     return 0;
+  }
+  if (annot && ctx->code.size > annot_base) {
+    mir_annotate_record_synthetic("prologue", "frame", 0,
+                                  ctx->code.size - annot_base,
+                                  ctx->code.data + annot_base);
   }
 
   /* Loop-header alignment: a label that is the target of a BACKWARD branch is a
@@ -1590,6 +1601,7 @@ int mir_encode(MirFunction *fn) {
   for (size_t i = 0; i < fn->insn_count; i++) {
     const MirInst *in = &fn->insns[i];
     int ok = 1;
+    size_t annot_off = ctx->code.size;
     if (in->op == MIR_LABEL && align_label && align_label[i]) {
       while (ctx->code.size % 16 != 0) {
         if (!binary_code_buffer_append_u8(&ctx->code, 0x90)) {
@@ -1797,6 +1809,32 @@ int mir_encode(MirFunction *fn) {
               (unsigned)in->b.imm, (in->cc & 1) != 0, (in->cc & 2) != 0,
               (in->cc & 4) != 0)) {
         ok = enc_err(fn, "out of memory emitting inline affine-map kernel");
+      }
+      break;
+    }
+    case MIR_SIMD_AFFINE_MAP_F64: {
+      /* Inline float64 affine map. The preceding MIR_MOVs marshalled src->RCX,
+       * dst->RDX, count->R8; dst.imm/a.imm/b.imm hold the a/b/c coefficient
+       * double bits and cc holds b_is_one|b_is_zero<<1|c_is_zero<<2. The kernel
+       * emits its own closing vzeroupper, so used_inline_vector stays unset. */
+      if (!code_generator_binary_emit_simd_affine_map_f64_inline(
+              &ctx->code, (unsigned long long)in->dst.imm,
+              (unsigned long long)in->a.imm, (unsigned long long)in->b.imm,
+              (in->cc & 1) != 0, (in->cc & 2) != 0, (in->cc & 4) != 0,
+              (in->cc & 8) != 0)) {
+        ok = enc_err(fn, "out of memory emitting inline f64 affine-map kernel");
+      }
+      break;
+    }
+    case MIR_SIMD_VLOOP: {
+      /* Inline general vloop (float64 map). The preceding MIR_MOVs marshalled the
+       * base pointers + count into the ABI arg registers; the DAG comes from the
+       * borrowed IRInstruction in `aux`. operands_marshaled=1 makes the kernel
+       * read them from registers instead of the operands' stack homes. */
+      const IRInstruction *vir = (const IRInstruction *)in->aux;
+      if (!vir || !code_generator_binary_emit_simd_vloop_f64(
+                      fn->generator, fn->context, vir, 1)) {
+        ok = enc_err(fn, "out of memory emitting inline vloop kernel");
       }
       break;
     }
@@ -2062,6 +2100,11 @@ int mir_encode(MirFunction *fn) {
     default:
       ok = enc_err(fn, "unsupported MIR opcode in encoder");
       break;
+    }
+    if (annot && ok && ctx->code.size > annot_off) {
+      mir_annotate_record(fn, in, (int)i, annot_off - annot_base,
+                          ctx->code.size - annot_off,
+                          ctx->code.data + annot_off);
     }
     if (!ok) {
       free(align_label);

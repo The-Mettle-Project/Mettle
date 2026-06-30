@@ -2,7 +2,7 @@
   "name": "mettle-syntax",
   "displayName": "Mettle Language Support",
   "description": "Full language support for Mettle (.mettle): source-level debugging (breakpoints, stepping, live variable editing), go to definition, references, rename, outline, completion, signature help, compiler-backed diagnostics, run/build, and an interactive optimization report panel with one-click compiler-verified fixes.",
-  "version": "0.17.0",
+  "version": "0.18.0",
   "publisher": "TheMettleProject",
   "license": "Apache-2.0",
   "repository": {
@@ -34,7 +34,7 @@
   ],
   "main": "extension.js",
   "scripts": {
-    "check": "node ./scripts/check-extension.js && node ./scripts/test-explain-parse.js && node ./scripts/test-analysis.js && node ./scripts/test-language.js",
+    "check": "node ./scripts/check-extension.js && node ./scripts/test-explain-parse.js && node ./scripts/test-analysis.js && node ./scripts/test-language.js && node ./scripts/test-profile.js",
     "vscode:prepublish": "npm run check"
   },
   "contributes": {
@@ -76,6 +76,18 @@
         "title": "Mettle: Debug File",
         "category": "Mettle",
         "icon": "$(debug-alt)"
+      },
+      {
+        "command": "mettle.showCodegenAnnotations",
+        "title": "Mettle: Show Codegen Annotations",
+        "category": "Mettle",
+        "icon": "$(file-binary)"
+      },
+      {
+        "command": "mettle.profileCodegen",
+        "title": "Mettle: Profile Codegen (measured)",
+        "category": "Mettle",
+        "icon": "$(flame)"
       }
     ],
     "menus": {
@@ -89,6 +101,16 @@
           "command": "mettle.showOptimizationReport",
           "when": "editorLangId == mettle",
           "group": "navigation@2"
+        },
+        {
+          "command": "mettle.showCodegenAnnotations",
+          "when": "editorLangId == mettle",
+          "group": "navigation@3"
+        },
+        {
+          "command": "mettle.profileCodegen",
+          "when": "editorLangId == mettle",
+          "group": "navigation@4"
         }
       ]
     },
@@ -276,6 +298,23 @@
           "minimum": 2000,
           "description": "Maximum time in milliseconds for one --release --explain compile (verified fix simulations included)."
         },
+        "mettle.codegen.asmSyntax": {
+          "type": "string",
+          "enum": ["intel", "att"],
+          "default": "intel",
+          "description": "Default assembly syntax for the Codegen Annotations panel (toggle live in the panel)."
+        },
+        "mettle.codegen.refreshOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Recompile and refresh the Codegen Annotations panel when its source file is saved."
+        },
+        "mettle.codegen.timeoutMs": {
+          "type": "number",
+          "default": 30000,
+          "minimum": 2000,
+          "description": "Maximum time in milliseconds for one --annotate-asm compile."
+        },
         "mettle.hints.parameterNames": {
           "type": "string",
           "enum": ["off", "literals", "all"],
@@ -300,6 +339,11 @@
             "type": "string"
           },
           "description": "Extra compiler arguments for Mettle: Run File / Build File (for example --native-heap)."
+        },
+        "mettle.profile.runTimeoutMs": {
+          "type": "number",
+          "default": 60000,
+          "description": "Maximum time (ms) the instrumented binary may run during Mettle: Profile Codegen before it is killed."
         }
       }
     }

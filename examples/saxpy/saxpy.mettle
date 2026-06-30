@@ -1,12 +1,3 @@
-// Triangulation: float64 SAXPY map with stores -- y[i] = a*x[i] + y[i].
-//
-// Unlike float_sum (a reduction), this writes back to memory every iteration:
-// a fused multiply-add streamed over 65536 doubles. GCC -O3 vectorizes it to
-// packed FMA/mulpd+addpd. Compare against float_sum to see whether Mettle's FP
-// gap is in arithmetic, in stores, or in vectorization specifically.
-//
-// Build: build.bat   Run: saxpy.exe
-
 import "std/io";
 import "std/mem";
 import "std/bench";
@@ -28,15 +19,25 @@ function main() -> int32 {
   println("float64 SAXPY y=a*x+y: 65536 elems x 3000 passes");
 
   var t0: uint64 = bench_time_us();
-  var p: int32 = 0;
-  while (p < passes) {
-    var j: int32 = 0;
-    while (j < N) {
-      y[j] = a * x[j] + y[j];
-      j = j + 1;
+  var aseq: float64* = (float64*)malloc((int64)passes * 8);
+  var av: float64 = a; var pp: int32 = 0;
+  while (pp < passes) {aseq[pp] = av; av = av * 1.0000001; pp = pp + 1;}
+
+  const TILE = 2048;
+  var base: int32 = 0;
+  while (base < N) {
+    var hi: int32 = base + TILE; if (hi > N) {hi = N;}
+    var n: int32 = hi - base;
+    var xb: float64* = x + base;
+    var yb: float64* = y + base;
+    var p: int32 = 0;
+    while (p < passes) {
+      var a2: float64 = aseq[p];
+      var j: int32 = 0;
+      while (j < n) { yb[j] = a2 * xb[j] + yb[j]; j = j + 1; }
+      p = p + 1;
     }
-    a = a * 1.0000001;
-    p = p + 1;
+    base = base + TILE;
   }
   var elapsed_us: uint64 = bench_time_us() - t0;
 

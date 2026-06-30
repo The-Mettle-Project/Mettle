@@ -17,6 +17,8 @@ const fs = require('fs');
 const os = require('os');
 const { registerExplain } = require('./explain');
 const { registerLanguageFeatures } = require('./language');
+const { registerCodegen } = require('./codegen');
+const { registerProfile } = require('./profile');
 const { registerDebugAdapter } = require('./debugAdapter');
 
 /** @type {vscode.DiagnosticCollection} */
@@ -813,6 +815,27 @@ function activate(context) {
   });
   context.subscriptions.push(
     vscode.commands.registerCommand('mettle.showOptimizationReport', explain.showReport)
+  );
+
+  // Codegen annotations: annotated assembly with the compiler decision behind
+  // each instruction, in a synced side panel (+ source decorations, CodeLens).
+  const codegen = registerCodegen(context, {
+    findCompiler,
+    log: (line) => mettleOutputChannel?.appendLine(line),
+  });
+  context.subscriptions.push(
+    vscode.commands.registerCommand('mettle.showCodegenAnnotations', codegen.showAnnotations)
+  );
+
+  // VTune-style measured codegen profiler: builds + runs the file instrumented
+  // with per-basic-block counters, fuses the measured frequency with the static
+  // port-cost model, and renders hotspots / port utilization / a flame graph.
+  const profile = registerProfile(context, {
+    findCompiler,
+    log: (line) => mettleOutputChannel?.appendLine(line),
+  });
+  context.subscriptions.push(
+    vscode.commands.registerCommand('mettle.profileCodegen', profile.showProfile)
   );
 
   // Navigation and editing intelligence (definition, references, rename,

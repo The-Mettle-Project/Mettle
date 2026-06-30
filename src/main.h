@@ -34,6 +34,17 @@ typedef struct {
                       inlining) for the main input file, with reasons */
   int explain_all; /* --explain-all: drop the focus filter (whole program) */
   int explain_json; /* --explain-json: machine-readable .explain.json sidecar */
+  int annotate_asm; /* --annotate-asm: emit asm annotated with codegen decisions
+                       (a listing on stdout + <stem>.annot.json sidecar) */
+  int asm_syntax;   /* 0=intel, 1=att, 2=both (matches MirAnnotSyntax) */
+  /* LLM-facing focused codegen queries (imply --annotate-asm). When a line
+   * range is set the annotator prints a compact report for just those source
+   * lines (asm + cost + covering loops + live registers + decisions) instead of
+   * the full listing; the hot query prints the program's top hotspots. */
+  int annotate_q_lo; /* --annotate-lines=A-B: first source line (0 = unset) */
+  int annotate_q_hi; /* last source line of the range */
+  const char *annotate_q_fn; /* --annotate-fn=NAME: restrict to one function */
+  int annotate_hot; /* --annotate-hot[=N]: top-N hotspots (0 = unset) */
   int emit_object;
   int generate_debug_symbols;
   int generate_line_mapping;
@@ -48,6 +59,9 @@ typedef struct {
   int profile;
   int profile_runtime;
   int profile_runtime_ops;
+  int profile_blocks; /* --profile-blocks: per-basic-block execution counters
+                         dumped to a .mprof sidecar for the VTune-style codegen
+                         view; implies --profile-runtime. */
   int debug_hooks; /* --debug-hooks: interactive debugger instrumentation */
   int native_heap;
   int tracy;

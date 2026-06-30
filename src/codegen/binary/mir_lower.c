@@ -1,5 +1,6 @@
 #include "codegen/binary/mir.h"
 
+#include "codegen/binary/mir_annotate.h"
 #include "common.h"
 #include "ir/ir_optimize.h"
 #include "semantic/symbol_table.h"
@@ -1549,12 +1550,14 @@ int mir_function_is_eligible(CodeGenerator *generator,
       }
       break;
     }
+    case IR_OP_SIMD_AFFINE_MAP_F64:
     case IR_OP_SIMD_AFFINE_MAP_F32: {
-      /* Inline float32 affine-map passthrough (`dst[i]=a*src[i]+b*dst[i]+c`, the
+      /* Inline float affine-map passthrough (`dst[i]=a*src[i]+b*dst[i]+c`, the
        * float-copy/saxpy class). src (lhs) and dst (rhs) must be LEA-able
        * pointers (TEMP/SYMBOL), the count GP-resolvable, and the a/b/c
        * coefficients compile-time FLOAT immediates (so the kernel can bake their
-       * broadcasts); a runtime coefficient stays in the fallback. */
+       * broadcasts); a runtime coefficient stays in the fallback. F32 and F64
+       * share this validation; the lowering below picks the width. */
       if (in->argument_count < 4 || !in->arguments) {
         return mir_trace_bail(function_data, "affine_map:shape");
       }
@@ -1568,9 +1571,48 @@ int mir_function_is_eligible(CodeGenerator *generator,
         return mir_trace_bail(function_data, "affine_map:count");
       }
       for (int k = 1; k <= 3; k++) {
-        if (in->arguments[k].kind != IR_OPERAND_FLOAT) {
-          return mir_trace_bail(function_data, "affine_map:coeff");
+        if (in->arguments[k].kind == IR_OPERAND_FLOAT) continue;
+        /* F64 additionally accepts a RUNTIME `a` scale (arguments[1]) -- the
+         * saxpy `y=a*x+y` shape where a varies per pass; it is marshalled into
+         * an xmm and broadcast at runtime. b and c (args 2,3) must stay
+         * compile-time so their broadcasts are baked. F32 stays const-only. */
+        if (in->op == IR_OP_SIMD_AFFINE_MAP_F64 && k == 1 &&
+            (in->arguments[k].kind == IR_OPERAND_TEMP ||
+             in->arguments[k].kind == IR_OPERAND_SYMBOL)) {
+          continue;
         }
+        return mir_trace_bail(function_data, "affine_map:coeff");
+      }
+      break;
+    }
+    case IR_OP_SIMD_VLOOP_F64: {
+      /* Inline general-vectorized-loop passthrough (float64 MAPS only). The DAG
+       * is carried by reference at lowering; here we only gate the marshalling:
+       * a map (not a reduction), float64 lanes, and <=3 distinct base pointers
+       * so the element count still fits in an ABI arg register (RCX/RDX/R8/R9)
+       * alongside them. Integer/float32 vloops and reductions stay in the
+       * fallback. */
+      const char *vnames[4];
+      const IROperand *vsrcs[4];
+      int vn = 0;
+      if (in->argument_count < 7 || !in->arguments ||
+          in->arguments[0].int_value != 0 /* reduce_op: maps only */ ||
+          in->float_bits != 64) {
+        return mir_trace_bail(function_data, "vloop:shape");
+      }
+      if (code_generator_vloop_collect_dist(in, 0, vnames, vsrcs, &vn) < 0 ||
+          vn > 3) {
+        return mir_trace_bail(function_data, "vloop:bases");
+      }
+      for (int vk = 0; vk < vn; vk++) {
+        if (!vsrcs[vk] || (vsrcs[vk]->kind != IR_OPERAND_TEMP &&
+                           vsrcs[vk]->kind != IR_OPERAND_SYMBOL)) {
+          return mir_trace_bail(function_data, "vloop:ptr");
+        }
+      }
+      if (in->lhs.kind != IR_OPERAND_TEMP && in->lhs.kind != IR_OPERAND_SYMBOL &&
+          in->lhs.kind != IR_OPERAND_INT) {
+        return mir_trace_bail(function_data, "vloop:count");
       }
       break;
     }
@@ -3620,6 +3662,81 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
                      mir_op_imm(b_bits), mir_op_imm(c_bits), 4, 0, flags);
   }
 
+  case IR_OP_SIMD_AFFINE_MAP_F64: {
+    /* Inline float64 affine map: marshal src->RCX, dst->RDX, count->R8, then
+     * emit the kernel with the (compile-time) a/b/c coefficient 64-bit bits in
+     * dst/a/b.imm and the b_is_one/b_is_zero/c_is_zero flags in cc. */
+    MirOperand src = mir_value_operand(fn, g, ctx, map, &in->lhs);
+    MirOperand dst = mir_value_operand(fn, g, ctx, map, &in->rhs);
+    MirOperand cnt = mir_value_operand(fn, g, ctx, map, &in->arguments[0]);
+    if (!mir_emit1(fn, MIR_MOV, mir_op_phys(BINARY_GP_RCX, MIR_RC_GP), src,
+                   mir_op_none(), 8, 0, 0) ||
+        !mir_emit1(fn, MIR_MOV, mir_op_phys(BINARY_GP_RDX, MIR_RC_GP), dst,
+                   mir_op_none(), 8, 0, 0) ||
+        !mir_emit1(fn, MIR_MOV, mir_op_phys(BINARY_GP_R8, MIR_RC_GP), cnt,
+                   mir_op_none(), 8, 0, 0)) {
+      return 0;
+    }
+    /* Runtime `a`: marshal its scalar value into XMM4 (the kernel's `a` lane,
+     * a caller-saved register the kernel clobbers anyway) right before the
+     * kernel, which then broadcasts it instead of materializing an immediate. */
+    int a_runtime = in->arguments[1].kind != IR_OPERAND_FLOAT;
+    if (a_runtime) {
+      MirOperand av = mir_value_operand(fn, g, ctx, map, &in->arguments[1]);
+      if (!mir_emit_fmov(fn, mir_op_phys(BINARY_XMM4, MIR_RC_XMM), av, 8)) {
+        return 0;
+      }
+    }
+    long long a_bits =
+        a_runtime ? 0
+                  : (long long)mir_float_bits_at(in->arguments[1].float_value, 8);
+    long long b_bits = (long long)mir_float_bits_at(in->arguments[2].float_value, 8);
+    long long c_bits = (long long)mir_float_bits_at(in->arguments[3].float_value, 8);
+    int b_is_one = in->arguments[2].float_value == 1.0;
+    int b_is_zero = in->arguments[2].float_value == 0.0;
+    int c_is_zero = in->arguments[3].float_value == 0.0;
+    unsigned char flags = (unsigned char)((b_is_one ? 1 : 0) |
+                                          (b_is_zero ? 2 : 0) |
+                                          (c_is_zero ? 4 : 0) |
+                                          (a_runtime ? 8 : 0));
+    return mir_emit1(fn, MIR_SIMD_AFFINE_MAP_F64, mir_op_imm(a_bits),
+                     mir_op_imm(b_bits), mir_op_imm(c_bits), 8, 0, flags);
+  }
+
+  case IR_OP_SIMD_VLOOP_F64: {
+    /* Inline general vloop (float64 map): marshal the <=3 distinct base pointers
+     * into RCX/RDX/R8/R9 (kGp order, matching the kernel's dist) and the element
+     * count into the next arg register; the kernel reads its DAG from the
+     * borrowed IRInstruction in `aux`. */
+    static const int kGp[4] = {BINARY_GP_RCX, BINARY_GP_RDX, BINARY_GP_R8,
+                               BINARY_GP_R9};
+    const char *vnames[4];
+    const IROperand *vsrcs[4];
+    int vn = 0;
+    if (code_generator_vloop_collect_dist(in, 0, vnames, vsrcs, &vn) < 0 ||
+        vn > 3) {
+      return 0;
+    }
+    for (int vk = 0; vk < vn; vk++) {
+      MirOperand v = mir_value_operand(fn, g, ctx, map, vsrcs[vk]);
+      if (!mir_emit1(fn, MIR_MOV, mir_op_phys(kGp[vk], MIR_RC_GP), v,
+                     mir_op_none(), 8, 0, 0)) {
+        return 0;
+      }
+    }
+    MirOperand cnt = mir_value_operand(fn, g, ctx, map, &in->lhs);
+    if (!mir_emit1(fn, MIR_MOV, mir_op_phys(kGp[vn], MIR_RC_GP), cnt,
+                   mir_op_none(), 8, 0, 0)) {
+      return 0;
+    }
+    MirInst v;
+    memset(&v, 0, sizeof(v));
+    v.op = MIR_SIMD_VLOOP;
+    v.ir_index = -1;
+    v.aux = in; /* borrowed: the IR outlives this function's codegen */
+    return mir_emit(fn, &v);
+  }
+
   case IR_OP_SIMD_SILU_F32: {
     /* Inline SiLU/SwiGLU gate: marshal g/out->RCX, count->R8, u->RDX (SwiGLU),
      * then emit the kernel with has_mul in dst.imm. */
@@ -4758,6 +4875,9 @@ int code_generator_binary_emit_function_via_mir(
   }
 
   for (size_t i = 0; i < ir_function->instruction_count; i++) {
+    /* --annotate-asm: attribute every op emitted while lowering this IR
+     * instruction back to it (inert when the annotator is off). */
+    fn.cur_ir_index = (int)i;
     if (fold_skip[i]) {
       continue; /* address sub-expression folded into a SIB access */
     }
@@ -4896,9 +5016,20 @@ int code_generator_binary_emit_function_via_mir(
   if (getenv("METTLE_MIR_DUMP")) {
     mir_function_dump(&fn, stderr);
   }
+  /* --annotate-asm: open a capture context so mir_encode's per-instruction
+   * records land under this function (inert when the annotator is off). */
+  fn.cur_ir_index = -1;
+  if (mir_annotate_enabled()) {
+    mir_annotate_begin_function(
+        function_data->name, ir_function, mir_function_filename(function_data),
+        (function_data->body ? function_data->body->location.line : 0));
+    mir_annotate_note_backend("register-allocated", NULL);
+  }
   if (!mir_encode(&fn) || fn.has_error) {
+    mir_annotate_end_function();
     goto oom;
   }
+  mir_annotate_end_function();
 
   free(wb.names);
   free(wb.all);

@@ -29,7 +29,7 @@ examples/llm/
 web/benchmarks.json
 MettleWarband/
 MettleWarband.zip
-# --ml-opt transient artifacts (regenerated each compile)
 _mlopt.ir
 _mlopt.disp
 _mlopt.explain
+*.mprof
