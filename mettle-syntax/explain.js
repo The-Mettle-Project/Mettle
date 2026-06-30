@@ -364,18 +364,18 @@ function modelFromJson(json) {
 // optimizer already re-checked the change on a clone, so applying it is safe
 // by construction.
 
-/** Find the 0-based line of `function <name>(` at or above `belowLine`. */
+/** Find the 0-based line of `fn <name>(` at or above `belowLine`. */
 function findFunctionStart(lines, fnName, belowLine) {
-  const re = new RegExp(`^\\s*(?:export\\s+)?(?:@\\w+!?\\s+)*function\\s+${escapeRe(fnName)}\\s*[(<]`);
+  const re = new RegExp(`^\\s*(?:export\\s+)?(?:@\\w+!?\\s+)*fn\\s+${escapeRe(fnName)}\\s*[(<]`);
   for (let i = Math.min(belowLine, lines.length - 1); i >= 0; i--) {
     if (re.test(lines[i])) return i;
   }
   return -1;
 }
 
-/** Find `function <name>(` anywhere in the file (for callee-side edits). */
+/** Find `fn <name>(` anywhere in the file (for callee-side edits). */
 function findFunctionAnywhere(lines, fnName) {
-  const re = new RegExp(`^(\\s*)((?:export\\s+)?(?:@\\w+!?\\s+)*)function\\s+${escapeRe(fnName)}\\s*[(<]`);
+  const re = new RegExp(`^(\\s*)((?:export\\s+)?(?:@\\w+!?\\s+)*)fn\\s+${escapeRe(fnName)}\\s*[(<]`);
   for (let i = 0; i < lines.length; i++) {
     const m = lines[i].match(re);
     if (m) return { line: i, indent: m[1], decorators: m[2] };

@@ -137,11 +137,11 @@ struct Vec2 {
     }
 }
 
-function blend(a: float32, b: float32, t: float32) -> float32 {
+fn blend(a: float32, b: float32, t: float32) -> float32 {
     return a + (b - a) * t;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     var v: Vec2;
     v.x = 1.0;
     var r: float32 = blend(1.0, 2.0, 0.5);
@@ -149,7 +149,7 @@ function main() -> int32 {
     return 0;
 }
 `;
-const GEO = `export function area(w: float32, h: float32) -> float32 {
+const GEO = `export fn area(w: float32, h: float32) -> float32 {
     return w * h;
 }
 `;

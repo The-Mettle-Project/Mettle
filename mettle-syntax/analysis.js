@@ -311,7 +311,7 @@ function scanModule(text, filePath) {
           }
           continue;
         }
-        const meth = bodyLine.match(/^\s*(?:export\s+)?(?:@\w+!?\s+)*(?:method|function)\s+([A-Za-z_][A-Za-z0-9_]*)/);
+        const meth = bodyLine.match(/^\s*(?:export\s+)?(?:@\w+!?\s+)*(?:method|fn)\s+([A-Za-z_][A-Za-z0-9_]*)/);
         if (meth) {
           const mcol = bodyLine.indexOf(meth[1], bodyLine.indexOf(meth[0]));
           const callable = parseCallable(bl, mcol + meth[1].length);

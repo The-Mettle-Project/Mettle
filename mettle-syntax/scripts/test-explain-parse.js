@@ -132,7 +132,7 @@ const dampFix = synthesizeFix(dampLoop, contractsLines);
 if (!dampFix) fail('remove-@noinline fix not synthesized');
 {
   const after = applyEdits(contractsLines, dampFix.edits);
-  const dampDecl = after.find((l) => /function damp\(/.test(l));
+  const dampDecl = after.find((l) => /fn damp\(/.test(l));
   if (!dampDecl || /@noinline/.test(dampDecl)) {
     fail(`remove-@noinline fix did not strip the decorator: ${dampDecl}`);
   }
@@ -146,8 +146,8 @@ const chainFix = synthesizeFix(chainCall, contractsLines);
 if (!chainFix) fail('mark-@inline fix not synthesized for chain');
 {
   const after = applyEdits(contractsLines, chainFix.edits);
-  const chainDecl = after.find((l) => /function chain\(/.test(l));
-  if (!chainDecl || !/^@inline function chain\(/.test(chainDecl)) {
+  const chainDecl = after.find((l) => /fn chain\(/.test(l));
+  if (!chainDecl || !/^@inline fn chain\(/.test(chainDecl)) {
     fail(`mark-@inline fix wrong: ${chainDecl}`);
   }
 }
@@ -201,7 +201,7 @@ const jsonFix = synthesizeFix(jsonNoinline, jsonSourceLines);
 if (!jsonFix) fail('fix synthesis failed on a JSON-sourced remark');
 {
   const after = applyEdits(jsonSourceLines, jsonFix.edits);
-  if (!after.some((l) => /^function scale\(/.test(l))) {
+  if (!after.some((l) => /^fn scale\(/.test(l))) {
     fail('JSON-sourced @noinline removal did not produce a clean declaration');
   }
 }
