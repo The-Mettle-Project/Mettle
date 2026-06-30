@@ -91,6 +91,24 @@ fn main() -> int32 {
 
 **Type equality:** Two function pointer types are equal if they have the same parameter types and return type. `fn(int32) -> int32` is compatible with `fn(int32) -> int32` but not with `fn(int32, int32) -> int32`.
 
+### Anonymous Functions (Lambdas)
+
+`fn` may also be written in expression position to produce an anonymous function value, without naming it at the top level:
+
+```mettle
+var add: fn(int32, int32) -> int32 = fn(x: int32, y: int32) -> int32 {
+  return x + y;
+};
+var seven: int32 = add(3, 4);
+
+// Inline as a higher-order argument:
+var product: int32 = apply(fn(x: int32, y: int32) -> int32 { return x * y; }, 6, 7);
+```
+
+A lambda has the same `fn(params) -> ret` type as a named function and is a plain function pointer, so it is usable anywhere a function pointer is (including C callbacks). A return type is required; the body is a normal block.
+
+A lambda that references a variable from an enclosing scope is a *capturing closure*. Capturing closures are not yet supported and are reported at compile time; capture nothing, or pass state through an explicit parameter, for now. See [known limitations](known-limitations.md).
+
 ## Array Types
 
 Fixed-size arrays use `[N]` where N is a constant. Arrays are value types; the elements are laid out contiguously. Indexing is zero-based.

@@ -80,11 +80,13 @@ Source: "..\mettle.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\stdlib\*"; DestDir: "{app}\stdlib"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\bin\runtime\*"; DestDir: "{app}\runtime"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\bin\mlopt\*"; DestDir: "{app}\mlopt"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\README.html"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\docs\*"; DestDir: "{app}\docs"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\Mettle Documentation"; Filename: "{app}\README.md"
+Name: "{group}\Mettle Documentation"; Filename: "{app}\README.html"
 Name: "{group}\Mettle on GitHub"; Filename: "{#MyRepoUrl}"
 Name: "{group}\Uninstall Mettle"; Filename: "{uninstallexe}"
 

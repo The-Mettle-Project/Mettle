@@ -1,0 +1,21 @@
+// Anonymous function (lambda) expressions used as values.
+// Non-capturing lambdas are thin function pointers: storable, callable, and
+// passable as higher-order arguments.
+import "std/io";
+
+fn apply(f: fn(int32, int32) -> int32, a: int32, b: int32) -> int32 {
+  return f(a, b);
+}
+
+fn main() -> int32 {
+  var add: fn(int32, int32) -> int32 = fn(x: int32, y: int32) -> int32 {
+    return x + y;
+  };
+  if (add(3, 4) != 7) {
+    return 1;
+  }
+  if (apply(fn(x: int32, y: int32) -> int32 { return x * y; }, 6, 7) != 42) {
+    return 2;
+  }
+  return 0;
+}

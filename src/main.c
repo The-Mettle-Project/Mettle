@@ -2748,6 +2748,14 @@ static int compile_monomorphize(ASTNode *program,
     }
     return 0;
   }
+  if (!closure_convert_program(program, error_reporter)) {
+    if (error_reporter_has_errors(error_reporter)) {
+      error_reporter_print_errors(error_reporter);
+    } else {
+      fprintf(stderr, "Closure conversion error\n");
+    }
+    return 0;
+  }
   return 1;
 }
 

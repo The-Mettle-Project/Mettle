@@ -25,6 +25,10 @@ This document lists current limitations of the Mettle language, compiler, and ru
 
 Traits and constrained generics support inline bounds, multiple bounds, trailing `where` clauses on functions and structs, explicit impls, and trait method declarations with concrete impl method bodies. **Limitation:** generic trait-method calls on named values are monomorphized to concrete impl functions rather than resolved dynamically.
 
+### Anonymous Functions & Closures
+
+Anonymous functions are written `fn(params) -> ret { body }` in expression position and are first-class function pointers (storable, callable, passable as higher-order arguments, usable as C callbacks). **Limitation:** a lambda that captures a variable from an enclosing scope (a *capturing closure*) is not yet supported and is reported at compile time (`capturing closures are not yet supported`). For now, capture nothing, or thread state through an explicit parameter / user-data pointer.
+
 ### Pattern Matching
 
 - `**match` on tagged enums** supports both a statement form (arm bodies are `{ ... }` blocks) and an expression form that yields a value. In expression form, each arm body must be a single value-yielding expression (for example, `match (o) { case Some(v): v + 1, default: 0 }`). All arm types must unify, and the match must be exhaustive (`default:` or all variants covered) because it must always produce a value.

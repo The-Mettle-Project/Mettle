@@ -151,6 +151,39 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
                                                 expression->location);
   }
 
+  case AST_LAMBDA_EXPRESSION: {
+    /* Closure conversion lifted the lambda body to a top-level function and
+     * recorded its name here. A non-capturing lambda is the address of that
+     * function: a thin function pointer, exactly like `&func`. */
+    FunctionDeclaration *lam = (FunctionDeclaration *)expression->data;
+    if (!lam || !lam->name) {
+      type_checker_set_error_at_location(checker, expression->location,
+                                         "Internal: lambda was not converted");
+      return NULL;
+    }
+    Symbol *sym = symbol_table_lookup(checker->symbol_table, lam->name);
+    if (!sym || sym->kind != SYMBOL_FUNCTION) {
+      type_checker_set_error_at_location(checker, expression->location,
+                                         "Internal: lifted lambda function '%s' "
+                                         "not found",
+                                         lam->name);
+      return NULL;
+    }
+    Type *return_type = sym->data.function.return_type;
+    if (!return_type) {
+      return_type = checker->builtin_void;
+    }
+    Type *fp_type = type_create_function_pointer(
+        sym->data.function.parameter_types,
+        sym->data.function.parameter_count, return_type);
+    if (!fp_type) {
+      type_checker_set_error_at_location(checker, expression->location,
+                                         "Failed to create lambda type");
+      return NULL;
+    }
+    return fp_type;
+  }
+
   case AST_UNARY_EXPRESSION: {
     UnaryExpression *unop = (UnaryExpression *)expression->data;
     if (!unop || !unop->operator || !unop->operand) {

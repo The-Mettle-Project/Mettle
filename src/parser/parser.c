@@ -1676,6 +1676,103 @@ static int parser_identifier_name_is(ASTNode *expr, const char *name) {
   return id && id->name && strcmp(id->name, name) == 0;
 }
 
+static int parser_parse_parameter_list(Parser *parser, char ***out_names,
+                                       char ***out_types, size_t *out_count);
+
+/* Anonymous function (lambda) expression: `fn(params) [-> ret] { body }`. In
+ * expression position `fn` always begins a lambda; the type spelling
+ * `fn(...)->R` is parsed only in type positions by parser_parse_type_annotation,
+ * and named declarations only at the top level via parse_declaration. The node
+ * is an AST_LAMBDA_EXPRESSION carrying a FunctionDeclaration payload with a NULL
+ * name; the closure-conversion pass lifts it to a real top-level function. */
+static ASTNode *parser_parse_lambda_expression(Parser *parser) {
+  SourceLocation location = parser_current_location(parser);
+  parser_advance(parser); // consume 'fn'
+
+  if (!parser_expect(parser, TOKEN_LPAREN)) {
+    return NULL;
+  }
+
+  char **param_names = NULL;
+  char **param_types = NULL;
+  size_t param_count = 0;
+  if (!parser_parse_parameter_list(parser, &param_names, &param_types,
+                                   &param_count)) {
+    return NULL;
+  }
+
+  if (!parser_expect(parser, TOKEN_RPAREN)) {
+    for (size_t i = 0; i < param_count; i++) {
+      free(param_names[i]);
+      free(param_types[i]);
+    }
+    free(param_names);
+    free(param_types);
+    return NULL;
+  }
+
+  char *return_type = NULL;
+  if (parser->current_token.type == TOKEN_ARROW ||
+      parser->current_token.type == TOKEN_COLON) {
+    parser_advance(parser);
+    return_type = parser_parse_type_annotation(parser);
+    if (!return_type) {
+      if (!parser->has_error) {
+        parser_set_error(parser, "Expected return type after '->' in lambda");
+      }
+      for (size_t i = 0; i < param_count; i++) {
+        free(param_names[i]);
+        free(param_types[i]);
+      }
+      free(param_names);
+      free(param_types);
+      return NULL;
+    }
+  } else {
+    return_type = strdup("void");
+  }
+
+  if (parser->current_token.type != TOKEN_LBRACE) {
+    parser_set_error(parser, "Expected '{' to begin lambda body");
+    for (size_t i = 0; i < param_count; i++) {
+      free(param_names[i]);
+      free(param_types[i]);
+    }
+    free(param_names);
+    free(param_types);
+    free(return_type);
+    return NULL;
+  }
+
+  ASTNode *body = parser_parse_block(parser);
+  if (!body) {
+    for (size_t i = 0; i < param_count; i++) {
+      free(param_names[i]);
+      free(param_types[i]);
+    }
+    free(param_names);
+    free(param_types);
+    free(return_type);
+    return NULL;
+  }
+
+  ASTNode *node = ast_create_function_declaration(
+      NULL, param_names, param_types, param_count, return_type, body, location);
+  for (size_t i = 0; i < param_count; i++) {
+    free(param_names[i]);
+    free(param_types[i]);
+  }
+  free(param_names);
+  free(param_types);
+  free(return_type);
+  if (!node) {
+    ast_destroy_node(body);
+    return NULL;
+  }
+  node->type = AST_LAMBDA_EXPRESSION;
+  return node;
+}
+
 ASTNode *parser_parse_primary_expression(Parser *parser) {
   if (!parser)
     return NULL;
@@ -1741,6 +1838,9 @@ ASTNode *parser_parse_primary_expression(Parser *parser) {
     }
     return expr;
   }
+  case TOKEN_FN:
+  case TOKEN_FUNCTION:
+    return parser_parse_lambda_expression(parser);
   case TOKEN_MATCH:
     return parser_parse_match_expression(parser);
   case TOKEN_THIS: {

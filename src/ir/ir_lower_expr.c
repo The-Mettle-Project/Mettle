@@ -721,6 +721,17 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
     return 1;
   }
 
+  case AST_LAMBDA_EXPRESSION: {
+    /* A non-capturing lambda is the address of its lifted top-level function. */
+    FunctionDeclaration *lam = (FunctionDeclaration *)expression->data;
+    if (!lam || !lam->name) {
+      ir_set_error(context, "Internal: lambda was not converted");
+      return 0;
+    }
+    return ir_emit_address_of_symbol(context, function, lam->name,
+                                     expression->location, out_value);
+  }
+
   case AST_UNARY_EXPRESSION: {
     UnaryExpression *unary = (UnaryExpression *)expression->data;
     if (!unary || !unary->operator || !unary->operand) {

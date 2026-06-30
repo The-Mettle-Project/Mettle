@@ -2129,6 +2129,232 @@ static int mono_emit_instantiation(MonoContext *ctx, Program *prog,
   return 1;
 }
 
+/* ---- Closure conversion --------------------------------------------------
+ * Anonymous `fn(...) { }` expressions parse to AST_LAMBDA_EXPRESSION nodes
+ * carrying a FunctionDeclaration payload with a NULL name. This pass lifts each
+ * lambda body to a uniquely-named top-level function and records that name on
+ * the lambda node (fd->name) so the type checker and IR lowering treat the
+ * lambda value as the address of that function. A lambda that references a
+ * variable from an enclosing function is a true (capturing) closure, handled in
+ * a later step. */
+
+typedef struct {
+  char **items;
+  size_t count;
+  size_t cap;
+} CCStrSet;
+
+static int cc_set_has(const CCStrSet *s, const char *name) {
+  if (!name)
+    return 0;
+  for (size_t i = 0; i < s->count; i++)
+    if (strcmp(s->items[i], name) == 0)
+      return 1;
+  return 0;
+}
+
+static void cc_set_add(CCStrSet *s, const char *name) {
+  if (!name || cc_set_has(s, name))
+    return;
+  if (s->count == s->cap) {
+    size_t ncap = s->cap ? s->cap * 2 : 8;
+    char **grown = realloc(s->items, ncap * sizeof(char *));
+    if (!grown)
+      return;
+    s->items = grown;
+    s->cap = ncap;
+  }
+  s->items[s->count++] = strdup(name);
+}
+
+static void cc_set_free(CCStrSet *s) {
+  for (size_t i = 0; i < s->count; i++)
+    free(s->items[i]);
+  free(s->items);
+  s->items = NULL;
+  s->count = 0;
+  s->cap = 0;
+}
+
+/* Names bound inside `node` (var declarations), not descending into nested
+ * lambdas (which open their own scope). */
+static void cc_collect_bound(ASTNode *node, CCStrSet *set) {
+  if (!node || node->type == AST_LAMBDA_EXPRESSION)
+    return;
+  if (node->type == AST_VAR_DECLARATION) {
+    VarDeclaration *vd = (VarDeclaration *)node->data;
+    if (vd)
+      cc_set_add(set, vd->name);
+  }
+  for (size_t i = 0; i < node->child_count; i++)
+    cc_collect_bound(node->children[i], set);
+}
+
+static void cc_collect_fn_locals(FunctionDeclaration *fd, CCStrSet *set) {
+  for (size_t i = 0; i < fd->parameter_count; i++)
+    cc_set_add(set, fd->parameter_names[i]);
+  cc_collect_bound(fd->body, set);
+}
+
+/* A use of a name that is bound in an enclosing function (and not rebound inside
+ * the lambda) is a capture. Does not descend into nested lambdas. */
+static void cc_scan_captures(ASTNode *node, const CCStrSet *enclosing,
+                             const CCStrSet *bound, CCStrSet *captures) {
+  if (!node || node->type == AST_LAMBDA_EXPRESSION)
+    return;
+  if (node->type == AST_IDENTIFIER) {
+    Identifier *id = (Identifier *)node->data;
+    if (id && id->name && !cc_set_has(bound, id->name) &&
+        cc_set_has(enclosing, id->name))
+      cc_set_add(captures, id->name);
+  } else if (node->type == AST_ASSIGNMENT) {
+    Assignment *a = (Assignment *)node->data;
+    if (a && a->variable_name && !cc_set_has(bound, a->variable_name) &&
+        cc_set_has(enclosing, a->variable_name))
+      cc_set_add(captures, a->variable_name);
+  } else if (node->type == AST_FUNCTION_CALL) {
+    CallExpression *c = (CallExpression *)node->data;
+    if (c && c->function_name && !cc_set_has(bound, c->function_name) &&
+        cc_set_has(enclosing, c->function_name))
+      cc_set_add(captures, c->function_name);
+  }
+  for (size_t i = 0; i < node->child_count; i++)
+    cc_scan_captures(node->children[i], enclosing, bound, captures);
+}
+
+static int g_cc_counter;
+
+static void cc_lift_lambda(ASTNode *lambda, ASTNode *program, Program *prog,
+                           const CCStrSet *enclosing, ErrorReporter *reporter,
+                           int *had_error) {
+  FunctionDeclaration *fd = (FunctionDeclaration *)lambda->data;
+  if (!fd || fd->name)
+    return; // already lifted
+
+  CCStrSet bound = {0};
+  cc_collect_fn_locals(fd, &bound);
+  CCStrSet captures = {0};
+  cc_scan_captures(fd->body, enclosing, &bound, &captures);
+  cc_set_free(&bound);
+
+  if (captures.count > 0) {
+    char message[256];
+    snprintf(message, sizeof(message),
+             "capturing closures are not yet supported (this lambda captures "
+             "'%s' from the enclosing scope)",
+             captures.items[0]);
+    if (reporter)
+      error_reporter_add_error(reporter, ERROR_SEMANTIC, lambda->location,
+                               message);
+    *had_error = 1;
+    cc_set_free(&captures);
+    return;
+  }
+  cc_set_free(&captures);
+
+  char name[32];
+  snprintf(name, sizeof(name), "__lam_%d", g_cc_counter++);
+
+  /* Move the body out of the lambda node into the lifted function, detaching it
+   * from the lambda's children so no later AST walker descends into it. */
+  ASTNode *body = fd->body;
+  fd->body = NULL;
+  if (body) {
+    for (size_t i = 0; i < lambda->child_count; i++) {
+      if (lambda->children[i] == body) {
+        for (size_t j = i + 1; j < lambda->child_count; j++)
+          lambda->children[j - 1] = lambda->children[j];
+        lambda->child_count--;
+        break;
+      }
+    }
+  }
+
+  ASTNode *fn = ast_create_function_declaration(
+      name, fd->parameter_names, fd->parameter_types, fd->parameter_count,
+      fd->return_type, body, lambda->location);
+  if (!fn) {
+    *had_error = 1;
+    if (body)
+      ast_destroy_node(body);
+    return;
+  }
+
+  ASTNode **grown =
+      realloc(prog->declarations,
+              (prog->declaration_count + 1) * sizeof(ASTNode *));
+  if (!grown) {
+    *had_error = 1;
+    ast_destroy_node(fn);
+    return;
+  }
+  prog->declarations = grown;
+  prog->declarations[prog->declaration_count++] = fn;
+  ast_add_child(program, fn);
+
+  fd->name = (char *)string_intern(name);
+}
+
+static void cc_walk(ASTNode *node, const CCStrSet *enclosing, ASTNode *program,
+                    Program *prog, ErrorReporter *reporter, int *had_error) {
+  if (!node)
+    return;
+  if (node->type == AST_LAMBDA_EXPRESSION) {
+    cc_lift_lambda(node, program, prog, enclosing, reporter, had_error);
+    return; // the original in-place body is dead; the lifted clone is walked
+  }
+  for (size_t i = 0; i < node->child_count; i++)
+    cc_walk(node->children[i], enclosing, program, prog, reporter, had_error);
+}
+
+static void cc_process_fn(ASTNode *fnnode, ASTNode *program, Program *prog,
+                          ErrorReporter *reporter, int *had_error) {
+  FunctionDeclaration *fd = (FunctionDeclaration *)fnnode->data;
+  if (!fd || !fd->body)
+    return;
+  CCStrSet locals = {0};
+  cc_collect_fn_locals(fd, &locals);
+  cc_walk(fd->body, &locals, program, prog, reporter, had_error);
+  cc_set_free(&locals);
+}
+
+int closure_convert_program(ASTNode *program, ErrorReporter *reporter) {
+  if (!program || program->type != AST_PROGRAM)
+    return 1;
+  Program *prog = (Program *)program->data;
+  if (!prog)
+    return 1;
+
+  g_cc_counter = 0;
+  int had_error = 0;
+
+  for (size_t i = 0; i < prog->declaration_count; i++) {
+    ASTNode *decl = prog->declarations[i];
+    if (!decl)
+      continue;
+    if (decl->type == AST_FUNCTION_DECLARATION ||
+        decl->type == AST_METHOD_DECLARATION) {
+      cc_process_fn(decl, program, prog, reporter, &had_error);
+    } else if (decl->type == AST_STRUCT_DECLARATION) {
+      StructDeclaration *sd = (StructDeclaration *)decl->data;
+      for (size_t m = 0; sd && m < sd->method_count; m++)
+        cc_process_fn(sd->methods[m], program, prog, reporter, &had_error);
+    } else if (decl->type == AST_IMPL_DECLARATION) {
+      ImplDeclaration *id = (ImplDeclaration *)decl->data;
+      for (size_t m = 0; id && m < id->method_count; m++)
+        cc_process_fn(id->methods[m], program, prog, reporter, &had_error);
+    } else if (decl->type == AST_VAR_DECLARATION) {
+      VarDeclaration *vd = (VarDeclaration *)decl->data;
+      if (vd && vd->initializer) {
+        CCStrSet empty = {0};
+        cc_walk(vd->initializer, &empty, program, prog, reporter, &had_error);
+      }
+    }
+  }
+
+  return had_error ? 0 : 1;
+}
+
 int monomorphize_program(ASTNode *program, ErrorReporter *reporter) {
   if (!program || program->type != AST_PROGRAM)
     return 1;

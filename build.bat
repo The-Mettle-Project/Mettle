@@ -257,6 +257,9 @@ if exist tools\mlopt\gnn_genius.bin copy /Y tools\mlopt\gnn_genius.bin bin\mlopt
 if exist tools\mlopt\bw_lib.txt copy /Y tools\mlopt\bw_lib.txt bin\mlopt\bw_lib.txt >nul
 if exist tools\mlopt\gf2_lib1.txt copy /Y tools\mlopt\gf2_lib1.txt bin\mlopt\gf2_lib1.txt >nul
 
+echo Rendering README.html for the installer docs shortcut...
+where python >nul 2>&1 && python installer\render_readme.py
+
 echo Build successful! Executable created at bin\mettle.exe
 if defined SKIP_TESTS (
     echo Tests skipped.

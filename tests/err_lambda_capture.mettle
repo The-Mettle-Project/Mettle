@@ -1,0 +1,7 @@
+// A lambda that references an enclosing local is a capturing closure. Capturing
+// closures are not yet supported; this must be reported, not silently miscompiled.
+fn main() -> int32 {
+  var base: int32 = 10;
+  var add: fn(int32) -> int32 = fn(x: int32) -> int32 { return x + base; };
+  return add(5);
+}

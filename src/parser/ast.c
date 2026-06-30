@@ -100,6 +100,7 @@ ASTNode *ast_clone_node(ASTNode *node) {
     clone->data = dst;
     break;
   }
+  case AST_LAMBDA_EXPRESSION:
   case AST_FUNCTION_DECLARATION: {
     FunctionDeclaration *src = (FunctionDeclaration *)node->data;
     FunctionDeclaration *dst = malloc(sizeof(FunctionDeclaration));
@@ -730,6 +731,7 @@ void ast_destroy_node(ASTNode *node) {
     }
     break;
   }
+  case AST_LAMBDA_EXPRESSION:
   case AST_FUNCTION_DECLARATION: {
     FunctionDeclaration *func_decl = (FunctionDeclaration *)node->data;
     if (func_decl) {
