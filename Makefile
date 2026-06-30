@@ -1,6 +1,6 @@
 CC = gcc
 # EXTRA_CFLAGS lets release builds stamp the version, e.g.
-#   make EXTRA_CFLAGS='-DMETTLE_VERSION_RAW=v0.12.0'
+#   make EXTRA_CFLAGS='-DMETTLE_VERSION_RAW=v0.13.0'
 # (bare token, stringified in main.c ??? avoids fragile quote escaping)
 EXTRA_CFLAGS =
 CFLAGS = -Wall -Wextra -std=c99 -g -O2 -D_GNU_SOURCE -Isrc -fno-omit-frame-pointer $(EXTRA_CFLAGS)
