@@ -139,6 +139,70 @@ int ir_lower_call_expression(IRLoweringContext *context,
     }
   }
 
+  if (call->callee_closure_env) {
+    /* Closure call: the variable holds an 8-byte pointer to a heap record whose
+     * field 0 is the code pointer. Load the code pointer, then call it passing
+     * the record pointer (the environment) as a hidden leading argument that the
+     * lifted function receives as its first parameter. */
+    IROperand code = ir_operand_none();
+    if (!ir_make_temp_operand(context, &code)) {
+      for (size_t i = 0; i < call->argument_count; i++)
+        ir_operand_destroy(&arguments[i]);
+      free(arguments);
+      ir_operand_destroy(&destination);
+      return 0;
+    }
+    IRInstruction load = {0};
+    load.op = IR_OP_LOAD;
+    load.location = expression->location;
+    load.dest = code;
+    load.lhs = ir_operand_symbol(call->function_name);
+    load.rhs = ir_operand_int(8);
+    int load_ok = ir_emit(context, function, &load);
+    ir_operand_destroy(&load.lhs);
+    if (!load_ok) {
+      for (size_t i = 0; i < call->argument_count; i++)
+        ir_operand_destroy(&arguments[i]);
+      free(arguments);
+      ir_operand_destroy(&code);
+      ir_operand_destroy(&destination);
+      return 0;
+    }
+
+    IROperand *cargs = calloc(call->argument_count + 1, sizeof(IROperand));
+    if (!cargs) {
+      for (size_t i = 0; i < call->argument_count; i++)
+        ir_operand_destroy(&arguments[i]);
+      free(arguments);
+      ir_operand_destroy(&code);
+      ir_operand_destroy(&destination);
+      return 0;
+    }
+    cargs[0] = ir_operand_symbol(call->function_name);
+    for (size_t i = 0; i < call->argument_count; i++)
+      cargs[i + 1] = arguments[i];
+    free(arguments);
+
+    IRInstruction cinstr = {0};
+    cinstr.op = IR_OP_CALL_INDIRECT;
+    cinstr.location = expression->location;
+    cinstr.dest = destination;
+    cinstr.lhs = code;
+    cinstr.arguments = cargs;
+    cinstr.argument_count = call->argument_count + 1;
+    int ok = ir_emit(context, function, &cinstr);
+    for (size_t i = 0; i < call->argument_count + 1; i++)
+      ir_operand_destroy(&cargs[i]);
+    free(cargs);
+    ir_operand_destroy(&code);
+    if (!ok) {
+      ir_operand_destroy(&destination);
+      return 0;
+    }
+    *out_value = destination;
+    return 1;
+  }
+
   IRInstruction instruction = {0};
   instruction.location = expression->location;
   instruction.dest = destination;
@@ -722,12 +786,45 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
   }
 
   case AST_LAMBDA_EXPRESSION: {
-    /* A non-capturing lambda is the address of its lifted top-level function. */
     FunctionDeclaration *lam = (FunctionDeclaration *)expression->data;
     if (!lam || !lam->name) {
       ir_set_error(context, "Internal: lambda was not converted");
       return 0;
     }
+    if (lam->captured_count > 0) {
+      /* Capturing closure value: call the synthesized constructor with the
+       * current value of each captured variable; it allocates and populates the
+       * environment record and returns the 8-byte closure pointer. */
+      IROperand dest = ir_operand_none();
+      if (!ir_make_temp_operand(context, &dest)) {
+        return 0;
+      }
+      IROperand *args = calloc(lam->captured_count, sizeof(IROperand));
+      if (!args) {
+        ir_operand_destroy(&dest);
+        return 0;
+      }
+      for (size_t i = 0; i < lam->captured_count; i++)
+        args[i] = ir_operand_symbol(lam->captured_names[i]);
+      IRInstruction call = {0};
+      call.op = IR_OP_CALL;
+      call.location = expression->location;
+      call.dest = dest;
+      call.text = lam->name;
+      call.arguments = args;
+      call.argument_count = lam->captured_count;
+      int ok = ir_emit(context, function, &call);
+      for (size_t i = 0; i < lam->captured_count; i++)
+        ir_operand_destroy(&args[i]);
+      free(args);
+      if (!ok) {
+        ir_operand_destroy(&dest);
+        return 0;
+      }
+      *out_value = dest;
+      return 1;
+    }
+    /* A non-capturing lambda is the address of its lifted top-level function. */
     return ir_emit_address_of_symbol(context, function, lam->name,
                                      expression->location, out_value);
   }

@@ -2,6 +2,8 @@
 #include "../common.h"
 #include "../string_intern.h"
 #include "../common.h"
+#include "../lexer/lexer.h"
+#include "../parser/parser.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2138,125 +2140,362 @@ static int mono_emit_instantiation(MonoContext *ctx, Program *prog,
  * variable from an enclosing function is a true (capturing) closure, handled in
  * a later step. */
 
+/* A scope's variable names paired with their declared type strings (NULL when
+ * the type was inferred and no annotation is available). */
 typedef struct {
-  char **items;
+  char **names;
+  char **types;
   size_t count;
   size_t cap;
-} CCStrSet;
+} CCEnv;
 
-static int cc_set_has(const CCStrSet *s, const char *name) {
+static int cc_env_has(const CCEnv *e, const char *name) {
   if (!name)
     return 0;
-  for (size_t i = 0; i < s->count; i++)
-    if (strcmp(s->items[i], name) == 0)
+  for (size_t i = 0; i < e->count; i++)
+    if (strcmp(e->names[i], name) == 0)
       return 1;
   return 0;
 }
 
-static void cc_set_add(CCStrSet *s, const char *name) {
-  if (!name || cc_set_has(s, name))
+static const char *cc_env_type(const CCEnv *e, const char *name) {
+  if (!name)
+    return NULL;
+  for (size_t i = 0; i < e->count; i++)
+    if (strcmp(e->names[i], name) == 0)
+      return e->types[i];
+  return NULL;
+}
+
+static void cc_env_add(CCEnv *e, const char *name, const char *type) {
+  if (!name || cc_env_has(e, name))
     return;
-  if (s->count == s->cap) {
-    size_t ncap = s->cap ? s->cap * 2 : 8;
-    char **grown = realloc(s->items, ncap * sizeof(char *));
-    if (!grown)
+  if (e->count == e->cap) {
+    size_t ncap = e->cap ? e->cap * 2 : 8;
+    char **gn = realloc(e->names, ncap * sizeof(char *));
+    char **gt = realloc(e->types, ncap * sizeof(char *));
+    if (!gn || !gt) {
+      free(gn);
+      free(gt);
       return;
-    s->items = grown;
-    s->cap = ncap;
+    }
+    e->names = gn;
+    e->types = gt;
+    e->cap = ncap;
   }
-  s->items[s->count++] = strdup(name);
+  e->names[e->count] = strdup(name);
+  e->types[e->count] = type ? strdup(type) : NULL;
+  e->count++;
 }
 
-static void cc_set_free(CCStrSet *s) {
-  for (size_t i = 0; i < s->count; i++)
-    free(s->items[i]);
-  free(s->items);
-  s->items = NULL;
-  s->count = 0;
-  s->cap = 0;
+static void cc_env_free(CCEnv *e) {
+  for (size_t i = 0; i < e->count; i++) {
+    free(e->names[i]);
+    free(e->types[i]);
+  }
+  free(e->names);
+  free(e->types);
+  e->names = NULL;
+  e->types = NULL;
+  e->count = 0;
+  e->cap = 0;
 }
 
-/* Names bound inside `node` (var declarations), not descending into nested
- * lambdas (which open their own scope). */
-static void cc_collect_bound(ASTNode *node, CCStrSet *set) {
+/* Var-declaration names (with their type strings) inside `node`, not descending
+ * into nested lambdas (which open their own scope). */
+static void cc_collect_vars(ASTNode *node, CCEnv *env) {
   if (!node || node->type == AST_LAMBDA_EXPRESSION)
     return;
   if (node->type == AST_VAR_DECLARATION) {
     VarDeclaration *vd = (VarDeclaration *)node->data;
     if (vd)
-      cc_set_add(set, vd->name);
+      cc_env_add(env, vd->name, vd->type_name);
   }
   for (size_t i = 0; i < node->child_count; i++)
-    cc_collect_bound(node->children[i], set);
+    cc_collect_vars(node->children[i], env);
 }
 
-static void cc_collect_fn_locals(FunctionDeclaration *fd, CCStrSet *set) {
+static void cc_collect_fn_env(FunctionDeclaration *fd, CCEnv *env) {
   for (size_t i = 0; i < fd->parameter_count; i++)
-    cc_set_add(set, fd->parameter_names[i]);
-  cc_collect_bound(fd->body, set);
+    cc_env_add(env, fd->parameter_names[i], fd->parameter_types[i]);
+  cc_collect_vars(fd->body, env);
 }
 
-/* A use of a name that is bound in an enclosing function (and not rebound inside
- * the lambda) is a capture. Does not descend into nested lambdas. */
-static void cc_scan_captures(ASTNode *node, const CCStrSet *enclosing,
-                             const CCStrSet *bound, CCStrSet *captures) {
+/* A name used in the lambda body that is bound in an enclosing function (and not
+ * rebound inside the lambda) is a capture. Does not descend into nested lambdas.
+ * Captures are accumulated in first-reference order in `caps`. */
+static void cc_scan_captures(ASTNode *node, const CCEnv *enclosing,
+                             const CCEnv *bound, CCEnv *caps) {
   if (!node || node->type == AST_LAMBDA_EXPRESSION)
     return;
+  const char *use = NULL;
   if (node->type == AST_IDENTIFIER) {
     Identifier *id = (Identifier *)node->data;
-    if (id && id->name && !cc_set_has(bound, id->name) &&
-        cc_set_has(enclosing, id->name))
-      cc_set_add(captures, id->name);
+    use = id ? id->name : NULL;
   } else if (node->type == AST_ASSIGNMENT) {
     Assignment *a = (Assignment *)node->data;
-    if (a && a->variable_name && !cc_set_has(bound, a->variable_name) &&
-        cc_set_has(enclosing, a->variable_name))
-      cc_set_add(captures, a->variable_name);
+    use = a ? a->variable_name : NULL;
   } else if (node->type == AST_FUNCTION_CALL) {
     CallExpression *c = (CallExpression *)node->data;
-    if (c && c->function_name && !cc_set_has(bound, c->function_name) &&
-        cc_set_has(enclosing, c->function_name))
-      cc_set_add(captures, c->function_name);
+    use = c ? c->function_name : NULL;
   }
+  if (use && !cc_env_has(bound, use) && cc_env_has(enclosing, use))
+    cc_env_add(caps, use, cc_env_type(enclosing, use));
   for (size_t i = 0; i < node->child_count; i++)
-    cc_scan_captures(node->children[i], enclosing, bound, captures);
+    cc_scan_captures(node->children[i], enclosing, bound, caps);
+}
+
+/* Growable text buffer for synthesizing source. */
+typedef struct {
+  char *data;
+  size_t len;
+  size_t cap;
+} CCBuf;
+
+static void cc_buf_add(CCBuf *b, const char *s) {
+  size_t n = strlen(s);
+  if (b->len + n + 1 > b->cap) {
+    size_t ncap = b->cap ? b->cap * 2 : 256;
+    while (ncap < b->len + n + 1)
+      ncap *= 2;
+    char *grown = realloc(b->data, ncap);
+    if (!grown)
+      return;
+    b->data = grown;
+    b->cap = ncap;
+  }
+  memcpy(b->data + b->len, s, n + 1);
+  b->len += n;
 }
 
 static int g_cc_counter;
 
+/* Lift a capturing lambda: synthesize an environment struct, a lifted function
+ * (env pointer + user params; captures copied from the env at entry), and a
+ * constructor that allocates and populates the env. The lambda value becomes a
+ * call to the constructor. Built as source text and parsed, then the original
+ * body is grafted onto the lifted function. */
+static void cc_emit_capturing(ASTNode *lambda, FunctionDeclaration *fd,
+                              CCEnv *caps, ASTNode *program, Program *prog,
+                              ErrorReporter *reporter, int *had_error) {
+  for (size_t i = 0; i < caps->count; i++) {
+    if (!caps->types[i]) {
+      char message[256];
+      snprintf(message, sizeof(message),
+               "cannot capture '%s' in a closure: its type is inferred; add an "
+               "explicit type annotation to the variable",
+               caps->names[i]);
+      if (reporter)
+        error_reporter_add_error(reporter, ERROR_SEMANTIC, lambda->location,
+                                 message);
+      *had_error = 1;
+      return;
+    }
+  }
+
+  int id = g_cc_counter++;
+  char env_name[32], lam_name[32], make_name[32], idx[24];
+  snprintf(env_name, sizeof(env_name), "__ClosEnv_%d", id);
+  snprintf(lam_name, sizeof(lam_name), "__lam_%d", id);
+  snprintf(make_name, sizeof(make_name), "__make_lam_%d", id);
+  const char *ret = fd->return_type ? fd->return_type : "void";
+
+  CCBuf src = {0};
+  /* struct __ClosEnv_N { __code: fn(__ClosEnv_N*, userparams)->R; cap: T; ... } */
+  cc_buf_add(&src, "struct ");
+  cc_buf_add(&src, env_name);
+  cc_buf_add(&src, " {\n  __code: fn(");
+  cc_buf_add(&src, env_name);
+  cc_buf_add(&src, "*");
+  for (size_t i = 0; i < fd->parameter_count; i++) {
+    cc_buf_add(&src, ", ");
+    cc_buf_add(&src, fd->parameter_types[i]);
+  }
+  cc_buf_add(&src, ") -> ");
+  cc_buf_add(&src, ret);
+  cc_buf_add(&src, ";\n");
+  for (size_t i = 0; i < caps->count; i++) {
+    cc_buf_add(&src, "  ");
+    cc_buf_add(&src, caps->names[i]);
+    cc_buf_add(&src, ": ");
+    cc_buf_add(&src, caps->types[i]);
+    cc_buf_add(&src, ";\n");
+  }
+  cc_buf_add(&src, "}\n");
+
+  /* fn __lam_N(__env: __ClosEnv_N*, userparams) -> R { var cap: T = __env.cap; ... } */
+  cc_buf_add(&src, "fn ");
+  cc_buf_add(&src, lam_name);
+  cc_buf_add(&src, "(__env: ");
+  cc_buf_add(&src, env_name);
+  cc_buf_add(&src, "*");
+  for (size_t i = 0; i < fd->parameter_count; i++) {
+    cc_buf_add(&src, ", ");
+    cc_buf_add(&src, fd->parameter_names[i]);
+    cc_buf_add(&src, ": ");
+    cc_buf_add(&src, fd->parameter_types[i]);
+  }
+  cc_buf_add(&src, ") -> ");
+  cc_buf_add(&src, ret);
+  cc_buf_add(&src, " {\n");
+  for (size_t i = 0; i < caps->count; i++) {
+    cc_buf_add(&src, "  var ");
+    cc_buf_add(&src, caps->names[i]);
+    cc_buf_add(&src, ": ");
+    cc_buf_add(&src, caps->types[i]);
+    cc_buf_add(&src, " = __env.");
+    cc_buf_add(&src, caps->names[i]);
+    cc_buf_add(&src, ";\n");
+  }
+  cc_buf_add(&src, "}\n");
+
+  /* fn __make_lam_N(cap: T, ...) -> __ClosEnv_N* { var __e = new ...; ... return __e; } */
+  cc_buf_add(&src, "fn ");
+  cc_buf_add(&src, make_name);
+  cc_buf_add(&src, "(");
+  for (size_t i = 0; i < caps->count; i++) {
+    cc_buf_add(&src, caps->names[i]);
+    cc_buf_add(&src, ": ");
+    cc_buf_add(&src, caps->types[i]);
+    if (i + 1 < caps->count)
+      cc_buf_add(&src, ", ");
+  }
+  cc_buf_add(&src, ") -> ");
+  cc_buf_add(&src, env_name);
+  cc_buf_add(&src, "* {\n  var __e: ");
+  cc_buf_add(&src, env_name);
+  cc_buf_add(&src, "* = new ");
+  cc_buf_add(&src, env_name);
+  cc_buf_add(&src, ";\n  __e.__code = &");
+  cc_buf_add(&src, lam_name);
+  cc_buf_add(&src, ";\n");
+  for (size_t i = 0; i < caps->count; i++) {
+    cc_buf_add(&src, "  __e.");
+    cc_buf_add(&src, caps->names[i]);
+    cc_buf_add(&src, " = ");
+    cc_buf_add(&src, caps->names[i]);
+    cc_buf_add(&src, ";\n");
+  }
+  cc_buf_add(&src, "  return __e;\n}\n");
+
+  if (!src.data) {
+    *had_error = 1;
+    return;
+  }
+
+  Lexer *lx = lexer_create(src.data);
+  Parser *ps = lx ? parser_create(lx) : NULL;
+  ASTNode *sub = ps ? parser_parse_program(ps) : NULL;
+  Program *subp = (sub && sub->type == AST_PROGRAM) ? (Program *)sub->data : NULL;
+  if (!subp || subp->declaration_count < 3) {
+    if (reporter)
+      error_reporter_add_error(reporter, ERROR_SEMANTIC, lambda->location,
+                               "internal: failed to synthesize closure");
+    *had_error = 1;
+    free(src.data);
+    return;
+  }
+
+  /* Graft the lambda's original body statements onto the lifted function (the
+   * second synthesized declaration), after the injected capture locals. */
+  ASTNode *lifted = subp->declarations[1];
+  ASTNode *body = fd->body;
+  fd->body = NULL;
+  if (body) {
+    for (size_t i = 0; i < lambda->child_count; i++) {
+      if (lambda->children[i] == body) {
+        for (size_t j = i + 1; j < lambda->child_count; j++)
+          lambda->children[j - 1] = lambda->children[j];
+        lambda->child_count--;
+        break;
+      }
+    }
+  }
+  if (body && body->type == AST_PROGRAM && lifted &&
+      lifted->type == AST_FUNCTION_DECLARATION) {
+    FunctionDeclaration *lf = (FunctionDeclaration *)lifted->data;
+    Program *lbody = lf->body ? (Program *)lf->body->data : NULL;
+    Program *obody = (Program *)body->data;
+    if (lbody && obody && obody->declaration_count > 0) {
+      ASTNode **merged =
+          realloc(lbody->declarations,
+                  (lbody->declaration_count + obody->declaration_count) *
+                      sizeof(ASTNode *));
+      if (merged) {
+        lbody->declarations = merged;
+        for (size_t i = 0; i < obody->declaration_count; i++) {
+          ASTNode *stmt = obody->declarations[i];
+          lbody->declarations[lbody->declaration_count++] = stmt;
+          ast_add_child(lf->body, stmt);
+        }
+        /* Detach the moved statements from the old body so destroying it does
+         * not free them. */
+        obody->declaration_count = 0;
+        body->child_count = 0;
+      }
+    }
+  }
+  if (body)
+    ast_destroy_node(body);
+
+  /* Move the three synthesized declarations into the program. */
+  for (size_t i = 0; i < subp->declaration_count; i++) {
+    ASTNode *d = subp->declarations[i];
+    ASTNode **grown =
+        realloc(prog->declarations,
+                (prog->declaration_count + 1) * sizeof(ASTNode *));
+    if (!grown) {
+      *had_error = 1;
+      break;
+    }
+    prog->declarations = grown;
+    prog->declarations[prog->declaration_count++] = d;
+    ast_add_child(program, d);
+  }
+  /* The sub-program shell still references the moved nodes via its own arrays;
+   * leave it unfreed (a small, bounded compile-time allocation) rather than
+   * risk double-freeing the transferred declarations. */
+
+  /* Record the closure on the lambda node: the value is produced by calling the
+   * constructor, passing the current value of each captured variable. */
+  fd->name = (char *)string_intern(make_name);
+  fd->env_struct_name = (char *)string_intern(env_name);
+  fd->captured_count = caps->count;
+  fd->captured_names = malloc(caps->count * sizeof(char *));
+  fd->captured_types = malloc(caps->count * sizeof(char *));
+  for (size_t i = 0; i < caps->count; i++) {
+    fd->captured_names[i] = (char *)string_intern(caps->names[i]);
+    fd->captured_types[i] = (char *)string_intern(caps->types[i]);
+  }
+
+  free(src.data);
+}
+
 static void cc_lift_lambda(ASTNode *lambda, ASTNode *program, Program *prog,
-                           const CCStrSet *enclosing, ErrorReporter *reporter,
+                           const CCEnv *enclosing, ErrorReporter *reporter,
                            int *had_error) {
   FunctionDeclaration *fd = (FunctionDeclaration *)lambda->data;
   if (!fd || fd->name)
     return; // already lifted
 
-  CCStrSet bound = {0};
-  cc_collect_fn_locals(fd, &bound);
-  CCStrSet captures = {0};
-  cc_scan_captures(fd->body, enclosing, &bound, &captures);
-  cc_set_free(&bound);
+  CCEnv bound = {0};
+  cc_collect_fn_env(fd, &bound);
+  CCEnv caps = {0};
+  cc_scan_captures(fd->body, enclosing, &bound, &caps);
+  cc_env_free(&bound);
 
-  if (captures.count > 0) {
-    char message[256];
-    snprintf(message, sizeof(message),
-             "capturing closures are not yet supported (this lambda captures "
-             "'%s' from the enclosing scope)",
-             captures.items[0]);
-    if (reporter)
-      error_reporter_add_error(reporter, ERROR_SEMANTIC, lambda->location,
-                               message);
-    *had_error = 1;
-    cc_set_free(&captures);
+  if (caps.count > 0) {
+    cc_emit_capturing(lambda, fd, &caps, program, prog, reporter, had_error);
+    cc_env_free(&caps);
     return;
   }
-  cc_set_free(&captures);
+  cc_env_free(&caps);
 
+  /* Non-capturing: lift the body to a top-level function and let the lambda
+   * value be its address (a thin function pointer). */
   char name[32];
   snprintf(name, sizeof(name), "__lam_%d", g_cc_counter++);
 
-  /* Move the body out of the lambda node into the lifted function, detaching it
-   * from the lambda's children so no later AST walker descends into it. */
   ASTNode *body = fd->body;
   fd->body = NULL;
   if (body) {
@@ -2295,13 +2534,13 @@ static void cc_lift_lambda(ASTNode *lambda, ASTNode *program, Program *prog,
   fd->name = (char *)string_intern(name);
 }
 
-static void cc_walk(ASTNode *node, const CCStrSet *enclosing, ASTNode *program,
+static void cc_walk(ASTNode *node, const CCEnv *enclosing, ASTNode *program,
                     Program *prog, ErrorReporter *reporter, int *had_error) {
   if (!node)
     return;
   if (node->type == AST_LAMBDA_EXPRESSION) {
     cc_lift_lambda(node, program, prog, enclosing, reporter, had_error);
-    return; // the original in-place body is dead; the lifted clone is walked
+    return; // the original in-place body is moved out; do not descend
   }
   for (size_t i = 0; i < node->child_count; i++)
     cc_walk(node->children[i], enclosing, program, prog, reporter, had_error);
@@ -2312,10 +2551,10 @@ static void cc_process_fn(ASTNode *fnnode, ASTNode *program, Program *prog,
   FunctionDeclaration *fd = (FunctionDeclaration *)fnnode->data;
   if (!fd || !fd->body)
     return;
-  CCStrSet locals = {0};
-  cc_collect_fn_locals(fd, &locals);
+  CCEnv locals = {0};
+  cc_collect_fn_env(fd, &locals);
   cc_walk(fd->body, &locals, program, prog, reporter, had_error);
-  cc_set_free(&locals);
+  cc_env_free(&locals);
 }
 
 int closure_convert_program(ASTNode *program, ErrorReporter *reporter) {
@@ -2346,7 +2585,7 @@ int closure_convert_program(ASTNode *program, ErrorReporter *reporter) {
     } else if (decl->type == AST_VAR_DECLARATION) {
       VarDeclaration *vd = (VarDeclaration *)decl->data;
       if (vd && vd->initializer) {
-        CCStrSet empty = {0};
+        CCEnv empty = {0};
         cc_walk(vd->initializer, &empty, program, prog, reporter, &had_error);
       }
     }

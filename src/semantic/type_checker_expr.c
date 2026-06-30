@@ -1,5 +1,6 @@
 // Type checker: expression type inference and checking.
 #include "type_checker_internal.h"
+#include "../string_intern.h"
 
 Type *type_checker_method_receiver_struct_type(Type *receiver_type) {
   if (!receiver_type) {
@@ -152,15 +153,79 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
   }
 
   case AST_LAMBDA_EXPRESSION: {
-    /* Closure conversion lifted the lambda body to a top-level function and
-     * recorded its name here. A non-capturing lambda is the address of that
-     * function: a thin function pointer, exactly like `&func`. */
+    /* Closure conversion lifted the lambda body and recorded the symbol its
+     * value derives from. A non-capturing lambda is the address of its lifted
+     * function (a thin function pointer, like `&func`). A capturing lambda has
+     * the user-facing type fn(params)->R tagged with its environment struct so
+     * call sites know to dispatch through the captured environment. */
     FunctionDeclaration *lam = (FunctionDeclaration *)expression->data;
     if (!lam || !lam->name) {
       type_checker_set_error_at_location(checker, expression->location,
                                          "Internal: lambda was not converted");
       return NULL;
     }
+
+    /* The lambda value is an 8-byte function pointer (thin) or closure pointer.
+     * Name its type with its canonical signature `fn(a,b)->R` (no spaces) so an
+     * inferred `var f = <lambda>` local is sized as a pointer by the backend. */
+    char sig[1024];
+    {
+      size_t off = 0;
+      int wrote = snprintf(sig, sizeof(sig), "fn(");
+      if (wrote > 0)
+        off += (size_t)wrote;
+      for (size_t i = 0; i < lam->parameter_count && off < sizeof(sig); i++) {
+        wrote = snprintf(sig + off, sizeof(sig) - off, "%s%s", i ? "," : "",
+                         lam->parameter_types[i]);
+        if (wrote > 0)
+          off += (size_t)wrote;
+      }
+      if (off < sizeof(sig))
+        snprintf(sig + off, sizeof(sig) - off, ")->%s",
+                 lam->return_type ? lam->return_type : "void");
+    }
+
+    if (lam->captured_count > 0) {
+      Type **ptypes = NULL;
+      if (lam->parameter_count > 0) {
+        ptypes = malloc(lam->parameter_count * sizeof(Type *));
+        if (!ptypes) {
+          return NULL;
+        }
+        for (size_t i = 0; i < lam->parameter_count; i++) {
+          ptypes[i] =
+              type_checker_get_type_by_name(checker, lam->parameter_types[i]);
+          if (!ptypes[i]) {
+            type_checker_set_error_at_location(
+                checker, expression->location,
+                "Unknown lambda parameter type '%s'", lam->parameter_types[i]);
+            free(ptypes);
+            return NULL;
+          }
+        }
+      }
+      Type *return_type =
+          lam->return_type
+              ? type_checker_get_type_by_name(checker, lam->return_type)
+              : checker->builtin_void;
+      if (!return_type) {
+        return_type = checker->builtin_void;
+      }
+      Type *closure_type = type_create_function_pointer(
+          ptypes, lam->parameter_count, return_type);
+      free(ptypes);
+      if (!closure_type) {
+        type_checker_set_error_at_location(checker, expression->location,
+                                           "Failed to create closure type");
+        return NULL;
+      }
+      /* The closure_env tag, not the name, drives call dispatch. */
+      closure_type->name = (char *)string_intern(sig);
+      closure_type->closure_env =
+          type_checker_get_type_by_name(checker, lam->env_struct_name);
+      return closure_type;
+    }
+
     Symbol *sym = symbol_table_lookup(checker->symbol_table, lam->name);
     if (!sym || sym->kind != SYMBOL_FUNCTION) {
       type_checker_set_error_at_location(checker, expression->location,
@@ -181,6 +246,7 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
                                          "Failed to create lambda type");
       return NULL;
     }
+    fp_type->name = (char *)string_intern(sig);
     return fp_type;
   }
 
@@ -374,6 +440,7 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
         func_symbol->type->kind == TYPE_FUNCTION_POINTER) {
       call->is_indirect_call = 1;
       Type *fp_type = func_symbol->type;
+      call->callee_closure_env = fp_type->closure_env;
       if (call->argument_count != fp_type->fn_param_count) {
         char error_msg[512];
         snprintf(error_msg, sizeof(error_msg),
@@ -621,6 +688,12 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
     }
 
     Type *object_type = type_checker_infer_type(checker, member->object);
+    /* Member access through a pointer-to-struct auto-dereferences (like C's
+     * `->`), matching what IR lowering already does. */
+    if (object_type && object_type->kind == TYPE_POINTER &&
+        object_type->base_type) {
+      object_type = object_type->base_type;
+    }
     if (object_type && (object_type->kind == TYPE_STRUCT ||
                         object_type->kind == TYPE_STRING)) {
       // Look up the field type in the struct

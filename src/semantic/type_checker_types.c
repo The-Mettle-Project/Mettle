@@ -746,6 +746,14 @@ int type_checker_is_assignable(TypeChecker *checker, Type *dest_type,
   if (!checker || !dest_type || !src_type)
     return 0;
 
+  /* A capturing closure (function-pointer type carrying an environment) is not
+   * assignable to a plain function pointer: a thin call site would dispatch
+   * without the captured environment. */
+  if (src_type->kind == TYPE_FUNCTION_POINTER && src_type->closure_env &&
+      !(dest_type->kind == TYPE_FUNCTION_POINTER && dest_type->closure_env)) {
+    return 0;
+  }
+
   if (type_checker_types_equal(dest_type, src_type)) {
     return 1;
   }

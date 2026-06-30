@@ -128,6 +128,12 @@ ASTNode *ast_clone_node(ASTNode *node) {
     dst->is_pure = src->is_pure;
     dst->is_noalloc = src->is_noalloc;
     dst->simd_mode = src->simd_mode;
+    dst->captured_count = src->captured_count;
+    dst->captured_names =
+        ast_copy_string_array(src->captured_names, src->captured_count);
+    dst->captured_types =
+        ast_copy_string_array(src->captured_types, src->captured_count);
+    dst->env_struct_name = ast_intern_string(src->env_struct_name);
     if (src->parameter_count > 0) {
       dst->parameter_names = malloc(src->parameter_count * sizeof(char *));
       dst->parameter_types = malloc(src->parameter_count * sizeof(char *));
@@ -195,6 +201,7 @@ ASTNode *ast_clone_node(ASTNode *node) {
     dst->argument_count = src->argument_count;
     dst->type_arg_count = src->type_arg_count;
     dst->is_indirect_call = src->is_indirect_call;
+    dst->callee_closure_env = src->callee_closure_env;
     dst->object = src->object ? ast_clone_node(src->object) : NULL;
     if (dst->object)
       ast_add_child(clone, dst->object);
@@ -750,6 +757,13 @@ void ast_destroy_node(ASTNode *node) {
       }
       free(func_decl->type_params);
       free(func_decl->type_param_traits);
+      for (size_t i = 0; i < func_decl->captured_count; i++) {
+        ast_free_string(func_decl->captured_names[i]);
+        ast_free_string(func_decl->captured_types[i]);
+      }
+      free(func_decl->captured_names);
+      free(func_decl->captured_types);
+      ast_free_string(func_decl->env_struct_name);
       free(func_decl);
     }
     break;
@@ -1189,6 +1203,10 @@ ASTNode *ast_create_function_declaration(const char *name, char **param_names,
   func_decl->is_pure = 0;
   func_decl->is_noalloc = 0;
   func_decl->simd_mode = SIMD_ATTR_NONE;
+  func_decl->captured_names = NULL;
+  func_decl->captured_types = NULL;
+  func_decl->captured_count = 0;
+  func_decl->env_struct_name = NULL;
 
   if (param_count > 0) {
     func_decl->parameter_names = malloc(param_count * sizeof(char *));
@@ -1433,6 +1451,7 @@ ASTNode *ast_create_call_expression(const char *function_name,
   call_expr->type_args = NULL;
   call_expr->type_arg_count = 0;
   call_expr->is_indirect_call = 0;
+  call_expr->callee_closure_env = NULL;
 
   if (argument_count > 0) {
     call_expr->arguments = malloc(argument_count * sizeof(ASTNode *));
@@ -1723,6 +1742,7 @@ ASTNode *ast_create_method_call(ASTNode *object, const char *method_name,
   call_expr->type_args = NULL;
   call_expr->type_arg_count = 0;
   call_expr->is_indirect_call = 0;
+  call_expr->callee_closure_env = NULL;
 
   if (argument_count > 0) {
     call_expr->arguments = malloc(argument_count * sizeof(ASTNode *));

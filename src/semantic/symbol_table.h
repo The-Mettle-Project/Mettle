@@ -36,6 +36,10 @@ typedef struct Type {
   struct Type **fn_param_types; // For function pointers
   size_t fn_param_count;        // For function pointers
   struct Type *fn_return_type;  // For function pointers
+  // For a capturing closure: the synthesized environment struct type. NULL for
+  // a thin function pointer. The closure VALUE is an 8-byte pointer to a heap
+  // record whose field 0 is the code pointer and remaining fields are captures.
+  struct Type *closure_env;
 
   // Struct-specific fields
   char **field_names;        // For structs - field names

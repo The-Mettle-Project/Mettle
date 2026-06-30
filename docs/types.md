@@ -105,9 +105,30 @@ var seven: int32 = add(3, 4);
 var product: int32 = apply(fn(x: int32, y: int32) -> int32 { return x * y; }, 6, 7);
 ```
 
-A lambda has the same `fn(params) -> ret` type as a named function and is a plain function pointer, so it is usable anywhere a function pointer is (including C callbacks). A return type is required; the body is a normal block.
+A non-capturing lambda has the same `fn(params) -> ret` type as a named function and is a plain function pointer, so it is usable anywhere a function pointer is (including C callbacks). A return type is required; the body is a normal block.
 
-A lambda that references a variable from an enclosing scope is a *capturing closure*. Capturing closures are not yet supported and are reported at compile time; capture nothing, or pass state through an explicit parameter, for now. See [known limitations](known-limitations.md).
+### Closures
+
+A lambda that references a variable from an enclosing scope *captures* it, becoming a closure that carries its captured state:
+
+```mettle
+fn main() -> int32 {
+  var base: int32 = 10;
+  var add = fn(x: int32) -> int32 { return x + base; };  // captures base
+  print_int(add(5));    // 15
+  return 0;
+}
+```
+
+Captures are **by value**: each captured variable's value is snapshotted when the closure is created, so changing the original afterwards does not change what the closure sees. A closure value is an 8-byte pointer to a heap-allocated environment holding the code pointer and the captured values.
+
+Because a closure carries state, its type is distinct from a plain function pointer. Bind a closure to an **inferred** local (`var f = ...`, no type annotation) so the closure type is preserved:
+
+```mettle
+var f = fn(x: int32) -> int32 { return x * scale; };   // ok: type inferred
+```
+
+Storing a capturing closure in an explicitly-typed `fn(...) -> ...` variable, parameter, or return type is a compile error (a thin function pointer cannot carry an environment). Passing a capturing closure across a function boundary (as an argument or return value) is therefore not yet supported; keep a closure within the function that creates it, or use a non-capturing lambda. See [known limitations](known-limitations.md).
 
 ## Array Types
 

@@ -420,6 +420,7 @@ Type *type_create(TypeKind kind, const char *name) {
   type->fn_param_types = NULL;
   type->fn_param_count = 0;
   type->fn_return_type = NULL;
+  type->closure_env = NULL;
 
   // Initialize struct-specific fields
   type->field_names = NULL;

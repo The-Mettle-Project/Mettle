@@ -100,6 +100,14 @@ typedef struct {
   int is_pure;            // `@pure`    : side-effect-free; enables call LICM
   int is_noalloc;         // `@noalloc` : proven allocation-free or compile error
   int simd_mode;          // SimdAttr applied as the default to every body loop
+  // Closure conversion metadata (set on AST_LAMBDA_EXPRESSION nodes only). A
+  // capturing lambda records the variables it captures by value, their types,
+  // and the synthesized environment struct; `name` then holds the constructor
+  // function the lambda value is produced by.
+  char **captured_names;
+  char **captured_types;
+  size_t captured_count;
+  char *env_struct_name;
 } FunctionDeclaration;
 
 typedef struct {
@@ -179,6 +187,8 @@ typedef struct {
   char **type_args;
   size_t type_arg_count;
   int is_indirect_call; // 1 if callee is a variable with function pointer type
+  struct Type *callee_closure_env; // non-NULL if the callee is a capturing
+                                   // closure; set by the type checker
 } CallExpression;
 
 typedef struct {

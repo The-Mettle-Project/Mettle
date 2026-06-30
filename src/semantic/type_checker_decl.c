@@ -551,6 +551,20 @@ int type_checker_process_declaration(TypeChecker *checker,
         return 0;
       }
       if (var_type) {
+        /* A capturing closure carries a heap environment and cannot be stored in
+         * a plain function-pointer type. Use an inferred local (`var f = ...`)
+         * or capture nothing. */
+        if (init_type && init_type->kind == TYPE_FUNCTION_POINTER &&
+            init_type->closure_env &&
+            !(var_type->kind == TYPE_FUNCTION_POINTER && var_type->closure_env)) {
+          type_checker_set_error_at_location(
+              checker, var_decl->initializer->location,
+              "a capturing closure cannot be stored in a plain function-pointer "
+              "type '%s'; declare the variable without a type (var %s = ...) or "
+              "capture nothing",
+              var_type->name, var_decl->name);
+          return 0;
+        }
         // Type specified: validate assignment compatibility
         if (!(var_type->kind == TYPE_POINTER &&
               type_checker_is_null_pointer_constant(var_decl->initializer)) &&
@@ -1120,6 +1134,10 @@ int type_checker_process_declaration(TypeChecker *checker,
         Type *object_type = type_checker_infer_type(checker, member->object);
         if (!object_type) {
           return 0;
+        }
+        /* Assigning through a pointer-to-struct auto-dereferences (like `->`). */
+        if (object_type->kind == TYPE_POINTER && object_type->base_type) {
+          object_type = object_type->base_type;
         }
 
         if (object_type->kind != TYPE_STRUCT &&

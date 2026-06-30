@@ -27,7 +27,7 @@ Traits and constrained generics support inline bounds, multiple bounds, trailing
 
 ### Anonymous Functions & Closures
 
-Anonymous functions are written `fn(params) -> ret { body }` in expression position and are first-class function pointers (storable, callable, passable as higher-order arguments, usable as C callbacks). **Limitation:** a lambda that captures a variable from an enclosing scope (a *capturing closure*) is not yet supported and is reported at compile time (`capturing closures are not yet supported`). For now, capture nothing, or thread state through an explicit parameter / user-data pointer.
+Anonymous functions are written `fn(params) -> ret { body }` in expression position. A non-capturing lambda is a first-class function pointer (storable, callable, passable as a higher-order argument, usable as a C callback). A lambda that references an enclosing variable is a *capturing closure*: captures are by value (snapshotted at creation), and the closure value is an 8-byte pointer to a heap environment. **Limitations:** (1) a capturing closure must be bound to an inferred local (`var f = ...`); it cannot be stored in an explicitly-typed `fn(...)->...` slot, which means it cannot be passed across a function boundary as an argument or return value yet (both are reported at compile time, not miscompiled). (2) The captured variables must have an explicit type (closures cannot capture a variable whose type was inferred). (3) Captured-variable mutations inside the closure are call-local and do not persist across calls. (4) The heap environment is not freed automatically (consistent with Mettle's manual-heap model).
 
 ### Pattern Matching
 
