@@ -1225,6 +1225,70 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
       }
     }
 
+    if (func_type && func_type->kind == TYPE_FUNCTION_POINTER &&
+        func_type->closure_env) {
+      /* Closure value: func_ptr is the environment pointer. Load the code
+       * pointer from field 0 and pass the environment as a hidden leading
+       * argument. */
+      IROperand code = ir_operand_none();
+      if (!ir_make_temp_operand(context, &code)) {
+        for (size_t i = 0; i < fp_call->argument_count; i++)
+          ir_operand_destroy(&arguments[i]);
+        free(arguments);
+        ir_operand_destroy(&func_ptr);
+        ir_operand_destroy(&destination);
+        return 0;
+      }
+      IRInstruction load = {0};
+      load.op = IR_OP_LOAD;
+      load.location = expression->location;
+      load.dest = code;
+      load.lhs = func_ptr;
+      load.rhs = ir_operand_int(8);
+      int load_ok = ir_emit(context, function, &load);
+      if (!load_ok) {
+        for (size_t i = 0; i < fp_call->argument_count; i++)
+          ir_operand_destroy(&arguments[i]);
+        free(arguments);
+        ir_operand_destroy(&func_ptr);
+        ir_operand_destroy(&code);
+        ir_operand_destroy(&destination);
+        return 0;
+      }
+      IROperand *cargs = calloc(fp_call->argument_count + 1, sizeof(IROperand));
+      if (!cargs) {
+        for (size_t i = 0; i < fp_call->argument_count; i++)
+          ir_operand_destroy(&arguments[i]);
+        free(arguments);
+        ir_operand_destroy(&func_ptr);
+        ir_operand_destroy(&code);
+        ir_operand_destroy(&destination);
+        return 0;
+      }
+      cargs[0] = func_ptr;
+      for (size_t i = 0; i < fp_call->argument_count; i++)
+        cargs[i + 1] = arguments[i];
+      free(arguments);
+      IRInstruction cinstr = {0};
+      cinstr.op = IR_OP_CALL_INDIRECT;
+      cinstr.location = expression->location;
+      cinstr.dest = destination;
+      cinstr.lhs = code;
+      cinstr.arguments = cargs;
+      cinstr.argument_count = fp_call->argument_count + 1;
+      int ok = ir_emit(context, function, &cinstr);
+      for (size_t i = 0; i < fp_call->argument_count + 1; i++)
+        ir_operand_destroy(&cargs[i]);
+      free(cargs);
+      ir_operand_destroy(&code);
+      if (!ok) {
+        ir_operand_destroy(&destination);
+        return 0;
+      }
+      *out_value = destination;
+      return 1;
+    }
+
     IRInstruction instruction = {0};
     instruction.op = IR_OP_CALL_INDIRECT;
     instruction.location = expression->location;

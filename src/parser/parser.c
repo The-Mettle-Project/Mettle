@@ -1306,9 +1306,14 @@ static char *parser_parse_type_annotation(Parser *parser) {
 
   char *type_name = NULL;
 
-  /* Function pointer type: fn(param_types) -> return_type */
-  if (parser->current_token.type == TOKEN_FN) {
-    parser_advance(parser); /* consume 'fn' */
+  /* Function pointer type: fn(param_types) -> return_type (thin), or
+   * Fn(param_types) -> return_type (a stateful closure type). */
+  int is_closure_fn = parser_is_identifier_like(parser->current_token.type) &&
+                      parser->current_token.value &&
+                      strcmp(parser->current_token.value, "Fn") == 0 &&
+                      parser->peek_token.type == TOKEN_LPAREN;
+  if (parser->current_token.type == TOKEN_FN || is_closure_fn) {
+    parser_advance(parser); /* consume 'fn' or 'Fn' */
     if (!parser_expect(parser, TOKEN_LPAREN)) {
       parser_set_error(parser,
                        "Expected '(' after 'fn' in function pointer type");
@@ -1389,7 +1394,8 @@ static char *parser_parse_type_annotation(Parser *parser) {
       free(ret);
       return NULL;
     }
-    snprintf(type_name, fn_len, "fn(%s)->%s", params_buf, ret);
+    snprintf(type_name, fn_len, is_closure_fn ? "Fn(%s)->%s" : "fn(%s)->%s",
+             params_buf, ret);
     free(params_buf);
     free(ret);
     /* Continue to allow * and [] suffixes (e.g. fn()->int32* is nonsensical but
@@ -2310,14 +2316,16 @@ ASTNode *parser_parse_postfix_expression(Parser *parser) {
                                           location);
         free(func_name);
       } else {
-        // Expression like (*fp)(args) or (expr)(args) - function pointer call
-        expr = ast_create_func_ptr_call(expr, arguments, arg_count, location);
-        for (size_t i = 0; i < arg_count; i++) {
-          ast_destroy_node(arguments[i]);
-        }
+        // (expr)(args) / f(...)(args): call through the value the expression
+        // produces - a thin function pointer or a closure. The node owns the
+        // callee expression and the argument nodes; only the array is ours.
+        ASTNode *fp = ast_create_func_ptr_call(expr, arguments, arg_count,
+                                               location);
         free(arguments);
-        ast_destroy_node(expr);
-        return NULL;
+        if (!fp) {
+          return NULL;
+        }
+        expr = fp;
       }
 
     } else if (parser->current_token.type == TOKEN_DOT) {

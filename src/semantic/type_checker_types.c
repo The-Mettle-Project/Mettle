@@ -1,5 +1,17 @@
 // Type checker: type construction, builtins, numeric promotion, conversions.
 #include "type_checker_internal.h"
+#include "../string_intern.h"
+
+/* A shared non-NULL marker used as closure_env for a boundary closure type
+ * (`Fn(...)->R`), where the specific environment layout is opaque. Call dispatch
+ * only checks closure_env for non-NULL; the concrete env is known to the callee. */
+Type *type_checker_closure_env_sentinel(void) {
+  static Type *sentinel = NULL;
+  if (!sentinel) {
+    sentinel = type_create(TYPE_STRUCT, "__closure_env");
+  }
+  return sentinel;
+}
 
 Type *type_checker_parse_array_type(TypeChecker *checker,
                                            const char *name) {
@@ -122,9 +134,15 @@ Type *type_checker_parse_function_pointer_type(TypeChecker *checker,
     return NULL;
   }
 
-  // Check if it's a function pointer type: fn(param1,param2)->returntype
+  // Check if it's a function pointer type: fn(param1,param2)->returntype (thin)
+  // or Fn(...)->returntype (a stateful closure type). Both prefixes are 3 chars.
+  int is_closure_type = 0;
   if (strlen(name) < 4 || strncmp(name, "fn(", 3) != 0) {
-    return NULL;
+    if (strlen(name) >= 4 && strncmp(name, "Fn(", 3) == 0) {
+      is_closure_type = 1;
+    } else {
+      return NULL;
+    }
   }
 
   size_t close_index = 0;
@@ -332,6 +350,13 @@ Type *type_checker_parse_function_pointer_type(TypeChecker *checker,
   if (!fp_type) {
     return NULL;
   }
+  if (is_closure_type) {
+    /* Name it with the resolvable `Fn(...)->R` string so an inferred closure
+     * local is sized as an 8-byte pointer by the backend, and mark it a
+     * closure so calls dispatch through the environment. */
+    fp_type->name = (char *)string_intern(name);
+    fp_type->closure_env = type_checker_closure_env_sentinel();
+  }
 
   return fp_type;
 }
@@ -508,8 +533,8 @@ Type *type_checker_get_type_by_name(TypeChecker *checker, const char *name) {
   if (strcmp(name, "void") == 0)
     return checker->builtin_void;
 
-  // Check for function pointer types: fn(param1,param2)->returntype
-  if (strncmp(name, "fn(", 3) == 0) {
+  // Check for function pointer types: fn(...)->R (thin) or Fn(...)->R (closure).
+  if (strncmp(name, "fn(", 3) == 0 || strncmp(name, "Fn(", 3) == 0) {
     Type *fp_type = type_checker_parse_function_pointer_type(checker, name);
     if (fp_type) {
       return fp_type;
@@ -746,12 +771,23 @@ int type_checker_is_assignable(TypeChecker *checker, Type *dest_type,
   if (!checker || !dest_type || !src_type)
     return 0;
 
-  /* A capturing closure (function-pointer type carrying an environment) is not
-   * assignable to a plain function pointer: a thin call site would dispatch
-   * without the captured environment. */
-  if (src_type->kind == TYPE_FUNCTION_POINTER && src_type->closure_env &&
-      !(dest_type->kind == TYPE_FUNCTION_POINTER && dest_type->closure_env)) {
-    return 0;
+  /* A closure (function-pointer type carrying an environment) and a thin
+   * function pointer are not interchangeable: a thin call site dispatches
+   * without the environment, and a closure call site reads a code pointer the
+   * thin value does not carry. Closures cross boundaries only as `Fn(...)->R`. */
+  {
+    int src_is_closure = src_type->kind == TYPE_FUNCTION_POINTER &&
+                         src_type->closure_env;
+    int dst_is_closure = dest_type->kind == TYPE_FUNCTION_POINTER &&
+                         dest_type->closure_env;
+    int src_is_thin_fn =
+        src_type->kind == TYPE_FUNCTION_POINTER && !src_type->closure_env;
+    int dst_is_thin_fn =
+        dest_type->kind == TYPE_FUNCTION_POINTER && !dest_type->closure_env;
+    if ((src_is_closure && dst_is_thin_fn) ||
+        (dst_is_closure && src_is_thin_fn)) {
+      return 0;
+    }
   }
 
   if (type_checker_types_equal(dest_type, src_type)) {

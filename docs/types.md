@@ -122,13 +122,29 @@ fn main() -> int32 {
 
 Captures are **by value**: each captured variable's value is snapshotted when the closure is created, so changing the original afterwards does not change what the closure sees. A closure value is an 8-byte pointer to a heap-allocated environment holding the code pointer and the captured values.
 
-Because a closure carries state, its type is distinct from a plain function pointer. Bind a closure to an **inferred** local (`var f = ...`, no type annotation) so the closure type is preserved:
+Because a closure carries state, its type is distinct from a plain function pointer. A closure type is written with a capital **`Fn`**: `Fn(int32) -> int32`. A plain `fn(...)->R` stays a thin, C-compatible function pointer; `Fn(...)->R` is a stateful closure.
+
+Use `Fn(...)->R` to carry closures across function boundaries - returned from a factory, passed to a higher-order function, or stored in a struct field:
 
 ```mettle
-var f = fn(x: int32) -> int32 { return x * scale; };   // ok: type inferred
+fn make_adder(n: int32) -> Fn(int32) -> int32 {
+  return fn(x: int32) -> int32 { return x + n; };   // closure capturing n
+}
+
+fn apply_twice(f: Fn(int32) -> int32, v: int32) -> int32 {
+  return f(f(v));
+}
+
+fn main() -> int32 {
+  var add = make_adder(10);
+  println_int(add(5));            // 15
+  println_int(apply_twice(add, 0)); // 20
+  println_int(make_adder(3)(5));  // 8 - the returned closure is called directly
+  return 0;
+}
 ```
 
-Storing a capturing closure in an explicitly-typed `fn(...) -> ...` variable, parameter, or return type is a compile error (a thin function pointer cannot carry an environment). Passing a capturing closure across a function boundary (as an argument or return value) is therefore not yet supported; keep a closure within the function that creates it, or use a non-capturing lambda. See [known limitations](known-limitations.md).
+A capturing closure and a thin `fn(...)->R` are not interchangeable: assigning one where the other is expected is a compile error (a thin pointer cannot carry an environment, and a closure call site reads a code pointer a thin value does not have). Within a single function you may also bind a closure to an inferred local (`var f = ...`). See [known limitations](known-limitations.md).
 
 ## Array Types
 
