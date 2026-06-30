@@ -572,55 +572,72 @@ int type_checker_process_declaration(TypeChecker *checker,
       return 0;
     }
 
-    // A `const` declaration binds an immutable compile-time integer value.
-    // At global scope it is folded at every use site (SYMBOL_CONSTANT) and
-    // needs no storage. A local `const` is registered as an immutable variable
-    // (it gets normal storage below) because IR lowering cannot resolve local
-    // scopes to fold it; reassignment is rejected via the immutable flag.
+    // A `const` declaration binds an immutable value and must be initialized.
+    // An integer const is folded at every use site (SYMBOL_CONSTANT) at global
+    // scope and needs no storage. A const of any other type (float, string,
+    // ...) cannot be folded, so it is registered as an immutable variable with
+    // normal storage and initializer codegen. Reassignment is rejected via the
+    // immutable flag in either case.
     if (var_decl->is_const) {
-      if (!type_checker_is_integer_type(var_type)) {
-        type_checker_report_type_mismatch(checker,
-                                          var_decl->initializer->location,
-                                          "integer type", var_type->name);
-        return 0;
-      }
-      long long const_value = 0;
-      if (!type_checker_eval_integer_constant_with_checker(
-              checker, var_decl->initializer, &const_value)) {
+      if (!var_decl->initializer) {
         type_checker_set_error_at_location(
-            checker, var_decl->initializer->location,
-            "Constant '%s' initializer must be a compile-time integer "
-            "constant expression",
-            var_decl->name);
+            checker, declaration->location,
+            "Constant '%s' must have an initializer", var_decl->name);
         return 0;
       }
-      if (current_scope && current_scope->type == SCOPE_GLOBAL) {
-        if (symbol_table_lookup_current_scope(checker->symbol_table,
-                                              var_decl->name)) {
-          type_checker_report_duplicate_declaration(
-              checker, declaration->location, var_decl->name);
-          return 0;
-        }
-        Symbol *const_symbol =
-            symbol_create(var_decl->name, SYMBOL_CONSTANT, var_type);
-        if (!const_symbol) {
+      if (type_checker_is_integer_type(var_type)) {
+        long long const_value = 0;
+        if (!type_checker_eval_integer_constant_with_checker(
+                checker, var_decl->initializer, &const_value)) {
           type_checker_set_error_at_location(
-              checker, declaration->location,
-              "Failed to create symbol for constant '%s'", var_decl->name);
+              checker, var_decl->initializer->location,
+              "Constant '%s' initializer must be a compile-time integer "
+              "constant expression",
+              var_decl->name);
           return 0;
         }
-        const_symbol->data.constant.value = const_value;
-        const_symbol->is_initialized = 1;
-        if (!symbol_table_declare(checker->symbol_table, const_symbol)) {
-          type_checker_report_duplicate_declaration(
-              checker, declaration->location, var_decl->name);
-          symbol_destroy(const_symbol);
-          return 0;
+        if (current_scope && current_scope->type == SCOPE_GLOBAL) {
+          if (symbol_table_lookup_current_scope(checker->symbol_table,
+                                                var_decl->name)) {
+            type_checker_report_duplicate_declaration(
+                checker, declaration->location, var_decl->name);
+            return 0;
+          }
+          Symbol *const_symbol =
+              symbol_create(var_decl->name, SYMBOL_CONSTANT, var_type);
+          if (!const_symbol) {
+            type_checker_set_error_at_location(
+                checker, declaration->location,
+                "Failed to create symbol for constant '%s'", var_decl->name);
+            return 0;
+          }
+          const_symbol->data.constant.value = const_value;
+          const_symbol->is_initialized = 1;
+          if (!symbol_table_declare(checker->symbol_table, const_symbol)) {
+            type_checker_report_duplicate_declaration(
+                checker, declaration->location, var_decl->name);
+            symbol_destroy(const_symbol);
+            return 0;
+          }
+          return 1;
         }
-        return 1;
+        // Local integer const: fall through to immutable variable registration.
+      } else if (current_scope && current_scope->type == SCOPE_GLOBAL) {
+        // Non-integer consts are registered as immutable variables, which at
+        // global scope rely on float/string global-initializer codegen that is
+        // not yet emitted (the value would read back as zero / fail to link).
+        // Keep them function-local until that lands; integer globals still fold.
+        type_checker_set_error_at_location(
+            checker, declaration->location,
+            "Global constant '%s' of non-integer type '%s' is not yet "
+            "supported; declare it inside a function, or use a top-level `var`",
+            var_decl->name, var_type->name);
+        return 0;
       }
-      // Local const: fall through to normal variable registration; the symbol
-      // is marked immutable where it is created below.
+      // Local non-integer const (float, string, ...): fall through to immutable
+      // variable registration; storage and the initializer are emitted like a
+      // normal local variable, and the immutable flag below rejects
+      // reassignment.
     }
 
     // Check for duplicate declaration in current scope.

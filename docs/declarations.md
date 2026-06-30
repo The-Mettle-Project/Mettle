@@ -15,15 +15,23 @@ var buf: uint8[1024];
 
 ## Constants
 
-Constants are declared with `const`, a name, an optional type, and a required initializer that is a compile-time constant integer expression. A top-level `const` is folded directly into the machine code at every use site and occupies no storage. A local `const` is an immutable binding; assigning to it is a compile error.
+Constants are declared with `const`, a name, an optional type, and a required initializer. Assigning to a `const` is a compile error, and a constant must be declared before it is used.
 
 ```mettle
 const MAX: int32 = 100;
 const STEP = 4;            // type inferred as int32
 const BOUND = MAX - STEP;  // may reference earlier constants
+
+function main() -> int32 {
+    const RATE = 1.5;      // local consts may be float, string, ...
+    const LABEL = "ready";
+    return MAX;
+}
 ```
 
-Initializers may use integer literals, `sizeof`, other constants, and arithmetic, bitwise, and comparison operators over them. Float, string, and aggregate constants are not yet supported, and a constant must be declared before it is used.
+A **top-level** `const` must have integer type. It is folded directly into the machine code at every use site and occupies no storage, so its initializer must be a compile-time constant integer expression: integer literals, `sizeof`, other constants, and arithmetic, bitwise, and comparison operators over them.
+
+A **local** (function-scope) `const` may have any type — integer, float, string, or aggregate. It is an immutable binding backed by normal local storage, so its initializer follows the same rules as any local variable initializer. Global float, string, and aggregate constants are not yet supported; use a top-level `var` or a function-local `const`.
 
 ## Functions
 

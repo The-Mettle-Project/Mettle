@@ -16,7 +16,10 @@ This document lists current limitations of the Mettle language, compiler, and ru
 
 ### Constants
 
-- `const NAME [: type] = <expr>;` declares a compile-time integer constant. At top level the value is folded at every use site; a local `const` is an immutable variable (reassignment is a compile error). Initializers must be compile-time constant integer expressions (literals, `sizeof`, other constants, and arithmetic/bitwise/comparison operators over them). Float, string, and aggregate constants are not yet supported, and constants must be declared before use.
+- `const NAME [: type] = <expr>;` declares an immutable binding; reassignment is a compile error. Constants must be declared before use.
+  - **Top-level (global) `const`** must have **integer** type. Its value is folded at every use site (it needs no storage), so the initializer must be a compile-time constant integer expression (literals, `sizeof`, other constants, and arithmetic/bitwise/comparison operators over them).
+  - **Local (function-scope) `const`** may have **any** type — integer, float, string, or aggregate. It is registered as an immutable local variable initialized to its value (not folded), so the initializer follows the same rules as any local variable initializer.
+  - **Global float, string, and aggregate constants are not yet supported** and are rejected with a clear diagnostic, because global non-integer initializer codegen is not yet emitted. Use a top-level `var` (which is mutable) or a function-local `const` instead.
 
 ### Traits & Generics
 
@@ -25,7 +28,7 @@ Traits and constrained generics support inline bounds, multiple bounds, trailing
 ### Pattern Matching
 
 - `**match` on tagged enums** supports both a statement form (arm bodies are `{ ... }` blocks) and an expression form that yields a value. In expression form, each arm body must be a single value-yielding expression (for example, `match (o) { case Some(v): v + 1, default: 0 }`). All arm types must unify, and the match must be exhaustive (`default:` or all variants covered) because it must always produce a value.
-- **Tagged-enum constructors** are function-like. Payload variants use `Some(x)`; payloadless variants use empty call syntax such as `None()`.
+- **Tagged-enum constructors** are function-like. Payload variants use `Some(x)`. Payloadless variants may be written either bare (`None`) or with empty call syntax (`None()`); both forms construct the same value.
 
 ### Switch
 
@@ -111,4 +114,4 @@ Arrays follow the same rule as in [Types - Array Types](types.md#array-types): t
 
 ### Platform Support
 
-- `std/net` and the web server example are Windows-only (Winsock2). Use POSIX socket externs for networking on Linux.
+- `std/net` works on both Windows and Linux from a single `import "std/net"`. On Windows it binds Winsock2; on the native ELF/Linux target the import resolver automatically selects `std/net.linux`, which exposes the same public API over POSIX libc sockets (the Windows-only `WSAStartup`/`WSACleanup`/`closesocket`/`WSAGetLastError` names become thin wrappers). The compiler auto-appends `posix_helpers.o` and `-lpthread` to the link line when `net` is imported on Linux.

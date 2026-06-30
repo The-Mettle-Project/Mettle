@@ -2070,6 +2070,50 @@ catch {
   Write-CaseResult -Name "const_top_level_runtime" -Passed $false -Reason $_.Exception.Message
 }
 
+# Local non-integer consts (float + string): --build and verify runtime value.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "const_local_float_string.exe"
+  $buildOut = & $CompilerPath --build "tests\test_const_local_float_string.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "Local non-integer const build failed: $buildOut"
+  }
+  if (-not (Test-Path $exePath)) {
+    throw "Local non-integer const build did not produce an executable"
+  }
+  & $exePath 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 42) {
+    throw "Local non-integer const exited with $LASTEXITCODE (expected 42)"
+  }
+  Write-CaseResult -Name "const_local_float_string_runtime" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "const_local_float_string_runtime" -Passed $false -Reason $_.Exception.Message
+}
+
+# Global non-integer const is rejected with a clear diagnostic (not yet supported).
+$total++
+try {
+  $srcPath = Join-Path $tmpDir "const_global_float.mettle"
+  Set-Content -LiteralPath $srcPath -Encoding utf8 -Value @(
+    "const PI = 3.14;",
+    "function main() -> int32 { return 0; }"
+  )
+  $out = & $CompilerPath $srcPath 2>&1 | Out-String
+  if ($LASTEXITCODE -eq 0) {
+    throw "Global non-integer const unexpectedly compiled"
+  }
+  if ($out -notmatch "non-integer type 'float64' is not yet supported") {
+    throw "Global non-integer const error message changed: $out"
+  }
+  Write-CaseResult -Name "err_const_global_float" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "err_const_global_float" -Passed $false -Reason $_.Exception.Message
+}
+
 # Conditional imports: --build and verify off-target guarded imports are dropped.
 $total++
 try {
