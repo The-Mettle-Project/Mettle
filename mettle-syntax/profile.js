@@ -182,7 +182,7 @@ function portAdvice(port) {
     case 'p0':
       return `Bound on port 0 (integer/vector divide and some shifts). If the loop divides or takes a remainder by a value, make the divisor a compile-time constant so the strength-reducer can replace it with a multiply.`;
     case 'p1':
-      return `Bound on port 1 (multiply). Reduce multiplies in the loop — strength-reduce multiplies by constants into shifts/adds, and hoist products that don't change each iteration.`;
+      return `Bound on port 1 (multiply). Reduce multiplies in the loop - strength-reduce multiplies by constants into shifts/adds, and hoist products that don't change each iteration.`;
     case 'p5':
       return `Bound on port 5 (vector shuffles / address generation). Simplify lane-crossing shuffles or complex addressing in the loop.`;
     case 'p6':
@@ -235,7 +235,7 @@ function buildInsights(model, fused, filePath) {
   if (topLine && topCyc / prog >= 0.15 && !loopLines.has(topLine)) {
     out.push({ kind: 'topline', tag: 'HOTSPOT', tone: 'hot', line: topLine, weight: topCyc / prog,
       title: `Line ${topLine} is ${fmtPct(topCyc / prog)} of all measured cycles`,
-      detail: 'The single biggest cost in the program — optimize here first for the most impact.' });
+      detail: 'The single biggest cost in the program - optimize here first for the most impact.' });
   }
 
   // Register spills inside hot functions.
@@ -257,7 +257,7 @@ function buildInsights(model, fused, filePath) {
       const share = (lineCyc.get(r.line) || 0) / prog;
       if (share < 0.05) continue;
       out.push({ kind: 'fix', sev: 'fix', tag: 'FIX', tone: 'fix', line: r.line, weight: share + 0.001,
-        title: `Line ${r.line} is ${fmtPct(share)} of cycles — the optimizer suggests a fix`,
+        title: `Line ${r.line} is ${fmtPct(share)} of cycles - the optimizer suggests a fix`,
         detail: r.fix, sub: r.reason || '' });
     }
   }
@@ -367,7 +367,7 @@ function portPanel(press) {
   const memBound = mem > core;
   const rows = RES.map((n, i) => {
     const isMem = i >= 4, hot = i === bnd;
-    return `<div class="prow ${isMem ? 'mem' : 'core'}${hot ? ' hot' : ''}" title="${n} — ${esc(PORT_ROLE[i])}">
+    return `<div class="prow ${isMem ? 'mem' : 'core'}${hot ? ' hot' : ''}" title="${n} - ${esc(PORT_ROLE[i])}">
       <span class="pn">${n}</span>
       <span class="pbar"><b style="width:${(press[i] / max * 100).toFixed(1)}%"></b></span>
       <span class="pv">${fmtPct(press[i] / total)}</span></div>`;
@@ -378,7 +378,7 @@ function portPanel(press) {
       <span class="pboundq">bottleneck: <b>${esc(RES[bnd])}</b> at ${fmtPct(press[bnd] / total)} · Core ${fmtPct(core / total)} / Memory ${fmtPct(mem / total)}</span>
     </div>
     <div class="pgrid">${rows}</div>
-    <div class="estnote">share of measured issue cycles per port (exec count × static Skylake port model, flex ALU water-filled across p0/p1/p5/p6) — bars are relative to the busiest port; not a hardware sample</div>
+    <div class="estnote">share of measured issue cycles per port (exec count × static Skylake port model, flex ALU water-filled across p0/p1/p5/p6); bars are relative to the busiest port; not a hardware sample</div>
   </div>`;
 }
 

@@ -341,7 +341,7 @@ function renderHtml(m, filePath, syntax, group) {
         <span><i class="ra"></i>register-allocated</span>
         ${fbCount ? `<span><i class="fbi"></i>baseline · ${fbCount}</span>` : ''}
       </span>
-      <input class="tocfilter" id="tocfilter" type="text" placeholder="filter functions…" spellcheck="false">
+      <input class="tocfilter" id="tocfilter" type="text" placeholder="filter functions..." spellcheck="false">
     </div>
     <div class="tocwrap">${toc}</div>
   </div>`;
