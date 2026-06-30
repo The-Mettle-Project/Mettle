@@ -10,7 +10,7 @@ import "std/io";
 import "std/bench";
 
 // Returns number of steps to reach 1 from n (n >= 1)
-function collatz_steps(n: int64) -> int64 {
+fn collatz_steps(n: int64) -> int64 {
   var count: int64 = 0;
   var x: int64 = n;
   while (x > 1) {
@@ -24,7 +24,7 @@ function collatz_steps(n: int64) -> int64 {
   return count;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var header: string = "Collatz: sum of steps for n=1..100000";
   println(cstr(header));
 

@@ -1,7 +1,7 @@
 import "std/mem";
 import "std/io";
 
-function page_checksum(data: cstring, size: int32) -> uint32 {
+fn page_checksum(data: cstring, size: int32) -> uint32 {
   var hash: uint32 = 2166136261;
   var i: int32 = 0;
   while (i < size) {
@@ -12,7 +12,7 @@ function page_checksum(data: cstring, size: int32) -> uint32 {
   return hash;
 }
 
-function page_init_buf(buf: cstring, page_id: int64, page_type: int32) {
+fn page_init_buf(buf: cstring, page_id: int64, page_type: int32) {
   memset(buf, 0, 4096);
   var cs: uint32 = page_checksum(buf + 32, 4096 - 32);
   if (cs == 0) {
@@ -62,13 +62,13 @@ struct Db {
   cache: CacheEntry[32];
 }
 
-function cache_load(db: Db*, page_id: int64) -> int32 {
+fn cache_load(db: Db*, page_id: int64) -> int32 {
   db[0].data_fp = fopen("nul", cstr("r+b"));
   page_init_buf(&db[0].cache[0].data[0], page_id, 2);
   return 0;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var db: Db* = new Db;
   return cache_load(db, 0);
 }

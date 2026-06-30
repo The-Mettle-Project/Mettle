@@ -1,6 +1,6 @@
 // Clamp-copy should fuse by shape, not benchmark-specific symbol names.
 
-function narrow(x: int32, floor_bound: int32, ceiling_bound: int32) -> int32 {
+fn narrow(x: int32, floor_bound: int32, ceiling_bound: int32) -> int32 {
   if (x < floor_bound) {
     return floor_bound;
   }
@@ -10,7 +10,7 @@ function narrow(x: int32, floor_bound: int32, ceiling_bound: int32) -> int32 {
   return x;
 }
 
-function bounded_copy(input_buf: int32*, output_buf: int32*, count: int64) -> int64 {
+fn bounded_copy(input_buf: int32*, output_buf: int32*, count: int64) -> int64 {
   var acc: int64 = 0;
   var idx: int64 = 0;
   while (idx < count) {
@@ -22,7 +22,7 @@ function bounded_copy(input_buf: int32*, output_buf: int32*, count: int64) -> in
   return acc;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var src: int32[8];
   var dst: int32[8];
   src[0] = -200;

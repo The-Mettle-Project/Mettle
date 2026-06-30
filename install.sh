@@ -216,7 +216,7 @@ else
 fi
 cat <<EOF
     ${BOLD}mettle --version${RESET}
-    ${BOLD}echo 'function main() -> int32 { return 0; }' > hello.mettle${RESET}
+    ${BOLD}echo 'fn main() -> int32 { return 0; }' > hello.mettle${RESET}
     ${BOLD}mettle --build hello.mettle -o hello && ./hello${RESET}
 
 Docs: ${BLUE}https://github.com/$REPO${RESET}

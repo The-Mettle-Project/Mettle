@@ -16,11 +16,11 @@
 
 import "std/io";
 
-function scale(x: float32) -> float32 {
+fn scale(x: float32) -> float32 {
   return x * 1.5 + 0.5;   // computed at float64, narrowed to float32 on return
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   // Path 1: float32 accumulation with a float64 RHS subexpression.
   var s: float32 = 0.0;
   var x: float32 = 4.0;

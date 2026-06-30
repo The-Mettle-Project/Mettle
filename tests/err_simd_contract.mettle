@@ -3,7 +3,7 @@
 // (only fires under optimization, where vectorization runs).
 import "std/io";
 
-function main() -> int32 {
+fn main() -> int32 {
   @simd! for i in 0..10 {
     print_int(i);
   }

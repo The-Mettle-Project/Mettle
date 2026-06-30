@@ -2,7 +2,7 @@
 import "../engine/engine_vk_shaders";
 import "../engine/engine_vulkan";
 
-function noop_call(ctx: int64, info: VkGraphicsPipelineCreateInfo*, out_pipe: int64*) -> int32 {
+fn noop_call(ctx: int64, info: VkGraphicsPipelineCreateInfo*, out_pipe: int64*) -> int32 {
   if (ctx == 0 || info == 0 || out_pipe == 0) {
     return 0;
   }
@@ -10,7 +10,7 @@ function noop_call(ctx: int64, info: VkGraphicsPipelineCreateInfo*, out_pipe: in
   return 0;
 }
 
-function pipeline_stack_with_calls(ctx: VkContext*) -> int32 {
+fn pipeline_stack_with_calls(ctx: VkContext*) -> int32 {
   if (ctx == 0 || ctx->device == 0 || ctx->render_pass == 0) {
     return 0;
   }
@@ -216,7 +216,7 @@ function pipeline_stack_with_calls(ctx: VkContext*) -> int32 {
   return 1;
 }
 
-export function main() -> int32 {
+export fn main() -> int32 {
   var raw: uint8[1024];
   var ctx: VkContext* = (VkContext*)((int64)(&(raw[0])));
   ctx->device = (int64)1;

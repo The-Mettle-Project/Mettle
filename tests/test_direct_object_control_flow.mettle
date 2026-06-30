@@ -1,4 +1,4 @@
-function choose(flag: int32, when_zero: int32, when_nonzero: int32) -> int32 {
+fn choose(flag: int32, when_zero: int32, when_nonzero: int32) -> int32 {
   if (flag) {
     return when_nonzero;
   }
@@ -6,6 +6,6 @@ function choose(flag: int32, when_zero: int32, when_nonzero: int32) -> int32 {
   return when_zero;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   return choose(0, 11, 22);
 }

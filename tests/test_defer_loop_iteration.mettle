@@ -1,9 +1,9 @@
 import "std/io";
 
-function iter_defer() { puts(cstr("ITER_DEFER\n")); }
-function iter_body() { puts(cstr("ITER_BODY\n")); }
+fn iter_defer() { puts(cstr("ITER_DEFER\n")); }
+fn iter_body() { puts(cstr("ITER_BODY\n")); }
 
-function main() -> int32 {
+fn main() -> int32 {
   var i: int32 = 0;
   while (i < 2) {
     defer iter_defer();

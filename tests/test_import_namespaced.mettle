@@ -1,6 +1,6 @@
 import "namespaced_math" as math;
 
-function main() -> int32 {
+fn main() -> int32 {
   var kind: math.Magic = math.FortyTwo;
   var pair: math.Pair* = math.make_pair(math.answer(), math.FortyTwo - 40);
 

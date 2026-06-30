@@ -6,6 +6,6 @@ struct TooBigForBudget {
 
 static_assert(sizeof(TooBigForBudget) <= 16);
 
-function main() -> int32 {
+fn main() -> int32 {
   return 0;
 }

@@ -240,7 +240,7 @@ function scanModule(text, filePath) {
     return { params, returnType, sigEndLine: close.line };
   }
 
-  const fnRe = /^(\s*)((?:export\s+)?)((?:@\w+!?\s+)*)((?:extern\s+)?)(function|method|kernel)\s+([A-Za-z_][A-Za-z0-9_]*)/;
+  const fnRe = /^(\s*)((?:export\s+)?)((?:@\w+!?\s+)*)((?:extern\s+)?)(fn|method|kernel)\s+([A-Za-z_][A-Za-z0-9_]*)/;
   const typeRe = /^(\s*)((?:export\s+)?)(struct|enum|trait)\s+([A-Za-z_][A-Za-z0-9_]*)/;
   const varRe = /^(\s*)((?:export\s+)?)((?:extern\s+)?)var\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([^=;]+)/;
 

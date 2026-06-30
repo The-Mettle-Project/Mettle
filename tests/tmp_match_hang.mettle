@@ -1,4 +1,4 @@
-﻿function main() -> int32 {
+﻿fn main() -> int32 {
   match x: int32 = 1 {
     _ => return 0;
   }

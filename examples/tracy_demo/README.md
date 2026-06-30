@@ -75,7 +75,7 @@ Mettle does not yet provide `__FILE__` / `__LINE__` builtins. Zones pass an expl
 ```mettle
 import "std/tracy";
 
-function work() {
+fn work() {
   var z: TracyZone = tracy_zone_colored(
     cstr("work"), cstr("myapp.mettle"), 42, cstr("work"), tracy_color_update());
   defer tracy_scope_end(z);

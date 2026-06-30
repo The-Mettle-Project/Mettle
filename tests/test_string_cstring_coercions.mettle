@@ -1,18 +1,18 @@
 import "std/io";
 
-function identity_cstring(p: cstring) -> cstring {
+fn identity_cstring(p: cstring) -> cstring {
   return p;
 }
 
-function literal_cstring() -> cstring {
+fn literal_cstring() -> cstring {
   return "hi";
 }
 
-function first_char(p: cstring) -> int32 {
+fn first_char(p: cstring) -> int32 {
   return p[0];
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var msg: string = "hello";
   print(msg);
   println("!");

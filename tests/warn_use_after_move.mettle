@@ -7,7 +7,7 @@ import "std/io";
 import "std/mem";
 
 // Free through the alias `q`, then use the original `buf`: use-after-free.
-function uaf_through_alias() -> int32 {
+fn uaf_through_alias() -> int32 {
     var buf: cstring = malloc(16);
     buf[0] = 7;
     var q: cstring = buf;
@@ -16,7 +16,7 @@ function uaf_through_alias() -> int32 {
 }
 
 // Free the original `block`, then use the alias `mirror`: same block, gone.
-function uaf_reverse() -> int32 {
+fn uaf_reverse() -> int32 {
     var block: cstring = malloc(16);
     var mirror: cstring = block;
     free(block);
@@ -24,7 +24,7 @@ function uaf_reverse() -> int32 {
 }
 
 // Two names for one block, freed twice: a double free.
-function double_free_alias() -> int32 {
+fn double_free_alias() -> int32 {
     var a: cstring = malloc(8);
     var b: cstring = a;
     free(a);
@@ -34,7 +34,7 @@ function double_free_alias() -> int32 {
 
 // Clean control: `view` is re-pointed to its own allocation before `keep` is
 // freed, so it no longer aliases `keep` and stays valid.
-function clean_realias() -> int32 {
+fn clean_realias() -> int32 {
     var keep: cstring = malloc(8);
     var view: cstring = keep;
     view = malloc(8);
@@ -45,7 +45,7 @@ function clean_realias() -> int32 {
 }
 
 // Clean control: the alias `peek` is read before `owned` is freed.
-function clean_read_first() -> int32 {
+fn clean_read_first() -> int32 {
     var owned: cstring = malloc(8);
     var peek: cstring = owned;
     var v: int32 = (int32)peek[0];
@@ -53,6 +53,6 @@ function clean_read_first() -> int32 {
     return v;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     return uaf_through_alias() + uaf_reverse() + double_free_alias() + clean_realias() + clean_read_first();
 }

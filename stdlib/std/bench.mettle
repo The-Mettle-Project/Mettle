@@ -2,10 +2,10 @@
 
 var g_bench_qpc_freq: int64 = 0;
 
-extern function QueryPerformanceCounter(counter: int64*) -> int32 = "QueryPerformanceCounter";
-extern function QueryPerformanceFrequency(frequency: int64*) -> int32 = "QueryPerformanceFrequency";
+extern fn QueryPerformanceCounter(counter: int64*) -> int32 = "QueryPerformanceCounter";
+extern fn QueryPerformanceFrequency(frequency: int64*) -> int32 = "QueryPerformanceFrequency";
 
-export function bench_time_us() -> uint64 {
+export fn bench_time_us() -> uint64 {
   if (g_bench_qpc_freq == 0) {
     QueryPerformanceFrequency(&g_bench_qpc_freq);
   }

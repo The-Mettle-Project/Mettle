@@ -58,7 +58,7 @@ var void_fn: fn() -> void;           // pointer to function taking nothing retur
 Use the address-of operator `&` to create a function pointer:
 
 ```mettle
-function add(a: int32, b: int32) -> int32 {
+fn add(a: int32, b: int32) -> int32 {
   return a + b;
 }
 
@@ -80,11 +80,11 @@ Function pointers are useful for callbacks, strategy patterns, and C interop:
 
 ```mettle
 // Callback pattern
-function apply(op: fn(int32, int32) -> int32, a: int32, b: int32) -> int32 {
+fn apply(op: fn(int32, int32) -> int32, a: int32, b: int32) -> int32 {
   return op(a, b);
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   return apply(&add, 5, 3);  // passes add as callback
 }
 ```
@@ -189,7 +189,7 @@ enum Result<T> {
 
 ## Generic Type Parameters
 
-Functions and structs can be generic. Type parameters are declared in angle brackets: `function f<T>(...)` or `struct S<T> { ... }`. Instantiation uses the same syntax: `f<int32>(args)` or `var x: Pair<int32, float64>`.
+Functions and structs can be generic. Type parameters are declared in angle brackets: `fn f<T>(...)` or `struct S<T> { ... }`. Instantiation uses the same syntax: `f<int32>(args)` or `var x: Pair<int32, float64>`.
 
 ```mettle
 struct Pair<A, B> {
@@ -211,11 +211,11 @@ The compiler performs **monomorphization** before type checking: each unique ins
 
 ```mettle
 trait Incrementable {
-  function next_value(self: Self) -> Self;
+  fn next_value(self: Self) -> Self;
 }
 
 impl Incrementable for int32 {
-  function next_value(self: Self) -> Self {
+  fn next_value(self: Self) -> Self {
     return self + 1;
   }
 }

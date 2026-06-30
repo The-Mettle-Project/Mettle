@@ -3,7 +3,7 @@ enum Option {
     None
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     match (Some(7)) {
         case Some(value): {
             return value;

@@ -3,6 +3,6 @@ export trait SignedNumber;
 impl Addable for int32;
 impl SignedNumber for int32;
 
-export function plus_one<T: Addable>(value: T) -> T {
+export fn plus_one<T: Addable>(value: T) -> T {
     return value + 1;
 }

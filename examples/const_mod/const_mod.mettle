@@ -12,7 +12,7 @@ import "std/bench";
 
 const N = 20000000;
 
-function run() -> int64 {
+fn run() -> int64 {
   var acc: int64 = 0;
   var x: int64 = 123456789;
   var i: int64 = 0;
@@ -24,7 +24,7 @@ function run() -> int64 {
   return acc;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var passes: int32 = 20;
   println("Const-divisor div/mod, 20M iters x 20 passes");
 

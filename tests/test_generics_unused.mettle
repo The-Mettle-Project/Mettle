@@ -3,10 +3,10 @@ struct Container<T> {
     size: int32;
 }
 
-function unused_generic<T>(val: T) -> T {
+fn unused_generic<T>(val: T) -> T {
     return val;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     return 0;
 }

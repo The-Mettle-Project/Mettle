@@ -1,5 +1,5 @@
 import "cycle_a"
 
-export function cycle_b_value() -> int32 {
+export fn cycle_b_value() -> int32 {
   return 20
 }

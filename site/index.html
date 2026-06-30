@@ -254,7 +254,7 @@
           </div>
 
           <div class="panel on" id="p-vec" role="tabpanel" aria-labelledby="tab-vec" tabindex="0">
-<div class="code"><span class="ln">1</span><span class="c-key">function</span> scale(dst: <span class="c-type">int32*</span>, src: <span class="c-type">int32*</span>, n: <span class="c-type">int32</span>) {
+<div class="code"><span class="ln">1</span><span class="c-key">fn</span> scale(dst: <span class="c-type">int32*</span>, src: <span class="c-type">int32*</span>, n: <span class="c-type">int32</span>) {
 <span class="ln">2</span>    <span class="c-at">@simd!</span> <span class="c-key">for</span> i <span class="c-key">in</span> <span class="c-num">0</span>..n {
 <span class="ln">3</span>        dst[i] = src[i] * <span class="c-num">3</span> + <span class="c-num">7</span>;
 <span class="ln">4</span>    }
@@ -266,7 +266,7 @@ scale <span class="em">(loop @ 2)</span>: <span class="ok">vectorized -&gt; AVX2
           </div>
 
           <div class="panel" id="p-explain" role="tabpanel" aria-labelledby="tab-explain" tabindex="0">
-<div class="code"><span class="ln">1</span><span class="c-key">function</span> sum(a: <span class="c-type">int32*</span>, n: <span class="c-type">int32</span>) -&gt; <span class="c-type">int64</span> {
+<div class="code"><span class="ln">1</span><span class="c-key">fn</span> sum(a: <span class="c-type">int32*</span>, n: <span class="c-type">int32</span>) -&gt; <span class="c-type">int64</span> {
 <span class="ln">2</span>    <span class="c-key">var</span> total: <span class="c-type">int32</span> = <span class="c-num">0</span>;
 <span class="ln">3</span>    <span class="c-key">for</span> i <span class="c-key">in</span> <span class="c-num">0</span>..n { total = total + a[i]; }
 <span class="ln">4</span>    <span class="c-key">return</span> total;
@@ -278,7 +278,7 @@ sum <span class="em">(loop @ 3)</span>: <span class="bad">not vectorized</span>
           </div>
 
           <div class="panel" id="p-contract" role="tabpanel" aria-labelledby="tab-contract" tabindex="0">
-<div class="code"><span class="ln">1</span><span class="c-at">@noalloc</span> <span class="c-key">function</span> step(s: <span class="c-type">World*</span>) {
+<div class="code"><span class="ln">1</span><span class="c-at">@noalloc</span> <span class="c-key">fn</span> step(s: <span class="c-type">World*</span>) {
 <span class="ln">2</span>    integrate(s);   <span class="c-com">// must run without allocating</span>
 <span class="ln">3</span>}</div>
 <div class="out"><span class="pr">$</span> <span class="cmd">mettle --build</span>
@@ -288,7 +288,7 @@ sum <span class="em">(loop @ 3)</span>: <span class="bad">not vectorized</span>
           </div>
 
           <div class="panel" id="p-safety" role="tabpanel" aria-labelledby="tab-safety" tabindex="0">
-<div class="code"><span class="ln">1</span><span class="c-key">function</span> first(n: <span class="c-type">int32</span>) -&gt; <span class="c-type">int32</span> {
+<div class="code"><span class="ln">1</span><span class="c-key">fn</span> first(n: <span class="c-type">int32</span>) -&gt; <span class="c-type">int32</span> {
 <span class="ln">2</span>    <span class="c-key">var</span> p: <span class="c-type">int32*</span> = (<span class="c-type">int32*</span>)malloc((<span class="c-type">int64</span>)n * <span class="c-num">4</span>);
 <span class="ln">3</span>    free(p);
 <span class="ln">4</span>    <span class="c-key">return</span> p[<span class="c-num">0</span>];      <span class="c-com">// read after free</span>
@@ -368,7 +368,7 @@ sum <span class="em">(loop @ 3)</span>: <span class="bad">not vectorized</span>
           <div class="h">hello.mettle</div>
 <div class="code"><span class="c-key">import</span> <span class="c-str">"std/io"</span>;
 
-<span class="c-key">function</span> main() -&gt; <span class="c-type">int32</span> {
+<span class="c-key">fn</span> main() -&gt; <span class="c-type">int32</span> {
     println(<span class="c-str">"Hello from the metal."</span>);
     <span class="c-key">return</span> <span class="c-num">0</span>;
 }</div>

@@ -3,7 +3,7 @@ enum Option<T> {
     None
 }
 
-function unwrap_int32(o: Option<int32>) -> int32 {
+fn unwrap_int32(o: Option<int32>) -> int32 {
     match (o) {
         case Some(v): {
             return v;
@@ -14,7 +14,7 @@ function unwrap_int32(o: Option<int32>) -> int32 {
     }
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     var a: Option<int32> = Some(42);
     return unwrap_int32(a);
 }

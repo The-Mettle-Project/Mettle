@@ -1,12 +1,12 @@
 // ABI: callee must preserve RBX, RBP, R12-R15, XMM6-XMM15 (MS x64)
 // Caller uses a function that uses RBX; nested call must not clobber
-function uses_rbx() -> int64 {
+fn uses_rbx() -> int64 {
   var a: int64 = 100;
   var b: int64 = 200;
   return a + b;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var r: int64 = uses_rbx();
   if (r == 300) {
     return 1;

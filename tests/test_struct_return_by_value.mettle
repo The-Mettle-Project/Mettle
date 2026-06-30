@@ -27,19 +27,19 @@ struct Six {
   f: int32;
 }
 
-function write_s(s: cstring) {
+fn write_s(s: cstring) {
   if (s != 0) {
     fputs(s, get_stdout());
   }
 }
 
-function write_i64(v: int64) {
+fn write_i64(v: int64) {
   var buf: uint8[32];
   int_to_dec((cstring)((int64)(&(buf[0]))), v);
   write_s((cstring)((int64)(&(buf[0]))));
 }
 
-function line_i64(label: cstring, v: int64) {
+fn line_i64(label: cstring, v: int64) {
   write_s(label);
   write_s(cstr(" "));
   write_i64(v);
@@ -47,7 +47,7 @@ function line_i64(label: cstring, v: int64) {
 }
 
 // 12-byte struct return.
-function make_three(a: int32, b: int32, c: int32) -> ThreeI32 {
+fn make_three(a: int32, b: int32, c: int32) -> ThreeI32 {
   var t: ThreeI32;
   t.a = a;
   t.b = b;
@@ -56,7 +56,7 @@ function make_three(a: int32, b: int32, c: int32) -> ThreeI32 {
 }
 
 // 24-byte struct return; goes well past the old 8-byte truncation window.
-function make_six() -> Six {
+fn make_six() -> Six {
   var s: Six;
   s.a = 10;
   s.b = 20;
@@ -69,11 +69,11 @@ function make_six() -> Six {
 
 // Indirect-arg consuming an indirect-return value: pass a returned struct
 // straight into a function that takes it by value.
-function sum_three(t: ThreeI32) -> int32 {
+fn sum_three(t: ThreeI32) -> int32 {
   return t.a + t.b + t.c;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   write_s(cstr("struct return by value\n"));
 
   // Read every field of a 12-byte return through a local variable.

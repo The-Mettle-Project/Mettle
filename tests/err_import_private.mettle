@@ -1,6 +1,6 @@
 // Non-exported function invisible to importer — compiler error test
 import "exported_module";
 
-function main() -> int32 {
+fn main() -> int32 {
   return private_func();
 }

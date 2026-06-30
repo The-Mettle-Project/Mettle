@@ -5,7 +5,7 @@ Short examples for common use cases.
 ## Minimal Program
 
 ```mettle
-function main() -> int32 {
+fn main() -> int32 {
   return 0;
 }
 ```
@@ -15,7 +15,7 @@ function main() -> int32 {
 ```mettle
 import "std/io";
 
-function main() -> int32 {
+fn main() -> int32 {
   println("Hello, Mettle!");
   return 0;
 }
@@ -27,7 +27,7 @@ See [Imports](imports.md) for path resolution and `import_str`.
 
 ```mettle
 // Compile with: mettle --prelude main.mettle -o main.s
-function main() -> int32 {
+fn main() -> int32 {
   println("Hello");
   return 0;
 }
@@ -36,9 +36,9 @@ function main() -> int32 {
 ## With Extern
 
 ```mettle
-extern function puts(msg: cstring) -> int32 = "puts";
+extern fn puts(msg: cstring) -> int32 = "puts";
 
-function main() -> int32 {
+fn main() -> int32 {
   puts("Hello");
   return 0;
 }
@@ -49,7 +49,7 @@ function main() -> int32 {
 ```mettle
 enum Status { Ok = 0, Error = 1 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var s: Status = Ok;
   switch (s) {
     case 0:
@@ -63,7 +63,7 @@ function main() -> int32 {
 ## With Explicit Casts
 
 ```mettle
-function main() -> int32 {
+fn main() -> int32 {
   var f: float64 = 3.14;
   var i: int32 = (int32)f;
   
@@ -84,7 +84,7 @@ struct Point {
   y: int32;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var p: Point* = new Point;
   p->x = 10;
   p->y = 20;
@@ -95,7 +95,7 @@ function main() -> int32 {
 ## Range-based for and `@simd`
 
 ```mettle
-function dot(a: int8*, b: int8*, n: int32) -> int32 {
+fn dot(a: int8*, b: int8*, n: int32) -> int32 {
   var s: int32 = 0;
   @simd! for i in 0..n {              // 0..n exclusive; 0..=n inclusive
     s = s + (int32)a[i] * (int32)b[i];
@@ -172,16 +172,16 @@ replaced with that finding rather than printed.
 ## Function decorators
 
 ```mettle
-@inline   function f(x: int32) -> int32 { return x * 3; }   // force inline
-@inline!  function l(a: float32, b: float32) -> float32 {   // CONTRACT: every call
+@inline   fn f(x: int32) -> int32 { return x * 3; }   // force inline
+@inline!  fn l(a: float32, b: float32) -> float32 {   // CONTRACT: every call
   return a + b;                                             // inlines, or compile error
 }
-@noinline function g() -> int32 { return 1; }               // never inline
-@pure @noinline function w(t: int32*, k: int32) -> int32 { /* ... */ }
-@noalloc  function hot(x: float32) -> float32 {             // CONTRACT: proven
+@noinline fn g() -> int32 { return 1; }               // never inline
+@pure @noinline fn w(t: int32*, k: int32) -> int32 { /* ... */ }
+@noalloc  fn hot(x: float32) -> float32 {             // CONTRACT: proven
   return x * x;                                             // allocation-free
 }
-@simd!    function s(a: int32*, n: int64) -> int64 { /* every body loop must vectorize */ }
+@simd!    fn s(a: int32*, n: int64) -> int64 { /* every body loop must vectorize */ }
 ```
 
 Prefix a function with `@inline`/`@noinline` (inlining control), `@pure`
@@ -234,7 +234,7 @@ function swap<T>(a: T*, b: T*) -> void {
   *b = tmp;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var p: Pair<int32, int32>;
   p.first = 10;
   p.second = 20;

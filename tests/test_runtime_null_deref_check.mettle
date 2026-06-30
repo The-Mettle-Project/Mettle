@@ -1,4 +1,4 @@
-function main() -> int32 {
+fn main() -> int32 {
   var x: int32 = 1;
   var p: int32* = &x;
 

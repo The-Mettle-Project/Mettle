@@ -47,7 +47,7 @@ Press F5 in a Mettle file (or click the `Debug` CodeLens above `main`) for full 
 
 How it works: the launch compiles the program with `--debug-hooks` (an unoptimized debug build) which instruments every function with entry/exit/line hooks and per-variable registrations, then talks to the running process over a named pipe. With no debugger attached, an instrumented binary runs normally -- each hook is a single early-out branch.
 
-**Hand-written kernel objects link automatically**: if the program declares `extern function ... = "symbol"` and a sibling `.o`/`.obj` defines that symbol (e.g. `llm_kernels.o` next to `engine.mettle`), the build passes it to the linker -- for F5 and for `Mettle: Run File` alike. No launch configuration needed.
+**Hand-written kernel objects link automatically**: if the program declares `extern fn ... = "symbol"` and a sibling `.o`/`.obj` defines that symbol (e.g. `llm_kernels.o` next to `engine.mettle`), the build passes it to the linker -- for F5 and for `Mettle: Run File` alike. No launch configuration needed.
 
 `launch.json` attributes (type `mettle`): `program`, `stopOnEntry`, `args`, `cwd`, `compilerArgs`, `console` (`internalConsole` default; `integratedTerminal` runs the program in a terminal so interactive stdin -- like the LLM engine's prompt -- works while debugging). No `launch.json` is needed for the default F5-on-active-file flow.
 
@@ -130,7 +130,7 @@ Settings:
 
 The grammar is aligned with the current compiler surface:
 
-- Declarations: `import`, `import_str`, `extern`, `export`, `var`, `function`, `fn`, `struct`, `enum`, `method`, `trait`, `impl`, `where`.
+- Declarations: `import`, `import_str`, `extern`, `export`, `var`, `fn`, `struct`, `enum`, `method`, `trait`, `impl`, `where`.
 - Control flow: `if`, `else`, `while`, `for`, `switch`, `match`, `case`, `default`, `break`, `continue`, `return`, `defer`, `errdefer`.
 - Types: integer and float primitives, `string`, `cstring`, `bool`, `void`, `fn(...) -> ...`, and user types.
 - Literals: decimal, hex, binary, float, strings, and character literals.
@@ -179,7 +179,7 @@ The check parses all JSON contribution files, verifies contributed paths exist, 
 ## Minimal Program
 
 ```mettle
-function main() -> int32 {
+fn main() -> int32 {
   return 0;
 }
 ```

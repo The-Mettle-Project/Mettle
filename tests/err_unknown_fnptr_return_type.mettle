@@ -1,4 +1,4 @@
-function main() -> int32 {
+fn main() -> int32 {
   // Unknown return type inside function pointer annotation should be rejected.
   var cb: fn() -> no_such_type;
   return 0;

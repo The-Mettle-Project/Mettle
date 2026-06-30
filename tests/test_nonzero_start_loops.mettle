@@ -7,10 +7,10 @@
 // Results are checked at runtime against values a 0-start replay cannot
 // produce. Returns the number of failures (0 = all correct).
 
-extern function expf(x: float32) -> float32 = "expf";
+extern fn expf(x: float32) -> float32 = "expf";
 
 // sum_i32: the original confirmed repro shape.
-function partial_sum_i32(a: int32*, n: int32) -> int64 {
+fn partial_sum_i32(a: int32*, n: int32) -> int64 {
   var s: int64 = 0;
   var j: int32 = 3;
   while (j < n) {
@@ -21,7 +21,7 @@ function partial_sum_i32(a: int32*, n: int32) -> int64 {
 }
 
 // dot_i32: int64 accumulator, multiply-accumulate over two int32 arrays.
-function partial_dot_i32(a: int32*, b: int32*, n: int32) -> int64 {
+fn partial_dot_i32(a: int32*, b: int32*, n: int32) -> int64 {
   var s: int64 = 0;
   var j: int32 = 3;
   while (j < n) {
@@ -32,7 +32,7 @@ function partial_dot_i32(a: int32*, b: int32*, n: int32) -> int64 {
 }
 
 // dot_i8: int32 accumulator over byte loads (the quantized-GEMM inner loop).
-function partial_dot_i8(a: int8*, b: int8*, n: int32) -> int32 {
+fn partial_dot_i8(a: int8*, b: int8*, n: int32) -> int32 {
   var s: int32 = 0;
   var j: int32 = 3;
   while (j < n) {
@@ -43,7 +43,7 @@ function partial_dot_i8(a: int8*, b: int8*, n: int32) -> int32 {
 }
 
 // sum_u8 (already guarded; pinned here against regression).
-function partial_sum_u8(a: uint8*, n: int32) -> int64 {
+fn partial_sum_u8(a: uint8*, n: int32) -> int64 {
   var s: int64 = 0;
   var j: int32 = 3;
   while (j < n) {
@@ -54,7 +54,7 @@ function partial_sum_u8(a: uint8*, n: int32) -> int64 {
 }
 
 // byte map (already guarded; pinned): a[0..2] must stay untouched.
-function partial_byte_map(a: uint8*, n: int32) {
+fn partial_byte_map(a: uint8*, n: int32) {
   var j: int32 = 3;
   while (j < n) {
     a[j] = a[j] ^ 7;
@@ -64,7 +64,7 @@ function partial_byte_map(a: uint8*, n: int32) {
 
 // fill: supports a nonzero start via an explicit start operand -- the prefix
 // must stay untouched and the suffix must be written.
-function partial_fill(a: int32*, n: int32) {
+fn partial_fill(a: int32*, n: int32) {
   var j: int32 = 3;
   while (j < n) {
     a[j] = 42;
@@ -73,7 +73,7 @@ function partial_fill(a: int32*, n: int32) {
 }
 
 // exp_f32: in-place map; a[0..2] must keep their original bits.
-function partial_exp(a: float32*, n: int64) {
+fn partial_exp(a: float32*, n: int64) {
   var j: int64 = 3;
   while (j < n) {
     a[j] = expf(a[j]);
@@ -82,7 +82,7 @@ function partial_exp(a: float32*, n: int64) {
 }
 
 // i2f counter reduce: constant bound, chain on (float64)i, starting at 3.
-function partial_i2f() -> int64 {
+fn partial_i2f() -> int64 {
   var acc: int64 = 0;
   var i: int64 = 3;
   while (i < 1000) {
@@ -91,7 +91,7 @@ function partial_i2f() -> int64 {
   }
   return acc;
 }
-function partial_i2f_ref() -> int64 {
+fn partial_i2f_ref() -> int64 {
   var acc: int64 = 0;
   var i: int64 = 999; // reversed: the recognizer refuses, genuinely scalar
   while (i >= 3) {
@@ -103,7 +103,7 @@ function partial_i2f_ref() -> int64 {
 
 // minmax: scan starting at 2 must ignore the global extremes parked in
 // a[0]/a[1] (the recognizer only accepts the canonical init-from-a[0], i=1).
-function partial_minmax(a: int32*, n: int32) -> int64 {
+fn partial_minmax(a: int32*, n: int32) -> int64 {
   var mn: int32 = a[1];
   var mx: int32 = a[1];
   var i: int32 = 2;
@@ -118,7 +118,7 @@ function partial_minmax(a: int32*, n: int32) -> int64 {
 
 // SLP MAC: 4 parallel accumulator chains, k starting at 3 -> each sum counts
 // n-3 terms, not n.
-function partial_slp(a: int32*, b: int32*, c: int32*, n: int32, stride: int32) {
+fn partial_slp(a: int32*, b: int32*, c: int32*, n: int32, stride: int32) {
   var s0: int32 = 0;
   var s1: int32 = 0;
   var s2: int32 = 0;
@@ -144,7 +144,7 @@ function partial_slp(a: int32*, b: int32*, c: int32*, n: int32, stride: int32) {
 }
 
 // outer-lane: outer loop starting at p = 1; the kernel replays p = 0..P-1.
-function partial_outer(P: int32, n: int32) -> float64 {
+fn partial_outer(P: int32, n: int32) -> float64 {
   var total: float64 = 0.0;
   var p: int32 = 1;
   while (p < P) {
@@ -159,7 +159,7 @@ function partial_outer(P: int32, n: int32) -> float64 {
   }
   return total;
 }
-function partial_outer_ref(P: int32, n: int32) -> float64 {
+fn partial_outer_ref(P: int32, n: int32) -> float64 {
   var total: float64 = 0.0;
   var p: int32 = P - 1; // reversed outer order: refused, genuinely scalar
   while (p >= 1) {
@@ -175,7 +175,7 @@ function partial_outer_ref(P: int32, n: int32) -> float64 {
   return total;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var n: int32 = 100;
   var a: int32[100];
   var b: int32[100];

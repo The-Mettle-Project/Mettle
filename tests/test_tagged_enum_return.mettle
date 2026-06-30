@@ -7,13 +7,13 @@ enum DbOpenResult {
     Err(int32)
 }
 
-function open_ok() -> DbOpenResult {
+fn open_ok() -> DbOpenResult {
     var db: Db;
     db.id = 7;
     return Ok(&db);
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     var r: DbOpenResult = open_ok();
     return match (r) {
         case Ok(p): 1

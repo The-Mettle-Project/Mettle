@@ -1,7 +1,7 @@
-function takes_ptr(p: int32*) -> int32 {
+fn takes_ptr(p: int32*) -> int32 {
   return *p;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   return takes_ptr(7);
 }

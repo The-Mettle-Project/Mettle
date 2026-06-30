@@ -1,12 +1,12 @@
-function identity_ptr(p: uint8*) -> uint8* {
+fn identity_ptr(p: uint8*) -> uint8* {
   return p;
 }
 
-function identity_cstr(p: cstring) -> cstring {
+fn identity_cstr(p: cstring) -> cstring {
   return p;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var a: cstring = 0;
   var b: uint8* = identity_ptr(a);
   var c: cstring = identity_cstr(b);

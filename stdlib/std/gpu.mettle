@@ -9,29 +9,29 @@
 // `mettle --emit-ptx kernels.mettle -o kernels.ptx`.
 
 // ---- CUDA Driver API (versioned _v2 exports use the modern 64-bit ABI) ----
-export extern function cuInit(flags: uint32) -> int32 = "cuInit";
-export extern function cuDeviceGet(dev: int32*, ordinal: int32) -> int32 = "cuDeviceGet";
-export extern function cuCtxCreate_v2(pctx: int64*, flags: uint32, dev: int32) -> int32 = "cuCtxCreate_v2";
-export extern function cuModuleLoadData(modOut: int64*, image: uint8*) -> int32 = "cuModuleLoadData";
-export extern function cuModuleGetFunction(kfOut: int64*, mod: int64, name: cstring) -> int32 = "cuModuleGetFunction";
-export extern function cuMemAlloc_v2(dptr: int64*, bytes: int64) -> int32 = "cuMemAlloc_v2";
-export extern function cuMemFree_v2(dptr: int64) -> int32 = "cuMemFree_v2";
-export extern function cuMemHostAlloc(pp: int64*, bytes: int64, flags: uint32) -> int32 = "cuMemHostAlloc";
-export extern function cuMemFreeHost(p: int64) -> int32 = "cuMemFreeHost";
-export extern function cuMemHostGetDevicePointer_v2(dptr: int64*, p: int64, flags: uint32) -> int32 = "cuMemHostGetDevicePointer_v2";
-export extern function cuMemcpyHtoD_v2(dst: int64, src: uint8*, bytes: int64) -> int32 = "cuMemcpyHtoD_v2";
-export extern function cuMemcpyDtoH_v2(dst: uint8*, src: int64, bytes: int64) -> int32 = "cuMemcpyDtoH_v2";
-export extern function cuLaunchKernel(f: int64, gx: uint32, gy: uint32, gz: uint32,
+export extern fn cuInit(flags: uint32) -> int32 = "cuInit";
+export extern fn cuDeviceGet(dev: int32*, ordinal: int32) -> int32 = "cuDeviceGet";
+export extern fn cuCtxCreate_v2(pctx: int64*, flags: uint32, dev: int32) -> int32 = "cuCtxCreate_v2";
+export extern fn cuModuleLoadData(modOut: int64*, image: uint8*) -> int32 = "cuModuleLoadData";
+export extern fn cuModuleGetFunction(kfOut: int64*, mod: int64, name: cstring) -> int32 = "cuModuleGetFunction";
+export extern fn cuMemAlloc_v2(dptr: int64*, bytes: int64) -> int32 = "cuMemAlloc_v2";
+export extern fn cuMemFree_v2(dptr: int64) -> int32 = "cuMemFree_v2";
+export extern fn cuMemHostAlloc(pp: int64*, bytes: int64, flags: uint32) -> int32 = "cuMemHostAlloc";
+export extern fn cuMemFreeHost(p: int64) -> int32 = "cuMemFreeHost";
+export extern fn cuMemHostGetDevicePointer_v2(dptr: int64*, p: int64, flags: uint32) -> int32 = "cuMemHostGetDevicePointer_v2";
+export extern fn cuMemcpyHtoD_v2(dst: int64, src: uint8*, bytes: int64) -> int32 = "cuMemcpyHtoD_v2";
+export extern fn cuMemcpyDtoH_v2(dst: uint8*, src: int64, bytes: int64) -> int32 = "cuMemcpyDtoH_v2";
+export extern fn cuLaunchKernel(f: int64, gx: uint32, gy: uint32, gz: uint32,
                                       bx: uint32, by: uint32, bz: uint32,
                                       sharedBytes: uint32, stream: int64,
                                       kernelParams: int64*, extra: int64*) -> int32 = "cuLaunchKernel";
-export extern function cuCtxSynchronize() -> int32 = "cuCtxSynchronize";
+export extern fn cuCtxSynchronize() -> int32 = "cuCtxSynchronize";
 
 // ---- ergonomic helpers (return handles directly; 0 on failure) ----
 
 // Initialize CUDA on device 0 and create a context. Returns the context handle
 // (nonzero) or 0 on failure.
-export function gpu_init() -> int64 {
+export fn gpu_init() -> int64 {
   if (cuInit(0) != 0) { return 0; }
   var dev: int32 = 0;
   if (cuDeviceGet(&dev, 0) != 0) { return 0; }
@@ -41,27 +41,27 @@ export function gpu_init() -> int64 {
 }
 
 // Load a module from a null-terminated PTX image in host memory. 0 on failure.
-export function gpu_module(ptx_image: uint8*) -> int64 {
+export fn gpu_module(ptx_image: uint8*) -> int64 {
   var mod: int64 = 0;
   if (cuModuleLoadData(&mod, ptx_image) != 0) { return 0; }
   return mod;
 }
 
 // Resolve a kernel by name to a launchable handle. 0 on failure.
-export function gpu_func(mod: int64, name: cstring) -> int64 {
+export fn gpu_func(mod: int64, name: cstring) -> int64 {
   var kf: int64 = 0;
   if (cuModuleGetFunction(&kf, mod, name) != 0) { return 0; }
   return kf;
 }
 
 // Allocate `bytes` of device memory; returns the device pointer (0 on failure).
-export function gpu_malloc(bytes: int64) -> int64 {
+export fn gpu_malloc(bytes: int64) -> int64 {
   var dptr: int64 = 0;
   if (cuMemAlloc_v2(&dptr, bytes) != 0) { return 0; }
   return dptr;
 }
-export function gpu_free(dptr: int64) -> int32 { return cuMemFree_v2(dptr); }
-export function gpu_host_mapped_malloc(bytes: int64, dev_ptr_out: int64*) -> uint8* {
+export fn gpu_free(dptr: int64) -> int32 { return cuMemFree_v2(dptr); }
+export fn gpu_host_mapped_malloc(bytes: int64, dev_ptr_out: int64*) -> uint8* {
   dev_ptr_out[0] = 0;
   var hp: int64 = 0;
   if (cuMemHostAlloc(&hp, bytes, 2) != 0) { return (uint8*)0; } // CU_MEMHOSTALLOC_DEVICEMAP
@@ -73,20 +73,20 @@ export function gpu_host_mapped_malloc(bytes: int64, dev_ptr_out: int64*) -> uin
   dev_ptr_out[0] = dp;
   return (uint8*)hp;
 }
-export function gpu_host_free(ptr: uint8*) -> int32 { return cuMemFreeHost((int64)ptr); }
-export function gpu_to_device(dst: int64, src: uint8*, bytes: int64) -> int32 {
+export fn gpu_host_free(ptr: uint8*) -> int32 { return cuMemFreeHost((int64)ptr); }
+export fn gpu_to_device(dst: int64, src: uint8*, bytes: int64) -> int32 {
   return cuMemcpyHtoD_v2(dst, src, bytes);
 }
-export function gpu_to_host(dst: uint8*, src: int64, bytes: int64) -> int32 {
+export fn gpu_to_host(dst: uint8*, src: int64, bytes: int64) -> int32 {
   return cuMemcpyDtoH_v2(dst, src, bytes);
 }
-export function gpu_sync() -> int32 { return cuCtxSynchronize(); }
+export fn gpu_sync() -> int32 { return cuCtxSynchronize(); }
 
 // The launch primitive `dispatch` lowers to this function. It enqueues a kernel
 // on the default stream and returns after launch validation; subsequent kernels
 // and blocking copies keep their normal CUDA stream ordering. Call gpu_sync()
 // explicitly when host code truly needs a mid-pipeline barrier.
-export function gpu_launch(f: int64, grid: int32, block: int32,
+export fn gpu_launch(f: int64, grid: int32, block: int32,
                           params: int64*, nargs: int32) -> int32 {
   return cuLaunchKernel(f, (uint32)grid, 1, 1, (uint32)block, 1, 1,
                         0, 0, params, (int64*)0);
@@ -94,7 +94,7 @@ export function gpu_launch(f: int64, grid: int32, block: int32,
 
 // Synchronous launch helper for diagnostics or one-off kernels where immediate
 // completion/error reporting matters more than throughput.
-export function gpu_launch_sync(f: int64, grid: int32, block: int32,
+export fn gpu_launch_sync(f: int64, grid: int32, block: int32,
                                 params: int64*, nargs: int32) -> int32 {
   var rc: int32 = gpu_launch(f, grid, block, params, nargs);
   if (rc != 0) { return rc; }

@@ -10,7 +10,7 @@ import "std/io";
 import "std/bench";
 
 // Returns 1² + 2² + ... + n² (iterative, no formula)
-function sum_squares(n: int64) -> int64 {
+fn sum_squares(n: int64) -> int64 {
   var sum: int64 = 0;
   var i: int64 = 1;
   while (i <= n) {
@@ -20,7 +20,7 @@ function sum_squares(n: int64) -> int64 {
   return sum;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var header: string = "Sum of squares: 1²+2²+...+100000²";
   println(cstr(header));
 

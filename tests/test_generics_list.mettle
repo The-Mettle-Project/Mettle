@@ -4,7 +4,7 @@ struct List<T> {
     capacity: int32;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     var nums: List<int32>;
     nums.length = 0;
     nums.capacity = 10;

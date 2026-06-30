@@ -5,7 +5,7 @@
 import "std/io";
 import "std/bench";
 
-function lcg_pass(seed: int64, iters: int64) -> int64 {
+fn lcg_pass(seed: int64, iters: int64) -> int64 {
   var state: uint32 = (uint32)seed;
   var sum: int64 = 0;
   var i: int64 = 0;
@@ -17,7 +17,7 @@ function lcg_pass(seed: int64, iters: int64) -> int64 {
   return sum;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var iters: int64 = 1000000;
   var passes: int32 = 200;
 

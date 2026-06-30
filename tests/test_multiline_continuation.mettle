@@ -1,8 +1,8 @@
-function sum3(a: int32, b: int32, c: int32) -> int32 {
+fn sum3(a: int32, b: int32, c: int32) -> int32 {
   return a + b + c;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var a: int32 = 1;
   var b: int32 = 2;
   var c: int32 = 3;

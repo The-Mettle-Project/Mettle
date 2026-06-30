@@ -1,5 +1,5 @@
 extern var shared_counter_ref: int32 = "shared_counter";
 
-function mainCRTStartup() -> int32 {
+fn mainCRTStartup() -> int32 {
   return shared_counter_ref;
 }

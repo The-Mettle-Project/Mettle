@@ -8,7 +8,7 @@ var Gw: float32 = 1.25;      // written float32 global
 var Fro: float64 = 3.5;      // read-only float64 global
 const PI: float64 = 3.0;     // global float const (immutable variable storage)
 
-function main() -> int32 {
+fn main() -> int32 {
     Fw = Fw + 0.0;           // mutate without const-folding the read away
     Gw = Gw + 0.0;
     var sum: int32 = 0;

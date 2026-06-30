@@ -22,14 +22,14 @@ Plain imports add public declarations to the global scope. Namespaced imports ex
 Declarations can be exported with the `export` keyword:
 
 ```mettle
-export function forty_two() -> int32 {
+export fn forty_two() -> int32 {
   return 42;
 }
 
 export var answer: int32 = 42;
 export struct Point { ... }
 export enum Dir { ... }
-export extern function puts(msg: cstring) -> int32 = "puts";
+export extern fn puts(msg: cstring) -> int32 = "puts";
 ```
 
 If a module has no `export` declarations, every top-level declaration is public for backward compatibility. If a module uses `export` anywhere, only exported declarations are part of its source-level public surface. Non-exported declarations can still be compiled when public declarations depend on them, but the import resolver rewrites those helpers to internal names.

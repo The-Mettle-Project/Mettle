@@ -3,11 +3,11 @@ struct Point {
     x: int32;
     y: int32;
 }
-@noalloc function make_point() -> Point* {
+@noalloc fn make_point() -> Point* {
     var p: Point* = new Point;
     return p;
 }
-function main() -> int32 {
+fn main() -> int32 {
     var p: Point* = make_point();
     return p->x;
 }

@@ -453,7 +453,7 @@ static int print_help_topic(const char *program_name, const char *argv0,
 
   if (strcmp(topic, "interop") == 0 || strcmp(topic, "c") == 0) {
     printf("interop - calling C and OS APIs\n\n");
-    printf("  Declare external C functions with extern function.\n");
+    printf("  Declare external C functions with extern fn.\n");
     printf("  Prefer std/win32 for common Windows OS APIs.\n");
     printf("  Use --link-arg for extra linker libraries in --build mode.\n");
     printf("  Example:\n");

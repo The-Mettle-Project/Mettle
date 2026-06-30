@@ -5,15 +5,15 @@ struct Point3 {
   z: int32;
 }
 
-function get_y(p: Point3*) -> int32 {
+fn get_y(p: Point3*) -> int32 {
   return p->y;
 }
 
-function get_z(p: Point3*) -> int32 {
+fn get_z(p: Point3*) -> int32 {
   return p->z;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var p: Point3;
   p.x = 10;
   p.y = 20;

@@ -21,19 +21,19 @@ struct Bar {
   v: int32;
 }
 
-function cast_bar(x: Foo) -> Bar {
+fn cast_bar(x: Foo) -> Bar {
   var r: Bar;
   r.v = x.v;
   return r;
 }
 
-function cast_foo(x: Bar) -> Foo {
+fn cast_foo(x: Bar) -> Foo {
   var r: Foo;
   r.v = x.v;
   return r;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var a: Foo;
   a.v = 1;
 

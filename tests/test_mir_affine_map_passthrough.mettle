@@ -7,25 +7,25 @@
 // Built debug + release + *_fallback so MIR and the legacy backend agree.
 import "std/io";
 
-@noinline function touch(x: int64) -> int64 { return x + 1; }
+@noinline fn touch(x: int64) -> int64 { return x + 1; }
 
-@noinline function fcopy(dst: float32*, src: float32*, n: int64) {
+@noinline fn fcopy(dst: float32*, src: float32*, n: int64) {
   var i: int64 = 0; while (i < n) { dst[i] = src[i]; i = i + 1; }       // a=1,b=0,c=0
 }
-@noinline function fadd_into(dst: float32*, src: float32*, n: int64) {
+@noinline fn fadd_into(dst: float32*, src: float32*, n: int64) {
   var i: int64 = 0; while (i < n) { dst[i] = src[i] + dst[i]; i = i + 1; } // a=1,b=1,c=0
 }
-@noinline function faffine(dst: float32*, src: float32*, n: int64) {
+@noinline fn faffine(dst: float32*, src: float32*, n: int64) {
   var i: int64 = 0; while (i < n) { dst[i] = src[i] * 2.0 + 3.0; i = i + 1; } // a=2,b=0,c=3
 }
 
-function ssum(a: float32*, n: int64) -> int64 {
+fn ssum(a: float32*, n: int64) -> int64 {
   var s: float32 = 0.0; var i: int64 = 0;
   while (i < n) { s = s + a[i]; i = i + 1; }
   return (int64)s;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var ok: int32 = 1;
   if (touch(1) != 2) { ok = 0; }      // force a call (non-leaf)
 

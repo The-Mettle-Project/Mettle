@@ -1,11 +1,11 @@
-function max_val<T>(a: T, b: T) -> T {
+fn max_val<T>(a: T, b: T) -> T {
     if (a > b) {
         return a;
     }
     return b;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     var a: int32 = 10;
     var b: int32 = 20;
     var result: int32 = max_val<int32>(a, b);

@@ -1,14 +1,14 @@
 // ABI: nested calls — each call gets correct arg regs and shadow space
-function inner(x: int32) -> int32 {
+fn inner(x: int32) -> int32 {
   return x + 1;
 }
 
-function middle(a: int32, b: int32) -> int32 {
+fn middle(a: int32, b: int32) -> int32 {
   var t: int32 = inner(a);
   return t + b;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var r: int32 = middle(5, 10);
   if (r == 16) {
     return 1;

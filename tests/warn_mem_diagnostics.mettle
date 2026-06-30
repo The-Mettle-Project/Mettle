@@ -6,7 +6,7 @@ import "std/mem";
 var STASH: int32* = 0;
 
 // M0102 double free, then M0101 use-after-free.
-function double_free_then_use() -> int32 {
+fn double_free_then_use() -> int32 {
     var p: cstring = malloc(64);
     free(p);
     free(p);
@@ -14,14 +14,14 @@ function double_free_then_use() -> int32 {
 }
 
 // M0104: a stack address stored in a global outlives the frame.
-function stash_stack_address() {
+fn stash_stack_address() {
     var slot: int32[2];
     slot[0] = 1;
     STASH = (int32*)&slot[0];
 }
 
 // M0107: the allocation neither escapes nor gets freed.
-function leak_sixty_four() -> int32 {
+fn leak_sixty_four() -> int32 {
     var scratch: cstring = malloc(64);
     scratch[0] = 9;
     return (int32)scratch[0];
@@ -29,24 +29,24 @@ function leak_sixty_four() -> int32 {
 
 // Definite null dereference: assigned null on the spine, dereferenced with
 // no reassignment or guard between.
-function null_deref() -> int32 {
+fn null_deref() -> int32 {
     var p: int32* = 0;
     return p[0];
 }
 
 // Shift wider than the value: x86 masks the count, so this is x, not 0.
-function over_shift(x: int32) -> int32 {
+fn over_shift(x: int32) -> int32 {
     return x << 32;
 }
 
 // A small constant cast to a pointer can never be valid memory.
-function wild_pointer() -> int32 {
+fn wild_pointer() -> int32 {
     var p: int32* = (int32*)64;
     return p[0];
 }
 
 // Clean control group: conditional frees and defers must stay silent.
-function clean(n: int32) -> int32 {
+fn clean(n: int32) -> int32 {
     var p: cstring = malloc(64);
     defer free(p);
     if (n > 0) {
@@ -56,7 +56,7 @@ function clean(n: int32) -> int32 {
 }
 
 // Clean: the guard mentions p, so definite-null knowledge ends there.
-function clean_guarded_null(n: int32) -> int32 {
+fn clean_guarded_null(n: int32) -> int32 {
     var p: int32* = 0;
     if (n > 0) {
         p = (int32*)malloc(8);
@@ -68,7 +68,7 @@ function clean_guarded_null(n: int32) -> int32 {
 }
 
 // Clean: `<` against the length is the correct bound.
-function clean_loop(values: int32*) -> int32 {
+fn clean_loop(values: int32*) -> int32 {
     var a: int32[8];
     var i: int32 = 0;
     while (i < 8) {
@@ -79,7 +79,7 @@ function clean_loop(values: int32*) -> int32 {
 }
 
 // Clean: a break can leave before the final iteration, so no claim is made.
-function clean_loop_with_break(limit: int32) -> int32 {
+fn clean_loop_with_break(limit: int32) -> int32 {
     var a: int32[8];
     var i: int32 = 0;
     while (i <= 8) {
@@ -92,7 +92,7 @@ function clean_loop_with_break(limit: int32) -> int32 {
     return a[0];
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     var values: int32[8];
     var k: int32 = 0;
     while (k < 8) { values[k] = k; k = k + 1; }

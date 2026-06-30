@@ -1,6 +1,6 @@
-extern function socket_raw(af: int32, kind: int32, protocol: int32) -> int64 = "socket";
+extern fn socket_raw(af: int32, kind: int32, protocol: int32) -> int64 = "socket";
 
-function main() -> int32 {
+fn main() -> int32 {
   socket_raw(2, 1, 6);
   return 0;
 }

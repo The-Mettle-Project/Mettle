@@ -3,12 +3,12 @@ import sys
 # (stresses the over-budget caller gate incl. per-site loop membership).
 lines = []
 nloops = int(sys.argv[1]) if len(sys.argv) > 1 else 300
-lines.append("function helper(x: int32) -> int32 {")
+lines.append("fn helper(x: int32) -> int32 {")
 for i in range(24):
     lines.append(f"    x = x + {i};")
 lines.append("    return x;")
 lines.append("}")
-lines.append("function main() -> int32 {")
+lines.append("fn main() -> int32 {")
 lines.append("    var s: int32 = 0;")
 for i in range(nloops):
     lines.append(f"    var i{i}: int32 = 0;")

@@ -15,7 +15,7 @@ var pattern_len: int64 = 5;
 var pattern_u64: uint64 = 0x524F525245;
 var pattern_mask: uint64 = 0xFFFFFFFFFF;
 
-function pattern_matches(buf: cstring, i: int64, len: int64) -> int32 {
+fn pattern_matches(buf: cstring, i: int64, len: int64) -> int32 {
   if (i + pattern_len > len) {
     return 0;
   }
@@ -33,7 +33,7 @@ function pattern_matches(buf: cstring, i: int64, len: int64) -> int32 {
   return 0;
 }
 
-function grep_count(buf: cstring, len: int64) -> int64 {
+fn grep_count(buf: cstring, len: int64) -> int64 {
   var count: int64 = 0;
   var i: int64 = 0;
   var found: int32 = 0;
@@ -57,7 +57,7 @@ function grep_count(buf: cstring, len: int64) -> int64 {
   return count;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var buf_size: int64 = 1048576;
   var passes: int32 = 200;
 

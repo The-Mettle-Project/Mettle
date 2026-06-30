@@ -6,7 +6,7 @@ import "std/io";
 import "std/mem";
 import "std/bench";
 
-function compare_bytes(a: cstring, b: cstring, len: int64) -> int64 {
+fn compare_bytes(a: cstring, b: cstring, len: int64) -> int64 {
   var i: int64 = 0;
   while (i < len) {
     var av: uint8 = (uint8)a[i];
@@ -19,7 +19,7 @@ function compare_bytes(a: cstring, b: cstring, len: int64) -> int64 {
   return 0;
 }
 
-function compare_chunks(a: cstring, b: cstring, total: int64, chunk: int64) -> int64 {
+fn compare_chunks(a: cstring, b: cstring, total: int64, chunk: int64) -> int64 {
   var sum: int64 = 0;
   var off: int64 = 0;
   while (off < total) {
@@ -33,7 +33,7 @@ function compare_chunks(a: cstring, b: cstring, total: int64, chunk: int64) -> i
   return sum;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var buf_size: int64 = 262144;
   var chunk: int64 = 4096;
   var template: string = "0123456789abcdef";

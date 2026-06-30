@@ -3,7 +3,7 @@ import "../engine/engine_vulkan";
 import "std/io";
 
 // Stack footprint clone of vk_context_create_pipeline without Vulkan calls.
-function pipeline_stack_footprint() -> int32 {
+fn pipeline_stack_footprint() -> int32 {
   var vbuf: uint32[400];
   var fbuf: uint32[160];
   vk_spv_scene_vert_fill((uint32*)((int64)(&(vbuf[0]))));
@@ -40,6 +40,6 @@ function pipeline_stack_footprint() -> int32 {
   return 1;
 }
 
-export function main() -> int32 {
+export fn main() -> int32 {
   return pipeline_stack_footprint();
 }

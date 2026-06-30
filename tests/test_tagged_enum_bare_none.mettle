@@ -3,7 +3,7 @@ enum Option {
     None
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     var a: Option = None;
     var b: Option = None();
 

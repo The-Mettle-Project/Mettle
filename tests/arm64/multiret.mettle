@@ -1,7 +1,7 @@
 // classify(5) -> 2. Multiple early returns.
-function classify(n: int64) -> int64 {
+fn classify(n: int64) -> int64 {
   if (n < 0) { return 0; }
   if (n == 0) { return 1; }
   return 2;
 }
-function main() -> int64 { return classify(5); }
+fn main() -> int64 { return classify(5); }

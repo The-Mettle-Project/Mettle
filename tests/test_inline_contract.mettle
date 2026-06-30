@@ -1,8 +1,8 @@
 // `@inline!` succeeding: a small pure helper inlines at every call site.
-@inline! function lerp(a: float32, b: float32, t: float32) -> float32 {
+@inline! fn lerp(a: float32, b: float32, t: float32) -> float32 {
     return a + (b - a) * t;
 }
-function main() -> int32 {
+fn main() -> int32 {
     var x: float32 = lerp(0.0, 10.0, 0.5);
     var y: float32 = lerp(x, 20.0, 0.25);
     if (y > 8.7 && y < 8.8) { return 0; }

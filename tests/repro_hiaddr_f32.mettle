@@ -4,13 +4,13 @@ import "std/mem";
 var WR: uint8* = (uint8*)0;
 var SNW: float32* = (float32*)0;
 
-function load_f32(off: int64, n: int64, dst: float32*) {
+fn load_f32(off: int64, n: int64, dst: float32*) {
   var src: float32* = (float32*)(&WR[off]);
   var i: int64 = 0; while (i < n) { dst[i] = src[i]; i = i + 1; }
 }
 
 // big function (forward-like) that calls load_f32 — candidate for inlining
-function forward(off: int64) {
+fn forward(off: int64) {
   var a: int64 = 1; var b: int64 = 2; var c: int64 = 3; var d: int64 = 4;
   var e: int64 = 5; var f: int64 = 6; var g: int64 = 7; var h: int64 = 8;
   var l: int64 = 0;
@@ -24,7 +24,7 @@ function forward(off: int64) {
   print_int(a+b+c+d+e+f+g+h); println(cstr(""));
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   WR = malloc(6000000000);
   if (WR == 0) { println(cstr("malloc failed")); return 1; }
   SNW = (float32*)malloc(4*4096);

@@ -9,7 +9,7 @@ export struct StageInfo {
   p_specialization_info: int64;
 }
 
-function stage_array_stride() -> int32 {
+fn stage_array_stride() -> int32 {
   var stages: StageInfo[2];
   stages[0].s_type = (uint32)1;
   stages[0].p_next = (int64)0;
@@ -31,7 +31,7 @@ function stage_array_stride() -> int32 {
   return 0;
 }
 
-export function main() -> int32 {
+export fn main() -> int32 {
   var r: int32 = stage_array_stride();
   if (r != 0) {
     return 100 + r;

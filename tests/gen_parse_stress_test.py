@@ -38,7 +38,7 @@ for i in range(1, num_globals + 1):
     emit(f"var a{i}: float64 = {i} + a / b * c;")
 
 emit("")
-emit("function main() -> int32 {")
+emit("fn main() -> int32 {")
 emit("  return 0;")
 emit("}")
 

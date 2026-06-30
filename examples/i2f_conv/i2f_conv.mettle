@@ -12,7 +12,7 @@ import "std/bench";
 
 const N = 30000000;
 
-function run() -> int64 {
+fn run() -> int64 {
   var acc: int64 = 0;
   var i: int64 = 0;
   while (i < (int64)N) {
@@ -24,7 +24,7 @@ function run() -> int64 {
   return acc;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var passes: int32 = 20;
   println("int<->float64 conversion loop, 30M iters x 20 passes");
 

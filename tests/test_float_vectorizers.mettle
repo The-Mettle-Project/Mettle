@@ -4,41 +4,41 @@
 // Inputs are chosen so reductions are exact regardless of reassociation.
 // Returns the number of failures (0 = all correct).
 
-extern function expf(x: float32) -> float32 = "expf";
+extern fn expf(x: float32) -> float32 = "expf";
 
 // Scalar SiLU reference; @noinline so the loop calling it keeps a real call and
 // is NOT matched by the SiLU recognizer (a true scalar baseline).
-@noinline function ref_silu(x: float32) -> float32 {
+@noinline fn ref_silu(x: float32) -> float32 {
   return x / (1.0 + expf(0.0 - x));
 }
 // SwiGLU gate: in-place g[i] = silu(g[i]) * u[i]. @simd! asserts it vectorizes
 // to IR_OP_SIMD_SILU_F32 at --release.
-function vsilu_gate(g: float32*, u: float32*, n: int32) {
+fn vsilu_gate(g: float32*, u: float32*, n: int32) {
   @simd! for i in 0..n { g[i] = (g[i] / (1.0 + expf(0.0 - g[i]))) * u[i]; }
 }
 
-function vmap_f64(out: float64*, a: float64*, n: int32) {
+fn vmap_f64(out: float64*, a: float64*, n: int32) {
   @simd! for i in 0..n { out[i] = a[i] * 2.0 + 1.0; }
 }
-function vscale_f64(a: float64*, n: int32) {
+fn vscale_f64(a: float64*, n: int32) {
   @simd! for i in 0..n { a[i] = a[i] * 3.0; }
 }
-function vsum_f64(a: float64*, n: int32) -> float64 {
+fn vsum_f64(a: float64*, n: int32) -> float64 {
   var s: float64 = 0.0;
   @simd! for i in 0..n { s = s + a[i]; }
   return s;
 }
-function vsum_f32(a: float32*, n: int32) -> float32 {
+fn vsum_f32(a: float32*, n: int32) -> float32 {
   var s: float32 = 0.0;
   @simd! for i in 0..n { s = s + a[i]; }
   return s;
 }
-function vdot_f64(a: float64*, b: float64*, n: int32) -> float64 {
+fn vdot_f64(a: float64*, b: float64*, n: int32) -> float64 {
   var s: float64 = 0.0;
   @simd! for i in 0..n { s = s + a[i] * b[i]; }
   return s;
 }
-function vdot_f32(a: float32*, b: float32*, n: int32) -> float32 {
+fn vdot_f32(a: float32*, b: float32*, n: int32) -> float32 {
   var s: float32 = 0.0;
   @simd! for i in 0..n { s = s + a[i] * b[i]; }
   return s;
@@ -49,14 +49,14 @@ function vdot_f32(a: float32*, b: float32*, n: int32) -> float32 {
 // Regression for the base-poisoning bug: the first loop's fused op made the
 // second loop's @simd! fail to vectorize (the base `out` looked "written").
 // Both must vectorize now (the @simd! on the second asserts it).
-function vtwo_loops_f64(out: float64*, a: float64*, n: int32) {
+fn vtwo_loops_f64(out: float64*, a: float64*, n: int32) {
   @simd! for i in 0..n { out[i] = a[i]; }            // copy a -> out
   @simd! for i in 0..n { out[i] = out[i] + a[i]; }   // out += a (was poisoned)
 }
 
-function fabs64(x: float64) -> float64 { if (x < 0.0) { return 0.0 - x; } return x; }
+fn fabs64(x: float64) -> float64 { if (x < 0.0) { return 0.0 - x; } return x; }
 
-function main() -> int32 {
+fn main() -> int32 {
   var n: int32 = 1024;
   var bad: int32 = 0;
   var a: float64[1024];

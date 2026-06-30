@@ -1,5 +1,5 @@
 // 5x5 -> 25. nested while loops.
-function main() -> int64 {
+fn main() -> int64 {
   var s: int64 = 0;
   var i: int64 = 0;
   while (i < 5) {

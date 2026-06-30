@@ -4,7 +4,7 @@ import "std/bench";
 
 const N = 65536;
 
-function main() -> int32 {
+fn main() -> int32 {
   var x: float64* = (float64*)malloc((int64)N * 8);
   var y: float64* = (float64*)malloc((int64)N * 8);
   var i: int32 = 0;

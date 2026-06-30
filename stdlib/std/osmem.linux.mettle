@@ -6,20 +6,20 @@
 // Mettle's own allocator on top without any C runtime allocator in between.
 
 // ─── POSIX virtual-memory bindings ──────────────────────────────────────────
-export extern function mmap(addr: cstring, length: int64, prot: int32, flags: int32, fd: int32, offset: int64) -> cstring = "mmap";
-export extern function munmap(addr: cstring, length: int64) -> int32 = "munmap";
-export extern function mprotect(addr: cstring, length: int64, prot: int32) -> int32 = "mprotect";
+export extern fn mmap(addr: cstring, length: int64, prot: int32, flags: int32, fd: int32, offset: int64) -> cstring = "mmap";
+export extern fn munmap(addr: cstring, length: int64) -> int32 = "munmap";
+export extern fn mprotect(addr: cstring, length: int64, prot: int32) -> int32 = "mprotect";
 
 // ─── Public API ─────────────────────────────────────────────────────────────
 
 // Page size. 4 KiB on x86-64 Linux.
-export function os_page_size() -> int64 {
+export fn os_page_size() -> int64 {
   return (int64)4096;
 }
 
 // Map `n` bytes of zero-filled, read/write anonymous memory directly from the
 // kernel. Page-aligned. Returns 0 on failure (mmap's MAP_FAILED == (void*)-1).
-export function os_mem_map(n: int64) -> cstring {
+export fn os_mem_map(n: int64) -> cstring {
   if (n <= (int64)0) {
     return 0;
   }
@@ -33,7 +33,7 @@ export function os_mem_map(n: int64) -> cstring {
 
 // Unmap a region previously returned by os_mem_map. Unlike Windows, munmap
 // needs the exact length that was mapped.
-export function os_mem_unmap(p: cstring, n: int64) {
+export fn os_mem_unmap(p: cstring, n: int64) {
   if (p == 0 || n <= (int64)0) {
     return;
   }
@@ -44,7 +44,7 @@ export function os_mem_unmap(p: cstring, n: int64) {
 // reserved. Any later read or write of it faults immediately; the allocator
 // uses this to turn use-after-free of page-backed blocks into an instant,
 // classifiable crash.
-export function os_mem_protect_noaccess(p: cstring, n: int64) {
+export fn os_mem_protect_noaccess(p: cstring, n: int64) {
   if (p == 0 || n <= (int64)0) {
     return;
   }

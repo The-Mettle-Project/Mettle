@@ -1,5 +1,5 @@
 // sum 0..6 -> 21. int32 signature and locals.
-function main() -> int32 {
+fn main() -> int32 {
   var s: int32 = 0;
   var i: int32 = 0;
   while (i < 7) {

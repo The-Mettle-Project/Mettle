@@ -1,9 +1,9 @@
 // `@noalloc` succeeding: pure arithmetic and known-clean libm externs.
-extern function sqrtf(x: float32) -> float32 = "sqrtf";
-@noalloc function norm(x: float32, y: float32) -> float32 {
+extern fn sqrtf(x: float32) -> float32 = "sqrtf";
+@noalloc fn norm(x: float32, y: float32) -> float32 {
     return sqrtf(x * x + y * y);
 }
-function main() -> int32 {
+fn main() -> int32 {
     var n: float32 = norm(3.0, 4.0);
     if (n > 4.9 && n < 5.1) { return 0; }
     return 1;

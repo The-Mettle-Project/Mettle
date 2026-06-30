@@ -12,7 +12,7 @@ import "std/bench";
 
 const N = 262144;
 
-function run(buf: uint8*, n: int32) -> int64 {
+fn run(buf: uint8*, n: int32) -> int64 {
   var i: int32 = 0;
   while (i < n) {
     buf[i] = buf[i] * 3 + 7;
@@ -28,7 +28,7 @@ function run(buf: uint8*, n: int32) -> int64 {
   return acc;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var buf: uint8* = (uint8*)malloc((int64)N);
   var i: int32 = 0;
   while (i < N) {

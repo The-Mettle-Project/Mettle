@@ -11,7 +11,7 @@ import "std/mem";
 var N: int32 = 32;
 
 // Exact shape the matmul recognizer fuses (4-way column unroll, global N=32).
-function matmul(a: int32*, b: int32*, c: int32*) {
+fn matmul(a: int32*, b: int32*, c: int32*) {
   var row: int32 = 0;
   var row_base: int64 = 0;
   while (row < N) {
@@ -44,7 +44,7 @@ function matmul(a: int32*, b: int32*, c: int32*) {
 
 // Reference with a RUNTIME bound m (not the literal 32 the recognizer needs),
 // so it compiles to a plain scalar triple loop.
-function matmul_ref(a: int32*, b: int32*, c: int32*, m: int64) {
+fn matmul_ref(a: int32*, b: int32*, c: int32*, m: int64) {
   var i: int64 = 0;
   while (i < m) {
     var j: int64 = 0;
@@ -63,12 +63,12 @@ function matmul_ref(a: int32*, b: int32*, c: int32*, m: int64) {
 }
 
 var g_seed: int64 = 99887766;
-function rnd() -> int32 {
+fn rnd() -> int32 {
   g_seed = (g_seed * 1103515245 + 12345) & 0x7FFFFFFFFFFF;
   return (int32)((g_seed % 600) - 300);   // [-300, 299]
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var a: int32* = (int32*)malloc(1024 * 4);
   var b: int32* = (int32*)malloc(1024 * 4);
   var c: int32* = (int32*)malloc(1024 * 4);

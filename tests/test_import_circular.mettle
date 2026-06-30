@@ -1,5 +1,5 @@
 import "import_fixtures/cycle_a"
 
-function main() -> int32 {
+fn main() -> int32 {
   return cycle_a_value() + cycle_b_value()
 }

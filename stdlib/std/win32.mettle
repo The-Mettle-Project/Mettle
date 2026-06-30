@@ -6,35 +6,35 @@
 
 // Basic Win32 constants. They are functions because Mettle does not yet have
 // top-level constant expressions.
-export function FALSE() -> int32 { return 0; }
-export function TRUE() -> int32 { return 1; }
-export function NULL_HANDLE() -> int64 { return 0; }
-export function INVALID_HANDLE_VALUE() -> int64 { return -1; }
+export fn FALSE() -> int32 { return 0; }
+export fn TRUE() -> int32 { return 1; }
+export fn NULL_HANDLE() -> int64 { return 0; }
+export fn INVALID_HANDLE_VALUE() -> int64 { return -1; }
 
-export function STD_INPUT_HANDLE() -> int32 { return -10; }
-export function STD_OUTPUT_HANDLE() -> int32 { return -11; }
-export function STD_ERROR_HANDLE() -> int32 { return -12; }
+export fn STD_INPUT_HANDLE() -> int32 { return -10; }
+export fn STD_OUTPUT_HANDLE() -> int32 { return -11; }
+export fn STD_ERROR_HANDLE() -> int32 { return -12; }
 
-export function INFINITE() -> uint32 { return 0xFFFFFFFF; }
-export function WAIT_OBJECT_0() -> uint32 { return 0; }
-export function WAIT_TIMEOUT() -> uint32 { return 258; }
-export function WAIT_FAILED() -> uint32 { return 0xFFFFFFFF; }
+export fn INFINITE() -> uint32 { return 0xFFFFFFFF; }
+export fn WAIT_OBJECT_0() -> uint32 { return 0; }
+export fn WAIT_TIMEOUT() -> uint32 { return 258; }
+export fn WAIT_FAILED() -> uint32 { return 0xFFFFFFFF; }
 
-export function MB_OK() -> uint32 { return 0; }
-export function MB_ICONINFORMATION() -> uint32 { return 64; }
-export function SM_CXSCREEN() -> int32 { return 0; }
-export function SM_CYSCREEN() -> int32 { return 1; }
+export fn MB_OK() -> uint32 { return 0; }
+export fn MB_ICONINFORMATION() -> uint32 { return 64; }
+export fn SM_CXSCREEN() -> int32 { return 0; }
+export fn SM_CYSCREEN() -> int32 { return 1; }
 
-export function GENERIC_READ() -> uint32 { return 0x80000000; }
-export function GENERIC_WRITE() -> uint32 { return 0x40000000; }
-export function FILE_SHARE_READ() -> uint32 { return 1; }
-export function FILE_SHARE_WRITE() -> uint32 { return 2; }
-export function CREATE_NEW() -> uint32 { return 1; }
-export function CREATE_ALWAYS() -> uint32 { return 2; }
-export function OPEN_EXISTING() -> uint32 { return 3; }
-export function OPEN_ALWAYS() -> uint32 { return 4; }
-export function TRUNCATE_EXISTING() -> uint32 { return 5; }
-export function FILE_ATTRIBUTE_NORMAL() -> uint32 { return 128; }
+export fn GENERIC_READ() -> uint32 { return 0x80000000; }
+export fn GENERIC_WRITE() -> uint32 { return 0x40000000; }
+export fn FILE_SHARE_READ() -> uint32 { return 1; }
+export fn FILE_SHARE_WRITE() -> uint32 { return 2; }
+export fn CREATE_NEW() -> uint32 { return 1; }
+export fn CREATE_ALWAYS() -> uint32 { return 2; }
+export fn OPEN_EXISTING() -> uint32 { return 3; }
+export fn OPEN_ALWAYS() -> uint32 { return 4; }
+export fn TRUNCATE_EXISTING() -> uint32 { return 5; }
+export fn FILE_ATTRIBUTE_NORMAL() -> uint32 { return 128; }
 
 // SYSTEMTIME from WinBase.h.
 export struct Win32SystemTime {
@@ -49,50 +49,50 @@ export struct Win32SystemTime {
 }
 
 // Kernel32.
-export extern function Win32_GetLastError() -> uint32 = "GetLastError";
-export extern function Win32_SetLastError(error_code: uint32) = "SetLastError";
-export extern function Win32_GetStdHandle(std_handle: int32) -> int64 = "GetStdHandle";
-export extern function Win32_GetCurrentProcess() -> int64 = "GetCurrentProcess";
-export extern function Win32_GetCurrentProcessId() -> uint32 = "GetCurrentProcessId";
-export extern function Win32_GetCurrentThreadId() -> uint32 = "GetCurrentThreadId";
-export extern function Win32_GetTickCount64() -> uint64 = "GetTickCount64";
-export extern function Win32_Sleep(milliseconds: uint32) = "Sleep";
-export extern function Win32_CloseHandle(handle: int64) -> int32 = "CloseHandle";
-export extern function Win32_WaitForSingleObject(handle: int64, milliseconds: uint32) -> uint32 = "WaitForSingleObject";
-export extern function Win32_GetSystemTime(time: Win32SystemTime*) = "GetSystemTime";
-export extern function Win32_CreateFileA(file_name: cstring, desired_access: uint32, share_mode: uint32, security_attributes: cstring, creation_disposition: uint32, flags_and_attributes: uint32, template_file: int64) -> int64 = "CreateFileA";
-export extern function Win32_ReadFile(file: int64, buffer: cstring, bytes_to_read: uint32, bytes_read: uint32*, overlapped: cstring) -> int32 = "ReadFile";
-export extern function Win32_WriteFile(file: int64, buffer: cstring, bytes_to_write: uint32, bytes_written: uint32*, overlapped: cstring) -> int32 = "WriteFile";
+export extern fn Win32_GetLastError() -> uint32 = "GetLastError";
+export extern fn Win32_SetLastError(error_code: uint32) = "SetLastError";
+export extern fn Win32_GetStdHandle(std_handle: int32) -> int64 = "GetStdHandle";
+export extern fn Win32_GetCurrentProcess() -> int64 = "GetCurrentProcess";
+export extern fn Win32_GetCurrentProcessId() -> uint32 = "GetCurrentProcessId";
+export extern fn Win32_GetCurrentThreadId() -> uint32 = "GetCurrentThreadId";
+export extern fn Win32_GetTickCount64() -> uint64 = "GetTickCount64";
+export extern fn Win32_Sleep(milliseconds: uint32) = "Sleep";
+export extern fn Win32_CloseHandle(handle: int64) -> int32 = "CloseHandle";
+export extern fn Win32_WaitForSingleObject(handle: int64, milliseconds: uint32) -> uint32 = "WaitForSingleObject";
+export extern fn Win32_GetSystemTime(time: Win32SystemTime*) = "GetSystemTime";
+export extern fn Win32_CreateFileA(file_name: cstring, desired_access: uint32, share_mode: uint32, security_attributes: cstring, creation_disposition: uint32, flags_and_attributes: uint32, template_file: int64) -> int64 = "CreateFileA";
+export extern fn Win32_ReadFile(file: int64, buffer: cstring, bytes_to_read: uint32, bytes_read: uint32*, overlapped: cstring) -> int32 = "ReadFile";
+export extern fn Win32_WriteFile(file: int64, buffer: cstring, bytes_to_write: uint32, bytes_written: uint32*, overlapped: cstring) -> int32 = "WriteFile";
 
 // User32.
-export extern function Win32_GetSystemMetrics(index: int32) -> int32 = "GetSystemMetrics";
-export extern function Win32_MessageBoxA(owner: int64, text: cstring, caption: cstring, kind: uint32) -> int32 = "MessageBoxA";
+export extern fn Win32_GetSystemMetrics(index: int32) -> int32 = "GetSystemMetrics";
+export extern fn Win32_MessageBoxA(owner: int64, text: cstring, caption: cstring, kind: uint32) -> int32 = "MessageBoxA";
 
-export function win32_last_error() -> uint32 {
+export fn win32_last_error() -> uint32 {
   return Win32_GetLastError();
 }
 
-export function win32_set_last_error(error_code: uint32) {
+export fn win32_set_last_error(error_code: uint32) {
   Win32_SetLastError(error_code);
 }
 
-export function win32_get_std_handle(std_handle: int32) -> int64 {
+export fn win32_get_std_handle(std_handle: int32) -> int64 {
   return Win32_GetStdHandle(std_handle);
 }
 
-export function win32_stdout() -> int64 {
+export fn win32_stdout() -> int64 {
   return Win32_GetStdHandle(STD_OUTPUT_HANDLE());
 }
 
-export function win32_stderr() -> int64 {
+export fn win32_stderr() -> int64 {
   return Win32_GetStdHandle(STD_ERROR_HANDLE());
 }
 
-export function win32_stdin() -> int64 {
+export fn win32_stdin() -> int64 {
   return Win32_GetStdHandle(STD_INPUT_HANDLE());
 }
 
-export function win32_is_invalid_handle(handle: int64) -> int32 {
+export fn win32_is_invalid_handle(handle: int64) -> int32 {
   if (handle == NULL_HANDLE()) {
     return TRUE();
   }
@@ -102,75 +102,75 @@ export function win32_is_invalid_handle(handle: int64) -> int32 {
   return FALSE();
 }
 
-export function win32_close_handle(handle: int64) -> int32 {
+export fn win32_close_handle(handle: int64) -> int32 {
   if (win32_is_invalid_handle(handle) != FALSE()) {
     return FALSE();
   }
   return Win32_CloseHandle(handle);
 }
 
-export function win32_sleep_ms(milliseconds: uint32) {
+export fn win32_sleep_ms(milliseconds: uint32) {
   Win32_Sleep(milliseconds);
 }
 
-export function win32_tick_count64() -> uint64 {
+export fn win32_tick_count64() -> uint64 {
   return Win32_GetTickCount64();
 }
 
-export function win32_get_current_process_id() -> uint32 {
+export fn win32_get_current_process_id() -> uint32 {
   return Win32_GetCurrentProcessId();
 }
 
-export function win32_get_current_thread_id() -> uint32 {
+export fn win32_get_current_thread_id() -> uint32 {
   return Win32_GetCurrentThreadId();
 }
 
-export function win32_wait(handle: int64, timeout_ms: uint32) -> uint32 {
+export fn win32_wait(handle: int64, timeout_ms: uint32) -> uint32 {
   return Win32_WaitForSingleObject(handle, timeout_ms);
 }
 
-export function win32_wait_forever(handle: int64) -> uint32 {
+export fn win32_wait_forever(handle: int64) -> uint32 {
   return Win32_WaitForSingleObject(handle, INFINITE());
 }
 
-export function win32_get_system_time(out_time: Win32SystemTime*) {
+export fn win32_get_system_time(out_time: Win32SystemTime*) {
   Win32_GetSystemTime(out_time);
 }
 
-export function win32_get_system_metrics(index: int32) -> int32 {
+export fn win32_get_system_metrics(index: int32) -> int32 {
   return Win32_GetSystemMetrics(index);
 }
 
-export function win32_message_box(text: cstring, caption: cstring) -> int32 {
+export fn win32_message_box(text: cstring, caption: cstring) -> int32 {
   return Win32_MessageBoxA(NULL_HANDLE(), text, caption, MB_OK());
 }
 
-export function win32_message_box_info(text: cstring, caption: cstring) -> int32 {
+export fn win32_message_box_info(text: cstring, caption: cstring) -> int32 {
   return Win32_MessageBoxA(NULL_HANDLE(), text, caption, MB_OK() | MB_ICONINFORMATION());
 }
 
-export function win32_create_file_read(path: cstring) -> int64 {
+export fn win32_create_file_read(path: cstring) -> int64 {
   return Win32_CreateFileA(path, GENERIC_READ(), FILE_SHARE_READ(), 0, OPEN_EXISTING(), FILE_ATTRIBUTE_NORMAL(), 0);
 }
 
-export function win32_create_file_write(path: cstring) -> int64 {
+export fn win32_create_file_write(path: cstring) -> int64 {
   return Win32_CreateFileA(path, GENERIC_WRITE(), 0, 0, CREATE_ALWAYS(), FILE_ATTRIBUTE_NORMAL(), 0);
 }
 
-export function win32_read_file(file: int64, buffer: cstring, bytes_to_read: uint32, bytes_read: uint32*) -> int32 {
+export fn win32_read_file(file: int64, buffer: cstring, bytes_to_read: uint32, bytes_read: uint32*) -> int32 {
   return Win32_ReadFile(file, buffer, bytes_to_read, bytes_read, 0);
 }
 
-export function win32_write_file(file: int64, buffer: cstring, bytes_to_write: uint32, bytes_written: uint32*) -> int32 {
+export fn win32_write_file(file: int64, buffer: cstring, bytes_to_write: uint32, bytes_written: uint32*) -> int32 {
   return Win32_WriteFile(file, buffer, bytes_to_write, bytes_written, 0);
 }
 
-export function win32_write_stdout(buffer: cstring, bytes_to_write: uint32) -> int32 {
+export fn win32_write_stdout(buffer: cstring, bytes_to_write: uint32) -> int32 {
   var written: uint32 = 0;
   return Win32_WriteFile(win32_stdout(), buffer, bytes_to_write, &written, 0);
 }
 
-export function win32_write_stderr(buffer: cstring, bytes_to_write: uint32) -> int32 {
+export fn win32_write_stderr(buffer: cstring, bytes_to_write: uint32) -> int32 {
   var written: uint32 = 0;
   return Win32_WriteFile(win32_stderr(), buffer, bytes_to_write, &written, 0);
 }

@@ -1,8 +1,8 @@
-function callee() -> int32 {
+fn callee() -> int32 {
   return 1;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var ok: int32 = 1;
   if (callee() == 0) {
     ok = 0;

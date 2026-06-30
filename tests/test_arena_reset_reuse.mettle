@@ -2,7 +2,7 @@
 // must reuse those chunks without malloc'ing new ones.
 import "std/arena";
 
-function burst(a: Arena*, count: int32) -> int32 {
+fn burst(a: Arena*, count: int32) -> int32 {
   var i: int32 = 0;
   while (i < count) {
     var p: cstring = arena_alloc(a, (int64)256);
@@ -14,7 +14,7 @@ function burst(a: Arena*, count: int32) -> int32 {
   return 0;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var a: Arena* = arena_init((int64)2048);
   if (a == 0) { return 1; }
 

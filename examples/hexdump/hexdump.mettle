@@ -12,13 +12,13 @@
 import "std/io";
 
 // Convert nibble (0-15) to hex char
-function nibble_to_hex(n: int32) -> int32 {
+fn nibble_to_hex(n: int32) -> int32 {
   if (n < 10) { return n + 48; }
   return n + 87;
 }
 
 // Write one byte as two hex chars to buf at offset, advance
-function byte_to_hex(buf: cstring, offset: int32, b: uint8) -> int32 {
+fn byte_to_hex(buf: cstring, offset: int32, b: uint8) -> int32 {
   var v: int32 = b;
   var hi: int32 = v / 16;
   var lo: int32 = v - (v / 16) * 16;
@@ -28,7 +28,7 @@ function byte_to_hex(buf: cstring, offset: int32, b: uint8) -> int32 {
 }
 
 // Format 16 bytes as hex string into buf, return length
-function format_hex_line(buf: cstring, data: cstring, count: int32) -> int32 {
+fn format_hex_line(buf: cstring, data: cstring, count: int32) -> int32 {
   var i: int32 = 0;
   var pos: int32 = 0;
   while (i < 16) {
@@ -49,7 +49,7 @@ function format_hex_line(buf: cstring, data: cstring, count: int32) -> int32 {
 }
 
 // Format 16 bytes as ASCII (printable or '.')
-function format_ascii_line(buf: cstring, data: cstring, count: int32) -> int32 {
+fn format_ascii_line(buf: cstring, data: cstring, count: int32) -> int32 {
   var i: int32 = 0;
   while (i < 16) {
     if (i < count) {
@@ -68,7 +68,7 @@ function format_ascii_line(buf: cstring, data: cstring, count: int32) -> int32 {
 }
 
 // Format offset as 8 hex digits (right-to-left, LS nibble first)
-function format_offset(buf: cstring, off: int64) -> int32 {
+fn format_offset(buf: cstring, off: int64) -> int32 {
   var i: int32 = 7;
   var val: int64 = off;
   while (i >= 0) {
@@ -84,7 +84,7 @@ var err_usage: string = "Usage: hexdump <filename>";
 var err_open: string = "Error: cannot open file";
 var mode_r: string = "rb";
 
-function main(argc: int32, argv: cstring*) -> int32 {
+fn main(argc: int32, argv: cstring*) -> int32 {
   if (argc < 2) {
     println(cstr(err_usage));
     return 1;

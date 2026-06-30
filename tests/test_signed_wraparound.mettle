@@ -1,6 +1,6 @@
 // Signed overflow: two's complement wraparound
 // int8: 127 + 1 = -128, -128 - 1 = 127
-function main() -> int32 {
+fn main() -> int32 {
   var a: int8 = 127;
   var b: int8 = 1;
   var c: int8 = a + b;

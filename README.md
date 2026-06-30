@@ -58,7 +58,7 @@ Save as `hello.mettle`:
 ```mettle
 import "std/io";
 
-function fib(n: int32) -> int64 {
+fn fib(n: int32) -> int64 {
   if (n <= 1) { return n; }
   var a: int64 = 0;
   var b: int64 = 1;
@@ -72,7 +72,7 @@ function fib(n: int32) -> int64 {
   return b;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   print("fib(10) = ");
   print_int(fib(10));
   newline();

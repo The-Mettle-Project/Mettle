@@ -1,10 +1,10 @@
 import "std/io"
 
-function double_all(a: int32*, n: int32) {
+fn double_all(a: int32*, n: int32) {
     for i in 0..n { a[i] = a[i] * 2; }
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     var v: int32[32];
     var i: int32 = 0;
     while (i < 32) { v[i] = i; i = i + 1; }

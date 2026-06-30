@@ -1,12 +1,12 @@
 import "std/mem";
 
-function load_then_store(buf: cstring, idx: int64) -> int32 {
+fn load_then_store(buf: cstring, idx: int64) -> int32 {
   var old: int64 = (int64)(uint8)buf[idx];
   buf[idx] = (uint8)(old + 17);
   return (int32)(old + (int64)(uint8)buf[idx]);
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var buf: cstring = malloc(4);
   if (buf == 0) {
     return 3;

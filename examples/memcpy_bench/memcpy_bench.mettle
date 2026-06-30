@@ -6,14 +6,14 @@ import "std/io";
 import "std/mem";
 import "std/bench";
 
-function copy_buffer(dst: cstring, src: cstring, len: int64) -> int64 {
+fn copy_buffer(dst: cstring, src: cstring, len: int64) -> int64 {
   memcpy(dst, src, len);
   var last: int64 = (int64)(uint8)dst[len - 1];
   var first: int64 = (int64)(uint8)src[0];
   return last + first;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var buf_size: int64 = 262144;
   var template: string = "0123456789abcdef";
   var template_len: int64 = 16;

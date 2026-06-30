@@ -94,528 +94,528 @@ struct S15 {
   c: int64;
 }
 
-function compute0(x: int64, y: int64) -> int64;
-function compute1(x: int64, y: int64) -> int64;
-function compute2(x: int64, y: int64) -> int64;
-function compute3(x: int64, y: int64) -> int64;
-function compute4(x: int64, y: int64) -> int64;
-function compute5(x: int64, y: int64) -> int64;
-function compute6(x: int64, y: int64) -> int64;
-function compute7(x: int64, y: int64) -> int64;
-function compute8(x: int64, y: int64) -> int64;
-function compute9(x: int64, y: int64) -> int64;
-function compute10(x: int64, y: int64) -> int64;
-function compute11(x: int64, y: int64) -> int64;
-function compute12(x: int64, y: int64) -> int64;
-function compute13(x: int64, y: int64) -> int64;
-function compute14(x: int64, y: int64) -> int64;
-function compute15(x: int64, y: int64) -> int64;
-function compute16(x: int64, y: int64) -> int64;
-function compute17(x: int64, y: int64) -> int64;
-function compute18(x: int64, y: int64) -> int64;
-function compute19(x: int64, y: int64) -> int64;
-function compute20(x: int64, y: int64) -> int64;
-function compute21(x: int64, y: int64) -> int64;
-function compute22(x: int64, y: int64) -> int64;
-function compute23(x: int64, y: int64) -> int64;
-function compute24(x: int64, y: int64) -> int64;
-function compute25(x: int64, y: int64) -> int64;
-function compute26(x: int64, y: int64) -> int64;
-function compute27(x: int64, y: int64) -> int64;
-function compute28(x: int64, y: int64) -> int64;
-function compute29(x: int64, y: int64) -> int64;
-function compute30(x: int64, y: int64) -> int64;
-function compute31(x: int64, y: int64) -> int64;
-function compute32(x: int64, y: int64) -> int64;
-function compute33(x: int64, y: int64) -> int64;
-function compute34(x: int64, y: int64) -> int64;
-function compute35(x: int64, y: int64) -> int64;
-function compute36(x: int64, y: int64) -> int64;
-function compute37(x: int64, y: int64) -> int64;
-function compute38(x: int64, y: int64) -> int64;
-function compute39(x: int64, y: int64) -> int64;
-function compute40(x: int64, y: int64) -> int64;
-function compute41(x: int64, y: int64) -> int64;
-function compute42(x: int64, y: int64) -> int64;
-function compute43(x: int64, y: int64) -> int64;
-function compute44(x: int64, y: int64) -> int64;
-function compute45(x: int64, y: int64) -> int64;
-function compute46(x: int64, y: int64) -> int64;
-function compute47(x: int64, y: int64) -> int64;
-function compute48(x: int64, y: int64) -> int64;
-function compute49(x: int64, y: int64) -> int64;
-function compute50(x: int64, y: int64) -> int64;
-function compute51(x: int64, y: int64) -> int64;
-function compute52(x: int64, y: int64) -> int64;
-function compute53(x: int64, y: int64) -> int64;
-function compute54(x: int64, y: int64) -> int64;
-function compute55(x: int64, y: int64) -> int64;
-function compute56(x: int64, y: int64) -> int64;
-function compute57(x: int64, y: int64) -> int64;
-function compute58(x: int64, y: int64) -> int64;
-function compute59(x: int64, y: int64) -> int64;
-function compute60(x: int64, y: int64) -> int64;
-function compute61(x: int64, y: int64) -> int64;
-function compute62(x: int64, y: int64) -> int64;
-function compute63(x: int64, y: int64) -> int64;
-function compute64(x: int64, y: int64) -> int64;
-function compute65(x: int64, y: int64) -> int64;
-function compute66(x: int64, y: int64) -> int64;
-function compute67(x: int64, y: int64) -> int64;
-function compute68(x: int64, y: int64) -> int64;
-function compute69(x: int64, y: int64) -> int64;
-function compute70(x: int64, y: int64) -> int64;
-function compute71(x: int64, y: int64) -> int64;
-function compute72(x: int64, y: int64) -> int64;
-function compute73(x: int64, y: int64) -> int64;
-function compute74(x: int64, y: int64) -> int64;
-function compute75(x: int64, y: int64) -> int64;
-function compute76(x: int64, y: int64) -> int64;
-function compute77(x: int64, y: int64) -> int64;
-function compute78(x: int64, y: int64) -> int64;
-function compute79(x: int64, y: int64) -> int64;
-function compute80(x: int64, y: int64) -> int64;
-function compute81(x: int64, y: int64) -> int64;
-function compute82(x: int64, y: int64) -> int64;
-function compute83(x: int64, y: int64) -> int64;
-function compute84(x: int64, y: int64) -> int64;
-function compute85(x: int64, y: int64) -> int64;
-function compute86(x: int64, y: int64) -> int64;
-function compute87(x: int64, y: int64) -> int64;
-function compute88(x: int64, y: int64) -> int64;
-function compute89(x: int64, y: int64) -> int64;
-function compute90(x: int64, y: int64) -> int64;
-function compute91(x: int64, y: int64) -> int64;
-function compute92(x: int64, y: int64) -> int64;
-function compute93(x: int64, y: int64) -> int64;
-function compute94(x: int64, y: int64) -> int64;
-function compute95(x: int64, y: int64) -> int64;
-function compute96(x: int64, y: int64) -> int64;
-function compute97(x: int64, y: int64) -> int64;
-function compute98(x: int64, y: int64) -> int64;
-function compute99(x: int64, y: int64) -> int64;
-function compute100(x: int64, y: int64) -> int64;
-function compute101(x: int64, y: int64) -> int64;
-function compute102(x: int64, y: int64) -> int64;
-function compute103(x: int64, y: int64) -> int64;
-function compute104(x: int64, y: int64) -> int64;
-function compute105(x: int64, y: int64) -> int64;
-function compute106(x: int64, y: int64) -> int64;
-function compute107(x: int64, y: int64) -> int64;
-function compute108(x: int64, y: int64) -> int64;
-function compute109(x: int64, y: int64) -> int64;
-function compute110(x: int64, y: int64) -> int64;
-function compute111(x: int64, y: int64) -> int64;
-function compute112(x: int64, y: int64) -> int64;
-function compute113(x: int64, y: int64) -> int64;
-function compute114(x: int64, y: int64) -> int64;
-function compute115(x: int64, y: int64) -> int64;
-function compute116(x: int64, y: int64) -> int64;
-function compute117(x: int64, y: int64) -> int64;
-function compute118(x: int64, y: int64) -> int64;
-function compute119(x: int64, y: int64) -> int64;
-function compute120(x: int64, y: int64) -> int64;
-function compute121(x: int64, y: int64) -> int64;
-function compute122(x: int64, y: int64) -> int64;
-function compute123(x: int64, y: int64) -> int64;
-function compute124(x: int64, y: int64) -> int64;
-function compute125(x: int64, y: int64) -> int64;
-function compute126(x: int64, y: int64) -> int64;
-function compute127(x: int64, y: int64) -> int64;
-function compute128(x: int64, y: int64) -> int64;
-function compute129(x: int64, y: int64) -> int64;
-function compute130(x: int64, y: int64) -> int64;
-function compute131(x: int64, y: int64) -> int64;
-function compute132(x: int64, y: int64) -> int64;
-function compute133(x: int64, y: int64) -> int64;
-function compute134(x: int64, y: int64) -> int64;
-function compute135(x: int64, y: int64) -> int64;
-function compute136(x: int64, y: int64) -> int64;
-function compute137(x: int64, y: int64) -> int64;
-function compute138(x: int64, y: int64) -> int64;
-function compute139(x: int64, y: int64) -> int64;
-function compute140(x: int64, y: int64) -> int64;
-function compute141(x: int64, y: int64) -> int64;
-function compute142(x: int64, y: int64) -> int64;
-function compute143(x: int64, y: int64) -> int64;
-function compute144(x: int64, y: int64) -> int64;
-function compute145(x: int64, y: int64) -> int64;
-function compute146(x: int64, y: int64) -> int64;
-function compute147(x: int64, y: int64) -> int64;
-function compute148(x: int64, y: int64) -> int64;
-function compute149(x: int64, y: int64) -> int64;
-function compute150(x: int64, y: int64) -> int64;
-function compute151(x: int64, y: int64) -> int64;
-function compute152(x: int64, y: int64) -> int64;
-function compute153(x: int64, y: int64) -> int64;
-function compute154(x: int64, y: int64) -> int64;
-function compute155(x: int64, y: int64) -> int64;
-function compute156(x: int64, y: int64) -> int64;
-function compute157(x: int64, y: int64) -> int64;
-function compute158(x: int64, y: int64) -> int64;
-function compute159(x: int64, y: int64) -> int64;
-function compute160(x: int64, y: int64) -> int64;
-function compute161(x: int64, y: int64) -> int64;
-function compute162(x: int64, y: int64) -> int64;
-function compute163(x: int64, y: int64) -> int64;
-function compute164(x: int64, y: int64) -> int64;
-function compute165(x: int64, y: int64) -> int64;
-function compute166(x: int64, y: int64) -> int64;
-function compute167(x: int64, y: int64) -> int64;
-function compute168(x: int64, y: int64) -> int64;
-function compute169(x: int64, y: int64) -> int64;
-function compute170(x: int64, y: int64) -> int64;
-function compute171(x: int64, y: int64) -> int64;
-function compute172(x: int64, y: int64) -> int64;
-function compute173(x: int64, y: int64) -> int64;
-function compute174(x: int64, y: int64) -> int64;
-function compute175(x: int64, y: int64) -> int64;
-function compute176(x: int64, y: int64) -> int64;
-function compute177(x: int64, y: int64) -> int64;
-function compute178(x: int64, y: int64) -> int64;
-function compute179(x: int64, y: int64) -> int64;
-function compute180(x: int64, y: int64) -> int64;
-function compute181(x: int64, y: int64) -> int64;
-function compute182(x: int64, y: int64) -> int64;
-function compute183(x: int64, y: int64) -> int64;
-function compute184(x: int64, y: int64) -> int64;
-function compute185(x: int64, y: int64) -> int64;
-function compute186(x: int64, y: int64) -> int64;
-function compute187(x: int64, y: int64) -> int64;
-function compute188(x: int64, y: int64) -> int64;
-function compute189(x: int64, y: int64) -> int64;
-function compute190(x: int64, y: int64) -> int64;
-function compute191(x: int64, y: int64) -> int64;
-function compute192(x: int64, y: int64) -> int64;
-function compute193(x: int64, y: int64) -> int64;
-function compute194(x: int64, y: int64) -> int64;
-function compute195(x: int64, y: int64) -> int64;
-function compute196(x: int64, y: int64) -> int64;
-function compute197(x: int64, y: int64) -> int64;
-function compute198(x: int64, y: int64) -> int64;
-function compute199(x: int64, y: int64) -> int64;
-function compute200(x: int64, y: int64) -> int64;
-function compute201(x: int64, y: int64) -> int64;
-function compute202(x: int64, y: int64) -> int64;
-function compute203(x: int64, y: int64) -> int64;
-function compute204(x: int64, y: int64) -> int64;
-function compute205(x: int64, y: int64) -> int64;
-function compute206(x: int64, y: int64) -> int64;
-function compute207(x: int64, y: int64) -> int64;
-function compute208(x: int64, y: int64) -> int64;
-function compute209(x: int64, y: int64) -> int64;
-function compute210(x: int64, y: int64) -> int64;
-function compute211(x: int64, y: int64) -> int64;
-function compute212(x: int64, y: int64) -> int64;
-function compute213(x: int64, y: int64) -> int64;
-function compute214(x: int64, y: int64) -> int64;
-function compute215(x: int64, y: int64) -> int64;
-function compute216(x: int64, y: int64) -> int64;
-function compute217(x: int64, y: int64) -> int64;
-function compute218(x: int64, y: int64) -> int64;
-function compute219(x: int64, y: int64) -> int64;
-function compute220(x: int64, y: int64) -> int64;
-function compute221(x: int64, y: int64) -> int64;
-function compute222(x: int64, y: int64) -> int64;
-function compute223(x: int64, y: int64) -> int64;
-function compute224(x: int64, y: int64) -> int64;
-function compute225(x: int64, y: int64) -> int64;
-function compute226(x: int64, y: int64) -> int64;
-function compute227(x: int64, y: int64) -> int64;
-function compute228(x: int64, y: int64) -> int64;
-function compute229(x: int64, y: int64) -> int64;
-function compute230(x: int64, y: int64) -> int64;
-function compute231(x: int64, y: int64) -> int64;
-function compute232(x: int64, y: int64) -> int64;
-function compute233(x: int64, y: int64) -> int64;
-function compute234(x: int64, y: int64) -> int64;
-function compute235(x: int64, y: int64) -> int64;
-function compute236(x: int64, y: int64) -> int64;
-function compute237(x: int64, y: int64) -> int64;
-function compute238(x: int64, y: int64) -> int64;
-function compute239(x: int64, y: int64) -> int64;
-function compute240(x: int64, y: int64) -> int64;
-function compute241(x: int64, y: int64) -> int64;
-function compute242(x: int64, y: int64) -> int64;
-function compute243(x: int64, y: int64) -> int64;
-function compute244(x: int64, y: int64) -> int64;
-function compute245(x: int64, y: int64) -> int64;
-function compute246(x: int64, y: int64) -> int64;
-function compute247(x: int64, y: int64) -> int64;
-function compute248(x: int64, y: int64) -> int64;
-function compute249(x: int64, y: int64) -> int64;
-function compute250(x: int64, y: int64) -> int64;
-function compute251(x: int64, y: int64) -> int64;
-function compute252(x: int64, y: int64) -> int64;
-function compute253(x: int64, y: int64) -> int64;
-function compute254(x: int64, y: int64) -> int64;
-function compute255(x: int64, y: int64) -> int64;
-function compute256(x: int64, y: int64) -> int64;
-function compute257(x: int64, y: int64) -> int64;
-function compute258(x: int64, y: int64) -> int64;
-function compute259(x: int64, y: int64) -> int64;
-function compute260(x: int64, y: int64) -> int64;
-function compute261(x: int64, y: int64) -> int64;
-function compute262(x: int64, y: int64) -> int64;
-function compute263(x: int64, y: int64) -> int64;
-function compute264(x: int64, y: int64) -> int64;
-function compute265(x: int64, y: int64) -> int64;
-function compute266(x: int64, y: int64) -> int64;
-function compute267(x: int64, y: int64) -> int64;
-function compute268(x: int64, y: int64) -> int64;
-function compute269(x: int64, y: int64) -> int64;
-function compute270(x: int64, y: int64) -> int64;
-function compute271(x: int64, y: int64) -> int64;
-function compute272(x: int64, y: int64) -> int64;
-function compute273(x: int64, y: int64) -> int64;
-function compute274(x: int64, y: int64) -> int64;
-function compute275(x: int64, y: int64) -> int64;
-function compute276(x: int64, y: int64) -> int64;
-function compute277(x: int64, y: int64) -> int64;
-function compute278(x: int64, y: int64) -> int64;
-function compute279(x: int64, y: int64) -> int64;
-function compute280(x: int64, y: int64) -> int64;
-function compute281(x: int64, y: int64) -> int64;
-function compute282(x: int64, y: int64) -> int64;
-function compute283(x: int64, y: int64) -> int64;
-function compute284(x: int64, y: int64) -> int64;
-function compute285(x: int64, y: int64) -> int64;
-function compute286(x: int64, y: int64) -> int64;
-function compute287(x: int64, y: int64) -> int64;
-function compute288(x: int64, y: int64) -> int64;
-function compute289(x: int64, y: int64) -> int64;
-function compute290(x: int64, y: int64) -> int64;
-function compute291(x: int64, y: int64) -> int64;
-function compute292(x: int64, y: int64) -> int64;
-function compute293(x: int64, y: int64) -> int64;
-function compute294(x: int64, y: int64) -> int64;
-function compute295(x: int64, y: int64) -> int64;
-function compute296(x: int64, y: int64) -> int64;
-function compute297(x: int64, y: int64) -> int64;
-function compute298(x: int64, y: int64) -> int64;
-function compute299(x: int64, y: int64) -> int64;
-function compute300(x: int64, y: int64) -> int64;
-function compute301(x: int64, y: int64) -> int64;
-function compute302(x: int64, y: int64) -> int64;
-function compute303(x: int64, y: int64) -> int64;
-function compute304(x: int64, y: int64) -> int64;
-function compute305(x: int64, y: int64) -> int64;
-function compute306(x: int64, y: int64) -> int64;
-function compute307(x: int64, y: int64) -> int64;
-function compute308(x: int64, y: int64) -> int64;
-function compute309(x: int64, y: int64) -> int64;
-function compute310(x: int64, y: int64) -> int64;
-function compute311(x: int64, y: int64) -> int64;
-function compute312(x: int64, y: int64) -> int64;
-function compute313(x: int64, y: int64) -> int64;
-function compute314(x: int64, y: int64) -> int64;
-function compute315(x: int64, y: int64) -> int64;
-function compute316(x: int64, y: int64) -> int64;
-function compute317(x: int64, y: int64) -> int64;
-function compute318(x: int64, y: int64) -> int64;
-function compute319(x: int64, y: int64) -> int64;
-function compute320(x: int64, y: int64) -> int64;
-function compute321(x: int64, y: int64) -> int64;
-function compute322(x: int64, y: int64) -> int64;
-function compute323(x: int64, y: int64) -> int64;
-function compute324(x: int64, y: int64) -> int64;
-function compute325(x: int64, y: int64) -> int64;
-function compute326(x: int64, y: int64) -> int64;
-function compute327(x: int64, y: int64) -> int64;
-function compute328(x: int64, y: int64) -> int64;
-function compute329(x: int64, y: int64) -> int64;
-function compute330(x: int64, y: int64) -> int64;
-function compute331(x: int64, y: int64) -> int64;
-function compute332(x: int64, y: int64) -> int64;
-function compute333(x: int64, y: int64) -> int64;
-function compute334(x: int64, y: int64) -> int64;
-function compute335(x: int64, y: int64) -> int64;
-function compute336(x: int64, y: int64) -> int64;
-function compute337(x: int64, y: int64) -> int64;
-function compute338(x: int64, y: int64) -> int64;
-function compute339(x: int64, y: int64) -> int64;
-function compute340(x: int64, y: int64) -> int64;
-function compute341(x: int64, y: int64) -> int64;
-function compute342(x: int64, y: int64) -> int64;
-function compute343(x: int64, y: int64) -> int64;
-function compute344(x: int64, y: int64) -> int64;
-function compute345(x: int64, y: int64) -> int64;
-function compute346(x: int64, y: int64) -> int64;
-function compute347(x: int64, y: int64) -> int64;
-function compute348(x: int64, y: int64) -> int64;
-function compute349(x: int64, y: int64) -> int64;
-function compute350(x: int64, y: int64) -> int64;
-function compute351(x: int64, y: int64) -> int64;
-function compute352(x: int64, y: int64) -> int64;
-function compute353(x: int64, y: int64) -> int64;
-function compute354(x: int64, y: int64) -> int64;
-function compute355(x: int64, y: int64) -> int64;
-function compute356(x: int64, y: int64) -> int64;
-function compute357(x: int64, y: int64) -> int64;
-function compute358(x: int64, y: int64) -> int64;
-function compute359(x: int64, y: int64) -> int64;
-function compute360(x: int64, y: int64) -> int64;
-function compute361(x: int64, y: int64) -> int64;
-function compute362(x: int64, y: int64) -> int64;
-function compute363(x: int64, y: int64) -> int64;
-function compute364(x: int64, y: int64) -> int64;
-function compute365(x: int64, y: int64) -> int64;
-function compute366(x: int64, y: int64) -> int64;
-function compute367(x: int64, y: int64) -> int64;
-function compute368(x: int64, y: int64) -> int64;
-function compute369(x: int64, y: int64) -> int64;
-function compute370(x: int64, y: int64) -> int64;
-function compute371(x: int64, y: int64) -> int64;
-function compute372(x: int64, y: int64) -> int64;
-function compute373(x: int64, y: int64) -> int64;
-function compute374(x: int64, y: int64) -> int64;
-function compute375(x: int64, y: int64) -> int64;
-function compute376(x: int64, y: int64) -> int64;
-function compute377(x: int64, y: int64) -> int64;
-function compute378(x: int64, y: int64) -> int64;
-function compute379(x: int64, y: int64) -> int64;
-function compute380(x: int64, y: int64) -> int64;
-function compute381(x: int64, y: int64) -> int64;
-function compute382(x: int64, y: int64) -> int64;
-function compute383(x: int64, y: int64) -> int64;
-function compute384(x: int64, y: int64) -> int64;
-function compute385(x: int64, y: int64) -> int64;
-function compute386(x: int64, y: int64) -> int64;
-function compute387(x: int64, y: int64) -> int64;
-function compute388(x: int64, y: int64) -> int64;
-function compute389(x: int64, y: int64) -> int64;
-function compute390(x: int64, y: int64) -> int64;
-function compute391(x: int64, y: int64) -> int64;
-function compute392(x: int64, y: int64) -> int64;
-function compute393(x: int64, y: int64) -> int64;
-function compute394(x: int64, y: int64) -> int64;
-function compute395(x: int64, y: int64) -> int64;
-function compute396(x: int64, y: int64) -> int64;
-function compute397(x: int64, y: int64) -> int64;
-function compute398(x: int64, y: int64) -> int64;
-function compute399(x: int64, y: int64) -> int64;
-function compute400(x: int64, y: int64) -> int64;
-function compute401(x: int64, y: int64) -> int64;
-function compute402(x: int64, y: int64) -> int64;
-function compute403(x: int64, y: int64) -> int64;
-function compute404(x: int64, y: int64) -> int64;
-function compute405(x: int64, y: int64) -> int64;
-function compute406(x: int64, y: int64) -> int64;
-function compute407(x: int64, y: int64) -> int64;
-function compute408(x: int64, y: int64) -> int64;
-function compute409(x: int64, y: int64) -> int64;
-function compute410(x: int64, y: int64) -> int64;
-function compute411(x: int64, y: int64) -> int64;
-function compute412(x: int64, y: int64) -> int64;
-function compute413(x: int64, y: int64) -> int64;
-function compute414(x: int64, y: int64) -> int64;
-function compute415(x: int64, y: int64) -> int64;
-function compute416(x: int64, y: int64) -> int64;
-function compute417(x: int64, y: int64) -> int64;
-function compute418(x: int64, y: int64) -> int64;
-function compute419(x: int64, y: int64) -> int64;
-function compute420(x: int64, y: int64) -> int64;
-function compute421(x: int64, y: int64) -> int64;
-function compute422(x: int64, y: int64) -> int64;
-function compute423(x: int64, y: int64) -> int64;
-function compute424(x: int64, y: int64) -> int64;
-function compute425(x: int64, y: int64) -> int64;
-function compute426(x: int64, y: int64) -> int64;
-function compute427(x: int64, y: int64) -> int64;
-function compute428(x: int64, y: int64) -> int64;
-function compute429(x: int64, y: int64) -> int64;
-function compute430(x: int64, y: int64) -> int64;
-function compute431(x: int64, y: int64) -> int64;
-function compute432(x: int64, y: int64) -> int64;
-function compute433(x: int64, y: int64) -> int64;
-function compute434(x: int64, y: int64) -> int64;
-function compute435(x: int64, y: int64) -> int64;
-function compute436(x: int64, y: int64) -> int64;
-function compute437(x: int64, y: int64) -> int64;
-function compute438(x: int64, y: int64) -> int64;
-function compute439(x: int64, y: int64) -> int64;
-function compute440(x: int64, y: int64) -> int64;
-function compute441(x: int64, y: int64) -> int64;
-function compute442(x: int64, y: int64) -> int64;
-function compute443(x: int64, y: int64) -> int64;
-function compute444(x: int64, y: int64) -> int64;
-function compute445(x: int64, y: int64) -> int64;
-function compute446(x: int64, y: int64) -> int64;
-function compute447(x: int64, y: int64) -> int64;
-function compute448(x: int64, y: int64) -> int64;
-function compute449(x: int64, y: int64) -> int64;
-function compute450(x: int64, y: int64) -> int64;
-function compute451(x: int64, y: int64) -> int64;
-function compute452(x: int64, y: int64) -> int64;
-function compute453(x: int64, y: int64) -> int64;
-function compute454(x: int64, y: int64) -> int64;
-function compute455(x: int64, y: int64) -> int64;
-function compute456(x: int64, y: int64) -> int64;
-function compute457(x: int64, y: int64) -> int64;
-function compute458(x: int64, y: int64) -> int64;
-function compute459(x: int64, y: int64) -> int64;
-function compute460(x: int64, y: int64) -> int64;
-function compute461(x: int64, y: int64) -> int64;
-function compute462(x: int64, y: int64) -> int64;
-function compute463(x: int64, y: int64) -> int64;
-function compute464(x: int64, y: int64) -> int64;
-function compute465(x: int64, y: int64) -> int64;
-function compute466(x: int64, y: int64) -> int64;
-function compute467(x: int64, y: int64) -> int64;
-function compute468(x: int64, y: int64) -> int64;
-function compute469(x: int64, y: int64) -> int64;
-function compute470(x: int64, y: int64) -> int64;
-function compute471(x: int64, y: int64) -> int64;
-function compute472(x: int64, y: int64) -> int64;
-function compute473(x: int64, y: int64) -> int64;
-function compute474(x: int64, y: int64) -> int64;
-function compute475(x: int64, y: int64) -> int64;
-function compute476(x: int64, y: int64) -> int64;
-function compute477(x: int64, y: int64) -> int64;
-function compute478(x: int64, y: int64) -> int64;
-function compute479(x: int64, y: int64) -> int64;
-function compute480(x: int64, y: int64) -> int64;
-function compute481(x: int64, y: int64) -> int64;
-function compute482(x: int64, y: int64) -> int64;
-function compute483(x: int64, y: int64) -> int64;
-function compute484(x: int64, y: int64) -> int64;
-function compute485(x: int64, y: int64) -> int64;
-function compute486(x: int64, y: int64) -> int64;
-function compute487(x: int64, y: int64) -> int64;
-function compute488(x: int64, y: int64) -> int64;
-function compute489(x: int64, y: int64) -> int64;
-function compute490(x: int64, y: int64) -> int64;
-function compute491(x: int64, y: int64) -> int64;
-function compute492(x: int64, y: int64) -> int64;
-function compute493(x: int64, y: int64) -> int64;
-function compute494(x: int64, y: int64) -> int64;
-function compute495(x: int64, y: int64) -> int64;
-function compute496(x: int64, y: int64) -> int64;
-function compute497(x: int64, y: int64) -> int64;
-function compute498(x: int64, y: int64) -> int64;
-function compute499(x: int64, y: int64) -> int64;
-function compute500(x: int64, y: int64) -> int64;
-function compute501(x: int64, y: int64) -> int64;
-function compute502(x: int64, y: int64) -> int64;
-function compute503(x: int64, y: int64) -> int64;
-function compute504(x: int64, y: int64) -> int64;
-function compute505(x: int64, y: int64) -> int64;
-function compute506(x: int64, y: int64) -> int64;
-function compute507(x: int64, y: int64) -> int64;
-function compute508(x: int64, y: int64) -> int64;
-function compute509(x: int64, y: int64) -> int64;
-function compute510(x: int64, y: int64) -> int64;
-function compute511(x: int64, y: int64) -> int64;
-function compute512(x: int64, y: int64) -> int64;
-function compute513(x: int64, y: int64) -> int64;
-function compute514(x: int64, y: int64) -> int64;
-function compute515(x: int64, y: int64) -> int64;
-function compute516(x: int64, y: int64) -> int64;
-function compute517(x: int64, y: int64) -> int64;
-function compute518(x: int64, y: int64) -> int64;
-function compute519(x: int64, y: int64) -> int64;
+fn compute0(x: int64, y: int64) -> int64;
+fn compute1(x: int64, y: int64) -> int64;
+fn compute2(x: int64, y: int64) -> int64;
+fn compute3(x: int64, y: int64) -> int64;
+fn compute4(x: int64, y: int64) -> int64;
+fn compute5(x: int64, y: int64) -> int64;
+fn compute6(x: int64, y: int64) -> int64;
+fn compute7(x: int64, y: int64) -> int64;
+fn compute8(x: int64, y: int64) -> int64;
+fn compute9(x: int64, y: int64) -> int64;
+fn compute10(x: int64, y: int64) -> int64;
+fn compute11(x: int64, y: int64) -> int64;
+fn compute12(x: int64, y: int64) -> int64;
+fn compute13(x: int64, y: int64) -> int64;
+fn compute14(x: int64, y: int64) -> int64;
+fn compute15(x: int64, y: int64) -> int64;
+fn compute16(x: int64, y: int64) -> int64;
+fn compute17(x: int64, y: int64) -> int64;
+fn compute18(x: int64, y: int64) -> int64;
+fn compute19(x: int64, y: int64) -> int64;
+fn compute20(x: int64, y: int64) -> int64;
+fn compute21(x: int64, y: int64) -> int64;
+fn compute22(x: int64, y: int64) -> int64;
+fn compute23(x: int64, y: int64) -> int64;
+fn compute24(x: int64, y: int64) -> int64;
+fn compute25(x: int64, y: int64) -> int64;
+fn compute26(x: int64, y: int64) -> int64;
+fn compute27(x: int64, y: int64) -> int64;
+fn compute28(x: int64, y: int64) -> int64;
+fn compute29(x: int64, y: int64) -> int64;
+fn compute30(x: int64, y: int64) -> int64;
+fn compute31(x: int64, y: int64) -> int64;
+fn compute32(x: int64, y: int64) -> int64;
+fn compute33(x: int64, y: int64) -> int64;
+fn compute34(x: int64, y: int64) -> int64;
+fn compute35(x: int64, y: int64) -> int64;
+fn compute36(x: int64, y: int64) -> int64;
+fn compute37(x: int64, y: int64) -> int64;
+fn compute38(x: int64, y: int64) -> int64;
+fn compute39(x: int64, y: int64) -> int64;
+fn compute40(x: int64, y: int64) -> int64;
+fn compute41(x: int64, y: int64) -> int64;
+fn compute42(x: int64, y: int64) -> int64;
+fn compute43(x: int64, y: int64) -> int64;
+fn compute44(x: int64, y: int64) -> int64;
+fn compute45(x: int64, y: int64) -> int64;
+fn compute46(x: int64, y: int64) -> int64;
+fn compute47(x: int64, y: int64) -> int64;
+fn compute48(x: int64, y: int64) -> int64;
+fn compute49(x: int64, y: int64) -> int64;
+fn compute50(x: int64, y: int64) -> int64;
+fn compute51(x: int64, y: int64) -> int64;
+fn compute52(x: int64, y: int64) -> int64;
+fn compute53(x: int64, y: int64) -> int64;
+fn compute54(x: int64, y: int64) -> int64;
+fn compute55(x: int64, y: int64) -> int64;
+fn compute56(x: int64, y: int64) -> int64;
+fn compute57(x: int64, y: int64) -> int64;
+fn compute58(x: int64, y: int64) -> int64;
+fn compute59(x: int64, y: int64) -> int64;
+fn compute60(x: int64, y: int64) -> int64;
+fn compute61(x: int64, y: int64) -> int64;
+fn compute62(x: int64, y: int64) -> int64;
+fn compute63(x: int64, y: int64) -> int64;
+fn compute64(x: int64, y: int64) -> int64;
+fn compute65(x: int64, y: int64) -> int64;
+fn compute66(x: int64, y: int64) -> int64;
+fn compute67(x: int64, y: int64) -> int64;
+fn compute68(x: int64, y: int64) -> int64;
+fn compute69(x: int64, y: int64) -> int64;
+fn compute70(x: int64, y: int64) -> int64;
+fn compute71(x: int64, y: int64) -> int64;
+fn compute72(x: int64, y: int64) -> int64;
+fn compute73(x: int64, y: int64) -> int64;
+fn compute74(x: int64, y: int64) -> int64;
+fn compute75(x: int64, y: int64) -> int64;
+fn compute76(x: int64, y: int64) -> int64;
+fn compute77(x: int64, y: int64) -> int64;
+fn compute78(x: int64, y: int64) -> int64;
+fn compute79(x: int64, y: int64) -> int64;
+fn compute80(x: int64, y: int64) -> int64;
+fn compute81(x: int64, y: int64) -> int64;
+fn compute82(x: int64, y: int64) -> int64;
+fn compute83(x: int64, y: int64) -> int64;
+fn compute84(x: int64, y: int64) -> int64;
+fn compute85(x: int64, y: int64) -> int64;
+fn compute86(x: int64, y: int64) -> int64;
+fn compute87(x: int64, y: int64) -> int64;
+fn compute88(x: int64, y: int64) -> int64;
+fn compute89(x: int64, y: int64) -> int64;
+fn compute90(x: int64, y: int64) -> int64;
+fn compute91(x: int64, y: int64) -> int64;
+fn compute92(x: int64, y: int64) -> int64;
+fn compute93(x: int64, y: int64) -> int64;
+fn compute94(x: int64, y: int64) -> int64;
+fn compute95(x: int64, y: int64) -> int64;
+fn compute96(x: int64, y: int64) -> int64;
+fn compute97(x: int64, y: int64) -> int64;
+fn compute98(x: int64, y: int64) -> int64;
+fn compute99(x: int64, y: int64) -> int64;
+fn compute100(x: int64, y: int64) -> int64;
+fn compute101(x: int64, y: int64) -> int64;
+fn compute102(x: int64, y: int64) -> int64;
+fn compute103(x: int64, y: int64) -> int64;
+fn compute104(x: int64, y: int64) -> int64;
+fn compute105(x: int64, y: int64) -> int64;
+fn compute106(x: int64, y: int64) -> int64;
+fn compute107(x: int64, y: int64) -> int64;
+fn compute108(x: int64, y: int64) -> int64;
+fn compute109(x: int64, y: int64) -> int64;
+fn compute110(x: int64, y: int64) -> int64;
+fn compute111(x: int64, y: int64) -> int64;
+fn compute112(x: int64, y: int64) -> int64;
+fn compute113(x: int64, y: int64) -> int64;
+fn compute114(x: int64, y: int64) -> int64;
+fn compute115(x: int64, y: int64) -> int64;
+fn compute116(x: int64, y: int64) -> int64;
+fn compute117(x: int64, y: int64) -> int64;
+fn compute118(x: int64, y: int64) -> int64;
+fn compute119(x: int64, y: int64) -> int64;
+fn compute120(x: int64, y: int64) -> int64;
+fn compute121(x: int64, y: int64) -> int64;
+fn compute122(x: int64, y: int64) -> int64;
+fn compute123(x: int64, y: int64) -> int64;
+fn compute124(x: int64, y: int64) -> int64;
+fn compute125(x: int64, y: int64) -> int64;
+fn compute126(x: int64, y: int64) -> int64;
+fn compute127(x: int64, y: int64) -> int64;
+fn compute128(x: int64, y: int64) -> int64;
+fn compute129(x: int64, y: int64) -> int64;
+fn compute130(x: int64, y: int64) -> int64;
+fn compute131(x: int64, y: int64) -> int64;
+fn compute132(x: int64, y: int64) -> int64;
+fn compute133(x: int64, y: int64) -> int64;
+fn compute134(x: int64, y: int64) -> int64;
+fn compute135(x: int64, y: int64) -> int64;
+fn compute136(x: int64, y: int64) -> int64;
+fn compute137(x: int64, y: int64) -> int64;
+fn compute138(x: int64, y: int64) -> int64;
+fn compute139(x: int64, y: int64) -> int64;
+fn compute140(x: int64, y: int64) -> int64;
+fn compute141(x: int64, y: int64) -> int64;
+fn compute142(x: int64, y: int64) -> int64;
+fn compute143(x: int64, y: int64) -> int64;
+fn compute144(x: int64, y: int64) -> int64;
+fn compute145(x: int64, y: int64) -> int64;
+fn compute146(x: int64, y: int64) -> int64;
+fn compute147(x: int64, y: int64) -> int64;
+fn compute148(x: int64, y: int64) -> int64;
+fn compute149(x: int64, y: int64) -> int64;
+fn compute150(x: int64, y: int64) -> int64;
+fn compute151(x: int64, y: int64) -> int64;
+fn compute152(x: int64, y: int64) -> int64;
+fn compute153(x: int64, y: int64) -> int64;
+fn compute154(x: int64, y: int64) -> int64;
+fn compute155(x: int64, y: int64) -> int64;
+fn compute156(x: int64, y: int64) -> int64;
+fn compute157(x: int64, y: int64) -> int64;
+fn compute158(x: int64, y: int64) -> int64;
+fn compute159(x: int64, y: int64) -> int64;
+fn compute160(x: int64, y: int64) -> int64;
+fn compute161(x: int64, y: int64) -> int64;
+fn compute162(x: int64, y: int64) -> int64;
+fn compute163(x: int64, y: int64) -> int64;
+fn compute164(x: int64, y: int64) -> int64;
+fn compute165(x: int64, y: int64) -> int64;
+fn compute166(x: int64, y: int64) -> int64;
+fn compute167(x: int64, y: int64) -> int64;
+fn compute168(x: int64, y: int64) -> int64;
+fn compute169(x: int64, y: int64) -> int64;
+fn compute170(x: int64, y: int64) -> int64;
+fn compute171(x: int64, y: int64) -> int64;
+fn compute172(x: int64, y: int64) -> int64;
+fn compute173(x: int64, y: int64) -> int64;
+fn compute174(x: int64, y: int64) -> int64;
+fn compute175(x: int64, y: int64) -> int64;
+fn compute176(x: int64, y: int64) -> int64;
+fn compute177(x: int64, y: int64) -> int64;
+fn compute178(x: int64, y: int64) -> int64;
+fn compute179(x: int64, y: int64) -> int64;
+fn compute180(x: int64, y: int64) -> int64;
+fn compute181(x: int64, y: int64) -> int64;
+fn compute182(x: int64, y: int64) -> int64;
+fn compute183(x: int64, y: int64) -> int64;
+fn compute184(x: int64, y: int64) -> int64;
+fn compute185(x: int64, y: int64) -> int64;
+fn compute186(x: int64, y: int64) -> int64;
+fn compute187(x: int64, y: int64) -> int64;
+fn compute188(x: int64, y: int64) -> int64;
+fn compute189(x: int64, y: int64) -> int64;
+fn compute190(x: int64, y: int64) -> int64;
+fn compute191(x: int64, y: int64) -> int64;
+fn compute192(x: int64, y: int64) -> int64;
+fn compute193(x: int64, y: int64) -> int64;
+fn compute194(x: int64, y: int64) -> int64;
+fn compute195(x: int64, y: int64) -> int64;
+fn compute196(x: int64, y: int64) -> int64;
+fn compute197(x: int64, y: int64) -> int64;
+fn compute198(x: int64, y: int64) -> int64;
+fn compute199(x: int64, y: int64) -> int64;
+fn compute200(x: int64, y: int64) -> int64;
+fn compute201(x: int64, y: int64) -> int64;
+fn compute202(x: int64, y: int64) -> int64;
+fn compute203(x: int64, y: int64) -> int64;
+fn compute204(x: int64, y: int64) -> int64;
+fn compute205(x: int64, y: int64) -> int64;
+fn compute206(x: int64, y: int64) -> int64;
+fn compute207(x: int64, y: int64) -> int64;
+fn compute208(x: int64, y: int64) -> int64;
+fn compute209(x: int64, y: int64) -> int64;
+fn compute210(x: int64, y: int64) -> int64;
+fn compute211(x: int64, y: int64) -> int64;
+fn compute212(x: int64, y: int64) -> int64;
+fn compute213(x: int64, y: int64) -> int64;
+fn compute214(x: int64, y: int64) -> int64;
+fn compute215(x: int64, y: int64) -> int64;
+fn compute216(x: int64, y: int64) -> int64;
+fn compute217(x: int64, y: int64) -> int64;
+fn compute218(x: int64, y: int64) -> int64;
+fn compute219(x: int64, y: int64) -> int64;
+fn compute220(x: int64, y: int64) -> int64;
+fn compute221(x: int64, y: int64) -> int64;
+fn compute222(x: int64, y: int64) -> int64;
+fn compute223(x: int64, y: int64) -> int64;
+fn compute224(x: int64, y: int64) -> int64;
+fn compute225(x: int64, y: int64) -> int64;
+fn compute226(x: int64, y: int64) -> int64;
+fn compute227(x: int64, y: int64) -> int64;
+fn compute228(x: int64, y: int64) -> int64;
+fn compute229(x: int64, y: int64) -> int64;
+fn compute230(x: int64, y: int64) -> int64;
+fn compute231(x: int64, y: int64) -> int64;
+fn compute232(x: int64, y: int64) -> int64;
+fn compute233(x: int64, y: int64) -> int64;
+fn compute234(x: int64, y: int64) -> int64;
+fn compute235(x: int64, y: int64) -> int64;
+fn compute236(x: int64, y: int64) -> int64;
+fn compute237(x: int64, y: int64) -> int64;
+fn compute238(x: int64, y: int64) -> int64;
+fn compute239(x: int64, y: int64) -> int64;
+fn compute240(x: int64, y: int64) -> int64;
+fn compute241(x: int64, y: int64) -> int64;
+fn compute242(x: int64, y: int64) -> int64;
+fn compute243(x: int64, y: int64) -> int64;
+fn compute244(x: int64, y: int64) -> int64;
+fn compute245(x: int64, y: int64) -> int64;
+fn compute246(x: int64, y: int64) -> int64;
+fn compute247(x: int64, y: int64) -> int64;
+fn compute248(x: int64, y: int64) -> int64;
+fn compute249(x: int64, y: int64) -> int64;
+fn compute250(x: int64, y: int64) -> int64;
+fn compute251(x: int64, y: int64) -> int64;
+fn compute252(x: int64, y: int64) -> int64;
+fn compute253(x: int64, y: int64) -> int64;
+fn compute254(x: int64, y: int64) -> int64;
+fn compute255(x: int64, y: int64) -> int64;
+fn compute256(x: int64, y: int64) -> int64;
+fn compute257(x: int64, y: int64) -> int64;
+fn compute258(x: int64, y: int64) -> int64;
+fn compute259(x: int64, y: int64) -> int64;
+fn compute260(x: int64, y: int64) -> int64;
+fn compute261(x: int64, y: int64) -> int64;
+fn compute262(x: int64, y: int64) -> int64;
+fn compute263(x: int64, y: int64) -> int64;
+fn compute264(x: int64, y: int64) -> int64;
+fn compute265(x: int64, y: int64) -> int64;
+fn compute266(x: int64, y: int64) -> int64;
+fn compute267(x: int64, y: int64) -> int64;
+fn compute268(x: int64, y: int64) -> int64;
+fn compute269(x: int64, y: int64) -> int64;
+fn compute270(x: int64, y: int64) -> int64;
+fn compute271(x: int64, y: int64) -> int64;
+fn compute272(x: int64, y: int64) -> int64;
+fn compute273(x: int64, y: int64) -> int64;
+fn compute274(x: int64, y: int64) -> int64;
+fn compute275(x: int64, y: int64) -> int64;
+fn compute276(x: int64, y: int64) -> int64;
+fn compute277(x: int64, y: int64) -> int64;
+fn compute278(x: int64, y: int64) -> int64;
+fn compute279(x: int64, y: int64) -> int64;
+fn compute280(x: int64, y: int64) -> int64;
+fn compute281(x: int64, y: int64) -> int64;
+fn compute282(x: int64, y: int64) -> int64;
+fn compute283(x: int64, y: int64) -> int64;
+fn compute284(x: int64, y: int64) -> int64;
+fn compute285(x: int64, y: int64) -> int64;
+fn compute286(x: int64, y: int64) -> int64;
+fn compute287(x: int64, y: int64) -> int64;
+fn compute288(x: int64, y: int64) -> int64;
+fn compute289(x: int64, y: int64) -> int64;
+fn compute290(x: int64, y: int64) -> int64;
+fn compute291(x: int64, y: int64) -> int64;
+fn compute292(x: int64, y: int64) -> int64;
+fn compute293(x: int64, y: int64) -> int64;
+fn compute294(x: int64, y: int64) -> int64;
+fn compute295(x: int64, y: int64) -> int64;
+fn compute296(x: int64, y: int64) -> int64;
+fn compute297(x: int64, y: int64) -> int64;
+fn compute298(x: int64, y: int64) -> int64;
+fn compute299(x: int64, y: int64) -> int64;
+fn compute300(x: int64, y: int64) -> int64;
+fn compute301(x: int64, y: int64) -> int64;
+fn compute302(x: int64, y: int64) -> int64;
+fn compute303(x: int64, y: int64) -> int64;
+fn compute304(x: int64, y: int64) -> int64;
+fn compute305(x: int64, y: int64) -> int64;
+fn compute306(x: int64, y: int64) -> int64;
+fn compute307(x: int64, y: int64) -> int64;
+fn compute308(x: int64, y: int64) -> int64;
+fn compute309(x: int64, y: int64) -> int64;
+fn compute310(x: int64, y: int64) -> int64;
+fn compute311(x: int64, y: int64) -> int64;
+fn compute312(x: int64, y: int64) -> int64;
+fn compute313(x: int64, y: int64) -> int64;
+fn compute314(x: int64, y: int64) -> int64;
+fn compute315(x: int64, y: int64) -> int64;
+fn compute316(x: int64, y: int64) -> int64;
+fn compute317(x: int64, y: int64) -> int64;
+fn compute318(x: int64, y: int64) -> int64;
+fn compute319(x: int64, y: int64) -> int64;
+fn compute320(x: int64, y: int64) -> int64;
+fn compute321(x: int64, y: int64) -> int64;
+fn compute322(x: int64, y: int64) -> int64;
+fn compute323(x: int64, y: int64) -> int64;
+fn compute324(x: int64, y: int64) -> int64;
+fn compute325(x: int64, y: int64) -> int64;
+fn compute326(x: int64, y: int64) -> int64;
+fn compute327(x: int64, y: int64) -> int64;
+fn compute328(x: int64, y: int64) -> int64;
+fn compute329(x: int64, y: int64) -> int64;
+fn compute330(x: int64, y: int64) -> int64;
+fn compute331(x: int64, y: int64) -> int64;
+fn compute332(x: int64, y: int64) -> int64;
+fn compute333(x: int64, y: int64) -> int64;
+fn compute334(x: int64, y: int64) -> int64;
+fn compute335(x: int64, y: int64) -> int64;
+fn compute336(x: int64, y: int64) -> int64;
+fn compute337(x: int64, y: int64) -> int64;
+fn compute338(x: int64, y: int64) -> int64;
+fn compute339(x: int64, y: int64) -> int64;
+fn compute340(x: int64, y: int64) -> int64;
+fn compute341(x: int64, y: int64) -> int64;
+fn compute342(x: int64, y: int64) -> int64;
+fn compute343(x: int64, y: int64) -> int64;
+fn compute344(x: int64, y: int64) -> int64;
+fn compute345(x: int64, y: int64) -> int64;
+fn compute346(x: int64, y: int64) -> int64;
+fn compute347(x: int64, y: int64) -> int64;
+fn compute348(x: int64, y: int64) -> int64;
+fn compute349(x: int64, y: int64) -> int64;
+fn compute350(x: int64, y: int64) -> int64;
+fn compute351(x: int64, y: int64) -> int64;
+fn compute352(x: int64, y: int64) -> int64;
+fn compute353(x: int64, y: int64) -> int64;
+fn compute354(x: int64, y: int64) -> int64;
+fn compute355(x: int64, y: int64) -> int64;
+fn compute356(x: int64, y: int64) -> int64;
+fn compute357(x: int64, y: int64) -> int64;
+fn compute358(x: int64, y: int64) -> int64;
+fn compute359(x: int64, y: int64) -> int64;
+fn compute360(x: int64, y: int64) -> int64;
+fn compute361(x: int64, y: int64) -> int64;
+fn compute362(x: int64, y: int64) -> int64;
+fn compute363(x: int64, y: int64) -> int64;
+fn compute364(x: int64, y: int64) -> int64;
+fn compute365(x: int64, y: int64) -> int64;
+fn compute366(x: int64, y: int64) -> int64;
+fn compute367(x: int64, y: int64) -> int64;
+fn compute368(x: int64, y: int64) -> int64;
+fn compute369(x: int64, y: int64) -> int64;
+fn compute370(x: int64, y: int64) -> int64;
+fn compute371(x: int64, y: int64) -> int64;
+fn compute372(x: int64, y: int64) -> int64;
+fn compute373(x: int64, y: int64) -> int64;
+fn compute374(x: int64, y: int64) -> int64;
+fn compute375(x: int64, y: int64) -> int64;
+fn compute376(x: int64, y: int64) -> int64;
+fn compute377(x: int64, y: int64) -> int64;
+fn compute378(x: int64, y: int64) -> int64;
+fn compute379(x: int64, y: int64) -> int64;
+fn compute380(x: int64, y: int64) -> int64;
+fn compute381(x: int64, y: int64) -> int64;
+fn compute382(x: int64, y: int64) -> int64;
+fn compute383(x: int64, y: int64) -> int64;
+fn compute384(x: int64, y: int64) -> int64;
+fn compute385(x: int64, y: int64) -> int64;
+fn compute386(x: int64, y: int64) -> int64;
+fn compute387(x: int64, y: int64) -> int64;
+fn compute388(x: int64, y: int64) -> int64;
+fn compute389(x: int64, y: int64) -> int64;
+fn compute390(x: int64, y: int64) -> int64;
+fn compute391(x: int64, y: int64) -> int64;
+fn compute392(x: int64, y: int64) -> int64;
+fn compute393(x: int64, y: int64) -> int64;
+fn compute394(x: int64, y: int64) -> int64;
+fn compute395(x: int64, y: int64) -> int64;
+fn compute396(x: int64, y: int64) -> int64;
+fn compute397(x: int64, y: int64) -> int64;
+fn compute398(x: int64, y: int64) -> int64;
+fn compute399(x: int64, y: int64) -> int64;
+fn compute400(x: int64, y: int64) -> int64;
+fn compute401(x: int64, y: int64) -> int64;
+fn compute402(x: int64, y: int64) -> int64;
+fn compute403(x: int64, y: int64) -> int64;
+fn compute404(x: int64, y: int64) -> int64;
+fn compute405(x: int64, y: int64) -> int64;
+fn compute406(x: int64, y: int64) -> int64;
+fn compute407(x: int64, y: int64) -> int64;
+fn compute408(x: int64, y: int64) -> int64;
+fn compute409(x: int64, y: int64) -> int64;
+fn compute410(x: int64, y: int64) -> int64;
+fn compute411(x: int64, y: int64) -> int64;
+fn compute412(x: int64, y: int64) -> int64;
+fn compute413(x: int64, y: int64) -> int64;
+fn compute414(x: int64, y: int64) -> int64;
+fn compute415(x: int64, y: int64) -> int64;
+fn compute416(x: int64, y: int64) -> int64;
+fn compute417(x: int64, y: int64) -> int64;
+fn compute418(x: int64, y: int64) -> int64;
+fn compute419(x: int64, y: int64) -> int64;
+fn compute420(x: int64, y: int64) -> int64;
+fn compute421(x: int64, y: int64) -> int64;
+fn compute422(x: int64, y: int64) -> int64;
+fn compute423(x: int64, y: int64) -> int64;
+fn compute424(x: int64, y: int64) -> int64;
+fn compute425(x: int64, y: int64) -> int64;
+fn compute426(x: int64, y: int64) -> int64;
+fn compute427(x: int64, y: int64) -> int64;
+fn compute428(x: int64, y: int64) -> int64;
+fn compute429(x: int64, y: int64) -> int64;
+fn compute430(x: int64, y: int64) -> int64;
+fn compute431(x: int64, y: int64) -> int64;
+fn compute432(x: int64, y: int64) -> int64;
+fn compute433(x: int64, y: int64) -> int64;
+fn compute434(x: int64, y: int64) -> int64;
+fn compute435(x: int64, y: int64) -> int64;
+fn compute436(x: int64, y: int64) -> int64;
+fn compute437(x: int64, y: int64) -> int64;
+fn compute438(x: int64, y: int64) -> int64;
+fn compute439(x: int64, y: int64) -> int64;
+fn compute440(x: int64, y: int64) -> int64;
+fn compute441(x: int64, y: int64) -> int64;
+fn compute442(x: int64, y: int64) -> int64;
+fn compute443(x: int64, y: int64) -> int64;
+fn compute444(x: int64, y: int64) -> int64;
+fn compute445(x: int64, y: int64) -> int64;
+fn compute446(x: int64, y: int64) -> int64;
+fn compute447(x: int64, y: int64) -> int64;
+fn compute448(x: int64, y: int64) -> int64;
+fn compute449(x: int64, y: int64) -> int64;
+fn compute450(x: int64, y: int64) -> int64;
+fn compute451(x: int64, y: int64) -> int64;
+fn compute452(x: int64, y: int64) -> int64;
+fn compute453(x: int64, y: int64) -> int64;
+fn compute454(x: int64, y: int64) -> int64;
+fn compute455(x: int64, y: int64) -> int64;
+fn compute456(x: int64, y: int64) -> int64;
+fn compute457(x: int64, y: int64) -> int64;
+fn compute458(x: int64, y: int64) -> int64;
+fn compute459(x: int64, y: int64) -> int64;
+fn compute460(x: int64, y: int64) -> int64;
+fn compute461(x: int64, y: int64) -> int64;
+fn compute462(x: int64, y: int64) -> int64;
+fn compute463(x: int64, y: int64) -> int64;
+fn compute464(x: int64, y: int64) -> int64;
+fn compute465(x: int64, y: int64) -> int64;
+fn compute466(x: int64, y: int64) -> int64;
+fn compute467(x: int64, y: int64) -> int64;
+fn compute468(x: int64, y: int64) -> int64;
+fn compute469(x: int64, y: int64) -> int64;
+fn compute470(x: int64, y: int64) -> int64;
+fn compute471(x: int64, y: int64) -> int64;
+fn compute472(x: int64, y: int64) -> int64;
+fn compute473(x: int64, y: int64) -> int64;
+fn compute474(x: int64, y: int64) -> int64;
+fn compute475(x: int64, y: int64) -> int64;
+fn compute476(x: int64, y: int64) -> int64;
+fn compute477(x: int64, y: int64) -> int64;
+fn compute478(x: int64, y: int64) -> int64;
+fn compute479(x: int64, y: int64) -> int64;
+fn compute480(x: int64, y: int64) -> int64;
+fn compute481(x: int64, y: int64) -> int64;
+fn compute482(x: int64, y: int64) -> int64;
+fn compute483(x: int64, y: int64) -> int64;
+fn compute484(x: int64, y: int64) -> int64;
+fn compute485(x: int64, y: int64) -> int64;
+fn compute486(x: int64, y: int64) -> int64;
+fn compute487(x: int64, y: int64) -> int64;
+fn compute488(x: int64, y: int64) -> int64;
+fn compute489(x: int64, y: int64) -> int64;
+fn compute490(x: int64, y: int64) -> int64;
+fn compute491(x: int64, y: int64) -> int64;
+fn compute492(x: int64, y: int64) -> int64;
+fn compute493(x: int64, y: int64) -> int64;
+fn compute494(x: int64, y: int64) -> int64;
+fn compute495(x: int64, y: int64) -> int64;
+fn compute496(x: int64, y: int64) -> int64;
+fn compute497(x: int64, y: int64) -> int64;
+fn compute498(x: int64, y: int64) -> int64;
+fn compute499(x: int64, y: int64) -> int64;
+fn compute500(x: int64, y: int64) -> int64;
+fn compute501(x: int64, y: int64) -> int64;
+fn compute502(x: int64, y: int64) -> int64;
+fn compute503(x: int64, y: int64) -> int64;
+fn compute504(x: int64, y: int64) -> int64;
+fn compute505(x: int64, y: int64) -> int64;
+fn compute506(x: int64, y: int64) -> int64;
+fn compute507(x: int64, y: int64) -> int64;
+fn compute508(x: int64, y: int64) -> int64;
+fn compute509(x: int64, y: int64) -> int64;
+fn compute510(x: int64, y: int64) -> int64;
+fn compute511(x: int64, y: int64) -> int64;
+fn compute512(x: int64, y: int64) -> int64;
+fn compute513(x: int64, y: int64) -> int64;
+fn compute514(x: int64, y: int64) -> int64;
+fn compute515(x: int64, y: int64) -> int64;
+fn compute516(x: int64, y: int64) -> int64;
+fn compute517(x: int64, y: int64) -> int64;
+fn compute518(x: int64, y: int64) -> int64;
+fn compute519(x: int64, y: int64) -> int64;
 
-function compute0(x: int64, y: int64) -> int64 {
+fn compute0(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -631,7 +631,7 @@ function compute0(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute1(x: int64, y: int64) -> int64 {
+fn compute1(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -647,7 +647,7 @@ function compute1(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute2(x: int64, y: int64) -> int64 {
+fn compute2(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -663,7 +663,7 @@ function compute2(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute3(x: int64, y: int64) -> int64 {
+fn compute3(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -679,7 +679,7 @@ function compute3(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute4(x: int64, y: int64) -> int64 {
+fn compute4(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -695,7 +695,7 @@ function compute4(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute5(x: int64, y: int64) -> int64 {
+fn compute5(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -711,7 +711,7 @@ function compute5(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute6(x: int64, y: int64) -> int64 {
+fn compute6(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -727,7 +727,7 @@ function compute6(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute7(x: int64, y: int64) -> int64 {
+fn compute7(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -743,7 +743,7 @@ function compute7(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute8(x: int64, y: int64) -> int64 {
+fn compute8(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -759,7 +759,7 @@ function compute8(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute9(x: int64, y: int64) -> int64 {
+fn compute9(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -775,7 +775,7 @@ function compute9(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute10(x: int64, y: int64) -> int64 {
+fn compute10(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -791,7 +791,7 @@ function compute10(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute11(x: int64, y: int64) -> int64 {
+fn compute11(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -807,7 +807,7 @@ function compute11(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute12(x: int64, y: int64) -> int64 {
+fn compute12(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -823,7 +823,7 @@ function compute12(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute13(x: int64, y: int64) -> int64 {
+fn compute13(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -839,7 +839,7 @@ function compute13(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute14(x: int64, y: int64) -> int64 {
+fn compute14(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -855,7 +855,7 @@ function compute14(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute15(x: int64, y: int64) -> int64 {
+fn compute15(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -871,7 +871,7 @@ function compute15(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute16(x: int64, y: int64) -> int64 {
+fn compute16(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -887,7 +887,7 @@ function compute16(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute17(x: int64, y: int64) -> int64 {
+fn compute17(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -903,7 +903,7 @@ function compute17(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute18(x: int64, y: int64) -> int64 {
+fn compute18(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -919,7 +919,7 @@ function compute18(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute19(x: int64, y: int64) -> int64 {
+fn compute19(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -935,7 +935,7 @@ function compute19(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute20(x: int64, y: int64) -> int64 {
+fn compute20(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -951,7 +951,7 @@ function compute20(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute21(x: int64, y: int64) -> int64 {
+fn compute21(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -967,7 +967,7 @@ function compute21(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute22(x: int64, y: int64) -> int64 {
+fn compute22(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -983,7 +983,7 @@ function compute22(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute23(x: int64, y: int64) -> int64 {
+fn compute23(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -999,7 +999,7 @@ function compute23(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute24(x: int64, y: int64) -> int64 {
+fn compute24(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -1015,7 +1015,7 @@ function compute24(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute25(x: int64, y: int64) -> int64 {
+fn compute25(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -1031,7 +1031,7 @@ function compute25(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute26(x: int64, y: int64) -> int64 {
+fn compute26(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -1047,7 +1047,7 @@ function compute26(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute27(x: int64, y: int64) -> int64 {
+fn compute27(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -1063,7 +1063,7 @@ function compute27(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute28(x: int64, y: int64) -> int64 {
+fn compute28(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -1079,7 +1079,7 @@ function compute28(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute29(x: int64, y: int64) -> int64 {
+fn compute29(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -1095,7 +1095,7 @@ function compute29(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute30(x: int64, y: int64) -> int64 {
+fn compute30(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -1111,7 +1111,7 @@ function compute30(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute31(x: int64, y: int64) -> int64 {
+fn compute31(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -1127,7 +1127,7 @@ function compute31(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute32(x: int64, y: int64) -> int64 {
+fn compute32(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -1143,7 +1143,7 @@ function compute32(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute33(x: int64, y: int64) -> int64 {
+fn compute33(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -1159,7 +1159,7 @@ function compute33(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute34(x: int64, y: int64) -> int64 {
+fn compute34(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -1175,7 +1175,7 @@ function compute34(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute35(x: int64, y: int64) -> int64 {
+fn compute35(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -1191,7 +1191,7 @@ function compute35(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute36(x: int64, y: int64) -> int64 {
+fn compute36(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -1207,7 +1207,7 @@ function compute36(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute37(x: int64, y: int64) -> int64 {
+fn compute37(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -1223,7 +1223,7 @@ function compute37(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute38(x: int64, y: int64) -> int64 {
+fn compute38(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -1239,7 +1239,7 @@ function compute38(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute39(x: int64, y: int64) -> int64 {
+fn compute39(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -1255,7 +1255,7 @@ function compute39(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute40(x: int64, y: int64) -> int64 {
+fn compute40(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -1271,7 +1271,7 @@ function compute40(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute41(x: int64, y: int64) -> int64 {
+fn compute41(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -1287,7 +1287,7 @@ function compute41(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute42(x: int64, y: int64) -> int64 {
+fn compute42(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -1303,7 +1303,7 @@ function compute42(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute43(x: int64, y: int64) -> int64 {
+fn compute43(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -1319,7 +1319,7 @@ function compute43(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute44(x: int64, y: int64) -> int64 {
+fn compute44(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -1335,7 +1335,7 @@ function compute44(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute45(x: int64, y: int64) -> int64 {
+fn compute45(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -1351,7 +1351,7 @@ function compute45(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute46(x: int64, y: int64) -> int64 {
+fn compute46(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -1367,7 +1367,7 @@ function compute46(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute47(x: int64, y: int64) -> int64 {
+fn compute47(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -1383,7 +1383,7 @@ function compute47(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute48(x: int64, y: int64) -> int64 {
+fn compute48(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -1399,7 +1399,7 @@ function compute48(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute49(x: int64, y: int64) -> int64 {
+fn compute49(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -1415,7 +1415,7 @@ function compute49(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute50(x: int64, y: int64) -> int64 {
+fn compute50(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -1431,7 +1431,7 @@ function compute50(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute51(x: int64, y: int64) -> int64 {
+fn compute51(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -1447,7 +1447,7 @@ function compute51(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute52(x: int64, y: int64) -> int64 {
+fn compute52(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -1463,7 +1463,7 @@ function compute52(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute53(x: int64, y: int64) -> int64 {
+fn compute53(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -1479,7 +1479,7 @@ function compute53(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute54(x: int64, y: int64) -> int64 {
+fn compute54(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -1495,7 +1495,7 @@ function compute54(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute55(x: int64, y: int64) -> int64 {
+fn compute55(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -1511,7 +1511,7 @@ function compute55(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute56(x: int64, y: int64) -> int64 {
+fn compute56(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -1527,7 +1527,7 @@ function compute56(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute57(x: int64, y: int64) -> int64 {
+fn compute57(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -1543,7 +1543,7 @@ function compute57(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute58(x: int64, y: int64) -> int64 {
+fn compute58(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -1559,7 +1559,7 @@ function compute58(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute59(x: int64, y: int64) -> int64 {
+fn compute59(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -1575,7 +1575,7 @@ function compute59(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute60(x: int64, y: int64) -> int64 {
+fn compute60(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -1591,7 +1591,7 @@ function compute60(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute61(x: int64, y: int64) -> int64 {
+fn compute61(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -1607,7 +1607,7 @@ function compute61(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute62(x: int64, y: int64) -> int64 {
+fn compute62(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -1623,7 +1623,7 @@ function compute62(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute63(x: int64, y: int64) -> int64 {
+fn compute63(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -1639,7 +1639,7 @@ function compute63(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute64(x: int64, y: int64) -> int64 {
+fn compute64(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -1655,7 +1655,7 @@ function compute64(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute65(x: int64, y: int64) -> int64 {
+fn compute65(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -1671,7 +1671,7 @@ function compute65(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute66(x: int64, y: int64) -> int64 {
+fn compute66(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -1687,7 +1687,7 @@ function compute66(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute67(x: int64, y: int64) -> int64 {
+fn compute67(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -1703,7 +1703,7 @@ function compute67(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute68(x: int64, y: int64) -> int64 {
+fn compute68(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -1719,7 +1719,7 @@ function compute68(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute69(x: int64, y: int64) -> int64 {
+fn compute69(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -1735,7 +1735,7 @@ function compute69(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute70(x: int64, y: int64) -> int64 {
+fn compute70(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -1751,7 +1751,7 @@ function compute70(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute71(x: int64, y: int64) -> int64 {
+fn compute71(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -1767,7 +1767,7 @@ function compute71(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute72(x: int64, y: int64) -> int64 {
+fn compute72(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -1783,7 +1783,7 @@ function compute72(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute73(x: int64, y: int64) -> int64 {
+fn compute73(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -1799,7 +1799,7 @@ function compute73(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute74(x: int64, y: int64) -> int64 {
+fn compute74(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -1815,7 +1815,7 @@ function compute74(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute75(x: int64, y: int64) -> int64 {
+fn compute75(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -1831,7 +1831,7 @@ function compute75(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute76(x: int64, y: int64) -> int64 {
+fn compute76(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -1847,7 +1847,7 @@ function compute76(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute77(x: int64, y: int64) -> int64 {
+fn compute77(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -1863,7 +1863,7 @@ function compute77(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute78(x: int64, y: int64) -> int64 {
+fn compute78(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -1879,7 +1879,7 @@ function compute78(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute79(x: int64, y: int64) -> int64 {
+fn compute79(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -1895,7 +1895,7 @@ function compute79(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute80(x: int64, y: int64) -> int64 {
+fn compute80(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -1911,7 +1911,7 @@ function compute80(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute81(x: int64, y: int64) -> int64 {
+fn compute81(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -1927,7 +1927,7 @@ function compute81(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute82(x: int64, y: int64) -> int64 {
+fn compute82(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -1943,7 +1943,7 @@ function compute82(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute83(x: int64, y: int64) -> int64 {
+fn compute83(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -1959,7 +1959,7 @@ function compute83(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute84(x: int64, y: int64) -> int64 {
+fn compute84(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -1975,7 +1975,7 @@ function compute84(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute85(x: int64, y: int64) -> int64 {
+fn compute85(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -1991,7 +1991,7 @@ function compute85(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute86(x: int64, y: int64) -> int64 {
+fn compute86(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -2007,7 +2007,7 @@ function compute86(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute87(x: int64, y: int64) -> int64 {
+fn compute87(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -2023,7 +2023,7 @@ function compute87(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute88(x: int64, y: int64) -> int64 {
+fn compute88(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -2039,7 +2039,7 @@ function compute88(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute89(x: int64, y: int64) -> int64 {
+fn compute89(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -2055,7 +2055,7 @@ function compute89(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute90(x: int64, y: int64) -> int64 {
+fn compute90(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -2071,7 +2071,7 @@ function compute90(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute91(x: int64, y: int64) -> int64 {
+fn compute91(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -2087,7 +2087,7 @@ function compute91(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute92(x: int64, y: int64) -> int64 {
+fn compute92(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -2103,7 +2103,7 @@ function compute92(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute93(x: int64, y: int64) -> int64 {
+fn compute93(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -2119,7 +2119,7 @@ function compute93(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute94(x: int64, y: int64) -> int64 {
+fn compute94(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -2135,7 +2135,7 @@ function compute94(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute95(x: int64, y: int64) -> int64 {
+fn compute95(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -2151,7 +2151,7 @@ function compute95(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute96(x: int64, y: int64) -> int64 {
+fn compute96(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -2167,7 +2167,7 @@ function compute96(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute97(x: int64, y: int64) -> int64 {
+fn compute97(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -2183,7 +2183,7 @@ function compute97(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute98(x: int64, y: int64) -> int64 {
+fn compute98(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -2199,7 +2199,7 @@ function compute98(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute99(x: int64, y: int64) -> int64 {
+fn compute99(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -2215,7 +2215,7 @@ function compute99(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute100(x: int64, y: int64) -> int64 {
+fn compute100(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -2231,7 +2231,7 @@ function compute100(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute101(x: int64, y: int64) -> int64 {
+fn compute101(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -2247,7 +2247,7 @@ function compute101(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute102(x: int64, y: int64) -> int64 {
+fn compute102(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -2263,7 +2263,7 @@ function compute102(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute103(x: int64, y: int64) -> int64 {
+fn compute103(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -2279,7 +2279,7 @@ function compute103(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute104(x: int64, y: int64) -> int64 {
+fn compute104(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -2295,7 +2295,7 @@ function compute104(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute105(x: int64, y: int64) -> int64 {
+fn compute105(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -2311,7 +2311,7 @@ function compute105(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute106(x: int64, y: int64) -> int64 {
+fn compute106(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -2327,7 +2327,7 @@ function compute106(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute107(x: int64, y: int64) -> int64 {
+fn compute107(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -2343,7 +2343,7 @@ function compute107(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute108(x: int64, y: int64) -> int64 {
+fn compute108(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -2359,7 +2359,7 @@ function compute108(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute109(x: int64, y: int64) -> int64 {
+fn compute109(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -2375,7 +2375,7 @@ function compute109(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute110(x: int64, y: int64) -> int64 {
+fn compute110(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -2391,7 +2391,7 @@ function compute110(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute111(x: int64, y: int64) -> int64 {
+fn compute111(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -2407,7 +2407,7 @@ function compute111(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute112(x: int64, y: int64) -> int64 {
+fn compute112(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -2423,7 +2423,7 @@ function compute112(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute113(x: int64, y: int64) -> int64 {
+fn compute113(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -2439,7 +2439,7 @@ function compute113(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute114(x: int64, y: int64) -> int64 {
+fn compute114(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -2455,7 +2455,7 @@ function compute114(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute115(x: int64, y: int64) -> int64 {
+fn compute115(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -2471,7 +2471,7 @@ function compute115(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute116(x: int64, y: int64) -> int64 {
+fn compute116(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -2487,7 +2487,7 @@ function compute116(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute117(x: int64, y: int64) -> int64 {
+fn compute117(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -2503,7 +2503,7 @@ function compute117(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute118(x: int64, y: int64) -> int64 {
+fn compute118(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -2519,7 +2519,7 @@ function compute118(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute119(x: int64, y: int64) -> int64 {
+fn compute119(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -2535,7 +2535,7 @@ function compute119(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute120(x: int64, y: int64) -> int64 {
+fn compute120(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -2551,7 +2551,7 @@ function compute120(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute121(x: int64, y: int64) -> int64 {
+fn compute121(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -2567,7 +2567,7 @@ function compute121(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute122(x: int64, y: int64) -> int64 {
+fn compute122(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -2583,7 +2583,7 @@ function compute122(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute123(x: int64, y: int64) -> int64 {
+fn compute123(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -2599,7 +2599,7 @@ function compute123(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute124(x: int64, y: int64) -> int64 {
+fn compute124(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -2615,7 +2615,7 @@ function compute124(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute125(x: int64, y: int64) -> int64 {
+fn compute125(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -2631,7 +2631,7 @@ function compute125(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute126(x: int64, y: int64) -> int64 {
+fn compute126(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -2647,7 +2647,7 @@ function compute126(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute127(x: int64, y: int64) -> int64 {
+fn compute127(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -2663,7 +2663,7 @@ function compute127(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute128(x: int64, y: int64) -> int64 {
+fn compute128(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -2679,7 +2679,7 @@ function compute128(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute129(x: int64, y: int64) -> int64 {
+fn compute129(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -2695,7 +2695,7 @@ function compute129(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute130(x: int64, y: int64) -> int64 {
+fn compute130(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -2711,7 +2711,7 @@ function compute130(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute131(x: int64, y: int64) -> int64 {
+fn compute131(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -2727,7 +2727,7 @@ function compute131(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute132(x: int64, y: int64) -> int64 {
+fn compute132(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -2743,7 +2743,7 @@ function compute132(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute133(x: int64, y: int64) -> int64 {
+fn compute133(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -2759,7 +2759,7 @@ function compute133(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute134(x: int64, y: int64) -> int64 {
+fn compute134(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -2775,7 +2775,7 @@ function compute134(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute135(x: int64, y: int64) -> int64 {
+fn compute135(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -2791,7 +2791,7 @@ function compute135(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute136(x: int64, y: int64) -> int64 {
+fn compute136(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -2807,7 +2807,7 @@ function compute136(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute137(x: int64, y: int64) -> int64 {
+fn compute137(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -2823,7 +2823,7 @@ function compute137(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute138(x: int64, y: int64) -> int64 {
+fn compute138(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -2839,7 +2839,7 @@ function compute138(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute139(x: int64, y: int64) -> int64 {
+fn compute139(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -2855,7 +2855,7 @@ function compute139(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute140(x: int64, y: int64) -> int64 {
+fn compute140(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -2871,7 +2871,7 @@ function compute140(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute141(x: int64, y: int64) -> int64 {
+fn compute141(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -2887,7 +2887,7 @@ function compute141(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute142(x: int64, y: int64) -> int64 {
+fn compute142(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -2903,7 +2903,7 @@ function compute142(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute143(x: int64, y: int64) -> int64 {
+fn compute143(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -2919,7 +2919,7 @@ function compute143(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute144(x: int64, y: int64) -> int64 {
+fn compute144(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -2935,7 +2935,7 @@ function compute144(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute145(x: int64, y: int64) -> int64 {
+fn compute145(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -2951,7 +2951,7 @@ function compute145(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute146(x: int64, y: int64) -> int64 {
+fn compute146(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -2967,7 +2967,7 @@ function compute146(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute147(x: int64, y: int64) -> int64 {
+fn compute147(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -2983,7 +2983,7 @@ function compute147(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute148(x: int64, y: int64) -> int64 {
+fn compute148(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -2999,7 +2999,7 @@ function compute148(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute149(x: int64, y: int64) -> int64 {
+fn compute149(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -3015,7 +3015,7 @@ function compute149(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute150(x: int64, y: int64) -> int64 {
+fn compute150(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -3031,7 +3031,7 @@ function compute150(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute151(x: int64, y: int64) -> int64 {
+fn compute151(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -3047,7 +3047,7 @@ function compute151(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute152(x: int64, y: int64) -> int64 {
+fn compute152(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -3063,7 +3063,7 @@ function compute152(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute153(x: int64, y: int64) -> int64 {
+fn compute153(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -3079,7 +3079,7 @@ function compute153(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute154(x: int64, y: int64) -> int64 {
+fn compute154(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -3095,7 +3095,7 @@ function compute154(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute155(x: int64, y: int64) -> int64 {
+fn compute155(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -3111,7 +3111,7 @@ function compute155(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute156(x: int64, y: int64) -> int64 {
+fn compute156(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -3127,7 +3127,7 @@ function compute156(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute157(x: int64, y: int64) -> int64 {
+fn compute157(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -3143,7 +3143,7 @@ function compute157(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute158(x: int64, y: int64) -> int64 {
+fn compute158(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -3159,7 +3159,7 @@ function compute158(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute159(x: int64, y: int64) -> int64 {
+fn compute159(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -3175,7 +3175,7 @@ function compute159(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute160(x: int64, y: int64) -> int64 {
+fn compute160(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -3191,7 +3191,7 @@ function compute160(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute161(x: int64, y: int64) -> int64 {
+fn compute161(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -3207,7 +3207,7 @@ function compute161(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute162(x: int64, y: int64) -> int64 {
+fn compute162(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -3223,7 +3223,7 @@ function compute162(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute163(x: int64, y: int64) -> int64 {
+fn compute163(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -3239,7 +3239,7 @@ function compute163(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute164(x: int64, y: int64) -> int64 {
+fn compute164(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -3255,7 +3255,7 @@ function compute164(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute165(x: int64, y: int64) -> int64 {
+fn compute165(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -3271,7 +3271,7 @@ function compute165(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute166(x: int64, y: int64) -> int64 {
+fn compute166(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -3287,7 +3287,7 @@ function compute166(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute167(x: int64, y: int64) -> int64 {
+fn compute167(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -3303,7 +3303,7 @@ function compute167(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute168(x: int64, y: int64) -> int64 {
+fn compute168(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -3319,7 +3319,7 @@ function compute168(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute169(x: int64, y: int64) -> int64 {
+fn compute169(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -3335,7 +3335,7 @@ function compute169(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute170(x: int64, y: int64) -> int64 {
+fn compute170(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -3351,7 +3351,7 @@ function compute170(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute171(x: int64, y: int64) -> int64 {
+fn compute171(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -3367,7 +3367,7 @@ function compute171(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute172(x: int64, y: int64) -> int64 {
+fn compute172(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -3383,7 +3383,7 @@ function compute172(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute173(x: int64, y: int64) -> int64 {
+fn compute173(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -3399,7 +3399,7 @@ function compute173(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute174(x: int64, y: int64) -> int64 {
+fn compute174(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -3415,7 +3415,7 @@ function compute174(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute175(x: int64, y: int64) -> int64 {
+fn compute175(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -3431,7 +3431,7 @@ function compute175(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute176(x: int64, y: int64) -> int64 {
+fn compute176(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -3447,7 +3447,7 @@ function compute176(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute177(x: int64, y: int64) -> int64 {
+fn compute177(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -3463,7 +3463,7 @@ function compute177(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute178(x: int64, y: int64) -> int64 {
+fn compute178(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -3479,7 +3479,7 @@ function compute178(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute179(x: int64, y: int64) -> int64 {
+fn compute179(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -3495,7 +3495,7 @@ function compute179(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute180(x: int64, y: int64) -> int64 {
+fn compute180(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -3511,7 +3511,7 @@ function compute180(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute181(x: int64, y: int64) -> int64 {
+fn compute181(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -3527,7 +3527,7 @@ function compute181(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute182(x: int64, y: int64) -> int64 {
+fn compute182(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -3543,7 +3543,7 @@ function compute182(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute183(x: int64, y: int64) -> int64 {
+fn compute183(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -3559,7 +3559,7 @@ function compute183(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute184(x: int64, y: int64) -> int64 {
+fn compute184(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -3575,7 +3575,7 @@ function compute184(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute185(x: int64, y: int64) -> int64 {
+fn compute185(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -3591,7 +3591,7 @@ function compute185(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute186(x: int64, y: int64) -> int64 {
+fn compute186(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -3607,7 +3607,7 @@ function compute186(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute187(x: int64, y: int64) -> int64 {
+fn compute187(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -3623,7 +3623,7 @@ function compute187(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute188(x: int64, y: int64) -> int64 {
+fn compute188(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -3639,7 +3639,7 @@ function compute188(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute189(x: int64, y: int64) -> int64 {
+fn compute189(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -3655,7 +3655,7 @@ function compute189(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute190(x: int64, y: int64) -> int64 {
+fn compute190(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -3671,7 +3671,7 @@ function compute190(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute191(x: int64, y: int64) -> int64 {
+fn compute191(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -3687,7 +3687,7 @@ function compute191(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute192(x: int64, y: int64) -> int64 {
+fn compute192(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -3703,7 +3703,7 @@ function compute192(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute193(x: int64, y: int64) -> int64 {
+fn compute193(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -3719,7 +3719,7 @@ function compute193(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute194(x: int64, y: int64) -> int64 {
+fn compute194(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -3735,7 +3735,7 @@ function compute194(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute195(x: int64, y: int64) -> int64 {
+fn compute195(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -3751,7 +3751,7 @@ function compute195(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute196(x: int64, y: int64) -> int64 {
+fn compute196(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -3767,7 +3767,7 @@ function compute196(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute197(x: int64, y: int64) -> int64 {
+fn compute197(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -3783,7 +3783,7 @@ function compute197(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute198(x: int64, y: int64) -> int64 {
+fn compute198(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -3799,7 +3799,7 @@ function compute198(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute199(x: int64, y: int64) -> int64 {
+fn compute199(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -3815,7 +3815,7 @@ function compute199(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute200(x: int64, y: int64) -> int64 {
+fn compute200(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -3831,7 +3831,7 @@ function compute200(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute201(x: int64, y: int64) -> int64 {
+fn compute201(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -3847,7 +3847,7 @@ function compute201(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute202(x: int64, y: int64) -> int64 {
+fn compute202(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -3863,7 +3863,7 @@ function compute202(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute203(x: int64, y: int64) -> int64 {
+fn compute203(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -3879,7 +3879,7 @@ function compute203(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute204(x: int64, y: int64) -> int64 {
+fn compute204(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -3895,7 +3895,7 @@ function compute204(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute205(x: int64, y: int64) -> int64 {
+fn compute205(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -3911,7 +3911,7 @@ function compute205(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute206(x: int64, y: int64) -> int64 {
+fn compute206(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -3927,7 +3927,7 @@ function compute206(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute207(x: int64, y: int64) -> int64 {
+fn compute207(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -3943,7 +3943,7 @@ function compute207(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute208(x: int64, y: int64) -> int64 {
+fn compute208(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -3959,7 +3959,7 @@ function compute208(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute209(x: int64, y: int64) -> int64 {
+fn compute209(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -3975,7 +3975,7 @@ function compute209(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute210(x: int64, y: int64) -> int64 {
+fn compute210(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -3991,7 +3991,7 @@ function compute210(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute211(x: int64, y: int64) -> int64 {
+fn compute211(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -4007,7 +4007,7 @@ function compute211(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute212(x: int64, y: int64) -> int64 {
+fn compute212(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -4023,7 +4023,7 @@ function compute212(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute213(x: int64, y: int64) -> int64 {
+fn compute213(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -4039,7 +4039,7 @@ function compute213(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute214(x: int64, y: int64) -> int64 {
+fn compute214(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -4055,7 +4055,7 @@ function compute214(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute215(x: int64, y: int64) -> int64 {
+fn compute215(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -4071,7 +4071,7 @@ function compute215(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute216(x: int64, y: int64) -> int64 {
+fn compute216(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -4087,7 +4087,7 @@ function compute216(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute217(x: int64, y: int64) -> int64 {
+fn compute217(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -4103,7 +4103,7 @@ function compute217(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute218(x: int64, y: int64) -> int64 {
+fn compute218(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -4119,7 +4119,7 @@ function compute218(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute219(x: int64, y: int64) -> int64 {
+fn compute219(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -4135,7 +4135,7 @@ function compute219(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute220(x: int64, y: int64) -> int64 {
+fn compute220(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -4151,7 +4151,7 @@ function compute220(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute221(x: int64, y: int64) -> int64 {
+fn compute221(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -4167,7 +4167,7 @@ function compute221(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute222(x: int64, y: int64) -> int64 {
+fn compute222(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -4183,7 +4183,7 @@ function compute222(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute223(x: int64, y: int64) -> int64 {
+fn compute223(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -4199,7 +4199,7 @@ function compute223(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute224(x: int64, y: int64) -> int64 {
+fn compute224(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -4215,7 +4215,7 @@ function compute224(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute225(x: int64, y: int64) -> int64 {
+fn compute225(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -4231,7 +4231,7 @@ function compute225(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute226(x: int64, y: int64) -> int64 {
+fn compute226(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -4247,7 +4247,7 @@ function compute226(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute227(x: int64, y: int64) -> int64 {
+fn compute227(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -4263,7 +4263,7 @@ function compute227(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute228(x: int64, y: int64) -> int64 {
+fn compute228(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -4279,7 +4279,7 @@ function compute228(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute229(x: int64, y: int64) -> int64 {
+fn compute229(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -4295,7 +4295,7 @@ function compute229(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute230(x: int64, y: int64) -> int64 {
+fn compute230(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -4311,7 +4311,7 @@ function compute230(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute231(x: int64, y: int64) -> int64 {
+fn compute231(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -4327,7 +4327,7 @@ function compute231(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute232(x: int64, y: int64) -> int64 {
+fn compute232(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -4343,7 +4343,7 @@ function compute232(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute233(x: int64, y: int64) -> int64 {
+fn compute233(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -4359,7 +4359,7 @@ function compute233(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute234(x: int64, y: int64) -> int64 {
+fn compute234(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -4375,7 +4375,7 @@ function compute234(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute235(x: int64, y: int64) -> int64 {
+fn compute235(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -4391,7 +4391,7 @@ function compute235(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute236(x: int64, y: int64) -> int64 {
+fn compute236(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -4407,7 +4407,7 @@ function compute236(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute237(x: int64, y: int64) -> int64 {
+fn compute237(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -4423,7 +4423,7 @@ function compute237(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute238(x: int64, y: int64) -> int64 {
+fn compute238(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -4439,7 +4439,7 @@ function compute238(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute239(x: int64, y: int64) -> int64 {
+fn compute239(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -4455,7 +4455,7 @@ function compute239(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute240(x: int64, y: int64) -> int64 {
+fn compute240(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -4471,7 +4471,7 @@ function compute240(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute241(x: int64, y: int64) -> int64 {
+fn compute241(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -4487,7 +4487,7 @@ function compute241(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute242(x: int64, y: int64) -> int64 {
+fn compute242(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -4503,7 +4503,7 @@ function compute242(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute243(x: int64, y: int64) -> int64 {
+fn compute243(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -4519,7 +4519,7 @@ function compute243(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute244(x: int64, y: int64) -> int64 {
+fn compute244(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -4535,7 +4535,7 @@ function compute244(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute245(x: int64, y: int64) -> int64 {
+fn compute245(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -4551,7 +4551,7 @@ function compute245(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute246(x: int64, y: int64) -> int64 {
+fn compute246(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -4567,7 +4567,7 @@ function compute246(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute247(x: int64, y: int64) -> int64 {
+fn compute247(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -4583,7 +4583,7 @@ function compute247(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute248(x: int64, y: int64) -> int64 {
+fn compute248(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -4599,7 +4599,7 @@ function compute248(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute249(x: int64, y: int64) -> int64 {
+fn compute249(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -4615,7 +4615,7 @@ function compute249(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute250(x: int64, y: int64) -> int64 {
+fn compute250(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -4631,7 +4631,7 @@ function compute250(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute251(x: int64, y: int64) -> int64 {
+fn compute251(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -4647,7 +4647,7 @@ function compute251(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute252(x: int64, y: int64) -> int64 {
+fn compute252(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -4663,7 +4663,7 @@ function compute252(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute253(x: int64, y: int64) -> int64 {
+fn compute253(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -4679,7 +4679,7 @@ function compute253(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute254(x: int64, y: int64) -> int64 {
+fn compute254(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -4695,7 +4695,7 @@ function compute254(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute255(x: int64, y: int64) -> int64 {
+fn compute255(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -4711,7 +4711,7 @@ function compute255(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute256(x: int64, y: int64) -> int64 {
+fn compute256(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -4727,7 +4727,7 @@ function compute256(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute257(x: int64, y: int64) -> int64 {
+fn compute257(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -4743,7 +4743,7 @@ function compute257(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute258(x: int64, y: int64) -> int64 {
+fn compute258(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -4759,7 +4759,7 @@ function compute258(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute259(x: int64, y: int64) -> int64 {
+fn compute259(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -4775,7 +4775,7 @@ function compute259(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute260(x: int64, y: int64) -> int64 {
+fn compute260(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -4791,7 +4791,7 @@ function compute260(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute261(x: int64, y: int64) -> int64 {
+fn compute261(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -4807,7 +4807,7 @@ function compute261(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute262(x: int64, y: int64) -> int64 {
+fn compute262(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -4823,7 +4823,7 @@ function compute262(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute263(x: int64, y: int64) -> int64 {
+fn compute263(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -4839,7 +4839,7 @@ function compute263(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute264(x: int64, y: int64) -> int64 {
+fn compute264(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -4855,7 +4855,7 @@ function compute264(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute265(x: int64, y: int64) -> int64 {
+fn compute265(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -4871,7 +4871,7 @@ function compute265(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute266(x: int64, y: int64) -> int64 {
+fn compute266(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -4887,7 +4887,7 @@ function compute266(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute267(x: int64, y: int64) -> int64 {
+fn compute267(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -4903,7 +4903,7 @@ function compute267(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute268(x: int64, y: int64) -> int64 {
+fn compute268(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -4919,7 +4919,7 @@ function compute268(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute269(x: int64, y: int64) -> int64 {
+fn compute269(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -4935,7 +4935,7 @@ function compute269(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute270(x: int64, y: int64) -> int64 {
+fn compute270(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -4951,7 +4951,7 @@ function compute270(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute271(x: int64, y: int64) -> int64 {
+fn compute271(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -4967,7 +4967,7 @@ function compute271(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute272(x: int64, y: int64) -> int64 {
+fn compute272(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -4983,7 +4983,7 @@ function compute272(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute273(x: int64, y: int64) -> int64 {
+fn compute273(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -4999,7 +4999,7 @@ function compute273(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute274(x: int64, y: int64) -> int64 {
+fn compute274(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -5015,7 +5015,7 @@ function compute274(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute275(x: int64, y: int64) -> int64 {
+fn compute275(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -5031,7 +5031,7 @@ function compute275(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute276(x: int64, y: int64) -> int64 {
+fn compute276(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -5047,7 +5047,7 @@ function compute276(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute277(x: int64, y: int64) -> int64 {
+fn compute277(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -5063,7 +5063,7 @@ function compute277(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute278(x: int64, y: int64) -> int64 {
+fn compute278(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -5079,7 +5079,7 @@ function compute278(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute279(x: int64, y: int64) -> int64 {
+fn compute279(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -5095,7 +5095,7 @@ function compute279(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute280(x: int64, y: int64) -> int64 {
+fn compute280(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -5111,7 +5111,7 @@ function compute280(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute281(x: int64, y: int64) -> int64 {
+fn compute281(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -5127,7 +5127,7 @@ function compute281(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute282(x: int64, y: int64) -> int64 {
+fn compute282(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -5143,7 +5143,7 @@ function compute282(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute283(x: int64, y: int64) -> int64 {
+fn compute283(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -5159,7 +5159,7 @@ function compute283(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute284(x: int64, y: int64) -> int64 {
+fn compute284(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -5175,7 +5175,7 @@ function compute284(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute285(x: int64, y: int64) -> int64 {
+fn compute285(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -5191,7 +5191,7 @@ function compute285(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute286(x: int64, y: int64) -> int64 {
+fn compute286(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -5207,7 +5207,7 @@ function compute286(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute287(x: int64, y: int64) -> int64 {
+fn compute287(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -5223,7 +5223,7 @@ function compute287(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute288(x: int64, y: int64) -> int64 {
+fn compute288(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -5239,7 +5239,7 @@ function compute288(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute289(x: int64, y: int64) -> int64 {
+fn compute289(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -5255,7 +5255,7 @@ function compute289(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute290(x: int64, y: int64) -> int64 {
+fn compute290(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -5271,7 +5271,7 @@ function compute290(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute291(x: int64, y: int64) -> int64 {
+fn compute291(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -5287,7 +5287,7 @@ function compute291(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute292(x: int64, y: int64) -> int64 {
+fn compute292(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -5303,7 +5303,7 @@ function compute292(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute293(x: int64, y: int64) -> int64 {
+fn compute293(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -5319,7 +5319,7 @@ function compute293(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute294(x: int64, y: int64) -> int64 {
+fn compute294(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -5335,7 +5335,7 @@ function compute294(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute295(x: int64, y: int64) -> int64 {
+fn compute295(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -5351,7 +5351,7 @@ function compute295(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute296(x: int64, y: int64) -> int64 {
+fn compute296(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -5367,7 +5367,7 @@ function compute296(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute297(x: int64, y: int64) -> int64 {
+fn compute297(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -5383,7 +5383,7 @@ function compute297(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute298(x: int64, y: int64) -> int64 {
+fn compute298(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -5399,7 +5399,7 @@ function compute298(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute299(x: int64, y: int64) -> int64 {
+fn compute299(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -5415,7 +5415,7 @@ function compute299(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute300(x: int64, y: int64) -> int64 {
+fn compute300(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -5431,7 +5431,7 @@ function compute300(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute301(x: int64, y: int64) -> int64 {
+fn compute301(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -5447,7 +5447,7 @@ function compute301(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute302(x: int64, y: int64) -> int64 {
+fn compute302(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -5463,7 +5463,7 @@ function compute302(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute303(x: int64, y: int64) -> int64 {
+fn compute303(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -5479,7 +5479,7 @@ function compute303(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute304(x: int64, y: int64) -> int64 {
+fn compute304(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -5495,7 +5495,7 @@ function compute304(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute305(x: int64, y: int64) -> int64 {
+fn compute305(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -5511,7 +5511,7 @@ function compute305(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute306(x: int64, y: int64) -> int64 {
+fn compute306(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -5527,7 +5527,7 @@ function compute306(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute307(x: int64, y: int64) -> int64 {
+fn compute307(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -5543,7 +5543,7 @@ function compute307(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute308(x: int64, y: int64) -> int64 {
+fn compute308(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -5559,7 +5559,7 @@ function compute308(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute309(x: int64, y: int64) -> int64 {
+fn compute309(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -5575,7 +5575,7 @@ function compute309(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute310(x: int64, y: int64) -> int64 {
+fn compute310(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -5591,7 +5591,7 @@ function compute310(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute311(x: int64, y: int64) -> int64 {
+fn compute311(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -5607,7 +5607,7 @@ function compute311(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute312(x: int64, y: int64) -> int64 {
+fn compute312(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -5623,7 +5623,7 @@ function compute312(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute313(x: int64, y: int64) -> int64 {
+fn compute313(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -5639,7 +5639,7 @@ function compute313(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute314(x: int64, y: int64) -> int64 {
+fn compute314(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -5655,7 +5655,7 @@ function compute314(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute315(x: int64, y: int64) -> int64 {
+fn compute315(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -5671,7 +5671,7 @@ function compute315(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute316(x: int64, y: int64) -> int64 {
+fn compute316(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -5687,7 +5687,7 @@ function compute316(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute317(x: int64, y: int64) -> int64 {
+fn compute317(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -5703,7 +5703,7 @@ function compute317(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute318(x: int64, y: int64) -> int64 {
+fn compute318(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -5719,7 +5719,7 @@ function compute318(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute319(x: int64, y: int64) -> int64 {
+fn compute319(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -5735,7 +5735,7 @@ function compute319(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute320(x: int64, y: int64) -> int64 {
+fn compute320(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -5751,7 +5751,7 @@ function compute320(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute321(x: int64, y: int64) -> int64 {
+fn compute321(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -5767,7 +5767,7 @@ function compute321(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute322(x: int64, y: int64) -> int64 {
+fn compute322(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -5783,7 +5783,7 @@ function compute322(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute323(x: int64, y: int64) -> int64 {
+fn compute323(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -5799,7 +5799,7 @@ function compute323(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute324(x: int64, y: int64) -> int64 {
+fn compute324(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -5815,7 +5815,7 @@ function compute324(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute325(x: int64, y: int64) -> int64 {
+fn compute325(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -5831,7 +5831,7 @@ function compute325(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute326(x: int64, y: int64) -> int64 {
+fn compute326(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -5847,7 +5847,7 @@ function compute326(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute327(x: int64, y: int64) -> int64 {
+fn compute327(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -5863,7 +5863,7 @@ function compute327(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute328(x: int64, y: int64) -> int64 {
+fn compute328(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -5879,7 +5879,7 @@ function compute328(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute329(x: int64, y: int64) -> int64 {
+fn compute329(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -5895,7 +5895,7 @@ function compute329(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute330(x: int64, y: int64) -> int64 {
+fn compute330(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -5911,7 +5911,7 @@ function compute330(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute331(x: int64, y: int64) -> int64 {
+fn compute331(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -5927,7 +5927,7 @@ function compute331(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute332(x: int64, y: int64) -> int64 {
+fn compute332(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -5943,7 +5943,7 @@ function compute332(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute333(x: int64, y: int64) -> int64 {
+fn compute333(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -5959,7 +5959,7 @@ function compute333(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute334(x: int64, y: int64) -> int64 {
+fn compute334(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -5975,7 +5975,7 @@ function compute334(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute335(x: int64, y: int64) -> int64 {
+fn compute335(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -5991,7 +5991,7 @@ function compute335(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute336(x: int64, y: int64) -> int64 {
+fn compute336(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -6007,7 +6007,7 @@ function compute336(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute337(x: int64, y: int64) -> int64 {
+fn compute337(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -6023,7 +6023,7 @@ function compute337(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute338(x: int64, y: int64) -> int64 {
+fn compute338(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -6039,7 +6039,7 @@ function compute338(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute339(x: int64, y: int64) -> int64 {
+fn compute339(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -6055,7 +6055,7 @@ function compute339(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute340(x: int64, y: int64) -> int64 {
+fn compute340(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -6071,7 +6071,7 @@ function compute340(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute341(x: int64, y: int64) -> int64 {
+fn compute341(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -6087,7 +6087,7 @@ function compute341(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute342(x: int64, y: int64) -> int64 {
+fn compute342(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -6103,7 +6103,7 @@ function compute342(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute343(x: int64, y: int64) -> int64 {
+fn compute343(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -6119,7 +6119,7 @@ function compute343(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute344(x: int64, y: int64) -> int64 {
+fn compute344(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -6135,7 +6135,7 @@ function compute344(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute345(x: int64, y: int64) -> int64 {
+fn compute345(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -6151,7 +6151,7 @@ function compute345(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute346(x: int64, y: int64) -> int64 {
+fn compute346(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -6167,7 +6167,7 @@ function compute346(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute347(x: int64, y: int64) -> int64 {
+fn compute347(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -6183,7 +6183,7 @@ function compute347(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute348(x: int64, y: int64) -> int64 {
+fn compute348(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -6199,7 +6199,7 @@ function compute348(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute349(x: int64, y: int64) -> int64 {
+fn compute349(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -6215,7 +6215,7 @@ function compute349(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute350(x: int64, y: int64) -> int64 {
+fn compute350(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -6231,7 +6231,7 @@ function compute350(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute351(x: int64, y: int64) -> int64 {
+fn compute351(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -6247,7 +6247,7 @@ function compute351(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute352(x: int64, y: int64) -> int64 {
+fn compute352(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -6263,7 +6263,7 @@ function compute352(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute353(x: int64, y: int64) -> int64 {
+fn compute353(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -6279,7 +6279,7 @@ function compute353(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute354(x: int64, y: int64) -> int64 {
+fn compute354(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -6295,7 +6295,7 @@ function compute354(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute355(x: int64, y: int64) -> int64 {
+fn compute355(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -6311,7 +6311,7 @@ function compute355(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute356(x: int64, y: int64) -> int64 {
+fn compute356(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -6327,7 +6327,7 @@ function compute356(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute357(x: int64, y: int64) -> int64 {
+fn compute357(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -6343,7 +6343,7 @@ function compute357(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute358(x: int64, y: int64) -> int64 {
+fn compute358(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -6359,7 +6359,7 @@ function compute358(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute359(x: int64, y: int64) -> int64 {
+fn compute359(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -6375,7 +6375,7 @@ function compute359(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute360(x: int64, y: int64) -> int64 {
+fn compute360(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -6391,7 +6391,7 @@ function compute360(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute361(x: int64, y: int64) -> int64 {
+fn compute361(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -6407,7 +6407,7 @@ function compute361(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute362(x: int64, y: int64) -> int64 {
+fn compute362(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -6423,7 +6423,7 @@ function compute362(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute363(x: int64, y: int64) -> int64 {
+fn compute363(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -6439,7 +6439,7 @@ function compute363(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute364(x: int64, y: int64) -> int64 {
+fn compute364(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -6455,7 +6455,7 @@ function compute364(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute365(x: int64, y: int64) -> int64 {
+fn compute365(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -6471,7 +6471,7 @@ function compute365(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute366(x: int64, y: int64) -> int64 {
+fn compute366(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -6487,7 +6487,7 @@ function compute366(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute367(x: int64, y: int64) -> int64 {
+fn compute367(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -6503,7 +6503,7 @@ function compute367(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute368(x: int64, y: int64) -> int64 {
+fn compute368(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -6519,7 +6519,7 @@ function compute368(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute369(x: int64, y: int64) -> int64 {
+fn compute369(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -6535,7 +6535,7 @@ function compute369(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute370(x: int64, y: int64) -> int64 {
+fn compute370(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -6551,7 +6551,7 @@ function compute370(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute371(x: int64, y: int64) -> int64 {
+fn compute371(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -6567,7 +6567,7 @@ function compute371(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute372(x: int64, y: int64) -> int64 {
+fn compute372(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -6583,7 +6583,7 @@ function compute372(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute373(x: int64, y: int64) -> int64 {
+fn compute373(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -6599,7 +6599,7 @@ function compute373(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute374(x: int64, y: int64) -> int64 {
+fn compute374(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -6615,7 +6615,7 @@ function compute374(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute375(x: int64, y: int64) -> int64 {
+fn compute375(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -6631,7 +6631,7 @@ function compute375(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute376(x: int64, y: int64) -> int64 {
+fn compute376(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -6647,7 +6647,7 @@ function compute376(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute377(x: int64, y: int64) -> int64 {
+fn compute377(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -6663,7 +6663,7 @@ function compute377(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute378(x: int64, y: int64) -> int64 {
+fn compute378(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -6679,7 +6679,7 @@ function compute378(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute379(x: int64, y: int64) -> int64 {
+fn compute379(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -6695,7 +6695,7 @@ function compute379(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute380(x: int64, y: int64) -> int64 {
+fn compute380(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -6711,7 +6711,7 @@ function compute380(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute381(x: int64, y: int64) -> int64 {
+fn compute381(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -6727,7 +6727,7 @@ function compute381(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute382(x: int64, y: int64) -> int64 {
+fn compute382(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -6743,7 +6743,7 @@ function compute382(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute383(x: int64, y: int64) -> int64 {
+fn compute383(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -6759,7 +6759,7 @@ function compute383(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute384(x: int64, y: int64) -> int64 {
+fn compute384(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -6775,7 +6775,7 @@ function compute384(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute385(x: int64, y: int64) -> int64 {
+fn compute385(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -6791,7 +6791,7 @@ function compute385(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute386(x: int64, y: int64) -> int64 {
+fn compute386(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -6807,7 +6807,7 @@ function compute386(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute387(x: int64, y: int64) -> int64 {
+fn compute387(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -6823,7 +6823,7 @@ function compute387(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute388(x: int64, y: int64) -> int64 {
+fn compute388(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -6839,7 +6839,7 @@ function compute388(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute389(x: int64, y: int64) -> int64 {
+fn compute389(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -6855,7 +6855,7 @@ function compute389(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute390(x: int64, y: int64) -> int64 {
+fn compute390(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -6871,7 +6871,7 @@ function compute390(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute391(x: int64, y: int64) -> int64 {
+fn compute391(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -6887,7 +6887,7 @@ function compute391(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute392(x: int64, y: int64) -> int64 {
+fn compute392(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -6903,7 +6903,7 @@ function compute392(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute393(x: int64, y: int64) -> int64 {
+fn compute393(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -6919,7 +6919,7 @@ function compute393(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute394(x: int64, y: int64) -> int64 {
+fn compute394(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -6935,7 +6935,7 @@ function compute394(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute395(x: int64, y: int64) -> int64 {
+fn compute395(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -6951,7 +6951,7 @@ function compute395(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute396(x: int64, y: int64) -> int64 {
+fn compute396(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -6967,7 +6967,7 @@ function compute396(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute397(x: int64, y: int64) -> int64 {
+fn compute397(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -6983,7 +6983,7 @@ function compute397(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute398(x: int64, y: int64) -> int64 {
+fn compute398(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -6999,7 +6999,7 @@ function compute398(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute399(x: int64, y: int64) -> int64 {
+fn compute399(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -7015,7 +7015,7 @@ function compute399(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute400(x: int64, y: int64) -> int64 {
+fn compute400(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -7031,7 +7031,7 @@ function compute400(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute401(x: int64, y: int64) -> int64 {
+fn compute401(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -7047,7 +7047,7 @@ function compute401(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute402(x: int64, y: int64) -> int64 {
+fn compute402(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -7063,7 +7063,7 @@ function compute402(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute403(x: int64, y: int64) -> int64 {
+fn compute403(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -7079,7 +7079,7 @@ function compute403(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute404(x: int64, y: int64) -> int64 {
+fn compute404(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -7095,7 +7095,7 @@ function compute404(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute405(x: int64, y: int64) -> int64 {
+fn compute405(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -7111,7 +7111,7 @@ function compute405(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute406(x: int64, y: int64) -> int64 {
+fn compute406(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -7127,7 +7127,7 @@ function compute406(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute407(x: int64, y: int64) -> int64 {
+fn compute407(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -7143,7 +7143,7 @@ function compute407(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute408(x: int64, y: int64) -> int64 {
+fn compute408(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -7159,7 +7159,7 @@ function compute408(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute409(x: int64, y: int64) -> int64 {
+fn compute409(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -7175,7 +7175,7 @@ function compute409(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute410(x: int64, y: int64) -> int64 {
+fn compute410(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -7191,7 +7191,7 @@ function compute410(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute411(x: int64, y: int64) -> int64 {
+fn compute411(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -7207,7 +7207,7 @@ function compute411(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute412(x: int64, y: int64) -> int64 {
+fn compute412(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -7223,7 +7223,7 @@ function compute412(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute413(x: int64, y: int64) -> int64 {
+fn compute413(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -7239,7 +7239,7 @@ function compute413(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute414(x: int64, y: int64) -> int64 {
+fn compute414(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -7255,7 +7255,7 @@ function compute414(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute415(x: int64, y: int64) -> int64 {
+fn compute415(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -7271,7 +7271,7 @@ function compute415(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute416(x: int64, y: int64) -> int64 {
+fn compute416(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -7287,7 +7287,7 @@ function compute416(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute417(x: int64, y: int64) -> int64 {
+fn compute417(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -7303,7 +7303,7 @@ function compute417(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute418(x: int64, y: int64) -> int64 {
+fn compute418(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -7319,7 +7319,7 @@ function compute418(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute419(x: int64, y: int64) -> int64 {
+fn compute419(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -7335,7 +7335,7 @@ function compute419(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute420(x: int64, y: int64) -> int64 {
+fn compute420(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -7351,7 +7351,7 @@ function compute420(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute421(x: int64, y: int64) -> int64 {
+fn compute421(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -7367,7 +7367,7 @@ function compute421(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute422(x: int64, y: int64) -> int64 {
+fn compute422(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -7383,7 +7383,7 @@ function compute422(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute423(x: int64, y: int64) -> int64 {
+fn compute423(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -7399,7 +7399,7 @@ function compute423(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute424(x: int64, y: int64) -> int64 {
+fn compute424(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -7415,7 +7415,7 @@ function compute424(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute425(x: int64, y: int64) -> int64 {
+fn compute425(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -7431,7 +7431,7 @@ function compute425(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute426(x: int64, y: int64) -> int64 {
+fn compute426(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -7447,7 +7447,7 @@ function compute426(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute427(x: int64, y: int64) -> int64 {
+fn compute427(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -7463,7 +7463,7 @@ function compute427(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute428(x: int64, y: int64) -> int64 {
+fn compute428(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -7479,7 +7479,7 @@ function compute428(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute429(x: int64, y: int64) -> int64 {
+fn compute429(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -7495,7 +7495,7 @@ function compute429(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute430(x: int64, y: int64) -> int64 {
+fn compute430(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -7511,7 +7511,7 @@ function compute430(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute431(x: int64, y: int64) -> int64 {
+fn compute431(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -7527,7 +7527,7 @@ function compute431(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute432(x: int64, y: int64) -> int64 {
+fn compute432(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -7543,7 +7543,7 @@ function compute432(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute433(x: int64, y: int64) -> int64 {
+fn compute433(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -7559,7 +7559,7 @@ function compute433(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute434(x: int64, y: int64) -> int64 {
+fn compute434(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -7575,7 +7575,7 @@ function compute434(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute435(x: int64, y: int64) -> int64 {
+fn compute435(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -7591,7 +7591,7 @@ function compute435(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute436(x: int64, y: int64) -> int64 {
+fn compute436(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -7607,7 +7607,7 @@ function compute436(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute437(x: int64, y: int64) -> int64 {
+fn compute437(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -7623,7 +7623,7 @@ function compute437(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute438(x: int64, y: int64) -> int64 {
+fn compute438(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -7639,7 +7639,7 @@ function compute438(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute439(x: int64, y: int64) -> int64 {
+fn compute439(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -7655,7 +7655,7 @@ function compute439(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute440(x: int64, y: int64) -> int64 {
+fn compute440(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -7671,7 +7671,7 @@ function compute440(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute441(x: int64, y: int64) -> int64 {
+fn compute441(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -7687,7 +7687,7 @@ function compute441(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute442(x: int64, y: int64) -> int64 {
+fn compute442(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -7703,7 +7703,7 @@ function compute442(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute443(x: int64, y: int64) -> int64 {
+fn compute443(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -7719,7 +7719,7 @@ function compute443(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute444(x: int64, y: int64) -> int64 {
+fn compute444(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -7735,7 +7735,7 @@ function compute444(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute445(x: int64, y: int64) -> int64 {
+fn compute445(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -7751,7 +7751,7 @@ function compute445(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute446(x: int64, y: int64) -> int64 {
+fn compute446(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -7767,7 +7767,7 @@ function compute446(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute447(x: int64, y: int64) -> int64 {
+fn compute447(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -7783,7 +7783,7 @@ function compute447(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute448(x: int64, y: int64) -> int64 {
+fn compute448(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -7799,7 +7799,7 @@ function compute448(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute449(x: int64, y: int64) -> int64 {
+fn compute449(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -7815,7 +7815,7 @@ function compute449(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute450(x: int64, y: int64) -> int64 {
+fn compute450(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -7831,7 +7831,7 @@ function compute450(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute451(x: int64, y: int64) -> int64 {
+fn compute451(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -7847,7 +7847,7 @@ function compute451(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute452(x: int64, y: int64) -> int64 {
+fn compute452(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -7863,7 +7863,7 @@ function compute452(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute453(x: int64, y: int64) -> int64 {
+fn compute453(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -7879,7 +7879,7 @@ function compute453(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute454(x: int64, y: int64) -> int64 {
+fn compute454(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -7895,7 +7895,7 @@ function compute454(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute455(x: int64, y: int64) -> int64 {
+fn compute455(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -7911,7 +7911,7 @@ function compute455(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute456(x: int64, y: int64) -> int64 {
+fn compute456(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -7927,7 +7927,7 @@ function compute456(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute457(x: int64, y: int64) -> int64 {
+fn compute457(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -7943,7 +7943,7 @@ function compute457(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute458(x: int64, y: int64) -> int64 {
+fn compute458(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -7959,7 +7959,7 @@ function compute458(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute459(x: int64, y: int64) -> int64 {
+fn compute459(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -7975,7 +7975,7 @@ function compute459(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute460(x: int64, y: int64) -> int64 {
+fn compute460(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -7991,7 +7991,7 @@ function compute460(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute461(x: int64, y: int64) -> int64 {
+fn compute461(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -8007,7 +8007,7 @@ function compute461(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute462(x: int64, y: int64) -> int64 {
+fn compute462(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -8023,7 +8023,7 @@ function compute462(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute463(x: int64, y: int64) -> int64 {
+fn compute463(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -8039,7 +8039,7 @@ function compute463(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute464(x: int64, y: int64) -> int64 {
+fn compute464(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -8055,7 +8055,7 @@ function compute464(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute465(x: int64, y: int64) -> int64 {
+fn compute465(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -8071,7 +8071,7 @@ function compute465(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute466(x: int64, y: int64) -> int64 {
+fn compute466(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -8087,7 +8087,7 @@ function compute466(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute467(x: int64, y: int64) -> int64 {
+fn compute467(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -8103,7 +8103,7 @@ function compute467(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute468(x: int64, y: int64) -> int64 {
+fn compute468(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -8119,7 +8119,7 @@ function compute468(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute469(x: int64, y: int64) -> int64 {
+fn compute469(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -8135,7 +8135,7 @@ function compute469(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute470(x: int64, y: int64) -> int64 {
+fn compute470(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -8151,7 +8151,7 @@ function compute470(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute471(x: int64, y: int64) -> int64 {
+fn compute471(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -8167,7 +8167,7 @@ function compute471(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute472(x: int64, y: int64) -> int64 {
+fn compute472(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -8183,7 +8183,7 @@ function compute472(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute473(x: int64, y: int64) -> int64 {
+fn compute473(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -8199,7 +8199,7 @@ function compute473(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute474(x: int64, y: int64) -> int64 {
+fn compute474(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -8215,7 +8215,7 @@ function compute474(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute475(x: int64, y: int64) -> int64 {
+fn compute475(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -8231,7 +8231,7 @@ function compute475(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute476(x: int64, y: int64) -> int64 {
+fn compute476(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -8247,7 +8247,7 @@ function compute476(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute477(x: int64, y: int64) -> int64 {
+fn compute477(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -8263,7 +8263,7 @@ function compute477(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute478(x: int64, y: int64) -> int64 {
+fn compute478(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -8279,7 +8279,7 @@ function compute478(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute479(x: int64, y: int64) -> int64 {
+fn compute479(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -8295,7 +8295,7 @@ function compute479(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute480(x: int64, y: int64) -> int64 {
+fn compute480(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -8311,7 +8311,7 @@ function compute480(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute481(x: int64, y: int64) -> int64 {
+fn compute481(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -8327,7 +8327,7 @@ function compute481(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute482(x: int64, y: int64) -> int64 {
+fn compute482(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -8343,7 +8343,7 @@ function compute482(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute483(x: int64, y: int64) -> int64 {
+fn compute483(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -8359,7 +8359,7 @@ function compute483(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute484(x: int64, y: int64) -> int64 {
+fn compute484(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -8375,7 +8375,7 @@ function compute484(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute485(x: int64, y: int64) -> int64 {
+fn compute485(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -8391,7 +8391,7 @@ function compute485(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute486(x: int64, y: int64) -> int64 {
+fn compute486(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -8407,7 +8407,7 @@ function compute486(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute487(x: int64, y: int64) -> int64 {
+fn compute487(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -8423,7 +8423,7 @@ function compute487(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute488(x: int64, y: int64) -> int64 {
+fn compute488(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -8439,7 +8439,7 @@ function compute488(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute489(x: int64, y: int64) -> int64 {
+fn compute489(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -8455,7 +8455,7 @@ function compute489(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute490(x: int64, y: int64) -> int64 {
+fn compute490(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -8471,7 +8471,7 @@ function compute490(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute491(x: int64, y: int64) -> int64 {
+fn compute491(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -8487,7 +8487,7 @@ function compute491(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute492(x: int64, y: int64) -> int64 {
+fn compute492(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -8503,7 +8503,7 @@ function compute492(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute493(x: int64, y: int64) -> int64 {
+fn compute493(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -8519,7 +8519,7 @@ function compute493(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute494(x: int64, y: int64) -> int64 {
+fn compute494(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -8535,7 +8535,7 @@ function compute494(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute495(x: int64, y: int64) -> int64 {
+fn compute495(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -8551,7 +8551,7 @@ function compute495(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute496(x: int64, y: int64) -> int64 {
+fn compute496(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -8567,7 +8567,7 @@ function compute496(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute497(x: int64, y: int64) -> int64 {
+fn compute497(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -8583,7 +8583,7 @@ function compute497(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute498(x: int64, y: int64) -> int64 {
+fn compute498(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -8599,7 +8599,7 @@ function compute498(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute499(x: int64, y: int64) -> int64 {
+fn compute499(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -8615,7 +8615,7 @@ function compute499(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute500(x: int64, y: int64) -> int64 {
+fn compute500(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -8631,7 +8631,7 @@ function compute500(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute501(x: int64, y: int64) -> int64 {
+fn compute501(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -8647,7 +8647,7 @@ function compute501(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute502(x: int64, y: int64) -> int64 {
+fn compute502(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -8663,7 +8663,7 @@ function compute502(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute503(x: int64, y: int64) -> int64 {
+fn compute503(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -8679,7 +8679,7 @@ function compute503(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute504(x: int64, y: int64) -> int64 {
+fn compute504(x: int64, y: int64) -> int64 {
   var v: S8;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -8695,7 +8695,7 @@ function compute504(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute505(x: int64, y: int64) -> int64 {
+fn compute505(x: int64, y: int64) -> int64 {
   var v: S9;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -8711,7 +8711,7 @@ function compute505(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute506(x: int64, y: int64) -> int64 {
+fn compute506(x: int64, y: int64) -> int64 {
   var v: S10;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -8727,7 +8727,7 @@ function compute506(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute507(x: int64, y: int64) -> int64 {
+fn compute507(x: int64, y: int64) -> int64 {
   var v: S11;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -8743,7 +8743,7 @@ function compute507(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute508(x: int64, y: int64) -> int64 {
+fn compute508(x: int64, y: int64) -> int64 {
   var v: S12;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -8759,7 +8759,7 @@ function compute508(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute509(x: int64, y: int64) -> int64 {
+fn compute509(x: int64, y: int64) -> int64 {
   var v: S13;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -8775,7 +8775,7 @@ function compute509(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute510(x: int64, y: int64) -> int64 {
+fn compute510(x: int64, y: int64) -> int64 {
   var v: S14;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -8791,7 +8791,7 @@ function compute510(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute511(x: int64, y: int64) -> int64 {
+fn compute511(x: int64, y: int64) -> int64 {
   var v: S15;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -8807,7 +8807,7 @@ function compute511(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute512(x: int64, y: int64) -> int64 {
+fn compute512(x: int64, y: int64) -> int64 {
   var v: S0;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -8823,7 +8823,7 @@ function compute512(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute513(x: int64, y: int64) -> int64 {
+fn compute513(x: int64, y: int64) -> int64 {
   var v: S1;
   v.a = x + y;
   v.b = x * (int64)3;
@@ -8839,7 +8839,7 @@ function compute513(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute514(x: int64, y: int64) -> int64 {
+fn compute514(x: int64, y: int64) -> int64 {
   var v: S2;
   v.a = x + y;
   v.b = x * (int64)4;
@@ -8855,7 +8855,7 @@ function compute514(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute515(x: int64, y: int64) -> int64 {
+fn compute515(x: int64, y: int64) -> int64 {
   var v: S3;
   v.a = x + y;
   v.b = x * (int64)5;
@@ -8871,7 +8871,7 @@ function compute515(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute516(x: int64, y: int64) -> int64 {
+fn compute516(x: int64, y: int64) -> int64 {
   var v: S4;
   v.a = x + y;
   v.b = x * (int64)6;
@@ -8887,7 +8887,7 @@ function compute516(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute517(x: int64, y: int64) -> int64 {
+fn compute517(x: int64, y: int64) -> int64 {
   var v: S5;
   v.a = x + y;
   v.b = x * (int64)7;
@@ -8903,7 +8903,7 @@ function compute517(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute518(x: int64, y: int64) -> int64 {
+fn compute518(x: int64, y: int64) -> int64 {
   var v: S6;
   v.a = x + y;
   v.b = x * (int64)1;
@@ -8919,7 +8919,7 @@ function compute518(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function compute519(x: int64, y: int64) -> int64 {
+fn compute519(x: int64, y: int64) -> int64 {
   var v: S7;
   v.a = x + y;
   v.b = x * (int64)2;
@@ -8935,7 +8935,7 @@ function compute519(x: int64, y: int64) -> int64 {
   return acc + v.a + v.b + v.c;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var total: int64 = (int64)0;
   total = total + compute0((int64)0, (int64)0);
   total = total + compute1((int64)1, (int64)1);

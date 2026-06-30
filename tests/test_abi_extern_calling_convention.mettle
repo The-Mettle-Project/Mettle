@@ -1,6 +1,6 @@
 // ABI: extern call uses same convention — RCX for first arg, RAX for return
-extern function ext_check(x: int32) -> int32 = "ext_check";
+extern fn ext_check(x: int32) -> int32 = "ext_check";
 
-function main() -> int32 {
+fn main() -> int32 {
   return ext_check(123);
 }

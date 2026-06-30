@@ -29,7 +29,7 @@ import "std/mem";
 // ---- deterministic byte source (LCG) -------------------------------------
 var rng_state: int64 = 1;
 
-function next_byte() -> int32 {
+fn next_byte() -> int32 {
   rng_state = (rng_state * 1103515245 + 12345) & 2147483647;
   return (int32)((rng_state >> 16) & 255);
 }
@@ -37,7 +37,7 @@ function next_byte() -> int32 {
 // ---- the vectorized kernel: int8 x int8 -> int32 dot ---------------------
 // This exact shape (int32 accumulator, byte loads, unit stride) is recognized
 // and lowered to the AVX2 vpmaddwd int8 dot kernel under --release.
-function qdot(a: int8*, b: int8*, n: int64) -> int32 {
+fn qdot(a: int8*, b: int8*, n: int64) -> int32 {
   var sum: int32 = 0;
   var i: int64 = 0;
   while (i < n) {
@@ -48,7 +48,7 @@ function qdot(a: int8*, b: int8*, n: int64) -> int32 {
 }
 
 // Sum of unsigned bytes (the per-vector zero-point correction term).
-function bsum(a: int8*, n: int64) -> int32 {
+fn bsum(a: int8*, n: int64) -> int32 {
   var sum: int32 = 0;
   var i: int64 = 0;
   while (i < n) {
@@ -61,7 +61,7 @@ function bsum(a: int8*, n: int64) -> int32 {
 // ---- a fully-connected layer: out[j] = real-dot(x, W[j]) + bias[j] -------
 // W is row-major, out_n rows of in_n int8 weights each. Outputs are int32
 // "real" logits (zero-point already removed).
-function linear(inp: int8*, in_n: int64, w: int8*, bias: int32*, out_n: int64,
+fn linear(inp: int8*, in_n: int64, w: int8*, bias: int32*, out_n: int64,
                 out: int32*) {
   var asum: int32 = bsum(inp, in_n);
   var corr_a: int32 = 128 * asum;
@@ -78,7 +78,7 @@ function linear(inp: int8*, in_n: int64, w: int8*, bias: int32*, out_n: int64,
 
 // ReLU + requantize int32 logits back to unsigned int8 (zero-point 128) so the
 // next layer's input is in the same domain. `shift` rescales the accumulator.
-function requantize_relu(logits: int32*, n: int64, shift: int32, out_q: int8*) {
+fn requantize_relu(logits: int32*, n: int64, shift: int32, out_q: int8*) {
   var i: int64 = 0;
   while (i < n) {
     var v: int32 = logits[i];
@@ -92,7 +92,7 @@ function requantize_relu(logits: int32*, n: int64, shift: int32, out_q: int8*) {
 
 // Index of the largest logit (the predicted class). Softmax is unnecessary --
 // it is monotonic, so it does not change the argmax.
-function argmax(logits: int32*, n: int64) -> int32 {
+fn argmax(logits: int32*, n: int64) -> int32 {
   var best: int32 = 0;
   var bestv: int32 = logits[0];
   var i: int64 = 1;
@@ -106,7 +106,7 @@ function argmax(logits: int32*, n: int64) -> int32 {
   return best;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var IN: int64 = 16;
   var H: int64 = 8;
   var OUT: int64 = 4;

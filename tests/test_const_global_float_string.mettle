@@ -3,7 +3,7 @@
 // typed local so codegen must emit and link it as a global. Returns 42.
 const RATE = 1.5;
 const LABEL = "ok";
-function main() -> int32 {
+fn main() -> int32 {
   var s: string = LABEL;
   return (int32)(RATE * 28.0);
 }

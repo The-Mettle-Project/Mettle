@@ -12,7 +12,7 @@ import "std/bench";
 
 const N = 65536;
 
-function sum_f32(a: float32*, n: int32) -> float32 {
+fn sum_f32(a: float32*, n: int32) -> float32 {
   var s: float32 = 0.0;
   var i: int32 = 0;
   while (i < n) {
@@ -22,7 +22,7 @@ function sum_f32(a: float32*, n: int32) -> float32 {
   return s;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var a: float32* = (float32*)malloc((int64)N * 4);
   var i: int32 = 0;
   while (i < N) {

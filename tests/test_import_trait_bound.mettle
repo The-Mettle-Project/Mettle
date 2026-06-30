@@ -1,9 +1,9 @@
 import "traits_math" as math;
 
-function add_one<T: math.Addable>(value: T) -> T where T: math.SignedNumber {
+fn add_one<T: math.Addable>(value: T) -> T where T: math.SignedNumber {
     return value + 1;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     return add_one<int32>(41);
 }

@@ -8,7 +8,7 @@ enum DbExecResult {
     Err(int32)
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     var x: DbExecResult = Ok(1);
     return 0;
 }

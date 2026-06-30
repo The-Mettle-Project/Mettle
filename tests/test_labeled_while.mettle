@@ -1,4 +1,4 @@
-function main() -> int32 {
+fn main() -> int32 {
   var i: int32 = 0;
   var j: int32 = 0;
   outer: while (i < 10) {

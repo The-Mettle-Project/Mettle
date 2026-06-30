@@ -180,7 +180,7 @@ Omit either object when the corresponding symbols are not referenced.
 
 For concurrency, import `std/thread` (Windows) or `std/thread_posix` and call `CreateThread`/`pthread_create` directly — Mettle no longer has built-in `async`/`spawn`/`Channel<T>` keywords.
 
-**Programs with `main(argc, argv)`:** If your entry point has the signature `function main(argc: int32, argv: cstring*) -> int32`, Windows startup calls CRT `__getmainargs` before `main`. No Mettle argv shim is required.
+**Programs with `main(argc, argv)`:** If your entry point has the signature `fn main(argc: int32, argv: cstring*) -> int32`, Windows startup calls CRT `__getmainargs` before `main`. No Mettle argv shim is required.
 
 ## Compiler Diagnostics
 

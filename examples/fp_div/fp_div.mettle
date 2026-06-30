@@ -12,7 +12,7 @@ import "std/bench";
 
 const N = 20000000;
 
-function div_chain() -> float64 {
+fn div_chain() -> float64 {
   var acc: float64 = 1000000.0;
   var i: int32 = 1;
   while (i <= N) {
@@ -23,7 +23,7 @@ function div_chain() -> float64 {
   return acc;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var passes: int32 = 20;
   println("float64 serial divide chain, 20M iters x 20 passes");
 

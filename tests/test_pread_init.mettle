@@ -6,7 +6,7 @@ import "db_io";
 import "std/mem";
 import "std/io";
 
-export function load_slot(db: Db*) -> int32 {
+export fn load_slot(db: Db*) -> int32 {
   var idx: int32 = 0;
   var n: int64 = db_pread(db[0].data_fp, &db[0].cache[idx].data[0], 4096, 0);
   if (n <= 0) {
@@ -15,7 +15,7 @@ export function load_slot(db: Db*) -> int32 {
   return 0;
 }
 
-export function main(argc: int32, argv: cstring*) -> int32 {
+export fn main(argc: int32, argv: cstring*) -> int32 {
   if (argc < 2) { return 1; }
   var db: Db* = new Db;
   db[0].data_fp = db_open_file(argv[1], 1);

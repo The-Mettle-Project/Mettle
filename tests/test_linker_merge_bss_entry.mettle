@@ -1,5 +1,5 @@
 extern var shared_zero_ref: int64 = "shared_zero";
 
-function mainCRTStartup() -> int32 {
+fn mainCRTStartup() -> int32 {
   return 0;
 }

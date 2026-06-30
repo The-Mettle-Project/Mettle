@@ -3,13 +3,13 @@ import "std/mem";
 
 var G: uint8* = (uint8*)0;
 
-function rdf(off: int64, n: int64, dst: int32*) {
+fn rdf(off: int64, n: int64, dst: int32*) {
   var s: int32* = (int32*)(&G[off]);
   var i: int64 = 0; while (i < n) { dst[i] = s[i]; i = i + 1; }
 }
 
 // a big function with lots of locals to create register pressure / inlining
-function work(off: int64, dst: int32*) {
+fn work(off: int64, dst: int32*) {
   var a: int64 = 1; var b: int64 = 2; var c: int64 = 3; var d: int64 = 4;
   var e: int64 = 5; var f: int64 = 6; var g: int64 = 7; var h: int64 = 8;
   rdf(off, 3840, dst);
@@ -21,7 +21,7 @@ function work(off: int64, dst: int32*) {
   println(cstr(""));
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var sz: int64 = 6000000000;
   G = malloc(sz);
   if (G == 0) { println(cstr("malloc failed")); return 1; }

@@ -1,9 +1,9 @@
 // ABI: integer return value in RAX/EAX
-function get42() -> int32 {
+fn get42() -> int32 {
   return 42;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var x: int32 = get42();
   if (x == 42) {
     return 1;

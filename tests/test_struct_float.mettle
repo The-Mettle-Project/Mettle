@@ -48,37 +48,37 @@ struct MixedProbe {
   hz: float64;
 }
 
-function write_s(s: cstring) {
+fn write_s(s: cstring) {
   if (s != 0) {
     fputs(s, get_stdout());
   }
 }
 
-function write_i64(v: int64) {
+fn write_i64(v: int64) {
   var buf: uint8[32];
   int_to_dec((cstring)((int64)(&(buf[0]))), v);
   write_s((cstring)((int64)(&(buf[0]))));
 }
 
-function line_i64(label: cstring, v: int64) {
+fn line_i64(label: cstring, v: int64) {
   write_s(label);
   write_s(cstr(" "));
   write_i64(v);
   write_s(cstr("\n"));
 }
 
-function line_i32(label: cstring, v: int32) {
+fn line_i32(label: cstring, v: int32) {
   line_i64(label, (int64)v);
 }
 
-function scaled(v: float64, scale: float64) -> int64 {
+fn scaled(v: float64, scale: float64) -> int64 {
   if (v < 0.0) {
     return 0 - (int64)((0.0 - v) * scale);
   }
   return (int64)(v * scale);
 }
 
-function int_scaled_bounds(lx: float64, lz: float64, hx: float64, hz: float64) -> int32 {
+fn int_scaled_bounds(lx: float64, lz: float64, hx: float64, hz: float64) -> int32 {
   var lxi: int64 = scaled(lx, 1000000.0);
   var lzi: int64 = scaled(lz, 1000000.0);
   var hxi: int64 = scaled(hx, 1000000.0);
@@ -90,7 +90,7 @@ function int_scaled_bounds(lx: float64, lz: float64, hx: float64, hz: float64) -
   return 1;
 }
 
-function float_bounds(lx: float64, lz: float64, hx: float64, hz: float64) -> int32 {
+fn float_bounds(lx: float64, lz: float64, hx: float64, hz: float64) -> int32 {
   if (lx < 0.0 - hx) { return 0; }
   if (lx > hx) { return 0; }
   if (lz < 0.0 - hz) { return 0; }
@@ -98,14 +98,14 @@ function float_bounds(lx: float64, lz: float64, hx: float64, hz: float64) -> int
   return 1;
 }
 
-function fill_float_quad(p: FloatQuad*) {
+fn fill_float_quad(p: FloatQuad*) {
   p->lx = -3348.0;
   p->lz = -9738.0;
   p->hx = 22000.0;
   p->hz = 22000.0;
 }
 
-function fill_engine_style(p: EngineStyleProbe*) {
+fn fill_engine_style(p: EngineStyleProbe*) {
   p->lx = -3348.0;
   p->lz = -9738.0;
   p->hx = 22000.0;
@@ -114,7 +114,7 @@ function fill_engine_style(p: EngineStyleProbe*) {
   p->flags = 99;
 }
 
-function fill_mixed(p: MixedProbe*) {
+fn fill_mixed(p: MixedProbe*) {
   p->id = 17;
   p->lx = -3348.0;
   p->flags = 99;
@@ -124,7 +124,7 @@ function fill_mixed(p: MixedProbe*) {
   p->hz = 22000.0;
 }
 
-function probe_float_quad(prefix: cstring, p: FloatQuad*) {
+fn probe_float_quad(prefix: cstring, p: FloatQuad*) {
   write_s(prefix);
   write_s(cstr("\n"));
   line_i64(cstr("  lx_mm"), scaled(p->lx, 1000.0));
@@ -135,7 +135,7 @@ function probe_float_quad(prefix: cstring, p: FloatQuad*) {
   line_i32(cstr("  int_scaled_bounds"), int_scaled_bounds(p->lx, p->lz, p->hx, p->hz));
 }
 
-function probe_engine_style(prefix: cstring, p: EngineStyleProbe*) {
+fn probe_engine_style(prefix: cstring, p: EngineStyleProbe*) {
   write_s(prefix);
   write_s(cstr("\n"));
   line_i32(cstr("  id"), p->id);
@@ -148,7 +148,7 @@ function probe_engine_style(prefix: cstring, p: EngineStyleProbe*) {
   line_i32(cstr("  int_scaled_bounds"), int_scaled_bounds(p->lx, p->lz, p->hx, p->hz));
 }
 
-function probe_mixed(prefix: cstring, p: MixedProbe*) {
+fn probe_mixed(prefix: cstring, p: MixedProbe*) {
   write_s(prefix);
   write_s(cstr("\n"));
   line_i32(cstr("  id"), p->id);
@@ -162,7 +162,7 @@ function probe_mixed(prefix: cstring, p: MixedProbe*) {
   line_i32(cstr("  int_scaled_bounds"), int_scaled_bounds(p->lx, p->lz, p->hx, p->hz));
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   write_s(cstr("struct float repro\n"));
 
   var fq: FloatQuad;

@@ -128,7 +128,7 @@ class Gen:
         name = f"h{len(self.helpers)}"
         npar = self.rng.randint(1, 3)
         params = ", ".join(f"p{i}: int64" for i in range(npar))
-        self.lines.append(f"function {name}({params}) -> int64 {{")
+        self.lines.append(f"fn {name}({params}) -> int64 {{")
         self.indent = 1
         self.live = [f"p{i}" for i in range(npar)]
         self.vc = 0
@@ -144,7 +144,7 @@ class Gen:
     def gen(self):
         for _ in range(self.rng.randint(0, 1)):
             self.gen_helper()
-        self.lines.append("function main() -> int64 {")
+        self.lines.append("fn main() -> int64 {")
         self.indent = 1
         self.live = []
         self.vc = 0

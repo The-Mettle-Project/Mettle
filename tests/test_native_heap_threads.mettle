@@ -9,7 +9,7 @@ import "std/mem";
 import "std/alloc";
 import "std/thread";
 
-function worker(arg: cstring) -> uint32 {
+fn worker(arg: cstring) -> uint32 {
   var i: int64 = 0;
   while (i < (int64)5000) {
     var sz: int64 = ((i * (int64)13) % (int64)2000) + (int64)1;
@@ -24,7 +24,7 @@ function worker(arg: cstring) -> uint32 {
   return 0;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var tid: uint32 = 0;
   var h1: int64 = CreateThread(0, (uint64)0, &worker, 0, (uint32)0, &tid);
   var h2: int64 = CreateThread(0, (uint64)0, &worker, 0, (uint32)0, &tid);

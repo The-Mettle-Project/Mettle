@@ -43,30 +43,30 @@ run_case() {
 }
 
 cat > "$W/loop.mettle" <<'EOF'
-function compute(n: int32) -> int32 {
+fn compute(n: int32) -> int32 {
   var acc: int32 = 0; var i: int32 = 0;
   while (i < n) { acc = acc + i; i = i + 1; }
   return acc;
 }
-function main() -> int32 { return compute(10); }
+fn main() -> int32 { return compute(10); }
 EOF
 run_case loop 0 45
 
 cat > "$W/argc.mettle" <<'EOF'
-function main(argc: int32, argv: int8**) -> int32 { return argc; }
+fn main(argc: int32, argv: int8**) -> int32 { return argc; }
 EOF
 run_case argc 1 4 a b c
 
 # >6 args (SysV register overflow to stack) and a recursive call.
 cat > "$W/many.mettle" <<'EOF'
-function sum8(a: int64, b: int64, c: int64, d: int64, e: int64, f: int64, g: int64, h: int64) -> int64 {
+fn sum8(a: int64, b: int64, c: int64, d: int64, e: int64, f: int64, g: int64, h: int64) -> int64 {
   return a + b + c + d + e + f + g + h;
 }
-function fib(n: int32) -> int32 {
+fn fib(n: int32) -> int32 {
   if (n < 2) { return n; }
   return fib(n - 1) + fib(n - 2);
 }
-function main() -> int32 {
+fn main() -> int32 {
   return (int32)sum8(1, 2, 3, 4, 5, 6, 7, 8) + fib(10);
 }
 EOF

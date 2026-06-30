@@ -1,6 +1,6 @@
 import "std/io"
 
-function main() -> int32 {
+fn main() -> int32 {
     var content: string = import_str "test_import_str_data.txt"
     println(cstr(content))
     return 0

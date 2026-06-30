@@ -123,7 +123,7 @@ class Gen:
         self.depth = 0
         params = ", ".join(f"p{i}: int64" for i in range(npar))
         self.live = [f"p{i}" for i in range(npar)]
-        head = f"@noinline function f({params}) -> int64 {{"
+        head = f"@noinline fn f({params}) -> int64 {{"
         for _ in range(self.rng.randint(5, 14)):
             self.stmt(3, 0)
         ret = self.rng.choice(self.live)
@@ -132,7 +132,7 @@ class Gen:
         self.emit(f"return ({ret}) & {MASK};")
         body = "\n".join(self.lines)
         callargs = ", ".join(str(self.rng.randint(1, 200)) for _ in range(npar))
-        main = (f"function main() -> int64 {{\n  return f({callargs}) & 255;\n}}")
+        main = (f"fn main() -> int64 {{\n  return f({callargs}) & 255;\n}}")
         return f"// seed={self.seed} (gen_fn v2 diverse)\n{head}\n{body}\n}}\n\n{main}\n"
 
 

@@ -3,9 +3,9 @@
 // Regression pin: at -O that null-check branch must NOT be counted as control
 // flow (it was, before the runtime-check-label exclusion). The reason must be
 // the generic "shape is not vectorizable", not "control flow".
-function strided(a: int32*, n: int32) -> int64 {
+fn strided(a: int32*, n: int32) -> int64 {
   var s: int64 = 0;
   @simd! for i in 0..n { s = s + (int64)a[i * 2]; }
   return s;
 }
-function main() -> int32 { return 0; }
+fn main() -> int32 { return 0; }

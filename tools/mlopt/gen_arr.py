@@ -74,10 +74,10 @@ class Gen:
         self.d -= 1
         self.emit("}")
         body = "\n".join("  " + x for x in self.L)
-        head = f"@noinline function f({params}) -> int64 {{"
+        head = f"@noinline fn f({params}) -> int64 {{"
         # main passes literal strings so it type-checks / compiles
         callargs = ", ".join('"abcdefgh"' for _ in arrs)
-        main = (f"function main() -> int64 {{\n  return f({callargs}) & 255;\n}}")
+        main = (f"fn main() -> int64 {{\n  return f({callargs}) & 255;\n}}")
         return (f"// seed={self.seed} (gen_arr scan/load)\n{head}\n{body}\n"
                 f"  return (acc) & {MASK};\n}}\n\n{main}\n")
 

@@ -4,6 +4,6 @@ export enum Color {
   Blue = 2
 }
 
-export function color_value(c: Color) -> int32 {
+export fn color_value(c: Color) -> int32 {
   return 1;
 }

@@ -24,38 +24,38 @@ struct Big3 {
   c: int32;
 }
 
-function write_s(s: cstring) {
+fn write_s(s: cstring) {
   if (s != 0) {
     fputs(s, get_stdout());
   }
 }
 
-function write_i64(v: int64) {
+fn write_i64(v: int64) {
   var buf: uint8[32];
   int_to_dec((cstring)((int64)(&(buf[0]))), v);
   write_s((cstring)((int64)(&(buf[0]))));
 }
 
-function line_i64(label: cstring, v: int64) {
+fn line_i64(label: cstring, v: int64) {
   write_s(label);
   write_s(cstr(" "));
   write_i64(v);
   write_s(cstr("\n"));
 }
 
-function small4_value(s: Small4) -> int32 {
+fn small4_value(s: Small4) -> int32 {
   return s.a;
 }
 
-function small8_sum(s: Small8) -> int32 {
+fn small8_sum(s: Small8) -> int32 {
   return s.a + s.b;
 }
 
-function odd3_sum(o: Odd3) -> int32 {
+fn odd3_sum(o: Odd3) -> int32 {
   return (int32)o.a + (int32)o.b + (int32)o.c;
 }
 
-function make_odd3(a: uint8, b: uint8, c: uint8) -> Odd3 {
+fn make_odd3(a: uint8, b: uint8, c: uint8) -> Odd3 {
   var o: Odd3;
   o.a = a;
   o.b = b;
@@ -63,7 +63,7 @@ function make_odd3(a: uint8, b: uint8, c: uint8) -> Odd3 {
   return o;
 }
 
-function make_big(a: int32, b: int32, c: int32) -> Big3 {
+fn make_big(a: int32, b: int32, c: int32) -> Big3 {
   var v: Big3;
   v.a = a;
   v.b = b;
@@ -71,19 +71,19 @@ function make_big(a: int32, b: int32, c: int32) -> Big3 {
   return v;
 }
 
-function consume_big(v: Big3) -> int32 {
+fn consume_big(v: Big3) -> int32 {
   return v.a + v.b + v.c;
 }
 
-function value_receiver_total(v: Big3) -> int32 {
+fn value_receiver_total(v: Big3) -> int32 {
   return v.a + v.b + v.c;
 }
 
-function nested_big_sum() -> int32 {
+fn nested_big_sum() -> int32 {
   return consume_big(make_big(7, 8, 9)) + consume_big(make_big(1, 2, 3));
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   write_s(cstr("struct abi matrix\n"));
 
   var s4: Small4;

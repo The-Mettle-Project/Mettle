@@ -1,15 +1,15 @@
-function read_u32_le(b: uint8*, off: int32) -> uint32 {
+fn read_u32_le(b: uint8*, off: int32) -> uint32 {
   return (uint32)b[off] | ((uint32)b[off + 1] << 8) | ((uint32)b[off + 2] << 16) | ((uint32)b[off + 3] << 24);
 }
 
-function write_u32_le(b: uint8*, off: int32, v: uint32) {
+fn write_u32_le(b: uint8*, off: int32, v: uint32) {
   b[off] = (uint8)(v & 255);
   b[off + 1] = (uint8)((v >> 8) & 255);
   b[off + 2] = (uint8)((v >> 16) & 255);
   b[off + 3] = (uint8)((v >> 24) & 255);
 }
 
-function page_checksum(data: cstring, size: int32) -> uint32 {
+fn page_checksum(data: cstring, size: int32) -> uint32 {
   var hash: uint32 = 2166136261;
   var i: int32 = 0;
   while (i < size) {
@@ -20,7 +20,7 @@ function page_checksum(data: cstring, size: int32) -> uint32 {
   return hash;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var buf: uint8[4096];
   var i: int32 = 0;
   while (i < 4096) {

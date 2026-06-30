@@ -1,13 +1,13 @@
-function cold_path() -> int32 {
+fn cold_path() -> int32 {
   return 9;
 }
 
-function unsigned_load_cast_chain(buf: cstring) -> int64 {
+fn unsigned_load_cast_chain(buf: cstring) -> int64 {
   var b: int64 = (int64)(uint8)buf[0];
   return b;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var folded: int32 = 6 * 7;
   var result: int32 = folded;
   var same: int32 = result;

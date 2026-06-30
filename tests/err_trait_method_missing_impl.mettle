@@ -1,9 +1,9 @@
 trait Incrementable {
-    function next_value(self: Self) -> Self;
+    fn next_value(self: Self) -> Self;
 }
 
 impl Incrementable for int32;
 
-function main() -> int32 {
+fn main() -> int32 {
     return 0;
 }

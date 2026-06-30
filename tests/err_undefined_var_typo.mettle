@@ -1,6 +1,6 @@
 // A typo'd reference to a variable that IS in scope.
 // The compiler should suggest the intended name via edit-distance matching.
-function main() -> int32 {
+fn main() -> int32 {
   var counter: int32 = 41;
   return countr + 1;
 }

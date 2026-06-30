@@ -1,5 +1,5 @@
-function bad(p: int32*) -> int32;
+fn bad(p: int32*) -> int32;
 
-function bad(p: int32**) -> int32 {
+fn bad(p: int32**) -> int32 {
   return 0;
 }

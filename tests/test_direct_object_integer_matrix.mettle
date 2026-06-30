@@ -1,8 +1,8 @@
-function fold8(a: int32, b: int32, c: int32, d: int32, e: int32, f: int32, g: int32, h: int32) -> int32 {
+fn fold8(a: int32, b: int32, c: int32, d: int32, e: int32, f: int32, g: int32, h: int32) -> int32 {
   return a + b + c + d + e + f + g + h;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var divv: int32 = 43 / 6;
   if (divv != 7) { return 1; }
 

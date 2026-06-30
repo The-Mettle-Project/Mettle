@@ -1,4 +1,4 @@
-function main() -> int32 {
+fn main() -> int32 {
     // Basic modulo
     var a : int32 = 10 % 3;
     if (a != 1) { return 1; }

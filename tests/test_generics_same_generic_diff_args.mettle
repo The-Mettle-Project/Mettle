@@ -2,7 +2,7 @@ struct Box<T> {
     value: T;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     var box_int: Box<int32>;
     var box_long: Box<int64>;
 

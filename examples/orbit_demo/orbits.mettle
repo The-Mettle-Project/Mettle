@@ -54,29 +54,29 @@ var CENTER_MASS: float64  = 16000.0;
 var TAU: float64          = 6.28318530718;
 
 // --- C runtime + GDI bindings the stdlib doesn't already expose --------------
-extern function c_sqrt(x: float64) -> float64 = "sqrt";
-extern function c_sin(x: float64) -> float64  = "sin";
-extern function c_cos(x: float64) -> float64  = "cos";
-extern function c_sprintf(buf: cstring, fmt: cstring, a: int64, b: int64, c: int64, d: int64) -> int32 = "sprintf";
+extern fn c_sqrt(x: float64) -> float64 = "sqrt";
+extern fn c_sin(x: float64) -> float64  = "sin";
+extern fn c_cos(x: float64) -> float64  = "cos";
+extern fn c_sprintf(buf: cstring, fmt: cstring, a: int64, b: int64, c: int64, d: int64) -> int32 = "sprintf";
 
-extern function Gdi_CreateCompatibleDC(hdc: int64) -> int64 = "CreateCompatibleDC";
-extern function Gdi_CreateCompatibleBitmap(hdc: int64, w: int32, h: int32) -> int64 = "CreateCompatibleBitmap";
-extern function Gdi_BitBlt(dst: int64, x: int32, y: int32, w: int32, h: int32, src: int64, sx: int32, sy: int32, rop: uint32) -> int32 = "BitBlt";
-extern function Gdi_DeleteDC(hdc: int64) -> int32 = "DeleteDC";
+extern fn Gdi_CreateCompatibleDC(hdc: int64) -> int64 = "CreateCompatibleDC";
+extern fn Gdi_CreateCompatibleBitmap(hdc: int64, w: int32, h: int32) -> int64 = "CreateCompatibleBitmap";
+extern fn Gdi_BitBlt(dst: int64, x: int32, y: int32, w: int32, h: int32, src: int64, sx: int32, sy: int32, rop: uint32) -> int32 = "BitBlt";
+extern fn Gdi_DeleteDC(hdc: int64) -> int32 = "DeleteDC";
 
 // winmm: raise the system timer resolution to 1ms so a short WM_TIMER period is
 // actually honored. Without this, Windows rounds timers up to the ~15.6ms
 // scheduler tick, which caps the sim near 40 fps regardless of how cheap a
 // frame is.
-extern function Win_timeBeginPeriod(ms: uint32) -> uint32 = "timeBeginPeriod";
-extern function Win_timeEndPeriod(ms: uint32) -> uint32   = "timeEndPeriod";
+extern fn Win_timeBeginPeriod(ms: uint32) -> uint32 = "timeBeginPeriod";
+extern fn Win_timeEndPeriod(ms: uint32) -> uint32   = "timeEndPeriod";
 
 // kernel32 Sleep: yield the rest of a frame's budget so the idle loop paces
 // itself to the target rate without pinning a CPU core (timeBeginPeriod(1)
 // makes the 1ms granularity accurate).
-extern function Win_Sleep(ms: uint32) = "Sleep";
+extern fn Win_Sleep(ms: uint32) = "Sleep";
 
-function SRCCOPY() -> uint32 { return 0x00CC0020; }
+fn SRCCOPY() -> uint32 { return 0x00CC0020; }
 
 // --- Data --------------------------------------------------------------------
 struct Particle {
@@ -135,7 +135,7 @@ var fps_last_frame: int32 = 0;
 var stats_buf: cstring = 0;
 
 // --- Small helpers -----------------------------------------------------------
-function alloc_all() {
+fn alloc_all() {
   particles  = (Particle*)malloc((int64)300 * sizeof(Particle));
   wells      = (Well*)malloc((int64)32 * sizeof(Well));
   palette    = (int64*)malloc((int64)64 * 8);
@@ -146,21 +146,21 @@ function alloc_all() {
   stats_buf  = malloc(256);
 }
 
-function randf() -> float64 {
+fn randf() -> float64 {
   return (float64)(rand() & 0x7FFF) / 32768.0;
 }
 
-function rand_range(lo: int32, hi: int32) -> int32 {
+fn rand_range(lo: int32, hi: int32) -> int32 {
   if (hi <= lo) { return lo; }
   return lo + (int32)(randf() * (float64)(hi - lo));
 }
 
-function lerpf(a: float64, b: float64, t: float64) -> float64 {
+fn lerpf(a: float64, b: float64, t: float64) -> float64 {
   return a + (b - a) * t;
 }
 
 // Map t in [0,1] to a dark->blue->magenta->orange->white "ember" gradient.
-function grad_color(t: float64) -> uint32 {
+fn grad_color(t: float64) -> uint32 {
   var r: float64 = 0.0;
   var g: float64 = 0.0;
   var b: float64 = 0.0;
@@ -183,7 +183,7 @@ function grad_color(t: float64) -> uint32 {
   return ui_rgb((uint32)r, (uint32)g, (uint32)b);
 }
 
-function build_palette() {
+fn build_palette() {
   var i: int32 = 0;
   while (i < PAL) {
     var t: float64 = (float64)i / (float64)(PAL - 1);
@@ -192,7 +192,7 @@ function build_palette() {
   }
 }
 
-function build_assets() {
+fn build_assets() {
   star_brush[0] = Ui_CreateSolidBrush(ui_rgb(38, 44, 70));
   star_brush[1] = Ui_CreateSolidBrush(ui_rgb(72, 82, 116));
   star_brush[2] = Ui_CreateSolidBrush(ui_rgb(124, 138, 178));
@@ -203,7 +203,7 @@ function build_assets() {
   hud_font      = ui_create_font(17, cstr("Consolas"), UI_FW_NORMAL());
 }
 
-function build_stars() {
+fn build_stars() {
   var i: int32 = 0;
   while (i < NUM_STARS) {
     star_x[i] = rand_range(0, view_w);
@@ -213,7 +213,7 @@ function build_stars() {
   }
 }
 
-function set_trail(pp: Particle*) {
+fn set_trail(pp: Particle*) {
   var k: int32 = 0;
   while (k < TRAIL) {
     pp->tx[k] = pp->x;
@@ -223,7 +223,7 @@ function set_trail(pp: Particle*) {
 }
 
 // Lay particles out as a rotating accretion disk around the screen center.
-function reset_particles() {
+fn reset_particles() {
   var cx: float64 = (float64)view_w * 0.5;
   var cy: float64 = (float64)view_h * 0.5;
   var i: int32 = 0;
@@ -241,7 +241,7 @@ function reset_particles() {
   }
 }
 
-function add_well(x: float64, y: float64, strength: float64) {
+fn add_well(x: float64, y: float64, strength: float64) {
   if (well_count >= MAX_WELLS) { return; }
   wells[well_count].x = x;
   wells[well_count].y = y;
@@ -249,7 +249,7 @@ function add_well(x: float64, y: float64, strength: float64) {
   well_count = well_count + 1;
 }
 
-function speed_index(pp: Particle*) -> int32 {
+fn speed_index(pp: Particle*) -> int32 {
   var sp: float64 = c_sqrt(pp->vx * pp->vx + pp->vy * pp->vy);
   var t: float64 = sp / SPEED_CAP;
   if (t > 1.0) { t = 1.0; }
@@ -260,7 +260,7 @@ function speed_index(pp: Particle*) -> int32 {
 }
 
 // --- Simulation step ---------------------------------------------------------
-function update_physics() {
+fn update_physics() {
   var fw: float64 = (float64)view_w;
   var fh: float64 = (float64)view_h;
   var i: int32 = 0;
@@ -318,12 +318,12 @@ function update_physics() {
 }
 
 // --- Rendering ---------------------------------------------------------------
-function fill_dot(hdc: int64, cx: int32, cy: int32, half: int32, brush: int64) {
+fn fill_dot(hdc: int64, cx: int32, cy: int32, half: int32, brush: int64) {
   var r: UiRect = ui_make_rect(cx - half, cy - half, cx + half + 1, cy + half + 1);
   Ui_FillRect(hdc, &r, brush);
 }
 
-function draw_well(hdc: int64, w: int32) {
+fn draw_well(hdc: int64, w: int32) {
   var x: int32 = (int32)wells[w].x;
   var y: int32 = (int32)wells[w].y;
 
@@ -344,7 +344,7 @@ function draw_well(hdc: int64, w: int32) {
   ui_draw_ellipse_outline(hdc, &halo, ring, 2);
 }
 
-function draw_hud(hdc: int64) {
+fn draw_hud(hdc: int64) {
   var oldf: int64 = Ui_SelectObject(hdc, title_font);
   ui_draw_text_transparent(hdc, 24, 16, cstr("Mettle Orbits"), ui_rgb(150, 205, 255));
 
@@ -368,7 +368,7 @@ function draw_hud(hdc: int64) {
 }
 
 // Free the cached back buffer (on resize or shutdown).
-function free_back_buffer() {
+fn free_back_buffer() {
   if (back_dc != 0) {
     Ui_SelectObject(back_dc, back_old);
     Ui_DeleteObject(back_bmp);
@@ -382,7 +382,7 @@ function free_back_buffer() {
 }
 
 // Return a memory DC sized w x h, reusing the cached one when the size matches.
-function get_back_buffer(hdc: int64, w: int32, h: int32) -> int64 {
+fn get_back_buffer(hdc: int64, w: int32, h: int32) -> int64 {
   if (back_dc != 0 && back_w == w && back_h == h) {
     return back_dc;
   }
@@ -397,7 +397,7 @@ function get_back_buffer(hdc: int64, w: int32, h: int32) -> int64 {
 
 // Draw one full frame into the back buffer and blit it to the given window DC.
 // Shared by the WM_PAINT handler (BeginPaint DC) and the idle loop (GetDC).
-function render_to(hdc: int64, w: int32, h: int32) {
+fn render_to(hdc: int64, w: int32, h: int32) {
   // Reuse the off-screen back buffer across frames; rebuilt only on resize.
   var mem: int64 = get_back_buffer(hdc, w, h);
 
@@ -442,7 +442,7 @@ function render_to(hdc: int64, w: int32, h: int32) {
 
 // Idle-loop frame: paint straight to the window DC (no BeginPaint, which is
 // only valid while handling WM_PAINT).
-function render_frame(hwnd: int64) {
+fn render_frame(hwnd: int64) {
   var hdc: int64 = Ui_GetDC(hwnd);
   render_to(hdc, view_w, view_h);
   Ui_ReleaseDC(hwnd, hdc);
@@ -450,14 +450,14 @@ function render_frame(hwnd: int64) {
 
 // WM_PAINT frame: satisfy the OS paint request (resize/expose) and validate
 // the region via EndPaint.
-function render(hwnd: int64) {
+fn render(hwnd: int64) {
   var ps: UiPaintStruct;
   var hdc: int64 = Ui_BeginPaint(hwnd, &ps);
   render_to(hdc, view_w, view_h);
   Ui_EndPaint(hwnd, &ps);
 }
 
-function tick_fps() {
+fn tick_fps() {
   frame_count = frame_count + 1;
   var now: uint64 = win32_tick_count64();
   var elapsed: uint64 = now - fps_last_tick;
@@ -469,7 +469,7 @@ function tick_fps() {
 }
 
 // --- Window procedure (passed to std/ui as a function pointer) ---------------
-function window_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 {
+fn window_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 {
   if (msg == UI_WM_ERASEBKGND()) {
     return 1;   // we paint the whole client area ourselves
   }
@@ -508,7 +508,7 @@ function window_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> 
   return ui_def_window_proc(hwnd, msg, wparam, lparam);
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   println("Mettle Orbits - native gravity sandbox");
   println("  Left-click: attractor   Right-click: repeller");
   println("  Space: pause   R: reset   C: clear wells   Esc: quit");

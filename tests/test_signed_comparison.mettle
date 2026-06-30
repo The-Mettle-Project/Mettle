@@ -1,5 +1,5 @@
 // Signed comparison: -1 < 0, -1 > -2, -32768 < 32767
-function main() -> int32 {
+fn main() -> int32 {
   var a: int32 = -1;
   var b: int32 = 0;
   var c: int32 = -2;

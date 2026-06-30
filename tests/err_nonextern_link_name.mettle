@@ -1,5 +1,5 @@
-function local_alias() -> int32 = "puts";
+fn local_alias() -> int32 = "puts";
 
-function main() -> int32 {
+fn main() -> int32 {
   return 0;
 }

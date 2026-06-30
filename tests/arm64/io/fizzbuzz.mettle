@@ -1,5 +1,5 @@
 import "std/io";
-function main() -> int32 {
+fn main() -> int32 {
   var i: int64 = 1;
   while (i <= 15) {
     if (i % 15 == 0) {

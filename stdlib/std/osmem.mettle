@@ -9,21 +9,21 @@
 // mmap/munmap, so `import "std/osmem"` works unchanged on both platforms.
 
 // ─── Win32 virtual-memory bindings ──────────────────────────────────────────
-export extern function VirtualAlloc(addr: cstring, size: int64, alloc_type: uint32, protect: uint32) -> cstring = "VirtualAlloc";
-export extern function VirtualFree(addr: cstring, size: int64, free_type: uint32) -> int32 = "VirtualFree";
-export extern function VirtualProtect(addr: cstring, size: int64, new_protect: uint32, old_protect: uint32*) -> int32 = "VirtualProtect";
+export extern fn VirtualAlloc(addr: cstring, size: int64, alloc_type: uint32, protect: uint32) -> cstring = "VirtualAlloc";
+export extern fn VirtualFree(addr: cstring, size: int64, free_type: uint32) -> int32 = "VirtualFree";
+export extern fn VirtualProtect(addr: cstring, size: int64, new_protect: uint32, old_protect: uint32*) -> int32 = "VirtualProtect";
 
 // ─── Public API ─────────────────────────────────────────────────────────────
 
 // Allocation granularity / page size. Windows commits in 4 KiB pages.
-export function os_page_size() -> int64 {
+export fn os_page_size() -> int64 {
   return (int64)4096;
 }
 
 // Reserve and commit `n` bytes of zero-filled, read/write memory directly from
 // the OS. The result is page-aligned. Returns 0 on failure. The caller passes
 // the size back to os_mem_unmap, though Windows ignores it (see below).
-export function os_mem_map(n: int64) -> cstring {
+export fn os_mem_map(n: int64) -> cstring {
   if (n <= (int64)0) {
     return 0;
   }
@@ -35,7 +35,7 @@ export function os_mem_map(n: int64) -> cstring {
 // frees the entire original reservation, so `n` is required to be 0 and the
 // region size is unused here; it is part of the signature for parity with the
 // Linux (munmap) variant, which needs the length.
-export function os_mem_unmap(p: cstring, n: int64) {
+export fn os_mem_unmap(p: cstring, n: int64) {
   if (p == 0) {
     return;
   }
@@ -47,7 +47,7 @@ export function os_mem_unmap(p: cstring, n: int64) {
 // reserved. Any later read or write of it faults immediately; the allocator
 // uses this to turn use-after-free of page-backed blocks into an instant,
 // classifiable crash.
-export function os_mem_protect_noaccess(p: cstring, n: int64) {
+export fn os_mem_protect_noaccess(p: cstring, n: int64) {
   if (p == 0 || n <= (int64)0) {
     return;
   }

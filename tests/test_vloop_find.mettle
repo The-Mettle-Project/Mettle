@@ -7,22 +7,22 @@
 // the sub-block tail, at index 0, and absent. @simd! pins the for-range form
 // at build time. Returns the number of failures (0 = all correct).
 
-function find_eq(a: int32*, n: int32, k: int32) -> int32 {
+fn find_eq(a: int32*, n: int32, k: int32) -> int32 {
   var i: int32 = 0;
   while (i < n) { if (a[i] == k) { return i; } i = i + 1; }
   return -1;
 }
-function find_eq_for(a: int32*, n: int32, k: int32) -> int32 {
+fn find_eq_for(a: int32*, n: int32, k: int32) -> int32 {
   var r: int32 = -1;
   @simd! for i in 0..n { if (a[i] == k) { r = i; break; } }
   return r;
 }
-function find_gt(a: int32*, n: int32, k: int32) -> int32 {
+fn find_gt(a: int32*, n: int32, k: int32) -> int32 {
   var i: int32 = 0;
   while (i < n) { if (a[i] > k) { return i; } i = i + 1; }
   return -1;
 }
-function find_lt_break(a: int32*, n: int32, k: int32) -> int32 {
+fn find_lt_break(a: int32*, n: int32, k: int32) -> int32 {
   var i: int32 = 0;
   var found: int32 = -1;
   while (i < n) {
@@ -31,48 +31,48 @@ function find_lt_break(a: int32*, n: int32, k: int32) -> int32 {
   }
   return found;
 }
-function find_ge(a: int32*, n: int32, k: int32) -> int32 {
+fn find_ge(a: int32*, n: int32, k: int32) -> int32 {
   var i: int32 = 0;
   while (i < n) { if (a[i] >= k) { return i; } i = i + 1; }
   return -1;
 }
-function find_le(a: int32*, n: int32, k: int32) -> int32 {
+fn find_le(a: int32*, n: int32, k: int32) -> int32 {
   var i: int32 = 0;
   while (i < n) { if (a[i] <= k) { return i; } i = i + 1; }
   return -1;
 }
-function find_ne(a: int32*, n: int32, k: int32) -> int32 {
+fn find_ne(a: int32*, n: int32, k: int32) -> int32 {
   var i: int32 = 0;
   while (i < n) { if (a[i] != k) { return i; } i = i + 1; }
   return -1;
 }
 // Form B: textbook scan-while; returns n when no hit
-function scan_ne(a: int32*, n: int32, k: int32) -> int32 {
+fn scan_ne(a: int32*, n: int32, k: int32) -> int32 {
   var i: int32 = 0;
   while (i < n && a[i] != k) { i = i + 1; }
   return i;
 }
 // two-array mismatch (memcmp shape)
-function mismatch(a: int32*, b: int32*, n: int32) -> int32 {
+fn mismatch(a: int32*, b: int32*, n: int32) -> int32 {
   var i: int32 = 0;
   while (i < n) { if (a[i] != b[i]) { return i; } i = i + 1; }
   return n;
 }
 // byte find (memchr shape) with a runtime scalar key
-function memchr_b(s: uint8*, n: int32, c: int32) -> int32 {
+fn memchr_b(s: uint8*, n: int32, c: int32) -> int32 {
   var key: uint8 = (uint8)c;
   var i: int32 = 0;
   while (i < n) { if (s[i] == key) { return i; } i = i + 1; }
   return -1;
 }
 // byte Form B over a bounded buffer (strlen shape; folded `!= 0` condition)
-function strlen_b(s: uint8*, n: int32) -> int32 {
+fn strlen_b(s: uint8*, n: int32) -> int32 {
   var i: int32 = 0;
   while (i < n && s[i] != 0) { i = i + 1; }
   return i;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var n: int32 = 1003; // odd size: head + aligned blocks + tail all exercised
   var a: int32[1003];
   var b: int32[1003];

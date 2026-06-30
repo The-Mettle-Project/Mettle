@@ -11,7 +11,7 @@
 // Thread entry: pass a function pointer fn(cstring) -> cstring. The function
 // receives the arg and returns a value (use 0 for void). Example:
 //
-//   function thread_proc(arg: cstring) -> cstring {
+//   fn thread_proc(arg: cstring) -> cstring {
 //     thread_gc_attach_posix();
 //     // ... handle arg ...
 //     thread_gc_detach_posix();
@@ -32,61 +32,61 @@
 // ─── Thread lifecycle ────────────────────────────────────────────────────────
 // pthread_create(thread*, attr*, start_routine*, arg*) -> int (0 = success)
 // start_routine: fn(cstring) -> cstring (pthread expects void* (*)(void*))
-export extern function pthread_create(thread: int64*, attr: cstring, start_routine: fn(cstring) -> cstring, arg: cstring) -> int32 = "pthread_create";
+export extern fn pthread_create(thread: int64*, attr: cstring, start_routine: fn(cstring) -> cstring, arg: cstring) -> int32 = "pthread_create";
 
 // pthread_join(thread, retval*) -> int (0 = success)
 // Pass 0 for retval when the return value is not needed.
-export extern function pthread_join(thread: int64, retval: cstring) -> int32 = "pthread_join";
+export extern fn pthread_join(thread: int64, retval: cstring) -> int32 = "pthread_join";
 
 // pthread_detach(thread) -> int (0 = success)
-export extern function pthread_detach(thread: int64) -> int32 = "pthread_detach";
+export extern fn pthread_detach(thread: int64) -> int32 = "pthread_detach";
 
 // pthread_self() -> pthread_t (current thread handle)
-export extern function pthread_self() -> int64 = "pthread_self";
+export extern fn pthread_self() -> int64 = "pthread_self";
 
 // pthread_exit(retval*) – terminate the calling thread
-export extern function pthread_exit(retval: cstring) = "pthread_exit";
+export extern fn pthread_exit(retval: cstring) = "pthread_exit";
 
 // ─── Mutex ───────────────────────────────────────────────────────────────────
 // pthread_mutex_init(mutex*, attr*) -> int (0 = success)
-export extern function pthread_mutex_init(mutex: cstring, attr: cstring) -> int32 = "pthread_mutex_init";
+export extern fn pthread_mutex_init(mutex: cstring, attr: cstring) -> int32 = "pthread_mutex_init";
 
 // pthread_mutex_destroy(mutex*) -> int (0 = success)
-export extern function pthread_mutex_destroy(mutex: cstring) -> int32 = "pthread_mutex_destroy";
+export extern fn pthread_mutex_destroy(mutex: cstring) -> int32 = "pthread_mutex_destroy";
 
 // pthread_mutex_lock(mutex*) -> int (0 = success)
-export extern function pthread_mutex_lock(mutex: cstring) -> int32 = "pthread_mutex_lock";
+export extern fn pthread_mutex_lock(mutex: cstring) -> int32 = "pthread_mutex_lock";
 
 // pthread_mutex_trylock(mutex*) -> int (0 = acquired, EBUSY = not acquired)
-export extern function pthread_mutex_trylock(mutex: cstring) -> int32 = "pthread_mutex_trylock";
+export extern fn pthread_mutex_trylock(mutex: cstring) -> int32 = "pthread_mutex_trylock";
 
 // pthread_mutex_unlock(mutex*) -> int (0 = success)
-export extern function pthread_mutex_unlock(mutex: cstring) -> int32 = "pthread_mutex_unlock";
+export extern fn pthread_mutex_unlock(mutex: cstring) -> int32 = "pthread_mutex_unlock";
 
 // ─── Condition variable ──────────────────────────────────────────────────────
 // pthread_cond_init(cond*, attr*) -> int
-export extern function pthread_cond_init(cond: cstring, attr: cstring) -> int32 = "pthread_cond_init";
+export extern fn pthread_cond_init(cond: cstring, attr: cstring) -> int32 = "pthread_cond_init";
 
 // pthread_cond_destroy(cond*) -> int
-export extern function pthread_cond_destroy(cond: cstring) -> int32 = "pthread_cond_destroy";
+export extern fn pthread_cond_destroy(cond: cstring) -> int32 = "pthread_cond_destroy";
 
 // pthread_cond_wait(cond*, mutex*) -> int
-export extern function pthread_cond_wait(cond: cstring, mutex: cstring) -> int32 = "pthread_cond_wait";
+export extern fn pthread_cond_wait(cond: cstring, mutex: cstring) -> int32 = "pthread_cond_wait";
 
 // pthread_cond_signal(cond*) -> int  (wake one waiter)
-export extern function pthread_cond_signal(cond: cstring) -> int32 = "pthread_cond_signal";
+export extern fn pthread_cond_signal(cond: cstring) -> int32 = "pthread_cond_signal";
 
 // pthread_cond_broadcast(cond*) -> int  (wake all waiters)
-export extern function pthread_cond_broadcast(cond: cstring) -> int32 = "pthread_cond_broadcast";
+export extern fn pthread_cond_broadcast(cond: cstring) -> int32 = "pthread_cond_broadcast";
 
 // ─── Sleep ───────────────────────────────────────────────────────────────────
 // usleep(microseconds) – sleep for the given number of microseconds.
 // 1 ms = 1000 µs.  Available in libc; no extra link flags needed.
-export extern function usleep(usec: uint32) -> int32 = "usleep";
+export extern fn usleep(usec: uint32) -> int32 = "usleep";
 
 // nanosleep is more precise but requires a timespec struct (two int64 fields).
 // Allocate a 16-byte buffer: buf[0..7] = seconds, buf[8..15] = nanoseconds.
-export extern function nanosleep(req: cstring, rem: cstring) -> int32 = "nanosleep";
+export extern fn nanosleep(req: cstring, rem: cstring) -> int32 = "nanosleep";
 
 // ─── Atomic helpers (via C bridge) ──────────────────────────────────────────
 // GCC/Clang __sync built-ins are compiler intrinsics; we expose them through
@@ -109,29 +109,29 @@ export extern function nanosleep(req: cstring, rem: cstring) -> int32 = "nanosle
 //
 // Link flags: none (sched_yield is in libc; __sync builtins are inlined).
 
-export extern function posix_cas_i32(ptr: int32*, expected: int32, desired: int32) -> int32 = "posix_cas_i32";
-export extern function posix_yield() = "posix_yield";
-export extern function posix_atomic_exchange_i32(ptr: int32*, val: int32) -> int32 = "posix_atomic_exchange_i32";
-export extern function posix_atomic_add_i32(ptr: int32*, val: int32) -> int32 = "posix_atomic_add_i32";
+export extern fn posix_cas_i32(ptr: int32*, expected: int32, desired: int32) -> int32 = "posix_cas_i32";
+export extern fn posix_yield() = "posix_yield";
+export extern fn posix_atomic_exchange_i32(ptr: int32*, val: int32) -> int32 = "posix_atomic_exchange_i32";
+export extern fn posix_atomic_add_i32(ptr: int32*, val: int32) -> int32 = "posix_atomic_add_i32";
 
 // ─── Spin-lock helpers ───────────────────────────────────────────────────────
 // Lightweight synchronisation for short critical sections.
 // lock_var must be a shared int32 initialised to 0.
 
-export function posix_spin_try_lock(lock_var: int32*) -> int32 {
+export fn posix_spin_try_lock(lock_var: int32*) -> int32 {
   if (posix_cas_i32(lock_var, 0, 1) == 0) {
     return 1;
   }
   return 0;
 }
 
-export function posix_spin_lock(lock_var: int32*) {
+export fn posix_spin_lock(lock_var: int32*) {
   while (posix_spin_try_lock(lock_var) == 0) {
     posix_yield();
   }
 }
 
-export function posix_spin_unlock(lock_var: int32*) {
+export fn posix_spin_unlock(lock_var: int32*) {
   posix_atomic_exchange_i32(lock_var, 0);
 }
 
@@ -145,7 +145,7 @@ export function posix_spin_unlock(lock_var: int32*) {
 // We allocate 64 bytes to cover both platforms.
 import "std/mem";
 
-export function mutex_create_posix() -> cstring {
+export fn mutex_create_posix() -> cstring {
   var m: cstring = malloc(64);
   if (m == 0) {
     return 0;
@@ -155,33 +155,33 @@ export function mutex_create_posix() -> cstring {
   return m;
 }
 
-export function mutex_lock_posix(mutex: cstring) -> int32 {
+export fn mutex_lock_posix(mutex: cstring) -> int32 {
   return pthread_mutex_lock(mutex);
 }
 
-export function mutex_trylock_posix(mutex: cstring) -> int32 {
+export fn mutex_trylock_posix(mutex: cstring) -> int32 {
   return pthread_mutex_trylock(mutex);
 }
 
-export function mutex_unlock_posix(mutex: cstring) -> int32 {
+export fn mutex_unlock_posix(mutex: cstring) -> int32 {
   return pthread_mutex_unlock(mutex);
 }
 
-export function mutex_destroy_posix(mutex: cstring) -> int32 {
+export fn mutex_destroy_posix(mutex: cstring) -> int32 {
   return pthread_mutex_destroy(mutex);
 }
 
 // Sleep for the given number of milliseconds.
-export function thread_sleep_ms_posix(milliseconds: uint32) {
+export fn thread_sleep_ms_posix(milliseconds: uint32) {
   usleep(milliseconds * 1000);
 }
 
 // Join a thread, discarding its return value.
-export function thread_join_posix(thread: int64) -> int32 {
+export fn thread_join_posix(thread: int64) -> int32 {
   return pthread_join(thread, 0);
 }
 
 // Detach a thread so its resources are released automatically on exit.
-export function thread_detach_posix(thread: int64) -> int32 {
+export fn thread_detach_posix(thread: int64) -> int32 {
   return pthread_detach(thread);
 }

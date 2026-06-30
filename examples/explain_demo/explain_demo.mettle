@@ -23,7 +23,7 @@ import "std/bench";
 
 // Straight-line counted reduction over a unit-stride array: the vectorizer's
 // bread and butter. --explain reports this loop as vectorized.
-function array_sum(a: int32*, n: int64) -> int64 {
+fn array_sum(a: int32*, n: int64) -> int64 {
   var sum: int64 = 0;
   var i: int64 = 0;
   while (i < n) {
@@ -37,7 +37,7 @@ function array_sum(a: int32*, n: int64) -> int64 {
 // and gives the reason. It also computes `p * p` before the branch and AGAIN in
 // the else arm; the first dominates the second, so --ml-opt's GVN reuses it
 // (a cross-block redundancy classical's block-local CSE leaves behind).
-@noinline function step(p: int64, n: int64) -> int64 {
+@noinline fn step(p: int64, n: int64) -> int64 {
   var s: int64 = 0;
   var i: int64 = 0;
   while (i < n) {
@@ -52,7 +52,7 @@ function array_sum(a: int32*, n: int64) -> int64 {
 
 // ((x|y) ^ (x&y)) | (z&z)  is just  (x^y) | z, but classical and gcc -O3 leave
 // the tangle. The bitwise superoptimizer proves the optimum via truth tables.
-@noinline function bit_blend(x: int64, y: int64, z: int64) -> int64 {
+@noinline fn bit_blend(x: int64, y: int64, z: int64) -> int64 {
   return ((x | y) ^ (x & y)) | (z & z);
 }
 
@@ -60,12 +60,12 @@ function array_sum(a: int32*, n: int64) -> int64 {
 // classical and gcc -O3 leave it; the superoptimizer proves the optimum, seeing
 // through the shifts (it treats each shifted term as a value and the truth table
 // collapses (x ^ t) ^ t back to x).
-@noinline function shuffle(x: int64) -> int64 {
+@noinline fn shuffle(x: int64) -> int64 {
   return (x ^ (x << 7)) ^ (x << 7);
 }
 
 // Self-recursive: the inliner reports this call as NOT inlined.
-function gcd(a: int64, b: int64) -> int64 {
+fn gcd(a: int64, b: int64) -> int64 {
   if (b == 0) {
     return a;
   }
@@ -73,11 +73,11 @@ function gcd(a: int64, b: int64) -> int64 {
 }
 
 // Tiny leaf helper: the inliner folds this call into its caller (inlined).
-function lo_byte(x: int64) -> int64 {
+fn lo_byte(x: int64) -> int64 {
   return x & 255;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   println(cstr("--explain showcase"));
 
   var n: int64 = 4096;

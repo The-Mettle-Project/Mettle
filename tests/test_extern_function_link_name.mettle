@@ -1,6 +1,6 @@
-extern function print_c(msg: cstring) -> int32 = "puts";
+extern fn print_c(msg: cstring) -> int32 = "puts";
 
-function main() -> int32 {
+fn main() -> int32 {
   var msg: cstring = 0;
   return print_c(msg);
 }

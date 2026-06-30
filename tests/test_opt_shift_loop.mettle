@@ -8,7 +8,7 @@
 
 import "std/io";
 
-function insertion_sort(data: int32*, len: int32) {
+fn insertion_sort(data: int32*, len: int32) {
   var i: int32 = 1;
   var cur: int32* = data + 4;
   while (i < len) {
@@ -31,7 +31,7 @@ function insertion_sort(data: int32*, len: int32) {
   }
 }
 
-function is_sorted(data: int32*, len: int32) -> int32 {
+fn is_sorted(data: int32*, len: int32) -> int32 {
   var i: int32 = 1;
   while (i < len) {
     if (data[i] < data[i - 1]) {
@@ -42,7 +42,7 @@ function is_sorted(data: int32*, len: int32) -> int32 {
   return 1;
 }
 
-function checksum(data: int32*, len: int32) -> int64 {
+fn checksum(data: int32*, len: int32) -> int64 {
   var s: int64 = 0;
   var x: int64 = 0;
   var i: int32 = 0;
@@ -55,7 +55,7 @@ function checksum(data: int32*, len: int32) -> int64 {
 }
 
 // Fill with a pseudo-random pattern that can include negatives and ties.
-function fill(data: int32*, len: int32, seed: int32) {
+fn fill(data: int32*, len: int32, seed: int32) {
   var i: int32 = 0;
   var st: int32 = seed;
   while (i < len) {
@@ -66,7 +66,7 @@ function fill(data: int32*, len: int32, seed: int32) {
   }
 }
 
-function run_case(len: int32, seed: int32) -> int32 {
+fn run_case(len: int32, seed: int32) -> int32 {
   var data: int32[256];
   fill(&data[0], len, seed);
   var before: int64 = checksum(&data[0], len);
@@ -77,7 +77,7 @@ function run_case(len: int32, seed: int32) -> int32 {
   return 1;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var ok: int32 = 1;
 
   // Varied lengths incl. 0/1 (loop never enters), small, and odd/even,

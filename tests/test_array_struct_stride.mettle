@@ -5,7 +5,7 @@ struct StrideS {
   c: int64;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var arr: StrideS[2];
   var d: int64 = (int64)(&(arr[1])) - (int64)(&(arr[0]));
   if (d == (int64)24) {

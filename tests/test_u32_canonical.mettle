@@ -10,13 +10,13 @@
 // Exit code: bitmask of failed checks (0 = all pass). Run in BOTH debug and
 // release: the two modes must agree with each other and with C.
 
-extern function exit2(code: int32) -> int32 = "exit";
+extern fn exit2(code: int32) -> int32 = "exit";
 
 var G: uint32 = 0;
 
 // Reversed accumulator (no vectorizer claims it): per-iteration products
 // exceed 2^32; the uint32 home must wrap them mod 2^32.
-function uA(a: uint32*, n: int32) -> uint32 {
+fn uA(a: uint32*, n: int32) -> uint32 {
   var s: uint32 = 0;
   var i: int32 = n - 1;
   while (i >= 0) { s = s + (a[i] ^ 5) * 3; i = i - 1; }
@@ -25,7 +25,7 @@ function uA(a: uint32*, n: int32) -> uint32 {
 
 // Forward accumulator (vectorizable): release SIMD lanes truncate per-lane;
 // the debug scalar path must produce the identical wrapped value.
-function uF(a: uint32*, n: int32) -> uint32 {
+fn uF(a: uint32*, n: int32) -> uint32 {
   var s: uint32 = 0;
   var i: int32 = 0;
   while (i < n) { s = s + (a[i] ^ 5) * 3; i = i + 1; }
@@ -34,21 +34,21 @@ function uF(a: uint32*, n: int32) -> uint32 {
 
 // Non-homomorphic op (divide) on a wrapped local: t must be canonical BEFORE
 // the divide, not just at the return.
-function uDiv(x: uint32) -> uint32 {
+fn uDiv(x: uint32) -> uint32 {
   var t: uint32 = x + 9;
   var q: uint32 = t / 7;
   return q;
 }
 
 // Right shift is width-sensitive too.
-function uShr(x: uint32) -> uint32 {
+fn uShr(x: uint32) -> uint32 {
   var t: uint32 = x + 9;
   var q: uint32 = t >> 1;
   return q;
 }
 
 // Register-cached uint32 GLOBAL accumulator (leaf-function global promotion).
-function gAcc(n: int32) -> uint32 {
+fn gAcc(n: int32) -> uint32 {
   var i: int32 = 0;
   while (i < n) { G = G + 2654435761; i = i + 1; }
   return G;
@@ -56,20 +56,20 @@ function gAcc(n: int32) -> uint32 {
 
 // Explicit narrowing cast then divide: the cast must zero-extend even when
 // the value is already in the destination register (dst == src encoding).
-function castChain(x: int64) -> uint32 {
+fn castChain(x: int64) -> uint32 {
   var u: uint32 = (uint32)x;
   return u / 3;
 }
 
 // uint16 accumulator: sub-4-byte unsigned homes wrap mod 2^16.
-function u16A(a: uint32*, n: int32) -> uint16 {
+fn u16A(a: uint32*, n: int32) -> uint16 {
   var s: uint16 = 0;
   var i: int32 = n - 1;
   while (i >= 0) { s = s + (a[i] ^ 5); i = i - 1; }
   return s;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var n: int32 = 1003;
   var ua: uint32[1003];
   var i: int32 = 0;

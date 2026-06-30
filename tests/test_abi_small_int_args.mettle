@@ -1,11 +1,11 @@
 // ABI: int8/int16 args — passed in full 64-bit param reg, correct extension
-function add_small(a: int8, b: int16) -> int32 {
+fn add_small(a: int8, b: int16) -> int32 {
   var x: int32 = a;
   var y: int32 = b;
   return x + y;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var r: int32 = add_small(10, 20);
   if (r == 30) {
     return 1;

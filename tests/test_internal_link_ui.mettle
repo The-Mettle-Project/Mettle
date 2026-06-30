@@ -1,6 +1,6 @@
 import "std/ui";
 
-function noop_window_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 {
+fn noop_window_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 {
   if (msg == UI_WM_DESTROY()) {
     ui_quit(0);
     return 0;
@@ -8,7 +8,7 @@ function noop_window_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64
   return ui_def_window_proc(hwnd, msg, wparam, lparam);
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   if (ui_init() == 0) {
     return 1;
   }

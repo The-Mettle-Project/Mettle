@@ -1,6 +1,6 @@
 // 5! -> 120, recursively.
-function fact(n: int64) -> int64 {
+fn fact(n: int64) -> int64 {
   if (n <= 1) { return 1; }
   return n * fact(n - 1);
 }
-function main() -> int64 { return fact(5); }
+fn main() -> int64 { return fact(5); }

@@ -1,6 +1,6 @@
 import "std/conv";
 
-function main() -> int32 {
+fn main() -> int32 {
   var buf: uint8[16];
 
   buf[0] = 'G';

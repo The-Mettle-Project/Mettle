@@ -1,4 +1,4 @@
-function test() -> int32 {
+fn test() -> int32 {
   var x: int32 = 5;
   if (x == 1) {
     x = 2;

@@ -2,7 +2,7 @@ struct Wrapper<T> {
     value: T;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     var w: Wrapper<int32*>;
     var x: int32 = 42;
     w.value = &x;

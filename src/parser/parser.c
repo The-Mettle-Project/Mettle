@@ -143,7 +143,8 @@ static const char *token_type_to_string(TokenType type) {
   case TOKEN_VAR:
     return "'var'";
   case TOKEN_FUNCTION:
-    return "'function'";
+  case TOKEN_FN:
+    return "'fn'";
   case TOKEN_STRUCT:
     return "'struct'";
   case TOKEN_METHOD:
@@ -376,6 +377,7 @@ void parser_synchronize(Parser *parser) {
     // 'return'), causing parse/recover loops to spin forever at top level.
     switch (parser->current_token.type) {
     case TOKEN_FUNCTION:
+    case TOKEN_FN:
     case TOKEN_VAR:
     case TOKEN_STRUCT:
     case TOKEN_RETURN:
@@ -659,7 +661,8 @@ ASTNode *parser_parse_declaration(Parser *parser) {
     return parser_parse_import_declaration(parser);
   case TOKEN_EXTERN: {
     parser_advance(parser); // consume 'extern'
-    if (parser->current_token.type == TOKEN_FUNCTION) {
+    if (parser->current_token.type == TOKEN_FUNCTION ||
+        parser->current_token.type == TOKEN_FN) {
       ASTNode *decl = parser_parse_function_declaration(parser);
       if (decl && decl->data) {
         FunctionDeclaration *func_data = (FunctionDeclaration *)decl->data;
@@ -675,13 +678,14 @@ ASTNode *parser_parse_declaration(Parser *parser) {
     if (parser->current_token.type == TOKEN_VAR) {
       return parser_parse_extern_var_declaration(parser);
     }
-    parser_set_error(parser, "Expected 'function' or 'var' after 'extern'");
+    parser_set_error(parser, "Expected 'fn' or 'var' after 'extern'");
     return NULL;
   }
   case TOKEN_EXPORT: {
     parser_advance(parser); // consume 'export'
     ASTNode *decl = NULL;
-    if (parser->current_token.type == TOKEN_FUNCTION) {
+    if (parser->current_token.type == TOKEN_FUNCTION ||
+        parser->current_token.type == TOKEN_FN) {
       decl = parser_parse_function_declaration(parser);
       if (decl && decl->data) {
         ((FunctionDeclaration *)decl->data)->is_exported = 1;
@@ -708,7 +712,8 @@ ASTNode *parser_parse_declaration(Parser *parser) {
       }
     } else if (parser->current_token.type == TOKEN_EXTERN) {
       parser_advance(parser); // consume 'extern'
-      if (parser->current_token.type == TOKEN_FUNCTION) {
+      if (parser->current_token.type == TOKEN_FUNCTION ||
+          parser->current_token.type == TOKEN_FN) {
         decl = parser_parse_function_declaration(parser);
         if (decl && decl->data) {
           FunctionDeclaration *func_data = (FunctionDeclaration *)decl->data;
@@ -727,16 +732,16 @@ ASTNode *parser_parse_declaration(Parser *parser) {
         }
       } else {
         parser_set_error(parser,
-                         "Expected 'function' or 'var' after 'export extern'");
+                         "Expected 'fn' or 'var' after 'export extern'");
         return NULL;
       }
     } else if (parser->current_token.type == TOKEN_AT) {
       parser_set_error(parser,
                        "Decorators must precede 'export' (write "
-                       "'@inline export function', not 'export @inline ...')");
+                       "'@inline export fn', not 'export @inline ...')");
       return NULL;
     } else {
-      parser_set_error(parser, "Expected 'function', 'var', 'struct', 'enum', "
+      parser_set_error(parser, "Expected 'fn', 'var', 'struct', 'enum', "
                                "'trait', or 'extern' after 'export'");
       return NULL;
     }
@@ -750,6 +755,7 @@ ASTNode *parser_parse_declaration(Parser *parser) {
   case TOKEN_ERRDEFER:
     return parser_parse_errdefer_statement(parser);
   case TOKEN_FUNCTION:
+  case TOKEN_FN:
   case TOKEN_KERNEL:
     return parser_parse_function_declaration(parser);
   case TOKEN_STRUCT:
@@ -2756,7 +2762,7 @@ ASTNode *parser_parse_function_declaration(Parser *parser) {
   if (parser->current_token.type != TOKEN_FUNCTION &&
       parser->current_token.type != TOKEN_FN &&
       parser->current_token.type != TOKEN_KERNEL) {
-    parser_set_error(parser, "Expected 'function', 'fn', or 'kernel'");
+    parser_set_error(parser, "Expected 'fn' or 'kernel'");
     return NULL;
   }
   // `kernel` is the GPU-facing spelling of a top-level function; it parses
@@ -2765,7 +2771,7 @@ ASTNode *parser_parse_function_declaration(Parser *parser) {
 
   // Expect function name
   if (!parser_is_identifier_like(parser->current_token.type)) {
-    parser_set_error(parser, "Expected function name after 'function'");
+    parser_set_error(parser, "Expected function name after 'fn'");
     return NULL;
   }
 

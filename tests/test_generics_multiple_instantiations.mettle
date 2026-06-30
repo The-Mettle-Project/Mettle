@@ -3,11 +3,11 @@ struct Pair<A, B> {
     second: B;
 }
 
-function identity<T>(val: T) -> T {
+fn identity<T>(val: T) -> T {
     return val;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     var p1: Pair<int32, int32>;
     p1.first = 1;
     p1.second = 2;

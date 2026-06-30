@@ -517,8 +517,6 @@ static Token lexer_lex_identifier_or_keyword(Lexer *lexer) {
     token.type = TOKEN_VAR;
   else if (strcmp(token.value, "const") == 0)
     token.type = TOKEN_CONST;
-  else if (strcmp(token.value, "function") == 0)
-    token.type = TOKEN_FUNCTION;
   else if (strcmp(token.value, "struct") == 0)
     token.type = TOKEN_STRUCT;
   else if (strcmp(token.value, "enum") == 0)

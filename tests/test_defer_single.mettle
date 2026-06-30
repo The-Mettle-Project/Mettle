@@ -1,8 +1,8 @@
 import "std/io";
 
-function a() { puts(cstr("A\n")); }
+fn a() { puts(cstr("A\n")); }
 
-function main() -> int32 {
+fn main() -> int32 {
   defer a();
   return 0;
 }

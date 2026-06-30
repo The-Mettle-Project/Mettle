@@ -15,31 +15,31 @@ struct Odd3 {
   c: uint8;
 }
 
-extern function c_sum_three(t: ThreeI32) -> int32 = "mettle_struct_abi_c_sum_three";
-extern function c_make_three(a: int32, b: int32, c: int32) -> ThreeI32 = "mettle_struct_abi_c_make_three";
-extern function c_sum_odd3(o: Odd3) -> int32 = "mettle_struct_abi_c_sum_odd3";
-extern function c_make_odd3(a: uint8, b: uint8, c: uint8) -> Odd3 = "mettle_struct_abi_c_make_odd3";
+extern fn c_sum_three(t: ThreeI32) -> int32 = "mettle_struct_abi_c_sum_three";
+extern fn c_make_three(a: int32, b: int32, c: int32) -> ThreeI32 = "mettle_struct_abi_c_make_three";
+extern fn c_sum_odd3(o: Odd3) -> int32 = "mettle_struct_abi_c_sum_odd3";
+extern fn c_make_odd3(a: uint8, b: uint8, c: uint8) -> Odd3 = "mettle_struct_abi_c_make_odd3";
 
-function write_s(s: cstring) {
+fn write_s(s: cstring) {
   if (s != 0) {
     fputs(s, get_stdout());
   }
 }
 
-function write_i64(v: int64) {
+fn write_i64(v: int64) {
   var buf: uint8[32];
   int_to_dec((cstring)((int64)(&(buf[0]))), v);
   write_s((cstring)((int64)(&(buf[0]))));
 }
 
-function line_i64(label: cstring, v: int64) {
+fn line_i64(label: cstring, v: int64) {
   write_s(label);
   write_s(cstr(" "));
   write_i64(v);
   write_s(cstr("\n"));
 }
 
-function make_three(a: int32, b: int32, c: int32) -> ThreeI32 {
+fn make_three(a: int32, b: int32, c: int32) -> ThreeI32 {
   var t: ThreeI32;
   t.a = a;
   t.b = b;
@@ -47,7 +47,7 @@ function make_three(a: int32, b: int32, c: int32) -> ThreeI32 {
   return t;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   write_s(cstr("struct abi extern c\n"));
 
   var t: ThreeI32 = make_three(11, 22, 33);

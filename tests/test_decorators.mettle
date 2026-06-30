@@ -2,24 +2,24 @@ import "std/io";
 
 // @pure + @noinline: the call survives inlining (noinline) and is hoisted out
 // of the loop by pure-call LICM (pure). sq(7) = 49.
-@pure @noinline function sq(x: int32) -> int32 {
+@pure @noinline fn sq(x: int32) -> int32 {
   return x * x;
 }
 
 // @noinline leaf so the calls below stay as calls.
-@noinline function leaf() -> int32 {
+@noinline fn leaf() -> int32 {
   return 1;
 }
 
 // 3 internal calls exceeds the inliner's call-count heuristic (>2), so this is
 // normally NOT inlined. @inline forces it past that gate.
-@inline function many_calls() -> int32 {
+@inline fn many_calls() -> int32 {
   return leaf() + leaf() + leaf();
 }
 
 // @simd! on a function applies the vectorization contract to every counted loop
 // in the body. This sum loop must vectorize (sum_i32) or compilation fails.
-@simd! function sum_arr(a: int32*, n: int64) -> int64 {
+@simd! fn sum_arr(a: int32*, n: int64) -> int64 {
   var s: int64 = 0;
   var i: int64 = 0;
   while (i < n) {
@@ -29,7 +29,7 @@ import "std/io";
   return s;
 }
 
-function pure_sum() -> int32 {
+fn pure_sum() -> int32 {
   var total: int32 = 0;
   var k: int32 = 7;
   var i: int32 = 0;
@@ -43,11 +43,11 @@ function pure_sum() -> int32 {
 // Pure call with a POINTER argument. The pointer is loop-invariant and the loop
 // body never stores, so reading through it is stable across iterations and the
 // call may be hoisted. sum3(&buf) = 1+2+3 = 6, over 10 iterations = 60.
-@pure @noinline function sum3(p: int32*) -> int32 {
+@pure @noinline fn sum3(p: int32*) -> int32 {
   return p[0] + p[1] + p[2];
 }
 
-function pure_ptr_sum() -> int32 {
+fn pure_ptr_sum() -> int32 {
   var buf: int32[3];
   buf[0] = 1; buf[1] = 2; buf[2] = 3;
   var p: int32* = &buf[0];
@@ -63,11 +63,11 @@ function pure_ptr_sum() -> int32 {
 // SOUNDNESS GUARD: the loop body WRITES the memory `first` reads, so the call
 // must NOT be hoisted. If the no-store-in-body rule failed and it were hoisted,
 // the result would be wrong. Correct (not hoisted): 0+1+2+3+4 = 10.
-@pure @noinline function first(p: int32*) -> int32 {
+@pure @noinline fn first(p: int32*) -> int32 {
   return p[0];
 }
 
-function aliased_no_hoist() -> int32 {
+fn aliased_no_hoist() -> int32 {
   var buf: int32[1];
   buf[0] = 0;
   var sum: int32 = 0;
@@ -88,11 +88,11 @@ function aliased_no_hoist() -> int32 {
 //   (10+1)+(10+2)+(10+3)+(10+4)+(10+5) = 50 + 15 = 65.
 var g_read: int32 = 0;
 
-@pure @noinline function read_plus_global(x: int32) -> int32 {
+@pure @noinline fn read_plus_global(x: int32) -> int32 {
   return x + g_read;
 }
 
-function global_read_no_hoist() -> int32 {
+fn global_read_no_hoist() -> int32 {
   g_read = 0;
   var total: int32 = 0;
   var i: int32 = 0;
@@ -110,12 +110,12 @@ function global_read_no_hoist() -> int32 {
 // declines. Correct (called 5x): g_writes == 5.
 var g_writes: int32 = 0;
 
-@pure @noinline function bump_global(x: int32) -> int32 {
+@pure @noinline fn bump_global(x: int32) -> int32 {
   g_writes = g_writes + 1;
   return x;
 }
 
-function global_write_no_hoist() -> int32 {
+fn global_write_no_hoist() -> int32 {
   g_writes = 0;
   var s: int32 = 0;
   var i: int32 = 0;
@@ -126,7 +126,7 @@ function global_write_no_hoist() -> int32 {
   return g_writes;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var ps: int32 = pure_sum();
   var mc: int32 = many_calls();
   var pps: int32 = pure_ptr_sum();

@@ -1,7 +1,7 @@
 // Test that the prelude works when --prelude is passed. Uses std/io, std/math, std/conv.
 // print, println, cstr, min, max, clamp, exit, etc. should all be usable.
 
-function main() -> int32 {
+fn main() -> int32 {
   // std/io: print and println are available natively
   var greeting: string = "Hello from the prelude!";
   println(cstr(greeting));

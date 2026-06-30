@@ -5,7 +5,7 @@ import "std/io";
 import "std/mem";
 
 // M0112: `p` borrows into `buf`'s block, used after `buf` is freed.
-function use_after_free_interior() -> int32 {
+fn use_after_free_interior() -> int32 {
     var buf: cstring = malloc(16);
     buf[2] = 7;
     var p: cstring = &buf[2];
@@ -14,7 +14,7 @@ function use_after_free_interior() -> int32 {
 }
 
 // Clean control: `q` is read before `data` is freed.
-function clean_free() -> int32 {
+fn clean_free() -> int32 {
     var data: cstring = malloc(16);
     data[2] = 7;
     var q: cstring = &data[2];
@@ -23,6 +23,6 @@ function clean_free() -> int32 {
     return v;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     return use_after_free_interior() + clean_free();
 }

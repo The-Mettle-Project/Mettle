@@ -172,7 +172,7 @@ try {
     Write-Host 'Get started:'
   }
   Write-Host '    mettle --version' -ForegroundColor White
-  Write-Host "    'function main() -> int32 { return 0; }' | Out-File hello.mettle -Encoding ascii" -ForegroundColor White
+  Write-Host "    'fn main() -> int32 { return 0; }' | Out-File hello.mettle -Encoding ascii" -ForegroundColor White
   Write-Host '    mettle --build hello.mettle -o hello.exe; .\hello.exe' -ForegroundColor White
   Write-Host ''
   Write-Host "Docs: https://github.com/$Repo" -ForegroundColor Blue

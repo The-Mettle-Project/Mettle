@@ -2,7 +2,7 @@
   "function": {
     "prefix": "fn",
     "body": [
-      "function ${1:name}(${2}) -> ${3:int32} {",
+      "fn ${1:name}(${2}) -> ${3:int32} {",
       "  ${0:return 0;}",
       "}"
     ],
@@ -11,7 +11,7 @@
   "main": {
     "prefix": "main",
     "body": [
-      "function main() -> int32 {",
+      "fn main() -> int32 {",
       "  ${0:return 0;}",
       "}"
     ],
@@ -20,7 +20,7 @@
   "extern function": {
     "prefix": "externfn",
     "body": [
-      "extern function ${1:name}(${2}) -> ${3:int32} = \"${4:symbol}\";"
+      "extern fn ${1:name}(${2}) -> ${3:int32} = \"${4:symbol}\";"
     ],
     "description": "Extern function declaration"
   },
@@ -112,7 +112,7 @@
     "prefix": "trait",
     "body": [
       "trait ${1:Name} {",
-      "  function ${2:method}(self: Self) -> ${3:Self};",
+      "  fn ${2:method}(self: Self) -> ${3:Self};",
       "}"
     ],
     "description": "Trait declaration"
@@ -121,7 +121,7 @@
     "prefix": "impl",
     "body": [
       "impl ${1:Trait} for ${2:Type} {",
-      "  function ${3:method}(self: Self) -> ${4:Self} {",
+      "  fn ${3:method}(self: Self) -> ${4:Self} {",
       "    ${0:return self;}",
       "  }",
       "}"

@@ -1,5 +1,5 @@
 // M0105: constant index past the end of a stack array.
-function main() -> int32 {
+fn main() -> int32 {
     var a: int32[8];
     var i: int32 = 0;
     while (i < 8) { a[i] = i; i = i + 1; }

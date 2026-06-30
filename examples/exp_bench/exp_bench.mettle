@@ -1,21 +1,21 @@
 import "std/io";
 import "std/mem";
 import "std/bench";
-extern function expf(x: float32) -> float32 = "expf";
+extern fn expf(x: float32) -> float32 = "expf";
 
-function exp_array(a: float32*, n: int64) {
+fn exp_array(a: float32*, n: int64) {
   var i: int64 = 0;
   while (i < n) {
     a[i] = expf(a[i]);
     i = i + 1;
   }
 }
-function fill(a: float32*, n: int64, v: float32) {
+fn fill(a: float32*, n: int64, v: float32) {
   var i: int64 = 0;
   while (i < n) { a[i] = v; i = i + 1; }
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var n: int64 = 65536;
   var a: float32* = (float32*)malloc(n * 4);
   var t0: uint64 = bench_time_us();

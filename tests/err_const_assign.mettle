@@ -2,7 +2,7 @@
 
 const LIMIT: int32 = 10;
 
-function main() -> int32 {
+fn main() -> int32 {
   LIMIT = 20;
   return LIMIT;
 }

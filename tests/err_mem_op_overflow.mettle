@@ -1,7 +1,7 @@
 // M0106: a constant-size memory op that writes past a stack array's end.
 import "std/mem";
 
-function main() -> int32 {
+fn main() -> int32 {
     var buf: uint8[64];
     mem_zero(&buf[0], 128);
     return (int32)buf[0];

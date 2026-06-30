@@ -1,9 +1,9 @@
 trait Addable;
 
-function add_one<T: Addable>(value: T) -> T {
+fn add_one<T: Addable>(value: T) -> T {
     return value + 1;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     return add_one<int64>(41);
 }

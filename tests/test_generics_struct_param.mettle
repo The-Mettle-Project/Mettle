@@ -3,11 +3,11 @@ struct Pair<A, B> {
     second: B;
 }
 
-function get_first<T>(p: Pair<T, T>*) -> T {
+fn get_first<T>(p: Pair<T, T>*) -> T {
     return p->first;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     var p: Pair<int32, int32>;
     p.first = 42;
     p.second = 99;

@@ -1,5 +1,5 @@
 // Division by a constant zero traps the moment it executes.
-function main() -> int32 {
+fn main() -> int32 {
     var x: int32 = 10;
     return x / 0;
 }

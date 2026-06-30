@@ -132,9 +132,9 @@ class Gen:
         for _ in range(self.r.randint(0, 2)):
             self.redundancy(acc, self.r.randint(0, 1))
         body = "\n".join("  " + x for x in self.L)
-        head = f"@noinline function f({params}) -> int64 {{"
+        head = f"@noinline fn f({params}) -> int64 {{"
         args = ", ".join(str(self.r.randint(1, 200)) for _ in range(npar))
-        main = f"function main() -> int64 {{\n  return f({args}) & 255;\n}}"
+        main = f"fn main() -> int64 {{\n  return f({args}) & 255;\n}}"
         return (f"// seed={self.seed} (gen_gvn diverse)\n{head}\n{body}\n"
                 f"  return ({acc}) & {MASK};\n}}\n\n{main}\n")
 

@@ -1,8 +1,8 @@
 // ABI: first 4 integer args in RCX, RDX, R8, R9 (MS x64)
-function take4(a: int32, b: int32, c: int32, d: int32) -> int32 {
+fn take4(a: int32, b: int32, c: int32, d: int32) -> int32 {
   return a + b + c + d;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   return take4(10, 20, 30, 40);
 }

@@ -37,7 +37,7 @@ struct Db {
   cache: CacheEntry[32];
 }
 
-function cache_find_ptr(db: Db*, page_id: int64) -> int32 {
+fn cache_find_ptr(db: Db*, page_id: int64) -> int32 {
   var entries: CacheEntry* = &db[0].cache[0];
   var i: int32 = 0;
   while (i < 32) {
@@ -51,7 +51,7 @@ function cache_find_ptr(db: Db*, page_id: int64) -> int32 {
   return -1;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var db: Db* = new Db;
   var entries: CacheEntry* = &db[0].cache[0];
   var i: int32 = 0;

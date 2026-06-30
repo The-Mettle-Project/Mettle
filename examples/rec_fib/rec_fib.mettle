@@ -10,14 +10,14 @@
 import "std/io";
 import "std/bench";
 
-function fib(n: int32) -> int64 {
+fn fib(n: int32) -> int64 {
   if (n < 2) {
     return (int64)n;
   }
   return fib(n - 1) + fib(n - 2);
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var passes: int32 = 5;
   println("Recursive fib(34) x 5 passes");
 

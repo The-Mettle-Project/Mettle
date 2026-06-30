@@ -2,7 +2,7 @@ struct Node<T> {
     value: T;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     var p: Node<int32>* = new Node<int32>;
     p->value = 42;
     return p->value;

@@ -1,6 +1,6 @@
 // fib(10) -> 55. Recursion with two self-calls per frame.
-function fib(n: int64) -> int64 {
+fn fib(n: int64) -> int64 {
   if (n < 2) { return n; }
   return fib(n - 1) + fib(n - 2);
 }
-function main() -> int64 { return fib(10); }
+fn main() -> int64 { return fib(10); }

@@ -1,6 +1,6 @@
 var GREETING: string = "hello";
 
-function main() -> int32 {
+fn main() -> int32 {
   if (GREETING.length == 5) {
     return 0;
   }

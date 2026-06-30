@@ -9,13 +9,13 @@ import "std/io";
 import "std/mem";
 
 var g_seed: int64 = 2246822519;
-function rnd_byte() -> int32 {
+fn rnd_byte() -> int32 {
   g_seed = (g_seed * 1103515245 + 12345) & 0x7FFFFFFF;
   return (int32)((g_seed >> 7) & 255);
 }
 
 // ---- fused kernels (the exact in-place / reduction shapes recognized) ----
-function map_a(buf: uint8*, n: int32) -> void {
+fn map_a(buf: uint8*, n: int32) -> void {
   var i: int32 = 0;
   while (i < n) {
     buf[i] = buf[i] * 3 + 7;
@@ -23,7 +23,7 @@ function map_a(buf: uint8*, n: int32) -> void {
     i = i + 1;
   }
 }
-function map_b(buf: uint8*, n: int32) -> void {
+fn map_b(buf: uint8*, n: int32) -> void {
   var i: int32 = 0;
   while (i < n) {
     buf[i] = buf[i] - 5;
@@ -32,7 +32,7 @@ function map_b(buf: uint8*, n: int32) -> void {
     i = i + 1;
   }
 }
-function map_c(buf: uint8*, n: int32) -> void {
+fn map_c(buf: uint8*, n: int32) -> void {
   var i: int32 = 0;
   while (i < n) {
     buf[i] = buf[i] * 13;
@@ -41,7 +41,7 @@ function map_c(buf: uint8*, n: int32) -> void {
     i = i + 1;
   }
 }
-function sum_u8(buf: uint8*, n: int32) -> int64 {
+fn sum_u8(buf: uint8*, n: int32) -> int64 {
   var s: int64 = 0;
   var i: int32 = 0;
   while (i < n) { s = s + (int64)buf[i]; i = i + 1; }
@@ -49,7 +49,7 @@ function sum_u8(buf: uint8*, n: int32) -> int64 {
 }
 
 var g_fail: int32 = 0;
-function fail(label: cstring, len: int32) -> void {
+fn fail(label: cstring, len: int32) -> void {
   print(label);
   print(cstr(" failed at len="));
   print_int((int64)len);
@@ -57,7 +57,7 @@ function fail(label: cstring, len: int32) -> void {
   g_fail = g_fail + 1;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var a: uint8* = (uint8*)malloc(512);
   var b: uint8* = (uint8*)malloc(512);
 

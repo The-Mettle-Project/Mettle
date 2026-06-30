@@ -6,6 +6,6 @@
 import "std/core" if windows;
 import "std/this_module_does_not_exist_on_purpose" if linux;
 
-function main() -> int32 {
+fn main() -> int32 {
   return 7;
 }

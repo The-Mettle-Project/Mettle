@@ -2,10 +2,10 @@
 // (simd_affine_map_f32). Verify the vectorized result matches a scalar CPU
 // reference within f32 tolerance (the kernel fuses to FMA, ~1 ULP from
 // separate mul+add). Returns 0 on success.
-function saxpy(y: float32*, x: float32*, a: float32, n: int32) {
+fn saxpy(y: float32*, x: float32*, a: float32, n: int32) {
   for i in 0..n { y[i] = a * x[i] + y[i]; }
 }
-function main() -> int32 {
+fn main() -> int32 {
   var n: int32 = 1000;
   var x: float32[1000];
   var y: float32[1000];

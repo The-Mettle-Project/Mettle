@@ -1,6 +1,6 @@
 import "std/win32";
 
-function main() -> int32 {
+fn main() -> int32 {
   var width: int32 = win32_get_system_metrics(SM_CXSCREEN());
   var height: int32 = win32_get_system_metrics(SM_CYSCREEN());
   if (width <= 0) {

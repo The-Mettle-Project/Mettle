@@ -1,15 +1,15 @@
 // Test: function pointers
 // Test basic function pointer usage
 
-function add(a: int32, b: int32) -> int32 {
+fn add(a: int32, b: int32) -> int32 {
   return a + b;
 }
 
-function multiply(a: int32, b: int32) -> int32 {
+fn multiply(a: int32, b: int32) -> int32 {
   return a * b;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   // Declare a function pointer variable
   var fp: fn(int32, int32) -> int32;
   

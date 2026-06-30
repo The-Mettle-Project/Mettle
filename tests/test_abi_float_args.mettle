@@ -1,9 +1,9 @@
 // ABI: float args in XMM0, XMM1, XMM2, XMM3 (MS x64)
-function add2f(a: float64, b: float64) -> float64 {
+fn add2f(a: float64, b: float64) -> float64 {
   return a + b;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var r: float64 = add2f(1.5, 2.5);
   if (r >= 3.9 && r <= 4.1) {
     return 1;

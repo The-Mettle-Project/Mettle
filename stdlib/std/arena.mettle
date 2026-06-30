@@ -20,11 +20,11 @@ import "std/alloc";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
-function arena_default_chunk_size() -> int64 {
+fn arena_default_chunk_size() -> int64 {
   return (int64)65536;
 }
 
-function arena_default_alignment() -> int64 {
+fn arena_default_alignment() -> int64 {
   return (int64)8;
 }
 
@@ -81,18 +81,18 @@ export struct ArenaStats {
 
 // ─── Internal: chunk allocation ─────────────────────────────────────────────
 
-function arena_chunk_bytes() -> int64 {
+fn arena_chunk_bytes() -> int64 {
   return (int64)40;
 }
 
-function arena_bytes() -> int64 {
+fn arena_bytes() -> int64 {
   return (int64)56;
 }
 
 // Allocate the chunk header plus `cap` bytes of storage from the arena's heap.
 // The header lives in its own small allocation so chunk objects can be moved
 // between active and freelist lists without touching their backing storage.
-function arena_chunk_new(h: MemHeap*, cap: int64, id: int64) -> ArenaChunk* {
+fn arena_chunk_new(h: MemHeap*, cap: int64, id: int64) -> ArenaChunk* {
   if (h == 0 || cap <= (int64)0) {
     return 0;
   }
@@ -113,7 +113,7 @@ function arena_chunk_new(h: MemHeap*, cap: int64, id: int64) -> ArenaChunk* {
   return ch;
 }
 
-function arena_chunk_destroy(h: MemHeap*, ch: ArenaChunk*) {
+fn arena_chunk_destroy(h: MemHeap*, ch: ArenaChunk*) {
   if (ch == 0) {
     return;
   }
@@ -127,7 +127,7 @@ function arena_chunk_destroy(h: MemHeap*, ch: ArenaChunk*) {
 // Pop a chunk from the freelist that has at least `min_cap` bytes. Returns 0
 // if none fits. We scan linearly; the freelist is expected to be short (a
 // handful of entries even under high churn).
-function arena_pop_free_chunk(a: Arena*, min_cap: int64) -> ArenaChunk* {
+fn arena_pop_free_chunk(a: Arena*, min_cap: int64) -> ArenaChunk* {
   if (a == 0 || a->free_list == 0) {
     return 0;
   }
@@ -152,7 +152,7 @@ function arena_pop_free_chunk(a: Arena*, min_cap: int64) -> ArenaChunk* {
 
 // Push a chunk onto the freelist. Resets its `used` so it's ready to bump
 // from zero on next reuse.
-function arena_push_free_chunk(a: Arena*, ch: ArenaChunk*) {
+fn arena_push_free_chunk(a: Arena*, ch: ArenaChunk*) {
   if (a == 0 || ch == 0) {
     return;
   }
@@ -166,7 +166,7 @@ function arena_push_free_chunk(a: Arena*, ch: ArenaChunk*) {
 // Create a new arena. `default_chunk_size <= 0` selects the built-in default
 // (64 KiB). The first chunk is allocated lazily on the first bump that needs
 // one, so an arena that's never used costs only one small allocation.
-export function arena_init(default_chunk_size: int64) -> Arena* {
+export fn arena_init(default_chunk_size: int64) -> Arena* {
   var heap: MemHeap* = mem_heap_create();
   if (heap == 0) {
     return 0;
@@ -193,7 +193,7 @@ export function arena_init(default_chunk_size: int64) -> Arena* {
 
 // Round `value` up to the next multiple of `align`. `align` must be > 0; the
 // arena itself only ever calls this with powers of two.
-function arena_align_up(value: int64, align: int64) -> int64 {
+fn arena_align_up(value: int64, align: int64) -> int64 {
   if (align <= (int64)1) {
     return value;
   }
@@ -202,7 +202,7 @@ function arena_align_up(value: int64, align: int64) -> int64 {
 
 // Link a fresh chunk in as `head`. The previous head is preserved (linked
 // from the new head via `next`), so iteration from head walks newest-to-oldest.
-function arena_install_chunk(a: Arena*, ch: ArenaChunk*) {
+fn arena_install_chunk(a: Arena*, ch: ArenaChunk*) {
   if (a == 0 || ch == 0) {
     return;
   }
@@ -217,7 +217,7 @@ function arena_install_chunk(a: Arena*, ch: ArenaChunk*) {
 // Hot path is straight-line: align the current head's `used`, check that the
 // request fits, bump, return the pointer. Slow paths handle oversized
 // requests, exhausted current chunk, and freelist reuse.
-export function arena_alloc_aligned(a: Arena*, n: int64, align: int64) -> cstring {
+export fn arena_alloc_aligned(a: Arena*, n: int64, align: int64) -> cstring {
   if (a == 0 || n < (int64)0) {
     return 0;
   }
@@ -288,13 +288,13 @@ export function arena_alloc_aligned(a: Arena*, n: int64, align: int64) -> cstrin
 }
 
 // 8-byte aligned alloc. Common case.
-export function arena_alloc(a: Arena*, n: int64) -> cstring {
+export fn arena_alloc(a: Arena*, n: int64) -> cstring {
   return arena_alloc_aligned(a, n, arena_default_alignment());
 }
 
 // Zeroed alloc. Equivalent to arena_alloc followed by memset(0); we just call
 // memset here since the chunk's backing store from malloc is uninitialized.
-export function arena_alloc_zeroed(a: Arena*, n: int64) -> cstring {
+export fn arena_alloc_zeroed(a: Arena*, n: int64) -> cstring {
   var p: cstring = arena_alloc(a, n);
   if (p == 0 || n <= (int64)0) {
     return p;
@@ -306,7 +306,7 @@ export function arena_alloc_zeroed(a: Arena*, n: int64) -> cstring {
 // Capture the arena's current allocation position. A later arena_restore with
 // this savepoint frees every allocation made between the two calls and
 // returns the involved chunks to the freelist for reuse.
-export function arena_save(a: Arena*) -> ArenaSave {
+export fn arena_save(a: Arena*) -> ArenaSave {
   var s: ArenaSave;
   s.chunk_id = (int64)0;
   s.used = (int64)0;
@@ -323,7 +323,7 @@ export function arena_save(a: Arena*) -> ArenaSave {
 //
 // A savepoint taken when the arena was empty (chunk_id == 0) restores the
 // arena to fully empty: every active chunk goes to the freelist.
-export function arena_restore(a: Arena*, save: ArenaSave) {
+export fn arena_restore(a: Arena*, save: ArenaSave) {
   if (a == 0) {
     return;
   }
@@ -349,7 +349,7 @@ export function arena_restore(a: Arena*, save: ArenaSave) {
 // Free all live allocations but keep the chunks around in the freelist for
 // fast reuse. Use this between agent turns / request handlers: the per-turn
 // memory cost is one head pointer reset, not per-byte deallocation.
-export function arena_reset(a: Arena*) {
+export fn arena_reset(a: Arena*) {
   if (a == 0) {
     return;
   }
@@ -364,7 +364,7 @@ export function arena_reset(a: Arena*) {
 // Tear down the arena entirely. Releases the chunk backing store, the chunk
 // headers, the freelist, and the arena struct itself. The arena pointer must
 // not be used after this returns.
-export function arena_free(a: Arena*) {
+export fn arena_free(a: Arena*) {
   if (a == 0) {
     return;
   }
@@ -386,7 +386,7 @@ export function arena_free(a: Arena*) {
 
 // Snapshot of arena occupancy. Useful for instrumentation and budgeting; the
 // arena does not consult these fields itself.
-export function arena_stats(a: Arena*) -> ArenaStats {
+export fn arena_stats(a: Arena*) -> ArenaStats {
   var s: ArenaStats;
   s.total_used = (int64)0;
   s.total_cap = (int64)0;

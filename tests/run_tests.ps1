@@ -2015,7 +2015,7 @@ try {
   if ($run2 -notmatch 'no optimization changes since the last explain build') {
     throw "Identical rebuild must report no changes"
   }
-  (Get-Content "$exDir\demo.mettle" -Raw) -replace 'function scale\(x: float32\)', '@noinline function scale(x: float32)' |
+  (Get-Content "$exDir\demo.mettle" -Raw) -replace 'fn scale\(x: float32\)', '@noinline fn scale(x: float32)' |
     Set-Content "$exDir\demo.mettle" -Encoding ascii -NoNewline
   $run3 = cmd /c "`"$((Resolve-Path $CompilerPath).Path)`" -i `"$exDir\demo.mettle`" -o `"$exOut`" --release --explain-json 2>&1" | Out-String
   if ($run3 -notmatch 'REGRESSED' -or $run3 -notmatch 'was vectorized, now scalar') {
@@ -2199,7 +2199,7 @@ try {
   @'
 import "std/io";
 
-function main() -> int32 {
+fn main() -> int32 {
   var msg: string = "Bundled stdlib works";
   println(cstr(msg));
   return 0;
@@ -2243,7 +2243,7 @@ try {
   $bomSource = Join-Path $bomDir "main.mettle"
   $bomObj = Join-Path $bomDir "main.obj"
   @'
-function main() -> int32 {
+fn main() -> int32 {
   return 0;
 }
 '@ | Set-Content -Path $bomSource -Encoding utf8
@@ -2289,7 +2289,7 @@ try {
   @'
 import "testpkg/shared_math";
 
-function main() -> int32 {
+fn main() -> int32 {
   return forty_two();
 }
 '@ | Set-Content -Path $depsSource -Encoding ASCII

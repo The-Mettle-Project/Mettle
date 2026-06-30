@@ -5,7 +5,7 @@ struct Vector3 {
     z: int32;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     var v1: Vector3* = new Vector3;
     v1->x = 10;
     v1->y = 20;

@@ -1,10 +1,10 @@
-extern function puts(s: cstring) -> int32;
+extern fn puts(s: cstring) -> int32;
 
-function cast_helper() -> int64* {
+fn cast_helper() -> int64* {
     return (int64*)0;
 }
 
-function main() -> int64 {
+fn main() -> int64 {
     // float to int
     var f : float64 = 3.14;
     var i : int64 = (int64)f;

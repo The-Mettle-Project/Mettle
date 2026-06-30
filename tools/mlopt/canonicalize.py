@@ -13,7 +13,7 @@ Pipeline:
                               encodes control flow)
   canonicalize_fn(lines)   -> [lines] with nops removed and every temp / local /
                               label renamed to dense first-occurrence ids
-                              (%t0.., @v0.., L0..), per function
+                              (%t0.., @v0.., L0..), per fn
   tokenize(lines)          -> [tokens] over a small regular vocabulary
 
 CLI: read a pairs.jsonl (from build_pairs.py), align input/target functions by

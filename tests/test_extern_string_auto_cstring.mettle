@@ -1,9 +1,9 @@
 import "std/conv";
 
-extern function puts(msg: cstring) -> int32 = "puts";
-extern function strlen_c(msg: cstring) -> int64 = "strlen";
+extern fn puts(msg: cstring) -> int32 = "puts";
+extern fn strlen_c(msg: cstring) -> int64 = "strlen";
 
-function main() -> int32 {
+fn main() -> int32 {
   var msg: string = "hello";
   var path_buf: uint8[32];
   var path_len: int32 = format_i64(&path_buf[0], 32, "posts_%d.txt", 42);

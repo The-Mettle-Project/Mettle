@@ -43,27 +43,27 @@ run_case() {
   fi
 }
 
-run_case loop 45 'function compute(n: int32) -> int32 {
+run_case loop 45 'fn compute(n: int32) -> int32 {
   var acc: int32 = 0; var i: int32 = 0;
   while (i < n) { acc = acc + i; i = i + 1; }
   return acc;
 }
-function main() -> int32 { return compute(10); }'
+fn main() -> int32 { return compute(10); }'
 
-run_case recursion 55 'function fib(n: int32) -> int32 {
+run_case recursion 55 'fn fib(n: int32) -> int32 {
   if (n < 2) { return n; }
   return fib(n - 1) + fib(n - 2);
 }
-function main() -> int32 { return fib(10); }'
+fn main() -> int32 { return fib(10); }'
 
 # 8 integer args: 6 in SysV registers, 2 spilled to the stack.
-run_case stackargs 36 'function sum8(a: int64, b: int64, c: int64, d: int64, e: int64, f: int64, g: int64, h: int64) -> int64 {
+run_case stackargs 36 'fn sum8(a: int64, b: int64, c: int64, d: int64, e: int64, f: int64, g: int64, h: int64) -> int64 {
   return a + b + c + d + e + f + g + h;
 }
-function main() -> int32 { return (int32)sum8(1, 2, 3, 4, 5, 6, 7, 8); }'
+fn main() -> int32 { return (int32)sum8(1, 2, 3, 4, 5, 6, 7, 8); }'
 
 # argc read off the kernel stack at _start; 3 args + argv[0] => 4.
-run_case argcount 4 'function main(argc: int32, argv: int8**) -> int32 { return argc; }' a b c
+run_case argcount 4 'fn main(argc: int32, argv: int8**) -> int32 { return argc; }' a b c
 
 # run_case_out <name> <expected-exit> <expected-stdout> <source> [run-args...]
 # Like run_case but also asserts the program's stdout. Exercises the syscall-based
@@ -89,7 +89,7 @@ run_case_out() {
 # std/io console output via the write syscall (no libc): println + print_int.
 run_case_out stdio_console 0 'value=42
 -7' 'import "std/io";
-function main() -> int32 {
+fn main() -> int32 {
   print("value="); print_int(42); newline();
   print_int(-7); newline();
   return 0;
@@ -98,7 +98,7 @@ function main() -> int32 {
 # std/io file I/O round-trip via open/write/read/close syscalls. fgets reading a
 # parameter buffer across a call exercises the SysV RSI/RDI promotion fix.
 run_case_out stdio_file 0 'line one' 'import "std/io";
-function main() -> int32 {
+fn main() -> int32 {
   var w: cstring = fopen("/tmp/mettle_elf_test.txt", "w");
   if (w == 0) { return 1; }
   fputs("line one\n", w);
@@ -116,7 +116,7 @@ function main() -> int32 {
 # syscall. Returns 0 only if the second timestamp is >= the first.
 run_case bench_monotonic 0 'import "std/bench";
 import "std/process";
-function main() -> int32 {
+fn main() -> int32 {
   var t0: uint64 = bench_time_us();
   var i: int64 = 0; var acc: int64 = 0;
   while (i < 1000000) { acc = acc + i; i = i + 1; }
@@ -128,7 +128,7 @@ function main() -> int32 {
 
 # std/process exit code via libc exit().
 run_case proc_exit 7 'import "std/process";
-function main() -> int32 { exit(7); return 0; }'
+fn main() -> int32 { exit(7); return 0; }'
 
 # Heap allocation: `new` lowers to a libc calloc call (SysV ABI). Confirms the
 # allocator links and the calloc argument registers are correct on SysV.
@@ -136,7 +136,7 @@ run_case heap_new 30 'struct Pair {
   a: int32;
   b: int32;
 }
-function main() -> int32 {
+fn main() -> int32 {
   var p: Pair* = new Pair;
   p->a = 12;
   p->b = 18;
@@ -145,7 +145,7 @@ function main() -> int32 {
 
 # Direct malloc/free from std/mem (libc).
 run_case heap_malloc 42 'import "std/mem";
-function main() -> int32 {
+fn main() -> int32 {
   var buf: cstring = malloc(16);
   if (buf == 0) { return 1; }
   buf[0] = 42;
@@ -160,11 +160,11 @@ function main() -> int32 {
 run_case_out unified_thread 0 'worker ran
 main joined' 'import "std/io";
 import "std/thread";
-function worker(arg: cstring) -> uint32 {
+fn worker(arg: cstring) -> uint32 {
   println("worker ran");
   return 0;
 }
-function main() -> int32 {
+fn main() -> int32 {
   var h: int64 = CreateThread(0, 0, &worker, 0, 0, 0);
   if (h == 0) { return 1; }
   if (WaitForSingleObject(h, INFINITE()) != WAIT_OBJECT_0()) { return 2; }
@@ -178,7 +178,7 @@ function main() -> int32 {
 # that socket() returns a usable fd (kernel may run as unprivileged user).
 run_case_out unified_net 0 'tcp socket ok' 'import "std/io";
 import "std/net";
-function main() -> int32 {
+fn main() -> int32 {
   net_init();
   var s: int64 = socket_tcp();
   if (s < 0) { net_cleanup(); return 1; }
@@ -191,7 +191,7 @@ function main() -> int32 {
 # The standard prelude (--prelude) now links: std/mem/io/conv/math/process all
 # resolve against libc. Exercises the full default import set on Linux.
 prelude_name=prelude_build
-printf '%s' 'function main() -> int32 { println("preludes work"); return 0; }' \
+printf '%s' 'fn main() -> int32 { println("preludes work"); return 0; }' \
   > "$WORK/$prelude_name.mettle"
 if "$METTLE" --build --prelude "$WORK/$prelude_name.mettle" \
       -o "$WORK/$prelude_name.bin" >"$WORK/$prelude_name.log" 2>&1 \

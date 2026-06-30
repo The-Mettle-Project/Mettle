@@ -5,7 +5,7 @@ import "std/io";
 import "std/mem";
 import "std/bench";
 
-function qdot(a: int8*, b: int8*, n: int64) -> int32 {
+fn qdot(a: int8*, b: int8*, n: int64) -> int32 {
   var sum: int32 = 0;
   var i: int64 = 0;
   while (i < n) {
@@ -15,7 +15,7 @@ function qdot(a: int8*, b: int8*, n: int64) -> int32 {
   return sum;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var n: int64 = 4096;
   var passes: int32 = 100000;
   var a: int8* = (int8*)malloc(n);

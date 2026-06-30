@@ -1,26 +1,26 @@
 import "std/io";
 import "std/mem";
 
-extern function sqrtf(x: float32) -> float32 = "sqrtf";
+extern fn sqrtf(x: float32) -> float32 = "sqrtf";
 
 var WR: uint8* = (uint8*)0;
 var SNW: float32* = (float32*)0;
 var SXN: float32* = (float32*)0;
 var SX: float32* = (float32*)0;
 
-function rmsnorm(x: float32*, w: float32*, y: float32*, n: int64) {
+fn rmsnorm(x: float32*, w: float32*, y: float32*, n: int64) {
   var ss: float32 = 0.0; var i: int64 = 0;
   while (i < n) { ss = ss + x[i] * x[i]; i = i + 1; }
   var r: float32 = 1.0 / sqrtf(ss / (float32)n + 0.000001);
   i = 0; while (i < n) { y[i] = x[i] * r * (1.0 + w[i]); i = i + 1; }
 }
 
-function load_f32(off: int64, n: int64, dst: float32*) {
+fn load_f32(off: int64, n: int64, dst: float32*) {
   var src: float32* = (float32*)(&WR[off]);
   var i: int64 = 0; while (i < n) { dst[i] = src[i]; i = i + 1; }
 }
 
-function forward(off: int64) {
+fn forward(off: int64) {
   var a: int64 = 1; var b: int64 = 2; var c: int64 = 3; var d: int64 = 4;
   var l: int64 = 0;
   while (l < 1) {
@@ -37,7 +37,7 @@ function forward(off: int64) {
   print_int(a+b+c+d); println(cstr(""));
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   WR = malloc(6000000000);
   if (WR == 0) { println(cstr("malloc failed")); return 1; }
   SNW = (float32*)malloc(4*4096);

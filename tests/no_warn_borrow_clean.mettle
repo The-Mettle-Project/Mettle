@@ -7,7 +7,7 @@ import "std/io";
 import "std/mem";
 
 // The standard safe realloc idiom: the result is checked, then assigned back.
-function clean_safe_realloc() -> int32 {
+fn clean_safe_realloc() -> int32 {
     var buf: cstring = malloc(8);
     buf[0] = 1;
     var tmp: cstring = realloc(buf, 16);
@@ -21,7 +21,7 @@ function clean_safe_realloc() -> int32 {
 }
 
 // An alias to a different block than the one freed.
-function clean_disjoint_free() -> int32 {
+fn clean_disjoint_free() -> int32 {
     var a: cstring = malloc(8);
     var b: cstring = malloc(8);
     a[0] = 1;
@@ -33,7 +33,7 @@ function clean_disjoint_free() -> int32 {
 }
 
 // Alias re-pointed to its own block before the original is freed.
-function clean_repoint() -> int32 {
+fn clean_repoint() -> int32 {
     var p: cstring = malloc(8);
     var q: cstring = p;
     q = malloc(8);
@@ -45,7 +45,7 @@ function clean_repoint() -> int32 {
 }
 
 // Read the alias before freeing the block it shares.
-function clean_read_first() -> int32 {
+fn clean_read_first() -> int32 {
     var owned: cstring = malloc(8);
     var peek: cstring = owned;
     var v: int32 = (int32)peek[0];
@@ -53,6 +53,6 @@ function clean_read_first() -> int32 {
     return v;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     return clean_safe_realloc() + clean_disjoint_free() + clean_repoint() + clean_read_first();
 }

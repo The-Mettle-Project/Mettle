@@ -6,7 +6,7 @@ import "std/io";
 import "std/mem";
 import "std/bench";
 
-function reverse_copy(src: int32*, dst: int32*, n: int64) -> int64 {
+fn reverse_copy(src: int32*, dst: int32*, n: int64) -> int64 {
   var sum: int64 = 0;
   var i: int64 = 0;
   while (i < n) {
@@ -18,7 +18,7 @@ function reverse_copy(src: int32*, dst: int32*, n: int64) -> int64 {
   return sum;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var n: int64 = 65536;
   var passes: int32 = 200;
 

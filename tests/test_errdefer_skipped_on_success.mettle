@@ -1,9 +1,9 @@
 import "std/io";
 
-function ok() { puts(cstr("OK\n")); }
-function err() { puts(cstr("ERR\n")); }
+fn ok() { puts(cstr("OK\n")); }
+fn err() { puts(cstr("ERR\n")); }
 
-function main() -> int32 {
+fn main() -> int32 {
   errdefer err();
   defer ok();
   return 0;

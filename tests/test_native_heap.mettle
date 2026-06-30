@@ -14,7 +14,7 @@ struct Vec3 {
   z: int64;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   // `new` -> mettle_heap_zeroed: zeroed object allocation.
   var v: Vec3* = new Vec3;
   if (v->x != (int64)0 || v->y != (int64)0 || v->z != (int64)0) {

@@ -1,14 +1,14 @@
 // Re-verify narrowing + widening: sign-extend for signed, zero-extend for unsigned
 // Same patterns as test_narrowing_conversions but with explicit boundary values
-function widen_signed(x: int8) -> int32 {
+fn widen_signed(x: int8) -> int32 {
   return x;
 }
 
-function widen_unsigned(x: uint8) -> int32 {
+fn widen_unsigned(x: uint8) -> int32 {
   return x;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var i8: int8 = -1;
   var u8: uint8 = 255;
   var s: int32 = widen_signed(i8);

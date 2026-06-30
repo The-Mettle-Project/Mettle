@@ -11,7 +11,7 @@ import "std/mem";
 
 const SIZE = 5000;
 
-function sieve(flags: uint8*, size: int32) -> int32 {
+fn sieve(flags: uint8*, size: int32) -> int32 {
   var primeCount: int32 = 0;
   var i: int32 = 2;
   while (i <= size) {
@@ -28,7 +28,7 @@ function sieve(flags: uint8*, size: int32) -> int32 {
   return primeCount;
 }
 
-function benchmark(flags: uint8*) -> int32 {
+fn benchmark(flags: uint8*) -> int32 {
   var i: int32 = 0;
   while (i < SIZE) {
     flags[i] = 1;
@@ -37,7 +37,7 @@ function benchmark(flags: uint8*) -> int32 {
   return sieve(flags, SIZE);
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var passes: int32 = 3000;
   var flags: uint8[5000];
 
