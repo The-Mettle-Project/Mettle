@@ -107,6 +107,63 @@ int ir_try_emit_aggregate_symbol_memcpy(
   }
 }
 
+/* Whole-struct copy into an arbitrary lvalue address (e.g. `cfg.rect = r;`).
+ *
+ * Mirrors ir_try_emit_aggregate_symbol_memcpy, but the destination is an
+ * already-computed address operand rather than a named symbol. Without this,
+ * the lvalue-store path emits a single word-sized IR_OP_STORE for an aggregate
+ * RHS and silently drops everything past the first 8 bytes. */
+int ir_try_emit_aggregate_address_memcpy(IRLoweringContext *context,
+                                         IRFunction *function,
+                                         const IROperand *dest_addr,
+                                         const IROperand *value, Type *dest_type,
+                                         SourceLocation location) {
+  int nbytes = 0;
+
+  if (!context || !function || !dest_addr || !value) {
+    return 0;
+  }
+  if (value->kind != IR_OPERAND_SYMBOL || !value->name) {
+    return 0;
+  }
+  if (!dest_type || dest_type->kind != TYPE_STRUCT) {
+    return 0;
+  }
+  if (dest_type->size == 0 || dest_type->size > (size_t)INT_MAX) {
+    return 0;
+  }
+  nbytes = (int)dest_type->size;
+  if (nbytes <= 8) {
+    return 0;
+  }
+
+  {
+    IROperand src_addr = ir_operand_none();
+    IROperand dest_copy = ir_clone_operand_local(dest_addr);
+    IRInstruction store = {0};
+    int ok = 0;
+
+    if (dest_copy.kind == IR_OPERAND_NONE) {
+      return 0;
+    }
+    if (!ir_emit_address_of_symbol(context, function, value->name, location,
+                                   &src_addr)) {
+      ir_operand_destroy(&dest_copy);
+      return 0;
+    }
+
+    store.op = IR_OP_STORE;
+    store.location = location;
+    store.dest = dest_copy;
+    store.lhs = src_addr;
+    store.rhs = ir_operand_int((long long)nbytes);
+    ok = ir_emit(context, function, &store);
+    ir_operand_destroy(&dest_copy);
+    ir_operand_destroy(&src_addr);
+    return ok;
+  }
+}
+
 int ir_emit_symbol_assignment(IRLoweringContext *context,
                                      IRFunction *function,
                                      const char *name,

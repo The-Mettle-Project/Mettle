@@ -863,6 +863,59 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
       return 0;
     }
 
+    /* Aggregate-typed member/index read by value (a struct or array, e.g.
+     * `cfg.rect` passed by value). The backend cannot LOAD more than a register
+     * word, and ir_type_storage_size() collapses the rest to 8 bytes -- which
+     * would copy only the first word and leave the remainder stack garbage.
+     * Instead copy the whole aggregate into a fresh named local via the
+     * wide-STORE memcpy path and yield that local as the value. */
+    if (value_type->name &&
+        (value_type->kind == TYPE_STRUCT || value_type->kind == TYPE_ARRAY) &&
+        value_type->size > 8 && value_type->size <= (size_t)INT_MAX) {
+      char *agg_name = ir_new_label_name(context, "agg_byval");
+      IROperand dest_addr = ir_operand_none();
+      IRInstruction store = {0};
+      int ok = 0;
+
+      ir_operand_destroy(&destination);
+      if (!agg_name) {
+        ir_operand_destroy(&address);
+        ir_set_error(context, "Out of memory while copying aggregate value");
+        return 0;
+      }
+      ok = ir_emit_local_declaration(context, function, agg_name,
+                                     value_type->name, expression->location) &&
+           ir_emit_address_of_symbol(context, function, agg_name,
+                                     expression->location, &dest_addr);
+      if (!ok) {
+        free(agg_name);
+        ir_operand_destroy(&dest_addr);
+        ir_operand_destroy(&address);
+        return 0;
+      }
+
+      store.op = IR_OP_STORE;
+      store.location = expression->location;
+      store.dest = dest_addr;
+      store.lhs = address;
+      store.rhs = ir_operand_int((long long)value_type->size);
+      ok = ir_emit(context, function, &store);
+      ir_operand_destroy(&dest_addr);
+      ir_operand_destroy(&address);
+      if (!ok) {
+        free(agg_name);
+        return 0;
+      }
+
+      *out_value = ir_operand_symbol(agg_name);
+      free(agg_name);
+      if (!out_value->name) {
+        ir_set_error(context, "Out of memory while copying aggregate value");
+        return 0;
+      }
+      return 1;
+    }
+
     IRInstruction load = {0};
     load.op = IR_OP_LOAD;
     load.location = expression->location;

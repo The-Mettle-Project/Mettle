@@ -231,6 +231,17 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
       return 0;
     }
 
+    /* Aggregate destinations (struct fields, indexed struct elements) must copy
+     * the whole struct. A plain IR_OP_STORE of an aggregate RHS only moves one
+     * word, silently dropping everything past the first 8 bytes. */
+    if (ir_try_emit_aggregate_address_memcpy(context, function, &address, &value,
+                                             target_type,
+                                             statement->location)) {
+      ir_operand_destroy(&address);
+      ir_operand_destroy(&value);
+      return 1;
+    }
+
     IRInstruction store = {0};
     store.op = IR_OP_STORE;
     store.location = statement->location;

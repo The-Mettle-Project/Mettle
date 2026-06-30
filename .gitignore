@@ -33,3 +33,4 @@ _mlopt.ir
 _mlopt.disp
 _mlopt.explain
 *.mprof
+ui_test.mettle
