@@ -2002,7 +2002,10 @@ static int mir_emit_global_reload_names(MirFunction *fn, CodeGenerator *g,
     }
     int is_signed =
         code_generator_binary_resolved_type_is_signed_integer(s->type);
-    MirVregId v = mir_name_map_get_or_add(map, fn, name, 0, MIR_RC_GP, 8);
+    int fbits = code_generator_binary_resolved_type_float_bits(s->type);
+    MirVregId v = mir_name_map_get_or_add(map, fn, name, 0,
+                                          fbits ? MIR_RC_XMM : MIR_RC_GP,
+                                          fbits ? fbits / 8 : 8);
     if (v == MIR_VREG_NONE) {
       return 0;
     }
@@ -4793,8 +4796,13 @@ int code_generator_binary_emit_function_via_mir(
       }
       int is_signed =
           code_generator_binary_resolved_type_is_signed_integer(s->type);
-      MirVregId v =
-          mir_name_map_get_or_add(&map, &fn, op->name, 0, MIR_RC_GP, 8);
+      /* A float global must be cached in an XMM vreg so float consumers read it
+       * via the XMM path; a GP cache leaves the bits in a GP register the float
+       * ops never read (reading an uninitialized xmm instead). */
+      int fbits = code_generator_binary_resolved_type_float_bits(s->type);
+      MirVregId v = mir_name_map_get_or_add(
+          &map, &fn, op->name, 0, fbits ? MIR_RC_XMM : MIR_RC_GP,
+          fbits ? fbits / 8 : 8);
       if (v == MIR_VREG_NONE) {
         goto oom;
       }

@@ -1844,6 +1844,30 @@ catch {
   Write-CaseResult -Name "generics_runtime" -Passed $false -Reason $_.Exception.Message
 }
 
+# Global float variables: compile with --build and verify they read back their
+# initializer (and survive mutation) instead of reading 0 from an uninitialized
+# XMM lane. Returns 25+125+35+30 = 215.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "global_float_var.exe"
+  $buildOut = & $CompilerPath --build "tests\test_global_float_var.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "Global float var build failed: $buildOut"
+  }
+  if (-not (Test-Path $exePath)) {
+    throw "Global float var build did not produce an executable"
+  }
+  & $exePath 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 215) {
+    throw "Global float var exited with $LASTEXITCODE (expected 215)"
+  }
+  Write-CaseResult -Name "global_float_var_runtime" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "global_float_var_runtime" -Passed $false -Reason $_.Exception.Message
+}
+
 # Switch range cases: compile with --build and verify inclusive-interval dispatch.
 $total++
 try {
@@ -2092,26 +2116,28 @@ catch {
   Write-CaseResult -Name "const_local_float_string_runtime" -Passed $false -Reason $_.Exception.Message
 }
 
-# Global non-integer const is rejected with a clear diagnostic (not yet supported).
+# Global non-integer consts (float + string): --build and verify runtime value.
+# The float global now loads correctly in the direct-object backend, so it is no
+# longer rejected; the string global must emit and link like any global.
 $total++
 try {
-  $srcPath = Join-Path $tmpDir "const_global_float.mettle"
-  Set-Content -LiteralPath $srcPath -Encoding utf8 -Value @(
-    "const PI = 3.14;",
-    "function main() -> int32 { return 0; }"
-  )
-  $out = & $CompilerPath $srcPath 2>&1 | Out-String
-  if ($LASTEXITCODE -eq 0) {
-    throw "Global non-integer const unexpectedly compiled"
+  $exePath = Join-Path $tmpDir "const_global_float_string.exe"
+  $buildOut = & $CompilerPath --build "tests\test_const_global_float_string.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "Global non-integer const build failed: $buildOut"
   }
-  if ($out -notmatch "non-integer type 'float64' is not yet supported") {
-    throw "Global non-integer const error message changed: $out"
+  if (-not (Test-Path $exePath)) {
+    throw "Global non-integer const build did not produce an executable"
   }
-  Write-CaseResult -Name "err_const_global_float" -Passed $true
+  & $exePath 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 42) {
+    throw "Global non-integer const exited with $LASTEXITCODE (expected 42)"
+  }
+  Write-CaseResult -Name "const_global_float_string_runtime" -Passed $true
 }
 catch {
   $failed++
-  Write-CaseResult -Name "err_const_global_float" -Passed $false -Reason $_.Exception.Message
+  Write-CaseResult -Name "const_global_float_string_runtime" -Passed $false -Reason $_.Exception.Message
 }
 
 # Conditional imports: --build and verify off-target guarded imports are dropped.

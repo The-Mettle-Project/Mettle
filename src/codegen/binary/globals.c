@@ -113,7 +113,8 @@ int binary_global_const_table_add(const char *name, long long int_value,
     existing->is_float = is_float ? 1 : 0;
     existing->bits =
         binary_global_const_bits(int_value, float_value, existing->is_float);
-    existing->can_inline_load = can_inline_load ? 1 : 0;
+    existing->can_inline_load =
+        (existing->is_float ? 0 : (can_inline_load ? 1 : 0));
     return 1;
   }
 
@@ -133,6 +134,14 @@ int binary_global_const_table_add(const char *name, long long int_value,
   char *name_copy = mettle_strdup(name);
   if (!name_copy) {
     return 0;
+  }
+
+  /* Float globals are never inline-loaded as a GP immediate: that path emits
+   * `mov GP_reg, imm64`, leaving the bits in a general-purpose register, but a
+   * float consumer reads its value from an XMM register. Force the RIP-relative
+   * load path (which is XMM-aware) so the value reaches an XMM lane. */
+  if (is_float) {
+    can_inline_load = 0;
   }
 
   size_t index = g_binary_global_consts.count;

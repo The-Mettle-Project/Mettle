@@ -1483,6 +1483,34 @@ static int encode_load_global(MirFunction *fn, const MirInst *in) {
   if (!name) {
     return enc_err(fn, "MIR_LOAD_GLOBAL without a symbol");
   }
+
+  /* A float global is cached in an XMM vreg: load its raw bits into a GP scratch
+   * (the RIP-relative load helper is GP-only) then movd/movq them into the XMM
+   * lane. Float globals are never const-folded (see globals.c), so no immediate
+   * branch is needed here. */
+  if (in->dst.kind == MIR_OPK_VREG &&
+      fn->vregs[in->dst.vreg].rclass == MIR_RC_XMM) {
+    int width = fn->vregs[in->dst.vreg].width;
+    const char *link = code_generator_get_link_symbol_name(g, name);
+    Symbol *s =
+        (g && g->symbol_table) ? symbol_table_lookup(g->symbol_table, name)
+                               : NULL;
+    if (!link || !link[0] || !s) {
+      return enc_err(fn, "unresolved global in MIR_LOAD_GLOBAL");
+    }
+    if (!code_generator_binary_emit_global_symbol_load(g, ctx, link, s->type,
+                                                       s->is_extern, SCRATCH_A)) {
+      return enc_err(fn, "out of memory loading float global");
+    }
+    int moved = (width == 4)
+                    ? binary_emit_movd_xmm_reg(&ctx->code, FSCRATCH_A, SCRATCH_A)
+                    : binary_emit_movq_xmm_reg(&ctx->code, FSCRATCH_A, SCRATCH_A);
+    if (!moved) {
+      return enc_err(fn, "out of memory staging float global to xmm");
+    }
+    return xmm_store(fn, &in->dst, FSCRATCH_A, width);
+  }
+
   BinaryGpRegister D;
   int dst_in_reg = dst_is_reg(fn, &in->dst, &D);
   BinaryGpRegister target = dst_in_reg ? D : SCRATCH_A;
@@ -1521,10 +1549,31 @@ static int encode_store_global(MirFunction *fn, const MirInst *in) {
   if (!name) {
     return enc_err(fn, "MIR_STORE_GLOBAL without a symbol");
   }
-  int rok = 1;
-  BinaryGpRegister src = value_reg(fn, &in->b, SCRATCH_A, &rok);
-  if (!rok) {
-    return 0;
+  BinaryGpRegister src;
+  /* A float global is cached in an XMM vreg: pull its bits out of the XMM lane
+   * into a GP scratch, then the RIP-relative store writes the low `size` bytes
+   * (the GP store helper is GP-only). */
+  if (in->b.kind == MIR_OPK_VREG &&
+      fn->vregs[in->b.vreg].rclass == MIR_RC_XMM) {
+    int width = fn->vregs[in->b.vreg].width;
+    int xok = 1;
+    BinaryXmmRegister xsrc = xmm_value(fn, &in->b, FSCRATCH_A, width, &xok);
+    if (!xok) {
+      return 0;
+    }
+    int moved = (width == 4)
+                    ? binary_emit_movd_reg_xmm(&ctx->code, SCRATCH_A, xsrc)
+                    : binary_emit_movq_reg_xmm(&ctx->code, SCRATCH_A, xsrc);
+    if (!moved) {
+      return enc_err(fn, "out of memory staging float global from xmm");
+    }
+    src = SCRATCH_A;
+  } else {
+    int rok = 1;
+    src = value_reg(fn, &in->b, SCRATCH_A, &rok);
+    if (!rok) {
+      return 0;
+    }
   }
   const char *link = code_generator_get_link_symbol_name(g, name);
   Symbol *s = (g && g->symbol_table) ? symbol_table_lookup(g->symbol_table, name)

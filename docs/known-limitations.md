@@ -18,7 +18,7 @@ This document lists current limitations of the Mettle language, compiler, and ru
 
 - `const NAME [: type] = <expr>;` declares an immutable binding; reassignment is a compile error. Constants must be declared before use.
   - **Top-level (global) `const`** must have **integer** type. Its value is folded at every use site (it needs no storage), so the initializer must be a compile-time constant integer expression (literals, `sizeof`, other constants, and arithmetic/bitwise/comparison operators over them).
-  - **Local (function-scope) `const`** may have **any** type — integer, float, string, or aggregate. It is registered as an immutable local variable initialized to its value (not folded), so the initializer follows the same rules as any local variable initializer.
+  - **Local (function-scope) `const`** may have **any** type: integer, float, string, or aggregate. It is registered as an immutable local variable initialized to its value (not folded), so the initializer follows the same rules as any local variable initializer.
   - **Global float, string, and aggregate constants are not yet supported** and are rejected with a clear diagnostic, because global non-integer initializer codegen is not yet emitted. Use a top-level `var` (which is mutable) or a function-local `const` instead.
 
 ### Traits & Generics

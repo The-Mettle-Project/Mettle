@@ -473,9 +473,18 @@ int code_generator_generate_program_binary_object(CodeGenerator *generator,
       if (var_data->is_extern) {
         break;
       }
-      // `const` declarations are folded at use sites and carry no storage.
+      // An integer `const` folds to a SYMBOL_CONSTANT at every use site and
+      // carries no storage. A non-integer `const` (float/string/aggregate) is
+      // registered as an immutable variable instead and DOES need storage,
+      // since the IR references it via a RIP-relative load like any global.
       if (var_data->is_const) {
-        break;
+        Symbol *const_symbol =
+            generator->symbol_table
+                ? symbol_table_lookup(generator->symbol_table, var_data->name)
+                : NULL;
+        if (!const_symbol || const_symbol->kind == SYMBOL_CONSTANT) {
+          break;
+        }
       }
       if (!code_generator_emit_binary_global_variable(generator, var_data)) {
         return 0;

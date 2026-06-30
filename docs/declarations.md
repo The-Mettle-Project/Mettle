@@ -31,7 +31,7 @@ function main() -> int32 {
 
 A **top-level** `const` must have integer type. It is folded directly into the machine code at every use site and occupies no storage, so its initializer must be a compile-time constant integer expression: integer literals, `sizeof`, other constants, and arithmetic, bitwise, and comparison operators over them.
 
-A **local** (function-scope) `const` may have any type — integer, float, string, or aggregate. It is an immutable binding backed by normal local storage, so its initializer follows the same rules as any local variable initializer. Global float, string, and aggregate constants are not yet supported; use a top-level `var` or a function-local `const`.
+A **local** (function-scope) `const` may have any type: integer, float, string, or aggregate. It is an immutable binding backed by normal local storage, so its initializer follows the same rules as any local variable initializer. Global float, string, and aggregate constants are not yet supported; use a top-level `var` or a function-local `const`.
 
 ## Functions
 

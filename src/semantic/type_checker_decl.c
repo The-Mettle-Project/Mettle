@@ -585,6 +585,11 @@ int type_checker_process_declaration(TypeChecker *checker,
             "Constant '%s' must have an initializer", var_decl->name);
         return 0;
       }
+      // Integer consts fold to a compile-time value: at global scope they are
+      // registered as SYMBOL_CONSTANT (folded at every use, no storage). A
+      // non-integer const (float/string/aggregate) is not folded; it falls
+      // through to immutable-variable registration below and gets normal global
+      // (or local) storage. The initializer's assignability was validated above.
       if (type_checker_is_integer_type(var_type)) {
         long long const_value = 0;
         if (!type_checker_eval_integer_constant_with_checker(
@@ -622,22 +627,12 @@ int type_checker_process_declaration(TypeChecker *checker,
           return 1;
         }
         // Local integer const: fall through to immutable variable registration.
-      } else if (current_scope && current_scope->type == SCOPE_GLOBAL) {
-        // Non-integer consts are registered as immutable variables, which at
-        // global scope rely on float/string global-initializer codegen that is
-        // not yet emitted (the value would read back as zero / fail to link).
-        // Keep them function-local until that lands; integer globals still fold.
-        type_checker_set_error_at_location(
-            checker, declaration->location,
-            "Global constant '%s' of non-integer type '%s' is not yet "
-            "supported; declare it inside a function, or use a top-level `var`",
-            var_decl->name, var_type->name);
-        return 0;
       }
-      // Local non-integer const (float, string, ...): fall through to immutable
-      // variable registration; storage and the initializer are emitted like a
-      // normal local variable, and the immutable flag below rejects
-      // reassignment.
+      // Local const (any type) and non-integer global const (float, string,
+      // ...): fall through to immutable-variable registration; storage and the
+      // initializer are emitted like a normal variable, and the immutable flag
+      // below rejects reassignment. Global float/string globals now load
+      // correctly in the direct-object backend, so they are no longer rejected.
     }
 
     // Check for duplicate declaration in current scope.
