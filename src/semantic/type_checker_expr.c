@@ -54,6 +54,51 @@ int type_checker_desugar_struct_method_call(TypeChecker *checker,
            call->function_name);
 
   if (!symbol_table_lookup(checker->symbol_table, mangled_name)) {
+    /* No method by this name. If the receiver struct has a function-pointer or
+     * closure FIELD of this name, `obj.field(args)` is a call THROUGH that
+     * field: rewrite the node into a function-pointer call on `obj.field`,
+     * which handles both thin pointers and closures (the call site loads the
+     * code pointer and, for a closure, threads the environment). */
+    Type *field_type = type_get_field_type(struct_type, call->function_name);
+    if (field_type && field_type->kind == TYPE_FUNCTION_POINTER) {
+      free(mangled_name);
+      ASTNode *obj = call->object;
+      ASTNode **args = call->arguments;
+      size_t argc = call->argument_count;
+      ASTNode *member = ast_create_member_access(obj, call->function_name,
+                                                 expression->location);
+      if (!member) {
+        type_checker_set_error_at_location(
+            checker, expression->location,
+            "Out of memory while resolving field call");
+        return 0;
+      }
+      FuncPtrCall *fp = malloc(sizeof(FuncPtrCall));
+      if (!fp) {
+        type_checker_set_error_at_location(
+            checker, expression->location,
+            "Out of memory while resolving field call");
+        return 0;
+      }
+      fp->function = member;
+      fp->arguments = args;
+      fp->argument_count = argc;
+      /* The argument array is reused; `obj` now belongs to `member`. The old
+       * CallExpression payload is intentionally left unfreed - a small bounded
+       * compile-time allocation - to avoid any ownership mismatch. */
+      expression->child_count = 0;
+      expression->type = AST_FUNC_PTR_CALL;
+      expression->data = fp;
+      expression->resolved_type = NULL;
+      ast_add_child(expression, member);
+      for (size_t i = 0; i < argc; i++) {
+        if (args[i]) {
+          ast_add_child(expression, args[i]);
+        }
+      }
+      return 1;
+    }
+
     type_checker_set_error_at_location(
         checker, expression->location,
         "Undefined method '%s.%s' (expected function '%s')",
@@ -422,9 +467,16 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
     // Thread.join(), Mutex.new(), mutex.lock(), guard (unlock via drop),
     // Atomic.new(), atomic.load/store/fetch_add/fetch_sub/cas(),
     // channel(), tx.send(), rx.recv()
-    if (call && call->object &&
-        !type_checker_desugar_struct_method_call(checker, expression, call)) {
-      return NULL;
+    if (call && call->object) {
+      if (!type_checker_desugar_struct_method_call(checker, expression, call)) {
+        return NULL;
+      }
+      /* The desugar may have rewritten a closure/fn-pointer field call
+       * (`obj.field(args)`) into a function-pointer call; re-dispatch on the new
+       * node kind, since the CallExpression `call` is no longer valid. */
+      if (expression->type != AST_FUNCTION_CALL) {
+        return type_checker_infer_type_internal(checker, expression);
+      }
     }
 
     Symbol *func_symbol =

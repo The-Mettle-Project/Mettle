@@ -144,6 +144,22 @@ fn main() -> int32 {
 }
 ```
 
+A closure (or plain function pointer) stored in a struct field is called through the field, including via a pointer-to-struct receiver:
+
+```mettle
+struct Handler { on_event: Fn(int32) -> int32; }
+
+fn main() -> int32 {
+  var weight: int32 = 2;
+  var h: Handler;
+  h.on_event = fn(ev: int32) -> int32 { return ev * weight; };
+  println_int(h.on_event(21));   // 42
+  var hp: Handler* = &h;
+  println_int(hp.on_event(5));   // 10
+  return 0;
+}
+```
+
 A capturing closure and a thin `fn(...)->R` are not interchangeable: assigning one where the other is expected is a compile error (a thin pointer cannot carry an environment, and a closure call site reads a code pointer a thin value does not have). Within a single function you may also bind a closure to an inferred local (`var f = ...`). See [known limitations](known-limitations.md).
 
 ## Array Types

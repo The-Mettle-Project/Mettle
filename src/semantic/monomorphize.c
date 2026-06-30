@@ -2268,6 +2268,12 @@ static void cc_buf_add(CCBuf *b, const char *s) {
   b->len += n;
 }
 
+static void cc_buf_add_num(CCBuf *b, const char *prefix, size_t n) {
+  char tmp[32];
+  snprintf(tmp, sizeof(tmp), "%s%zu", prefix, n);
+  cc_buf_add(b, tmp);
+}
+
 static int g_cc_counter;
 
 /* Lift a capturing lambda: synthesize an environment struct, a lifted function
@@ -2316,14 +2322,14 @@ static void cc_emit_capturing(ASTNode *lambda, FunctionDeclaration *fd,
   cc_buf_add(&src, ";\n");
   for (size_t i = 0; i < caps->count; i++) {
     cc_buf_add(&src, "  ");
-    cc_buf_add(&src, caps->names[i]);
+    cc_buf_add_num(&src, "__cap", i);
     cc_buf_add(&src, ": ");
     cc_buf_add(&src, caps->types[i]);
     cc_buf_add(&src, ";\n");
   }
   cc_buf_add(&src, "}\n");
 
-  /* fn __lam_N(__env: __ClosEnv_N*, userparams) -> R { var cap: T = __env.cap; ... } */
+  /* fn __lam_N(__env: __ClosEnv_N*, userparams) -> R { var cap: T = __env.__capK; ... } */
   cc_buf_add(&src, "fn ");
   cc_buf_add(&src, lam_name);
   cc_buf_add(&src, "(__env: ");
@@ -2344,7 +2350,7 @@ static void cc_emit_capturing(ASTNode *lambda, FunctionDeclaration *fd,
     cc_buf_add(&src, ": ");
     cc_buf_add(&src, caps->types[i]);
     cc_buf_add(&src, " = __env.");
-    cc_buf_add(&src, caps->names[i]);
+    cc_buf_add_num(&src, "__cap", i);
     cc_buf_add(&src, ";\n");
   }
   cc_buf_add(&src, "}\n");
@@ -2354,7 +2360,7 @@ static void cc_emit_capturing(ASTNode *lambda, FunctionDeclaration *fd,
   cc_buf_add(&src, make_name);
   cc_buf_add(&src, "(");
   for (size_t i = 0; i < caps->count; i++) {
-    cc_buf_add(&src, caps->names[i]);
+    cc_buf_add_num(&src, "__arg", i);
     cc_buf_add(&src, ": ");
     cc_buf_add(&src, caps->types[i]);
     if (i + 1 < caps->count)
@@ -2371,9 +2377,9 @@ static void cc_emit_capturing(ASTNode *lambda, FunctionDeclaration *fd,
   cc_buf_add(&src, ";\n");
   for (size_t i = 0; i < caps->count; i++) {
     cc_buf_add(&src, "  __e.");
-    cc_buf_add(&src, caps->names[i]);
+    cc_buf_add_num(&src, "__cap", i);
     cc_buf_add(&src, " = ");
-    cc_buf_add(&src, caps->names[i]);
+    cc_buf_add_num(&src, "__arg", i);
     cc_buf_add(&src, ";\n");
   }
   cc_buf_add(&src, "  return __e;\n}\n");
