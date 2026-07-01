@@ -92,6 +92,7 @@ ASTNode *ast_clone_node(ASTNode *node) {
     dst->is_extern = src->is_extern;
     dst->is_exported = src->is_exported;
     dst->is_const = src->is_const;
+    dst->structural_type = src->structural_type;
     dst->link_name = ast_copy_string(src->link_name);
     dst->initializer =
         src->initializer ? ast_clone_node(src->initializer) : NULL;
@@ -1194,6 +1195,7 @@ ASTNode *ast_create_var_declaration(const char *name, const char *type_name,
   var_decl->is_extern = 0;
   var_decl->is_exported = 0;
   var_decl->is_const = 0;
+  var_decl->structural_type = 0;
   var_decl->link_name = NULL;
   node->data = var_decl;
 

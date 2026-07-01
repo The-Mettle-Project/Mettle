@@ -114,7 +114,7 @@ A lambda that references a variable from an enclosing scope *captures* it, becom
 ```mettle
 fn main() -> int32 {
   var base: int32 = 10;
-  var add = fn(x: int32) -> int32 { return x + base; };  // captures base
+  var add: Fn(int32) -> int32 = fn(x: int32) -> int32 { return x + base; };  // captures base
   print_int(add(5));    // 15
   return 0;
 }
@@ -126,7 +126,7 @@ Captures are **by value**: each captured variable's value is snapshotted when th
 fn counter(start: int32) -> Fn() -> int32 {
   return fn() -> int32 { start = start + 1; return start; };
 }
-var next = counter(0);
+var next: Fn() -> int32 = counter(0);
 println_int(next());   // 1
 println_int(next());   // 2 - state persists in the closure's environment
 ```
@@ -145,7 +145,7 @@ fn apply_twice(f: Fn(int32) -> int32, v: int32) -> int32 {
 }
 
 fn main() -> int32 {
-  var add = make_adder(10);
+  var add: Fn(int32) -> int32 = make_adder(10);
   println_int(add(5));            // 15
   println_int(apply_twice(add, 0)); // 20
   println_int(make_adder(3)(5));  // 8 - the returned closure is called directly
@@ -182,7 +182,7 @@ fn main() -> int32 {
 }
 ```
 
-Adaptation applies at the point a plain function or lambda literal is directly written into an `Fn(...)` boundary (a call argument, a `var` declaration, or a `return`). A thin value already sitting in a variable, or assigned into an `Fn(...)`-typed struct field, is not yet adapted; write `&func` (or the lambda literal) directly at the boundary. Within a single function you may also bind a closure to an inferred local (`var f = ...`). See [known limitations](known-limitations.md).
+Adaptation applies at the point a plain function or lambda literal is directly written into an `Fn(...)` boundary (a call argument, a `var` declaration, or a `return`). A thin value already sitting in a variable, or assigned into an `Fn(...)`-typed struct field, is not yet adapted; write `&func` (or the lambda literal) directly at the boundary. Like every binding in Mettle, a local holding a closure states its type explicitly - `var f: Fn(int32) -> int32 = ...`. See [known limitations](known-limitations.md).
 
 ## Array Types
 

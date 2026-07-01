@@ -4109,6 +4109,11 @@ static ASTNode *parser_parse_range_for(Parser *parser, SourceLocation location) 
   // initializer: var <name>[: type] = <start>
   ASTNode *initializer =
       ast_create_var_declaration(var_name, type_name, start, location);
+  // The loop counter's type is structural (it takes the type of its bound), so
+  // it is exempt from the "explicit type required" rule when no `: type` given.
+  if (initializer && !type_name) {
+    ((VarDeclaration *)initializer->data)->structural_type = 1;
+  }
   // condition: <name> <  <end>   (exclusive)
   //            <name> <= <end>   (inclusive)
   ASTNode *condition = ast_create_binary_expression(
@@ -4245,11 +4250,15 @@ static ASTNode *parser_parse_dispatch_statement(Parser *parser) {
     goto oom;
   }
 
-  // var __mdsp<uid>_a<i> = arg_i;   (type inferred from the argument)
+  // var __mdsp<uid>_a<i> = arg_i;   (type is structural: it is the arg's type)
   for (size_t i = 0; i < nargs; i++) {
     char an[32];
     snprintf(an, sizeof(an), "__mdsp%d_a%zu", uid, i);
-    parser_block_add(blk, ast_create_var_declaration(an, NULL, args[i], loc));
+    ASTNode *arg_decl = ast_create_var_declaration(an, NULL, args[i], loc);
+    if (arg_decl && arg_decl->data) {
+      ((VarDeclaration *)arg_decl->data)->structural_type = 1;
+    }
+    parser_block_add(blk, arg_decl);
     args[i] = NULL; // ownership moved into the var decl
   }
 

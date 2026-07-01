@@ -17,17 +17,17 @@ fn g(x: int32) -> int32 { return x + 1; }
 fn pick() -> fn(int32) -> int32 { return &g; }
 
 fn main() -> int32 {
-  var add = make_adder(10);
+  var add: Fn(int32) -> int32 = make_adder(10);
   if (add(5) != 15) {
     return 1;
   }
-  var add2 = make_adder(100);
+  var add2: Fn(int32) -> int32 = make_adder(100);
   if (add2(5) != 105 || add(5) != 15) {   // independent environments
     return 2;
   }
 
   var k: int32 = 3;
-  var addk = fn(x: int32) -> int32 { return x + k; };
+  var addk: Fn(int32) -> int32 = fn(x: int32) -> int32 { return x + k; };
   if (apply_twice(addk, 10) != 16) {       // ((10+3)+3)
     return 3;
   }

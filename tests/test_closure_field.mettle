@@ -30,7 +30,7 @@ fn main() -> int32 {
 
   // Capturing a soft-keyword-named local (`inc`) must still synthesize.
   var inc: int32 = 5;
-  var bump = fn(x: int32) -> int32 { return x + inc; };
+  var bump: Fn(int32) -> int32 = fn(x: int32) -> int32 { return x + inc; };
   if (bump(10) != 15) {
     return 4;
   }

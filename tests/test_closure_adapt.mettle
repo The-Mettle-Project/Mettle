@@ -40,7 +40,7 @@ fn main() -> int32 {
   }
 
   // Return-statement adaptation.
-  var g = get_doubler();
+  var g: Fn(int32) -> int32 = get_doubler();
   if (g(10) != 20) {
     return 4;
   }

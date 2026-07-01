@@ -6,7 +6,7 @@ import "std/io";
 
 fn main() -> int32 {
   var base: int32 = 10;
-  var add = fn(x: int32) -> int32 { return x + base; };
+  var add: Fn(int32) -> int32 = fn(x: int32) -> int32 { return x + base; };
   if (add(5) != 15) {
     return 1;
   }
@@ -17,7 +17,7 @@ fn main() -> int32 {
   // Multiple captures.
   var a: int32 = 3;
   var b: int32 = 100;
-  var sum3 = fn(x: int32) -> int32 { return x + a + b; };
+  var sum3: Fn(int32) -> int32 = fn(x: int32) -> int32 { return x + a + b; };
   if (sum3(5) != 108) {
     return 3;
   }
@@ -32,7 +32,7 @@ fn main() -> int32 {
   // A closure driving a loop over local state.
   var total: int32 = 0;
   var i: int32 = 0;
-  var dbl = fn(v: int32) -> int32 { return v * 2; };
+  var dbl: fn(int32) -> int32 = fn(v: int32) -> int32 { return v * 2; };
   while (i < 4) {
     total = total + dbl(i);
     i = i + 1;

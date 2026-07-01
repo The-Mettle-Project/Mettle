@@ -4,14 +4,17 @@ Declarations introduce variables, functions, types, and other program elements. 
 
 ## Variables
 
-Variables are declared with `var`, a name, a type, and an optional initializer. Variables require an explicit type. Initializers are optional for locals; globals can have initializers. The value `0` is a valid initializer for pointers (null).
+Variables are declared with `var`, a name, a type, and an optional initializer. **Mettle never infers binding types**: every `var` (and every local `const`) must state its type explicitly - a declaration with an initializer but no type annotation is a compile error. The value `0` is a valid initializer for pointers (null).
 
 ```mettle
 var x: int32;
 var y: int32 = 42;
 var msg: string = "hello";
 var buf: uint8[1024];
+var z = 1 + 2;              // ERROR: 'z' requires an explicit type
 ```
+
+(Only two kinds of binding get their type structurally rather than by annotation: a range-`for` loop counter takes the type of its bound, and a top-level `const` - which is integer-only - takes its literal's type. Neither is inferred from an arbitrary expression.)
 
 ## Constants
 
@@ -19,17 +22,17 @@ Constants are declared with `const`, a name, an optional type, and a required in
 
 ```mettle
 const MAX: int32 = 100;
-const STEP = 4;            // type inferred as int32
+const STEP = 4;            // top-level const is integer-only; type is its literal's
 const BOUND = MAX - STEP;  // may reference earlier constants
 
 fn main() -> int32 {
-    const RATE = 1.5;      // local consts may be float, string, ...
-    const LABEL = "ready";
+    const RATE: float64 = 1.5;   // local consts require an explicit type
+    const LABEL: string = "ready";
     return MAX;
 }
 ```
 
-A **top-level** `const` must have integer type. It is folded directly into the machine code at every use site and occupies no storage, so its initializer must be a compile-time constant integer expression: integer literals, `sizeof`, other constants, and arithmetic, bitwise, and comparison operators over them.
+A **top-level** `const` must have integer type. It is folded directly into the machine code at every use site and occupies no storage, so its initializer must be a compile-time constant integer expression: integer literals, `sizeof`, other constants, and arithmetic, bitwise, and comparison operators over them. Because it is integer-only and its value is a compile-time literal, a top-level `const` may omit the type annotation. A **local** `const` must state its type, like any local binding.
 
 A **local** (function-scope) `const` may have any type: integer, float, string, or aggregate. It is an immutable binding backed by normal local storage, so its initializer follows the same rules as any local variable initializer. Global float, string, and aggregate constants are not yet supported; use a top-level `var` or a function-local `const`.
 

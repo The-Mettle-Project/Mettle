@@ -552,16 +552,14 @@ int type_checker_process_declaration(TypeChecker *checker,
       }
       if (var_type) {
         /* A capturing closure carries a heap environment and cannot be stored in
-         * a plain function-pointer type. Use an inferred local (`var f = ...`)
-         * or capture nothing. */
+         * a plain function-pointer type; it needs a closure type `Fn(...)`. */
         if (init_type && init_type->kind == TYPE_FUNCTION_POINTER &&
             init_type->closure_env &&
             !(var_type->kind == TYPE_FUNCTION_POINTER && var_type->closure_env)) {
           type_checker_set_error_at_location(
               checker, var_decl->initializer->location,
               "a capturing closure cannot be stored in a plain function-pointer "
-              "type '%s'; declare the variable without a type (var %s = ...) or "
-              "capture nothing",
+              "type '%s'; declare '%s' with a closure type 'Fn(...)' instead",
               var_type->name, var_decl->name);
           return 0;
         }
@@ -574,9 +572,24 @@ int type_checker_process_declaration(TypeChecker *checker,
                                             var_type->name, init_type->name);
           return 0;
         }
-      } else {
-        // Type inference: use initializer type
+      } else if (var_decl->structural_type ||
+                 (var_decl->is_const &&
+                  (!current_scope || current_scope->type == SCOPE_GLOBAL))) {
+        // Exempt: a compiler-synthesized binding whose type is structural (e.g.
+        // a range-`for` counter), or a global `const` (integer-only and folded
+        // at each use, so its type is exactly its literal value's type). Take
+        // the initializer type.
         var_type = init_type;
+      } else {
+        // Mettle requires an explicit type on every user `var` and local
+        // `const` binding; nothing is inferred from an arbitrary initializer.
+        type_checker_set_error_at_location(
+            checker, declaration->location,
+            "%s '%s' requires an explicit type: write '%s %s: <type> = ...' "
+            "(Mettle does not infer binding types)",
+            var_decl->is_const ? "constant" : "variable", var_decl->name,
+            var_decl->is_const ? "const" : "var", var_decl->name);
+        return 0;
       }
     } else if (!var_type) {
       type_checker_set_error_at_location(

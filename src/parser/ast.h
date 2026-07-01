@@ -78,6 +78,11 @@ typedef struct {
   int is_exported;
   int is_const; // declared with `const`: immutable, compile-time integer value
   char *link_name;
+  // Set on compiler-synthesized bindings whose type is determined structurally
+  // (e.g. a range-`for` loop counter takes the type of its bound), which are
+  // exempt from the "explicit type required on var/const" rule. User-written
+  // `var`/`const` declarations always leave this 0.
+  int structural_type;
 } VarDeclaration;
 
 typedef struct {
