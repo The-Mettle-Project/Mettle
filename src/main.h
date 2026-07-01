@@ -5,6 +5,7 @@
 #include "debug/debug_info.h"
 #include "error/error_explain.h"
 #include "error/error_reporter.h"
+#include "ir/ir_verify.h"
 #include "lexer/lexer.h"
 #include "parser/parser.h"
 #include "semantic/register_allocator.h"

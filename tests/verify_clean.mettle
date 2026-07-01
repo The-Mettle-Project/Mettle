@@ -1,0 +1,31 @@
+fn dot(a: int64*, b: int64*, n: int64) -> int64 {
+    var s: int64 = 0;
+    var i: int64 = 0;
+    while (i < n) {
+        s = s + a[i] * b[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+fn scale_all(a: float64*, n: int64, k: float64) -> float64 {
+    var s: float64 = 0.0;
+    var i: int64 = 0;
+    while (i < n) {
+        a[i] = a[i] * k;
+        s = s + a[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() -> int64 {
+    var xs: int64[16];
+    var ys: int64[16];
+    var i: int64 = 0;
+    while (i < 16) { xs[i] = i; ys[i] = 31 - i; i = i + 1; }
+    var fs: float64[8];
+    var j: int64 = 0;
+    while (j < 8) { fs[j] = (float64)j * 0.5; j = j + 1; }
+    return dot(&xs[0], &ys[0], 16) + (int64)scale_all(&fs[0], 8, 3.0);
+}

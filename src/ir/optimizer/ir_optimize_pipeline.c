@@ -1,4 +1,5 @@
 #include "ir_optimize_internal.h"
+#include "../ir_verify.h"
 
 typedef struct {
   IROptPassId id;
@@ -382,6 +383,7 @@ int ir_optimize_program_pipeline(IRProgram *program,
   ir_optimize_set_explain(options && options->explain,
                           options ? options->explain_focus_file : NULL);
   ir_function_index_reset();
+  ir_verify_begin_program(program);
 
   {
     double t0 = ir_pass_time_begin();
@@ -476,6 +478,7 @@ int ir_optimize_program_pipeline(IRProgram *program,
     ir_explain_finalize(1);
   }
   ir_pass_time_report();
+  ir_verify_end_program();
 
   ir_function_index_reset();
   return contracts_ok;

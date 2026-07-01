@@ -1273,6 +1273,21 @@ $cases = @(
   @{ Name = "diag_poison_no_cascade"; Path = "tests/diag_poison_no_cascade.mettle"; ShouldSucceed = $false
      Pattern = "Type mismatch"
      OutputMustNotMatch = @("Undefined variable 'x'") },
+  # --verify translation validation: clean programs validate with zero
+  # divergences; a sabotaged pass is caught, quarantined, and the build heals.
+  @{ Name = "verify_clean"; Path = "tests/verify_clean.mettle"; ShouldSucceed = $true
+     Args = @("--verify")
+     OutputMustMatch = @("translation validation: OK")
+     OutputMustNotMatch = @("MISCOMPILE") },
+  @{ Name = "verify_nullcheck_zerotrip"; Path = "tests/verify_nullcheck_zerotrip.mettle"; ShouldSucceed = $true
+     Args = @("--verify")
+     OutputMustMatch = @("translation validation: OK")
+     OutputMustNotMatch = @("MISCOMPILE") },
+  @{ Name = "verify_sabotage_caught"; Path = "tests/verify_clean.mettle"; ShouldSucceed = $true
+     Args = @("--verify")
+     Env = @{ METTLE_VERIFY_BREAK = "constant_and_branch_simplify:dot" }
+     SkipDeterminism = $true
+     OutputMustMatch = @("MISCOMPILE CAUGHT", "quarantined", "pre-pass IR restored") },
   @{ Name = "err_match_non_exhaustive"; Path = "tests/err_match_non_exhaustive.mettle"; ShouldSucceed = $false; Pattern = "Non-exhaustive match" },
   @{ Name = "err_trait_bound_missing_impl"; Path = "tests/err_trait_bound_missing_impl.mettle"; ShouldSucceed = $false; Pattern = "does not implement trait 'Addable'" },
   @{ Name = "err_trait_bound_missing_second_impl"; Path = "tests/err_trait_bound_missing_second_impl.mettle"; ShouldSucceed = $false; Pattern = "does not implement trait 'SignedNumber'" },
@@ -1501,7 +1516,8 @@ foreach ($case in $cases) {
             }
           }
         }
-        if ($passed -and -not $SkipDeterminism) {
+        if ($passed -and -not $SkipDeterminism -and
+            -not ($case.ContainsKey("SkipDeterminism") -and $case.SkipDeterminism)) {
           $outFile2 = Join-Path $tmpDir ("{0}.second.obj" -f $case.Name)
           if (Test-Path $outFile2) {
             Remove-Item -Path $outFile2 -Force -ErrorAction SilentlyContinue

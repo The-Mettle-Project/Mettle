@@ -385,7 +385,7 @@ static void print_doc_reference(const char *argv0, const char *relative_path) {
 
 /* Single source of truth for the help-topic list. Referenced by print_usage,
  * the topic dispatcher, and the unknown-topic error so they cannot drift. */
-#define METTLE_HELP_TOPICS "build, runtime (alias: heap, gc), interop, stdlib, web, diagnostics (alias: errors)"
+#define METTLE_HELP_TOPICS "build, runtime (alias: heap, gc), interop, stdlib, web, diagnostics (alias: errors), verify"
 
 static int print_help_topic(const char *program_name, const char *argv0,
                             const char *topic) {
@@ -448,6 +448,22 @@ static int print_help_topic(const char *program_name, const char *argv0,
     printf("                      (any use of std/thread interlocked atomic "
            "helpers).\n");
     print_doc_reference(argv0, "runtime-model.md");
+    return 0;
+  }
+
+  if (strcmp(topic, "verify") == 0 || strcmp(topic, "validation") == 0) {
+    printf("verify - per-pass translation validation (self-verifying optimizer)\n\n");
+    printf("  mettle --verify app.mettle\n\n");
+    printf("  After every optimization pass, each changed function's before/after IR\n");
+    printf("  is executed on generated inputs and compared: return value, buffer\n");
+    printf("  bytes, extern-call trace, globals. A diverging pass is reported with a\n");
+    printf("  concrete counterexample, quarantined for that function, and the build\n");
+    printf("  continues from the validated pre-pass IR - the binary is always built\n");
+    printf("  from IR that passed validation.\n\n");
+    printf("  METTLE_VERIFY_BREAK=pass[:fn]  sabotage self-test (corrupts one\n");
+    printf("                                 constant after the named pass; --verify\n");
+    printf("                                 must catch and heal it)\n");
+    print_doc_reference(argv0, "translation-validation.md");
     return 0;
   }
 
@@ -2438,6 +2454,9 @@ int main(int argc, char *argv[]) {
                 fmt);
         return 1;
       }
+    } else if (strcmp(argv[i], "--verify") == 0) {
+      ir_verify_set_enabled(1);
+      options.optimize = 1;
     } else if (strcmp(argv[i], "--simd-report") == 0) {
       options.simd_report = 1;
     } else if (strcmp(argv[i], "--explain") == 0) {
@@ -3518,6 +3537,12 @@ void print_usage(const char *program_name) {
   printf("Options:\n");
   printf("  --error-format=F    Diagnostic output format: human (default) or json\n"
          "                      (one JSON object per diagnostic on stderr, for tooling)\n");
+  printf("  --verify            Translation validation: after every optimization pass,\n"
+         "                      execute each changed function's before/after IR on\n"
+         "                      generated inputs and compare behavior. A diverging pass\n"
+         "                      is reported with a concrete counterexample, quarantined\n"
+         "                      for that function, and the build continues from the\n"
+         "                      validated IR. Implies -O.\n");
   printf("  -i <file>           Input file\n");
   printf("  -o <file>           Output file (default: output.obj/output.o, or "
          "executable path with --build)\n");
