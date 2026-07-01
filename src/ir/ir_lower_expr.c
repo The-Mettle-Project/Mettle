@@ -785,6 +785,44 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
     return 1;
   }
 
+  case AST_CLOSURE_ADAPT_EXPRESSION: {
+    /* A thin value (`&func` or a non-capturing lambda) wrapped by the
+     * closure-adapt pass to satisfy an `Fn(...)` boundary: lower the thin value,
+     * then call the generated adapter constructor with it as the sole argument
+     * to produce a real closure value. */
+    ClosureAdapt *adapt = (ClosureAdapt *)expression->data;
+    if (!adapt || !adapt->ctor_name || !adapt->inner) {
+      ir_set_error(context, "Internal: closure adapter was not synthesized");
+      return 0;
+    }
+    IROperand thin_val = ir_operand_none();
+    if (!ir_lower_expression(context, function, adapt->inner, &thin_val)) {
+      return 0;
+    }
+    IROperand dest = ir_operand_none();
+    if (!ir_make_temp_operand(context, &dest)) {
+      ir_operand_destroy(&thin_val);
+      return 0;
+    }
+    IROperand args[1];
+    args[0] = thin_val;
+    IRInstruction call = {0};
+    call.op = IR_OP_CALL;
+    call.location = expression->location;
+    call.dest = dest;
+    call.text = adapt->ctor_name;
+    call.arguments = args;
+    call.argument_count = 1;
+    int ok = ir_emit(context, function, &call);
+    ir_operand_destroy(&thin_val);
+    if (!ok) {
+      ir_operand_destroy(&dest);
+      return 0;
+    }
+    *out_value = dest;
+    return 1;
+  }
+
   case AST_LAMBDA_EXPRESSION: {
     FunctionDeclaration *lam = (FunctionDeclaration *)expression->data;
     if (!lam || !lam->name) {

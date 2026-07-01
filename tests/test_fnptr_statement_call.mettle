@@ -1,0 +1,14 @@
+// A call through a function-pointer/closure value used as a bare statement
+// (result discarded), e.g. `obj.field(args);` or `f();` where f is a
+// closure/fn-pointer field or local. This is the AST_FUNC_PTR_CALL node used
+// as a statement rather than in an expression/return/assignment position.
+struct S { f: fn(int32) -> int32; }
+
+fn g(x: int32) -> int32 { return x + 1; }
+
+fn main() -> int32 {
+  var s: S;
+  s.f = &g;
+  s.f(5);          // bare statement call through a struct field
+  return 0;
+}

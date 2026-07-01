@@ -169,7 +169,20 @@ fn main() -> int32 {
 }
 ```
 
-A capturing closure and a thin `fn(...)->R` are not interchangeable: assigning one where the other is expected is a compile error (a thin pointer cannot carry an environment, and a closure call site reads a code pointer a thin value does not have). Within a single function you may also bind a closure to an inferred local (`var f = ...`). See [known limitations](known-limitations.md).
+A capturing closure and a thin `fn(...)->R` are not directly interchangeable (a thin pointer cannot carry an environment, and a closure call site reads a code pointer a thin value does not have) - but a plain function or non-capturing lambda can still be passed anywhere an `Fn(...)` is expected. The compiler transparently wraps it in a generated adapter so it dispatches through the closure calling convention:
+
+```mettle
+fn plus_one(x: int32) -> int32 { return x + 1; }
+
+fn main() -> int32 {
+  println_int(apply_twice(&plus_one, 5));   // 7 - a plain function, adapted
+  var f: Fn(int32) -> int32 = &plus_one;    // var-decl adaptation
+  println_int(f(10));                       // 11
+  return 0;
+}
+```
+
+Adaptation applies at the point a plain function or lambda literal is directly written into an `Fn(...)` boundary (a call argument, a `var` declaration, or a `return`). A thin value already sitting in a variable, or assigned into an `Fn(...)`-typed struct field, is not yet adapted; write `&func` (or the lambda literal) directly at the boundary. Within a single function you may also bind a closure to an inferred local (`var f = ...`). See [known limitations](known-limitations.md).
 
 ## Array Types
 

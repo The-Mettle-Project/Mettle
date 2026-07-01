@@ -197,6 +197,76 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
                                                 expression->location);
   }
 
+  case AST_CLOSURE_ADAPT_EXPRESSION: {
+    /* The closure-adapt pass wrapped a thin function value (`&func`, or a
+     * non-capturing lambda) that flowed into an `Fn(...)` boundary. The wrapper
+     * calls a generated adapter constructor at IR-lowering time; here it simply
+     * types as the closure signature it was synthesized for. */
+    ClosureAdapt *adapt = (ClosureAdapt *)expression->data;
+    if (!adapt || !adapt->ctor_name || !adapt->inner) {
+      type_checker_set_error_at_location(
+          checker, expression->location,
+          "Internal: closure adapter was not synthesized");
+      return NULL;
+    }
+    if (!type_checker_infer_type(checker, adapt->inner)) {
+      return NULL;
+    }
+    Type **ptypes = NULL;
+    if (adapt->param_count > 0) {
+      ptypes = malloc(adapt->param_count * sizeof(Type *));
+      if (!ptypes) {
+        return NULL;
+      }
+      for (size_t i = 0; i < adapt->param_count; i++) {
+        ptypes[i] =
+            type_checker_get_type_by_name(checker, adapt->param_types[i]);
+        if (!ptypes[i]) {
+          type_checker_set_error_at_location(
+              checker, expression->location,
+              "Unknown adapter parameter type '%s'", adapt->param_types[i]);
+          free(ptypes);
+          return NULL;
+        }
+      }
+    }
+    Type *adapt_return_type =
+        adapt->return_type
+            ? type_checker_get_type_by_name(checker, adapt->return_type)
+            : checker->builtin_void;
+    if (!adapt_return_type) {
+      adapt_return_type = checker->builtin_void;
+    }
+    Type *closure_type = type_create_function_pointer(
+        ptypes, adapt->param_count, adapt_return_type);
+    free(ptypes);
+    if (!closure_type) {
+      type_checker_set_error_at_location(checker, expression->location,
+                                         "Failed to create adapted closure type");
+      return NULL;
+    }
+    char adapt_sig[1024];
+    {
+      size_t off = 0;
+      int wrote = snprintf(adapt_sig, sizeof(adapt_sig), "Fn(");
+      if (wrote > 0)
+        off += (size_t)wrote;
+      for (size_t i = 0; i < adapt->param_count && off < sizeof(adapt_sig);
+           i++) {
+        wrote = snprintf(adapt_sig + off, sizeof(adapt_sig) - off, "%s%s",
+                         i ? "," : "", adapt->param_types[i]);
+        if (wrote > 0)
+          off += (size_t)wrote;
+      }
+      if (off < sizeof(adapt_sig))
+        snprintf(adapt_sig + off, sizeof(adapt_sig) - off, ")->%s",
+                 adapt->return_type ? adapt->return_type : "void");
+    }
+    closure_type->name = (char *)string_intern(adapt_sig);
+    closure_type->closure_env = type_checker_closure_env_sentinel();
+    return closure_type;
+  }
+
   case AST_LAMBDA_EXPRESSION: {
     /* Closure conversion lifted the lambda body and recorded the symbol its
      * value derives from. A non-capturing lambda is the address of its lifted

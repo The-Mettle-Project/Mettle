@@ -184,6 +184,8 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
 Type *type_checker_parse_function_pointer_type(TypeChecker *checker,
                                                       const char *name);
 
+Type *type_checker_closure_env_sentinel(void);
+
 Type *type_checker_build_tagged_enum_type(TypeChecker *checker,
                                                   const char *type_name,
                                                   EnumDeclaration *enum_decl);

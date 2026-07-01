@@ -38,7 +38,8 @@ typedef enum {
   AST_INDEX_EXPRESSION,
   AST_NEW_EXPRESSION,
   AST_CAST_EXPRESSION,
-  AST_LAMBDA_EXPRESSION
+  AST_LAMBDA_EXPRESSION,
+  AST_CLOSURE_ADAPT_EXPRESSION
 } ASTNodeType;
 
 typedef struct {
@@ -109,6 +110,20 @@ typedef struct {
   size_t captured_count;
   char *env_struct_name;
 } FunctionDeclaration;
+
+// A thin function value (`&func`, or a non-capturing lambda) implicitly wrapped
+// to satisfy an `Fn(...)->R` closure-typed boundary (parameter, return, or var
+// declaration). Synthesized by the closure-adapt pass; `ctor_name` is the
+// generated adapter constructor to call, `inner` is the original thin
+// expression, and `param_types`/`return_type` are the wrapped signature (used
+// by the type checker to build the resulting closure type).
+typedef struct {
+  ASTNode *inner;
+  char *ctor_name;
+  char **param_types;
+  size_t param_count;
+  char *return_type;
+} ClosureAdapt;
 
 typedef struct {
   char *name;
@@ -382,6 +397,10 @@ ASTNode *ast_create_field_assignment(ASTNode *target, ASTNode *value,
                                      SourceLocation location);
 ASTNode *ast_create_cast_expression(const char *type_name, ASTNode *operand,
                                     SourceLocation location);
+ASTNode *ast_create_closure_adapt(ASTNode *inner, const char *ctor_name,
+                                  char **param_types, size_t param_count,
+                                  const char *return_type,
+                                  SourceLocation location);
 ASTNode *ast_create_for_statement(ASTNode *initializer, ASTNode *condition,
                                   ASTNode *increment, ASTNode *body,
                                   SourceLocation location);

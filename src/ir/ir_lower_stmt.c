@@ -688,8 +688,21 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
   }
 
   default: {
-    if (statement->type >= AST_IDENTIFIER &&
-        statement->type <= AST_NEW_EXPRESSION) {
+    /* Any expression usable as a bare statement (result discarded), e.g. a
+     * call for its side effects. The AST_IDENTIFIER..AST_NEW_EXPRESSION range
+     * covers most expression kinds contiguously; a few were added later at
+     * other enum positions and are listed explicitly, notably
+     * AST_FUNC_PTR_CALL: a call through a function-pointer/closure struct
+     * field or expression result, used as a statement (`obj.callback(args);`).
+     */
+    int is_statement_expression =
+        (statement->type >= AST_IDENTIFIER &&
+         statement->type <= AST_NEW_EXPRESSION) ||
+        statement->type == AST_FUNC_PTR_CALL ||
+        statement->type == AST_CAST_EXPRESSION ||
+        statement->type == AST_LAMBDA_EXPRESSION ||
+        statement->type == AST_CLOSURE_ADAPT_EXPRESSION;
+    if (is_statement_expression) {
       IROperand ignored = ir_operand_none();
       int ok = ir_lower_expression(context, function, statement, &ignored);
       ir_operand_destroy(&ignored);

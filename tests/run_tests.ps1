@@ -617,6 +617,8 @@ $cases = @(
   @{ Name = "closure_crossboundary"; Path = "tests/test_closure_crossboundary.mettle"; ShouldSucceed = $true },
   @{ Name = "closure_field"; Path = "tests/test_closure_field.mettle"; ShouldSucceed = $true },
   @{ Name = "closure_state"; Path = "tests/test_closure_state.mettle"; ShouldSucceed = $true },
+  @{ Name = "closure_adapt"; Path = "tests/test_closure_adapt.mettle"; ShouldSucceed = $true },
+  @{ Name = "fnptr_statement_call"; Path = "tests/test_fnptr_statement_call.mettle"; ShouldSucceed = $true },
   @{ Name = "err_lambda_capture"; Path = "tests/err_lambda_capture.mettle"; ShouldSucceed = $false; Pattern = "capturing closure cannot be stored in a plain function-pointer type" },
   @{ Name = "err_missing_return"; Path = "tests/err_missing_return.mettle"; ShouldSucceed = $false; Pattern = "non-void return type .* but contains no return statement" },
   @{ Name = "err_const_no_init"; Path = "tests/err_const_no_init.mettle"; ShouldSucceed = $false; Pattern = "Constant declaration requires an initializer" },
