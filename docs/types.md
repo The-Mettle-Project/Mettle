@@ -120,7 +120,16 @@ fn main() -> int32 {
 }
 ```
 
-Captures are **by value**: each captured variable's value is snapshotted when the closure is created, so changing the original afterwards does not change what the closure sees. A closure value is an 8-byte pointer to a heap-allocated environment holding the code pointer and the captured values.
+Captures are **by value**: each captured variable's value is snapshotted when the closure is created, so changing the original afterwards does not change what the closure sees. A closure value is an 8-byte pointer to a heap-allocated environment holding the code pointer and the captured values. The closure's own copy is **mutable and persists across calls**, so a closure can carry state:
+
+```mettle
+fn counter(start: int32) -> Fn() -> int32 {
+  return fn() -> int32 { start = start + 1; return start; };
+}
+var next = counter(0);
+println_int(next());   // 1
+println_int(next());   // 2 - state persists in the closure's environment
+```
 
 Because a closure carries state, its type is distinct from a plain function pointer. A closure type is written with a capital **`Fn`**: `Fn(int32) -> int32`. A plain `fn(...)->R` stays a thin, C-compatible function pointer; `Fn(...)->R` is a stateful closure.
 

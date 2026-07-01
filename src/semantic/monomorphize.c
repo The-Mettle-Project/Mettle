@@ -2274,6 +2274,92 @@ static void cc_buf_add_num(CCBuf *b, const char *prefix, size_t n) {
   cc_buf_add(b, tmp);
 }
 
+static int cc_cap_index(const CCEnv *caps, const char *name) {
+  if (!name)
+    return -1;
+  for (size_t i = 0; i < caps->count; i++)
+    if (strcmp(caps->names[i], name) == 0)
+      return (int)i;
+  return -1;
+}
+
+static ASTNode *cc_env_field_access(int idx, SourceLocation loc) {
+  char field[32];
+  snprintf(field, sizeof(field), "__cap%d", idx);
+  ASTNode *env_id = ast_create_identifier("__env", loc);
+  return env_id ? ast_create_member_access(env_id, field, loc) : NULL;
+}
+
+/* Rewrite captured-variable references inside a lifted closure body into direct
+ * accesses to the heap environment (`__env.__capN`), so reads and writes go
+ * through the environment and mutations persist across calls. A captured name is
+ * never re-declared inside the lambda body (else it would not be a capture), so
+ * every matching reference is the capture. Nested lambdas are not descended into
+ * (their captures are handled when they are themselves lifted). Replaced payload
+ * nodes are left unfreed - a small, bounded compile-time allocation. */
+static void cc_rewrite_captures(ASTNode *node, const CCEnv *caps) {
+  if (!node || node->type == AST_LAMBDA_EXPRESSION)
+    return;
+
+  if (node->type == AST_IDENTIFIER) {
+    Identifier *id = (Identifier *)node->data;
+    int idx = id ? cc_cap_index(caps, id->name) : -1;
+    if (idx >= 0) {
+      char field[32];
+      snprintf(field, sizeof(field), "__cap%d", idx);
+      ASTNode *env_id = ast_create_identifier("__env", node->location);
+      MemberAccess *ma = env_id ? malloc(sizeof(MemberAccess)) : NULL;
+      if (ma) {
+        ma->object = env_id;
+        ma->member = (char *)string_intern(field);
+        node->type = AST_MEMBER_ACCESS;
+        node->data = ma;
+        node->resolved_type = NULL;
+        ast_add_child(node, env_id);
+      }
+    }
+    return;
+  }
+
+  if (node->type == AST_FUNCTION_CALL) {
+    CallExpression *c = (CallExpression *)node->data;
+    int idx = (c && !c->object) ? cc_cap_index(caps, c->function_name) : -1;
+    if (idx >= 0) {
+      ASTNode *member = cc_env_field_access(idx, node->location);
+      FuncPtrCall *fp = member ? malloc(sizeof(FuncPtrCall)) : NULL;
+      if (fp) {
+        fp->function = member;
+        fp->arguments = c->arguments;
+        fp->argument_count = c->argument_count;
+        node->child_count = 0;
+        node->type = AST_FUNC_PTR_CALL;
+        node->data = fp;
+        node->resolved_type = NULL;
+        ast_add_child(node, member);
+        for (size_t i = 0; i < fp->argument_count; i++)
+          if (fp->arguments[i])
+            ast_add_child(node, fp->arguments[i]);
+      }
+    }
+  } else if (node->type == AST_ASSIGNMENT) {
+    Assignment *a = (Assignment *)node->data;
+    if (a && !a->target && a->variable_name) {
+      int idx = cc_cap_index(caps, a->variable_name);
+      if (idx >= 0) {
+        ASTNode *member = cc_env_field_access(idx, node->location);
+        if (member) {
+          a->target = member;
+          a->variable_name = NULL; /* force the field-assignment path */
+          ast_add_child(node, member);
+        }
+      }
+    }
+  }
+
+  for (size_t i = 0; i < node->child_count; i++)
+    cc_rewrite_captures(node->children[i], caps);
+}
+
 static int g_cc_counter;
 
 /* Lift a capturing lambda: synthesize an environment struct, a lifted function
@@ -2343,17 +2429,9 @@ static void cc_emit_capturing(ASTNode *lambda, FunctionDeclaration *fd,
   }
   cc_buf_add(&src, ") -> ");
   cc_buf_add(&src, ret);
-  cc_buf_add(&src, " {\n");
-  for (size_t i = 0; i < caps->count; i++) {
-    cc_buf_add(&src, "  var ");
-    cc_buf_add(&src, caps->names[i]);
-    cc_buf_add(&src, ": ");
-    cc_buf_add(&src, caps->types[i]);
-    cc_buf_add(&src, " = __env.");
-    cc_buf_add_num(&src, "__cap", i);
-    cc_buf_add(&src, ";\n");
-  }
-  cc_buf_add(&src, "}\n");
+  /* Empty body: the original statements are grafted in, with captured-variable
+   * references rewritten to `__env.__capN` accesses (see cc_rewrite_captures). */
+  cc_buf_add(&src, " {\n}\n");
 
   /* fn __make_lam_N(cap: T, ...) -> __ClosEnv_N* { var __e = new ...; ... return __e; } */
   cc_buf_add(&src, "fn ");
@@ -2438,6 +2516,10 @@ static void cc_emit_capturing(ASTNode *lambda, FunctionDeclaration *fd,
          * not free them. */
         obody->declaration_count = 0;
         body->child_count = 0;
+        /* Rewrite captured references in the grafted body to env accesses so
+         * mutations persist across calls. */
+        for (size_t i = 0; i < lbody->declaration_count; i++)
+          cc_rewrite_captures(lbody->declarations[i], caps);
       }
     }
   }
