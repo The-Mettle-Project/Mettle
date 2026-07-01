@@ -1,0 +1,6 @@
+fn main() -> int64 {
+    var scratch: int64 = 5;
+    var _intentional: int64 = 6;
+    var used: int64 = 2;
+    return used;
+}

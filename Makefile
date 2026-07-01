@@ -1,7 +1,7 @@
 CC = gcc
 # EXTRA_CFLAGS lets release builds stamp the version, e.g.
 #   make EXTRA_CFLAGS='-DMETTLE_VERSION_RAW=v0.13.0'
-# (bare token, stringified in main.c ??? avoids fragile quote escaping)
+# (bare token, stringified in main.c - avoids fragile quote escaping)
 EXTRA_CFLAGS =
 CFLAGS = -Wall -Wextra -std=c99 -g -O2 -D_GNU_SOURCE -Isrc -fno-omit-frame-pointer $(EXTRA_CFLAGS)
 LDFLAGS =
@@ -31,7 +31,7 @@ CODEGEN_SOURCES = \
 	$(SRCDIR)/codegen/ptx_emitter.c \
 	$(wildcard $(SRCDIR)/codegen/binary/*.c)
 LINKER_SOURCES = $(wildcard $(SRCDIR)/linker/*.c)
-ERROR_SOURCES = $(SRCDIR)/error/error_reporter.c
+ERROR_SOURCES = $(SRCDIR)/error/error_reporter.c $(SRCDIR)/error/error_explain.c
 DEBUG_SOURCES = $(SRCDIR)/debug/debug_info.c
 COMPILER_SOURCES = $(SRCDIR)/compiler/compiler_context.c $(SRCDIR)/compiler/compiler_crash.c
 COMMON_SOURCES = $(SRCDIR)/common.c

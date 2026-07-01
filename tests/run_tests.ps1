@@ -1250,6 +1250,29 @@ $cases = @(
   @{ Name = "err_function_arg_count"; Path = "tests/err_function_arg_count.mettle"; ShouldSucceed = $false; Pattern = "expects .* arguments, got" },
   @{ Name = "err_function_arg_type"; Path = "tests/err_function_arg_type.mettle"; ShouldSucceed = $false; Pattern = "Type mismatch" },
   @{ Name = "err_match_bad_syntax"; Path = "tests/err_match_bad_syntax.mettle"; ShouldSucceed = $false; Pattern = "Expected .* after 'match'" },
+  # Diagnostics quality: multi-error recovery, cascade suppression, notes,
+  # caret labels, unused-variable warnings, JSON output.
+  @{ Name = "diag_multi_error"; Path = "tests/diag_multi_error.mettle"; ShouldSucceed = $false
+     OutputMustMatch = @("due to 4 previous errors", "Undefined variable 'missing1'", "Undefined variable 'missing2'") },
+  @{ Name = "diag_parser_no_cascade"; Path = "tests/diag_parser_no_cascade.mettle"; ShouldSucceed = $false
+     Pattern = "Expected '\(' after 'if'"
+     OutputMustNotMatch = @("Expected '\(', found identifier", "due to [4-9] previous") },
+  @{ Name = "diag_dup_note"; Path = "tests/diag_dup_note.mettle"; ShouldSucceed = $false
+     OutputMustMatch = @("Duplicate declaration of 'x'", "previous declaration of 'x' is here") },
+  @{ Name = "diag_call_notes"; Path = "tests/diag_call_notes.mettle"; ShouldSucceed = $false
+     OutputMustMatch = @("expects 2 arguments, got 3", "\^\^\^ expected 2 arguments, got 3", "function 'add' defined here") },
+  @{ Name = "diag_label_mismatch"; Path = "tests/diag_label_mismatch.mettle"; ShouldSucceed = $false
+     OutputMustMatch = @("\^\^\^\^\^ expected 'int64', found 'string'") },
+  @{ Name = "diag_unused_var"; Path = "tests/diag_unused_var.mettle"; ShouldSucceed = $true
+     OutputMustMatch = @("unused variable 'scratch'", "rename it to '_scratch'")
+     OutputMustNotMatch = @("unused variable '_intentional'", "unused variable 'used'") },
+  @{ Name = "diag_json_format"; Path = "tests/diag_json_format.mettle"; ShouldSucceed = $false
+     Args = @("--error-format=json")
+     Pattern = '"severity":"error"'
+     OutputMustMatch = @('"code":"E0004"', '"line":2', '"length":5', '"label":"expected ''int64'', found ''string''"') },
+  @{ Name = "diag_poison_no_cascade"; Path = "tests/diag_poison_no_cascade.mettle"; ShouldSucceed = $false
+     Pattern = "Type mismatch"
+     OutputMustNotMatch = @("Undefined variable 'x'") },
   @{ Name = "err_match_non_exhaustive"; Path = "tests/err_match_non_exhaustive.mettle"; ShouldSucceed = $false; Pattern = "Non-exhaustive match" },
   @{ Name = "err_trait_bound_missing_impl"; Path = "tests/err_trait_bound_missing_impl.mettle"; ShouldSucceed = $false; Pattern = "does not implement trait 'Addable'" },
   @{ Name = "err_trait_bound_missing_second_impl"; Path = "tests/err_trait_bound_missing_second_impl.mettle"; ShouldSucceed = $false; Pattern = "does not implement trait 'SignedNumber'" },

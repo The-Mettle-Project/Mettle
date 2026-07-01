@@ -712,6 +712,7 @@ int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
       }
 
       int reached_terminator = 0;
+      int block_ok = 1;
       for (size_t i = 0; i < statement->child_count; i++) {
         ASTNode *child = statement->children[i];
         if (reached_terminator && checker->error_reporter && child) {
@@ -719,18 +720,22 @@ int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
               checker->error_reporter, ERROR_SEMANTIC, child->location,
               "Unreachable code: statement will never execute");
         }
+        // A bad statement doesn't stop the walk: keep checking the block's
+        // remaining statements so one compile reports every error.
         if (!type_checker_check_statement(checker, statement->children[i])) {
-          type_checker_init_tracker_exit_scope(checker);
-          symbol_table_exit_scope(checker->symbol_table);
-          return 0;
+          block_ok = 0;
         }
         if (type_checker_statement_guarantees_termination(child)) {
           reached_terminator = 1;
         }
       }
 
+      if (block_ok)
+        type_checker_warn_unused_locals(checker);
       type_checker_init_tracker_exit_scope(checker);
       symbol_table_exit_scope(checker->symbol_table);
+      if (!block_ok)
+        return 0;
     }
     return 1;
   }

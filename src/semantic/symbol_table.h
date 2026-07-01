@@ -95,6 +95,13 @@ typedef struct Symbol {
   int is_extern;              // For extern declarations (C interop)
   int is_immutable;           // For local `const`: reassignment is rejected
   char *link_name;            // Link-time symbol name for extern declarations
+  /* Declaration site, for "previous declaration here" / "defined here"
+     diagnostic notes. Zero line when unknown. */
+  size_t decl_line;
+  size_t decl_column;
+  const char *decl_file;
+  /* Set on every scope-chain lookup; drives unused-variable warnings. */
+  int is_used;
   union {
     struct {
       int register_id;

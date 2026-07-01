@@ -538,19 +538,32 @@ int type_checker_process_declaration(TypeChecker *checker,
       }
     }
 
-    // If there's an initializer, validate it
+    // If there's an initializer, validate it. When validation fails but the
+    // declared type is known, the variable is still registered with that type
+    // ("poisoned") so later uses don't cascade into bogus undefined-variable
+    // errors; the declaration itself still fails.
+    int poisoned = 0;
     if (var_decl->initializer) {
+      size_t reports_before =
+          checker->error_reporter ? checker->error_reporter->count : 0;
       Type *init_type = type_checker_infer_type(checker, var_decl->initializer);
       if (!init_type) {
-        if (!checker->has_error) {
+        int already_reported =
+            checker->error_reporter
+                ? checker->error_reporter->count > reports_before
+                : checker->has_error;
+        if (!already_reported) {
           type_checker_set_error_at_location(
               checker, var_decl->initializer->location,
               "Cannot infer type of initializer for variable '%s'",
               var_decl->name);
         }
-        return 0;
+        checker->has_error = 1;
+        if (!var_type)
+          return 0;
+        poisoned = 1;
       }
-      if (var_type) {
+      if (!poisoned && var_type) {
         /* A capturing closure carries a heap environment and cannot be stored in
          * a plain function-pointer type; it needs a closure type `Fn(...)`. */
         if (init_type && init_type->kind == TYPE_FUNCTION_POINTER &&
@@ -561,17 +574,19 @@ int type_checker_process_declaration(TypeChecker *checker,
               "a capturing closure cannot be stored in a plain function-pointer "
               "type '%s'; declare '%s' with a closure type 'Fn(...)' instead",
               var_type->name, var_decl->name);
-          return 0;
+          poisoned = 1;
         }
         // Type specified: validate assignment compatibility
-        if (!(var_type->kind == TYPE_POINTER &&
+        else if (!(var_type->kind == TYPE_POINTER &&
               type_checker_is_null_pointer_constant(var_decl->initializer)) &&
             !type_checker_is_assignable(checker, var_type, init_type)) {
-          type_checker_report_type_mismatch(checker,
-                                            var_decl->initializer->location,
-                                            var_type->name, init_type->name);
-          return 0;
+          type_checker_report_type_mismatch_node(checker, var_decl->initializer,
+                                                 var_type->name,
+                                                 init_type->name);
+          poisoned = 1;
         }
+      } else if (poisoned) {
+        /* Initializer failed but declared type is known: register anyway. */
       } else if (var_decl->structural_type ||
                  (var_decl->is_const &&
                   (!current_scope || current_scope->type == SCOPE_GLOBAL))) {
@@ -617,7 +632,7 @@ int type_checker_process_declaration(TypeChecker *checker,
       // non-integer const (float/string/aggregate) is not folded; it falls
       // through to immutable-variable registration below and gets normal global
       // (or local) storage. The initializer's assignability was validated above.
-      if (type_checker_is_integer_type(var_type)) {
+      if (!poisoned && type_checker_is_integer_type(var_type)) {
         long long const_value = 0;
         if (!type_checker_eval_integer_constant_with_checker(
                 checker, var_decl->initializer, &const_value)) {
@@ -667,8 +682,8 @@ int type_checker_process_declaration(TypeChecker *checker,
                                                          var_decl->name);
     if (existing) {
       if (existing->kind != SYMBOL_VARIABLE) {
-        type_checker_report_duplicate_declaration(
-            checker, declaration->location, var_decl->name);
+        type_checker_report_duplicate_declaration_prev(
+            checker, declaration->location, var_decl->name, existing);
         return 0;
       }
       if (existing->is_extern != var_decl->is_extern) {
@@ -680,8 +695,8 @@ int type_checker_process_declaration(TypeChecker *checker,
         return 0;
       }
       if (!var_decl->is_extern) {
-        type_checker_report_duplicate_declaration(
-            checker, declaration->location, var_decl->name);
+        type_checker_report_duplicate_declaration_prev(
+            checker, declaration->location, var_decl->name, existing);
         return 0;
       }
       if (!type_checker_types_equal(existing->type, var_type)) {
@@ -706,6 +721,11 @@ int type_checker_process_declaration(TypeChecker *checker,
     // Create and declare the symbol
     Symbol *var_symbol =
         symbol_create(var_decl->name, SYMBOL_VARIABLE, var_type);
+    if (var_symbol) {
+      var_symbol->decl_line = declaration->location.line;
+      var_symbol->decl_column = declaration->location.column;
+      var_symbol->decl_file = declaration->location.filename;
+    }
     if (!var_symbol) {
       type_checker_set_error_at_location(
           checker, declaration->location,
@@ -731,8 +751,10 @@ int type_checker_process_declaration(TypeChecker *checker,
     }
 
     if (!symbol_table_declare(checker->symbol_table, var_symbol)) {
-      type_checker_report_duplicate_declaration(checker, declaration->location,
-                                                var_decl->name);
+      type_checker_report_duplicate_declaration_prev(
+          checker, declaration->location, var_decl->name,
+          symbol_table_lookup_current_scope(checker->symbol_table,
+                                            var_decl->name));
       symbol_destroy(var_symbol);
       return 0;
     }
@@ -775,7 +797,7 @@ int type_checker_process_declaration(TypeChecker *checker,
       }
     }
 
-    return 1;
+    return poisoned ? 0 : 1;
   }
 
   case AST_FUNCTION_DECLARATION: {

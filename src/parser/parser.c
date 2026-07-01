@@ -347,6 +347,15 @@ void parser_set_error_with_suggestion(Parser *parser, const char *message,
   }
 }
 
+void parser_refine_error(Parser *parser, const char *message) {
+  if (!parser || !message)
+    return;
+  free(parser->error_message);
+  parser->error_message = strdup(message);
+  if (parser->error_reporter)
+    error_reporter_refine_last(parser->error_reporter, message);
+}
+
 void parser_recover_from_error(Parser *parser) {
   if (!parser)
     return;
@@ -3809,7 +3818,7 @@ ASTNode *parser_parse_if_statement(Parser *parser) {
   }
 
   if (!parser_expect(parser, TOKEN_LPAREN)) {
-    parser_set_error(parser, "Expected '(' after 'if'");
+    parser_refine_error(parser, "Expected '(' after 'if'");
     return NULL;
   }
 
@@ -3939,7 +3948,7 @@ ASTNode *parser_parse_while_statement(Parser *parser) {
   }
 
   if (!parser_expect(parser, TOKEN_LPAREN)) {
-    parser_set_error(parser, "Expected '(' after 'while'");
+    parser_refine_error(parser, "Expected '(' after 'while'");
     return NULL;
   }
 
@@ -4606,7 +4615,7 @@ static ASTNode *parser_parse_match_core(Parser *parser, int is_expression) {
     return NULL;
 
   if (!parser_expect(parser, TOKEN_LPAREN)) {
-    parser_set_error(parser, "Expected '(' after 'match'");
+    parser_refine_error(parser, "Expected '(' after 'match'");
     return NULL;
   }
   ASTNode *expr = parser_parse_expression(parser);

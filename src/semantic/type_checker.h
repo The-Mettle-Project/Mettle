@@ -96,6 +96,18 @@ void type_checker_report_undefined_symbol(TypeChecker *checker,
 void type_checker_report_duplicate_declaration(TypeChecker *checker,
                                                SourceLocation location,
                                                const char *symbol_name);
+void type_checker_report_duplicate_declaration_prev(TypeChecker *checker,
+                                                    SourceLocation location,
+                                                    const char *symbol_name,
+                                                    const Symbol *previous);
+void type_checker_report_type_mismatch_node(TypeChecker *checker,
+                                            const ASTNode *node,
+                                            const char *expected,
+                                            const char *actual);
+size_t type_checker_node_span_length(const ASTNode *node);
+void type_checker_note_declared_here(TypeChecker *checker,
+                                     const Symbol *symbol, const char *what);
+void type_checker_warn_unused_locals(TypeChecker *checker);
 
 // Struct type processing functions
 int type_checker_process_struct_declaration(TypeChecker *checker,

@@ -3,6 +3,7 @@
 
 #include "codegen/code_generator.h"
 #include "debug/debug_info.h"
+#include "error/error_explain.h"
 #include "error/error_reporter.h"
 #include "lexer/lexer.h"
 #include "parser/parser.h"

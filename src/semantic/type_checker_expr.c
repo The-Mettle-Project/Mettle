@@ -645,8 +645,27 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
                call->function_name,
                (unsigned long long)func_symbol->data.function.parameter_count,
                (unsigned long long)call->argument_count);
-      type_checker_set_error_at_location(checker, expression->location,
-                                         error_msg);
+      checker->has_error = 1;
+      free(checker->error_message);
+      checker->error_message = strdup(error_msg);
+      if (checker->error_reporter) {
+        SourceSpan span = source_span_from_location(
+            expression->location, strlen(call->function_name));
+        /* The call node's location points at '('; walk back onto the name. */
+        if (span.column > strlen(call->function_name))
+          span.column -= strlen(call->function_name);
+        span = error_reporter_span_snap_to_token(checker->error_reporter, span,
+                                                 call->function_name);
+        error_reporter_add_error_with_span(checker->error_reporter,
+                                           ERROR_SEMANTIC, span, error_msg);
+        char label[128];
+        snprintf(label, sizeof(label), "expected %llu argument%s, got %llu",
+                 (unsigned long long)func_symbol->data.function.parameter_count,
+                 func_symbol->data.function.parameter_count == 1 ? "" : "s",
+                 (unsigned long long)call->argument_count);
+        error_reporter_set_last_label(checker->error_reporter, label);
+        type_checker_note_declared_here(checker, func_symbol, "function");
+      }
       return NULL;
     }
 
@@ -664,8 +683,20 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
            type_checker_is_null_pointer_constant(call->arguments[i]));
       if (!is_null_pointer_arg &&
            !type_checker_is_assignable(checker, param_type, arg_type)) {
-        type_checker_report_type_mismatch(checker, call->arguments[i]->location,
-                                          param_type->name, arg_type->name);
+        type_checker_report_type_mismatch_node(checker, call->arguments[i],
+                                               param_type->name,
+                                               arg_type->name);
+        if (func_symbol->data.function.parameter_names &&
+            func_symbol->data.function.parameter_names[i] &&
+            checker->error_reporter) {
+          char label[192];
+          snprintf(label, sizeof(label),
+                   "parameter '%s' expects '%s', this argument is '%s'",
+                   func_symbol->data.function.parameter_names[i],
+                   param_type->name, arg_type->name);
+          error_reporter_set_last_label(checker->error_reporter, label);
+        }
+        type_checker_note_declared_here(checker, func_symbol, "function");
         return NULL;
       }
 

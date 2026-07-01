@@ -385,7 +385,7 @@ static void print_doc_reference(const char *argv0, const char *relative_path) {
 
 /* Single source of truth for the help-topic list. Referenced by print_usage,
  * the topic dispatcher, and the unknown-topic error so they cannot drift. */
-#define METTLE_HELP_TOPICS "build, runtime (alias: heap, gc), interop, stdlib, web"
+#define METTLE_HELP_TOPICS "build, runtime (alias: heap, gc), interop, stdlib, web, diagnostics (alias: errors)"
 
 static int print_help_topic(const char *program_name, const char *argv0,
                             const char *topic) {
@@ -448,6 +448,28 @@ static int print_help_topic(const char *program_name, const char *argv0,
     printf("                      (any use of std/thread interlocked atomic "
            "helpers).\n");
     print_doc_reference(argv0, "runtime-model.md");
+    return 0;
+  }
+
+  if (strcmp(topic, "diagnostics") == 0 || strcmp(topic, "errors") == 0 ||
+      strcmp(topic, "warnings") == 0) {
+    printf("diagnostics - compile errors, warnings, and tooling output\n\n");
+    printf("  Every diagnostic carries a stable code (E0001..E0007, "
+           "M0101..M0112), a source snippet\n");
+    printf("  with the offending range underlined, and a help suggestion. The "
+           "compiler recovers after\n");
+    printf("  errors, so one compile reports every problem in the file.\n\n");
+    printf("  mettle explain <CODE>       extended docs for a code (try: "
+           "mettle explain E0004)\n");
+    printf("  mettle explain list         index of every diagnostic code\n");
+    printf("  --error-format=json         one JSON object per diagnostic on "
+           "stderr, for editors/CI\n");
+    printf("  NO_COLOR / CLICOLOR_FORCE   disable / force ANSI colors\n\n");
+    printf("  Warnings include unused variables (prefix a name with '_' to "
+           "opt out), unreachable code,\n");
+    printf("  and compile-time memory-safety findings (use-after-free, leaks, "
+           "double free, ...).\n");
+    print_doc_reference(argv0, "diagnostics.md");
     return 0;
   }
 
@@ -2330,6 +2352,9 @@ int main(int argc, char *argv[]) {
     if (strcmp(argv[1], "help") == 0) {
       return print_help_topic(argv[0], argv[0], argc >= 3 ? argv[2] : NULL);
     }
+    if (strcmp(argv[1], "explain") == 0) {
+      return mettle_explain_error_code(argc >= 3 ? argv[2] : NULL);
+    }
     if (strcmp(argv[1], "docs") == 0) {
       if (argc >= 3) {
         return print_help_topic(argv[0], argv[0], argv[2]);
@@ -2401,6 +2426,18 @@ int main(int argc, char *argv[]) {
     } else if (strcmp(argv[i], "--ml-opt") == 0) {
       options.ml_opt = 1;
       options.optimize = 1;
+    } else if (strncmp(argv[i], "--error-format=", 15) == 0) {
+      const char *fmt = argv[i] + 15;
+      if (strcmp(fmt, "json") == 0) {
+        error_reporter_set_format_json(1);
+      } else if (strcmp(fmt, "human") == 0) {
+        error_reporter_set_format_json(0);
+      } else {
+        fprintf(stderr,
+                "Error: Unknown error format '%s' (expected human or json)\n",
+                fmt);
+        return 1;
+      }
     } else if (strcmp(argv[i], "--simd-report") == 0) {
       options.simd_report = 1;
     } else if (strcmp(argv[i], "--explain") == 0) {
@@ -2675,7 +2712,7 @@ int main(int argc, char *argv[]) {
       fprintf(stderr, "  %-20s %9.3f ms\n", "assemble/link",
               compiler_profile_now_ms() - build_profile_start);
     }
-  } else if (result == 0 && auto_runtime_directory && !options.debug_mode &&
+  } else if (result == 0 && auto_runtime_directory && options.debug_mode &&
              !options.dump_ir) {
     fprintf(stderr,
             "Note: transitional runtime objects detected at '%s'. Use --build "
@@ -3476,7 +3513,11 @@ void print_usage(const char *program_name) {
   printf("Usage: %s [options] <input.mettle>\n", program_name);
   printf("       %s help [topic]\n", program_name);
   printf("       %s docs [topic]\n", program_name);
+  printf("       %s explain <CODE>   Explain a diagnostic code (e.g. E0004, M0103; 'list' for all)\n",
+         program_name);
   printf("Options:\n");
+  printf("  --error-format=F    Diagnostic output format: human (default) or json\n"
+         "                      (one JSON object per diagnostic on stderr, for tooling)\n");
   printf("  -i <file>           Input file\n");
   printf("  -o <file>           Output file (default: output.obj/output.o, or "
          "executable path with --build)\n");

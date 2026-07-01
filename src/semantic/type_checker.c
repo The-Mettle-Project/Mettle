@@ -143,6 +143,11 @@ int type_checker_register_function_signature(TypeChecker *checker,
 
   Symbol *func_symbol =
       symbol_create(func_decl->name, SYMBOL_FUNCTION, return_type);
+  if (func_symbol) {
+    func_symbol->decl_line = declaration->location.line;
+    func_symbol->decl_column = declaration->location.column;
+    func_symbol->decl_file = declaration->location.filename;
+  }
   if (!func_symbol) {
     for (size_t i = 0; i < func_decl->parameter_count; i++)
       free(param_names_copy[i]);
@@ -186,16 +191,18 @@ int type_checker_check_program(TypeChecker *checker, ASTNode *program) {
   if (!prog)
     return 0;
 
-  // Pass 1: Register struct and enum types
+  // Pass 1: Register struct and enum types. On failure keep going so every
+  // bad declaration is reported in one compile, not one per rebuild.
+  int ok = 1;
   for (size_t i = 0; i < prog->declaration_count; i++) {
     ASTNode *decl = prog->declarations[i];
     if (decl && decl->type == AST_STRUCT_DECLARATION) {
       if (!type_checker_process_struct_declaration(checker, decl)) {
-        return 0;
+        ok = 0;
       }
     } else if (decl && decl->type == AST_ENUM_DECLARATION) {
       if (!type_checker_process_enum_declaration(checker, decl)) {
-        return 0;
+        ok = 0;
       }
     }
   }
@@ -214,14 +221,18 @@ int type_checker_check_program(TypeChecker *checker, ASTNode *program) {
     if (decl && decl->type != AST_STRUCT_DECLARATION &&
         decl->type != AST_ENUM_DECLARATION) {
       if (!type_checker_process_declaration(checker, decl)) {
-        return 0;
+        ok = 0;
       }
     }
   }
 
+  if (!ok)
+    return 0;
+
   // Pass 4: whole-program memory diagnostics. Ownership summaries are
   // inferred over the call graph, then cross-call use-after-free and leak
-  // analysis runs with them (type_checker_memory.c).
+  // analysis runs with them (type_checker_memory.c). Skipped when earlier
+  // passes failed: the AST is not fully typed.
   if (!getenv("METTLE_NO_MEM_INTERPROC") &&
       !type_checker_check_program_memory(checker, program)) {
     return 0;

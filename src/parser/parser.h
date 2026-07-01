@@ -72,6 +72,7 @@ int parser_expect(Parser *parser, TokenType type);
 void parser_set_error(Parser *parser, const char *message);
 void parser_set_error_with_suggestion(Parser *parser, const char *message,
                                       const char *suggestion);
+void parser_refine_error(Parser *parser, const char *message);
 void parser_recover_from_error(Parser *parser);
 void parser_synchronize(Parser *parser);
 int parser_get_operator_precedence(TokenType type);
