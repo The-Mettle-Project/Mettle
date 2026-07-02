@@ -52,7 +52,52 @@ type_checker_create_with_error_reporter(SymbolTable *symbol_table,
   // Initialize built-in types
   type_checker_init_builtin_types(checker);
 
+  // Test builtins: assert(cond) / assert_eq(left, right). Registered always
+  // so @test bodies type-check in every build; calling them outside a @test
+  // function is rejected at the call site (they only execute under
+  // `mettle test`, where the interpreter implements them natively).
+  type_checker_register_test_builtin(checker, "assert", 1);
+  type_checker_register_test_builtin(checker, "assert_eq", 2);
+
   return checker;
+}
+
+void type_checker_register_test_builtin(TypeChecker *checker, const char *name,
+                                        size_t parameter_count) {
+  if (!checker || !checker->symbol_table || parameter_count > 2) {
+    return;
+  }
+  if (symbol_table_lookup_current_scope(checker->symbol_table, name)) {
+    return;
+  }
+  Symbol *symbol = symbol_create(name, SYMBOL_FUNCTION, checker->builtin_void);
+  if (!symbol) {
+    return;
+  }
+  Type **param_types = malloc(parameter_count * sizeof(Type *));
+  char **param_names = malloc(parameter_count * sizeof(char *));
+  if (!param_types || !param_names) {
+    free(param_types);
+    free(param_names);
+    symbol_destroy(symbol);
+    return;
+  }
+  static const char *NAMES[2] = {"left", "right"};
+  for (size_t i = 0; i < parameter_count; i++) {
+    param_types[i] = checker->builtin_int64;
+    param_names[i] = strdup(NAMES[i]);
+  }
+  symbol->data.function.parameter_count = parameter_count;
+  symbol->data.function.parameter_types = param_types;
+  symbol->data.function.parameter_names = param_names;
+  symbol->data.function.return_type = checker->builtin_void;
+  symbol->is_extern = 1;
+  symbol->is_builtin = 1;
+  symbol->is_initialized = 1;
+  symbol->link_name = strdup(name);
+  if (!symbol_table_declare(checker->symbol_table, symbol)) {
+    symbol_destroy(symbol);
+  }
 }
 
 void type_checker_destroy(TypeChecker *checker) {

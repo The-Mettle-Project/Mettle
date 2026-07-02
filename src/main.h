@@ -5,6 +5,7 @@
 #include "debug/debug_info.h"
 #include "error/error_explain.h"
 #include "error/error_reporter.h"
+#include "ir/ir_comptime.h"
 #include "ir/ir_verify.h"
 #include "lexer/lexer.h"
 #include "parser/parser.h"
@@ -47,6 +48,15 @@ typedef struct {
   int annotate_q_hi; /* last source line of the range */
   const char *annotate_q_fn; /* --annotate-fn=NAME: restrict to one function */
   int annotate_hot; /* --annotate-hot[=N]: top-N hotspots (0 = unset) */
+  /* `mettle test`: run every @test function in the compile-time interpreter
+   * instead of generating code. */
+  int test_mode;
+  const char *test_filter; /* --filter=SUBSTR: run matching tests only */
+  /* `mettle trace <file> <fn> [args...]`: interpret one function on the given
+   * arguments and print a line-by-line value trace. */
+  const char *trace_function;
+  const char *const *trace_args;
+  size_t trace_arg_count;
   int emit_object;
   int generate_debug_symbols;
   int generate_line_mapping;

@@ -128,6 +128,7 @@ ASTNode *ast_clone_node(ASTNode *node) {
     dst->is_noinline = src->is_noinline;
     dst->is_pure = src->is_pure;
     dst->is_noalloc = src->is_noalloc;
+    dst->is_test = src->is_test;
     dst->simd_mode = src->simd_mode;
     dst->captured_count = src->captured_count;
     dst->captured_names =
@@ -1235,6 +1236,7 @@ ASTNode *ast_create_function_declaration(const char *name, char **param_names,
   func_decl->is_noinline = 0;
   func_decl->is_pure = 0;
   func_decl->is_noalloc = 0;
+  func_decl->is_test = 0;
   func_decl->simd_mode = SIMD_ATTR_NONE;
   func_decl->captured_names = NULL;
   func_decl->captured_types = NULL;

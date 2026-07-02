@@ -94,6 +94,7 @@ typedef struct Symbol {
   int is_forward_declaration; // For functions that are declared but not defined
   int is_extern;              // For extern declarations (C interop)
   int is_immutable;           // For local `const`: reassignment is rejected
+  int is_builtin;             // Compiler-provided (assert/assert_eq test builtins)
   char *link_name;            // Link-time symbol name for extern declarations
   /* Declaration site, for "previous declaration here" / "defined here"
      diagnostic notes. Zero line when unknown. */

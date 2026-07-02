@@ -1,0 +1,4 @@
+fn main() -> int64 {
+    assert_eq(1, 1);
+    return 0;
+}

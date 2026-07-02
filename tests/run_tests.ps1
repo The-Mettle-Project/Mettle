@@ -1288,6 +1288,22 @@ $cases = @(
      Env = @{ METTLE_VERIFY_BREAK = "constant_and_branch_simplify:dot" }
      SkipDeterminism = $true
      OutputMustMatch = @("MISCOMPILE CAUGHT", "quarantined", "pre-pass IR restored") },
+  # `mettle test`: interpreted @test functions - pass/fail/leak reporting with
+  # assertion diagnostics; @test bodies are dropped from normal builds.
+  @{ Name = "comptime_test_run"; Path = "tests/comptime_tests_demo.mettle"; ShouldSucceed = $false
+     Args = @("test")
+     Pattern = "assertion failed in test 'test_fail'"
+     OutputMustMatch = @("test test_pass \.\.\. ok", "left: 20, right: 21",
+                         "LEAKED", "leaked 24 bytes", "2 passed, 1 failed, 1 leak") },
+  @{ Name = "comptime_test_filter"; Path = "tests/comptime_tests_demo.mettle"; ShouldSucceed = $false
+     Args = @("test", "--filter=test_fail")
+     Pattern = "running 1 test"
+     OutputMustMatch = @("0 passed, 1 failed")
+     OutputMustNotMatch = @("test test_pass") },
+  @{ Name = "comptime_tests_dropped_in_build"; Path = "tests/comptime_tests_demo.mettle"; ShouldSucceed = $true
+     OutputMustNotMatch = @("assertion failed") },
+  @{ Name = "err_assert_outside_test"; Path = "tests/err_assert_outside_test.mettle"; ShouldSucceed = $false
+     Pattern = "only be called inside a @test function" },
   @{ Name = "err_match_non_exhaustive"; Path = "tests/err_match_non_exhaustive.mettle"; ShouldSucceed = $false; Pattern = "Non-exhaustive match" },
   @{ Name = "err_trait_bound_missing_impl"; Path = "tests/err_trait_bound_missing_impl.mettle"; ShouldSucceed = $false; Pattern = "does not implement trait 'Addable'" },
   @{ Name = "err_trait_bound_missing_second_impl"; Path = "tests/err_trait_bound_missing_second_impl.mettle"; ShouldSucceed = $false; Pattern = "does not implement trait 'SignedNumber'" },

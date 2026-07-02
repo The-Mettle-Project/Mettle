@@ -31,7 +31,10 @@ typedef enum {
    * deliberate abort. Two runs that both guard-trap are considered
    * equivalent regardless of the exact crash point, matching how debug
    * checks behave under optimization. */
-  IR_INTERP_GUARD_TRAP
+  IR_INTERP_GUARD_TRAP,
+  /* assert()/assert_eq() builtin failed (mettle test). Details via
+   * ir_interp_assert_info. */
+  IR_INTERP_ASSERT_FAIL
 } IRInterpStatus;
 
 typedef struct {
@@ -82,5 +85,25 @@ IRInterpValue ir_interp_global_value(const IRInterpMachine *machine,
 /* Human-readable reason for the last non-OK status ("call_indirect",
  * "extern trace overflow", "local type 'string'", ...). */
 const char *ir_interp_status_detail(const IRInterpMachine *machine);
+
+/* After IR_INTERP_ASSERT_FAIL: the assert call site and operand values.
+ * Returns 0 when no assertion failed. */
+int ir_interp_assert_info(const IRInterpMachine *machine, size_t *line,
+                          size_t *column, IRInterpValue *left,
+                          IRInterpValue *right, int *is_eq);
+
+/* Source line of the NEW/malloc that created buffer `index` (0 = unknown /
+ * harness-registered input buffer). For leak reporting. */
+size_t ir_interp_buffer_alloc_line(const IRInterpMachine *machine,
+                                   size_t index);
+int ir_interp_buffer_freed(const IRInterpMachine *machine, size_t index);
+
+/* Line-level value tracing: after each executed instruction inside
+ * `only_in` frames that writes a named destination, the hook receives the
+ * source line, destination name, and new value. */
+typedef void (*IRInterpValueHook)(void *ctx, size_t line, const char *name,
+                                  IRInterpValue value);
+void ir_interp_set_value_hook(IRInterpMachine *machine, IRInterpValueHook hook,
+                              void *ctx, const IRFunction *only_in);
 
 #endif /* IR_INTERP_H */

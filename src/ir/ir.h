@@ -339,6 +339,7 @@ typedef struct {
   int is_noinline;        // `@noinline`: never inline this function
   int is_pure;            // `@pure`    : side-effect-free; enables call LICM
   int is_noalloc;         // `@noalloc` : proven allocation-free or error
+  int is_test;            // `@test`    : compile-time unit test (mettle test)
 } IRFunction;
 
 typedef struct {

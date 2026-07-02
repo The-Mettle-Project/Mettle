@@ -618,6 +618,7 @@ Symbol *symbol_create(const char *name, SymbolKind kind, Type *type) {
   symbol->is_forward_declaration = 0;
   symbol->is_extern = 0;
   symbol->is_immutable = 0;
+  symbol->is_builtin = 0;
   symbol->link_name = NULL;
   symbol->decl_line = 0;
   symbol->decl_column = 0;

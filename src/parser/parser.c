@@ -544,6 +544,7 @@ typedef struct {
   int is_noinline;        // `@noinline`
   int is_pure;            // `@pure`
   int is_noalloc;         // `@noalloc`
+  int is_test;            // `@test`: compile-time unit test (mettle test)
   int simd_mode; // SimdAttr from `@simd` / `@simd!` (SIMD_ATTR_NONE if absent)
 } ParsedDecorators;
 
@@ -558,6 +559,7 @@ static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
   out->is_noinline = 0;
   out->is_pure = 0;
   out->is_noalloc = 0;
+  out->is_test = 0;
   out->simd_mode = SIMD_ATTR_NONE;
 
   while (parser->current_token.type == TOKEN_AT) {
@@ -601,6 +603,13 @@ static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
       }
       out->is_pure = 1;
       parser_advance(parser);
+    } else if (strcmp(name, "test") == 0) {
+      if (out->is_test) {
+        parser_set_error(parser, "Duplicate '@test' decorator");
+        return 0;
+      }
+      out->is_test = 1;
+      parser_advance(parser);
     } else if (strcmp(name, "simd") == 0) {
       if (out->simd_mode != SIMD_ATTR_NONE) {
         parser_set_error(parser, "Duplicate '@simd' decorator");
@@ -615,7 +624,7 @@ static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
     } else {
       parser_set_error(parser,
                        "Unknown decorator after '@' (expected 'inline', "
-                       "'noinline', 'pure', 'noalloc', or 'simd')");
+                       "'noinline', 'pure', 'noalloc', 'test', or 'simd')");
       return 0;
     }
   }
@@ -661,6 +670,7 @@ ASTNode *parser_parse_declaration(Parser *parser) {
     fd->is_noinline = decos.is_noinline;
     fd->is_pure = decos.is_pure;
     fd->is_noalloc = decos.is_noalloc;
+    fd->is_test = decos.is_test;
     fd->simd_mode = decos.simd_mode;
     return decl;
   }

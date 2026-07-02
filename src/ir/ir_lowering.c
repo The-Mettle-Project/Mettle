@@ -150,6 +150,7 @@ IRFunction *ir_lower_function(IRLoweringContext *context,
   function->is_noinline = function_data->is_noinline;
   function->is_pure = function_data->is_pure;
   function->is_noalloc = function_data->is_noalloc;
+  function->is_test = function_data->is_test;
   /* A function-level `@simd` decorator becomes the default mode for every
    * counted loop in the body that has no `@simd` of its own. */
   context->current_function_simd_default = function_data->simd_mode;

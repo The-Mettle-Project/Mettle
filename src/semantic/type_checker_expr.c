@@ -637,6 +637,39 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
       return NULL;
     }
 
+    // assert/assert_eq are `mettle test` builtins: they exist only in the
+    // compile-time interpreter, so reject them outside @test functions
+    // (where they would survive into codegen and fail at link).
+    if (func_symbol->is_builtin &&
+        (strcmp(call->function_name, "assert") == 0 ||
+         strcmp(call->function_name, "assert_eq") == 0)) {
+      FunctionDeclaration *current_fn =
+          checker->current_function_decl && checker->current_function_decl->data
+              ? (FunctionDeclaration *)checker->current_function_decl->data
+              : NULL;
+      if (!current_fn || !current_fn->is_test) {
+        char error_msg[256];
+        snprintf(error_msg, sizeof(error_msg),
+                 "'%s' is a compile-time test builtin and can only be called "
+                 "inside a @test function",
+                 call->function_name);
+        checker->has_error = 1;
+        free(checker->error_message);
+        checker->error_message = strdup(error_msg);
+        if (checker->error_reporter) {
+          SourceSpan span = source_span_from_location(
+              expression->location, strlen(call->function_name));
+          span = error_reporter_span_snap_to_token(checker->error_reporter,
+                                                   span, call->function_name);
+          error_reporter_add_error_with_span_and_suggestion(
+              checker->error_reporter, ERROR_SEMANTIC, span, error_msg,
+              "mark the enclosing function @test and run it with `mettle "
+              "test`, or use an if + return instead");
+        }
+        return NULL;
+      }
+    }
+
     // Check argument count
     if (call->argument_count != func_symbol->data.function.parameter_count) {
       char error_msg[512];

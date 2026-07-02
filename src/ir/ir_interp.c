@@ -23,6 +23,7 @@ typedef struct {
   unsigned char *data;
   long long size;
   int freed;
+  size_t alloc_line; /* NEW/malloc source line; 0 for harness inputs */
 } IIBuffer;
 
 typedef struct {
@@ -58,6 +59,23 @@ struct IRInterpMachine {
   int depth;
   IRInterpStatus status;
   char detail[128];
+
+  /* Source location of the CALL currently dispatching to an extern; used to
+   * attribute assert failures and heap allocations to source lines. */
+  SourceLocation current_call_loc;
+
+  /* assert()/assert_eq() failure details (mettle test). */
+  int assert_failed;
+  size_t assert_line;
+  size_t assert_column;
+  IRInterpValue assert_left;
+  IRInterpValue assert_right;
+  int assert_is_eq;
+
+  /* Value tracing (mettle trace). */
+  IRInterpValueHook value_hook;
+  void *value_hook_ctx;
+  const IRFunction *value_hook_fn;
 };
 
 /* ---------------- environment ---------------- */
@@ -188,6 +206,7 @@ unsigned long long ir_interp_add_buffer(IRInterpMachine *machine,
   IIBuffer *buf = &machine->buffers[machine->buffer_count];
   buf->size = size;
   buf->freed = 0;
+  buf->alloc_line = 0;
   buf->base = II_ADDR_BASE + (unsigned long long)machine->buffer_count *
                                  II_ADDR_STRIDE;
   buf->data = (unsigned char *)malloc(size > 0 ? (size_t)size : 1);
@@ -388,6 +407,17 @@ static IRInterpValue ii_float_value(double v) {
   value.f = v;
   value.is_float = 1;
   return value;
+}
+
+/* Equality for assert_eq: exact for ints; floats compare as doubles (a test
+ * author asserting float equality means bit-for-bit intent). */
+static int ii_value_matches(const IRInterpValue *a, const IRInterpValue *b) {
+  if (a->is_float || b->is_float) {
+    double x = a->is_float ? a->f : (double)a->i;
+    double y = b->is_float ? b->f : (double)b->i;
+    return x == y;
+  }
+  return a->i == b->i;
 }
 
 static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
@@ -875,6 +905,35 @@ static int ii_extern_call(IRInterpMachine *machine, const char *name,
       return -1; /* unterminated within the buffer: refuse to guess */
     }
     *result = ii_int_value(n);
+    return 1;
+  }
+
+  /* assert()/assert_eq() builtins: interpreted natively by `mettle test`. */
+  if (strcmp(name, "assert_eq") == 0 && arg_count == 2) {
+    if (!ii_value_matches(&args[0], &args[1])) {
+      machine->assert_failed = 1;
+      machine->assert_line = machine->current_call_loc.line;
+      machine->assert_column = machine->current_call_loc.column;
+      machine->assert_left = args[0];
+      machine->assert_right = args[1];
+      machine->assert_is_eq = 1;
+      ii_fail(machine, IR_INTERP_ASSERT_FAIL, "assert_eq");
+      return -1;
+    }
+    return 1;
+  }
+  if (strcmp(name, "assert") == 0 && arg_count == 1) {
+    long long cond = args[0].is_float ? (args[0].f != 0.0) : (args[0].i != 0);
+    if (!cond) {
+      machine->assert_failed = 1;
+      machine->assert_line = machine->current_call_loc.line;
+      machine->assert_column = machine->current_call_loc.column;
+      machine->assert_left = args[0];
+      machine->assert_right = ii_int_value(0);
+      machine->assert_is_eq = 0;
+      ii_fail(machine, IR_INTERP_ASSERT_FAIL, "assert");
+      return -1;
+    }
     return 1;
   }
 
@@ -2147,6 +2206,8 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
         ii_fail(machine, IR_INTERP_TRAP, "new allocation");
         goto done;
       }
+      machine->buffers[machine->buffer_count - 1].alloc_line =
+          insn->location.line;
       IRInterpValue value = ii_int_value((long long)addr);
       if (!ii_store_dest(machine, &frame, &insn->dest, &value)) {
         goto done;
@@ -2186,9 +2247,16 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
           goto done;
         }
       } else {
+        machine->current_call_loc = insn->location;
+        size_t buffers_before = machine->buffer_count;
         int handled =
             ii_extern_call(machine, insn->text, call_args, call_arg_count,
                            &call_result);
+        /* Attribute any heap allocation the extern model made (malloc,
+         * calloc, realloc) to this call site for leak reporting. */
+        for (size_t bi = buffers_before; bi < machine->buffer_count; bi++) {
+          machine->buffers[bi].alloc_line = insn->location.line;
+        }
         if (handled < 0 || machine->status != IR_INTERP_OK) {
           if (machine->status == IR_INTERP_OK) {
             ii_fail(machine, IR_INTERP_TRAP, "extern call trap");
@@ -2232,6 +2300,37 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
       pc++;
       break;
     }
+
+    /* Value tracing: report the executed instruction's named result. */
+    if (machine->value_hook && frame.fn == machine->value_hook_fn &&
+        insn->location.line > 0 &&
+        (insn->dest.kind == IR_OPERAND_TEMP ||
+         insn->dest.kind == IR_OPERAND_SYMBOL) &&
+        insn->dest.name) {
+      switch (insn->op) {
+      case IR_OP_ASSIGN:
+      case IR_OP_BINARY:
+      case IR_OP_UNARY:
+      case IR_OP_CAST:
+      case IR_OP_LOAD:
+      case IR_OP_CALL:
+      case IR_OP_ROTATE_ADD:
+      case IR_OP_NEW: {
+        IIVar *var = ii_env_find(&frame.env, insn->dest.name);
+        if (!var && insn->dest.kind == IR_OPERAND_SYMBOL) {
+          var = ii_env_find(&machine->globals, insn->dest.name);
+        }
+        IRInterpValue value;
+        if (var && ii_var_read(machine, var, &value)) {
+          machine->value_hook(machine->value_hook_ctx, insn->location.line,
+                              insn->dest.name, value);
+        }
+        break;
+      }
+      default:
+        break;
+      }
+    }
   }
 
   /* Fell off the end: void return. */
@@ -2255,6 +2354,7 @@ IRInterpStatus ir_interp_run(IRInterpMachine *machine, IRFunction *function,
   machine->detail[0] = '\0';
   machine->fuel = fuel;
   machine->depth = 0;
+  machine->assert_failed = 0;
   IRInterpValue local_result = ii_int_value(0);
   int ok = ii_exec_function(machine, function, args, arg_count, &local_result);
   if (ok && machine->status == IR_INTERP_OK) {
@@ -2317,4 +2417,43 @@ IRInterpValue ir_interp_global_value(const IRInterpMachine *machine,
 
 const char *ir_interp_status_detail(const IRInterpMachine *machine) {
   return machine ? machine->detail : "";
+}
+
+int ir_interp_assert_info(const IRInterpMachine *machine, size_t *line,
+                          size_t *column, IRInterpValue *left,
+                          IRInterpValue *right, int *is_eq) {
+  if (!machine || !machine->assert_failed) {
+    return 0;
+  }
+  if (line) *line = machine->assert_line;
+  if (column) *column = machine->assert_column;
+  if (left) *left = machine->assert_left;
+  if (right) *right = machine->assert_right;
+  if (is_eq) *is_eq = machine->assert_is_eq;
+  return 1;
+}
+
+size_t ir_interp_buffer_alloc_line(const IRInterpMachine *machine,
+                                   size_t index) {
+  if (!machine || index >= machine->buffer_count) {
+    return 0;
+  }
+  return machine->buffers[index].alloc_line;
+}
+
+int ir_interp_buffer_freed(const IRInterpMachine *machine, size_t index) {
+  if (!machine || index >= machine->buffer_count) {
+    return 1;
+  }
+  return machine->buffers[index].freed;
+}
+
+void ir_interp_set_value_hook(IRInterpMachine *machine, IRInterpValueHook hook,
+                              void *ctx, const IRFunction *only_in) {
+  if (!machine) {
+    return;
+  }
+  machine->value_hook = hook;
+  machine->value_hook_ctx = ctx;
+  machine->value_hook_fn = only_in;
 }

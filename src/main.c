@@ -385,7 +385,7 @@ static void print_doc_reference(const char *argv0, const char *relative_path) {
 
 /* Single source of truth for the help-topic list. Referenced by print_usage,
  * the topic dispatcher, and the unknown-topic error so they cannot drift. */
-#define METTLE_HELP_TOPICS "build, runtime (alias: heap, gc), interop, stdlib, web, diagnostics (alias: errors), verify"
+#define METTLE_HELP_TOPICS "build, runtime (alias: heap, gc), interop, stdlib, web, diagnostics (alias: errors), verify, test (alias: trace)"
 
 static int print_help_topic(const char *program_name, const char *argv0,
                             const char *topic) {
@@ -448,6 +448,23 @@ static int print_help_topic(const char *program_name, const char *argv0,
     printf("                      (any use of std/thread interlocked atomic "
            "helpers).\n");
     print_doc_reference(argv0, "runtime-model.md");
+    return 0;
+  }
+
+  if (strcmp(topic, "test") == 0 || strcmp(topic, "tests") == 0 ||
+      strcmp(topic, "trace") == 0) {
+    printf("test / trace - compile-time execution (no codegen, no linking)\n\n");
+    printf("  mettle test app.mettle [--filter=SUBSTR]\n");
+    printf("      Run every @test function in the compiler's interpreter.\n");
+    printf("      assert(cond) / assert_eq(left, right) failures render as\n");
+    printf("      diagnostics with the actual values; unfreed allocations and\n");
+    printf("      null/out-of-bounds accesses fail or flag the test. @test\n");
+    printf("      functions are type-checked in every build but compiled out\n");
+    printf("      of normal binaries.\n\n");
+    printf("  mettle trace app.mettle sum_range 0 10\n");
+    printf("      Interpret one function on concrete arguments and print its\n");
+    printf("      source annotated with the values each line produced.\n");
+    print_doc_reference(argv0, "testing.md");
     return 0;
   }
 
@@ -2371,6 +2388,33 @@ int main(int argc, char *argv[]) {
     if (strcmp(argv[1], "explain") == 0) {
       return mettle_explain_error_code(argc >= 3 ? argv[2] : NULL);
     }
+    if (strcmp(argv[1], "test") == 0) {
+      /* `mettle test <file> [--filter=S] [flags...]`: shift the subcommand
+       * out and let the normal flag loop see the rest. */
+      options.test_mode = 1;
+      for (int i = 1; i + 1 < argc; i++) {
+        argv[i] = argv[i + 1];
+      }
+      argc--;
+      if (argc < 2) {
+        fprintf(stderr, "usage: mettle test <file.mettle> [--filter=SUBSTR]\n");
+        return 1;
+      }
+    } else if (strcmp(argv[1], "trace") == 0) {
+      /* `mettle trace <file> <fn> [args...]` */
+      if (argc < 4) {
+        fprintf(stderr,
+                "usage: mettle trace <file.mettle> <function> [args...]\n"
+                "  int/float parameters take the CLI values in order; pointer\n"
+                "  parameters get a synthesized buffer\n");
+        return 1;
+      }
+      options.trace_function = argv[3];
+      options.trace_args = (const char *const *)&argv[4];
+      options.trace_arg_count = (size_t)(argc - 4);
+      argv[1] = argv[2]; /* the input file */
+      argc = 2;
+    }
     if (strcmp(argv[1], "docs") == 0) {
       if (argc >= 3) {
         return print_help_topic(argv[0], argv[0], argv[2]);
@@ -2454,6 +2498,8 @@ int main(int argc, char *argv[]) {
                 fmt);
         return 1;
       }
+    } else if (strncmp(argv[i], "--filter=", 9) == 0) {
+      options.test_filter = argv[i] + 9;
     } else if (strcmp(argv[i], "--verify") == 0) {
       ir_verify_set_enabled(1);
       options.optimize = 1;
@@ -3198,6 +3244,38 @@ int compile_file(const char *input_filename, const char *output_filename,
     goto cleanup;
   }
 
+  /* @test functions are type-checked in every build (so they can't rot) but
+   * compiled only under `mettle test`: drop them before lowering. The node
+   * lives in BOTH program->children and Program->declarations; remove it
+   * from both before destroying it. */
+  if (!options->test_mode) {
+    Program *prog_data = (Program *)program->data;
+    if (prog_data) {
+      size_t kept = 0;
+      for (size_t i = 0; i < prog_data->declaration_count; i++) {
+        ASTNode *decl = prog_data->declarations[i];
+        FunctionDeclaration *fd =
+            decl && decl->type == AST_FUNCTION_DECLARATION && decl->data
+                ? (FunctionDeclaration *)decl->data
+                : NULL;
+        if (fd && fd->is_test) {
+          size_t child_kept = 0;
+          for (size_t c = 0; c < program->child_count; c++) {
+            if (program->children[c] == decl) {
+              continue;
+            }
+            program->children[child_kept++] = program->children[c];
+          }
+          program->child_count = child_kept;
+          ast_destroy_node(decl);
+          continue;
+        }
+        prog_data->declarations[kept++] = decl;
+      }
+      prog_data->declaration_count = kept;
+    }
+  }
+
   /* --explain reports optimizer decisions, so it only means something when the
    * optimizer runs; lowering then brackets every loop with report-only markers
    * for the verifier to report on. */
@@ -3222,6 +3300,28 @@ int compile_file(const char *input_filename, const char *output_filename,
   }
 
   mettle_compiler_ctx_set_ir_program(ir_program);
+
+  /* `mettle test` / `mettle trace`: execute in the compile-time interpreter
+   * and stop - no optimization (unless requested), no codegen, no linking. */
+  if (options->test_mode || options->trace_function) {
+    if (options->optimize) {
+      int opt_ok = compile_optimize_ir(ir_program, options);
+      if (!opt_ok) {
+        result = 1;
+        goto cleanup;
+      }
+    }
+    if (options->test_mode) {
+      result = ir_comptime_run_tests(ir_program, error_reporter,
+                                     input_filename, options->test_filter);
+    } else {
+      result = ir_comptime_trace(ir_program, error_reporter, input_filename,
+                                 source, options->trace_function,
+                                 options->trace_args,
+                                 options->trace_arg_count);
+    }
+    goto cleanup;
+  }
 
   /* --emit-ptx: lower every function to a PTX `.visible .entry` and write the
    * PTX text to the output file. No optimization (keeps the IR shape the PTX
@@ -3533,6 +3633,12 @@ void print_usage(const char *program_name) {
   printf("       %s help [topic]\n", program_name);
   printf("       %s docs [topic]\n", program_name);
   printf("       %s explain <CODE>   Explain a diagnostic code (e.g. E0004, M0103; 'list' for all)\n",
+         program_name);
+  printf("       %s test <file> [--filter=S]   Run @test functions in the compile-time\n"
+         "                           interpreter (instant; no codegen or linking)\n",
+         program_name);
+  printf("       %s trace <file> <fn> [args...] Interpret a function and print a\n"
+         "                           line-by-line value trace\n",
          program_name);
   printf("Options:\n");
   printf("  --error-format=F    Diagnostic output format: human (default) or json\n"
