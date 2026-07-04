@@ -1,0 +1,11 @@
+C	fib	fib	0	R	17
+C	main	println	0	I	22
+C	main	bench_time_us	0	I	24
+L	main	0	S	27
+C	main	fib	0	R	28
+C	main	bench_time_us	1	I	31
+C	main	print	0	I	33
+C	main	println_int	0	I	34
+C	main	print	1	I	35
+C	main	print_int	0	R	36
+C	main	println	1	I	37

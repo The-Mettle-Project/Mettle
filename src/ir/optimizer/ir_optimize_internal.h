@@ -375,6 +375,15 @@ int ir_index_vector_append(IRIndexVector *vector, size_t value);
 void ir_index_vector_destroy(IRIndexVector *vector);
 int ir_inline_small_functions_pass(IRProgram *program, int *changed);
 int ir_inline_self_recursion_pass(IRProgram *program, int *changed);
+int ir_tail_recursion_elimination_pass(IRProgram *program, int *changed);
+/* Allocation-site layout factorization (ir_optimize_layout.c): re-map the
+ * interior layout of provably-private malloc pools (compact padded strides /
+ * factor into per-field arrays). Whole-program; run after inlining. */
+int ir_layout_factor_pass(IRProgram *program, int *changed);
+struct IRGlobalIntConst;
+int ir_fold_readonly_globals_pass(IRProgram *program,
+                                  const struct IRGlobalIntConst *consts,
+                                  size_t count, int *changed);
 /* Resolve a function by name within the program (hashed lookup with a linear
  * fallback). Defined in ir_optimize_inline.c. */
 IRFunction *ir_program_find_function(IRProgram *program, const char *name);

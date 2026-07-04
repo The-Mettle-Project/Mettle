@@ -2500,6 +2500,9 @@ int main(int argc, char *argv[]) {
       }
     } else if (strncmp(argv[i], "--filter=", 9) == 0) {
       options.test_filter = argv[i] + 9;
+    } else if (strcmp(argv[i], "--pgo") == 0) {
+      options.pgo = 1;
+      options.optimize = 1;
     } else if (strcmp(argv[i], "--verify") == 0) {
       ir_verify_set_enabled(1);
       options.optimize = 1;
@@ -2902,7 +2905,75 @@ static int compile_lower_to_ir(ASTNode *program, TypeChecker *type_checker,
 int ir_apply_ml_opt(IRProgram *program); /* src/ir/ml_opt.c */
 int ir_hoist_constants(IRProgram *program); /* src/ir/ml_opt.c */
 
-static int compile_optimize_ir(IRProgram *ir_program,
+/* Collect non-extern, non-exported global integer `var`s whose initializer is
+ * an integer literal (optionally negated). The optimizer proves each is never
+ * written before folding its reads - this only supplies the candidates. */
+static IRGlobalIntConst *collect_global_int_consts(ASTNode *program,
+                                                   size_t *out_count) {
+  *out_count = 0;
+  if (!program || program->type != AST_PROGRAM || !program->data) {
+    return NULL;
+  }
+  Program *prog = (Program *)program->data;
+  IRGlobalIntConst *consts = NULL;
+  size_t count = 0, capacity = 0;
+  for (size_t i = 0; i < prog->declaration_count; i++) {
+    ASTNode *decl = prog->declarations[i];
+    if (!decl || decl->type != AST_VAR_DECLARATION || !decl->data) {
+      continue;
+    }
+    VarDeclaration *vd = (VarDeclaration *)decl->data;
+    if (!vd->name || !vd->type_name || vd->is_extern || vd->is_exported ||
+        vd->link_name || !vd->initializer) {
+      continue;
+    }
+    if (strcmp(vd->type_name, "int8") != 0 &&
+        strcmp(vd->type_name, "int16") != 0 &&
+        strcmp(vd->type_name, "int32") != 0 &&
+        strcmp(vd->type_name, "int64") != 0 &&
+        strcmp(vd->type_name, "uint8") != 0 &&
+        strcmp(vd->type_name, "uint16") != 0 &&
+        strcmp(vd->type_name, "uint32") != 0 &&
+        strcmp(vd->type_name, "uint64") != 0) {
+      continue;
+    }
+    ASTNode *init = vd->initializer;
+    long long sign = 1;
+    if (init->type == AST_UNARY_EXPRESSION && init->data) {
+      UnaryExpression *ue = (UnaryExpression *)init->data;
+      if (!ue->operator|| strcmp(ue->operator, "-") != 0 || !ue->operand) {
+        continue;
+      }
+      sign = -1;
+      init = ue->operand;
+    }
+    if (init->type != AST_NUMBER_LITERAL || !init->data) {
+      continue;
+    }
+    NumberLiteral *nl = (NumberLiteral *)init->data;
+    if (nl->is_float) {
+      continue;
+    }
+    if (count >= capacity) {
+      size_t nc = capacity ? capacity * 2 : 16;
+      IRGlobalIntConst *grown =
+          (IRGlobalIntConst *)realloc(consts, nc * sizeof(*grown));
+      if (!grown) {
+        free(consts);
+        return NULL;
+      }
+      consts = grown;
+      capacity = nc;
+    }
+    consts[count].name = vd->name;
+    consts[count].value = sign * nl->int_value;
+    count++;
+  }
+  *out_count = count;
+  return consts;
+}
+
+static int compile_optimize_ir(IRProgram *ir_program, ASTNode *ast_program,
                                CompilerOptions *options) {
   IROptimizeOptions ir_optimize_options = {0};
   ir_optimize_options.preserve_function_boundaries =
@@ -2929,7 +3000,15 @@ static int compile_optimize_ir(IRProgram *ir_program,
     if (options->annotate_hot) mir_annotate_set_hot_query(options->annotate_hot);
     ir_explain_set_retain_remarks(1);
   }
-  if (!ir_optimize_program(ir_program, &ir_optimize_options)) {
+  size_t global_const_count = 0;
+  IRGlobalIntConst *global_consts =
+      collect_global_int_consts(ast_program, &global_const_count);
+  ir_optimize_options.global_int_consts = global_consts;
+  ir_optimize_options.global_int_const_count = global_const_count;
+  ir_optimize_options.whole_program = options->building_executable;
+  int opt_ok = ir_optimize_program(ir_program, &ir_optimize_options);
+  free(global_consts);
+  if (!opt_ok) {
     /* A violated `@simd!` contract is a user error already printed with a
      * source location; don't bury it under a generic internal-error report. */
     if (!ir_optimize_had_user_error()) {
@@ -3301,11 +3380,18 @@ int compile_file(const char *input_filename, const char *output_filename,
 
   mettle_compiler_ctx_set_ir_program(ir_program);
 
+  /* --pgo: interpret main() now, before optimization, so the optimizer can
+   * consume measured call frequencies instead of static guesses. */
+  if (options->pgo) {
+    ir_pgo_profile_program(ir_program);
+    ir_pgo_print_summary();
+  }
+
   /* `mettle test` / `mettle trace`: execute in the compile-time interpreter
    * and stop - no optimization (unless requested), no codegen, no linking. */
   if (options->test_mode || options->trace_function) {
     if (options->optimize) {
-      int opt_ok = compile_optimize_ir(ir_program, options);
+      int opt_ok = compile_optimize_ir(ir_program, program, options);
       if (!opt_ok) {
         result = 1;
         goto cleanup;
@@ -3425,7 +3511,7 @@ int compile_file(const char *input_filename, const char *output_filename,
   if (options->optimize) {
     compiler_set_phase(PROFILE_PHASE_IR_OPTIMIZATION);
     phase_start = compiler_profile_begin(&profile);
-    int opt_ok = compile_optimize_ir(ir_program, options);
+    int opt_ok = compile_optimize_ir(ir_program, program, options);
     compiler_profile_add(&profile, PROFILE_PHASE_IR_OPTIMIZATION, phase_start);
     if (!opt_ok) {
       result = 1;
@@ -3643,6 +3729,12 @@ void print_usage(const char *program_name) {
   printf("Options:\n");
   printf("  --error-format=F    Diagnostic output format: human (default) or json\n"
          "                      (one JSON object per diagnostic on stderr, for tooling)\n");
+  printf("  --pgo               Zero-run profile-guided optimization: interpret main()\n"
+         "                      at compile time (deterministic, sandboxed) and feed the\n"
+         "                      measured call frequencies to the optimizer - a hot\n"
+         "                      callee bypasses the inliner's static size budget like an\n"
+         "                      explicit @inline. No instrumented build, no training\n"
+         "                      run. Implies -O. METTLE_PGO_HOT sets the threshold.\n");
   printf("  --verify            Translation validation: after every optimization pass,\n"
          "                      execute each changed function's before/after IR on\n"
          "                      generated inputs and compare behavior. A diverging pass\n"

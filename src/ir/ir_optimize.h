@@ -3,6 +3,15 @@
 
 #include "ir.h"
 
+/* A global integer `var` with a compile-time constant initializer. The
+ * optimizer folds reads of such a global to its initializer value when no
+ * function in the program writes it or takes its address (IR has no global
+ * table of its own, so main.c collects these from the AST). */
+typedef struct IRGlobalIntConst {
+  const char *name;
+  long long value;
+} IRGlobalIntConst;
+
 typedef struct {
   /* Reserved for future IR optimization controls. */
   int preserve_function_boundaries;
@@ -14,6 +23,14 @@ typedef struct {
   /* When set, --explain remarks are limited to source locations in this file
    * (the main input), so imported stdlib modules don't flood the report. */
   const char *explain_focus_file;
+  /* Non-extern global integer vars with literal initializers (see above). */
+  const IRGlobalIntConst *global_int_consts;
+  size_t global_int_const_count;
+  /* Set when this compile feeds an executable link with `main` as the single
+   * entry point. Gates whole-program transforms whose soundness needs every
+   * call site visible (e.g. allocation-site layout factorization, which
+   * rewrites callee bodies to a new pool layout). */
+  int whole_program;
 } IROptimizeOptions;
 
 // Runs optimization passes on the generated IR program.

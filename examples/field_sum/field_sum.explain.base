@@ -1,0 +1,29 @@
+L	build_records	0	S	31
+C	build_records	set_field	0	I	34
+C	build_records	set_field	1	I	38
+C	build_records	set_field	2	I	39
+C	build_records	set_field	3	I	40
+C	build_records	set_field	4	I	41
+C	build_records	set_field	5	I	42
+C	build_records	set_field	6	I	43
+C	build_records	set_field	7	I	44
+L	sum_field0	0	S	52
+C	main	println	0	I	63
+C	main	build_records	0	R	67
+C	main	println	1	I	69
+C	main	sum_field0	0	R	71
+C	main	print	0	I	72
+C	main	println_int	0	I	73
+C	main	println	2	I	76
+C	main	bench_time_us	0	I	78
+L	main	0	S	81
+C	main	sum_field0	1	R	82
+C	main	bench_time_us	1	I	85
+C	main	print	1	I	87
+C	main	println_int	1	I	88
+C	main	print	2	I	89
+C	main	print_int	0	R	90
+C	main	println	3	I	91
+C	main	print	3	I	94
+C	main	print_int	1	R	95
+C	main	println	4	I	96

@@ -1,0 +1,59 @@
+import "std/io";
+import "std/mem";
+
+var NODE_BYTES: int64 = 16;
+
+fn node_next(nodes: cstring, idx: int32) -> int32 {
+  return *(int32*)(nodes + (int64)idx * NODE_BYTES);
+}
+
+fn set_node_next(nodes: cstring, idx: int32, next_idx: int32) {
+  *(int32*)(nodes + (int64)idx * NODE_BYTES) = next_idx;
+}
+
+fn build_list(nodes: cstring, order: int32*, count: int32) {
+  var i: int32 = 0;
+  while (i < count) {
+    order[i] = i;
+    i = i + 1;
+  }
+  i = 0;
+  while (i < count - 1) {
+    set_node_next(nodes, order[i], order[i + 1]);
+    i = i + 1;
+  }
+  set_node_next(nodes, order[count - 1], -1);
+}
+
+fn main() -> int32 {
+  var count: int32 = 64;
+  var nodes: cstring = malloc((int64)count * NODE_BYTES);
+  var order: int32* = (int32*)malloc((int64)count * 4);
+  if (nodes == 0 || order == 0) {
+    println("malloc failed");
+    return 1;
+  }
+
+  build_list(nodes, order, count);
+
+  var i: int32 = 0;
+  while (i < count - 1) {
+    if (node_next(nodes, i) != i + 1) {
+      print("MISMATCH at ");
+      print_int((int64)i);
+      print(": ");
+      println_int((int64)node_next(nodes, i));
+      return 2;
+    }
+    i = i + 1;
+  }
+  if (node_next(nodes, count - 1) != -1) {
+    println("MISMATCH at tail");
+    return 2;
+  }
+
+  println("ptr_induction_two_loops OK");
+  free(nodes);
+  free((cstring)order);
+  return 0;
+}

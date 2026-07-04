@@ -1,0 +1,107 @@
+// Allocation-site layout factorization (layout_factor) self-check.
+//
+// Pool A: 16-byte stride, two int32 fields at 0/4 (8 bytes of padding) that
+//   are both loaded -> COMPACT candidate. Accessors are separate functions so
+//   the interprocedural alias tracking is exercised.
+// Pool B: 8-byte stride, two int32 fields; both written, only field 0 loaded
+//   -> SOA candidate (dead-field skipping).
+// Pool C: same shape as A, but its base pointer is stored into a side buffer
+//   and read back before deref -> the analysis must decline (escape), and the
+//   program must still be correct.
+//
+// The checks are closed-form sums; any layout bug changes the checksums.
+// Prints "layout OK" and exits 0 on success; exits 1 on any mismatch.
+
+import "std/io";
+import "std/mem";
+
+var N: int32 = 64;
+var STRIDE_A: int64 = 16;
+
+fn a_set(pool: cstring, idx: int32, v: int32, w: int32) {
+  *(int32*)(pool + (int64)idx * STRIDE_A) = v;
+  *(int32*)(pool + (int64)idx * STRIDE_A + 4) = w;
+}
+
+fn a_sum(pool: cstring, count: int32) -> int64 {
+  var total: int64 = 0;
+  var i: int32 = 0;
+  while (i < count) {
+    total = total + (int64)*(int32*)(pool + (int64)i * STRIDE_A);
+    total = total + (int64)*(int32*)(pool + (int64)i * STRIDE_A + 4);
+    i = i + 1;
+  }
+  return total;
+}
+
+fn main() -> int32 {
+  var n: int32 = N;
+
+  // Pool A: compact candidate.
+  var pa: cstring = malloc((int64)n * STRIDE_A);
+  if (pa == 0) { return 1; }
+  var i: int32 = 0;
+  while (i < n) {
+    a_set(pa, i, i, i * 3);
+    i = i + 1;
+  }
+  var got_a: int64 = a_sum(pa, n);
+  // sum(i) + sum(3i) over 0..63 = 4 * 63*64/2 = 8064
+  if (got_a != 8064) {
+    println("layout FAIL a");
+    return 1;
+  }
+  free(pa);
+
+  // Pool B: SoA candidate (loads touch only field 0).
+  var pb: cstring = malloc((int64)n * 8);
+  if (pb == 0) { return 1; }
+  i = 0;
+  while (i < n) {
+    *(int32*)(pb + (int64)i * 8) = i * 2;
+    *(int32*)(pb + (int64)i * 8 + 4) = 12345;
+    i = i + 1;
+  }
+  var got_b: int64 = 0;
+  i = 0;
+  while (i < n) {
+    got_b = got_b + (int64)*(int32*)(pb + (int64)i * 8);
+    i = i + 1;
+  }
+  // sum(2i) over 0..63 = 63*64 = 4032
+  if (got_b != 4032) {
+    println("layout FAIL b");
+    return 1;
+  }
+  free(pb);
+
+  // Pool C: escaped pointer (stored to memory) -> must be left untouched.
+  var pc: cstring = malloc((int64)n * 16);
+  var side: int64* = (int64*)malloc(8);
+  if (pc == 0 || side == 0) { return 1; }
+  side[0] = (int64)pc;
+  i = 0;
+  while (i < n) {
+    var via: cstring = (cstring)side[0];
+    *(int32*)(via + (int64)i * 16) = i;
+    *(int32*)(via + (int64)i * 16 + 4) = i + 1;
+    i = i + 1;
+  }
+  var got_c: int64 = 0;
+  i = 0;
+  while (i < n) {
+    got_c = got_c + (int64)*(int32*)(pc + (int64)i * 16);
+    got_c = got_c + (int64)*(int32*)(pc + (int64)i * 16 + 4);
+    i = i + 1;
+  }
+  // sum(i) + sum(i+1) over 0..63 = 2016 + 2016 + 64 = 4096
+  if (got_c != 4096) {
+    println("layout FAIL c");
+    return 1;
+  }
+  free(pc);
+  free((cstring)side);
+
+  println("layout OK");
+  return 0;
+}

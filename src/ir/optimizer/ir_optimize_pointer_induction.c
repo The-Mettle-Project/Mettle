@@ -662,7 +662,10 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
       continue;
     }
 
-  if (!ir_ptr_induction_rewrite_instruction(
+  /* Rewrites are only valid inside this loop; the iv and addr temps may be
+   * reused by later loops that keep their indexed form. */
+  if (i <= jump_index &&
+      !ir_ptr_induction_rewrite_instruction(
             &rewritten, bindings, binding_count, iv_symbol, end_ptr)) {
       ir_instruction_destroy_storage(&rewritten);
       ir_instruction_vector_destroy(&vector);

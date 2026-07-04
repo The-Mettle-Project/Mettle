@@ -1,7 +1,10 @@
-fn main() -> int32 {
-  var x: int32 = 5;
+@noinline fn check(x: int32) -> int32 {
   if (x != 0) {
     return 1;
   }
   return 0;
+}
+
+fn main() -> int32 {
+  return check(5);
 }

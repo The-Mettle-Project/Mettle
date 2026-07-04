@@ -23,7 +23,7 @@ fn main() -> int32 {
   var av: float64 = a; var pp: int32 = 0;
   while (pp < passes) {aseq[pp] = av; av = av * 1.0000001; pp = pp + 1;}
 
-  const TILE = 2048;
+  const TILE: int32 = 2048;
   var base: int32 = 0;
   while (base < N) {
     var hi: int32 = base + TILE; if (hi > N) {hi = N;}

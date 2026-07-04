@@ -76,6 +76,16 @@ struct IRInterpMachine {
   IRInterpValueHook value_hook;
   void *value_hook_ctx;
   const IRFunction *value_hook_fn;
+
+  /* Execution counting (zero-run PGO). */
+  int count_enabled;
+  struct {
+    const IRFunction *fn;
+    long long *counts;
+    size_t n;
+  } *count_tables;
+  size_t count_table_count;
+  size_t count_table_capacity;
 };
 
 /* ---------------- environment ---------------- */
@@ -175,8 +185,68 @@ void ir_interp_destroy(IRInterpMachine *machine) {
   for (size_t i = 0; i < machine->buffer_count; i++) {
     free(machine->buffers[i].data);
   }
+  for (size_t i = 0; i < machine->count_table_count; i++) {
+    free(machine->count_tables[i].counts);
+  }
+  free(machine->count_tables);
   ii_env_free(&machine->globals);
   free(machine);
+}
+
+void ir_interp_enable_counting(IRInterpMachine *machine) {
+  if (machine) {
+    machine->count_enabled = 1;
+  }
+}
+
+static long long *ii_counts_for(IRInterpMachine *machine,
+                                const IRFunction *fn) {
+  if (!machine->count_enabled || !fn || fn->instruction_count == 0) {
+    return NULL;
+  }
+  for (size_t i = 0; i < machine->count_table_count; i++) {
+    if (machine->count_tables[i].fn == fn) {
+      return machine->count_tables[i].counts;
+    }
+  }
+  if (machine->count_table_count >= machine->count_table_capacity) {
+    size_t new_capacity =
+        machine->count_table_capacity ? machine->count_table_capacity * 2 : 32;
+    void *grown = realloc(machine->count_tables,
+                          new_capacity * sizeof(*machine->count_tables));
+    if (!grown) {
+      return NULL;
+    }
+    machine->count_tables = grown;
+    machine->count_table_capacity = new_capacity;
+  }
+  long long *counts =
+      (long long *)calloc(fn->instruction_count, sizeof(long long));
+  if (!counts) {
+    return NULL;
+  }
+  machine->count_tables[machine->count_table_count].fn = fn;
+  machine->count_tables[machine->count_table_count].counts = counts;
+  machine->count_tables[machine->count_table_count].n = fn->instruction_count;
+  machine->count_table_count++;
+  return counts;
+}
+
+const long long *ir_interp_get_counts(const IRInterpMachine *machine,
+                                      const IRFunction *function,
+                                      size_t *count_out) {
+  if (!machine || !function) {
+    return NULL;
+  }
+  for (size_t i = 0; i < machine->count_table_count; i++) {
+    if (machine->count_tables[i].fn == function) {
+      if (count_out) {
+        *count_out = machine->count_tables[i].n;
+      }
+      return machine->count_tables[i].counts;
+    }
+  }
+  return NULL;
 }
 
 void ir_interp_set_override(IRInterpMachine *machine, const char *name,
@@ -1886,6 +1956,8 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
     }
   }
 
+  long long *exec_counts = ii_counts_for(machine, fn);
+
   size_t pc = 0;
   while (pc < fn->instruction_count) {
     if (--machine->fuel < 0) {
@@ -1893,6 +1965,7 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
       goto done;
     }
     const IRInstruction *insn = &fn->instructions[pc];
+    size_t executed_pc = pc;
 
     switch (insn->op) {
     case IR_OP_NOP:
@@ -2299,6 +2372,10 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
       }
       pc++;
       break;
+    }
+
+    if (exec_counts) {
+      exec_counts[executed_pc]++;
     }
 
     /* Value tracing: report the executed instruction's named result. */

@@ -1,4 +1,5 @@
 #include "ir_optimize_internal.h"
+#include "../ir_pgo.h"
 
 #include <stdio.h>
 
@@ -141,6 +142,11 @@ static int ir_function_is_inline_candidate(const IRFunction *function,
    * work around a latent optimizer bug, and the must-have-a-return rule still
    * apply. */
   int forced = function->is_inline;
+  /* Zero-run PGO: a measured-hot callee earns the same budget override an
+   * explicit @inline grants - the profile IS the "this is worth code size"
+   * evidence the static heuristic lacks. It does NOT bypass the denylist or
+   * structural guards, and stays under a 4x sanity cap. */
+  int pgo_hot = !forced && ir_pgo_function_is_hot(function->name);
 
   if (!forced && ir_function_name_is_inline_denylisted(function->name)) {
     *why_not = "the callee is on the compiler's inline denylist "
@@ -172,8 +178,17 @@ static int ir_function_is_inline_candidate(const IRFunction *function,
     }
 
     non_nop_count++;
-    if (!forced && non_nop_count > IR_INLINE_MAX_NON_NOP_INSTRUCTIONS) {
+    if (!forced && !pgo_hot &&
+        non_nop_count > IR_INLINE_MAX_NON_NOP_INSTRUCTIONS) {
       *why_not = "the callee's body is over the 128-instruction inline budget";
+      *fix = "mark the callee @inline to override the budget, or compile "
+             "with --pgo so a measured-hot callee overrides it";
+      return 0;
+    }
+    if (!forced && pgo_hot &&
+        non_nop_count > 4 * IR_INLINE_MAX_NON_NOP_INSTRUCTIONS) {
+      *why_not = "the callee is measured-hot but over even the profile-"
+                 "widened 512-instruction budget";
       *fix = "mark the callee @inline to override the budget";
       return 0;
     }
@@ -214,9 +229,15 @@ static int ir_function_is_inline_candidate(const IRFunction *function,
     if (instruction->op == IR_OP_CALL ||
         instruction->op == IR_OP_CALL_INDIRECT) {
       call_count++;
-      if (!forced && call_count > 2) {
+      if (!forced && !pgo_hot && call_count > 2) {
         *why_not = "the callee makes more than 2 calls of its own (inlining "
                    "glue functions bloats callers without runtime gain)";
+        *fix = "mark the callee @inline to override the call-count cap";
+        return 0;
+      }
+      if (!forced && pgo_hot && call_count > 6) {
+        *why_not = "the callee is measured-hot but makes more than 6 calls "
+                   "of its own";
         *fix = "mark the callee @inline to override the call-count cap";
         return 0;
       }

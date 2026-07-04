@@ -302,8 +302,12 @@ static void mir_compute_liveness(MirFunction *fn) {
         if (vr->live_end < l || vr->live_start > b) {
           continue;
         }
-        /* crosses a boundary (defined before l, or used after b)? */
-        int crosses = (vr->live_start < l) || (vr->live_end > b);
+        /* crosses a boundary (defined before l, or used after b)? An
+         * entry-live vreg (param / hidden out-pointer) is defined by the
+         * prologue BEFORE instruction 0, so when the loop header is at index
+         * 0 (tail-recursion loops) it crosses even though live_start == l. */
+        int crosses = (vr->live_start < l) || (vr->live_end > b) ||
+                      (vr->entry_live && l == 0);
         if (!crosses) {
           continue;
         }

@@ -1,0 +1,132 @@
+// Mettle radix-sort benchmark (Suite 2)
+//
+// LSD radix sort (4 passes of 8-bit digits) over 4096 uint32 values
+// (deterministic pseudo-random fill). 200 outer passes.
+//
+// Build: build.bat
+// Run: radix_sort.exe
+
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+var DATA_LEN: int32 = 4096;
+
+fn fill_data(data: uint32*, seed: uint32) {
+  var state: uint32 = seed;
+  var i: int32 = 0;
+  while (i < DATA_LEN) {
+    state = state ^ (state << 13);
+    state = state ^ (state >> 17);
+    state = state ^ (state << 5);
+    data[i] = state;
+    i = i + 1;
+  }
+}
+
+fn radix_pass(src: uint32*, dst: uint32*, len: int32, shift: int32, count: int32*) {
+  var i: int32 = 0;
+  while (i < 256) {
+    count[i] = 0;
+    i = i + 1;
+  }
+
+  i = 0;
+  while (i < len) {
+    var digit: int32 = (int32)((src[i] >> shift) & 255);
+    count[digit] = count[digit] + 1;
+    i = i + 1;
+  }
+
+  var total: int32 = 0;
+  i = 0;
+  while (i < 256) {
+    var c: int32 = count[i];
+    count[i] = total;
+    total = total + c;
+    i = i + 1;
+  }
+
+  i = 0;
+  while (i < len) {
+    var digit: int32 = (int32)((src[i] >> shift) & 255);
+    dst[count[digit]] = src[i];
+    count[digit] = count[digit] + 1;
+    i = i + 1;
+  }
+}
+
+@inline fn radix_sort(data: uint32*, tmp: uint32*, len: int32, count: int32*) {
+  radix_pass(data, tmp, len, 0, count);
+  radix_pass(tmp, data, len, 8, count);
+  radix_pass(data, tmp, len, 16, count);
+  radix_pass(tmp, data, len, 24, count);
+}
+
+fn weighted_sum(data: uint32*, len: int32) -> int64 {
+  var sum: int64 = 0;
+  var i: int32 = 0;
+  while (i < len) {
+    sum = sum + (int64)data[i] * (int64)(i % 7 + 1);
+    i = i + 1;
+  }
+  return sum;
+}
+
+fn sum_array(data: uint32*, len: int32) -> int64 {
+  var sum: int64 = 0;
+  var i: int32 = 0;
+  while (i < len) {
+    sum = sum + (int64)data[i];
+    i = i + 1;
+  }
+  return sum;
+}
+
+fn copy_array(dst: uint32*, src: uint32*, len: int32) {
+  memcpy((cstring)((int64)dst), (cstring)((int64)src), (int64)len * 4);
+}
+
+fn main() -> int32 {
+  var passes: int32 = 200;
+  var data: uint32[4096];
+  var scratch: uint32[4096];
+  var tmp: uint32[4096];
+  var count: int32[256];
+
+  fill_data(&data[0], 88172645);
+
+  println("Radix sort: 4096 uint32 values");
+
+  copy_array(&scratch[0], &data[0], DATA_LEN);
+  radix_sort(&scratch[0], &tmp[0], DATA_LEN, &count[0]);
+  var check: int64 = weighted_sum(&scratch[0], DATA_LEN);
+  print("Sorted wsum = ");
+  println_int(check);
+
+  println("Benchmark: 200 passes (radix_sort)");
+
+  var t0: uint64 = bench_time_us();
+  var bench_sum: int64 = 0;
+  var p: int32 = 0;
+  while (p < passes) {
+    copy_array(&scratch[0], &data[0], DATA_LEN);
+    radix_sort(&scratch[0], &tmp[0], DATA_LEN, &count[0]);
+    bench_sum = bench_sum + sum_array(&scratch[0], DATA_LEN);
+    p = p + 1;
+  }
+  var elapsed_us: uint64 = bench_time_us() - t0;
+
+  print("Bench sum = ");
+  println_int(bench_sum);
+  print("Time: ");
+  print_int(elapsed_us);
+  println(" us");
+
+  var per_pass: uint64 = elapsed_us / passes;
+  print("Per pass: ~");
+  print_int(per_pass);
+  println(" us");
+
+  return 0;
+}

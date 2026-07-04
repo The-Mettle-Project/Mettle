@@ -1,0 +1,128 @@
+// Mettle heapsort benchmark (Suite 2)
+//
+// In-place binary-heap sort over 2048 int32 values (deterministic
+// pseudo-random fill). 200 passes.
+//
+// Build: build.bat
+// Run: heapsort.exe
+
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+var DATA_LEN: int32 = 2048;
+
+fn fill_data(data: int32*, seed: int32) {
+  var i: int32 = 0;
+  while (i < DATA_LEN) {
+    var v: int32 = (i * 1103515245 + seed + 12345) % 65536;
+    data[i] = v;
+    i = i + 1;
+  }
+}
+
+fn sift_down(data: int32*, start: int32, end: int32) {
+  var root: int32 = start;
+  while (root * 2 + 1 <= end) {
+    var child: int32 = root * 2 + 1;
+    var swap_idx: int32 = root;
+
+    if (data[swap_idx] < data[child]) {
+      swap_idx = child;
+    }
+    if (child + 1 <= end && data[swap_idx] < data[child + 1]) {
+      swap_idx = child + 1;
+    }
+    if (swap_idx == root) {
+      return;
+    }
+
+    var tmp: int32 = data[root];
+    data[root] = data[swap_idx];
+    data[swap_idx] = tmp;
+    root = swap_idx;
+  }
+}
+
+fn heapsort(data: int32*, len: int32) {
+  var start: int32 = (len - 2) / 2;
+  while (start >= 0) {
+    sift_down(data, start, len - 1);
+    start = start - 1;
+  }
+
+  var end: int32 = len - 1;
+  while (end > 0) {
+    var tmp: int32 = data[0];
+    data[0] = data[end];
+    data[end] = tmp;
+    end = end - 1;
+    sift_down(data, 0, end);
+  }
+}
+
+fn weighted_sum(data: int32*, len: int32) -> int64 {
+  var sum: int64 = 0;
+  var i: int32 = 0;
+  while (i < len) {
+    sum = sum + (int64)data[i] * (int64)(i + 1);
+    i = i + 1;
+  }
+  return sum;
+}
+
+fn sum_array(data: int32*, len: int32) -> int64 {
+  var sum: int64 = 0;
+  var i: int32 = 0;
+  while (i < len) {
+    sum = sum + (int64)data[i];
+    i = i + 1;
+  }
+  return sum;
+}
+
+fn copy_array(dst: int32*, src: int32*, len: int32) {
+  memcpy((cstring)((int64)dst), (cstring)((int64)src), (int64)len * 4);
+}
+
+fn main() -> int32 {
+  var passes: int32 = 200;
+  var data: int32[2048];
+  var scratch: int32[2048];
+
+  fill_data(&data[0], 42);
+
+  println("Heapsort: 2048 int32 values");
+
+  copy_array(&scratch[0], &data[0], DATA_LEN);
+  heapsort(&scratch[0], DATA_LEN);
+  var check: int64 = weighted_sum(&scratch[0], DATA_LEN);
+  print("Sorted wsum = ");
+  println_int(check);
+
+  println("Benchmark: 200 passes (heapsort)");
+
+  var t0: uint64 = bench_time_us();
+  var bench_sum: int64 = 0;
+  var p: int32 = 0;
+  while (p < passes) {
+    copy_array(&scratch[0], &data[0], DATA_LEN);
+    heapsort(&scratch[0], DATA_LEN);
+    bench_sum = bench_sum + sum_array(&scratch[0], DATA_LEN);
+    p = p + 1;
+  }
+  var elapsed_us: uint64 = bench_time_us() - t0;
+
+  print("Bench sum = ");
+  println_int(bench_sum);
+  print("Time: ");
+  print_int(elapsed_us);
+  println(" us");
+
+  var per_pass: uint64 = elapsed_us / passes;
+  print("Per pass: ~");
+  print_int(per_pass);
+  println(" us");
+
+  return 0;
+}

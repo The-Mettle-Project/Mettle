@@ -1304,6 +1304,16 @@ $cases = @(
      OutputMustNotMatch = @("assertion failed") },
   @{ Name = "err_assert_outside_test"; Path = "tests/err_assert_outside_test.mettle"; ShouldSucceed = $false
      Pattern = "only be called inside a @test function" },
+  # Zero-run PGO: interpreted profile marks the oversized callee hot, which
+  # overrides the inliner's static budget; without --pgo it stays refused.
+  @{ Name = "pgo_hot_inline"; Path = "tests/pgo_hot_inline.mettle"; ShouldSucceed = $true
+     Args = @("--pgo", "--release", "--explain")
+     OutputMustMatch = @('pgo: interpreted main', 'keyed_mix: 100000 calls.*\[hot\]',
+                         'call to .keyed_mix. @ line 32.: inlined')
+     OutputMustNotMatch = @('NOT inlined') },
+  @{ Name = "pgo_off_budget_refusal"; Path = "tests/pgo_hot_inline.mettle"; ShouldSucceed = $true
+     Args = @("--release", "--explain")
+     OutputMustMatch = @('call to .keyed_mix. @ line 32.: NOT inlined') },
   @{ Name = "err_match_non_exhaustive"; Path = "tests/err_match_non_exhaustive.mettle"; ShouldSucceed = $false; Pattern = "Non-exhaustive match" },
   @{ Name = "err_trait_bound_missing_impl"; Path = "tests/err_trait_bound_missing_impl.mettle"; ShouldSucceed = $false; Pattern = "does not implement trait 'Addable'" },
   @{ Name = "err_trait_bound_missing_second_impl"; Path = "tests/err_trait_bound_missing_second_impl.mettle"; ShouldSucceed = $false; Pattern = "does not implement trait 'SignedNumber'" },
@@ -2548,6 +2558,148 @@ foreach ($relFlag in @($true, $false)) {
   catch {
     $failed++
     Write-CaseResult -Name "opt_closed_form_sum_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# Pointer-induction scope: converting the first of two loops that share an
+# induction variable and array must not rewrite the second loop's compare to
+# the first loop's exhausted walk pointers (regression: the rewrite window ran
+# to end-of-function instead of the loop's back-edge). Self-checks the second
+# loop's stores and returns nonzero on any mismatch.
+foreach ($relFlag in @($true, $false)) {
+  $total++
+  $variant = if ($relFlag) { "release" } else { "debug" }
+  try {
+    $exePath = Join-Path $tmpDir "test_opt_ptr_induction_two_loops_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($relFlag) { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_opt_ptr_induction_two_loops.mettle", "-o", $exePath)
+
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "ptr-induction two-loops build ($variant) failed: $buildOut"
+    }
+    if (-not (Test-Path $exePath)) {
+      throw "ptr-induction two-loops build ($variant) did not produce an executable"
+    }
+
+    $runOut = & $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "ptr-induction two-loops ($variant) reported a mismatch (exit $LASTEXITCODE): $runOut"
+    }
+    if ($runOut -notmatch "ptr_induction_two_loops OK") {
+      throw "ptr-induction two-loops ($variant) did not print OK: $runOut"
+    }
+
+    Write-CaseResult -Name "opt_ptr_induction_two_loops_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "opt_ptr_induction_two_loops_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# Tail-recursion elimination: pure (`return self(...)`), void (`self(...);
+# return`), and accumulator (`return E + self(...)`) forms must preserve
+# semantics, including the MIR back-edge-to-entry liveness fix (params must
+# survive the rebind+jump loop). Order-sensitive checks: qsr verifies actual
+# sortedness, not an order-blind sum.
+foreach ($relFlag in @($true, $false)) {
+  $total++
+  $variant = if ($relFlag) { "release" } else { "debug" }
+  try {
+    $exePath = Join-Path $tmpDir "test_opt_tail_recursion_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($relFlag) { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_opt_tail_recursion.mettle", "-o", $exePath)
+
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "tail-recursion build ($variant) failed: $buildOut"
+    }
+    if (-not (Test-Path $exePath)) {
+      throw "tail-recursion build ($variant) did not produce an executable"
+    }
+
+    $runOut = & $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "tail-recursion ($variant) reported a mismatch (exit $LASTEXITCODE): $runOut"
+    }
+    if ($runOut -notmatch "tail_recursion OK") {
+      throw "tail-recursion ($variant) did not print OK: $runOut"
+    }
+
+    Write-CaseResult -Name "opt_tail_recursion_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "opt_tail_recursion_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# Read-only global fold: a never-written global integer var must fold to its
+# initializer; a written one must NOT. Self-checks both.
+foreach ($relFlag in @($true, $false)) {
+  $total++
+  $variant = if ($relFlag) { "release" } else { "debug" }
+  try {
+    $exePath = Join-Path $tmpDir "test_opt_readonly_global_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($relFlag) { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_opt_readonly_global.mettle", "-o", $exePath)
+
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "readonly-global build ($variant) failed: $buildOut"
+    }
+
+    $runOut = & $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "readonly-global ($variant) reported a mismatch (exit $LASTEXITCODE): $runOut"
+    }
+    if ($runOut -notmatch "readonly_global OK") {
+      throw "readonly-global ($variant) did not print OK: $runOut"
+    }
+
+    Write-CaseResult -Name "opt_readonly_global_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "opt_readonly_global_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# Allocation-site layout factorization: a padded malloc pool must compact, a
+# subset-loaded pool must factor into per-field arrays (SoA), and an escaped
+# pool must be declined -- all while the program's closed-form checksums hold.
+# Self-checks and returns nonzero on any mismatch.
+foreach ($relFlag in @($true, $false)) {
+  $total++
+  $variant = if ($relFlag) { "release" } else { "debug" }
+  try {
+    $exePath = Join-Path $tmpDir "test_opt_layout_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($relFlag) { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_opt_layout.mettle", "-o", $exePath)
+
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "layout build ($variant) failed: $buildOut"
+    }
+
+    $runOut = & $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "layout ($variant) reported a mismatch (exit $LASTEXITCODE): $runOut"
+    }
+    if ($runOut -notmatch "layout OK") {
+      throw "layout ($variant) did not print OK: $runOut"
+    }
+
+    Write-CaseResult -Name "opt_layout_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "opt_layout_$variant" -Passed $false -Reason $_.Exception.Message
   }
 }
 
