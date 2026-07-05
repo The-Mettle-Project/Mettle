@@ -21,8 +21,24 @@ evidence, inlining a large callee is a code-size gamble. A measured-hot
 callee (>= `METTLE_PGO_HOT` calls, default 1024) IS the evidence: it gets
 the same budget override an explicit `@inline` grants - the 128-instruction
 budget widens to 512 and the 2-call glue cap to 6. The denylist and
-structural guards still apply, and a cold or unprofiled callee keeps the
-static heuristics, so `--pgo` can only unlock inlining, never lose it.
+structural guards still apply. Unprofiled builds keep the static heuristic;
+profiled cold code can now use tighter budgets to avoid training-run code-size
+bloat.
+
+**Hotness-aware thresholds.** The interpreter also records body-step counts
+and source-keyed execution counts for IR sites, giving the optimizer a
+lightweight block profile that survives ordinary early rewrites and inlining.
+When a profile is present, code-size/speed thresholds adapt:
+
+- measured-hot callees and callers get wider inline budgets;
+- measured-cold callees get tighter discretionary inline budgets;
+- constant-trip full unrolling uses 16 trips for cold sites, 64 trips normally,
+  and 128 trips for hot sites;
+- indirect-access software prefetching is skipped for cold sites and can use a
+  wider look-ahead distance for hot sites.
+
+No-profile builds keep the old static thresholds. `METTLE_PGO_HOT=<n>` is the
+shared threshold for hot function calls and source/block-like site counts.
 
 Inlining is the gateway optimization: once the call boundary dissolves,
 constant arguments propagate into the callee's body. Combined with the

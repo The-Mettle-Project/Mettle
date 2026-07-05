@@ -28,6 +28,8 @@
 #define IR_SELF_INLINE_MAX_SELF_CALLS 4
 #define IR_SELF_INLINE_MAX_BODY_INSTRUCTIONS 320
 #define IR_UNROLL_MAX_TRIP_COUNT 64
+#define IR_UNROLL_COLD_MAX_TRIP_COUNT 16
+#define IR_UNROLL_HOT_MAX_TRIP_COUNT 128
 
 typedef struct {
   char *name;
@@ -458,6 +460,26 @@ int ir_operand_resolve_symbol_int(const IRSymbolValueMap *symbol_map,
 int ir_optimize_function_pipeline(IRFunction *function);
 int ir_optimize_program_pipeline(IRProgram *program,
                                  const IROptimizeOptions *options);
+/* Profile-aware optimization policy (ir_optimize_hotness.c). When no PGO data
+ * is available these return the historical static thresholds. With zero-run
+ * PGO, function body steps and source-keyed site counts act like lightweight
+ * block hotness for thresholds that trade code size against speed. */
+int ir_opt_function_is_hot(const IRFunction *function);
+int ir_opt_function_is_cold(const IRFunction *function);
+int ir_opt_site_is_hot(const IRFunction *function, SourceLocation location);
+int ir_opt_site_is_cold(const IRFunction *function, SourceLocation location);
+size_t ir_opt_inline_body_budget(const IRFunction *callee);
+size_t ir_opt_inline_nested_call_budget(const IRFunction *callee);
+size_t ir_opt_inline_caller_budget(const IRFunction *caller);
+int ir_opt_self_inline_max_depth(const IRFunction *function);
+size_t ir_opt_self_inline_body_budget(const IRFunction *function);
+long long ir_opt_unroll_max_trip_count(const IRFunction *function,
+                                       SourceLocation location);
+long long ir_opt_prefetch_distance_for_site(const IRFunction *function,
+                                            SourceLocation location,
+                                            long long default_distance);
+int ir_opt_should_prefetch_site(const IRFunction *function,
+                                SourceLocation location);
 /* Enforce `@simd` / `@simd!` loop attributes after vectorization has run.
  * Returns 1 if every contract was honored (and clears all `@simd` markers),
  * 0 if a `@simd!` contract was violated (after printing a diagnostic). */
@@ -712,4 +734,3 @@ int ir_unroll_small_const_bound_loops_pass(IRFunction *function,
                                                   int *changed);
 
 #endif /* IR_OPTIMIZE_INTERNAL_H */
-

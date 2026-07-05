@@ -1,5 +1,4 @@
 #include "ir_optimize_internal.h"
-#include "../ir_pgo.h"
 
 #include <stdio.h>
 
@@ -142,11 +141,8 @@ static int ir_function_is_inline_candidate(const IRFunction *function,
    * work around a latent optimizer bug, and the must-have-a-return rule still
    * apply. */
   int forced = function->is_inline;
-  /* Zero-run PGO: a measured-hot callee earns the same budget override an
-   * explicit @inline grants - the profile IS the "this is worth code size"
-   * evidence the static heuristic lacks. It does NOT bypass the denylist or
-   * structural guards, and stays under a 4x sanity cap. */
-  int pgo_hot = !forced && ir_pgo_function_is_hot(function->name);
+  size_t body_budget = ir_opt_inline_body_budget(function);
+  size_t nested_call_budget = ir_opt_inline_nested_call_budget(function);
 
   if (!forced && ir_function_name_is_inline_denylisted(function->name)) {
     *why_not = "the callee is on the compiler's inline denylist "
@@ -178,18 +174,11 @@ static int ir_function_is_inline_candidate(const IRFunction *function,
     }
 
     non_nop_count++;
-    if (!forced && !pgo_hot &&
-        non_nop_count > IR_INLINE_MAX_NON_NOP_INSTRUCTIONS) {
-      *why_not = "the callee's body is over the 128-instruction inline budget";
+    if (!forced && non_nop_count > body_budget) {
+      *why_not = "the callee's body is over the profile-adjusted inline "
+                 "instruction budget";
       *fix = "mark the callee @inline to override the budget, or compile "
              "with --pgo so a measured-hot callee overrides it";
-      return 0;
-    }
-    if (!forced && pgo_hot &&
-        non_nop_count > 4 * IR_INLINE_MAX_NON_NOP_INSTRUCTIONS) {
-      *why_not = "the callee is measured-hot but over even the profile-"
-                 "widened 512-instruction budget";
-      *fix = "mark the callee @inline to override the budget";
       return 0;
     }
 
@@ -217,7 +206,7 @@ static int ir_function_is_inline_candidate(const IRFunction *function,
     }
 
     /* Loop-bearing callees are allowed when not denylisted; the loop unroller
-     * only fully expands trips <= IR_UNROLL_MAX_TRIP_COUNT (64). */
+     * keeps its own static/PGO-adjusted trip-count caps. */
 
     /* CALL and CALL_INDIRECT are allowed:
      * calls just turns those into call instructions in the caller, which is
@@ -229,15 +218,10 @@ static int ir_function_is_inline_candidate(const IRFunction *function,
     if (instruction->op == IR_OP_CALL ||
         instruction->op == IR_OP_CALL_INDIRECT) {
       call_count++;
-      if (!forced && !pgo_hot && call_count > 2) {
-        *why_not = "the callee makes more than 2 calls of its own (inlining "
-                   "glue functions bloats callers without runtime gain)";
-        *fix = "mark the callee @inline to override the call-count cap";
-        return 0;
-      }
-      if (!forced && pgo_hot && call_count > 6) {
-        *why_not = "the callee is measured-hot but makes more than 6 calls "
-                   "of its own";
+      if (!forced && call_count > nested_call_budget) {
+        *why_not =
+            "the callee makes more calls of its own than the profile-adjusted "
+            "inline call-count budget allows";
         *fix = "mark the callee @inline to override the call-count cap";
         return 0;
       }
@@ -774,7 +758,7 @@ static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
    * overhead in hot loops). What stays refused: cold one-shot call sites,
    * which cost nothing measurable as real calls. */
   int caller_over_budget = ir_function_non_nop_instruction_count(function) >
-                           IR_INLINE_MAX_CALLER_NON_NOP_INSTRUCTIONS;
+                           ir_opt_inline_caller_budget(function);
   char *in_loop = caller_over_budget ? ir_build_in_loop_bitmap(function) : NULL;
 
   IRInstructionVector vector = {0};
@@ -790,7 +774,9 @@ static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
       if (callee && callee != function &&
           instruction->argument_count == callee->parameter_count &&
           (!caller_over_budget || callee->is_inline ||
-           ir_function_is_tiny_leaf(callee) || (in_loop && in_loop[i])) &&
+           ir_function_is_tiny_leaf(callee) || ir_opt_function_is_hot(callee) ||
+           ir_opt_site_is_hot(function, instruction->location) ||
+           (in_loop && in_loop[i])) &&
           ir_function_is_inline_candidate(callee, NULL, NULL)) {
         if (ir_explain_enabled()) {
           char entity[160];
@@ -956,9 +942,11 @@ int ir_inline_self_recursion_pass(IRProgram *program, int *changed) {
     if (!ir_function_is_self_inline_candidate(function, &self_calls)) {
       continue;
     }
-    for (int depth = 0; depth < IR_SELF_INLINE_MAX_DEPTH; depth++) {
+    int max_depth = ir_opt_self_inline_max_depth(function);
+    size_t body_budget = ir_opt_self_inline_body_budget(function);
+    for (int depth = 0; depth < max_depth; depth++) {
       if (ir_function_non_nop_instruction_count(function) >
-          IR_SELF_INLINE_MAX_BODY_INSTRUCTIONS) {
+          body_budget) {
         break;
       }
       int round_changed = 0;
@@ -1008,12 +996,14 @@ static void ir_inline_site_reason(IRFunction *caller,
   }
   if (callee == caller) {
     *reason = "the call is directly recursive";
-    *fix = "bounded self-recursion expansion applies automatically (depth 3); "
-           "rewrite as a loop for full control";
+    *fix = "bounded self-recursion expansion applies automatically; rewrite "
+           "as a loop for full control";
   } else if (ir_function_non_nop_instruction_count(caller) >
-                 IR_INLINE_MAX_CALLER_NON_NOP_INSTRUCTIONS &&
+                 ir_opt_inline_caller_budget(caller) &&
              !callee->is_inline && !ir_function_is_tiny_leaf(callee) &&
+             !ir_opt_function_is_hot(callee) &&
              instruction >= caller->instructions &&
+             !ir_opt_site_is_hot(caller, instruction->location) &&
              !ir_call_site_is_in_loop(
                  caller, (size_t)(instruction - caller->instructions))) {
     /* Mirrors the gate in ir_inline_calls_in_function: tiny leaves,
@@ -1021,12 +1011,12 @@ static void ir_inline_site_reason(IRFunction *caller,
      * caller budget, so only cold one-shot sites can be refused for this
      * reason -- and for those, NOT inlining is the right call, so there is
      * deliberately no fix advice to hand out. */
-    *reason = "the calling function is over the 512-instruction caller "
-              "budget, and this call site is not inside a loop -- it runs "
-              "at most once per call of the function, so keeping it a real "
-              "call costs nothing measurable (loop-resident calls, tiny "
-              "call-free callees, and @inline-marked callees still inline "
-              "here)";
+    *reason = "the calling function is over the profile-adjusted caller "
+              "budget, and this call site is not measured hot or inside a "
+              "loop -- it runs at most once per call of the function, so "
+              "keeping it a real call costs nothing measurable (loop-resident "
+              "calls, measured-hot sites, tiny call-free callees, and "
+              "@inline-marked callees still inline here)";
   } else if (instruction->argument_count > IR_INLINE_MAX_PARAMETERS ||
              instruction->argument_count != callee->parameter_count) {
     *reason = "the call's argument count doesn't match what the inliner "

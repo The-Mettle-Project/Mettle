@@ -1,0 +1,15 @@
+fn cold_loop() -> int32 {
+  var x: int32 = 0;
+  var y: int32 = 1;
+  var i: int32 = 0;
+  while (i < 32) {
+    x = x + i;
+    y = y ^ x;
+    i = i + 1;
+  }
+  return x ^ y;
+}
+
+fn main() -> int32 {
+  return 0;
+}

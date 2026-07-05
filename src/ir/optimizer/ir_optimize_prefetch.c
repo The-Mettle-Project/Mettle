@@ -31,19 +31,30 @@
 
 static size_t g_prefetch_id;
 
-static long long ir_prefetch_distance(void) {
+static long long ir_prefetch_distance_override(void) {
   static long long cached = -1;
   if (cached < 0) {
     const char *env = getenv("METTLE_PREFETCH_DIST");
-    cached = IR_PREFETCH_DEFAULT_DIST;
-    if (env && *env) {
-      long long v = atoll(env);
-      if (v >= 1 && v <= 4096) {
-        cached = v;
-      }
+    cached = 0;
+    if (!env || !*env) {
+      return -1;
+    }
+    long long v = atoll(env);
+    if (v >= 1 && v <= 4096) {
+      cached = v;
     }
   }
-  return cached;
+  return cached > 0 ? cached : -1;
+}
+
+static long long ir_prefetch_distance_for_loop(const IRFunction *function,
+                                               SourceLocation location) {
+  long long override = ir_prefetch_distance_override();
+  if (override > 0) {
+    return override;
+  }
+  return ir_opt_prefetch_distance_for_site(function, location,
+                                          IR_PREFETCH_DEFAULT_DIST);
 }
 
 /* Is `name` written anywhere in [start, end)? Loop-invariant bases must not
@@ -314,7 +325,11 @@ static int ir_prefetch_plan_loop(IRFunction *function, size_t header_index,
   IRInstructionVector *seq = &plan->seq;
   memset(seq, 0, sizeof(*seq));
   SourceLocation loc = function->instructions[target_load].location;
-  long long D = ir_prefetch_distance();
+  if (ir_prefetch_distance_override() < 0 &&
+      !ir_opt_should_prefetch_site(function, loc)) {
+    return 0;
+  }
+  long long D = ir_prefetch_distance_for_loop(function, loc);
 
   char *ahead = ir_prefetch_temp_name();
   char *cond = ir_prefetch_temp_name();

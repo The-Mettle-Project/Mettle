@@ -573,7 +573,7 @@ $cases = @(
       # entry that explains why NOT inlining is the right call -- and hands
       # out no fix advice (there is nothing worth fixing)
       'main \(8 calls, lines \d+-\d+\): NOT inlined',
-      'reason: the calling function is over the 512-instruction caller budget, and this call site is not inside a loop',
+      'reason: the calling function is over the profile-adjusted caller budget, and this call site is not measured hot or inside a loop',
       'calls: f1 \(x3\), f2 \(x2\), f3 \(x2\), f4',
       # tiny call-free callees are exempt from the caller budget: the
       # accessor still inlines into the over-budget main
@@ -1343,6 +1343,10 @@ $cases = @(
   @{ Name = "pgo_off_budget_refusal"; Path = "tests/pgo_hot_inline.mettle"; ShouldSucceed = $true
      Args = @("--release", "--explain")
      OutputMustMatch = @('call to .keyed_mix. @ line 32.: NOT inlined') },
+  @{ Name = "pgo_cold_unroll_threshold"; Path = "tests/pgo_hot_thresholds.mettle"; ShouldSucceed = $true
+     Args = @("--pgo", "--release", "--dump-ir")
+     OutputMustMatch = @('pgo: interpreted main')
+     IrMustMatch = @('function cold_loop[\s\S]*jump ir_while_') },
   @{ Name = "err_match_non_exhaustive"; Path = "tests/err_match_non_exhaustive.mettle"; ShouldSucceed = $false; Pattern = "Non-exhaustive match" },
   @{ Name = "err_trait_bound_missing_impl"; Path = "tests/err_trait_bound_missing_impl.mettle"; ShouldSucceed = $false; Pattern = "does not implement trait 'Addable'" },
   @{ Name = "err_trait_bound_missing_second_impl"; Path = "tests/err_trait_bound_missing_second_impl.mettle"; ShouldSucceed = $false; Pattern = "does not implement trait 'SignedNumber'" },
