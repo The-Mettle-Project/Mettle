@@ -1912,6 +1912,58 @@ int mir_encode(MirFunction *fn) {
       }
       break;
     }
+    case MIR_CMOV: {
+      /* dst = (a != 0) ? b : dst. dst was pre-loaded with the else value by a
+       * preceding MIR_MOV, so `test a; cmovnz dst, b` completes the select.
+       * A spilled dst is staged through SCRATCH_A; cond stages through
+       * SCRATCH_B, and `then` reuses SCRATCH_B (cond is dead after the test). */
+      int rok;
+      BinaryGpRegister D;
+      int dst_in_reg = dst_is_reg(fn, &in->dst, &D);
+      BinaryGpRegister target = D;
+      if (!dst_in_reg) {
+        const MirVreg *v = &fn->vregs[in->dst.vreg];
+        target = SCRATCH_A;
+        if (!binary_emit_mov_reg_mem(&ctx->code, SCRATCH_A, frame_base(fn),
+                                     frame_disp(fn, -spill_off(v)))) {
+          ok = enc_err(fn, "out of memory loading cmov dst");
+          break;
+        }
+      }
+      BinaryGpRegister creg = value_reg(fn, &in->a, SCRATCH_B, &rok);
+      if (!rok || !binary_emit_test_reg_reg(&ctx->code, creg)) {
+        ok = enc_err(fn, "out of memory in cmov test");
+        break;
+      }
+      BinaryGpRegister treg = value_reg(fn, &in->b, SCRATCH_B, &rok);
+      if (!rok ||
+          !binary_emit_cmovcc_reg_reg(&ctx->code, 0x45, target, treg)) {
+        ok = enc_err(fn, "out of memory in cmov");
+        break;
+      }
+      if (!dst_in_reg) {
+        ok = store_from(fn, &in->dst, target);
+      }
+      break;
+    }
+    case MIR_PREFETCH: {
+      /* prefetcht0 [base + disp]: advisory, no destination. The address vreg
+       * is a plain read; a spilled address stages through SCRATCH_A. */
+      if (in->a.kind != MIR_OPK_MEM || in->a.mem.index != MIR_VREG_NONE) {
+        ok = enc_err(fn, "MIR_PREFETCH expects a base-only memory operand");
+        break;
+      }
+      int prok;
+      MirOperand pbop = mir_op_vreg(in->a.mem.base);
+      BinaryGpRegister pbase = value_reg(fn, &pbop, SCRATCH_A, &prok);
+      if (!prok) {
+        break;
+      }
+      if (!binary_emit_prefetcht0_mem(&ctx->code, pbase, in->a.mem.disp)) {
+        ok = enc_err(fn, "out of memory in prefetch");
+      }
+      break;
+    }
     case MIR_LEA: {
       /* dst <- address of [base + index*scale + disp]. base/index are vregs
        * (index optional). Mirrors the scaled-LOAD address staging but

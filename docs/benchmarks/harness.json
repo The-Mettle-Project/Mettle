@@ -479,6 +479,17 @@
       "build_script": "examples/linked_list_sum/build.bat"
     },
     {
+      "name": "gather_sum",
+      "kind": "runtime",
+      "suite": 2,
+      "description": "Random gather sum a[b[i]] over a 64MB table x 20 (indirect-access software prefetching; hardware prefetchers defeated)",
+      "mettle_source": "examples/gather_sum/gather_sum.mettle",
+      "mettle_exe": "examples/gather_sum/gather_sum.exe",
+      "c_source": "examples/gather_sum/gather_sum.c",
+      "c_exe": "examples/gather_sum/gather_sum_c.exe",
+      "build_script": "examples/gather_sum/build.bat"
+    },
+    {
       "name": "field_sum",
       "kind": "runtime",
       "suite": 2,

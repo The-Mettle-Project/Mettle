@@ -66,11 +66,24 @@ static int ir_try_match_word_count_load(const IRFunction *function,
     const IRInstruction *load = &function->instructions[load_index];
     if (load->op != IR_OP_LOAD ||
         !ir_operand_is_temp_named(&load->lhs, addr->dest.name) ||
-        load->dest.kind != IR_OPERAND_TEMP || !load->dest.name ||
         load->rhs.kind != IR_OPERAND_INT || load->rhs.int_value != 1) {
       continue;
     }
 
+    /* Direct-to-symbol byte load: `@c <- *addr [1]`. Copy propagation +
+     * eliminate_load_symbol_copy fold the old load-to-temp-then-cast into a
+     * single load whose destination is the char symbol itself. */
+    if (load->dest.kind == IR_OPERAND_SYMBOL && load->dest.name) {
+      *buf_symbol_out = buf_symbol;
+      *char_symbol_out = load->dest.name;
+      return 1;
+    }
+
+    /* Legacy shape: `%t <- *addr [1]; @c = (uint8)%t` (load to temp, then a
+     * cast into the char symbol). */
+    if (load->dest.kind != IR_OPERAND_TEMP || !load->dest.name) {
+      continue;
+    }
     size_t cast_index = 0;
     if (!ir_find_next_non_nop_in_block(function, load_index + 1,
                                        &cast_index) ||

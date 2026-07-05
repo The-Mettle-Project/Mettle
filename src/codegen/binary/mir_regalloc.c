@@ -72,6 +72,26 @@ static int mir_fn_has_calls(const MirFunction *fn) {
   return 0;
 }
 
+/* True if the function makes a REAL call (MIR_CALL / MIR_CALL_INDIRECT), as
+ * opposed to an inline SIMD kernel. Used for LEAF-POOL BUILDING: a real call
+ * clobbers all caller-saved registers with no per-clobber PHYS write for the
+ * allocator to see, so arg registers stay out of the general pool. An inline
+ * kernel is different -- it marshals its operands through explicit
+ * `MIR_MOV phys(RCX/RDX/R8/R9/RAX), value` writes (which mir_reg_clobbered_in_range
+ * detects) and is itself a crosses_call barrier (which bars spanning values from
+ * the arg registers). Both per-vreg mechanisms run regardless of the pool, so a
+ * kernel-only function can keep the full leaf pool; the histogram/RMW loops that
+ * run AFTER a one-time `simd_fill` init were needlessly spilling because the fill
+ * shrank the whole function's pool (radix_sort). */
+static int mir_fn_has_real_calls(const MirFunction *fn) {
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    if (fn->insns[i].op == MIR_CALL || fn->insns[i].op == MIR_CALL_INDIRECT) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 /* True if the function contains an inline SLP vector kernel. Such kernels
  * marshal through fixed registers without representing every clobber as a MIR
  * PHYS write, so when the frame pointer is omitted we conservatively keep rbp
@@ -953,7 +973,7 @@ static int mir_regalloc_color(MirFunction *fn) {
    * register still holding an incoming parameter is never reclaimed. */
   size_t gp_leaf_n = mir_build_gp_leaf_pool(
       gp_leaf_pool, fn->param_count + (fn->returns_indirect ? 1 : 0),
-      !mir_fn_has_calls(fn));
+      !mir_fn_has_real_calls(fn));
   BinaryGpRegister gp_cross_pool[MIR_GP_CROSSCALL_POOL_MAX];
   size_t gp_cross_n = mir_build_gp_crosscall_pool(gp_cross_pool);
 
@@ -1179,7 +1199,7 @@ int mir_regalloc(MirFunction *fn) {
    * first incoming arg slot, shifting the real parameters up). */
   size_t gp_leaf_pool_count = mir_build_gp_leaf_pool(
       gp_leaf_pool, fn->param_count + (fn->returns_indirect ? 1 : 0),
-      !mir_fn_has_calls(fn));
+      !mir_fn_has_real_calls(fn));
   BinaryGpRegister gp_cross_pool[MIR_GP_CROSSCALL_POOL_MAX];
   size_t gp_cross_pool_count = mir_build_gp_crosscall_pool(gp_cross_pool);
   /* Start every GP register reserved, then open exactly the leaf-pool members.

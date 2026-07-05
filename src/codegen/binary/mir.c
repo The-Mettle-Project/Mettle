@@ -179,6 +179,8 @@ const char *mir_opcode_name(MirOpcode op) {
   case MIR_MOVSX: return "movsx";
   case MIR_LOAD_GLOBAL: return "ldglobal";
   case MIR_STORE_GLOBAL: return "stglobal";
+  case MIR_PREFETCH: return "prefetch";
+  case MIR_CMOV: return "cmov";
   case MIR_ADD: return "add";
   case MIR_SUB: return "sub";
   case MIR_AND: return "and";

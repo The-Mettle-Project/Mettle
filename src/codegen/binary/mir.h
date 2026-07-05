@@ -188,6 +188,14 @@ typedef enum {
   MIR_JCC,        /* test a; cc -> label (cc carries jcc opcode) */
   MIR_CMPBR,      /* cmp a,b; cc -> label (fused compare-and-branch) */
   MIR_LABEL,      /* defines label (sym) at this point */
+  MIR_PREFETCH,   /* prefetcht0 [a]: a is a MEM operand (usually [vreg+0]).
+                     A read-only use of the address register(s); no def, and
+                     the access never faults. */
+  MIR_CMOV,       /* dst = (a != 0) ? b : dst. dst is PRE-LOADED with the
+                     else-value by a preceding MIR_MOV, so its live range
+                     starts there and overlaps a/b at this point (forcing
+                     distinct registers). Encodes to `test a,a; cmovnz dst,b`.
+                     b must be a register (cmov has no immediate source). */
 
   /* calls / return (Stage 3 for full ABI; declared now for completeness) */
   MIR_CALL,       /* call sym; clobbers volatiles */

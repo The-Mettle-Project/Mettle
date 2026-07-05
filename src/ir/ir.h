@@ -263,7 +263,18 @@ typedef enum {
    * scalar loop. dest = sum accumulator symbol; lhs = trip count (SYMBOL/INT);
    * rhs = state symbol (its value at loop entry is the seed); arguments[0]=A,
    * [1]=C, [2]=MASK (all INT, compile-time). Direct-object backend only. */
-  IR_OP_SIMD_LCG_U32
+  IR_OP_SIMD_LCG_U32,
+  /* Software prefetch hint (prefetcht0): lhs = a TEMP holding the fully
+   * computed byte address. Advisory only -- never faults, no destination, a
+   * no-op in the IR interpreter. Emitted by ir_optimize_prefetch.c for
+   * indirect (gather) accesses whose future address is computable early. */
+  IR_OP_PREFETCH,
+  /* Branchless select (conditional move): dest = (lhs != 0) ? rhs :
+   * arguments[0]. lhs is the condition, rhs the then-value, arguments[0] the
+   * else-value (each a temp/symbol/int). Emitted by ir_optimize_if_convert.c
+   * to replace a data-dependent register-only if/else diamond, lowered to a
+   * cmov so an unpredictable branch becomes straight-line code. */
+  IR_OP_SELECT
 } IROpcode;
 
 /* Chain operation codes for IR_OP_SIMD_BYTE_MAP arguments. Each step applies

@@ -208,13 +208,25 @@ static int ir_try_vectorize_sum_i32_at(IRFunction *function, size_t header_index
     return 1;
   }
 
-  /* Body must be: idx = iv << 2; ptr = base + idx; load; cast (int64); sum += cast. */
+  /* Body must be: idx = iv << 2; ptr = base + idx; load; cast (int64); sum += cast.
+   * The load that feeds the accumulator and the load at the iv-indexed
+   * address are matched separately below; they MUST be the same instruction,
+   * and the only load in the body. Otherwise an indirect gather
+   * `s += a[idx[i]]` pairs the sum with the a-load but the address with the
+   * idx-load and the kernel silently sums idx[0..n) instead (a real
+   * --release miscompile caught by the gather_sum benchmark). */
   sum_symbol = NULL;
   base_symbol = NULL;
+  size_t sum_load_index = (size_t)-1;
+  size_t indexed_load_index = (size_t)-1;
+  size_t body_load_count = 0;
   for (size_t i = branch_index + 1; i < jump_index; i++) {
     const IRInstruction *ins = &function->instructions[i];
     if (ins->op == IR_OP_NOP) {
       continue;
+    }
+    if (ins->op == IR_OP_LOAD) {
+      body_load_count++;
     }
     if (ins->op == IR_OP_STORE || ins->op == IR_OP_CALL ||
         ins->op == IR_OP_CALL_INDIRECT || ins->op == IR_OP_BRANCH_ZERO ||
@@ -242,6 +254,7 @@ static int ir_try_vectorize_sum_i32_at(IRFunction *function, size_t header_index
             load->rhs.kind == IR_OPERAND_INT && load->rhs.int_value == 4 &&
             !load->is_float && !load->is_unsigned) {
           ok = 1; /* s += (int64)a[i] */
+          sum_load_index = (size_t)(load - function->instructions);
         }
       } else if (prod && prod->op == IR_OP_LOAD &&
                  prod->rhs.kind == IR_OPERAND_INT &&
@@ -253,6 +266,7 @@ static int ir_try_vectorize_sum_i32_at(IRFunction *function, size_t header_index
          * kernel sums int32 into int64 with sign-extension). Lets the natural
          * cast-free reduction vectorize. */
         ok = 1;
+        sum_load_index = (size_t)(prod - function->instructions);
       } else if (prod && prod->op == IR_OP_CAST && prod->text &&
                  strcmp(prod->text, "int32") == 0 &&
                  prod->lhs.kind == IR_OPERAND_TEMP && prod->lhs.name &&
@@ -267,6 +281,7 @@ static int ir_try_vectorize_sum_i32_at(IRFunction *function, size_t header_index
             load->rhs.kind == IR_OPERAND_INT && load->rhs.int_value == 4 &&
             !load->is_float && !load->is_unsigned) {
           ok = 1;
+          sum_load_index = (size_t)(load - function->instructions);
         }
       }
       if (!ok) {
@@ -294,6 +309,7 @@ static int ir_try_vectorize_sum_i32_at(IRFunction *function, size_t header_index
             load = probe;
             base_symbol = addr->lhs.name;
             has_indexed_load = 1;
+            indexed_load_index = j;
             break;
           }
         }
@@ -303,6 +319,12 @@ static int ir_try_vectorize_sum_i32_at(IRFunction *function, size_t header_index
   }
 
   if (!sum_symbol || !base_symbol || !has_int64_cast || !has_indexed_load) {
+    return 1;
+  }
+  /* The accumulator's load and the iv-indexed load must be one and the same
+   * instruction, and the body's only load -- otherwise this is an indirect
+   * access (`s += a[idx[i]]`), not a unit-stride sum. */
+  if (sum_load_index != indexed_load_index || body_load_count != 1) {
     return 1;
   }
 
@@ -513,11 +535,20 @@ static int ir_try_vectorize_sum_u8_at(IRFunction *function, size_t header_index,
   }
 
   /* Body must be: addr = base + iv; load[1]; cast(int64); sum += cast. The only
-   * memory op is that single byte load; reject stores, calls, other loads. */
+   * memory op is that single byte load; reject stores, calls, other loads.
+   * As in the i32 form, the load feeding the accumulator's cast and the
+   * iv-indexed load must be the SAME instruction (an indirect gather pairs
+   * them differently and would sum the wrong array). */
+  size_t sum_load_index = (size_t)-1;
+  size_t indexed_load_index = (size_t)-1;
+  size_t body_load_count = 0;
   for (size_t i = branch_index + 1; i < jump_index; i++) {
     const IRInstruction *ins = &function->instructions[i];
     if (ins->op == IR_OP_NOP) {
       continue;
+    }
+    if (ins->op == IR_OP_LOAD) {
+      body_load_count++;
     }
     if (ins->op == IR_OP_STORE || ins->op == IR_OP_CALL ||
         ins->op == IR_OP_CALL_INDIRECT || ins->op == IR_OP_BRANCH_ZERO ||
@@ -531,11 +562,18 @@ static int ir_try_vectorize_sum_u8_at(IRFunction *function, size_t header_index,
       const IRInstruction *cast =
           ir_find_temp_producer_before(function, i, ins->rhs.name);
       if (!cast || cast->op != IR_OP_CAST || !cast->text ||
-          strcmp(cast->text, "int64") != 0) {
+          strcmp(cast->text, "int64") != 0 ||
+          cast->lhs.kind != IR_OPERAND_TEMP || !cast->lhs.name) {
+        continue;
+      }
+      const IRInstruction *load =
+          ir_find_temp_producer_before(function, i, cast->lhs.name);
+      if (!load || load->op != IR_OP_LOAD) {
         continue;
       }
       has_int64_cast = 1;
       sum_symbol = ins->dest.name;
+      sum_load_index = (size_t)(load - function->instructions);
     }
     if (ins->op == IR_OP_LOAD && ins->rhs.kind == IR_OPERAND_INT &&
         ins->rhs.int_value == 1 && ins->lhs.kind == IR_OPERAND_TEMP &&
@@ -548,11 +586,15 @@ static int ir_try_vectorize_sum_u8_at(IRFunction *function, size_t header_index,
           addr->lhs.kind == IR_OPERAND_SYMBOL && addr->lhs.name) {
         base_symbol = addr->lhs.name;
         has_indexed_load = 1;
+        indexed_load_index = i;
       }
     }
   }
 
   if (!sum_symbol || !base_symbol || !has_int64_cast || !has_indexed_load) {
+    return 1;
+  }
+  if (sum_load_index != indexed_load_index || body_load_count != 1) {
     return 1;
   }
   if (strcmp(sum_symbol, iv_symbol) == 0 ||

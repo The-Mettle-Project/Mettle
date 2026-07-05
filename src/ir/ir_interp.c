@@ -1024,6 +1024,9 @@ static int ii_extern_call(IRInterpMachine *machine, const char *name,
 static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
                         const IRInstruction *insn) {
   switch (insn->op) {
+  case IR_OP_PREFETCH:
+    /* Advisory cache hint: no architectural effect, nothing to interpret. */
+    return 1;
   case IR_OP_MEMCPY_INLINE: {
     unsigned long long dst, src;
     long long n;
@@ -2255,6 +2258,53 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
       IRInterpValue a, out;
       if (!ii_fetch(machine, &frame, &insn->lhs, &a) ||
           !ii_cast(machine, insn, &a, &out) ||
+          !ii_store_dest(machine, &frame, &insn->dest, &out)) {
+        goto done;
+      }
+      pc++;
+      break;
+    }
+
+    case IR_OP_SELECT: {
+      /* Fused form (text != NULL): cond = (lhs <cmp> arguments[1]). Plain
+       * form: cond = (lhs != 0). Then dest = cond ? rhs : arguments[0]. */
+      long long truth = 0;
+      if (insn->text && insn->argument_count > 1) {
+        IRInterpValue a, b;
+        if (!ii_fetch(machine, &frame, &insn->lhs, &a) ||
+            !ii_fetch(machine, &frame, &insn->arguments[1], &b)) {
+          goto done;
+        }
+        long long x = ii_as_int(&a), y = ii_as_int(&b);
+        const char *op = insn->text;
+        if (insn->is_unsigned) {
+          unsigned long long ux = (unsigned long long)x, uy = (unsigned long long)y;
+          truth = strcmp(op, "<") == 0    ? ux < uy
+                  : strcmp(op, "<=") == 0 ? ux <= uy
+                  : strcmp(op, ">") == 0  ? ux > uy
+                  : strcmp(op, ">=") == 0 ? ux >= uy
+                  : strcmp(op, "==") == 0 ? ux == uy
+                                          : ux != uy;
+        } else {
+          truth = strcmp(op, "<") == 0    ? x < y
+                  : strcmp(op, "<=") == 0 ? x <= y
+                  : strcmp(op, ">") == 0  ? x > y
+                  : strcmp(op, ">=") == 0 ? x >= y
+                  : strcmp(op, "==") == 0 ? x == y
+                                          : x != y;
+        }
+      } else {
+        IRInterpValue cond;
+        if (!ii_fetch(machine, &frame, &insn->lhs, &cond)) {
+          goto done;
+        }
+        truth = ii_as_int(&cond) != 0;
+      }
+      IRInterpValue out;
+      const IROperand *chosen =
+          truth ? &insn->rhs
+                : (insn->argument_count > 0 ? &insn->arguments[0] : NULL);
+      if (!chosen || !ii_fetch(machine, &frame, chosen, &out) ||
           !ii_store_dest(machine, &frame, &insn->dest, &out)) {
         goto done;
       }

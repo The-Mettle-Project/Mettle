@@ -586,6 +586,12 @@ int ir_pointer_induction_pass(IRFunction *function, int *changed);
 int ir_positive_loop_div2_to_shift_pass(IRFunction *function,
                                                int *changed);
 int ir_prefix_sum_i32_pass(IRFunction *function, int *changed);
+/* Software prefetch insertion for indirect (gather) loads in counted loops
+ * (ir_optimize_prefetch.c). Runs last in the post-fixpoint stage. */
+int ir_prefetch_indirect_pass(IRFunction *function, int *changed);
+/* If-conversion of register-only if/else diamonds to branchless IR_OP_SELECT
+ * (cmov), for data-dependent branches (ir_optimize_if_convert.c). */
+int ir_if_convert_pass(IRFunction *function, int *changed);
 int ir_ptr_induction_iv_start_value(const IRFunction *function,
                                            size_t header_index,
                                            const char *iv_symbol,

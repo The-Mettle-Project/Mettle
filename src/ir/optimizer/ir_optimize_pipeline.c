@@ -87,6 +87,15 @@ static const IROptNamedPass g_ir_post_fixpoint_passes[] = {
     /* After congruent-IV merge so parallel lane indices appear as base+J. */
     {"simd_slp_mac_i32", ir_simd_slp_mac_i32_pass},
     {"simd_slp_mac_i8", ir_simd_slp_mac_i8_pass},
+    /* After every recognizer: collapses register-only data-dependent
+     * diamonds to branchless selects. Runs before prefetch (which only
+     * touches loop headers) and after vectorizers (whose loop bodies are
+     * straight-line and thus unaffected). */
+    {"if_convert", ir_if_convert_pass},
+    /* LAST: inserts control flow into loop bodies, which would defeat every
+     * recognizer above. Only fires on loops with indirect (load-fed) accesses
+     * -- shapes no vectorizer can claim. */
+    {"prefetch_indirect", ir_prefetch_indirect_pass},
 };
 
 static const IROptNamedStage g_ir_pre_inline_stage = {

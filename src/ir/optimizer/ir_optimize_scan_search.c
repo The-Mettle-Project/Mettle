@@ -1654,7 +1654,14 @@ static int ir_slp_loop_frame_is_replayable(const IRFunction *function,
                                            size_t jump_index,
                                            const IRInstruction *compare,
                                            const char *iv_symbol) {
-  if (compare->rhs.kind != IR_OPERAND_SYMBOL || !compare->rhs.name) {
+  /* The bound is either a loop-invariant symbol or a compile-time constant
+   * (the latter appears once a global bound like `N` is folded, or when the
+   * source writes a literal `while (k < 32)`). A constant is trivially
+   * invariant, so only a symbolic bound needs the body-write check below. */
+  const char *bound_sym = NULL;
+  if (compare->rhs.kind == IR_OPERAND_SYMBOL && compare->rhs.name) {
+    bound_sym = compare->rhs.name;
+  } else if (compare->rhs.kind != IR_OPERAND_INT) {
     return 0;
   }
   if (!ir_iv_zero_at_header(function, header_index, iv_symbol)) {
@@ -1673,9 +1680,10 @@ static int ir_slp_loop_frame_is_replayable(const IRFunction *function,
         ir_operand_is_symbol_named(&ins->dest, iv_symbol)) {
       return 0;
     }
-    /* The bound is read once by the kernel: a write in the body diverges. */
-    if (ir_instruction_writes_destination(ins) &&
-        ir_operand_is_symbol_named(&ins->dest, compare->rhs.name)) {
+    /* A symbolic bound is read once by the kernel: a write in the body
+     * diverges. (A constant bound cannot be written.) */
+    if (bound_sym && ir_instruction_writes_destination(ins) &&
+        ir_operand_is_symbol_named(&ins->dest, bound_sym)) {
       return 0;
     }
   }
@@ -1838,8 +1846,13 @@ static int ir_try_vectorize_slp_mac_i32_at(IRFunction *function,
     return 1;
   }
 
-  /* Loop IV increments: iv (k) += 1, a_idx += 1, b_idx += stride. */
-  const char *stride_sym = NULL;
+  /* Loop IV increments: iv (k) += 1, a_idx += 1, b_idx += stride. The stride
+   * is the matrix row length: a loop-invariant symbol, OR a compile-time
+   * constant -- directly, or as a cast of one -- which is what a folded
+   * global bound (`(int64)N` -> `(int64)32`) or a literal row length lowers
+   * to. The kernel consumes the stride as an INT or a symbol equally. */
+  IROperand stride_op = {0};
+  int have_stride = 0;
   int a_inc_ok = 0, b_inc_ok = 0;
   for (size_t i = branch_index + 1; i < jump_index; i++) {
     const IRInstruction *in = &function->instructions[i];
@@ -1853,20 +1866,28 @@ static int ir_try_vectorize_slp_mac_i32_at(IRFunction *function,
       a_inc_ok = 1;
     } else if (strcmp(in->dest.name, b_idx_sym) == 0) {
       if (in->rhs.kind == IR_OPERAND_SYMBOL && in->rhs.name) {
-        stride_sym = in->rhs.name;
-        b_inc_ok = 1;
+        stride_op = ir_operand_symbol(in->rhs.name);
+        b_inc_ok = have_stride = stride_op.name != NULL;
+      } else if (in->rhs.kind == IR_OPERAND_INT) {
+        stride_op = ir_operand_int(in->rhs.int_value);
+        b_inc_ok = have_stride = 1;
       } else if (in->rhs.kind == IR_OPERAND_TEMP && in->rhs.name) {
         const IRInstruction *p =
             ir_find_temp_producer_before(function, i, in->rhs.name);
         if (p && p->op == IR_OP_CAST && p->lhs.kind == IR_OPERAND_SYMBOL &&
             p->lhs.name) {
-          stride_sym = p->lhs.name;
-          b_inc_ok = 1;
+          stride_op = ir_operand_symbol(p->lhs.name);
+          b_inc_ok = have_stride = stride_op.name != NULL;
+        } else if (p && p->op == IR_OP_CAST &&
+                   p->lhs.kind == IR_OPERAND_INT) {
+          stride_op = ir_operand_int(p->lhs.int_value);
+          b_inc_ok = have_stride = 1;
         }
       }
     }
   }
-  if (!a_inc_ok || !b_inc_ok || !stride_sym) {
+  if (!a_inc_ok || !b_inc_ok || !have_stride) {
+    ir_operand_destroy(&stride_op);
     return 1;
   }
 
@@ -1876,6 +1897,7 @@ static int ir_try_vectorize_slp_mac_i32_at(IRFunction *function,
       !ir_slp_find_init(function, header_index, b_idx_sym, &b_off)) {
     ir_operand_destroy(&a_off);
     ir_operand_destroy(&b_off);
+    ir_operand_destroy(&stride_op);
     return 1;
   }
 
@@ -1893,6 +1915,7 @@ static int ir_try_vectorize_slp_mac_i32_at(IRFunction *function,
   if (exit_label_index == (size_t)-1) {
     ir_operand_destroy(&a_off);
     ir_operand_destroy(&b_off);
+    ir_operand_destroy(&stride_op);
     return 1;
   }
   const char *c_base = NULL, *out_idx_sym = NULL;
@@ -1902,6 +1925,7 @@ static int ir_try_vectorize_slp_mac_i32_at(IRFunction *function,
   if (!sfound || strcmp(c_base, a_base) == 0) {
     ir_operand_destroy(&a_off);
     ir_operand_destroy(&b_off);
+    ir_operand_destroy(&stride_op);
     return 1;
   }
   if (ir_symbol_live_after_loop(function, exit_label_index, iv_symbol) ||
@@ -1909,8 +1933,15 @@ static int ir_try_vectorize_slp_mac_i32_at(IRFunction *function,
       ir_symbol_live_after_loop(function, exit_label_index, b_idx_sym)) {
     ir_operand_destroy(&a_off);
     ir_operand_destroy(&b_off);
+    ir_operand_destroy(&stride_op);
     return 1;
   }
+
+  /* The trip count: a symbol (loop-invariant bound) or a constant (a folded
+   * global / literal bound). The kernel accepts either. */
+  IROperand count_op = (compare->rhs.kind == IR_OPERAND_INT)
+                           ? ir_operand_int(compare->rhs.int_value)
+                           : ir_operand_symbol(compare->rhs.name);
 
   /* Build the op at the first store; out_idx is live there. */
   IRInstruction fused = {0};
@@ -1923,15 +1954,17 @@ static int ir_try_vectorize_slp_mac_i32_at(IRFunction *function,
   if (!fused.arguments) {
     ir_operand_destroy(&a_off);
     ir_operand_destroy(&b_off);
+    ir_operand_destroy(&stride_op);
+    ir_operand_destroy(&count_op);
     return 0;
   }
   fused.argument_count = 6;
   fused.arguments[0] = ir_operand_int(K);
-  fused.arguments[1] = ir_operand_symbol(compare->rhs.name); /* count */
-  fused.arguments[2] = a_off;                                /* a_off */
-  fused.arguments[3] = b_off;                                /* b_off */
-  fused.arguments[4] = ir_operand_symbol(stride_sym);        /* b stride */
-  fused.arguments[5] = ir_operand_symbol(out_idx_sym);       /* out_off */
+  fused.arguments[1] = count_op;                       /* count (sym or int) */
+  fused.arguments[2] = a_off;                          /* a_off */
+  fused.arguments[3] = b_off;                          /* b_off */
+  fused.arguments[4] = stride_op;                      /* b stride (sym/int) */
+  fused.arguments[5] = ir_operand_symbol(out_idx_sym); /* out_off */
 
   size_t place = store_idx[0];
   ir_instruction_destroy_storage(&function->instructions[place]);

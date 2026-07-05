@@ -1406,6 +1406,32 @@ int mir_function_is_eligible(CodeGenerator *generator,
         return 0; /* value */
       }
       break;
+    case IR_OP_PREFETCH:
+      if (in->lhs.kind != IR_OPERAND_TEMP && in->lhs.kind != IR_OPERAND_SYMBOL) {
+        return mir_trace_bail(function_data, "prefetch:addr");
+      }
+      break;
+    case IR_OP_SELECT: {
+      /* dest = (cond != 0) ? then : else. Each of cond/then/else may be a
+       * temp/symbol/int; the dest is a temp/symbol. */
+      const IROperand *sops[3] = {&in->lhs, &in->rhs,
+                                  in->argument_count > 0 ? &in->arguments[0]
+                                                         : NULL};
+      if (!sops[2]) {
+        return mir_trace_bail(function_data, "select:no_else");
+      }
+      for (int s = 0; s < 3; s++) {
+        if (sops[s]->kind != IR_OPERAND_TEMP &&
+            sops[s]->kind != IR_OPERAND_SYMBOL &&
+            sops[s]->kind != IR_OPERAND_INT) {
+          return mir_trace_bail(function_data, "select:operand_kind");
+        }
+      }
+      if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
+        return mir_trace_bail(function_data, "select:dest_kind");
+      }
+      break;
+    }
     case IR_OP_RETURN:
       if (in->lhs.kind != IR_OPERAND_NONE && in->lhs.kind != IR_OPERAND_TEMP &&
           in->lhs.kind != IR_OPERAND_SYMBOL && in->lhs.kind != IR_OPERAND_INT) {
@@ -2920,6 +2946,48 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
     }
     MirOperand val = mir_value_operand(fn, g, ctx, map, &in->lhs);
     return mir_emit1(fn, MIR_MOV, mem, val, mir_op_none(), size, 0, 0);
+  }
+
+  case IR_OP_PREFETCH: {
+    MirOperand addr = mir_value_operand(fn, g, ctx, map, &in->lhs);
+    if (addr.kind != MIR_OPK_VREG) {
+      fn->has_error = 1;
+      return 0;
+    }
+    MirOperand mem = mir_op_mem_vreg(addr.vreg, MIR_VREG_NONE, 1, 0);
+    return mir_emit1(fn, MIR_PREFETCH, mir_op_none(), mem, mir_op_none(), 8, 0,
+                     0);
+  }
+
+  case IR_OP_SELECT: {
+    /* dst = (cond != 0) ? then : else. Stage cond and then in vregs, pre-load
+     * a result vreg with else, then MIR_CMOV res, cond, then. Pre-loading res
+     * makes its live range start before the cmov so it interferes with
+     * cond/then and gets a distinct register (cmov needs res != then). Finally
+     * move res into the IR dest (which may be a memory-resident local). */
+    MirOperand cond = mir_value_operand(fn, g, ctx, map, &in->lhs);
+    MirOperand then_v = mir_value_operand(fn, g, ctx, map, &in->rhs);
+    MirOperand else_v = mir_value_operand(fn, g, ctx, map, &in->arguments[0]);
+    MirOperand dest = mir_value_operand(fn, g, ctx, map, &in->dest);
+    MirVregId cond_r = mir_new_vreg(fn, MIR_RC_GP, 8);
+    MirVregId then_r = mir_new_vreg(fn, MIR_RC_GP, 8);
+    MirVregId res_r = mir_new_vreg(fn, MIR_RC_GP, 8);
+    if (cond_r == MIR_VREG_NONE || then_r == MIR_VREG_NONE ||
+        res_r == MIR_VREG_NONE) {
+      return 0;
+    }
+    if (!mir_emit1(fn, MIR_MOV, mir_op_vreg(cond_r), cond, mir_op_none(), 8, 0,
+                   0) ||
+        !mir_emit1(fn, MIR_MOV, mir_op_vreg(then_r), then_v, mir_op_none(), 8,
+                   0, 0) ||
+        !mir_emit1(fn, MIR_MOV, mir_op_vreg(res_r), else_v, mir_op_none(), 8, 0,
+                   0) ||
+        !mir_emit1(fn, MIR_CMOV, mir_op_vreg(res_r), mir_op_vreg(cond_r),
+                   mir_op_vreg(then_r), 8, 0, 0)) {
+      return 0;
+    }
+    return mir_emit1(fn, MIR_MOV, dest, mir_op_vreg(res_r), mir_op_none(), 8, 0,
+                     0);
   }
 
   case IR_OP_RETURN: {

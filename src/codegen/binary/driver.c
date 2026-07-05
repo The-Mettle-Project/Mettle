@@ -1,6 +1,8 @@
 #include "codegen/binary/internal.h"
 #include "codegen/binary/mir.h"
 #include "codegen/binary/mir_annotate.h"
+#include "ir/ir_pgo.h"
+#include <limits.h>
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -407,8 +409,71 @@ int code_generator_generate_program_binary_object(CodeGenerator *generator,
     return 0;
   }
 
+  /* --pgo code layout: emit measured-hot functions first (main leading) so
+   * the hot working set shares I-cache lines and iTLB pages, cold glue sinks
+   * to the tail. Zero-run: the frequencies come from the compile-time
+   * interpretation of main(), no training run. Only the FUNCTION declaration
+   * slots are permuted among themselves; every other declaration keeps its
+   * position. Without a profile the order is untouched. */
+  size_t *emit_order = NULL;
+  if (ir_pgo_enabled() && program_data->declaration_count > 1) {
+    size_t n = program_data->declaration_count;
+    emit_order = (size_t *)malloc(n * sizeof(size_t));
+    size_t *fn_slots = (size_t *)malloc(n * sizeof(size_t));
+    long long *heat = (long long *)malloc(n * sizeof(long long));
+    if (emit_order && fn_slots && heat) {
+      size_t fn_count = 0;
+      for (size_t i = 0; i < n; i++) {
+        emit_order[i] = i;
+        ASTNode *d = program_data->declarations[i];
+        if (d && d->type == AST_FUNCTION_DECLARATION && d->data) {
+          FunctionDeclaration *fd = (FunctionDeclaration *)d->data;
+          if (fd->name && !fd->is_extern && fd->body) {
+            fn_slots[fn_count] = i;
+            heat[fn_count] =
+                (strcmp(fd->name, "main") == 0)
+                    ? LLONG_MAX
+                    : ir_pgo_callee_calls(fd->name);
+            fn_count++;
+          }
+        }
+      }
+      /* Stable insertion sort of the function indices by heat, descending:
+       * ties (and cold/-1) keep declaration order. */
+      for (size_t i = 1; i < fn_count; i++) {
+        size_t slot = fn_slots[i];
+        long long h = heat[i];
+        size_t j = i;
+        while (j > 0 && heat[j - 1] < h) {
+          fn_slots[j] = fn_slots[j - 1];
+          heat[j] = heat[j - 1];
+          j--;
+        }
+        fn_slots[j] = slot;
+        heat[j] = h;
+      }
+      /* Redistribute the sorted functions into the function slots. */
+      size_t next = 0;
+      for (size_t i = 0; i < n; i++) {
+        ASTNode *d = program_data->declarations[i];
+        if (d && d->type == AST_FUNCTION_DECLARATION && d->data) {
+          FunctionDeclaration *fd = (FunctionDeclaration *)d->data;
+          if (fd->name && !fd->is_extern && fd->body) {
+            emit_order[i] = fn_slots[next++];
+          }
+        }
+      }
+    } else {
+      free(emit_order);
+      emit_order = NULL;
+    }
+    free(fn_slots);
+    free(heat);
+  }
+
   for (size_t i = 0; i < program_data->declaration_count; i++) {
-    ASTNode *declaration = program_data->declarations[i];
+    ASTNode *declaration =
+        program_data->declarations[emit_order ? emit_order[i] : i];
     if (!declaration) {
       continue;
     }
@@ -501,9 +566,11 @@ int code_generator_generate_program_binary_object(CodeGenerator *generator,
           generator,
           "Direct object backend encountered unsupported declaration type %d",
           declaration->type);
+      free(emit_order);
       return 0;
     }
   }
+  free(emit_order);
 
   if ((generator->profile_runtime || generator->debug_hooks) &&
       !code_generator_binary_emit_profile_tables(generator)) {

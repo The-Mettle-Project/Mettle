@@ -1,0 +1,102 @@
+// Random-gather reduction (Suite 2): sum += A[B[i]].
+//
+// A is 16,777,216 int32 values (64 MB, far beyond LLC); B is a shuffled
+// permutation of [0, N). Each iteration loads B[i] (sequential, cheap) and
+// then A[B[i]] (random, a guaranteed cache + TLB miss). 20 passes.
+//
+// This is the canonical indirect-access pattern software prefetching targets:
+// B[i + D] is already known D iterations early, so `prefetcht0 A[B[i+D]]`
+// overlaps the miss latency with useful work. The address stream is
+// unpredictable to hardware prefetchers, so the compiler either issues
+// software prefetches or eats the full memory latency every element.
+//
+// Build: build.bat   Run: gather_sum.exe
+
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+var N: int32 = 16777216;
+
+fn build_permutation(idx: int32*, count: int32) {
+  var i: int32 = 0;
+  while (i < count) {
+    idx[i] = i;
+    i = i + 1;
+  }
+  var state: uint32 = 362436069;
+  i = count - 1;
+  while (i > 0) {
+    state = state ^ (state << 13);
+    state = state ^ (state >> 17);
+    state = state ^ (state << 5);
+    var j: int32 = (int32)(state % (uint32)(i + 1));
+    var tmp: int32 = idx[i];
+    idx[i] = idx[j];
+    idx[j] = tmp;
+    i = i - 1;
+  }
+}
+
+fn gather(a: int32*, idx: int32*, count: int32) -> int64 {
+  var total: int64 = 0;
+  var i: int32 = 0;
+  while (i < count) {
+    total = total + (int64)a[idx[i]];
+    i = i + 1;
+  }
+  return total;
+}
+
+fn main() -> int32 {
+  var count: int32 = N;
+  var a: int32* = (int32*)malloc((int64)count * 4);
+  var idx: int32* = (int32*)malloc((int64)count * 4);
+  if (a == 0 || idx == 0) {
+    println("malloc failed");
+    return 1;
+  }
+
+  var i: int32 = 0;
+  while (i < count) {
+    a[i] = i & 8191;
+    i = i + 1;
+  }
+  build_permutation(idx, count);
+
+  println("Random gather: 16777216 elements (64MB table)");
+
+  var check: int64 = gather(a, idx, count);
+  print("Checksum = ");
+  println_int(check);
+
+  var passes: int32 = 20;
+  println("Benchmark: 20 passes (gather_sum)");
+
+  var t0: uint64 = bench_time_us();
+  var bench_sum: int64 = 0;
+  var p: int32 = 0;
+  while (p < passes) {
+    // Mutate the table each pass so no compiler can hoist the pure gather
+    // out of the timing loop.
+    a[p] = a[p] + 1;
+    bench_sum = bench_sum + gather(a, idx, count);
+    p = p + 1;
+  }
+  var elapsed_us: uint64 = bench_time_us() - t0;
+
+  print("Bench sum = ");
+  println_int(bench_sum);
+  print("Time: ");
+  print_int(elapsed_us);
+  println(" us");
+
+  var per_pass: uint64 = elapsed_us / passes;
+  print("Per pass: ~");
+  print_int(per_pass);
+  println(" us");
+
+  free((cstring)a);
+  free((cstring)idx);
+  return 0;
+}

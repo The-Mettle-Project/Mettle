@@ -1090,6 +1090,35 @@ $cases = @(
     Args            = @("--build", "--emit-obj", "--linker", "internal", "--release", "--dump-ir")
     IrMustMatch     = @("dot_i32")
   },
+  # Anti-rot guards on real BENCHMARK sources: these exact-shape recognizers
+  # broke silently once when unrelated passes drifted the IR out from under
+  # them (fold_readonly_globals folded the matmul bound/stride to a constant;
+  # eliminate_load_symbol_copy folded word_count's byte load straight into the
+  # char symbol). A silent perf regression -- not a wrong answer -- so it slips
+  # past correctness tests. Assert the kernel op is present in the optimized
+  # IR of the actual benchmark, so any future drift is a red test, not a
+  # quiet 3x slowdown on the next benchmark run.
+  @{
+    Name            = "antirot_matmul_slp_mac"
+    Path            = "examples/matrix_mul/matrix_mul.mettle"
+    ShouldSucceed   = $true
+    Args            = @("--build", "--emit-obj", "--linker", "internal", "--release", "--dump-ir")
+    IrMustMatch     = @("slp_mac_i32\(")
+  },
+  @{
+    Name            = "antirot_word_count_scan"
+    Path            = "examples/word_count/word_count.mettle"
+    ShouldSucceed   = $true
+    Args            = @("--build", "--emit-obj", "--linker", "internal", "--release", "--dump-ir")
+    IrMustMatch     = @("count_word_starts\(")
+  },
+  @{
+    Name            = "antirot_saxpy_affine_fma"
+    Path            = "examples/saxpy/saxpy.mettle"
+    ShouldSucceed   = $true
+    Args            = @("--build", "--emit-obj", "--linker", "internal", "--release", "--dump-ir")
+    IrMustMatch     = @("simd_affine_map_f64\(")
+  },
   @{
     Name            = "opt_no_hidden_matmul_n32"
     Path            = "tests/test_opt_simd_matmul_n32.mettle"
@@ -2666,6 +2695,39 @@ foreach ($relFlag in @($true, $false)) {
   catch {
     $failed++
     Write-CaseResult -Name "opt_readonly_global_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# Indirect-gather correctness: `total += a[b[i]]` must not be misclaimed by
+# the unit-stride sum recognizers (a fixed --release miscompile summed b
+# instead), and the prefetch pass's look-ahead clone must not change results.
+foreach ($relFlag in @($true, $false)) {
+  $total++
+  $variant = if ($relFlag) { "release" } else { "debug" }
+  try {
+    $exePath = Join-Path $tmpDir "test_opt_gather_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($relFlag) { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_opt_gather.mettle", "-o", $exePath)
+
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "gather build ($variant) failed: $buildOut"
+    }
+
+    $runOut = & $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "gather ($variant) reported a mismatch (exit $LASTEXITCODE): $runOut"
+    }
+    if ($runOut -notmatch "gather OK") {
+      throw "gather ($variant) did not print OK: $runOut"
+    }
+
+    Write-CaseResult -Name "opt_gather_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "opt_gather_$variant" -Passed $false -Reason $_.Exception.Message
   }
 }
 

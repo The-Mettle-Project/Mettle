@@ -1,0 +1,68 @@
+// Indirect-gather correctness (simd_sum_i32/u8 recognizer + prefetch pass).
+//
+// `total += a[b[i]]` must NOT be claimed by the unit-stride sum recognizers:
+// their accumulator-side and address-side matchers once paired DIFFERENT
+// loads and the kernel silently summed b[0..n) instead (a real --release
+// miscompile caught by the gather_sum benchmark). The direct sum below must
+// still vectorize-and-agree. The prefetch pass also fires on the gather loop
+// here; the look-ahead clone must not change results.
+//
+// Prints "gather OK" and exits 0 on success; exits 1 on any mismatch.
+
+import "std/io";
+import "std/mem";
+
+var N: int32 = 256;
+
+fn gather(a: int32*, b: int32*, count: int32) -> int64 {
+  var total: int64 = 0;
+  var i: int32 = 0;
+  while (i < count) {
+    total = total + (int64)a[b[i]];
+    i = i + 1;
+  }
+  return total;
+}
+
+fn direct_sum(a: int32*, count: int32) -> int64 {
+  var total: int64 = 0;
+  var i: int32 = 0;
+  while (i < count) {
+    total = total + (int64)a[i];
+    i = i + 1;
+  }
+  return total;
+}
+
+fn main() -> int32 {
+  var n: int32 = N;
+  var a: int32* = (int32*)malloc((int64)n * 4);
+  var b: int32* = (int32*)malloc((int64)n * 4);
+  if (a == 0 || b == 0) { return 1; }
+
+  var i: int32 = 0;
+  while (i < n) {
+    a[i] = i * 2;
+    // gcd(7,256)=1, so b visits every index exactly once.
+    b[i] = (i * 7 + 3) % n;
+    i = i + 1;
+  }
+
+  // sum over a permutation of [0,n) of 2j = n*(n-1) = 65280
+  var got: int64 = gather(a, b, n);
+  if (got != 65280) {
+    println("gather FAIL indirect");
+    return 1;
+  }
+
+  var direct: int64 = direct_sum(a, n);
+  if (direct != 65280) {
+    println("gather FAIL direct");
+    return 1;
+  }
+
+  free((cstring)a);
+  free((cstring)b);
+  println("gather OK");
+  return 0;
+}

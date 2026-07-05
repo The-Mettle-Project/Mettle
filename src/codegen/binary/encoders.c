@@ -392,6 +392,14 @@ int binary_emit_memory_access_ex(BinaryCodeBuffer *buffer,
       base, displacement, 0);
 }
 
+/* prefetcht0 [base + disp]: 0F 18 /1. Advisory -- never faults, so a bad
+ * (speculative, out-of-range) address costs nothing but the hint. */
+int binary_emit_prefetcht0_mem(BinaryCodeBuffer *buffer,
+                               BinaryGpRegister base, int displacement) {
+  return binary_emit_memory_access_ex(buffer, 0, 0, 0x0F, 1, 0x18, 1, base,
+                                      displacement);
+}
+
 /* Like binary_emit_memory_access_ex but with a scaled-index SIB address
  * [base + index*scale + disp]. `reg` is the ModRM.reg operand (load dest or
  * store source). scale must be 1/2/4/8 and index must not be RSP. */

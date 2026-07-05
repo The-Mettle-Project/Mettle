@@ -1,0 +1,30 @@
+L	word_count	0	V	18
+C	main	println	0	I	40
+C	main	cstr	0	I	40
+L	main	0	S	45
+C	main	cstr	1	I	50
+C	main	word_count	0	R	54
+C	main	bench_time_us	0	I	57
+L	main	1	S	60
+C	main	word_count	1	R	61
+C	main	bench_time_us	1	I	64
+C	main	println	1	I	67
+C	main	cstr	2	I	67
+C	main	print	0	I	70
+C	main	cstr	3	I	70
+C	main	println_int	0	I	71
+C	main	println	2	I	74
+C	main	cstr	4	I	74
+C	main	print	1	I	77
+C	main	cstr	5	I	77
+C	main	println_int	1	I	78
+C	main	print	2	I	81
+C	main	cstr	6	I	81
+C	main	print_int	0	R	82
+C	main	println	3	I	83
+C	main	cstr	7	I	83
+C	main	print	3	I	87
+C	main	cstr	8	I	87
+C	main	print_int	1	R	88
+C	main	println	4	I	89
+C	main	cstr	9	I	89
