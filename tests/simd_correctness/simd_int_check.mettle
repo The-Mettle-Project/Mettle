@@ -9,25 +9,25 @@ import "std/io";
 import "std/mem";
 
 var g_seed: int64 = 123456789;
-function rnd() -> int32 {
+fn rnd() -> int32 {
   // LCG; take a signed 32-bit window so negatives appear.
   g_seed = (g_seed * 1103515245 + 12345) & 0x7FFFFFFFFFFF;
   return (int32)((g_seed % 4000) - 2000);   // [-2000, 1999]
 }
 
 // ---- kernels (each is the exact loop shape the recognizers fuse) ----
-function k_sum(a: int32*, n: int64) -> int64 {
+fn k_sum(a: int32*, n: int64) -> int64 {
   var s: int64 = 0; var i: int64 = 0;
   while (i < n) { s = s + (int64)a[i]; i = i + 1; }
   return s;
 }
-function k_dot(a: int32*, b: int32*, n: int64) -> int64 {
+fn k_dot(a: int32*, b: int32*, n: int64) -> int64 {
   var s: int64 = 0; var i: int64 = 0;
   while (i < n) { s = s + (int64)a[i] * (int64)b[i]; i = i + 1; }
   return s;
 }
 // Constant mul/add — the scale recognizer only fires when they are literals.
-function k_scale(src: int32*, dst: int32*, n: int64) -> int64 {
+fn k_scale(src: int32*, dst: int32*, n: int64) -> int64 {
   var s: int64 = 0; var i: int64 = 0;
   while (i < n) {
     var v: int32 = src[i] * 3 + 7;
@@ -38,12 +38,12 @@ function k_scale(src: int32*, dst: int32*, n: int64) -> int64 {
   return s;
 }
 // Constant lo/hi via an inlined clamp helper (mirrors the clamp_i32 example).
-function clamp1(v: int32, lo: int32, hi: int32) -> int32 {
+fn clamp1(v: int32, lo: int32, hi: int32) -> int32 {
   if (v < lo) { return lo; }
   if (v > hi) { return hi; }
   return v;
 }
-function k_clamp(src: int32*, dst: int32*, n: int64) -> int64 {
+fn k_clamp(src: int32*, dst: int32*, n: int64) -> int64 {
   var s: int64 = 0; var i: int64 = 0;
   while (i < n) {
     var v: int32 = clamp1(src[i], -500, 500);
@@ -53,7 +53,7 @@ function k_clamp(src: int32*, dst: int32*, n: int64) -> int64 {
   }
   return s;
 }
-function k_reverse(src: int32*, dst: int32*, n: int64) -> int64 {
+fn k_reverse(src: int32*, dst: int32*, n: int64) -> int64 {
   var s: int64 = 0; var i: int64 = 0;
   while (i < n) {
     var v: int32 = src[n - 1 - i];
@@ -63,7 +63,7 @@ function k_reverse(src: int32*, dst: int32*, n: int64) -> int64 {
   }
   return s;
 }
-function k_min(arr: int32*, n: int64) -> int32 {
+fn k_min(arr: int32*, n: int64) -> int32 {
   var minv: int32 = arr[0]; var maxv: int32 = arr[0];
   var i: int64 = 1;
   while (i < n) {
@@ -77,14 +77,14 @@ function k_min(arr: int32*, n: int64) -> int32 {
 
 var g_fail: int32 = 0;
 
-function fail(label: cstring, len: int64) -> int32 {
+fn fail(label: cstring, len: int64) -> int32 {
   print(cstr("FAIL ")); print(label); print(cstr(" n=")); print_int(len);
   println(cstr(""));
   g_fail = g_fail + 1;
   return 0;
 }
 
-function run_len(n: int64) -> int32 {
+fn run_len(n: int64) -> int32 {
   var cap: int64 = n; if (cap < 1) { cap = 1; }
   var a: int32* = (int32*)malloc(cap * 4);
   var b: int32* = (int32*)malloc(cap * 4);
@@ -151,7 +151,7 @@ function run_len(n: int64) -> int32 {
   return 0;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   // Lengths chosen to straddle the 8-lane vector width and scalar tails.
   var lens: int64* = (int64*)malloc(32 * 8);
   lens[0]=1; lens[1]=2; lens[2]=3; lens[3]=4; lens[4]=5; lens[5]=7; lens[6]=8;

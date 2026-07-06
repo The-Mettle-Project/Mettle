@@ -1,3 +1,3 @@
-function imported_bad_semantic() -> int32 {
+fn imported_bad_semantic() -> int32 {
   return missing_imported_symbol;
 }

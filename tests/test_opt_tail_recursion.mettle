@@ -1,0 +1,72 @@
+import "std/io";
+import "std/mem";
+
+fn sum_down(n: int64, acc: int64) -> int64 {
+  if (n <= 0) {
+    return acc;
+  }
+  return sum_down(n - 1, acc + n);
+}
+
+fn tree_sum(v: int64) -> int64 {
+  if (v <= 0) {
+    return 0;
+  }
+  return tree_sum(v / 2) + v + tree_sum(v / 2 - 1);
+}
+
+fn qsr(data: int32*, lo: int32, hi: int32) {
+  if (lo >= hi) {
+    return;
+  }
+  var pivot: int32 = data[hi];
+  var i: int32 = lo - 1;
+  var j: int32 = lo;
+  while (j < hi) {
+    if (data[j] < pivot) {
+      i = i + 1;
+      var tmp: int32 = data[i];
+      data[i] = data[j];
+      data[j] = tmp;
+    }
+    j = j + 1;
+  }
+  var tmp2: int32 = data[i + 1];
+  data[i + 1] = data[hi];
+  data[hi] = tmp2;
+  qsr(data, lo, i);
+  qsr(data, i + 2, hi);
+}
+
+fn main() -> int32 {
+  if (sum_down(100, 0) != 5050) {
+    println("sum_down FAILED");
+    return 2;
+  }
+  if (tree_sum(20) != 68) {
+    println("tree_sum FAILED");
+    return 2;
+  }
+
+  var n: int32 = 512;
+  var data: int32* = (int32*)malloc((int64)n * 4);
+  var i: int32 = 0;
+  while (i < n) {
+    data[i] = (i * 1103515245 + 12345) % 4096;
+    i = i + 1;
+  }
+  qsr(data, 0, n - 1);
+  i = 1;
+  while (i < n) {
+    if (data[i - 1] > data[i]) {
+      print("qsr NOT SORTED at ");
+      println_int((int64)i);
+      return 2;
+    }
+    i = i + 1;
+  }
+
+  free((cstring)data);
+  println("tail_recursion OK");
+  return 0;
+}

@@ -1,5 +1,5 @@
 import "bad_syntax_module";
 
-function main() -> int32 {
+fn main() -> int32 {
   return 0;
 }

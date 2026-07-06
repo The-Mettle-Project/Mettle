@@ -1,7 +1,7 @@
-function id(x: int32) -> int32 {
+fn id(x: int32) -> int32 {
   return x;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   return id(9);
 }

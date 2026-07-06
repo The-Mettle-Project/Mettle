@@ -1,0 +1,34 @@
+// Stateful closures: a captured variable is captured by value, but the closure's
+// copy lives in its heap environment and persists across calls, so a closure can
+// hold mutable state (counters, accumulators) while leaving the outer variable
+// unchanged.
+import "std/io";
+
+fn counter(start: int32) -> Fn() -> int32 {
+  return fn() -> int32 { start = start + 1; return start; };
+}
+
+fn main() -> int32 {
+  var count: int32 = 0;
+  var bump: Fn() -> int32 = fn() -> int32 { count = count + 1; return count; };
+  if (bump() != 1) {
+    return 1;
+  }
+  if (bump() != 2) {
+    return 2;
+  }
+  if (bump() != 3) {
+    return 3;
+  }
+  if (count != 0) {           // outer variable unaffected (capture is by value)
+    return 4;
+  }
+
+  // Each returned closure carries its own independent persistent state.
+  var a: Fn() -> int32 = counter(10);
+  var b: Fn() -> int32 = counter(100);
+  if (a() != 11 || a() != 12 || b() != 101 || a() != 13) {
+    return 5;
+  }
+  return 0;
+}

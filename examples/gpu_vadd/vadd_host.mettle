@@ -9,7 +9,7 @@ import "std/io";
 import "std/mem";
 import "std/gpu";
 
-function main() -> int32 {
+fn main() -> int32 {
   if (gpu_init() == 0) { println(cstr("GPU init failed")); return 1; }
 
   // load the emitted PTX module and resolve the kernel

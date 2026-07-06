@@ -13,7 +13,7 @@ var CURL_CMD_MID: string = " -o ";
 
 // Fetch URL to output file using curl. Returns curl exit code (0 = success).
 // Caller must ensure url and output_path are reasonable length (< ~2000 chars total).
-export function http_fetch_to_file(url: cstring, output_path: cstring) -> int32 {
+export fn http_fetch_to_file(url: cstring, output_path: cstring) -> int32 {
   var url_len: int64 = strlen(url);
   var path_len: int64 = strlen(output_path);
   var total: int64 = 8 + 1 + url_len + 4 + 1 + path_len + 1;

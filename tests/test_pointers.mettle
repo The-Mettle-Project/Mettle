@@ -3,11 +3,11 @@ struct Pair {
   b: int32;
 }
 
-function sum_pair(p: Pair*) -> int32 {
+fn sum_pair(p: Pair*) -> int32 {
   return p->a + p->b;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var p: Pair* = new Pair;
   p->a = 7;
   (*p).b = 9;

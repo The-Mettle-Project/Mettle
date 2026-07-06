@@ -1,0 +1,20 @@
+// Global floating-point variables must read back their initializer value and
+// survive mutation. Regression for the direct-object backend caching a float
+// global in a GP register (or const-folding it to a GP immediate) so float
+// consumers read an uninitialized XMM lane. Exercises written float64, written
+// float32, a read-only float64, and a global float64 const.
+var Fw: float64 = 2.5;       // written float64 global
+var Gw: float32 = 1.25;      // written float32 global
+var Fro: float64 = 3.5;      // read-only float64 global
+const PI: float64 = 3.0;     // global float const (immutable variable storage)
+
+fn main() -> int32 {
+    Fw = Fw + 0.0;           // mutate without const-folding the read away
+    Gw = Gw + 0.0;
+    var sum: int32 = 0;
+    sum = sum + (int32)(Fw * 10.0);    // 25
+    sum = sum + (int32)(Gw * 100.0);   // 125
+    sum = sum + (int32)(Fro * 10.0);   // 35
+    sum = sum + (int32)(PI * 10.0);    // 30
+    return sum;                        // 215
+}

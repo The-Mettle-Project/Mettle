@@ -573,7 +573,7 @@ $cases = @(
       # entry that explains why NOT inlining is the right call -- and hands
       # out no fix advice (there is nothing worth fixing)
       'main \(8 calls, lines \d+-\d+\): NOT inlined',
-      'reason: the calling function is over the 512-instruction caller budget, and this call site is not inside a loop',
+      'reason: the calling function is over the profile-adjusted caller budget, and this call site is not measured hot or inside a loop',
       'calls: f1 \(x3\), f2 \(x2\), f3 \(x2\), f4',
       # tiny call-free callees are exempt from the caller budget: the
       # accessor still inlines into the over-budget main
@@ -612,6 +612,15 @@ $cases = @(
   @{ Name = "err_decorator_on_struct"; Path = "tests/err_decorator_on_struct.mettle"; ShouldSucceed = $false; Pattern = "may only precede a function declaration" },
   @{ Name = "err_decorator_after_export"; Path = "tests/err_decorator_after_export.mettle"; ShouldSucceed = $false; Pattern = "Decorators must precede 'export'" },
   @{ Name = "const_top_level"; Path = "tests/test_const_top_level.mettle"; ShouldSucceed = $true },
+  @{ Name = "lambda"; Path = "tests/test_lambda.mettle"; ShouldSucceed = $true },
+  @{ Name = "err_var_inferred"; Path = "tests/err_var_inferred.mettle"; ShouldSucceed = $false; Pattern = "requires an explicit type" },
+  @{ Name = "closure_capture"; Path = "tests/test_closure_capture.mettle"; ShouldSucceed = $true },
+  @{ Name = "closure_crossboundary"; Path = "tests/test_closure_crossboundary.mettle"; ShouldSucceed = $true },
+  @{ Name = "closure_field"; Path = "tests/test_closure_field.mettle"; ShouldSucceed = $true },
+  @{ Name = "closure_state"; Path = "tests/test_closure_state.mettle"; ShouldSucceed = $true },
+  @{ Name = "closure_adapt"; Path = "tests/test_closure_adapt.mettle"; ShouldSucceed = $true },
+  @{ Name = "fnptr_statement_call"; Path = "tests/test_fnptr_statement_call.mettle"; ShouldSucceed = $true },
+  @{ Name = "err_lambda_capture"; Path = "tests/err_lambda_capture.mettle"; ShouldSucceed = $false; Pattern = "capturing closure cannot be stored in a plain function-pointer type" },
   @{ Name = "err_missing_return"; Path = "tests/err_missing_return.mettle"; ShouldSucceed = $false; Pattern = "non-void return type .* but contains no return statement" },
   @{ Name = "err_const_no_init"; Path = "tests/err_const_no_init.mettle"; ShouldSucceed = $false; Pattern = "Constant declaration requires an initializer" },
   @{ Name = "err_const_assign"; Path = "tests/err_const_assign.mettle"; ShouldSucceed = $false; Pattern = "is a constant and cannot be assigned to" },
@@ -1081,6 +1090,35 @@ $cases = @(
     Args            = @("--build", "--emit-obj", "--linker", "internal", "--release", "--dump-ir")
     IrMustMatch     = @("dot_i32")
   },
+  # Anti-rot guards on real BENCHMARK sources: these exact-shape recognizers
+  # broke silently once when unrelated passes drifted the IR out from under
+  # them (fold_readonly_globals folded the matmul bound/stride to a constant;
+  # eliminate_load_symbol_copy folded word_count's byte load straight into the
+  # char symbol). A silent perf regression -- not a wrong answer -- so it slips
+  # past correctness tests. Assert the kernel op is present in the optimized
+  # IR of the actual benchmark, so any future drift is a red test, not a
+  # quiet 3x slowdown on the next benchmark run.
+  @{
+    Name            = "antirot_matmul_slp_mac"
+    Path            = "examples/matrix_mul/matrix_mul.mettle"
+    ShouldSucceed   = $true
+    Args            = @("--build", "--emit-obj", "--linker", "internal", "--release", "--dump-ir")
+    IrMustMatch     = @("slp_mac_i32\(")
+  },
+  @{
+    Name            = "antirot_word_count_scan"
+    Path            = "examples/word_count/word_count.mettle"
+    ShouldSucceed   = $true
+    Args            = @("--build", "--emit-obj", "--linker", "internal", "--release", "--dump-ir")
+    IrMustMatch     = @("count_word_starts\(")
+  },
+  @{
+    Name            = "antirot_saxpy_affine_fma"
+    Path            = "examples/saxpy/saxpy.mettle"
+    ShouldSucceed   = $true
+    Args            = @("--build", "--emit-obj", "--linker", "internal", "--release", "--dump-ir")
+    IrMustMatch     = @("simd_affine_map_f64\(")
+  },
   @{
     Name            = "opt_no_hidden_matmul_n32"
     Path            = "tests/test_opt_simd_matmul_n32.mettle"
@@ -1237,10 +1275,78 @@ $cases = @(
   @{ Name = "err_array_index_oob_const"; Path = "tests/err_array_index_oob_const.mettle"; ShouldSucceed = $false; Pattern = "out of bounds" },
   @{ Name = "err_array_index_oob_const_negative"; Path = "tests/err_array_index_oob_const_negative.mettle"; ShouldSucceed = $false; Pattern = "out of bounds" },
   @{ Name = "err_null_deref_const"; Path = "tests/err_null_deref_const.mettle"; ShouldSucceed = $false; Pattern = "Null pointer dereference" },
-  @{ Name = "err_codegen_member_expr"; Path = "tests/err_codegen_member_expr.mettle"; ShouldSucceed = $false },
+  @{ Name = "member_through_ptr"; Path = "tests/err_codegen_member_expr.mettle"; ShouldSucceed = $true },
   @{ Name = "err_function_arg_count"; Path = "tests/err_function_arg_count.mettle"; ShouldSucceed = $false; Pattern = "expects .* arguments, got" },
   @{ Name = "err_function_arg_type"; Path = "tests/err_function_arg_type.mettle"; ShouldSucceed = $false; Pattern = "Type mismatch" },
   @{ Name = "err_match_bad_syntax"; Path = "tests/err_match_bad_syntax.mettle"; ShouldSucceed = $false; Pattern = "Expected .* after 'match'" },
+  # Diagnostics quality: multi-error recovery, cascade suppression, notes,
+  # caret labels, unused-variable warnings, JSON output.
+  @{ Name = "diag_multi_error"; Path = "tests/diag_multi_error.mettle"; ShouldSucceed = $false
+     OutputMustMatch = @("due to 4 previous errors", "Undefined variable 'missing1'", "Undefined variable 'missing2'") },
+  @{ Name = "diag_parser_no_cascade"; Path = "tests/diag_parser_no_cascade.mettle"; ShouldSucceed = $false
+     Pattern = "Expected '\(' after 'if'"
+     OutputMustNotMatch = @("Expected '\(', found identifier", "due to [4-9] previous") },
+  @{ Name = "diag_dup_note"; Path = "tests/diag_dup_note.mettle"; ShouldSucceed = $false
+     OutputMustMatch = @("Duplicate declaration of 'x'", "previous declaration of 'x' is here") },
+  @{ Name = "diag_call_notes"; Path = "tests/diag_call_notes.mettle"; ShouldSucceed = $false
+     OutputMustMatch = @("expects 2 arguments, got 3", "\^\^\^ expected 2 arguments, got 3", "function 'add' defined here") },
+  @{ Name = "diag_label_mismatch"; Path = "tests/diag_label_mismatch.mettle"; ShouldSucceed = $false
+     OutputMustMatch = @("\^\^\^\^\^ expected 'int64', found 'string'") },
+  @{ Name = "diag_unused_var"; Path = "tests/diag_unused_var.mettle"; ShouldSucceed = $true
+     OutputMustMatch = @("unused variable 'scratch'", "rename it to '_scratch'")
+     OutputMustNotMatch = @("unused variable '_intentional'", "unused variable 'used'") },
+  @{ Name = "diag_json_format"; Path = "tests/diag_json_format.mettle"; ShouldSucceed = $false
+     Args = @("--error-format=json")
+     Pattern = '"severity":"error"'
+     OutputMustMatch = @('"code":"E0004"', '"line":2', '"length":5', '"label":"expected ''int64'', found ''string''"') },
+  @{ Name = "diag_poison_no_cascade"; Path = "tests/diag_poison_no_cascade.mettle"; ShouldSucceed = $false
+     Pattern = "Type mismatch"
+     OutputMustNotMatch = @("Undefined variable 'x'") },
+  # --verify translation validation: clean programs validate with zero
+  # divergences; a sabotaged pass is caught, quarantined, and the build heals.
+  @{ Name = "verify_clean"; Path = "tests/verify_clean.mettle"; ShouldSucceed = $true
+     Args = @("--verify")
+     OutputMustMatch = @("translation validation: OK")
+     OutputMustNotMatch = @("MISCOMPILE") },
+  @{ Name = "verify_nullcheck_zerotrip"; Path = "tests/verify_nullcheck_zerotrip.mettle"; ShouldSucceed = $true
+     Args = @("--verify")
+     OutputMustMatch = @("translation validation: OK")
+     OutputMustNotMatch = @("MISCOMPILE") },
+  @{ Name = "verify_sabotage_caught"; Path = "tests/verify_clean.mettle"; ShouldSucceed = $true
+     Args = @("--verify")
+     Env = @{ METTLE_VERIFY_BREAK = "constant_and_branch_simplify:dot" }
+     SkipDeterminism = $true
+     OutputMustMatch = @("MISCOMPILE CAUGHT", "quarantined", "pre-pass IR restored") },
+  # `mettle test`: interpreted @test functions - pass/fail/leak reporting with
+  # assertion diagnostics; @test bodies are dropped from normal builds.
+  @{ Name = "comptime_test_run"; Path = "tests/comptime_tests_demo.mettle"; ShouldSucceed = $false
+     Args = @("test")
+     Pattern = "assertion failed in test 'test_fail'"
+     OutputMustMatch = @("test test_pass \.\.\. ok", "left: 20, right: 21",
+                         "LEAKED", "leaked 24 bytes", "2 passed, 1 failed, 1 leak") },
+  @{ Name = "comptime_test_filter"; Path = "tests/comptime_tests_demo.mettle"; ShouldSucceed = $false
+     Args = @("test", "--filter=test_fail")
+     Pattern = "running 1 test"
+     OutputMustMatch = @("0 passed, 1 failed")
+     OutputMustNotMatch = @("test test_pass") },
+  @{ Name = "comptime_tests_dropped_in_build"; Path = "tests/comptime_tests_demo.mettle"; ShouldSucceed = $true
+     OutputMustNotMatch = @("assertion failed") },
+  @{ Name = "err_assert_outside_test"; Path = "tests/err_assert_outside_test.mettle"; ShouldSucceed = $false
+     Pattern = "only be called inside a @test function" },
+  # Zero-run PGO: interpreted profile marks the oversized callee hot, which
+  # overrides the inliner's static budget; without --pgo it stays refused.
+  @{ Name = "pgo_hot_inline"; Path = "tests/pgo_hot_inline.mettle"; ShouldSucceed = $true
+     Args = @("--pgo", "--release", "--explain")
+     OutputMustMatch = @('pgo: interpreted main', 'keyed_mix: 100000 calls.*\[hot\]',
+                         'call to .keyed_mix. @ line 32.: inlined')
+     OutputMustNotMatch = @('NOT inlined') },
+  @{ Name = "pgo_off_budget_refusal"; Path = "tests/pgo_hot_inline.mettle"; ShouldSucceed = $true
+     Args = @("--release", "--explain")
+     OutputMustMatch = @('call to .keyed_mix. @ line 32.: NOT inlined') },
+  @{ Name = "pgo_cold_unroll_threshold"; Path = "tests/pgo_hot_thresholds.mettle"; ShouldSucceed = $true
+     Args = @("--pgo", "--release", "--dump-ir")
+     OutputMustMatch = @('pgo: interpreted main')
+     IrMustMatch = @('function cold_loop[\s\S]*jump ir_while_') },
   @{ Name = "err_match_non_exhaustive"; Path = "tests/err_match_non_exhaustive.mettle"; ShouldSucceed = $false; Pattern = "Non-exhaustive match" },
   @{ Name = "err_trait_bound_missing_impl"; Path = "tests/err_trait_bound_missing_impl.mettle"; ShouldSucceed = $false; Pattern = "does not implement trait 'Addable'" },
   @{ Name = "err_trait_bound_missing_second_impl"; Path = "tests/err_trait_bound_missing_second_impl.mettle"; ShouldSucceed = $false; Pattern = "does not implement trait 'SignedNumber'" },
@@ -1469,7 +1575,8 @@ foreach ($case in $cases) {
             }
           }
         }
-        if ($passed -and -not $SkipDeterminism) {
+        if ($passed -and -not $SkipDeterminism -and
+            -not ($case.ContainsKey("SkipDeterminism") -and $case.SkipDeterminism)) {
           $outFile2 = Join-Path $tmpDir ("{0}.second.obj" -f $case.Name)
           if (Test-Path $outFile2) {
             Remove-Item -Path $outFile2 -Force -ErrorAction SilentlyContinue
@@ -1844,6 +1951,30 @@ catch {
   Write-CaseResult -Name "generics_runtime" -Passed $false -Reason $_.Exception.Message
 }
 
+# Global float variables: compile with --build and verify they read back their
+# initializer (and survive mutation) instead of reading 0 from an uninitialized
+# XMM lane. Returns 25+125+35+30 = 215.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "global_float_var.exe"
+  $buildOut = & $CompilerPath --build "tests\test_global_float_var.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "Global float var build failed: $buildOut"
+  }
+  if (-not (Test-Path $exePath)) {
+    throw "Global float var build did not produce an executable"
+  }
+  & $exePath 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 215) {
+    throw "Global float var exited with $LASTEXITCODE (expected 215)"
+  }
+  Write-CaseResult -Name "global_float_var_runtime" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "global_float_var_runtime" -Passed $false -Reason $_.Exception.Message
+}
+
 # Switch range cases: compile with --build and verify inclusive-interval dispatch.
 $total++
 try {
@@ -1991,7 +2122,7 @@ try {
   if ($run2 -notmatch 'no optimization changes since the last explain build') {
     throw "Identical rebuild must report no changes"
   }
-  (Get-Content "$exDir\demo.mettle" -Raw) -replace 'function scale\(x: float32\)', '@noinline function scale(x: float32)' |
+  (Get-Content "$exDir\demo.mettle" -Raw) -replace 'fn scale\(x: float32\)', '@noinline fn scale(x: float32)' |
     Set-Content "$exDir\demo.mettle" -Encoding ascii -NoNewline
   $run3 = cmd /c "`"$((Resolve-Path $CompilerPath).Path)`" -i `"$exDir\demo.mettle`" -o `"$exOut`" --release --explain-json 2>&1" | Out-String
   if ($run3 -notmatch 'REGRESSED' -or $run3 -notmatch 'was vectorized, now scalar') {
@@ -2070,6 +2201,52 @@ catch {
   Write-CaseResult -Name "const_top_level_runtime" -Passed $false -Reason $_.Exception.Message
 }
 
+# Local non-integer consts (float + string): --build and verify runtime value.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "const_local_float_string.exe"
+  $buildOut = & $CompilerPath --build "tests\test_const_local_float_string.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "Local non-integer const build failed: $buildOut"
+  }
+  if (-not (Test-Path $exePath)) {
+    throw "Local non-integer const build did not produce an executable"
+  }
+  & $exePath 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 42) {
+    throw "Local non-integer const exited with $LASTEXITCODE (expected 42)"
+  }
+  Write-CaseResult -Name "const_local_float_string_runtime" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "const_local_float_string_runtime" -Passed $false -Reason $_.Exception.Message
+}
+
+# Global non-integer consts (float + string): --build and verify runtime value.
+# The float global now loads correctly in the direct-object backend, so it is no
+# longer rejected; the string global must emit and link like any global.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "const_global_float_string.exe"
+  $buildOut = & $CompilerPath --build "tests\test_const_global_float_string.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "Global non-integer const build failed: $buildOut"
+  }
+  if (-not (Test-Path $exePath)) {
+    throw "Global non-integer const build did not produce an executable"
+  }
+  & $exePath 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 42) {
+    throw "Global non-integer const exited with $LASTEXITCODE (expected 42)"
+  }
+  Write-CaseResult -Name "const_global_float_string_runtime" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "const_global_float_string_runtime" -Passed $false -Reason $_.Exception.Message
+}
+
 # Conditional imports: --build and verify off-target guarded imports are dropped.
 $total++
 try {
@@ -2129,7 +2306,7 @@ try {
   @'
 import "std/io";
 
-function main() -> int32 {
+fn main() -> int32 {
   var msg: string = "Bundled stdlib works";
   println(cstr(msg));
   return 0;
@@ -2173,7 +2350,7 @@ try {
   $bomSource = Join-Path $bomDir "main.mettle"
   $bomObj = Join-Path $bomDir "main.obj"
   @'
-function main() -> int32 {
+fn main() -> int32 {
   return 0;
 }
 '@ | Set-Content -Path $bomSource -Encoding utf8
@@ -2219,7 +2396,7 @@ try {
   @'
 import "testpkg/shared_math";
 
-function main() -> int32 {
+fn main() -> int32 {
   return forty_two();
 }
 '@ | Set-Content -Path $depsSource -Encoding ASCII
@@ -2414,6 +2591,181 @@ foreach ($relFlag in @($true, $false)) {
   catch {
     $failed++
     Write-CaseResult -Name "opt_closed_form_sum_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# Pointer-induction scope: converting the first of two loops that share an
+# induction variable and array must not rewrite the second loop's compare to
+# the first loop's exhausted walk pointers (regression: the rewrite window ran
+# to end-of-function instead of the loop's back-edge). Self-checks the second
+# loop's stores and returns nonzero on any mismatch.
+foreach ($relFlag in @($true, $false)) {
+  $total++
+  $variant = if ($relFlag) { "release" } else { "debug" }
+  try {
+    $exePath = Join-Path $tmpDir "test_opt_ptr_induction_two_loops_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($relFlag) { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_opt_ptr_induction_two_loops.mettle", "-o", $exePath)
+
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "ptr-induction two-loops build ($variant) failed: $buildOut"
+    }
+    if (-not (Test-Path $exePath)) {
+      throw "ptr-induction two-loops build ($variant) did not produce an executable"
+    }
+
+    $runOut = & $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "ptr-induction two-loops ($variant) reported a mismatch (exit $LASTEXITCODE): $runOut"
+    }
+    if ($runOut -notmatch "ptr_induction_two_loops OK") {
+      throw "ptr-induction two-loops ($variant) did not print OK: $runOut"
+    }
+
+    Write-CaseResult -Name "opt_ptr_induction_two_loops_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "opt_ptr_induction_two_loops_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# Tail-recursion elimination: pure (`return self(...)`), void (`self(...);
+# return`), and accumulator (`return E + self(...)`) forms must preserve
+# semantics, including the MIR back-edge-to-entry liveness fix (params must
+# survive the rebind+jump loop). Order-sensitive checks: qsr verifies actual
+# sortedness, not an order-blind sum.
+foreach ($relFlag in @($true, $false)) {
+  $total++
+  $variant = if ($relFlag) { "release" } else { "debug" }
+  try {
+    $exePath = Join-Path $tmpDir "test_opt_tail_recursion_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($relFlag) { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_opt_tail_recursion.mettle", "-o", $exePath)
+
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "tail-recursion build ($variant) failed: $buildOut"
+    }
+    if (-not (Test-Path $exePath)) {
+      throw "tail-recursion build ($variant) did not produce an executable"
+    }
+
+    $runOut = & $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "tail-recursion ($variant) reported a mismatch (exit $LASTEXITCODE): $runOut"
+    }
+    if ($runOut -notmatch "tail_recursion OK") {
+      throw "tail-recursion ($variant) did not print OK: $runOut"
+    }
+
+    Write-CaseResult -Name "opt_tail_recursion_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "opt_tail_recursion_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# Read-only global fold: a never-written global integer var must fold to its
+# initializer; a written one must NOT. Self-checks both.
+foreach ($relFlag in @($true, $false)) {
+  $total++
+  $variant = if ($relFlag) { "release" } else { "debug" }
+  try {
+    $exePath = Join-Path $tmpDir "test_opt_readonly_global_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($relFlag) { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_opt_readonly_global.mettle", "-o", $exePath)
+
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "readonly-global build ($variant) failed: $buildOut"
+    }
+
+    $runOut = & $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "readonly-global ($variant) reported a mismatch (exit $LASTEXITCODE): $runOut"
+    }
+    if ($runOut -notmatch "readonly_global OK") {
+      throw "readonly-global ($variant) did not print OK: $runOut"
+    }
+
+    Write-CaseResult -Name "opt_readonly_global_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "opt_readonly_global_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# Indirect-gather correctness: `total += a[b[i]]` must not be misclaimed by
+# the unit-stride sum recognizers (a fixed --release miscompile summed b
+# instead), and the prefetch pass's look-ahead clone must not change results.
+foreach ($relFlag in @($true, $false)) {
+  $total++
+  $variant = if ($relFlag) { "release" } else { "debug" }
+  try {
+    $exePath = Join-Path $tmpDir "test_opt_gather_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($relFlag) { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_opt_gather.mettle", "-o", $exePath)
+
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "gather build ($variant) failed: $buildOut"
+    }
+
+    $runOut = & $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "gather ($variant) reported a mismatch (exit $LASTEXITCODE): $runOut"
+    }
+    if ($runOut -notmatch "gather OK") {
+      throw "gather ($variant) did not print OK: $runOut"
+    }
+
+    Write-CaseResult -Name "opt_gather_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "opt_gather_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# Allocation-site layout factorization: a padded malloc pool must compact, a
+# subset-loaded pool must factor into per-field arrays (SoA), and an escaped
+# pool must be declined -- all while the program's closed-form checksums hold.
+# Self-checks and returns nonzero on any mismatch.
+foreach ($relFlag in @($true, $false)) {
+  $total++
+  $variant = if ($relFlag) { "release" } else { "debug" }
+  try {
+    $exePath = Join-Path $tmpDir "test_opt_layout_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($relFlag) { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_opt_layout.mettle", "-o", $exePath)
+
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "layout build ($variant) failed: $buildOut"
+    }
+
+    $runOut = & $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "layout ($variant) reported a mismatch (exit $LASTEXITCODE): $runOut"
+    }
+    if ($runOut -notmatch "layout OK") {
+      throw "layout ($variant) did not print OK: $runOut"
+    }
+
+    Write-CaseResult -Name "opt_layout_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "opt_layout_$variant" -Passed $false -Reason $_.Exception.Message
   }
 }
 
@@ -4849,6 +5201,179 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "crash_handler" -Passed $false -Reason $_.Exception.Message
+}
+
+# AArch64 encoder validity gate. Compiles and runs the from-scratch A64
+# instruction encoder against ground-truth constants from the ARM Architecture
+# Reference Manual (RET=0xD65F03C0, the stp x29,x30,[sp,#-16]! prologue, ...)
+# plus an encode->decode round-trip across the register/immediate range. This
+# is the AArch64 analogue of the PTX/ptxas gate below: it validates the hardest
+# layer (instruction encodings) with no external assembler and no ARM hardware,
+# since the test is pure 32-bit math that runs on the build host.
+$total++
+try {
+  $arm64Exe = "bin\arm64_encode_test.exe"
+  & gcc -Wall -Wextra -std=c99 -g -O0 -Isrc tests\arm64_encode_test.c src\codegen\binary\arm64_encode.c src\codegen\binary\arm64_disasm.c src\codegen\binary\arm64_abi.c -o $arm64Exe
+  if ($LASTEXITCODE -ne 0) {
+    throw "Failed to compile AArch64 encoder test"
+  }
+
+  $arm64Output = & $arm64Exe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "AArch64 encoder test failed:`n$arm64Output"
+  }
+  if ($arm64Output -notmatch "RESULT: PASS") {
+    throw "AArch64 encoder test did not report PASS"
+  }
+
+  Write-CaseResult -Name "arm64_encoder" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "arm64_encoder" -Passed $false -Reason $_.Exception.Message
+}
+
+# AArch64 emit-layer + execution gate. Emits complete AAPCS64 functions
+# (prologue/body/epilogue with branch fixups), validates each by decoding every
+# word with the from-scratch disassembler, and writes them as minimal static
+# AArch64 ELF executables (hand-built header -- no external assembler/linker).
+# The structural validation always runs (no external deps). If a qemu-aarch64
+# user-mode emulator is reachable through WSL, each ELF is executed and its exit
+# code checked against the expected result -- the semantic proof that the
+# generated machine code runs on AArch64 without ARM hardware. Execution is
+# skipped (not failed) when no emulator is present, like the ptxas gate.
+$total++
+try {
+  $arm64EmitExe = "bin\arm64_emit_test.exe"
+  & gcc -Wall -Wextra -std=c99 -g -O0 -Isrc tests\arm64_emit_test.c src\codegen\binary\arm64_encode.c src\codegen\binary\arm64_emit.c src\codegen\binary\arm64_disasm.c src\codegen\binary\arm64_mir_encode.c -o $arm64EmitExe
+  if ($LASTEXITCODE -ne 0) {
+    throw "Failed to compile AArch64 emit test"
+  }
+
+  $elfDir = Join-Path $tmpDir "arm64elf"
+  New-Item -ItemType Directory -Force -Path $elfDir | Out-Null
+  $emitOut = & $arm64EmitExe $elfDir 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "AArch64 emit test failed:`n$emitOut"
+  }
+  if ($emitOut -notmatch "RESULT: PASS") {
+    throw "AArch64 emit test did not report PASS"
+  }
+
+  # Best-effort: run the ELF programs under qemu-aarch64 via WSL.
+  $wsl = Get-Command wsl -ErrorAction SilentlyContinue
+  if ($wsl -and $elfDir -match '^[A-Za-z]:\\') {
+    $scriptWin = (Resolve-Path (Join-Path $PSScriptRoot "arm64_qemu_run.sh")).Path
+    $toWsl = {
+      param($p)
+      "/mnt/" + $p.Substring(0, 1).ToLower() + ($p.Substring(2) -replace '\\', '/')
+    }
+    $wslScript = & $toWsl $scriptWin
+    $wslDir = & $toWsl $elfDir
+    $runOut = & wsl bash $wslScript $wslDir 2>&1 | Out-String
+    $code = $LASTEXITCODE
+    if ($code -eq 0) {
+      Write-Host ($runOut.Trim())
+    }
+    elseif ($code -eq 64) {
+      Write-Host "[SKIP] arm64_emit execution (qemu-aarch64 not found; structural validation passed)"
+    }
+    elseif ($code -eq 1) {
+      throw "AArch64 program(s) produced wrong result under qemu:`n$runOut"
+    }
+    else {
+      Write-Host "[SKIP] arm64_emit execution (qemu run unavailable: exit $code)"
+    }
+  }
+  else {
+    Write-Host "[SKIP] arm64_emit execution (no WSL; structural validation passed)"
+  }
+
+  Write-CaseResult -Name "arm64_emit" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "arm64_emit" -Passed $false -Reason $_.Exception.Message
+}
+
+# Real-source -> AArch64 gate. Drives the REAL compiler ($CompilerPath
+# --emit-arm64) to lower each tests/arm64/*.mettle fixture to a static AArch64
+# ELF, then (if a qemu-aarch64 emulator is reachable through WSL) runs each and
+# checks the exit code against expected.txt. Proves actual Mettle source --
+# loops, if/else, modulo, recursion, mutual recursion, multi-arg calls --
+# compiles to AArch64 and executes. Execution skips like the ptxas gate.
+$total++
+try {
+  $elfDir = Join-Path $tmpDir "arm64src"
+  New-Item -ItemType Directory -Force -Path $elfDir | Out-Null
+  Copy-Item tests\arm64\expected.txt (Join-Path $elfDir "manifest.txt") -Force
+  $names = Get-Content tests\arm64\expected.txt |
+    ForEach-Object { ($_ -split ' ')[0] } | Where-Object { $_ }
+  foreach ($n in $names) {
+    $elf = Join-Path $elfDir "$n.elf"
+    & $CompilerPath --emit-arm64 "tests\arm64\$n.mettle" -o $elf 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $elf)) {
+      throw "mettle --emit-arm64 failed on $n.mettle"
+    }
+  }
+
+  # I/O fixtures: compile and stage each with its expected-stdout .out sidecar.
+  $ioDir = Join-Path $tmpDir "arm64io"
+  New-Item -ItemType Directory -Force -Path $ioDir | Out-Null
+  Get-ChildItem tests\arm64\io\*.mettle | ForEach-Object {
+    $elf = Join-Path $ioDir ($_.BaseName + ".elf")
+    & $CompilerPath --emit-arm64 $_.FullName -o $elf 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $elf)) {
+      throw "mettle --emit-arm64 failed on io/$($_.Name)"
+    }
+    Copy-Item (Join-Path "tests\arm64\io" ($_.BaseName + ".out")) `
+      (Join-Path $ioDir ($_.BaseName + ".out")) -Force
+  }
+
+  $wsl = Get-Command wsl -ErrorAction SilentlyContinue
+  if ($wsl -and $elfDir -match '^[A-Za-z]:\\') {
+    $toWsl = {
+      param($p)
+      "/mnt/" + $p.Substring(0, 1).ToLower() + ($p.Substring(2) -replace '\\', '/')
+    }
+    $wslScript = & $toWsl (Resolve-Path (Join-Path $PSScriptRoot "arm64_qemu_run.sh")).Path
+    $runOut = & wsl bash $wslScript (& $toWsl $elfDir) 2>&1 | Out-String
+    $code = $LASTEXITCODE
+    if ($code -eq 0) {
+      Write-Host ($runOut.Trim())
+      # I/O: diff each program's stdout against its committed .out
+      $ioScript = & $toWsl (Resolve-Path (Join-Path $PSScriptRoot "arm64_io_run.sh")).Path
+      $ioOut = & wsl bash $ioScript (& $toWsl $ioDir) 2>&1 | Out-String
+      $ioCode = $LASTEXITCODE
+      if ($ioCode -eq 0) {
+        Write-Host ($ioOut.Trim())
+      }
+      elseif ($ioCode -eq 64) {
+        Write-Host "[SKIP] arm64 I/O execution (qemu-aarch64 not found)"
+      }
+      else {
+        throw "real-source AArch64 I/O stdout mismatch:`n$ioOut"
+      }
+    }
+    elseif ($code -eq 64) {
+      Write-Host "[SKIP] arm64_source execution (qemu-aarch64 not found; all fixtures lowered)"
+    }
+    elseif ($code -eq 1) {
+      throw "real-source AArch64 program produced wrong result under qemu:`n$runOut"
+    }
+    else {
+      Write-Host "[SKIP] arm64_source execution (qemu run unavailable: exit $code)"
+    }
+  }
+  else {
+    Write-Host "[SKIP] arm64_source execution (no WSL; all fixtures lowered)"
+  }
+
+  Write-CaseResult -Name "arm64_source" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "arm64_source" -Passed $false -Reason $_.Exception.Message
 }
 
 # General reduction-unrolling vectorizer: correctness on non-benchmark

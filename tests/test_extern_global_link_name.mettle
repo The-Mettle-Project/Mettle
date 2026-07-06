@@ -1,6 +1,6 @@
 extern var errno_value: int32 = "errno";
 
-function main() -> int32 {
+fn main() -> int32 {
   errno_value = 7;
   return errno_value;
 }

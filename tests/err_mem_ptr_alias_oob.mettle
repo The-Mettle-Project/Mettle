@@ -1,6 +1,6 @@
 // Constant out-of-bounds through a pointer alias: p starts at a[2], so p[6]
 // lands at a[8], one past the end of int32[8].
-function main() -> int32 {
+fn main() -> int32 {
     var a: int32[8];
     var i: int32 = 0;
     while (i < 8) { a[i] = i; i = i + 1; }

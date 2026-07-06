@@ -148,6 +148,7 @@ ErrorReporter *error_reporter_create(const char *filename,
   reporter->source_capacity = 0;
   reporter->current_filename = reporter->filename;
   reporter->current_source_code = reporter->source_code;
+  reporter->last_add_suppressed = 0;
   error_reporter_register_source(reporter, filename, source_code);
 
   return reporter;
@@ -177,6 +178,7 @@ void error_reporter_destroy(ErrorReporter *reporter) {
     free(reporter->errors[i].message);
     free(reporter->errors[i].suggestion);
     free(reporter->errors[i].code_snippet);
+    free(reporter->errors[i].span_label);
   }
 
   for (size_t i = 0; i < reporter->source_count; i++) {
@@ -311,11 +313,40 @@ void error_reporter_add_error_with_suggestion(ErrorReporter *reporter,
                                                     message, suggestion);
 }
 
+/* A later diagnostic at the same spot is almost always a cascade of the
+   first (parser retries, re-checks after recovery). Suppress: exact
+   duplicates everywhere, and any second syntax error at one location. */
+static int error_reporter_is_cascade(ErrorReporter *reporter, ErrorSeverity severity,
+                                     const SourceSpan *span, ErrorType type,
+                                     const char *filename, const char *message) {
+  if (severity == DIAG_SEVERITY_NOTE_OF)
+    return 0;
+  for (size_t i = 0; i < reporter->count; i++) {
+    const ErrorReport *e = &reporter->errors[i];
+    if (e->severity == DIAG_SEVERITY_NOTE_OF)
+      continue;
+    if (e->location.line != span->line || e->location.column != span->column)
+      continue;
+    if ((e->filename && filename && strcmp(e->filename, filename) != 0) ||
+        (!e->filename != !filename))
+      continue;
+    if (e->message && message && strcmp(e->message, message) == 0)
+      return 1;
+    if (type == ERROR_SYNTAX && e->type == ERROR_SYNTAX &&
+        e->severity == DIAG_SEVERITY_ERROR && severity == DIAG_SEVERITY_ERROR)
+      return 1;
+  }
+  return 0;
+}
+
 static void error_reporter_add_report(ErrorReporter *reporter,
                                       ErrorSeverity severity, SourceSpan span,
                                       ErrorType type, const char *message,
                                       const char *suggestion) {
-  if (!reporter || reporter->count >= reporter->max_errors)
+  if (!reporter)
+    return;
+  reporter->last_add_suppressed = 1;
+  if (reporter->count >= reporter->max_errors)
     return;
 
   if (!error_reporter_expand_capacity(reporter))
@@ -331,6 +362,11 @@ static void error_reporter_add_report(ErrorReporter *reporter,
   const char *source_code =
       source_entry ? source_entry->source_code : reporter->current_source_code;
 
+  if (error_reporter_is_cascade(reporter, severity, &span, type, filename,
+                                message))
+    return;
+  reporter->last_add_suppressed = 0;
+
   ErrorReport *error = &reporter->errors[reporter->count];
   error->type = type;
   error->severity = severity;
@@ -344,8 +380,81 @@ static void error_reporter_add_report(ErrorReporter *reporter,
   error->suggestion = suggestion ? mettle_strdup(suggestion) : NULL;
   error->code_snippet =
       error_reporter_get_line_from_source(source_code, span.line);
+  error->span_label = NULL;
 
   reporter->count++;
+}
+
+static int er_ident_char(char c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+         (c >= '0' && c <= '9') || c == '_';
+}
+
+SourceSpan error_reporter_span_snap_to_token(ErrorReporter *reporter,
+                                             SourceSpan span,
+                                             const char *token) {
+  if (!reporter || !token || token[0] == '\0' || span.line == 0)
+    return span;
+  const char *filename = span.filename ? span.filename : reporter->current_filename;
+  const ErrorReporterSource *entry =
+      filename ? error_reporter_find_source(reporter, filename) : NULL;
+  const char *source =
+      entry ? entry->source_code : reporter->current_source_code;
+  char *line = error_reporter_get_line_from_source(source, span.line);
+  if (!line)
+    return span;
+  size_t token_len = strlen(token);
+  size_t line_len = strlen(line);
+  size_t start = (span.column > 0) ? span.column - 1 : 0;
+  if (start > line_len)
+    start = 0;
+  const char *p = line + start;
+  while ((p = strstr(p, token)) != NULL) {
+    int left_ok = (p == line) || !er_ident_char(p[-1]);
+    int right_ok = !er_ident_char(p[token_len]);
+    if (left_ok && right_ok) {
+      span.column = (size_t)(p - line) + 1;
+      span.length = token_len;
+      break;
+    }
+    p += 1;
+  }
+  free(line);
+  return span;
+}
+
+void error_reporter_refine_last(ErrorReporter *reporter, const char *message) {
+  if (!reporter || !message || reporter->count == 0 ||
+      reporter->last_add_suppressed)
+    return;
+  ErrorReport *last = &reporter->errors[reporter->count - 1];
+  if (last->severity != DIAG_SEVERITY_ERROR)
+    return;
+  char *copy = mettle_strdup(message);
+  if (!copy)
+    return;
+  free(last->message);
+  last->message = copy;
+}
+
+void error_reporter_set_last_label(ErrorReporter *reporter, const char *label) {
+  if (!reporter || !label || reporter->count == 0 ||
+      reporter->last_add_suppressed)
+    return;
+  ErrorReport *last = &reporter->errors[reporter->count - 1];
+  free(last->span_label);
+  last->span_label = mettle_strdup(label);
+}
+
+void error_reporter_add_note_of_span(ErrorReporter *reporter, SourceSpan span,
+                                     const char *message) {
+  if (!reporter || !message || reporter->count == 0 ||
+      reporter->last_add_suppressed)
+    return;
+  int saved = reporter->last_add_suppressed;
+  error_reporter_add_report(reporter, DIAG_SEVERITY_NOTE_OF, span,
+                            ERROR_SEMANTIC, message, NULL);
+  reporter->last_add_suppressed = saved;
 }
 
 void error_reporter_add_error_with_span(ErrorReporter *reporter, ErrorType type,
@@ -383,9 +492,113 @@ void error_reporter_add_warning_with_suggestion(ErrorReporter *reporter,
                             message, suggestion);
 }
 
+static int g_error_format_json = 0;
+
+void error_reporter_set_format_json(int enabled) {
+  g_error_format_json = enabled;
+}
+
+int error_reporter_format_json(void) { return g_error_format_json; }
+
+/* Emit a JSON string literal (with escaping) to the diagnostic stream. */
+static void diag_json_string(const char *s) {
+  fputc('"', DIAG_STREAM);
+  for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++) {
+    switch (*p) {
+    case '"':  fputs("\\\"", DIAG_STREAM); break;
+    case '\\': fputs("\\\\", DIAG_STREAM); break;
+    case '\n': fputs("\\n", DIAG_STREAM); break;
+    case '\r': fputs("\\r", DIAG_STREAM); break;
+    case '\t': fputs("\\t", DIAG_STREAM); break;
+    default:
+      if (*p < 0x20)
+        fprintf(DIAG_STREAM, "\\u%04x", *p);
+      else
+        fputc(*p, DIAG_STREAM);
+    }
+  }
+  fputc('"', DIAG_STREAM);
+}
+
+static const char *severity_json_name(ErrorSeverity s) {
+  switch (s) {
+  case DIAG_SEVERITY_ERROR:   return "error";
+  case DIAG_SEVERITY_WARNING: return "warning";
+  default:                    return "note";
+  }
+}
+
+/* One diagnostic per line (NDJSON): easy for editors/CI to stream-parse. */
+static void error_reporter_print_errors_json(ErrorReporter *reporter) {
+  for (size_t i = 0; i < reporter->count; i++) {
+    const ErrorReport *e = &reporter->errors[i];
+    if (e->severity == DIAG_SEVERITY_NOTE_OF)
+      continue;
+    fprintf(DIAG_STREAM, "{\"severity\":\"%s\",\"code\":\"%s\",\"message\":",
+            severity_json_name(e->severity), error_type_code(e->type));
+    diag_json_string(e->message);
+    fprintf(DIAG_STREAM, ",\"file\":");
+    diag_json_string(e->filename ? e->filename : "");
+    fprintf(DIAG_STREAM, ",\"line\":%zu,\"column\":%zu,\"length\":%zu",
+            e->location.line, e->location.column,
+            e->span.length > 0 ? e->span.length : 1);
+    if (e->span_label) {
+      fprintf(DIAG_STREAM, ",\"label\":");
+      diag_json_string(e->span_label);
+    }
+    if (e->suggestion) {
+      fprintf(DIAG_STREAM, ",\"help\":");
+      diag_json_string(e->suggestion);
+    }
+    fprintf(DIAG_STREAM, ",\"notes\":[");
+    int first_note = 1;
+    for (size_t j = i + 1;
+         j < reporter->count &&
+         reporter->errors[j].severity == DIAG_SEVERITY_NOTE_OF;
+         j++) {
+      const ErrorReport *n = &reporter->errors[j];
+      if (!first_note)
+        fputc(',', DIAG_STREAM);
+      first_note = 0;
+      fprintf(DIAG_STREAM, "{\"message\":");
+      diag_json_string(n->message);
+      fprintf(DIAG_STREAM, ",\"file\":");
+      diag_json_string(n->filename ? n->filename : "");
+      fprintf(DIAG_STREAM, ",\"line\":%zu,\"column\":%zu,\"length\":%zu}",
+              n->location.line, n->location.column,
+              n->span.length > 0 ? n->span.length : 1);
+    }
+    fprintf(DIAG_STREAM, "]}\n");
+  }
+}
+
+int error_reporter_get_warning_count(ErrorReporter *reporter) {
+  if (!reporter)
+    return 0;
+  int count = 0;
+  for (size_t i = 0; i < reporter->count; i++) {
+    if (reporter->errors[i].severity == DIAG_SEVERITY_WARNING)
+      count++;
+  }
+  return count;
+}
+
+void error_reporter_add_warning_span_suggestion(ErrorReporter *reporter,
+                                                ErrorType type, SourceSpan span,
+                                                const char *message,
+                                                const char *suggestion) {
+  error_reporter_add_report(reporter, DIAG_SEVERITY_WARNING, span, type,
+                            message, suggestion);
+}
+
 void error_reporter_print_errors(ErrorReporter *reporter) {
   if (!reporter)
     return;
+
+  if (g_error_format_json) {
+    error_reporter_print_errors_json(reporter);
+    return;
+  }
 
   for (size_t i = 0; i < reporter->count; i++) {
     const ErrorReport *e = &reporter->errors[i];
@@ -402,6 +615,34 @@ void error_reporter_print_errors(ErrorReporter *reporter) {
     }
     if (i < reporter->count - 1) {
       fprintf(DIAG_STREAM, "\n");
+    }
+  }
+
+  int error_count = error_reporter_get_error_count(reporter);
+  if (error_count > 0) {
+    const int use_color = error_reporter_should_use_color();
+    const char *bold_red = use_color ? ANSI_COLOR_RED ANSI_BOLD : "";
+    const char *cyan = use_color ? ANSI_COLOR_CYAN : "";
+    const char *reset = use_color ? ANSI_COLOR_RESET : "";
+    int warning_count = error_reporter_get_warning_count(reporter);
+    fprintf(DIAG_STREAM, "\n%serror%s: could not compile", bold_red, reset);
+    if (reporter->filename)
+      fprintf(DIAG_STREAM, " `%s`", reporter->filename);
+    fprintf(DIAG_STREAM, " due to %d previous error%s", error_count,
+            error_count == 1 ? "" : "s");
+    if (warning_count > 0)
+      fprintf(DIAG_STREAM, "; %d warning%s emitted", warning_count,
+              warning_count == 1 ? "" : "s");
+    fprintf(DIAG_STREAM, "\n");
+
+    /* Point at the first error's code for the explain command */
+    for (size_t i = 0; i < reporter->count; i++) {
+      if (reporter->errors[i].severity == DIAG_SEVERITY_ERROR) {
+        fprintf(DIAG_STREAM,
+                "%shelp%s: for more about this error, run `mettle explain %s`\n",
+                cyan, reset, error_type_code(reporter->errors[i].type));
+        break;
+      }
     }
   }
 }
@@ -464,18 +705,44 @@ void error_reporter_print_error(ErrorReporter *reporter,
   reset     = use_color ? ANSI_COLOR_RESET : "";
   help_color = use_color ? ANSI_COLOR_CYAN : "";
 
-  /* Header: "error[E0002]: message" */
-  fprintf(DIAG_STREAM, "%s%s[%s]%s: %s\n",
-          severity_color, severity_text,
-          error_type_code(error->type),
-          reset, error->message);
+  /* Header: "error[E0002]: message" (notes carry no code) */
+  if (error->severity == DIAG_SEVERITY_NOTE ||
+      error->severity == DIAG_SEVERITY_NOTE_OF) {
+    fprintf(DIAG_STREAM, "%s%s%s: %s\n", severity_color, severity_text, reset,
+            error->message);
+  } else {
+    fprintf(DIAG_STREAM, "%s%s[%s]%s: %s\n",
+            severity_color, severity_text,
+            error_type_code(error->type),
+            reset, error->message);
+  }
 
   /* Location */
   if (error->severity == DIAG_SEVERITY_NOTE_OF ||
       error->severity == DIAG_SEVERITY_NOTE) {
-    /* Notes: indent slightly to show they belong to the parent */
+    /* Notes with a snippet render a compact location+snippet like errors do
+       (below); bare notes just name the location. */
     const char *filename = error->filename ? error->filename : reporter->filename;
-    if (filename) {
+    if (error->code_snippet) {
+      if (filename) {
+        fprintf(DIAG_STREAM, "  --> %s:%zu:%zu\n", filename,
+                error->location.line, error->location.column);
+      }
+      size_t gutter_width = error_reporter_count_digits(error->location.line);
+      char *snippet = snippet_truncate(error->code_snippet);
+      fprintf(DIAG_STREAM, "%*s |\n", (int)gutter_width, "");
+      fprintf(DIAG_STREAM, "%*zu | %s\n", (int)gutter_width,
+              error->location.line, snippet ? snippet : "");
+      size_t caret_len = (error->span.length > 0) ? error->span.length : 1;
+      char *caret_line =
+          error_reporter_create_caret_line(error->location.column, caret_len);
+      if (caret_line) {
+        fprintf(DIAG_STREAM, "%*s | %s%s%s\n", (int)gutter_width, "",
+                severity_color, caret_line, reset);
+        free(caret_line);
+      }
+      free(snippet);
+    } else if (filename) {
       fprintf(DIAG_STREAM, "   = %snote%s at %s:%zu:%zu\n",
               help_color, reset,
               filename, error->location.line, error->location.column);
@@ -535,8 +802,13 @@ void error_reporter_print_error(ErrorReporter *reporter,
     char *caret_line =
         error_reporter_create_caret_line(error->location.column, caret_len);
     if (caret_line) {
-      fprintf(DIAG_STREAM, "%*s | %s%s%s\n", (int)gutter_width, "",
-              severity_color, caret_line, reset);
+      if (error->span_label) {
+        fprintf(DIAG_STREAM, "%*s | %s%s %s%s\n", (int)gutter_width, "",
+                severity_color, caret_line, error->span_label, reset);
+      } else {
+        fprintf(DIAG_STREAM, "%*s | %s%s%s\n", (int)gutter_width, "",
+                severity_color, caret_line, reset);
+      }
       free(caret_line);
     }
 

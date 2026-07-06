@@ -1,5 +1,5 @@
 // int64 assigned to int32 local — truncate correctly, no adjacent corruption
-function main() -> int32 {
+fn main() -> int32 {
   var before: int32 = 111;
   var wide: int64 = 0x100000001;
   var narrow: int32 = wide;

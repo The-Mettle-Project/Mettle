@@ -1,8 +1,8 @@
-function null_i64_ptr() -> int64* {
+fn null_i64_ptr() -> int64* {
   return (int64*)0;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var wide: int64 = 257;
   var small: int8 = (int8)wide;
   if (small != 1) {

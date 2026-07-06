@@ -1334,6 +1334,8 @@ typedef struct {
   int has_iota;
   int overflow; /* a table limit was exceeded -> refuse */
   int resolve_depth; /* body-local substitution recursion guard */
+  int iota_bound_known; /* the loop's trip count is a compile-time constant */
+  long long iota_bound; /* that constant (iv ranges over [0, iota_bound)) */
 } VLoopDag;
 
 #define VLOOP_MAX_RESOLVE_DEPTH 16
@@ -1552,6 +1554,64 @@ static int vloop_build(IRFunction *function, size_t before, const IROperand *op,
     d->has_iota = 1;
     return vloop_add_node(d, VLOOP_VN_IOTA, 0, 0);
   }
+  /* (float64)(C +/- iv) / (float64)(iv +/- C): an INTEGER affine function of the
+   * induction var cast to float64. Sound to evaluate in the f64 domain as
+   * `IOTA +/- (float64)C` because every int32 value (and the int32 sum/difference
+   * when it does not overflow) is exactly representable in float64, so the f64
+   * op is bit-identical to casting the integer result. Gated to float64 (the
+   * equivalence fails for float32 once |value| >= 2^24) and to a compile-time
+   * trip count, so the no-overflow range check is decidable. */
+  if (p->op == IR_OP_CAST && !p->is_float && p->text && d->width_bits == 64 &&
+      vloop_text_is_float_width(p->text, d->width_bits) && d->iota_bound_known &&
+      d->iota_bound > 0 &&
+      (p->lhs.kind == IR_OPERAND_TEMP || p->lhs.kind == IR_OPERAND_SYMBOL)) {
+    const IRInstruction *q = ir_i2f_resolve_producer(function, pidx, &p->lhs);
+    if (q && q->op == IR_OP_BINARY && !q->is_float && q->text &&
+        (strcmp(q->text, "+") == 0 || strcmp(q->text, "-") == 0)) {
+      int is_sub = strcmp(q->text, "-") == 0;
+      int iv_left = ir_operand_is_symbol_named(&q->lhs, iv);
+      int iv_right = ir_operand_is_symbol_named(&q->rhs, iv);
+      long long C = 0;
+      int have = 0, on_left = 0;
+      if (iv_left && q->rhs.kind == IR_OPERAND_INT) {
+        C = q->rhs.int_value; have = 1; on_left = 1;
+      } else if (iv_right && q->lhs.kind == IR_OPERAND_INT) {
+        C = q->lhs.int_value; have = 1; on_left = 0;
+      }
+      if (have) {
+        long long hi = d->iota_bound - 1; /* max iv */
+        long long rmin, rmax;
+        if (on_left) { /* iv (+/-) C */
+          rmin = is_sub ? -C : C;
+          rmax = is_sub ? hi - C : hi + C;
+        } else { /* C (+/-) iv */
+          rmin = is_sub ? C - hi : C;
+          rmax = is_sub ? C : C + hi;
+        }
+        if (rmin >= -2147483648LL && rmax <= 2147483647LL) {
+          int tag = vloop_binop_tag(q->text);
+          int ci = vloop_intern_const(d, (double)C);
+          if (tag < 0 || ci < 0) return -1;
+          /* The kernel is a postorder stack machine: a binary node pops the two
+           * most-recently built results as (left, right) and computes left OP
+           * right. So build the LEFT operand first to preserve subtraction order
+           * (`iv - C` vs `C - iv`). */
+          int a, b;
+          if (on_left) { /* iv OP C : left = iota */
+            d->has_iota = 1;
+            a = vloop_add_node(d, VLOOP_VN_IOTA, 0, 0);
+            b = vloop_add_node(d, VLOOP_VN_CONST, ci, 0);
+          } else { /* C OP iv : left = const */
+            a = vloop_add_node(d, VLOOP_VN_CONST, ci, 0);
+            d->has_iota = 1;
+            b = vloop_add_node(d, VLOOP_VN_IOTA, 0, 0);
+          }
+          if (a < 0 || b < 0) return -1;
+          return vloop_add_node(d, tag, a, b);
+        }
+      }
+    }
+  }
   /* binary float op */
   if (p->op == IR_OP_BINARY && p->is_float && p->text) {
     int tag = vloop_binop_tag(p->text);
@@ -1753,6 +1813,10 @@ static int ir_try_vectorize_map_at(IRFunction *function, size_t header_index,
   d.width_bits = store_bits; /* 64 (float64) or 32 (float32) */
   d.body_lo = branch_index + 1;
   d.body_hi = jump_index;
+  if (bound.kind == IR_OPERAND_INT) {
+    d.iota_bound_known = 1;
+    d.iota_bound = bound.int_value;
+  }
   root = vloop_build(function, store_index, &store->lhs, iv_symbol, &d);
   if (root < 0 || d.overflow) {
     ir_operand_destroy(&bound);
@@ -1921,6 +1985,10 @@ static int ir_try_vectorize_reduce_at(IRFunction *function, size_t header_index,
   d.width_bits = width_bits; /* 64 (float64) or 32 (float32) */
   d.body_lo = branch_index + 1;
   d.body_hi = jump_index;
+  if (bound.kind == IR_OPERAND_INT) {
+    d.iota_bound_known = 1;
+    d.iota_bound = bound.int_value;
+  }
   root = vloop_build(function, reduce_index, addend, iv_symbol, &d);
   if (root < 0 || d.overflow) {
     ir_operand_destroy(&bound);
@@ -1958,11 +2026,264 @@ static int ir_try_vectorize_reduce_at(IRFunction *function, size_t header_index,
   return 1;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Multi-store map fission: a counted loop whose body is K>=2 independent       */
+/* unit-stride float stores (e.g. saxpy init `x[i]=f(i); y[i]=g(i)`). Each      */
+/* store is emitted as its own full-count IR_OP_SIMD_VLOOP_F64 -- semantically  */
+/* loop fission (all of store_1, then all of store_2) -- reusing the proven     */
+/* single-store kernel unchanged. SOUND ONLY when the destinations are disjoint */
+/* (reordering writes across the lane window is otherwise observable), so it is */
+/* gated on a conservative non-aliasing proof below.                            */
+
+#define MULTISTORE_MAX 8
+
+static int ir_msf_name_is_allocator(const char *n) {
+  if (!n) return 0;
+  static const char *const a[] = {"malloc",        "calloc",
+                                  "aligned_alloc", "_aligned_malloc",
+                                  "alloc_zeroed",  NULL};
+  for (int i = 0; a[i]; i++)
+    if (strcmp(n, a[i]) == 0) return 1;
+  return 0;
+}
+
+/* The single instruction that defines symbol/temp `name`, or -1 if there is not
+ * exactly one (a conservative "give up" for the disjointness proof). */
+static int ir_msf_single_def(IRFunction *function, const char *name,
+                             int is_symbol) {
+  int found = -1;
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    /* A SIMD array op carries the output array's base symbol as its dest by
+     * convention (`@a = simd_vloop_f64(...)`): it writes the array ELEMENTS, not
+     * the base pointer's value, so it must not count as a (re)definition of the
+     * pointer -- otherwise a sibling already-vectorized loop on the same array
+     * (e.g. saxpy's hot loop on @y) would mask its fresh-allocation provenance. */
+    if (ins->op >= IR_OP_SIMD_SUM_I32 && ins->op <= IR_OP_SIMD_LCG_U32) continue;
+    if (!ir_instruction_writes_destination(ins)) continue;
+    const IROperand *d = &ins->dest;
+    int match = is_symbol
+                    ? (d->kind == IR_OPERAND_SYMBOL && d->name && name &&
+                       strcmp(d->name, name) == 0)
+                    : (d->kind == IR_OPERAND_TEMP && d->name && name &&
+                       strcmp(d->name, name) == 0);
+    if (match) {
+      if (found >= 0) return -1;
+      found = (int)i;
+    }
+  }
+  return found;
+}
+
+/* True if `v` provably holds the result of a fresh heap allocation, following
+ * cast/assign hops through singly-defined temps (bounded depth). */
+static int ir_msf_value_is_fresh_alloc(IRFunction *function, const IROperand *v,
+                                       int depth) {
+  if (depth <= 0 || !v ||
+      (v->kind != IR_OPERAND_TEMP && v->kind != IR_OPERAND_SYMBOL)) {
+    return 0;
+  }
+  int di = ir_msf_single_def(function, v->name, v->kind == IR_OPERAND_SYMBOL);
+  if (di < 0) return 0;
+  const IRInstruction *def = &function->instructions[di];
+  if (def->op == IR_OP_NEW) return 1;
+  if (def->op == IR_OP_CALL && ir_msf_name_is_allocator(def->text)) return 1;
+  if (def->op == IR_OP_CAST || def->op == IR_OP_ASSIGN) {
+    return ir_msf_value_is_fresh_alloc(function, &def->lhs, depth - 1);
+  }
+  return 0;
+}
+
+/* Every destination is a distinct local pointer, address never taken, defined
+ * exactly once from a fresh allocation -- two distinct allocations never alias,
+ * so the per-store full-count rewrite preserves the scalar memory state. */
+static int ir_msf_bases_disjoint(IRFunction *function, const char **bases,
+                                 int k) {
+  for (int i = 0; i < k; i++) {
+    if (!bases[i]) return 0;
+    for (int j = i + 1; j < k; j++)
+      if (!bases[j] || strcmp(bases[i], bases[j]) == 0) return 0;
+  }
+  for (int i = 0; i < k; i++) {
+    if (ir_function_local_declared_type(function, bases[i]) == NULL) return 0;
+    if (ir_symbol_address_taken(function, bases[i])) return 0;
+    int di = ir_msf_single_def(function, bases[i], 1);
+    if (di < 0) return 0;
+    const IRInstruction *def = &function->instructions[di];
+    if (def->op == IR_OP_NEW) continue;
+    if (def->op == IR_OP_CALL && ir_msf_name_is_allocator(def->text)) continue;
+    if ((def->op == IR_OP_CAST || def->op == IR_OP_ASSIGN) &&
+        ir_msf_value_is_fresh_alloc(function, &def->lhs, 4)) {
+      continue;
+    }
+    return 0;
+  }
+  return 1;
+}
+
+/* Collect the store indices of a multi-store map body; require it otherwise
+ * pure (no loads -- so the only memory dependence is between the stores -- no
+ * calls/branches, and any per-iteration local does not outlive the loop). */
+static int ir_msf_body_is_safe(IRFunction *function, size_t lo, size_t hi,
+                               const char *iv_symbol, size_t *stores,
+                               int *nstores) {
+  int ns = 0;
+  for (size_t i = lo; i < hi; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_STORE) {
+      if (ns >= MULTISTORE_MAX) return 0;
+      stores[ns++] = i;
+      continue;
+    }
+    if (ins->op == IR_OP_LOAD || ins->op == IR_OP_CALL ||
+        ins->op == IR_OP_CALL_INDIRECT || ins->op == IR_OP_BRANCH_ZERO ||
+        ins->op == IR_OP_BRANCH_EQ || ins->op == IR_OP_JUMP ||
+        ins->op == IR_OP_INLINE_ASM || ins->op == IR_OP_MEMCPY_INLINE ||
+        ins->op == IR_OP_COUNT_WORD_STARTS) {
+      return 0;
+    }
+    if (ir_instruction_writes_symbol(ins) &&
+        !ir_operand_is_symbol_named(&ins->dest, iv_symbol)) {
+      if (ins->dest.kind != IR_OPERAND_SYMBOL || !ins->dest.name ||
+          ir_symbol_live_after_loop(function, hi + 1, ins->dest.name)) {
+        return 0;
+      }
+    }
+  }
+  *nstores = ns;
+  return ns >= 2;
+}
+
+/* Build the IR_OP_SIMD_VLOOP_F64 fused op for one store of a multi-store loop,
+ * mirroring the single-store path. Returns 1 (filling *fused and *dst_base) or 0
+ * to reject the whole loop. `bound` is cloned into the fused op. */
+static int ir_msf_build_store(IRFunction *function, size_t store_index,
+                              const char *iv_symbol, size_t body_lo,
+                              size_t body_hi, const IROperand *bound,
+                              IRInstruction *fused, const char **dst_base_out) {
+  const IRInstruction *store = &function->instructions[store_index];
+  const char *dst_base = NULL;
+  int store_bits = 0;
+  VLoopDag d;
+  int root, depth;
+
+  if (!store->is_float || store->dest.kind != IR_OPERAND_TEMP ||
+      !store->dest.name ||
+      (store->lhs.kind != IR_OPERAND_TEMP && store->lhs.kind != IR_OPERAND_SYMBOL &&
+       store->lhs.kind != IR_OPERAND_FLOAT) ||
+      store->rhs.kind != IR_OPERAND_INT ||
+      (store->rhs.int_value != 4 && store->rhs.int_value != 8) ||
+      !ir_decode_float_indexed_address(function, store_index, store->dest.name,
+                                       iv_symbol, &dst_base, &store_bits) ||
+      store_bits != store->rhs.int_value * 8) {
+    return 0;
+  }
+  memset(&d, 0, sizeof(d));
+  d.width_bits = store_bits;
+  d.body_lo = body_lo;
+  d.body_hi = body_hi;
+  if (bound->kind == IR_OPERAND_INT) {
+    d.iota_bound_known = 1;
+    d.iota_bound = bound->int_value;
+  }
+  root = vloop_build(function, store_index, &store->lhs, iv_symbol, &d);
+  if (root < 0 || d.overflow) return 0;
+  if (!ir_symbol_is_float_array_base(function, dst_base)) return 0;
+  for (int i = 0; i < d.n_arrays; i++) {
+    if (!ir_symbol_is_float_array_base(function, d.arrays[i])) return 0;
+  }
+  depth = vloop_eval_depth(&d, root);
+  if (depth > VLOOP_REG_BUDGET ||
+      vloop_distinct_bases(&d, dst_base) > VLOOP_MAX_ARRAYS) {
+    return 0;
+  }
+  memset(fused, 0, sizeof(*fused));
+  fused->op = IR_OP_SIMD_VLOOP_F64;
+  fused->location = store->location;
+  fused->is_float = 1;
+  fused->float_bits = store_bits;
+  fused->dest = ir_operand_symbol(dst_base);
+  if (!ir_operand_clone(bound, &fused->lhs) ||
+      !vloop_serialize_into(fused, &d, /*reduce_op=*/0, root, depth)) {
+    ir_instruction_destroy_storage(fused);
+    return 0;
+  }
+  *dst_base_out = dst_base;
+  return 1;
+}
+
+static int ir_try_vectorize_multistore_map_at(IRFunction *function,
+                                              size_t header_index,
+                                              int *changed) {
+  const char *iv_symbol = NULL;
+  size_t branch_index = 0, jump_index = 0;
+  IROperand bound = {0};
+  int matched = 0;
+  size_t stores[MULTISTORE_MAX];
+  int ns = 0;
+  IRInstruction fused[MULTISTORE_MAX];
+  const char *bases[MULTISTORE_MAX];
+  int built = 0;
+
+  if (!ir_float_reduction_frame(function, header_index, &iv_symbol,
+                                &branch_index, &jump_index, &bound, &matched)) {
+    return 0;
+  }
+  if (!matched) return 1;
+  if (!ir_msf_body_is_safe(function, branch_index + 1, jump_index, iv_symbol,
+                           stores, &ns)) {
+    ir_operand_destroy(&bound);
+    return 1;
+  }
+  if (ir_symbol_live_after_loop(function, jump_index + 1, iv_symbol)) {
+    ir_operand_destroy(&bound);
+    return 1;
+  }
+  /* Room to place ns fused ops in the loop's instruction range. */
+  if ((size_t)ns > jump_index - header_index + 1) {
+    ir_operand_destroy(&bound);
+    return 1;
+  }
+  for (built = 0; built < ns; built++) {
+    if (!ir_msf_build_store(function, stores[built], iv_symbol,
+                            branch_index + 1, jump_index, &bound, &fused[built],
+                            &bases[built])) {
+      for (int k = 0; k < built; k++) ir_instruction_destroy_storage(&fused[k]);
+      ir_operand_destroy(&bound);
+      return 1;
+    }
+  }
+  if (!ir_msf_bases_disjoint(function, bases, ns)) {
+    for (int k = 0; k < ns; k++) ir_instruction_destroy_storage(&fused[k]);
+    ir_operand_destroy(&bound);
+    return 1;
+  }
+  /* Commit: one full-count store-kernel per destination, then NOP the loop. */
+  for (int k = 0; k < ns; k++) {
+    ir_instruction_destroy_storage(&function->instructions[header_index + k]);
+    function->instructions[header_index + k] = fused[k];
+  }
+  for (size_t i = header_index + ns; i <= jump_index; i++) {
+    ir_instruction_make_nop(&function->instructions[i]);
+  }
+  ir_operand_destroy(&bound);
+  *changed = 1;
+  return 1;
+}
+
 int ir_auto_vectorize_pass(IRFunction *function, int *changed) {
   if (!function) {
     return 0;
   }
   for (size_t i = 0; i < function->instruction_count; i++) {
+    /* Multi-store map fission runs first: it claims K>=2 store loops the
+     * single-store recognizer would reject, lowering each to its own kernel. */
+    if (function->instructions[i].op == IR_OP_LABEL &&
+        ir_label_is_while_header(function->instructions[i].text)) {
+      if (!ir_try_vectorize_multistore_map_at(function, i, changed)) {
+        return 0;
+      }
+    }
     if (function->instructions[i].op == IR_OP_LABEL &&
         ir_label_is_while_header(function->instructions[i].text)) {
       if (!ir_try_vectorize_map_at(function, i, changed)) {

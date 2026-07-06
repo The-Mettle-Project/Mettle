@@ -1,0 +1,6 @@
+// (240 | 15) & 255 -> 255. Bitwise or/and.
+fn main() -> int64 {
+  var x: int64 = 240;
+  var y: int64 = 15;
+  return (x | y) & 255;
+}

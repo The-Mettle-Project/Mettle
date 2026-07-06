@@ -3,7 +3,7 @@ enum DbError {
     NotFound = 1
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     var e: DbError = DbError.NoError;
     switch (e) {
         case DbError.NoError:

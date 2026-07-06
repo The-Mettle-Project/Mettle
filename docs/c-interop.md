@@ -4,13 +4,13 @@ Mettle can call C functions and access C globals, but Windows programs should pr
 
 ## Calling C Functions
 
-Declare C functions with `extern function`. Use the `= "symbol"` suffix to specify the C link name when it differs from the Mettle name. Parameters and return types must match the target ABI. On Windows, the Microsoft x64 ABI applies. On Linux and macOS, the System V AMD64 ABI applies.
+Declare C functions with `extern fn`. Use the `= "symbol"` suffix to specify the C link name when it differs from the Mettle name. Parameters and return types must match the target ABI. On Windows, the Microsoft x64 ABI applies. On Linux and macOS, the System V AMD64 ABI applies.
 
 ```mettle
-extern function puts(msg: cstring) -> int32 = "puts";
-extern function malloc(size: int64) -> cstring = "malloc";
+extern fn puts(msg: cstring) -> int32 = "puts";
+extern fn malloc(size: int64) -> cstring = "malloc";
 
-function main() -> int32 {
+fn main() -> int32 {
   puts("Hello");
   var p: cstring = malloc(100);
   return 0;
@@ -24,7 +24,7 @@ For Win32 APIs, import `std/win32` instead of repeating raw extern declarations:
 ```mettle
 import "std/win32";
 
-function main() -> int32 {
+fn main() -> int32 {
   win32_write_stdout("hello\n", 6);
   win32_sleep_ms(10);
   return 0;

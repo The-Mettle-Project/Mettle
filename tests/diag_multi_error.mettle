@@ -1,0 +1,7 @@
+fn main() -> int64 {
+    var a: int64 = "one";
+    var b: int64 = "two";
+    var c: int64 = missing1;
+    var d: int64 = missing2;
+    return a + b + c + d;
+}

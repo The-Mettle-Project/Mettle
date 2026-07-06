@@ -10,7 +10,7 @@ import "std/io";
 import "std/mem";
 import "std/bench";
 
-function byte_hash(buf: cstring, len: int64) -> int64 {
+fn byte_hash(buf: cstring, len: int64) -> int64 {
   var hash: int64 = 5381;
   var i: int64 = 0;
   while (i < len) {
@@ -21,7 +21,7 @@ function byte_hash(buf: cstring, len: int64) -> int64 {
   return hash;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var buf_size: int64 = 262144;
   var template: string = "a b c d e f g h ";
   var template_len: int64 = 16;

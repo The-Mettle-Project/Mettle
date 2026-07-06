@@ -1,32 +1,32 @@
-extern function printf(fmt: cstring, v: int64) -> int32 = "printf";
+extern fn printf(fmt: cstring, v: int64) -> int32 = "printf";
 
-function fill32(buf: uint32*, n: int32, c: uint32) {
+fn fill32(buf: uint32*, n: int32, c: uint32) {
     var i: int32 = 0;
     while (i < n) { buf[i] = c; i = i + 1; }
 }
-function fill8(p: uint8*, n: int64, v: uint8) {
+fn fill8(p: uint8*, n: int64, v: uint8) {
     var i: int64 = 0;
     while (i < n) { p[i] = v; i = i + 1; }
 }
-function fill16(p: int16*, n: int32, v: int16) {
+fn fill16(p: int16*, n: int32, v: int16) {
     var i: int32 = 0;
     while (i < n) { p[i] = v; i = i + 1; }
 }
-function fill64(p: int64*, n: int32, v: int64) {
+fn fill64(p: int64*, n: int32, v: int64) {
     var i: int32 = 0;
     while (i < n) { p[i] = v; i = i + 1; }
 }
-function fillf32(p: float32*, n: int32) {
+fn fillf32(p: float32*, n: int32) {
     for i in 0..n { p[i] = 2.5; }
 }
-function fillf64(p: float64*, n: int32, v: float64) {
+fn fillf64(p: float64*, n: int32, v: float64) {
     for i in 0..n { p[i] = v; }
 }
-function zero32(buf: int32*, n: int32) {
+fn zero32(buf: int32*, n: int32) {
     for i in 0..n { buf[i] = 0; }
 }
 
-function checksum(p: uint8*, n: int32) -> int64 {
+fn checksum(p: uint8*, n: int32) -> int64 {
     var s: int64 = 0;
     var i: int32 = 0;
     while (i < n) {
@@ -37,7 +37,7 @@ function checksum(p: uint8*, n: int32) -> int64 {
 }
 
 
-function rect_fill(px: uint32*, fw: int32, x0: int32, y0: int32, x1: int32, y1: int32, c: uint32) {
+fn rect_fill(px: uint32*, fw: int32, x0: int32, y0: int32, x1: int32, y1: int32, c: uint32) {
     var yy: int32 = y0;
     while (yy < y1) {
         var row: int32 = yy * fw;
@@ -49,7 +49,7 @@ function rect_fill(px: uint32*, fw: int32, x0: int32, y0: int32, x1: int32, y1: 
         yy = yy + 1;
     }
 }
-function mz(p: cstring, n: int64) {
+fn mz(p: cstring, n: int64) {
     var d: int64 = (int64)p;
     var i: int64 = 0;
     var words: int64 = n & ~(int64)7;
@@ -62,7 +62,7 @@ function mz(p: cstring, n: int64) {
         i = i + (int64)1;
     }
 }
-function part2() -> int64 {
+fn part2() -> int64 {
     var fb: uint32[256];
     var total: int64 = 0;
     var k: int32 = 0;
@@ -90,7 +90,7 @@ function part2() -> int64 {
     }
     return total;
 }
-function main() -> int32 {
+fn main() -> int32 {
     var b: uint8[1024];
     var total: int64 = 0;
     // guard bytes around each region get a sentinel; fills must not touch them

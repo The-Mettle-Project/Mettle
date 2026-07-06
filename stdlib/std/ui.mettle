@@ -120,226 +120,229 @@ export struct UiFontConfig {
 }
 
 // Window and message constants.
-export function UI_WM_NULL() -> uint32 { return 0; }
-export function UI_WM_CREATE() -> uint32 { return 1; }
-export function UI_WM_DESTROY() -> uint32 { return 2; }
-export function UI_WM_MOVE() -> uint32 { return 3; }
-export function UI_WM_SIZE() -> uint32 { return 5; }
-export function UI_WM_SETFOCUS() -> uint32 { return 7; }
-export function UI_WM_KILLFOCUS() -> uint32 { return 8; }
-export function UI_WM_ENABLE() -> uint32 { return 10; }
-export function UI_WM_SETTEXT() -> uint32 { return 12; }
-export function UI_WM_GETTEXT() -> uint32 { return 13; }
-export function UI_WM_GETTEXTLENGTH() -> uint32 { return 14; }
-export function UI_WM_PAINT() -> uint32 { return 15; }
-export function UI_WM_CLOSE() -> uint32 { return 16; }
-export function UI_WM_QUIT() -> uint32 { return 18; }
-export function UI_WM_ERASEBKGND() -> uint32 { return 20; }
-export function UI_WM_SHOWWINDOW() -> uint32 { return 24; }
-export function UI_WM_SETFONT() -> uint32 { return 48; }
-export function UI_WM_GETFONT() -> uint32 { return 49; }
-export function UI_WM_TIMER() -> uint32 { return 275; }
-export function UI_WM_COMMAND() -> uint32 { return 273; }
-export function UI_WM_HSCROLL() -> uint32 { return 276; }
-export function UI_WM_VSCROLL() -> uint32 { return 277; }
-export function UI_WM_KEYDOWN() -> uint32 { return 256; }
-export function UI_WM_KEYUP() -> uint32 { return 257; }
-export function UI_WM_CHAR() -> uint32 { return 258; }
-export function UI_WM_MOUSEMOVE() -> uint32 { return 512; }
-export function UI_WM_LBUTTONDOWN() -> uint32 { return 513; }
-export function UI_WM_LBUTTONUP() -> uint32 { return 514; }
-export function UI_WM_LBUTTONDBLCLK() -> uint32 { return 515; }
-export function UI_WM_RBUTTONDOWN() -> uint32 { return 516; }
-export function UI_WM_RBUTTONUP() -> uint32 { return 517; }
-export function UI_WM_MOUSEWHEEL() -> uint32 { return 522; }
+export fn UI_WM_NULL() -> uint32 { return 0; }
+export fn UI_WM_CREATE() -> uint32 { return 1; }
+export fn UI_WM_DESTROY() -> uint32 { return 2; }
+export fn UI_WM_MOVE() -> uint32 { return 3; }
+export fn UI_WM_SIZE() -> uint32 { return 5; }
+export fn UI_WM_SETFOCUS() -> uint32 { return 7; }
+export fn UI_WM_KILLFOCUS() -> uint32 { return 8; }
+export fn UI_WM_ENABLE() -> uint32 { return 10; }
+export fn UI_WM_SETTEXT() -> uint32 { return 12; }
+export fn UI_WM_GETTEXT() -> uint32 { return 13; }
+export fn UI_WM_GETTEXTLENGTH() -> uint32 { return 14; }
+export fn UI_WM_PAINT() -> uint32 { return 15; }
+export fn UI_WM_CLOSE() -> uint32 { return 16; }
+export fn UI_WM_QUIT() -> uint32 { return 18; }
+export fn UI_WM_ERASEBKGND() -> uint32 { return 20; }
+export fn UI_WM_SHOWWINDOW() -> uint32 { return 24; }
+export fn UI_WM_SETFONT() -> uint32 { return 48; }
+export fn UI_WM_GETFONT() -> uint32 { return 49; }
+export fn UI_WM_TIMER() -> uint32 { return 275; }
+export fn UI_WM_COMMAND() -> uint32 { return 273; }
+export fn UI_WM_HSCROLL() -> uint32 { return 276; }
+export fn UI_WM_VSCROLL() -> uint32 { return 277; }
+export fn UI_WM_KEYDOWN() -> uint32 { return 256; }
+export fn UI_WM_KEYUP() -> uint32 { return 257; }
+export fn UI_WM_CHAR() -> uint32 { return 258; }
+export fn UI_WM_MOUSEMOVE() -> uint32 { return 512; }
+export fn UI_WM_LBUTTONDOWN() -> uint32 { return 513; }
+export fn UI_WM_LBUTTONUP() -> uint32 { return 514; }
+export fn UI_WM_LBUTTONDBLCLK() -> uint32 { return 515; }
+export fn UI_WM_RBUTTONDOWN() -> uint32 { return 516; }
+export fn UI_WM_RBUTTONUP() -> uint32 { return 517; }
+export fn UI_WM_MOUSEWHEEL() -> uint32 { return 522; }
 
-export function UI_SIZE_RESTORED() -> uint32 { return 0; }
-export function UI_SIZE_MINIMIZED() -> uint32 { return 1; }
-export function UI_SIZE_MAXIMIZED() -> uint32 { return 2; }
+export fn UI_SIZE_RESTORED() -> uint32 { return 0; }
+export fn UI_SIZE_MINIMIZED() -> uint32 { return 1; }
+export fn UI_SIZE_MAXIMIZED() -> uint32 { return 2; }
 
-export function UI_WS_OVERLAPPED() -> uint32 { return 0; }
-export function UI_WS_CAPTION() -> uint32 { return 0x00C00000; }
-export function UI_WS_SYSMENU() -> uint32 { return 0x00080000; }
-export function UI_WS_THICKFRAME() -> uint32 { return 0x00040000; }
-export function UI_WS_MINIMIZEBOX() -> uint32 { return 0x00020000; }
-export function UI_WS_MAXIMIZEBOX() -> uint32 { return 0x00010000; }
-export function UI_WS_OVERLAPPEDWINDOW() -> uint32 { return 0x00CF0000; }
-export function UI_WS_VISIBLE() -> uint32 { return 0x10000000; }
-export function UI_WS_DISABLED() -> uint32 { return 0x08000000; }
-export function UI_WS_CHILD() -> uint32 { return 0x40000000; }
-export function UI_WS_TABSTOP() -> uint32 { return 0x00010000; }
-export function UI_WS_GROUP() -> uint32 { return 0x00020000; }
-export function UI_WS_BORDER() -> uint32 { return 0x00800000; }
-export function UI_WS_VSCROLL() -> uint32 { return 0x00200000; }
-export function UI_WS_HSCROLL() -> uint32 { return 0x00100000; }
+export fn UI_WS_OVERLAPPED() -> uint32 { return 0; }
+export fn UI_WS_CAPTION() -> uint32 { return 0x00C00000; }
+export fn UI_WS_SYSMENU() -> uint32 { return 0x00080000; }
+export fn UI_WS_THICKFRAME() -> uint32 { return 0x00040000; }
+export fn UI_WS_MINIMIZEBOX() -> uint32 { return 0x00020000; }
+export fn UI_WS_MAXIMIZEBOX() -> uint32 { return 0x00010000; }
+export fn UI_WS_OVERLAPPEDWINDOW() -> uint32 { return 0x00CF0000; }
+export fn UI_WS_VISIBLE() -> uint32 { return 0x10000000; }
+export fn UI_WS_DISABLED() -> uint32 { return 0x08000000; }
+export fn UI_WS_CHILD() -> uint32 { return 0x40000000; }
+export fn UI_WS_CLIPCHILDREN() -> uint32 { return 0x02000000; }
+export fn UI_WS_CLIPSIBLINGS() -> uint32 { return 0x04000000; }
+export fn UI_WS_TABSTOP() -> uint32 { return 0x00010000; }
+export fn UI_WS_GROUP() -> uint32 { return 0x00020000; }
+export fn UI_WS_BORDER() -> uint32 { return 0x00800000; }
+export fn UI_WS_VSCROLL() -> uint32 { return 0x00200000; }
+export fn UI_WS_HSCROLL() -> uint32 { return 0x00100000; }
 
-export function UI_WS_EX_CLIENTEDGE() -> uint32 { return 0x00000200; }
-export function UI_WS_EX_APPWINDOW() -> uint32 { return 0x00040000; }
-export function UI_WS_EX_CONTROLPARENT() -> uint32 { return 0x00010000; }
+export fn UI_WS_EX_CLIENTEDGE() -> uint32 { return 0x00000200; }
+export fn UI_WS_EX_APPWINDOW() -> uint32 { return 0x00040000; }
+export fn UI_WS_EX_CONTROLPARENT() -> uint32 { return 0x00010000; }
 
-export function UI_SW_HIDE() -> int32 { return 0; }
-export function UI_SW_SHOWNORMAL() -> int32 { return 1; }
-export function UI_SW_SHOW() -> int32 { return 5; }
+export fn UI_SW_HIDE() -> int32 { return 0; }
+export fn UI_SW_SHOWNORMAL() -> int32 { return 1; }
+export fn UI_SW_SHOW() -> int32 { return 5; }
 
-export function UI_SWP_NOSIZE() -> uint32 { return 0x0001; }
-export function UI_SWP_NOMOVE() -> uint32 { return 0x0002; }
-export function UI_SWP_NOZORDER() -> uint32 { return 0x0004; }
-export function UI_SWP_NOACTIVATE() -> uint32 { return 0x0010; }
+export fn UI_SWP_NOSIZE() -> uint32 { return 0x0001; }
+export fn UI_SWP_NOMOVE() -> uint32 { return 0x0002; }
+export fn UI_SWP_NOZORDER() -> uint32 { return 0x0004; }
+export fn UI_SWP_NOACTIVATE() -> uint32 { return 0x0010; }
 
-export function UI_CS_HREDRAW() -> uint32 { return 0x0001; }
-export function UI_CS_VREDRAW() -> uint32 { return 0x0002; }
-export function UI_CS_DBLCLKS() -> uint32 { return 0x0008; }
+export fn UI_CS_HREDRAW() -> uint32 { return 0x0001; }
+export fn UI_CS_VREDRAW() -> uint32 { return 0x0002; }
+export fn UI_CS_DBLCLKS() -> uint32 { return 0x0008; }
 
-export function UI_COLOR_WINDOW() -> int32 { return 5; }
-export function UI_COLOR_BTNFACE() -> int32 { return 15; }
-export function UI_COLOR_BTNTEXT() -> int32 { return 18; }
-export function UI_COLOR_GRAYTEXT() -> int32 { return 17; }
-export function UI_IDC_ARROW() -> int32 { return 32512; }
-export function UI_IDI_APPLICATION() -> int32 { return 32512; }
+export fn UI_COLOR_WINDOW() -> int32 { return 5; }
+export fn UI_COLOR_BTNFACE() -> int32 { return 15; }
+export fn UI_COLOR_BTNTEXT() -> int32 { return 18; }
+export fn UI_COLOR_GRAYTEXT() -> int32 { return 17; }
+export fn UI_IDC_ARROW() -> int32 { return 32512; }
+export fn UI_IDI_APPLICATION() -> int32 { return 32512; }
 
-export function UI_BS_PUSHBUTTON() -> uint32 { return 0; }
-export function UI_BS_DEFPUSHBUTTON() -> uint32 { return 1; }
-export function UI_BS_CHECKBOX() -> uint32 { return 2; }
-export function UI_BS_AUTOCHECKBOX() -> uint32 { return 3; }
-export function UI_BS_RADIOBUTTON() -> uint32 { return 4; }
-export function UI_BS_GROUPBOX() -> uint32 { return 7; }
-export function UI_BS_AUTORADIOBUTTON() -> uint32 { return 9; }
+export fn UI_BS_PUSHBUTTON() -> uint32 { return 0; }
+export fn UI_BS_DEFPUSHBUTTON() -> uint32 { return 1; }
+export fn UI_BS_CHECKBOX() -> uint32 { return 2; }
+export fn UI_BS_AUTOCHECKBOX() -> uint32 { return 3; }
+export fn UI_BS_RADIOBUTTON() -> uint32 { return 4; }
+export fn UI_BS_GROUPBOX() -> uint32 { return 7; }
+export fn UI_BS_AUTORADIOBUTTON() -> uint32 { return 9; }
 
-export function UI_SS_LEFT() -> uint32 { return 0; }
-export function UI_SS_CENTER() -> uint32 { return 1; }
-export function UI_SS_RIGHT() -> uint32 { return 2; }
-export function UI_SS_CENTERIMAGE() -> uint32 { return 0x00000200; }
+export fn UI_SS_LEFT() -> uint32 { return 0; }
+export fn UI_SS_CENTER() -> uint32 { return 1; }
+export fn UI_SS_RIGHT() -> uint32 { return 2; }
+export fn UI_SS_CENTERIMAGE() -> uint32 { return 0x00000200; }
 
-export function UI_ES_LEFT() -> uint32 { return 0; }
-export function UI_ES_CENTER() -> uint32 { return 1; }
-export function UI_ES_RIGHT() -> uint32 { return 2; }
-export function UI_ES_MULTILINE() -> uint32 { return 4; }
-export function UI_ES_PASSWORD() -> uint32 { return 32; }
-export function UI_ES_AUTOVSCROLL() -> uint32 { return 64; }
-export function UI_ES_AUTOHSCROLL() -> uint32 { return 128; }
-export function UI_ES_READONLY() -> uint32 { return 2048; }
-export function UI_ES_NUMBER() -> uint32 { return 8192; }
+export fn UI_ES_LEFT() -> uint32 { return 0; }
+export fn UI_ES_CENTER() -> uint32 { return 1; }
+export fn UI_ES_RIGHT() -> uint32 { return 2; }
+export fn UI_ES_MULTILINE() -> uint32 { return 4; }
+export fn UI_ES_PASSWORD() -> uint32 { return 32; }
+export fn UI_ES_AUTOVSCROLL() -> uint32 { return 64; }
+export fn UI_ES_AUTOHSCROLL() -> uint32 { return 128; }
+export fn UI_ES_READONLY() -> uint32 { return 2048; }
+export fn UI_ES_NUMBER() -> uint32 { return 8192; }
 
-export function UI_LBS_NOTIFY() -> uint32 { return 1; }
-export function UI_CBS_DROPDOWN() -> uint32 { return 2; }
-export function UI_CBS_DROPDOWNLIST() -> uint32 { return 3; }
-export function UI_CBS_AUTOHSCROLL() -> uint32 { return 64; }
+export fn UI_LBS_NOTIFY() -> uint32 { return 1; }
+export fn UI_CBS_DROPDOWN() -> uint32 { return 2; }
+export fn UI_CBS_DROPDOWNLIST() -> uint32 { return 3; }
+export fn UI_CBS_AUTOHSCROLL() -> uint32 { return 64; }
 
-export function UI_BN_CLICKED() -> uint32 { return 0; }
-export function UI_LBN_SELCHANGE() -> uint32 { return 1; }
-export function UI_CBN_SELCHANGE() -> uint32 { return 1; }
+export fn UI_BN_CLICKED() -> uint32 { return 0; }
+export fn UI_LBN_SELCHANGE() -> uint32 { return 1; }
+export fn UI_CBN_SELCHANGE() -> uint32 { return 1; }
 
-export function UI_BM_GETCHECK() -> uint32 { return 240; }
-export function UI_BM_SETCHECK() -> uint32 { return 241; }
-export function UI_BST_UNCHECKED() -> int32 { return 0; }
-export function UI_BST_CHECKED() -> int32 { return 1; }
+export fn UI_BM_GETCHECK() -> uint32 { return 240; }
+export fn UI_BM_SETCHECK() -> uint32 { return 241; }
+export fn UI_BST_UNCHECKED() -> int32 { return 0; }
+export fn UI_BST_CHECKED() -> int32 { return 1; }
 
-export function UI_LB_ADDSTRING() -> uint32 { return 384; }
-export function UI_LB_GETCURSEL() -> uint32 { return 392; }
-export function UI_LB_SETCURSEL() -> uint32 { return 390; }
-export function UI_LB_RESETCONTENT() -> uint32 { return 388; }
-export function UI_LB_ERR() -> int32 { return -1; }
+export fn UI_LB_ADDSTRING() -> uint32 { return 384; }
+export fn UI_LB_GETCURSEL() -> uint32 { return 392; }
+export fn UI_LB_SETCURSEL() -> uint32 { return 390; }
+export fn UI_LB_RESETCONTENT() -> uint32 { return 388; }
+export fn UI_LB_ERR() -> int32 { return -1; }
 
-export function UI_CB_ADDSTRING() -> uint32 { return 323; }
-export function UI_CB_GETCURSEL() -> uint32 { return 327; }
-export function UI_CB_SETCURSEL() -> uint32 { return 334; }
-export function UI_CB_RESETCONTENT() -> uint32 { return 331; }
-export function UI_CB_ERR() -> int32 { return -1; }
+export fn UI_CB_ADDSTRING() -> uint32 { return 323; }
+export fn UI_CB_GETCURSEL() -> uint32 { return 327; }
+export fn UI_CB_SETCURSEL() -> uint32 { return 334; }
+export fn UI_CB_RESETCONTENT() -> uint32 { return 331; }
+export fn UI_CB_ERR() -> int32 { return -1; }
 
-export function UI_PM_REMOVE() -> uint32 { return 0x0001; }
-export function UI_GWLP_USERDATA() -> int32 { return -21; }
+export fn UI_PM_REMOVE() -> uint32 { return 0x0001; }
+export fn UI_GWLP_USERDATA() -> int32 { return -21; }
 
-export function UI_DT_LEFT() -> uint32 { return 0; }
-export function UI_DT_CENTER() -> uint32 { return 1; }
-export function UI_DT_RIGHT() -> uint32 { return 2; }
-export function UI_DT_VCENTER() -> uint32 { return 4; }
-export function UI_DT_WORDBREAK() -> uint32 { return 16; }
-export function UI_DT_SINGLELINE() -> uint32 { return 32; }
-export function UI_DT_NOCLIP() -> uint32 { return 256; }
-export function UI_DT_CALCRECT() -> uint32 { return 1024; }
-export function UI_DT_END_ELLIPSIS() -> uint32 { return 32768; }
+export fn UI_DT_LEFT() -> uint32 { return 0; }
+export fn UI_DT_CENTER() -> uint32 { return 1; }
+export fn UI_DT_RIGHT() -> uint32 { return 2; }
+export fn UI_DT_VCENTER() -> uint32 { return 4; }
+export fn UI_DT_WORDBREAK() -> uint32 { return 16; }
+export fn UI_DT_SINGLELINE() -> uint32 { return 32; }
+export fn UI_DT_NOCLIP() -> uint32 { return 256; }
+export fn UI_DT_CALCRECT() -> uint32 { return 1024; }
+export fn UI_DT_END_ELLIPSIS() -> uint32 { return 32768; }
 
-export function UI_BKMODE_TRANSPARENT() -> int32 { return 1; }
-export function UI_BKMODE_OPAQUE() -> int32 { return 2; }
+export fn UI_BKMODE_TRANSPARENT() -> int32 { return 1; }
+export fn UI_BKMODE_OPAQUE() -> int32 { return 2; }
 
-export function UI_PS_SOLID() -> int32 { return 0; }
-export function UI_FW_NORMAL() -> int32 { return 400; }
-export function UI_FW_SEMIBOLD() -> int32 { return 600; }
-export function UI_FW_BOLD() -> int32 { return 700; }
-export function UI_DEFAULT_CHARSET() -> uint32 { return 1; }
-export function UI_OUT_DEFAULT_PRECIS() -> uint32 { return 0; }
-export function UI_CLIP_DEFAULT_PRECIS() -> uint32 { return 0; }
-export function UI_DEFAULT_QUALITY() -> uint32 { return 0; }
-export function UI_CLEARTYPE_QUALITY() -> uint32 { return 5; }
-export function UI_DEFAULT_PITCH() -> uint32 { return 0; }
+export fn UI_PS_SOLID() -> int32 { return 0; }
+export fn UI_FW_NORMAL() -> int32 { return 400; }
+export fn UI_FW_SEMIBOLD() -> int32 { return 600; }
+export fn UI_FW_BOLD() -> int32 { return 700; }
+export fn UI_DEFAULT_CHARSET() -> uint32 { return 1; }
+export fn UI_OUT_DEFAULT_PRECIS() -> uint32 { return 0; }
+export fn UI_CLIP_DEFAULT_PRECIS() -> uint32 { return 0; }
+export fn UI_DEFAULT_QUALITY() -> uint32 { return 0; }
+export fn UI_CLEARTYPE_QUALITY() -> uint32 { return 5; }
+export fn UI_DEFAULT_PITCH() -> uint32 { return 0; }
 
-export function UI_MF_STRING() -> uint32 { return 0; }
-export function UI_MF_SEPARATOR() -> uint32 { return 0x00000800; }
-export function UI_MF_POPUP() -> uint32 { return 0x00000010; }
+export fn UI_MF_STRING() -> uint32 { return 0; }
+export fn UI_MF_SEPARATOR() -> uint32 { return 0x00000800; }
+export fn UI_MF_POPUP() -> uint32 { return 0x00000010; }
 
 // User32 and GDI32 bindings.
-export extern function Ui_GetModuleHandleA(name: cstring) -> int64 = "GetModuleHandleA";
-export extern function Ui_LoadCursorA(instance: int64, name: cstring) -> int64 = "LoadCursorA";
-export extern function Ui_LoadIconA(instance: int64, name: cstring) -> int64 = "LoadIconA";
-export extern function Ui_RegisterClassExA(wnd_class: UiWndClassEx*) -> uint16 = "RegisterClassExA";
-export extern function Ui_UnregisterClassA(class_name: cstring, instance: int64) -> int32 = "UnregisterClassA";
-export extern function Ui_CreateWindowExA(ex_style: uint32, class_name: cstring, window_name: cstring, style: uint32, x: int32, y: int32, width: int32, height: int32, parent: int64, menu: int64, instance: int64, param: cstring) -> int64 = "CreateWindowExA";
-export extern function Ui_DestroyWindow(hwnd: int64) -> int32 = "DestroyWindow";
-export extern function Ui_ShowWindow(hwnd: int64, cmd: int32) -> int32 = "ShowWindow";
-export extern function Ui_UpdateWindow(hwnd: int64) -> int32 = "UpdateWindow";
-export extern function Ui_EnableWindow(hwnd: int64, enabled: int32) -> int32 = "EnableWindow";
-export extern function Ui_SetFocus(hwnd: int64) -> int64 = "SetFocus";
-export extern function Ui_GetFocus() -> int64 = "GetFocus";
-export extern function Ui_SetWindowTextA(hwnd: int64, text: cstring) -> int32 = "SetWindowTextA";
-export extern function Ui_GetWindowTextA(hwnd: int64, text: cstring, max_len: int32) -> int32 = "GetWindowTextA";
-export extern function Ui_GetClientRect(hwnd: int64, rect: UiRect*) -> int32 = "GetClientRect";
-export extern function Ui_GetWindowRect(hwnd: int64, rect: UiRect*) -> int32 = "GetWindowRect";
-export extern function Ui_MoveWindow(hwnd: int64, x: int32, y: int32, width: int32, height: int32, repaint: int32) -> int32 = "MoveWindow";
-export extern function Ui_SetWindowPos(hwnd: int64, after: int64, x: int32, y: int32, width: int32, height: int32, flags: uint32) -> int32 = "SetWindowPos";
-export extern function Ui_InvalidateRect(hwnd: int64, rect: UiRect*, erase: int32) -> int32 = "InvalidateRect";
-export extern function Ui_DefWindowProcA(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 = "DefWindowProcA";
-export extern function Ui_PostQuitMessage(exit_code: int32) = "PostQuitMessage";
-export extern function Ui_GetMessageA(msg: UiMsg*, hwnd: int64, filter_min: uint32, filter_max: uint32) -> int32 = "GetMessageA";
-export extern function Ui_PeekMessageA(msg: UiMsg*, hwnd: int64, filter_min: uint32, filter_max: uint32, remove: uint32) -> int32 = "PeekMessageA";
-export extern function Ui_TranslateMessage(msg: UiMsg*) -> int32 = "TranslateMessage";
-export extern function Ui_DispatchMessageA(msg: UiMsg*) -> int64 = "DispatchMessageA";
-export extern function Ui_SendMessageA(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 = "SendMessageA";
-export extern function Ui_SetTimer(hwnd: int64, timer_id: uint32, elapsed_ms: uint32, proc: cstring) -> uint32 = "SetTimer";
-export extern function Ui_KillTimer(hwnd: int64, timer_id: uint32) -> int32 = "KillTimer";
-export extern function Ui_MessageBoxA(owner: int64, text: cstring, caption: cstring, kind: uint32) -> int32 = "MessageBoxA";
-export extern function Ui_CreateMenu() -> int64 = "CreateMenu";
-export extern function Ui_CreatePopupMenu() -> int64 = "CreatePopupMenu";
-export extern function Ui_AppendMenuA(menu: int64, flags: uint32, item_id: int64, text: cstring) -> int32 = "AppendMenuA";
-export extern function Ui_SetMenu(hwnd: int64, menu: int64) -> int32 = "SetMenu";
-export extern function Ui_DrawMenuBar(hwnd: int64) -> int32 = "DrawMenuBar";
-export extern function Ui_DestroyMenu(menu: int64) -> int32 = "DestroyMenu";
+export extern fn Ui_GetModuleHandleA(name: cstring) -> int64 = "GetModuleHandleA";
+export extern fn Ui_LoadCursorA(instance: int64, name: cstring) -> int64 = "LoadCursorA";
+export extern fn Ui_LoadIconA(instance: int64, name: cstring) -> int64 = "LoadIconA";
+export extern fn Ui_RegisterClassExA(wnd_class: UiWndClassEx*) -> uint16 = "RegisterClassExA";
+export extern fn Ui_UnregisterClassA(class_name: cstring, instance: int64) -> int32 = "UnregisterClassA";
+export extern fn Ui_CreateWindowExA(ex_style: uint32, class_name: cstring, window_name: cstring, style: uint32, x: int32, y: int32, width: int32, height: int32, parent: int64, menu: int64, instance: int64, param: cstring) -> int64 = "CreateWindowExA";
+export extern fn Ui_DestroyWindow(hwnd: int64) -> int32 = "DestroyWindow";
+export extern fn Ui_ShowWindow(hwnd: int64, cmd: int32) -> int32 = "ShowWindow";
+export extern fn Ui_UpdateWindow(hwnd: int64) -> int32 = "UpdateWindow";
+export extern fn Ui_EnableWindow(hwnd: int64, enabled: int32) -> int32 = "EnableWindow";
+export extern fn Ui_SetFocus(hwnd: int64) -> int64 = "SetFocus";
+export extern fn Ui_GetFocus() -> int64 = "GetFocus";
+export extern fn Ui_SetWindowTextA(hwnd: int64, text: cstring) -> int32 = "SetWindowTextA";
+export extern fn Ui_GetWindowTextA(hwnd: int64, text: cstring, max_len: int32) -> int32 = "GetWindowTextA";
+export extern fn Ui_GetClientRect(hwnd: int64, rect: UiRect*) -> int32 = "GetClientRect";
+export extern fn Ui_GetWindowRect(hwnd: int64, rect: UiRect*) -> int32 = "GetWindowRect";
+export extern fn Ui_MoveWindow(hwnd: int64, x: int32, y: int32, width: int32, height: int32, repaint: int32) -> int32 = "MoveWindow";
+export extern fn Ui_SetWindowPos(hwnd: int64, after: int64, x: int32, y: int32, width: int32, height: int32, flags: uint32) -> int32 = "SetWindowPos";
+export extern fn Ui_InvalidateRect(hwnd: int64, rect: UiRect*, erase: int32) -> int32 = "InvalidateRect";
+export extern fn Ui_RedrawWindow(hwnd: int64, rect: UiRect*, region: int64, flags: uint32) -> int32 = "RedrawWindow";
+export extern fn Ui_DefWindowProcA(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 = "DefWindowProcA";
+export extern fn Ui_PostQuitMessage(exit_code: int32) = "PostQuitMessage";
+export extern fn Ui_GetMessageA(msg: UiMsg*, hwnd: int64, filter_min: uint32, filter_max: uint32) -> int32 = "GetMessageA";
+export extern fn Ui_PeekMessageA(msg: UiMsg*, hwnd: int64, filter_min: uint32, filter_max: uint32, remove: uint32) -> int32 = "PeekMessageA";
+export extern fn Ui_TranslateMessage(msg: UiMsg*) -> int32 = "TranslateMessage";
+export extern fn Ui_DispatchMessageA(msg: UiMsg*) -> int64 = "DispatchMessageA";
+export extern fn Ui_SendMessageA(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 = "SendMessageA";
+export extern fn Ui_SetTimer(hwnd: int64, timer_id: uint32, elapsed_ms: uint32, proc: cstring) -> uint32 = "SetTimer";
+export extern fn Ui_KillTimer(hwnd: int64, timer_id: uint32) -> int32 = "KillTimer";
+export extern fn Ui_MessageBoxA(owner: int64, text: cstring, caption: cstring, kind: uint32) -> int32 = "MessageBoxA";
+export extern fn Ui_CreateMenu() -> int64 = "CreateMenu";
+export extern fn Ui_CreatePopupMenu() -> int64 = "CreatePopupMenu";
+export extern fn Ui_AppendMenuA(menu: int64, flags: uint32, item_id: int64, text: cstring) -> int32 = "AppendMenuA";
+export extern fn Ui_SetMenu(hwnd: int64, menu: int64) -> int32 = "SetMenu";
+export extern fn Ui_DrawMenuBar(hwnd: int64) -> int32 = "DrawMenuBar";
+export extern fn Ui_DestroyMenu(menu: int64) -> int32 = "DestroyMenu";
 
-export extern function Ui_BeginPaint(hwnd: int64, paint: UiPaintStruct*) -> int64 = "BeginPaint";
-export extern function Ui_EndPaint(hwnd: int64, paint: UiPaintStruct*) -> int32 = "EndPaint";
-export extern function Ui_GetDC(hwnd: int64) -> int64 = "GetDC";
-export extern function Ui_ReleaseDC(hwnd: int64, hdc: int64) -> int32 = "ReleaseDC";
-export extern function Ui_FillRect(hdc: int64, rect: UiRect*, brush: int64) -> int32 = "FillRect";
-export extern function Ui_FrameRect(hdc: int64, rect: UiRect*, brush: int64) -> int32 = "FrameRect";
-export extern function Ui_DrawTextA(hdc: int64, text: cstring, text_len: int32, rect: UiRect*, format: uint32) -> int32 = "DrawTextA";
-export extern function Ui_Rectangle(hdc: int64, left: int32, top: int32, right: int32, bottom: int32) -> int32 = "Rectangle";
-export extern function Ui_Ellipse(hdc: int64, left: int32, top: int32, right: int32, bottom: int32) -> int32 = "Ellipse";
-export extern function Ui_MoveToEx(hdc: int64, x: int32, y: int32, point: cstring) -> int32 = "MoveToEx";
-export extern function Ui_LineTo(hdc: int64, x: int32, y: int32) -> int32 = "LineTo";
+export extern fn Ui_BeginPaint(hwnd: int64, paint: UiPaintStruct*) -> int64 = "BeginPaint";
+export extern fn Ui_EndPaint(hwnd: int64, paint: UiPaintStruct*) -> int32 = "EndPaint";
+export extern fn Ui_GetDC(hwnd: int64) -> int64 = "GetDC";
+export extern fn Ui_ReleaseDC(hwnd: int64, hdc: int64) -> int32 = "ReleaseDC";
+export extern fn Ui_FillRect(hdc: int64, rect: UiRect*, brush: int64) -> int32 = "FillRect";
+export extern fn Ui_FrameRect(hdc: int64, rect: UiRect*, brush: int64) -> int32 = "FrameRect";
+export extern fn Ui_DrawTextA(hdc: int64, text: cstring, text_len: int32, rect: UiRect*, format: uint32) -> int32 = "DrawTextA";
+export extern fn Ui_Rectangle(hdc: int64, left: int32, top: int32, right: int32, bottom: int32) -> int32 = "Rectangle";
+export extern fn Ui_Ellipse(hdc: int64, left: int32, top: int32, right: int32, bottom: int32) -> int32 = "Ellipse";
+export extern fn Ui_MoveToEx(hdc: int64, x: int32, y: int32, point: cstring) -> int32 = "MoveToEx";
+export extern fn Ui_LineTo(hdc: int64, x: int32, y: int32) -> int32 = "LineTo";
 
-export extern function Ui_CreateSolidBrush(color: uint32) -> int64 = "CreateSolidBrush";
-export extern function Ui_CreatePen(style: int32, width: int32, color: uint32) -> int64 = "CreatePen";
-export extern function Ui_CreateFontA(height: int32, width: int32, escapement: int32, orientation: int32, weight: int32, italic: uint32, underline: uint32, strikeout: uint32, charset: uint32, out_precision: uint32, clip_precision: uint32, quality: uint32, pitch_and_family: uint32, face: cstring) -> int64 = "CreateFontA";
-export extern function Ui_DeleteObject(obj: int64) -> int32 = "DeleteObject";
-export extern function Ui_SelectObject(hdc: int64, obj: int64) -> int64 = "SelectObject";
-export extern function Ui_GetStockObject(index: int32) -> int64 = "GetStockObject";
-export extern function Ui_GetSysColor(index: int32) -> uint32 = "GetSysColor";
-export extern function Ui_GetSysColorBrush(index: int32) -> int64 = "GetSysColorBrush";
-export extern function Ui_SetBkMode(hdc: int64, mode: int32) -> int32 = "SetBkMode";
-export extern function Ui_SetBkColor(hdc: int64, color: uint32) -> uint32 = "SetBkColor";
-export extern function Ui_SetTextColor(hdc: int64, color: uint32) -> uint32 = "SetTextColor";
-export extern function Ui_TextOutA(hdc: int64, x: int32, y: int32, text: cstring, length: int32) -> int32 = "TextOutA";
-export extern function Ui_SetWindowLongPtrA(hwnd: int64, index: int32, value: int64) -> int64 = "SetWindowLongPtrA";
-export extern function Ui_GetWindowLongPtrA(hwnd: int64, index: int32) -> int64 = "GetWindowLongPtrA";
+export extern fn Ui_CreateSolidBrush(color: uint32) -> int64 = "CreateSolidBrush";
+export extern fn Ui_CreatePen(style: int32, width: int32, color: uint32) -> int64 = "CreatePen";
+export extern fn Ui_CreateFontA(height: int32, width: int32, escapement: int32, orientation: int32, weight: int32, italic: uint32, underline: uint32, strikeout: uint32, charset: uint32, out_precision: uint32, clip_precision: uint32, quality: uint32, pitch_and_family: uint32, face: cstring) -> int64 = "CreateFontA";
+export extern fn Ui_DeleteObject(obj: int64) -> int32 = "DeleteObject";
+export extern fn Ui_SelectObject(hdc: int64, obj: int64) -> int64 = "SelectObject";
+export extern fn Ui_GetStockObject(index: int32) -> int64 = "GetStockObject";
+export extern fn Ui_GetSysColor(index: int32) -> uint32 = "GetSysColor";
+export extern fn Ui_GetSysColorBrush(index: int32) -> int64 = "GetSysColorBrush";
+export extern fn Ui_SetBkMode(hdc: int64, mode: int32) -> int32 = "SetBkMode";
+export extern fn Ui_SetBkColor(hdc: int64, color: uint32) -> uint32 = "SetBkColor";
+export extern fn Ui_SetTextColor(hdc: int64, color: uint32) -> uint32 = "SetTextColor";
+export extern fn Ui_TextOutA(hdc: int64, x: int32, y: int32, text: cstring, length: int32) -> int32 = "TextOutA";
+export extern fn Ui_SetWindowLongPtrA(hwnd: int64, index: int32, value: int64) -> int64 = "SetWindowLongPtrA";
+export extern fn Ui_GetWindowLongPtrA(hwnd: int64, index: int32) -> int64 = "GetWindowLongPtrA";
 
 // Module state.
 var UI_CLASS_NAME: string = "MettleUiWindow";
@@ -347,45 +350,45 @@ var ui_class_registered: int32 = 0;
 var ui_app_instance: int64 = 0;
 
 // General helpers.
-export function ui_rgb(r: uint32, g: uint32, b: uint32) -> uint32 {
+export fn ui_rgb(r: uint32, g: uint32, b: uint32) -> uint32 {
   return r | (g << 8) | (b << 16);
 }
 
-export function ui_color_r(color: uint32) -> uint32 {
+export fn ui_color_r(color: uint32) -> uint32 {
   return color & 0xFF;
 }
 
-export function ui_color_g(color: uint32) -> uint32 {
+export fn ui_color_g(color: uint32) -> uint32 {
   return (color >> 8) & 0xFF;
 }
 
-export function ui_color_b(color: uint32) -> uint32 {
+export fn ui_color_b(color: uint32) -> uint32 {
   return (color >> 16) & 0xFF;
 }
 
-export function ui_lo_word(value: int64) -> uint32 {
+export fn ui_lo_word(value: int64) -> uint32 {
   return (uint32)value & 0xFFFF;
 }
 
-export function ui_hi_word(value: int64) -> uint32 {
+export fn ui_hi_word(value: int64) -> uint32 {
   return ((uint32)value >> 16) & 0xFFFF;
 }
 
-export function ui_make_point(x: int32, y: int32) -> UiPoint {
+export fn ui_make_point(x: int32, y: int32) -> UiPoint {
   var point: UiPoint;
   point.x = x;
   point.y = y;
   return point;
 }
 
-export function ui_make_size(width: int32, height: int32) -> UiSize {
+export fn ui_make_size(width: int32, height: int32) -> UiSize {
   var size: UiSize;
   size.width = width;
   size.height = height;
   return size;
 }
 
-export function ui_make_insets(all: int32) -> UiInsets {
+export fn ui_make_insets(all: int32) -> UiInsets {
   var insets: UiInsets;
   insets.left = all;
   insets.top = all;
@@ -394,7 +397,7 @@ export function ui_make_insets(all: int32) -> UiInsets {
   return insets;
 }
 
-export function ui_make_insets_xy(x: int32, y: int32) -> UiInsets {
+export fn ui_make_insets_xy(x: int32, y: int32) -> UiInsets {
   var insets: UiInsets;
   insets.left = x;
   insets.right = x;
@@ -403,7 +406,7 @@ export function ui_make_insets_xy(x: int32, y: int32) -> UiInsets {
   return insets;
 }
 
-export function ui_make_rect(left: int32, top: int32, right: int32, bottom: int32) -> UiRect {
+export fn ui_make_rect(left: int32, top: int32, right: int32, bottom: int32) -> UiRect {
   var rect: UiRect;
   rect.left = left;
   rect.top = top;
@@ -412,33 +415,33 @@ export function ui_make_rect(left: int32, top: int32, right: int32, bottom: int3
   return rect;
 }
 
-export function ui_rect_xywh(x: int32, y: int32, width: int32, height: int32) -> UiRect {
+export fn ui_rect_xywh(x: int32, y: int32, width: int32, height: int32) -> UiRect {
   return ui_make_rect(x, y, x + width, y + height);
 }
 
-export function ui_rect_width(rect: UiRect) -> int32 {
+export fn ui_rect_width(rect: UiRect) -> int32 {
   return rect.right - rect.left;
 }
 
-export function ui_rect_height(rect: UiRect) -> int32 {
+export fn ui_rect_height(rect: UiRect) -> int32 {
   return rect.bottom - rect.top;
 }
 
-export function ui_rect_is_empty(rect: UiRect) -> int32 {
+export fn ui_rect_is_empty(rect: UiRect) -> int32 {
   if (ui_rect_width(rect) <= 0) { return 1; }
   if (ui_rect_height(rect) <= 0) { return 1; }
   return 0;
 }
 
-export function ui_rect_inset(rect: UiRect, insets: UiInsets) -> UiRect {
+export fn ui_rect_inset(rect: UiRect, insets: UiInsets) -> UiRect {
   return ui_make_rect(rect.left + insets.left, rect.top + insets.top, rect.right - insets.right, rect.bottom - insets.bottom);
 }
 
-export function ui_rect_offset(rect: UiRect, dx: int32, dy: int32) -> UiRect {
+export fn ui_rect_offset(rect: UiRect, dx: int32, dy: int32) -> UiRect {
   return ui_make_rect(rect.left + dx, rect.top + dy, rect.right + dx, rect.bottom + dy);
 }
 
-export function ui_rect_contains(rect: UiRect, x: int32, y: int32) -> int32 {
+export fn ui_rect_contains(rect: UiRect, x: int32, y: int32) -> int32 {
   if (x < rect.left) { return 0; }
   if (x >= rect.right) { return 0; }
   if (y < rect.top) { return 0; }
@@ -446,17 +449,17 @@ export function ui_rect_contains(rect: UiRect, x: int32, y: int32) -> int32 {
   return 1;
 }
 
-export function ui_clamp_i32(value: int32, lo: int32, hi: int32) -> int32 {
+export fn ui_clamp_i32(value: int32, lo: int32, hi: int32) -> int32 {
   if (value < lo) { return lo; }
   if (value > hi) { return hi; }
   return value;
 }
 
-export function ui_scale(value: int32, dpi: int32) -> int32 {
+export fn ui_scale(value: int32, dpi: int32) -> int32 {
   return (value * dpi + 48) / 96;
 }
 
-export function ui_cstring_len(text: cstring) -> int32 {
+export fn ui_cstring_len(text: cstring) -> int32 {
   var len: int32 = 0;
   while (text[len] != 0) {
     len = len + 1;
@@ -464,7 +467,7 @@ export function ui_cstring_len(text: cstring) -> int32 {
   return len;
 }
 
-export function ui_default_theme() -> UiTheme {
+export fn ui_default_theme() -> UiTheme {
   var theme: UiTheme;
   theme.background = ui_rgb(245, 247, 250);
   theme.surface = ui_rgb(255, 255, 255);
@@ -477,36 +480,36 @@ export function ui_default_theme() -> UiTheme {
   return theme;
 }
 
-export function ui_command_id(wparam: int64) -> uint32 {
+export fn ui_command_id(wparam: int64) -> uint32 {
   return ui_lo_word(wparam);
 }
 
-export function ui_command_notify(wparam: int64) -> uint32 {
+export fn ui_command_notify(wparam: int64) -> uint32 {
   return ui_hi_word(wparam);
 }
 
-export function ui_size_width(lparam: int64) -> int32 {
+export fn ui_size_width(lparam: int64) -> int32 {
   return (int32)(lparam & 0xFFFF);
 }
 
-export function ui_size_height(lparam: int64) -> int32 {
+export fn ui_size_height(lparam: int64) -> int32 {
   return (int32)((lparam >> 16) & 0xFFFF);
 }
 
-export function ui_mouse_x(lparam: int64) -> int32 {
+export fn ui_mouse_x(lparam: int64) -> int32 {
   var x: int32 = (int32)(lparam & 0xFFFF);
   if (x >= 32768) { return x - 65536; }
   return x;
 }
 
-export function ui_mouse_y(lparam: int64) -> int32 {
+export fn ui_mouse_y(lparam: int64) -> int32 {
   var y: int32 = (int32)((lparam >> 16) & 0xFFFF);
   if (y >= 32768) { return y - 65536; }
   return y;
 }
 
 // Lightweight layout helpers.
-export function ui_stack_vertical(x: int32, y: int32, width: int32, height: int32, gap: int32) -> UiLayoutCursor {
+export fn ui_stack_vertical(x: int32, y: int32, width: int32, height: int32, gap: int32) -> UiLayoutCursor {
   var layout: UiLayoutCursor;
   layout.x = x;
   layout.y = y;
@@ -516,23 +519,23 @@ export function ui_stack_vertical(x: int32, y: int32, width: int32, height: int3
   return layout;
 }
 
-export function ui_stack_horizontal(x: int32, y: int32, width: int32, height: int32, gap: int32) -> UiLayoutCursor {
+export fn ui_stack_horizontal(x: int32, y: int32, width: int32, height: int32, gap: int32) -> UiLayoutCursor {
   return ui_stack_vertical(x, y, width, height, gap);
 }
 
-export function ui_stack_next(layout: UiLayoutCursor*) -> UiRect {
+export fn ui_stack_next(layout: UiLayoutCursor*) -> UiRect {
   var rect: UiRect = ui_rect_xywh(layout->x, layout->y, layout->width, layout->height);
   layout->y = layout->y + layout->height + layout->gap;
   return rect;
 }
 
-export function ui_stack_next_h(layout: UiLayoutCursor*) -> UiRect {
+export fn ui_stack_next_h(layout: UiLayoutCursor*) -> UiRect {
   var rect: UiRect = ui_rect_xywh(layout->x, layout->y, layout->width, layout->height);
   layout->x = layout->x + layout->width + layout->gap;
   return rect;
 }
 
-export function ui_row_rect(parent: UiRect*, index: int32, row_height: int32, gap: int32) -> UiRect {
+export fn ui_row_rect(parent: UiRect*, index: int32, row_height: int32, gap: int32) -> UiRect {
   var y: int32 = parent->top;
   var i: int32 = 0;
   while (i < index) {
@@ -542,7 +545,7 @@ export function ui_row_rect(parent: UiRect*, index: int32, row_height: int32, ga
   return ui_make_rect(parent->left, y, parent->right, y + row_height);
 }
 
-export function ui_column_rect(parent: UiRect*, index: int32, column_count: int32, gap: int32) -> UiRect {
+export fn ui_column_rect(parent: UiRect*, index: int32, column_count: int32, gap: int32) -> UiRect {
   var usable_width: int32 = parent->right - parent->left;
   var gaps: int32 = column_count - 1;
   while (gaps > 0) {
@@ -561,7 +564,7 @@ export function ui_column_rect(parent: UiRect*, index: int32, column_count: int3
 }
 
 // Initialization and app shell.
-export function ui_init() -> int32 {
+export fn ui_init() -> int32 {
   if (ui_class_registered != 0) {
     return 1;
   }
@@ -593,7 +596,7 @@ export function ui_init() -> int32 {
   return 1;
 }
 
-export function ui_shutdown() {
+export fn ui_shutdown() {
   if (ui_class_registered == 0) {
     return;
   }
@@ -601,7 +604,7 @@ export function ui_shutdown() {
   ui_class_registered = 0;
 }
 
-function ui_trampoline_window_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 {
+fn ui_trampoline_window_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 {
   if (msg == UI_WM_CREATE()) {
     var create_params: int64 = *((int64*)lparam);
     if (create_params != 0) {
@@ -623,7 +626,7 @@ function ui_trampoline_window_proc(hwnd: int64, msg: uint32, wparam: int64, lpar
 }
 
 // Window lifecycle.
-export function ui_window_create(title: cstring, x: int32, y: int32, width: int32, height: int32, proc: fn(int64, uint32, int64, int64) -> int64) -> int64 {
+export fn ui_window_create(title: cstring, x: int32, y: int32, width: int32, height: int32, proc: fn(int64, uint32, int64, int64) -> int64) -> int64 {
   if (ui_init() == 0) {
     return 0;
   }
@@ -633,7 +636,7 @@ export function ui_window_create(title: cstring, x: int32, y: int32, width: int3
     UI_WS_EX_APPWINDOW(),
     cstr(UI_CLASS_NAME),
     title,
-    UI_WS_OVERLAPPEDWINDOW(),
+    UI_WS_OVERLAPPEDWINDOW() | UI_WS_CLIPCHILDREN(),
     x,
     y,
     width,
@@ -645,17 +648,17 @@ export function ui_window_create(title: cstring, x: int32, y: int32, width: int3
   );
 }
 
-export function ui_window_create_config(config: UiWindowConfig, proc: fn(int64, uint32, int64, int64) -> int64) -> int64 {
+export fn ui_window_create_config(config: UiWindowConfig, proc: fn(int64, uint32, int64, int64) -> int64) -> int64 {
   return ui_window_create(config.title, config.x, config.y, config.width, config.height, proc);
 }
 
-export function ui_window_create_centered(title: cstring, width: int32, height: int32, proc: fn(int64, uint32, int64, int64) -> int64) -> int64 {
+export fn ui_window_create_centered(title: cstring, width: int32, height: int32, proc: fn(int64, uint32, int64, int64) -> int64) -> int64 {
   var screen_w: int32 = win32_get_system_metrics(SM_CXSCREEN());
   var screen_h: int32 = win32_get_system_metrics(SM_CYSCREEN());
   return ui_window_create(title, (screen_w - width) / 2, (screen_h - height) / 2, width, height, proc);
 }
 
-export function ui_app_run(config: UiAppConfig) -> int32 {
+export fn ui_app_run(config: UiAppConfig) -> int32 {
   var hwnd: int64 = ui_window_create_centered(config.title, config.width, config.height, config.proc);
   if (hwnd == 0) {
     return 1;
@@ -664,28 +667,31 @@ export function ui_app_run(config: UiAppConfig) -> int32 {
   return ui_run_message_loop();
 }
 
-export function ui_window_show(hwnd: int64) {
+export fn ui_window_show(hwnd: int64) {
   Ui_ShowWindow(hwnd, UI_SW_SHOW());
   Ui_UpdateWindow(hwnd);
+  // RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN|RDW_UPDATENOW: force child
+  // controls (buttons, labels, etc.) to paint their initial frame.
+  Ui_RedrawWindow(hwnd, 0, 0, 0x0185);
 }
 
-export function ui_window_hide(hwnd: int64) {
+export fn ui_window_hide(hwnd: int64) {
   Ui_ShowWindow(hwnd, UI_SW_HIDE());
 }
 
-export function ui_window_close(hwnd: int64) {
+export fn ui_window_close(hwnd: int64) {
   Ui_DestroyWindow(hwnd);
 }
 
-export function ui_window_set_title(hwnd: int64, title: cstring) {
+export fn ui_window_set_title(hwnd: int64, title: cstring) {
   Ui_SetWindowTextA(hwnd, title);
 }
 
-export function ui_window_get_title(hwnd: int64, buf: cstring, max_len: int32) -> int32 {
+export fn ui_window_get_title(hwnd: int64, buf: cstring, max_len: int32) -> int32 {
   return Ui_GetWindowTextA(hwnd, buf, max_len);
 }
 
-export function ui_window_client_rect(hwnd: int64) -> UiRect {
+export fn ui_window_client_rect(hwnd: int64) -> UiRect {
   var rect: UiRect;
   if (Ui_GetClientRect(hwnd, &rect) == 0) {
     return ui_make_rect(0, 0, 0, 0);
@@ -693,7 +699,7 @@ export function ui_window_client_rect(hwnd: int64) -> UiRect {
   return rect;
 }
 
-export function ui_window_rect(hwnd: int64) -> UiRect {
+export fn ui_window_rect(hwnd: int64) -> UiRect {
   var rect: UiRect;
   if (Ui_GetWindowRect(hwnd, &rect) == 0) {
     return ui_make_rect(0, 0, 0, 0);
@@ -701,52 +707,52 @@ export function ui_window_rect(hwnd: int64) -> UiRect {
   return rect;
 }
 
-export function ui_client_width(hwnd: int64) -> int32 {
+export fn ui_client_width(hwnd: int64) -> int32 {
   return ui_rect_width(ui_window_client_rect(hwnd));
 }
 
-export function ui_client_height(hwnd: int64) -> int32 {
+export fn ui_client_height(hwnd: int64) -> int32 {
   return ui_rect_height(ui_window_client_rect(hwnd));
 }
 
-export function ui_window_move(hwnd: int64, x: int32, y: int32, width: int32, height: int32, repaint: int32) -> int32 {
+export fn ui_window_move(hwnd: int64, x: int32, y: int32, width: int32, height: int32, repaint: int32) -> int32 {
   return Ui_MoveWindow(hwnd, x, y, width, height, repaint);
 }
 
-export function ui_window_set_pos(hwnd: int64, x: int32, y: int32, width: int32, height: int32, flags: uint32) -> int32 {
+export fn ui_window_set_pos(hwnd: int64, x: int32, y: int32, width: int32, height: int32, flags: uint32) -> int32 {
   return Ui_SetWindowPos(hwnd, 0, x, y, width, height, flags | UI_SWP_NOZORDER());
 }
 
-export function ui_window_invalidate(hwnd: int64) {
+export fn ui_window_invalidate(hwnd: int64) {
   Ui_InvalidateRect(hwnd, 0, 1);
 }
 
-export function ui_window_invalidate_rect(hwnd: int64, rect: UiRect*) {
+export fn ui_window_invalidate_rect(hwnd: int64, rect: UiRect*) {
   Ui_InvalidateRect(hwnd, rect, 1);
 }
 
-export function ui_set_user_data(hwnd: int64, value: int64) -> int64 {
+export fn ui_set_user_data(hwnd: int64, value: int64) -> int64 {
   return Ui_SetWindowLongPtrA(hwnd, UI_GWLP_USERDATA(), value);
 }
 
-export function ui_get_user_data(hwnd: int64) -> int64 {
+export fn ui_get_user_data(hwnd: int64) -> int64 {
   return Ui_GetWindowLongPtrA(hwnd, UI_GWLP_USERDATA());
 }
 
-export function ui_def_window_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 {
+export fn ui_def_window_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 {
   return Ui_DefWindowProcA(hwnd, msg, wparam, lparam);
 }
 
-export function ui_alert(owner: int64, title: cstring, text: cstring) -> int32 {
+export fn ui_alert(owner: int64, title: cstring, text: cstring) -> int32 {
   return Ui_MessageBoxA(owner, text, title, MB_OK() | MB_ICONINFORMATION());
 }
 
 // Message loop and timers.
-export function ui_quit(exit_code: int32) {
+export fn ui_quit(exit_code: int32) {
   Ui_PostQuitMessage(exit_code);
 }
 
-export function ui_run_message_loop() -> int32 {
+export fn ui_run_message_loop() -> int32 {
   var msg: UiMsg;
   while (Ui_GetMessageA(&msg, 0, 0, 0) > 0) {
     Ui_TranslateMessage(&msg);
@@ -755,7 +761,7 @@ export function ui_run_message_loop() -> int32 {
   return (int32)msg.wparam;
 }
 
-export function ui_pump_messages() -> int32 {
+export fn ui_pump_messages() -> int32 {
   var msg: UiMsg;
   var had_message: int32 = 0;
   while (Ui_PeekMessageA(&msg, 0, 0, 0, UI_PM_REMOVE()) != 0) {
@@ -766,33 +772,33 @@ export function ui_pump_messages() -> int32 {
   return had_message;
 }
 
-export function ui_timer_start(hwnd: int64, timer_id: uint32, elapsed_ms: uint32) -> uint32 {
+export fn ui_timer_start(hwnd: int64, timer_id: uint32, elapsed_ms: uint32) -> uint32 {
   return Ui_SetTimer(hwnd, timer_id, elapsed_ms, 0);
 }
 
-export function ui_timer_stop(hwnd: int64, timer_id: uint32) -> int32 {
+export fn ui_timer_stop(hwnd: int64, timer_id: uint32) -> int32 {
   return Ui_KillTimer(hwnd, timer_id);
 }
 
 // Drawing.
-export function ui_begin_paint(hwnd: int64, paint: UiPaintStruct*) -> int64 {
+export fn ui_begin_paint(hwnd: int64, paint: UiPaintStruct*) -> int64 {
   return Ui_BeginPaint(hwnd, paint);
 }
 
-export function ui_end_paint(hwnd: int64, paint: UiPaintStruct*) {
+export fn ui_end_paint(hwnd: int64, paint: UiPaintStruct*) {
   Ui_EndPaint(hwnd, paint);
 }
 
-export function ui_fill_rect(hdc: int64, rect: UiRect*, brush: int64) -> int32 {
+export fn ui_fill_rect(hdc: int64, rect: UiRect*, brush: int64) -> int32 {
   return Ui_FillRect(hdc, rect, brush);
 }
 
-export function ui_fill_rect_color(hdc: int64, left: int32, top: int32, right: int32, bottom: int32, color: uint32) -> int32 {
+export fn ui_fill_rect_color(hdc: int64, left: int32, top: int32, right: int32, bottom: int32, color: uint32) -> int32 {
   var rect: UiRect = ui_make_rect(left, top, right, bottom);
   return ui_fill_rect_color_rect(hdc, &rect, color);
 }
 
-export function ui_fill_rect_color_rect(hdc: int64, rect: UiRect*, color: uint32) -> int32 {
+export fn ui_fill_rect_color_rect(hdc: int64, rect: UiRect*, color: uint32) -> int32 {
   var brush: int64 = Ui_CreateSolidBrush(color);
   if (brush == 0) {
     return 0;
@@ -802,7 +808,7 @@ export function ui_fill_rect_color_rect(hdc: int64, rect: UiRect*, color: uint32
   return result;
 }
 
-export function ui_frame_rect_color(hdc: int64, rect: UiRect*, color: uint32) -> int32 {
+export fn ui_frame_rect_color(hdc: int64, rect: UiRect*, color: uint32) -> int32 {
   var brush: int64 = Ui_CreateSolidBrush(color);
   if (brush == 0) {
     return 0;
@@ -812,7 +818,7 @@ export function ui_frame_rect_color(hdc: int64, rect: UiRect*, color: uint32) ->
   return result;
 }
 
-export function ui_draw_line(hdc: int64, x1: int32, y1: int32, x2: int32, y2: int32, color: uint32, width: int32) -> int32 {
+export fn ui_draw_line(hdc: int64, x1: int32, y1: int32, x2: int32, y2: int32, color: uint32, width: int32) -> int32 {
   var pen: int64 = Ui_CreatePen(UI_PS_SOLID(), width, color);
   if (pen == 0) {
     return 0;
@@ -825,7 +831,7 @@ export function ui_draw_line(hdc: int64, x1: int32, y1: int32, x2: int32, y2: in
   return result;
 }
 
-export function ui_draw_rect_outline(hdc: int64, rect: UiRect*, color: uint32, width: int32) -> int32 {
+export fn ui_draw_rect_outline(hdc: int64, rect: UiRect*, color: uint32, width: int32) -> int32 {
   var pen: int64 = Ui_CreatePen(UI_PS_SOLID(), width, color);
   if (pen == 0) {
     return 0;
@@ -837,7 +843,7 @@ export function ui_draw_rect_outline(hdc: int64, rect: UiRect*, color: uint32, w
   return result;
 }
 
-export function ui_draw_ellipse_outline(hdc: int64, rect: UiRect*, color: uint32, width: int32) -> int32 {
+export fn ui_draw_ellipse_outline(hdc: int64, rect: UiRect*, color: uint32, width: int32) -> int32 {
   var pen: int64 = Ui_CreatePen(UI_PS_SOLID(), width, color);
   if (pen == 0) {
     return 0;
@@ -849,198 +855,233 @@ export function ui_draw_ellipse_outline(hdc: int64, rect: UiRect*, color: uint32
   return result;
 }
 
-export function ui_set_text_color(hdc: int64, color: uint32) {
+export fn ui_set_text_color(hdc: int64, color: uint32) {
   Ui_SetTextColor(hdc, color);
 }
 
-export function ui_set_text_background(hdc: int64, color: uint32) {
+export fn ui_set_text_background(hdc: int64, color: uint32) {
   Ui_SetBkMode(hdc, UI_BKMODE_OPAQUE());
   Ui_SetBkColor(hdc, color);
 }
 
-export function ui_set_text_transparent(hdc: int64) {
+export fn ui_set_text_transparent(hdc: int64) {
   Ui_SetBkMode(hdc, UI_BKMODE_TRANSPARENT());
 }
 
-export function ui_draw_text(hdc: int64, x: int32, y: int32, text: cstring) -> int32 {
+export fn ui_draw_text(hdc: int64, x: int32, y: int32, text: cstring) -> int32 {
   Ui_SetBkMode(hdc, UI_BKMODE_TRANSPARENT());
   Ui_SetTextColor(hdc, ui_rgb(0, 0, 0));
   return Ui_TextOutA(hdc, x, y, text, ui_cstring_len(text));
 }
 
-export function ui_draw_text_color(hdc: int64, x: int32, y: int32, text: cstring, text_color: uint32, bg_color: uint32) -> int32 {
+export fn ui_draw_text_color(hdc: int64, x: int32, y: int32, text: cstring, text_color: uint32, bg_color: uint32) -> int32 {
   Ui_SetBkMode(hdc, UI_BKMODE_OPAQUE());
   Ui_SetBkColor(hdc, bg_color);
   Ui_SetTextColor(hdc, text_color);
   return Ui_TextOutA(hdc, x, y, text, ui_cstring_len(text));
 }
 
-export function ui_draw_text_transparent(hdc: int64, x: int32, y: int32, text: cstring, text_color: uint32) -> int32 {
+export fn ui_draw_text_transparent(hdc: int64, x: int32, y: int32, text: cstring, text_color: uint32) -> int32 {
   Ui_SetBkMode(hdc, UI_BKMODE_TRANSPARENT());
   Ui_SetTextColor(hdc, text_color);
   return Ui_TextOutA(hdc, x, y, text, ui_cstring_len(text));
 }
 
-export function ui_draw_text_rect(hdc: int64, rect: UiRect*, text: cstring, flags: uint32) -> int32 {
+export fn ui_draw_text_rect(hdc: int64, rect: UiRect*, text: cstring, flags: uint32) -> int32 {
   Ui_SetBkMode(hdc, UI_BKMODE_TRANSPARENT());
   return Ui_DrawTextA(hdc, text, -1, rect, flags);
 }
 
-export function ui_draw_text_rect_color(hdc: int64, rect: UiRect*, text: cstring, text_color: uint32, flags: uint32) -> int32 {
+export fn ui_draw_text_rect_color(hdc: int64, rect: UiRect*, text: cstring, text_color: uint32, flags: uint32) -> int32 {
   Ui_SetBkMode(hdc, UI_BKMODE_TRANSPARENT());
   Ui_SetTextColor(hdc, text_color);
   return Ui_DrawTextA(hdc, text, -1, rect, flags);
 }
 
-export function ui_create_font(height: int32, face: cstring, weight: int32) -> int64 {
+export fn ui_create_font(height: int32, face: cstring, weight: int32) -> int64 {
   return Ui_CreateFontA(0 - height, 0, 0, 0, weight, 0, 0, 0, UI_DEFAULT_CHARSET(), UI_OUT_DEFAULT_PRECIS(), UI_CLIP_DEFAULT_PRECIS(), UI_CLEARTYPE_QUALITY(), UI_DEFAULT_PITCH(), face);
 }
 
-export function ui_create_font_config(config: UiFontConfig) -> int64 {
+export fn ui_create_font_config(config: UiFontConfig) -> int64 {
   return Ui_CreateFontA(0 - config.height, 0, 0, 0, config.weight, (uint32)config.italic, (uint32)config.underline, 0, UI_DEFAULT_CHARSET(), UI_OUT_DEFAULT_PRECIS(), UI_CLIP_DEFAULT_PRECIS(), UI_CLEARTYPE_QUALITY(), UI_DEFAULT_PITCH(), config.face);
 }
 
-export function ui_select_object(hdc: int64, obj: int64) -> int64 {
+export fn ui_select_object(hdc: int64, obj: int64) -> int64 {
   return Ui_SelectObject(hdc, obj);
 }
 
-export function ui_delete_object(obj: int64) -> int32 {
+export fn ui_delete_object(obj: int64) -> int32 {
   return Ui_DeleteObject(obj);
 }
 
-export function ui_get_white_brush() -> int64 {
+export fn ui_get_white_brush() -> int64 {
   return Ui_GetStockObject(0);
 }
 
-export function ui_get_system_brush(color_index: int32) -> int64 {
+export fn ui_get_system_brush(color_index: int32) -> int64 {
   return Ui_GetSysColorBrush(color_index);
 }
 
-export function ui_get_system_color(color_index: int32) -> uint32 {
+export fn ui_get_system_color(color_index: int32) -> uint32 {
   return Ui_GetSysColor(color_index);
 }
 
 // Controls.
-export function ui_control_create(parent: int64, config: UiControlConfig) -> int64 {
+//
+// The 12-argument Ui_CreateWindowExA call MUST be made from a frame that holds
+// only scalar locals. Making it directly from ui_control_create -- whose frame
+// also contains a by-value UiControlConfig struct -- mislays the outgoing stack
+// arguments and corrupts width/height (controls get created at 0 height and are
+// invisible). Keeping the extern call isolated here sidesteps that.
+fn ui_native_control(
+  parent: int64,
+  class_name: cstring,
+  text: cstring,
+  ex_style: uint32,
+  style: uint32,
+  x: int32,
+  y: int32,
+  w: int32,
+  h: int32,
+  control_id: int32) -> int64 {
   return Ui_CreateWindowExA(
-    config.ex_style,
-    config.class_name,
-    config.text,
-    UI_WS_CHILD() | UI_WS_VISIBLE() | config.style,
-    config.rect.left,
-    config.rect.top,
-    ui_rect_width(config.rect),
-    ui_rect_height(config.rect),
+    ex_style,
+    class_name,
+    text,
+    style,
+    x,
+    y,
+    w,
+    h,
     parent,
-    (int64)config.control_id,
+    (int64)control_id,
     ui_app_instance,
     0
   );
 }
 
-export function ui_control_create_raw(parent: int64, class_name: cstring, text: cstring, rect: UiRect, style: uint32, ex_style: uint32, control_id: int32) -> int64 {
-  var config: UiControlConfig;
-  config.class_name = class_name;
-  config.text = text;
-  config.rect = rect;
-  config.style = style;
-  config.ex_style = ex_style;
-  config.control_id = control_id;
-  return ui_control_create(parent, config);
+export fn ui_control_create(parent: int64, config: UiControlConfig) -> int64 {
+  return ui_native_control(
+    parent,
+    config.class_name,
+    config.text,
+    config.ex_style,
+    UI_WS_CHILD() | UI_WS_VISIBLE() | config.style,
+    config.rect.left,
+    config.rect.top,
+    ui_rect_width(config.rect),
+    ui_rect_height(config.rect),
+    config.control_id
+  );
 }
 
-export function ui_button_create(parent: int64, x: int32, y: int32, width: int32, height: int32, label: cstring, control_id: int32) -> int64 {
+export fn ui_control_create_raw(parent: int64, class_name: cstring, text: cstring, rect: UiRect, style: uint32, ex_style: uint32, control_id: int32) -> int64 {
+  return ui_native_control(
+    parent,
+    class_name,
+    text,
+    ex_style,
+    UI_WS_CHILD() | UI_WS_VISIBLE() | style,
+    rect.left,
+    rect.top,
+    ui_rect_width(rect),
+    ui_rect_height(rect),
+    control_id
+  );
+}
+
+export fn ui_button_create(parent: int64, x: int32, y: int32, width: int32, height: int32, label: cstring, control_id: int32) -> int64 {
   return ui_control_create_raw(parent, cstr("BUTTON"), label, ui_rect_xywh(x, y, width, height), UI_WS_TABSTOP() | UI_BS_PUSHBUTTON(), 0, control_id);
 }
 
-export function ui_button_create_default(parent: int64, x: int32, y: int32, width: int32, height: int32, label: cstring, control_id: int32) -> int64 {
+export fn ui_button_create_default(parent: int64, x: int32, y: int32, width: int32, height: int32, label: cstring, control_id: int32) -> int64 {
   return ui_control_create_raw(parent, cstr("BUTTON"), label, ui_rect_xywh(x, y, width, height), UI_WS_TABSTOP() | UI_BS_DEFPUSHBUTTON(), 0, control_id);
 }
 
-export function ui_checkbox_create(parent: int64, x: int32, y: int32, width: int32, height: int32, label: cstring, control_id: int32) -> int64 {
+export fn ui_checkbox_create(parent: int64, x: int32, y: int32, width: int32, height: int32, label: cstring, control_id: int32) -> int64 {
   return ui_control_create_raw(parent, cstr("BUTTON"), label, ui_rect_xywh(x, y, width, height), UI_WS_TABSTOP() | UI_BS_AUTOCHECKBOX(), 0, control_id);
 }
 
-export function ui_radio_create(parent: int64, x: int32, y: int32, width: int32, height: int32, label: cstring, control_id: int32) -> int64 {
+export fn ui_radio_create(parent: int64, x: int32, y: int32, width: int32, height: int32, label: cstring, control_id: int32) -> int64 {
   return ui_control_create_raw(parent, cstr("BUTTON"), label, ui_rect_xywh(x, y, width, height), UI_WS_TABSTOP() | UI_BS_AUTORADIOBUTTON(), 0, control_id);
 }
 
-export function ui_groupbox_create(parent: int64, x: int32, y: int32, width: int32, height: int32, label: cstring, control_id: int32) -> int64 {
+export fn ui_groupbox_create(parent: int64, x: int32, y: int32, width: int32, height: int32, label: cstring, control_id: int32) -> int64 {
   return ui_control_create_raw(parent, cstr("BUTTON"), label, ui_rect_xywh(x, y, width, height), UI_BS_GROUPBOX(), 0, control_id);
 }
 
-export function ui_label_create(parent: int64, x: int32, y: int32, width: int32, height: int32, text: cstring, control_id: int32) -> int64 {
+export fn ui_label_create(parent: int64, x: int32, y: int32, width: int32, height: int32, text: cstring, control_id: int32) -> int64 {
   return ui_control_create_raw(parent, cstr("STATIC"), text, ui_rect_xywh(x, y, width, height), UI_SS_LEFT(), 0, control_id);
 }
 
-export function ui_label_create_center(parent: int64, x: int32, y: int32, width: int32, height: int32, text: cstring, control_id: int32) -> int64 {
+export fn ui_label_create_center(parent: int64, x: int32, y: int32, width: int32, height: int32, text: cstring, control_id: int32) -> int64 {
   return ui_control_create_raw(parent, cstr("STATIC"), text, ui_rect_xywh(x, y, width, height), UI_SS_CENTER() | UI_SS_CENTERIMAGE(), 0, control_id);
 }
 
-export function ui_textbox_create(parent: int64, x: int32, y: int32, width: int32, height: int32, control_id: int32) -> int64 {
+export fn ui_textbox_create(parent: int64, x: int32, y: int32, width: int32, height: int32, control_id: int32) -> int64 {
   return ui_control_create_raw(parent, cstr("EDIT"), cstr(""), ui_rect_xywh(x, y, width, height), UI_WS_TABSTOP() | UI_WS_BORDER() | UI_ES_LEFT() | UI_ES_AUTOHSCROLL(), UI_WS_EX_CLIENTEDGE(), control_id);
 }
 
-export function ui_textbox_create_multiline(parent: int64, x: int32, y: int32, width: int32, height: int32, control_id: int32) -> int64 {
+export fn ui_textbox_create_multiline(parent: int64, x: int32, y: int32, width: int32, height: int32, control_id: int32) -> int64 {
   return ui_control_create_raw(parent, cstr("EDIT"), cstr(""), ui_rect_xywh(x, y, width, height), UI_WS_TABSTOP() | UI_WS_BORDER() | UI_WS_VSCROLL() | UI_ES_LEFT() | UI_ES_MULTILINE() | UI_ES_AUTOVSCROLL(), UI_WS_EX_CLIENTEDGE(), control_id);
 }
 
-export function ui_listbox_create(parent: int64, x: int32, y: int32, width: int32, height: int32, control_id: int32) -> int64 {
+export fn ui_listbox_create(parent: int64, x: int32, y: int32, width: int32, height: int32, control_id: int32) -> int64 {
   return ui_control_create_raw(parent, cstr("LISTBOX"), cstr(""), ui_rect_xywh(x, y, width, height), UI_WS_TABSTOP() | UI_WS_BORDER() | UI_WS_VSCROLL() | UI_LBS_NOTIFY(), UI_WS_EX_CLIENTEDGE(), control_id);
 }
 
-export function ui_combobox_create(parent: int64, x: int32, y: int32, width: int32, height: int32, control_id: int32) -> int64 {
+export fn ui_combobox_create(parent: int64, x: int32, y: int32, width: int32, height: int32, control_id: int32) -> int64 {
   return ui_control_create_raw(parent, cstr("COMBOBOX"), cstr(""), ui_rect_xywh(x, y, width, height), UI_WS_TABSTOP() | UI_CBS_DROPDOWNLIST() | UI_CBS_AUTOHSCROLL(), 0, control_id);
 }
 
-export function ui_control_set_text(control: int64, text: cstring) {
+export fn ui_control_set_text(control: int64, text: cstring) {
   Ui_SetWindowTextA(control, text);
 }
 
-export function ui_control_get_text(control: int64, buf: cstring, max_len: int32) -> int32 {
+export fn ui_control_get_text(control: int64, buf: cstring, max_len: int32) -> int32 {
   return Ui_GetWindowTextA(control, buf, max_len);
 }
 
-export function ui_control_text_length(control: int64) -> int32 {
+export fn ui_control_text_length(control: int64) -> int32 {
   return (int32)Ui_SendMessageA(control, UI_WM_GETTEXTLENGTH(), 0, 0);
 }
 
-export function ui_control_move(control: int64, x: int32, y: int32, width: int32, height: int32) {
+export fn ui_control_move(control: int64, x: int32, y: int32, width: int32, height: int32) {
   Ui_MoveWindow(control, x, y, width, height, 1);
 }
 
-export function ui_control_move_rect(control: int64, rect: UiRect) {
+export fn ui_control_move_rect(control: int64, rect: UiRect) {
   Ui_MoveWindow(control, rect.left, rect.top, ui_rect_width(rect), ui_rect_height(rect), 1);
 }
 
-export function ui_control_show(control: int64) {
+export fn ui_control_show(control: int64) {
   Ui_ShowWindow(control, UI_SW_SHOW());
 }
 
-export function ui_control_hide(control: int64) {
+export fn ui_control_hide(control: int64) {
   Ui_ShowWindow(control, UI_SW_HIDE());
 }
 
-export function ui_control_enable(control: int64, enabled: int32) {
+export fn ui_control_enable(control: int64, enabled: int32) {
   Ui_EnableWindow(control, enabled);
 }
 
-export function ui_control_focus(control: int64) {
+export fn ui_control_focus(control: int64) {
   Ui_SetFocus(control);
 }
 
-export function ui_control_set_font(control: int64, font: int64) {
+export fn ui_control_set_font(control: int64, font: int64) {
   Ui_SendMessageA(control, UI_WM_SETFONT(), font, 1);
 }
 
-export function ui_checkbox_is_checked(control: int64) -> int32 {
+export fn ui_checkbox_is_checked(control: int64) -> int32 {
   if ((int32)Ui_SendMessageA(control, UI_BM_GETCHECK(), 0, 0) == UI_BST_CHECKED()) {
     return 1;
   }
   return 0;
 }
 
-export function ui_checkbox_set_checked(control: int64, checked: int32) {
+export fn ui_checkbox_set_checked(control: int64, checked: int32) {
   if (checked != 0) {
     Ui_SendMessageA(control, UI_BM_SETCHECK(), UI_BST_CHECKED(), 0);
     return;
@@ -1048,65 +1089,65 @@ export function ui_checkbox_set_checked(control: int64, checked: int32) {
   Ui_SendMessageA(control, UI_BM_SETCHECK(), UI_BST_UNCHECKED(), 0);
 }
 
-export function ui_listbox_add(control: int64, text: cstring) -> int32 {
+export fn ui_listbox_add(control: int64, text: cstring) -> int32 {
   return (int32)Ui_SendMessageA(control, UI_LB_ADDSTRING(), 0, (int64)text);
 }
 
-export function ui_listbox_clear(control: int64) {
+export fn ui_listbox_clear(control: int64) {
   Ui_SendMessageA(control, UI_LB_RESETCONTENT(), 0, 0);
 }
 
-export function ui_listbox_selected(control: int64) -> int32 {
+export fn ui_listbox_selected(control: int64) -> int32 {
   return (int32)Ui_SendMessageA(control, UI_LB_GETCURSEL(), 0, 0);
 }
 
-export function ui_listbox_select(control: int64, index: int32) {
+export fn ui_listbox_select(control: int64, index: int32) {
   Ui_SendMessageA(control, UI_LB_SETCURSEL(), index, 0);
 }
 
-export function ui_combobox_add(control: int64, text: cstring) -> int32 {
+export fn ui_combobox_add(control: int64, text: cstring) -> int32 {
   return (int32)Ui_SendMessageA(control, UI_CB_ADDSTRING(), 0, (int64)text);
 }
 
-export function ui_combobox_clear(control: int64) {
+export fn ui_combobox_clear(control: int64) {
   Ui_SendMessageA(control, UI_CB_RESETCONTENT(), 0, 0);
 }
 
-export function ui_combobox_selected(control: int64) -> int32 {
+export fn ui_combobox_selected(control: int64) -> int32 {
   return (int32)Ui_SendMessageA(control, UI_CB_GETCURSEL(), 0, 0);
 }
 
-export function ui_combobox_select(control: int64, index: int32) {
+export fn ui_combobox_select(control: int64, index: int32) {
   Ui_SendMessageA(control, UI_CB_SETCURSEL(), index, 0);
 }
 
 // Menus.
-export function ui_menu_create() -> int64 {
+export fn ui_menu_create() -> int64 {
   return Ui_CreateMenu();
 }
 
-export function ui_menu_popup_create() -> int64 {
+export fn ui_menu_popup_create() -> int64 {
   return Ui_CreatePopupMenu();
 }
 
-export function ui_menu_append_item(menu: int64, item_id: int32, text: cstring) -> int32 {
+export fn ui_menu_append_item(menu: int64, item_id: int32, text: cstring) -> int32 {
   return Ui_AppendMenuA(menu, UI_MF_STRING(), item_id, text);
 }
 
-export function ui_menu_append_separator(menu: int64) -> int32 {
+export fn ui_menu_append_separator(menu: int64) -> int32 {
   return Ui_AppendMenuA(menu, UI_MF_SEPARATOR(), 0, 0);
 }
 
-export function ui_menu_append_popup(menu: int64, popup: int64, text: cstring) -> int32 {
+export fn ui_menu_append_popup(menu: int64, popup: int64, text: cstring) -> int32 {
   return Ui_AppendMenuA(menu, UI_MF_POPUP(), popup, text);
 }
 
-export function ui_window_set_menu(hwnd: int64, menu: int64) -> int32 {
+export fn ui_window_set_menu(hwnd: int64, menu: int64) -> int32 {
   var result: int32 = Ui_SetMenu(hwnd, menu);
   Ui_DrawMenuBar(hwnd);
   return result;
 }
 
-export function ui_menu_destroy(menu: int64) -> int32 {
+export fn ui_menu_destroy(menu: int64) -> int32 {
   return Ui_DestroyMenu(menu);
 }

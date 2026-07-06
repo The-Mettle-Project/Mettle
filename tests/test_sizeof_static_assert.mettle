@@ -8,11 +8,11 @@ struct BudgetedEntity {
 static_assert(sizeof(BudgetedEntity) <= 24);
 static_assert(sizeof(int64) == 8);
 
-function scene_row_bytes() -> int64 {
+fn scene_row_bytes() -> int64 {
   return sizeof(BudgetedEntity);
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   if (scene_row_bytes() == 24) {
     return 0;
   }

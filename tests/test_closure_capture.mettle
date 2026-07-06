@@ -1,0 +1,44 @@
+// Capturing closures: a lambda that references an enclosing local captures it
+// by value (a snapshot taken when the closure is created). The closure value is
+// an 8-byte pointer to a heap environment; stored in an inferred local and
+// called like any function.
+import "std/io";
+
+fn main() -> int32 {
+  var base: int32 = 10;
+  var add: Fn(int32) -> int32 = fn(x: int32) -> int32 { return x + base; };
+  if (add(5) != 15) {
+    return 1;
+  }
+  if (add(100) != 110) {
+    return 2;
+  }
+
+  // Multiple captures.
+  var a: int32 = 3;
+  var b: int32 = 100;
+  var sum3: Fn(int32) -> int32 = fn(x: int32) -> int32 { return x + a + b; };
+  if (sum3(5) != 108) {
+    return 3;
+  }
+
+  // By-value snapshot: mutating the captured variable after the closure is
+  // created does not change what the closure sees.
+  a = 999;
+  if (sum3(5) != 108) {
+    return 4;
+  }
+
+  // A closure driving a loop over local state.
+  var total: int32 = 0;
+  var i: int32 = 0;
+  var dbl: fn(int32) -> int32 = fn(v: int32) -> int32 { return v * 2; };
+  while (i < 4) {
+    total = total + dbl(i);
+    i = i + 1;
+  }
+  if (total != 12) {
+    return 5;
+  }
+  return 0;
+}

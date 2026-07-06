@@ -2,7 +2,7 @@
 // makes the body non-straight-line, so no vectorizer claims it. Checks that the
 // bail-reason analyzer names control flow (not a spurious "function call" from
 // the -O runtime-check traps, which it filters out).
-function sel(a: int32*, n: int32) -> int64 {
+fn sel(a: int32*, n: int32) -> int64 {
   var s: int64 = 0;
   @simd! for i in 0..n {
     if (a[i] > 0) { s = s + (int64)a[i]; }
@@ -10,4 +10,4 @@ function sel(a: int32*, n: int32) -> int64 {
   return s;
 }
 
-function main() -> int32 { return 0; }
+fn main() -> int32 { return 0; }

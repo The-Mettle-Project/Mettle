@@ -556,6 +556,130 @@ static void ir_cp_prune_dead_entries(IRTempValueMap *map,
   }
 }
 
+static int ir_try_evaluate_integer_binary(const char *op, long long lhs,
+                                          long long rhs, long long *result,
+                                          int *folded);
+
+/* Constant value of an operand under the current propagation maps, WITHOUT
+ * rewriting the operand (a persistent rewrite would perturb the shape the
+ * SIMD recognizers pattern-match downstream). */
+static int ir_cp_operand_constant(const IRTempValueMap *temp_map,
+                                  const IRTempValueMap *symbol_map,
+                                  const IROperand *operand, long long *out) {
+  if (operand->kind == IR_OPERAND_INT) {
+    *out = operand->int_value;
+    return 1;
+  }
+  const IROperand *known = NULL;
+  if (operand->kind == IR_OPERAND_TEMP && operand->name) {
+    known = ir_temp_value_map_lookup(temp_map, operand->name);
+  } else if (operand->kind == IR_OPERAND_SYMBOL && operand->name) {
+    known = ir_temp_value_map_lookup(symbol_map, operand->name);
+  }
+  if (known && known->kind == IR_OPERAND_INT) {
+    *out = known->int_value;
+    return 1;
+  }
+  return 0;
+}
+
+/* Fold `dest = a op b` to `dest <- C` the moment the propagation maps prove
+ * both operands constant, INSIDE the propagation walk. Recording the result
+ * immediately lets an entire arithmetic chain over one variable
+ * (`m = m ^ K; m = m * P; ...` - the shape inlining a keyed helper with
+ * constant arguments produces) collapse in a single pass instead of one
+ * step per fixpoint round. Operands are consulted, never rewritten, so
+ * partially-constant expressions keep their recognizable shape.
+ *
+ * Width discipline (the canonical-homes contract): a temp computes at the
+ * full 64-bit width; a typed local's result wraps to its declared width on
+ * the write. So a TEMP dest folds as-is, a SYMBOL dest folds only when its
+ * declared type is known, with the result narrowed accordingly, and
+ * comparisons fold at operand width regardless of dest. Sign-sensitive ops
+ * are skipped when the instruction is unsigned: the evaluator computes
+ * signed semantics. */
+static void ir_cp_fold_constant_binary(const IRFunction *function,
+                                       const IRTempValueMap *temp_map,
+                                       const IRTempValueMap *symbol_map,
+                                       IRInstruction *instruction,
+                                       int *any_changed) {
+  if (!instruction || instruction->op != IR_OP_BINARY ||
+      instruction->is_float || !instruction->text) {
+    return;
+  }
+  long long lhs = 0, rhs = 0;
+  if (!ir_cp_operand_constant(temp_map, symbol_map, &instruction->lhs, &lhs) ||
+      !ir_cp_operand_constant(temp_map, symbol_map, &instruction->rhs, &rhs)) {
+    return;
+  }
+  const char *op = instruction->text;
+  if (instruction->is_unsigned) {
+    if (strcmp(op, ">>") == 0 || strcmp(op, "/") == 0 ||
+        strcmp(op, "%") == 0 || strcmp(op, "<") == 0 ||
+        strcmp(op, "<=") == 0 || strcmp(op, ">") == 0 ||
+        strcmp(op, ">=") == 0) {
+      return;
+    }
+  }
+
+  /* Result-width narrowing for typed symbol destinations. */
+  int narrow_bits = 0; /* 0 = keep 64-bit */
+  int narrow_unsigned = 0;
+  int is_compare = strcmp(op, "==") == 0 || strcmp(op, "!=") == 0 ||
+                   strcmp(op, "<") == 0 || strcmp(op, "<=") == 0 ||
+                   strcmp(op, ">") == 0 || strcmp(op, ">=") == 0;
+  if (instruction->dest.kind == IR_OPERAND_SYMBOL && !is_compare) {
+    const char *type = instruction->dest.name
+                           ? ir_function_local_declared_type(
+                                 (IRFunction *)function,
+                                 instruction->dest.name)
+                           : NULL;
+    if (!type) {
+      return; /* global or untracked local: width unknown, don't fold */
+    }
+    if (strcmp(type, "int64") == 0) {
+      narrow_bits = 0;
+    } else if (strcmp(type, "uint64") == 0) {
+      narrow_bits = 0;
+      narrow_unsigned = 1;
+    } else if (strcmp(type, "int32") == 0) {
+      narrow_bits = 32;
+    } else if (strcmp(type, "int16") == 0) {
+      narrow_bits = 16;
+    } else if (strcmp(type, "int8") == 0) {
+      narrow_bits = 8;
+    } else if (strcmp(type, "uint32") == 0) {
+      narrow_bits = 32;
+      narrow_unsigned = 1;
+    } else if (strcmp(type, "uint16") == 0) {
+      narrow_bits = 16;
+      narrow_unsigned = 1;
+    } else if (strcmp(type, "uint8") == 0 || strcmp(type, "bool") == 0) {
+      narrow_bits = 8;
+      narrow_unsigned = 1;
+    } else {
+      return; /* pointer/float/struct-typed home: not an integer fold */
+    }
+  }
+  (void)narrow_unsigned;
+
+  long long result = 0;
+  int folded = 0;
+  if (!ir_try_evaluate_integer_binary(op, lhs, rhs, &result, &folded) ||
+      !folded) {
+    return;
+  }
+  if (narrow_bits > 0) {
+    int shift = 64 - narrow_bits;
+    if (narrow_unsigned) {
+      result = (long long)(((unsigned long long)result << shift) >> shift);
+    } else {
+      result = (result << shift) >> shift;
+    }
+  }
+  ir_rewrite_to_assign_int(instruction, result, any_changed);
+}
+
 int ir_copy_and_constant_propagation_pass(IRFunction *function,
                                                  int *changed) {
   if (!function) {
@@ -692,6 +816,8 @@ int ir_copy_and_constant_propagation_pass(IRFunction *function,
         return 0;
       }
 
+      ir_cp_fold_constant_binary(function, &map, &symbol_map, instruction,
+                                 &any_changed);
 
       if (ir_instruction_writes_temp(instruction) && instruction->dest.name) {
         ir_temp_value_map_remove(&map, instruction->dest.name);

@@ -92,6 +92,7 @@ ASTNode *ast_clone_node(ASTNode *node) {
     dst->is_extern = src->is_extern;
     dst->is_exported = src->is_exported;
     dst->is_const = src->is_const;
+    dst->structural_type = src->structural_type;
     dst->link_name = ast_copy_string(src->link_name);
     dst->initializer =
         src->initializer ? ast_clone_node(src->initializer) : NULL;
@@ -100,6 +101,7 @@ ASTNode *ast_clone_node(ASTNode *node) {
     clone->data = dst;
     break;
   }
+  case AST_LAMBDA_EXPRESSION:
   case AST_FUNCTION_DECLARATION: {
     FunctionDeclaration *src = (FunctionDeclaration *)node->data;
     FunctionDeclaration *dst = malloc(sizeof(FunctionDeclaration));
@@ -126,7 +128,14 @@ ASTNode *ast_clone_node(ASTNode *node) {
     dst->is_noinline = src->is_noinline;
     dst->is_pure = src->is_pure;
     dst->is_noalloc = src->is_noalloc;
+    dst->is_test = src->is_test;
     dst->simd_mode = src->simd_mode;
+    dst->captured_count = src->captured_count;
+    dst->captured_names =
+        ast_copy_string_array(src->captured_names, src->captured_count);
+    dst->captured_types =
+        ast_copy_string_array(src->captured_types, src->captured_count);
+    dst->env_struct_name = ast_intern_string(src->env_struct_name);
     if (src->parameter_count > 0) {
       dst->parameter_names = malloc(src->parameter_count * sizeof(char *));
       dst->parameter_types = malloc(src->parameter_count * sizeof(char *));
@@ -194,6 +203,7 @@ ASTNode *ast_clone_node(ASTNode *node) {
     dst->argument_count = src->argument_count;
     dst->type_arg_count = src->type_arg_count;
     dst->is_indirect_call = src->is_indirect_call;
+    dst->callee_closure_env = src->callee_closure_env;
     dst->object = src->object ? ast_clone_node(src->object) : NULL;
     if (dst->object)
       ast_add_child(clone, dst->object);
@@ -431,6 +441,24 @@ ASTNode *ast_clone_node(ASTNode *node) {
     dst->operand = src->operand ? ast_clone_node(src->operand) : NULL;
     if (dst->operand)
       ast_add_child(clone, dst->operand);
+    clone->data = dst;
+    break;
+  }
+  case AST_CLOSURE_ADAPT_EXPRESSION: {
+    ClosureAdapt *src = (ClosureAdapt *)node->data;
+    ClosureAdapt *dst = malloc(sizeof(ClosureAdapt));
+    if (!dst) {
+      free(clone);
+      return NULL;
+    }
+    dst->ctor_name = ast_intern_string(src->ctor_name);
+    dst->return_type = ast_intern_string(src->return_type);
+    dst->param_count = src->param_count;
+    dst->param_types =
+        ast_copy_string_array(src->param_types, src->param_count);
+    dst->inner = src->inner ? ast_clone_node(src->inner) : NULL;
+    if (dst->inner)
+      ast_add_child(clone, dst->inner);
     clone->data = dst;
     break;
   }
@@ -730,6 +758,7 @@ void ast_destroy_node(ASTNode *node) {
     }
     break;
   }
+  case AST_LAMBDA_EXPRESSION:
   case AST_FUNCTION_DECLARATION: {
     FunctionDeclaration *func_decl = (FunctionDeclaration *)node->data;
     if (func_decl) {
@@ -748,6 +777,13 @@ void ast_destroy_node(ASTNode *node) {
       }
       free(func_decl->type_params);
       free(func_decl->type_param_traits);
+      for (size_t i = 0; i < func_decl->captured_count; i++) {
+        ast_free_string(func_decl->captured_names[i]);
+        ast_free_string(func_decl->captured_types[i]);
+      }
+      free(func_decl->captured_names);
+      free(func_decl->captured_types);
+      ast_free_string(func_decl->env_struct_name);
       free(func_decl);
     }
     break;
@@ -941,6 +977,19 @@ void ast_destroy_node(ASTNode *node) {
     if (cast_expr) {
       ast_free_string(cast_expr->type_name);
       free(cast_expr);
+    }
+    break;
+  }
+  case AST_CLOSURE_ADAPT_EXPRESSION: {
+    ClosureAdapt *adapt = (ClosureAdapt *)node->data;
+    if (adapt) {
+      ast_free_string(adapt->ctor_name);
+      ast_free_string(adapt->return_type);
+      for (size_t i = 0; i < adapt->param_count; i++) {
+        ast_free_string(adapt->param_types[i]);
+      }
+      free(adapt->param_types);
+      free(adapt);
     }
     break;
   }
@@ -1147,6 +1196,7 @@ ASTNode *ast_create_var_declaration(const char *name, const char *type_name,
   var_decl->is_extern = 0;
   var_decl->is_exported = 0;
   var_decl->is_const = 0;
+  var_decl->structural_type = 0;
   var_decl->link_name = NULL;
   node->data = var_decl;
 
@@ -1186,7 +1236,12 @@ ASTNode *ast_create_function_declaration(const char *name, char **param_names,
   func_decl->is_noinline = 0;
   func_decl->is_pure = 0;
   func_decl->is_noalloc = 0;
+  func_decl->is_test = 0;
   func_decl->simd_mode = SIMD_ATTR_NONE;
+  func_decl->captured_names = NULL;
+  func_decl->captured_types = NULL;
+  func_decl->captured_count = 0;
+  func_decl->env_struct_name = NULL;
 
   if (param_count > 0) {
     func_decl->parameter_names = malloc(param_count * sizeof(char *));
@@ -1431,6 +1486,7 @@ ASTNode *ast_create_call_expression(const char *function_name,
   call_expr->type_args = NULL;
   call_expr->type_arg_count = 0;
   call_expr->is_indirect_call = 0;
+  call_expr->callee_closure_env = NULL;
 
   if (argument_count > 0) {
     call_expr->arguments = malloc(argument_count * sizeof(ASTNode *));
@@ -1721,6 +1777,7 @@ ASTNode *ast_create_method_call(ASTNode *object, const char *method_name,
   call_expr->type_args = NULL;
   call_expr->type_arg_count = 0;
   call_expr->is_indirect_call = 0;
+  call_expr->callee_closure_env = NULL;
 
   if (argument_count > 0) {
     call_expr->arguments = malloc(argument_count * sizeof(ASTNode *));
@@ -1963,6 +2020,34 @@ ASTNode *ast_create_cast_expression(const char *type_name, ASTNode *operand,
 
   if (operand) {
     ast_add_child(node, operand);
+  }
+
+  return node;
+}
+
+ASTNode *ast_create_closure_adapt(ASTNode *inner, const char *ctor_name,
+                                  char **param_types, size_t param_count,
+                                  const char *return_type,
+                                  SourceLocation location) {
+  ASTNode *node = ast_create_node(AST_CLOSURE_ADAPT_EXPRESSION, location);
+  if (!node)
+    return NULL;
+
+  ClosureAdapt *adapt = malloc(sizeof(ClosureAdapt));
+  if (!adapt) {
+    free(node);
+    return NULL;
+  }
+
+  adapt->ctor_name = ast_intern_string(ctor_name);
+  adapt->return_type = ast_intern_string(return_type);
+  adapt->param_count = param_count;
+  adapt->param_types = ast_copy_string_array(param_types, param_count);
+  adapt->inner = inner;
+  node->data = adapt;
+
+  if (inner) {
+    ast_add_child(node, inner);
   }
 
   return node;

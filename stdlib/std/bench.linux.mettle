@@ -7,9 +7,9 @@
 
 // clock_gettime(clk_id, timespec*) -> 0 on success. timespec is 16 bytes:
 // tv_sec @0 (int64), tv_nsec @8 (int64). CLOCK_MONOTONIC = 1 on Linux.
-extern function clock_gettime(clk_id: int32, ts: cstring) -> int32 = "clock_gettime";
+extern fn clock_gettime(clk_id: int32, ts: cstring) -> int32 = "clock_gettime";
 
-export function bench_time_us() -> uint64 {
+export fn bench_time_us() -> uint64 {
   var ts: uint8[16];
   if (clock_gettime(1, &ts[0]) != 0) {
     return 0;

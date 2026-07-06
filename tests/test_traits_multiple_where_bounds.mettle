@@ -4,11 +4,11 @@ trait SignedNumber;
 impl Addable for int32;
 impl SignedNumber for int32;
 
-function add_one<T: Addable>(value: T) -> T where T: SignedNumber {
+fn add_one<T: Addable>(value: T) -> T where T: SignedNumber {
     return value + 1;
 }
 
-function identity<T>(value: T) -> T where T: Addable + SignedNumber {
+fn identity<T>(value: T) -> T where T: Addable + SignedNumber {
     return value;
 }
 
@@ -16,7 +16,7 @@ struct Box<T> where T: Addable + SignedNumber {
     value: T;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     var box: Box<int32>;
     box.value = identity<int32>(add_one<int32>(41));
     return box.value;

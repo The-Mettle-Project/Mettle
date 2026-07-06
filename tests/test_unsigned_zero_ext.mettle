@@ -1,14 +1,14 @@
 // Unsigned zero-extension: uint8/uint16 widened must use movzx (not movsx)
 // 255 as uint8 -> uint64 must stay 255; 65535 as uint16 -> uint64 must stay 65535
-function widen_u8(x: uint8) -> uint64 {
+fn widen_u8(x: uint8) -> uint64 {
   return x;
 }
 
-function widen_u16(x: uint16) -> uint64 {
+fn widen_u16(x: uint16) -> uint64 {
   return x;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var a: uint8 = 255;
   var b: uint16 = 65535;
   var x: uint64 = widen_u8(a);

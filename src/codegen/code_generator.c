@@ -261,9 +261,11 @@ char *code_generator_generate_label(CodeGenerator *generator,
     return NULL;
   }
 
-  char *label = malloc(64);
+  enum { LABEL_BUFFER_SIZE = 64 };
+  char *label = malloc(LABEL_BUFFER_SIZE);
   if (label) {
-    snprintf(label, 64, "L%s%d", prefix, generator->current_label_id++);
+    snprintf(label, LABEL_BUFFER_SIZE, "L%s%d", prefix,
+             generator->current_label_id++);
   }
   return label;
 }
@@ -382,153 +384,4 @@ int code_generator_is_floating_point_type(Type *type) {
          strcmp(type->name, "float64") == 0 ||
          strcmp(type->name, "double") == 0 ||
          strcmp(type->name, "float") == 0;
-}
-
-const char *code_generator_get_register_name(x86Register reg) {
-  switch (reg) {
-  case REG_RAX:
-    return "rax";
-  case REG_RBX:
-    return "rbx";
-  case REG_RCX:
-    return "rcx";
-  case REG_RDX:
-    return "rdx";
-  case REG_RSI:
-    return "rsi";
-  case REG_RDI:
-    return "rdi";
-  case REG_RSP:
-    return "rsp";
-  case REG_RBP:
-    return "rbp";
-  case REG_R8:
-    return "r8";
-  case REG_R9:
-    return "r9";
-  case REG_R10:
-    return "r10";
-  case REG_R11:
-    return "r11";
-  case REG_R12:
-    return "r12";
-  case REG_R13:
-    return "r13";
-  case REG_R14:
-    return "r14";
-  case REG_R15:
-    return "r15";
-  case REG_XMM0:
-    return "xmm0";
-  case REG_XMM1:
-    return "xmm1";
-  case REG_XMM2:
-    return "xmm2";
-  case REG_XMM3:
-    return "xmm3";
-  case REG_XMM4:
-    return "xmm4";
-  case REG_XMM5:
-    return "xmm5";
-  case REG_XMM6:
-    return "xmm6";
-  case REG_XMM7:
-    return "xmm7";
-  case REG_XMM8:
-    return "xmm8";
-  case REG_XMM9:
-    return "xmm9";
-  case REG_XMM10:
-    return "xmm10";
-  case REG_XMM11:
-    return "xmm11";
-  case REG_XMM12:
-    return "xmm12";
-  case REG_XMM13:
-    return "xmm13";
-  case REG_XMM14:
-    return "xmm14";
-  case REG_XMM15:
-    return "xmm15";
-  default:
-    return NULL;
-  }
-}
-
-const char *code_generator_get_subregister_name(x86Register reg,
-                                                int width_bits) {
-  switch (reg) {
-  case REG_RAX:
-    return width_bits == 8    ? "al"
-           : width_bits == 16 ? "ax"
-           : width_bits == 32 ? "eax"
-                              : "rax";
-  case REG_RBX:
-    return width_bits == 8    ? "bl"
-           : width_bits == 16 ? "bx"
-           : width_bits == 32 ? "ebx"
-                              : "rbx";
-  case REG_RCX:
-    return width_bits == 8    ? "cl"
-           : width_bits == 16 ? "cx"
-           : width_bits == 32 ? "ecx"
-                              : "rcx";
-  case REG_RDX:
-    return width_bits == 8    ? "dl"
-           : width_bits == 16 ? "dx"
-           : width_bits == 32 ? "edx"
-                              : "rdx";
-  case REG_RSI:
-    return width_bits == 8    ? "sil"
-           : width_bits == 16 ? "si"
-           : width_bits == 32 ? "esi"
-                              : "rsi";
-  case REG_RDI:
-    return width_bits == 8    ? "dil"
-           : width_bits == 16 ? "di"
-           : width_bits == 32 ? "edi"
-                              : "rdi";
-  case REG_R8:
-    return width_bits == 8    ? "r8b"
-           : width_bits == 16 ? "r8w"
-           : width_bits == 32 ? "r8d"
-                              : "r8";
-  case REG_R9:
-    return width_bits == 8    ? "r9b"
-           : width_bits == 16 ? "r9w"
-           : width_bits == 32 ? "r9d"
-                              : "r9";
-  case REG_R10:
-    return width_bits == 8    ? "r10b"
-           : width_bits == 16 ? "r10w"
-           : width_bits == 32 ? "r10d"
-                              : "r10";
-  case REG_R11:
-    return width_bits == 8    ? "r11b"
-           : width_bits == 16 ? "r11w"
-           : width_bits == 32 ? "r11d"
-                              : "r11";
-  case REG_R12:
-    return width_bits == 8    ? "r12b"
-           : width_bits == 16 ? "r12w"
-           : width_bits == 32 ? "r12d"
-                              : "r12";
-  case REG_R13:
-    return width_bits == 8    ? "r13b"
-           : width_bits == 16 ? "r13w"
-           : width_bits == 32 ? "r13d"
-                              : "r13";
-  case REG_R14:
-    return width_bits == 8    ? "r14b"
-           : width_bits == 16 ? "r14w"
-           : width_bits == 32 ? "r14d"
-                              : "r14";
-  case REG_R15:
-    return width_bits == 8    ? "r15b"
-           : width_bits == 16 ? "r15w"
-           : width_bits == 32 ? "r15d"
-                              : "r15";
-  default:
-    return NULL;
-  }
 }

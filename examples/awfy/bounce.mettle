@@ -8,20 +8,20 @@ import "std/math";
 struct Ball { x: int32; y: int32; xVel: int32; yVel: int32; }
 
 var rnd_seed: int32 = 74755;
-function rnd_reset() { rnd_seed = 74755; }
-function rnd_next() -> int32 {
+fn rnd_reset() { rnd_seed = 74755; }
+fn rnd_next() -> int32 {
   rnd_seed = ((rnd_seed * 1309) + 13849) & 65535;
   return rnd_seed;
 }
 
-function ball_init(b: Ball*) {
+fn ball_init(b: Ball*) {
   b->x = rnd_next() % 500;
   b->y = rnd_next() % 500;
   b->xVel = (rnd_next() % 300) - 150;
   b->yVel = (rnd_next() % 300) - 150;
 }
 
-function ball_bounce(b: Ball*) -> int32 {
+fn ball_bounce(b: Ball*) -> int32 {
   var xLimit: int32 = 500;
   var yLimit: int32 = 500;
   var bounced: int32 = 0;
@@ -34,7 +34,7 @@ function ball_bounce(b: Ball*) -> int32 {
   return bounced;
 }
 
-function benchmark(balls: Ball*) -> int32 {
+fn benchmark(balls: Ball*) -> int32 {
   rnd_reset();
   var ballCount: int32 = 100;
   var bounces: int32 = 0;
@@ -52,7 +52,7 @@ function benchmark(balls: Ball*) -> int32 {
   return bounces;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var passes: int32 = 1500;
   var balls: Ball[100];
   var last: int32 = 0;

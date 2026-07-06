@@ -1,0 +1,6 @@
+// Float arithmetic + int cast: (1.5*2.0 + 0.5) * 10 = 35.
+fn main() -> int64 {
+  var f: float64 = 1.5;
+  var g: float64 = f * 2.0 + 0.5;
+  return (int64)(g * 10.0);
+}

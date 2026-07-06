@@ -88,7 +88,7 @@ Arrays and pointers support indexing. The index must be an integer. The expressi
 To pass an array to a function that expects a pointer, use `&arr[0]` or `&buf[0]`. The function parameter should have type `T*`:
 
 ```mettle
-function sum(buf: int32*, len: int32) -> int32 {
+fn sum(buf: int32*, len: int32) -> int32 {
   var total: int32 = 0;
   var i: int32 = 0;
   while (i < len) {

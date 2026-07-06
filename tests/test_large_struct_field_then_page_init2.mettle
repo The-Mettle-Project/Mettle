@@ -1,6 +1,6 @@
 import "std/io";
 
-function main() -> int32 {
+fn main() -> int32 {
   var fp: cstring = fopen("nul", "r");
   if (fp == 0) {
     return 1;

@@ -1,6 +1,6 @@
 // Stack layout: mixed types in sequence — no overlap or misalignment
 // int8, int16, int32, int64, array, scalar — each must retain its value
-function main() -> int32 {
+fn main() -> int32 {
   var a: int8 = 127;
   var b: int16 = -32768;
   var c: int32 = 2147483647;

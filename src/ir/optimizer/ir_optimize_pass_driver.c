@@ -1,4 +1,5 @@
 #include "ir_optimize_internal.h"
+#include "../ir_verify.h"
 
 #include <time.h>
 
@@ -214,6 +215,21 @@ int ir_pass_is_skipped(IROptPassId pass_id) {
   return ir_skip_spec_matches(id_text, ir_opt_pass_name(pass_id));
 }
 
+/* METTLE_NO_SIMD: build a baseline (SSE2-only) binary by skipping every
+ * vectorizer / SLP / SIMD named pass. Those are the only passes that emit
+ * AVX/AVX2/FMA instructions, so a binary built with this set runs on any
+ * x86-64 CPU (SSE2 is mandatory in the x86-64 baseline). Scalar float codegen
+ * already uses legacy SSE2 encodings, so nothing else needs AVX. Use for
+ * distributable builds that must run on older machines. */
+static int ir_no_simd_enabled(void) {
+  static int v = -1;
+  if (v < 0) {
+    const char *e = getenv("METTLE_NO_SIMD");
+    v = (e && e[0] && !(e[0] == '0' && e[1] == '\0')) ? 1 : 0;
+  }
+  return v;
+}
+
 static int ir_run_named_pass(IRFunction *function, const IROptNamedPass *pass,
                              const char *failure_message) {
   int changed = 0;
@@ -222,10 +238,21 @@ static int ir_run_named_pass(IRFunction *function, const IROptNamedPass *pass,
     return 0;
   }
 
+  if (ir_no_simd_enabled()) {
+    return 1;                 /* baseline build: no vectorization, no AVX */
+  }
+
   if (ir_pass_name_is_skipped(pass->name)) {
     ir_trace_pass_event(pass->name, "skipped", NULL, -1);
     return 1;
   }
+
+  if (ir_verify_pass_quarantined(function, pass->name)) {
+    ir_trace_pass_event(pass->name, "quarantined", NULL, -1);
+    return 1;
+  }
+
+  IRVerifySnapshot *verify_snapshot = ir_verify_snapshot_take(function);
 
   mettle_compiler_ctx_set_pass_name(pass->name);
   double t0 = ir_pass_time_begin();
@@ -234,6 +261,12 @@ static int ir_run_named_pass(IRFunction *function, const IROptNamedPass *pass,
     mettle_compiler_ice(failure_message);
   }
   ir_pass_time_end(pass->name, t0);
+
+  if (verify_snapshot) {
+    ir_verify_maybe_sabotage(function, pass->name, &changed);
+    ir_verify_check_pass(function, verify_snapshot, pass->name, &changed);
+    ir_verify_snapshot_free(verify_snapshot);
+  }
 
   ir_trace_pass_event(pass->name, changed ? "changed" : "clean", NULL,
                       changed);
@@ -287,16 +320,36 @@ int ir_run_fixpoint_pass(IRFunction *function, IROptPassId pass_id,
     return 1;
   }
 
+  if (ir_verify_pass_quarantined(function, pass_name)) {
+    ir_trace_pass_event(pass_name, "quarantined", version, -1);
+    clean_version[pass_id] = *version;
+    return 1;
+  }
+
+  IRVerifySnapshot *verify_snapshot = ir_verify_snapshot_take(function);
+
   int pass_changed = 0;
   mettle_compiler_ctx_set_pass_name(pass_name);
   double t0 = ir_pass_time_begin();
   if (!pass || !pass(function, &pass_changed)) {
+    ir_verify_snapshot_free(verify_snapshot);
     ir_trace_pass_event(pass_name, "failed", version, -1);
     return 0;
   }
   if (ir_pass_time_enabled()) {
     g_ir_pass_ms[pass_id] += ir_pass_now_ms() - t0;
     g_ir_pass_runs[pass_id]++;
+  }
+
+  if (verify_snapshot) {
+    ir_verify_maybe_sabotage(function, pass_name, &pass_changed);
+    if (!ir_verify_check_pass(function, verify_snapshot, pass_name,
+                              &pass_changed)) {
+      /* Divergence: IR restored; the pass is quarantined for this function,
+       * so mark it clean at this version rather than re-running it. */
+      clean_version[pass_id] = *version;
+    }
+    ir_verify_snapshot_free(verify_snapshot);
   }
 
   if (pass_changed) {

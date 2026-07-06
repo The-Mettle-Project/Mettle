@@ -1,7 +1,7 @@
-export function public_func() -> int32 {
+export fn public_func() -> int32 {
   return 42;
 }
 
-function private_func() -> int32 {
+fn private_func() -> int32 {
   return 99;
 }

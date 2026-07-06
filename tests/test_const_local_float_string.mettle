@@ -1,0 +1,9 @@
+// Local consts of non-integer type: float and string. The float const drives a
+// deterministic exit code (1.5 * 28 = 42) and the string const is loaded into a
+// typed local so codegen must emit and link it. Returns 42.
+fn main() -> int32 {
+  const RATE: float64 = 1.5;
+  const LABEL: string = "ok";
+  var s: string = LABEL;
+  return (int32)(RATE * 28.0);
+}

@@ -81,8 +81,5 @@ void code_generator_record_runtime_trap_site(
 Type *code_generator_infer_expression_type(CodeGenerator *generator,
                                            ASTNode *expression);
 int code_generator_is_floating_point_type(Type *type);
-const char *code_generator_get_register_name(x86Register reg);
-const char *code_generator_get_subregister_name(x86Register reg,
-                                                int width_bits);
 
 #endif // CODE_GENERATOR_H

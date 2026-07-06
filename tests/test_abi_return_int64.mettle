@@ -1,9 +1,9 @@
 // ABI: int64 return value in RAX (full 64-bit)
-function get64() -> int64 {
+fn get64() -> int64 {
   return 0x123456789ABCDEF0;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var x: int64 = get64();
   if (x == 0x123456789ABCDEF0) {
     return 1;

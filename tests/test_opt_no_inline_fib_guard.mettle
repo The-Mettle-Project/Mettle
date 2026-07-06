@@ -1,5 +1,5 @@
 // fib() must stay out-of-line to avoid compile-time explosion when inlined.
-function fib(n: int32) -> int64 {
+fn fib(n: int32) -> int64 {
   if (n <= 1) {
     return n;
   }
@@ -16,6 +16,6 @@ function fib(n: int32) -> int64 {
   return b;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   return (int32)fib(35);
 }

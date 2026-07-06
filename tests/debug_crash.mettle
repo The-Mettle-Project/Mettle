@@ -5,7 +5,7 @@
 // runtime must stop at the faulting line with stack and variables intact.
 import "std/io";
 
-function main() -> int32 {
+fn main() -> int32 {
     var p: int32* = (int32*)16;
     var i: int32 = 0;
     while (i < 10) {

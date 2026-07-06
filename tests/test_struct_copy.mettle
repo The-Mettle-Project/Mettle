@@ -31,33 +31,33 @@ struct Mixed {
   c: int32;
 }
 
-function write_s(s: cstring) {
+fn write_s(s: cstring) {
   if (s != 0) {
     fputs(s, get_stdout());
   }
 }
 
-function write_i64(v: int64) {
+fn write_i64(v: int64) {
   var buf: uint8[32];
   int_to_dec((cstring)((int64)(&(buf[0]))), v);
   write_s((cstring)((int64)(&(buf[0]))));
 }
 
-function line_i64(label: cstring, v: int64) {
+fn line_i64(label: cstring, v: int64) {
   write_s(label);
   write_s(cstr(" "));
   write_i64(v);
   write_s(cstr("\n"));
 }
 
-function scaled(v: float64) -> int64 {
+fn scaled(v: float64) -> int64 {
   if (v < 0.0) {
     return 0 - (int64)((0.0 - v) * 1000.0);
   }
   return (int64)(v * 1000.0);
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   write_s(cstr("struct copy repro\n"));
 
   var i0: TwoI32;

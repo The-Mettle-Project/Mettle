@@ -1,0 +1,10 @@
+// Sum 1..10 -> 55. while loop + accumulation.
+fn main() -> int64 {
+  var total: int64 = 0;
+  var i: int64 = 1;
+  while (i <= 10) {
+    total = total + i;
+    i = i + 1;
+  }
+  return total;
+}

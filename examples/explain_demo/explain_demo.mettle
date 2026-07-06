@@ -1,0 +1,123 @@
+// Mettle --explain showcase
+//
+// One program that exercises every section of `--explain`, both the classical
+// optimizer report and the learned `--ml-opt` report. Compile with:
+//
+//   mettle --release --explain            examples/explain_demo/explain_demo.mettle
+//   mettle --release --explain --ml-opt   examples/explain_demo/explain_demo.mettle
+//
+// What each piece demonstrates (look for it in the --explain output):
+//   array_sum   - straight-line counted reduction      -> loop VECTORIZED
+//   step        - loop with a data-dependent branch     -> loop NOT vectorized (reason)
+//               - recomputes p*p across that branch      -> --ml-opt: GVN reuse
+//   bit_blend   - tangled bitwise identity               -> --ml-opt: bitwise superoptimize
+//   shuffle     - redundant xor-shift                    -> --ml-opt: xor-shift superoptimize
+//   gcd         - self-recursive                         -> call NOT inlined
+//   lo_byte     - tiny helper                            -> call inlined
+//
+// Build: build.bat    Run: explain_demo.exe
+
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+// Straight-line counted reduction over a unit-stride array: the vectorizer's
+// bread and butter. --explain reports this loop as vectorized.
+fn array_sum(a: int32*, n: int64) -> int64 {
+  var sum: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    sum = sum + (int64)a[i];
+    i = i + 1;
+  }
+  return sum;
+}
+
+// The loop branches on data (i & 1), so it cannot vectorize -- --explain says so
+// and gives the reason. It also computes `p * p` before the branch and AGAIN in
+// the else arm; the first dominates the second, so --ml-opt's GVN reuses it
+// (a cross-block redundancy classical's block-local CSE leaves behind).
+@noinline fn step(p: int64, n: int64) -> int64 {
+  var s: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    s = s + p * p;             // p*p computed into a temp that dominates the if
+    if ((i & 1) == 1) {
+      s = s + p * p + i;       // recomputes p*p across the branch -> GVN reuses it
+    }
+    i = i + 1;
+  }
+  return s;
+}
+
+// ((x|y) ^ (x&y)) | (z&z)  is just  (x^y) | z, but classical and gcc -O3 leave
+// the tangle. The bitwise superoptimizer proves the optimum via truth tables.
+@noinline fn bit_blend(x: int64, y: int64, z: int64) -> int64 {
+  return ((x | y) ^ (x & y)) | (z & z);
+}
+
+// The two `x << 7` terms XOR-cancel, so this whole tangle is provably just `x`.
+// classical and gcc -O3 leave it; the superoptimizer proves the optimum, seeing
+// through the shifts (it treats each shifted term as a value and the truth table
+// collapses (x ^ t) ^ t back to x).
+@noinline fn shuffle(x: int64) -> int64 {
+  return (x ^ (x << 7)) ^ (x << 7);
+}
+
+// Self-recursive: the inliner reports this call as NOT inlined.
+fn gcd(a: int64, b: int64) -> int64 {
+  if (b == 0) {
+    return a;
+  }
+  return gcd(b, a % b);
+}
+
+// Tiny leaf helper: the inliner folds this call into its caller (inlined).
+fn lo_byte(x: int64) -> int64 {
+  return x & 255;
+}
+
+fn main() -> int32 {
+  println(cstr("--explain showcase"));
+
+  var n: int64 = 4096;
+  var a: int32* = (int32*)malloc(n * 4);
+  if (a == 0) {
+    println(cstr("malloc failed"));
+    return 1;
+  }
+  var i: int64 = 0;
+  while (i < n) {
+    a[i] = (int32)((i * 2654435761) % 1009);
+    i = i + 1;
+  }
+
+  var total: int64 = array_sum(a, n);
+  var mixed: int64 = step(7, 1000);
+  var blended: int64 = bit_blend(total, mixed, 0x9E3779B9);
+  var shuffled: int64 = shuffle(blended);
+  var divisor: int64 = gcd(blended, shuffled) + lo_byte(shuffled);
+
+  print(cstr("array_sum  = ")); println_int(total);
+  print(cstr("step       = ")); println_int(mixed);
+  print(cstr("bit_blend  = ")); println_int(blended);
+  print(cstr("shuffle    = ")); println_int(shuffled);
+  print(cstr("gcd+lo     = ")); println_int(divisor);
+
+  // Small benchmark so the example does real work and reports a time.
+  var passes: int32 = 2000;
+  var t0: uint64 = bench_time_us();
+  var bench_sum: int64 = 0;
+  var p: int32 = 0;
+  while (p < passes) {
+    bench_sum = bench_sum + shuffle(bit_blend(total, step(p, 64), bench_sum));
+    p = p + 1;
+  }
+  var elapsed_us: uint64 = bench_time_us() - t0;
+
+  print(cstr("Bench sum  = ")); println_int(bench_sum);
+  print(cstr("Time: ")); print_int(elapsed_us); println(cstr(" us"));
+
+  free((cstring)a);
+  return 0;
+}

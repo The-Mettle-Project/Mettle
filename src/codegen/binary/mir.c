@@ -11,6 +11,7 @@ void mir_function_init(MirFunction *fn, BinaryFunctionContext *context) {
   memset(fn, 0, sizeof(*fn));
   fn->context = context;
   fn->indirect_return_vreg = MIR_VREG_NONE;
+  fn->cur_ir_index = -1; /* no IR instruction open yet (annotator) */
 }
 
 void mir_function_destroy(MirFunction *fn) {
@@ -21,6 +22,10 @@ void mir_function_destroy(MirFunction *fn) {
   free(fn->insns);
   free(fn->fconsts);
   free(fn->iconsts);
+  for (size_t i = 0; i < fn->owned_sym_count; i++) {
+    free(fn->owned_syms[i]);
+  }
+  free(fn->owned_syms);
   memset(fn, 0, sizeof(*fn));
 }
 
@@ -66,6 +71,11 @@ int mir_emit(MirFunction *fn, const MirInst *inst) {
     fn->insn_capacity = new_cap;
   }
   fn->insns[fn->insn_count++] = *inst;
+  /* --annotate-asm: trace each emitted op back to the IR instruction being
+   * lowered, unless the caller already set a specific ir_index. */
+  if (inst->ir_index < 0 && fn->cur_ir_index >= 0) {
+    fn->insns[fn->insn_count - 1].ir_index = fn->cur_ir_index;
+  }
   return 1;
 }
 
@@ -156,15 +166,21 @@ MirOperand mir_op_mem_rbp(int rbp_disp) {
 
 /* ---- dump --------------------------------------------------------------- */
 
-static const char *mir_opcode_name(MirOpcode op) {
+const char *mir_opcode_name(MirOpcode op) {
   switch (op) {
   case MIR_NOP: return "nop";
   case MIR_MOV: return "mov";
   case MIR_LEA: return "lea";
+  case MIR_LEA_LOCAL: return "lea_local";
+  case MIR_LEA_GLOBAL: return "lea_global";
+  case MIR_LEA_FUNC: return "lea_func";
+  case MIR_LEA_CSTR: return "lea_cstr";
   case MIR_MOVZX: return "movzx";
   case MIR_MOVSX: return "movsx";
   case MIR_LOAD_GLOBAL: return "ldglobal";
   case MIR_STORE_GLOBAL: return "stglobal";
+  case MIR_PREFETCH: return "prefetch";
+  case MIR_CMOV: return "cmov";
   case MIR_ADD: return "add";
   case MIR_SUB: return "sub";
   case MIR_AND: return "and";
@@ -180,6 +196,7 @@ static const char *mir_opcode_name(MirOpcode op) {
   case MIR_XOR_RDX: return "xor_rdx";
   case MIR_IDIV: return "idiv";
   case MIR_DIV: return "div";
+  case MIR_MULHI: return "mulhi";
   case MIR_CMP: return "cmp";
   case MIR_TEST: return "test";
   case MIR_SETCC: return "setcc";
@@ -189,6 +206,10 @@ static const char *mir_opcode_name(MirOpcode op) {
   case MIR_CMPBR: return "cmpbr";
   case MIR_LABEL: return "label";
   case MIR_CALL: return "call";
+  case MIR_CALL_INDIRECT: return "call_indirect";
+  case MIR_STORE_OUTARG: return "store_outarg";
+  case MIR_LEA_OUTARG: return "lea_outarg";
+  case MIR_TRAP: return "trap";
   case MIR_RET: return "ret";
   case MIR_FADD: return "fadd";
   case MIR_FSUB: return "fsub";
@@ -216,7 +237,9 @@ static const char *mir_opcode_name(MirOpcode op) {
   case MIR_SIMD_SLP_MAC: return "simd_slp_mac";
   case MIR_SIMD_FILL: return "simd_fill";
   case MIR_SIMD_AFFINE_MAP_F32: return "simd_affine_map_f32";
+  case MIR_SIMD_AFFINE_MAP_F64: return "simd_affine_map_f64";
   case MIR_SIMD_SILU_F32: return "simd_silu_f32";
+  case MIR_SIMD_VLOOP: return "simd_vloop";
   case MIR_OPCODE_COUNT: break;
   }
   return "?";

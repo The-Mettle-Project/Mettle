@@ -1,0 +1,10 @@
+// Stack array: a[i] = i*i for i in 0..4, then sum -> 0+1+4+9+16 = 30.
+fn main() -> int64 {
+  var a: int64[5];
+  var i: int64 = 0;
+  while (i < 5) { a[i] = i * i; i = i + 1; }
+  var s: int64 = 0;
+  i = 0;
+  while (i < 5) { s = s + a[i]; i = i + 1; }
+  return s;
+}

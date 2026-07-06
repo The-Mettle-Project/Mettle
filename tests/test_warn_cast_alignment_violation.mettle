@@ -1,7 +1,7 @@
-extern function malloc(size: int32) -> uint8* = "malloc";
-extern function free(ptr: uint8*) = "free";
+extern fn malloc(size: int32) -> uint8* = "malloc";
+extern fn free(ptr: uint8*) = "free";
 
-function main() -> int32 {
+fn main() -> int32 {
   var p: uint8* = malloc(8);
   if (p == 0) {
     return 1;

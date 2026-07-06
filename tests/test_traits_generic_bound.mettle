@@ -1,7 +1,7 @@
 trait Addable;
 impl Addable for int32;
 
-function add_one<T: Addable>(value: T) -> T {
+fn add_one<T: Addable>(value: T) -> T {
     return value + 1;
 }
 
@@ -9,7 +9,7 @@ struct Box<T: Addable> {
     value: T;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     var box: Box<int32>;
     box.value = add_one<int32>(41);
     return box.value;

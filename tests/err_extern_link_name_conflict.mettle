@@ -1,2 +1,2 @@
-extern function c_print(msg: cstring) -> int32 = "puts";
-extern function c_print(msg: cstring) -> int32 = "printf";
+extern fn c_print(msg: cstring) -> int32 = "puts";
+extern fn c_print(msg: cstring) -> int32 = "printf";

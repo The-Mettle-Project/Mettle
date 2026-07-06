@@ -3,7 +3,7 @@
 // instantly and the crash handler classifies the address as a freed block.
 import "std/mem";
 
-function main() -> int32 {
+fn main() -> int32 {
     var p: cstring = malloc(8192);
     p[0] = 42;
     free(p);

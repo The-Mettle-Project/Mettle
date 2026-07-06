@@ -1,4 +1,4 @@
-function broken_import() -> int32 {
+fn broken_import() -> int32 {
   var x: int32 = ;
   return x;
 }

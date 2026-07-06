@@ -16,22 +16,22 @@
 // Both checks are deterministic (the output buffer is explicitly poisoned with
 // NaN / the inputs are explicit float-NaN bit patterns). Returns 0 on success.
 
-@noinline function poison(z: float64) -> float64 { return z / z; }  // NaN, opaque
+@noinline fn poison(z: float64) -> float64 { return z / z; }  // NaN, opaque
 
-@noinline function amap64(out: float64*, a: float64*, n: int32) {
+@noinline fn amap64(out: float64*, a: float64*, n: int32) {
   var i: int32 = 0;
   while (i < n) { out[i] = a[i] * 2.0 + 1.0; i = i + 1; }   // b == 0
 }
-@noinline function amap32(out: float32*, a: float32*, n: int32) {
+@noinline fn amap32(out: float32*, a: float32*, n: int32) {
   var i: int32 = 0;
   while (i < n) { out[i] = a[i] * 2.0 + 1.0; i = i + 1; }   // b == 0
 }
-@noinline function ucopy(out: uint32*, a: uint32*, n: int32) {
+@noinline fn ucopy(out: uint32*, a: uint32*, n: int32) {
   var i: int32 = 0;
   while (i < n) { out[i] = a[i] + 0; i = i + 1; }            // degenerate copy
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var bad: int32 = 0;
   var n: int32 = 200;
 

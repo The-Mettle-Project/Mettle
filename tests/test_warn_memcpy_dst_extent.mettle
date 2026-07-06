@@ -1,8 +1,8 @@
-extern function malloc(size: int32) -> cstring = "malloc";
-extern function free(ptr: cstring) = "free";
-extern function memcpy(dst: cstring, src: cstring, len: int32) -> cstring = "memcpy";
+extern fn malloc(size: int32) -> cstring = "malloc";
+extern fn free(ptr: cstring) = "free";
+extern fn memcpy(dst: cstring, src: cstring, len: int32) -> cstring = "memcpy";
 
-function main() -> int32 {
+fn main() -> int32 {
   var dst: cstring = malloc(128);
   var src: cstring = malloc(256);
   if (dst == 0 || src == 0) {

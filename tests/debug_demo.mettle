@@ -13,13 +13,13 @@ struct Rect {
     max: Point;
 }
 
-function scale(value: int32, amount: int32) -> int32 {
+fn scale(value: int32, amount: int32) -> int32 {
     var doubled: int32 = value * 2;
     var result: int32 = doubled * amount;
     return result;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     var total: int32 = 0;
     var ratio: float64 = 1.5;
     var label: string = "checkpoint";

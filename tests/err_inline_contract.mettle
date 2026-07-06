@@ -1,9 +1,9 @@
 // `@inline!` is a contract: every call to `fact` must inline. A recursive
 // function can never have ALL its calls inlined away, so this must fail.
-@inline! function fact(n: int32) -> int32 {
+@inline! fn fact(n: int32) -> int32 {
     if (n <= 1) { return 1; }
     return n * fact(n - 1);
 }
-function main() -> int32 {
+fn main() -> int32 {
     return fact(5) - 120;
 }

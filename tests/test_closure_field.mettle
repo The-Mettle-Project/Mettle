@@ -1,0 +1,38 @@
+// Closures and function pointers stored in struct fields, called via
+// obj.field(args). Also covers capturing a variable whose name is a soft
+// keyword (e.g. `inc`), which the synthesized environment must handle.
+import "std/io";
+
+struct Ops {
+  combine: fn(int32, int32) -> int32;   // thin function-pointer field
+  shaper: Fn(int32) -> int32;           // closure field
+}
+
+fn plus(a: int32, b: int32) -> int32 { return a + b; }
+
+fn main() -> int32 {
+  var factor: int32 = 3;
+  var o: Ops;
+  o.combine = &plus;
+  o.shaper = fn(x: int32) -> int32 { return x * factor; };
+
+  if (o.combine(4, 5) != 9) {           // thin field call
+    return 1;
+  }
+  if (o.shaper(10) != 30) {             // closure field call
+    return 2;
+  }
+
+  var p: Ops* = &o;
+  if (p.shaper(2) != 6) {               // call through a pointer receiver
+    return 3;
+  }
+
+  // Capturing a soft-keyword-named local (`inc`) must still synthesize.
+  var inc: int32 = 5;
+  var bump: Fn(int32) -> int32 = fn(x: int32) -> int32 { return x + inc; };
+  if (bump(10) != 15) {
+    return 4;
+  }
+  return 0;
+}

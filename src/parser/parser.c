@@ -143,7 +143,8 @@ static const char *token_type_to_string(TokenType type) {
   case TOKEN_VAR:
     return "'var'";
   case TOKEN_FUNCTION:
-    return "'function'";
+  case TOKEN_FN:
+    return "'fn'";
   case TOKEN_STRUCT:
     return "'struct'";
   case TOKEN_METHOD:
@@ -346,6 +347,15 @@ void parser_set_error_with_suggestion(Parser *parser, const char *message,
   }
 }
 
+void parser_refine_error(Parser *parser, const char *message) {
+  if (!parser || !message)
+    return;
+  free(parser->error_message);
+  parser->error_message = strdup(message);
+  if (parser->error_reporter)
+    error_reporter_refine_last(parser->error_reporter, message);
+}
+
 void parser_recover_from_error(Parser *parser) {
   if (!parser)
     return;
@@ -376,6 +386,7 @@ void parser_synchronize(Parser *parser) {
     // 'return'), causing parse/recover loops to spin forever at top level.
     switch (parser->current_token.type) {
     case TOKEN_FUNCTION:
+    case TOKEN_FN:
     case TOKEN_VAR:
     case TOKEN_STRUCT:
     case TOKEN_RETURN:
@@ -533,6 +544,7 @@ typedef struct {
   int is_noinline;        // `@noinline`
   int is_pure;            // `@pure`
   int is_noalloc;         // `@noalloc`
+  int is_test;            // `@test`: compile-time unit test (mettle test)
   int simd_mode; // SimdAttr from `@simd` / `@simd!` (SIMD_ATTR_NONE if absent)
 } ParsedDecorators;
 
@@ -547,6 +559,7 @@ static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
   out->is_noinline = 0;
   out->is_pure = 0;
   out->is_noalloc = 0;
+  out->is_test = 0;
   out->simd_mode = SIMD_ATTR_NONE;
 
   while (parser->current_token.type == TOKEN_AT) {
@@ -590,6 +603,13 @@ static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
       }
       out->is_pure = 1;
       parser_advance(parser);
+    } else if (strcmp(name, "test") == 0) {
+      if (out->is_test) {
+        parser_set_error(parser, "Duplicate '@test' decorator");
+        return 0;
+      }
+      out->is_test = 1;
+      parser_advance(parser);
     } else if (strcmp(name, "simd") == 0) {
       if (out->simd_mode != SIMD_ATTR_NONE) {
         parser_set_error(parser, "Duplicate '@simd' decorator");
@@ -604,7 +624,7 @@ static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
     } else {
       parser_set_error(parser,
                        "Unknown decorator after '@' (expected 'inline', "
-                       "'noinline', 'pure', 'noalloc', or 'simd')");
+                       "'noinline', 'pure', 'noalloc', 'test', or 'simd')");
       return 0;
     }
   }
@@ -650,6 +670,7 @@ ASTNode *parser_parse_declaration(Parser *parser) {
     fd->is_noinline = decos.is_noinline;
     fd->is_pure = decos.is_pure;
     fd->is_noalloc = decos.is_noalloc;
+    fd->is_test = decos.is_test;
     fd->simd_mode = decos.simd_mode;
     return decl;
   }
@@ -659,7 +680,8 @@ ASTNode *parser_parse_declaration(Parser *parser) {
     return parser_parse_import_declaration(parser);
   case TOKEN_EXTERN: {
     parser_advance(parser); // consume 'extern'
-    if (parser->current_token.type == TOKEN_FUNCTION) {
+    if (parser->current_token.type == TOKEN_FUNCTION ||
+        parser->current_token.type == TOKEN_FN) {
       ASTNode *decl = parser_parse_function_declaration(parser);
       if (decl && decl->data) {
         FunctionDeclaration *func_data = (FunctionDeclaration *)decl->data;
@@ -675,13 +697,14 @@ ASTNode *parser_parse_declaration(Parser *parser) {
     if (parser->current_token.type == TOKEN_VAR) {
       return parser_parse_extern_var_declaration(parser);
     }
-    parser_set_error(parser, "Expected 'function' or 'var' after 'extern'");
+    parser_set_error(parser, "Expected 'fn' or 'var' after 'extern'");
     return NULL;
   }
   case TOKEN_EXPORT: {
     parser_advance(parser); // consume 'export'
     ASTNode *decl = NULL;
-    if (parser->current_token.type == TOKEN_FUNCTION) {
+    if (parser->current_token.type == TOKEN_FUNCTION ||
+        parser->current_token.type == TOKEN_FN) {
       decl = parser_parse_function_declaration(parser);
       if (decl && decl->data) {
         ((FunctionDeclaration *)decl->data)->is_exported = 1;
@@ -708,7 +731,8 @@ ASTNode *parser_parse_declaration(Parser *parser) {
       }
     } else if (parser->current_token.type == TOKEN_EXTERN) {
       parser_advance(parser); // consume 'extern'
-      if (parser->current_token.type == TOKEN_FUNCTION) {
+      if (parser->current_token.type == TOKEN_FUNCTION ||
+          parser->current_token.type == TOKEN_FN) {
         decl = parser_parse_function_declaration(parser);
         if (decl && decl->data) {
           FunctionDeclaration *func_data = (FunctionDeclaration *)decl->data;
@@ -727,16 +751,16 @@ ASTNode *parser_parse_declaration(Parser *parser) {
         }
       } else {
         parser_set_error(parser,
-                         "Expected 'function' or 'var' after 'export extern'");
+                         "Expected 'fn' or 'var' after 'export extern'");
         return NULL;
       }
     } else if (parser->current_token.type == TOKEN_AT) {
       parser_set_error(parser,
                        "Decorators must precede 'export' (write "
-                       "'@inline export function', not 'export @inline ...')");
+                       "'@inline export fn', not 'export @inline ...')");
       return NULL;
     } else {
-      parser_set_error(parser, "Expected 'function', 'var', 'struct', 'enum', "
+      parser_set_error(parser, "Expected 'fn', 'var', 'struct', 'enum', "
                                "'trait', or 'extern' after 'export'");
       return NULL;
     }
@@ -750,6 +774,7 @@ ASTNode *parser_parse_declaration(Parser *parser) {
   case TOKEN_ERRDEFER:
     return parser_parse_errdefer_statement(parser);
   case TOKEN_FUNCTION:
+  case TOKEN_FN:
   case TOKEN_KERNEL:
     return parser_parse_function_declaration(parser);
   case TOKEN_STRUCT:
@@ -1300,9 +1325,14 @@ static char *parser_parse_type_annotation(Parser *parser) {
 
   char *type_name = NULL;
 
-  /* Function pointer type: fn(param_types) -> return_type */
-  if (parser->current_token.type == TOKEN_FN) {
-    parser_advance(parser); /* consume 'fn' */
+  /* Function pointer type: fn(param_types) -> return_type (thin), or
+   * Fn(param_types) -> return_type (a stateful closure type). */
+  int is_closure_fn = parser_is_identifier_like(parser->current_token.type) &&
+                      parser->current_token.value &&
+                      strcmp(parser->current_token.value, "Fn") == 0 &&
+                      parser->peek_token.type == TOKEN_LPAREN;
+  if (parser->current_token.type == TOKEN_FN || is_closure_fn) {
+    parser_advance(parser); /* consume 'fn' or 'Fn' */
     if (!parser_expect(parser, TOKEN_LPAREN)) {
       parser_set_error(parser,
                        "Expected '(' after 'fn' in function pointer type");
@@ -1383,7 +1413,8 @@ static char *parser_parse_type_annotation(Parser *parser) {
       free(ret);
       return NULL;
     }
-    snprintf(type_name, fn_len, "fn(%s)->%s", params_buf, ret);
+    snprintf(type_name, fn_len, is_closure_fn ? "Fn(%s)->%s" : "fn(%s)->%s",
+             params_buf, ret);
     free(params_buf);
     free(ret);
     /* Continue to allow * and [] suffixes (e.g. fn()->int32* is nonsensical but
@@ -1670,6 +1701,103 @@ static int parser_identifier_name_is(ASTNode *expr, const char *name) {
   return id && id->name && strcmp(id->name, name) == 0;
 }
 
+static int parser_parse_parameter_list(Parser *parser, char ***out_names,
+                                       char ***out_types, size_t *out_count);
+
+/* Anonymous function (lambda) expression: `fn(params) [-> ret] { body }`. In
+ * expression position `fn` always begins a lambda; the type spelling
+ * `fn(...)->R` is parsed only in type positions by parser_parse_type_annotation,
+ * and named declarations only at the top level via parse_declaration. The node
+ * is an AST_LAMBDA_EXPRESSION carrying a FunctionDeclaration payload with a NULL
+ * name; the closure-conversion pass lifts it to a real top-level function. */
+static ASTNode *parser_parse_lambda_expression(Parser *parser) {
+  SourceLocation location = parser_current_location(parser);
+  parser_advance(parser); // consume 'fn'
+
+  if (!parser_expect(parser, TOKEN_LPAREN)) {
+    return NULL;
+  }
+
+  char **param_names = NULL;
+  char **param_types = NULL;
+  size_t param_count = 0;
+  if (!parser_parse_parameter_list(parser, &param_names, &param_types,
+                                   &param_count)) {
+    return NULL;
+  }
+
+  if (!parser_expect(parser, TOKEN_RPAREN)) {
+    for (size_t i = 0; i < param_count; i++) {
+      free(param_names[i]);
+      free(param_types[i]);
+    }
+    free(param_names);
+    free(param_types);
+    return NULL;
+  }
+
+  char *return_type = NULL;
+  if (parser->current_token.type == TOKEN_ARROW ||
+      parser->current_token.type == TOKEN_COLON) {
+    parser_advance(parser);
+    return_type = parser_parse_type_annotation(parser);
+    if (!return_type) {
+      if (!parser->has_error) {
+        parser_set_error(parser, "Expected return type after '->' in lambda");
+      }
+      for (size_t i = 0; i < param_count; i++) {
+        free(param_names[i]);
+        free(param_types[i]);
+      }
+      free(param_names);
+      free(param_types);
+      return NULL;
+    }
+  } else {
+    return_type = strdup("void");
+  }
+
+  if (parser->current_token.type != TOKEN_LBRACE) {
+    parser_set_error(parser, "Expected '{' to begin lambda body");
+    for (size_t i = 0; i < param_count; i++) {
+      free(param_names[i]);
+      free(param_types[i]);
+    }
+    free(param_names);
+    free(param_types);
+    free(return_type);
+    return NULL;
+  }
+
+  ASTNode *body = parser_parse_block(parser);
+  if (!body) {
+    for (size_t i = 0; i < param_count; i++) {
+      free(param_names[i]);
+      free(param_types[i]);
+    }
+    free(param_names);
+    free(param_types);
+    free(return_type);
+    return NULL;
+  }
+
+  ASTNode *node = ast_create_function_declaration(
+      NULL, param_names, param_types, param_count, return_type, body, location);
+  for (size_t i = 0; i < param_count; i++) {
+    free(param_names[i]);
+    free(param_types[i]);
+  }
+  free(param_names);
+  free(param_types);
+  free(return_type);
+  if (!node) {
+    ast_destroy_node(body);
+    return NULL;
+  }
+  node->type = AST_LAMBDA_EXPRESSION;
+  return node;
+}
+
 ASTNode *parser_parse_primary_expression(Parser *parser) {
   if (!parser)
     return NULL;
@@ -1735,6 +1863,9 @@ ASTNode *parser_parse_primary_expression(Parser *parser) {
     }
     return expr;
   }
+  case TOKEN_FN:
+  case TOKEN_FUNCTION:
+    return parser_parse_lambda_expression(parser);
   case TOKEN_MATCH:
     return parser_parse_match_expression(parser);
   case TOKEN_THIS: {
@@ -2204,14 +2335,16 @@ ASTNode *parser_parse_postfix_expression(Parser *parser) {
                                           location);
         free(func_name);
       } else {
-        // Expression like (*fp)(args) or (expr)(args) - function pointer call
-        expr = ast_create_func_ptr_call(expr, arguments, arg_count, location);
-        for (size_t i = 0; i < arg_count; i++) {
-          ast_destroy_node(arguments[i]);
-        }
+        // (expr)(args) / f(...)(args): call through the value the expression
+        // produces - a thin function pointer or a closure. The node owns the
+        // callee expression and the argument nodes; only the array is ours.
+        ASTNode *fp = ast_create_func_ptr_call(expr, arguments, arg_count,
+                                               location);
         free(arguments);
-        ast_destroy_node(expr);
-        return NULL;
+        if (!fp) {
+          return NULL;
+        }
+        expr = fp;
       }
 
     } else if (parser->current_token.type == TOKEN_DOT) {
@@ -2756,7 +2889,7 @@ ASTNode *parser_parse_function_declaration(Parser *parser) {
   if (parser->current_token.type != TOKEN_FUNCTION &&
       parser->current_token.type != TOKEN_FN &&
       parser->current_token.type != TOKEN_KERNEL) {
-    parser_set_error(parser, "Expected 'function', 'fn', or 'kernel'");
+    parser_set_error(parser, "Expected 'fn' or 'kernel'");
     return NULL;
   }
   // `kernel` is the GPU-facing spelling of a top-level function; it parses
@@ -2765,7 +2898,7 @@ ASTNode *parser_parse_function_declaration(Parser *parser) {
 
   // Expect function name
   if (!parser_is_identifier_like(parser->current_token.type)) {
-    parser_set_error(parser, "Expected function name after 'function'");
+    parser_set_error(parser, "Expected function name after 'fn'");
     return NULL;
   }
 
@@ -3695,7 +3828,7 @@ ASTNode *parser_parse_if_statement(Parser *parser) {
   }
 
   if (!parser_expect(parser, TOKEN_LPAREN)) {
-    parser_set_error(parser, "Expected '(' after 'if'");
+    parser_refine_error(parser, "Expected '(' after 'if'");
     return NULL;
   }
 
@@ -3825,7 +3958,7 @@ ASTNode *parser_parse_while_statement(Parser *parser) {
   }
 
   if (!parser_expect(parser, TOKEN_LPAREN)) {
-    parser_set_error(parser, "Expected '(' after 'while'");
+    parser_refine_error(parser, "Expected '(' after 'while'");
     return NULL;
   }
 
@@ -3995,6 +4128,11 @@ static ASTNode *parser_parse_range_for(Parser *parser, SourceLocation location) 
   // initializer: var <name>[: type] = <start>
   ASTNode *initializer =
       ast_create_var_declaration(var_name, type_name, start, location);
+  // The loop counter's type is structural (it takes the type of its bound), so
+  // it is exempt from the "explicit type required" rule when no `: type` given.
+  if (initializer && !type_name) {
+    ((VarDeclaration *)initializer->data)->structural_type = 1;
+  }
   // condition: <name> <  <end>   (exclusive)
   //            <name> <= <end>   (inclusive)
   ASTNode *condition = ast_create_binary_expression(
@@ -4131,11 +4269,15 @@ static ASTNode *parser_parse_dispatch_statement(Parser *parser) {
     goto oom;
   }
 
-  // var __mdsp<uid>_a<i> = arg_i;   (type inferred from the argument)
+  // var __mdsp<uid>_a<i> = arg_i;   (type is structural: it is the arg's type)
   for (size_t i = 0; i < nargs; i++) {
     char an[32];
     snprintf(an, sizeof(an), "__mdsp%d_a%zu", uid, i);
-    parser_block_add(blk, ast_create_var_declaration(an, NULL, args[i], loc));
+    ASTNode *arg_decl = ast_create_var_declaration(an, NULL, args[i], loc);
+    if (arg_decl && arg_decl->data) {
+      ((VarDeclaration *)arg_decl->data)->structural_type = 1;
+    }
+    parser_block_add(blk, arg_decl);
     args[i] = NULL; // ownership moved into the var decl
   }
 
@@ -4483,7 +4625,7 @@ static ASTNode *parser_parse_match_core(Parser *parser, int is_expression) {
     return NULL;
 
   if (!parser_expect(parser, TOKEN_LPAREN)) {
-    parser_set_error(parser, "Expected '(' after 'match'");
+    parser_refine_error(parser, "Expected '(' after 'match'");
     return NULL;
   }
   ASTNode *expr = parser_parse_expression(parser);

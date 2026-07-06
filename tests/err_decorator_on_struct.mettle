@@ -4,6 +4,6 @@
   y: int32;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   return 0;
 }

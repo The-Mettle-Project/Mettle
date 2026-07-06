@@ -1,14 +1,14 @@
 // Sign extension: int8/int16 widened to int64 must use movsx (not movzx)
 // -1 as int8 -> int64 must stay -1; -128 as int8 -> int64 must stay -128
-function widen_i8(x: int8) -> int64 {
+fn widen_i8(x: int8) -> int64 {
   return x;
 }
 
-function widen_i16(x: int16) -> int64 {
+fn widen_i16(x: int16) -> int64 {
   return x;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var a: int8 = -1;
   var b: int8 = -128;
   var c: int16 = -32768;

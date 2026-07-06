@@ -10,21 +10,21 @@ export enum Magic {
 
 export var seed: int32 = 40;
 
-function private_bonus() -> int32 {
+fn private_bonus() -> int32 {
   return 2;
 }
 
-export function make_pair(left: int32, right: int32) -> Pair* {
+export fn make_pair(left: int32, right: int32) -> Pair* {
   var pair: Pair* = new Pair;
   pair->left = left;
   pair->right = right;
   return pair;
 }
 
-export function total(pair: Pair*) -> int32 {
+export fn total(pair: Pair*) -> int32 {
   return pair->left + pair->right;
 }
 
-export function answer() -> int32 {
+export fn answer() -> int32 {
   return seed + private_bonus();
 }

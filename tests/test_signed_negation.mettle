@@ -1,5 +1,5 @@
 // Signed negation: negative literals, unary minus, int8/int16/int32 boundaries
-function main() -> int32 {
+fn main() -> int32 {
   var a: int8 = -128;
   var b: int8 = 127;
   var c: int16 = -32768;

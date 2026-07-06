@@ -397,6 +397,7 @@ Symbol *symbol_table_lookup(SymbolTable *table, const char *name) {
   while (current_scope) {
     Symbol *found = scope_lookup_symbol(current_scope, name);
     if (found) {
+      found->is_used = 1;
       return found;
     }
     // Move to parent scope
@@ -420,6 +421,7 @@ Type *type_create(TypeKind kind, const char *name) {
   type->fn_param_types = NULL;
   type->fn_param_count = 0;
   type->fn_return_type = NULL;
+  type->closure_env = NULL;
 
   // Initialize struct-specific fields
   type->field_names = NULL;
@@ -616,7 +618,12 @@ Symbol *symbol_create(const char *name, SymbolKind kind, Type *type) {
   symbol->is_forward_declaration = 0;
   symbol->is_extern = 0;
   symbol->is_immutable = 0;
+  symbol->is_builtin = 0;
   symbol->link_name = NULL;
+  symbol->decl_line = 0;
+  symbol->decl_column = 0;
+  symbol->decl_file = NULL;
+  symbol->is_used = 0;
 
   // Initialize union data based on symbol kind
   switch (kind) {

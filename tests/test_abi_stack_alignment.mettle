@@ -1,9 +1,9 @@
 // ABI: stack 16-byte aligned before call
-function leaf() -> int32 {
+fn leaf() -> int32 {
   return 1;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var a: int32 = leaf();
   var b: int32 = leaf();
   if (a == 1 && b == 1) {

@@ -4,19 +4,19 @@ struct Measure {
   b: float64;
 }
 
-function get_pi() -> float64 {
+fn get_pi() -> float64 {
   return 3.14159;
 }
 
-function get_b(m: Measure) -> float64 {
+fn get_b(m: Measure) -> float64 {
   return m.b;
 }
 
-function add_float(a: float64, b: float64) -> float64 {
+fn add_float(a: float64, b: float64) -> float64 {
   return a + b;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var x: float64 = get_pi();
   if (x < 3.1 || x > 3.2) {
     return 0;

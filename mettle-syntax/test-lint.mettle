@@ -1,7 +1,7 @@
 // Intentional linter test file - triggers mettle-syntax diagnostics.
 // Open this file and check View > Problems.
 
-function main() -> int32 {
+fn main() -> int32 {
   var bad_hex: int32 = 0x;         // invalid hex - no digits
   var bad_bin: int32 = 0b;         // invalid binary - no digits
   var bad_hex2: int32 = 0Xg;       // invalid hex - g not allowed

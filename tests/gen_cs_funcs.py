@@ -9,7 +9,7 @@ for i in range(n):
     lines.append(f"    t = t ^ {i % 7};")
     lines.append(f"    return t;")
     lines.append("}")
-lines.append("function main() -> int32 {")
+lines.append("fn main() -> int32 {")
 lines.append("    var s: int32 = 0;")
 for i in range(0, n, 4):
     lines.append(f"    s = s + f{i}(s);")

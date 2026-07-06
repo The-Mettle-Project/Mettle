@@ -10,32 +10,32 @@ import "std/conv";
 import "std/dir";
 import "std/mem";
 
-extern function Win_CreateCompatibleDC(hdc: int64) -> int64 = "CreateCompatibleDC";
-extern function Win_CreateCompatibleBitmap(hdc: int64, width: int32, height: int32) -> int64 = "CreateCompatibleBitmap";
-extern function Win_BitBlt(
+extern fn Win_CreateCompatibleDC(hdc: int64) -> int64 = "CreateCompatibleDC";
+extern fn Win_CreateCompatibleBitmap(hdc: int64, width: int32, height: int32) -> int64 = "CreateCompatibleBitmap";
+extern fn Win_BitBlt(
   dest_dc: int64, x: int32, y: int32, width: int32, height: int32,
   src_dc: int64, x_src: int32, y_src: int32, rop: uint32) -> int32 = "BitBlt";
-extern function Win_DeleteDC(hdc: int64) -> int32 = "DeleteDC";
-extern function Win_InvalidateRect(hwnd: int64, rect: UiRect*, erase: int32) -> int32 = "InvalidateRect";
+extern fn Win_DeleteDC(hdc: int64) -> int32 = "DeleteDC";
+extern fn Win_InvalidateRect(hwnd: int64, rect: UiRect*, erase: int32) -> int32 = "InvalidateRect";
 
-function UI_SRCCOPY() -> uint32 { return 0x00CC0020; }
+fn UI_SRCCOPY() -> uint32 { return 0x00CC0020; }
 
-function ID_STATUS() -> int32 { return 1003; }
-function ID_THEME() -> int32 { return 1004; }
-function ID_RELOAD() -> int32 { return 4001; }
-function ID_ABOUT() -> int32 { return 4002; }
-function ID_EXIT() -> int32 { return 4003; }
+fn ID_STATUS() -> int32 { return 1003; }
+fn ID_THEME() -> int32 { return 1004; }
+fn ID_RELOAD() -> int32 { return 4001; }
+fn ID_ABOUT() -> int32 { return 4002; }
+fn ID_EXIT() -> int32 { return 4003; }
 
-function VK_ESCAPE() -> uint32 { return 27; }
-function VK_F5() -> uint32 { return 116; }
+fn VK_ESCAPE() -> uint32 { return 27; }
+fn VK_F5() -> uint32 { return 116; }
 
-function SIDEBAR_ROW_HEIGHT() -> int32 { return 30; }
+fn SIDEBAR_ROW_HEIGHT() -> int32 { return 30; }
 
-function DOC_BUF_SIZE() -> int32 { return 32768; }
-function DISPLAY_BUF_SIZE() -> int32 { return 65536; }
-function PATHS_BUF_SIZE() -> int32 { return 8192; }
-function PATH_SLOT_SIZE() -> int32 { return 260; }
-function MAX_DOCS() -> int32 { return 64; }
+fn DOC_BUF_SIZE() -> int32 { return 32768; }
+fn DISPLAY_BUF_SIZE() -> int32 { return 65536; }
+fn PATHS_BUF_SIZE() -> int32 { return 8192; }
+fn PATH_SLOT_SIZE() -> int32 { return 260; }
+fn MAX_DOCS() -> int32 { return 64; }
 
 var g_main_window: int64 = 0;
 var g_status_label: int64 = 0;
@@ -96,32 +96,32 @@ var g_table_col_px7: int32 = 0;
 var g_table_body_row: int32 = 0;
 var g_table_stripe: int32 = 0;
 
-function TABLE_CHAR_PX() -> int32 { return 9; }
-function TABLE_COL_GAP() -> int32 { return 20; }
+fn TABLE_CHAR_PX() -> int32 { return 9; }
+fn TABLE_COL_GAP() -> int32 { return 20; }
 
-function accent_color() -> uint32 {
+fn accent_color() -> uint32 {
   if (g_theme_index == 1) { return ui_rgb(14, 116, 144); }
   if (g_theme_index == 2) { return ui_rgb(101, 84, 192); }
   return ui_rgb(37, 99, 235);
 }
 
-function accent_dark() -> uint32 {
+fn accent_dark() -> uint32 {
   if (g_theme_index == 1) { return ui_rgb(21, 94, 117); }
   if (g_theme_index == 2) { return ui_rgb(79, 70, 155); }
   return ui_rgb(23, 75, 180);
 }
 
-function set_status(text: cstring) {
+fn set_status(text: cstring) {
   ui_control_set_text(g_status_label, text);
 }
 
-function set_status_i64(pattern: string, value: int64) {
+fn set_status_i64(pattern: string, value: int64) {
   var status: uint8[160];
   format_i64(&status[0], 160, pattern, value);
   ui_control_set_text(g_status_label, &status[0]);
 }
 
-function cstr_starts_with(text: cstring, prefix: cstring) -> int32 {
+fn cstr_starts_with(text: cstring, prefix: cstring) -> int32 {
   var i: int32 = 0;
   while (prefix[i] != 0) {
     if (text[i] != prefix[i]) { return 0; }
@@ -130,7 +130,7 @@ function cstr_starts_with(text: cstring, prefix: cstring) -> int32 {
   return 1;
 }
 
-function cstr_copy(dst: cstring, src: cstring, max_len: int32) -> int32 {
+fn cstr_copy(dst: cstring, src: cstring, max_len: int32) -> int32 {
   var i: int32 = 0;
   while (i + 1 < max_len) {
     if (src[i] == 0) { break; }
@@ -141,7 +141,7 @@ function cstr_copy(dst: cstring, src: cstring, max_len: int32) -> int32 {
   return i;
 }
 
-function cstr_compare(a: cstring, b: cstring) -> int32 {
+fn cstr_compare(a: cstring, b: cstring) -> int32 {
   var i: int32 = 0;
   while (a[i] != 0 || b[i] != 0) {
     if (a[i] < b[i]) { return -1; }
@@ -151,7 +151,7 @@ function cstr_compare(a: cstring, b: cstring) -> int32 {
   return 0;
 }
 
-function path_join(base: cstring, suffix: cstring, out: cstring, out_len: int32) {
+fn path_join(base: cstring, suffix: cstring, out: cstring, out_len: int32) {
   var pos: int32 = cstr_copy(out, base, out_len);
   if (pos <= 0) { return; }
   if (pos + 1 >= out_len) { return; }
@@ -163,18 +163,18 @@ function path_join(base: cstring, suffix: cstring, out: cstring, out_len: int32)
   cstr_copy(out + pos, suffix, out_len - pos);
 }
 
-function path_slot(index: int32) -> cstring {
+fn path_slot(index: int32) -> cstring {
   return g_path_slots + index * PATH_SLOT_SIZE();
 }
 
-function swap_path_slots(a: int32, b: int32) {
+fn swap_path_slots(a: int32, b: int32) {
   var tmp: uint8[260];
   memcpy(&tmp[0], path_slot(a), PATH_SLOT_SIZE());
   memcpy(path_slot(a), path_slot(b), PATH_SLOT_SIZE());
   memcpy(path_slot(b), &tmp[0], PATH_SLOT_SIZE());
 }
 
-function sort_doc_paths() {
+fn sort_doc_paths() {
   var i: int32 = 0;
   while (i < g_doc_count - 1) {
     var j: int32 = i + 1;
@@ -188,7 +188,7 @@ function sort_doc_paths() {
   }
 }
 
-function probe_docs_root(candidate: cstring) -> int32 {
+fn probe_docs_root(candidate: cstring) -> int32 {
   var marker: uint8[640];
   path_join(candidate, cstr("LANGUAGE.md"), &marker[0], 640);
   if (file_exists(&marker[0]) != 0) {
@@ -198,7 +198,7 @@ function probe_docs_root(candidate: cstring) -> int32 {
   return 0;
 }
 
-function resolve_docs_root() -> int32 {
+fn resolve_docs_root() -> int32 {
   if (probe_docs_root(cstr("docs")) != 0) { return 1; }
   if (probe_docs_root(cstr("..\\docs")) != 0) { return 1; }
   if (probe_docs_root(cstr("..\\..\\docs")) != 0) { return 1; }
@@ -214,7 +214,7 @@ function resolve_docs_root() -> int32 {
   return 0;
 }
 
-function doc_label_from_path(rel: cstring, out: cstring, out_len: int32) {
+fn doc_label_from_path(rel: cstring, out: cstring, out_len: int32) {
   var pos: int32 = 0;
   var i: int32 = 0;
   while (rel[i] != 0 && pos + 1 < out_len) {
@@ -229,7 +229,7 @@ function doc_label_from_path(rel: cstring, out: cstring, out_len: int32) {
   out[pos] = 0;
 }
 
-function scan_docs() -> int32 {
+fn scan_docs() -> int32 {
   memset(g_paths_blob, 0, PATHS_BUF_SIZE());
   g_doc_count = dir_list_md_files(g_doc_root, g_paths_blob, PATHS_BUF_SIZE(), MAX_DOCS());
   if (g_doc_count <= 0) { return 0; }
@@ -249,7 +249,7 @@ function scan_docs() -> int32 {
   return g_doc_count;
 }
 
-function count_doc_lines() -> int32 {
+fn count_doc_lines() -> int32 {
   if (g_doc_len <= 0) { return 0; }
   var lines: int32 = 1;
   var i: int32 = 0;
@@ -260,7 +260,7 @@ function count_doc_lines() -> int32 {
   return lines;
 }
 
-function doc_line_at(line_index: int32, out: cstring, out_len: int32) -> int32 {
+fn doc_line_at(line_index: int32, out: cstring, out_len: int32) -> int32 {
   var current: int32 = 0;
   var pos: int32 = 0;
   var out_pos: int32 = 0;
@@ -279,7 +279,7 @@ function doc_line_at(line_index: int32, out: cstring, out_len: int32) -> int32 {
   return out_pos;
 }
 
-function cstr_len(text: cstring) -> int32 {
+fn cstr_len(text: cstring) -> int32 {
   var i: int32 = 0;
   while (text[i] != 0) {
     i = i + 1;
@@ -287,16 +287,16 @@ function cstr_len(text: cstring) -> int32 {
   return i;
 }
 
-function display_reset() {
+fn display_reset() {
   g_display_pos = 0;
   memset(g_display_buf, 0, 1);
 }
 
-function display_null_terminate() {
+fn display_null_terminate() {
   memset(g_display_buf + g_display_pos, 0, 1);
 }
 
-function display_append_char(ch: uint8) {
+fn display_append_char(ch: uint8) {
   if (g_display_pos + 1 >= DISPLAY_BUF_SIZE()) { return; }
   var byte: uint8[1];
   byte[0] = ch;
@@ -305,11 +305,11 @@ function display_append_char(ch: uint8) {
   display_null_terminate();
 }
 
-function display_append_crlf() {
+fn display_append_crlf() {
   display_append_char(10);
 }
 
-function display_append_text(text: cstring) {
+fn display_append_text(text: cstring) {
   var i: int32 = 0;
   var byte: uint8[1];
   while (text[i] != 0 && g_display_pos + 1 < DISPLAY_BUF_SIZE()) {
@@ -321,7 +321,7 @@ function display_append_text(text: cstring) {
   display_null_terminate();
 }
 
-function display_strip_cr() {
+fn display_strip_cr() {
   var read: int32 = 0;
   var write: int32 = 0;
   var byte: uint8[1];
@@ -342,14 +342,14 @@ function display_strip_cr() {
   g_display_lines = count_display_lines();
 }
 
-function md_heading_level(text: cstring) -> int32 {
+fn md_heading_level(text: cstring) -> int32 {
   if (cstr_starts_with(text, cstr("### ")) != 0) { return 3; }
   if (cstr_starts_with(text, cstr("## ")) != 0) { return 2; }
   if (cstr_starts_with(text, cstr("# ")) != 0) { return 1; }
   return 0;
 }
 
-function md_strip_heading_prefix(text: cstring, out: cstring, out_len: int32) {
+fn md_strip_heading_prefix(text: cstring, out: cstring, out_len: int32) {
   var skip: int32 = 0;
   if (cstr_starts_with(text, cstr("### ")) != 0) { skip = 4; }
   else if (cstr_starts_with(text, cstr("## ")) != 0) { skip = 3; }
@@ -365,7 +365,7 @@ function md_strip_heading_prefix(text: cstring, out: cstring, out_len: int32) {
   out[i] = 0;
 }
 
-function md_strip_inline(out: cstring) {
+fn md_strip_inline(out: cstring) {
   var read: int32 = 0;
   var write: int32 = 0;
   while (out[read] != 0) {
@@ -397,7 +397,7 @@ function md_strip_inline(out: cstring) {
   out[write] = 0;
 }
 
-function md_is_ordered_item(text: cstring) -> int32 {
+fn md_is_ordered_item(text: cstring) -> int32 {
   if (text[0] < 48 || text[0] > 57) { return 0; }
   var i: int32 = 1;
   while (text[i] >= 48 && text[i] <= 57) { i = i + 1; }
@@ -405,18 +405,18 @@ function md_is_ordered_item(text: cstring) -> int32 {
   return 0;
 }
 
-function md_is_table_row(text: cstring) -> int32 {
+fn md_is_table_row(text: cstring) -> int32 {
   if (text[0] != 124) { return 0; }
   return 1;
 }
 
-function md_is_rule(text: cstring) -> int32 {
+fn md_is_rule(text: cstring) -> int32 {
   if (text[0] == 45 && text[1] == 45 && text[2] == 45) { return 1; }
   if (text[0] == 42 && text[1] == 42 && text[2] == 42) { return 1; }
   return 0;
 }
 
-function format_markdown_for_viewer() {
+fn format_markdown_for_viewer() {
   var line: int32 = 0;
   var in_code: int32 = 0;
   var line_buf: uint8[2048];
@@ -527,7 +527,7 @@ function format_markdown_for_viewer() {
   g_display_lines = count_display_lines();
 }
 
-function count_display_lines() -> int32 {
+fn count_display_lines() -> int32 {
   if (g_display_pos <= 0) { return 0; }
   var lines: int32 = 1;
   var i: int32 = 0;
@@ -538,7 +538,7 @@ function count_display_lines() -> int32 {
   return lines;
 }
 
-function display_line_at(line_index: int32, out: cstring, out_len: int32) -> int32 {
+fn display_line_at(line_index: int32, out: cstring, out_len: int32) -> int32 {
   var current: int32 = 0;
   var pos: int32 = 0;
   var out_pos: int32 = 0;
@@ -557,7 +557,7 @@ function display_line_at(line_index: int32, out: cstring, out_len: int32) -> int
   return out_pos;
 }
 
-function copy_raw_doc_to_display() {
+fn copy_raw_doc_to_display() {
   display_reset();
   var i: int32 = 0;
   var byte: uint8[1];
@@ -575,7 +575,7 @@ function copy_raw_doc_to_display() {
   g_display_lines = count_display_lines();
 }
 
-function update_current_title() {
+fn update_current_title() {
   var line: uint8[512];
   var i: int32 = 0;
   while (i < g_doc_lines) {
@@ -590,7 +590,7 @@ function update_current_title() {
   doc_label_from_path(g_current_rel, g_current_title, 128);
 }
 
-function load_doc(index: int32) -> int32 {
+fn load_doc(index: int32) -> int32 {
   if (index < 0) { return 0; }
   if (index >= g_doc_count) { return 0; }
 
@@ -641,18 +641,18 @@ function load_doc(index: int32) -> int32 {
   return 1;
 }
 
-function select_doc_index(index: int32) {
+fn select_doc_index(index: int32) {
   if (index < 0) { return; }
   if (index >= g_doc_count) { return; }
   load_doc(index);
 }
 
-function viewer_text_left() -> int32 { return g_viewer_left + 12; }
-function viewer_text_right() -> int32 { return g_viewer_right - 24; }
-function viewer_content_top() -> int32 { return g_viewer_top + 16; }
-function viewer_content_bottom() -> int32 { return g_viewer_bottom - 16; }
+fn viewer_text_left() -> int32 { return g_viewer_left + 12; }
+fn viewer_text_right() -> int32 { return g_viewer_right - 24; }
+fn viewer_content_top() -> int32 { return g_viewer_top + 16; }
+fn viewer_content_bottom() -> int32 { return g_viewer_bottom - 16; }
 
-function viewer_contains(x: int32, y: int32) -> int32 {
+fn viewer_contains(x: int32, y: int32) -> int32 {
   if (x < g_viewer_left) { return 0; }
   if (x >= g_viewer_right) { return 0; }
   if (y < g_viewer_top) { return 0; }
@@ -660,24 +660,24 @@ function viewer_contains(x: int32, y: int32) -> int32 {
   return 1;
 }
 
-function VIEWER_KIND_BLANK() -> int32 { return 0; }
-function VIEWER_KIND_H1() -> int32 { return 1; }
-function VIEWER_KIND_H2() -> int32 { return 2; }
-function VIEWER_KIND_H3() -> int32 { return 3; }
-function VIEWER_KIND_BODY() -> int32 { return 4; }
-function VIEWER_KIND_BULLET() -> int32 { return 5; }
-function VIEWER_KIND_ORDERED() -> int32 { return 6; }
-function VIEWER_KIND_CODE() -> int32 { return 7; }
-function VIEWER_KIND_QUOTE() -> int32 { return 8; }
-function VIEWER_KIND_RULE() -> int32 { return 9; }
-function VIEWER_KIND_TABLE() -> int32 { return 10; }
-function VIEWER_KIND_TABLE_SEP() -> int32 { return 11; }
-function VIEWER_KIND_FENCE() -> int32 { return 12; }
-function VIEWER_KIND_TABLE_HEADER() -> int32 { return 13; }
+fn VIEWER_KIND_BLANK() -> int32 { return 0; }
+fn VIEWER_KIND_H1() -> int32 { return 1; }
+fn VIEWER_KIND_H2() -> int32 { return 2; }
+fn VIEWER_KIND_H3() -> int32 { return 3; }
+fn VIEWER_KIND_BODY() -> int32 { return 4; }
+fn VIEWER_KIND_BULLET() -> int32 { return 5; }
+fn VIEWER_KIND_ORDERED() -> int32 { return 6; }
+fn VIEWER_KIND_CODE() -> int32 { return 7; }
+fn VIEWER_KIND_QUOTE() -> int32 { return 8; }
+fn VIEWER_KIND_RULE() -> int32 { return 9; }
+fn VIEWER_KIND_TABLE() -> int32 { return 10; }
+fn VIEWER_KIND_TABLE_SEP() -> int32 { return 11; }
+fn VIEWER_KIND_FENCE() -> int32 { return 12; }
+fn VIEWER_KIND_TABLE_HEADER() -> int32 { return 13; }
 
-function TABLE_MAX_COLS() -> int32 { return 8; }
+fn TABLE_MAX_COLS() -> int32 { return 8; }
 
-function table_col_width_get(index: int32) -> int32 {
+fn table_col_width_get(index: int32) -> int32 {
   if (index == 0) { return g_table_col_w0; }
   if (index == 1) { return g_table_col_w1; }
   if (index == 2) { return g_table_col_w2; }
@@ -689,7 +689,7 @@ function table_col_width_get(index: int32) -> int32 {
   return 0;
 }
 
-function table_col_width_set(index: int32, width: int32) {
+fn table_col_width_set(index: int32, width: int32) {
   if (index == 0) { g_table_col_w0 = width; return; }
   if (index == 1) { g_table_col_w1 = width; return; }
   if (index == 2) { g_table_col_w2 = width; return; }
@@ -700,7 +700,7 @@ function table_col_width_set(index: int32, width: int32) {
   if (index == 7) { g_table_col_w7 = width; return; }
 }
 
-function table_col_px_get(index: int32) -> int32 {
+fn table_col_px_get(index: int32) -> int32 {
   if (index == 0) { return g_table_col_px0; }
   if (index == 1) { return g_table_col_px1; }
   if (index == 2) { return g_table_col_px2; }
@@ -712,7 +712,7 @@ function table_col_px_get(index: int32) -> int32 {
   return 0;
 }
 
-function table_col_px_set(index: int32, x: int32) {
+fn table_col_px_set(index: int32, x: int32) {
   if (index == 0) { g_table_col_px0 = x; return; }
   if (index == 1) { g_table_col_px1 = x; return; }
   if (index == 2) { g_table_col_px2 = x; return; }
@@ -723,7 +723,7 @@ function table_col_px_set(index: int32, x: int32) {
   if (index == 7) { g_table_col_px7 = x; return; }
 }
 
-function table_col_width_reset() {
+fn table_col_width_reset() {
   g_table_num_cols = 0;
   g_table_col_w0 = 0;
   g_table_col_w1 = 0;
@@ -743,7 +743,7 @@ function table_col_width_reset() {
   g_table_col_px7 = 0;
 }
 
-function table_cell_delim_pos(raw: cstring, start: int32) -> int32 {
+fn table_cell_delim_pos(raw: cstring, start: int32) -> int32 {
   var pos: int32 = start;
   var in_tick: int32 = 0;
   while (raw[pos] != 0) {
@@ -760,7 +760,7 @@ function table_cell_delim_pos(raw: cstring, start: int32) -> int32 {
   return pos;
 }
 
-function table_row_cell_count(raw: cstring) -> int32 {
+fn table_row_cell_count(raw: cstring) -> int32 {
   if (raw[0] != 124) { return 0; }
   var count: int32 = 0;
   var pos: int32 = 0;
@@ -776,7 +776,7 @@ function table_row_cell_count(raw: cstring) -> int32 {
   return count;
 }
 
-function table_copy_cell(raw: cstring, cell_index: int32, out: cstring, out_len: int32) -> int32 {
+fn table_copy_cell(raw: cstring, cell_index: int32, out: cstring, out_len: int32) -> int32 {
   var pos: int32 = 0;
   var idx: int32 = 0;
   var write_pos: int32 = 0;
@@ -824,7 +824,7 @@ function table_copy_cell(raw: cstring, cell_index: int32, out: cstring, out_len:
   return 0;
 }
 
-function table_measure_block(start_line: int32) {
+fn table_measure_block(start_line: int32) {
   table_col_width_reset();
   var line: int32 = start_line;
   var raw: uint8[512];
@@ -851,7 +851,7 @@ function table_measure_block(start_line: int32) {
   table_compute_column_layout();
 }
 
-function table_compute_column_layout() {
+fn table_compute_column_layout() {
   var x: int32 = viewer_text_left() + 8;
   var col: int32 = 0;
   while (col < g_table_num_cols && col < TABLE_MAX_COLS()) {
@@ -863,11 +863,11 @@ function table_compute_column_layout() {
   }
 }
 
-function table_format_row(raw: cstring, out: cstring, out_len: int32) {
+fn table_format_row(raw: cstring, out: cstring, out_len: int32) {
   out[0] = 0;
 }
 
-function viewer_classify_line_at(line: int32, raw: cstring, in_code: int32) -> int32 {
+fn viewer_classify_line_at(line: int32, raw: cstring, in_code: int32) -> int32 {
   var kind: int32 = viewer_classify_line(raw, in_code);
   if (kind == VIEWER_KIND_TABLE()) {
     if (line + 1 < g_doc_lines) {
@@ -895,7 +895,7 @@ struct ViewerLineMetrics {
   top_pad: int32;
 }
 
-function md_is_table_sep(text: cstring) -> int32 {
+fn md_is_table_sep(text: cstring) -> int32 {
   if (text[0] != 124) { return 0; }
   var i: int32 = 0;
   while (text[i] != 0) {
@@ -906,7 +906,7 @@ function md_is_table_sep(text: cstring) -> int32 {
   return 1;
 }
 
-function viewer_classify_line(raw: cstring, in_code: int32) -> int32 {
+fn viewer_classify_line(raw: cstring, in_code: int32) -> int32 {
   if (cstr_starts_with(raw, cstr("```")) != 0) {
     return VIEWER_KIND_FENCE();
   }
@@ -941,7 +941,7 @@ function viewer_classify_line(raw: cstring, in_code: int32) -> int32 {
   return VIEWER_KIND_BODY();
 }
 
-function viewer_wrap_line_height(text: cstring, indent: int32) -> int32 {
+fn viewer_wrap_line_height(text: cstring, indent: int32) -> int32 {
   var width: int32 = viewer_text_right() - viewer_text_left() - indent;
   if (width < 120) { width = 120; }
   var len: int32 = cstr_len(text);
@@ -953,7 +953,7 @@ function viewer_wrap_line_height(text: cstring, indent: int32) -> int32 {
   return rows * 22 + 6;
 }
 
-function viewer_format_line(raw: cstring, kind: int32, out: cstring, out_len: int32) {
+fn viewer_format_line(raw: cstring, kind: int32, out: cstring, out_len: int32) {
   var cleaned: uint8[512];
   if (kind == VIEWER_KIND_BLANK() || kind == VIEWER_KIND_FENCE() || kind == VIEWER_KIND_RULE()) {
     out[0] = 0;
@@ -984,7 +984,7 @@ function viewer_format_line(raw: cstring, kind: int32, out: cstring, out_len: in
   utf8_normalize_ascii(&cleaned[0], out, out_len);
 }
 
-function viewer_line_metrics(kind: int32, text: cstring, theme: UiTheme) -> ViewerLineMetrics {
+fn viewer_line_metrics(kind: int32, text: cstring, theme: UiTheme) -> ViewerLineMetrics {
   var m: ViewerLineMetrics;
   m.indent = 0;
   m.use_bg = 0;
@@ -1100,7 +1100,7 @@ function viewer_line_metrics(kind: int32, text: cstring, theme: UiTheme) -> View
   return m;
 }
 
-function viewer_total_content_height() -> int32 {
+fn viewer_total_content_height() -> int32 {
   var total: int32 = 0;
   var line: int32 = 0;
   var in_code: int32 = 0;
@@ -1134,7 +1134,7 @@ function viewer_total_content_height() -> int32 {
   return total;
 }
 
-function viewer_max_scroll() -> int32 {
+fn viewer_max_scroll() -> int32 {
   var view_h: int32 = viewer_content_bottom() - viewer_content_top();
   var est_h: int32 = g_viewer_content_height;
   if (g_doc_len <= 0) { est_h = 0; }
@@ -1143,41 +1143,41 @@ function viewer_max_scroll() -> int32 {
   return max_scroll;
 }
 
-function viewer_recompute_content_height() {
+fn viewer_recompute_content_height() {
   g_viewer_content_height = viewer_total_content_height();
 }
 
-function invalidate_area(hwnd: int64, rect: UiRect) {
+fn invalidate_area(hwnd: int64, rect: UiRect) {
   Win_InvalidateRect(hwnd, &rect, 0);
 }
 
-function invalidate_sidebar_list(hwnd: int64) {
+fn invalidate_sidebar_list(hwnd: int64) {
   var rect: UiRect = ui_make_rect(g_content_left, sidebar_list_top(), g_sidebar_right, sidebar_list_bottom());
   invalidate_area(hwnd, rect);
 }
 
-function invalidate_viewer_panel(hwnd: int64) {
+fn invalidate_viewer_panel(hwnd: int64) {
   var rect: UiRect = ui_make_rect(g_viewer_left, g_viewer_top, g_viewer_right, g_viewer_bottom);
   invalidate_area(hwnd, rect);
 }
 
-function invalidate_hero(hwnd: int64) {
+fn invalidate_hero(hwnd: int64) {
   var rect: UiRect = ui_make_rect(g_content_left, g_content_top, g_content_right, g_content_top + 96);
   invalidate_area(hwnd, rect);
 }
 
-function invalidate_client(hwnd: int64) {
+fn invalidate_client(hwnd: int64) {
   var rect: UiRect = ui_window_client_rect(hwnd);
   invalidate_area(hwnd, rect);
 }
 
-function invalidate_after_doc_load() {
+fn invalidate_after_doc_load() {
   invalidate_hero(g_main_window);
   invalidate_sidebar_list(g_main_window);
   invalidate_viewer_panel(g_main_window);
 }
 
-function viewer_draw_table_row(
+fn viewer_draw_table_row(
   hdc: int64,
   y: int32,
   raw: cstring,
@@ -1242,7 +1242,7 @@ function viewer_draw_table_row(
   return block_h;
 }
 
-function viewer_draw_line(
+fn viewer_draw_line(
   hdc: int64,
   y: int32,
   kind: int32,
@@ -1314,7 +1314,7 @@ function viewer_draw_line(
   return block_h;
 }
 
-function draw_viewer_content(hdc: int64, theme: UiTheme) {
+fn draw_viewer_content(hdc: int64, theme: UiTheme) {
   var top: int32 = viewer_content_top();
   var bottom: int32 = viewer_content_bottom();
   var y: int32 = top - g_viewer_scroll;
@@ -1383,11 +1383,11 @@ function draw_viewer_content(hdc: int64, theme: UiTheme) {
   }
 }
 
-function viewer_clamp_scroll() {
+fn viewer_clamp_scroll() {
   g_viewer_scroll = ui_clamp_i32(g_viewer_scroll, 0, viewer_max_scroll());
 }
 
-function utf8_copy_chunk(out: cstring, out_len: int32, write: int32, chunk: cstring) -> int32 {
+fn utf8_copy_chunk(out: cstring, out_len: int32, write: int32, chunk: cstring) -> int32 {
   var i: int32 = 0;
   while (chunk[i] != 0 && write + 1 < out_len) {
     out[write] = chunk[i];
@@ -1397,7 +1397,7 @@ function utf8_copy_chunk(out: cstring, out_len: int32, write: int32, chunk: cstr
   return write;
 }
 
-function utf8_skip_multibyte(src: cstring, read: int32) -> int32 {
+fn utf8_skip_multibyte(src: cstring, read: int32) -> int32 {
   var b0: uint8 = src[read];
   if (b0 < 128) { return read + 1; }
   if (b0 >= 192 && b0 < 224) { return read + 2; }
@@ -1407,7 +1407,7 @@ function utf8_skip_multibyte(src: cstring, read: int32) -> int32 {
 }
 
 // DrawTextA expects ANSI; docs are UTF-8. Map common punctuation to ASCII.
-function utf8_normalize_ascii(src: cstring, out: cstring, out_len: int32) {
+fn utf8_normalize_ascii(src: cstring, out: cstring, out_len: int32) {
   var read: int32 = 0;
   var write: int32 = 0;
   while (src[read] != 0 && write + 1 < out_len) {
@@ -1473,7 +1473,7 @@ function utf8_normalize_ascii(src: cstring, out: cstring, out_len: int32) {
   out[write] = 0;
 }
 
-function draw_viewer_scrollbar(hdc: int64, theme: UiTheme) {
+fn draw_viewer_scrollbar(hdc: int64, theme: UiTheme) {
   var max_scroll: int32 = viewer_max_scroll();
   if (max_scroll <= 0) { return; }
 
@@ -1492,31 +1492,31 @@ function draw_viewer_scrollbar(hdc: int64, theme: UiTheme) {
   ui_fill_rect_color_rect(hdc, &thumb, accent_color());
 }
 
-function sidebar_list_top() -> int32 {
+fn sidebar_list_top() -> int32 {
   return g_viewer_top + 36;
 }
 
-function sidebar_list_bottom() -> int32 {
+fn sidebar_list_bottom() -> int32 {
   return g_viewer_bottom - 10;
 }
 
-function sidebar_visible_rows() -> int32 {
+fn sidebar_visible_rows() -> int32 {
   var height: int32 = sidebar_list_bottom() - sidebar_list_top();
   if (height <= 0) { return 0; }
   return height / SIDEBAR_ROW_HEIGHT();
 }
 
-function sidebar_max_scroll() -> int32 {
+fn sidebar_max_scroll() -> int32 {
   var max_scroll: int32 = g_doc_count - sidebar_visible_rows();
   if (max_scroll < 0) { return 0; }
   return max_scroll;
 }
 
-function sidebar_clamp_scroll() {
+fn sidebar_clamp_scroll() {
   g_sidebar_scroll = ui_clamp_i32(g_sidebar_scroll, 0, sidebar_max_scroll());
 }
 
-function sidebar_contains(x: int32, y: int32) -> int32 {
+fn sidebar_contains(x: int32, y: int32) -> int32 {
   if (x < g_content_left) { return 0; }
   if (x >= g_sidebar_right) { return 0; }
   if (y < sidebar_list_top()) { return 0; }
@@ -1524,7 +1524,7 @@ function sidebar_contains(x: int32, y: int32) -> int32 {
   return 1;
 }
 
-function sidebar_doc_at(x: int32, y: int32) -> int32 {
+fn sidebar_doc_at(x: int32, y: int32) -> int32 {
   if (sidebar_contains(x, y) == 0) { return -1; }
   var row: int32 = (y - sidebar_list_top()) / SIDEBAR_ROW_HEIGHT() + g_sidebar_scroll;
   if (row < 0) { return -1; }
@@ -1532,7 +1532,7 @@ function sidebar_doc_at(x: int32, y: int32) -> int32 {
   return row;
 }
 
-function draw_sidebar_docs(hdc: int64, theme: UiTheme) {
+fn draw_sidebar_docs(hdc: int64, theme: UiTheme) {
   var y: int32 = sidebar_list_top();
   var bottom: int32 = sidebar_list_bottom();
   var index: int32 = g_sidebar_scroll;
@@ -1573,7 +1573,7 @@ function draw_sidebar_docs(hdc: int64, theme: UiTheme) {
   }
 }
 
-function build_menu(hwnd: int64) {
+fn build_menu(hwnd: int64) {
   var menu: int64 = ui_menu_create();
   var file_menu: int64 = ui_menu_popup_create();
   ui_menu_append_item(file_menu, ID_RELOAD(), cstr("Reload docs\tF5"));
@@ -1585,7 +1585,7 @@ function build_menu(hwnd: int64) {
   ui_window_set_menu(hwnd, menu);
 }
 
-function compute_layout(hwnd: int64) {
+fn compute_layout(hwnd: int64) {
   var client: UiRect = ui_window_client_rect(hwnd);
   var content: UiRect = ui_rect_inset(client, ui_make_insets(24));
   g_content_left = content.left;
@@ -1612,7 +1612,7 @@ function compute_layout(hwnd: int64) {
   viewer_recompute_content_height();
 }
 
-function build_controls(hwnd: int64) {
+fn build_controls(hwnd: int64) {
   g_status_label = ui_label_create(hwnd, 0, 0, 400, 22, cstr("Loading docs..."), ID_STATUS());
   g_theme_combo = ui_combobox_create(hwnd, 0, 0, 180, 160, ID_THEME());
 
@@ -1627,7 +1627,7 @@ function build_controls(hwnd: int64) {
   compute_layout(hwnd);
 }
 
-function paint_client(hdc: int64) {
+fn paint_client(hdc: int64) {
   var theme: UiTheme = ui_default_theme();
   var client: UiRect = ui_window_client_rect(g_main_window);
   var content: UiRect = ui_make_rect(g_content_left, g_content_top, g_content_right, g_content_bottom);
@@ -1674,7 +1674,7 @@ function paint_client(hdc: int64) {
   draw_viewer_scrollbar(hdc, theme);
 }
 
-function on_paint(hwnd: int64) {
+fn on_paint(hwnd: int64) {
   var ps: UiPaintStruct;
   var hdc: int64 = ui_begin_paint(hwnd, &ps);
   var client: UiRect = ui_window_client_rect(hwnd);
@@ -1701,7 +1701,7 @@ function on_paint(hwnd: int64) {
   ui_end_paint(hwnd, &ps);
 }
 
-function reload_docs() -> int32 {
+fn reload_docs() -> int32 {
   var keep_index: int32 = g_selected_doc;
   if (resolve_docs_root() == 0) {
     set_status(cstr("Could not locate docs/ (expected LANGUAGE.md)."));
@@ -1717,7 +1717,7 @@ function reload_docs() -> int32 {
   return 1;
 }
 
-function window_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 {
+fn window_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 {
   if (msg == UI_WM_ERASEBKGND()) { return 1; }
 
   if (msg == UI_WM_PAINT()) {
@@ -1812,7 +1812,7 @@ function window_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> 
   return ui_def_window_proc(hwnd, msg, wparam, lparam);
 }
 
-function alloc_buffers() -> int32 {
+fn alloc_buffers() -> int32 {
   g_paths_blob = malloc(PATHS_BUF_SIZE());
   g_path_slots = malloc(PATH_SLOT_SIZE() * MAX_DOCS());
   g_doc_buf = malloc(DOC_BUF_SIZE());
@@ -1833,7 +1833,7 @@ function alloc_buffers() -> int32 {
   return 1;
 }
 
-function free_buffers() {
+fn free_buffers() {
   if (g_paths_blob != 0) { free(g_paths_blob); g_paths_blob = 0; }
   if (g_path_slots != 0) { free(g_path_slots); g_path_slots = 0; }
   if (g_doc_buf != 0) { free(g_doc_buf); g_doc_buf = 0; }
@@ -1843,7 +1843,7 @@ function free_buffers() {
   if (g_current_title != 0) { free(g_current_title); g_current_title = 0; }
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   if (ui_init() == 0) { return 1; }
   if (alloc_buffers() == 0) { return 1; }
 

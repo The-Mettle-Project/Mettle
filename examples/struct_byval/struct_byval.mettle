@@ -20,7 +20,7 @@ struct V4 {
   d: int64;
 }
 
-function step(v: V4) -> V4 {
+fn step(v: V4) -> V4 {
   var r: V4;
   r.a = v.a + v.d;
   r.b = v.b ^ (v.a >> 3);
@@ -29,7 +29,7 @@ function step(v: V4) -> V4 {
   return r;
 }
 
-function run() -> int64 {
+fn run() -> int64 {
   var s: V4;
   s.a = 1; s.b = 2; s.c = 3; s.d = 4;
   var i: int64 = 0;
@@ -40,7 +40,7 @@ function run() -> int64 {
   return s.a ^ s.b ^ s.c ^ s.d;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var passes: int32 = 5;
   println("Struct-by-value (32B) call, 40M iters x 5 passes");
 

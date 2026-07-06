@@ -1,6 +1,6 @@
 // A range case whose lower bound exceeds its upper bound is a compile error.
 
-function main() -> int32 {
+fn main() -> int32 {
   switch (3) {
     case 5..1:
       return 1;

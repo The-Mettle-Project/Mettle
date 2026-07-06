@@ -56,6 +56,9 @@ void ir_explain_set_output_path(const char *path) {
  * the document. */
 
 static int g_explain_json = 0;
+/* When set (by --annotate-asm), ir_explain_flush keeps the remark table alive
+ * past optimization so the codegen annotator can join it onto emitted asm. */
+static int g_explain_retain_remarks = 0;
 static char *g_json_buf = NULL;
 static size_t g_json_len = 0;
 static size_t g_json_cap = 0;
@@ -224,6 +227,36 @@ void ir_optimize_set_explain(int enabled, const char *focus_file) {
 }
 
 int ir_explain_enabled(void) { return g_explain; }
+
+void ir_explain_set_retain_remarks(int enabled) {
+  g_explain_retain_remarks = enabled ? 1 : 0;
+}
+
+/* --annotate-asm reads the collected remarks to enrich its codegen listing with
+ * the same verified vectorization/inlining narration. These accessors expose the
+ * remark table read-only without leaking the struct definition. */
+size_t ir_explain_remark_count(void) { return g_remark_count; }
+
+int ir_explain_remark_at(size_t i, const char **function_name,
+                         const char **entity, size_t *line, int *positive,
+                         const char **headline, const char **reason,
+                         const char **fix, const char **verified,
+                         size_t *depth) {
+  if (i >= g_remark_count) {
+    return 0;
+  }
+  const IRExplainRemark *r = &g_remarks[i];
+  if (function_name) *function_name = r->function_name;
+  if (entity) *entity = r->entity;
+  if (line) *line = r->line;
+  if (positive) *positive = r->positive;
+  if (headline) *headline = r->headline;
+  if (reason) *reason = r->reason;
+  if (fix) *fix = r->fix;
+  if (verified) *verified = r->verified;
+  if (depth) *depth = r->depth;
+  return 1;
+}
 
 static const char *ir_explain_path_basename(const char *path) {
   const char *base = path;
@@ -1171,18 +1204,23 @@ void ir_explain_flush(void) {
   }
   ir_explain_json_raw("],");
 
-  for (size_t i = 0; i < g_remark_count; i++) {
-    free(g_remarks[i].function_name);
-    free(g_remarks[i].entity);
-    free(g_remarks[i].headline);
-    free(g_remarks[i].reason);
-    free(g_remarks[i].fix);
-    free(g_remarks[i].verified);
+  /* --annotate-asm reads the remarks during codegen (which runs AFTER this
+   * optimization-stage flush), so when retention is requested we keep them
+   * alive; the one-shot compile leaks them at exit. */
+  if (!g_explain_retain_remarks) {
+    for (size_t i = 0; i < g_remark_count; i++) {
+      free(g_remarks[i].function_name);
+      free(g_remarks[i].entity);
+      free(g_remarks[i].headline);
+      free(g_remarks[i].reason);
+      free(g_remarks[i].fix);
+      free(g_remarks[i].verified);
+    }
+    free(g_remarks);
+    g_remarks = NULL;
+    g_remark_count = 0;
+    g_remark_capacity = 0;
   }
-  free(g_remarks);
-  g_remarks = NULL;
-  g_remark_count = 0;
-  g_remark_capacity = 0;
 
   /* Memory diagnostics land after "remarks" and before "backend". */
   ir_explain_memory_flush();
@@ -1803,5 +1841,88 @@ void ir_explain_kernel_desc(const IRInstruction *ins, char *buf, size_t cap) {
   default:
     snprintf(buf, cap, "%s (SIMD kernel)", ir_opcode_name(ins->op));
     return;
+  }
+}
+
+/* Render the --ml-opt report from the native pass's TSV (fn, gidx, kind, before,
+ * after, saved, line, file), styled like the main report. */
+static const char *glyph_ellipsis(void) {
+  return ir_explain_use_unicode() ? "\xE2\x80\xA6" : "..";
+}
+
+static void ml_fit(const char *s, int width, char *out, size_t cap) {
+  int len = (int)strlen(s);
+  if (len <= width) {
+    snprintf(out, cap, "%-*s", width, s);
+    return;
+  }
+  int keep = width - 2;
+  if (keep < 1) keep = 1;
+  snprintf(out, cap, "%.*s%s", keep, s, glyph_ellipsis());
+}
+
+void ir_explain_ml_opt(const char *path) {
+  FILE *f = fopen(path, "r");
+  if (!f) {
+    return;
+  }
+  const char *rule = glyph_rule();
+  fprintf(stderr, "\n%s%s ml-opt: model-driven IR optimizations %s%s%s%s%s\n\n",
+          clr(EXPLAIN_BOLD), rule, rule, rule, rule, rule, clr(EXPLAIN_RESET));
+
+  char ln[1024];
+  char cur_fn[256] = "";
+  int total = 0, funcs = 0, saved_total = 0;
+  while (fgets(ln, sizeof ln, f)) {
+    char *fn = strtok(ln, "\t");
+    char *gi = fn ? strtok(NULL, "\t") : NULL;
+    char *kind = gi ? strtok(NULL, "\t") : NULL;
+    char *before = kind ? strtok(NULL, "\t") : NULL;
+    char *after = before ? strtok(NULL, "\t") : NULL;
+    char *saved = after ? strtok(NULL, "\t") : NULL;
+    char *line = saved ? strtok(NULL, "\t") : NULL;
+    char *file = line ? strtok(NULL, "\t\n") : NULL;
+    if (!after) {
+      continue;
+    }
+    int sv = saved ? atoi(saved) : 0;
+    long src_line = line ? atol(line) : 0;
+    if (strcmp(fn, cur_fn) != 0) {
+      snprintf(cur_fn, sizeof cur_fn, "%s", fn);
+      funcs++;
+      if (file && file[0]) {
+        fprintf(stderr, "  %sfunction %s%s%s  %s%s%s\n", clr(EXPLAIN_DIM),
+                clr(EXPLAIN_RESET), clr(EXPLAIN_BOLD), fn, clr(EXPLAIN_DIM),
+                file, clr(EXPLAIN_RESET));
+      } else {
+        fprintf(stderr, "  %sfunction %s%s%s%s\n", clr(EXPLAIN_DIM),
+                clr(EXPLAIN_RESET), clr(EXPLAIN_BOLD), fn, clr(EXPLAIN_RESET));
+      }
+    }
+    char kbuf[28], bbuf[34], loc[24];
+    ml_fit(kind, 22, kbuf, sizeof kbuf);
+    ml_fit(before, 30, bbuf, sizeof bbuf);
+    if (src_line > 0) snprintf(loc, sizeof loc, "line %ld", src_line);
+    else snprintf(loc, sizeof loc, "ir#%s", gi ? gi : "?");
+    const char *aft = (after[0] == '@') ? after + 1 : after;   /* drop sigil */
+    fprintf(stderr, "    %s%s %-9s%s %s  %s  %s %s%s%s",
+            clr(EXPLAIN_DIM), glyph_elbow(), loc, clr(EXPLAIN_RESET), kbuf, bbuf,
+            glyph_arrow(), clr(EXPLAIN_GREEN), aft, clr(EXPLAIN_RESET));
+    if (sv > 0) {
+      fprintf(stderr, "  %s-%d op%s%s", clr(EXPLAIN_DIM), sv, sv == 1 ? "" : "s",
+              clr(EXPLAIN_RESET));
+    }
+    fprintf(stderr, "\n");
+    total++;
+    saved_total += sv;
+  }
+  fclose(f);
+  if (total) {
+    fprintf(stderr,
+            "\n  %s%d rewrite%s in %d function%s %s %d IR op%s removed, "
+            "all verified equivalent%s\n",
+            clr(EXPLAIN_DIM), total, total == 1 ? "" : "s", funcs,
+            funcs == 1 ? "" : "s", ir_explain_use_unicode() ? "\xC2\xB7" : "*",
+            saved_total, saved_total == 1 ? "" : "s", clr(EXPLAIN_RESET));
   }
 }

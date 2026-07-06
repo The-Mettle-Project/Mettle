@@ -1,8 +1,8 @@
 // ABI: MS x64 shadow space (32 bytes) before call
-function callee() -> int32 {
+fn callee() -> int32 {
   return 7;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   return callee();
 }

@@ -10,42 +10,42 @@
 
 import "std/io";
 
-function sum_i(n: int64) -> int64 {
+fn sum_i(n: int64) -> int64 {
   var s: int64 = 0;
   var i: int64 = 1;
   while (i <= n) { s = s + i; i = i + 1; }
   return s;
 }
 
-function sum_i2(n: int64) -> int64 {
+fn sum_i2(n: int64) -> int64 {
   var s: int64 = 0;
   var i: int64 = 1;
   while (i <= n) { s = s + i * i; i = i + 1; }
   return s;
 }
 
-function sum_affine(n: int64) -> int64 {
+fn sum_affine(n: int64) -> int64 {
   var s: int64 = 0;
   var i: int64 = 1;
   while (i <= n) { s = s + (2 * i + 3); i = i + 1; }
   return s;
 }
 
-function sum_i3(n: int64) -> int64 {
+fn sum_i3(n: int64) -> int64 {
   var s: int64 = 0;
   var i: int64 = 1;
   while (i <= n) { s = s + i * i * i; i = i + 1; }
   return s;
 }
 
-function sum_const(n: int64) -> int64 {
+fn sum_const(n: int64) -> int64 {
   var s: int64 = 0;
   var i: int64 = 0;
   while (i < n) { s = s + 7; i = i + 1; }
   return s;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var ok: int32 = 1;
 
   if (sum_i(100) != 5050) { ok = 0; }

@@ -1,4 +1,5 @@
 #include "codegen/binary/mir.h"
+#include "codegen/binary/mir_annotate.h"
 #include "codegen/code_generator_internal.h"
 #include "semantic/symbol_table.h"
 
@@ -1107,7 +1108,9 @@ static int mir_has_calls(const MirFunction *fn) {
   for (size_t i = 0; i < fn->insn_count; i++) {
     /* MIR_TRAP also emits calls (puts/exit), so it needs outgoing shadow space
      * reserved at the bottom of the frame just like a MIR_CALL. */
-    if (fn->insns[i].op == MIR_CALL || fn->insns[i].op == MIR_TRAP) {
+    if (fn->insns[i].op == MIR_CALL ||
+        fn->insns[i].op == MIR_CALL_INDIRECT ||
+        fn->insns[i].op == MIR_TRAP) {
       return 1;
     }
   }
@@ -1480,6 +1483,34 @@ static int encode_load_global(MirFunction *fn, const MirInst *in) {
   if (!name) {
     return enc_err(fn, "MIR_LOAD_GLOBAL without a symbol");
   }
+
+  /* A float global is cached in an XMM vreg: load its raw bits into a GP scratch
+   * (the RIP-relative load helper is GP-only) then movd/movq them into the XMM
+   * lane. Float globals are never const-folded (see globals.c), so no immediate
+   * branch is needed here. */
+  if (in->dst.kind == MIR_OPK_VREG &&
+      fn->vregs[in->dst.vreg].rclass == MIR_RC_XMM) {
+    int width = fn->vregs[in->dst.vreg].width;
+    const char *link = code_generator_get_link_symbol_name(g, name);
+    Symbol *s =
+        (g && g->symbol_table) ? symbol_table_lookup(g->symbol_table, name)
+                               : NULL;
+    if (!link || !link[0] || !s) {
+      return enc_err(fn, "unresolved global in MIR_LOAD_GLOBAL");
+    }
+    if (!code_generator_binary_emit_global_symbol_load(g, ctx, link, s->type,
+                                                       s->is_extern, SCRATCH_A)) {
+      return enc_err(fn, "out of memory loading float global");
+    }
+    int moved = (width == 4)
+                    ? binary_emit_movd_xmm_reg(&ctx->code, FSCRATCH_A, SCRATCH_A)
+                    : binary_emit_movq_xmm_reg(&ctx->code, FSCRATCH_A, SCRATCH_A);
+    if (!moved) {
+      return enc_err(fn, "out of memory staging float global to xmm");
+    }
+    return xmm_store(fn, &in->dst, FSCRATCH_A, width);
+  }
+
   BinaryGpRegister D;
   int dst_in_reg = dst_is_reg(fn, &in->dst, &D);
   BinaryGpRegister target = dst_in_reg ? D : SCRATCH_A;
@@ -1518,10 +1549,31 @@ static int encode_store_global(MirFunction *fn, const MirInst *in) {
   if (!name) {
     return enc_err(fn, "MIR_STORE_GLOBAL without a symbol");
   }
-  int rok = 1;
-  BinaryGpRegister src = value_reg(fn, &in->b, SCRATCH_A, &rok);
-  if (!rok) {
-    return 0;
+  BinaryGpRegister src;
+  /* A float global is cached in an XMM vreg: pull its bits out of the XMM lane
+   * into a GP scratch, then the RIP-relative store writes the low `size` bytes
+   * (the GP store helper is GP-only). */
+  if (in->b.kind == MIR_OPK_VREG &&
+      fn->vregs[in->b.vreg].rclass == MIR_RC_XMM) {
+    int width = fn->vregs[in->b.vreg].width;
+    int xok = 1;
+    BinaryXmmRegister xsrc = xmm_value(fn, &in->b, FSCRATCH_A, width, &xok);
+    if (!xok) {
+      return 0;
+    }
+    int moved = (width == 4)
+                    ? binary_emit_movd_reg_xmm(&ctx->code, SCRATCH_A, xsrc)
+                    : binary_emit_movq_reg_xmm(&ctx->code, SCRATCH_A, xsrc);
+    if (!moved) {
+      return enc_err(fn, "out of memory staging float global from xmm");
+    }
+    src = SCRATCH_A;
+  } else {
+    int rok = 1;
+    src = value_reg(fn, &in->b, SCRATCH_A, &rok);
+    if (!rok) {
+      return 0;
+    }
   }
   const char *link = code_generator_get_link_symbol_name(g, name);
   Symbol *s = (g && g->symbol_table) ? symbol_table_lookup(g->symbol_table, name)
@@ -1557,8 +1609,18 @@ int mir_encode(MirFunction *fn) {
   }
   BinaryFunctionContext *ctx = fn->context;
 
+  /* --annotate-asm: byte offsets are reported relative to this function's start
+   * (the context's code buffer may already hold earlier functions). */
+  size_t annot_base = ctx->code.size;
+  int annot = mir_annotate_enabled();
+
   if (!mir_layout_frame(fn) || !mir_emit_prologue(fn)) {
     return 0;
+  }
+  if (annot && ctx->code.size > annot_base) {
+    mir_annotate_record_synthetic("prologue", "frame", 0,
+                                  ctx->code.size - annot_base,
+                                  ctx->code.data + annot_base);
   }
 
   /* Loop-header alignment: a label that is the target of a BACKWARD branch is a
@@ -1588,6 +1650,7 @@ int mir_encode(MirFunction *fn) {
   for (size_t i = 0; i < fn->insn_count; i++) {
     const MirInst *in = &fn->insns[i];
     int ok = 1;
+    size_t annot_off = ctx->code.size;
     if (in->op == MIR_LABEL && align_label && align_label[i]) {
       while (ctx->code.size % 16 != 0) {
         if (!binary_code_buffer_append_u8(&ctx->code, 0x90)) {
@@ -1736,6 +1799,17 @@ int mir_encode(MirFunction *fn) {
       }
       break;
     }
+    case MIR_CALL_INDIRECT: {
+      /* Same frame contract as MIR_CALL: the prologue reserved shadow/stack
+       * argument space, and regalloc kept the target out of any argument
+       * register clobbered by the preceding marshalling moves. */
+      int rok;
+      BinaryGpRegister target = value_reg(fn, &in->a, SCRATCH_A, &rok);
+      if (!rok || !binary_emit_call_reg(&ctx->code, target)) {
+        ok = enc_err(fn, "out of memory emitting indirect call");
+      }
+      break;
+    }
     case MIR_SIMD_SLP_MAC: {
       /* Inline SLP MAC kernel. The preceding MIR_MOVs marshalled a/b/out element
        * pointers into RCX/RDX/R8, the k count into R9, and the byte row stride
@@ -1787,6 +1861,32 @@ int mir_encode(MirFunction *fn) {
       }
       break;
     }
+    case MIR_SIMD_AFFINE_MAP_F64: {
+      /* Inline float64 affine map. The preceding MIR_MOVs marshalled src->RCX,
+       * dst->RDX, count->R8; dst.imm/a.imm/b.imm hold the a/b/c coefficient
+       * double bits and cc holds b_is_one|b_is_zero<<1|c_is_zero<<2. The kernel
+       * emits its own closing vzeroupper, so used_inline_vector stays unset. */
+      if (!code_generator_binary_emit_simd_affine_map_f64_inline(
+              &ctx->code, (unsigned long long)in->dst.imm,
+              (unsigned long long)in->a.imm, (unsigned long long)in->b.imm,
+              (in->cc & 1) != 0, (in->cc & 2) != 0, (in->cc & 4) != 0,
+              (in->cc & 8) != 0)) {
+        ok = enc_err(fn, "out of memory emitting inline f64 affine-map kernel");
+      }
+      break;
+    }
+    case MIR_SIMD_VLOOP: {
+      /* Inline general vloop (float64 map). The preceding MIR_MOVs marshalled the
+       * base pointers + count into the ABI arg registers; the DAG comes from the
+       * borrowed IRInstruction in `aux`. operands_marshaled=1 makes the kernel
+       * read them from registers instead of the operands' stack homes. */
+      const IRInstruction *vir = (const IRInstruction *)in->aux;
+      if (!vir || !code_generator_binary_emit_simd_vloop_f64(
+                      fn->generator, fn->context, vir, 1)) {
+        ok = enc_err(fn, "out of memory emitting inline vloop kernel");
+      }
+      break;
+    }
     case MIR_SIMD_SILU_F32: {
       /* Inline SiLU/SwiGLU gate. g/out->RCX, u->RDX, count->R8 marshalled by the
        * preceding MIR_MOVs; dst.imm = has_mul. The kernel emits its own closing
@@ -1809,6 +1909,58 @@ int mir_encode(MirFunction *fn) {
       if (!binary_emit_mov_mem_reg(&ctx->code, BINARY_GP_RSP, (int)in->b.imm,
                                    r)) {
         ok = enc_err(fn, "out of memory storing outgoing call argument");
+      }
+      break;
+    }
+    case MIR_CMOV: {
+      /* dst = (a != 0) ? b : dst. dst was pre-loaded with the else value by a
+       * preceding MIR_MOV, so `test a; cmovnz dst, b` completes the select.
+       * A spilled dst is staged through SCRATCH_A; cond stages through
+       * SCRATCH_B, and `then` reuses SCRATCH_B (cond is dead after the test). */
+      int rok;
+      BinaryGpRegister D;
+      int dst_in_reg = dst_is_reg(fn, &in->dst, &D);
+      BinaryGpRegister target = D;
+      if (!dst_in_reg) {
+        const MirVreg *v = &fn->vregs[in->dst.vreg];
+        target = SCRATCH_A;
+        if (!binary_emit_mov_reg_mem(&ctx->code, SCRATCH_A, frame_base(fn),
+                                     frame_disp(fn, -spill_off(v)))) {
+          ok = enc_err(fn, "out of memory loading cmov dst");
+          break;
+        }
+      }
+      BinaryGpRegister creg = value_reg(fn, &in->a, SCRATCH_B, &rok);
+      if (!rok || !binary_emit_test_reg_reg(&ctx->code, creg)) {
+        ok = enc_err(fn, "out of memory in cmov test");
+        break;
+      }
+      BinaryGpRegister treg = value_reg(fn, &in->b, SCRATCH_B, &rok);
+      if (!rok ||
+          !binary_emit_cmovcc_reg_reg(&ctx->code, 0x45, target, treg)) {
+        ok = enc_err(fn, "out of memory in cmov");
+        break;
+      }
+      if (!dst_in_reg) {
+        ok = store_from(fn, &in->dst, target);
+      }
+      break;
+    }
+    case MIR_PREFETCH: {
+      /* prefetcht0 [base + disp]: advisory, no destination. The address vreg
+       * is a plain read; a spilled address stages through SCRATCH_A. */
+      if (in->a.kind != MIR_OPK_MEM || in->a.mem.index != MIR_VREG_NONE) {
+        ok = enc_err(fn, "MIR_PREFETCH expects a base-only memory operand");
+        break;
+      }
+      int prok;
+      MirOperand pbop = mir_op_vreg(in->a.mem.base);
+      BinaryGpRegister pbase = value_reg(fn, &pbop, SCRATCH_A, &prok);
+      if (!prok) {
+        break;
+      }
+      if (!binary_emit_prefetcht0_mem(&ctx->code, pbase, in->a.mem.disp)) {
+        ok = enc_err(fn, "out of memory in prefetch");
       }
       break;
     }
@@ -1889,6 +2041,29 @@ int mir_encode(MirFunction *fn) {
       if (!code_generator_binary_emit_symbol_address(fn->generator, ctx, link,
                                                      in->is_unsigned, target)) {
         ok = enc_err(fn, "out of memory emitting global address");
+        break;
+      }
+      if (!dst_in_reg) {
+        ok = store_from(fn, &in->dst, SCRATCH_A);
+      }
+      break;
+    }
+    case MIR_LEA_FUNC: {
+      /* dst <- RIP-relative address of function symbol a.sym. This shares the
+       * same relocation path as global addresses; the linker resolves the code
+       * symbol and the function pointer receives that address. */
+      const char *name = in->a.sym ? in->a.sym : "";
+      const char *link = code_generator_get_link_symbol_name(fn->generator, name);
+      if (!link || link[0] == '\0') {
+        ok = enc_err(fn, "invalid function symbol in address-of");
+        break;
+      }
+      BinaryGpRegister D;
+      int dst_in_reg = dst_is_reg(fn, &in->dst, &D);
+      BinaryGpRegister target = dst_in_reg ? D : SCRATCH_A;
+      if (!code_generator_binary_emit_symbol_address(fn->generator, ctx, link,
+                                                     in->is_unsigned, target)) {
+        ok = enc_err(fn, "out of memory emitting function address");
         break;
       }
       if (!dst_in_reg) {
@@ -2026,6 +2201,11 @@ int mir_encode(MirFunction *fn) {
     default:
       ok = enc_err(fn, "unsupported MIR opcode in encoder");
       break;
+    }
+    if (annot && ok && ctx->code.size > annot_off) {
+      mir_annotate_record(fn, in, (int)i, annot_off - annot_base,
+                          ctx->code.size - annot_off,
+                          ctx->code.data + annot_off);
     }
     if (!ok) {
       free(align_label);

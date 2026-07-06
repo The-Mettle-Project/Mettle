@@ -6,7 +6,7 @@ import "std/io";
 import "std/mem";
 import "std/alloc";
 
-function main() -> int32 {
+fn main() -> int32 {
   var a: cstring = mx_alloc((int64)64);
   mx_free(a);
   mx_free(a);                            // double free -> rejected

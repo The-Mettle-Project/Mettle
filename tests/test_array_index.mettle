@@ -1,4 +1,4 @@
-function main() -> int32 {
+fn main() -> int32 {
   var arr: int32[4];
   arr[0] = 7;
   arr[1] = arr[0] + 3;

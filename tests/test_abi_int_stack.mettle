@@ -1,8 +1,8 @@
 // ABI: 5th+ integer args on stack (MS x64: [rsp+32], [rsp+40], ...)
-function take6(a: int32, b: int32, c: int32, d: int32, e: int32, f: int32) -> int32 {
+fn take6(a: int32, b: int32, c: int32, d: int32, e: int32, f: int32) -> int32 {
   return a + b + c + d + e + f;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   return take6(1, 2, 3, 4, 5, 6);
 }

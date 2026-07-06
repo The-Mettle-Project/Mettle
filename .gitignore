@@ -28,3 +28,9 @@ docs/benchmarks/latest.json
 examples/llm/
 web/benchmarks.json
 MettleWarband/
+MettleWarband.zip
+_mlopt.ir
+_mlopt.disp
+_mlopt.explain
+*.mprof
+ui_test.mettle

@@ -95,7 +95,7 @@ use-after-move checking on raw-pointer dereferences. Mettle checks exactly that
 code:
 
 ```mettle
-function uaf_through_alias() -> int32 {
+fn uaf_through_alias() -> int32 {
     var buf: cstring = malloc(16);
     buf[0] = 7;
     var q: cstring = buf;     // q and buf name the same block

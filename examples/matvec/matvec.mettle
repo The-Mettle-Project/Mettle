@@ -1,0 +1,79 @@
+// Mettle matrix-vector multiply benchmark (Suite 2)
+//
+// float64 512x512 matrix times a 512-element vector, 200 passes.
+//
+// Build: build.bat
+// Run: matvec.exe
+
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+var DIM: int64 = 512;
+
+fn matvec(mat: float64*, vec: float64*, out: float64*, dim: int64) {
+  var i: int64 = 0;
+  while (i < dim) {
+    var sum: float64 = 0.0;
+    var base: int64 = i * dim;
+    var j: int64 = 0;
+    while (j < dim) {
+      sum = sum + mat[base + j] * vec[j];
+      j = j + 1;
+    }
+    out[i] = sum;
+    i = i + 1;
+  }
+}
+
+fn main() -> int32 {
+  var dim: int64 = DIM;
+  var passes: int32 = 200;
+
+  var mat: float64* = (float64*)malloc(dim * dim * 8);
+  var vec: float64* = (float64*)malloc(dim * 8);
+  var out: float64* = (float64*)malloc(dim * 8);
+  if (mat == 0 || vec == 0 || out == 0) {
+    println("malloc failed");
+    return 1;
+  }
+
+  var i: int64 = 0;
+  while (i < dim) {
+    vec[i] = (float64)(i % 17) * 0.5 + 1.0;
+    var j: int64 = 0;
+    while (j < dim) {
+      mat[i * dim + j] = (float64)((i + j) % 13) * 0.25;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+
+  println("Matrix-vector multiply: 512x512 float64 x 200 passes");
+
+  var t0: uint64 = bench_time_us();
+  var bench_sum: float64 = 0.0;
+  var p: int32 = 0;
+  while (p < passes) {
+    matvec(mat, vec, out, dim);
+    bench_sum = bench_sum + out[0] + out[dim - 1];
+    p = p + 1;
+  }
+  var elapsed_us: uint64 = bench_time_us() - t0;
+
+  print("Checksum = ");
+  println_int((int64)bench_sum);
+  print("Time: ");
+  print_int(elapsed_us);
+  println(" us");
+
+  var per_pass: uint64 = elapsed_us / passes;
+  print("Per pass: ~");
+  print_int(per_pass);
+  println(" us");
+
+  free((cstring)mat);
+  free((cstring)vec);
+  free((cstring)out);
+  return 0;
+}

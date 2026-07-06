@@ -3,16 +3,16 @@ struct Box {
   spare: int32;
 }
 
-function read_through(p: int32*) -> int32 {
+fn read_through(p: int32*) -> int32 {
   return *p;
 }
 
-function bump(p: int32*) -> int32 {
+fn bump(p: int32*) -> int32 {
   *p = *p + 2;
   return *p;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var local: int32 = 5;
   var p: int32* = &local;
 

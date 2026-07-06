@@ -1,15 +1,15 @@
 // ABI: function pointer / indirect call — same convention
 // We test by calling through a known function (no function pointers in Mettle)
 // This verifies chained calls preserve ABI
-function f1(x: int32) -> int32 {
+fn f1(x: int32) -> int32 {
   return x * 2;
 }
 
-function f2(y: int32) -> int32 {
+fn f2(y: int32) -> int32 {
   return f1(y) + 1;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var r: int32 = f2(7);
   if (r == 15) {
     return 1;

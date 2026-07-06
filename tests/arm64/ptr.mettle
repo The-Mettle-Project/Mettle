@@ -1,0 +1,8 @@
+// Pointer aliasing: *p mutates x -> 99. (Works because every local is
+// memory-resident in the stack-home model.)
+fn main() -> int64 {
+  var x: int64 = 5;
+  var p: int64* = &x;
+  *p = 99;
+  return x;
+}

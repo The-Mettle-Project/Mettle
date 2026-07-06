@@ -6,7 +6,7 @@ import "std/bench";
 
 var N: int32 = 32;
 
-function qmatmul(a: int8*, b: int8*, c: int32*) {
+fn qmatmul(a: int8*, b: int8*, c: int32*) {
   var row: int32 = 0;
   var row_base: int64 = 0;
   while (row < N) {
@@ -47,7 +47,7 @@ function qmatmul(a: int8*, b: int8*, c: int32*) {
   }
 }
 
-function trace_c(c: int32*) -> int64 {
+fn trace_c(c: int32*) -> int64 {
   var sum: int64 = 0;
   var i: int32 = 0;
   var idx: int64 = 0;
@@ -59,7 +59,7 @@ function trace_c(c: int32*) -> int64 {
   return sum;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var a: int8* = (int8*)malloc(1024);
   var b: int8* = (int8*)malloc(1024);
   var c: int32* = (int32*)malloc(1024 * 4);

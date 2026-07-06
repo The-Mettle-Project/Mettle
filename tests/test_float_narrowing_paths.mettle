@@ -17,7 +17,7 @@
 //
 // Exit code 1 = all OK, 0 = some path miscompiled.
 
-function map_f32(a: float32*, n: int64) {
+fn map_f32(a: float32*, n: int64) {
   var i: int64 = 0;
   while (i < n) {
     a[i] = a[i] * 2.0 + 3.0;
@@ -25,16 +25,16 @@ function map_f32(a: float32*, n: int64) {
   }
 }
 
-@noinline function ret_f32(x: float32) -> float32 {
+@noinline fn ret_f32(x: float32) -> float32 {
   return x * 3.0 + 1.0;
 }
 
-function param_f32(x: float32, y: float32) -> float64 {
+fn param_f32(x: float32, y: float32) -> float64 {
   var r: float64 = (float64)x * 5.0 + (float64)y * 6.0;
   return r + 3.0;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   // 1. MIR float32 store of an arithmetic result
   var fa: float32[4];
   fa[0] = 5.0; fa[1] = 8.0; fa[2] = 11.0; fa[3] = 14.0;

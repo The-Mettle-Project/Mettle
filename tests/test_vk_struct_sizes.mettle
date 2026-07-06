@@ -164,7 +164,7 @@ export struct VkGraphicsPipelineCreateInfo {
 
 import "std/io";
 
-export function main() -> int32 {
+export fn main() -> int32 {
   print(cstr("StageInfo "));
   print_int((int64)sizeof(VkPipelineShaderStageCreateInfo));
   newline();

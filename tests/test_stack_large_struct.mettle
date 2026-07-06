@@ -10,7 +10,7 @@ struct Big {
   h: int32;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var s: Big;
   s.a = 1;
   s.b = 2;

@@ -5,7 +5,7 @@ enum Direction {
     West = -5
 }
 
-export function main() : int32 {
+export fn main() : int32 {
     var a : Direction = North;
     var b : Direction = East;
     var c : Direction = South;

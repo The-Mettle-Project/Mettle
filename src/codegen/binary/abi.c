@@ -1559,6 +1559,52 @@ int code_generator_binary_prepare_function_context(
     }
   }
 
+  /* Pre-mark referenced global float symbols with their DECLARED float width,
+   * symmetric with the parameter/local declared-type passes above. The mark map
+   * is first-wins, and a written float global (`@g <- t`, where t is a float64
+   * temp from a double-precision expression) would otherwise be recorded by the
+   * instruction-result pass below at the temp's width (64), mislabeling a
+   * float32 global. Globals are not declared by a DECLARE_LOCAL, so without this
+   * they have no authoritative declared-width mark. */
+  for (size_t i = 0; i < ir_function->instruction_count; i++) {
+    const IRInstruction *instruction = &ir_function->instructions[i];
+    if (!instruction) {
+      continue;
+    }
+    for (int k = 0;; k++) {
+      const IROperand *op;
+      if (k == 0) {
+        op = &instruction->dest;
+      } else if (k == 1) {
+        op = &instruction->lhs;
+      } else if (k == 2) {
+        op = &instruction->rhs;
+      } else if ((size_t)(k - 3) < instruction->argument_count) {
+        op = &instruction->arguments[k - 3];
+      } else {
+        break;
+      }
+      if (op->kind != IR_OPERAND_SYMBOL || !op->name || op->name[0] == '\0' ||
+          !generator->symbol_table) {
+        continue;
+      }
+      Symbol *sym = symbol_table_lookup(generator->symbol_table, op->name);
+      if (!sym || !sym->scope || sym->scope->type != SCOPE_GLOBAL) {
+        continue;
+      }
+      int gfbits = code_generator_binary_resolved_type_float_bits(sym->type);
+      if (gfbits &&
+          !code_generator_binary_mark_float_symbol(context, op->name, gfbits)) {
+        code_generator_set_error(
+            generator, "Failed to allocate float global metadata in function "
+                       "'%s'",
+            function_data->name);
+        binary_function_context_destroy(context);
+        return 0;
+      }
+    }
+  }
+
   for (size_t i = 0; i < ir_function->instruction_count; i++) {
     const IRInstruction *instruction = &ir_function->instructions[i];
     if (!instruction || !instruction->dest.name ||

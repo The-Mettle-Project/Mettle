@@ -1,7 +1,7 @@
-function reader_target_symbol_long_name() -> int32 {
+fn reader_target_symbol_long_name() -> int32 {
   return 9;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   return reader_target_symbol_long_name();
 }

@@ -1,6 +1,6 @@
 import "enum_module";
 
-function main() -> int32 {
+fn main() -> int32 {
   var c: Color = Green;
   switch (c) {
     case 0:

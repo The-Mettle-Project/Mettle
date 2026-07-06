@@ -3,48 +3,48 @@
 // sign-extended before later width-sensitive operations like division/shift.
 // Exit code: bitmask of failed checks (0 = all pass).
 
-extern function exit2(code: int32) -> int32 = "exit";
+extern fn exit2(code: int32) -> int32 = "exit";
 
 var G: int32 = 0;
 
-function sDiv(x: int32) -> int32 {
+fn sDiv(x: int32) -> int32 {
   var t: int32 = x + 9;
   var q: int32 = t / 7;
   return q;
 }
 
-function sShr(x: int32) -> int32 {
+fn sShr(x: int32) -> int32 {
   var t: int32 = x + 9;
   var q: int32 = t >> 1;
   return q;
 }
 
-function wideAssignDiv(x: int32) -> int32 {
+fn wideAssignDiv(x: int32) -> int32 {
   var wide: int64 = (int64)x + 9;
   var t: int32 = wide;
   var q: int32 = t / 7;
   return q;
 }
 
-function gDiv(x: int32) -> int32 {
+fn gDiv(x: int32) -> int32 {
   G = x;
   G = G + 9;
   return G / 7;
 }
 
-function s16Div(x: int16) -> int32 {
+fn s16Div(x: int16) -> int32 {
   var t: int16 = x + 5;
   var q: int16 = t / 3;
   return q;
 }
 
-function s8Div(x: int8) -> int32 {
+fn s8Div(x: int8) -> int32 {
   var t: int8 = x + 2;
   var q: int8 = t / 3;
   return q;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var fail: int32 = 0;
   if (sDiv(2147483647) != (0 - 306783377)) { fail = fail | 1; }
   if ((int64)sDiv(2147483647) != (0 - 306783377)) { fail = fail | 2; }

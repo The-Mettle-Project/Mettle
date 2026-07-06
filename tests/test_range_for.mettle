@@ -2,7 +2,7 @@
 // variable, variable bound, and a labeled range-for with break.
 import "std/io";
 
-function main() -> int32 {
+fn main() -> int32 {
   var a: int32 = 0;
   for i in 0..5 { a = a + i; }          // 0+1+2+3+4 = 10
 

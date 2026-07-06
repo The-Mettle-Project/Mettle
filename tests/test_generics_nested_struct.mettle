@@ -6,7 +6,7 @@ struct Outer<T> {
     inner: Inner<T>;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     var o: Outer<int32>;
     o.inner.value = 99;
     return o.inner.value;

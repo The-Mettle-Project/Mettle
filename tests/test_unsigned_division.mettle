@@ -1,6 +1,6 @@
 // Unsigned division: 10/3=3, 255/10=25 (zero-extension for uint8)
 // Note: compiler should use div for unsigned; idiv gives same result for positive operands
-function main() -> int32 {
+fn main() -> int32 {
   var a: uint32 = 10;
   var b: uint32 = 3;
   var q: uint32 = a / b;

@@ -37,7 +37,7 @@ struct Db {
   cache: CacheEntry[32];
 }
 
-function cache_find(db: Db*, page_id: int64) -> int32 {
+fn cache_find(db: Db*, page_id: int64) -> int32 {
   var i: int32 = 0;
   while (i < 32) {
     if (db[0].cache[i].in_use != 0) {
@@ -50,7 +50,7 @@ function cache_find(db: Db*, page_id: int64) -> int32 {
   return -1;
 }
 
-function cache_evict(db: Db*) -> int32 {
+fn cache_evict(db: Db*) -> int32 {
   var i: int32 = 0;
   while (i < 32) {
     if (db[0].cache[i].in_use == 0) {
@@ -61,7 +61,7 @@ function cache_evict(db: Db*) -> int32 {
   return 0;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var db: Db* = new Db;
   var i: int32 = 0;
   while (i < 32) {

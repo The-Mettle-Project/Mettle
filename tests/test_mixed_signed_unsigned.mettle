@@ -1,14 +1,14 @@
 // Mixed signed/unsigned: assignment and function args across sign boundaries
 // uint8 255 -> int16 (narrowing, value fits); int8 -1 -> uint16 (reinterpret)
-function take_u16(x: uint16) -> uint32 {
+fn take_u16(x: uint16) -> uint32 {
   return x;
 }
 
-function take_i16(x: int16) -> int32 {
+fn take_i16(x: int16) -> int32 {
   return x;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var u8: uint8 = 255;
   var i8: int8 = -1;
   var u16: uint16 = take_u16(u8);

@@ -3,7 +3,7 @@
 // their chunks recycled.
 import "std/arena";
 
-function main() -> int32 {
+fn main() -> int32 {
   var a: Arena* = arena_init((int64)1024);
   if (a == 0) { return 1; }
 

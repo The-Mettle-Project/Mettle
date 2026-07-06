@@ -48,77 +48,77 @@ export var posix_net_ref_lock: int32 = 0;
 // Returned as functions because Mettle does not yet support top-level
 // constant expressions.
 
-export function AF_INET_POSIX() -> int32     { return 2; }
-export function SOCK_STREAM_POSIX() -> int32 { return 1; }
-export function SOCK_DGRAM_POSIX() -> int32  { return 2; }
-export function IPPROTO_TCP_POSIX() -> int32 { return 6; }
-export function IPPROTO_UDP_POSIX() -> int32 { return 17; }
+export fn AF_INET_POSIX() -> int32     { return 2; }
+export fn SOCK_STREAM_POSIX() -> int32 { return 1; }
+export fn SOCK_DGRAM_POSIX() -> int32  { return 2; }
+export fn IPPROTO_TCP_POSIX() -> int32 { return 6; }
+export fn IPPROTO_UDP_POSIX() -> int32 { return 17; }
 
 // SOL_SOCKET and SO_REUSEADDR differ between Linux and macOS.
 // Linux:  SOL_SOCKET = 1,  SO_REUSEADDR = 2
 // macOS:  SOL_SOCKET = 0xFFFF, SO_REUSEADDR = 4
 // The values below match Linux.  For macOS, override them at the call site
 // or define a separate set of constants.
-export function SOL_SOCKET_POSIX() -> int32  { return 1; }
-export function SO_REUSEADDR_POSIX() -> int32 { return 2; }
+export fn SOL_SOCKET_POSIX() -> int32  { return 1; }
+export fn SO_REUSEADDR_POSIX() -> int32 { return 2; }
 
 // Shutdown directions (POSIX SHUT_* constants – same on Linux and macOS).
-export function SHUT_RD_POSIX() -> int32  { return 0; }
-export function SHUT_WR_POSIX() -> int32  { return 1; }
-export function SHUT_RDWR_POSIX() -> int32 { return 2; }
+export fn SHUT_RD_POSIX() -> int32  { return 0; }
+export fn SHUT_WR_POSIX() -> int32  { return 1; }
+export fn SHUT_RDWR_POSIX() -> int32 { return 2; }
 
-export function INADDR_ANY_POSIX() -> int32 { return 0; }
+export fn INADDR_ANY_POSIX() -> int32 { return 0; }
 
 // ─── POSIX socket lifecycle ──────────────────────────────────────────────────
 // socket(domain, type, protocol) -> fd (int32 on POSIX, widened to int64)
-export extern function socket(af: int32, sock_type: int32, protocol: int32) -> int64 = "socket";
+export extern fn socket(af: int32, sock_type: int32, protocol: int32) -> int64 = "socket";
 
 // close() closes any file descriptor, including sockets.
 // Named close_fd to avoid clashing with a user-defined close().
-export extern function close_fd(fd: int64) -> int32 = "close";
+export extern fn close_fd(fd: int64) -> int32 = "close";
 
 // shutdown(fd, how) -> 0 on success, -1 on error
-export extern function posix_shutdown(fd: int64, how: int32) -> int32 = "shutdown";
+export extern fn posix_shutdown(fd: int64, how: int32) -> int32 = "shutdown";
 
 // ─── Client operations ──────────────────────────────────────────────────────
 // connect(fd, addr, addrlen) -> 0 on success, -1 on error
-export extern function posix_connect(fd: int64, addr: cstring, addrlen: int32) -> int32 = "connect";
+export extern fn posix_connect(fd: int64, addr: cstring, addrlen: int32) -> int32 = "connect";
 
 // ─── Server operations ───────────────────────────────────────────────────────
 // bind(fd, addr, addrlen) -> 0 on success, -1 on error
-export extern function posix_bind(fd: int64, addr: cstring, addrlen: int32) -> int32 = "bind";
+export extern fn posix_bind(fd: int64, addr: cstring, addrlen: int32) -> int32 = "bind";
 
 // listen(fd, backlog) -> 0 on success, -1 on error
-export extern function posix_listen(fd: int64, backlog: int32) -> int32 = "listen";
+export extern fn posix_listen(fd: int64, backlog: int32) -> int32 = "listen";
 
 // accept(fd, addr, addrlen) -> new fd on success, -1 on error
 // Pass 0 for addr and addrlen when the caller does not need the peer address.
-export extern function posix_accept(fd: int64, addr: cstring, addrlen: cstring) -> int64 = "accept";
+export extern fn posix_accept(fd: int64, addr: cstring, addrlen: cstring) -> int64 = "accept";
 
 // setsockopt(fd, level, optname, optval, optlen) -> 0 on success, -1 on error
-export extern function posix_setsockopt(fd: int64, level: int32, optname: int32, optval: cstring, optlen: int32) -> int32 = "setsockopt";
+export extern fn posix_setsockopt(fd: int64, level: int32, optname: int32, optval: cstring, optlen: int32) -> int32 = "setsockopt";
 
 // ─── Data transfer ───────────────────────────────────────────────────────────
 // send / recv return the number of bytes transferred, or -1 on error.
 // On POSIX, the return type is ssize_t (int64 on 64-bit platforms).
-export extern function posix_send(fd: int64, buf: cstring, len: int64, flags: int32) -> int64 = "send";
-export extern function posix_recv(fd: int64, buf: cstring, len: int64, flags: int32) -> int64 = "recv";
+export extern fn posix_send(fd: int64, buf: cstring, len: int64, flags: int32) -> int64 = "send";
+export extern fn posix_recv(fd: int64, buf: cstring, len: int64, flags: int32) -> int64 = "recv";
 
 // ─── Address utilities ────────────────────────────────────────────────────────
 // These live in libc on both Linux and macOS; no extra link flags needed.
-export extern function htons(hostshort: int32) -> int32 = "htons";
-export extern function htonl(hostlong: int32) -> int32 = "htonl";
-export extern function ntohs(netshort: int32) -> int32 = "ntohs";
-export extern function ntohl(netlong: int32) -> int32 = "ntohl";
-export extern function inet_addr(cp: cstring) -> int32 = "inet_addr";
+export extern fn htons(hostshort: int32) -> int32 = "htons";
+export extern fn htonl(hostlong: int32) -> int32 = "htonl";
+export extern fn ntohs(netshort: int32) -> int32 = "ntohs";
+export extern fn ntohl(netlong: int32) -> int32 = "ntohl";
+export extern fn inet_addr(cp: cstring) -> int32 = "inet_addr";
 
 // ─── Error reporting ────────────────────────────────────────────────────────
 // errno is a thread-local variable on POSIX.  We expose it through a tiny
 // C helper (posix_get_errno in posix_helpers.c) rather than reading the TLS
 // slot directly.  The helper is linked via stdlib/posix_helpers.c.
-export extern function posix_get_errno() -> int32 = "posix_get_errno";
+export extern fn posix_get_errno() -> int32 = "posix_get_errno";
 
-export function net_posix_last_error() -> int32 {
+export fn net_posix_last_error() -> int32 {
   return posix_get_errno();
 }
 
@@ -127,24 +127,24 @@ export function net_posix_last_error() -> int32 {
 // Uses sched_yield() (from <sched.h>, in libc) to yield the CPU while
 // spinning, and GCC/Clang __sync built-ins for atomic compare-and-swap.
 // These are provided by posix_helpers.c.
-export extern function posix_cas_i32(ptr: int32*, expected: int32, desired: int32) -> int32 = "posix_cas_i32";
-export extern function posix_yield() = "posix_yield";
-export extern function posix_atomic_exchange_i32(ptr: int32*, val: int32) -> int32 = "posix_atomic_exchange_i32";
+export extern fn posix_cas_i32(ptr: int32*, expected: int32, desired: int32) -> int32 = "posix_cas_i32";
+export extern fn posix_yield() = "posix_yield";
+export extern fn posix_atomic_exchange_i32(ptr: int32*, val: int32) -> int32 = "posix_atomic_exchange_i32";
 
-export function posix_spin_try_lock(lock_var: int32*) -> int32 {
+export fn posix_spin_try_lock(lock_var: int32*) -> int32 {
   if (posix_cas_i32(lock_var, 0, 1) == 0) {
     return 1;
   }
   return 0;
 }
 
-export function posix_spin_lock(lock_var: int32*) {
+export fn posix_spin_lock(lock_var: int32*) {
   while (posix_spin_try_lock(lock_var) == 0) {
     posix_yield();
   }
 }
 
-export function posix_spin_unlock(lock_var: int32*) {
+export fn posix_spin_unlock(lock_var: int32*) {
   posix_atomic_exchange_i32(lock_var, 0);
 }
 
@@ -153,14 +153,14 @@ export function posix_spin_unlock(lock_var: int32*) {
 // net_posix_cleanup are provided for source-level compatibility with code
 // written against std/net.  They are reference-counted and thread-safe.
 
-export function net_posix_init() -> int32 {
+export fn net_posix_init() -> int32 {
   posix_spin_lock(&posix_net_ref_lock);
   posix_net_ref_count = posix_net_ref_count + 1;
   posix_spin_unlock(&posix_net_ref_lock);
   return 0;
 }
 
-export function net_posix_cleanup() -> int32 {
+export fn net_posix_cleanup() -> int32 {
   posix_spin_lock(&posix_net_ref_lock);
   if (posix_net_ref_count > 0) {
     posix_net_ref_count = posix_net_ref_count - 1;
@@ -169,7 +169,7 @@ export function net_posix_cleanup() -> int32 {
   return 0;
 }
 
-export function net_posix_is_initialized() -> int32 {
+export fn net_posix_is_initialized() -> int32 {
   var ready: int32 = 0;
   posix_spin_lock(&posix_net_ref_lock);
   if (posix_net_ref_count > 0) {
@@ -181,11 +181,11 @@ export function net_posix_is_initialized() -> int32 {
 
 // ─── Convenience wrappers ───────────────────────────────────────────────────
 
-export function socket_tcp_posix() -> int64 {
+export fn socket_tcp_posix() -> int64 {
   return socket(AF_INET_POSIX(), SOCK_STREAM_POSIX(), IPPROTO_TCP_POSIX());
 }
 
-export function socket_udp_posix() -> int64 {
+export fn socket_udp_posix() -> int64 {
   return socket(AF_INET_POSIX(), SOCK_DGRAM_POSIX(), IPPROTO_UDP_POSIX());
 }
 
@@ -193,7 +193,7 @@ export function socket_udp_posix() -> int64 {
 // Returns a malloc'd 16-byte buffer the caller must free() after use.
 //   ip   – dotted-quad string, e.g. "127.0.0.1"
 //   port – port number in host byte order
-export function sockaddr_in_posix(ip: cstring, port: int32) -> cstring {
+export fn sockaddr_in_posix(ip: cstring, port: int32) -> cstring {
   var buf: cstring = malloc(16);
   if (buf == 0) {
     return 0;
@@ -220,7 +220,7 @@ export function sockaddr_in_posix(ip: cstring, port: int32) -> cstring {
 }
 
 // Build sockaddr_in for 0.0.0.0:port (bind to all interfaces).
-export function sockaddr_in_any_posix(port: int32) -> cstring {
+export fn sockaddr_in_any_posix(port: int32) -> cstring {
   var buf: cstring = malloc(16);
   if (buf == 0) {
     return 0;
@@ -243,7 +243,7 @@ export function sockaddr_in_any_posix(port: int32) -> cstring {
 // Uses the Linux SOL_SOCKET / SO_REUSEADDR values (1 / 2).
 // On macOS, pass SOL_SOCKET=0xFFFF and SO_REUSEADDR=4 explicitly via
 // posix_setsockopt() instead.
-export function set_reuseaddr_posix(sock: int64, enabled: int32) -> int32 {
+export fn set_reuseaddr_posix(sock: int64, enabled: int32) -> int32 {
   var opt: uint8[4];
   if (enabled != 0) {
     opt[0] = 1;
@@ -257,7 +257,7 @@ export function set_reuseaddr_posix(sock: int64, enabled: int32) -> int32 {
 }
 
 // Send all bytes in buf[0..len).  Returns total bytes sent, or -1 on error.
-export function send_all_posix(sock: int64, buf: cstring, len: int64) -> int64 {
+export fn send_all_posix(sock: int64, buf: cstring, len: int64) -> int64 {
   var total: int64 = 0;
   while (total < len) {
     var sent: int64 = posix_send(sock, &buf[total], len - total, 0);

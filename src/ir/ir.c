@@ -703,6 +703,10 @@ const char *ir_opcode_name(IROpcode op) {
     return "load";
   case IR_OP_STORE:
     return "store";
+  case IR_OP_PREFETCH:
+    return "prefetch";
+  case IR_OP_SELECT:
+    return "select";
   case IR_OP_BINARY:
     return "binary";
   case IR_OP_ROTATE_ADD:
@@ -903,6 +907,22 @@ static int ir_format_instruction_line(const IRInstruction *instruction,
     written = snprintf(buffer, buffer_size, "%s = count_word_starts(buf=%s, len=%s)",
                        dest, lhs, rhs);
     break;
+  case IR_OP_SELECT: {
+    char else_val[128];
+    ir_format_operand(instruction->argument_count > 0 ? &instruction->arguments[0]
+                                                      : NULL,
+                      else_val, sizeof(else_val));
+    if (instruction->text && instruction->argument_count > 1) {
+      char cmp_rhs[128];
+      ir_format_operand(&instruction->arguments[1], cmp_rhs, sizeof(cmp_rhs));
+      written = snprintf(buffer, buffer_size, "%s = select(%s %s %s, %s, %s)",
+                         dest, lhs, instruction->text, cmp_rhs, rhs, else_val);
+    } else {
+      written = snprintf(buffer, buffer_size, "%s = select(%s, %s, %s)", dest,
+                         lhs, rhs, else_val);
+    }
+    break;
+  }
   case IR_OP_MEMCPY_INLINE:
     written = snprintf(buffer, buffer_size, "%s = memcpy_inline %s, %s", dest,
                        lhs, rhs);

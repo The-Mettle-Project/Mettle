@@ -1,0 +1,10 @@
+// 5! -> 120. while loop + multiply.
+fn main() -> int64 {
+  var r: int64 = 1;
+  var i: int64 = 1;
+  while (i <= 5) {
+    r = r * i;
+    i = i + 1;
+  }
+  return r;
+}

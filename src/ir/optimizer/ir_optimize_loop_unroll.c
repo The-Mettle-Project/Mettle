@@ -341,7 +341,10 @@ static int ir_try_unroll_loop_at(IRFunction *function, size_t header_index,
                       : (start_value - limit_value);
   }
 
-  if (trips <= 0 || trips > IR_UNROLL_MAX_TRIP_COUNT) {
+  long long max_trips =
+      ir_opt_unroll_max_trip_count(function,
+                                   function->instructions[header_index].location);
+  if (trips <= 0 || trips > max_trips) {
     ir_temp_value_map_destroy(&symbol_map);
     return 1;
   }

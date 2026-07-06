@@ -1,5 +1,5 @@
 // Signed arithmetic: add/sub/mul with negatives
-function main() -> int32 {
+fn main() -> int32 {
   var a: int32 = 10;
   var b: int32 = -3;
   var sum: int32 = a + b;

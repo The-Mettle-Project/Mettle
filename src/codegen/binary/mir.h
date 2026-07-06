@@ -138,6 +138,9 @@ typedef enum {
   MIR_LEA_GLOBAL, /* dst(reg) <- address of global symbol a.sym (RIP-relative).
                      The global stays cached, but is flushed/reloaded around
                      pointer memory ops since the alias can read/write it. */
+  MIR_LEA_FUNC,   /* dst(reg) <- address of function symbol a.sym (RIP-relative).
+                     Used to initialize function-pointer values without falling
+                     back to the stack-home backend. */
   MIR_LEA_CSTR,   /* dst(reg) <- address of the string literal a.sym (RIP-relative
                      lea into a .rdata cstring). Carries no vreg source, so the
                      allocator ignores it. Used to pass a string-literal call
@@ -185,9 +188,18 @@ typedef enum {
   MIR_JCC,        /* test a; cc -> label (cc carries jcc opcode) */
   MIR_CMPBR,      /* cmp a,b; cc -> label (fused compare-and-branch) */
   MIR_LABEL,      /* defines label (sym) at this point */
+  MIR_PREFETCH,   /* prefetcht0 [a]: a is a MEM operand (usually [vreg+0]).
+                     A read-only use of the address register(s); no def, and
+                     the access never faults. */
+  MIR_CMOV,       /* dst = (a != 0) ? b : dst. dst is PRE-LOADED with the
+                     else-value by a preceding MIR_MOV, so its live range
+                     starts there and overlaps a/b at this point (forcing
+                     distinct registers). Encodes to `test a,a; cmovnz dst,b`.
+                     b must be a register (cmov has no immediate source). */
 
   /* calls / return (Stage 3 for full ABI; declared now for completeness) */
   MIR_CALL,       /* call sym; clobbers volatiles */
+  MIR_CALL_INDIRECT, /* call a(reg); clobbers volatiles */
   MIR_STORE_OUTARG,/* store outgoing stack call argument a to [rsp + b.imm].
                       Used for the 5th+ GP argument (beyond the ABI's argument
                       registers); the prologue reserves the outgoing region. The
@@ -262,11 +274,30 @@ typedef enum {
    * b_is_one|b_is_zero<<1|c_is_zero<<2. Clobbers RAX/RCX/RDX/R8/R9/R10 + ymm0-5. */
   MIR_SIMD_AFFINE_MAP_F32,
 
+  /* Inline float64 affine-map kernel (IR_OP_SIMD_AFFINE_MAP_F64, the saxpy
+   * `dst[i] = a*src[i] + b*dst[i] + c` class) run in place so the function keeps
+   * register-allocated codegen instead of dropping to the spill-everything
+   * fallback. Identical shape to the F32 variant but 4-wide f64 (vfmadd231pd):
+   * lowering marshals src->RCX, dst->RDX, count->R8; this op materializes the
+   * 64-bit coefficient broadcasts and emits the AVX2 loop + scalar tail +
+   * vzeroupper. dst.imm/a.imm/b.imm carry the a/b/c double bits; cc carries
+   * b_is_one|b_is_zero<<1|c_is_zero<<2. Clobbers RAX/RCX/RDX/R8/R9/R11 + ymm0-5. */
+  MIR_SIMD_AFFINE_MAP_F64,
+
   /* Inline float32 SiLU/SwiGLU gate (IR_OP_SIMD_SILU_F32) run in place. Call-like:
    * the lowering marshals g/out->RCX, u->RDX (SwiGLU only), count->R8; this op
    * emits the AVX2 exp-poly SiLU loop. dst.imm = has_mul (1 = SwiGLU `* u[i]`).
    * Clobbers RAX/RCX/RDX/R8/R9/R10/R11 + ymm0-7 and reserves a scratch frame. */
   MIR_SIMD_SILU_F32,
+
+  /* Inline general auto-vectorized loop kernel (IR_OP_SIMD_VLOOP_F64 maps) run
+   * in place so the function keeps register-allocated codegen. The DAG is too
+   * large for MirOperands, so the op borrows a pointer to the source
+   * IRInstruction in `aux`; the lowering marshals the <=3 distinct base pointers
+   * into RCX/RDX/R8/R9 and the element count into the next arg register (the
+   * kernel moves it to R10 -- R10/R11 are MIR scratch and unsafe to marshal
+   * into). Call-like: clobbers the caller-saved set + ymm0-5. Maps only. */
+  MIR_SIMD_VLOOP,
 
   MIR_OPCODE_COUNT
 } MirOpcode;
@@ -285,10 +316,11 @@ typedef struct {
   int is_unsigned; /* affects shifts, divides, compares, extensions */
   unsigned char cc;/* x86 condition opcode for SETCC/CMOVCC/JCC */
   int ir_index;    /* source IR index, or -1 */
+  const void *aux; /* MIR_SIMD_VLOOP: borrowed const IRInstruction* (the DAG) */
 } MirInst;
 
 /* A pooled (loop-invariant) float constant: its IEEE bits at `width`, and the
- * vreg it is materialized into once at function entry, reused at every use. */
+ * vreg materialized once near the loop that first uses it. */
 typedef struct {
   uint64_t bits;
   int width;
@@ -296,9 +328,9 @@ typedef struct {
 } MirFConst;
 
 /* A pooled (loop-invariant) 64-bit integer constant: its raw value and the GP
- * vreg it is materialized into once at function entry (one movabs), reused at
- * every use. Used to hoist the div/mod magic-multiply constant out of a loop so
- * it is not re-materialized with a 10-byte movabs every iteration. */
+ * vreg materialized once near the loop that first uses it. Used to hoist the
+ * div/mod magic-multiply constant out of a loop so it is not re-materialized
+ * with a 10-byte movabs every iteration. */
 typedef struct {
   int64_t value;
   MirVregId vreg;
@@ -329,6 +361,13 @@ typedef struct {
   MirInst *insns;
   size_t insn_count;
   size_t insn_capacity;
+
+  /* Owned label-name strings synthesized by layout passes (e.g. cold-block
+   * sinking). The encoder strdups label names into its tables, so these only
+   * need to outlive mir_encode; freed in mir_function_destroy. */
+  char **owned_syms;
+  size_t owned_sym_count;
+  size_t owned_sym_capacity;
 
   /* Borrowed: the function context owning stack homes, ABI, fixup tables, and
    * the output code buffer; and the code generator (for type queries, fixup
@@ -370,13 +409,13 @@ typedef struct {
   } divmod_precomp[16];
   size_t divmod_precomp_count;
 
-  /* Loop-invariant float constants materialized once at entry (see mir_lower). */
+  /* Loop-invariant float constants materialized once near their first hot loop. */
   MirFConst *fconsts;
   size_t fconst_count;
   size_t fconst_capacity;
 
   /* Loop-invariant 64-bit integer constants (div/mod magic numbers) materialized
-   * once at entry, kept live across the loop instead of re-emitted per iter. */
+   * once near their first hot loop instead of re-emitted per iter. */
   MirIConst *iconsts;
   size_t iconst_count;
   size_t iconst_capacity;
@@ -415,6 +454,12 @@ typedef struct {
    * applied uniformly for simplicity. */
   int has_xmm_arg_call;
 
+  /* --annotate-asm: index of the IR instruction currently being lowered. The
+   * mir_emit chokepoint stamps it onto every MirInst whose ir_index is still
+   * unset (-1), so each emitted op can be traced back to its source line. Inert
+   * unless the annotator is enabled. */
+  int cur_ir_index;
+
   int has_error;
 } MirFunction;
 
@@ -444,6 +489,10 @@ MirOperand mir_op_mem_rbp(int rbp_disp);
 
 /* Debug dump of a MIR function to a FILE (used under METTLE_MIR_DUMP). */
 void mir_function_dump(const MirFunction *fn, FILE *out);
+
+/* Human-readable mnemonic for a MIR opcode (e.g. "mov", "simd_fill"). Used by
+ * the dump and by the --annotate-asm codegen annotator. */
+const char *mir_opcode_name(MirOpcode op);
 
 /* ---- passes ------------------------------------------------------------- */
 

@@ -6,7 +6,7 @@ struct B {
   y: int32;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var a: A* = new A;
   var b: B* = new B;
   a = b;

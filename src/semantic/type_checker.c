@@ -52,7 +52,52 @@ type_checker_create_with_error_reporter(SymbolTable *symbol_table,
   // Initialize built-in types
   type_checker_init_builtin_types(checker);
 
+  // Test builtins: assert(cond) / assert_eq(left, right). Registered always
+  // so @test bodies type-check in every build; calling them outside a @test
+  // function is rejected at the call site (they only execute under
+  // `mettle test`, where the interpreter implements them natively).
+  type_checker_register_test_builtin(checker, "assert", 1);
+  type_checker_register_test_builtin(checker, "assert_eq", 2);
+
   return checker;
+}
+
+void type_checker_register_test_builtin(TypeChecker *checker, const char *name,
+                                        size_t parameter_count) {
+  if (!checker || !checker->symbol_table || parameter_count > 2) {
+    return;
+  }
+  if (symbol_table_lookup_current_scope(checker->symbol_table, name)) {
+    return;
+  }
+  Symbol *symbol = symbol_create(name, SYMBOL_FUNCTION, checker->builtin_void);
+  if (!symbol) {
+    return;
+  }
+  Type **param_types = malloc(parameter_count * sizeof(Type *));
+  char **param_names = malloc(parameter_count * sizeof(char *));
+  if (!param_types || !param_names) {
+    free(param_types);
+    free(param_names);
+    symbol_destroy(symbol);
+    return;
+  }
+  static const char *NAMES[2] = {"left", "right"};
+  for (size_t i = 0; i < parameter_count; i++) {
+    param_types[i] = checker->builtin_int64;
+    param_names[i] = strdup(NAMES[i]);
+  }
+  symbol->data.function.parameter_count = parameter_count;
+  symbol->data.function.parameter_types = param_types;
+  symbol->data.function.parameter_names = param_names;
+  symbol->data.function.return_type = checker->builtin_void;
+  symbol->is_extern = 1;
+  symbol->is_builtin = 1;
+  symbol->is_initialized = 1;
+  symbol->link_name = strdup(name);
+  if (!symbol_table_declare(checker->symbol_table, symbol)) {
+    symbol_destroy(symbol);
+  }
 }
 
 void type_checker_destroy(TypeChecker *checker) {
@@ -143,6 +188,11 @@ int type_checker_register_function_signature(TypeChecker *checker,
 
   Symbol *func_symbol =
       symbol_create(func_decl->name, SYMBOL_FUNCTION, return_type);
+  if (func_symbol) {
+    func_symbol->decl_line = declaration->location.line;
+    func_symbol->decl_column = declaration->location.column;
+    func_symbol->decl_file = declaration->location.filename;
+  }
   if (!func_symbol) {
     for (size_t i = 0; i < func_decl->parameter_count; i++)
       free(param_names_copy[i]);
@@ -186,16 +236,18 @@ int type_checker_check_program(TypeChecker *checker, ASTNode *program) {
   if (!prog)
     return 0;
 
-  // Pass 1: Register struct and enum types
+  // Pass 1: Register struct and enum types. On failure keep going so every
+  // bad declaration is reported in one compile, not one per rebuild.
+  int ok = 1;
   for (size_t i = 0; i < prog->declaration_count; i++) {
     ASTNode *decl = prog->declarations[i];
     if (decl && decl->type == AST_STRUCT_DECLARATION) {
       if (!type_checker_process_struct_declaration(checker, decl)) {
-        return 0;
+        ok = 0;
       }
     } else if (decl && decl->type == AST_ENUM_DECLARATION) {
       if (!type_checker_process_enum_declaration(checker, decl)) {
-        return 0;
+        ok = 0;
       }
     }
   }
@@ -214,14 +266,18 @@ int type_checker_check_program(TypeChecker *checker, ASTNode *program) {
     if (decl && decl->type != AST_STRUCT_DECLARATION &&
         decl->type != AST_ENUM_DECLARATION) {
       if (!type_checker_process_declaration(checker, decl)) {
-        return 0;
+        ok = 0;
       }
     }
   }
 
+  if (!ok)
+    return 0;
+
   // Pass 4: whole-program memory diagnostics. Ownership summaries are
   // inferred over the call graph, then cross-call use-after-free and leak
-  // analysis runs with them (type_checker_memory.c).
+  // analysis runs with them (type_checker_memory.c). Skipped when earlier
+  // passes failed: the AST is not fully typed.
   if (!getenv("METTLE_NO_MEM_INTERPROC") &&
       !type_checker_check_program_memory(checker, program)) {
     return 0;

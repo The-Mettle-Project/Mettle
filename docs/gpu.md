@@ -13,7 +13,7 @@ mirrors how real GPU code manages persistent VRAM.
 ## Writing a kernel
 
 A kernel file is compiled with `mettle --emit-ptx`. Use the `kernel` keyword for
-GPU entry points (it parses like `function` and is emitted as a PTX `.entry`):
+GPU entry points (it parses like `fn` and is emitted as a PTX `.entry`):
 
 ```mettle
 // kernels.mettle  ->  mettle --emit-ptx kernels.mettle -o kernels.ptx
@@ -65,7 +65,7 @@ import "std/io";
 import "std/mem";
 import "std/gpu";
 
-function main() -> int32 {
+fn main() -> int32 {
   if (gpu_init() == 0) { println(cstr("GPU init failed")); return 1; }
 
   // load the emitted PTX and resolve the kernel

@@ -1,4 +1,4 @@
 struct Vector3 { x: int32; }
-function main() -> int32 {
+fn main() -> int32 {
   return (new Vector3).x;
 }

@@ -1,0 +1,11 @@
+// gcd(48,18) -> 6. Euclid: while + modulo + temp local.
+fn main() -> int64 {
+  var a: int64 = 48;
+  var b: int64 = 18;
+  while (b != 0) {
+    var t: int64 = b;
+    b = a % b;
+    a = t;
+  }
+  return a;
+}

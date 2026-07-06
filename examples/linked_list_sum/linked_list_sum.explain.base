@@ -1,0 +1,28 @@
+L	build_list	0	S	35
+C	build_list	set_node_value	0	I	37
+L	build_list	1	S	43
+L	build_list	2	S	55
+C	build_list	set_node_next	0	I	56
+C	build_list	set_node_next	1	I	59
+L	sum_chase	0	S	65
+C	sum_chase	node_value	0	I	66
+C	sum_chase	node_next	0	I	67
+C	main	println	0	I	77
+C	main	build_list	0	R	81
+C	main	println	1	I	84
+C	main	sum_chase	0	R	86
+C	main	print	0	I	87
+C	main	println_int	0	I	88
+C	main	println	2	I	91
+C	main	bench_time_us	0	I	93
+L	main	0	S	96
+C	main	sum_chase	1	R	97
+C	main	bench_time_us	1	I	100
+C	main	print	1	I	102
+C	main	println_int	1	I	103
+C	main	print	2	I	104
+C	main	print_int	0	R	105
+C	main	println	3	I	106
+C	main	print	3	I	109
+C	main	print_int	1	R	110
+C	main	println	4	I	111

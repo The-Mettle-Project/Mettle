@@ -6,11 +6,11 @@
 // runtime result still matches the hand-computed answer. main returns 0 on
 // success, or the number of the first failing check.
 
-@noinline function opaque(v: int64) -> int64 {
+@noinline fn opaque(v: int64) -> int64 {
   return v;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var a: int64 = opaque(10);
   var c: int64 = opaque(0 - 4);
 

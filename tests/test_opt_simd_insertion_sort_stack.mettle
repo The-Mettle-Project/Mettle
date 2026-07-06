@@ -1,4 +1,4 @@
-function insertion_sort(data: int32*, len: int32) {
+fn insertion_sort(data: int32*, len: int32) {
   var i: int32 = 1;
   var cur: int32* = data + 4;
   while (i < len) {
@@ -21,7 +21,7 @@ function insertion_sort(data: int32*, len: int32) {
   }
 }
 
-function checksum(data: int32*, len: int32) -> int64 {
+fn checksum(data: int32*, len: int32) -> int64 {
   var s: int64 = 0;
   var x: int64 = 0;
   var i: int32 = 0;
@@ -33,7 +33,7 @@ function checksum(data: int32*, len: int32) -> int64 {
   return s * 1000003 + x;
 }
 
-function is_sorted(data: int32*, len: int32) -> int32 {
+fn is_sorted(data: int32*, len: int32) -> int32 {
   var i: int32 = 1;
   while (i < len) {
     if (data[i] < data[i - 1]) {
@@ -44,7 +44,7 @@ function is_sorted(data: int32*, len: int32) -> int32 {
   return 1;
 }
 
-function run_case(len: int32, seed: int32) -> int32 {
+fn run_case(len: int32, seed: int32) -> int32 {
   var data: int32[129];
   var i: int32 = 0;
   var state: int32 = seed;
@@ -65,7 +65,7 @@ function run_case(len: int32, seed: int32) -> int32 {
   return 1;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   if (run_case(0, 11) == 0) { return 10; }
   if (run_case(1, 13) == 0) { return 11; }
   if (run_case(2, 17) == 0) { return 12; }

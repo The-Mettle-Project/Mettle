@@ -4,7 +4,9 @@
 #include "main.h"
 #include "common.h"
 #include "codegen/binary/startup.h"
+#include "codegen/binary/mir_annotate.h"
 #include "codegen/binary_emitter.h"
+#include "codegen/binary/arm64_ir.h"
 #include "codegen/program_entry.h"
 #include "codegen/ptx_emitter.h"
 #include "linker/pe_emitter.h"
@@ -58,7 +60,7 @@ extern pid_t waitpid(pid_t pid, int *wstatus, int options);
 #ifdef METTLE_VERSION_RAW
 #define METTLE_VERSION METTLE_STRINGIFY(METTLE_VERSION_RAW)
 #else
-#define METTLE_VERSION "v0.12.0"
+#define METTLE_VERSION "v0.13.0"
 #endif
 #endif
 
@@ -327,6 +329,38 @@ static char *infer_default_runtime_directory(const char *argv0) {
   return infer_default_sibling_directory(argv0, "runtime", NULL);
 }
 
+/* Point the ML optimizer at its bundled model/libraries (bin/mlopt by the exe, or
+ * tools/mlopt in a dev tree) via env vars; a user-set value always wins. */
+static void ml_opt_set_default_paths(const char *argv0) {
+  char *dir = infer_default_sibling_directory(argv0, "mlopt", "tools/mlopt");
+  if (!dir) {
+    return;
+  }
+  static const struct {
+    const char *env;
+    const char *file;
+  } resources[] = {
+      {"METTLE_ML_MODEL", "gnn_genius.bin"},
+      {"METTLE_ML_BWLIB", "bw_lib.txt"},
+      {"METTLE_ML_GF2LIB", "gf2_lib1.txt"},
+  };
+  for (size_t i = 0; i < sizeof(resources) / sizeof(resources[0]); i++) {
+    if (getenv(resources[i].env)) {
+      continue;
+    }
+    char *path = join_paths(dir, resources[i].file);
+    if (path) {
+      char *kv = malloc(strlen(resources[i].env) + strlen(path) + 2);
+      if (kv) {
+        sprintf(kv, "%s=%s", resources[i].env, path);
+        putenv(kv); /* putenv keeps the pointer; intentionally not freed */
+      }
+      free(path);
+    }
+  }
+  free(dir);
+}
+
 static char *infer_default_docs_directory(const char *argv0) {
   return infer_default_sibling_directory(argv0, "docs", NULL);
 }
@@ -351,7 +385,7 @@ static void print_doc_reference(const char *argv0, const char *relative_path) {
 
 /* Single source of truth for the help-topic list. Referenced by print_usage,
  * the topic dispatcher, and the unknown-topic error so they cannot drift. */
-#define METTLE_HELP_TOPICS "build, runtime (alias: heap, gc), interop, stdlib, web"
+#define METTLE_HELP_TOPICS "build, runtime (alias: heap, gc), interop, stdlib, web, diagnostics (alias: errors), verify, test (alias: trace)"
 
 static int print_help_topic(const char *program_name, const char *argv0,
                             const char *topic) {
@@ -417,9 +451,64 @@ static int print_help_topic(const char *program_name, const char *argv0,
     return 0;
   }
 
+  if (strcmp(topic, "test") == 0 || strcmp(topic, "tests") == 0 ||
+      strcmp(topic, "trace") == 0) {
+    printf("test / trace - compile-time execution (no codegen, no linking)\n\n");
+    printf("  mettle test app.mettle [--filter=SUBSTR]\n");
+    printf("      Run every @test function in the compiler's interpreter.\n");
+    printf("      assert(cond) / assert_eq(left, right) failures render as\n");
+    printf("      diagnostics with the actual values; unfreed allocations and\n");
+    printf("      null/out-of-bounds accesses fail or flag the test. @test\n");
+    printf("      functions are type-checked in every build but compiled out\n");
+    printf("      of normal binaries.\n\n");
+    printf("  mettle trace app.mettle sum_range 0 10\n");
+    printf("      Interpret one function on concrete arguments and print its\n");
+    printf("      source annotated with the values each line produced.\n");
+    print_doc_reference(argv0, "testing.md");
+    return 0;
+  }
+
+  if (strcmp(topic, "verify") == 0 || strcmp(topic, "validation") == 0) {
+    printf("verify - per-pass translation validation (self-verifying optimizer)\n\n");
+    printf("  mettle --verify app.mettle\n\n");
+    printf("  After every optimization pass, each changed function's before/after IR\n");
+    printf("  is executed on generated inputs and compared: return value, buffer\n");
+    printf("  bytes, extern-call trace, globals. A diverging pass is reported with a\n");
+    printf("  concrete counterexample, quarantined for that function, and the build\n");
+    printf("  continues from the validated pre-pass IR - the binary is always built\n");
+    printf("  from IR that passed validation.\n\n");
+    printf("  METTLE_VERIFY_BREAK=pass[:fn]  sabotage self-test (corrupts one\n");
+    printf("                                 constant after the named pass; --verify\n");
+    printf("                                 must catch and heal it)\n");
+    print_doc_reference(argv0, "translation-validation.md");
+    return 0;
+  }
+
+  if (strcmp(topic, "diagnostics") == 0 || strcmp(topic, "errors") == 0 ||
+      strcmp(topic, "warnings") == 0) {
+    printf("diagnostics - compile errors, warnings, and tooling output\n\n");
+    printf("  Every diagnostic carries a stable code (E0001..E0007, "
+           "M0101..M0112), a source snippet\n");
+    printf("  with the offending range underlined, and a help suggestion. The "
+           "compiler recovers after\n");
+    printf("  errors, so one compile reports every problem in the file.\n\n");
+    printf("  mettle explain <CODE>       extended docs for a code (try: "
+           "mettle explain E0004)\n");
+    printf("  mettle explain list         index of every diagnostic code\n");
+    printf("  --error-format=json         one JSON object per diagnostic on "
+           "stderr, for editors/CI\n");
+    printf("  NO_COLOR / CLICOLOR_FORCE   disable / force ANSI colors\n\n");
+    printf("  Warnings include unused variables (prefix a name with '_' to "
+           "opt out), unreachable code,\n");
+    printf("  and compile-time memory-safety findings (use-after-free, leaks, "
+           "double free, ...).\n");
+    print_doc_reference(argv0, "diagnostics.md");
+    return 0;
+  }
+
   if (strcmp(topic, "interop") == 0 || strcmp(topic, "c") == 0) {
     printf("interop - calling C and OS APIs\n\n");
-    printf("  Declare external C functions with extern function.\n");
+    printf("  Declare external C functions with extern fn.\n");
     printf("  Prefer std/win32 for common Windows OS APIs.\n");
     printf("  Use --link-arg for extra linker libraries in --build mode.\n");
     printf("  Example:\n");
@@ -2296,6 +2385,36 @@ int main(int argc, char *argv[]) {
     if (strcmp(argv[1], "help") == 0) {
       return print_help_topic(argv[0], argv[0], argc >= 3 ? argv[2] : NULL);
     }
+    if (strcmp(argv[1], "explain") == 0) {
+      return mettle_explain_error_code(argc >= 3 ? argv[2] : NULL);
+    }
+    if (strcmp(argv[1], "test") == 0) {
+      /* `mettle test <file> [--filter=S] [flags...]`: shift the subcommand
+       * out and let the normal flag loop see the rest. */
+      options.test_mode = 1;
+      for (int i = 1; i + 1 < argc; i++) {
+        argv[i] = argv[i + 1];
+      }
+      argc--;
+      if (argc < 2) {
+        fprintf(stderr, "usage: mettle test <file.mettle> [--filter=SUBSTR]\n");
+        return 1;
+      }
+    } else if (strcmp(argv[1], "trace") == 0) {
+      /* `mettle trace <file> <fn> [args...]` */
+      if (argc < 4) {
+        fprintf(stderr,
+                "usage: mettle trace <file.mettle> <function> [args...]\n"
+                "  int/float parameters take the CLI values in order; pointer\n"
+                "  parameters get a synthesized buffer\n");
+        return 1;
+      }
+      options.trace_function = argv[3];
+      options.trace_args = (const char *const *)&argv[4];
+      options.trace_arg_count = (size_t)(argc - 4);
+      argv[1] = argv[2]; /* the input file */
+      argc = 2;
+    }
     if (strcmp(argv[1], "docs") == 0) {
       if (argc >= 3) {
         return print_help_topic(argv[0], argv[0], argv[2]);
@@ -2364,6 +2483,29 @@ int main(int argc, char *argv[]) {
       options.generate_stack_trace_support = 1;
     } else if (strcmp(argv[i], "--dump-ir") == 0) {
       options.dump_ir = 1;
+    } else if (strcmp(argv[i], "--ml-opt") == 0) {
+      options.ml_opt = 1;
+      options.optimize = 1;
+    } else if (strncmp(argv[i], "--error-format=", 15) == 0) {
+      const char *fmt = argv[i] + 15;
+      if (strcmp(fmt, "json") == 0) {
+        error_reporter_set_format_json(1);
+      } else if (strcmp(fmt, "human") == 0) {
+        error_reporter_set_format_json(0);
+      } else {
+        fprintf(stderr,
+                "Error: Unknown error format '%s' (expected human or json)\n",
+                fmt);
+        return 1;
+      }
+    } else if (strncmp(argv[i], "--filter=", 9) == 0) {
+      options.test_filter = argv[i] + 9;
+    } else if (strcmp(argv[i], "--pgo") == 0) {
+      options.pgo = 1;
+      options.optimize = 1;
+    } else if (strcmp(argv[i], "--verify") == 0) {
+      ir_verify_set_enabled(1);
+      options.optimize = 1;
     } else if (strcmp(argv[i], "--simd-report") == 0) {
       options.simd_report = 1;
     } else if (strcmp(argv[i], "--explain") == 0) {
@@ -2378,8 +2520,79 @@ int main(int argc, char *argv[]) {
        * prose report; implies --explain. */
       options.explain = 1;
       options.explain_json = 1;
+    } else if (strcmp(argv[i], "--annotate-asm") == 0) {
+      /* Codegen provenance listing + <stem>.annot.json sidecar. Needs the
+       * optimizer's decisions (and remarks) to be interesting, so it implies
+       * -O and collects --explain remarks (retained past optimization for the
+       * codegen join). The default syntax is both Intel and AT&T (toggle). */
+      options.annotate_asm = 1;
+      /* Reflect the codegen users actually ship: --release enables every
+       * vectorizer/idiom, so the annotation matches release output (otherwise a
+       * loop shown "not vectorized" at -O would mislead). */
+      options.optimize = 1;
+      options.release = 1;
+      options.explain = 1;
+      options.asm_syntax = 2; /* both */
+    } else if (strncmp(argv[i], "--annotate-lines=", 17) == 0) {
+      /* Focused codegen report for a source line range (LLM-facing): asm + cost
+       * + covering loops + live registers + decisions for just those lines.
+       * Accepts "A" (single line) or "A-B". Implies --annotate-asm. */
+      const char *v = argv[i] + 17;
+      int a = 0, b = 0;
+      if (sscanf(v, "%d-%d", &a, &b) == 2) {
+        /* range */
+      } else if (sscanf(v, "%d", &a) == 1) {
+        b = a;
+      } else {
+        fprintf(stderr, "Error: --annotate-lines expects A or A-B (got '%s')\n", v);
+        return 1;
+      }
+      if (a <= 0 || b < a) {
+        fprintf(stderr, "Error: --annotate-lines range invalid: %s\n", v);
+        return 1;
+      }
+      options.annotate_q_lo = a;
+      options.annotate_q_hi = b;
+      options.annotate_asm = 1;
+      options.optimize = 1;
+      options.release = 1;
+      options.explain = 1;
+      if (!options.asm_syntax) options.asm_syntax = 0; /* intel-only is terser */
+    } else if (strncmp(argv[i], "--annotate-fn=", 14) == 0) {
+      options.annotate_q_fn = argv[i] + 14;
+      options.annotate_asm = 1;
+      options.optimize = 1;
+      options.release = 1;
+      options.explain = 1;
+    } else if (strcmp(argv[i], "--annotate-hot") == 0 ||
+               strncmp(argv[i], "--annotate-hot=", 15) == 0) {
+      /* Top-N hotspots across the program (LLM-facing "where is the time"). */
+      int n = 8;
+      if (argv[i][14] == '=') n = atoi(argv[i] + 15);
+      if (n <= 0) n = 8;
+      options.annotate_hot = n;
+      options.annotate_asm = 1;
+      options.optimize = 1;
+      options.release = 1;
+      options.explain = 1;
+    } else if (strncmp(argv[i], "--asm-syntax=", 13) == 0) {
+      const char *v = argv[i] + 13;
+      if (strcmp(v, "intel") == 0) {
+        options.asm_syntax = 0;
+      } else if (strcmp(v, "att") == 0) {
+        options.asm_syntax = 1;
+      } else if (strcmp(v, "both") == 0) {
+        options.asm_syntax = 2;
+      } else {
+        fprintf(stderr,
+                "Error: --asm-syntax must be intel, att, or both (got '%s')\n",
+                v);
+        return 1;
+      }
     } else if (strcmp(argv[i], "--emit-ptx") == 0) {
       options.emit_ptx = 1;
+    } else if (strcmp(argv[i], "--emit-arm64") == 0) {
+      options.emit_arm64 = 1;
     } else if (strcmp(argv[i], "-g") == 0 ||
                strcmp(argv[i], "--debug-symbols") == 0) {
       options.generate_debug_symbols = 1;
@@ -2411,6 +2624,9 @@ int main(int argc, char *argv[]) {
       options.profile_runtime = 1;
     } else if (strcmp(argv[i], "--profile-runtime-ops") == 0) {
       options.profile_runtime_ops = 1;
+    } else if (strcmp(argv[i], "--profile-blocks") == 0) {
+      options.profile_blocks = 1;
+      options.profile_runtime = 1;
     } else if (strcmp(argv[i], "--debug-hooks") == 0) {
       options.debug_hooks = 1;
     } else if (strcmp(argv[i], "--native-heap") == 0) {
@@ -2471,6 +2687,10 @@ int main(int argc, char *argv[]) {
   }
 
   auto_runtime_directory = infer_default_runtime_directory(argv[0]);
+
+  if (options.ml_opt) {
+    ml_opt_set_default_paths(argv[0]);
+  }
 
   /* The native ELF backend supports --build on Linux via an ld-based link of
    * the emitted ELF object plus a self-contained _start. On Linux --build
@@ -2560,7 +2780,7 @@ int main(int argc, char *argv[]) {
       fprintf(stderr, "  %-20s %9.3f ms\n", "assemble/link",
               compiler_profile_now_ms() - build_profile_start);
     }
-  } else if (result == 0 && auto_runtime_directory && !options.debug_mode &&
+  } else if (result == 0 && auto_runtime_directory && options.debug_mode &&
              !options.dump_ir) {
     fprintf(stderr,
             "Note: transitional runtime objects detected at '%s'. Use --build "
@@ -2633,6 +2853,22 @@ static int compile_monomorphize(ASTNode *program,
     }
     return 0;
   }
+  if (!closure_convert_program(program, error_reporter)) {
+    if (error_reporter_has_errors(error_reporter)) {
+      error_reporter_print_errors(error_reporter);
+    } else {
+      fprintf(stderr, "Closure conversion error\n");
+    }
+    return 0;
+  }
+  if (!closure_adapt_program(program, error_reporter)) {
+    if (error_reporter_has_errors(error_reporter)) {
+      error_reporter_print_errors(error_reporter);
+    } else {
+      fprintf(stderr, "Closure adaptation error\n");
+    }
+    return 0;
+  }
   return 1;
 }
 
@@ -2666,7 +2902,78 @@ static int compile_lower_to_ir(ASTNode *program, TypeChecker *type_checker,
   return 1;
 }
 
-static int compile_optimize_ir(IRProgram *ir_program,
+int ir_apply_ml_opt(IRProgram *program); /* src/ir/ml_opt.c */
+int ir_hoist_constants(IRProgram *program); /* src/ir/ml_opt.c */
+
+/* Collect non-extern, non-exported global integer `var`s whose initializer is
+ * an integer literal (optionally negated). The optimizer proves each is never
+ * written before folding its reads - this only supplies the candidates. */
+static IRGlobalIntConst *collect_global_int_consts(ASTNode *program,
+                                                   size_t *out_count) {
+  *out_count = 0;
+  if (!program || program->type != AST_PROGRAM || !program->data) {
+    return NULL;
+  }
+  Program *prog = (Program *)program->data;
+  IRGlobalIntConst *consts = NULL;
+  size_t count = 0, capacity = 0;
+  for (size_t i = 0; i < prog->declaration_count; i++) {
+    ASTNode *decl = prog->declarations[i];
+    if (!decl || decl->type != AST_VAR_DECLARATION || !decl->data) {
+      continue;
+    }
+    VarDeclaration *vd = (VarDeclaration *)decl->data;
+    if (!vd->name || !vd->type_name || vd->is_extern || vd->is_exported ||
+        vd->link_name || !vd->initializer) {
+      continue;
+    }
+    if (strcmp(vd->type_name, "int8") != 0 &&
+        strcmp(vd->type_name, "int16") != 0 &&
+        strcmp(vd->type_name, "int32") != 0 &&
+        strcmp(vd->type_name, "int64") != 0 &&
+        strcmp(vd->type_name, "uint8") != 0 &&
+        strcmp(vd->type_name, "uint16") != 0 &&
+        strcmp(vd->type_name, "uint32") != 0 &&
+        strcmp(vd->type_name, "uint64") != 0) {
+      continue;
+    }
+    ASTNode *init = vd->initializer;
+    long long sign = 1;
+    if (init->type == AST_UNARY_EXPRESSION && init->data) {
+      UnaryExpression *ue = (UnaryExpression *)init->data;
+      if (!ue->operator|| strcmp(ue->operator, "-") != 0 || !ue->operand) {
+        continue;
+      }
+      sign = -1;
+      init = ue->operand;
+    }
+    if (init->type != AST_NUMBER_LITERAL || !init->data) {
+      continue;
+    }
+    NumberLiteral *nl = (NumberLiteral *)init->data;
+    if (nl->is_float) {
+      continue;
+    }
+    if (count >= capacity) {
+      size_t nc = capacity ? capacity * 2 : 16;
+      IRGlobalIntConst *grown =
+          (IRGlobalIntConst *)realloc(consts, nc * sizeof(*grown));
+      if (!grown) {
+        free(consts);
+        return NULL;
+      }
+      consts = grown;
+      capacity = nc;
+    }
+    consts[count].name = vd->name;
+    consts[count].value = sign * nl->int_value;
+    count++;
+  }
+  *out_count = count;
+  return consts;
+}
+
+static int compile_optimize_ir(IRProgram *ir_program, ASTNode *ast_program,
                                CompilerOptions *options) {
   IROptimizeOptions ir_optimize_options = {0};
   ir_optimize_options.preserve_function_boundaries =
@@ -2678,13 +2985,46 @@ static int compile_optimize_ir(IRProgram *ir_program,
   /* Large --explain reports divert to `<output-stem>.explain.txt`. */
   ir_explain_set_output_path(options->output_filename);
   ir_explain_set_json(options->explain_json ? 1 : 0);
-  if (!ir_optimize_program(ir_program, &ir_optimize_options)) {
+  /* --annotate-asm: arm the codegen annotator before codegen runs, and keep the
+   * optimization remarks alive so it can join them onto the emitted asm. */
+  if (options->annotate_asm) {
+    mir_annotate_set_enabled(1);
+    mir_annotate_set_syntax((MirAnnotSyntax)options->asm_syntax);
+    mir_annotate_set_output_path(options->output_filename);
+    mir_annotate_set_source_file(options->input_filename);
+    if (options->annotate_q_lo)
+      mir_annotate_set_line_query(options->annotate_q_lo, options->annotate_q_hi,
+                                  options->annotate_q_fn);
+    else if (options->annotate_q_fn)
+      mir_annotate_set_line_query(0, 0, options->annotate_q_fn);
+    if (options->annotate_hot) mir_annotate_set_hot_query(options->annotate_hot);
+    ir_explain_set_retain_remarks(1);
+  }
+  size_t global_const_count = 0;
+  IRGlobalIntConst *global_consts =
+      collect_global_int_consts(ast_program, &global_const_count);
+  ir_optimize_options.global_int_consts = global_consts;
+  ir_optimize_options.global_int_const_count = global_const_count;
+  ir_optimize_options.whole_program = options->building_executable;
+  int opt_ok = ir_optimize_program(ir_program, &ir_optimize_options);
+  free(global_consts);
+  if (!opt_ok) {
     /* A violated `@simd!` contract is a user error already printed with a
      * source location; don't bury it under a generic internal-error report. */
     if (!ir_optimize_had_user_error()) {
       mettle_compiler_ice_report("IR optimization failed", NULL);
     }
     return 0;
+  }
+  if (options->ml_opt) {
+    int applied = ir_apply_ml_opt(ir_program);
+    int hoisted = ir_hoist_constants(ir_program);
+    fprintf(stderr, "--ml-opt: applied %d model dispositions, hoisted %d "
+            "large constants\n", applied, hoisted);
+    if (options->explain) {
+      /* ml_gnn wrote _mlopt.explain (TSV). Render it styled like the main report. */
+      ir_explain_ml_opt("_mlopt.explain");
+    }
   }
   return 1;
 }
@@ -2983,6 +3323,38 @@ int compile_file(const char *input_filename, const char *output_filename,
     goto cleanup;
   }
 
+  /* @test functions are type-checked in every build (so they can't rot) but
+   * compiled only under `mettle test`: drop them before lowering. The node
+   * lives in BOTH program->children and Program->declarations; remove it
+   * from both before destroying it. */
+  if (!options->test_mode) {
+    Program *prog_data = (Program *)program->data;
+    if (prog_data) {
+      size_t kept = 0;
+      for (size_t i = 0; i < prog_data->declaration_count; i++) {
+        ASTNode *decl = prog_data->declarations[i];
+        FunctionDeclaration *fd =
+            decl && decl->type == AST_FUNCTION_DECLARATION && decl->data
+                ? (FunctionDeclaration *)decl->data
+                : NULL;
+        if (fd && fd->is_test) {
+          size_t child_kept = 0;
+          for (size_t c = 0; c < program->child_count; c++) {
+            if (program->children[c] == decl) {
+              continue;
+            }
+            program->children[child_kept++] = program->children[c];
+          }
+          program->child_count = child_kept;
+          ast_destroy_node(decl);
+          continue;
+        }
+        prog_data->declarations[kept++] = decl;
+      }
+      prog_data->declaration_count = kept;
+    }
+  }
+
   /* --explain reports optimizer decisions, so it only means something when the
    * optimizer runs; lowering then brackets every loop with report-only markers
    * for the verifier to report on. */
@@ -2993,7 +3365,8 @@ int compile_file(const char *input_filename, const char *output_filename,
   ir_lowering_set_explain(options->explain && options->optimize &&
                           !options->emit_ptx);
 
-  int emit_runtime_checks = (options->release || options->emit_ptx) ? 0 : 1;
+  int emit_runtime_checks =
+      (options->release || options->emit_ptx || options->emit_arm64) ? 0 : 1;
   compiler_set_phase(PROFILE_PHASE_IR_LOWERING);
   phase_start = compiler_profile_begin(&profile);
   int ir_ok = compile_lower_to_ir(program, type_checker, symbol_table,
@@ -3006,6 +3379,35 @@ int compile_file(const char *input_filename, const char *output_filename,
   }
 
   mettle_compiler_ctx_set_ir_program(ir_program);
+
+  /* --pgo: interpret main() now, before optimization, so the optimizer can
+   * consume measured call frequencies instead of static guesses. */
+  if (options->pgo) {
+    ir_pgo_profile_program(ir_program);
+    ir_pgo_print_summary();
+  }
+
+  /* `mettle test` / `mettle trace`: execute in the compile-time interpreter
+   * and stop - no optimization (unless requested), no codegen, no linking. */
+  if (options->test_mode || options->trace_function) {
+    if (options->optimize) {
+      int opt_ok = compile_optimize_ir(ir_program, program, options);
+      if (!opt_ok) {
+        result = 1;
+        goto cleanup;
+      }
+    }
+    if (options->test_mode) {
+      result = ir_comptime_run_tests(ir_program, error_reporter,
+                                     input_filename, options->test_filter);
+    } else {
+      result = ir_comptime_trace(ir_program, error_reporter, input_filename,
+                                 source, options->trace_function,
+                                 options->trace_args,
+                                 options->trace_arg_count);
+    }
+    goto cleanup;
+  }
 
   /* --emit-ptx: lower every function to a PTX `.visible .entry` and write the
    * PTX text to the output file. No optimization (keeps the IR shape the PTX
@@ -3030,6 +3432,35 @@ int compile_file(const char *input_filename, const char *output_filename,
       goto cleanup;
     }
     printf("Generated PTX: %s\n", output_filename);
+    result = 0;
+    goto cleanup;
+  }
+
+  /* --emit-arm64: lower the scalar-integer subset of every function directly to
+   * an AArch64 ELF executable (from-scratch backend, no external assembler). A
+   * `_start` calls main() and exits with its return value. No optimization (the
+   * direct IR backend consumes the unoptimized IR shape), no x86 object. */
+  if (options->emit_arm64) {
+    Arm64Emit ae;
+    arm64_emit_init(&ae);
+    int ok = arm64_ir_encode_program(&ae, ir_program, "main") &&
+             arm64_emit_finalize(&ae);
+    if (ok) {
+      ok = arm64_write_elf(output_filename, ae.code.data, ae.code.len);
+      if (!ok) {
+        fprintf(stderr, "Error: could not write AArch64 ELF '%s'\n",
+                output_filename);
+      }
+    } else {
+      fprintf(stderr, "Error: AArch64 lowering failed (an op outside the "
+                      "supported scalar subset, or an unresolved call)\n");
+    }
+    arm64_emit_free(&ae);
+    if (!ok) {
+      result = 1;
+      goto cleanup;
+    }
+    printf("Generated AArch64 ELF: %s\n", output_filename);
     result = 0;
     goto cleanup;
   }
@@ -3080,7 +3511,7 @@ int compile_file(const char *input_filename, const char *output_filename,
   if (options->optimize) {
     compiler_set_phase(PROFILE_PHASE_IR_OPTIMIZATION);
     phase_start = compiler_profile_begin(&profile);
-    int opt_ok = compile_optimize_ir(ir_program, options);
+    int opt_ok = compile_optimize_ir(ir_program, program, options);
     compiler_profile_add(&profile, PROFILE_PHASE_IR_OPTIMIZATION, phase_start);
     if (!opt_ok) {
       result = 1;
@@ -3111,6 +3542,16 @@ int compile_file(const char *input_filename, const char *output_filename,
     if (!ir_profile_instrument_operation_counters(ir_program)) {
       fprintf(stderr,
               "Error: Failed to instrument IR operation counters for runtime profiling\n");
+      result = 1;
+      goto cleanup;
+    }
+  }
+
+  if (options->profile_blocks) {
+    if (!ir_profile_instrument_blocks(ir_program)) {
+      fprintf(stderr,
+              "Error: Failed to instrument IR basic-block counters for the "
+              "codegen profile view\n");
       result = 1;
       goto cleanup;
     }
@@ -3160,6 +3601,12 @@ int compile_file(const char *input_filename, const char *output_filename,
    * (No-op unless --explain is on.) */
   if (options->explain && options->optimize) {
     ir_explain_backend_flush();
+  }
+
+  /* --annotate-asm: now that every function has been encoded, write the
+   * annotated listing (stdout) and the <stem>.annot.json sidecar. */
+  if (options->annotate_asm) {
+    mir_annotate_flush();
   }
 
   compiler_set_phase(PROFILE_PHASE_WRITE_OUTPUT);
@@ -3271,7 +3718,29 @@ void print_usage(const char *program_name) {
   printf("Usage: %s [options] <input.mettle>\n", program_name);
   printf("       %s help [topic]\n", program_name);
   printf("       %s docs [topic]\n", program_name);
+  printf("       %s explain <CODE>   Explain a diagnostic code (e.g. E0004, M0103; 'list' for all)\n",
+         program_name);
+  printf("       %s test <file> [--filter=S]   Run @test functions in the compile-time\n"
+         "                           interpreter (instant; no codegen or linking)\n",
+         program_name);
+  printf("       %s trace <file> <fn> [args...] Interpret a function and print a\n"
+         "                           line-by-line value trace\n",
+         program_name);
   printf("Options:\n");
+  printf("  --error-format=F    Diagnostic output format: human (default) or json\n"
+         "                      (one JSON object per diagnostic on stderr, for tooling)\n");
+  printf("  --pgo               Zero-run profile-guided optimization: interpret main()\n"
+         "                      at compile time (deterministic, sandboxed) and feed the\n"
+         "                      measured call frequencies to the optimizer - a hot\n"
+         "                      callee bypasses the inliner's static size budget like an\n"
+         "                      explicit @inline. No instrumented build, no training\n"
+         "                      run. Implies -O. METTLE_PGO_HOT sets the threshold.\n");
+  printf("  --verify            Translation validation: after every optimization pass,\n"
+         "                      execute each changed function's before/after IR on\n"
+         "                      generated inputs and compare behavior. A diverging pass\n"
+         "                      is reported with a concrete counterexample, quarantined\n"
+         "                      for that function, and the build continues from the\n"
+         "                      validated IR. Implies -O.\n");
   printf("  -i <file>           Input file\n");
   printf("  -o <file>           Output file (default: output.obj/output.o, or "
          "executable path with --build)\n");
@@ -3300,6 +3769,31 @@ void print_usage(const char *program_name) {
          "                      regressions first\n");
   printf("  --explain-json      Also write <output-stem>.explain.json (machine-\n"
          "                      readable report; implies --explain)\n");
+  printf("  --annotate-asm      Print the emitted assembly annotated with the codegen\n"
+         "                      decision behind each instruction (spill, vectorized\n"
+         "                      kernel, strength-reduced divide, ...), a per-op\n"
+         "                      latency/throughput cost model, recovered loops with\n"
+         "                      their port bottleneck, a register-lifetime map, and an\n"
+         "                      instruction-mix summary; also writes a\n"
+         "                      <output-stem>.annot.json sidecar. Implies -O and joins\n"
+         "                      the --explain remarks. Pair with --asm-syntax=\n");
+  printf("  --asm-syntax=S       Assembly syntax for --annotate-asm: intel, att, or\n"
+         "                      both (default both)\n");
+  printf("  --annotate-lines=A-B Focused codegen report for source lines A..B (or a\n"
+         "                      single line A): the emitted asm, per-op cost, the loops\n"
+         "                      covering the range, the registers live across it, and\n"
+         "                      the optimizer's decisions. Compact, for tools/LLMs.\n");
+  printf("  --annotate-fn=NAME   Restrict --annotate-lines/--annotate-asm to one\n"
+         "                      function\n");
+  printf("  --annotate-hot[=N]  Print the program's top N codegen hotspots (hottest\n"
+         "                      loops by cycles/iteration and functions by weighted\n"
+         "                      cost); default N=8. For tools/LLMs.\n");
+  printf("  --ml-opt            Run the learned ML IR optimizer after the classical\n"
+         "                      passes (experimental). A GNN flags redundancy/algebra\n"
+         "                      classical missed; sound transforms (GVN, affine,\n"
+         "                      collapse, bitwise/xor-shift superoptimizer) verify and\n"
+         "                      apply each. Enables -O. See docs/ml-opt.md; with\n"
+         "                      --explain it reports each model-driven rewrite.\n");
   printf("  -g, --debug-symbols Generate debug symbols\n");
   printf("  -l, --line-mapping  Generate source line mapping\n");
   printf("  -s, --stack-trace   Embed runtime crash traceback support\n");
@@ -3315,6 +3809,12 @@ void print_usage(const char *program_name) {
          "(disables inlining)\n");
   printf("  --profile-runtime-ops  Emit runtime op-class counters per function "
          "(after optimization)\n");
+  printf("  --profile-blocks    Emit per-basic-block execution counters to a "
+         ".mprof sidecar\n"
+         "                      (path via METTLE_PROFILE_OUT); fuses with "
+         "--annotate-asm for\n"
+         "                      the VTune-style codegen profile view. Implies "
+         "--profile-runtime\n");
   printf("  --debug-hooks       Instrument for the interactive source-level "
          "debugger (requires -O0; used by the editor's F5)\n");
   printf("  --native-heap       Route new/malloc/calloc/realloc/free through "

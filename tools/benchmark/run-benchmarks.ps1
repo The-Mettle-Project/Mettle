@@ -14,6 +14,8 @@
 #   .\tools\benchmark\run-benchmarks.ps1 -BuildCompiler
 #   .\tools\benchmark\run-benchmarks.ps1 -Runs 7 -Warmup 2
 #   .\tools\benchmark\run-benchmarks.ps1 -Benchmark fib,grep
+#   .\tools\benchmark\run-benchmarks.ps1 -Suite 2          # Suite 2 only (new benchmark set)
+#   .\tools\benchmark\run-benchmarks.ps1 -MlOpt        # compile Mettle with --ml-opt
 #   .\tools\benchmark\run-benchmarks.ps1 -CompileOnly
 #   .\tools\benchmark\run-benchmarks.ps1 -SkipCompileBenchmarks
 #   .\tools\benchmark\run-benchmarks.ps1 -Quiet
@@ -29,12 +31,14 @@ param(
     [switch]$OpenReport,
     [switch]$Gcc,
     [switch]$Clang,
+    [switch]$MlOpt,
     [string]$ConfigPath = "docs/benchmarks/harness.json",
     [string]$CompilerPath = "",
     [string[]]$Benchmark = @(),
     [string[]]$CFlags = @(),
     [int]$Runs = 0,
-    [int]$Warmup = -1
+    [int]$Warmup = -1,
+    [int[]]$Suite = @()
 )
 
 $ErrorActionPreference = "Stop"
@@ -77,6 +81,32 @@ function Test-BenchmarkSelected {
 
     foreach ($item in $Benchmark) {
         if ($item -eq $Name) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Get-BenchmarkSuite {
+    param([object]$Bench)
+
+    if ($null -ne $Bench.suite) {
+        return [int]$Bench.suite
+    }
+
+    return 1
+}
+
+function Test-SuiteSelected {
+    param([int]$SuiteNumber)
+
+    if ($null -eq $Suite -or $Suite.Count -eq 0) {
+        return $true
+    }
+
+    foreach ($item in $Suite) {
+        if ($item -eq $SuiteNumber) {
             return $true
         }
     }
@@ -413,6 +443,10 @@ function Get-MettleBuildArgs {
         $args = @($Bench.mettle_flags)
     }
 
+    if ($script:MlOpt -and ($args -notcontains "--ml-opt")) {
+        $args += "--ml-opt"
+    }
+
     return $args
 }
 
@@ -657,16 +691,21 @@ function Write-SummaryTable {
 
     Write-Log ""
     Write-Log "=== Runtime summary (Mettle vs C, median) ==="
-    Write-Log ("{0,-14} {1,12} {2,12} {3,8} {4,8} {5,8}" -f "benchmark", "mettle", "c", "runtime", "compile", "size")
-    foreach ($row in $RuntimeResults) {
-        $runtimeRatio = if ($null -ne $row.relative) { "{0}x" -f ([double]$row.relative).ToString("F2", $InvariantCulture) } else { "FAIL" }
-        $compileRatio = if ($null -ne $row.compile_relative) { "{0}x" -f ([double]$row.compile_relative).ToString("F2", $InvariantCulture) } else { "FAIL" }
-        $sizeRatio = if ($null -ne $row.size_relative) { "{0}x" -f ([double]$row.size_relative).ToString("F2", $InvariantCulture) } else { "FAIL" }
-        Write-Log ("{0,-14} {1,12} {2,12} {3,8} {4,8} {5,8}" -f `
-            $row.name, `
-            $(if ($null -ne $row.mettle_ms) { "{0} ms" -f ([double]$row.mettle_ms).ToString("F3", $InvariantCulture) } else { "FAIL" }), `
-            $(if ($null -ne $row.c_ms) { "{0} ms" -f ([double]$row.c_ms).ToString("F3", $InvariantCulture) } else { "FAIL" }), `
-            $runtimeRatio, $compileRatio, $sizeRatio)
+    $suiteGroups = $RuntimeResults | Group-Object -Property { if ($null -ne $_.suite) { [int]$_.suite } else { 1 } } | Sort-Object Name
+    foreach ($group in $suiteGroups) {
+        Write-Log ""
+        Write-Log "--- Suite $($group.Name) ---"
+        Write-Log ("{0,-16} {1,12} {2,12} {3,8} {4,8} {5,8}" -f "benchmark", "mettle", "c", "runtime", "compile", "size")
+        foreach ($row in $group.Group) {
+            $runtimeRatio = if ($null -ne $row.relative) { "{0}x" -f ([double]$row.relative).ToString("F2", $InvariantCulture) } else { "FAIL" }
+            $compileRatio = if ($null -ne $row.compile_relative) { "{0}x" -f ([double]$row.compile_relative).ToString("F2", $InvariantCulture) } else { "FAIL" }
+            $sizeRatio = if ($null -ne $row.size_relative) { "{0}x" -f ([double]$row.size_relative).ToString("F2", $InvariantCulture) } else { "FAIL" }
+            Write-Log ("{0,-16} {1,12} {2,12} {3,8} {4,8} {5,8}" -f `
+                $row.name, `
+                $(if ($null -ne $row.mettle_ms) { "{0} ms" -f ([double]$row.mettle_ms).ToString("F3", $InvariantCulture) } else { "FAIL" }), `
+                $(if ($null -ne $row.c_ms) { "{0} ms" -f ([double]$row.c_ms).ToString("F3", $InvariantCulture) } else { "FAIL" }), `
+                $runtimeRatio, $compileRatio, $sizeRatio)
+        }
     }
 
     if ($CompileResults.Count -gt 0) {
@@ -730,6 +769,8 @@ if (-not $cCompilerCommand) {
     exit 1
 }
 
+if ($MlOpt) { Write-Log "ML optimizer enabled: compiling Mettle with --ml-opt" }
+
 $cVersionOutput = (& $cCompiler --version 2>&1 | Out-String).Trim()
 $cVersionLine = ($cVersionOutput -split "`r?`n")[0]
 $hostInfo = Get-BenchmarkHostInfo -CompilerFullPath $compilerFullPath -GccVersion $cVersionLine -CCompilerName $cCompiler
@@ -741,7 +782,8 @@ $failed = @()
 if ($null -ne $config.benchmarks -and $config.benchmarks.Count -gt 0) {
     foreach ($bench in $config.benchmarks) {
         $name = [string]$bench.name
-        if (-not (Test-BenchmarkSelected -Name $name)) {
+        $suiteNumber = Get-BenchmarkSuite -Bench $bench
+        if (-not (Test-BenchmarkSelected -Name $name) -or -not (Test-SuiteSelected -SuiteNumber $suiteNumber)) {
             continue
         }
 
@@ -815,6 +857,7 @@ if ($null -ne $config.benchmarks -and $config.benchmarks.Count -gt 0) {
             $results += [ordered]@{
                 name = $name
                 kind = if ($null -ne $bench.kind) { [string]$bench.kind } else { "runtime" }
+                suite = $suiteNumber
                 description = $description
                 mettle_us = if ($null -ne $mettleUs) { [uint64][math]::Round($mettleUs, 0) } else { $null }
                 c_us = if ($null -ne $cUs) { [uint64][math]::Round($cUs, 0) } else { $null }
@@ -901,6 +944,9 @@ $mettleFlags = if ($null -ne $config.defaults -and $null -ne $config.defaults.me
     @($config.defaults.mettle_flags)
 } else {
     @("--build", "--emit-obj", "--linker", "internal", "--release")
+}
+if ($MlOpt -and ($mettleFlags -notcontains "--ml-opt")) {
+    $mettleFlags += "--ml-opt"
 }
 
 $summary = Get-BenchmarkSummary -RuntimeResults $results

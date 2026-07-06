@@ -8,4 +8,4 @@
 //
 // Returns the command's exit status, or -1 on error.
 
-export extern function system(cmd: cstring) -> int32 = "system";
+export extern fn system(cmd: cstring) -> int32 = "system";

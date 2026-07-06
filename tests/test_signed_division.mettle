@@ -1,6 +1,6 @@
 // Signed division: truncates toward zero per spec
 // -7/2 = -3, 7/-2 = -3, -9/3 = -3
-function main() -> int32 {
+fn main() -> int32 {
   var a: int32 = -7;
   var b: int32 = 2;
   var q1: int32 = a / b;

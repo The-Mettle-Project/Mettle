@@ -14,7 +14,7 @@ const W = 600;
 const H = 400;
 const MAXIT = 256;
 
-function mandel_sum() -> int64 {
+fn mandel_sum() -> int64 {
   var total: int64 = 0;
   var py: int32 = 0;
   while (py < H) {
@@ -45,7 +45,7 @@ function mandel_sum() -> int64 {
   return total;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var passes: int32 = 30;
   println("Mandelbrot 600x400, 256 iters x 30 passes");
 

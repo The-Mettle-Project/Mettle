@@ -16,16 +16,27 @@ This document lists current limitations of the Mettle language, compiler, and ru
 
 ### Constants
 
-- `const NAME [: type] = <expr>;` declares a compile-time integer constant. At top level the value is folded at every use site; a local `const` is an immutable variable (reassignment is a compile error). Initializers must be compile-time constant integer expressions (literals, `sizeof`, other constants, and arithmetic/bitwise/comparison operators over them). Float, string, and aggregate constants are not yet supported, and constants must be declared before use.
+- `const NAME [: type] = <expr>;` declares an immutable binding; reassignment is a compile error. Constants must be declared before use.
+  - **Top-level (global) `const`** must have **integer** type. Its value is folded at every use site (it needs no storage), so the initializer must be a compile-time constant integer expression (literals, `sizeof`, other constants, and arithmetic/bitwise/comparison operators over them).
+  - **Local (function-scope) `const`** may have **any** type: integer, float, string, or aggregate. It is registered as an immutable local variable initialized to its value (not folded), so the initializer follows the same rules as any local variable initializer.
+  - **Global float, string, and aggregate constants are not yet supported** and are rejected with a clear diagnostic, because global non-integer initializer codegen is not yet emitted. Use a top-level `var` (which is mutable) or a function-local `const` instead.
 
 ### Traits & Generics
 
 Traits and constrained generics support inline bounds, multiple bounds, trailing `where` clauses on functions and structs, explicit impls, and trait method declarations with concrete impl method bodies. **Limitation:** generic trait-method calls on named values are monomorphized to concrete impl functions rather than resolved dynamically.
 
+### Anonymous Functions & Closures
+
+Anonymous functions are written `fn(params) -> ret { body }` in expression position. A non-capturing lambda is a first-class function pointer (storable, callable, passable as a higher-order argument, usable as a C callback). A lambda that references an enclosing variable is a *capturing closure*: captures are by value (snapshotted at creation), and the closure value is an 8-byte pointer to a heap environment. A closure type is spelled with a capital `Fn(...)->R` (distinct from the thin, C-compatible `fn(...)->R`); use it to return a closure, pass one to a higher-order function, or store one in a struct field. A capturing closure and a thin function pointer are not interchangeable (mixing them across a boundary is a compile error, not a miscompile).
+
+A closure (or plain function pointer) stored in a struct field can be called through `obj.field(args)`, including through a pointer-to-struct receiver. Captures are by value, but the closure's copy lives in its heap environment and persists across calls, so closures can hold mutable state (counters, accumulators) without affecting the outer variable.
+
+A non-capturing lambda or `&func` can be passed anywhere an `Fn(...)` closure is expected - as a call argument to a plain function, a variable declaration, or a return value - and the compiler transparently wraps it in a generated adapter so it dispatches through the closure calling convention. **Limitations:** (1) Adaptation covers a *literal* `&func` or lambda at the boundary; a thin value already sitting in a variable (`var g: fn(...)->R = &func; use(g);`) is not yet adapted - write `use(g)` as `use(&func)` directly, or re-spell `g`'s declared type as `Fn(...)`. (2) Assigning a thin value to an existing `Fn(...)`-typed struct field (`obj.field = &func;`) is not yet adapted; assign a real (possibly non-capturing) lambda literal instead. (3) The captured variables must have an explicit type (closures cannot capture a variable whose type was inferred). (4) The heap environment (of both closures and adapters) is not freed automatically (consistent with Mettle's manual-heap model).
+
 ### Pattern Matching
 
 - `**match` on tagged enums** supports both a statement form (arm bodies are `{ ... }` blocks) and an expression form that yields a value. In expression form, each arm body must be a single value-yielding expression (for example, `match (o) { case Some(v): v + 1, default: 0 }`). All arm types must unify, and the match must be exhaustive (`default:` or all variants covered) because it must always produce a value.
-- **Tagged-enum constructors** are function-like. Payload variants use `Some(x)`; payloadless variants use empty call syntax such as `None()`.
+- **Tagged-enum constructors** are function-like. Payload variants use `Some(x)`. Payloadless variants may be written either bare (`None`) or with empty call syntax (`None()`); both forms construct the same value.
 
 ### Switch
 
@@ -111,4 +122,4 @@ Arrays follow the same rule as in [Types - Array Types](types.md#array-types): t
 
 ### Platform Support
 
-- `std/net` and the web server example are Windows-only (Winsock2). Use POSIX socket externs for networking on Linux.
+- `std/net` works on both Windows and Linux from a single `import "std/net"`. On Windows it binds Winsock2; on the native ELF/Linux target the import resolver automatically selects `std/net.linux`, which exposes the same public API over POSIX libc sockets (the Windows-only `WSAStartup`/`WSACleanup`/`closesocket`/`WSAGetLastError` names become thin wrappers). The compiler auto-appends `posix_helpers.o` and `-lpthread` to the link line when `net` is imported on Linux.

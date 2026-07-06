@@ -3,12 +3,12 @@
 // indexed, and sum_i32 admits the implicit int32->int64 widen. Verify the
 // vectorized result equals the closed form, with negative inputs stressing the
 // signed widening. Returns 0 on success.
-function isum(a: int32*, n: int32) -> int64 {
+fn isum(a: int32*, n: int32) -> int64 {
   var s: int64 = 0;
   for i in 0..n { s = s + a[i]; }
   return s;
 }
-function main() -> int32 {
+fn main() -> int32 {
   var n: int32 = 4096;
   var a: int32[4096];
   for i in 0..n { a[i] = i * 7 - 1000000; }

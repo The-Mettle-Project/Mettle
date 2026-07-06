@@ -1,6 +1,6 @@
 import "std/io";
 
-function main() -> int32 {
+fn main() -> int32 {
   var x: int32 = 0;
   errdefer x = x + 1;
   return 1;

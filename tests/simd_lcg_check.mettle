@@ -5,7 +5,7 @@
 // printed checksum must match.
 import "std/io";
 
-function lcg_pass(seed: int64, iters: int64) -> int64 {
+fn lcg_pass(seed: int64, iters: int64) -> int64 {
   var state: uint32 = (uint32)seed;
   var sum: int64 = 0;
   var i: int64 = 0;
@@ -17,11 +17,11 @@ function lcg_pass(seed: int64, iters: int64) -> int64 {
   return sum;
 }
 
-function check_one(seed: int64, iters: int64) -> int64 {
+fn check_one(seed: int64, iters: int64) -> int64 {
   return lcg_pass(seed, iters);
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   // Mix of trip counts: 0..16 (every remainder), plus large multiples and
   // non-multiples of 8, with varied seeds.
   var total: int64 = 0;

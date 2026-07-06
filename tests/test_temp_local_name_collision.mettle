@@ -5,7 +5,7 @@
 // (observed at -O0: nested attention-style loops summed 15 instead of 2912).
 // Temps are now namespaced (".t%d") and the map keys on operand kind.
 
-function nested_sum(NH: int64, pos: int64) -> int64 {
+fn nested_sum(NH: int64, pos: int64) -> int64 {
     var acc: int64 = 0;
     var h: int64 = 0;
     while (h < NH) {
@@ -18,7 +18,7 @@ function nested_sum(NH: int64, pos: int64) -> int64 {
     return acc;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     // 32 * (91 + 14) = 3360
     if (nested_sum(32, 13) != 3360) {
         return 1;

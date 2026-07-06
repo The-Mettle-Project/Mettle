@@ -8,7 +8,7 @@
 import "std/io";
 import "std/bench";
 
-function is_prime(n: int64) -> int32 {
+fn is_prime(n: int64) -> int32 {
   if (n < 2) {
     return 0;
   }
@@ -22,7 +22,7 @@ function is_prime(n: int64) -> int32 {
   return 1;
 }
 
-function count_primes(limit: int64) -> int64 {
+fn count_primes(limit: int64) -> int64 {
   var count: int64 = 0;
   var n: int64 = 2;
   while (n <= limit) {
@@ -34,7 +34,7 @@ function count_primes(limit: int64) -> int64 {
   return count;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var limit: int64 = 50000;
   var passes: int32 = 200;
 

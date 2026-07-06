@@ -392,6 +392,14 @@ int binary_emit_memory_access_ex(BinaryCodeBuffer *buffer,
       base, displacement, 0);
 }
 
+/* prefetcht0 [base + disp]: 0F 18 /1. Advisory -- never faults, so a bad
+ * (speculative, out-of-range) address costs nothing but the hint. */
+int binary_emit_prefetcht0_mem(BinaryCodeBuffer *buffer,
+                               BinaryGpRegister base, int displacement) {
+  return binary_emit_memory_access_ex(buffer, 0, 0, 0x0F, 1, 0x18, 1, base,
+                                      displacement);
+}
+
 /* Like binary_emit_memory_access_ex but with a scaled-index SIB address
  * [base + index*scale + disp]. `reg` is the ModRM.reg operand (load dest or
  * store source). scale must be 1/2/4/8 and index must not be RSP. */
@@ -941,6 +949,36 @@ int binary_emit_imul_reg_reg_imm32(BinaryCodeBuffer *buffer,
   if (binary_emit_imul_reg_reg_small_imm(buffer, destination, source,
                                          signed_immediate)) {
     return 1;
+  }
+
+  /* C = (3|5|9) * 2^k (6,10,12,18,20,24,36,40,...): lea [src+src*(C'-1)] then
+   * shl by k. LEA reads both inputs before writing, so dst==src is fine; the
+   * chain is lea+shl (~1.5 cycles) vs imul's 3-cycle latency, and stays off
+   * the multiply port. Negative C appends a neg. */
+  {
+    int32_t magnitude = signed_immediate;
+    int negate = 0;
+    if (magnitude < 0 && magnitude != INT32_MIN) {
+      magnitude = -magnitude;
+      negate = 1;
+    }
+    if (magnitude > 0 && source != BINARY_GP_RSP) {
+      unsigned char k = 0;
+      int32_t odd = magnitude;
+      while ((odd & 1) == 0) {
+        odd >>= 1;
+        k++;
+      }
+      if (k > 0 && (odd == 3 || odd == 5 || odd == 9)) {
+        if (binary_emit_lea_reg_base_index_scale_disp(
+                buffer, destination, source, source, (int)(odd - 1), 0) &&
+            binary_emit_shift_reg_imm8(buffer, 4, destination, k) &&
+            (!negate || binary_emit_neg_reg(buffer, destination))) {
+          return 1;
+        }
+        return 0;
+      }
+    }
   }
 
   unsigned char opcode = signed_immediate >= INT8_MIN &&

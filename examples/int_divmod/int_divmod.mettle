@@ -13,7 +13,7 @@ import "std/bench";
 
 const N = 2000000;
 
-function divmod_sum() -> uint64 {
+fn divmod_sum() -> uint64 {
   var acc: uint64 = 0;
   var x: uint64 = 1469598103934665603;
   var i: uint64 = 1;
@@ -27,7 +27,7 @@ function divmod_sum() -> uint64 {
   return acc;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var passes: int32 = 40;
   println("64-bit div+mod, 2M iters x 40 passes");
 

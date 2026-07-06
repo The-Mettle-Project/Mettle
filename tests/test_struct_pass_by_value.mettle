@@ -22,26 +22,26 @@ struct Mixed {
   c: int32;
 }
 
-function write_s(s: cstring) {
+fn write_s(s: cstring) {
   if (s != 0) {
     fputs(s, get_stdout());
   }
 }
 
-function write_i64(v: int64) {
+fn write_i64(v: int64) {
   var buf: uint8[32];
   int_to_dec((cstring)((int64)(&(buf[0]))), v);
   write_s((cstring)((int64)(&(buf[0]))));
 }
 
-function line_i64(label: cstring, v: int64) {
+fn line_i64(label: cstring, v: int64) {
   write_s(label);
   write_s(cstr(" "));
   write_i64(v);
   write_s(cstr("\n"));
 }
 
-function scaled(v: float64) -> int64 {
+fn scaled(v: float64) -> int64 {
   if (v < 0.0) {
     return 0 - (int64)((0.0 - v) * 1000.0);
   }
@@ -49,17 +49,17 @@ function scaled(v: float64) -> int64 {
 }
 
 // Reads every field. Pre-fix this would truncate to bytes 0..7 and miss .c.
-function sum_three(t: ThreeI32) -> int32 {
+fn sum_three(t: ThreeI32) -> int32 {
   return t.a + t.b + t.c;
 }
 
 // Reads a non-prefix field. Pre-fix this would return garbage.
-function third(t: ThreeI32) -> int32 {
+fn third(t: ThreeI32) -> int32 {
   return t.c;
 }
 
 // Mutates the parameter. By-value semantics: caller must NOT see the change.
-function clobber(t: ThreeI32) {
+fn clobber(t: ThreeI32) {
   t.a = 999;
   t.b = 999;
   t.c = 999;
@@ -68,15 +68,15 @@ function clobber(t: ThreeI32) {
 // Returns m.b scaled in int64 so the result travels back via RAX (which is
 // reliable for integer returns) and we don't depend on the float-return
 // convention of a freshly-loaded field landing in XMM0.
-function mixed_b_scaled(m: Mixed) -> int64 {
+fn mixed_b_scaled(m: Mixed) -> int64 {
   return scaled(m.b);
 }
 
-function mixed_c(m: Mixed) -> int32 {
+fn mixed_c(m: Mixed) -> int32 {
   return m.c;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   write_s(cstr("struct pass by value\n"));
 
   var t: ThreeI32;

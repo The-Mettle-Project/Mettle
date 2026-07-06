@@ -17,6 +17,8 @@ const fs = require('fs');
 const os = require('os');
 const { registerExplain } = require('./explain');
 const { registerLanguageFeatures } = require('./language');
+const { registerCodegen } = require('./codegen');
+const { registerProfile } = require('./profile');
 const { registerDebugAdapter } = require('./debugAdapter');
 
 /** @type {vscode.DiagnosticCollection} */
@@ -83,7 +85,7 @@ const HOVER_DOCS = new Map(Object.entries({
       'Marks a declaration as part of a module public surface. Once a module exports anything, only exported declarations are visible to importers.',
       'Export applies to declarations defined in the current file.',
     ],
-    syntax: 'export function add(a: int64, b: int64) -> int64 {\n  return a + b;\n}',
+    syntax: 'export fn add(a: int64, b: int64) -> int64 {\n  return a + b;\n}',
     notes: [
       'There is no `private` keyword; omit `export` for implementation details.',
       'Exporting a struct makes its methods visible to importers as part of the struct API.',
@@ -95,34 +97,23 @@ const HOVER_DOCS = new Map(Object.entries({
       'Declares a symbol implemented outside Mettle, usually by libc, Win32, a linked C file, or an object/library passed to the linker.',
       'The string after `=` is the linker symbol name. Keep signatures ABI-correct; the compiler trusts the declaration.',
     ],
-    syntax: 'extern function puts(msg: cstring) -> int32 = "puts";\nextern var errno_value: int32 = "errno";',
+    syntax: 'extern fn puts(msg: cstring) -> int32 = "puts";\nextern var errno_value: int32 = "errno";',
     notes: [
       '`cstring` is the usual type for C `char*`, `void*`, and opaque handles.',
       'For structs passed to C, match C field order, sizes, and padding exactly.',
     ],
   },
-  function: {
-    title: 'function',
+  fn: {
+    title: 'fn',
     body: [
       'Declares a named function. Parameters and return type are explicit, and arguments are evaluated left to right at call sites.',
-      '`fn` is used for function pointer types; `function` declares an actual function body or prototype.',
+      '`fn` is also used for the function pointer type (e.g. `fn(int32, int32) -> int32`): take an address with `&name` and call through the pointer with ordinary call syntax.',
     ],
-    syntax: 'function add(a: int32, b: int32) -> int32 {\n  return a + b;\n}',
+    syntax: 'fn add(a: int32, b: int32) -> int32 {\n  return a + b;\n}\n\nvar op: fn(int32, int32) -> int32 = &add;\nvar result: int32 = op(3, 4);',
     notes: [
       'Use `-> void` or omit a return value with `return;` for procedures.',
-      'Generic functions are monomorphized at compile time: `function id<T>(x: T) -> T { ... }`.',
-    ],
-  },
-  fn: {
-    title: 'fn function pointer type',
-    body: [
-      'Describes a function pointer type. Function pointers are values: store them, pass them, return them, and call through them.',
-      'Take a function address with `&name`; call the pointer with ordinary call syntax.',
-    ],
-    syntax: 'var op: fn(int32, int32) -> int32;\nop = &add;\nvar result: int32 = op(3, 4);',
-    notes: [
-      'Two `fn` types are compatible only when parameter types and return type match.',
-      'Function pointers can be useful for callbacks and C interop.',
+      'Generic functions are monomorphized at compile time: `fn id<T>(x: T) -> T { ... }`.',
+      'Two function pointer types are compatible only when parameter types and return type match.',
     ],
   },
   var: {
@@ -168,7 +159,7 @@ const HOVER_DOCS = new Map(Object.entries({
       'Declares a compile-time capability that generic code can require. Traits describe required methods or marker constraints.',
       'Trait use is static: generic instantiations are checked and monomorphized by the compiler.',
     ],
-    syntax: 'trait Incrementable {\n  function next_value(self: Self) -> Self;\n}',
+    syntax: 'trait Incrementable {\n  fn next_value(self: Self) -> Self;\n}',
     notes: [
       'Use `Self` inside trait method signatures for the implementing type.',
       'Bounds can be inline (`T: Name`) or in a trailing `where` clause.',
@@ -180,7 +171,7 @@ const HOVER_DOCS = new Map(Object.entries({
       'Satisfies a trait for a concrete type. Methods inside an impl provide the implementation required by the trait.',
       'Impls are used by constrained generic functions during monomorphization.',
     ],
-    syntax: 'impl Incrementable for int32 {\n  function next_value(self: Self) -> Self {\n    return self + 1;\n  }\n}',
+    syntax: 'impl Incrementable for int32 {\n  fn next_value(self: Self) -> Self {\n    return self + 1;\n  }\n}',
     notes: [
       'Generic trait-method calls are statically resolved; this is not dynamic dispatch.',
     ],
@@ -190,7 +181,7 @@ const HOVER_DOCS = new Map(Object.entries({
     body: [
       'Adds trailing trait bounds to a generic function or struct. It keeps signatures readable when multiple constraints apply.',
     ],
-    syntax: 'function bump<T>(x: T) -> T where T: Incrementable {\n  return x.next_value();\n}',
+    syntax: 'fn bump<T>(x: T) -> T where T: Incrementable {\n  return x.next_value();\n}',
     notes: [
       'Multiple bounds use `+`: `where T: Addable + SignedNumber`.',
       'Inline bounds and trailing bounds can be combined.',
@@ -390,7 +381,7 @@ const HOVER_DOCS = new Map(Object.entries({
       'Built-in alias for `uint8*`. Use it for C interop: null-terminated strings, `void*`, `FILE*`, handles, and opaque pointers.',
       '`cstring` and `uint8*` are interchangeable; the name communicates intent at C boundaries.',
     ],
-    syntax: 'extern function puts(msg: cstring) -> int32 = "puts";',
+    syntax: 'extern fn puts(msg: cstring) -> int32 = "puts";',
     notes: [
       'Use `cstr(s)` from `std/io` or `s.chars` when a C function expects a pointer.',
       'Pointer arithmetic on `cstring` advances by one byte.',
@@ -422,7 +413,7 @@ const HOVER_DOCS = new Map(Object.entries({
     body: [
       'Placeholder for the implementing type inside trait method signatures and impl bodies.',
     ],
-    syntax: 'trait Incrementable {\n  function next_value(self: Self) -> Self;\n}',
+    syntax: 'trait Incrementable {\n  fn next_value(self: Self) -> Self;\n}',
   },
   sizeof: {
     title: 'sizeof',
@@ -813,6 +804,27 @@ function activate(context) {
   });
   context.subscriptions.push(
     vscode.commands.registerCommand('mettle.showOptimizationReport', explain.showReport)
+  );
+
+  // Codegen annotations: annotated assembly with the compiler decision behind
+  // each instruction, in a synced side panel (+ source decorations, CodeLens).
+  const codegen = registerCodegen(context, {
+    findCompiler,
+    log: (line) => mettleOutputChannel?.appendLine(line),
+  });
+  context.subscriptions.push(
+    vscode.commands.registerCommand('mettle.showCodegenAnnotations', codegen.showAnnotations)
+  );
+
+  // VTune-style measured codegen profiler: builds + runs the file instrumented
+  // with per-basic-block counters, fuses the measured frequency with the static
+  // port-cost model, and renders hotspots / port utilization / a flame graph.
+  const profile = registerProfile(context, {
+    findCompiler,
+    log: (line) => mettleOutputChannel?.appendLine(line),
+  });
+  context.subscriptions.push(
+    vscode.commands.registerCommand('mettle.profileCodegen', profile.showProfile)
   );
 
   // Navigation and editing intelligence (definition, references, rename,

@@ -3,14 +3,14 @@ enum Option {
     None
 }
 
-function unwrap_or(o: Option, fallback: int32) -> int32 {
+fn unwrap_or(o: Option, fallback: int32) -> int32 {
     return match (o) {
         case Some(value): value
         case None: fallback
     };
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     // match expression with payload binding
     var a: int32 = match (Some(40)) {
         case Some(value): value + 2

@@ -108,7 +108,7 @@
       "patterns": [
         {
           "name": "meta.function.mettle",
-          "match": "\\b(export\\s+)?(extern\\s+)?(function|fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "match": "\\b(export\\s+)?(extern\\s+)?(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
           "captures": {
             "1": { "name": "keyword.declaration.export.mettle" },
             "2": { "name": "keyword.declaration.extern.mettle" },
@@ -151,7 +151,7 @@
         },
         {
           "name": "keyword.declaration.mettle",
-          "match": "\\b(import|import_str|extern|export|var|function|fn|struct|enum|method|trait|impl|where)\\b"
+          "match": "\\b(import|import_str|extern|export|var|fn|struct|enum|method|trait|impl|where)\\b"
         },
         {
           "name": "keyword.operator.word.mettle",

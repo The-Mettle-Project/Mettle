@@ -11,7 +11,7 @@ import "std/mem";
 import "std/bench";
 
 // Count words in buf[0..len-1]. Word = non-empty sequence of non-whitespace bytes.
-function word_count(buf: cstring, len: int64) -> int64 {
+fn word_count(buf: cstring, len: int64) -> int64 {
   var count: int64 = 0;
   var i: int64 = 0;
   var in_word: int32 = 0;
@@ -30,7 +30,7 @@ function word_count(buf: cstring, len: int64) -> int64 {
   return count;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var buf_size: int64 = 262144;
   var template: string = "a b ";
   var template_len: int64 = 4;

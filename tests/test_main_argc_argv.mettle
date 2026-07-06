@@ -3,7 +3,7 @@
 
 import "std/conv";
 
-function main(argc: int32, argv: cstring*) -> int32 {
+fn main(argc: int32, argv: cstring*) -> int32 {
   // argv[0] is the program name; argc >= 1 means we got at least that
   if (argc < 1) {
     return 1;

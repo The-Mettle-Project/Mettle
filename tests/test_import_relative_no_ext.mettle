@@ -1,5 +1,5 @@
 import "import_fixtures/math_utils";
 
-function main() -> int32 {
+fn main() -> int32 {
   return add_one(41) - 42;
 }

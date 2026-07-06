@@ -15,7 +15,7 @@ For the wider picture (helper objects, what `--build` links, the runtime-model s
 ```mettle
 struct Point { x: int32; y: int32; }
 
-function main() -> int32 {
+fn main() -> int32 {
   var p: Point* = new Point;
   p.x = 10;
   p.y = 20;

@@ -1,10 +1,10 @@
-function swap<T>(a: T*, b: T*) -> void {
+fn swap<T>(a: T*, b: T*) -> void {
     var tmp: T = *a;
     *a = *b;
     *b = tmp;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     var x: int32 = 10;
     var y: int32 = 20;
     swap<int32>(&x, &y);

@@ -1,5 +1,5 @@
 // Decimal widens above int32_max to int64; hex infers uint32 in high range.
-function main() -> int32 {
+fn main() -> int32 {
   var u32_max_dec: uint32 = 4294967295;
   var u32_max_hex: uint32 = 0xFFFFFFFF;
   var as_i64: int64 = 4294967295;

@@ -3,7 +3,7 @@ struct Point {
   y: int32;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var p: Point* = 0;
   p.x = 1;
   return 0;

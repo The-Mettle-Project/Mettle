@@ -1,20 +1,20 @@
 // Demo for --explain: a mix of loops and calls the optimizer treats differently.
 
-function scale(x: float32) -> float32 {
+fn scale(x: float32) -> float32 {
     return x * 2.5;
 }
 
-function opaque(x: int32) -> int32 {
+fn opaque(x: int32) -> int32 {
     return x + 1;
 }
 
-function saxpy(a: float32, x: float32*, y: float32*, n: int32) {
+fn saxpy(a: float32, x: float32*, y: float32*, n: int32) {
     for i in 0..n {
         y[i] = a * x[i] + y[i];
     }
 }
 
-function with_call(out: float32*, n: int32) {
+fn with_call(out: float32*, n: int32) {
     var i: int32 = 0;
     while (i < n) {
         out[i] = scale(out[i]);
@@ -22,7 +22,7 @@ function with_call(out: float32*, n: int32) {
     }
 }
 
-function sum_bytes(data: uint8*, n: int32) -> int32 {
+fn sum_bytes(data: uint8*, n: int32) -> int32 {
     var total: int32 = 0;
     for i in 0..n {
         total = total + (int32)data[i];
@@ -32,7 +32,7 @@ function sum_bytes(data: uint8*, n: int32) -> int32 {
 
 // Row-times-vector: the inner dot product vectorizes, the outer row loop
 // stays scalar and drives it.
-function matvec(m: float32*, x: float32*, y: float32*, rows: int32, cols: int32) {
+fn matvec(m: float32*, x: float32*, y: float32*, rows: int32, cols: int32) {
     for r in 0..rows {
         var acc: float32 = 0.0;
         for c in 0..cols {
@@ -42,7 +42,7 @@ function matvec(m: float32*, x: float32*, y: float32*, rows: int32, cols: int32)
     }
 }
 
-function tiny_fixed() -> int32 {
+fn tiny_fixed() -> int32 {
     var s: int32 = 0;
     for i in 0..8 {
         s = s + i * i;
@@ -52,11 +52,11 @@ function tiny_fixed() -> int32 {
 
 // `@pure` + loop-invariant argument: the call is hoisted out of the loop
 // (`@noinline` keeps it a real call so LICM, not the inliner, handles it).
-function bias(k: int32) -> int32 {
+fn bias(k: int32) -> int32 {
     return k * 3 + 1;
 }
 
-function apply_bias(a: int32*, n: int32, k: int32) -> int32 {
+fn apply_bias(a: int32*, n: int32, k: int32) -> int32 {
     var s: int32 = 0;
     for i in 0..n {
         s = s + a[i] + bias(k);
@@ -65,13 +65,13 @@ function apply_bias(a: int32*, n: int32, k: int32) -> int32 {
 }
 
 // `@noalloc`: proven allocation-free over everything it can reach.
-function norm2(x: float32, y: float32) -> float32 {
+fn norm2(x: float32, y: float32) -> float32 {
     return x * x + y * y;
 }
 
 // int32 sum into an int32 accumulator: the kernel needs int64; the fix is
 // simulated and proven (-> vpaddd).
-function sum_ints(a: int32*, n: int32) -> int32 {
+fn sum_ints(a: int32*, n: int32) -> int32 {
     var s: int32 = 0;
     for i in 0..n {
         s = s + a[i];
@@ -81,7 +81,7 @@ function sum_ints(a: int32*, n: int32) -> int32 {
 
 // int16 elements have no kernel; "use int32 + int64 accumulator" is simulated
 // and proven.
-function sum_shorts(a: int16*, n: int32) -> int32 {
+fn sum_shorts(a: int16*, n: int32) -> int32 {
     var s: int64 = 0;
     for i in 0..n {
         s = s + (int32)a[i];
@@ -91,11 +91,11 @@ function sum_shorts(a: int16*, n: int32) -> int32 {
 
 // `@noinline` on the callee blocks the loop; the report simulates REMOVING
 // the veto, re-runs the inliner, and proves the loop then vectorizes.
-function damp(x: float32) -> float32 {
+fn damp(x: float32) -> float32 {
     return x * 0.5;
 }
 
-function apply_damp(a: float32*, n: int32) {
+fn apply_damp(a: float32*, n: int32) {
     for i in 0..n {
         a[i] = damp(a[i]);
     }
@@ -103,7 +103,7 @@ function apply_damp(a: float32*, n: int32) {
 
 // The non-counter index half mutates each iteration: the row-pointer advice
 // is provably unwritable, so the report REPLACES it instead of printing it.
-function skew(m: float32*, v: float32*, n: int32) -> float32 {
+fn skew(m: float32*, v: float32*, n: int32) -> float32 {
     var acc: float32 = 0.0;
     var k: int32 = 0;
     for c in 0..n {
@@ -113,13 +113,13 @@ function skew(m: float32*, v: float32*, n: int32) -> float32 {
     return acc;
 }
 
-function step1(x: float32) -> float32 {
+fn step1(x: float32) -> float32 {
     return x + 1.0;
 }
 
 // Refused by the call-count cap -- but the report re-checks with @inline
 // pretend-applied and proves the suggestion before printing it.
-function chain(x: float32) -> float32 {
+fn chain(x: float32) -> float32 {
     return step1(step1(step1(x)));
 }
 
@@ -127,7 +127,7 @@ function chain(x: float32) -> float32 {
 // value through *, +, >>, ^ (an LCG/hash step). None of those reassociate, so
 // the lanes form a dependency chain -- the dependence-analysis diagnosis reports
 // the scalar floor, NOT a missing kernel.
-function lcg_hash(seed: int64, n: int64) -> int64 {
+fn lcg_hash(seed: int64, n: int64) -> int64 {
     var h: int64 = seed;
     var i: int64 = 0;
     while (i < n) {
@@ -137,7 +137,7 @@ function lcg_hash(seed: int64, n: int64) -> int64 {
     return h;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     var xs: float32[64];
     var ys: float32[64];
     var bs: uint8[64];

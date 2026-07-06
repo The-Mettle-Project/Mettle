@@ -1,0 +1,16 @@
+var screen: int64* = (int64*)0;
+
+fn fill(w: int64, h: int64, v: int64) -> int64 {
+    var count: int64 = 0;
+    var i: int64 = 0;
+    while (i < w * h) {
+        screen[i] = v;
+        count = count + 1;
+        i = i + 1;
+    }
+    return count;
+}
+
+fn main() -> int64 {
+    return fill(0, 0, 7);
+}

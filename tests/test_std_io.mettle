@@ -1,6 +1,6 @@
 import "std/io";
 
-function main() -> int32 {
+fn main() -> int32 {
   var msg1: string = "Hello from println!";
   println(msg1);
 

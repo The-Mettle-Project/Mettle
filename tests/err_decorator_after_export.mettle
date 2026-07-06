@@ -1,9 +1,9 @@
 // Decorators must come BEFORE `export`, not after it. `export @inline ...` is a
 // clear, common ordering mistake and should get a targeted diagnostic.
-export @inline function f() -> int32 {
+export @inline fn f() -> int32 {
   return 0;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   return f();
 }

@@ -1,8 +1,8 @@
-function id_addr(x: int32) -> int32 {
+fn id_addr(x: int32) -> int32 {
   var p: int32* = &x;
   return *p;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   return id_addr(7);
 }

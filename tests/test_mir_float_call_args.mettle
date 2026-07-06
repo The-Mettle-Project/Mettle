@@ -16,18 +16,18 @@
 // Exit code 1 = every result correct, 0 = some path miscompiled. Built debug,
 // release, and *_fallback (METTLE_MIR=0) so MIR and the legacy backend agree.
 
-@noinline function add2(a: float32, b: float32) -> float32 { return a + b; }
-@noinline function iadd(a: int32, b: int32) -> int32 { return a + b; }
-@noinline function isub(a: int32, b: int32) -> int32 { return a - b; }
-@noinline function fma4(a: float32, b: float32, c: float32, d: float32) -> float32 {
+@noinline fn add2(a: float32, b: float32) -> float32 { return a + b; }
+@noinline fn iadd(a: int32, b: int32) -> int32 { return a + b; }
+@noinline fn isub(a: int32, b: int32) -> int32 { return a - b; }
+@noinline fn fma4(a: float32, b: float32, c: float32, d: float32) -> float32 {
   return a * b + c - d;
 }
-@noinline function negf(x: float32) -> float32 { return 0.0 - x; }
-@noinline function uneg(x: float64) -> float64 { var y: float64 = -x; return y; }
-@noinline function scale_f32(p: float32*, k: float32) -> float32 { return p[0] * k; }
-@noinline function narrow(d: float64) -> float32 { return (float32)d; }
+@noinline fn negf(x: float32) -> float32 { return 0.0 - x; }
+@noinline fn uneg(x: float64) -> float64 { var y: float64 = -x; return y; }
+@noinline fn scale_f32(p: float32*, k: float32) -> float32 { return p[0] * k; }
+@noinline fn narrow(d: float64) -> float32 { return (float32)d; }
 
-function approx(x: float32, want: int32) -> int32 {
+fn approx(x: float32, want: int32) -> int32 {
   // True when (int32)round(x) == want, tolerant of float rounding.
   var xi: int32 = (int32)(x + 0.5);
   if (x < 0.0) { xi = (int32)(x - 0.5); }
@@ -35,7 +35,7 @@ function approx(x: float32, want: int32) -> int32 {
   return 0;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var ok: int32 = 1;
 
   if (approx(add2(7.0, 3.0), 10) == 0) { ok = 0; }          // entry-live: a+b

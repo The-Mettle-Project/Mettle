@@ -1,5 +1,8 @@
 #include "codegen/binary/internal.h"
 #include "codegen/binary/mir.h"
+#include "codegen/binary/mir_annotate.h"
+#include "ir/ir_pgo.h"
+#include <limits.h>
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -81,12 +84,51 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
     goto mir_shared_append;
   }
 
+  /* --annotate-asm: this function uses the BASELINE (fallback) backend, which
+   * works at IR granularity. Open a capture context and record each IR
+   * instruction's emitted byte span. The optimized idioms the MIR gate rejects
+   * (vectorized kernels, the Fibonacci rotate) land here. */
+  int annot = mir_annotate_enabled();
+  size_t annot_base = context.code.size;
+  if (annot) {
+    mir_annotate_begin_function(
+        function_data->name, ir_function,
+        function_data->body ? function_data->body->location.filename : NULL,
+        function_data->body ? function_data->body->location.line : 0);
+    mir_annotate_note_backend("baseline (fallback)", NULL);
+  }
+
   if (!code_generator_binary_emit_prologue(generator, &context, function_data)) {
+    if (annot) mir_annotate_end_function();
     binary_function_context_destroy(&context);
     return 0;
   }
+  if (annot && context.code.size > annot_base) {
+    mir_annotate_record_synthetic("prologue", "frame", 0,
+                                  context.code.size - annot_base,
+                                  context.code.data + annot_base);
+  }
 
+  size_t annot_prev_off = context.code.size;
+  int annot_prev_idx = -1;
   for (size_t i = 0; i < ir_function->instruction_count;) {
+    /* Lazily record the previous instruction's span now that it is fully
+     * emitted; this is robust to the cascade's many `continue` paths because
+     * every one returns here. */
+    if (annot && annot_prev_idx >= 0 && context.code.size > annot_prev_off) {
+      mir_annotate_record_ir(ir_function, annot_prev_idx,
+                             annot_prev_off - annot_base,
+                             context.code.size - annot_prev_off,
+                             context.code.data + annot_prev_off);
+    }
+    annot_prev_off = context.code.size;
+    annot_prev_idx = (int)i;
+    /* Labels emit no bytes, so the lazy span recorder never sees them; record a
+     * zero-byte marker so loop recovery can resolve backward-branch targets. */
+    if (annot && ir_function->instructions[i].op == IR_OP_LABEL) {
+      mir_annotate_record_ir_label(ir_function->instructions[i].text,
+                                   context.code.size - annot_base);
+    }
     size_t consumed = 0;
     if (code_generator_binary_try_skip_scaled_address_shift(ir_function, i,
                                                             &consumed)) {
@@ -189,10 +231,21 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
 
     if (!code_generator_binary_emit_instruction(
             generator, &context, &ir_function->instructions[i])) {
+      if (annot) mir_annotate_end_function();
       binary_function_context_destroy(&context);
       return 0;
     }
     i++;
+  }
+  /* Record the last instruction's span (no further loop top runs). */
+  if (annot && annot_prev_idx >= 0 && context.code.size > annot_prev_off) {
+    mir_annotate_record_ir(ir_function, annot_prev_idx,
+                           annot_prev_off - annot_base,
+                           context.code.size - annot_prev_off,
+                           context.code.data + annot_prev_off);
+  }
+  if (annot) {
+    mir_annotate_end_function();
   }
 
   return_offset = context.code.size;
@@ -356,8 +409,71 @@ int code_generator_generate_program_binary_object(CodeGenerator *generator,
     return 0;
   }
 
+  /* --pgo code layout: emit measured-hot functions first (main leading) so
+   * the hot working set shares I-cache lines and iTLB pages, cold glue sinks
+   * to the tail. Zero-run: the frequencies come from the compile-time
+   * interpretation of main(), no training run. Only the FUNCTION declaration
+   * slots are permuted among themselves; every other declaration keeps its
+   * position. Without a profile the order is untouched. */
+  size_t *emit_order = NULL;
+  if (ir_pgo_enabled() && program_data->declaration_count > 1) {
+    size_t n = program_data->declaration_count;
+    emit_order = (size_t *)malloc(n * sizeof(size_t));
+    size_t *fn_slots = (size_t *)malloc(n * sizeof(size_t));
+    long long *heat = (long long *)malloc(n * sizeof(long long));
+    if (emit_order && fn_slots && heat) {
+      size_t fn_count = 0;
+      for (size_t i = 0; i < n; i++) {
+        emit_order[i] = i;
+        ASTNode *d = program_data->declarations[i];
+        if (d && d->type == AST_FUNCTION_DECLARATION && d->data) {
+          FunctionDeclaration *fd = (FunctionDeclaration *)d->data;
+          if (fd->name && !fd->is_extern && fd->body) {
+            fn_slots[fn_count] = i;
+            heat[fn_count] =
+                (strcmp(fd->name, "main") == 0)
+                    ? LLONG_MAX
+                    : ir_pgo_callee_calls(fd->name);
+            fn_count++;
+          }
+        }
+      }
+      /* Stable insertion sort of the function indices by heat, descending:
+       * ties (and cold/-1) keep declaration order. */
+      for (size_t i = 1; i < fn_count; i++) {
+        size_t slot = fn_slots[i];
+        long long h = heat[i];
+        size_t j = i;
+        while (j > 0 && heat[j - 1] < h) {
+          fn_slots[j] = fn_slots[j - 1];
+          heat[j] = heat[j - 1];
+          j--;
+        }
+        fn_slots[j] = slot;
+        heat[j] = h;
+      }
+      /* Redistribute the sorted functions into the function slots. */
+      size_t next = 0;
+      for (size_t i = 0; i < n; i++) {
+        ASTNode *d = program_data->declarations[i];
+        if (d && d->type == AST_FUNCTION_DECLARATION && d->data) {
+          FunctionDeclaration *fd = (FunctionDeclaration *)d->data;
+          if (fd->name && !fd->is_extern && fd->body) {
+            emit_order[i] = fn_slots[next++];
+          }
+        }
+      }
+    } else {
+      free(emit_order);
+      emit_order = NULL;
+    }
+    free(fn_slots);
+    free(heat);
+  }
+
   for (size_t i = 0; i < program_data->declaration_count; i++) {
-    ASTNode *declaration = program_data->declarations[i];
+    ASTNode *declaration =
+        program_data->declarations[emit_order ? emit_order[i] : i];
     if (!declaration) {
       continue;
     }
@@ -422,9 +538,18 @@ int code_generator_generate_program_binary_object(CodeGenerator *generator,
       if (var_data->is_extern) {
         break;
       }
-      // `const` declarations are folded at use sites and carry no storage.
+      // An integer `const` folds to a SYMBOL_CONSTANT at every use site and
+      // carries no storage. A non-integer `const` (float/string/aggregate) is
+      // registered as an immutable variable instead and DOES need storage,
+      // since the IR references it via a RIP-relative load like any global.
       if (var_data->is_const) {
-        break;
+        Symbol *const_symbol =
+            generator->symbol_table
+                ? symbol_table_lookup(generator->symbol_table, var_data->name)
+                : NULL;
+        if (!const_symbol || const_symbol->kind == SYMBOL_CONSTANT) {
+          break;
+        }
       }
       if (!code_generator_emit_binary_global_variable(generator, var_data)) {
         return 0;
@@ -441,9 +566,11 @@ int code_generator_generate_program_binary_object(CodeGenerator *generator,
           generator,
           "Direct object backend encountered unsupported declaration type %d",
           declaration->type);
+      free(emit_order);
       return 0;
     }
   }
+  free(emit_order);
 
   if ((generator->profile_runtime || generator->debug_hooks) &&
       !code_generator_binary_emit_profile_tables(generator)) {

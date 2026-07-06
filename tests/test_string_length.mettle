@@ -1,5 +1,5 @@
 // String length field matches actual character count
-function main() -> int32 {
+fn main() -> int32 {
   var s: string = "abc";
   if (s.length == 3) {
     return 1;

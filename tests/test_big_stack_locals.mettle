@@ -1,9 +1,9 @@
-function big_stack_frame() -> int32 {
+fn big_stack_frame() -> int32 {
   var vbuf: uint32[400];
   vbuf[399] = (uint32)558;
   return (int32)vbuf[399];
 }
 
-export function main() -> int32 {
+export fn main() -> int32 {
   return big_stack_frame();
 }

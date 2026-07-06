@@ -1,7 +1,7 @@
 import "std/conv";
 import "std/io";
 
-function main() -> int32 {
+fn main() -> int32 {
   var digits: uint8[32];
   var text: uint8[32];
 

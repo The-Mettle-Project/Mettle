@@ -1,7 +1,7 @@
 // Compile-only guard for the `dispatch` desugar + std/gpu (no GPU needed):
 // exercises kernel-handle parse, arg marshalling, and the gpu_launch call.
 import "std/gpu";
-function main() -> int32 {
+fn main() -> int32 {
   var k: int64 = 0;
   var da: int64 = 0;
   var db: int64 = 0;

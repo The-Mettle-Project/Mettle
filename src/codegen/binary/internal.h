@@ -371,6 +371,7 @@ int binary_emit_lea_reg_reg(BinaryCodeBuffer *buffer, BinaryGpRegister destinati
 int binary_emit_lea_reg_rip_placeholder(BinaryCodeBuffer *buffer, BinaryGpRegister destination, size_t *displacement_offset_out);
 int binary_emit_memory_access(BinaryCodeBuffer *buffer, unsigned char opcode, BinaryGpRegister reg, BinaryGpRegister base, int displacement);
 int binary_emit_memory_access_ex(BinaryCodeBuffer *buffer, int operand_size_prefix, int rex_w, unsigned char opcode1, int has_opcode2, unsigned char opcode2, BinaryGpRegister reg, BinaryGpRegister base, int displacement);
+int binary_emit_prefetcht0_mem(BinaryCodeBuffer *buffer, BinaryGpRegister base, int displacement);
 int binary_emit_memory_access_sib(BinaryCodeBuffer *buffer, int operand_size_prefix, int rex_w, unsigned char opcode1, int has_opcode2, unsigned char opcode2, BinaryGpRegister reg, BinaryGpRegister base, BinaryGpRegister index, int scale, int displacement);
 int binary_emit_mov_eax_eax(BinaryCodeBuffer *buffer);
 int binary_emit_mov_mem_reg(BinaryCodeBuffer *buffer, BinaryGpRegister base, int displacement, BinaryGpRegister source);
@@ -574,6 +575,10 @@ int code_generator_binary_emit_simd_fill_loop_bytewalk(BinaryCodeBuffer *b, long
  * ymm4=a, ymm5=b, ymm3=c broadcasts): fallback + MIR passthrough share it. */
 int code_generator_binary_emit_simd_affine_map_f32_loop(BinaryCodeBuffer *b, int b_is_one, int b_is_zero, int c_is_zero);
 int code_generator_binary_emit_simd_affine_map_f32_inline(BinaryCodeBuffer *b, unsigned a_bits, unsigned b_bits, unsigned c_bits, int b_is_one, int b_is_zero, int c_is_zero);
+/* Shared float64 affine-map loop + MIR inline passthrough (coeffs from raw
+ * 64-bit IEEE bits; assumes RCX=src, RDX=dst, R8=count marshalled). */
+int code_generator_binary_emit_simd_affine_map_f64_loop(BinaryCodeBuffer *b, int b_is_one, int b_is_zero, int c_is_zero);
+int code_generator_binary_emit_simd_affine_map_f64_inline(BinaryCodeBuffer *b, unsigned long long a_bits, unsigned long long b_bits, unsigned long long c_bits, int b_is_one, int b_is_zero, int c_is_zero, int a_runtime);
 int code_generator_binary_emit_prefix_sum_i32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_minmax_i32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_sum_f64( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
@@ -583,7 +588,10 @@ int code_generator_binary_emit_simd_dot_f32( CodeGenerator *generator, BinaryFun
 int code_generator_binary_emit_simd_affine_map_f64( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_affine_map_f32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_i2f_reduce_f64( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
-int code_generator_binary_emit_simd_vloop_f64( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
+int code_generator_binary_emit_simd_vloop_f64( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction, int operands_marshaled);
+/* Distinct base operands of a vloop in kGp order; shared by the kernel and the
+ * MIR passthrough lowering. names/srcs must hold VLOOP_KERNEL_MAX_BASES (4). */
+int code_generator_vloop_collect_dist(const IRInstruction *in, int is_reduce, const char *names[4], const IROperand *srcs[4], int *n_out);
 int code_generator_binary_emit_simd_find( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_outer_lane_f64( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_store(CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);

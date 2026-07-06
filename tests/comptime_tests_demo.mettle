@@ -1,0 +1,27 @@
+fn double_it(x: int64) -> int64 {
+    return x * 2;
+}
+
+@test fn test_pass() -> int64 {
+    assert_eq(double_it(21), 42);
+    assert(double_it(0) == 0);
+    return 0;
+}
+
+@test fn test_fail() -> int64 {
+    assert_eq(double_it(10), 21);
+    return 0;
+}
+
+extern fn malloc(size: int64) -> int64*;
+
+@test fn test_leak() -> int64 {
+    var p: int64* = (int64*)malloc(24);
+    p[0] = 5;
+    assert_eq(p[0], 5);
+    return 0;
+}
+
+fn main() -> int64 {
+    return double_it(21);
+}

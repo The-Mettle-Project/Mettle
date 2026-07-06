@@ -1,5 +1,5 @@
-extern function missing_symbol() -> int32 = "missing_symbol";
+extern fn missing_symbol() -> int32 = "missing_symbol";
 
-function mainCRTStartup() -> int32 {
+fn mainCRTStartup() -> int32 {
   return missing_symbol();
 }

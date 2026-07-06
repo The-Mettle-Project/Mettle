@@ -1,0 +1,82 @@
+// Mettle CRC32 benchmark (Suite 2)
+//
+// CRC-32 (bit-by-bit, IEEE 802.3 polynomial) over a 256 KB buffer.
+// 200 passes.
+//
+// Build: build.bat
+// Run: crc32.exe
+
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+fn crc32(buf: cstring, len: int64) -> uint32 {
+  var crc: uint32 = 4294967295;
+  var i: int64 = 0;
+  while (i < len) {
+    var b: uint32 = (uint32)(uint8)buf[i];
+    crc = crc ^ b;
+    var k: int32 = 0;
+    while (k < 8) {
+      var mask: uint32 = 0 - (crc & 1);
+      crc = (crc >> 1) ^ (3988292384 & mask);
+      k = k + 1;
+    }
+    i = i + 1;
+  }
+  return crc ^ 4294967295;
+}
+
+fn main() -> int32 {
+  var buf_size: int64 = 262144;
+  var template: string = "a b c d e f g h ";
+  var template_len: int64 = 16;
+
+  var buf: cstring = malloc(buf_size);
+  if (buf == 0) {
+    println("malloc failed");
+    return 1;
+  }
+
+  var pos: int64 = 0;
+  while (pos < buf_size) {
+    var chunk: int64 = template_len;
+    if (pos + chunk > buf_size) {
+      chunk = buf_size - pos;
+    }
+    memcpy(buf + pos, cstr(template), chunk);
+    pos = pos + chunk;
+  }
+
+  println("CRC32: 256 KB buffer");
+
+  var check: uint32 = crc32(buf, buf_size);
+  print("CRC = ");
+  println_int((int64)check);
+
+  var passes: int32 = 200;
+  println("Benchmark: 200 passes (crc32)");
+
+  var t0: uint64 = bench_time_us();
+  var bench_sum: int64 = 0;
+  var p: int32 = 0;
+  while (p < passes) {
+    bench_sum = bench_sum + (int64)crc32(buf, buf_size);
+    p = p + 1;
+  }
+  var elapsed_us: uint64 = bench_time_us() - t0;
+
+  print("Bench sum = ");
+  println_int(bench_sum);
+  print("Time: ");
+  print_int(elapsed_us);
+  println(" us");
+
+  var per_pass: uint64 = elapsed_us / passes;
+  print("Per pass: ~");
+  print_int(per_pass);
+  println(" us");
+
+  free(buf);
+  return 0;
+}

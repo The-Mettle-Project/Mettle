@@ -1,0 +1,74 @@
+// Thin-to-closure adaptation: a plain function (`&func`) or a non-capturing
+// lambda can be passed anywhere an `Fn(...)->R` closure is expected - as a call
+// argument to a higher-order function, a variable declaration, or a return
+// value. The compiler wraps the thin value in a generated adapter so it
+// dispatches through the same closure calling convention as a real closure.
+import "std/io";
+
+fn apply_twice(f: Fn(int32) -> int32, v: int32) -> int32 {
+  return f(f(v));
+}
+
+fn plus_one(x: int32) -> int32 { return x + 1; }
+fn double_it(x: int32) -> int32 { return x * 2; }
+fn get_answer() -> int32 { return 42; }
+
+var sink: int32 = 0;
+fn store_seven() -> void { sink = 7; }
+
+fn get_doubler() -> Fn(int32) -> int32 {
+  return &double_it;   // return-statement adaptation
+}
+
+fn use1(f: Fn(int32) -> int32, v: int32) -> int32 { return f(v); }
+fn use0(f: Fn() -> int32) -> int32 { return f(); }
+fn use_void(f: Fn() -> void) -> void { f(); }
+
+fn main() -> int32 {
+  // Plain function and non-capturing lambda as call arguments.
+  if (apply_twice(&plus_one, 5) != 7) {
+    return 1;
+  }
+  if (apply_twice(fn(x: int32) -> int32 { return x * 2; }, 3) != 12) {
+    return 2;
+  }
+
+  // Var-decl adaptation.
+  var f: Fn(int32) -> int32 = &double_it;
+  if (f(21) != 42) {
+    return 3;
+  }
+
+  // Return-statement adaptation.
+  var g: Fn(int32) -> int32 = get_doubler();
+  if (g(10) != 20) {
+    return 4;
+  }
+
+  // A real capturing closure still works alongside adaptation.
+  var n: int32 = 100;
+  var h: Fn(int32) -> int32 = fn(x: int32) -> int32 { return x + n; };
+  if (h(1) != 101) {
+    return 5;
+  }
+
+  // Zero-parameter and void-returning signatures.
+  if (use0(&get_answer) != 42) {
+    return 6;
+  }
+  use_void(&store_seven);
+  if (sink != 7) {
+    return 7;
+  }
+
+  // Two distinct plain functions adapted at the same-signature call site (the
+  // adapter is deduplicated by signature; each call must still invoke the
+  // right function).
+  if (use1(&plus_one, 10) != 11) {
+    return 8;
+  }
+  if (use1(&double_it, 10) != 20) {
+    return 9;
+  }
+  return 0;
+}

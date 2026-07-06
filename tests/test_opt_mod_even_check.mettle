@@ -1,11 +1,11 @@
-function is_even(n: int32) -> int32 {
+fn is_even(n: int32) -> int32 {
   if (n % 2 == 0) {
     return 1;
   }
   return 0;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var a: int32 = is_even(6);
   var b: int32 = is_even(7);
   return a - b;

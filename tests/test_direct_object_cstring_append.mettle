@@ -1,6 +1,6 @@
 import "std/io";
 
-function append(dst: cstring, dst_cap: int32, pos: int32, src: cstring) -> int32 {
+fn append(dst: cstring, dst_cap: int32, pos: int32, src: cstring) -> int32 {
   if (dst == 0 || src == 0) {
     return pos;
   }
@@ -18,7 +18,7 @@ function append(dst: cstring, dst_cap: int32, pos: int32, src: cstring) -> int32
   return j;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var buf: uint8[128];
   var out: cstring = (cstring)((int64)(&(buf[0])));
   var p: int32 = append(out, 128, 0, cstr("Project: "));

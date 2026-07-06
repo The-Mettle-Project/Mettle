@@ -1,7 +1,4 @@
-function main() -> int32 {
-  var a: int32 = 7;
-  var b: int32 = 9;
-
+@noinline fn compute(a: int32, b: int32) -> int32 {
   var x: int32 = a * 8;
   var y: int32 = 8 * a;
 
@@ -13,4 +10,8 @@ function main() -> int32 {
   }
 
   return x + y;
+}
+
+fn main() -> int32 {
+  return compute(7, 9);
 }

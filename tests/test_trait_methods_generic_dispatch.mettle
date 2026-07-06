@@ -1,17 +1,17 @@
 trait Incrementable {
-    function next_value(self: Self) -> Self;
+    fn next_value(self: Self) -> Self;
 }
 
 impl Incrementable for int32 {
-    function next_value(self: Self) -> Self {
+    fn next_value(self: Self) -> Self {
         return self + 1;
     }
 }
 
-function bump<T: Incrementable>(value: T) -> T {
+fn bump<T: Incrementable>(value: T) -> T {
     return value.next_value();
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     return bump<int32>(41);
 }

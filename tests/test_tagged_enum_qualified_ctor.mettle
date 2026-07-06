@@ -8,7 +8,7 @@ enum DbExecResult {
     Err(int32)
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     var opened: DbOpenResult = DbOpenResult.Ok(1);
     var executed: DbExecResult = DbExecResult.Ok(2);
 

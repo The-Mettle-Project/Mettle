@@ -4,57 +4,57 @@
 // Requires linking with kernel32 (already done by the web demo build).
 
 // Wait constants
-export function INFINITE() -> uint32 { return 0xFFFFFFFF; }
-export function WAIT_OBJECT_0() -> uint32 { return 0; }
-export function WAIT_TIMEOUT() -> uint32 { return 258; }
-export function WAIT_FAILED() -> uint32 { return 0xFFFFFFFF; }
+export fn INFINITE() -> uint32 { return 0xFFFFFFFF; }
+export fn WAIT_OBJECT_0() -> uint32 { return 0; }
+export fn WAIT_TIMEOUT() -> uint32 { return 258; }
+export fn WAIT_FAILED() -> uint32 { return 0xFFFFFFFF; }
 
 // Thread creation and synchronization
 // lpStartAddress: Win32 thread proc fn(LPVOID) -> DWORD
-export extern function CreateThread(lpThreadAttributes: cstring, dwStackSize: uint64, lpStartAddress: fn(cstring) -> uint32, lpParameter: cstring, dwCreationFlags: uint32, lpThreadId: uint32*) -> int64 = "CreateThread";
-export extern function CloseHandle(hObject: int64) -> int32 = "CloseHandle";
-export extern function WaitForSingleObject(hHandle: int64, dwMilliseconds: uint32) -> uint32 = "WaitForSingleObject";
-export extern function GetCurrentThreadId() -> uint32 = "GetCurrentThreadId";
-export extern function Sleep(dwMilliseconds: uint32) = "Sleep";
-export extern function CreateMutexA(lpMutexAttributes: cstring, bInitialOwner: int32, lpName: cstring) -> int64 = "CreateMutexA";
-export extern function ReleaseMutex(hMutex: int64) -> int32 = "ReleaseMutex";
+export extern fn CreateThread(lpThreadAttributes: cstring, dwStackSize: uint64, lpStartAddress: fn(cstring) -> uint32, lpParameter: cstring, dwCreationFlags: uint32, lpThreadId: uint32*) -> int64 = "CreateThread";
+export extern fn CloseHandle(hObject: int64) -> int32 = "CloseHandle";
+export extern fn WaitForSingleObject(hHandle: int64, dwMilliseconds: uint32) -> uint32 = "WaitForSingleObject";
+export extern fn GetCurrentThreadId() -> uint32 = "GetCurrentThreadId";
+export extern fn Sleep(dwMilliseconds: uint32) = "Sleep";
+export extern fn CreateMutexA(lpMutexAttributes: cstring, bInitialOwner: int32, lpName: cstring) -> int64 = "CreateMutexA";
+export extern fn ReleaseMutex(hMutex: int64) -> int32 = "ReleaseMutex";
 
 // Interlocked atomics
-export extern function InterlockedCompareExchange(target: int32*, exchange: int32, comparand: int32) -> int32 = "mettle_atomic_compare_exchange_i32";
-export extern function InterlockedExchange(target: int32*, value: int32) -> int32 = "mettle_atomic_exchange_i32";
-export extern function InterlockedIncrement(target: int32*) -> int32 = "mettle_atomic_inc_i32";
-export extern function InterlockedDecrement(target: int32*) -> int32 = "mettle_atomic_dec_i32";
+export extern fn InterlockedCompareExchange(target: int32*, exchange: int32, comparand: int32) -> int32 = "mettle_atomic_compare_exchange_i32";
+export extern fn InterlockedExchange(target: int32*, value: int32) -> int32 = "mettle_atomic_exchange_i32";
+export extern fn InterlockedIncrement(target: int32*) -> int32 = "mettle_atomic_inc_i32";
+export extern fn InterlockedDecrement(target: int32*) -> int32 = "mettle_atomic_dec_i32";
 
-export function thread_close(handle: int64) -> int32 {
+export fn thread_close(handle: int64) -> int32 {
   return CloseHandle(handle);
 }
 
-export function thread_join(handle: int64, timeout_ms: uint32) -> uint32 {
+export fn thread_join(handle: int64, timeout_ms: uint32) -> uint32 {
   return WaitForSingleObject(handle, timeout_ms);
 }
 
-export function thread_join_infinite(handle: int64) -> uint32 {
+export fn thread_join_infinite(handle: int64) -> uint32 {
   return WaitForSingleObject(handle, INFINITE());
 }
 
-export function thread_detach(handle: int64) -> int32 {
+export fn thread_detach(handle: int64) -> int32 {
   return CloseHandle(handle);
 }
 
-export function thread_sleep_ms(milliseconds: uint32) {
+export fn thread_sleep_ms(milliseconds: uint32) {
   Sleep(milliseconds);
 }
 
 // Mutex wrappers
-export function mutex_create() -> int64 {
+export fn mutex_create() -> int64 {
   return CreateMutexA(0, 0, 0);
 }
 
-export function mutex_create_owned() -> int64 {
+export fn mutex_create_owned() -> int64 {
   return CreateMutexA(0, 1, 0);
 }
 
-export function mutex_lock(mutex: int64, timeout_ms: uint32) -> int32 {
+export fn mutex_lock(mutex: int64, timeout_ms: uint32) -> int32 {
   var result: uint32 = WaitForSingleObject(mutex, timeout_ms);
   if (result == WAIT_OBJECT_0()) {
     return 1;
@@ -62,51 +62,51 @@ export function mutex_lock(mutex: int64, timeout_ms: uint32) -> int32 {
   return 0;
 }
 
-export function mutex_lock_infinite(mutex: int64) -> int32 {
+export fn mutex_lock_infinite(mutex: int64) -> int32 {
   return mutex_lock(mutex, INFINITE());
 }
 
-export function mutex_unlock(mutex: int64) -> int32 {
+export fn mutex_unlock(mutex: int64) -> int32 {
   return ReleaseMutex(mutex);
 }
 
-export function mutex_close(mutex: int64) -> int32 {
+export fn mutex_close(mutex: int64) -> int32 {
   return CloseHandle(mutex);
 }
 
 // Atomic wrappers
-export function atomic_compare_exchange_i32(target: int32*, exchange: int32, comparand: int32) -> int32 {
+export fn atomic_compare_exchange_i32(target: int32*, exchange: int32, comparand: int32) -> int32 {
   return InterlockedCompareExchange(target, exchange, comparand);
 }
 
-export function atomic_exchange_i32(target: int32*, value: int32) -> int32 {
+export fn atomic_exchange_i32(target: int32*, value: int32) -> int32 {
   return InterlockedExchange(target, value);
 }
 
-export function atomic_inc_i32(target: int32*) -> int32 {
+export fn atomic_inc_i32(target: int32*) -> int32 {
   return InterlockedIncrement(target);
 }
 
-export function atomic_dec_i32(target: int32*) -> int32 {
+export fn atomic_dec_i32(target: int32*) -> int32 {
   return InterlockedDecrement(target);
 }
 
 // Spin lock helpers for lightweight synchronization around short critical sections.
 // lock_var must be a shared int32 initialized to 0.
-export function spin_try_lock(lock_var: int32*) -> int32 {
+export fn spin_try_lock(lock_var: int32*) -> int32 {
   if (InterlockedCompareExchange(lock_var, 1, 0) == 0) {
     return 1;
   }
   return 0;
 }
 
-export function spin_lock(lock_var: int32*) {
+export fn spin_lock(lock_var: int32*) {
   while (spin_try_lock(lock_var) == 0) {
     // Yield to avoid burning CPU while contended.
     Sleep(0);
   }
 }
 
-export function spin_unlock(lock_var: int32*) {
+export fn spin_unlock(lock_var: int32*) {
   InterlockedExchange(lock_var, 0);
 }

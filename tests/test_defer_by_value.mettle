@@ -5,12 +5,12 @@
 
 var trace: int32 = 0;
 
-function note(v: int32) -> int32 {
+fn note(v: int32) -> int32 {
   trace = trace * 10 + v;
   return 0;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var i: int32 = 0;
   while (i < 3) {
     defer note(i);

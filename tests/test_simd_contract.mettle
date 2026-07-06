@@ -5,7 +5,7 @@
 import "std/io";
 import "std/mem";
 
-function qdot(a: int8*, b: int8*, n: int64) -> int32 {
+fn qdot(a: int8*, b: int8*, n: int64) -> int32 {
   var sum: int32 = 0;
   @simd! for i: int64 in 0..n {
     sum = sum + (int32)a[i] * (int32)b[i];
@@ -13,7 +13,7 @@ function qdot(a: int8*, b: int8*, n: int64) -> int32 {
   return sum;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var n: int64 = 64;
   var a: int8* = (int8*)malloc(n);
   var b: int8* = (int8*)malloc(n);

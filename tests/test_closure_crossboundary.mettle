@@ -1,0 +1,42 @@
+// Cross-boundary closures via the `Fn(...)->R` closure type: closures can be
+// returned from functions and passed to higher-order functions, and the value
+// an expression produces can be called directly.
+import "std/io";
+
+// Returned across a function boundary (a closure factory).
+fn make_adder(n: int32) -> Fn(int32) -> int32 {
+  return fn(x: int32) -> int32 { return x + n; };
+}
+
+// Passed into a higher-order function and called through the parameter.
+fn apply_twice(f: Fn(int32) -> int32, v: int32) -> int32 {
+  return f(f(v));
+}
+
+fn g(x: int32) -> int32 { return x + 1; }
+fn pick() -> fn(int32) -> int32 { return &g; }
+
+fn main() -> int32 {
+  var add: Fn(int32) -> int32 = make_adder(10);
+  if (add(5) != 15) {
+    return 1;
+  }
+  var add2: Fn(int32) -> int32 = make_adder(100);
+  if (add2(5) != 105 || add(5) != 15) {   // independent environments
+    return 2;
+  }
+
+  var k: int32 = 3;
+  var addk: Fn(int32) -> int32 = fn(x: int32) -> int32 { return x + k; };
+  if (apply_twice(addk, 10) != 16) {       // ((10+3)+3)
+    return 3;
+  }
+
+  if (make_adder(3)(5) != 8) {             // call an expression result (closure)
+    return 4;
+  }
+  if (pick()(5) != 6) {                     // call an expression result (thin)
+    return 5;
+  }
+  return 0;
+}

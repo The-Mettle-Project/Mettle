@@ -7,7 +7,7 @@
 # ~/.mettle, and adds the compiler to your PATH. No root required.
 #
 # Environment overrides:
-#   METTLE_VERSION      install a specific tag (e.g. v0.12.0) instead of latest
+#   METTLE_VERSION      install a specific tag (e.g. v0.13.0) instead of latest
 #   METTLE_INSTALL_DIR  install location (default: ~/.mettle)
 #   METTLE_NO_MODIFY_PATH=1  install but don't touch shell rc files
 #
@@ -216,7 +216,7 @@ else
 fi
 cat <<EOF
     ${BOLD}mettle --version${RESET}
-    ${BOLD}echo 'function main() -> int32 { return 0; }' > hello.mettle${RESET}
+    ${BOLD}echo 'fn main() -> int32 { return 0; }' > hello.mettle${RESET}
     ${BOLD}mettle --build hello.mettle -o hello && ./hello${RESET}
 
 Docs: ${BLUE}https://github.com/$REPO${RESET}

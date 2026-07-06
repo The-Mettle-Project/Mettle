@@ -1,11 +1,11 @@
 // ABI: mixed int and float — ints in RCX,RDX,R8,R9; floats in XMM0-XMM3
-function mixed(i: int32, f: float64, j: int32) -> float64 {
+fn mixed(i: int32, f: float64, j: int32) -> float64 {
   var x: float64 = f;
   var y: int32 = i + j;
   return x + y;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var r: float64 = mixed(10, 1.5, 20);
   if (r >= 31.4 && r <= 31.6) {
     return 1;

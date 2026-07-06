@@ -9,7 +9,7 @@
 import "std/io";
 
 // sum_{i=1..n} i  = n(n+1)/2.  n=1000 -> 500500. Trip count 1000 (mult of 4).
-function sum_linear(n: int64) -> int64 {
+fn sum_linear(n: int64) -> int64 {
   var s: int64 = 0;
   var i: int64 = 1;
   while (i <= n) {
@@ -21,7 +21,7 @@ function sum_linear(n: int64) -> int64 {
 
 // sum_{i=1..n} (3*i + 7) = 3*n(n+1)/2 + 7n.  n=1003 (NOT a multiple of 4, so
 // the scalar remainder tail must run). n=1003 -> 3*503506 + 7021 = 1517539.
-function sum_affine(n: int64) -> int64 {
+fn sum_affine(n: int64) -> int64 {
   var s: int64 = 0;
   var i: int64 = 1;
   while (i <= n) {
@@ -33,7 +33,7 @@ function sum_affine(n: int64) -> int64 {
 
 // sum_{i=0..n-1} of a constant (exclusive bound, '<'): 1 added n times = n.
 // n=777 (not a multiple of 4).
-function count_to(n: int64) -> int64 {
+fn count_to(n: int64) -> int64 {
   var s: int64 = 0;
   var i: int64 = 0;
   while (i < n) {
@@ -43,7 +43,7 @@ function count_to(n: int64) -> int64 {
   return s;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   print(cstr("lin="));
   println_int(sum_linear(1000));      // 500500
   print(cstr("aff="));

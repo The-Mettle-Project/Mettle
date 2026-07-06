@@ -1,0 +1,11 @@
+import "std/io";
+// Harmonic sum 1 + 1/2 + ... + 1/10, scaled, plus an average via a float call.
+fn avg(a: float64, b: float64) -> float64 { return (a + b) / 2.0; }
+fn main() -> int32 {
+  println_int((int64)(avg(3.0, 8.0) * 100.0));
+  var sum: float64 = 0.0;
+  var i: int64 = 1;
+  while (i <= 10) { sum = sum + 1.0 / (float64)i; i = i + 1; }
+  println_int((int64)(sum * 1000.0));
+  return 0;
+}

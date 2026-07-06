@@ -1,0 +1,9 @@
+import "std/io";
+fn main() -> int32 {
+  var i: int64 = 1;
+  while (i <= 5) {
+    println_int(i * i);
+    i = i + 1;
+  }
+  return 0;
+}

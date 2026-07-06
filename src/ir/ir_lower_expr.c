@@ -139,6 +139,70 @@ int ir_lower_call_expression(IRLoweringContext *context,
     }
   }
 
+  if (call->callee_closure_env) {
+    /* Closure call: the variable holds an 8-byte pointer to a heap record whose
+     * field 0 is the code pointer. Load the code pointer, then call it passing
+     * the record pointer (the environment) as a hidden leading argument that the
+     * lifted function receives as its first parameter. */
+    IROperand code = ir_operand_none();
+    if (!ir_make_temp_operand(context, &code)) {
+      for (size_t i = 0; i < call->argument_count; i++)
+        ir_operand_destroy(&arguments[i]);
+      free(arguments);
+      ir_operand_destroy(&destination);
+      return 0;
+    }
+    IRInstruction load = {0};
+    load.op = IR_OP_LOAD;
+    load.location = expression->location;
+    load.dest = code;
+    load.lhs = ir_operand_symbol(call->function_name);
+    load.rhs = ir_operand_int(8);
+    int load_ok = ir_emit(context, function, &load);
+    ir_operand_destroy(&load.lhs);
+    if (!load_ok) {
+      for (size_t i = 0; i < call->argument_count; i++)
+        ir_operand_destroy(&arguments[i]);
+      free(arguments);
+      ir_operand_destroy(&code);
+      ir_operand_destroy(&destination);
+      return 0;
+    }
+
+    IROperand *cargs = calloc(call->argument_count + 1, sizeof(IROperand));
+    if (!cargs) {
+      for (size_t i = 0; i < call->argument_count; i++)
+        ir_operand_destroy(&arguments[i]);
+      free(arguments);
+      ir_operand_destroy(&code);
+      ir_operand_destroy(&destination);
+      return 0;
+    }
+    cargs[0] = ir_operand_symbol(call->function_name);
+    for (size_t i = 0; i < call->argument_count; i++)
+      cargs[i + 1] = arguments[i];
+    free(arguments);
+
+    IRInstruction cinstr = {0};
+    cinstr.op = IR_OP_CALL_INDIRECT;
+    cinstr.location = expression->location;
+    cinstr.dest = destination;
+    cinstr.lhs = code;
+    cinstr.arguments = cargs;
+    cinstr.argument_count = call->argument_count + 1;
+    int ok = ir_emit(context, function, &cinstr);
+    for (size_t i = 0; i < call->argument_count + 1; i++)
+      ir_operand_destroy(&cargs[i]);
+    free(cargs);
+    ir_operand_destroy(&code);
+    if (!ok) {
+      ir_operand_destroy(&destination);
+      return 0;
+    }
+    *out_value = destination;
+    return 1;
+  }
+
   IRInstruction instruction = {0};
   instruction.location = expression->location;
   instruction.dest = destination;
@@ -721,6 +785,88 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
     return 1;
   }
 
+  case AST_CLOSURE_ADAPT_EXPRESSION: {
+    /* A thin value (`&func` or a non-capturing lambda) wrapped by the
+     * closure-adapt pass to satisfy an `Fn(...)` boundary: lower the thin value,
+     * then call the generated adapter constructor with it as the sole argument
+     * to produce a real closure value. */
+    ClosureAdapt *adapt = (ClosureAdapt *)expression->data;
+    if (!adapt || !adapt->ctor_name || !adapt->inner) {
+      ir_set_error(context, "Internal: closure adapter was not synthesized");
+      return 0;
+    }
+    IROperand thin_val = ir_operand_none();
+    if (!ir_lower_expression(context, function, adapt->inner, &thin_val)) {
+      return 0;
+    }
+    IROperand dest = ir_operand_none();
+    if (!ir_make_temp_operand(context, &dest)) {
+      ir_operand_destroy(&thin_val);
+      return 0;
+    }
+    IROperand args[1];
+    args[0] = thin_val;
+    IRInstruction call = {0};
+    call.op = IR_OP_CALL;
+    call.location = expression->location;
+    call.dest = dest;
+    call.text = adapt->ctor_name;
+    call.arguments = args;
+    call.argument_count = 1;
+    int ok = ir_emit(context, function, &call);
+    ir_operand_destroy(&thin_val);
+    if (!ok) {
+      ir_operand_destroy(&dest);
+      return 0;
+    }
+    *out_value = dest;
+    return 1;
+  }
+
+  case AST_LAMBDA_EXPRESSION: {
+    FunctionDeclaration *lam = (FunctionDeclaration *)expression->data;
+    if (!lam || !lam->name) {
+      ir_set_error(context, "Internal: lambda was not converted");
+      return 0;
+    }
+    if (lam->captured_count > 0) {
+      /* Capturing closure value: call the synthesized constructor with the
+       * current value of each captured variable; it allocates and populates the
+       * environment record and returns the 8-byte closure pointer. */
+      IROperand dest = ir_operand_none();
+      if (!ir_make_temp_operand(context, &dest)) {
+        return 0;
+      }
+      IROperand *args = calloc(lam->captured_count, sizeof(IROperand));
+      if (!args) {
+        ir_operand_destroy(&dest);
+        return 0;
+      }
+      for (size_t i = 0; i < lam->captured_count; i++)
+        args[i] = ir_operand_symbol(lam->captured_names[i]);
+      IRInstruction call = {0};
+      call.op = IR_OP_CALL;
+      call.location = expression->location;
+      call.dest = dest;
+      call.text = lam->name;
+      call.arguments = args;
+      call.argument_count = lam->captured_count;
+      int ok = ir_emit(context, function, &call);
+      for (size_t i = 0; i < lam->captured_count; i++)
+        ir_operand_destroy(&args[i]);
+      free(args);
+      if (!ok) {
+        ir_operand_destroy(&dest);
+        return 0;
+      }
+      *out_value = dest;
+      return 1;
+    }
+    /* A non-capturing lambda is the address of its lifted top-level function. */
+    return ir_emit_address_of_symbol(context, function, lam->name,
+                                     expression->location, out_value);
+  }
+
   case AST_UNARY_EXPRESSION: {
     UnaryExpression *unary = (UnaryExpression *)expression->data;
     if (!unary || !unary->operator || !unary->operand) {
@@ -861,6 +1007,59 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
     if (!ir_make_temp_operand(context, &destination)) {
       ir_operand_destroy(&address);
       return 0;
+    }
+
+    /* Aggregate-typed member/index read by value (a struct or array, e.g.
+     * `cfg.rect` passed by value). The backend cannot LOAD more than a register
+     * word, and ir_type_storage_size() collapses the rest to 8 bytes -- which
+     * would copy only the first word and leave the remainder stack garbage.
+     * Instead copy the whole aggregate into a fresh named local via the
+     * wide-STORE memcpy path and yield that local as the value. */
+    if (value_type->name &&
+        (value_type->kind == TYPE_STRUCT || value_type->kind == TYPE_ARRAY) &&
+        value_type->size > 8 && value_type->size <= (size_t)INT_MAX) {
+      char *agg_name = ir_new_label_name(context, "agg_byval");
+      IROperand dest_addr = ir_operand_none();
+      IRInstruction store = {0};
+      int ok = 0;
+
+      ir_operand_destroy(&destination);
+      if (!agg_name) {
+        ir_operand_destroy(&address);
+        ir_set_error(context, "Out of memory while copying aggregate value");
+        return 0;
+      }
+      ok = ir_emit_local_declaration(context, function, agg_name,
+                                     value_type->name, expression->location) &&
+           ir_emit_address_of_symbol(context, function, agg_name,
+                                     expression->location, &dest_addr);
+      if (!ok) {
+        free(agg_name);
+        ir_operand_destroy(&dest_addr);
+        ir_operand_destroy(&address);
+        return 0;
+      }
+
+      store.op = IR_OP_STORE;
+      store.location = expression->location;
+      store.dest = dest_addr;
+      store.lhs = address;
+      store.rhs = ir_operand_int((long long)value_type->size);
+      ok = ir_emit(context, function, &store);
+      ir_operand_destroy(&dest_addr);
+      ir_operand_destroy(&address);
+      if (!ok) {
+        free(agg_name);
+        return 0;
+      }
+
+      *out_value = ir_operand_symbol(agg_name);
+      free(agg_name);
+      if (!out_value->name) {
+        ir_set_error(context, "Out of memory while copying aggregate value");
+        return 0;
+      }
+      return 1;
     }
 
     IRInstruction load = {0};
@@ -1062,6 +1261,70 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
           return 0;
         }
       }
+    }
+
+    if (func_type && func_type->kind == TYPE_FUNCTION_POINTER &&
+        func_type->closure_env) {
+      /* Closure value: func_ptr is the environment pointer. Load the code
+       * pointer from field 0 and pass the environment as a hidden leading
+       * argument. */
+      IROperand code = ir_operand_none();
+      if (!ir_make_temp_operand(context, &code)) {
+        for (size_t i = 0; i < fp_call->argument_count; i++)
+          ir_operand_destroy(&arguments[i]);
+        free(arguments);
+        ir_operand_destroy(&func_ptr);
+        ir_operand_destroy(&destination);
+        return 0;
+      }
+      IRInstruction load = {0};
+      load.op = IR_OP_LOAD;
+      load.location = expression->location;
+      load.dest = code;
+      load.lhs = func_ptr;
+      load.rhs = ir_operand_int(8);
+      int load_ok = ir_emit(context, function, &load);
+      if (!load_ok) {
+        for (size_t i = 0; i < fp_call->argument_count; i++)
+          ir_operand_destroy(&arguments[i]);
+        free(arguments);
+        ir_operand_destroy(&func_ptr);
+        ir_operand_destroy(&code);
+        ir_operand_destroy(&destination);
+        return 0;
+      }
+      IROperand *cargs = calloc(fp_call->argument_count + 1, sizeof(IROperand));
+      if (!cargs) {
+        for (size_t i = 0; i < fp_call->argument_count; i++)
+          ir_operand_destroy(&arguments[i]);
+        free(arguments);
+        ir_operand_destroy(&func_ptr);
+        ir_operand_destroy(&code);
+        ir_operand_destroy(&destination);
+        return 0;
+      }
+      cargs[0] = func_ptr;
+      for (size_t i = 0; i < fp_call->argument_count; i++)
+        cargs[i + 1] = arguments[i];
+      free(arguments);
+      IRInstruction cinstr = {0};
+      cinstr.op = IR_OP_CALL_INDIRECT;
+      cinstr.location = expression->location;
+      cinstr.dest = destination;
+      cinstr.lhs = code;
+      cinstr.arguments = cargs;
+      cinstr.argument_count = fp_call->argument_count + 1;
+      int ok = ir_emit(context, function, &cinstr);
+      for (size_t i = 0; i < fp_call->argument_count + 1; i++)
+        ir_operand_destroy(&cargs[i]);
+      free(cargs);
+      ir_operand_destroy(&code);
+      if (!ok) {
+        ir_operand_destroy(&destination);
+        return 0;
+      }
+      *out_value = destination;
+      return 1;
     }
 
     IRInstruction instruction = {0};

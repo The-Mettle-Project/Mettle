@@ -1,0 +1,5 @@
+import "std/io";
+fn main() -> int32 {
+  println(cstr("Hello, ARM!"));
+  return 0;
+}

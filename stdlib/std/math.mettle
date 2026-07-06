@@ -1,10 +1,10 @@
 // Mettle standard library: Math
 
 // C runtime externs
-export extern function abs(x: int32) -> int32 = "abs";
+export extern fn abs(x: int32) -> int32 = "abs";
 
 // Integer minimum
-export function min(a: int64, b: int64) -> int64 {
+export fn min(a: int64, b: int64) -> int64 {
   if (a < b) {
     return a;
   }
@@ -12,7 +12,7 @@ export function min(a: int64, b: int64) -> int64 {
 }
 
 // Integer maximum
-export function max(a: int64, b: int64) -> int64 {
+export fn max(a: int64, b: int64) -> int64 {
   if (a > b) {
     return a;
   }
@@ -20,7 +20,7 @@ export function max(a: int64, b: int64) -> int64 {
 }
 
 // Integer clamping
-export function clamp(value: int64, lo: int64, hi: int64) -> int64 {
+export fn clamp(value: int64, lo: int64, hi: int64) -> int64 {
   if (value < lo) {
     return lo;
   }

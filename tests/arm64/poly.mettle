@@ -1,0 +1,5 @@
+// f(9) = (81 + 27 + 2) % 100 -> 10. Compound expression + modulo + a call.
+fn f(x: int64) -> int64 {
+  return (x * x + 3 * x + 2) % 100;
+}
+fn main() -> int64 { return f(9); }

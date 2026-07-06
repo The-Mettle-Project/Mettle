@@ -58,7 +58,7 @@ var void_fn: fn() -> void;           // pointer to function taking nothing retur
 Use the address-of operator `&` to create a function pointer:
 
 ```mettle
-function add(a: int32, b: int32) -> int32 {
+fn add(a: int32, b: int32) -> int32 {
   return a + b;
 }
 
@@ -80,16 +80,109 @@ Function pointers are useful for callbacks, strategy patterns, and C interop:
 
 ```mettle
 // Callback pattern
-function apply(op: fn(int32, int32) -> int32, a: int32, b: int32) -> int32 {
+fn apply(op: fn(int32, int32) -> int32, a: int32, b: int32) -> int32 {
   return op(a, b);
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   return apply(&add, 5, 3);  // passes add as callback
 }
 ```
 
 **Type equality:** Two function pointer types are equal if they have the same parameter types and return type. `fn(int32) -> int32` is compatible with `fn(int32) -> int32` but not with `fn(int32, int32) -> int32`.
+
+### Anonymous Functions (Lambdas)
+
+`fn` may also be written in expression position to produce an anonymous function value, without naming it at the top level:
+
+```mettle
+var add: fn(int32, int32) -> int32 = fn(x: int32, y: int32) -> int32 {
+  return x + y;
+};
+var seven: int32 = add(3, 4);
+
+// Inline as a higher-order argument:
+var product: int32 = apply(fn(x: int32, y: int32) -> int32 { return x * y; }, 6, 7);
+```
+
+A non-capturing lambda has the same `fn(params) -> ret` type as a named function and is a plain function pointer, so it is usable anywhere a function pointer is (including C callbacks). A return type is required; the body is a normal block.
+
+### Closures
+
+A lambda that references a variable from an enclosing scope *captures* it, becoming a closure that carries its captured state:
+
+```mettle
+fn main() -> int32 {
+  var base: int32 = 10;
+  var add: Fn(int32) -> int32 = fn(x: int32) -> int32 { return x + base; };  // captures base
+  print_int(add(5));    // 15
+  return 0;
+}
+```
+
+Captures are **by value**: each captured variable's value is snapshotted when the closure is created, so changing the original afterwards does not change what the closure sees. A closure value is an 8-byte pointer to a heap-allocated environment holding the code pointer and the captured values. The closure's own copy is **mutable and persists across calls**, so a closure can carry state:
+
+```mettle
+fn counter(start: int32) -> Fn() -> int32 {
+  return fn() -> int32 { start = start + 1; return start; };
+}
+var next: Fn() -> int32 = counter(0);
+println_int(next());   // 1
+println_int(next());   // 2 - state persists in the closure's environment
+```
+
+Because a closure carries state, its type is distinct from a plain function pointer. A closure type is written with a capital **`Fn`**: `Fn(int32) -> int32`. A plain `fn(...)->R` stays a thin, C-compatible function pointer; `Fn(...)->R` is a stateful closure.
+
+Use `Fn(...)->R` to carry closures across function boundaries - returned from a factory, passed to a higher-order function, or stored in a struct field:
+
+```mettle
+fn make_adder(n: int32) -> Fn(int32) -> int32 {
+  return fn(x: int32) -> int32 { return x + n; };   // closure capturing n
+}
+
+fn apply_twice(f: Fn(int32) -> int32, v: int32) -> int32 {
+  return f(f(v));
+}
+
+fn main() -> int32 {
+  var add: Fn(int32) -> int32 = make_adder(10);
+  println_int(add(5));            // 15
+  println_int(apply_twice(add, 0)); // 20
+  println_int(make_adder(3)(5));  // 8 - the returned closure is called directly
+  return 0;
+}
+```
+
+A closure (or plain function pointer) stored in a struct field is called through the field, including via a pointer-to-struct receiver:
+
+```mettle
+struct Handler { on_event: Fn(int32) -> int32; }
+
+fn main() -> int32 {
+  var weight: int32 = 2;
+  var h: Handler;
+  h.on_event = fn(ev: int32) -> int32 { return ev * weight; };
+  println_int(h.on_event(21));   // 42
+  var hp: Handler* = &h;
+  println_int(hp.on_event(5));   // 10
+  return 0;
+}
+```
+
+A capturing closure and a thin `fn(...)->R` are not directly interchangeable (a thin pointer cannot carry an environment, and a closure call site reads a code pointer a thin value does not have) - but a plain function or non-capturing lambda can still be passed anywhere an `Fn(...)` is expected. The compiler transparently wraps it in a generated adapter so it dispatches through the closure calling convention:
+
+```mettle
+fn plus_one(x: int32) -> int32 { return x + 1; }
+
+fn main() -> int32 {
+  println_int(apply_twice(&plus_one, 5));   // 7 - a plain function, adapted
+  var f: Fn(int32) -> int32 = &plus_one;    // var-decl adaptation
+  println_int(f(10));                       // 11
+  return 0;
+}
+```
+
+Adaptation applies at the point a plain function or lambda literal is directly written into an `Fn(...)` boundary (a call argument, a `var` declaration, or a `return`). A thin value already sitting in a variable, or assigned into an `Fn(...)`-typed struct field, is not yet adapted; write `&func` (or the lambda literal) directly at the boundary. Like every binding in Mettle, a local holding a closure states its type explicitly - `var f: Fn(int32) -> int32 = ...`. See [known limitations](known-limitations.md).
 
 ## Array Types
 
@@ -189,7 +282,7 @@ enum Result<T> {
 
 ## Generic Type Parameters
 
-Functions and structs can be generic. Type parameters are declared in angle brackets: `function f<T>(...)` or `struct S<T> { ... }`. Instantiation uses the same syntax: `f<int32>(args)` or `var x: Pair<int32, float64>`.
+Functions and structs can be generic. Type parameters are declared in angle brackets: `fn f<T>(...)` or `struct S<T> { ... }`. Instantiation uses the same syntax: `f<int32>(args)` or `var x: Pair<int32, float64>`.
 
 ```mettle
 struct Pair<A, B> {
@@ -211,11 +304,11 @@ The compiler performs **monomorphization** before type checking: each unique ins
 
 ```mettle
 trait Incrementable {
-  function next_value(self: Self) -> Self;
+  fn next_value(self: Self) -> Self;
 }
 
 impl Incrementable for int32 {
-  function next_value(self: Self) -> Self {
+  fn next_value(self: Self) -> Self {
     return self + 1;
   }
 }

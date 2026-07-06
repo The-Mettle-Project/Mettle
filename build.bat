@@ -211,6 +211,8 @@ if %ERRORLEVEL% NEQ 0 exit /b 1
 echo Compiling error reporter...
 %CC% %CFLAGS% -c src\error\error_reporter.c -o obj\error\error_reporter.o
 if %ERRORLEVEL% NEQ 0 exit /b 1
+%CC% %CFLAGS% -c src\error\error_explain.c -o obj\error\error_explain.o
+if %ERRORLEVEL% NEQ 0 exit /b 1
 
 echo Compiling compiler diagnostics...
 %CC% %CFLAGS% -c src\compiler\compiler_context.c -o obj\compiler\compiler_context.o
@@ -223,7 +225,7 @@ echo Compiling main...
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
 echo Linking...
-%CC% obj\common.o obj\lexer\lexer.o obj\parser\ast.o obj\parser\parser.o obj\semantic\symbol_table.o obj\semantic\type_checker.o obj\semantic\type_checker_types.o obj\semantic\type_checker_errors.o obj\semantic\type_checker_safety.o obj\semantic\type_checker_init_tracker.o obj\semantic\type_checker_decl.o obj\semantic\type_checker_match.o obj\semantic\type_checker_stmt.o obj\semantic\type_checker_expr.o obj\semantic\type_checker_memory.o obj\semantic\register_allocator.o obj\semantic\import_resolver.o obj\semantic\monomorphize.o obj\ir\*.o obj\ir\optimizer\*.o obj\codegen\binary_emitter.o obj\codegen\code_generator.o obj\codegen\elf_emitter.o obj\codegen\program_entry.o obj\codegen\ptx_emitter.o obj\\codegen\\binary\\*.o obj\\linker\\*.o obj\debug\debug_info.o obj\error\error_reporter.o obj\compiler\compiler_context.o obj\compiler\compiler_crash.o obj\runtime\crash_handler.o obj\tracy_build.o obj\main.o -o bin\mettle.exe %LDFLAGS%
+%CC% obj\common.o obj\lexer\lexer.o obj\parser\ast.o obj\parser\parser.o obj\semantic\symbol_table.o obj\semantic\type_checker.o obj\semantic\type_checker_types.o obj\semantic\type_checker_errors.o obj\semantic\type_checker_safety.o obj\semantic\type_checker_init_tracker.o obj\semantic\type_checker_decl.o obj\semantic\type_checker_match.o obj\semantic\type_checker_stmt.o obj\semantic\type_checker_expr.o obj\semantic\type_checker_memory.o obj\semantic\register_allocator.o obj\semantic\import_resolver.o obj\semantic\monomorphize.o obj\ir\*.o obj\ir\optimizer\*.o obj\codegen\binary_emitter.o obj\codegen\code_generator.o obj\codegen\elf_emitter.o obj\codegen\program_entry.o obj\codegen\ptx_emitter.o obj\\codegen\\binary\\*.o obj\\linker\\*.o obj\debug\debug_info.o obj\error\error_reporter.o obj\error\error_explain.o obj\compiler\compiler_context.o obj\compiler\compiler_crash.o obj\runtime\crash_handler.o obj\tracy_build.o obj\main.o -o bin\mettle.exe %LDFLAGS%
 
 if %ERRORLEVEL% NEQ 0 (
     echo Build failed!
@@ -249,6 +251,16 @@ copy /Y obj\runtime\tracy_helpers.o bin\runtime\tracy_helpers.o >nul
 copy /Y obj\runtime\tracy_helpers.o bin\runtime\tracy_helpers.obj >nul
 
 if exist installer\mettle-build.bat copy /Y installer\mettle-build.bat bin\mettle-build.bat >nul
+
+echo Bundling ML optimizer model into bin\mlopt (used by --ml-opt)...
+if exist bin\mlopt rmdir /S /Q bin\mlopt
+mkdir bin\mlopt
+if exist tools\mlopt\gnn_genius.bin copy /Y tools\mlopt\gnn_genius.bin bin\mlopt\gnn_genius.bin >nul
+if exist tools\mlopt\bw_lib.txt copy /Y tools\mlopt\bw_lib.txt bin\mlopt\bw_lib.txt >nul
+if exist tools\mlopt\gf2_lib1.txt copy /Y tools\mlopt\gf2_lib1.txt bin\mlopt\gf2_lib1.txt >nul
+
+echo Rendering README.html for the installer docs shortcut...
+where python >nul 2>&1 && python installer\render_readme.py
 
 echo Build successful! Executable created at bin\mettle.exe
 if defined SKIP_TESTS (

@@ -1,4 +1,4 @@
-function bad(x: int32) -> int32;
-function bad(x: int64) -> int32 {
+fn bad(x: int32) -> int32;
+fn bad(x: int64) -> int32 {
   return 0;
 }

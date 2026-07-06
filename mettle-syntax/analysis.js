@@ -240,7 +240,7 @@ function scanModule(text, filePath) {
     return { params, returnType, sigEndLine: close.line };
   }
 
-  const fnRe = /^(\s*)((?:export\s+)?)((?:@\w+!?\s+)*)((?:extern\s+)?)(function|method|kernel)\s+([A-Za-z_][A-Za-z0-9_]*)/;
+  const fnRe = /^(\s*)((?:export\s+)?)((?:@\w+!?\s+)*)((?:extern\s+)?)(fn|method|kernel)\s+([A-Za-z_][A-Za-z0-9_]*)/;
   const typeRe = /^(\s*)((?:export\s+)?)(struct|enum|trait)\s+([A-Za-z_][A-Za-z0-9_]*)/;
   const varRe = /^(\s*)((?:export\s+)?)((?:extern\s+)?)var\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([^=;]+)/;
 
@@ -311,7 +311,7 @@ function scanModule(text, filePath) {
           }
           continue;
         }
-        const meth = bodyLine.match(/^\s*(?:export\s+)?(?:@\w+!?\s+)*(?:method|function)\s+([A-Za-z_][A-Za-z0-9_]*)/);
+        const meth = bodyLine.match(/^\s*(?:export\s+)?(?:@\w+!?\s+)*(?:method|fn)\s+([A-Za-z_][A-Za-z0-9_]*)/);
         if (meth) {
           const mcol = bodyLine.indexOf(meth[1], bodyLine.indexOf(meth[0]));
           const callable = parseCallable(bl, mcol + meth[1].length);

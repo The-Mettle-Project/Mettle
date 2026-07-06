@@ -1,5 +1,5 @@
 // sum_array pattern should vectorize under --release (COFF backend).
-function sum_array(data: int32*, len: int32) -> int64 {
+fn sum_array(data: int32*, len: int32) -> int64 {
   var sum: int64 = 0;
   var i: int32 = 0;
   while (i < len) {
@@ -9,7 +9,7 @@ function sum_array(data: int32*, len: int32) -> int64 {
   return sum;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var buf: int32[8];
   var i: int32 = 0;
   while (i < 8) {

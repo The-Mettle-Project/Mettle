@@ -5,7 +5,7 @@ import "std/io";
 import "std/mem";
 
 // M0111: `p` points into `buf`, used after `realloc` may have moved it.
-function use_after_realloc() -> int32 {
+fn use_after_realloc() -> int32 {
     var buf: cstring = malloc(16);
     buf[2] = 5;
     var p: cstring = &buf[2];
@@ -16,7 +16,7 @@ function use_after_realloc() -> int32 {
 }
 
 // Clean control: `r` is re-derived from `nb` after the realloc, then used.
-function clean_realloc() -> int32 {
+fn clean_realloc() -> int32 {
     var nb: cstring = malloc(16);
     nb[2] = 5;
     var r: cstring = &nb[2];
@@ -27,6 +27,6 @@ function clean_realloc() -> int32 {
     return v;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
     return use_after_realloc() + clean_realloc();
 }

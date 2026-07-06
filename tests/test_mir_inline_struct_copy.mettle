@@ -9,7 +9,7 @@ struct Big {
   d: uint32;
 }
 
-@inline function make_big(x: int64) -> Big {
+@inline fn make_big(x: int64) -> Big {
   var s: Big;
   s.a = x;
   s.b = (uint8)((x + 4) & 255);
@@ -18,11 +18,11 @@ struct Big {
   return s;
 }
 
-function fold_big(s: Big) -> int64 {
+fn fold_big(s: Big) -> int64 {
   return (s.a + (int64)s.b + (int64)s.c + (int64)s.d) & 1099511627775;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var acc: int64 = 1;
   var sv: Big = make_big(6510);
   acc = (acc + fold_big(sv)) & 1099511627775;

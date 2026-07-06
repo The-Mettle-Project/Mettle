@@ -1,7 +1,7 @@
 import "std/io";
 import "std/mem";
 
-function popcount_byte(b: uint8) -> int32 {
+fn popcount_byte(b: uint8) -> int32 {
   var count: int32 = 0;
   var v: uint8 = b;
   while (v != 0) {
@@ -11,7 +11,7 @@ function popcount_byte(b: uint8) -> int32 {
   return count;
 }
 
-function popcount_buffer(buf: cstring, len: int64) -> int64 {
+fn popcount_buffer(buf: cstring, len: int64) -> int64 {
   var total: int64 = 0;
   var i: int64 = 0;
   while (i < len) {
@@ -21,7 +21,7 @@ function popcount_buffer(buf: cstring, len: int64) -> int64 {
   return total;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var data: cstring = cstr("0123456789abcdef");
   return (int32)popcount_buffer(data, 16);
 }

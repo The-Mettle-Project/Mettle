@@ -1,0 +1,5 @@
+fn main() -> int64 {
+    var x: int64 = "bad";
+    var y: int64 = x + 1;
+    return y;
+}

@@ -1,0 +1,6 @@
+// 1 << 5 -> 32. Shift, compound assignment.
+fn main() -> int64 {
+  var x: int64 = 1;
+  x = x << 5;
+  return x;
+}

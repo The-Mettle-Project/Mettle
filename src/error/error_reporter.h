@@ -51,6 +51,9 @@ typedef struct {
   char *message;
   char *suggestion;
   char *code_snippet;
+  /* Short text rendered inline after the caret underline, e.g.
+     "expected 'int64', found 'string'". Optional. */
+  char *span_label;
 } ErrorReport;
 
 typedef struct {
@@ -70,6 +73,9 @@ typedef struct {
   size_t source_capacity;
   const char *current_filename;
   const char *current_source_code;
+  /* Set when the most recent add was suppressed as a duplicate/cascade, so
+     follow-up label/note attachments know to skip themselves too. */
+  int last_add_suppressed;
 } ErrorReporter;
 
 ErrorReporter *error_reporter_create(const char *filename,
@@ -105,6 +111,31 @@ void error_reporter_add_warning_with_suggestion(ErrorReporter *reporter,
                                                 SourceLocation location,
                                                 const char *message,
                                                 const char *suggestion);
+void error_reporter_add_warning_span_suggestion(ErrorReporter *reporter,
+                                                ErrorType type, SourceSpan span,
+                                                const char *message,
+                                                const char *suggestion);
+
+/* Replace the message of the most recently added error with a more precise
+   contextual one (e.g. "Expected '(', found identifier" -> "Expected '('
+   after 'if'"). No-op if the last add was suppressed as a cascade. */
+void error_reporter_refine_last(ErrorReporter *reporter, const char *message);
+/* Move a span's caret onto the first whole-word occurrence of `token` on its
+   line (searching from the span's column), so diagnostics underline the name
+   rather than a leading keyword. Returns the span unchanged if not found. */
+SourceSpan error_reporter_span_snap_to_token(ErrorReporter *reporter,
+                                             SourceSpan span,
+                                             const char *token);
+/* Attach an inline caret label to the most recently added diagnostic. */
+void error_reporter_set_last_label(ErrorReporter *reporter, const char *label);
+/* Attach a note (with its own source snippet) to the most recently added
+   diagnostic, e.g. "function 'add' defined here". */
+void error_reporter_add_note_of_span(ErrorReporter *reporter, SourceSpan span,
+                                     const char *message);
+/* Switch diagnostic printing to newline-delimited JSON (for tooling). */
+void error_reporter_set_format_json(int enabled);
+int error_reporter_format_json(void);
+int error_reporter_get_warning_count(ErrorReporter *reporter);
 
 void error_reporter_print_errors(ErrorReporter *reporter);
 void error_reporter_print_error(ErrorReporter *reporter,

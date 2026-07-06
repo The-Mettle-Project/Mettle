@@ -2,11 +2,11 @@ struct Node {
   value: int32;
 }
 
-function add3(a: int32, b: int32, c: int32) -> int32 {
+fn add3(a: int32, b: int32, c: int32) -> int32 {
   return a + b + c;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var arr: int32[5];
   for (var i: int32 = 0; i < 5; i = i + 1) {
     arr[i] = i * 2;

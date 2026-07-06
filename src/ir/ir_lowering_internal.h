@@ -109,6 +109,12 @@ int ir_try_emit_aggregate_symbol_memcpy(
     IRLoweringContext *context, IRFunction *function, const char *dest_name,
     const IROperand *value, Type *dest_type, SourceLocation location);
 
+int ir_try_emit_aggregate_address_memcpy(IRLoweringContext *context,
+                                         IRFunction *function,
+                                         const IROperand *dest_addr,
+                                         const IROperand *value, Type *dest_type,
+                                         SourceLocation location);
+
 Type *ir_resolve_named_type(IRLoweringContext *context,
                                    const char *name);
 

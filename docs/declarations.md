@@ -4,33 +4,44 @@ Declarations introduce variables, functions, types, and other program elements. 
 
 ## Variables
 
-Variables are declared with `var`, a name, a type, and an optional initializer. Variables require an explicit type. Initializers are optional for locals; globals can have initializers. The value `0` is a valid initializer for pointers (null).
+Variables are declared with `var`, a name, a type, and an optional initializer. **Mettle never infers binding types**: every `var` (and every local `const`) must state its type explicitly - a declaration with an initializer but no type annotation is a compile error. The value `0` is a valid initializer for pointers (null).
 
 ```mettle
 var x: int32;
 var y: int32 = 42;
 var msg: string = "hello";
 var buf: uint8[1024];
+var z = 1 + 2;              // ERROR: 'z' requires an explicit type
 ```
+
+(Only two kinds of binding get their type structurally rather than by annotation: a range-`for` loop counter takes the type of its bound, and a top-level `const` - which is integer-only - takes its literal's type. Neither is inferred from an arbitrary expression.)
 
 ## Constants
 
-Constants are declared with `const`, a name, an optional type, and a required initializer that is a compile-time constant integer expression. A top-level `const` is folded directly into the machine code at every use site and occupies no storage. A local `const` is an immutable binding; assigning to it is a compile error.
+Constants are declared with `const`, a name, an optional type, and a required initializer. Assigning to a `const` is a compile error, and a constant must be declared before it is used.
 
 ```mettle
 const MAX: int32 = 100;
-const STEP = 4;            // type inferred as int32
+const STEP = 4;            // top-level const is integer-only; type is its literal's
 const BOUND = MAX - STEP;  // may reference earlier constants
+
+fn main() -> int32 {
+    const RATE: float64 = 1.5;   // local consts require an explicit type
+    const LABEL: string = "ready";
+    return MAX;
+}
 ```
 
-Initializers may use integer literals, `sizeof`, other constants, and arithmetic, bitwise, and comparison operators over them. Float, string, and aggregate constants are not yet supported, and a constant must be declared before it is used.
+A **top-level** `const` must have integer type. It is folded directly into the machine code at every use site and occupies no storage, so its initializer must be a compile-time constant integer expression: integer literals, `sizeof`, other constants, and arithmetic, bitwise, and comparison operators over them. Because it is integer-only and its value is a compile-time literal, a top-level `const` may omit the type annotation. A **local** `const` must state its type, like any local binding.
+
+A **local** (function-scope) `const` may have any type: integer, float, string, or aggregate. It is an immutable binding backed by normal local storage, so its initializer follows the same rules as any local variable initializer. Global float, string, and aggregate constants are not yet supported; use a top-level `var` or a function-local `const`.
 
 ## Functions
 
-Functions are declared with `function` (or the shorthand `fn`), a name, parameters in parentheses, an optional return type, and a body. The return type can use `->` or `:`. Omitting the return type indicates a void function (no return value).
+Functions are declared with `fn`, a name, parameters in parentheses, an optional return type, and a body. The return type can use `->` or `:`. Omitting the return type indicates a void function (no return value).
 
 ```mettle
-function add(a: int32, b: int32) -> int32 {
+fn add(a: int32, b: int32) -> int32 {
   return a + b;
 }
 
@@ -45,11 +56,11 @@ A function named `main` with signature `() -> int32` serves as the program entry
 
 A function declaration may be prefixed with one or more `@` decorators that
 steer the optimizer. Decorators stack and may appear in any order; they attach
-to the `function` (or `export function`) that follows.
+to the `fn` (or `export fn`) that follows.
 
 ```mettle
-@inline function fast(x: int32) -> int32 { return x * 3 + 1; }
-@pure @noinline function hash(p: int32*, n: int64) -> int64 { /* ... */ }
+@inline fn fast(x: int32) -> int32 { return x * 3 + 1; }
+@pure @noinline fn hash(p: int32*, n: int64) -> int64 { /* ... */ }
 ```
 
 | Decorator | Meaning |
@@ -74,9 +85,9 @@ change across iterations, the optimizer hoists the call into the loop preheader
 and reuses the single result:
 
 ```mettle
-@pure @noinline function weight(table: int32*, k: int32) -> int32 { /* ... */ }
+@pure @noinline fn weight(table: int32*, k: int32) -> int32 { /* ... */ }
 
-function score(table: int32*, k: int32, items: int32*, n: int64) -> int64 {
+fn score(table: int32*, k: int32, items: int32*, n: int64) -> int64 {
   var total: int64 = 0;
   for i in 0..n {
     total = total + (int64)(items[i] * weight(table, k));  // weight(table,k) hoisted
@@ -103,7 +114,7 @@ function swap<T>(a: T*, b: T*) -> void {
   *b = tmp;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var x: int32 = 10;
   var y: int32 = 20;
   swap<int32>(&x, &y);
@@ -118,21 +129,21 @@ The compiler monomorphizes each unique instantiation before type checking. Type 
 Functions can be declared before definition. The forward declaration ends with a semicolon. The definition must match the forward declaration (same name, parameter types, return type).
 
 ```mettle
-function add(a: int32, b: int32) -> int32;
+fn add(a: int32, b: int32) -> int32;
 
-function add(a: int32, b: int32) -> int32 {
+fn add(a: int32, b: int32) -> int32 {
   return a + b;
 }
 ```
 
 ## Extern Functions
 
-Extern functions are implemented in C or another language. They are declared with `extern function` and an optional link name after `=`. If the link name is omitted, the Mettle name is used. Parameters and return types must match the C ABI. Use `cstring` for C `char*` or `void*`.
+Extern functions are implemented in C or another language. They are declared with `extern fn` and an optional link name after `=`. If the link name is omitted, the Mettle name is used. Parameters and return types must match the C ABI. Use `cstring` for C `char*` or `void*`.
 
 ```mettle
-extern function puts(msg: cstring) -> int32 = "puts";
-extern function malloc(size: int64) -> cstring = "malloc";
-extern function my_func(x: int32) -> int32;  // link name = my_func
+extern fn puts(msg: cstring) -> int32 = "puts";
+extern fn malloc(size: int64) -> cstring = "malloc";
+extern fn my_func(x: int32) -> int32;  // link name = my_func
 ```
 
 ## Extern Variables
@@ -159,7 +170,7 @@ struct List<T> {
   capacity: int32;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var p: Pair<int32, int32>;
   p.first = 10;
   p.second = 20;
@@ -204,7 +215,7 @@ v.magnitude();
 The `asm` block syntax is reserved, but native object code generation does not currently support inline assembly.
 
 ```mettle
-function get_rax() -> int64 {
+fn get_rax() -> int64 {
   asm {
     mov rax, 42
   }

@@ -15,7 +15,7 @@ for d in range(10):
         lines.append(f"    s = s + f{i * 4 % n}(s);")
     lines.append("    return s;")
     lines.append("}")
-lines.append("function main() -> int32 {")
+lines.append("fn main() -> int32 {")
 lines.append("    var s: int32 = 0;")
 for d in range(10):
     lines.append(f"    s = s + driver{d}(s);")

@@ -21,31 +21,31 @@ struct Big3 {
   c: int32;
 }
 
-function Tiny1_value(v: Tiny1) -> int32 {
+fn Tiny1_value(v: Tiny1) -> int32 {
   return (int32)v.a;
 }
 
-function Tiny2_value(v: Tiny2) -> int32 {
+fn Tiny2_value(v: Tiny2) -> int32 {
   return (int32)v.a;
 }
 
-function Small4_value(v: Small4) -> int32 {
+fn Small4_value(v: Small4) -> int32 {
   return v.a;
 }
 
-function Small8_sum(v: Small8) -> int32 {
+fn Small8_sum(v: Small8) -> int32 {
   return v.a + v.b;
 }
 
-function Big3_total(v: Big3) -> int32 {
+fn Big3_total(v: Big3) -> int32 {
   return v.a + v.b + v.c;
 }
 
-function Big3_total_ptr(v: Big3*) -> int32 {
+fn Big3_total_ptr(v: Big3*) -> int32 {
   return v->a + v->b + v->c;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var t1: Tiny1;
   t1.a = (uint8)7;
   if (t1.value() != 7) {

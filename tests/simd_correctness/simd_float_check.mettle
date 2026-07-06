@@ -8,32 +8,32 @@ import "std/io";
 import "std/mem";
 
 var g_seed: int64 = 987654321;
-function rnd_small() -> int32 {
+fn rnd_small() -> int32 {
   g_seed = (g_seed * 1103515245 + 12345) & 0x7FFFFFFFFFFF;
   return (int32)((g_seed % 40) - 20);   // [-20, 19], small to keep f32 exact
 }
 
-function ks_f64(a: float64*, n: int64) -> float64 {
+fn ks_f64(a: float64*, n: int64) -> float64 {
   var s: float64 = 0.0; var i: int64 = 0;
   while (i < n) { s = s + a[i]; i = i + 1; }
   return s;
 }
-function ks_f32(a: float32*, n: int64) -> float32 {
+fn ks_f32(a: float32*, n: int64) -> float32 {
   var s: float32 = 0.0; var i: int64 = 0;
   while (i < n) { s = s + a[i]; i = i + 1; }
   return s;
 }
-function kd_f64(a: float64*, b: float64*, n: int64) -> float64 {
+fn kd_f64(a: float64*, b: float64*, n: int64) -> float64 {
   var s: float64 = 0.0; var i: int64 = 0;
   while (i < n) { s = s + a[i] * b[i]; i = i + 1; }
   return s;
 }
-function kd_f32(a: float32*, b: float32*, n: int64) -> float32 {
+fn kd_f32(a: float32*, b: float32*, n: int64) -> float32 {
   var s: float32 = 0.0; var i: int64 = 0;
   while (i < n) { s = s + a[i] * b[i]; i = i + 1; }
   return s;
 }
-function ka_f64(src: float64*, dst: float64*, n: int64) -> int32 {
+fn ka_f64(src: float64*, dst: float64*, n: int64) -> int32 {
   var i: int64 = 0;
   while (i < n) {
     dst[i] = 2.0 * src[i] + 3.0 * dst[i] + 5.0;
@@ -41,7 +41,7 @@ function ka_f64(src: float64*, dst: float64*, n: int64) -> int32 {
   }
   return 0;
 }
-function ka_f32(src: float32*, dst: float32*, n: int64) -> int32 {
+fn ka_f32(src: float32*, dst: float32*, n: int64) -> int32 {
   var i: int64 = 0;
   while (i < n) {
     dst[i] = (float32)2.0 * src[i] + (float32)3.0 * dst[i] + (float32)5.0;
@@ -53,13 +53,13 @@ function ka_f32(src: float32*, dst: float32*, n: int64) -> int32 {
 /* General auto-vectorizer (IR_OP_SIMD_VLOOP_F64) shapes the per-shape
  * recognizers do not claim: a multi-array element-wise map and a sum-of-DAG
  * reduction. Integer-valued in-range inputs keep == exact. */
-function vmap_combo(out: float64*, a: float64*, b: float64*, c: float64*,
+fn vmap_combo(out: float64*, a: float64*, b: float64*, c: float64*,
                     n: int64) -> int32 {
   var i: int64 = 0;
   while (i < n) { out[i] = (a[i] + b[i]) * c[i]; i = i + 1; }
   return 0;
 }
-function vred_ssq(a: float64*, b: float64*, n: int64) -> float64 {
+fn vred_ssq(a: float64*, b: float64*, n: int64) -> float64 {
   var acc: float64 = 0.0; var i: int64 = 0;
   while (i < n) { acc = acc + (a[i] * a[i] + b[i]); i = i + 1; }
   return acc;
@@ -70,18 +70,18 @@ function vred_ssq(a: float64*, b: float64*, n: int64) -> float64 {
  * additionally exercises the packed vdivps / scalar divss path — (a*6)/3 == 2*a
  * is exact for integer-valued a and the two constants are not adjacent, so they
  * cannot be folded into a single multiply. */
-function vmap_combo_f32(out: float32*, a: float32*, b: float32*, c: float32*,
+fn vmap_combo_f32(out: float32*, a: float32*, b: float32*, c: float32*,
                         n: int64) -> int32 {
   var i: int64 = 0;
   while (i < n) { out[i] = (a[i] + b[i]) * c[i]; i = i + 1; }
   return 0;
 }
-function vred_ssq_f32(a: float32*, b: float32*, n: int64) -> float32 {
+fn vred_ssq_f32(a: float32*, b: float32*, n: int64) -> float32 {
   var acc: float32 = 0.0; var i: int64 = 0;
   while (i < n) { acc = acc + (a[i] * a[i] + b[i]); i = i + 1; }
   return acc;
 }
-function vmap_div_f32(out: float32*, a: float32*, n: int64) -> int32 {
+fn vmap_div_f32(out: float32*, a: float32*, n: int64) -> int32 {
   var i: int64 = 0;
   while (i < n) { out[i] = a[i] * (float32)6.0 / (float32)3.0; i = i + 1; }
   return 0;
@@ -89,7 +89,7 @@ function vmap_div_f32(out: float32*, a: float32*, n: int64) -> int32 {
 /* iota map: exercises the f32 (float32)i path (packed [0..7] build +
  * vcvtdq2ps, scalar cvtsi2ss tail). out[i] = 3*i + 1, exact in f32 for the
  * lengths tested. */
-function vmap_iota_f32(out: float32*, n: int64) -> int32 {
+fn vmap_iota_f32(out: float32*, n: int64) -> int32 {
   var i: int64 = 0;
   while (i < n) { out[i] = (float32)i * (float32)3.0 + (float32)1.0; i = i + 1; }
   return 0;
@@ -99,7 +99,7 @@ function vmap_iota_f32(out: float32*, n: int64) -> int32 {
  * the exactly-narrowable-f64-literal path in vloop_operand_is_literal. The
  * literals narrow to f32 exactly and the inputs are small integers, so the f32
  * lanes produce the exact integer 2*x*x + 3*x -- == against the int reference. */
-function vmap_lit_quad_f32(out: float32*, a: float32*, n: int64) -> int32 {
+fn vmap_lit_quad_f32(out: float32*, a: float32*, n: int64) -> int32 {
   var i: int64 = 0;
   while (i < n) { out[i] = a[i] * a[i] * 2.0 + a[i] * 3.0; i = i + 1; }
   return 0;
@@ -108,7 +108,7 @@ function vmap_lit_quad_f32(out: float32*, a: float32*, n: int64) -> int32 {
  * f64-narrowing leaves the accumulation in temp+ASSIGN form (`%t = s + X; s <-
  * %t`); this exercises both the exactly-narrowable-literal admission AND the
  * temp+ASSIGN reduction match. Sum of 2*x is an exact integer in f32. */
-function vred_lit_f32(a: float32*, n: int64) -> float32 {
+fn vred_lit_f32(a: float32*, n: int64) -> float32 {
   var s: float32 = 0.0; var i: int64 = 0;
   while (i < n) { s = s + a[i] * 2.0; i = i + 1; }
   return s;
@@ -117,12 +117,12 @@ function vred_lit_f32(a: float32*, n: int64) -> float32 {
  * the DAG builder substitutes in place of the symbol. Reduction (sum of squared
  * differences) and map (squared-difference) forms; integer inputs keep ==
  * exact. These are the SSD / variance / `var x=...; x*x` shapes. */
-function vred_ssd_f32(a: float32*, b: float32*, n: int64) -> float32 {
+fn vred_ssd_f32(a: float32*, b: float32*, n: int64) -> float32 {
   var s: float32 = 0.0; var i: int64 = 0;
   while (i < n) { var d: float32 = a[i] - b[i]; s = s + d * d; i = i + 1; }
   return s;
 }
-function vmap_sqdiff_f32(out: float32*, a: float32*, b: float32*,
+fn vmap_sqdiff_f32(out: float32*, a: float32*, b: float32*,
                          n: int64) -> int32 {
   var i: int64 = 0;
   while (i < n) { var d: float32 = a[i] - b[i]; out[i] = d * d; i = i + 1; }
@@ -130,14 +130,14 @@ function vmap_sqdiff_f32(out: float32*, a: float32*, b: float32*,
 }
 
 var g_fail: int32 = 0;
-function fail(label: cstring, len: int64) -> int32 {
+fn fail(label: cstring, len: int64) -> int32 {
   print(cstr("FAIL ")); print(label); print(cstr(" n=")); print_int(len);
   println(cstr(""));
   g_fail = g_fail + 1;
   return 0;
 }
 
-function run_len(n: int64) -> int32 {
+fn run_len(n: int64) -> int32 {
   var cap: int64 = n; if (cap < 1) { cap = 1; }
   var a64: float64* = (float64*)malloc(cap * 8);
   var b64: float64* = (float64*)malloc(cap * 8);
@@ -219,7 +219,7 @@ function run_len(n: int64) -> int32 {
   return 0;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var lens: int64* = (int64*)malloc(32 * 8);
   lens[0]=1; lens[1]=2; lens[2]=3; lens[3]=4; lens[4]=5; lens[5]=7; lens[6]=8;
   lens[7]=9; lens[8]=15; lens[9]=16; lens[10]=17; lens[11]=23; lens[12]=31;

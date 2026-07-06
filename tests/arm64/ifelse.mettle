@@ -1,0 +1,11 @@
+// 17 is odd -> 7. if/else with a modulo condition.
+fn main() -> int64 {
+  var x: int64 = 17;
+  var r: int64 = 0;
+  if (x % 2 == 0) {
+    r = 100;
+  } else {
+    r = 7;
+  }
+  return r;
+}

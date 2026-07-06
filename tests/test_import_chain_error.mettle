@@ -1,5 +1,5 @@
 import "nonexistent/module/path";
 
-function main() -> int32 {
+fn main() -> int32 {
   return 0;
 }

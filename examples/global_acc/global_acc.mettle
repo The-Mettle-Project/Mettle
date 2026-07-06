@@ -16,7 +16,7 @@ var g_a: int64 = 1;
 var g_b: int64 = 2;
 var g_c: int64 = 3;
 
-function run() {
+fn run() {
   var i: int64 = 0;
   while (i < (int64)N) {
     g_a = g_a + i;
@@ -26,7 +26,7 @@ function run() {
   }
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var passes: int32 = 3;
   println("Global RMW hot loop, 100M iters x 3 passes");
 

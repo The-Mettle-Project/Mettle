@@ -1,4 +1,5 @@
 #include "ir_optimize_internal.h"
+#include "../ir_verify.h"
 
 typedef struct {
   IROptPassId id;
@@ -86,6 +87,15 @@ static const IROptNamedPass g_ir_post_fixpoint_passes[] = {
     /* After congruent-IV merge so parallel lane indices appear as base+J. */
     {"simd_slp_mac_i32", ir_simd_slp_mac_i32_pass},
     {"simd_slp_mac_i8", ir_simd_slp_mac_i8_pass},
+    /* After every recognizer: collapses register-only data-dependent
+     * diamonds to branchless selects. Runs before prefetch (which only
+     * touches loop headers) and after vectorizers (whose loop bodies are
+     * straight-line and thus unaffected). */
+    {"if_convert", ir_if_convert_pass},
+    /* LAST: inserts control flow into loop bodies, which would defeat every
+     * recognizer above. Only fires on loops with indirect (load-fed) accesses
+     * -- shapes no vectorizer can claim. */
+    {"prefetch_indirect", ir_prefetch_indirect_pass},
 };
 
 static const IROptNamedStage g_ir_pre_inline_stage = {
@@ -382,6 +392,24 @@ int ir_optimize_program_pipeline(IRProgram *program,
   ir_optimize_set_explain(options && options->explain,
                           options ? options->explain_focus_file : NULL);
   ir_function_index_reset();
+  ir_verify_begin_program(program);
+
+  /* Fold never-written global integer vars to their initializer constants
+   * first, so every later pass (strength reduction, vectorizers, TRE) sees
+   * plain constants instead of opaque global reads. */
+  if (options && options->global_int_consts &&
+      !ir_pass_name_is_skipped("fold_readonly_globals")) {
+    int fold_changed = 0;
+    mettle_compiler_ctx_set_pass_name("fold_readonly_globals");
+    mettle_compiler_ctx_set_fixpoint_iteration(0);
+    double t0 = ir_pass_time_begin();
+    if (!ir_fold_readonly_globals_pass(program, options->global_int_consts,
+                                       options->global_int_const_count,
+                                       &fold_changed)) {
+      mettle_compiler_ice("IR read-only global fold pass failed");
+    }
+    ir_pass_time_end("fold_readonly_globals [program]", t0);
+  }
 
   {
     double t0 = ir_pass_time_begin();
@@ -391,6 +419,22 @@ int ir_optimize_program_pipeline(IRProgram *program,
       return 0;
     }
     ir_pass_time_end("pre_inline [stage]", t0);
+  }
+
+  /* Tail-recursion elimination before any inlining: converting the tail
+   * self call into a loop first means the regular inliner sees a loop-shaped
+   * callee and the bounded self-recursion expander only has the remaining
+   * non-tail calls to amortize. */
+  if ((!options || !options->preserve_function_boundaries) &&
+      !ir_pass_name_is_skipped("tail_recursion_elim")) {
+    int tre_changed = 0;
+    mettle_compiler_ctx_set_pass_name("tail_recursion_elim");
+    mettle_compiler_ctx_set_fixpoint_iteration(0);
+    double t0 = ir_pass_time_begin();
+    if (!ir_tail_recursion_elimination_pass(program, &tre_changed)) {
+      mettle_compiler_ice("IR tail-recursion elimination pass failed");
+    }
+    ir_pass_time_end("tail_recursion_elim [program]", t0);
   }
 
   if ((!options || !options->preserve_function_boundaries) &&
@@ -437,6 +481,30 @@ int ir_optimize_program_pipeline(IRProgram *program,
     ir_pass_time_end("hoist_pure_calls [program]", t0);
   }
 
+  /* Allocation-site layout factorization: re-map provably-private malloc
+   * pools (compact padded strides / factor into per-field SoA arrays).
+   * Whole-program only: rewriting a callee body to a new pool layout is
+   * sound only when every call site is visible. Runs after inlining so
+   * field-accessor helpers are already folded into their callers, and
+   * before the per-function stage so the vectorizers see the rewritten
+   * unit-stride form. NOT under per-function --verify: the transform
+   * preserves program behavior but changes the buffer's byte image, which
+   * the per-function validator counts as an observation (and a coordinated
+   * multi-function rewrite must never be quarantined one function at a
+   * time). METTLE_SKIP_PASS=layout_factor disables it. */
+  if (options && options->whole_program &&
+      !options->preserve_function_boundaries &&
+      !ir_pass_name_is_skipped("layout_factor")) {
+    int layout_changed = 0;
+    mettle_compiler_ctx_set_pass_name("layout_factor");
+    mettle_compiler_ctx_set_fixpoint_iteration(0);
+    double t0 = ir_pass_time_begin();
+    if (!ir_layout_factor_pass(program, &layout_changed)) {
+      mettle_compiler_ice("IR layout factorization pass failed");
+    }
+    ir_pass_time_end("layout_factor [program]", t0);
+  }
+
   /* Give the per-function contract verifier program access for the duration
    * of the stage: the call-in-body fix simulation re-runs the inliner on a
    * caller clone, which needs callee lookup. */
@@ -476,6 +544,7 @@ int ir_optimize_program_pipeline(IRProgram *program,
     ir_explain_finalize(1);
   }
   ir_pass_time_report();
+  ir_verify_end_program();
 
   ir_function_index_reset();
   return contracts_ok;

@@ -26,14 +26,14 @@ var g_render_buf: cstring = 0;
 var MAT_N: int32 = 16;
 var SORT_LEN: int32 = 128;
 
-function demo_file() -> cstring {
+fn demo_file() -> cstring {
   if (DEMO_FILE == 0) {
     DEMO_FILE = cstr("examples/tracy_demo/tracy_demo.mettle");
   }
   return DEMO_FILE;
 }
 
-function fill_matrix(m: int32*, n: int32, seed: int32) {
+fn fill_matrix(m: int32*, n: int32, seed: int32) {
   var row: int32 = 0;
   while (row < n) {
     var col: int32 = 0;
@@ -46,7 +46,7 @@ function fill_matrix(m: int32*, n: int32, seed: int32) {
   }
 }
 
-function matmul_small(a: int32*, b: int32*, c: int32*, n: int32) {
+fn matmul_small(a: int32*, b: int32*, c: int32*, n: int32) {
   var row: int32 = 0;
   while (row < n) {
     var col: int32 = 0;
@@ -67,7 +67,7 @@ function matmul_small(a: int32*, b: int32*, c: int32*, n: int32) {
   }
 }
 
-function fill_sort_data(data: int32*, len: int32, seed: int32) {
+fn fill_sort_data(data: int32*, len: int32, seed: int32) {
   var i: int32 = 0;
   while (i < len) {
     data[i] = (i * 1103515245 + seed + 12345) % 1024;
@@ -75,7 +75,7 @@ function fill_sort_data(data: int32*, len: int32, seed: int32) {
   }
 }
 
-function insertion_sort_small(data: int32*, len: int32) {
+fn insertion_sort_small(data: int32*, len: int32) {
   var i: int32 = 1;
   while (i < len) {
     var key: int32 = data[i];
@@ -92,7 +92,7 @@ function insertion_sort_small(data: int32*, len: int32) {
   }
 }
 
-function simulate_input(frame_no: int32) {
+fn simulate_input(frame_no: int32) {
   var z: TracyZone = tracy_zone_colored(
     cstr("Input"),
     demo_file(),
@@ -104,7 +104,7 @@ function simulate_input(frame_no: int32) {
   var _unused: int32 = frame_no + g_entity_count;
 }
 
-function simulate_physics(frame_no: int32) -> int32 {
+fn simulate_physics(frame_no: int32) -> int32 {
   var z: TracyZone = tracy_zone_colored(
     cstr("Physics"),
     demo_file(),
@@ -122,7 +122,7 @@ function simulate_physics(frame_no: int32) -> int32 {
   return acc;
 }
 
-function simulate_gameplay(frame_no: int32) -> int32 {
+fn simulate_gameplay(frame_no: int32) -> int32 {
   var z: TracyZone = tracy_zone_colored(
     cstr("Gameplay"),
     demo_file(),
@@ -138,7 +138,7 @@ function simulate_gameplay(frame_no: int32) -> int32 {
   return data[0] + data[SORT_LEN - 1];
 }
 
-function simulate_simulation(frame_no: int32) -> int32 {
+fn simulate_simulation(frame_no: int32) -> int32 {
   var z: TracyZone = tracy_zone_colored(
     cstr("Simulation"),
     demo_file(),
@@ -152,7 +152,7 @@ function simulate_simulation(frame_no: int32) -> int32 {
   return p + g;
 }
 
-function simulate_render_prep(frame_no: int32) -> int32 {
+fn simulate_render_prep(frame_no: int32) -> int32 {
   var z: TracyZone = tracy_zone_colored(
     cstr("RenderPrep"),
     demo_file(),
@@ -170,7 +170,7 @@ function simulate_render_prep(frame_no: int32) -> int32 {
   return c[0] + c[255];
 }
 
-function run_frame(frame_no: int32, hitch: int32) -> int32 {
+fn run_frame(frame_no: int32, hitch: int32) -> int32 {
   var z: TracyZone = tracy_zone(
     cstr("Frame"),
     demo_file(),
@@ -191,7 +191,7 @@ function run_frame(frame_no: int32, hitch: int32) -> int32 {
   return sim + render;
 }
 
-function asset_loader_thread(_param: cstring) -> uint32 {
+fn asset_loader_thread(_param: cstring) -> uint32 {
   tracy_set_thread_name(cstr("AssetLoader"));
   var progress_buf: uint8[32];
 
@@ -221,13 +221,13 @@ function asset_loader_thread(_param: cstring) -> uint32 {
   return 0;
 }
 
-function setup_plots() {
+fn setup_plots() {
   tracy_plot_setup_number(cstr("frame_ms"), 1, 1, tracy_color_render());
   tracy_plot_setup_number(cstr("entity_count"), 1, 0, tracy_color_update());
   tracy_plot_setup_memory(cstr("heap_bytes"), 1024, 1, tracy_color_load());
 }
 
-function setup_memory() {
+fn setup_memory() {
   var scratch_size: int64 = 65536;
   var render_size: int64 = 4096;
   g_scratch = tracy_malloc(scratch_size);
@@ -241,7 +241,7 @@ function setup_memory() {
   g_heap_bytes = scratch_size + render_size;
 }
 
-function teardown_memory() {
+fn teardown_memory() {
   tracy_heap_free(g_scratch);
   tracy_heap_free(g_render_buf);
   g_scratch = 0;
@@ -249,12 +249,12 @@ function teardown_memory() {
   g_heap_bytes = 0;
 }
 
-function start_loader_thread() {
+fn start_loader_thread() {
   g_load_progress = 0;
   g_loader_thread = CreateThread(0, 0, &asset_loader_thread, 0, 0, 0);
 }
 
-function stop_loader_thread() {
+fn stop_loader_thread() {
   if (g_loader_thread == 0) {
     return;
   }
@@ -263,7 +263,7 @@ function stop_loader_thread() {
   g_loader_thread = 0;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   tracy_app_info(cstr("Mettle Tracy Demo — frame pipeline + loader thread"));
   tracy_set_thread_name(cstr("Main"));
   setup_plots();

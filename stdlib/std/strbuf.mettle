@@ -36,11 +36,11 @@ export struct StrBuf {
 
 // ─── Internal ───────────────────────────────────────────────────────────────
 
-function strbuf_default_cap() -> int64 {
+fn strbuf_default_cap() -> int64 {
   return (int64)64;
 }
 
-function strbuf_bytes() -> int64 {
+fn strbuf_bytes() -> int64 {
   return (int64)32;
 }
 
@@ -48,7 +48,7 @@ function strbuf_bytes() -> int64 {
 // implicit NUL the finish call appends). On growth, allocate a new block in
 // the arena, copy old contents, and switch pointers. The old block is left
 // behind as arena-owned garbage; it will be reclaimed when the arena is.
-function strbuf_grow(b: StrBuf*, needed: int64) -> int32 {
+fn strbuf_grow(b: StrBuf*, needed: int64) -> int32 {
   if (b == 0 || b->arena == 0) { return 0; }
   if (needed <= b->cap) { return 1; }
 
@@ -75,7 +75,7 @@ function strbuf_grow(b: StrBuf*, needed: int64) -> int32 {
 
 // Create a new builder allocated in `arena`. `initial_cap <= 0` selects a
 // sensible default (64 bytes). Returns 0 on OOM.
-export function strbuf_new(arena: Arena*, initial_cap: int64) -> StrBuf* {
+export fn strbuf_new(arena: Arena*, initial_cap: int64) -> StrBuf* {
   if (arena == 0) { return 0; }
   var raw: cstring = arena_alloc(arena, strbuf_bytes());
   if (raw == 0) { return 0; }
@@ -91,14 +91,14 @@ export function strbuf_new(arena: Arena*, initial_cap: int64) -> StrBuf* {
 }
 
 // Current byte length, excluding the NUL terminator finish will write.
-export function strbuf_len(b: StrBuf*) -> int64 {
+export fn strbuf_len(b: StrBuf*) -> int64 {
   if (b == 0) { return (int64)0; }
   return b->len;
 }
 
 // Append a single byte. Returns 1 on success, 0 on OOM (allocation of a
 // larger block failed). The builder's previous contents survive an OOM.
-export function strbuf_append_byte(b: StrBuf*, c: uint8) -> int32 {
+export fn strbuf_append_byte(b: StrBuf*, c: uint8) -> int32 {
   if (b == 0) { return 0; }
   if (strbuf_grow(b, b->len + (int64)1) == 0) { return 0; }
   b->data[b->len] = c;
@@ -107,7 +107,7 @@ export function strbuf_append_byte(b: StrBuf*, c: uint8) -> int32 {
 }
 
 // Append `n` bytes from `src` verbatim.
-export function strbuf_append_bytes(b: StrBuf*, src: cstring, n: int64) -> int32 {
+export fn strbuf_append_bytes(b: StrBuf*, src: cstring, n: int64) -> int32 {
   if (b == 0) { return 0; }
   if (n <= (int64)0 || src == 0) { return 1; }
   if (strbuf_grow(b, b->len + n) == 0) { return 0; }
@@ -117,7 +117,7 @@ export function strbuf_append_bytes(b: StrBuf*, src: cstring, n: int64) -> int32
 }
 
 // Append a NUL-terminated C string (length determined by scanning).
-export function strbuf_append_cstr(b: StrBuf*, s: cstring) -> int32 {
+export fn strbuf_append_cstr(b: StrBuf*, s: cstring) -> int32 {
   if (b == 0 || s == 0) { return 0; }
   var n: int64 = (int64)0;
   while (s[n] != (uint8)0) {
@@ -128,14 +128,14 @@ export function strbuf_append_cstr(b: StrBuf*, s: cstring) -> int32 {
 
 // Append a Mettle string. Reads its 16-byte record (chars + length) and
 // appends the bytes; does NOT append the NUL.
-export function strbuf_append_string(b: StrBuf*, s: string) -> int32 {
+export fn strbuf_append_string(b: StrBuf*, s: string) -> int32 {
   if (b == 0) { return 0; }
   return strbuf_append_bytes(b, s.chars, (int64)s.length);
 }
 
 // Append a signed 64-bit integer in base 10. Handles INT64_MIN by emitting
 // the digits in two halves to avoid negating a value that overflows int64.
-export function strbuf_append_int(b: StrBuf*, n: int64) -> int32 {
+export fn strbuf_append_int(b: StrBuf*, n: int64) -> int32 {
   if (b == 0) { return 0; }
   if (n == (int64)0) {
     return strbuf_append_byte(b, (uint8)48);
@@ -176,7 +176,7 @@ export function strbuf_append_int(b: StrBuf*, n: int64) -> int32 {
 }
 
 // Append an unsigned 64-bit integer in base 10.
-export function strbuf_append_uint(b: StrBuf*, n: uint64) -> int32 {
+export fn strbuf_append_uint(b: StrBuf*, n: uint64) -> int32 {
   if (b == 0) { return 0; }
   if (n == (uint64)0) {
     return strbuf_append_byte(b, (uint8)48);
@@ -199,7 +199,7 @@ export function strbuf_append_uint(b: StrBuf*, n: uint64) -> int32 {
 
 // Append an unsigned 64-bit integer in lowercase hex, no "0x" prefix, no
 // leading zeros (except for zero itself, which emits "0").
-export function strbuf_append_hex(b: StrBuf*, n: uint64) -> int32 {
+export fn strbuf_append_hex(b: StrBuf*, n: uint64) -> int32 {
   if (b == 0) { return 0; }
   if (n == (uint64)0) {
     return strbuf_append_byte(b, (uint8)48);
@@ -233,7 +233,7 @@ export function strbuf_append_hex(b: StrBuf*, n: uint64) -> int32 {
 // Calling finish more than once is supported but discouraged: a subsequent
 // append may grow the buffer, invalidating the pointer returned by the first
 // finish. The intended pattern is build → finish → don't touch.
-export function strbuf_finish_cstr(b: StrBuf*) -> cstring {
+export fn strbuf_finish_cstr(b: StrBuf*) -> cstring {
   if (b == 0) { return 0; }
   // strbuf_grow always allocates cap+1 bytes; the NUL slot is reserved.
   if (b->data == 0) {

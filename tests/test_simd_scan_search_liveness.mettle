@@ -3,7 +3,7 @@
 // post-loop stores, and the byte-compare-to-memcmp recognizer must not erase
 // arbitrary code after the loop exit. Returns 0 on success.
 
-function slp_i32_live_after(a: int32*, b: int32*, c: int32*, n: int32,
+fn slp_i32_live_after(a: int32*, b: int32*, c: int32*, n: int32,
                             stride: int32, out_idx: int32) -> int32 {
   var s0: int32 = 0;
   var s1: int32 = 0;
@@ -35,7 +35,7 @@ function slp_i32_live_after(a: int32*, b: int32*, c: int32*, n: int32,
   return bad;
 }
 
-function slp_i8_live_after(a: int8*, b: int8*, c: int32*, n: int32,
+fn slp_i8_live_after(a: int8*, b: int8*, c: int32*, n: int32,
                            stride: int32, out_idx: int32) -> int32 {
   var s0: int32 = 0;
   var s1: int32 = 0;
@@ -67,7 +67,7 @@ function slp_i8_live_after(a: int8*, b: int8*, c: int32*, n: int32,
   return bad;
 }
 
-function byte_compare_with_tail(a: cstring, b: cstring, len: int64) -> int64 {
+fn byte_compare_with_tail(a: cstring, b: cstring, len: int64) -> int64 {
   var i: int64 = 0;
   while (i < len) {
     var av_i: int32 = (int32)a[i];
@@ -92,7 +92,7 @@ function byte_compare_with_tail(a: cstring, b: cstring, len: int64) -> int64 {
   return 0;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var a32: int32[64];
   var b32: int32[64];
   var c32: int32[4];

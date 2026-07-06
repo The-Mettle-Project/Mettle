@@ -1,7 +1,7 @@
-function unused() -> int32 {
+fn unused() -> int32 {
   return ghost;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   return 0;
 }

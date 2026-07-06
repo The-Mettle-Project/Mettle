@@ -37,7 +37,9 @@ typedef enum {
   AST_MEMBER_ACCESS,
   AST_INDEX_EXPRESSION,
   AST_NEW_EXPRESSION,
-  AST_CAST_EXPRESSION
+  AST_CAST_EXPRESSION,
+  AST_LAMBDA_EXPRESSION,
+  AST_CLOSURE_ADAPT_EXPRESSION
 } ASTNodeType;
 
 typedef struct {
@@ -76,6 +78,11 @@ typedef struct {
   int is_exported;
   int is_const; // declared with `const`: immutable, compile-time integer value
   char *link_name;
+  // Set on compiler-synthesized bindings whose type is determined structurally
+  // (e.g. a range-`for` loop counter takes the type of its bound), which are
+  // exempt from the "explicit type required on var/const" rule. User-written
+  // `var`/`const` declarations always leave this 0.
+  int structural_type;
 } VarDeclaration;
 
 typedef struct {
@@ -98,8 +105,32 @@ typedef struct {
   int is_noinline;        // `@noinline`: never inline this function
   int is_pure;            // `@pure`    : side-effect-free; enables call LICM
   int is_noalloc;         // `@noalloc` : proven allocation-free or compile error
+  int is_test;            // `@test`    : compile-time unit test; compiled out
+                          //              of normal builds, run by `mettle test`
   int simd_mode;          // SimdAttr applied as the default to every body loop
+  // Closure conversion metadata (set on AST_LAMBDA_EXPRESSION nodes only). A
+  // capturing lambda records the variables it captures by value, their types,
+  // and the synthesized environment struct; `name` then holds the constructor
+  // function the lambda value is produced by.
+  char **captured_names;
+  char **captured_types;
+  size_t captured_count;
+  char *env_struct_name;
 } FunctionDeclaration;
+
+// A thin function value (`&func`, or a non-capturing lambda) implicitly wrapped
+// to satisfy an `Fn(...)->R` closure-typed boundary (parameter, return, or var
+// declaration). Synthesized by the closure-adapt pass; `ctor_name` is the
+// generated adapter constructor to call, `inner` is the original thin
+// expression, and `param_types`/`return_type` are the wrapped signature (used
+// by the type checker to build the resulting closure type).
+typedef struct {
+  ASTNode *inner;
+  char *ctor_name;
+  char **param_types;
+  size_t param_count;
+  char *return_type;
+} ClosureAdapt;
 
 typedef struct {
   char *name;
@@ -178,6 +209,8 @@ typedef struct {
   char **type_args;
   size_t type_arg_count;
   int is_indirect_call; // 1 if callee is a variable with function pointer type
+  struct Type *callee_closure_env; // non-NULL if the callee is a capturing
+                                   // closure; set by the type checker
 } CallExpression;
 
 typedef struct {
@@ -371,6 +404,10 @@ ASTNode *ast_create_field_assignment(ASTNode *target, ASTNode *value,
                                      SourceLocation location);
 ASTNode *ast_create_cast_expression(const char *type_name, ASTNode *operand,
                                     SourceLocation location);
+ASTNode *ast_create_closure_adapt(ASTNode *inner, const char *ctor_name,
+                                  char **param_types, size_t param_count,
+                                  const char *return_type,
+                                  SourceLocation location);
 ASTNode *ast_create_for_statement(ASTNode *initializer, ASTNode *condition,
                                   ASTNode *increment, ASTNode *body,
                                   SourceLocation location);

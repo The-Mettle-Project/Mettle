@@ -1,5 +1,6 @@
 // Type checker: expression type inference and checking.
 #include "type_checker_internal.h"
+#include "../string_intern.h"
 
 Type *type_checker_method_receiver_struct_type(Type *receiver_type) {
   if (!receiver_type) {
@@ -53,6 +54,51 @@ int type_checker_desugar_struct_method_call(TypeChecker *checker,
            call->function_name);
 
   if (!symbol_table_lookup(checker->symbol_table, mangled_name)) {
+    /* No method by this name. If the receiver struct has a function-pointer or
+     * closure FIELD of this name, `obj.field(args)` is a call THROUGH that
+     * field: rewrite the node into a function-pointer call on `obj.field`,
+     * which handles both thin pointers and closures (the call site loads the
+     * code pointer and, for a closure, threads the environment). */
+    Type *field_type = type_get_field_type(struct_type, call->function_name);
+    if (field_type && field_type->kind == TYPE_FUNCTION_POINTER) {
+      free(mangled_name);
+      ASTNode *obj = call->object;
+      ASTNode **args = call->arguments;
+      size_t argc = call->argument_count;
+      ASTNode *member = ast_create_member_access(obj, call->function_name,
+                                                 expression->location);
+      if (!member) {
+        type_checker_set_error_at_location(
+            checker, expression->location,
+            "Out of memory while resolving field call");
+        return 0;
+      }
+      FuncPtrCall *fp = malloc(sizeof(FuncPtrCall));
+      if (!fp) {
+        type_checker_set_error_at_location(
+            checker, expression->location,
+            "Out of memory while resolving field call");
+        return 0;
+      }
+      fp->function = member;
+      fp->arguments = args;
+      fp->argument_count = argc;
+      /* The argument array is reused; `obj` now belongs to `member`. The old
+       * CallExpression payload is intentionally left unfreed - a small bounded
+       * compile-time allocation - to avoid any ownership mismatch. */
+      expression->child_count = 0;
+      expression->type = AST_FUNC_PTR_CALL;
+      expression->data = fp;
+      expression->resolved_type = NULL;
+      ast_add_child(expression, member);
+      for (size_t i = 0; i < argc; i++) {
+        if (args[i]) {
+          ast_add_child(expression, args[i]);
+        }
+      }
+      return 1;
+    }
+
     type_checker_set_error_at_location(
         checker, expression->location,
         "Undefined method '%s.%s' (expected function '%s')",
@@ -149,6 +195,174 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
     BinaryExpression *binop = (BinaryExpression *)expression->data;
     return type_checker_check_binary_expression(checker, binop,
                                                 expression->location);
+  }
+
+  case AST_CLOSURE_ADAPT_EXPRESSION: {
+    /* The closure-adapt pass wrapped a thin function value (`&func`, or a
+     * non-capturing lambda) that flowed into an `Fn(...)` boundary. The wrapper
+     * calls a generated adapter constructor at IR-lowering time; here it simply
+     * types as the closure signature it was synthesized for. */
+    ClosureAdapt *adapt = (ClosureAdapt *)expression->data;
+    if (!adapt || !adapt->ctor_name || !adapt->inner) {
+      type_checker_set_error_at_location(
+          checker, expression->location,
+          "Internal: closure adapter was not synthesized");
+      return NULL;
+    }
+    if (!type_checker_infer_type(checker, adapt->inner)) {
+      return NULL;
+    }
+    Type **ptypes = NULL;
+    if (adapt->param_count > 0) {
+      ptypes = malloc(adapt->param_count * sizeof(Type *));
+      if (!ptypes) {
+        return NULL;
+      }
+      for (size_t i = 0; i < adapt->param_count; i++) {
+        ptypes[i] =
+            type_checker_get_type_by_name(checker, adapt->param_types[i]);
+        if (!ptypes[i]) {
+          type_checker_set_error_at_location(
+              checker, expression->location,
+              "Unknown adapter parameter type '%s'", adapt->param_types[i]);
+          free(ptypes);
+          return NULL;
+        }
+      }
+    }
+    Type *adapt_return_type =
+        adapt->return_type
+            ? type_checker_get_type_by_name(checker, adapt->return_type)
+            : checker->builtin_void;
+    if (!adapt_return_type) {
+      adapt_return_type = checker->builtin_void;
+    }
+    Type *closure_type = type_create_function_pointer(
+        ptypes, adapt->param_count, adapt_return_type);
+    free(ptypes);
+    if (!closure_type) {
+      type_checker_set_error_at_location(checker, expression->location,
+                                         "Failed to create adapted closure type");
+      return NULL;
+    }
+    char adapt_sig[1024];
+    {
+      size_t off = 0;
+      int wrote = snprintf(adapt_sig, sizeof(adapt_sig), "Fn(");
+      if (wrote > 0)
+        off += (size_t)wrote;
+      for (size_t i = 0; i < adapt->param_count && off < sizeof(adapt_sig);
+           i++) {
+        wrote = snprintf(adapt_sig + off, sizeof(adapt_sig) - off, "%s%s",
+                         i ? "," : "", adapt->param_types[i]);
+        if (wrote > 0)
+          off += (size_t)wrote;
+      }
+      if (off < sizeof(adapt_sig))
+        snprintf(adapt_sig + off, sizeof(adapt_sig) - off, ")->%s",
+                 adapt->return_type ? adapt->return_type : "void");
+    }
+    closure_type->name = (char *)string_intern(adapt_sig);
+    closure_type->closure_env = type_checker_closure_env_sentinel();
+    return closure_type;
+  }
+
+  case AST_LAMBDA_EXPRESSION: {
+    /* Closure conversion lifted the lambda body and recorded the symbol its
+     * value derives from. A non-capturing lambda is the address of its lifted
+     * function (a thin function pointer, like `&func`). A capturing lambda has
+     * the user-facing type fn(params)->R tagged with its environment struct so
+     * call sites know to dispatch through the captured environment. */
+    FunctionDeclaration *lam = (FunctionDeclaration *)expression->data;
+    if (!lam || !lam->name) {
+      type_checker_set_error_at_location(checker, expression->location,
+                                         "Internal: lambda was not converted");
+      return NULL;
+    }
+
+    /* The lambda value is an 8-byte function pointer (thin) or closure pointer.
+     * Name its type with its canonical signature `fn(a,b)->R` (no spaces) so an
+     * inferred `var f = <lambda>` local is sized as a pointer by the backend. */
+    char sig[1024];
+    {
+      size_t off = 0;
+      int wrote = snprintf(sig, sizeof(sig), "fn(");
+      if (wrote > 0)
+        off += (size_t)wrote;
+      for (size_t i = 0; i < lam->parameter_count && off < sizeof(sig); i++) {
+        wrote = snprintf(sig + off, sizeof(sig) - off, "%s%s", i ? "," : "",
+                         lam->parameter_types[i]);
+        if (wrote > 0)
+          off += (size_t)wrote;
+      }
+      if (off < sizeof(sig))
+        snprintf(sig + off, sizeof(sig) - off, ")->%s",
+                 lam->return_type ? lam->return_type : "void");
+    }
+
+    if (lam->captured_count > 0) {
+      Type **ptypes = NULL;
+      if (lam->parameter_count > 0) {
+        ptypes = malloc(lam->parameter_count * sizeof(Type *));
+        if (!ptypes) {
+          return NULL;
+        }
+        for (size_t i = 0; i < lam->parameter_count; i++) {
+          ptypes[i] =
+              type_checker_get_type_by_name(checker, lam->parameter_types[i]);
+          if (!ptypes[i]) {
+            type_checker_set_error_at_location(
+                checker, expression->location,
+                "Unknown lambda parameter type '%s'", lam->parameter_types[i]);
+            free(ptypes);
+            return NULL;
+          }
+        }
+      }
+      Type *return_type =
+          lam->return_type
+              ? type_checker_get_type_by_name(checker, lam->return_type)
+              : checker->builtin_void;
+      if (!return_type) {
+        return_type = checker->builtin_void;
+      }
+      Type *closure_type = type_create_function_pointer(
+          ptypes, lam->parameter_count, return_type);
+      free(ptypes);
+      if (!closure_type) {
+        type_checker_set_error_at_location(checker, expression->location,
+                                           "Failed to create closure type");
+        return NULL;
+      }
+      /* The closure_env tag, not the name, drives call dispatch. */
+      closure_type->name = (char *)string_intern(sig);
+      closure_type->closure_env =
+          type_checker_get_type_by_name(checker, lam->env_struct_name);
+      return closure_type;
+    }
+
+    Symbol *sym = symbol_table_lookup(checker->symbol_table, lam->name);
+    if (!sym || sym->kind != SYMBOL_FUNCTION) {
+      type_checker_set_error_at_location(checker, expression->location,
+                                         "Internal: lifted lambda function '%s' "
+                                         "not found",
+                                         lam->name);
+      return NULL;
+    }
+    Type *return_type = sym->data.function.return_type;
+    if (!return_type) {
+      return_type = checker->builtin_void;
+    }
+    Type *fp_type = type_create_function_pointer(
+        sym->data.function.parameter_types,
+        sym->data.function.parameter_count, return_type);
+    if (!fp_type) {
+      type_checker_set_error_at_location(checker, expression->location,
+                                         "Failed to create lambda type");
+      return NULL;
+    }
+    fp_type->name = (char *)string_intern(sig);
+    return fp_type;
   }
 
   case AST_UNARY_EXPRESSION: {
@@ -323,9 +537,16 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
     // Thread.join(), Mutex.new(), mutex.lock(), guard (unlock via drop),
     // Atomic.new(), atomic.load/store/fetch_add/fetch_sub/cas(),
     // channel(), tx.send(), rx.recv()
-    if (call && call->object &&
-        !type_checker_desugar_struct_method_call(checker, expression, call)) {
-      return NULL;
+    if (call && call->object) {
+      if (!type_checker_desugar_struct_method_call(checker, expression, call)) {
+        return NULL;
+      }
+      /* The desugar may have rewritten a closure/fn-pointer field call
+       * (`obj.field(args)`) into a function-pointer call; re-dispatch on the new
+       * node kind, since the CallExpression `call` is no longer valid. */
+      if (expression->type != AST_FUNCTION_CALL) {
+        return type_checker_infer_type_internal(checker, expression);
+      }
     }
 
     Symbol *func_symbol =
@@ -341,6 +562,7 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
         func_symbol->type->kind == TYPE_FUNCTION_POINTER) {
       call->is_indirect_call = 1;
       Type *fp_type = func_symbol->type;
+      call->callee_closure_env = fp_type->closure_env;
       if (call->argument_count != fp_type->fn_param_count) {
         char error_msg[512];
         snprintf(error_msg, sizeof(error_msg),
@@ -415,6 +637,39 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
       return NULL;
     }
 
+    // assert/assert_eq are `mettle test` builtins: they exist only in the
+    // compile-time interpreter, so reject them outside @test functions
+    // (where they would survive into codegen and fail at link).
+    if (func_symbol->is_builtin &&
+        (strcmp(call->function_name, "assert") == 0 ||
+         strcmp(call->function_name, "assert_eq") == 0)) {
+      FunctionDeclaration *current_fn =
+          checker->current_function_decl && checker->current_function_decl->data
+              ? (FunctionDeclaration *)checker->current_function_decl->data
+              : NULL;
+      if (!current_fn || !current_fn->is_test) {
+        char error_msg[256];
+        snprintf(error_msg, sizeof(error_msg),
+                 "'%s' is a compile-time test builtin and can only be called "
+                 "inside a @test function",
+                 call->function_name);
+        checker->has_error = 1;
+        free(checker->error_message);
+        checker->error_message = strdup(error_msg);
+        if (checker->error_reporter) {
+          SourceSpan span = source_span_from_location(
+              expression->location, strlen(call->function_name));
+          span = error_reporter_span_snap_to_token(checker->error_reporter,
+                                                   span, call->function_name);
+          error_reporter_add_error_with_span_and_suggestion(
+              checker->error_reporter, ERROR_SEMANTIC, span, error_msg,
+              "mark the enclosing function @test and run it with `mettle "
+              "test`, or use an if + return instead");
+        }
+        return NULL;
+      }
+    }
+
     // Check argument count
     if (call->argument_count != func_symbol->data.function.parameter_count) {
       char error_msg[512];
@@ -423,8 +678,27 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
                call->function_name,
                (unsigned long long)func_symbol->data.function.parameter_count,
                (unsigned long long)call->argument_count);
-      type_checker_set_error_at_location(checker, expression->location,
-                                         error_msg);
+      checker->has_error = 1;
+      free(checker->error_message);
+      checker->error_message = strdup(error_msg);
+      if (checker->error_reporter) {
+        SourceSpan span = source_span_from_location(
+            expression->location, strlen(call->function_name));
+        /* The call node's location points at '('; walk back onto the name. */
+        if (span.column > strlen(call->function_name))
+          span.column -= strlen(call->function_name);
+        span = error_reporter_span_snap_to_token(checker->error_reporter, span,
+                                                 call->function_name);
+        error_reporter_add_error_with_span(checker->error_reporter,
+                                           ERROR_SEMANTIC, span, error_msg);
+        char label[128];
+        snprintf(label, sizeof(label), "expected %llu argument%s, got %llu",
+                 (unsigned long long)func_symbol->data.function.parameter_count,
+                 func_symbol->data.function.parameter_count == 1 ? "" : "s",
+                 (unsigned long long)call->argument_count);
+        error_reporter_set_last_label(checker->error_reporter, label);
+        type_checker_note_declared_here(checker, func_symbol, "function");
+      }
       return NULL;
     }
 
@@ -442,8 +716,20 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
            type_checker_is_null_pointer_constant(call->arguments[i]));
       if (!is_null_pointer_arg &&
            !type_checker_is_assignable(checker, param_type, arg_type)) {
-        type_checker_report_type_mismatch(checker, call->arguments[i]->location,
-                                          param_type->name, arg_type->name);
+        type_checker_report_type_mismatch_node(checker, call->arguments[i],
+                                               param_type->name,
+                                               arg_type->name);
+        if (func_symbol->data.function.parameter_names &&
+            func_symbol->data.function.parameter_names[i] &&
+            checker->error_reporter) {
+          char label[192];
+          snprintf(label, sizeof(label),
+                   "parameter '%s' expects '%s', this argument is '%s'",
+                   func_symbol->data.function.parameter_names[i],
+                   param_type->name, arg_type->name);
+          error_reporter_set_last_label(checker->error_reporter, label);
+        }
+        type_checker_note_declared_here(checker, func_symbol, "function");
         return NULL;
       }
 
@@ -588,6 +874,12 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
     }
 
     Type *object_type = type_checker_infer_type(checker, member->object);
+    /* Member access through a pointer-to-struct auto-dereferences (like C's
+     * `->`), matching what IR lowering already does. */
+    if (object_type && object_type->kind == TYPE_POINTER &&
+        object_type->base_type) {
+      object_type = object_type->base_type;
+    }
     if (object_type && (object_type->kind == TYPE_STRUCT ||
                         object_type->kind == TYPE_STRING)) {
       // Look up the field type in the struct

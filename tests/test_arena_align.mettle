@@ -1,13 +1,13 @@
 // arena_alloc_aligned honors explicit alignment requests up to 64.
 import "std/arena";
 
-function check_align(p: cstring, align_mask: int64) -> int32 {
+fn check_align(p: cstring, align_mask: int64) -> int32 {
   if (p == 0) { return 1; }
   if (((int64)p & align_mask) != (int64)0) { return 1; }
   return 0;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var a: Arena* = arena_init((int64)4096);
   if (a == 0) { return 1; }
 

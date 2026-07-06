@@ -61,7 +61,7 @@ for i in range(num_fns):
     emit("")
 
 # main() drives a subset of the functions and returns a checksum (mod 256).
-emit("function main() -> int32 {")
+emit("fn main() -> int32 {")
 emit("  var total: int64 = (int64)0;")
 step = max(1, num_fns // 2000)  # ~2000 call sites in main
 for i in range(0, num_fns, step):

@@ -1,6 +1,6 @@
 // Over-budget caller: fat callees fold into one refusal entry; the tiny
 // accessor is exempt from the caller budget and still inlines.
-function f1(x: int32) -> int32 {
+fn f1(x: int32) -> int32 {
     var t: int32 = x;
     t = t + 1;
     t = t + 2;
@@ -28,7 +28,7 @@ function f1(x: int32) -> int32 {
     t = t + 24;
     return t;
 }
-function f2(x: int32) -> int32 {
+fn f2(x: int32) -> int32 {
     var t: int32 = x;
     t = t * 1;
     t = t * 2;
@@ -56,7 +56,7 @@ function f2(x: int32) -> int32 {
     t = t * 24;
     return t;
 }
-function f3(x: int32) -> int32 {
+fn f3(x: int32) -> int32 {
     var t: int32 = x;
     t = t - 1;
     t = t - 2;
@@ -84,7 +84,7 @@ function f3(x: int32) -> int32 {
     t = t - 24;
     return t;
 }
-function f4(x: int32) -> int32 {
+fn f4(x: int32) -> int32 {
     var t: int32 = x;
     t = t ^ 1;
     t = t ^ 2;
@@ -113,9 +113,9 @@ function f4(x: int32) -> int32 {
     return t;
 }
 
-function tiny(x: int32) -> int32 { return x + 7; }
+fn tiny(x: int32) -> int32 { return x + 7; }
 
-function main() -> int32 {
+fn main() -> int32 {
     var a: int32[700];
     a[0] = 0;
     a[1] = 1;

@@ -1,0 +1,11 @@
+// is_even(10) -> 1. Mutual recursion across three functions.
+fn is_odd(n: int64) -> int64;
+fn is_even(n: int64) -> int64 {
+  if (n == 0) { return 1; }
+  return is_odd(n - 1);
+}
+fn is_odd(n: int64) -> int64 {
+  if (n == 0) { return 0; }
+  return is_even(n - 1);
+}
+fn main() -> int64 { return is_even(10); }

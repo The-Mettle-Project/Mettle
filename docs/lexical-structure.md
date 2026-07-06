@@ -47,9 +47,9 @@ Vector3
 
 The following words are reserved and cannot be used as identifiers.
 
-Declarations: `import`, `extern`, `export`, `var`, `function`, `fn`, `kernel`, `struct`, `enum`, `method`. Control flow: `if`, `else`, `while`, `for`, `switch`, `case`, `default`, `break`, `continue`, `return`, `dispatch`. Other: `asm`, `this`, `new`. Types: `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float32`, `float64`, `string`.
+Declarations: `import`, `extern`, `export`, `var`, `fn`, `kernel`, `struct`, `enum`, `method`. Control flow: `if`, `else`, `while`, `for`, `switch`, `case`, `default`, `break`, `continue`, `return`, `dispatch`. Other: `asm`, `this`, `new`. Types: `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float32`, `float64`, `string`.
 
-`kernel` declares a GPU entry point (parses like `function`; emitted as PTX under `--emit-ptx`) and `dispatch` launches one; see [GPU Offload](gpu.md). `in` (used in range-based `for i in lo..hi`) is a *contextual* keyword: it is only special in that position and remains usable as an ordinary identifier elsewhere.
+`kernel` declares a GPU entry point (parses like `fn`; emitted as PTX under `--emit-ptx`) and `dispatch` launches one; see [GPU Offload](gpu.md). `in` (used in range-based `for i in lo..hi`) is a *contextual* keyword: it is only special in that position and remains usable as an ordinary identifier elsewhere.
 
 `this` is only valid inside method bodies; it refers to the receiver. Using `this` as a variable name outside a method produces an error. `new` is an expression keyword, not a statement keyword; it appears in expressions like `var p: T* = new T` and cannot start a statement by itself. `cstring` is a type alias, not a keyword; it is available as a built-in name.
 
@@ -85,12 +85,12 @@ Assignment `=`. Compound assignment `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^
 
 **Logical operators:** Short-circuit logical AND (`&&`) and OR (`||`) are supported.
 
-**Arrow `->`:** The arrow serves two roles. In function signatures it denotes the return type: `function f() -> int32`. In expressions it denotes pointer field access: `ptr->field`. Both uses appear in the same program:
+**Arrow `->`:** The arrow serves two roles. In function signatures it denotes the return type: `fn f() -> int32`. In expressions it denotes pointer field access: `ptr->field`. Both uses appear in the same program:
 
 ```mettle
 struct Point { x: int32; y: int32; }
 
-function get_x(p: Point*) -> int32 {
+fn get_x(p: Point*) -> int32 {
   return p->x;
 }
 ```

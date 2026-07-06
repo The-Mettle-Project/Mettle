@@ -1,5 +1,5 @@
 import "shared_math";
 
-function main() -> int32 {
+fn main() -> int32 {
   return forty_two() - 42;
 }

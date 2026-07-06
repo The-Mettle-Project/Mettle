@@ -138,7 +138,7 @@ reassociate and vectorize.
 for *every* counted loop in the body that does not carry its own `@simd`:
 
 ```mettle
-@simd! function sum(a: int32*, n: int64) -> int64 {
+@simd! fn sum(a: int32*, n: int64) -> int64 {
   var s: int64 = 0;
   var i: int64 = 0;
   while (i < n) { s = s + (int64)a[i]; i = i + 1; }   // inherits @simd! from the function

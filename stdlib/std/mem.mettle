@@ -4,14 +4,14 @@
 // For runtime-tracked heap objects, use the `new` keyword instead.
 
 // ─── C runtime memory functions ─────────────────────────────────────────────
-export extern function malloc(size: int64) -> cstring = "malloc";
-export extern function calloc(count: int64, size: int64) -> cstring = "calloc";
-export extern function realloc(ptr: cstring, size: int64) -> cstring = "realloc";
-export extern function free(ptr: cstring) = "free";
-export extern function memset(ptr: cstring, value: int32, size: int64) -> cstring = "memset";
-export extern function memcpy(dest: cstring, src: cstring, size: int64) -> cstring = "memcpy";
-export extern function memmove(dest: cstring, src: cstring, size: int64) -> cstring = "memmove";
-export extern function memcmp(a: cstring, b: cstring, size: int64) -> int32 = "memcmp";
+export extern fn malloc(size: int64) -> cstring = "malloc";
+export extern fn calloc(count: int64, size: int64) -> cstring = "calloc";
+export extern fn realloc(ptr: cstring, size: int64) -> cstring = "realloc";
+export extern fn free(ptr: cstring) = "free";
+export extern fn memset(ptr: cstring, value: int32, size: int64) -> cstring = "memset";
+export extern fn memcpy(dest: cstring, src: cstring, size: int64) -> cstring = "memcpy";
+export extern fn memmove(dest: cstring, src: cstring, size: int64) -> cstring = "memmove";
+export extern fn memcmp(a: cstring, b: cstring, size: int64) -> int32 = "memcmp";
 
 // ─── Native memory operations ───────────────────────────────────────────────
 //
@@ -22,7 +22,7 @@ export extern function memcmp(a: cstring, b: cstring, size: int64) -> int32 = "m
 // pick up. `byte` arguments use only the low 8 bits.
 
 // Set `n` bytes at `p` to zero. Returns `p`.
-export function mem_zero(p: cstring, n: int64) -> cstring {
+export fn mem_zero(p: cstring, n: int64) -> cstring {
   if (n <= (int64)0) { return p; }
   var d: int64 = (int64)p;
   var i: int64 = (int64)0;
@@ -39,7 +39,7 @@ export function mem_zero(p: cstring, n: int64) -> cstring {
 }
 
 // Set `n` bytes at `p` to the low byte of `value`. Returns `p`.
-export function mem_fill(p: cstring, value: int32, n: int64) -> cstring {
+export fn mem_fill(p: cstring, value: int32, n: int64) -> cstring {
   if (n <= (int64)0) { return p; }
   var b: int64 = (int64)value & (int64)0xFF;
   var word: int64 = b | (b << (int64)8) | (b << (int64)16) | (b << (int64)24) | (b << (int64)32) | (b << (int64)40) | (b << (int64)48) | (b << (int64)56);
@@ -59,7 +59,7 @@ export function mem_fill(p: cstring, value: int32, n: int64) -> cstring {
 
 // Copy `n` bytes from `src` to `dst`. The ranges must not overlap; use
 // mem_move when they might. Returns `dst`.
-export function mem_copy(dst: cstring, src: cstring, n: int64) -> cstring {
+export fn mem_copy(dst: cstring, src: cstring, n: int64) -> cstring {
   if (n <= (int64)0 || dst == src) { return dst; }
   var d: int64 = (int64)dst;
   var s: int64 = (int64)src;
@@ -79,7 +79,7 @@ export function mem_copy(dst: cstring, src: cstring, n: int64) -> cstring {
 // Copy `n` bytes from `src` to `dst`, handling overlap correctly. Copies
 // backward when `dst` is above `src` so an overlapping forward copy can't
 // clobber not-yet-read source bytes. Returns `dst`.
-export function mem_move(dst: cstring, src: cstring, n: int64) -> cstring {
+export fn mem_move(dst: cstring, src: cstring, n: int64) -> cstring {
   if (n <= (int64)0 || dst == src) { return dst; }
   var d: int64 = (int64)dst;
   var s: int64 = (int64)src;
@@ -100,7 +100,7 @@ export function mem_move(dst: cstring, src: cstring, n: int64) -> cstring {
 }
 
 // Return 1 if the first `n` bytes of `a` and `b` are equal, else 0.
-export function mem_equal(a: cstring, b: cstring, n: int64) -> int32 {
+export fn mem_equal(a: cstring, b: cstring, n: int64) -> int32 {
   if (n <= (int64)0 || a == b) { return 1; }
   var pa: int64 = (int64)a;
   var pb: int64 = (int64)b;
@@ -126,7 +126,7 @@ export function mem_equal(a: cstring, b: cstring, n: int64) -> int32 {
 // locate the differing position. On little-endian x86-64 the lowest-address
 // byte is the low-order byte of the word, so the byte rescan walks memory order
 // and reports the same first-difference C memcmp would.
-export function mem_compare(a: cstring, b: cstring, n: int64) -> int32 {
+export fn mem_compare(a: cstring, b: cstring, n: int64) -> int32 {
   if (n <= (int64)0 || a == b) { return 0; }
   var pa: int64 = (int64)a;
   var pb: int64 = (int64)b;
@@ -159,7 +159,7 @@ export function mem_compare(a: cstring, b: cstring, n: int64) -> int32 {
 
 // Return the index of the first byte in the first `n` bytes of `p` equal to
 // the low byte of `value`, or -1 if not present.
-export function mem_find_byte(p: cstring, value: int32, n: int64) -> int64 {
+export fn mem_find_byte(p: cstring, value: int32, n: int64) -> int64 {
   if (n <= (int64)0) { return (int64)-1; }
   var target: int32 = value & 0xFF;
   var base: int64 = (int64)p;
@@ -176,12 +176,12 @@ export function mem_find_byte(p: cstring, value: int32, n: int64) -> int64 {
 // ─── Buffer helpers ─────────────────────────────────────────────────────────
 
 // Allocate a zero-initialized buffer of `n` bytes.
-export function alloc_zeroed(n: int64) -> cstring {
+export fn alloc_zeroed(n: int64) -> cstring {
   return calloc(1, n);
 }
 
 // Copy `len` bytes from src into a freshly allocated buffer.
-export function buf_dup(src: cstring, len: int64) -> cstring {
+export fn buf_dup(src: cstring, len: int64) -> cstring {
   if (len <= 0) { return 0; }
   var dst: cstring = malloc(len);
   if (dst == 0) { return 0; }

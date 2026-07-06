@@ -1,5 +1,5 @@
 // Array followed by scalar — scalar not overwritten by array operations
-function main() -> int32 {
+fn main() -> int32 {
   var arr: int32[8];
   var guard: int32 = 0x12345678;
   var i: int32 = 0;

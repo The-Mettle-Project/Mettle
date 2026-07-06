@@ -2,7 +2,7 @@
 import "std/io";
 import "std/mem";
 
-function main() -> int32 {
+fn main() -> int32 {
   var n: int32 = 8;
   var n64: int64 = (int64)n;
   var fails: int32 = 0;

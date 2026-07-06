@@ -10,7 +10,7 @@
 //
 // Self-checking: exits 0 iff every expectation holds, else a distinct code.
 
-function main() -> int32 {
+fn main() -> int32 {
   var a: int64 = 100;
   var b: int64 = 5;
 

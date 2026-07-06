@@ -1,5 +1,5 @@
 import "bad_semantic_module";
 
-function main() -> int32 {
+fn main() -> int32 {
   return imported_bad_semantic();
 }

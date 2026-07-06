@@ -1,0 +1,123 @@
+// Mettle binary-search-tree benchmark (Suite 2)
+//
+// Builds a BST from 4096 pseudo-random int32 values (node pool, no per-node
+// malloc) and repeatedly walks it with a recursive in-order sum. 200 passes.
+// Stresses recursive tree traversal + branchy pointer comparisons, distinct
+// from the flat pointer-chase of linked_list_sum.
+//
+// Build: build.bat
+// Run: bst_insert.exe
+
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+var NODE_COUNT: int32 = 4096;
+var NODE_BYTES: int64 = 12;
+
+fn node_value(pool: cstring, idx: int32) -> int32 {
+  return *(int32*)(pool + (int64)idx * NODE_BYTES);
+}
+
+fn set_node_value(pool: cstring, idx: int32, v: int32) {
+  *(int32*)(pool + (int64)idx * NODE_BYTES) = v;
+}
+
+fn node_left(pool: cstring, idx: int32) -> int32 {
+  return *(int32*)(pool + (int64)idx * NODE_BYTES + 4);
+}
+
+fn set_node_left(pool: cstring, idx: int32, v: int32) {
+  *(int32*)(pool + (int64)idx * NODE_BYTES + 4) = v;
+}
+
+fn node_right(pool: cstring, idx: int32) -> int32 {
+  return *(int32*)(pool + (int64)idx * NODE_BYTES + 8);
+}
+
+fn set_node_right(pool: cstring, idx: int32, v: int32) {
+  *(int32*)(pool + (int64)idx * NODE_BYTES + 8) = v;
+}
+
+fn bst_insert(pool: cstring, root: int32, new_idx: int32, value: int32) -> int32 {
+  if (root < 0) {
+    return new_idx;
+  }
+  if (value < node_value(pool, root)) {
+    set_node_left(pool, root, bst_insert(pool, node_left(pool, root), new_idx, value));
+  } else {
+    set_node_right(pool, root, bst_insert(pool, node_right(pool, root), new_idx, value));
+  }
+  return root;
+}
+
+fn build_tree(pool: cstring, count: int32) -> int32 {
+  var state: uint32 = 2246822519;
+  var root: int32 = -1;
+  var i: int32 = 0;
+  while (i < count) {
+    state = state ^ (state << 13);
+    state = state ^ (state >> 17);
+    state = state ^ (state << 5);
+    var v: int32 = (int32)(state % 1000000);
+    set_node_value(pool, i, v);
+    set_node_left(pool, i, -1);
+    set_node_right(pool, i, -1);
+    root = bst_insert(pool, root, i, v);
+    i = i + 1;
+  }
+  return root;
+}
+
+fn inorder_sum(pool: cstring, idx: int32) -> int64 {
+  if (idx < 0) {
+    return 0;
+  }
+  var left_sum: int64 = inorder_sum(pool, node_left(pool, idx));
+  var here: int64 = (int64)node_value(pool, idx);
+  var right_sum: int64 = inorder_sum(pool, node_right(pool, idx));
+  return left_sum + here + right_sum;
+}
+
+fn main() -> int32 {
+  var count: int32 = NODE_COUNT;
+  var pool: cstring = malloc((int64)count * NODE_BYTES);
+  if (pool == 0) {
+    println("malloc failed");
+    return 1;
+  }
+
+  var root: int32 = build_tree(pool, count);
+
+  println("BST insert + in-order traversal: 4096 nodes");
+
+  var check: int64 = inorder_sum(pool, root);
+  print("Checksum = ");
+  println_int(check);
+
+  var passes: int32 = 200;
+  println("Benchmark: 200 passes (bst_insert)");
+
+  var t0: uint64 = bench_time_us();
+  var bench_sum: int64 = 0;
+  var p: int32 = 0;
+  while (p < passes) {
+    bench_sum = bench_sum + inorder_sum(pool, root);
+    p = p + 1;
+  }
+  var elapsed_us: uint64 = bench_time_us() - t0;
+
+  print("Bench sum = ");
+  println_int(bench_sum);
+  print("Time: ");
+  print_int(elapsed_us);
+  println(" us");
+
+  var per_pass: uint64 = elapsed_us / passes;
+  print("Per pass: ~");
+  print_int(per_pass);
+  println(" us");
+
+  free(pool);
+  return 0;
+}

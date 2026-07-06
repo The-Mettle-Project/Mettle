@@ -17,22 +17,22 @@ import "lib/vec";
 
 /// Scales a value by an amount.
 /// Two doc lines.
-@inline function scale(value: int32, amount: int32) -> int32 {
+@inline fn scale(value: int32, amount: int32) -> int32 {
     return value * amount;
 }
 
-export function entry(a: float32*, n: int64) -> float32 {
+export fn entry(a: float32*, n: int64) -> float32 {
     var total: float32 = 0.0;
     var i: int64 = 0;
     while (i < n) {
         total = total + a[i];
         i = i + 1;
     }
-    // "function fake_in_string" inside a comment must not index
+    // "fn fake_in_string" inside a comment must not index
     return total;
 }
 
-extern function puts(msg: cstring) -> int32 = "puts";
+extern fn puts(msg: cstring) -> int32 = "puts";
 
 struct Point {
     x: int32;
@@ -48,15 +48,15 @@ enum Shape {
 }
 
 trait Order {
-    function less(self: Self, other: Self) -> bool;
+    fn less(self: Self, other: Self) -> bool;
 }
 
 export var GRID_W: int32 = 64;
 extern var errno_value: int32 = "errno";
 
-function main() -> int32 {
+fn main() -> int32 {
     var p: Point* = new Point;
-    var s: string = "function not_a_decl() {}";
+    var s: string = "fn not_a_decl() {}";
     var d: int32 = scale(GRID_W, 3);
     for k in 0..10 {
         d = d + k;
@@ -65,12 +65,12 @@ function main() -> int32 {
 }
 `;
 
-const LIB_SRC = `export function vec_add(a: float32*, b: float32*, n: int64) {
+const LIB_SRC = `export fn vec_add(a: float32*, b: float32*, n: int64) {
     var i: int64 = 0;
     while (i < n) { a[i] = a[i] + b[i]; i = i + 1; }
 }
 
-function internal_helper() -> int32 {
+fn internal_helper() -> int32 {
     return 1;
 }
 `;
@@ -111,7 +111,7 @@ assert.strictEqual(scale.params.length, 2);
 assert.deepStrictEqual(scale.params[0], { name: 'value', type: 'int32' });
 assert.strictEqual(scale.returnType, 'int32');
 assert.strictEqual(scale.doc.length, 2, 'two /// doc lines');
-assert.strictEqual(scale.line, lineOf('@inline function scale'));
+assert.strictEqual(scale.line, lineOf('@inline fn scale'));
 
 const entry = byName.get('entry');
 assert.ok(entry.exported, 'entry exported');
@@ -184,7 +184,7 @@ assert.strictEqual(methodHits.length, 1, 'methods findable by name');
 assert.ok(methodHits[0].method);
 
 // live-buffer override wins over disk
-index.overrideText(mainPath, MAIN_SRC + '\nfunction added_live() -> int32 { return 0; }\n');
+index.overrideText(mainPath, MAIN_SRC + '\nfn added_live() -> int32 { return 0; }\n');
 assert.strictEqual(index.lookup('added_live', mainPath, env).length, 1, 'override text indexed');
 index.clearOverride(mainPath);
 assert.strictEqual(index.lookup('added_live', mainPath, env).length, 0, 'override cleared');
@@ -256,8 +256,8 @@ assert.deepStrictEqual(analysis.coffDefinedSymbols(path.join(tmp, 'garbage.o')),
 
 const externMain = path.join(tmp, 'kernel_user.mettle');
 fs.writeFileSync(externMain,
-  'extern function gemv(base: uint8*, n: int64) -> int32 = "gemv_q4k_avx2";\n' +
-  'function main() -> int32 { return gemv(0, 0); }\n');
+  'extern fn gemv(base: uint8*, n: int64) -> int32 = "gemv_q4k_avx2";\n' +
+  'fn main() -> int32 { return gemv(0, 0); }\n');
 const linkObjs = analysis.findExternLinkObjects(new analysis.ProjectIndex(), externMain, env);
 assert.deepStrictEqual(linkObjs, [kernelObj],
   'only the object defining a declared extern symbol is selected');

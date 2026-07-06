@@ -1,6 +1,35 @@
 // AST->IR lowering: driver, context lifecycle, emit primitives.
 #include "ir_lowering_internal.h"
 
+static void ir_lowering_free_control_stack(IRLoweringContext *context) {
+  for (size_t j = 0; j < context->control_count; j++) {
+    free(context->control_stack[j].break_label);
+    free(context->control_stack[j].continue_label);
+    free(context->control_stack[j].user_label);
+  }
+  free(context->control_stack);
+  context->control_stack = NULL;
+  context->control_count = 0;
+}
+
+// Tear down a partially-built program on any lowering failure and hand the
+// pending error to the caller (or free it if the caller does not want one).
+// Always returns NULL so callers can `return ir_lowering_fail(...)`.
+static IRProgram *ir_lowering_fail(IRProgram *ir_program,
+                                   IRLoweringContext *context,
+                                   char **error_message) {
+  ir_program_destroy(ir_program);
+  ir_lowering_free_control_stack(context);
+  if (error_message) {
+    *error_message = context->error_message
+                         ? context->error_message
+                         : mettle_strdup("Unknown IR lowering error");
+  } else {
+    free(context->error_message);
+  }
+  return NULL;
+}
+
 IRProgram *ir_lower_program(ASTNode *program, TypeChecker *type_checker,
                             SymbolTable *symbol_table, char **error_message,
                             int emit_runtime_checks) {
@@ -43,21 +72,7 @@ IRProgram *ir_lower_program(ASTNode *program, TypeChecker *type_checker,
         (FunctionDeclaration *)declaration->data;
     if (!function_data) {
       ir_set_error(&context, "Malformed function declaration");
-      ir_program_destroy(ir_program);
-      for (size_t j = 0; j < context.control_count; j++) {
-        free(context.control_stack[j].break_label);
-        free(context.control_stack[j].continue_label);
-        free(context.control_stack[j].user_label);
-      }
-      free(context.control_stack);
-      if (error_message) {
-        *error_message = context.error_message
-                             ? context.error_message
-                             : mettle_strdup("Unknown IR lowering error");
-      } else {
-        free(context.error_message);
-      }
-      return NULL;
+      return ir_lowering_fail(ir_program, &context, error_message);
     }
     if (!function_data->body) {
       continue;
@@ -68,50 +83,17 @@ IRProgram *ir_lower_program(ASTNode *program, TypeChecker *type_checker,
       if (!context.error_message) {
         ir_set_error(&context, "Failed to lower function declaration to IR");
       }
-      ir_program_destroy(ir_program);
-      for (size_t j = 0; j < context.control_count; j++) {
-        free(context.control_stack[j].break_label);
-        free(context.control_stack[j].continue_label);
-        free(context.control_stack[j].user_label);
-      }
-      free(context.control_stack);
-      if (error_message) {
-        *error_message = context.error_message
-                             ? context.error_message
-                             : mettle_strdup("Unknown IR lowering error");
-      } else {
-        free(context.error_message);
-      }
-      return NULL;
+      return ir_lowering_fail(ir_program, &context, error_message);
     }
 
     if (!ir_program_add_function(ir_program, function)) {
       ir_function_destroy(function);
       ir_set_error(&context, "Out of memory while appending IR function");
-      ir_program_destroy(ir_program);
-      for (size_t j = 0; j < context.control_count; j++) {
-        free(context.control_stack[j].break_label);
-        free(context.control_stack[j].continue_label);
-        free(context.control_stack[j].user_label);
-      }
-      free(context.control_stack);
-      if (error_message) {
-        *error_message = context.error_message
-                             ? context.error_message
-                             : mettle_strdup("Unknown IR lowering error");
-      } else {
-        free(context.error_message);
-      }
-      return NULL;
+      return ir_lowering_fail(ir_program, &context, error_message);
     }
   }
 
-  for (size_t j = 0; j < context.control_count; j++) {
-    free(context.control_stack[j].break_label);
-    free(context.control_stack[j].continue_label);
-    free(context.control_stack[j].user_label);
-  }
-  free(context.control_stack);
+  ir_lowering_free_control_stack(&context);
 
   if (context.error_message) {
     if (error_message) {
@@ -150,6 +132,7 @@ IRFunction *ir_lower_function(IRLoweringContext *context,
   function->is_noinline = function_data->is_noinline;
   function->is_pure = function_data->is_pure;
   function->is_noalloc = function_data->is_noalloc;
+  function->is_test = function_data->is_test;
   /* A function-level `@simd` decorator becomes the default mode for every
    * counted loop in the body that has no `@simd` of its own. */
   context->current_function_simd_default = function_data->simd_mode;
@@ -211,17 +194,6 @@ IRFunction *ir_lower_function(IRLoweringContext *context,
   return function;
 }
 
-// `@simd` loop markers. A marker is an IR_OP_NOP carrying a sentinel string in
-// `text`: "@@simd:B:<id>:<mode>" before a vectorization-requested loop and
-// "@@simd:E:<id>:0" after it. NOP is transparent to every recognizer (they skip
-// NOPs) and a no-op in every backend, so the marker never disturbs codegen or
-// vectorization; the release-stage contract verifier (see ir_optimize) pairs
-// B/E by id, checks whether a SIMD intrinsic landed between them, and then
-// clears the markers. `which` is 'B' or 'E'; `mode` is a SimdAttr.
-// (IR_SIMD_MARKER_PREFIX and the text format live in ir.h.)
-
-/* --explain: bracket every loop with report-only markers so the optimizer can
- * tell the user what became of it. Off by default; set by the driver. */
 int g_ir_lowering_explain = 0;
 
 void ir_lowering_set_explain(int enabled) { g_ir_lowering_explain = enabled; }
@@ -254,10 +226,10 @@ void ir_set_error(IRLoweringContext *context, const char *format, ...) {
 
 char *ir_new_temp_name(IRLoweringContext *context) {
   char buffer[64];
-  /* The '.' prefix keeps temp names out of the user-identifier namespace.
-   * Several backend tables (the MIR name->vreg map, float-bits marking) key on
-   * the bare name, so a temp named "t2" would alias a user local named "t2"
-   * and share its storage — a silent miscompile. */
+  // The '.' prefix keeps temp names out of the user-identifier namespace.
+  // Several backend tables (the MIR name->vreg map, float-bits marking) key on
+  // the bare name, so a temp named "t2" would alias a user local named "t2" and
+  // share its storage - a silent miscompile.
   snprintf(buffer, sizeof(buffer), ".t%d", context->next_temp_id++);
   return mettle_strdup(buffer);
 }
@@ -304,6 +276,13 @@ int ir_emit_label_instruction(IRLoweringContext *context,
   return ir_emit(context, function, &instruction);
 }
 
+// `@simd` loop markers. A marker is an IR_OP_NOP carrying a sentinel string in
+// `text`: "@@simd:B:<id>:<mode>" before a vectorization-requested loop and
+// "@@simd:E:<id>:0" after it. NOP is transparent to every recognizer (they skip
+// NOPs) and a no-op in every backend, so the marker never disturbs codegen; the
+// release-stage contract verifier (see ir_optimize) pairs B/E by id, checks
+// whether a SIMD intrinsic landed between them, then clears the markers.
+// `which` is 'B' or 'E'; `mode` is a SimdAttr.
 int ir_emit_simd_marker(IRLoweringContext *context, IRFunction *function,
                                char which, int id, int mode,
                                SourceLocation location) {

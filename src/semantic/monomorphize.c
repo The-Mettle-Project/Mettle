@@ -2,6 +2,8 @@
 #include "../common.h"
 #include "../string_intern.h"
 #include "../common.h"
+#include "../lexer/lexer.h"
+#include "../parser/parser.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2127,6 +2129,975 @@ static int mono_emit_instantiation(MonoContext *ctx, Program *prog,
   inst->emitted = 1;
   collect_type_instantiations(mono_node, ctx);
   return 1;
+}
+
+/* ---- Closure conversion --------------------------------------------------
+ * Anonymous `fn(...) { }` expressions parse to AST_LAMBDA_EXPRESSION nodes
+ * carrying a FunctionDeclaration payload with a NULL name. This pass lifts each
+ * lambda body to a uniquely-named top-level function and records that name on
+ * the lambda node (fd->name) so the type checker and IR lowering treat the
+ * lambda value as the address of that function. A lambda that references a
+ * variable from an enclosing function is a true (capturing) closure, handled in
+ * a later step. */
+
+/* A scope's variable names paired with their declared type strings (NULL when
+ * the type was inferred and no annotation is available). */
+typedef struct {
+  char **names;
+  char **types;
+  size_t count;
+  size_t cap;
+} CCEnv;
+
+static int cc_env_has(const CCEnv *e, const char *name) {
+  if (!name)
+    return 0;
+  for (size_t i = 0; i < e->count; i++)
+    if (strcmp(e->names[i], name) == 0)
+      return 1;
+  return 0;
+}
+
+static const char *cc_env_type(const CCEnv *e, const char *name) {
+  if (!name)
+    return NULL;
+  for (size_t i = 0; i < e->count; i++)
+    if (strcmp(e->names[i], name) == 0)
+      return e->types[i];
+  return NULL;
+}
+
+static void cc_env_add(CCEnv *e, const char *name, const char *type) {
+  if (!name || cc_env_has(e, name))
+    return;
+  if (e->count == e->cap) {
+    size_t ncap = e->cap ? e->cap * 2 : 8;
+    char **gn = realloc(e->names, ncap * sizeof(char *));
+    char **gt = realloc(e->types, ncap * sizeof(char *));
+    if (!gn || !gt) {
+      free(gn);
+      free(gt);
+      return;
+    }
+    e->names = gn;
+    e->types = gt;
+    e->cap = ncap;
+  }
+  e->names[e->count] = strdup(name);
+  e->types[e->count] = type ? strdup(type) : NULL;
+  e->count++;
+}
+
+static void cc_env_free(CCEnv *e) {
+  for (size_t i = 0; i < e->count; i++) {
+    free(e->names[i]);
+    free(e->types[i]);
+  }
+  free(e->names);
+  free(e->types);
+  e->names = NULL;
+  e->types = NULL;
+  e->count = 0;
+  e->cap = 0;
+}
+
+/* Var-declaration names (with their type strings) inside `node`, not descending
+ * into nested lambdas (which open their own scope). */
+static void cc_collect_vars(ASTNode *node, CCEnv *env) {
+  if (!node || node->type == AST_LAMBDA_EXPRESSION)
+    return;
+  if (node->type == AST_VAR_DECLARATION) {
+    VarDeclaration *vd = (VarDeclaration *)node->data;
+    if (vd)
+      cc_env_add(env, vd->name, vd->type_name);
+  }
+  for (size_t i = 0; i < node->child_count; i++)
+    cc_collect_vars(node->children[i], env);
+}
+
+static void cc_collect_fn_env(FunctionDeclaration *fd, CCEnv *env) {
+  for (size_t i = 0; i < fd->parameter_count; i++)
+    cc_env_add(env, fd->parameter_names[i], fd->parameter_types[i]);
+  cc_collect_vars(fd->body, env);
+}
+
+/* A name used in the lambda body that is bound in an enclosing function (and not
+ * rebound inside the lambda) is a capture. Does not descend into nested lambdas.
+ * Captures are accumulated in first-reference order in `caps`. */
+static void cc_scan_captures(ASTNode *node, const CCEnv *enclosing,
+                             const CCEnv *bound, CCEnv *caps) {
+  if (!node || node->type == AST_LAMBDA_EXPRESSION)
+    return;
+  const char *use = NULL;
+  if (node->type == AST_IDENTIFIER) {
+    Identifier *id = (Identifier *)node->data;
+    use = id ? id->name : NULL;
+  } else if (node->type == AST_ASSIGNMENT) {
+    Assignment *a = (Assignment *)node->data;
+    use = a ? a->variable_name : NULL;
+  } else if (node->type == AST_FUNCTION_CALL) {
+    CallExpression *c = (CallExpression *)node->data;
+    use = c ? c->function_name : NULL;
+  }
+  if (use && !cc_env_has(bound, use) && cc_env_has(enclosing, use))
+    cc_env_add(caps, use, cc_env_type(enclosing, use));
+  for (size_t i = 0; i < node->child_count; i++)
+    cc_scan_captures(node->children[i], enclosing, bound, caps);
+}
+
+/* Growable text buffer for synthesizing source. */
+typedef struct {
+  char *data;
+  size_t len;
+  size_t cap;
+} CCBuf;
+
+static void cc_buf_add(CCBuf *b, const char *s) {
+  size_t n = strlen(s);
+  if (b->len + n + 1 > b->cap) {
+    size_t ncap = b->cap ? b->cap * 2 : 256;
+    while (ncap < b->len + n + 1)
+      ncap *= 2;
+    char *grown = realloc(b->data, ncap);
+    if (!grown)
+      return;
+    b->data = grown;
+    b->cap = ncap;
+  }
+  memcpy(b->data + b->len, s, n + 1);
+  b->len += n;
+}
+
+static void cc_buf_add_num(CCBuf *b, const char *prefix, size_t n) {
+  char tmp[32];
+  snprintf(tmp, sizeof(tmp), "%s%zu", prefix, n);
+  cc_buf_add(b, tmp);
+}
+
+static int cc_cap_index(const CCEnv *caps, const char *name) {
+  if (!name)
+    return -1;
+  for (size_t i = 0; i < caps->count; i++)
+    if (strcmp(caps->names[i], name) == 0)
+      return (int)i;
+  return -1;
+}
+
+static ASTNode *cc_env_field_access(int idx, SourceLocation loc) {
+  char field[32];
+  snprintf(field, sizeof(field), "__cap%d", idx);
+  ASTNode *env_id = ast_create_identifier("__env", loc);
+  return env_id ? ast_create_member_access(env_id, field, loc) : NULL;
+}
+
+/* Rewrite captured-variable references inside a lifted closure body into direct
+ * accesses to the heap environment (`__env.__capN`), so reads and writes go
+ * through the environment and mutations persist across calls. A captured name is
+ * never re-declared inside the lambda body (else it would not be a capture), so
+ * every matching reference is the capture. Nested lambdas are not descended into
+ * (their captures are handled when they are themselves lifted). Replaced payload
+ * nodes are left unfreed - a small, bounded compile-time allocation. */
+static void cc_rewrite_captures(ASTNode *node, const CCEnv *caps) {
+  if (!node || node->type == AST_LAMBDA_EXPRESSION)
+    return;
+
+  if (node->type == AST_IDENTIFIER) {
+    Identifier *id = (Identifier *)node->data;
+    int idx = id ? cc_cap_index(caps, id->name) : -1;
+    if (idx >= 0) {
+      char field[32];
+      snprintf(field, sizeof(field), "__cap%d", idx);
+      ASTNode *env_id = ast_create_identifier("__env", node->location);
+      MemberAccess *ma = env_id ? malloc(sizeof(MemberAccess)) : NULL;
+      if (ma) {
+        ma->object = env_id;
+        ma->member = (char *)string_intern(field);
+        node->type = AST_MEMBER_ACCESS;
+        node->data = ma;
+        node->resolved_type = NULL;
+        ast_add_child(node, env_id);
+      }
+    }
+    return;
+  }
+
+  if (node->type == AST_FUNCTION_CALL) {
+    CallExpression *c = (CallExpression *)node->data;
+    int idx = (c && !c->object) ? cc_cap_index(caps, c->function_name) : -1;
+    if (idx >= 0) {
+      ASTNode *member = cc_env_field_access(idx, node->location);
+      FuncPtrCall *fp = member ? malloc(sizeof(FuncPtrCall)) : NULL;
+      if (fp) {
+        fp->function = member;
+        fp->arguments = c->arguments;
+        fp->argument_count = c->argument_count;
+        node->child_count = 0;
+        node->type = AST_FUNC_PTR_CALL;
+        node->data = fp;
+        node->resolved_type = NULL;
+        ast_add_child(node, member);
+        for (size_t i = 0; i < fp->argument_count; i++)
+          if (fp->arguments[i])
+            ast_add_child(node, fp->arguments[i]);
+      }
+    }
+  } else if (node->type == AST_ASSIGNMENT) {
+    Assignment *a = (Assignment *)node->data;
+    if (a && !a->target && a->variable_name) {
+      int idx = cc_cap_index(caps, a->variable_name);
+      if (idx >= 0) {
+        ASTNode *member = cc_env_field_access(idx, node->location);
+        if (member) {
+          a->target = member;
+          a->variable_name = NULL; /* force the field-assignment path */
+          ast_add_child(node, member);
+        }
+      }
+    }
+  }
+
+  for (size_t i = 0; i < node->child_count; i++)
+    cc_rewrite_captures(node->children[i], caps);
+}
+
+static int g_cc_counter;
+
+/* Lift a capturing lambda: synthesize an environment struct, a lifted function
+ * (env pointer + user params; captures copied from the env at entry), and a
+ * constructor that allocates and populates the env. The lambda value becomes a
+ * call to the constructor. Built as source text and parsed, then the original
+ * body is grafted onto the lifted function. */
+static void cc_emit_capturing(ASTNode *lambda, FunctionDeclaration *fd,
+                              CCEnv *caps, ASTNode *program, Program *prog,
+                              ErrorReporter *reporter, int *had_error) {
+  for (size_t i = 0; i < caps->count; i++) {
+    if (!caps->types[i]) {
+      char message[256];
+      snprintf(message, sizeof(message),
+               "cannot capture '%s' in a closure: its type is inferred; add an "
+               "explicit type annotation to the variable",
+               caps->names[i]);
+      if (reporter)
+        error_reporter_add_error(reporter, ERROR_SEMANTIC, lambda->location,
+                                 message);
+      *had_error = 1;
+      return;
+    }
+  }
+
+  int id = g_cc_counter++;
+  char env_name[32], lam_name[32], make_name[32], idx[24];
+  snprintf(env_name, sizeof(env_name), "__ClosEnv_%d", id);
+  snprintf(lam_name, sizeof(lam_name), "__lam_%d", id);
+  snprintf(make_name, sizeof(make_name), "__make_lam_%d", id);
+  const char *ret = fd->return_type ? fd->return_type : "void";
+
+  CCBuf src = {0};
+  /* struct __ClosEnv_N { __code: fn(__ClosEnv_N*, userparams)->R; cap: T; ... } */
+  cc_buf_add(&src, "struct ");
+  cc_buf_add(&src, env_name);
+  cc_buf_add(&src, " {\n  __code: fn(");
+  cc_buf_add(&src, env_name);
+  cc_buf_add(&src, "*");
+  for (size_t i = 0; i < fd->parameter_count; i++) {
+    cc_buf_add(&src, ", ");
+    cc_buf_add(&src, fd->parameter_types[i]);
+  }
+  cc_buf_add(&src, ") -> ");
+  cc_buf_add(&src, ret);
+  cc_buf_add(&src, ";\n");
+  for (size_t i = 0; i < caps->count; i++) {
+    cc_buf_add(&src, "  ");
+    cc_buf_add_num(&src, "__cap", i);
+    cc_buf_add(&src, ": ");
+    cc_buf_add(&src, caps->types[i]);
+    cc_buf_add(&src, ";\n");
+  }
+  cc_buf_add(&src, "}\n");
+
+  /* fn __lam_N(__env: __ClosEnv_N*, userparams) -> R { var cap: T = __env.__capK; ... } */
+  cc_buf_add(&src, "fn ");
+  cc_buf_add(&src, lam_name);
+  cc_buf_add(&src, "(__env: ");
+  cc_buf_add(&src, env_name);
+  cc_buf_add(&src, "*");
+  for (size_t i = 0; i < fd->parameter_count; i++) {
+    cc_buf_add(&src, ", ");
+    cc_buf_add(&src, fd->parameter_names[i]);
+    cc_buf_add(&src, ": ");
+    cc_buf_add(&src, fd->parameter_types[i]);
+  }
+  cc_buf_add(&src, ") -> ");
+  cc_buf_add(&src, ret);
+  /* Empty body: the original statements are grafted in, with captured-variable
+   * references rewritten to `__env.__capN` accesses (see cc_rewrite_captures). */
+  cc_buf_add(&src, " {\n}\n");
+
+  /* fn __make_lam_N(cap: T, ...) -> __ClosEnv_N* { var __e = new ...; ... return __e; } */
+  cc_buf_add(&src, "fn ");
+  cc_buf_add(&src, make_name);
+  cc_buf_add(&src, "(");
+  for (size_t i = 0; i < caps->count; i++) {
+    cc_buf_add_num(&src, "__arg", i);
+    cc_buf_add(&src, ": ");
+    cc_buf_add(&src, caps->types[i]);
+    if (i + 1 < caps->count)
+      cc_buf_add(&src, ", ");
+  }
+  cc_buf_add(&src, ") -> ");
+  cc_buf_add(&src, env_name);
+  cc_buf_add(&src, "* {\n  var __e: ");
+  cc_buf_add(&src, env_name);
+  cc_buf_add(&src, "* = new ");
+  cc_buf_add(&src, env_name);
+  cc_buf_add(&src, ";\n  __e.__code = &");
+  cc_buf_add(&src, lam_name);
+  cc_buf_add(&src, ";\n");
+  for (size_t i = 0; i < caps->count; i++) {
+    cc_buf_add(&src, "  __e.");
+    cc_buf_add_num(&src, "__cap", i);
+    cc_buf_add(&src, " = ");
+    cc_buf_add_num(&src, "__arg", i);
+    cc_buf_add(&src, ";\n");
+  }
+  cc_buf_add(&src, "  return __e;\n}\n");
+
+  if (!src.data) {
+    *had_error = 1;
+    return;
+  }
+
+  Lexer *lx = lexer_create(src.data);
+  Parser *ps = lx ? parser_create(lx) : NULL;
+  ASTNode *sub = ps ? parser_parse_program(ps) : NULL;
+  Program *subp = (sub && sub->type == AST_PROGRAM) ? (Program *)sub->data : NULL;
+  if (!subp || subp->declaration_count < 3) {
+    if (reporter)
+      error_reporter_add_error(reporter, ERROR_SEMANTIC, lambda->location,
+                               "internal: failed to synthesize closure");
+    *had_error = 1;
+    free(src.data);
+    return;
+  }
+
+  /* Graft the lambda's original body statements onto the lifted function (the
+   * second synthesized declaration), after the injected capture locals. */
+  ASTNode *lifted = subp->declarations[1];
+  ASTNode *body = fd->body;
+  fd->body = NULL;
+  if (body) {
+    for (size_t i = 0; i < lambda->child_count; i++) {
+      if (lambda->children[i] == body) {
+        for (size_t j = i + 1; j < lambda->child_count; j++)
+          lambda->children[j - 1] = lambda->children[j];
+        lambda->child_count--;
+        break;
+      }
+    }
+  }
+  if (body && body->type == AST_PROGRAM && lifted &&
+      lifted->type == AST_FUNCTION_DECLARATION) {
+    FunctionDeclaration *lf = (FunctionDeclaration *)lifted->data;
+    Program *lbody = lf->body ? (Program *)lf->body->data : NULL;
+    Program *obody = (Program *)body->data;
+    if (lbody && obody && obody->declaration_count > 0) {
+      ASTNode **merged =
+          realloc(lbody->declarations,
+                  (lbody->declaration_count + obody->declaration_count) *
+                      sizeof(ASTNode *));
+      if (merged) {
+        lbody->declarations = merged;
+        for (size_t i = 0; i < obody->declaration_count; i++) {
+          ASTNode *stmt = obody->declarations[i];
+          lbody->declarations[lbody->declaration_count++] = stmt;
+          ast_add_child(lf->body, stmt);
+        }
+        /* Detach the moved statements from the old body so destroying it does
+         * not free them. */
+        obody->declaration_count = 0;
+        body->child_count = 0;
+        /* Rewrite captured references in the grafted body to env accesses so
+         * mutations persist across calls. */
+        for (size_t i = 0; i < lbody->declaration_count; i++)
+          cc_rewrite_captures(lbody->declarations[i], caps);
+      }
+    }
+  }
+  if (body)
+    ast_destroy_node(body);
+
+  /* Move the three synthesized declarations into the program. */
+  for (size_t i = 0; i < subp->declaration_count; i++) {
+    ASTNode *d = subp->declarations[i];
+    ASTNode **grown =
+        realloc(prog->declarations,
+                (prog->declaration_count + 1) * sizeof(ASTNode *));
+    if (!grown) {
+      *had_error = 1;
+      break;
+    }
+    prog->declarations = grown;
+    prog->declarations[prog->declaration_count++] = d;
+    ast_add_child(program, d);
+  }
+  /* The sub-program shell still references the moved nodes via its own arrays;
+   * leave it unfreed (a small, bounded compile-time allocation) rather than
+   * risk double-freeing the transferred declarations. */
+
+  /* Record the closure on the lambda node: the value is produced by calling the
+   * constructor, passing the current value of each captured variable. */
+  fd->name = (char *)string_intern(make_name);
+  fd->env_struct_name = (char *)string_intern(env_name);
+  fd->captured_count = caps->count;
+  fd->captured_names = malloc(caps->count * sizeof(char *));
+  fd->captured_types = malloc(caps->count * sizeof(char *));
+  for (size_t i = 0; i < caps->count; i++) {
+    fd->captured_names[i] = (char *)string_intern(caps->names[i]);
+    fd->captured_types[i] = (char *)string_intern(caps->types[i]);
+  }
+
+  free(src.data);
+}
+
+static void cc_lift_lambda(ASTNode *lambda, ASTNode *program, Program *prog,
+                           const CCEnv *enclosing, ErrorReporter *reporter,
+                           int *had_error) {
+  FunctionDeclaration *fd = (FunctionDeclaration *)lambda->data;
+  if (!fd || fd->name)
+    return; // already lifted
+
+  CCEnv bound = {0};
+  cc_collect_fn_env(fd, &bound);
+  CCEnv caps = {0};
+  cc_scan_captures(fd->body, enclosing, &bound, &caps);
+  cc_env_free(&bound);
+
+  if (caps.count > 0) {
+    cc_emit_capturing(lambda, fd, &caps, program, prog, reporter, had_error);
+    cc_env_free(&caps);
+    return;
+  }
+  cc_env_free(&caps);
+
+  /* Non-capturing: lift the body to a top-level function and let the lambda
+   * value be its address (a thin function pointer). */
+  char name[32];
+  snprintf(name, sizeof(name), "__lam_%d", g_cc_counter++);
+
+  ASTNode *body = fd->body;
+  fd->body = NULL;
+  if (body) {
+    for (size_t i = 0; i < lambda->child_count; i++) {
+      if (lambda->children[i] == body) {
+        for (size_t j = i + 1; j < lambda->child_count; j++)
+          lambda->children[j - 1] = lambda->children[j];
+        lambda->child_count--;
+        break;
+      }
+    }
+  }
+
+  ASTNode *fn = ast_create_function_declaration(
+      name, fd->parameter_names, fd->parameter_types, fd->parameter_count,
+      fd->return_type, body, lambda->location);
+  if (!fn) {
+    *had_error = 1;
+    if (body)
+      ast_destroy_node(body);
+    return;
+  }
+
+  ASTNode **grown =
+      realloc(prog->declarations,
+              (prog->declaration_count + 1) * sizeof(ASTNode *));
+  if (!grown) {
+    *had_error = 1;
+    ast_destroy_node(fn);
+    return;
+  }
+  prog->declarations = grown;
+  prog->declarations[prog->declaration_count++] = fn;
+  ast_add_child(program, fn);
+
+  fd->name = (char *)string_intern(name);
+}
+
+static void cc_walk(ASTNode *node, const CCEnv *enclosing, ASTNode *program,
+                    Program *prog, ErrorReporter *reporter, int *had_error) {
+  if (!node)
+    return;
+  if (node->type == AST_LAMBDA_EXPRESSION) {
+    cc_lift_lambda(node, program, prog, enclosing, reporter, had_error);
+    return; // the original in-place body is moved out; do not descend
+  }
+  for (size_t i = 0; i < node->child_count; i++)
+    cc_walk(node->children[i], enclosing, program, prog, reporter, had_error);
+}
+
+static void cc_process_fn(ASTNode *fnnode, ASTNode *program, Program *prog,
+                          ErrorReporter *reporter, int *had_error) {
+  FunctionDeclaration *fd = (FunctionDeclaration *)fnnode->data;
+  if (!fd || !fd->body)
+    return;
+  CCEnv locals = {0};
+  cc_collect_fn_env(fd, &locals);
+  cc_walk(fd->body, &locals, program, prog, reporter, had_error);
+  cc_env_free(&locals);
+}
+
+int closure_convert_program(ASTNode *program, ErrorReporter *reporter) {
+  if (!program || program->type != AST_PROGRAM)
+    return 1;
+  Program *prog = (Program *)program->data;
+  if (!prog)
+    return 1;
+
+  g_cc_counter = 0;
+  int had_error = 0;
+
+  for (size_t i = 0; i < prog->declaration_count; i++) {
+    ASTNode *decl = prog->declarations[i];
+    if (!decl)
+      continue;
+    if (decl->type == AST_FUNCTION_DECLARATION ||
+        decl->type == AST_METHOD_DECLARATION) {
+      cc_process_fn(decl, program, prog, reporter, &had_error);
+    } else if (decl->type == AST_STRUCT_DECLARATION) {
+      StructDeclaration *sd = (StructDeclaration *)decl->data;
+      for (size_t m = 0; sd && m < sd->method_count; m++)
+        cc_process_fn(sd->methods[m], program, prog, reporter, &had_error);
+    } else if (decl->type == AST_IMPL_DECLARATION) {
+      ImplDeclaration *id = (ImplDeclaration *)decl->data;
+      for (size_t m = 0; id && m < id->method_count; m++)
+        cc_process_fn(id->methods[m], program, prog, reporter, &had_error);
+    } else if (decl->type == AST_VAR_DECLARATION) {
+      VarDeclaration *vd = (VarDeclaration *)decl->data;
+      if (vd && vd->initializer) {
+        CCEnv empty = {0};
+        cc_walk(vd->initializer, &empty, program, prog, reporter, &had_error);
+      }
+    }
+  }
+
+  return had_error ? 0 : 1;
+}
+
+/* ---- Closure adaptation ---------------------------------------------------
+ * A thin function value (`&func`, or a non-capturing lambda, which is itself a
+ * thin `&__lam_N` once lifted) cannot be assigned where a closure (`Fn(...)->R`)
+ * is expected: the closure calling convention passes a hidden environment
+ * argument the thin value does not carry. This pass makes that boundary
+ * transparent: wherever a thin source flows into an `Fn(...)` -spelled
+ * destination (a var declaration, a return statement, or a call argument to a
+ * plain top-level function), it is wrapped in a small generated ADAPTER - a
+ * one-field heap environment holding the thin function pointer, plus a thunk
+ * that calls through it - so the thin value becomes a real closure value.
+ * Adapters are deduplicated by signature (one per distinct `(params)->ret`). */
+
+static void cc_detach_child(ASTNode *parent, ASTNode *child) {
+  if (!parent || !child)
+    return;
+  for (size_t i = 0; i < parent->child_count; i++) {
+    if (parent->children[i] == child) {
+      for (size_t j = i + 1; j < parent->child_count; j++)
+        parent->children[j - 1] = parent->children[j];
+      parent->child_count--;
+      return;
+    }
+  }
+}
+
+typedef struct {
+  char **sigs;
+  char **ctor_names;
+  size_t count;
+  size_t cap;
+} AdaptCache;
+
+static char *adapt_sig_key(char **param_types, size_t param_count,
+                           const char *return_type) {
+  CCBuf b = {0};
+  for (size_t i = 0; i < param_count; i++) {
+    if (i > 0)
+      cc_buf_add(&b, ",");
+    cc_buf_add(&b, param_types[i]);
+  }
+  cc_buf_add(&b, "->");
+  cc_buf_add(&b, return_type ? return_type : "void");
+  return b.data;
+}
+
+static const char *adapt_cache_find(const AdaptCache *c, const char *sig) {
+  for (size_t i = 0; i < c->count; i++)
+    if (strcmp(c->sigs[i], sig) == 0)
+      return c->ctor_names[i];
+  return NULL;
+}
+
+static void adapt_cache_add(AdaptCache *c, const char *sig,
+                            const char *ctor_name) {
+  if (c->count == c->cap) {
+    size_t ncap = c->cap ? c->cap * 2 : 8;
+    char **gs = realloc(c->sigs, ncap * sizeof(char *));
+    char **gc = realloc(c->ctor_names, ncap * sizeof(char *));
+    if (!gs || !gc) {
+      free(gs);
+      free(gc);
+      return;
+    }
+    c->sigs = gs;
+    c->ctor_names = gc;
+    c->cap = ncap;
+  }
+  c->sigs[c->count] = strdup(sig);
+  c->ctor_names[c->count] = strdup(ctor_name);
+  c->count++;
+}
+
+static void adapt_cache_free(AdaptCache *c) {
+  for (size_t i = 0; i < c->count; i++) {
+    free(c->sigs[i]);
+    free(c->ctor_names[i]);
+  }
+  free(c->sigs);
+  free(c->ctor_names);
+}
+
+static int g_adapt_counter;
+
+/* Synthesizes struct __Adapt_K { __code: fn(__Adapt_K*, P...)->R; __real:
+ * fn(P...)->R; }, fn __athunk_K(__env: __Adapt_K*, p0: P0, ...) -> R { return
+ * __env.__real(p0, ...); }, and fn __amake_K(__real: fn(P...)->R) -> __Adapt_K*
+ * { ... }. Returns the interned constructor name, or NULL on failure. */
+static const char *adapt_emit_adapter(char **param_types, size_t param_count,
+                                      const char *return_type,
+                                      ASTNode *program, Program *prog,
+                                      int *had_error) {
+  int id = g_adapt_counter++;
+  char struct_name[32], thunk_name[32], make_name[32];
+  snprintf(struct_name, sizeof(struct_name), "__Adapt_%d", id);
+  snprintf(thunk_name, sizeof(thunk_name), "__athunk_%d", id);
+  snprintf(make_name, sizeof(make_name), "__amake_%d", id);
+  const char *ret = return_type ? return_type : "void";
+
+  CCBuf src = {0};
+  cc_buf_add(&src, "struct ");
+  cc_buf_add(&src, struct_name);
+  cc_buf_add(&src, " {\n  __code: fn(");
+  cc_buf_add(&src, struct_name);
+  cc_buf_add(&src, "*");
+  for (size_t i = 0; i < param_count; i++) {
+    cc_buf_add(&src, ", ");
+    cc_buf_add(&src, param_types[i]);
+  }
+  cc_buf_add(&src, ") -> ");
+  cc_buf_add(&src, ret);
+  cc_buf_add(&src, ";\n  __real: fn(");
+  for (size_t i = 0; i < param_count; i++) {
+    if (i > 0)
+      cc_buf_add(&src, ", ");
+    cc_buf_add(&src, param_types[i]);
+  }
+  cc_buf_add(&src, ") -> ");
+  cc_buf_add(&src, ret);
+  cc_buf_add(&src, ";\n}\n");
+
+  cc_buf_add(&src, "fn ");
+  cc_buf_add(&src, thunk_name);
+  cc_buf_add(&src, "(__env: ");
+  cc_buf_add(&src, struct_name);
+  cc_buf_add(&src, "*");
+  for (size_t i = 0; i < param_count; i++) {
+    cc_buf_add(&src, ", ");
+    cc_buf_add_num(&src, "p", i);
+    cc_buf_add(&src, ": ");
+    cc_buf_add(&src, param_types[i]);
+  }
+  cc_buf_add(&src, ") -> ");
+  cc_buf_add(&src, ret);
+  cc_buf_add(&src, " {\n  ");
+  cc_buf_add(&src, strcmp(ret, "void") == 0 ? "" : "return ");
+  cc_buf_add(&src, "__env.__real(");
+  for (size_t i = 0; i < param_count; i++) {
+    if (i > 0)
+      cc_buf_add(&src, ", ");
+    cc_buf_add_num(&src, "p", i);
+  }
+  cc_buf_add(&src, ");\n}\n");
+
+  cc_buf_add(&src, "fn ");
+  cc_buf_add(&src, make_name);
+  cc_buf_add(&src, "(__real: fn(");
+  for (size_t i = 0; i < param_count; i++) {
+    if (i > 0)
+      cc_buf_add(&src, ", ");
+    cc_buf_add(&src, param_types[i]);
+  }
+  cc_buf_add(&src, ") -> ");
+  cc_buf_add(&src, ret);
+  cc_buf_add(&src, ") -> ");
+  cc_buf_add(&src, struct_name);
+  cc_buf_add(&src, "* {\n  var __e: ");
+  cc_buf_add(&src, struct_name);
+  cc_buf_add(&src, "* = new ");
+  cc_buf_add(&src, struct_name);
+  cc_buf_add(&src, ";\n  __e.__code = &");
+  cc_buf_add(&src, thunk_name);
+  cc_buf_add(&src, ";\n  __e.__real = __real;\n  return __e;\n}\n");
+
+  if (!src.data) {
+    *had_error = 1;
+    return NULL;
+  }
+
+  Lexer *lx = lexer_create(src.data);
+  Parser *ps = lx ? parser_create(lx) : NULL;
+  ASTNode *sub = ps ? parser_parse_program(ps) : NULL;
+  Program *subp = (sub && sub->type == AST_PROGRAM) ? (Program *)sub->data : NULL;
+  free(src.data);
+  if (!subp || subp->declaration_count < 3) {
+    *had_error = 1;
+    return NULL;
+  }
+
+  for (size_t i = 0; i < subp->declaration_count; i++) {
+    ASTNode *d = subp->declarations[i];
+    ASTNode **grown =
+        realloc(prog->declarations,
+                (prog->declaration_count + 1) * sizeof(ASTNode *));
+    if (!grown) {
+      *had_error = 1;
+      break;
+    }
+    prog->declarations = grown;
+    prog->declarations[prog->declaration_count++] = d;
+    ast_add_child(program, d);
+  }
+  /* The sub-program shell is intentionally left unfreed, as in
+   * cc_emit_capturing: a small, bounded compile-time allocation. */
+
+  return string_intern(make_name);
+}
+
+static const char *adapt_get_or_create(char **param_types, size_t param_count,
+                                       const char *return_type,
+                                       AdaptCache *cache, ASTNode *program,
+                                       Program *prog, int *had_error) {
+  char *sig = adapt_sig_key(param_types, param_count, return_type);
+  if (!sig) {
+    *had_error = 1;
+    return NULL;
+  }
+  const char *existing = adapt_cache_find(cache, sig);
+  if (existing) {
+    free(sig);
+    return existing;
+  }
+  const char *ctor =
+      adapt_emit_adapter(param_types, param_count, return_type, program, prog,
+                        had_error);
+  if (ctor) {
+    adapt_cache_add(cache, sig, ctor);
+  }
+  free(sig);
+  return ctor;
+}
+
+static int adapt_type_is_closure_string(const char *s) {
+  return s && strlen(s) >= 4 && strncmp(s, "Fn(", 3) == 0;
+}
+
+/* Recognizes a "thin" source expression eligible for adaptation: `&plainFunc`
+ * (a top-level function found by name) or a non-capturing lambda (already
+ * lifted by closure_convert_program). On success, fills the borrowed
+ * (not owned by the caller) param_types/param_count/return_type describing the
+ * source's signature. */
+static int adapt_thin_signature(ASTNode *expr, ASTNode **top_decls,
+                                size_t top_count, char ***out_param_types,
+                                size_t *out_param_count,
+                                char **out_return_type) {
+  if (!expr)
+    return 0;
+  if (expr->type == AST_UNARY_EXPRESSION) {
+    UnaryExpression *un = (UnaryExpression *)expr->data;
+    if (!un || !un->operator || strcmp(un->operator, "&") != 0 || !un->operand ||
+        un->operand->type != AST_IDENTIFIER) {
+      return 0;
+    }
+    Identifier *id = (Identifier *)un->operand->data;
+    if (!id || !id->name)
+      return 0;
+    for (size_t i = 0; i < top_count; i++) {
+      FunctionDeclaration *fd = (FunctionDeclaration *)top_decls[i]->data;
+      if (fd && fd->name && strcmp(fd->name, id->name) == 0) {
+        *out_param_types = fd->parameter_types;
+        *out_param_count = fd->parameter_count;
+        *out_return_type = fd->return_type;
+        return 1;
+      }
+    }
+    return 0;
+  }
+  if (expr->type == AST_LAMBDA_EXPRESSION) {
+    FunctionDeclaration *fd = (FunctionDeclaration *)expr->data;
+    if (!fd || fd->captured_count > 0)
+      return 0;
+    *out_param_types = fd->parameter_types;
+    *out_param_count = fd->parameter_count;
+    *out_return_type = fd->return_type;
+    return 1;
+  }
+  return 0;
+}
+
+/* If `dest_type_str` is a closure boundary (`Fn(...)`) and `*slot` is a thin,
+ * adaptable source, wraps `*slot` in a generated adapter call in place. */
+static void adapt_wrap_if_needed(ASTNode **slot, ASTNode *owner,
+                                 const char *dest_type_str,
+                                 ASTNode **top_decls, size_t top_count,
+                                 AdaptCache *cache, ASTNode *program,
+                                 Program *prog, int *had_error) {
+  if (!slot || !*slot || !owner || !adapt_type_is_closure_string(dest_type_str))
+    return;
+  char **param_types = NULL;
+  size_t param_count = 0;
+  char *return_type = NULL;
+  if (!adapt_thin_signature(*slot, top_decls, top_count, &param_types,
+                            &param_count, &return_type)) {
+    return;
+  }
+  const char *ctor = adapt_get_or_create(param_types, param_count, return_type,
+                                        cache, program, prog, had_error);
+  if (!ctor) {
+    *had_error = 1;
+    return;
+  }
+  ASTNode *inner = *slot;
+  ASTNode *wrapper = ast_create_closure_adapt(inner, ctor, param_types,
+                                              param_count, return_type,
+                                              inner->location);
+  if (!wrapper) {
+    *had_error = 1;
+    return;
+  }
+  cc_detach_child(owner, inner);
+  ast_add_child(owner, wrapper);
+  *slot = wrapper;
+}
+
+static void adapt_walk(ASTNode *node, const char *current_return_type,
+                       ASTNode **top_decls, size_t top_count,
+                       AdaptCache *cache, ASTNode *program, Program *prog,
+                       int *had_error) {
+  if (!node || node->type == AST_LAMBDA_EXPRESSION ||
+      node->type == AST_CLOSURE_ADAPT_EXPRESSION)
+    return;
+
+  if (node->type == AST_VAR_DECLARATION) {
+    VarDeclaration *vd = (VarDeclaration *)node->data;
+    if (vd && vd->initializer) {
+      adapt_wrap_if_needed(&vd->initializer, node, vd->type_name, top_decls,
+                           top_count, cache, program, prog, had_error);
+    }
+  } else if (node->type == AST_RETURN_STATEMENT) {
+    ReturnStatement *rs = (ReturnStatement *)node->data;
+    if (rs && rs->value) {
+      adapt_wrap_if_needed(&rs->value, node, current_return_type, top_decls,
+                           top_count, cache, program, prog, had_error);
+    }
+  } else if (node->type == AST_FUNCTION_CALL) {
+    CallExpression *call = (CallExpression *)node->data;
+    if (call && !call->object && call->function_name) {
+      for (size_t i = 0; i < top_count; i++) {
+        FunctionDeclaration *fd = (FunctionDeclaration *)top_decls[i]->data;
+        if (fd && fd->name && strcmp(fd->name, call->function_name) == 0 &&
+            fd->parameter_count == call->argument_count) {
+          for (size_t a = 0; a < call->argument_count; a++) {
+            adapt_wrap_if_needed(&call->arguments[a], node,
+                                 fd->parameter_types[a], top_decls, top_count,
+                                 cache, program, prog, had_error);
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  for (size_t i = 0; i < node->child_count; i++)
+    adapt_walk(node->children[i], current_return_type, top_decls, top_count,
+              cache, program, prog, had_error);
+}
+
+static void adapt_process_fn(ASTNode *fnnode, ASTNode **top_decls,
+                             size_t top_count, AdaptCache *cache,
+                             ASTNode *program, Program *prog, int *had_error) {
+  FunctionDeclaration *fd = (FunctionDeclaration *)fnnode->data;
+  if (!fd || !fd->body)
+    return;
+  adapt_walk(fd->body, fd->return_type, top_decls, top_count, cache, program,
+            prog, had_error);
+}
+
+int closure_adapt_program(ASTNode *program, ErrorReporter *reporter) {
+  (void)reporter; /* adaptation failures are internal allocation errors only;
+                    * signature mismatches surface later as ordinary type
+                    * errors once the wrapped node is type-checked. */
+  if (!program || program->type != AST_PROGRAM)
+    return 1;
+  Program *prog = (Program *)program->data;
+  if (!prog)
+    return 1;
+
+  g_adapt_counter = 0;
+  int had_error = 0;
+
+  /* Snapshot of callable top-level function signatures (by name), taken before
+   * any adapters are synthesized: adapters are never themselves user-callable
+   * boundary targets, so they do not need to be discoverable here. */
+  ASTNode **top_decls = malloc(prog->declaration_count * sizeof(ASTNode *));
+  size_t top_count = 0;
+  if (!top_decls && prog->declaration_count > 0) {
+    return 0;
+  }
+  for (size_t i = 0; i < prog->declaration_count; i++) {
+    if (prog->declarations[i] &&
+        prog->declarations[i]->type == AST_FUNCTION_DECLARATION) {
+      top_decls[top_count++] = prog->declarations[i];
+    }
+  }
+
+  AdaptCache cache = {0};
+
+  for (size_t i = 0; i < prog->declaration_count; i++) {
+    ASTNode *decl = prog->declarations[i];
+    if (!decl)
+      continue;
+    if (decl->type == AST_FUNCTION_DECLARATION ||
+        decl->type == AST_METHOD_DECLARATION) {
+      adapt_process_fn(decl, top_decls, top_count, &cache, program, prog,
+                       &had_error);
+    } else if (decl->type == AST_STRUCT_DECLARATION) {
+      StructDeclaration *sd = (StructDeclaration *)decl->data;
+      for (size_t m = 0; sd && m < sd->method_count; m++)
+        adapt_process_fn(sd->methods[m], top_decls, top_count, &cache,
+                         program, prog, &had_error);
+    } else if (decl->type == AST_IMPL_DECLARATION) {
+      ImplDeclaration *id = (ImplDeclaration *)decl->data;
+      for (size_t m = 0; id && m < id->method_count; m++)
+        adapt_process_fn(id->methods[m], top_decls, top_count, &cache,
+                         program, prog, &had_error);
+    } else if (decl->type == AST_VAR_DECLARATION) {
+      VarDeclaration *vd = (VarDeclaration *)decl->data;
+      if (vd && vd->initializer) {
+        adapt_wrap_if_needed(&vd->initializer, decl, vd->type_name, top_decls,
+                             top_count, &cache, program, prog, &had_error);
+      }
+    }
+  }
+
+  free(top_decls);
+  adapt_cache_free(&cache);
+  return had_error ? 0 : 1;
 }
 
 int monomorphize_program(ASTNode *program, ErrorReporter *reporter) {

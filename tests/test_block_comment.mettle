@@ -5,11 +5,11 @@
  * with stars in the body.
  */
 
-function add(a: int32, b: int32) -> int32 {
+fn add(a: int32, b: int32) -> int32 {
   return a + b; /* inline trailing block comment */
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   /* leading block comment in a function body */
   var x: int32 = 10 /* expression-position comment */ + 5;
   /* nested /* block */ comment should also be skipped */

@@ -1,6 +1,6 @@
 import "std/io";
 
-export function main() : int32 {    var hello : string = "Hello, ";
+export fn main() : int32 {    var hello : string = "Hello, ";
     var world : string = "World!";
     
     var result : string = hello + world;

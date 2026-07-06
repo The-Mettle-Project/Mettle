@@ -1,10 +1,10 @@
 import "std/io";
 
-function before() { puts(cstr("BEFORE\n")); }
-function inside() { puts(cstr("INSIDE\n")); }
-function after() { puts(cstr("AFTER\n")); }
+fn before() { puts(cstr("BEFORE\n")); }
+fn inside() { puts(cstr("INSIDE\n")); }
+fn after() { puts(cstr("AFTER\n")); }
 
-function main() -> int32 {
+fn main() -> int32 {
   before();
   defer {
     inside();

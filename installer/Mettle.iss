@@ -2,7 +2,7 @@
 ;
 ; Build locally:
 ;   iscc Mettle.iss
-; Stamp a version: iscc /DMyAppVersion=0.12.0 Mettle.iss
+; Stamp a version: iscc /DMyAppVersion=0.13.0 Mettle.iss
 ; CI builds this in release.yml and attaches Mettle-Setup.exe to the Release.
 ;
 ; WizardStyle uses Inno Setup 6's built-in modern UI (HiDPI, light/dark aware).
@@ -14,7 +14,7 @@
 ; constants and the HKA registry root.
 
 #ifndef MyAppVersion
-  #define MyAppVersion "v0.12.0"
+  #define MyAppVersion "v0.13.0"
 #endif
 
 #define MyAppName "Mettle"
@@ -80,11 +80,11 @@ Source: "..\mettle.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\stdlib\*"; DestDir: "{app}\stdlib"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\bin\runtime\*"; DestDir: "{app}\runtime"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\bin\mlopt\*"; DestDir: "{app}\mlopt"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\docs\*"; DestDir: "{app}\docs"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\Mettle Documentation"; Filename: "{app}\README.md"
 Name: "{group}\Mettle on GitHub"; Filename: "{#MyRepoUrl}"
 Name: "{group}\Uninstall Mettle"; Filename: "{uninstallexe}"
 

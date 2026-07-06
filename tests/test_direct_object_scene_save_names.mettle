@@ -3,7 +3,7 @@ import "../engine/engine_scene_io";
 import "../engine/engine_mesh";
 import "std/io";
 
-function main() -> int32 {
+fn main() -> int32 {
   var sc: Scene* = scene_create(8);
   if (sc == 0) {
     return 1;

@@ -12,9 +12,9 @@ import "std/mem";
 
 var gbuf: int64* = (int64*)0;
 
-@noinline function touch(x: int64) -> int64 { return x + 1; }
+@noinline fn touch(x: int64) -> int64 { return x + 1; }
 
-@noinline function zero_then_sum(a: int32*, n: int64) -> int64 {
+@noinline fn zero_then_sum(a: int32*, n: int64) -> int64 {
   var i: int64 = 0;
   while (i < n) { a[i] = 0; i = i + 1; }     // mode 1 fill
   var s: int64 = 0;
@@ -23,7 +23,7 @@ var gbuf: int64* = (int64*)0;
   return s;                                   // 0
 }
 
-@noinline function offset_fill_reuse(off: int64, n: int64) -> int64 {
+@noinline fn offset_fill_reuse(off: int64, n: int64) -> int64 {
   var i: int64 = 0;
   while (i < n) { gbuf[off + i] = 0; i = i + 1; }   // mode 0, runtime offset, live i
   var s: int64 = 0;
@@ -31,12 +31,12 @@ var gbuf: int64* = (int64*)0;
   return s + i;                                       // i must be 0; s = 0
 }
 
-@noinline function seedg(n: int64) {
+@noinline fn seedg(n: int64) {
   var i: int64 = 0;
   while (i < n) { gbuf[i] = 5; i = i + 1; }
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var ok: int32 = 1;
   var t: int64 = touch(1);                 // force a call (non-leaf)
   if (t != 2) { ok = 0; }

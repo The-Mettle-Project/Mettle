@@ -50,6 +50,8 @@ Pipeline:
   pipelines.
 - `ir_optimize_pass_driver.c`: pass names, `METTLE_SKIP_PASS` diagnostics,
   named-pass sequences, and fixpoint pass scheduling.
+- `ir_optimize_hotness.c`: zero-run PGO/block-like source-site hotness policy
+  for code-size/speed thresholds.
 - `ir_optimize_sroa.c`: scalar replacement of aggregate locals.
 - `ir_optimize_induction_cleanup.c`: congruent induction-variable elimination.
 

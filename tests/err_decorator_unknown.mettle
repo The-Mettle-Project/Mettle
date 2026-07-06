@@ -1,8 +1,8 @@
 // Unknown decorator name.
-@frobnicate function f() -> int32 {
+@frobnicate fn f() -> int32 {
   return 0;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   return f();
 }

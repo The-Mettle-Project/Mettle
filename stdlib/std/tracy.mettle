@@ -17,14 +17,14 @@
 //   import "std/tracy";
 //   import "std/io";
 //
-//   function work() {
+//   fn work() {
 //     var z: TracyZone = tracy_zone_colored(
 //       cstr("work"), cstr("app.mettle"), 42, cstr("work"), tracy_color_update());
 //     defer tracy_scope_end(z);
 //     ...
 //   }
 //
-//   function main() -> int32 {
+//   fn main() -> int32 {
 //     tracy_plot_setup_number(cstr("frame_ms"), 1, 1, tracy_color_render());
 //     while (running != 0) {
 //       do_frame();
@@ -45,28 +45,28 @@ export struct TracyZone {
 }
 
 // ─── Plot format (TracyPlotFormatEnum) ───────────────────────────────────────
-export function tracy_plot_number() -> int32 { return 0; }
-export function tracy_plot_memory() -> int32 { return 1; }
-export function tracy_plot_percentage() -> int32 { return 2; }
-export function tracy_plot_watt() -> int32 { return 3; }
+export fn tracy_plot_number() -> int32 { return 0; }
+export fn tracy_plot_memory() -> int32 { return 1; }
+export fn tracy_plot_percentage() -> int32 { return 2; }
+export fn tracy_plot_watt() -> int32 { return 3; }
 
 // ─── Message severity (TracyMessageSeverity) ─────────────────────────────────
-export function tracy_severity_trace() -> int32 { return 0; }
-export function tracy_severity_debug() -> int32 { return 1; }
-export function tracy_severity_info() -> int32 { return 2; }
-export function tracy_severity_warning() -> int32 { return 3; }
-export function tracy_severity_error() -> int32 { return 4; }
-export function tracy_severity_fatal() -> int32 { return 5; }
+export fn tracy_severity_trace() -> int32 { return 0; }
+export fn tracy_severity_debug() -> int32 { return 1; }
+export fn tracy_severity_info() -> int32 { return 2; }
+export fn tracy_severity_warning() -> int32 { return 3; }
+export fn tracy_severity_error() -> int32 { return 4; }
+export fn tracy_severity_fatal() -> int32 { return 5; }
 
 // ─── Named zone colors (Tracy ABGR) ─────────────────────────────────────────
-export function tracy_color_input() -> uint32 { return 0xFF44AA44; }
-export function tracy_color_update() -> uint32 { return 0xFF4488FF; }
-export function tracy_color_render() -> uint32 { return 0xFF0088FF; }
-export function tracy_color_load() -> uint32 { return 0xFFAA44FF; }
-export function tracy_color_warn() -> uint32 { return 0xFF0044FF; }
+export fn tracy_color_input() -> uint32 { return 0xFF44AA44; }
+export fn tracy_color_update() -> uint32 { return 0xFF4488FF; }
+export fn tracy_color_render() -> uint32 { return 0xFF0088FF; }
+export fn tracy_color_load() -> uint32 { return 0xFFAA44FF; }
+export fn tracy_color_warn() -> uint32 { return 0xFF0044FF; }
 
 // ─── C bridge (stdlib/tracy_helpers.c) ───────────────────────────────────────
-export extern function mettle_tracy_zone_begin(
+export extern fn mettle_tracy_zone_begin(
   line: uint32,
   file: cstring,
   file_len: int64,
@@ -79,42 +79,42 @@ export extern function mettle_tracy_zone_begin(
   out: TracyZone*
 ) = "mettle_tracy_zone_begin";
 
-export extern function mettle_tracy_zone_end(zone: TracyZone) = "mettle_tracy_zone_end";
-export extern function mettle_tracy_zone_text(zone: TracyZone, text: cstring, text_len: int64) = "mettle_tracy_zone_text";
-export extern function mettle_tracy_zone_name(zone: TracyZone, text: cstring, text_len: int64) = "mettle_tracy_zone_name";
-export extern function mettle_tracy_zone_color(zone: TracyZone, color: uint32) = "mettle_tracy_zone_color";
-export extern function mettle_tracy_zone_value(zone: TracyZone, value: uint64) = "mettle_tracy_zone_value";
+export extern fn mettle_tracy_zone_end(zone: TracyZone) = "mettle_tracy_zone_end";
+export extern fn mettle_tracy_zone_text(zone: TracyZone, text: cstring, text_len: int64) = "mettle_tracy_zone_text";
+export extern fn mettle_tracy_zone_name(zone: TracyZone, text: cstring, text_len: int64) = "mettle_tracy_zone_name";
+export extern fn mettle_tracy_zone_color(zone: TracyZone, color: uint32) = "mettle_tracy_zone_color";
+export extern fn mettle_tracy_zone_value(zone: TracyZone, value: uint64) = "mettle_tracy_zone_value";
 
-export extern function mettle_tracy_frame_mark() = "mettle_tracy_frame_mark";
-export extern function mettle_tracy_frame_mark_named(name: cstring) = "mettle_tracy_frame_mark_named";
-export extern function mettle_tracy_frame_mark_start(name: cstring) = "mettle_tracy_frame_mark_start";
-export extern function mettle_tracy_frame_mark_end(name: cstring) = "mettle_tracy_frame_mark_end";
+export extern fn mettle_tracy_frame_mark() = "mettle_tracy_frame_mark";
+export extern fn mettle_tracy_frame_mark_named(name: cstring) = "mettle_tracy_frame_mark_named";
+export extern fn mettle_tracy_frame_mark_start(name: cstring) = "mettle_tracy_frame_mark_start";
+export extern fn mettle_tracy_frame_mark_end(name: cstring) = "mettle_tracy_frame_mark_end";
 
-export extern function mettle_tracy_set_thread_name(name: cstring) = "mettle_tracy_set_thread_name";
+export extern fn mettle_tracy_set_thread_name(name: cstring) = "mettle_tracy_set_thread_name";
 
-export extern function mettle_tracy_plot(name: cstring, value: float64) = "mettle_tracy_plot";
-export extern function mettle_tracy_plot_float(name: cstring, value: float32) = "mettle_tracy_plot_float";
-export extern function mettle_tracy_plot_int(name: cstring, value: int64) = "mettle_tracy_plot_int";
-export extern function mettle_tracy_plot_config(name: cstring, type: int32, step: int32, fill: int32, color: uint32) = "mettle_tracy_plot_config";
+export extern fn mettle_tracy_plot(name: cstring, value: float64) = "mettle_tracy_plot";
+export extern fn mettle_tracy_plot_float(name: cstring, value: float32) = "mettle_tracy_plot_float";
+export extern fn mettle_tracy_plot_int(name: cstring, value: int64) = "mettle_tracy_plot_int";
+export extern fn mettle_tracy_plot_config(name: cstring, type: int32, step: int32, fill: int32, color: uint32) = "mettle_tracy_plot_config";
 
-export extern function mettle_tracy_message(text: cstring, text_len: int64) = "mettle_tracy_message";
-export extern function mettle_tracy_message_colored(text: cstring, text_len: int64, color: uint32) = "mettle_tracy_message_colored";
-export extern function mettle_tracy_message_literal(text: cstring) = "mettle_tracy_message_literal";
-export extern function mettle_tracy_app_info(text: cstring, text_len: int64) = "mettle_tracy_app_info";
+export extern fn mettle_tracy_message(text: cstring, text_len: int64) = "mettle_tracy_message";
+export extern fn mettle_tracy_message_colored(text: cstring, text_len: int64, color: uint32) = "mettle_tracy_message_colored";
+export extern fn mettle_tracy_message_literal(text: cstring) = "mettle_tracy_message_literal";
+export extern fn mettle_tracy_app_info(text: cstring, text_len: int64) = "mettle_tracy_app_info";
 
-export extern function mettle_tracy_alloc(ptr: cstring, size: int64) = "mettle_tracy_alloc";
-export extern function mettle_tracy_free(ptr: cstring) = "mettle_tracy_free";
+export extern fn mettle_tracy_alloc(ptr: cstring, size: int64) = "mettle_tracy_alloc";
+export extern fn mettle_tracy_free(ptr: cstring) = "mettle_tracy_free";
 
-export extern function mettle_tracy_connected() -> int32 = "mettle_tracy_connected";
-export extern function mettle_tracy_started() -> int32 = "mettle_tracy_started";
-export extern function mettle_tracy_startup() = "mettle_tracy_startup";
-export extern function mettle_tracy_shutdown() = "mettle_tracy_shutdown";
+export extern fn mettle_tracy_connected() -> int32 = "mettle_tracy_connected";
+export extern fn mettle_tracy_started() -> int32 = "mettle_tracy_started";
+export extern fn mettle_tracy_startup() = "mettle_tracy_startup";
+export extern fn mettle_tracy_shutdown() = "mettle_tracy_shutdown";
 
 // ─── Zones ───────────────────────────────────────────────────────────────────
 
 // Begin a profiling zone. Pass active=0 to skip instrumentation (e.g. when
 // tracy_connected() is 0 under TRACY_ON_DEMAND). name may be 0 for function-only label.
-export function tracy_zone_begin(
+export fn tracy_zone_begin(
   name: cstring,
   file: cstring,
   line: uint32,
@@ -142,7 +142,7 @@ export function tracy_zone_begin(
   return z;
 }
 
-export function tracy_zone(
+export fn tracy_zone(
   name: cstring,
   file: cstring,
   line: uint32,
@@ -151,7 +151,7 @@ export function tracy_zone(
   return tracy_zone_begin(name, file, line, func_name, 0, 1);
 }
 
-export function tracy_zone_active(
+export fn tracy_zone_active(
   name: cstring,
   file: cstring,
   line: uint32,
@@ -161,7 +161,7 @@ export function tracy_zone_active(
   return tracy_zone_begin(name, file, line, func_name, 0, active);
 }
 
-export function tracy_zone_colored(
+export fn tracy_zone_colored(
   name: cstring,
   file: cstring,
   line: uint32,
@@ -172,7 +172,7 @@ export function tracy_zone_colored(
 }
 
 // Begin a zone only when Tracy is connected (TRACY_ON_DEMAND builds).
-export function tracy_zone_on_demand(
+export fn tracy_zone_on_demand(
   name: cstring,
   file: cstring,
   line: uint32,
@@ -182,102 +182,102 @@ export function tracy_zone_on_demand(
   return tracy_zone_begin(name, file, line, func_name, color, tracy_connected());
 }
 
-export function tracy_zone_end(zone: TracyZone) {
+export fn tracy_zone_end(zone: TracyZone) {
   mettle_tracy_zone_end(zone);
 }
 
 // Readable alias for defer tracy_scope_end(z).
-export function tracy_scope_end(zone: TracyZone) {
+export fn tracy_scope_end(zone: TracyZone) {
   tracy_zone_end(zone);
 }
 
-export function tracy_zone_text(zone: TracyZone, text: cstring) {
+export fn tracy_zone_text(zone: TracyZone, text: cstring) {
   if (text == 0) {
     return;
   }
   mettle_tracy_zone_text(zone, text, strlen(text));
 }
 
-export function tracy_zone_name(zone: TracyZone, text: cstring) {
+export fn tracy_zone_name(zone: TracyZone, text: cstring) {
   if (text == 0) {
     return;
   }
   mettle_tracy_zone_name(zone, text, strlen(text));
 }
 
-export function tracy_zone_color(zone: TracyZone, color: uint32) {
+export fn tracy_zone_color(zone: TracyZone, color: uint32) {
   mettle_tracy_zone_color(zone, color);
 }
 
-export function tracy_zone_value(zone: TracyZone, value: uint64) {
+export fn tracy_zone_value(zone: TracyZone, value: uint64) {
   mettle_tracy_zone_value(zone, value);
 }
 
 // ─── Frames ──────────────────────────────────────────────────────────────────
-export function tracy_frame_mark() {
+export fn tracy_frame_mark() {
   mettle_tracy_frame_mark();
 }
 
-export function tracy_frame_mark_named(name: cstring) {
+export fn tracy_frame_mark_named(name: cstring) {
   mettle_tracy_frame_mark_named(name);
 }
 
-export function tracy_frame_mark_start(name: cstring) {
+export fn tracy_frame_mark_start(name: cstring) {
   mettle_tracy_frame_mark_start(name);
 }
 
-export function tracy_frame_mark_end(name: cstring) {
+export fn tracy_frame_mark_end(name: cstring) {
   mettle_tracy_frame_mark_end(name);
 }
 
 // ─── Threads, plots, messages ────────────────────────────────────────────────
-export function tracy_set_thread_name(name: cstring) {
+export fn tracy_set_thread_name(name: cstring) {
   mettle_tracy_set_thread_name(name);
 }
 
-export function tracy_plot(name: cstring, value: float64) {
+export fn tracy_plot(name: cstring, value: float64) {
   mettle_tracy_plot(name, value);
 }
 
-export function tracy_plot_float(name: cstring, value: float32) {
+export fn tracy_plot_float(name: cstring, value: float32) {
   mettle_tracy_plot_float(name, value);
 }
 
-export function tracy_plot_int(name: cstring, value: int64) {
+export fn tracy_plot_int(name: cstring, value: int64) {
   mettle_tracy_plot_int(name, value);
 }
 
-export function tracy_plot_config(name: cstring, type: int32, step: int32, fill: int32, color: uint32) {
+export fn tracy_plot_config(name: cstring, type: int32, step: int32, fill: int32, color: uint32) {
   mettle_tracy_plot_config(name, type, step, fill, color);
 }
 
-export function tracy_plot_setup_number(name: cstring, step: int32, fill: int32, color: uint32) {
+export fn tracy_plot_setup_number(name: cstring, step: int32, fill: int32, color: uint32) {
   tracy_plot_config(name, tracy_plot_number(), step, fill, color);
 }
 
-export function tracy_plot_setup_memory(name: cstring, step: int32, fill: int32, color: uint32) {
+export fn tracy_plot_setup_memory(name: cstring, step: int32, fill: int32, color: uint32) {
   tracy_plot_config(name, tracy_plot_memory(), step, fill, color);
 }
 
-export function tracy_message(text: cstring) {
+export fn tracy_message(text: cstring) {
   if (text == 0) {
     return;
   }
   mettle_tracy_message(text, strlen(text));
 }
 
-export function tracy_message_colored(text: cstring, color: uint32) {
+export fn tracy_message_colored(text: cstring, color: uint32) {
   if (text == 0) {
     return;
   }
   mettle_tracy_message_colored(text, strlen(text), color);
 }
 
-export function tracy_message_literal(text: cstring) {
+export fn tracy_message_literal(text: cstring) {
   mettle_tracy_message_literal(text);
 }
 
-export function tracy_app_info(text: cstring) {
+export fn tracy_app_info(text: cstring) {
   if (text == 0) {
     return;
   }
@@ -285,16 +285,16 @@ export function tracy_app_info(text: cstring) {
 }
 
 // ─── Memory events (custom allocators) ───────────────────────────────────────
-export function tracy_alloc(ptr: cstring, size: int64) {
+export fn tracy_alloc(ptr: cstring, size: int64) {
   mettle_tracy_alloc(ptr, size);
 }
 
-export function tracy_free(ptr: cstring) {
+export fn tracy_free(ptr: cstring) {
   mettle_tracy_free(ptr);
 }
 
 // malloc/free with Tracy memory events for custom-allocator demos.
-export function tracy_malloc(size: int64) -> cstring {
+export fn tracy_malloc(size: int64) -> cstring {
   var p: cstring = malloc(size);
   if (p != 0) {
     tracy_alloc(p, size);
@@ -302,7 +302,7 @@ export function tracy_malloc(size: int64) -> cstring {
   return p;
 }
 
-export function tracy_heap_free(ptr: cstring) {
+export fn tracy_heap_free(ptr: cstring) {
   if (ptr != 0) {
     tracy_free(ptr);
     free(ptr);
@@ -310,18 +310,18 @@ export function tracy_heap_free(ptr: cstring) {
 }
 
 // ─── Connection / manual lifetime ────────────────────────────────────────────
-export function tracy_connected() -> int32 {
+export fn tracy_connected() -> int32 {
   return mettle_tracy_connected();
 }
 
-export function tracy_started() -> int32 {
+export fn tracy_started() -> int32 {
   return mettle_tracy_started();
 }
 
-export function tracy_startup() {
+export fn tracy_startup() {
   mettle_tracy_startup();
 }
 
-export function tracy_shutdown() {
+export fn tracy_shutdown() {
   mettle_tracy_shutdown();
 }

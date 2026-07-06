@@ -5,7 +5,7 @@ struct Box {
   z: int64;
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   var p: Box* = new Box;
   if (p->x == 0 && p->y == 0 && p->z == 0) {
     return 1;

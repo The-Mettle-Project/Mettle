@@ -1,4 +1,4 @@
 var g: int32 = 1;
-function main() -> int32 {
+fn main() -> int32 {
   return g;
 }

@@ -1,6 +1,6 @@
 import "std/io";
 
-export function main() : int32 {
+export fn main() : int32 {
     var a : int32 = 5; // 0101
     var b : int32 = 3; // 0011
 

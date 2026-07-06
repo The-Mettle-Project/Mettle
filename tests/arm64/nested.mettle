@@ -1,0 +1,14 @@
+// 5x5 -> 25. nested while loops.
+fn main() -> int64 {
+  var s: int64 = 0;
+  var i: int64 = 0;
+  while (i < 5) {
+    var j: int64 = 0;
+    while (j < 5) {
+      s = s + 1;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return s;
+}

@@ -5348,6 +5348,54 @@ int code_generator_binary_emit_instruction(
   case IR_OP_STORE:
     return code_generator_binary_emit_store(generator, context, instruction);
 
+  case IR_OP_PREFETCH:
+    /* Advisory cache hint: materialize the precomputed address and emit
+     * prefetcht0 [reg]. Never faults, so no guards are needed here. */
+    if (!code_generator_binary_emit_operand_load(generator, context,
+                                                 &instruction->lhs,
+                                                 BINARY_GP_RAX) ||
+        !binary_emit_prefetcht0_mem(&context->code, BINARY_GP_RAX, 0)) {
+      if (!generator->has_error) {
+        code_generator_set_error(generator,
+                                 "Out of memory while emitting prefetch in "
+                                 "function '%s'",
+                                 context->function_name);
+      }
+      return 0;
+    }
+    return 1;
+
+  case IR_OP_SELECT: {
+    /* dest = (cond != 0) ? then : else. Materialize else into RDX (the
+     * result register), then into RCX, cond into RAX, and cmovnz RDX<-RCX. */
+    const IROperand *else_val =
+        instruction->argument_count > 0 ? &instruction->arguments[0] : NULL;
+    if (!else_val ||
+        !code_generator_binary_emit_operand_load(generator, context, else_val,
+                                                 BINARY_GP_RDX) ||
+        !code_generator_binary_emit_operand_load(generator, context,
+                                                 &instruction->rhs,
+                                                 BINARY_GP_RCX) ||
+        !code_generator_binary_emit_operand_load(generator, context,
+                                                 &instruction->lhs,
+                                                 BINARY_GP_RAX) ||
+        !binary_emit_alu_reg_reg(&context->code, 0x85, BINARY_GP_RAX,
+                                 BINARY_GP_RAX) || /* test rax, rax */
+        !binary_emit_cmovcc_reg_reg(&context->code, 0x45, BINARY_GP_RDX,
+                                    BINARY_GP_RCX) || /* cmovnz rdx, rcx */
+        !code_generator_binary_emit_destination_store(
+            generator, context, &instruction->dest, BINARY_GP_RDX)) {
+      if (!generator->has_error) {
+        code_generator_set_error(generator,
+                                 "Out of memory while emitting select in "
+                                 "function '%s'",
+                                 context->function_name);
+      }
+      return 0;
+    }
+    return 1;
+  }
+
   case IR_OP_BINARY:
     return code_generator_binary_emit_binary(generator, context, instruction);
 
@@ -5595,7 +5643,7 @@ int code_generator_binary_emit_instruction(
   case IR_OP_SIMD_VLOOP_F64:
   case IR_OP_SIMD_VLOOP_I32:
     return code_generator_binary_emit_simd_vloop_f64(generator, context,
-                                                     instruction);
+                                                     instruction, 0);
   case IR_OP_SIMD_FIND:
     return code_generator_binary_emit_simd_find(generator, context,
                                                 instruction);

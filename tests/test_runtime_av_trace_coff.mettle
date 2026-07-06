@@ -1,13 +1,13 @@
-function leaf_crash() -> int32 {
+fn leaf_crash() -> int32 {
   var p: int32* = (int32*)1;
   *p = 42;
   return 0;
 }
 
-function intermediate() -> int32 {
+fn intermediate() -> int32 {
   return leaf_crash();
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   return intermediate();
 }

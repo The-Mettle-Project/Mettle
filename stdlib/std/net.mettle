@@ -36,64 +36,64 @@ export var net_ref_lock: int32 = 0;
 // These are returned as functions because Mettle doesn't have
 // top-level constant expressions yet.
 
-export function AF_INET() -> int32     { return 2; }
-export function SOCK_STREAM() -> int32 { return 1; }
-export function SOCK_DGRAM() -> int32  { return 2; }
-export function IPPROTO_TCP() -> int32 { return 6; }
-export function IPPROTO_UDP() -> int32 { return 17; }
-export function SOL_SOCKET() -> int32 { return 0xFFFF; }
-export function SO_REUSEADDR() -> int32 { return 4; }
-export function SD_RECEIVE() -> int32 { return 0; }
-export function SD_SEND() -> int32 { return 1; }
-export function SD_BOTH() -> int32 { return 2; }
-export function INADDR_ANY() -> int32 { return 0; }
-export function INVALID_SOCKET() -> int64 { return -1; }
-export function SOCKET_ERROR() -> int32 { return -1; }
+export fn AF_INET() -> int32     { return 2; }
+export fn SOCK_STREAM() -> int32 { return 1; }
+export fn SOCK_DGRAM() -> int32  { return 2; }
+export fn IPPROTO_TCP() -> int32 { return 6; }
+export fn IPPROTO_UDP() -> int32 { return 17; }
+export fn SOL_SOCKET() -> int32 { return 0xFFFF; }
+export fn SO_REUSEADDR() -> int32 { return 4; }
+export fn SD_RECEIVE() -> int32 { return 0; }
+export fn SD_SEND() -> int32 { return 1; }
+export fn SD_BOTH() -> int32 { return 2; }
+export fn INADDR_ANY() -> int32 { return 0; }
+export fn INVALID_SOCKET() -> int64 { return -1; }
+export fn SOCKET_ERROR() -> int32 { return -1; }
 
 // ─── Winsock2 core functions ─────────────────────────────────────────────────
 // WSAStartup(wVersionRequired, lpWSAData) -> int32
 //   wVersionRequired: typically 0x0202 for Winsock 2.2
 //   lpWSAData: pointer to a 408-byte buffer (WSADATA struct)
-export extern function WSAStartup(version: int32, wsa_data: cstring) -> int32 = "WSAStartup";
-export extern function WSACleanup() -> int32 = "WSACleanup";
-export extern function WSAGetLastError() -> int32 = "WSAGetLastError";
+export extern fn WSAStartup(version: int32, wsa_data: cstring) -> int32 = "WSAStartup";
+export extern fn WSACleanup() -> int32 = "WSACleanup";
+export extern fn WSAGetLastError() -> int32 = "WSAGetLastError";
 
 // ─── Socket lifecycle ────────────────────────────────────────────────────────
-export extern function socket(af: int32, sock_type: int32, protocol: int32) -> int64 = "socket";
-export extern function closesocket(s: int64) -> int32 = "closesocket";
-export extern function shutdown(s: int64, how: int32) -> int32 = "shutdown";
+export extern fn socket(af: int32, sock_type: int32, protocol: int32) -> int64 = "socket";
+export extern fn closesocket(s: int64) -> int32 = "closesocket";
+export extern fn shutdown(s: int64, how: int32) -> int32 = "shutdown";
 
 // ─── Client operations ──────────────────────────────────────────────────────
-export extern function connect(s: int64, addr: cstring, addrlen: int32) -> int32 = "connect";
+export extern fn connect(s: int64, addr: cstring, addrlen: int32) -> int32 = "connect";
 
 // ─── Server operations ──────────────────────────────────────────────────────
-export extern function bind(s: int64, addr: cstring, addrlen: int32) -> int32 = "bind";
-export extern function listen(s: int64, backlog: int32) -> int32 = "listen";
-export extern function accept(s: int64, addr: cstring, addrlen: cstring) -> int64 = "accept";
-export extern function setsockopt(s: int64, level: int32, optname: int32, optval: cstring, optlen: int32) -> int32 = "setsockopt";
+export extern fn bind(s: int64, addr: cstring, addrlen: int32) -> int32 = "bind";
+export extern fn listen(s: int64, backlog: int32) -> int32 = "listen";
+export extern fn accept(s: int64, addr: cstring, addrlen: cstring) -> int64 = "accept";
+export extern fn setsockopt(s: int64, level: int32, optname: int32, optval: cstring, optlen: int32) -> int32 = "setsockopt";
 
 // ─── Data transfer ──────────────────────────────────────────────────────────
-export extern function send(s: int64, buf: cstring, len: int32, flags: int32) -> int32 = "send";
-export extern function recv(s: int64, buf: cstring, len: int32, flags: int32) -> int32 = "recv";
+export extern fn send(s: int64, buf: cstring, len: int32, flags: int32) -> int32 = "send";
+export extern fn recv(s: int64, buf: cstring, len: int32, flags: int32) -> int32 = "recv";
 
 // ─── Socket I/O mode ─────────────────────────────────────────────────────────
 // ioctlsocket(s, cmd, argp) controls blocking mode etc. cmd FIONBIO toggles
 // non-blocking I/O (argp points to a u_long: nonzero = non-blocking).
-export extern function ioctlsocket(s: int64, cmd: int32, argp: cstring) -> int32 = "ioctlsocket";
-export function FIONBIO() -> int32 { return 0x8004667E; }   // _IOW('f', 126, u_long)
-export function TCP_NODELAY() -> int32 { return 1; }
+export extern fn ioctlsocket(s: int64, cmd: int32, argp: cstring) -> int32 = "ioctlsocket";
+export fn FIONBIO() -> int32 { return 0x8004667E; }   // _IOW('f', 126, u_long)
+export fn TCP_NODELAY() -> int32 { return 1; }
 
 // ─── Address utilities ──────────────────────────────────────────────────────
-export extern function htons(hostshort: int32) -> int32 = "htons";
-export extern function htonl(hostlong: int32) -> int32 = "htonl";
-export extern function ntohs(netshort: int32) -> int32 = "ntohs";
-export extern function ntohl(netlong: int32) -> int32 = "ntohl";
-export extern function inet_addr(cp: cstring) -> int32 = "inet_addr";
+export extern fn htons(hostshort: int32) -> int32 = "htons";
+export extern fn htonl(hostlong: int32) -> int32 = "htonl";
+export extern fn ntohs(netshort: int32) -> int32 = "ntohs";
+export extern fn ntohl(netlong: int32) -> int32 = "ntohl";
+export extern fn inet_addr(cp: cstring) -> int32 = "inet_addr";
 
 // ─── Convenience wrappers ───────────────────────────────────────────────────
 
 // Initialize Winsock 2.2.  Returns 0 on success.
-export function net_init() -> int32 {
+export fn net_init() -> int32 {
   spin_lock(&net_ref_lock);
 
   if (net_ref_count > 0) {
@@ -120,7 +120,7 @@ export function net_init() -> int32 {
 }
 
 // Shut down Winsock.  Returns 0 on success.
-export function net_cleanup() -> int32 {
+export fn net_cleanup() -> int32 {
   spin_lock(&net_ref_lock);
 
   if (net_ref_count <= 0) {
@@ -140,19 +140,19 @@ export function net_cleanup() -> int32 {
   return result;
 }
 
-export function net_last_error() -> int32 {
+export fn net_last_error() -> int32 {
   return WSAGetLastError();
 }
 
-export function socket_tcp() -> int64 {
+export fn socket_tcp() -> int64 {
   return socket(AF_INET(), SOCK_STREAM(), IPPROTO_TCP());
 }
 
-export function socket_udp() -> int64 {
+export fn socket_udp() -> int64 {
   return socket(AF_INET(), SOCK_DGRAM(), IPPROTO_UDP());
 }
 
-export function net_is_initialized() -> int32 {
+export fn net_is_initialized() -> int32 {
   var ready: int32 = 0;
   spin_lock(&net_ref_lock);
   if (net_ref_count > 0) {
@@ -166,7 +166,7 @@ export function net_is_initialized() -> int32 {
 // Returns a malloc'd 16-byte buffer the caller must free() after use.
 //   ip   – dotted-quad string, e.g. "127.0.0.1"
 //   port – port number in host byte order
-export function sockaddr_in(ip: cstring, port: int32) -> cstring {
+export fn sockaddr_in(ip: cstring, port: int32) -> cstring {
   var buf: cstring = malloc(16);
   if (buf == 0) {
     return 0;
@@ -194,7 +194,7 @@ export function sockaddr_in(ip: cstring, port: int32) -> cstring {
 }
 
 // Build sockaddr_in for 0.0.0.0:port.
-export function sockaddr_in_any(port: int32) -> cstring {
+export fn sockaddr_in_any(port: int32) -> cstring {
   var buf: cstring = malloc(16);
   if (buf == 0) {
     return 0;
@@ -212,7 +212,7 @@ export function sockaddr_in_any(port: int32) -> cstring {
 }
 
 // Set SO_REUSEADDR to enabled (1) or disabled (0).
-export function set_reuseaddr(sock: int64, enabled: int32) -> int32 {
+export fn set_reuseaddr(sock: int64, enabled: int32) -> int32 {
   var opt: uint8[4];
   if (enabled != 0) {
     opt[0] = 1;
@@ -227,7 +227,7 @@ export function set_reuseaddr(sock: int64, enabled: int32) -> int32 {
 
 // Toggle non-blocking I/O on a socket. enabled != 0 => non-blocking (recv/send
 // return immediately, with WSAEWOULDBLOCK when no data / buffer full).
-export function set_nonblocking(sock: int64, enabled: int32) -> int32 {
+export fn set_nonblocking(sock: int64, enabled: int32) -> int32 {
   var v: uint32[1];
   if (enabled != 0) { v[0] = 1; } else { v[0] = 0; }
   return ioctlsocket(sock, FIONBIO(), (cstring)&v[0]);
@@ -235,7 +235,7 @@ export function set_nonblocking(sock: int64, enabled: int32) -> int32 {
 
 // Disable Nagle's algorithm on a TCP socket so small packets go out immediately
 // (lower latency for chatty, latency-sensitive traffic like a game state stream).
-export function set_nodelay(sock: int64, enabled: int32) -> int32 {
+export fn set_nodelay(sock: int64, enabled: int32) -> int32 {
   var opt: uint8[4];
   if (enabled != 0) { opt[0] = 1; } else { opt[0] = 0; }
   opt[1] = 0; opt[2] = 0; opt[3] = 0;
@@ -243,7 +243,7 @@ export function set_nodelay(sock: int64, enabled: int32) -> int32 {
 }
 
 // Send all bytes in buf[0..len). Returns total sent, or -1 on error.
-export function send_all(sock: int64, buf: cstring, len: int32) -> int32 {
+export fn send_all(sock: int64, buf: cstring, len: int32) -> int32 {
   var total: int32 = 0;
   while (total < len) {
     var sent: int32 = send(sock, &buf[total], len - total, 0);
