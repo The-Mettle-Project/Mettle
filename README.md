@@ -11,9 +11,7 @@
 
 **A from-scratch systems language that compiles straight to native x86-64.**
 
-Its own backend, linker, and source-level debugger. An auto-vectorizer that beats `gcc -O3` on key kernels.
-A compiler that explains every optimization decision and tells you when an edit made one regress.
-A native NVIDIA GPU path. No LLVM, no VM, no managed runtime.
+Its own backend, linker, and source-level debugger. No LLVM, no VM, no managed runtime.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 &nbsp;![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-2b6cb0.svg)
@@ -31,25 +29,22 @@ A native NVIDIA GPU path. No LLVM, no VM, no managed runtime.
 
 ---
 
-Mettle compiles `.mettle` source to native x86-64. On Windows, `mettle --build` produces a PE executable using a built-in linker. On Linux, it produces ELF and links with the system toolchain. There is no LLVM dependency, no VM, and no managed runtime.
+Mettle compiles `.mettle` source to native x86-64. On Windows, `mettle --build` produces a PE executable using a built-in linker. On Linux, it produces ELF and links with the system toolchain.
 
 ## Features
 
-- Static types, pointers, structs, and enums
+- Static types, pointers, structs, enums, closures, and `defer`/`errdefer`
 - Direct calls to C and OS APIs; a bundled stdlib for I/O, memory, math, and more
-- `defer` / `errdefer` for scope cleanup; compile errors with source snippets
-- **Compile-time memory diagnostics**: use-after-free, double free, leak detection, definite null dereference, and over-width shifts as warnings with concrete fix suggestions; hard errors for returning the address of a stack local, constant indexes past an array's end, constant-size memory ops that overwrite a stack frame, division by a constant zero, and the classic loop off-by-one (`while (i <= 8)` over an `int32[8]` is rejected with "use `i < 8`", proven because nothing in the loop can exit early). The analysis is interprocedural: it infers per-function ownership (which parameters a function frees, which it keeps, whether it returns a fresh allocation) across the whole program, so `consume(p); p[0]` is caught as use-after-free even when the `free` lives inside `consume`, and a leak is still seen through a helper that only borrows the pointer. It speaks only when certain; anything conditional stays silent. A **borrow-lifetime** layer extends this to dangling references: a pointer that borrows into a stack local (`p = &x[i]`) and is used after that local's `{ }` block exits, or an interior pointer into a heap buffer (`p = &buf[i]`) used after the buffer is `realloc`'d (the block may have moved) or `free`'d, are each reported with a concrete fix. Ownership is tracked **through pointer copies**, so `q = p; free(q); p[0]` is flagged as use-after-free and `free(a); free(b)` (with `b = a`) as a double free — the single-owner discipline Rust enforces in its type system, here on raw pointers where Rust's borrow checker is off, and entirely by inference with no annotations. See the [borrow checker](docs/borrow-checker.md) doc for how this compares to Rust's.
-- Range-based `for` (`for i in 0..n`) and **`@simd` / `@simd!` vectorization contracts**: ask the optimizer to vectorize a loop, and with `@simd!` fail the build if it can't. An auto-vectorizer (AVX2) backs them, beating `gcc -O3` on several kernels; `--simd-report` shows what each loop became.
-- `--explain` the optimizer as a collaborator: compile with `--explain` and the compiler reports every optimization decision in your file, which loops vectorized (and into what), which didn't (and why), which calls inlined, which were refused (and what to change). No annotations, no disassembly.
-- **Suggested fixes are proven**: before printing "declare the accumulator as int64", the compiler applies that change to an internal copy, re-runs the optimizer, and only prints the suggestion when the loop actually vectorizes. Advice the simulation disproves is replaced with the honest reason.
-- **Regression detection at compile time**: each `--explain` build remembers its decisions and the next one leads with the diff. A loop that was vectorized and no longer is gets reported as REGRESSED, in red, with the reason, before you ever run a benchmark. `--explain-json` emits the whole report as a machine-readable sidecar for CI (`fail if changesRegressed > 0` is a one-liner).
-- **A built-in source-level debugger**, no gdb, no PDB, no DWARF: `--debug-hooks` instruments the program and a named-pipe runtime gives breakpoints (including conditional ones and logpoints), stepping, call stacks, struct and array expansion, and live variable inspection. Writes too: edit a variable while paused and the program takes the new value. Hardware faults stop the debugger at the faulting source line with the stack and every variable intact.
-- **Optimization contracts**: `@simd!` (vectorize or fail the build), `@inline!` (every call inlines or fail with the inliner's reason), `@noalloc` (the function and everything it reaches is *proven* allocation-free, or the build fails pointing at the allocation). State intent; the compiler delivers it or explains the refusal.
-- **GPU offload to NVIDIA** via a native CUDA/PTX backend: write `kernel` functions, launch them with `dispatch K[grid, block](args)`, no LLVM or `nvcc`. See [GPU offload](docs/gpu.md).
-- **Crash forensics**: with `-s`, an access violation reports what the faulting address IS. An address under 4096 reads as "null plus offset 16: a field or array access through a null pointer". Under `--native-heap`, freed page-backed blocks keep their mapping with access revoked, so a use-after-free faults instantly and the report says "inside a 12272-byte heap block that was already freed"; freed small blocks are poisoned and quarantined, so a dangling write is caught and reported the moment the block would be reused.
+- **Compile-time memory diagnostics**: use-after-free, double free, leaks, and dangling pointers caught at compile time, with no annotations. Interprocedural and zero false positives. See [borrow checker](docs/borrow-checker.md).
+- **AVX2 auto-vectorizer** that beats `gcc -O3` on several kernels, plus `@simd` / `@simd!` contracts (vectorize or fail the build)
+- **`--explain`**: the compiler reports every optimization decision, why loops did or didn't vectorize, and flags regressions since your last build. Suggested fixes are verified by simulation before they're printed. `--explain-json` for CI.
+- **Optimization contracts**: `@inline!` and `@noalloc` fail the build with the compiler's reason if the guarantee can't be met
+- **Built-in source-level debugger**: breakpoints, stepping, live variable read/write via `--debug-hooks`. No gdb, no PDB, no DWARF.
+- **GPU offload to NVIDIA**: write `kernel` functions and launch with `dispatch K[grid, block](args)`. Native CUDA/PTX backend, no `nvcc`. See [GPU offload](docs/gpu.md).
+- **Crash forensics**: with `-s`, faults report what the bad address is (null field access, freed heap block, etc.); `--native-heap` catches use-after-free at the faulting instruction
 - Optional Tracy profiling, runtime timing, and debug stack traces
 
-Windows is the most complete target (internal PE linker, Win32 GUI via `std/ui`). Linux supports builds, a libc-backed stdlib, and compiler development. See [known limitations](docs/known-limitations.md) for caveats.
+Windows is the most complete target (internal PE linker, Win32 GUI via `std/ui`). Linux supports builds, a libc-backed stdlib, and compiler development. See [known limitations](docs/known-limitations.md).
 
 ## Example
 
@@ -85,8 +80,6 @@ mettle --build hello.mettle -o hello
 ./hello          # Windows: .\hello.exe
 ```
 
-Pass `--prelude` to pull in common stdlib modules without explicit imports. Import networking yourself when you need it (`std/net` on Windows; `std/net` or `std/net_posix` on Linux).
-
 ## Install
 
 **Linux (x86-64)**
@@ -101,13 +94,7 @@ curl -fsSL https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/inst
 irm https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/install.ps1 | iex
 ```
 
-Installs to `~/.mettle` (Linux) or `%LOCALAPPDATA%\Mettle` (Windows), updates user PATH, and checks for a C toolchain when linking stdlib programs. No root or admin required. Pin a release: `--version v0.13.0` (Linux) or `-Version v0.13.0` (Windows).
-
-```bash
-mettle --version
-```
-
-Dev builds from source report `v0.13.0` unless `METTLE_VERSION_RAW` is set at compile time.
+Installs to `~/.mettle` (Linux) or `%LOCALAPPDATA%\Mettle` (Windows) and updates user PATH. No root or admin required. Pin a release with `--version v0.13.0` (Linux) or `-Version v0.13.0` (Windows).
 
 ## Build from source
 
@@ -118,7 +105,7 @@ Dev builds from source report `v0.13.0` unless `METTLE_VERSION_RAW` is set at co
 .\build.bat clang
 ```
 
-**Linux / macOS** (build the compiler on the host; codegen targets x86-64 Windows and Linux):
+**Linux / macOS**:
 
 ```bash
 make                 # bin/mettle + bundled stdlib/ and runtime/
@@ -127,23 +114,19 @@ make install         # optional: /usr/local/bin, stdlib, runtime
 
 Typical release build:
 
-```powershell
-.\bin\mettle.exe --build --release hello.mettle -o hello.exe
-```
-
 ```bash
 ./bin/mettle --build --release hello.mettle -o hello
 ```
 
-Useful flags: `--build` (executable), `--release` / `-O` (optimized), `--emit-obj` (native object, the default), `--explain` / `--explain-json` (optimization report with since-last-build diffing), `--debug-hooks` (debugger instrumentation; what the editor's F5 uses), `-d` / `-s` / `-g` (debug and stack traces), `--profile-runtime`, `--tracy`, `--native-heap` (route `new`/`malloc`/`calloc`/`realloc`/`free` through Mettle's own allocator in `std/alloc` instead of the OS heap manager). Full list: `mettle --help` and `mettle help build`.
+Common flags: `--release` / `-O`, `--explain`, `--debug-hooks`, `-d` / `-s` / `-g`, `--native-heap`. Full list: `mettle --help`.
 
 ## Documentation
 
 - [Language reference](docs/LANGUAGE.md)
-- [Borrow checker](docs/borrow-checker.md) (advisory, zero-false-positive, inference-only ownership & lifetime analysis on raw pointers)
-- [Control flow](docs/control-flow.md) (range-`for`, `@simd` vectorization contracts)
-- [GPU offload](docs/gpu.md) (`kernel` / `dispatch`, CUDA/PTX backend)
-- [Compilation](docs/compilation.md) (CLI, link pipelines, Tracy, profiling)
+- [Borrow checker](docs/borrow-checker.md)
+- [Control flow](docs/control-flow.md)
+- [GPU offload](docs/gpu.md)
+- [Compilation](docs/compilation.md)
 - [Imports](docs/imports.md)
 - [Runtime model](docs/runtime-model.md)
 - [Standard library](docs/standard-library.md)
@@ -167,13 +150,11 @@ docs/           language and tooling reference
 
 ## Examples and benchmarks
 
-Runnable samples live under `[examples/](examples/)`. Benchmark suites pair Mettle, C, and Rust; run them with:
+Runnable samples live under [examples/](examples/). Benchmark suites pair Mettle, C, and Rust:
 
 ```powershell
 .\tools\benchmark\run-benchmarks.ps1
 ```
-
-See `[examples/README.md](examples/README.md)` for `fib`, `grep`, `ui_demo`, `tracy_demo`, and others.
 
 ## Development
 
@@ -182,7 +163,6 @@ See `[examples/README.md](examples/README.md)` for `fib`, `grep`, `ui_demo`, `tr
 ```powershell
 .\build.bat
 .\tests\run_tests.ps1
-.\tests\run_tests.ps1 -BuildCompiler
 ```
 
 **Linux** (native ELF backend):
@@ -192,18 +172,9 @@ make -j"$(nproc)"
 bash tools/test-elf-native.sh
 ```
 
-Optional: `tools/fuzz/` (nightly workflow). Crash-handler unit test: `make test`.
-
 ## Editor support
 
-The `[mettle-syntax](mettle-syntax/)` extension turns VS Code or Cursor into a full Mettle IDE:
-
-- **Debugging on F5**: breakpoints, conditional breakpoints, logpoints, step in/over/out, call stacks, struct/array/pointer expansion in the Variables pane, hover and watch evaluation of paths like `box.min.x`, and Set Value that genuinely writes program memory. Crashes stop at the faulting line with the stack and variables still inspectable. Hand-written kernel objects next to the source (`extern ... = "symbol"` plus a sibling `.o`) are detected and linked automatically.
-- **Navigation**: go to definition across imports, find references, rename, outline, workspace symbols, completion with struct fields and signature help, CodeLens with Run / Debug / Build above `main`.
-- **Optimization report panel**: the `--explain` report as an interactive dashboard, with an **Optimizations** tab and a **Memory** tab. One-click fixes for suggestions the optimizer has already verified by simulation, inline loop annotations in the editor, and a "since the last compile" section that shows what your edit just did to the optimizer's decisions, regressions first. The Memory tab surfaces the compile-time memory analysis (use-after-free, leaks, dangling borrows, out-of-bounds) with each diagnostic's proven fix.
-- Syntax highlighting, snippets, hover documentation, and compiler-backed diagnostics, as before.
-
-Everything runs against the compiler in your workspace; there is no separate language server to install.
+The [mettle-syntax](mettle-syntax/) extension turns VS Code or Cursor into a full Mettle IDE: debugging on F5, go to definition, rename, completion, an interactive `--explain` dashboard, and compiler-backed diagnostics. Everything runs against the compiler in your workspace; no separate language server.
 
 ## License
 
