@@ -412,11 +412,72 @@ static int link_resolution_merge_sections(LinkResolution *resolution,
   return 1;
 }
 
+static int link_resolution_reindex_symbols(LinkResolution *resolution,
+                                           size_t min_buckets) {
+  size_t nb = 64;
+  size_t *fresh = NULL;
+  size_t i = 0;
+
+  while (nb < min_buckets) {
+    nb *= 2u;
+  }
+  fresh = calloc(nb, sizeof(size_t));
+  if (!fresh) {
+    return 0;
+  }
+  for (i = 0; i < resolution->symbol_count; i++) {
+    if (resolution->symbols[i].name) {
+      size_t b = mettle_fnv1a_hash(resolution->symbols[i].name) & (nb - 1);
+      while (fresh[b]) {
+        b = (b + 1) & (nb - 1);
+      }
+      fresh[b] = i + 1;
+    }
+  }
+  free(resolution->symbol_buckets);
+  resolution->symbol_buckets = fresh;
+  resolution->symbol_bucket_count = nb;
+  return 1;
+}
+
+static int link_resolution_index_insert(LinkResolution *resolution,
+                                        size_t symbol_index) {
+  size_t b = 0;
+
+  if ((resolution->symbol_count + 1u) * 4u >=
+      resolution->symbol_bucket_count * 3u) {
+    if (!link_resolution_reindex_symbols(resolution,
+                                         (resolution->symbol_count + 1u) * 2u)) {
+      return 0;
+    }
+    return 1; /* reindex covered the new entry */
+  }
+  b = mettle_fnv1a_hash(resolution->symbols[symbol_index].name) &
+      (resolution->symbol_bucket_count - 1);
+  while (resolution->symbol_buckets[b]) {
+    b = (b + 1) & (resolution->symbol_bucket_count - 1);
+  }
+  resolution->symbol_buckets[b] = symbol_index + 1u;
+  return 1;
+}
+
 static LinkedSymbol *link_resolution_find_symbol_mutable(LinkResolution *resolution,
                                                          const char *name) {
   size_t i = 0;
 
   if (!resolution || !name) {
+    return NULL;
+  }
+
+  if (resolution->symbol_bucket_count) {
+    size_t b = mettle_fnv1a_hash(name) & (resolution->symbol_bucket_count - 1);
+    while (resolution->symbol_buckets[b]) {
+      LinkedSymbol *s = &resolution->symbols[resolution->symbol_buckets[b] - 1];
+      if (s->name && strcmp(s->name, name) == 0) {
+        return s;
+      }
+      b = (b + 1) & (resolution->symbol_bucket_count - 1);
+    }
     return NULL;
   }
 
@@ -490,6 +551,13 @@ static int link_resolution_record_global_symbol(
     }
     global_symbol->defining_object_index = LINKED_SECTION_INDEX_NONE;
     global_symbol->defining_symbol_index = UINT32_MAX;
+    if (!link_resolution_index_insert(resolution,
+                                      resolution->symbol_count - 1u)) {
+      mettle_set_error(error_message_out,
+                                "Out of memory while indexing symbol '%s'",
+                                object_symbol->name);
+      return 0;
+    }
   }
 
   global_symbol->is_external = 1;
@@ -784,6 +852,7 @@ void link_resolution_destroy(LinkResolution *resolution) {
 
   free(resolution->objects);
   free(resolution->symbols);
+  free(resolution->symbol_buckets);
   free(resolution);
 }
 
@@ -803,6 +872,19 @@ const LinkedSymbol *link_resolution_find_symbol(const LinkResolution *resolution
   size_t symbol_index = 0;
 
   if (!resolution || !name) {
+    return NULL;
+  }
+
+  if (resolution->symbol_bucket_count) {
+    size_t b = mettle_fnv1a_hash(name) & (resolution->symbol_bucket_count - 1);
+    while (resolution->symbol_buckets[b]) {
+      const LinkedSymbol *s =
+          &resolution->symbols[resolution->symbol_buckets[b] - 1];
+      if (s->name && strcmp(s->name, name) == 0) {
+        return s;
+      }
+      b = (b + 1) & (resolution->symbol_bucket_count - 1);
+    }
     return NULL;
   }
 

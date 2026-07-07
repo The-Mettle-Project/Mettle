@@ -24,8 +24,38 @@ static size_t g_mir_gate_fn_size = 0;
  * rejected by the MIR eligibility gate, so the spill-everything-fallback work
  * list can be prioritized by real frequency. Returns 0 (ineligible). Also
  * feeds the --explain backend report (a no-op when --explain is off). */
+/* getenv is slow on Windows and these are consulted per function (or per
+ * bail); snapshot each knob once per process. */
+static int mir_env_trace(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    cached = getenv("METTLE_MIR_TRACE") ? 1 : 0;
+  }
+  return cached;
+}
+
+static const char *mir_env_mir(void) {
+  static const char *cached = NULL;
+  static int resolved = 0;
+  if (!resolved) {
+    cached = getenv("METTLE_MIR");
+    resolved = 1;
+  }
+  return cached;
+}
+
+static const char *mir_env_skipfn(void) {
+  static const char *cached = NULL;
+  static int resolved = 0;
+  if (!resolved) {
+    cached = getenv("METTLE_MIR_SKIPFN");
+    resolved = 1;
+  }
+  return cached;
+}
+
 static int mir_trace_bail(FunctionDeclaration *fd, const char *reason) {
-  if (getenv("METTLE_MIR_TRACE")) {
+  if (mir_env_trace()) {
     fprintf(stderr, "MIR-BAIL\t%s\t%s\n", reason,
             (fd && fd->name) ? fd->name : "?");
   }
@@ -74,21 +104,66 @@ typedef struct {
   MirNameEntry *items;
   size_t count;
   size_t capacity;
+  /* Open-addressing index over items (slot+1; 0 = empty). Linear name scans
+   * here were a measured hotspot on large inlined functions. */
+  size_t *buckets;
+  size_t bucket_count;
 } MirNameMap;
 
 static void mir_name_map_destroy(MirNameMap *m) {
   free(m->items);
+  free(m->buckets);
   m->items = NULL;
-  m->count = m->capacity = 0;
+  m->buckets = NULL;
+  m->count = m->capacity = m->bucket_count = 0;
+}
+
+static size_t mir_name_map_hash(const char *name, int is_temp) {
+  size_t h = mettle_fnv1a_hash(name);
+  return h ^ (is_temp ? 0x9e3779b97f4a7c15ull : 0);
+}
+
+static int mir_name_map_reindex(MirNameMap *m, size_t min_buckets) {
+  size_t nb = 64;
+  while (nb < min_buckets) {
+    nb *= 2;
+  }
+  size_t *fresh = (size_t *)calloc(nb, sizeof(size_t));
+  if (!fresh) {
+    return 0;
+  }
+  for (size_t i = 0; i < m->count; i++) {
+    size_t b = mir_name_map_hash(m->items[i].name, m->items[i].is_temp) &
+               (nb - 1);
+    while (fresh[b]) {
+      b = (b + 1) & (nb - 1);
+    }
+    fresh[b] = i + 1;
+  }
+  free(m->buckets);
+  m->buckets = fresh;
+  m->bucket_count = nb;
+  return 1;
 }
 
 static MirVregId mir_name_map_get_or_add(MirNameMap *m, MirFunction *fn,
                                          const char *name, int is_temp,
                                          MirRegClass rclass, int width) {
-  for (size_t i = 0; i < m->count; i++) {
-    if (m->items[i].is_temp == is_temp &&
-        strcmp(m->items[i].name, name) == 0) {
-      return m->items[i].vreg;
+  if (m->bucket_count && m->count * 4 < m->bucket_count * 3) {
+    size_t b = mir_name_map_hash(name, is_temp) & (m->bucket_count - 1);
+    while (m->buckets[b]) {
+      const MirNameEntry *e = &m->items[m->buckets[b] - 1];
+      if (e->is_temp == is_temp && strcmp(e->name, name) == 0) {
+        return e->vreg;
+      }
+      b = (b + 1) & (m->bucket_count - 1);
+    }
+  } else {
+    for (size_t i = 0; i < m->count; i++) {
+      if (m->items[i].is_temp == is_temp &&
+          strcmp(m->items[i].name, name) == 0) {
+        return m->items[i].vreg;
+      }
     }
   }
   if (m->count >= m->capacity) {
@@ -110,12 +185,35 @@ static MirVregId mir_name_map_get_or_add(MirNameMap *m, MirFunction *fn,
   m->items[m->count].is_temp = is_temp;
   m->items[m->count].vreg = v;
   m->count++;
+  if ((m->count + 1) * 4 >= m->bucket_count * 3) {
+    if (!mir_name_map_reindex(m, (m->count + 1) * 2)) {
+      fn->has_error = 1;
+      return MIR_VREG_NONE;
+    }
+  } else {
+    size_t b = mir_name_map_hash(name, is_temp) & (m->bucket_count - 1);
+    while (m->buckets[b]) {
+      b = (b + 1) & (m->bucket_count - 1);
+    }
+    m->buckets[b] = m->count; /* slot index (count-1) + 1 */
+  }
   return v;
 }
 
 /* True if symbol `name` already has a vreg binding (param/local/cached
  * global). Symbols only — temps live in a separate namespace. */
 static int mir_name_map_has(const MirNameMap *m, const char *name) {
+  if (m->bucket_count) {
+    size_t b = mir_name_map_hash(name, 0) & (m->bucket_count - 1);
+    while (m->buckets[b]) {
+      const MirNameEntry *e = &m->items[m->buckets[b] - 1];
+      if (!e->is_temp && strcmp(e->name, name) == 0) {
+        return 1;
+      }
+      b = (b + 1) & (m->bucket_count - 1);
+    }
+    return 0;
+  }
   for (size_t i = 0; i < m->count; i++) {
     if (!m->items[i].is_temp && strcmp(m->items[i].name, name) == 0) {
       return 1;
@@ -655,7 +753,7 @@ static int mir_temp_is_float(CodeGenerator *g, IRFunction *function,
  * GP-scalar type (float args are deferred), a non-INDIRECT (register) return,
  * and simple argument/destination operands. */
 static void mir_call_trace(const char *sub) {
-  if (getenv("METTLE_MIR_TRACE")) {
+  if (mir_env_trace()) {
     fprintf(stderr, "MIR-CALLBAIL\t%s\n", sub);
   }
 }
@@ -1013,12 +1111,12 @@ int mir_function_is_eligible(CodeGenerator *generator,
   }
   /* Kill switch for bisecting MIR vs legacy regressions. */
   {
-    const char *off = getenv("METTLE_MIR");
+    const char *off = mir_env_mir();
     if (off && off[0] == '0') {
       return 0;
     }
     /* Bisect: comma-separated list of function names forced to fallback. */
-    const char *skip = getenv("METTLE_MIR_SKIPFN");
+    const char *skip = mir_env_skipfn();
     if (skip && function_data->name) {
       const char *nm = function_data->name;
       size_t nl = strlen(nm);
@@ -1670,7 +1768,7 @@ int mir_function_is_eligible(CodeGenerator *generator,
     }
     }
   }
-  if (getenv("METTLE_MIR_TRACE")) {
+  if (mir_env_trace()) {
     fprintf(stderr, "MIR-OK\t%s\n",
             function_data->name ? function_data->name : "?");
   }
@@ -4725,7 +4823,13 @@ int code_generator_binary_emit_function_via_mir(
    * byte. Set unconditionally to 0 so the allocator keeps the rbp frame and rbp
    * stays reserved. (The FPO machinery in mir_encode/mir_regalloc is inert while
    * this is 0; opt back in via METTLE_FPO if a future change makes it pay off.) */
-  context->omit_frame_pointer = getenv("METTLE_FPO") ? 1 : 0;
+  {
+    static int fpo = -1;
+    if (fpo < 0) {
+      fpo = getenv("METTLE_FPO") ? 1 : 0;
+    }
+    context->omit_frame_pointer = fpo;
+  }
 
   /* Bind parameters to vregs and record their incoming extension. */
   const BinaryAbi *abi = code_generator_binary_active_abi();
@@ -5089,8 +5193,14 @@ int code_generator_binary_emit_function_via_mir(
   if (!mir_regalloc(&fn) || fn.has_error) {
     goto oom;
   }
-  if (getenv("METTLE_MIR_DUMP")) {
-    mir_function_dump(&fn, stderr);
+  {
+    static int dump = -1;
+    if (dump < 0) {
+      dump = getenv("METTLE_MIR_DUMP") ? 1 : 0;
+    }
+    if (dump) {
+      mir_function_dump(&fn, stderr);
+    }
   }
   /* --annotate-asm: open a capture context so mir_encode's per-instruction
    * records land under this function (inert when the annotator is off). */

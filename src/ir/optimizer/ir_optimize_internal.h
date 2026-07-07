@@ -99,6 +99,10 @@ typedef struct {
   IRNameMapEntry *items;
   size_t count;
   size_t capacity;
+  /* Open-addressing index over items (slot+1; 0 = empty). The inliner hits
+   * lookup per operand of every inlined instruction. */
+  size_t *buckets;
+  size_t bucket_count;
 } IRNameMap;
 
 typedef struct {
@@ -400,6 +404,8 @@ int ir_instruction_is_trivially_dead_if_dest_unused(
     const IRInstruction *instruction);
 void ir_instruction_make_jump(IRInstruction *instruction);
 void ir_instruction_make_nop(IRInstruction *instruction);
+int ir_instruction_vector_reserve(IRInstructionVector *vector,
+                                  size_t capacity);
 int ir_instruction_vector_append_move(IRInstructionVector *vector,
                                              IRInstruction *instruction);
 void ir_instruction_vector_destroy(IRInstructionVector *vector);

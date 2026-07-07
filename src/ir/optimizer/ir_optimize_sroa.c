@@ -33,41 +33,6 @@ static const char *ir_builtin_scalar_type_for_slot(int size, int is_float,
   }
 }
 
-/* Find the addr-record for a temp name, or NULL. */
-static IRSroaAddr *ir_sroa_find_addr(IRSroaAddr *addrs, size_t count,
-                                     const char *name) {
-  if (!name) {
-    return NULL;
-  }
-  for (size_t i = 0; i < count; i++) {
-    if (addrs[i].temp && strcmp(addrs[i].temp, name) == 0) {
-      return &addrs[i];
-    }
-  }
-  return NULL;
-}
-
-/* Count how many of an instruction's operands (dest/lhs/rhs/args) name `temp`. */
-static int ir_sroa_temp_operand_uses(const IRInstruction *insn,
-                                     const char *temp) {
-  int n = 0;
-  if (ir_operand_is_temp_named(&insn->dest, temp)) {
-    n++;
-  }
-  if (ir_operand_is_temp_named(&insn->lhs, temp)) {
-    n++;
-  }
-  if (ir_operand_is_temp_named(&insn->rhs, temp)) {
-    n++;
-  }
-  for (size_t a = 0; a < insn->argument_count; a++) {
-    if (ir_operand_is_temp_named(&insn->arguments[a], temp)) {
-      n++;
-    }
-  }
-  return n;
-}
-
 static IRSroaSlot *ir_sroa_find_slot(IRSroaSlot *slots, size_t slot_count,
                                      long long offset) {
   for (size_t i = 0; i < slot_count; i++) {
@@ -110,200 +75,6 @@ static int ir_sroa_note_slot(IRSroaSlot *slots, size_t *slot_count,
          slot->float_bits == float_bits;
 }
 
-/* Analyze a single aggregate local `sym` declared at decl_index: discover its
- * field slots (offset/size/float) and the set of whole-aggregate copy partners
- * (`@sym <- @other` or `@other <- @sym`). Fills slots/slot_count and
- * partners/partner_count. Returns 1 if `sym` is SROA-eligible in isolation
- * (clean field access + only whole-aggregate-copy non-field uses), else 0.
- * "Eligible in isolation" does NOT yet require partners to be eligible here;
- * the group driver checks that. */
-static int ir_sroa_analyze_local(IRFunction *function, size_t decl_index,
-                                 const char *sym, IRSroaSlot *slots,
-                                 size_t *slot_count_out,
-                                 const char **partners,
-                                 size_t *partner_count_out,
-                                 size_t max_partners) {
-  IRSroaAddr addrs[IR_SROA_MAX_SLOTS * 2];
-  size_t addr_count = 0;
-  size_t slot_count = 0;
-  size_t partner_count = 0;
-  int eligible = 1;
-
-  *slot_count_out = 0;
-  *partner_count_out = 0;
-
-  /* discover address temps (&sym and &sym + CONST). A whole-aggregate
-   * copy ASSIGN that references sym is recorded as a partner (not a
-   * disqualifier). Any OTHER bare-symbol use means the value escapes. */
-  for (size_t i = 0; i < function->instruction_count && eligible; i++) {
-    const IRInstruction *insn = &function->instructions[i];
-    if (insn->op == IR_OP_ADDRESS_OF &&
-        ir_operand_is_symbol_named(&insn->lhs, sym) &&
-        insn->dest.kind == IR_OPERAND_TEMP && insn->dest.name) {
-      if (addr_count >= sizeof(addrs) / sizeof(addrs[0])) {
-        eligible = 0;
-        break;
-      }
-      addrs[addr_count].temp = insn->dest.name;
-      addrs[addr_count].offset = 0;
-      addrs[addr_count].valid = 1;
-      addr_count++;
-      continue;
-    }
-    if (i == decl_index) {
-      continue;
-    }
-    /* Whole-aggregate copy: ASSIGN where one side is sym and the other is a
-     * plain symbol (the partner). Both operands must be bare symbols; a
-     * scalar-typed assign would not have sym as an aggregate value. */
-    if (insn->op == IR_OP_ASSIGN &&
-        insn->dest.kind == IR_OPERAND_SYMBOL && insn->dest.name &&
-        insn->lhs.kind == IR_OPERAND_SYMBOL && insn->lhs.name &&
-        (ir_operand_is_symbol_named(&insn->dest, sym) ||
-         ir_operand_is_symbol_named(&insn->lhs, sym))) {
-      const char *other = ir_operand_is_symbol_named(&insn->dest, sym)
-                              ? insn->lhs.name
-                              : insn->dest.name;
-      /* Self-copy (@sym <- @sym) is degenerate; treat as escape to be safe. */
-      if (strcmp(other, sym) == 0) {
-        eligible = 0;
-        break;
-      }
-      int found = 0;
-      for (size_t p = 0; p < partner_count; p++) {
-        if (strcmp(partners[p], other) == 0) {
-          found = 1;
-          break;
-        }
-      }
-      if (!found) {
-        if (partner_count >= max_partners) {
-          eligible = 0;
-          break;
-        }
-        partners[partner_count++] = other;
-      }
-      continue;
-    }
-    /* Any other reference to the bare symbol escapes. */
-    if (ir_operand_is_symbol_named(&insn->dest, sym) ||
-        ir_operand_is_symbol_named(&insn->lhs, sym) ||
-        ir_operand_is_symbol_named(&insn->rhs, sym)) {
-      eligible = 0;
-    }
-    for (size_t a = 0; a < insn->argument_count && eligible; a++) {
-      if (ir_operand_is_symbol_named(&insn->arguments[a], sym)) {
-        eligible = 0;
-      }
-    }
-  }
-  if (!eligible || addr_count == 0) {
-    return 0;
-  }
-
-  /* derive `base + CONST` offset temps from the base temps. A single
-   * sweep suffices because ir_lowering emits the add right after the addr-of. */
-  for (size_t i = 0; i < function->instruction_count && eligible; i++) {
-    const IRInstruction *insn = &function->instructions[i];
-    if (insn->op == IR_OP_BINARY && insn->text &&
-        strcmp(insn->text, "+") == 0 && !insn->is_float &&
-        insn->dest.kind == IR_OPERAND_TEMP && insn->dest.name &&
-        insn->lhs.kind == IR_OPERAND_TEMP && insn->lhs.name &&
-        insn->rhs.kind == IR_OPERAND_INT) {
-      IRSroaAddr *base = ir_sroa_find_addr(addrs, addr_count, insn->lhs.name);
-      if (base) {
-        if (addr_count >= sizeof(addrs) / sizeof(addrs[0])) {
-          eligible = 0;
-          break;
-        }
-        addrs[addr_count].temp = insn->dest.name;
-        addrs[addr_count].offset = base->offset + insn->rhs.int_value;
-        addrs[addr_count].valid = 1;
-        addr_count++;
-      }
-    }
-  }
-  if (!eligible) {
-    return 0;
-  }
-
-  /* every use of every address temp must be exactly one of:
-   *  - producer (ADDRESS_OF, or the `+CONST` that defined it): allowed once,
-   *  - LOAD with the temp as the address (lhs),
-   *  - STORE with the temp as the address (dest),
-   *  - a `+CONST` deriving another (already-recorded) address temp.
-   * Anything else (used as a value, passed to a call, stored into memory,
-   * dynamic index) means the address escapes -> bail. Collect field slots. */
-  for (size_t i = 0; i < function->instruction_count && eligible; i++) {
-    const IRInstruction *insn = &function->instructions[i];
-
-    /* Skip the defining instructions of address temps. */
-    if ((insn->op == IR_OP_ADDRESS_OF || insn->op == IR_OP_BINARY) &&
-        insn->dest.kind == IR_OPERAND_TEMP &&
-        ir_sroa_find_addr(addrs, addr_count, insn->dest.name)) {
-      continue;
-    }
-
-    if (insn->op == IR_OP_LOAD) {
-      IRSroaAddr *a = ir_sroa_find_addr(addrs, addr_count, insn->lhs.name);
-      if (a) {
-        /* The address temp must appear ONLY as the load address. */
-        if (ir_operand_is_temp_named(&insn->dest, a->temp) ||
-            ir_operand_is_temp_named(&insn->rhs, a->temp)) {
-          eligible = 0;
-          break;
-        }
-        int size = (insn->rhs.kind == IR_OPERAND_INT)
-                       ? (int)insn->rhs.int_value
-                       : 8;
-        if (!ir_sroa_note_slot(slots, &slot_count, a->offset, size,
-                               insn->is_float, insn->float_bits)) {
-          /* Mixed-width / mixed-class access of the same offset: not a clean
-           * scalar field. Decline rather than guess. */
-          eligible = 0;
-          break;
-        }
-        continue;
-      }
-    }
-
-    if (insn->op == IR_OP_STORE) {
-      IRSroaAddr *a = ir_sroa_find_addr(addrs, addr_count, insn->dest.name);
-      if (a) {
-        if (ir_operand_is_temp_named(&insn->lhs, a->temp)) {
-          eligible = 0; /* address used as the stored value -> escapes */
-          break;
-        }
-        int size = (insn->rhs.kind == IR_OPERAND_INT)
-                       ? (int)insn->rhs.int_value
-                       : 8;
-        if (!ir_sroa_note_slot(slots, &slot_count, a->offset, size,
-                               insn->is_float, insn->float_bits)) {
-          eligible = 0;
-          break;
-        }
-        continue;
-      }
-    }
-
-    /* Any other instruction must not reference an address temp at all. */
-    for (size_t k = 0; k < addr_count; k++) {
-      if (ir_sroa_temp_operand_uses(insn, addrs[k].temp) > 0) {
-        eligible = 0;
-        break;
-      }
-    }
-  }
-
-  if (!eligible || slot_count == 0) {
-    return 0;
-  }
-
-  *slot_count_out = slot_count;
-  *partner_count_out = partner_count;
-  return 1;
-}
-
 /* True when two slot layouts are identical (same offsets/sizes/float class in
  * the same order). Group members must match exactly so a whole-aggregate copy
  * can be rewritten field-for-field. */
@@ -321,22 +92,105 @@ static int ir_sroa_slots_match(const IRSroaSlot *a, size_t an,
   return 1;
 }
 
-/* Build the address records for `sym` again (cheap, bounded) so the transform
- * can map each LOAD/STORE address temp back to a field offset. Mirrors passes
- * 1-2 of the analyzer but only records addrs. */
-static size_t ir_sroa_collect_addrs(IRFunction *function, const char *sym,
-                                    IRSroaAddr *addrs, size_t cap) {
-  size_t addr_count = 0;
+/* All transformable groups discovered this round, flattened. Each member
+ * carries the index of its group's shared slot layout. Name lookups go through
+ * two open-addressing hashes (member symbol names, address temp names): the
+ * transform consults them per instruction, and linear scans here were a
+ * measured strcmp hotspot on large inlined functions. */
+typedef struct {
+  IRSroaSlot slots[IR_SROA_MAX_SLOTS];
+  size_t slot_count;
+} IRSroaLayout;
+
+typedef struct {
+  const char *name;
+  size_t decl_index;
+  size_t layout;
+  IRSroaAddr addrs[IR_SROA_MAX_SLOTS * 2];
+  size_t addr_count;
+} IRSroaFlatMember;
+
+typedef struct {
+  const char *key; /* borrowed name; NULL = empty */
+  size_t member;
+  long long offset; /* addr hash only */
+} IRSroaHashEnt;
+
+typedef struct {
+  IRSroaHashEnt *ents;
+  size_t bucket_count; /* power of two, 0 = empty table */
+} IRSroaHash;
+
+static int ir_sroa_hash_init(IRSroaHash *h, size_t expected) {
+  size_t nb = 64;
+  while (nb < expected * 2) {
+    nb *= 2;
+  }
+  h->ents = (IRSroaHashEnt *)calloc(nb, sizeof(IRSroaHashEnt));
+  if (!h->ents) {
+    h->bucket_count = 0;
+    return 0;
+  }
+  h->bucket_count = nb;
+  return 1;
+}
+
+/* Insert; first insert for a key wins (mirrors the old first-match scan). */
+static void ir_sroa_hash_put(IRSroaHash *h, const char *key, size_t member,
+                             long long offset) {
+  size_t b = mettle_fnv1a_hash(key) & (h->bucket_count - 1);
+  while (h->ents[b].key) {
+    if (strcmp(h->ents[b].key, key) == 0) {
+      return;
+    }
+    b = (b + 1) & (h->bucket_count - 1);
+  }
+  h->ents[b].key = key;
+  h->ents[b].member = member;
+  h->ents[b].offset = offset;
+}
+
+static const IRSroaHashEnt *ir_sroa_hash_get(const IRSroaHash *h,
+                                             const char *key) {
+  if (!h->bucket_count || !key) {
+    return NULL;
+  }
+  size_t b = mettle_fnv1a_hash(key) & (h->bucket_count - 1);
+  while (h->ents[b].key) {
+    if (strcmp(h->ents[b].key, key) == 0) {
+      return &h->ents[b];
+    }
+    b = (b + 1) & (h->bucket_count - 1);
+  }
+  return NULL;
+}
+
+/* Build every member's address records in two shared sweeps (ADDRESS_OF
+ * bases, then `base + CONST` derivations in stream order), filling `addr_hash`
+ * (addr temp name -> member + offset) as it goes. Mirrors passes 1-2 of the
+ * analyzer. */
+static void ir_sroa_collect_all_addrs(IRFunction *function,
+                                      IRSroaFlatMember *members,
+                                      const IRSroaHash *member_hash,
+                                      IRSroaHash *addr_hash) {
   for (size_t i = 0; i < function->instruction_count; i++) {
     const IRInstruction *insn = &function->instructions[i];
-    if (insn->op == IR_OP_ADDRESS_OF &&
-        ir_operand_is_symbol_named(&insn->lhs, sym) &&
-        insn->dest.kind == IR_OPERAND_TEMP && insn->dest.name &&
-        addr_count < cap) {
-      addrs[addr_count].temp = insn->dest.name;
-      addrs[addr_count].offset = 0;
-      addrs[addr_count].valid = 1;
-      addr_count++;
+    if (insn->op == IR_OP_ADDRESS_OF && insn->lhs.kind == IR_OPERAND_SYMBOL &&
+        insn->lhs.name && insn->dest.kind == IR_OPERAND_TEMP &&
+        insn->dest.name) {
+      const IRSroaHashEnt *m = ir_sroa_hash_get(member_hash, insn->lhs.name);
+      if (!m) {
+        continue;
+      }
+      IRSroaFlatMember *fm = &members[m->member];
+      if (fm->addr_count >= IR_ARRAY_COUNT(fm->addrs)) {
+        continue;
+      }
+      fm->addrs[fm->addr_count].temp = insn->dest.name;
+      fm->addrs[fm->addr_count].offset = 0;
+      fm->addrs[fm->addr_count].valid = 1;
+      fm->addr_count++;
+      ir_sroa_hash_put(addr_hash, insn->dest.name, m->member, 0);
     }
   }
   for (size_t i = 0; i < function->instruction_count; i++) {
@@ -345,34 +199,23 @@ static size_t ir_sroa_collect_addrs(IRFunction *function, const char *sym,
         strcmp(insn->text, "+") == 0 && !insn->is_float &&
         insn->dest.kind == IR_OPERAND_TEMP && insn->dest.name &&
         insn->lhs.kind == IR_OPERAND_TEMP && insn->lhs.name &&
-        insn->rhs.kind == IR_OPERAND_INT && addr_count < cap) {
-      IRSroaAddr *base = ir_sroa_find_addr(addrs, addr_count, insn->lhs.name);
-      if (base) {
-        addrs[addr_count].temp = insn->dest.name;
-        addrs[addr_count].offset = base->offset + insn->rhs.int_value;
-        addrs[addr_count].valid = 1;
-        addr_count++;
+        insn->rhs.kind == IR_OPERAND_INT) {
+      const IRSroaHashEnt *base = ir_sroa_hash_get(addr_hash, insn->lhs.name);
+      if (!base) {
+        continue;
       }
+      IRSroaFlatMember *fm = &members[base->member];
+      if (fm->addr_count >= IR_ARRAY_COUNT(fm->addrs)) {
+        continue;
+      }
+      long long off = base->offset + insn->rhs.int_value;
+      fm->addrs[fm->addr_count].temp = insn->dest.name;
+      fm->addrs[fm->addr_count].offset = off;
+      fm->addrs[fm->addr_count].valid = 1;
+      fm->addr_count++;
+      ir_sroa_hash_put(addr_hash, insn->dest.name, base->member, off);
     }
   }
-  return addr_count;
-}
-
-/* Return the group member that `name` is an address temp of, or NULL, also
- * writing the matching slot. */
-static IRSroaMemberCtx *ir_sroa_addr_owner(IRSroaMemberCtx *members,
-                                           size_t member_count,
-                                           const char *name,
-                                           long long *offset_out) {
-  for (size_t m = 0; m < member_count; m++) {
-    IRSroaAddr *a =
-        ir_sroa_find_addr(members[m].addrs, members[m].addr_count, name);
-    if (a) {
-      *offset_out = a->offset;
-      return &members[m];
-    }
-  }
-  return NULL;
 }
 
 /* Build a scalar name "<member>$<offset>" into a fresh allocation. */
@@ -385,29 +228,38 @@ static char *ir_sroa_scalar_name(const char *member, long long offset) {
   return s;
 }
 
-/* Transform a whole group of layout-compatible aggregates at once. `members`
- * lists each aggregate name + decl index; `slots` is the shared layout. Returns
- * 1 on success, 0 on allocation failure (stream left intact on failure). */
-static int ir_sroa_transform_group(IRFunction *function,
-                                    IRSroaMemberCtx *members,
-                                    size_t member_count, const IRSroaSlot *slots,
-                                    size_t slot_count) {
+/* Transform every collected group in a single rebuild of the instruction
+ * stream. Returns 1 on success, 0 on allocation failure (stream left intact
+ * on failure). */
+static int ir_sroa_transform_all(IRFunction *function,
+                                 const IRSroaFlatMember *members,
+                                 size_t member_count,
+                                 const IRSroaLayout *layouts,
+                                 const IRSroaHash *member_hash,
+                                 const IRSroaHash *addr_hash) {
   IRInstructionVector vec = {0};
   int ok = 1;
+  (void)member_count;
+  if (!ir_instruction_vector_reserve(&vec, function->instruction_count)) {
+    return 0;
+  }
 
   for (size_t i = 0; i < function->instruction_count && ok; i++) {
     IRInstruction *insn = &function->instructions[i];
 
     /* Replace each member's aggregate decl with per-slot scalar decls. */
-    int is_member_decl = 0;
-    for (size_t m = 0; m < member_count; m++) {
-      if (i == members[m].decl_index) {
-        is_member_decl = 1;
+    if (insn->op == IR_OP_DECLARE_LOCAL &&
+        insn->dest.kind == IR_OPERAND_SYMBOL && insn->dest.name) {
+      const IRSroaHashEnt *me = ir_sroa_hash_get(member_hash, insn->dest.name);
+      if (me && members[me->member].decl_index == i) {
+        const IRSroaFlatMember *fm = &members[me->member];
+        const IRSroaSlot *slots = layouts[fm->layout].slots;
+        size_t slot_count = layouts[fm->layout].slot_count;
         for (size_t s = 0; s < slot_count && ok; s++) {
           IRInstruction decl = {0};
           decl.op = IR_OP_DECLARE_LOCAL;
           decl.location = insn->location;
-          char *nm = ir_sroa_scalar_name(members[m].name, slots[s].offset);
+          char *nm = ir_sroa_scalar_name(fm->name, slots[s].offset);
           decl.dest = nm ? ir_operand_symbol(nm) : ir_operand_none();
           decl.text = mettle_strdup(ir_builtin_scalar_type_for_slot(
               slots[s].size, slots[s].is_float, slots[s].float_bits));
@@ -418,18 +270,14 @@ static int ir_sroa_transform_group(IRFunction *function,
             ok = 0;
           }
         }
-        break;
+        continue;
       }
-    }
-    if (is_member_decl) {
-      continue;
     }
 
     /* Drop address-temp producers belonging to any member. */
     if ((insn->op == IR_OP_ADDRESS_OF || insn->op == IR_OP_BINARY) &&
         insn->dest.kind == IR_OPERAND_TEMP) {
-      long long off = 0;
-      if (ir_sroa_addr_owner(members, member_count, insn->dest.name, &off)) {
+      if (ir_sroa_hash_get(addr_hash, insn->dest.name)) {
         continue;
       }
     }
@@ -438,17 +286,17 @@ static int ir_sroa_transform_group(IRFunction *function,
     if (insn->op == IR_OP_ASSIGN && insn->dest.kind == IR_OPERAND_SYMBOL &&
         insn->dest.name && insn->lhs.kind == IR_OPERAND_SYMBOL &&
         insn->lhs.name) {
-      const char *dst_m = NULL;
-      const char *src_m = NULL;
-      for (size_t m = 0; m < member_count; m++) {
-        if (strcmp(members[m].name, insn->dest.name) == 0) {
-          dst_m = members[m].name;
-        }
-        if (strcmp(members[m].name, insn->lhs.name) == 0) {
-          src_m = members[m].name;
-        }
-      }
-      if (dst_m && src_m) {
+      const IRSroaHashEnt *de = ir_sroa_hash_get(member_hash, insn->dest.name);
+      const IRSroaHashEnt *se = ir_sroa_hash_get(member_hash, insn->lhs.name);
+      /* Copy partners always land in the same group (a whole-aggregate copy
+       * makes them partners, and a group only transforms when every partner
+       * analyzed clean), so both sides share one layout. */
+      if (de && se &&
+          members[de->member].layout == members[se->member].layout) {
+        const char *dst_m = members[de->member].name;
+        const char *src_m = members[se->member].name;
+        const IRSroaSlot *slots = layouts[members[de->member].layout].slots;
+        size_t slot_count = layouts[members[de->member].layout].slot_count;
         for (size_t s = 0; s < slot_count && ok; s++) {
           IRInstruction a = {0};
           a.op = IR_OP_ASSIGN;
@@ -479,12 +327,13 @@ static int ir_sroa_transform_group(IRFunction *function,
 
     /* LOAD via a member address temp -> ASSIGN dest <- scalar. */
     if (insn->op == IR_OP_LOAD && insn->lhs.kind == IR_OPERAND_TEMP) {
-      long long off = 0;
-      IRSroaMemberCtx *owner =
-          ir_sroa_addr_owner(members, member_count, insn->lhs.name, &off);
-      if (owner) {
+      const IRSroaHashEnt *ae = ir_sroa_hash_get(addr_hash, insn->lhs.name);
+      if (ae) {
+        long long off = ae->offset;
+        const IRSroaFlatMember *owner = &members[ae->member];
         const IRSroaSlot *slot =
-            ir_sroa_find_const_slot(slots, slot_count, off);
+            ir_sroa_find_const_slot(layouts[owner->layout].slots,
+                                    layouts[owner->layout].slot_count, off);
         if (!slot) {
           ok = 0;
           continue;
@@ -515,12 +364,13 @@ static int ir_sroa_transform_group(IRFunction *function,
 
     /* STORE via a member address temp -> ASSIGN scalar <- value. */
     if (insn->op == IR_OP_STORE && insn->dest.kind == IR_OPERAND_TEMP) {
-      long long off = 0;
-      IRSroaMemberCtx *owner =
-          ir_sroa_addr_owner(members, member_count, insn->dest.name, &off);
-      if (owner) {
+      const IRSroaHashEnt *ae = ir_sroa_hash_get(addr_hash, insn->dest.name);
+      if (ae) {
+        long long off = ae->offset;
+        const IRSroaFlatMember *owner = &members[ae->member];
         const IRSroaSlot *slot =
-            ir_sroa_find_const_slot(slots, slot_count, off);
+            ir_sroa_find_const_slot(layouts[owner->layout].slots,
+                                    layouts[owner->layout].slot_count, off);
         if (!slot) {
           ok = 0;
           continue;
@@ -547,14 +397,12 @@ static int ir_sroa_transform_group(IRFunction *function,
       }
     }
 
-    /* Everything else: copy verbatim. */
-    {
-      IRInstruction cloned = {0};
-      if (!ir_clone_instruction_plain(insn, &cloned) ||
-          !ir_instruction_vector_append_move(&vec, &cloned)) {
-        ir_instruction_destroy_storage(&cloned);
-        ok = 0;
-      }
+    /* Everything else: MOVE verbatim. append_move neutralizes the source, so
+     * the final cleanup sweep only destroys replaced instructions. (On the
+     * OOM failure path the function body is left gutted, but a pass failure
+     * aborts compilation before anything reads it again.) */
+    if (!ir_instruction_vector_append_move(&vec, insn)) {
+      ok = 0;
     }
   }
 
@@ -583,18 +431,59 @@ static int ir_sroa_is_scalar_type_name(const char *t) {
                strcmp(t, "bool") == 0);
 }
 
-/* Find an aggregate local's DECLARE_LOCAL index by name, or SIZE_MAX. */
-static size_t ir_sroa_find_decl(IRFunction *function, const char *name) {
-  for (size_t i = 0; i < function->instruction_count; i++) {
-    const IRInstruction *insn = &function->instructions[i];
-    if (insn->op == IR_OP_DECLARE_LOCAL &&
-        insn->dest.kind == IR_OPERAND_SYMBOL && insn->dest.name &&
-        insn->text && !ir_sroa_is_scalar_type_name(insn->text) &&
-        strcmp(insn->dest.name, name) == 0) {
-      return i;
+/* ---- whole-function analysis -------------------------------------------
+ *
+ * One record per aggregate DECLARE_LOCAL; a fixed number of whole-function
+ * sweeps analyzes every record simultaneously (the old per-symbol analyzer
+ * swept the function three times PER aggregate, which dominated the pass on
+ * heavily inlined functions). Eligibility semantics mirror the old analyzer:
+ * flags only ever get cleared, so marking a record ineligible mid-sweep and
+ * carrying on is equivalent to the old early-out. */
+typedef struct {
+  const char *name;
+  size_t decl_index;
+  int eligible;  /* clean field-access discipline so far */
+  int comp_fail; /* self-copy / partner without an aggregate decl: the whole
+                    connected component must be abandoned */
+  IRSroaSlot slots[IR_SROA_MAX_SLOTS];
+  size_t slot_count;
+  size_t partners[IR_SROA_MAX_GROUP]; /* record indices, copy-linked */
+  size_t partner_count;
+  size_t addr_count;
+  int visited; /* component walk state */
+} IRSroaRec;
+
+static void ir_sroa_rec_add_partner(IRSroaRec *rec, size_t other) {
+  for (size_t p = 0; p < rec->partner_count; p++) {
+    if (rec->partners[p] == other) {
+      return;
     }
   }
-  return SIZE_MAX;
+  if (rec->partner_count >= IR_SROA_MAX_GROUP) {
+    rec->eligible = 0;
+    return;
+  }
+  rec->partners[rec->partner_count++] = other;
+}
+
+/* Register an address temp for `owner`; a duplicate temp name across records
+ * cannot be attributed to a unique owner, so both records decline. */
+static void ir_sroa_rec_add_addr(IRSroaRec *recs, size_t owner,
+                                 IRSroaHash *addr_hash, const char *temp,
+                                 long long offset) {
+  IRSroaRec *rec = &recs[owner];
+  if (rec->addr_count >= IR_SROA_MAX_SLOTS * 2) {
+    rec->eligible = 0;
+    return;
+  }
+  const IRSroaHashEnt *dup = ir_sroa_hash_get(addr_hash, temp);
+  if (dup) {
+    recs[dup->member].eligible = 0;
+    rec->eligible = 0;
+    return;
+  }
+  ir_sroa_hash_put(addr_hash, temp, owner, offset);
+  rec->addr_count++;
 }
 
 int ir_sroa_pass(IRFunction *function, int *changed) {
@@ -602,123 +491,425 @@ int ir_sroa_pass(IRFunction *function, int *changed) {
     return 0;
   }
 
+  /* Each round analyzes every aggregate at once, then rewrites every
+   * transformable group in a single rebuild. A second round only finds work
+   * if the first round's rewrite exposed new opportunities. */
   for (int iter = 0; iter < 32; iter++) {
-    int did_any = 0;
+    /* ---- sweep 0: one record per aggregate DECLARE_LOCAL ---- */
+    IRSroaRec *recs = NULL;
+    size_t rec_count = 0, rec_cap = 0;
+    IRSroaHash rec_hash = {0};
+    IRSroaHash addr_hash = {0};
 
-    for (size_t i = 0; i < function->instruction_count && !did_any; i++) {
+    for (size_t i = 0; i < function->instruction_count; i++) {
       const IRInstruction *insn = &function->instructions[i];
       if (insn->op != IR_OP_DECLARE_LOCAL ||
           insn->dest.kind != IR_OPERAND_SYMBOL || !insn->dest.name ||
           !insn->text || ir_sroa_is_scalar_type_name(insn->text)) {
         continue;
       }
-
-      /* Analyze the seed aggregate. */
-      IRSroaSlot seed_slots[IR_SROA_MAX_SLOTS];
-      size_t seed_slot_count = 0;
-      const char *seed_partners[IR_SROA_MAX_GROUP];
-      size_t seed_partner_count = 0;
-      if (!ir_sroa_analyze_local(function, i, insn->dest.name, seed_slots,
-                                 &seed_slot_count, seed_partners,
-                                 &seed_partner_count, IR_SROA_MAX_GROUP)) {
+      if (rec_count >= rec_cap) {
+        size_t nc = rec_cap ? rec_cap * 2 : 16;
+        IRSroaRec *grown = (IRSroaRec *)realloc(recs, nc * sizeof(IRSroaRec));
+        if (!grown) {
+          free(recs);
+          return 0;
+        }
+        recs = grown;
+        rec_cap = nc;
+      }
+      IRSroaRec *rec = &recs[rec_count];
+      memset(rec, 0, sizeof(*rec));
+      rec->name = insn->dest.name;
+      rec->decl_index = i;
+      rec->eligible = 1;
+      rec_count++;
+    }
+    if (rec_count == 0) {
+      free(recs);
+      break;
+    }
+    if (!ir_sroa_hash_init(&rec_hash, rec_count) ||
+        !ir_sroa_hash_init(&addr_hash, rec_count * IR_SROA_MAX_SLOTS * 2)) {
+      free(rec_hash.ents);
+      free(addr_hash.ents);
+      free(recs);
+      return 0;
+    }
+    for (size_t r = 0; r < rec_count; r++) {
+      const IRSroaHashEnt *dup = ir_sroa_hash_get(&rec_hash, recs[r].name);
+      if (dup) {
+        /* Duplicate declaration of the same name: the old analyzer saw the
+         * other DECLARE_LOCAL as a bare-symbol reference and declined. */
+        recs[dup->member].eligible = 0;
+        recs[r].eligible = 0;
         continue;
       }
+      ir_sroa_hash_put(&rec_hash, recs[r].name, r, 0);
+    }
 
-      /* Build the connected group via whole-aggregate copies. Every member must
-       * analyze cleanly AND share the seed's exact slot layout; otherwise the
-       * whole group is abandoned (correctness over coverage). */
-      IRSroaMember group[IR_SROA_MAX_GROUP];
-      size_t group_count = 0;
-      group[group_count].name = insn->dest.name;
-      group[group_count].decl_index = i;
-      group_count++;
-
-      const char *worklist[IR_SROA_MAX_GROUP];
-      size_t worklist_count = 0;
-      for (size_t p = 0; p < seed_partner_count; p++) {
-        worklist[worklist_count++] = seed_partners[p];
-      }
-
-      int group_ok = 1;
-      while (worklist_count > 0 && group_ok) {
-        const char *cand = worklist[--worklist_count];
-        int already = 0;
-        for (size_t g = 0; g < group_count; g++) {
-          if (strcmp(group[g].name, cand) == 0) {
-            already = 1;
-            break;
-          }
-        }
-        if (already) {
+    /* ---- sweep 1: address-of bases, whole-aggregate copies, escapes ---- */
+    for (size_t i = 0; i < function->instruction_count; i++) {
+      const IRInstruction *insn = &function->instructions[i];
+      if (insn->op == IR_OP_ADDRESS_OF &&
+          insn->lhs.kind == IR_OPERAND_SYMBOL && insn->lhs.name &&
+          insn->dest.kind == IR_OPERAND_TEMP && insn->dest.name) {
+        const IRSroaHashEnt *m = ir_sroa_hash_get(&rec_hash, insn->lhs.name);
+        if (m) {
+          ir_sroa_rec_add_addr(recs, m->member, &addr_hash, insn->dest.name,
+                               0);
           continue;
         }
-        if (group_count >= IR_SROA_MAX_GROUP) {
-          group_ok = 0;
-          break;
+      }
+      if (insn->op == IR_OP_DECLARE_LOCAL &&
+          insn->dest.kind == IR_OPERAND_SYMBOL && insn->dest.name) {
+        const IRSroaHashEnt *m = ir_sroa_hash_get(&rec_hash, insn->dest.name);
+        if (m && recs[m->member].decl_index == i) {
+          continue; /* the record's own declaration */
         }
-        size_t cand_decl = ir_sroa_find_decl(function, cand);
-        if (cand_decl == SIZE_MAX) {
-          group_ok = 0; /* partner is a param/return temp, not a local: bail */
-          break;
-        }
-        IRSroaSlot cand_slots[IR_SROA_MAX_SLOTS];
-        size_t cand_slot_count = 0;
-        const char *cand_partners[IR_SROA_MAX_GROUP];
-        size_t cand_partner_count = 0;
-        if (!ir_sroa_analyze_local(function, cand_decl, cand, cand_slots,
-                                   &cand_slot_count, cand_partners,
-                                   &cand_partner_count, IR_SROA_MAX_GROUP) ||
-            !ir_sroa_slots_match(seed_slots, seed_slot_count, cand_slots,
-                                 cand_slot_count)) {
-          group_ok = 0;
-          break;
-        }
-        group[group_count].name = cand;
-        group[group_count].decl_index = cand_decl;
-        group_count++;
-        for (size_t p = 0; p < cand_partner_count; p++) {
-          if (worklist_count < IR_SROA_MAX_GROUP) {
-            worklist[worklist_count++] = cand_partners[p];
+      }
+      /* Whole-aggregate copy: ASSIGN where both sides are bare symbols and at
+       * least one is a record. */
+      if (insn->op == IR_OP_ASSIGN && insn->dest.kind == IR_OPERAND_SYMBOL &&
+          insn->dest.name && insn->lhs.kind == IR_OPERAND_SYMBOL &&
+          insn->lhs.name) {
+        const IRSroaHashEnt *de = ir_sroa_hash_get(&rec_hash, insn->dest.name);
+        const IRSroaHashEnt *se = ir_sroa_hash_get(&rec_hash, insn->lhs.name);
+        if (de || se) {
+          if (strcmp(insn->dest.name, insn->lhs.name) == 0) {
+            /* Self-copy is degenerate; decline to be safe. */
+            recs[(de ? de : se)->member].eligible = 0;
+            continue;
+          }
+          if (de && se) {
+            ir_sroa_rec_add_partner(&recs[de->member], se->member);
+            ir_sroa_rec_add_partner(&recs[se->member], de->member);
           } else {
-            group_ok = 0;
+            /* Partner is a param/return temp or scalar, not an aggregate
+             * local: the old group builder abandoned the whole group. */
+            recs[(de ? de : se)->member].comp_fail = 1;
+          }
+          continue;
+        }
+      }
+      /* Any other reference to a record's bare symbol escapes. */
+      if (insn->dest.kind == IR_OPERAND_SYMBOL && insn->dest.name) {
+        const IRSroaHashEnt *m = ir_sroa_hash_get(&rec_hash, insn->dest.name);
+        if (m) {
+          recs[m->member].eligible = 0;
+        }
+      }
+      if (insn->lhs.kind == IR_OPERAND_SYMBOL && insn->lhs.name) {
+        const IRSroaHashEnt *m = ir_sroa_hash_get(&rec_hash, insn->lhs.name);
+        if (m) {
+          recs[m->member].eligible = 0;
+        }
+      }
+      if (insn->rhs.kind == IR_OPERAND_SYMBOL && insn->rhs.name) {
+        const IRSroaHashEnt *m = ir_sroa_hash_get(&rec_hash, insn->rhs.name);
+        if (m) {
+          recs[m->member].eligible = 0;
+        }
+      }
+      for (size_t a = 0; a < insn->argument_count; a++) {
+        const IROperand *arg = &insn->arguments[a];
+        if (arg->kind == IR_OPERAND_SYMBOL && arg->name) {
+          const IRSroaHashEnt *m = ir_sroa_hash_get(&rec_hash, arg->name);
+          if (m) {
+            recs[m->member].eligible = 0;
           }
         }
-      }
-
-      if (!group_ok) {
-        continue;
-      }
-
-      /* Build per-member address records and transform the whole group. */
-      IRSroaMemberCtx *ctx =
-          (IRSroaMemberCtx *)calloc(group_count, sizeof(IRSroaMemberCtx));
-      if (!ctx) {
-        return 0;
-      }
-      for (size_t g = 0; g < group_count; g++) {
-        ctx[g].name = group[g].name;
-        ctx[g].decl_index = group[g].decl_index;
-        ctx[g].addr_count = ir_sroa_collect_addrs(
-            function, group[g].name, ctx[g].addrs,
-            sizeof(ctx[g].addrs) / sizeof(ctx[g].addrs[0]));
-      }
-
-      int rc = ir_sroa_transform_group(function, ctx, group_count, seed_slots,
-                                       seed_slot_count);
-      free(ctx);
-      if (!rc) {
-        return 0;
-      }
-      did_any = 1;
-      if (changed) {
-        *changed = 1;
       }
     }
 
-    if (!did_any) {
+    /* ---- sweep 2: `base + CONST` derived address temps ---- */
+    for (size_t i = 0; i < function->instruction_count; i++) {
+      const IRInstruction *insn = &function->instructions[i];
+      if (insn->op == IR_OP_BINARY && insn->text &&
+          strcmp(insn->text, "+") == 0 && !insn->is_float &&
+          insn->dest.kind == IR_OPERAND_TEMP && insn->dest.name &&
+          insn->lhs.kind == IR_OPERAND_TEMP && insn->lhs.name &&
+          insn->rhs.kind == IR_OPERAND_INT) {
+        const IRSroaHashEnt *base =
+            ir_sroa_hash_get(&addr_hash, insn->lhs.name);
+        if (base) {
+          ir_sroa_rec_add_addr(recs, base->member, &addr_hash,
+                               insn->dest.name,
+                               base->offset + insn->rhs.int_value);
+        }
+      }
+    }
+
+    /* ---- sweep 3: validate every address-temp use, collect field slots ----
+     * A use must be the producer, a LOAD address (lhs), a STORE address
+     * (dest), or a recorded derivation; anything else escapes. */
+    for (size_t i = 0; i < function->instruction_count; i++) {
+      const IRInstruction *insn = &function->instructions[i];
+      if ((insn->op == IR_OP_ADDRESS_OF || insn->op == IR_OP_BINARY) &&
+          insn->dest.kind == IR_OPERAND_TEMP &&
+          ir_sroa_hash_get(&addr_hash, insn->dest.name)) {
+        continue; /* producer */
+      }
+      if (insn->op == IR_OP_LOAD) {
+        const IRSroaHashEnt *ae = ir_sroa_hash_get(&addr_hash, insn->lhs.name);
+        if (ae) {
+          IRSroaRec *rec = &recs[ae->member];
+          if (ir_operand_is_temp_named(&insn->dest, insn->lhs.name) ||
+              ir_operand_is_temp_named(&insn->rhs, insn->lhs.name)) {
+            rec->eligible = 0;
+            continue;
+          }
+          /* Another record's address temp in a non-address slot is a value
+           * use of that address (e.g. a block copy): that record escapes. */
+          if (insn->dest.kind == IR_OPERAND_TEMP && insn->dest.name) {
+            const IRSroaHashEnt *o =
+                ir_sroa_hash_get(&addr_hash, insn->dest.name);
+            if (o) {
+              recs[o->member].eligible = 0;
+            }
+          }
+          if (insn->rhs.kind == IR_OPERAND_TEMP && insn->rhs.name) {
+            const IRSroaHashEnt *o =
+                ir_sroa_hash_get(&addr_hash, insn->rhs.name);
+            if (o) {
+              recs[o->member].eligible = 0;
+            }
+          }
+          int size = (insn->rhs.kind == IR_OPERAND_INT)
+                         ? (int)insn->rhs.int_value
+                         : 8;
+          if (!ir_sroa_note_slot(rec->slots, &rec->slot_count, ae->offset,
+                                 size, insn->is_float, insn->float_bits)) {
+            /* Mixed-width / mixed-class access of one offset: decline. */
+            rec->eligible = 0;
+          }
+          continue;
+        }
+      }
+      if (insn->op == IR_OP_STORE) {
+        const IRSroaHashEnt *ae =
+            ir_sroa_hash_get(&addr_hash, insn->dest.name);
+        if (ae) {
+          IRSroaRec *rec = &recs[ae->member];
+          if (ir_operand_is_temp_named(&insn->lhs, insn->dest.name)) {
+            rec->eligible = 0; /* address stored as a value -> escapes */
+            continue;
+          }
+          /* Storing another record's address temp as the VALUE (whole-struct
+           * block copy `*%t_addr <- %s_addr [n]`) is a value use of that
+           * address: that record escapes. */
+          if (insn->lhs.kind == IR_OPERAND_TEMP && insn->lhs.name) {
+            const IRSroaHashEnt *o =
+                ir_sroa_hash_get(&addr_hash, insn->lhs.name);
+            if (o) {
+              recs[o->member].eligible = 0;
+            }
+          }
+          if (insn->rhs.kind == IR_OPERAND_TEMP && insn->rhs.name) {
+            const IRSroaHashEnt *o =
+                ir_sroa_hash_get(&addr_hash, insn->rhs.name);
+            if (o) {
+              recs[o->member].eligible = 0;
+            }
+          }
+          int size = (insn->rhs.kind == IR_OPERAND_INT)
+                         ? (int)insn->rhs.int_value
+                         : 8;
+          if (!ir_sroa_note_slot(rec->slots, &rec->slot_count, ae->offset,
+                                 size, insn->is_float, insn->float_bits)) {
+            rec->eligible = 0;
+          }
+          continue;
+        }
+      }
+      /* Any other instruction must not touch an address temp at all. */
+      if (insn->dest.kind == IR_OPERAND_TEMP && insn->dest.name) {
+        const IRSroaHashEnt *ae =
+            ir_sroa_hash_get(&addr_hash, insn->dest.name);
+        if (ae) {
+          recs[ae->member].eligible = 0;
+        }
+      }
+      if (insn->lhs.kind == IR_OPERAND_TEMP && insn->lhs.name) {
+        const IRSroaHashEnt *ae = ir_sroa_hash_get(&addr_hash, insn->lhs.name);
+        if (ae) {
+          recs[ae->member].eligible = 0;
+        }
+      }
+      if (insn->rhs.kind == IR_OPERAND_TEMP && insn->rhs.name) {
+        const IRSroaHashEnt *ae = ir_sroa_hash_get(&addr_hash, insn->rhs.name);
+        if (ae) {
+          recs[ae->member].eligible = 0;
+        }
+      }
+      for (size_t a = 0; a < insn->argument_count; a++) {
+        const IROperand *arg = &insn->arguments[a];
+        if (arg->kind == IR_OPERAND_TEMP && arg->name) {
+          const IRSroaHashEnt *ae = ir_sroa_hash_get(&addr_hash, arg->name);
+          if (ae) {
+            recs[ae->member].eligible = 0;
+          }
+        }
+      }
+    }
+
+    for (size_t r = 0; r < rec_count; r++) {
+      if (recs[r].addr_count == 0 || recs[r].slot_count == 0) {
+        recs[r].eligible = 0;
+      }
+    }
+    static int sroa_debug = -1;
+    if (sroa_debug < 0) {
+      sroa_debug = getenv("METTLE_SROA_DEBUG") ? 1 : 0;
+    }
+    if (sroa_debug) {
+      for (size_t r = 0; r < rec_count; r++) {
+        fprintf(stderr,
+                "SROA rec %zu name=%s decl=%zu elig=%d comp_fail=%d "
+                "partners=%zu addrs=%zu slots=%zu\n",
+                r, recs[r].name, recs[r].decl_index, recs[r].eligible,
+                recs[r].comp_fail, recs[r].partner_count, recs[r].addr_count,
+                recs[r].slot_count);
+      }
+    }
+    free(addr_hash.ents);
+    addr_hash.ents = NULL;
+    addr_hash.bucket_count = 0;
+
+    /* ---- connected components over copy-partner edges. Every member must be
+     * eligible and share the root (lowest-decl) member's exact slot layout,
+     * or the whole component is abandoned (correctness over coverage). ---- */
+    IRSroaFlatMember *members = NULL;
+    IRSroaLayout *layouts = NULL;
+    size_t member_count = 0, member_cap = 0;
+    size_t layout_count = 0, layout_cap = 0;
+    size_t comp[IR_SROA_MAX_GROUP];
+    size_t stack[IR_SROA_MAX_GROUP];
+    int oom = 0;
+
+    for (size_t r = 0; r < rec_count && !oom; r++) {
+      if (recs[r].visited) {
+        continue;
+      }
+      size_t comp_count = 0, stack_count = 0;
+      int comp_ok = 1;
+      recs[r].visited = 1;
+      stack[stack_count++] = r;
+      while (stack_count > 0) {
+        size_t cur = stack[--stack_count];
+        if (comp_count >= IR_SROA_MAX_GROUP) {
+          comp_ok = 0;
+          break;
+        }
+        comp[comp_count++] = cur;
+        for (size_t p = 0; p < recs[cur].partner_count; p++) {
+          size_t nxt = recs[cur].partners[p];
+          if (!recs[nxt].visited) {
+            recs[nxt].visited = 1;
+            if (stack_count >= IR_SROA_MAX_GROUP) {
+              comp_ok = 0;
+              break;
+            }
+            stack[stack_count++] = nxt;
+          }
+        }
+        if (!comp_ok) {
+          break;
+        }
+      }
+      if (comp_ok) {
+        const IRSroaRec *seed = &recs[comp[0]];
+        for (size_t c = 0; c < comp_count && comp_ok; c++) {
+          const IRSroaRec *m = &recs[comp[c]];
+          if (!m->eligible || m->comp_fail ||
+              !ir_sroa_slots_match(seed->slots, seed->slot_count, m->slots,
+                                   m->slot_count)) {
+            comp_ok = 0;
+          }
+        }
+      }
+      if (!comp_ok) {
+        continue;
+      }
+
+      /* Record the component: one shared layout + flattened members. */
+      if (layout_count >= layout_cap) {
+        size_t nc = layout_cap ? layout_cap * 2 : 8;
+        IRSroaLayout *grown =
+            (IRSroaLayout *)realloc(layouts, nc * sizeof(IRSroaLayout));
+        if (!grown) {
+          oom = 1;
+          break;
+        }
+        layouts = grown;
+        layout_cap = nc;
+      }
+      memcpy(layouts[layout_count].slots, recs[comp[0]].slots,
+             sizeof(layouts[layout_count].slots));
+      layouts[layout_count].slot_count = recs[comp[0]].slot_count;
+
+      if (member_count + comp_count > member_cap) {
+        size_t nc = member_cap ? member_cap * 2 : 16;
+        while (nc < member_count + comp_count) {
+          nc *= 2;
+        }
+        IRSroaFlatMember *grown = (IRSroaFlatMember *)realloc(
+            members, nc * sizeof(IRSroaFlatMember));
+        if (!grown) {
+          oom = 1;
+          break;
+        }
+        members = grown;
+        member_cap = nc;
+      }
+      for (size_t c = 0; c < comp_count; c++) {
+        IRSroaFlatMember *fm = &members[member_count++];
+        fm->name = recs[comp[c]].name;
+        fm->decl_index = recs[comp[c]].decl_index;
+        fm->layout = layout_count;
+        fm->addr_count = 0;
+      }
+      layout_count++;
+    }
+
+    free(rec_hash.ents);
+    free(recs);
+    if (oom) {
+      free(members);
+      free(layouts);
+      return 0;
+    }
+    if (member_count == 0) {
+      free(members);
+      free(layouts);
       break;
+    }
+
+    /* ---- index members, rebuild address temps, transform in one pass ---- */
+    IRSroaHash member_hash = {0};
+    IRSroaHash xform_addr_hash = {0};
+    int rc = ir_sroa_hash_init(&member_hash, member_count) &&
+             ir_sroa_hash_init(&xform_addr_hash,
+                               member_count * IR_SROA_MAX_SLOTS * 2);
+    if (rc) {
+      for (size_t m = 0; m < member_count; m++) {
+        ir_sroa_hash_put(&member_hash, members[m].name, m, 0);
+      }
+      ir_sroa_collect_all_addrs(function, members, &member_hash,
+                                &xform_addr_hash);
+      rc = ir_sroa_transform_all(function, members, member_count, layouts,
+                                 &member_hash, &xform_addr_hash);
+    }
+    free(member_hash.ents);
+    free(xform_addr_hash.ents);
+    free(members);
+    free(layouts);
+    if (!rc) {
+      return 0;
+    }
+    if (changed) {
+      *changed = 1;
     }
   }
   return 1;
 }
-

@@ -101,7 +101,9 @@ void ir_operand_destroy(IROperand *operand) {
   case IR_OPERAND_SYMBOL:
   case IR_OPERAND_STRING:
   case IR_OPERAND_LABEL:
-    free(operand->name);
+    if (operand->name) {
+      free(operand->name);
+    }
     break;
   default:
     break;
@@ -1445,11 +1447,20 @@ int ir_program_eliminate_dead_functions(IRProgram *program) {
     }
   }
 
+  /* Freeing thousands of dead post-inline bodies instruction-by-instruction
+   * costs real time on large programs and the process reclaims it at exit;
+   * only pay for it when deep teardown is explicitly requested. */
+  static int full_cleanup = -1;
+  if (full_cleanup < 0) {
+    full_cleanup = getenv("METTLE_FULL_CLEANUP") ? 1 : 0;
+  }
   for (size_t i = 0; i < n; i++) {
     if (live[i]) {
       program->functions[kept++] = program->functions[i];
     } else if (program->functions[i]) {
-      ir_function_destroy(program->functions[i]);
+      if (full_cleanup) {
+        ir_function_destroy(program->functions[i]);
+      }
     }
   }
   program->function_count = kept;

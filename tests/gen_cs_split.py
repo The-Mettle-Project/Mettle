@@ -2,14 +2,14 @@ import sys
 lines = []
 n = 4000
 for i in range(n):
-    lines.append(f"function f{i}(x: int32) -> int32 {{")
+    lines.append(f"fn f{i}(x: int32) -> int32 {{")
     lines.append(f"    var t: int32 = x + {i};")
     lines.append(f"    t = t * 3;")
     lines.append(f"    t = t ^ {i % 7};")
     lines.append(f"    return t;")
     lines.append("}")
 for d in range(10):
-    lines.append(f"function driver{d}(s0: int32) -> int32 {{")
+    lines.append(f"fn driver{d}(s0: int32) -> int32 {{")
     lines.append("    var s: int32 = s0;")
     for i in range(d * 100, (d + 1) * 100):
         lines.append(f"    s = s + f{i * 4 % n}(s);")

@@ -80,6 +80,11 @@ typedef struct {
   LinkedSymbol *symbols;
   size_t symbol_count;
   size_t symbol_capacity;
+  /* Open-addressing name index over symbols (slot+1; 0 = empty). Lookups run
+   * per input symbol and per relocation; linear scans here were quadratic on
+   * programs with hundreds of thousands of globals. */
+  size_t *symbol_buckets;
+  size_t symbol_bucket_count;
   const LinkedSymbol *entry_symbol;
 } LinkResolution;
 

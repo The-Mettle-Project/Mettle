@@ -185,8 +185,14 @@ int ir_detect_shift_loops_pass(IRFunction *function, int *changed) {
   if (!function) {
     return 0;
   }
-  if (!getenv("METTLE_SHIFT_DEBUG")) {
-    return 1;
+  {
+    static int enabled = -1;
+    if (enabled < 0) {
+      enabled = getenv("METTLE_SHIFT_DEBUG") ? 1 : 0;
+    }
+    if (!enabled) {
+      return 1;
+    }
   }
   for (size_t i = 0; i < function->instruction_count; i++) {
     if (function->instructions[i].op != IR_OP_LABEL) {

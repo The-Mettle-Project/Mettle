@@ -1796,8 +1796,11 @@ try {
   }
   if (Test-Path $irPath) {
     $irText = Get-Content -Path $irPath -Raw
-    if ($irText -notmatch "mettle_heap_zeroed") {
-      throw "native-heap IR missing mettle_heap_zeroed (new not rerouted)"
+    # The reroute target call is usually inlined (and inline prefixes no
+    # longer embed the callee name), so assert on the allocator core that
+    # only enters the program when `new` was rerouted to the native heap.
+    if ($irText -notmatch "mem_alloc") {
+      throw "native-heap IR missing native allocator core (new not rerouted)"
     }
   }
 

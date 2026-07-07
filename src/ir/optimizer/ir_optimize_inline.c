@@ -761,14 +761,46 @@ static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
                            ir_opt_inline_caller_budget(function);
   char *in_loop = caller_over_budget ? ir_build_in_loop_bitmap(function) : NULL;
 
-  IRInstructionVector vector = {0};
-  int local_changed = 0;
-
+  /* Pre-scan: find the first call site that will actually inline. Callers with
+   * none (the common case once the program stabilizes) skip the rebuild -- the
+   * rebuild used to deep-clone every instruction of every function per driver
+   * round, which dominated the pass. The decision below must stay identical to
+   * the one in the rebuild loop. */
+  size_t first_inline = function->instruction_count;
   for (size_t i = 0; i < function->instruction_count; i++) {
     const IRInstruction *instruction = &function->instructions[i];
-    IRInstruction cloned = {0};
-
     if (instruction->op == IR_OP_CALL && instruction->text &&
+        instruction->argument_count <= IR_INLINE_MAX_PARAMETERS) {
+      IRFunction *callee = ir_program_find_function(program, instruction->text);
+      if (callee && callee != function &&
+          instruction->argument_count == callee->parameter_count &&
+          (!caller_over_budget || callee->is_inline ||
+           ir_function_is_tiny_leaf(callee) || ir_opt_function_is_hot(callee) ||
+           ir_opt_site_is_hot(function, instruction->location) ||
+           (in_loop && in_loop[i])) &&
+          ir_function_is_inline_candidate(callee, NULL, NULL)) {
+        first_inline = i;
+        break;
+      }
+    }
+  }
+  if (first_inline == function->instruction_count) {
+    free(in_loop);
+    return 1;
+  }
+
+  IRInstructionVector vector = {0};
+  int local_changed = 0;
+  if (!ir_instruction_vector_reserve(&vector, function->instruction_count)) {
+    free(in_loop);
+    return 0;
+  }
+
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    IRInstruction *instruction = &function->instructions[i];
+
+    if (i >= first_inline && instruction->op == IR_OP_CALL &&
+        instruction->text &&
         instruction->argument_count <= IR_INLINE_MAX_PARAMETERS) {
       IRFunction *callee = ir_program_find_function(program, instruction->text);
       if (callee && callee != function &&
@@ -787,6 +819,7 @@ static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
         if (!ir_inline_call_instruction(&vector, instruction, callee,
                                         (*inline_counter)++)) {
           ir_instruction_vector_destroy(&vector);
+          free(in_loop);
           return 0;
         }
         local_changed = 1;
@@ -794,9 +827,9 @@ static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
       }
     }
 
-    if (!ir_clone_instruction_plain(instruction, &cloned) ||
-        !ir_instruction_vector_append_move(&vector, &cloned)) {
-      ir_instruction_destroy_storage(&cloned);
+    /* Untouched instruction: MOVE it (append_move neutralizes the source, so
+     * the destroy sweep below only pays for replaced call instructions). */
+    if (!ir_instruction_vector_append_move(&vector, instruction)) {
       ir_instruction_vector_destroy(&vector);
       free(in_loop);
       return 0;
@@ -935,7 +968,13 @@ int ir_inline_self_recursion_pass(IRProgram *program, int *changed) {
     return 0;
   }
 
-  size_t inline_counter = 0;
+  /* Inline prefixes are "__inl_<id>" with no callee name, so every producer
+   * of ids needs its own disjoint range: the regular inliner counts up from
+   * 0, the forced-inline simulator from 900000, and self-recursion expansion
+   * from here. (A real program cannot push the other counters anywhere near
+   * this base: each site materializes instructions, so memory runs out many
+   * orders of magnitude earlier.) */
+  size_t inline_counter = 1800000000;
   for (size_t i = 0; i < program->function_count; i++) {
     IRFunction *function = program->functions[i];
     size_t self_calls = 0;

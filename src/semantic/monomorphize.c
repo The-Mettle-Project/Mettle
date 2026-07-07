@@ -2765,6 +2765,79 @@ static void adapt_cache_free(AdaptCache *c) {
 
 static int g_adapt_counter;
 
+/* Name index over the top_decls snapshot (decl slot+1; 0 = empty). Duplicate
+ * names keep every entry: linear probing places same-key entries along one
+ * probe path in insertion order, so a lookup that continues to the first
+ * empty bucket sees them in snapshot order — exactly what the old linear
+ * scans (first name match / first name+arity match) relied on. Consulted per
+ * call expression, so a linear scan is O(calls x functions). */
+typedef struct {
+  size_t *buckets;
+  size_t bucket_count;
+} AdaptFnIndex;
+
+static AdaptFnIndex g_adapt_fn_index;
+
+static void adapt_fn_index_build(ASTNode **top_decls, size_t top_count) {
+  size_t nb = 64;
+  while (nb < top_count * 2) {
+    nb *= 2;
+  }
+  g_adapt_fn_index.buckets = calloc(nb, sizeof(size_t));
+  g_adapt_fn_index.bucket_count = g_adapt_fn_index.buckets ? nb : 0;
+  if (!g_adapt_fn_index.bucket_count) {
+    return;
+  }
+  for (size_t i = 0; i < top_count; i++) {
+    FunctionDeclaration *fd = (FunctionDeclaration *)top_decls[i]->data;
+    if (!fd || !fd->name) {
+      continue;
+    }
+    size_t b = mettle_fnv1a_hash(fd->name) & (nb - 1);
+    while (g_adapt_fn_index.buckets[b]) {
+      b = (b + 1) & (nb - 1);
+    }
+    g_adapt_fn_index.buckets[b] = i + 1;
+  }
+}
+
+static void adapt_fn_index_free(void) {
+  free(g_adapt_fn_index.buckets);
+  g_adapt_fn_index.buckets = NULL;
+  g_adapt_fn_index.bucket_count = 0;
+}
+
+/* First snapshot entry whose name matches; want_arity < 0 matches any arity,
+ * otherwise the parameter count must equal want_arity. */
+static FunctionDeclaration *adapt_fn_index_find(ASTNode **top_decls,
+                                                size_t top_count,
+                                                const char *name,
+                                                long long want_arity) {
+  if (!g_adapt_fn_index.bucket_count) {
+    /* Index allocation failed: fall back to the linear scan. */
+    for (size_t i = 0; i < top_count; i++) {
+      FunctionDeclaration *fd = (FunctionDeclaration *)top_decls[i]->data;
+      if (fd && fd->name && strcmp(fd->name, name) == 0 &&
+          (want_arity < 0 || (long long)fd->parameter_count == want_arity)) {
+        return fd;
+      }
+    }
+    return NULL;
+  }
+  size_t nb = g_adapt_fn_index.bucket_count;
+  size_t b = mettle_fnv1a_hash(name) & (nb - 1);
+  while (g_adapt_fn_index.buckets[b]) {
+    FunctionDeclaration *fd =
+        (FunctionDeclaration *)top_decls[g_adapt_fn_index.buckets[b] - 1]->data;
+    if (fd && fd->name && strcmp(fd->name, name) == 0 &&
+        (want_arity < 0 || (long long)fd->parameter_count == want_arity)) {
+      return fd;
+    }
+    b = (b + 1) & (nb - 1);
+  }
+  return NULL;
+}
+
 /* Synthesizes struct __Adapt_K { __code: fn(__Adapt_K*, P...)->R; __real:
  * fn(P...)->R; }, fn __athunk_K(__env: __Adapt_K*, p0: P0, ...) -> R { return
  * __env.__real(p0, ...); }, and fn __amake_K(__real: fn(P...)->R) -> __Adapt_K*
@@ -2927,14 +3000,13 @@ static int adapt_thin_signature(ASTNode *expr, ASTNode **top_decls,
     Identifier *id = (Identifier *)un->operand->data;
     if (!id || !id->name)
       return 0;
-    for (size_t i = 0; i < top_count; i++) {
-      FunctionDeclaration *fd = (FunctionDeclaration *)top_decls[i]->data;
-      if (fd && fd->name && strcmp(fd->name, id->name) == 0) {
-        *out_param_types = fd->parameter_types;
-        *out_param_count = fd->parameter_count;
-        *out_return_type = fd->return_type;
-        return 1;
-      }
+    FunctionDeclaration *fd =
+        adapt_fn_index_find(top_decls, top_count, id->name, -1);
+    if (fd) {
+      *out_param_types = fd->parameter_types;
+      *out_param_count = fd->parameter_count;
+      *out_return_type = fd->return_type;
+      return 1;
     }
     return 0;
   }
@@ -3008,16 +3080,14 @@ static void adapt_walk(ASTNode *node, const char *current_return_type,
   } else if (node->type == AST_FUNCTION_CALL) {
     CallExpression *call = (CallExpression *)node->data;
     if (call && !call->object && call->function_name) {
-      for (size_t i = 0; i < top_count; i++) {
-        FunctionDeclaration *fd = (FunctionDeclaration *)top_decls[i]->data;
-        if (fd && fd->name && strcmp(fd->name, call->function_name) == 0 &&
-            fd->parameter_count == call->argument_count) {
-          for (size_t a = 0; a < call->argument_count; a++) {
-            adapt_wrap_if_needed(&call->arguments[a], node,
-                                 fd->parameter_types[a], top_decls, top_count,
-                                 cache, program, prog, had_error);
-          }
-          break;
+      FunctionDeclaration *fd =
+          adapt_fn_index_find(top_decls, top_count, call->function_name,
+                              (long long)call->argument_count);
+      if (fd) {
+        for (size_t a = 0; a < call->argument_count; a++) {
+          adapt_wrap_if_needed(&call->arguments[a], node,
+                               fd->parameter_types[a], top_decls, top_count,
+                               cache, program, prog, had_error);
         }
       }
     }
@@ -3067,6 +3137,7 @@ int closure_adapt_program(ASTNode *program, ErrorReporter *reporter) {
   }
 
   AdaptCache cache = {0};
+  adapt_fn_index_build(top_decls, top_count);
 
   for (size_t i = 0; i < prog->declaration_count; i++) {
     ASTNode *decl = prog->declarations[i];
@@ -3095,6 +3166,7 @@ int closure_adapt_program(ASTNode *program, ErrorReporter *reporter) {
     }
   }
 
+  adapt_fn_index_free();
   free(top_decls);
   adapt_cache_free(&cache);
   return had_error ? 0 : 1;

@@ -2799,7 +2799,9 @@ int main(int argc, char *argv[]) {
   free(auto_runtime_directory);
   free(build_output_filename);
   free(object_output_filename);
-  string_intern_clear();
+  if (getenv("METTLE_FULL_CLEANUP")) {
+    string_intern_clear();
+  }
   return result;
 }
 
@@ -3693,15 +3695,22 @@ cleanup:
   // Clean up resources
   compiler_set_phase(PROFILE_PHASE_CLEANUP);
   phase_start = compiler_profile_begin(&profile);
-  if (program)
-    ast_destroy_node(program);
-  if (ir_program)
-    ir_program_destroy(ir_program);
+  /* compile_file runs once per process and the caller exits right after
+   * linking, so the recursive AST/IR/type/symbol teardown (hundreds of ms on
+   * large inputs) buys nothing: leave those to process exit by default.
+   * METTLE_FULL_CLEANUP=1 restores the deep teardown for leak-hunting under
+   * sanitizers or heap tooling. */
+  if (getenv("METTLE_FULL_CLEANUP")) {
+    if (program)
+      ast_destroy_node(program);
+    if (ir_program)
+      ir_program_destroy(ir_program);
+    type_checker_destroy(type_checker);
+    symbol_table_destroy(symbol_table);
+  }
   free(ir_error_message);
   code_generator_destroy(code_generator);
   register_allocator_destroy(register_allocator);
-  type_checker_destroy(type_checker);
-  symbol_table_destroy(symbol_table);
   parser_destroy(parser);
   lexer_destroy(lexer);
   if (debug_info)

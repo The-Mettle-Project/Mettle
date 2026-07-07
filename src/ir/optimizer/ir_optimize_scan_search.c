@@ -1986,8 +1986,14 @@ int ir_simd_slp_mac_i32_pass(IRFunction *function, int *changed) {
   if (!function) {
     return 0;
   }
-  if (getenv("NO_SLP")) {
-    return 0;
+  {
+    static int no_slp = -1;
+    if (no_slp < 0) {
+      no_slp = getenv("NO_SLP") ? 1 : 0;
+    }
+    if (no_slp) {
+      return 0;
+    }
   }
   for (size_t i = 0; i < function->instruction_count; i++) {
     if (function->instructions[i].op == IR_OP_LABEL &&
@@ -2317,8 +2323,14 @@ int ir_simd_slp_mac_i8_pass(IRFunction *function, int *changed) {
   if (!function) {
     return 0;
   }
-  if (getenv("NO_SLP")) {
-    return 0;
+  {
+    static int no_slp = -1;
+    if (no_slp < 0) {
+      no_slp = getenv("NO_SLP") ? 1 : 0;
+    }
+    if (no_slp) {
+      return 0;
+    }
   }
   for (size_t i = 0; i < function->instruction_count; i++) {
     if (function->instructions[i].op == IR_OP_LABEL &&

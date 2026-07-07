@@ -38,8 +38,45 @@ int ir_operand_clone(const IROperand *source, IROperand *out) {
   return 1;
 }
 
+static int ir_name_map_reindex(IRNameMap *map, size_t min_buckets) {
+  size_t nb = 64;
+  while (nb < min_buckets) {
+    nb *= 2;
+  }
+  size_t *fresh = (size_t *)calloc(nb, sizeof(size_t));
+  if (!fresh) {
+    return 0;
+  }
+  for (size_t i = 0; i < map->count; i++) {
+    if (!map->items[i].from) {
+      continue;
+    }
+    size_t b = mettle_fnv1a_hash(map->items[i].from) & (nb - 1);
+    while (fresh[b]) {
+      b = (b + 1) & (nb - 1);
+    }
+    fresh[b] = i + 1;
+  }
+  free(map->buckets);
+  map->buckets = fresh;
+  map->bucket_count = nb;
+  return 1;
+}
+
 static int ir_name_map_find(const IRNameMap *map, const char *from) {
   if (!map || !from) {
+    return -1;
+  }
+
+  if (map->bucket_count) {
+    size_t b = mettle_fnv1a_hash(from) & (map->bucket_count - 1);
+    while (map->buckets[b]) {
+      size_t i = map->buckets[b] - 1;
+      if (map->items[i].from && strcmp(map->items[i].from, from) == 0) {
+        return (int)i;
+      }
+      b = (b + 1) & (map->bucket_count - 1);
+    }
     return -1;
   }
 
@@ -91,6 +128,17 @@ int ir_name_map_add(IRNameMap *map, const char *from, const char *to) {
   map->items[map->count].from = from_copy;
   map->items[map->count].to = to_copy;
   map->count++;
+  if ((map->count + 1) * 4 >= map->bucket_count * 3) {
+    if (!ir_name_map_reindex(map, (map->count + 1) * 2)) {
+      return 0;
+    }
+  } else {
+    size_t b = mettle_fnv1a_hash(from_copy) & (map->bucket_count - 1);
+    while (map->buckets[b]) {
+      b = (b + 1) & (map->bucket_count - 1);
+    }
+    map->buckets[b] = map->count;
+  }
   return 1;
 }
 
@@ -104,14 +152,22 @@ void ir_name_map_destroy(IRNameMap *map) {
     free(map->items[i].to);
   }
   free(map->items);
+  free(map->buckets);
   map->items = NULL;
+  map->buckets = NULL;
   map->count = 0;
   map->capacity = 0;
+  map->bucket_count = 0;
 }
 
 char *ir_make_inline_prefix(const char *callee_name, size_t inline_id) {
-  const char *name = callee_name ? callee_name : "func";
-  int length = snprintf(NULL, 0, "__inl_%s_%zu", name, inline_id);
+  /* The site id alone is unique (one shared counter per inlining run; the
+   * forced-inline simulator uses a disjoint high base). The callee name used
+   * to be embedded for readability, but nested inlining compounds prefixes
+   * into very long names whose hashing/compare/copy cost was measurable in
+   * every downstream pass -- keep them short. */
+  (void)callee_name;
+  int length = snprintf(NULL, 0, "__inl_%zu", inline_id);
   if (length < 0) {
     return NULL;
   }
@@ -122,7 +178,7 @@ char *ir_make_inline_prefix(const char *callee_name, size_t inline_id) {
     return NULL;
   }
 
-  snprintf(prefix, size, "__inl_%s_%zu", name, inline_id);
+  snprintf(prefix, size, "__inl_%zu", inline_id);
   return prefix;
 }
 
@@ -354,8 +410,10 @@ void ir_instruction_make_nop(IRInstruction *instruction) {
   ir_operand_destroy(&instruction->lhs);
   ir_operand_destroy(&instruction->rhs);
   ir_instruction_clear_arguments(instruction);
-  free(instruction->text);
-  instruction->text = NULL;
+  if (instruction->text) {
+    free(instruction->text);
+    instruction->text = NULL;
+  }
   instruction->is_float = 0;
   instruction->ast_ref = NULL;
   instruction->op = IR_OP_NOP;
@@ -384,11 +442,35 @@ void ir_instruction_destroy_storage(IRInstruction *instruction) {
   ir_operand_destroy(&instruction->lhs);
   ir_operand_destroy(&instruction->rhs);
   ir_instruction_clear_arguments(instruction);
-  free(instruction->text);
-  instruction->text = NULL;
+  if (instruction->text) {
+    free(instruction->text);
+    instruction->text = NULL;
+  }
   instruction->is_float = 0;
   instruction->ast_ref = NULL;
   instruction->op = IR_OP_NOP;
+}
+
+int ir_instruction_vector_reserve(IRInstructionVector *vector,
+                                  size_t capacity) {
+  if (!vector) {
+    return 0;
+  }
+  if (vector->capacity >= capacity) {
+    return 1;
+  }
+  size_t new_capacity = vector->capacity == 0 ? 64 : vector->capacity * 2;
+  while (new_capacity < capacity) {
+    new_capacity *= 2;
+  }
+  IRInstruction *new_items =
+      realloc(vector->items, new_capacity * sizeof(IRInstruction));
+  if (!new_items) {
+    return 0;
+  }
+  vector->items = new_items;
+  vector->capacity = new_capacity;
+  return 1;
 }
 
 int ir_instruction_vector_append_move(IRInstructionVector *vector,
@@ -474,8 +556,10 @@ int ir_rewrite_to_assign_operand(IRInstruction *instruction,
   ir_operand_destroy(&instruction->lhs);
   ir_operand_destroy(&instruction->rhs);
   ir_instruction_clear_arguments(instruction);
-  free(instruction->text);
-  instruction->text = NULL;
+  if (instruction->text) {
+    free(instruction->text);
+    instruction->text = NULL;
+  }
 
   instruction->op = IR_OP_ASSIGN;
   instruction->lhs = cloned;
