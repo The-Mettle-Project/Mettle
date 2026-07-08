@@ -1,10 +1,23 @@
 /* --ml-opt: apply the native model's dispositions (NOP / COPY <src> / CONST <int>
- * / REWRITE <postfix>) to the IR after the classical optimizer.  */
-#include "ir.h"
+ * / REWRITE <postfix>) to the IR after the classical optimizer, gating every
+ * applied disposition through the reference-interpreter differential
+ * (ir_verify_check_rewrite). The model proposes; the validator disposes. */
+#include "ml_opt.h"
+#include "ir_verify.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <io.h>
+#define MLO_ISATTY _isatty
+#define MLO_FILENO _fileno
+#else
+#include <unistd.h>
+#define MLO_ISATTY isatty
+#define MLO_FILENO fileno
+#endif
 
 int ir_rewrite_to_assign_int(IRInstruction *instruction, long long value,
                              int *changed);
@@ -140,43 +153,6 @@ static IRInstruction *find_instr(IRFunction *f, size_t gidx) {
   return NULL;
 }
 
-/* Apply one NOP/COPY/CONST disposition line in place. Returns 1 if it changed. */
-static int apply_disp_line(IRProgram *program, const char *line) {
-  char fname[256], kind[32], arg[256];
-  long long gi = 0;
-  int n = sscanf(line, "%255s %lld %31s %255s", fname, &gi, kind, arg);
-  if (n < 3) {
-    return 0;
-  }
-  IRFunction *fn = find_func(program, fname);
-  if (!fn) {
-    return 0;
-  }
-  IRInstruction *ins = find_instr(fn, (size_t)gi);
-  if (!ins) {
-    return 0;
-  }
-  if (strcmp(kind, "NOP") == 0) {
-    ins->op = IR_OP_NOP;
-    return 1;
-  }
-  if ((strcmp(kind, "COPY") == 0 || strcmp(kind, "CONST") == 0) &&
-      n >= 4 && ins->dest.kind == IR_OPERAND_TEMP && ins->dest.name &&
-      defs_once(fn, ins->dest.name)) {
-    char dest[256];
-    snprintf(dest, sizeof(dest), "%s", ins->dest.name);
-    if (strcmp(kind, "CONST") == 0) {
-      redirect_uses(fn, dest, 1, atoll(arg), NULL, 0);
-    } else {
-      int sym = (arg[0] == '@');
-      redirect_uses(fn, dest, 0, 0, arg + 1, sym);
-    }
-    ins->op = IR_OP_NOP;
-    return 1;
-  }
-  return 0;
-}
-
 int ml_gnn_run(const char *ir_dump_path, char **out_disp);
 
 static int g_rw_tmp = 0;
@@ -250,6 +226,329 @@ static const char *base_name(const char *p) {
   return b;
 }
 
+/* ---------------- the dispositions ---------------- */
+
+enum { MLK_NOP, MLK_COPY, MLK_CONST, MLK_REWRITE };
+enum { MLV_PENDING, MLV_VALIDATED, MLV_PROVEN, MLV_REJECTED, MLV_SKIPPED };
+
+typedef struct {
+  char fn[256];
+  long long gidx;
+  int kind;
+  char *arg;     /* COPY/CONST operand or REWRITE postfix (immutable here) */
+  int applied;   /* changed the IR and currently stands */
+  int verdict;   /* MLV_* */
+} MLDisp;
+
+static const char *mlv_name(int verdict) {
+  switch (verdict) {
+  case MLV_VALIDATED: return "validated";
+  case MLV_PROVEN:    return "proven";
+  case MLV_REJECTED:  return "rejected";
+  default:            return "skipped";
+  }
+}
+
+static const char *mlk_name(int kind) {
+  switch (kind) {
+  case MLK_NOP:     return "NOP";
+  case MLK_COPY:    return "COPY";
+  case MLK_CONST:   return "CONST";
+  default:          return "REWRITE";
+  }
+}
+
+/* NOP dispositions are the model's speculative dead-code deletes: they carry
+ * no construction-time proof and stand only when the validator can check the
+ * function. COPY/CONST/REWRITE come from sound transforms (GVN dataflow,
+ * collapse probing, truth-table/GF(2) superoptimization). */
+static int disp_speculative(const MLDisp *d) { return d->kind == MLK_NOP; }
+
+static MLDisp *parse_disps(char *text, int *out_n) {
+  int cap = 64, n = 0;
+  MLDisp *d = calloc((size_t)cap, sizeof(MLDisp));
+  if (!d) { *out_n = 0; return NULL; }
+  for (char *p = text; *p;) {
+    char *nl = strchr(p, '\n');
+    if (nl) *nl = 0;
+    char fname[256], kind[32];
+    long long gi = 0;
+    int consumed = 0;
+    if (*p &&
+        sscanf(p, "%255s %lld %31s %n", fname, &gi, kind, &consumed) >= 3) {
+      if (n == cap) {
+        MLDisp *grown = realloc(d, (size_t)cap * 2 * sizeof(MLDisp));
+        if (!grown) break;
+        memset(grown + cap, 0, (size_t)cap * sizeof(MLDisp));
+        d = grown; cap *= 2;
+      }
+      MLDisp *m = &d[n];
+      snprintf(m->fn, sizeof(m->fn), "%s", fname);
+      m->gidx = gi;
+      m->verdict = MLV_PENDING;
+      m->arg = strdup(p + consumed);
+      if (strcmp(kind, "NOP") == 0) m->kind = MLK_NOP;
+      else if (strcmp(kind, "COPY") == 0) m->kind = MLK_COPY;
+      else if (strcmp(kind, "CONST") == 0) m->kind = MLK_CONST;
+      else if (strcmp(kind, "REWRITE") == 0) m->kind = MLK_REWRITE;
+      else { free(m->arg); m->arg = NULL; }
+      if (m->arg) {
+        char *end = m->arg + strlen(m->arg);
+        while (end > m->arg && (end[-1] == '\r' || end[-1] == ' ')) *--end = 0;
+        n++;
+      }
+    }
+    if (!nl) break;
+    p = nl + 1;
+  }
+  *out_n = n;
+  return d;
+}
+
+/* METTLE_ML_SABOTAGE: corrupt the first COPY/CONST disposition into a wrong
+ * constant, proving end to end that the validator catches and discards a bad
+ * model proposal - the ml-opt twin of METTLE_VERIFY_BREAK. */
+static void maybe_sabotage(MLDisp *d, int n) {
+  const char *spec = getenv("METTLE_ML_SABOTAGE");
+  if (!spec || !spec[0] || strcmp(spec, "0") == 0) {
+    return;
+  }
+  for (int i = 0; i < n; i++) {
+    if (d[i].kind == MLK_COPY || d[i].kind == MLK_CONST) {
+      free(d[i].arg);
+      d[i].kind = MLK_CONST;
+      d[i].arg = strdup("271828");
+      fprintf(stderr,
+              "ml-opt: SABOTAGE armed: disposition for '%s' ir#%lld forced to "
+              "CONST 271828\n",
+              d[i].fn, d[i].gidx);
+      return;
+    }
+  }
+}
+
+/* Apply one disposition. Returns 1 when the IR changed (the disposition now
+ * stands until validation says otherwise), 0 when the applier declined. */
+static int apply_one(IRFunction *fn, const MLDisp *d) {
+  if (!fn->cfg_valid && !ir_function_rebuild_cfg(fn)) {
+    return 0;
+  }
+  if (d->kind == MLK_REWRITE) {
+    char *scratch = strdup(d->arg); /* apply_rewrite tokenizes destructively */
+    if (!scratch) return 0;
+    int changed = apply_rewrite(fn, (size_t)d->gidx, scratch);
+    free(scratch);
+    return changed;
+  }
+  IRInstruction *ins = find_instr(fn, (size_t)d->gidx);
+  if (!ins) {
+    return 0;
+  }
+  if (d->kind == MLK_NOP) {
+    /* Deleting control flow would leave the CFG lying about the stream;
+     * the model has no business proposing it and the applier refuses. */
+    if (ins->op == IR_OP_NOP || ins->op == IR_OP_LABEL ||
+        ins->op == IR_OP_JUMP || ins->op == IR_OP_BRANCH_ZERO ||
+        ins->op == IR_OP_BRANCH_EQ || ins->op == IR_OP_RETURN) {
+      return 0;
+    }
+    ins->op = IR_OP_NOP;
+    return 1;
+  }
+  if (ins->dest.kind != IR_OPERAND_TEMP || !ins->dest.name ||
+      !defs_once(fn, ins->dest.name)) {
+    return 0;
+  }
+  char dest[256];
+  snprintf(dest, sizeof(dest), "%s", ins->dest.name);
+  if (d->kind == MLK_CONST) {
+    redirect_uses(fn, dest, 1, atoll(d->arg), NULL, 0);
+  } else {
+    int sym = (d->arg[0] == '@');
+    redirect_uses(fn, dest, 0, 0, d->arg + 1, sym);
+  }
+  ins->op = IR_OP_NOP;
+  return 1;
+}
+
+static int mlo_color(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    const char *no_color = getenv("NO_COLOR");
+    cached = (!no_color || !no_color[0]) && MLO_ISATTY(MLO_FILENO(stderr));
+  }
+  return cached;
+}
+
+static void report_rejection(const MLDisp *d, const char *cex,
+                             const char *why) {
+  const char *red = mlo_color() ? "\x1b[31m\x1b[1m" : "";
+  const char *cyan = mlo_color() ? "\x1b[36m" : "";
+  const char *reset = mlo_color() ? "\x1b[0m" : "";
+  fprintf(stderr,
+          "\n%sml-opt: PROPOSAL REJECTED%s: model rewrite '%s ir#%lld' changed "
+          "the observable behavior of function '%s'\n",
+          red, reset, mlk_name(d->kind), d->gidx, d->fn);
+  fprintf(stderr, "  %scounterexample%s %s\n", cyan, reset, cex);
+  fprintf(stderr, "  %sdivergence%s: %s\n", cyan, reset, why);
+  fprintf(stderr,
+          "  %saction%s: proposal discarded; '%s' keeps its validated IR\n",
+          cyan, reset, d->fn);
+}
+
+/* Restore the pre-disposition IR and leave the function in an appliable
+ * state (blocks rebuilt: apply_one and redirect_uses walk fn->blocks). */
+static void restore_fn(IRFunction *fn, const IRVerifySnapshot *snap) {
+  if (ir_verify_snapshot_restore(fn, snap)) {
+    ir_function_rebuild_cfg(fn);
+  }
+}
+
+/* Validate the disposition group of one function. `idx`/`count` index into
+ * `d` in apply order (non-REWRITE first in model order, then REWRITEs by
+ * descending gidx so insertions never shift a pending target). */
+static void run_function_group(IRProgram *program, IRFunction *fn, MLDisp *d,
+                               const int *idx, int count, MLOptStats *stats) {
+  IRVerifySnapshot *snap = ir_verify_snapshot_capture(fn);
+  char why[192], cex[320], skip[160];
+
+  if (!snap) {
+    /* Function too large (or empty) to snapshot: no gate possible. Proven
+     * dispositions stand on their proofs; speculative ones never stand. */
+    for (int i = 0; i < count; i++) {
+      MLDisp *m = &d[idx[i]];
+      if (disp_speculative(m)) {
+        m->verdict = MLV_SKIPPED;
+        stats->skipped++;
+      } else if (apply_one(fn, m)) {
+        m->applied = 1;
+        m->verdict = MLV_PROVEN;
+        stats->proven++;
+      } else {
+        m->verdict = MLV_SKIPPED;
+        stats->skipped++;
+      }
+    }
+    return;
+  }
+
+  int applied_any = 0;
+  for (int i = 0; i < count; i++) {
+    MLDisp *m = &d[idx[i]];
+    m->applied = apply_one(fn, m);
+    if (!m->applied) {
+      m->verdict = MLV_SKIPPED;
+      stats->skipped++;
+    }
+    applied_any |= m->applied;
+  }
+  if (!applied_any) {
+    ir_verify_snapshot_free(snap);
+    return;
+  }
+
+  IRVerifyRewriteVerdict verdict = ir_verify_check_rewrite(
+      program, fn, snap, why, sizeof(why), cex, sizeof(cex), skip,
+      sizeof(skip));
+
+  if (verdict == IR_VERIFY_REWRITE_VALIDATED) {
+    for (int i = 0; i < count; i++) {
+      if (d[idx[i]].applied) {
+        d[idx[i]].verdict = MLV_VALIDATED;
+        stats->validated++;
+      }
+    }
+    ir_verify_snapshot_free(snap);
+    return;
+  }
+
+  if (verdict == IR_VERIFY_REWRITE_UNVERIFIABLE) {
+    /* The gate cannot run this function. Proven dispositions stand; any
+     * applied speculative one must come back out, which means restoring and
+     * re-applying only the proven ones. */
+    int has_spec = 0;
+    for (int i = 0; i < count; i++) {
+      if (d[idx[i]].applied && disp_speculative(&d[idx[i]])) has_spec = 1;
+    }
+    if (has_spec) {
+      restore_fn(fn, snap);
+      for (int i = 0; i < count; i++) {
+        MLDisp *m = &d[idx[i]];
+        if (!m->applied) continue;
+        if (disp_speculative(m)) {
+          m->applied = 0;
+          m->verdict = MLV_SKIPPED;
+          stats->skipped++;
+        } else {
+          m->applied = apply_one(fn, m);
+          m->verdict = m->applied ? MLV_PROVEN : MLV_SKIPPED;
+          if (m->applied) stats->proven++; else stats->skipped++;
+        }
+      }
+    } else {
+      for (int i = 0; i < count; i++) {
+        if (d[idx[i]].applied) {
+          d[idx[i]].verdict = MLV_PROVEN;
+          stats->proven++;
+        }
+      }
+    }
+    ir_verify_snapshot_free(snap);
+    return;
+  }
+
+  /* Divergence. Roll everything back and bisect: re-apply one disposition at
+   * a time, each against a fresh snapshot, so exactly the offending
+   * proposal(s) are named and discarded while the innocent ones stand. */
+  restore_fn(fn, snap);
+  ir_verify_snapshot_free(snap);
+  for (int i = 0; i < count; i++) {
+    MLDisp *m = &d[idx[i]];
+    if (!m->applied) continue; /* already counted as skipped */
+    m->applied = 0;
+    IRVerifySnapshot *one = ir_verify_snapshot_capture(fn);
+    if (!one) {
+      m->verdict = MLV_SKIPPED;
+      stats->skipped++;
+      continue;
+    }
+    if (!apply_one(fn, m)) {
+      m->verdict = MLV_SKIPPED;
+      stats->skipped++;
+      ir_verify_snapshot_free(one);
+      continue;
+    }
+    switch (ir_verify_check_rewrite(program, fn, one, why, sizeof(why), cex,
+                                    sizeof(cex), skip, sizeof(skip))) {
+    case IR_VERIFY_REWRITE_VALIDATED:
+      m->applied = 1;
+      m->verdict = MLV_VALIDATED;
+      stats->validated++;
+      break;
+    case IR_VERIFY_REWRITE_DIVERGED:
+      report_rejection(m, cex, why);
+      restore_fn(fn, one);
+      m->verdict = MLV_REJECTED;
+      stats->rejected++;
+      break;
+    default: /* function became unverifiable mid-bisect */
+      if (disp_speculative(m)) {
+        restore_fn(fn, one);
+        m->verdict = MLV_SKIPPED;
+        stats->skipped++;
+      } else {
+        m->applied = 1;
+        m->verdict = MLV_PROVEN;
+        stats->proven++;
+      }
+      break;
+    }
+    ir_verify_snapshot_free(one);
+  }
+}
+
+/* ---------------- explain-record annotation ---------------- */
+
 /* Append source file:line to each explain record, resolved from the pristine
  * program (must run before any disposition shifts indices). */
 static void annotate_explain(IRProgram *program) {
@@ -303,7 +602,65 @@ static void annotate_explain(IRProgram *program) {
   free(buf);
 }
 
-int ir_apply_ml_opt(IRProgram *program) {
+/* After validation, append each record's verdict (matched by fn+gidx) so the
+ * --explain report can say which rewrites stood and which were rejected. */
+static void append_verdicts(const MLDisp *d, int n) {
+  FILE *in = fopen("_mlopt.explain", "rb");
+  if (!in) {
+    return;
+  }
+  fseek(in, 0, SEEK_END);
+  long sz = ftell(in);
+  fseek(in, 0, SEEK_SET);
+  char *buf = sz > 0 ? malloc((size_t)sz + 1) : NULL;
+  size_t got = buf ? fread(buf, 1, (size_t)sz, in) : 0;
+  fclose(in);
+  if (!buf) {
+    return;
+  }
+  buf[got] = 0;
+  FILE *out = fopen("_mlopt.explain", "wb");
+  if (!out) {
+    free(buf);
+    return;
+  }
+  for (char *p = buf; *p;) {
+    char *nl = strchr(p, '\n');
+    size_t len = nl ? (size_t)(nl - p) : strlen(p);
+    if (len) {
+      char rec[1500];
+      if (len >= sizeof(rec)) len = sizeof(rec) - 1;
+      memcpy(rec, p, len);
+      rec[len] = 0;
+      char cpy[1500];
+      snprintf(cpy, sizeof(cpy), "%s", rec);
+      char *fn = strtok(cpy, "\t");
+      char *gi = fn ? strtok(NULL, "\t") : NULL;
+      const char *verdict = "skipped";
+      if (fn && gi) {
+        long long g = atoll(gi);
+        for (int i = 0; i < n; i++) {
+          if (d[i].gidx == g && strcmp(d[i].fn, fn) == 0) {
+            verdict = mlv_name(d[i].verdict);
+            break;
+          }
+        }
+      }
+      fprintf(out, "%s\t%s\n", rec, verdict);
+    }
+    if (!nl) break;
+    p = nl + 1;
+  }
+  fclose(out);
+  free(buf);
+}
+
+/* ---------------- entry ---------------- */
+
+int ir_apply_ml_opt(IRProgram *program, MLOptStats *stats) {
+  MLOptStats local;
+  if (!stats) stats = &local;
+  memset(stats, 0, sizeof(*stats));
   if (!program) {
     return 0;
   }
@@ -342,42 +699,64 @@ int ir_apply_ml_opt(IRProgram *program) {
     fclose(dd);
   }
   annotate_explain(program);
-  char *rw_fn[2048]; long long rw_gi[2048]; char *rw_body[2048]; int rw_n = 0;
-  int applied = 0;
-  char *p = disp;
-  while (*p) {
-    char *nl = strchr(p, '\n');
-    if (nl) {
-      *nl = 0;
-    }
-    if (*p) {
-      char fname[256], kind[32]; long long gi = 0;
-      if (sscanf(p, "%255s %lld %31s", fname, &gi, kind) == 3 &&
-          strcmp(kind, "REWRITE") == 0 && rw_n < 2048) {
-        const char *body = strstr(p, "REWRITE ");
-        if (body) { rw_fn[rw_n] = strdup(fname); rw_gi[rw_n] = gi;
-          rw_body[rw_n] = strdup(body + 8); rw_n++; }
-      } else {
-        applied += apply_disp_line(program, p);
-      }
-    }
-    if (!nl) {
-      break;
-    }
-    p = nl + 1;
-  }
-  for (int i = 0; i < rw_n; i++)
-    for (int j = i + 1; j < rw_n; j++)
-      if (rw_gi[j] > rw_gi[i]) {
-        long long tg = rw_gi[i]; rw_gi[i] = rw_gi[j]; rw_gi[j] = tg;
-        char *tf = rw_fn[i]; rw_fn[i] = rw_fn[j]; rw_fn[j] = tf;
-        char *tb = rw_body[i]; rw_body[i] = rw_body[j]; rw_body[j] = tb;
-      }
-  for (int i = 0; i < rw_n; i++) {
-    IRFunction *fn = find_func(program, rw_fn[i]);
-    if (fn) applied += apply_rewrite(fn, (size_t)rw_gi[i], rw_body[i]);
-    free(rw_fn[i]); free(rw_body[i]);
-  }
+
+  int n = 0;
+  MLDisp *d = parse_disps(disp, &n);
   free(disp);
-  return applied;
+  if (!d) {
+    return 0;
+  }
+  maybe_sabotage(d, n);
+  stats->proposals = n;
+
+  /* Group by function, preserving first-seen order. Apply order inside a
+   * group: non-REWRITEs in model order (in-place, index-stable), then
+   * REWRITEs by descending gidx (insertions never shift a pending target). */
+  int *idx = malloc(n ? (size_t)n * sizeof(int) : sizeof(int));
+  char *done = calloc(n ? (size_t)n : 1, 1);
+  if (idx && done) {
+    for (int i = 0; i < n; i++) {
+      if (done[i]) continue;
+      int count = 0;
+      for (int j = i; j < n; j++) {
+        if (!done[j] && strcmp(d[j].fn, d[i].fn) == 0 &&
+            d[j].kind != MLK_REWRITE) {
+          idx[count++] = j;
+          done[j] = 1;
+        }
+      }
+      int rw_start = count;
+      for (int j = i; j < n; j++) {
+        if (!done[j] && strcmp(d[j].fn, d[i].fn) == 0) {
+          idx[count++] = j;
+          done[j] = 1;
+        }
+      }
+      for (int a = rw_start; a < count; a++) {
+        for (int b = a + 1; b < count; b++) {
+          if (d[idx[b]].gidx > d[idx[a]].gidx) {
+            int t = idx[a]; idx[a] = idx[b]; idx[b] = t;
+          }
+        }
+      }
+      IRFunction *fn = find_func(program, d[i].fn);
+      if (!fn) {
+        for (int a = 0; a < count; a++) {
+          d[idx[a]].verdict = MLV_SKIPPED;
+          stats->skipped++;
+        }
+        continue;
+      }
+      run_function_group(program, fn, d, idx, count, stats);
+    }
+  }
+  free(idx);
+  free(done);
+
+  append_verdicts(d, n);
+  for (int i = 0; i < n; i++) {
+    free(d[i].arg);
+  }
+  free(d);
+  return stats->validated + stats->proven;
 }

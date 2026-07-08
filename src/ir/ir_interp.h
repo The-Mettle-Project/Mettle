@@ -43,10 +43,20 @@ typedef struct {
   int is_float;
 } IRInterpValue;
 
+/* Bytes captured per pointer argument at extern-call time. */
+#define IR_INTERP_EXTERN_MEM_CAP 96
+
 typedef struct {
   char name[64];
   IRInterpValue args[8];
   size_t arg_count;
+  /* What each pointer argument addressed AT CALL TIME (capped): the memory an
+   * extern could observe through the pointer. Length 0 = not a pointer into
+   * interpreter memory. Without this, a pass that corrupts a locally-built
+   * buffer handed to an extern is invisible - the pointer VALUE is identical
+   * in both machines, and only final buffer bytes are otherwise compared. */
+  unsigned char arg_mem[8][IR_INTERP_EXTERN_MEM_CAP];
+  unsigned short arg_mem_len[8];
 } IRInterpExternCall;
 
 typedef struct IRInterpMachine IRInterpMachine;

@@ -146,7 +146,9 @@ typedef enum {
    * arguments[0]=len. */
   IR_OP_SIMD_REVERSE_COPY_I32,
   /* Lower-bound index search over sorted int32 array:
-   * dest=lo index result, lhs=arr, rhs=n, arguments[0]=key(int32). */
+   * dest=lo index result, lhs=arr, rhs=n, arguments[0]=key(int32).
+   * dest is IN/OUT: codegen seeds the running lo from dest's prior value,
+   * so the recognizer must prove the source loop initializes it to 0. */
   IR_OP_LOWER_BOUND_I32,
   /* Inclusive int32 prefix sum: dst[i]=sum(src[0..i]) in int32, dest holds
    * int64 running sum. lhs=src, rhs=dst, arguments[0]=len. */

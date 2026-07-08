@@ -479,6 +479,20 @@ static IRInterpValue ii_float_value(double v) {
   return value;
 }
 
+/* Uninitialized locals/temps read this instead of 0. Native code gives them
+ * stack or register garbage, so a zero-defaulting interpreter would blind the
+ * differential to a deleted initializing store (`@neg <- 0` in print_int was
+ * exactly that). Deterministic, identical in both machines - only a transform
+ * that changes WHETHER a read sees its initialization can diverge on it. */
+#define II_POISON_BYTE 0xA5
+static IRInterpValue ii_poison_value(void) {
+  IRInterpValue value;
+  value.i = (long long)0xA5A5A5A5A5A5A5A5ULL;
+  value.f = 0;
+  value.is_float = 0;
+  return value;
+}
+
 /* Equality for assert_eq: exact for ints; floats compare as doubles (a test
  * author asserting float equality means bit-for-bit intent). */
 static int ii_value_matches(const IRInterpValue *a, const IRInterpValue *b) {
@@ -562,8 +576,16 @@ static IIVar *ii_resolve(IRInterpMachine *machine, IIFrame *frame,
     return var;
   }
   if (operand->kind == IR_OPERAND_TEMP) {
-    /* Temps are function-local by construction. */
-    return ii_env_upsert(&frame->env, operand->name);
+    /* Temps are function-local by construction. A brand-new temp slot means a
+     * read before any def (possible only after a transform deleted the def):
+     * it reads POISON, not 0, because native code would see a stale register.
+     * A deterministic-but-nonzero value keeps the differential faithful and
+     * both machines identical. Globals stay zero (.bss is zeroed for real). */
+    IIVar *fresh = ii_env_upsert(&frame->env, operand->name);
+    if (fresh) {
+      fresh->value = ii_poison_value();
+    }
+    return fresh;
   }
   return ii_env_upsert(&machine->globals, operand->name);
 }
@@ -814,6 +836,27 @@ static void ii_trace_extern(IRInterpMachine *machine, const char *name,
   call->arg_count = arg_count > 8 ? 8 : arg_count;
   for (size_t i = 0; i < call->arg_count; i++) {
     call->args[i] = args[i];
+    call->arg_mem_len[i] = 0;
+    if (args[i].is_float) {
+      continue;
+    }
+    /* Pointer argument: capture the bytes it addresses right now, up to the
+     * cap or the end of its buffer. The extern observes memory at the moment
+     * of the call, so the trace must too. */
+    long long offset = 0;
+    IIBuffer *buf = ii_addr_to_buffer(machine, (unsigned long long)args[i].i,
+                                      0, &offset);
+    if (!buf) {
+      continue;
+    }
+    long long avail = buf->size - offset;
+    if (avail <= 0) {
+      continue;
+    }
+    long long take =
+        avail < IR_INTERP_EXTERN_MEM_CAP ? avail : IR_INTERP_EXTERN_MEM_CAP;
+    memcpy(call->arg_mem[i], buf->data + offset, (size_t)take);
+    call->arg_mem_len[i] = (unsigned short)take;
   }
 }
 
@@ -1355,14 +1398,18 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
 
   case IR_OP_LOWER_BOUND_I32: {
     unsigned long long base;
-    long long n, key;
+    long long n, key, lo0;
     if (insn->argument_count < 1 ||
         !ii_fetch_addr(machine, frame, &insn->lhs, &base) ||
         !ii_fetch_int(machine, frame, &insn->rhs, &n) ||
-        !ii_fetch_int(machine, frame, &insn->arguments[0], &key)) {
+        !ii_fetch_int(machine, frame, &insn->arguments[0], &key) ||
+        !ii_fetch_int(machine, frame, &insn->dest, &lo0)) {
       return 0;
     }
-    long long lo = 0, hi = n;
+    /* dest is in/out: codegen seeds the running lo from dest's prior value
+     * (the recognizer guarantees the source loop starts it at 0). Reading 0
+     * here regardless would hide a transform that deletes the init. */
+    long long lo = lo0, hi = n;
     while (lo < hi) {
       long long mid = lo + (hi - lo) / 2;
       int v;
@@ -2071,14 +2118,23 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
           ii_fail(machine, IR_INTERP_TRAP, "local storage allocation");
           goto done;
         }
+        /* Local storage is stack memory: poison it (heap `new` stays zeroed,
+         * matching HEAP_ZERO_MEMORY in codegen). */
+        memset(machine->buffers[machine->buffer_count - 1].data,
+               II_POISON_BYTE, (size_t)(count * elem_size));
         var->value = ii_int_value((long long)addr);
         var->slotted = count == 1; /* arrays are accessed via &, not by name */
         var->slot_size = elem_size;
         var->slot_is_float = is_float;
         var->slot_is_unsigned = is_unsigned;
       } else {
-        var->value = is_float ? ii_float_value(0.0) : ii_int_value(0);
+        var->value = ii_poison_value();
         var->slotted = 0;
+        if (is_float) {
+          var->value.is_float = 1;
+          var->value.f = -6510615.5; /* deterministic float poison */
+          var->value.i = 0;
+        }
       }
       pc++;
       break;

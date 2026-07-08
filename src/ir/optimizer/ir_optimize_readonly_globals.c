@@ -7,73 +7,82 @@
  * and never has its address taken anywhere in the program, then rewrites
  * every read operand to the constant. Turns `idx * NODE_BYTES` into a
  * strength-reducible constant multiply and removes the per-call global-cache
- * reload the MIR backend would otherwise emit. */
+ * reload the MIR backend would otherwise emit.
+ *
+ * All candidates are checked and folded together in a fixed number of
+ * whole-program sweeps: the per-candidate program scan was
+ * O(candidates x instructions) and dominated the phase on real applications
+ * with hundreds of constant globals. */
 
-static int ir_rg_operand_reads(const IROperand *operand, const char *name) {
-  return operand->kind == IR_OPERAND_SYMBOL && operand->name &&
-         strcmp(operand->name, name) == 0;
+typedef struct {
+  const char *name;
+  long long value;
+  int disqualified;
+  size_t shadow_gen; /* == current function generation when shadowed there */
+} IRRgCandidate;
+
+typedef struct {
+  IRRgCandidate *items;
+  size_t count;
+  size_t *buckets; /* slot+1; 0 = empty */
+  size_t bucket_count;
+} IRRgTable;
+
+static IRRgCandidate *ir_rg_table_find(IRRgTable *table, const char *name) {
+  if (!name) {
+    return NULL;
+  }
+  size_t b = mettle_fnv1a_hash(name) & (table->bucket_count - 1);
+  while (table->buckets[b]) {
+    IRRgCandidate *cand = &table->items[table->buckets[b] - 1];
+    if (strcmp(cand->name, name) == 0) {
+      return cand;
+    }
+    b = (b + 1) & (table->bucket_count - 1);
+  }
+  return NULL;
 }
 
-static int ir_rg_global_is_written(const IRProgram *program,
-                                   const char *name) {
-  for (size_t f = 0; f < program->function_count; f++) {
-    const IRFunction *fn = program->functions[f];
-    if (!fn) {
-      continue;
-    }
-    /* A local or parameter of the same name shadows the global throughout
-     * this function; skip it entirely so its writes don't disqualify (its
-     * reads are also not rewritten - see the same check in the fold). */
-    if (ir_function_local_declared_type((IRFunction *)fn, name) ||
-        ir_function_symbol_is_parameter(fn, name)) {
-      continue;
-    }
-    for (size_t i = 0; i < fn->instruction_count; i++) {
-      const IRInstruction *ins = &fn->instructions[i];
-      if (ins->op == IR_OP_ADDRESS_OF && ir_rg_operand_reads(&ins->lhs, name)) {
-        return 1;
-      }
-      if (ir_instruction_writes_destination(ins) &&
-          ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name &&
-          strcmp(ins->dest.name, name) == 0) {
-        return 1;
+/* Mark every candidate shadowed in `fn` (declared as a local or bound as a
+ * parameter there) with the function's generation `gen`. A shadowing name
+ * hides the global throughout the function: its writes don't disqualify and
+ * its reads are never folded. */
+static void ir_rg_mark_shadows(IRRgTable *table, const IRFunction *fn,
+                               size_t gen) {
+  for (size_t p = 0; p < fn->parameter_count; p++) {
+    if (fn->parameter_names && fn->parameter_names[p]) {
+      IRRgCandidate *cand = ir_rg_table_find(table, fn->parameter_names[p]);
+      if (cand) {
+        cand->shadow_gen = gen;
       }
     }
   }
-  return 0;
+  for (size_t i = 0; i < fn->instruction_count; i++) {
+    const IRInstruction *ins = &fn->instructions[i];
+    if (ins->op == IR_OP_DECLARE_LOCAL &&
+        ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name && ins->text) {
+      IRRgCandidate *cand = ir_rg_table_find(table, ins->dest.name);
+      if (cand) {
+        cand->shadow_gen = gen;
+      }
+    }
+  }
 }
 
-static void ir_rg_fold_reads(IRProgram *program, const char *name,
-                             long long value) {
-  for (size_t f = 0; f < program->function_count; f++) {
-    IRFunction *fn = program->functions[f];
-    if (!fn) {
-      continue;
-    }
-    if (ir_function_local_declared_type(fn, name) ||
-        ir_function_symbol_is_parameter(fn, name)) {
-      continue;
-    }
-    for (size_t i = 0; i < fn->instruction_count; i++) {
-      IRInstruction *ins = &fn->instructions[i];
-      if (ins->op == IR_OP_ADDRESS_OF) {
-        continue;
-      }
-      if (ir_rg_operand_reads(&ins->lhs, name)) {
-        ir_operand_destroy(&ins->lhs);
-        ins->lhs = ir_operand_int(value);
-      }
-      if (ir_rg_operand_reads(&ins->rhs, name)) {
-        ir_operand_destroy(&ins->rhs);
-        ins->rhs = ir_operand_int(value);
-      }
-      for (size_t a = 0; a < ins->argument_count; a++) {
-        if (ir_rg_operand_reads(&ins->arguments[a], name)) {
-          ir_operand_destroy(&ins->arguments[a]);
-          ins->arguments[a] = ir_operand_int(value);
-        }
-      }
-    }
+static void ir_rg_fold_operand(IRRgTable *table, IROperand *operand,
+                               size_t gen, int *changed) {
+  if (operand->kind != IR_OPERAND_SYMBOL || !operand->name) {
+    return;
+  }
+  IRRgCandidate *cand = ir_rg_table_find(table, operand->name);
+  if (!cand || cand->disqualified || cand->shadow_gen == gen) {
+    return;
+  }
+  long long value = cand->value;
+  ir_operand_destroy(operand);
+  *operand = ir_operand_int(value);
+  if (changed) {
+    *changed = 1;
   }
 }
 
@@ -83,14 +92,86 @@ int ir_fold_readonly_globals_pass(IRProgram *program,
   if (!program || !consts || count == 0) {
     return 1;
   }
+
+  IRRgTable table = {0};
+  table.items = calloc(count, sizeof(IRRgCandidate));
+  size_t nb = 64;
+  while (nb < count * 2) {
+    nb *= 2;
+  }
+  table.buckets = calloc(nb, sizeof(size_t));
+  if (!table.items || !table.buckets) {
+    free(table.items);
+    free(table.buckets);
+    return 0;
+  }
+  table.bucket_count = nb;
   for (size_t c = 0; c < count; c++) {
-    if (!consts[c].name || ir_rg_global_is_written(program, consts[c].name)) {
+    if (!consts[c].name || ir_rg_table_find(&table, consts[c].name)) {
       continue;
     }
-    ir_rg_fold_reads(program, consts[c].name, consts[c].value);
-    if (changed) {
-      *changed = 1;
+    IRRgCandidate *cand = &table.items[table.count];
+    cand->name = consts[c].name;
+    cand->value = consts[c].value;
+    cand->shadow_gen = 0; /* generations start at 1 */
+    size_t b = mettle_fnv1a_hash(cand->name) & (nb - 1);
+    while (table.buckets[b]) {
+      b = (b + 1) & (nb - 1);
+    }
+    table.buckets[b] = ++table.count; /* slot index + 1 */
+  }
+
+  /* Disqualify: any address-of or write of a candidate (outside functions
+   * that shadow it) anywhere in the program. */
+  size_t gen = 0;
+  for (size_t f = 0; f < program->function_count; f++) {
+    const IRFunction *fn = program->functions[f];
+    if (!fn) {
+      continue;
+    }
+    gen++;
+    ir_rg_mark_shadows(&table, fn, gen);
+    for (size_t i = 0; i < fn->instruction_count; i++) {
+      const IRInstruction *ins = &fn->instructions[i];
+      if (ins->op == IR_OP_ADDRESS_OF && ins->lhs.kind == IR_OPERAND_SYMBOL &&
+          ins->lhs.name) {
+        IRRgCandidate *cand = ir_rg_table_find(&table, ins->lhs.name);
+        if (cand && cand->shadow_gen != gen) {
+          cand->disqualified = 1;
+        }
+      }
+      if (ir_instruction_writes_destination(ins) &&
+          ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name) {
+        IRRgCandidate *cand = ir_rg_table_find(&table, ins->dest.name);
+        if (cand && cand->shadow_gen != gen) {
+          cand->disqualified = 1;
+        }
+      }
     }
   }
+
+  /* Fold every surviving candidate's reads. */
+  for (size_t f = 0; f < program->function_count; f++) {
+    IRFunction *fn = program->functions[f];
+    if (!fn) {
+      continue;
+    }
+    gen++;
+    ir_rg_mark_shadows(&table, fn, gen);
+    for (size_t i = 0; i < fn->instruction_count; i++) {
+      IRInstruction *ins = &fn->instructions[i];
+      if (ins->op == IR_OP_ADDRESS_OF) {
+        continue;
+      }
+      ir_rg_fold_operand(&table, &ins->lhs, gen, changed);
+      ir_rg_fold_operand(&table, &ins->rhs, gen, changed);
+      for (size_t a = 0; a < ins->argument_count; a++) {
+        ir_rg_fold_operand(&table, &ins->arguments[a], gen, changed);
+      }
+    }
+  }
+
+  free(table.items);
+  free(table.buckets);
   return 1;
 }

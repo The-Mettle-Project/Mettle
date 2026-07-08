@@ -56,4 +56,31 @@ int ir_verify_check_pass(IRFunction *function, IRVerifySnapshot *snapshot,
 /* Exit code contribution: number of divergences found this compile. */
 int ir_verify_divergence_count(void);
 
+/* ---- standalone rewrite gate ----
+ *
+ * The differential check is also usable OUTSIDE the --verify lifecycle, by
+ * callers that gate their own rewrites (--ml-opt validates every model
+ * disposition through this). No quarantine, no counters, no reporting: the
+ * caller owns the policy. */
+
+typedef enum {
+  IR_VERIFY_REWRITE_VALIDATED,    /* equivalent on every usable input set */
+  IR_VERIFY_REWRITE_DIVERGED,     /* counterexample found; why/cex filled */
+  IR_VERIFY_REWRITE_UNVERIFIABLE  /* signature/construct/inputs not runnable */
+} IRVerifyRewriteVerdict;
+
+/* Snapshot capture/restore that do not require --verify to be active. */
+IRVerifySnapshot *ir_verify_snapshot_capture(IRFunction *function);
+int ir_verify_snapshot_restore(IRFunction *function,
+                               const IRVerifySnapshot *snapshot);
+
+/* Compare `function` (after) against `snapshot` (before) on generated inputs.
+ * On DIVERGED, `why` holds the divergence description and `counterexample`
+ * the formatted call. On UNVERIFIABLE, `skip_reason` says what blocked the
+ * check. Any output pointer may be NULL. */
+IRVerifyRewriteVerdict ir_verify_check_rewrite(
+    IRProgram *program, IRFunction *function, const IRVerifySnapshot *snapshot,
+    char *why, size_t why_capacity, char *counterexample, size_t cex_capacity,
+    char *skip_reason, size_t skip_capacity);
+
 #endif /* IR_VERIFY_H */

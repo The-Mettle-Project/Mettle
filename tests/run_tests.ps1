@@ -1773,6 +1773,115 @@ catch {
   Write-CaseResult -Name "decorators" -Passed $false -Reason $_.Exception.Message
 }
 
+# --ml-opt translation-validation gate: every model disposition is executed
+# through the reference interpreter before it stands. A clean run and a
+# speculative run (model dead-code deletes) must never change program
+# behavior, and a hand-injected wrong disposition must be rejected with a
+# counterexample while the binary stays correct.
+$total++
+try {
+  $mlBase = Join-Path $tmpDir "ml_gate_base.exe"
+  $buildOut = & $CompilerPath --build --release "tests\ml_gate.mettle" -o $mlBase 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "ml_gate baseline build failed: $buildOut"
+  }
+  & $mlBase 2>&1 | Out-Null
+  $mlBaseExit = $LASTEXITCODE
+
+  $mlExe = Join-Path $tmpDir "ml_gate_ml.exe"
+  $buildOut = & $CompilerPath --build --release --ml-opt "tests\ml_gate.mettle" -o $mlExe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "ml_gate --ml-opt build failed: $buildOut"
+  }
+  if ($buildOut -notmatch "--ml-opt:") {
+    throw "ml_gate --ml-opt summary line missing"
+  }
+  & $mlExe 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne $mlBaseExit) {
+    throw "--ml-opt changed program behavior: exit $LASTEXITCODE vs baseline $mlBaseExit"
+  }
+
+  $mlSpec = Join-Path $tmpDir "ml_gate_spec.exe"
+  $buildOut = & $CompilerPath --build --release --ml-opt-speculative "tests\ml_gate.mettle" -o $mlSpec 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "ml_gate --ml-opt-speculative build failed: $buildOut"
+  }
+  & $mlSpec 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne $mlBaseExit) {
+    throw "--ml-opt-speculative changed program behavior: exit $LASTEXITCODE vs baseline $mlBaseExit"
+  }
+
+  # Inject two wrong dispositions resolved from the post-classical IR dump: a
+  # CONST fold of mix's `a * b` (wrong at function level) and a speculative
+  # delete of signbit's `neg <- 0` initializer (visible only because
+  # uninitialized locals read poison, not zero). The validator must reject
+  # both and the binary must still match the baseline.
+  $irLine = Select-String -Path "_mlopt.ir" -Pattern "^\s+(\d+): %\S+ = @a \* @b" | Select-Object -First 1
+  if (-not $irLine) {
+    throw "could not locate 'a * b' in _mlopt.ir"
+  }
+  $badIdx = $irLine.Matches[0].Groups[1].Value
+  $negLine = Select-String -Path "_mlopt.ir" -Pattern "^\s+(\d+): @neg <- 0" | Select-Object -First 1
+  if (-not $negLine) {
+    throw "could not locate '@neg <- 0' in _mlopt.ir"
+  }
+  $negIdx = $negLine.Matches[0].Groups[1].Value
+  $dispPath = Join-Path $tmpDir "ml_gate_bad.disp"
+  "mix $badIdx CONST 271828`nsignbit $negIdx NOP" | Out-File -Encoding ascii $dispPath
+  $env:METTLE_ML_DISP = $dispPath
+  $badExe = Join-Path $tmpDir "ml_gate_bad.exe"
+  $buildOut = & $CompilerPath --build --release --ml-opt "tests\ml_gate.mettle" -o $badExe 2>&1 | Out-String
+  $env:METTLE_ML_DISP = $null
+  if ($LASTEXITCODE -ne 0) {
+    throw "ml_gate bad-disposition build failed: $buildOut"
+  }
+  if ($buildOut -notmatch "PROPOSAL REJECTED") {
+    throw "wrong disposition was not rejected by the validator: $buildOut"
+  }
+  if ($buildOut -notmatch "keeps its validated IR") {
+    throw "rejection did not report restoring validated IR"
+  }
+  & $badExe 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne $mlBaseExit) {
+    throw "rejected disposition still changed behavior: exit $LASTEXITCODE vs baseline $mlBaseExit"
+  }
+  Write-CaseResult -Name "ml_opt_gate" -Passed $true
+}
+catch {
+  $env:METTLE_ML_DISP = $null
+  $failed++
+  Write-CaseResult -Name "ml_opt_gate" -Passed $false -Reason $_.Exception.Message
+}
+
+# --ml-opt sabotage self-test: METTLE_ML_SABOTAGE corrupts one real model
+# disposition into a wrong constant; the gate must catch it, name it, and
+# discard it - the ml-opt twin of verify_sabotage_caught.
+$total++
+try {
+  $env:METTLE_ML_SABOTAGE = "1"
+  $sabExe = Join-Path $tmpDir "ml_gate_sab.exe"
+  $buildOut = & $CompilerPath --build --release --ml-opt "examples\explain_demo\explain_demo.mettle" -o $sabExe 2>&1 | Out-String
+  $env:METTLE_ML_SABOTAGE = $null
+  if ($LASTEXITCODE -ne 0) {
+    throw "sabotaged --ml-opt build failed: $buildOut"
+  }
+  if ($buildOut -notmatch "SABOTAGE armed") {
+    throw "sabotage did not arm (model produced no COPY/CONST disposition?)"
+  }
+  if ($buildOut -notmatch "PROPOSAL REJECTED") {
+    throw "sabotaged disposition was not rejected: $buildOut"
+  }
+  if ($buildOut -notmatch "REJECTED by the validator") {
+    throw "summary line does not report the rejection: $buildOut"
+  }
+  Write-CaseResult -Name "ml_opt_sabotage_caught" -Passed $true
+}
+catch {
+  $env:METTLE_ML_SABOTAGE = $null
+  $failed++
+  Write-CaseResult -Name "ml_opt_sabotage_caught" -Passed $false -Reason $_.Exception.Message
+}
+
 # Native heap: build with --native-heap and confirm new/malloc/calloc/realloc/
 # free route through std/alloc's Mettle allocator (mettle_heap_*), stay correct
 # at runtime, and do NOT emit the Win32 HeapAlloc/calloc path for `new`.

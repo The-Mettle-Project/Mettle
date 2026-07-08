@@ -19,7 +19,7 @@
 #define IRV_FILENO fileno
 #endif
 
-#define IRV_INPUT_RUNS 3
+#define IRV_INPUT_RUNS 6
 #define IRV_FUEL_PER_RUN 400000LL
 #define IRV_MAX_PARAMS 12
 #define IRV_MAX_FN_INSNS 20000
@@ -188,7 +188,14 @@ static void irv_instructions_free(IRInstruction *instructions, size_t count) {
 }
 
 IRVerifySnapshot *ir_verify_snapshot_take(IRFunction *function) {
-  if (!g_active || !function || function->instruction_count == 0 ||
+  if (!g_active) {
+    return NULL;
+  }
+  return ir_verify_snapshot_capture(function);
+}
+
+IRVerifySnapshot *ir_verify_snapshot_capture(IRFunction *function) {
+  if (!function || function->instruction_count == 0 ||
       function->instruction_count > IRV_MAX_FN_INSNS) {
     return NULL;
   }
@@ -246,6 +253,14 @@ static int irv_restore(IRFunction *function, const IRVerifySnapshot *snapshot) {
   function->instruction_capacity = snapshot->instruction_count;
   ir_function_clear_cfg(function);
   return 1;
+}
+
+int ir_verify_snapshot_restore(IRFunction *function,
+                               const IRVerifySnapshot *snapshot) {
+  if (!function || !snapshot) {
+    return 0;
+  }
+  return irv_restore(function, snapshot);
 }
 
 /* ---------------- input generation ---------------- */
@@ -321,20 +336,31 @@ static unsigned int irv_lcg_next(unsigned int *state) {
 }
 
 /* Per-run buffer element counts and integer argument tables. Small ints keep
- * length-like parameters within buffer bounds; run 2 probes negatives. */
-static const long long IRV_BUFFER_ELEMS[IRV_INPUT_RUNS] = {33, 7, 16};
+ * length-like parameters within buffer bounds; run 2 probes negatives; runs
+ * 3-5 probe index-pair relationships ((0, N-1) spans, mid-range pairs, large
+ * magnitudes) so loops whose trip count depends on how two arguments relate
+ * (sift_down(start, end)-shaped code) actually execute their bodies. Run 3
+ * caught a real escape the first three runs validated. */
+static const long long IRV_BUFFER_ELEMS[IRV_INPUT_RUNS] = {33, 7, 16,
+                                                           33, 32, 24};
 static long long irv_int_arg(int run, size_t param_index) {
   switch (run) {
   case 0: return 5 + (long long)param_index * 3;
   case 1: return (long long)param_index;
-  default: return param_index == 0 ? 7 : -2 + (long long)param_index;
+  case 2: return param_index == 0 ? 7 : -2 + (long long)param_index;
+  case 3: return param_index <= 1 ? 0 : 33 - (long long)param_index;
+  case 4: return 2 + (long long)param_index * 7;
+  default: return param_index == 0 ? 1 : 1000 + (long long)param_index * 37;
   }
 }
 static double irv_float_arg(int run, size_t param_index) {
   switch (run) {
   case 0: return 1.5 + (double)param_index;
   case 1: return 0.0 - (double)param_index * 0.5;
-  default: return -2.25 + (double)param_index * 1.75;
+  case 2: return -2.25 + (double)param_index * 1.75;
+  case 3: return (double)param_index * 0.125;
+  case 4: return 100.5 - (double)param_index * 33.25;
+  default: return 0.0001 + (double)param_index * 1e6;
   }
 }
 
@@ -550,6 +576,16 @@ static int irv_compare_observations(IRInterpMachine *before,
                  i, a->name, j);
         return 0;
       }
+      /* Pointer arguments: the extern reads memory, so the bytes the pointer
+       * addressed at call time are part of the observation. */
+      if (a->arg_mem_len[j] != b->arg_mem_len[j] ||
+          (a->arg_mem_len[j] > 0 &&
+           memcmp(a->arg_mem[j], b->arg_mem[j], a->arg_mem_len[j]) != 0)) {
+        snprintf(why, why_capacity,
+                 "extern call %zu (%s) argument %zu points to differing bytes",
+                 i, a->name, j);
+        return 0;
+      }
     }
   }
 
@@ -658,21 +694,14 @@ static IRVRunOutcome irv_run_one(IRInterpMachine *machine, IRFunction *fn,
   }
 }
 
-static void irv_report_divergence(IRFunction *function, const char *pass_name,
-                                  int run, const IRVParamInfo *params,
-                                  const IRInterpValue *args, size_t arg_count,
-                                  const char *why) {
-  const char *red = irv_color() ? "\x1b[31m\x1b[1m" : "";
-  const char *cyan = irv_color() ? "\x1b[36m" : "";
-  const char *reset = irv_color() ? "\x1b[0m" : "";
-
-  fprintf(stderr,
-          "\n%sverify: MISCOMPILE CAUGHT%s: pass '%s' changed the observable "
-          "behavior of function '%s'\n",
-          red, reset, pass_name, function->name ? function->name : "?");
-  fprintf(stderr, "  %scounterexample%s (input set %d): %s(", cyan, reset, run,
-          function->name ? function->name : "?");
-  for (size_t i = 0; i < arg_count; i++) {
+/* Format the diverging call as `fn(5, 8, <buf:33 elems>)`. */
+static void irv_format_call(const IRFunction *function,
+                            const IRVParamInfo *params,
+                            const IRInterpValue *args, size_t arg_count,
+                            int run, char *out, size_t capacity) {
+  size_t off = (size_t)snprintf(out, capacity, "%s(",
+                                function->name ? function->name : "?");
+  for (size_t i = 0; i < arg_count && off + 1 < capacity; i++) {
     char value[48];
     if (params[i].kind == IRV_PARAM_BUFFER) {
       snprintf(value, sizeof(value), "<buf:%lld elems>",
@@ -682,47 +711,63 @@ static void irv_report_divergence(IRFunction *function, const char *pass_name,
     } else {
       irv_format_value(&args[i], value, sizeof(value));
     }
-    fprintf(stderr, "%s%s", i == 0 ? "" : ", ", value);
+    off += (size_t)snprintf(out + off, capacity - off, "%s%s",
+                            i == 0 ? "" : ", ", value);
+    if (off >= capacity) {
+      return;
+    }
   }
-  fprintf(stderr, ")\n  %sdivergence%s: %s\n", cyan, reset, why);
-  fprintf(stderr,
-          "  %saction%s: pre-pass IR restored; '%s' quarantined for '%s'; "
-          "compilation continues from validated IR\n",
-          cyan, reset, pass_name, function->name ? function->name : "?");
+  if (off + 1 < capacity) {
+    snprintf(out + off, capacity - off, ")");
+  }
 }
 
-int ir_verify_check_pass(IRFunction *function, IRVerifySnapshot *snapshot,
-                         const char *pass_name, int *changed) {
-  if (!g_active || !function || !snapshot || !pass_name) {
-    return 1;
-  }
-  if (!changed || !*changed) {
-    return 1; /* nothing to validate */
-  }
+typedef enum {
+  IRV_CHECK_VALIDATED,
+  IRV_CHECK_DIVERGED,
+  IRV_CHECK_UNVERIFIABLE,
+  IRV_CHECK_NO_INPUT
+} IRVCheckOutcome;
 
-  g_apps_checked++;
+typedef struct {
+  char why[192];         /* DIVERGED: divergence description */
+  char cex[288];         /* DIVERGED: formatted counterexample call */
+  char skip_reason[160]; /* UNVERIFIABLE / NO_INPUT: what blocked the check */
+  int run;               /* DIVERGED: diverging input set */
+} IRVCheckResult;
+
+/* The policy-free differential check: run `function` (after) against the
+ * snapshot's instructions (before) on generated inputs and compare every
+ * observation. No counters, no quarantine, no restore, no printing - both
+ * the --verify pass driver and the --ml-opt rewrite gate wrap this. */
+static IRVCheckOutcome irv_check_function(IRProgram *program,
+                                          IRFunction *function,
+                                          const IRVerifySnapshot *snapshot,
+                                          IRVCheckResult *result) {
+  result->why[0] = '\0';
+  result->cex[0] = '\0';
+  result->skip_reason[0] = '\0';
+  result->run = -1;
 
   /* Classify parameters; bail early on unverifiable signatures. */
   size_t param_count = function->parameter_count;
   IRVParamInfo params[IRV_MAX_PARAMS];
   if (param_count > IRV_MAX_PARAMS) {
-    irv_note_skip(function, "more than 12 parameters");
-    g_apps_unverifiable++;
-    return 1;
+    snprintf(result->skip_reason, sizeof(result->skip_reason),
+             "more than 12 parameters");
+    return IRV_CHECK_UNVERIFIABLE;
   }
   for (size_t i = 0; i < param_count; i++) {
     params[i] = irv_classify_param(function->parameter_types
                                        ? function->parameter_types[i]
                                        : NULL);
     if (params[i].kind == IRV_PARAM_UNSUPPORTED) {
-      char reason[96];
-      snprintf(reason, sizeof(reason), "parameter type '%s'",
+      snprintf(result->skip_reason, sizeof(result->skip_reason),
+               "parameter type '%s'",
                function->parameter_types && function->parameter_types[i]
                    ? function->parameter_types[i]
                    : "?");
-      irv_note_skip(function, reason);
-      g_apps_unverifiable++;
-      return 1;
+      return IRV_CHECK_UNVERIFIABLE;
     }
   }
 
@@ -738,8 +783,8 @@ int ir_verify_check_pass(IRFunction *function, IRVerifySnapshot *snapshot,
 
   int usable_inputs = 0;
   for (int run = 0; run < IRV_INPUT_RUNS; run++) {
-    IRInterpMachine *machine_before = ir_interp_create(g_program);
-    IRInterpMachine *machine_after = ir_interp_create(g_program);
+    IRInterpMachine *machine_before = ir_interp_create(program);
+    IRInterpMachine *machine_after = ir_interp_create(program);
     if (!machine_before || !machine_after) {
       ir_interp_destroy(machine_before);
       ir_interp_destroy(machine_after);
@@ -770,15 +815,13 @@ int ir_verify_check_pass(IRFunction *function, IRVerifySnapshot *snapshot,
 
     if (outcome_before == IRV_RUN_UNVERIFIABLE ||
         outcome_after == IRV_RUN_UNVERIFIABLE) {
-      char reason[160];
-      snprintf(reason, sizeof(reason), "unsupported construct: %s",
+      snprintf(result->skip_reason, sizeof(result->skip_reason),
+               "unsupported construct: %s",
                outcome_after == IRV_RUN_UNVERIFIABLE ? detail_after
                                                      : detail_before);
-      irv_note_skip(function, reason);
-      g_apps_unverifiable++;
       ir_interp_destroy(machine_before);
       ir_interp_destroy(machine_after);
-      return 1;
+      return IRV_CHECK_UNVERIFIABLE;
     }
 
     /* A program that cleanly guard-traps on both sides is equivalent: the
@@ -795,15 +838,12 @@ int ir_verify_check_pass(IRFunction *function, IRVerifySnapshot *snapshot,
      * made a working program crash (or a crashing program succeed). */
     if ((outcome_before == IRV_RUN_GUARD_TRAP && outcome_after == IRV_RUN_OK) ||
         (outcome_before == IRV_RUN_OK && outcome_after == IRV_RUN_GUARD_TRAP)) {
-      char why[192];
-      snprintf(why, sizeof(why), "%s (%s)",
+      snprintf(result->why, sizeof(result->why), "%s (%s)",
                outcome_after == IRV_RUN_GUARD_TRAP
                    ? "pass made a completing program hit a runtime guard trap"
                    : "pass removed a runtime guard trap the program hit",
                outcome_after == IRV_RUN_GUARD_TRAP ? detail_after
                                                    : detail_before);
-      irv_report_divergence(function, pass_name, run, params, args_before,
-                            param_count, why);
       goto divergence;
     }
 
@@ -818,13 +858,10 @@ int ir_verify_check_pass(IRFunction *function, IRVerifySnapshot *snapshot,
                        strstr(detail_after, "fuel") == NULL;
       if (trap_before != trap_after &&
           (outcome_before == IRV_RUN_OK || outcome_after == IRV_RUN_OK)) {
-        char why[192];
-        snprintf(why, sizeof(why), "%s: %s",
+        snprintf(result->why, sizeof(result->why), "%s: %s",
                  trap_after ? "pass introduced a trap"
                             : "pass removed a trap",
                  trap_after ? detail_after : detail_before);
-        irv_report_divergence(function, pass_name, run, params,
-                              args_before, param_count, why);
         goto divergence;
       }
       ir_interp_destroy(machine_before);
@@ -832,12 +869,9 @@ int ir_verify_check_pass(IRFunction *function, IRVerifySnapshot *snapshot,
       continue;
     }
 
-    char why[192];
     if (!irv_compare_observations(machine_before, machine_after, &ret_before,
-                                  &ret_after, input_buffer_count, why,
-                                  sizeof(why))) {
-      irv_report_divergence(function, pass_name, run, params, args_before,
-                            param_count, why);
+                                  &ret_after, input_buffer_count, result->why,
+                                  sizeof(result->why))) {
       goto divergence;
     }
 
@@ -847,23 +881,118 @@ int ir_verify_check_pass(IRFunction *function, IRVerifySnapshot *snapshot,
     continue;
 
   divergence:
+    result->run = run;
+    irv_format_call(function, params, args_before, param_count, run,
+                    result->cex, sizeof(result->cex));
     ir_interp_destroy(machine_before);
     ir_interp_destroy(machine_after);
+    return IRV_CHECK_DIVERGED;
+  }
+
+  if (usable_inputs == 0) {
+    snprintf(result->skip_reason, sizeof(result->skip_reason),
+             "no executable inputs (traps/fuel on all sets)");
+    return IRV_CHECK_NO_INPUT;
+  }
+  return IRV_CHECK_VALIDATED;
+}
+
+static void irv_report_divergence(IRFunction *function, const char *pass_name,
+                                  const IRVCheckResult *result) {
+  const char *red = irv_color() ? "\x1b[31m\x1b[1m" : "";
+  const char *cyan = irv_color() ? "\x1b[36m" : "";
+  const char *reset = irv_color() ? "\x1b[0m" : "";
+
+  fprintf(stderr,
+          "\n%sverify: MISCOMPILE CAUGHT%s: pass '%s' changed the observable "
+          "behavior of function '%s'\n",
+          red, reset, pass_name, function->name ? function->name : "?");
+  fprintf(stderr, "  %scounterexample%s (input set %d): %s\n", cyan, reset,
+          result->run, result->cex);
+  fprintf(stderr, "  %sdivergence%s: %s\n", cyan, reset, result->why);
+  fprintf(stderr,
+          "  %saction%s: pre-pass IR restored; '%s' quarantined for '%s'; "
+          "compilation continues from validated IR\n",
+          cyan, reset, pass_name, function->name ? function->name : "?");
+}
+
+int ir_verify_check_pass(IRFunction *function, IRVerifySnapshot *snapshot,
+                         const char *pass_name, int *changed) {
+  if (!g_active || !function || !snapshot || !pass_name) {
+    return 1;
+  }
+  if (!changed || !*changed) {
+    return 1; /* nothing to validate */
+  }
+
+  g_apps_checked++;
+
+  IRVCheckResult result;
+  switch (irv_check_function(g_program, function, snapshot, &result)) {
+  case IRV_CHECK_UNVERIFIABLE:
+    irv_note_skip(function, result.skip_reason);
+    g_apps_unverifiable++;
+    return 1;
+  case IRV_CHECK_NO_INPUT:
+    irv_note_skip(function, result.skip_reason);
+    g_apps_no_input++;
+    return 1;
+  case IRV_CHECK_DIVERGED:
+    irv_report_divergence(function, pass_name, &result);
     g_divergences++;
     irv_quarantine_add(function, pass_name);
     if (irv_restore(function, snapshot)) {
       *changed = 0;
     }
     return 0;
-  }
-
-  if (usable_inputs == 0) {
-    g_apps_no_input++;
-    irv_note_skip(function, "no executable inputs (traps/fuel on all sets)");
+  case IRV_CHECK_VALIDATED:
+  default:
+    g_apps_validated++;
     return 1;
   }
-  g_apps_validated++;
-  return 1;
+}
+
+IRVerifyRewriteVerdict ir_verify_check_rewrite(
+    IRProgram *program, IRFunction *function, const IRVerifySnapshot *snapshot,
+    char *why, size_t why_capacity, char *counterexample, size_t cex_capacity,
+    char *skip_reason, size_t skip_capacity) {
+  if (why && why_capacity) {
+    why[0] = '\0';
+  }
+  if (counterexample && cex_capacity) {
+    counterexample[0] = '\0';
+  }
+  if (skip_reason && skip_capacity) {
+    skip_reason[0] = '\0';
+  }
+  if (!program || !function || !snapshot) {
+    if (skip_reason && skip_capacity) {
+      snprintf(skip_reason, skip_capacity, "nothing to check");
+    }
+    return IR_VERIFY_REWRITE_UNVERIFIABLE;
+  }
+
+  IRVCheckResult result;
+  switch (irv_check_function(program, function, snapshot, &result)) {
+  case IRV_CHECK_DIVERGED:
+    if (why && why_capacity) {
+      snprintf(why, why_capacity, "%s", result.why);
+    }
+    if (counterexample && cex_capacity) {
+      snprintf(counterexample, cex_capacity, "(input set %d) %s", result.run,
+               result.cex);
+    }
+    return IR_VERIFY_REWRITE_DIVERGED;
+  case IRV_CHECK_UNVERIFIABLE:
+  case IRV_CHECK_NO_INPUT:
+    if (skip_reason && skip_capacity) {
+      snprintf(skip_reason, skip_capacity, "%s", result.skip_reason);
+    }
+    return IR_VERIFY_REWRITE_UNVERIFIABLE;
+  case IRV_CHECK_VALIDATED:
+  default:
+    return IR_VERIFY_REWRITE_VALIDATED;
+  }
 }
 
 void ir_verify_end_program(void) {

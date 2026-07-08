@@ -1873,6 +1873,7 @@ void ir_explain_ml_opt(const char *path) {
   char ln[1024];
   char cur_fn[256] = "";
   int total = 0, funcs = 0, saved_total = 0;
+  int n_validated = 0, n_proven = 0, n_rejected = 0;
   while (fgets(ln, sizeof ln, f)) {
     char *fn = strtok(ln, "\t");
     char *gi = fn ? strtok(NULL, "\t") : NULL;
@@ -1882,8 +1883,15 @@ void ir_explain_ml_opt(const char *path) {
     char *saved = after ? strtok(NULL, "\t") : NULL;
     char *line = saved ? strtok(NULL, "\t") : NULL;
     char *file = line ? strtok(NULL, "\t\n") : NULL;
+    char *verdict = file ? strtok(NULL, "\t\n") : NULL;
     if (!after) {
       continue;
+    }
+    int rejected = verdict && strcmp(verdict, "rejected") == 0;
+    int skipped = verdict && strcmp(verdict, "skipped") == 0;
+    int proven = verdict && strcmp(verdict, "proven") == 0;
+    if (skipped) {
+      continue; /* declined applier or unverifiable speculative: never stood */
     }
     int sv = saved ? atoi(saved) : 0;
     long src_line = line ? atol(line) : 0;
@@ -1907,22 +1915,47 @@ void ir_explain_ml_opt(const char *path) {
     const char *aft = (after[0] == '@') ? after + 1 : after;   /* drop sigil */
     fprintf(stderr, "    %s%s %-9s%s %s  %s  %s %s%s%s",
             clr(EXPLAIN_DIM), glyph_elbow(), loc, clr(EXPLAIN_RESET), kbuf, bbuf,
-            glyph_arrow(), clr(EXPLAIN_GREEN), aft, clr(EXPLAIN_RESET));
-    if (sv > 0) {
-      fprintf(stderr, "  %s-%d op%s%s", clr(EXPLAIN_DIM), sv, sv == 1 ? "" : "s",
+            glyph_arrow(), rejected ? clr(EXPLAIN_RED) : clr(EXPLAIN_GREEN), aft,
+            clr(EXPLAIN_RESET));
+    if (rejected) {
+      fprintf(stderr, "  %sREJECTED: counterexample found%s", clr(EXPLAIN_RED),
               clr(EXPLAIN_RESET));
+      n_rejected++;
+    } else {
+      if (sv > 0) {
+        fprintf(stderr, "  %s-%d op%s%s", clr(EXPLAIN_DIM), sv,
+                sv == 1 ? "" : "s", clr(EXPLAIN_RESET));
+      }
+      if (proven) {
+        fprintf(stderr, "  %s(proven)%s", clr(EXPLAIN_DIM), clr(EXPLAIN_RESET));
+        n_proven++;
+      } else {
+        n_validated++;
+      }
+      total++;
+      saved_total += sv;
     }
     fprintf(stderr, "\n");
-    total++;
-    saved_total += sv;
   }
   fclose(f);
-  if (total) {
+  if (total || n_rejected) {
+    const char *dot = ir_explain_use_unicode() ? "\xC2\xB7" : "*";
     fprintf(stderr,
-            "\n  %s%d rewrite%s in %d function%s %s %d IR op%s removed, "
-            "all verified equivalent%s\n",
+            "\n  %s%d rewrite%s in %d function%s %s %d IR op%s removed %s ",
             clr(EXPLAIN_DIM), total, total == 1 ? "" : "s", funcs,
-            funcs == 1 ? "" : "s", ir_explain_use_unicode() ? "\xC2\xB7" : "*",
-            saved_total, saved_total == 1 ? "" : "s", clr(EXPLAIN_RESET));
+            funcs == 1 ? "" : "s", dot, saved_total,
+            saved_total == 1 ? "" : "s", dot);
+    if (n_proven == 0) {
+      fprintf(stderr, "all validated equivalent by the interpreter");
+    } else {
+      fprintf(stderr, "%d validated equivalent, %d proven by construction",
+              n_validated, n_proven);
+    }
+    if (n_rejected > 0) {
+      fprintf(stderr, "%s %s%d proposal%s rejected with a counterexample",
+              clr(EXPLAIN_RESET), clr(EXPLAIN_RED), n_rejected,
+              n_rejected == 1 ? "" : "s");
+    }
+    fprintf(stderr, "%s\n", clr(EXPLAIN_RESET));
   }
 }

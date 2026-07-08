@@ -2486,6 +2486,13 @@ int main(int argc, char *argv[]) {
     } else if (strcmp(argv[i], "--ml-opt") == 0) {
       options.ml_opt = 1;
       options.optimize = 1;
+    } else if (strcmp(argv[i], "--ml-opt-speculative") == 0) {
+      /* Unlocks the model's unproven actions (dead-code DELETE). They exist
+       * only on the validator's word, so this implies --ml-opt; ml_gnn reads
+       * the env to emit the speculative dispositions. */
+      options.ml_opt = 1;
+      options.optimize = 1;
+      putenv("METTLE_ML_SPECULATIVE=1");
     } else if (strncmp(argv[i], "--error-format=", 15) == 0) {
       const char *fmt = argv[i] + 15;
       if (strcmp(fmt, "json") == 0) {
@@ -2904,8 +2911,7 @@ static int compile_lower_to_ir(ASTNode *program, TypeChecker *type_checker,
   return 1;
 }
 
-int ir_apply_ml_opt(IRProgram *program); /* src/ir/ml_opt.c */
-int ir_hoist_constants(IRProgram *program); /* src/ir/ml_opt.c */
+#include "ir/ml_opt.h"
 
 /* Collect non-extern, non-exported global integer `var`s whose initializer is
  * an integer literal (optionally negated). The optimizer proves each is never
@@ -3019,10 +3025,22 @@ static int compile_optimize_ir(IRProgram *ir_program, ASTNode *ast_program,
     return 0;
   }
   if (options->ml_opt) {
-    int applied = ir_apply_ml_opt(ir_program);
+    MLOptStats ml = {0};
+    ir_apply_ml_opt(ir_program, &ml);
     int hoisted = ir_hoist_constants(ir_program);
-    fprintf(stderr, "--ml-opt: applied %d model dispositions, hoisted %d "
-            "large constants\n", applied, hoisted);
+    fprintf(stderr, "--ml-opt: %d model proposal%s", ml.proposals,
+            ml.proposals == 1 ? "" : "s");
+    if (ml.proposals > 0) {
+      fprintf(stderr, ": %d applied (%d validated equivalent, %d proven-only)",
+              ml.validated + ml.proven, ml.validated, ml.proven);
+      if (ml.rejected > 0) {
+        fprintf(stderr, ", %d REJECTED by the validator", ml.rejected);
+      }
+      if (ml.skipped > 0) {
+        fprintf(stderr, ", %d skipped", ml.skipped);
+      }
+    }
+    fprintf(stderr, "; hoisted %d large constants\n", hoisted);
     if (options->explain) {
       /* ml_gnn wrote _mlopt.explain (TSV). Render it styled like the main report. */
       ir_explain_ml_opt("_mlopt.explain");
@@ -3799,10 +3817,15 @@ void print_usage(const char *program_name) {
          "                      cost); default N=8. For tools/LLMs.\n");
   printf("  --ml-opt            Run the learned ML IR optimizer after the classical\n"
          "                      passes (experimental). A GNN flags redundancy/algebra\n"
-         "                      classical missed; sound transforms (GVN, affine,\n"
-         "                      collapse, bitwise/xor-shift superoptimizer) verify and\n"
-         "                      apply each. Enables -O. See docs/ml-opt.md; with\n"
-         "                      --explain it reports each model-driven rewrite.\n");
+         "                      classical missed; sound transforms realize each, and\n"
+         "                      every applied rewrite is re-executed through the\n"
+         "                      translation-validation interpreter and discarded on\n"
+         "                      divergence. Enables -O. See docs/ml-opt.md; with\n"
+         "                      --explain it reports each rewrite and its verdict.\n");
+  printf("  --ml-opt-speculative  Also apply the model's unproven proposals (dead-\n"
+         "                      code deletes). These stand ONLY when the validator\n"
+         "                      can execute the function and finds no divergence.\n"
+         "                      Implies --ml-opt.\n");
   printf("  -g, --debug-symbols Generate debug symbols\n");
   printf("  -l, --line-mapping  Generate source line mapping\n");
   printf("  -s, --stack-trace   Embed runtime crash traceback support\n");

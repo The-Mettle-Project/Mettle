@@ -7,6 +7,7 @@
 #define NOPS 17
 #define NFEAT 9
 #define NEDGE 8
+#define DELETE_CLASS 1
 #define AFFINE_CLASS 3
 #define GVN_CLASS 4
 #define COLLAPSE_CLASS 5
@@ -1451,6 +1452,27 @@ static void process_function(const char *fname, char **texts, int *gidx, int n,
         buf_add(explain, ex);
         continue;
       }
+    }
+    /* Speculative dead-code delete (--ml-opt-speculative): the model's DELETE
+     * action carries no construction-time proof, so the disposition is a bare
+     * NOP that ml_opt.c applies ONLY behind the interpreter-differential gate.
+     * Control flow and locals are never proposed; stores/defs/calls are fair
+     * game because the validator observes buffers, globals, and the extern
+     * trace. */
+    static int speculative = -1;
+    if (speculative < 0) {
+      const char *e = getenv("METTLE_ML_SPECULATIVE");
+      speculative = (e && e[0] && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    if (speculative && action[j] == DELETE_CLASS &&
+        (kind[j] == 5 || kind[j] == 6 || kind[j] == 7 || kind[j] == 8)) {
+      char line[700];
+      snprintf(line, sizeof line, "%s %d NOP\n", fname, gidx[j]);
+      buf_add(out, line);
+      snprintf(ex, sizeof ex, "%s\t%d\tmodel delete\t%s\t(deleted)\t1\n", fname,
+               gidx[j], bexpr[0] ? bexpr : texts[j]);
+      buf_add(explain, ex);
+      continue;
     }
     if (action[j] == AFFINE_CLASS && aff_kind[j]) {
       char line[700];

@@ -1520,13 +1520,16 @@ static void ir_expression_map_invalidate_named(IRExpressionMap *map,
   map->count = write;
 }
 
-/* True if @operand names a symbol whose address is taken in @function (and so
- * could be aliased by a store/call through a pointer). Temps, constants, and
- * symbols that never escape cannot be reached by such a store. */
-static int ir_operand_is_aliasable_symbol(const IRFunction *function,
+/* True if @operand names a symbol whose address is taken (and so could be
+ * aliased by a store/call through a pointer). Temps, constants, and symbols
+ * that never escape cannot be reached by such a store. `addr_taken` is the
+ * function's precomputed address-taken set: consulting it per entry is O(1),
+ * where rescanning the function per entry per store was a cubic term on
+ * large functions. */
+static int ir_operand_is_aliasable_symbol(const IRTempValueMap *addr_taken,
                                           const IROperand *operand) {
   return operand && operand->kind == IR_OPERAND_SYMBOL && operand->name &&
-         ir_symbol_address_taken(function, operand->name);
+         ir_temp_value_map_lookup(addr_taken, operand->name) != NULL;
 }
 
 /* A STORE writes memory but cannot change the value of a pure arithmetic
@@ -1538,8 +1541,8 @@ static int ir_operand_is_aliasable_symbol(const IRFunction *function,
  * ADDRESS_OF entries cache `&@sym`, whose value never changes, but @sym is by
  * definition address-taken, so they are conservatively dropped here exactly as
  * the old clear-on-store did -- no regression. */
-static void ir_expression_map_invalidate_after_store(IRExpressionMap *map,
-                                                     const IRFunction *function) {
+static void ir_expression_map_invalidate_after_store(
+    IRExpressionMap *map, const IRTempValueMap *addr_taken) {
   if (!map) {
     return;
   }
@@ -1547,8 +1550,8 @@ static void ir_expression_map_invalidate_after_store(IRExpressionMap *map,
   size_t write = 0;
   for (size_t read = 0; read < map->count; read++) {
     IRExpressionEntry *entry = &map->items[read];
-    if (ir_operand_is_aliasable_symbol(function, &entry->lhs) ||
-        ir_operand_is_aliasable_symbol(function, &entry->rhs)) {
+    if (ir_operand_is_aliasable_symbol(addr_taken, &entry->lhs) ||
+        ir_operand_is_aliasable_symbol(addr_taken, &entry->rhs)) {
       ir_expression_entry_destroy(entry);
       continue;
     }
@@ -1573,6 +1576,12 @@ int ir_common_subexpression_elimination_pass(IRFunction *function,
   }
 
   IRExpressionMap map = {0};
+  IRTempValueMap addr_taken;
+  if (!ir_temp_value_map_init(&addr_taken) ||
+      !ir_addr_taken_set_build(function, &addr_taken)) {
+    ir_temp_value_map_destroy(&addr_taken);
+    return 0;
+  }
 
   for (size_t i = 0; i < function->instruction_count; i++) {
     IRInstruction *instruction = &function->instructions[i];
@@ -1596,17 +1605,19 @@ int ir_common_subexpression_elimination_pass(IRFunction *function,
       if (existing) {
         if (!ir_rewrite_to_assign_operand(instruction, existing, changed)) {
           ir_expression_map_destroy(&map);
+          ir_temp_value_map_destroy(&addr_taken);
           return 0;
         }
       } else if (!ir_expression_map_store_value_for_instruction(&map,
                                                                 instruction)) {
         ir_expression_map_destroy(&map);
+        ir_temp_value_map_destroy(&addr_taken);
         return 0;
       }
     }
 
     if (instruction->op == IR_OP_STORE) {
-      ir_expression_map_invalidate_after_store(&map, function);
+      ir_expression_map_invalidate_after_store(&map, &addr_taken);
     }
 
     if (instruction->op == IR_OP_CALL ||
@@ -1623,6 +1634,7 @@ int ir_common_subexpression_elimination_pass(IRFunction *function,
   }
 
   ir_expression_map_destroy(&map);
+  ir_temp_value_map_destroy(&addr_taken);
   return 1;
 }
 
