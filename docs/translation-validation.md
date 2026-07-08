@@ -138,7 +138,11 @@ build (`verify_sabotage_caught`), alongside `verify_clean` and
 
 ## Cost
 
-Roughly 5-10x compile time (the move from 3 to 6 input sets doubled the
-validation work; small programs stay under a second). Use it in CI, before
-releases, or whenever a release-mode result looks suspicious. `--verify`
-implies `-O`.
+Roughly 2-4x compile time; small programs stay well under a second. Two
+things keep it cheap: interpreter machines grow their buffer/trace storage
+on demand instead of zeroing full-capacity arrays per run, and the pre-pass
+IR snapshot is cached per function and reused (validity proven by content
+comparison) across the majority of pass applications that change nothing.
+`METTLE_VERIFY_STATS=1` prints a breakdown of where validation time went.
+Use `--verify` in CI, before releases, or whenever a release-mode result
+looks suspicious. It implies `-O`.

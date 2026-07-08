@@ -47,13 +47,20 @@ struct IRInterpMachine {
   const char *override_name;
   IRFunction *override_fn;
 
-  IIBuffer buffers[II_MAX_BUFFERS];
+  /* Grown on demand (capped at II_MAX_BUFFERS / II_TRACE_CAP). Embedding the
+   * full-capacity arrays made the machine struct ~570 KB, and translation
+   * validation creates tens of thousands of machines per compile - the calloc
+   * zeroing alone dominated --verify wall time. Entries are fully initialized
+   * on write, so the grown storage is plain malloc. */
+  IIBuffer *buffers;
   size_t buffer_count;
+  size_t buffer_capacity;
 
   IIEnv globals;
 
-  IRInterpExternCall trace[II_TRACE_CAP];
+  IRInterpExternCall *trace;
   size_t trace_count;
+  size_t trace_capacity;
 
   long long fuel;
   int depth;
@@ -185,6 +192,8 @@ void ir_interp_destroy(IRInterpMachine *machine) {
   for (size_t i = 0; i < machine->buffer_count; i++) {
     free(machine->buffers[i].data);
   }
+  free(machine->buffers);
+  free(machine->trace);
   for (size_t i = 0; i < machine->count_table_count; i++) {
     free(machine->count_tables[i].counts);
   }
@@ -272,6 +281,16 @@ unsigned long long ir_interp_add_buffer(IRInterpMachine *machine,
   if (!machine || size < 0 || size > II_MAX_BUFFER_SIZE ||
       machine->buffer_count >= II_MAX_BUFFERS) {
     return 0;
+  }
+  if (machine->buffer_count == machine->buffer_capacity) {
+    size_t grown = machine->buffer_capacity ? machine->buffer_capacity * 2 : 16;
+    IIBuffer *table =
+        (IIBuffer *)realloc(machine->buffers, grown * sizeof(IIBuffer));
+    if (!table) {
+      return 0;
+    }
+    machine->buffers = table;
+    machine->buffer_capacity = grown;
   }
   IIBuffer *buf = &machine->buffers[machine->buffer_count];
   buf->size = size;
@@ -830,6 +849,17 @@ static void ii_trace_extern(IRInterpMachine *machine, const char *name,
   if (machine->trace_count >= II_TRACE_CAP) {
     ii_fail(machine, IR_INTERP_UNSUPPORTED, "extern trace overflow");
     return;
+  }
+  if (machine->trace_count == machine->trace_capacity) {
+    size_t grown = machine->trace_capacity ? machine->trace_capacity * 2 : 8;
+    IRInterpExternCall *table = (IRInterpExternCall *)realloc(
+        machine->trace, grown * sizeof(IRInterpExternCall));
+    if (!table) {
+      ii_fail(machine, IR_INTERP_TRAP, "out of memory");
+      return;
+    }
+    machine->trace = table;
+    machine->trace_capacity = grown;
   }
   IRInterpExternCall *call = &machine->trace[machine->trace_count++];
   snprintf(call->name, sizeof(call->name), "%s", name);

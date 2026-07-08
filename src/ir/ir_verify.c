@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef _WIN32
 #include <io.h>
@@ -42,6 +43,26 @@ static int g_enabled = 0;
 static IRProgram *g_program = NULL;
 static int g_active = 0;
 
+/* METTLE_VERIFY_STATS=1: accumulate where validation time goes and print a
+ * breakdown with the summary. The cheap way to see whether snapshot copies,
+ * before-runs, or after-runs dominate a slow --verify build. */
+static int irv_stats_enabled(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    const char *spec = getenv("METTLE_VERIFY_STATS");
+    cached = (spec && spec[0] && strcmp(spec, "0") != 0) ? 1 : 0;
+  }
+  return cached;
+}
+static double g_ms_snapshot, g_ms_before, g_ms_after, g_ms_setup;
+static long long g_n_snapshot, g_n_before, g_n_after;
+static long long g_n_snap_hits;
+static double irv_now_ms(void) {
+  return (double)clock() * 1000.0 / (double)CLOCKS_PER_SEC;
+}
+
+static void irv_take_cache_clear(void);
+
 static long long g_apps_checked = 0;
 static long long g_apps_validated = 0;
 static long long g_apps_unverifiable = 0;
@@ -70,6 +91,7 @@ void ir_verify_begin_program(IRProgram *program) {
   if (!g_enabled) {
     return;
   }
+  irv_take_cache_clear();
   g_program = program;
   g_active = 1;
   g_apps_checked = 0;
@@ -149,6 +171,9 @@ static void irv_quarantine_add(const IRFunction *function,
 struct IRVerifySnapshot {
   IRInstruction *instructions;
   size_t instruction_count;
+  /* Owned by the take-cache below, not the caller: snapshot_free is a no-op
+   * for these; the cache frees them on replacement or program end. */
+  int cache_owned;
 };
 
 static int irv_instruction_deep_copy(IRInstruction *dst,
@@ -187,11 +212,98 @@ static void irv_instructions_free(IRInstruction *instructions, size_t count) {
   free(instructions);
 }
 
+static IRVerifySnapshot *irv_snapshot_capture_inner(IRFunction *function);
+
+/* Take-cache: the pass driver snapshots a function before EVERY pass it
+ * runs, but the vast majority of pass applications change nothing, so the
+ * function's IR still matches the last snapshot exactly. Reusing it saves
+ * the deep copy (thousands of small mallocs) and the matching frees. The
+ * validity check is a full content comparison against the live IR - no
+ * invalidation protocol to get wrong, and mutations that bypass the driver
+ * (the inliner, ml-opt) are caught by the comparison itself. */
+static struct {
+  const IRFunction *fn;
+  IRVerifySnapshot *snap;
+} g_take_cache;
+
+static int irv_operand_matches(const IROperand *a, const IROperand *b) {
+  if (a->kind != b->kind || a->int_value != b->int_value ||
+      a->float_bits != b->float_bits) {
+    return 0;
+  }
+  if (a->kind == IR_OPERAND_FLOAT &&
+      memcmp(&a->float_value, &b->float_value, sizeof(double)) != 0) {
+    return 0;
+  }
+  if ((a->name == NULL) != (b->name == NULL)) {
+    return 0;
+  }
+  return !a->name || strcmp(a->name, b->name) == 0;
+}
+
+static int irv_snapshot_matches(const IRFunction *function,
+                                const IRVerifySnapshot *snapshot) {
+  if (!snapshot || snapshot->instruction_count != function->instruction_count) {
+    return 0;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *a = &function->instructions[i];
+    const IRInstruction *b = &snapshot->instructions[i];
+    if (a->op != b->op || a->is_float != b->is_float ||
+        a->float_bits != b->float_bits || a->is_unsigned != b->is_unsigned ||
+        a->argument_count != b->argument_count) {
+      return 0;
+    }
+    if ((a->text == NULL) != (b->text == NULL) ||
+        (a->text && strcmp(a->text, b->text) != 0)) {
+      return 0;
+    }
+    if (!irv_operand_matches(&a->dest, &b->dest) ||
+        !irv_operand_matches(&a->lhs, &b->lhs) ||
+        !irv_operand_matches(&a->rhs, &b->rhs)) {
+      return 0;
+    }
+    for (size_t j = 0; j < a->argument_count; j++) {
+      if (!irv_operand_matches(&a->arguments[j], &b->arguments[j])) {
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
+static void irv_take_cache_clear(void) {
+  if (g_take_cache.snap) {
+    g_take_cache.snap->cache_owned = 0;
+    ir_verify_snapshot_free(g_take_cache.snap);
+  }
+  g_take_cache.fn = NULL;
+  g_take_cache.snap = NULL;
+}
+
 IRVerifySnapshot *ir_verify_snapshot_take(IRFunction *function) {
   if (!g_active) {
     return NULL;
   }
-  return ir_verify_snapshot_capture(function);
+  if (g_take_cache.fn == function) {
+    double t0 = irv_stats_enabled() ? irv_now_ms() : 0.0;
+    int hit = irv_snapshot_matches(function, g_take_cache.snap);
+    if (irv_stats_enabled()) {
+      g_ms_snapshot += irv_now_ms() - t0;
+    }
+    if (hit) {
+      g_n_snap_hits++;
+      return g_take_cache.snap;
+    }
+  }
+  irv_take_cache_clear();
+  IRVerifySnapshot *snap = ir_verify_snapshot_capture(function);
+  if (snap) {
+    snap->cache_owned = 1;
+    g_take_cache.fn = function;
+    g_take_cache.snap = snap;
+  }
+  return snap;
 }
 
 IRVerifySnapshot *ir_verify_snapshot_capture(IRFunction *function) {
@@ -199,6 +311,16 @@ IRVerifySnapshot *ir_verify_snapshot_capture(IRFunction *function) {
       function->instruction_count > IRV_MAX_FN_INSNS) {
     return NULL;
   }
+  double t0 = irv_stats_enabled() ? irv_now_ms() : 0.0;
+  IRVerifySnapshot *result = irv_snapshot_capture_inner(function);
+  if (irv_stats_enabled()) {
+    g_ms_snapshot += irv_now_ms() - t0;
+    g_n_snapshot++;
+  }
+  return result;
+}
+
+static IRVerifySnapshot *irv_snapshot_capture_inner(IRFunction *function) {
   IRVerifySnapshot *snapshot =
       (IRVerifySnapshot *)calloc(1, sizeof(*snapshot));
   if (!snapshot) {
@@ -223,8 +345,8 @@ IRVerifySnapshot *ir_verify_snapshot_capture(IRFunction *function) {
 }
 
 void ir_verify_snapshot_free(IRVerifySnapshot *snapshot) {
-  if (!snapshot) {
-    return;
+  if (!snapshot || snapshot->cache_owned) {
+    return; /* the take-cache owns it; freed on replacement / program end */
   }
   irv_instructions_free(snapshot->instructions, snapshot->instruction_count);
   free(snapshot);
@@ -782,7 +904,9 @@ static IRVCheckOutcome irv_check_function(IRProgram *program,
   before_fn.instruction_count = snapshot->instruction_count;
 
   int usable_inputs = 0;
+  int stats = irv_stats_enabled();
   for (int run = 0; run < IRV_INPUT_RUNS; run++) {
+    double t0 = stats ? irv_now_ms() : 0.0;
     IRInterpMachine *machine_before = ir_interp_create(program);
     IRInterpMachine *machine_after = ir_interp_create(program);
     if (!machine_before || !machine_after) {
@@ -806,12 +930,22 @@ static IRVCheckOutcome irv_check_function(IRProgram *program,
 
     IRInterpValue ret_before = {0, 0, 0}, ret_after = {0, 0, 0};
     char detail_before[128] = "", detail_after[128] = "";
+    double t1 = stats ? irv_now_ms() : 0.0;
     IRVRunOutcome outcome_before =
         irv_run_one(machine_before, &before_fn, args_before, param_count,
                     &ret_before, detail_before, sizeof(detail_before));
+    double t2 = stats ? irv_now_ms() : 0.0;
     IRVRunOutcome outcome_after =
         irv_run_one(machine_after, function, args_after, param_count,
                     &ret_after, detail_after, sizeof(detail_after));
+    if (stats) {
+      double t3 = irv_now_ms();
+      g_ms_setup += t1 - t0;
+      g_ms_before += t2 - t1;
+      g_ms_after += t3 - t2;
+      g_n_before++;
+      g_n_after++;
+    }
 
     if (outcome_before == IRV_RUN_UNVERIFIABLE ||
         outcome_after == IRV_RUN_UNVERIFIABLE) {
@@ -1023,6 +1157,17 @@ void ir_verify_end_program(void) {
     fprintf(stderr, "  %snot validated%s: %s (%s)\n", dim, reset,
             g_skip_notes[i].function_name, g_skip_notes[i].reason);
   }
+  if (irv_stats_enabled()) {
+    fprintf(stderr,
+            "  %sverify stats%s: snapshots %.0f ms (%lld copies, %lld cache "
+            "hits), machine setup %.0f ms, before-runs %.0f ms (%lld), "
+            "after-runs %.0f ms (%lld)\n",
+            dim, reset, g_ms_snapshot, g_n_snapshot, g_n_snap_hits, g_ms_setup,
+            g_ms_before, g_n_before, g_ms_after, g_n_after);
+    g_ms_snapshot = g_ms_before = g_ms_after = g_ms_setup = 0;
+    g_n_snapshot = g_n_before = g_n_after = g_n_snap_hits = 0;
+  }
+  irv_take_cache_clear();
   g_active = 0;
   g_program = NULL;
 }
