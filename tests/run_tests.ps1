@@ -8546,6 +8546,13 @@ else {
     $nativeOut = & $nativeExe | Out-String
     if ($LASTEXITCODE -ne 42) { throw "native exe exit code $LASTEXITCODE, expected 42" }
     if ($nativeOut -notmatch "OK") { throw "native exe stdout missing OK: '$nativeOut'" }
+    # The convenience surface (element/field addressing, allocated labels,
+    # operator enums) must lower to the same working native code: the program
+    # sums i*i for i in 0..4 into a struct field and adds a second field.
+    $ergExe = Join-Path $pubOut "pubapi_ergonomics.exe"
+    if (-not (Test-Path $ergExe)) { throw "no ergonomics executable produced" }
+    & $ergExe | Out-Null
+    if ($LASTEXITCODE -ne 77) { throw "ergonomics exe exit code $LASTEXITCODE, expected 77" }
     Write-CaseResult -Name "public_api" -Passed $true
   }
   catch {

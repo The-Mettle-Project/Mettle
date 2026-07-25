@@ -143,7 +143,6 @@ typedef struct {
   MtlcFn *fn;      /* current function being lowered */
   Local locals[128];
   int local_count;
-  int label_id;
   int error;
 } Parser;
 
@@ -198,11 +197,12 @@ static MtlcValue parse_primary(Parser *p) {
   }
   if (t->type == T_MINUS) {
     advance(p);
-    return mtlc_unary(p->fn, "-", parse_primary(p), p->i64);
+    return mtlc_unary_op(p->fn, MTLC_UNOP_NEGATE, parse_primary(p), p->i64);
   }
   if (t->type == T_NOT) {
     advance(p);
-    return mtlc_unary(p->fn, "!", parse_primary(p), p->i64);
+    return mtlc_unary_op(p->fn, MTLC_UNOP_LOGICAL_NOT, parse_primary(p),
+                         p->i64);
   }
   if (t->type == T_LPAREN) {
     advance(p);
@@ -238,15 +238,24 @@ static MtlcValue parse_primary(Parser *p) {
   return MTLC_NO_VALUE;
 }
 
-/* Precedence-climbing over the binary operators. */
-static const char *binop_text(TokType t) {
+/* Precedence-climbing over the binary operators. The backend's operator enum
+ * means a token that is not an operator cannot silently become bad IR. */
+static int binop_of(TokType t, MtlcBinaryOp *out) {
   switch (t) {
-  case T_STAR: return "*"; case T_SLASH: return "/"; case T_PERCENT: return "%";
-  case T_PLUS: return "+"; case T_MINUS: return "-";
-  case T_LT: return "<"; case T_LE: return "<="; case T_GT: return ">"; case T_GE: return ">=";
-  case T_EQ: return "=="; case T_NE: return "!=";
-  case T_AND: return "&&"; case T_OR: return "||";
-  default: return NULL;
+  case T_STAR: *out = MTLC_BINOP_MUL; return 1;
+  case T_SLASH: *out = MTLC_BINOP_DIV; return 1;
+  case T_PERCENT: *out = MTLC_BINOP_REM; return 1;
+  case T_PLUS: *out = MTLC_BINOP_ADD; return 1;
+  case T_MINUS: *out = MTLC_BINOP_SUB; return 1;
+  case T_LT: *out = MTLC_BINOP_LT; return 1;
+  case T_LE: *out = MTLC_BINOP_LE; return 1;
+  case T_GT: *out = MTLC_BINOP_GT; return 1;
+  case T_GE: *out = MTLC_BINOP_GE; return 1;
+  case T_EQ: *out = MTLC_BINOP_EQ; return 1;
+  case T_NE: *out = MTLC_BINOP_NE; return 1;
+  case T_AND: *out = MTLC_BINOP_LOGICAL_AND; return 1;
+  case T_OR: *out = MTLC_BINOP_LOGICAL_OR; return 1;
+  default: return 0;
   }
 }
 static int binop_prec(TokType t) {
@@ -266,10 +275,11 @@ static MtlcValue parse_binary(Parser *p, int min_prec) {
     TokType t = peek(p)->type;
     int prec = binop_prec(t);
     if (prec == 0 || prec < min_prec) break;
-    const char *op = binop_text(t);
+    MtlcBinaryOp op;
+    if (!binop_of(t, &op)) break;
     advance(p);
     MtlcValue right = parse_binary(p, prec + 1); /* left-associative */
-    left = mtlc_binary(p->fn, op, left, right, p->i64);
+    left = mtlc_binary_op(p->fn, op, left, right, p->i64);
   }
   return left;
 }
@@ -298,35 +308,33 @@ static void parse_statement(Parser *p) {
   }
   if (t->type == T_IF) {
     advance(p);
-    int id = p->label_id++;
-    char lelse[32], lend[32];
-    snprintf(lelse, sizeof(lelse), "L%d_else", id);
-    snprintf(lend, sizeof(lend), "L%d_end", id);
+    /* The builder hands out unique labels, so the frontend never composes
+     * label strings -- and a target it forgets to place is caught at finish. */
+    MtlcLabel lelse = mtlc_label_new(p->fn, "else");
+    MtlcLabel lend = mtlc_label_new(p->fn, "endif");
     expect(p, T_LPAREN, "'('");
     MtlcValue cond = parse_expr(p);
     expect(p, T_RPAREN, "')'");
-    mtlc_branch_if_zero(p->fn, cond, lelse);
+    mtlc_branch_if_zero_to(p->fn, cond, lelse);
     parse_block(p);
-    mtlc_jump(p->fn, lend);
-    mtlc_label(p->fn, lelse);
+    mtlc_jump_to(p->fn, lend);
+    mtlc_label_here(p->fn, lelse);
     if (accept(p, T_ELSE)) parse_block(p);
-    mtlc_label(p->fn, lend);
+    mtlc_label_here(p->fn, lend);
     return;
   }
   if (t->type == T_WHILE) {
     advance(p);
-    int id = p->label_id++;
-    char ltop[32], lend[32];
-    snprintf(ltop, sizeof(ltop), "L%d_top", id);
-    snprintf(lend, sizeof(lend), "L%d_end", id);
+    MtlcLabel ltop = mtlc_label_new(p->fn, "loop");
+    MtlcLabel lend = mtlc_label_new(p->fn, "endloop");
     expect(p, T_LPAREN, "'('");
-    mtlc_label(p->fn, ltop);
+    mtlc_label_here(p->fn, ltop);
     MtlcValue cond = parse_expr(p);
     expect(p, T_RPAREN, "')'");
-    mtlc_branch_if_zero(p->fn, cond, lend);
+    mtlc_branch_if_zero_to(p->fn, cond, lend);
     parse_block(p);
-    mtlc_jump(p->fn, ltop);
-    mtlc_label(p->fn, lend);
+    mtlc_jump_to(p->fn, ltop);
+    mtlc_label_here(p->fn, lend);
     return;
   }
   if (t->type == T_IDENT && p->toks->toks[p->pos + 1].type == T_ASSIGN) {
@@ -417,6 +425,16 @@ static char *read_file(const char *path) {
   return buf;
 }
 
+/* Both the builder and the pipeline report through this, so a backend failure
+ * is reported in calc's own voice instead of appearing on stderr from
+ * somewhere inside libmtlc. */
+static void on_backend_diagnostic(void *user_data, MtlcDiagSeverity severity,
+                                  const char *message) {
+  (void)user_data;
+  fprintf(stderr, "calc: backend %s: %s\n", mtlc_diag_severity_name(severity),
+          message);
+}
+
 int main(int argc, char **argv) {
   if (argc < 3) {
     fprintf(stderr, "usage: %s <input.calc> <output-exe>\n", argv[0]);
@@ -434,25 +452,34 @@ int main(int argc, char **argv) {
   Parser p = {0};
   p.toks = &toks;
   p.builder = mtlc_builder_create();
+  mtlc_builder_set_diagnostic_handler(p.builder, on_backend_diagnostic, NULL);
   p.i64 = mtlc_type_scalar(MTLC_TYPE_INT64);
   while (peek(&p)->type != T_EOF && !p.error) {
     parse_function(&p);
   }
   free(src);
   free(toks.toks);
-  if (p.error) {
+  /* Builder errors are sticky, so one check after lowering the whole program
+   * covers every emit call above. */
+  if (p.error || !mtlc_builder_ok(p.builder)) {
+    if (!p.error) {
+      fprintf(stderr, "calc: IR construction failed: %s\n",
+              mtlc_builder_error(p.builder));
+    }
     mtlc_builder_destroy(p.builder);
     return 1;
   }
 
   MtlcModule *module = mtlc_builder_finish(p.builder);
   if (!module) {
+    /* finish consumed the builder, so its message already went to the handler. */
     fprintf(stderr, "calc: IR construction failed\n");
     return 1;
   }
 
   /* Drive the backend: optimize, then compile+link to a native executable. */
   MtlcContext *ctx = mtlc_context_create();
+  mtlc_context_set_diagnostic_handler(ctx, on_backend_diagnostic, NULL);
   mtlc_context_set_opt_level(ctx, 1);
   mtlc_context_set_whole_program(ctx, 1);
   int ok = mtlc_optimize(ctx, module) &&
@@ -461,7 +488,8 @@ int main(int argc, char **argv) {
     printf("calc: wrote %s (%zu functions) via libmtlc %s\n", argv[2],
            mtlc_module_function_count(module), mtlc_version());
   } else {
-    fprintf(stderr, "calc: backend failed\n");
+    const char *why = mtlc_context_last_error(ctx);
+    fprintf(stderr, "calc: backend failed: %s\n", why ? why : "unknown error");
   }
   mtlc_module_destroy(module);
   mtlc_context_destroy(ctx);

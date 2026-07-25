@@ -20,6 +20,10 @@
  *      stable PTX WMMA shape/type family -> GB10 PTX
  *   6. transfer: frontend-neutral multidimensional workgroup transfers ->
  *      portable cooperative replay and native GB10 TMA PTX
+ *   7. ergonomics: the convenience surface -- composite type constructors,
+ *      element/field addressing, typed operator enums, allocated labels,
+ *      builder and context diagnostics -> <outdir>/pubapi_ergonomics.exe
+ *      (the harness runs it: expects exit code 77)
  *
  * Exit code 0 = everything emitted and structurally verified. */
 #include <mtlc/build.h>
@@ -2201,6 +2205,280 @@ static int public_async_copy_contract_is_checked(void) {
   return mtlc_builder_finish(builder) == NULL;
 }
 
+/* ------------------------------------------------------- 7. ergonomics ---- */
+
+/* Diagnostics are collected rather than printed, which is the whole point of
+ * the handler: an embedder formats them itself. */
+typedef struct {
+  char last[512];
+  int count;
+} DiagSink;
+
+static void diag_sink(void *user_data, MtlcDiagSeverity severity,
+                      const char *message) {
+  DiagSink *sink = (DiagSink *)user_data;
+  if (severity == MTLC_DIAG_ERROR) {
+    snprintf(sink->last, sizeof(sink->last), "%s", message);
+    sink->count++;
+  }
+}
+
+/* The layout mtlc_type_struct must compute for { int32; float64; int8 } under
+ * the standard C rule: 0, 8 (padded to alignment 8), 16, size 24, align 8. */
+static int composite_types_are_laid_out(void) {
+  const MtlcType *i32 = mtlc_type_scalar(MTLC_TYPE_INT32);
+  const MtlcType *f64 = mtlc_type_scalar(MTLC_TYPE_FLOAT64);
+  const MtlcType *i8 = mtlc_type_scalar(MTLC_TYPE_INT8);
+  const char *names[] = {"tag", "weight", "flag"};
+  const MtlcType *types[] = {i32, f64, i8};
+  const MtlcType *record = mtlc_type_struct("ErgRecord", names, types, 3);
+  if (!record || record->kind != MTLC_TYPE_STRUCT) return 0;
+  if (mtlc_type_size(record) != 24 || mtlc_type_alignment(record) != 8) return 0;
+  if (mtlc_type_field_count(record) != 3) return 0;
+  if (mtlc_type_field_offset(record, 0) != 0 ||
+      mtlc_type_field_offset(record, 1) != 8 ||
+      mtlc_type_field_offset(record, 2) != 16) {
+    return 0;
+  }
+  if (mtlc_type_field_offset(record, 3) != (size_t)-1) return 0;
+  if (mtlc_type_field_index(record, "weight") != 1 ||
+      mtlc_type_field_index(record, "absent") != (size_t)-1) {
+    return 0;
+  }
+  /* Interned by name: the same declaration is the same descriptor, and a
+   * conflicting one is refused rather than silently shadowing. */
+  if (mtlc_type_struct("ErgRecord", names, types, 3) != record) return 0;
+  {
+    const char *other_names[] = {"tag"};
+    const MtlcType *other_types[] = {i32};
+    if (mtlc_type_struct("ErgRecord", other_names, other_types, 1) != NULL) {
+      return 0;
+    }
+  }
+
+  const MtlcType *array = mtlc_type_array(i32, 4);
+  if (!array || array->kind != MTLC_TYPE_ARRAY) return 0;
+  if (mtlc_type_size(array) != 16 || mtlc_type_alignment(array) != 4) return 0;
+  if (mtlc_type_array(i32, 4) != array) return 0;
+  if (mtlc_type_array(i32, 0) != NULL || mtlc_type_array(NULL, 4) != NULL) {
+    return 0;
+  }
+
+  const MtlcType *params[] = {i32, i32};
+  const MtlcType *fp = mtlc_type_function_pointer(i32, params, 2);
+  if (!fp || fp->kind != MTLC_TYPE_FUNCTION_POINTER) return 0;
+  if (mtlc_type_size(fp) != 8 || fp->fn_param_count != 2) return 0;
+  if (mtlc_type_function_pointer(i32, params, 2) != fp) return 0;
+  if (mtlc_type_function_pointer(NULL, params, 2) != NULL) return 0;
+  return 1;
+}
+
+/* A bad operator string, a bad label handle, and a branch to a label that was
+ * never defined must each fail the builder with a message that names the
+ * offending thing -- not produce a module that breaks later in codegen. */
+static int builder_reports_its_errors(void) {
+  const MtlcType *i64 = mtlc_type_scalar(MTLC_TYPE_INT64);
+
+  /* 1. an operator the IR does not have */
+  {
+    DiagSink sink = {{0}, 0};
+    MtlcBuilder *b = mtlc_builder_create();
+    mtlc_builder_set_diagnostic_handler(b, diag_sink, &sink);
+    MtlcFn *f = mtlc_builder_function(b, "main", i64, NULL, NULL, 0, 0);
+    mtlc_binary(f, "<=>", mtlc_const_int(f, i64, 1), mtlc_const_int(f, i64, 2),
+                i64);
+    if (mtlc_builder_ok(b) || mtlc_fn_ok(f)) return 0;
+    if (sink.count == 0 || !strstr(sink.last, "<=>")) return 0;
+    if (!mtlc_builder_error(b) || !strstr(mtlc_builder_error(b), "mtlc_binary")) {
+      return 0;
+    }
+    if (mtlc_builder_finish(b) != NULL) return 0;
+  }
+
+  /* 2. a label handle that was never allocated */
+  {
+    DiagSink sink = {{0}, 0};
+    MtlcBuilder *b = mtlc_builder_create();
+    mtlc_builder_set_diagnostic_handler(b, diag_sink, &sink);
+    MtlcFn *f = mtlc_builder_function(b, "main", i64, NULL, NULL, 0, 0);
+    mtlc_jump_to(f, 41);
+    if (mtlc_builder_ok(b)) return 0;
+    if (!strstr(sink.last, "mtlc_jump_to")) return 0;
+    mtlc_builder_destroy(b);
+  }
+
+  /* 3. a branch to a label string that is never defined */
+  {
+    DiagSink sink = {{0}, 0};
+    MtlcBuilder *b = mtlc_builder_create();
+    mtlc_builder_set_diagnostic_handler(b, diag_sink, &sink);
+    MtlcFn *f = mtlc_builder_function(b, "main", i64, NULL, NULL, 0, 0);
+    mtlc_jump(f, "nowhere");
+    mtlc_label(f, "elsewhere");
+    mtlc_return(f, mtlc_const_int(f, i64, 0));
+    if (!mtlc_builder_ok(b)) return 0; /* only detectable at finish */
+    if (mtlc_builder_finish(b) != NULL) return 0;
+    if (!strstr(sink.last, "nowhere") || !strstr(sink.last, "main")) return 0;
+  }
+
+  /* 4. placing the same allocated label twice */
+  {
+    DiagSink sink = {{0}, 0};
+    MtlcBuilder *b = mtlc_builder_create();
+    mtlc_builder_set_diagnostic_handler(b, diag_sink, &sink);
+    MtlcFn *f = mtlc_builder_function(b, "main", i64, NULL, NULL, 0, 0);
+    MtlcLabel twice = mtlc_label_new(f, "twice");
+    mtlc_label_here(f, twice);
+    mtlc_label_here(f, twice);
+    if (mtlc_builder_ok(b)) return 0;
+    if (!strstr(sink.last, "already placed")) return 0;
+    mtlc_builder_destroy(b);
+  }
+
+  /* 5. indexing through something that is not a pointer */
+  {
+    DiagSink sink = {{0}, 0};
+    MtlcBuilder *b = mtlc_builder_create();
+    mtlc_builder_set_diagnostic_handler(b, diag_sink, &sink);
+    MtlcFn *f = mtlc_builder_function(b, "main", i64, NULL, NULL, 0, 0);
+    if (mtlc_element_address(f, mtlc_const_int(f, i64, 0), i64,
+                             mtlc_const_int(f, i64, 1)) != MTLC_NO_VALUE) {
+      return 0;
+    }
+    if (mtlc_builder_ok(b) || !strstr(sink.last, "not a pointer")) return 0;
+    mtlc_builder_destroy(b);
+  }
+
+  /* 6. a missing index, including at a stride of one where the scaling
+   *    multiply that would otherwise catch it is skipped. */
+  {
+    const MtlcType *pi8 = mtlc_type_pointer(mtlc_type_scalar(MTLC_TYPE_INT8));
+    DiagSink sink = {{0}, 0};
+    MtlcBuilder *b = mtlc_builder_create();
+    mtlc_builder_set_diagnostic_handler(b, diag_sink, &sink);
+    MtlcFn *f = mtlc_builder_function(b, "main", i64, NULL, NULL, 0, 0);
+    if (mtlc_element_address(f, mtlc_const_int(f, i64, 0), pi8,
+                             MTLC_NO_VALUE) != MTLC_NO_VALUE) {
+      return 0;
+    }
+    if (mtlc_builder_ok(b) || !strstr(sink.last, "index")) return 0;
+    mtlc_builder_destroy(b);
+  }
+  return 1;
+}
+
+/* A failing pipeline call must leave a retrievable message on the context. */
+static int context_reports_pipeline_errors(void) {
+  DiagSink sink = {{0}, 0};
+  MtlcContext *ctx = mtlc_context_create();
+  if (!ctx) return 0;
+  if (mtlc_context_last_error(ctx) != NULL) return 0;
+
+  if (mtlc_emit_object(ctx, NULL, "unused.obj")) return 0;
+  const char *recorded = mtlc_context_last_error(ctx);
+  if (!recorded || !strstr(recorded, "mtlc_emit_object")) return 0;
+
+  mtlc_context_clear_error(ctx);
+  if (mtlc_context_last_error(ctx) != NULL) return 0;
+
+  /* With a handler installed the message goes there instead of stderr. */
+  mtlc_context_set_diagnostic_handler(ctx, diag_sink, &sink);
+  if (mtlc_emit(ctx, NULL, MTLC_ARCH_PTX, "unused.ptx")) return 0;
+  if (sink.count != 1 || !strstr(sink.last, "mtlc_emit")) return 0;
+  if (strcmp(mtlc_diag_severity_name(MTLC_DIAG_ERROR), "error") != 0 ||
+      strcmp(mtlc_diag_severity_name(MTLC_DIAG_WARNING), "warning") != 0 ||
+      strcmp(mtlc_diag_severity_name(MTLC_DIAG_NOTE), "note") != 0) {
+    return 0;
+  }
+  mtlc_context_destroy(ctx);
+  return 1;
+}
+
+/* A whole program built with the convenience surface only: allocated labels
+ * for the loop, operator enums for the arithmetic, element addressing over a
+ * malloc'd array, and field addressing through a struct pointer.
+ *
+ *   sum = 0; for (i = 0; i < 5; i++) { a[i] = i * i; sum += a[i]; }  -> 30
+ *   r->tag = sum; r->flag = 47;  return r->tag + r->flag;            -> 77
+ */
+static MtlcModule *build_ergonomics_module(void) {
+  const MtlcType *i32 = mtlc_type_scalar(MTLC_TYPE_INT32);
+  const MtlcType *i64 = mtlc_type_scalar(MTLC_TYPE_INT64);
+  const MtlcType *i8 = mtlc_type_scalar(MTLC_TYPE_INT8);
+  const MtlcType *f64 = mtlc_type_scalar(MTLC_TYPE_FLOAT64);
+  const MtlcType *pi64 = mtlc_type_pointer(i64);
+
+  const char *field_names[] = {"tag", "weight", "flag"};
+  const MtlcType *field_types[] = {i32, f64, i8};
+  const MtlcType *record = mtlc_type_struct("ErgRecord", field_names,
+                                            field_types, 3);
+  const MtlcType *precord = mtlc_type_pointer(record);
+  if (!record || !precord) return NULL;
+
+  MtlcBuilder *b = mtlc_builder_create();
+  if (!b) return NULL;
+
+  {
+    const MtlcType *pt[] = {i64};
+    if (!mtlc_builder_declare_function(b, "malloc", pi64, NULL, pt, 1)) {
+      mtlc_builder_destroy(b);
+      return NULL;
+    }
+  }
+
+  MtlcFn *m = mtlc_builder_function(b, "main", i64, NULL, NULL, 0, 0);
+  if (!m) {
+    mtlc_builder_destroy(b);
+    return NULL;
+  }
+
+  /* int64 a[5], via malloc: element addressing does the stride arithmetic. */
+  MtlcValue bytes = mtlc_const_int(m, i64, 5 * 8);
+  MtlcValue array = mtlc_call(m, "malloc", &bytes, 1, pi64);
+
+  MtlcValue i = mtlc_local(m, "i", i64);
+  MtlcValue sum = mtlc_local(m, "sum", i64);
+  mtlc_assign(m, i, mtlc_const_int(m, i64, 0));
+  mtlc_assign(m, sum, mtlc_const_int(m, i64, 0));
+
+  MtlcLabel top = mtlc_label_new(m, "loop_top");
+  MtlcLabel done = mtlc_label_new(m, "loop_done");
+  mtlc_label_here(m, top);
+  MtlcValue more = mtlc_binary_op(m, MTLC_BINOP_LT, i,
+                                  mtlc_const_int(m, i64, 5), i64);
+  mtlc_branch_if_zero_to(m, more, done);
+
+  mtlc_store_element(m, array, pi64, i,
+                     mtlc_binary_op(m, MTLC_BINOP_MUL, i, i, i64));
+  mtlc_assign(m, sum,
+              mtlc_binary_op(m, MTLC_BINOP_ADD, sum,
+                             mtlc_load_element(m, array, pi64, i), i64));
+  mtlc_assign(m, i,
+              mtlc_binary_op(m, MTLC_BINOP_ADD, i, mtlc_const_int(m, i64, 1),
+                             i64));
+  mtlc_jump_to(m, top);
+  mtlc_label_here(m, done);
+
+  /* A struct through a pointer: offsets come from the computed layout. */
+  MtlcValue record_bytes = mtlc_const_int(m, i64, (long long)record->size);
+  MtlcValue r = mtlc_cast(m, mtlc_call(m, "malloc", &record_bytes, 1, pi64),
+                          precord);
+  mtlc_store_field(m, r, precord, 0, mtlc_cast(m, sum, i32));   /* tag  = 30 */
+  mtlc_store_field(m, r, precord, 2, mtlc_const_int(m, i8, 47)); /* flag = 47 */
+
+  MtlcValue tag = mtlc_cast(m, mtlc_load_field(m, r, precord, 0), i64);
+  MtlcValue flag = mtlc_cast(m, mtlc_load_field(m, r, precord, 2), i64);
+  mtlc_return(m, mtlc_binary_op(m, MTLC_BINOP_ADD, tag, flag, i64));
+
+  if (!mtlc_builder_ok(b)) {
+    fprintf(stderr, "public_api_test: ergonomics build: %s\n",
+            mtlc_builder_error(b));
+    mtlc_builder_destroy(b);
+    return NULL;
+  }
+  return mtlc_builder_finish(b);
+}
+
 int main(int argc, char **argv) {
   if (argc < 2) {
     fprintf(stderr, "usage: %s <outdir>\n", argv[0]);
@@ -2769,6 +3047,33 @@ int main(int argc, char **argv) {
     printf("tensor transfer: %s, %s\n", portable, gb10);
     free(portable);
     free(gb10);
+    mtlc_module_destroy(m);
+  }
+
+  /* 7. the ergonomic convenience surface, end to end. */
+  {
+    if (!composite_types_are_laid_out()) {
+      return fail("composite type constructors");
+    }
+    if (!builder_reports_its_errors()) {
+      return fail("builder diagnostics");
+    }
+    if (!context_reports_pipeline_errors()) {
+      return fail("context diagnostics");
+    }
+    MtlcModule *m = build_ergonomics_module();
+    if (!m) {
+      return fail("ergonomics module construction");
+    }
+    if (!mtlc_optimize(ctx, m)) {
+      return fail("mtlc_optimize (ergonomics)");
+    }
+    char *exe = path_join(outdir, "pubapi_ergonomics.exe");
+    if (!mtlc_build_executable(ctx, m, exe)) {
+      return fail("mtlc_build_executable (ergonomics)");
+    }
+    printf("ergonomics: %s\n", exe);
+    free(exe);
     mtlc_module_destroy(m);
   }
 

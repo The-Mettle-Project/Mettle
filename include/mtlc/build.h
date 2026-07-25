@@ -4,7 +4,7 @@
  * libmtlc IR without touching the backend's internal headers. You describe
  * functions and an imperative instruction stream through opaque handles; the
  * builder produces an MtlcModule (see mtlc/module.h) ready for the pipeline
- * (mtlc_optimize -> mtlc_emit_object -> mtlc_link_executable in mtlc/pipeline.h).
+ * (mtlc_optimize -> mtlc_emit_object -> mtlc_build_executable in mtlc/pipeline.h).
  *
  * The model mirrors the backend IR: values are SSA-like temporaries or named
  * locals/parameters, referenced by opaque MtlcValue handles; control flow is
@@ -22,6 +22,7 @@
 #ifndef MTLC_BUILD_H
 #define MTLC_BUILD_H
 
+#include "diag.h"
 #include "intrinsic.h"
 #include "module.h"
 #include "tensor.h"
@@ -117,17 +118,55 @@ typedef struct {
 MtlcBuilder *mtlc_builder_create(void);
 void mtlc_builder_destroy(MtlcBuilder *builder);
 
+/* ---- diagnostics ---- */
+
+/* Report every IR-construction diagnostic to `handler` as it happens. Without
+ * one the builder stays silent and only records the first error for
+ * mtlc_builder_error below; a handler is what tells you WHICH call failed,
+ * while the offending frontend code is still on the stack. `user_data` is
+ * passed back unchanged and is neither copied nor freed. */
+void mtlc_builder_set_diagnostic_handler(MtlcBuilder *builder,
+                                         MtlcDiagHandler handler,
+                                         void *user_data);
+
+/* Non-zero while no builder call has failed. Once a call fails the builder
+ * latches the error, every later call is a no-op, and mtlc_builder_finish
+ * returns NULL -- so a frontend can emit a whole function without checking
+ * each call and test once at the end. */
+int mtlc_builder_ok(const MtlcBuilder *builder);
+
+/* The first error recorded on this builder, or NULL if none has been. The
+ * string belongs to the builder and dies with it, so copy it if you need it
+ * after mtlc_builder_finish (which consumes the builder on both paths). */
+const char *mtlc_builder_error(const MtlcBuilder *builder);
+
+/* mtlc_builder_ok for the builder that owns `fn`: the convenient form while
+ * emitting a body, when the builder handle is not at hand. Returns 0 for a
+ * NULL fn. */
+int mtlc_fn_ok(const MtlcFn *fn);
+
 /* Declare a function. `return_type` may be mtlc_type_scalar(MTLC_TYPE_VOID).
  * `param_names`/`param_types` each hold `param_count` entries (pass NULL/NULL/0
  * for no parameters). `is_extern` != 0 declares a body-less external symbol
  * (return value is NULL; do not emit a body into it). Otherwise returns a
  * function builder to emit the body into. The first non-extern function named
- * "main" is treated as the program entry point by mtlc_link_executable. */
+ * "main" is treated as the program entry point by mtlc_build_executable. */
 MtlcFn *mtlc_builder_function(MtlcBuilder *builder, const char *name,
                              const MtlcType *return_type,
                              const char *const *param_names,
                              const MtlcType *const *param_types,
                              size_t param_count, int is_extern);
+
+/* Declare a body-less external function -- a symbol resolved at link time,
+ * such as a C runtime routine. This is mtlc_builder_function's is_extern form
+ * with an unambiguous result: it returns 1 on success and 0 on failure, where
+ * the general entry point returns NULL for both. `param_names` may be NULL
+ * when the names do not matter, which for an extern they usually do not. */
+int mtlc_builder_declare_function(MtlcBuilder *builder, const char *name,
+                                  const MtlcType *return_type,
+                                  const char *const *param_names,
+                                  const MtlcType *const *param_types,
+                                  size_t param_count);
 
 /* Define a GPU entry-point function. Kernel entry points always return void
  * and accept only POD scalar parameters or pointers to POD scalars. Unlike an
@@ -188,13 +227,57 @@ MtlcValue mtlc_global_ref(MtlcFn *fn, const char *name);
 /* Store `value` into the storage `dest` refers to (a local or a parameter). */
 void mtlc_assign(MtlcFn *fn, MtlcValue dest, MtlcValue value);
 
-/* A binary op. `op` is one of: "+", "-", "*", "/", "%", "==", "!=", "<", "<=",
- * ">", ">=", "&&", "||", "&", "|", "^", "<<", ">>". `result_type` is the type
- * of the result (baked onto the instruction so codegen never re-derives it). */
+/* The operators the IR understands. Prefer these over the string spellings
+ * below: an unknown enumerator will not compile, whereas a mistyped string is
+ * only caught when the builder rejects it at emission. */
+typedef enum {
+  MTLC_BINOP_ADD,          /* "+"  */
+  MTLC_BINOP_SUB,          /* "-"  */
+  MTLC_BINOP_MUL,          /* "*"  */
+  MTLC_BINOP_DIV,          /* "/"  */
+  MTLC_BINOP_REM,          /* "%"  */
+  MTLC_BINOP_EQ,           /* "==" */
+  MTLC_BINOP_NE,           /* "!=" */
+  MTLC_BINOP_LT,           /* "<"  */
+  MTLC_BINOP_LE,           /* "<=" */
+  MTLC_BINOP_GT,           /* ">"  */
+  MTLC_BINOP_GE,           /* ">=" */
+  MTLC_BINOP_LOGICAL_AND,  /* "&&" */
+  MTLC_BINOP_LOGICAL_OR,   /* "||" */
+  MTLC_BINOP_BIT_AND,      /* "&"  */
+  MTLC_BINOP_BIT_OR,       /* "|"  */
+  MTLC_BINOP_BIT_XOR,      /* "^"  */
+  MTLC_BINOP_SHL,          /* "<<" */
+  MTLC_BINOP_SHR           /* ">>" */
+} MtlcBinaryOp;
+
+typedef enum {
+  MTLC_UNOP_NEGATE,       /* "-" */
+  MTLC_UNOP_LOGICAL_NOT,  /* "!" */
+  MTLC_UNOP_BITWISE_NOT   /* "~" */
+} MtlcUnaryOp;
+
+/* The canonical string spelling of an operator, or NULL if the enumerator is
+ * out of range. Useful for a frontend that prints IR alongside building it. */
+const char *mtlc_binary_op_name(MtlcBinaryOp op);
+const char *mtlc_unary_op_name(MtlcUnaryOp op);
+
+/* A binary op. `result_type` is the type of the result (baked onto the
+ * instruction so codegen never re-derives it). */
+MtlcValue mtlc_binary_op(MtlcFn *fn, MtlcBinaryOp op, MtlcValue lhs,
+                         MtlcValue rhs, const MtlcType *result_type);
+
+/* A unary op, likewise. */
+MtlcValue mtlc_unary_op(MtlcFn *fn, MtlcUnaryOp op, MtlcValue operand,
+                        const MtlcType *result_type);
+
+/* The string forms, kept for frontends that already carry operator text. `op`
+ * is one of: "+", "-", "*", "/", "%", "==", "!=", "<", "<=", ">", ">=", "&&",
+ * "||", "&", "|", "^", "<<", ">>" for binary, and "-", "!", "~" for unary.
+ * Anything else fails the builder with a diagnostic naming the operator rather
+ * than emitting an instruction no backend can lower. */
 MtlcValue mtlc_binary(MtlcFn *fn, const char *op, MtlcValue lhs, MtlcValue rhs,
                      const MtlcType *result_type);
-
-/* A unary op: "-" (negate), "!" (logical not), "~" (bitwise not). */
 MtlcValue mtlc_unary(MtlcFn *fn, const char *op, MtlcValue operand,
                     const MtlcType *result_type);
 
@@ -366,20 +449,84 @@ MtlcValue mtlc_load(MtlcFn *fn, MtlcValue address, const MtlcType *elem_type);
 void mtlc_store(MtlcFn *fn, MtlcValue address, MtlcValue value,
                const MtlcType *elem_type);
 
+/* ---- indexing ---- */
+
+/* Address of element `index` of the array `base` points at, i.e. `&base[index]`.
+ * `pointer_type` is the type of `base` -- an mtlc_type_pointer (or
+ * mtlc_type_pointer_in) whose element type supplies the stride, and whose
+ * address space the result keeps. The builder emits the scaling, so a frontend
+ * never converts an element index into a byte offset itself. `index` is a
+ * pointer-width integer value. Returns MTLC_NO_VALUE if `pointer_type` is not
+ * a pointer. */
+MtlcValue mtlc_element_address(MtlcFn *fn, MtlcValue base,
+                               const MtlcType *pointer_type, MtlcValue index);
+
+/* `base[index]` and `base[index] = value`: mtlc_element_address followed by a
+ * load or store of the pointer's element type. */
+MtlcValue mtlc_load_element(MtlcFn *fn, MtlcValue base,
+                            const MtlcType *pointer_type, MtlcValue index);
+void mtlc_store_element(MtlcFn *fn, MtlcValue base,
+                        const MtlcType *pointer_type, MtlcValue index,
+                        MtlcValue value);
+
+/* Address of field `field_index` of the struct `base` points at, i.e.
+ * `&base->field`. `struct_pointer_type` is the type of `base`: a pointer to an
+ * mtlc_type_struct. The offset comes from that struct's computed layout, and
+ * the result is a pointer to the field's own type in the same address space.
+ * Returns MTLC_NO_VALUE if the type is not a pointer to a struct or the index
+ * is out of range. */
+MtlcValue mtlc_field_address(MtlcFn *fn, MtlcValue base,
+                             const MtlcType *struct_pointer_type,
+                             size_t field_index);
+
+/* `base->field` and `base->field = value`, for a field of scalar or pointer
+ * type. */
+MtlcValue mtlc_load_field(MtlcFn *fn, MtlcValue base,
+                          const MtlcType *struct_pointer_type,
+                          size_t field_index);
+void mtlc_store_field(MtlcFn *fn, MtlcValue base,
+                      const MtlcType *struct_pointer_type, size_t field_index,
+                      MtlcValue value);
+
 /* ---- control flow ---- */
 
-/* Define a label at the current position. */
-void mtlc_label(MtlcFn *fn, const char *label);
+/* An opaque handle to a label within one function builder, allocated by
+ * mtlc_label_new. Labels do not cross function boundaries. */
+typedef int MtlcLabel;
+#define MTLC_NO_LABEL (-1)
+
+/* Allocate a label with a name unique within the module. `hint` is an optional
+ * readability tag ("else", "loop_top") that appears in the generated name and
+ * in diagnostics; pass NULL for none. This is the alternative to composing
+ * unique label strings in the frontend, which is where duplicate and misspelled
+ * labels come from. Returns MTLC_NO_LABEL on error. */
+MtlcLabel mtlc_label_new(MtlcFn *fn, const char *hint);
+
+/* Place `label` at the current position. Placing a label twice, or branching to
+ * one never placed by the time the module is finished, fails the builder with a
+ * diagnostic that names the label. */
+void mtlc_label_here(MtlcFn *fn, MtlcLabel label);
 /* Unconditional branch to `label`. */
-void mtlc_jump(MtlcFn *fn, const char *label);
+void mtlc_jump_to(MtlcFn *fn, MtlcLabel label);
 /* Branch to `label` when `cond` is zero; fall through otherwise. */
+void mtlc_branch_if_zero_to(MtlcFn *fn, MtlcValue cond, MtlcLabel label);
+
+/* The string forms, for frontends that name their own labels. Uniqueness is
+ * the caller's problem, but a branch to a label that is never defined is still
+ * caught at mtlc_builder_finish. */
+void mtlc_label(MtlcFn *fn, const char *label);
+void mtlc_jump(MtlcFn *fn, const char *label);
 void mtlc_branch_if_zero(MtlcFn *fn, MtlcValue cond, const char *label);
+
 /* Return `value` (or MTLC_NO_VALUE for a void return). */
 void mtlc_return(MtlcFn *fn, MtlcValue value);
 
-/* Finish building: populate the module's type registry and symbol table and
- * return the module. The builder is consumed and must not be used afterwards
- * (do not also call mtlc_builder_destroy). Returns NULL on error. */
+/* Finish building: verify that every branch target is defined, populate the
+ * module's type registry and symbol table, and return the module. The builder
+ * is consumed either way and must not be used afterwards (do not also call
+ * mtlc_builder_destroy). Returns NULL on error -- including an error latched
+ * earlier -- so install a diagnostic handler if you want to know which call
+ * was at fault, since the builder's own message dies with it here. */
 MtlcModule *mtlc_builder_finish(MtlcBuilder *builder);
 
 #ifdef __cplusplus

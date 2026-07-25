@@ -16,6 +16,7 @@
 #define MTLC_H
 
 #include "context.h"
+#include "diag.h"
 #include "intrinsic.h"
 #include "memory.h"
 #include "tensor.h"

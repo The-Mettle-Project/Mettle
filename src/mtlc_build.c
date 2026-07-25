@@ -13,6 +13,7 @@
 #include "common.h"
 #include "ir/ir.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +40,11 @@ struct MtlcFn {
   size_t param_count;
   IROperand *values;   /* value-handle table; each owns its operand */
   size_t value_count, value_capacity;
+  /* Labels allocated by mtlc_label_new, so a double placement is caught here
+   * and an unplaced-but-branched-to label is caught at finish. */
+  char **labels;
+  unsigned char *label_placed;
+  size_t label_count, label_capacity;
 };
 
 /* A module-level global variable declaration. */
@@ -63,8 +69,40 @@ struct MtlcBuilder {
   const MtlcType **seen_types;
   size_t seen_count, seen_capacity;
   int temp_counter;
+  int label_counter;
   int error;
+  char error_message[512];
+  MtlcDiagHandler diag_handler;
+  void *diag_user_data;
 };
+
+/* Latch the first construction error and report it. Errors are sticky: once
+ * one lands every later builder call is a no-op, so a frontend can emit a whole
+ * function and test once, and the message still names the call that broke. */
+static void builder_fail_impl(MtlcBuilder *b, const char *api,
+                              const char *format, ...) {
+  char detail[384];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(detail, sizeof(detail), format, args);
+  va_end(args);
+
+  char message[512];
+  snprintf(message, sizeof(message), "%s: %s", api ? api : "mtlc_builder",
+           detail);
+  if (!b) {
+    return;
+  }
+  if (!b->error) {
+    b->error = 1;
+    snprintf(b->error_message, sizeof(b->error_message), "%s", message);
+  }
+  if (b->diag_handler) {
+    b->diag_handler(b->diag_user_data, MTLC_DIAG_ERROR, message);
+  }
+}
+
+#define BUILDER_FAIL(b, ...) builder_fail_impl((b), __func__, __VA_ARGS__)
 
 /* The parseable NAME of a type: its canonical name when set (scalars carry
  * "int64", interned pointers carry "int64*"), else the kind name. */
@@ -89,7 +127,7 @@ static void record_type(MtlcBuilder *b, const MtlcType *t) {
     const MtlcType **grown =
         realloc(b->seen_types, next * sizeof(*b->seen_types));
     if (!grown) {
-      b->error = 1;
+      BUILDER_FAIL(b, "invalid argument or allocation failure");
       return;
     }
     b->seen_types = grown;
@@ -125,6 +163,11 @@ static void fn_destroy(MtlcFn *fn) {
     ir_operand_destroy(&fn->values[i]);
   }
   free(fn->values);
+  for (size_t i = 0; i < fn->label_count; i++) {
+    free(fn->labels[i]);
+  }
+  free(fn->labels);
+  free(fn->label_placed);
   free(fn);
 }
 
@@ -156,12 +199,37 @@ void mtlc_builder_destroy(MtlcBuilder *builder) {
   free(builder);
 }
 
+void mtlc_builder_set_diagnostic_handler(MtlcBuilder *builder,
+                                         MtlcDiagHandler handler,
+                                         void *user_data) {
+  if (builder) {
+    builder->diag_handler = handler;
+    builder->diag_user_data = user_data;
+  }
+}
+
+int mtlc_builder_ok(const MtlcBuilder *builder) {
+  return builder && !builder->error;
+}
+
+const char *mtlc_builder_error(const MtlcBuilder *builder) {
+  if (!builder || !builder->error) {
+    return NULL;
+  }
+  return builder->error_message[0] ? builder->error_message
+                                   : "mtlc_builder: construction failed";
+}
+
+int mtlc_fn_ok(const MtlcFn *fn) {
+  return fn && fn->builder && !fn->builder->error;
+}
+
 void mtlc_builder_global(MtlcBuilder *builder, const char *name,
                         const MtlcType *type, long long init_value,
                         int is_extern) {
   if (!builder || builder->error || !name || !type) {
     if (builder) {
-      builder->error = 1;
+      BUILDER_FAIL(builder, "invalid argument or allocation failure");
     }
     return;
   }
@@ -169,7 +237,7 @@ void mtlc_builder_global(MtlcBuilder *builder, const char *name,
     size_t next = builder->global_capacity ? builder->global_capacity * 2 : 8;
     GlobalDecl *grown = realloc(builder->globals, next * sizeof(GlobalDecl));
     if (!grown) {
-      builder->error = 1;
+      BUILDER_FAIL(builder, "invalid argument or allocation failure");
       return;
     }
     builder->globals = grown;
@@ -206,12 +274,12 @@ static MtlcFn *builder_function_impl(MtlcBuilder *builder, const char *name,
   }
   if (is_kernel) {
     if (is_extern || return_type->kind != MTLC_TYPE_VOID) {
-      builder->error = 1;
+      BUILDER_FAIL(builder, "invalid argument or allocation failure");
       return NULL;
     }
     for (size_t i = 0; i < param_count; i++) {
       if (!param_types || !kernel_parameter_type(param_types[i])) {
-        builder->error = 1;
+        BUILDER_FAIL(builder, "invalid argument or allocation failure");
         return NULL;
       }
     }
@@ -222,7 +290,7 @@ static MtlcFn *builder_function_impl(MtlcBuilder *builder, const char *name,
     size_t next = builder->decl_capacity ? builder->decl_capacity * 2 : 8;
     FnDecl *grown = realloc(builder->decls, next * sizeof(FnDecl));
     if (!grown) {
-      builder->error = 1;
+      BUILDER_FAIL(builder, "invalid argument or allocation failure");
       return NULL;
     }
     builder->decls = grown;
@@ -255,7 +323,7 @@ static MtlcFn *builder_function_impl(MtlcBuilder *builder, const char *name,
    * the type registry at codegen time) */
   IRFunction *irf = ir_function_create(name);
   if (!irf) {
-    builder->error = 1;
+    BUILDER_FAIL(builder, "invalid argument or allocation failure");
     return NULL;
   }
   if (param_count > 0) {
@@ -275,13 +343,13 @@ static MtlcFn *builder_function_impl(MtlcBuilder *builder, const char *name,
   record_type(builder, return_type);
   if (!ir_program_add_function(builder->program, irf)) {
     ir_function_destroy(irf);
-    builder->error = 1;
+    BUILDER_FAIL(builder, "invalid argument or allocation failure");
     return NULL;
   }
 
   MtlcFn *fn = calloc(1, sizeof(MtlcFn));
   if (!fn) {
-    builder->error = 1;
+    BUILDER_FAIL(builder, "invalid argument or allocation failure");
     return NULL;
   }
   fn->ir = irf;
@@ -296,7 +364,7 @@ static MtlcFn *builder_function_impl(MtlcBuilder *builder, const char *name,
     MtlcFn **grown = realloc(builder->fns, next * sizeof(MtlcFn *));
     if (!grown) {
       fn_destroy(fn);
-      builder->error = 1;
+      BUILDER_FAIL(builder, "invalid argument or allocation failure");
       return NULL;
     }
     builder->fns = grown;
@@ -313,6 +381,22 @@ MtlcFn *mtlc_builder_function(MtlcBuilder *builder, const char *name,
                               size_t param_count, int is_extern) {
   return builder_function_impl(builder, name, return_type, param_names,
                                param_types, param_count, is_extern, 0);
+}
+
+int mtlc_builder_declare_function(MtlcBuilder *builder, const char *name,
+                                  const MtlcType *return_type,
+                                  const char *const *param_names,
+                                  const MtlcType *const *param_types,
+                                  size_t param_count) {
+  if (!builder) {
+    return 0;
+  }
+  int was_ok = !builder->error;
+  builder_function_impl(builder, name, return_type, param_names, param_types,
+                        param_count, /*is_extern=*/1, /*is_kernel=*/0);
+  /* An extern declaration has no body builder, so NULL is its success value
+   * too; the error latch is what actually distinguishes the two. */
+  return was_ok && !builder->error;
 }
 
 MtlcFn *mtlc_builder_kernel(MtlcBuilder *builder, const char *name,
@@ -350,7 +434,7 @@ static MtlcValue push_value(MtlcFn *fn, IROperand op) {
     IROperand *grown = realloc(fn->values, next * sizeof(IROperand));
     if (!grown) {
       ir_operand_destroy(&op);
-      fn->builder->error = 1;
+      BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
       return MTLC_NO_VALUE;
     }
     fn->values = grown;
@@ -376,7 +460,7 @@ static void emit(MtlcFn *fn, const IRInstruction *inst) {
     return;
   }
   if (!ir_function_append_instruction(fn->ir, inst)) {
-    fn->builder->error = 1;
+    BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
   }
 }
 
@@ -389,7 +473,7 @@ static MtlcValue fresh_temp(MtlcFn *fn) {
 MtlcValue mtlc_fn_param(MtlcFn *fn, size_t index) {
   if (!fn || index >= fn->param_count) {
     if (fn) {
-      fn->builder->error = 1;
+      BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     }
     return MTLC_NO_VALUE;
   }
@@ -411,7 +495,7 @@ MtlcValue mtlc_const_int(MtlcFn *fn, const MtlcType *type, long long value) {
 MtlcValue mtlc_local(MtlcFn *fn, const char *name, const MtlcType *type) {
   if (!fn || !name || !type) {
     if (fn) {
-      fn->builder->error = 1;
+      BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     }
     return MTLC_NO_VALUE;
   }
@@ -434,7 +518,7 @@ MtlcValue mtlc_local(MtlcFn *fn, const char *name, const MtlcType *type) {
 MtlcValue mtlc_global_ref(MtlcFn *fn, const char *name) {
   if (!fn || !name) {
     if (fn) {
-      fn->builder->error = 1;
+      BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     }
     return MTLC_NO_VALUE;
   }
@@ -451,7 +535,7 @@ MtlcValue mtlc_global_ref(MtlcFn *fn, const char *name) {
 MtlcValue mtlc_const_float(MtlcFn *fn, const MtlcType *type, double value) {
   if (!fn || !type) {
     if (fn) {
-      fn->builder->error = 1;
+      BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     }
     return MTLC_NO_VALUE;
   }
@@ -468,7 +552,7 @@ void mtlc_assign(MtlcFn *fn, MtlcValue dest, MtlcValue value) {
   const IROperand *d = value_operand(fn, dest);
   const IROperand *v = value_operand(fn, value);
   if (!d || !v) {
-    fn->builder->error = 1;
+    BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return;
   }
   IRInstruction inst = {0};
@@ -478,18 +562,106 @@ void mtlc_assign(MtlcFn *fn, MtlcValue dest, MtlcValue value) {
   emit(fn, &inst);
 }
 
+const char *mtlc_binary_op_name(MtlcBinaryOp op) {
+  switch (op) {
+  case MTLC_BINOP_ADD: return "+";
+  case MTLC_BINOP_SUB: return "-";
+  case MTLC_BINOP_MUL: return "*";
+  case MTLC_BINOP_DIV: return "/";
+  case MTLC_BINOP_REM: return "%";
+  case MTLC_BINOP_EQ: return "==";
+  case MTLC_BINOP_NE: return "!=";
+  case MTLC_BINOP_LT: return "<";
+  case MTLC_BINOP_LE: return "<=";
+  case MTLC_BINOP_GT: return ">";
+  case MTLC_BINOP_GE: return ">=";
+  case MTLC_BINOP_LOGICAL_AND: return "&&";
+  case MTLC_BINOP_LOGICAL_OR: return "||";
+  case MTLC_BINOP_BIT_AND: return "&";
+  case MTLC_BINOP_BIT_OR: return "|";
+  case MTLC_BINOP_BIT_XOR: return "^";
+  case MTLC_BINOP_SHL: return "<<";
+  case MTLC_BINOP_SHR: return ">>";
+  }
+  return NULL;
+}
+
+const char *mtlc_unary_op_name(MtlcUnaryOp op) {
+  switch (op) {
+  case MTLC_UNOP_NEGATE: return "-";
+  case MTLC_UNOP_LOGICAL_NOT: return "!";
+  case MTLC_UNOP_BITWISE_NOT: return "~";
+  }
+  return NULL;
+}
+
+/* The instruction text must outlive the call, and ir_function_append_instruction
+ * copies it -- but only the canonical spellings below are ever accepted, so the
+ * pointer handed to the IR is always a string literal either way. */
+static const char *canonical_binary_op(const char *op) {
+  static const char *const ops[] = {"+",  "-",  "*",  "/",  "%",  "==", "!=",
+                                    "<",  "<=", ">",  ">=", "&&", "||", "&",
+                                    "|",  "^",  "<<", ">>"};
+  for (size_t i = 0; i < sizeof(ops) / sizeof(ops[0]); i++) {
+    if (strcmp(op, ops[i]) == 0) {
+      return ops[i];
+    }
+  }
+  return NULL;
+}
+
+static const char *canonical_unary_op(const char *op) {
+  static const char *const ops[] = {"-", "!", "~"};
+  for (size_t i = 0; i < sizeof(ops) / sizeof(ops[0]); i++) {
+    if (strcmp(op, ops[i]) == 0) {
+      return ops[i];
+    }
+  }
+  return NULL;
+}
+
+MtlcValue mtlc_binary_op(MtlcFn *fn, MtlcBinaryOp op, MtlcValue lhs,
+                         MtlcValue rhs, const MtlcType *result_type) {
+  const char *text = mtlc_binary_op_name(op);
+  if (!text) {
+    if (fn) {
+      BUILDER_FAIL(fn->builder, "unknown binary operator %d", (int)op);
+    }
+    return MTLC_NO_VALUE;
+  }
+  return mtlc_binary(fn, text, lhs, rhs, result_type);
+}
+
+MtlcValue mtlc_unary_op(MtlcFn *fn, MtlcUnaryOp op, MtlcValue operand,
+                        const MtlcType *result_type) {
+  const char *text = mtlc_unary_op_name(op);
+  if (!text) {
+    if (fn) {
+      BUILDER_FAIL(fn->builder, "unknown unary operator %d", (int)op);
+    }
+    return MTLC_NO_VALUE;
+  }
+  return mtlc_unary(fn, text, operand, result_type);
+}
+
 MtlcValue mtlc_binary(MtlcFn *fn, const char *op, MtlcValue lhs, MtlcValue rhs,
                      const MtlcType *result_type) {
   if (!fn || !op || !result_type) {
     if (fn) {
-      fn->builder->error = 1;
+      BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     }
+    return MTLC_NO_VALUE;
+  }
+  const char *requested = op;
+  op = canonical_binary_op(op);
+  if (!op) {
+    BUILDER_FAIL(fn->builder, "'%s' is not a binary operator", requested);
     return MTLC_NO_VALUE;
   }
   const IROperand *l = value_operand(fn, lhs);
   const IROperand *r = value_operand(fn, rhs);
   if (!l || !r) {
-    fn->builder->error = 1;
+    BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return MTLC_NO_VALUE;
   }
   record_type(fn->builder, result_type);
@@ -528,13 +700,19 @@ MtlcValue mtlc_unary(MtlcFn *fn, const char *op, MtlcValue operand,
                     const MtlcType *result_type) {
   if (!fn || !op || !result_type) {
     if (fn) {
-      fn->builder->error = 1;
+      BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     }
+    return MTLC_NO_VALUE;
+  }
+  const char *requested = op;
+  op = canonical_unary_op(op);
+  if (!op) {
+    BUILDER_FAIL(fn->builder, "'%s' is not a unary operator", requested);
     return MTLC_NO_VALUE;
   }
   const IROperand *o = value_operand(fn, operand);
   if (!o) {
-    fn->builder->error = 1;
+    BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return MTLC_NO_VALUE;
   }
   IROperand oc = *o;
@@ -564,7 +742,7 @@ MtlcValue mtlc_call(MtlcFn *fn, const char *callee, const MtlcValue *args,
                    size_t arg_count, const MtlcType *return_type) {
   if (!fn || !callee || !return_type) {
     if (fn) {
-      fn->builder->error = 1;
+      BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     }
     return MTLC_NO_VALUE;
   }
@@ -572,14 +750,14 @@ MtlcValue mtlc_call(MtlcFn *fn, const char *callee, const MtlcValue *args,
   if (arg_count > 0) {
     argv = calloc(arg_count, sizeof(IROperand));
     if (!argv) {
-      fn->builder->error = 1;
+      BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
       return MTLC_NO_VALUE;
     }
     for (size_t i = 0; i < arg_count; i++) {
       const IROperand *a = value_operand(fn, args[i]);
       if (!a) {
         free(argv);
-        fn->builder->error = 1;
+        BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
         return MTLC_NO_VALUE;
       }
       argv[i] = *a; /* shallow alias; append clones */
@@ -620,14 +798,14 @@ MtlcValue mtlc_address_space_alloc(MtlcFn *fn, const char *name,
       !fn->ir->is_kernel ||
       (address_space != MTLC_ADDRESS_SPACE_WORKGROUP &&
        address_space != MTLC_ADDRESS_SPACE_PRIVATE)) {
-    if (fn) fn->builder->error = 1;
+    if (fn) BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return MTLC_NO_VALUE;
   }
   const MtlcType *pointer_type =
       mtlc_type_pointer_in(element_type, address_space);
   if (!pointer_type || mtlc_type_size(element_type) == 0 ||
       count > SIZE_MAX / mtlc_type_size(element_type)) {
-    fn->builder->error = 1;
+    BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return MTLC_NO_VALUE;
   }
   record_type(fn->builder, element_type);
@@ -650,13 +828,13 @@ MtlcValue mtlc_dynamic_workgroup_view(MtlcFn *fn, const char *name,
                                       const MtlcType *element_type) {
   if (!fn || !fn->ir || !fn->ir->is_kernel || !name || !element_type ||
       mtlc_type_size(element_type) == 0) {
-    if (fn) fn->builder->error = 1;
+    if (fn) BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return MTLC_NO_VALUE;
   }
   const MtlcType *pointer_type =
       mtlc_type_pointer_in(element_type, MTLC_ADDRESS_SPACE_WORKGROUP);
   if (!pointer_type) {
-    fn->builder->error = 1;
+    BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return MTLC_NO_VALUE;
   }
   record_type(fn->builder, element_type);
@@ -687,7 +865,7 @@ MtlcValue mtlc_intrinsic(MtlcFn *fn, MtlcIntrinsic intrinsic,
       (ir_intrinsic_is_subgroup(intrinsic) &&
        return_type->kind != ir_intrinsic_subgroup_result_kind(intrinsic))) {
     if (fn) {
-      fn->builder->error = 1;
+      BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     }
     return MTLC_NO_VALUE;
   }
@@ -723,7 +901,7 @@ MtlcValue mtlc_intrinsic_memory(MtlcFn *fn, MtlcIntrinsic intrinsic,
       (address_space == MTLC_ADDRESS_SPACE_WORKGROUP &&
        scope > MTLC_MEMORY_SCOPE_WORKGROUP)) {
     if (fn) {
-      fn->builder->error = 1;
+      BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     }
     return MTLC_NO_VALUE;
   }
@@ -733,7 +911,7 @@ MtlcValue mtlc_intrinsic_memory(MtlcFn *fn, MtlcIntrinsic intrinsic,
   }
   instruction = &fn->ir->instructions[fn->ir->instruction_count - 1];
   if (instruction->op != IR_OP_CALL || instruction->intrinsic != intrinsic) {
-    fn->builder->error = 1;
+    BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return MTLC_NO_VALUE;
   }
   instruction->address_space = address_space;
@@ -785,7 +963,7 @@ MtlcValue mtlc_atomic_compare_exchange(
       scope > MTLC_MEMORY_SCOPE_SYSTEM ||
       (address_space == MTLC_ADDRESS_SPACE_WORKGROUP &&
        scope > MTLC_MEMORY_SCOPE_WORKGROUP)) {
-    if (fn) fn->builder->error = 1;
+    if (fn) BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return MTLC_NO_VALUE;
   }
   result = mtlc_intrinsic(fn, intrinsic, args, 4, return_type);
@@ -793,7 +971,7 @@ MtlcValue mtlc_atomic_compare_exchange(
     return MTLC_NO_VALUE;
   instruction = &fn->ir->instructions[fn->ir->instruction_count - 1];
   if (instruction->op != IR_OP_CALL || instruction->intrinsic != intrinsic) {
-    fn->builder->error = 1;
+    BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return MTLC_NO_VALUE;
   }
   instruction->address_space = address_space;
@@ -811,7 +989,7 @@ void mtlc_workgroup_barrier(MtlcFn *fn, MtlcMemoryOrder order,
       order < MTLC_MEMORY_ORDER_ACQUIRE ||
       order > MTLC_MEMORY_ORDER_SEQ_CST || memory_regions == 0 ||
       (memory_regions & ~supported) != 0) {
-    if (fn) fn->builder->error = 1;
+    if (fn) BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return;
   }
   IRInstruction instruction = {0};
@@ -854,7 +1032,7 @@ void mtlc_async_copy_workgroup(MtlcFn *fn, MtlcValue destination,
        cache != MTLC_ASYNC_CACHE_GLOBAL) ||
       (cache == MTLC_ASYNC_CACHE_GLOBAL &&
        transaction_bytes != 16)) {
-    if (fn) fn->builder->error = 1;
+    if (fn) BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return;
   }
   const IROperand *destination_operand = value_operand(fn, destination);
@@ -865,7 +1043,7 @@ void mtlc_async_copy_workgroup(MtlcFn *fn, MtlcValue destination,
       mtlc_type_pointer_in(element_type, MTLC_ADDRESS_SPACE_GLOBAL);
   if (!destination_operand || !source_operand || !destination_type ||
       !source_type) {
-    fn->builder->error = 1;
+    BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return;
   }
   record_type(fn->builder, element_type);
@@ -887,7 +1065,7 @@ void mtlc_async_copy_workgroup(MtlcFn *fn, MtlcValue destination,
 
 void mtlc_async_copy_commit(MtlcFn *fn) {
   if (!fn || !fn->ir || !fn->ir->is_kernel) {
-    if (fn) fn->builder->error = 1;
+    if (fn) BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return;
   }
   IRInstruction instruction = {0};
@@ -897,7 +1075,7 @@ void mtlc_async_copy_commit(MtlcFn *fn) {
 
 void mtlc_async_copy_wait(MtlcFn *fn, uint32_t pending_groups) {
   if (!fn || !fn->ir || !fn->ir->is_kernel || pending_groups > 7) {
-    if (fn) fn->builder->error = 1;
+    if (fn) BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return;
   }
   IRInstruction instruction = {0};
@@ -928,7 +1106,7 @@ void mtlc_tensor_transfer_workgroup(
   if (!fn || !fn->ir || !fn->ir->is_kernel || !operands || !count ||
       storage_kind == MTLC_TYPE_VOID || !element_type || !global_type ||
       !workgroup_type || !view_type || !coordinate_type) {
-    if (fn) fn->builder->error = 1;
+    if (fn) BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return;
   }
   arguments = calloc(count, sizeof(*arguments));
@@ -936,7 +1114,7 @@ void mtlc_tensor_transfer_workgroup(
   if (!arguments || !argument_types) {
     free(arguments);
     free(argument_types);
-    fn->builder->error = 1;
+    BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return;
   }
   handles[at++] = operands->destination;
@@ -947,7 +1125,7 @@ void mtlc_tensor_transfer_workgroup(
   if (at != count) {
     free(arguments);
     free(argument_types);
-    fn->builder->error = 1;
+    BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return;
   }
   for (size_t i = 0; i < count; i++) {
@@ -955,7 +1133,7 @@ void mtlc_tensor_transfer_workgroup(
     if (!operand) {
       free(arguments);
       free(argument_types);
-      fn->builder->error = 1;
+      BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
       return;
     }
     arguments[i] = *operand;
@@ -1049,7 +1227,7 @@ void mtlc_tensor_mma_chain(MtlcFn *fn, const MtlcTensorMmaDesc *desc,
          (desc->d_leading_dimension == 0)) ||
         (desc->c_leading_dimension != 0 &&
          desc->c_leading_dimension != desc->d_leading_dimension)))) {
-    if (fn) fn->builder->error = 1;
+    if (fn) BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return;
   }
   if (tile_count > 1) {
@@ -1064,7 +1242,7 @@ void mtlc_tensor_mma_chain(MtlcFn *fn, const MtlcTensorMmaDesc *desc,
             (tile > 0 &&
              !mtlc_values_same(fn, tiles[tile].c_leading_dimension,
                                output_stride))))) {
-        fn->builder->error = 1;
+        BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
         return;
       }
     }
@@ -1072,7 +1250,7 @@ void mtlc_tensor_mma_chain(MtlcFn *fn, const MtlcTensorMmaDesc *desc,
   size_t total = per_tile * tile_count;
   IROperand *arguments = calloc(total, sizeof(*arguments));
   if (!arguments) {
-    fn->builder->error = 1;
+    BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return;
   }
   for (size_t tile = 0; tile < tile_count; tile++) {
@@ -1081,14 +1259,14 @@ void mtlc_tensor_mma_chain(MtlcFn *fn, const MtlcTensorMmaDesc *desc,
     if (!mtlc_tensor_mma_handles(desc, &tiles[tile], handles, &count) ||
         count != per_tile) {
       free(arguments);
-      fn->builder->error = 1;
+      BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
       return;
     }
     for (size_t i = 0; i < count; i++) {
       const IROperand *operand = value_operand(fn, handles[i]);
       if (!operand) {
         free(arguments);
-        fn->builder->error = 1;
+        BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
         return;
       }
       arguments[tile * per_tile + i] = *operand;
@@ -1154,7 +1332,7 @@ void mtlc_tensor_matmul(MtlcFn *fn, const MtlcTensorMmaDesc *desc,
       !mtlc_tensor_mma_handles(desc, &operands->matrix, handles,
                                &handle_count) ||
       handle_count != mma_count) {
-    if (fn) fn->builder->error = 1;
+    if (fn) BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return;
   }
   handles[handle_count++] = operands->row_origin;
@@ -1163,19 +1341,19 @@ void mtlc_tensor_matmul(MtlcFn *fn, const MtlcTensorMmaDesc *desc,
   handles[handle_count++] = operands->problem_n;
   handles[handle_count++] = operands->problem_k;
   if (handle_count != total) {
-    fn->builder->error = 1;
+    BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return;
   }
   IROperand *arguments = calloc(total, sizeof(*arguments));
   if (!arguments) {
-    fn->builder->error = 1;
+    BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return;
   }
   for (size_t i = 0; i < total; i++) {
     const IROperand *operand = value_operand(fn, handles[i]);
     if (!operand) {
       free(arguments);
-      fn->builder->error = 1;
+      BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
       return;
     }
     arguments[i] = *operand;
@@ -1220,7 +1398,7 @@ void mtlc_tensor_epilogue(
        (operands && operands->leading_dimension != MTLC_NO_VALUE)) ||
       (needs_bias_stride !=
        (operands && operands->bias_leading_dimension != MTLC_NO_VALUE))) {
-    if (fn) fn->builder->error = 1;
+    if (fn) BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return;
   }
 
@@ -1236,7 +1414,7 @@ void mtlc_tensor_epilogue(
   if (needs_bias_stride)
     handles[count++] = operands->bias_leading_dimension;
   if (count != expected) {
-    fn->builder->error = 1;
+    BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return;
   }
 
@@ -1244,7 +1422,7 @@ void mtlc_tensor_epilogue(
   for (size_t i = 0; i < count; i++) {
     const IROperand *operand = value_operand(fn, handles[i]);
     if (!operand) {
-      fn->builder->error = 1;
+      BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
       return;
     }
     arguments[i] = *operand;
@@ -1270,13 +1448,13 @@ void mtlc_gpu_launch(MtlcFn *fn, MtlcValue kernel_handle, MtlcDim3 grid,
   size_t total = IR_GPU_LAUNCH_CONTROL_ARGS + arg_count;
   if (!fn || fn->ir->is_kernel || (arg_count > 0 && (!args || !arg_types))) {
     if (fn) {
-      fn->builder->error = 1;
+      BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     }
     return;
   }
   handle = value_operand(fn, kernel_handle);
   if (!handle) {
-    fn->builder->error = 1;
+    BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return;
   }
   operands = calloc(total, sizeof(*operands));
@@ -1284,7 +1462,7 @@ void mtlc_gpu_launch(MtlcFn *fn, MtlcValue kernel_handle, MtlcDim3 grid,
   if (!operands || !types) {
     free(operands);
     free(types);
-    fn->builder->error = 1;
+    BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return;
   }
   for (size_t i = 0; i < IR_GPU_LAUNCH_CONTROL_ARGS; i++) {
@@ -1292,7 +1470,7 @@ void mtlc_gpu_launch(MtlcFn *fn, MtlcValue kernel_handle, MtlcDim3 grid,
     if (!value) {
       free(operands);
       free(types);
-      fn->builder->error = 1;
+      BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
       return;
     }
     operands[i] = *value;
@@ -1302,7 +1480,7 @@ void mtlc_gpu_launch(MtlcFn *fn, MtlcValue kernel_handle, MtlcDim3 grid,
     if (!value || !kernel_parameter_type(arg_types[i])) {
       free(operands);
       free(types);
-      fn->builder->error = 1;
+      BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
       return;
     }
     operands[IR_GPU_LAUNCH_CONTROL_ARGS + i] = *value;
@@ -1327,7 +1505,7 @@ void mtlc_gpu_launch(MtlcFn *fn, MtlcValue kernel_handle, MtlcDim3 grid,
 MtlcValue mtlc_function_address(MtlcFn *fn, const char *name) {
   if (!fn || !name) {
     if (fn) {
-      fn->builder->error = 1;
+      BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     }
     return MTLC_NO_VALUE;
   }
@@ -1341,7 +1519,7 @@ MtlcValue mtlc_function_address(MtlcFn *fn, const char *name) {
   inst.dest = *dest;
   inst.lhs = ir_operand_symbol(name);
   if (inst.lhs.kind != IR_OPERAND_SYMBOL) {
-    fn->builder->error = 1;
+    BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return MTLC_NO_VALUE;
   }
   emit(fn, &inst);
@@ -1358,13 +1536,13 @@ MtlcValue mtlc_call_indirect(MtlcFn *fn, MtlcValue callee,
                              const MtlcType *return_type) {
   if (!fn || !return_type) {
     if (fn) {
-      fn->builder->error = 1;
+      BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     }
     return MTLC_NO_VALUE;
   }
   const IROperand *code = value_operand(fn, callee);
   if (!code) {
-    fn->builder->error = 1;
+    BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return MTLC_NO_VALUE;
   }
   IROperand code_copy = *code;
@@ -1372,14 +1550,14 @@ MtlcValue mtlc_call_indirect(MtlcFn *fn, MtlcValue callee,
   if (arg_count > 0) {
     argv = calloc(arg_count, sizeof(IROperand));
     if (!argv) {
-      fn->builder->error = 1;
+      BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
       return MTLC_NO_VALUE;
     }
     for (size_t i = 0; i < arg_count; i++) {
       const IROperand *a = value_operand(fn, args[i]);
       if (!a) {
         free(argv);
-        fn->builder->error = 1;
+        BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
         return MTLC_NO_VALUE;
       }
       argv[i] = *a; /* shallow alias; append clones */
@@ -1409,13 +1587,13 @@ MtlcValue mtlc_call_indirect(MtlcFn *fn, MtlcValue callee,
 MtlcValue mtlc_cast(MtlcFn *fn, MtlcValue value, const MtlcType *type) {
   if (!fn || !type) {
     if (fn) {
-      fn->builder->error = 1;
+      BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     }
     return MTLC_NO_VALUE;
   }
   const IROperand *v = value_operand(fn, value);
   if (!v) {
-    fn->builder->error = 1;
+    BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return MTLC_NO_VALUE;
   }
   record_type(fn->builder, type);
@@ -1449,13 +1627,13 @@ MtlcValue mtlc_address_of(MtlcFn *fn, MtlcValue storage,
                          const MtlcType *pointer_type) {
   if (!fn || !pointer_type) {
     if (fn) {
-      fn->builder->error = 1;
+      BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     }
     return MTLC_NO_VALUE;
   }
   const IROperand *s = value_operand(fn, storage);
   if (!s) {
-    fn->builder->error = 1;
+    BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return MTLC_NO_VALUE;
   }
   record_type(fn->builder, pointer_type);
@@ -1491,13 +1669,13 @@ static void apply_mem_flags(IRInstruction *inst, const MtlcType *elem) {
 MtlcValue mtlc_load(MtlcFn *fn, MtlcValue address, const MtlcType *elem_type) {
   if (!fn || !elem_type) {
     if (fn) {
-      fn->builder->error = 1;
+      BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     }
     return MTLC_NO_VALUE;
   }
   const IROperand *a = value_operand(fn, address);
   if (!a) {
-    fn->builder->error = 1;
+    BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return MTLC_NO_VALUE;
   }
   record_type(fn->builder, elem_type);
@@ -1524,14 +1702,14 @@ void mtlc_store(MtlcFn *fn, MtlcValue address, MtlcValue value,
                const MtlcType *elem_type) {
   if (!fn || !elem_type) {
     if (fn) {
-      fn->builder->error = 1;
+      BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     }
     return;
   }
   const IROperand *a = value_operand(fn, address);
   const IROperand *v = value_operand(fn, value);
   if (!a || !v) {
-    fn->builder->error = 1;
+    BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return;
   }
   record_type(fn->builder, elem_type);
@@ -1543,7 +1721,256 @@ void mtlc_store(MtlcFn *fn, MtlcValue address, MtlcValue value,
   emit(fn, &inst);
 }
 
+/* -------------------------------------------------------------------- indexing */
+
+/* The pointee of a pointer descriptor, or NULL when `t` is not a pointer. */
+static const MtlcType *pointer_element(const MtlcType *t) {
+  if (!t || t->kind != MTLC_TYPE_POINTER || !t->base_type) {
+    return NULL;
+  }
+  return t->base_type;
+}
+
+/* base + byte_offset, typed as the pointer itself so codegen keeps the address
+ * space. A zero offset is folded here rather than left for the optimizer. */
+static MtlcValue offset_pointer(MtlcFn *fn, MtlcValue base,
+                                const MtlcType *pointer_type,
+                                MtlcValue byte_offset) {
+  return mtlc_binary(fn, "+", base, byte_offset, pointer_type);
+}
+
+MtlcValue mtlc_element_address(MtlcFn *fn, MtlcValue base,
+                               const MtlcType *pointer_type, MtlcValue index) {
+  if (!fn) {
+    return MTLC_NO_VALUE;
+  }
+  const MtlcType *element = pointer_element(pointer_type);
+  if (!element) {
+    BUILDER_FAIL(fn->builder, "'%s' is not a pointer type",
+                 pointer_type ? type_name(pointer_type) : "(null)");
+    return MTLC_NO_VALUE;
+  }
+  size_t stride = element->size;
+  if (stride == 0) {
+    BUILDER_FAIL(fn->builder, "element type '%s' has no size",
+                 type_name(element));
+    return MTLC_NO_VALUE;
+  }
+  /* Checked here rather than left to the arithmetic below, which a stride of
+   * one would skip entirely. */
+  if (index == MTLC_NO_VALUE) {
+    BUILDER_FAIL(fn->builder, "the index is not a value");
+    return MTLC_NO_VALUE;
+  }
+  /* IR pointer arithmetic is in bytes; scaling the element index is exactly
+   * the step a frontend should not have to open-code. */
+  const MtlcType *i64 = mtlc_type_scalar(MTLC_TYPE_INT64);
+  MtlcValue byte_offset =
+      (stride == 1) ? index
+                    : mtlc_binary(fn, "*", index,
+                                  mtlc_const_int(fn, i64, (long long)stride),
+                                  i64);
+  return offset_pointer(fn, base, pointer_type, byte_offset);
+}
+
+MtlcValue mtlc_load_element(MtlcFn *fn, MtlcValue base,
+                            const MtlcType *pointer_type, MtlcValue index) {
+  MtlcValue address = mtlc_element_address(fn, base, pointer_type, index);
+  if (address == MTLC_NO_VALUE) {
+    return MTLC_NO_VALUE;
+  }
+  return mtlc_load(fn, address, pointer_element(pointer_type));
+}
+
+void mtlc_store_element(MtlcFn *fn, MtlcValue base,
+                        const MtlcType *pointer_type, MtlcValue index,
+                        MtlcValue value) {
+  MtlcValue address = mtlc_element_address(fn, base, pointer_type, index);
+  if (address == MTLC_NO_VALUE) {
+    return;
+  }
+  mtlc_store(fn, address, value, pointer_element(pointer_type));
+}
+
+/* Resolve a pointer-to-struct plus a field index into (field type, offset). */
+static const MtlcType *field_of(MtlcFn *fn, const MtlcType *struct_pointer_type,
+                                size_t field_index, size_t *out_offset) {
+  const MtlcType *record = pointer_element(struct_pointer_type);
+  if (!record || record->kind != MTLC_TYPE_STRUCT) {
+    BUILDER_FAIL(fn->builder, "'%s' is not a pointer to a struct",
+                 struct_pointer_type ? type_name(struct_pointer_type)
+                                     : "(null)");
+    return NULL;
+  }
+  if (field_index >= record->field_count) {
+    BUILDER_FAIL(fn->builder, "struct '%s' has %llu fields, not %llu",
+                 type_name(record), (unsigned long long)record->field_count,
+                 (unsigned long long)field_index + 1u);
+    return NULL;
+  }
+  *out_offset = record->field_offsets ? record->field_offsets[field_index] : 0;
+  return record->field_types[field_index];
+}
+
+MtlcValue mtlc_field_address(MtlcFn *fn, MtlcValue base,
+                             const MtlcType *struct_pointer_type,
+                             size_t field_index) {
+  if (!fn) {
+    return MTLC_NO_VALUE;
+  }
+  size_t offset = 0;
+  const MtlcType *field = field_of(fn, struct_pointer_type, field_index, &offset);
+  if (!field) {
+    return MTLC_NO_VALUE;
+  }
+  /* The result points at the field's own type, in the struct pointer's space,
+   * so the caller can load or store through it directly. */
+  const MtlcType *field_pointer =
+      mtlc_type_pointer_in(field, struct_pointer_type->address_space);
+  if (!field_pointer) {
+    BUILDER_FAIL(fn->builder, "could not form a pointer to field type '%s'",
+                 type_name(field));
+    return MTLC_NO_VALUE;
+  }
+  record_type(fn->builder, field_pointer);
+  if (offset == 0) {
+    /* Field 0 is at the base address; a cast retypes it without arithmetic. */
+    return mtlc_cast(fn, base, field_pointer);
+  }
+  const MtlcType *i64 = mtlc_type_scalar(MTLC_TYPE_INT64);
+  MtlcValue address =
+      mtlc_binary(fn, "+", base, mtlc_const_int(fn, i64, (long long)offset),
+                  field_pointer);
+  return address;
+}
+
+MtlcValue mtlc_load_field(MtlcFn *fn, MtlcValue base,
+                          const MtlcType *struct_pointer_type,
+                          size_t field_index) {
+  if (!fn) {
+    return MTLC_NO_VALUE;
+  }
+  size_t offset = 0;
+  const MtlcType *field = field_of(fn, struct_pointer_type, field_index, &offset);
+  if (!field) {
+    return MTLC_NO_VALUE;
+  }
+  MtlcValue address =
+      mtlc_field_address(fn, base, struct_pointer_type, field_index);
+  if (address == MTLC_NO_VALUE) {
+    return MTLC_NO_VALUE;
+  }
+  return mtlc_load(fn, address, field);
+}
+
+void mtlc_store_field(MtlcFn *fn, MtlcValue base,
+                      const MtlcType *struct_pointer_type, size_t field_index,
+                      MtlcValue value) {
+  if (!fn) {
+    return;
+  }
+  size_t offset = 0;
+  const MtlcType *field = field_of(fn, struct_pointer_type, field_index, &offset);
+  if (!field) {
+    return;
+  }
+  MtlcValue address =
+      mtlc_field_address(fn, base, struct_pointer_type, field_index);
+  if (address == MTLC_NO_VALUE) {
+    return;
+  }
+  mtlc_store(fn, address, value, field);
+}
+
 /* --------------------------------------------------------------- control flow */
+
+/* Allocated labels are named ".L<n>[_hint]". The counter lives on the builder,
+ * so the name is unique across the whole module, not just this function. */
+MtlcLabel mtlc_label_new(MtlcFn *fn, const char *hint) {
+  if (!fn) {
+    return MTLC_NO_LABEL;
+  }
+  if (fn->label_count == fn->label_capacity) {
+    size_t next = fn->label_capacity ? fn->label_capacity * 2 : 8;
+    char **grown_names = (char **)realloc(fn->labels, next * sizeof(char *));
+    if (!grown_names) {
+      BUILDER_FAIL(fn->builder, "out of memory allocating a label");
+      return MTLC_NO_LABEL;
+    }
+    fn->labels = grown_names;
+    unsigned char *grown_placed =
+        (unsigned char *)realloc(fn->label_placed, next * sizeof(unsigned char));
+    if (!grown_placed) {
+      BUILDER_FAIL(fn->builder, "out of memory allocating a label");
+      return MTLC_NO_LABEL;
+    }
+    fn->label_placed = grown_placed;
+    fn->label_capacity = next;
+  }
+
+  char name[96];
+  if (hint && hint[0]) {
+    snprintf(name, sizeof(name), ".L%d_%s", fn->builder->label_counter++, hint);
+  } else {
+    snprintf(name, sizeof(name), ".L%d", fn->builder->label_counter++);
+  }
+  char *owned = mettle_strdup(name);
+  if (!owned) {
+    BUILDER_FAIL(fn->builder, "out of memory allocating a label");
+    return MTLC_NO_LABEL;
+  }
+  fn->labels[fn->label_count] = owned;
+  fn->label_placed[fn->label_count] = 0;
+  return (MtlcLabel)fn->label_count++;
+}
+
+/* The name behind a handle, or NULL after reporting an invalid handle. */
+static const char *label_name(MtlcFn *fn, MtlcLabel label, const char *api) {
+  if (label < 0 || (size_t)label >= fn->label_count) {
+    builder_fail_impl(fn->builder, api,
+                      "label handle %d was not created by mtlc_label_new",
+                      (int)label);
+    return NULL;
+  }
+  return fn->labels[label];
+}
+
+void mtlc_label_here(MtlcFn *fn, MtlcLabel label) {
+  if (!fn) {
+    return;
+  }
+  const char *name = label_name(fn, label, __func__);
+  if (!name) {
+    return;
+  }
+  if (fn->label_placed[label]) {
+    BUILDER_FAIL(fn->builder, "label '%s' is already placed in this function",
+                 name);
+    return;
+  }
+  fn->label_placed[label] = 1;
+  mtlc_label(fn, name);
+}
+
+void mtlc_jump_to(MtlcFn *fn, MtlcLabel label) {
+  if (!fn) {
+    return;
+  }
+  const char *name = label_name(fn, label, __func__);
+  if (name) {
+    mtlc_jump(fn, name);
+  }
+}
+
+void mtlc_branch_if_zero_to(MtlcFn *fn, MtlcValue cond, MtlcLabel label) {
+  if (!fn) {
+    return;
+  }
+  const char *name = label_name(fn, label, __func__);
+  if (name) {
+    mtlc_branch_if_zero(fn, cond, name);
+  }
+}
 
 void mtlc_label(MtlcFn *fn, const char *label) {
   if (!fn || !label) {
@@ -1571,7 +1998,7 @@ void mtlc_branch_if_zero(MtlcFn *fn, MtlcValue cond, const char *label) {
   }
   const IROperand *c = value_operand(fn, cond);
   if (!c) {
-    fn->builder->error = 1;
+    BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
     return;
   }
   IRInstruction inst = {0};
@@ -1590,7 +2017,7 @@ void mtlc_return(MtlcFn *fn, MtlcValue value) {
   if (value != MTLC_NO_VALUE) {
     const IROperand *v = value_operand(fn, value);
     if (!v) {
-      fn->builder->error = 1;
+      BUILDER_FAIL(fn->builder, "invalid argument or allocation failure");
       return;
     }
     inst.lhs = *v;
@@ -1618,9 +2045,80 @@ static void register_scalar_types(IRProgram *program) {
   }
 }
 
+/* Every branch must have somewhere to land. A jump to a label that was never
+ * defined is the classic IR-builder slip -- a typo in a label string, or a
+ * label allocated and then forgotten -- and it produces a module that fails
+ * far away in codegen, or silently falls through. Catching it here names the
+ * function and the label. */
+static int compare_label_names(const void *a, const void *b) {
+  return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+static int verify_branch_targets(MtlcBuilder *builder) {
+  const char **defined = NULL;
+  size_t defined_capacity = 0;
+  int ok = 1;
+
+  for (size_t f = 0; f < builder->fn_count && ok; f++) {
+    MtlcFn *fn = builder->fns[f];
+    if (!fn || !fn->ir) {
+      continue;
+    }
+    IRFunction *irf = fn->ir;
+    if (irf->instruction_count > defined_capacity) {
+      const char **grown = (const char **)realloc(
+          defined, irf->instruction_count * sizeof(*defined));
+      if (!grown) {
+        /* Verification is a courtesy; running out of memory here must not
+         * condemn an otherwise valid module. */
+        free(defined);
+        return 1;
+      }
+      defined = grown;
+      defined_capacity = irf->instruction_count;
+    }
+
+    /* Collect the defined labels once, then answer each branch by binary
+     * search: a big generated function should not cost a quadratic scan. */
+    size_t defined_count = 0;
+    for (size_t i = 0; i < irf->instruction_count; i++) {
+      const IRInstruction *insn = &irf->instructions[i];
+      if (insn->op == IR_OP_LABEL && insn->text) {
+        defined[defined_count++] = insn->text;
+      }
+    }
+    qsort(defined, defined_count, sizeof(*defined), compare_label_names);
+
+    for (size_t i = 0; i < irf->instruction_count; i++) {
+      const IRInstruction *branch = &irf->instructions[i];
+      if (branch->op != IR_OP_JUMP && branch->op != IR_OP_BRANCH_ZERO &&
+          branch->op != IR_OP_BRANCH_EQ) {
+        continue;
+      }
+      if (!branch->text) {
+        continue;
+      }
+      if (!bsearch(&branch->text, defined, defined_count, sizeof(*defined),
+                   compare_label_names)) {
+        builder_fail_impl(builder, "mtlc_builder_finish",
+                          "function '%s' branches to label '%s', which is "
+                          "never defined",
+                          irf->name ? irf->name : "?", branch->text);
+        ok = 0;
+        break;
+      }
+    }
+  }
+  free(defined);
+  return ok;
+}
+
 MtlcModule *mtlc_builder_finish(MtlcBuilder *builder) {
   if (!builder) {
     return NULL;
+  }
+  if (!builder->error) {
+    verify_branch_targets(builder);
   }
   if (builder->error) {
     mtlc_builder_destroy(builder);

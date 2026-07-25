@@ -85,9 +85,10 @@ typedef struct MtlcType {
 /* Canonical descriptor for a scalar/primitive kind: a shared, immortal singleton
  * with the right size/alignment and canonical name. Intended for frontends that
  * build IR through mtlc/build.h -- the returned pointer never needs freeing and
- * outlives codegen. Returns NULL for kinds that need caller-supplied layout
- * (STRUCT/ARRAY/POINTER/FUNCTION_POINTER/ENUM/TAGGED_ENUM); build those by
- * filling an MtlcType you own, or with mtlc_type_pointer below. */
+ * outlives codegen. Returns NULL for kinds that carry their own layout --
+ * build those with mtlc_type_pointer, mtlc_type_array, mtlc_type_struct, or
+ * mtlc_type_function_pointer below, which compute the layout and are interned
+ * and immortal on the same terms. */
 const MtlcType *mtlc_type_scalar(MtlcTypeKind kind);
 
 /* Canonical pointer-to-`base` descriptor. Interned and immortal like
@@ -101,6 +102,52 @@ const MtlcType *mtlc_type_pointer(const MtlcType *base);
  * descriptor is interned and immortal like mtlc_type_pointer(). */
 const MtlcType *mtlc_type_pointer_in(const MtlcType *base,
                                      MtlcAddressSpace address_space);
+
+/* Canonical `element[count]` descriptor: size is count * element size, and the
+ * alignment is the element's. Interned and immortal like mtlc_type_pointer, so
+ * the same (element, count) pair always yields the same pointer and the result
+ * never needs freeing. `element` must itself be a canonical descriptor, so
+ * arrays of arrays and arrays of structs work. Returns NULL on a NULL element,
+ * a zero count, a size that would overflow, or OOM. */
+const MtlcType *mtlc_type_array(const MtlcType *element, size_t count);
+
+/* Canonical struct descriptor with the layout computed for you under the
+ * standard C rule: each field is placed at the next offset that satisfies its
+ * own alignment, the struct's alignment is the widest field's, and the total
+ * size is rounded up to that alignment. This is what mtlc_field_offset and
+ * mtlc_field_address (mtlc/build.h) report and address, so a frontend never
+ * hand-computes offsets.
+ *
+ * `name` is copied and becomes the descriptor's registered type name; it must
+ * be unique within the process for a given layout. Structs are interned by
+ * name: declaring the same name twice returns the first descriptor, and a
+ * second declaration with a conflicting layout returns NULL. `field_names` and
+ * `field_types` each hold `field_count` entries; the names are copied and the
+ * types must be canonical descriptors. Returns NULL on invalid input or OOM. */
+const MtlcType *mtlc_type_struct(const char *name,
+                                 const char *const *field_names,
+                                 const MtlcType *const *field_types,
+                                 size_t field_count);
+
+/* Byte offset of field `index` within a struct descriptor, and the number of
+ * fields it has. mtlc_type_field_count returns 0 for a non-struct;
+ * mtlc_type_field_offset returns (size_t)-1 for a non-struct or an index that
+ * is out of range. */
+size_t mtlc_type_field_count(const MtlcType *t);
+size_t mtlc_type_field_offset(const MtlcType *t, size_t index);
+
+/* Index of the field named `name`, or (size_t)-1 when the type is not a struct
+ * or has no such field. */
+size_t mtlc_type_field_index(const MtlcType *t, const char *name);
+
+/* Canonical function-pointer descriptor for a callee returning `return_type`
+ * and taking `param_count` parameters. Interned and immortal; the parameter
+ * array is copied. Use it as the type of a value produced by
+ * mtlc_function_address (mtlc/build.h). `param_types` may be NULL when
+ * `param_count` is 0. Returns NULL on a NULL return type or OOM. */
+const MtlcType *mtlc_type_function_pointer(const MtlcType *return_type,
+                                           const MtlcType *const *param_types,
+                                           size_t param_count);
 
 /* Queries used across the backend. Implemented in src/ir/mtlc_type.c. */
 int mtlc_type_is_integer(const MtlcType *t);

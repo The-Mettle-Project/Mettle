@@ -59,14 +59,49 @@ Then compile a `.calc` program to a native binary and run it:
 ## What actually happens
 
 `calc.c` walks its parse and calls the builder as it goes
-(`mtlc_builder_function`, `mtlc_local`, `mtlc_binary`, `mtlc_call`,
-`mtlc_branch_if_zero`, `mtlc_return`, and so on), then hands the finished module
-to the backend:
+(`mtlc_builder_function`, `mtlc_local`, `mtlc_binary_op`, `mtlc_call`,
+`mtlc_branch_if_zero_to`, `mtlc_return`, and so on), then hands the finished
+module to the backend:
 
 ```c
 mtlc_optimize(ctx, module);              // classical optimizer (fold, inline, ...)
 mtlc_build_executable(ctx, module, out); // native x86-64 codegen + internal PE link
 ```
+
+Two things worth copying into a real frontend:
+
+**Labels come from the builder.** `mtlc_label_new` hands out a name unique
+across the module, so `calc` never composes label strings for its `if` and
+`while` lowering, and a target it forgets to place is caught by name at
+`mtlc_builder_finish` rather than becoming broken IR:
+
+```c
+MtlcLabel lelse = mtlc_label_new(p->fn, "else");
+MtlcLabel lend  = mtlc_label_new(p->fn, "endif");
+mtlc_branch_if_zero_to(p->fn, cond, lelse);
+/* then-body */
+mtlc_jump_to(p->fn, lend);
+mtlc_label_here(p->fn, lelse);
+/* else-body */
+mtlc_label_here(p->fn, lend);
+```
+
+**Backend messages come out in the frontend's voice.** One handler, installed on
+both the builder and the context, routes every libmtlc diagnostic through
+`calc`'s own error reporting instead of letting it reach `stderr` from inside
+the library:
+
+```c
+static void on_backend_diagnostic(void *user_data, MtlcDiagSeverity severity,
+                                  const char *message) {
+  (void)user_data;
+  fprintf(stderr, "calc: backend %s: %s\n", mtlc_diag_severity_name(severity),
+          message);
+}
+```
+
+Because builder errors are sticky, `calc` emits the whole program without
+checking each call and asks `mtlc_builder_ok` once at the end.
 
 Everything after `mtlc_builder_finish` (optimization, register allocation,
 instruction selection/encoding, and on Windows linking a PE executable with no

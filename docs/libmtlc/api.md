@@ -1,6 +1,6 @@
 # libmtlc API reference
 
-Everything a frontend can call lives in ten headers under
+Everything a frontend can call lives in eleven headers under
 [`include/mtlc/`](../../include/mtlc/). `#include <mtlc/mtlc.h>` pulls in all of
 them except `build.h`, which is included explicitly by frontends that construct
 IR through the builder.
@@ -8,8 +8,12 @@ IR through the builder.
 Conventions that hold across the whole API:
 
 - **Return codes.** Functions that can fail return `int`: 1 on success, 0 on
-  failure, with a human-readable message printed to `stderr`. There is no
-  error-code enum and no `errno`-style state.
+  failure. There is no error-code enum and no `errno`-style state.
+- **Diagnostics.** Every failure carries a human-readable message. By default
+  it goes to `stderr`; install a handler (`mtlc_context_set_diagnostic_handler`,
+  `mtlc_builder_set_diagnostic_handler`) to capture it instead, or read the last
+  one back with `mtlc_context_last_error` / `mtlc_builder_error`. See
+  [diag.h](#diagh).
 - **NULL tolerance.** Setters and destroyers accept NULL and do nothing.
   Getters on NULL return 0/NULL. Constructors return NULL on allocation
   failure.
@@ -17,9 +21,10 @@ Conventions that hold across the whole API:
   arguments are copied; the caller keeps ownership of what it passed in.
 - **Type ownership.** `const MtlcType *` arguments are borrowed and must stay
   valid for the life of the module they end up in. The canonical constructors
-  (`mtlc_type_scalar`, `mtlc_type_pointer`, `mtlc_type_pointer_in`) return
-  immortal descriptors that
-  satisfy this automatically. See [The type system](types.md).
+  (`mtlc_type_scalar`, `mtlc_type_pointer`, `mtlc_type_pointer_in`,
+  `mtlc_type_array`, `mtlc_type_struct`, `mtlc_type_function_pointer`) return
+  immortal descriptors that satisfy this automatically. See
+  [The type system](types.md).
 - **Thread safety.** There is no shared mutable global state in the backend
   (per-compile diagnostic state is thread-local). One thread may own one
   compilation at a time: a builder, the module it produces, and the context
@@ -30,8 +35,8 @@ Conventions that hold across the whole API:
 
 ## mtlc.h
 
-Umbrella header. Includes `context.h`, `intrinsic.h`, `memory.h`, `module.h`,
-`pipeline.h`, `target.h`, `tensor.h`, and `type.h`.
+Umbrella header. Includes `context.h`, `diag.h`, `intrinsic.h`, `memory.h`,
+`module.h`, `pipeline.h`, `target.h`, `tensor.h`, and `type.h`.
 
 ```c
 const char *mtlc_version(void);
@@ -39,6 +44,42 @@ const char *mtlc_version(void);
 
 Returns a static version string, e.g. `"libmtlc 0.1.0"`. Never NULL, never
 freed.
+
+---
+
+## diag.h
+
+How the backend says what went wrong. Both the pipeline and the IR builder
+report through the same handler type, so a frontend routes every backend
+message into its own diagnostic stream.
+
+```c
+typedef enum {
+  MTLC_DIAG_ERROR,
+  MTLC_DIAG_WARNING,
+  MTLC_DIAG_NOTE
+} MtlcDiagSeverity;
+
+typedef void (*MtlcDiagHandler)(void *user_data, MtlcDiagSeverity severity,
+                                const char *message);
+
+const char *mtlc_diag_severity_name(MtlcDiagSeverity severity);
+```
+
+`message` is a complete sentence with no trailing newline, valid only for the
+duration of the call -- copy it if you keep it. Builder messages are prefixed
+with the API entry point that failed, so you learn which call was at fault:
+
+```
+mtlc_binary: '<=>' is not a binary operator
+mtlc_builder_finish: function 'main' branches to label 'nowhere', which is never defined
+```
+
+`mtlc_diag_severity_name` returns `"error"`, `"warning"`, or `"note"`.
+
+Without a handler, errors go to `stderr` as `mtlc: <message>` -- the behavior
+libmtlc has always had, so an existing consumer that installs nothing sees no
+change.
 
 ---
 
@@ -55,6 +96,33 @@ void mtlc_context_destroy(MtlcContext *ctx);
 `create` returns a context with optimization off (`opt_level` 0), ML-opt off,
 whole-program off, explain off, and the PTX backend set to the GB10 profile
 (PTX 8.8 / architecture-specific `sm_121a`). Returns NULL on allocation failure.
+
+```c
+void mtlc_context_set_diagnostic_handler(MtlcContext *ctx,
+                                         MtlcDiagHandler handler,
+                                         void *user_data);
+const char *mtlc_context_last_error(const MtlcContext *ctx);
+void mtlc_context_clear_error(MtlcContext *ctx);
+```
+
+Route pipeline diagnostics -- optimize, ML-opt, codegen, link -- to `handler`
+instead of `stderr`. `user_data` is passed back unchanged and is neither copied
+nor freed; a NULL handler restores the default.
+
+`mtlc_context_last_error` returns the most recent error, or NULL if there has
+been none. It is the low-ceremony alternative to a handler: call a pipeline
+entry point and, on a 0 return, ask what happened.
+
+```c
+MtlcContext *ctx = mtlc_context_create();
+if (!mtlc_build_executable(ctx, module, "out.exe")) {
+  fprintf(stderr, "compile failed: %s\n", mtlc_context_last_error(ctx));
+}
+```
+
+The string belongs to the context and is replaced by the next error.
+`mtlc_context_clear_error` forgets it, so a later query reports only what
+happened after that point.
 
 ```c
 void mtlc_context_set_opt_level(MtlcContext *ctx, int level);
@@ -251,9 +319,34 @@ return's operand, and every error return.
 
 **Error latching.** The builder is designed so a lowering pass can emit
 straight-line calls without checking each one: any internal failure (allocation,
-bad handle, NULL argument) latches an error flag on the builder. Subsequent
-calls become no-ops returning `MTLC_NO_VALUE`, and `mtlc_builder_finish`
-returns NULL. Check once, at finish.
+bad handle, NULL argument) latches an error on the builder. Subsequent calls
+become no-ops returning `MTLC_NO_VALUE`, and `mtlc_builder_finish` returns
+NULL. Check once, at finish.
+
+```c
+void mtlc_builder_set_diagnostic_handler(MtlcBuilder *builder,
+                                         MtlcDiagHandler handler,
+                                         void *user_data);
+int mtlc_builder_ok(const MtlcBuilder *builder);
+const char *mtlc_builder_error(const MtlcBuilder *builder);
+int mtlc_fn_ok(const MtlcFn *fn);
+```
+
+`mtlc_builder_ok` is non-zero while nothing has failed; `mtlc_builder_error`
+returns the first error, prefixed with the entry point that produced it, or
+NULL if there has been none. `mtlc_fn_ok` asks the same question of the builder
+that owns `fn`, which is the convenient form mid-body.
+
+Because `mtlc_builder_finish` consumes the builder on the failure path too, its
+message is gone by the time it returns NULL. Install a handler if you want to
+see errors as they happen -- including the ones only detectable at finish:
+
+```c
+static void on_diag(void *user, MtlcDiagSeverity sev, const char *msg) {
+  fprintf(stderr, "myfrontend: %s: %s\n", mtlc_diag_severity_name(sev), msg);
+}
+mtlc_builder_set_diagnostic_handler(b, on_diag, NULL);
+```
 
 ### Lifecycle
 
@@ -288,6 +381,23 @@ borrowed (use canonical descriptors). With `is_extern` nonzero this declares a
 body-less external symbol resolved at link time (libc functions work on the
 executable path) and **returns NULL by design**; do not treat that NULL as an
 error. Otherwise it returns a function builder to emit the body into.
+
+```c
+int mtlc_builder_declare_function(MtlcBuilder *builder, const char *name,
+                                  const MtlcType *return_type,
+                                  const char *const *param_names,
+                                  const MtlcType *const *param_types,
+                                  size_t param_count);
+```
+
+The same extern declaration with an unambiguous result: 1 on success, 0 on
+failure, rather than a NULL that means both. `param_names` may be NULL when the
+names do not matter, which for an extern they usually do not.
+
+```c
+const MtlcType *pt[] = {i64};
+mtlc_builder_declare_function(b, "malloc", mtlc_type_pointer(i64), NULL, pt, 1);
+```
 
 ```c
 MtlcFn *mtlc_builder_kernel(MtlcBuilder *builder, const char *name,
@@ -377,23 +487,49 @@ reference). Assigning to a literal or temp handle is meaningless and will
 produce IR that codegen rejects; assign only to storage handles.
 
 ```c
-MtlcValue mtlc_binary(MtlcFn *fn, const char *op, MtlcValue lhs, MtlcValue rhs,
-                      const MtlcType *result_type);
+typedef enum {
+  MTLC_BINOP_ADD, MTLC_BINOP_SUB, MTLC_BINOP_MUL, MTLC_BINOP_DIV,
+  MTLC_BINOP_REM, MTLC_BINOP_EQ, MTLC_BINOP_NE, MTLC_BINOP_LT,
+  MTLC_BINOP_LE, MTLC_BINOP_GT, MTLC_BINOP_GE, MTLC_BINOP_LOGICAL_AND,
+  MTLC_BINOP_LOGICAL_OR, MTLC_BINOP_BIT_AND, MTLC_BINOP_BIT_OR,
+  MTLC_BINOP_BIT_XOR, MTLC_BINOP_SHL, MTLC_BINOP_SHR
+} MtlcBinaryOp;
+
+typedef enum {
+  MTLC_UNOP_NEGATE, MTLC_UNOP_LOGICAL_NOT, MTLC_UNOP_BITWISE_NOT
+} MtlcUnaryOp;
+
+MtlcValue mtlc_binary_op(MtlcFn *fn, MtlcBinaryOp op, MtlcValue lhs,
+                         MtlcValue rhs, const MtlcType *result_type);
+MtlcValue mtlc_unary_op(MtlcFn *fn, MtlcUnaryOp op, MtlcValue operand,
+                        const MtlcType *result_type);
+
+const char *mtlc_binary_op_name(MtlcBinaryOp op);
+const char *mtlc_unary_op_name(MtlcUnaryOp op);
 ```
 
-A binary operation producing a fresh temp. `op` is one of
-`+ - * / % == != < <= > >= && || & | ^ << >>` (spelled exactly). `result_type`
-is baked onto the instruction so codegen never re-derives it: it decides
-integer width, signed vs unsigned division/comparison/shift, and float
-arithmetic. Comparisons produce a 0/1 integer, so pass an integer
-`result_type` for them.
+A binary or unary operation producing a fresh temp. `result_type` is baked onto
+the instruction so codegen never re-derives it: it decides integer width, signed
+vs unsigned division/comparison/shift, and float arithmetic. Comparisons produce
+a 0/1 integer, so pass an integer `result_type` for them. `MTLC_UNOP_NEGATE` is
+arithmetic negation, `MTLC_UNOP_LOGICAL_NOT` yields 0/1, and
+`MTLC_UNOP_BITWISE_NOT` complements.
+
+`mtlc_binary_op_name` and `mtlc_unary_op_name` give the canonical spelling,
+which is useful when a frontend prints IR alongside building it.
 
 ```c
+MtlcValue mtlc_binary(MtlcFn *fn, const char *op, MtlcValue lhs, MtlcValue rhs,
+                      const MtlcType *result_type);
 MtlcValue mtlc_unary(MtlcFn *fn, const char *op, MtlcValue operand,
                      const MtlcType *result_type);
 ```
 
-`-` (negate), `!` (logical not, 0/1 result), `~` (bitwise not).
+The string forms, for frontends that already carry operator text: `op` is one of
+`+ - * / % == != < <= > >= && || & | ^ << >>` for binary and `- ! ~` for unary,
+spelled exactly. Anything else fails the builder with a message naming the
+operator, rather than emitting an instruction no backend can lower. Prefer the
+enum forms, where a wrong operator will not compile.
 
 ```c
 MtlcValue mtlc_call(MtlcFn *fn, const char *callee, const MtlcValue *args,
@@ -711,22 +847,103 @@ Scalar memory access through a pointer value (a pointer parameter, an
 `mtlc_address_of` result, a `malloc` return, or pointer arithmetic done with
 `mtlc_binary`). `elem_type` must be a scalar; its size, floatness, and
 signedness are recorded on the instruction (an unsigned 32-bit load
-zero-extends, a signed one sign-extends). Array indexing is pointer
-arithmetic: scale the index by the element size and add it to the base.
+zero-extends, a signed one sign-extends).
+
+### Indexing
+
+IR pointer arithmetic is in bytes. These helpers do the scaling, so a frontend
+indexes by element and by field instead of computing byte offsets itself.
+
+```c
+MtlcValue mtlc_element_address(MtlcFn *fn, MtlcValue base,
+                               const MtlcType *pointer_type, MtlcValue index);
+MtlcValue mtlc_load_element(MtlcFn *fn, MtlcValue base,
+                            const MtlcType *pointer_type, MtlcValue index);
+void mtlc_store_element(MtlcFn *fn, MtlcValue base,
+                        const MtlcType *pointer_type, MtlcValue index,
+                        MtlcValue value);
+```
+
+`&base[index]`, `base[index]`, and `base[index] = value`. `pointer_type` is the
+type of `base`: the pointee supplies the stride, and the result keeps the
+pointer's address space, so a `global:float32*` indexes to a `global:float32*`.
+`index` is a pointer-width integer value.
+
+```c
+MtlcValue mtlc_field_address(MtlcFn *fn, MtlcValue base,
+                             const MtlcType *struct_pointer_type,
+                             size_t field_index);
+MtlcValue mtlc_load_field(MtlcFn *fn, MtlcValue base,
+                          const MtlcType *struct_pointer_type,
+                          size_t field_index);
+void mtlc_store_field(MtlcFn *fn, MtlcValue base,
+                      const MtlcType *struct_pointer_type, size_t field_index,
+                      MtlcValue value);
+```
+
+`&base->field`, `base->field`, and `base->field = value`.
+`struct_pointer_type` is a pointer to an `mtlc_type_struct`; the offset comes
+from that struct's computed layout, and `mtlc_field_address` yields a pointer to
+the field's own type in the same address space. Pair with
+`mtlc_type_field_index` to address a field by name.
+
+```c
+const MtlcType *point = mtlc_type_struct("Point", names, types, 2);
+const MtlcType *ppoint = mtlc_type_pointer(point);
+mtlc_store_field(fn, p, ppoint, mtlc_type_field_index(point, "y"),
+                 mtlc_const_int(fn, i32, 7));
+```
 
 ### Control flow
+
+```c
+typedef int MtlcLabel;
+#define MTLC_NO_LABEL (-1)
+
+MtlcLabel mtlc_label_new(MtlcFn *fn, const char *hint);
+void mtlc_label_here(MtlcFn *fn, MtlcLabel label);
+void mtlc_jump_to(MtlcFn *fn, MtlcLabel label);
+void mtlc_branch_if_zero_to(MtlcFn *fn, MtlcValue cond, MtlcLabel label);
+```
+
+`mtlc_label_new` allocates a label whose name is unique across the module;
+`hint` is an optional readability tag ("else", "loop_top") that shows up in the
+generated name and in diagnostics. This is what a frontend should use instead of
+composing label strings, which is where duplicate and misspelled labels come
+from. Placing a label twice is an error, as is branching to one that is never
+placed.
+
+```c
+MtlcLabel done = mtlc_label_new(fn, "endif");
+mtlc_branch_if_zero_to(fn, cond, done);
+/* ... then-body ... */
+mtlc_label_here(fn, done);
+```
 
 ```c
 void mtlc_label(MtlcFn *fn, const char *label);
 void mtlc_jump(MtlcFn *fn, const char *label);
 void mtlc_branch_if_zero(MtlcFn *fn, MtlcValue cond, const char *label);
+```
+
+The string forms, for frontends that name their own labels. Labels are
+function-scoped; a jump or branch may target a label defined later, and
+uniqueness is the caller's problem.
+
+Either way, `mtlc_builder_finish` verifies that every branch has somewhere to
+land and fails with a message naming the function and the label if one does not:
+
+```
+mtlc_builder_finish: function 'main' branches to label 'loop_exit', which is never defined
+```
+
+```c
 void mtlc_return(MtlcFn *fn, MtlcValue value);
 ```
 
-Labels are function-scoped strings; a jump or branch may target a label defined
-later. `mtlc_branch_if_zero` transfers control to `label` when `cond` is zero
-and falls through otherwise; it is the only conditional primitive (frontends
-compose `if`/`else`/`while` from it, see [The IR model](ir.md#control-flow)).
+`mtlc_branch_if_zero` transfers control to its label when `cond` is zero and
+falls through otherwise; it is the only conditional primitive (frontends compose
+`if`/`else`/`while` from it, see [The IR model](ir.md#control-flow)).
 `mtlc_return` with `MTLC_NO_VALUE` is a void return. **Every path through a
 function body must reach a return**; the builder does not synthesize one.
 
@@ -818,7 +1035,8 @@ temporaries. On Windows this uses libmtlc's own PE linker with imports resolved
 by DLL name from `kernel32.dll`, `ucrtbase.dll`, and `msvcrt.dll` (no Windows
 SDK import libraries needed), so extern libc calls like `malloc` and `putchar`
 just work. On ELF hosts it invokes the system C compiler (`cc -no-pie`) to
-link. Returns 1/0; failures print to stderr.
+link. Returns 1/0; failures report through the context's diagnostic handler, or
+`mtlc_context_last_error` if you installed none.
 
 ---
 
@@ -849,15 +1067,55 @@ const MtlcType *mtlc_type_pointer_in(const MtlcType *base,
                                      MtlcAddressSpace address_space);
 ```
 
-Both return immortal, immutable, canonical descriptors that never need freeing
+All return immortal, immutable, canonical descriptors that never need freeing
 and satisfy every "must outlive the module" requirement in this API. Scalars
 cover `MTLC_TYPE_INT8` through `MTLC_TYPE_VOID`; `mtlc_type_scalar` returns
-NULL for kinds that need caller-supplied layout (structs, arrays, tagged
-enums). Pointers intern by `(base, address_space)`, and pointer-to-pointer chains
-compose. `mtlc_type_pointer` constructs a generic pointer. Use
-`mtlc_type_pointer_in` for device-visible global, workgroup, constant, or
-private pointers; the address space remains part of the backend-owned type and
-does not depend on frontend syntax.
+NULL for the kinds that carry their own layout. Pointers intern by
+`(base, address_space)`, and pointer-to-pointer chains compose.
+`mtlc_type_pointer` constructs a generic pointer. Use `mtlc_type_pointer_in` for
+device-visible global, workgroup, constant, or private pointers; the address
+space remains part of the backend-owned type and does not depend on frontend
+syntax.
+
+```c
+const MtlcType *mtlc_type_array(const MtlcType *element, size_t count);
+const MtlcType *mtlc_type_struct(const char *name,
+                                 const char *const *field_names,
+                                 const MtlcType *const *field_types,
+                                 size_t field_count);
+const MtlcType *mtlc_type_function_pointer(const MtlcType *return_type,
+                                           const MtlcType *const *param_types,
+                                           size_t param_count);
+```
+
+The composite constructors, interned and immortal on the same terms. They
+compute the layout, so a frontend does not fill an `MtlcType` by hand and does
+not have to reproduce the backend's padding rules.
+
+`mtlc_type_struct` places each field at the next offset satisfying its own
+alignment, takes the struct's alignment from the widest field, and rounds the
+size up to that alignment -- the standard C rule. `name` becomes the registered
+type name; structs intern by it, so declaring the same name twice returns the
+first descriptor and a conflicting redeclaration returns NULL rather than
+silently shadowing.
+
+```c
+const char *names[] = {"tag", "weight", "flag"};
+const MtlcType *types[] = {i32, f64, i8};
+const MtlcType *record = mtlc_type_struct("Record", names, types, 3);
+/* offsets 0, 8, 16; size 24; alignment 8 */
+```
+
+```c
+size_t mtlc_type_field_count(const MtlcType *t);
+size_t mtlc_type_field_offset(const MtlcType *t, size_t index);
+size_t mtlc_type_field_index(const MtlcType *t, const char *name);
+```
+
+Layout queries over a struct descriptor. `mtlc_type_field_count` returns 0 for a
+non-struct; the other two return `(size_t)-1` for a non-struct, an index out of
+range, or an unknown field name. These are what `mtlc_field_address` addresses
+with.
 
 ```c
 int mtlc_type_is_integer(const MtlcType *t);

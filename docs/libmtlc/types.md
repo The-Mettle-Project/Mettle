@@ -93,13 +93,20 @@ const MtlcType *mtlc_type_scalar(MtlcTypeKind kind);
 const MtlcType *mtlc_type_pointer(const MtlcType *base);
 const MtlcType *mtlc_type_pointer_in(const MtlcType *base,
                                      MtlcAddressSpace address_space);
+const MtlcType *mtlc_type_array(const MtlcType *element, size_t count);
+const MtlcType *mtlc_type_struct(const char *name,
+                                 const char *const *field_names,
+                                 const MtlcType *const *field_types,
+                                 size_t field_count);
+const MtlcType *mtlc_type_function_pointer(const MtlcType *return_type,
+                                           const MtlcType *const *param_types,
+                                           size_t param_count);
 ```
 
 - `mtlc_type_scalar` returns a static singleton per scalar kind: immortal,
   shared, correctly sized and named (`"int64"`, `"float32"`, ...). It returns
-  NULL for kinds needing caller-supplied layout (`STRUCT`, `ARRAY`,
-  `TAGGED_ENUM`, `ENUM`, `FUNCTION_POINTER`, and raw `POINTER`; build pointers
-  with `mtlc_type_pointer`).
+  NULL for the kinds that carry their own layout, which the constructors below
+  build instead (`TAGGED_ENUM` and `ENUM` remain hand-built).
 - `mtlc_type_pointer` creates a generic pointer. `mtlc_type_pointer_in` creates
   a pointer in generic, global, workgroup, constant, or private device memory.
   Pointer descriptors intern by `(base, address_space)`: the first request
@@ -109,6 +116,21 @@ const MtlcType *mtlc_type_pointer_in(const MtlcType *base,
   is thread-local, upholding the backend's no-shared-mutable-globals rule;
   descriptors created on different threads for the same pointee are distinct
   pointers but interchangeable in meaning.
+
+- `mtlc_type_array` interns by `(element, count)` and takes its alignment from
+  the element. Its canonical name is `"<element>[<count>]"`.
+- `mtlc_type_struct` computes the layout under the standard C rule: each field
+  goes at the next offset satisfying its own alignment, the struct's alignment
+  is the widest field's, and the size rounds up to that alignment. Structs
+  intern **by name**, which is what keeps the registry unambiguous: the same
+  declaration returns the same descriptor, and a redeclaration with a different
+  layout returns NULL instead of silently shadowing the first.
+- `mtlc_type_function_pointer` interns by signature, with the canonical name
+  `"ret(*)(p0,p1)"`.
+
+Query the computed layout with `mtlc_type_field_count`,
+`mtlc_type_field_offset`, and `mtlc_type_field_index` (by name). The last two
+return `(size_t)-1` when the type is not a struct or the field does not exist.
 
 Call them at any time, in any order, from the thread doing that compilation,
 and never free the results.
@@ -125,22 +147,43 @@ to the kind name), so:
 - generic pointers register as `"<base>*"` (`"int64*"`, `"float32**"`);
   explicitly spaced pointers include the space in their canonical name (for
   example `"global:float32*"`) so distinct spaces cannot collide;
+- arrays register as `"<element>[<count>]"`, structs under the name given to
+  `mtlc_type_struct`, and function pointers as `"ret(*)(p0,p1)"`;
 - a hand-built descriptor **must have a unique, stable `name`**, or two
-  different structs would collide under the fallback kind name.
+  different structs would collide under the fallback kind name. Using
+  `mtlc_type_struct` makes this automatic, since it interns by name and rejects
+  a conflicting reuse.
 
-## Hand-built aggregates
+## Aggregates
 
-`STRUCT`, `ARRAY`, and `TAGGED_ENUM` descriptors can be built by filling the
-struct yourself: allocate it (statically, or from an arena that outlives the
-module), set `kind`, `name`, `size`, `alignment`, and the layout arrays, and
-use it wherever a type is accepted. The x86-64 code generator honors the
-layout (field offsets for member access lowered as base-plus-offset,
-aggregate copies by size). Two honest limitations:
+Prefer `mtlc_type_array` and `mtlc_type_struct`: they compute the layout, intern
+the descriptor, and register a parseable name. `TAGGED_ENUM` and `ENUM` still
+have to be built by filling the struct yourself -- allocate it (statically, or
+from an arena that outlives the module), set `kind`, `name`, `size`,
+`alignment`, and the layout arrays, and use it wherever a type is accepted.
 
-1. The **builder has no aggregate helpers yet**: no field-address instruction
-   and no aggregate locals through `mtlc_local`. Field access today is pointer
-   arithmetic (`base + offset`, then `mtlc_load`/`mtlc_store` on the field's
-   scalar type), which is exactly what it compiles to anyway.
+The x86-64 code generator honors the layout: field offsets for member access
+lower as base-plus-offset, and aggregate copies go by size. Reach a struct's
+fields through a pointer with `mtlc_field_address`, `mtlc_load_field`, and
+`mtlc_store_field` ([build.h](api.md#buildh)), which turn a field index into the
+offset arithmetic for you:
+
+```c
+const char *names[] = {"x", "y"};
+const MtlcType *types[] = {i32, i32};
+const MtlcType *point = mtlc_type_struct("Point", names, types, 2);
+const MtlcType *ppoint = mtlc_type_pointer(point);
+
+mtlc_store_field(fn, p, ppoint, mtlc_type_field_index(point, "y"),
+                 mtlc_const_int(fn, i32, 7));
+```
+
+Two limitations remain:
+
+1. **No aggregate locals through `mtlc_local`**: a struct value lives behind a
+   pointer (a `malloc` result, or `mtlc_address_of` on storage you declared),
+   and field access is the pointer arithmetic above -- which is what it compiles
+   to anyway.
 2. The GPU and ARM64 emitters do not accept aggregates at all (see the
    [per-target table](ir.md#what-each-consumer-requires)).
 

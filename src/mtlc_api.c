@@ -19,6 +19,7 @@
 #include "linker/symbol_resolve.h"
 
 #include <ctype.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -71,7 +72,69 @@ struct MtlcContext {
   int ptx_isa_major;
   int ptx_isa_minor;
   int ptx_tensor_tuple_budget;
+  MtlcDiagHandler diag_handler;
+  void *diag_user_data;
+  char last_error[512];
+  int has_error;
 };
+
+/* --------------------------------------------------------------- diagnostics */
+
+const char *mtlc_diag_severity_name(MtlcDiagSeverity severity) {
+  switch (severity) {
+  case MTLC_DIAG_ERROR:
+    return "error";
+  case MTLC_DIAG_WARNING:
+    return "warning";
+  case MTLC_DIAG_NOTE:
+    return "note";
+  }
+  return "diagnostic";
+}
+
+/* Report one diagnostic through `ctx`. A NULL context (the documented
+ * conservative-defaults path) and a context with no installed handler both fall
+ * back to the historical stderr behavior, so nothing an existing consumer sees
+ * changes until it opts in. Errors are recorded for mtlc_context_last_error
+ * regardless of where they are delivered. */
+static void mtlc_diag(MtlcContext *ctx, MtlcDiagSeverity severity,
+                      const char *format, ...) {
+  char message[512];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(message, sizeof(message), format, args);
+  va_end(args);
+
+  if (ctx && severity == MTLC_DIAG_ERROR) {
+    snprintf(ctx->last_error, sizeof(ctx->last_error), "%s", message);
+    ctx->has_error = 1;
+  }
+  if (ctx && ctx->diag_handler) {
+    ctx->diag_handler(ctx->diag_user_data, severity, message);
+    return;
+  }
+  fprintf(stderr, "mtlc: %s\n", message);
+}
+
+void mtlc_context_set_diagnostic_handler(MtlcContext *ctx,
+                                         MtlcDiagHandler handler,
+                                         void *user_data) {
+  if (ctx) {
+    ctx->diag_handler = handler;
+    ctx->diag_user_data = user_data;
+  }
+}
+
+const char *mtlc_context_last_error(const MtlcContext *ctx) {
+  return (ctx && ctx->has_error) ? ctx->last_error : NULL;
+}
+
+void mtlc_context_clear_error(MtlcContext *ctx) {
+  if (ctx) {
+    ctx->last_error[0] = '\0';
+    ctx->has_error = 0;
+  }
+}
 
 MtlcContext *mtlc_context_create(void) {
   MtlcContext *ctx = (MtlcContext *)calloc(1, sizeof(MtlcContext));
@@ -233,6 +296,7 @@ static int mtlc_optimize_policy(MtlcContext *ctx, MtlcModule *module,
                                 int target_neutral_only,
                                 int gpu_device_only) {
   if (!module || !module->ir) {
+    mtlc_diag(ctx, MTLC_DIAG_ERROR, "mtlc_optimize: a module is required");
     return 0;
   }
   /* Honor the context's documented contract: opt level 0 = none. A NULL ctx
@@ -249,8 +313,15 @@ static int mtlc_optimize_policy(MtlcContext *ctx, MtlcModule *module,
   options.explain_focus_file = ctx ? ctx->explain_focus_file : NULL;
   options.target_neutral_only = target_neutral_only;
   options.gpu_device_only = gpu_device_only;
-  if (!gpu_device_only && !ir_program_lower_gpu_launches(module->ir)) return 0;
-  return ir_optimize_program(module->ir, &options);
+  if (!gpu_device_only && !ir_program_lower_gpu_launches(module->ir)) {
+    mtlc_diag(ctx, MTLC_DIAG_ERROR, "GPU launch host lowering failed");
+    return 0;
+  }
+  if (!ir_optimize_program(module->ir, &options)) {
+    mtlc_diag(ctx, MTLC_DIAG_ERROR, "the optimizer rejected the module");
+    return 0;
+  }
+  return 1;
 }
 
 int mtlc_optimize(MtlcContext *ctx, MtlcModule *module) {
@@ -268,21 +339,28 @@ int mtlc_optimize_for(MtlcContext *ctx, MtlcModule *module, MtlcArch arch) {
   case MTLC_ARCH_SPIRV:
     return mtlc_optimize_policy(ctx, module, 1, 1);
   default:
+    mtlc_diag(ctx, MTLC_DIAG_ERROR,
+              "mtlc_optimize_for: unknown architecture %d", (int)arch);
     return 0;
   }
 }
 
 int mtlc_apply_ml_opt(MtlcContext *ctx, MtlcModule *module,
                       MtlcMlOptStats *stats) {
-  (void)ctx; /* the caller decides when to run the ML pass */
+  /* The caller decides when to run the ML pass; ctx carries only diagnostics. */
   if (!module || !module->ir) {
+    mtlc_diag(ctx, MTLC_DIAG_ERROR, "mtlc_apply_ml_opt: a module is required");
     return 0;
   }
   if (!ir_program_lower_gpu_launches(module->ir)) {
+    mtlc_diag(ctx, MTLC_DIAG_ERROR, "GPU launch host lowering failed");
     return 0;
   }
   MLOptStats s = {0};
   int ok = ir_apply_ml_opt(module->ir, &s);
+  if (!ok) {
+    mtlc_diag(ctx, MTLC_DIAG_ERROR, "the ML optimizer failed on this module");
+  }
   if (ok) {
     ir_hoist_constants(module->ir);
   }
@@ -299,12 +377,13 @@ int mtlc_apply_ml_opt(MtlcContext *ctx, MtlcModule *module,
 /* ------------------------------------------------------------- codegen + link */
 
 int mtlc_emit_object(MtlcContext *ctx, MtlcModule *module, const char *path) {
-  (void)ctx;
   if (!module || !module->ir || !path) {
+    mtlc_diag(ctx, MTLC_DIAG_ERROR,
+              "mtlc_emit_object: a module and an output path are required");
     return 0;
   }
   if (!ir_program_lower_gpu_launches(module->ir)) {
-    fprintf(stderr, "mtlc: GPU launch host lowering failed\n");
+    mtlc_diag(ctx, MTLC_DIAG_ERROR, "GPU launch host lowering failed");
     return 0;
   }
 #if defined(__aarch64__) && defined(__linux__)
@@ -312,29 +391,30 @@ int mtlc_emit_object(MtlcContext *ctx, MtlcModule *module, const char *path) {
     char error[512] = {0};
     int ok = arm64_ir_write_object(module->ir, path, error, sizeof(error));
     if (!ok) {
-      fprintf(stderr, "mtlc: AArch64 object emission failed: %s\n",
-              error[0] ? error : "unknown error");
+      mtlc_diag(ctx, MTLC_DIAG_ERROR, "AArch64 object emission failed: %s",
+                error[0] ? error : "unknown error");
     }
     return ok;
   }
 #else
   CodeGenerator *gen = code_generator_create();
   if (!gen) {
+    mtlc_diag(ctx, MTLC_DIAG_ERROR, "could not create the code generator");
     return 0;
   }
   code_generator_set_ir_program(gen, module->ir);
   if (!code_generator_generate_program(gen)) {
-    fprintf(stderr, "mtlc: code generation failed: %s\n",
-            gen->error_message ? gen->error_message : "unknown error");
+    mtlc_diag(ctx, MTLC_DIAG_ERROR, "code generation failed: %s",
+              gen->error_message ? gen->error_message : "unknown error");
     code_generator_destroy(gen);
     return 0;
   }
   BinaryEmitter *be = code_generator_get_binary_emitter(gen);
   int ok = binary_emitter_write_object_file(be, path);
   if (!ok) {
-    fprintf(stderr, "mtlc: could not write object '%s': %s\n", path,
-            binary_emitter_get_error(be) ? binary_emitter_get_error(be)
-                                          : "unknown error");
+    mtlc_diag(ctx, MTLC_DIAG_ERROR, "could not write object '%s': %s", path,
+              binary_emitter_get_error(be) ? binary_emitter_get_error(be)
+                                           : "unknown error");
   }
   code_generator_destroy(gen);
   return ok;
@@ -344,6 +424,8 @@ int mtlc_emit_object(MtlcContext *ctx, MtlcModule *module, const char *path) {
 int mtlc_emit(MtlcContext *ctx, MtlcModule *module, MtlcArch arch,
               const char *path) {
   if (!module || !module->ir || !path) {
+    mtlc_diag(ctx, MTLC_DIAG_ERROR,
+              "mtlc_emit: a module and an output path are required");
     return 0;
   }
   switch (arch) {
@@ -354,21 +436,21 @@ int mtlc_emit(MtlcContext *ctx, MtlcModule *module, MtlcArch arch,
     /* Cross-host AArch64 relocatable object. The CLI's explicit --emit-arm64
      * legacy smoke target remains a self-contained executable. */
     if (!ir_program_lower_gpu_launches(module->ir)) {
-      fprintf(stderr, "mtlc: GPU launch host lowering failed\n");
+      mtlc_diag(ctx, MTLC_DIAG_ERROR, "GPU launch host lowering failed");
       return 0;
     }
     char error[512] = {0};
     int ok = arm64_ir_write_object(module->ir, path, error, sizeof(error));
     if (!ok)
-      fprintf(stderr, "mtlc: AArch64 object emission failed: %s\n",
-              error[0] ? error : "unknown error");
+      mtlc_diag(ctx, MTLC_DIAG_ERROR, "AArch64 object emission failed: %s",
+                error[0] ? error : "unknown error");
     return ok;
   }
 
   case MTLC_ARCH_PTX: {
     FILE *out = fopen(path, "w");
     if (!out) {
-      fprintf(stderr, "mtlc: could not open PTX output '%s'\n", path);
+      mtlc_diag(ctx, MTLC_DIAG_ERROR, "could not open PTX output '%s'", path);
       return 0;
     }
     char *err = NULL;
@@ -379,8 +461,8 @@ int mtlc_emit(MtlcContext *ctx, MtlcModule *module, MtlcArch arch,
     int ok = ptx_emit_program(module->ir, NULL, out, &ptx_options, &err);
     fclose(out);
     if (!ok) {
-      fprintf(stderr, "mtlc: PTX emission failed: %s\n",
-              err ? err : "unknown error");
+      mtlc_diag(ctx, MTLC_DIAG_ERROR, "PTX emission failed: %s",
+                err ? err : "unknown error");
       free(err);
     }
     return ok;
@@ -389,29 +471,30 @@ int mtlc_emit(MtlcContext *ctx, MtlcModule *module, MtlcArch arch,
   case MTLC_ARCH_SPIRV: {
     FILE *out = fopen(path, "wb");
     if (!out) {
-      fprintf(stderr, "mtlc: could not open SPIR-V output '%s'\n", path);
+      mtlc_diag(ctx, MTLC_DIAG_ERROR, "could not open SPIR-V output '%s'",
+                path);
       return 0;
     }
     char *err = NULL;
     int ok = spirv_emit_program(module->ir, NULL, out, &err);
     fclose(out);
     if (!ok) {
-      fprintf(stderr, "mtlc: SPIR-V emission failed: %s\n",
-              err ? err : "unknown error");
+      mtlc_diag(ctx, MTLC_DIAG_ERROR, "SPIR-V emission failed: %s",
+                err ? err : "unknown error");
       free(err);
     }
     return ok;
   }
   }
-  fprintf(stderr, "mtlc: unknown architecture %d\n", (int)arch);
+  mtlc_diag(ctx, MTLC_DIAG_ERROR, "unknown architecture %d", (int)arch);
   return 0;
 }
 
 /* Link `object_paths` + the C-runtime startup object into a PE executable using
  * libmtlc's internal linker. Imports are resolved by DLL name, so no Windows SDK
  * import libraries are needed. */
-static int link_pe_internal(const char **object_paths, size_t object_count,
-                            const char *output_path) {
+static int link_pe_internal(MtlcContext *ctx, const char **object_paths,
+                            size_t object_count, const char *output_path) {
   static const char *const import_dlls[] = {"kernel32.dll", "ucrtbase.dll",
                                              "msvcrt.dll"};
   LinkResolutionOptions resolution_options = {"mainCRTStartup", 16u, 1};
@@ -422,16 +505,16 @@ static int link_pe_internal(const char **object_paths, size_t object_count,
 
   if (!link_resolution_build(object_paths, object_count, &resolution_options,
                              &resolution, &error_message)) {
-    fprintf(stderr, "mtlc: internal linker resolution failed: %s\n",
-            error_message ? error_message : "unknown error");
+    mtlc_diag(ctx, MTLC_DIAG_ERROR, "internal linker resolution failed: %s",
+              error_message ? error_message : "unknown error");
     free(error_message);
     return 0;
   }
   emission.import_dll_names = (const char **)import_dlls;
   emission.import_dll_count = sizeof(import_dlls) / sizeof(import_dlls[0]);
   if (!pe_emit_executable(resolution, output_path, &emission, &error_message)) {
-    fprintf(stderr, "mtlc: internal linker PE emission failed: %s\n",
-            error_message ? error_message : "unknown error");
+    mtlc_diag(ctx, MTLC_DIAG_ERROR, "internal linker PE emission failed: %s",
+              error_message ? error_message : "unknown error");
     free(error_message);
     link_resolution_destroy(resolution);
     return 0;
@@ -443,8 +526,10 @@ static int link_pe_internal(const char **object_paths, size_t object_count,
 
 int mtlc_build_executable(MtlcContext *ctx, MtlcModule *module,
                           const char *output_path) {
-  (void)ctx;
   if (!module || !module->ir || !output_path) {
+    mtlc_diag(
+        ctx, MTLC_DIAG_ERROR,
+        "mtlc_build_executable: a module and an output path are required");
     return 0;
   }
   int wants_argc_argv = module->ir->main_wants_argc_argv;
@@ -456,6 +541,7 @@ int mtlc_build_executable(MtlcContext *ctx, MtlcModule *module,
   if (!obj_path || !startup_path) {
     free(obj_path);
     free(startup_path);
+    mtlc_diag(ctx, MTLC_DIAG_ERROR, "out of memory building temporary paths");
     return 0;
   }
 #ifdef _WIN32
@@ -475,22 +561,30 @@ int mtlc_build_executable(MtlcContext *ctx, MtlcModule *module,
   /* binary_write_program_startup_object returns 0 on success (non-zero fails). */
   if (binary_write_program_startup_object(startup_path, 0, 0,
                                           wants_argc_argv) != 0) {
-    fprintf(stderr, "mtlc: could not write startup object\n");
+    mtlc_diag(ctx, MTLC_DIAG_ERROR,
+              "could not write the C-runtime startup object");
     goto done;
   }
   {
     const char *objects[2] = {startup_path, obj_path};
-    result = link_pe_internal(objects, 2, output_path);
+    result = link_pe_internal(ctx, objects, 2, output_path);
   }
 #else
   /* ELF hosts: the system C toolchain provides crt startup + links the object. */
   {
     size_t cmd_len = strlen(obj_path) + strlen(output_path) + 64;
     char *cmd = (char *)malloc(cmd_len);
-    if (cmd) {
+    if (!cmd) {
+      mtlc_diag(ctx, MTLC_DIAG_ERROR,
+                "out of memory building the link command");
+    } else {
       snprintf(cmd, cmd_len, "cc -no-pie \"%s\" -o \"%s\"", obj_path,
                output_path);
       result = (system(cmd) == 0);
+      if (!result) {
+        mtlc_diag(ctx, MTLC_DIAG_ERROR,
+                  "the system C compiler failed to link '%s'", output_path);
+      }
       free(cmd);
     }
     (void)wants_argc_argv;

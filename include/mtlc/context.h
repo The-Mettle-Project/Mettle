@@ -12,6 +12,8 @@
 #ifndef MTLC_CONTEXT_H
 #define MTLC_CONTEXT_H
 
+#include "diag.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -21,6 +23,25 @@ typedef struct MtlcContext MtlcContext;
 /* Create/destroy a backend session. Returns NULL on allocation failure. */
 MtlcContext *mtlc_context_create(void);
 void mtlc_context_destroy(MtlcContext *ctx);
+
+/* Route every pipeline diagnostic -- optimize, ML-opt, codegen, link -- to
+ * `handler` instead of stderr. Pass a NULL handler to restore the default,
+ * which writes errors to stderr as "mtlc: <message>". `user_data` is passed
+ * back to the handler unchanged and is neither copied nor freed. */
+void mtlc_context_set_diagnostic_handler(MtlcContext *ctx,
+                                         MtlcDiagHandler handler,
+                                         void *user_data);
+
+/* The most recent error reported through this context, or NULL if none has
+ * been. The string belongs to the context and is replaced by the next error,
+ * so copy it if you keep it. This is the low-ceremony alternative to a
+ * handler: call a pipeline entry point, and on a 0 return ask what went
+ * wrong. */
+const char *mtlc_context_last_error(const MtlcContext *ctx);
+
+/* Forget the recorded error, so a later mtlc_context_last_error reports only
+ * what happened after this call. */
+void mtlc_context_clear_error(MtlcContext *ctx);
 
 /* Optimization level: 0 = none, >=1 = the classical pipeline. */
 void mtlc_context_set_opt_level(MtlcContext *ctx, int level);
