@@ -1156,8 +1156,12 @@ void mtlc_tensor_transfer_workgroup(
   record_type(fn->builder, view_type);
   record_type(fn->builder, coordinate_type);
   IRInstruction instruction = {0};
+  /* Stack block: emit deep-copies it, and heap_owned == 0 means no destroy path
+   * can try to free stack memory. */
+  IRTensorAux tensor;
+  ir_instruction_tensor_attach(&instruction, &tensor);
+  tensor.transfer = *desc;
   instruction.op = IR_OP_TENSOR_TRANSFER;
-  instruction.tensor_transfer = *desc;
   instruction.tensor_transfer_has_prepared_view = has_view;
   instruction.arguments = arguments;
   instruction.argument_types = argument_types;
@@ -1273,10 +1277,12 @@ void mtlc_tensor_mma_chain(MtlcFn *fn, const MtlcTensorMmaDesc *desc,
     }
   }
   IRInstruction instruction = {0};
+  IRTensorAux tensor;
+  ir_instruction_tensor_attach(&instruction, &tensor);
+  tensor.mma = *desc;
   instruction.op = IR_OP_TENSOR_MMA;
   instruction.arguments = arguments;
   instruction.argument_count = total;
-  instruction.tensor_mma = *desc;
   instruction.tensor_mma_count = (uint32_t)tile_count;
   emit(fn, &instruction);
   free(arguments);
@@ -1359,10 +1365,12 @@ void mtlc_tensor_matmul(MtlcFn *fn, const MtlcTensorMmaDesc *desc,
     arguments[i] = *operand;
   }
   IRInstruction instruction = {0};
+  IRTensorAux tensor;
+  ir_instruction_tensor_attach(&instruction, &tensor);
+  tensor.mma = *desc;
   instruction.op = IR_OP_TENSOR_MATMUL;
   instruction.arguments = arguments;
   instruction.argument_count = total;
-  instruction.tensor_mma = *desc;
   instruction.tensor_mma_count = 1;
   emit(fn, &instruction);
   free(arguments);
@@ -1428,10 +1436,12 @@ void mtlc_tensor_epilogue(
     arguments[i] = *operand;
   }
   IRInstruction instruction = {0};
+  IRTensorAux tensor;
+  ir_instruction_tensor_attach(&instruction, &tensor);
+  tensor.epilogue = *desc;
   instruction.op = IR_OP_TENSOR_EPILOGUE;
   instruction.arguments = arguments;
   instruction.argument_count = count;
-  instruction.tensor_epilogue = *desc;
   emit(fn, &instruction);
 }
 

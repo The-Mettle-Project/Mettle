@@ -124,7 +124,6 @@ typedef struct {
   MemMode mode;
   const MemSummaryTable *summaries; /* NULL in MEM_MODE_LOCAL */
   MemFnSummary *collect;            /* MEM_MODE_SUMMARY output */
-  MemLocal locals[MEM_MAX_LOCALS];
   size_t local_count;
   int depth;      /* 0 = the function's straight-line spine */
   int scope_level; /* lexical block nesting (0 = function body); independent of
@@ -137,6 +136,12 @@ typedef struct {
   int saw_value_return;
   int returns_all_fresh;
   int had_error;
+  /* Kept LAST so mem_ctx_init can zero only the fields above it. This is 256
+   * entries of a large struct -- around 50KB -- and mem_add_local zeroes each
+   * slot as it hands it out, so clearing the whole array once per function was
+   * pure waste: 2.5% of total compile time on a 13k-function input. Every read
+   * of a slot is bounded by local_count, so untouched slots are never seen. */
+  MemLocal locals[MEM_MAX_LOCALS];
 } MemCtx;
 
 /* ---- small type helpers ----------------------------------------------------- */
@@ -1909,7 +1914,9 @@ static void mem_ctx_init(MemCtx *ctx, TypeChecker *checker, ASTNode *decl,
                          FunctionDeclaration *fn, MemMode mode,
                          const MemSummaryTable *summaries,
                          MemFnSummary *collect) {
-  memset(ctx, 0, sizeof(*ctx));
+  /* Everything except the trailing locals array; see the note on its
+   * declaration for why that one is left alone. */
+  memset(ctx, 0, offsetof(MemCtx, locals));
   ctx->checker = checker;
   ctx->fn = fn;
   ctx->fn_loc = decl->location;

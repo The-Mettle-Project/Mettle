@@ -138,6 +138,30 @@ typedef struct {
   size_t capacity;
 } BinaryDebugLabelExportTable;
 
+/* What the IR records about one operand name, gathered so that resolving an
+ * operand's type does not have to rescan the function.
+ *
+ * A DECLARE_LOCAL carries its local's type as text; any instruction may carry a
+ * baked value_type for the value it defines. TEMP and SYMBOL are separate
+ * namespaces, so a name can have a distinct value_type in each. Each field holds
+ * the FIRST instruction to supply it, which is what the scans this replaces
+ * returned. */
+typedef struct {
+  const char *name;         /* borrowed from the IR */
+  const char *decl_type;    /* first DECLARE_LOCAL's type text, or NULL */
+  MtlcType *symbol_type;    /* first value_type defined into this SYMBOL */
+  MtlcType *temp_type;      /* first value_type defined into this TEMP */
+} BinaryOperandTypeEntry;
+
+typedef struct {
+  BinaryOperandTypeEntry *items;
+  size_t count;
+  size_t capacity;
+  size_t *buckets; /* open addressing over items: slot+1, 0 = empty */
+  size_t bucket_count;
+  int built; /* built lazily: many functions never need it */
+} BinaryOperandTypeIndex;
+
 typedef struct {
   BinaryCodeBuffer code;
   BinaryNamedSlotTable parameter_slots;
@@ -197,6 +221,7 @@ typedef struct {
   size_t indirect_temp_capacity;
   IRFunction *ir_function;
   const char *function_name;
+  BinaryOperandTypeIndex operand_types;
   char *runtime_end_label;
   BinaryDebugLabelExportTable debug_export_labels;
 } BinaryFunctionContext;
@@ -644,6 +669,7 @@ int code_generator_binary_operand_uses_temp(const IROperand *operand, const char
 int code_generator_binary_operator_is_commutative(const char *op);
 int code_generator_binary_parameter_is_indirect( CodeGenerator *generator, BinaryFunctionContext *context, const char *name);
 int code_generator_binary_prepare_function_context( CodeGenerator *generator, IRFunction *ir_function, BinaryFunctionContext *context);
+void binary_operand_type_index_destroy(BinaryOperandTypeIndex *ix);
 int code_generator_binary_promote_hot_symbols( CodeGenerator *generator, BinaryFunctionContext *context, IRFunction *ir_function);
 int code_generator_binary_resolve_fixups(CodeGenerator *generator, BinaryFunctionContext *context, size_t return_offset);
 int code_generator_binary_resolved_type_float_bits(MtlcType *type);

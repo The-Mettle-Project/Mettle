@@ -24,6 +24,8 @@ int ir_instruction_insert_move(IRFunction *function, size_t index,
   function->instructions[index] = *instruction;
   function->instruction_count++;
 
+  /* A move: the array now owns the tensor block. */
+  instruction->tensor = NULL;
   instruction->op = IR_OP_NOP;
   instruction->dest = ir_operand_none();
   instruction->lhs = ir_operand_none();

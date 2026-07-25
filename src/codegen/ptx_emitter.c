@@ -888,7 +888,7 @@ static void ptx_tensor_transfer_barrier_name(const PtxFn *fn, char *buffer,
 static void ptx_emit_tensor_transfer_fallback(
     PtxFn *fn, const IRInstruction *in, const char *destination,
     const char *source, size_t coordinate_base, size_t label_id) {
-  const MtlcTensorTransferDesc *desc = &in->tensor_transfer;
+  const MtlcTensorTransferDesc *desc = &IR_TENSOR_TRANSFER(in);
   size_t element_bytes = ir_tensor_transfer_element_bytes(desc->element);
   size_t tile_elements = ir_tensor_transfer_tile_elements(desc);
   int r_tid_x = new_reg(fn, PC_B32), r_tid_y = new_reg(fn, PC_B32);
@@ -1064,11 +1064,11 @@ static void ptx_emit_tensor_transfer_fallback(
 
 static void ptx_emit_tensor_transfer(PtxFn *fn, const IRInstruction *in) {
   if (!fn || !in || in->op != IR_OP_TENSOR_TRANSFER ||
-      !ir_tensor_transfer_desc_valid(&in->tensor_transfer)) {
+      !ir_tensor_transfer_desc_valid(&IR_TENSOR_TRANSFER(in))) {
     if (fn) fn_error(fn, "PTX received an invalid tensor-transfer instruction");
     return;
   }
-  const MtlcTensorTransferDesc *desc = &in->tensor_transfer;
+  const MtlcTensorTransferDesc *desc = &IR_TENSOR_TRANSFER(in);
   int has_view = in->tensor_transfer_has_prepared_view;
   size_t expected = ir_tensor_transfer_operand_count(desc, has_view);
   if (!expected || in->argument_count != expected) {
@@ -2289,7 +2289,7 @@ static void ptx_mma_store_f32_accumulator_subtile(
         1, 0, m_offset + (element >= 2 ? 8u : 0u)};
     PtxMmaCoordinate column = {
         0, 2, n_offset + (unsigned)(element & 1)};
-    ptx_mma_store_f32(fn, dp, d_stride, in->tensor_mma.d_layout, dspace, row,
+    ptx_mma_store_f32(fn, dp, d_stride, IR_TENSOR_MMA(in).d_layout, dspace, row,
                       column, group, thread, accumulator_base + element);
   }
 }
@@ -2335,7 +2335,7 @@ static int ptx_mma_prepare_tile_memory(PtxFn *fn,
     use_as(fn, &in->arguments[base + 4], PC_B64, memory->bases[4]);
     reg_name(PC_B32, new_reg(fn, PC_B32), memory->metadata_stride);
     sb_printf(&fn->body, "\tmov.u32 %s, %u;\n", memory->metadata_stride,
-              (unsigned)in->tensor_mma.k / 4u);
+              (unsigned)IR_TENSOR_MMA(in).k / 4u);
   } else if (profile->kind == PTX_MMA_MXF8F6F4 ||
              profile->kind == PTX_MMA_MXFP4 ||
              profile->kind == PTX_MMA_NVFP4) {
@@ -2349,8 +2349,8 @@ static int ptx_mma_prepare_tile_memory(PtxFn *fn,
       use_as(fn, &in->arguments[argument], PC_B64,
              memory->bases[4 + scale]);
       uint32_t leading_dimension =
-          scale == 0 ? in->tensor_mma.a_scale_leading_dimension
-                     : in->tensor_mma.b_scale_leading_dimension;
+          scale == 0 ? IR_TENSOR_MMA(in).a_scale_leading_dimension
+                     : IR_TENSOR_MMA(in).b_scale_leading_dimension;
       if (!leading_dimension)
         leading_dimension = (uint32_t)profile->scale_vectors;
       reg_name(PC_B32, new_reg(fn, PC_B32), memory->scale_strides[scale]);
@@ -2363,19 +2363,19 @@ static int ptx_mma_prepare_tile_memory(PtxFn *fn,
     return 0;
   memory->dense_contiguous[0] =
       profile->a_bits < 8 &&
-      in->tensor_mma.a_packing == MTLC_TENSOR_PACKING_DENSE_SUBBYTE &&
-      in->tensor_mma.a_layout == MTLC_TENSOR_LAYOUT_ROW_MAJOR &&
-      !in->tensor_mma.transpose_a &&
-      in->tensor_mma.a_leading_dimension != 0 &&
-      ((in->tensor_mma.a_leading_dimension *
+      IR_TENSOR_MMA(in).a_packing == MTLC_TENSOR_PACKING_DENSE_SUBBYTE &&
+      IR_TENSOR_MMA(in).a_layout == MTLC_TENSOR_LAYOUT_ROW_MAJOR &&
+      !IR_TENSOR_MMA(in).transpose_a &&
+      IR_TENSOR_MMA(in).a_leading_dimension != 0 &&
+      ((IR_TENSOR_MMA(in).a_leading_dimension *
         (uint32_t)profile->a_bits) & 7u) == 0;
   memory->dense_contiguous[1] =
       profile->b_bits < 8 &&
-      in->tensor_mma.b_packing == MTLC_TENSOR_PACKING_DENSE_SUBBYTE &&
-      in->tensor_mma.b_layout == MTLC_TENSOR_LAYOUT_COLUMN_MAJOR &&
-      !in->tensor_mma.transpose_b &&
-      in->tensor_mma.b_leading_dimension != 0 &&
-      ((in->tensor_mma.b_leading_dimension *
+      IR_TENSOR_MMA(in).b_packing == MTLC_TENSOR_PACKING_DENSE_SUBBYTE &&
+      IR_TENSOR_MMA(in).b_layout == MTLC_TENSOR_LAYOUT_COLUMN_MAJOR &&
+      !IR_TENSOR_MMA(in).transpose_b &&
+      IR_TENSOR_MMA(in).b_leading_dimension != 0 &&
+      ((IR_TENSOR_MMA(in).b_leading_dimension *
         (uint32_t)profile->b_bits) & 7u) == 0;
   return 1;
 }
@@ -2417,8 +2417,8 @@ static void ptx_emit_mma_byte_subtile(
     }
     ptx_mma_load_narrow_containers(
         fn, memory->bases[0], memory->strides[0],
-        in->tensor_mma.a_layout, in->tensor_mma.transpose_a,
-        in->tensor_mma.a_packing, memory->spaces[0], rows, columns, group,
+        IR_TENSOR_MMA(in).a_layout, IR_TENSOR_MMA(in).transpose_a,
+        IR_TENSOR_MMA(in).a_packing, memory->spaces[0], rows, columns, group,
         thread, (unsigned)profile->a_bits, a_base + reg, direct_a);
   }
   for (int reg = 0; reg < profile->b_registers; reg++) {
@@ -2432,8 +2432,8 @@ static void ptx_emit_mma_byte_subtile(
     }
     ptx_mma_load_narrow_containers(
         fn, memory->bases[1], memory->strides[1],
-        in->tensor_mma.b_layout, in->tensor_mma.transpose_b,
-        in->tensor_mma.b_packing, memory->spaces[1], rows, columns, group,
+        IR_TENSOR_MMA(in).b_layout, IR_TENSOR_MMA(in).transpose_b,
+        IR_TENSOR_MMA(in).b_packing, memory->spaces[1], rows, columns, group,
         thread, (unsigned)profile->b_bits, b_base + reg, direct_b);
   }
   if (profile->kind == PTX_MMA_MXF8F6F4) {
@@ -2461,7 +2461,7 @@ static void ptx_emit_mma_byte_subtile(
       PtxMmaCoordinate column = {
           0, 2, n_offset + (unsigned)(element & 1)};
       ptx_mma_load_f32(fn, memory->bases[2], memory->strides[2],
-                       in->tensor_mma.c_layout, memory->spaces[2], row, column,
+                       IR_TENSOR_MMA(in).c_layout, memory->spaces[2], row, column,
                        group, thread,
                        accumulator_base + element);
     }
@@ -2531,7 +2531,7 @@ static void ptx_emit_mma_fp4_subtile(
     }
     ptx_mma_load_packed_nibbles(
         fn, memory->bases[0], memory->strides[0],
-        in->tensor_mma.a_layout, in->tensor_mma.transpose_a,
+        IR_TENSOR_MMA(in).a_layout, IR_TENSOR_MMA(in).transpose_a,
         memory->spaces[0], rows, columns, group, thread, a_base + reg,
         direct_a);
   }
@@ -2547,7 +2547,7 @@ static void ptx_emit_mma_fp4_subtile(
     }
     ptx_mma_load_packed_nibbles(
         fn, memory->bases[1], memory->strides[1],
-        in->tensor_mma.b_layout, in->tensor_mma.transpose_b,
+        IR_TENSOR_MMA(in).b_layout, IR_TENSOR_MMA(in).transpose_b,
         memory->spaces[1], rows, columns, group, thread, b_base + reg,
         direct_b);
   }
@@ -2606,7 +2606,7 @@ static void ptx_emit_mma_fp4_subtile(
       PtxMmaCoordinate column = {
           0, 2, n_offset + (unsigned)(element & 1)};
       ptx_mma_load_f32(fn, memory->bases[2], memory->strides[2],
-                       in->tensor_mma.c_layout, memory->spaces[2], row,
+                       IR_TENSOR_MMA(in).c_layout, memory->spaces[2], row,
                        column, group, thread, accumulator_base + element);
     }
   }
@@ -2725,7 +2725,7 @@ static void ptx_mma_prepare_sparse_f16_a(
     PtxMmaCoordinate columns[2] = {{0, 2, 0}, {0, 2, 1}};
     ptx_mma_load_u16_pair(
         fn, memory->bases[0], memory->strides[0],
-        in->tensor_mma.a_layout, in->tensor_mma.transpose_a,
+        IR_TENSOR_MMA(in).a_layout, IR_TENSOR_MMA(in).transpose_a,
         memory->spaces[0], rows, columns, group, thread,
         fragment->a_base + reg);
   }
@@ -2754,7 +2754,7 @@ static void ptx_emit_mma_sparse_f16_subtile(
         {1, 0, n_offset}, {1, 0, n_offset}};
     ptx_mma_load_u16_pair(
         fn, memory->bases[1], memory->strides[1],
-        in->tensor_mma.b_layout, in->tensor_mma.transpose_b,
+        IR_TENSOR_MMA(in).b_layout, IR_TENSOR_MMA(in).transpose_b,
         memory->spaces[1], rows, columns, group, thread, b_base + reg);
   }
 
@@ -2765,7 +2765,7 @@ static void ptx_emit_mma_sparse_f16_subtile(
       PtxMmaCoordinate column = {
           0, 2, n_offset + (unsigned)(element & 1)};
       ptx_mma_load_f32(fn, memory->bases[2], memory->strides[2],
-                       in->tensor_mma.c_layout, memory->spaces[2], row,
+                       IR_TENSOR_MMA(in).c_layout, memory->spaces[2], row,
                        column, group, thread, accumulator_base + element);
     }
   }
@@ -2817,7 +2817,7 @@ static void ptx_emit_mma_native_subtile(
 static void ptx_emit_tensor_mma_native_single(PtxFn *fn,
                                                const IRInstruction *in,
                                                const PtxMmaProfile *profile) {
-  size_t per_tile = ir_tensor_mma_operand_count(&in->tensor_mma);
+  size_t per_tile = ir_tensor_mma_operand_count(&IR_TENSOR_MMA(in));
   PtxMmaTileMemory memory;
   if (!per_tile || in->argument_count != per_tile) {
     fn_error(fn, "PTX native MMA tensor operand count is inconsistent");
@@ -3034,30 +3034,30 @@ static int ptx_emit_wmma_tiled_subtile(
   }
   if (load_accumulator) {
     if (!ptx_wmma_offset_pointer(fn, c_base, strides[2],
-                                 in->tensor_mma.c_layout, row, column,
-                                 in->tensor_mma.accumulator_element, cp)) {
+                                 IR_TENSOR_MMA(in).c_layout, row, column,
+                                 IR_TENSOR_MMA(in).accumulator_element, cp)) {
       fn_error(fn, "PTX tiled WMMA cannot address the C subtile");
       return 0;
     }
     sb_printf(&fn->body,
               "\twmma.load.c.sync.aligned.%s%s.%s.%s %s, [%s], %s;\n",
               profile->shape, c_space,
-              ptx_tensor_layout(in->tensor_mma.c_layout), profile->c_type,
+              ptx_tensor_layout(IR_TENSOR_MMA(in).c_layout), profile->c_type,
               c, cp, strides[2]);
   }
-  ptx_emit_wmma_mma(fn, &in->tensor_mma, profile, accumulator, a, b,
+  ptx_emit_wmma_mma(fn, &IR_TENSOR_MMA(in), profile, accumulator, a, b,
                     load_accumulator ? c : accumulator);
   if (store_accumulator) {
     if (!ptx_wmma_offset_pointer(fn, d_base, strides[3],
-                                 in->tensor_mma.d_layout, row, column,
-                                 in->tensor_mma.result_element, dp)) {
+                                 IR_TENSOR_MMA(in).d_layout, row, column,
+                                 IR_TENSOR_MMA(in).result_element, dp)) {
       fn_error(fn, "PTX tiled WMMA cannot address the D subtile");
       return 0;
     }
     sb_printf(&fn->body,
               "\twmma.store.d.sync.aligned.%s%s.%s.%s [%s], %s, %s;\n",
               profile->shape, d_space,
-              ptx_tensor_layout(in->tensor_mma.d_layout), profile->d_type,
+              ptx_tensor_layout(IR_TENSOR_MMA(in).d_layout), profile->d_type,
               dp, accumulator, strides[3]);
   }
   return 1;
@@ -3109,8 +3109,8 @@ static int ptx_emit_wmma_tiled_tile(
   if (profile->m_tiles * profile->n_tiles > 1) {
     sb_printf(&fn->body,
               "\t// mtlc.tensor_mma tiled logical=m%un%uk%u physical=%s subtiles=%d reuse=%s\n",
-              (unsigned)in->tensor_mma.m, (unsigned)in->tensor_mma.n,
-              (unsigned)in->tensor_mma.k, profile->shape,
+              (unsigned)IR_TENSOR_MMA(in).m, (unsigned)IR_TENSOR_MMA(in).n,
+              (unsigned)IR_TENSOR_MMA(in).k, profile->shape,
               profile->m_tiles * profile->n_tiles,
               reuse_a ? "A" : "B");
   }
@@ -3118,30 +3118,30 @@ static int ptx_emit_wmma_tiled_tile(
     for (int m = 0; m < profile->m_tiles; m++) {
       char ap[24];
       if (!ptx_wmma_offset_pointer(
-              fn, pointers[0], strides[0], in->tensor_mma.a_layout,
+              fn, pointers[0], strides[0], IR_TENSOR_MMA(in).a_layout,
               (unsigned)m * profile->tile_m, 0,
-              in->tensor_mma.a_element, ap)) {
+              IR_TENSOR_MMA(in).a_element, ap)) {
         fn_error(fn, "PTX tiled WMMA cannot address the A subtile");
         return 0;
       }
       sb_printf(&fn->body,
                 "\twmma.load.a.sync.aligned.%s%s.%s.%s %s, [%s], %s;\n",
                 profile->shape, spaces[0],
-                ptx_tensor_layout(in->tensor_mma.a_layout), profile->a_type,
+                ptx_tensor_layout(IR_TENSOR_MMA(in).a_layout), profile->a_type,
                 a, ap, strides[0]);
       for (int n = 0; n < profile->n_tiles; n++) {
         char bp[24];
         if (!ptx_wmma_offset_pointer(
-                fn, pointers[1], strides[1], in->tensor_mma.b_layout, 0,
+                fn, pointers[1], strides[1], IR_TENSOR_MMA(in).b_layout, 0,
                 (unsigned)n * profile->tile_n,
-                in->tensor_mma.b_element, bp)) {
+                IR_TENSOR_MMA(in).b_element, bp)) {
           fn_error(fn, "PTX tiled WMMA cannot address the B subtile");
           return 0;
         }
         sb_printf(&fn->body,
                   "\twmma.load.b.sync.aligned.%s%s.%s.%s %s, [%s], %s;\n",
                   profile->shape, spaces[1],
-                  ptx_tensor_layout(in->tensor_mma.b_layout),
+                  ptx_tensor_layout(IR_TENSOR_MMA(in).b_layout),
                   profile->b_type, b, bp, strides[1]);
         if (!ptx_emit_wmma_tiled_subtile(
                 fn, in, profile, pointers[2], pointers[3], spaces[2],
@@ -3155,30 +3155,30 @@ static int ptx_emit_wmma_tiled_tile(
     for (int n = 0; n < profile->n_tiles; n++) {
       char bp[24];
       if (!ptx_wmma_offset_pointer(
-              fn, pointers[1], strides[1], in->tensor_mma.b_layout, 0,
+              fn, pointers[1], strides[1], IR_TENSOR_MMA(in).b_layout, 0,
               (unsigned)n * profile->tile_n,
-              in->tensor_mma.b_element, bp)) {
+              IR_TENSOR_MMA(in).b_element, bp)) {
         fn_error(fn, "PTX tiled WMMA cannot address the B subtile");
         return 0;
       }
       sb_printf(&fn->body,
                 "\twmma.load.b.sync.aligned.%s%s.%s.%s %s, [%s], %s;\n",
                 profile->shape, spaces[1],
-                ptx_tensor_layout(in->tensor_mma.b_layout), profile->b_type,
+                ptx_tensor_layout(IR_TENSOR_MMA(in).b_layout), profile->b_type,
                 b, bp, strides[1]);
       for (int m = 0; m < profile->m_tiles; m++) {
         char ap[24];
         if (!ptx_wmma_offset_pointer(
-                fn, pointers[0], strides[0], in->tensor_mma.a_layout,
+                fn, pointers[0], strides[0], IR_TENSOR_MMA(in).a_layout,
                 (unsigned)m * profile->tile_m, 0,
-                in->tensor_mma.a_element, ap)) {
+                IR_TENSOR_MMA(in).a_element, ap)) {
           fn_error(fn, "PTX tiled WMMA cannot address the A subtile");
           return 0;
         }
         sb_printf(&fn->body,
                   "\twmma.load.a.sync.aligned.%s%s.%s.%s %s, [%s], %s;\n",
                   profile->shape, spaces[0],
-                  ptx_tensor_layout(in->tensor_mma.a_layout),
+                  ptx_tensor_layout(IR_TENSOR_MMA(in).a_layout),
                   profile->a_type, a, ap, strides[0]);
         if (!ptx_emit_wmma_tiled_subtile(
                 fn, in, profile, pointers[2], pointers[3], spaces[2],
@@ -3212,10 +3212,10 @@ static int ptx_emit_wmma_tiled_store(
       int subtile = m * profile->n_tiles + n;
       char dp[24], accumulator[256];
       if (!ptx_wmma_offset_pointer(
-              fn, dp_base, strides[3], in->tensor_mma.d_layout,
+              fn, dp_base, strides[3], IR_TENSOR_MMA(in).d_layout,
               (unsigned)m * profile->tile_m,
               (unsigned)n * profile->tile_n,
-              in->tensor_mma.result_element, dp)) {
+              IR_TENSOR_MMA(in).result_element, dp)) {
         fn_error(fn, "PTX tiled WMMA commit cannot address the D subtile");
         return 0;
       }
@@ -3226,7 +3226,7 @@ static int ptx_emit_wmma_tiled_store(
       sb_printf(&fn->body,
                 "\twmma.store.d.sync.aligned.%s%s.%s.%s [%s], %s, %s;\n",
                 profile->shape, dspace,
-                ptx_tensor_layout(in->tensor_mma.d_layout),
+                ptx_tensor_layout(IR_TENSOR_MMA(in).d_layout),
                 profile->d_type, dp, accumulator, strides[3]);
     }
   }
@@ -3234,14 +3234,14 @@ static int ptx_emit_wmma_tiled_store(
 }
 
 static void ptx_emit_tensor_mma_single(PtxFn *fn, const IRInstruction *in) {
-  if (ptx_tensor_uses_direct_mma(&in->tensor_mma)) {
+  if (ptx_tensor_uses_direct_mma(&IR_TENSOR_MMA(in))) {
     PtxMmaProfile native_profile;
     char native_reason[256];
-    if (!ptx_select_mma_profile(fn, &in->tensor_mma, &native_profile,
+    if (!ptx_select_mma_profile(fn, &IR_TENSOR_MMA(in), &native_profile,
                                 native_reason, sizeof(native_reason))) {
       fn_error(fn, "PTX native tensor MMA cannot lower m%un%uk%u: %s",
-               (unsigned)in->tensor_mma.m, (unsigned)in->tensor_mma.n,
-               (unsigned)in->tensor_mma.k, native_reason);
+               (unsigned)IR_TENSOR_MMA(in).m, (unsigned)IR_TENSOR_MMA(in).n,
+               (unsigned)IR_TENSOR_MMA(in).k, native_reason);
       return;
     }
     ptx_emit_tensor_mma_native_single(fn, in, &native_profile);
@@ -3249,14 +3249,14 @@ static void ptx_emit_tensor_mma_single(PtxFn *fn, const IRInstruction *in) {
   }
   PtxWmmaProfile profile;
   char reason[256];
-  if (!ptx_select_wmma_profile(fn, &in->tensor_mma, &profile, reason,
+  if (!ptx_select_wmma_profile(fn, &IR_TENSOR_MMA(in), &profile, reason,
                                sizeof(reason))) {
     fn_error(fn, "PTX tensor MMA cannot lower m%un%uk%u: %s",
-             (unsigned)in->tensor_mma.m, (unsigned)in->tensor_mma.n,
-             (unsigned)in->tensor_mma.k, reason);
+             (unsigned)IR_TENSOR_MMA(in).m, (unsigned)IR_TENSOR_MMA(in).n,
+             (unsigned)IR_TENSOR_MMA(in).k, reason);
     return;
   }
-  size_t expected_operands = ir_tensor_mma_operand_count(&in->tensor_mma);
+  size_t expected_operands = ir_tensor_mma_operand_count(&IR_TENSOR_MMA(in));
   if (!expected_operands || in->argument_count != expected_operands) {
     fn_error(fn, "PTX stable WMMA tensor operand count is inconsistent");
     return;
@@ -3269,15 +3269,15 @@ static int ptx_tensor_stride_registers(PtxFn *fn, const IRInstruction *in,
                                        size_t base, size_t per_tile,
                                        char registers[4][24]) {
   uint32_t static_strides[4] = {
-      in->tensor_mma.a_leading_dimension,
-      in->tensor_mma.b_leading_dimension,
-      in->tensor_mma.c_leading_dimension,
-      in->tensor_mma.d_leading_dimension};
+      IR_TENSOR_MMA(in).a_leading_dimension,
+      IR_TENSOR_MMA(in).b_leading_dimension,
+      IR_TENSOR_MMA(in).c_leading_dimension,
+      IR_TENSOR_MMA(in).d_leading_dimension};
   size_t stride_argument =
       base + 4u +
-      (in->tensor_mma.sparsity != MTLC_TENSOR_SPARSITY_DENSE ? 1u : 0u) +
-      (in->tensor_mma.a_scale_mode != MTLC_TENSOR_SCALE_NONE ? 1u : 0u) +
-      (in->tensor_mma.b_scale_mode != MTLC_TENSOR_SCALE_NONE ? 1u : 0u);
+      (IR_TENSOR_MMA(in).sparsity != MTLC_TENSOR_SPARSITY_DENSE ? 1u : 0u) +
+      (IR_TENSOR_MMA(in).a_scale_mode != MTLC_TENSOR_SCALE_NONE ? 1u : 0u) +
+      (IR_TENSOR_MMA(in).b_scale_mode != MTLC_TENSOR_SCALE_NONE ? 1u : 0u);
   for (size_t stride = 0; stride < 4; stride++) {
     if (static_strides[stride] == 0) {
       if (stride_argument >= base + per_tile) return 0;
@@ -3466,20 +3466,20 @@ static void ptx_emit_tensor_residency_mma(PtxFn *fn,
     fn_error(fn, "PTX received an invalid tensor residency MMA");
     return;
   }
-  size_t per_tile = ir_tensor_mma_operand_count(&in->tensor_mma);
+  size_t per_tile = ir_tensor_mma_operand_count(&IR_TENSOR_MMA(in));
   if (!per_tile || in->argument_count != per_tile) {
     fn_error(fn, "PTX tensor residency operand count is inconsistent");
     return;
   }
-  if (ptx_tensor_uses_direct_mma(&in->tensor_mma)) {
+  if (ptx_tensor_uses_direct_mma(&IR_TENSOR_MMA(in))) {
     PtxMmaProfile native_profile;
     char native_reason[256];
-    if (!ptx_select_mma_profile(fn, &in->tensor_mma, &native_profile,
+    if (!ptx_select_mma_profile(fn, &IR_TENSOR_MMA(in), &native_profile,
                                 native_reason, sizeof(native_reason))) {
       fn_error(fn, "PTX native tensor residency cannot lower m%un%uk%u: %s",
-               (unsigned)in->tensor_mma.m,
-               (unsigned)in->tensor_mma.n,
-               (unsigned)in->tensor_mma.k, native_reason);
+               (unsigned)IR_TENSOR_MMA(in).m,
+               (unsigned)IR_TENSOR_MMA(in).n,
+               (unsigned)IR_TENSOR_MMA(in).k, native_reason);
       return;
     }
     ptx_emit_tensor_residency_mma_native(
@@ -3488,11 +3488,11 @@ static void ptx_emit_tensor_residency_mma(PtxFn *fn,
   }
   PtxWmmaProfile profile;
   char reason[256];
-  if (!ptx_select_wmma_profile(fn, &in->tensor_mma, &profile, reason,
+  if (!ptx_select_wmma_profile(fn, &IR_TENSOR_MMA(in), &profile, reason,
                                sizeof(reason))) {
     fn_error(fn, "PTX tensor residency cannot lower m%un%uk%u: %s",
-             (unsigned)in->tensor_mma.m, (unsigned)in->tensor_mma.n,
-             (unsigned)in->tensor_mma.k, reason);
+             (unsigned)IR_TENSOR_MMA(in).m, (unsigned)IR_TENSOR_MMA(in).n,
+             (unsigned)IR_TENSOR_MMA(in).k, reason);
     return;
   }
   int subtile_count = profile.m_tiles * profile.n_tiles;
@@ -3583,12 +3583,12 @@ static void ptx_emit_tensor_residency_commit(PtxFn *fn,
     return;
   }
   if (!group->resident) return;
-  size_t per_tile = ir_tensor_mma_operand_count(&in->tensor_mma);
-  if (ptx_tensor_uses_direct_mma(&in->tensor_mma)) {
+  size_t per_tile = ir_tensor_mma_operand_count(&IR_TENSOR_MMA(in));
+  if (ptx_tensor_uses_direct_mma(&IR_TENSOR_MMA(in))) {
     PtxMmaProfile native_profile;
     char native_reason[256];
     if (!per_tile || in->argument_count != per_tile ||
-        !ptx_select_mma_profile(fn, &in->tensor_mma, &native_profile,
+        !ptx_select_mma_profile(fn, &IR_TENSOR_MMA(in), &native_profile,
                                 native_reason, sizeof(native_reason))) {
       fn_error(fn,
                "PTX native tensor residency commit has an invalid profile");
@@ -3601,7 +3601,7 @@ static void ptx_emit_tensor_residency_commit(PtxFn *fn,
   PtxWmmaProfile profile;
   char reason[256];
   if (!per_tile || in->argument_count != per_tile ||
-      !ptx_select_wmma_profile(fn, &in->tensor_mma, &profile, reason,
+      !ptx_select_wmma_profile(fn, &IR_TENSOR_MMA(in), &profile, reason,
                                sizeof(reason))) {
     fn_error(fn, "PTX tensor residency commit has an invalid profile");
     return;
@@ -3684,11 +3684,11 @@ static void ptx_tensor_epilogue_address(
 static void ptx_emit_tensor_epilogue(PtxFn *fn,
                                      const IRInstruction *in) {
   if (!fn || !in || in->op != IR_OP_TENSOR_EPILOGUE ||
-      !ir_tensor_epilogue_desc_valid(&in->tensor_epilogue)) {
+      !ir_tensor_epilogue_desc_valid(&IR_TENSOR_EPILOGUE(in))) {
     if (fn) fn_error(fn, "PTX received an invalid tensor epilogue");
     return;
   }
-  const MtlcTensorEpilogueDesc *desc = &in->tensor_epilogue;
+  const MtlcTensorEpilogueDesc *desc = &IR_TENSOR_EPILOGUE(in);
   size_t expected = ir_tensor_epilogue_operand_count(desc);
   if (!expected || in->argument_count != expected) {
     fn_error(fn, "PTX tensor epilogue has an invalid operand count");
@@ -3973,11 +3973,11 @@ static int ptx_tensor_epilogue_handoff_compatible(
   if (!mma || !epilogue ||
       (mma->op != IR_OP_TENSOR_MMA && mma->op != IR_OP_TENSOR_COMMIT) ||
       epilogue->op != IR_OP_TENSOR_EPILOGUE ||
-      !ir_tensor_mma_desc_valid(&mma->tensor_mma) ||
-      !ir_tensor_epilogue_desc_valid(&epilogue->tensor_epilogue))
+      !ir_tensor_mma_desc_valid(&IR_TENSOR_MMA(mma)) ||
+      !ir_tensor_epilogue_desc_valid(&IR_TENSOR_EPILOGUE(epilogue)))
     return 0;
-  const MtlcTensorMmaDesc *md = &mma->tensor_mma;
-  const MtlcTensorEpilogueDesc *ed = &epilogue->tensor_epilogue;
+  const MtlcTensorMmaDesc *md = &IR_TENSOR_MMA(mma);
+  const MtlcTensorEpilogueDesc *ed = &IR_TENSOR_EPILOGUE(epilogue);
   if (md->m != ed->m || md->n != ed->n ||
       md->result_element != ed->element || md->d_layout != ed->layout ||
       md->scope != ed->scope)
@@ -4107,11 +4107,11 @@ static int ptx_prepare_resident_epilogue(PtxFn *fn,
                                          PtxResidentEpilogue *state) {
   if (!fn || !epilogue || !state ||
       epilogue->op != IR_OP_TENSOR_EPILOGUE ||
-      !ir_tensor_epilogue_desc_valid(&epilogue->tensor_epilogue))
+      !ir_tensor_epilogue_desc_valid(&IR_TENSOR_EPILOGUE(epilogue)))
     return 0;
   memset(state, 0, sizeof(*state));
   state->instruction = epilogue;
-  state->desc = &epilogue->tensor_epilogue;
+  state->desc = &IR_TENSOR_EPILOGUE(epilogue);
   state->compute_class =
       state->desc->element == MTLC_TENSOR_ELEMENT_FLOAT64 ? PC_F64 : PC_F32;
   state->compute_type = state->compute_class == PC_F64 ? "f64" : "f32";
@@ -4235,7 +4235,7 @@ static int ptx_apply_stable_resident_epilogue(
     const PtxWmmaProfile *profile, int accumulator_base,
     int accumulator_count, char mask[24]) {
   if (!ptx_stable_resident_epilogue_capable(
-          profile, &epilogue->tensor_epilogue))
+          profile, &IR_TENSOR_EPILOGUE(epilogue)))
     return 0;
   PtxResidentEpilogue state;
   if (!ptx_prepare_resident_epilogue(fn, epilogue, &state)) return 0;
@@ -4291,7 +4291,7 @@ static void ptx_apply_store_native_resident_epilogue_subtile(
                 state->bias_value, bias_address);
     }
     ptx_apply_resident_epilogue_value(fn, state, value, have_bias);
-    ptx_mma_store_f32(fn, dp, d_stride, mma->tensor_mma.d_layout, dspace,
+    ptx_mma_store_f32(fn, dp, d_stride, IR_TENSOR_MMA(mma).d_layout, dspace,
                       row, column, group, thread,
                       accumulator_base + element);
   }
@@ -4305,18 +4305,18 @@ static int ptx_try_emit_tensor_mma_resident_epilogue(
       !ptx_tensor_epilogue_handoff_compatible(mma, epilogue))
     return 0;
   size_t tile_count = ir_tensor_mma_instruction_count(mma);
-  size_t per_tile = ir_tensor_mma_operand_count(&mma->tensor_mma);
+  size_t per_tile = ir_tensor_mma_operand_count(&IR_TENSOR_MMA(mma));
   int tuple_budget = ptx_tensor_tuple_budget(fn);
   int epilogue_cost =
-      ptx_resident_epilogue_tuple_cost(&epilogue->tensor_epilogue);
+      ptx_resident_epilogue_tuple_cost(&IR_TENSOR_EPILOGUE(epilogue));
 
-  if (ptx_tensor_uses_direct_mma(&mma->tensor_mma)) {
+  if (ptx_tensor_uses_direct_mma(&IR_TENSOR_MMA(mma))) {
     PtxMmaProfile profile;
     char reason[256];
-    if (!ptx_select_mma_profile(fn, &mma->tensor_mma, &profile, reason,
+    if (!ptx_select_mma_profile(fn, &IR_TENSOR_MMA(mma), &profile, reason,
                                 sizeof(reason)) ||
         !ptx_native_resident_epilogue_capable(
-            &profile, &epilogue->tensor_epilogue))
+            &profile, &IR_TENSOR_EPILOGUE(epilogue)))
       return 0;
     int subtile_count = profile.m_tiles * profile.n_tiles;
     int accumulator_count =
@@ -4403,10 +4403,10 @@ static int ptx_try_emit_tensor_mma_resident_epilogue(
 
   PtxWmmaProfile profile;
   char reason[256];
-  if (!ptx_select_wmma_profile(fn, &mma->tensor_mma, &profile, reason,
+  if (!ptx_select_wmma_profile(fn, &IR_TENSOR_MMA(mma), &profile, reason,
                                sizeof(reason)) ||
       !ptx_stable_resident_epilogue_capable(
-          &profile, &epilogue->tensor_epilogue))
+          &profile, &IR_TENSOR_EPILOGUE(epilogue)))
     return 0;
   int subtile_count = profile.m_tiles * profile.n_tiles;
   int accumulator_count = subtile_count * profile.d_registers;
@@ -4451,19 +4451,19 @@ static int ptx_try_emit_tensor_commit_resident_epilogue(
   PtxTensorResidency *group =
       ptx_tensor_residency_find(fn, commit->tensor_residency_id);
   if (!group || !group->resident) return 0;
-  size_t per_tile = ir_tensor_mma_operand_count(&commit->tensor_mma);
+  size_t per_tile = ir_tensor_mma_operand_count(&IR_TENSOR_MMA(commit));
   int total_peak =
       group->tuple_peak +
-      ptx_resident_epilogue_tuple_cost(&epilogue->tensor_epilogue);
+      ptx_resident_epilogue_tuple_cost(&IR_TENSOR_EPILOGUE(epilogue));
   if (total_peak > ptx_tensor_tuple_budget(fn)) return 0;
 
-  if (ptx_tensor_uses_direct_mma(&commit->tensor_mma)) {
+  if (ptx_tensor_uses_direct_mma(&IR_TENSOR_MMA(commit))) {
     PtxMmaProfile profile;
     char reason[256];
-    if (!ptx_select_mma_profile(fn, &commit->tensor_mma, &profile, reason,
+    if (!ptx_select_mma_profile(fn, &IR_TENSOR_MMA(commit), &profile, reason,
                                 sizeof(reason)) ||
         !ptx_native_resident_epilogue_capable(
-            &profile, &epilogue->tensor_epilogue))
+            &profile, &IR_TENSOR_EPILOGUE(epilogue)))
       return 0;
     PtxVal dv = operand_desc(fn, &commit->arguments[3]);
     const char *dspace = ptx_wmma_space(dv);
@@ -4506,10 +4506,10 @@ static int ptx_try_emit_tensor_commit_resident_epilogue(
 
   PtxWmmaProfile profile;
   char reason[256];
-  if (!ptx_select_wmma_profile(fn, &commit->tensor_mma, &profile, reason,
+  if (!ptx_select_wmma_profile(fn, &IR_TENSOR_MMA(commit), &profile, reason,
                                sizeof(reason)) ||
       !ptx_stable_resident_epilogue_capable(
-          &profile, &epilogue->tensor_epilogue))
+          &profile, &IR_TENSOR_EPILOGUE(epilogue)))
     return 0;
   int accumulator_count =
       profile.m_tiles * profile.n_tiles * profile.d_registers;
@@ -4550,22 +4550,22 @@ static void ptx_emit_tensor_mma(PtxFn *fn, const IRInstruction *in) {
     ptx_emit_tensor_mma_single(fn, in);
     return;
   }
-  size_t per_tile = ir_tensor_mma_operand_count(&in->tensor_mma);
+  size_t per_tile = ir_tensor_mma_operand_count(&IR_TENSOR_MMA(in));
   if (!per_tile || tile_count > SIZE_MAX / per_tile ||
       in->argument_count != per_tile * tile_count) {
     fn_error(fn, "PTX tensor chain operand count is inconsistent");
     return;
   }
   int tuple_budget = ptx_tensor_tuple_budget(fn);
-  if (ptx_tensor_uses_direct_mma(&in->tensor_mma)) {
+  if (ptx_tensor_uses_direct_mma(&IR_TENSOR_MMA(in))) {
     PtxMmaProfile native_profile;
     char native_reason[256];
-    if (!ptx_select_mma_profile(fn, &in->tensor_mma, &native_profile,
+    if (!ptx_select_mma_profile(fn, &IR_TENSOR_MMA(in), &native_profile,
                                 native_reason, sizeof(native_reason))) {
       fn_error(fn, "PTX native tensor MMA chain cannot lower m%un%uk%u: %s",
-               (unsigned)in->tensor_mma.m,
-               (unsigned)in->tensor_mma.n,
-               (unsigned)in->tensor_mma.k, native_reason);
+               (unsigned)IR_TENSOR_MMA(in).m,
+               (unsigned)IR_TENSOR_MMA(in).n,
+               (unsigned)IR_TENSOR_MMA(in).k, native_reason);
       return;
     }
     int accumulator_count = native_profile.m_tiles * native_profile.n_tiles *
@@ -4597,11 +4597,11 @@ static void ptx_emit_tensor_mma(PtxFn *fn, const IRInstruction *in) {
   }
   PtxWmmaProfile profile;
   char reason[256];
-  if (!ptx_select_wmma_profile(fn, &in->tensor_mma, &profile, reason,
+  if (!ptx_select_wmma_profile(fn, &IR_TENSOR_MMA(in), &profile, reason,
                                sizeof(reason))) {
     fn_error(fn, "PTX tensor MMA chain cannot lower m%un%uk%u: %s",
-             (unsigned)in->tensor_mma.m, (unsigned)in->tensor_mma.n,
-             (unsigned)in->tensor_mma.k, reason);
+             (unsigned)IR_TENSOR_MMA(in).m, (unsigned)IR_TENSOR_MMA(in).n,
+             (unsigned)IR_TENSOR_MMA(in).k, reason);
     return;
   }
   int subtile_count = profile.m_tiles * profile.n_tiles;
@@ -5277,15 +5277,15 @@ static int ptx_tensor_matmul_stride64(PtxFn *fn,
                                       size_t per_tile,
                                       char strides[4][24]) {
   uint32_t static_strides[4] = {
-      in->tensor_mma.a_leading_dimension,
-      in->tensor_mma.b_leading_dimension,
-      in->tensor_mma.c_leading_dimension,
-      in->tensor_mma.d_leading_dimension};
+      IR_TENSOR_MMA(in).a_leading_dimension,
+      IR_TENSOR_MMA(in).b_leading_dimension,
+      IR_TENSOR_MMA(in).c_leading_dimension,
+      IR_TENSOR_MMA(in).d_leading_dimension};
   size_t argument =
       4u +
-      (in->tensor_mma.sparsity != MTLC_TENSOR_SPARSITY_DENSE ? 1u : 0u) +
-      (in->tensor_mma.a_scale_mode != MTLC_TENSOR_SCALE_NONE ? 1u : 0u) +
-      (in->tensor_mma.b_scale_mode != MTLC_TENSOR_SCALE_NONE ? 1u : 0u);
+      (IR_TENSOR_MMA(in).sparsity != MTLC_TENSOR_SPARSITY_DENSE ? 1u : 0u) +
+      (IR_TENSOR_MMA(in).a_scale_mode != MTLC_TENSOR_SCALE_NONE ? 1u : 0u) +
+      (IR_TENSOR_MMA(in).b_scale_mode != MTLC_TENSOR_SCALE_NONE ? 1u : 0u);
   for (size_t i = 0; i < 4; i++) {
     if (static_strides[i] == 0) {
       if (argument >= per_tile) return 0;
@@ -5308,7 +5308,7 @@ static void ptx_emit_tensor_matmul_scalar(
     const char *start_k, int initialize_from_d, const char *lane_rank,
     const char *participants, const char *mask, unsigned long long label_id,
     const char *phase) {
-  const MtlcTensorMmaDesc *desc = &in->tensor_mma;
+  const MtlcTensorMmaDesc *desc = &IR_TENSOR_MMA(in);
   PtxClass compute_class =
       desc->accumulator_element == MTLC_TENSOR_ELEMENT_FLOAT64
           ? PC_F64
@@ -5468,15 +5468,15 @@ static int ptx_tensor_matmul_bind_pointer(PtxFn *fn, const char *name,
 
 static void ptx_emit_tensor_matmul(PtxFn *fn,
                                    const IRInstruction *in) {
-  size_t per_tile = ir_tensor_mma_operand_count(&in->tensor_mma);
-  size_t expected = ir_tensor_matmul_operand_count(&in->tensor_mma);
+  size_t per_tile = ir_tensor_mma_operand_count(&IR_TENSOR_MMA(in));
+  size_t expected = ir_tensor_matmul_operand_count(&IR_TENSOR_MMA(in));
   if (in->op != IR_OP_TENSOR_MATMUL || !per_tile ||
       expected != per_tile + 5u || in->argument_count != expected ||
-      !ptx_tensor_matmul_capability(fn, &in->tensor_mma))
+      !ptx_tensor_matmul_capability(fn, &IR_TENSOR_MMA(in)))
     return;
 
-  int sparse = in->tensor_mma.sparsity != MTLC_TENSOR_SPARSITY_DENSE;
-  int scaled = in->tensor_mma.a_scale_mode != MTLC_TENSOR_SCALE_NONE;
+  int sparse = IR_TENSOR_MMA(in).sparsity != MTLC_TENSOR_SPARSITY_DENSE;
+  int scaled = IR_TENSOR_MMA(in).a_scale_mode != MTLC_TENSOR_SCALE_NONE;
   size_t pointer_count = 4u + (sparse ? 1u : scaled ? 2u : 0u);
   char bases[6][24], strides32[4][24], strides64[4][24];
   char scale_strides64[2][24] = {{0}};
@@ -5500,8 +5500,8 @@ static void ptx_emit_tensor_matmul(PtxFn *fn,
   }
   if (scaled) {
     uint32_t scale_strides[2] = {
-        in->tensor_mma.a_scale_leading_dimension,
-        in->tensor_mma.b_scale_leading_dimension};
+        IR_TENSOR_MMA(in).a_scale_leading_dimension,
+        IR_TENSOR_MMA(in).b_scale_leading_dimension};
     for (size_t i = 0; i < 2; i++) {
       reg_name(PC_B64, new_reg(fn, PC_B64), scale_strides64[i]);
       sb_printf(&fn->body, "\tmov.u64 %s, %u;\n", scale_strides64[i],
@@ -5559,7 +5559,7 @@ static void ptx_emit_tensor_matmul(PtxFn *fn,
    * transposed logical coordinates with the same leading dimension. Keep this
    * normalization backend-local; scalar replay continues to use the original
    * descriptor and explicit coordinate swaps. */
-  MtlcTensorMmaDesc native_desc = in->tensor_mma;
+  MtlcTensorMmaDesc native_desc = IR_TENSOR_MMA(in);
   if (native_desc.transpose_a) {
     native_desc.a_layout =
         ptx_tensor_matmul_transposed_layout(native_desc.a_layout);
@@ -5646,13 +5646,13 @@ static void ptx_emit_tensor_matmul(PtxFn *fn,
             "\tand.pred %s, %s, %s;\n"
             "\tand.pred %s, %s, %s;\n",
             row_origin_ok, row_origin, problem_m, row_remaining, problem_m,
-            row_origin, row_full, row_remaining, (unsigned)in->tensor_mma.m,
+            row_origin, row_full, row_remaining, (unsigned)IR_TENSOR_MMA(in).m,
             row_full, row_origin_ok, row_full, column_origin_ok,
             column_origin, problem_n, column_remaining, problem_n,
             column_origin, column_full, column_remaining,
-            (unsigned)in->tensor_mma.n, column_full, column_origin_ok,
+            (unsigned)IR_TENSOR_MMA(in).n, column_full, column_origin_ok,
             column_full, k_remaining, problem_k, k_full, k_remaining,
-            (unsigned)in->tensor_mma.k, mask_full, mask, native, row_full,
+            (unsigned)IR_TENSOR_MMA(in).k, mask_full, mask, native, row_full,
             column_full, native, native, k_full, native, native, mask_full);
   if (sparse) {
     char metadata_stride_roundtrip[24], metadata_stride_fits[24];
@@ -5699,8 +5699,13 @@ static void ptx_emit_tensor_matmul(PtxFn *fn,
     tile_arguments[i].name = pointer_names[i];
   }
   IRInstruction tile = *in;
+  /* `tile` borrows `in`'s tensor block, so the substituted descriptor goes into a
+   * private stack block rather than through the shared pointer -- writing there
+   * would rewrite the instruction we are reading from. */
+  IRTensorAux tile_tensor;
+  ir_instruction_tensor_borrow(&tile, &tile_tensor, in);
+  tile_tensor.mma = native_desc;
   tile.op = IR_OP_TENSOR_MMA;
-  tile.tensor_mma = native_desc;
   tile.arguments = tile_arguments;
   tile.argument_count = per_tile;
   tile.tensor_mma_count = 1;
@@ -5712,23 +5717,23 @@ static void ptx_emit_tensor_matmul(PtxFn *fn,
   int initial_indices[6] = {-1, -1, -1, -1, -1, -1};
   initial_indices[0] = ptx_tensor_matmul_storage_address(
       fn, bases[0], row_origin, zero64, strides64[0], native_desc.a_layout,
-      in->tensor_mma.a_element, in->tensor_mma.a_packing,
+      IR_TENSOR_MMA(in).a_element, IR_TENSOR_MMA(in).a_packing,
       initial_addresses[0], a_aligned);
   initial_indices[1] = ptx_tensor_matmul_storage_address(
       fn, bases[1], zero64, column_origin, strides64[1], native_desc.b_layout,
-      in->tensor_mma.b_element, in->tensor_mma.b_packing,
+      IR_TENSOR_MMA(in).b_element, IR_TENSOR_MMA(in).b_packing,
       initial_addresses[1], b_aligned);
   initial_indices[2] = ptx_tensor_matmul_address(
       fn, bases[2], row_origin, column_origin, strides64[2],
-      in->tensor_mma.c_layout,
+      IR_TENSOR_MMA(in).c_layout,
       (unsigned)ptx_tensor_matmul_element_bytes(
-          in->tensor_mma.accumulator_element),
+          IR_TENSOR_MMA(in).accumulator_element),
       initial_addresses[2]);
   initial_indices[3] = ptx_tensor_matmul_address(
       fn, bases[3], row_origin, column_origin, strides64[3],
-      in->tensor_mma.d_layout,
+      IR_TENSOR_MMA(in).d_layout,
       (unsigned)ptx_tensor_matmul_element_bytes(
-          in->tensor_mma.result_element),
+          IR_TENSOR_MMA(in).result_element),
       initial_addresses[3]);
   if (sparse) {
     initial_indices[4] = ptx_tensor_matmul_address(
@@ -5748,11 +5753,11 @@ static void ptx_emit_tensor_matmul(PtxFn *fn,
             a_aligned, b_aligned);
   int force_dense_contiguous[2] = {
       use_direct_mma && direct_profile.a_bits < 8 &&
-          in->tensor_mma.a_packing == MTLC_TENSOR_PACKING_DENSE_SUBBYTE &&
+          IR_TENSOR_MMA(in).a_packing == MTLC_TENSOR_PACKING_DENSE_SUBBYTE &&
           native_desc.a_layout == MTLC_TENSOR_LAYOUT_ROW_MAJOR &&
           !native_desc.transpose_a,
       use_direct_mma && direct_profile.b_bits < 8 &&
-          in->tensor_mma.b_packing == MTLC_TENSOR_PACKING_DENSE_SUBBYTE &&
+          IR_TENSOR_MMA(in).b_packing == MTLC_TENSOR_PACKING_DENSE_SUBBYTE &&
           native_desc.b_layout == MTLC_TENSOR_LAYOUT_COLUMN_MAJOR &&
           !native_desc.transpose_b};
   int direct_bits[2] = {use_direct_mma ? direct_profile.a_bits : 0,
@@ -5844,9 +5849,9 @@ static void ptx_emit_tensor_matmul(PtxFn *fn,
               "\tsub.u64 %s, %s, %s;\n"
               "\tsetp.lt.u64 %s, %s, %u;\n"
               "\t@%s bra mtlc_tensor_matmul_%llu_native_store;\n",
-              direct_q, (unsigned)in->tensor_mma.k, label_id,
+              direct_q, (unsigned)IR_TENSOR_MMA(in).k, label_id,
               direct_remaining, problem_k, direct_q, direct_loop_done,
-              direct_remaining, (unsigned)in->tensor_mma.k,
+              direct_remaining, (unsigned)IR_TENSOR_MMA(in).k,
               direct_loop_done, label_id);
     char direct_update_a[24], direct_update_b[24], direct_a_q[24];
     char direct_a_aligned[24], direct_b_aligned[24];
@@ -5859,12 +5864,12 @@ static void ptx_emit_tensor_matmul(PtxFn *fn,
     }
     int direct_update_a_index = ptx_tensor_matmul_storage_address(
         fn, bases[0], row_origin, direct_a_column, strides64[0],
-        native_desc.a_layout, in->tensor_mma.a_element,
-        in->tensor_mma.a_packing, direct_update_a, direct_a_aligned);
+        native_desc.a_layout, IR_TENSOR_MMA(in).a_element,
+        IR_TENSOR_MMA(in).a_packing, direct_update_a, direct_a_aligned);
     int direct_update_b_index = ptx_tensor_matmul_storage_address(
         fn, bases[1], direct_q, column_origin, strides64[1],
-        native_desc.b_layout, in->tensor_mma.b_element,
-        in->tensor_mma.b_packing, direct_update_b, direct_b_aligned);
+        native_desc.b_layout, IR_TENSOR_MMA(in).b_element,
+        IR_TENSOR_MMA(in).b_packing, direct_update_b, direct_b_aligned);
     int direct_bound =
         ptx_tensor_matmul_bind_pointer(fn, pointer_names[0], pointer_descs[0],
                                        direct_update_a_index) &&
@@ -5886,7 +5891,7 @@ static void ptx_emit_tensor_matmul(PtxFn *fn,
               direct_update_metadata_index);
     } else if (scaled) {
       unsigned scale_shift =
-          in->tensor_mma.a_scale_mode == MTLC_TENSOR_SCALE_BLOCK_16 ? 4 : 5;
+          IR_TENSOR_MMA(in).a_scale_mode == MTLC_TENSOR_SCALE_BLOCK_16 ? 4 : 5;
       char direct_scale_chunk[24], direct_update_scale_a[24];
       char direct_update_scale_b[24];
       reg_name(PC_B64, new_reg(fn, PC_B64), direct_scale_chunk);
@@ -5948,7 +5953,7 @@ static void ptx_emit_tensor_matmul(PtxFn *fn,
               "\tadd.u64 %s, %s, %u;\n"
               "\tbra mtlc_tensor_matmul_%llu_native_k;\n"
               "mtlc_tensor_matmul_%llu_native_store:\n",
-              direct_q, direct_q, (unsigned)in->tensor_mma.k, label_id,
+              direct_q, direct_q, (unsigned)IR_TENSOR_MMA(in).k, label_id,
               label_id);
     for (int m_tile = 0; m_tile < direct_profile.m_tiles; m_tile++) {
       for (int n_tile = 0; n_tile < direct_profile.n_tiles; n_tile++) {
@@ -5997,18 +6002,18 @@ static void ptx_emit_tensor_matmul(PtxFn *fn,
             "\tsub.u64 %s, %s, %s;\n"
             "\tsetp.lt.u64 %s, %s, %u;\n"
             "\t@%s bra mtlc_tensor_matmul_%llu_native_store;\n",
-            q, (unsigned)in->tensor_mma.k, label_id, remaining, problem_k, q,
-            loop_done, remaining, (unsigned)in->tensor_mma.k, loop_done,
+            q, (unsigned)IR_TENSOR_MMA(in).k, label_id, remaining, problem_k, q,
+            loop_done, remaining, (unsigned)IR_TENSOR_MMA(in).k, loop_done,
             label_id);
   char update_a[24], update_b[24];
   int update_a_index = ptx_tensor_matmul_address(
       fn, bases[0], row_origin, q, strides64[0], native_desc.a_layout,
-      (unsigned)ptx_tensor_matmul_element_bytes(in->tensor_mma.a_element),
+      (unsigned)ptx_tensor_matmul_element_bytes(IR_TENSOR_MMA(in).a_element),
       update_a);
   int update_b_index = ptx_tensor_matmul_address(
       fn, bases[1], q, column_origin, strides64[1],
       native_desc.b_layout,
-      (unsigned)ptx_tensor_matmul_element_bytes(in->tensor_mma.b_element),
+      (unsigned)ptx_tensor_matmul_element_bytes(IR_TENSOR_MMA(in).b_element),
       update_b);
   if (!ptx_tensor_matmul_bind_pointer(fn, pointer_names[0], pointer_descs[0],
                                       update_a_index) ||
@@ -6021,7 +6026,7 @@ static void ptx_emit_tensor_matmul(PtxFn *fn,
             "\tadd.u64 %s, %s, %u;\n"
             "\tbra mtlc_tensor_matmul_%llu_native_k;\n"
             "mtlc_tensor_matmul_%llu_native_store:\n",
-            q, q, (unsigned)in->tensor_mma.k, label_id, label_id);
+            q, q, (unsigned)IR_TENSOR_MMA(in).k, label_id, label_id);
   if (!ptx_emit_wmma_tiled_store(fn, &tile, &profile, 0, per_tile,
                                   accumulator_base))
     return;
@@ -6419,10 +6424,10 @@ static void emit_function(IRProgram *program, size_t fi, CodeGenerator *gen,
   for (size_t i = 0; i < func->instruction_count; i++) {
     const IRInstruction *in = &func->instructions[i];
     if (in->op == IR_OP_TENSOR_TRANSFER &&
-        in->tensor_transfer.direction ==
+        IR_TENSOR_TRANSFER(in).direction ==
             MTLC_TENSOR_TRANSFER_GLOBAL_TO_WORKGROUP &&
         ptx_tensor_transfer_native_capable(
-            &fn, &in->tensor_transfer,
+            &fn, &IR_TENSOR_TRANSFER(in),
             in->tensor_transfer_has_prepared_view)) {
       needs_tensor_transfer_barrier = 1;
       break;

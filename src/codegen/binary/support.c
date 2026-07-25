@@ -558,6 +558,7 @@ void binary_function_context_destroy(BinaryFunctionContext *context) {
   binary_label_fixup_table_destroy(&context->label_fixups);
   binary_call_relocation_table_destroy(&context->call_relocations);
   binary_offset_table_destroy(&context->return_fixups);
+  binary_operand_type_index_destroy(&context->operand_types);
   free(context->indirect_return_slot_offsets);
   free(context->indirect_temp_names);
   free(context->indirect_temp_sizes);

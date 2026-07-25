@@ -4,6 +4,15 @@ CC = gcc
 # (bare token, stringified in main.c - avoids fragile quote escaping)
 EXTRA_CFLAGS =
 CFLAGS = -Wall -Wextra -std=c99 -g -O2 -D_GNU_SOURCE -Isrc -Iinclude -fno-omit-frame-pointer $(EXTRA_CFLAGS)
+# Build the driver against src/mettle_alloc.c instead of the platform heap.
+# Drop this to fall back to malloc (e.g. to attribute a regression). A
+# sanitizer build needs no flag: the allocator detects one and stands down,
+# because ASan/TSan/MSan/LSan intercept malloc themselves. See
+# src/mettle_alloc.h.
+INTERNAL_ALLOC ?= 1
+ifeq ($(INTERNAL_ALLOC),1)
+CFLAGS += -DMETTLE_INTERNAL_ALLOC
+endif
 # Native compiler build profile for DGX Spark. GCC/Clang versions without a
 # GB10-specific scheduler use ARMv9.2-A; GCC 15 / LLVM 21 users should override
 # with `DGX_SPARK_CFLAGS=-mcpu=gb10` as recommended by NVIDIA.
@@ -67,7 +76,11 @@ ERROR_SOURCES = $(SRCDIR)/error/error_explain.c
 DEBUG_SOURCES = $(SRCDIR)/debug/debug_info.c
 COMPILER_SOURCES = $(SRCDIR)/compiler/compiler_context.c $(SRCDIR)/compiler/compiler_crash.c
 COMMON_SOURCES = $(SRCDIR)/common.c
-MAIN_SOURCES = $(SRCDIR)/main.c $(SRCDIR)/tracy_build.c
+# mettle_alloc.c interposes on malloc/free for the whole process, which is
+# the host application's call to make -- so it links into the driver, not
+# into libmtlc, where it would silently replace an embedder's allocator.
+# Symbol resolution is global, so the backend's allocations still land in it.
+MAIN_SOURCES = $(SRCDIR)/main.c $(SRCDIR)/tracy_build.c $(SRCDIR)/mettle_alloc.c
 
 # libmtlc: the standalone, frontend-agnostic backend (IR core, optimizer + GNN,
 # code generators, native linker, public API).

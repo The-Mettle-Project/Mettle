@@ -164,6 +164,27 @@ static int ir_fill_install(IRFunction *function, size_t header_index,
     }
   }
 
+  /* Pointer-walk mode: the walking pointer ends at `pend` in the scalar loop;
+   * preserve that for any later reads (dead-store elimination removes it when
+   * nothing looks). Built HERE, before the teardown below, because
+   * final_assign_to/from point at operand names owned by the loop body that the
+   * teardown is about to free. */
+  IRInstruction final_assign = {0};
+  int want_final_assign =
+      final_assign_to && final_assign_from && header_index + 2 <= jump_index;
+  if (want_final_assign) {
+    final_assign.op = IR_OP_ASSIGN;
+    final_assign.location = fused.location;
+    final_assign.dest = ir_operand_symbol(final_assign_to);
+    final_assign.lhs = ir_operand_symbol(final_assign_from);
+    if (!final_assign.dest.name || !final_assign.lhs.name) {
+      ir_instruction_destroy_storage(&final_assign);
+      ir_instruction_destroy_storage(&producer_clone);
+      ir_instruction_destroy_storage(&fused);
+      return 0;
+    }
+  }
+
   ir_instruction_destroy_storage(&function->instructions[header_index]);
   memset(&function->instructions[header_index], 0,
          sizeof(function->instructions[header_index]));
@@ -177,17 +198,10 @@ static int ir_fill_install(IRFunction *function, size_t header_index,
     function->instructions[header_index] = fused;
   }
 
-  /* Pointer-walk mode: the walking pointer ends at `pend` in the scalar
-   * loop; preserve that for any later reads (dead-store elimination removes
-   * it when nothing looks). */
-  if (final_assign_to && final_assign_from &&
-      header_index + 2 <= jump_index) {
-    IRInstruction *assign =
-        &function->instructions[header_index + (offset_producer ? 2 : 1)];
-    assign->op = IR_OP_ASSIGN;
-    assign->dest = ir_operand_symbol(final_assign_to);
-    assign->lhs = ir_operand_symbol(final_assign_from);
-    assign->location = function->instructions[header_index].location;
+  if (want_final_assign) {
+    /* The slot was nop'd above, so it owns nothing and can be overwritten. */
+    function->instructions[header_index + (offset_producer ? 2 : 1)] =
+        final_assign;
   }
 
   if (changed) {
@@ -514,14 +528,24 @@ static int ir_fill_try_indexed(IRFunction *function, size_t header_index,
     }
     start_op = &start;
   }
+  /* install rewrites the loop, freeing the compare that owns `iv`'s name, so
+   * take a copy while it is still valid. */
+  char *iv_name = iv_live_after ? mettle_strdup(iv) : NULL;
+  if (iv_live_after && !iv_name) {
+    ir_operand_destroy(&value);
+    ir_operand_destroy(&start);
+    return 0;
+  }
   int ok = ir_fill_install(function, header_index, jump_index, /*mode=*/0,
                            size, &addr->lhs, &compare->rhs, &value, start_op,
                            offset_op, offset_producer, NULL, NULL, changed);
-  if (ok && iv_live_after) {
+  if (ok && iv_name) {
     IRInstruction *fused =
         &function->instructions[header_index + (offset_producer ? 1 : 0)];
-    fused->dest = ir_operand_symbol(iv);
+    ir_operand_destroy(&fused->dest);
+    fused->dest = ir_operand_symbol(iv_name);
   }
+  mettle_free_string(iv_name);
   if (ok && index_width == 64) {
     /* Flag the 64-bit index path for the kernel (args[5]). */
     IRInstruction *fused =
@@ -647,14 +671,24 @@ static int ir_fill_try_byte_walk(IRFunction *function, size_t header_index,
    * start + ceil(len/size)*size, overshoot included -- and writes it back
    * when anything reads the iv afterwards. */
   int iv_live_after = ir_symbol_live_after_loop(function, jump_index + 1, iv);
+  /* install rewrites the loop, freeing the compare that owns `iv`'s name, so
+   * take a copy while it is still valid. */
+  char *iv_name = iv_live_after ? mettle_strdup(iv) : NULL;
+  if (iv_live_after && !iv_name) {
+    ir_operand_destroy(&value);
+    ir_operand_destroy(&start);
+    return 0;
+  }
   int ok = ir_fill_install(function, header_index, jump_index, /*mode=*/2,
                            size, &addr->lhs, &compare->rhs, &value, &start,
                            NULL, NULL, NULL, NULL, changed);
-  if (ok && iv_live_after) {
+  if (ok && iv_name) {
     /* install placed the fused op at header_index. */
     IRInstruction *fused = &function->instructions[header_index];
-    fused->dest = ir_operand_symbol(iv);
+    ir_operand_destroy(&fused->dest);
+    fused->dest = ir_operand_symbol(iv_name);
   }
+  mettle_free_string(iv_name);
   ir_operand_destroy(&value);
   ir_operand_destroy(&start);
   return ok;

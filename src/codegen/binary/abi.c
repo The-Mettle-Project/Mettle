@@ -1,5 +1,7 @@
 #include "codegen/binary/internal.h"
 
+#include "common.h" /* mettle_fnv1a_hash, for the operand-type index */
+
 #include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -1084,11 +1086,127 @@ MtlcType *code_generator_binary_get_operand_type(CodeGenerator *generator,
   }
 }
 
+/* Slot for `name`, appending an empty entry when absent. NULL only on OOM. */
+static BinaryOperandTypeEntry *binary_operand_type_slot(
+    BinaryOperandTypeIndex *ix, const char *name) {
+  size_t b = mettle_fnv1a_hash(name) & (ix->bucket_count - 1);
+  while (ix->buckets[b]) {
+    BinaryOperandTypeEntry *e = &ix->items[ix->buckets[b] - 1];
+    if (strcmp(e->name, name) == 0) {
+      return e;
+    }
+    b = (b + 1) & (ix->bucket_count - 1);
+  }
+  if (ix->count >= ix->capacity) {
+    size_t nc = ix->capacity ? ix->capacity * 2 : 32;
+    BinaryOperandTypeEntry *grown = (BinaryOperandTypeEntry *)realloc(
+        ix->items, nc * sizeof(BinaryOperandTypeEntry));
+    if (!grown) {
+      return NULL;
+    }
+    ix->items = grown;
+    ix->capacity = nc;
+  }
+  memset(&ix->items[ix->count], 0, sizeof(ix->items[ix->count]));
+  ix->items[ix->count].name = name;
+  ix->count++;
+  ix->buckets[b] = ix->count;
+
+  if ((ix->count + 1) * 4 >= ix->bucket_count * 3) {
+    size_t nb = ix->bucket_count * 2;
+    size_t *fresh = (size_t *)calloc(nb, sizeof(size_t));
+    if (!fresh) {
+      return NULL;
+    }
+    for (size_t i = 0; i < ix->count; i++) {
+      size_t nbk = mettle_fnv1a_hash(ix->items[i].name) & (nb - 1);
+      while (fresh[nbk]) {
+        nbk = (nbk + 1) & (nb - 1);
+      }
+      fresh[nbk] = i + 1;
+    }
+    free(ix->buckets);
+    ix->buckets = fresh;
+    ix->bucket_count = nb;
+  }
+  return &ix->items[ix->count - 1];
+}
+
+/* One pass over the function, recording for each operand name the first
+ * DECLARE_LOCAL type text and the first baked value_type per operand kind.
+ * Leaves `built` set either way: a function whose index cannot be allocated
+ * simply resolves nothing here, exactly as an empty function would. */
+static void binary_operand_type_index_build(BinaryOperandTypeIndex *ix,
+                                            const IRFunction *fn) {
+  ix->built = 1;
+  ix->bucket_count = 64;
+  while (ix->bucket_count < (fn->instruction_count + 1) * 2) {
+    ix->bucket_count *= 2;
+  }
+  ix->buckets = (size_t *)calloc(ix->bucket_count, sizeof(size_t));
+  if (!ix->buckets) {
+    ix->bucket_count = 0;
+    return;
+  }
+  for (size_t i = 0; i < fn->instruction_count; i++) {
+    const IRInstruction *in = &fn->instructions[i];
+    if (in->op == IR_OP_DECLARE_LOCAL && in->dest.name && in->text) {
+      BinaryOperandTypeEntry *e = binary_operand_type_slot(ix, in->dest.name);
+      if (!e) {
+        return;
+      }
+      if (!e->decl_type) {
+        e->decl_type = in->text;
+      }
+    }
+    if (in->value_type && in->dest.name &&
+        (in->dest.kind == IR_OPERAND_SYMBOL ||
+         in->dest.kind == IR_OPERAND_TEMP)) {
+      BinaryOperandTypeEntry *e = binary_operand_type_slot(ix, in->dest.name);
+      if (!e) {
+        return;
+      }
+      if (in->dest.kind == IR_OPERAND_SYMBOL) {
+        if (!e->symbol_type) {
+          e->symbol_type = in->value_type;
+        }
+      } else if (!e->temp_type) {
+        e->temp_type = in->value_type;
+      }
+    }
+  }
+}
+
+static const BinaryOperandTypeEntry *binary_operand_type_find(
+    const BinaryOperandTypeIndex *ix, const char *name) {
+  if (!ix->bucket_count) {
+    return NULL;
+  }
+  {
+    size_t b = mettle_fnv1a_hash(name) & (ix->bucket_count - 1);
+    while (ix->buckets[b]) {
+      const BinaryOperandTypeEntry *e = &ix->items[ix->buckets[b] - 1];
+      if (strcmp(e->name, name) == 0) {
+        return e;
+      }
+      b = (b + 1) & (ix->bucket_count - 1);
+    }
+  }
+  return NULL;
+}
+
+void binary_operand_type_index_destroy(BinaryOperandTypeIndex *ix) {
+  free(ix->items);
+  free(ix->buckets);
+  memset(ix, 0, sizeof(*ix));
+}
+
 MtlcType *code_generator_binary_get_operand_type_in_context(
     CodeGenerator *generator, BinaryFunctionContext *context,
     const IROperand *operand) {
   MtlcType *type = code_generator_binary_get_operand_type(generator, operand);
   IRFunction *ir_function = NULL;
+  const BinaryOperandTypeEntry *entry = NULL;
 
   if (type || !generator || !operand || !operand->name ||
       (operand->kind != IR_OPERAND_SYMBOL &&
@@ -1096,12 +1214,26 @@ MtlcType *code_generator_binary_get_operand_type_in_context(
     return type;
   }
 
-  if (context && context->function_name) {
-    ir_function =
-        code_generator_find_ir_function_binary(generator, context->function_name);
+  if (context) {
+    /* prepare_function_context sets both from the same IRFunction, so the
+     * pointer it recorded is the function this name lookup used to perform. */
+    ir_function = context->ir_function;
+    if (!ir_function && context->function_name) {
+      ir_function = code_generator_find_ir_function_binary(
+          generator, context->function_name);
+    }
   }
   if (!ir_function) {
     return NULL;
+  }
+
+  /* Both remaining lookups used to scan every instruction with a strcmp per
+   * instruction, once per operand -- quadratic in the function's size. */
+  if (context && ir_function == context->ir_function) {
+    if (!context->operand_types.built) {
+      binary_operand_type_index_build(&context->operand_types, ir_function);
+    }
+    entry = binary_operand_type_find(&context->operand_types, operand->name);
   }
 
   if (operand->kind == IR_OPERAND_SYMBOL) {
@@ -1122,14 +1254,9 @@ MtlcType *code_generator_binary_get_operand_type_in_context(
       }
     }
 
-    for (size_t i = 0; i < ir_function->instruction_count; i++) {
-      const IRInstruction *instruction = &ir_function->instructions[i];
-      if (instruction->op == IR_OP_DECLARE_LOCAL && instruction->dest.name &&
-          strcmp(instruction->dest.name, operand->name) == 0 &&
-          instruction->text) {
-        return code_generator_binary_get_resolved_type(generator,
-                                                       instruction->text, 0);
-      }
+    if (entry && entry->decl_type) {
+      return code_generator_binary_get_resolved_type(generator,
+                                                     entry->decl_type, 0);
     }
   }
 
@@ -1141,13 +1268,11 @@ MtlcType *code_generator_binary_get_operand_type_in_context(
    * before a following arithmetic shift reads it. Without this an unsigned or
    * narrow temp operand resolves NULL -> "signed"/unwidened and miscompiles
    * unsigned / % >> and compares in API-built modules. */
-  for (size_t i = 0; i < ir_function->instruction_count; i++) {
-    const IRInstruction *instruction = &ir_function->instructions[i];
-    if (instruction->value_type &&
-        instruction->dest.kind == operand->kind &&
-        instruction->dest.name &&
-        strcmp(instruction->dest.name, operand->name) == 0) {
-      return instruction->value_type;
+  if (entry) {
+    MtlcType *baked = operand->kind == IR_OPERAND_SYMBOL ? entry->symbol_type
+                                                         : entry->temp_type;
+    if (baked) {
+      return baked;
     }
   }
 

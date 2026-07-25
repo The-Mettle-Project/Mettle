@@ -179,6 +179,12 @@ struct IRVerifySnapshot {
 static int irv_instruction_deep_copy(IRInstruction *dst,
                                      const IRInstruction *src) {
   *dst = *src;
+  /* Detach the aliased tensor block the shallow copy brought over, then take our
+   * own: this snapshot is freed independently of the instruction it copies. */
+  dst->tensor = NULL;
+  if (!ir_instruction_tensor_copy(dst, src)) {
+    return 0;
+  }
   dst->dest = ir_operand_copy(&src->dest);
   dst->lhs = ir_operand_copy(&src->lhs);
   dst->rhs = ir_operand_copy(&src->rhs);
@@ -270,14 +276,14 @@ static int irv_snapshot_matches(const IRFunction *function,
         a->async_copy_pending_groups != b->async_copy_pending_groups ||
         a->async_copy_cache != b->async_copy_cache ||
         a->async_copy_generated != b->async_copy_generated ||
-        memcmp(&a->tensor_transfer, &b->tensor_transfer,
-               sizeof(a->tensor_transfer)) != 0 ||
+        memcmp(&IR_TENSOR_TRANSFER(a), &IR_TENSOR_TRANSFER(b),
+               sizeof(IR_TENSOR_TRANSFER(a))) != 0 ||
         a->tensor_transfer_has_prepared_view !=
             b->tensor_transfer_has_prepared_view ||
-        memcmp(&a->tensor_mma, &b->tensor_mma,
-               sizeof(a->tensor_mma)) != 0 ||
-        memcmp(&a->tensor_epilogue, &b->tensor_epilogue,
-               sizeof(a->tensor_epilogue)) != 0 ||
+        memcmp(&IR_TENSOR_MMA(a), &IR_TENSOR_MMA(b),
+               sizeof(IR_TENSOR_MMA(a))) != 0 ||
+        memcmp(&IR_TENSOR_EPILOGUE(a), &IR_TENSOR_EPILOGUE(b),
+               sizeof(IR_TENSOR_EPILOGUE(a))) != 0 ||
         a->tensor_mma_count != b->tensor_mma_count ||
         a->tensor_residency_id != b->tensor_residency_id ||
         a->tensor_residency_role != b->tensor_residency_role ||

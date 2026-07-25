@@ -5647,6 +5647,37 @@ catch {
   Write-CaseResult -Name "runtime_access_violation_trace" -Passed $false -Reason $_.Exception.Message
 }
 
+# Internal allocator gate. src/mettle_alloc.c interposes on malloc/free for the
+# whole driver, so a fault there corrupts every later phase in ways that are hard
+# to attribute back. This exercises the parts that are easy to get wrong -- size
+# class boundaries, realloc growth and shrink, calloc's skip-the-memset path, page
+# and segment recycling, huge allocations, cross-thread frees -- and checks block
+# CONTENTS, not merely that nothing crashed. Built with -DMETTLE_ALLOC_POISON so
+# freed blocks are stamped, which turns a stale-pointer read into a recognisable
+# value instead of whatever happened to still be there.
+$total++
+try {
+  $allocExe = "bin\alloc_test.exe"
+  & gcc -Wall -Wextra -std=c99 -g -O2 -D_GNU_SOURCE -DMETTLE_INTERNAL_ALLOC -DMETTLE_ALLOC_POISON -Isrc tests\alloc_test.c src\mettle_alloc.c -o $allocExe
+  if ($LASTEXITCODE -ne 0) {
+    throw "Failed to compile allocator test"
+  }
+
+  $allocOutput = & $allocExe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "Allocator test exited with code $LASTEXITCODE`n$allocOutput"
+  }
+  if ($allocOutput -notmatch "\[PASS\] alloc_test") {
+    throw "Allocator test did not report success`n$allocOutput"
+  }
+
+  Write-CaseResult -Name "internal_allocator" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "internal_allocator" -Passed $false -Reason $_.Exception.Message
+}
+
 # Crash handler test. On Windows this compiles and runs but is a documented
 # no-op (the SEH crash path is already covered by runtime_null_trace /
 # runtime_access_violation_trace); the meaningful assertions run on POSIX.

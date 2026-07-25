@@ -39,7 +39,7 @@ static int tensor_desc_can_accumulate(const MtlcTensorMmaDesc *desc) {
 
 static int tensor_runtime_accumulator_stride_matches(
     const IRInstruction *first, const IRInstruction *candidate) {
-  const MtlcTensorMmaDesc *desc = &first->tensor_mma;
+  const MtlcTensorMmaDesc *desc = &IR_TENSOR_MMA(first);
   size_t c = tensor_stride_operand_index(desc, MTLC_TENSOR_RUNTIME_STRIDE_C);
   size_t d = tensor_stride_operand_index(desc, MTLC_TENSOR_RUNTIME_STRIDE_D);
   if (c == SIZE_MAX) return 1;
@@ -54,11 +54,11 @@ static int tensor_instruction_can_join(const IRInstruction *first,
       candidate->op != IR_OP_TENSOR_MMA ||
       ir_tensor_mma_instruction_count(first) != 1 ||
       ir_tensor_mma_instruction_count(candidate) != 1 ||
-      !ir_tensor_mma_desc_equal(&first->tensor_mma,
-                                &candidate->tensor_mma) ||
-      !tensor_desc_can_accumulate(&first->tensor_mma))
+      !ir_tensor_mma_desc_equal(&IR_TENSOR_MMA(first),
+                                &IR_TENSOR_MMA(candidate)) ||
+      !tensor_desc_can_accumulate(&IR_TENSOR_MMA(first)))
     return 0;
-  size_t per_tile = ir_tensor_mma_operand_count(&first->tensor_mma);
+  size_t per_tile = ir_tensor_mma_operand_count(&IR_TENSOR_MMA(first));
   if (!per_tile || first->argument_count != per_tile ||
       candidate->argument_count != per_tile)
     return 0;
@@ -133,7 +133,7 @@ static int tensor_try_form_pipeline_residency(IRFunction *function,
       ir_tensor_mma_instruction_count(first) != 1 ||
       first->tensor_residency_role != IR_TENSOR_RESIDENCY_NONE ||
       first->tensor_residency_scope != IR_TENSOR_RESIDENCY_SCOPE_NONE ||
-      !tensor_desc_can_accumulate(&first->tensor_mma) ||
+      !tensor_desc_can_accumulate(&IR_TENSOR_MMA(first)) ||
       first->argument_count < 4)
     return 0;
 
@@ -252,7 +252,7 @@ static int tensor_try_form_loop_residency(IRFunction *function,
       ir_tensor_mma_instruction_count(first) != 1 ||
       first->tensor_residency_role != IR_TENSOR_RESIDENCY_NONE ||
       first->tensor_residency_scope != IR_TENSOR_RESIDENCY_SCOPE_NONE ||
-      !tensor_desc_can_accumulate(&first->tensor_mma) ||
+      !tensor_desc_can_accumulate(&IR_TENSOR_MMA(first)) ||
       first->argument_count < 4)
     return 0;
 
@@ -413,7 +413,7 @@ int ir_fuse_tensor_mma_chains_pass(IRFunction *function, int *changed) {
     IRInstruction *first = &function->instructions[i];
     if (first->op != IR_OP_TENSOR_MMA ||
         ir_tensor_mma_instruction_count(first) != 1 ||
-        !tensor_desc_can_accumulate(&first->tensor_mma))
+        !tensor_desc_can_accumulate(&IR_TENSOR_MMA(first)))
       continue;
     size_t end = i + 1;
     while (end < function->instruction_count &&

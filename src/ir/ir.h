@@ -358,6 +358,46 @@ typedef enum {
   IR_TENSOR_RESIDENCY_SCOPE_PIPELINE = 2
 } IRTensorResidencyScope;
 
+/* The three tensor descriptors, held out of line.
+ *
+ * Together they are 296 bytes, and only the handful of tensor opcodes carry any
+ * of them -- yet an inline copy made every IRInstruction in the program 576
+ * bytes. That is nine cache lines to touch per instruction in every pass that
+ * walks the array, and one full 576-byte store per append. Moving them behind a
+ * pointer takes IRInstruction to 288.
+ *
+ * Ownership follows the conventions the rest of IRInstruction already uses:
+ *
+ *   - A shallow struct copy is a BORROW. It shares this block and must never be
+ *     destroyed. That is what ptx_emitter and the tensor optimizer do with their
+ *     local `IRInstruction single = *in;` working copies.
+ *   - append / insert / clone / snapshot COPY IN, and deep-copy this block via
+ *     ir_instruction_tensor_copy.
+ *   - the vector-append and insert helpers that MOVE clear the source pointer.
+ *   - destroy releases it through ir_instruction_tensor_clear.
+ *
+ * `heap_owned` is what makes a borrow safe to modify: a caller that needs to
+ * change a descriptor on a working copy points it at a stack block (via
+ * ir_instruction_tensor_borrow) instead of writing through the shared one, and
+ * clear() then knows not to free it.
+ *
+ * Those rules are what a shallow struct copy cannot enforce for itself, so
+ * building with -DMETTLE_IR_TENSOR_DEBUG checks them: every owned block carries a
+ * magic word that clear() invalidates before freeing, and both clear() and the
+ * read accessor abort on a block whose magic is wrong. A copy site that was
+ * missed then shows up as a double free or a read-after-free with a message,
+ * instead of as quiet corruption. Combined with -DMETTLE_ALLOC_POISON, which
+ * stamps freed memory, the check is deterministic rather than probabilistic. */
+typedef struct IRTensorAux {
+  int heap_owned; /* 0 for a stack or otherwise non-owned block */
+#ifdef METTLE_IR_TENSOR_DEBUG
+  unsigned magic;
+#endif
+  MtlcTensorTransferDesc transfer;
+  MtlcTensorMmaDesc mma;
+  MtlcTensorEpilogueDesc epilogue;
+} IRTensorAux;
+
 typedef struct {
   IROpcode op;
   /* Semantic identity for a target-neutral intrinsic call. `text` is retained
@@ -381,10 +421,11 @@ typedef struct {
    * global-load/workgroup-store pair. This is provenance for dumps,
    * diagnostics, and backend comments; it never changes copy semantics. */
   int async_copy_generated;
-  MtlcTensorTransferDesc tensor_transfer;
+  /* Tensor descriptors, out of line; NULL on the overwhelming majority of
+   * instructions. Read through IR_TENSOR_TRANSFER / _MMA / _EPILOGUE, which
+   * substitute an all-zero block when it is absent. See IRTensorAux. */
+  IRTensorAux *tensor;
   int tensor_transfer_has_prepared_view;
-  MtlcTensorMmaDesc tensor_mma;
-  MtlcTensorEpilogueDesc tensor_epilogue;
   /* Number of sequential D=A*B+C tiles packed into arguments. Zero and one
    * both mean the legacy single tile. For a chain, each tile contributes one
    * complete operand bundle; C[i] must be D[i-1] and every D must name the
@@ -681,6 +722,37 @@ int ir_program_dump(IRProgram *program, FILE *output);
 /* Human-readable mnemonic for an opcode (e.g. "simd_dot_i8"), used by dumps and
  * the `--simd-report` diagnostics. */
 const char *ir_opcode_name(IROpcode op);
+/* ---- tensor descriptor block ------------------------------------------------
+ *
+ * Reads go through the three macros, which yield an lvalue so that both
+ * `IR_TENSOR_MMA(in).k` and `&IR_TENSOR_MMA(in)` read the same as the inline
+ * fields they replace. An instruction with no block reads as all zeroes, which is
+ * what the zero-initialised inline fields used to give. */
+const IRTensorAux *ir_instruction_tensor_ro(const IRInstruction *instruction);
+
+#define IR_TENSOR_TRANSFER(in) (ir_instruction_tensor_ro(in)->transfer)
+#define IR_TENSOR_MMA(in) (ir_instruction_tensor_ro(in)->mma)
+#define IR_TENSOR_EPILOGUE(in) (ir_instruction_tensor_ro(in)->epilogue)
+
+/* Give `dst` its own copy of `src`'s block. Used by every path that copies an
+ * instruction rather than moving or borrowing it. Returns 0 only on OOM. */
+int ir_instruction_tensor_copy(IRInstruction *dst, const IRInstruction *src);
+
+/* Release `dst`'s block if it owns one, and detach it either way. */
+void ir_instruction_tensor_clear(IRInstruction *instruction);
+
+/* Seed a caller-provided (typically stack) block from `src` and attach it to
+ * `dst`, so a working copy can carry a modified descriptor without writing
+ * through the block its borrow shares. The block is marked not-owned, so `dst`
+ * can still go through the normal destroy path. */
+void ir_instruction_tensor_borrow(IRInstruction *dst, IRTensorAux *block,
+                                  const IRInstruction *src);
+
+/* Attach a zeroed caller-provided block to a freshly built instruction, for the
+ * lowering and builder paths that fill in one descriptor and then append. */
+#define ir_instruction_tensor_attach(dst, block) \
+  ir_instruction_tensor_borrow((dst), (block), NULL)
+
 int ir_instruction_dump(const IRInstruction *instruction,
                         char *buffer, size_t capacity);
 
