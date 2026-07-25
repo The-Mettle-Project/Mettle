@@ -74,6 +74,35 @@ fn main() -> int32 {
 }
 ```
 
+## With Constant Tables
+
+Arrays and structs are written with an [aggregate literal](expressions.md#aggregate-literals). At global scope the value is laid out in the object file's data, so a lookup table costs nothing at startup. `[value; count]` repeats one value.
+
+```mettle
+struct Pt {
+  x: float64;
+  y: float64;
+}
+
+struct Ops {
+  fast: fn(int32) -> int32;
+  slow: fn(int32) -> int32;
+}
+
+fn triple(v: int32) -> int32 { return v * 3; }
+fn quadruple(v: int32) -> int32 { return v * 4; }
+
+const SHIFTS: int32[8] = [7, 12, 17, 22, 5, 9, 14, 20];
+const SCRATCH: uint8[64] = [0; 64];
+const CORNERS: Pt[2] = [{ x: 0.0, y: 0.0 }, { x: 1.0, y: 1.0 }];
+const DISPATCH: Ops = { fast: &triple, slow: &quadruple };
+
+fn main() -> int32 {
+  var local: int32[4] = [1, 2, 3, 4];  // copied in from the same constant
+  return SHIFTS[0] + (int32)CORNERS[1].x + DISPATCH.fast(1) + local[3];
+}
+```
+
 ## With Heap Allocation and Structs
 
 Uses `new` for zero-initialized heap allocation. The emitted code calls `calloc(1, n)` directly; no Mettle runtime object is linked unless the program also uses `-d`/`-s` crash tracebacks or `std/thread` atomics. See [Heap Allocator Runtime](heap-allocation.md).

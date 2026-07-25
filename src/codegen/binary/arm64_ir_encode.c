@@ -1251,6 +1251,112 @@ static void arm64_object_error(char *error, size_t capacity,
   }
 }
 
+/* Emit a global struct or array. With a folded initializer image it goes to
+ * .data followed by one ADDR64 relocation per pointer-sized hole (a function's
+ * address, another global's address, or a string element, whose characters and
+ * { chars, length } record are parked in .rodata first). Without one it is
+ * plain zeroed .bss. Mirrors the x86-64 path in globals.c. */
+static int arm64_object_emit_aggregate(Arm64ObjectContext *object,
+                                       const IRModuleSymbol *symbol,
+                                       const char *link_name,
+                                       size_t data_section,
+                                       size_t bss_section) {
+  BinaryEmitter *emitter = object->emitter;
+  size_t size = mtlc_type_size(symbol->type);
+  size_t alignment = symbol->type->alignment ? symbol->type->alignment : 8;
+  size_t offset = 0;
+
+  if (size == 0) return 0;
+
+  if (!symbol->init_bytes || symbol->init_bytes_size == 0) {
+    if (!binary_emitter_align_section(emitter, bss_section, alignment, 0) ||
+        !binary_emitter_append_zeros(emitter, bss_section, size, &offset)) {
+      return 0;
+    }
+    return binary_emitter_define_symbol(emitter, link_name,
+                                        BINARY_SYMBOL_GLOBAL, bss_section,
+                                        offset, size);
+  }
+
+  if (!binary_emitter_align_section(emitter, data_section, alignment, 0) ||
+      !binary_emitter_append_bytes(emitter, data_section, symbol->init_bytes,
+                                   symbol->init_bytes_size, &offset)) {
+    return 0;
+  }
+
+  for (size_t i = 0; i < symbol->init_reloc_count; i++) {
+    const IRInitReloc *reloc = &symbol->init_relocs[i];
+    const char *target = reloc->symbol;
+    char chars_symbol[64];
+    char record_symbol[64];
+
+    if (!target) {
+      size_t chars_offset = 0;
+      size_t length = reloc->string ? strlen(reloc->string) : 0;
+      snprintf(chars_symbol, sizeof(chars_symbol), ".Lmtlc.gstr.%u",
+               object->string_id++);
+      if (!binary_emitter_append_bytes(emitter, object->rodata_section,
+                                       reloc->string ? reloc->string : "",
+                                       length + 1, &chars_offset) ||
+          !binary_emitter_define_symbol(emitter, chars_symbol,
+                                        BINARY_SYMBOL_LOCAL,
+                                        object->rodata_section, chars_offset,
+                                        length + 1)) {
+        return 0;
+      }
+      target = chars_symbol;
+
+      if (reloc->string_wants_record) {
+        /* A `string` slot points at a { chars, length } record, not at the
+         * characters, which is what a string value is everywhere else. */
+        size_t record_offset = 0;
+        uint64_t encoded_length = (uint64_t)length;
+        BinarySection *rodata = NULL;
+        snprintf(record_symbol, sizeof(record_symbol), ".Lmtlc.gstr.%u",
+                 object->string_id++);
+        if (!binary_emitter_align_section(emitter, object->rodata_section, 8,
+                                          0) ||
+            !binary_emitter_append_zeros(emitter, object->rodata_section, 16,
+                                         &record_offset) ||
+            !binary_emitter_define_symbol(emitter, record_symbol,
+                                          BINARY_SYMBOL_LOCAL,
+                                          object->rodata_section,
+                                          record_offset, 16) ||
+            !binary_emitter_add_relocation(emitter, object->rodata_section,
+                                           record_offset,
+                                           BINARY_RELOCATION_ADDR64,
+                                           chars_symbol, 0)) {
+          return 0;
+        }
+        rodata = binary_emitter_get_section(emitter, object->rodata_section);
+        if (!rodata || !rodata->data ||
+            record_offset + 16 > rodata->size) {
+          return 0;
+        }
+        memcpy(rodata->data + record_offset + 8, &encoded_length, 8);
+        target = record_symbol;
+      }
+    } else {
+      const IRModuleSymbol *referenced =
+          object->program ? ir_program_lookup_symbol(object->program, target)
+                          : NULL;
+      if (referenced) {
+        target = module_link_name(referenced);
+      }
+    }
+
+    if (!binary_emitter_add_relocation(emitter, data_section,
+                                       offset + reloc->offset,
+                                       BINARY_RELOCATION_ADDR64, target, 0)) {
+      return 0;
+    }
+  }
+
+  return binary_emitter_define_symbol(emitter, link_name, BINARY_SYMBOL_GLOBAL,
+                                      data_section, offset,
+                                      symbol->init_bytes_size);
+}
+
 static int arm64_object_emit_global(Arm64ObjectContext *object,
                                     const IRModuleSymbol *symbol,
                                     size_t data_section,
@@ -1299,6 +1405,12 @@ static int arm64_object_emit_global(Arm64ObjectContext *object,
     return binary_emitter_define_symbol(
         emitter, link_name, BINARY_SYMBOL_GLOBAL, data_section, value_offset,
         16);
+  }
+
+  if (symbol->type->kind == MTLC_TYPE_STRUCT ||
+      symbol->type->kind == MTLC_TYPE_ARRAY) {
+    return arm64_object_emit_aggregate(object, symbol, link_name, data_section,
+                                       bss_section);
   }
 
   size_t size = mtlc_type_size(symbol->type);

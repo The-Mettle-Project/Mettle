@@ -45,7 +45,8 @@ typedef enum {
   AST_CAST_EXPRESSION,
   AST_LAMBDA_EXPRESSION,
   AST_CLOSURE_ADAPT_EXPRESSION,
-  AST_BARRIER_STATEMENT
+  AST_BARRIER_STATEMENT,
+  AST_AGGREGATE_LITERAL
 } ASTNodeType;
 
 /* SourceLocation moved to ../source_location.h so the backend IR can share it
@@ -358,6 +359,45 @@ typedef struct {
   ASTNode *index;
 } ArrayIndexExpression;
 
+/* One link-time address inside a folded aggregate image. A pointer, function
+ * pointer, or string element has no value until the linker places what it
+ * refers to, so the image leaves a pointer-sized hole and records what fills
+ * it. Exactly one of `symbol` and `string` is set. */
+typedef struct {
+  size_t offset;  // byte offset into the image
+  char *symbol;   // module symbol whose address goes here (`&f`, `&g`)
+  char *string;   // string-literal bytes to emit and point at
+  /* A `string` value is a pointer to a { chars, length } record, so the slot
+   * points at a record the backend builds; a `cstring` points straight at the
+   * characters. Only meaningful when `string` is set. */
+  int string_wants_record;
+} AggregateReloc;
+
+/* An aggregate literal: `[a, b, c]` or `[value; count]` for an array, and
+ * `{ field: value, ... }` for a struct. The literal has no type of its own -
+ * it takes the type of whatever it initializes, which is always spelled out in
+ * Mettle (every `var` and `const` states its type). Elements are also children
+ * of the node, so the node's destructor frees them; only the arrays here are
+ * owned by this struct. */
+typedef struct {
+  int is_struct;      // 1: `{ field: value }` form; 0: `[ element ]` form
+  ASTNode **elements; // borrowed; the nodes are children
+  char **field_names; // struct form only: one name per element
+  size_t element_count;
+  /* Array repeat form `[value; count]`: `elements[0]` is the repeated value and
+   * this is the count expression. NULL for the comma-separated form. */
+  ASTNode *repeat_count;
+  /* The folded value, filled in by the type checker. Aggregate literals are
+   * compile-time constants, so the whole thing collapses to a byte image plus
+   * the relocations that finish it at link time. Lowering copies these onto the
+   * IR module symbol; codegen blits them into the object file. Only the
+   * outermost literal of a nested group carries an image. */
+  unsigned char *image;
+  size_t image_size;
+  AggregateReloc *relocs;
+  size_t reloc_count;
+} AggregateLiteral;
+
 typedef struct {
   ASTNode *condition;
   ASTNode *body;
@@ -481,6 +521,13 @@ ASTNode *ast_create_member_access(ASTNode *object, const char *member,
                                   SourceLocation location);
 ASTNode *ast_create_array_index_expression(ASTNode *array, ASTNode *index,
                                            SourceLocation location);
+/* Takes ownership of `elements` and `field_names` (and of the name strings);
+ * `field_names` is NULL for the array form. Returns NULL on allocation
+ * failure, in which case the caller still owns its arrays. */
+ASTNode *ast_create_aggregate_literal(int is_struct, ASTNode **elements,
+                                      char **field_names, size_t element_count,
+                                      ASTNode *repeat_count,
+                                      SourceLocation location);
 ASTNode *ast_create_method_call(ASTNode *object, const char *method_name,
                                 ASTNode **arguments, size_t argument_count,
                                 SourceLocation location);

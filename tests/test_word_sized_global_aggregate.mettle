@@ -1,0 +1,94 @@
+// Globals reached through their address.
+//
+// The MIR backend keeps a global's value in a register between accesses, and
+// flushes that cache to memory around any pointer access that might alias it.
+// The set to flush was every address-taken global, but a global that is ONLY
+// address-taken was never loaded into a cache register in the first place: the
+// flush stored an undefined register over the global's own storage, and the
+// pointer read that followed picked up whatever that register held.
+//
+// `var p: int32* = &g; return *p;` returned garbage. Every global aggregate is
+// in this class, since an aggregate is only ever reached through an address,
+// which made it fatal for any 1/2/4/8-byte global struct or array: those look
+// register-sized to the ABI's pass-in-one-register rule, so they entered the
+// cache set, and reading one by name came back as the flushed register.
+//
+// No aggregate literals here on purpose: the bug predates them, and this test
+// should keep standing if they ever change.
+//
+// Exits 55 when every read sees what was written, 1..N to name the failure.
+
+struct Word {   // 8 bytes
+  lo: int32;
+  hi: int32;
+}
+
+struct Half {   // 4 bytes
+  a: int16;
+  b: int16;
+}
+
+var g_word: Word;
+var g_half: Half;
+var g_pair: int32[2];
+var g_bytes: uint8[4];
+
+// The scalar shape of the same bug: `g_scalar` is address-taken in `read_alias`
+// and never read there by name, so it was never cached, yet was flushed.
+var g_scalar: int32 = 7;
+
+fn read_alias() -> int32 {
+  var p: int32* = &g_scalar;
+  return *p;
+}
+
+fn fill() -> int32 {
+  g_word.lo = 6;
+  g_word.hi = 7;
+  g_half.a = 2;
+  g_half.b = 3;
+  g_pair[0] = 4;
+  g_pair[1] = 5;
+  g_bytes[0] = 1;
+  g_bytes[3] = 9;
+  return 0;
+}
+
+// Read in a different function, so the values have to survive in memory rather
+// than in whatever register the writer left them in.
+fn read_word() -> int32 { return g_word.lo * 10 + g_word.hi; }
+fn read_half() -> int32 { return (int32)g_half.a * 10 + (int32)g_half.b; }
+fn read_pair() -> int32 { return g_pair[0] * 10 + g_pair[1]; }
+fn read_bytes() -> int32 { return (int32)g_bytes[0] * 10 + (int32)g_bytes[3]; }
+
+fn main() -> int32 {
+  // A scalar global read only through a pointer.
+  if (read_alias() != 7) { return 12; }
+
+  // Before anything is written, a global starts zeroed. This is the read that
+  // used to come back as a flushed register.
+  if (g_word.lo != 0 || g_word.hi != 0) { return 1; }
+  if (g_pair[0] != 0 || g_pair[1] != 0) { return 2; }
+
+  var status: int32 = fill();
+  if (status != 0) { return 3; }
+
+  if (read_word() != 67) { return 4; }
+  if (read_half() != 23) { return 5; }
+  if (read_pair() != 45) { return 6; }
+  if (read_bytes() != 19) { return 7; }
+
+  // Same globals reached through a pointer, which is the aliasing case the
+  // cache exists to handle.
+  var wp: Word* = &g_word;
+  wp->lo = 11;
+  if (g_word.lo != 11 || g_word.hi != 7) { return 8; }
+  if (read_word() != 117) { return 9; }
+
+  var pp: int32* = &g_pair[0];
+  pp[1] = 12;
+  if (g_pair[1] != 12) { return 10; }
+  if (read_pair() != 52) { return 11; }
+
+  return 55;
+}

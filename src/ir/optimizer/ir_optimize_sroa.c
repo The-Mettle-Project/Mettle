@@ -54,6 +54,14 @@ static const IRSroaSlot *ir_sroa_find_const_slot(const IRSroaSlot *slots,
   return NULL;
 }
 
+/* A LOAD/STORE width that names one scalar field. Anything else is the
+ * block-copy form, where the value operand is a source address and the access
+ * spans the whole record -- splitting a record accessed that way would shrink
+ * the copy to a single word. */
+static int ir_sroa_scalar_access_width(int size) {
+  return size == 1 || size == 2 || size == 4 || size == 8;
+}
+
 static int ir_sroa_note_slot(IRSroaSlot *slots, size_t *slot_count,
                              long long offset, int size, int is_float,
                              int float_bits) {
@@ -678,6 +686,13 @@ int ir_sroa_pass(IRFunction *function, int *changed) {
           int size = (insn->rhs.kind == IR_OPERAND_INT)
                          ? (int)insn->rhs.int_value
                          : 8;
+          if (!ir_sroa_scalar_access_width(size)) {
+            /* Wider than a machine word: a block copy, not a field access.
+             * Splitting the record would turn the copy into a one-word
+             * assignment and drop the rest of the value. */
+            rec->eligible = 0;
+            continue;
+          }
           if (!ir_sroa_note_slot(rec->slots, &rec->slot_count, ae->offset,
                                  size, insn->is_float, insn->float_bits)) {
             /* Mixed-width / mixed-class access of one offset: decline. */
@@ -715,6 +730,12 @@ int ir_sroa_pass(IRFunction *function, int *changed) {
           int size = (insn->rhs.kind == IR_OPERAND_INT)
                          ? (int)insn->rhs.int_value
                          : 8;
+          if (!ir_sroa_scalar_access_width(size)) {
+            /* A block copy into this record (its whole value arriving from
+             * somewhere else), not a field store. */
+            rec->eligible = 0;
+            continue;
+          }
           if (!ir_sroa_note_slot(rec->slots, &rec->slot_count, ae->offset,
                                  size, insn->is_float, insn->float_bits)) {
             rec->eligible = 0;

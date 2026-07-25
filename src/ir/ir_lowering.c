@@ -58,6 +58,7 @@ IRProgram *ir_lower_program(ASTNode *program, TypeChecker *type_checker,
   context.type_checker = type_checker;
   context.symbol_table = symbol_table;
   context.emit_runtime_checks = emit_runtime_checks ? 1 : 0;
+  context.program = ir_program;
 
   Program *program_data = (Program *)program->data;
   if (!program_data) {

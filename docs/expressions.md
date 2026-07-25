@@ -39,6 +39,30 @@ Numeric literals: decimal (`42`), hexadecimal (`0xFF`), binary (`0b1010`), float
 
 **Literal default types:** A bare integer literal like `42` has type `int32` when the context does not require a specific type. Floating-point literals default to `float64`. In expressions like `var x: int64 = 42`, the literal is implicitly converted to the expected type. See [Types](types.md) for conversion rules.
 
+## Aggregate Literals
+
+An **array literal** is `[a, b, c]`, and a **struct literal** is `{ field: value, ... }`. The repeat form `[value; count]` writes one value `count` times, which is how a large table is filled without spelling out every element.
+
+```mettle
+const TABLE: int32[4] = [10, 20, 30, 40];
+const ZEROED: uint8[256] = [0; 256];
+const ORIGIN: Pt = { x: 1.0, y: 2.0 };
+const GRID: Pt[2] = [{ x: 1.0, y: 2.0 }, { x: 3.0, y: 4.0 }];
+```
+
+An aggregate literal has **no type of its own**. It takes the type of what it initializes, which in Mettle is always written down, since every `var` and `const` states its type. That is why it may only appear where that type is known: as the initializer of a `var` or `const`, or as the right-hand side of an assignment. Anywhere else is a compile error.
+
+The rules:
+
+- **Fields may be given in any order**, and any field left out keeps the zero it starts as. Naming a field twice, or naming one the struct does not have, is an error.
+- **An array literal may be shorter than the array**; the remaining elements stay zero. Longer is an error.
+- **Every element must be a compile-time constant.** Literals, other constants, `sizeof`, arithmetic over those, `&some_function`, `&some_global`, `0` for a pointer, a string literal, and nested aggregate literals all qualify. A function call does not.
+- **Nesting matches the type**: `{ ... }` initializes a struct, `[ ... ]` initializes an array, and the two do not substitute for one another.
+
+Because the whole literal is constant, it folds to the laid-out bytes of the value. A global one becomes those bytes in the object file's data, with the linker filling the pointer-sized holes (a function's address, another global's address, a string's characters). A local one is copied in from that same constant rather than stored element by element, so a large table costs one block copy.
+
+A trailing comma is allowed in both forms. Array literals may be written across as many lines as they need; so may struct literals.
+
 ## Identifiers and Member Access
 
 An identifier denotes a variable, parameter, or function. Member access uses `.` for struct fields and string fields. Pointer field access uses `->`.

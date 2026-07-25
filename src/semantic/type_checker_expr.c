@@ -1737,6 +1737,15 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
     // String literals are string type
     return checker->builtin_string;
 
+  case AST_AGGREGATE_LITERAL: {
+    /* The literal takes the type of what it initializes; whoever knows that
+     * type parked it on the checker just before this call. Consume it so a
+     * nested inference cannot pick up a stale target. */
+    Type *target = checker->aggregate_target_type;
+    checker->aggregate_target_type = NULL;
+    return type_checker_check_aggregate_literal(checker, expression, target);
+  }
+
   case AST_IDENTIFIER: {
     Identifier *id = (Identifier *)expression->data;
     Symbol *symbol = symbol_table_lookup(checker->symbol_table, id->name);

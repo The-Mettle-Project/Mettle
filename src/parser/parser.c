@@ -1814,6 +1814,203 @@ static ASTNode *parser_parse_lambda_expression(Parser *parser) {
   return node;
 }
 
+/* Free the half-built element/name arrays of an aggregate literal that failed
+ * to parse. The element nodes are not children of anything yet, so they have to
+ * go too. */
+static void parser_free_aggregate_parts(ASTNode **elements, char **field_names,
+                                        size_t count) {
+  for (size_t i = 0; i < count; i++) {
+    ast_destroy_node(elements ? elements[i] : NULL);
+    free(field_names ? field_names[i] : NULL);
+  }
+  free(elements);
+  free(field_names);
+}
+
+static int parser_aggregate_push(ASTNode ***elements, char ***field_names,
+                                 size_t *count, size_t *capacity,
+                                 ASTNode *element, char *field_name) {
+  if (*count == *capacity) {
+    size_t next = *capacity ? *capacity * 2 : 8;
+    ASTNode **grown_elements =
+        realloc(*elements, next * sizeof(**elements));
+    if (!grown_elements) {
+      return 0;
+    }
+    *elements = grown_elements;
+    if (field_names) {
+      char **grown_names = realloc(*field_names, next * sizeof(**field_names));
+      if (!grown_names) {
+        return 0;
+      }
+      *field_names = grown_names;
+    }
+    *capacity = next;
+  }
+  (*elements)[*count] = element;
+  if (field_names) {
+    (*field_names)[*count] = field_name;
+  }
+  (*count)++;
+  return 1;
+}
+
+/* `[ a, b, c ]` or `[ value; count ]`. The lexer suppresses newlines inside
+ * brackets, so a table may be written across as many lines as it needs. */
+static ASTNode *parser_parse_array_literal(Parser *parser,
+                                           SourceLocation location) {
+  ASTNode **elements = NULL;
+  size_t count = 0;
+  size_t capacity = 0;
+  ASTNode *repeat_count = NULL;
+
+  parser_advance(parser); // consume '['
+
+  if (parser->current_token.type != TOKEN_RBRACKET) {
+    for (;;) {
+      ASTNode *element = parser_parse_expression(parser);
+      if (!element) {
+        parser_free_aggregate_parts(elements, NULL, count);
+        return NULL;
+      }
+      if (!parser_aggregate_push(&elements, NULL, &count, &capacity, element,
+                                 NULL)) {
+        ast_destroy_node(element);
+        parser_free_aggregate_parts(elements, NULL, count);
+        parser_set_error(parser, "Out of memory in array literal");
+        return NULL;
+      }
+
+      /* `[value; count]` repeats one element; it is only meaningful as the
+       * whole literal, so it may appear exactly once, after the first. */
+      if (parser->current_token.type == TOKEN_SEMICOLON) {
+        if (count != 1) {
+          parser_set_error(parser,
+                           "Repeat count in an array literal must follow a "
+                           "single element: write '[value; count]'");
+          parser_free_aggregate_parts(elements, NULL, count);
+          return NULL;
+        }
+        parser_advance(parser); // consume ';'
+        repeat_count = parser_parse_expression(parser);
+        if (!repeat_count) {
+          parser_free_aggregate_parts(elements, NULL, count);
+          return NULL;
+        }
+        break;
+      }
+
+      if (parser->current_token.type != TOKEN_COMMA) {
+        break;
+      }
+      parser_advance(parser); // consume ','
+      if (parser->current_token.type == TOKEN_RBRACKET) {
+        break; // trailing comma
+      }
+    }
+  }
+
+  if (!parser_expect(parser, TOKEN_RBRACKET)) {
+    ast_destroy_node(repeat_count);
+    parser_free_aggregate_parts(elements, NULL, count);
+    return NULL;
+  }
+
+  ASTNode *node = ast_create_aggregate_literal(0, elements, NULL, count,
+                                               repeat_count, location);
+  if (!node) {
+    ast_destroy_node(repeat_count);
+    parser_free_aggregate_parts(elements, NULL, count);
+    parser_set_error(parser, "Out of memory in array literal");
+    return NULL;
+  }
+  return node;
+}
+
+/* `{ field: value, ... }`. Braces do not suppress newlines (they delimit
+ * blocks, where newlines end statements), so this skips them explicitly and a
+ * struct literal may span lines. */
+static ASTNode *parser_parse_struct_literal(Parser *parser,
+                                            SourceLocation location) {
+  ASTNode **elements = NULL;
+  char **field_names = NULL;
+  size_t count = 0;
+  size_t capacity = 0;
+
+  parser_advance(parser); // consume '{'
+  while (parser->current_token.type == TOKEN_NEWLINE) {
+    parser_advance(parser);
+  }
+
+  if (parser->current_token.type != TOKEN_RBRACE) {
+    for (;;) {
+      if (!parser_is_identifier_like(parser->current_token.type)) {
+        parser_set_error(parser,
+                         "Expected a field name in the struct literal: write "
+                         "'{ field: value, ... }'");
+        parser_free_aggregate_parts(elements, field_names, count);
+        return NULL;
+      }
+      char *field_name = strdup(parser->current_token.value);
+      if (!field_name) {
+        parser_set_error(parser, "Out of memory in struct literal");
+        parser_free_aggregate_parts(elements, field_names, count);
+        return NULL;
+      }
+      parser_advance(parser); // consume the field name
+      if (!parser_expect(parser, TOKEN_COLON)) {
+        free(field_name);
+        parser_free_aggregate_parts(elements, field_names, count);
+        return NULL;
+      }
+
+      ASTNode *element = parser_parse_expression(parser);
+      if (!element) {
+        free(field_name);
+        parser_free_aggregate_parts(elements, field_names, count);
+        return NULL;
+      }
+      if (!parser_aggregate_push(&elements, &field_names, &count, &capacity,
+                                 element, field_name)) {
+        ast_destroy_node(element);
+        free(field_name);
+        parser_free_aggregate_parts(elements, field_names, count);
+        parser_set_error(parser, "Out of memory in struct literal");
+        return NULL;
+      }
+
+      while (parser->current_token.type == TOKEN_NEWLINE) {
+        parser_advance(parser);
+      }
+      if (parser->current_token.type != TOKEN_COMMA) {
+        break;
+      }
+      parser_advance(parser); // consume ','
+      while (parser->current_token.type == TOKEN_NEWLINE) {
+        parser_advance(parser);
+      }
+      if (parser->current_token.type == TOKEN_RBRACE) {
+        break; // trailing comma
+      }
+    }
+  }
+
+  if (!parser_expect(parser, TOKEN_RBRACE)) {
+    parser_free_aggregate_parts(elements, field_names, count);
+    return NULL;
+  }
+
+  ASTNode *node =
+      ast_create_aggregate_literal(1, elements, field_names, count, NULL,
+                                   location);
+  if (!node) {
+    parser_free_aggregate_parts(elements, field_names, count);
+    parser_set_error(parser, "Out of memory in struct literal");
+    return NULL;
+  }
+  return node;
+}
+
 ASTNode *parser_parse_primary_expression(Parser *parser) {
   if (!parser)
     return NULL;
@@ -1890,6 +2087,13 @@ ASTNode *parser_parse_primary_expression(Parser *parser) {
     }
     return expr;
   }
+  /* Aggregate literals. A '[' only reaches primary position when nothing
+   * precedes it (indexing is postfix), and a '{' only reaches an expression
+   * when a block was not what was being parsed, so neither is ambiguous. */
+  case TOKEN_LBRACKET:
+    return parser_parse_array_literal(parser, location);
+  case TOKEN_LBRACE:
+    return parser_parse_struct_literal(parser, location);
   case TOKEN_FN:
   case TOKEN_FUNCTION:
     return parser_parse_lambda_expression(parser);

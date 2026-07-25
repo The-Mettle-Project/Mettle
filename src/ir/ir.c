@@ -1481,6 +1481,12 @@ void ir_program_destroy(IRProgram *program) {
       free(program->module_symbols[i].link_name);
       free(program->module_symbols[i].init_string);
       free(program->module_symbols[i].init_symbol_ref);
+      for (size_t r = 0; r < program->module_symbols[i].init_reloc_count; r++) {
+        free(program->module_symbols[i].init_relocs[r].symbol);
+        free(program->module_symbols[i].init_relocs[r].string);
+      }
+      free(program->module_symbols[i].init_relocs);
+      free(program->module_symbols[i].init_bytes);
       free(program->module_symbols[i].param_types);
       free(program->module_symbols[i].codegen_view);
     }
@@ -1642,6 +1648,50 @@ IRModuleSymbol *ir_program_add_symbol(IRProgram *program,
   dst->init_string = proto->init_string ? mettle_strdup(proto->init_string) : NULL;
   dst->init_symbol_ref =
       proto->init_symbol_ref ? mettle_strdup(proto->init_symbol_ref) : NULL;
+  /* Deep-copy the aggregate initializer image so the symbol table owns it
+   * independently of the frontend AST it was folded on. */
+  dst->init_bytes = NULL;
+  dst->init_bytes_size = 0;
+  dst->init_relocs = NULL;
+  dst->init_reloc_count = 0;
+  if (proto->init_bytes && proto->init_bytes_size > 0) {
+    dst->init_bytes = malloc(proto->init_bytes_size);
+    if (!dst->init_bytes) {
+      free(dst->name);
+      free(dst->link_name);
+      free(dst->init_string);
+      free(dst->init_symbol_ref);
+      return NULL;
+    }
+    memcpy(dst->init_bytes, proto->init_bytes, proto->init_bytes_size);
+    dst->init_bytes_size = proto->init_bytes_size;
+    if (proto->init_reloc_count > 0 && proto->init_relocs) {
+      dst->init_relocs =
+          calloc(proto->init_reloc_count, sizeof(IRInitReloc));
+      if (!dst->init_relocs) {
+        free(dst->init_bytes);
+        free(dst->name);
+        free(dst->link_name);
+        free(dst->init_string);
+        free(dst->init_symbol_ref);
+        return NULL;
+      }
+      for (size_t r = 0; r < proto->init_reloc_count; r++) {
+        dst->init_relocs[r].offset = proto->init_relocs[r].offset;
+        dst->init_relocs[r].symbol =
+            proto->init_relocs[r].symbol
+                ? mettle_strdup(proto->init_relocs[r].symbol)
+                : NULL;
+        dst->init_relocs[r].string =
+            proto->init_relocs[r].string
+                ? mettle_strdup(proto->init_relocs[r].string)
+                : NULL;
+        dst->init_relocs[r].string_wants_record =
+            proto->init_relocs[r].string_wants_record;
+      }
+      dst->init_reloc_count = proto->init_reloc_count;
+    }
+  }
   dst->param_types = NULL;
   if (proto->param_count > 0 && proto->param_types) {
     dst->param_types = malloc(proto->param_count * sizeof(MtlcType *));
@@ -4916,6 +4966,12 @@ int ir_program_eliminate_dead_functions(IRProgram *program) {
   for (size_t i = 0; i < program->module_symbol_count; i++) {
     ir_dead_fn_mark(&table, program->module_symbols[i].init_symbol_ref, live,
                     worklist, &worklist_count);
+    /* Same for a dispatch table built as an aggregate constant: every entry is
+     * a relocation against a function nothing else may mention. */
+    for (size_t r = 0; r < program->module_symbols[i].init_reloc_count; r++) {
+      ir_dead_fn_mark(&table, program->module_symbols[i].init_relocs[r].symbol,
+                      live, worklist, &worklist_count);
+    }
   }
 
   /* A function is referenced when any instruction of a live function carries

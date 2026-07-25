@@ -201,7 +201,11 @@ Fixed-size arrays use `[N]` where N is a constant. Arrays are value types; the e
 ```mettle
 var arr: int32[10];
 var buf: uint8[256];
+var table: int32[4] = [10, 20, 30, 40];
+const ZEROED: uint8[256] = [0; 256];
 ```
+
+An array may be initialized with an [aggregate literal](expressions.md#aggregate-literals); left uninitialized, it starts zeroed.
 
 **Out-of-bounds indexing:** The compiler rejects constant out-of-bounds indexes for fixed-size arrays (for example `arr[10]` on `int32[10]`). For dynamic indices on fixed-size arrays, normal builds emit runtime bounds checks. In `--release`, those generated bounds checks are disabled. Pointer indexing is never bounds-checked because pointee extent is unknown.
 
@@ -236,6 +240,8 @@ struct SockAddrIn {
   sin_zero: uint8[8];
 }
 ```
+
+A struct value is written with an [aggregate literal](expressions.md#aggregate-literals): `var p: Point = { x: 1, y: 2 };`. Fields may appear in any order, and any field left out stays zero.
 
 For C interop, match the C struct layout exactly (field order, types, padding).
 

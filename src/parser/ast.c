@@ -519,6 +519,48 @@ ASTNode *ast_clone_node(ASTNode *node) {
     clone->data = dst;
     break;
   }
+  case AST_AGGREGATE_LITERAL: {
+    AggregateLiteral *src = (AggregateLiteral *)node->data;
+    AggregateLiteral *dst = malloc(sizeof(AggregateLiteral));
+    if (!dst) {
+      free(clone);
+      return NULL;
+    }
+    dst->is_struct = src->is_struct;
+    dst->element_count = src->element_count;
+    dst->elements = NULL;
+    dst->field_names = ast_copy_string_array(src->field_names,
+                                             src->element_count);
+    if (src->element_count > 0) {
+      dst->elements = malloc(src->element_count * sizeof(ASTNode *));
+      if (!dst->elements) {
+        free(dst->field_names);
+        free(dst);
+        free(clone);
+        return NULL;
+      }
+      for (size_t i = 0; i < src->element_count; i++) {
+        dst->elements[i] =
+            src->elements[i] ? ast_clone_node(src->elements[i]) : NULL;
+        if (dst->elements[i]) {
+          ast_add_child(clone, dst->elements[i]);
+        }
+      }
+    }
+    dst->repeat_count =
+        src->repeat_count ? ast_clone_node(src->repeat_count) : NULL;
+    if (dst->repeat_count) {
+      ast_add_child(clone, dst->repeat_count);
+    }
+    /* The folded image is re-derived when the clone is checked; a clone made
+     * before checking (monomorphization) has nothing to copy anyway. */
+    dst->image = NULL;
+    dst->image_size = 0;
+    dst->relocs = NULL;
+    dst->reloc_count = 0;
+    clone->data = dst;
+    break;
+  }
   case AST_NEW_EXPRESSION: {
     NewExpression *src = (NewExpression *)node->data;
     NewExpression *dst = malloc(sizeof(NewExpression));
@@ -1086,6 +1128,26 @@ void ast_destroy_node(ASTNode *node) {
     if (new_expr) {
       ast_free_string(new_expr->type_name);
       free(new_expr);
+    }
+    break;
+  }
+  case AST_AGGREGATE_LITERAL: {
+    AggregateLiteral *literal = (AggregateLiteral *)node->data;
+    if (literal) {
+      /* The element nodes are children and were already freed above; only the
+       * arrays and the field-name strings belong to this struct. */
+      for (size_t i = 0; i < literal->element_count; i++) {
+        ast_free_string(literal->field_names ? literal->field_names[i] : NULL);
+      }
+      free(literal->field_names);
+      free(literal->elements);
+      for (size_t i = 0; i < literal->reloc_count; i++) {
+        free(literal->relocs[i].symbol);
+        free(literal->relocs[i].string);
+      }
+      free(literal->relocs);
+      free(literal->image);
+      free(literal);
     }
     break;
   }
@@ -1969,6 +2031,43 @@ ASTNode *ast_create_array_index_expression(ASTNode *array, ASTNode *index,
   }
   if (index) {
     ast_add_child(node, index);
+  }
+
+  return node;
+}
+
+ASTNode *ast_create_aggregate_literal(int is_struct, ASTNode **elements,
+                                      char **field_names, size_t element_count,
+                                      ASTNode *repeat_count,
+                                      SourceLocation location) {
+  ASTNode *node = ast_create_node(AST_AGGREGATE_LITERAL, location);
+  if (!node)
+    return NULL;
+
+  AggregateLiteral *literal = malloc(sizeof(AggregateLiteral));
+  if (!literal) {
+    free(node);
+    return NULL;
+  }
+
+  literal->is_struct = is_struct ? 1 : 0;
+  literal->elements = elements;
+  literal->field_names = field_names;
+  literal->element_count = element_count;
+  literal->repeat_count = repeat_count;
+  literal->image = NULL;
+  literal->image_size = 0;
+  literal->relocs = NULL;
+  literal->reloc_count = 0;
+  node->data = literal;
+
+  for (size_t i = 0; i < element_count; i++) {
+    if (elements && elements[i]) {
+      ast_add_child(node, elements[i]);
+    }
+  }
+  if (repeat_count) {
+    ast_add_child(node, repeat_count);
   }
 
   return node;

@@ -1,0 +1,10 @@
+// Struct literals name their fields, so a misspelled one is caught rather than
+// landing at whatever offset happened to come next.
+struct Pt {
+  x: int32;
+  y: int32;
+}
+
+const ORIGIN: Pt = { x: 1, z: 2 };
+
+fn main() -> int32 { return ORIGIN.x; }

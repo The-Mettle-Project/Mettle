@@ -652,7 +652,14 @@ int type_checker_process_declaration(TypeChecker *checker,
     if (var_decl->initializer) {
       size_t reports_before =
           checker->error_reporter ? checker->error_reporter->count : 0;
+      /* An aggregate literal has no type of its own, so hand it the declared
+       * type. Without one there is nothing to check it against, and the
+       * literal reports that itself. */
+      checker->aggregate_target_type =
+          var_decl->initializer->type == AST_AGGREGATE_LITERAL ? var_type
+                                                               : NULL;
       Type *init_type = type_checker_infer_type(checker, var_decl->initializer);
+      checker->aggregate_target_type = NULL;
       if (!init_type) {
         int already_reported =
             checker->error_reporter
@@ -718,6 +725,29 @@ int type_checker_process_declaration(TypeChecker *checker,
           "Variable '%s' must have either a type annotation or an initializer",
           var_decl->name);
       return 0;
+    }
+
+    /* A global's storage is laid out in the object file, so its value has to be
+     * known at compile time. For an aggregate that means an aggregate literal
+     * and nothing else -- a call or any other run-time expression has no image
+     * to lay out, and there is no module initializer to run one in. Caught here
+     * rather than in codegen so the report carries a source location. */
+    if (!poisoned && var_decl->initializer && !var_decl->is_extern && var_type &&
+        (var_type->kind == TYPE_STRUCT || var_type->kind == TYPE_ARRAY) &&
+        var_decl->initializer->type != AST_AGGREGATE_LITERAL &&
+        (!current_scope || current_scope->type == SCOPE_GLOBAL)) {
+      type_checker_set_error_at_location(
+          checker, var_decl->initializer->location,
+          "a global of aggregate type must be initialized with an aggregate "
+          "literal (%s), whose value is known at compile time; '%s' has type "
+          "'%s'",
+          var_type->kind == TYPE_STRUCT ? "'{ field: value, ... }'"
+                                        : "'[ value, ... ]'",
+          var_decl->name, var_type->name ? var_type->name : "?");
+      /* Register the binding anyway so later uses do not pile on with
+       * "undefined variable"; the declaration itself has already failed. */
+      checker->has_error = 1;
+      poisoned = 1;
     }
 
     // A `const` declaration binds an immutable value and must be initialized.
@@ -1354,7 +1384,9 @@ int type_checker_process_declaration(TypeChecker *checker,
           return 0;
         }
 
+        checker->aggregate_target_type = field_type;
         Type *value_type = type_checker_infer_type(checker, assignment->value);
+        checker->aggregate_target_type = NULL;
         if (!value_type) {
           if (!checker->has_error) {
             type_checker_set_error_at_location(
@@ -1413,7 +1445,9 @@ int type_checker_process_declaration(TypeChecker *checker,
           return 0;
         }
 
+        checker->aggregate_target_type = element_type;
         Type *value_type = type_checker_infer_type(checker, assignment->value);
+        checker->aggregate_target_type = NULL;
         if (!value_type) {
           if (!checker->has_error) {
             type_checker_set_error_at_location(
@@ -1450,7 +1484,9 @@ int type_checker_process_declaration(TypeChecker *checker,
           return 0;
         }
 
+        checker->aggregate_target_type = target_type;
         Type *value_type = type_checker_infer_type(checker, assignment->value);
+        checker->aggregate_target_type = NULL;
         if (!value_type) {
           if (!checker->has_error) {
             type_checker_set_error_at_location(
@@ -1527,7 +1563,9 @@ int type_checker_process_declaration(TypeChecker *checker,
     }
 
     // Infer the type of the assignment value
+    checker->aggregate_target_type = var_symbol->type;
     Type *value_type = type_checker_infer_type(checker, assignment->value);
+    checker->aggregate_target_type = NULL;
     if (!value_type) {
       if (!checker->has_error) {
         type_checker_set_error_at_location(

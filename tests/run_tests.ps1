@@ -334,6 +334,37 @@ $cases = @(
     Args          = @("-O")
   },
   @{
+    # Aggregate literals are compile-time constants: a call in an element has
+    # no bytes to lay out, and there is no module initializer to run it in.
+    Name          = "err_aggregate_literal_runtime"
+    Path          = "tests/err_aggregate_literal_runtime.mettle"
+    ShouldSucceed = $false
+    Pattern       = 'aggregate literal elements must be compile-time constants'
+  },
+  @{
+    # A global aggregate needs a literal. This used to reach the backend and
+    # surface as an internal compiler error with no source line.
+    Name          = "err_aggregate_global_call"
+    Path          = "tests/err_aggregate_global_call.mettle"
+    ShouldSucceed = $false
+    Pattern       = 'a global of aggregate type must be initialized with an aggregate literal'
+  },
+  @{
+    # Shape check: too many elements do not spill past the array's end.
+    Name          = "err_aggregate_literal_shape"
+    Path          = "tests/err_aggregate_literal_shape.mettle"
+    ShouldSucceed = $false
+    Pattern       = "4 elements do not fit 'int32\[3\]', which holds 3"
+  },
+  @{
+    # Struct literals name their fields, so a misspelling is caught here rather
+    # than landing at whatever offset came next.
+    Name          = "err_aggregate_literal_field"
+    Path          = "tests/err_aggregate_literal_field.mettle"
+    ShouldSucceed = $false
+    Pattern       = "struct 'Pt' has no field 'z'"
+  },
+  @{
     # Memory diagnostics: returning the address of a stack local is an error.
     Name          = "err_mem_return_stack"
     Path          = "tests/err_mem_return_stack.mettle"
@@ -2255,6 +2286,68 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "global_aggregates_and_fnptr" -Passed $false -Reason $_.Exception.Message
+}
+
+# Word-sized global aggregates: a global struct or array of exactly 1/2/4/8
+# bytes is memory reached through an address, not a value the MIR global cache
+# may hold in a register. Caching one gave it a vreg nothing defines, and the
+# allocator flushed that undefined vreg over the global's storage. 55 = every
+# read sees what was written.
+$total++
+try {
+  foreach ($mode in @("", "--release")) {
+    $label = if ($mode -eq "") { "debug" } else { "release" }
+    $exePath = Join-Path $tmpDir ("word_sized_global_aggregate_{0}.exe" -f $label)
+    if ($mode -eq "") {
+      $buildOut = & $CompilerPath --build --linker internal "tests\test_word_sized_global_aggregate.mettle" -o $exePath 2>&1 | Out-String
+    }
+    else {
+      $buildOut = & $CompilerPath --build --linker internal --release "tests\test_word_sized_global_aggregate.mettle" -o $exePath 2>&1 | Out-String
+    }
+    if ($LASTEXITCODE -ne 0) {
+      throw "word-sized global aggregate $label build failed: $buildOut"
+    }
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 55) {
+      throw "word-sized global aggregate $label exited with $LASTEXITCODE (expected 55)"
+    }
+  }
+  Write-CaseResult -Name "word_sized_global_aggregate" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "word_sized_global_aggregate" -Passed $false -Reason $_.Exception.Message
+}
+
+# Aggregate literals: `[a, b, c]`, `[value; count]`, and `{ field: value }` as
+# global constants, global variables, locals, and assignment right-hand sides.
+# Covers the element shapes that need more than plain bytes (float, bool,
+# string, a function's address, another global's address) and the folded image's
+# relocations. 55 = every form intact.
+$total++
+try {
+  foreach ($mode in @("", "--release")) {
+    $label = if ($mode -eq "") { "debug" } else { "release" }
+    $exePath = Join-Path $tmpDir ("aggregate_literals_{0}.exe" -f $label)
+    if ($mode -eq "") {
+      $buildOut = & $CompilerPath --build --linker internal "tests\test_aggregate_literals.mettle" -o $exePath 2>&1 | Out-String
+    }
+    else {
+      $buildOut = & $CompilerPath --build --linker internal --release "tests\test_aggregate_literals.mettle" -o $exePath 2>&1 | Out-String
+    }
+    if ($LASTEXITCODE -ne 0) {
+      throw "aggregate literals $label build failed: $buildOut"
+    }
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 55) {
+      throw "aggregate literals $label exited with $LASTEXITCODE (expected 55)"
+    }
+  }
+  Write-CaseResult -Name "aggregate_literals" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "aggregate_literals" -Passed $false -Reason $_.Exception.Message
 }
 
 # Struct-return regression: an aggregate returned through a hidden pointer must

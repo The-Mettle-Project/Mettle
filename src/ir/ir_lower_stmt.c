@@ -125,6 +125,15 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     }
     ir_operand_destroy(&local.dest);
 
+    if (declaration->initializer &&
+        declaration->initializer->type == AST_AGGREGATE_LITERAL) {
+      /* The literal was folded to a constant image at type-check time; copy it
+       * in wholesale rather than lowering it as an expression. */
+      return ir_emit_aggregate_literal_copy_to_symbol(
+          context, function, declaration->name, declaration->initializer,
+          decl_type, statement->location);
+    }
+
     if (declaration->initializer) {
       IROperand value = ir_operand_none();
       if (!ir_lower_expression(context, function, declaration->initializer,
@@ -174,6 +183,35 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     if (!assignment || !assignment->value) {
       ir_set_error(context, "Malformed assignment statement");
       return 0;
+    }
+
+    /* An aggregate literal on the right is a folded constant, not something to
+     * evaluate: copy its image into the destination. */
+    if (assignment->value->type == AST_AGGREGATE_LITERAL) {
+      Type *literal_type = assignment->value->resolved_type;
+      if (assignment->variable_name) {
+        Type *assign_type =
+            ir_lookup_symbol_type(context, assignment->variable_name);
+        return ir_emit_aggregate_literal_copy_to_symbol(
+            context, function, assignment->variable_name, assignment->value,
+            assign_type ? assign_type : literal_type, statement->location);
+      }
+      if (!assignment->target) {
+        ir_set_error(context, "Assignment target is missing");
+        return 0;
+      }
+      IROperand literal_address = ir_operand_none();
+      Type *literal_target_type = NULL;
+      if (!ir_lower_lvalue_address(context, function, assignment->target,
+                                   &literal_address, &literal_target_type)) {
+        return 0;
+      }
+      int ok = ir_emit_aggregate_literal_copy(
+          context, function, &literal_address, assignment->value,
+          literal_target_type ? literal_target_type : literal_type,
+          statement->location);
+      ir_operand_destroy(&literal_address);
+      return ok;
     }
 
     IROperand value = ir_operand_none();

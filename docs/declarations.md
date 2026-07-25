@@ -11,8 +11,12 @@ var x: int32;
 var y: int32 = 42;
 var msg: string = "hello";
 var buf: uint8[1024];
+var table: int32[4] = [10, 20, 30, 40];
+var origin: Pt = { x: 1.0, y: 2.0 };
 var z = 1 + 2;              // ERROR: 'z' requires an explicit type
 ```
+
+Arrays and structs may be initialized with an [aggregate literal](expressions.md#aggregate-literals), or left uninitialized, in which case they start zeroed.
 
 (Only two kinds of binding get their type structurally rather than by annotation: a range-`for` loop counter takes the type of its bound, and a top-level `const` - which is integer-only - takes its literal's type. Neither is inferred from an arbitrary expression.)
 
@@ -32,9 +36,20 @@ fn main() -> int32 {
 }
 ```
 
-A **top-level** `const` must have integer type. It is folded directly into the machine code at every use site and occupies no storage, so its initializer must be a compile-time constant integer expression: integer literals, `sizeof`, other constants, and arithmetic, bitwise, and comparison operators over them. Because it is integer-only and its value is a compile-time literal, a top-level `const` may omit the type annotation. A **local** `const` must state its type, like any local binding.
+A **top-level** `const` of **integer** type is folded directly into the machine code at every use site and occupies no storage, so its initializer must be a compile-time constant integer expression: integer literals, `sizeof`, other constants, and arithmetic, bitwise, and comparison operators over them. Because its value is a compile-time literal, an integer top-level `const` may omit the type annotation. A **local** `const` must state its type, like any local binding.
 
-A **local** (function-scope) `const` may have any type: integer, float, string, or aggregate. It is an immutable binding backed by normal local storage, so its initializer follows the same rules as any local variable initializer. Global float, string, and aggregate constants are not yet supported; use a top-level `var` or a function-local `const`.
+A top-level `const` of any other type gets normal storage in the object file, initialized to its value. Float, string, and **aggregate** constants all work at global scope:
+
+```mettle
+const RATE: float64 = 1.5;
+const LABEL: string = "ready";
+const TABLE: int32[4] = [10, 20, 30, 40];
+const ORIGIN: Pt = { x: 1.0, y: 2.0 };
+```
+
+Because a global's storage is laid out at compile time, an aggregate one must be initialized with an [aggregate literal](expressions.md#aggregate-literals) whose elements are all compile-time constants. A call has nothing to lay out and is rejected with a source location. There is no module initializer that could run one.
+
+A **local** (function-scope) `const` may have any type, and its initializer follows the same rules as any local variable initializer, so it may be a call.
 
 ## Functions
 

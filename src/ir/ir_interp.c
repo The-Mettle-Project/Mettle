@@ -2187,8 +2187,40 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
       }
       IIVar *var = ii_env_find(&frame.env, insn->lhs.name);
       if (!var) {
-        ii_fail(machine, IR_INTERP_UNSUPPORTED, "address-of global");
-        goto done;
+        /* A module symbol carrying a folded aggregate image: an aggregate
+         * constant, or the hidden constant a local aggregate literal is copied
+         * from. Its bytes are known, so give it a buffer and hand back the
+         * address. Anything else about globals is still out of reach here. */
+        const IRModuleSymbol *sym =
+            machine->program
+                ? ir_program_lookup_symbol(machine->program, insn->lhs.name)
+                : NULL;
+        if (!sym || !sym->init_bytes || sym->init_bytes_size == 0) {
+          ii_fail(machine, IR_INTERP_UNSUPPORTED, "address-of global");
+          goto done;
+        }
+        if (sym->init_reloc_count > 0) {
+          /* The image has link-time holes (a string or another symbol's
+           * address); those addresses do not exist at compile time. */
+          ii_fail(machine, IR_INTERP_UNSUPPORTED,
+                  "aggregate constant with link-time addresses");
+          goto done;
+        }
+        var = ii_env_upsert(&machine->globals, insn->lhs.name);
+        if (!var) {
+          ii_fail(machine, IR_INTERP_TRAP, "global storage allocation");
+          goto done;
+        }
+        if (!var->value.i) {
+          unsigned long long addr = ir_interp_add_buffer(
+              machine, sym->init_bytes, (long long)sym->init_bytes_size);
+          if (!addr) {
+            ii_fail(machine, IR_INTERP_TRAP, "global storage allocation");
+            goto done;
+          }
+          var->value = ii_int_value((long long)addr);
+          var->slotted = 0;
+        }
       }
       /* Slot-backed local or array: value.i is the base address. */
       IRInterpValue addr = ii_int_value(var->value.i);
@@ -2251,8 +2283,26 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
         goto done;
       }
       if (size != 1 && size != 2 && size != 4 && size != 8) {
-        ii_fail(machine, IR_INTERP_UNSUPPORTED, "store size");
-        goto done;
+        /* Wider than a machine word: this is the block-copy form, where the
+         * value operand is the SOURCE ADDRESS rather than a value (whole-struct
+         * assignment, and the copy of an aggregate literal's constant image).
+         * Both regions are checked before either is touched. */
+        unsigned long long source = (unsigned long long)ii_as_int(&value);
+        long long dest_offset = 0;
+        long long source_offset = 0;
+        IIBuffer *dest_buffer =
+            ii_addr_to_buffer(machine, addr, size, &dest_offset);
+        IIBuffer *source_buffer =
+            ii_addr_to_buffer(machine, source, size, &source_offset);
+        if (!dest_buffer || !source_buffer) {
+          ii_fail(machine, IR_INTERP_TRAP,
+                  "block copy out of bounds / after free");
+          goto done;
+        }
+        memmove(dest_buffer->data + dest_offset,
+                source_buffer->data + source_offset, (size_t)size);
+        pc++;
+        break;
       }
       unsigned long long raw;
       if (value.is_float || insn->is_float) {

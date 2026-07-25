@@ -513,6 +513,7 @@ static void populate_module_symbols(IRProgram *program, ASTNode *ast_program,
       }
       Symbol *s = symbol_table_lookup(st, vd->name);
       IRModuleSymbol entry = {0};
+      IRInitReloc *aggregate_relocs = NULL;
       entry.name = vd->name;
       entry.is_extern = vd->is_extern;
       entry.link_name = s ? s->link_name : NULL;
@@ -527,7 +528,35 @@ static void populate_module_symbols(IRProgram *program, ASTNode *ast_program,
           vtype = type_checker_get_type_by_name(tc, vd->type_name);
         }
         entry.type = mtlc_type_from_frontend(vtype);
-        if (!vd->is_extern && vd->initializer) {
+        if (!vd->is_extern && vd->initializer &&
+            vd->initializer->type == AST_AGGREGATE_LITERAL) {
+          /* An aggregate literal was already folded to its laid-out bytes when
+           * the type checker validated it against the declared type, so the
+           * image just moves across. Codegen blits it and emits the
+           * relocations; nothing re-walks the AST. */
+          AggregateLiteral *literal = (AggregateLiteral *)vd->initializer->data;
+          if (literal && literal->image) {
+            entry.init_bytes = literal->image;
+            entry.init_bytes_size = literal->image_size;
+            if (literal->reloc_count > 0) {
+              aggregate_relocs =
+                  calloc(literal->reloc_count, sizeof(IRInitReloc));
+              if (aggregate_relocs) {
+                for (size_t r = 0; r < literal->reloc_count; r++) {
+                  aggregate_relocs[r].offset = literal->relocs[r].offset;
+                  aggregate_relocs[r].symbol = literal->relocs[r].symbol;
+                  aggregate_relocs[r].string = literal->relocs[r].string;
+                  aggregate_relocs[r].string_wants_record =
+                      literal->relocs[r].string_wants_record;
+                }
+                entry.init_relocs = aggregate_relocs;
+                entry.init_reloc_count = literal->reloc_count;
+              }
+            }
+          } else {
+            entry.has_unfoldable_initializer = 1;
+          }
+        } else if (!vd->is_extern && vd->initializer) {
           if (entry.type && entry.type->kind == MTLC_TYPE_STRING) {
             if (vd->initializer->type == AST_STRING_LITERAL) {
               StringLiteral *lit = (StringLiteral *)vd->initializer->data;
@@ -558,7 +587,8 @@ static void populate_module_symbols(IRProgram *program, ASTNode *ast_program,
           }
         }
       }
-      ir_program_add_symbol(program, &entry);
+      ir_program_add_symbol(program, &entry); /* deep-copies the image */
+      free(aggregate_relocs);
     } else if (decl->type == AST_STRUCT_DECLARATION ||
                decl->type == AST_ENUM_DECLARATION) {
       /* Register user-defined named types so codegen can resolve them. */

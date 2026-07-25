@@ -278,6 +278,157 @@ IRFunction *code_generator_find_ir_function_binary(CodeGenerator *generator,
  * codegen reads sym->init_bits/init_is_float/init_string directly instead of
  * re-evaluating the AST. */
 
+/* Emit a folded aggregate initializer: the bytes go to .data verbatim, then one
+ * ADDR64 relocation per pointer-sized hole. A hole naming a module symbol
+ * relocates against that symbol's linkage name; a hole holding a string element
+ * gets its characters parked in .rdata under a generated label and relocates
+ * against that. */
+static int code_generator_binary_emit_global_aggregate_image(
+    CodeGenerator *generator, const char *link_name, const IRModuleSymbol *sym,
+    size_t alignment) {
+  BinaryEmitter *emitter = code_generator_get_binary_emitter(generator);
+  size_t data_section = 0;
+  size_t image_offset = 0;
+
+  data_section = binary_emitter_get_or_create_section(
+      emitter, ".data", BINARY_SECTION_DATA, 0, alignment);
+  if (data_section == (size_t)-1) {
+    code_generator_set_error(generator, "%s",
+                             binary_emitter_get_error(emitter)
+                                 ? binary_emitter_get_error(emitter)
+                                 : "Failed to create .data section");
+    return 0;
+  }
+  if (!binary_emitter_align_section(emitter, data_section, alignment, 0) ||
+      !binary_emitter_append_bytes(emitter, data_section, sym->init_bytes,
+                                   sym->init_bytes_size, &image_offset)) {
+    code_generator_set_error(generator, "%s",
+                             binary_emitter_get_error(emitter)
+                                 ? binary_emitter_get_error(emitter)
+                                 : "Failed to emit aggregate global image");
+    return 0;
+  }
+
+  for (size_t i = 0; i < sym->init_reloc_count; i++) {
+    const IRInitReloc *reloc = &sym->init_relocs[i];
+    const char *target = reloc->symbol;
+    char *chars_label = NULL;
+
+    if (!target) {
+      /* A string element. The characters go to .rdata; a `string` slot then
+       * points at a { chars, length } record built beside them (that is what a
+       * string value is everywhere else in the language), while a `cstring`
+       * slot points straight at the characters. */
+      size_t rdata_section = binary_emitter_get_or_create_section(
+          emitter, ".rdata", BINARY_SECTION_RDATA, 0, 8);
+      size_t chars_offset = 0;
+      size_t length = reloc->string ? strlen(reloc->string) : 0;
+      unsigned char terminator = 0;
+
+      chars_label = code_generator_generate_label(generator, "str_chars");
+      if (rdata_section == (size_t)-1 || !chars_label) {
+        code_generator_set_error(generator,
+                                 "Failed to emit aggregate string element");
+        free(chars_label);
+        return 0;
+      }
+      if (!binary_emitter_append_bytes(emitter, rdata_section,
+                                       reloc->string ? reloc->string : "",
+                                       length, &chars_offset) ||
+          !binary_emitter_append_bytes(emitter, rdata_section, &terminator, 1,
+                                       NULL) ||
+          !binary_emitter_define_symbol(emitter, chars_label,
+                                        BINARY_SYMBOL_LOCAL, rdata_section,
+                                        chars_offset, length + 1)) {
+        code_generator_set_error(generator, "%s",
+                                 binary_emitter_get_error(emitter)
+                                     ? binary_emitter_get_error(emitter)
+                                     : "Failed to emit aggregate string bytes");
+        free(chars_label);
+        return 0;
+      }
+      target = chars_label;
+
+      if (reloc->string_wants_record) {
+        char *record_label =
+            code_generator_generate_label(generator, "str_struct");
+        size_t record_offset = 0;
+        BinarySection *section = NULL;
+        uint64_t encoded_length = (uint64_t)length;
+
+        if (!record_label) {
+          code_generator_set_error(generator,
+                                   "Out of memory building string record");
+          free(chars_label);
+          return 0;
+        }
+        if (!binary_emitter_align_section(emitter, rdata_section, 8, 0) ||
+            !binary_emitter_append_zeros(emitter, rdata_section, 16,
+                                         &record_offset) ||
+            !binary_emitter_define_symbol(emitter, record_label,
+                                          BINARY_SYMBOL_LOCAL, rdata_section,
+                                          record_offset, 16) ||
+            !binary_emitter_add_relocation(emitter, rdata_section,
+                                           record_offset,
+                                           BINARY_RELOCATION_ADDR64,
+                                           chars_label, 0)) {
+          code_generator_set_error(generator, "%s",
+                                   binary_emitter_get_error(emitter)
+                                       ? binary_emitter_get_error(emitter)
+                                       : "Failed to emit string record");
+          free(record_label);
+          free(chars_label);
+          return 0;
+        }
+        section = binary_emitter_get_section(emitter, rdata_section);
+        if (!section || !section->data || record_offset + 16 > section->size) {
+          code_generator_set_error(generator,
+                                   "Failed to access emitted string record");
+          free(record_label);
+          free(chars_label);
+          return 0;
+        }
+        memcpy(section->data + record_offset + 8, &encoded_length,
+               sizeof(encoded_length));
+        free(chars_label);
+        chars_label = record_label;
+        target = record_label;
+      }
+    } else if (generator->ir_program) {
+      /* Relocate against the referenced symbol's linkage name, which may
+       * differ from its source name. */
+      const IRModuleSymbol *referenced =
+          ir_program_lookup_symbol(generator->ir_program, target);
+      if (referenced && referenced->link_name && referenced->link_name[0]) {
+        target = referenced->link_name;
+      }
+    }
+
+    if (!binary_emitter_add_relocation(emitter, data_section,
+                                       image_offset + reloc->offset,
+                                       BINARY_RELOCATION_ADDR64, target, 0)) {
+      code_generator_set_error(generator, "%s",
+                               binary_emitter_get_error(emitter)
+                                   ? binary_emitter_get_error(emitter)
+                                   : "Failed to emit aggregate relocation");
+      free(chars_label);
+      return 0;
+    }
+    free(chars_label);
+  }
+
+  if (!binary_emitter_define_symbol(emitter, link_name, BINARY_SYMBOL_GLOBAL,
+                                    data_section, image_offset,
+                                    sym->init_bytes_size)) {
+    code_generator_set_error(generator, "%s",
+                             binary_emitter_get_error(emitter)
+                                 ? binary_emitter_get_error(emitter)
+                                 : "Failed to define aggregate global symbol");
+    return 0;
+  }
+  return 1;
+}
+
 int code_generator_emit_binary_global_variable(CodeGenerator *generator,
                                                       const IRModuleSymbol *sym) {
   BinaryEmitter *emitter = NULL;
@@ -331,10 +482,11 @@ int code_generator_emit_binary_global_variable(CodeGenerator *generator,
         generator, link_name, sym->has_initializer ? sym->init_string : NULL);
   }
 
-  /* Aggregates: a global struct or array is just zero-filled storage of its
-   * laid-out size. There is no aggregate initializer syntax, so these always
-   * land in .bss and the only thing that matters is reserving the right number
-   * of bytes at the right alignment. Handled ahead of the scalar path, whose
+  /* Aggregates: a global struct or array either carries a folded initializer
+   * image (`var t: int32[4] = [1, 2, 3, 4];`, and every global aggregate
+   * `const`) or is plain zero-filled storage of its laid-out size. The image
+   * goes to .data with its relocations; the zero case stays in .bss, where it
+   * costs nothing in the object file. Handled ahead of the scalar path, whose
    * type check is shared with ABI decisions and must keep rejecting them. */
   if (type->kind == MTLC_TYPE_STRUCT || type->kind == MTLC_TYPE_ARRAY) {
     size_t aggregate_size = type->size;
@@ -349,12 +501,19 @@ int code_generator_emit_binary_global_variable(CodeGenerator *generator,
       return 0;
     }
     if (sym->has_initializer || sym->has_unfoldable_initializer) {
+      /* A scalar-shaped or unfoldable initializer on an aggregate: the
+       * frontend rejects these with a source location, so reaching here means
+       * something slipped through rather than a user error. */
       code_generator_set_error(
           generator,
-          "Direct object backend does not support initializers on aggregate "
-          "globals (encountered '%s'); assign the fields at run time",
+          "Aggregate global '%s' carries an initializer that was not folded to "
+          "a constant image",
           sym->name);
       return 0;
+    }
+    if (sym->init_bytes && sym->init_bytes_size > 0) {
+      return code_generator_binary_emit_global_aggregate_image(
+          generator, link_name, sym, aggregate_alignment);
     }
 
     aggregate_section = binary_emitter_get_or_create_section(

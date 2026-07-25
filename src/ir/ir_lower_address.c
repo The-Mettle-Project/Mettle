@@ -1,5 +1,150 @@
 // AST->IR lowering: lvalue address, symbol assignment, pointer arithmetic.
 #include "ir_lowering_internal.h"
+#include "frontend/mtlc_frontend.h" // mtlc_type_from_frontend
+
+/* Park a local aggregate literal's folded image in the module as a hidden
+ * constant, and hand back its name.
+ *
+ * An aggregate literal is a compile-time constant wherever it appears, so a
+ * local one is the same value a global one would be: laying it out once in the
+ * object file and copying from it beats emitting a store per element, and it
+ * costs nothing when the literal is large. Returns an owned name, or NULL on
+ * failure (with the error already set). */
+static char *ir_intern_aggregate_literal(IRLoweringContext *context,
+                                         ASTNode *literal_node,
+                                         Type *dest_type) {
+  AggregateLiteral *literal =
+      literal_node && literal_node->type == AST_AGGREGATE_LITERAL
+          ? (AggregateLiteral *)literal_node->data
+          : NULL;
+
+  if (!context || !context->program || !literal || !literal->image ||
+      !dest_type) {
+    ir_set_error(context, "Aggregate literal reached lowering without a folded "
+                          "constant image");
+    return NULL;
+  }
+
+  char *name = ir_new_label_name(context, "agg_const");
+  if (!name) {
+    ir_set_error(context, "Out of memory while interning aggregate literal");
+    return NULL;
+  }
+
+  IRInitReloc *relocs = NULL;
+  if (literal->reloc_count > 0) {
+    relocs = calloc(literal->reloc_count, sizeof(IRInitReloc));
+    if (!relocs) {
+      free(name);
+      ir_set_error(context, "Out of memory while interning aggregate literal");
+      return NULL;
+    }
+    for (size_t i = 0; i < literal->reloc_count; i++) {
+      relocs[i].offset = literal->relocs[i].offset;
+      relocs[i].symbol = literal->relocs[i].symbol;
+      relocs[i].string = literal->relocs[i].string;
+      relocs[i].string_wants_record = literal->relocs[i].string_wants_record;
+    }
+  }
+
+  IRModuleSymbol entry = {0};
+  entry.name = name;
+  entry.kind = IR_MODSYM_VARIABLE;
+  entry.type = mtlc_type_from_frontend(dest_type);
+  entry.init_bytes = literal->image;
+  entry.init_bytes_size = literal->image_size;
+  entry.init_relocs = relocs;
+  entry.init_reloc_count = literal->reloc_count;
+  IRModuleSymbol *added = ir_program_add_symbol(context->program, &entry);
+  free(relocs); /* the program deep-copied them */
+  if (!added) {
+    free(name);
+    ir_set_error(context, "Out of memory while interning aggregate literal");
+    return NULL;
+  }
+  return name;
+}
+
+int ir_emit_aggregate_literal_copy(IRLoweringContext *context,
+                                   IRFunction *function,
+                                   const IROperand *dest_address,
+                                   ASTNode *literal_node, Type *dest_type,
+                                   SourceLocation location) {
+  if (!context || !function || !dest_address || !dest_type ||
+      dest_type->size == 0 || dest_type->size > (size_t)INT_MAX) {
+    ir_set_error(context, "Cannot copy aggregate literal into a target of "
+                          "unknown size");
+    return 0;
+  }
+
+  char *source_name = ir_intern_aggregate_literal(context, literal_node,
+                                                  dest_type);
+  if (!source_name) {
+    return 0;
+  }
+
+  IROperand source_address = ir_operand_none();
+  if (!ir_emit_address_of_symbol(context, function, source_name, location,
+                                 &source_address)) {
+    free(source_name);
+    return 0;
+  }
+  free(source_name);
+
+  /* A block move is spelled as a STORE whose value operand is the source
+   * ADDRESS, which the backend only reads that way past one machine word. An
+   * aggregate of eight bytes or fewer has to go through a register instead:
+   * load the word, then store it. */
+  IROperand value = source_address;
+  if (dest_type->size <= 8) {
+    IROperand loaded = ir_operand_none();
+    if (!ir_make_temp_operand(context, &loaded)) {
+      ir_operand_destroy(&source_address);
+      return 0;
+    }
+    IRInstruction load = {0};
+    load.op = IR_OP_LOAD;
+    load.location = location;
+    load.dest = loaded;
+    load.lhs = source_address;
+    load.rhs = ir_operand_int((long long)dest_type->size);
+    if (!ir_emit(context, function, &load)) {
+      ir_operand_destroy(&loaded);
+      ir_operand_destroy(&source_address);
+      return 0;
+    }
+    ir_operand_destroy(&source_address);
+    value = loaded;
+  }
+
+  IRInstruction store = {0};
+  store.op = IR_OP_STORE;
+  store.location = location;
+  store.dest = ir_clone_operand_local(dest_address);
+  store.lhs = value;
+  store.rhs = ir_operand_int((long long)dest_type->size);
+  int ok = ir_emit(context, function, &store);
+  ir_operand_destroy(&store.dest);
+  ir_operand_destroy(&value);
+  return ok;
+}
+
+int ir_emit_aggregate_literal_copy_to_symbol(IRLoweringContext *context,
+                                             IRFunction *function,
+                                             const char *dest_name,
+                                             ASTNode *literal_node,
+                                             Type *dest_type,
+                                             SourceLocation location) {
+  IROperand dest_address = ir_operand_none();
+  if (!ir_emit_address_of_symbol(context, function, dest_name, location,
+                                 &dest_address)) {
+    return 0;
+  }
+  int ok = ir_emit_aggregate_literal_copy(context, function, &dest_address,
+                                          literal_node, dest_type, location);
+  ir_operand_destroy(&dest_address);
+  return ok;
+}
 
 /* The frontend's nested scopes have been popped by IR lowering time. The IR
  * declaration stream is therefore the authoritative scoped record for whether

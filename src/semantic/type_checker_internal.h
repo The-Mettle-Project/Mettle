@@ -234,4 +234,10 @@ int type_checker_check_for_statement(TypeChecker *checker,
 int type_checker_check_switch_statement(TypeChecker *checker,
                                                ASTNode *statement);
 
+/* Check and fold an aggregate literal against the type it initializes
+ * (type_checker_aggregate.c). On success the literal's folded byte image and
+ * relocations are attached to the node and `target` is returned. */
+Type *type_checker_check_aggregate_literal(TypeChecker *checker,
+                                           ASTNode *expression, Type *target);
+
 #endif // TYPE_CHECKER_INTERNAL_H

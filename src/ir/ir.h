@@ -585,6 +585,22 @@ typedef enum {
   IR_MODSYM_CONSTANT
 } IRModuleSymbolKind;
 
+/* One link-time address inside an aggregate global's initializer image. A
+ * pointer, function pointer, or string element has no value until the linker
+ * places what it refers to, so the image leaves a pointer-sized hole here and
+ * the backend emits a relocation. Exactly one of `symbol` and `string` is set:
+ * `symbol` names another module symbol, `string` carries literal bytes the
+ * backend parks in .rdata and points at. */
+typedef struct {
+  size_t offset;
+  char *symbol; /* owned */
+  char *string; /* owned */
+  /* A `string` value is a pointer to a { chars, length } record, so the slot
+   * points at a record the backend builds next to the characters; a `cstring`
+   * points straight at the characters. Only read when `string` is set. */
+  int string_wants_record;
+} IRInitReloc;
+
 /* One module-level symbol (global var, function, or folded constant) the code
  * generators emit or reference. Populated at lowering from the frontend symbol
  * table + AST so codegen needs neither. All MtlcType* are borrowed; strings are
@@ -608,6 +624,15 @@ typedef struct {
    * not known until link time, so the backend reserves a pointer-sized slot and
    * emits a relocation against this name rather than a constant. */
   char *init_symbol_ref;    /* owned; referenced symbol name, or NULL */
+  /* Aggregate initializer (`var t: int32[4] = [1, 2, 3, 4];`), folded to the
+   * laid-out bytes of the value at type-check time. `init_bytes` is exactly the
+   * type's size; `init_relocs` finishes the pointer-sized holes in it. NULL
+   * when the global is an aggregate with no initializer -- that is plain .bss
+   * zero-fill and needs no image. */
+  unsigned char *init_bytes; /* owned */
+  size_t init_bytes_size;
+  IRInitReloc *init_relocs;  /* owned */
+  size_t init_reloc_count;
   /* Set when the source had an initializer expression but it could not be
    * folded to a compile-time constant (or a string global's initializer wasn't
    * a string literal) -- the direct-object backend requires a constant global
