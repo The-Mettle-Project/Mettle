@@ -1459,9 +1459,19 @@ int mir_regalloc(MirFunction *fn) {
   }
 
   /* Graph coloring is the default; METTLE_LINEAR_ALLOC forces the legacy
-   * linear scan (an escape hatch for differential debugging). */
-  if (!getenv("METTLE_LINEAR_ALLOC")) {
-    return mir_regalloc_color(fn);
+   * linear scan (an escape hatch for differential debugging). Snapshotted
+   * because this runs once per function and getenv on Windows takes a lock and
+   * scans the whole environment -- measured at 2.5% of total compile time on a
+   * 13k-function input. The env cannot change mid-process for a diagnostic
+   * knob. */
+  {
+    static int linear = -1;
+    if (linear < 0) {
+      linear = getenv("METTLE_LINEAR_ALLOC") ? 1 : 0;
+    }
+    if (!linear) {
+      return mir_regalloc_color(fn);
+    }
   }
 
   mir_compute_liveness(fn);
