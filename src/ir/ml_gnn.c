@@ -3,10 +3,29 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "ml_obs.h"
+
 #define NKIND 10
 #define NOPS 17
-#define NFEAT 9
-#define NEDGE 8
+#define NFEAT 9        /* v1 scalar node features */
+#define NEDGE 8        /* v1 typed edges */
+
+/* v2 (`MLGO`) additionally carries observational-equivalence features and the
+ * value-equality edges built from them; see src/ir/ml_obs.c and
+ * docs/ml-opt-oracle.md. A v1 (`MLGN`) blob takes exactly the v1 path, so the
+ * shipped model's behaviour is unchanged by any of this. */
+#define NFEAT_OBS (NFEAT + ML_OBS_NOBS)   /* 9 + 36 = 45 */
+#define NEDGE_OBS 12                      /* + same-value and dominating-same-value */
+#define NFEAT_MAX NFEAT_OBS
+#define NEDGE_MAX NEDGE_OBS
+
+#define MLW_FLAG_OBS 1
+#define MLW_FLAG_PTR 2
+#define MLW_FLAG_PONDER 4
+#define MLW_FLAG_AUX 8
+
+/* Must equal gnn_oracle.MAX_CAND. */
+#define ML_PTR_MAX_CAND 8
 #define DELETE_CLASS 1
 #define AFFINE_CLASS 3
 #define GVN_CLASS 4
@@ -256,14 +275,27 @@ static int count_consts(const char *s) {
 
 typedef struct {
   int d, layers, nclass, ok;
+  int version;              /* 1 = MLGN (shipped), 2 = MLGO (oracle) */
+  int nfeat, nedge, flags, max_steps;
   float *kind_emb, *op_emb, *feat_w, *feat_b;
   float **msg_w, **msg_b;
   float *selfw_w, *selfw_b;
   float *norm_w, *norm_b;
   float *head0_w, *head0_b, *head2_w, *head2_b;
+  /* v2 PONDER: one shared block applied recurrently with a GRU update and an
+   * ACT halting scalar. msg_w/msg_b hold the single block's messages. */
+  float *gru_wih, *gru_whh, *gru_bih, *gru_bhh;
+  float *halt_w, *halt_b;
+  /* v2 PTR / AUX heads. */
+  float *ptr_q_w, *ptr_q_b, *ptr_k_w, *ptr_k_b, *ptr_none;
+  float *live_w, *live_b, *risk_w, *risk_b;
 } Weights;
 
 static Weights G;    /* unified genius model (6 actions incl. COLLAPSE) */
+
+/* Speculative deletes withheld by the risk head this compile (METTLE_ML_RISK).
+ * Reported so the saving is measurable rather than asserted. */
+static long ml_risk_declined = 0;
 
 static float *rd(FILE *f, size_t n) {
   float *p = malloc(n * sizeof(float));
@@ -275,37 +307,104 @@ static int load_weights_into(Weights *W, const char *path) {
   if (W->ok) return 1;
   FILE *f = fopen(path, "rb");
   if (!f) { fprintf(stderr, "--ml-opt: model weights not found (%s)\n", path); return 0; }
-  char magic[4]; int hdr[4];
-  if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "MLGN", 4) != 0 ||
-      fread(hdr, sizeof(int), 4, f) != 4) { fclose(f); return 0; }
+  char magic[4]; int hdr[8];
+  if (fread(magic, 1, 4, f) != 4) { fclose(f); return 0; }
+  int v2 = memcmp(magic, "MLGO", 4) == 0;
+  if (!v2 && memcmp(magic, "MLGN", 4) != 0) { fclose(f); return 0; }
+  int nhdr = v2 ? 8 : 4;
+  if (fread(hdr, sizeof(int), (size_t)nhdr, f) != (size_t)nhdr) {
+    fclose(f);
+    return 0;
+  }
   int d = hdr[1], L = hdr[2], C = hdr[3];
+  W->version = v2 ? 2 : 1;
   W->d = d; W->layers = L; W->nclass = C;
+  W->nfeat = v2 ? hdr[4] : NFEAT;
+  W->nedge = v2 ? hdr[5] : NEDGE;
+  W->flags = v2 ? hdr[6] : 0;
+  W->max_steps = v2 ? hdr[7] : 0;
+  if (W->nfeat > NFEAT_MAX || W->nedge > NEDGE_MAX || W->nfeat < NFEAT ||
+      W->nedge < NEDGE) {
+    fprintf(stderr, "--ml-opt: model wants nfeat=%d nedge=%d, this build "
+                    "supports at most %d/%d\n",
+            W->nfeat, W->nedge, NFEAT_MAX, NEDGE_MAX);
+    fclose(f);
+    return 0;
+  }
+  int E = W->nedge;
+  int ponder = (W->flags & MLW_FLAG_PONDER) != 0;
+  int nblock = ponder ? 1 : L;
   int fail = 0;
   W->kind_emb = rd(f, (size_t)NKIND * d);
   W->op_emb = rd(f, (size_t)NOPS * d);
-  W->feat_w = rd(f, (size_t)d * NFEAT);
+  W->feat_w = rd(f, (size_t)d * W->nfeat);
   W->feat_b = rd(f, d);
-  W->msg_w = calloc((size_t)L * 8, sizeof(float *));
-  W->msg_b = calloc((size_t)L * 8, sizeof(float *));
-  W->selfw_w = malloc((size_t)L * d * d * sizeof(float));
-  W->selfw_b = malloc((size_t)L * d * sizeof(float));
-  W->norm_w = malloc((size_t)L * d * sizeof(float));
-  W->norm_b = malloc((size_t)L * d * sizeof(float));
-  for (int li = 0; li < L && !fail; li++) {
-    for (int t = 0; t < 8; t++) {
-      W->msg_w[li * 8 + t] = rd(f, (size_t)d * d);
-      W->msg_b[li * 8 + t] = rd(f, d);
-      if (!W->msg_w[li * 8 + t] || !W->msg_b[li * 8 + t]) fail = 1;
+  W->msg_w = calloc((size_t)nblock * E, sizeof(float *));
+  W->msg_b = calloc((size_t)nblock * E, sizeof(float *));
+  W->selfw_w = malloc((size_t)nblock * d * d * sizeof(float));
+  W->selfw_b = malloc((size_t)nblock * d * sizeof(float));
+  W->norm_w = malloc((size_t)nblock * d * sizeof(float));
+  W->norm_b = malloc((size_t)nblock * d * sizeof(float));
+  if (!W->msg_w || !W->msg_b || !W->selfw_w || !W->selfw_b || !W->norm_w ||
+      !W->norm_b) {
+    fclose(f);
+    return 0;
+  }
+  for (int li = 0; li < nblock && !fail; li++) {
+    for (int t = 0; t < E; t++) {
+      W->msg_w[li * E + t] = rd(f, (size_t)d * d);
+      W->msg_b[li * E + t] = rd(f, d);
+      if (!W->msg_w[li * E + t] || !W->msg_b[li * E + t]) fail = 1;
     }
     if (fread(W->selfw_w + (size_t)li * d * d, sizeof(float), (size_t)d * d, f) != (size_t)d * d) fail = 1;
     if (fread(W->selfw_b + (size_t)li * d, sizeof(float), d, f) != (size_t)d) fail = 1;
+    /* v2 PONDER emits the GRU update between the block and its LayerNorm. */
+    if (!fail && ponder) {
+      W->gru_wih = rd(f, (size_t)3 * d * d);
+      W->gru_whh = rd(f, (size_t)3 * d * d);
+      W->gru_bih = rd(f, (size_t)3 * d);
+      W->gru_bhh = rd(f, (size_t)3 * d);
+      if (!W->gru_wih || !W->gru_whh || !W->gru_bih || !W->gru_bhh) fail = 1;
+    }
     if (fread(W->norm_w + (size_t)li * d, sizeof(float), d, f) != (size_t)d) fail = 1;
     if (fread(W->norm_b + (size_t)li * d, sizeof(float), d, f) != (size_t)d) fail = 1;
+    if (!fail && ponder) {
+      W->halt_w = rd(f, (size_t)d);
+      W->halt_b = rd(f, 1);
+      if (!W->halt_w || !W->halt_b) fail = 1;
+    }
   }
   W->head0_w = rd(f, (size_t)d * d);
   W->head0_b = rd(f, d);
   W->head2_w = rd(f, (size_t)C * d);
   W->head2_b = rd(f, C);
+  if (!fail && (W->flags & MLW_FLAG_PTR)) {
+    W->ptr_q_w = rd(f, (size_t)d * d);
+    W->ptr_q_b = rd(f, d);
+    W->ptr_k_w = rd(f, (size_t)d * d);
+    W->ptr_k_b = rd(f, d);
+    W->ptr_none = rd(f, 1);
+    if (!W->ptr_q_w || !W->ptr_q_b || !W->ptr_k_w || !W->ptr_k_b || !W->ptr_none)
+      fail = 1;
+  }
+  if (!fail && (W->flags & MLW_FLAG_AUX)) {
+    W->live_w = rd(f, (size_t)2 * d);
+    W->live_b = rd(f, 2);
+    W->risk_w = rd(f, (size_t)2 * d);
+    W->risk_b = rd(f, 2);
+    if (!W->live_w || !W->live_b || !W->risk_w || !W->risk_b) fail = 1;
+  }
+  /* A blob longer than its header describes means the writer and this reader
+   * disagree about the layout, which would otherwise show up as a subtly wrong
+   * model rather than an error. */
+  if (!fail) {
+    char tail;
+    if (fread(&tail, 1, 1, f) == 1) {
+      fprintf(stderr, "--ml-opt: model file has trailing data; header and "
+                      "tensor layout disagree\n");
+      fail = 1;
+    }
+  }
   fclose(f);
   if (fail || !W->kind_emb || !W->op_emb || !W->feat_w || !W->feat_b ||
       !W->head0_w || !W->head0_b || !W->head2_w || !W->head2_b) {
@@ -389,13 +488,20 @@ static void layernorm(float *x, const float *g, const float *b, int d) {
 
 /* Relational GNN forward over the typed-edge graph; writes per-node argmax class
  * to out[]. Reusable across both models (genius 5-class, collapse 2-class). */
+/* `out_h`, when non-NULL, receives the final per-node hidden states (caller
+ * frees). The pointer head scores PAIRS of nodes, so it needs the embeddings and
+ * not just the per-node argmax. */
 static void gnn_forward(Weights *W, int n, int *kind, int *op, float *feat,
-                        int *esrc[NEDGE], int *edst[NEDGE], int *ecnt, int *out) {
+                        int **esrc, int **edst, int *ecnt, int *out,
+                        float **out_h) {
   int d = W->d, L = W->layers, C = W->nclass;
+  int E = W->nedge;
+  int ponder = (W->flags & MLW_FLAG_PONDER) != 0;
+  int nf = W->nfeat;
   float *h = malloc((size_t)n * d * sizeof(float));
   for (int i = 0; i < n; i++) {
     float *hi = h + (size_t)i * d;
-    linear(hi, feat + (size_t)i * NFEAT, W->feat_w, W->feat_b, d, NFEAT);
+    linear(hi, feat + (size_t)i * nf, W->feat_w, W->feat_b, d, nf);
     const float *ke = W->kind_emb + (size_t)kind[i] * d;
     const float *oe = W->op_emb + (size_t)op[i] * d;
     for (int c = 0; c < d; c++) hi[c] += ke[c] + oe[c];
@@ -410,15 +516,34 @@ static void gnn_forward(Weights *W, int n, int *kind, int *op, float *feat,
   float *msgbuf = malloc((size_t)n * d * sizeof(float));
   int *computed_gen = calloc((size_t)n, sizeof(int));
   int *touched = malloc((size_t)n * sizeof(int));
-  for (int li = 0; li < L; li++) {
+  /* PONDER: one shared block applied up to max_steps times, each node halting
+   * when its accumulated halting probability saturates. A halted node FREEZES
+   * (it still sends messages but stops updating), which is what makes the early
+   * exit sound here and cheap: its state cannot change again, so skipping its
+   * update changes nothing. `y` accumulates the halting-weighted state. */
+  int steps = ponder ? (W->max_steps > 0 ? W->max_steps : 16) : L;
+  float *cum = NULL, *y = NULL, *hnew = NULL, *gbuf = NULL;
+  if (ponder) {
+    cum = calloc((size_t)n, sizeof(float));
+    y = calloc((size_t)n * d, sizeof(float));
+    hnew = malloc((size_t)d * sizeof(float));
+    gbuf = malloc((size_t)6 * d * sizeof(float));
+  }
+  for (int li = 0; li < steps; li++) {
+    int wi = ponder ? 0 : li;      /* shared weights when pondering */
+    if (ponder) {
+      int running = 0;
+      for (int i = 0; i < n; i++) if (cum[i] < 0.99f) { running = 1; break; }
+      if (!running) break;
+    }
     for (int i = 0; i < n; i++)
       linear(agg + (size_t)i * d, h + (size_t)i * d,
-             W->selfw_w + (size_t)li * d * d, W->selfw_b + (size_t)li * d, d, d);
-    for (int t = 0; t < NEDGE; t++) {
+             W->selfw_w + (size_t)wi * d * d, W->selfw_b + (size_t)wi * d, d, d);
+    for (int t = 0; t < E; t++) {
       if (ecnt[t] == 0) continue;
       int ntouched = 0;
-      int gen = li * NEDGE + t + 1;
-      const float *mw = W->msg_w[li * 8 + t], *mb = W->msg_b[li * 8 + t];
+      int gen = li * E + t + 1;
+      const float *mw = W->msg_w[wi * E + t], *mb = W->msg_b[wi * E + t];
       for (int e = 0; e < ecnt[t]; e++) {
         int s = esrc[t][e], dd = edst[t][e];
         float *ms = msgbuf + (size_t)s * d;
@@ -442,12 +567,43 @@ static void gnn_forward(Weights *W, int n, int *kind, int *op, float *feat,
         deg[i] = 0;
       }
     }
+    if (!ponder) {
+      for (int i = 0; i < n; i++) {
+        float *hi = h + (size_t)i * d, *ai = agg + (size_t)i * d;
+        for (int c = 0; c < d; c++) hi[c] += ai[c] > 0 ? ai[c] : 0.0f;
+        layernorm(hi, W->norm_w + (size_t)li * d, W->norm_b + (size_t)li * d, d);
+      }
+      continue;
+    }
     for (int i = 0; i < n; i++) {
+      if (cum[i] >= 0.99f) continue;                 /* halted: frozen */
       float *hi = h + (size_t)i * d, *ai = agg + (size_t)i * d;
-      for (int c = 0; c < d; c++) hi[c] += ai[c] > 0 ? ai[c] : 0.0f;
-      layernorm(hi, W->norm_w + (size_t)li * d, W->norm_b + (size_t)li * d, d);
+      for (int c = 0; c < d; c++) ai[c] = ai[c] > 0 ? ai[c] : 0.0f;
+      /* GRUCell(input = relu(agg), hidden = h); PyTorch gate order is r, z, n
+       * and weight_ih/weight_hh are each [3d, d]. */
+      float *gi = gbuf, *gh = gbuf + 3 * d;
+      linear(gi, ai, W->gru_wih, W->gru_bih, 3 * d, d);
+      linear(gh, hi, W->gru_whh, W->gru_bhh, 3 * d, d);
+      for (int c = 0; c < d; c++) {
+        float r = 1.0f / (1.0f + expf(-(gi[c] + gh[c])));
+        float z = 1.0f / (1.0f + expf(-(gi[d + c] + gh[d + c])));
+        float nn = tanhf(gi[2 * d + c] + r * gh[2 * d + c]);
+        hnew[c] = (1.0f - z) * nn + z * hi[c];
+      }
+      layernorm(hnew, W->norm_w, W->norm_b, d);
+      memcpy(hi, hnew, (size_t)d * sizeof(float));
+      float hp = W->halt_b[0];
+      for (int c = 0; c < d; c++) hp += W->halt_w[c] * hi[c];
+      float p = 1.0f / (1.0f + expf(-hp));
+      int last = (cum[i] + p >= 0.99f) || (li == steps - 1);
+      float wgt = last ? (1.0f - cum[i]) : p;
+      if (wgt < 0.0f) wgt = 0.0f;
+      float *yi = y + (size_t)i * d;
+      for (int c = 0; c < d; c++) yi[c] += wgt * hi[c];
+      cum[i] += p;
     }
   }
+  if (ponder) memcpy(h, y, (size_t)n * d * sizeof(float));
   float *t0 = malloc((size_t)d * sizeof(float)), *lg = malloc((size_t)C * sizeof(float));
   for (int i = 0; i < n; i++) {
     linear(t0, h + (size_t)i * d, W->head0_w, W->head0_b, d, d);
@@ -456,7 +612,13 @@ static void gnn_forward(Weights *W, int n, int *kind, int *op, float *feat,
     int best = 0; for (int c = 1; c < C; c++) if (lg[c] > lg[best]) best = c;
     out[i] = best;
   }
-  free(t0); free(lg); free(h); free(agg); free(acc); free(deg);
+  free(cum); free(y); free(hnew); free(gbuf);
+  if (out_h) {
+    *out_h = h;
+  } else {
+    free(h);
+  }
+  free(t0); free(lg); free(agg); free(acc); free(deg);
   free(msgbuf); free(computed_gen); free(touched);
 }
 
@@ -1226,18 +1388,19 @@ static void process_function(const char *fname, char **texts, int *gidx, int n,
    * arithmetic (loads/stores/address-of are never numbered), so reuse is sound
    * regardless of surrounding memory. */
   int *kind = calloc(n, sizeof(int)), *op = calloc(n, sizeof(int));
-  float *feat = calloc((size_t)n * NFEAT, sizeof(float));
+  const int NF = G.nfeat > 0 ? G.nfeat : NFEAT;
+  float *feat = calloc((size_t)n * NF, sizeof(float));
   char **defn = calloc(n, sizeof(char *));
   VecS *uses = calloc(n, sizeof(VecS));
   for (int i = 0; i < n; i++) {
     classify(texts[i], &kind[i], &op[i]);
     defn[i] = parse_instr(texts[i], &uses[i]);
-    feat[(size_t)i * NFEAT + 0] = (defn[i] && defn[i][0] == '%') ? 1.f : 0.f;
-    feat[(size_t)i * NFEAT + 1] = (defn[i] && defn[i][0] == '@') ? 1.f : 0.f;
-    int nc = count_consts(texts[i]); feat[(size_t)i * NFEAT + 2] = nc < 3 ? nc : 3;
-    int nu = uses[i].n; feat[(size_t)i * NFEAT + 3] = nu < 4 ? nu : 4;
+    feat[(size_t)i * NF + 0] = (defn[i] && defn[i][0] == '%') ? 1.f : 0.f;
+    feat[(size_t)i * NF + 1] = (defn[i] && defn[i][0] == '@') ? 1.f : 0.f;
+    int nc = count_consts(texts[i]); feat[(size_t)i * NF + 2] = nc < 3 ? nc : 3;
+    int nu = uses[i].n; feat[(size_t)i * NF + 3] = nu < 4 ? nu : 4;
     float of[5]; operand_feats(texts[i], of);
-    for (int j = 0; j < 5; j++) feat[(size_t)i * NFEAT + 4 + j] = of[j];
+    for (int j = 0; j < 5; j++) feat[(size_t)i * NF + 4 + j] = of[j];
   }
 
   VecI du_s = {0}, du_d = {0};
@@ -1318,7 +1481,8 @@ static void process_function(const char *fname, char **texts, int *gidx, int n,
     }
   }
 
-  int *esrc[NEDGE], *edst[NEDGE], ecnt[NEDGE];
+  int *esrc[NEDGE_MAX], *edst[NEDGE_MAX], ecnt[NEDGE_MAX];
+  for (int t = 0; t < NEDGE_MAX; t++) { esrc[t] = NULL; edst[t] = NULL; ecnt[t] = 0; }
   esrc[0] = du_s.a; edst[0] = du_d.a; ecnt[0] = du_s.n;
   esrc[1] = du_d.a; edst[1] = du_s.a; ecnt[1] = du_s.n;
   esrc[2] = c_s.a; edst[2] = c_d.a; ecnt[2] = c_s.n;
@@ -1328,8 +1492,109 @@ static void process_function(const char *fname, char **texts, int *gidx, int n,
   esrc[6] = dse_s.a; edst[6] = dse_d.a; ecnt[6] = dse_s.n;
   esrc[7] = dse_d.a; edst[7] = dse_s.a; ecnt[7] = dse_s.n;
 
+  /* v2 only: observational-equivalence features and the value-equality edges
+   * derived from them. A v1 model leaves all of this untouched, so its graph and
+   * its predictions are bit-identical to before. */
+  VecI sv_s = {0}, sv_d = {0}, dsv_s = {0}, dsv_d = {0};
+  MlObsFp *ofps = NULL;
+  if (G.nfeat >= NFEAT_OBS && G.nedge >= NEDGE_OBS) {
+    float *ob = calloc((size_t)n * ML_OBS_NOBS, sizeof(float));
+    if (ob) {
+      ml_obs_features(texts, n, ob);
+      for (int i = 0; i < n; i++)
+        for (int j = 0; j < ML_OBS_NOBS; j++)
+          feat[(size_t)i * NF + NFEAT + j] = ob[(size_t)i * ML_OBS_NOBS + j];
+      free(ob);
+    }
+    ofps = calloc((size_t)n, sizeof(MlObsFp));
+    if (ofps) {
+      ml_obs_fingerprints(texts, n, ofps, NULL, NULL);
+      /* 8/9: nearest earlier node with the same value */
+      for (int i = 0; i < n; i++) {
+        if (!ml_obs_edge_eligible(&ofps[i])) continue;
+        for (int p = i - 1; p >= 0; p--) {
+          if (!ml_obs_edge_eligible(&ofps[p])) continue;
+          if (memcmp(ofps[i].v, ofps[p].v, sizeof ofps[i].v) == 0) {
+            vi_push(&sv_s, p); vi_push(&sv_d, i);
+            break;
+          }
+        }
+      }
+      /* 10/11: nearest earlier node with the same value that also DOMINATES */
+      if (sv_s.n > 0) {
+        if (!dom) dom = dominators(preds, n);
+        if (dom) {
+          for (int i = 0; i < n; i++) {
+            if (!ml_obs_edge_eligible(&ofps[i])) continue;
+            for (int p = i - 1; p >= 0; p--) {
+              if (!ml_obs_edge_eligible(&ofps[p])) continue;
+              if (memcmp(ofps[i].v, ofps[p].v, sizeof ofps[i].v) != 0) continue;
+              if (dom[(size_t)i * n + p]) {
+                vi_push(&dsv_s, p); vi_push(&dsv_d, i);
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+    esrc[8] = sv_s.a; edst[8] = sv_d.a; ecnt[8] = sv_s.n;
+    esrc[9] = sv_d.a; edst[9] = sv_s.a; ecnt[9] = sv_s.n;
+    esrc[10] = dsv_s.a; edst[10] = dsv_d.a; ecnt[10] = dsv_s.n;
+    esrc[11] = dsv_d.a; edst[11] = dsv_s.a; ecnt[11] = dsv_s.n;
+  }
+
   int *action = malloc(n * sizeof(int));
-  gnn_forward(&G, n, kind, op, feat, esrc, edst, ecnt, action);
+  float *hstate = NULL;
+  int want_ptr = (G.flags & MLW_FLAG_PTR) && getenv("METTLE_ML_PTR") &&
+                 getenv("METTLE_ML_PTR")[0] != '0';
+  /* METTLE_ML_RISK=<t>: decline speculative deletes whose predicted probability
+   * of validator rejection is at least t. The gate's cost is real -- it snapshots
+   * the function and re-executes it on generated inputs -- and roughly two thirds
+   * of speculative deletes are rejected, so a model that can rank its own
+   * proposals turns that into avoidable work rather than unavoidable work.
+   * Declining can only remove proposals, never add or alter one, so this cannot
+   * affect correctness: the worst case is a sound rewrite left unmade. */
+  double risk_thresh = -1.0;
+  {
+    const char *rt = getenv("METTLE_ML_RISK");
+    if (rt && rt[0] && (G.flags & MLW_FLAG_AUX)) risk_thresh = atof(rt);
+  }
+  int want_risk = risk_thresh >= 0.0;
+  gnn_forward(&G, n, kind, op, feat, esrc, edst, ecnt, action,
+              (want_ptr || want_risk) ? &hstate : NULL);
+
+  /* p(reject) per node from the auxiliary risk head. */
+  float *risk_p = NULL;
+  if (want_risk && hstate) {
+    risk_p = malloc((size_t)n * sizeof(float));
+    for (int i = 0; i < n; i++) {
+      float lg2[2];
+      linear(lg2, hstate + (size_t)i * G.d, G.risk_w, G.risk_b, 2, G.d);
+      float m0 = lg2[0] > lg2[1] ? lg2[0] : lg2[1];
+      float e0 = expf(lg2[0] - m0), e1 = expf(lg2[1] - m0);
+      risk_p[i] = e1 / (e0 + e1);
+    }
+  }
+
+  /* METTLE_ML_ACTIONS=<path>: append the model's raw per-instruction argmax,
+   * `function<TAB>ir-index<TAB>class`, BEFORE any transform decides whether it
+   * can realize it. The disposition file only records proposals a transform
+   * accepted, so it cannot tell you what the network actually predicted. This
+   * can, which is what makes it possible to check the C forward pass against
+   * PyTorch on the same graph (tools/mlopt/check_forward.py) rather than
+   * assuming the port is faithful. Off unless the variable is set. */
+  {
+    const char *ap = getenv("METTLE_ML_ACTIONS");
+    if (ap && ap[0]) {
+      FILE *af = fopen(ap, "a");
+      if (af) {
+        for (int j = 0; j < n; j++)
+          fprintf(af, "%s\t%d\t%d\n", fname, gidx[j], action[j]);
+        fclose(af);
+      }
+    }
+  }
   /* COLLAPSE is the model's 6th action (same forward pass). METTLE_ML_COLLAPSE_ALL
    * runs the verifier on every root (diagnostic). */
   int *collapse_flag = calloc(n, sizeof(int));
@@ -1340,6 +1605,9 @@ static void process_function(const char *fname, char **texts, int *gidx, int n,
   }
 
   char **gvn_src = calloc(n, sizeof(char *));
+  /* Per-node: did the pointer head choose this source rather than the sound
+     analysis? Decides whether the disposition is emitted as COPY or COPY?. */
+  unsigned char *gvn_model_src = calloc(n, 1);
   {
     Intern vk = {0}; VecS vk_a = {0}, vk_b = {0};
     int *keyid = malloc(n * sizeof(int));
@@ -1405,6 +1673,57 @@ static void process_function(const char *fname, char **texts, int *gidx, int n,
       }
       free(gen); free(kill); free(ain); free(aout); free(tmp);
     }
+    /* METTLE_ML_PTR: let the model NAME the reuse target instead of taking the
+     * one the available-expressions analysis picked.
+     *
+     * The candidate set is the union of the dominating same-expression and
+     * dominating same-value relations -- the same set the pointer head was
+     * trained against. Slot 0 is "decline"; a node whose best slot is 0 keeps
+     * whatever the sound analysis said, so the head can only ADD proposals or
+     * redirect ones the analysis already wanted to make.
+     *
+     * Anything the head chooses that the analysis did not is emitted as `COPY?`
+     * (see disp_speculative in ml_opt.c): the source came from a network, so it
+     * carries no construction-time proof and must face the interpreter gate even
+     * on functions the gate would otherwise skip. Without that marking this
+     * would be an unsound widening rather than a new proposal class. */
+    if (want_ptr && hstate) {
+      int d = G.d;
+      float *q = malloc((size_t)d * sizeof(float));
+      float *k = malloc((size_t)d * sizeof(float));
+      for (int i = 0; i < n; i++) {
+        /* MAX_CAND must match gnn_oracle.MAX_CAND: the head was trained with
+           at most this many candidates per node, and a longer list at inference
+           would score slots the model never saw. */
+        int cs[ML_PTR_MAX_CAND], nc = 0;
+        for (int e = 0; e < ecnt[6] && nc < ML_PTR_MAX_CAND; e++)
+          if (edst[6][e] == i) cs[nc++] = esrc[6][e];
+        for (int e = 0; e < ecnt[10] && nc < ML_PTR_MAX_CAND; e++) {
+          if (edst[10][e] != i) continue;
+          int dup = 0;
+          for (int c = 0; c < nc; c++) if (cs[c] == esrc[10][e]) dup = 1;
+          if (!dup) cs[nc++] = esrc[10][e];
+        }
+        if (nc == 0) continue;
+        linear(q, hstate + (size_t)i * d, G.ptr_q_w, G.ptr_q_b, d, d);
+        float best = G.ptr_none[0];      /* slot 0: decline */
+        int bestc = -1;
+        for (int c = 0; c < nc; c++) {
+          linear(k, hstate + (size_t)cs[c] * d, G.ptr_k_w, G.ptr_k_b, d, d);
+          float s = 0.f;
+          for (int t = 0; t < d; t++) s += q[t] * k[t];
+          s /= sqrtf((float)d);
+          if (s > best) { best = s; bestc = cs[c]; }
+        }
+        if (bestc < 0 || !vdefn[bestc] || vdefn[bestc][0] != '%') continue;
+        if (gvn_src[i] && strcmp(gvn_src[i], vdefn[bestc]) == 0) continue;
+        free(gvn_src[i]);
+        gvn_src[i] = strdup(vdefn[bestc]);
+        gvn_model_src[i] = 1;
+        if (action[i] != GVN_CLASS) action[i] = GVN_CLASS;
+      }
+      free(q); free(k);
+    }
     for (int i = 0; i < n; i++) free(vdefn[i]);
     free(vdefn); free(keyid); vs_free(&vk.keys); vs_free(&vk_a); vs_free(&vk_b);
   }
@@ -1466,6 +1785,10 @@ static void process_function(const char *fname, char **texts, int *gidx, int n,
     }
     if (speculative && action[j] == DELETE_CLASS &&
         (kind[j] == 5 || kind[j] == 6 || kind[j] == 7 || kind[j] == 8)) {
+      if (risk_p && risk_p[j] >= (float)risk_thresh) {
+        ml_risk_declined++;
+        continue;                    /* the model expects the gate to reject */
+      }
       char line[700];
       snprintf(line, sizeof line, "%s %d NOP\n", fname, gidx[j]);
       buf_add(out, line);
@@ -1487,9 +1810,14 @@ static void process_function(const char *fname, char **texts, int *gidx, int n,
       char a[256], o[16], b[256];
       if (drhs[0] == 0 || three_token(drhs, a, sizeof a, o, sizeof o, b, sizeof b) == 0) continue;
       char line[700];
-      snprintf(line, sizeof line, "%s %d COPY %s\n", fname, gidx[j], gvn_src[j]);
+      /* `COPY?` when the pointer head chose this source: model-sourced, so it
+       * carries no construction-time proof and must face the interpreter gate
+       * even where the gate would otherwise pass a COPY through unchecked. */
+      snprintf(line, sizeof line, "%s %d COPY%s %s\n", fname, gidx[j],
+               gvn_model_src[j] ? "?" : "", gvn_src[j]);
       buf_add(out, line);
-      snprintf(ex, sizeof ex, "%s\t%d\tGVN reuse\t%s\t%s\t1\n", fname, gidx[j], bexpr, gvn_src[j]);
+      snprintf(ex, sizeof ex, "%s\t%d\tGVN reuse%s\t%s\t%s\t1\n", fname, gidx[j],
+               gvn_model_src[j] ? " (model-chosen)" : "", bexpr, gvn_src[j]);
       buf_add(explain, ex);
     }
   }
@@ -1497,10 +1825,13 @@ static void process_function(const char *fname, char **texts, int *gidx, int n,
   for (int i = 0; i < n; i++) free(aff_arg[i]);
   free(aff_kind); free(aff_arg); vs_free(&params); free(collapse_flag);
   for (int i = 0; i < n; i++) { free(defn[i]); free(gvn_src[i]); vs_free(&uses[i]); }
-  free(defn); free(gvn_src); free(uses); free(kind); free(op); free(feat);
+  free(defn); free(gvn_src); free(gvn_model_src); free(hstate); free(risk_p);
+  free(uses); free(kind); free(op); free(feat);
   free(action); free(gkey); vs_free(&gk.keys);
   vi_free(&du_s); vi_free(&du_d); vi_free(&c_s); vi_free(&c_d);
   vi_free(&se_s); vi_free(&se_d); vi_free(&dse_s); vi_free(&dse_d);
+  vi_free(&sv_s); vi_free(&sv_d); vi_free(&dsv_s); vi_free(&dsv_d);
+  free(ofps);
   for (int i = 0; i < n; i++) { vi_free(&succ[i]); vi_free(&preds[i]); }
   free(succ); free(preds); free(dom);
 }
@@ -1560,6 +1891,13 @@ int ml_gnn_run(const char *ir_dump_path, char **out_disp) {
     free(explain.s);
   } else {
     remove("_mlopt.explain");                 /* no transforms this run */
+  }
+
+  if (ml_risk_declined > 0) {
+    fprintf(stderr,
+            "ml-opt: risk head declined %ld speculative delete%s before the "
+            "gate saw them\n",
+            ml_risk_declined, ml_risk_declined == 1 ? "" : "s");
   }
 
   if (!out.s) out.s = calloc(1, 1);

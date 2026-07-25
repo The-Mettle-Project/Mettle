@@ -263,7 +263,7 @@ if %ERRORLEVEL% NEQ 0 (
 echo Archiving libmtlc ^(backend: IR core, optimizer, codegen, linker^)...
 if exist bin\mtlc.lib del /Q bin\mtlc.lib
 REM Backend IR core -- explicitly listed to EXCLUDE the lowering TUs below.
-for %%o in (ir ir_comptime ir_debug_hooks ir_interp ir_optimize ir_pgo ir_profile ir_verify ml_gnn ml_opt mtlc_type) do %AR% rcs bin\mtlc.lib obj\ir\%%o.o
+for %%o in (ir ir_comptime ir_debug_hooks ir_interp ir_optimize ir_pgo ir_profile ir_verify ml_gnn ml_obs ml_opt mtlc_type) do %AR% rcs bin\mtlc.lib obj\ir\%%o.o
 for %%o in (obj\ir\optimizer\*.o) do %AR% rcs bin\mtlc.lib %%o
 for %%o in (obj\codegen\binary_emitter.o obj\codegen\code_generator.o obj\codegen\elf_emitter.o obj\codegen\ptx_emitter.o obj\codegen\spirv_emitter.o) do %AR% rcs bin\mtlc.lib %%o
 for %%o in (obj\codegen\binary\*.o) do %AR% rcs bin\mtlc.lib %%o

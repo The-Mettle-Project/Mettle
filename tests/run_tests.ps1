@@ -2018,6 +2018,33 @@ catch {
   Write-CaseResult -Name "ml_opt_sabotage_caught" -Passed $false -Reason $_.Exception.Message
 }
 
+# OBS Python/C parity. The ml-opt model trains on node features computed in
+# Python (tools/mlopt/obs.py) and runs on node features computed in C
+# (src/ir/ml_obs.c). A divergence between them does not crash or warn - the
+# model just reads different inputs at compile time than it trained on, and the
+# only symptom is optimization quality silently degrading. This replays the
+# golden vectors so that failure mode is a build error instead.
+$total++
+try {
+  $obsExe = "bin\ml_obs_parity_test.exe"
+  & gcc -Wall -Wextra -std=c11 -g -O1 -Isrc -Iinclude tests\ml_obs_parity_test.c src\ir\ml_obs.c -o $obsExe -lm
+  if ($LASTEXITCODE -ne 0) {
+    throw "Failed to compile OBS parity test"
+  }
+  $obsOutput = & $obsExe "tools\mlopt\obs_golden.txt" 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "OBS parity test failed:`n$obsOutput"
+  }
+  if ($obsOutput -notmatch "RESULT: (PASS|SKIP)") {
+    throw "OBS parity test did not report PASS or SKIP:`n$obsOutput"
+  }
+  Write-CaseResult -Name "ml_obs_python_parity" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "ml_obs_python_parity" -Passed $false -Reason $_.Exception.Message
+}
+
 
 # Native heap: build with --native-heap and confirm new/malloc/calloc/realloc/
 # free route through std/alloc's Mettle allocator (mettle_heap_*), stay correct
