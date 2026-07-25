@@ -2894,6 +2894,15 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
     }
     MirOpcode op = MIR_ADD;
     mir_arith_opcode(in->text, &op);
+    /* `0 - x` is a negate. Written literally it is rare, but it is the standard
+     * way to build an all-ones mask from a bit (`0 - (crc & 1)`), and SUB is
+     * two-address: without this the encoder must first materialize the zero
+     * into the destination register, so the idiom costs two instructions per
+     * use instead of one. */
+    if (op == MIR_SUB && in->lhs.kind == IR_OPERAND_INT &&
+        in->lhs.int_value == 0) {
+      return mir_emit1(fn, MIR_NEG, dst, b, mir_op_none(), 8, 0, 0);
+    }
     int uns = 0;
     if (op == MIR_SHR) {
       /* arithmetic vs logical right shift depends on the LHS signedness. */
@@ -4053,7 +4062,13 @@ typedef struct {
 typedef struct {
   const char *name;
   int reads;
+  /* Reads that occur as the ADDRESS operand of a non-float LOAD/STORE. When
+   * this equals `reads`, every consumer of the temp is an access that can carry
+   * the address in its own memory operand, so the address computation can be
+   * folded into all of them at once rather than only a single one. */
+  int addr_reads;
   long def_index; /* -1 until an instruction defines it */
+  int def_count;  /* number of instructions defining it (non-SSA names exist) */
 } MirTempUse;
 
 typedef struct {
@@ -4094,7 +4109,9 @@ static MirTempUse *mir_temp_use_slot(MirTempUseIndex *ix, const char *name) {
   }
   ix->items[ix->count].name = name;
   ix->items[ix->count].reads = 0;
+  ix->items[ix->count].addr_reads = 0;
   ix->items[ix->count].def_index = -1;
+  ix->items[ix->count].def_count = 0;
   ix->count++;
   ix->buckets[b] = ix->count;
 
@@ -4143,6 +4160,18 @@ static int mir_temp_use_build(const IRFunction *f, MirTempUseIndex *ix) {
         in->dest.name) {
       reads[nreads++] = &in->dest;
     }
+    /* The address operand of a non-float LOAD/STORE: a read that an x86 memory
+     * operand can absorb (see mir_compute_address_folds). */
+    const IROperand *addr_read = NULL;
+    if (!in->is_float) {
+      if (in->op == IR_OP_LOAD && in->lhs.kind == IR_OPERAND_TEMP &&
+          in->lhs.name) {
+        addr_read = &in->lhs;
+      } else if (in->op == IR_OP_STORE && in->dest.kind == IR_OPERAND_TEMP &&
+                 in->dest.name) {
+        addr_read = &in->dest;
+      }
+    }
     for (int k = 0; k < nreads; k++) {
       MirTempUse *e = mir_temp_use_slot(ix, reads[k]->name);
       if (!e) {
@@ -4150,6 +4179,9 @@ static int mir_temp_use_build(const IRFunction *f, MirTempUseIndex *ix) {
         return 0;
       }
       e->reads++;
+      if (reads[k] == addr_read) {
+        e->addr_reads++;
+      }
     }
     /* Any op with a TEMP dest, STORE included: the two queries are independent,
      * and the scan this replaces treated a STORE's dest as both a read (its
@@ -4162,6 +4194,13 @@ static int mir_temp_use_build(const IRFunction *f, MirTempUseIndex *ix) {
       }
       if (e->def_index < 0) {
         e->def_index = (long)i; /* first definition wins, as the scan did */
+      }
+      /* A STORE's dest is the address it writes THROUGH, not a value it
+       * defines, so it must not count towards the "exactly one producer"
+       * test -- `*%t <- v` would otherwise make every stored-through address
+       * look multiply-defined. (def_index keeps its historical behaviour.) */
+      if (in->op != IR_OP_STORE) {
+        e->def_count++;
       }
     }
   }
@@ -4190,6 +4229,101 @@ static int mir_temp_read_count(const MirTempUseIndex *ix, const char *name) {
 static long mir_temp_def_index(const MirTempUseIndex *ix, const char *name) {
   const MirTempUse *e = mir_temp_use_find(ix, name);
   return e ? e->def_index : -1;
+}
+
+/* True when every read of `name` is the address operand of a non-float
+ * LOAD/STORE, and the name has exactly one definition. Both conditions are
+ * needed before an address computation may be folded into more than one
+ * access: a non-address read would still need the value in a register, and a
+ * second definition means `def_index` does not identify the producer that
+ * reaches those reads. */
+static int mir_temp_reads_are_all_addresses(const MirTempUseIndex *ix,
+                                            const char *name, int *reads_out) {
+  const MirTempUse *e = mir_temp_use_find(ix, name);
+  if (!e || e->reads < 1) {
+    return 0;
+  }
+  if (reads_out) {
+    *reads_out = e->reads;
+  }
+  if (e->reads == 1) {
+    return 1; /* the long-standing single-access fold; unchanged */
+  }
+  return e->def_count == 1 && e->reads == e->addr_reads;
+}
+
+/* True when `operand` names the value written by `in`. Symbols are the mutable
+ * ones -- a temp is written by its own producer, which the caller has already
+ * accounted for. */
+static int mir_instruction_defines_operand(const IRInstruction *in,
+                                           const IROperand *operand) {
+  /* A NOP is a deleted instruction: the optimizer blanks the opcode but leaves
+   * the operands in place, so its `dest` names a value it no longer writes.
+   * A STORE's `dest` is its address -- read, not written. */
+  if (in->op == IR_OP_NOP || in->op == IR_OP_STORE) {
+    return 0;
+  }
+  if (!operand || !operand->name || in->dest.kind != operand->kind ||
+      !in->dest.name) {
+    return 0;
+  }
+  if (operand->kind != IR_OPERAND_SYMBOL && operand->kind != IR_OPERAND_TEMP) {
+    return 0;
+  }
+  return strcmp(in->dest.name, operand->name) == 0;
+}
+
+/* An access folds the address computation into its own memory operand, so the
+ * operands are re-read at the access rather than at the original add. Folding
+ * into SEVERAL accesses is therefore only sound while `base` and `index` still
+ * hold the values they had at the add. Walk forward from the producer and
+ * require all `expected` accesses to be reached before either operand is
+ * rewritten (a store through a pointer cannot change a register value, so only
+ * direct writes and calls -- which may write a global -- matter).
+ *
+ * The scan is bounded: a candidate whose uses are far apart is left alone
+ * rather than paying an unbounded walk per access on a large function. */
+#define MIR_ADDR_FOLD_SCAN_LIMIT 256
+
+static int mir_addr_fold_multiuse_safe(const IRFunction *f, size_t def_index,
+                                       const char *addr_name,
+                                       const IROperand *base,
+                                       const IROperand *index, int expected) {
+  int seen = 0;
+  int base_is_symbol = (base->kind == IR_OPERAND_SYMBOL);
+  int index_is_symbol = (index->kind == IR_OPERAND_SYMBOL);
+  size_t limit = def_index + 1 + MIR_ADDR_FOLD_SCAN_LIMIT;
+  if (limit > f->instruction_count) {
+    limit = f->instruction_count;
+  }
+  for (size_t k = def_index + 1; k < limit; k++) {
+    const IRInstruction *in = &f->instructions[k];
+    const IROperand *addr = NULL;
+    if (in->op == IR_OP_LOAD) {
+      addr = &in->lhs;
+    } else if (in->op == IR_OP_STORE) {
+      addr = &in->dest;
+    }
+    if (addr && addr->kind == IR_OPERAND_TEMP && addr->name &&
+        strcmp(addr->name, addr_name) == 0) {
+      seen++;
+      if (seen == expected) {
+        return 1;
+      }
+      continue;
+    }
+    /* A call may write any global, and the base/index of an array access are
+     * routinely globals or parameters spilled to memory. */
+    if ((in->op == IR_OP_CALL || in->op == IR_OP_CALL_INDIRECT) &&
+        (base_is_symbol || index_is_symbol)) {
+      return 0;
+    }
+    if (mir_instruction_defines_operand(in, base) ||
+        mir_instruction_defines_operand(in, index)) {
+      return 0;
+    }
+  }
+  return 0;
 }
 
 /* If `p` scales an index by a legal SIB factor (`idx << k`, k in 0..3, or
@@ -4280,9 +4414,14 @@ static void mir_compute_address_folds(const IRFunction *f,
     if (in->is_float || addr->kind != IR_OPERAND_TEMP || !addr->name) {
       continue;
     }
-    /* The address must feed only this access, or dropping its producer would
-     * lose a value another instruction needs. */
-    if (mir_temp_read_count(uses, addr->name) != 1) {
+    /* Every read of the address must be an access that can carry it in its own
+     * memory operand, or dropping its producer would lose a value another
+     * instruction needs. Several such accesses are fine -- a SIB operand costs
+     * no extra instruction, so re-deriving the address per access is strictly
+     * cheaper than computing it once into a register. `count[d] = count[d] + 1`
+     * (load and store through one address) is the common shape. */
+    int addr_reads = 0;
+    if (!mir_temp_reads_are_all_addresses(uses, addr->name, &addr_reads)) {
       continue;
     }
     long ai = mir_temp_def_index(uses, addr->name);
@@ -4316,6 +4455,11 @@ static void mir_compute_address_folds(const IRFunction *f,
       if (!mir_decode_scale(&f->instructions[si], &index, &scale)) {
         continue;
       }
+      if (addr_reads > 1 &&
+          !mir_addr_fold_multiuse_safe(f, (size_t)ai, addr->name, base, &index,
+                                       addr_reads)) {
+        continue;
+      }
       folds[i].valid = 1;
       folds[i].base = *base;
       folds[i].index = index;
@@ -4339,7 +4483,10 @@ static void mir_compute_address_folds(const IRFunction *f,
       const IROperand *o1 = &padd->rhs;
       int o0_reg = (o0->kind == IR_OPERAND_TEMP || o0->kind == IR_OPERAND_SYMBOL);
       int o1_reg = (o1->kind == IR_OPERAND_TEMP || o1->kind == IR_OPERAND_SYMBOL);
-      if (o0_reg && o1_reg) {
+      if (o0_reg && o1_reg &&
+          (addr_reads == 1 ||
+           mir_addr_fold_multiuse_safe(f, (size_t)ai, addr->name, o0, o1,
+                                       addr_reads))) {
         folds[i].valid = 1;
         folds[i].base = *o0;
         folds[i].index = *o1;
@@ -4372,7 +4519,10 @@ static void mir_compute_address_folds(const IRFunction *f,
         cst = o0;
       }
       if (base && cst->int_value >= -2147483648LL &&
-          cst->int_value <= 2147483647LL) {
+          cst->int_value <= 2147483647LL &&
+          (addr_reads == 1 ||
+           mir_addr_fold_multiuse_safe(f, (size_t)ai, addr->name, base, cst,
+                                       addr_reads))) {
         folds[i].valid = 1;
         folds[i].base = *base;
         folds[i].index = *cst;
@@ -5146,13 +5296,20 @@ int code_generator_binary_emit_function_via_mir(
 
   /* Address-taken globals (&g): a pointer can read/write their memory, so the
    * cache vreg must be flushed before a pointer LOAD/STORE and reloaded after a
-   * pointer STORE. Collect them once (deduped). They are a subset of the cached
-   * globals above, so reads/writes still hit the fast register cache between
-   * pointer accesses. */
+   * pointer STORE. Collect them once (deduped).
+   *
+   * Only globals the loop above actually cached belong here. One that is merely
+   * address-taken -- `&g` with no read of `g` by name anywhere in the function,
+   * which is every global aggregate, since those are only ever reached through
+   * an address -- has no cache vreg, and memory is already authoritative. Its
+   * name still maps to a fresh vreg on demand, so flushing it would store an
+   * undefined register over the global's own storage: `var p: int32* = &g;
+   * return *p;` read back whatever the allocator had left in that register. */
   for (size_t i = 0; i < ir_function->instruction_count; i++) {
     const IRInstruction *in = &ir_function->instructions[i];
     if (in->op != IR_OP_ADDRESS_OF || in->lhs.kind != IR_OPERAND_SYMBOL ||
-        !in->lhs.name || !mir_name_is_global_scalar(generator, in->lhs.name)) {
+        !in->lhs.name || !mir_name_is_global_scalar(generator, in->lhs.name) ||
+        !mir_name_map_has(&map, in->lhs.name)) {
       continue;
     }
     int present = 0;
