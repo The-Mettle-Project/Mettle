@@ -236,6 +236,7 @@ typedef struct {
   char fn[256];
   long long gidx;
   int kind;
+  int unproven;  /* source is a model guess, not a construction-time proof */
   char *arg;     /* COPY/CONST operand or REWRITE postfix (immutable here) */
   int applied;   /* changed the IR and currently stands */
   int verdict;   /* MLV_* */
@@ -259,11 +260,26 @@ static const char *mlk_name(int kind) {
   }
 }
 
-/* NOP dispositions are the model's speculative dead-code deletes: they carry
- * no construction-time proof and stand only when the validator can check the
- * function. COPY/CONST/REWRITE come from sound transforms (GVN dataflow,
- * collapse probing, truth-table/GF(2) superoptimization). */
-static int disp_speculative(const MLDisp *d) { return d->kind == MLK_NOP; }
+/* Which dispositions may NOT stand on their own authority.
+ *
+ * NOP is the model's speculative dead-code delete: no construction-time proof,
+ * so it stands only when the validator can check the function. COPY/CONST/
+ * REWRITE have historically come from sound transforms (GVN dataflow, collapse
+ * probing, truth-table/GF(2) superoptimization), so they are proven by
+ * construction and may stand even when the gate cannot run the function.
+ *
+ * That reasoning is about PROVENANCE, not about the kind. A `COPY` whose source
+ * a model chose is not proven by anything, and treating it as proven would apply
+ * an unchecked rewrite to every function the interpreter cannot execute. So a
+ * disposition may mark itself unproven by suffixing its kind with `?`
+ * (`COPY? %t7`), and anything unproven is gated exactly like a NOP.
+ *
+ * This matters concretely: the pointer head in gnn_oracle names its own reuse
+ * target, and must emit `COPY?`. Without this distinction, enabling that head
+ * would silently widen what the compiler applies without validation. */
+static int disp_speculative(const MLDisp *d) {
+  return d->kind == MLK_NOP || d->unproven;
+}
 
 static MLDisp *parse_disps(char *text, int *out_n) {
   int cap = 64, n = 0;
@@ -288,6 +304,13 @@ static MLDisp *parse_disps(char *text, int *out_n) {
       m->gidx = gi;
       m->verdict = MLV_PENDING;
       m->arg = strdup(p + consumed);
+      /* A `?` suffix marks the disposition as model-sourced rather than proven
+       * by construction; see disp_speculative. */
+      size_t klen = strlen(kind);
+      if (klen && kind[klen - 1] == '?') {
+        m->unproven = 1;
+        kind[klen - 1] = 0;
+      }
       if (strcmp(kind, "NOP") == 0) m->kind = MLK_NOP;
       else if (strcmp(kind, "COPY") == 0) m->kind = MLK_COPY;
       else if (strcmp(kind, "CONST") == 0) m->kind = MLK_CONST;
@@ -605,6 +628,29 @@ static void annotate_explain(IRProgram *program) {
 
 /* After validation, append each record's verdict (matched by fn+gidx) so the
  * --explain report can say which rewrites stood and which were rejected. */
+/* METTLE_ML_TRACE=<path>: append one machine-readable record per disposition,
+ * `file<TAB>function<TAB>gidx<TAB>kind<TAB>verdict`. The --explain report is for
+ * humans; this is for tooling that has to pair every proposal with the
+ * validator's ruling on it, which the summary line and the explain report cannot
+ * do reliably (they are prose, and they pluralize). Off unless the variable is
+ * set; appends, so a whole-corpus build accumulates into one file. */
+static void write_trace(const MLDisp *d, int n, const char *ir_path) {
+  const char *path = getenv("METTLE_ML_TRACE");
+  if (!path || !path[0]) {
+    return;
+  }
+  FILE *t = fopen(path, "a");
+  if (!t) {
+    return;
+  }
+  for (int i = 0; i < n; i++) {
+    fprintf(t, "%s\t%s\t%lld\t%s%s\t%s\n", ir_path ? ir_path : "?", d[i].fn,
+            d[i].gidx, mlk_name(d[i].kind), d[i].unproven ? "?" : "",
+            mlv_name(d[i].verdict));
+  }
+  fclose(t);
+}
+
 static void append_verdicts(const MLDisp *d, int n) {
   FILE *in = fopen("_mlopt.explain", "rb");
   if (!in) {
@@ -755,6 +801,7 @@ int ir_apply_ml_opt(IRProgram *program, MLOptStats *stats) {
   free(done);
 
   append_verdicts(d, n);
+  write_trace(d, n, ir_path);
   for (int i = 0; i < n; i++) {
     free(d[i].arg);
   }

@@ -1956,6 +1956,31 @@ try {
   if ($LASTEXITCODE -ne $mlBaseExit) {
     throw "rejected disposition still changed behavior: exit $LASTEXITCODE vs baseline $mlBaseExit"
   }
+  # Provenance: a `?` suffix marks a disposition as model-sourced rather than
+  # proven by construction, and anything unproven must be gated exactly like a
+  # speculative NOP. Without this, a future model that picks its own rewrite
+  # targets could reuse the COPY kind and have its guesses applied UNVALIDATED
+  # on every function the interpreter cannot execute. Here the same wrong CONST
+  # is injected as `CONST?`; it must still be caught and the binary must still
+  # match the baseline.
+  $dispPath2 = Join-Path $tmpDir "ml_gate_unproven.disp"
+  "mix $badIdx CONST? 271828" | Out-File -Encoding ascii $dispPath2
+  $env:METTLE_ML_DISP = $dispPath2
+  $unpExe = Join-Path $tmpDir "ml_gate_unproven.exe"
+  $buildOut = & $CompilerPath --build --release --ml-opt "tests\ml_gate.mettle" -o $unpExe 2>&1 | Out-String
+  $env:METTLE_ML_DISP = $null
+  if ($LASTEXITCODE -ne 0) {
+    throw "ml_gate unproven-disposition build failed: $buildOut"
+  }
+  if ($buildOut -match "proven-only\)\s*,?\s*0 REJECTED" -and
+      $buildOut -notmatch "PROPOSAL REJECTED") {
+    throw "unproven disposition was applied without adjudication: $buildOut"
+  }
+  & $unpExe 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne $mlBaseExit) {
+    throw "unproven disposition changed behavior: exit $LASTEXITCODE vs baseline $mlBaseExit"
+  }
+
   Write-CaseResult -Name "ml_opt_gate" -Passed $true
 }
 catch {
@@ -1992,6 +2017,7 @@ catch {
   $failed++
   Write-CaseResult -Name "ml_opt_sabotage_caught" -Passed $false -Reason $_.Exception.Message
 }
+
 
 # Native heap: build with --native-heap and confirm new/malloc/calloc/realloc/
 # free route through std/alloc's Mettle allocator (mettle_heap_*), stay correct

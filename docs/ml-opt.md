@@ -82,6 +82,33 @@ Every default-mode transform is sound by proof or by construction before it ever
 
 These proofs are the transforms' *first* line of defense; the interpreter differential still re-checks every applied rewrite (defense in depth: the applier itself could be buggy). The `DELETE` action has no proof of its own and is applied only under `--ml-opt-speculative`, where the validator is the sole gate.
 
+### Proven versus unproven dispositions
+
+When the interpreter cannot execute a function, a disposition may still apply on the strength of its construction-time proof. Whether it has one is a question of *provenance*, not of which transform kind it is: a `COPY` produced by the available-expressions analysis is sound by construction, while a `COPY` whose source a model chose is not.
+
+A disposition therefore declares itself unproven by suffixing its kind with `?`:
+
+```
+mem_move 32 COPY  %.t9      proven by construction; may stand unvalidated
+mem_move 32 COPY? %.t9      model-sourced; gated exactly like a speculative NOP
+```
+
+Everything the shipped model emits is proven, so this changes nothing about `--ml-opt` today. It exists so that a future model which picks its own rewrite targets cannot widen what the compiler applies without validation simply by reusing an existing disposition kind.
+
+## Machine-readable proposal trace
+
+`METTLE_ML_TRACE=<path>` appends one record per disposition,
+`file<TAB>function<TAB>ir-index<TAB>kind<TAB>verdict`:
+
+```
+_mlopt.ir	mem_move	32	COPY	validated
+_mlopt.ir	mem_move	67	NOP	rejected
+```
+
+`--explain` is the human-readable report; this is for tooling that needs to pair each proposal with the validator's ruling on it. The summary line cannot serve that purpose reliably (it is prose, and it pluralizes). Off unless the variable is set, and it appends, so a whole-corpus build accumulates into one file.
+
+`METTLE_ML_ACTIONS=<path>` is the analogous dump for the model's raw per-instruction argmax, recorded *before* any transform decides whether it can realize it. The disposition file only records proposals a transform accepted, so it cannot tell you what the network actually predicted; this can, which is what makes it possible to check the C inference against the training-time implementation on the same graphs.
+
 ## When It Helps
 
 The transforms target different kinds of redundancy:
@@ -132,3 +159,5 @@ Two further toggles control optional behavior. `METTLE_ML_AFFINE=1` enables the 
 ## Internals and Retraining
 
 See [`tools/mlopt/README.md`](../tools/mlopt/README.md) for the model architecture, the offline training and export pipeline, and how to rebuild `gnn_genius.bin`, `bw_lib.txt`, and `gf2_lib1.txt`. The fuller design history is in [`ml-ir-optimization-design.md`](ml-ir-optimization-design.md).
+
+A successor architecture is in development and described in [`ml-opt-oracle.md`](ml-opt-oracle.md): semantic rather than syntactic node identity, a head that names the reuse target instead of only its class, adaptive depth, and training labels harvested from the validator's own verdicts on real IR. It is not wired into the compiler; `--ml-opt` loads `gnn_genius.bin` as described above.
