@@ -186,12 +186,16 @@ int ir_lower_call_expression(IRLoweringContext *context,
                               : NULL;
     }
     IRInstruction instruction = {0};
+    /* Stack block: ir_emit deep-copies it, and heap_owned == 0 means no destroy
+     * path can try to free stack memory. */
+    IRTensorAux tensor;
+    ir_instruction_tensor_attach(&instruction, &tensor);
+    tensor.transfer = call->tensor_transfer_desc;
     instruction.op = IR_OP_TENSOR_TRANSFER;
     instruction.location = expression->location;
     instruction.arguments = arguments;
     instruction.argument_types = argument_types;
     instruction.argument_count = count;
-    instruction.tensor_transfer = call->tensor_transfer_desc;
     instruction.tensor_transfer_has_prepared_view = has_view;
     if (!ir_emit(context, function, &instruction)) {
       for (size_t i = 0; i < count; i++) ir_operand_destroy(&arguments[i]);
@@ -261,12 +265,14 @@ int ir_lower_call_expression(IRLoweringContext *context,
                               : NULL;
     }
     IRInstruction instruction = {0};
+    IRTensorAux tensor;
+    ir_instruction_tensor_attach(&instruction, &tensor);
+    tensor.epilogue = call->tensor_epilogue_desc;
     instruction.op = IR_OP_TENSOR_EPILOGUE;
     instruction.location = expression->location;
     instruction.arguments = arguments;
     instruction.argument_types = argument_types;
     instruction.argument_count = count;
-    instruction.tensor_epilogue = call->tensor_epilogue_desc;
     if (!ir_emit(context, function, &instruction)) {
       for (size_t i = 0; i < count; i++) ir_operand_destroy(&arguments[i]);
       free(arguments);
@@ -338,13 +344,15 @@ int ir_lower_call_expression(IRLoweringContext *context,
                               : NULL;
     }
     IRInstruction instruction = {0};
+    IRTensorAux tensor;
+    ir_instruction_tensor_attach(&instruction, &tensor);
+    tensor.mma = call->tensor_mma_desc;
     instruction.op = call->is_tensor_matmul ? IR_OP_TENSOR_MATMUL
                                             : IR_OP_TENSOR_MMA;
     instruction.location = expression->location;
     instruction.arguments = arguments;
     instruction.argument_types = argument_types;
     instruction.argument_count = count;
-    instruction.tensor_mma = call->tensor_mma_desc;
     if (!ir_emit(context, function, &instruction)) {
       for (size_t i = 0; i < count; i++) ir_operand_destroy(&arguments[i]);
       free(arguments);

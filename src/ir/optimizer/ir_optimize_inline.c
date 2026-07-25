@@ -324,11 +324,11 @@ int ir_clone_instruction_plain(const IRInstruction *source,
   out->async_copy_pending_groups = source->async_copy_pending_groups;
   out->async_copy_cache = source->async_copy_cache;
   out->async_copy_generated = source->async_copy_generated;
-  out->tensor_transfer = source->tensor_transfer;
+  if (!ir_instruction_tensor_copy(out, source)) {
+    return 0;
+  }
   out->tensor_transfer_has_prepared_view =
       source->tensor_transfer_has_prepared_view;
-  out->tensor_mma = source->tensor_mma;
-  out->tensor_epilogue = source->tensor_epilogue;
   out->tensor_mma_count = source->tensor_mma_count;
   out->tensor_residency_id = source->tensor_residency_id;
   out->tensor_residency_role = source->tensor_residency_role;
@@ -412,11 +412,11 @@ static int ir_clone_instruction_for_inline(const IRInstruction *source,
   out->async_copy_pending_groups = source->async_copy_pending_groups;
   out->async_copy_cache = source->async_copy_cache;
   out->async_copy_generated = source->async_copy_generated;
-  out->tensor_transfer = source->tensor_transfer;
+  if (!ir_instruction_tensor_copy(out, source)) {
+    return 0;
+  }
   out->tensor_transfer_has_prepared_view =
       source->tensor_transfer_has_prepared_view;
-  out->tensor_mma = source->tensor_mma;
-  out->tensor_epilogue = source->tensor_epilogue;
   out->tensor_mma_count = source->tensor_mma_count;
   out->tensor_residency_id = source->tensor_residency_id;
   out->tensor_residency_role = source->tensor_residency_role;

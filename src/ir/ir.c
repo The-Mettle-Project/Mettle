@@ -733,6 +733,91 @@ static IROperand ir_operand_clone(const IROperand *operand) {
   return ir_operand_copy(operand);
 }
 
+/* ---- tensor descriptor block ---------------------------------------------- */
+
+/* Stand-in for an instruction with no block. Const and never written, so every
+ * caller reading a descriptor off a non-tensor instruction sees the zeroes the
+ * inline fields used to hold. */
+static const IRTensorAux g_ir_tensor_absent;
+
+#ifdef METTLE_IR_TENSOR_DEBUG
+/* "TNSR". Present on every live block; cleared before the block is freed, so a
+ * second free or a later read through a stale alias is caught rather than
+ * silently corrupting the free list. */
+#define IR_TENSOR_MAGIC 0x544E5352u
+
+static void ir_tensor_check(const IRTensorAux *block, const char *what) {
+  if (block->magic != IR_TENSOR_MAGIC) {
+    fprintf(stderr,
+            "mettle: IR tensor block %s at %p with magic %08x (expected %08x).\n"
+            "This means an IRInstruction was duplicated without going through\n"
+            "ir_instruction_tensor_copy, or a borrow outlived what it borrowed.\n",
+            what, (const void *)block, block->magic, IR_TENSOR_MAGIC);
+    abort();
+  }
+}
+#endif
+
+const IRTensorAux *ir_instruction_tensor_ro(const IRInstruction *instruction) {
+  if (instruction && instruction->tensor) {
+#ifdef METTLE_IR_TENSOR_DEBUG
+    ir_tensor_check(instruction->tensor, "read");
+#endif
+    return instruction->tensor;
+  }
+  return &g_ir_tensor_absent;
+}
+
+void ir_instruction_tensor_clear(IRInstruction *instruction) {
+  if (!instruction || !instruction->tensor) {
+    return;
+  }
+  if (instruction->tensor->heap_owned) {
+#ifdef METTLE_IR_TENSOR_DEBUG
+    ir_tensor_check(instruction->tensor, "freed");
+    instruction->tensor->magic = 0;
+#endif
+    free(instruction->tensor);
+  }
+  instruction->tensor = NULL;
+}
+
+int ir_instruction_tensor_copy(IRInstruction *dst, const IRInstruction *src) {
+  if (!dst) {
+    return 0;
+  }
+  ir_instruction_tensor_clear(dst);
+  if (!src || !src->tensor) {
+    return 1; /* nothing to carry: absent stays absent */
+  }
+  {
+    IRTensorAux *block = (IRTensorAux *)malloc(sizeof(IRTensorAux));
+    if (!block) {
+      return 0;
+    }
+    *block = *src->tensor;
+    block->heap_owned = 1;
+#ifdef METTLE_IR_TENSOR_DEBUG
+    block->magic = IR_TENSOR_MAGIC;
+#endif
+    dst->tensor = block;
+  }
+  return 1;
+}
+
+void ir_instruction_tensor_borrow(IRInstruction *dst, IRTensorAux *block,
+                                  const IRInstruction *src) {
+  if (!dst || !block) {
+    return;
+  }
+  *block = *ir_instruction_tensor_ro(src);
+  block->heap_owned = 0;
+#ifdef METTLE_IR_TENSOR_DEBUG
+  block->magic = IR_TENSOR_MAGIC;
+#endif
+  dst->tensor = block;
+}
+
 static void ir_instruction_destroy(IRInstruction *instruction) {
   if (!instruction) {
     return;
@@ -742,6 +827,7 @@ static void ir_instruction_destroy(IRInstruction *instruction) {
   ir_operand_destroy(&instruction->lhs);
   ir_operand_destroy(&instruction->rhs);
   mettle_free_string(instruction->text);
+  ir_instruction_tensor_clear(instruction);
 
   if (instruction->arguments) {
     for (size_t i = 0; i < instruction->argument_count; i++) {
@@ -930,6 +1016,12 @@ int ir_function_append_instruction(IRFunction *function,
   IRInstruction *slot = &function->instructions[function->instruction_count];
   *slot = *instruction;
 
+  /* The shallow copy above aliased the source's tensor block; take our own
+   * before anything can free either instruction. */
+  slot->tensor = NULL;
+  if (!ir_instruction_tensor_copy(slot, instruction)) {
+    return 0;
+  }
   slot->dest = ir_operand_clone(&instruction->dest);
   slot->lhs = ir_operand_clone(&instruction->lhs);
   slot->rhs = ir_operand_clone(&instruction->rhs);
@@ -1005,11 +1097,11 @@ int ir_function_insert_instruction(IRFunction *function, size_t index,
   slot->async_copy_pending_groups = instruction->async_copy_pending_groups;
   slot->async_copy_cache = instruction->async_copy_cache;
   slot->async_copy_generated = instruction->async_copy_generated;
-  slot->tensor_transfer = instruction->tensor_transfer;
+  if (!ir_instruction_tensor_copy(slot, instruction)) {
+    return 0;
+  }
   slot->tensor_transfer_has_prepared_view =
       instruction->tensor_transfer_has_prepared_view;
-  slot->tensor_mma = instruction->tensor_mma;
-  slot->tensor_epilogue = instruction->tensor_epilogue;
   slot->tensor_mma_count = instruction->tensor_mma_count;
   slot->tensor_residency_id = instruction->tensor_residency_id;
   slot->tensor_residency_role = instruction->tensor_residency_role;
@@ -1957,7 +2049,7 @@ static int ir_format_instruction_line(const IRInstruction *instruction,
                        instruction->async_copy_pending_groups);
     break;
   case IR_OP_TENSOR_TRANSFER: {
-    const MtlcTensorTransferDesc *desc = &instruction->tensor_transfer;
+    const MtlcTensorTransferDesc *desc = &IR_TENSOR_TRANSFER(instruction);
     written = snprintf(
         buffer, buffer_size,
         "tensor_transfer.workgroup %s rank=%u element=%d tile=(%u,%u,%u,%u,%u) view=%s",
@@ -1996,55 +2088,55 @@ static int ir_format_instruction_line(const IRInstruction *instruction,
         "tensor_mma x%llu%s m%un%uk%u fmt(%d,%d,%d,%d) layout(%d,%d,%d,%d) ld(%u,%u,%u,%u) packing(%d,%d) sparsity(%d) scale(%d:%d:%u,%d:%d:%u)",
         (unsigned long long)ir_tensor_mma_instruction_count(instruction),
         residency,
-        (unsigned)instruction->tensor_mma.m,
-        (unsigned)instruction->tensor_mma.n,
-        (unsigned)instruction->tensor_mma.k,
-        (int)instruction->tensor_mma.a_element,
-        (int)instruction->tensor_mma.b_element,
-        (int)instruction->tensor_mma.accumulator_element,
-        (int)instruction->tensor_mma.result_element,
-        (int)instruction->tensor_mma.a_layout,
-        (int)instruction->tensor_mma.b_layout,
-        (int)instruction->tensor_mma.c_layout,
-        (int)instruction->tensor_mma.d_layout,
-        (unsigned)instruction->tensor_mma.a_leading_dimension,
-        (unsigned)instruction->tensor_mma.b_leading_dimension,
-        (unsigned)instruction->tensor_mma.c_leading_dimension,
-        (unsigned)instruction->tensor_mma.d_leading_dimension,
-        (int)instruction->tensor_mma.a_packing,
-        (int)instruction->tensor_mma.b_packing,
-        (int)instruction->tensor_mma.sparsity,
-        (int)instruction->tensor_mma.a_scale_mode,
-        (int)instruction->tensor_mma.a_scale_element,
-        (unsigned)instruction->tensor_mma.a_scale_leading_dimension,
-        (int)instruction->tensor_mma.b_scale_mode,
-        (int)instruction->tensor_mma.b_scale_element,
-        (unsigned)instruction->tensor_mma.b_scale_leading_dimension);
+        (unsigned)IR_TENSOR_MMA(instruction).m,
+        (unsigned)IR_TENSOR_MMA(instruction).n,
+        (unsigned)IR_TENSOR_MMA(instruction).k,
+        (int)IR_TENSOR_MMA(instruction).a_element,
+        (int)IR_TENSOR_MMA(instruction).b_element,
+        (int)IR_TENSOR_MMA(instruction).accumulator_element,
+        (int)IR_TENSOR_MMA(instruction).result_element,
+        (int)IR_TENSOR_MMA(instruction).a_layout,
+        (int)IR_TENSOR_MMA(instruction).b_layout,
+        (int)IR_TENSOR_MMA(instruction).c_layout,
+        (int)IR_TENSOR_MMA(instruction).d_layout,
+        (unsigned)IR_TENSOR_MMA(instruction).a_leading_dimension,
+        (unsigned)IR_TENSOR_MMA(instruction).b_leading_dimension,
+        (unsigned)IR_TENSOR_MMA(instruction).c_leading_dimension,
+        (unsigned)IR_TENSOR_MMA(instruction).d_leading_dimension,
+        (int)IR_TENSOR_MMA(instruction).a_packing,
+        (int)IR_TENSOR_MMA(instruction).b_packing,
+        (int)IR_TENSOR_MMA(instruction).sparsity,
+        (int)IR_TENSOR_MMA(instruction).a_scale_mode,
+        (int)IR_TENSOR_MMA(instruction).a_scale_element,
+        (unsigned)IR_TENSOR_MMA(instruction).a_scale_leading_dimension,
+        (int)IR_TENSOR_MMA(instruction).b_scale_mode,
+        (int)IR_TENSOR_MMA(instruction).b_scale_element,
+        (unsigned)IR_TENSOR_MMA(instruction).b_scale_leading_dimension);
     break;
     }
   case IR_OP_TENSOR_MATMUL:
     written = snprintf(
         buffer, buffer_size,
         "tensor_matmul region=m%un%u k_chunk=%u fmt(%d,%d,%d,%d) layout(%d,%d,%d,%d) ld(%u,%u,%u,%u) packing(%d,%d) sparsity=%d scope=%s",
-        (unsigned)instruction->tensor_mma.m,
-        (unsigned)instruction->tensor_mma.n,
-        (unsigned)instruction->tensor_mma.k,
-        (int)instruction->tensor_mma.a_element,
-        (int)instruction->tensor_mma.b_element,
-        (int)instruction->tensor_mma.accumulator_element,
-        (int)instruction->tensor_mma.result_element,
-        (int)instruction->tensor_mma.a_layout,
-        (int)instruction->tensor_mma.b_layout,
-        (int)instruction->tensor_mma.c_layout,
-        (int)instruction->tensor_mma.d_layout,
-        (unsigned)instruction->tensor_mma.a_leading_dimension,
-        (unsigned)instruction->tensor_mma.b_leading_dimension,
-        (unsigned)instruction->tensor_mma.c_leading_dimension,
-        (unsigned)instruction->tensor_mma.d_leading_dimension,
-        (int)instruction->tensor_mma.a_packing,
-        (int)instruction->tensor_mma.b_packing,
-        (int)instruction->tensor_mma.sparsity,
-        instruction->tensor_mma.scope == MTLC_MEMORY_SCOPE_WORKGROUP
+        (unsigned)IR_TENSOR_MMA(instruction).m,
+        (unsigned)IR_TENSOR_MMA(instruction).n,
+        (unsigned)IR_TENSOR_MMA(instruction).k,
+        (int)IR_TENSOR_MMA(instruction).a_element,
+        (int)IR_TENSOR_MMA(instruction).b_element,
+        (int)IR_TENSOR_MMA(instruction).accumulator_element,
+        (int)IR_TENSOR_MMA(instruction).result_element,
+        (int)IR_TENSOR_MMA(instruction).a_layout,
+        (int)IR_TENSOR_MMA(instruction).b_layout,
+        (int)IR_TENSOR_MMA(instruction).c_layout,
+        (int)IR_TENSOR_MMA(instruction).d_layout,
+        (unsigned)IR_TENSOR_MMA(instruction).a_leading_dimension,
+        (unsigned)IR_TENSOR_MMA(instruction).b_leading_dimension,
+        (unsigned)IR_TENSOR_MMA(instruction).c_leading_dimension,
+        (unsigned)IR_TENSOR_MMA(instruction).d_leading_dimension,
+        (int)IR_TENSOR_MMA(instruction).a_packing,
+        (int)IR_TENSOR_MMA(instruction).b_packing,
+        (int)IR_TENSOR_MMA(instruction).sparsity,
+        IR_TENSOR_MMA(instruction).scope == MTLC_MEMORY_SCOPE_WORKGROUP
             ? "workgroup"
             : "subgroup");
     break;
@@ -2052,18 +2144,18 @@ static int ir_format_instruction_line(const IRInstruction *instruction,
     written = snprintf(
         buffer, buffer_size,
         "tensor_epilogue m%un%u element=%d layout=%d ld=%u bias=%d:%d:%u activation=%d scale=(%u,%u) scope=%s",
-        (unsigned)instruction->tensor_epilogue.m,
-        (unsigned)instruction->tensor_epilogue.n,
-        (int)instruction->tensor_epilogue.element,
-        (int)instruction->tensor_epilogue.layout,
-        (unsigned)instruction->tensor_epilogue.leading_dimension,
-        (int)instruction->tensor_epilogue.bias_mode,
-        (int)instruction->tensor_epilogue.bias_layout,
-        (unsigned)instruction->tensor_epilogue.bias_leading_dimension,
-        (int)instruction->tensor_epilogue.activation,
-        (unsigned)instruction->tensor_epilogue.scale_output,
-        (unsigned)instruction->tensor_epilogue.scale_bias,
-        instruction->tensor_epilogue.scope == MTLC_MEMORY_SCOPE_WORKGROUP
+        (unsigned)IR_TENSOR_EPILOGUE(instruction).m,
+        (unsigned)IR_TENSOR_EPILOGUE(instruction).n,
+        (int)IR_TENSOR_EPILOGUE(instruction).element,
+        (int)IR_TENSOR_EPILOGUE(instruction).layout,
+        (unsigned)IR_TENSOR_EPILOGUE(instruction).leading_dimension,
+        (int)IR_TENSOR_EPILOGUE(instruction).bias_mode,
+        (int)IR_TENSOR_EPILOGUE(instruction).bias_layout,
+        (unsigned)IR_TENSOR_EPILOGUE(instruction).bias_leading_dimension,
+        (int)IR_TENSOR_EPILOGUE(instruction).activation,
+        (unsigned)IR_TENSOR_EPILOGUE(instruction).scale_output,
+        (unsigned)IR_TENSOR_EPILOGUE(instruction).scale_bias,
+        IR_TENSOR_EPILOGUE(instruction).scope == MTLC_MEMORY_SCOPE_WORKGROUP
             ? "workgroup"
             : "subgroup");
     break;
@@ -2078,9 +2170,9 @@ static int ir_format_instruction_line(const IRInstruction *instruction,
                                  ? "loop."
                                  : "",
                        instruction->tensor_residency_id,
-                       (unsigned)instruction->tensor_mma.m,
-                       (unsigned)instruction->tensor_mma.n,
-                       (unsigned)instruction->tensor_mma.k);
+                       (unsigned)IR_TENSOR_MMA(instruction).m,
+                       (unsigned)IR_TENSOR_MMA(instruction).n,
+                       (unsigned)IR_TENSOR_MMA(instruction).k);
     break;
   case IR_OP_ASSIGN:
     written = snprintf(buffer, buffer_size, "%s <- %s", dest, lhs);
@@ -3209,7 +3301,7 @@ static int ir_gpu_tensor_transfer_signature_matches(
   if (!program || !function || !instruction ||
       instruction->op != IR_OP_TENSOR_TRANSFER)
     return 0;
-  const MtlcTensorTransferDesc *desc = &instruction->tensor_transfer;
+  const MtlcTensorTransferDesc *desc = &IR_TENSOR_TRANSFER(instruction);
   int has_view = instruction->tensor_transfer_has_prepared_view;
   size_t expected = ir_tensor_transfer_operand_count(desc, has_view);
   if (!expected || instruction->argument_count != expected ||
@@ -3397,7 +3489,7 @@ static size_t ir_tensor_runtime_stride_operand_index(
 static int ir_gpu_tensor_signature_matches(const IRProgram *program,
                                             const IRFunction *function,
                                             const IRInstruction *instruction) {
-  const MtlcTensorMmaDesc *desc = &instruction->tensor_mma;
+  const MtlcTensorMmaDesc *desc = &IR_TENSOR_MMA(instruction);
   size_t per_tile = ir_tensor_mma_operand_count(desc);
   size_t tile_count = ir_tensor_mma_instruction_count(instruction);
   if (!per_tile || tile_count > SIZE_MAX / per_tile ||
@@ -3487,8 +3579,8 @@ static int ir_gpu_tensor_signature_matches(const IRProgram *program,
 static int ir_gpu_tensor_matmul_signature_matches(
     const IRProgram *program, const IRFunction *function,
     const IRInstruction *instruction) {
-  size_t mma_operands = ir_tensor_mma_operand_count(&instruction->tensor_mma);
-  size_t expected = ir_tensor_matmul_operand_count(&instruction->tensor_mma);
+  size_t mma_operands = ir_tensor_mma_operand_count(&IR_TENSOR_MMA(instruction));
+  size_t expected = ir_tensor_matmul_operand_count(&IR_TENSOR_MMA(instruction));
   if (!mma_operands || expected != mma_operands + 5u ||
       instruction->argument_count != expected ||
       instruction->dest.kind != IR_OPERAND_NONE ||
@@ -3504,12 +3596,12 @@ static int ir_gpu_tensor_matmul_signature_matches(
   tile.tensor_mma_count = 1;
   if (!ir_gpu_tensor_signature_matches(program, function, &tile)) return 0;
   unsigned runtime_strides =
-      ir_tensor_mma_runtime_stride_mask(&instruction->tensor_mma);
+      ir_tensor_mma_runtime_stride_mask(&IR_TENSOR_MMA(instruction));
   for (unsigned bit = MTLC_TENSOR_RUNTIME_STRIDE_A;
        bit <= MTLC_TENSOR_RUNTIME_STRIDE_D; bit <<= 1) {
     if (!(runtime_strides & bit)) continue;
     size_t index = ir_tensor_runtime_stride_operand_index(
-        &instruction->tensor_mma, bit);
+        &IR_TENSOR_MMA(instruction), bit);
     const MtlcType *type = index == SIZE_MAX
                                ? NULL
                                : ir_gpu_operand_type(program, function,
@@ -3530,7 +3622,7 @@ static int ir_gpu_tensor_matmul_signature_matches(
 static int ir_gpu_tensor_epilogue_signature_matches(
     const IRProgram *program, const IRFunction *function,
     const IRInstruction *instruction) {
-  const MtlcTensorEpilogueDesc *desc = &instruction->tensor_epilogue;
+  const MtlcTensorEpilogueDesc *desc = &IR_TENSOR_EPILOGUE(instruction);
   size_t expected = ir_tensor_epilogue_operand_count(desc);
   size_t index = 0;
   MtlcTypeKind storage_kind = ir_tensor_element_storage_kind(desc->element);
@@ -3709,7 +3801,7 @@ static int ir_gpu_tensor_residency_groups_valid(IRFunction *function) {
         !commit || !(i < first_update_index &&
                      last_update_index < commit_index) ||
         commit->tensor_residency_scope != start->tensor_residency_scope ||
-        !ir_tensor_mma_desc_equal(&start->tensor_mma, &commit->tensor_mma) ||
+        !ir_tensor_mma_desc_equal(&IR_TENSOR_MMA(start), &IR_TENSOR_MMA(commit)) ||
         start->argument_count < 4 ||
         commit->argument_count != start->argument_count)
       return 0;
@@ -3718,17 +3810,17 @@ static int ir_gpu_tensor_residency_groups_valid(IRFunction *function) {
         return 0;
     }
     size_t c_stride = ir_tensor_runtime_stride_operand_index(
-        &start->tensor_mma, MTLC_TENSOR_RUNTIME_STRIDE_C);
+        &IR_TENSOR_MMA(start), MTLC_TENSOR_RUNTIME_STRIDE_C);
     size_t d_stride = ir_tensor_runtime_stride_operand_index(
-        &start->tensor_mma, MTLC_TENSOR_RUNTIME_STRIDE_D);
+        &IR_TENSOR_MMA(start), MTLC_TENSOR_RUNTIME_STRIDE_D);
     for (size_t j = first_update_index; j <= last_update_index; j++) {
       const IRInstruction *update = &function->instructions[j];
       if (update->tensor_residency_id != start->tensor_residency_id ||
           update->tensor_residency_role != IR_TENSOR_RESIDENCY_UPDATE)
         continue;
       if (update->tensor_residency_scope != start->tensor_residency_scope ||
-          !ir_tensor_mma_desc_equal(&start->tensor_mma,
-                                    &update->tensor_mma) ||
+          !ir_tensor_mma_desc_equal(&IR_TENSOR_MMA(start),
+                                    &IR_TENSOR_MMA(update)) ||
           update->argument_count != start->argument_count ||
           !ir_operand_same(&update->arguments[2], &start->arguments[3]) ||
           !ir_operand_same(&update->arguments[3], &start->arguments[3]) ||
@@ -4150,12 +4242,12 @@ static int ir_gpu_instruction_collective_requirement(
   if (instruction->op == IR_OP_TENSOR_MMA ||
       instruction->op == IR_OP_TENSOR_MATMUL ||
       instruction->op == IR_OP_TENSOR_COMMIT) {
-    return instruction->tensor_mma.scope == MTLC_MEMORY_SCOPE_WORKGROUP
+    return IR_TENSOR_MMA(instruction).scope == MTLC_MEMORY_SCOPE_WORKGROUP
                ? IR_GPU_COLLECTIVE_WORKGROUP
                : IR_GPU_COLLECTIVE_SUBGROUP;
   }
   if (instruction->op == IR_OP_TENSOR_EPILOGUE) {
-    return instruction->tensor_epilogue.scope == MTLC_MEMORY_SCOPE_WORKGROUP
+    return IR_TENSOR_EPILOGUE(instruction).scope == MTLC_MEMORY_SCOPE_WORKGROUP
                ? IR_GPU_COLLECTIVE_WORKGROUP
                : IR_GPU_COLLECTIVE_SUBGROUP;
   }
@@ -4330,18 +4422,18 @@ static int ir_gpu_validate_function_uniformity(
           instruction->op == IR_OP_TENSOR_COMMIT) {
         size_t pointer_operands =
             4u +
-            (instruction->tensor_mma.sparsity != MTLC_TENSOR_SPARSITY_DENSE
+            (IR_TENSOR_MMA(instruction).sparsity != MTLC_TENSOR_SPARSITY_DENSE
                  ? 1u
                  : 0u) +
-            (instruction->tensor_mma.a_scale_mode != MTLC_TENSOR_SCALE_NONE
+            (IR_TENSOR_MMA(instruction).a_scale_mode != MTLC_TENSOR_SCALE_NONE
                  ? 1u
                  : 0u) +
-            (instruction->tensor_mma.b_scale_mode != MTLC_TENSOR_SCALE_NONE
+            (IR_TENSOR_MMA(instruction).b_scale_mode != MTLC_TENSOR_SCALE_NONE
                  ? 1u
                  : 0u);
         size_t matmul_control_base =
             instruction->op == IR_OP_TENSOR_MATMUL
-                ? ir_tensor_mma_operand_count(&instruction->tensor_mma)
+                ? ir_tensor_mma_operand_count(&IR_TENSOR_MMA(instruction))
                 : SIZE_MAX;
         static const char *matmul_control_names[5] = {
             "row-origin control", "column-origin control",

@@ -428,6 +428,7 @@ void ir_instruction_make_nop(IRInstruction *instruction) {
   instruction->tensor_residency_id = 0;
   instruction->tensor_residency_role = IR_TENSOR_RESIDENCY_NONE;
   instruction->tensor_residency_scope = IR_TENSOR_RESIDENCY_SCOPE_NONE;
+  ir_instruction_tensor_clear(instruction);
   instruction->ast_ref = NULL;
   instruction->op = IR_OP_NOP;
 }
@@ -441,6 +442,7 @@ void ir_instruction_make_jump(IRInstruction *instruction) {
   ir_operand_destroy(&instruction->lhs);
   ir_operand_destroy(&instruction->rhs);
   ir_instruction_clear_arguments(instruction);
+  ir_instruction_tensor_clear(instruction);
   instruction->is_float = 0;
   instruction->ast_ref = NULL;
   instruction->op = IR_OP_JUMP;
@@ -455,6 +457,7 @@ void ir_instruction_destroy_storage(IRInstruction *instruction) {
   ir_operand_destroy(&instruction->lhs);
   ir_operand_destroy(&instruction->rhs);
   ir_instruction_clear_arguments(instruction);
+  ir_instruction_tensor_clear(instruction);
   if (instruction->text) {
     mettle_free_string(instruction->text);
     instruction->text = NULL;
@@ -504,6 +507,8 @@ int ir_instruction_vector_append_move(IRInstructionVector *vector,
   }
 
   vector->items[vector->count++] = *instruction;
+  /* A move: the vector now owns the tensor block, so the source must not. */
+  instruction->tensor = NULL;
   instruction->op = IR_OP_NOP;
   instruction->dest = ir_operand_none();
   instruction->lhs = ir_operand_none();
