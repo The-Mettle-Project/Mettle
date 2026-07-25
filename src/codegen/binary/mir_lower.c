@@ -4669,6 +4669,162 @@ static void mir_narrow_zero_extended_ops(MirFunction *fn) {
   }
 }
 
+/* ---- demanded bits: drop extensions nothing looks at ---------------------
+ *
+ * int32 values live in 64-bit registers, so the frontend re-extends after every
+ * step to keep the register agreeing with the declared type. Most of those
+ * extensions are dead: an `i` that is only ever compared as int32 and fed to
+ * more int32 arithmetic never has its upper half read, and the sign extension
+ * that guards it is pure cost -- an instruction, and in a recurrence a cycle,
+ * per step.
+ *
+ * The analysis asks one question per value: does EVERY reader of it look only
+ * at its low 32 bits? Start by assuming yes for all, then let each instruction
+ * veto the values it reads in full. A 32-bit ALU result depends only on the low
+ * halves of its inputs, so those readers pass the question down to their own
+ * destination -- which is why this iterates to a fixpoint. The answer only ever
+ * moves from yes to no, so it converges, and anything not explicitly understood
+ * vetoes, so an unmodelled opcode is safe by construction.
+ *
+ * Where the answer is yes, a MOVSX/MOVZX of that value becomes a plain copy,
+ * which the register allocator's coalescer then usually removes outright. */
+
+/* Reads of these ops' operands only need the low 32 bits when the op's own
+ * result does. Right shifts, divides and MULHI are excluded: they read the
+ * bits above 32 even when their result does not. */
+static int mir_op_demand_passes_through(MirOpcode op) {
+  switch (op) {
+  case MIR_ADD:
+  case MIR_SUB:
+  case MIR_AND:
+  case MIR_OR:
+  case MIR_XOR:
+  case MIR_NEG:
+  case MIR_NOT:
+  case MIR_IMUL:
+  case MIR_SHL:
+  case MIR_MOV:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+static void mir_demand_veto_operand(const MirOperand *op, char *low32,
+                                    size_t n) {
+  if (!op) {
+    return;
+  }
+  if (op->kind == MIR_OPK_VREG && op->vreg != MIR_VREG_NONE &&
+      (size_t)op->vreg < n) {
+    low32[op->vreg] = 0;
+  }
+  if (op->kind == MIR_OPK_MEM) {
+    /* An address is always used in full. */
+    if (op->mem.base != MIR_VREG_NONE && (size_t)op->mem.base < n) {
+      low32[op->mem.base] = 0;
+    }
+    if (op->mem.index != MIR_VREG_NONE && (size_t)op->mem.index < n) {
+      low32[op->mem.index] = 0;
+    }
+  }
+}
+
+/* True when `in` writes a GP vreg whose own readers all want just 32 bits. */
+static int mir_demand_dst_is_low32(const MirInst *in, const char *low32,
+                                   size_t n) {
+  return in->dst.kind == MIR_OPK_VREG && in->dst.vreg != MIR_VREG_NONE &&
+         (size_t)in->dst.vreg < n && low32[in->dst.vreg];
+}
+
+static void mir_drop_dead_extensions(MirFunction *fn) {
+  if (!fn || fn->vreg_count == 0) {
+    return;
+  }
+  size_t n = fn->vreg_count;
+  char *low32 = (char *)malloc(n);
+  if (!low32) {
+    return;
+  }
+  for (size_t v = 0; v < n; v++) {
+    /* An address-taken value lives in memory, where a full-width load elsewhere
+     * can see the bits this analysis would let go undefined. Float and vector
+     * values are not in scope at all. */
+    low32[v] = (fn->vregs[v].rclass == MIR_RC_GP && !fn->vregs[v].address_taken)
+                   ? 1
+                   : 0;
+  }
+
+  size_t last_low32_count = (size_t)-1;
+  for (int changed = 1; changed;) {
+    changed = 0;
+    for (size_t i = 0; i < fn->insn_count; i++) {
+      const MirInst *in = &fn->insns[i];
+      if (in->op == MIR_NOP || in->op == MIR_LABEL) {
+        continue;
+      }
+      int reads_low32_only = 0;
+      if ((in->op == MIR_MOVZX || in->op == MIR_MOVSX) && in->width <= 4) {
+        reads_low32_only = 1; /* only the low `width` bytes are extended */
+      } else if ((in->op == MIR_CMP || in->op == MIR_CMPBR ||
+                  in->op == MIR_TEST) &&
+                 in->width == 4) {
+        reads_low32_only = 1;
+      } else if (mir_op_demand_passes_through(in->op)) {
+        /* A store (`mov [mem], a`) has no vreg destination to pass the question
+         * to, and writes `width` bytes; treat only the narrow store as narrow. */
+        reads_low32_only = mir_demand_dst_is_low32(in, low32, n) ||
+                           (in->op == MIR_MOV && in->dst.kind == MIR_OPK_MEM &&
+                            in->width <= 4);
+      }
+      if (reads_low32_only) {
+        /* The value operands are read narrowly, but an address inside them is
+         * still an address. */
+        if (in->a.kind == MIR_OPK_MEM) {
+          mir_demand_veto_operand(&in->a, low32, n);
+        }
+        if (in->b.kind == MIR_OPK_MEM) {
+          mir_demand_veto_operand(&in->b, low32, n);
+        }
+        if (in->dst.kind == MIR_OPK_MEM) {
+          mir_demand_veto_operand(&in->dst, low32, n);
+        }
+        continue;
+      }
+      mir_demand_veto_operand(&in->a, low32, n);
+      mir_demand_veto_operand(&in->b, low32, n);
+      if (in->dst.kind == MIR_OPK_MEM) {
+        mir_demand_veto_operand(&in->dst, low32, n);
+      }
+    }
+    /* A veto can turn a pass-through op into a full reader of its own inputs,
+     * so re-run until the flags stop moving. They only ever move one way. */
+    size_t still_low32 = 0;
+    for (size_t v = 0; v < n; v++) {
+      still_low32 += (size_t)low32[v];
+    }
+    if (still_low32 != last_low32_count) {
+      last_low32_count = still_low32;
+      changed = 1;
+    }
+  }
+
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    MirInst *in = &fn->insns[i];
+    if ((in->op != MIR_MOVSX && in->op != MIR_MOVZX) || in->is_float ||
+        in->width != 4 || in->a.kind != MIR_OPK_VREG ||
+        in->dst.kind != MIR_OPK_VREG || !low32[in->dst.vreg]) {
+      continue;
+    }
+    /* Nothing reads above bit 31, so the extension is just a copy. */
+    in->op = MIR_MOV;
+    in->width = 8;
+    in->is_unsigned = 0;
+  }
+
+  free(low32);
+}
+
 static void mir_fuse_mov_then_extend(MirFunction *fn) {
   if (!fn) {
     return;
@@ -5563,6 +5719,7 @@ int code_generator_binary_emit_function_via_mir(
   free(folds);
 
   mir_fuse_mov_then_extend(&fn);
+  mir_drop_dead_extensions(&fn);
   mir_narrow_zero_extended_ops(&fn);
   mir_rotate_loops(&fn);
   mir_sink_cold_exits(&fn);
