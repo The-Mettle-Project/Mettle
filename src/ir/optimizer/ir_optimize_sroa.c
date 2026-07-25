@@ -83,6 +83,25 @@ static int ir_sroa_note_slot(IRSroaSlot *slots, size_t *slot_count,
          slot->float_bits == float_bits;
 }
 
+/* Slots are appended as they are first encountered, so two aggregates with the
+ * same fields can still record them in different orders -- the struct being
+ * WRITTEN is usually touched in declaration order, while the struct being READ
+ * is touched in whatever order the expressions need it. Sorting by offset makes
+ * the layout canonical, which is what lets ir_sroa_slots_match below compare
+ * two members position by position. Slot counts are bounded by
+ * IR_SROA_MAX_SLOTS, so an insertion sort is the right shape. */
+static void ir_sroa_sort_slots(IRSroaSlot *slots, size_t count) {
+  for (size_t i = 1; i < count; i++) {
+    IRSroaSlot key = slots[i];
+    size_t j = i;
+    while (j > 0 && slots[j - 1].offset > key.offset) {
+      slots[j] = slots[j - 1];
+      j--;
+    }
+    slots[j] = key;
+  }
+}
+
 /* True when two slot layouts are identical (same offsets/sizes/float class in
  * the same order). Group members must match exactly so a whole-aggregate copy
  * can be rewritten field-for-field. */
@@ -778,6 +797,7 @@ int ir_sroa_pass(IRFunction *function, int *changed) {
       if (recs[r].addr_count == 0 || recs[r].slot_count == 0) {
         recs[r].eligible = 0;
       }
+      ir_sroa_sort_slots(recs[r].slots, recs[r].slot_count);
     }
     static int sroa_debug = -1;
     if (sroa_debug < 0) {
@@ -899,6 +919,11 @@ int ir_sroa_pass(IRFunction *function, int *changed) {
       free(members);
       free(layouts);
       return 0;
+    }
+    if (sroa_debug) {
+      fprintf(stderr, "SROA fn=%s iter=%d members=%zu layouts=%zu\n",
+              function->name ? function->name : "?", iter, member_count,
+              layout_count);
     }
     if (member_count == 0) {
       free(members);
