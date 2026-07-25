@@ -4,21 +4,32 @@ Expressions produce values. They appear in initializers, assignments, function a
 
 **Operator precedence** (highest first):
 
+Three tiers bind tighter than every binary operator. From tightest:
+
+| Tier | Forms | Example |
+|------|-------|---------|
+| Postfix | call, generic call, member access `.` and `->`, indexing `[]` | `a.b[i].c(x)` |
+| Unary | `-`, `+`, `*`, `&`, `~`, `!` | `-x`, `!y`, `*p`, `&v`, `~mask` |
+| Cast | `(Type)expr` | `(int64)x` |
+
+Postfix forms chain left to right; unary operators are right-associative. A cast binds tighter than any binary operator but looser than postfix, so `(int64)p->len` casts the field, not the pointer.
+
+Binary operators, all **left-associative**, from tightest to loosest:
+
 | Precedence | Operators | Example |
 |------------|-----------|---------|
-| 1 | Member access `.`, `->` | `obj.field`, `ptr->x` |
-| 2 | Unary `-`, `!`, `*`, `&` | `-x`, `!y`, `*p`, `&v` |
-| 3 | Multiplicative `*`, `/` | `a * b`, `a / b` |
-| 4 | Additive `+`, `-` | `a + b`, `a - b` |
-| 5 | Relational `<`, `<=`, `>`, `>=` | `a < b` |
-| 6 | Equality `==`, `!=` | `a == b` |
-| 7 | Bitwise AND `&` | `a & b` |
-| 8 | Bitwise XOR `^` | `a ^ b` |
-| 9 | Bitwise OR `\|` | `a \| b` |
-| 10 | Logical AND `&&` | `a && b` |
-| 11 | Logical OR `\|\|` | `a \|\| b` |
+| 1 | Multiplicative `*`, `/`, `%` | `a * b`, `a % b` |
+| 2 | Additive `+`, `-` | `a + b` |
+| 3 | Shifts `<<`, `>>` | `a << 1` |
+| 4 | Relational `<`, `<=`, `>`, `>=` | `a < b` |
+| 5 | Equality `==`, `!=` | `a == b` |
+| 6 | Bitwise AND `&` | `a & b` |
+| 7 | Bitwise XOR `^` | `a ^ b` |
+| 8 | Bitwise OR `\|` | `a \| b` |
+| 9 | Logical AND `&&` | `a && b` |
+| 10 | Logical OR `\|\|` | `a \|\| b` |
 
-Bitwise shifts (`<<`, `>>`) and complement (`~`) follow multiplicative/additive precedence. Use parentheses to clarify or override.
+The shift level sits between additive and relational, as in C: `a << 1 < b` parses as `(a << 1) < b`, and `a + b << c` parses as `(a + b) << c`. Comparisons do not chain specially, so `a < b == c` parses as `(a < b) == c`, comparing a 0/1 result against `c`. Use parentheses to clarify or override.
 
 ## Literals
 

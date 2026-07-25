@@ -1,4 +1,4 @@
-// Use-after-move through pointer aliases (M0113): `q = p` makes two names for
+// Use-after-move through pointer aliases: `q = p` makes two names for
 // one allocation, so freeing or reallocating either invalidates the other.
 // This is the single-owner / move discipline Rust enforces in its type system,
 // applied to raw pointers where Rust performs no checking at all. The buggy

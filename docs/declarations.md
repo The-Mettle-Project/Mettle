@@ -71,12 +71,17 @@ to the `fn` (or `export fn`) that follows.
 | `@pure` | Assert the function is free of side effects **and** safe to evaluate speculatively (it neither writes observable state nor traps in a way that depends on being reached). The optimizer may then evaluate a call once before a loop and reuse the result — see below. |
 | `@noalloc` | **Contract**: the function — and everything it can reach through direct calls — performs zero heap allocations, or compilation fails pointing at the allocation. This is a proof, not a lint: `new`, string `+` concatenation, allocator calls (`malloc`/`calloc`/...), calls to externs not known to be allocation-free, and calls through function pointers anywhere in the reachable graph all violate it. Known-clean libm/memory externs (`sqrtf`, `memcpy`, ...) are allowed. |
 | `@simd` / `@simd!` | Apply a vectorization contract to every counted loop in the body — see [Vectorization contracts](control-flow.md#vectorization-contracts). |
+| `@test` | Mark a compile-time unit test. The function takes no parameters, returns `int64`, and treats `0` as pass. It is type-checked in every build but compiled out of normal binaries, and `mettle test` runs it in the compiler's IR interpreter. See [Testing](testing.md). |
 
 `@inline` and `@noinline` are mutually exclusive. Applying `@inline`,
 `@noinline`, `@pure`, or `@noalloc` to anything other than a function — a loop,
-a struct, an `extern` function — is a compile error. Decorators have effect
-only under `-O` / `--release` (a note reminds you when contracts go
-unverified in a debug build).
+a struct, an `extern` function — is a compile error. Only `@simd` and `@simd!`
+may be attached to a statement, and only to a `for` or `while` loop. When a
+declaration is both decorated and exported, the decorators come first
+(`@inline export fn f()`, never `export @inline fn f()`). Decorators have
+effect only under `-O` / `--release` (a note reminds you when contracts go
+unverified in a debug build); `@test` is the exception, since it changes what
+is compiled in every build.
 
 ### `@pure` and loop-invariant call hoisting
 

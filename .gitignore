@@ -1,4 +1,4 @@
-bin/
+﻿bin/
 obj/
 dist/
 .claude/
@@ -51,3 +51,8 @@ tools/mlopt/oracle_*.bin
 tools/mlopt/_auto_dagger.sh
 tools/mlopt/_auto_summary.sh
 tools/mlopt/_dagger.log
+
+promotion/
+.vs/
+tests/profiler_test.mettle
+tests/parse_stress_test.mettle

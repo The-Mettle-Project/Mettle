@@ -47,19 +47,40 @@ Vector3
 
 The following words are reserved and cannot be used as identifiers.
 
-Declarations: `import`, `extern`, `export`, `var`, `fn`, `kernel`, `struct`, `enum`, `method`; GPU storage qualifiers: `workgroup`, `private`. Control flow: `if`, `else`, `while`, `for`, `switch`, `case`, `default`, `break`, `continue`, `return`, `dispatch`, `barrier`. Other: `asm`, `this`, `new`. Types: `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float32`, `float64`, `string`.
+Declarations: `import`, `import_str`, `extern`, `export`, `var`, `const`, `fn`, `kernel`, `struct`, `enum`, `trait`, `impl`, `where`, `method`; GPU storage qualifiers: `workgroup`, `private`. Control flow: `if`, `else`, `while`, `for`, `switch`, `case`, `default`, `match`, `break`, `continue`, `return`, `defer`, `errdefer`, `dispatch`, `barrier`. Other: `asm`, `this`, `new`. Types: `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float32`, `float64`, `string`.
 
 `kernel` declares a GPU entry point, `workgroup var` / `private var` declare static device storage, `barrier(...)` synchronizes a workgroup, and `dispatch` launches a kernel; see [GPU Offload](gpu.md). `in` (used in range-based `for i in lo..hi`) is a *contextual* keyword: it is only special in that position and remains usable as an ordinary identifier elsewhere.
 
-`this` is only valid inside method bodies; it refers to the receiver. Using `this` as a variable name outside a method produces an error. `new` is an expression keyword, not a statement keyword; it appears in expressions like `var p: T* = new T` and cannot start a statement by itself. `cstring` is a type alias, not a keyword; it is available as a built-in name.
+`this` is only valid inside method bodies; it refers to the receiver. Using `this` as a variable name outside a method produces an error. `new` is an expression keyword, not a statement keyword; it appears in expressions like `var p: T* = new T` and cannot start a statement by itself.
+
+Several built-in names are **not** reserved words, so they are ordinary identifiers that happen to have built-in meaning: the type names `bool`, `cstring`, and `void`; the `bool` constants `true` and `false`; the compile-time forms `sizeof`, `assert`, and `assert_eq`; the closure type constructor `Fn`; and the GPU built-ins (`thread`, `block`, `block_dim`, `grid_dim`, and the `subgroup_*`, `atomic_*`, and `tensor_*` families).
+
+x86 mnemonics and register names (`add`, `mov`, `cmp`, `call`, `ret`, `push`, `pop`, `lea`, `jmp`, `eax` through `r15`, and similar) are recognized as distinct tokens for the reserved inline-assembly syntax, matched case-insensitively. They are still accepted wherever an identifier is expected, so a variable named `add` or `cmp` compiles normally.
 
 ## Numeric Literals
 
-Decimal literals use digits: `42`, `0`. Hexadecimal: `0x1A`, `0xFF`, `0Xdead`. Binary: `0b1010`, `0B1111`. Floating-point: `3.14`, `0.5`, `1e-3`. Invalid literals (e.g. empty hex after `0x`) produce lexical errors.
+Decimal literals use digits: `42`, `0`. A leading zero does not select octal: `007` is decimal 7. Hexadecimal: `0x1A`, `0xFF`, `0Xdead`. Binary: `0b1010`, `0B1111`. Floating-point: `3.14`, `0.5`. Invalid literals (e.g. empty hex after `0x`) produce lexical errors.
+
+**Exponent notation is not supported.** A float literal is recognized by the presence of a `.` in the digits, so `1e-3` does not lex as one number; it becomes the literal `1`, the identifier `e`, the operator `-`, and the literal `3`. Write `0.001` instead.
+
+The lexer will not consume a `.` that begins a `..` range, so `1..5` lexes as three tokens rather than as the float `1.` followed by `.5`.
 
 A leading minus is not part of the literal. The expression `-17` is parsed as the unary minus operator applied to the literal `17`. So `var x: int8 = -128` is valid: the literal `128` is negated to `-128`, which fits in `int8`. Integer literals are parsed as decimal strings and must fit within the target type when used; the implementation uses `strtol`/`strtoull` internally. There is no formal maximum; values that overflow the target type may produce implementation-defined behavior.
 
 Underscores in numeric literals (e.g. `1_000_000`) are not supported. The underscore would terminate the number and start an identifier. Use `1000000` instead.
+
+## Character Literals
+
+A character literal is a single character in single quotes, or one escape sequence. The supported escapes are `\n`, `\t`, `\r`, `\\`, `\'`, and `\0`; any other escape is a lexical error.
+
+```mettle
+var newline: int32 = '\n';   // 10
+var letter:  int32 = 'A';    // 65
+```
+
+**A character literal is an integer literal.** The lexer converts it to the numeric value of the byte, so `'A'` and `65` are indistinguishable after lexing, and a character literal is usable anywhere an integer literal is, including in `const` initializers and `switch` case values. There is no distinct character type.
+
+A literal containing more than one character, or a raw newline, is a lexical error. Note that `\"` is not among the character escapes; a double quote inside single quotes is just an ordinary character.
 
 ## String Literals
 
@@ -77,7 +98,7 @@ Assignment `=`. Compound assignment `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^
 
 **Compound assignment:** `target OP= value` is exact syntactic sugar for `target = target OP value`, where `OP` is one of `+ - * / % & | ^ << >>`. The target is evaluated as an ordinary assignment target (identifier, struct field, array element, or pointer dereference) and must be a valid lvalue. For example, `count += 1` is identical to `count = count + 1`, and `mask &= 0xFF` is identical to `mask = mask & 0xFF`. Compound assignment is a statement (also valid as a `for`-loop initializer or increment), not an expression, so it does not produce a value. See [Expressions](expressions.md).
 
-**Operator precedence:** Multiplication, division, and modulo bind tighter than addition and subtraction. Relational operators bind tighter than equality. Logical AND (`&&`) binds tighter than logical OR (`||`). So `a + b * c` parses as `a + (b * c)`, and `a < b == c` parses as `(a < b) == c`. Precedence levels (highest first): member access (`.`), multiplicative (`*`, `/`, `%`), additive (`+`, `-`), relational (`<`, `<=`, `>`, `>=`), equality (`==`, `!=`), logical AND (`&&`), logical OR (`||`). Use parentheses to override.
+**Operator precedence:** every binary operator is left-associative. From tightest to loosest: multiplicative (`*`, `/`, `%`), additive (`+`, `-`), shifts (`<<`, `>>`), relational (`<`, `<=`, `>`, `>=`), equality (`==`, `!=`), bitwise AND (`&`), bitwise XOR (`^`), bitwise OR (`|`), logical AND (`&&`), logical OR (`||`). Postfix forms (call, member access, indexing), then unary operators, then casts all bind tighter than any binary operator. So `a + b * c` parses as `a + (b * c)`, `a << 1 < b` parses as `(a << 1) < b`, and `a < b == c` parses as `(a < b) == c`. See [Expressions](expressions.md) for the full table. Use parentheses to override.
 
 **Modulo:** The modulo operator `%` returns the remainder of integer division. It requires integer operands. See [Expressions](expressions.md).
 

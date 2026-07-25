@@ -467,7 +467,7 @@ $cases = @(
     )
   },
   @{
-    # Use-after-move (M0113): `q = p` aliases one allocation under two names, so
+    # Use-after-move: `q = p` aliases one allocation under two names, so
     # freeing or reallocating either invalidates the other -- ownership tracked
     # through pointer copies the way Rust tracks moves, but on raw pointers. The
     # clean controls re-point the alias or read it before the free, and stay

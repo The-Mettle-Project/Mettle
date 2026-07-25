@@ -52,7 +52,10 @@ help: for more about this error, run `mettle explain E0003`
 - Memory-safety warnings and errors (`M0101`..`M0112`): use-after-free,
   double free, leaks, out-of-bounds constant indexing, escaping stack
   addresses, and borrow-checker lifetime findings. See
-  [borrow-checker.md](borrow-checker.md).
+  [borrow-checker.md](borrow-checker.md). `M0101` and `M0102` also cover the
+  aliased forms, where one allocation is reachable under two names and freeing
+  through either invalidates both; the message names the alias rather than
+  using a separate code.
 
 ## `mettle explain <CODE>`
 

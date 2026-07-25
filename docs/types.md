@@ -8,7 +8,7 @@ The following sizes and alignments apply on x86-64. Use these when laying out st
 
 | Type | Size | Alignment |
 |------|------|-----------|
-| `int8`, `uint8` | 1 | 1 |
+| `int8`, `uint8`, `bool` | 1 | 1 |
 | `int16`, `uint16` | 2 | 2 |
 | `int32`, `uint32`, `float32` | 4 | 4 |
 | `int64`, `uint64`, `float64`, pointers, plain enums | 8 | 8 |
@@ -23,6 +23,16 @@ Signed integers: `int8`, `int16`, `int32`, `int64` (1, 2, 4, 8 bytes). Unsigned 
 **Integer overflow:** The compiler emits native x86-64 arithmetic instructions. Signed integer overflow wraps (two's complement); there is no trap or runtime check. Unsigned overflow wraps modulo 2^n. Assembly programmers can rely on wrap-around behavior.
 
 **Integer literal default type:** When the context does not disambiguate, integer literals default to `int32`. Floating-point literals default to `float64`. Examples: `42` has type `int32`; `3.14` has type `float64`. In expressions like `var x: int64 = 42`, the literal is implicitly converted to the expected type.
+
+**Boolean:** `bool` is a built-in 1-byte type with the two built-in constants `true` and `false`. It is distinct from `uint8`: a `switch` over a `bool` must cover both `true` and `false` unless it has a `default`. Note that comparison operators do not produce `bool`; they produce an `int32` that is 0 or 1, and conditions in `if`, `while`, and `for` accept any numeric type rather than requiring `bool`.
+
+```mettle
+var ready: bool = true;
+switch (ready) {
+  case true:  return 1;
+  case false: return 0;
+}
+```
 
 ## Pointer Types
 
@@ -105,7 +115,7 @@ var seven: int32 = add(3, 4);
 var product: int32 = apply(fn(x: int32, y: int32) -> int32 { return x * y; }, 6, 7);
 ```
 
-A non-capturing lambda has the same `fn(params) -> ret` type as a named function and is a plain function pointer, so it is usable anywhere a function pointer is (including C callbacks). A return type is required; the body is a normal block.
+A non-capturing lambda has the same `fn(params) -> ret` type as a named function and is a plain function pointer, so it is usable anywhere a function pointer is (including C callbacks). The body is a normal block. The return type may be omitted, in which case it defaults to `void`; write it explicitly whenever the lambda returns a value, since an omitted type silently makes the lambda `void` rather than inferring from the `return` statement.
 
 ### Closures
 
