@@ -53,11 +53,11 @@
 
 #include "mettle_alloc.h"
 
-/* The allocator interposes on the CRT and needs the compiler's atomic builtins
- * for its cross-thread free lists, so it is active only for GCC/Clang builds
- * that opt in. Anything else compiles this file to nothing and gets the
- * platform heap. */
-#if defined(METTLE_INTERNAL_ALLOC) && (defined(__GNUC__) || defined(__clang__))
+/* The allocator interposes on the CRT, so it is active only where owning those
+ * symbols is both possible and ours to do. METTLE_ALLOC_ACTIVE in the header
+ * spells out the conditions; anything else compiles this file to nothing and
+ * gets the platform heap. */
+#if METTLE_ALLOC_ACTIVE
 
 #include <stdint.h>
 #include <stdio.h>
@@ -1032,11 +1032,24 @@ char *strdup(const char *s) {
 #if defined(_WIN32)
 char *_strdup(const char *s) { return strdup(s); }
 
+/* Answering _msize for our own blocks is possible only where the CRT reaches
+ * the program as a DLL import, which a strong definition here outranks -- the
+ * msvcrt-based toolchains, gcc's default on Windows among them. A UCRT-based
+ * one (MSYS2 CLANG64, or anything targeting the MSVC CRT) links a real
+ * msize.obj out of libucrt instead, and a second definition of that symbol is a
+ * link error rather than an override. So there the query stays the CRT's and
+ * this joins the deliberately-not-overridden list below.
+ *
+ * Nothing in the toolchain asks: the allocator's own foreign-pointer path goes
+ * through the g_sys_usable pointer resolved out of the CRT DLL, never through
+ * this definition. */
+#if !defined(_UCRT)
 size_t _msize(void *ptr) {
   if (!ptr) return 0;
   if (!mtlc_owned(ptr)) return g_sys_usable ? g_sys_usable(ptr) : 0;
   return page_of(ptr)->bsize;
 }
+#endif
 #else
 char *strndup(const char *s, size_t cap) {
   size_t n = 0;
@@ -1062,7 +1075,8 @@ size_t malloc_usable_size(void *ptr) {
  * over-allocate-and-offset trick would hand out interior pointers that free()
  * could not map back to a page. Letting them fall through to the platform heap
  * is correct: free() and _aligned_free() both recognise the result as foreign
- * and forward it. */
+ * and forward it. _msize joins them on a UCRT target, for the linkage reason
+ * given above. */
 
 /* ---------------------------------------------------------------- reporting */
 
@@ -1107,4 +1121,4 @@ void mettle_alloc_report(void) {
 #endif
 }
 
-#endif /* METTLE_INTERNAL_ALLOC && GCC/Clang */
+#endif /* METTLE_ALLOC_ACTIVE */

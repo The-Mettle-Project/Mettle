@@ -23,9 +23,45 @@
 #include <stddef.h>
 
 /* Compiled out entirely unless the build opts in, so a consumer that wants the
- * platform heap (a sanitizer build, a frontend embedding libmtlc alongside
- * another allocator) just drops -DMETTLE_INTERNAL_ALLOC. */
-#ifdef METTLE_INTERNAL_ALLOC
+ * platform heap (a frontend embedding libmtlc alongside another allocator) just
+ * drops -DMETTLE_INTERNAL_ALLOC.
+ *
+ * It also stands down on its own under a sanitizer. ASan, TSan, MSan and LSan
+ * each intercept malloc/calloc/realloc/free to attach their own metadata, and
+ * two interposers on one heap is not a slow build, it is a crash before main:
+ * blocks handed out by one and released by the other, and a bootstrap dlsym
+ * that allocates while the allocator it is being asked to find does not exist
+ * yet. Detecting it here rather than relying on the build to pass
+ * INTERNAL_ALLOC=0 means an ad-hoc `-fsanitize=address` gets the platform heap
+ * too, and gets it whether or not whoever typed it knew to.
+ *
+ * The predicate lives in the header so that the implementation, this header's
+ * declarations and the driver's call site cannot disagree about it -- gating
+ * them on different conditions is a link error, not a diagnostic. */
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) ||     \
+    __has_feature(memory_sanitizer) || __has_feature(leak_sanitizer)
+#define METTLE_ALLOC_SANITIZED 1
+#endif
+#endif
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__) ||           \
+    defined(__SANITIZE_LEAK__)
+#define METTLE_ALLOC_SANITIZED 1
+#endif
+#ifndef METTLE_ALLOC_SANITIZED
+#define METTLE_ALLOC_SANITIZED 0
+#endif
+
+/* The cross-thread free lists need the compiler's atomic builtins, so the
+ * allocator is GCC/Clang only; anything else gets the platform heap. */
+#if defined(METTLE_INTERNAL_ALLOC) && !METTLE_ALLOC_SANITIZED &&               \
+    (defined(__GNUC__) || defined(__clang__))
+#define METTLE_ALLOC_ACTIVE 1
+#else
+#define METTLE_ALLOC_ACTIVE 0
+#endif
+
+#if METTLE_ALLOC_ACTIVE
 
 typedef struct MettleAllocStats {
   size_t bytes_reserved;  /* address space reserved from the OS */
@@ -44,6 +80,6 @@ void mettle_alloc_stats(MettleAllocStats *out);
 /* Human-readable one-line summary, written to stderr. */
 void mettle_alloc_report(void);
 
-#endif /* METTLE_INTERNAL_ALLOC */
+#endif /* METTLE_ALLOC_ACTIVE */
 
 #endif /* METTLE_ALLOC_H */

@@ -39,7 +39,8 @@ if defined METTLE_SKIP_TESTS set "SKIP_TESTS=1"
 
 REM METTLE_INTERNAL_ALLOC builds the driver against src\mettle_alloc.c
 REM instead of the platform heap. Set METTLE_NO_INTERNAL_ALLOC=1 to fall
-REM back to malloc (e.g. under a sanitizer, or to attribute a regression).
+REM back to malloc (e.g. to attribute a regression). A sanitizer build needs
+REM no variable: the allocator detects one and stands down.
 set CFLAGS=-Wall -Wextra -std=c99 -g -O2 -D_GNU_SOURCE -Isrc -Iinclude -fno-omit-frame-pointer
 if not defined METTLE_NO_INTERNAL_ALLOC set "CFLAGS=%CFLAGS% -DMETTLE_INTERNAL_ALLOC"
 if /I "%CC%"=="clang" set "CFLAGS=%CFLAGS% -D_CRT_NONSTDC_NO_DEPRECATE -D_CRT_SECURE_NO_WARNINGS"

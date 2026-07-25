@@ -17,6 +17,18 @@
 
 #include "mettle_alloc.h"
 
+/* The subject of this test compiles to nothing when the allocator stands down
+ * (no opt-in, a non-GNU compiler, or a sanitizer that owns malloc already), and
+ * then every check below would be measuring the platform heap. Say so and pass
+ * rather than failing to build, so a sanitized configure of the tree is not a
+ * mystery compile error in a file that has nothing to report. */
+#if !METTLE_ALLOC_ACTIVE
+int main(void) {
+  printf("[SKIP] alloc_test (internal allocator inactive in this build)\n");
+  return 0;
+}
+#else
+
 #if defined(_WIN32)
 #include <windows.h>
 #else
@@ -369,3 +381,5 @@ int main(void) {
   printf("alloc_test: %d failure(s)\n", failures);
   return 1;
 }
+
+#endif /* METTLE_ALLOC_ACTIVE */

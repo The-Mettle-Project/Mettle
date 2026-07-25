@@ -5,8 +5,10 @@ CC = gcc
 EXTRA_CFLAGS =
 CFLAGS = -Wall -Wextra -std=c99 -g -O2 -D_GNU_SOURCE -Isrc -Iinclude -fno-omit-frame-pointer $(EXTRA_CFLAGS)
 # Build the driver against src/mettle_alloc.c instead of the platform heap.
-# Drop this to fall back to malloc (e.g. under a sanitizer, or to attribute
-# a regression). See src/mettle_alloc.h.
+# Drop this to fall back to malloc (e.g. to attribute a regression). A
+# sanitizer build needs no flag: the allocator detects one and stands down,
+# because ASan/TSan/MSan/LSan intercept malloc themselves. See
+# src/mettle_alloc.h.
 INTERNAL_ALLOC ?= 1
 ifeq ($(INTERNAL_ALLOC),1)
 CFLAGS += -DMETTLE_INTERNAL_ALLOC
