@@ -3,6 +3,7 @@
 #endif
 #include "main.h"
 #include "common.h"
+#include "mettle_alloc.h"
 #include "codegen/binary/startup.h"
 #include "codegen/binary/mir_annotate.h"
 #include "codegen/binary_emitter.h"
@@ -162,6 +163,11 @@ static void compiler_profile_print_compile(const CompilerProfile *profile,
             mettle_compiler_phase_name((MettleCompilerPhase)i), ms, percent);
   }
   fprintf(stderr, "  %-20s %9.3f ms  %6.2f%%\n", "total", total_ms, 100.0);
+#ifdef METTLE_INTERNAL_ALLOC
+  /* Allocation volume is the single biggest lever on these numbers, so report it
+   * alongside them rather than making it a separate flag. */
+  mettle_alloc_report();
+#endif
 }
 
 static void compiler_set_phase(MettleCompilerPhase phase) {
