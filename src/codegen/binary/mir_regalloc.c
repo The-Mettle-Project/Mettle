@@ -550,6 +550,11 @@ static void mir_compute_coalesce_hints(MirFunction *fn) {
       break;
     case MIR_SUB:
     case MIR_FSUB:
+    /* NEG/NOT are one-source two-address ops (`neg D` computes D = -D), so the
+     * encoder copies the source into the destination unless the allocator put
+     * it there already -- the same copy the arithmetic cases above elide. */
+    case MIR_NEG:
+    case MIR_NOT:
     /* A plain register copy `dst <- a` is the most basic coalescing target: if a
      * dies at the copy, dst and a never overlap, so they can share a register and
      * the move disappears entirely (store_from/materialize elide a `mov R,R`).
@@ -893,6 +898,45 @@ static int mir_color_interferes(const MirVreg *a, const MirVreg *b) {
 /* The Chaitin-Briggs core. Returns 1 on success (every vreg has assigned set,
  * to a register or a fresh stack slot), 0 on OOM. `*next_spill` is advanced for
  * each value that ends up memory-resident. */
+/* For each vreg, the vreg it is narrowed from by a MOVZX/MOVSX, or
+ * MIR_VREG_NONE. Colouring the two alike makes the extend a same-register
+ * `mov r32, r32`, which -- unlike the cross-register form -- the hardware
+ * cannot rename away, so it costs a full cycle on the dependence chain. Both
+ * allocators consult this to prefer a different register. One pass over the
+ * instructions; NULL on OOM, which callers treat as "no preference". */
+static MirVregId *mir_build_narrowing_extend_map(const MirFunction *fn) {
+  if (fn->vreg_count == 0) {
+    return NULL;
+  }
+  MirVregId *map = (MirVregId *)malloc(fn->vreg_count * sizeof(MirVregId));
+  if (!map) {
+    return NULL;
+  }
+  for (size_t v = 0; v < fn->vreg_count; v++) {
+    map[v] = MIR_VREG_NONE;
+  }
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    const MirInst *in = &fn->insns[i];
+    if ((in->op != MIR_MOVZX && in->op != MIR_MOVSX) || in->width >= 8 ||
+        in->dst.kind != MIR_OPK_VREG || in->a.kind != MIR_OPK_VREG ||
+        in->dst.vreg == in->a.vreg) {
+      continue;
+    }
+    map[in->dst.vreg] = in->a.vreg;
+  }
+  return map;
+}
+
+/* The physical register a narrowing extend's destination should avoid, or -1. */
+static int mir_narrowing_avoid_reg(const MirFunction *fn, const MirVregId *map,
+                                   MirVregId v) {
+  if (!map || map[v] == MIR_VREG_NONE) {
+    return -1;
+  }
+  const MirVreg *sv = &fn->vregs[map[v]];
+  return sv->in_register ? (int)sv->phys : -1;
+}
+
 static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool,
                            size_t gp_leaf_n,
                            const BinaryGpRegister *gp_cross_pool,
@@ -920,10 +964,12 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
    * (including ties) are unchanged. */
   long long *metric = (long long *)calloc(N, sizeof(long long));
   MirVregId *stack = (MirVregId *)malloc(N * sizeof(MirVregId));
+  MirVregId *narrow_src = mir_build_narrowing_extend_map(fn);
   if (!inter || !mask || !degree || !cost || !colorable || !removed ||
       !reg_count || !metric || !stack) {
     free(inter); free(mask); free(degree); free(cost); free(colorable);
     free(removed); free(reg_count); free(metric); free(stack);
+    free(narrow_src);
     return 0;
   }
 #define MIR_METRIC(v) ((long long)cost[v] * 1000 / (degree[v] + 1))
@@ -1017,6 +1063,35 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
         degree[a]++;
         degree[b]++;
       }
+    }
+  }
+
+  /* Anti-affinity edge across a narrowing MOVZX/MOVSX. The two ends do NOT
+   * overlap (the source dies at the extend), so nothing above makes them
+   * interfere and they are free to share a register -- which is precisely the
+   * placement to avoid. `mov r8d, r9d` is renamed away by the hardware and
+   * costs nothing; `mov r8d, r8d`, the same instruction with both ends coloured
+   * alike, cannot be (it zeroes the upper half in place) and so lands a full
+   * cycle on the dependence chain. In a serial recurrence such as a
+   * bit-at-a-time CRC, one of these sits on the loop-carried path per step and
+   * that cycle is a quarter of the whole loop.
+   *
+   * An edge is the right mechanism because the SELECT order is arbitrary: a
+   * one-sided preference only works when the source happens to be coloured
+   * first. Recorded only when both ends are still register candidates, so the
+   * pressure this adds is one extra neighbour on values that are already
+   * short-lived. */
+  if (narrow_src) {
+    for (size_t v = 0; v < N; v++) {
+      MirVregId s = narrow_src[v];
+      if (!colorable[v] || s == MIR_VREG_NONE || (size_t)s >= N ||
+          !colorable[s] || (size_t)s == v || MIR_INTER_GET(v, s)) {
+        continue;
+      }
+      MIR_INTER_SET(v, s);
+      MIR_INTER_SET(s, v);
+      degree[v]++;
+      degree[s]++;
     }
   }
 
@@ -1116,11 +1191,25 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
       vr->spill_offset = *next_spill;
       continue;
     }
+    /* Anti-preference for a narrowing extend's destination: keep it OFF its
+     * source's register. `mov r8d, r9d` is renamed away by the hardware and
+     * costs nothing, but `mov r8d, r8d` -- the same instruction with both
+     * operands coloured alike -- is not eliminable (it has to zero the upper
+     * half in place) and so lands a full cycle on the dependence chain. In a
+     * serial recurrence like a bit-at-a-time CRC, where one of these sits on
+     * the loop-carried path per step, that single cycle is ~25% of the loop.
+     * Only a preference: if the source's register is the only one left, taking
+     * it still beats spilling. */
+    uint32_t preferred = avail;
+    int avoid = mir_narrowing_avoid_reg(fn, narrow_src, v);
+    if (avoid >= 0 && (preferred & ~(1u << (unsigned)avoid)) != 0) {
+      preferred &= ~(1u << (unsigned)avoid);
+    }
     int chosen = -1;
     /* Bias toward a copy partner's register to elide the move. */
     if (vr->coalesce_hint != MIR_VREG_NONE) {
       MirVreg *hv = &fn->vregs[vr->coalesce_hint];
-      if (hv->in_register && (avail & (1u << hv->phys))) {
+      if (hv->in_register && (preferred & (1u << hv->phys))) {
         chosen = hv->phys;
       }
     }
@@ -1128,7 +1217,7 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
       /* Otherwise the lowest-numbered available register: keeps volatile/low
        * regs busy first and is deterministic. */
       for (int r = 0; r < 16; r++) {
-        if (avail & (1u << r)) {
+        if (preferred & (1u << r)) {
           chosen = r;
           break;
         }
@@ -1190,6 +1279,7 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
 #undef MIR_INTER_GET
   free(inter); free(mask); free(degree); free(cost); free(colorable);
   free(removed); free(reg_count); free(metric); free(stack);
+  free(narrow_src);
   return 1;
 }
 
@@ -1514,6 +1604,7 @@ int mir_regalloc(MirFunction *fn) {
     free(order);
     return 0;
   }
+  MirVregId *narrow_src = mir_build_narrowing_extend_map(fn);
 
   /* Per-class free pools, tracked as "register r is free / held by vreg". */
   int gp_held_by[16];  /* index by BinaryGpRegister -> vreg id or -1 */
@@ -1573,6 +1664,7 @@ int mir_regalloc(MirFunction *fn) {
   MirVregId *active = (MirVregId *)malloc(order_count * sizeof(MirVregId));
   if (!active && order_count > 0) {
     free(order);
+    free(narrow_src);
     fn->has_error = 1;
     return 0;
   }
@@ -1673,17 +1765,31 @@ int mir_regalloc(MirFunction *fn) {
           cv->crosses_call ? gp_cross_pool : gp_leaf_pool;
       size_t pool_n =
           cv->crosses_call ? gp_cross_pool_count : gp_leaf_pool_count;
-      for (size_t p = 0; p < pool_n; p++) {
-        BinaryGpRegister reg = pool[p];
-        if (gp_held_by[reg] == -1 &&
-            !mir_reg_clobbered_in_range(fn, reg, cv->live_start,
-                                        cv->live_end)) {
-          gp_held_by[reg] = cur;
-          cv->assigned = 1;
-          cv->in_register = 1;
-          cv->phys = reg;
-          got_reg = 1;
-          break;
+      /* A narrowing extend wants a register OTHER than the one it extends:
+       * `mov r8d, r9d` is renamed away by the hardware for free, while
+       * `mov r8d, r8d` cannot be (it zeroes the upper half in place) and costs
+       * a cycle on the dependence chain. Pass 0 skips that one register; pass 1
+       * reconsiders it, since taking it still beats spilling. */
+      int avoid = mir_narrowing_avoid_reg(fn, narrow_src, cur);
+      for (int relax = 0; !got_reg && relax < 2; relax++) {
+        for (size_t p = 0; p < pool_n; p++) {
+          BinaryGpRegister reg = pool[p];
+          if (relax == 0 && avoid >= 0 && (int)reg == avoid) {
+            continue;
+          }
+          if (gp_held_by[reg] == -1 &&
+              !mir_reg_clobbered_in_range(fn, reg, cv->live_start,
+                                          cv->live_end)) {
+            gp_held_by[reg] = cur;
+            cv->assigned = 1;
+            cv->in_register = 1;
+            cv->phys = reg;
+            got_reg = 1;
+            break;
+          }
+        }
+        if (avoid < 0) {
+          break; /* nothing was skipped, so the second pass would repeat */
         }
       }
     }
@@ -1804,6 +1910,7 @@ int mir_regalloc(MirFunction *fn) {
               fn->context, (BinaryGpRegister)reg)) {
         free(order);
         free(active);
+        free(narrow_src);
         fn->has_error = 1;
         return 0;
       }
@@ -1825,6 +1932,7 @@ int mir_regalloc(MirFunction *fn) {
               fn->context, (BinaryXmmRegister)reg)) {
         free(order);
         free(active);
+        free(narrow_src);
         fn->has_error = 1;
         return 0;
       }
@@ -1833,5 +1941,6 @@ int mir_regalloc(MirFunction *fn) {
 
   free(order);
   free(active);
+  free(narrow_src);
   return 1;
 }

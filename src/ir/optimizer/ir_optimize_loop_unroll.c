@@ -302,6 +302,145 @@ int ir_function_replace_instructions(IRFunction *function,
   return 1;
 }
 
+/* ---- per-copy temp renaming for full unrolling -------------------------- *
+ *
+ * Cloning a loop body verbatim gives every copy the same temp names, so what
+ * were N short, disjoint values become one value live across the whole unrolled
+ * region. Nothing downstream can tell the copies apart: the register allocator
+ * sees a single long live range per temp, its coalescer never sees a source die
+ * (the name is written again further down), and so every operation in every
+ * copy pays a register-to-register copy it would not otherwise need.
+ *
+ * Giving each copy its own names restores the short live ranges. A temp is only
+ * renamed when it is entirely local to the body -- defined inside it and read
+ * nowhere else -- so a value flowing in from before the loop, or out to code
+ * after it, keeps the single name those readers expect. */
+
+typedef struct {
+  const char **names;
+  size_t count;
+  size_t capacity;
+} IrUnrollTempSet;
+
+static void ir_unroll_temp_set_destroy(IrUnrollTempSet *set) {
+  free(set->names);
+  set->names = NULL;
+  set->count = set->capacity = 0;
+}
+
+static int ir_unroll_temp_set_contains(const IrUnrollTempSet *set,
+                                       const char *name) {
+  for (size_t i = 0; i < set->count; i++) {
+    if (strcmp(set->names[i], name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int ir_unroll_temp_set_add(IrUnrollTempSet *set, const char *name) {
+  if (ir_unroll_temp_set_contains(set, name)) {
+    return 1;
+  }
+  if (set->count >= set->capacity) {
+    size_t grown = set->capacity ? set->capacity * 2 : 16;
+    const char **names =
+        (const char **)realloc(set->names, grown * sizeof(*names));
+    if (!names) {
+      return 0;
+    }
+    set->names = names;
+    set->capacity = grown;
+  }
+  set->names[set->count++] = name;
+  return 1;
+}
+
+/* Every operand slot of `in`, so callers can walk reads and writes uniformly. */
+static size_t ir_unroll_operand_slots(IRInstruction *in, IROperand **slots,
+                                      size_t max_slots) {
+  size_t n = 0;
+  if (n < max_slots) slots[n++] = &in->dest;
+  if (n < max_slots) slots[n++] = &in->lhs;
+  if (n < max_slots) slots[n++] = &in->rhs;
+  for (size_t a = 0; a < in->argument_count && n < max_slots; a++) {
+    slots[n++] = &in->arguments[a];
+  }
+  return n;
+}
+
+/* True when `name` is read or written by any instruction outside [lo, hi). */
+static int ir_unroll_temp_used_outside(const IRFunction *function, size_t lo,
+                                       size_t hi, const char *name) {
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    if (i >= lo && i < hi) {
+      continue;
+    }
+    IRInstruction *in = &function->instructions[i];
+    if (in->op == IR_OP_NOP) {
+      continue; /* a deleted instruction keeps operands it no longer touches */
+    }
+    IROperand *slots[3 + 16];
+    size_t n = ir_unroll_operand_slots(in, slots, sizeof(slots) / sizeof(*slots));
+    for (size_t s = 0; s < n; s++) {
+      if (slots[s]->kind == IR_OPERAND_TEMP && slots[s]->name &&
+          strcmp(slots[s]->name, name) == 0) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+/* Collect the temps that are defined in [lo, hi) and used nowhere else. */
+static int ir_unroll_collect_private_temps(const IRFunction *function, size_t lo,
+                                           size_t hi, IrUnrollTempSet *set) {
+  for (size_t i = lo; i < hi; i++) {
+    IRInstruction *in = &function->instructions[i];
+    if (in->op == IR_OP_NOP || in->op == IR_OP_STORE) {
+      continue; /* a STORE's dest is the address it writes through */
+    }
+    if (in->dest.kind != IR_OPERAND_TEMP || !in->dest.name) {
+      continue;
+    }
+    if (ir_unroll_temp_set_contains(set, in->dest.name)) {
+      continue;
+    }
+    if (ir_unroll_temp_used_outside(function, lo, hi, in->dest.name)) {
+      continue;
+    }
+    if (!ir_unroll_temp_set_add(set, in->dest.name)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+/* Rewrite the body-private temps in an already-cloned instruction to this
+ * copy's private names. */
+static int ir_unroll_rename_copy_temps(IRInstruction *out,
+                                       const IrUnrollTempSet *set,
+                                       long long trip) {
+  IROperand *slots[3 + 16];
+  size_t n = ir_unroll_operand_slots(out, slots, sizeof(slots) / sizeof(*slots));
+  for (size_t s = 0; s < n; s++) {
+    IROperand *o = slots[s];
+    if (o->kind != IR_OPERAND_TEMP || !o->name ||
+        !ir_unroll_temp_set_contains(set, o->name)) {
+      continue;
+    }
+    size_t len = strlen(o->name) + 24;
+    char *renamed = (char *)malloc(len);
+    if (!renamed) {
+      return 0;
+    }
+    snprintf(renamed, len, "%s__u%lld", o->name, trip);
+    mettle_free_string(o->name);
+    o->name = renamed;
+  }
+  return 1;
+}
+
 static int ir_try_unroll_loop_at(IRFunction *function, size_t header_index,
                                  int *changed) {
   IRSymbolValueMap symbol_map;
@@ -366,6 +505,16 @@ static int ir_try_unroll_loop_at(IRFunction *function, size_t header_index,
     }
   }
 
+  /* Each copy gets private names for the temps that live only inside the body,
+   * so the copies do not merge into one long live range (see the comment on
+   * ir_unroll_collect_private_temps). A collection failure is not fatal: the
+   * empty set just reproduces the old verbatim clone. */
+  IrUnrollTempSet private_temps = {0};
+  if (!ir_unroll_collect_private_temps(function, body_start, body_end,
+                                       &private_temps)) {
+    ir_unroll_temp_set_destroy(&private_temps);
+  }
+
   for (long long trip = 0; trip < trips; trip++) {
     for (size_t b = body_start; b < body_end; b++) {
       if (!counter_used_in_body && b == increment_index) {
@@ -374,14 +523,17 @@ static int ir_try_unroll_loop_at(IRFunction *function, size_t header_index,
 
       IRInstruction cloned = {0};
       if (!ir_clone_instruction_plain(&function->instructions[b], &cloned) ||
+          !ir_unroll_rename_copy_temps(&cloned, &private_temps, trip) ||
           !ir_instruction_vector_append_move(&vector, &cloned)) {
         ir_instruction_destroy_storage(&cloned);
         ir_instruction_vector_destroy(&vector);
         ir_temp_value_map_destroy(&symbol_map);
+        ir_unroll_temp_set_destroy(&private_temps);
         return 0;
       }
     }
   }
+  ir_unroll_temp_set_destroy(&private_temps);
 
   /* Emit an explicit jump to the loop's exit label after the unrolled body.
    * Without it, the unrolled straight-line body falls through into whatever

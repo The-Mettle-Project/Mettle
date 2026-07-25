@@ -4603,6 +4603,72 @@ static int mir_lower_folded_access(MirFunction *fn, CodeGenerator *g,
  * is common in inlined and recursive code (e.g. rec_fib's `mov r13,r12; movsxd
  * r13,r13d`). Only vreg->vreg moves (a load/immediate MOV is left alone), and
  * the two are adjacent so s cannot be redefined between them. */
+/* True for integer ops whose low 32 result bits depend only on the low 32 bits
+ * of their inputs, so evaluating them at operand size 32 gives the same answer
+ * as evaluating at 64 and discarding the top half. The right shifts, the
+ * divides and MULHI are excluded: they read the bits above 32. */
+static int mir_op_low32_is_self_contained(MirOpcode op) {
+  switch (op) {
+  case MIR_ADD:
+  case MIR_SUB:
+  case MIR_AND:
+  case MIR_OR:
+  case MIR_XOR:
+  case MIR_NEG:
+  case MIR_NOT:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+/* uint32 arithmetic is evaluated in 64-bit registers and truncated back after
+ * every step, so each operation is followed by a zero-extend of its own result.
+ * That extend is pure overhead: a 32-bit-operand-size instruction already
+ * zero-extends into the full register. Where the extend immediately follows the
+ * op that defines it -- so nothing can observe the untruncated value -- mark the
+ * op as 32-bit and delete the extend.
+ *
+ * Two things follow. The instruction disappears, and so does its cycle: an
+ * in-place `mov r8d, r8d` is one of the few register moves the hardware cannot
+ * rename away, and in a serial recurrence (a bit-at-a-time CRC, a hash step)
+ * that cycle sits on the loop-carried path. The 32-bit form also takes a full
+ * 32-bit immediate, so masking constants like 0xEDB88320 stop needing a
+ * register: at width 8 they do not fit a sign-extended imm32.
+ *
+ * Only MOVZX qualifies. MOVSX asks for sign extension, which a 32-bit operation
+ * does not perform. */
+static void mir_narrow_zero_extended_ops(MirFunction *fn) {
+  if (!fn) {
+    return;
+  }
+  for (size_t i = 1; i < fn->insn_count; i++) {
+    MirInst *ext = &fn->insns[i];
+    if (ext->op != MIR_MOVZX || ext->is_float || ext->width != 4 ||
+        ext->dst.kind != MIR_OPK_VREG || ext->a.kind != MIR_OPK_VREG ||
+        ext->dst.vreg != ext->a.vreg) {
+      continue;
+    }
+    /* The defining op must be the previous real instruction: anything in
+     * between could read the value before it is truncated. */
+    size_t d = i;
+    while (d > 0 && fn->insns[d - 1].op == MIR_NOP) {
+      d--;
+    }
+    if (d == 0) {
+      continue;
+    }
+    MirInst *def = &fn->insns[d - 1];
+    if (def->is_float || def->width != 8 || def->dst.kind != MIR_OPK_VREG ||
+        def->dst.vreg != ext->dst.vreg ||
+        !mir_op_low32_is_self_contained(def->op)) {
+      continue;
+    }
+    def->width = 4;
+    ext->op = MIR_NOP;
+  }
+}
+
 static void mir_fuse_mov_then_extend(MirFunction *fn) {
   if (!fn) {
     return;
@@ -5497,6 +5563,7 @@ int code_generator_binary_emit_function_via_mir(
   free(folds);
 
   mir_fuse_mov_then_extend(&fn);
+  mir_narrow_zero_extended_ops(&fn);
   mir_rotate_loops(&fn);
   mir_sink_cold_exits(&fn);
   mir_place_const_pool(&fn);

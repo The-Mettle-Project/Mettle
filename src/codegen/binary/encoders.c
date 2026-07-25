@@ -101,6 +101,88 @@ int binary_emit_mov_reg_reg32(BinaryCodeBuffer *buffer,
  * is the canonical uint32 zero-extension — callers relying on that zeroing
  * must use this, not binary_emit_mov_reg_reg32 (whose same-register no-op
  * would silently skip it). */
+/* 32-bit-operand-size forms of the ALU and unary encoders below. On x86-64 a
+ * 32-bit result is zero-extended to the full register for free, so computing a
+ * uint32 expression at operand size 32 makes the truncation the language
+ * requires implicit -- no separate zero-extend instruction, and no cycle for it
+ * on the dependence chain. Widening to 32-bit immediates also becomes free:
+ * `and eax, 0xedb88320` is one instruction, where the 64-bit form has to
+ * materialize the constant into a register first because it cannot be
+ * expressed as a sign-extended imm32. */
+
+int binary_emit_alu_reg_reg32(BinaryCodeBuffer *buffer, unsigned char opcode,
+                              BinaryGpRegister destination,
+                              BinaryGpRegister source) {
+  if (!buffer) {
+    return 0;
+  }
+  if (!binary_emit_rex(buffer, 0, source >> 3, 0, destination >> 3) ||
+      !binary_code_buffer_append_u8(buffer, opcode) ||
+      !binary_code_buffer_append_u8(
+          buffer,
+          (unsigned char)(0xC0 | ((source & 7) << 3) | (destination & 7)))) {
+    return 0;
+  }
+  return 1;
+}
+
+/* Unlike the 64-bit form this never elides a no-op immediate (`add r,0` and
+ * friends): at operand size 32 the instruction still performs the zero-extend
+ * that the caller is relying on. */
+int binary_emit_alu_reg_imm_w32(BinaryCodeBuffer *buffer,
+                                unsigned char subopcode, BinaryGpRegister reg,
+                                uint32_t immediate) {
+  if (!buffer) {
+    return 0;
+  }
+
+  int32_t signed_immediate = (int32_t)immediate;
+  if (signed_immediate >= INT8_MIN && signed_immediate <= INT8_MAX) {
+    if (!binary_emit_rex(buffer, 0, 0, 0, reg >> 3) ||
+        !binary_code_buffer_append_u8(buffer, 0x83) ||
+        !binary_code_buffer_append_u8(
+            buffer,
+            (unsigned char)(0xC0 | ((subopcode & 7) << 3) | (reg & 7))) ||
+        !binary_code_buffer_append_u8(buffer,
+                                      (unsigned char)(int8_t)signed_immediate)) {
+      return 0;
+    }
+    return 1;
+  }
+
+  if (!binary_emit_rex(buffer, 0, 0, 0, reg >> 3) ||
+      !binary_code_buffer_append_u8(buffer, 0x81) ||
+      !binary_code_buffer_append_u8(
+          buffer, (unsigned char)(0xC0 | ((subopcode & 7) << 3) | (reg & 7))) ||
+      !binary_code_buffer_append_u32(buffer, immediate)) {
+    return 0;
+  }
+  return 1;
+}
+
+int binary_emit_unary_reg32(BinaryCodeBuffer *buffer, unsigned char subopcode,
+                            BinaryGpRegister reg) {
+  if (!buffer) {
+    return 0;
+  }
+  if (!binary_emit_rex(buffer, 0, 0, 0, reg >> 3) ||
+      !binary_code_buffer_append_u8(buffer, 0xF7) ||
+      !binary_code_buffer_append_u8(
+          buffer,
+          (unsigned char)(0xC0 | ((subopcode & 7) << 3) | (reg & 7)))) {
+    return 0;
+  }
+  return 1;
+}
+
+int binary_emit_neg_reg32(BinaryCodeBuffer *buffer, BinaryGpRegister reg) {
+  return binary_emit_unary_reg32(buffer, 3, reg);
+}
+
+int binary_emit_not_reg32(BinaryCodeBuffer *buffer, BinaryGpRegister reg) {
+  return binary_emit_unary_reg32(buffer, 2, reg);
+}
+
 int binary_emit_movzx_reg_reg32(BinaryCodeBuffer *buffer,
                                 BinaryGpRegister destination,
                                 BinaryGpRegister source) {

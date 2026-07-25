@@ -182,10 +182,29 @@ static int alu_opcode(MirOpcode op, unsigned char *out) {
   }
 }
 
+/* ALU /digit sub-opcodes for the reg,imm forms. */
+static int alu_imm_subopcode(MirOpcode op, unsigned char *out) {
+  switch (op) {
+  case MIR_ADD: *out = 0; return 1;
+  case MIR_OR:  *out = 1; return 1;
+  case MIR_AND: *out = 4; return 1;
+  case MIR_SUB: *out = 5; return 1;
+  case MIR_XOR: *out = 6; return 1;
+  default: return 0;
+  }
+}
+
 static int alu_imm(MirFunction *fn, MirOpcode op, BinaryGpRegister reg,
-                   long long imm) {
+                   long long imm, int width) {
   BinaryCodeBuffer *code = &fn->context->code;
   uint32_t v = (uint32_t)imm;
+  if (width == 4) {
+    unsigned char sub;
+    if (!alu_imm_subopcode(op, &sub)) {
+      return 0;
+    }
+    return binary_emit_alu_reg_imm_w32(code, sub, reg, v);
+  }
   switch (op) {
   case MIR_ADD: return binary_emit_add_reg_imm32(code, reg, v);
   case MIR_SUB: return binary_emit_sub_reg_imm32(code, reg, v);
@@ -252,12 +271,17 @@ static int dst_is_reg(MirFunction *fn, const MirOperand *dst,
  * the op is commutative (callers guarantee this). Uses the scratch register
  * that is not `target` to stage a spilled/wide-immediate `x`. */
 static int emit_op_eq(MirFunction *fn, MirOpcode mop, unsigned char opc,
-                      BinaryGpRegister target, const MirOperand *x) {
+                      BinaryGpRegister target, const MirOperand *x, int width) {
   BinaryCodeBuffer *code = &fn->context->code;
+  /* At operand size 32 the immediate is not sign-extended, so ANY 32-bit
+   * constant folds into the instruction -- including the ones (0x80000000 and
+   * up) that the 64-bit form has to stage through a register. */
   if (x->kind == MIR_OPK_IMM &&
-      code_generator_binary_immediate_fits_signed_32(x->imm)) {
-    return alu_imm(fn, mop, target, x->imm) ? 1
-                                            : enc_err(fn, "out of memory in ALU imm");
+      (code_generator_binary_immediate_fits_signed_32(x->imm) ||
+       (width == 4 && (unsigned long long)x->imm <= 0xFFFFFFFFULL))) {
+    return alu_imm(fn, mop, target, x->imm, width)
+               ? 1
+               : enc_err(fn, "out of memory in ALU imm");
   }
   BinaryGpRegister scratch = (target == SCRATCH_A) ? SCRATCH_B : SCRATCH_A;
   int ok;
@@ -265,9 +289,10 @@ static int emit_op_eq(MirFunction *fn, MirOpcode mop, unsigned char opc,
   if (!ok) {
     return 0;
   }
-  return binary_emit_alu_reg_reg(code, opc, target, xr)
-             ? 1
-             : enc_err(fn, "out of memory in ALU");
+  int emitted = (width == 4)
+                    ? binary_emit_alu_reg_reg32(code, opc, target, xr)
+                    : binary_emit_alu_reg_reg(code, opc, target, xr);
+  return emitted ? 1 : enc_err(fn, "out of memory in ALU");
 }
 
 /* dst = -a (MIR_NEG) or dst = ~a (MIR_NOT). One-source two-address: stage a in
@@ -275,20 +300,27 @@ static int emit_op_eq(MirFunction *fn, MirOpcode mop, unsigned char opc,
  * place. */
 static int encode_neg_not(MirFunction *fn, const MirInst *in) {
   BinaryCodeBuffer *code = &fn->context->code;
+  int w32 = (in->width == 4); /* see encode_alu */
   BinaryGpRegister D;
   if (dst_is_reg(fn, &in->dst, &D)) {
     if (!operand_in_phys(fn, &in->a, D) && !materialize_into(fn, &in->a, D)) {
       return 0;
     }
-    int ok = (in->op == MIR_NEG) ? binary_emit_neg_reg(code, D)
-                                 : binary_emit_not_reg(code, D);
+    int ok = (in->op == MIR_NEG)
+                 ? (w32 ? binary_emit_neg_reg32(code, D)
+                        : binary_emit_neg_reg(code, D))
+                 : (w32 ? binary_emit_not_reg32(code, D)
+                        : binary_emit_not_reg(code, D));
     return ok ? 1 : enc_err(fn, "out of memory in neg/not");
   }
   if (!materialize_into(fn, &in->a, SCRATCH_A)) {
     return 0;
   }
-  int ok = (in->op == MIR_NEG) ? binary_emit_neg_reg(code, SCRATCH_A)
-                               : binary_emit_not_reg(code, SCRATCH_A);
+  int ok = (in->op == MIR_NEG)
+               ? (w32 ? binary_emit_neg_reg32(code, SCRATCH_A)
+                      : binary_emit_neg_reg(code, SCRATCH_A))
+               : (w32 ? binary_emit_not_reg32(code, SCRATCH_A)
+                      : binary_emit_not_reg(code, SCRATCH_A));
   if (!ok) {
     return enc_err(fn, "out of memory in neg/not");
   }
@@ -302,6 +334,11 @@ static int encode_alu(MirFunction *fn, const MirInst *in) {
     return enc_err(fn, "bad ALU opcode");
   }
   int is_sub = (in->op == MIR_SUB);
+  /* Width 4 means the result is defined to be the low 32 bits zero-extended,
+   * which is exactly what a 32-bit-operand-size instruction produces for free
+   * (see mir_narrow_zero_extended_ops). Staging an operand may still use a
+   * 64-bit move: the narrow op reads only the low half and rewrites the top. */
+  int w32 = (in->width == 4);
   BinaryGpRegister D;
 
   if (dst_is_reg(fn, &in->dst, &D)) {
@@ -313,7 +350,7 @@ static int encode_alu(MirFunction *fn, const MirInst *in) {
      * the SIB index can't be RSP, so swap operands if needed (ADD commutes).
      * MIR consumes condition flags only through explicit CMP, so LEA not
      * setting flags is fine. */
-    if (in->op == MIR_ADD && !operand_in_phys(fn, &in->a, D) &&
+    if (in->op == MIR_ADD && !w32 && !operand_in_phys(fn, &in->a, D) &&
         !operand_in_phys(fn, &in->b, D)) {
       BinaryGpRegister ra, rb;
       if (operand_gp_reg(fn, &in->a, &ra) && operand_gp_reg(fn, &in->b, &rb)) {
@@ -333,26 +370,29 @@ static int encode_alu(MirFunction *fn, const MirInst *in) {
       /* b already occupies the destination register. */
       if (is_sub) {
         /* dst = a - b, b in D: stage a in RAX, subtract D, write back. */
-        if (!materialize_into(fn, &in->a, SCRATCH_A) ||
-            !binary_emit_alu_reg_reg(code, opc, SCRATCH_A, D)) {
+        if (!materialize_into(fn, &in->a, SCRATCH_A)) {
+          return 0;
+        }
+        if (!(w32 ? binary_emit_alu_reg_reg32(code, opc, SCRATCH_A, D)
+                  : binary_emit_alu_reg_reg(code, opc, SCRATCH_A, D))) {
           return enc_err(fn, "out of memory in sub");
         }
         return store_from(fn, &in->dst, SCRATCH_A);
       }
       /* commutative: D = D OP a == a OP b. */
-      return emit_op_eq(fn, in->op, opc, D, &in->a);
+      return emit_op_eq(fn, in->op, opc, D, &in->a, in->width);
     }
     /* b does not alias D: place a in D, then D OP= b. */
     if (!operand_in_phys(fn, &in->a, D) &&
         !materialize_into(fn, &in->a, D)) {
       return 0;
     }
-    return emit_op_eq(fn, in->op, opc, D, &in->b);
+    return emit_op_eq(fn, in->op, opc, D, &in->b, in->width);
   }
 
   /* Spilled destination: compute in RAX (no allocatable reg aliases it), store. */
   if (!materialize_into(fn, &in->a, SCRATCH_A) ||
-      !emit_op_eq(fn, in->op, opc, SCRATCH_A, &in->b)) {
+      !emit_op_eq(fn, in->op, opc, SCRATCH_A, &in->b, in->width)) {
     return 0;
   }
   return store_from(fn, &in->dst, SCRATCH_A);

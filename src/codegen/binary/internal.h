@@ -360,6 +360,11 @@ int binary_emit_addss_xmm_xmm(BinaryCodeBuffer *buffer, BinaryXmmRegister destin
 int binary_emit_alu_reg8_reg8(BinaryCodeBuffer *buffer, unsigned char opcode, BinaryGpRegister destination, BinaryGpRegister source);
 int binary_emit_alu_reg_imm32(BinaryCodeBuffer *buffer, unsigned char subopcode, BinaryGpRegister reg, uint32_t immediate);
 int binary_emit_alu_reg_reg(BinaryCodeBuffer *buffer, unsigned char opcode, BinaryGpRegister destination, BinaryGpRegister source);
+int binary_emit_alu_reg_reg32(BinaryCodeBuffer *buffer, unsigned char opcode, BinaryGpRegister destination, BinaryGpRegister source);
+int binary_emit_alu_reg_imm_w32(BinaryCodeBuffer *buffer, unsigned char subopcode, BinaryGpRegister reg, uint32_t immediate);
+int binary_emit_unary_reg32(BinaryCodeBuffer *buffer, unsigned char subopcode, BinaryGpRegister reg);
+int binary_emit_neg_reg32(BinaryCodeBuffer *buffer, BinaryGpRegister reg);
+int binary_emit_not_reg32(BinaryCodeBuffer *buffer, BinaryGpRegister reg);
 int binary_emit_alu_rsp_imm32(BinaryCodeBuffer *buffer, unsigned char subopcode, uint32_t immediate);
 int binary_emit_and_reg_imm32(BinaryCodeBuffer *buffer, BinaryGpRegister reg, uint32_t immediate);
 int binary_emit_call_placeholder(BinaryCodeBuffer *buffer, size_t *displacement_offset_out);
