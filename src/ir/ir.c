@@ -908,8 +908,15 @@ int ir_function_append_instruction(IRFunction *function,
   }
 
   if (function->instruction_count >= function->instruction_capacity) {
+    /* The first block holds 128, not 64. An IRInstruction is around 576 bytes,
+     * so the 64 -> 128 step copies ~36KB, and on a 13k-function program almost
+     * every function took it: peak working set is identical either way, which is
+     * the measurement saying the arrays were reaching 128 regardless. Starting
+     * there just skips the copy -- worth ~50ms of the IR lowering phase. Going
+     * further (192, 256, 2048) measured slower: the extra pages have to be
+     * touched, and past 512KB each array becomes an individual OS mapping. */
     size_t new_capacity = function->instruction_capacity == 0
-                              ? 64
+                              ? 128
                               : function->instruction_capacity * 2;
     IRInstruction *new_instructions =
         realloc(function->instructions, new_capacity * sizeof(IRInstruction));

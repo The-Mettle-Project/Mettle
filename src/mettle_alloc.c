@@ -254,7 +254,9 @@ typedef struct Heap {
    * back, so a malloc/free pair repeated in a loop cannot turn into a pair of
    * commit/decommit syscalls per iteration. */
   Segment *cached_empty[2];
-  size_t live_objects, live_bytes;
+  /* Only the two totals are maintained on the hot paths: live_objects is their
+   * difference, and tracking live BYTES as well cost a third read-modify-write
+   * per allocation and per free for a figure nothing consumed. */
   size_t total_allocs, total_frees, foreign_frees, huge_live;
   struct Heap *next_all;
 } Heap;
@@ -814,8 +816,6 @@ static void *huge_alloc(Heap *h, size_t n) {
   ATOMIC_STORE(&p->owner, h);
   seg->pages_in_use = 1;
 
-  h->live_objects++;
-  h->live_bytes += p->bsize;
   h->total_allocs++;
   h->huge_live++;
   return (char *)seg + PAGE_SIZE_;
@@ -900,8 +900,6 @@ static inline void *alloc_block(size_t n) {
   b = alloc_slow(h, cls);
   if (!b) return NULL;
 counted:
-  h->live_objects++;
-  h->live_bytes += g_bsize[cls];
   h->total_allocs++;
   return b;
 }
@@ -920,8 +918,6 @@ static void free_block(void *ptr) {
     return;
   }
 
-  h->live_objects--;
-  h->live_bytes -= p->bsize;
   h->total_frees++;
 
   if (p->seg->kind == SEG_HUGE) {
@@ -1078,14 +1074,13 @@ void mettle_alloc_stats(MettleAllocStats *out) {
   out->bytes_reserved = g_bytes_reserved;
   out->bytes_committed = g_bytes_committed;
   for (h = g_all_heaps; h; h = h->next_all) {
-    out->live_objects += h->live_objects;
-    out->live_bytes += h->live_bytes;
     out->total_allocs += h->total_allocs;
     out->total_frees += h->total_frees;
     out->foreign_frees += h->foreign_frees;
     out->huge_live += h->huge_live;
   }
   lock_release();
+  out->live_objects = out->total_allocs - out->total_frees;
 }
 
 void mettle_alloc_report(void) {

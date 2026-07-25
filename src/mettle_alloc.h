@@ -30,8 +30,7 @@
 typedef struct MettleAllocStats {
   size_t bytes_reserved;  /* address space reserved from the OS */
   size_t bytes_committed; /* of that, backed by the OS */
-  size_t live_objects;    /* allocated and not yet freed */
-  size_t live_bytes;      /* size-class bytes held by those objects */
+  size_t live_objects;    /* allocated and not yet freed (allocs minus frees) */
   size_t total_allocs;
   size_t total_frees;
   size_t foreign_frees; /* pointers forwarded to the platform heap */
