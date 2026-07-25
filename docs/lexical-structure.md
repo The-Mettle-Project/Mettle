@@ -61,7 +61,7 @@ x86 mnemonics and register names (`add`, `mov`, `cmp`, `call`, `ret`, `push`, `p
 
 Decimal literals use digits: `42`, `0`. A leading zero does not select octal: `007` is decimal 7. Hexadecimal: `0x1A`, `0xFF`, `0Xdead`. Binary: `0b1010`, `0B1111`. Floating-point: `3.14`, `0.5`. Invalid literals (e.g. empty hex after `0x`) produce lexical errors.
 
-**Exponent notation is not supported.** A float literal is recognized by the presence of a `.` in the digits, so `1e-3` does not lex as one number; it becomes the literal `1`, the identifier `e`, the operator `-`, and the literal `3`. Write `0.001` instead.
+**Exponent notation** is supported on decimal literals: `1e10`, `1.5E+3`, `2.220446049250313e-16`. An `e` or `E` starts an exponent only when followed by an optional sign and at least one digit; otherwise it is left to the next token, so an identifier butted against a number still lexes separately. A literal is floating-point if it contains a `.` or an exponent, which means `1e10` is a `float64` rather than an integer. Exponents apply to decimal literals only: hexadecimal digits include `e`, so `0x1E` is the integer 30.
 
 The lexer will not consume a `.` that begins a `..` range, so `1..5` lexes as three tokens rather than as the float `1.` followed by `.5`.
 
