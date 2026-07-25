@@ -908,18 +908,40 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
   int *cost = (int *)calloc(N, sizeof(int));
   int *colorable = (int *)calloc(N, sizeof(int));
   int *removed = (int *)calloc(N, sizeof(int));
+  /* Register count per vreg: popcount(mask[v]). mask never changes once built,
+   * and the simplify loop tests this once per node per round, so computing it
+   * here takes the popcount out of an O(N^2) path. */
+  int *reg_count = (int *)calloc(N, sizeof(int));
+  /* Spill-preference metric, cost per unit of relief. Both selection scans below
+   * read it for every remaining node every round -- O(N^2) reads -- while it only
+   * changes when a node's degree does, so it is cached and refreshed at the point
+   * of change. That keeps the 64-bit divide off the scan, and the cached value is
+   * the same truncated integer the scan used to compute inline, so the choices
+   * (including ties) are unchanged. */
+  long long *metric = (long long *)calloc(N, sizeof(long long));
   MirVregId *stack = (MirVregId *)malloc(N * sizeof(MirVregId));
-  if (!inter || !mask || !degree || !cost || !colorable || !removed || !stack) {
+  if (!inter || !mask || !degree || !cost || !colorable || !removed ||
+      !reg_count || !metric || !stack) {
     free(inter); free(mask); free(degree); free(cost); free(colorable);
-    free(removed); free(stack);
+    free(removed); free(reg_count); free(metric); free(stack);
     return 0;
   }
+#define MIR_METRIC(v) ((long long)cost[v] * 1000 / (degree[v] + 1))
 #define MIR_INTER_SET(a, b)                                                    \
   (inter[(size_t)(a) * words + ((size_t)(b) >> 6)] |= (uint64_t)1                \
                                                        << ((size_t)(b) & 63))
 #define MIR_INTER_GET(a, b)                                                    \
   ((inter[(size_t)(a) * words + ((size_t)(b) >> 6)] >>                          \
     ((size_t)(b) & 63)) & 1u)
+/* Walk vreg `a`'s neighbours. Popping set bits word by word skips the runs of
+ * non-neighbours that testing 0..N one index at a time would visit, which is
+ * what the three O(N) neighbour scans below used to spend their time on. Only
+ * colourable vregs ever get an edge, so no colorable[] re-check is needed. */
+#define MIR_INTER_FOR_EACH(a, bvar)                                            \
+  for (size_t w_ = 0; w_ < words; w_++)                                        \
+    for (uint64_t bits_ = inter[(size_t)(a) * words + w_], bvar;               \
+         bits_ && ((bvar = w_ * 64 + (size_t)__builtin_ctzll(bits_)), 1);       \
+         bits_ &= bits_ - 1)
 
   /* Colorable set: live, not address-taken (those are already memory-resident).
    * Mask + per-operand access count (the spill cost, weighted up for loop-
@@ -932,6 +954,7 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
     colorable[v] = 1;
     mask[v] = mir_color_reg_mask(fn, (MirVregId)v, gp_leaf_pool, gp_leaf_n,
                                  gp_cross_pool, gp_cross_n, allow_rbp);
+    reg_count[v] = __builtin_popcount(mask[v]);
     cost[v] = 1;
   }
   for (size_t i = 0; i < fn->insn_count; i++) {
@@ -1007,6 +1030,7 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
   for (size_t v = 0; v < N; v++) {
     if (colorable[v]) {
       remaining++;
+      metric[v] = MIR_METRIC(v);
     }
   }
   while (remaining > 0) {
@@ -1015,20 +1039,18 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
     int best_simplify_lc = 1;
     for (size_t v = 0; v < N; v++) {
       if (colorable[v] && !removed[v]) {
-        int k = __builtin_popcount(mask[v]);
-        if (degree[v] < k) {
+        if (degree[v] < reg_count[v]) {
           int lc = fn->vregs[v].loop_carried ? 1 : 0;
-          long long metric = (long long)cost[v] * 1000 / (degree[v] + 1);
           int better;
           if (pick == MIR_VREG_NONE) {
             better = 1;
           } else if (lc != best_simplify_lc) {
             better = (lc < best_simplify_lc);
           } else {
-            better = (metric < best_simplify);
+            better = (metric[v] < best_simplify);
           }
           if (better) {
-            best_simplify = metric;
+            best_simplify = metric[v];
             best_simplify_lc = lc;
             pick = (MirVregId)v;
           }
@@ -1048,17 +1070,16 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
           continue;
         }
         int lc = fn->vregs[v].loop_carried ? 1 : 0;
-        long long metric = (long long)cost[v] * 1000 / (degree[v] + 1);
         int better;
         if (pick == MIR_VREG_NONE) {
           better = 1;
         } else if (lc != best_lc) {
           better = (lc < best_lc); /* non-loop-carried first */
         } else {
-          better = (metric < best);
+          better = (metric[v] < best);
         }
         if (better) {
-          best = metric;
+          best = metric[v];
           best_lc = lc;
           pick = (MirVregId)v;
         }
@@ -1067,9 +1088,10 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
     removed[pick] = 1;
     stack[sp++] = pick;
     remaining--;
-    for (size_t b = 0; b < N; b++) {
-      if (colorable[b] && !removed[b] && MIR_INTER_GET(pick, b)) {
+    MIR_INTER_FOR_EACH(pick, b) {
+      if (!removed[b]) {
         degree[b]--;
+        metric[b] = MIR_METRIC(b);
       }
     }
   }
@@ -1081,8 +1103,8 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
     MirVregId v = stack[--sp];
     MirVreg *vr = &fn->vregs[v];
     uint32_t used = 0;
-    for (size_t b = 0; b < N; b++) {
-      if (colorable[b] && MIR_INTER_GET(v, b) && fn->vregs[b].in_register) {
+    MIR_INTER_FOR_EACH(v, b) {
+      if (fn->vregs[b].in_register) {
         used |= 1u << fn->vregs[b].phys;
       }
     }
@@ -1150,8 +1172,8 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
         continue;
       }
       uint32_t used = 0;
-      for (size_t b = 0; b < N; b++) {
-        if (colorable[b] && MIR_INTER_GET(d, b) && fn->vregs[b].in_register) {
+      MIR_INTER_FOR_EACH(d, b) {
+        if (fn->vregs[b].in_register) {
           used |= 1u << fn->vregs[b].phys;
         }
       }
@@ -1163,10 +1185,11 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
     }
   }
 
+#undef MIR_METRIC
 #undef MIR_INTER_SET
 #undef MIR_INTER_GET
   free(inter); free(mask); free(degree); free(cost); free(colorable);
-  free(removed); free(stack);
+  free(removed); free(reg_count); free(metric); free(stack);
   return 1;
 }
 

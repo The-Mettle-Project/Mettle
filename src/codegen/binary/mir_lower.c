@@ -4038,40 +4038,158 @@ typedef struct {
   int scale;
 } MirAddrFold;
 
-/* Number of instructions that READ temp `name`: any lhs/rhs operand, plus a
- * STORE's dest (its address). A producer's own dest is a definition, not a
- * read, so it is excluded. Used to confirm an address sub-expression feeds
- * nothing but the access before its producer is dropped. */
-static int mir_temp_read_count(const IRFunction *f, const char *name) {
-  int n = 0;
+/* Per-function index over TEMP names, recording for each temp how many
+ * instructions READ it and which instruction DEFINES it.
+ *
+ * A read is any lhs/rhs operand, plus a STORE's dest (that dest is the store's
+ * address, so it is read, not defined). A producer's own dest is a definition.
+ *
+ * The address- and compare-fold passes below ask both questions once per
+ * candidate access. Answering each by scanning the whole instruction list made
+ * those passes quadratic, with a strcmp per instruction visited -- profiling a
+ * 226k-line compile put that single call site at 3.8% of total wall clock, the
+ * largest source of strcmp in the compiler. One pass builds the index; each
+ * query is then a hash lookup. */
+typedef struct {
+  const char *name;
+  int reads;
+  long def_index; /* -1 until an instruction defines it */
+} MirTempUse;
+
+typedef struct {
+  MirTempUse *items;
+  size_t count;
+  size_t capacity;
+  size_t *buckets; /* open addressing over items: slot+1, 0 = empty */
+  size_t bucket_count;
+} MirTempUseIndex;
+
+static void mir_temp_use_destroy(MirTempUseIndex *ix) {
+  free(ix->items);
+  free(ix->buckets);
+  ix->items = NULL;
+  ix->buckets = NULL;
+  ix->count = ix->capacity = ix->bucket_count = 0;
+}
+
+/* Slot for `name`, appending an empty entry when absent. NULL only on OOM. */
+static MirTempUse *mir_temp_use_slot(MirTempUseIndex *ix, const char *name) {
+  size_t h = mettle_fnv1a_hash(name);
+  size_t b = h & (ix->bucket_count - 1);
+  while (ix->buckets[b]) {
+    MirTempUse *e = &ix->items[ix->buckets[b] - 1];
+    if (strcmp(e->name, name) == 0) {
+      return e;
+    }
+    b = (b + 1) & (ix->bucket_count - 1);
+  }
+  if (ix->count >= ix->capacity) {
+    size_t nc = ix->capacity ? ix->capacity * 2 : 32;
+    MirTempUse *grown = (MirTempUse *)realloc(ix->items, nc * sizeof(MirTempUse));
+    if (!grown) {
+      return NULL;
+    }
+    ix->items = grown;
+    ix->capacity = nc;
+  }
+  ix->items[ix->count].name = name;
+  ix->items[ix->count].reads = 0;
+  ix->items[ix->count].def_index = -1;
+  ix->count++;
+  ix->buckets[b] = ix->count;
+
+  if ((ix->count + 1) * 4 >= ix->bucket_count * 3) {
+    /* Rehash before the table gets dense enough for probes to lengthen. */
+    size_t nb = ix->bucket_count * 2;
+    size_t *fresh = (size_t *)calloc(nb, sizeof(size_t));
+    if (!fresh) {
+      return NULL;
+    }
+    for (size_t i = 0; i < ix->count; i++) {
+      size_t nbk = mettle_fnv1a_hash(ix->items[i].name) & (nb - 1);
+      while (fresh[nbk]) {
+        nbk = (nbk + 1) & (nb - 1);
+      }
+      fresh[nbk] = i + 1;
+    }
+    free(ix->buckets);
+    ix->buckets = fresh;
+    ix->bucket_count = nb;
+  }
+  return &ix->items[ix->count - 1];
+}
+
+static int mir_temp_use_build(const IRFunction *f, MirTempUseIndex *ix) {
+  memset(ix, 0, sizeof(*ix));
+  ix->bucket_count = 64;
+  while (ix->bucket_count < (f->instruction_count + 1) * 2) {
+    ix->bucket_count *= 2;
+  }
+  ix->buckets = (size_t *)calloc(ix->bucket_count, sizeof(size_t));
+  if (!ix->buckets) {
+    return 0;
+  }
   for (size_t i = 0; i < f->instruction_count; i++) {
     const IRInstruction *in = &f->instructions[i];
-    if (in->lhs.kind == IR_OPERAND_TEMP && in->lhs.name &&
-        strcmp(in->lhs.name, name) == 0) {
-      n++;
+    const IROperand *reads[3];
+    int nreads = 0;
+    if (in->lhs.kind == IR_OPERAND_TEMP && in->lhs.name) {
+      reads[nreads++] = &in->lhs;
     }
-    if (in->rhs.kind == IR_OPERAND_TEMP && in->rhs.name &&
-        strcmp(in->rhs.name, name) == 0) {
-      n++;
+    if (in->rhs.kind == IR_OPERAND_TEMP && in->rhs.name) {
+      reads[nreads++] = &in->rhs;
     }
     if (in->op == IR_OP_STORE && in->dest.kind == IR_OPERAND_TEMP &&
-        in->dest.name && strcmp(in->dest.name, name) == 0) {
-      n++;
+        in->dest.name) {
+      reads[nreads++] = &in->dest;
+    }
+    for (int k = 0; k < nreads; k++) {
+      MirTempUse *e = mir_temp_use_slot(ix, reads[k]->name);
+      if (!e) {
+        mir_temp_use_destroy(ix);
+        return 0;
+      }
+      e->reads++;
+    }
+    /* Any op with a TEMP dest, STORE included: the two queries are independent,
+     * and the scan this replaces treated a STORE's dest as both a read (its
+     * address) and a candidate definition. */
+    if (in->dest.kind == IR_OPERAND_TEMP && in->dest.name) {
+      MirTempUse *e = mir_temp_use_slot(ix, in->dest.name);
+      if (!e) {
+        mir_temp_use_destroy(ix);
+        return 0;
+      }
+      if (e->def_index < 0) {
+        e->def_index = (long)i; /* first definition wins, as the scan did */
+      }
     }
   }
-  return n;
+  return 1;
+}
+
+static const MirTempUse *mir_temp_use_find(const MirTempUseIndex *ix,
+                                           const char *name) {
+  size_t b = mettle_fnv1a_hash(name) & (ix->bucket_count - 1);
+  while (ix->buckets[b]) {
+    const MirTempUse *e = &ix->items[ix->buckets[b] - 1];
+    if (strcmp(e->name, name) == 0) {
+      return e;
+    }
+    b = (b + 1) & (ix->bucket_count - 1);
+  }
+  return NULL;
+}
+
+static int mir_temp_read_count(const MirTempUseIndex *ix, const char *name) {
+  const MirTempUse *e = mir_temp_use_find(ix, name);
+  return e ? e->reads : 0;
 }
 
 /* Index of the instruction whose dest defines temp `name`, or -1. */
-static long mir_temp_def_index(const IRFunction *f, const char *name) {
-  for (size_t i = 0; i < f->instruction_count; i++) {
-    const IRInstruction *in = &f->instructions[i];
-    if (in->dest.kind == IR_OPERAND_TEMP && in->dest.name &&
-        strcmp(in->dest.name, name) == 0) {
-      return (long)i;
-    }
-  }
-  return -1;
+static long mir_temp_def_index(const MirTempUseIndex *ix, const char *name) {
+  const MirTempUse *e = mir_temp_use_find(ix, name);
+  return e ? e->def_index : -1;
 }
 
 /* If `p` scales an index by a legal SIB factor (`idx << k`, k in 0..3, or
@@ -4121,7 +4239,9 @@ static int mir_decode_scale(const IRInstruction *p, IROperand *index,
  * compare. */
 static void mir_compute_const_compare_skips(CodeGenerator *g,
                                             BinaryFunctionContext *ctx,
-                                            IRFunction *f, char *skip) {
+                                            IRFunction *f,
+                                            const MirTempUseIndex *uses,
+                                            char *skip) {
   for (size_t i = 0; i + 1 < f->instruction_count; i++) {
     if (!mir_fuses_compare_branch(g, f, i)) {
       continue;
@@ -4134,21 +4254,18 @@ static void mir_compute_const_compare_skips(CodeGenerator *g,
     if (!mir_fused_cmp_imm(g, ctx, f, &cmp->rhs, &imm)) {
       continue;
     }
-    if (mir_temp_read_count(f, cmp->rhs.name) != 1) {
+    if (mir_temp_read_count(uses, cmp->rhs.name) != 1) {
       continue; /* bound temp feeds something else; keep its producer */
     }
-    for (size_t j = 0; j < f->instruction_count; j++) {
-      const IRInstruction *in = &f->instructions[j];
-      if (in->dest.kind == IR_OPERAND_TEMP && in->dest.name &&
-          strcmp(in->dest.name, cmp->rhs.name) == 0) {
-        skip[j] = 1;
-        break;
-      }
+    long def = mir_temp_def_index(uses, cmp->rhs.name);
+    if (def >= 0) {
+      skip[def] = 1;
     }
   }
 }
 
-static void mir_compute_address_folds(const IRFunction *f, char *skip,
+static void mir_compute_address_folds(const IRFunction *f,
+                                      const MirTempUseIndex *uses, char *skip,
                                       MirAddrFold *folds) {
   for (size_t i = 0; i < f->instruction_count; i++) {
     const IRInstruction *in = &f->instructions[i];
@@ -4165,10 +4282,10 @@ static void mir_compute_address_folds(const IRFunction *f, char *skip,
     }
     /* The address must feed only this access, or dropping its producer would
      * lose a value another instruction needs. */
-    if (mir_temp_read_count(f, addr->name) != 1) {
+    if (mir_temp_read_count(uses, addr->name) != 1) {
       continue;
     }
-    long ai = mir_temp_def_index(f, addr->name);
+    long ai = mir_temp_def_index(uses, addr->name);
     if (ai < 0) {
       continue;
     }
@@ -4187,10 +4304,10 @@ static void mir_compute_address_folds(const IRFunction *f, char *skip,
       if (scaled->kind != IR_OPERAND_TEMP || !scaled->name) {
         continue;
       }
-      if (mir_temp_read_count(f, scaled->name) != 1) {
+      if (mir_temp_read_count(uses, scaled->name) != 1) {
         continue;
       }
-      long si = mir_temp_def_index(f, scaled->name);
+      long si = mir_temp_def_index(uses, scaled->name);
       if (si < 0) {
         continue;
       }
@@ -5079,8 +5196,16 @@ int code_generator_binary_emit_function_via_mir(
       free(folds);
       goto oom;
     }
-    mir_compute_address_folds(ir_function, fold_skip, folds);
-    mir_compute_const_compare_skips(generator, context, ir_function, fold_skip);
+    MirTempUseIndex uses;
+    if (!mir_temp_use_build(ir_function, &uses)) {
+      free(fold_skip);
+      free(folds);
+      goto oom;
+    }
+    mir_compute_address_folds(ir_function, &uses, fold_skip, folds);
+    mir_compute_const_compare_skips(generator, context, ir_function, &uses,
+                                    fold_skip);
+    mir_temp_use_destroy(&uses);
   }
 
   for (size_t i = 0; i < ir_function->instruction_count; i++) {

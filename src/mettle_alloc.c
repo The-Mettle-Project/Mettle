@@ -1004,13 +1004,18 @@ void *realloc(void *ptr, size_t n) {
   }
 
   old = page_of(ptr)->bsize;
-  /* The case that matters: a geometrically growing buffer whose new size still
-   * lands in the same class. Returning the same block is what keeps repeated
-   * growth linear rather than quadratic in bytes copied. */
-  if (n <= old && (n > old / 2 || old <= 16 ||
-                   page_of(ptr)->seg->kind == SEG_HUGE))
-    return ptr;
 
+  /* Shrinking keeps the block. Relocating would trade a copy for memory the
+   * program had already committed at this buffer's high-water mark, so it cannot
+   * lower peak usage -- and judging "worth relocating" from the block size is
+   * actively wrong for a huge run, whose size is rounded up to whole segments
+   * and so overstates the request by up to 4MiB. */
+  if (n <= old) return ptr;
+
+  /* Growth past the class copies. Rounding the request up geometrically to
+   * absorb the next few appends was measured and made no difference on either
+   * large fixture -- four size-class steps per doubling already absorb
+   * incremental growth -- so the exact request is what gets allocated. */
   b = alloc_block(n);
   if (!b) return NULL;
   memcpy(b, ptr, n < old ? n : old);
