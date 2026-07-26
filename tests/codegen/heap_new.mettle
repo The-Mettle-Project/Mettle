@@ -1,0 +1,20 @@
+struct Node { v: int32; next: Node*; }
+struct Rgb { r: uint8; g: uint8; b: uint8; }
+extern fn free(p: cstring) = "free";
+fn main() -> int32 {
+  var n: Node* = new Node;
+  n->v = 42;
+  n->next = 0;
+  if (n->v != 42) { return 1; }
+  var m: Node* = new Node;
+  m->v = 1;
+  m->next = n;
+  if (m->next->v != 42) { return 2; }
+  var c: Rgb* = new Rgb;
+  c->r = 1; c->g = 2; c->b = 3;
+  if ((int32)c->r + (int32)c->g + (int32)c->b != 6) { return 3; }
+  free((cstring)c);
+  free((cstring)m);
+  free((cstring)n);
+  return 0;
+}

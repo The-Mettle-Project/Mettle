@@ -1,0 +1,22 @@
+struct Pair<A, B> { first: A; second: B; }
+@noinline fn maxof<T>(a: T, b: T) -> T { if (a > b) { return a; } return b; }
+@noinline fn swap<T>(a: T*, b: T*) -> void { var t: T = *a; *a = *b; *b = t; }
+fn main() -> int32 {
+  if (maxof<int32>(3, 7) != 7) { return 1; }
+  if (maxof<int64>(9, 2) != 9) { return 2; }
+  if (maxof<float64>(1.5, 2.5) != 2.5) { return 3; }
+  if (maxof<uint8>(200, 100) != 200) { return 4; }
+  var x: int32 = 1;
+  var y: int32 = 2;
+  swap<int32>(&x, &y);
+  if (x != 2 || y != 1) { return 5; }
+  var p: Pair<int32, float64>;
+  p.first = 5;
+  p.second = 0.5;
+  if (p.first != 5 || p.second != 0.5) { return 6; }
+  var q: Pair<uint8, uint8>;
+  q.first = 250;
+  q.second = 5;
+  if ((int32)q.first + (int32)q.second != 255) { return 7; }
+  return 0;
+}

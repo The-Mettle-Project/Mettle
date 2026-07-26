@@ -1,0 +1,26 @@
+@noinline fn sdiv(a: int32, b: int32) -> int32 { return a / b; }
+@noinline fn smod(a: int32, b: int32) -> int32 { return a % b; }
+@noinline fn shl(a: int32, n: int32) -> int32 { return a << n; }
+@noinline fn shr(a: int32, n: int32) -> int32 { return a >> n; }
+@noinline fn ushr(a: uint32, n: int32) -> uint32 { return a >> n; }
+@noinline fn udiv(a: uint32, b: uint32) -> uint32 { return a / b; }
+@noinline fn umod(a: uint32, b: uint32) -> uint32 { return a % b; }
+@noinline fn u64div(a: uint64, b: uint64) -> uint64 { return a / b; }
+@noinline fn ucmp(a: uint32, b: uint32) -> int32 { if (a > b) { return 1; } return 0; }
+@noinline fn u64cmp(a: uint64, b: uint64) -> int32 { if (a > b) { return 1; } return 0; }
+fn main() -> int32 {
+  if (sdiv(-7, 2) != -3) { return 1; }
+  if (smod(-7, 2) != -1) { return 2; }
+  if (sdiv(7, -2) != -3) { return 3; }
+  if (smod(7, -2) != 1) { return 4; }
+  if (shl(1, 31) != -2147483647 - 1) { return 5; }
+  if (shr(-8, 2) != -2) { return 6; }
+  if (ushr(4294967288, 2) != 1073741822) { return 7; }
+  if (udiv(4294967295, 3) != 1431655765) { return 8; }
+  if (umod(4294967295, 7) != 3) { return 9; }
+  if (u64div(9223372036854775807, 3) != 3074457345618258602) { return 10; }
+  if (ucmp(4294967295, 1) != 1) { return 11; }
+  if (u64cmp(9223372036854775807, 1) != 1) { return 12; }
+  if (sdiv(-2147483647 - 1, 1) != -2147483647 - 1) { return 13; }
+  return 0;
+}

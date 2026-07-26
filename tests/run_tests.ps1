@@ -8411,7 +8411,49 @@ $runFixtures = @(
   @{ Name = "struct_ret_sizes"; Path = "tests/codegen/struct_ret_sizes.mettle"
      What = "a struct return of some size class came back wrong" },
   @{ Name = "call_chains"; Path = "tests/codegen/call_chains.mettle"
-     What = "a nested call passed something wrong" }
+     What = "a nested call passed something wrong" },
+  @{ Name = "float_conv"; Path = "tests/codegen/float_conv.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "unsigned_loops"; Path = "tests/codegen/unsigned_loops.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "defer_scopes"; Path = "tests/codegen/defer_scopes.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "generic_structs"; Path = "tests/codegen/generic_structs.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "simd_loops"; Path = "tests/codegen/simd_loops.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "switch_dense"; Path = "tests/codegen/switch_dense.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "enums_match"; Path = "tests/codegen/enums_match.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "pointers"; Path = "tests/codegen/pointers.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "casts"; Path = "tests/codegen/casts.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "int_edges"; Path = "tests/codegen/int_edges.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "funcptr"; Path = "tests/codegen/funcptr.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "control_flow"; Path = "tests/codegen/control_flow.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "reg_pressure"; Path = "tests/codegen/reg_pressure.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "scalar_params"; Path = "tests/codegen/scalar_params.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "struct_byval"; Path = "tests/codegen/struct_byval.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "heap_new"; Path = "tests/codegen/heap_new.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "global_arrays"; Path = "tests/codegen/global_arrays.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "strings"; Path = "tests/codegen/strings.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "nested_data"; Path = "tests/codegen/nested_data.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "methods"; Path = "tests/codegen/methods.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "generics_mono"; Path = "tests/codegen/generics_mono.mettle"
+     What = "a codegen check failed" }
 )
 foreach ($fixture in $runFixtures) {
   foreach ($mode in @(@{ Name = "debug"; Args = @() },

@@ -1062,6 +1062,21 @@ static void substitute_types_in_ast(ASTNode *node, char **param_names,
     }
     break;
   }
+  case AST_CAST_EXPRESSION: {
+    CastExpression *ce = (CastExpression *)node->data;
+    if (ce) {
+      if (ce->type_name) {
+        char *new_type = substitute_type_string(ce->type_name, param_names,
+                                                arg_names, count, ctx);
+        if (new_type) {
+          mettle_free_string(ce->type_name);
+          ce->type_name = new_type;
+        }
+      }
+      substitute_types_in_ast(ce->operand, param_names, arg_names, count, ctx);
+    }
+    break;
+  }
   case AST_BINARY_EXPRESSION: {
     BinaryExpression *be = (BinaryExpression *)node->data;
     if (be) {
@@ -1348,6 +1363,12 @@ static void collect_type_instantiations(ASTNode *node, MonoContext *ctx) {
     }
     break;
   }
+  case AST_CAST_EXPRESSION: {
+    CastExpression *ce = (CastExpression *)node->data;
+    if (ce && ce->operand)
+      collect_type_instantiations(ce->operand, ctx);
+    break;
+  }
   case AST_BINARY_EXPRESSION: {
     BinaryExpression *be = (BinaryExpression *)node->data;
     if (be) {
@@ -1596,6 +1617,12 @@ static void rewrite_generic_references(ASTNode *node, MonoContext *ctx) {
       if (cc->body)
         rewrite_generic_references(cc->body, ctx);
     }
+    break;
+  }
+  case AST_CAST_EXPRESSION: {
+    CastExpression *ce = (CastExpression *)node->data;
+    if (ce && ce->operand)
+      rewrite_generic_references(ce->operand, ctx);
     break;
   }
   case AST_BINARY_EXPRESSION: {

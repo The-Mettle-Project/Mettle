@@ -1,0 +1,20 @@
+struct Pt { x: int32; y: int32; }
+struct Rgb { r: uint8; g: uint8; b: uint8; }
+const PTS: Pt[3] = [{ x: 1, y: 2 }, { x: 3, y: 4 }, { x: 5, y: 6 }];
+const COLORS: Rgb[2] = [{ r: 1, g: 2, b: 3 }, { r: 4, g: 5, b: 6 }];
+const NUMS: int32[8] = [1, 2, 3, 4, 5, 6, 7, 8];
+const ZEROS: uint8[16] = [0; 16];
+const F: float64[3] = [1.5, 2.5, 3.5];
+var MUT: int32[4] = [9, 9, 9, 9];
+fn main() -> int32 {
+  if (PTS[0].x + PTS[1].y + PTS[2].x != 1 + 4 + 5) { return 1; }
+  if ((int32)COLORS[1].g != 5) { return 2; }
+  var t: int32 = 0;
+  for i in 0..8 { t = t + NUMS[i]; }
+  if (t != 36) { return 3; }
+  for i in 0..16 { if (ZEROS[i] != 0) { return 4; } }
+  if (F[0] + F[1] + F[2] != 7.5) { return 5; }
+  MUT[2] = 1;
+  if (MUT[2] != 1 || MUT[0] != 9) { return 6; }
+  return 0;
+}
