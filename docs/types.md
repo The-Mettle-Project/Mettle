@@ -306,12 +306,16 @@ struct Pair<A, B> {
   second: B;
 }
 
-function identity<T>(x: T) -> T {
+fn identity<T>(x: T) -> T {
   return x;
 }
 
-var p: Pair<int32, int32>;           // struct instantiation
-var n: int32 = identity<int32>(42);  // function call with type args
+fn main() -> int32 {
+  var p: Pair<int32, int32>;           // struct instantiation
+  var n: int32 = identity<int32>(42);  // function call with type args
+  p.first = n;
+  return p.first;
+}
 ```
 
 The compiler performs **monomorphization** before type checking: each unique instantiation becomes a concrete type or function. There is no runtime generics; all type parameters are resolved at compile time.
@@ -329,7 +333,7 @@ impl Incrementable for int32 {
   }
 }
 
-function bump<T>(x: T) -> T where T: Incrementable {
+fn bump<T>(x: T) -> T where T: Incrementable {
   return x.next_value();
 }
 ```

@@ -1,0 +1,58 @@
+// Every global initializer shape the module lowering can fold to bytes in the
+// object file. A global has no initializer to run, so each of these is laid out
+// at compile time; a shape that stops folding here used to reach codegen and
+// fail as an internal compiler error with no source location.
+//
+// `main` returns 0 only when every folded value is the expected one, so the
+// harness runs the binary rather than only compiling it. This cannot be a @test:
+// the compile-time interpreter does not model global `var` initializers (it
+// reads them as zero), though it does fold a global `const`.
+//
+// tests/err_global_init_*.mettle cover the reject side.
+
+struct Pt {
+  x: int32;
+  y: int32;
+}
+
+enum Status {
+  Ok = 0,
+  Error = 1
+}
+
+fn target() -> int32 { return 3; }
+
+const K: int32 = 5;
+
+var g_num:    int32   = 42;
+var g_expr:   int32   = K * 2 + 1;
+var g_float:  float64 = 1.5 * 2.0;
+var g_cast:   int32   = (int32)3.9;
+var g_neg:    int32   = -K;
+var g_sizeof: int64   = sizeof(Pt);       // a call node, but a constant one
+var g_str:    string  = "ready";
+var g_enum:   Status  = Ok;               // enum member: a frontend constant
+var g_null:   int32*  = 0;
+var g_fnptr:  fn() -> int32 = &target;    // link-time address, a relocation
+var g_addr:   int32*  = &g_num;
+
+var g_zero:   int32;                      // .bss, so its value is 0
+var g_from_zero: int32 = g_zero + 1;      // ... and that folds to 1
+var g_chain:  int32 = g_num + 1;          // an earlier global's folded value
+
+fn main() -> int32 {
+  if (g_num != 42) { return 1; }
+  if (g_expr != 11) { return 2; }
+  if ((int64)g_float != 3) { return 3; }
+  if (g_cast != 3) { return 4; }
+  if (g_neg != -5) { return 5; }
+  if (g_sizeof != 8) { return 6; }
+  if ((int32)g_enum != 0) { return 7; }
+  if (g_null != 0) { return 8; }
+  if (g_fnptr() != 3) { return 9; }
+  if (*g_addr != 42) { return 10; }
+  if (g_zero != 0) { return 11; }
+  if (g_from_zero != 1) { return 12; }
+  if (g_chain != 43) { return 13; }
+  return 0;
+}

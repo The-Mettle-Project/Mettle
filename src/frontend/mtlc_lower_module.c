@@ -5,6 +5,7 @@
 #include "frontend/mtlc_frontend.h" // mtlc_type_from_frontend
 #include "common.h"                 // mettle_fnv1a_hash
 
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -187,6 +188,15 @@ static int module_symbol_numeric(const IRProgram *program, const char *name,
     }
     return 1;
   }
+  /* A global we own with no initializer is .bss, so its compile-time value is
+   * zero -- `var a: int32; var b: int32 = a + 1;` lays out b as 1, the value it
+   * would hold at load. An extern's storage belongs to another object and an
+   * unfoldable initializer has already failed, so neither folds. */
+  if (s->kind == IR_MODSYM_VARIABLE && !s->is_extern && !s->has_initializer &&
+      !s->has_unfoldable_initializer && !s->init_symbol_ref && !s->init_bytes) {
+    num_from_int(out, 0);
+    return 1;
+  }
   return 0;
 }
 
@@ -218,12 +228,40 @@ static const char *lower_module_address_of_symbol_name(ASTNode *expression) {
   return identifier->name;
 }
 
-static int eval_numeric(const IRProgram *program, ASTNode *expression,
+static int eval_numeric(const IRProgram *program, TypeChecker *tc,
+                        SymbolTable *st, ASTNode *expression,
                         NumConst *out) {
   if (!expression || !out) {
     return 0;
   }
   switch (expression->type) {
+  case AST_FUNCTION_CALL: {
+    /* `sizeof(T)` is a compile-time integer, so it can initialize a global just
+     * as it can a const. It reaches here as a call node rather than a literal
+     * (see ir_lower_expr.c), and without this case it would be reported
+     * unfoldable and fail in codegen with no source location. No other call is
+     * foldable: there is no module initializer to run one in. */
+    CallExpression *call = (CallExpression *)expression->data;
+    Identifier *type_id = NULL;
+    Type *sized = NULL;
+    if (!call || !call->function_name ||
+        strcmp(call->function_name, "sizeof") != 0) {
+      return 0;
+    }
+    if (call->argument_count != 1 || !call->arguments || !call->arguments[0] ||
+        call->arguments[0]->type != AST_IDENTIFIER) {
+      return 0;
+    }
+    type_id = (Identifier *)call->arguments[0]->data;
+    sized = (tc && type_id && type_id->name)
+                ? type_checker_get_type_by_name(tc, type_id->name)
+                : NULL;
+    if (!sized || sized->size > (size_t)LLONG_MAX) {
+      return 0;
+    }
+    num_from_int(out, (long long)sized->size);
+    return 1;
+  }
   case AST_NUMBER_LITERAL: {
     NumberLiteral *literal = (NumberLiteral *)expression->data;
     if (!literal) {
@@ -238,14 +276,28 @@ static int eval_numeric(const IRProgram *program, ASTNode *expression,
   }
   case AST_IDENTIFIER: {
     Identifier *identifier = (Identifier *)expression->data;
-    return identifier && identifier->name &&
-           module_symbol_numeric(program, identifier->name, out);
+    Symbol *symbol = NULL;
+    if (!identifier || !identifier->name) {
+      return 0;
+    }
+    if (module_symbol_numeric(program, identifier->name, out)) {
+      return 1;
+    }
+    /* An enum member is a frontend constant, not a module symbol, so it never
+     * reaches the module table -- resolve it here so `var s: Status = Ok;`
+     * lays out its discriminant. */
+    symbol = st ? symbol_table_lookup(st, identifier->name) : NULL;
+    if (symbol && symbol->kind == SYMBOL_CONSTANT) {
+      num_from_int(out, symbol->data.constant.value);
+      return 1;
+    }
+    return 0;
   }
   case AST_UNARY_EXPRESSION: {
     UnaryExpression *unary = (UnaryExpression *)expression->data;
     NumConst operand = {0};
     if (!unary || !unary->operator|| !unary->operand ||
-        !eval_numeric(program, unary->operand, &operand)) {
+        !eval_numeric(program, tc, st, unary->operand, &operand)) {
       return 0;
     }
     if (strcmp(unary->operator, "+") == 0) {
@@ -278,8 +330,8 @@ static int eval_numeric(const IRProgram *program, ASTNode *expression,
     NumConst left = {0};
     NumConst right = {0};
     if (!binary || !binary->operator|| !binary->left || !binary->right ||
-        !eval_numeric(program, binary->left, &left) ||
-        !eval_numeric(program, binary->right, &right)) {
+        !eval_numeric(program, tc, st, binary->left, &left) ||
+        !eval_numeric(program, tc, st, binary->right, &right)) {
       return 0;
     }
     if (left.is_float || right.is_float || num_is_float(NULL, expression)) {
@@ -360,7 +412,7 @@ static int eval_numeric(const IRProgram *program, ASTNode *expression,
     CastExpression *cast = (CastExpression *)expression->data;
     NumConst operand = {0};
     if (!cast || !cast->operand ||
-        !eval_numeric(program, cast->operand, &operand)) {
+        !eval_numeric(program, tc, st, cast->operand, &operand)) {
       return 0;
     }
     int target_float_bits =
@@ -568,7 +620,7 @@ static void populate_module_symbols(IRProgram *program, ASTNode *ast_program,
           } else {
             NumConst c = {0};
             const char *addressed = lower_module_address_of_symbol_name(vd->initializer);
-            if (eval_numeric(program, vd->initializer, &c)) {
+            if (eval_numeric(program, tc, st, vd->initializer, &c)) {
               entry.has_initializer = 1;
               entry.init_is_float = c.is_float;
               if (c.is_float) {

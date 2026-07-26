@@ -2305,6 +2305,14 @@ static int parser_try_parse_generic_call_type_args(Parser *parser,
 
   ParserSavedState saved = parser_save_state(parser);
   parser->error_message = NULL;
+  // This is a speculative parse: `<` after an identifier is far more often a
+  // comparison than a type-argument list. Detach the reporter first, exactly as
+  // parser_parse_cast_expression does, so a failed speculation leaves no
+  // diagnostic behind - parser_restore_state alone cannot retract one that has
+  // already been handed to the reporter. Without this, `v < fields[i].range.lo`
+  // backtracks and reparses correctly but still fails the build with the
+  // speculation's "Expected array size after '['".
+  parser->error_reporter = NULL;
 
   parser_advance(parser); // consume '<'
 
@@ -2338,6 +2346,7 @@ static int parser_try_parse_generic_call_type_args(Parser *parser,
     if (parser->current_token.type == TOKEN_LPAREN) {
       *out_type_args = type_args;
       *out_type_arg_count = type_arg_count;
+      parser->error_reporter = saved.error_reporter;
       parser_discard_saved_state(&saved);
       parser->has_error = 0;
       free(parser->error_message);

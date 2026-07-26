@@ -662,6 +662,24 @@ $cases = @(
   @{ Name = "err_const_no_init"; Path = "tests/err_const_no_init.mettle"; ShouldSucceed = $false; Pattern = "Constant declaration requires an initializer" },
   @{ Name = "err_const_assign"; Path = "tests/err_const_assign.mettle"; ShouldSucceed = $false; Pattern = "is a constant and cannot be assigned to" },
   @{ Name = "err_const_nonconst"; Path = "tests/err_const_nonconst.mettle"; ShouldSucceed = $false; Pattern = "compile-time integer constant expression" },
+  # A global is laid out at compile time and there is no module initializer, so a
+  # run-time initializer must be a diagnostic with a source location - it used to
+  # reach the direct-object backend and abort as an internal compiler error.
+  @{ Name = "err_global_init_call"; Path = "tests/err_global_init_call.mettle"; ShouldSucceed = $false
+     Pattern = "a global's initializer must be known at compile time"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_global_init_new"; Path = "tests/err_global_init_new.mettle"; ShouldSucceed = $false
+     Pattern = "a global's initializer must be known at compile time"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_global_init_extern"; Path = "tests/err_global_init_extern.mettle"; ShouldSucceed = $false
+     Pattern = "a global's initializer must be known at compile time"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_global_init_string_concat"; Path = "tests/err_global_init_string_concat.mettle"; ShouldSucceed = $false
+     Pattern = "a global's initializer must be known at compile time"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_global_init_address_arith"; Path = "tests/err_global_init_address_arith.mettle"; ShouldSucceed = $false
+     Pattern = "a global's initializer must be known at compile time"
+     OutputMustNotMatch = @("internal compiler error") },
   @{ Name = "err_import_guard_bad_platform"; Path = "tests/err_import_guard_bad_platform.mettle"; ShouldSucceed = $false; Pattern = "Import guard platform must be 'windows' or 'linux'" },
   @{ Name = "block_comment"; Path = "tests/test_block_comment.mettle"; ShouldSucceed = $true },
   @{ Name = "compound_assign"; Path = "tests/test_compound_assign.mettle"; ShouldSucceed = $true },
@@ -1494,6 +1512,15 @@ $cases = @(
   @{ Name = "err_trait_bound_missing_second_impl"; Path = "tests/err_trait_bound_missing_second_impl.mettle"; ShouldSucceed = $false; Pattern = "does not implement trait 'SignedNumber'" },
   @{ Name = "err_trait_method_missing_impl"; Path = "tests/err_trait_method_missing_impl.mettle"; ShouldSucceed = $false; Pattern = "missing trait method 'next_value'" },
   @{ Name = "err_generics_generic_fn_ptr_address"; Path = "tests/err_generics_generic_fn_ptr_address.mettle"; ShouldSucceed = $false; Pattern = "Expected primary expression" },
+  # A `<` comparison whose right side makes the speculative type-argument parse
+  # fail must backtrack without leaving the abandoned parse's diagnostic behind.
+  @{ Name = "generic_call_lt_ambiguity"; Path = "tests/generic_call_lt_ambiguity.mettle"; ShouldSucceed = $true
+     Args = @("test")
+     SkipBinaryCheck = $true
+     OutputMustMatch = @("3 passed")
+     OutputMustNotMatch = @("Expected array size after", "error\[E0002\]") },
+  @{ Name = "generic_call_lt_ambiguity_build"; Path = "tests/generic_call_lt_ambiguity.mettle"; ShouldSucceed = $true
+     OutputMustNotMatch = @("Expected array size after", "error\[E0002\]") },
   @{ Name = "err_member_on_non_struct"; Path = "tests/err_member_on_non_struct.mettle"; ShouldSucceed = $false; Pattern = "Cannot access field on non-struct type" },
   @{ Name = "err_switch_multiple_default"; Path = "tests/err_switch_multiple_default.mettle"; ShouldSucceed = $false; Pattern = "Only one default case is allowed|only contain one default clause" },
   @{ Name = "err_return_type_mismatch"; Path = "tests/err_return_type_mismatch.mettle"; ShouldSucceed = $false; Pattern = "Type mismatch" },
@@ -1627,10 +1654,16 @@ foreach ($case in $cases) {
         }
         $usesEmitObj = $caseArgs -contains "--emit-obj"
 
-        $binaryCheck = Test-BinaryOutput -BinaryPath $outFile
-        if (-not $binaryCheck.Passed) {
-          $passed = $false
-          $reason = $binaryCheck.Reason
+        # `mettle test` and `mettle trace` run in the compiler's interpreter and
+        # emit no artifact, so a passing case in those modes has no binary to
+        # check. SkipBinaryCheck lets such a case assert on output alone.
+        $skipBinaryCheck = $case.ContainsKey("SkipBinaryCheck") -and $case.SkipBinaryCheck
+        if (-not $skipBinaryCheck) {
+          $binaryCheck = Test-BinaryOutput -BinaryPath $outFile
+          if (-not $binaryCheck.Passed) {
+            $passed = $false
+            $reason = $binaryCheck.Reason
+          }
         }
         if ($passed) {
           foreach ($pattern in $requiredOutputPatterns) {
@@ -1717,7 +1750,7 @@ foreach ($case in $cases) {
             }
           }
         }
-        if ($passed -and -not $SkipDeterminism -and
+        if ($passed -and -not $SkipDeterminism -and -not $skipBinaryCheck -and
             -not ($case.ContainsKey("SkipDeterminism") -and $case.SkipDeterminism)) {
           $outFile2 = Join-Path $tmpDir ("{0}.second.obj" -f $case.Name)
           if (Test-Path $outFile2) {
@@ -8352,6 +8385,39 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "ptx_emit_gb10_tensor_pipeline" -Passed $false -Reason $_.Exception.Message
+}
+
+# Global initializers that fold: every shape module lowering can lay out as
+# bytes (numeric constant expressions, sizeof, an enum member, a string literal,
+# `&name`, a zero-filled .bss global, an earlier global's folded value). The
+# fixture's main returns a distinct nonzero code per wrong value, so this runs
+# the binary rather than only compiling it - a shape that silently folded to the
+# wrong constant would still compile. It cannot be a @test: the compile-time
+# interpreter does not model global `var` initializers.
+foreach ($globalInitMode in @(@{ Name = "debug"; Args = @() },
+                              @{ Name = "release"; Args = @("--release") })) {
+  try {
+    $total++
+    $caseName = "global_init_layoutable_$($globalInitMode.Name)"
+    $globalInitExe = Join-Path $tmpDir "$caseName.exe"
+    $globalInitOut = & $CompilerPath --build @($globalInitMode.Args) `
+      tests/global_init_layoutable.mettle -o $globalInitExe 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "compile failed: $globalInitOut"
+    }
+    if ($globalInitOut -match "internal compiler error") {
+      throw "compile reported an internal compiler error: $globalInitOut"
+    }
+    & $globalInitExe | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "a global folded to the wrong value (fixture check #$LASTEXITCODE)"
+    }
+    Write-CaseResult -Name $caseName -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name $caseName -Passed $false -Reason $_.Exception.Message
+  }
 }
 
 # SPIR-V backend validity gate. Emits the self-contained GPU compute-kernel

@@ -1,0 +1,11 @@
+// `new` allocates at run time, so it cannot initialize a global.
+
+struct Node {
+  value: int32;
+}
+
+var root: Node* = new Node;
+
+fn main() -> int32 {
+  return 0;
+}

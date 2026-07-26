@@ -125,10 +125,10 @@ non-speculation-safe function `@pure` is a program error.
 
 ## Generic Functions
 
-Functions can declare type parameters in angle brackets before the parameter list. Call sites must provide type arguments: `f<T>(args)` or `f<int32>(args)`.
+Functions can declare type parameters in angle brackets before the parameter list. A generic function is declared with `fn`, like any other; there is no separate `function` keyword. Call sites must provide type arguments: `f<T>(args)` or `f<int32>(args)`.
 
 ```mettle
-function swap<T>(a: T*, b: T*) -> void {
+fn swap<T>(a: T*, b: T*) -> void {
   var tmp: T = *a;
   *a = *b;
   *b = tmp;

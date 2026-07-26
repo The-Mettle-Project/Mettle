@@ -27,6 +27,84 @@ static int gpu_kernel_scalar_type(const Type *type) {
   }
 }
 
+/* Can this expression become bytes in the object file's data section?
+ *
+ * A global has no initializer to run: its value is laid out at compile time, so
+ * the initializer must be one of the shapes module lowering can fold. This
+ * mirrors eval_numeric in src/frontend/mtlc_lower_module.c structurally (it does
+ * not evaluate - folding still happens there, and a shape accepted here that
+ * turns out not to fold is still caught downstream). Keep the two in step: a
+ * shape added to eval_numeric belongs here too, or it gets rejected with a
+ * misleading diagnostic. */
+static int layoutable_global_initializer(TypeChecker *checker,
+                                         const Type *declared,
+                                         const ASTNode *expression,
+                                         int top_level) {
+  if (!expression) {
+    return 1; /* no initializer: nothing to lay out */
+  }
+
+  /* A string global stores a pointer to one string literal's storage. There is
+   * nowhere to run a concatenation, so nothing else qualifies. */
+  if (declared && declared->kind == TYPE_STRING) {
+    return expression->type == AST_STRING_LITERAL;
+  }
+
+  switch (expression->type) {
+  case AST_NUMBER_LITERAL:
+  case AST_STRING_LITERAL:
+    return 1;
+  /* Another global's folded value, a global const, or an enum member. An
+   * extern's storage lives in another object file, so its value is not ours to
+   * read at layout time. */
+  case AST_IDENTIFIER: {
+    const Identifier *identifier = (const Identifier *)expression->data;
+    const Symbol *symbol =
+        (checker && identifier && identifier->name)
+            ? symbol_table_lookup(checker->symbol_table, identifier->name)
+            : NULL;
+    return !symbol || !symbol->is_extern;
+  }
+  case AST_UNARY_EXPRESSION: {
+    const UnaryExpression *unary = (const UnaryExpression *)expression->data;
+    if (!unary || !unary->operator|| !unary->operand) {
+      return 0;
+    }
+    /* `&name` becomes a relocation filling the whole slot, so it is the entire
+     * initializer or nothing: there is no addend for `&name + 1`. */
+    if (strcmp(unary->operator, "&") == 0) {
+      return top_level && unary->operand->type == AST_IDENTIFIER;
+    }
+    if (strcmp(unary->operator, "+") == 0 ||
+        strcmp(unary->operator, "-") == 0 ||
+        strcmp(unary->operator, "!") == 0 ||
+        strcmp(unary->operator, "~") == 0) {
+      return layoutable_global_initializer(checker, declared, unary->operand, 0);
+    }
+    return 0;
+  }
+  case AST_BINARY_EXPRESSION: {
+    const BinaryExpression *binary = (const BinaryExpression *)expression->data;
+    return binary && binary->left && binary->right &&
+           layoutable_global_initializer(checker, declared, binary->left, 0) &&
+           layoutable_global_initializer(checker, declared, binary->right, 0);
+  }
+  case AST_CAST_EXPRESSION: {
+    const CastExpression *cast = (const CastExpression *)expression->data;
+    return cast && cast->operand &&
+           layoutable_global_initializer(checker, declared, cast->operand, 0);
+  }
+  /* `sizeof(T)` is a compile-time integer; every other call needs to run. */
+  case AST_FUNCTION_CALL: {
+    const CallExpression *call = (const CallExpression *)expression->data;
+    return call && call->function_name &&
+           strcmp(call->function_name, "sizeof") == 0;
+  }
+  default:
+    return 0;
+  }
+}
+
 static int gpu_kernel_parameter_type(const Type *type) {
   if (!type) {
     return 0;
@@ -746,6 +824,33 @@ int type_checker_process_declaration(TypeChecker *checker,
           var_decl->name, var_type->name ? var_type->name : "?");
       /* Register the binding anyway so later uses do not pile on with
        * "undefined variable"; the declaration itself has already failed. */
+      checker->has_error = 1;
+      poisoned = 1;
+    }
+
+    /* The same rule for a scalar global. Its initializer is folded to bytes in
+     * the object file, so it has to be one of the shapes the module lowering
+     * can fold (see eval_numeric in mtlc_lower_module.c): a numeric constant
+     * expression, `sizeof(T)`, `&name`, or a string literal. Anything else -- a
+     * call, `new`, an index or member access, string concatenation -- is a
+     * run-time value with nothing to lay out. Rejected here so the report
+     * carries a source location instead of failing as an internal compiler
+     * error in codegen. */
+    if (!poisoned && var_decl->initializer && !var_decl->is_extern && var_type &&
+        var_type->kind != TYPE_STRUCT && var_type->kind != TYPE_ARRAY &&
+        (!current_scope || current_scope->type == SCOPE_GLOBAL) &&
+        /* An integer `const` gets the more specific diagnostic from its own
+         * fold below; everything else lands here. */
+        !(var_decl->is_const && type_checker_is_integer_type(var_type)) &&
+        !layoutable_global_initializer(checker, var_type, var_decl->initializer,
+                                      1)) {
+      type_checker_set_error_at_location(
+          checker, var_decl->initializer->location,
+          "a global's initializer must be known at compile time; '%s' is "
+          "initialized with a value that is only available at run time. Move "
+          "the initialization into a function, or make the initializer a "
+          "constant expression",
+          var_decl->name);
       checker->has_error = 1;
       poisoned = 1;
     }

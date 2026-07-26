@@ -380,7 +380,7 @@ struct Pair<A, B> {
   second: B;
 }
 
-function swap<T>(a: T*, b: T*) -> void {
+fn swap<T>(a: T*, b: T*) -> void {
   var tmp: T = *a;
   *a = *b;
   *b = tmp;

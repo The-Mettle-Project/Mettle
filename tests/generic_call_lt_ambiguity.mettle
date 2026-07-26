@@ -1,0 +1,69 @@
+// `<` after an identifier starts a speculative parse of a generic call's type
+// argument list. When that speculation fails the parser backtracks and reparses
+// the `<` as a comparison - but it used to leave the speculation's diagnostic
+// behind in the error reporter, so a correct comparison failed the build with
+// an error from a parse that was abandoned:
+//
+//   if (v < bounds[i].lo)   ->   error: Expected array size after '['
+//
+// Each shape below both parses and evaluates, so a silent misparse fails too.
+
+struct Range {
+  lo: int32;
+  hi: int32;
+}
+
+const BOUNDS: Range[3] = [
+  { lo: 1, hi: 65535 }, { lo: 1, hi: 256 }, { lo: 100, hi: 30000 }
+];
+
+fn id<T>(x: T) -> T { return x; }
+
+// The reported case: an indexed field access on the right of `<`.
+fn first_violation(values: int32*, bounds: Range*, n: int32) -> int32 {
+  for i in 0..n {
+    var v: int32 = values[i];
+    if (v < bounds[i].lo || v > bounds[i].hi) { return i; }
+  }
+  return -1;
+}
+
+// Other right-hand shapes that make the type-argument parse fail partway.
+fn shapes(a: int32, b: int32*, n: int32) -> int32 {
+  var total: int32 = 0;
+  if (a < b[0]) { total = total + 1; }
+  if (a < n * 2) { total = total + 2; }
+  if (a < b[n - 1] && n > 0) { total = total + 4; }
+  if (a < b[2] - b[0]) { total = total + 8; }
+  return total;
+}
+
+@test fn test_indexed_field_compare() -> int64 {
+  var good: int32[3] = [1000, 50, 20000];
+  var slow: int32[3] = [8080, 8, 90000];
+  var dead: int32[3] = [0, 0, 0];
+  assert_eq(first_violation(&good[0], &BOUNDS[0], 3), -1);
+  assert_eq(first_violation(&slow[0], &BOUNDS[0], 3), 2);
+  assert_eq(first_violation(&dead[0], &BOUNDS[0], 3), 0);
+  return 0;
+}
+
+@test fn test_backtracked_shapes() -> int64 {
+  var b: int32[3] = [5, 6, 7];
+  assert_eq(shapes(1, &b[0], 3), 15);
+  assert_eq(shapes(9, &b[0], 3), 0);
+  return 0;
+}
+
+// A real generic call still parses as one, so the speculation is not simply
+// disabled.
+@test fn test_generic_call_still_works() -> int64 {
+  assert_eq(id<int32>(7), 7);
+  assert_eq(id<int64>(9), 9);
+  return 0;
+}
+
+fn main() -> int32 {
+  var b: int32[3] = [5, 6, 7];
+  return shapes(9, &b[0], 3) + id<int32>(0);
+}
