@@ -1,0 +1,112 @@
+// A `/` and a `%` of the SAME operands, fused into one divide.
+//
+// The backend emits one divide for such a pair and reads both results out of
+// their fixed registers -- the quotient from RAX, the remainder from RDX. That
+// second read is the only place in the MIR where a physical register is
+// consumed as an instruction SOURCE rather than written as a destination, and
+// the register allocator used to model only the write direction. Nothing
+// stopped it parking the quotient in RDX, and the encoder's `mov rdx, rax` then
+// overwrote the remainder before anything read it: `x % d` silently evaluated
+// to `x / d`, and a checksum came out at exactly twice the quotient sum.
+//
+// The helpers are deliberately NOT @noinline. The miscompile needs the loop to
+// see its inputs as constants -- that is what leaves enough of the volatile
+// RAX/RCX/RDX tier free for the allocator to reach for RDX in the first place.
+// Taking the same values as opaque parameters keeps the quotient in a
+// callee-saved register and the bug does not appear, so a @noinline version of
+// this file passes even on a compiler that has it.
+//
+// Only the release build can fail here: the MIR backend is release-only, and
+// debug goes through the baseline emitter, which gives every value a stack home
+// and so never had the conflict. The debug run is kept for the same reason the
+// other fixtures keep theirs -- it covers the other backend.
+//
+// main returns 0 when every check passes, or the number of the failing check.
+
+fn u64_pair(x0: uint64, n: uint64) -> uint64 {
+  var acc: uint64 = 0;
+  var x: uint64 = x0;
+  var i: uint64 = 1;
+  while (i <= n) {
+    var d: uint64 = (i & 1023) + 3;
+    acc = acc + (x % d);
+    acc = acc + (x / d);
+    x = x + 1099511628211;
+    i = i + 1;
+  }
+  return acc;
+}
+
+fn i64_pair(x0: int64, n: int64) -> int64 {
+  var acc: int64 = 0;
+  var x: int64 = x0;
+  var i: int64 = 1;
+  while (i <= n) {
+    var d: int64 = (i & 63) + 3;
+    acc = acc + (x % d);
+    acc = acc + (x / d);
+    x = x - 7919;
+    i = i + 1;
+  }
+  return acc;
+}
+
+fn i32_pair(x0: int32, n: int32) -> int64 {
+  var acc: int64 = 0;
+  var x: int32 = x0;
+  var i: int32 = 1;
+  while (i <= n) {
+    var d: int32 = (i & 31) + 3;
+    acc = acc + (int64)(x % d);
+    acc = acc + (int64)(x / d);
+    x = x + 104729;
+    i = i + 1;
+  }
+  return acc;
+}
+
+// Four more values live across the divide, so the volatile tier is under real
+// demand rather than merely available.
+fn pressure_pair(x0: uint64, n: uint64, a: uint64, b: uint64, c: uint64,
+                 e: uint64) -> uint64 {
+  var acc: uint64 = 0;
+  var x: uint64 = x0;
+  var i: uint64 = 1;
+  while (i <= n) {
+    var d: uint64 = (i & 255) + 5;
+    acc = acc + (x % d);
+    acc = acc + (x / d);
+    acc = acc + (a ^ i) + (b ^ i) + (c ^ i) + (e ^ i);
+    x = x + 2654435761;
+    i = i + 1;
+  }
+  return acc + a + b + c + e;
+}
+
+fn main() -> int32 {
+  // Four iterations is what the original report reduced to; 300 also walks the
+  // whole divisor range rather than the first four values of it.
+  if (u64_pair(1469598103934665603, 4) != 1116195807994895547) { return 1; }
+  if (u64_pair(1469598103934665603, 300) != 6553636740409758173) { return 2; }
+
+  // Signed idiv, and a negative dividend so the sign of the remainder matters.
+  if (i64_pair(999983, 200) != 2486147) { return 3; }
+  if (i64_pair(-999983, 200) != -19537593) { return 4; }
+
+  // The 32-bit divide takes a different encoder path than the 64-bit one.
+  if (i32_pair(70001, 150) != 95057673) { return 5; }
+  if (i32_pair(-70001, 150) != 93313984) { return 6; }
+
+  if (pressure_pair(1469598103934665603, 64, 11, 22, 33, 44) !=
+      3725751269212005876) {
+    return 7;
+  }
+
+  // Truncation toward zero, checked directly rather than through a loop.
+  if (7 / 2 != 3) { return 8; }
+  if (7 % 2 != 1) { return 9; }
+  if (-7 / 2 != -3) { return 10; }
+  if (-7 % 2 != -1) { return 11; }
+
+  return 0;
+}

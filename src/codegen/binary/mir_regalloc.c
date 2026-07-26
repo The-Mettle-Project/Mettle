@@ -591,14 +591,22 @@ static void mir_compute_coalesce_hints(MirFunction *fn) {
   }
 }
 
-/* True if a value occupying `reg` would be clobbered by an instruction strictly
- * inside the interval (s, e). Only RAX/RCX/RDX carry implicit clobbers: the
- * divide family (IDIV/DIV/MULHI) writes RAX:RDX, setcc writes RAX, and a
- * variable-count shift routes its count through CL (RCX). Boundary instructions
- * (k == s or k == e) are the value's own def/last-use as a div/shift operand or
- * result, which the encoder places correctly, so they are not clobbers. Calls
- * are handled separately by crosses_call (a value spanning a call is barred from
- * all volatiles, including these three). */
+/* True if `reg` is unavailable to a value whose interval is (s, e) -- because an
+ * instruction strictly inside it needs that register to carry a FIXED value.
+ * Two ways that happens:
+ *
+ *  - The register is named explicitly as an instruction's destination or source
+ *    (MIR_OPK_PHYS). A fixed destination would overwrite the value; a fixed
+ *    source needs the register to hold something else at that point, so a value
+ *    parked there has displaced it.
+ *  - RAX/RCX/RDX additionally carry IMPLICIT clobbers: the divide family
+ *    (IDIV/DIV/MULHI) writes RAX:RDX, setcc writes RAX, and a variable-count
+ *    shift routes its count through CL (RCX).
+ *
+ * Boundary instructions (k == s or k == e) are the value's own def/last-use as a
+ * div/shift operand or result, which the encoder places correctly, so they are
+ * not conflicts. Calls are handled separately by crosses_call (a value spanning
+ * a call is barred from all volatiles, including these three). */
 /* Positions of every clobber event in one function, sorted ascending, so a
  * clobbered-in-range query is two binary searches instead of a scan of the
  * interval. mir_color_reg_mask asks this question for every register of the
@@ -617,7 +625,14 @@ typedef struct {
   const MirInst *insns;
   size_t insn_count;
   int valid; /* 0 after an allocation failure: callers use the linear scan */
-  MirClobberList explicit_writes[16]; /* per physical GP register */
+  /* Per physical GP register: every index where that register carries a FIXED
+   * value, as either the destination or a source of the instruction. Both
+   * directions bar the same thing -- a vreg assigned that register whose live
+   * range strictly spans the index. A fixed WRITE would overwrite the vreg; a
+   * fixed READ means the register is holding the vreg instead of the value the
+   * instruction needs, which is how the divide's remainder used to be lost (see
+   * mir_clobber_index_ensure). */
+  MirClobberList explicit_fixed[16];
   MirClobberList rax_implicit;
   MirClobberList rcx_implicit;
   MirClobberList rdx_implicit;
@@ -663,7 +678,7 @@ static int mir_clobber_list_hit(const MirClobberList *l, int s, int e) {
 
 static void mir_clobber_index_reset(void) {
   for (size_t r = 0; r < 16; r++) {
-    mir_clobber_list_free(&g_mir_clobber_index.explicit_writes[r]);
+    mir_clobber_list_free(&g_mir_clobber_index.explicit_fixed[r]);
   }
   mir_clobber_list_free(&g_mir_clobber_index.rax_implicit);
   mir_clobber_list_free(&g_mir_clobber_index.rcx_implicit);
@@ -690,9 +705,19 @@ static int mir_clobber_index_ensure(const MirFunction *fn) {
   for (size_t k = 0; k < fn->insn_count; k++) {
     const MirInst *in = &fn->insns[k];
     int ok = 1;
-    if (in->dst.kind == MIR_OPK_PHYS && in->dst.rclass == MIR_RC_GP &&
-        in->dst.phys >= 0 && in->dst.phys < 16) {
-      ok = mir_clobber_list_push(&ix->explicit_writes[in->dst.phys], (int)k);
+    /* Destination AND sources. Recording only destinations left a fixed-register
+     * READ invisible, and the divmod fusion depends on one: the divide leaves
+     * the quotient in RAX and the remainder in RDX, and the very next
+     * instruction is `mov <vreg>, phys(RDX)` to capture the remainder. Nothing
+     * stopped the allocator giving the QUOTIENT vreg RDX, whereupon the
+     * encoder's `mov rdx, rax` overwrote the remainder before it was read and
+     * `x % d` quietly evaluated to `x / d`. */
+    const MirOperand *fixed[3] = {&in->dst, &in->a, &in->b};
+    for (int f = 0; ok && f < 3; f++) {
+      if (fixed[f]->kind == MIR_OPK_PHYS && fixed[f]->rclass == MIR_RC_GP &&
+          fixed[f]->phys >= 0 && fixed[f]->phys < 16) {
+        ok = mir_clobber_list_push(&ix->explicit_fixed[fixed[f]->phys], (int)k);
+      }
     }
     if (ok) {
       switch (in->op) {
@@ -730,7 +755,7 @@ static int mir_clobber_index_ensure(const MirFunction *fn) {
         unsigned clobbers = kern ? kern->gp_clobbers : 0u;
         for (int r = 0; clobbers && ok; r++, clobbers >>= 1) {
           if (clobbers & 1u) {
-            ok = mir_clobber_list_push(&ix->explicit_writes[r], (int)k);
+            ok = mir_clobber_list_push(&ix->explicit_fixed[r], (int)k);
           }
         }
         break;
@@ -759,7 +784,7 @@ static int mir_reg_clobbered_in_range(const MirFunction *fn,
 
   if ((int)reg >= 0 && (int)reg < 16 && mir_clobber_index_ensure(fn)) {
     const MirClobberIndex *ix = &g_mir_clobber_index;
-    if (mir_clobber_list_hit(&ix->explicit_writes[reg], s, e)) {
+    if (mir_clobber_list_hit(&ix->explicit_fixed[reg], s, e)) {
       return 1;
     }
     if (!constrained) {
@@ -777,11 +802,17 @@ static int mir_reg_clobbered_in_range(const MirFunction *fn,
   /* Fallback: index unavailable; scan the interval as before. */
   for (int k = s + 1; k < e; k++) {
     const MirInst *in = &fn->insns[k];
-    /* An explicit write to this physical register (return value into RAX, ABI
-     * argument setup, hidden-return pointer, ...) clobbers a value held there. */
-    if (in->dst.kind == MIR_OPK_PHYS && in->dst.rclass == MIR_RC_GP &&
-        in->dst.phys == (int)reg) {
-      return 1;
+    /* This physical register carrying a fixed value here, as the destination
+     * (return value into RAX, ABI argument setup, hidden-return pointer, ...)
+     * or as a source (capturing the divide's remainder out of RDX). Either way
+     * a vreg cannot also be living in it across this point. Mirrors the index
+     * build above. */
+    const MirOperand *fixed[3] = {&in->dst, &in->a, &in->b};
+    for (int f = 0; f < 3; f++) {
+      if (fixed[f]->kind == MIR_OPK_PHYS && fixed[f]->rclass == MIR_RC_GP &&
+          fixed[f]->phys == (int)reg) {
+        return 1;
+      }
     }
     /* Callee-saved registers an inline kernel writes without preserving (see
      * the index build above); unlike the cases below these are not limited to
