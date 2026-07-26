@@ -4045,6 +4045,10 @@ typedef struct {
   IROperand base;
   IROperand index;
   int scale;
+  /* Constant byte offset to add on top of base + index*scale. Non-zero when the
+   * index was itself `j + k`: x86 addresses carry that k for free in their
+   * displacement, so `a[j + 1]` need not compute a second index register. */
+  long long disp;
 } MirAddrFold;
 
 /* Per-function index over TEMP names, recording for each temp how many
@@ -4326,6 +4330,66 @@ static int mir_addr_fold_multiuse_safe(const IRFunction *f, size_t def_index,
   return 0;
 }
 
+/* An index of the form `j + k` (k a constant) needs no arithmetic of its own:
+ * x86 carries `k * scale` in the address displacement. Neighbour accesses --
+ * `src[i + 1]`, `dst[o + 2]`, `a[i - 1]` -- are ubiquitous, and each one was
+ * paying an ADD and a register for an offset the address encodes for free.
+ *
+ * Rewrites *index to `j` and adds the byte offset to *disp, but only when the
+ * constant-add temp exists solely to feed this address (otherwise its producer
+ * still has to run and nothing is saved). Returns the producer's index to skip,
+ * or -1 when the index is left alone. */
+static long mir_fold_index_constant_offset(const IRFunction *f,
+                                           const MirTempUseIndex *uses,
+                                           IROperand *index, int scale,
+                                           long long *disp) {
+  if (index->kind != IR_OPERAND_TEMP || !index->name) {
+    return -1;
+  }
+  if (mir_temp_read_count(uses, index->name) != 1) {
+    return -1;
+  }
+  long pi = mir_temp_def_index(uses, index->name);
+  if (pi < 0) {
+    return -1;
+  }
+  const IRInstruction *p = &f->instructions[pi];
+  if (p->op != IR_OP_BINARY || p->is_float || !p->text) {
+    return -1;
+  }
+  int subtract = strcmp(p->text, "-") == 0;
+  if (!subtract && strcmp(p->text, "+") != 0) {
+    return -1;
+  }
+  /* For subtraction only `j - k` works; `k - j` negates the index. */
+  const IROperand *var = NULL;
+  long long konst = 0;
+  if (p->rhs.kind == IR_OPERAND_INT &&
+      (p->lhs.kind == IR_OPERAND_TEMP || p->lhs.kind == IR_OPERAND_SYMBOL)) {
+    var = &p->lhs;
+    konst = subtract ? -p->rhs.int_value : p->rhs.int_value;
+  } else if (!subtract && p->lhs.kind == IR_OPERAND_INT &&
+             (p->rhs.kind == IR_OPERAND_TEMP ||
+              p->rhs.kind == IR_OPERAND_SYMBOL)) {
+    var = &p->rhs;
+    konst = p->lhs.int_value;
+  } else {
+    return -1;
+  }
+  if (!var->name) {
+    return -1;
+  }
+  long long offset = konst * (long long)scale;
+  long long total = *disp + offset;
+  if (offset / (scale ? scale : 1) != konst || total < -2147483648LL ||
+      total > 2147483647LL) {
+    return -1; /* would not fit the displacement */
+  }
+  *index = *var;
+  *disp = total;
+  return pi;
+}
+
 /* If `p` scales an index by a legal SIB factor (`idx << k`, k in 0..3, or
  * `idx * c`, c in {1,2,4,8}), fill *index/*scale and return 1. */
 static int mir_decode_scale(const IRInstruction *p, IROperand *index,
@@ -4455,6 +4519,9 @@ static void mir_compute_address_folds(const IRFunction *f,
       if (!mir_decode_scale(&f->instructions[si], &index, &scale)) {
         continue;
       }
+      long long disp = 0;
+      long offset_producer =
+          mir_fold_index_constant_offset(f, uses, &index, scale, &disp);
       if (addr_reads > 1 &&
           !mir_addr_fold_multiuse_safe(f, (size_t)ai, addr->name, base, &index,
                                        addr_reads)) {
@@ -4464,8 +4531,12 @@ static void mir_compute_address_folds(const IRFunction *f,
       folds[i].base = *base;
       folds[i].index = index;
       folds[i].scale = scale;
+      folds[i].disp = disp;
       skip[ai] = 1; /* the base+scaled add */
       skip[si] = 1; /* the index scale */
+      if (offset_producer >= 0) {
+        skip[offset_producer] = 1; /* the index's constant offset */
+      }
       break;
     }
 
@@ -4487,11 +4558,33 @@ static void mir_compute_address_folds(const IRFunction *f,
           (addr_reads == 1 ||
            mir_addr_fold_multiuse_safe(f, (size_t)ai, addr->name, o0, o1,
                                        addr_reads))) {
+        /* Either side may be the one carrying the `+ k`; the base pointer is
+         * whichever is not. Try the second operand first, the usual index
+         * position for `buf[i + 1]`. */
+        IROperand index = *o1;
+        IROperand base = *o0;
+        long long disp = 0;
+        long offset_producer =
+            mir_fold_index_constant_offset(f, uses, &index, 1, &disp);
+        if (offset_producer < 0) {
+          index = *o0;
+          base = *o1;
+          offset_producer =
+              mir_fold_index_constant_offset(f, uses, &index, 1, &disp);
+          if (offset_producer < 0) {
+            index = *o1;
+            base = *o0;
+          }
+        }
         folds[i].valid = 1;
-        folds[i].base = *o0;
-        folds[i].index = *o1;
+        folds[i].base = base;
+        folds[i].index = index;
         folds[i].scale = 1;
+        folds[i].disp = disp;
         skip[ai] = 1; /* fold the base+index add into the memory operand */
+        if (offset_producer >= 0) {
+          skip[offset_producer] = 1;
+        }
       }
     }
 
@@ -4548,7 +4641,7 @@ static int mir_lower_folded_access(MirFunction *fn, CodeGenerator *g,
     /* A constant index (e.g. `p[0]`, `arr[5]`) folds into the displacement:
      * [base + index*scale]. mir_decode_scale yields the literal index when the
      * scaled-offset expression is itself constant. */
-    long long disp = fold->index.int_value * (long long)fold->scale;
+    long long disp = fold->index.int_value * (long long)fold->scale + fold->disp;
     if (disp < -2147483648LL || disp > 2147483647LL) {
       fn->has_error = 1;
       return 0;
@@ -4560,7 +4653,11 @@ static int mir_lower_folded_access(MirFunction *fn, CodeGenerator *g,
       fn->has_error = 1;
       return 0;
     }
-    mem = mir_op_mem_vreg(baseo.vreg, idxo.vreg, fold->scale, 0);
+    if (fold->disp < -2147483648LL || fold->disp > 2147483647LL) {
+      fn->has_error = 1;
+      return 0;
+    }
+    mem = mir_op_mem_vreg(baseo.vreg, idxo.vreg, fold->scale, (int)fold->disp);
   }
   int size = code_generator_binary_get_access_size(g, ctx, &in->rhs);
   if (size <= 0) {
