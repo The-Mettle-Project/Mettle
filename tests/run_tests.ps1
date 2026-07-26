@@ -8387,36 +8387,46 @@ catch {
   Write-CaseResult -Name "ptx_emit_gb10_tensor_pipeline" -Passed $false -Reason $_.Exception.Message
 }
 
-# Global initializers that fold: every shape module lowering can lay out as
-# bytes (numeric constant expressions, sizeof, an enum member, a string literal,
-# `&name`, a zero-filled .bss global, an earlier global's folded value). The
-# fixture's main returns a distinct nonzero code per wrong value, so this runs
-# the binary rather than only compiling it - a shape that silently folded to the
-# wrong constant would still compile. It cannot be a @test: the compile-time
-# interpreter does not model global `var` initializers.
-foreach ($globalInitMode in @(@{ Name = "debug"; Args = @() },
-                              @{ Name = "release"; Args = @("--release") })) {
-  try {
-    $total++
-    $caseName = "global_init_layoutable_$($globalInitMode.Name)"
-    $globalInitExe = Join-Path $tmpDir "$caseName.exe"
-    $globalInitOut = & $CompilerPath --build @($globalInitMode.Args) `
-      tests/global_init_layoutable.mettle -o $globalInitExe 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0) {
-      throw "compile failed: $globalInitOut"
+# Self-checking codegen fixtures. Each one's main returns 0 when every value it
+# computes is correct and a distinct nonzero code otherwise, so these are RUN,
+# not merely compiled: a construct that silently produces the wrong value still
+# compiles clean. Every fixture runs in debug and release, since the two take
+# different backend paths. They cannot be @test functions - the compile-time
+# interpreter does not model global `var` initializers, and it is the native
+# backend under audit here.
+$runFixtures = @(
+  @{ Name = "global_init_layoutable"; Path = "tests/global_init_layoutable.mettle"
+     What = "a global folded to the wrong value" },
+  @{ Name = "bool_roundtrip"; Path = "tests/codegen/bool_roundtrip.mettle"
+     What = "a bool crossed a call boundary wrong" },
+  @{ Name = "odd_size_aggregates"; Path = "tests/codegen/odd_size_aggregates.mettle"
+     What = "a 3/5/6/7-byte aggregate copied wrong" }
+)
+foreach ($fixture in $runFixtures) {
+  foreach ($mode in @(@{ Name = "debug"; Args = @() },
+                      @{ Name = "release"; Args = @("--release") })) {
+    $caseName = "$($fixture.Name)_$($mode.Name)"
+    try {
+      $total++
+      $fixtureExe = Join-Path $tmpDir "$caseName.exe"
+      $fixtureOut = & $CompilerPath --build @($mode.Args) `
+        $fixture.Path -o $fixtureExe 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) {
+        throw "compile failed: $fixtureOut"
+      }
+      if ($fixtureOut -match "internal compiler error") {
+        throw "compile reported an internal compiler error: $fixtureOut"
+      }
+      & $fixtureExe | Out-Null
+      if ($LASTEXITCODE -ne 0) {
+        throw "$($fixture.What) (fixture check #$LASTEXITCODE)"
+      }
+      Write-CaseResult -Name $caseName -Passed $true
     }
-    if ($globalInitOut -match "internal compiler error") {
-      throw "compile reported an internal compiler error: $globalInitOut"
+    catch {
+      $failed++
+      Write-CaseResult -Name $caseName -Passed $false -Reason $_.Exception.Message
     }
-    & $globalInitExe | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-      throw "a global folded to the wrong value (fixture check #$LASTEXITCODE)"
-    }
-    Write-CaseResult -Name $caseName -Passed $true
-  }
-  catch {
-    $failed++
-    Write-CaseResult -Name $caseName -Passed $false -Reason $_.Exception.Message
   }
 }
 

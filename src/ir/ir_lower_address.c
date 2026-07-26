@@ -93,10 +93,17 @@ int ir_emit_aggregate_literal_copy(IRLoweringContext *context,
 
   /* A block move is spelled as a STORE whose value operand is the source
    * ADDRESS, which the backend only reads that way past one machine word. An
-   * aggregate of eight bytes or fewer has to go through a register instead:
-   * load the word, then store it. */
+   * aggregate that is exactly one machine load wide goes through a register
+   * instead: load the word, then store it.
+   *
+   * Only 1/2/4/8 qualify. A 3-, 5-, 6-, or 7-byte aggregate (`struct Rgb { r:
+   * uint8; g: uint8; b: uint8; }`) has no single load that covers it exactly --
+   * widening to the next power of two would read past the object and, on the
+   * store side, clobber whatever follows it -- so it takes the block move,
+   * which is byte-exact for any size. */
   IROperand value = source_address;
-  if (dest_type->size <= 8) {
+  if (dest_type->size == 1 || dest_type->size == 2 || dest_type->size == 4 ||
+      dest_type->size == 8) {
     IROperand loaded = ir_operand_none();
     if (!ir_make_temp_operand(context, &loaded)) {
       ir_operand_destroy(&source_address);

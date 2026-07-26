@@ -1016,6 +1016,7 @@ int code_generator_binary_resolved_type_is_supported(MtlcType *type,
   case MTLC_TYPE_UINT16:
   case MTLC_TYPE_UINT32:
   case MTLC_TYPE_UINT64:
+  case MTLC_TYPE_BOOL:
   case MTLC_TYPE_FLOAT32:
   case MTLC_TYPE_FLOAT64:
   case MTLC_TYPE_POINTER:
