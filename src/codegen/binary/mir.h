@@ -308,8 +308,39 @@ typedef enum {
    * into). Call-like: clobbers the caller-saved set + ymm0-5. Maps only. */
   MIR_SIMD_VLOOP,
 
+  /* Generic inline legacy kernel. The five opcodes above each hard-wire one
+   * kernel: a MIR opcode, a name, an encoder case, and four enumerations in the
+   * allocator. This one covers the rest of the family with no per-kernel MIR
+   * surface at all -- a kernel joins by adding a row to the table in
+   * mir_kernel.c and nothing else.
+   *
+   * The difference is how operands reach the kernel. Those five marshal into
+   * fixed physical registers, so each needs the lowering to know exactly which
+   * register the kernel reads which operand from. This one stages every
+   * TEMP/SYMBOL operand of the source IR instruction into a frame slot and
+   * publishes the slot addresses on the context; the kernel's own
+   * emit_operand_load / emit_destination_store calls then hit those slots
+   * instead of the fallback's named stack homes, wherever in its body they
+   * happen to be and into whatever register it happens to want. Kernels with
+   * several outputs, conditional operand loads, or an operand read twice into
+   * different registers all work without the bridge knowing anything about
+   * them.
+   *
+   * `aux` borrows a MirKernelAux (owned by the MirFunction) naming the source
+   * instruction, the table row, and the staging vregs; the surrounding MIR_MOVs
+   * fill the slots before and read them back after. Call-like: treated as a
+   * clobber barrier by the allocator, plus whatever callee-saved registers the
+   * row declares. */
+  MIR_IR_KERNEL,
+
   MIR_OPCODE_COUNT
 } MirOpcode;
+
+/* True for the inline-kernel opcodes: ops that run a whole vector kernel in
+ * place, clobbering the caller-saved set the way a call does. The allocator and
+ * the annotator ask this rather than each listing the set, so a new kernel
+ * opcode is one edit here instead of five. */
+int mir_op_is_inline_kernel(MirOpcode op);
 
 /* One MIR instruction. dst/a/b are the general operand slots; mem is the address
  * for load/store/lea; width is the operation width in bytes; cc holds an x86
@@ -327,6 +358,35 @@ typedef struct {
   int ir_index;    /* source IR index, or -1 */
   const void *aux; /* MIR_SIMD_VLOOP: borrowed const IRInstruction* (the DAG) */
 } MirInst;
+
+/* Upper bound on the operands one inline kernel stages through frame slots.
+ * Only TEMP/SYMBOL operands need a slot (an immediate or string literal is
+ * materialized by the kernel itself), and the widest kernel in the table reads
+ * six. A kernel instruction with more defers to the fallback. */
+#define MIR_KERNEL_MAX_SLOTS 8
+
+/* The bridge payload for one MIR_IR_KERNEL: which kernel to run, over which IR
+ * instruction, and where its operands were staged.
+ *
+ * `slot_vreg` holds one address-taken vreg per DISTINCT staged value -- keyed by
+ * value, not by operand, because two operand positions can name the same value
+ * (a kernel that accumulates into its own dest reads and writes one variable).
+ * Two slots for one value would each be filled with it and each read back, and
+ * whichever reload ran last would win -- dropping the kernel's result whenever
+ * the stale copy came second. `operand_slot[i]` maps operand[i] onto its slot.
+ *
+ * The MIR lowering fills the slots before the kernel and reads them back after;
+ * the encoder turns each slot into a frame address for the kernel's own operand
+ * loads and stores. */
+typedef struct {
+  const IRInstruction *ir; /* borrowed: the IR outlives this codegen */
+  int kernel_index;        /* row in the mir_kernel.c table */
+  int slot_count;
+  MirVregId slot_vreg[MIR_KERNEL_MAX_SLOTS];
+  int operand_count;
+  const IROperand *operand[MIR_KERNEL_MAX_SLOTS]; /* borrowed, address-matched */
+  int operand_slot[MIR_KERNEL_MAX_SLOTS];
+} MirKernelAux;
 
 /* A pooled (loop-invariant) float constant: its IEEE bits at `width`, and the
  * vreg materialized once near the loop that first uses it. */
@@ -385,6 +445,14 @@ typedef struct {
   char **owned_syms;
   size_t owned_sym_count;
   size_t owned_sym_capacity;
+
+  /* Owned side payloads pointed at by MirInst.aux (currently the MirKernelAux
+   * of each MIR_IR_KERNEL). They must outlive the encoder, which reads them
+   * after allocation has filled in the staging vregs' frame offsets; freed in
+   * mir_function_destroy. */
+  void **owned_aux;
+  size_t owned_aux_count;
+  size_t owned_aux_capacity;
 
   /* Borrowed: the function context owning stack homes, ABI, fixup tables, and
    * the output code buffer; and the code generator (for type queries, fixup
@@ -491,6 +559,36 @@ MirVregId mir_new_vreg(MirFunction *fn, MirRegClass rclass, int width);
 
 /* Append an instruction; returns 0 on OOM (and sets fn->has_error). */
 int mir_emit(MirFunction *fn, const MirInst *inst);
+
+/* Take ownership of `block` (freed by mir_function_destroy) and return it, or
+ * NULL on OOM (which also sets fn->has_error; `block` is freed). */
+void *mir_function_own_aux(MirFunction *fn, void *block);
+
+/* ---- inline kernel table (mir_kernel.c) --------------------------------- */
+
+/* One legacy vector kernel the MIR backend can run in place. `emit` is the
+ * fallback emitter, called unchanged -- the operand bridge makes its own
+ * operand loads and stores resolve to the staging slots. */
+typedef struct {
+  IROpcode ir_op;
+  const char *name;
+  int (*emit)(CodeGenerator *generator, BinaryFunctionContext *context,
+              const IRInstruction *instruction);
+  /* Callee-saved GP registers the kernel writes without preserving, as a
+   * 1u<<BinaryGpRegister mask. The allocator keeps live values out of them
+   * across the kernel; the caller-saved set is already handled by treating the
+   * kernel as a call barrier, so only the exceptions are listed. */
+  unsigned gp_clobbers;
+} MirIrKernel;
+
+/* Row for `op`, or NULL if no kernel handles it. */
+const MirIrKernel *mir_ir_kernel_for_op(IROpcode op);
+
+/* Row `index`, or NULL if out of range. Indices are stable for a build. */
+const MirIrKernel *mir_ir_kernel_at(int index);
+
+/* Index of `op`'s row, or -1. */
+int mir_ir_kernel_index_for_op(IROpcode op);
 
 /* Operand builders. */
 MirOperand mir_op_none(void);

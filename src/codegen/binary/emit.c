@@ -1246,11 +1246,45 @@ int code_generator_binary_emit_float_reg_convert(
   return 1;
 }
 
+/* The staging slot an inline kernel's operand was placed in, or NULL when no
+ * kernel is running or this operand is not one of its staged ones (an immediate
+ * or a string literal, which the kernel materializes for itself). The list is
+ * at most BINARY_MAX_MARSHALED_OPERANDS long and empty outside a kernel, so
+ * this is a handful of pointer compares on the kernel path and one count test
+ * everywhere else. */
+static const BinaryMarshaledOperand *binary_marshaled_slot(
+    const BinaryFunctionContext *context, const IROperand *operand) {
+  if (!context || !operand || context->marshaled_operand_count == 0) {
+    return NULL;
+  }
+  for (size_t i = 0; i < context->marshaled_operand_count; i++) {
+    if (context->marshaled_operands[i].operand == operand) {
+      return &context->marshaled_operands[i];
+    }
+  }
+  return NULL;
+}
+
 int code_generator_binary_emit_operand_load(
     CodeGenerator *generator, BinaryFunctionContext *context,
     const IROperand *operand, BinaryGpRegister target_register) {
   if (!generator || !context || !operand) {
     return 0;
+  }
+
+  /* Inside an inline kernel this operand's value lives in a staging slot rather
+   * than the named stack home the cases below would look up (which does not
+   * exist in a register-allocated frame). Read the slot as a full 8 bytes: the
+   * MIR side wrote the whole value there, and every kernel operand is a
+   * pointer, a count, or an accumulator the kernel narrows itself. */
+  {
+    const BinaryMarshaledOperand *slot =
+        binary_marshaled_slot(context, operand);
+    if (slot) {
+      return binary_emit_mov_reg_mem(&context->code, target_register,
+                                     (BinaryGpRegister)slot->base_register,
+                                     slot->displacement);
+    }
   }
 
   switch (operand->kind) {
@@ -2000,6 +2034,21 @@ int code_generator_binary_emit_destination_store(
     const IROperand *destination, BinaryGpRegister source_register) {
   if (!generator || !context || !destination) {
     return 0;
+  }
+
+  /* Inside an inline kernel: write the result back to the staging slot. The MIR
+   * side reads the slot after the kernel returns and moves it into whatever
+   * register or spill home holds that value for the rest of the function. A
+   * kernel with several outputs (simd_minmax_i32 writes both its dest and its
+   * arguments[0]) needs nothing special -- each store finds its own slot. */
+  {
+    const BinaryMarshaledOperand *slot =
+        binary_marshaled_slot(context, destination);
+    if (slot) {
+      return binary_emit_mov_mem_reg(&context->code,
+                                     (BinaryGpRegister)slot->base_register,
+                                     slot->displacement, source_register);
+    }
   }
 
   switch (destination->kind) {

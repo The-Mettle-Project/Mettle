@@ -1954,6 +1954,44 @@ int mir_encode(MirFunction *fn) {
       }
       break;
     }
+    case MIR_IR_KERNEL: {
+      /* Generic inline kernel. The preceding MIR_MOVs staged each by-name
+       * operand into its own frame slot; publish those slot addresses on the
+       * context so the kernel's own emit_operand_load / emit_destination_store
+       * calls resolve to them, run the unmodified fallback emitter, then take
+       * the map back down. The MIR_MOVs that follow read the slots back.
+       *
+       * The slot address is the frame base plus the staging vreg's spill
+       * offset, both final by now. Some kernels borrow stack below rsp
+       * (a balanced sub/add) or push a register, so the base has to be rbp --
+       * mir_regalloc keeps the frame pointer for any function containing one of
+       * these. */
+      const MirKernelAux *ka = (const MirKernelAux *)in->aux;
+      const MirIrKernel *kern = ka ? mir_ir_kernel_at(ka->kernel_index) : NULL;
+      if (!ka || !kern || ka->operand_count > BINARY_MAX_MARSHALED_OPERANDS) {
+        ok = enc_err(fn, "malformed inline kernel");
+        break;
+      }
+      for (int s = 0; s < ka->operand_count; s++) {
+        const MirVreg *sv = &fn->vregs[ka->slot_vreg[ka->operand_slot[s]]];
+        ctx->marshaled_operands[s].operand = ka->operand[s];
+        ctx->marshaled_operands[s].base_register = frame_base(fn);
+        ctx->marshaled_operands[s].displacement =
+            frame_disp(fn, -sv->spill_offset);
+      }
+      ctx->marshaled_operand_count = (size_t)ka->operand_count;
+      int kok = kern->emit(fn->generator, ctx, ka->ir);
+      ctx->marshaled_operand_count = 0;
+      if (!kok) {
+        ok = enc_err(fn, "failed to emit inline kernel");
+        break;
+      }
+      /* These kernels leave the YMM upper halves dirty (several emit their own
+       * closing vzeroupper, but not all); one more in the epilogue costs a
+       * single instruction per function and removes the need to track which. */
+      fn->used_inline_vector = 1;
+      break;
+    }
     case MIR_SIMD_SILU_F32: {
       /* Inline SiLU/SwiGLU gate. g/out->RCX, u->RDX, count->R8 marshalled by the
        * preceding MIR_MOVs; dst.imm = has_mul. The kernel emits its own closing

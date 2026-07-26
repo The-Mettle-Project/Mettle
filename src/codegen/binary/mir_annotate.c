@@ -729,14 +729,16 @@ static void cost_model(const MirFunction *fn, const MirInst *in, int *lat,
     break;
   case MIR_VCVTSI2F: case MIR_VCVTF2SI:
     *kind = "vec"; *ports = "p01"; mask = M_P01; centi = 100; *lat = 5; break;
-  case MIR_SIMD_SLP_MAC: case MIR_SIMD_FILL:
-  case MIR_SIMD_AFFINE_MAP_F32: case MIR_SIMD_AFFINE_MAP_F64:
-  case MIR_SIMD_SILU_F32: case MIR_SIMD_VLOOP:
-    *kind = "kernel"; *ports = "kernel"; mask = 0; centi = 0; *is_kernel = 1;
-    *lat = 0; load = 0; break;
   case MIR_NOP: case MIR_LABEL:
     *kind = "other"; mask = 0; centi = 0; *lat = 0; break;
   default:
+    /* Every inline kernel (the five with their own opcode plus the generic
+     * MIR_IR_KERNEL) is a whole loop, not a uop: the model has nothing useful
+     * to say about it and the annotator prints it as an opaque kernel. */
+    if (mir_op_is_inline_kernel(in->op)) {
+      *kind = "kernel"; *ports = "kernel"; mask = 0; centi = 0; *is_kernel = 1;
+      *lat = 0; load = 0; break;
+    }
     *kind = "other"; mask = M_ALU4; centi = 25; break;
   }
 

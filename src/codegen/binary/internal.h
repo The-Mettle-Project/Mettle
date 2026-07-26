@@ -162,6 +162,22 @@ typedef struct {
   int built; /* built lazily: many functions never need it */
 } BinaryOperandTypeIndex;
 
+/* One operand of an inline kernel, staged into a frame slot by the MIR
+ * lowering. Matched by ADDRESS, not by name: the kernel is handed the same
+ * IRInstruction the bridge scanned, so `&instruction->lhs` and
+ * `&instruction->arguments[3]` are the very pointers recorded here, and no
+ * name lookup (which would not resolve in an allocated frame anyway) is
+ * needed. */
+typedef struct {
+  const IROperand *operand; /* borrowed */
+  int base_register;        /* BinaryGpRegister the slot is addressed off */
+  int displacement;         /* byte displacement from base_register */
+} BinaryMarshaledOperand;
+
+/* Ceiling on staged operands, mirroring MIR_KERNEL_MAX_SLOTS in mir.h (kept
+ * separate so internal.h does not have to include the MIR header). */
+#define BINARY_MAX_MARSHALED_OPERANDS 8
+
 typedef struct {
   BinaryCodeBuffer code;
   BinaryNamedSlotTable parameter_slots;
@@ -224,6 +240,15 @@ typedef struct {
   BinaryOperandTypeIndex operand_types;
   char *runtime_end_label;
   BinaryDebugLabelExportTable debug_export_labels;
+  /* Live only while the MIR encoder is running one inline kernel (see
+   * MIR_IR_KERNEL): the kernel's operands and the frame slots the surrounding
+   * MIR staged them into. code_generator_binary_emit_operand_load and
+   * ..._emit_destination_store consult this first, so a kernel written against
+   * the fallback's named stack homes reads and writes the right storage inside
+   * an allocated frame without knowing it. Zero at every other moment, which is
+   * what makes the fallback path pay nothing for this. */
+  BinaryMarshaledOperand marshaled_operands[BINARY_MAX_MARSHALED_OPERANDS];
+  size_t marshaled_operand_count;
 } BinaryFunctionContext;
 
 typedef struct {

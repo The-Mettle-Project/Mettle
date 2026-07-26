@@ -54,20 +54,21 @@ static const BinaryGpRegister MIR_GP_EXTRA[] = {
 #define MIR_GP_LEAF_POOL_MAX (MIR_GP_POOL_COUNT + MIR_GP_EXTRA_COUNT)
 
 /* True if the function makes any call (so caller-saved regs are unsafe to hold
- * values across, and outgoing-arg registers must not be reclaimed). */
+ * values across, and outgoing-arg registers must not be reclaimed).
+ *
+ * The frame-pointer-omission decision depends on inline kernels counting here,
+ * not only calls: a MIR_IR_KERNEL addresses its staged operands off the frame
+ * base, and several of those kernels borrow stack with a balanced `sub rsp` or
+ * push a register mid-body. rsp is therefore not stable across them, and an
+ * rsp-relative slot address would land inside the kernel's own scratch. */
 static int mir_fn_has_calls(const MirFunction *fn) {
   for (size_t i = 0; i < fn->insn_count; i++) {
-    /* The inline SLP kernel clobbers the ABI argument/caller-saved registers, so
-     * the function must be treated as non-leaf: RCX/RDX/R8/R9 are unsafe to
-     * reclaim into the general pool (the kernel marshalling overwrites them). */
+    /* An inline kernel clobbers the ABI argument/caller-saved registers, so the
+     * function must be treated as non-leaf: RCX/RDX/R8/R9 are unsafe to reclaim
+     * into the general pool (the kernel overwrites them). */
     if (fn->insns[i].op == MIR_CALL ||
         fn->insns[i].op == MIR_CALL_INDIRECT ||
-        fn->insns[i].op == MIR_SIMD_SLP_MAC ||
-        fn->insns[i].op == MIR_SIMD_FILL ||
-        fn->insns[i].op == MIR_SIMD_AFFINE_MAP_F32 ||
-        fn->insns[i].op == MIR_SIMD_AFFINE_MAP_F64 ||
-        fn->insns[i].op == MIR_SIMD_SILU_F32 ||
-        fn->insns[i].op == MIR_SIMD_VLOOP) {
+        mir_op_is_inline_kernel(fn->insns[i].op)) {
       return 1;
     }
   }
@@ -101,12 +102,7 @@ static int mir_fn_has_real_calls(const MirFunction *fn) {
  * that already beat gcc and gain nothing from one more GP register). */
 static int mir_fn_uses_slp(const MirFunction *fn) {
   for (size_t i = 0; i < fn->insn_count; i++) {
-    if (fn->insns[i].op == MIR_SIMD_SLP_MAC ||
-        fn->insns[i].op == MIR_SIMD_FILL ||
-        fn->insns[i].op == MIR_SIMD_AFFINE_MAP_F32 ||
-        fn->insns[i].op == MIR_SIMD_AFFINE_MAP_F64 ||
-        fn->insns[i].op == MIR_SIMD_SILU_F32 ||
-        fn->insns[i].op == MIR_SIMD_VLOOP) {
+    if (mir_op_is_inline_kernel(fn->insns[i].op)) {
       return 1;
     }
   }
@@ -721,6 +717,24 @@ static int mir_clobber_index_ensure(const MirFunction *fn) {
           ok = mir_clobber_list_push(&ix->rcx_implicit, (int)k);
         }
         break;
+      case MIR_IR_KERNEL: {
+        /* Caller-saved registers are already barred across a kernel by
+         * crosses_call. What that does not cover is a kernel writing a
+         * CALLEE-saved register without preserving it, which the allocator would
+         * otherwise consider a safe home for a value spanning the kernel. Each
+         * such register is declared by the kernel's table row; record it as an
+         * explicit clobber here so an interval containing the kernel avoids
+         * it. */
+        const MirKernelAux *ka = (const MirKernelAux *)in->aux;
+        const MirIrKernel *kern = ka ? mir_ir_kernel_at(ka->kernel_index) : NULL;
+        unsigned clobbers = kern ? kern->gp_clobbers : 0u;
+        for (int r = 0; clobbers && ok; r++, clobbers >>= 1) {
+          if (clobbers & 1u) {
+            ok = mir_clobber_list_push(&ix->explicit_writes[r], (int)k);
+          }
+        }
+        break;
+      }
       default:
         break;
       }
@@ -768,6 +782,16 @@ static int mir_reg_clobbered_in_range(const MirFunction *fn,
     if (in->dst.kind == MIR_OPK_PHYS && in->dst.rclass == MIR_RC_GP &&
         in->dst.phys == (int)reg) {
       return 1;
+    }
+    /* Callee-saved registers an inline kernel writes without preserving (see
+     * the index build above); unlike the cases below these are not limited to
+     * RAX/RCX/RDX, so they are checked before the `constrained` filter. */
+    if (in->op == MIR_IR_KERNEL && (int)reg >= 0 && (int)reg < 16) {
+      const MirKernelAux *ka = (const MirKernelAux *)in->aux;
+      const MirIrKernel *kern = ka ? mir_ir_kernel_at(ka->kernel_index) : NULL;
+      if (kern && (kern->gp_clobbers & (1u << (unsigned)reg))) {
+        return 1;
+      }
     }
     if (!constrained) {
       continue;
@@ -1304,6 +1328,27 @@ static int mir_regalloc_report_saved(MirFunction *fn) {
       used_nonvol[vr->phys] = 1;
     }
   }
+  /* An inline kernel writing a callee-saved register is preserving nothing on
+   * its own, so the function has to preserve it for its caller exactly as if
+   * the allocator had placed a value there. Keeping a value OUT of that
+   * register across the kernel is a separate matter, handled by the clobber
+   * index -- prologue save/restore only covers entry and exit, not the middle
+   * of the body. (The fallback emitter never hit this because its promoter
+   * claims R12..R15 up front, so they are always in its saved set.) */
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    if (fn->insns[i].op != MIR_IR_KERNEL) {
+      continue;
+    }
+    const MirKernelAux *ka = (const MirKernelAux *)fn->insns[i].aux;
+    const MirIrKernel *kern = ka ? mir_ir_kernel_at(ka->kernel_index) : NULL;
+    unsigned clobbers = kern ? kern->gp_clobbers : 0u;
+    for (int reg = 0; clobbers; reg++, clobbers >>= 1) {
+      if ((clobbers & 1u) && (mir_gp_is_nonvolatile((BinaryGpRegister)reg) ||
+                              reg == BINARY_GP_RBP)) {
+        used_nonvol[reg] = 1;
+      }
+    }
+  }
   for (int reg = 0; reg < 16; reg++) {
     if (used_nonvol[reg] && !code_generator_binary_context_add_saved_register(
                                 fn->context, (BinaryGpRegister)reg)) {
@@ -1338,12 +1383,7 @@ static int mir_regalloc_color(MirFunction *fn) {
   for (size_t i = 0; i < fn->insn_count; i++) {
     if (fn->insns[i].op != MIR_CALL &&
         fn->insns[i].op != MIR_CALL_INDIRECT &&
-        fn->insns[i].op != MIR_SIMD_SLP_MAC &&
-        fn->insns[i].op != MIR_SIMD_FILL &&
-        fn->insns[i].op != MIR_SIMD_AFFINE_MAP_F32 &&
-        fn->insns[i].op != MIR_SIMD_AFFINE_MAP_F64 &&
-        fn->insns[i].op != MIR_SIMD_SILU_F32 &&
-        fn->insns[i].op != MIR_SIMD_VLOOP) {
+        !mir_op_is_inline_kernel(fn->insns[i].op)) {
       continue;
     }
     int c = (int)i;
@@ -1575,17 +1615,12 @@ int mir_regalloc(MirFunction *fn) {
     fn->vregs[v].crosses_call = 0;
   }
   for (size_t i = 0; i < fn->insn_count; i++) {
-    /* MIR_SIMD_SLP_MAC and MIR_SIMD_FILL clobber the caller-saved set
-     * (RAX/RCX/RDX/R8/R9/R10/R11 + xmm0..) exactly like a call, so a value
-     * spanning one must also live in a callee-saved register or spill. */
+    /* An inline kernel clobbers the caller-saved set (RAX/RCX/RDX/R8/R9/R10/R11
+     * + xmm0..) exactly like a call, so a value spanning one must also live in a
+     * callee-saved register or spill. */
     if (fn->insns[i].op != MIR_CALL &&
         fn->insns[i].op != MIR_CALL_INDIRECT &&
-        fn->insns[i].op != MIR_SIMD_SLP_MAC &&
-        fn->insns[i].op != MIR_SIMD_FILL &&
-        fn->insns[i].op != MIR_SIMD_AFFINE_MAP_F32 &&
-        fn->insns[i].op != MIR_SIMD_AFFINE_MAP_F64 &&
-        fn->insns[i].op != MIR_SIMD_SILU_F32 &&
-        fn->insns[i].op != MIR_SIMD_VLOOP) {
+        !mir_op_is_inline_kernel(fn->insns[i].op)) {
       continue;
     }
     int c = (int)i;

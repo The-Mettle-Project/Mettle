@@ -1,0 +1,343 @@
+// Vector kernels running INSIDE a register-allocated function (MIR_IR_KERNEL).
+//
+// Each helper below fuses to one of the kernels in the inline-kernel table, and
+// each is written so the kernel is NOT the whole function: live values are
+// computed before it and read after it. That is the part worth testing. The
+// kernels themselves are long-standing and covered elsewhere; what is new is
+// running one in a frame where the surrounding values live in registers rather
+// than stack homes, so a bridge that staged an operand wrongly, or let the
+// kernel destroy a register holding a live value, shows up here as a wrong sum.
+//
+// `guard` is threaded through every helper for exactly that reason: it is
+// computed before the kernel, unused by it, and folded into the result after,
+// so it must survive the kernel in a register the kernel does not touch. Values
+// spanning the kernel are what the allocator has to get right.
+//
+// main returns 0 when every check passes, or the number of the first failing
+// check, so a miscompile names itself.
+
+import "std/mem";
+
+// --- reductions -----------------------------------------------------------
+
+@noinline fn k_sum_i32(a: int32*, n: int64, guard: int64) -> int64 {
+  var g: int64 = guard * 7 + 1;
+  var t: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) { t = t + (int64)a[i]; i = i + 1; }
+  return t + g;
+}
+
+@noinline fn k_sum_u8(a: uint8*, n: int64, guard: int64) -> int64 {
+  var g: int64 = guard * 11 + 2;
+  var t: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) { t = t + (int64)a[i]; i = i + 1; }
+  return t + g;
+}
+
+@noinline fn k_dot_i32(a: int32*, b: int32*, n: int64, guard: int64) -> int64 {
+  var t: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) { t = t + (int64)a[i] * (int64)b[i]; i = i + 1; }
+  return t + guard * 13 + 3;
+}
+
+@noinline fn k_dot_i8(a: int8*, b: int8*, n: int64, guard: int64) -> int64 {
+  var t: int32 = 0;
+  var i: int64 = 0;
+  while (i < n) { t = t + (int32)a[i] * (int32)b[i]; i = i + 1; }
+  return (int64)t + guard * 3 + 1;
+}
+
+@noinline fn k_byte_map(a: uint8*, n: int64, guard: int64) -> int64 {
+  var i: int64 = 0;
+  while (i < n) { a[i] = a[i] ^ 7; i = i + 1; }
+  return guard * 53 + 13;
+}
+
+// The one shape here that does NOT currently fuse to its kernel: the
+// lower_bound_i32 recognizer wants the binary_search form that RETURNS the
+// element, not the index. Kept anyway -- it costs nothing, and it starts
+// passing through the bridge the day the recognizer widens.
+@noinline fn k_lower_bound(a: int32*, n: int64, key: int32,
+                           guard: int64) -> int64 {
+  var lo: int64 = 0;
+  var hi: int64 = n;
+  while (lo < hi) {
+    var mid: int64 = lo + ((hi - lo) / 2);
+    if (a[mid] < key) { lo = mid + 1; } else { hi = mid; }
+  }
+  return lo + guard * 59 + 14;
+}
+
+@noinline fn k_sum_f64(a: float64*, n: int64, guard: int64) -> float64 {
+  var g: float64 = (float64)(guard * 2);
+  var t: float64 = 0.0;
+  var i: int64 = 0;
+  while (i < n) { t = t + a[i]; i = i + 1; }
+  return t + g;
+}
+
+@noinline fn k_sum_f32(a: float32*, n: int64, guard: int64) -> float32 {
+  var g: float32 = (float32)(guard * 2);
+  var t: float32 = 0.0;
+  var i: int64 = 0;
+  while (i < n) { t = t + a[i]; i = i + 1; }
+  return t + g;
+}
+
+@noinline fn k_dot_f64(a: float64*, b: float64*, n: int64,
+                       guard: int64) -> float64 {
+  var g: float64 = (float64)(guard * 2);
+  var t: float64 = 0.0;
+  var i: int64 = 0;
+  while (i < n) { t = t + a[i] * b[i]; i = i + 1; }
+  return t + g;
+}
+
+@noinline fn k_dot_f32(a: float32*, b: float32*, n: int64,
+                       guard: int64) -> float32 {
+  var g: float32 = (float32)(guard * 2);
+  var t: float32 = 0.0;
+  var i: int64 = 0;
+  while (i < n) { t = t + a[i] * b[i]; i = i + 1; }
+  return t + g;
+}
+
+// Two outputs from one kernel (min AND max), and the only kernel in the table
+// that writes a callee-saved register (R14) without preserving it -- so this is
+// the one that catches both a lost second output and a missing prologue save.
+// Four extra live parameters, not two, so the allocator runs out of volatile
+// registers and has to place some of them in the callee-saved bank the kernel
+// writes into.
+@noinline fn k_minmax(a: int32*, n: int64, p: int64, q: int64, r: int64,
+                      s: int64) -> int64 {
+  var minv: int32 = a[0];
+  var maxv: int32 = a[0];
+  var i: int64 = 1;
+  while (i < n) {
+    var v: int32 = a[i];
+    if (v < minv) { minv = v; }
+    if (v > maxv) { maxv = v; }
+    i = i + 1;
+  }
+  return (int64)minv * 1000 + (int64)maxv + p * 17 + q * 19 + r * 23 + s * 29;
+}
+
+// --- element-wise maps ----------------------------------------------------
+
+@noinline fn k_scale(src: int32*, dst: int32*, n: int64,
+                     guard: int64) -> int64 {
+  var g: int64 = guard * 19 + 5;
+  var sum: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    var v: int32 = src[i] * 3 + 7;
+    dst[i] = v;
+    sum = sum + (int64)v;
+    i = i + 1;
+  }
+  return sum + g;
+}
+
+fn narrow(x: int32, lo: int32, hi: int32) -> int32 {
+  if (x < lo) { return lo; }
+  if (x > hi) { return hi; }
+  return x;
+}
+
+@noinline fn k_clamp(src: int32*, dst: int32*, n: int64,
+                     guard: int64) -> int64 {
+  var g: int64 = guard * 23 + 6;
+  var acc: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    var v: int32 = narrow(src[i], -90, 90);
+    dst[i] = v;
+    acc = acc + (int64)v;
+    i = i + 1;
+  }
+  return acc + g;
+}
+
+@noinline fn k_reverse(src: int32*, dst: int32*, n: int64,
+                       guard: int64) -> int64 {
+  var g: int64 = guard * 29 + 7;
+  var sum: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    var v: int32 = src[n - 1 - i];
+    dst[i] = v;
+    sum = sum + (int64)v;
+    i = i + 1;
+  }
+  return sum + g;
+}
+
+@noinline fn k_prefix(src: int32*, dst: int32*, n: int64,
+                      guard: int64) -> int64 {
+  var g: int64 = guard * 31 + 8;
+  var sum: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    sum = sum + (int64)src[i];
+    dst[i] = (int32)sum;
+    i = i + 1;
+  }
+  return sum + g;
+}
+
+// --- searches -------------------------------------------------------------
+
+@noinline fn k_find_eq(a: int32*, n: int64, key: int32, guard: int64) -> int64 {
+  var g: int64 = guard * 37 + 9;
+  var i: int64 = 0;
+  while (i < n) {
+    if (a[i] == key) { return i + g; }
+    i = i + 1;
+  }
+  return -1 + g;
+}
+
+@noinline fn k_find_gt(a: int32*, n: int64, key: int32, guard: int64) -> int64 {
+  var g: int64 = guard * 41 + 10;
+  var i: int64 = 0;
+  while (i < n) {
+    if (a[i] > key) { return i + g; }
+    i = i + 1;
+  }
+  return -1 + g;
+}
+
+@noinline fn k_words(buf: cstring, len: int64, guard: int64) -> int64 {
+  var g: int64 = guard * 43 + 11;
+  var count: int64 = 0;
+  var in_word: int32 = 0;
+  var i: int64 = 0;
+  while (i < len) {
+    var c: uint8 = (uint8)buf[i];
+    if (c == 32 || c == 9 || c == 10 || c == 13) {
+      in_word = 0;
+    } else {
+      if (in_word == 0) { count = count + 1; }
+      in_word = 1;
+    }
+    i = i + 1;
+  }
+  return count + g;
+}
+
+// --- block move -----------------------------------------------------------
+
+@noinline fn k_memcpy(dst: cstring, src: cstring, guard: int64) -> int64 {
+  var g: int64 = guard * 47 + 12;
+  memcpy(dst, src, 256);
+  return g;
+}
+
+fn main() -> int32 {
+  // Sizes deliberately straddle the kernels' vector-block boundaries so the
+  // aligned body, the sub-block tail, and the scalar remainder all run.
+  var a: int32[33];
+  var b: int32[33];
+  var dst: int32[33];
+  var i: int64 = 0;
+  while (i < 33) { a[i] = (int32)(i * 3 - 20); b[i] = 2; i = i + 1; }
+
+  // sum_i32: sum(3i - 20) for i in 0..32 = 3*528 - 660 = 924
+  if (k_sum_i32(&a[0], 33, 1) != 924 + 8) { return 1; }
+
+  var u: uint8[40];
+  i = 0;
+  while (i < 40) { u[i] = (uint8)(i + 1); i = i + 1; }
+  if (k_sum_u8(&u[0], 40, 1) != 820 + 13) { return 2; }
+
+  // dot: 2 * 924
+  if (k_dot_i32(&a[0], &b[0], 33, 1) != 1848 + 16) { return 3; }
+
+  var qa: int8[40];
+  var qb: int8[40];
+  i = 0;
+  while (i < 40) { qa[i] = (int8)(i % 7); qb[i] = 3; i = i + 1; }
+  // sum(i % 7) for i in 0..39 = 5 whole cycles of 0..6 (105) + 0..4 (10) = 115
+  if (k_dot_i8(&qa[0], &qb[0], 40, 1) != 115 * 3 + 4) { return 26; }
+
+  var fa: float64[17];
+  var fb: float64[17];
+  i = 0;
+  while (i < 17) { fa[i] = 2.0; fb[i] = 3.0; i = i + 1; }
+  if (k_sum_f64(&fa[0], 17, 3) != 40.0) { return 4; }
+  if (k_dot_f64(&fa[0], &fb[0], 17, 3) != 108.0) { return 5; }
+
+  var ga: float32[17];
+  var gb: float32[17];
+  i = 0;
+  while (i < 17) { ga[i] = 2.0; gb[i] = 3.0; i = i + 1; }
+  if (k_sum_f32(&ga[0], 17, 3) != 40.0) { return 6; }
+  if (k_dot_f32(&ga[0], &gb[0], 17, 3) != 108.0) { return 7; }
+
+  // minmax over 3i-20, i in 0..32: min -20, max 76
+  if (k_minmax(&a[0], 33, 2, 3, 5, 7) !=
+      -20 * 1000 + 76 + 2 * 17 + 3 * 19 + 5 * 23 + 7 * 29) { return 8; }
+
+  // scale: sum(3*(3i-20)+7) = 3*924 + 33*7 = 3003
+  if (k_scale(&a[0], &dst[0], 33, 1) != 3003 + 24) { return 9; }
+  if (dst[32] != 3 * 76 + 7) { return 10; }
+
+  // clamp to [-90, 90]: nothing in 3i-20 exceeds it, so the sum is unchanged
+  if (k_clamp(&a[0], &dst[0], 33, 1) != 924 + 29) { return 11; }
+  if (dst[0] != -20) { return 12; }
+
+  if (k_reverse(&a[0], &dst[0], 33, 1) != 924 + 36) { return 13; }
+  if (dst[0] != 76) { return 14; }
+  if (dst[32] != -20) { return 15; }
+
+  // prefix sum returns the running total, i.e. the full sum
+  if (k_prefix(&a[0], &dst[0], 33, 1) != 924 + 39) { return 16; }
+  if (dst[32] != 924) { return 17; }
+
+  // a[24] = 52 is the first element equal to 52 and the first greater than 51
+  if (k_find_eq(&a[0], 33, 52, 1) != 24 + 46) { return 18; }
+  if (k_find_eq(&a[0], 33, 5, 1) != -1 + 46) { return 19; }
+  if (k_find_gt(&a[0], 33, 51, 1) != 24 + 51) { return 20; }
+
+  var text: uint8[24];
+  i = 0;
+  while (i < 24) { text[i] = 32; i = i + 1; }
+  text[0] = 97; text[1] = 98;            // "ab"
+  text[5] = 99;                          // "c"
+  text[10] = 100; text[11] = 101;        // "de"
+  text[23] = 102;                        // "f"
+  if (k_words((cstring)((int64)&text[0]), 24, 1) != 4 + 54) { return 21; }
+
+  var s: uint8[256];
+  var d: uint8[256];
+  i = 0;
+  while (i < 256) { s[i] = (uint8)(i & 255); d[i] = 0; i = i + 1; }
+  if (k_memcpy((cstring)((int64)&d[0]), (cstring)((int64)&s[0]), 1) != 59) { return 22; }
+  if (d[0] != 0) { return 23; }
+  if (d[255] != 255) { return 24; }
+  if (d[137] != 137) { return 25; }
+
+  // byte_map: xor 7 in place, twice, restores the original bytes
+  var m: uint8[40];
+  i = 0;
+  while (i < 40) { m[i] = (uint8)(i + 1); i = i + 1; }
+  if (k_byte_map(&m[0], 40, 1) != 66) { return 27; }
+  if (m[0] != (1 ^ 7)) { return 28; }
+  if (m[39] != (40 ^ 7)) { return 29; }
+  if (k_byte_map(&m[0], 40, 1) != 66) { return 30; }
+  if (m[17] != 18) { return 31; }
+
+  // lower_bound over a sorted array: first index whose value is >= key
+  var srt: int32[33];
+  i = 0;
+  while (i < 33) { srt[i] = (int32)(i * 2); i = i + 1; }
+  if (k_lower_bound(&srt[0], 33, 20, 1) != 10 + 73) { return 32; }
+  if (k_lower_bound(&srt[0], 33, 21, 1) != 11 + 73) { return 33; }
+  if (k_lower_bound(&srt[0], 33, -5, 1) != 0 + 73) { return 34; }
+  if (k_lower_bound(&srt[0], 33, 999, 1) != 33 + 73) { return 35; }
+
+  return 0;
+}

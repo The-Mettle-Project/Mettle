@@ -65,6 +65,60 @@ static int mir_trace_bail(const IRFunction *fn, const char *reason) {
   return 0;
 }
 
+/* ---- inline kernel operand walk ----------------------------------------- */
+
+/* Every operand slot of an instruction in one sequence: dest, lhs, rhs, then
+ * the arguments. Returns NULL past the end, so callers just index upward. Both
+ * the eligibility gate and the lowering walk kernels this way, which is what
+ * keeps them agreeing on exactly which operands get staged. */
+static const IROperand *mir_instruction_operand_at(const IRInstruction *in,
+                                                   int index) {
+  if (index == 0) {
+    return &in->dest;
+  }
+  if (index == 1) {
+    return &in->lhs;
+  }
+  if (index == 2) {
+    return &in->rhs;
+  }
+  size_t a = (size_t)(index - 3);
+  if (in->arguments && a < in->argument_count) {
+    return &in->arguments[a];
+  }
+  return NULL;
+}
+
+/* Upper bound on the staging slots an inline kernel instruction needs: one per
+ * by-name (TEMP/SYMBOL) operand. Immediates, floats, and string literals are
+ * materialized by the kernel itself and need no slot. Returns -1 if an operand
+ * is of a kind the bridge cannot stage (a LABEL, which no kernel takes). The
+ * real slot count can only be lower, since operands naming one value share a
+ * slot; over-estimating here just makes the gate marginally strict. */
+static int mir_kernel_slot_estimate(const IRInstruction *in) {
+  int slots = 0;
+  for (int k = 0;; k++) {
+    const IROperand *op = mir_instruction_operand_at(in, k);
+    if (!op) {
+      break;
+    }
+    switch (op->kind) {
+    case IR_OPERAND_TEMP:
+    case IR_OPERAND_SYMBOL:
+      slots++;
+      break;
+    case IR_OPERAND_NONE:
+    case IR_OPERAND_INT:
+    case IR_OPERAND_FLOAT:
+    case IR_OPERAND_STRING:
+      break;
+    default:
+      return -1;
+    }
+  }
+  return slots;
+}
+
 /* True if `name` resolves to a read-accessible global scalar — a value we can
  * cache in a register at function entry (used by both the eligibility gate and
  * the entry-load emitter, so they agree exactly on what counts as cacheable). */
@@ -1770,7 +1824,19 @@ int mir_function_is_eligible(CodeGenerator *generator,
       break;
     }
     default: {
-      /* NEW, other SIMD ops, ROTATE_ADD: not yet. */
+      /* A kernel in the inline-kernel table runs in place (MIR_IR_KERNEL): it
+       * needs no per-opcode gate, only room to stage its by-name operands. */
+      if (mir_ir_kernel_for_op(in->op)) {
+        int slots = mir_kernel_slot_estimate(in);
+        if (slots < 0) {
+          return mir_trace_bail(ir_function, "kernel:operand_kind");
+        }
+        if (slots > MIR_KERNEL_MAX_SLOTS) {
+          return mir_trace_bail(ir_function, "kernel:slots");
+        }
+        break;
+      }
+      /* NEW, ROTATE_ADD, the tensor ops: not yet. */
       char buf[40];
       snprintf(buf, sizeof(buf), "op:%d", (int)in->op);
       return mir_trace_bail(ir_function, buf);
@@ -2663,6 +2729,131 @@ static int mir_fuses_compare_branch(CodeGenerator *g, IRFunction *function,
   (void)g;
   return code_generator_binary_function_temp_use_count(function,
                                                        cmp->dest.name) == 1;
+}
+
+/* ---- generic inline kernel (MIR_IR_KERNEL) ------------------------------- */
+
+/* Run one table kernel in place. Every by-name operand of `in` is staged into
+ * an address-taken vreg (a plain frame slot), the kernel runs against those
+ * slots, and each slot is read back into the value it came from.
+ *
+ * Staging through memory rather than fixed registers is what makes this one
+ * routine cover the whole table: the bridge never has to know which register a
+ * kernel wants an operand in, how many times it loads it, or which of its
+ * operands it writes. The cost is a store and a load per operand around a loop
+ * that runs over an entire array, which is not measurable.
+ *
+ * Operands naming the SAME value share one slot (see MirKernelAux): a kernel
+ * that accumulates into its own destination reads and writes one variable
+ * through two operand positions, and two slots would race on the read-back. */
+static int mir_lower_ir_kernel(MirFunction *fn, CodeGenerator *g,
+                               BinaryFunctionContext *ctx, MirNameMap *map,
+                               const IRInstruction *in) {
+  int kernel_index = mir_ir_kernel_index_for_op(in->op);
+  if (kernel_index < 0) {
+    fn->has_error = 1;
+    return 0;
+  }
+
+  MirKernelAux *aux = (MirKernelAux *)calloc(1, sizeof(MirKernelAux));
+  if (!mir_function_own_aux(fn, aux)) {
+    return 0;
+  }
+  aux->ir = in; /* borrowed: the IR outlives this function's codegen */
+  aux->kernel_index = kernel_index;
+
+  /* Source vreg per slot, and the staging vreg it is copied through. Kept
+   * alongside the aux (which the encoder reads) rather than in it, since the
+   * encoder needs only the staging side. */
+  MirVregId source[MIR_KERNEL_MAX_SLOTS];
+  int is_float[MIR_KERNEL_MAX_SLOTS];
+  int width[MIR_KERNEL_MAX_SLOTS];
+
+  for (int k = 0;; k++) {
+    const IROperand *op = mir_instruction_operand_at(in, k);
+    if (!op) {
+      break;
+    }
+    if (op->kind != IR_OPERAND_TEMP && op->kind != IR_OPERAND_SYMBOL) {
+      continue; /* the kernel materializes immediates and literals itself */
+    }
+    MirOperand v = mir_value_operand(fn, g, ctx, map, op);
+    if (v.kind != MIR_OPK_VREG) {
+      fn->has_error = 1;
+      return 0;
+    }
+    int slot = -1;
+    for (int s = 0; s < aux->slot_count; s++) {
+      if (source[s] == v.vreg) {
+        slot = s;
+        break;
+      }
+    }
+    if (slot < 0) {
+      if (aux->slot_count >= MIR_KERNEL_MAX_SLOTS) {
+        fn->has_error = 1; /* the gate sized this; a mismatch is a bug */
+        return 0;
+      }
+      int fb = code_generator_binary_operand_float_bits(g, ctx, op);
+      slot = aux->slot_count++;
+      source[slot] = v.vreg;
+      is_float[slot] = fb ? 1 : 0;
+      width[slot] = fb ? fb / 8 : 8;
+      MirVregId stage = mir_new_vreg(fn, fb ? MIR_RC_XMM : MIR_RC_GP,
+                                     width[slot]);
+      if (stage == MIR_VREG_NONE) {
+        return 0;
+      }
+      /* address_taken keeps the staging value out of the register file: it
+       * lives only in its frame slot, which is exactly the storage the kernel
+       * addresses. */
+      fn->vregs[stage].address_taken = 1;
+      aux->slot_vreg[slot] = stage;
+    }
+    if (aux->operand_count >= MIR_KERNEL_MAX_SLOTS) {
+      fn->has_error = 1;
+      return 0;
+    }
+    aux->operand[aux->operand_count] = op;
+    aux->operand_slot[aux->operand_count] = slot;
+    aux->operand_count++;
+  }
+
+  for (int s = 0; s < aux->slot_count; s++) {
+    MirOperand stage = mir_op_vreg(aux->slot_vreg[s]);
+    MirOperand src = mir_op_vreg(source[s]);
+    if (is_float[s] ? !mir_emit_fmov(fn, stage, src, width[s])
+                    : !mir_emit1(fn, MIR_MOV, stage, src, mir_op_none(), 8, 0,
+                                 0)) {
+      return 0;
+    }
+  }
+
+  {
+    MirInst kin;
+    memset(&kin, 0, sizeof(kin));
+    kin.op = MIR_IR_KERNEL;
+    kin.dst = mir_op_imm(kernel_index);
+    kin.ir_index = -1;
+    kin.aux = aux;
+    if (!mir_emit(fn, &kin)) {
+      return 0;
+    }
+  }
+
+  /* Read every slot back, not just the ones the kernel writes: which operands
+   * are outputs is kernel-specific knowledge the bridge deliberately does not
+   * carry, and reloading an input costs one move and restores its own value. */
+  for (int s = 0; s < aux->slot_count; s++) {
+    MirOperand stage = mir_op_vreg(aux->slot_vreg[s]);
+    MirOperand dst = mir_op_vreg(source[s]);
+    if (is_float[s] ? !mir_emit_fmov(fn, dst, stage, width[s])
+                    : !mir_emit1(fn, MIR_MOV, dst, stage, mir_op_none(), 8, 0,
+                                 0)) {
+      return 0;
+    }
+  }
+  return 1;
 }
 
 static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
@@ -4026,6 +4217,9 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
   }
 
   default:
+    if (mir_ir_kernel_index_for_op(in->op) >= 0) {
+      return mir_lower_ir_kernel(fn, g, ctx, map, in);
+    }
     fn->has_error = 1;
     return 0;
   }
@@ -5695,9 +5889,14 @@ int code_generator_binary_emit_function_via_mir(
      * address-taken globals to memory first (so the access sees pending by-name
      * writes), and reload them after a STORE (so a later by-name read sees what
      * the store wrote through the alias). Empty set => no overhead. */
+    /* An inline kernel reads and writes arrays through pointers, so it is a
+     * pointer memory op for this purpose too: an address-taken global it walks
+     * over must be flushed from its cache vreg first and reloaded after. */
+    int kernel_op =
+        mir_ir_kernel_index_for_op(ir_function->instructions[i].op) >= 0;
     int mem_op = ir_function->instructions[i].op == IR_OP_LOAD ||
-                 ir_function->instructions[i].op == IR_OP_STORE;
-    int store_op = ir_function->instructions[i].op == IR_OP_STORE;
+                 ir_function->instructions[i].op == IR_OP_STORE || kernel_op;
+    int store_op = ir_function->instructions[i].op == IR_OP_STORE || kernel_op;
     if (mem_op && wb.at_count > 0 &&
         !mir_emit_global_flush_names(&fn, generator, &map, wb.at, wb.at_count)) {
       free(fold_skip);

@@ -8422,6 +8422,8 @@ $runFixtures = @(
      What = "a codegen check failed" },
   @{ Name = "simd_loops"; Path = "tests/codegen/simd_loops.mettle"
      What = "a codegen check failed" },
+  @{ Name = "inline_kernels"; Path = "tests/codegen/inline_kernels.mettle"
+     What = "a vector kernel run inside a register-allocated frame produced the wrong value" },
   @{ Name = "switch_dense"; Path = "tests/codegen/switch_dense.mettle"
      What = "a codegen check failed" },
   @{ Name = "enums_match"; Path = "tests/codegen/enums_match.mettle"

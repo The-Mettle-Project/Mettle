@@ -26,7 +26,34 @@ void mir_function_destroy(MirFunction *fn) {
     free(fn->owned_syms[i]);
   }
   free(fn->owned_syms);
+  for (size_t i = 0; i < fn->owned_aux_count; i++) {
+    free(fn->owned_aux[i]);
+  }
+  free(fn->owned_aux);
   memset(fn, 0, sizeof(*fn));
+}
+
+void *mir_function_own_aux(MirFunction *fn, void *block) {
+  if (!fn || !block) {
+    if (fn) {
+      fn->has_error = 1;
+    }
+    free(block);
+    return NULL;
+  }
+  if (fn->owned_aux_count >= fn->owned_aux_capacity) {
+    size_t nc = fn->owned_aux_capacity ? fn->owned_aux_capacity * 2 : 4;
+    void **grown = (void **)realloc(fn->owned_aux, nc * sizeof(void *));
+    if (!grown) {
+      fn->has_error = 1;
+      free(block);
+      return NULL;
+    }
+    fn->owned_aux = grown;
+    fn->owned_aux_capacity = nc;
+  }
+  fn->owned_aux[fn->owned_aux_count++] = block;
+  return block;
 }
 
 MirVregId mir_new_vreg(MirFunction *fn, MirRegClass rclass, int width) {
@@ -240,9 +267,25 @@ const char *mir_opcode_name(MirOpcode op) {
   case MIR_SIMD_AFFINE_MAP_F64: return "simd_affine_map_f64";
   case MIR_SIMD_SILU_F32: return "simd_silu_f32";
   case MIR_SIMD_VLOOP: return "simd_vloop";
+  case MIR_IR_KERNEL: return "ir_kernel";
   case MIR_OPCODE_COUNT: break;
   }
   return "?";
+}
+
+int mir_op_is_inline_kernel(MirOpcode op) {
+  switch (op) {
+  case MIR_SIMD_SLP_MAC:
+  case MIR_SIMD_FILL:
+  case MIR_SIMD_AFFINE_MAP_F32:
+  case MIR_SIMD_AFFINE_MAP_F64:
+  case MIR_SIMD_SILU_F32:
+  case MIR_SIMD_VLOOP:
+  case MIR_IR_KERNEL:
+    return 1;
+  default:
+    return 0;
+  }
 }
 
 static void mir_dump_operand(const MirFunction *fn, const MirOperand *op,
