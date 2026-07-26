@@ -1,0 +1,15 @@
+// A decimal literal past LLONG_MAX is still a uint64. It used to be rejected as
+// out of range, so a uint64 constant had to be spelled in hex.
+
+fn main() -> int32 {
+  var max: uint64 = 18446744073709551615;
+  if (max != 0xFFFFFFFFFFFFFFFF) { return 1; }
+  var near: uint64 = 18446744073709551614;
+  if (near + 1 != max) { return 2; }
+  var ten19: uint64 = 10000000000000000000;
+  if (ten19 != 0x8AC7230489E80000) { return 3; }
+  var signed_max: int64 = 9223372036854775807;
+  if (signed_max != 0x7FFFFFFFFFFFFFFF) { return 4; }
+  if (ten19 / 2 != 5000000000000000000) { return 5; }
+  return 0;
+}

@@ -615,6 +615,21 @@ static int ir_cp_operand_constant(const IRTempValueMap *temp_map,
  * number C never produced. `(int)15 << 28` is 0xF0000000, which is negative as
  * an int: folding it as 64-bit left it positive, so the `>> 28` that read it
  * back shifted in zeros and `(x << 28) >> 28` gave 15 instead of -1. */
+static int ir_mtlc_type_is_unsigned_integer(const MtlcType *type) {
+  if (!type) {
+    return 0;
+  }
+  switch (type->kind) {
+  case MTLC_TYPE_UINT8:
+  case MTLC_TYPE_UINT16:
+  case MTLC_TYPE_UINT32:
+  case MTLC_TYPE_UINT64:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
 static long long ir_narrow_folded(const MtlcType *type, long long value) {
   if (!type) {
     return value;
@@ -709,7 +724,18 @@ static void ir_cp_fold_constant_binary(const IRFunction *function,
       return; /* pointer/float/struct-typed home: not an integer fold */
     }
   }
-  (void)narrow_unsigned;
+  /* The evaluator computes signed semantics, so a sign-sensitive op on an
+   * unsigned destination must not fold here. instruction->is_unsigned only ever
+   * gets set on loads, so this declared-type answer is the one that catches a
+   * `uint64` local: `var c: uint64 = 10000000000000000000; c / 2` folded with a
+   * signed divide and silently produced a negative result under -O while the
+   * unoptimized build divided correctly. */
+  if (narrow_unsigned &&
+      (strcmp(op, ">>") == 0 || strcmp(op, "/") == 0 || strcmp(op, "%") == 0 ||
+       strcmp(op, "<") == 0 || strcmp(op, "<=") == 0 || strcmp(op, ">") == 0 ||
+       strcmp(op, ">=") == 0)) {
+    return;
+  }
 
   long long result = 0;
   int folded = 0;
@@ -1076,6 +1102,20 @@ static int ir_try_fold_integer_binary(IRInstruction *instruction, int *changed) 
   if (!instruction || instruction->op != IR_OP_BINARY || instruction->is_float ||
       !instruction->text) {
     return 1;
+  }
+
+  /* Same rule as the propagation-time fold above: signed evaluation cannot
+   * stand in for an unsigned divide, remainder, shift, or ordering. */
+  if ((instruction->is_unsigned ||
+       ir_mtlc_type_is_unsigned_integer(instruction->value_type)) &&
+      (strcmp(instruction->text, ">>") == 0 ||
+       strcmp(instruction->text, "/") == 0 ||
+       strcmp(instruction->text, "%") == 0 ||
+       strcmp(instruction->text, "<") == 0 ||
+       strcmp(instruction->text, "<=") == 0 ||
+       strcmp(instruction->text, ">") == 0 ||
+       strcmp(instruction->text, ">=") == 0)) {
+    return ir_rewrite_apply_binary_identities(instruction, changed);
   }
 
   if (instruction->lhs.kind == IR_OPERAND_INT &&

@@ -1706,8 +1706,22 @@ static int parser_parse_integer_literal_string(
     return 0;
   }
   if (errno == ERANGE) {
-    parser_set_error(parser, "Decimal integer literal is out of range");
-    return 0;
+    /* Past LLONG_MAX but still a uint64: retry unsigned and keep the bit
+     * pattern, exactly as the hexadecimal branch above already does. Without
+     * this, a uint64 constant had to be written in hex -- 18446744073709551615
+     * was rejected while 0xFFFFFFFFFFFFFFFF, the same value, was accepted. A
+     * leading '-' is not part of the literal (it lexes as unary minus), so
+     * this only ever widens the positive range. */
+    errno = 0;
+    end = NULL;
+    unsigned long long u = strtoull(value, &end, 10);
+    if (end == value || *end != '\0' || errno == ERANGE) {
+      parser_set_error(parser, "Decimal integer literal is out of range");
+      return 0;
+    }
+    *out_radix = 10;
+    *out_value = (long long)u;
+    return 1;
   }
   *out_radix = 10;
   *out_value = s;

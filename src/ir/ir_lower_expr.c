@@ -1135,6 +1135,19 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
     instruction.lhs = left;
     instruction.rhs = right;
     instruction.text = binary->operator;
+    /* Record that this operation is unsigned so the optimizer's constant
+     * folder, which evaluates in signed long long, declines to fold a divide,
+     * remainder, right shift, or ordering that signed arithmetic would get
+     * wrong. Nothing else set this for a binary, so `var c: uint64 = 1e19; c /
+     * 2` folded with a signed divide under -O and produced a negative result
+     * while the unoptimized build divided correctly. Either operand being
+     * unsigned makes the operation unsigned, matching the usual arithmetic
+     * conversions the type checker already applied. */
+    instruction.is_unsigned =
+        ir_type_is_unsigned_integer(
+            ir_infer_expression_type(context, binary->left)) ||
+        ir_type_is_unsigned_integer(
+            ir_infer_expression_type(context, binary->right));
     int operation_float_bits = ir_binary_expression_operation_float_bits(
         context, expression, binary);
     instruction.is_float = operation_float_bits != 0;

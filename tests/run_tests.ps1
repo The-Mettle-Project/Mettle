@@ -8457,7 +8457,13 @@ $runFixtures = @(
   @{ Name = "nested_generics"; Path = "tests/codegen/nested_generics.mettle"
      What = "a nested generic instantiation was wrong" },
   @{ Name = "keyword_field_names"; Path = "tests/codegen/keyword_field_names.mettle"
-     What = "a mnemonic-named field read back wrong" }
+     What = "a mnemonic-named field read back wrong" },
+  @{ Name = "struct_methods"; Path = "tests/codegen/struct_methods.mettle"
+     What = "a struct method body behaved wrong" },
+  @{ Name = "unsigned_fold"; Path = "tests/codegen/unsigned_fold.mettle"
+     What = "an unsigned operation folded with signed semantics" },
+  @{ Name = "uint64_literals"; Path = "tests/codegen/uint64_literals.mettle"
+     What = "a uint64 decimal literal was wrong" }
 )
 foreach ($fixture in $runFixtures) {
   foreach ($mode in @(@{ Name = "debug"; Args = @() },
