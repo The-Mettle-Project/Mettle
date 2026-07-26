@@ -53,6 +53,10 @@ tools/mlopt/_auto_summary.sh
 tools/mlopt/_dagger.log
 
 promotion/
+# Discord bot: deployed straight to mikoshi (/home/claude/mettlebot), not shipped
+# with the toolchain. Keep bot.env out of a repo whatever else happens to it.
+tools/discord-bot/
+examples/cad/
 .vs/
 tests/profiler_test.mettle
 tests/parse_stress_test.mettle
