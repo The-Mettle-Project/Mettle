@@ -8453,7 +8453,11 @@ $runFixtures = @(
   @{ Name = "methods"; Path = "tests/codegen/methods.mettle"
      What = "a codegen check failed" },
   @{ Name = "generics_mono"; Path = "tests/codegen/generics_mono.mettle"
-     What = "a codegen check failed" }
+     What = "a codegen check failed" },
+  @{ Name = "nested_generics"; Path = "tests/codegen/nested_generics.mettle"
+     What = "a nested generic instantiation was wrong" },
+  @{ Name = "keyword_field_names"; Path = "tests/codegen/keyword_field_names.mettle"
+     What = "a mnemonic-named field read back wrong" }
 )
 foreach ($fixture in $runFixtures) {
   foreach ($mode in @(@{ Name = "debug"; Args = @() },

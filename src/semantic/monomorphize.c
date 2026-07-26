@@ -783,6 +783,17 @@ static void record_generic_type_use(MonoContext *ctx, const char *type_name,
     return;
   }
 
+  /* A type argument may itself be a generic instantiation, as in
+   * `Pair<Box<int32>, int32>`. Substitution already mangles the field type to
+   * `Box__int32`, but nothing ever asked for `Box<int32>` to be generated, so
+   * the field referred to a struct that did not exist. Record the arguments
+   * BEFORE the type that uses them: emission follows list order, and Mettle
+   * requires a type to be declared before it is used, so `Box__int32` has to
+   * land in the program ahead of the struct whose field names it. */
+  for (size_t i = 0; i < arg_count; i++) {
+    record_generic_type_use(ctx, args[i], location);
+  }
+
   mono_add_instantiation(ctx, base, args, arg_count, location);
   free(base);
   free_string_array(args, arg_count);

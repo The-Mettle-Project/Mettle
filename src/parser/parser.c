@@ -1089,6 +1089,34 @@ int parser_is_identifier_like(TokenType type) {
          (type >= TOKEN_EAX && type <= TOKEN_R15);
 }
 
+/* A nested type argument list closes with `>>`, which the lexer reads as one
+ * right-shift token: `Pair<Box<int32>, Box<int32>>` failed to parse while the
+ * same type spelled `... Box<int32> >` succeeded.
+ *
+ * These two split it. The inner list takes one `>` from the pair by rewriting
+ * the token in place to a single `>` WITHOUT advancing, leaving that `>` as the
+ * current token for the enclosing list to consume normally. Deeper nests fall
+ * out of the same rule: `>>>>` is RSHIFT RSHIFT, and each level takes one `>`
+ * in turn. Only the type is rewritten -- the token's text stays ">>", which
+ * nothing in this path reads -- so a speculative parse that backtracks restores
+ * the original token from its clone and loses the rewrite with it. */
+static int parser_at_type_arg_close(const Parser *parser) {
+  return parser->current_token.type == TOKEN_GREATER_THAN ||
+         parser->current_token.type == TOKEN_RSHIFT;
+}
+
+static int parser_consume_type_arg_close(Parser *parser) {
+  if (parser->current_token.type == TOKEN_GREATER_THAN) {
+    parser_advance(parser);
+    return 1;
+  }
+  if (parser->current_token.type == TOKEN_RSHIFT) {
+    parser->current_token.type = TOKEN_GREATER_THAN;
+    return 1;
+  }
+  return 0;
+}
+
 int parser_is_type_keyword(TokenType type) {
   // Check if token is a built-in type keyword
   return (type >= TOKEN_INT8 && type <= TOKEN_STRING_TYPE);
@@ -1481,7 +1509,7 @@ static char *parser_parse_type_annotation(Parser *parser) {
     args_buf[0] = '\0';
 
     int first = 1;
-    while (parser->current_token.type != TOKEN_GREATER_THAN &&
+    while (!parser_at_type_arg_close(parser) &&
            parser->current_token.type != TOKEN_EOF && !parser->has_error) {
       if (!first) {
         if (parser->current_token.type != TOKEN_COMMA) {
@@ -1534,7 +1562,8 @@ static char *parser_parse_type_annotation(Parser *parser) {
       free(arg);
     }
 
-    if (!parser_expect(parser, TOKEN_GREATER_THAN)) {
+    if (!parser_consume_type_arg_close(parser)) {
+      parser_set_error(parser, "Expected '>' to close the type argument list");
       free(args_buf);
       free(type_name);
       return NULL;
@@ -2320,7 +2349,7 @@ static int parser_try_parse_generic_call_type_args(Parser *parser,
   size_t type_arg_count = 0;
   int success = 1;
 
-  while (parser->current_token.type != TOKEN_GREATER_THAN &&
+  while (!parser_at_type_arg_close(parser) &&
          parser->current_token.type != TOKEN_EOF) {
     if (type_arg_count > 0) {
       if (parser->current_token.type != TOKEN_COMMA) {
@@ -2341,8 +2370,7 @@ static int parser_try_parse_generic_call_type_args(Parser *parser,
     type_args[type_arg_count++] = arg;
   }
 
-  if (success && parser->current_token.type == TOKEN_GREATER_THAN) {
-    parser_advance(parser); // consume '>'
+  if (success && parser_consume_type_arg_close(parser)) {
     if (parser->current_token.type == TOKEN_LPAREN) {
       *out_type_args = type_args;
       *out_type_arg_count = type_arg_count;
@@ -2652,7 +2680,13 @@ ASTNode *parser_parse_postfix_expression(Parser *parser) {
       // Member access
       parser_advance(parser); // consume '.'
 
-      if (parser->current_token.type != TOKEN_IDENTIFIER) {
+      /* A field name here is subject to the same rule as where it was declared
+       * and where a literal initializes it, both of which accept any
+       * identifier-like token. The x86 mnemonics are lexed as keywords
+       * everywhere, not just inside an `asm` block, so requiring a bare
+       * TOKEN_IDENTIFIER meant a field called `add`, `sub`, `cmp`, `div`, or
+       * `mov` could be declared and initialized but never read back. */
+      if (!parser_is_identifier_like(parser->current_token.type)) {
         parser_set_error(parser, "Expected member name after '.'");
         ast_destroy_node(expr);
         return NULL;
@@ -2686,7 +2720,7 @@ ASTNode *parser_parse_postfix_expression(Parser *parser) {
       // Pointer member access: p->field == (*p).field
       parser_advance(parser); // consume '->'
 
-      if (parser->current_token.type != TOKEN_IDENTIFIER) {
+      if (!parser_is_identifier_like(parser->current_token.type)) {
         parser_set_error(parser, "Expected member name after '->'");
         ast_destroy_node(expr);
         return NULL;
