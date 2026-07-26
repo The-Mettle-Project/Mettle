@@ -1032,8 +1032,68 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
     return 1;
   }
 
-  default:
-    ir_set_error(context, "Expression is not assignable in IR lowering");
-    return 0;
+  default: {
+    /* An aggregate rvalue -- a struct returned by a call, as in
+     * `make_point().x` -- has no storage to point at, so a member or index
+     * access on one had nowhere to read from and this reported "not
+     * assignable". Give it storage: declare a synthetic local of the value's
+     * type, assign the value into it, and hand back that local's address. This
+     * is the same shape the frontend already produces for
+     * `var t: S = make_point(); t.x`, just without the source-level name. */
+    Type *value_type = ir_infer_expression_type(context, expression);
+    if (!value_type || !value_type->name ||
+        (value_type->kind != TYPE_STRUCT && value_type->kind != TYPE_ARRAY)) {
+      ir_set_error(context, "Expression is not assignable in IR lowering");
+      return 0;
+    }
+
+    char temp_local_name[48];
+    snprintf(temp_local_name, sizeof(temp_local_name), ".aggregate_tmp%d",
+             context->next_temp_id++);
+
+    IRInstruction local = {0};
+    local.op = IR_OP_DECLARE_LOCAL;
+    local.location = expression->location;
+    local.dest = ir_operand_symbol(temp_local_name);
+    local.text = value_type->name;
+    local.value_type = mtlc_type_from_frontend(value_type);
+    if (!local.dest.name) {
+      ir_set_error(context, "Out of memory materializing aggregate rvalue");
+      return 0;
+    }
+    int local_ok = ir_emit(context, function, &local);
+    ir_operand_destroy(&local.dest);
+    if (!local_ok) {
+      return 0;
+    }
+
+    IROperand value = ir_operand_none();
+    if (!ir_lower_expression(context, function, expression, &value)) {
+      return 0;
+    }
+
+    IRInstruction assign = {0};
+    assign.op = IR_OP_ASSIGN;
+    assign.location = expression->location;
+    assign.dest = ir_operand_symbol(temp_local_name);
+    assign.lhs = value;
+    if (!assign.dest.name) {
+      ir_operand_destroy(&value);
+      ir_set_error(context, "Out of memory materializing aggregate rvalue");
+      return 0;
+    }
+    int assign_ok = ir_emit(context, function, &assign);
+    ir_operand_destroy(&assign.dest);
+    ir_operand_destroy(&value);
+    if (!assign_ok) {
+      return 0;
+    }
+
+    if (out_type) {
+      *out_type = value_type;
+    }
+    return ir_emit_address_of_symbol(context, function, temp_local_name,
+                                     expression->location, out_address);
+  }
   }
 }

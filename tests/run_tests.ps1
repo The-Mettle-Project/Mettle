@@ -8407,7 +8407,11 @@ $runFixtures = @(
   @{ Name = "abi_mixed_args"; Path = "tests/codegen/abi_mixed_args.mettle"
      What = "an argument crossed the ABI boundary wrong" },
   @{ Name = "abi_struct_args"; Path = "tests/codegen/abi_struct_args.mettle"
-     What = "a struct argument or a spilled stack argument landed wrong" }
+     What = "a struct argument or a spilled stack argument landed wrong" },
+  @{ Name = "struct_ret_sizes"; Path = "tests/codegen/struct_ret_sizes.mettle"
+     What = "a struct return of some size class came back wrong" },
+  @{ Name = "call_chains"; Path = "tests/codegen/call_chains.mettle"
+     What = "a nested call passed something wrong" }
 )
 foreach ($fixture in $runFixtures) {
   foreach ($mode in @(@{ Name = "debug"; Args = @() },
