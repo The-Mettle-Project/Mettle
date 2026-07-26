@@ -3265,9 +3265,20 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
   target_ir_function =
       code_generator_find_ir_function_binary(generator, instruction->text);
 
-  /* Per-arg INDIRECT classification and per-call indirect-temp region. The
-   * region lives at [rsp + 0 .. indirect_temp_region) within the call's
-   * sub-rsp window, followed by shadow space and any stack arg slots. */
+  /* Per-arg INDIRECT classification and per-call indirect-temp region.
+   *
+   * The call frame from rsp upward is fixed by the ABI: shadow space first,
+   * then the outgoing stack-arg slots, because the callee finds an incoming
+   * stack argument at a fixed distance above the return address. The
+   * indirect-temp region -- scratch copies of by-value structs the callee
+   * receives by pointer -- is ours, so it goes ABOVE both, at
+   * indirect_temp_base. Putting it at rsp + 0 instead (as this did) shifts
+   * every outgoing stack slot up by its size, so the callee reads the wrong
+   * words: any INDIRECT struct argument silently corrupted every argument that
+   * spilled past the register slots.
+   *
+   * indirect_arg_offset[] is relative to indirect_temp_base, which is only
+   * known once the layout has reported stack_bytes. */
   size_t argument_count = instruction->argument_count;
   int *is_indirect_arg =
       argument_count > 0 ? calloc(argument_count, sizeof(int)) : NULL;
@@ -3392,8 +3403,10 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
     return 0;
   }
 
-  int call_stack_total =
-      indirect_temp_region + abi->shadow_space_size + stack_bytes;
+  /* Base of the indirect-temp region: above shadow space and the outgoing
+   * stack-arg slots, both of which the callee addresses at fixed offsets. */
+  int indirect_temp_base = abi->shadow_space_size + stack_bytes;
+  int call_stack_total = indirect_temp_base + indirect_temp_region;
   if (!binary_align_up_int(call_stack_total, 16, &call_stack_total)) {
     free(is_indirect_arg);
     free(indirect_arg_offset);
@@ -3433,7 +3446,8 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
     }
     /* dst = lea rdx, [rsp + offset] (offset within indirect_temp_region) */
     if (!binary_emit_lea_reg_mem(&context->code, BINARY_GP_RDX,
-                                 BINARY_GP_RSP, indirect_arg_offset[i]) ||
+                                 BINARY_GP_RSP,
+                                 indirect_temp_base + indirect_arg_offset[i]) ||
         !code_generator_binary_emit_rep_movsb(
             generator, context, BINARY_GP_RAX, BINARY_GP_RDX,
             indirect_arg_size[i])) {
@@ -3454,12 +3468,12 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
   for (size_t i = 0; i < argument_count; i++) {
     const BinaryArgLocation *loc = &arg_locations[i + hidden_arg_count];
     if (loc->kind != BINARY_ARG_ON_STACK) continue;
-    int slot_offset =
-        indirect_temp_region + abi->shadow_space_size + loc->stack_offset;
+    int slot_offset = abi->shadow_space_size + loc->stack_offset;
     if (is_indirect_arg[i]) {
       /* Place &temp into the stack slot. */
       if (!binary_emit_lea_reg_mem(&context->code, BINARY_GP_RAX,
-                                   BINARY_GP_RSP, indirect_arg_offset[i]) ||
+                                   BINARY_GP_RSP,
+                                 indirect_temp_base + indirect_arg_offset[i]) ||
           !binary_emit_mov_mem_reg(&context->code, BINARY_GP_RSP, slot_offset,
                                    BINARY_GP_RAX)) {
         free(is_indirect_arg);
@@ -3504,7 +3518,8 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
       /* INDIRECT args always pass a pointer in a GP register. */
       if (loc->kind != BINARY_ARG_IN_GP_REGISTER ||
           !binary_emit_lea_reg_mem(&context->code, loc->gp_register,
-                                   BINARY_GP_RSP, indirect_arg_offset[i])) {
+                                   BINARY_GP_RSP,
+                                 indirect_temp_base + indirect_arg_offset[i])) {
         free(is_indirect_arg);
         free(indirect_arg_offset);
         free(indirect_arg_size);

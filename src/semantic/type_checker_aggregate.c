@@ -311,6 +311,22 @@ static int aggregate_fold_scalar(TypeChecker *checker, ASTNode *element,
     }
     const char *referenced = aggregate_address_of_name(element);
     if (referenced) {
+      Symbol *symbol = symbol_table_lookup(checker->symbol_table, referenced);
+      /* The image records `&name` as a relocation, which the linker resolves
+       * against a symbol in the object file. A local lives on the stack and has
+       * no such symbol, so folding one produced an image referring to a name
+       * that does not exist -- surfacing as "Relocation refers to an undefined
+       * symbol" from the linker, with no source location. Only a module-scope
+       * name has an address that is known at link time. */
+      if (symbol && symbol->kind != SYMBOL_FUNCTION && symbol->scope &&
+          symbol->scope->type != SCOPE_GLOBAL) {
+        type_checker_set_error_at_location(
+            checker, element->location,
+            "'&%s' cannot appear in an aggregate literal: '%s' is a local, so "
+            "its address is only known at run time",
+            referenced, referenced);
+        return 0;
+      }
       char *copy = strdup(referenced);
       if (!copy) {
         type_checker_set_error_at_location(
@@ -318,7 +334,6 @@ static int aggregate_fold_scalar(TypeChecker *checker, ASTNode *element,
                                         "literal");
         return 0;
       }
-      Symbol *symbol = symbol_table_lookup(checker->symbol_table, referenced);
       if (symbol) {
         symbol->is_used = 1;
       }

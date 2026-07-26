@@ -665,6 +665,9 @@ $cases = @(
   # A global is laid out at compile time and there is no module initializer, so a
   # run-time initializer must be a diagnostic with a source location - it used to
   # reach the direct-object backend and abort as an internal compiler error.
+  @{ Name = "err_aggregate_address_of_local"; Path = "tests/err_aggregate_address_of_local.mettle"; ShouldSucceed = $false
+     Pattern = "is a local, so its address is only known at run time"
+     OutputMustNotMatch = @("Relocation refers to an undefined symbol") },
   @{ Name = "err_global_init_call"; Path = "tests/err_global_init_call.mettle"; ShouldSucceed = $false
      Pattern = "a global's initializer must be known at compile time"
      OutputMustNotMatch = @("internal compiler error") },
@@ -8400,7 +8403,11 @@ $runFixtures = @(
   @{ Name = "bool_roundtrip"; Path = "tests/codegen/bool_roundtrip.mettle"
      What = "a bool crossed a call boundary wrong" },
   @{ Name = "odd_size_aggregates"; Path = "tests/codegen/odd_size_aggregates.mettle"
-     What = "a 3/5/6/7-byte aggregate copied wrong" }
+     What = "a 3/5/6/7-byte aggregate copied wrong" },
+  @{ Name = "abi_mixed_args"; Path = "tests/codegen/abi_mixed_args.mettle"
+     What = "an argument crossed the ABI boundary wrong" },
+  @{ Name = "abi_struct_args"; Path = "tests/codegen/abi_struct_args.mettle"
+     What = "a struct argument or a spilled stack argument landed wrong" }
 )
 foreach ($fixture in $runFixtures) {
   foreach ($mode in @(@{ Name = "debug"; Args = @() },
