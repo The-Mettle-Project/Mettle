@@ -37,8 +37,8 @@ SKIP_ALL_PASSES = ",".join([
     # fixpoint passes (IR_OPT_PASS_LIST)
     "reduction_unroll", "copy_and_constant_propagation", "fuse_rotate_add",
     "strength_reduce_rotate_loops", "unroll_small_const_bound_loops",
-    "positive_loop_div2_to_shift", "fold_popcount_byte_loop",
-    "fuse_popcount_buffer_loop", "collatz_odd_step_fold",
+    "fold_popcount_byte_loop", "fuse_popcount_buffer_loop",
+    "collatz_odd_step_fold",
     "coalesce_single_use_temp_assign",
     "eliminate_single_use_float_symbol_copies",
     "common_subexpression_elimination", "constant_and_branch_simplify",

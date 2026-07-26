@@ -1079,26 +1079,9 @@ static int ir_try_evaluate_integer_binary(const char *op, long long lhs,
   return 1;
 }
 
-static int ir_try_get_positive_pow2_shift(long long value, long long *shift) {
-  if (!shift || value <= 0) {
-    return 0;
-  }
-
-  unsigned long long u = (unsigned long long)value;
-  if ((u & (u - 1ull)) != 0ull) {
-    return 0;
-  }
-
-  long long amount = 0;
-  while (u > 1ull) {
-    u >>= 1u;
-    amount++;
-  }
-  *shift = amount;
-  return 1;
-}
-
-static int ir_try_fold_integer_binary(IRInstruction *instruction, int *changed) {
+static int ir_try_fold_integer_binary(IRInstruction *instruction,
+                                      IRValueRangeCtx *ranges, size_t at,
+                                      int *changed) {
   if (!instruction || instruction->op != IR_OP_BINARY || instruction->is_float ||
       !instruction->text) {
     return 1;
@@ -1115,7 +1098,7 @@ static int ir_try_fold_integer_binary(IRInstruction *instruction, int *changed) 
        strcmp(instruction->text, "<=") == 0 ||
        strcmp(instruction->text, ">") == 0 ||
        strcmp(instruction->text, ">=") == 0)) {
-    return ir_rewrite_apply_binary_identities(instruction, changed);
+    return ir_rewrite_apply_binary_identities(instruction, ranges, at, changed);
   }
 
   if (instruction->lhs.kind == IR_OPERAND_INT &&
@@ -1136,130 +1119,11 @@ static int ir_try_fold_integer_binary(IRInstruction *instruction, int *changed) 
   }
 
   /* Every algebraic identity now lives in the declarative table in
-   * ir_optimize_rewrite.c; add a rule there to teach a new one. */
-  return ir_rewrite_apply_binary_identities(instruction, changed);
-}
-
-static int ir_find_temp_producer_in_block(const IRFunction *function,
-                                          size_t before_index,
-                                          const char *temp_name,
-                                          size_t *producer_index_out) {
-  if (!function || !temp_name || !producer_index_out ||
-      before_index > function->instruction_count) {
-    return 0;
-  }
-
-  size_t i = before_index;
-  while (i > 0) {
-    i--;
-    const IRInstruction *instruction = &function->instructions[i];
-    if (instruction->op == IR_OP_NOP) {
-      continue;
-    }
-    if (instruction->op == IR_OP_LABEL) {
-      break;
-    }
-    if (ir_instruction_writes_temp(instruction) && instruction->dest.name &&
-        strcmp(instruction->dest.name, temp_name) == 0) {
-      *producer_index_out = i;
-      return 1;
-    }
-  }
-
-  return 0;
-}
-
-static int ir_try_rewrite_mod_pow2_compare_zero(IRFunction *function,
-                                                const IRTempUseMap *uses,
-                                                size_t compare_index,
-                                                int *changed) {
-  if (!function || !uses || compare_index >= function->instruction_count) {
-    return 0;
-  }
-
-  IRInstruction *compare = &function->instructions[compare_index];
-  if (compare->op != IR_OP_BINARY || compare->is_float || !compare->text) {
-    return 1;
-  }
-  if (strcmp(compare->text, "==") != 0 && strcmp(compare->text, "!=") != 0) {
-    return 1;
-  }
-
-  const IROperand *temp_operand = NULL;
-  if (compare->lhs.kind == IR_OPERAND_TEMP && compare->lhs.name &&
-      compare->rhs.kind == IR_OPERAND_INT && compare->rhs.int_value == 0) {
-    temp_operand = &compare->lhs;
-  } else if (compare->rhs.kind == IR_OPERAND_TEMP && compare->rhs.name &&
-             compare->lhs.kind == IR_OPERAND_INT &&
-             compare->lhs.int_value == 0) {
-    temp_operand = &compare->rhs;
-  } else {
-    return 1;
-  }
-
-  if (ir_temp_use_map_get(uses, temp_operand->name) != 1) {
-    return 1;
-  }
-
-  size_t producer_index = 0;
-  if (!ir_find_temp_producer_in_block(function, compare_index,
-                                      temp_operand->name, &producer_index)) {
-    return 1;
-  }
-
-  IRInstruction *producer = &function->instructions[producer_index];
-  if (producer->op != IR_OP_BINARY || producer->is_float || !producer->text ||
-      strcmp(producer->text, "%") != 0 ||
-      producer->rhs.kind != IR_OPERAND_INT) {
-    return 1;
-  }
-
-  long long shift = 0;
-  if (!ir_try_get_positive_pow2_shift(producer->rhs.int_value, &shift) ||
-      shift <= 0 || shift >= 63) {
-    return 1;
-  }
-
-  long long mask = ((long long)1 << shift) - 1;
-  producer->rhs.int_value = mask;
-  mettle_free_string(producer->text);
-  producer->text = mettle_strdup("&");
-  if (!producer->text) {
-    return 0;
-  }
-
-  if (changed) {
-    *changed = 1;
-  }
-  return 1;
-}
-
-static int ir_mod_even_bitcheck_pass(IRFunction *function, int *changed) {
-  if (!function) {
-    return 0;
-  }
-
-  IRTempUseMap uses;
-  if (!ir_temp_use_map_init(&uses)) {
-    return 0;
-  }
-
-  for (size_t i = 0; i < function->instruction_count; i++) {
-    if (!ir_collect_instruction_temp_uses(&uses, &function->instructions[i])) {
-      ir_temp_use_map_destroy(&uses);
-      return 0;
-    }
-  }
-
-  for (size_t i = 0; i < function->instruction_count; i++) {
-    if (!ir_try_rewrite_mod_pow2_compare_zero(function, &uses, i, changed)) {
-      ir_temp_use_map_destroy(&uses);
-      return 0;
-    }
-  }
-
-  ir_temp_use_map_destroy(&uses);
-  return 1;
+   * ir_optimize_rewrite.c; add a rule there to teach a new one. Facts that
+   * depend on WHERE the instruction sits (a dividend that cannot be negative,
+   * a mask that covers every reachable bit) belong to the range analysis in
+   * ir_optimize_value_range.c instead. */
+  return ir_rewrite_apply_binary_identities(instruction, ranges, at, changed);
 }
 
 int ir_find_next_non_nop_in_block(const IRFunction *function,
@@ -1624,8 +1488,8 @@ int ir_constant_and_branch_simplify_pass(IRFunction *function,
     }
   }
 
-  if (has_mod && (has_eq || has_ne)) {
-    if (!ir_mod_even_bitcheck_pass(function, changed)) {
+  if (has_mod && (has_eq || has_ne || has_branch_zero)) {
+    if (!ir_remainder_zero_test_to_mask_pass(function, changed)) {
       return 0;
     }
   }
@@ -1640,16 +1504,27 @@ int ir_constant_and_branch_simplify_pass(IRFunction *function,
     }
   }
 
+  /* The range analysis is what proves the facts the table cannot express as a
+   * pattern on operand slots -- "this dividend is never negative", "this mask
+   * covers every bit the value can carry", "this comparison is already
+   * decided". It builds its tables on the first question, so a function with
+   * no divide, mask, or bounded comparison never pays for it. */
+  IRValueRangeCtx ranges;
+  ir_value_range_ctx_init(&ranges, function);
+
   for (size_t i = 0; i < function->instruction_count; i++) {
     IRInstruction *instruction = &function->instructions[i];
-    if (!ir_try_fold_integer_binary(instruction, changed) ||
+    if (!ir_try_fold_integer_binary(instruction, &ranges, i, changed) ||
         !ir_try_fold_integer_unary(instruction, changed) ||
+        !ir_value_range_simplify(&ranges, i, instruction, changed) ||
         !ir_simplify_redundant_assign(instruction, changed) ||
         !ir_simplify_branch(instruction, changed)) {
+      ir_value_range_ctx_destroy(&ranges);
       return 0;
     }
   }
 
+  ir_value_range_ctx_destroy(&ranges);
   return 1;
 }
 

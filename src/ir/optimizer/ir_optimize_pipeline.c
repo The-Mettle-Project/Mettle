@@ -121,9 +121,6 @@ static const IROptScheduledPass g_ir_fixpoint_passes[] = {
     IR_OPT_PASS_WHEN_ALL(UNROLL_SMALL_CONST_BOUND_LOOPS,
                          ir_unroll_small_const_bound_loops_pass,
                          IR_OPT_LABEL_JUMP),
-    IR_OPT_PASS_WHEN_ALL(POSITIVE_LOOP_DIV2_TO_SHIFT,
-                         ir_positive_loop_div2_to_shift_pass,
-                         IR_OPT_LABEL_JUMP | IR_OPT_FEATURE_DIV),
     IR_OPT_PASS_WHEN_ALL(FOLD_POPCOUNT_BYTE_LOOP,
                          ir_fold_popcount_byte_loop_pass,
                          IR_OPT_LABEL_JUMP | IR_OPT_FEATURE_BRANCH_ZERO |

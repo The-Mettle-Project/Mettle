@@ -45,8 +45,7 @@ OTHER_PASSES = [
     "eliminate_dead_temp_writes", "thread_jump_targets", "null_check_licm",
     "hoist_pure_calls", "induction_pointer", "prefix_sum_i32",
     "lower_bound_i32", "detect_shift_loops", "eliminate_congruent_ivs",
-    "positive_loop_div2_to_shift", "memcpy_inline",
-    "eliminate_load_symbol_copy", "fuse_rotate_add",
+    "memcpy_inline", "eliminate_load_symbol_copy", "fuse_rotate_add",
     "strength_reduce_rotate_loops",
 ]
 

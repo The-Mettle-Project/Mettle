@@ -1006,6 +1006,25 @@ $cases = @(
     IrMustNotMatch = @("jump ir_while")
   },
   @{
+    # The range analysis replaced a family of loop-shaped and use-shaped
+    # special cases, so this pins what it now proves GENERALLY: a divide under
+    # any dominating guard (on either side of the `if`), a remainder on an
+    # unsigned parameter, a mask the value cannot reach outside of, a
+    # comparison the bounds already decide, and a counter that starts at zero.
+    Name          = "opt_value_range"
+    Path          = "tests/codegen/value_range.mettle"
+    ShouldSucceed = $true
+    Args          = @("-O")
+    IrMustMatch   = @("%\.?t[0-9]+ = @n >> 3",      # guarded_div: `if (n >= 0) n / 8`
+                      "%\.?t[0-9]+ = @n & 15",      # guarded_mod: `if (n > 0) n % 16`
+                      "%\.?t[0-9]+ = @u >> 6",      # unsigned_div: uint32 / 64
+                      "%\.?t[0-9]+ = @u & 63",      # unsigned_mod: uint32 % 64
+                      "%\.?t[0-9]+ = @n >> 5",      # shift_chain: else-side guard, merged
+                      "%\.?t[0-9]+ = @i & 3")       # counter_mod: monotone counter
+    # decided(): every comparison against a uint16 is settled by its type.
+    IrMustNotMatch = @("%\.?t[0-9]+ = @u < 0", "%\.?t[0-9]+ = @u > 100000")
+  },
+  @{
     Name          = "opt_mod_even_check"
     Path          = "tests/test_opt_mod_even_check.mettle"
     ShouldSucceed = $true
@@ -8467,7 +8486,9 @@ $runFixtures = @(
   @{ Name = "unsigned_fold"; Path = "tests/codegen/unsigned_fold.mettle"
      What = "an unsigned operation folded with signed semantics" },
   @{ Name = "uint64_literals"; Path = "tests/codegen/uint64_literals.mettle"
-     What = "a uint64 decimal literal was wrong" }
+     What = "a uint64 decimal literal was wrong" },
+  @{ Name = "value_range"; Path = "tests/codegen/value_range.mettle"
+     What = "a range-driven rewrite proved the wrong thing" }
 )
 foreach ($fixture in $runFixtures) {
   foreach ($mode in @(@{ Name = "debug"; Args = @() },

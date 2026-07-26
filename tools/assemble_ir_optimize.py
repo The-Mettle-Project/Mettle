@@ -230,8 +230,8 @@ static int ir_simd_dot_i32_pass(IRFunction *function, int *changed) {
 PASS_NAMES = '''static const char *g_ir_pass_names[IR_OPT_PASS_COUNT] = {
     "reduction_unroll", "copy_and_constant_propagation", "fuse_rotate_add",
     "strength_reduce_rotate_loops", "unroll_small_const_bound_loops",
-    "positive_loop_div2_to_shift", "fold_popcount_byte_loop",
-    "fuse_popcount_buffer_loop", "collatz_odd_step_fold",
+    "fold_popcount_byte_loop", "fuse_popcount_buffer_loop",
+    "collatz_odd_step_fold",
     "coalesce_single_use_temp_assign", "common_subexpression_elimination",
     "constant_and_branch_simplify", "count_word_starts",
     "eliminate_dead_temp_writes", "thread_jump_targets", "null_check_licm",

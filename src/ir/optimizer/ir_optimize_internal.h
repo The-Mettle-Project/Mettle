@@ -238,6 +238,27 @@ typedef struct {
   size_t addr_count;
 } IRSroaMemberCtx;
 
+/* Inclusive integer bounds on the SIGNED 64-bit interpretation of a value.
+ * LLONG_MIN/LLONG_MAX on both ends means "nothing known". See
+ * ir_optimize_value_range.c. */
+typedef struct {
+  long long lo;
+  long long hi;
+} IRIntRange;
+
+/* Per-function tables the range walk needs in O(1). Zero-initialize with
+ * ir_value_range_ctx_init; the tables are built on the first query, so a
+ * function nothing asks about costs nothing. */
+typedef struct {
+  const IRFunction *function;
+  IRTempValueMap decl_types; /* symbol -> declared integer width/signedness */
+  IRTempValueMap addr_taken;
+  IRTempValueMap monotone;   /* symbol -> memoized "monotone counter?" verdict */
+  IRTempValueMap label_guard; /* label -> memoized sole entering branch_zero */
+  int built;
+  int ok;
+} IRValueRangeCtx;
+
 #define IR_ARRAY_COUNT(items) (sizeof(items) / sizeof((items)[0]))
 
 #define IR_OPT_PASS_LIST(X)                                                   \
@@ -248,7 +269,6 @@ typedef struct {
   X(FUSE_ROTATE_ADD, "fuse_rotate_add")                                      \
   X(STRENGTH_REDUCE_ROTATE_LOOPS, "strength_reduce_rotate_loops")            \
   X(UNROLL_SMALL_CONST_BOUND_LOOPS, "unroll_small_const_bound_loops")         \
-  X(POSITIVE_LOOP_DIV2_TO_SHIFT, "positive_loop_div2_to_shift")              \
   X(FOLD_POPCOUNT_BYTE_LOOP, "fold_popcount_byte_loop")                      \
   X(FUSE_POPCOUNT_BUFFER_LOOP, "fuse_popcount_buffer_loop")                  \
   X(COLLATZ_ODD_STEP_FOLD, "collatz_odd_step_fold")                          \
@@ -626,8 +646,6 @@ double ir_pass_time_begin(void);
 void ir_pass_time_end(const char *name, double begin_ms);
 void ir_pass_time_report(void);
 int ir_pointer_induction_pass(IRFunction *function, int *changed);
-int ir_positive_loop_div2_to_shift_pass(IRFunction *function,
-                                               int *changed);
 int ir_prefix_sum_i32_pass(IRFunction *function, int *changed);
 /* Software prefetch insertion for indirect (gather) loads in counted loops
  * (ir_optimize_prefetch.c). Runs last in the post-fixpoint stage. */
@@ -643,6 +661,7 @@ int ir_reduction_unroll_pass(IRFunction *function, int *changed);
 /* Declarative algebraic rewrite engine (ir_optimize_rewrite.c): the integer
  * identity table lives there, so adding an identity is adding one table row. */
 int ir_rewrite_apply_binary_identities(IRInstruction *instruction,
+                                       IRValueRangeCtx *ranges, size_t at,
                                        int *changed);
 int ir_reassociate_constants_pass(IRFunction *function, int *changed);
 int ir_remove_empty_conditional_diamonds_pass(IRFunction *function,
@@ -749,6 +768,26 @@ int ir_temp_value_map_any_value_symbol(IRTempValueMap *map,
 void ir_temp_value_map_note_value_removed(IRTempValueMap *map,
                                           const IROperand *value);
 int ir_thread_jump_targets_pass(IRFunction *function, int *changed);
+/* Integer value-range analysis (ir_optimize_value_range.c). One generic
+ * "what can this value be here?" question replaces the loop-shaped and
+ * use-shaped special cases that used to prove non-negativity one idiom at a
+ * time; ir_value_range_simplify is where the rewrites that spend the
+ * answer live. */
+void ir_value_range_ctx_init(IRValueRangeCtx *ctx, const IRFunction *function);
+void ir_value_range_ctx_destroy(IRValueRangeCtx *ctx);
+void ir_value_range_of(IRValueRangeCtx *ctx, size_t at,
+                       const IROperand *operand, IRIntRange *out);
+int ir_value_is_nonnegative(IRValueRangeCtx *ctx, size_t at,
+                            const IROperand *operand);
+int ir_value_range_simplify(IRValueRangeCtx *ctx, size_t at,
+                            IRInstruction *instruction, int *changed);
+/* `x % 2^k` whose only consumer is a test against zero becomes `x & (2^k-1)`.
+ * A use-context rewrite, not a value rewrite: the two disagree for negative x
+ * and agree only on the question being asked, so no range proof is needed. */
+int ir_remainder_zero_test_to_mask_pass(IRFunction *function, int *changed);
+/* Width/signedness of a builtin integer type NAME ("uint16" -> 16, unsigned).
+ * Returns 0 for anything else (pointers, floats, aggregates). */
+int ir_int_type_name_info(const char *name, int *bits_out, int *is_unsigned_out);
 int ir_try_parse_direct_unit_increment(const IRInstruction *instruction,
                                               const char *iv_symbol);
 int ir_unroll_small_const_bound_loops_pass(IRFunction *function,

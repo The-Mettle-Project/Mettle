@@ -983,15 +983,15 @@ function index with PGO-widened budgets; bounded self-recursion inlining;
 allocation-site layout factorization (sound only when every call site is
 visible and `main` is the single entry).
 
-**2. Per-function fixpoint stage**, up to 8 iterations over **38 named
+**2. Per-function fixpoint stage**, up to 8 iterations over **37 named
 feature-gated passes** (the `IR_OPT_PASS_LIST` X-macro in
-`ir_optimize_internal.h:243`), in order:
+`ir_optimize_internal.h`), in order:
 
 ```
 reduction_unroll, copy_and_constant_propagation, fuse_tensor_mma_chains,
 promote_gpu_async_staging, fuse_rotate_add, strength_reduce_rotate_loops,
-unroll_small_const_bound_loops, positive_loop_div2_to_shift,
-fold_popcount_byte_loop, fuse_popcount_buffer_loop, collatz_odd_step_fold,
+unroll_small_const_bound_loops, fold_popcount_byte_loop,
+fuse_popcount_buffer_loop, collatz_odd_step_fold,
 coalesce_single_use_temp_assign, eliminate_single_use_float_symbol_copies,
 common_subexpression_elimination, constant_and_branch_simplify,
 reassociate_constants, count_word_starts, eliminate_dead_temp_writes,
@@ -1017,7 +1017,88 @@ simd_insertion_sort_i32, sroa
 a violated contract fails the compile with a diagnosis rather than degrading
 silently.
 
-## 5.2 Pass driver mechanics
+## 5.2 What the optimizer can prove: value ranges
+
+Implementation: `src/ir/optimizer/ir_optimize_value_range.c`.
+
+A family of rewrites needs the same fact -- *what can this value be here?* --
+and the optimizer used to derive it one shape at a time: a loop-shaped pass
+proved a symbol positive only when a `while (x > 1)` guarded it, and a
+use-shaped pass turned `x % 2^k` into a mask only when the result was compared
+against zero. Both are now consequences of one bounded analysis.
+
+`ir_value_range_of` answers with inclusive bounds on the **signed 64-bit
+interpretation** of an operand at a program point, from:
+
+- integer literals, and the declared width and signedness of a local or
+  parameter (a `uint16` slot is `[0, 65535]` by construction; `uint64` is
+  deliberately left unbounded, because its upper half is negative as a
+  `long long`);
+- the producing instruction of a temp, or the reaching definition of a symbol
+  in the same straight-line region -- but only across a call, store, or inline
+  assembly when the symbol is a local or parameter of this function whose
+  address never escapes;
+- the operator: a comparison is `[0,1]`, `&` with a non-negative operand cannot
+  exceed it, `%` by a positive constant is bounded by it, and the arithmetic
+  and shift operators propagate bounds when they provably cannot overflow;
+- **dominating guards**, on both sides of a branch. Falling through
+  `branch_zero %t, L` means the condition held; arriving at a label whose only
+  entry is that branch means it did not. So `if (n >= 0) { ... }` and
+  `if (n < 0) { return ...; } ...` bound `n` equally well;
+- **monotone counters**: a 64-bit signed local whose every definition is a
+  non-negative constant or a step forward by a positive constant is
+  non-negative everywhere (the standard no-signed-overflow assumption for
+  induction variables, restricted to the width where wraparound is
+  unreachable).
+
+The walk is on-demand and capped in both recursion depth and per-level scan, so
+a query costs a constant; the per-function tables it needs (declared types, the
+address-taken set, and the memoized counter and label verdicts) are built on
+the first question and skipped entirely for a function nothing asks about.
+
+The rewrites that spend the answer are split by what they need. Those that are
+ordinary algebraic identities gated on a proof -- power-of-two divide into a
+shift, remainder into a mask -- are **rows in the identity table** below, which
+reaches into the analysis through its `P_NONNEG` operand pattern. Those that
+need the computed bounds themselves live in `ir_value_range_simplify`:
+whole-operation folds (`x / c` is `0` and `x % c` is `x` when `0 <= x < c`),
+removal of a mask that covers every reachable bit -- or of the whole operation
+when it covers none -- comparisons the bounds already decide, and branches they
+already resolve. Teaching the analysis a new source of bounds strengthens every
+one of them at once.
+
+One relative of these rewrites deliberately does **not** go through the range
+analysis: `x % 2^k` whose only consumer is a test against zero becomes
+`x & (2^k-1)` for any sign of `x`. That is a use-context rewrite, not a value
+rewrite -- the two expressions differ when `x` is negative and agree only on
+the question being asked -- so it needs no proof about the dividend at all.
+
+## 5.3 Declarative algebraic rewriting
+
+Implementation: `src/ir/optimizer/ir_optimize_rewrite.c`.
+
+Two tables, each with a shared driver, hold everything the optimizer knows
+about integer algebra that does not depend on where the instruction sits:
+
+- `g_binary_identities` -- one row per identity on a single `dest = lhs op rhs`
+  (`x + 0`, `x * 2^k`, `x - x`, `x | -1`, ...), matched by operator text plus a
+  pattern per operand slot, with commutativity handled by the driver. Most
+  patterns match on operand shape and so hold everywhere; `P_NONNEG` instead
+  asks the range analysis whether the operand can be negative at this
+  instruction, which is how `x / 2^k -> x >> k` and `x % 2^k -> x & m` are
+  table rows rather than a bespoke pass.
+- `g_const_chains` -- one row per two-instruction chain `(x op c1) op c2` that
+  collapses to `x op K`: additive (with subtraction normalized into a signed
+  sum), multiplicative, the three bitwise merges, and width-bounded shifts.
+  Every row is bit-exact under two's-complement wraparound at every operand
+  width, and the driver proves `x` is unchanged between the producer and the
+  use before folding.
+
+Teaching either one a new rule is adding a row, not adding control flow. The
+two compose across fixpoint iterations: a chain collapse produces `x * K`,
+which the identity table then turns into `x << k`.
+
+## 5.4 Pass driver mechanics
 
 `ir_run_fixpoint_pass` (`ir_optimize_pass_driver.c:296`) gives every function a
 monotonic IR **version**. Each pass records the version at which it last
@@ -1031,7 +1112,7 @@ pass), `METTLE_TRACE_IR_PASSES` (prints `changed` / `clean` / `disabled` /
 `already_clean` with function, version, and iteration), `METTLE_TIME_IR_PASSES`,
 `METTLE_NO_SIMD`.
 
-## 5.3 The target-neutral schedule
+## 5.5 The target-neutral schedule
 
 The idiom recognizers rewrite loops into super-ops that **only the x86-64
 backend implements**. So `mtlc_optimize_for(..., ARM64|PTX|SPIRV)` runs a
@@ -1042,10 +1123,18 @@ semantic GPU transforms (async staging promotion, and tensor accumulator-chain
 and residency formation). It forms no SIMD opcodes, fuses no x86 rotates, and
 introduces no host memory intrinsics or prefetch.
 
+Both entries that carry the value-range work -- algebraic and branch
+simplification, and constant reassociation -- are on this schedule, so ARM64,
+PTX, and SPIR-V get the divide-into-shift, remainder-into-mask, mask removal,
+and decided comparisons on the same terms x86-64 does. That is a direct
+consequence of expressing the transform as a target-neutral analysis plus
+table rows instead of as a loop-shaped recognizer: the pass it replaced was
+reachable only from the x86 schedule.
+
 For PTX and SPIR-V, the shared device call graph is validated first and only
 transitively kernel-reachable functions are transformed.
 
-## 5.4 Hotness and PGO
+## 5.6 Hotness and PGO
 
 Two profile sources feed one policy
 (`ir_optimize_hotness.c`):
@@ -1069,7 +1158,7 @@ Effects: hot callees get inline budgets widened from 128 to 512 (and glue from
 default, 128 hot; cold sites skip prefetch; and PGO reorders function emission
 for instruction-cache locality (driver.c:393-442).
 
-## 5.5 The ML optimizer
+## 5.7 The ML optimizer
 
 Implementation: `src/ir/ml_gnn.c` (1568 lines, native C GNN inference) and
 `src/ir/ml_opt.c` (763 lines, application and gate).
@@ -1104,7 +1193,7 @@ Default builds ship no model, so the pass proposes nothing and returns success.
 `--ml-opt` is rejected on portable targets until its proposal and validator
 surface has an equally explicit neutral contract.
 
-## 5.6 Translation validation
+## 5.8 Translation validation
 
 Implementation: `src/ir/ir_verify.c` (1206 lines) over `src/ir/ir_interp.c`
 (2672 lines).
@@ -1146,7 +1235,7 @@ pair, and continues. **The shipped binary is always built from validated IR.**
 `METTLE_VERIFY_BREAK=<pass>[:<fn>]` deliberately corrupts a pass's output as a
 self-test that the checker really catches divergence.
 
-## 5.7 The reference interpreter
+## 5.9 The reference interpreter
 
 `ir_interp.c` is load-bearing for four features (validation, ML-opt gating,
 zero-run PGO, and `mettle test`/`trace`), so its state model is worth knowing.
@@ -1874,7 +1963,7 @@ and only then prints `verified:`.
 
 Beyond unit tests, three mechanisms check the pipeline end to end:
 
-- **Translation validation** (section 5.6), per pass per function.
+- **Translation validation** (section 5.8), per pass per function.
 - **The differential fuzzer** (`tools/fuzz/`): generated UB-free programs
   compiled at `-O0` and `--release`, failing on any behavioral divergence. Any
   codegen or optimizer change runs it.
