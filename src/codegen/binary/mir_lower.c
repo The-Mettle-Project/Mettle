@@ -5138,6 +5138,156 @@ static void mir_fuse_mov_then_extend(MirFunction *fn) {
   }
 }
 
+/* Every vreg an operand READS (a MEM operand reads its base and index). */
+static void mir_operand_reads_pair(const MirOperand *op, MirVregId out[2]) {
+  out[0] = MIR_VREG_NONE;
+  out[1] = MIR_VREG_NONE;
+  if (!op) {
+    return;
+  }
+  if (op->kind == MIR_OPK_VREG) {
+    out[0] = op->vreg;
+  } else if (op->kind == MIR_OPK_MEM) {
+    out[0] = op->mem.base;
+    out[1] = op->mem.index;
+  }
+}
+
+/* Rewrite every vreg an operand READS from `from` to `to`. */
+static void mir_operand_rename_read(MirOperand *op, MirVregId from,
+                                    MirVregId to) {
+  if (!op) {
+    return;
+  }
+  if (op->kind == MIR_OPK_VREG && op->vreg == from) {
+    op->vreg = to;
+  } else if (op->kind == MIR_OPK_MEM) {
+    if (op->mem.base == from) {
+      op->mem.base = to;
+    }
+    if (op->mem.index == from) {
+      op->mem.index = to;
+    }
+  }
+}
+
+/* ---- fold a constant address adjustment into the access -----------------
+ *
+ * Reading a struct field lowers to "compute the base, add the field offset,
+ * load through it". x86 addressing already has that offset field, so the add
+ * is free to absorb: `add rax, 4; mov edx, [rax]` becomes `mov edx, [rax+4]`.
+ * A three-field node read pays this three times per visit.
+ *
+ * Only an add whose result is used exactly once, by that one access, can move
+ * -- otherwise the address is still needed in a register. */
+static void mir_fold_address_offsets(MirFunction *fn) {
+  if (!fn || fn->insn_count < 2 || fn->vreg_count == 0) {
+    return;
+  }
+  int *uses = (int *)calloc(fn->vreg_count, sizeof(int));
+  int *defs = (int *)calloc(fn->vreg_count, sizeof(int));
+  if (!uses || !defs) {
+    free(uses);
+    free(defs);
+    return;
+  }
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    const MirInst *in = &fn->insns[i];
+    if (in->op == MIR_NOP) {
+      continue; /* retired: its leftover operands are neither reads nor writes */
+    }
+    const MirOperand *ops[3] = {&in->a, &in->b, &in->dst};
+    for (int k = 0; k < 3; k++) {
+      MirVregId r[2];
+      if (ops[k] == &in->dst && in->dst.kind == MIR_OPK_VREG) {
+        defs[in->dst.vreg]++;
+        continue;
+      }
+      mir_operand_reads_pair(ops[k], r);
+      for (int e = 0; e < 2; e++) {
+        if (r[e] >= 0 && (size_t)r[e] < fn->vreg_count) {
+          uses[r[e]]++;
+        }
+      }
+    }
+  }
+
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    MirInst *add = &fn->insns[i];
+    if (add->op != MIR_ADD || add->is_float || add->width != 8 ||
+        add->dst.kind != MIR_OPK_VREG || add->a.kind != MIR_OPK_VREG ||
+        add->b.kind != MIR_OPK_IMM) {
+      continue;
+    }
+    MirVregId addr = add->dst.vreg;
+    if (addr == add->a.vreg || uses[addr] != 1 || defs[addr] != 1 ||
+        fn->vregs[addr].address_taken) {
+      continue;
+    }
+    if (add->b.imm < INT32_MIN / 2 || add->b.imm > INT32_MAX / 2) {
+      continue;
+    }
+    /* The access must be the very next instruction -- anything in between could
+     * redefine the base the offset would now be applied to. The lowering does
+     * leave plain `vC <- addr` copies in the way, though, so walk through any
+     * that are themselves used exactly once: they are links in the same chain,
+     * and retiring them leaves nothing behind. */
+    MirVregId cur = addr;
+    size_t u = i;
+    size_t chain[4];
+    size_t chain_n = 0;
+    MirOperand *mem = NULL;
+    for (;;) {
+      u++;
+      while (u < fn->insn_count && fn->insns[u].op == MIR_NOP) {
+        u++;
+      }
+      if (u >= fn->insn_count) {
+        break;
+      }
+      MirInst *use = &fn->insns[u];
+      if (use->a.kind == MIR_OPK_MEM && use->a.mem.base == cur) {
+        mem = &use->a;
+      } else if (use->dst.kind == MIR_OPK_MEM && use->dst.mem.base == cur) {
+        mem = &use->dst;
+      }
+      if (mem) {
+        break;
+      }
+      if (chain_n < 4 && use->op == MIR_MOV && use->dst.kind == MIR_OPK_VREG &&
+          use->a.kind == MIR_OPK_VREG && use->a.vreg == cur &&
+          use->b.kind == MIR_OPK_NONE && uses[cur] == 1 &&
+          defs[use->dst.vreg] == 1 && !fn->vregs[use->dst.vreg].address_taken) {
+        chain[chain_n++] = u;
+        cur = use->dst.vreg;
+        continue;
+      }
+      break;
+    }
+    /* The float access path has no scaled-index form, so never hand it one. */
+    if (!mem || uses[cur] != 1 || mem->mem.index == cur ||
+        mem->mem.phys_base_valid ||
+        (fn->insns[u].is_float && mem->mem.index != MIR_VREG_NONE)) {
+      continue;
+    }
+    long long disp = (long long)mem->mem.disp + add->b.imm;
+    if (disp < INT32_MIN || disp > INT32_MAX) {
+      continue;
+    }
+    mem->mem.base = add->a.vreg;
+    mem->mem.disp = (int)disp;
+    add->op = MIR_NOP;
+    for (size_t c = 0; c < chain_n; c++) {
+      fn->insns[chain[c]].op = MIR_NOP;
+    }
+    uses[add->a.vreg]++;
+    uses[addr] = 0;
+  }
+
+  free(uses);
+  free(defs);
+}
+
 /* ---- redundant load elimination -----------------------------------------
  *
  * `if (data[i] <= data[j]) { tmp[k] = data[i]; }` loads data[i] twice: once to
@@ -6269,6 +6419,7 @@ int code_generator_binary_emit_function_via_mir(
   mir_fuse_mov_then_extend(&fn);
   mir_drop_dead_extensions(&fn);
   mir_narrow_zero_extended_ops(&fn);
+  mir_fold_address_offsets(&fn);
   mir_cse_loads(&fn);
   mir_rotate_loops(&fn);
   mir_sink_cold_exits(&fn);

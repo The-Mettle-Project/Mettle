@@ -1026,7 +1026,12 @@ static int encode_mov(MirFunction *fn, const MirInst *in) {
     int w = in->width;
     unsigned char prefix = (w == 4) ? 0xF3 : 0xF2; /* movss / movsd */
     if (in->a.kind == MIR_OPK_MEM) {
-      /* float LOAD: movss/movsd dst <- [base], straight into dst's register. */
+      /* float LOAD: movss/movsd dst <- [base + disp], straight into dst's
+       * register. This path has no scaled-index form; the lowering never builds
+       * one, and mir_fold_address_offsets refuses to create one. */
+      if (in->a.mem.index != MIR_VREG_NONE) {
+        return enc_err(fn, "scaled index in a float load");
+      }
       MirOperand base = mir_op_vreg(in->a.mem.base);
       BinaryGpRegister addr = value_reg(fn, &base, SCRATCH_B, &ok);
       if (!ok) {
@@ -1038,13 +1043,16 @@ static int encode_mov(MirFunction *fn, const MirInst *in) {
         target = FSCRATCH_A;
       }
       if (!simd_emit_prefixed_xmm_mem_disp(&ctx->code, prefix, 0x10, target,
-                                           addr, 0)) {
+                                           addr, in->a.mem.disp)) {
         return enc_err(fn, "out of memory in float load");
       }
       return direct ? 1 : xmm_store(fn, &in->dst, FSCRATCH_A, w);
     }
     if (in->dst.kind == MIR_OPK_MEM) {
-      /* float STORE: movss/movsd [base] <- a. */
+      /* float STORE: movss/movsd [base + disp] <- a. */
+      if (in->dst.mem.index != MIR_VREG_NONE) {
+        return enc_err(fn, "scaled index in a float store");
+      }
       MirOperand base = mir_op_vreg(in->dst.mem.base);
       BinaryGpRegister addr = value_reg(fn, &base, SCRATCH_B, &ok);
       if (!ok) {
@@ -1055,7 +1063,7 @@ static int encode_mov(MirFunction *fn, const MirInst *in) {
         return 0;
       }
       if (!simd_emit_prefixed_xmm_mem_disp(&ctx->code, prefix, 0x11, val, addr,
-                                           0)) {
+                                           in->dst.mem.disp)) {
         return enc_err(fn, "out of memory in float store");
       }
       return 1;
