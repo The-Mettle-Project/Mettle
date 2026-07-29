@@ -5138,6 +5138,258 @@ static void mir_fuse_mov_then_extend(MirFunction *fn) {
   }
 }
 
+/* ---- redundant load elimination -----------------------------------------
+ *
+ * `if (data[i] <= data[j]) { tmp[k] = data[i]; }` loads data[i] twice: once to
+ * compare it and once to store it. The second load is reached only through the
+ * first, and nothing writes memory in between, so it can read the register the
+ * first one already filled. Merge sort's inner loop pays this on every
+ * iteration, and the shape -- test a value, then use it -- is everywhere.
+ *
+ * This is a linear scan carrying a small table of loads whose results are still
+ * valid. An entry dies when anything could have changed what it loaded (a
+ * store, a call, an inline kernel), when one of its address registers is
+ * rewritten, when its own destination is rewritten, or at a label the value
+ * might not have reached along every incoming edge. */
+
+#define MIR_LOAD_TABLE_MAX 12
+
+typedef struct {
+  int def;        /* MIR index of the load */
+  MirVregId dst;  /* vreg it filled */
+  MirMem mem;     /* address it read */
+  int width;
+  int is_unsigned;
+  int is_float;
+} MirAvailableLoad;
+
+/* A plain register load: `dst(vreg) <- [mem]`, no scaling of the result beyond
+ * the width/signedness the instruction already carries. */
+static int mir_is_plain_load(const MirInst *in) {
+  return in->op == MIR_MOV && in->a.kind == MIR_OPK_MEM &&
+         in->dst.kind == MIR_OPK_VREG;
+}
+
+static int mir_mem_same(const MirMem *a, const MirMem *b) {
+  return a->base == b->base && a->index == b->index && a->scale == b->scale &&
+         a->disp == b->disp && a->phys_base_valid == b->phys_base_valid &&
+         a->phys_base == b->phys_base;
+}
+
+/* Could this instruction change what some earlier load returned? Stores are the
+ * obvious case; a call or an inline kernel can write anywhere. */
+static int mir_clobbers_memory(const MirInst *in) {
+  if (in->dst.kind == MIR_OPK_MEM) {
+    return 1;
+  }
+  switch (in->op) {
+  case MIR_CALL:
+  case MIR_CALL_INDIRECT:
+  case MIR_TRAP:
+  case MIR_STORE_GLOBAL:
+  case MIR_STORE_OUTARG:
+    return 1;
+  default:
+    return mir_op_is_inline_kernel(in->op);
+  }
+}
+
+/* Keep only the entries `keep` also has: what is available where two paths meet
+ * is what was available on both. Identity is the destination vreg -- the same
+ * vreg is the same value. */
+static size_t mir_load_table_intersect(MirAvailableLoad *dst, size_t dst_n,
+                                       const MirAvailableLoad *keep,
+                                       size_t keep_n) {
+  size_t n = 0;
+  for (size_t a = 0; a < dst_n; a++) {
+    for (size_t b = 0; b < keep_n; b++) {
+      if (dst[a].dst == keep[b].dst) {
+        dst[n++] = dst[a];
+        break;
+      }
+    }
+  }
+  return n;
+}
+
+/* The instruction before `index`, skipping NOPs; -1 if there is none. */
+static int mir_prev_real(const MirFunction *fn, size_t index) {
+  for (size_t k = index; k > 0; k--) {
+    if (fn->insns[k - 1].op != MIR_NOP) {
+      return (int)(k - 1);
+    }
+  }
+  return -1;
+}
+
+static void mir_cse_loads(MirFunction *fn) {
+  if (!fn || fn->insn_count < 2) {
+    return;
+  }
+  /* Per label: the highest index that branches to it (a back-edge, i.e. a loop
+   * header, if it is at or past the label), and an ordinal for the snapshot
+   * table below. */
+  int *pred_hi = (int *)malloc(fn->insn_count * sizeof(int));
+  int *label_ord = (int *)malloc(fn->insn_count * sizeof(int));
+  if (!pred_hi || !label_ord) {
+    free(pred_hi);
+    free(label_ord);
+    return;
+  }
+  size_t label_count = 0;
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    pred_hi[i] = -1;
+    label_ord[i] = (fn->insns[i].op == MIR_LABEL) ? (int)label_count++ : -1;
+  }
+  for (size_t b = 0; b < fn->insn_count; b++) {
+    const MirInst *in = &fn->insns[b];
+    if (in->op != MIR_JMP && in->op != MIR_JCC && in->op != MIR_CMPBR &&
+        in->op != MIR_FCMPBR) {
+      continue;
+    }
+    if (in->dst.kind != MIR_OPK_LABEL || !in->dst.sym) {
+      continue;
+    }
+    for (size_t d = 0; d < fn->insn_count; d++) {
+      const MirInst *lb = &fn->insns[d];
+      if (lb->op == MIR_LABEL && lb->dst.kind == MIR_OPK_LABEL && lb->dst.sym &&
+          strcmp(lb->dst.sym, in->dst.sym) == 0) {
+        if ((int)b > pred_hi[d]) pred_hi[d] = (int)b;
+        break;
+      }
+    }
+  }
+
+  /* What was available at each forward branch into a label. Without this, an
+   * `if (p) { ...store... } else { ...reuse... }` loses the reuse: the linear
+   * walk reaches the else-arm's label having passed through the then-arm's
+   * store, which the branched-to path never executes. */
+  MirAvailableLoad *snap = NULL;
+  size_t *snap_n = NULL;
+  char *snap_seen = NULL;
+  if (label_count > 0 && label_count <= 1024) {
+    snap = (MirAvailableLoad *)malloc(label_count * MIR_LOAD_TABLE_MAX *
+                                      sizeof(MirAvailableLoad));
+    snap_n = (size_t *)calloc(label_count, sizeof(size_t));
+    snap_seen = (char *)calloc(label_count, 1);
+    if (!snap || !snap_n || !snap_seen) {
+      free(snap);
+      free(snap_n);
+      free(snap_seen);
+      snap = NULL;
+      snap_n = NULL;
+      snap_seen = NULL;
+    }
+  }
+
+  MirAvailableLoad table[MIR_LOAD_TABLE_MAX];
+  size_t table_n = 0;
+
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    MirInst *in = &fn->insns[i];
+    if (in->op == MIR_NOP) {
+      continue;
+    }
+
+    if (mir_clobbers_memory(in)) {
+      table_n = 0;
+      continue;
+    }
+
+    if (snap && (in->op == MIR_JMP || in->op == MIR_JCC ||
+                 in->op == MIR_CMPBR || in->op == MIR_FCMPBR) &&
+        in->dst.kind == MIR_OPK_LABEL && in->dst.sym) {
+      for (size_t d = i + 1; d < fn->insn_count; d++) {
+        const MirInst *lb = &fn->insns[d];
+        if (lb->op == MIR_LABEL && lb->dst.kind == MIR_OPK_LABEL &&
+            lb->dst.sym && strcmp(lb->dst.sym, in->dst.sym) == 0) {
+          int o = label_ord[d];
+          MirAvailableLoad *slot = snap + (size_t)o * MIR_LOAD_TABLE_MAX;
+          if (!snap_seen[o]) {
+            memcpy(slot, table, table_n * sizeof(MirAvailableLoad));
+            snap_n[o] = table_n;
+            snap_seen[o] = 1;
+          } else {
+            snap_n[o] = mir_load_table_intersect(slot, snap_n[o], table,
+                                                 table_n);
+          }
+          break;
+        }
+      }
+    }
+
+    if (in->op == MIR_LABEL) {
+      int o = label_ord[i];
+      if (pred_hi[i] >= (int)i) {
+        table_n = 0; /* loop header: memory may change across the back-edge */
+      } else if (pred_hi[i] < 0) {
+        /* Only reachable by falling through: the walked table is exact. */
+      } else if (!snap || !snap_seen[o]) {
+        table_n = 0;
+      } else {
+        const MirAvailableLoad *slot = snap + (size_t)o * MIR_LOAD_TABLE_MAX;
+        int prev = mir_prev_real(fn, i);
+        int falls_through =
+            prev >= 0 && fn->insns[prev].op != MIR_JMP &&
+            fn->insns[prev].op != MIR_RET;
+        if (falls_through) {
+          table_n = mir_load_table_intersect(table, table_n, slot, snap_n[o]);
+        } else {
+          memcpy(table, slot, snap_n[o] * sizeof(MirAvailableLoad));
+          table_n = snap_n[o];
+        }
+      }
+      continue;
+    }
+
+    /* Reuse: an identical load whose value is still around becomes a copy. */
+    if (mir_is_plain_load(in)) {
+      for (size_t e = 0; e < table_n; e++) {
+        if (table[e].width == in->width &&
+            table[e].is_unsigned == in->is_unsigned &&
+            table[e].is_float == in->is_float &&
+            table[e].dst != in->dst.vreg &&
+            mir_mem_same(&table[e].mem, &in->a.mem)) {
+          in->a = mir_op_vreg(table[e].dst);
+          in->b = mir_op_none();
+          break;
+        }
+      }
+    }
+
+    /* Anything this instruction writes invalidates the entries that depend on
+     * it, whether as an address register or as the cached result itself. */
+    if (in->dst.kind == MIR_OPK_VREG) {
+      MirVregId w = in->dst.vreg;
+      size_t keep = 0;
+      for (size_t e = 0; e < table_n; e++) {
+        if (table[e].dst != w && table[e].mem.base != w &&
+            table[e].mem.index != w) {
+          table[keep++] = table[e];
+        }
+      }
+      table_n = keep;
+    }
+
+    if (mir_is_plain_load(in) && in->a.kind == MIR_OPK_MEM &&
+        table_n < MIR_LOAD_TABLE_MAX) {
+      table[table_n].def = (int)i;
+      table[table_n].dst = in->dst.vreg;
+      table[table_n].mem = in->a.mem;
+      table[table_n].width = in->width;
+      table[table_n].is_unsigned = in->is_unsigned;
+      table[table_n].is_float = in->is_float;
+      table_n++;
+    }
+  }
+
+  free(pred_hi);
+  free(label_ord);
+  free(snap);
+  free(snap_n);
+  free(snap_seen);
+}
+
 static void mir_rotate_loops(MirFunction *fn) {
   if (!fn || fn->insn_count < 3) {
     return;
@@ -6017,6 +6269,7 @@ int code_generator_binary_emit_function_via_mir(
   mir_fuse_mov_then_extend(&fn);
   mir_drop_dead_extensions(&fn);
   mir_narrow_zero_extended_ops(&fn);
+  mir_cse_loads(&fn);
   mir_rotate_loops(&fn);
   mir_sink_cold_exits(&fn);
   mir_place_const_pool(&fn);
