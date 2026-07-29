@@ -137,14 +137,20 @@ static int mir_reg_arg_index(BinaryGpRegister reg) {
 static int mir_reg_poolable(BinaryGpRegister reg, size_t param_count,
                             int is_leaf) {
   (void)is_leaf;
-  int ai = mir_reg_arg_index(reg);
-  if (ai < 0) {
-    return 1; /* not an arg register: safe on both ABIs */
-  }
-  if ((size_t)ai < param_count) {
-    return 0; /* holds a live incoming parameter -> homing source */
-  }
-  return 1; /* dead arg reg: homing writes are indexed clobber events */
+  (void)param_count;
+  (void)reg;
+  /* Even a register holding an incoming parameter is poolable. The homing
+   * hazard it used to be excluded for is a hazard only among the PARAMETERS --
+   * one parameter's home overwriting an argument register another parameter has
+   * not been read out of yet -- so it is enough to bar arg registers from the
+   * entry-live values themselves, which mir_color_reg_mask does per vreg. Every
+   * other value is defined after the prologue has finished homing, when the
+   * argument registers hold nothing anyone still needs.
+   *
+   * Excluding them wholesale cost real registers: a 5-parameter function lost
+   * ALL FOUR Win64 argument registers, leaving eight for its whole body, and a
+   * merge loop with eight live values then spilled its array reads. */
+  return 1;
 }
 
 /* Build the non-cross-call GP pool: the universally-safe base, then any
@@ -910,8 +916,22 @@ static uint32_t mir_color_reg_mask(const MirFunction *fn, MirVregId v,
     const BinaryGpRegister *pool =
         vr->crosses_call ? gp_cross_pool : gp_leaf_pool;
     size_t n = vr->crosses_call ? gp_cross_n : gp_leaf_n;
+    /* The prologue homes each parameter out of its incoming argument register.
+     * Those moves happen in sequence, so a parameter whose home IS an argument
+     * register another parameter has not been read out of yet would clobber it.
+     * Barring the entry-live values -- the parameters and the hidden indirect-
+     * return pointer -- from every argument register the function actually
+     * receives in removes that hazard at its source. Values defined later are
+     * free to use those registers: by then homing is finished. */
+    size_t incoming = fn->param_count + (fn->returns_indirect ? 1 : 0);
     for (size_t i = 0; i < n; i++) {
       BinaryGpRegister reg = pool[i];
+      if (vr->entry_live) {
+        int ai = mir_reg_arg_index(reg);
+        if (ai >= 0 && (size_t)ai < incoming) {
+          continue;
+        }
+      }
       if (!mir_reg_clobbered_in_range(fn, reg, vr->live_start, vr->live_end)) {
         m |= 1u << reg;
       }
