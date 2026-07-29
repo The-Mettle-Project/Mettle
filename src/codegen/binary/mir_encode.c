@@ -1714,6 +1714,35 @@ static int mir_encode_label_index(const MirFunction *fn, const char *name) {
   return -1;
 }
 
+/* Is the MIR_JMP at `index` a jump to the code that immediately follows it?
+ *
+ * Only NOPs and labels may sit in between: both emit no bytes, so control
+ * reaches the target either way. Alignment padding before a loop label is NOPs
+ * too -- skipping it by falling through instead of branching over it is
+ * harmless, since NOPs do nothing whichever way they are reached. */
+static int mir_jump_is_fallthrough(const MirFunction *fn, size_t index) {
+  const MirInst *jmp = &fn->insns[index];
+  if (jmp->dst.kind != MIR_OPK_LABEL || !jmp->dst.sym) {
+    return 0;
+  }
+  for (size_t k = index + 1; k < fn->insn_count; k++) {
+    const MirInst *in = &fn->insns[k];
+    if (in->op == MIR_NOP) {
+      continue;
+    }
+    if (in->op != MIR_LABEL) {
+      return 0;
+    }
+    if (in->dst.kind == MIR_OPK_LABEL && in->dst.sym &&
+        strcmp(in->dst.sym, jmp->dst.sym) == 0) {
+      return 1;
+    }
+    /* A different label: keep looking. Falling through it reaches the same
+     * place a branch past it would. */
+  }
+  return 0;
+}
+
 int mir_encode(MirFunction *fn) {
   if (!fn || !fn->context) {
     return 0;
@@ -1753,7 +1782,14 @@ int mir_encode(MirFunction *fn) {
       }
       int d = mir_encode_label_index(fn, in->dst.sym);
       if (d >= 0 && (size_t)d < b) {
-        align_label[d] = 1;
+        /* 1 = align, 2 = align wider: the body from here to this back-edge is
+         * big enough that the extra padding costs nothing next to it. The
+         * FURTHEST back-edge decides, so a nested loop sharing a header is
+         * measured at its full extent. */
+        align_label[d] = (b - (size_t)d >= BINARY_LOOP_BIG_MIR_INSTRUCTIONS ||
+                          align_label[d] == 2)
+                             ? 2
+                             : 1;
       }
     }
   }
@@ -1763,8 +1799,14 @@ int mir_encode(MirFunction *fn) {
     int ok = 1;
     size_t annot_off = ctx->code.size;
     if (in->op == MIR_LABEL && align_label && align_label[i]) {
-      ok = binary_emit_align_code(&ctx->code, BINARY_LOOP_ALIGN,
-                                  BINARY_LOOP_ALIGN_MAX_PAD);
+      if (align_label[i] == 2) {
+        ctx->wants_wide_loop_alignment = 1;
+        ok = binary_emit_align_code(&ctx->code, BINARY_LOOP_ALIGN_BIG,
+                                    BINARY_LOOP_ALIGN_BIG_MAX_PAD);
+      } else {
+        ok = binary_emit_align_code(&ctx->code, BINARY_LOOP_ALIGN,
+                                    BINARY_LOOP_ALIGN_MAX_PAD);
+      }
     }
     if (!ok) {
       free(align_label);
@@ -1869,6 +1911,14 @@ int mir_encode(MirFunction *fn) {
       }
       break;
     case MIR_JMP: {
+      /* A jump whose target is the very next thing emitted is the fall-through
+       * it would have taken anyway. The lowering produces these wherever a
+       * structured statement ends by branching to its own exit label -- an
+       * if/else arm, a loop body, a short-circuit -- and each one costs five
+       * bytes of instruction fetch for nothing. */
+      if (mir_jump_is_fallthrough(fn, i)) {
+        break;
+      }
       size_t off = 0;
       if (!binary_emit_jmp_placeholder(&ctx->code, &off) ||
           !binary_label_fixup_table_add(&ctx->label_fixups, in->dst.sym, off)) {

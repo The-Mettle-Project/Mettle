@@ -213,6 +213,13 @@ typedef struct {
    * debug hooks need a frame-pointer chain. Since rsp sits frame_size below where
    * rbp would be, an [rbp+d] slot becomes [rsp+frame_size+d]. */
   int omit_frame_pointer;
+  /* Set when a loop header inside this function was padded to
+   * BINARY_LOOP_ALIGN_BIG. That padding is computed as an offset within the
+   * function's own code buffer, so it only lands on a real 32-byte boundary if
+   * the function itself starts on one -- otherwise the loop ends up 16 bytes
+   * off, which is exactly the placement the alignment was meant to avoid. The
+   * .text append reads this and aligns the function entry to match. */
+  int wants_wide_loop_alignment;
   /* IEEE-754 width of the function's float return (0/32/64). 0 = not float. */
   int return_float_bits;
   /* Set when the function's return type classifies INDIRECT (struct >8B or
@@ -434,15 +441,32 @@ int binary_emit_memory_access_ex(BinaryCodeBuffer *buffer, int operand_size_pref
 int binary_emit_prefetcht0_mem(BinaryCodeBuffer *buffer, BinaryGpRegister base, int displacement);
 int binary_emit_memory_access_sib(BinaryCodeBuffer *buffer, int operand_size_prefix, int rex_w, unsigned char opcode1, int has_opcode2, unsigned char opcode2, BinaryGpRegister reg, BinaryGpRegister base, BinaryGpRegister index, int scale, int displacement);
 int binary_emit_mov_eax_eax(BinaryCodeBuffer *buffer);
-/* Loop-top alignment, shared by both x86-64 backends. 16 bytes is the classic
- * -falign-loops choice and measured best here: 32 looked attractive (it is the
- * uop-cache fetch window) but lost across the benchmark suite, because the
- * extra padding pushes the rest of the function around more than the tighter
- * window placement wins back. The cap stops a loop that starts just past a
- * boundary from soaking up an almost-full boundary's worth of NOPs for a
- * marginal gain. */
+/* Loop-top alignment, shared by both x86-64 backends.
+ *
+ * Aligning a loop header keeps the loop's speed from depending on where its
+ * function happened to land. How far to align is a cost/benefit question, and
+ * the cost is padding on the fall-through path into the loop while the benefit
+ * grows with how many times the loop body is fetched. So the boundary scales
+ * with the body: 16 bytes normally, 32 -- the instruction-fetch and uop-cache
+ * window -- once the body is big enough that up to 31 bytes of padding is a
+ * rounding error next to it.
+ *
+ * The threshold is "loop body of about 128 bytes or more", where 31 bytes of
+ * one-time padding is a quarter of a single fetch of the body. Byte sizes are
+ * not known until the loop has been emitted, so each backend counts the
+ * instructions it has and converts at its own expansion rate: a MIR
+ * instruction is roughly one machine instruction (~4 bytes), while the
+ * baseline backend works at IR granularity and expands each IR instruction
+ * into several machine ones (~13 bytes).
+ *
+ * The MAX_PAD caps stop a loop that starts just past a boundary from soaking up
+ * an almost-full boundary's worth of NOPs for a marginal gain. */
 #define BINARY_LOOP_ALIGN 16u
 #define BINARY_LOOP_ALIGN_MAX_PAD 11u
+#define BINARY_LOOP_ALIGN_BIG 32u
+#define BINARY_LOOP_ALIGN_BIG_MAX_PAD 31u
+#define BINARY_LOOP_BIG_MIR_INSTRUCTIONS 32u
+#define BINARY_LOOP_BIG_IR_INSTRUCTIONS 10u
 
 int binary_emit_align_code(BinaryCodeBuffer *buffer, size_t boundary, size_t max_pad);
 int binary_emit_mov_mem_imm32(BinaryCodeBuffer *buffer, BinaryGpRegister base, int displacement, int32_t immediate);

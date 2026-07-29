@@ -8,6 +8,32 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Does the IR_OP_JUMP at `index` target the code that immediately follows it?
+ *
+ * Only instructions that emit no bytes may sit in between. Labels qualify (a
+ * label is a name for a position); so do NOPs and local declarations, which the
+ * emitter drops. Any other opcode means the jump really does skip something. */
+static int code_generator_binary_jump_is_fallthrough(const IRFunction *function,
+                                                     size_t index) {
+  const IRInstruction *jmp = &function->instructions[index];
+  if (!jmp->text || !jmp->text[0]) {
+    return 0;
+  }
+  for (size_t k = index + 1; k < function->instruction_count; k++) {
+    const IRInstruction *in = &function->instructions[k];
+    if (in->op == IR_OP_LABEL) {
+      if (in->text && strcmp(in->text, jmp->text) == 0) {
+        return 1;
+      }
+      continue; /* a different label: falling through it reaches the same place */
+    }
+    if (in->op != IR_OP_NOP && in->op != IR_OP_DECLARE_LOCAL) {
+      return 0;
+    }
+  }
+  return 0;
+}
+
 int code_generator_emit_binary_function(CodeGenerator *generator,
                                                IRFunction *ir_function) {
   BinaryEmitter *emitter = NULL;
@@ -129,7 +155,14 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
         const IRInstruction *lb = &ir_function->instructions[d];
         if (lb->op == IR_OP_LABEL && lb->text &&
             strcmp(lb->text, br->text) == 0) {
-          align_label[d] = 1;
+          /* 1 = align, 2 = align wider: the body from here to this back-edge is
+           * big enough that the extra padding costs nothing next to it. The
+           * FURTHEST back-edge decides, so a nested loop sharing a header is
+           * measured at its full extent. */
+          align_label[d] = (b - d >= BINARY_LOOP_BIG_IR_INSTRUCTIONS ||
+                            align_label[d] == 2)
+                               ? 2
+                               : 1;
           break;
         }
       }
@@ -139,9 +172,27 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
   size_t annot_prev_off = context.code.size;
   int annot_prev_idx = -1;
   for (size_t i = 0; i < ir_function->instruction_count;) {
+    /* A jump to the code that immediately follows it is the fall-through it
+     * would have taken anyway. The lowering emits one wherever a structured
+     * statement ends by branching to its own exit label -- if/else arms, loop
+     * bodies, short-circuits -- and each costs five bytes of instruction fetch
+     * for nothing. Only zero-byte instructions may sit in between; anything
+     * that emits code means the jump really is a jump. */
+    if (ir_function->instructions[i].op == IR_OP_JUMP &&
+        code_generator_binary_jump_is_fallthrough(ir_function, i)) {
+      i++;
+      continue;
+    }
+    if (align_label && align_label[i] == 2) {
+      context.wants_wide_loop_alignment = 1;
+    }
     if (align_label && align_label[i] &&
-        !binary_emit_align_code(&context.code, BINARY_LOOP_ALIGN,
-                                BINARY_LOOP_ALIGN_MAX_PAD)) {
+        !binary_emit_align_code(&context.code,
+                                align_label[i] == 2 ? BINARY_LOOP_ALIGN_BIG
+                                                    : BINARY_LOOP_ALIGN,
+                                align_label[i] == 2
+                                    ? BINARY_LOOP_ALIGN_BIG_MAX_PAD
+                                    : BINARY_LOOP_ALIGN_MAX_PAD)) {
       code_generator_set_error(generator,
                                "Out of memory while aligning a loop header");
       free(align_label);
@@ -357,8 +408,15 @@ mir_shared_append:
     return 0;
   }
 
+  /* Aligning only the functions that asked for it, rather than all of them:
+   * making every entry 32-byte aligned measured worse across the suite, because
+   * the extra inter-function padding reshuffles everything downstream for the
+   * benefit of functions that had no wide-aligned loop to protect. */
   if (!binary_emitter_align_section(emitter, text_section,
-                                    BINARY_TEXT_SECTION_ALIGNMENT, 0x90)) {
+                                    context.wants_wide_loop_alignment
+                                        ? (int)BINARY_LOOP_ALIGN_BIG
+                                        : BINARY_TEXT_SECTION_ALIGNMENT,
+                                    0x90)) {
     code_generator_set_error(generator, "%s",
                              binary_emitter_get_error(emitter)
                                  ? binary_emitter_get_error(emitter)
