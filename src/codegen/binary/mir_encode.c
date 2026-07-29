@@ -1160,7 +1160,35 @@ static int encode_mov(MirFunction *fn, const MirInst *in) {
     return 1;
   }
 
-  /* Plain register/immediate move. */
+  /* Plain register/immediate move.
+   *
+   * An immediate goes straight to its destination. Routing it through the
+   * scratch register the way the general path does costs an extra instruction
+   * at every single constant, and constants are everywhere: loop bounds, zero
+   * initializers, small call arguments. */
+  if (in->a.kind == MIR_OPK_IMM) {
+    BinaryGpRegister D;
+    if (dst_is_reg(fn, &in->dst, &D)) {
+      if (!binary_emit_mov_reg_imm64(&ctx->code, D, (uint64_t)in->a.imm)) {
+        return enc_err(fn, "out of memory in immediate move");
+      }
+      return 1;
+    }
+    if (in->dst.kind == MIR_OPK_VREG) {
+      /* Spilled destination: store the constant into its home directly, when
+       * it fits the sign-extended imm32 the C7 /0 form carries. */
+      const MirVreg *v = &fn->vregs[in->dst.vreg];
+      if (in->a.imm >= INT32_MIN && in->a.imm <= INT32_MAX) {
+        if (!binary_emit_mov_mem_imm32(&ctx->code, frame_base(fn),
+                                       frame_disp(fn, -spill_off(v)),
+                                       (int32_t)in->a.imm)) {
+          return enc_err(fn, "out of memory in immediate spill store");
+        }
+        return 1;
+      }
+    }
+  }
+
   int ok;
   BinaryGpRegister src = value_reg(fn, &in->a, SCRATCH_A, &ok);
   if (!ok) {
@@ -1691,7 +1719,7 @@ int mir_encode(MirFunction *fn) {
   }
 
   /* Loop-header alignment: a label that is the target of a BACKWARD branch is a
-   * loop top; pad it to a 16-byte boundary (like gcc -falign-loops) so the hot
+   * loop top; pad it to BINARY_LOOP_ALIGN (like gcc -falign-loops) so the hot
    * loop's instruction fetch does not depend on where the function happened to
    * land. The pad NOPs sit BEFORE the label, so a back-edge (which jumps to the
    * label, past the pad) never executes them; only a fall-through into the loop
@@ -1719,12 +1747,8 @@ int mir_encode(MirFunction *fn) {
     int ok = 1;
     size_t annot_off = ctx->code.size;
     if (in->op == MIR_LABEL && align_label && align_label[i]) {
-      while (ctx->code.size % 16 != 0) {
-        if (!binary_code_buffer_append_u8(&ctx->code, 0x90)) {
-          ok = 0;
-          break;
-        }
-      }
+      ok = binary_emit_align_code(&ctx->code, BINARY_LOOP_ALIGN,
+                                  BINARY_LOOP_ALIGN_MAX_PAD);
     }
     if (!ok) {
       free(align_label);

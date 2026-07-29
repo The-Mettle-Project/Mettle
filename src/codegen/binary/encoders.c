@@ -553,6 +553,64 @@ int binary_emit_mov_mem_reg(BinaryCodeBuffer *buffer,
   return binary_emit_memory_access(buffer, 0x89, source, base, displacement);
 }
 
+/* Pad the code buffer up to a `boundary`-byte alignment with NOPs.
+ *
+ * Uses the canonical multi-byte NOP forms rather than a run of 0x90: a 15-byte
+ * gap is then two instructions instead of fifteen. That matters because
+ * alignment padding sits on the fall-through path into a loop, so it is
+ * decoded (once) rather than jumped over.
+ *
+ * `max_pad` caps how far the buffer will be pushed; a gap wider than that is
+ * left alone, since the padding would cost more instruction bytes than the
+ * alignment is worth. boundary must be a power of two. */
+int binary_emit_align_code(BinaryCodeBuffer *buffer, size_t boundary,
+                           size_t max_pad) {
+  static const unsigned char kNops[10][9] = {
+      {0},
+      {0x90},
+      {0x66, 0x90},
+      {0x0F, 0x1F, 0x00},
+      {0x0F, 0x1F, 0x40, 0x00},
+      {0x0F, 0x1F, 0x44, 0x00, 0x00},
+      {0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00},
+      {0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00},
+      {0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00},
+      {0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00},
+  };
+
+  if (!buffer || boundary < 2 || (boundary & (boundary - 1)) != 0) {
+    return 1;
+  }
+  size_t pad = (boundary - (buffer->size & (boundary - 1))) & (boundary - 1);
+  if (pad == 0 || pad > max_pad) {
+    return 1;
+  }
+  while (pad > 0) {
+    size_t chunk = pad > 9 ? 9 : pad;
+    for (size_t i = 0; i < chunk; i++) {
+      if (!binary_code_buffer_append_u8(buffer, kNops[chunk][i])) {
+        return 0;
+      }
+    }
+    pad -= chunk;
+  }
+  return 1;
+}
+
+/* mov qword [base+disp], imm32 (sign-extended to 64) : REX.W C7 /0 id.
+ *
+ * Only the sign-extending form exists, so the caller must have checked the
+ * immediate fits in a signed 32-bit field. Storing a constant to a stack slot
+ * would otherwise cost a scratch register plus two instructions. */
+int binary_emit_mov_mem_imm32(BinaryCodeBuffer *buffer, BinaryGpRegister base,
+                              int displacement, int32_t immediate) {
+  /* ModRM.reg carries the /0 sub-opcode, not a register. */
+  return binary_emit_memory_access_ex(buffer, 0, 1, 0xC7, 0, 0,
+                                      (BinaryGpRegister)0, base,
+                                      displacement) &&
+         binary_code_buffer_append_u32(buffer, (uint32_t)immediate);
+}
+
 int binary_emit_movzx_reg_mem8(BinaryCodeBuffer *buffer,
                                       BinaryGpRegister destination,
                                       BinaryGpRegister base,

@@ -429,6 +429,18 @@ int binary_emit_memory_access_ex(BinaryCodeBuffer *buffer, int operand_size_pref
 int binary_emit_prefetcht0_mem(BinaryCodeBuffer *buffer, BinaryGpRegister base, int displacement);
 int binary_emit_memory_access_sib(BinaryCodeBuffer *buffer, int operand_size_prefix, int rex_w, unsigned char opcode1, int has_opcode2, unsigned char opcode2, BinaryGpRegister reg, BinaryGpRegister base, BinaryGpRegister index, int scale, int displacement);
 int binary_emit_mov_eax_eax(BinaryCodeBuffer *buffer);
+/* Loop-top alignment, shared by both x86-64 backends. 16 bytes is the classic
+ * -falign-loops choice and measured best here: 32 looked attractive (it is the
+ * uop-cache fetch window) but lost across the benchmark suite, because the
+ * extra padding pushes the rest of the function around more than the tighter
+ * window placement wins back. The cap stops a loop that starts just past a
+ * boundary from soaking up an almost-full boundary's worth of NOPs for a
+ * marginal gain. */
+#define BINARY_LOOP_ALIGN 16u
+#define BINARY_LOOP_ALIGN_MAX_PAD 11u
+
+int binary_emit_align_code(BinaryCodeBuffer *buffer, size_t boundary, size_t max_pad);
+int binary_emit_mov_mem_imm32(BinaryCodeBuffer *buffer, BinaryGpRegister base, int displacement, int32_t immediate);
 int binary_emit_mov_mem_reg(BinaryCodeBuffer *buffer, BinaryGpRegister base, int displacement, BinaryGpRegister source);
 int binary_emit_mov_mem_reg16(BinaryCodeBuffer *buffer, BinaryGpRegister base, int displacement, BinaryGpRegister source);
 int binary_emit_mov_mem_reg32(BinaryCodeBuffer *buffer, BinaryGpRegister base, int displacement, BinaryGpRegister source);

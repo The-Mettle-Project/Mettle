@@ -102,9 +102,53 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
                                   context.code.data + annot_base);
   }
 
+  /* Loop-top alignment, matching what the MIR backend does for the functions it
+   * takes: an IR label that some LATER branch jumps back to is a loop header,
+   * so pad it onto a boundary. Without this a loop's speed depends on where its
+   * function happened to land -- an unrelated change upstream that shifts the
+   * function by a few bytes moves a hot loop across an instruction-fetch window
+   * and swings it by tens of percent.
+   *
+   * The pad sits before the label, so the back-edge jumps past it and only a
+   * fall-through into the loop decodes it, once. */
+  char *align_label = NULL;
+  if (ir_function->instruction_count > 0) {
+    align_label = (char *)calloc(ir_function->instruction_count, 1);
+  }
+  if (align_label) {
+    for (size_t b = 0; b < ir_function->instruction_count; b++) {
+      const IRInstruction *br = &ir_function->instructions[b];
+      if (br->op != IR_OP_JUMP && br->op != IR_OP_BRANCH_ZERO &&
+          br->op != IR_OP_BRANCH_EQ) {
+        continue;
+      }
+      if (!br->text || !br->text[0]) {
+        continue;
+      }
+      for (size_t d = 0; d < b; d++) {
+        const IRInstruction *lb = &ir_function->instructions[d];
+        if (lb->op == IR_OP_LABEL && lb->text &&
+            strcmp(lb->text, br->text) == 0) {
+          align_label[d] = 1;
+          break;
+        }
+      }
+    }
+  }
+
   size_t annot_prev_off = context.code.size;
   int annot_prev_idx = -1;
   for (size_t i = 0; i < ir_function->instruction_count;) {
+    if (align_label && align_label[i] &&
+        !binary_emit_align_code(&context.code, BINARY_LOOP_ALIGN,
+                                BINARY_LOOP_ALIGN_MAX_PAD)) {
+      code_generator_set_error(generator,
+                               "Out of memory while aligning a loop header");
+      free(align_label);
+      if (annot) mir_annotate_end_function();
+      binary_function_context_destroy(&context);
+      return 0;
+    }
     /* Lazily record the previous instruction's span now that it is fully
      * emitted; this is robust to the cascade's many `continue` paths because
      * every one returns here. */
@@ -216,6 +260,7 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
                 instruction->location.column,
                 code_generator_runtime_filename(
                     generator, instruction->location.filename))) {
+          free(align_label);
           binary_function_context_destroy(&context);
           return 0;
         }
@@ -224,12 +269,15 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
 
     if (!code_generator_binary_emit_instruction(
             generator, &context, &ir_function->instructions[i])) {
+      free(align_label);
       if (annot) mir_annotate_end_function();
       binary_function_context_destroy(&context);
       return 0;
     }
     i++;
   }
+  free(align_label);
+  align_label = NULL;
   /* Record the last instruction's span (no further loop top runs). */
   if (annot && annot_prev_idx >= 0 && context.code.size > annot_prev_off) {
     mir_annotate_record_ir(ir_function, annot_prev_idx,
