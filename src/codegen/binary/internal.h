@@ -415,6 +415,11 @@ int binary_emit_mul_reg(BinaryCodeBuffer *buffer, BinaryGpRegister src);
 int binary_emit_imul_reg(BinaryCodeBuffer *buffer, BinaryGpRegister src);
 int binary_emit_imul_reg_reg(BinaryCodeBuffer *buffer, BinaryGpRegister destination, BinaryGpRegister source);
 int binary_emit_imul_reg_reg_imm32(BinaryCodeBuffer *buffer, BinaryGpRegister destination, BinaryGpRegister source, uint32_t immediate);
+/* As above, but the caller offers a free scratch register. Two of the
+ * shift-and-add expansions need the multiplicand to survive the final add, so
+ * without a scratch an in-place `x = x * C` has to fall back to imul and its
+ * longer latency. Pass have_scratch = 0 when no register is free. */
+int binary_emit_imul_reg_reg_imm32_scratch(BinaryCodeBuffer *buffer, BinaryGpRegister destination, BinaryGpRegister source, uint32_t immediate, int have_scratch, BinaryGpRegister scratch);
 int binary_emit_imul_reg_reg_small_imm(BinaryCodeBuffer *buffer, BinaryGpRegister destination, BinaryGpRegister source, int32_t immediate);
 int binary_emit_jcc_placeholder(BinaryCodeBuffer *buffer, unsigned char condition_opcode, size_t *displacement_offset_out);
 int binary_emit_je_placeholder(BinaryCodeBuffer *buffer, size_t *displacement_offset_out);
@@ -689,6 +694,23 @@ int code_generator_binary_get_temp_offset(BinaryFunctionContext *context, const 
 int code_generator_binary_global_is_written(IRProgram *ir_program, const char *name);
 int code_generator_binary_gp_register_is_win64_nonvolatile( BinaryGpRegister reg);
 int code_generator_binary_immediate_fits_signed_32(long long value);
+/* Should `value <op> immediate` be emitted at operand size 32?
+ *
+ * The 64-bit ALU immediate form sign-extends its imm32, so it cannot express a
+ * constant above INT32_MAX -- 0xEDB88320, 0x9E3779B9, 0xFFFFFF00 and most
+ * other bit-twiddling constants. Those otherwise cost a scratch register and a
+ * separate `mov reg, imm` at every use, inside the loop that uses them.
+ * Operand size 32 takes the full unsigned range in its immediate field and
+ * zero-extends the result.
+ *
+ * AND is always safe that way: the immediate's upper half is zero, so the
+ * result's upper half is zero at either width. OR and XOR are safe only when
+ * the value operand already has a zero upper half -- a uint32, whose register
+ * holds the canonical zero-extended form. Returns 0 for every other case,
+ * including immediates that already fit a signed imm32. */
+int code_generator_binary_bitwise_imm_wants_operand_size_32(
+    CodeGenerator *generator, BinaryFunctionContext *context, const char *op,
+    const IROperand *value, long long immediate);
 int code_generator_binary_instruction_in_backward_loop( const IRFunction *function, size_t instruction_index);
 int code_generator_binary_instruction_result_float_bits( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_instruction_result_is_float64( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);

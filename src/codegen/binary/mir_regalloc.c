@@ -546,11 +546,21 @@ static void mir_compute_coalesce_hints(MirFunction *fn) {
       break;
     case MIR_SUB:
     case MIR_FSUB:
+    case MIR_FDIV:
     /* NEG/NOT are one-source two-address ops (`neg D` computes D = -D), so the
      * encoder copies the source into the destination unless the allocator put
      * it there already -- the same copy the arithmetic cases above elide. */
     case MIR_NEG:
     case MIR_NOT:
+    /* A shift by a constant is two-address the same way (`shr D, 1` computes
+     * D = D >> 1). Only the shifted value is a candidate, never the count --
+     * which the `commutative = 0` below already ensures, since the count is
+     * operand b. A VARIABLE shift stages through a fixed scratch register no
+     * matter where its input lives, so hinting it would bias the allocator for
+     * nothing; those are filtered out below. */
+    case MIR_SHL:
+    case MIR_SHR:
+    case MIR_SAR:
     /* A plain register copy `dst <- a` is the most basic coalescing target: if a
      * dies at the copy, dst and a never overlap, so they can share a register and
      * the move disappears entirely (store_from/materialize elide a `mov R,R`).
@@ -570,6 +580,10 @@ static void mir_compute_coalesce_hints(MirFunction *fn) {
     MirRegClass dcls = fn->vregs[in->dst.vreg].rclass;
     if (in->op == MIR_IMUL && in->b.kind == MIR_OPK_IMM) {
       continue; /* imul r, a, imm32 needs no copy */
+    }
+    if ((in->op == MIR_SHL || in->op == MIR_SHR || in->op == MIR_SAR) &&
+        in->b.kind != MIR_OPK_IMM) {
+      continue; /* variable shift: the value goes through a scratch anyway */
     }
     MirVregId d = in->dst.vreg;
     MirVregId cand = MIR_VREG_NONE;

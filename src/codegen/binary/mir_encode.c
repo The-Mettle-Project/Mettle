@@ -275,11 +275,24 @@ static int emit_op_eq(MirFunction *fn, MirOpcode mop, unsigned char opc,
   BinaryCodeBuffer *code = &fn->context->code;
   /* At operand size 32 the immediate is not sign-extended, so ANY 32-bit
    * constant folds into the instruction -- including the ones (0x80000000 and
-   * up) that the 64-bit form has to stage through a register. */
+   * up) that the 64-bit form has to stage through a register.
+   *
+   * A 64-bit AND joins that: the immediate's upper half is zero, so the
+   * result's upper half is zero whichever operand size the instruction uses,
+   * and operand size 32 zeroes it for free. That rescues the masking constants
+   * -- 0xEDB88320, 0xFFFFFF00, 0x9E3779B9 -- which otherwise burn a register
+   * and an instruction at every use. OR and XOR do NOT join: they would have
+   * preserved the operand's upper half, which operand size 32 discards. */
   if (x->kind == MIR_OPK_IMM &&
       (code_generator_binary_immediate_fits_signed_32(x->imm) ||
        (width == 4 && (unsigned long long)x->imm <= 0xFFFFFFFFULL))) {
     return alu_imm(fn, mop, target, x->imm, width)
+               ? 1
+               : enc_err(fn, "out of memory in ALU imm");
+  }
+  if (x->kind == MIR_OPK_IMM && mop == MIR_AND && width == 8 &&
+      (unsigned long long)x->imm <= 0xFFFFFFFFULL) {
+    return alu_imm(fn, mop, target, x->imm, 4)
                ? 1
                : enc_err(fn, "out of memory in ALU imm");
   }
@@ -407,10 +420,13 @@ static int encode_imul(MirFunction *fn, const MirInst *in) {
   if (dst_is_reg(fn, &in->dst, &D)) {
     int ok;
     if (b_imm32) {
-      /* D = a * imm: three-operand imul reads a, writes D (a may equal D). */
+      /* D = a * imm: three-operand imul reads a, writes D (a may equal D).
+       * Hand over the scratch that staging `a` did not use, so the shift-and-add
+       * expansions stay available when D and a are the same register. */
       BinaryGpRegister areg = value_reg(fn, &in->a, SCRATCH_A, &ok);
-      if (!ok ||
-          !binary_emit_imul_reg_reg_imm32(code, D, areg, (uint32_t)in->b.imm)) {
+      BinaryGpRegister scratch = (areg == SCRATCH_A) ? SCRATCH_B : SCRATCH_A;
+      if (!ok || !binary_emit_imul_reg_reg_imm32_scratch(
+                     code, D, areg, (uint32_t)in->b.imm, 1, scratch)) {
         return enc_err(fn, "out of memory in imul imm");
       }
       return 1;

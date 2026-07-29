@@ -1050,10 +1050,12 @@ int binary_emit_imul_reg_reg_small_imm(BinaryCodeBuffer *buffer,
   return 1;
 }
 
-int binary_emit_imul_reg_reg_imm32(BinaryCodeBuffer *buffer,
-                                          BinaryGpRegister destination,
-                                          BinaryGpRegister source,
-                                          uint32_t immediate) {
+int binary_emit_imul_reg_reg_imm32_scratch(BinaryCodeBuffer *buffer,
+                                           BinaryGpRegister destination,
+                                           BinaryGpRegister source,
+                                           uint32_t immediate,
+                                           int have_scratch,
+                                           BinaryGpRegister scratch) {
   if (!buffer) {
     return 0;
   }
@@ -1102,9 +1104,24 @@ int binary_emit_imul_reg_reg_imm32(BinaryCodeBuffer *buffer,
              binary_emit_alu_reg_reg(buffer, 0x01 /* ADD */, destination,
                                      source);
     }
+    /* dst == src: shift a COPY instead, so the original survives the add. The
+     * chain is still shl+add, and the caller's scratch is free here. Without
+     * this an in-place `h = h * 33` -- the shape a hash loop's recurrence takes
+     * once its temp is folded into its destination -- falls back to imul and
+     * pays a 3-cycle loop-carried latency instead of 2. */
+    if (have_scratch && scratch != destination && scratch != BINARY_GP_RSP) {
+      return binary_emit_mov_reg_reg(buffer, scratch, source) &&
+             binary_emit_shift_reg_imm8(buffer, 4, scratch, shift) &&
+             binary_emit_alu_reg_reg(buffer, 0x01 /* ADD */, destination,
+                                     scratch);
+    }
   }
   /* C = 2^k - 1 (7,15,31,63,...): source*(2^k-1) = (source<<k) - source. Same
-   * rationale and constraints (C==3 is already handled above as 2^1+1). */
+   * rationale and constraints (C==3 is already handled above as 2^1+1).
+   *
+   * There is no dst==src form here. SUB does not commute, so the scratch would
+   * have to hold the result and be moved back -- four instructions to save one
+   * cycle of latency, past the point where the trade is worth making. */
   if (signed_immediate >= 7 && destination != source &&
       binary_immediate_positive_power_of_two_i32(signed_immediate + 1,
                                                  &shift)) {
@@ -1165,6 +1182,14 @@ int binary_emit_imul_reg_reg_imm32(BinaryCodeBuffer *buffer,
   }
 
   return 1;
+}
+
+int binary_emit_imul_reg_reg_imm32(BinaryCodeBuffer *buffer,
+                                          BinaryGpRegister destination,
+                                          BinaryGpRegister source,
+                                          uint32_t immediate) {
+  return binary_emit_imul_reg_reg_imm32_scratch(buffer, destination, source,
+                                                immediate, 0, BINARY_GP_RAX);
 }
 
 int binary_emit_unary_reg(BinaryCodeBuffer *buffer,
