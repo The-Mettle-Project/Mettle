@@ -15,6 +15,8 @@
 #   .\tools\benchmark\run-benchmarks.ps1 -Runs 7 -Warmup 2
 #   .\tools\benchmark\run-benchmarks.ps1 -Benchmark fib,grep
 #   .\tools\benchmark\run-benchmarks.ps1 -Suite 2          # Suite 2 only (new benchmark set)
+#   .\tools\benchmark\run-benchmarks.ps1 -Clang            # clang instead of gcc (mingw target)
+#   .\tools\benchmark\run-benchmarks.ps1 -Clang -ClangTarget ""   # clang with its own default target
 #   .\tools\benchmark\run-benchmarks.ps1 -MlOpt        # compile Mettle with --ml-opt
 #   .\tools\benchmark\run-benchmarks.ps1 -CompileOnly
 #   .\tools\benchmark\run-benchmarks.ps1 -SkipCompileBenchmarks
@@ -32,6 +34,7 @@ param(
     [switch]$Gcc,
     [switch]$Clang,
     [switch]$MlOpt,
+    [string]$ClangTarget = "x86_64-w64-mingw32",
     [string]$ConfigPath = "docs/benchmarks/harness.json",
     [string]$CompilerPath = "",
     [string[]]$Benchmark = @(),
@@ -450,6 +453,25 @@ function Get-MettleBuildArgs {
     return $args
 }
 
+function Get-CCompilerPrefixArgs {
+    param([string[]]$Flags = @())
+
+    # The standalone LLVM build on Windows defaults to the MSVC target, which needs a
+    # Windows SDK for stdio.h and friends. The benchmark flags are gcc-shaped anyway, so
+    # aim clang at the mingw sysroot unless the caller already picked a target.
+    if (-not $script:Clang -or [string]::IsNullOrWhiteSpace($script:ClangTarget)) {
+        return @()
+    }
+
+    foreach ($flag in @($Flags)) {
+        if ($flag -like "--target=*" -or $flag -eq "-target" -or $flag -like "--sysroot=*") {
+            return @()
+        }
+    }
+
+    return @("--target=$($script:ClangTarget)")
+}
+
 function Get-CCompileArgs {
     param(
         [object]$Config,
@@ -466,7 +488,7 @@ function Get-CCompileArgs {
         $flags = @("-O3", "-lkernel32")
     }
 
-    return @($flags) + @("-o", $ExePath, $SourcePath)
+    return @(Get-CCompilerPrefixArgs -Flags $flags) + @($flags) + @("-o", $ExePath, $SourcePath)
 }
 
 function Compile-MettleBenchmark {
@@ -562,7 +584,7 @@ function Compile-CBenchmarkWithFlags {
         Remove-Item -LiteralPath $ExePath -Force
     }
 
-    $args = @($Flags) + @("-o", $ExePath, $SourcePath)
+    $args = @(Get-CCompilerPrefixArgs -Flags $Flags) + @($Flags) + @("-o", $ExePath, $SourcePath)
     $compile = Invoke-CapturedProcess -FilePath $CCompiler -Arguments $args -WorkingDirectory $Root
     if ($compile.ExitCode -ne 0) {
         throw "C compile failed for ${BenchmarkName}:`n$($compile.Output)"
@@ -769,6 +791,10 @@ if (-not $cCompilerCommand) {
     exit 1
 }
 
+if ($Clang -and -not [string]::IsNullOrWhiteSpace($ClangTarget)) {
+    Write-Log "C compiler: clang targeting $ClangTarget"
+}
+
 if ($MlOpt) { Write-Log "ML optimizer enabled: compiling Mettle with --ml-opt" }
 
 $cVersionOutput = (& $cCompiler --version 2>&1 | Out-String).Trim()
@@ -963,6 +989,7 @@ $payload = [ordered]@{
         compile_only = [bool]$CompileOnly
         compiler = $compilerFullPath
         c_compiler = $cCompiler
+        c_compiler_target = if ($Clang -and -not [string]::IsNullOrWhiteSpace($ClangTarget)) { $ClangTarget } else { $null }
         mettle_flags = @($mettleFlags)
         c_flags = if ($CFlags.Count -gt 0) { @($CFlags) } elseif ($null -ne $config.defaults.c_flags) { @($config.defaults.c_flags) } else { @("-O3", "-lkernel32") }
     }
