@@ -1,0 +1,69 @@
+import "std/io";
+import "std/mem";
+
+struct ProbIndex {
+  prob: float32;
+  index: int32;
+}
+
+var rng: uint64 = 0x2545F4914F6CDD1D;
+var spins: int64 = 0;
+
+fn rand_f32() -> float32 {
+  rng = rng ^ (rng >> 12);
+  rng = rng ^ (rng << 25);
+  rng = rng ^ (rng >> 27);
+  var r: uint32 = (uint32)((rng * 0x2545F4914F6CDD1D) >> 32) >> 8;
+  return (float32)((float64)r / 16777216.0);
+}
+
+fn qs(pi: ProbIndex*, lo: int32, hi: int32) {
+  if (lo >= hi) { return; }
+  var pivot: float32 = pi[(lo + hi) / 2].prob;
+  var i: int32 = lo;
+  var j: int32 = hi;
+  while (i <= j) {
+    spins = spins + 1;
+    if (spins > 1000000) { return; }
+    while (pi[i].prob > pivot) { i = i + 1; }
+    while (pi[j].prob < pivot) { j = j - 1; }
+    if (i <= j) {
+      var tmp: ProbIndex = pi[i];
+      pi[i] = pi[j];
+      pi[j] = tmp;
+      i = i + 1;
+      j = j - 1;
+    }
+  }
+  qs(pi, lo, j);
+  qs(pi, i, hi);
+}
+
+fn main() -> int32 {
+  var n: int32 = 259;
+  var pi: ProbIndex* = (ProbIndex*)malloc((int64)n * (int64)sizeof(ProbIndex));
+  var k: int32 = 0;
+  while (k < n) {
+    pi[k].prob = rand_f32();
+    pi[k].index = k;
+    k = k + 1;
+  }
+  qs(pi, 0, n - 1);
+  if (spins > 1000000) {
+    println(cstr("rotate_backedge SPUN"));
+    fflush(get_stdout());
+    return 1;
+  }
+  k = 1;
+  while (k < n) {
+    if (pi[k - 1].prob < pi[k].prob) {
+      println(cstr("rotate_backedge UNSORTED"));
+      fflush(get_stdout());
+      return 2;
+    }
+    k = k + 1;
+  }
+  println(cstr("rotate_backedge OK"));
+  fflush(get_stdout());
+  return 0;
+}

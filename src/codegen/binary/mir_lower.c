@@ -5568,19 +5568,30 @@ static void mir_rotate_loops(MirFunction *fn) {
     const char *hname = fn->insns[j].dst.sym;     /* header / body-start label */
     const char *ename = fn->insns[j + 1].dst.sym; /* loop exit target          */
 
-    /* Require exactly one backward edge: a `JMP H` after the header. (A loop
-     * with extra back-edges from `continue` is left unrotated.) */
+    /* Require that the only edge into H is a single backward `JMP H`: the latch.
+     * Rotation moves the test above the label, so H stops being tested on entry
+     * and every other edge reaching it would run the body without ever
+     * evaluating the loop condition. That covers conditional back-edges as well
+     * as unconditional ones -- a `while (i <= j) { ...; if (i <= j) { ... } }`
+     * lowers the `if`'s false arm to a `CMPBR H`, which is a back-edge the JMP
+     * scan alone does not see -- and forward jumps into the header. */
     size_t be = 0;
     int nbe = 0;
-    for (size_t k = j + 2; k < fn->insn_count; k++) {
-      if (fn->insns[k].op == MIR_JMP &&
-          fn->insns[k].dst.kind == MIR_OPK_LABEL && fn->insns[k].dst.sym &&
-          strcmp(fn->insns[k].dst.sym, hname) == 0) {
+    int other_edge = 0;
+    for (size_t k = 0; k < fn->insn_count; k++) {
+      if (k == j || fn->insns[k].dst.kind != MIR_OPK_LABEL ||
+          !fn->insns[k].dst.sym ||
+          strcmp(fn->insns[k].dst.sym, hname) != 0) {
+        continue;
+      }
+      if (fn->insns[k].op == MIR_JMP && k > j + 1) {
         be = k;
         nbe++;
+      } else {
+        other_edge = 1;
       }
     }
-    if (nbe != 1) {
+    if (nbe != 1 || other_edge) {
       continue;
     }
     /* The instruction right after the back-edge must be the header's exit label.

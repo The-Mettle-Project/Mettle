@@ -3269,6 +3269,46 @@ foreach ($relFlag in @($true, $false)) {
   }
 }
 
+# MIR loop rotation moves the header test above the header label, so it is only
+# legal when the latch is the sole edge into the header. A Hoare partition's
+# `if (i <= j)` false arm threads straight back to the enclosing `while (i <= j)`
+# header as a CMPBR, which the back-edge scan missed when it counted only JMPs;
+# rotating then let that edge re-enter the body untested and spin forever. The
+# reproducer carries its own iteration budget so a regression fails instead of
+# hanging the suite.
+foreach ($relFlag in @($true, $false)) {
+  $total++
+  $variant = if ($relFlag) { "release" } else { "debug" }
+  try {
+    $exePath = Join-Path $tmpDir "test_mir_rotate_backedge_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($relFlag) { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_mir_rotate_backedge.mettle", "-o", $exePath)
+
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "rotate back-edge build ($variant) failed: $buildOut"
+    }
+    if (-not (Test-Path $exePath)) {
+      throw "rotate back-edge build ($variant) did not produce an executable"
+    }
+
+    $runOut = & $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "rotate back-edge ($variant) failed (exit $LASTEXITCODE): $runOut"
+    }
+    if ($runOut -notmatch "rotate_backedge OK") {
+      throw "rotate back-edge ($variant) did not print OK: $runOut"
+    }
+
+    Write-CaseResult -Name "mir_rotate_backedge_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "mir_rotate_backedge_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # Tail-recursion elimination: pure (`return self(...)`), void (`self(...);
 # return`), and accumulator (`return E + self(...)`) forms must preserve
 # semantics, including the MIR back-edge-to-entry liveness fix (params must
