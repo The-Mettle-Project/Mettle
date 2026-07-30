@@ -60,3 +60,6 @@ examples/cad/
 .vs/
 tests/profiler_test.mettle
 tests/parse_stress_test.mettle
+
+# JetBrains IDE project config, per-developer.
+.idea/
