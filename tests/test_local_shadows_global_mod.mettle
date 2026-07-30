@@ -1,0 +1,46 @@
+// Deliberately does NOT import std/math: the caller does, so `exp` exists as a
+// global function symbol while `exp` here is only ever a function local.
+export var gcounter: int32 = 7;
+
+export fn with_early_return(h: int32) -> float32 {
+  var exp: int32 = (h >> 7) & 0xFF;
+  if (exp == 255) { return 0.0; }
+  return 1.0 + (float32)(h & 0x7F) * (float32)0.0078125;
+}
+
+export fn with_early_return_f64(h: int32) -> float64 {
+  var exp: int32 = (h >> 7) & 0xFF;
+  if (exp == 255) { return 0.0; }
+  return 1.0 + (float64)(h & 0x7F) * 0.0078125;
+}
+
+export fn single_exit(h: int32) -> float32 {
+  var r: float32 = 0.0;
+  var exp: int32 = (h >> 7) & 0xFF;
+  if (exp != 255) {
+    r = 1.0 + (float32)(h & 0x7F) * (float32)0.0078125;
+  }
+  return r;
+}
+
+export fn no_branch(h: int32) -> float32 {
+  return 1.0 + (float32)(h & 0x7F) * (float32)0.0078125;
+}
+
+// The local shadows this module's own global scalar, which is the silent-
+// corruption form: the promoted local was written back over the global.
+export fn shadows_a_global_var(h: int32) -> float32 {
+  var gcounter: int32 = (h >> 7) & 0xFF;
+  if (gcounter == 255) { return 0.0; }
+  return 1.0 + (float32)(h & 0x7F) * (float32)0.0078125;
+}
+
+// A genuine global read-modify-write, so the test also proves the promotion
+// itself still happens rather than being disabled outright.
+export fn bump(n: int32) {
+  var i: int32 = 0;
+  while (i < n) {
+    gcounter = gcounter + 1;
+    i = i + 1;
+  }
+}

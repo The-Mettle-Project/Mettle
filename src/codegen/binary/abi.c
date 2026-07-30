@@ -815,6 +815,7 @@ int code_generator_binary_promote_hot_symbols(
        reg_index++) {
     const char *best_name = NULL;
     size_t best_score = 0;
+    int best_is_global = 0;
 
     for (size_t i = 0; i < ir_function->parameter_count; i++) {
       const char *name = ir_function->parameter_names[i];
@@ -841,6 +842,7 @@ int code_generator_binary_promote_hot_symbols(
       if (score > best_score) {
         best_score = score;
         best_name = name;
+        best_is_global = 0;
       }
     }
 
@@ -878,6 +880,7 @@ int code_generator_binary_promote_hot_symbols(
         if (score > best_score) {
           best_score = score;
           best_name = name;
+          best_is_global = 0;
         }
       }
     }
@@ -906,8 +909,12 @@ int code_generator_binary_promote_hot_symbols(
           symbol = generator->ir_program
                        ? code_generator_lookup_symbol(generator, name)
                        : NULL;
-          if (!symbol || !symbol->scope ||
+          if (!symbol || symbol->kind != CG_SYM_VARIABLE || !symbol->scope ||
               symbol->scope->type != CG_SCOPE_GLOBAL || symbol->is_extern ||
+              binary_named_slot_table_get_offset(&context->local_slots, name) >=
+                  0 ||
+              binary_named_slot_table_get_offset(&context->parameter_slots,
+                                                 name) >= 0 ||
               !code_generator_binary_type_is_gp_promotable(symbol->type)) {
             continue;
           }
@@ -916,6 +923,7 @@ int code_generator_binary_promote_hot_symbols(
           if (score > best_score) {
             best_score = score;
             best_name = name;
+            best_is_global = 1;
           }
         }
         for (size_t arg_i = 0; arg_i < instruction->argument_count; arg_i++) {
@@ -933,8 +941,12 @@ int code_generator_binary_promote_hot_symbols(
           symbol = generator->ir_program
                        ? code_generator_lookup_symbol(generator, name)
                        : NULL;
-          if (!symbol || !symbol->scope ||
+          if (!symbol || symbol->kind != CG_SYM_VARIABLE || !symbol->scope ||
               symbol->scope->type != CG_SCOPE_GLOBAL || symbol->is_extern ||
+              binary_named_slot_table_get_offset(&context->local_slots, name) >=
+                  0 ||
+              binary_named_slot_table_get_offset(&context->parameter_slots,
+                                                 name) >= 0 ||
               !code_generator_binary_type_is_gp_promotable(symbol->type)) {
             continue;
           }
@@ -943,6 +955,7 @@ int code_generator_binary_promote_hot_symbols(
           if (score > best_score) {
             best_score = score;
             best_name = name;
+            best_is_global = 1;
           }
         }
       }
@@ -950,6 +963,17 @@ int code_generator_binary_promote_hot_symbols(
 
     if (!best_name || best_score < 2) {
       break;
+    }
+
+    if (best_is_global &&
+        !binary_named_slot_table_add(&context->register_global_symbols,
+                                     best_name,
+                                     (int)promotion_registers[reg_index])) {
+      code_generator_set_error(
+          generator, "Out of memory while promoting global '%s' in '%s'",
+          best_name, ir_function->name);
+      free(loop_weights);
+      return 0;
     }
 
     if (!binary_named_slot_table_add(&context->register_symbols, best_name,

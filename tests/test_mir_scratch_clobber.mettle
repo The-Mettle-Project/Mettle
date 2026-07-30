@@ -1,0 +1,118 @@
+import "std/io";
+import "std/mem";
+
+// A nest deep enough to spill, whose inner byte loads are `src[base + idx]`
+// with a spilled index: the encoder stages that index through a scratch, and
+// picking one the allocator had handed a live loop counter silently corrupted
+// the counter. `n` ran past its bound, `is` walked off `sc`, and the release
+// build faulted. Self-checks the decoded values, so a wrong-but-not-faulting
+// staging choice fails too.
+fn kern(src: uint8*, dst: float32*, nblocks: int64) {
+  var b: int64 = 0;
+  while (b < nblocks) {
+    var s: int64 = b * 110;
+    var o: int64 = b * 256;
+
+    var sc: int32[16];
+    var i: int32 = 0;
+    while (i < 16) {
+      sc[i] = (int32)src[s + 96 + (int64)i] & 0x3F;
+      i = i + 1;
+    }
+
+    var m: int32 = 1;
+    var is: int32 = 0;
+    var n: int32 = 0;
+    while (n < 256) {
+      var qbase: int64 = s + 32 + (int64)(n / 4);
+      var shift: int32 = 0;
+      var j: int32 = 0;
+      while (j < 4) {
+        var dl: float64 = 0.5 * (float32)(sc[is] - 32);
+        is = is + 1;
+        var l: int32 = 0;
+        while (l < 16) {
+          var q: int32 = ((int32)src[qbase + (int64)l] >> shift) & 3;
+          var sub: int32 = 4;
+          if (((int32)src[s + (int64)l] & m) != 0) { sub = 0; }
+          dst[o + (int64)(n + j * 32 + l)] = dl * (float32)(q - sub);
+          l = l + 1;
+        }
+        var dl2: float64 = 0.5 * (float32)(sc[is] - 32);
+        is = is + 1;
+        l = 0;
+        while (l < 16) {
+          var q2: int32 = ((int32)src[qbase + (int64)(l + 16)] >> shift) & 3;
+          var sub2: int32 = 4;
+          if (((int32)src[s + (int64)(l + 16)] & m) != 0) { sub2 = 0; }
+          dst[o + (int64)(n + j * 32 + 16 + l)] = dl2 * (float32)(q2 - sub2);
+          l = l + 1;
+        }
+        shift = shift + 2;
+        m = m << 1;
+        j = j + 1;
+      }
+      n = n + 128;
+    }
+    b = b + 1;
+  }
+}
+
+fn main() -> int32 {
+  var nb: int64 = 2;
+  var src: uint8* = (uint8*)malloc(nb * 110);
+  var dst: float32* = (float32*)malloc(nb * 256 * 4);
+  var k: int64 = 0;
+  while (k < nb * 110) {
+    src[k] = (uint8)((k * 37 + 11) & 0xFF);
+    k = k + 1;
+  }
+
+  kern(src, dst, nb);
+
+  // Recompute in a shape the miscompile does not hit (no spilled-index byte
+  // load feeding a live counter) and compare every element.
+  var bad: int32 = 0;
+  var b2: int64 = 0;
+  while (b2 < nb) {
+    var s2: int64 = b2 * 110;
+    var o2: int64 = b2 * 256;
+    var idx: int32 = 0;
+    while (idx < 256) {
+      var blk: int32 = idx / 128;
+      var rem: int32 = idx % 128;
+      var jj: int32 = rem / 32;
+      var half: int32 = (rem % 32) / 16;
+      var pos: int32 = rem % 32;
+      var isx: int32 = blk * 8 + jj * 2 + half;
+      var scv: int32 = (int32)src[s2 + 96 + (int64)isx] & 0x3F;
+      var dl: float64 = 0.5 * (float32)(scv - 32);
+      var shift: int32 = jj * 2;
+      var mask: int32 = 1;
+      var t: int32 = 0;
+      while (t < blk * 4 + jj) { mask = mask * 2; t = t + 1; }
+      var qb: int64 = s2 + 32 + (int64)(blk * 32);
+      var q: int32 = ((int32)src[qb + (int64)pos] >> shift) & 3;
+      var sub: int32 = 4;
+      if (((int32)src[s2 + (int64)pos] & mask) != 0) { sub = 0; }
+      var want: float32 = (float32)(dl * (float32)(q - sub));
+      var got: float32 = dst[o2 + (int64)idx];
+      var diff: float32 = want - got;
+      if (diff < 0.0) { diff = 0.0 - diff; }
+      if (diff > 0.0001) { bad = bad + 1; }
+      idx = idx + 1;
+    }
+    b2 = b2 + 1;
+  }
+
+  if (bad != 0) {
+    print(cstr("mir_scratch_clobber MISMATCH count="));
+    print_int(bad);
+    newline();
+    fflush(get_stdout());
+    return 1;
+  }
+  println(cstr("mir_scratch_clobber OK"));
+  fflush(get_stdout());
+  return 0;
+}

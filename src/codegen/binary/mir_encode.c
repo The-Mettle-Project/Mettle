@@ -151,6 +151,24 @@ static void mir_note_fixed_reg(const MirFunction *fn, const MirOperand *op,
   }
 }
 
+/* True when some allocated value sitting in `phys` is live at instruction
+ * `idx`. Only meaningful for allocatable registers: R10/R11 are outside the
+ * pool, so nothing is ever live in them. */
+static int mir_phys_live_at(const MirFunction *fn, BinaryGpRegister phys,
+                            size_t idx) {
+  for (size_t v = 0; v < fn->vreg_count; v++) {
+    const MirVreg *vr = &fn->vregs[v];
+    if (!vr->assigned || !vr->in_register || vr->rclass == MIR_RC_XMM ||
+        (BinaryGpRegister)vr->phys != phys) {
+      continue;
+    }
+    if (vr->live_start <= (int)idx && vr->live_end >= (int)idx) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 /* Pick a scratch register for staging a spilled operand: `preferred` unless it
  * is already holding one of `avoid`.
  *
@@ -159,25 +177,56 @@ static void mir_note_fixed_reg(const MirFunction *fn, const MirOperand *op,
  * base and index as one register, so `[base + index*4]` silently becomes
  * `[r11 + r11*4]` and the access reads the wrong address.
  *
- * The fallbacks are the reserved encoder scratches R10/R11 first, because those
- * are outside the allocator's pool and so can never hold a live value. RDX is
- * last: it IS allocatable, so it is only used where a caller already asked for
- * it. Keeping each caller's original preference means a combination that
- * encoded correctly before still encodes identically. */
-static BinaryGpRegister mir_pick_scratch(BinaryGpRegister preferred,
-                                         const BinaryGpRegister *avoid,
-                                         int avoid_n) {
-  if (!mir_reg_in(preferred, avoid, avoid_n)) {
-    return preferred;
+ * The candidates are the reserved encoder scratches R10/R11, which are outside
+ * the allocator's pool and so can never hold a live value. RDX is allowed only
+ * as a last resort AND only when no live value occupies it at this instruction:
+ * it is allocatable, and staging over a live one is silent corruption of a
+ * value this instruction never mentions. A loop counter in RDX was overwritten
+ * by the index staging of a byte load, and the loop then ran until it walked
+ * off its array -- `avoid` cannot see that, because the clobbered value is not
+ * an operand of the access doing the clobbering.
+ *
+ * `extra` names registers the caller has vouched for -- an address-forming
+ * instruction's own destination, which it writes only after reading the whole
+ * address, so staging into it is safe once the operands' resident registers are
+ * in `avoid`. Those skip the liveness gate: the destination is defined here, so
+ * a scan would always see it as live.
+ *
+ * Returns 0 (and leaves *out untouched) when nothing is safe, so the caller
+ * raises an encoder error rather than emitting a wrong address. */
+static int mir_pick_scratch(const MirFunction *fn, size_t idx,
+                            BinaryGpRegister preferred,
+                            const BinaryGpRegister *avoid, int avoid_n,
+                            const BinaryGpRegister *extra, int extra_n,
+                            BinaryGpRegister *out) {
+  BinaryGpRegister pool[8];
+  int vouched[8];
+  int n = 0;
+  pool[n] = preferred;
+  vouched[n++] = 0;
+  pool[n] = SCRATCH_B;
+  vouched[n++] = 1;
+  pool[n] = SCRATCH_A;
+  vouched[n++] = 1;
+  for (int i = 0; i < extra_n && n < 7; i++) {
+    pool[n] = extra[i];
+    vouched[n++] = 1;
   }
-  static const BinaryGpRegister pool[3] = {SCRATCH_B, SCRATCH_A,
-                                           BINARY_GP_RDX};
-  for (int i = 0; i < 3; i++) {
-    if (!mir_reg_in(pool[i], avoid, avoid_n)) {
-      return pool[i];
+  pool[n] = BINARY_GP_RDX;
+  vouched[n++] = 0;
+
+  for (int i = 0; i < n; i++) {
+    if (mir_reg_in(pool[i], avoid, avoid_n)) {
+      continue;
     }
+    if (!vouched[i] && pool[i] != SCRATCH_A && pool[i] != SCRATCH_B &&
+        mir_phys_live_at(fn, pool[i], idx)) {
+      continue;
+    }
+    *out = pool[i];
+    return 1;
   }
-  return preferred;
+  return 0;
 }
 
 /* Return the physical register currently holding `op`'s value, materializing
@@ -1161,17 +1210,29 @@ static int encode_mov(MirFunction *fn, const MirInst *in) {
        * and index read one register. */
       BinaryGpRegister taken[4];
       int tn = 0;
-      taken[tn++] = target;
       mir_note_fixed_reg(fn, &bop, taken, &tn);
       mir_note_fixed_reg(fn, &iop, taken, &tn);
-      BinaryGpRegister base_reg =
-          value_reg(fn, &bop, mir_pick_scratch(SCRATCH_B, taken, tn), &ok);
+      /* The load writes `target` only after reading base and index, so it is a
+       * legal staging register once neither operand is resident in it. */
+      BinaryGpRegister vouch[1];
+      int vn = mir_reg_in(target, taken, tn) ? 0 : 1;
+      vouch[0] = target;
+      size_t idx = (size_t)(in - fn->insns);
+      BinaryGpRegister base_scratch, index_scratch;
+      if (!mir_pick_scratch(fn, idx, SCRATCH_B, taken, tn, vouch, vn,
+                            &base_scratch)) {
+        return enc_err(fn, "no free scratch register for a scaled load base");
+      }
+      BinaryGpRegister base_reg = value_reg(fn, &bop, base_scratch, &ok);
       if (!ok) {
         return 0;
       }
       taken[tn++] = base_reg;
-      BinaryGpRegister index_reg =
-          value_reg(fn, &iop, mir_pick_scratch(BINARY_GP_RDX, taken, tn), &ok);
+      if (!mir_pick_scratch(fn, idx, BINARY_GP_RDX, taken, tn, vouch, vn,
+                            &index_scratch)) {
+        return enc_err(fn, "no free scratch register for a scaled load index");
+      }
+      BinaryGpRegister index_reg = value_reg(fn, &iop, index_scratch, &ok);
       if (!ok) {
         return 0;
       }
@@ -1218,16 +1279,22 @@ static int encode_mov(MirFunction *fn, const MirInst *in) {
       mir_note_fixed_reg(fn, &iop, taken, &tn);
       mir_note_fixed_reg(fn, &in->a, taken, &tn);
 
-      BinaryGpRegister base_reg =
-          value_reg(fn, &bop, mir_pick_scratch(SCRATCH_B, taken, tn), &ok1);
+      size_t idx = (size_t)(in - fn->insns);
+      BinaryGpRegister base_scratch, index_scratch, val_scratch;
+      if (!mir_pick_scratch(fn, idx, SCRATCH_B, taken, tn, NULL, 0, &base_scratch)) {
+        return enc_err(fn, "no free scratch register for a scaled store base");
+      }
+      BinaryGpRegister base_reg = value_reg(fn, &bop, base_scratch, &ok1);
       if (!ok1) {
         return 0;
       }
       taken[tn++] = base_reg;
       /* The narrow-width path leas the address into SCRATCH_B after reading base
        * and index, so those two may live there but the value may not. */
-      BinaryGpRegister index_reg =
-          value_reg(fn, &iop, mir_pick_scratch(BINARY_GP_RDX, taken, tn), &ok2);
+      if (!mir_pick_scratch(fn, idx, BINARY_GP_RDX, taken, tn, NULL, 0, &index_scratch)) {
+        return enc_err(fn, "no free scratch register for a scaled store index");
+      }
+      BinaryGpRegister index_reg = value_reg(fn, &iop, index_scratch, &ok2);
       if (!ok2) {
         return 0;
       }
@@ -1235,8 +1302,10 @@ static int encode_mov(MirFunction *fn, const MirInst *in) {
       if (needs_lea) {
         taken[tn++] = SCRATCH_B;
       }
-      BinaryGpRegister val =
-          value_reg(fn, &in->a, mir_pick_scratch(SCRATCH_A, taken, tn), &ok1);
+      if (!mir_pick_scratch(fn, idx, SCRATCH_A, taken, tn, NULL, 0, &val_scratch)) {
+        return enc_err(fn, "no free scratch register for a scaled store value");
+      }
+      BinaryGpRegister val = value_reg(fn, &in->a, val_scratch, &ok1);
       if (!ok1) {
         return 0;
       }
@@ -2285,22 +2354,35 @@ int mir_encode(MirFunction *fn) {
        * clear of the target and of each other, resident registers included. */
       BinaryGpRegister taken[4];
       int tn = 0;
-      taken[tn++] = target;
       mir_note_fixed_reg(fn, &bop, taken, &tn);
       MirOperand iop_probe = mir_op_vreg(in->a.mem.index);
       if (in->a.mem.index != MIR_VREG_NONE) {
         mir_note_fixed_reg(fn, &iop_probe, taken, &tn);
       }
-      BinaryGpRegister base_reg =
-          value_reg(fn, &bop, mir_pick_scratch(SCRATCH_B, taken, tn), &rok);
+      /* As in the scaled load: the lea writes `target` last. */
+      BinaryGpRegister vouch[1];
+      int vn = mir_reg_in(target, taken, tn) ? 0 : 1;
+      vouch[0] = target;
+      size_t idx = (size_t)(in - fn->insns);
+      BinaryGpRegister base_scratch, index_scratch;
+      if (!mir_pick_scratch(fn, idx, SCRATCH_B, taken, tn, vouch, vn,
+                            &base_scratch)) {
+        ok = enc_err(fn, "no free scratch register for a scaled lea base");
+        break;
+      }
+      BinaryGpRegister base_reg = value_reg(fn, &bop, base_scratch, &rok);
       if (!rok) {
         break;
       }
       taken[tn++] = base_reg;
       if (in->a.mem.index != MIR_VREG_NONE) {
         MirOperand iop = mir_op_vreg(in->a.mem.index);
-        BinaryGpRegister index_reg =
-            value_reg(fn, &iop, mir_pick_scratch(BINARY_GP_RDX, taken, tn), &rok);
+        if (!mir_pick_scratch(fn, idx, BINARY_GP_RDX, taken, tn, vouch, vn,
+                              &index_scratch)) {
+          ok = enc_err(fn, "no free scratch register for a scaled lea index");
+          break;
+        }
+        BinaryGpRegister index_reg = value_reg(fn, &iop, index_scratch, &rok);
         if (!rok) {
           break;
         }

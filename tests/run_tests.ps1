@@ -3309,6 +3309,75 @@ foreach ($relFlag in @($true, $false)) {
   }
 }
 
+# A function-local that shares a name with a global must never be treated as
+# that global. code_generator_lookup_symbol resolves against the module symbol
+# table alone, so a `var exp` beside std/math's `exp` scored as global-scope and
+# the register-promotion write-back stored the local into .text (a fault) or,
+# when the name matched a global VARIABLE, over the global itself (silent
+# corruption). Also asserts real global promotion still happens.
+foreach ($relFlag in @($true, $false)) {
+  $total++
+  $variant = if ($relFlag) { "release" } else { "debug" }
+  try {
+    $exePath = Join-Path $tmpDir "test_local_shadows_global_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($relFlag) { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_local_shadows_global.mettle", "-o", $exePath)
+
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "local-shadows-global build ($variant) failed: $buildOut"
+    }
+    $runOut = & $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "local-shadows-global ($variant) failed (exit $LASTEXITCODE): $runOut"
+    }
+    if ($runOut -notmatch "local_shadows_global OK") {
+      throw "local-shadows-global ($variant) did not print OK: $runOut"
+    }
+
+    Write-CaseResult -Name "local_shadows_global_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "local_shadows_global_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# The MIR encoder stages a spilled base/index/value through a scratch register.
+# RDX was a candidate, but RDX is in the allocator's pool: staging over the live
+# loop counter it held made the counter run past its bound and the release build
+# walked off a local array. The scratch pick now vets liveness; this decodes a
+# K-quant-shaped nest and checks every element against an independent oracle.
+foreach ($relFlag in @($true, $false)) {
+  $total++
+  $variant = if ($relFlag) { "release" } else { "debug" }
+  try {
+    $exePath = Join-Path $tmpDir "test_mir_scratch_clobber_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($relFlag) { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_mir_scratch_clobber.mettle", "-o", $exePath)
+
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "mir scratch-clobber build ($variant) failed: $buildOut"
+    }
+    $runOut = & $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "mir scratch-clobber ($variant) failed (exit $LASTEXITCODE): $runOut"
+    }
+    if ($runOut -notmatch "mir_scratch_clobber OK") {
+      throw "mir scratch-clobber ($variant) did not print OK: $runOut"
+    }
+
+    Write-CaseResult -Name "mir_scratch_clobber_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "mir_scratch_clobber_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # Tail-recursion elimination: pure (`return self(...)`), void (`self(...);
 # return`), and accumulator (`return E + self(...)`) forms must preserve
 # semantics, including the MIR back-edge-to-entry liveness fix (params must

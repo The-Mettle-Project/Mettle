@@ -188,6 +188,14 @@ typedef struct {
   BinaryNamedSlotTable float64_symbols;
   BinaryNamedSlotTable address_taken_symbols;
   BinaryNamedSlotTable register_symbols;
+  /* The subset of register_symbols that are cached GLOBALS rather than
+   * register-homed locals: only these get a load at entry and a write-back
+   * before each return. Recorded when the promotion picks them, because the
+   * name alone cannot answer the question -- a local shadowing a global (a
+   * `var exp` next to std/math's `exp`) resolves to the global in the module
+   * symbol table, and writing the local back over it corrupts the global or
+   * faults storing into .text. */
+  BinaryNamedSlotTable register_global_symbols;
   BinarySymbolAliasTable symbol_aliases;
   BinaryLabelTable labels;
   BinaryLabelFixupTable label_fixups;

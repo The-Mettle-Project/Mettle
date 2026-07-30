@@ -341,6 +341,18 @@ void mir_function_dump(const MirFunction *fn, FILE *out) {
   }
   fprintf(out, "; MIR function: %zu vregs, %zu insns, spill_bytes=%d\n",
           fn->vreg_count, fn->insn_count, fn->spill_bytes);
+  for (size_t v = 0; v < fn->vreg_count; v++) {
+    const MirVreg *vr = &fn->vregs[v];
+    if (!vr->assigned) {
+      continue;
+    }
+    fprintf(out, ";   v%-4zu %-6s%-4d live=[%d,%d]%s%s%s\n", v,
+            vr->in_register ? (vr->rclass == MIR_RC_XMM ? "xmm" : "r") : "spill",
+            vr->in_register ? vr->phys : vr->spill_offset, vr->live_start,
+            vr->live_end, vr->crosses_call ? " call" : "",
+            vr->loop_carried ? " loop" : "",
+            vr->address_taken ? " addr" : "");
+  }
   for (size_t i = 0; i < fn->insn_count; i++) {
     const MirInst *in = &fn->insns[i];
     fprintf(out, "%4zu: %-8s", i, mir_opcode_name(in->op));

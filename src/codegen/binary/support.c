@@ -553,6 +553,7 @@ void binary_function_context_destroy(BinaryFunctionContext *context) {
   binary_named_slot_table_destroy(&context->float64_symbols);
   binary_named_slot_table_destroy(&context->address_taken_symbols);
   binary_named_slot_table_destroy(&context->register_symbols);
+  binary_named_slot_table_destroy(&context->register_global_symbols);
   binary_symbol_alias_table_destroy(&context->symbol_aliases);
   binary_label_table_destroy(&context->labels);
   binary_label_fixup_table_destroy(&context->label_fixups);

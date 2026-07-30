@@ -833,15 +833,31 @@ int code_generator_binary_emit_global_symbol_store(
   return 1;
 }
 
+/* A promoted symbol gets an entry load and a write-back only if the promotion
+ * picked it as a global. The name cannot be re-classified here:
+ * code_generator_lookup_symbol resolves against the module symbol table alone,
+ * so any local sharing a name with a global scores as global-scope -- a `var
+ * exp` beside std/math's `exp` resolved to the function and the write-back
+ * stored a local into .text. register_global_symbols records the answer where
+ * it is actually known. */
 static int code_generator_binary_promoted_symbol_is_global(
-    CodeGenerator *generator, const char *name, const CgSym **symbol_out) {
-  const CgSym *symbol = generator && generator->ir_program && name
-                       ? code_generator_lookup_symbol(generator, name)
-                       : NULL;
+    CodeGenerator *generator, const BinaryFunctionContext *context,
+    const char *name, const CgSym **symbol_out) {
+  const CgSym *symbol = NULL;
+  if (symbol_out) {
+    *symbol_out = NULL;
+  }
+  if (!generator || !generator->ir_program || !context || !name ||
+      binary_named_slot_table_get_offset(&context->register_global_symbols,
+                                         name) < 0) {
+    return 0;
+  }
+  symbol = code_generator_lookup_symbol(generator, name);
   if (symbol_out) {
     *symbol_out = symbol;
   }
-  return symbol && symbol->scope && symbol->scope->type == CG_SCOPE_GLOBAL;
+  return symbol && symbol->kind == CG_SYM_VARIABLE && symbol->scope &&
+         symbol->scope->type == CG_SCOPE_GLOBAL;
 }
 
 int code_generator_binary_emit_promoted_global_loads(
@@ -855,8 +871,8 @@ int code_generator_binary_emit_promoted_global_loads(
     BinaryGpRegister reg =
         (BinaryGpRegister)context->register_symbols.items[i].offset;
     const CgSym *symbol = NULL;
-    if (!code_generator_binary_promoted_symbol_is_global(generator, name,
-                                                         &symbol)) {
+    if (!code_generator_binary_promoted_symbol_is_global(generator, context,
+                                                         name, &symbol)) {
       continue;
     }
 
@@ -888,8 +904,8 @@ int code_generator_binary_emit_promoted_global_stores(
     BinaryGpRegister reg =
         (BinaryGpRegister)context->register_symbols.items[i].offset;
     const CgSym *symbol = NULL;
-    if (!code_generator_binary_promoted_symbol_is_global(generator, name,
-                                                         &symbol)) {
+    if (!code_generator_binary_promoted_symbol_is_global(generator, context,
+                                                         name, &symbol)) {
       continue;
     }
 
