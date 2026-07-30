@@ -1,0 +1,6 @@
+kernel wrong_async_copy_space(destination: uint32*, source: uint32*) {
+  async_copy_workgroup(destination, source, 1,
+                       transaction: 4, cache: all);
+  async_copy_commit();
+  async_copy_wait(0);
+}

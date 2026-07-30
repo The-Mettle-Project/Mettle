@@ -1,0 +1,119 @@
+// Range-constrained struct fields, checked at compile time.
+//
+// The C++26 reflection idiom hangs a [[=Range{...}]] annotation on each member
+// and walks nonstatic_data_members_of() to validate them. Mettle has no
+// reflection, so the ranges live in a constant table beside the struct and one
+// generic function walks that table for any struct. @test does what
+// static_assert does: it runs in the compiler and never reaches the binary.
+//
+//   mettle test examples\field_ranges\field_ranges.mettle
+//   mettle --build examples\field_ranges\field_ranges.mettle -o field_ranges
+
+import "std/io";
+
+struct Range { lo: int32; hi: int32; }
+
+struct Config {
+  port:        int32;
+  max_threads: int32;
+  timeout_ms:  int32;
+}
+
+const CONFIG_FIELDS = sizeof(Config) / sizeof(int32);
+
+const CONFIG_BOUNDS: Range[3] = [
+  { lo: 1, hi: 65535 }, { lo: 1, hi: 256 }, { lo: 100, hi: 30000 }
+];
+
+const CONFIG_NAMES: cstring[3] = ["port", "max_threads", "timeout_ms"];
+
+struct Window {
+  width:      int32;
+  height:     int32;
+  refresh_hz: int32;
+}
+
+const WINDOW_FIELDS = sizeof(Window) / sizeof(int32);
+
+const WINDOW_BOUNDS: Range[3] = [
+  { lo: 320, hi: 7680 }, { lo: 240, hi: 4320 }, { lo: 24, hi: 480 }
+];
+
+const WINDOW_NAMES: cstring[3] = ["width", "height", "refresh_hz"];
+
+// `template for (member : ...)` becomes a counted loop, and `obj.[:member:]` an
+// indexed read through the struct's int32 view.
+fn first_violation<T>(obj: T*, bounds: Range*, n: int32) -> int32 {
+  var values: int32* = (int32*)obj;
+  for i in 0..n {
+    var v: int32 = values[i];
+    if (v < bounds[i].lo || v > bounds[i].hi) { return i; }
+  }
+  return -1;
+}
+
+// int32 rather than bool: a bool-returning function does not survive the
+// direct-object backend (it compiles here only because @test bodies never
+// reach codegen, which is exactly the trap worth avoiding in an example).
+fn is_valid<T>(obj: T*, bounds: Range*, n: int32) -> int32 {
+  return first_violation<T>(obj, bounds, n) < 0;
+}
+
+const GOOD_CONFIG: Config = { port: 1000, max_threads: 50, timeout_ms: 20000 };
+const BAD_CONFIG:  Config = { port: 0,    max_threads: 0,  timeout_ms: 0 };
+const SLOW_CONFIG: Config = { port: 8080, max_threads: 8,  timeout_ms: 90000 };
+
+const GOOD_WINDOW: Window = { width: 1920, height: 1080, refresh_hz: 144 };
+const BAD_WINDOW:  Window = { width: 1920, height: 1080, refresh_hz: 1000 };
+
+@test fn test_config() -> int64 {
+  assert_eq(is_valid<Config>(&GOOD_CONFIG, &CONFIG_BOUNDS[0], CONFIG_FIELDS), 1);
+  assert_eq(is_valid<Config>(&BAD_CONFIG, &CONFIG_BOUNDS[0], CONFIG_FIELDS), 0);
+  assert_eq(first_violation<Config>(&BAD_CONFIG, &CONFIG_BOUNDS[0], CONFIG_FIELDS), 0);
+  assert_eq(first_violation<Config>(&SLOW_CONFIG, &CONFIG_BOUNDS[0], CONFIG_FIELDS), 2);
+  return 0;
+}
+
+// Same validator, different struct.
+@test fn test_window() -> int64 {
+  assert_eq(is_valid<Window>(&GOOD_WINDOW, &WINDOW_BOUNDS[0], WINDOW_FIELDS), 1);
+  assert_eq(first_violation<Window>(&BAD_WINDOW, &WINDOW_BOUNDS[0], WINDOW_FIELDS), 2);
+  return 0;
+}
+
+// The one thing a positional table cannot check for itself: adding a field
+// without adding its range.
+@test fn test_table_covers_every_field() -> int64 {
+  assert_eq(CONFIG_FIELDS, 3);
+  assert_eq(WINDOW_FIELDS, 3);
+  return 0;
+}
+
+fn report<T>(label: cstring, obj: T*, names: cstring*, bounds: Range*, n: int32) {
+  var bad: int32 = first_violation<T>(obj, bounds, n);
+  print(label);
+  if (bad < 0) {
+    println(": ok");
+    return;
+  }
+  var values: int32* = (int32*)obj;
+  print(": ");
+  print(names[bad]);
+  print(" = ");
+  print_int((int64)values[bad]);
+  print(" is outside ");
+  print_int((int64)bounds[bad].lo);
+  print("..");
+  print_int((int64)bounds[bad].hi);
+  println("");
+}
+
+fn main() -> int32 {
+  if (is_valid<Config>(&GOOD_CONFIG, &CONFIG_BOUNDS[0], CONFIG_FIELDS) != 1) { return 1; }
+  report<Config>("good config", &GOOD_CONFIG, &CONFIG_NAMES[0], &CONFIG_BOUNDS[0], CONFIG_FIELDS);
+  report<Config>("bad config",  &BAD_CONFIG,  &CONFIG_NAMES[0], &CONFIG_BOUNDS[0], CONFIG_FIELDS);
+  report<Config>("slow config", &SLOW_CONFIG, &CONFIG_NAMES[0], &CONFIG_BOUNDS[0], CONFIG_FIELDS);
+  report<Window>("good window", &GOOD_WINDOW, &WINDOW_NAMES[0], &WINDOW_BOUNDS[0], WINDOW_FIELDS);
+  report<Window>("bad window",  &BAD_WINDOW,  &WINDOW_NAMES[0], &WINDOW_BOUNDS[0], WINDOW_FIELDS);
+  return 0;
+}

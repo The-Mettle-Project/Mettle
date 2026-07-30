@@ -1,0 +1,28 @@
+// Boundary coverage for wide calls. test_call_many_args.mettle only goes to 8
+// arguments -- below the point where a call spills arguments to the stack and
+// (over MIR_MAX_PARAMS) drops the enclosing function onto the baseline emitter.
+// This exercises a 20-parameter callee and a 20-argument call: parameter homing
+// and argument passing past the register set, a correct return value from the
+// wide call, and a float local that reads back intact across it. Returns 3.
+//
+// Note: this does NOT reproduce the m-c99 #14 clobber, which depends on the
+// caller's exact frame layout and reproduces reliably only through the C99
+// frontend's builder-API frames (that repro lives in the frontend's
+// tests/diff/many_args.c). Here `main` still lands on the baseline emitter at a
+// low MIR_MAX_PARAMS, but this frame's float local does not fall in the
+// overwritten region, so it is a wide-call sanity check, not a #14 guard.
+fn wide20(a: int32, b: int32, c: int32, d: int32, e: int32, f: int32, g: int32,
+          h: int32, i: int32, j: int32, k: int32, l: int32, m: int32, n: int32,
+          o: int32, p: int32, q: int32, r: int32, s: int32, t: int32) -> int32 {
+  return a + t;
+}
+
+fn main() -> int32 {
+  var keep: float64 = 3.75;
+  var got: int32 = wide20(1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                          11, 12, 13, 14, 15, 16, 17, 18, 19, 20);
+  if (got != 21) {
+    return 100;
+  }
+  return (int32)keep;
+}

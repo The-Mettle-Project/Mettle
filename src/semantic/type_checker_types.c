@@ -1,6 +1,6 @@
 // Type checker: type construction, builtins, numeric promotion, conversions.
 #include "type_checker_internal.h"
-#include "../string_intern.h"
+#include "string_intern.h"
 
 /* A shared non-NULL marker used as closure_env for a boundary closure type
  * (`Fn(...)->R`), where the specific environment layout is opaque. Call dispatch

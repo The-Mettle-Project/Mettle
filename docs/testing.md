@@ -1,10 +1,10 @@
 # Compile-time execution: `mettle test` and `mettle trace`
 
-Mettle's compiler contains a reference interpreter for its own IR. Two
-everyday workflows run on it - no codegen, no linker, no process spawn, so
-feedback is effectively instant:
+libmtlc contains a reference interpreter for its IR, and the `mettle` driver
+exposes two everyday workflows that run on it (no codegen, no linker, no process
+spawn), so feedback is effectively instant:
 
-## `mettle test` - tests that live inside the compiler
+## `mettle test`: tests that live inside the compiler
 
 ```mettle
 fn fib(n: int64) -> int64 {

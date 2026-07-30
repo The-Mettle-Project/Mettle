@@ -1,0 +1,88 @@
+// Exact block-scaled whole-matrix regions. Full M/N/K interiors retain native
+// accumulators across scale blocks; arbitrary origins and M/N/K tails replay
+// the same neutral descriptor exactly. Packed FP6/FP4 matrices are an LSB-first
+// logical bitstream. Scale_A is row-major [M, ceil(K/block)] and scale_B is
+// column-major [ceil(K/block), N], independently of operand transposition.
+
+kernel tensor_matmul_mxfp6_f32(
+    a: uint8*, b: uint8*, c: float32*, d: float32*,
+    a_scale: uint8*, b_scale: uint8*,
+    row_origin: uint32, column_origin: uint32,
+    problem_m: uint32, problem_n: uint32, problem_k: uint32,
+    lda: uint32, ldb: uint32, ldc: uint32, ldd: uint32) {
+  tensor_matmul(
+      a, b, c, d, row_origin, column_origin,
+      problem_m, problem_n, problem_k,
+      shape: m16n16k32,
+      a_type: e3m2, b_type: e2m3,
+      accumulator_type: f32, result_type: f32,
+      a_packing: dense_subbyte, b_packing: dense_subbyte,
+      a_scale_mode: block32, b_scale_mode: block32,
+      a_scale_type: ue8m0, b_scale_type: ue8m0,
+      a_scale: a_scale, b_scale: b_scale,
+      a_layout: row, b_layout: col,
+      lda: lda, ldb: ldb, ldc: ldc, ldd: ldd,
+      a_scale_ld: 9, b_scale_ld: 11);
+}
+
+kernel tensor_matmul_mxfp4_f32(
+    a: uint8*, b: uint8*, c: float32*, d: float32*,
+    a_scale: uint8*, b_scale: uint8*,
+    row_origin: uint32, column_origin: uint32,
+    problem_m: uint32, problem_n: uint32, problem_k: uint32,
+    lda: uint32, ldb: uint32, ldc: uint32, ldd: uint32) {
+  tensor_matmul(
+      a, b, c, d, row_origin, column_origin,
+      problem_m, problem_n, problem_k,
+      shape: m16n16k64,
+      a_type: e2m1, b_type: e2m1,
+      accumulator_type: f32, result_type: f32,
+      a_packing: dense_subbyte, b_packing: dense_subbyte,
+      a_scale_mode: block32, b_scale_mode: block32,
+      a_scale_type: ue8m0, b_scale_type: ue8m0,
+      a_scale: a_scale, b_scale: b_scale,
+      a_layout: row, b_layout: col,
+      lda: lda, ldb: ldb, ldc: ldc, ldd: ldd,
+      a_scale_ld: 9, b_scale_ld: 11);
+}
+
+kernel tensor_matmul_nvfp4_f32(
+    a: uint8*, b: uint8*, c: float32*, d: float32*,
+    a_scale: uint8*, b_scale: uint8*,
+    row_origin: uint32, column_origin: uint32,
+    problem_m: uint32, problem_n: uint32, problem_k: uint32,
+    lda: uint32, ldb: uint32, ldc: uint32, ldd: uint32) {
+  tensor_matmul(
+      a, b, c, d, row_origin, column_origin,
+      problem_m, problem_n, problem_k,
+      shape: m16n16k64,
+      a_type: e2m1, b_type: e2m1,
+      accumulator_type: f32, result_type: f32,
+      a_packing: dense_subbyte, b_packing: dense_subbyte,
+      a_scale_mode: block16, b_scale_mode: block16,
+      a_scale_type: ue4m3, b_scale_type: ue4m3,
+      a_scale: a_scale, b_scale: b_scale,
+      a_layout: row, b_layout: col,
+      lda: lda, ldb: ldb, ldc: ldc, ldd: ldd,
+      a_scale_ld: 17, b_scale_ld: 19);
+}
+
+kernel tensor_matmul_mxfp8_transpose_f32(
+    a: uint8*, b: uint8*, c: float32*, d: float32*,
+    a_scale: uint8*, b_scale: uint8*,
+    row_origin: uint32, column_origin: uint32,
+    problem_m: uint32, problem_n: uint32, problem_k: uint32) {
+  tensor_matmul(
+      a, b, c, d, row_origin, column_origin,
+      problem_m, problem_n, problem_k,
+      shape: m16n16k32,
+      a_type: e4m3, b_type: e5m2,
+      accumulator_type: f32, result_type: f32,
+      a_scale_mode: block32, b_scale_mode: block32,
+      a_scale_type: ue8m0, b_scale_type: ue8m0,
+      a_scale: a_scale, b_scale: b_scale,
+      a_layout: col, b_layout: row,
+      transpose_a: true, transpose_b: true,
+      lda: 131, ldb: 137, ldc: 139, ldd: 149,
+      a_scale_ld: 9, b_scale_ld: 11);
+}

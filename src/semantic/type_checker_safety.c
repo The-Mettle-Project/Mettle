@@ -694,6 +694,13 @@ int type_checker_is_null_pointer_constant(ASTNode *expression) {
   return type_checker_eval_integer_constant(expression, &value) && value == 0;
 }
 
+int type_checker_type_accepts_null_pointer(const Type *type) {
+  if (!type) {
+    return 0;
+  }
+  return type->kind == TYPE_POINTER || type->kind == TYPE_FUNCTION_POINTER;
+}
+
 int type_checker_statement_guarantees_termination(ASTNode *statement) {
   if (!statement) {
     return 0;

@@ -1,0 +1,19 @@
+struct Ops { plus: fn(int32, int32) -> int32; neg: fn(int32) -> int32; }
+@noinline fn plus(a: int32, b: int32) -> int32 { return a + b; }
+@noinline fn neg(a: int32) -> int32 { return -a; }
+@noinline fn fadd(a: float64, b: float64) -> float64 { return a + b; }
+@noinline fn retbool(a: int32) -> bool { return a > 0; }
+const OPS: Ops = { plus: &plus, neg: &neg };
+const DIRECT: fn(int32, int32) -> int32 = &plus;
+@noinline fn apply(f: fn(int32, int32) -> int32, a: int32, b: int32) -> int32 { return f(a, b); }
+fn main() -> int32 {
+  if (OPS.plus(2, 3) != 5) { return 1; }
+  if (OPS.neg(4) != -4) { return 2; }
+  if (DIRECT(1, 1) != 2) { return 3; }
+  if (apply(&plus, 5, 6) != 11) { return 4; }
+  var fp: fn(float64, float64) -> float64 = &fadd;
+  if (fp(1.5, 2.5) != 4.0) { return 5; }
+  var bp: fn(int32) -> bool = &retbool;
+  if (!bp(1)) { return 6; }
+  return 0;
+}

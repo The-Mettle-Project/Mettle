@@ -1,8 +1,8 @@
 #ifndef TYPE_CHECKER_H
 #define TYPE_CHECKER_H
 
-#include "../error/error_reporter.h"
-#include "../parser/ast.h"
+#include "error/error_reporter.h"
+#include "parser/ast.h"
 
 // Forward declarations
 struct SymbolTable;
@@ -50,6 +50,11 @@ typedef struct {
   size_t tracked_scope_capacity;
   int tracked_scope_depth;
   struct TrackedBufferExtent *tracked_buffer_extents;
+  /* Target type for an aggregate literal about to be inferred. An aggregate
+   * literal has no type of its own - it takes the type of the binding it
+   * initializes - so the caller that knows that type parks it here for the one
+   * inference call that may see the literal. Consumed (cleared) on read. */
+  Type *aggregate_target_type;
 } TypeChecker;
 
 // Function declarations

@@ -1,0 +1,6 @@
+extern fn putchar(ch: int32) -> int32 = "putchar";
+
+fn main() -> int32 {
+  putchar(65);
+  return 0;
+}

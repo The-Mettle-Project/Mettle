@@ -1,0 +1,25 @@
+struct Box<T> { value: T; }
+struct Pair<A, B> { first: A; second: B; }
+@noinline fn get<T>(b: Box<T>) -> T { return b.value; }
+fn main() -> int32 {
+  var a: Pair<Box<int32>, Box<int32>>;
+  a.first.value = 3; a.second.value = 4;
+  if (a.first.value + a.second.value != 7) { return 1; }
+  var b: Box<Pair<int32, Box<int32>>>;
+  b.value.first = 1; b.value.second.value = 2;
+  if (b.value.first + b.value.second.value != 3) { return 2; }
+  var c: Box<Box<Box<int32>>>;
+  c.value.value.value = 9;
+  if (c.value.value.value != 9) { return 3; }
+  var d: Box<Box<Box<Box<int32>>>>;
+  d.value.value.value.value = 11;
+  if (d.value.value.value.value != 11) { return 4; }
+  if (get<int32>(a.first) != 3) { return 5; }
+  if (get<int32>(b.value.second) != 2) { return 6; }
+  var e: Box<int32> = a.first;
+  if (e.value != 3) { return 7; }
+  if (8 >> 2 != 2) { return 8; }
+  var sh: int32 = 1024;
+  if (sh >> 3 != 128) { return 9; }
+  return 0;
+}

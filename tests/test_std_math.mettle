@@ -1,0 +1,288 @@
+// Accuracy and behaviour checks for std/math.
+//
+// Two kinds of check: absolute anchors against independently computed reference
+// values, and identities that must hold across a sweep of arguments. The
+// anchors catch a systematically wrong kernel; the identities catch a kernel
+// that is right at one point and drifts elsewhere.
+
+import "std/math";
+import "std/io";
+
+var g_failures: int32 = 0;
+
+fn report(name: cstring, got: float64, want: float64) {
+  g_failures = g_failures + 1;
+  print(cstr("FAIL "));
+  print(name);
+  print(cstr(" got*1e12="));
+  print_int((int64)(got * 1000000000000.0));
+  print(cstr(" want*1e12="));
+  print_int((int64)(want * 1000000000000.0));
+  println(cstr(""));
+}
+
+// Relative comparison, so the tolerance means the same thing at every scale.
+fn check(name: cstring, got: float64, want: float64, tol: float64) {
+  if (approx_eq(got, want, tol) == 0) { report(name, got, want); }
+}
+
+fn check_int(name: cstring, got: int64, want: int64) {
+  if (got != want) {
+    g_failures = g_failures + 1;
+    print(cstr("FAIL "));
+    print(name);
+    print(cstr(" got="));
+    print_int(got);
+    print(cstr(" want="));
+    print_int(want);
+    println(cstr(""));
+  }
+}
+
+fn TOL() -> float64 { return 1.0e-13; }
+
+fn check_anchors() {
+  check(cstr("sqrt(2)"), sqrt(2.0), 1.4142135623730951, TOL());
+  check(cstr("exp(1)"), exp(1.0), 2.7182818284590451, TOL());
+  check(cstr("log(2)"), log(2.0), 0.69314718055994529, TOL());
+  check(cstr("sin(1)"), sin(1.0), 0.8414709848078965, TOL());
+  check(cstr("cos(1)"), cos(1.0), 0.54030230586813977, TOL());
+  check(cstr("tan(1)"), tan(1.0), 1.5574077246549023, TOL());
+  check(cstr("atan(1)"), atan(1.0), 0.78539816339744828, TOL());
+  check(cstr("atan(100)"), atan(100.0), 1.5607966601082315, TOL());
+  check(cstr("asin(0.9)"), asin(0.9), 1.1197695149986342, TOL());
+  check(cstr("acos(0.9)"), acos(0.9), 0.45102681179626236, TOL());
+  check(cstr("atan2(1,-1)"), atan2(1.0, -1.0), 2.3561944901923448, TOL());
+  check(cstr("sinh(1)"), sinh(1.0), 1.1752011936438014, TOL());
+  check(cstr("cosh(1)"), cosh(1.0), 1.5430806348152437, TOL());
+  check(cstr("tanh(1)"), tanh(1.0), 0.76159415595576485, TOL());
+  check(cstr("log10(7)"), log10(7.0), 0.84509804001425681, TOL());
+  check(cstr("log2(7)"), log2(7.0), 2.8073549220576042, TOL());
+  check(cstr("pow(2,0.3)"), pow(2.0, 0.3), 1.2311444133449163, TOL());
+  check(cstr("exp(-5)"), exp(-5.0), 0.006737946999085467, TOL());
+  check(cstr("log(1e300)"), log(1.0e300), 690.77552789821368, TOL());
+  check(cstr("cbrt(2)"), cbrt(2.0), 1.2599210498948732, TOL());
+  check(cstr("hypot(3,4)"), hypot(3.0, 4.0), 5.0, TOL());
+
+  // Reduction over many periods still has to land in the right place.
+  check(cstr("sin(1000)"), sin(1000.0), 0.82687954053200252, 1.0e-11);
+  check(cstr("cos(1e6)"), cos(1000000.0), 0.93675212753314518, 1.0e-9);
+
+  // These exist precisely because the naive forms cancel; the true values are
+  // not what 1+x then log/exp would give.
+  check(cstr("log1p(1e-10)"), log1p(1.0e-10), 9.9999999995e-11, 1.0e-14);
+  check(cstr("expm1(1e-10)"), expm1(1.0e-10), 1.00000000005e-10, 1.0e-14);
+
+  // Exactness where it is expected.
+  check(cstr("pow(2,10)"), pow(2.0, 10.0), 1024.0, 0.0);
+  check(cstr("pow(2,-2)"), pow(2.0, -2.0), 0.25, 0.0);
+  check(cstr("sqrt(1024)"), sqrt(1024.0), 32.0, 0.0);
+  check(cstr("log2(1024)"), log2(1024.0), 10.0, 1.0e-15);
+  check(cstr("exp2(10)"), exp2(10.0), 1024.0, 1.0e-15);
+}
+
+fn check_identities() {
+  // exp/log round trip across a wide dynamic range.
+  var i: int32 = -60;
+  while (i <= 60) {
+    var x: float64 = (float64)i * 5.0;
+    check(cstr("log(exp(x))"), log(exp(x)), x, 1.0e-12);
+    i = i + 1;
+  }
+
+  // sin^2 + cos^2 = 1 across several periods.
+  var k: int32 = -200;
+  while (k <= 200) {
+    var a: float64 = (float64)k * 0.137;
+    var s: float64 = sin(a);
+    var c: float64 = cos(a);
+    check(cstr("sin^2+cos^2"), s * s + c * c, 1.0, 1.0e-14);
+    // tan agrees with the ratio.
+    if (fabs(c) > 1.0e-3) {
+      check(cstr("tan=sin/cos"), tan(a), s / c, 1.0e-12);
+    }
+    k = k + 1;
+  }
+
+  // sqrt and its square.
+  var j: int32 = 1;
+  while (j <= 200) {
+    var v: float64 = (float64)j * 0.37;
+    check(cstr("sqrt^2"), sqrt(v) * sqrt(v), v, 1.0e-14);
+    check(cstr("cbrt^3"), cbrt(v) * cbrt(v) * cbrt(v), v, 1.0e-13);
+    j = j + 1;
+  }
+
+  // atan/tan round trip inside the principal branch.
+  var m: int32 = -70;
+  while (m <= 70) {
+    var a: float64 = (float64)m * 0.02;
+    check(cstr("atan(tan(x))"), atan(tan(a)), a, 1.0e-13);
+    m = m + 1;
+  }
+
+  // Hyperbolic identity. Held to |x| <= 4 on purpose: cosh^2 - sinh^2 subtracts
+  // two values of magnitude cosh(x)^2 to leave 1, so the check itself loses
+  // about 2*x/ln(10) digits. Past x = 4 it measures the identity's conditioning
+  // rather than the implementation.
+  var h: int32 = -16;
+  while (h <= 16) {
+    var x: float64 = (float64)h * 0.25;
+    var sh: float64 = sinh(x);
+    var ch: float64 = cosh(x);
+    check(cstr("cosh^2-sinh^2"), ch * ch - sh * sh, 1.0, 1.0e-12);
+    check(cstr("tanh=sinh/cosh"), tanh(x), sh / ch, 1.0e-13);
+    h = h + 1;
+  }
+
+  // Inverse trig round trips.
+  var n: int32 = -95;
+  while (n <= 95) {
+    var v: float64 = (float64)n * 0.01;
+    check(cstr("sin(asin(x))"), sin(asin(v)), v, 1.0e-13);
+    check(cstr("cos(acos(x))"), cos(acos(v)), v, 1.0e-13);
+    check(cstr("asinh"), sinh(asinh(v)), v, 1.0e-13);
+    check(cstr("atanh"), tanh(atanh(v)), v, 1.0e-13);
+    n = n + 1;
+  }
+
+  // pow against repeated multiplication.
+  var p: int32 = 1;
+  while (p <= 12) {
+    var b: float64 = 1.7;
+    var acc: float64 = 1.0;
+    var q: int32 = 0;
+    while (q < p) {
+      acc = acc * b;
+      q = q + 1;
+    }
+    check(cstr("pow=repeated mul"), pow(b, (float64)p), acc, 1.0e-13);
+    p = p + 1;
+  }
+}
+
+fn check_rounding() {
+  check(cstr("floor(2.5)"), floor(2.5), 2.0, 0.0);
+  check(cstr("floor(-2.5)"), floor(-2.5), -3.0, 0.0);
+  check(cstr("ceil(2.5)"), ceil(2.5), 3.0, 0.0);
+  check(cstr("ceil(-2.5)"), ceil(-2.5), -2.0, 0.0);
+  check(cstr("trunc(2.7)"), trunc(2.7), 2.0, 0.0);
+  check(cstr("trunc(-2.7)"), trunc(-2.7), -2.0, 0.0);
+  check(cstr("round(2.5)"), round(2.5), 3.0, 0.0);
+  check(cstr("round(-2.5)"), round(-2.5), -3.0, 0.0);
+  check(cstr("round(2.4)"), round(2.4), 2.0, 0.0);
+  check(cstr("fract(-0.25)"), fract(-0.25), 0.75, 1.0e-15);
+
+  // Beyond 2^52 every double is already an integer and must pass through.
+  check(cstr("floor(1e300)"), floor(1.0e300), 1.0e300, 0.0);
+
+  check(cstr("fmod(10.5,3)"), fmod(10.5, 3.0), 1.5, 0.0);
+  check(cstr("fmod(-10.5,3)"), fmod(-10.5, 3.0), -1.5, 0.0);
+  // Quotient of 2.7e11: exercises the scaled-subtraction loop, not a shortcut.
+  check(cstr("fmod(1e12,3.7)"), fmod(1000000000000.0, 3.7), 0.99995199035569193, 1.0e-14);
+
+  check(cstr("wrap(7,0,5)"), wrap(7.0, 0.0, 5.0), 2.0, 1.0e-15);
+  check(cstr("wrap(-1,0,5)"), wrap(-1.0, 0.0, 5.0), 4.0, 1.0e-15);
+  check(cstr("wrap_angle(4pi+1)"), wrap_angle(4.0 * PI() + 1.0), 1.0, 1.0e-13);
+}
+
+fn check_exponent_ops() {
+  check(cstr("ldexp(1,10)"), ldexp(1.0, 10), 1024.0, 0.0);
+  check(cstr("ldexp(3,-2)"), ldexp(3.0, -2), 0.75, 0.0);
+  check(cstr("ldexp(1,-1074)"), ldexp(1.0, -1074), 4.9406564584124654e-324, 1.0e-10);
+
+  var e: int32 = 0;
+  var m: float64 = frexp(12.0, &e);
+  check(cstr("frexp mantissa"), m, 0.75, 0.0);
+  check_int(cstr("frexp exponent"), (int64)e, 4);
+
+  // Subnormal input still splits correctly.
+  var e2: int32 = 0;
+  var m2: float64 = frexp(1.0e-320, &e2);
+  check(cstr("frexp subnormal"), ldexp(m2, e2), 1.0e-320, 1.0e-12);
+}
+
+fn check_classification() {
+  check_int(cstr("is_nan(NAN)"), (int64)is_nan(NAN()), 1);
+  check_int(cstr("is_nan(1)"), (int64)is_nan(1.0), 0);
+  check_int(cstr("is_inf(INF)"), (int64)is_inf(INF()), 1);
+  check_int(cstr("is_inf(-INF)"), (int64)is_inf(-INF()), 1);
+  check_int(cstr("is_inf(1e308)"), (int64)is_inf(1.0e308), 0);
+  check_int(cstr("is_finite(NAN)"), (int64)is_finite(NAN()), 0);
+  check_int(cstr("is_finite(1)"), (int64)is_finite(1.0), 1);
+  check_int(cstr("signbit(-0.5)"), (int64)signbit(-0.5), 1);
+  check_int(cstr("signbit(0.5)"), (int64)signbit(0.5), 0);
+
+  check(cstr("copysign(3,-1)"), copysign(3.0, -1.0), -3.0, 0.0);
+  check(cstr("sqrt(-1) is nan"), (float64)is_nan(sqrt(-1.0)), 1.0, 0.0);
+  check(cstr("log(0) is -inf"), (float64)is_inf(log(0.0)), 1.0, 0.0);
+  check(cstr("exp(1000) is inf"), (float64)is_inf(exp(1000.0)), 1.0, 0.0);
+  check(cstr("exp(-1000) is 0"), exp(-1000.0), 0.0, 0.0);
+}
+
+fn check_integer() {
+  check_int(cstr("abs(-5)"), (int64)abs(-5), 5);
+  check_int(cstr("labs(-5e9)"), labs(-5000000000), 5000000000);
+  check_int(cstr("min"), min(3, 9), 3);
+  check_int(cstr("max"), max(3, 9), 9);
+  check_int(cstr("clamp"), clamp(12, 0, 10), 10);
+  check_int(cstr("isign(-3)"), isign(-3), -1);
+
+  check_int(cstr("ipow(3,5)"), ipow(3, 5), 243);
+  check_int(cstr("ipow(2,62)"), ipow(2, 62), 4611686018427387904);
+  check_int(cstr("isqrt(1000000)"), isqrt(1000000), 1000);
+  check_int(cstr("isqrt(999999)"), isqrt(999999), 999);
+  check_int(cstr("isqrt(0)"), isqrt(0), 0);
+  check_int(cstr("isqrt(1)"), isqrt(1), 1);
+  check_int(cstr("isqrt(3)"), isqrt(3), 1);
+  check_int(cstr("isqrt(4)"), isqrt(4), 2);
+
+  check_int(cstr("gcd(48,18)"), gcd(48, 18), 6);
+  check_int(cstr("gcd(-48,18)"), gcd(-48, 18), 6);
+  check_int(cstr("lcm(4,6)"), lcm(4, 6), 12);
+  check_int(cstr("is_pow2(64)"), (int64)is_pow2(64), 1);
+  check_int(cstr("is_pow2(63)"), (int64)is_pow2(63), 0);
+  check_int(cstr("next_pow2(63)"), next_pow2(63), 64);
+  check_int(cstr("next_pow2(64)"), next_pow2(64), 64);
+  check_int(cstr("next_pow2(65)"), next_pow2(65), 128);
+  check_int(cstr("ilog2(1024)"), (int64)ilog2(1024), 10);
+  check_int(cstr("ilog2(1023)"), (int64)ilog2(1023), 9);
+
+  // Floor division must round toward negative infinity, not toward zero.
+  check_int(cstr("idiv_floor(-7,2)"), idiv_floor(-7, 2), -4);
+  check_int(cstr("idiv_floor(7,2)"), idiv_floor(7, 2), 3);
+  check_int(cstr("imod_floor(-7,2)"), imod_floor(-7, 2), 1);
+  check_int(cstr("imod_floor(7,-2)"), imod_floor(7, -2), -1);
+}
+
+fn check_interpolation() {
+  check(cstr("lerp"), lerp(2.0, 10.0, 0.25), 4.0, 1.0e-15);
+  check(cstr("inv_lerp"), inv_lerp(2.0, 10.0, 4.0), 0.25, 1.0e-15);
+  check(cstr("remap"), remap(5.0, 0.0, 10.0, 100.0, 200.0), 150.0, 1.0e-15);
+  check(cstr("saturate"), saturate(1.7), 1.0, 0.0);
+  check(cstr("smoothstep mid"), smoothstep(0.0, 1.0, 0.5), 0.5, 1.0e-15);
+  check(cstr("smoothstep lo"), smoothstep(0.0, 1.0, -1.0), 0.0, 0.0);
+  check(cstr("smootherstep mid"), smootherstep(0.0, 1.0, 0.5), 0.5, 1.0e-15);
+  check(cstr("degrees"), degrees(PI()), 180.0, 1.0e-13);
+  check(cstr("radians"), radians(180.0), PI(), 1.0e-13);
+  check(cstr("angle_diff"), angle_diff(3.0, -3.0), 0.28318530717958623, 1.0e-13);
+}
+
+fn main() -> int32 {
+  check_anchors();
+  check_identities();
+  check_rounding();
+  check_exponent_ops();
+  check_classification();
+  check_integer();
+  check_interpolation();
+
+  if (g_failures == 0) {
+    println(cstr("MATH: ALL OK"));
+    return 0;
+  }
+  print(cstr("MATH: "));
+  print_int((int64)g_failures);
+  println(cstr(" FAILURES"));
+  return 1;
+}

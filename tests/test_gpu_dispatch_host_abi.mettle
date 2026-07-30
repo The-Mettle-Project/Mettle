@@ -1,0 +1,27 @@
+// Hardware-free end-to-end host ABI fixture. The linked C stub implements the
+// provider-neutral checked launch and validates both compact and named forms.
+extern fn mtlc_gpu_launch_checked(
+    function: int64,
+    gx: int32, gy: int32, gz: int32,
+    bx: int32, by: int32, bz: int32,
+    shared_bytes: int32, stream: int64,
+    kernel_params: int64*, nargs: int32) = "mtlc_gpu_launch_checked";
+extern fn gpu_stub_finish() -> int32 = "gpu_stub_finish";
+
+fn main() -> int32 {
+  var handle: int64 = 0;
+  var da: int64 = 11;
+  var db: int64 = 22;
+  var dc: int64 = 33;
+  var n: int32 = 1024;
+  var scale: float32 = 2.5;
+  dispatch handle[(n + 255) / 256, 256](da, db, dc, n, scale);
+
+  var shared_bytes: int32 = 4096;
+  var stream: int64 = 99;
+  dispatch handle[shared: shared_bytes,
+                  grid: (7, 3, 2),
+                  stream: stream,
+                  block: (32, 4, 1)](da, db, dc, n, scale);
+  return gpu_stub_finish();
+}

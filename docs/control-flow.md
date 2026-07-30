@@ -212,7 +212,25 @@ match (value) {
 
 **No fall-through:** `match` arms do not fall through. Once an arm matches, its block runs and control continues after the `match`.
 
-**Statement-only:** `match` is currently a statement, not an expression. Use assignments or `return` inside the arm bodies when you want to produce a value.
+### match as an expression
+
+`match` also exists in an expression form that yields a value. Each arm body is a single value-yielding expression rather than a block, and arms may be separated by commas, newlines, or semicolons:
+
+```mettle
+fn unwrap_or(o: Option, fallback: int32) -> int32 {
+  return match (o) {
+    case Some(value): value
+    case None: fallback
+  };
+}
+
+var doubled: int32 = match (Some(10)) {
+  case Some(v): v
+  default: 0
+} * 2;
+```
+
+All arm bodies must have a compatible type, and because the expression has to produce a value, it must be exhaustive: cover every variant or supply a `default`. The statement form above is the right choice when the arms run several statements or diverge; the expression form is the right choice when each arm is a single value.
 
 ## Break and Continue
 

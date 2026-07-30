@@ -1,0 +1,100 @@
+// Rank-aware movement is expressed entirely in logical tensor geometry. The
+// optional uint8* view is a provider-prepared acceleration handle; it never
+// replaces the raw pointer, dimensions, byte strides, or portable semantics.
+kernel tensor_transfer_load_2d(
+    source: float32*, prepared_view: uint8*, out: float32*,
+    x: int32, y: int32) {
+  workgroup var tile: float32[256];
+  tensor_transfer_workgroup(
+      &tile[0], source,
+      rank: 2, element: f32, direction: load, bounds: zero,
+      extent0: 128, extent1: 96,
+      stride0: 4, stride1: 512,
+      tile0: 16, tile1: 16,
+      coordinate0: x, coordinate1: y,
+      view: prepared_view);
+  if (thread.x < 256) {
+    out[thread.x] = tile[thread.x];
+  }
+}
+
+// The same operation family covers the reverse direction and all five tensor
+// dimensions. Transfer entry provides the workgroup publication barrier; no
+// async-proxy concept appears in source.
+kernel tensor_transfer_store_5d(
+    destination: float32*, prepared_view: uint8*,
+    c0: int32, c1: int32, c2: int32, c3: int32, c4: int32) {
+  workgroup var tile: float32[128];
+  if (thread.x < 128) {
+    tile[thread.x] = (float32)thread.x;
+  }
+  tensor_transfer_workgroup(
+      destination, &tile[0],
+      rank: 5, element: f32, direction: store, bounds: zero,
+      extent0: 32, extent1: 24, extent2: 8, extent3: 4, extent4: 3,
+      stride0: 4, stride1: 128, stride2: 3072,
+      stride3: 24576, stride4: 98304,
+      tile0: 4, tile1: 4, tile2: 2, tile3: 2, tile4: 2,
+      coordinate0: c0, coordinate1: c1, coordinate2: c2,
+      coordinate3: c3, coordinate4: c4,
+      view: prepared_view);
+}
+
+// Absence of a prepared view is first-class, not an error or a null CUDA
+// object. Every backend profile that accepts the operation must replay this
+// rank-3 strided tile exactly; unsupported profiles reject it explicitly.
+kernel tensor_transfer_portable_3d(
+    source: uint16*, out: uint16*, x: int32, y: int32, z: int32) {
+  workgroup var tile: uint16[64];
+  tensor_transfer_workgroup(
+      &tile[0], source,
+      rank: 3, element: f16,
+      extent0: 64, extent1: 32, extent2: 16,
+      stride0: 2, stride1: 128, stride2: 4096,
+      tile0: 8, tile1: 4, tile2: 2,
+      element_stride0: 1, element_stride1: 2, element_stride2: 1,
+      coordinate0: x, coordinate1: y, coordinate2: z);
+  if (thread.x < 64) {
+    out[thread.x] = tile[thread.x];
+  }
+}
+
+// A prepared view is only an acceleration opportunity. This inner box is
+// smaller than TMA's 16-byte dimension-0 granularity, so GB10 must select the
+// exact cooperative replay even when the runtime view is non-null.
+kernel tensor_transfer_tma_ineligible_inner_2d(
+    source: float32*, prepared_view: uint8*, out: float32*,
+    x: int32, y: int32) {
+  workgroup var tile: float32[4];
+  tensor_transfer_workgroup(
+      &tile[0], source,
+      rank: 2, element: f32,
+      extent0: 8, extent1: 8,
+      stride0: 4, stride1: 32,
+      tile0: 2, tile1: 2,
+      coordinate0: x, coordinate1: y,
+      view: prepared_view);
+  if (thread.x < 4) {
+    out[thread.x] = tile[thread.x];
+  }
+}
+
+// TMA ignores an element stride in dimension 0. Preserve the neutral contract
+// by replaying rather than silently treating every second element as dense.
+kernel tensor_transfer_tma_ineligible_stride0_2d(
+    source: float32*, prepared_view: uint8*, out: float32*,
+    x: int32, y: int32) {
+  workgroup var tile: float32[16];
+  tensor_transfer_workgroup(
+      &tile[0], source,
+      rank: 2, element: f32,
+      extent0: 32, extent1: 8,
+      stride0: 4, stride1: 128,
+      tile0: 8, tile1: 2,
+      element_stride0: 2,
+      coordinate0: x, coordinate1: y,
+      view: prepared_view);
+  if (thread.x < 16) {
+    out[thread.x] = tile[thread.x];
+  }
+}

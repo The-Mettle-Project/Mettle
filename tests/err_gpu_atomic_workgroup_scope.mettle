@@ -1,0 +1,4 @@
+kernel invalid() {
+  workgroup var counter: uint32[1];
+  var old: uint32 = atomic_fetch_add(counter, 0, 1, scope: device);
+}

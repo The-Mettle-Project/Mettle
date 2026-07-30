@@ -1,5 +1,10 @@
+// The condition has to be OPAQUE for this to test forwarding: given a literal
+// initializer the range analysis now settles the branch outright, and there is
+// no `branch_zero` left to read the symbol from.
+@noinline fn opaque() -> int32 { return 1; }
+
 fn main() -> int32 {
-  var x: int32 = 1;
+  var x: int32 = opaque();
   if (x) {
     return 7;
   }

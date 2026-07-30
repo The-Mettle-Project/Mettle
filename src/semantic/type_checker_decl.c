@@ -1,5 +1,120 @@
-// Type checker: struct / enum / declaration processing.
+﻿// Type checker: struct / enum / declaration processing.
 #include "type_checker_internal.h"
+
+/* The current PTX/SPIR-V kernel ABI is intentionally explicit: kernel
+ * parameters are POD scalars or pointers to POD scalars. Rejecting aggregates,
+ * strings, closures, and nested pointers here produces a source diagnostic
+ * instead of a late target-emitter failure or, worse, an ABI mismatch. */
+static int gpu_kernel_scalar_type(const Type *type) {
+  if (!type) {
+    return 0;
+  }
+  switch (type->kind) {
+  case TYPE_INT8:
+  case TYPE_INT16:
+  case TYPE_INT32:
+  case TYPE_INT64:
+  case TYPE_UINT8:
+  case TYPE_UINT16:
+  case TYPE_UINT32:
+  case TYPE_UINT64:
+  case TYPE_BOOL:
+  case TYPE_FLOAT32:
+  case TYPE_FLOAT64:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+/* Can this expression become bytes in the object file's data section?
+ *
+ * A global has no initializer to run: its value is laid out at compile time, so
+ * the initializer must be one of the shapes module lowering can fold. This
+ * mirrors eval_numeric in src/frontend/mtlc_lower_module.c structurally (it does
+ * not evaluate - folding still happens there, and a shape accepted here that
+ * turns out not to fold is still caught downstream). Keep the two in step: a
+ * shape added to eval_numeric belongs here too, or it gets rejected with a
+ * misleading diagnostic. */
+static int layoutable_global_initializer(TypeChecker *checker,
+                                         const Type *declared,
+                                         const ASTNode *expression,
+                                         int top_level) {
+  if (!expression) {
+    return 1; /* no initializer: nothing to lay out */
+  }
+
+  /* A string global stores a pointer to one string literal's storage. There is
+   * nowhere to run a concatenation, so nothing else qualifies. */
+  if (declared && declared->kind == TYPE_STRING) {
+    return expression->type == AST_STRING_LITERAL;
+  }
+
+  switch (expression->type) {
+  case AST_NUMBER_LITERAL:
+  case AST_STRING_LITERAL:
+    return 1;
+  /* Another global's folded value, a global const, or an enum member. An
+   * extern's storage lives in another object file, so its value is not ours to
+   * read at layout time. */
+  case AST_IDENTIFIER: {
+    const Identifier *identifier = (const Identifier *)expression->data;
+    const Symbol *symbol =
+        (checker && identifier && identifier->name)
+            ? symbol_table_lookup(checker->symbol_table, identifier->name)
+            : NULL;
+    return !symbol || !symbol->is_extern;
+  }
+  case AST_UNARY_EXPRESSION: {
+    const UnaryExpression *unary = (const UnaryExpression *)expression->data;
+    if (!unary || !unary->operator|| !unary->operand) {
+      return 0;
+    }
+    /* `&name` becomes a relocation filling the whole slot, so it is the entire
+     * initializer or nothing: there is no addend for `&name + 1`. */
+    if (strcmp(unary->operator, "&") == 0) {
+      return top_level && unary->operand->type == AST_IDENTIFIER;
+    }
+    if (strcmp(unary->operator, "+") == 0 ||
+        strcmp(unary->operator, "-") == 0 ||
+        strcmp(unary->operator, "!") == 0 ||
+        strcmp(unary->operator, "~") == 0) {
+      return layoutable_global_initializer(checker, declared, unary->operand, 0);
+    }
+    return 0;
+  }
+  case AST_BINARY_EXPRESSION: {
+    const BinaryExpression *binary = (const BinaryExpression *)expression->data;
+    return binary && binary->left && binary->right &&
+           layoutable_global_initializer(checker, declared, binary->left, 0) &&
+           layoutable_global_initializer(checker, declared, binary->right, 0);
+  }
+  case AST_CAST_EXPRESSION: {
+    const CastExpression *cast = (const CastExpression *)expression->data;
+    return cast && cast->operand &&
+           layoutable_global_initializer(checker, declared, cast->operand, 0);
+  }
+  /* `sizeof(T)` is a compile-time integer; every other call needs to run. */
+  case AST_FUNCTION_CALL: {
+    const CallExpression *call = (const CallExpression *)expression->data;
+    return call && call->function_name &&
+           strcmp(call->function_name, "sizeof") == 0;
+  }
+  default:
+    return 0;
+  }
+}
+
+static int gpu_kernel_parameter_type(const Type *type) {
+  if (!type) {
+    return 0;
+  }
+  if (gpu_kernel_scalar_type(type)) {
+    return 1;
+  }
+  return type->kind == TYPE_POINTER && type->base_type &&
+         gpu_kernel_scalar_type(type->base_type);
+}
 
 // Struct type processing functions
 
@@ -142,7 +257,7 @@ Type *type_checker_build_tagged_enum_type(TypeChecker *checker,
 
   // data starts at first offset >= 4 that satisfies alignment of payload
   size_t data_align = max_payload_align < 4 ? 4 : max_payload_align;
-  // align_up(4, data_align) – tag is 4 bytes, then pad to data_align
+  // align_up(4, data_align) â€“ tag is 4 bytes, then pad to data_align
   size_t data_offset = (4 + data_align - 1) & ~(data_align - 1);
   size_t total_size = max_payload_size > 0 ? data_offset + max_payload_size
                                            : data_offset;
@@ -227,7 +342,7 @@ int type_checker_process_tagged_enum(TypeChecker *checker,
 
 // ---------------------------------------------------------------------------
 // Instantiate a generic enum template for a concrete type argument string.
-// e.g. "Option<int32>" → creates and registers Option__int32 if needed.
+// e.g. "Option<int32>" â†’ creates and registers Option__int32 if needed.
 // ---------------------------------------------------------------------------
 Type *type_checker_instantiate_generic_enum(TypeChecker *checker,
                                                     const char *generic_name,
@@ -285,7 +400,7 @@ Type *type_checker_instantiate_generic_enum(TypeChecker *checker,
   for (size_t i = 0; i < tmpl->variant_count; i++) {
     concrete_variants[i].name = tmpl->variants[i].name;
     concrete_variants[i].value = NULL;
-    // Substitute type parameter: if payload_type == type_param[0] → use arg
+    // Substitute type parameter: if payload_type == type_param[0] â†’ use arg
     const char *orig_pt = tmpl->variants[i].payload_type;
     if (orig_pt && tmpl->type_param_count > 0 &&
         strcmp(orig_pt, tmpl->type_params[0]) == 0) {
@@ -357,7 +472,7 @@ int type_checker_process_enum_declaration(TypeChecker *checker,
     return 0;
   }
 
-  // If this enum has type parameters it's a generic template — store the AST
+  // If this enum has type parameters it's a generic template â€” store the AST
   // node for later monomorphization and do not register a concrete type now.
   if (enum_decl->type_param_count > 0) {
     ASTNode **new_tmpl = realloc(
@@ -371,7 +486,7 @@ int type_checker_process_enum_declaration(TypeChecker *checker,
     return 1;
   }
 
-  // Check whether any variant carries a payload — if so, it's a tagged enum.
+  // Check whether any variant carries a payload â€” if so, it's a tagged enum.
   int is_tagged = 0;
   for (size_t i = 0; i < enum_decl->variant_count; i++) {
     if (enum_decl->variants[i].payload_type) {
@@ -538,6 +653,75 @@ int type_checker_process_declaration(TypeChecker *checker,
       }
     }
 
+    if (var_decl->address_space != AST_ADDRESS_SPACE_DEFAULT) {
+      FunctionDeclaration *owner =
+          checker->current_function_decl &&
+                  checker->current_function_decl->type == AST_FUNCTION_DECLARATION
+              ? (FunctionDeclaration *)checker->current_function_decl->data
+              : NULL;
+      if (!owner || !owner->is_kernel || !current_scope ||
+          current_scope->type == SCOPE_GLOBAL) {
+        type_checker_set_error_at_location(
+            checker, declaration->location,
+            "%s storage is only legal inside a GPU kernel",
+            var_decl->address_space == AST_ADDRESS_SPACE_WORKGROUP ? "workgroup"
+                                                                   : "private");
+        return 0;
+      }
+      if (var_decl->is_const || var_decl->is_extern || var_decl->is_exported) {
+        type_checker_set_error_at_location(
+            checker, declaration->location,
+            "GPU address-space storage must be a local 'var' binding");
+        return 0;
+      }
+      if (var_decl->initializer) {
+        type_checker_set_error_at_location(
+            checker, declaration->location,
+            "%s storage cannot have a declaration initializer; initialize "
+            "elements explicitly",
+            var_decl->address_space == AST_ADDRESS_SPACE_WORKGROUP ? "workgroup"
+                                                                   : "private");
+        return 0;
+      }
+      int is_static_storage =
+          var_type && var_type->kind == TYPE_ARRAY && var_type->base_type &&
+          var_type->array_size > 0 && var_type->array_size <= UINT32_MAX;
+      int is_dynamic_workgroup_view =
+          var_type && var_type->kind == TYPE_POINTER && var_type->base_type &&
+          var_decl->address_space == AST_ADDRESS_SPACE_WORKGROUP;
+      if (!is_static_storage && !is_dynamic_workgroup_view) {
+        type_checker_set_error_at_location(
+            checker, declaration->location,
+            "GPU address-space storage requires a statically sized array type "
+            "with at most %u elements, or a pointer type for a dynamic "
+            "workgroup view",
+            UINT32_MAX);
+        return 0;
+      }
+      Type *element_type = var_type->base_type;
+      switch (element_type->kind) {
+      case TYPE_INT8:
+      case TYPE_INT16:
+      case TYPE_INT32:
+      case TYPE_INT64:
+      case TYPE_UINT8:
+      case TYPE_UINT16:
+      case TYPE_UINT32:
+      case TYPE_UINT64:
+      case TYPE_BOOL:
+      case TYPE_FLOAT32:
+      case TYPE_FLOAT64:
+        break;
+      default:
+        type_checker_set_error_at_location(
+            checker, declaration->location,
+            "GPU address-space binding '%s' must have a scalar numeric element "
+            "type",
+            var_decl->name);
+        return 0;
+      }
+    }
+
     // If there's an initializer, validate it. When validation fails but the
     // declared type is known, the variable is still registered with that type
     // ("poisoned") so later uses don't cascade into bogus undefined-variable
@@ -546,7 +730,14 @@ int type_checker_process_declaration(TypeChecker *checker,
     if (var_decl->initializer) {
       size_t reports_before =
           checker->error_reporter ? checker->error_reporter->count : 0;
+      /* An aggregate literal has no type of its own, so hand it the declared
+       * type. Without one there is nothing to check it against, and the
+       * literal reports that itself. */
+      checker->aggregate_target_type =
+          var_decl->initializer->type == AST_AGGREGATE_LITERAL ? var_type
+                                                               : NULL;
       Type *init_type = type_checker_infer_type(checker, var_decl->initializer);
+      checker->aggregate_target_type = NULL;
       if (!init_type) {
         int already_reported =
             checker->error_reporter
@@ -577,7 +768,7 @@ int type_checker_process_declaration(TypeChecker *checker,
           poisoned = 1;
         }
         // Type specified: validate assignment compatibility
-        else if (!(var_type->kind == TYPE_POINTER &&
+        else if (!(type_checker_type_accepts_null_pointer(var_type) &&
               type_checker_is_null_pointer_constant(var_decl->initializer)) &&
             !type_checker_is_assignable(checker, var_type, init_type)) {
           type_checker_report_type_mismatch_node(checker, var_decl->initializer,
@@ -612,6 +803,56 @@ int type_checker_process_declaration(TypeChecker *checker,
           "Variable '%s' must have either a type annotation or an initializer",
           var_decl->name);
       return 0;
+    }
+
+    /* A global's storage is laid out in the object file, so its value has to be
+     * known at compile time. For an aggregate that means an aggregate literal
+     * and nothing else -- a call or any other run-time expression has no image
+     * to lay out, and there is no module initializer to run one in. Caught here
+     * rather than in codegen so the report carries a source location. */
+    if (!poisoned && var_decl->initializer && !var_decl->is_extern && var_type &&
+        (var_type->kind == TYPE_STRUCT || var_type->kind == TYPE_ARRAY) &&
+        var_decl->initializer->type != AST_AGGREGATE_LITERAL &&
+        (!current_scope || current_scope->type == SCOPE_GLOBAL)) {
+      type_checker_set_error_at_location(
+          checker, var_decl->initializer->location,
+          "a global of aggregate type must be initialized with an aggregate "
+          "literal (%s), whose value is known at compile time; '%s' has type "
+          "'%s'",
+          var_type->kind == TYPE_STRUCT ? "'{ field: value, ... }'"
+                                        : "'[ value, ... ]'",
+          var_decl->name, var_type->name ? var_type->name : "?");
+      /* Register the binding anyway so later uses do not pile on with
+       * "undefined variable"; the declaration itself has already failed. */
+      checker->has_error = 1;
+      poisoned = 1;
+    }
+
+    /* The same rule for a scalar global. Its initializer is folded to bytes in
+     * the object file, so it has to be one of the shapes the module lowering
+     * can fold (see eval_numeric in mtlc_lower_module.c): a numeric constant
+     * expression, `sizeof(T)`, `&name`, or a string literal. Anything else -- a
+     * call, `new`, an index or member access, string concatenation -- is a
+     * run-time value with nothing to lay out. Rejected here so the report
+     * carries a source location instead of failing as an internal compiler
+     * error in codegen. */
+    if (!poisoned && var_decl->initializer && !var_decl->is_extern && var_type &&
+        var_type->kind != TYPE_STRUCT && var_type->kind != TYPE_ARRAY &&
+        (!current_scope || current_scope->type == SCOPE_GLOBAL) &&
+        /* An integer `const` gets the more specific diagnostic from its own
+         * fold below; everything else lands here. */
+        !(var_decl->is_const && type_checker_is_integer_type(var_type)) &&
+        !layoutable_global_initializer(checker, var_type, var_decl->initializer,
+                                      1)) {
+      type_checker_set_error_at_location(
+          checker, var_decl->initializer->location,
+          "a global's initializer must be known at compile time; '%s' is "
+          "initialized with a value that is only available at run time. Move "
+          "the initialization into a function, or make the initializer a "
+          "constant expression",
+          var_decl->name);
+      checker->has_error = 1;
+      poisoned = 1;
     }
 
     // A `const` declaration binds an immutable value and must be initialized.
@@ -735,6 +976,14 @@ int type_checker_process_declaration(TypeChecker *checker,
 
     var_symbol->is_extern = var_decl->is_extern;
     var_symbol->is_immutable = var_decl->is_const;
+    var_symbol->is_address_space_binding =
+        var_decl->address_space != AST_ADDRESS_SPACE_DEFAULT;
+    var_symbol->address_space =
+        var_decl->address_space == AST_ADDRESS_SPACE_WORKGROUP
+            ? MTLC_ADDRESS_SPACE_WORKGROUP
+        : var_decl->address_space == AST_ADDRESS_SPACE_PRIVATE
+            ? MTLC_ADDRESS_SPACE_PRIVATE
+            : MTLC_ADDRESS_SPACE_DEFAULT;
     if (var_decl->is_extern) {
       const char *effective_link_name = type_checker_decl_link_name(
           var_decl->name, var_decl->is_extern, var_decl->link_name);
@@ -764,6 +1013,7 @@ int type_checker_process_declaration(TypeChecker *checker,
           symbol_table_get_current_scope(checker->symbol_table);
       if (declare_scope && declare_scope->type != SCOPE_GLOBAL) {
         int track_definite_init =
+            !var_symbol->is_address_space_binding &&
             !(var_type &&
               (var_type->kind == TYPE_ARRAY || var_type->kind == TYPE_STRUCT ||
                var_type->kind == TYPE_STRING));
@@ -817,6 +1067,25 @@ int type_checker_process_declaration(TypeChecker *checker,
 
     Scope *current_scope =
         symbol_table_get_current_scope(checker->symbol_table);
+    if (func_decl->is_kernel &&
+        (!current_scope || current_scope->type != SCOPE_GLOBAL)) {
+      type_checker_set_error_at_location(
+          checker, declaration->location,
+          "GPU kernel '%s' must be declared at top level", func_decl->name);
+      return 0;
+    }
+    if (func_decl->is_kernel && func_decl->is_extern) {
+      type_checker_set_error_at_location(
+          checker, declaration->location,
+          "GPU kernel '%s' cannot be an extern declaration", func_decl->name);
+      return 0;
+    }
+    if (func_decl->is_kernel && !func_decl->body) {
+      type_checker_set_error_at_location(
+          checker, declaration->location,
+          "GPU kernel '%s' must have a body", func_decl->name);
+      return 0;
+    }
     if (func_decl->is_extern &&
         (!current_scope || current_scope->type != SCOPE_GLOBAL)) {
       type_checker_set_error_at_location(
@@ -843,6 +1112,13 @@ int type_checker_process_declaration(TypeChecker *checker,
       }
     } else {
       return_type = checker->builtin_void;
+    }
+    if (func_decl->is_kernel && return_type->kind != TYPE_VOID) {
+      type_checker_set_error_at_location(
+          checker, declaration->location,
+          "GPU kernel '%s' must return void (remove '-> %s')", func_decl->name,
+          return_type->name ? return_type->name : "non-void");
+      return 0;
     }
 
     // Resolve parameter types and check for duplicate parameter names
@@ -876,6 +1152,17 @@ int type_checker_process_declaration(TypeChecker *checker,
           type_checker_report_undefined_symbol(checker, declaration->location,
                                                func_decl->parameter_types[i],
                                                "type");
+          free(param_types);
+          return 0;
+        }
+        if (func_decl->is_kernel &&
+            !gpu_kernel_parameter_type(param_types[i])) {
+          type_checker_set_error_at_location(
+              checker, declaration->location,
+              "GPU kernel '%s' parameter '%s' has unsupported ABI type '%s'; "
+              "use a scalar or a pointer to a scalar",
+              func_decl->name, func_decl->parameter_names[i],
+              param_types[i]->name ? param_types[i]->name : "unknown");
           free(param_types);
           return 0;
         }
@@ -1054,6 +1341,11 @@ int type_checker_process_declaration(TypeChecker *checker,
           symbol_table_exit_scope(checker->symbol_table);
           return 0;
         }
+        if (func_decl->is_kernel && active_param_types &&
+            active_param_types[i] &&
+            active_param_types[i]->kind == TYPE_POINTER) {
+          param_symbol->address_space = MTLC_ADDRESS_SPACE_GLOBAL;
+        }
         if (!symbol_table_declare(checker->symbol_table, param_symbol)) {
           type_checker_report_duplicate_declaration(
               checker, declaration->location, func_decl->parameter_names[i]);
@@ -1197,7 +1489,9 @@ int type_checker_process_declaration(TypeChecker *checker,
           return 0;
         }
 
+        checker->aggregate_target_type = field_type;
         Type *value_type = type_checker_infer_type(checker, assignment->value);
+        checker->aggregate_target_type = NULL;
         if (!value_type) {
           if (!checker->has_error) {
             type_checker_set_error_at_location(
@@ -1207,7 +1501,7 @@ int type_checker_process_declaration(TypeChecker *checker,
           return 0;
         }
 
-        if (!(field_type->kind == TYPE_POINTER &&
+        if (!(type_checker_type_accepts_null_pointer(field_type) &&
               type_checker_is_null_pointer_constant(assignment->value)) &&
             !type_checker_is_assignable(checker, field_type, value_type)) {
           type_checker_report_type_mismatch(checker,
@@ -1256,7 +1550,9 @@ int type_checker_process_declaration(TypeChecker *checker,
           return 0;
         }
 
+        checker->aggregate_target_type = element_type;
         Type *value_type = type_checker_infer_type(checker, assignment->value);
+        checker->aggregate_target_type = NULL;
         if (!value_type) {
           if (!checker->has_error) {
             type_checker_set_error_at_location(
@@ -1266,7 +1562,7 @@ int type_checker_process_declaration(TypeChecker *checker,
           return 0;
         }
 
-        if (!(element_type->kind == TYPE_POINTER &&
+        if (!(type_checker_type_accepts_null_pointer(element_type) &&
               type_checker_is_null_pointer_constant(assignment->value)) &&
             !type_checker_is_assignable(checker, element_type, value_type)) {
           type_checker_report_type_mismatch(
@@ -1293,7 +1589,9 @@ int type_checker_process_declaration(TypeChecker *checker,
           return 0;
         }
 
+        checker->aggregate_target_type = target_type;
         Type *value_type = type_checker_infer_type(checker, assignment->value);
+        checker->aggregate_target_type = NULL;
         if (!value_type) {
           if (!checker->has_error) {
             type_checker_set_error_at_location(
@@ -1303,7 +1601,7 @@ int type_checker_process_declaration(TypeChecker *checker,
           return 0;
         }
 
-        if (!(target_type->kind == TYPE_POINTER &&
+        if (!(type_checker_type_accepts_null_pointer(target_type) &&
               type_checker_is_null_pointer_constant(assignment->value)) &&
             !type_checker_is_assignable(checker, target_type, value_type)) {
           type_checker_report_type_mismatch(
@@ -1360,9 +1658,19 @@ int type_checker_process_declaration(TypeChecker *checker,
           assignment->variable_name);
       return 0;
     }
+    if (var_symbol->is_address_space_binding) {
+      type_checker_set_error_at_location(
+          checker, declaration->location,
+          "GPU address-space binding '%s' cannot be rebound; assign its "
+          "elements instead",
+          assignment->variable_name);
+      return 0;
+    }
 
     // Infer the type of the assignment value
+    checker->aggregate_target_type = var_symbol->type;
     Type *value_type = type_checker_infer_type(checker, assignment->value);
+    checker->aggregate_target_type = NULL;
     if (!value_type) {
       if (!checker->has_error) {
         type_checker_set_error_at_location(
@@ -1373,7 +1681,7 @@ int type_checker_process_declaration(TypeChecker *checker,
     }
 
     // Validate assignment compatibility
-    if (!(var_symbol->type->kind == TYPE_POINTER &&
+    if (!(type_checker_type_accepts_null_pointer(var_symbol->type) &&
           type_checker_is_null_pointer_constant(assignment->value)) &&
         !type_checker_is_assignable(checker, var_symbol->type, value_type)) {
       type_checker_report_type_mismatch(checker, assignment->value->location,

@@ -17,6 +17,7 @@ Its own backend, linker, and source-level debugger. No LLVM, no VM, no managed r
 &nbsp;![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-2b6cb0.svg)
 &nbsp;![Codegen](https://img.shields.io/badge/codegen-native%20x86--64-2f855a.svg)
 &nbsp;![Dependencies](https://img.shields.io/badge/dependencies-no%20LLVM%20%C2%B7%20no%20VM-c53030.svg)
+&nbsp;![Backend](https://img.shields.io/badge/backend-libmtlc-2b6cb0.svg)
 &nbsp;![GPU](https://img.shields.io/badge/GPU-CUDA%20%2F%20PTX-805ad5.svg)
 
 [**Documentation**](docs/LANGUAGE.md)
@@ -30,6 +31,8 @@ Its own backend, linker, and source-level debugger. No LLVM, no VM, no managed r
 ---
 
 Mettle compiles `.mettle` source to native x86-64. On Windows, `mettle --build` produces a PE executable using a built-in linker. On Linux, it produces ELF and links with the system toolchain.
+
+This repository is the language and its compiler frontend. The backend it compiles against is [**libmtlc**](https://github.com/The-Mettle-Project/libmtlc): the IR, the optimizers, code generation, and native linking. Building from source fetches it; see [Build from source](#build-from-source) and [Mettle and libmtlc](docs/mettle-and-libmtlc.md). Installing a release needs nothing extra, because the released compiler already has it linked in.
 
 ## Features
 
@@ -98,9 +101,14 @@ Installs to `~/.mettle` (Linux) or `%LOCALAPPDATA%\Mettle` (Windows) and updates
 
 ## Build from source
 
+Mettle needs [libmtlc](https://github.com/The-Mettle-Project/libmtlc), its
+compiler backend. One command fetches the pinned revision and builds it; after
+that the build is offline.
+
 **Windows** (gcc or clang):
 
 ```powershell
+.\get-libmtlc.ps1    # fetch + build the backend into .\libmtlc
 .\build.bat          # default: gcc
 .\build.bat clang
 ```
@@ -108,8 +116,16 @@ Installs to `~/.mettle` (Linux) or `%LOCALAPPDATA%\Mettle` (Windows) and updates
 **Linux / macOS**:
 
 ```bash
+./get-libmtlc.sh     # fetch + build the backend into ./libmtlc
 make                 # bin/mettle + bundled stdlib/ and runtime/
 make install         # optional: /usr/local/bin, stdlib, runtime
+```
+
+The revision is pinned in [`libmtlc.version`](libmtlc.version). Already have a
+libmtlc checkout? Point at it and skip the download:
+
+```bash
+make LIBMTLC_DIR=../libmtlc
 ```
 
 Typical release build:
@@ -132,21 +148,33 @@ Common flags: `--release` / `-O`, `--explain`, `--debug-hooks`, `-d` / `-s` / `-
 - [Standard library](docs/standard-library.md)
 - [C interop](docs/c-interop.md)
 - [Known limitations](docs/known-limitations.md)
+- [Mettle and libmtlc](docs/mettle-and-libmtlc.md) — the frontend/backend boundary
 
 `mettle docs` prints paths to these files next to the compiler binary.
 
 ## Repository layout
 
 ```
-src/            compiler (lexer through codegen, linker, diagnostics)
-stdlib/         standard library
+src/lexer/      lexer
+src/parser/     parser and AST
+src/semantic/   imports, monomorphization, type checking, memory safety
+src/ir/         AST to IR lowering (the IR itself is libmtlc's)
+src/frontend/   adapters from Mettle types onto the backend's
+src/main.c      the compiler driver
 src/runtime/    optional helper objects (crash traces, atomics, ...)
+stdlib/         standard library
 tests/          regression tests; run_tests.ps1 on Windows
 examples/       benchmarks and demos
-tools/          ELF tests, benchmarks, fuzz scripts
+tools/          ELF tests, benchmarks, fuzz scripts, upstream sync
 mettle-syntax/  VS Code / Cursor extension
 docs/           language and tooling reference
+libmtlc/        the backend dependency (fetched, gitignored)
 ```
+
+The optimizers, code generators and linkers are not here. They are in
+[libmtlc](https://github.com/The-Mettle-Project/libmtlc), which is upstream of
+this repository: both halves are developed there, and `tools/sync-from-libmtlc.ps1`
+brings the Mettle half back over.
 
 ## Examples and benchmarks
 
@@ -161,6 +189,7 @@ Runnable samples live under [examples/](examples/). Benchmark suites pair Mettle
 **Windows** (primary CI: full test suite):
 
 ```powershell
+.\get-libmtlc.ps1
 .\build.bat
 .\tests\run_tests.ps1
 ```
@@ -168,9 +197,21 @@ Runnable samples live under [examples/](examples/). Benchmark suites pair Mettle
 **Linux** (native ELF backend):
 
 ```bash
+./get-libmtlc.sh
 make -j"$(nproc)"
 bash tools/test-elf-native.sh
 ```
+
+Working on the backend at the same time? Build against your checkout instead of
+the pinned download, and both halves rebuild together:
+
+```powershell
+$env:LIBMTLC_DIR = "..\libmtlc"
+.\build.bat
+```
+
+See [Mettle and libmtlc](docs/mettle-and-libmtlc.md) for the boundary, the
+include-path rules, and how to sync frontend changes back from upstream.
 
 ## Editor support
 

@@ -31,7 +31,7 @@
 // trusted, so the false-positive budget is zero.
 
 #include "type_checker_internal.h"
-#include "../ir/ir_explain_memory.h"
+#include "ir/ir_explain_memory.h"
 
 #define MEM_MAX_LOCALS 256
 #define MEM_MAX_PARAMS 32
@@ -72,6 +72,12 @@ typedef struct {
 typedef struct {
   MemFnSummary *items;
   size_t count;
+  /* Open-addressing index (slot+1; 0 = empty) over items, keyed by name.
+   * Consulted per call expression across every function walk: a linear scan
+   * here is O(calls x functions) on large programs. Sized once at table
+   * construction (the item set is fixed after seeding). */
+  size_t *buckets;
+  size_t bucket_count;
 } MemSummaryTable;
 
 typedef struct {
@@ -118,7 +124,6 @@ typedef struct {
   MemMode mode;
   const MemSummaryTable *summaries; /* NULL in MEM_MODE_LOCAL */
   MemFnSummary *collect;            /* MEM_MODE_SUMMARY output */
-  MemLocal locals[MEM_MAX_LOCALS];
   size_t local_count;
   int depth;      /* 0 = the function's straight-line spine */
   int scope_level; /* lexical block nesting (0 = function body); independent of
@@ -131,6 +136,12 @@ typedef struct {
   int saw_value_return;
   int returns_all_fresh;
   int had_error;
+  /* Kept LAST so mem_ctx_init can zero only the fields above it. This is 256
+   * entries of a large struct -- around 50KB -- and mem_add_local zeroes each
+   * slot as it hands it out, so clearing the whole array once per function was
+   * pure waste: 2.5% of total compile time on a 13k-function input. Every read
+   * of a slot is bounded by local_count, so untouched slots are never seen. */
+  MemLocal locals[MEM_MAX_LOCALS];
 } MemCtx;
 
 /* ---- small type helpers ----------------------------------------------------- */
@@ -211,12 +222,36 @@ static MemFnSummary *mem_summary_find(const MemSummaryTable *table,
   if (!table || !name) {
     return NULL;
   }
+  if (table->bucket_count) {
+    size_t b = mettle_fnv1a_hash(name) & (table->bucket_count - 1);
+    while (table->buckets[b]) {
+      MemFnSummary *s = &table->items[table->buckets[b] - 1];
+      if (strcmp(s->name, name) == 0) {
+        return s;
+      }
+      b = (b + 1) & (table->bucket_count - 1);
+    }
+    return NULL;
+  }
   for (size_t i = 0; i < table->count; i++) {
     if (strcmp(table->items[i].name, name) == 0) {
       return &table->items[i];
     }
   }
   return NULL;
+}
+
+/* Register items[slot] in the name index (no-op when the index is absent). */
+static void mem_summary_index_put(MemSummaryTable *table, size_t slot) {
+  if (!table->bucket_count) {
+    return;
+  }
+  size_t b =
+      mettle_fnv1a_hash(table->items[slot].name) & (table->bucket_count - 1);
+  while (table->buckets[b]) {
+    b = (b + 1) & (table->bucket_count - 1);
+  }
+  table->buckets[b] = slot + 1;
 }
 
 /* ---- local table ------------------------------------------------------------- */
@@ -1862,6 +1897,7 @@ static void mem_walk_statement(MemCtx *ctx, ASTNode *statement) {
   }
   case AST_FUNCTION_CALL:
   case AST_FUNC_PTR_CALL:
+  case AST_GPU_LAUNCH:
     mem_walk_expr(ctx, statement);
     return;
   default:
@@ -1878,7 +1914,9 @@ static void mem_ctx_init(MemCtx *ctx, TypeChecker *checker, ASTNode *decl,
                          FunctionDeclaration *fn, MemMode mode,
                          const MemSummaryTable *summaries,
                          MemFnSummary *collect) {
-  memset(ctx, 0, sizeof(*ctx));
+  /* Everything except the trailing locals array; see the note on its
+   * declaration for why that one is left alone. */
+  memset(ctx, 0, offsetof(MemCtx, locals));
   ctx->checker = checker;
   ctx->fn = fn;
   ctx->fn_loc = decl->location;
@@ -1968,12 +2006,24 @@ int type_checker_check_program_memory(TypeChecker *checker, ASTNode *program) {
     free(decls);
     return 1;
   }
-  MemSummaryTable table = {items, 0};
+  MemSummaryTable table = {items, 0, NULL, 0};
+  {
+    size_t nb = 64;
+    while (nb < capacity * 2) {
+      nb *= 2;
+    }
+    table.buckets = calloc(nb, sizeof(size_t));
+    table.bucket_count = table.buckets ? nb : 0;
+  }
 
-  items[table.count++] = (MemFnSummary){"free", NULL, 1u, 0, 0, 0};
-  items[table.count++] = (MemFnSummary){"realloc", NULL, 1u, 0, 0, 1};
-  items[table.count++] = (MemFnSummary){"malloc", NULL, 0, 0, 0, 1};
-  items[table.count++] = (MemFnSummary){"calloc", NULL, 0, 0, 0, 1};
+  items[table.count] = (MemFnSummary){"free", NULL, 1u, 0, 0, 0};
+  mem_summary_index_put(&table, table.count++);
+  items[table.count] = (MemFnSummary){"realloc", NULL, 1u, 0, 0, 1};
+  mem_summary_index_put(&table, table.count++);
+  items[table.count] = (MemFnSummary){"malloc", NULL, 0, 0, 0, 1};
+  mem_summary_index_put(&table, table.count++);
+  items[table.count] = (MemFnSummary){"calloc", NULL, 0, 0, 0, 1};
+  mem_summary_index_put(&table, table.count++);
 
   for (size_t i = 0; i < prog->declaration_count; i++) {
     if (!mem_decl_is_analyzable(prog->declarations[i]) ||
@@ -1987,6 +2037,7 @@ int type_checker_check_program_memory(TypeChecker *checker, ASTNode *program) {
     }
     decls[table.count] = prog->declarations[i];
     items[table.count] = (MemFnSummary){fn->name, fn, 0, 0, 0, 0};
+    mem_summary_index_put(&table, table.count);
     table.count++;
   }
 
@@ -2047,6 +2098,7 @@ int type_checker_check_program_memory(TypeChecker *checker, ASTNode *program) {
     }
   }
 
+  free(table.buckets);
   free(items);
   free(decls);
   return 1;

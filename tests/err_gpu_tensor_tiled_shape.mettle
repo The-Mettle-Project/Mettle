@@ -1,0 +1,8 @@
+// Structurally meaningful whole-tile semantics, but 24x24 cannot be covered
+// by the stable PTX WMMA shapes selected by the current backend. Capability
+// selection must reject it rather than truncate the logical tile.
+kernel tensor_tiled_unsupported(a: uint16*, b: uint16*,
+                                c: float32*, d: float32*) {
+  tensor_mma(a, b, c, d, shape: m24n24k16,
+             input_type: f16, output_type: f32);
+}

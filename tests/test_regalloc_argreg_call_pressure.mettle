@@ -1,0 +1,72 @@
+// Register-allocator invariant: ABI argument registers (RCX/RDX/R8/R9) are
+// allocatable in functions that make calls, because outgoing-argument homing
+// writes are explicit phys-dst MOVs indexed as clobber events — a value whose
+// live interval contains one is never placed in that register, and a value
+// spanning the call is cross-call and barred from all volatiles.
+//
+// This test manufactures the adversarial shape: a parameterless caller with
+// more simultaneously live non-cross values than the callee-saved pool
+// (RBX/R12-R15/RSI/RDI/RAX), so later values spill into RCX/RDX/R8/R9, then
+// feeds them as the SOURCES of a 4-argument call (their last uses are the
+// homing moves themselves). If homing clobbered a not-yet-consumed source,
+// the checksum diverges. Self-checking: exit 55 on the expected value.
+import "std/mem";
+
+@noinline fn sink4(a: int64, b: int64, c: int64, d: int64) -> int64 {
+  return a * 1000000 + b * 10000 + c * 100 + d;
+}
+
+@noinline fn pressure(seed: int64) -> int64 {
+  // 14 values, all live from their defs down to the sink4 call(s): more than
+  // the 8 non-arg pool registers, so several must land in arg registers.
+  var v0: int64 = seed + 1;
+  var v1: int64 = seed * 3 + 2;
+  var v2: int64 = (seed << 2) + 3;
+  var v3: int64 = seed * 7 + 4;
+  var v4: int64 = (seed << 1) + 5;
+  var v5: int64 = seed * 11 + 6;
+  var v6: int64 = (seed << 3) + 7;
+  var v7: int64 = seed * 13 + 8;
+  var v8: int64 = (seed << 4) + 9;
+  var v9: int64 = seed * 17 + 10;
+  var v10: int64 = (seed << 5) + 11;
+  var v11: int64 = seed * 19 + 12;
+  var v12: int64 = (seed << 6) + 13;
+  var v13: int64 = seed * 23 + 14;
+  // Two calls whose argument sources are the tail values (the ones most
+  // likely to be colored into arg registers), consumed in an order that makes
+  // an earlier homing write overlap a later source if the allocator got the
+  // clobber accounting wrong.
+  var r1: int64 = sink4(v10 % 97, v11 % 97, v12 % 97, v13 % 97);
+  var r2: int64 = sink4(v6 % 97, v7 % 97, v8 % 97, v9 % 97);
+  // Keep the early values live past both calls (cross-call set).
+  return r1 * 3 + r2 * 5 + v0 + v1 + v2 + v3 + v4 + v5;
+}
+
+fn main() -> int32 {
+  var total: int64 = 0;
+  var s: int64 = 0;
+  while (s < 32) { total = total + pressure(s); s = s + 1; }
+  // Golden value computed by the same expression evaluated scalar-by-scalar
+  // in the interpreter-friendly path below (no calls, no pressure).
+  var expect: int64 = 0;
+  s = 0;
+  while (s < 32) {
+    var w10: int64 = ((s << 5) + 11) % 97;
+    var w11: int64 = (s * 19 + 12) % 97;
+    var w12: int64 = ((s << 6) + 13) % 97;
+    var w13: int64 = (s * 23 + 14) % 97;
+    var w6: int64 = ((s << 3) + 7) % 97;
+    var w7: int64 = (s * 13 + 8) % 97;
+    var w8: int64 = ((s << 4) + 9) % 97;
+    var w9: int64 = (s * 17 + 10) % 97;
+    var e1: int64 = w10 * 1000000 + w11 * 10000 + w12 * 100 + w13;
+    var e2: int64 = w6 * 1000000 + w7 * 10000 + w8 * 100 + w9;
+    expect = expect + e1 * 3 + e2 * 5;
+    expect = expect + (s + 1) + (s * 3 + 2) + ((s << 2) + 3);
+    expect = expect + (s * 7 + 4) + ((s << 1) + 5) + (s * 11 + 6);
+    s = s + 1;
+  }
+  if (total == expect) { return 55; }
+  return 1;
+}

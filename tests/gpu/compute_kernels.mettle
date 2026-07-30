@@ -1,0 +1,230 @@
+// Self-contained GPU compute kernels for the --emit-ptx / --emit-spirv backend
+// validity gates. No external data and no LLM: generic vector, byte, and flag
+// compute that exercises the GPU code paths the emitters must handle, namely
+// thread-index intrinsics, guarded stores, counted loops with float and int
+// accumulators, int/float/byte casts, bitwise ops, the f32 math and fp16
+// intrinsics, a workgroup barrier, and short-circuit &&/|| with float
+// truthiness (the SPIR-V structurizer's hard cases).
+
+extern fn gpu_tid_x() -> int32 = "gpu_tid_x";
+extern fn gpu_ntid_x() -> int32 = "gpu_ntid_x";
+extern fn gpu_ctaid_x() -> int32 = "gpu_ctaid_x";
+extern fn sqrtf(x: float32) -> float32 = "sqrtf";
+extern fn fabsf(x: float32) -> float32 = "fabsf";
+extern fn h2f(bits: uint16) -> float32 = "h2f";
+extern fn f2h(x: float32) -> uint16 = "f2h";
+extern fn gpu_barrier() = "gpu_barrier";
+
+// An unreachable ordinary function is neither an entry point nor device code.
+// This guards reachability and the frontend-neutral kernel identity in IR.
+fn ordinary_function_not_entry(x: int32) -> int32 { return x + 1; }
+
+// Ordinary functions become device-callable only when reached by a kernel.
+// No backend-specific source annotation is required.
+fn scale_value(alpha: float32, x: float32) -> float32 {
+  return alpha * x;
+}
+
+// c[i] = a[i] + b[i]   -- the basic guarded load/store kernel.
+kernel vadd(a: float32*, b: float32*, c: float32*, n: int32) {
+  var i: int32 = gpu_ctaid_x() * gpu_ntid_x() + gpu_tid_x();
+  if (i < n) {
+    c[i] = a[i] + b[i];
+  }
+}
+
+// y[i] = alpha * x[i] + y[i]   -- a scalar parameter plus a fused multiply-add.
+kernel saxpy(alpha: float32, x: float32*, y: float32*, n: int32) {
+  var i: int32 = gpu_ctaid_x() * gpu_ntid_x() + gpu_tid_x();
+  if (i < n) {
+    y[i] = scale_value(alpha, x[i]) + y[i];
+  }
+}
+
+// out[o] = sqrt(sum_k inp[o*cols + k]^2)   -- counted loop, float accumulator,
+// nested index math, and a math intrinsic (generic per-row L2 norm).
+kernel row_norm(inp: float32*, out: float32*, rows: int32, cols: int32) {
+  var o: int32 = gpu_ctaid_x() * gpu_ntid_x() + gpu_tid_x();
+  if (o < rows) {
+    var acc: float32 = 0.0;
+    var k: int32 = 0;
+    while (k < cols) {
+      var v: float32 = inp[o * cols + k];
+      acc = acc + v * v;
+      k = k + 1;
+    }
+    out[o] = sqrtf(acc);
+  }
+}
+
+// Unpack packed 4-bit nibbles to floats: uint8 load, & and >>, int->float cast.
+kernel unpack_nibbles(src: uint8*, dst: float32*, n: int32) {
+  var i: int32 = gpu_ctaid_x() * gpu_ntid_x() + gpu_tid_x();
+  if (i < n) {
+    var b: int32 = (int32)src[i];
+    var lo: int32 = b & 15;
+    var hi: int32 = (b >> 4) & 15;
+    dst[i * 2] = (float32)(lo - 8);
+    dst[i * 2 + 1] = (float32)(hi - 8);
+  }
+}
+
+// Clamp |x| into [0, 1] with a branch (if without else).
+kernel clamp_abs01(x: float32*, out: float32*, n: int32) {
+  var i: int32 = gpu_ctaid_x() * gpu_ntid_x() + gpu_tid_x();
+  if (i < n) {
+    var v: float32 = fabsf(x[i]);
+    if (v > 1.0) { v = 1.0; }
+    out[i] = v;
+  }
+}
+
+// fp16 round-trip through f32: h2f then f2h (the fp16 bit-pattern intrinsics).
+kernel fp16_roundtrip(src: uint16*, dst: uint16*, n: int32) {
+  var i: int32 = gpu_ctaid_x() * gpu_ntid_x() + gpu_tid_x();
+  if (i < n) {
+    var f: float32 = h2f(src[i]);
+    dst[i] = f2h(f + 1.0);
+  }
+}
+
+// Predicate flags: every comparison, short-circuit && and ||, and float
+// truthiness. These are exactly the branch shapes the SPIR-V structurizer and
+// the PTX predicate lowering must get right.
+kernel flags(a: int32*, b: int32*, fx: float32*, out: int32*, n: int32) {
+  var i: int32 = gpu_ctaid_x() * gpu_ntid_x() + gpu_tid_x();
+  if (i < n) {
+    var x: int32 = a[i];
+    var y: int32 = b[i];
+    var r: int32 = 0;
+    if (x < y)  { r = r + 1; }
+    if (x <= y) { r = r + 2; }
+    if (x >= y) { r = r + 4; }
+    if (x == y) { r = r + 8; }
+    if (x != y) { r = r + 16; }
+    if (x < y && y < 100) { r = r + 32; }
+    if (x > y || y > 100) { r = r + 64; }
+    if (fx[i]) { r = r + 128; }
+    out[i] = r;
+  }
+}
+
+// A workgroup barrier between a load phase and a per-block write.
+kernel block_first(x: float32*, partial: float32*, n: int32) {
+  var i: int32 = gpu_ctaid_x() * gpu_ntid_x() + gpu_tid_x();
+  var m: float32 = 0.0;
+  if (i < n) {
+    m = x[i];
+  }
+  barrier(workgroup, global, acq_rel);
+  if (gpu_tid_x() == 0) {
+    partial[gpu_ctaid_x()] = m;
+  }
+}
+
+// Static address-space storage is a language feature, not a target spelling.
+// `tile` is shared by the workgroup and `scratch` is distinct per work-item;
+// the same source must become PTX .shared/.local and SPIR-V Workgroup/Private.
+kernel staged_copy(x: float32*, out: float32*, n: int32) {
+  workgroup var tile: float32[32];
+  private var scratch: int32[4];
+  var lane: int32 = gpu_tid_x();
+  var i: int32 = gpu_ctaid_x() * gpu_ntid_x() + lane;
+  scratch[0] = lane;
+  if (lane < 32 && i < n) {
+    tile[lane] = x[i];
+  }
+  gpu_barrier();
+  if (lane < 32 && i < n) {
+    out[i] = tile[lane] + (float32)(scratch[0] - lane);
+  }
+}
+
+// Pointer-shaped workgroup bindings are typed views of the one dynamic arena
+// supplied by the launch. Views intentionally alias, so portable kernels can
+// partition the arena without exposing CUDA extern-shared or OpenCL local-arg
+// syntax. This layout uses [0,32) as float data and [32,64) as uint metadata.
+kernel dynamic_staged_copy(x: float32*, out: float32*, n: int32) {
+  workgroup var values: float32*;
+  workgroup var metadata: uint32*;
+  var lane: int32 = gpu_tid_x();
+  var i: int32 = gpu_ctaid_x() * gpu_ntid_x() + lane;
+  if (lane < 32 && i < n) {
+    values[lane] = x[i];
+    metadata[32 + lane] = (uint32)i;
+  }
+  barrier(workgroup, acq_rel);
+  if (lane < 32 && i < n) {
+    out[i] = values[lane] + (float32)(metadata[32 + lane] - (uint32)i);
+  }
+}
+
+// Portable subgroup semantics use an implementation-sized subgroup. The PTX
+// backend selects an NVIDIA warp; SPIR-V preserves subgroup scope. All lanes
+// reach the collectives uniformly, including lanes whose global index is past n.
+kernel subgroup_sums(fsrc: float32*, fdst: float32*, usrc: uint32*,
+                     udst: uint32*, n: int32) {
+  var lane: uint32 = subgroup_local_id();
+  var width: uint32 = subgroup_size();
+  var i: int32 = gpu_ctaid_x() * gpu_ntid_x() + gpu_tid_x();
+  var fv: float32 = 0.0;
+  var uv: uint32 = 0;
+  if (i < n) {
+    fv = fsrc[i];
+    uv = usrc[i];
+  }
+  var fsum: float32 = subgroup_reduce_add(fv);
+  var usum: uint32 = subgroup_reduce_add(uv);
+  var ffirst: float32 = subgroup_broadcast(fv, 0);
+  var ufirst: uint32 = subgroup_broadcast(uv, 0);
+  if (i < n) {
+    fdst[i] = fsum + ffirst + (float32)(width - width);
+    udst[i] = usum + ufirst + lane - lane;
+  }
+}
+
+kernel subgroup_extended(fsrc: float32*, fdst: float32*, usrc: uint32*,
+                         udst: uint32*, n: int32) {
+  var i: int32 = gpu_ctaid_x() * gpu_ntid_x() + gpu_tid_x();
+  var fv: float32 = 0.0;
+  var uv: uint32 = 0;
+  if (i < n) {
+    fv = fsrc[i];
+    uv = usrc[i];
+  }
+  var fmin: float32 = subgroup_reduce_min(fv);
+  var fmax: float32 = subgroup_reduce_max(fv);
+  var finc: float32 = subgroup_scan_inclusive_add(fv);
+  var fexc: float32 = subgroup_scan_exclusive_add(fv);
+  var umin: uint32 = subgroup_reduce_min(uv);
+  var umax: uint32 = subgroup_reduce_max(uv);
+  var uinc: uint32 = subgroup_scan_inclusive_add(uv);
+  var uexc: uint32 = subgroup_scan_exclusive_add(uv);
+  if (i < n) {
+    fdst[i] = fmin + fmax + finc + fexc;
+    udst[i] = umin + umax + uinc + uexc;
+  }
+}
+
+// Ballot is word-addressed instead of narrowing an implementation-sized mask
+// into one scalar. Words outside the backend mask representation are zero.
+kernel subgroup_votes(flags: uint32*, out: uint32*) {
+  var i: int32 = gpu_ctaid_x() * gpu_ntid_x() + gpu_tid_x();
+  var predicate: bool = (flags[i] & (uint32)1) != 0;
+  out[i * 5] = subgroup_ballot(predicate, 0);
+  out[i * 5 + 1] = subgroup_ballot(predicate, 3);
+  out[i * 5 + 2] = (uint32)subgroup_any(predicate);
+  out[i * 5 + 3] = (uint32)subgroup_all(predicate);
+  out[i * 5 + 4] = (uint32)subgroup_all(
+      subgroup_local_id() < subgroup_size());
+}
+
+// Kernel-parameter ABI coverage. CUDA's launch API receives pointers to host
+// values at their natural widths, so the PTX declaration must not widen these
+// to 32 bits and accidentally over-read the argument storage.
+kernel narrow_scalar_abi(i8: int8, u8: uint8, i16: int16, u16: uint16,
+                         flag: bool, out: int32*) {
+  if (flag) {
+    out[0] = (int32)i8 + (int32)u8 + (int32)i16 + (int32)u16;
+  }
+}

@@ -49,7 +49,9 @@ The `std/prelude` module uses the first pattern: it imports common stdlib module
 
 ## Visibility
 
-There is no `private` keyword. A declaration is private by omission when its module uses at least one `export` and that declaration is not marked `export`.
+Module visibility is private by omission when a module uses at least one
+`export`. The `private` keyword is unrelated: inside GPU kernels, `private var`
+selects per-work-item storage and cannot qualify a module declaration.
 
 Use `export` for the API you intend other files to call. Keep helper functions, helper structs, and implementation globals unexported. Plain, namespaced, and selective imports all respect that source-level boundary.
 

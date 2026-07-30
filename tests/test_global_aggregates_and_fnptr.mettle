@@ -1,0 +1,113 @@
+// Global variables beyond the scalar set the direct-object backend used to
+// accept.
+//
+// Previously the backend rejected any non-scalar global outright, which forced
+// every module-level table onto the heap with hand-written index arithmetic.
+// Three separate gaps are covered here:
+//
+//   1. Aggregate globals (arrays and structs), which are just zero-filled .bss
+//      storage of the laid-out size.
+//   2. Function-pointer globals initialized to null. `0` is a valid null
+//      pointer constant for a function pointer exactly as for a data pointer.
+//   3. Globals initialized with the address of another symbol. That value is
+//      only known at link time, so it becomes a relocation rather than a
+//      constant -- and the referenced function has to survive dead-function
+//      elimination, which walks instructions and would not otherwise see it.
+//
+// Exits 55 when everything holds, 1 otherwise.
+
+struct Ent {
+  kind: int32;
+  layer: int32;
+  x: float64;
+  y: float64;
+}
+
+// Aggregate globals.
+var g_ents: Ent[8];
+var g_counts: int32[16];
+var g_single: Ent;
+var g_bytes: uint8[64];
+
+// Scalars must still work alongside them.
+var g_scalar: int32 = 42;
+var g_float: float64 = 1.5;
+
+// Function-pointer globals: null-initialized, and address-initialized.
+var g_null_fn: fn(int32) -> int32 = 0;
+var g_uninit_fn: fn(int32) -> int32;
+
+fn triple(x: int32) -> int32 { return x * 3; }
+fn quadruple(x: int32) -> int32 { return x * 4; }
+
+// Only the global initializer references this one, so it is the case dead
+// function elimination has to keep.
+var g_bound_fn: fn(int32) -> int32 = &triple;
+
+// A data pointer aliasing another global, the same relocation path.
+var g_alias: int32* = &g_scalar;
+
+fn main() -> int32 {
+  // .bss starts zeroed.
+  if (g_ents[3].kind != 0) { return 1; }
+  if (g_counts[5] != 0) { return 1; }
+  if (g_bytes[10] != 0) { return 1; }
+  if (g_single.kind != 0) { return 1; }
+
+  // Aggregate stores, including the correct element stride.
+  var i: int32 = 0;
+  while (i < 8) {
+    g_ents[i].kind = i + 1;
+    g_ents[i].layer = i * 10;
+    g_ents[i].x = (float64)i * 1.5;
+    i = i + 1;
+  }
+  if (g_ents[0].kind != 1) { return 1; }
+  if (g_ents[7].kind != 8) { return 1; }
+  if (g_ents[7].layer != 70) { return 1; }
+  if ((int64)(g_ents[5].x * 100.0) != 750) { return 1; }
+
+  var j: int32 = 0;
+  while (j < 16) {
+    g_counts[j] = j * j;
+    j = j + 1;
+  }
+  if (g_counts[15] != 225) { return 1; }
+
+  g_bytes[0] = 7;
+  g_bytes[63] = 9;
+  if (g_bytes[0] != 7 || g_bytes[63] != 9) { return 1; }
+
+  g_single.kind = 77;
+  if (g_single.kind != 77) { return 1; }
+
+  // Address-of into a global array, and neighbours left intact.
+  var p: Ent* = &g_ents[2];
+  p->kind = 555;
+  if (g_ents[2].kind != 555) { return 1; }
+  if (g_ents[1].kind != 2) { return 1; }
+  if (g_ents[3].kind != 4) { return 1; }
+
+  // Scalars unaffected.
+  if (g_scalar != 42) { return 1; }
+  if ((int64)(g_float * 10.0) != 15) { return 1; }
+
+  // Null function pointer, then assigned and called.
+  if (g_null_fn != 0) { return 1; }
+  g_null_fn = &quadruple;
+  if (g_null_fn(5) != 20) { return 1; }
+
+  // Uninitialized function-pointer global.
+  g_uninit_fn = &triple;
+  if (g_uninit_fn(5) != 15) { return 1; }
+
+  // Address-initialized function pointer, called without ever being reassigned.
+  if (g_bound_fn(7) != 21) { return 1; }
+
+  // Address-initialized data pointer aliases the real global.
+  if (*g_alias != 42) { return 1; }
+  g_scalar = 100;
+  if (*g_alias != 100) { return 1; }
+
+  return 55;
+}

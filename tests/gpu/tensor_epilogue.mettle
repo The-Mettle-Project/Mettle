@@ -1,0 +1,40 @@
+// Target-neutral cooperative post-processing. These kernels deliberately span
+// storage formats, logical layouts, bias broadcasts, runtime dimensions,
+// activations, and both collective scopes. The operation remains a logical
+// MxN memory contract; PTX lane assignment is backend-private.
+kernel tensor_epilogue_f32_column_bias_relu(
+    d: float32*, bias: float32*, alpha: float32, beta: float32) {
+  tensor_epilogue(d, shape: m32n16, element_type: f32,
+                  bias_mode: column, bias: bias,
+                  alpha: alpha, beta: beta, activation: relu);
+}
+
+kernel tensor_epilogue_f32_matrix_bias_clamp_runtime(
+    d: float32*, bias: float32*, alpha: float32, beta: float32,
+    minimum: float32, maximum: float32, ldd: int32, ldbias: uint64) {
+  tensor_epilogue(d, m: 19, n: 37, element_type: f32,
+                  layout: col, ldd: ldd,
+                  bias_mode: matrix, bias: bias,
+                  bias_layout: row, ldbias: ldbias,
+                  alpha: alpha, beta: beta,
+                  activation: clamp,
+                  clamp_min: minimum, clamp_max: maximum,
+                  scope: workgroup);
+}
+
+kernel tensor_epilogue_f64_row_bias(
+    d: float64*, bias: float64*, beta: float64) {
+  tensor_epilogue(d, shape: m8n13, element_type: f64,
+                  bias_mode: row, bias: bias, beta: beta,
+                  activation: identity);
+}
+
+kernel tensor_epilogue_f16_identity(d: uint16*) {
+  tensor_epilogue(d, shape: m16n16, element_type: f16);
+}
+
+kernel tensor_epilogue_bf16_column_bias_relu(d: uint16*, bias: uint16*) {
+  tensor_epilogue(d, shape: m16n32, element_type: bf16,
+                  layout: col, bias_mode: column, bias: bias,
+                  activation: relu);
+}

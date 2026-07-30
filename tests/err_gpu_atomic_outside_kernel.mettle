@@ -1,0 +1,3 @@
+fn invalid(counter: uint32*) -> uint32 {
+  return atomic_fetch_add(counter, 0, 1);
+}

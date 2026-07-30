@@ -1,0 +1,17 @@
+kernel uniform_collectives(flag: int32, value: uint32, output: uint32*) {
+  if (flag != 0) {
+    barrier(workgroup, acq_rel);
+  }
+
+  var width: uint32 = subgroup_size();
+  if (width > 0) {
+    var sum: uint32 = subgroup_reduce_add(value);
+    if (subgroup_local_id() == 0) {
+      output[block.x] = sum;
+    }
+  }
+
+  if (block.x >= 0) {
+    barrier(workgroup, global, seq_cst);
+  }
+}

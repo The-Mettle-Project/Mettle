@@ -29,7 +29,12 @@ typedef struct {
   int debug_mode;
   int dump_ir;
   int ml_opt; /* --ml-opt: run the learned ML optimizer pass on the IR */
-  int emit_ptx; /* --emit-ptx: lower every function to a PTX .entry, no object */
+  int emit_ptx; /* --emit-ptx: lower declared kernels to PTX .entry, no object */
+  const char *ptx_target; /* backend-only target such as sm_121a */
+  int ptx_isa_major;
+  int ptx_isa_minor;
+  int ptx_tensor_tuple_budget; /* 0=arch default; backend-only residency knob */
+  int emit_spirv; /* --emit-spirv: lower declared kernels to SPIR-V, no object */
   int emit_arm64; /* --emit-arm64: lower scalar functions to an AArch64 ELF */
   int optimize;
   int release;

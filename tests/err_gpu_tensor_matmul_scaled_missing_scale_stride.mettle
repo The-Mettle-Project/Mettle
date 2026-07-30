@@ -1,0 +1,17 @@
+kernel invalid_scaled_whole_matrix(
+    a: uint8*, b: uint8*, c: float32*, d: float32*,
+    a_scale: uint8*, b_scale: uint8*,
+    row: uint32, column: uint32,
+    m: uint32, n: uint32, k: uint32,
+    lda: uint32, ldb: uint32, ldc: uint32, ldd: uint32) {
+  tensor_matmul(
+      a, b, c, d, row, column, m, n, k,
+      shape: m16n16k32,
+      a_type: e3m2, b_type: e2m3,
+      accumulator_type: f32, result_type: f32,
+      a_packing: dense_subbyte, b_packing: dense_subbyte,
+      a_scale_mode: block32, b_scale_mode: block32,
+      a_scale_type: ue8m0, b_scale_type: ue8m0,
+      a_scale: a_scale, b_scale: b_scale,
+      lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+}

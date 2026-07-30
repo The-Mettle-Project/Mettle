@@ -1,5 +1,188 @@
 // AST->IR lowering: lvalue address, symbol assignment, pointer arithmetic.
 #include "ir_lowering_internal.h"
+#include "frontend/mtlc_frontend.h" // mtlc_type_from_frontend
+
+/* Park a local aggregate literal's folded image in the module as a hidden
+ * constant, and hand back its name.
+ *
+ * An aggregate literal is a compile-time constant wherever it appears, so a
+ * local one is the same value a global one would be: laying it out once in the
+ * object file and copying from it beats emitting a store per element, and it
+ * costs nothing when the literal is large. Returns an owned name, or NULL on
+ * failure (with the error already set). */
+static char *ir_intern_aggregate_literal(IRLoweringContext *context,
+                                         ASTNode *literal_node,
+                                         Type *dest_type) {
+  AggregateLiteral *literal =
+      literal_node && literal_node->type == AST_AGGREGATE_LITERAL
+          ? (AggregateLiteral *)literal_node->data
+          : NULL;
+
+  if (!context || !context->program || !literal || !literal->image ||
+      !dest_type) {
+    ir_set_error(context, "Aggregate literal reached lowering without a folded "
+                          "constant image");
+    return NULL;
+  }
+
+  char *name = ir_new_label_name(context, "agg_const");
+  if (!name) {
+    ir_set_error(context, "Out of memory while interning aggregate literal");
+    return NULL;
+  }
+
+  IRInitReloc *relocs = NULL;
+  if (literal->reloc_count > 0) {
+    relocs = calloc(literal->reloc_count, sizeof(IRInitReloc));
+    if (!relocs) {
+      free(name);
+      ir_set_error(context, "Out of memory while interning aggregate literal");
+      return NULL;
+    }
+    for (size_t i = 0; i < literal->reloc_count; i++) {
+      relocs[i].offset = literal->relocs[i].offset;
+      relocs[i].symbol = literal->relocs[i].symbol;
+      relocs[i].string = literal->relocs[i].string;
+      relocs[i].string_wants_record = literal->relocs[i].string_wants_record;
+    }
+  }
+
+  IRModuleSymbol entry = {0};
+  entry.name = name;
+  entry.kind = IR_MODSYM_VARIABLE;
+  entry.type = mtlc_type_from_frontend(dest_type);
+  entry.init_bytes = literal->image;
+  entry.init_bytes_size = literal->image_size;
+  entry.init_relocs = relocs;
+  entry.init_reloc_count = literal->reloc_count;
+  IRModuleSymbol *added = ir_program_add_symbol(context->program, &entry);
+  free(relocs); /* the program deep-copied them */
+  if (!added) {
+    free(name);
+    ir_set_error(context, "Out of memory while interning aggregate literal");
+    return NULL;
+  }
+  return name;
+}
+
+int ir_emit_aggregate_literal_copy(IRLoweringContext *context,
+                                   IRFunction *function,
+                                   const IROperand *dest_address,
+                                   ASTNode *literal_node, Type *dest_type,
+                                   SourceLocation location) {
+  if (!context || !function || !dest_address || !dest_type ||
+      dest_type->size == 0 || dest_type->size > (size_t)INT_MAX) {
+    ir_set_error(context, "Cannot copy aggregate literal into a target of "
+                          "unknown size");
+    return 0;
+  }
+
+  char *source_name = ir_intern_aggregate_literal(context, literal_node,
+                                                  dest_type);
+  if (!source_name) {
+    return 0;
+  }
+
+  IROperand source_address = ir_operand_none();
+  if (!ir_emit_address_of_symbol(context, function, source_name, location,
+                                 &source_address)) {
+    free(source_name);
+    return 0;
+  }
+  free(source_name);
+
+  /* A block move is spelled as a STORE whose value operand is the source
+   * ADDRESS, which the backend only reads that way past one machine word. An
+   * aggregate that is exactly one machine load wide goes through a register
+   * instead: load the word, then store it.
+   *
+   * Only 1/2/4/8 qualify. A 3-, 5-, 6-, or 7-byte aggregate (`struct Rgb { r:
+   * uint8; g: uint8; b: uint8; }`) has no single load that covers it exactly --
+   * widening to the next power of two would read past the object and, on the
+   * store side, clobber whatever follows it -- so it takes the block move,
+   * which is byte-exact for any size. */
+  IROperand value = source_address;
+  if (dest_type->size == 1 || dest_type->size == 2 || dest_type->size == 4 ||
+      dest_type->size == 8) {
+    IROperand loaded = ir_operand_none();
+    if (!ir_make_temp_operand(context, &loaded)) {
+      ir_operand_destroy(&source_address);
+      return 0;
+    }
+    IRInstruction load = {0};
+    load.op = IR_OP_LOAD;
+    load.location = location;
+    load.dest = loaded;
+    load.lhs = source_address;
+    load.rhs = ir_operand_int((long long)dest_type->size);
+    if (!ir_emit(context, function, &load)) {
+      ir_operand_destroy(&loaded);
+      ir_operand_destroy(&source_address);
+      return 0;
+    }
+    ir_operand_destroy(&source_address);
+    value = loaded;
+  }
+
+  IRInstruction store = {0};
+  store.op = IR_OP_STORE;
+  store.location = location;
+  store.dest = ir_clone_operand_local(dest_address);
+  store.lhs = value;
+  store.rhs = ir_operand_int((long long)dest_type->size);
+  int ok = ir_emit(context, function, &store);
+  ir_operand_destroy(&store.dest);
+  ir_operand_destroy(&value);
+  return ok;
+}
+
+int ir_emit_aggregate_literal_copy_to_symbol(IRLoweringContext *context,
+                                             IRFunction *function,
+                                             const char *dest_name,
+                                             ASTNode *literal_node,
+                                             Type *dest_type,
+                                             SourceLocation location) {
+  IROperand dest_address = ir_operand_none();
+  if (!ir_emit_address_of_symbol(context, function, dest_name, location,
+                                 &dest_address)) {
+    return 0;
+  }
+  int ok = ir_emit_aggregate_literal_copy(context, function, &dest_address,
+                                          literal_node, dest_type, location);
+  ir_operand_destroy(&dest_address);
+  return ok;
+}
+
+/* The frontend's nested scopes have been popped by IR lowering time. The IR
+ * declaration stream is therefore the authoritative scoped record for whether
+ * an array-shaped source binding already IS an address-space pointer (rather
+ * than inline host storage whose address must be taken). Scan backwards so a
+ * later shadowing declaration wins. */
+static int ir_symbol_is_address_space_allocation(const IRFunction *function,
+                                                 const char *name) {
+  if (!function || !name) return 0;
+  for (size_t i = function->instruction_count; i-- > 0;) {
+    const IRInstruction *instruction = &function->instructions[i];
+    if ((instruction->op != IR_OP_ADDRESS_SPACE_ALLOC &&
+         instruction->op != IR_OP_DECLARE_LOCAL) ||
+        instruction->dest.kind != IR_OPERAND_SYMBOL ||
+        !instruction->dest.name || strcmp(instruction->dest.name, name) != 0) {
+      continue;
+    }
+    return instruction->op == IR_OP_ADDRESS_SPACE_ALLOC;
+  }
+  return 0;
+}
+
+static int ir_expression_is_address_space_allocation(
+    const IRFunction *function, const ASTNode *expression) {
+  if (!expression || expression->type != AST_IDENTIFIER || !expression->data) {
+    return 0;
+  }
+  const Identifier *identifier = (const Identifier *)expression->data;
+  return identifier->name &&
+         ir_symbol_is_address_space_allocation(function, identifier->name);
+}
 
 int ir_emit_local_declaration(IRLoweringContext *context,
                                      IRFunction *function,
@@ -107,6 +290,80 @@ int ir_try_emit_aggregate_symbol_memcpy(
   }
 }
 
+/* Gives an aggregate value a home that has an address.
+ *
+ * The wide-copy paths below build their source operand with
+ * ir_emit_address_of_symbol, so they need the value to be a named symbol. A
+ * call returning a struct yields a temp instead, which has no address to copy
+ * from -- so those paths declined and the caller fell back to a single
+ * word-sized store, dropping everything past the first 8 bytes. That is what
+ * corrupted `cfg.rect = ui_rect_xywh(...)`: the rect arrived as a temp, only
+ * its first word landed in the field, and controls were then created from
+ * garbage width and height.
+ *
+ * Spilling through a fresh local uses only paths already known good: symbol
+ * assignment moves a whole aggregate correctly, and the local then supplies the
+ * address the wide store needs. Returns 1 and fills `out_symbol` when a spill
+ * happened, 0 when the value was already usable or cannot be spilled. */
+static int ir_spill_aggregate_value_to_local(IRLoweringContext *context,
+                                             IRFunction *function,
+                                             const IROperand *value,
+                                             Type *dest_type,
+                                             SourceLocation location,
+                                             IROperand *out_symbol) {
+  char *name = NULL;
+  IRInstruction assign = {0};
+  int ok = 0;
+
+  if (!context || !function || !value || !dest_type || !out_symbol) {
+    return 0;
+  }
+  if (value->kind == IR_OPERAND_SYMBOL) {
+    return 0;               /* already addressable */
+  }
+  if (value->kind != IR_OPERAND_TEMP || !dest_type->name) {
+    return 0;
+  }
+
+  name = ir_new_label_name(context, "agg_ret");
+  if (!name) {
+    ir_set_error(context, "Out of memory while spilling aggregate value");
+    return 0;
+  }
+  if (!ir_emit_local_declaration(context, function, name, dest_type->name,
+                                 location)) {
+    free(name);
+    return 0;
+  }
+
+  assign.op = IR_OP_ASSIGN;
+  assign.location = location;
+  assign.dest = ir_operand_symbol(name);
+  assign.lhs = ir_clone_operand_local(value);
+  if (!assign.dest.name || assign.lhs.kind == IR_OPERAND_NONE) {
+    ir_operand_destroy(&assign.dest);
+    ir_operand_destroy(&assign.lhs);
+    free(name);
+    ir_set_error(context, "Out of memory while spilling aggregate value");
+    return 0;
+  }
+  ok = ir_emit(context, function, &assign);
+  ir_operand_destroy(&assign.dest);
+  ir_operand_destroy(&assign.lhs);
+  if (!ok) {
+    free(name);
+    return 0;
+  }
+
+  *out_symbol = ir_operand_symbol(name);
+  free(name);
+  if (!out_symbol->name) {
+    ir_set_error(context, "Out of memory while spilling aggregate value");
+    return 0;
+  }
+  return 1;
+}
+
 /* Whole-struct copy into an arbitrary lvalue address (e.g. `cfg.rect = r;`).
  *
  * Mirrors ir_try_emit_aggregate_symbol_memcpy, but the destination is an
@@ -123,9 +380,6 @@ int ir_try_emit_aggregate_address_memcpy(IRLoweringContext *context,
   if (!context || !function || !dest_addr || !value) {
     return 0;
   }
-  if (value->kind != IR_OPERAND_SYMBOL || !value->name) {
-    return 0;
-  }
   if (!dest_type || dest_type->kind != TYPE_STRUCT) {
     return 0;
   }
@@ -138,17 +392,32 @@ int ir_try_emit_aggregate_address_memcpy(IRLoweringContext *context,
   }
 
   {
+    IROperand spilled = ir_operand_none();
+    const IROperand *source = value;
     IROperand src_addr = ir_operand_none();
-    IROperand dest_copy = ir_clone_operand_local(dest_addr);
+    IROperand dest_copy = ir_operand_none();
     IRInstruction store = {0};
     int ok = 0;
 
-    if (dest_copy.kind == IR_OPERAND_NONE) {
+    /* A call result arrives as a temp, which has no address to copy from. */
+    if (ir_spill_aggregate_value_to_local(context, function, value, dest_type,
+                                          location, &spilled)) {
+      source = &spilled;
+    }
+    if (source->kind != IR_OPERAND_SYMBOL || !source->name) {
+      ir_operand_destroy(&spilled);
       return 0;
     }
-    if (!ir_emit_address_of_symbol(context, function, value->name, location,
+
+    dest_copy = ir_clone_operand_local(dest_addr);
+    if (dest_copy.kind == IR_OPERAND_NONE) {
+      ir_operand_destroy(&spilled);
+      return 0;
+    }
+    if (!ir_emit_address_of_symbol(context, function, source->name, location,
                                    &src_addr)) {
       ir_operand_destroy(&dest_copy);
+      ir_operand_destroy(&spilled);
       return 0;
     }
 
@@ -160,6 +429,7 @@ int ir_try_emit_aggregate_address_memcpy(IRLoweringContext *context,
     ok = ir_emit(context, function, &store);
     ir_operand_destroy(&dest_copy);
     ir_operand_destroy(&src_addr);
+    ir_operand_destroy(&spilled);
     return ok;
   }
 }
@@ -635,7 +905,14 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
     IROperand base = ir_operand_none();
     IROperand index = ir_operand_none();
     int lowered_base = 0;
-    if (array_type->kind == TYPE_ARRAY) {
+    int is_address_space_allocation =
+        ir_expression_is_address_space_allocation(function,
+                                                  index_expression->array);
+    if (array_type->kind == TYPE_ARRAY && is_address_space_allocation) {
+      /* Workgroup/private arrays lower to pointer-valued storage bindings. */
+      lowered_base =
+          ir_lower_expression(context, function, index_expression->array, &base);
+    } else if (array_type->kind == TYPE_ARRAY) {
       // For inline arrays (including struct fields), indexing must use the
       // address of the array storage, not a loaded value.
       lowered_base = ir_lower_lvalue_address(context, function,
@@ -654,7 +931,7 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
       return 0;
     }
 
-    if (array_type->kind == TYPE_POINTER &&
+    if (array_type->kind == TYPE_POINTER && !is_address_space_allocation &&
         !ir_emit_null_check(context, function, expression->location, &base)) {
       ir_operand_destroy(&base);
       ir_operand_destroy(&index);
@@ -755,8 +1032,68 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
     return 1;
   }
 
-  default:
-    ir_set_error(context, "Expression is not assignable in IR lowering");
-    return 0;
+  default: {
+    /* An aggregate rvalue -- a struct returned by a call, as in
+     * `make_point().x` -- has no storage to point at, so a member or index
+     * access on one had nowhere to read from and this reported "not
+     * assignable". Give it storage: declare a synthetic local of the value's
+     * type, assign the value into it, and hand back that local's address. This
+     * is the same shape the frontend already produces for
+     * `var t: S = make_point(); t.x`, just without the source-level name. */
+    Type *value_type = ir_infer_expression_type(context, expression);
+    if (!value_type || !value_type->name ||
+        (value_type->kind != TYPE_STRUCT && value_type->kind != TYPE_ARRAY)) {
+      ir_set_error(context, "Expression is not assignable in IR lowering");
+      return 0;
+    }
+
+    char temp_local_name[48];
+    snprintf(temp_local_name, sizeof(temp_local_name), ".aggregate_tmp%d",
+             context->next_temp_id++);
+
+    IRInstruction local = {0};
+    local.op = IR_OP_DECLARE_LOCAL;
+    local.location = expression->location;
+    local.dest = ir_operand_symbol(temp_local_name);
+    local.text = value_type->name;
+    local.value_type = mtlc_type_from_frontend(value_type);
+    if (!local.dest.name) {
+      ir_set_error(context, "Out of memory materializing aggregate rvalue");
+      return 0;
+    }
+    int local_ok = ir_emit(context, function, &local);
+    ir_operand_destroy(&local.dest);
+    if (!local_ok) {
+      return 0;
+    }
+
+    IROperand value = ir_operand_none();
+    if (!ir_lower_expression(context, function, expression, &value)) {
+      return 0;
+    }
+
+    IRInstruction assign = {0};
+    assign.op = IR_OP_ASSIGN;
+    assign.location = expression->location;
+    assign.dest = ir_operand_symbol(temp_local_name);
+    assign.lhs = value;
+    if (!assign.dest.name) {
+      ir_operand_destroy(&value);
+      ir_set_error(context, "Out of memory materializing aggregate rvalue");
+      return 0;
+    }
+    int assign_ok = ir_emit(context, function, &assign);
+    ir_operand_destroy(&assign.dest);
+    ir_operand_destroy(&value);
+    if (!assign_ok) {
+      return 0;
+    }
+
+    if (out_type) {
+      *out_type = value_type;
+    }
+    return ir_emit_address_of_symbol(context, function, temp_local_name,
+                                     expression->location, out_address);
+  }
   }
 }

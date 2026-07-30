@@ -1,0 +1,27 @@
+struct Inner { x: int32; y: int32; }
+struct Outer { id: int32; in1: Inner; in2: Inner; }
+struct Node { value: int32; next: Node*; }
+var GRID: Inner[3] = [{ x: 1, y: 2 }, { x: 3, y: 4 }, { x: 5, y: 6 }];
+fn main() -> int32 {
+  var o: Outer = { id: 7, in1: { x: 1, y: 2 }, in2: { x: 3, y: 4 } };
+  if (o.id != 7) { return 1; }
+  if (o.in1.x + o.in1.y + o.in2.x + o.in2.y != 10) { return 2; }
+  o.in2.x = 30;
+  if (o.in2.x != 30) { return 3; }
+  var arr: Outer[2];
+  arr[0].id = 1;
+  arr[0].in1.x = 9;
+  arr[1].id = 2;
+  if (arr[0].id + arr[0].in1.x + arr[1].id != 12) { return 4; }
+  if (GRID[0].x + GRID[1].y + GRID[2].x != 1 + 4 + 5) { return 5; }
+  var a: Node = { value: 1, next: 0 };
+  var b: Node;
+  b.value = 2;
+  b.next = &a;
+  if (b.next->value != 1) { return 6; }
+  var pp: Node* = &b;
+  if (pp->next->value != 1) { return 7; }
+  var ptr: Inner* = &GRID[1];
+  if (ptr->x != 3) { return 8; }
+  return 0;
+}

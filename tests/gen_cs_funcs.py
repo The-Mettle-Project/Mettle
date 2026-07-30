@@ -3,7 +3,7 @@ import sys
 lines = []
 n = int(sys.argv[1]) if len(sys.argv) > 1 else 4000
 for i in range(n):
-    lines.append(f"function f{i}(x: int32) -> int32 {{")
+    lines.append(f"fn f{i}(x: int32) -> int32 {{")
     lines.append(f"    var t: int32 = x + {i};")
     lines.append(f"    t = t * 3;")
     lines.append(f"    t = t ^ {i % 7};")

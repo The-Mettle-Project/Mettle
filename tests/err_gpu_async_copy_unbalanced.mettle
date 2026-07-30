@@ -1,0 +1,5 @@
+kernel unbalanced_async_copy(source: uint32*) {
+  workgroup var destination: uint32[1];
+  async_copy_workgroup(&destination[0], source, 1,
+                       transaction: 4, cache: all);
+}

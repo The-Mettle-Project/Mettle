@@ -1,0 +1,4 @@
+kernel tensor_epilogue_incomplete_clamp(d: float32*, minimum: float32) {
+  tensor_epilogue(d, shape: m16n16, element_type: f32,
+                  activation: clamp, clamp_min: minimum);
+}

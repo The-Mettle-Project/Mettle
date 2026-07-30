@@ -1,6 +1,13 @@
-# Mettle examples
+# Examples
 
-Runnable programs demonstrating the language and serving as the runtime benchmark suite.
+Runnable Mettle programs. Most double as the runtime benchmark suite, pairing a
+`.mettle` implementation against C and Rust versions of the same kernel.
+
+Driving the [libmtlc](https://github.com/The-Mettle-Project/libmtlc) backend from
+a language that is not Mettle is a different exercise, and lives in that
+repository: [`examples/calc`](https://github.com/The-Mettle-Project/libmtlc/tree/main/examples/calc)
+is a tiny C-like language whose entire compiler is one file, using only the
+public `mtlc/` headers.
 
 ## Benchmark examples
 
@@ -61,7 +68,7 @@ Run a single suite:
 
 ## Mettle vs Rust demo
 
-[`mettle_vs_rust/`](mettle_vs_rust/) — single workload in Mettle and Rust with a script that compares **compile time**, **binary size**, and **runtime** side by side. Run `examples\mettle_vs_rust\build.bat`.
+[`mettle_vs_rust/`](mettle_vs_rust/): a single workload in Mettle and Rust with a script that compares **compile time**, **binary size**, and **runtime** side by side. Run `examples\mettle_vs_rust\build.bat`.
 
 ## Other examples
 
@@ -71,7 +78,7 @@ Run a single suite:
 | [`hexdump/`](hexdump/) | Hex dump utility |
 | [`ui_demo/`](ui_demo/) | Win32 UI demo (`std/ui`); see [ui_demo/README.md](ui_demo/README.md) |
 | [`tracy_demo/`](tracy_demo/) | Tracy profiler demo (`std/tracy`); see [tracy_demo/README.md](tracy_demo/README.md) |
-| [`gpu_vadd/`](gpu_vadd/) | GPU offload demo: a `kernel` compiled to PTX and launched with `dispatch` (`std/gpu`); see [docs/gpu.md](../docs/gpu.md) |
+| [`gpu_vadd/`](gpu_vadd/) | GPU offload demo: a `kernel` compiled to PTX (or SPIR-V with `--emit-spirv`) and launched with `dispatch` (`std/gpu`); see [docs/gpu.md](../docs/gpu.md) |
 | [`guessing-game/`](guessing-game/) | Simple interactive game |
 | [`direct_object_smoke/`](direct_object_smoke/) | Direct object backend smoke test |
 

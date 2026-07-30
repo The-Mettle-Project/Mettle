@@ -30,6 +30,7 @@ type_checker_create_with_error_reporter(SymbolTable *symbol_table,
   checker->tracked_scope_capacity = 0;
   checker->tracked_scope_depth = 0;
   checker->tracked_buffer_extents = NULL;
+  checker->aggregate_target_type = NULL;
 
   // Initialize built-in type pointers to NULL
   checker->builtin_int8 = NULL;

@@ -1,0 +1,5 @@
+fn host_subgroup_query() -> uint32 {
+  return subgroup_size();
+}
+
+fn main() -> int32 { return 0; }

@@ -1,9 +1,13 @@
 # Diagnostics
 
-Mettle reports compile problems with rustc-style rich diagnostics: a stable
-error code, the source snippet with the offending range underlined, an inline
-label saying what was expected, attached notes pointing at related code, and a
-concrete `help:` suggestion.
+libmtlc ships a frontend-neutral diagnostics reporter (`src/error`): it renders
+compile problems against raw source text and source positions, with rustc-style
+rich output, a stable error code, the source snippet with the offending range
+underlined, an inline label saying what was expected, attached notes pointing at
+related code, and a concrete `help:` suggestion. It knows nothing about any AST,
+so the Mettle frontend and the backend (for example the compile-time
+interpreter) both report through it. The examples below are from the Mettle
+frontend.
 
 ```
 error[E0003]: Function 'add' expects 2 arguments, got 3
@@ -48,7 +52,10 @@ help: for more about this error, run `mettle explain E0003`
 - Memory-safety warnings and errors (`M0101`..`M0112`): use-after-free,
   double free, leaks, out-of-bounds constant indexing, escaping stack
   addresses, and borrow-checker lifetime findings. See
-  [borrow-checker.md](borrow-checker.md).
+  [borrow-checker.md](borrow-checker.md). `M0101` and `M0102` also cover the
+  aliased forms, where one allocation is reachable under two names and freeing
+  through either invalidates both; the message names the alias rather than
+  using a separate code.
 
 ## `mettle explain <CODE>`
 

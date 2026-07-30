@@ -3,10 +3,24 @@ param(
   [switch]$BuildCompiler,
   [switch]$SkipRuntime,
   [switch]$SkipDeterminism,
-  [int]$FuzzCount = 60
+  [int]$FuzzCount = 60,
+  # The libmtlc dependency. A handful of cases compile backend translation
+  # units directly (the ARM64 encoder, the ML observation parity check) or link
+  # the archive, so they need to know where the backend lives. Everything else
+  # drives bin\mettle.exe and does not care.
+  [string]$LibmtlcDir = $(if ($env:LIBMTLC_DIR) { $env:LIBMTLC_DIR } else { "libmtlc" })
 )
 
 $ErrorActionPreference = "Continue"
+
+# Resolved once; a case that needs the backend skips itself when it is absent
+# rather than failing, so the suite still runs without a fetched dependency.
+$LibmtlcSrc = Join-Path $LibmtlcDir "src"
+$LibmtlcInc = Join-Path $LibmtlcDir "include"
+$LibmtlcLib = @("bin\mtlc.lib", "lib\mtlc.lib", "bin\libmtlc.a", "lib\libmtlc.a") |
+  ForEach-Object { Join-Path $LibmtlcDir $_ } |
+  Where-Object { Test-Path $_ } | Select-Object -First 1
+$HaveLibmtlcSrc = Test-Path (Join-Path $LibmtlcSrc "ir\ir.h")
 
 function Write-CaseResult {
   param(
@@ -147,6 +161,12 @@ $cases = @(
   @{
     Name          = "gpu_dispatch"
     Path          = "tests/test_gpu_dispatch.mettle"
+    ShouldSucceed = $true
+    Args          = @("--emit-obj")
+  },
+  @{
+    Name          = "gpu_dispatch_host_abi"
+    Path          = "tests/test_gpu_dispatch_host_abi.mettle"
     ShouldSucceed = $true
     Args          = @("--emit-obj")
   },
@@ -328,6 +348,37 @@ $cases = @(
     Args          = @("-O")
   },
   @{
+    # Aggregate literals are compile-time constants: a call in an element has
+    # no bytes to lay out, and there is no module initializer to run it in.
+    Name          = "err_aggregate_literal_runtime"
+    Path          = "tests/err_aggregate_literal_runtime.mettle"
+    ShouldSucceed = $false
+    Pattern       = 'aggregate literal elements must be compile-time constants'
+  },
+  @{
+    # A global aggregate needs a literal. This used to reach the backend and
+    # surface as an internal compiler error with no source line.
+    Name          = "err_aggregate_global_call"
+    Path          = "tests/err_aggregate_global_call.mettle"
+    ShouldSucceed = $false
+    Pattern       = 'a global of aggregate type must be initialized with an aggregate literal'
+  },
+  @{
+    # Shape check: too many elements do not spill past the array's end.
+    Name          = "err_aggregate_literal_shape"
+    Path          = "tests/err_aggregate_literal_shape.mettle"
+    ShouldSucceed = $false
+    Pattern       = "4 elements do not fit 'int32\[3\]', which holds 3"
+  },
+  @{
+    # Struct literals name their fields, so a misspelling is caught here rather
+    # than landing at whatever offset came next.
+    Name          = "err_aggregate_literal_field"
+    Path          = "tests/err_aggregate_literal_field.mettle"
+    ShouldSucceed = $false
+    Pattern       = "struct 'Pt' has no field 'z'"
+  },
+  @{
     # Memory diagnostics: returning the address of a stack local is an error.
     Name          = "err_mem_return_stack"
     Path          = "tests/err_mem_return_stack.mettle"
@@ -461,7 +512,7 @@ $cases = @(
     )
   },
   @{
-    # Use-after-move (M0113): `q = p` aliases one allocation under two names, so
+    # Use-after-move: `q = p` aliases one allocation under two names, so
     # freeing or reallocating either invalidates the other -- ownership tracked
     # through pointer copies the way Rust tracks moves, but on raw pointers. The
     # clean controls re-point the alias or read it before the free, and stay
@@ -625,6 +676,27 @@ $cases = @(
   @{ Name = "err_const_no_init"; Path = "tests/err_const_no_init.mettle"; ShouldSucceed = $false; Pattern = "Constant declaration requires an initializer" },
   @{ Name = "err_const_assign"; Path = "tests/err_const_assign.mettle"; ShouldSucceed = $false; Pattern = "is a constant and cannot be assigned to" },
   @{ Name = "err_const_nonconst"; Path = "tests/err_const_nonconst.mettle"; ShouldSucceed = $false; Pattern = "compile-time integer constant expression" },
+  # A global is laid out at compile time and there is no module initializer, so a
+  # run-time initializer must be a diagnostic with a source location - it used to
+  # reach the direct-object backend and abort as an internal compiler error.
+  @{ Name = "err_aggregate_address_of_local"; Path = "tests/err_aggregate_address_of_local.mettle"; ShouldSucceed = $false
+     Pattern = "is a local, so its address is only known at run time"
+     OutputMustNotMatch = @("Relocation refers to an undefined symbol") },
+  @{ Name = "err_global_init_call"; Path = "tests/err_global_init_call.mettle"; ShouldSucceed = $false
+     Pattern = "a global's initializer must be known at compile time"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_global_init_new"; Path = "tests/err_global_init_new.mettle"; ShouldSucceed = $false
+     Pattern = "a global's initializer must be known at compile time"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_global_init_extern"; Path = "tests/err_global_init_extern.mettle"; ShouldSucceed = $false
+     Pattern = "a global's initializer must be known at compile time"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_global_init_string_concat"; Path = "tests/err_global_init_string_concat.mettle"; ShouldSucceed = $false
+     Pattern = "a global's initializer must be known at compile time"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_global_init_address_arith"; Path = "tests/err_global_init_address_arith.mettle"; ShouldSucceed = $false
+     Pattern = "a global's initializer must be known at compile time"
+     OutputMustNotMatch = @("internal compiler error") },
   @{ Name = "err_import_guard_bad_platform"; Path = "tests/err_import_guard_bad_platform.mettle"; ShouldSucceed = $false; Pattern = "Import guard platform must be 'windows' or 'linux'" },
   @{ Name = "block_comment"; Path = "tests/test_block_comment.mettle"; ShouldSucceed = $true },
   @{ Name = "compound_assign"; Path = "tests/test_compound_assign.mettle"; ShouldSucceed = $true },
@@ -946,6 +1018,25 @@ $cases = @(
     ShouldSucceed = $true
     Args          = @("-O")
     IrMustNotMatch = @("jump ir_while")
+  },
+  @{
+    # The range analysis replaced a family of loop-shaped and use-shaped
+    # special cases, so this pins what it now proves GENERALLY: a divide under
+    # any dominating guard (on either side of the `if`), a remainder on an
+    # unsigned parameter, a mask the value cannot reach outside of, a
+    # comparison the bounds already decide, and a counter that starts at zero.
+    Name          = "opt_value_range"
+    Path          = "tests/codegen/value_range.mettle"
+    ShouldSucceed = $true
+    Args          = @("-O")
+    IrMustMatch   = @("%\.?t[0-9]+ = @n >> 3",      # guarded_div: `if (n >= 0) n / 8`
+                      "%\.?t[0-9]+ = @n & 15",      # guarded_mod: `if (n > 0) n % 16`
+                      "%\.?t[0-9]+ = @u >> 6",      # unsigned_div: uint32 / 64
+                      "%\.?t[0-9]+ = @u & 63",      # unsigned_mod: uint32 % 64
+                      "%\.?t[0-9]+ = @n >> 5",      # shift_chain: else-side guard, merged
+                      "%\.?t[0-9]+ = @i & 3")       # counter_mod: monotone counter
+    # decided(): every comparison against a uint16 is settled by its type.
+    IrMustNotMatch = @("%\.?t[0-9]+ = @u < 0", "%\.?t[0-9]+ = @u > 100000")
   },
   @{
     Name          = "opt_mod_even_check"
@@ -1278,6 +1369,111 @@ $cases = @(
   @{ Name = "member_through_ptr"; Path = "tests/err_codegen_member_expr.mettle"; ShouldSucceed = $true },
   @{ Name = "err_function_arg_count"; Path = "tests/err_function_arg_count.mettle"; ShouldSucceed = $false; Pattern = "expects .* arguments, got" },
   @{ Name = "err_function_arg_type"; Path = "tests/err_function_arg_type.mettle"; ShouldSucceed = $false; Pattern = "Type mismatch" },
+  @{ Name = "err_gpu_kernel_return"; Path = "tests/err_gpu_kernel_return.mettle"; ShouldSucceed = $false; Pattern = "GPU kernel 'invalid_result' must return void" },
+  @{ Name = "err_gpu_kernel_abi"; Path = "tests/err_gpu_kernel_abi.mettle"; ShouldSucceed = $false; Pattern = "GPU kernel 'invalid_parameter' parameter 'pair' has unsupported ABI type 'Pair'" },
+  @{ Name = "err_gpu_no_kernel"; Path = "tests/err_gpu_no_kernel.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "GPU module has no kernel entry points" },
+  @{ Name = "err_gpu_recursive_device_call"; Path = "tests/err_gpu_recursive_device_call.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "GPU device call graph is recursive at 'recurse'" },
+  @{ Name = "err_gpu_recursive_device_call_spirv"; Path = "tests/err_gpu_recursive_device_call.mettle"; ShouldSucceed = $false; Args = @("--emit-spirv"); Pattern = "GPU device call graph is recursive at 'recurse'" },
+  @{ Name = "err_gpu_external_device_call"; Path = "tests/err_gpu_external_device_call.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "calls external or missing 'host_only'" },
+  @{ Name = "err_gpu_indirect_device_call"; Path = "tests/err_gpu_indirect_device_call.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "contains an indirect call" },
+  @{ Name = "err_gpu_direct_kernel_call"; Path = "tests/err_gpu_direct_kernel_call.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "directly calls kernel 'child'" },
+  @{ Name = "err_gpu_launch_dimension"; Path = "tests/err_gpu_launch_dimension.mettle"; ShouldSucceed = $false; Pattern = "integer GPU launch dimension" },
+  @{ Name = "err_gpu_launch_argument"; Path = "tests/err_gpu_launch_argument.mettle"; ShouldSucceed = $false; Pattern = "GPU launch argument 0 has unsupported ABI type 'string'" },
+  @{ Name = "err_gpu_dispatch_named_missing"; Path = "tests/err_gpu_dispatch_named_missing.mettle"; ShouldSucceed = $false; Pattern = "Named dispatch controls require grid and block" },
+  @{ Name = "err_gpu_dispatch_named_duplicate"; Path = "tests/err_gpu_dispatch_named_duplicate.mettle"; ShouldSucceed = $false; Pattern = "Duplicate named dispatch control" },
+  @{ Name = "err_gpu_dispatch_named_unknown"; Path = "tests/err_gpu_dispatch_named_unknown.mettle"; ShouldSucceed = $false; Pattern = "Unknown named dispatch control" },
+  @{ Name = "err_gpu_dispatch_named_shared_type"; Path = "tests/err_gpu_dispatch_named_shared_type.mettle"; ShouldSucceed = $false; Pattern = "integer dynamic shared-memory byte count" },
+  @{ Name = "err_gpu_dispatch_named_dimension"; Path = "tests/err_gpu_dispatch_named_dimension.mettle"; ShouldSucceed = $false; Pattern = "GPU grid dimension 1 must be greater than zero" },
+  @{ Name = "err_gpu_dispatch_named_stream_type"; Path = "tests/err_gpu_dispatch_named_stream_type.mettle"; ShouldSucceed = $false; Pattern = "integer or pointer stream handle" },
+  @{ Name = "err_gpu_nested_launch"; Path = "tests/err_gpu_nested_launch.mettle"; ShouldSucceed = $false; Pattern = "GPU kernel cannot launch another kernel" },
+  @{ Name = "err_gpu_workgroup_outside_kernel"; Path = "tests/err_gpu_workgroup_outside_kernel.mettle"; ShouldSucceed = $false; Pattern = "workgroup storage is only legal inside a GPU kernel" },
+  @{ Name = "err_gpu_address_space_shape"; Path = "tests/err_gpu_address_space_shape.mettle"; ShouldSucceed = $false; Pattern = "GPU address-space storage requires a statically sized array type" },
+  @{ Name = "err_gpu_dynamic_private"; Path = "tests/err_gpu_dynamic_private.mettle"; ShouldSucceed = $false; Pattern = "pointer type for a dynamic workgroup view" },
+  @{ Name = "err_gpu_address_space_initializer"; Path = "tests/err_gpu_address_space_initializer.mettle"; ShouldSucceed = $false; Pattern = "workgroup storage cannot have a declaration initializer" },
+  @{ Name = "err_gpu_address_space_rebind"; Path = "tests/err_gpu_address_space_rebind.mettle"; ShouldSucceed = $false; Pattern = "GPU address-space binding 'scratch' cannot be rebound" },
+  @{ Name = "err_gpu_barrier_outside_kernel"; Path = "tests/err_gpu_barrier_outside_kernel.mettle"; ShouldSucceed = $false; Pattern = "Barrier statements are only legal inside a GPU kernel" },
+  @{ Name = "err_gpu_subgroup_signature"; Path = "tests/err_gpu_subgroup_signature.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "invalid subgroup intrinsic signature" },
+  @{ Name = "err_gpu_subgroup_outside_kernel"; Path = "tests/err_gpu_subgroup_outside_kernel.mettle"; ShouldSucceed = $false; Pattern = "Subgroup built-ins are only legal directly inside a GPU kernel" },
+  @{ Name = "err_gpu_subgroup_type"; Path = "tests/err_gpu_subgroup_type.mettle"; ShouldSucceed = $false; Pattern = "Subgroup 'reduce_add' value must be uint32 or float32" },
+  @{ Name = "err_gpu_subgroup_vote_type"; Path = "tests/err_gpu_subgroup_vote_type.mettle"; ShouldSucceed = $false; Pattern = "Subgroup 'any' predicate must be bool" },
+  @{ Name = "err_gpu_subgroup_ballot_word"; Path = "tests/err_gpu_subgroup_ballot_word.mettle"; ShouldSucceed = $false; Pattern = "Subgroup ballot word index must be an integer" },
+  @{ Name = "err_gpu_subgroup_shuffle_type"; Path = "tests/err_gpu_subgroup_shuffle_type.mettle"; ShouldSucceed = $false; Pattern = "Subgroup 'shuffle' value must be uint32 or float32" },
+  @{ Name = "err_gpu_subgroup_shuffle_spirv"; Path = "tests/gpu/subgroup_shuffle.mettle"; ShouldSucceed = $false; Args = @("--emit-spirv"); Pattern = "SPIR-V OpenCL 2.0 does not provide non-uniform subgroup shuffle" },
+  @{ Name = "err_gpu_atomic_outside_kernel"; Path = "tests/err_gpu_atomic_outside_kernel.mettle"; ShouldSucceed = $false; Pattern = "Atomic GPU built-ins are only legal directly inside a GPU kernel" },
+  @{ Name = "err_gpu_atomic_type"; Path = "tests/err_gpu_atomic_type.mettle"; ShouldSucceed = $false; Pattern = "Atomic storage must be a uint32\* or uint64\*" },
+  @{ Name = "err_gpu_atomic_failure_order"; Path = "tests/err_gpu_atomic_failure_order.mettle"; ShouldSucceed = $false; Pattern = "failure_order may not be release/acq_rel or stronger than success order" },
+  @{ Name = "err_gpu_atomic_load_order"; Path = "tests/err_gpu_atomic_load_order.mettle"; ShouldSucceed = $false; Pattern = "Atomic load order must be relaxed, acquire, or seq_cst" },
+  @{ Name = "err_gpu_atomic_store_order"; Path = "tests/err_gpu_atomic_store_order.mettle"; ShouldSucceed = $false; Pattern = "Atomic store order must be relaxed, release, or seq_cst" },
+  @{ Name = "err_gpu_atomic_workgroup_scope"; Path = "tests/err_gpu_atomic_workgroup_scope.mettle"; ShouldSucceed = $false; Pattern = "Workgroup atomics cannot request device or system scope" },
+  @{ Name = "err_gpu_divergent_barrier"; Path = "tests/err_gpu_divergent_barrier.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "workgroup barrier is control-dependent on a work-item-varying condition" },
+  @{ Name = "err_gpu_subgroup_uniform_barrier"; Path = "tests/err_gpu_subgroup_uniform_barrier.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "workgroup barrier is control-dependent on a subgroup-uniform but not workgroup-uniform condition" },
+  @{ Name = "err_gpu_divergent_subgroup"; Path = "tests/err_gpu_divergent_subgroup.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "subgroup collective is control-dependent on a work-item-varying condition" },
+  @{ Name = "err_gpu_varying_broadcast_lane"; Path = "tests/err_gpu_varying_broadcast_lane.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "subgroup broadcast source lane is work-item-varying" },
+  @{ Name = "err_gpu_varying_scan_lane"; Path = "tests/err_gpu_varying_scan_lane.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "subgroup broadcast source lane is work-item-varying" },
+  @{ Name = "err_gpu_tensor_outside_kernel"; Path = "tests/err_gpu_tensor_outside_kernel.mettle"; ShouldSucceed = $false; Pattern = "tensor_mma is only legal directly inside a GPU kernel" },
+  @{ Name = "err_gpu_tensor_storage"; Path = "tests/err_gpu_tensor_storage.mettle"; ShouldSucceed = $false; Pattern = "Tensor operand A has storage type 'float32\*' incompatible" },
+  @{ Name = "err_gpu_tensor_option"; Path = "tests/err_gpu_tensor_option.mettle"; ShouldSucceed = $false; Pattern = "Unknown tensor option 'vendor_opcode'" },
+  @{ Name = "err_gpu_tensor_stride_type"; Path = "tests/err_gpu_tensor_stride_type.mettle"; ShouldSucceed = $false; Pattern = "Runtime tensor option 'lda' must have integer type" },
+  @{ Name = "err_gpu_tensor_scale_contract"; Path = "tests/err_gpu_tensor_scale_contract.mettle"; ShouldSucceed = $false; Pattern = "Invalid tensor MMA descriptor" },
+  @{ Name = "err_gpu_tensor_scale_storage"; Path = "tests/err_gpu_tensor_scale_storage.mettle"; ShouldSucceed = $false; Pattern = "Tensor A scale has storage type 'uint32\*' incompatible with its scale format" },
+  @{ Name = "err_gpu_tensor_packing_contract"; Path = "tests/err_gpu_tensor_packing_contract.mettle"; ShouldSucceed = $false; Pattern = "Invalid tensor MMA descriptor" },
+  @{ Name = "err_gpu_divergent_tensor"; Path = "tests/err_gpu_divergent_tensor.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "tensor MMA is control-dependent on a work-item-varying condition" },
+  @{ Name = "err_gpu_varying_tensor_pointer"; Path = "tests/err_gpu_varying_tensor_pointer.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "tensor MMA pointer operand 0 is not subgroup-uniform" },
+  @{ Name = "err_gpu_varying_tensor_stride"; Path = "tests/err_gpu_varying_tensor_stride.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "tensor MMA runtime stride operand 4 is not subgroup-uniform" },
+  @{ Name = "gpu_tensor_matmul_gb10"; Path = "tests/gpu/tensor_matmul.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10") },
+  @{ Name = "gpu_tensor_matmul_fp8_gb10"; Path = "tests/gpu/tensor_matmul_fp8.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10") },
+  @{ Name = "gpu_tensor_matmul_scaled_gb10"; Path = "tests/gpu/tensor_matmul_scaled.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10") },
+  @{ Name = "gpu_tensor_matmul_sparse_gb10"; Path = "tests/gpu/tensor_matmul_sparse.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10") },
+  @{ Name = "err_gpu_tensor_matmul_scaled_missing_scale_stride"; Path = "tests/err_gpu_tensor_matmul_scaled_missing_scale_stride.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx", "--gpu-arch=gb10"); Pattern = "block scales require explicit whole-matrix A/B scale leading dimensions" },
+  @{ Name = "err_gpu_tensor_matmul_missing_stride"; Path = "tests/err_gpu_tensor_matmul_missing_stride.mettle"; ShouldSucceed = $false; Pattern = "tensor_matmul requires explicit lda, ldb, ldc, and ldd" },
+  @{ Name = "err_gpu_tensor_matmul_control_type"; Path = "tests/err_gpu_tensor_matmul_control_type.mettle"; ShouldSucceed = $false; Pattern = "tensor_matmul row origin must have unsigned integer type" },
+  @{ Name = "err_gpu_tensor_matmul_stride_type"; Path = "tests/err_gpu_tensor_matmul_stride_type.mettle"; ShouldSucceed = $false; Pattern = "Runtime tensor_matmul leading dimensions must fit the descriptor's uint32 range" },
+  @{ Name = "err_gpu_tensor_matmul_tf32_tail"; Path = "tests/err_gpu_tensor_matmul_tf32_tail.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx", "--gpu-arch=gb10"); Pattern = "TF32, reduced-precision accumulators, unsupported sparse/scale profiles, and saturating integer tails are rejected" },
+  @{ Name = "gpu_tensor_matmul_transpose_gb10"; Path = "tests/gpu/tensor_matmul_transpose.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10") },
+  @{ Name = "err_gpu_divergent_tensor_matmul"; Path = "tests/err_gpu_divergent_tensor_matmul.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx", "--gpu-arch=gb10"); Pattern = "bounded tensor matrix operation is control-dependent on a work-item-varying condition" },
+  @{ Name = "err_gpu_varying_tensor_matmul_origin"; Path = "tests/err_gpu_varying_tensor_matmul_origin.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx", "--gpu-arch=gb10"); Pattern = "tensor matrix row-origin control operand [0-9]+ is not subgroup-uniform" },
+  @{ Name = "err_gpu_tensor_matmul_spirv_profile"; Path = "tests/gpu/tensor_matmul.mettle"; ShouldSucceed = $false; Args = @("--emit-spirv"); Pattern = "SPIR-V OpenCL 2.0 profile has no exact bounded matrix-region lowering" },
+  @{ Name = "gpu_tensor_epilogue_gb10"; Path = "tests/gpu/tensor_epilogue.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10") },
+  @{ Name = "gpu_tensor_epilogue_fused_gb10"; Path = "tests/gpu/tensor_epilogue_fused.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10") },
+  @{ Name = "gpu_tensor_epilogue_portable"; Path = "tests/gpu/tensor_epilogue_portable.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=portable") },
+  @{ Name = "err_gpu_tensor_epilogue_outside_kernel"; Path = "tests/err_gpu_tensor_epilogue_outside_kernel.mettle"; ShouldSucceed = $false; Pattern = "tensor_epilogue is only legal directly inside a GPU kernel" },
+  @{ Name = "err_gpu_tensor_epilogue_storage"; Path = "tests/err_gpu_tensor_epilogue_storage.mettle"; ShouldSucceed = $false; Pattern = "Tensor epilogue destination storage is incompatible with element_type" },
+  @{ Name = "err_gpu_tensor_epilogue_bias_contract"; Path = "tests/err_gpu_tensor_epilogue_bias_contract.mettle"; ShouldSucceed = $false; Pattern = "bias operand must be present exactly when bias_mode" },
+  @{ Name = "err_gpu_tensor_epilogue_clamp_contract"; Path = "tests/err_gpu_tensor_epilogue_clamp_contract.mettle"; ShouldSucceed = $false; Pattern = "clamp activation requires exactly one clamp_min and one clamp_max" },
+  @{ Name = "err_gpu_tensor_epilogue_scalar_type"; Path = "tests/err_gpu_tensor_epilogue_scalar_type.mettle"; ShouldSucceed = $false; Pattern = "Tensor epilogue alpha must have type float32" },
+  @{ Name = "err_gpu_divergent_tensor_epilogue"; Path = "tests/err_gpu_divergent_tensor_epilogue.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx", "--gpu-arch=gb10"); Pattern = "tensor epilogue is control-dependent on a work-item-varying condition" },
+  @{ Name = "err_gpu_varying_tensor_epilogue_pointer"; Path = "tests/err_gpu_varying_tensor_epilogue_pointer.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx", "--gpu-arch=gb10"); Pattern = "tensor epilogue operand 0 is not subgroup-uniform" },
+  @{ Name = "err_gpu_tensor_epilogue_spirv_profile"; Path = "tests/gpu/tensor_epilogue.mettle"; ShouldSucceed = $false; Args = @("--emit-spirv"); Pattern = "SPIR-V OpenCL 2.0 profile has no exact cooperative tensor-epilogue lowering" },
+  @{ Name = "err_gpu_tensor_spirv_profile"; Path = "tests/gpu/tensor_kernels.mettle"; ShouldSucceed = $false; Args = @("--emit-spirv"); Pattern = "SPIR-V OpenCL 2.0 profile has no cooperative-matrix capability" },
+  @{ Name = "err_gpu_tensor_portable_profile"; Path = "tests/gpu/tensor_kernels.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx", "--gpu-arch=portable"); Pattern = "profile requires PTX 7.0 and sm_80 or newer" },
+  @{ Name = "gpu_tensor_sparse_gb10"; Path = "tests/gpu/tensor_sparse.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10") },
+  @{ Name = "err_gpu_tensor_sparse_portable"; Path = "tests/gpu/tensor_sparse.mettle"; ShouldSucceed = $false; Args = @("-O", "--emit-ptx", "--gpu-arch=portable"); Pattern = "structured-sparse mma\.sp requires PTX 7\.1 and sm_80 or newer" },
+  @{ Name = "err_gpu_tensor_tiled_shape"; Path = "tests/err_gpu_tensor_tiled_shape.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx", "--gpu-arch=gb10"); Pattern = "profile is not a stable PTX WMMA combination" },
+  @{ Name = "err_gpu_tensor_sparse_metadata_type"; Path = "tests/err_gpu_tensor_sparse_metadata_type.mettle"; ShouldSucceed = $false; Pattern = "Tensor metadata operand must be a uint8 pointer" },
+  @{ Name = "err_gpu_tensor_transfer_outside_kernel"; Path = "tests/err_gpu_tensor_transfer_outside_kernel.mettle"; ShouldSucceed = $false; Pattern = "Tensor transfers are only legal directly inside a GPU kernel" },
+  @{ Name = "err_gpu_tensor_transfer_geometry"; Path = "tests/err_gpu_tensor_transfer_geometry.mettle"; ShouldSucceed = $false; Pattern = "requires extent1, stride1, tile1, and coordinate1" },
+  @{ Name = "err_gpu_tensor_transfer_storage"; Path = "tests/err_gpu_tensor_transfer_storage.mettle"; ShouldSucceed = $false; Pattern = "Tensor transfer source and destination pointer storage must match" },
+  @{ Name = "err_gpu_tensor_transfer_rank"; Path = "tests/err_gpu_tensor_transfer_rank.mettle"; ShouldSucceed = $false; Pattern = "option for dimension 1 exceeds rank 1" },
+  @{ Name = "gpu_tensor_transfer_gb10"; Path = "tests/gpu/tensor_transfer.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10") },
+  @{ Name = "gpu_tensor_transfer_portable"; Path = "tests/gpu/tensor_transfer.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=portable") },
+  @{ Name = "err_gpu_tensor_transfer_spirv_profile"; Path = "tests/gpu/tensor_transfer.mettle"; ShouldSucceed = $false; Args = @("--emit-spirv"); Pattern = "SPIR-V OpenCL 2.0 profile has no multidimensional workgroup-transfer lowering" },
+  @{ Name = "err_gpu_async_copy_outside_kernel"; Path = "tests/err_gpu_async_copy_outside_kernel.mettle"; ShouldSucceed = $false; Pattern = "Asynchronous workgroup copies are only legal directly inside a GPU kernel" },
+  @{ Name = "err_gpu_async_copy_transaction"; Path = "tests/err_gpu_async_copy_transaction.mettle"; ShouldSucceed = $false; Pattern = "async copy byte span must be divisible by its transaction size" },
+  @{ Name = "err_gpu_async_copy_unbalanced"; Path = "tests/err_gpu_async_copy_unbalanced.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "invalid asynchronous-copy contract or unbalanced group" },
+  @{ Name = "err_gpu_async_copy_space"; Path = "tests/err_gpu_async_copy_space.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "invalid asynchronous-copy contract or unbalanced group" },
+  @{ Name = "gpu_uniform_collectives"; Path = "tests/gpu/uniform_collectives.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx") },
+  @{ Name = "gpu_hardware_ai_kernels"; Path = "tests/gpu/hardware_kernels.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10") },
+  @{ Name = "gpu_native_fp8"; Path = "tests/gpu/tensor_native_fp8.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10") },
+  @{ Name = "err_gpu_native_fp8_portable"; Path = "tests/gpu/tensor_native_fp8.mettle"; ShouldSucceed = $false; Args = @("-O", "--emit-ptx", "--gpu-arch=portable"); Pattern = "FP8 mma\.sync requires PTX 8\.4 and sm_89 or newer" },
+  @{ Name = "gpu_native_fp4"; Path = "tests/gpu/tensor_native_fp4.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10") },
+  @{ Name = "err_gpu_native_fp4_portable"; Path = "tests/gpu/tensor_native_fp4.mettle"; ShouldSucceed = $false; Args = @("-O", "--emit-ptx", "--gpu-arch=portable"); Pattern = "architecture- or family-specific sm_120a/sm_121a target" },
+  @{ Name = "err_gpu_native_fp4_sm121"; Path = "tests/gpu/tensor_native_fp4.mettle"; ShouldSucceed = $false; Args = @("-O", "--emit-ptx", "--gpu-arch=sm_121"); Pattern = "architecture- or family-specific sm_120a/sm_121a target" },
+  @{ Name = "gpu_native_fp6"; Path = "tests/gpu/tensor_native_fp6.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10") },
+  @{ Name = "err_gpu_native_fp6_portable"; Path = "tests/gpu/tensor_native_fp6.mettle"; ShouldSucceed = $false; Args = @("-O", "--emit-ptx", "--gpu-arch=portable"); Pattern = "architecture- or family-specific sm_120a/sm_121a target" },
+  @{ Name = "err_gpu_native_fp6_sm121"; Path = "tests/gpu/tensor_native_fp6.mettle"; ShouldSucceed = $false; Args = @("-O", "--emit-ptx", "--gpu-arch=sm_121"); Pattern = "architecture- or family-specific sm_120a/sm_121a target" },
+  @{ Name = "gpu_native_indices"; Path = "tests/gpu/native_indices.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx") },
+  @{ Name = "gpu_native_indices_spirv"; Path = "tests/gpu/native_indices.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-spirv") },
+  @{ Name = "err_gpu_ml_optimizer_policy"; Path = "tests/gpu/native_indices.mettle"; ShouldSucceed = $false; Args = @("--ml-opt", "--emit-ptx"); Pattern = "--ml-opt is not target-neutral" },
   @{ Name = "err_match_bad_syntax"; Path = "tests/err_match_bad_syntax.mettle"; ShouldSucceed = $false; Pattern = "Expected .* after 'match'" },
   # Diagnostics quality: multi-error recovery, cascade suppression, notes,
   # caret labels, unused-variable warnings, JSON output.
@@ -1352,6 +1548,15 @@ $cases = @(
   @{ Name = "err_trait_bound_missing_second_impl"; Path = "tests/err_trait_bound_missing_second_impl.mettle"; ShouldSucceed = $false; Pattern = "does not implement trait 'SignedNumber'" },
   @{ Name = "err_trait_method_missing_impl"; Path = "tests/err_trait_method_missing_impl.mettle"; ShouldSucceed = $false; Pattern = "missing trait method 'next_value'" },
   @{ Name = "err_generics_generic_fn_ptr_address"; Path = "tests/err_generics_generic_fn_ptr_address.mettle"; ShouldSucceed = $false; Pattern = "Expected primary expression" },
+  # A `<` comparison whose right side makes the speculative type-argument parse
+  # fail must backtrack without leaving the abandoned parse's diagnostic behind.
+  @{ Name = "generic_call_lt_ambiguity"; Path = "tests/generic_call_lt_ambiguity.mettle"; ShouldSucceed = $true
+     Args = @("test")
+     SkipBinaryCheck = $true
+     OutputMustMatch = @("3 passed")
+     OutputMustNotMatch = @("Expected array size after", "error\[E0002\]") },
+  @{ Name = "generic_call_lt_ambiguity_build"; Path = "tests/generic_call_lt_ambiguity.mettle"; ShouldSucceed = $true
+     OutputMustNotMatch = @("Expected array size after", "error\[E0002\]") },
   @{ Name = "err_member_on_non_struct"; Path = "tests/err_member_on_non_struct.mettle"; ShouldSucceed = $false; Pattern = "Cannot access field on non-struct type" },
   @{ Name = "err_switch_multiple_default"; Path = "tests/err_switch_multiple_default.mettle"; ShouldSucceed = $false; Pattern = "Only one default case is allowed|only contain one default clause" },
   @{ Name = "err_return_type_mismatch"; Path = "tests/err_return_type_mismatch.mettle"; ShouldSucceed = $false; Pattern = "Type mismatch" },
@@ -1485,10 +1690,16 @@ foreach ($case in $cases) {
         }
         $usesEmitObj = $caseArgs -contains "--emit-obj"
 
-        $binaryCheck = Test-BinaryOutput -BinaryPath $outFile
-        if (-not $binaryCheck.Passed) {
-          $passed = $false
-          $reason = $binaryCheck.Reason
+        # `mettle test` and `mettle trace` run in the compiler's interpreter and
+        # emit no artifact, so a passing case in those modes has no binary to
+        # check. SkipBinaryCheck lets such a case assert on output alone.
+        $skipBinaryCheck = $case.ContainsKey("SkipBinaryCheck") -and $case.SkipBinaryCheck
+        if (-not $skipBinaryCheck) {
+          $binaryCheck = Test-BinaryOutput -BinaryPath $outFile
+          if (-not $binaryCheck.Passed) {
+            $passed = $false
+            $reason = $binaryCheck.Reason
+          }
         }
         if ($passed) {
           foreach ($pattern in $requiredOutputPatterns) {
@@ -1575,7 +1786,7 @@ foreach ($case in $cases) {
             }
           }
         }
-        if ($passed -and -not $SkipDeterminism -and
+        if ($passed -and -not $SkipDeterminism -and -not $skipBinaryCheck -and
             -not ($case.ContainsKey("SkipDeterminism") -and $case.SkipDeterminism)) {
           $outFile2 = Join-Path $tmpDir ("{0}.second.obj" -f $case.Name)
           if (Test-Path $outFile2) {
@@ -1773,6 +1984,174 @@ catch {
   Write-CaseResult -Name "decorators" -Passed $false -Reason $_.Exception.Message
 }
 
+# --ml-opt translation-validation gate: every model disposition is executed
+# through the reference interpreter before it stands. A clean run and a
+# speculative run (model dead-code deletes) must never change program
+# behavior, and a hand-injected wrong disposition must be rejected with a
+# counterexample while the binary stays correct.
+$total++
+try {
+  $mlBase = Join-Path $tmpDir "ml_gate_base.exe"
+  $buildOut = & $CompilerPath --build --release "tests\ml_gate.mettle" -o $mlBase 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "ml_gate baseline build failed: $buildOut"
+  }
+  & $mlBase 2>&1 | Out-Null
+  $mlBaseExit = $LASTEXITCODE
+
+  $mlExe = Join-Path $tmpDir "ml_gate_ml.exe"
+  $buildOut = & $CompilerPath --build --release --ml-opt "tests\ml_gate.mettle" -o $mlExe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "ml_gate --ml-opt build failed: $buildOut"
+  }
+  if ($buildOut -notmatch "--ml-opt:") {
+    throw "ml_gate --ml-opt summary line missing"
+  }
+  & $mlExe 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne $mlBaseExit) {
+    throw "--ml-opt changed program behavior: exit $LASTEXITCODE vs baseline $mlBaseExit"
+  }
+
+  $mlSpec = Join-Path $tmpDir "ml_gate_spec.exe"
+  $buildOut = & $CompilerPath --build --release --ml-opt-speculative "tests\ml_gate.mettle" -o $mlSpec 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "ml_gate --ml-opt-speculative build failed: $buildOut"
+  }
+  & $mlSpec 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne $mlBaseExit) {
+    throw "--ml-opt-speculative changed program behavior: exit $LASTEXITCODE vs baseline $mlBaseExit"
+  }
+
+  # Inject two wrong dispositions resolved from the post-classical IR dump: a
+  # CONST fold of mix's `a * b` (wrong at function level) and a speculative
+  # delete of signbit's `neg <- 0` initializer (visible only because
+  # uninitialized locals read poison, not zero). The validator must reject
+  # both and the binary must still match the baseline.
+  $irLine = Select-String -Path "_mlopt.ir" -Pattern "^\s+(\d+): %\S+ = @a \* @b" | Select-Object -First 1
+  if (-not $irLine) {
+    throw "could not locate 'a * b' in _mlopt.ir"
+  }
+  $badIdx = $irLine.Matches[0].Groups[1].Value
+  $negLine = Select-String -Path "_mlopt.ir" -Pattern "^\s+(\d+): @neg <- 0" | Select-Object -First 1
+  if (-not $negLine) {
+    throw "could not locate '@neg <- 0' in _mlopt.ir"
+  }
+  $negIdx = $negLine.Matches[0].Groups[1].Value
+  $dispPath = Join-Path $tmpDir "ml_gate_bad.disp"
+  "mix $badIdx CONST 271828`nsignbit $negIdx NOP" | Out-File -Encoding ascii $dispPath
+  $env:METTLE_ML_DISP = $dispPath
+  $badExe = Join-Path $tmpDir "ml_gate_bad.exe"
+  $buildOut = & $CompilerPath --build --release --ml-opt "tests\ml_gate.mettle" -o $badExe 2>&1 | Out-String
+  $env:METTLE_ML_DISP = $null
+  if ($LASTEXITCODE -ne 0) {
+    throw "ml_gate bad-disposition build failed: $buildOut"
+  }
+  if ($buildOut -notmatch "PROPOSAL REJECTED") {
+    throw "wrong disposition was not rejected by the validator: $buildOut"
+  }
+  if ($buildOut -notmatch "keeps its validated IR") {
+    throw "rejection did not report restoring validated IR"
+  }
+  & $badExe 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne $mlBaseExit) {
+    throw "rejected disposition still changed behavior: exit $LASTEXITCODE vs baseline $mlBaseExit"
+  }
+  # Provenance: a `?` suffix marks a disposition as model-sourced rather than
+  # proven by construction, and anything unproven must be gated exactly like a
+  # speculative NOP. Without this, a future model that picks its own rewrite
+  # targets could reuse the COPY kind and have its guesses applied UNVALIDATED
+  # on every function the interpreter cannot execute. Here the same wrong CONST
+  # is injected as `CONST?`; it must still be caught and the binary must still
+  # match the baseline.
+  $dispPath2 = Join-Path $tmpDir "ml_gate_unproven.disp"
+  "mix $badIdx CONST? 271828" | Out-File -Encoding ascii $dispPath2
+  $env:METTLE_ML_DISP = $dispPath2
+  $unpExe = Join-Path $tmpDir "ml_gate_unproven.exe"
+  $buildOut = & $CompilerPath --build --release --ml-opt "tests\ml_gate.mettle" -o $unpExe 2>&1 | Out-String
+  $env:METTLE_ML_DISP = $null
+  if ($LASTEXITCODE -ne 0) {
+    throw "ml_gate unproven-disposition build failed: $buildOut"
+  }
+  if ($buildOut -match "proven-only\)\s*,?\s*0 REJECTED" -and
+      $buildOut -notmatch "PROPOSAL REJECTED") {
+    throw "unproven disposition was applied without adjudication: $buildOut"
+  }
+  & $unpExe 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne $mlBaseExit) {
+    throw "unproven disposition changed behavior: exit $LASTEXITCODE vs baseline $mlBaseExit"
+  }
+
+  Write-CaseResult -Name "ml_opt_gate" -Passed $true
+}
+catch {
+  $env:METTLE_ML_DISP = $null
+  $failed++
+  Write-CaseResult -Name "ml_opt_gate" -Passed $false -Reason $_.Exception.Message
+}
+
+# --ml-opt sabotage self-test: METTLE_ML_SABOTAGE corrupts one real model
+# disposition into a wrong constant; the gate must catch it, name it, and
+# discard it - the ml-opt twin of verify_sabotage_caught.
+$total++
+try {
+  $env:METTLE_ML_SABOTAGE = "1"
+  $sabExe = Join-Path $tmpDir "ml_gate_sab.exe"
+  $buildOut = & $CompilerPath --build --release --ml-opt "examples\explain_demo\explain_demo.mettle" -o $sabExe 2>&1 | Out-String
+  $env:METTLE_ML_SABOTAGE = $null
+  if ($LASTEXITCODE -ne 0) {
+    throw "sabotaged --ml-opt build failed: $buildOut"
+  }
+  if ($buildOut -notmatch "SABOTAGE armed") {
+    throw "sabotage did not arm (model produced no COPY/CONST disposition?)"
+  }
+  if ($buildOut -notmatch "PROPOSAL REJECTED") {
+    throw "sabotaged disposition was not rejected: $buildOut"
+  }
+  if ($buildOut -notmatch "REJECTED by the validator") {
+    throw "summary line does not report the rejection: $buildOut"
+  }
+  Write-CaseResult -Name "ml_opt_sabotage_caught" -Passed $true
+}
+catch {
+  $env:METTLE_ML_SABOTAGE = $null
+  $failed++
+  Write-CaseResult -Name "ml_opt_sabotage_caught" -Passed $false -Reason $_.Exception.Message
+}
+
+# OBS Python/C parity. The ml-opt model trains on node features computed in
+# Python (tools/mlopt/obs.py) and runs on node features computed in C
+# (libmtlc's src/ir/ml_obs.c). A divergence between them does not crash or warn
+# - the model just reads different inputs at compile time than it trained on,
+# and the only symptom is optimization quality silently degrading. This replays
+# the golden vectors so that failure mode is a build error instead. The feature
+# extractor is the backend's, so this needs the libmtlc sources.
+$total++
+if (-not $HaveLibmtlcSrc) {
+  Write-Host "[SKIP] ml_obs_python_parity (libmtlc sources not found in $LibmtlcDir)"
+}
+else {
+try {
+  $obsExe = "bin\ml_obs_parity_test.exe"
+  & gcc -Wall -Wextra -std=c11 -g -O1 -Isrc "-I$LibmtlcInc" "-I$LibmtlcSrc" tests\ml_obs_parity_test.c (Join-Path $LibmtlcSrc "ir\ml_obs.c") -o $obsExe -lm
+  if ($LASTEXITCODE -ne 0) {
+    throw "Failed to compile OBS parity test"
+  }
+  $obsOutput = & $obsExe "tools\mlopt\obs_golden.txt" 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "OBS parity test failed:`n$obsOutput"
+  }
+  if ($obsOutput -notmatch "RESULT: (PASS|SKIP)") {
+    throw "OBS parity test did not report PASS or SKIP:`n$obsOutput"
+  }
+  Write-CaseResult -Name "ml_obs_python_parity" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "ml_obs_python_parity" -Passed $false -Reason $_.Exception.Message
+}
+}
+
+
 # Native heap: build with --native-heap and confirm new/malloc/calloc/realloc/
 # free route through std/alloc's Mettle allocator (mettle_heap_*), stay correct
 # at runtime, and do NOT emit the Win32 HeapAlloc/calloc path for `new`.
@@ -1796,8 +2175,11 @@ try {
   }
   if (Test-Path $irPath) {
     $irText = Get-Content -Path $irPath -Raw
-    if ($irText -notmatch "mettle_heap_zeroed") {
-      throw "native-heap IR missing mettle_heap_zeroed (new not rerouted)"
+    # The reroute target call is usually inlined (and inline prefixes no
+    # longer embed the callee name), so assert on the allocator core that
+    # only enters the program when `new` was rerouted to the native heap.
+    if ($irText -notmatch "mem_alloc") {
+      throw "native-heap IR missing native allocator core (new not rerouted)"
     }
   }
 
@@ -1951,6 +2333,259 @@ catch {
   Write-CaseResult -Name "generics_runtime" -Passed $false -Reason $_.Exception.Message
 }
 
+# Global aggregates and function-pointer globals: arrays/structs at module
+# scope, null-initialized function pointers, and globals initialized with the
+# address of another symbol (which lowers to a relocation and must keep the
+# referenced function alive through dead-function elimination). 55 = all intact.
+$total++
+try {
+  foreach ($mode in @("", "--release")) {
+    $label = if ($mode -eq "") { "debug" } else { "release" }
+    $exePath = Join-Path $tmpDir ("global_aggregates_and_fnptr_{0}.exe" -f $label)
+    if ($mode -eq "") {
+      $buildOut = & $CompilerPath --build --linker internal "tests\test_global_aggregates_and_fnptr.mettle" -o $exePath 2>&1 | Out-String
+    }
+    else {
+      $buildOut = & $CompilerPath --build --linker internal --release "tests\test_global_aggregates_and_fnptr.mettle" -o $exePath 2>&1 | Out-String
+    }
+    if ($LASTEXITCODE -ne 0) {
+      throw "global aggregates $label build failed: $buildOut"
+    }
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 55) {
+      throw "global aggregates $label exited with $LASTEXITCODE (expected 55)"
+    }
+  }
+  Write-CaseResult -Name "global_aggregates_and_fnptr" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "global_aggregates_and_fnptr" -Passed $false -Reason $_.Exception.Message
+}
+
+# Word-sized global aggregates: a global struct or array of exactly 1/2/4/8
+# bytes is memory reached through an address, not a value the MIR global cache
+# may hold in a register. Caching one gave it a vreg nothing defines, and the
+# allocator flushed that undefined vreg over the global's storage. 55 = every
+# read sees what was written.
+$total++
+try {
+  foreach ($mode in @("", "--release")) {
+    $label = if ($mode -eq "") { "debug" } else { "release" }
+    $exePath = Join-Path $tmpDir ("word_sized_global_aggregate_{0}.exe" -f $label)
+    if ($mode -eq "") {
+      $buildOut = & $CompilerPath --build --linker internal "tests\test_word_sized_global_aggregate.mettle" -o $exePath 2>&1 | Out-String
+    }
+    else {
+      $buildOut = & $CompilerPath --build --linker internal --release "tests\test_word_sized_global_aggregate.mettle" -o $exePath 2>&1 | Out-String
+    }
+    if ($LASTEXITCODE -ne 0) {
+      throw "word-sized global aggregate $label build failed: $buildOut"
+    }
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 55) {
+      throw "word-sized global aggregate $label exited with $LASTEXITCODE (expected 55)"
+    }
+  }
+  Write-CaseResult -Name "word_sized_global_aggregate" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "word_sized_global_aggregate" -Passed $false -Reason $_.Exception.Message
+}
+
+# Aggregate literals: `[a, b, c]`, `[value; count]`, and `{ field: value }` as
+# global constants, global variables, locals, and assignment right-hand sides.
+# Covers the element shapes that need more than plain bytes (float, bool,
+# string, a function's address, another global's address) and the folded image's
+# relocations. 55 = every form intact.
+$total++
+try {
+  foreach ($mode in @("", "--release")) {
+    $label = if ($mode -eq "") { "debug" } else { "release" }
+    $exePath = Join-Path $tmpDir ("aggregate_literals_{0}.exe" -f $label)
+    if ($mode -eq "") {
+      $buildOut = & $CompilerPath --build --linker internal "tests\test_aggregate_literals.mettle" -o $exePath 2>&1 | Out-String
+    }
+    else {
+      $buildOut = & $CompilerPath --build --linker internal --release "tests\test_aggregate_literals.mettle" -o $exePath 2>&1 | Out-String
+    }
+    if ($LASTEXITCODE -ne 0) {
+      throw "aggregate literals $label build failed: $buildOut"
+    }
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 55) {
+      throw "aggregate literals $label exited with $LASTEXITCODE (expected 55)"
+    }
+  }
+  Write-CaseResult -Name "aggregate_literals" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "aggregate_literals" -Passed $false -Reason $_.Exception.Message
+}
+
+# Struct-return regression: an aggregate returned through a hidden pointer must
+# be copied whole into a field, array element, or pointer target, not just its
+# first machine word. 55 = every destination form intact.
+$total++
+try {
+  foreach ($mode in @("", "--release")) {
+    $label = if ($mode -eq "") { "debug" } else { "release" }
+    $exePath = Join-Path $tmpDir ("struct_return_to_field_{0}.exe" -f $label)
+    if ($mode -eq "") {
+      $buildOut = & $CompilerPath --build --linker internal "tests\test_struct_return_to_field.mettle" -o $exePath 2>&1 | Out-String
+    }
+    else {
+      $buildOut = & $CompilerPath --build --linker internal --release "tests\test_struct_return_to_field.mettle" -o $exePath 2>&1 | Out-String
+    }
+    if ($LASTEXITCODE -ne 0) {
+      throw "struct-return $label build failed: $buildOut"
+    }
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 55) {
+      throw "struct-return $label exited with $LASTEXITCODE (expected 55): a returned aggregate was truncated on assignment"
+    }
+  }
+  Write-CaseResult -Name "struct_return_to_field" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "struct_return_to_field" -Passed $false -Reason $_.Exception.Message
+}
+
+# Nested-loop unroll regression: a loop whose bound is the enclosing loop's
+# counter must have its trip count recomputed per outer iteration. The symbol
+# map is built by a linear scan before the header, so without back-edge
+# handling the bound froze at its pre-loop value. 55 = every shape correct.
+$total++
+try {
+  foreach ($mode in @("", "--release")) {
+    $label = if ($mode -eq "") { "debug" } else { "release" }
+    $exePath = Join-Path $tmpDir ("opt_nested_loop_variable_bound_{0}.exe" -f $label)
+    if ($mode -eq "") {
+      $buildOut = & $CompilerPath --build --linker internal "tests\test_opt_nested_loop_variable_bound.mettle" -o $exePath 2>&1 | Out-String
+    }
+    else {
+      $buildOut = & $CompilerPath --build --linker internal --release "tests\test_opt_nested_loop_variable_bound.mettle" -o $exePath 2>&1 | Out-String
+    }
+    if ($LASTEXITCODE -ne 0) {
+      throw "nested-loop unroll $label build failed: $buildOut"
+    }
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 55) {
+      throw "nested-loop unroll $label exited with $LASTEXITCODE (expected 55): an inner trip count was frozen at its pre-loop value"
+    }
+  }
+  Write-CaseResult -Name "opt_nested_loop_variable_bound" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "opt_nested_loop_variable_bound" -Passed $false -Reason $_.Exception.Message
+}
+
+# std/math accuracy. Self-checking against independently computed reference
+# values plus identity sweeps; prints "MATH: ALL OK" and exits 0 only when every
+# assertion holds. Run at both optimisation levels because the library
+# reinterprets doubles through pointer casts, which --release must not disturb.
+$total++
+try {
+  foreach ($mode in @("", "--release")) {
+    $label = if ($mode -eq "") { "debug" } else { "release" }
+    $exePath = Join-Path $tmpDir ("std_math_{0}.exe" -f $label)
+    if ($mode -eq "") {
+      $buildOut = & $CompilerPath --build --linker internal "tests\test_std_math.mettle" -o $exePath 2>&1 | Out-String
+    }
+    else {
+      $buildOut = & $CompilerPath --build --linker internal --release "tests\test_std_math.mettle" -o $exePath 2>&1 | Out-String
+    }
+    if ($LASTEXITCODE -ne 0) {
+      throw "std/math $label build failed: $buildOut"
+    }
+    $runOut = & $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "std/math $label reported failures: $runOut"
+    }
+    if ($runOut -notmatch "MATH: ALL OK") {
+      throw "std/math $label output missing success marker: $runOut"
+    }
+  }
+  Write-CaseResult -Name "std_math" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "std_math" -Passed $false -Reason $_.Exception.Message
+}
+
+# Fused-loop threaded-exit regression: a vectorizable loop in an if/else THEN
+# branch whose exit was jump-threaded to the join must not fall through into
+# the ELSE branch after fusion (ir_fused_loop_exit_is_adjacent). Self-checking
+# at --release: 55 = fused and reference results match, 1 = divergence.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "opt_fused_loop_threaded_exit.exe"
+  $buildOut = & $CompilerPath --build --release "tests\test_opt_fused_loop_threaded_exit.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "threaded-exit regression build failed: $buildOut"
+  }
+  & $exePath 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 55) {
+    throw "threaded-exit regression exited with $LASTEXITCODE (expected 55): fused loop fell through its deleted exit edge"
+  }
+  Write-CaseResult -Name "opt_fused_loop_threaded_exit" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "opt_fused_loop_threaded_exit" -Passed $false -Reason $_.Exception.Message
+}
+
+# Arg-register pool invariant: values whose intervals contain an outgoing
+# argument homing write must never be placed in that argument register (the
+# explicit-writes clobber index). Adversarial pressure shape, self-checking at
+# --release: 55 = checksum matches, 1 = a homing move clobbered a live source.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "regalloc_argreg_call_pressure.exe"
+  $buildOut = & $CompilerPath --build --release "tests\test_regalloc_argreg_call_pressure.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "argreg pressure build failed: $buildOut"
+  }
+  & $exePath 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 55) {
+    throw "argreg pressure exited with $LASTEXITCODE (expected 55)"
+  }
+  Write-CaseResult -Name "regalloc_argreg_call_pressure" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "regalloc_argreg_call_pressure" -Passed $false -Reason $_.Exception.Message
+}
+
+# Wide-call boundary coverage: test_call_many_args.mettle only goes to 8 args,
+# below the point where arguments spill to the stack and (over MIR_MAX_PARAMS)
+# the enclosing function drops onto the baseline emitter. This runs a 20-param
+# callee and a 20-arg call: >register-set parameter homing and argument passing,
+# a correct wide-call return, and a float local intact across it. Returns 3. (It
+# is a sanity check, not the m-c99 #14 clobber repro -- that is frame-specific to
+# the C99 frontend and lives in the frontend's tests/diff/many_args.c.)
+$total++
+try {
+  $exePath = Join-Path $tmpDir "call_many_args_frame.exe"
+  $buildOut = & $CompilerPath --build "tests\test_call_many_args_frame.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "wide-call frame build failed: $buildOut"
+  }
+  & $exePath 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 3) {
+    throw "wide-call frame exited with $LASTEXITCODE (expected 3): a wide call clobbered the caller's float local"
+  }
+  Write-CaseResult -Name "call_many_args_frame" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "call_many_args_frame" -Passed $false -Reason $_.Exception.Message
+}
+
 # Global float variables: compile with --build and verify they read back their
 # initializer (and survive mutation) instead of reading 0 from an uninitialized
 # XMM lane. Returns 25+125+35+30 = 215.
@@ -2080,27 +2715,6 @@ catch {
   Write-CaseResult -Name "debug_hooks_standalone" -Passed $false -Reason $_.Exception.Message
 }
 
-# Debugger protocol end-to-end: node hosts the pipe and drives a real session
-# (entry stop, breakpoint, stack, variables, step in/out, eval, and a live
-# variable WRITE asserted on the program's final stdout).
-$total++
-try {
-  $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
-  if (-not $nodeCmd) {
-    Write-CaseResult -Name "debug_protocol" -Passed $true -Reason "skipped (node not found)"
-  } else {
-    $protoOut = & $nodeCmd.Source "mettle-syntax\scripts\test-debug-protocol.js" $CompilerPath 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0) {
-      throw "Protocol test failed: $protoOut"
-    }
-    Write-CaseResult -Name "debug_protocol" -Passed $true
-  }
-}
-catch {
-  $failed++
-  Write-CaseResult -Name "debug_protocol" -Passed $false -Reason $_.Exception.Message
-}
-
 # --explain "since last build" diffing + --explain-json: recompiling unchanged
 # source reports no changes; de-inlining `scale` between builds reports the
 # with_call loop as REGRESSED; the .explain.json sidecar parses and agrees.
@@ -2129,13 +2743,56 @@ try {
     throw "De-inlined scale must report a loop regression. Output: $($run3.Substring(0, [Math]::Min(600, $run3.Length)))"
   }
   $json = Get-Content (Join-Path $exDir "demo.explain.json") -Raw | ConvertFrom-Json
-  if ($json.schema -ne 1) { throw "JSON schema field wrong" }
+  if ($json.schema -ne 2) { throw "JSON schema field wrong" }
   if ($json.stats.changesRegressed -lt 1) { throw "JSON regression count missing" }
   if (@($json.remarks).Count -lt 10) { throw "JSON remarks too few: $(@($json.remarks).Count)" }
   $regLoop = @($json.changes.entries | Where-Object { $_.direction -eq 'regressed' -and $_.kind -eq 'loop' })
   if ($regLoop.Count -lt 1 -or -not $regLoop[0].reason) { throw "JSON regressed-loop entry missing reason" }
   if (-not @($json.remarks | Where-Object { $_.kind -eq 'loop' -and $_.depth -ge 2 }).Count) {
     throw "JSON nest depth missing (matvec inner loop is depth 2)"
+  }
+  # Schema 2: the structured half. Prose is for people; these are what tools key off.
+  $coded = @($json.remarks | Where-Object { $_.code })
+  if ($coded.Count -lt 5) { throw "JSON remarks missing stable codes: $($coded.Count)" }
+  if (-not @($json.remarks | Where-Object { $_.code -eq 'int32-sum-narrow-acc' }).Count) {
+    throw "JSON missing the int32-sum-narrow-acc diagnosis id"
+  }
+  if (-not @($json.remarks | Where-Object { $_.kind -eq 'loop' -and $_.endLine -gt $_.line }).Count) {
+    throw "JSON loop remarks missing their source extent"
+  }
+  if (-not @($json.remarks | Where-Object { $_.trivial }).Count) {
+    throw "JSON missing trivial-inline classification"
+  }
+  if (@($json.functions).Count -lt 2) { throw "JSON per-function table missing" }
+  $mainFn = @($json.functions | Where-Object { $_.fn -eq 'main' })[0]
+  if (-not $mainFn -or $mainFn.instructionsBefore -le 0) { throw "JSON function weights missing" }
+  if (@($json.passes).Count -lt 5) { throw "JSON pass ledger missing" }
+  if (-not @($json.passes | Where-Object { $_.instructionsRemoved -gt 0 }).Count) {
+    throw "JSON pass ledger recorded no instruction deltas"
+  }
+  # A ledger entry has to say WHAT it did and WHERE, not just that it fired.
+  $described = @($json.passes | Where-Object { $_.effects -and $_.sites })
+  if ($described.Count -lt 3) {
+    throw "JSON pass ledger missing effects/sites: $($described.Count) described"
+  }
+  $vec = @($json.passes | Where-Object { $_.pass -eq 'simd_affine_map_float' })[0]
+  if (-not $vec) { throw "JSON pass ledger missing the vectorizer" }
+  $kernel = $vec.effects.PSObject.Properties | Where-Object { $_.Name -like 'simd_*' -and $_.Value -lt 0 }
+  if (-not $kernel) { throw "vectorizer ledger should report the kernel it introduced" }
+  $scalar = $vec.effects.PSObject.Properties | Where-Object { $_.Name -eq 'binary' -and $_.Value -gt 0 }
+  if (-not $scalar) { throw "vectorizer ledger should report the scalar work it removed" }
+  if (-not @($vec.sites | Where-Object { $_.fn -and $_.line -gt 0 }).Count) {
+    throw "vectorizer ledger missing the lines it changed"
+  }
+  if (@($json.loops).Count -lt 1) { throw "JSON per-loop cost model missing" }
+  if (-not @($json.loops | Where-Object { $_.cyclesPerIter -gt 0 -and $_.bottleneck }).Count) {
+    throw "JSON loop costs missing cycles or bottleneck port"
+  }
+  if (@($json.callGraph).Count -lt 1) { throw "JSON call graph missing" }
+  if (@($json.hotspots).Count -lt 1) { throw "JSON hotspot ranking missing" }
+  $ranked = @($json.hotspots)
+  if ($ranked.Count -gt 1 -and $ranked[0].cost -lt $ranked[-1].cost) {
+    throw "JSON hotspots are not ranked by cost"
   }
   Remove-Item Env:METTLE_EXPLAIN_REPORT_LINES -ErrorAction SilentlyContinue
   Write-CaseResult -Name "explain_changes_and_json" -Passed $true
@@ -3125,6 +3782,10 @@ foreach ($relFlag in @($true, $false)) {
 
 # COFF reader test: parse Mettle and GCC-produced COFF objects
 $total++
+if (-not $HaveLibmtlcSrc) {
+  Write-Host "[SKIP] coff_reader (libmtlc sources not found in $LibmtlcDir)"
+}
+else {
 try {
   $coffReaderExe = Join-Path $tmpDir "coff_reader_test.exe"
   $basicObjPath = Join-Path $tmpDir "coff_reader_basic.obj"
@@ -3133,7 +3794,7 @@ try {
   $gccSourcePath = Join-Path $tmpDir "coff_reader_gcc_input.c"
   $gccObjPath = Join-Path $tmpDir "coff_reader_gcc_input.o"
 
-  $compileHarness = & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests\coff_reader_test.c src\common.c src\lexer\lexer.c src\error\error_reporter.c src\linker\coff_reader.c -Isrc -o $coffReaderExe 2>&1 | Out-String
+  $compileHarness = & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests\coff_reader_test.c (Join-Path $LibmtlcSrc "common.c") src\lexer\lexer.c (Join-Path $LibmtlcSrc "error\error_reporter.c") (Join-Path $LibmtlcSrc "linker\coff_reader.c") -Isrc "-I$LibmtlcInc" "-I$LibmtlcSrc" -o $coffReaderExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "COFF reader harness compile failed: $compileHarness"
   }
@@ -3179,9 +3840,14 @@ catch {
   $failed++
   Write-CaseResult -Name "coff_reader" -Passed $false -Reason $_.Exception.Message
 }
+}
 
 # Linker symbol resolution test: merge sections, resolve externals, and reject invalid symbol graphs
 $total++
+if (-not $HaveLibmtlcSrc) {
+  Write-Host "[SKIP] symbol_resolve (libmtlc sources not found in $LibmtlcDir)"
+}
+else {
 try {
   $symbolResolveExe = Join-Path $tmpDir "symbol_resolve_test.exe"
   $fnEntryObj = Join-Path $tmpDir "linker_merge_entry.obj"
@@ -3194,7 +3860,7 @@ try {
   $dupBObj = Join-Path $tmpDir "linker_duplicate_b.obj"
   $unresolvedObj = Join-Path $tmpDir "linker_unresolved_entry.obj"
 
-  $compileHarness = & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests\symbol_resolve_test.c src\common.c src\lexer\lexer.c src\error\error_reporter.c src\linker\coff_reader.c src\linker\symbol_resolve.c src\codegen\binary_emitter.c src\codegen\elf_emitter.c -Isrc -Isrc\codegen -o $symbolResolveExe 2>&1 | Out-String
+  $compileHarness = & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests\symbol_resolve_test.c (Join-Path $LibmtlcSrc "common.c") src\lexer\lexer.c (Join-Path $LibmtlcSrc "error\error_reporter.c") (Join-Path $LibmtlcSrc "linker\coff_reader.c") (Join-Path $LibmtlcSrc "linker\symbol_resolve.c") (Join-Path $LibmtlcSrc "codegen\binary_emitter.c") (Join-Path $LibmtlcSrc "codegen\elf_emitter.c") -Isrc "-I$LibmtlcInc" "-I$LibmtlcSrc" "-I$LibmtlcSrc\codegen" -o $symbolResolveExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Symbol-resolve harness compile failed: $compileHarness"
   }
@@ -3232,13 +3898,18 @@ catch {
   $failed++
   Write-CaseResult -Name "symbol_resolve" -Passed $false -Reason $_.Exception.Message
 }
+}
 
 # Linker relocation test: apply merged-image relocations for REL32, ADDR64, ADDR32NB, and SECREL
 $total++
+if (-not $HaveLibmtlcSrc) {
+  Write-Host "[SKIP] relocation (libmtlc sources not found in $LibmtlcDir)"
+}
+else {
 try {
   $relocationExe = Join-Path $tmpDir "relocation_test.exe"
 
-  $compileHarness = & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests\relocation_test.c src\common.c src\lexer\lexer.c src\error\error_reporter.c src\linker\coff_reader.c src\linker\symbol_resolve.c src\linker\relocation.c src\codegen\binary_emitter.c src\codegen\elf_emitter.c -Isrc -Isrc\codegen -o $relocationExe 2>&1 | Out-String
+  $compileHarness = & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests\relocation_test.c (Join-Path $LibmtlcSrc "common.c") src\lexer\lexer.c (Join-Path $LibmtlcSrc "error\error_reporter.c") (Join-Path $LibmtlcSrc "linker\coff_reader.c") (Join-Path $LibmtlcSrc "linker\symbol_resolve.c") (Join-Path $LibmtlcSrc "linker\relocation.c") (Join-Path $LibmtlcSrc "codegen\binary_emitter.c") (Join-Path $LibmtlcSrc "codegen\elf_emitter.c") -Isrc "-I$LibmtlcInc" "-I$LibmtlcSrc" "-I$LibmtlcSrc\codegen" -o $relocationExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Relocation harness compile failed: $compileHarness"
   }
@@ -3254,13 +3925,18 @@ catch {
   $failed++
   Write-CaseResult -Name "relocation" -Passed $false -Reason $_.Exception.Message
 }
+}
 
 # PE emitter test: write a minimal PE32+ image, verify headers/sections, and run it
 $total++
+if (-not $HaveLibmtlcSrc) {
+  Write-Host "[SKIP] pe_emitter (libmtlc sources not found in $LibmtlcDir)"
+}
+else {
 try {
   $peEmitterExe = Join-Path $tmpDir "pe_emitter_test.exe"
 
-  $compileHarness = & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests\pe_emitter_test.c src\common.c src\lexer\lexer.c src\error\error_reporter.c src\linker\coff_reader.c src\linker\symbol_resolve.c src\linker\relocation.c src\linker\pe_emitter.c src\linker\import_lib.c src\codegen\binary_emitter.c src\codegen\elf_emitter.c -Isrc -Isrc\codegen -o $peEmitterExe 2>&1 | Out-String
+  $compileHarness = & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests\pe_emitter_test.c (Join-Path $LibmtlcSrc "common.c") src\lexer\lexer.c (Join-Path $LibmtlcSrc "error\error_reporter.c") (Join-Path $LibmtlcSrc "linker\coff_reader.c") (Join-Path $LibmtlcSrc "linker\symbol_resolve.c") (Join-Path $LibmtlcSrc "linker\relocation.c") (Join-Path $LibmtlcSrc "linker\pe_emitter.c") (Join-Path $LibmtlcSrc "linker\import_lib.c") (Join-Path $LibmtlcSrc "codegen\binary_emitter.c") (Join-Path $LibmtlcSrc "codegen\elf_emitter.c") -Isrc "-I$LibmtlcInc" "-I$LibmtlcSrc" "-I$LibmtlcSrc\codegen" -o $peEmitterExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "PE-emitter harness compile failed: $compileHarness"
   }
@@ -3275,6 +3951,7 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "pe_emitter" -Passed $false -Reason $_.Exception.Message
+}
 }
 
 # Internal linker basic test: direct object build uses native PE emission for default imports
@@ -4795,6 +5472,31 @@ catch {
   Write-CaseResult -Name "direct_object_byte_load_store_alias" -Passed $false -Reason $_.Exception.Message
 }
 
+# Direct object backend release test: inline memcpy must preserve live RSI/RDI values
+$total++
+try {
+  $exePath = Join-Path $tmpDir "test_opt_memcpy_const.exe"
+
+  $buildOut = & $CompilerPath --build --emit-obj --linker internal --release tests\test_opt_memcpy_const.mettle -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "Direct object memcpy-live-registers build failed: $buildOut"
+  }
+  if (-not (Test-Path $exePath)) {
+    throw "Direct object memcpy-live-registers build did not produce an executable"
+  }
+
+  & $exePath 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "Direct object memcpy-live-registers executable exited with $LASTEXITCODE (expected 0)"
+  }
+
+  Write-CaseResult -Name "direct_object_memcpy_live_registers" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "direct_object_memcpy_live_registers" -Passed $false -Reason $_.Exception.Message
+}
+
 # Direct object backend aggregate-local test: stack-allocated struct addressed and passed by pointer
 $total++
 try {
@@ -5176,6 +5878,37 @@ catch {
   Write-CaseResult -Name "runtime_access_violation_trace" -Passed $false -Reason $_.Exception.Message
 }
 
+# Internal allocator gate. src/mettle_alloc.c interposes on malloc/free for the
+# whole driver, so a fault there corrupts every later phase in ways that are hard
+# to attribute back. This exercises the parts that are easy to get wrong -- size
+# class boundaries, realloc growth and shrink, calloc's skip-the-memset path, page
+# and segment recycling, huge allocations, cross-thread frees -- and checks block
+# CONTENTS, not merely that nothing crashed. Built with -DMETTLE_ALLOC_POISON so
+# freed blocks are stamped, which turns a stale-pointer read into a recognisable
+# value instead of whatever happened to still be there.
+$total++
+try {
+  $allocExe = "bin\alloc_test.exe"
+  & gcc -Wall -Wextra -std=c99 -g -O2 -D_GNU_SOURCE -DMETTLE_INTERNAL_ALLOC -DMETTLE_ALLOC_POISON -Isrc tests\alloc_test.c src\mettle_alloc.c -o $allocExe
+  if ($LASTEXITCODE -ne 0) {
+    throw "Failed to compile allocator test"
+  }
+
+  $allocOutput = & $allocExe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "Allocator test exited with code $LASTEXITCODE`n$allocOutput"
+  }
+  if ($allocOutput -notmatch "\[PASS\] alloc_test") {
+    throw "Allocator test did not report success`n$allocOutput"
+  }
+
+  Write-CaseResult -Name "internal_allocator" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "internal_allocator" -Passed $false -Reason $_.Exception.Message
+}
+
 # Crash handler test. On Windows this compiles and runs but is a documented
 # no-op (the SEH crash path is already covered by runtime_null_trace /
 # runtime_access_violation_trace); the meaningful assertions run on POSIX.
@@ -5209,11 +5942,16 @@ catch {
 # plus an encode->decode round-trip across the register/immediate range. This
 # is the AArch64 analogue of the PTX/ptxas gate below: it validates the hardest
 # layer (instruction encodings) with no external assembler and no ARM hardware,
-# since the test is pure 32-bit math that runs on the build host.
+# since the test is pure 32-bit math that runs on the build host. The encoder is
+# the backend's, so this needs the libmtlc sources.
 $total++
+if (-not $HaveLibmtlcSrc) {
+  Write-Host "[SKIP] arm64_encoder (libmtlc sources not found in $LibmtlcDir)"
+}
+else {
 try {
   $arm64Exe = "bin\arm64_encode_test.exe"
-  & gcc -Wall -Wextra -std=c99 -g -O0 -Isrc tests\arm64_encode_test.c src\codegen\binary\arm64_encode.c src\codegen\binary\arm64_disasm.c src\codegen\binary\arm64_abi.c -o $arm64Exe
+  & gcc -Wall -Wextra -std=c99 -g -O0 -Isrc "-I$LibmtlcInc" "-I$LibmtlcSrc" tests\arm64_encode_test.c (Join-Path $LibmtlcSrc "codegen\binary\arm64_encode.c") (Join-Path $LibmtlcSrc "codegen\binary\arm64_disasm.c") (Join-Path $LibmtlcSrc "codegen\binary\arm64_abi.c") -o $arm64Exe
   if ($LASTEXITCODE -ne 0) {
     throw "Failed to compile AArch64 encoder test"
   }
@@ -5232,6 +5970,7 @@ catch {
   $failed++
   Write-CaseResult -Name "arm64_encoder" -Passed $false -Reason $_.Exception.Message
 }
+}
 
 # AArch64 emit-layer + execution gate. Emits complete AAPCS64 functions
 # (prologue/body/epilogue with branch fixups), validates each by decoding every
@@ -5242,10 +5981,15 @@ catch {
 # code checked against the expected result -- the semantic proof that the
 # generated machine code runs on AArch64 without ARM hardware. Execution is
 # skipped (not failed) when no emulator is present, like the ptxas gate.
+# The emit layer is the backend's, so this needs the libmtlc sources.
 $total++
+if (-not $HaveLibmtlcSrc) {
+  Write-Host "[SKIP] arm64_emit (libmtlc sources not found in $LibmtlcDir)"
+}
+else {
 try {
   $arm64EmitExe = "bin\arm64_emit_test.exe"
-  & gcc -Wall -Wextra -std=c99 -g -O0 -Isrc tests\arm64_emit_test.c src\codegen\binary\arm64_encode.c src\codegen\binary\arm64_emit.c src\codegen\binary\arm64_disasm.c src\codegen\binary\arm64_mir_encode.c -o $arm64EmitExe
+  & gcc -Wall -Wextra -std=c99 -g -O0 -Isrc "-I$LibmtlcInc" "-I$LibmtlcSrc" tests\arm64_emit_test.c (Join-Path $LibmtlcSrc "codegen\binary\arm64_encode.c") (Join-Path $LibmtlcSrc "codegen\binary\arm64_emit.c") (Join-Path $LibmtlcSrc "codegen\binary\arm64_disasm.c") (Join-Path $LibmtlcSrc "codegen\binary\arm64_mir_encode.c") -o $arm64EmitExe
   if ($LASTEXITCODE -ne 0) {
     throw "Failed to compile AArch64 emit test"
   }
@@ -5294,6 +6038,7 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "arm64_emit" -Passed $false -Reason $_.Exception.Message
+}
 }
 
 # Real-source -> AArch64 gate. Drives the REAL compiler ($CompilerPath
@@ -5506,10 +6251,17 @@ catch {
   Write-CaseResult -Name "profile_runtime_ops" -Passed $false -Reason $_.Exception.Message
 }
 
+# Internal-compiler-error report. Mixed: the lexer and the crash-handler
+# runtime are ours, the compiler context, IR and crash reporter are libmtlc's,
+# so the harness pulls translation units from both sides.
+$total++
+if (-not $HaveLibmtlcSrc) {
+  Write-Host "[SKIP] compiler_ice_report (libmtlc sources not found in $LibmtlcDir)"
+}
+else {
 try {
-  $total++
   $iceExe = Join-Path $tmpDir "compiler_ice_report_test.exe"
-  $iceCompile = & gcc -Wall -Wextra -std=c99 -g -O0 -Isrc tests\compiler_ice_report_test.c src\common.c src\lexer\lexer.c src\compiler\compiler_context.c src\compiler\compiler_crash.c src\runtime\crash_handler.c src\ir\ir.c -o $iceExe -ldbghelp 2>&1 | Out-String
+  $iceCompile = & gcc -Wall -Wextra -std=c99 -g -O0 -Isrc "-I$LibmtlcInc" "-I$LibmtlcSrc" tests\compiler_ice_report_test.c (Join-Path $LibmtlcSrc "common.c") src\lexer\lexer.c (Join-Path $LibmtlcSrc "compiler\compiler_context.c") (Join-Path $LibmtlcSrc "compiler\compiler_crash.c") src\runtime\crash_handler.c (Join-Path $LibmtlcSrc "ir\ir.c") -o $iceExe -ldbghelp 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "compiler ICE report harness compile failed: $iceCompile"
   }
@@ -5538,37 +6290,2630 @@ catch {
   $failed++
   Write-CaseResult -Name "compiler_ice_report" -Passed $false -Reason $_.Exception.Message
 }
-
-# PTX backend validity gate. Emits the real GPU kernel corpus and the stress
-# corpus to PTX and round-trips each through ptxas (NVIDIA's assembler) -- the
-# authoritative check that the emitted PTX is well-formed. Catches emitter
-# regressions that produce syntactically/typed-invalid PTX. Skipped when the
-# CUDA toolkit (ptxas) is absent. Semantic (GPU-execution) checks live in
-# examples/llm/qwen3/gpu/dgpu_check.mettle (needs a GPU, so not in this gate).
-$ptxas = Get-Command ptxas -ErrorAction SilentlyContinue
-if (-not $ptxas) {
-  Write-Host "[SKIP] ptx_emit_validate (ptxas not found)"
 }
-else {
-  foreach ($src in @("examples/llm/qwen3/gpu/kernels.mettle",
-                     "examples/llm/qwen3/gpu/ptx_stress.mettle",
-                     "examples/gpu_vadd/vadd_kernel.mettle")) {
-    $total++
-    $name = "ptx_emit_" + [System.IO.Path]::GetFileNameWithoutExtension($src)
-    try {
-      $ptxPath = Join-Path $tmpDir ($name + ".ptx")
-      $cubin = Join-Path $tmpDir ($name + ".cubin")
-      $emitOut = & $CompilerPath --emit-ptx $src -o $ptxPath 2>&1 | Out-String
-      if ($LASTEXITCODE -ne 0) { throw "emit failed: $emitOut" }
-      if (-not (Test-Path $ptxPath)) { throw "no PTX produced" }
-      $asmOut = & $ptxas.Source -arch=sm_90 $ptxPath -o $cubin 2>&1 | Out-String
+
+# PTX backend validity gate. Emission and structural/profile checks always run.
+# When NVIDIA's ptxas is installed, each portable module is assembled too; a
+# second GB10-specific gate assembles sm_121a when the installed toolkit knows
+# that target. This keeps non-NVIDIA CI useful without weakening the DGX Spark
+# acceptance gate on CUDA development machines.
+$ptxas = Get-Command ptxas -ErrorAction SilentlyContinue
+foreach ($src in @("tests/gpu/compute_kernels.mettle",
+                   "tests/gpu/subgroup_shuffle.mettle",
+                   "tests/gpu/atomic_kernels.mettle",
+                   "tests/gpu/async_copy.mettle",
+                   "tests/gpu/auto_staging.mettle",
+                   "tests/gpu/auto_staging_no_promote.mettle",
+                   "tests/gpu/tensor_chain.mettle",
+                   "tests/gpu/tensor_chain_no_fuse.mettle",
+                   "tests/gpu/tensor_loop.mettle",
+                   "tests/gpu/tensor_loop_no_residency.mettle",
+                   "tests/gpu/tensor_pipeline.mettle",
+                   "tests/gpu/tensor_pipeline4.mettle",
+                   "tests/gpu/tensor_pipeline_no_residency.mettle",
+                   "tests/gpu/tensor_epilogue_portable.mettle",
+                   "examples/gpu_vadd/vadd_kernel.mettle")) {
+  $total++
+  $name = "ptx_emit_" + [System.IO.Path]::GetFileNameWithoutExtension($src)
+  try {
+    $ptxPath = Join-Path $tmpDir ($name + ".ptx")
+    $cubin = Join-Path $tmpDir ($name + ".cubin")
+    $emitOut = & $CompilerPath -O --emit-ptx --gpu-arch=portable $src -o $ptxPath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "emit failed: $emitOut" }
+    if (-not (Test-Path $ptxPath)) { throw "no PTX produced" }
+    $ptxText = Get-Content -Raw $ptxPath
+    if ($ptxText -notmatch "(?m)^\.version 6\.4\r?$") { throw "portable PTX version is not 6.4" }
+    if ($ptxText -notmatch "(?m)^\.target compute_75\r?$") { throw "portable PTX target is not compute_75" }
+    if ($ptxText -match "ordinary_function_not_entry") {
+      throw "unreachable ordinary function entered the PTX module"
+    }
+    if ($src -like "*compute_kernels.mettle") {
+      if ($ptxText -notmatch "(?m)^\.func \(\.param \.f32 scale_value_ret\) scale_value\(" -or
+          $ptxText -notmatch "call\.uni .*scale_value") {
+        throw "reachable ordinary helper was not lowered as a PTX device call"
+      }
+      foreach ($decl in @("\.param \.s8 narrow_scalar_abi_p0",
+                           "\.param \.u8 narrow_scalar_abi_p1",
+                           "\.param \.s16 narrow_scalar_abi_p2",
+                           "\.param \.u16 narrow_scalar_abi_p3",
+                           "\.param \.u8 narrow_scalar_abi_p4")) {
+        if ($ptxText -notmatch $decl) { throw "missing natural-width kernel ABI declaration: $decl" }
+      }
+      foreach ($memoryContract in @(
+          "\.shared \.align 32 \.b8 staged_copy_tile_storage\[128\]",
+          "\.local \.align 4 \.b8 staged_copy_scratch_storage\[16\]",
+          "\.extern \.shared \.align 32 \.b8 dynamic_staged_copy_dynamic_workgroup_storage\[\]",
+          "st\.shared\.f32", "ld\.shared\.f32",
+          "st\.local\.s32", "ld\.local\.s32")) {
+        if ($ptxText -notmatch $memoryContract) {
+          throw "missing static address-space memory contract: $memoryContract"
+        }
+      }
+      $dynamicBaseMoves = [regex]::Matches(
+        $ptxText,
+        'mov\.u64 %rd[0-9]+, dynamic_staged_copy_dynamic_workgroup_storage;'
+      ).Count
+      if ($dynamicBaseMoves -ne 2) {
+        throw "dynamic workgroup views did not alias one PTX arena: moves=$dynamicBaseMoves"
+      }
+      foreach ($subgroupContract in @(
+          "min\.f32", "min\.u32", "max\.f32", "max\.u32",
+          "shfl\.sync\.up\.b32", "vote\.sync\.ballot\.b32",
+          "vote\.sync\.any\.pred", "vote\.sync\.all\.pred")) {
+        if ($ptxText -notmatch $subgroupContract) {
+          throw "missing extended subgroup contract: $subgroupContract"
+        }
+      }
+    }
+    if ($src -like "*subgroup_shuffle.mettle") {
+      if ([regex]::Matches($ptxText, "shfl\.sync\.idx\.b32").Count -ne 2 -or
+          [regex]::Matches($ptxText, "activemask\.b32").Count -ne 2) {
+        throw "variable-source subgroup shuffle contract mismatch"
+      }
+    }
+    if ($src -like "*atomic_kernels.mettle") {
+      if ([regex]::Matches($ptxText, "atom\.").Count -ne 20 -or
+          [regex]::Matches($ptxText, "ld\.(relaxed|acquire)\.").Count -lt 4 -or
+          [regex]::Matches($ptxText, "st\.(relaxed|release)\.").Count -lt 4 -or
+          $ptxText -notmatch "mul\.lo\.u64" -or
+          $ptxText -notmatch "neg\.s32" -or
+          $ptxText -notmatch "neg\.s64") {
+        throw "atomic family did not preserve exact operation/index width"
+      }
+      foreach ($atomicContract in @(
+          "global\.add\.u32", "global\.add\.u64",
+          "global\.min\.u32", "global\.min\.u64",
+          "global\.max\.u32", "global\.max\.u64",
+          "global\.and\.b32", "global\.and\.b64",
+          "global\.or\.b32", "global\.or\.b64",
+          "global\.xor\.b32", "global\.xor\.b64",
+          "global\.exch\.b32", "global\.exch\.b64",
+          "global\.cas\.b32", "global\.cas\.b64",
+          "shared\.add\.u32", "shared\.cas\.b64",
+          "ld\.acquire\.gpu\.global\.u32",
+          "ld\.acquire\.sys\.global\.u64",
+          "st\.release\.gpu\.global\.u32",
+          "st\.relaxed\.sys\.global\.u64",
+          "ld\.relaxed\.cta\.shared\.u32",
+          "ld\.acquire\.cta\.shared\.u64",
+          "st\.relaxed\.cta\.shared\.u32",
+          "st\.release\.cta\.shared\.u64")) {
+        if ($ptxText -notmatch $atomicContract) {
+          throw "missing broad atomic contract: $atomicContract"
+        }
+      }
+    }
+    if ($src -like "*tensor_chain.mettle") {
+      $mmaCount = [regex]::Matches($ptxText, "wmma\.mma\.sync").Count
+      $cLoadCount = [regex]::Matches($ptxText, "wmma\.load\.c\.sync").Count
+      $dStoreCount = [regex]::Matches($ptxText, "wmma\.store\.d\.sync").Count
+      if ($ptxText -notmatch "mtlc\.tensor_chain resident tiles=4 tuple_peak=32 budget=64" -or
+          $mmaCount -ne 4 -or $cLoadCount -ne 1 -or $dStoreCount -ne 1) {
+        throw "optimized tensor chain residency mismatch: mma=$mmaCount c_load=$cLoadCount d_store=$dStoreCount"
+      }
+      $unoptimized = Join-Path $tmpDir ($name + "_unoptimized.ptx")
+      $unoptimizedOut = & $CompilerPath --emit-ptx --gpu-arch=portable $src -o $unoptimized 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) { throw "unoptimized tensor emit failed: $unoptimizedOut" }
+      $unoptimizedText = Get-Content -Raw $unoptimized
+      if ($unoptimizedText -match "mtlc\.tensor_chain" -or
+          [regex]::Matches($unoptimizedText, "wmma\.load\.c\.sync").Count -ne 4 -or
+          [regex]::Matches($unoptimizedText, "wmma\.store\.d\.sync").Count -ne 4) {
+        throw "tensor residency was not formed exclusively by the optimizer"
+      }
+      $explained = Join-Path $tmpDir ($name + "_explained.ptx")
+      $explainOut = & $CompilerPath -O --explain-all --emit-ptx `
+        --gpu-arch=portable $src -o $explained 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0 -or
+          $explainOut -notmatch "fused 4 tensor tiles into one accumulator-resident chain" -or
+          $explainOut -notmatch "target-neutral optimized IR emitted through the PTX backend") {
+        throw "PTX --explain omitted the neutral tensor decision or backend boundary: $explainOut"
+      }
+      $dumped = Join-Path $tmpDir ($name + "_dumped.ptx")
+      $dumpOut = & $CompilerPath -O --dump-ir --emit-ptx `
+        --gpu-arch=portable $src -o $dumped 2>&1 | Out-String
+      $dumpPath = $dumped + ".ir"
+      if ($LASTEXITCODE -ne 0 -or -not (Test-Path $dumpPath) -or
+          (Get-Content -Raw $dumpPath) -notmatch "tensor_mma x4") {
+        throw "GPU --dump-ir omitted the optimized tensor chain: $dumpOut"
+      }
+      $budgeted = Join-Path $tmpDir ($name + "_budget31.ptx")
+      $budgetOut = & $CompilerPath -O --emit-ptx --gpu-arch=portable `
+        --gpu-tensor-tuple-budget=31 $src -o $budgeted 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) {
+        throw "tensor tuple-budget variant emit failed: $budgetOut"
+      }
+      $budgetText = Get-Content -Raw $budgeted
+      if ($budgetText -notmatch
+            "mtlc\.tensor_chain replay tiles=4 tuple_peak=32 budget=31" -or
+          [regex]::Matches($budgetText, "wmma\.load\.c\.sync").Count -ne 4 -or
+          [regex]::Matches($budgetText, "wmma\.store\.d\.sync").Count -ne 4) {
+        throw "explicit tensor tuple budget did not select exact replay"
+      }
+      $invalidBudgetOut = & $CompilerPath -O --emit-ptx `
+        --gpu-tensor-tuple-budget=4097 $src -o $budgeted 2>&1 | Out-String
+      if ($LASTEXITCODE -eq 0 -or
+          $invalidBudgetOut -notmatch
+            "--gpu-tensor-tuple-budget expects 0\.\.4096") {
+        throw "invalid tensor tuple budget was not rejected: $invalidBudgetOut"
+      }
+    }
+    if ($src -like "*tensor_chain_no_fuse.mettle") {
+      $mmaCount = [regex]::Matches($ptxText, "wmma\.mma\.sync").Count
+      $cLoadCount = [regex]::Matches($ptxText, "wmma\.load\.c\.sync").Count
+      $dStoreCount = [regex]::Matches($ptxText, "wmma\.store\.d\.sync").Count
+      if ($ptxText -match "mtlc\.tensor_chain" -or
+          $mmaCount -ne 4 -or $cLoadCount -ne 4 -or $dStoreCount -ne 4 -or
+          $ptxText -notmatch "st\.relaxed\.gpu\.global\.u32") {
+        throw "illegal tensor-chain fusion: mma=$mmaCount c_load=$cLoadCount d_store=$dStoreCount"
+      }
+    }
+    if ($src -like "*tensor_loop.mettle") {
+      $mmaCount = [regex]::Matches($ptxText, "wmma\.mma\.sync").Count
+      $cLoadCount = [regex]::Matches($ptxText, "wmma\.load\.c\.sync").Count
+      $dStoreCount = [regex]::Matches($ptxText, "wmma\.store\.d\.sync").Count
+      if ($ptxText -notmatch "mtlc\.tensor_loop resident group=1 tuple_peak=32 budget=64" -or
+          $mmaCount -ne 2 -or $cLoadCount -ne 1 -or $dStoreCount -ne 1) {
+        throw "optimized tensor-loop residency mismatch: mma=$mmaCount c_load=$cLoadCount d_store=$dStoreCount"
+      }
+      $unoptimized = Join-Path $tmpDir ($name + "_unoptimized.ptx")
+      $unoptimizedOut = & $CompilerPath --emit-ptx --gpu-arch=portable $src -o $unoptimized 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) { throw "unoptimized tensor-loop emit failed: $unoptimizedOut" }
+      $unoptimizedText = Get-Content -Raw $unoptimized
+      if ($unoptimizedText -match "mtlc\.tensor_loop" -or
+          [regex]::Matches($unoptimizedText, "wmma\.load\.c\.sync").Count -ne 2 -or
+          [regex]::Matches($unoptimizedText, "wmma\.store\.d\.sync").Count -ne 2) {
+        throw "tensor-loop residency was not formed exclusively by the optimizer"
+      }
+      $explained = Join-Path $tmpDir ($name + "_explained.ptx")
+      $explainOut = & $CompilerPath -O --explain-all --emit-ptx `
+        --gpu-arch=portable $src -o $explained 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0 -or
+          $explainOut -notmatch "formed a loop-carried tensor accumulator residency region" -or
+          $explainOut -notmatch "target-neutral optimized IR emitted through the PTX backend") {
+        throw "PTX --explain omitted the neutral tensor-loop decision or backend boundary: $explainOut"
+      }
+      $dumped = Join-Path $tmpDir ($name + "_dumped.ptx")
+      $dumpOut = & $CompilerPath -O --dump-ir --emit-ptx `
+        --gpu-arch=portable $src -o $dumped 2>&1 | Out-String
+      $dumpPath = $dumped + ".ir"
+      if ($LASTEXITCODE -ne 0 -or -not (Test-Path $dumpPath)) {
+        throw "GPU --dump-ir omitted the optimized tensor loop: $dumpOut"
+      }
+      $dumpText = Get-Content -Raw $dumpPath
+      foreach ($loopContract in @("residency\.loop\.start#",
+                                   "residency\.loop\.update#",
+                                   "residency\.loop\.commit#")) {
+        if ($dumpText -notmatch $loopContract) {
+          throw "GPU --dump-ir omitted tensor-loop contract: $loopContract"
+        }
+      }
+    }
+    if ($src -like "*tensor_loop_no_residency.mettle") {
+      $mmaCount = [regex]::Matches($ptxText, "wmma\.mma\.sync").Count
+      $cLoadCount = [regex]::Matches($ptxText, "wmma\.load\.c\.sync").Count
+      $dStoreCount = [regex]::Matches($ptxText, "wmma\.store\.d\.sync").Count
+      if ($ptxText -match "mtlc\.tensor_loop" -or
+          $mmaCount -ne 2 -or $cLoadCount -ne 2 -or $dStoreCount -ne 2 -or
+          $ptxText -notmatch "st\.relaxed\.gpu\.global\.u32") {
+        throw "illegal tensor-loop residency: mma=$mmaCount c_load=$cLoadCount d_store=$dStoreCount"
+      }
+    }
+    if ($src -like "*tensor_pipeline.mettle") {
+      if ([regex]::Matches($ptxText,
+                          "mtlc\.async_copy synchronous-fallback bytes=16 transaction=16").Count -ne 4 -or
+          [regex]::Matches($ptxText, "ld\.global\.b32").Count -ne 16 -or
+          [regex]::Matches($ptxText, "st\.shared\.b32").Count -ne 16 -or
+          [regex]::Matches($ptxText,
+                          "mtlc\.async_copy commit synchronous-fallback").Count -ne 2 -or
+          [regex]::Matches($ptxText, "bar\.sync 0").Count -ne 2 -or
+          $ptxText -notmatch "mtlc\.tensor_pipeline resident group=1 tuple_peak=32 budget=64" -or
+          [regex]::Matches($ptxText, "wmma\.mma\.sync").Count -ne 2 -or
+          [regex]::Matches($ptxText, "wmma\.load\.c\.sync").Count -ne 1 -or
+          [regex]::Matches($ptxText, "wmma\.store\.d\.sync").Count -ne 1 -or
+          $ptxText -match "cp\.async\.") {
+        throw "portable staged-tensor replay/residency contract mismatch"
+      }
+      $waitOneAt = $ptxText.IndexOf(
+        "mtlc.async_copy wait pending=1 synchronous-fallback")
+      $firstBarrierAt = $ptxText.IndexOf("bar.sync 0", $waitOneAt + 1)
+      $firstMmaAt = $ptxText.IndexOf("wmma.mma.sync", $firstBarrierAt + 1)
+      $waitZeroAt = $ptxText.IndexOf(
+        "mtlc.async_copy wait pending=0 synchronous-fallback", $firstMmaAt + 1)
+      $secondBarrierAt = $ptxText.IndexOf("bar.sync 0", $waitZeroAt + 1)
+      $secondMmaAt = $ptxText.IndexOf("wmma.mma.sync", $firstMmaAt + 1)
+      $storeAt = $ptxText.IndexOf("wmma.store.d.sync", $secondMmaAt + 1)
+      if ($waitOneAt -lt 0 -or $firstBarrierAt -le $waitOneAt -or
+          $firstMmaAt -le $firstBarrierAt -or $waitZeroAt -le $firstMmaAt -or
+          $secondBarrierAt -le $waitZeroAt -or
+          $secondMmaAt -le $secondBarrierAt -or $storeAt -le $secondMmaAt) {
+        throw "portable staged-tensor handoff ordering mismatch"
+      }
+      $unoptimized = Join-Path $tmpDir ($name + "_unoptimized.ptx")
+      $unoptimizedOut = & $CompilerPath --emit-ptx --gpu-arch=portable `
+        $src -o $unoptimized 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) {
+        throw "unoptimized staged-tensor emit failed: $unoptimizedOut"
+      }
+      $unoptimizedText = Get-Content -Raw $unoptimized
+      if ($unoptimizedText -match "mtlc\.tensor_pipeline" -or
+          [regex]::Matches($unoptimizedText, "wmma\.load\.c\.sync").Count -ne 2 -or
+          [regex]::Matches($unoptimizedText, "wmma\.store\.d\.sync").Count -ne 2) {
+        throw "staged-tensor residency was not formed exclusively by the optimizer"
+      }
+      $explained = Join-Path $tmpDir ($name + "_explained.ptx")
+      $explainOut = & $CompilerPath -O --explain-all --emit-ptx `
+        --gpu-arch=portable $src -o $explained 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0 -or
+          $explainOut -notmatch "formed an asynchronously staged tensor accumulator pipeline" -or
+          $explainOut -notmatch "target-neutral optimized IR emitted through the PTX backend") {
+        throw "PTX --explain omitted the neutral staged-tensor decision: $explainOut"
+      }
+      $dumped = Join-Path $tmpDir ($name + "_dumped.ptx")
+      $dumpOut = & $CompilerPath -O --dump-ir --emit-ptx `
+        --gpu-arch=portable $src -o $dumped 2>&1 | Out-String
+      $dumpPath = $dumped + ".ir"
+      if ($LASTEXITCODE -ne 0 -or -not (Test-Path $dumpPath)) {
+        throw "GPU --dump-ir omitted the staged tensor pipeline: $dumpOut"
+      }
+      $dumpText = Get-Content -Raw $dumpPath
+      foreach ($pipelineContract in @("residency\.pipeline\.start#",
+                                       "residency\.pipeline\.update#",
+                                       "residency\.pipeline\.commit#")) {
+        if ($dumpText -notmatch $pipelineContract) {
+          throw "GPU --dump-ir omitted staged-tensor contract: $pipelineContract"
+        }
+      }
+    }
+    if ($src -like "*tensor_pipeline_no_residency.mettle") {
+      if ($ptxText -match "mtlc\.tensor_pipeline" -or
+          [regex]::Matches($ptxText, "wmma\.mma\.sync").Count -ne 2 -or
+          [regex]::Matches($ptxText, "wmma\.load\.c\.sync").Count -ne 2 -or
+          [regex]::Matches($ptxText, "wmma\.store\.d\.sync").Count -ne 2 -or
+          [regex]::Matches($ptxText,
+                          "mtlc\.async_copy synchronous-fallback bytes=16 transaction=16").Count -ne 4 -or
+          $ptxText -notmatch "st\.global\.u32") {
+        throw "observable effect illegally received staged-tensor residency"
+      }
+    }
+    if ($src -like "*tensor_pipeline4.mettle") {
+      if ([regex]::Matches($ptxText,
+                          "mtlc\.async_copy synchronous-fallback bytes=16 transaction=16").Count -ne 8 -or
+          [regex]::Matches($ptxText, "ld\.global\.b32").Count -ne 32 -or
+          [regex]::Matches($ptxText, "st\.shared\.b32").Count -ne 32 -or
+          [regex]::Matches($ptxText,
+                          "mtlc\.async_copy commit synchronous-fallback").Count -ne 4 -or
+          [regex]::Matches($ptxText, "bar\.sync 0").Count -ne 4 -or
+          $ptxText -notmatch "mtlc\.tensor_pipeline resident group=1 tuple_peak=32 budget=64" -or
+          [regex]::Matches($ptxText, "wmma\.mma\.sync").Count -ne 4 -or
+          [regex]::Matches($ptxText, "wmma\.load\.c\.sync").Count -ne 1 -or
+          [regex]::Matches($ptxText, "wmma\.store\.d\.sync").Count -ne 1 -or
+          $ptxText -match "cp\.async\.") {
+        throw "portable four-stage tensor pipeline contract mismatch"
+      }
+      foreach ($pending in 3, 2, 1, 0) {
+        if ([regex]::Matches(
+              $ptxText,
+              "mtlc\.async_copy wait pending=$pending synchronous-fallback").Count -ne 1) {
+          throw "portable four-stage pipeline omitted wait pending=$pending"
+        }
+      }
+      $unoptimized = Join-Path $tmpDir ($name + "_unoptimized.ptx")
+      $unoptimizedOut = & $CompilerPath --emit-ptx --gpu-arch=portable `
+        $src -o $unoptimized 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) {
+        throw "unoptimized four-stage pipeline emit failed: $unoptimizedOut"
+      }
+      $unoptimizedText = Get-Content -Raw $unoptimized
+      if ($unoptimizedText -match "mtlc\.tensor_pipeline" -or
+          [regex]::Matches($unoptimizedText,
+                          "wmma\.load\.c\.sync").Count -ne 4 -or
+          [regex]::Matches($unoptimizedText,
+                          "wmma\.store\.d\.sync").Count -ne 4) {
+        throw "four-stage residency was not formed exclusively by the optimizer"
+      }
+      $dumped = Join-Path $tmpDir ($name + "_dumped.ptx")
+      $dumpOut = & $CompilerPath -O --dump-ir --emit-ptx `
+        --gpu-arch=portable $src -o $dumped 2>&1 | Out-String
+      $dumpPath = $dumped + ".ir"
+      if ($LASTEXITCODE -ne 0 -or -not (Test-Path $dumpPath)) {
+        throw "GPU --dump-ir omitted the four-stage pipeline: $dumpOut"
+      }
+      $dumpText = Get-Content -Raw $dumpPath
+      if ([regex]::Matches($dumpText,
+                          "residency\.pipeline\.start#").Count -ne 1 -or
+          [regex]::Matches($dumpText,
+                          "residency\.pipeline\.update#").Count -ne 3 -or
+          [regex]::Matches($dumpText,
+                          "residency\.pipeline\.commit#").Count -ne 1) {
+        throw "neutral four-stage residency roles are incomplete"
+      }
+    }
+    if ($src -like "*async_copy.mettle") {
+      if ([regex]::Matches($ptxText, "mtlc\.async_copy synchronous-fallback").Count -ne 2 -or
+          [regex]::Matches($ptxText, "ld\.global\.b32").Count -ne 5 -or
+          [regex]::Matches($ptxText, "st\.shared\.b32").Count -ne 5 -or
+          $ptxText -match "cp\.async\.") {
+        throw "portable async-copy fallback contract mismatch"
+      }
+    }
+    if ([System.IO.Path]::GetFileName($src) -eq "auto_staging.mettle") {
+      $commitAt = $ptxText.IndexOf("mtlc.async_copy commit synchronous-fallback")
+      $overlapAt = $ptxText.IndexOf("mul.lo.u32", $commitAt + 1)
+      $waitAt = $ptxText.IndexOf("mtlc.async_copy wait pending=0 synchronous-fallback", $commitAt + 1)
+      $barrierAt = $ptxText.IndexOf("bar.sync 0", $waitAt + 1)
+      if ([regex]::Matches($ptxText,
+                           "mtlc\.async_copy auto-promoted synchronous-fallback").Count -ne 1 -or
+          $ptxText -match "cp\.async\." -or $commitAt -lt 0 -or
+          $overlapAt -le $commitAt -or $waitAt -le $overlapAt -or
+          $barrierAt -le $waitAt) {
+        throw "portable optimizer-generated staging/overlap contract mismatch"
+      }
+      $unoptimized = Join-Path $tmpDir ($name + "_unoptimized.ptx")
+      $unoptimizedOut = & $CompilerPath --emit-ptx --gpu-arch=portable $src -o $unoptimized 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) { throw "unoptimized auto-staging emit failed: $unoptimizedOut" }
+      $unoptimizedText = Get-Content -Raw $unoptimized
+      if ($unoptimizedText -match "mtlc\.async_copy|cp\.async\." -or
+          $unoptimizedText -notmatch "ld\.global\.u32" -or
+          $unoptimizedText -notmatch "st\.shared\.u32") {
+        throw "auto staging was not formed exclusively by the optimizer"
+      }
+      $explained = Join-Path $tmpDir ($name + "_explained.ptx")
+      $explainOut = & $CompilerPath -O --explain-all --emit-ptx `
+        --gpu-arch=portable $src -o $explained 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0 -or
+          $explainOut -notmatch "promoted 1 typed global-to-workgroup copy to asynchronous staging" -or
+          $explainOut -notmatch "target-neutral optimized IR emitted through the PTX backend") {
+        throw "PTX --explain omitted automatic neutral staging: $explainOut"
+      }
+      $dumped = Join-Path $tmpDir ($name + "_dumped.ptx")
+      $dumpOut = & $CompilerPath -O --dump-ir --emit-ptx `
+        --gpu-arch=portable $src -o $dumped 2>&1 | Out-String
+      $dumpPath = $dumped + ".ir"
+      if ($LASTEXITCODE -ne 0 -or -not (Test-Path $dumpPath) -or
+          (Get-Content -Raw $dumpPath) -notmatch
+            "(?s)async_copy\.workgroup .* generated.*async_copy\.commit.*async_copy\.wait") {
+        throw "GPU --dump-ir omitted optimizer-generated staging: $dumpOut"
+      }
+    }
+    if ([System.IO.Path]::GetFileName($src) -eq
+        "auto_staging_no_promote.mettle") {
+      if ($ptxText -match "mtlc\.async_copy|cp\.async\." -or
+          $ptxText -notmatch "ld\.global\.u32" -or
+          $ptxText -notmatch "st\.shared\.u32") {
+        throw "acquire-only barrier was illegally auto-promoted"
+      }
+    }
+    if ($ptxas) {
+      $asmOut = & $ptxas.Source -arch=sm_75 $ptxPath -o $cubin 2>&1 | Out-String
       if ($LASTEXITCODE -ne 0) { throw "ptxas rejected emitted PTX: $asmOut" }
-      Write-CaseResult -Name $name -Passed $true
+    }
+    Write-CaseResult -Name $name -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name $name -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# Execute the semantic launch lowering against a pure host stub. This validates
+# all eight controls and the natural-width parameter cells without loading a
+# GPU provider or touching a device. The public-API gate below feeds the same
+# nontrivial controls through the cross-host AArch64 object backend.
+$total++
+try {
+  $hostGcc = Get-Command gcc -ErrorAction SilentlyContinue
+  if (-not $hostGcc) {
+    Write-Host "[SKIP] gpu_dispatch_host_abi_runtime (gcc not found)"
+  } else {
+    $dispatchObj = Join-Path $tmpDir "gpu_dispatch_host_abi.obj"
+    $dispatchExe = Join-Path $tmpDir "gpu_dispatch_host_abi.exe"
+    $linkOut = & $hostGcc.Source $dispatchObj tests/gpu_dispatch_checked_stub.c `
+      -o $dispatchExe 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "linking the hardware-free launch ABI fixture failed: $linkOut"
+    }
+    & $dispatchExe | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "hardware-free launch ABI fixture returned $LASTEXITCODE"
+    }
+    Write-CaseResult -Name "gpu_dispatch_host_abi_runtime" -Passed $true
+  }
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "gpu_dispatch_host_abi_runtime" -Passed $false `
+    -Reason $_.Exception.Message
+}
+
+# Pure CPU semantic oracle for the neutral bounded matrix-region contract.
+# It covers non-multiple M/N/K, mixed layouts/strides, uint32 wrap, canonical
+# structured 2:4 compressed A, packed FP8/FP6/FP4 block scaling, K=0, and
+# out-of-range no-op behavior. It neither links a GPU provider nor touches a
+# driver/device.
+$total++
+try {
+  $hostGcc = Get-Command gcc -ErrorAction SilentlyContinue
+  if (-not $hostGcc) {
+    Write-Host "[SKIP] tensor_matmul_cpu_oracle (gcc not found)"
+  } else {
+    $oracleExe = Join-Path $tmpDir "tensor_matmul_oracle.exe"
+    $buildOut = & $hostGcc.Source -std=c11 -Wall -Wextra -Werror `
+      tests/tensor_matmul_oracle.c -o $oracleExe 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "building the tensor_matmul CPU oracle failed: $buildOut"
+    }
+    $oracleOut = & $oracleExe 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or
+        $oracleOut -notmatch "structured 2:4, FP8/FP6/FP4 block scales, packed streams, K=0, and no-op bounds OK") {
+      throw "tensor_matmul CPU oracle failed: $oracleOut"
+    }
+    Write-CaseResult -Name "tensor_matmul_cpu_oracle" -Passed $true
+  }
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "tensor_matmul_cpu_oracle" -Passed $false `
+    -Reason $_.Exception.Message
+}
+
+# Compiler/offline-assembler evidence for whole-problem tensor lowering. No
+# cubin produced here is ever loaded or executed.
+$total++
+try {
+  $matmulPtx = Join-Path $tmpDir "tensor_matmul_sm121a.ptx"
+  $matmulBudgetPtx = Join-Path $tmpDir "tensor_matmul_budget1.ptx"
+  $matmulTransposePtx = Join-Path $tmpDir "tensor_matmul_transpose_sm121a.ptx"
+  $matmulTransposeBudgetPtx = Join-Path $tmpDir "tensor_matmul_transpose_budget1.ptx"
+  $matmulFp8Ptx = Join-Path $tmpDir "tensor_matmul_fp8_sm121a.ptx"
+  $matmulFp8BudgetPtx = Join-Path $tmpDir "tensor_matmul_fp8_budget1.ptx"
+  $matmulScaledPtx = Join-Path $tmpDir "tensor_matmul_scaled_sm121a.ptx"
+  $matmulScaledBudgetPtx = Join-Path $tmpDir "tensor_matmul_scaled_budget1.ptx"
+  $matmulSparsePtx = Join-Path $tmpDir "tensor_matmul_sparse_sm121a.ptx"
+  $matmulSparseBudgetPtx = Join-Path $tmpDir "tensor_matmul_sparse_budget1.ptx"
+  $matmulCubin = Join-Path $tmpDir "tensor_matmul_sm121a.cubin"
+  $matmulTransposeCubin = Join-Path $tmpDir "tensor_matmul_transpose_sm121a.cubin"
+  $matmulFp8Cubin = Join-Path $tmpDir "tensor_matmul_fp8_sm121a.cubin"
+  $matmulScaledCubin = Join-Path $tmpDir "tensor_matmul_scaled_sm121a.cubin"
+  $matmulSparseCubin = Join-Path $tmpDir "tensor_matmul_sparse_sm121a.cubin"
+  $emitOut = & $CompilerPath -O --dump-ir --emit-ptx --gpu-arch=gb10 `
+    tests/gpu/tensor_matmul.mettle -o $matmulPtx 2>&1 | Out-String
+  $matmulIr = $matmulPtx + ".ir"
+  if ($LASTEXITCODE -ne 0 -or -not (Test-Path $matmulIr)) {
+    throw "tensor_matmul GB10 text emission failed: $emitOut"
+  }
+  $matmulText = Get-Content -Raw $matmulPtx
+  $matmulIrText = Get-Content -Raw $matmulIr
+  if ([regex]::Matches($matmulText,
+        "mtlc\.tensor_matmul native interior runtime-K resident stable-wmma").Count -ne 5 -or
+      [regex]::Matches($matmulText,
+        "mtlc\.tensor_matmul cooperative-full exact M/N/K edge replay").Count -ne 5 -or
+      [regex]::Matches($matmulText,
+        "mtlc\.tensor_matmul cooperative-tail exact M/N/K edge replay").Count -ne 5 -or
+      [regex]::Matches($matmulText, "wmma\.load\.c\.sync").Count -ne 5 -or
+      [regex]::Matches($matmulText, "wmma\.store\.d\.sync").Count -ne 5 -or
+      $matmulText -notmatch "mul\.lo\.u64" -or
+      $matmulText -notmatch "fma\.rn\.f32" -or
+      $matmulText -notmatch "fma\.rn\.f64" -or
+      $matmulText -notmatch "mad\.lo\.s32" -or
+      $matmulIrText -notmatch "tensor_matmul region=m16n16 k_chunk=16") {
+    throw "tensor_matmul output lost native residency, exact edge replay, 64-bit addressing, or neutral IR identity"
+  }
+  $budgetOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
+    --gpu-tensor-tuple-budget=1 tests/gpu/tensor_matmul.mettle `
+    -o $matmulBudgetPtx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "tensor_matmul tuple-budget fallback emission failed: $budgetOut"
+  }
+  $budgetText = Get-Content -Raw $matmulBudgetPtx
+  if ([regex]::Matches($budgetText,
+        "mtlc\.tensor_matmul cooperative-only: native accumulator exceeds tensor tuple budget").Count -ne 5 -or
+      $budgetText -match "wmma\.mma") {
+    throw "tensor_matmul tuple-budget policy did not fail over to exact cooperative lowering"
+  }
+  $transposeOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
+    tests/gpu/tensor_matmul_transpose.mettle -o $matmulTransposePtx `
+    2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "tensor_matmul transpose emission failed: $transposeOut"
+  }
+  $transposeText = Get-Content -Raw $matmulTransposePtx
+  if ([regex]::Matches($transposeText,
+        "mtlc\.tensor_matmul native interior runtime-K resident stable-wmma").Count -ne 3 -or
+      [regex]::Matches($transposeText,
+        "mtlc\.tensor_matmul cooperative-full exact M/N/K edge replay").Count -ne 3 -or
+      [regex]::Matches($transposeText,
+        "mtlc\.tensor_matmul cooperative-tail exact M/N/K edge replay").Count -ne 3 -or
+      [regex]::Matches($transposeText, "wmma\.mma").Count -ne 6 -or
+      [regex]::Matches($transposeText, "wmma\.load\.c\.sync").Count -ne 3 -or
+      [regex]::Matches($transposeText, "wmma\.store\.d\.sync").Count -ne 3 -or
+      $transposeText -notmatch "mul\.lo\.u64") {
+    throw "tensor_matmul transpose lost its backend-local native view or exact edge replay"
+  }
+  $transposeBudgetOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
+    --gpu-tensor-tuple-budget=1 tests/gpu/tensor_matmul_transpose.mettle `
+    -o $matmulTransposeBudgetPtx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "tensor_matmul transpose tuple-budget fallback emission failed: $transposeBudgetOut"
+  }
+  $transposeBudgetText = Get-Content -Raw $matmulTransposeBudgetPtx
+  if ([regex]::Matches($transposeBudgetText,
+        "mtlc\.tensor_matmul cooperative-only: native accumulator exceeds tensor tuple budget").Count -ne 3 -or
+      $transposeBudgetText -match "wmma\.mma") {
+    throw "tensor_matmul transpose tuple-budget policy did not preserve exact cooperative replay"
+  }
+  $fp8Out = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
+    tests/gpu/tensor_matmul_fp8.mettle -o $matmulFp8Ptx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "tensor_matmul FP8 emission failed: $fp8Out"
+  }
+  $fp8Text = Get-Content -Raw $matmulFp8Ptx
+  if ([regex]::Matches($fp8Text,
+        "mtlc\.tensor_matmul native interior runtime-K resident direct-mma").Count -ne 2 -or
+      [regex]::Matches($fp8Text,
+        "mtlc\.tensor_matmul cooperative-full exact M/N/K edge replay").Count -ne 2 -or
+      [regex]::Matches($fp8Text,
+        "mtlc\.tensor_matmul cooperative-tail exact M/N/K edge replay").Count -ne 2 -or
+      [regex]::Matches($fp8Text, "cvt\.rn\.f16x2\.e4m3x2").Count -ne 4 -or
+      [regex]::Matches($fp8Text, "cvt\.rn\.f16x2\.e5m2x2").Count -ne 4 -or
+      [regex]::Matches($fp8Text, "mma\.sync").Count -ne 8 -or
+      $fp8Text -match "wmma\.mma") {
+    throw "tensor_matmul FP8 lost direct-MMA residency or exact architectural edge conversion"
+  }
+  $fp8BudgetOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
+    --gpu-tensor-tuple-budget=1 tests/gpu/tensor_matmul_fp8.mettle `
+    -o $matmulFp8BudgetPtx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "tensor_matmul FP8 tuple-budget fallback emission failed: $fp8BudgetOut"
+  }
+  $fp8BudgetText = Get-Content -Raw $matmulFp8BudgetPtx
+  if ([regex]::Matches($fp8BudgetText,
+        "mtlc\.tensor_matmul cooperative-only: native accumulator exceeds tensor tuple budget").Count -ne 2 -or
+      [regex]::Matches($fp8BudgetText, "cvt\.rn\.f16x2\.e4m3x2").Count -ne 2 -or
+      [regex]::Matches($fp8BudgetText, "cvt\.rn\.f16x2\.e5m2x2").Count -ne 2 -or
+      $fp8BudgetText -match "wmma\.mma|mma\.sync") {
+    throw "tensor_matmul FP8 tuple-budget policy did not preserve exact cooperative replay"
+  }
+  $scaledOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
+    tests/gpu/tensor_matmul_scaled.mettle -o $matmulScaledPtx `
+    2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "tensor_matmul scaled FP8/FP6/FP4 emission failed: $scaledOut"
+  }
+  $scaledText = Get-Content -Raw $matmulScaledPtx
+  if ([regex]::Matches($scaledText,
+        "mtlc\.tensor_matmul native interior runtime-K resident direct-mma").Count -ne 4 -or
+      [regex]::Matches($scaledText,
+        "mtlc\.tensor_matmul cooperative-full exact M/N/K edge replay").Count -ne 4 -or
+      [regex]::Matches($scaledText,
+        "mtlc\.tensor_matmul cooperative-tail exact M/N/K edge replay").Count -ne 4 -or
+      [regex]::Matches($scaledText,
+        "mtlc\.tensor_matmul dense-subbyte byte-alignment guard").Count -ne 4 -or
+      [regex]::Matches($scaledText, "fma\.rn\.f32").Count -ne 8 -or
+      [regex]::Matches($scaledText, "@%p[0-9]+ mov\.u32 %r[0-9]+, 4194304").Count -ne 12 -or
+      [regex]::Matches($scaledText, "@%p[0-9]+ mov\.u32 %r[0-9]+, 2143289344").Count -ne 12 -or
+      $scaledText -match "cvt\.rn\.f16x2\.(e2m1|e2m3|e3m2)x2|wmma\.mma") {
+    throw "tensor_matmul scaled output lost native residency, exact packed/scale replay, or the GB10-safe integer decoder"
+  }
+  foreach ($scaledInstruction in @(
+      "mma\.sync\.aligned\.m16n8k32\.row\.col\.kind::mxf8f6f4\.block_scale\.scale_vec::1X\.f32\.e3m2\.e2m3\.f32\.ue8m0",
+      "mma\.sync\.aligned\.m16n8k64\.row\.col\.kind::mxf4\.block_scale\.scale_vec::2X\.f32\.e2m1\.e2m1\.f32\.ue8m0",
+      "mma\.sync\.aligned\.m16n8k64\.row\.col\.kind::mxf4nvf4\.block_scale\.scale_vec::4X\.f32\.e2m1\.e2m1\.f32\.ue4m3",
+      "mma\.sync\.aligned\.m16n8k32\.row\.col\.kind::mxf8f6f4\.block_scale\.scale_vec::1X\.f32\.e4m3\.e5m2\.f32\.ue8m0")) {
+    if ([regex]::Matches($scaledText, $scaledInstruction).Count -ne 4) {
+      throw "tensor_matmul scaled output lost native instruction family: $scaledInstruction"
+    }
+  }
+  $scaledBudgetOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
+    --gpu-tensor-tuple-budget=1 tests/gpu/tensor_matmul_scaled.mettle `
+    -o $matmulScaledBudgetPtx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "tensor_matmul scaled tuple-budget fallback emission failed: $scaledBudgetOut"
+  }
+  $scaledBudgetText = Get-Content -Raw $matmulScaledBudgetPtx
+  if ([regex]::Matches($scaledBudgetText,
+        "mtlc\.tensor_matmul cooperative-only: native accumulator exceeds tensor tuple budget").Count -ne 4 -or
+      [regex]::Matches($scaledBudgetText, "fma\.rn\.f32").Count -ne 4 -or
+      $scaledBudgetText -match "wmma\.mma|mma\.sync") {
+    throw "tensor_matmul scaled tuple-budget policy did not preserve exact cooperative replay"
+  }
+  $sparseOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
+    tests/gpu/tensor_matmul_sparse.mettle -o $matmulSparsePtx `
+    2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "tensor_matmul structured-2:4 emission failed: $sparseOut"
+  }
+  $sparseText = Get-Content -Raw $matmulSparsePtx
+  if ([regex]::Matches($sparseText,
+        "mtlc\.tensor_matmul native interior runtime-K resident direct-mma").Count -ne 2 -or
+      [regex]::Matches($sparseText,
+        "mtlc\.tensor_matmul cooperative-full exact M/N/K edge replay").Count -ne 2 -or
+      [regex]::Matches($sparseText,
+        "mtlc\.tensor_matmul cooperative-tail exact M/N/K edge replay").Count -ne 2 -or
+      [regex]::Matches($sparseText,
+        "mma\.sp::ordered_metadata\.sync\.aligned\.m16n8k16").Count -ne 8 -or
+      [regex]::Matches($sparseText, "@%p[0-9]+ ld\.global\.b16").Count -ne 4 -or
+      [regex]::Matches($sparseText, "cvt\.f32\.f16").Count -ne 4 -or
+      [regex]::Matches($sparseText, "cvt\.f32\.bf16").Count -ne 4 -or
+      $sparseText -match "wmma\.mma") {
+    throw "tensor_matmul structured-2:4 lost native residency, canonical metadata translation, transpose, or exact edge replay"
+  }
+  $sparseBudgetOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
+    --gpu-tensor-tuple-budget=1 tests/gpu/tensor_matmul_sparse.mettle `
+    -o $matmulSparseBudgetPtx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "tensor_matmul structured-2:4 tuple-budget fallback emission failed: $sparseBudgetOut"
+  }
+  $sparseBudgetText = Get-Content -Raw $matmulSparseBudgetPtx
+  if ([regex]::Matches($sparseBudgetText,
+        "mtlc\.tensor_matmul cooperative-only: native accumulator exceeds tensor tuple budget").Count -ne 2 -or
+      [regex]::Matches($sparseBudgetText,
+        "@%p[0-9]+ ld\.global\.b16").Count -ne 2 -or
+      $sparseBudgetText -match "wmma\.mma|mma\.sp") {
+    throw "tensor_matmul structured-2:4 tuple-budget policy did not preserve exact cooperative replay"
+  }
+  if ($ptxas) {
+    $ptxasHelp = & $ptxas.Source --help 2>&1 | Out-String
+    if ($ptxasHelp -match "sm_121a") {
+      $asmOut = & $ptxas.Source -arch=sm_121a -v $matmulPtx `
+        -o $matmulCubin 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0 -or
+          $asmOut -match "[1-9][0-9]* bytes spill (stores|loads)") {
+        throw "offline ptxas rejected or spilled tensor_matmul PTX: $asmOut"
+      }
+      $transposeAsmOut = & $ptxas.Source -arch=sm_121a -v `
+        $matmulTransposePtx -o $matmulTransposeCubin 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0 -or
+          $transposeAsmOut -match "[1-9][0-9]* bytes spill (stores|loads)") {
+        throw "offline ptxas rejected or spilled transposed tensor_matmul PTX: $transposeAsmOut"
+      }
+      $fp8AsmOut = & $ptxas.Source -arch=sm_121a -v $matmulFp8Ptx `
+        -o $matmulFp8Cubin 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0 -or
+          $fp8AsmOut -match "[1-9][0-9]* bytes spill (stores|loads)") {
+        throw "offline ptxas rejected or spilled FP8 tensor_matmul PTX: $fp8AsmOut"
+      }
+      $scaledAsmOut = & $ptxas.Source -arch=sm_121a -v $matmulScaledPtx `
+        -o $matmulScaledCubin 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0 -or
+          $scaledAsmOut -match "[1-9][0-9]* bytes (stack frame|spill stores|spill loads)") {
+        throw "offline ptxas rejected, stacked, or spilled scaled tensor_matmul PTX: $scaledAsmOut"
+      }
+      $sparseAsmOut = & $ptxas.Source -arch=sm_121a -v $matmulSparsePtx `
+        -o $matmulSparseCubin 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0 -or
+          $sparseAsmOut -match "[1-9][0-9]* bytes (stack frame|spill stores|spill loads)") {
+        throw "offline ptxas rejected, stacked, or spilled structured-2:4 tensor_matmul PTX: $sparseAsmOut"
+      }
+      foreach ($sparseKernel in @(
+          "tensor_matmul_sparse_f16",
+          "tensor_matmul_sparse_bf16_transpose_a")) {
+        $resource = [regex]::Match(
+          $sparseAsmOut,
+          "(?s)Function properties for $sparseKernel.*?Used ([0-9]+) registers"
+        )
+        if (-not $resource.Success -or
+            [int]$resource.Groups[1].Value -gt 56) {
+          throw "structured-2:4 tensor_matmul register ceiling failed for $sparseKernel`: $sparseAsmOut"
+        }
+      }
+      $scaledRegisterCeilings = @{
+        tensor_matmul_mxfp6_f32 = 64
+        tensor_matmul_mxfp4_f32 = 64
+        tensor_matmul_nvfp4_f32 = 64
+        tensor_matmul_mxfp8_transpose_f32 = 80
+      }
+      foreach ($scaledKernel in $scaledRegisterCeilings.Keys) {
+        $resource = [regex]::Match(
+          $scaledAsmOut,
+          "(?s)Function properties for $scaledKernel.*?Used ([0-9]+) registers"
+        )
+        if (-not $resource.Success -or
+            [int]$resource.Groups[1].Value -gt $scaledRegisterCeilings[$scaledKernel]) {
+          throw "scaled tensor_matmul register ceiling failed for $scaledKernel`: $scaledAsmOut"
+        }
+      }
+    } else {
+      Write-Host "[SKIP] tensor_matmul_offline ptxas assembly (toolkit lacks sm_121a)"
+    }
+  } else {
+    Write-Host "[SKIP] tensor_matmul_offline ptxas assembly (ptxas not found)"
+  }
+  Write-CaseResult -Name "tensor_matmul_offline" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "tensor_matmul_offline" -Passed $false `
+    -Reason $_.Exception.Message
+}
+
+$total++
+try {
+  $gb10Ptx = Join-Path $tmpDir "ptx_emit_gb10.ptx"
+  $gb10Cubin = Join-Path $tmpDir "ptx_emit_gb10.cubin"
+  $emitOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
+    tests/gpu/compute_kernels.mettle -o $gb10Ptx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "GB10 emit failed: $emitOut" }
+  $gb10Text = Get-Content -Raw $gb10Ptx
+  if ($gb10Text -notmatch "(?m)^\.version 8\.8\r?$") { throw "GB10 PTX version is not 8.8" }
+  if ($gb10Text -notmatch "(?m)^\.target sm_121a\r?$") { throw "GB10 PTX target is not sm_121a" }
+  $rowNormEntry = [regex]::Match(
+    $gb10Text,
+    '(?s)\.visible \.entry row_norm\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  if (-not $rowNormEntry -or
+      $rowNormEntry -notmatch 'add\.f32 (?<acc>%f[0-9]+), \k<acc>, ' -or
+      $rowNormEntry -notmatch 'add\.s32 (?<iv>%r[0-9]+), \k<iv>, ') {
+    throw "optimized PTX lost stable mutable-symbol homes across the row_norm loop"
+  }
+  if ($ptxas) {
+    $ptxasHelp = & $ptxas.Source --help 2>&1 | Out-String
+    if ($ptxasHelp -match "sm_121a") {
+      $asmOut = & $ptxas.Source -arch=sm_121a $gb10Ptx -o $gb10Cubin 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) { throw "ptxas rejected GB10 PTX: $asmOut" }
+    } else {
+      Write-Host "[SKIP] ptx_emit_gb10 ptxas assembly (toolkit lacks sm_121a)"
+    }
+  } else {
+    Write-Host "[SKIP] ptx_emit_gb10 ptxas assembly (ptxas not found)"
+  }
+  Write-CaseResult -Name "ptx_emit_gb10" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "ptx_emit_gb10" -Passed $false -Reason $_.Exception.Message
+}
+
+$total++
+try {
+  $gb10AsyncPtx = Join-Path $tmpDir "ptx_emit_gb10_async_copy.ptx"
+  $gb10AsyncCubin = Join-Path $tmpDir "ptx_emit_gb10_async_copy.cubin"
+  $gb10AutoPtx = Join-Path $tmpDir "ptx_emit_gb10_auto_staging.ptx"
+  $gb10AutoCubin = Join-Path $tmpDir "ptx_emit_gb10_auto_staging.cubin"
+  $asyncEmitOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
+    tests/gpu/async_copy.mettle -o $gb10AsyncPtx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "GB10 async-copy emit failed: $asyncEmitOut" }
+  $autoEmitOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
+    tests/gpu/auto_staging.mettle -o $gb10AutoPtx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "GB10 auto-staging emit failed: $autoEmitOut" }
+  $gb10AsyncText = Get-Content -Raw $gb10AsyncPtx
+  if ([regex]::Matches($gb10AsyncText, "cp\.async\.ca\.shared\.global").Count -ne 1 -or
+      [regex]::Matches($gb10AsyncText, "cp\.async\.cg\.shared\.global").Count -ne 1 -or
+      [regex]::Matches($gb10AsyncText, "cp\.async\.commit_group").Count -ne 2 -or
+      [regex]::Matches($gb10AsyncText, "cp\.async\.wait_group 0").Count -ne 2 -or
+      $gb10AsyncText -match "synchronous-fallback") {
+    throw "GB10 async-copy native contract mismatch"
+  }
+  $gb10AutoText = Get-Content -Raw $gb10AutoPtx
+  $autoCommitAt = $gb10AutoText.IndexOf("cp.async.commit_group")
+  $autoOverlapAt = $gb10AutoText.IndexOf("mul.lo.u32", $autoCommitAt + 1)
+  $autoWaitAt = $gb10AutoText.IndexOf("cp.async.wait_group 0", $autoCommitAt + 1)
+  $autoBarrierAt = $gb10AutoText.IndexOf("bar.sync 0", $autoWaitAt + 1)
+  if ([regex]::Matches($gb10AutoText,
+                       "mtlc\.async_copy auto-promoted native").Count -ne 1 -or
+      [regex]::Matches($gb10AutoText,
+                       "cp\.async\.ca\.shared\.global").Count -ne 1 -or
+      $autoCommitAt -lt 0 -or $autoOverlapAt -le $autoCommitAt -or
+      $autoWaitAt -le $autoOverlapAt -or $autoBarrierAt -le $autoWaitAt -or
+      $gb10AutoText -match "synchronous-fallback") {
+    throw "GB10 optimizer-generated staging/overlap contract mismatch"
+  }
+  if ($ptxas) {
+    $ptxasHelp = & $ptxas.Source --help 2>&1 | Out-String
+    if ($ptxasHelp -match "sm_121a") {
+      $asyncAsmOut = & $ptxas.Source -arch=sm_121a $gb10AsyncPtx -o $gb10AsyncCubin 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) { throw "ptxas rejected GB10 async-copy PTX: $asyncAsmOut" }
+      $autoAsmOut = & $ptxas.Source -arch=sm_121a $gb10AutoPtx -o $gb10AutoCubin 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) { throw "ptxas rejected GB10 auto-staging PTX: $autoAsmOut" }
+    } else {
+      Write-Host "[SKIP] ptx_emit_gb10_async_copy ptxas assembly (toolkit lacks sm_121a)"
+    }
+  } else {
+    Write-Host "[SKIP] ptx_emit_gb10_async_copy ptxas assembly (ptxas not found)"
+  }
+  Write-CaseResult -Name "ptx_emit_gb10_async_copy" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "ptx_emit_gb10_async_copy" -Passed $false -Reason $_.Exception.Message
+}
+
+$total++
+try {
+  $gb10TensorPtx = Join-Path $tmpDir "ptx_emit_gb10_tensor.ptx"
+  $gb10TensorCubin = Join-Path $tmpDir "ptx_emit_gb10_tensor.cubin"
+  $gb10ChainPtx = Join-Path $tmpDir "ptx_emit_gb10_tensor_chain.ptx"
+  $gb10ChainCubin = Join-Path $tmpDir "ptx_emit_gb10_tensor_chain.cubin"
+  $tensorEmitOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
+    tests/gpu/tensor_kernels.mettle -o $gb10TensorPtx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "GB10 tensor emit failed: $tensorEmitOut" }
+  $chainEmitOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
+    tests/gpu/tensor_chain.mettle -o $gb10ChainPtx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "GB10 tensor-chain emit failed: $chainEmitOut" }
+  $gb10ChainText = Get-Content -Raw $gb10ChainPtx
+  if ($gb10ChainText -notmatch "mtlc\.tensor_chain resident tiles=4 tuple_peak=32 budget=96" -or
+      [regex]::Matches($gb10ChainText, "wmma\.load\.c\.sync").Count -ne 1 -or
+      [regex]::Matches($gb10ChainText, "wmma\.store\.d\.sync").Count -ne 1) {
+    throw "GB10 tensor-chain cost model/residency contract mismatch"
+  }
+  $gb10TensorText = Get-Content -Raw $gb10TensorPtx
+  foreach ($tensorContract in @(
+      "wmma\.mma\.sync\.aligned\.m16n16k16\.row\.col\.f32\.f32",
+      "wmma\.mma\.sync\.aligned\.m32n8k16\.col\.row\.f32\.bf16\.bf16\.f32",
+      "wmma\.mma\.sync\.aligned\.m16n16k8\.row\.col\.f32\.tf32\.tf32\.f32",
+      "wmma\.mma\.sync\.aligned\.m8n8k4\.row\.col\.f64\.f64\.f64\.f64",
+      "wmma\.mma\.sync\.aligned\.m16n16k16\.row\.col\.s32\.s8\.s8\.s32\.satfinite",
+      "wmma\.mma\.sync\.aligned\.m8n8k32\.row\.col\.s32\.u4\.u4\.s32",
+      "wmma\.mma\.xor\.popc\.sync\.aligned\.m8n8k128",
+      "\.entry tensor_f16_f32_strided\(",
+      "\.param \.s32 tensor_f16_f32_strided_p7",
+      "ld\.param\.s32 %r[0-9]+, \[tensor_f16_f32_strided_p4\]",
+      "\.entry tensor_f16_f32_kloop\(")) {
+    if ($gb10TensorText -notmatch $tensorContract) {
+      throw "missing GB10 tensor contract: $tensorContract"
+    }
+  }
+  $gb10KLoopEntry = [regex]::Match(
+    $gb10TensorText,
+    '(?s)\.visible \.entry tensor_f16_f32_kloop\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  if (-not $gb10KLoopEntry -or
+      $gb10KLoopEntry -notmatch 'mtlc\.tensor_loop resident group=1 tuple_peak=32 budget=96' -or
+      [regex]::Matches($gb10KLoopEntry, 'wmma\.mma\.sync').Count -ne 2 -or
+      [regex]::Matches($gb10KLoopEntry, 'wmma\.load\.c\.sync').Count -ne 1 -or
+      [regex]::Matches($gb10KLoopEntry, 'wmma\.store\.d\.sync').Count -ne 1) {
+    throw "GB10 runtime-K tensor residency contract mismatch"
+  }
+  if ($ptxas) {
+    $ptxasHelp = & $ptxas.Source --help 2>&1 | Out-String
+    if ($ptxasHelp -match "sm_121a") {
+      $tensorAsmOut = & $ptxas.Source -arch=sm_121a $gb10TensorPtx -o $gb10TensorCubin 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) { throw "ptxas rejected GB10 tensor PTX: $tensorAsmOut" }
+      $chainAsmOut = & $ptxas.Source -arch=sm_121a $gb10ChainPtx -o $gb10ChainCubin 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) { throw "ptxas rejected GB10 tensor-chain PTX: $chainAsmOut" }
+    } else {
+      Write-Host "[SKIP] ptx_emit_gb10_tensor ptxas assembly (toolkit lacks sm_121a)"
+    }
+  } else {
+    Write-Host "[SKIP] ptx_emit_gb10_tensor ptxas assembly (ptxas not found)"
+  }
+  Write-CaseResult -Name "ptx_emit_gb10_tensor" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "ptx_emit_gb10_tensor" -Passed $false -Reason $_.Exception.Message
+}
+
+$total++
+try {
+  $gb10Fp8Ptx = Join-Path $tmpDir "ptx_emit_gb10_tensor_fp8.ptx"
+  $gb10Fp8Cubin = Join-Path $tmpDir "ptx_emit_gb10_tensor_fp8.cubin"
+  $fp8EmitOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
+    tests/gpu/tensor_native_fp8.mettle -o $gb10Fp8Ptx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "GB10 native-FP8 tensor emit failed: $fp8EmitOut"
+  }
+  $gb10Fp8Text = Get-Content -Raw $gb10Fp8Ptx
+  if ($gb10Fp8Text -notmatch "(?m)^\.version 8\.8\r?$" -or
+      $gb10Fp8Text -notmatch "(?m)^\.target sm_121a\r?$") {
+    throw "GB10 native-FP8 tensor module did not select PTX 8.8/sm_121a"
+  }
+  $gb10Fp8Entry = [regex]::Match(
+    $gb10Fp8Text,
+    '(?s)\.visible \.entry tensor_fp8_m16n16k32\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  if (-not $gb10Fp8Entry -or
+      $gb10Fp8Entry -notmatch
+        'mtlc\.tensor_mma native-mma fp8 whole-tile lowering' -or
+      [regex]::Matches(
+        $gb10Fp8Entry,
+        'mma\.sync\.aligned\.m16n8k32\.row\.col\.f32\.e4m3\.e5m2\.f32'
+      ).Count -ne 2 -or
+      $gb10Fp8Entry -match 'wmma\.') {
+    throw "GB10 native mixed-FP8 m16n16k32 contract mismatch"
+  }
+  $gb10Fp8TransposedEntry = [regex]::Match(
+    $gb10Fp8Text,
+    '(?s)\.visible \.entry tensor_fp8_m32n24k16_transposed\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  if (-not $gb10Fp8TransposedEntry -or
+      $gb10Fp8TransposedEntry -notmatch
+        'mtlc\.tensor_mma native-mma fp8 whole-tile lowering' -or
+      [regex]::Matches(
+        $gb10Fp8TransposedEntry,
+        'mma\.sync\.aligned\.m16n8k16\.row\.col\.f32\.e5m2\.e4m3\.f32'
+      ).Count -ne 6 -or
+      $gb10Fp8TransposedEntry -match 'wmma\.') {
+    throw "GB10 tiled mixed-FP8 transpose/layout contract mismatch"
+  }
+  $gb10Fp8ChainEntry = [regex]::Match(
+    $gb10Fp8Text,
+    '(?s)\.visible \.entry tensor_fp8_chain4_m16n16k32\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  if (-not $gb10Fp8ChainEntry -or
+      $gb10Fp8ChainEntry -notmatch
+        'mtlc\.tensor_chain resident native-mma fp8 tiles=4 subtiles=2' -or
+      [regex]::Matches(
+        $gb10Fp8ChainEntry,
+        'mma\.sync\.aligned\.m16n8k32\.row\.col\.f32\.e4m3\.e5m2\.f32'
+      ).Count -ne 8 -or
+      [regex]::Matches($gb10Fp8ChainEntry, 'ld\.global\.f32').Count -ne 8 -or
+      [regex]::Matches($gb10Fp8ChainEntry, 'st\.global\.f32').Count -ne 8 -or
+      $gb10Fp8ChainEntry -match 'replay|wmma\.') {
+    throw "GB10 native FP8 chain residency contract mismatch"
+  }
+  $gb10Fp8LoopEntry = [regex]::Match(
+    $gb10Fp8Text,
+    '(?s)\.visible \.entry tensor_fp8_runtime_k_m16n16k32\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  if (-not $gb10Fp8LoopEntry -or
+      $gb10Fp8LoopEntry -notmatch
+        'mtlc\.tensor_loop resident native-mma fp8 group=1 subtiles=2' -or
+      [regex]::Matches(
+        $gb10Fp8LoopEntry,
+        'mma\.sync\.aligned\.m16n8k32\.row\.col\.f32\.e4m3\.e5m2\.f32'
+      ).Count -ne 4 -or
+      [regex]::Matches($gb10Fp8LoopEntry, 'ld\.global\.f32').Count -ne 8 -or
+      [regex]::Matches($gb10Fp8LoopEntry, 'st\.global\.f32').Count -ne 8 -or
+      $gb10Fp8LoopEntry -match 'replay|wmma\.') {
+    throw "GB10 runtime-K native FP8 residency contract mismatch"
+  }
+  $gb10Fp8Unoptimized =
+    Join-Path $tmpDir "ptx_emit_gb10_tensor_fp8_unoptimized.ptx"
+  $fp8UnoptimizedOut = & $CompilerPath --emit-ptx --gpu-arch=gb10 `
+    tests/gpu/tensor_native_fp8.mettle -o $gb10Fp8Unoptimized 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "GB10 unoptimized native-FP8 emit failed: $fp8UnoptimizedOut"
+  }
+  $gb10Fp8UnoptimizedText = Get-Content -Raw $gb10Fp8Unoptimized
+  $gb10Fp8UnoptimizedChain = [regex]::Match(
+    $gb10Fp8UnoptimizedText,
+    '(?s)\.visible \.entry tensor_fp8_chain4_m16n16k32\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  $gb10Fp8UnoptimizedLoop = [regex]::Match(
+    $gb10Fp8UnoptimizedText,
+    '(?s)\.visible \.entry tensor_fp8_runtime_k_m16n16k32\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  if ($gb10Fp8UnoptimizedChain -match 'mtlc\.tensor_chain' -or
+      [regex]::Matches(
+        $gb10Fp8UnoptimizedChain,
+        'mtlc\.tensor_mma native-mma fp8 whole-tile lowering'
+      ).Count -ne 4 -or
+      $gb10Fp8UnoptimizedLoop -match 'mtlc\.tensor_loop' -or
+      [regex]::Matches(
+        $gb10Fp8UnoptimizedLoop,
+        'mtlc\.tensor_mma native-mma fp8 whole-tile lowering'
+      ).Count -ne 2) {
+    throw "native FP8 residency was not formed exclusively by the optimizer"
+  }
+  if ($ptxas) {
+    $ptxasHelp = & $ptxas.Source --help 2>&1 | Out-String
+    if ($ptxasHelp -match "sm_121a") {
+      $fp8AsmOut = & $ptxas.Source -arch=sm_121a $gb10Fp8Ptx `
+        -o $gb10Fp8Cubin 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) {
+        throw "ptxas rejected GB10 native-FP8 tensor PTX: $fp8AsmOut"
+      }
+    } else {
+      Write-Host "[SKIP] ptx_emit_gb10_tensor_fp8 ptxas assembly (toolkit lacks sm_121a)"
+    }
+  } else {
+    Write-Host "[SKIP] ptx_emit_gb10_tensor_fp8 ptxas assembly (ptxas not found)"
+  }
+  Write-CaseResult -Name "ptx_emit_gb10_tensor_fp8" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "ptx_emit_gb10_tensor_fp8" -Passed $false -Reason $_.Exception.Message
+}
+
+$total++
+try {
+  $gb10Fp4Ptx = Join-Path $tmpDir "ptx_emit_gb10_tensor_fp4.ptx"
+  $gb10Fp4Cubin = Join-Path $tmpDir "ptx_emit_gb10_tensor_fp4.cubin"
+  $fp4EmitOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
+    tests/gpu/tensor_native_fp4.mettle -o $gb10Fp4Ptx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "GB10 native-MXFP4 tensor emit failed: $fp4EmitOut"
+  }
+  $gb10Fp4Text = Get-Content -Raw $gb10Fp4Ptx
+  if ($gb10Fp4Text -notmatch "(?m)^\.version 8\.8\r?$" -or
+      $gb10Fp4Text -notmatch "(?m)^\.target sm_121a\r?$") {
+    throw "GB10 native-MXFP4 tensor module did not select PTX 8.8/sm_121a"
+  }
+  $fp4Instruction =
+    'mma\.sync\.aligned\.m16n8k64\.row\.col\.kind::mxf4\.block_scale\.scale_vec::2X\.f32\.e2m1\.e2m1\.f32\.ue8m0'
+  $gb10Fp4Entry = [regex]::Match(
+    $gb10Fp4Text,
+    '(?s)\.visible \.entry tensor_mxfp4_m16n16k64\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  if (-not $gb10Fp4Entry -or
+      $gb10Fp4Entry -notmatch
+        'mtlc\.tensor_mma native-mma mxfp4 whole-tile lowering' -or
+      [regex]::Matches($gb10Fp4Entry, $fp4Instruction).Count -ne 2 -or
+      [regex]::Matches($gb10Fp4Entry, 'ld\.global\.b32').Count -ne 12 -or
+      [regex]::Matches($gb10Fp4Entry, 'ld\.global\.f32').Count -ne 8 -or
+      [regex]::Matches($gb10Fp4Entry, 'st\.global\.f32').Count -ne 8 -or
+      $gb10Fp4Entry -match 'wmma\.') {
+    throw "GB10 native MXFP4 direct/packed-load contract mismatch"
+  }
+  $gb10Fp4ChainEntry = [regex]::Match(
+    $gb10Fp4Text,
+    '(?s)\.visible \.entry tensor_mxfp4_chain3_m16n16k64\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  if (-not $gb10Fp4ChainEntry -or
+      $gb10Fp4ChainEntry -notmatch
+        'mtlc\.tensor_chain resident native-mma mxfp4 tiles=3 subtiles=2' -or
+      [regex]::Matches($gb10Fp4ChainEntry, $fp4Instruction).Count -ne 6 -or
+      [regex]::Matches($gb10Fp4ChainEntry, 'ld\.global\.b32').Count -ne 36 -or
+      [regex]::Matches($gb10Fp4ChainEntry, 'ld\.global\.f32').Count -ne 8 -or
+      [regex]::Matches($gb10Fp4ChainEntry, 'st\.global\.f32').Count -ne 8 -or
+      $gb10Fp4ChainEntry -match 'replay|wmma\.') {
+    throw "GB10 native MXFP4 chain-residency contract mismatch"
+  }
+  $gb10Fp4LoopEntry = [regex]::Match(
+    $gb10Fp4Text,
+    '(?s)\.visible \.entry tensor_mxfp4_runtime_k_m16n16k64\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  if (-not $gb10Fp4LoopEntry -or
+      $gb10Fp4LoopEntry -notmatch
+        'mtlc\.tensor_loop resident native-mma mxfp4 group=1 subtiles=2' -or
+      [regex]::Matches($gb10Fp4LoopEntry, $fp4Instruction).Count -ne 4 -or
+      [regex]::Matches($gb10Fp4LoopEntry, 'ld\.global\.f32').Count -ne 8 -or
+      [regex]::Matches($gb10Fp4LoopEntry, 'st\.global\.f32').Count -ne 8 -or
+      $gb10Fp4LoopEntry -match 'replay|wmma\.') {
+    throw "GB10 runtime-K native MXFP4 residency contract mismatch"
+  }
+  $nvfp4Instruction =
+    'mma\.sync\.aligned\.m16n8k64\.row\.col\.kind::mxf4nvf4\.block_scale\.scale_vec::4X\.f32\.e2m1\.e2m1\.f32\.ue4m3'
+  $gb10Nvfp4Entry = [regex]::Match(
+    $gb10Fp4Text,
+    '(?s)\.visible \.entry tensor_nvfp4_m16n16k64\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  if (-not $gb10Nvfp4Entry -or
+      $gb10Nvfp4Entry -notmatch
+        'mtlc\.tensor_mma native-mma nvfp4 whole-tile lowering' -or
+      [regex]::Matches($gb10Nvfp4Entry, $nvfp4Instruction).Count -ne 2 -or
+      [regex]::Matches($gb10Nvfp4Entry, 'ld\.global\.b32').Count -ne 12 -or
+      [regex]::Matches($gb10Nvfp4Entry, 'ld\.global\.f32').Count -ne 8 -or
+      [regex]::Matches($gb10Nvfp4Entry, 'st\.global\.f32').Count -ne 8 -or
+      $gb10Nvfp4Entry -match 'wmma\.') {
+    throw "GB10 native NVFP4 direct/packed-load contract mismatch"
+  }
+  $gb10Nvfp4ChainEntry = [regex]::Match(
+    $gb10Fp4Text,
+    '(?s)\.visible \.entry tensor_nvfp4_chain3_m16n16k64\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  if (-not $gb10Nvfp4ChainEntry -or
+      $gb10Nvfp4ChainEntry -notmatch
+        'mtlc\.tensor_chain resident native-mma nvfp4 tiles=3 subtiles=2' -or
+      [regex]::Matches($gb10Nvfp4ChainEntry, $nvfp4Instruction).Count -ne 6 -or
+      [regex]::Matches($gb10Nvfp4ChainEntry, 'ld\.global\.b32').Count -ne 36 -or
+      [regex]::Matches($gb10Nvfp4ChainEntry, 'ld\.global\.f32').Count -ne 8 -or
+      [regex]::Matches($gb10Nvfp4ChainEntry, 'st\.global\.f32').Count -ne 8 -or
+      $gb10Nvfp4ChainEntry -match 'replay|wmma\.') {
+    throw "GB10 native NVFP4 chain-residency contract mismatch"
+  }
+  $gb10Nvfp4LoopEntry = [regex]::Match(
+    $gb10Fp4Text,
+    '(?s)\.visible \.entry tensor_nvfp4_runtime_k_m16n16k64\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  if (-not $gb10Nvfp4LoopEntry -or
+      $gb10Nvfp4LoopEntry -notmatch
+        'mtlc\.tensor_loop resident native-mma nvfp4 group=1 subtiles=2' -or
+      [regex]::Matches($gb10Nvfp4LoopEntry, $nvfp4Instruction).Count -ne 4 -or
+      [regex]::Matches($gb10Nvfp4LoopEntry, 'ld\.global\.f32').Count -ne 8 -or
+      [regex]::Matches($gb10Nvfp4LoopEntry, 'st\.global\.f32').Count -ne 8 -or
+      $gb10Nvfp4LoopEntry -match 'replay|wmma\.') {
+    throw "GB10 runtime-K native NVFP4 residency contract mismatch"
+  }
+
+  $gb10Fp4Unoptimized =
+    Join-Path $tmpDir "ptx_emit_gb10_tensor_fp4_unoptimized.ptx"
+  $fp4UnoptimizedOut = & $CompilerPath --emit-ptx --gpu-arch=gb10 `
+    tests/gpu/tensor_native_fp4.mettle -o $gb10Fp4Unoptimized 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "GB10 unoptimized native-MXFP4 emit failed: $fp4UnoptimizedOut"
+  }
+  $gb10Fp4UnoptimizedText = Get-Content -Raw $gb10Fp4Unoptimized
+  $gb10Fp4UnoptimizedChain = [regex]::Match(
+    $gb10Fp4UnoptimizedText,
+    '(?s)\.visible \.entry tensor_mxfp4_chain3_m16n16k64\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  $gb10Fp4UnoptimizedLoop = [regex]::Match(
+    $gb10Fp4UnoptimizedText,
+    '(?s)\.visible \.entry tensor_mxfp4_runtime_k_m16n16k64\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  $gb10Nvfp4UnoptimizedChain = [regex]::Match(
+    $gb10Fp4UnoptimizedText,
+    '(?s)\.visible \.entry tensor_nvfp4_chain3_m16n16k64\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  $gb10Nvfp4UnoptimizedLoop = [regex]::Match(
+    $gb10Fp4UnoptimizedText,
+    '(?s)\.visible \.entry tensor_nvfp4_runtime_k_m16n16k64\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  if ($gb10Fp4UnoptimizedChain -match 'mtlc\.tensor_chain' -or
+      [regex]::Matches(
+        $gb10Fp4UnoptimizedChain,
+        'mtlc\.tensor_mma native-mma mxfp4 whole-tile lowering'
+      ).Count -ne 3 -or
+      $gb10Fp4UnoptimizedLoop -match 'mtlc\.tensor_loop' -or
+      [regex]::Matches(
+        $gb10Fp4UnoptimizedLoop,
+        'mtlc\.tensor_mma native-mma mxfp4 whole-tile lowering'
+      ).Count -ne 2 -or
+      $gb10Nvfp4UnoptimizedChain -match 'mtlc\.tensor_chain' -or
+      [regex]::Matches(
+        $gb10Nvfp4UnoptimizedChain,
+        'mtlc\.tensor_mma native-mma nvfp4 whole-tile lowering'
+      ).Count -ne 3 -or
+      $gb10Nvfp4UnoptimizedLoop -match 'mtlc\.tensor_loop' -or
+      [regex]::Matches(
+        $gb10Nvfp4UnoptimizedLoop,
+        'mtlc\.tensor_mma native-mma nvfp4 whole-tile lowering'
+      ).Count -ne 2) {
+    throw "native FP4 residency was not formed exclusively by the optimizer"
+  }
+
+  $rawFp4Ptx = Join-Path $tmpDir "ptx_emit_sm121_tensor_fp4.ptx"
+  $rawFp4Out = & $CompilerPath -O --emit-ptx --gpu-arch=sm_121 `
+    tests/gpu/tensor_native_fp4.mettle -o $rawFp4Ptx 2>&1 | Out-String
+  if ($LASTEXITCODE -eq 0 -or
+      $rawFp4Out -notmatch
+        'architecture- or family-specific sm_120a/sm_121a target') {
+    throw "raw sm_121 did not reject architecture-specific native FP4 lowering"
+  }
+
+  if ($ptxas) {
+    $ptxasHelp = & $ptxas.Source --help 2>&1 | Out-String
+    if ($ptxasHelp -match "sm_121a") {
+      $fp4AsmOut = & $ptxas.Source -v -arch=sm_121a $gb10Fp4Ptx `
+        -o $gb10Fp4Cubin 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) {
+        throw "ptxas rejected GB10 native-MXFP4 tensor PTX: $fp4AsmOut"
+      }
+      if ($fp4AsmOut -match '(?m)^\s*[1-9][0-9]* bytes spill (stores|loads)') {
+        throw "GB10 native-MXFP4 kernels spilled registers: $fp4AsmOut"
+      }
+      foreach ($registerGate in @(
+          @{ Name = 'tensor_mxfp4_m16n16k64'; Max = 48 },
+          @{ Name = 'tensor_mxfp4_chain3_m16n16k64'; Max = 64 },
+          @{ Name = 'tensor_mxfp4_runtime_k_m16n16k64'; Max = 64 },
+          @{ Name = 'tensor_nvfp4_m16n16k64'; Max = 56 },
+          @{ Name = 'tensor_nvfp4_chain3_m16n16k64'; Max = 64 },
+          @{ Name = 'tensor_nvfp4_runtime_k_m16n16k64'; Max = 56 })) {
+        $escapedName = [regex]::Escape($registerGate.Name)
+        $registerMatch = [regex]::Match(
+          $fp4AsmOut,
+          "(?s)Function properties for $escapedName.*?Used ([0-9]+) registers"
+        )
+        if (-not $registerMatch.Success -or
+            [int]$registerMatch.Groups[1].Value -gt $registerGate.Max) {
+          throw "GB10 native-MXFP4 register ceiling exceeded for $($registerGate.Name): $fp4AsmOut"
+        }
+      }
+    } else {
+      Write-Host "[SKIP] ptx_emit_gb10_tensor_fp4 ptxas assembly (toolkit lacks sm_121a)"
+    }
+  } else {
+    Write-Host "[SKIP] ptx_emit_gb10_tensor_fp4 ptxas assembly (ptxas not found)"
+  }
+  Write-CaseResult -Name "ptx_emit_gb10_tensor_fp4" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "ptx_emit_gb10_tensor_fp4" -Passed $false -Reason $_.Exception.Message
+}
+
+$total++
+try {
+  $gb10Fp6Ptx = Join-Path $tmpDir "ptx_emit_gb10_tensor_fp6.ptx"
+  $gb10Fp6Cubin = Join-Path $tmpDir "ptx_emit_gb10_tensor_fp6.cubin"
+  $fp6EmitOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
+    tests/gpu/tensor_native_fp6.mettle -o $gb10Fp6Ptx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "GB10 native-FP6 tensor emit failed: $fp6EmitOut"
+  }
+  $gb10Fp6Text = Get-Content -Raw $gb10Fp6Ptx
+  if ($gb10Fp6Text -notmatch "(?m)^\.version 8\.8\r?$" -or
+      $gb10Fp6Text -notmatch "(?m)^\.target sm_121a\r?$") {
+    throw "GB10 native-FP6 tensor module did not select PTX 8.8/sm_121a"
+  }
+  $fp6Instruction =
+    'mma\.sync\.aligned\.m16n8k32\.row\.col\.kind::mxf8f6f4\.block_scale\.scale_vec::1X\.f32\.e3m2\.e2m3\.f32\.ue8m0'
+  $gb10Fp6Entry = [regex]::Match(
+    $gb10Fp6Text,
+    '(?s)\.visible \.entry tensor_mxfp6_m16n16k32\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  if (-not $gb10Fp6Entry -or
+      $gb10Fp6Entry -notmatch
+        'mtlc\.tensor_mma native-mma mxf8f6f4 whole-tile lowering' -or
+      [regex]::Matches($gb10Fp6Entry, $fp6Instruction).Count -ne 2 -or
+      [regex]::Matches($gb10Fp6Entry, 'setp\.gt\.u32').Count -ne 0 -or
+      [regex]::Matches($gb10Fp6Entry, 'ld\.global\.f32').Count -ne 8 -or
+      [regex]::Matches($gb10Fp6Entry, 'st\.global\.f32').Count -ne 8 -or
+      $gb10Fp6Entry -match 'wmma\.') {
+    throw "GB10 native FP6 direct/packed-fast-path contract mismatch"
+  }
+  $gb10Fp6ChainEntry = [regex]::Match(
+    $gb10Fp6Text,
+    '(?s)\.visible \.entry tensor_mxfp6_chain3_m16n16k32\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  if (-not $gb10Fp6ChainEntry -or
+      $gb10Fp6ChainEntry -notmatch
+        'mtlc\.tensor_chain resident native-mma mxf8f6f4 tiles=3 subtiles=2' -or
+      [regex]::Matches($gb10Fp6ChainEntry, $fp6Instruction).Count -ne 6 -or
+      [regex]::Matches($gb10Fp6ChainEntry, 'setp\.gt\.u32').Count -ne 0 -or
+      [regex]::Matches($gb10Fp6ChainEntry, 'ld\.global\.f32').Count -ne 8 -or
+      [regex]::Matches($gb10Fp6ChainEntry, 'st\.global\.f32').Count -ne 8 -or
+      $gb10Fp6ChainEntry -match 'replay|wmma\.') {
+    throw "GB10 native FP6 chain-residency contract mismatch"
+  }
+  $gb10Fp6LoopEntry = [regex]::Match(
+    $gb10Fp6Text,
+    '(?s)\.visible \.entry tensor_mxfp6_runtime_k_m16n16k32\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  if (-not $gb10Fp6LoopEntry -or
+      $gb10Fp6LoopEntry -notmatch
+        'mtlc\.tensor_loop resident native-mma mxf8f6f4 group=1 subtiles=2' -or
+      [regex]::Matches($gb10Fp6LoopEntry, $fp6Instruction).Count -ne 4 -or
+      [regex]::Matches($gb10Fp6LoopEntry, 'setp\.gt\.u32').Count -eq 0 -or
+      [regex]::Matches($gb10Fp6LoopEntry, 'ld\.global\.f32').Count -ne 8 -or
+      [regex]::Matches($gb10Fp6LoopEntry, 'st\.global\.f32').Count -ne 8 -or
+      $gb10Fp6LoopEntry -match 'replay|wmma\.') {
+    throw "GB10 runtime-K native FP6 residency/general-pack contract mismatch"
+  }
+
+  $gb10Fp6Unoptimized =
+    Join-Path $tmpDir "ptx_emit_gb10_tensor_fp6_unoptimized.ptx"
+  $fp6UnoptimizedOut = & $CompilerPath --emit-ptx --gpu-arch=gb10 `
+    tests/gpu/tensor_native_fp6.mettle -o $gb10Fp6Unoptimized 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "GB10 unoptimized native-FP6 emit failed: $fp6UnoptimizedOut"
+  }
+  $gb10Fp6UnoptimizedText = Get-Content -Raw $gb10Fp6Unoptimized
+  $gb10Fp6UnoptimizedChain = [regex]::Match(
+    $gb10Fp6UnoptimizedText,
+    '(?s)\.visible \.entry tensor_mxfp6_chain3_m16n16k32\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  $gb10Fp6UnoptimizedLoop = [regex]::Match(
+    $gb10Fp6UnoptimizedText,
+    '(?s)\.visible \.entry tensor_mxfp6_runtime_k_m16n16k32\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  if ($gb10Fp6UnoptimizedChain -match 'mtlc\.tensor_chain' -or
+      [regex]::Matches(
+        $gb10Fp6UnoptimizedChain,
+        'mtlc\.tensor_mma native-mma mxf8f6f4 whole-tile lowering'
+      ).Count -ne 3 -or
+      $gb10Fp6UnoptimizedLoop -match 'mtlc\.tensor_loop' -or
+      [regex]::Matches(
+        $gb10Fp6UnoptimizedLoop,
+        'mtlc\.tensor_mma native-mma mxf8f6f4 whole-tile lowering'
+      ).Count -ne 2) {
+    throw "native FP6 residency was not formed exclusively by the optimizer"
+  }
+
+  $rawFp6Ptx = Join-Path $tmpDir "ptx_emit_sm121_tensor_fp6.ptx"
+  $rawFp6Out = & $CompilerPath -O --emit-ptx --gpu-arch=sm_121 `
+    tests/gpu/tensor_native_fp6.mettle -o $rawFp6Ptx 2>&1 | Out-String
+  if ($LASTEXITCODE -eq 0 -or
+      $rawFp6Out -notmatch
+        'architecture- or family-specific sm_120a/sm_121a target') {
+    throw "raw sm_121 did not reject architecture-specific native FP6 lowering"
+  }
+
+  if ($ptxas) {
+    $ptxasHelp = & $ptxas.Source --help 2>&1 | Out-String
+    if ($ptxasHelp -match "sm_121a") {
+      $fp6AsmOut = & $ptxas.Source -v -arch=sm_121a $gb10Fp6Ptx `
+        -o $gb10Fp6Cubin 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) {
+        throw "ptxas rejected GB10 native-FP6 tensor PTX: $fp6AsmOut"
+      }
+      if ($fp6AsmOut -match '(?m)^\s*[1-9][0-9]* bytes spill (stores|loads)') {
+        throw "GB10 native-FP6 kernels spilled registers: $fp6AsmOut"
+      }
+      foreach ($registerGate in @(
+          @{ Name = 'tensor_mxfp6_m16n16k32'; Max = 48 },
+          @{ Name = 'tensor_mxfp6_chain3_m16n16k32'; Max = 56 },
+          @{ Name = 'tensor_mxfp6_runtime_k_m16n16k32'; Max = 72 })) {
+        $escapedName = [regex]::Escape($registerGate.Name)
+        $registerMatch = [regex]::Match(
+          $fp6AsmOut,
+          "(?s)Function properties for $escapedName.*?Used ([0-9]+) registers"
+        )
+        if (-not $registerMatch.Success -or
+            [int]$registerMatch.Groups[1].Value -gt $registerGate.Max) {
+          throw "GB10 native-FP6 register ceiling exceeded for $($registerGate.Name): $fp6AsmOut"
+        }
+      }
+    } else {
+      Write-Host "[SKIP] ptx_emit_gb10_tensor_fp6 ptxas assembly (toolkit lacks sm_121a)"
+    }
+  } else {
+    Write-Host "[SKIP] ptx_emit_gb10_tensor_fp6 ptxas assembly (ptxas not found)"
+  }
+  Write-CaseResult -Name "ptx_emit_gb10_tensor_fp6" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "ptx_emit_gb10_tensor_fp6" -Passed $false -Reason $_.Exception.Message
+}
+
+$total++
+try {
+  # Sparse A and its uint8 occupancy masks are frontend/IR semantics. PTX alone
+  # translates those masks into ordered warp metadata and sanitizes every
+  # dynamic group before it can reach an instruction with undefined encodings.
+  $gb10SparsePtx = Join-Path $tmpDir "ptx_emit_gb10_tensor_sparse.ptx"
+  $gb10SparseCubin = Join-Path $tmpDir "ptx_emit_gb10_tensor_sparse.cubin"
+  $sparseEmitOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
+    tests/gpu/tensor_sparse.mettle -o $gb10SparsePtx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "GB10 structured-sparse emit failed: $sparseEmitOut"
+  }
+  $sparseText = Get-Content -Raw $gb10SparsePtx
+  if ([regex]::Matches(
+        $sparseText,
+        'mma\.sp::ordered_metadata\.sync\.aligned\.m16n8k16\.row\.col\.f32\.f16\.f16\.f32').Count -ne 10 -or
+      [regex]::Matches(
+        $sparseText,
+        'mma\.sp::ordered_metadata\.sync\.aligned\.m16n8k16\.row\.col\.f32\.bf16\.bf16\.f32').Count -ne 2 -or
+      [regex]::Matches($sparseText,
+        'mtlc\.tensor_mma native-mma sparse-').Count -ne 2 -or
+      # A and its metadata are M/K fragments; each is prepared once and reused
+      # by both adjacent N subtiles in these m16n16 logical tensors.
+      [regex]::Matches($sparseText, 'popc\.b32').Count -ne 48 -or
+      [regex]::Matches($sparseText,
+        '(?m)^\s*and\.b32 [^,]+, [^,]+, 15;\r?$').Count -ne 48 -or
+      [regex]::Matches($sparseText,
+        'mtlc\.tensor_chain resident native-mma sparse-f16-2to4').Count -ne 1 -or
+      [regex]::Matches($sparseText,
+        'mtlc\.tensor_loop resident native-mma sparse-f16-2to4').Count -ne 1 -or
+      $sparseText -match 'tcgen05') {
+    throw "GB10 canonical structured-sparse PTX contract mismatch"
+  }
+  if ($ptxas) {
+    $ptxasHelp = & $ptxas.Source --help 2>&1 | Out-String
+    if ($ptxasHelp -match "sm_121a") {
+      $sparseAsmOut = & $ptxas.Source -v -arch=sm_121a $gb10SparsePtx `
+        -o $gb10SparseCubin 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) {
+        throw "ptxas rejected GB10 structured-sparse PTX: $sparseAsmOut"
+      }
+      if ($sparseAsmOut -match
+          '(?m)^\s*[1-9][0-9]* bytes spill (stores|loads)') {
+        throw "GB10 structured-sparse kernels spilled registers: $sparseAsmOut"
+      }
+      foreach ($name in @('tensor_sparse_f16_2to4',
+                           'tensor_sparse_bf16_2to4',
+                           'tensor_sparse_chain2',
+                           'tensor_sparse_runtime_k')) {
+        $registerMatch = [regex]::Match(
+          $sparseAsmOut,
+          "(?s)Function properties for $name.*?Used ([0-9]+) registers"
+        )
+        if (-not $registerMatch.Success -or
+            [int]$registerMatch.Groups[1].Value -gt 56) {
+          throw "GB10 structured-sparse register ceiling exceeded for $name`: $sparseAsmOut"
+        }
+      }
+    } else {
+      Write-Host "[SKIP] ptx_emit_gb10_tensor_sparse native assembly (toolkit lacks sm_121a)"
+    }
+  } else {
+    Write-Host "[SKIP] ptx_emit_gb10_tensor_sparse assembly (ptxas not found)"
+  }
+  Write-CaseResult -Name "ptx_emit_gb10_tensor_sparse" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "ptx_emit_gb10_tensor_sparse" -Passed $false -Reason $_.Exception.Message
+}
+
+$total++
+try {
+  # Large logical dense tiles remain one frontend/shared-IR operation. PTX
+  # selects a stable physical WMMA grid, reuses the cheaper input fragment,
+  # and applies the same tuple policy to every resident output subtile.
+  $gb10TiledPtx = Join-Path $tmpDir "ptx_emit_gb10_tensor_tiled.ptx"
+  $gb10TiledCubin = Join-Path $tmpDir "ptx_emit_gb10_tensor_tiled.cubin"
+  $gb10TiledReplayPtx =
+    Join-Path $tmpDir "ptx_emit_gb10_tensor_tiled_budget55.ptx"
+  $gb10TiledReplayCubin =
+    Join-Path $tmpDir "ptx_emit_gb10_tensor_tiled_budget55.cubin"
+  $tiledEmitOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
+    tests/gpu/tensor_tiled.mettle -o $gb10TiledPtx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "GB10 logical tensor-grid emit failed: $tiledEmitOut"
+  }
+  $tiledReplayOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
+    --gpu-tensor-tuple-budget=55 tests/gpu/tensor_tiled.mettle `
+    -o $gb10TiledReplayPtx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "GB10 tensor-grid replay variant emit failed: $tiledReplayOut"
+  }
+  $tiledText = Get-Content -Raw $gb10TiledPtx
+  $tiledReplayText = Get-Content -Raw $gb10TiledReplayPtx
+  if ([regex]::Matches($tiledText, 'mtlc\.tensor_mma tiled').Count -ne 13 -or
+      [regex]::Matches($tiledText, 'subtiles=4 reuse=A').Count -ne 12 -or
+      [regex]::Matches($tiledText, 'subtiles=2 reuse=B').Count -ne 1 -or
+      [regex]::Matches($tiledText, 'wmma\.mma\.sync').Count -ne 50 -or
+      [regex]::Matches($tiledText, 'mul\.wide\.u32').Count -lt 20 -or
+      $tiledText -notmatch
+        'mtlc\.tensor_chain resident tiles=2 subtiles=4 tuple_peak=56 budget=96' -or
+      $tiledText -notmatch
+        'mtlc\.tensor_loop resident group=1 subtiles=4 tuple_peak=56 budget=96' -or
+      $tiledReplayText -notmatch
+        'mtlc\.tensor_chain replay tiles=2 subtiles=4 tuple_peak=56 budget=55' -or
+      $tiledReplayText -notmatch
+        'mtlc\.tensor_loop replay group=1 tuple_peak=56 budget=55') {
+    throw "GB10 logical tensor-grid selection/reuse policy mismatch"
+  }
+  foreach ($variant in @(
+      @{ Text = $tiledText; Name = 'tensor_tiled_chain2_f16_m32n32';
+         CLoads = 4; Stores = 4 },
+      @{ Text = $tiledText; Name = 'tensor_tiled_loop_f16_m32n32';
+         CLoads = 4; Stores = 4 },
+      @{ Text = $tiledReplayText; Name = 'tensor_tiled_chain2_f16_m32n32';
+         CLoads = 8; Stores = 8 },
+      @{ Text = $tiledReplayText; Name = 'tensor_tiled_loop_f16_m32n32';
+         CLoads = 8; Stores = 8 })) {
+    $entry = [regex]::Match(
+      $variant.Text,
+      "(?s)\.visible \.entry $($variant.Name)\(.*?(?=\.visible \.entry|\z)"
+    ).Value
+    if (-not $entry -or
+        [regex]::Matches($entry, 'wmma\.mma\.sync').Count -ne 8 -or
+        [regex]::Matches($entry, 'wmma\.load\.a\.sync').Count -ne 4 -or
+        [regex]::Matches($entry, 'wmma\.load\.b\.sync').Count -ne 8 -or
+        [regex]::Matches($entry, 'wmma\.load\.c\.sync').Count -ne
+          $variant.CLoads -or
+        [regex]::Matches($entry, 'wmma\.store\.d\.sync').Count -ne
+          $variant.Stores) {
+      throw "tensor-grid resident/replay instruction counts changed for $($variant.Name)"
+    }
+  }
+  foreach ($variant in @(
+      @{ Name = 'tensor_tiled_u8_m32n32';
+         Checks = @(
+           @{ Pattern = 'wmma\.load\.a\.sync.*\.row\.u8'; Count = 2 },
+           @{ Pattern = 'wmma\.load\.b\.sync.*\.col\.u8'; Count = 4 },
+           @{ Pattern = 'wmma\.mma\.sync.*\.s32\.u8\.u8\.s32\.satfinite'; Count = 4 },
+           @{ Pattern = 'wmma\.store\.d\.sync.*\.row\.s32'; Count = 4 }
+         ) },
+      @{ Name = 'tensor_tiled_f16_result_m32n32';
+         Checks = @(
+           @{ Pattern = 'wmma\.load\.c\.sync.*\.row\.f16'; Count = 4 },
+           @{ Pattern = 'wmma\.mma\.sync.*\.row\.col\.f16\.f16'; Count = 4 },
+           @{ Pattern = 'wmma\.store\.d\.sync.*\.row\.f16'; Count = 4 }
+         ) },
+      @{ Name = 'tensor_tiled_f16_colrow_m32n32';
+         Checks = @(
+           @{ Pattern = 'wmma\.load\.a\.sync.*\.col\.f16'; Count = 2 },
+           @{ Pattern = 'wmma\.load\.b\.sync.*\.row\.f16'; Count = 4 },
+           @{ Pattern = 'wmma\.load\.c\.sync.*\.col\.f32'; Count = 4 },
+           @{ Pattern = 'wmma\.mma\.sync.*\.col\.row\.f32\.f32'; Count = 4 },
+           @{ Pattern = 'wmma\.store\.d\.sync.*\.col\.f32'; Count = 4 },
+           @{ Pattern = 'mul\.wide\.u32'; Count = 4 }
+         ) },
+      @{ Name = 'tensor_tiled_f16_runtime_strides_m32n32';
+         Checks = @(
+           @{ Pattern = 'ld\.param\.s32'; Count = 4 },
+           @{ Pattern = 'wmma\.load\.a\.sync'; Count = 2 },
+           @{ Pattern = 'wmma\.load\.b\.sync'; Count = 4 },
+           @{ Pattern = 'wmma\.load\.c\.sync'; Count = 4 },
+           @{ Pattern = 'wmma\.mma\.sync'; Count = 4 },
+           @{ Pattern = 'wmma\.store\.d\.sync'; Count = 4 },
+           @{ Pattern = 'mul\.wide\.u32'; Count = 7 }
+         ) })) {
+    $entry = [regex]::Match(
+      $tiledText,
+      "(?s)\.visible \.entry $($variant.Name)\(.*?(?=\.visible \.entry|\z)"
+    ).Value
+    if (-not $entry) {
+      throw "missing widened tensor-grid entry $($variant.Name)"
+    }
+    foreach ($check in $variant.Checks) {
+      $actual = [regex]::Matches($entry, $check.Pattern).Count
+      if ($actual -ne $check.Count) {
+        throw "tensor-grid lowering changed for $($variant.Name): " +
+          "'$($check.Pattern)' expected $($check.Count), got $actual"
+      }
+    }
+  }
+  if ($ptxas) {
+    $ptxasHelp = & $ptxas.Source --help 2>&1 | Out-String
+    if ($ptxasHelp -match "sm_121a") {
+      $tiledAsmOut = & $ptxas.Source -v -arch=sm_121a $gb10TiledPtx `
+        -o $gb10TiledCubin 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) {
+        throw "ptxas rejected GB10 logical tensor-grid PTX: $tiledAsmOut"
+      }
+      $tiledReplayAsmOut = & $ptxas.Source -v -arch=sm_121a `
+        $gb10TiledReplayPtx -o $gb10TiledReplayCubin 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) {
+        throw "ptxas rejected GB10 tensor-grid replay PTX: $tiledReplayAsmOut"
+      }
+      if (($tiledAsmOut + $tiledReplayAsmOut) -match
+          '(?m)^\s*[1-9][0-9]* bytes spill (stores|loads)') {
+        throw "GB10 logical tensor-grid variants spilled registers"
+      }
+      $residentRegisters = [regex]::Matches(
+        $tiledAsmOut, 'Used ([0-9]+) registers') |
+        ForEach-Object { [int]$_.Groups[1].Value }
+      $replayRegisters = [regex]::Matches(
+        $tiledReplayAsmOut, 'Used ([0-9]+) registers') |
+        ForEach-Object { [int]$_.Groups[1].Value }
+      if (-not $residentRegisters -or
+          ($residentRegisters | Measure-Object -Maximum).Maximum -gt 64 -or
+          -not $replayRegisters -or
+          ($replayRegisters | Measure-Object -Maximum).Maximum -gt 48) {
+        throw "GB10 logical tensor-grid register ceiling exceeded"
+      }
+    } else {
+      Write-Host "[SKIP] ptx_emit_gb10_tensor_tiled native assembly (toolkit lacks sm_121a)"
+    }
+  } else {
+    Write-Host "[SKIP] ptx_emit_gb10_tensor_tiled assembly (ptxas not found)"
+  }
+  Write-CaseResult -Name "ptx_emit_gb10_tensor_tiled" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "ptx_emit_gb10_tensor_tiled" -Passed $false `
+    -Reason $_.Exception.Message
+}
+
+$total++
+try {
+  # Epilogues are a separate neutral collective so activation never changes an
+  # MMA chain's exact composition. PTX currently emits synchronized logical
+  # memory replay, not a fictional addressable view of opaque WMMA fragments.
+  $epiloguePtx = Join-Path $tmpDir "ptx_emit_gb10_tensor_epilogue.ptx"
+  $epilogueCubin = Join-Path $tmpDir "ptx_emit_gb10_tensor_epilogue.cubin"
+  $epilogueOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
+    tests/gpu/tensor_epilogue.mettle -o $epiloguePtx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "GB10 tensor-epilogue emit failed: $epilogueOut"
+  }
+  $epilogueText = Get-Content -Raw $epiloguePtx
+  if ([regex]::Matches(
+        $epilogueText,
+        'mtlc\.tensor_epilogue cooperative-memory').Count -ne 5 -or
+      [regex]::Matches($epilogueText, 'bar\.warp\.sync').Count -ne 8 -or
+      [regex]::Matches($epilogueText, 'bar\.sync 0').Count -ne 2 -or
+      [regex]::Matches($epilogueText, 'cvt\.f32\.f16').Count -ne 1 -or
+      [regex]::Matches($epilogueText, 'cvt\.rn\.f16\.f32').Count -ne 1 -or
+      [regex]::Matches($epilogueText, 'cvt\.f32\.bf16').Count -ne 2 -or
+      [regex]::Matches($epilogueText, 'cvt\.rn\.bf16\.f32').Count -ne 1 -or
+      [regex]::Matches($epilogueText, 'ld\.global\.f64').Count -ne 2 -or
+      [regex]::Matches($epilogueText, 'st\.global\.f64').Count -ne 1 -or
+      [regex]::Matches($epilogueText, 'setp\.lt\.f32').Count -ne 3 -or
+      [regex]::Matches($epilogueText, 'setp\.gt\.f32').Count -ne 1 -or
+      [regex]::Matches($epilogueText, 'selp\.f32').Count -ne 4 -or
+      $epilogueText -match 'wmma\.|mma\.sync') {
+    throw "GB10 tensor-epilogue synchronized replay contract mismatch"
+  }
+  $runtimeEntry = [regex]::Match(
+    $epilogueText,
+    '(?s)\.visible \.entry tensor_epilogue_f32_matrix_bias_clamp_runtime\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  if (-not $runtimeEntry -or
+      $runtimeEntry -notmatch 'scope=workgroup' -or
+      [regex]::Matches($runtimeEntry, 'mul\.wide\.u32').Count -lt 2 -or
+      $runtimeEntry -notmatch 'cvt\.u32\.u64') {
+    throw "runtime-stride matrix-bias epilogue lowering mismatch"
+  }
+  if ($ptxas) {
+    $ptxasHelp = & $ptxas.Source --help 2>&1 | Out-String
+    if ($ptxasHelp -match "sm_121a") {
+      $epilogueAsmOut = & $ptxas.Source -v -arch=sm_121a $epiloguePtx `
+        -o $epilogueCubin 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) {
+        throw "ptxas rejected GB10 tensor-epilogue PTX: $epilogueAsmOut"
+      }
+      if ($epilogueAsmOut -match
+          '(?m)^\s*[1-9][0-9]* bytes spill (stores|loads)') {
+        throw "GB10 tensor-epilogue lowering spilled registers"
+      }
+      $epilogueRegisters = [regex]::Matches(
+        $epilogueAsmOut, 'Used ([0-9]+) registers') |
+        ForEach-Object { [int]$_.Groups[1].Value }
+      if (-not $epilogueRegisters -or
+          ($epilogueRegisters | Measure-Object -Maximum).Maximum -gt 24) {
+        throw "GB10 tensor-epilogue register ceiling exceeded"
+      }
+    } else {
+      Write-Host "[SKIP] ptx_emit_gb10_tensor_epilogue native assembly (toolkit lacks sm_121a)"
+    }
+  } else {
+    Write-Host "[SKIP] ptx_emit_gb10_tensor_epilogue assembly (ptxas not found)"
+  }
+  Write-CaseResult -Name "ptx_emit_gb10_tensor_epilogue" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "ptx_emit_gb10_tensor_epilogue" -Passed $false `
+    -Reason $_.Exception.Message
+}
+
+$total++
+try {
+  # A backend may consume adjacent verified neutral MMA/commit + epilogue
+  # operations, or a uniquely reached loop-exit epilogue. Opaque fragment
+  # mappings, bypass edges, and tuple pressure must fall back to the already-
+  # tested synchronized memory contract.
+  $fusedEpiloguePtx = Join-Path $tmpDir "ptx_emit_gb10_tensor_epilogue_fused.ptx"
+  $fusedEpilogueCubin = Join-Path $tmpDir "ptx_emit_gb10_tensor_epilogue_fused.cubin"
+  $replayEpiloguePtx = Join-Path $tmpDir "ptx_emit_gb10_tensor_epilogue_fused_replay.ptx"
+  $replayEpilogueCubin = Join-Path $tmpDir "ptx_emit_gb10_tensor_epilogue_fused_replay.cubin"
+  $fusedOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
+    tests/gpu/tensor_epilogue_fused.mettle -o $fusedEpiloguePtx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "GB10 resident tensor-epilogue emit failed: $fusedOut"
+  }
+  $replayOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
+    --gpu-tensor-tuple-budget=25 tests/gpu/tensor_epilogue_fused.mettle `
+    -o $replayEpiloguePtx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "GB10 tensor-epilogue replay emit failed: $replayOut"
+  }
+  $fusedText = Get-Content -Raw $fusedEpiloguePtx
+  $replayText = Get-Content -Raw $replayEpiloguePtx
+  if ([regex]::Matches(
+        $fusedText, 'mtlc\.tensor_epilogue resident').Count -ne 4 -or
+      [regex]::Matches(
+        $fusedText, 'mtlc\.tensor_epilogue cooperative-memory').Count -ne 3 -or
+      [regex]::Matches($fusedText, 'bar\.warp\.sync').Count -ne 14) {
+    throw "resident tensor-epilogue selection/ordering mismatch"
+  }
+  $stableEntry = [regex]::Match(
+    $fusedText,
+    '(?s)\.visible \.entry tensor_epilogue_fused_wmma_chain\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  $nativeEntry = [regex]::Match(
+    $fusedText,
+    '(?s)\.visible \.entry tensor_epilogue_fused_native_matrix_bias\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  $opaqueEntry = [regex]::Match(
+    $fusedText,
+    '(?s)\.visible \.entry tensor_epilogue_wmma_bias_replay\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  $mismatchEntry = [regex]::Match(
+    $fusedText,
+    '(?s)\.visible \.entry tensor_epilogue_stride_mismatch_replay\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  $pipelineEntry = [regex]::Match(
+    $fusedText,
+    '(?s)\.visible \.entry tensor_epilogue_fused_pipeline\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  $loopEntry = [regex]::Match(
+    $fusedText,
+    '(?s)\.visible \.entry tensor_epilogue_fused_loop\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  $guardedLoopEntry = [regex]::Match(
+    $fusedText,
+    '(?s)\.visible \.entry tensor_epilogue_guarded_loop_replay\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  if (-not $stableEntry -or
+      $stableEntry -notmatch 'resident stable-wmma tiles=2' -or
+      [regex]::Matches($stableEntry, 'wmma\.store\.d').Count -ne 1 -or
+      [regex]::Matches($stableEntry, 'mul\.rn\.f32').Count -ne 8 -or
+      [regex]::Matches($stableEntry, 'setp\.lt\.f32').Count -ne 8 -or
+      [regex]::Matches($stableEntry, 'selp\.f32').Count -ne 8 -or
+      $stableEntry -match 'cooperative-memory' -or
+      -not $nativeEntry -or
+      $nativeEntry -notmatch 'resident native-mma fp8 tiles=2 subtiles=2' -or
+      [regex]::Matches($nativeEntry, 'ld\.global\.f32').Count -ne 16 -or
+      [regex]::Matches($nativeEntry, 'mul\.rn\.f32').Count -ne 16 -or
+      [regex]::Matches($nativeEntry, 'add\.rn\.f32').Count -ne 8 -or
+      [regex]::Matches($nativeEntry, 'setp\.lt\.f32').Count -ne 8 -or
+      [regex]::Matches($nativeEntry, 'setp\.gt\.f32').Count -ne 8 -or
+      [regex]::Matches($nativeEntry, 'selp\.f32').Count -ne 16 -or
+      [regex]::Matches($nativeEntry, 'st\.global\.f32').Count -ne 8 -or
+      $nativeEntry -match 'cooperative-memory' -or
+      -not $opaqueEntry -or
+      $opaqueEntry -match 'tensor_epilogue resident' -or
+      $opaqueEntry -notmatch 'cooperative-memory' -or
+      [regex]::Matches($opaqueEntry, 'wmma\.store\.d').Count -ne 1 -or
+      -not $mismatchEntry -or
+      $mismatchEntry -match 'tensor_epilogue resident' -or
+      $mismatchEntry -notmatch 'cooperative-memory' -or
+      [regex]::Matches($mismatchEntry, 'wmma\.store\.d').Count -ne 1 -or
+      -not $pipelineEntry -or
+      $pipelineEntry -notmatch 'resident handoff group=1 stable-wmma' -or
+      [regex]::Matches($pipelineEntry, 'setp\.lt\.f32').Count -ne 8 -or
+      [regex]::Matches($pipelineEntry, 'selp\.f32').Count -ne 8 -or
+      [regex]::Matches($pipelineEntry, 'wmma\.store\.d').Count -ne 1 -or
+      -not $loopEntry -or
+      $loopEntry -notmatch 'mtlc\.tensor_loop resident group=1' -or
+      $loopEntry -notmatch 'resident handoff group=1 stable-wmma' -or
+      [regex]::Matches($loopEntry, 'mul\.rn\.f32').Count -ne 8 -or
+      [regex]::Matches($loopEntry, 'setp\.lt\.f32').Count -ne 8 -or
+      [regex]::Matches($loopEntry, 'selp\.f32').Count -ne 8 -or
+      [regex]::Matches($loopEntry, 'wmma\.store\.d').Count -ne 1 -or
+      $loopEntry -match 'cooperative-memory' -or
+      -not $guardedLoopEntry -or
+      $guardedLoopEntry -notmatch 'mtlc\.tensor_loop resident group=1' -or
+      $guardedLoopEntry -match 'tensor_epilogue resident' -or
+      $guardedLoopEntry -notmatch 'cooperative-memory' -or
+      [regex]::Matches($guardedLoopEntry, 'wmma\.store\.d').Count -ne 1) {
+    throw "resident tensor-epilogue structural contract mismatch"
+  }
+  if ($replayText -match 'mtlc\.tensor_epilogue resident' -or
+      [regex]::Matches(
+        $replayText, 'mtlc\.tensor_epilogue cooperative-memory').Count -ne 7) {
+    throw "tensor-epilogue tuple-budget replay mismatch"
+  }
+  if ($ptxas) {
+    $ptxasHelp = & $ptxas.Source --help 2>&1 | Out-String
+    if ($ptxasHelp -match "sm_121a") {
+      foreach ($assembly in @(
+          @{ Ptx = $fusedEpiloguePtx; Cubin = $fusedEpilogueCubin },
+          @{ Ptx = $replayEpiloguePtx; Cubin = $replayEpilogueCubin })) {
+        $assemblyOut = & $ptxas.Source -v -arch=sm_121a $assembly.Ptx `
+          -o $assembly.Cubin 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0) {
+          throw "GB10 resident/replay tensor-epilogue assembly failed: $assemblyOut"
+        }
+        if ($assemblyOut -match '[1-9][0-9]* bytes spill (stores|loads)') {
+          throw "GB10 resident/replay tensor-epilogue spilled registers"
+        }
+        $registers = [regex]::Matches(
+          $assemblyOut, 'Used\s+([0-9]+)\s+registers') |
+          ForEach-Object { [int]$_.Groups[1].Value }
+        if (-not $registers -or
+            ($registers | Measure-Object -Maximum).Maximum -gt 72) {
+          throw "GB10 resident/replay tensor-epilogue register ceiling exceeded"
+        }
+      }
+    } else {
+      Write-Host "[SKIP] ptx_emit_gb10_tensor_epilogue_fused native assembly (toolkit lacks sm_121a)"
+    }
+  } else {
+    Write-Host "[SKIP] ptx_emit_gb10_tensor_epilogue_fused assembly (ptxas not found)"
+  }
+  Write-CaseResult -Name "ptx_emit_gb10_tensor_epilogue_fused" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "ptx_emit_gb10_tensor_epilogue_fused" -Passed $false `
+    -Reason $_.Exception.Message
+}
+
+$total++
+try {
+  # The source and shared IR expose only a rank/geometry/storage contract.  This
+  # gate proves that GB10 selects TMA while the exact same program remains
+  # executable as cooperative scalar replay on the baseline portable profile.
+  $gb10TransferPtx = Join-Path $tmpDir "ptx_emit_gb10_tensor_transfer.ptx"
+  $gb10TransferCubin = Join-Path $tmpDir "ptx_emit_gb10_tensor_transfer.cubin"
+  $portableTransferPtx = Join-Path $tmpDir "ptx_emit_portable_tensor_transfer.ptx"
+  $portableTransferCubin = Join-Path $tmpDir "ptx_emit_portable_tensor_transfer.cubin"
+  $transferEmitOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
+    tests/gpu/tensor_transfer.mettle -o $gb10TransferPtx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "GB10 tensor-transfer emit failed: $transferEmitOut"
+  }
+  $portableTransferOut = & $CompilerPath -O --emit-ptx --gpu-arch=portable `
+    tests/gpu/tensor_transfer.mettle -o $portableTransferPtx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "portable tensor-transfer emit failed: $portableTransferOut"
+  }
+  $gb10TransferText = Get-Content -Raw $gb10TransferPtx
+  $portableTransferText = Get-Content -Raw $portableTransferPtx
+  if ($gb10TransferText -notmatch "(?m)^\.version 8\.8\r?$" -or
+      $gb10TransferText -notmatch "(?m)^\.target sm_121a\r?$" -or
+      [regex]::Matches($gb10TransferText,
+        'cp\.async\.bulk\.tensor\.2d\.shared::cta\.global\.tile\.mbarrier::complete_tx::bytes').Count -ne 1 -or
+      [regex]::Matches($gb10TransferText,
+        'cp\.async\.bulk\.tensor\.5d\.global\.shared::cta\.tile\.bulk_group').Count -ne 1 -or
+      [regex]::Matches($gb10TransferText,
+        'fence\.proxy\.tensormap::generic\.acquire\.sys').Count -ne 2 -or
+      [regex]::Matches($gb10TransferText,
+        'fence\.proxy\.async\.shared::cta').Count -ne 2 -or
+      [regex]::Matches($gb10TransferText,
+        'mbarrier\.arrive\.expect_tx\.release\.cta\.shared::cta').Count -ne 1 -or
+      [regex]::Matches($gb10TransferText,
+        'mbarrier\.try_wait\.parity\.acquire\.cta\.shared::cta').Count -ne 1 -or
+      [regex]::Matches($gb10TransferText, 'cp\.async\.bulk\.commit_group').Count -ne 1 -or
+      [regex]::Matches($gb10TransferText, 'cp\.async\.bulk\.wait_group 0').Count -ne 1 -or
+      [regex]::Matches($gb10TransferText,
+        '(?m)^\s*and\.b64 [^,]+, [^,]+, 63;\r?$').Count -ne 2 -or
+      [regex]::Matches($gb10TransferText,
+        '(?m)^\s*and\.b64 [^,]+, [^,]+, 15;\r?$').Count -ne 2 -or
+      [regex]::Matches($gb10TransferText,
+        'bra mtlc_tensor_transfer_0_fallback').Count -ne 6 -or
+      [regex]::Matches($gb10TransferText,
+        'mtlc\.tensor_transfer cooperative-fallback').Count -ne 5) {
+    throw "GB10 native/fallback tensor-transfer structure contract mismatch"
+  }
+  $transferLoadEntry = [regex]::Match(
+    $gb10TransferText,
+    '(?s)\.visible \.entry tensor_transfer_load_2d\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  $transferStoreEntry = [regex]::Match(
+    $gb10TransferText,
+    '(?s)\.visible \.entry tensor_transfer_store_5d\(.*?(?=\.visible \.entry|\z)'
+  ).Value
+  if (-not $transferLoadEntry -or -not $transferStoreEntry -or
+      $transferLoadEntry -notmatch
+        '(?m)^\s*@%p[0-9]+ fence\.proxy\.async\.shared::cta;\r?$' -or
+      $transferStoreEntry -notmatch
+        '(?m)^\s*fence\.proxy\.async\.shared::cta;\r?$') {
+    throw "GB10 tensor-transfer proxy-fence participation contract mismatch"
+  }
+  foreach ($entry in @($transferLoadEntry, $transferStoreEntry)) {
+    $mapGuardAt = $entry.IndexOf(', 63;')
+    $sharedGuardAt = $entry.IndexOf(', 15;')
+    $mapAcquireAt = $entry.IndexOf(
+      'fence.proxy.tensormap::generic.acquire.sys'
+    )
+    if ($mapGuardAt -lt 0 -or $sharedGuardAt -le $mapGuardAt -or
+        $mapAcquireAt -le $sharedGuardAt) {
+      throw "GB10 tensor-transfer alignment guards do not dominate tensor-map acquire"
+    }
+  }
+  $loadOrder = @(
+    'mbarrier.init.shared::cta.b64',
+    'fence.proxy.async.shared::cta',
+    'bar.sync 0',
+    'cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes',
+    'mbarrier.arrive.expect_tx.release.cta.shared::cta.b64',
+    'mbarrier.try_wait.parity.acquire.cta.shared::cta.b64',
+    'bar.sync 0',
+    'mbarrier.inval.shared::cta.b64'
+  )
+  $cursor = -1
+  foreach ($needle in $loadOrder) {
+    $next = $transferLoadEntry.IndexOf($needle, $cursor + 1)
+    if ($next -le $cursor) {
+      throw "GB10 tensor-transfer load ordering failed at '$needle'"
+    }
+    $cursor = $next
+  }
+  $storeOrder = @(
+    'fence.proxy.async.shared::cta',
+    'bar.sync 0',
+    'cp.async.bulk.tensor.5d.global.shared::cta.tile.bulk_group',
+    'cp.async.bulk.commit_group',
+    'cp.async.bulk.wait_group 0',
+    'bar.sync 0'
+  )
+  $cursor = -1
+  foreach ($needle in $storeOrder) {
+    $next = $transferStoreEntry.IndexOf($needle, $cursor + 1)
+    if ($next -le $cursor) {
+      throw "GB10 tensor-transfer store ordering failed at '$needle'"
+    }
+    $cursor = $next
+  }
+  if ($portableTransferText -notmatch "(?m)^\.target compute_75\r?$" -or
+      [regex]::Matches($portableTransferText,
+        'mtlc\.tensor_transfer cooperative-fallback').Count -ne 5 -or
+      $portableTransferText -match 'cp\.async\.bulk\.tensor|fence\.proxy|mbarrier') {
+    throw "portable tensor-transfer replay contract mismatch"
+  }
+
+  if ($ptxas) {
+    $portableTransferAsmOut = & $ptxas.Source -v -arch=sm_75 $portableTransferPtx `
+      -o $portableTransferCubin 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "ptxas rejected portable tensor-transfer PTX: $portableTransferAsmOut"
+    }
+    if ($portableTransferAsmOut -match
+        '(?m)^\s*[1-9][0-9]* bytes spill (stores|loads)') {
+      throw "portable tensor-transfer kernels spilled registers: $portableTransferAsmOut"
+    }
+    foreach ($registerGate in @(
+        @{ Name = 'tensor_transfer_load_2d'; Max = 20 },
+        @{ Name = 'tensor_transfer_store_5d'; Max = 28 },
+        @{ Name = 'tensor_transfer_portable_3d'; Max = 24 },
+        @{ Name = 'tensor_transfer_tma_ineligible_inner_2d'; Max = 20 },
+        @{ Name = 'tensor_transfer_tma_ineligible_stride0_2d'; Max = 20 })) {
+      $escapedName = [regex]::Escape($registerGate.Name)
+      $registerMatch = [regex]::Match(
+        $portableTransferAsmOut,
+        "(?s)Function properties for $escapedName.*?Used ([0-9]+) registers"
+      )
+      if (-not $registerMatch.Success -or
+          [int]$registerMatch.Groups[1].Value -gt $registerGate.Max) {
+        throw "portable tensor-transfer register ceiling exceeded for $($registerGate.Name): $portableTransferAsmOut"
+      }
+    }
+
+    $ptxasHelp = & $ptxas.Source --help 2>&1 | Out-String
+    if ($ptxasHelp -match "sm_121a") {
+      $gb10TransferAsmOut = & $ptxas.Source -v -arch=sm_121a $gb10TransferPtx `
+        -o $gb10TransferCubin 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) {
+        throw "ptxas rejected GB10 tensor-transfer PTX: $gb10TransferAsmOut"
+      }
+      if ($gb10TransferAsmOut -match
+          '(?m)^\s*[1-9][0-9]* bytes spill (stores|loads)') {
+        throw "GB10 tensor-transfer kernels spilled registers: $gb10TransferAsmOut"
+      }
+      foreach ($registerGate in @(
+          @{ Name = 'tensor_transfer_load_2d'; Max = 24 },
+          @{ Name = 'tensor_transfer_store_5d'; Max = 32 },
+          @{ Name = 'tensor_transfer_portable_3d'; Max = 28 },
+          @{ Name = 'tensor_transfer_tma_ineligible_inner_2d'; Max = 20 },
+          @{ Name = 'tensor_transfer_tma_ineligible_stride0_2d'; Max = 20 })) {
+        $escapedName = [regex]::Escape($registerGate.Name)
+        $registerMatch = [regex]::Match(
+          $gb10TransferAsmOut,
+          "(?s)Function properties for $escapedName.*?Used ([0-9]+) registers"
+        )
+        if (-not $registerMatch.Success -or
+            [int]$registerMatch.Groups[1].Value -gt $registerGate.Max) {
+          throw "GB10 tensor-transfer register ceiling exceeded for $($registerGate.Name): $gb10TransferAsmOut"
+        }
+      }
+    } else {
+      Write-Host "[SKIP] ptx_emit_gb10_tensor_transfer native assembly (toolkit lacks sm_121a)"
+    }
+  } else {
+    Write-Host "[SKIP] ptx_emit_gb10_tensor_transfer assembly (ptxas not found)"
+  }
+  Write-CaseResult -Name "ptx_emit_gb10_tensor_transfer" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "ptx_emit_gb10_tensor_transfer" -Passed $false -Reason $_.Exception.Message
+}
+
+$total++
+try {
+  # Native TMA is not part of the ordinary real-device suite until it has
+  # passed on a disposable/recoverable host.  Keep both runners and direct
+  # harness invocation fail-closed so an offline assembler success cannot
+  # accidentally turn into local device execution.
+  $hardwarePs = Get-Content -Raw "tests/gpu/run_hardware_tests.ps1"
+  $hardwareSh = Get-Content -Raw "tests/gpu/run_hardware_tests.sh"
+  $hardwareHarness = Get-Content -Raw "tests/gpu/hardware_harness.c"
+  $ack = "MTLC_ALLOW_EXPERIMENTAL_TMA"
+  $ackValue = "I_ACCEPT_GPU_RESET_RISK"
+  $recoveryAck = "MTLC_TMA_RECOVERY_READY"
+  $recoveryAckValue = "I_HAVE_OUT_OF_BAND_RECOVERY"
+  if ($hardwarePs -notmatch '\[switch\]\$ExperimentalTma' -or
+      $hardwarePs -notmatch [regex]::Escape($ack) -or
+      $hardwarePs -notmatch [regex]::Escape($ackValue) -or
+      $hardwarePs -notmatch [regex]::Escape($recoveryAck) -or
+      $hardwarePs -notmatch [regex]::Escape($recoveryAckValue) -or
+      $hardwarePs -notmatch
+        'if \(\$ExperimentalTma -and \$computeMajor -ge 9\)' -or
+      $hardwareSh -notmatch '--experimental-tma' -or
+      $hardwareSh -notmatch [regex]::Escape($ack) -or
+      $hardwareSh -notmatch [regex]::Escape($ackValue) -or
+      $hardwareSh -notmatch [regex]::Escape($recoveryAck) -or
+      $hardwareSh -notmatch [regex]::Escape($recoveryAckValue) -or
+      $hardwareSh -notmatch
+        'if \[\[ \$EXPERIMENTAL_TMA -eq 1 && "\$COMPUTE_MAJOR" -ge 9 \]\]' -or
+      $hardwarePs -notmatch '\$tmaHarnessArgs' -or
+      $hardwareSh -notmatch 'TMA_HARNESS_ARGS') {
+    throw "experimental TMA runner quarantine is missing or fail-open"
+  }
+  $directGateAt = $hardwareHarness.IndexOf('if (tensor_transfer_path &&')
+  $driverLoadAt = $hardwareHarness.IndexOf('if (!load_driver(&h.api))')
+  if ($directGateAt -lt 0 -or $driverLoadAt -lt 0 -or
+      $directGateAt -ge $driverLoadAt -or
+      $hardwareHarness -notmatch [regex]::Escape($ack) -or
+      $hardwareHarness -notmatch [regex]::Escape($ackValue) -or
+      $hardwareHarness -notmatch [regex]::Escape($recoveryAck) -or
+      $hardwareHarness -notmatch [regex]::Escape($recoveryAckValue) -or
+      $hardwareHarness -notmatch '--tensor-transfer-only' -or
+      $hardwareHarness -notmatch 'experimental TMA must run alone') {
+    throw "direct hardware harness does not quarantine TMA before loading CUDA"
+  }
+  Write-CaseResult -Name "gpu_experimental_tma_quarantine" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "gpu_experimental_tma_quarantine" -Passed $false -Reason $_.Exception.Message
+}
+
+$total++
+try {
+  # Pure host parser coverage for the offline resource-profile tool.  This test
+  # does not invoke ptxas, load a module, query a driver, or touch a GPU.
+  $profilePython = Get-Command python -ErrorAction SilentlyContinue
+  if (-not $profilePython) {
+    $profilePython = Get-Command python3 -ErrorAction SilentlyContinue
+  }
+  if (-not $profilePython) {
+    Write-CaseResult -Name "ptxas_resource_profile_parser" -Passed $true `
+      -Reason "python not found; skipped"
+  }
+  else {
+    $profileTestOut = & $profilePython.Source `
+      "tests/ptxas_profile_test.py" 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "offline ptxas resource-profile parser failed: $profileTestOut"
+    }
+    Write-CaseResult -Name "ptxas_resource_profile_parser" -Passed $true
+  }
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "ptxas_resource_profile_parser" -Passed $false `
+    -Reason $_.Exception.Message
+}
+
+$total++
+try {
+  # Pure host coverage for deterministic occupancy bounds and Pareto selection.
+  # The selector consumes JSON only and has no ptxas/driver/device code path.
+  $selectorPython = Get-Command python -ErrorAction SilentlyContinue
+  if (-not $selectorPython) {
+    $selectorPython = Get-Command python3 -ErrorAction SilentlyContinue
+  }
+  if (-not $selectorPython) {
+    Write-CaseResult -Name "ptxas_resource_selector" -Passed $true `
+      -Reason "python not found; skipped"
+  }
+  else {
+    $selectorTestOut = & $selectorPython.Source `
+      "tests/ptxas_select_test.py" 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "offline ptxas resource selector failed: $selectorTestOut"
+    }
+    Write-CaseResult -Name "ptxas_resource_selector" -Passed $true
+  }
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "ptxas_resource_selector" -Passed $false `
+    -Reason $_.Exception.Message
+}
+
+$total++
+try {
+  $gb10PipelinePtx = Join-Path $tmpDir "ptx_emit_gb10_tensor_pipeline.ptx"
+  $gb10PipelineCubin = Join-Path $tmpDir "ptx_emit_gb10_tensor_pipeline.cubin"
+  $gb10Pipeline4Ptx = Join-Path $tmpDir "ptx_emit_gb10_tensor_pipeline4.ptx"
+  $gb10Pipeline4Cubin = Join-Path $tmpDir "ptx_emit_gb10_tensor_pipeline4.cubin"
+  $pipelineEmitOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
+    tests/gpu/tensor_pipeline.mettle -o $gb10PipelinePtx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "GB10 staged-tensor emit failed: $pipelineEmitOut"
+  }
+  $pipeline4EmitOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
+    tests/gpu/tensor_pipeline4.mettle -o $gb10Pipeline4Ptx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "GB10 four-stage tensor emit failed: $pipeline4EmitOut"
+  }
+  $pipelineText = Get-Content -Raw $gb10PipelinePtx
+  if ([regex]::Matches($pipelineText,
+                      "cp\.async\.cg\.shared\.global").Count -ne 4 -or
+      [regex]::Matches($pipelineText, "cp\.async\.commit_group").Count -ne 2 -or
+      [regex]::Matches($pipelineText, "cp\.async\.wait_group 1").Count -ne 1 -or
+      [regex]::Matches($pipelineText, "cp\.async\.wait_group 0").Count -ne 1 -or
+      [regex]::Matches($pipelineText, "bar\.sync 0").Count -ne 2 -or
+      $pipelineText -notmatch "mtlc\.tensor_pipeline resident group=1 tuple_peak=32 budget=96" -or
+      [regex]::Matches($pipelineText, "wmma\.load\.a\.sync").Count -ne 2 -or
+      [regex]::Matches($pipelineText, "wmma\.load\.b\.sync").Count -ne 2 -or
+      [regex]::Matches($pipelineText, "wmma\.load\.c\.sync").Count -ne 1 -or
+      [regex]::Matches($pipelineText, "wmma\.mma\.sync").Count -ne 2 -or
+      [regex]::Matches($pipelineText, "wmma\.store\.d\.sync").Count -ne 1 -or
+      [regex]::Matches($pipelineText,
+                      "\.shared \.align 32 \.b8 tensor_pipeline_f16_f32_[ab]_stage_storage\[1024\]").Count -ne 2 -or
+      $pipelineText -match "synchronous-fallback") {
+    throw "GB10 native staged-tensor structure/residency contract mismatch"
+  }
+  $secondCommitAt = $pipelineText.LastIndexOf("cp.async.commit_group")
+  $waitOneAt = $pipelineText.IndexOf("cp.async.wait_group 1", $secondCommitAt + 1)
+  $firstBarrierAt = $pipelineText.IndexOf("bar.sync 0", $waitOneAt + 1)
+  $firstMmaAt = $pipelineText.IndexOf("wmma.mma.sync", $firstBarrierAt + 1)
+  $waitZeroAt = $pipelineText.IndexOf("cp.async.wait_group 0", $firstMmaAt + 1)
+  $secondBarrierAt = $pipelineText.IndexOf("bar.sync 0", $waitZeroAt + 1)
+  $secondMmaAt = $pipelineText.IndexOf("wmma.mma.sync", $firstMmaAt + 1)
+  $storeAt = $pipelineText.IndexOf("wmma.store.d.sync", $secondMmaAt + 1)
+  if ($secondCommitAt -lt 0 -or $waitOneAt -le $secondCommitAt -or
+      $firstBarrierAt -le $waitOneAt -or $firstMmaAt -le $firstBarrierAt -or
+      $waitZeroAt -le $firstMmaAt -or $secondBarrierAt -le $waitZeroAt -or
+      $secondMmaAt -le $secondBarrierAt -or $storeAt -le $secondMmaAt) {
+    throw "GB10 native staged-tensor overlap/handoff ordering mismatch"
+  }
+  $gb10PipelineUnoptimized =
+    Join-Path $tmpDir "ptx_emit_gb10_tensor_pipeline_unoptimized.ptx"
+  $pipelineUnoptimizedOut = & $CompilerPath --emit-ptx --gpu-arch=gb10 `
+    tests/gpu/tensor_pipeline.mettle -o $gb10PipelineUnoptimized 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "GB10 unoptimized staged-tensor emit failed: $pipelineUnoptimizedOut"
+  }
+  $pipelineUnoptimizedText = Get-Content -Raw $gb10PipelineUnoptimized
+  if ($pipelineUnoptimizedText -match "mtlc\.tensor_pipeline" -or
+      [regex]::Matches($pipelineUnoptimizedText,
+                      "cp\.async\.cg\.shared\.global").Count -ne 4 -or
+      [regex]::Matches($pipelineUnoptimizedText,
+                      "wmma\.load\.c\.sync").Count -ne 2 -or
+      [regex]::Matches($pipelineUnoptimizedText,
+                      "wmma\.store\.d\.sync").Count -ne 2) {
+    throw "GB10 staged-tensor optimization ownership contract mismatch"
+  }
+  $pipeline4Text = Get-Content -Raw $gb10Pipeline4Ptx
+  if ([regex]::Matches($pipeline4Text,
+                      "cp\.async\.cg\.shared\.global").Count -ne 8 -or
+      [regex]::Matches($pipeline4Text,
+                      "cp\.async\.commit_group").Count -ne 4 -or
+      [regex]::Matches($pipeline4Text,
+                      "cp\.async\.wait_group [0-3]").Count -ne 4 -or
+      [regex]::Matches($pipeline4Text, "bar\.sync 0").Count -ne 4 -or
+      $pipeline4Text -notmatch "mtlc\.tensor_pipeline resident group=1 tuple_peak=32 budget=96" -or
+      [regex]::Matches($pipeline4Text, "wmma\.load\.a\.sync").Count -ne 4 -or
+      [regex]::Matches($pipeline4Text, "wmma\.load\.b\.sync").Count -ne 4 -or
+      [regex]::Matches($pipeline4Text, "wmma\.load\.c\.sync").Count -ne 1 -or
+      [regex]::Matches($pipeline4Text, "wmma\.mma\.sync").Count -ne 4 -or
+      [regex]::Matches($pipeline4Text, "wmma\.store\.d\.sync").Count -ne 1 -or
+      $pipeline4Text -match "synchronous-fallback") {
+    throw "GB10 native four-stage tensor pipeline contract mismatch"
+  }
+  $pipeline4Order = New-Object System.Collections.Generic.List[int]
+  $pipeline4Cursor = -1
+  foreach ($needle in @("cp.async.wait_group 3", "bar.sync 0",
+                         "wmma.mma.sync", "cp.async.wait_group 2",
+                         "bar.sync 0", "wmma.mma.sync",
+                         "cp.async.wait_group 1", "bar.sync 0",
+                         "wmma.mma.sync", "cp.async.wait_group 0",
+                         "bar.sync 0", "wmma.mma.sync",
+                         "wmma.store.d.sync")) {
+    $pipeline4Cursor = $pipeline4Text.IndexOf($needle, $pipeline4Cursor + 1)
+    $pipeline4Order.Add($pipeline4Cursor)
+  }
+  for ($i = 0; $i -lt $pipeline4Order.Count; $i++) {
+    if ($pipeline4Order[$i] -lt 0 -or
+        ($i -gt 0 -and $pipeline4Order[$i] -le $pipeline4Order[$i - 1])) {
+      throw "GB10 four-stage tensor pipeline ordering mismatch at step $i"
+    }
+  }
+  if ($ptxas) {
+    $ptxasHelp = & $ptxas.Source --help 2>&1 | Out-String
+    if ($ptxasHelp -match "sm_121a") {
+      $pipelineAsmOut = & $ptxas.Source -arch=sm_121a $gb10PipelinePtx `
+        -o $gb10PipelineCubin 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) {
+        throw "ptxas rejected GB10 staged-tensor PTX: $pipelineAsmOut"
+      }
+      $pipeline4AsmOut = & $ptxas.Source -arch=sm_121a $gb10Pipeline4Ptx `
+        -o $gb10Pipeline4Cubin 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) {
+        throw "ptxas rejected GB10 four-stage tensor PTX: $pipeline4AsmOut"
+      }
+    } else {
+      Write-Host "[SKIP] ptx_emit_gb10_tensor_pipeline ptxas assembly (toolkit lacks sm_121a)"
+    }
+  } else {
+    Write-Host "[SKIP] ptx_emit_gb10_tensor_pipeline ptxas assembly (ptxas not found)"
+  }
+  Write-CaseResult -Name "ptx_emit_gb10_tensor_pipeline" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "ptx_emit_gb10_tensor_pipeline" -Passed $false -Reason $_.Exception.Message
+}
+
+# Self-checking codegen fixtures. Each one's main returns 0 when every value it
+# computes is correct and a distinct nonzero code otherwise, so these are RUN,
+# not merely compiled: a construct that silently produces the wrong value still
+# compiles clean. Every fixture runs in debug and release, since the two take
+# different backend paths. They cannot be @test functions - the compile-time
+# interpreter does not model global `var` initializers, and it is the native
+# backend under audit here.
+$runFixtures = @(
+  @{ Name = "global_init_layoutable"; Path = "tests/global_init_layoutable.mettle"
+     What = "a global folded to the wrong value" },
+  @{ Name = "bool_roundtrip"; Path = "tests/codegen/bool_roundtrip.mettle"
+     What = "a bool crossed a call boundary wrong" },
+  @{ Name = "odd_size_aggregates"; Path = "tests/codegen/odd_size_aggregates.mettle"
+     What = "a 3/5/6/7-byte aggregate copied wrong" },
+  @{ Name = "abi_mixed_args"; Path = "tests/codegen/abi_mixed_args.mettle"
+     What = "an argument crossed the ABI boundary wrong" },
+  @{ Name = "abi_struct_args"; Path = "tests/codegen/abi_struct_args.mettle"
+     What = "a struct argument or a spilled stack argument landed wrong" },
+  @{ Name = "struct_ret_sizes"; Path = "tests/codegen/struct_ret_sizes.mettle"
+     What = "a struct return of some size class came back wrong" },
+  @{ Name = "call_chains"; Path = "tests/codegen/call_chains.mettle"
+     What = "a nested call passed something wrong" },
+  @{ Name = "float_conv"; Path = "tests/codegen/float_conv.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "unsigned_loops"; Path = "tests/codegen/unsigned_loops.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "defer_scopes"; Path = "tests/codegen/defer_scopes.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "generic_structs"; Path = "tests/codegen/generic_structs.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "simd_loops"; Path = "tests/codegen/simd_loops.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "inline_kernels"; Path = "tests/codegen/inline_kernels.mettle"
+     What = "a vector kernel run inside a register-allocated frame produced the wrong value" },
+  @{ Name = "divmod_pairs"; Path = "tests/codegen/divmod_pairs.mettle"
+     What = "a fused divide lost its quotient or its remainder" },
+  @{ Name = "switch_dense"; Path = "tests/codegen/switch_dense.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "enums_match"; Path = "tests/codegen/enums_match.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "pointers"; Path = "tests/codegen/pointers.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "casts"; Path = "tests/codegen/casts.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "int_edges"; Path = "tests/codegen/int_edges.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "funcptr"; Path = "tests/codegen/funcptr.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "control_flow"; Path = "tests/codegen/control_flow.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "reg_pressure"; Path = "tests/codegen/reg_pressure.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "scalar_params"; Path = "tests/codegen/scalar_params.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "struct_byval"; Path = "tests/codegen/struct_byval.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "heap_new"; Path = "tests/codegen/heap_new.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "global_arrays"; Path = "tests/codegen/global_arrays.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "strings"; Path = "tests/codegen/strings.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "nested_data"; Path = "tests/codegen/nested_data.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "methods"; Path = "tests/codegen/methods.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "generics_mono"; Path = "tests/codegen/generics_mono.mettle"
+     What = "a codegen check failed" },
+  @{ Name = "nested_generics"; Path = "tests/codegen/nested_generics.mettle"
+     What = "a nested generic instantiation was wrong" },
+  @{ Name = "keyword_field_names"; Path = "tests/codegen/keyword_field_names.mettle"
+     What = "a mnemonic-named field read back wrong" },
+  @{ Name = "struct_methods"; Path = "tests/codegen/struct_methods.mettle"
+     What = "a struct method body behaved wrong" },
+  @{ Name = "unsigned_fold"; Path = "tests/codegen/unsigned_fold.mettle"
+     What = "an unsigned operation folded with signed semantics" },
+  @{ Name = "uint64_literals"; Path = "tests/codegen/uint64_literals.mettle"
+     What = "a uint64 decimal literal was wrong" },
+  @{ Name = "value_range"; Path = "tests/codegen/value_range.mettle"
+     What = "a range-driven rewrite proved the wrong thing" }
+)
+foreach ($fixture in $runFixtures) {
+  foreach ($mode in @(@{ Name = "debug"; Args = @() },
+                      @{ Name = "release"; Args = @("--release") })) {
+    $caseName = "$($fixture.Name)_$($mode.Name)"
+    try {
+      $total++
+      $fixtureExe = Join-Path $tmpDir "$caseName.exe"
+      $fixtureOut = & $CompilerPath --build @($mode.Args) `
+        $fixture.Path -o $fixtureExe 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) {
+        throw "compile failed: $fixtureOut"
+      }
+      if ($fixtureOut -match "internal compiler error") {
+        throw "compile reported an internal compiler error: $fixtureOut"
+      }
+      & $fixtureExe | Out-Null
+      if ($LASTEXITCODE -ne 0) {
+        throw "$($fixture.What) (fixture check #$LASTEXITCODE)"
+      }
+      Write-CaseResult -Name $caseName -Passed $true
     }
     catch {
       $failed++
-      Write-CaseResult -Name $name -Passed $false -Reason $_.Exception.Message
+      Write-CaseResult -Name $caseName -Passed $false -Reason $_.Exception.Message
     }
+  }
+}
+
+# SPIR-V backend validity gate. Emits the self-contained GPU compute-kernel
+# fixture (tests/gpu/compute_kernels.mettle) plus the vadd kernel to SPIR-V
+# binary modules (--emit-spirv, the OpenCL 2.0 sibling of --emit-ptx) and
+# structurally validates each word stream: little-endian, correct magic, a
+# consistent word-count walk that lands exactly on EOF, an in-range id bound,
+# and every OpEntryPoint referencing a defined OpFunction. When the Vulkan SDK's
+# spirv-val is on PATH it is run too (the authoritative full validation, like
+# ptxas for PTX); otherwise the structural check stands alone (skip-augmented,
+# never skipped -- the emitter must always produce a well-formed module).
+$spirvVal = if ($env:SPIRV_VAL -and (Test-Path -LiteralPath $env:SPIRV_VAL)) {
+  [pscustomobject]@{ Source = (Resolve-Path -LiteralPath $env:SPIRV_VAL).ProviderPath }
+} else {
+  Get-Command spirv-val -ErrorAction SilentlyContinue
+}
+function Test-SpirvModule([string]$path, [bool]$RequireDeviceCall = $false,
+                          [bool]$RequireAtomicFamily = $false,
+                          [bool]$RequireAtomicU32 = $false) {
+  $bytes = [System.IO.File]::ReadAllBytes($path)
+  if ($bytes.Length % 4 -ne 0) { throw "not word-aligned ($($bytes.Length) bytes)" }
+  $nwords = $bytes.Length / 4
+  if ($nwords -lt 5) { throw "shorter than a SPIR-V header" }
+  $w = [uint32[]]::new($nwords)
+  for ($k = 0; $k -lt $nwords; $k++) { $w[$k] = [BitConverter]::ToUInt32($bytes, $k * 4) }
+  if ($w[0] -ne 0x07230203) { throw ("bad magic 0x{0:x8}" -f $w[0]) }
+  $bound = $w[3]
+  $i = 5; $entries = @(); $funcs = @{}; $calls = @()
+  $workgroupVars = 0; $privateVars = 0; $arrayTypes = 0
+  $arrayTypeIds = @{}; $pointerStorage = @{}; $pointerPointee = @{}
+  $workgroupPointerParams = 0
+  $capabilities = @{}; $groupBroadcasts = 0; $groupIAdds = 0; $groupFAdds = 0
+  $opcodeCounts = @{}
+  $groupIAddOps = @(0, 0, 0); $groupFAddOps = @(0, 0, 0)
+  $groupFMins = 0; $groupUMins = 0; $groupFMaxs = 0; $groupUMaxs = 0
+  while ($i -lt $nwords) {
+    $count = $w[$i] -shr 16; $op = $w[$i] -band 0xffff
+    if ($count -eq 0) { throw "zero word-count at word $i" }
+    if ($i + $count -gt $nwords) { throw "instruction overruns stream at word $i" }
+    if (-not $opcodeCounts.ContainsKey($op)) { $opcodeCounts[$op] = 0 }
+    $opcodeCounts[$op]++
+    if ($op -eq 15) { $entries += $w[$i + 2] }        # OpEntryPoint: funcid is operand 2
+    elseif ($op -eq 17) { $capabilities[$w[$i + 1]] = $true } # OpCapability
+    elseif ($op -eq 54) { $funcs[$w[$i + 2]] = $true } # OpFunction: result id is operand 2
+    elseif ($op -eq 57) { $calls += $w[$i + 3] }      # OpFunctionCall: function is operand 3
+    elseif ($op -eq 28) {                              # OpTypeArray
+      $arrayTypes++
+      $arrayTypeIds[$w[$i + 1]] = $true
+    }
+    elseif ($op -eq 32 -and $count -eq 4) {            # OpTypePointer
+      $pointerStorage[$w[$i + 1]] = $w[$i + 2]
+      $pointerPointee[$w[$i + 1]] = $w[$i + 3]
+    }
+    elseif ($op -eq 55 -and $count -eq 3 -and          # OpFunctionParameter
+            $pointerStorage.ContainsKey($w[$i + 1]) -and
+            $pointerStorage[$w[$i + 1]] -eq 4) {
+      $workgroupPointerParams++
+    }
+    elseif ($op -eq 263) { $groupBroadcasts++ }        # OpGroupBroadcast
+    elseif ($op -eq 264) {                             # OpGroupIAdd
+      $groupIAdds++
+      if ($w[$i + 4] -le 2) { $groupIAddOps[$w[$i + 4]]++ }
+    }
+    elseif ($op -eq 265) {                             # OpGroupFAdd
+      $groupFAdds++
+      if ($w[$i + 4] -le 2) { $groupFAddOps[$w[$i + 4]]++ }
+    }
+    elseif ($op -eq 266) { $groupFMins++ }             # OpGroupFMin
+    elseif ($op -eq 267) { $groupUMins++ }             # OpGroupUMin
+    elseif ($op -eq 269) { $groupFMaxs++ }             # OpGroupFMax
+    elseif ($op -eq 270) { $groupUMaxs++ }             # OpGroupUMax
+    elseif ($op -eq 59 -and $count -eq 4) {            # OpVariable
+      $variableType = $w[$i + 1]
+      $isArrayVariable = $pointerPointee.ContainsKey($variableType) -and
+                         $arrayTypeIds.ContainsKey($pointerPointee[$variableType])
+      if ($isArrayVariable -and $w[$i + 3] -eq 4) { $workgroupVars++ }
+      elseif ($isArrayVariable -and $w[$i + 3] -eq 7) { $privateVars++ }
+    }
+    $i += $count
+  }
+  if ($i -ne $nwords) { throw "trailing words after last instruction" }
+  foreach ($e in $entries) {
+    if (-not $funcs.ContainsKey($e)) { throw "entry point $e is not a defined function" }
+    if ($e -ge $bound) { throw "entry point id $e exceeds id bound $bound" }
+  }
+  foreach ($c in $calls) {
+    if (-not $funcs.ContainsKey($c)) { throw "device call target $c is not a defined function" }
+    if ($c -ge $bound) { throw "device call target id $c exceeds id bound $bound" }
+  }
+  if ($RequireDeviceCall) {
+    if ($calls.Count -lt 1) { throw "module has no OpFunctionCall" }
+    if ($funcs.Count -ne $entries.Count + 1) {
+      throw "device reachability mismatch: $($funcs.Count) functions for $($entries.Count) entries"
+    }
+    if ($arrayTypes -lt 2 -or $workgroupVars -ne 1 -or $privateVars -ne 1) {
+      throw "static address-space storage mismatch: arrays=$arrayTypes workgroup=$workgroupVars private=$privateVars"
+    }
+    if ($workgroupPointerParams -ne 1) {
+      throw "dynamic workgroup ABI mismatch: Workgroup pointer params=$workgroupPointerParams"
+    }
+    if (-not $capabilities.ContainsKey([uint32]18) -or
+        $groupBroadcasts -ne 2 -or $groupIAdds -ne 3 -or $groupFAdds -ne 3 -or
+        ($groupIAddOps -join ',') -ne '1,1,1' -or
+        ($groupFAddOps -join ',') -ne '1,1,1' -or
+        $groupFMins -ne 1 -or $groupUMins -ne 1 -or
+        $groupFMaxs -ne 1 -or $groupUMaxs -ne 1 -or
+        -not $capabilities.ContainsKey([uint32]4423) -or
+        -not $capabilities.ContainsKey([uint32]4431) -or
+        -not $opcodeCounts.ContainsKey([uint32]4421) -or
+        $opcodeCounts[[uint32]4421] -ne 2 -or
+        -not $opcodeCounts.ContainsKey([uint32]4428) -or
+        $opcodeCounts[[uint32]4428] -ne 2 -or
+        -not $opcodeCounts.ContainsKey([uint32]4429) -or
+        $opcodeCounts[[uint32]4429] -ne 1) {
+      throw "subgroup contract mismatch: Groups=$($capabilities.ContainsKey([uint32]18)) broadcast=$groupBroadcasts iadd=$groupIAdds/$($groupIAddOps -join ',') fadd=$groupFAdds/$($groupFAddOps -join ',') min=$groupFMins,$groupUMins max=$groupFMaxs,$groupUMaxs"
+    }
+  }
+  if ($RequireAtomicFamily) {
+    $expectedAtomicOpcodes = @{
+      227 = 4; 228 = 4
+      229 = 2; 230 = 3; 234 = 3; 235 = 2; 237 = 2
+      239 = 2; 240 = 2; 241 = 2; 242 = 2
+    }
+    if (-not $capabilities.ContainsKey([uint32]12)) {
+      throw "64-bit atomic module omitted Int64Atomics capability"
+    }
+    foreach ($entry in $expectedAtomicOpcodes.GetEnumerator()) {
+      $actual = if ($opcodeCounts.ContainsKey([uint32]$entry.Key)) {
+        $opcodeCounts[[uint32]$entry.Key]
+      } else { 0 }
+      if ($actual -ne $entry.Value) {
+        throw "atomic opcode $($entry.Key) count=$actual expected=$($entry.Value)"
+      }
+    }
+  }
+  if ($RequireAtomicU32) {
+    foreach ($entry in @{ 227 = 2; 228 = 2 }.GetEnumerator()) {
+      $actual = if ($opcodeCounts.ContainsKey([uint32]$entry.Key)) {
+        $opcodeCounts[[uint32]$entry.Key]
+      } else { 0 }
+      if ($actual -ne $entry.Value) {
+        throw "u32 atomic opcode $($entry.Key) count=$actual expected=$($entry.Value)"
+      }
+    }
+    if ($capabilities.ContainsKey([uint32]12)) {
+      throw "u32-only atomic module declared optional Int64Atomics capability"
+    }
+  }
+  return $entries.Count
+}
+foreach ($src in @("tests/gpu/compute_kernels.mettle",
+                   "tests/gpu/atomic_kernels.mettle",
+                   "tests/gpu/atomic_u32_profile.mettle",
+                   "tests/gpu/async_copy.mettle",
+                   "tests/gpu/auto_staging.mettle",
+                   "tests/gpu/auto_staging_no_promote.mettle",
+                   "examples/gpu_vadd/vadd_kernel.mettle")) {
+  $total++
+  $name = "spirv_emit_" + [System.IO.Path]::GetFileNameWithoutExtension($src)
+  try {
+    $spvPath = Join-Path $tmpDir ($name + ".spv")
+    $emitOut = & $CompilerPath -O --emit-spirv $src -o $spvPath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "emit failed: $emitOut" }
+    if (-not (Test-Path $spvPath)) { throw "no SPIR-V produced" }
+    $isAtomicFamily = $src -like "*atomic_kernels.mettle"
+    $isAtomicU32 = $src -like "*atomic_u32_profile.mettle"
+    $null = Test-SpirvModule $spvPath ($src -like "*compute_kernels.mettle") `
+      $isAtomicFamily $isAtomicU32
+    if ($spirvVal) {
+      # Int64Atomics is a standard optional OpenCL capability gated by both
+      # cl_khr_int64_* extensions. spirv-val's OpenCL profiles model only the
+      # mandatory capability set, so validate such a module as SPIR-V 1.0 and
+      # validate all mandatory-profile modules against OpenCL 2.0 directly.
+      $targetEnv = if ($isAtomicFamily) { "spv1.0" } else { "opencl2.0" }
+      $valOut = & $spirvVal.Source --target-env $targetEnv $spvPath 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) { throw "spirv-val rejected emitted module: $valOut" }
+    }
+    Write-CaseResult -Name $name -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name $name -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Gates that link the libmtlc archive directly. They prove the backend this
+# build was made against actually works end to end. libmtlc's own suite audits
+# its internal boundaries -- archive self-containment, and the non-Mettle calc
+# frontend that proves the backend is frontend-agnostic -- which is that
+# repository's job, not this one's.
+# ---------------------------------------------------------------------------
+$calcGcc = Get-Command gcc -ErrorAction SilentlyContinue
+
+# Optimizer unit gate: loop-carried float symbols must not become temps before
+# loop unrolling, which would clone several producers under one temp name.
+if (-not $calcGcc) {
+  Write-Host "[SKIP] optimizer_float_copy (gcc not found)"
+}
+elseif (-not $LibmtlcLib) {
+  Write-Host "[SKIP] optimizer_float_copy (no libmtlc archive found in $LibmtlcDir)"
+}
+else {
+  $total++
+  try {
+    $floatCopyExe = Join-Path $tmpDir "optimizer_float_copy_test.exe"
+    $buildOut = & $calcGcc.Source -Wall -Wextra -std=c99 -Isrc "-I$LibmtlcInc" "-I$LibmtlcSrc" `
+      tests/optimizer_float_copy_test.c $LibmtlcLib -o $floatCopyExe -ldbghelp 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "building optimizer_float_copy_test failed: $buildOut"
+    }
+    $runOut = & $floatCopyExe 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "optimizer_float_copy_test failed: $runOut"
+    }
+    Write-CaseResult -Name "optimizer_float_copy" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "optimizer_float_copy" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# Full public-API surface gate. Compiles tests/public_api_test.c (includes ONLY
+# include/mtlc, links ONLY bin/mtlc.lib) and runs it: it builds six module
+# families through the public IR builder -- globals, extern libc calls, pointer
+# load/store, address-of, float arithmetic + casts -- and emits through
+# mtlc_emit/mtlc_build_executable to all four targets: a native x86-64 exe
+# (run below: exit 42 + stdout OK), PTX text, a SPIR-V binary, and an AArch64
+# ELF, a typed semantic host-launch object, and broad cooperative-tensor PTX
+# (each structurally verified inside the test). Skipped without gcc.
+if (-not $calcGcc) {
+  Write-Host "[SKIP] public_api (gcc not found)"
+}
+elseif (-not $LibmtlcLib) {
+  Write-Host "[SKIP] public_api (no libmtlc archive found in $LibmtlcDir)"
+}
+else {
+  $total++
+  try {
+    $pubExe = Join-Path $tmpDir "public_api_test.exe"
+    $pubOut = Join-Path $tmpDir "pubapi"
+    New-Item -ItemType Directory -Force $pubOut | Out-Null
+    $buildOut = & $calcGcc.Source -Wall -Wextra -std=c99 "-I$LibmtlcInc" `
+      tests/public_api_test.c $LibmtlcLib -o $pubExe -ldbghelp 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "building public_api_test failed: $buildOut" }
+    $runOut = & $pubExe $pubOut 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "public_api_test failed: $runOut" }
+    if ($ptxas) {
+      $pubPortablePtx = Join-Path $pubOut "pubapi_kernel_compute75.ptx"
+      $pubPortableCubin = Join-Path $pubOut "pubapi_kernel_compute75.cubin"
+      $asmOut = & $ptxas.Source -arch=sm_75 $pubPortablePtx -o $pubPortableCubin 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) { throw "ptxas rejected public atomic-memory PTX: $asmOut" }
+      $pubTensorPtx = Join-Path $pubOut "pubapi_tensor_sm121a.ptx"
+      $pubTensorCubin = Join-Path $pubOut "pubapi_tensor_sm121a.cubin"
+      $tensorAsmOut = & $ptxas.Source -arch=sm_121a $pubTensorPtx -o $pubTensorCubin 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) { throw "ptxas rejected public tensor-family PTX: $tensorAsmOut" }
+      $pubShufflePtx = Join-Path $pubOut "pubapi_subgroup_shuffle_sm121a.ptx"
+      $pubShuffleCubin = Join-Path $pubOut "pubapi_subgroup_shuffle_sm121a.cubin"
+      $shuffleAsmOut = & $ptxas.Source -arch=sm_121a $pubShufflePtx -o $pubShuffleCubin 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) { throw "ptxas rejected public subgroup-shuffle PTX: $shuffleAsmOut" }
+      $pubTransferPortablePtx = Join-Path $pubOut "pubapi_transfer_compute75.ptx"
+      $pubTransferPortableCubin = Join-Path $pubOut "pubapi_transfer_compute75.cubin"
+      $transferPortableAsmOut = & $ptxas.Source -arch=sm_75 $pubTransferPortablePtx -o $pubTransferPortableCubin 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) { throw "ptxas rejected public portable tensor-transfer PTX: $transferPortableAsmOut" }
+      $pubTransferGb10Ptx = Join-Path $pubOut "pubapi_transfer_sm121a.ptx"
+      $pubTransferGb10Cubin = Join-Path $pubOut "pubapi_transfer_sm121a.cubin"
+      $transferGb10AsmOut = & $ptxas.Source -arch=sm_121a $pubTransferGb10Ptx -o $pubTransferGb10Cubin 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) { throw "ptxas rejected public GB10 tensor-transfer PTX: $transferGb10AsmOut" }
+    }
+    if ($spirvVal) {
+      $pubSpv = Join-Path $pubOut "pubapi_kernel.spv"
+      # The public module deliberately exercises optional Int64Atomics; its
+      # exact capabilities/opcodes are checked in-process, while spirv-val
+      # validates the core SPIR-V module independently of device extensions.
+      $valOut = & $spirvVal.Source --target-env spv1.0 $pubSpv 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) { throw "spirv-val rejected public atomic-memory SPIR-V: $valOut" }
+    }
+    $nativeExe = Join-Path $pubOut "pubapi_native.exe"
+    if (-not (Test-Path $nativeExe)) { throw "no native executable produced" }
+    $nativeOut = & $nativeExe | Out-String
+    if ($LASTEXITCODE -ne 42) { throw "native exe exit code $LASTEXITCODE, expected 42" }
+    if ($nativeOut -notmatch "OK") { throw "native exe stdout missing OK: '$nativeOut'" }
+    # The convenience surface (element/field addressing, allocated labels,
+    # operator enums) must lower to the same working native code: the program
+    # sums i*i for i in 0..4 into a struct field and adds a second field.
+    $ergExe = Join-Path $pubOut "pubapi_ergonomics.exe"
+    if (-not (Test-Path $ergExe)) { throw "no ergonomics executable produced" }
+    & $ergExe | Out-Null
+    if ($LASTEXITCODE -ne 77) { throw "ergonomics exe exit code $LASTEXITCODE, expected 77" }
+    Write-CaseResult -Name "public_api" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "public_api" -Passed $false -Reason $_.Exception.Message
   }
 }
 

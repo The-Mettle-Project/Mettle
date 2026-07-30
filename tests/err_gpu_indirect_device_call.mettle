@@ -1,0 +1,9 @@
+fn increment(value: int32) -> int32 {
+  return value + 1;
+}
+
+kernel indirect_device_call(out: int32*) {
+  var operation: fn(int32) -> int32;
+  operation = &increment;
+  out[0] = operation(1);
+}

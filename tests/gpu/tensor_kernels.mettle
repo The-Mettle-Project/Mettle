@@ -1,0 +1,40 @@
+kernel tensor_f16_f32(a: uint16*, b: uint16*, c: float32*, d: float32*) {
+  tensor_mma(a, b, c, d, shape: m16n16k16, input_type: f16, output_type: f32);
+}
+
+kernel tensor_f16_f32_strided(a: uint16*, b: uint16*, c: float32*, d: float32*, lda: int32, ldb: int32, ldc: int32, ldd: int32) {
+  tensor_mma(a, b, c, d, shape: m16n16k16, input_type: f16, output_type: f32, lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+}
+
+kernel tensor_f16_f32_kloop(a: uint16*, b: uint16*, c: float32*, d: float32*, k: int32, lda: int32, ldb: int32, ldc: int32, ldd: int32) {
+  tensor_mma(a, b, c, d, shape: m16n16k16, input_type: f16, output_type: f32, lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+  var inner: int32 = 16;
+  while (inner < k) {
+    tensor_mma(a + inner, b + inner, d, d, shape: m16n16k16, input_type: f16, output_type: f32, lda: lda, ldb: ldb, ldc: ldd, ldd: ldd);
+    inner = inner + 16;
+  }
+}
+
+kernel tensor_bf16_f32(a: uint16*, b: uint16*, c: float32*, d: float32*) {
+  tensor_mma(a, b, c, d, m: 32, n: 8, k: 16, input_type: bf16, output_type: f32, a_layout: col, b_layout: row, d_layout: col, lda: 32, ldb: 8, ldc: 8, ldd: 32);
+}
+
+kernel tensor_tf32_f32(a: float32*, b: float32*, c: float32*, d: float32*) {
+  tensor_mma(a, b, c, d, shape: m16n16k8, input_type: tf32, output_type: f32);
+}
+
+kernel tensor_f64(a: float64*, b: float64*, c: float64*, d: float64*) {
+  tensor_mma(a, b, c, d, shape: m8n8k4, input_type: f64, output_type: f64, rounding: nearest_even);
+}
+
+kernel tensor_i8_i32(a: int8*, b: int8*, c: int32*, d: int32*) {
+  tensor_mma(a, b, c, d, shape: m16n16k16, input_type: i8, output_type: i32, overflow: saturate_finite);
+}
+
+kernel tensor_u4_i32(a: uint8*, b: uint8*, c: int32*, d: int32*) {
+  tensor_mma(a, b, c, d, shape: m8n8k32, input_type: u4, output_type: i32);
+}
+
+kernel tensor_b1_xor(a: uint8*, b: uint8*, c: int32*, d: int32*) {
+  tensor_mma(a, b, c, d, shape: m8n8k128, input_type: b1, output_type: i32, math: xor_popcount);
+}

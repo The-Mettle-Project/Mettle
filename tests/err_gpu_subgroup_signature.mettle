@@ -1,0 +1,7 @@
+// A source frontend may choose its own spelling, but a spelling mapped to the
+// reference subgroup semantic cannot lie about the shared IR ABI.
+extern fn subgroup_reduce_add_f32(value: int32) -> float32 = "subgroup_reduce_add_f32";
+
+kernel bad_subgroup_signature(out: float32*) {
+  out[0] = subgroup_reduce_add_f32(1);
+}

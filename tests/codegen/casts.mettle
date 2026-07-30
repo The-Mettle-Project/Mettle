@@ -1,0 +1,21 @@
+@noinline fn id64(x: int64) -> int64 { return x; }
+@noinline fn idf(x: float64) -> float64 { return x; }
+fn main() -> int32 {
+  var big: int64 = 4294967296;
+  if ((int32)big != 0) { return 1; }
+  var neg: int32 = -1;
+  if ((int64)neg != -1) { return 2; }
+  if ((int64)(uint32)neg != 4294967295) { return 3; }
+  var f: float64 = -3.7;
+  if ((int32)f != -3) { return 4; }
+  var i: int32 = -3;
+  if ((float64)i != -3.0) { return 5; }
+  var u: uint8 = 200;
+  if ((int32)u != 200) { return 6; }
+  var s8: int8 = -56;
+  if ((int32)s8 != -56) { return 7; }
+  if ((int32)(int8)200 != -56) { return 8; }
+  if (id64((int64)(float32)1.5) != 1) { return 9; }
+  if (idf((float64)(int64)7) != 7.0) { return 10; }
+  return 0;
+}

@@ -1,0 +1,6 @@
+kernel divergent_tensor_epilogue(d: float32*) {
+  if (subgroup_local_id() == 0) {
+    tensor_epilogue(d, shape: m16n16, element_type: f32,
+                    activation: relu);
+  }
+}

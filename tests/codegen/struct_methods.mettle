@@ -1,0 +1,30 @@
+struct Vec {
+  x: int32;
+  y: int32;
+
+  method sum() -> int32 { return this.x + this.y; }
+  method scale(k: int32) -> int32 { return (this.x + this.y) * k; }
+  method is_origin() -> int32 { if (this.x == 0 && this.y == 0) { return 1; } return 0; }
+}
+
+struct Big {
+  a: int64;
+  b: int64;
+  c: int64;
+
+  method total() -> int64 { return this.a + this.b + this.c; }
+}
+
+fn main() -> int32 {
+  var v: Vec = { x: 3, y: 4 };
+  if (v.sum() != 7) { return 1; }
+  if (v.scale(2) != 14) { return 2; }
+  if (v.is_origin() != 0) { return 3; }
+  var p: Vec* = &v;
+  if (p->sum() != 7) { return 4; }
+  var z: Vec = { x: 0, y: 0 };
+  if (z.is_origin() != 1) { return 5; }
+  var b: Big = { a: 1, b: 2, c: 3 };
+  if (b.total() != 6) { return 6; }
+  return 0;
+}

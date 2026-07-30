@@ -1,0 +1,6 @@
+fn host_copy(destination: uint32*, source: uint32*) {
+  async_copy_workgroup(destination, source, 1,
+                       transaction: 4, cache: all);
+}
+
+fn main() -> int64 { return 0; }

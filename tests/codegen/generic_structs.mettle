@@ -1,0 +1,22 @@
+struct Box<T> { value: T; tag: int32; }
+struct Pair<A, B> { first: A; second: B; }
+@noinline fn unbox<T>(b: Box<T>) -> T { return b.value; }
+@noinline fn boxed<T>(v: T) -> Box<T> { var b: Box<T>; b.value = v; b.tag = 1; return b; }
+fn main() -> int32 {
+  var bi: Box<int32>;
+  bi.value = 42; bi.tag = 1;
+  if (unbox<int32>(bi) != 42) { return 1; }
+  var bf: Box<float64>;
+  bf.value = 2.5; bf.tag = 1;
+  if (unbox<float64>(bf) != 2.5) { return 2; }
+  var bb: Box<uint8>;
+  bb.value = 250; bb.tag = 1;
+  if ((int32)unbox<uint8>(bb) != 250) { return 3; }
+  if ((int64)unbox<int32>(bi) != 42) { return 6; }
+  var r: Box<int64> = boxed<int64>(7);
+  if (r.value != 7 || r.tag != 1) { return 4; }
+  var p: Pair<int32, float64>;
+  p.first = 5; p.second = 6.5;
+  if ((float64)p.first + p.second != 11.5) { return 5; }
+  return 0;
+}

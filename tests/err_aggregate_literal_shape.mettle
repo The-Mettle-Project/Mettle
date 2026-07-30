@@ -1,0 +1,5 @@
+// The literal's shape has to match the type it initializes: too many elements
+// do not silently spill past the end of the array.
+const TABLE: int32[3] = [1, 2, 3, 4];
+
+fn main() -> int32 { return TABLE[0]; }

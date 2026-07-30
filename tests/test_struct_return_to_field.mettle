@@ -1,0 +1,97 @@
+// Regression: assigning a returned aggregate into a non-local destination.
+//
+// Aggregates above 8 bytes come back through a hidden pointer, landing in a
+// temp. The wide-copy paths built their source with ir_emit_address_of_symbol,
+// so they required a named symbol and declined for a temp -- leaving the caller
+// to emit a single word-sized store that dropped everything past the first 8
+// bytes.
+//
+// It only bit when the destination was not a plain local, which is why
+// `var r: Rect = make()` looked fine while `cfg.rect = make()` produced
+// garbage. That is what corrupted control sizes in std/ui: the rect arrived as
+// a temp, only its first word reached the field, and CreateWindowExA was then
+// handed nonsense width and height. The cause was misread at the time as
+// corruption of stack-passed arguments to that call.
+//
+// Exits 55 when every destination form copies the whole aggregate, 1 otherwise.
+
+struct Rect {
+  left: int32;
+  top: int32;
+  right: int32;
+  bottom: int32;
+}
+
+struct Config {
+  rect: Rect;
+  tag: int32;
+}
+
+struct Outer {
+  config: Config;
+  extra: int64;
+}
+
+fn make_rect(base: int32) -> Rect {
+  var r: Rect;
+  r.left = base + 1;
+  r.top = base + 2;
+  r.right = base + 3;
+  r.bottom = base + 4;
+  return r;
+}
+
+fn rect_ok(r: Rect, base: int32) -> int32 {
+  if (r.left != base + 1) { return 0; }
+  if (r.top != base + 2) { return 0; }
+  if (r.right != base + 3) { return 0; }
+  if (r.bottom != base + 4) { return 0; }
+  return 1;
+}
+
+fn main() -> int32 {
+  // Plain local, at declaration and by later assignment. These always worked.
+  var plain: Rect = make_rect(0);
+  if (rect_ok(plain, 0) == 0) { return 1; }
+
+  var plain2: Rect;
+  plain2 = make_rect(10);
+  if (rect_ok(plain2, 10) == 0) { return 1; }
+
+  // Field of a struct, with a sibling to catch an over-wide copy.
+  var cfg: Config;
+  cfg.tag = 99;
+  cfg.rect = make_rect(20);
+  if (rect_ok(cfg.rect, 20) == 0) { return 1; }
+  if (cfg.tag != 99) { return 1; }
+
+  // Two levels down.
+  var outer: Outer;
+  outer.extra = 555;
+  outer.config.rect = make_rect(30);
+  if (rect_ok(outer.config.rect, 30) == 0) { return 1; }
+  if (outer.extra != 555) { return 1; }
+
+  // Through a pointer.
+  var p: Config* = &cfg;
+  p->rect = make_rect(40);
+  if (rect_ok(cfg.rect, 40) == 0) { return 1; }
+
+  // Array element, with neighbours to catch a copy landing at the wrong index.
+  var arr: Rect[4];
+  arr[0] = make_rect(60);
+  arr[2] = make_rect(50);
+  arr[3] = make_rect(70);
+  if (rect_ok(arr[2], 50) == 0) { return 1; }
+  if (rect_ok(arr[0], 60) == 0) { return 1; }
+  if (rect_ok(arr[3], 70) == 0) { return 1; }
+
+  // Nested aggregate inside an array element.
+  var configs: Config[3];
+  configs[1].tag = 7;
+  configs[1].rect = make_rect(80);
+  if (rect_ok(configs[1].rect, 80) == 0) { return 1; }
+  if (configs[1].tag != 7) { return 1; }
+
+  return 55;
+}

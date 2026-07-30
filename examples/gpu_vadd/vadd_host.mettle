@@ -2,7 +2,7 @@
 // launches the Mettle-emitted vadd kernel with the `dispatch` statement.
 //
 // Build (links the CUDA driver import stub; adjust the path to your toolkit):
-//   mettle --emit-ptx vadd_kernel.mettle -o vadd_kernel.ptx
+//   mettle --emit-ptx --gpu-arch=gb10 vadd_kernel.mettle -o vadd_kernel.ptx
 //   mettle --build vadd_host.mettle -o vadd_host.exe \
 //     --link-arg "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.9/lib/x64/cuda.lib"
 import "std/io";
@@ -13,7 +13,7 @@ fn main() -> int32 {
   if (gpu_init() == 0) { println(cstr("GPU init failed")); return 1; }
 
   // load the emitted PTX module and resolve the kernel
-  var fp: cstring = fopen(cstr("G:/Projects/Mettle/examples/gpu_vadd/vadd_kernel.ptx"), cstr("rb"));
+  var fp: cstring = fopen(cstr("vadd_kernel.ptx"), cstr("rb"));
   if (fp == 0) { println(cstr("open vadd_kernel.ptx failed (emit it first)")); return 1; }
   var ptx: uint8* = (uint8*)malloc(65536);
   var pl: int64 = fread((cstring)ptx, 1, 65535, fp); fclose(fp); ptx[pl] = 0;
@@ -37,7 +37,8 @@ fn main() -> int32 {
   gpu_to_device(da, (uint8*)ha, bytes);
   gpu_to_device(db, (uint8*)hb, bytes);
 
-  // launch: one line instead of param-packing + cuLaunchKernel + sync
+  // launch: one line instead of parameter packing + cuLaunchKernel. The
+  // following blocking copy supplies the required completion ordering.
   dispatch vadd[(n + 255) / 256, 256](da, db, dc, n);
 
   gpu_to_host((uint8*)hc, dc, bytes);

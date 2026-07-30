@@ -1,0 +1,4 @@
+kernel invalid_dynamic_private(out: float32*) {
+  private var arena: float32*;
+  out[0] = arena[0];
+}

@@ -1,0 +1,3 @@
+kernel invalid(counter: uint32*) {
+  var old: uint32 = atomic_load(counter, 0, order: release);
+}

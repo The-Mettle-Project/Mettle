@@ -1,0 +1,8 @@
+// Variable source lanes are intentionally work-item-varying. This distinguishes
+// shuffle from the uniform-source broadcast contract in neutral IR.
+kernel subgroup_shuffle_contract(uout: uint32*, fout: float32*) {
+  var lane: uint32 = subgroup_local_id();
+  var source: uint32 = (lane * 7 + 3) % subgroup_size();
+  uout[lane] = subgroup_shuffle(lane + 11, source);
+  fout[lane] = subgroup_shuffle((float32)lane + (float32)0.5, source);
+}

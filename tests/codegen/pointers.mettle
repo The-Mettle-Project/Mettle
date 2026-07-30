@@ -1,0 +1,28 @@
+struct Node { v: int32; next: Node*; }
+@noinline fn walk(n: Node*) -> int32 {
+  var t: int32 = 0;
+  var cur: Node* = n;
+  while (cur != 0) { t = t + cur->v; cur = cur->next; }
+  return t;
+}
+@noinline fn bump(p: int32*) { *p = *p + 1; }
+@noinline fn idx(base: int32*, i: int32) -> int32 { return base[i]; }
+fn main() -> int32 {
+  var a: Node; var b: Node; var c: Node;
+  a.v = 1; b.v = 2; c.v = 3;
+  a.next = &b; b.next = &c; c.next = 0;
+  if (walk(&a) != 6) { return 1; }
+  var x: int32 = 5;
+  bump(&x);
+  if (x != 6) { return 2; }
+  var arr: int32[5] = [10, 20, 30, 40, 50];
+  if (idx(&arr[0], 3) != 40) { return 3; }
+  var p: int32* = &arr[0];
+  p = p + 2;
+  if (*p != 30) { return 4; }
+  var pp: Node** = &a.next;
+  if ((*pp)->v != 2) { return 5; }
+  var byte_view: uint8* = (uint8*)&arr[0];
+  if ((int32)byte_view[0] != 10) { return 6; }
+  return 0;
+}

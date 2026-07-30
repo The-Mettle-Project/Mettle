@@ -1,0 +1,8 @@
+kernel invalid_transfer_geometry(destination: float32*, source: float32*,
+                                 x: int32) {
+  tensor_transfer_workgroup(
+      destination, source,
+      rank: 2, element: f32,
+      extent0: 64, stride0: 4, tile0: 16, coordinate0: x,
+      extent1: 64, stride1: 256, tile1: 16);
+}

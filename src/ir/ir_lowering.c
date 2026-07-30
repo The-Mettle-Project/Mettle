@@ -1,5 +1,6 @@
 // AST->IR lowering: driver, context lifecycle, emit primitives.
 #include "ir_lowering_internal.h"
+#include "frontend/mtlc_lower_module.h" // backend module table population
 
 static void ir_lowering_free_control_stack(IRLoweringContext *context) {
   for (size_t j = 0; j < context->control_count; j++) {
@@ -57,6 +58,7 @@ IRProgram *ir_lower_program(ASTNode *program, TypeChecker *type_checker,
   context.type_checker = type_checker;
   context.symbol_table = symbol_table;
   context.emit_runtime_checks = emit_runtime_checks ? 1 : 0;
+  context.program = ir_program;
 
   Program *program_data = (Program *)program->data;
   if (!program_data) {
@@ -101,7 +103,12 @@ IRProgram *ir_lower_program(ASTNode *program, TypeChecker *type_checker,
     } else {
       free(context.error_message);
     }
+    return ir_program;
   }
+
+  /* Bake the backend-owned type registry + module symbol table so the code
+   * generators no longer consult the frontend TypeChecker/SymbolTable/AST. */
+  mtlc_lower_populate_module(ir_program, program, type_checker, symbol_table);
 
   return ir_program;
 }
@@ -127,12 +134,17 @@ IRFunction *ir_lower_function(IRLoweringContext *context,
     ir_set_error(context, "Out of memory while creating IR function");
     return NULL;
   }
+  function->location = declaration->location;
+  if (function_data->return_type) {
+    function->return_type_name = mettle_strdup(function_data->return_type);
+  }
   function->is_inline = function_data->is_inline;
   function->is_inline_contract = function_data->is_inline_contract;
   function->is_noinline = function_data->is_noinline;
   function->is_pure = function_data->is_pure;
   function->is_noalloc = function_data->is_noalloc;
   function->is_test = function_data->is_test;
+  function->is_kernel = function_data->is_kernel;
   /* A function-level `@simd` decorator becomes the default mode for every
    * counted loop in the body that has no `@simd` of its own. */
   context->current_function_simd_default = function_data->simd_mode;

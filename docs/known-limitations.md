@@ -17,9 +17,26 @@ This document lists current limitations of the Mettle language, compiler, and ru
 ### Constants
 
 - `const NAME [: type] = <expr>;` declares an immutable binding; reassignment is a compile error. Constants must be declared before use.
-  - **Top-level (global) `const`** must have **integer** type. Its value is folded at every use site (it needs no storage), so the initializer must be a compile-time constant integer expression (literals, `sizeof`, other constants, and arithmetic/bitwise/comparison operators over them).
-  - **Local (function-scope) `const`** may have **any** type: integer, float, string, or aggregate. It is registered as an immutable local variable initialized to its value (not folded), so the initializer follows the same rules as any local variable initializer.
-  - **Global float, string, and aggregate constants are not yet supported** and are rejected with a clear diagnostic, because global non-integer initializer codegen is not yet emitted. Use a top-level `var` (which is mutable) or a function-local `const` instead.
+  - **Top-level (global) `const`** of **integer** type is folded at every use site (it needs no storage), so its initializer must be a compile-time constant integer expression (literals, `sizeof`, other constants, and arithmetic/bitwise/comparison operators over them). Only an integer `const` may omit its type annotation.
+  - **Top-level `const` of any other type** (float, string, array, struct) gets storage in the object file initialized to its value. An aggregate one must be initialized with an aggregate literal, since a global's bytes are laid out at compile time and there is no module initializer to run a call in.
+  - **Local (function-scope) `const`** may have **any** type. It is registered as an immutable local variable initialized to its value (not folded), so the initializer follows the same rules as any local variable initializer, including calls.
+
+### Aggregate Literals
+
+`[a, b, c]`, `[value; count]`, and `{ field: value, ... }` initialize arrays and structs. The literal takes the type of what it initializes, so it is only legal where that type is written down: a `var`/`const` initializer, or the right-hand side of an assignment.
+
+- **Elements must be compile-time constants** (literals, other constants, `sizeof`, arithmetic over those, `&some_function`, `&some_global`, `0`, string literals, nested literals). A call is rejected at the element. There is no run-time aggregate literal.
+- **Omitted struct fields and short array literals leave the rest zero.** Extra array elements, unknown field names, and repeated field names are all errors.
+- A **closure** cannot appear in a literal: its environment is built at run time.
+
+### Global Variables
+
+Top-level `var` supports scalars, strings, aggregates, and pointers:
+
+- **Aggregates** (arrays and structs) may carry an aggregate literal, which is laid out in `.data`, or be left uninitialized, which reserves zeroed `.bss`. Indexing, field access, `&g[i]`, and pointer traversal all behave as they do for locals.
+- **Function pointers** may be left uninitialized, set to `0` (a null function pointer, as for any pointer), or initialized with `&some_function`.
+- **Address initializers** (`var p: int32* = &g_other;`, `var f: fn(int32) -> int32 = &handler;`) resolve at link time rather than folding to a constant, so the backend emits a relocation. The same applies to a `&function` or string element inside an aggregate literal. A function referenced only this way is kept alive by dead-function elimination.
+- **An array of function pointers cannot be spelled directly**: `fn(int32) -> int32[2]` parses `int32[2]` as the return type. Wrap the entries in a struct, which is the usual shape for a dispatch table anyway.
 
 ### Traits & Generics
 
@@ -54,7 +71,7 @@ A non-capturing lambda or `&func` can be passed anywhere an `Fn(...)` closure is
 
 ### Struct-by-Value Function Arguments
 
-Structs work normally as **locals**: field access, whole-struct assignment, and `&s` all use the full laid-out size (assignment copies every byte, not just the first machine word).
+Structs work normally as **locals**: field access, whole-struct assignment, and `&s` all use the full laid-out size (assignment copies every byte, not just the first machine word). The same holds when the destination is a struct field, a nested field, an array element, or reached through a pointer — including when the value comes from a function returning an aggregate, which arrives through a hidden pointer.
 
 **Struct-by-value parameters and returns** follow the Microsoft x64 ABI's aggregate rule on Windows. A struct whose size is exactly 1, 2, 4, or 8 bytes is passed directly in one integer register. Other aggregate sizes, including structs larger than 8 bytes and odd-sized small structs such as 3-byte values, are passed and returned by **hidden pointer**:
 

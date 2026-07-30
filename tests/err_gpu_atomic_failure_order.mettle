@@ -1,0 +1,4 @@
+kernel invalid(counter: uint32*) {
+  var old: uint32 = atomic_compare_exchange(
+      counter, 0, 0, 1, order: acquire, failure_order: release);
+}

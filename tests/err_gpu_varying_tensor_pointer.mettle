@@ -1,0 +1,7 @@
+kernel varying_tensor_pointer(a: uint16*, b: uint16*, c: float32*, d: float32*) {
+  var lane: uint32 = subgroup_local_id();
+  tensor_mma(a + lane, b, c, d,
+             shape: m16n16k16,
+             input_type: f16,
+             output_type: f32);
+}

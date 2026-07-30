@@ -35,7 +35,7 @@ MAIN_RESERVE = 2100
 num_fns = max(1, (target_loc - header_lines - MAIN_RESERVE) // (LINES_PER_FN + 1))
 
 for i in range(num_fns):
-    emit(f"function compute{i}(x: int64, y: int64) -> int64;")
+    emit(f"fn compute{i}(x: int64, y: int64) -> int64;")
 emit("")
 
 # Function bodies: each does loops, conditionals, struct use, and calls a
@@ -43,7 +43,7 @@ emit("")
 for i in range(num_fns):
     si = i % NUM_STRUCTS
     callee = i // 2  # creates a real (acyclic) call graph
-    emit(f"function compute{i}(x: int64, y: int64) -> int64 {{")
+    emit(f"fn compute{i}(x: int64, y: int64) -> int64 {{")
     emit(f"  var v: S{si};")
     emit("  v.a = x + y;")
     emit(f"  v.b = x * (int64){(i % 7) + 1};")

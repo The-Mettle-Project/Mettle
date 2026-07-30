@@ -1,0 +1,15 @@
+// `&name` in an aggregate literal becomes a link-time relocation, so the name
+// has to be one the object file defines. A local lives on the stack. This used
+// to fold anyway and fail in the linker with "Relocation refers to an undefined
+// symbol", carrying no source location at all.
+
+struct Node {
+  value: int32;
+  next: Node*;
+}
+
+fn main() -> int32 {
+  var first: Node = { value: 1, next: 0 };
+  var second: Node = { value: 2, next: &first };
+  return second.value;
+}

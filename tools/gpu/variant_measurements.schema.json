@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mettle.dev/schemas/gpu-variant-measurements.v1.json",
+  "title": "Mettle GPU variant measurements v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "architecture", "device", "entries"],
+  "properties": {
+    "schema": {
+      "const": "mettle.gpu-variant-measurements.v1"
+    },
+    "architecture": {
+      "type": "string",
+      "pattern": "^sm_[0-9]+[a-z]?$"
+    },
+    "device": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "name",
+        "uuid",
+        "host_arch",
+        "compute_capability",
+        "integrated_memory",
+        "driver_version"
+      ],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "uuid": {"type": "string", "minLength": 1},
+        "host_arch": {"type": "string", "minLength": 1},
+        "compute_capability": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+$"
+        },
+        "integrated_memory": {"type": "boolean"},
+        "driver_version": {"type": "string", "minLength": 1}
+      }
+    },
+    "entries": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+          "workload_sha256",
+          "threads_per_block",
+          "dynamic_shared_bytes",
+          "candidates"
+        ],
+        "properties": {
+          "workload_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "threads_per_block": {"type": "integer", "minimum": 1},
+          "dynamic_shared_bytes": {"type": "integer", "minimum": 0},
+          "candidates": {
+            "type": "object",
+            "minProperties": 1,
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": true,
+              "required": ["profile_sha256", "samples_ns"],
+              "properties": {
+                "profile_sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "samples_ns": {
+                  "type": "array",
+                  "minItems": 3,
+                  "items": {"type": "number", "exclusiveMinimum": 0}
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

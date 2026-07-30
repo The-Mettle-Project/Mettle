@@ -1,0 +1,4 @@
+kernel varying_tensor_stride(a: uint16*, b: uint16*, c: float32*, d: float32*) {
+  var lda: int32 = 16 + thread.x;
+  tensor_mma(a, b, c, d, shape: m16n16k16, input_type: f16, output_type: f32, lda: lda);
+}

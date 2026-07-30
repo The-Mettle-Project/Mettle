@@ -1,0 +1,8 @@
+// An aggregate literal is a compile-time constant, so every element has to be
+// one. A call cannot be folded into the value's bytes, and there is no module
+// initializer to run it in, so this is rejected at the element.
+fn side() -> int32 { return 3; }
+
+const TABLE: int32[3] = [1, side(), 2];
+
+fn main() -> int32 { return TABLE[0]; }

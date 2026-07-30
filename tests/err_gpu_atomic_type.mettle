@@ -1,0 +1,3 @@
+kernel invalid(counter: int32*) {
+  var old: int32 = atomic_fetch_add(counter, 0, 1);
+}

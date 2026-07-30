@@ -1,0 +1,6 @@
+kernel subgroup_uniform_barrier() {
+  var lane_sum: uint32 = subgroup_reduce_add(subgroup_local_id());
+  if (lane_sum > 0) {
+    barrier(workgroup, acq_rel);
+  }
+}

@@ -17,7 +17,7 @@
  * runtime_access_violation_trace_coff).
  */
 
-#include "../src/runtime/crash_handler.h"
+#include "runtime/crash_handler.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>

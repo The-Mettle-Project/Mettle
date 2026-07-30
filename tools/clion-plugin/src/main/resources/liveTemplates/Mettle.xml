@@ -1,0 +1,78 @@
+<templateSet group="Mettle">
+  <template name="fn" value="fn $NAME$($PARAMS$) -&gt; $RET$ {&#10;  $END$&#10;}"
+            description="Function declaration" toReformat="false" toShortenFQNames="false">
+    <variable name="NAME" expression="" defaultValue="&quot;name&quot;" alwaysStopAt="true"/>
+    <variable name="PARAMS" expression="" defaultValue="" alwaysStopAt="true"/>
+    <variable name="RET" expression="" defaultValue="&quot;int32&quot;" alwaysStopAt="true"/>
+    <context><option name="Mettle" value="true"/></context>
+  </template>
+
+  <template name="main" value="fn main() -&gt; int32 {&#10;  $END$&#10;  return 0;&#10;}"
+            description="Entry point" toReformat="false" toShortenFQNames="false">
+    <context><option name="Mettle" value="true"/></context>
+  </template>
+
+  <template name="st" value="struct $NAME$ {&#10;  $END$&#10;}"
+            description="Struct declaration" toReformat="false" toShortenFQNames="false">
+    <variable name="NAME" expression="" defaultValue="&quot;Name&quot;" alwaysStopAt="true"/>
+    <context><option name="Mettle" value="true"/></context>
+  </template>
+
+  <template name="forr" value="for $I$ in $LO$..$HI$ {&#10;  $END$&#10;}"
+            description="Range-based for loop" toReformat="false" toShortenFQNames="false">
+    <variable name="I" expression="" defaultValue="&quot;i&quot;" alwaysStopAt="true"/>
+    <variable name="LO" expression="" defaultValue="&quot;0&quot;" alwaysStopAt="true"/>
+    <variable name="HI" expression="" defaultValue="&quot;n&quot;" alwaysStopAt="true"/>
+    <context><option name="Mettle" value="true"/></context>
+  </template>
+
+  <template name="fori" value="for (var $I$: int32 = 0; $I$ &lt; $N$; $I$ = $I$ + 1) {&#10;  $END$&#10;}"
+            description="Counted for loop" toReformat="false" toShortenFQNames="false">
+    <variable name="I" expression="" defaultValue="&quot;i&quot;" alwaysStopAt="true"/>
+    <variable name="N" expression="" defaultValue="&quot;n&quot;" alwaysStopAt="true"/>
+    <context><option name="Mettle" value="true"/></context>
+  </template>
+
+  <template name="wh" value="while ($COND$) {&#10;  $END$&#10;}"
+            description="While loop" toReformat="false" toShortenFQNames="false">
+    <variable name="COND" expression="" defaultValue="&quot;true&quot;" alwaysStopAt="true"/>
+    <context><option name="Mettle" value="true"/></context>
+  </template>
+
+  <template name="sw" value="switch ($VALUE$) {&#10;  case $CASE$:&#10;    $END$&#10;    break;&#10;  default:&#10;    break;&#10;}"
+            description="Switch statement" toReformat="false" toShortenFQNames="false">
+    <variable name="VALUE" expression="" defaultValue="&quot;value&quot;" alwaysStopAt="true"/>
+    <variable name="CASE" expression="" defaultValue="&quot;0&quot;" alwaysStopAt="true"/>
+    <context><option name="Mettle" value="true"/></context>
+  </template>
+
+  <template name="v" value="var $NAME$: $TYPE$ = $VALUE$;$END$"
+            description="Variable declaration" toReformat="false" toShortenFQNames="false">
+    <variable name="NAME" expression="" defaultValue="&quot;name&quot;" alwaysStopAt="true"/>
+    <variable name="TYPE" expression="" defaultValue="&quot;int32&quot;" alwaysStopAt="true"/>
+    <variable name="VALUE" expression="" defaultValue="&quot;0&quot;" alwaysStopAt="true"/>
+    <context><option name="Mettle" value="true"/></context>
+  </template>
+
+  <template name="ext" value="extern fn $NAME$($PARAMS$) -&gt; $RET$ = &quot;$LINK$&quot;;$END$"
+            description="Extern function" toReformat="false" toShortenFQNames="false">
+    <variable name="NAME" expression="" defaultValue="&quot;puts&quot;" alwaysStopAt="true"/>
+    <variable name="PARAMS" expression="" defaultValue="&quot;msg: cstring&quot;" alwaysStopAt="true"/>
+    <variable name="RET" expression="" defaultValue="&quot;int32&quot;" alwaysStopAt="true"/>
+    <variable name="LINK" expression="NAME" defaultValue="" alwaysStopAt="true"/>
+    <context><option name="Mettle" value="true"/></context>
+  </template>
+
+  <template name="test" value="@test fn $NAME$() -&gt; int64 {&#10;  $END$&#10;  return 0;&#10;}"
+            description="Compile-time unit test" toReformat="false" toShortenFQNames="false">
+    <variable name="NAME" expression="" defaultValue="&quot;test_name&quot;" alwaysStopAt="true"/>
+    <context><option name="Mettle" value="true"/></context>
+  </template>
+
+  <template name="kern" value="kernel $NAME$($PARAMS$) {&#10;  var i: int32 = block.x * block_dim.x + thread.x;&#10;  $END$&#10;}"
+            description="GPU kernel" toReformat="false" toShortenFQNames="false">
+    <variable name="NAME" expression="" defaultValue="&quot;vadd&quot;" alwaysStopAt="true"/>
+    <variable name="PARAMS" expression="" defaultValue="&quot;out: float32*, n: int32&quot;" alwaysStopAt="true"/>
+    <context><option name="Mettle" value="true"/></context>
+  </template>
+</templateSet>

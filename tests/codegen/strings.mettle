@@ -1,0 +1,14 @@
+import "std/io";
+var G: string = "global";
+@noinline fn takes(s: string) -> int32 { return (int32)strlen(s); }
+extern fn strlen(s: cstring) -> int64 = "strlen";
+@noinline fn takes_c(s: cstring) -> int32 { return (int32)strlen(s); }
+const NAMES: cstring[3] = ["a", "bb", "ccc"];
+fn main() -> int32 {
+  if (takes_c("hello") != 5) { return 1; }
+  if (takes_c(G) != 6) { return 2; }
+  if (takes_c(NAMES[2]) != 3) { return 3; }
+  var local: string = "abcd";
+  if (takes_c(local) != 4) { return 4; }
+  return 0;
+}

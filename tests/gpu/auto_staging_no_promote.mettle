@@ -1,0 +1,9 @@
+// Acquire-only is not a portable publication contract. The optimizer must
+// leave this ordinary synchronous staging sequence untouched.
+kernel auto_stage_acquire_only(src: uint32*, out: uint32*) {
+  workgroup var tile: uint32[32];
+  var lane: int32 = thread.x;
+  tile[lane] = src[lane];
+  barrier(workgroup, acquire);
+  out[lane] = tile[lane];
+}

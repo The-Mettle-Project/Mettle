@@ -1,0 +1,4 @@
+kernel bad_scan_lane(out: uint32*) {
+  var lane: uint32 = subgroup_scan_inclusive_add((uint32)1);
+  out[0] = subgroup_broadcast((uint32)7, lane);
+}

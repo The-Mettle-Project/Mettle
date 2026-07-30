@@ -1,0 +1,4 @@
+kernel native_indices(output: int32*) {
+  var value: int32 = thread.x + thread.y + thread.z + block.x + block.y + block.z + block_dim.x + block_dim.y + block_dim.z + grid_dim.x + grid_dim.y + grid_dim.z;
+  output[thread.x] = value;
+}

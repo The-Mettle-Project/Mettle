@@ -287,6 +287,24 @@ int ir_type_array_element_stride(Type *element_type) {
   return (int)element_type->size;
 }
 
+/* An unsigned integer type: `/`, `%`, `>>`, and the four orderings mean
+ * something different on one than the signed evaluation the optimizer's
+ * constant folder performs. */
+int ir_type_is_unsigned_integer(Type *type) {
+  if (!type) {
+    return 0;
+  }
+  switch (type->kind) {
+  case TYPE_UINT8:
+  case TYPE_UINT16:
+  case TYPE_UINT32:
+  case TYPE_UINT64:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
 int ir_type_is_pointer(Type *type) {
   return type && type->kind == TYPE_POINTER && type->base_type;
 }

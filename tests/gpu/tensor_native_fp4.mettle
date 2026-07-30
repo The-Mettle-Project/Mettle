@@ -1,0 +1,197 @@
+// MXFP4 storage and scaling remain backend-neutral: E2M1 operands are densely
+// nibble-packed in logical matrix order, while scale_A is row-major Mx2 and
+// scale_B is column-major 2xN. The PTX backend alone owns lane fragments and
+// the sm_121a instruction spelling.
+kernel tensor_mxfp4_m16n16k64(
+    a: uint8*, b: uint8*, c: float32*, d: float32*,
+    a_scale: uint8*, b_scale: uint8*) {
+  tensor_mma(a, b, c, d,
+             shape: m16n16k64,
+             a_type: e2m1, b_type: e2m1,
+             accumulator_type: f32, result_type: f32,
+             a_packing: dense_subbyte, b_packing: dense_subbyte,
+             a_scale_mode: block32, b_scale_mode: block32,
+             a_scale_type: ue8m0, b_scale_type: ue8m0,
+             a_scale: a_scale, b_scale: b_scale,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: 72, ldb: 72, ldc: 20, ldd: 24,
+             ldsa: 3, ldsb: 3);
+}
+
+// Connected neutral operations may retain all native f32 accumulator
+// fragments; packed operands and scale metadata are reloaded per product.
+kernel tensor_mxfp4_chain3_m16n16k64(
+    a: uint8*, b: uint8*, c: float32*, d: float32*,
+    a_scale: uint8*, b_scale: uint8*) {
+  tensor_mma(a, b, c, d,
+             shape: m16n16k64,
+             a_type: e2m1, b_type: e2m1,
+             accumulator_type: f32, result_type: f32,
+             a_packing: dense_subbyte, b_packing: dense_subbyte,
+             a_scale_mode: block32, b_scale_mode: block32,
+             a_scale_type: ue8m0, b_scale_type: ue8m0,
+             a_scale: a_scale, b_scale: b_scale,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: 72, ldb: 72, ldc: 24, ldd: 24,
+             ldsa: 3, ldsb: 3);
+  tensor_mma(a, b, d, d,
+             shape: m16n16k64,
+             a_type: e2m1, b_type: e2m1,
+             accumulator_type: f32, result_type: f32,
+             a_packing: dense_subbyte, b_packing: dense_subbyte,
+             a_scale_mode: block32, b_scale_mode: block32,
+             a_scale_type: ue8m0, b_scale_type: ue8m0,
+             a_scale: a_scale, b_scale: b_scale,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: 72, ldb: 72, ldc: 24, ldd: 24,
+             ldsa: 3, ldsb: 3);
+  tensor_mma(a, b, d, d,
+             shape: m16n16k64,
+             a_type: e2m1, b_type: e2m1,
+             accumulator_type: f32, result_type: f32,
+             a_packing: dense_subbyte, b_packing: dense_subbyte,
+             a_scale_mode: block32, b_scale_mode: block32,
+             a_scale_type: ue8m0, b_scale_type: ue8m0,
+             a_scale: a_scale, b_scale: b_scale,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: 72, ldb: 72, ldc: 24, ldd: 24,
+             ldsa: 3, ldsb: 3);
+}
+
+// The K loop advances byte pointers by half the logical E2M1 distance and
+// scale pointers by one byte per block32 chunk. Those storage calculations are
+// target-neutral; the optimizer only proves the D dependency.
+kernel tensor_mxfp4_runtime_k_m16n16k64(
+    a: uint8*, b: uint8*, c: float32*, d: float32*,
+    a_scale: uint8*, b_scale: uint8*, k: int32,
+    lda: int32, ldb: int32, ldc: int32, ldd: int32) {
+  tensor_mma(a, b, c, d,
+             shape: m16n16k64,
+             a_type: e2m1, b_type: e2m1,
+             accumulator_type: f32, result_type: f32,
+             a_packing: dense_subbyte, b_packing: dense_subbyte,
+             a_scale_mode: block32, b_scale_mode: block32,
+             a_scale_type: ue8m0, b_scale_type: ue8m0,
+             a_scale: a_scale, b_scale: b_scale,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldc, ldd: ldd,
+             ldsa: 7, ldsb: 7);
+  var inner: int32 = 64;
+  while (inner < k) {
+    tensor_mma(a + inner / 2, b + inner / 2, d, d,
+               shape: m16n16k64,
+               a_type: e2m1, b_type: e2m1,
+               accumulator_type: f32, result_type: f32,
+               a_packing: dense_subbyte, b_packing: dense_subbyte,
+               a_scale_mode: block32, b_scale_mode: block32,
+               a_scale_type: ue8m0, b_scale_type: ue8m0,
+               a_scale: a_scale + inner / 32,
+               b_scale: b_scale + inner / 32,
+               a_layout: row, b_layout: col,
+               c_layout: row, d_layout: row,
+               lda: lda, ldb: ldb, ldc: ldd, ldd: ldd,
+               ldsa: 7, ldsb: 7);
+    inner = inner + 64;
+  }
+}
+
+// NVFP4 uses the same neutral packed-E2M1 matrices with a finer block16
+// scale grid. UE4M3 is an unsigned semantic scale format, not a backend byte
+// convention; PTX selects mxf4nvf4/scale_vec::4X from this descriptor.
+kernel tensor_nvfp4_m16n16k64(
+    a: uint8*, b: uint8*, c: float32*, d: float32*,
+    a_scale: uint8*, b_scale: uint8*) {
+  tensor_mma(a, b, c, d,
+             shape: m16n16k64,
+             a_type: e2m1, b_type: e2m1,
+             accumulator_type: f32, result_type: f32,
+             a_packing: dense_subbyte, b_packing: dense_subbyte,
+             a_scale_mode: block16, b_scale_mode: block16,
+             a_scale_type: ue4m3, b_scale_type: ue4m3,
+             a_scale: a_scale, b_scale: b_scale,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: 72, ldb: 72, ldc: 20, ldd: 24,
+             ldsa: 5, ldsb: 5);
+}
+
+kernel tensor_nvfp4_chain3_m16n16k64(
+    a: uint8*, b: uint8*, c: float32*, d: float32*,
+    a_scale: uint8*, b_scale: uint8*) {
+  tensor_mma(a, b, c, d,
+             shape: m16n16k64,
+             a_type: e2m1, b_type: e2m1,
+             accumulator_type: f32, result_type: f32,
+             a_packing: dense_subbyte, b_packing: dense_subbyte,
+             a_scale_mode: block16, b_scale_mode: block16,
+             a_scale_type: ue4m3, b_scale_type: ue4m3,
+             a_scale: a_scale, b_scale: b_scale,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: 72, ldb: 72, ldc: 24, ldd: 24,
+             ldsa: 5, ldsb: 5);
+  tensor_mma(a, b, d, d,
+             shape: m16n16k64,
+             a_type: e2m1, b_type: e2m1,
+             accumulator_type: f32, result_type: f32,
+             a_packing: dense_subbyte, b_packing: dense_subbyte,
+             a_scale_mode: block16, b_scale_mode: block16,
+             a_scale_type: ue4m3, b_scale_type: ue4m3,
+             a_scale: a_scale, b_scale: b_scale,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: 72, ldb: 72, ldc: 24, ldd: 24,
+             ldsa: 5, ldsb: 5);
+  tensor_mma(a, b, d, d,
+             shape: m16n16k64,
+             a_type: e2m1, b_type: e2m1,
+             accumulator_type: f32, result_type: f32,
+             a_packing: dense_subbyte, b_packing: dense_subbyte,
+             a_scale_mode: block16, b_scale_mode: block16,
+             a_scale_type: ue4m3, b_scale_type: ue4m3,
+             a_scale: a_scale, b_scale: b_scale,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: 72, ldb: 72, ldc: 24, ldd: 24,
+             ldsa: 5, ldsb: 5);
+}
+
+kernel tensor_nvfp4_runtime_k_m16n16k64(
+    a: uint8*, b: uint8*, c: float32*, d: float32*,
+    a_scale: uint8*, b_scale: uint8*, k: int32,
+    lda: int32, ldb: int32, ldc: int32, ldd: int32) {
+  tensor_mma(a, b, c, d,
+             shape: m16n16k64,
+             a_type: e2m1, b_type: e2m1,
+             accumulator_type: f32, result_type: f32,
+             a_packing: dense_subbyte, b_packing: dense_subbyte,
+             a_scale_mode: block16, b_scale_mode: block16,
+             a_scale_type: ue4m3, b_scale_type: ue4m3,
+             a_scale: a_scale, b_scale: b_scale,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldc, ldd: ldd,
+             ldsa: 13, ldsb: 13);
+  var inner: int32 = 64;
+  while (inner < k) {
+    tensor_mma(a + inner / 2, b + inner / 2, d, d,
+               shape: m16n16k64,
+               a_type: e2m1, b_type: e2m1,
+               accumulator_type: f32, result_type: f32,
+               a_packing: dense_subbyte, b_packing: dense_subbyte,
+               a_scale_mode: block16, b_scale_mode: block16,
+               a_scale_type: ue4m3, b_scale_type: ue4m3,
+               a_scale: a_scale + inner / 16,
+               b_scale: b_scale + inner / 16,
+               a_layout: row, b_layout: col,
+               c_layout: row, d_layout: row,
+               lda: lda, ldb: ldb, ldc: ldd, ldd: ldd,
+               ldsa: 13, ldsb: 13);
+    inner = inner + 64;
+  }
+}

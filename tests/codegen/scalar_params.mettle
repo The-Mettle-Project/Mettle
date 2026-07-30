@@ -1,0 +1,19 @@
+@noinline fn p_i8(a: int8, b: int8) -> int32 { return (int32)a + (int32)b; }
+@noinline fn p_u8(a: uint8, b: uint8) -> int32 { return (int32)a + (int32)b; }
+@noinline fn p_i16(a: int16) -> int32 { return (int32)a; }
+@noinline fn p_u16(a: uint16) -> int32 { return (int32)a; }
+@noinline fn p_mix(a: int32, b: float64, c: int64, d: float32) -> float64 {
+  return (float64)a + b + (float64)c + (float64)d;
+}
+@noinline fn p_many(a: int32, b: int32, c: int32, d: int32, e: int32, f: int32, g: int32) -> int32 {
+  return a + b + c + d + e + f + g;
+}
+fn main() -> int32 {
+  if (p_i8(-128, 127) != -1) { return 1; }
+  if (p_u8(255, 1) != 256) { return 2; }
+  if (p_i16(-32768) != -32768) { return 3; }
+  if (p_u16(65535) != 65535) { return 4; }
+  if (p_mix(1, 2.0, 3, 4.0) != 10.0) { return 5; }
+  if (p_many(1, 2, 3, 4, 5, 6, 7) != 28) { return 6; }
+  return 0;
+}

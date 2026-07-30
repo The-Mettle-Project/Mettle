@@ -1,0 +1,28 @@
+// Four explicit K tiles. The target-neutral optimizer recognizes the exact
+// D=A*B+C; D=A1*B1+D composition and packs it into one tensor chain. No source
+// annotation requests a PTX fragment or a backend-specific optimization.
+kernel tensor_chain4(a: uint16*, b: uint16*, c: float32*, d: float32*,
+                     lda: int32, ldb: int32, ldc: int32, ldd: int32) {
+  var a1: uint16* = a + 16;
+  var a2: uint16* = a + 32;
+  var a3: uint16* = a + 48;
+  var b1: uint16* = b + 16;
+  var b2: uint16* = b + 32;
+  var b3: uint16* = b + 48;
+  tensor_mma(a, b, c, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+  tensor_mma(a1, b1, d, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldd, ldd: ldd);
+  tensor_mma(a2, b2, d, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldd, ldd: ldd);
+  tensor_mma(a3, b3, d, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldd, ldd: ldd);
+}

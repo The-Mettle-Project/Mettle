@@ -1,0 +1,5 @@
+kernel divergent_barrier() {
+  if (subgroup_local_id() == 0) {
+    barrier(workgroup, acq_rel);
+  }
+}

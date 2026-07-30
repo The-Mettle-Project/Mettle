@@ -1,0 +1,22 @@
+// The atomic is an observable operation inside the loop. Even though the two
+// MMAs are accumulator-connected, D cannot be silently retained across it.
+kernel tensor_loop_observable(a: uint16*, b: uint16*, c: float32*,
+                              d: float32*, marker: uint32*, k: int32,
+                              lda: int32, ldb: int32,
+                              ldc: int32, ldd: int32) {
+  var zero: uint64 = 0;
+  var one: uint32 = 1;
+  tensor_mma(a, b, c, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+  var inner: int32 = 16;
+  while (inner < k) {
+    tensor_mma(a + inner, b + inner, d, d,
+               shape: m16n16k16, input_type: f16, output_type: f32,
+               a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+               lda: lda, ldb: ldb, ldc: ldd, ldd: ldd);
+    atomic_store(marker, zero, one, order: relaxed, scope: device);
+    inner = inner + 16;
+  }
+}

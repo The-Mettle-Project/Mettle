@@ -42,6 +42,9 @@ typedef enum {
   TOKEN_MATCH,
   TOKEN_KERNEL,
   TOKEN_DISPATCH,
+  TOKEN_WORKGROUP,
+  TOKEN_PRIVATE,
+  TOKEN_BARRIER,
 
   // Type keywords
   TOKEN_INT8,

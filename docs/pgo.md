@@ -1,11 +1,11 @@
 # Zero-run profile-guided optimization: `--pgo`
 
 Classic PGO demands three steps: build instrumented, run a training
-workload, rebuild with the profile. Almost nobody does it. Mettle collapses
-the loop to one flag: the compiler **interprets your program's own `main()`
+workload, rebuild with the profile. Almost nobody does it. libmtlc collapses
+the loop to one flag: the backend **interprets your program's own `main()`
 while compiling it** (deterministic, sandboxed, externs modeled as pure,
 fuel-capped at 64M steps) and feeds the measured execution frequencies
-straight into the optimizer.
+straight into the optimizer. The `mettle` driver exposes this as `--pgo`.
 
 ```
 $ mettle --release --pgo app.mettle -o app.obj

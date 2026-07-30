@@ -41,9 +41,15 @@ _TOKEN_RE = re.compile(r"""
     (?P<num>    -?\d+\.\d+ | -?\d+ )         |  # float literal before int
     (?P<word>   [A-Za-z_][A-Za-z0-9_]*       # keywords, opcodes, types, labels
                 (?:\[\d+\])? )               # array type suffix e.g. uint8[43]
-              | (?P<op>  <-|->|==|<=|>=|!=|<<|>>|&&|\|\| ) |
+              | (?P<op>  <-|->|==|<=|>=|!=|<<|>>|&&|\|\||\+= ) |
     (?P<punct>  [=+\-*/&|^<>():,~%\[\]] )       # incl. % modulo, [N] deref size
 """, re.VERBOSE)
+# `+=` must be ONE token. Split into `+` and `=`, detokenize re-emits it as
+# `@sum + = rhs`, which liveness.parse_instr no longer recognizes as a
+# definition at all -- the instruction silently loses its def and all its
+# def-use edges, in the training corpus but not in the raw IR the compiler
+# featurizes at inference time. That skew is invisible except as a model that
+# behaves differently in the compiler than it did in training.
 
 
 def parse_program(text):

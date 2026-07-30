@@ -1,0 +1,7 @@
+kernel invalid_transfer_storage(destination: uint32*, source: uint32*,
+                                x: int32) {
+  tensor_transfer_workgroup(
+      destination, source,
+      rank: 1, element: f32, extent0: 64, stride0: 4, tile0: 16,
+      coordinate0: x);
+}

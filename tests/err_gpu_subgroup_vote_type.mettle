@@ -1,0 +1,3 @@
+kernel bad_subgroup_vote(out: uint32*) {
+  out[0] = (uint32)subgroup_any((uint32)1);
+}

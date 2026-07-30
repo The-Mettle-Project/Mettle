@@ -1,14 +1,33 @@
-// Constant-size memcpy should lower to inline rep movs (no libc call).
+// Constant-size memcpy should lower to inline rep movs and preserve live values.
 import "std/mem";
+
+@noinline fn copy_and_sum(dst: cstring, src: cstring,
+                          a: int64, b: int64, c: int64, d: int64,
+                          e: int64, f: int64, g: int64, h: int64) -> int64 {
+  var v0: int64 = a * 3 + 1;
+  var v1: int64 = b * 5 + 2;
+  var v2: int64 = c * 7 + 3;
+  var v3: int64 = d * 11 + 4;
+  var v4: int64 = e * 13 + 5;
+  var v5: int64 = f * 17 + 6;
+  var v6: int64 = g * 19 + 7;
+  var v7: int64 = h * 23 + 8;
+
+  memcpy(dst, src, 2048);
+  return v0 + v1 + v2 + v3 + v4 + v5 + v6 + v7;
+}
 
 fn main() -> int32 {
   var dst: int32[512];
   var src: int32[512];
-  var i: int32 = 0;
-  while (i < 512) {
-    src[i] = i;
-    i = i + 1;
-  }
-  memcpy((cstring)((int64)&dst[0]), (cstring)((int64)&src[0]), 2048);
-  return dst[511];
+  src[0] = 123456789;
+  src[511] = -987654321;
+
+  var sum: int64 = copy_and_sum((cstring)((int64)&dst[0]),
+                                (cstring)((int64)&src[0]),
+                                2, 3, 5, 7, 11, 13, 17, 19);
+  if (dst[0] != 123456789) { return 1; }
+  if (dst[511] != -987654321) { return 2; }
+  if (sum != 1293) { return 3; }
+  return 0;
 }

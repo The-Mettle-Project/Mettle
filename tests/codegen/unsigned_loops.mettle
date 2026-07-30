@@ -1,0 +1,28 @@
+@noinline fn count_u32(n: uint32) -> uint32 {
+  var t: uint32 = 0;
+  var i: uint32 = 0;
+  while (i < n) { t = t + i; i = i + 1; }
+  return t;
+}
+@noinline fn count_u8(a: uint8*, n: int32) -> int32 {
+  var t: int32 = 0;
+  for i in 0..n { if (a[i] > 200) { t = t + 1; } }
+  return t;
+}
+@noinline fn u64_loop(n: uint64) -> uint64 {
+  var t: uint64 = 0;
+  var i: uint64 = 0;
+  while (i < n) { t = t + 1; i = i + 1; }
+  return t;
+}
+@noinline fn wrap(a: uint8, b: uint8) -> uint8 { return a + b; }
+@noinline fn wrap16(a: uint16, b: uint16) -> uint16 { return a + b; }
+fn main() -> int32 {
+  if (count_u32(10) != 45) { return 1; }
+  var v: uint8[6] = [10, 210, 255, 3, 201, 200];
+  if (count_u8(&v[0], 6) != 3) { return 2; }
+  if (u64_loop(100) != 100) { return 3; }
+  if ((int32)wrap(250, 10) != 4) { return 4; }
+  if ((int32)wrap16(65530, 10) != 4) { return 5; }
+  return 0;
+}
