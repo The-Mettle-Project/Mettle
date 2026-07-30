@@ -1,0 +1,66 @@
+// Regression: two array reads at the same index share one scaled index.
+//
+// `a[i] * b[i]` computes `i << 2` twice, and CSE folds the two into one temp
+// read by both address adds. The SIB address fold used to require the scaled
+// temp to have exactly one reader, so this shape fell through to its scale-1
+// fallback, which folded the already-scaled value in as a unit index and
+// addressed the wrong element. Found by the differential fuzzer on seed 844752.
+//
+// Both loops below produce the shape: one in a called function, one inline in
+// main, since inlining changes which temps end up shared.
+
+fn dot(a: int32*, b: int32*, n: int64) -> int64 {
+  var s: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    s = s + a[i] * b[i];
+    i = i + 1;
+  }
+  return s;
+}
+
+fn main() -> int32 {
+  var x: int32[8];
+  var y: int32[8];
+  var i: int64 = 0;
+  while (i < 8) {
+    x[i] = (int32)(i + 1);
+    y[i] = (int32)(i + 2);
+    i = i + 1;
+  }
+
+  // sum of (i+1)*(i+2) for i in 0..7 = 2+6+12+20+30+42+56+72 = 240
+  var viaCall: int64 = dot(&x[0], &y[0], 8);
+  if (viaCall != 240) {
+    return 1;
+  }
+
+  var inline: int64 = 0;
+  var j: int64 = 0;
+  while (j < 8) {
+    inline = inline + x[j] * y[j];
+    j = j + 1;
+  }
+  if (inline != 240) {
+    return 2;
+  }
+
+  // A store through a shared scaled index, the same shape on the write side.
+  var z: int32[8];
+  var k: int64 = 0;
+  while (k < 8) {
+    z[k] = x[k] * y[k];
+    k = k + 1;
+  }
+  var stored: int64 = 0;
+  var m: int64 = 0;
+  while (m < 8) {
+    stored = stored + z[m];
+    m = m + 1;
+  }
+  if (stored != 240) {
+    return 3;
+  }
+
+  return 7;
+}
