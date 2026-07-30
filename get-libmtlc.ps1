@@ -70,11 +70,19 @@ if ($isLocalCheckout) {
   New-Item -ItemType Directory -Force $tmp | Out-Null
   try {
     $zip = Join-Path $tmp "libmtlc.zip"
+    # Progress rendering is what makes Invoke-WebRequest slow on Windows
+    # PowerShell -- it repaints per chunk, and on a source archive this size that
+    # dominates the transfer by an order of magnitude. Silence it for the
+    # download and put it back afterwards.
+    $prevProgress = $ProgressPreference
+    $ProgressPreference = "SilentlyContinue"
     try {
       Invoke-WebRequest $url -OutFile $zip -UseBasicParsing `
         -Headers @{ "User-Agent" = "get-libmtlc" }
     } catch {
       throw "download failed. Does $repo have a revision '$Version'? See https://github.com/$repo"
+    } finally {
+      $ProgressPreference = $prevProgress
     }
 
     Say "Unpacking to $Dir"
@@ -119,28 +127,30 @@ $buildBat = Join-Path $Dir "build.bat"
 if (-not (Test-Path $buildBat)) { throw "$buildBat not found; cannot build the backend." }
 
 Say "Building the backend archive (this takes a few minutes)"
-# cmd does not resolve a bare batch name against the working directory, so pass
-# the full path; Push-Location still sets the cwd the script builds in.
-function Invoke-LibmtlcBuild([string]$batArgs) {
-  Push-Location $Dir
-  try {
-    & cmd /c "`"$buildBat`" $batArgs"
-    return $LASTEXITCODE
-  } finally { Pop-Location }
-}
 
 # Build the archive with the same compiler the driver will use: mixing gcc and
 # clang objects in one link works often enough to be a trap.
 $cc = if ($env:CC) { $env:CC } else { "" }
 
-$code = Invoke-LibmtlcBuild "$cc --backend-only".Trim()
-if ($code -ne 0) {
-  # An older libmtlc has no --backend-only mode; a full build still produces
-  # bin\mtlc.lib on its way to the driver, so fall back to that.
-  Warn "--backend-only failed (exit $code); trying a full libmtlc build"
-  $code = Invoke-LibmtlcBuild "$cc --skip-tests".Trim()
-  if ($code -ne 0) { throw "building libmtlc failed (exit $code)." }
-}
+# Inline rather than wrapped in a function on purpose. A PowerShell function
+# returns everything it writes to the pipeline, so `$code = Build ...` would
+# capture the whole build log with the exit code appended, and `$code -ne 0`
+# would then compare an array and be true no matter how the build went.
+# cmd does not resolve a bare batch name against the working directory, so pass
+# the full path; Push-Location still sets the cwd the build runs in.
+Push-Location $Dir
+try {
+  & cmd /c "`"$buildBat`" $("$cc --backend-only".Trim())"
+  $code = $LASTEXITCODE
+  if ($code -ne 0) {
+    # An older libmtlc has no --backend-only mode; a full build still produces
+    # bin\mtlc.lib on its way to the driver, so fall back to that.
+    Warn "--backend-only failed (exit $code); trying a full libmtlc build"
+    & cmd /c "`"$buildBat`" $("$cc --skip-tests".Trim())"
+    $code = $LASTEXITCODE
+  }
+} finally { Pop-Location }
+if ($code -ne 0) { throw "building libmtlc failed (exit $code)." }
 
 $lib = Join-Path $Dir "bin\mtlc.lib"
 if (-not (Test-Path $lib)) { throw "the build finished but $lib is missing." }

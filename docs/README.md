@@ -62,9 +62,10 @@ is the tutorial for driving the backend from a language that is not Mettle, and
 architecture](https://github.com/The-Mettle-Project/libmtlc/blob/main/docs/ARCHITECTURE.md)
 is the single-document deep dive across both halves.
 
-Those links track libmtlc's `main`. When [`libmtlc.version`](../libmtlc.version)
-pins a tag, read them at that tag instead. A fetched dependency also carries
-them at `libmtlc/docs/`.
+Those links track libmtlc's `main`, while
+[`libmtlc.version`](../libmtlc.version) pins a specific commit — so read them at
+that commit when the difference matters. A fetched dependency carries the same
+docs at `libmtlc/docs/`, always at the pinned revision.
 
 ## Contributing
 

@@ -22,7 +22,11 @@
 set -eu
 
 REPO="The-Mettle-Project/libmtlc"
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# Clear CDPATH before any cd: a value in the environment would send us somewhere
+# else entirely. Unset rather than `CDPATH= cd`, which shellcheck reads as a
+# botched assignment (SC1007).
+unset CDPATH
+ROOT=$(cd -- "$(dirname -- "$0")" && pwd)
 DIR=${LIBMTLC_DIR:-"$ROOT/libmtlc"}
 STAMP="$DIR/.libmtlc-revision"
 
