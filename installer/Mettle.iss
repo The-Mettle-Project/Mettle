@@ -14,7 +14,7 @@
 ; constants and the HKA registry root.
 
 #ifndef MyAppVersion
-  #define MyAppVersion "v0.14.0"
+  #define MyAppVersion "v0.14.1"
 #endif
 
 #define MyAppName "Mettle"
