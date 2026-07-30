@@ -1,6 +1,8 @@
-// Compile-only guard for the `dispatch` desugar + std/gpu (no GPU needed):
-// exercises kernel-handle parse, arg marshalling, and the gpu_launch call.
+// Hardware-free guard for semantic `dispatch` + std/gpu: exercises legacy and
+// complete named launch controls, typed host marshalling, and the checked
+// provider-neutral launch ABI.
 import "std/gpu";
+extern fn gpu_stub_finish() -> int32 = "gpu_stub_finish";
 fn main() -> int32 {
   var k: int64 = 0;
   var da: int64 = 0;
@@ -9,5 +11,11 @@ fn main() -> int32 {
   var n: int32 = 1024;
   var scale: float32 = 2.5;
   dispatch k[(n + 255) / 256, 256](da, db, dc, n, scale);
-  return 0;
+  var shared_bytes: int32 = 4096;
+  var stream: int64 = 99;
+  dispatch k[stream: stream,
+             block: (32, 4, 1),
+             grid: (7, 3, 2),
+             shared: shared_bytes](da, db, dc, n, scale);
+  return gpu_stub_finish();
 }

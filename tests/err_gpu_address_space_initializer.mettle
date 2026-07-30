@@ -1,0 +1,3 @@
+kernel invalid_initializer(out: float32*) {
+  workgroup var tile: float32[32] = out;
+}

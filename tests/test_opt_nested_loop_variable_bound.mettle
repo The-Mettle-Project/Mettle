@@ -1,0 +1,112 @@
+// Regression: constant-bound loop unrolling across a nested loop.
+//
+// The unroller resolves a loop's bound through a map of symbol -> constant
+// built by scanning instructions BEFORE the loop header. That scan is linear,
+// but execution is not: when the header sits inside an enclosing loop, writes
+// that follow it in program order (`i = i + 1` at the end of the outer body)
+// run before control reaches the header again.
+//
+// Without accounting for the back-edge, `i` stayed mapped to its pre-loop
+// value and every copy of the unrolled outer body used the same inner trip
+// count -- so an ascending outer loop ran the inner body once each time, and a
+// descending one ran it the initial number of times.
+//
+// Exits 55 when every shape is right, 1 otherwise.
+
+fn ascending() -> int64 {
+  var total: int64 = 0;
+  var i: int32 = 1;
+  while (i <= 5) {
+    var j: int32 = 0;
+    while (j < i) {
+      total = total + 1;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return total;                    // 1+2+3+4+5
+}
+
+fn descending() -> int64 {
+  var total: int64 = 0;
+  var i: int32 = 5;
+  while (i >= 1) {
+    var j: int32 = 0;
+    while (j < i) {
+      total = total + 1;
+      j = j + 1;
+    }
+    i = i - 1;
+  }
+  return total;                    // 5+4+3+2+1
+}
+
+fn range_form() -> int64 {
+  var total: int64 = 0;
+  for i in 1..6 {
+    for j in 0..i {
+      total = total + 1;
+    }
+  }
+  return total;                    // same triangle
+}
+
+fn derived_bound() -> int64 {
+  var total: int64 = 0;
+  var i: int32 = 1;
+  while (i <= 5) {
+    var limit: int32 = i * 2;
+    var j: int32 = 0;
+    while (j < limit) {
+      total = total + 1;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return total;                    // 2+4+6+8+10
+}
+
+// Three deep, so the fix has to look past more than one enclosing back-edge.
+fn triple_nested() -> int64 {
+  var total: int64 = 0;
+  var i: int32 = 1;
+  while (i <= 4) {
+    var j: int32 = 0;
+    while (j < i) {
+      var k: int32 = 0;
+      while (k < j) {
+        total = total + 1;
+        k = k + 1;
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return total;                    // sum over i of (0+1+..+(i-1))
+}
+
+// A genuinely loop-invariant bound must still unroll, so the fix must not be
+// so conservative that it disables the optimisation.
+fn invariant_bound(bound: int32) -> int64 {
+  var total: int64 = 0;
+  var i: int32 = 1;
+  while (i <= 5) {
+    var j: int32 = 0;
+    while (j < bound) {
+      total = total + 1;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return total;                    // 5 * bound
+}
+
+fn main() -> int32 {
+  if (ascending() != 15) { return 1; }
+  if (descending() != 15) { return 1; }
+  if (range_form() != 15) { return 1; }
+  if (derived_bound() != 30) { return 1; }
+  if (triple_nested() != 10) { return 1; }
+  if (invariant_bound(3) != 15) { return 1; }
+  return 55;
+}

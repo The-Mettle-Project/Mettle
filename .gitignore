@@ -1,7 +1,12 @@
-bin/
+﻿bin/
 obj/
+# The libmtlc backend dependency, fetched by get-libmtlc.ps1 / get-libmtlc.sh at
+# the revision pinned in libmtlc.version. Never committed: it is somebody
+# else's tree. See docs/mettle-and-libmtlc.md.
+libmtlc/
 .claude/
 .cursor/
+.idea/
 web/
 .tmp/
 lib/
@@ -34,3 +39,5 @@ _mlopt.disp
 _mlopt.explain
 *.mprof
 ui_test.mettle
+promotion/
+.vs/

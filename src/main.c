@@ -3,18 +3,20 @@
 #endif
 #include "main.h"
 #include "common.h"
+#include "mettle_alloc.h"
 #include "codegen/binary/startup.h"
 #include "codegen/binary/mir_annotate.h"
 #include "codegen/binary_emitter.h"
 #include "codegen/binary/arm64_ir.h"
-#include "codegen/program_entry.h"
 #include "codegen/ptx_emitter.h"
+#include "codegen/spirv_emitter.h"
 #include "linker/pe_emitter.h"
 #include "string_intern.h"
 #include "compiler/compiler_context.h"
 #include "compiler/compiler_crash.h"
 #include "tracy_build.h"
 #include "ir/ir.h"
+#include "ir/ir_lowering.h" // ir_lower_program / ir_lowering_set_explain (frontend boundary)
 #include "ir/ir_optimize.h"
 #include "ir/ir_explain_memory.h"
 #include "ir/ir_profile.h"
@@ -60,7 +62,7 @@ extern pid_t waitpid(pid_t pid, int *wstatus, int options);
 #ifdef METTLE_VERSION_RAW
 #define METTLE_VERSION METTLE_STRINGIFY(METTLE_VERSION_RAW)
 #else
-#define METTLE_VERSION "v0.13.0"
+#define METTLE_VERSION "v0.14.0"
 #endif
 #endif
 
@@ -161,6 +163,11 @@ static void compiler_profile_print_compile(const CompilerProfile *profile,
             mettle_compiler_phase_name((MettleCompilerPhase)i), ms, percent);
   }
   fprintf(stderr, "  %-20s %9.3f ms  %6.2f%%\n", "total", total_ms, 100.0);
+#if METTLE_ALLOC_ACTIVE
+  /* Allocation volume is the single biggest lever on these numbers, so report it
+   * alongside them rather than making it a separate flag. */
+  mettle_alloc_report();
+#endif
 }
 
 static void compiler_set_phase(MettleCompilerPhase phase) {
@@ -2357,6 +2364,47 @@ static int add_link_argument(CompilerOptions *options, const char *argument) {
   return 1;
 }
 
+/* Resolve the default PTX target from the local GPU when the user gave no
+ * --gpu-arch. Queries the driver for the device's compute capability and maps
+ * it to the matching sm_ target, taking the architecture-specific `a` variant
+ * where one exists (sm_90 onward) so the full instruction surface (block-scaled
+ * MMA and friends) is available on the machine that will run the output.
+ * Returns 1 and fills `out` on success; returns 0 when no NVIDIA driver is
+ * visible or its answer is unparseable, in which case the caller keeps the
+ * project default (GB10 sm_121a), preserving cross-compile behavior on hosts
+ * with no GPU. */
+static int detect_host_gpu_ptx_target(char *out, size_t out_size) {
+#ifdef _WIN32
+  FILE *pipe = _popen(
+      "nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>nul", "r");
+#else
+  FILE *pipe = popen(
+      "nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null",
+      "r");
+#endif
+  if (!pipe) {
+    return 0;
+  }
+  char line[64] = {0};
+  const char *read = fgets(line, sizeof(line), pipe);
+#ifdef _WIN32
+  int status = _pclose(pipe);
+#else
+  int status = pclose(pipe);
+#endif
+  int major = 0, minor = 0;
+  char trailing = '\0';
+  if (!read || status != 0 ||
+      sscanf(line, "%d.%d%c", &major, &minor, &trailing) < 2 || major < 1 ||
+      major > 99 || minor < 0 || minor > 9 ||
+      (trailing != '\0' && trailing != '\n' && trailing != '\r' &&
+       trailing != ' ')) {
+    return 0;
+  }
+  snprintf(out, out_size, "sm_%d%d%s", major, minor, major >= 9 ? "a" : "");
+  return 1;
+}
+
 int main(int argc, char *argv[]) {
   CompilerOptions options = {0};
   mettle_compiler_crash_install(argc, argv);
@@ -2367,18 +2415,31 @@ int main(int argc, char *argv[]) {
   int build_executable = 0;
   int linker_mode_explicit = 0;
   int output_filename_explicit = 0;
+  int ptx_version_explicit = 0;
+  int gpu_arch_explicit = 0;
+  char detected_ptx_target[16];
   options.emit_object = 1;
   options.output_filename = default_object_output_filename();
   options.debug_format = "dwarf";
+  options.ptx_target = "sm_121a";
+  options.ptx_isa_major = 8;
+  options.ptx_isa_minor = 8;
 
   if (argc >= 2) {
     if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0 ||
         strcmp(argv[1], "version") == 0) {
+#if defined(__aarch64__) && defined(__linux__)
+      const char *host = "aarch64";
+      const char *target = "aarch64-linux (ELF relocatable object)";
+#else
+      const char *host = "x86_64";
       const char *target =
           binary_target_format_host_default() == BINARY_TARGET_FORMAT_ELF_X64
               ? "x86_64-linux (ELF)"
               : "x86_64-windows (COFF)";
+#endif
       printf("mettle %s\n", METTLE_VERSION);
+      printf("host: %s\n", host);
       printf("target: %s\n", target);
       return 0;
     }
@@ -2598,6 +2659,64 @@ int main(int argc, char *argv[]) {
       }
     } else if (strcmp(argv[i], "--emit-ptx") == 0) {
       options.emit_ptx = 1;
+    } else if (strncmp(argv[i], "--gpu-arch=", 11) == 0) {
+      const char *arch = argv[i] + 11;
+      gpu_arch_explicit = 1;
+      if (strcmp(arch, "gb10") == 0) {
+        /* GB10's compatible sm_121 profile excludes its architecture-specific
+         * FP4/block-scaled MMA forms. The named performance target must retain
+         * the `a` suffix; callers needing compatible PTX can request sm_121. */
+        options.ptx_target = "sm_121a";
+        if (!ptx_version_explicit) {
+          options.ptx_isa_major = 8;
+          options.ptx_isa_minor = 8;
+        }
+      } else if (strcmp(arch, "portable") == 0) {
+        /* Virtual Turing ISA is the oldest forward-compatible baseline still
+         * supported for offline assembly by current CUDA 13 toolchains. */
+        options.ptx_target = "compute_75";
+        if (!ptx_version_explicit) {
+          options.ptx_isa_major = 6;
+          options.ptx_isa_minor = 4;
+        }
+      } else if (strncmp(arch, "sm_", 3) == 0 ||
+                 strncmp(arch, "compute_", 8) == 0) {
+        options.ptx_target = arch;
+      } else {
+        fprintf(stderr,
+                "Error: --gpu-arch expects gb10, portable, sm_NN, or "
+                "compute_NN (got '%s')\n",
+                arch);
+        return 1;
+      }
+    } else if (strncmp(argv[i], "--ptx-version=", 14) == 0) {
+      const char *version = argv[i] + 14;
+      int major = 0, minor = 0;
+      char trailing = '\0';
+      if (sscanf(version, "%d.%d%c", &major, &minor, &trailing) != 2 ||
+          major < 1 || major > 99 || minor < 0 || minor > 9) {
+        fprintf(stderr,
+                "Error: --ptx-version expects MAJOR.MINOR (got '%s')\n",
+                version);
+        return 1;
+      }
+      options.ptx_isa_major = major;
+      options.ptx_isa_minor = minor;
+      ptx_version_explicit = 1;
+    } else if (strncmp(argv[i], "--gpu-tensor-tuple-budget=", 26) == 0) {
+      const char *value = argv[i] + 26;
+      int budget = 0;
+      char trailing = '\0';
+      if (sscanf(value, "%d%c", &budget, &trailing) != 1 || budget < 0 ||
+          budget > 4096) {
+        fprintf(stderr,
+                "Error: --gpu-tensor-tuple-budget expects 0..4096 (got '%s')\n",
+                value);
+        return 1;
+      }
+      options.ptx_tensor_tuple_budget = budget;
+    } else if (strcmp(argv[i], "--emit-spirv") == 0) {
+      options.emit_spirv = 1;
     } else if (strcmp(argv[i], "--emit-arm64") == 0) {
       options.emit_arm64 = 1;
     } else if (strcmp(argv[i], "-g") == 0 ||
@@ -2672,6 +2791,15 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  /* No --gpu-arch given: target the GPU that is actually in this machine when
+   * one is visible. Detection failure (no driver, headless build host) keeps
+   * the GB10 default so cross-compiles for DGX Spark are unchanged. */
+  if (options.emit_ptx && !gpu_arch_explicit &&
+      detect_host_gpu_ptx_target(detected_ptx_target,
+                                 sizeof(detected_ptx_target))) {
+    options.ptx_target = detected_ptx_target;
+  }
+
   if (options.tracy && !build_executable) {
     fprintf(stderr, "Error: --tracy requires --build\n");
     free((void *)options.import_directories);
@@ -2702,8 +2830,9 @@ int main(int argc, char *argv[]) {
   /* The native ELF backend supports --build on Linux via an ld-based link of
    * the emitted ELF object plus a self-contained _start. On Linux --build
    * always uses the direct-object backend (no asm/NASM path). */
-  int elf_build = (binary_target_format_host_default() ==
-                   BINARY_TARGET_FORMAT_ELF_X64);
+  BinaryTargetFormat host_format = binary_target_format_host_default();
+  int elf_build = host_format == BINARY_TARGET_FORMAT_ELF_X64 ||
+                  host_format == BINARY_TARGET_FORMAT_ELF_ARM64;
 
   if (build_executable) {
 #ifndef _WIN32
@@ -2984,6 +3113,14 @@ static IRGlobalIntConst *collect_global_int_consts(ASTNode *program,
 static int compile_optimize_ir(IRProgram *ir_program, ASTNode *ast_program,
                                CompilerOptions *options) {
   IROptimizeOptions ir_optimize_options = {0};
+  int target_neutral =
+      options->emit_arm64 || options->emit_ptx || options->emit_spirv;
+  if (options->ml_opt && target_neutral) {
+    fprintf(stderr,
+            "Error: --ml-opt is not target-neutral and cannot be combined "
+            "with --emit-arm64, --emit-ptx, or --emit-spirv\n");
+    return 0;
+  }
   ir_optimize_options.preserve_function_boundaries =
       options->profile_runtime ? 1 : 0;
   ir_optimize_options.simd_report = options->simd_report;
@@ -2995,6 +3132,20 @@ static int compile_optimize_ir(IRProgram *ir_program, ASTNode *ast_program,
   ir_explain_set_json(options->explain_json ? 1 : 0);
   /* --annotate-asm: arm the codegen annotator before codegen runs, and keep the
    * optimization remarks alive so it can join them onto the emitted asm. */
+  /* --explain-json wants the codegen cost model (cycles per iteration, port
+   * bottleneck, spills) joined onto the optimizer's decisions, so arm the
+   * annotator for its numbers alone: no listing, no .annot.json sidecar. */
+  if (options->explain_json && !options->annotate_asm) {
+    mir_annotate_set_enabled(1);
+    mir_annotate_set_cost_only(1);
+    mir_annotate_set_output_path(options->output_filename);
+    mir_annotate_set_source_file(options->input_filename);
+  }
+  /* The call graph and the ranking are assembled after codegen, from the same
+   * remark table -- so it has to outlive the optimization-stage flush. */
+  if (options->explain_json) {
+    ir_explain_set_retain_remarks(1);
+  }
   if (options->annotate_asm) {
     mir_annotate_set_enabled(1);
     mir_annotate_set_syntax((MirAnnotSyntax)options->asm_syntax);
@@ -3014,6 +3165,9 @@ static int compile_optimize_ir(IRProgram *ir_program, ASTNode *ast_program,
   ir_optimize_options.global_int_consts = global_consts;
   ir_optimize_options.global_int_const_count = global_const_count;
   ir_optimize_options.whole_program = options->building_executable;
+  ir_optimize_options.target_neutral_only = target_neutral;
+  ir_optimize_options.gpu_device_only =
+      options->emit_ptx || options->emit_spirv;
   int opt_ok = ir_optimize_program(ir_program, &ir_optimize_options);
   free(global_consts);
   if (!opt_ok) {
@@ -3049,9 +3203,8 @@ static int compile_optimize_ir(IRProgram *ir_program, ASTNode *ast_program,
   return 1;
 }
 
-static int compile_generate_code(CodeGenerator *code_generator,
-                                 ASTNode *program) {
-  if (!code_generator_generate_program(code_generator, program)) {
+static int compile_generate_code(CodeGenerator *code_generator) {
+  if (!code_generator_generate_program(code_generator)) {
     fprintf(stderr, "Code generation error: %s\n",
             (code_generator && code_generator->error_message)
                 ? code_generator->error_message
@@ -3063,6 +3216,29 @@ static int compile_generate_code(CodeGenerator *code_generator,
     return 0;
   }
   return 1;
+}
+
+static void compile_dump_device_ir(IRProgram *program,
+                                   const char *output_filename) {
+  char *ir_output = build_sidecar_filename(output_filename, ".ir");
+  if (!ir_output) {
+    fprintf(stderr,
+            "Warning: Failed to allocate IR output filename for '%s'\n",
+            output_filename ? output_filename : "<device module>");
+    return;
+  }
+  FILE *ir_file = fopen(ir_output, "w");
+  if (!ir_file) {
+    fprintf(stderr, "Warning: Could not create IR file '%s': %s\n",
+            ir_output, strerror(errno));
+  } else {
+    if (!ir_program_dump(program, ir_file)) {
+      fprintf(stderr, "Warning: Failed to write IR dump to '%s'\n",
+              ir_output);
+    }
+    fclose(ir_file);
+  }
+  free(ir_output);
 }
 
 int compile_file(const char *input_filename, const char *output_filename,
@@ -3148,7 +3324,7 @@ int compile_file(const char *input_filename, const char *output_filename,
   parser = parser_create_with_error_reporter(lexer, error_reporter);
   if (parser) {
     /* Enable kernel index built-ins (thread.x etc.) for GPU compiles. */
-    parser->gpu_mode = options->emit_ptx;
+    parser->gpu_mode = options->emit_ptx || options->emit_spirv;
   }
   type_checker =
       type_checker_create_with_error_reporter(symbol_table, error_reporter);
@@ -3190,11 +3366,9 @@ int compile_file(const char *input_filename, const char *output_filename,
       compiler_profile_print_compile(&profile, input_filename, 1);
       return 1;
     }
-    code_generator = code_generator_create_with_debug(
-        symbol_table, type_checker, register_allocator, debug_info);
+    code_generator = code_generator_create_with_debug(debug_info);
   } else {
-    code_generator =
-        code_generator_create(symbol_table, type_checker, register_allocator);
+    code_generator = code_generator_create();
   }
 
   if (!code_generator) {
@@ -3315,8 +3489,6 @@ int compile_file(const char *input_filename, const char *output_filename,
     goto cleanup;
   }
 
-  options->main_wants_argc_argv = program_main_wants_argc_argv(program);
-
   compiler_set_phase(PROFILE_PHASE_MONOMORPHIZE);
   phase_start = compiler_profile_begin(&profile);
   int mono_ok = compile_monomorphize(program, error_reporter);
@@ -3383,10 +3555,13 @@ int compile_file(const char *input_filename, const char *output_filename,
                     "reports optimization decisions)\n");
   }
   ir_lowering_set_explain(options->explain && options->optimize &&
-                          !options->emit_ptx);
+                          !options->emit_ptx && !options->emit_spirv);
 
   int emit_runtime_checks =
-      (options->release || options->emit_ptx || options->emit_arm64) ? 0 : 1;
+      (options->release || options->emit_ptx || options->emit_spirv ||
+       options->emit_arm64)
+          ? 0
+          : 1;
   compiler_set_phase(PROFILE_PHASE_IR_LOWERING);
   phase_start = compiler_profile_begin(&profile);
   int ir_ok = compile_lower_to_ir(program, type_checker, symbol_table,
@@ -3399,6 +3574,7 @@ int compile_file(const char *input_filename, const char *output_filename,
   }
 
   mettle_compiler_ctx_set_ir_program(ir_program);
+  options->main_wants_argc_argv = ir_program->main_wants_argc_argv;
 
   /* --pgo: interpret main() now, before optimization, so the optimizer can
    * consume measured call frequencies instead of static guesses. */
@@ -3429,11 +3605,26 @@ int compile_file(const char *input_filename, const char *output_filename,
     goto cleanup;
   }
 
-  /* --emit-ptx: lower every function to a PTX `.visible .entry` and write the
-   * PTX text to the output file. No optimization (keeps the IR shape the PTX
-   * emitter expects), no object, no link -- the GPU kernels are JIT-compiled by
-   * the CUDA driver at runtime from this text. */
+  /* --emit-ptx: lower every declared kernel to a PTX `.visible .entry` and
+   * write the PTX text to the output file. Under -O, run only the shared
+   * target-neutral scalar/CFG pipeline over kernel-reachable device code; the
+   * x86-specific optimizer is never allowed to shape GPU IR. No object or link
+   * is produced -- the CUDA driver JIT-compiles this text at runtime. */
   if (options->emit_ptx) {
+    if (options->optimize) {
+      compiler_set_phase(PROFILE_PHASE_IR_OPTIMIZATION);
+      phase_start = compiler_profile_begin(&profile);
+      int opt_ok = compile_optimize_ir(ir_program, program, options);
+      compiler_profile_add(&profile, PROFILE_PHASE_IR_OPTIMIZATION,
+                           phase_start);
+      if (!opt_ok) {
+        result = 1;
+        goto cleanup;
+      }
+    }
+    if (options->dump_ir) {
+      compile_dump_device_ir(ir_program, output_filename);
+    }
     FILE *ptx_out = fopen(output_filename, "w");
     if (!ptx_out) {
       fprintf(stderr, "Error: could not open PTX output '%s'\n",
@@ -3442,7 +3633,12 @@ int compile_file(const char *input_filename, const char *output_filename,
       goto cleanup;
     }
     char *ptx_err = NULL;
-    int ok = ptx_emit_program(ir_program, code_generator, ptx_out, &ptx_err);
+    PtxEmitOptions ptx_options = {options->ptx_target,
+                                   options->ptx_isa_major,
+                                   options->ptx_isa_minor,
+                                   options->ptx_tensor_tuple_budget};
+    int ok = ptx_emit_program(ir_program, code_generator, ptx_out,
+                              &ptx_options, &ptx_err);
     fclose(ptx_out);
     if (!ok) {
       fprintf(stderr, "Error: PTX emission failed: %s\n",
@@ -3451,8 +3647,64 @@ int compile_file(const char *input_filename, const char *output_filename,
       result = 1;
       goto cleanup;
     }
+    if (options->explain && options->optimize) {
+      ir_explain_target_flush("PTX");
+    }
     printf("Generated PTX: %s\n", output_filename);
     result = 0;
+    goto cleanup;
+  }
+
+  /* --emit-spirv: lower every declared kernel to a SPIR-V `Kernel` entry point
+   * and write the binary module. -O has the same target-neutral,
+   * kernel-reachable policy as PTX. This remains offload-only: no host object
+   * or link. An OpenCL runtime JITs the module at load time. */
+  if (options->emit_spirv) {
+    if (options->optimize) {
+      compiler_set_phase(PROFILE_PHASE_IR_OPTIMIZATION);
+      phase_start = compiler_profile_begin(&profile);
+      int opt_ok = compile_optimize_ir(ir_program, program, options);
+      compiler_profile_add(&profile, PROFILE_PHASE_IR_OPTIMIZATION,
+                           phase_start);
+      if (!opt_ok) {
+        result = 1;
+        goto cleanup;
+      }
+    }
+    if (options->dump_ir) {
+      compile_dump_device_ir(ir_program, output_filename);
+    }
+    FILE *spv_out = fopen(output_filename, "wb");
+    if (!spv_out) {
+      fprintf(stderr, "Error: could not open SPIR-V output '%s'\n",
+              output_filename);
+      result = 1;
+      goto cleanup;
+    }
+    char *spv_err = NULL;
+    int ok = spirv_emit_program(ir_program, code_generator, spv_out, &spv_err);
+    fclose(spv_out);
+    if (!ok) {
+      fprintf(stderr, "Error: SPIR-V emission failed: %s\n",
+              spv_err ? spv_err : "unknown");
+      free(spv_err);
+      result = 1;
+      goto cleanup;
+    }
+    if (options->explain && options->optimize) {
+      ir_explain_target_flush("SPIR-V");
+    }
+    printf("Generated SPIR-V: %s\n", output_filename);
+    result = 0;
+    goto cleanup;
+  }
+
+  /* Device-module emitters consume semantic kernel IR directly. Host targets
+   * now lower semantic launch operations to the stable runtime-provider ABI;
+   * parsing and frontend type checking never mention CUDA argument arrays. */
+  if (!ir_program_lower_gpu_launches(ir_program)) {
+    fprintf(stderr, "Error: Failed to lower GPU launches for the host runtime\n");
+    result = 1;
     goto cleanup;
   }
 
@@ -3609,11 +3861,25 @@ int compile_file(const char *input_filename, const char *output_filename,
 
   compiler_set_phase(PROFILE_PHASE_CODEGEN);
   phase_start = compiler_profile_begin(&profile);
-  int codegen_ok = compile_generate_code(code_generator, program);
+#if defined(__aarch64__) || defined(_M_ARM64)
+  /* The native Arm path is a first-class IR backend. It deliberately bypasses
+   * the x86 MIR/encoder while sharing the frontend-neutral IR and linker flow. */
+  int codegen_ok = 1;
+#else
+  int codegen_ok = compile_generate_code(code_generator);
+#endif
   compiler_profile_add(&profile, PROFILE_PHASE_CODEGEN, phase_start);
   if (!codegen_ok) {
     result = 1;
     goto cleanup;
+  }
+
+  /* The annotator goes first: it publishes the cost model (cycles per
+   * iteration, port bottlenecks, spills) into the --explain report, which the
+   * backend flush below then writes out. It also emits its own listing and
+   * .annot.json sidecar when --annotate-asm asked for them. */
+  if (options->annotate_asm || (options->explain_json && mir_annotate_enabled())) {
+    mir_annotate_flush();
   }
 
   /* --explain: the MIR eligibility gate recorded, per function, whether it got
@@ -3623,14 +3889,20 @@ int compile_file(const char *input_filename, const char *output_filename,
     ir_explain_backend_flush();
   }
 
-  /* --annotate-asm: now that every function has been encoded, write the
-   * annotated listing (stdout) and the <stem>.annot.json sidecar. */
-  if (options->annotate_asm) {
-    mir_annotate_flush();
-  }
-
   compiler_set_phase(PROFILE_PHASE_WRITE_OUTPUT);
   phase_start = compiler_profile_begin(&profile);
+#if defined(__aarch64__) || defined(_M_ARM64)
+  char arm64_error[512] = {0};
+  if (!arm64_ir_write_object(ir_program, output_filename, arm64_error,
+                             sizeof(arm64_error))) {
+    compiler_profile_add(&profile, PROFILE_PHASE_WRITE_OUTPUT, phase_start);
+    fprintf(stderr, "Error: Could not create AArch64 object file '%s': %s\n",
+            output_filename,
+            arm64_error[0] ? arm64_error : "Unknown error");
+    result = 1;
+    goto cleanup;
+  }
+#else
   BinaryEmitter *binary_emitter =
       code_generator_get_binary_emitter(code_generator);
   if (!binary_emitter_write_object_file(binary_emitter, output_filename)) {
@@ -3643,6 +3915,7 @@ int compile_file(const char *input_filename, const char *output_filename,
     result = 1;
     goto cleanup;
   }
+#endif
   compiler_profile_add(&profile, PROFILE_PHASE_WRITE_OUTPUT, phase_start);
 
   // Generate debug information files if requested
@@ -3777,6 +4050,17 @@ void print_usage(const char *program_name) {
   printf("  --build             Compile and link to an executable (COFF/PE on "
          "Windows, ELF on Linux)\n");
   printf("  --emit-obj          Emit a native object directly (default)\n");
+  printf("  --emit-ptx          Emit declared kernels as NVIDIA PTX (targets the\n"
+         "                      local GPU when one is visible via nvidia-smi;\n"
+         "                      otherwise DGX Spark GB10, PTX 8.8 / sm_121a)\n");
+  printf("  --gpu-arch=A        PTX profile: gb10, portable (compute_75), sm_NN,\n"
+         "                      or compute_NN (disables local GPU detection)\n");
+  printf("  --ptx-version=M.m   Override the emitted PTX ISA version\n");
+  printf("  --gpu-tensor-tuple-budget=N\n"
+         "                      PTX resident-fragment ceiling (0=architecture\n"
+         "                      default); enables measured resident/replay variants\n"
+         "                      without changing source or shared IR\n");
+  printf("  --emit-spirv        Emit declared kernels as OpenCL SPIR-V\n");
   printf("  --linker <mode>     Linker backend: auto, internal, gcc, or msvc "
          "(default: internal with --build, otherwise %s)\n",
          linker_mode_name(LINKER_MODE_AUTO));

@@ -1,0 +1,60 @@
+// Whole-problem matrix regions. These kernels are compiler/offline-assembly
+// fixtures; hardware execution is intentionally not part of the safe suite.
+
+kernel tensor_matmul_f16_f32(
+    a: uint16*, b: uint16*, c: float32*, d: float32*,
+    row_origin: uint32, column_origin: uint32,
+    problem_m: uint32, problem_n: uint32, problem_k: uint32,
+    lda: uint32, ldb: uint32, ldc: uint32, ldd: uint32) {
+  tensor_matmul(
+      a, b, c, d, row_origin, column_origin,
+      problem_m, problem_n, problem_k,
+      shape: m16n16k16, input_type: f16, output_type: f32,
+      lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+}
+
+kernel tensor_matmul_f16_grid(
+    a: uint16*, b: uint16*, c: float32*, d: float32*,
+    problem_m: uint32, problem_n: uint32, problem_k: uint32,
+    lda: uint32, ldb: uint32, ldc: uint32, ldd: uint32) {
+  var row_origin: uint32 = (uint32)block.y * (uint32)16;
+  var column_origin: uint32 = (uint32)block.x * (uint32)16;
+  tensor_matmul(
+      a, b, c, d, row_origin, column_origin,
+      problem_m, problem_n, problem_k,
+      shape: m16n16k16, input_type: f16, output_type: f32,
+      lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+}
+
+kernel tensor_matmul_bf16_f32(
+    a: uint16*, b: uint16*, c: float32*, d: float32*,
+    row_origin: uint32, column_origin: uint32,
+    problem_m: uint32, problem_n: uint32, problem_k: uint32) {
+  tensor_matmul(
+      a, b, c, d, row_origin, column_origin,
+      problem_m, problem_n, problem_k,
+      shape: m16n16k16, input_type: bf16, output_type: f32,
+      lda: 257, ldb: 263, ldc: 269, ldd: 271);
+}
+
+kernel tensor_matmul_f64(
+    a: float64*, b: float64*, c: float64*, d: float64*,
+    row_origin: uint32, column_origin: uint32,
+    problem_m: uint32, problem_n: uint32, problem_k: uint32) {
+  tensor_matmul(
+      a, b, c, d, row_origin, column_origin,
+      problem_m, problem_n, problem_k,
+      shape: m8n8k4, input_type: f64, output_type: f64,
+      lda: 67, ldb: 71, ldc: 73, ldd: 79);
+}
+
+kernel tensor_matmul_i8_i32(
+    a: int8*, b: int8*, c: int32*, d: int32*,
+    row_origin: uint32, column_origin: uint32,
+    problem_m: uint32, problem_n: uint32, problem_k: uint32) {
+  tensor_matmul(
+      a, b, c, d, row_origin, column_origin,
+      problem_m, problem_n, problem_k,
+      shape: m16n16k16, input_type: i8, output_type: i32,
+      overflow: wrap, lda: 257, ldb: 263, ldc: 269, ldd: 271);
+}

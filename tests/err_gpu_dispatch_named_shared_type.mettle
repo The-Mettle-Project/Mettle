@@ -1,0 +1,5 @@
+fn main() -> int32 {
+  var handle: int64 = 0;
+  dispatch handle[grid: (1, 1, 1), block: (32, 1, 1), shared: "bad"]();
+  return 0;
+}

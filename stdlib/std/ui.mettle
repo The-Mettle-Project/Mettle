@@ -928,11 +928,19 @@ export fn ui_get_system_color(color_index: int32) -> uint32 {
 
 // Controls.
 //
-// The 12-argument Ui_CreateWindowExA call MUST be made from a frame that holds
-// only scalar locals. Making it directly from ui_control_create -- whose frame
-// also contains a by-value UiControlConfig struct -- mislays the outgoing stack
-// arguments and corrupts width/height (controls get created at 0 height and are
-// invisible). Keeping the extern call isolated here sidesteps that.
+// This wrapper used to be load-bearing: the 12-argument Ui_CreateWindowExA call
+// was believed to mislay its outgoing stack arguments when issued from a frame
+// holding a by-value UiControlConfig, corrupting width and height so controls
+// came out invisible.
+//
+// The argument passing was never at fault. The config arrived already broken:
+// `config.rect = ui_rect_xywh(...)` assigned a returned aggregate into a struct
+// field, and that path copied only the first machine word (see
+// tests/test_struct_return_to_field.mettle). CreateWindowExA was faithfully
+// given the garbage it was handed.
+//
+// The isolation is no longer required. It is kept because a single named helper
+// for the raw extern call is worth having on its own.
 fn ui_native_control(
   parent: int64,
   class_name: cstring,

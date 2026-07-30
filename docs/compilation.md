@@ -1,6 +1,10 @@
 # Compilation
 
-This document describes how to compile Mettle programs and the available compiler options.
+The `mettle` command is the reference driver: it runs the Mettle frontend
+(lexer, parser, semantic analysis) to lower source into libmtlc IR, then drives
+the backend (optimize, code generation, link). This document describes how to
+compile Mettle programs with it and the options it accepts. To drive the backend
+from a different frontend, see [Writing a frontend for libmtlc](embedding.md).
 
 ## Compiler Usage
 
@@ -27,7 +31,22 @@ Available topics: `build`, `runtime` (aliases `heap`, `gc`), `interop`, `stdlib`
 
 ## Options
 
-`-o <file>` output object file (default `output.obj` / `output.o`, or executable path when used with `--build`). `-i <file>` input file (alternative to positional argument). `-I <dir>` add import search directory (repeatable). `--stdlib <dir>` set stdlib root (default auto-detects bundled stdlib near the compiler binary, then falls back to `./stdlib`). `--build` build a native executable: Windows uses a COFF object + the internal PE linker by default; Linux emits an ELF object and links it with `gcc -no-pie`. `--static` adds static Linux linking, and `--musl` uses `musl-gcc -static`. `--emit-obj` emit a native object (the default). `--linker <internal|auto|gcc|msvc>` choose the Windows linker path (**default: `internal`**). `--link-arg <arg>` pass an extra linker argument in `--build` mode for additional DLLs/import libraries. `--tracy` link `std/tracy` with the Tracy profiler (requires `--build`; set `TRACY_DIR` or `--tracy-dir`). `--tracy-dir <dir>` Tracy repo root for `--tracy`. `--prelude` auto-import `std/prelude` (std/io, std/math, std/conv, std/mem, std/process, std/net). `-d`/`--debug` debug mode and embedded runtime crash traceback support. `-g`/`--debug-symbols` generate debug symbols. `-l`/`--line-mapping` source line mapping. `-s`/`--stack-trace` embeds runtime crash traceback support without the rest of debug mode. `-O`/`--optimize` enable optimizations. `-r`/`--release` enables `-O`, removes unreachable functions, and disables generated runtime null/bounds checks in IR lowering. `--profile-runtime` emit function-level runtime timing hooks and print a sorted report at process exit. `--emit-ptx` compile each function to an NVIDIA PTX `.entry` (the GPU backend) instead of a native object; see [GPU Offload](gpu.md). `--simd-report` (with `-O`/`--release`) print a note for every `@simd` loop saying whether it vectorized and into which kernel. `--explain` (with `-O`/`--release`) print a grouped optimization report for the main input file — per loop: vectorized (into which instruction-level kernel, e.g. `vfmadd231ps, 8-wide float32`) or `NOT vectorized` with a `└ reason:` and, when actionable, a `└ fix:` line; per call: inlined or not, with the same reason/fix treatment; loop nests are summarized (`vectorized inner, scalar outer`); a final backend section shows which functions got the register-allocating backend vs baseline codegen and why. No annotations required; remarks from imported modules are filtered out. `-h`/`--help` print usage. See [Imports](imports.md) for path resolution and `-I`/`--stdlib` details.
+`-o <file>` output object file (default `output.obj` / `output.o`, or executable path when used with `--build`). `-i <file>` input file (alternative to positional argument). `-I <dir>` add import search directory (repeatable). `--stdlib <dir>` set stdlib root (default auto-detects bundled stdlib near the compiler binary, then falls back to `./stdlib`). `--build` build a native executable: Windows uses a COFF object + the internal PE linker by default; Linux emits an ELF object and links it with `gcc -no-pie`. `--static` adds static Linux linking, and `--musl` uses `musl-gcc -static`. `--emit-obj` emit a native object (the default). `--linker <internal|auto|gcc|msvc>` choose the Windows linker path (**default: `internal`**). `--link-arg <arg>` pass an extra linker argument in `--build` mode for additional DLLs/import libraries. `--tracy` link `std/tracy` with the Tracy profiler (requires `--build`; set `TRACY_DIR` or `--tracy-dir`). `--tracy-dir <dir>` Tracy repo root for `--tracy`. `--prelude` auto-import `std/prelude` (std/io, std/math, std/conv, std/mem, std/process, std/net). `-d`/`--debug` debug mode and embedded runtime crash traceback support. `-g`/`--debug-symbols` generate debug symbols. `-l`/`--line-mapping` source line mapping. `-s`/`--stack-trace` embeds runtime crash traceback support without the rest of debug mode. `-O`/`--optimize` enable optimizations. `-r`/`--release` enables `-O`, removes unreachable functions, and disables generated runtime null/bounds checks in IR lowering. `--profile-runtime` emit function-level runtime timing hooks and print a sorted report at process exit. `--emit-ptx` compile each function to an NVIDIA PTX `.entry` (the GPU backend) instead of a native object; see [GPU Offload](gpu.md). `--emit-spirv` compile each function to a SPIR-V `Kernel` entry point (OpenCL 2.0 environment) instead of a native object; see [GPU Offload](gpu.md). `--simd-report` (with `-O`/`--release`) print a note for every `@simd` loop saying whether it vectorized and into which kernel. `--explain` (with `-O`/`--release`) print a grouped optimization report for the main input file. Per loop: vectorized (into which instruction-level kernel, e.g. `vfmadd231ps, 8-wide float32`) or `NOT vectorized` with a `└ reason:` and, when actionable, a `└ fix:` line; per call: inlined or not, with the same reason/fix treatment; loop nests are summarized (`vectorized inner, scalar outer`); a final backend section shows which functions got the register-allocating backend vs baseline codegen and why. No annotations required; remarks from imported modules are filtered out. `-h`/`--help` print usage. See [Imports](imports.md) for path resolution and `-I`/`--stdlib` details.
+<!-- Target-qualified device/native modes. -->
+GPU/native target qualification: `--emit-ptx` and `--emit-spirv` emit only
+functions declared with `kernel`; ordinary `fn` declarations are not entry
+points. Without `--gpu-arch`, PTX targets the local GPU (compute capability
+queried through `nvidia-smi`, architecture-specific `a` variant from `sm_90`
+onward); with no visible GPU it falls back to PTX 8.8 / `sm_121a` for GB10. Use
+`--gpu-arch=gb10|portable|sm_NN|compute_NN` and optionally
+`--ptx-version=M.m` to select backend policy explicitly.
+`--gpu-tensor-tuple-budget=N` selects the PTX-only resident-fragment ceiling
+(`0` uses the architecture default), allowing an external measurement harness
+to compare resident and exact-replay variants without changing source or shared
+IR. Native Linux object/build
+emission supports x86-64 and AArch64: Arm uses ELF64/AAPCS64 and the system
+`gcc -no-pie` link contract. The explicit `--emit-arm64` command is the older
+self-contained smoke product, not the normal native object path.
 
 ## Compilation Pipeline
 
@@ -178,7 +197,7 @@ gcc -nostartfiles main.o \
 
 Omit either object when the corresponding symbols are not referenced.
 
-For concurrency, import `std/thread` (Windows) or `std/thread_posix` and call `CreateThread`/`pthread_create` directly — Mettle no longer has built-in `async`/`spawn`/`Channel<T>` keywords.
+For concurrency, import `std/thread` (Windows) or `std/thread_posix` and call `CreateThread`/`pthread_create` directly. Mettle has no built-in `async`/`spawn`/`Channel<T>` keywords.
 
 **Programs with `main(argc, argv)`:** If your entry point has the signature `fn main(argc: int32, argv: cstring*) -> int32`, Windows startup calls CRT `__getmainargs` before `main`. No Mettle argv shim is required.
 
@@ -186,7 +205,7 @@ For concurrency, import `std/thread` (Windows) or `std/thread_posix` and call `C
 
 Compile-time errors and warnings are printed with a stable error code, the
 source location, a code snippet with a caret pointing at the offending span
-(plus one line of surrounding context), and — where possible — a `help:`
+(plus one line of surrounding context), and, where possible, a `help:`
 suggestion. Output is colorized on a TTY and respects `NO_COLOR`,
 `CLICOLOR`/`CLICOLOR_FORCE`, and `TERM=dumb`. Up to 100 diagnostics are
 reported per run rather than stopping at the first.
@@ -316,7 +335,7 @@ Helper scripts live under `tools/debug/` (`dump-compiler-artifacts.ps1`,
 With object emission or `--build`, `-g` embeds binary DWARF 4
 sections (`.debug_info`, `.debug_abbrev`, `.debug_line`, `.debug_str`,
 `.debug_frame`) in native objects (ELF on Linux; COFF/PE on Windows as supported by the active linker path) for GDB/LLDB. Locals and
-parameters kept in GP registers by the optimizer (for example `r12`–`r15`) are
+parameters kept in GP registers by the optimizer (for example `r12` to `r15`) are
 described with `DW_OP_regN` location expressions; stack-homed symbols use
 `DW_OP_fbreg`. Runtime stack-trace tables (`-s`) are embedded in COFF objects on the default object / `--build` path (`.rdata` symbols `mettle_debug_functions`, `mettle_debug_locations`, plus `mettle_crash_startup`). They are separate from `-g` DWARF sections: `-s` alone enables tracebacks without emitting `.debug_*`.
 

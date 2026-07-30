@@ -1,0 +1,29 @@
+// Neutral per-work-item staging. The same IR becomes native cp.async on
+// capable PTX profiles and synchronous typed copies on portable backends.
+kernel async_stage_u32(src: uint32*, out: uint32*) {
+  workgroup var tile: uint32[32];
+  var lane: int32 = thread.x;
+  async_copy_workgroup(&tile[lane], src + lane, 1,
+                       transaction: 4, cache: all);
+  async_copy_commit();
+  async_copy_wait(0);
+  barrier(workgroup, acq_rel);
+  out[lane] = tile[(lane + 31) % 32];
+}
+
+// Four u32 values per lane form one explicitly aligned 16-byte transaction.
+// Launchers must satisfy that asserted alignment for both bases and offsets.
+kernel async_stage_u32x4(src: uint32*, out: uint32*) {
+  workgroup var tile: uint32[128];
+  var lane: int32 = thread.x;
+  var base: int32 = lane * 4;
+  async_copy_workgroup(&tile[base], src + base, 4,
+                       transaction: 16, cache: global);
+  async_copy_commit();
+  async_copy_wait(0);
+  barrier(workgroup, acq_rel);
+  out[base] = tile[(base + 124) % 128];
+  out[base + 1] = tile[(base + 125) % 128];
+  out[base + 2] = tile[(base + 126) % 128];
+  out[base + 3] = tile[(base + 127) % 128];
+}

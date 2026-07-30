@@ -1,0 +1,3 @@
+kernel invalid_result(value: int32) -> int32 {
+  return value;
+}

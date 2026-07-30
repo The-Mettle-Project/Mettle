@@ -1,8 +1,8 @@
 #ifndef PARSER_H
 #define PARSER_H
 
-#include "../error/error_reporter.h"
-#include "../lexer/lexer.h"
+#include "error/error_reporter.h"
+#include "lexer/lexer.h"
 #include "ast.h"
 
 typedef struct {
@@ -16,13 +16,11 @@ typedef struct {
   ErrorReporter *error_reporter;
   int error_recovery_mode;
   const char *source_filename;
-  /* Set when compiling for the GPU (--emit-ptx). Enables the kernel index
-   * built-ins (thread/block/block_dim/grid_dim member access on x/y/z) to
-   * desugar to the gpu_* intrinsics. Off for normal CPU compiles, so member
+  /* Set when compiling a GPU module. Enables the kernel index built-ins
+   * (thread/block/block_dim/grid_dim member access on x/y/z) to desugar to
+   * target-neutral gpu_* intrinsics. Off for normal CPU compiles, so member
    * access on an ordinary struct named e.g. `block` is unaffected. */
   int gpu_mode;
-  /* Monotonic id for synthesizing unique local names in `dispatch` desugaring. */
-  int dispatch_counter;
 } Parser;
 
 // Function declarations
@@ -45,6 +43,7 @@ ASTNode *parser_parse_cast_expression(Parser *parser);
 // Specific parsing functions
 ASTNode *parser_parse_import_declaration(Parser *parser);
 ASTNode *parser_parse_var_declaration(Parser *parser);
+ASTNode *parser_parse_barrier_statement(Parser *parser);
 ASTNode *parser_parse_function_declaration(Parser *parser);
 ASTNode *parser_parse_struct_declaration(Parser *parser);
 ASTNode *parser_parse_enum_declaration(Parser *parser);

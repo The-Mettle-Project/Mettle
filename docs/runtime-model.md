@@ -1,10 +1,17 @@
 # Runtime Model
 
-Mettle has no GC, async scheduler, heap manager, thread pool, or startup shim that every program must link.
+Programs libmtlc emits have no GC, async scheduler, heap manager, thread pool,
+or startup shim that every program must link.
 
-A typical program links **libc only**. The compiler emits `mainCRTStartup` (Windows) or `_start` (Linux), calls your `main`, and exits. Heap use goes straight to `calloc(1, n)`. There is no `runtime_init`, `runtime_shutdown`, background thread, or allocator state inside Mettle.
+A typical program links **libc only**. The backend emits `mainCRTStartup`
+(Windows) or `_start` (Linux), calls your `main`, and exits. Heap use goes
+straight to `calloc(1, n)`. There is no `runtime_init`, `runtime_shutdown`,
+background thread, or allocator state baked into the output.
 
-This page covers what gets emitted, the two optional helper objects in `src/runtime/`, and when the linker pulls them in.
+This page covers what gets emitted, the two optional helper objects in
+`src/runtime/`, and when the linker pulls them in. The table below uses Mettle
+language features to name what the frontend lowers; the compiler output column
+is the backend's.
 
 ## Call boundary
 

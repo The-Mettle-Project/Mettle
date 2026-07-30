@@ -1,0 +1,10 @@
+fn recurse(value: int32) -> int32 {
+  if (value == 0) {
+    return 0;
+  }
+  return recurse(value - 1);
+}
+
+kernel recursive_device_call(out: int32*) {
+  out[0] = recurse(4);
+}

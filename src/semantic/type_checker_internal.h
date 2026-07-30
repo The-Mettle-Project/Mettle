@@ -6,9 +6,9 @@
 // helper prototypes and shared file-local types.
 
 #include "type_checker.h"
-#include "../common.h"
-#include "../error/error_reporter.h"
-#include "../string_intern.h"
+#include "common.h"
+#include "error/error_reporter.h"
+#include "string_intern.h"
 #include "symbol_table.h"
 #include <ctype.h>
 #include <errno.h>
@@ -122,6 +122,12 @@ int type_checker_ast_contains_node_type(ASTNode *node,
 
 int type_checker_is_null_pointer_constant(ASTNode *expression);
 
+/* Targets that accept a null pointer constant. Function pointers are pointers
+ * too: `var f: fn(int32) -> int32 = 0;` is the same idea as a null data
+ * pointer, and is how a table of entry points is declared before it is
+ * populated at run time. */
+int type_checker_type_accepts_null_pointer(const Type *type);
+
 void type_checker_init_tracker_reset(TypeChecker *checker);
 
 int type_checker_init_tracker_ensure_var_capacity(TypeChecker *checker);
@@ -181,6 +187,22 @@ Type *type_checker_default_integer_literal_type(TypeChecker *checker,
 Type *type_checker_infer_type_internal(TypeChecker *checker,
                                               ASTNode *expression);
 
+/* Shared target-neutral tensor builtin helpers. The epilogue checker lives in
+ * its own translation unit to keep complete CodeView debug information in
+ * normal MinGW builds. */
+const char *type_checker_tensor_option_identifier(ASTNode *node);
+int type_checker_tensor_option_u32(TypeChecker *checker, ASTNode *node,
+                                   const char *name, uint32_t maximum,
+                                   uint32_t *out_value);
+MtlcTensorElement type_checker_tensor_element_name(const char *name);
+MtlcTensorLayout type_checker_tensor_layout_name(const char *name);
+int type_checker_tensor_pointer_matches(Type *type,
+                                        MtlcTensorElement element);
+Type *type_checker_tensor_epilogue_builtin(TypeChecker *checker,
+                                           ASTNode *expression,
+                                           CallExpression *call,
+                                           int *handled);
+
 Type *type_checker_parse_function_pointer_type(TypeChecker *checker,
                                                       const char *name);
 
@@ -211,5 +233,11 @@ int type_checker_check_for_statement(TypeChecker *checker,
 
 int type_checker_check_switch_statement(TypeChecker *checker,
                                                ASTNode *statement);
+
+/* Check and fold an aggregate literal against the type it initializes
+ * (type_checker_aggregate.c). On success the literal's folded byte image and
+ * relocations are attached to the node and `target` is returned. */
+Type *type_checker_check_aggregate_literal(TypeChecker *checker,
+                                           ASTNode *expression, Type *target);
 
 #endif // TYPE_CHECKER_INTERNAL_H

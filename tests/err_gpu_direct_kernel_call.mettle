@@ -1,0 +1,7 @@
+kernel child(out: int32*) {
+  out[0] = 1;
+}
+
+kernel parent(out: int32*) {
+  child(out);
+}

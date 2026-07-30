@@ -1,6 +1,7 @@
 #ifndef SYMBOL_TABLE_H
 #define SYMBOL_TABLE_H
 
+#include "mtlc/memory.h"
 #include <stddef.h>
 #include <string.h>
 
@@ -94,6 +95,8 @@ typedef struct Symbol {
   int is_forward_declaration; // For functions that are declared but not defined
   int is_extern;              // For extern declarations (C interop)
   int is_immutable;           // For local `const`: reassignment is rejected
+  int is_address_space_binding; // Fixed GPU storage binding; elements stay mutable
+  MtlcAddressSpace address_space; // Neutral GPU storage provenance when known
   int is_builtin;             // Compiler-provided (assert/assert_eq test builtins)
   char *link_name;            // Link-time symbol name for extern declarations
   /* Declaration site, for "previous declaration here" / "defined here"

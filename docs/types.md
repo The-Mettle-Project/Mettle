@@ -8,7 +8,7 @@ The following sizes and alignments apply on x86-64. Use these when laying out st
 
 | Type | Size | Alignment |
 |------|------|-----------|
-| `int8`, `uint8` | 1 | 1 |
+| `int8`, `uint8`, `bool` | 1 | 1 |
 | `int16`, `uint16` | 2 | 2 |
 | `int32`, `uint32`, `float32` | 4 | 4 |
 | `int64`, `uint64`, `float64`, pointers, plain enums | 8 | 8 |
@@ -23,6 +23,16 @@ Signed integers: `int8`, `int16`, `int32`, `int64` (1, 2, 4, 8 bytes). Unsigned 
 **Integer overflow:** The compiler emits native x86-64 arithmetic instructions. Signed integer overflow wraps (two's complement); there is no trap or runtime check. Unsigned overflow wraps modulo 2^n. Assembly programmers can rely on wrap-around behavior.
 
 **Integer literal default type:** When the context does not disambiguate, integer literals default to `int32`. Floating-point literals default to `float64`. Examples: `42` has type `int32`; `3.14` has type `float64`. In expressions like `var x: int64 = 42`, the literal is implicitly converted to the expected type.
+
+**Boolean:** `bool` is a built-in 1-byte type with the two built-in constants `true` and `false`. It is distinct from `uint8`: a `switch` over a `bool` must cover both `true` and `false` unless it has a `default`. Note that comparison operators do not produce `bool`; they produce an `int32` that is 0 or 1, and conditions in `if`, `while`, and `for` accept any numeric type rather than requiring `bool`.
+
+```mettle
+var ready: bool = true;
+switch (ready) {
+  case true:  return 1;
+  case false: return 0;
+}
+```
 
 ## Pointer Types
 
@@ -105,7 +115,7 @@ var seven: int32 = add(3, 4);
 var product: int32 = apply(fn(x: int32, y: int32) -> int32 { return x * y; }, 6, 7);
 ```
 
-A non-capturing lambda has the same `fn(params) -> ret` type as a named function and is a plain function pointer, so it is usable anywhere a function pointer is (including C callbacks). A return type is required; the body is a normal block.
+A non-capturing lambda has the same `fn(params) -> ret` type as a named function and is a plain function pointer, so it is usable anywhere a function pointer is (including C callbacks). The body is a normal block. The return type may be omitted, in which case it defaults to `void`; write it explicitly whenever the lambda returns a value, since an omitted type silently makes the lambda `void` rather than inferring from the `return` statement.
 
 ### Closures
 
@@ -191,7 +201,11 @@ Fixed-size arrays use `[N]` where N is a constant. Arrays are value types; the e
 ```mettle
 var arr: int32[10];
 var buf: uint8[256];
+var table: int32[4] = [10, 20, 30, 40];
+const ZEROED: uint8[256] = [0; 256];
 ```
+
+An array may be initialized with an [aggregate literal](expressions.md#aggregate-literals); left uninitialized, it starts zeroed.
 
 **Out-of-bounds indexing:** The compiler rejects constant out-of-bounds indexes for fixed-size arrays (for example `arr[10]` on `int32[10]`). For dynamic indices on fixed-size arrays, normal builds emit runtime bounds checks. In `--release`, those generated bounds checks are disabled. Pointer indexing is never bounds-checked because pointee extent is unknown.
 
@@ -226,6 +240,8 @@ struct SockAddrIn {
   sin_zero: uint8[8];
 }
 ```
+
+A struct value is written with an [aggregate literal](expressions.md#aggregate-literals): `var p: Point = { x: 1, y: 2 };`. Fields may appear in any order, and any field left out stays zero.
 
 For C interop, match the C struct layout exactly (field order, types, padding).
 
@@ -290,12 +306,16 @@ struct Pair<A, B> {
   second: B;
 }
 
-function identity<T>(x: T) -> T {
+fn identity<T>(x: T) -> T {
   return x;
 }
 
-var p: Pair<int32, int32>;           // struct instantiation
-var n: int32 = identity<int32>(42);  // function call with type args
+fn main() -> int32 {
+  var p: Pair<int32, int32>;           // struct instantiation
+  var n: int32 = identity<int32>(42);  // function call with type args
+  p.first = n;
+  return p.first;
+}
 ```
 
 The compiler performs **monomorphization** before type checking: each unique instantiation becomes a concrete type or function. There is no runtime generics; all type parameters are resolved at compile time.
@@ -313,7 +333,7 @@ impl Incrementable for int32 {
   }
 }
 
-function bump<T>(x: T) -> T where T: Incrementable {
+fn bump<T>(x: T) -> T where T: Incrementable {
   return x.next_value();
 }
 ```

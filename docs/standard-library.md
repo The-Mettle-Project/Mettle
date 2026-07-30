@@ -4,7 +4,7 @@ The standard library lives under `stdlib/`. Modules are imported by path. The `s
 
 ## Platform Support
 
-The compiler and most stdlib modules work on Linux and Windows. The compiler emits `elf64` assembly on Linux and `win64` on Windows. Use `make` to build the compiler on Linux and macOS; use `build.bat` on Windows.
+The compiler and most stdlib modules work on Linux and Windows. libmtlc emits native `elf64` objects on Linux and `win64` (COFF) objects on Windows, with no external assembler. Use `make` to build the toolchain on Linux and macOS; use `build.bat` on Windows.
 
 **Cross-platform modules:** `std/io`, `std/mem`, `std/math`, `std/conv`, and `std/process` use the C runtime and work on both Linux and Windows.
 
@@ -22,7 +22,35 @@ Memory management. C runtime functions: `malloc`, `calloc`, `realloc`, `free`, `
 
 ## std/math
 
-Math utilities. `abs` (C runtime). `min`, `max`, `clamp` (integer operations on int64).
+Mathematics, implemented entirely in Mettle. Nothing in this module binds a C math library: the elementary functions are built from IEEE 754 bit manipulation, argument reduction, and polynomial kernels.
+
+**Bit access.** `f64_bits`, `f64_from_bits`, `f64_raw_exponent`, `ldexp`, `frexp`. `INF`, `NAN`.
+
+**Constants** (functions, because top-level `const` is restricted to integers): `PI`, `TAU`, `HALF_PI`, `QUARTER_PI`, `E`, `SQRT2`, `SQRT1_2`, `LN2`, `LN10`, `LOG2E`, `LOG10E`, `LOG10_2`, `EPSILON`, `F32_EPSILON`, `MAX_FINITE`, `MIN_POSITIVE`, `DEG_PER_RAD`, `RAD_PER_DEG`.
+
+**Classification.** `is_nan`, `is_inf`, `is_finite`, `signbit`.
+
+**Sign and magnitude.** `fabs`, `copysign`, `fsign`, `fmin`, `fmax`, `fclamp`, `saturate`.
+
+**Rounding.** `floor`, `ceil`, `trunc`, `round` (halfway away from zero), `fract`, `fmod` (exact, by scaled subtraction).
+
+**Roots and powers.** `sqrt`, `rsqrt`, `cbrt`, `hypot` (overflow-safe), `pow` (exact for integer exponents by repeated squaring).
+
+**Exponential and logarithm.** `exp`, `exp2`, `expm1`, `log`, `log2`, `log10`, `log1p`. `expm1` and `log1p` avoid the cancellation that `exp(x)-1` and `log(1+x)` suffer near zero.
+
+**Trigonometry.** `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, and the hyperbolics `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`.
+
+**Angles.** `degrees`, `radians`, `wrap`, `wrap_angle`, `angle_diff`.
+
+**Interpolation.** `lerp`, `inv_lerp`, `remap`, `smoothstep`, `smootherstep`.
+
+**Comparison.** `approx_eq` (combined absolute and relative tolerance), `approx_zero`.
+
+**Integers.** `abs`, `labs`, `min`, `max`, `clamp`, `isign`, `ipow`, `isqrt`, `gcd`, `lcm`, `is_pow2`, `next_pow2`, `ilog2`, `idiv_floor` and `imod_floor` (round toward negative infinity, unlike the truncating `/` and `%`).
+
+**float32 helpers.** `f32_abs`, `f32_min`, `f32_max`, `f32_clamp`, `f32_lerp`, `f32_sqrt`.
+
+Accuracy: kernels carry enough terms that truncation error sits below the rounding error, giving roughly 1 ulp across the normal range. Trigonometric argument reduction uses a two-part split of pi/2, which holds full precision to about |x| = 1e8 and degrades beyond that. `tests/test_std_math.mettle` checks the module against independently computed reference values and identity sweeps, at both optimization levels.
 
 ## std/conv
 
@@ -223,9 +251,9 @@ on the GPU. Thin bindings over `nvcuda` (the OS driver, no `cudart`, no `nvcc`).
 Link the driver import stub at build time (`--link-arg <CUDA>/lib/x64/cuda.lib`
 on Windows; `-lcuda` on Linux).
 
-Raw bindings: `cuInit`, `cuDeviceGet`, `cuCtxCreate_v2`, `cuModuleLoadData`,
-`cuModuleGetFunction`, `cuMemAlloc_v2`, `cuMemFree_v2`, `cuMemcpyHtoD_v2`,
-`cuMemcpyDtoH_v2`, `cuLaunchKernel`, `cuCtxSynchronize`.
+Raw bindings cover context/device queries, module loading, device/managed and
+stream-ordered allocation, blocking/asynchronous copies, streams, events,
+kernel launch, and synchronization.
 
 Helpers (return handles directly; `0` on failure):
 
@@ -234,11 +262,21 @@ Helpers (return handles directly; `0` on failure):
   null-terminated PTX image in host memory.
 - `gpu_func(mod: int64, name: cstring) -> int64`: resolve a kernel by name.
 - `gpu_malloc(bytes: int64) -> int64`, `gpu_free(dptr: int64)`.
+- `gpu_managed_malloc` / `gpu_managed_free`: one unified-address pointer for
+  the host and GPU (important on GB10 UMA).
+- `gpu_malloc_async` / `gpu_free_async`: stream-ordered allocation.
 - `gpu_to_device(dst: int64, src: uint8*, bytes: int64)`,
   `gpu_to_host(dst: uint8*, src: int64, bytes: int64)`.
+- `gpu_stream_create`, `gpu_stream_sync`, `gpu_stream_destroy`, asynchronous
+  copy helpers, and event create/record/wait/timing helpers.
 - `gpu_sync()`: wraps `cuCtxSynchronize`.
-- `gpu_launch(f, grid, block, params, nargs)`: the primitive the
-  [`dispatch`](gpu.md) statement lowers to (1-D `cuLaunchKernel` + synchronize).
+- `mtlc_gpu_launch_checked`: stable checked provider ABI used by semantic
+  [`dispatch`](gpu.md); the CUDA provider maps its 3-D launch descriptor to
+  `cuLaunchKernel` and terminates on enqueue failure.
+- `gpu_launch(f, grid, block, params, nargs)`: low-level asynchronous 1-D
+  helper returning CUDA's status for manual error handling.
+- `gpu_launch_on` and `gpu_launch_3d`: explicit stream, 3-D geometry, and
+  dynamic shared-memory launch configuration.
 
 See [GPU Offload](gpu.md) for kernel syntax (`kernel`, `thread.x`, `dispatch`)
 and a complete example.

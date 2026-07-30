@@ -1,0 +1,73 @@
+kernel tensor_sparse_f16_2to4(a: uint16*, b: uint16*, c: float32*,
+                              d: float32*, metadata: uint8*) {
+  tensor_mma(a, b, c, d,
+             shape: m16n16k16,
+             input_type: f16,
+             output_type: f32,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: 8, ldb: 16, ldc: 16, ldd: 16,
+             sparsity: structured_2_to_4,
+             metadata: metadata);
+}
+
+kernel tensor_sparse_bf16_2to4(a: uint16*, b: uint16*, c: float32*,
+                               d: float32*, metadata: uint8*) {
+  tensor_mma(a, b, c, d,
+             shape: m16n16k16,
+             input_type: bf16,
+             output_type: f32,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             sparsity: structured_2_to_4,
+             metadata: metadata);
+}
+
+// The optimizer must retain the same neutral sparse descriptor and metadata
+// operand when it forms an exact accumulator-resident chain.
+kernel tensor_sparse_chain2(a: uint16*, b: uint16*, c: float32*,
+                            d: float32*, metadata: uint8*) {
+  tensor_mma(a, b, c, d,
+             shape: m16n16k16,
+             input_type: f16,
+             output_type: f32,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             sparsity: structured_2_to_4,
+             metadata: metadata);
+  tensor_mma(a, b, d, d,
+             shape: m16n16k16,
+             input_type: f16,
+             output_type: f32,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             sparsity: structured_2_to_4,
+             metadata: metadata);
+}
+
+// Likewise, sparse semantics survive the backend-neutral single-update loop
+// residency transform. Reusing one tile keeps this test about representation
+// and control-flow legality rather than prescribing a tiled storage policy.
+kernel tensor_sparse_runtime_k(a: uint16*, b: uint16*, c: float32*,
+                               d: float32*, metadata: uint8*, k: int32) {
+  tensor_mma(a, b, c, d,
+             shape: m16n16k16,
+             input_type: f16,
+             output_type: f32,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             sparsity: structured_2_to_4,
+             metadata: metadata);
+  var inner: int32 = 16;
+  while (inner < k) {
+    tensor_mma(a, b, d, d,
+               shape: m16n16k16,
+               input_type: f16,
+               output_type: f32,
+               a_layout: row, b_layout: col,
+               c_layout: row, d_layout: row,
+               sparsity: structured_2_to_4,
+               metadata: metadata);
+    inner = inner + 16;
+  }
+}

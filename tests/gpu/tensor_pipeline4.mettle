@@ -1,0 +1,56 @@
+// Four independently committed tiles prove that pipeline residency is a
+// verified sequence, not a hard-coded two-MMA peephole. Each wait releases one
+// more staged tile while the remaining groups stay eligible for overlap.
+kernel tensor_pipeline4_f16_f32(a: uint16*, b: uint16*,
+                                c: float32*, d: float32*) {
+  workgroup var a_stage: uint16[1024];
+  workgroup var b_stage: uint16[1024];
+  var lane: int32 = thread.x;
+  var base: int32 = lane * 8;
+
+  async_copy_workgroup(&a_stage[base], a + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_workgroup(&b_stage[base], b + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_commit();
+  async_copy_workgroup(&a_stage[256 + base], a + 256 + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_workgroup(&b_stage[256 + base], b + 256 + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_commit();
+  async_copy_workgroup(&a_stage[512 + base], a + 512 + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_workgroup(&b_stage[512 + base], b + 512 + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_commit();
+  async_copy_workgroup(&a_stage[768 + base], a + 768 + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_workgroup(&b_stage[768 + base], b + 768 + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_commit();
+
+  async_copy_wait(3);
+  barrier(workgroup, acq_rel);
+  tensor_mma(&a_stage[0], &b_stage[0], c, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: 16, ldb: 16, ldc: 16, ldd: 16);
+  async_copy_wait(2);
+  barrier(workgroup, acq_rel);
+  tensor_mma(&a_stage[256], &b_stage[256], d, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: 16, ldb: 16, ldc: 16, ldd: 16);
+  async_copy_wait(1);
+  barrier(workgroup, acq_rel);
+  tensor_mma(&a_stage[512], &b_stage[512], d, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: 16, ldb: 16, ldc: 16, ldd: 16);
+  async_copy_wait(0);
+  barrier(workgroup, acq_rel);
+  tensor_mma(&a_stage[768], &b_stage[768], d, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: 16, ldb: 16, ldc: 16, ldd: 16);
+}

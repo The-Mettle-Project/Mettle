@@ -11,8 +11,12 @@ var x: int32;
 var y: int32 = 42;
 var msg: string = "hello";
 var buf: uint8[1024];
+var table: int32[4] = [10, 20, 30, 40];
+var origin: Pt = { x: 1.0, y: 2.0 };
 var z = 1 + 2;              // ERROR: 'z' requires an explicit type
 ```
+
+Arrays and structs may be initialized with an [aggregate literal](expressions.md#aggregate-literals), or left uninitialized, in which case they start zeroed.
 
 (Only two kinds of binding get their type structurally rather than by annotation: a range-`for` loop counter takes the type of its bound, and a top-level `const` - which is integer-only - takes its literal's type. Neither is inferred from an arbitrary expression.)
 
@@ -32,9 +36,20 @@ fn main() -> int32 {
 }
 ```
 
-A **top-level** `const` must have integer type. It is folded directly into the machine code at every use site and occupies no storage, so its initializer must be a compile-time constant integer expression: integer literals, `sizeof`, other constants, and arithmetic, bitwise, and comparison operators over them. Because it is integer-only and its value is a compile-time literal, a top-level `const` may omit the type annotation. A **local** `const` must state its type, like any local binding.
+A **top-level** `const` of **integer** type is folded directly into the machine code at every use site and occupies no storage, so its initializer must be a compile-time constant integer expression: integer literals, `sizeof`, other constants, and arithmetic, bitwise, and comparison operators over them. Because its value is a compile-time literal, an integer top-level `const` may omit the type annotation. A **local** `const` must state its type, like any local binding.
 
-A **local** (function-scope) `const` may have any type: integer, float, string, or aggregate. It is an immutable binding backed by normal local storage, so its initializer follows the same rules as any local variable initializer. Global float, string, and aggregate constants are not yet supported; use a top-level `var` or a function-local `const`.
+A top-level `const` of any other type gets normal storage in the object file, initialized to its value. Float, string, and **aggregate** constants all work at global scope:
+
+```mettle
+const RATE: float64 = 1.5;
+const LABEL: string = "ready";
+const TABLE: int32[4] = [10, 20, 30, 40];
+const ORIGIN: Pt = { x: 1.0, y: 2.0 };
+```
+
+Because a global's storage is laid out at compile time, an aggregate one must be initialized with an [aggregate literal](expressions.md#aggregate-literals) whose elements are all compile-time constants. A call has nothing to lay out and is rejected with a source location. There is no module initializer that could run one.
+
+A **local** (function-scope) `const` may have any type, and its initializer follows the same rules as any local variable initializer, so it may be a call.
 
 ## Functions
 
@@ -71,12 +86,17 @@ to the `fn` (or `export fn`) that follows.
 | `@pure` | Assert the function is free of side effects **and** safe to evaluate speculatively (it neither writes observable state nor traps in a way that depends on being reached). The optimizer may then evaluate a call once before a loop and reuse the result — see below. |
 | `@noalloc` | **Contract**: the function — and everything it can reach through direct calls — performs zero heap allocations, or compilation fails pointing at the allocation. This is a proof, not a lint: `new`, string `+` concatenation, allocator calls (`malloc`/`calloc`/...), calls to externs not known to be allocation-free, and calls through function pointers anywhere in the reachable graph all violate it. Known-clean libm/memory externs (`sqrtf`, `memcpy`, ...) are allowed. |
 | `@simd` / `@simd!` | Apply a vectorization contract to every counted loop in the body — see [Vectorization contracts](control-flow.md#vectorization-contracts). |
+| `@test` | Mark a compile-time unit test. The function takes no parameters, returns `int64`, and treats `0` as pass. It is type-checked in every build but compiled out of normal binaries, and `mettle test` runs it in the compiler's IR interpreter. See [Testing](testing.md). |
 
 `@inline` and `@noinline` are mutually exclusive. Applying `@inline`,
 `@noinline`, `@pure`, or `@noalloc` to anything other than a function — a loop,
-a struct, an `extern` function — is a compile error. Decorators have effect
-only under `-O` / `--release` (a note reminds you when contracts go
-unverified in a debug build).
+a struct, an `extern` function — is a compile error. Only `@simd` and `@simd!`
+may be attached to a statement, and only to a `for` or `while` loop. When a
+declaration is both decorated and exported, the decorators come first
+(`@inline export fn f()`, never `export @inline fn f()`). Decorators have
+effect only under `-O` / `--release` (a note reminds you when contracts go
+unverified in a debug build); `@test` is the exception, since it changes what
+is compiled in every build.
 
 ### `@pure` and loop-invariant call hoisting
 
@@ -105,10 +125,10 @@ non-speculation-safe function `@pure` is a program error.
 
 ## Generic Functions
 
-Functions can declare type parameters in angle brackets before the parameter list. Call sites must provide type arguments: `f<T>(args)` or `f<int32>(args)`.
+Functions can declare type parameters in angle brackets before the parameter list. A generic function is declared with `fn`, like any other; there is no separate `function` keyword. Call sites must provide type arguments: `f<T>(args)` or `f<int32>(args)`.
 
 ```mettle
-function swap<T>(a: T*, b: T*) -> void {
+fn swap<T>(a: T*, b: T*) -> void {
   var tmp: T = *a;
   *a = *b;
   *b = tmp;

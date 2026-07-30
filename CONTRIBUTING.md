@@ -1,8 +1,21 @@
 # Contributing to Mettle
 
 Thanks for your interest in Mettle, a from-scratch systems language that compiles
-straight to native x86-64 with its own backend, linker, and debugger. No LLVM, no VM,
-no managed runtime. This guide covers how to build, test, and land changes.
+straight to native x86-64. No LLVM, no VM, no managed runtime. This guide covers how
+to build, test, and land changes.
+
+## Where the change belongs
+
+This repository is the **frontend**: the language, the type system, the memory safety
+analysis, IR lowering, the driver, and the standard library. The **backend** is
+[libmtlc](https://github.com/The-Mettle-Project/libmtlc): the IR itself, the
+optimizers, code generation, and linking.
+
+A change to an optimizer pass, an instruction encoding, the register allocator, or the
+PE/ELF writers goes **upstream to libmtlc**, not here. A change to syntax, type
+checking, diagnostics, lowering, the driver, or the stdlib goes here.
+[docs/mettle-and-libmtlc.md](docs/mettle-and-libmtlc.md) has the full boundary and the
+sync workflow.
 
 ## Ground rules
 
@@ -11,9 +24,9 @@ through LLVM, Cranelift, or GNU `as`, not even as a reference oracle. Instructio
 hand-built from the ISA. `ptxas` (for the PTX/GPU path) and QEMU (for AArch64 testing)
 are the only accepted external tools.
 
-Correctness comes first. A miscompile is the worst possible bug, so any change to the
-IR, optimizer, register allocator, or backend must keep debug and release output in
-agreement (see the differential fuzzer below).
+Correctness comes first. A miscompile is the worst possible bug, so any change to
+lowering, or to the backend upstream, must keep debug and release output in agreement
+(see the differential fuzzer below).
 
 The compiler stays in C99. Everything under `src/` builds with `-std=c99 -Wall -Wextra`
 and must compile clean under both GCC and Clang, on Windows and Linux.
@@ -21,17 +34,34 @@ and must compile clean under both GCC and Clang, on Windows and Linux.
 ## Repository layout
 
 ```
-src/            compiler: lexer, parser, semantic, IR + optimizer, codegen, linker, debug
+src/lexer/      lexer
+src/parser/     parser and AST
+src/semantic/   imports, monomorphization, type checking, memory safety
+src/ir/         AST to IR lowering (the IR itself is libmtlc's)
+src/frontend/   adapters from Mettle types onto the backend's
+src/main.c      the compiler driver
 src/runtime/    optional helper objects linked into user programs (crash traces, atomics, ...)
 stdlib/         standard library (.mettle modules)
 tests/          regression tests; run_tests.ps1 on Windows
-tools/          ELF tests, benchmarks, fuzz scripts, ML optimizer
+tools/          ELF tests, benchmarks, fuzz scripts, ML optimizer, upstream sync
 examples/       runnable samples and benchmarks
 docs/           language and tooling reference
 mettle-syntax/  VS Code extension
+libmtlc/        the backend dependency (fetched, gitignored)
 ```
 
 ## Building the compiler
+
+First, get the backend. It downloads the revision pinned in `libmtlc.version` and
+builds the static archive; after that the build needs no network.
+
+```powershell
+.\get-libmtlc.ps1           # Windows
+```
+
+```bash
+./get-libmtlc.sh            # Linux, macOS
+```
 
 On Windows, the primary target, build with GCC or Clang via MinGW-w64 or LLVM:
 
@@ -41,9 +71,10 @@ On Windows, the primary target, build with GCC or Clang via MinGW-w64 or LLVM:
 .\build.bat --skip-tests    # build only
 ```
 
-`build.bat` starts from a clean `obj\` tree, compiles every module, links
-`bin\mettle.exe`, and bundles `stdlib/` and the runtime objects into `bin\`. Run it
-from PowerShell (`build.bat` under Bash no-ops on some setups).
+`build.bat` starts from a clean `obj\` tree, compiles the frontend, links
+`bin\mettle.exe` against the libmtlc archive, and bundles `stdlib/` and the runtime
+objects into `bin\`. Run it from PowerShell (`build.bat` under Bash no-ops on some
+setups).
 
 On Linux or macOS the compiler builds on the host, and codegen still targets x86-64
 Windows and Linux:
@@ -55,8 +86,24 @@ make clean
 ```
 
 Both builds use `-O2 -g -fno-omit-frame-pointer`. When you add a new `.c` file, register
-it in both `build.bat` and the `Makefile`; files under `src/ir/` and `src/ir/optimizer/`
-are picked up by wildcard automatically.
+it in `build.bat`, the `Makefile`, and `$FrontendFiles` in
+`tools/sync-from-libmtlc.ps1`.
+
+### Working on both halves at once
+
+Point `LIBMTLC_DIR` at a libmtlc checkout and the build uses it directly, with no
+download and nothing cached in between:
+
+```powershell
+$env:LIBMTLC_DIR = "..\libmtlc"; .\build.bat
+```
+
+```bash
+make LIBMTLC_DIR=../libmtlc
+```
+
+A frontend change made in that checkout comes back here with
+`.\tools\sync-from-libmtlc.ps1 -LibmtlcDir ..\libmtlc`.
 
 ## Testing
 
@@ -78,14 +125,15 @@ bash tools/test-elf-native.sh
 make test                            # crash-handler unit test
 ```
 
-### Differential fuzzer (required for codegen/optimizer changes)
+### Differential fuzzer (required for anything that changes generated code)
 
-Any change touching the IR, optimizer, register allocator, or a backend must be run
-through the debug-vs-release miscompile fuzzer in `tools/fuzz/`. It compiles generated
-programs at `-O0` and `--release` and diffs the results; `METTLE_SKIP_PASS` bisects
-which pass introduced a divergence. A single silent miscompile that escapes review is
-worse than a missed optimization. The nightly workflow runs the heavy sweep; run a
-local pass on anything that changes generated code.
+Any change touching lowering, or a bump of `libmtlc.version`, must be run through the
+debug-vs-release miscompile fuzzer in `tools/fuzz/`. It compiles generated programs at
+`-O0` and `--release` and diffs the results; `METTLE_SKIP_PASS` bisects which pass
+introduced a divergence. A single silent miscompile that escapes review is worse than a
+missed optimization. The nightly workflow runs the heavy sweep; run a local pass on
+anything that changes generated code, including a backend version bump, since that is
+exactly when a backend regression would land here.
 
 ## Making changes
 

@@ -38,6 +38,18 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Cache libmtlc
+        uses: actions/cache@v4
+        with:
+          path: libmtlc
+          key: libmtlc-windows-gcc-${{ hashFiles('libmtlc.version') }}
+
+      - name: Fetch and build libmtlc backend
+        shell: pwsh
+        env:
+          METTLE_NO_CODEVIEW: "1"
+        run: .\get-libmtlc.ps1
+
       - name: Build compiler
         shell: pwsh
         # METTLE_NO_CODEVIEW avoids a MinGW gcc ICE in the CodeView emitter.

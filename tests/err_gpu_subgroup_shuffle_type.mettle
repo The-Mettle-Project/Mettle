@@ -1,0 +1,3 @@
+kernel bad_subgroup_shuffle(out: int32*) {
+  out[0] = subgroup_shuffle(7, (uint32)0);
+}

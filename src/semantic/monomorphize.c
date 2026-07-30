@@ -1,9 +1,9 @@
 #include "monomorphize.h"
-#include "../common.h"
-#include "../string_intern.h"
-#include "../common.h"
-#include "../lexer/lexer.h"
-#include "../parser/parser.h"
+#include "common.h"
+#include "string_intern.h"
+#include "common.h"
+#include "lexer/lexer.h"
+#include "parser/parser.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -783,6 +783,17 @@ static void record_generic_type_use(MonoContext *ctx, const char *type_name,
     return;
   }
 
+  /* A type argument may itself be a generic instantiation, as in
+   * `Pair<Box<int32>, int32>`. Substitution already mangles the field type to
+   * `Box__int32`, but nothing ever asked for `Box<int32>` to be generated, so
+   * the field referred to a struct that did not exist. Record the arguments
+   * BEFORE the type that uses them: emission follows list order, and Mettle
+   * requires a type to be declared before it is used, so `Box__int32` has to
+   * land in the program ahead of the struct whose field names it. */
+  for (size_t i = 0; i < arg_count; i++) {
+    record_generic_type_use(ctx, args[i], location);
+  }
+
   mono_add_instantiation(ctx, base, args, arg_count, location);
   free(base);
   free_string_array(args, arg_count);
@@ -1062,6 +1073,21 @@ static void substitute_types_in_ast(ASTNode *node, char **param_names,
     }
     break;
   }
+  case AST_CAST_EXPRESSION: {
+    CastExpression *ce = (CastExpression *)node->data;
+    if (ce) {
+      if (ce->type_name) {
+        char *new_type = substitute_type_string(ce->type_name, param_names,
+                                                arg_names, count, ctx);
+        if (new_type) {
+          mettle_free_string(ce->type_name);
+          ce->type_name = new_type;
+        }
+      }
+      substitute_types_in_ast(ce->operand, param_names, arg_names, count, ctx);
+    }
+    break;
+  }
   case AST_BINARY_EXPRESSION: {
     BinaryExpression *be = (BinaryExpression *)node->data;
     if (be) {
@@ -1101,6 +1127,12 @@ static void substitute_types_in_ast(ASTNode *node, char **param_names,
       substitute_types_in_ast(ds->statement, param_names, arg_names, count, ctx);
     break;
   }
+  case AST_GPU_LAUNCH:
+    for (size_t i = 0; i < node->child_count; i++) {
+      substitute_types_in_ast(node->children[i], param_names, arg_names, count,
+                              ctx);
+    }
+    break;
   default:
     break;
   }
@@ -1342,6 +1374,12 @@ static void collect_type_instantiations(ASTNode *node, MonoContext *ctx) {
     }
     break;
   }
+  case AST_CAST_EXPRESSION: {
+    CastExpression *ce = (CastExpression *)node->data;
+    if (ce && ce->operand)
+      collect_type_instantiations(ce->operand, ctx);
+    break;
+  }
   case AST_BINARY_EXPRESSION: {
     BinaryExpression *be = (BinaryExpression *)node->data;
     if (be) {
@@ -1379,6 +1417,11 @@ static void collect_type_instantiations(ASTNode *node, MonoContext *ctx) {
       collect_type_instantiations(ds->statement, ctx);
     break;
   }
+  case AST_GPU_LAUNCH:
+    for (size_t i = 0; i < node->child_count; i++) {
+      collect_type_instantiations(node->children[i], ctx);
+    }
+    break;
   default:
     break;
   }
@@ -1587,6 +1630,12 @@ static void rewrite_generic_references(ASTNode *node, MonoContext *ctx) {
     }
     break;
   }
+  case AST_CAST_EXPRESSION: {
+    CastExpression *ce = (CastExpression *)node->data;
+    if (ce && ce->operand)
+      rewrite_generic_references(ce->operand, ctx);
+    break;
+  }
   case AST_BINARY_EXPRESSION: {
     BinaryExpression *be = (BinaryExpression *)node->data;
     if (be) {
@@ -1624,6 +1673,11 @@ static void rewrite_generic_references(ASTNode *node, MonoContext *ctx) {
       rewrite_generic_references(ds->statement, ctx);
     break;
   }
+  case AST_GPU_LAUNCH:
+    for (size_t i = 0; i < node->child_count; i++) {
+      rewrite_generic_references(node->children[i], ctx);
+    }
+    break;
   default:
     break;
   }
@@ -2060,6 +2114,137 @@ static int mono_emit_impl_method_functions(MonoContext *ctx, ASTNode *program) {
     }
   }
 
+  return 1;
+}
+
+/* `struct S { method m(a: T) -> R { ... } }` is called as `s.m(x)`, which the
+ * type checker rewrites into a plain call to `S_m(s, x)`. Nothing ever created
+ * S_m: the parser stored the method on the struct declaration and every later
+ * pass ignored it, so the documented form failed with "Undefined method 'S.m'
+ * (expected function 'S_m')" and methods only worked if you hand-wrote the free
+ * function yourself.
+ *
+ * Lift each one into that free function: name it `S_m`, give it the receiver as
+ * a leading parameter named `this` (which is what the body already calls it,
+ * and which the parser will not accept as a user-written parameter name), and
+ * append it to the program. The body moves across rather than being cloned --
+ * the struct declaration keeps the method node for diagnostics, but its body
+ * now belongs to the lifted function, so it is detached here to keep a single
+ * owner.
+ *
+ * The receiver is passed by value, matching the call-site rewrite, which passes
+ * the object expression as the first argument. `p->m()` already desugars to
+ * `(*p).m()` in the parser, so a pointer receiver arrives dereferenced. */
+static int mono_lift_struct_methods(MonoContext *ctx, Program *prog,
+                                    ASTNode *program) {
+  size_t original_count = prog->declaration_count;
+  for (size_t d = 0; d < original_count; d++) {
+    ASTNode *decl = prog->declarations[d];
+    if (!decl || decl->type != AST_STRUCT_DECLARATION) {
+      continue;
+    }
+    StructDeclaration *sd = (StructDeclaration *)decl->data;
+    if (!sd || !sd->name || sd->method_count == 0) {
+      continue;
+    }
+    /* A generic template is removed from the program after instantiation; its
+     * methods would name type parameters that no longer exist. */
+    if (sd->type_param_count > 0) {
+      continue;
+    }
+
+    for (size_t m = 0; m < sd->method_count; m++) {
+      ASTNode *method = sd->methods[m];
+      if (!method || !method->data) {
+        continue;
+      }
+      FunctionDeclaration *md = (FunctionDeclaration *)method->data;
+      if (!md || !md->name || !md->body) {
+        continue;
+      }
+
+      size_t mangled_len = strlen(sd->name) + 1 + strlen(md->name) + 1;
+      char *mangled = malloc(mangled_len);
+      if (!mangled) {
+        mono_report_error(ctx, method->location,
+                          "Out of memory lifting a struct method");
+        return 0;
+      }
+      snprintf(mangled, mangled_len, "%s_%s", sd->name, md->name);
+
+      size_t count = md->parameter_count + 1;
+      char **names = calloc(count, sizeof(char *));
+      char **types = calloc(count, sizeof(char *));
+      if (!names || !types) {
+        free(mangled);
+        free(names);
+        free(types);
+        mono_report_error(ctx, method->location,
+                          "Out of memory lifting a struct method");
+        return 0;
+      }
+      names[0] = mettle_strdup("this");
+      types[0] = mettle_strdup(sd->name);
+      int copied_ok = names[0] != NULL && types[0] != NULL;
+      for (size_t p = 0; copied_ok && p < md->parameter_count; p++) {
+        names[p + 1] = mettle_strdup(md->parameter_names[p]);
+        types[p + 1] = mettle_strdup(md->parameter_types[p]);
+        copied_ok = names[p + 1] != NULL && types[p + 1] != NULL;
+      }
+
+      ASTNode *fn_node = copied_ok
+                             ? ast_create_node(AST_FUNCTION_DECLARATION,
+                                               method->location)
+                             : NULL;
+      FunctionDeclaration *fn =
+          fn_node ? calloc(1, sizeof(FunctionDeclaration)) : NULL;
+      if (!fn) {
+        for (size_t p = 0; p < count; p++) {
+          mettle_free_string(names[p]);
+          mettle_free_string(types[p]);
+        }
+        free(names);
+        free(types);
+        free(mangled);
+        if (fn_node) {
+          ast_destroy_node(fn_node);
+        }
+        mono_report_error(ctx, method->location,
+                          "Out of memory lifting a struct method");
+        return 0;
+      }
+
+      fn->name = mangled;
+      fn->parameter_names = names;
+      fn->parameter_types = types;
+      fn->parameter_count = count;
+      fn->return_type =
+          md->return_type ? mettle_strdup(md->return_type) : NULL;
+      fn->body = md->body;
+      fn->is_inline = md->is_inline;
+      fn->is_inline_contract = md->is_inline_contract;
+      fn->is_noinline = md->is_noinline;
+      fn->is_pure = md->is_pure;
+      fn->is_noalloc = md->is_noalloc;
+      fn->simd_mode = md->simd_mode;
+      md->body = NULL; /* ownership moves to the lifted function */
+      fn_node->data = fn;
+      ast_add_child(fn_node, fn->body);
+
+      ASTNode **grown =
+          realloc(prog->declarations,
+                  (prog->declaration_count + 1) * sizeof(ASTNode *));
+      if (!grown) {
+        ast_destroy_node(fn_node);
+        mono_report_error(ctx, method->location,
+                          "Failed to append a lifted struct method");
+        return 0;
+      }
+      prog->declarations = grown;
+      prog->declarations[prog->declaration_count++] = fn_node;
+      ast_add_child(program, fn_node);
+    }
+  }
   return 1;
 }
 
@@ -3221,6 +3406,12 @@ int monomorphize_program(ASTNode *program, ErrorReporter *reporter) {
   }
 
   if (!mono_rewrite_trait_method_calls(&ctx, program)) {
+    success = 0;
+    goto cleanup;
+  }
+
+  /* After instantiation, so a monomorphized struct's methods are lifted too. */
+  if (!mono_lift_struct_methods(&ctx, prog, program)) {
     success = 0;
     goto cleanup;
   }

@@ -1,0 +1,22 @@
+@noinline fn many_live(a: int32, b: int32, c: int32, d: int32) -> int32 {
+  var v0: int32 = a + 1;   var v1: int32 = b + 2;   var v2: int32 = c + 3;
+  var v3: int32 = d + 4;   var v4: int32 = a * b;   var v5: int32 = c * d;
+  var v6: int32 = a - b;   var v7: int32 = c - d;   var v8: int32 = a ^ b;
+  var v9: int32 = c ^ d;   var v10: int32 = a | b;  var v11: int32 = c | d;
+  var v12: int32 = a & b;  var v13: int32 = c & d;  var v14: int32 = v0 + v1;
+  var v15: int32 = v2 + v3; var v16: int32 = v4 + v5; var v17: int32 = v6 + v7;
+  var v18: int32 = v8 + v9; var v19: int32 = v10 + v11;
+  return v0+v1+v2+v3+v4+v5+v6+v7+v8+v9+v10+v11+v12+v13+v14+v15+v16+v17+v18+v19;
+}
+@noinline fn many_floats(a: float64, b: float64) -> float64 {
+  var f0: float64 = a + 1.0; var f1: float64 = b + 2.0; var f2: float64 = a * b;
+  var f3: float64 = a - b;   var f4: float64 = a / 2.0; var f5: float64 = b / 4.0;
+  var f6: float64 = f0 + f1; var f7: float64 = f2 + f3; var f8: float64 = f4 + f5;
+  var f9: float64 = f6 + f7 + f8;
+  return f0+f1+f2+f3+f4+f5+f6+f7+f8+f9;
+}
+fn main() -> int32 {
+  if (many_live(2, 3, 4, 5) != 122) { return 1; }
+  if (many_floats(4.0, 8.0) != 141.0) { return 2; }
+  return 0;
+}

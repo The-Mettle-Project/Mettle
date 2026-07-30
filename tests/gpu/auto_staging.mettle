@@ -1,0 +1,11 @@
+// No async builtins appear here. -O recognizes the typed global load consumed
+// once by the workgroup store and sinks completion across independent scalar
+// work to the first acquire/release workgroup barrier.
+kernel auto_stage_u32(src: uint32*, out: uint32*) {
+  workgroup var tile: uint32[32];
+  var lane: int32 = thread.x;
+  tile[lane] = src[lane];
+  var mix: uint32 = (uint32)lane * (uint32)1664525 + (uint32)1013904223;
+  barrier(workgroup, acq_rel);
+  out[lane] = tile[(lane + 31) % 32] ^ mix;
+}

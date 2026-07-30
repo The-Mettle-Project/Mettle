@@ -1,0 +1,34 @@
+// The optimizer's constant folder evaluates in signed long long. A divide,
+// remainder, right shift, or ordering on an unsigned operand means something
+// different, so those must not fold that way: `var c: uint64 = 1e19; c / 2`
+// used to produce a negative result under -O while the unoptimized build
+// divided correctly. Signed operations must keep folding as before.
+
+fn main() -> int32 {
+  var a: uint64 = 10000000000000000000;
+  if (a / 2 != 5000000000000000000) { return 1; }
+  if (a % 3 != 1) { return 2; }
+  if (a >> 1 != 5000000000000000000) { return 3; }
+  var one: uint64 = 1;
+  if (a < one) { return 4; }
+  if (!(a > one)) { return 5; }
+  if (a <= one) { return 6; }
+  if (!(a >= one)) { return 7; }
+
+  var c: uint32 = 4294967295;
+  if (c / 2 != 2147483647) { return 8; }
+  if (c % 7 != 3) { return 9; }
+  if (c >> 4 != 268435455) { return 10; }
+  var d: uint32 = 1;
+  if (c < d) { return 11; }
+
+  var e: int64 = -8;
+  if (e / 2 != -4) { return 12; }
+  if (e >> 1 != -4) { return 13; }
+  var f: int32 = -7;
+  if (f / 2 != -3) { return 14; }
+  if (f % 2 != -1) { return 15; }
+  if (!(f < 0)) { return 16; }
+  if (f >> 1 != -4) { return 17; }
+  return 0;
+}

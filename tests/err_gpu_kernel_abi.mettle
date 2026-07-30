@@ -1,0 +1,7 @@
+struct Pair {
+  x: float32;
+  y: float32;
+}
+
+kernel invalid_parameter(pair: Pair) {
+}

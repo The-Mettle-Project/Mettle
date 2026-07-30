@@ -1,0 +1,23 @@
+enum Color { Red = 0, Green = 1, Blue = 7 }
+@noinline fn name_of(c: Color) -> int32 {
+  switch (c) {
+    case 0: return 100;
+    case 1: return 200;
+    case 7: return 700;
+    default: return -1;
+  }
+}
+@noinline fn pass_enum(c: Color) -> Color { return c; }
+var GC: Color = Blue;
+struct Holder { c: Color; n: int32; }
+fn main() -> int32 {
+  if (name_of(Red) != 100) { return 1; }
+  if (name_of(Blue) != 700) { return 2; }
+  if ((int32)pass_enum(Green) != 1) { return 3; }
+  if ((int32)GC != 7) { return 4; }
+  var h: Holder = { c: Blue, n: 3 };
+  if ((int32)h.c != 7 || h.n != 3) { return 5; }
+  var arr: Color[3] = [Red, Green, Blue];
+  if ((int32)arr[2] != 7) { return 6; }
+  return 0;
+}

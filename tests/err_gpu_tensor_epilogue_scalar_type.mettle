@@ -1,0 +1,3 @@
+kernel tensor_epilogue_wrong_scalar(d: float32*, alpha: float64) {
+  tensor_epilogue(d, shape: m16n16, element_type: f32, alpha: alpha);
+}

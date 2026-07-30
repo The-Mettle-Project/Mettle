@@ -1,0 +1,4 @@
+kernel bad_tensor_stride(a: uint16*, b: uint16*, c: float32*, d: float32*,
+                         lda: float32) {
+  tensor_mma(a, b, c, d, shape: m16n16k16, input_type: f16, output_type: f32, lda: lda);
+}

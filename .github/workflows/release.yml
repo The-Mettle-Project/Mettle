@@ -31,6 +31,14 @@ jobs:
         with:
           python-version: "3.12"
 
+      # The backend comes from libmtlc at the revision pinned in
+      # libmtlc.version, so a release records exactly which backend it shipped.
+      - name: Fetch and build libmtlc backend
+        shell: pwsh
+        env:
+          METTLE_NO_CODEVIEW: "1"
+        run: .\get-libmtlc.ps1
+
       # Build + full suite (build.bat runs the gate); a tag must pass tests to ship.
       # METTLE_VERSION stamps the version into the binary (build.bat reads it);
       # on a tag push it is the tag, otherwise the manual-dispatch label.
@@ -110,6 +118,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+
+      - name: Fetch and build libmtlc backend
+        run: ./get-libmtlc.sh
 
       - name: Build compiler
         run: |

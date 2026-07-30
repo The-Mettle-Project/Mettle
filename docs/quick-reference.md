@@ -74,6 +74,35 @@ fn main() -> int32 {
 }
 ```
 
+## With Constant Tables
+
+Arrays and structs are written with an [aggregate literal](expressions.md#aggregate-literals). At global scope the value is laid out in the object file's data, so a lookup table costs nothing at startup. `[value; count]` repeats one value.
+
+```mettle
+struct Pt {
+  x: float64;
+  y: float64;
+}
+
+struct Ops {
+  fast: fn(int32) -> int32;
+  slow: fn(int32) -> int32;
+}
+
+fn triple(v: int32) -> int32 { return v * 3; }
+fn quadruple(v: int32) -> int32 { return v * 4; }
+
+const SHIFTS: int32[8] = [7, 12, 17, 22, 5, 9, 14, 20];
+const SCRATCH: uint8[64] = [0; 64];
+const CORNERS: Pt[2] = [{ x: 0.0, y: 0.0 }, { x: 1.0, y: 1.0 }];
+const DISPATCH: Ops = { fast: &triple, slow: &quadruple };
+
+fn main() -> int32 {
+  var local: int32[4] = [1, 2, 3, 4];  // copied in from the same constant
+  return SHIFTS[0] + (int32)CORNERS[1].x + DISPATCH.fast(1) + local[3];
+}
+```
+
 ## With Heap Allocation and Structs
 
 Uses `new` for zero-initialized heap allocation. The emitted code calls `calloc(1, n)` directly; no Mettle runtime object is linked unless the program also uses `-d`/`-s` crash tracebacks or `std/thread` atomics. See [Heap Allocator Runtime](heap-allocation.md).
@@ -204,8 +233,12 @@ graph are all compile errors pointing at the offending site. Verified
 ```mettle
 // kernels.mettle  ->  mettle --emit-ptx kernels.mettle -o kernels.ptx
 kernel vadd(a: float32*, b: float32*, c: float32*, n: int32) {
+  workgroup var tile: float32[256];
+  private var scratch: int32[4];
   var i: int32 = block.x * block_dim.x + thread.x;
-  if (i < n) { c[i] = a[i] + b[i]; }
+  if (thread.x < 256 && i < n) { tile[thread.x] = a[i] + b[i]; }
+  barrier(workgroup, acq_rel);
+  if (thread.x < 256 && i < n) { c[i] = tile[thread.x]; }
 }
 ```
 
@@ -214,7 +247,126 @@ kernel vadd(a: float32*, b: float32*, c: float32*, n: int32) {
 import "std/gpu";
 // ... gpu_init, gpu_module, gpu_func, gpu_malloc, gpu_to_device ...
 dispatch vadd[(n + 255) / 256, 256](da, db, dc, n);
+
+dispatch gemm[grid: (tiles_n, tiles_m, batch),
+              block: (32, 1, 1),
+              shared: arena_bytes,
+              stream: compute_stream](a, b, c, d, m, n, k);
 ```
+
+Here `vadd` is the runtime function handle returned by `gpu_func`, not a
+compile-time reference to the source kernel declaration. `dispatch` preserves
+a typed, target-neutral launch in IR; the host backend alone marshals it for
+the selected runtime provider. The compact form supplies 1-D grid/block sizes.
+The named form requires `grid: (x,y,z)` and `block: (x,y,z)` and optionally
+accepts `shared:` dynamic-arena bytes plus `stream:`; controls may be reordered.
+libmtlc's `mtlc_gpu_launch` builds the identical operation.
+
+`workgroup var name: T[N]` is fixed storage shared by a workgroup;
+`private var name: T[N]` is fixed storage per work-item. A pointer-shaped
+`workgroup var arena: T*` is an unbounded view of launch-sized workgroup memory;
+multiple typed views alias one base and are partitioned with aligned offsets.
+All are kernel-only. `barrier(workgroup, global,
+acq_rel)` accepts one or both memory regions and an acquire/release/acq-rel/
+seq-cst order; all live work-items must reach it uniformly.
+
+Native subgroup built-ins expose `subgroup_local_id`, `subgroup_size`, typed
+`subgroup_broadcast(value, lane)`, add/min/max reductions, and inclusive or
+exclusive add scans for u32/f32, variable-source `subgroup_shuffle`,
+word-addressed `subgroup_ballot`, and boolean `subgroup_any` / `subgroup_all`.
+No declaration is required. Collectives must be uniform, and a broadcast source
+lane must be uniform and valid. PTX uses a 32-lane warp; SPIR-V keeps the
+implementation-defined OpenCL subgroup size and uses KHR ballot/vote extensions.
+
+Native atomic built-ins are type-directed for `uint32*`, `uint64*`, and matching
+workgroup arrays. Loads and value-returning operations need no extern; stores
+return `void`:
+
+```mettle
+var ticket: uint32 = atomic_fetch_add(counter, index, 1,
+                                      order: acq_rel, scope: device);
+var ready: uint32 = atomic_load(flags, index,
+                                order: acquire, scope: device);
+atomic_store(flags, index, 1, order: release, scope: device);
+var observed: uint64 = atomic_compare_exchange(
+    state, index, expected, desired,
+    success_order: seq_cst, failure_order: acquire, scope: system);
+```
+
+The full family is `atomic_load`, `atomic_store`,
+`atomic_fetch_add/sub/min/max/and/or/xor`, `atomic_exchange`, and
+`atomic_compare_exchange`. Storage is inferred as global or workgroup;
+`space:` may state it explicitly. Defaults are seq-cst and device scope for
+global storage or workgroup scope for workgroup storage. Loads accept
+relaxed/acquire/seq-cst; stores accept relaxed/release/seq-cst. CAS failure
+order is distinct and cannot be release/acq-rel or stronger than success.
+
+Native cooperative tensor operations use named, compile-time semantics rather
+than backend fragments or opcodes:
+
+```mettle
+kernel tile(a: uint16*, b: uint16*, c: float32*, d: float32*) {
+  tensor_mma(a, b, c, d,
+             shape: m16n16k16,
+             input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col);
+}
+
+kernel gemm_region(a: uint16*, b: uint16*, c: float32*, d: float32*,
+                   m: uint32, n: uint32, k: uint32,
+                   lda: uint32, ldb: uint32, ldc: uint32, ldd: uint32) {
+  tensor_matmul(a, b, c, d,
+                (uint32)block.y * (uint32)16,
+                (uint32)block.x * (uint32)16,
+                m, n, k,
+                shape: m16n16k16,
+                input_type: f16, output_type: f32,
+                lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+}
+
+kernel finish(d: float32*, bias: float32*, alpha: float32, beta: float32) {
+  tensor_epilogue(d, shape: m32n16, element_type: f32,
+                  bias_mode: column, bias: bias,
+                  alpha: alpha, beta: beta, activation: relu);
+}
+```
+
+`shape` can be replaced by `m`/`n`/`k`; independent operand/result formats,
+all four layouts/leading dimensions, transpose, rounding, overflow, math,
+sparsity, scale operands, and subgroup/workgroup scope are represented. Leading
+dimensions may be compile-time integers or uniform runtime integer expressions.
+`tensor_matmul(A,B,C,D,row,column,M,N,K,...)` computes one exact bounded
+whole-matrix region. Its five controls are unsigned and uniform; all four
+whole-matrix leading dimensions are explicit. PTX keeps full runtime-K chunks
+resident when legal and cooperatively computes every M/N/K edge. PTX can view
+independently transposed A/B through the opposite backend-local layout; forced
+fallback still replays transpose exactly, and neither path creates a frontend
+transpose. Unscaled E4M3/E5M2 inputs have exact architectural conversion and
+cooperative edge replay plus resident direct-MMA full interiors. Matched
+block32/UE8M0 FP8/FP6/FP4 descriptors and packed block32/UE8M0 or
+block16/UE4M3 E2M1 descriptors likewise keep scaled native interiors resident
+and replay every M/N/K edge exactly. `scale_A` is logical row-major
+`[M,ceil(K/block)]`; `scale_B` is logical column-major
+`[ceil(K/block),N]`, independently of operand transpose. Dense FP6/FP4 is an
+LSB-first logical bitstream. Matching f16/bf16 structured-2:4 regions use two
+stored A values and one uint8 mask per logical four-wide K group. Metadata is
+compact row-major `[M,ceil(K/4)]`, does not transpose with A, and a partial final
+group still owns two stored values; PTX keeps complete K16 `mma.sp` chunks
+resident and replays every edge from the neutral masks. Unsupported numeric or
+sparse tail families reject rather than round, pad, or silently narrow.
+`tensor_epilogue` is a separate exact `activation(alpha*D + beta*bias)`
+collective with row/column D layout, absent/row/column/matrix bias,
+identity/ReLU/clamp, f16/bf16/f32/f64 storage, and subgroup/workgroup scope.
+ReLU and clamp use ordered comparisons and preserve unordered values.
+PTX always has ordered cooperative memory replay and may consume an adjacent
+compatible MMA/commit directly. It may also carry a verified loop accumulator
+across its exit jump when that jump is the epilogue label's only predecessor;
+bypass edges force replay. Stable opaque WMMA permits bias-free scalar post-ops;
+direct mapped MMA permits every bias mode. No fragment enters shared IR.
+
+The PTX backend supports the stable WMMA family and rejects unsupported profiles;
+the current OpenCL 2.0 SPIR-V profile explicitly rejects unsupported tensor
+MMA and epilogue capabilities.
 
 See [GPU Offload](gpu.md).
 
@@ -228,7 +380,7 @@ struct Pair<A, B> {
   second: B;
 }
 
-function swap<T>(a: T*, b: T*) -> void {
+fn swap<T>(a: T*, b: T*) -> void {
   var tmp: T = *a;
   *a = *b;
   *b = tmp;

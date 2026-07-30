@@ -1,0 +1,172 @@
+// Backend-neutral producer/epilogue adjacency. The source and shared IR expose
+// only exact whole-tile operations; the selected backend may retain a verified
+// accumulator or replay through memory.
+kernel tensor_epilogue_fused_wmma_chain(
+    a: uint16*, b: uint16*, c: float32*, d: float32*, alpha: float32,
+    lda: int32, ldb: int32, ldc: int32, ldd: int32) {
+  var a1: uint16* = a + 16;
+  var b1: uint16* = b + 16;
+  tensor_mma(a, b, c, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+  tensor_mma(a1, b1, d, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldd, ldd: ldd);
+  tensor_epilogue(d, shape: m16n16, element_type: f32,
+                  layout: row, ldd: ldd,
+                  alpha: alpha, activation: relu);
+}
+
+// Direct m16n8 register mappings can load every neutral bias form without
+// leaking that mapping into source or shared IR.
+kernel tensor_epilogue_fused_native_matrix_bias(
+    a: uint8*, b: uint8*, c: float32*, d: float32*, bias: float32*,
+    alpha: float32, beta: float32, minimum: float32, maximum: float32,
+    lda: int32, ldb: int32, ldc: int32, ldd: int32, ldbias: int32) {
+  var a1: uint8* = a + 32;
+  var b1: uint8* = b + 32;
+  tensor_mma(a, b, c, d,
+             shape: m16n16k32,
+             a_type: e4m3, b_type: e5m2,
+             accumulator_type: f32, result_type: f32,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+  tensor_mma(a1, b1, d, d,
+             shape: m16n16k32,
+             a_type: e4m3, b_type: e5m2,
+             accumulator_type: f32, result_type: f32,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldd, ldd: ldd);
+  tensor_epilogue(d, shape: m16n16, element_type: f32,
+                  layout: row, ldd: ldd,
+                  bias_mode: matrix, bias: bias,
+                  bias_layout: col, ldbias: ldbias,
+                  alpha: alpha, beta: beta,
+                  activation: clamp,
+                  clamp_min: minimum, clamp_max: maximum);
+}
+
+// Stable WMMA deliberately refuses register fusion when logical bias indexing
+// would require assuming an opaque fragment-to-coordinate mapping.
+kernel tensor_epilogue_wmma_bias_replay(
+    a: uint16*, b: uint16*, c: float32*, d: float32*, bias: float32*) {
+  tensor_mma(a, b, c, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: 16, ldb: 16, ldc: 16, ldd: 16);
+  tensor_epilogue(d, shape: m16n16, element_type: f32,
+                  bias_mode: row, bias: bias, activation: relu);
+}
+
+// Even a supported bias-free post-op must replay when the neutral D view is
+// not identical. Runtime stride equality is proved by operand identity, not by
+// guessing that two launch arguments happen to carry the same value.
+kernel tensor_epilogue_stride_mismatch_replay(
+    a: uint16*, b: uint16*, c: float32*, d: float32*,
+    mma_ldd: int32, epilogue_ldd: int32) {
+  tensor_mma(a, b, c, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: 16, ldb: 16, ldc: 16, ldd: mma_ldd);
+  tensor_epilogue(d, shape: m16n16, element_type: f32,
+                  layout: row, ldd: epilogue_ldd,
+                  activation: relu);
+}
+
+// A staged accumulator reaches the same neutral epilogue after the optimizer
+// inserts its verified commit. The backend may consume that commit directly.
+kernel tensor_epilogue_fused_pipeline(
+    a: uint16*, b: uint16*, c: float32*, d: float32*) {
+  workgroup var a_stage: uint16[512];
+  workgroup var b_stage: uint16[512];
+  var lane: int32 = thread.x;
+  var base: int32 = lane * 8;
+
+  async_copy_workgroup(&a_stage[base], a + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_workgroup(&b_stage[base], b + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_commit();
+  async_copy_workgroup(&a_stage[256 + base], a + 256 + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_workgroup(&b_stage[256 + base], b + 256 + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_commit();
+
+  async_copy_wait(1);
+  barrier(workgroup, acq_rel);
+  tensor_mma(&a_stage[0], &b_stage[0], c, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: 16, ldb: 16, ldc: 16, ldd: 16);
+  async_copy_wait(0);
+  barrier(workgroup, acq_rel);
+  tensor_mma(&a_stage[256], &b_stage[256], d, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: 16, ldb: 16, ldc: 16, ldd: 16);
+  tensor_epilogue(d, shape: m16n16, element_type: f32,
+                  activation: relu);
+}
+
+// The optimizer places the loop commit on the loop-exit edge. When that edge is
+// the epilogue label's only predecessor, the backend can apply the post-op to
+// the still-resident accumulator before following the edge.
+kernel tensor_epilogue_fused_loop(
+    a: uint16*, b: uint16*, c: float32*, d: float32*,
+    k: int32, alpha: float32,
+    lda: int32, ldb: int32, ldc: int32, ldd: int32) {
+  tensor_mma(a, b, c, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+  var inner: int32 = 16;
+  while (inner < k) {
+    tensor_mma(a + inner, b + inner, d, d,
+               shape: m16n16k16, input_type: f16, output_type: f32,
+               a_layout: row, b_layout: col,
+               c_layout: row, d_layout: row,
+               lda: lda, ldb: ldb, ldc: ldd, ldd: ldd);
+    inner = inner + 16;
+  }
+  tensor_epilogue(d, shape: m16n16, element_type: f32,
+                  layout: row, ldd: ldd,
+                  alpha: alpha, activation: relu);
+}
+
+// An outer guard also reaches the epilogue label. The backend must not move the
+// post-op onto only the loop-commit edge; the complete memory replay remains at
+// the shared label and therefore covers both paths.
+kernel tensor_epilogue_guarded_loop_replay(
+    a: uint16*, b: uint16*, c: float32*, d: float32*,
+    k: int32, lda: int32, ldb: int32, ldc: int32, ldd: int32) {
+  if (k >= 16) {
+    tensor_mma(a, b, c, d,
+               shape: m16n16k16, input_type: f16, output_type: f32,
+               a_layout: row, b_layout: col,
+               c_layout: row, d_layout: row,
+               lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+    var inner: int32 = 16;
+    while (inner < k) {
+      tensor_mma(a + inner, b + inner, d, d,
+                 shape: m16n16k16, input_type: f16, output_type: f32,
+                 a_layout: row, b_layout: col,
+                 c_layout: row, d_layout: row,
+                 lda: lda, ldb: ldb, ldc: ldd, ldd: ldd);
+      inner = inner + 16;
+    }
+  }
+  tensor_epilogue(d, shape: m16n16, element_type: f32,
+                  layout: row, ldd: ldd, activation: relu);
+}

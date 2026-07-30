@@ -1,0 +1,5 @@
+fn host_function() {
+  workgroup var tile: float32[32];
+}
+
+fn main() -> int64 { return 0; }

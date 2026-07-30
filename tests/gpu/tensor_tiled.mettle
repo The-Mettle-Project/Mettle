@@ -1,0 +1,94 @@
+// Logical tiles larger than one hardware WMMA shape. Source and shared IR
+// describe only the complete matrix operation; PTX owns the physical grid,
+// address calculation, and A/B fragment reuse policy.
+kernel tensor_tiled_f16_m32n32(a: uint16*, b: uint16*,
+                               c: float32*, d: float32*) {
+  tensor_mma(a, b, c, d, shape: m32n32k16,
+             input_type: f16, output_type: f32);
+}
+
+kernel tensor_tiled_bf16_m32n16(a: uint16*, b: uint16*,
+                                c: float32*, d: float32*) {
+  tensor_mma(a, b, c, d, shape: m32n16k16,
+             input_type: bf16, output_type: f32);
+}
+
+kernel tensor_tiled_tf32_m32n32(a: float32*, b: float32*,
+                                c: float32*, d: float32*) {
+  tensor_mma(a, b, c, d, shape: m32n32k8,
+             input_type: tf32, output_type: f32);
+}
+
+kernel tensor_tiled_f64_m16n16(a: float64*, b: float64*,
+                               c: float64*, d: float64*) {
+  tensor_mma(a, b, c, d, shape: m16n16k4,
+             input_type: f64, output_type: f64,
+             rounding: nearest_even);
+}
+
+kernel tensor_tiled_i8_m32n32(a: int8*, b: int8*,
+                              c: int32*, d: int32*) {
+  tensor_mma(a, b, c, d, shape: m32n32k16,
+             input_type: i8, output_type: i32,
+             overflow: saturate_finite);
+}
+
+kernel tensor_tiled_u8_m32n32(a: uint8*, b: uint8*,
+                              c: int32*, d: int32*) {
+  tensor_mma(a, b, c, d, shape: m32n32k16,
+             input_type: u8, output_type: i32,
+             overflow: saturate_finite);
+}
+
+kernel tensor_tiled_f16_result_m32n32(a: uint16*, b: uint16*,
+                                      c: uint16*, d: uint16*) {
+  tensor_mma(a, b, c, d, shape: m32n32k16,
+             input_type: f16, output_type: f16);
+}
+
+kernel tensor_tiled_f16_colrow_m32n32(a: uint16*, b: uint16*,
+                                      c: float32*, d: float32*) {
+  tensor_mma(a, b, c, d, shape: m32n32k16,
+             input_type: f16, output_type: f32,
+             a_layout: col, b_layout: row,
+             c_layout: col, d_layout: col,
+             lda: 32, ldb: 32, ldc: 32, ldd: 32);
+}
+
+kernel tensor_tiled_f16_runtime_strides_m32n32(
+    a: uint16*, b: uint16*, c: float32*, d: float32*,
+    lda: int32, ldb: int32, ldc: int32, ldd: int32) {
+  tensor_mma(a, b, c, d, shape: m32n32k16,
+             input_type: f16, output_type: f32,
+             lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+}
+
+// The neutral chain is also a grid: four output subtiles stay resident across
+// two K tiles when the PTX tuple policy admits its 56 logical-register peak.
+kernel tensor_tiled_chain2_f16_m32n32(a: uint16*, b: uint16*,
+                                      c: float32*, d: float32*) {
+  var a1: uint16* = a + 16;
+  var b1: uint16* = b + 16;
+  tensor_mma(a, b, c, d, shape: m32n32k16,
+             input_type: f16, output_type: f32,
+             lda: 32, ldb: 32, ldc: 32, ldd: 32);
+  tensor_mma(a1, b1, d, d, shape: m32n32k16,
+             input_type: f16, output_type: f32,
+             lda: 32, ldb: 32, ldc: 32, ldd: 32);
+}
+
+// The same grid survives a neutral loop-residency proof. Only the loop-exit
+// edge commits all four output subtiles.
+kernel tensor_tiled_loop_f16_m32n32(a: uint16*, b: uint16*,
+                                    c: float32*, d: float32*, k: int32) {
+  tensor_mma(a, b, c, d, shape: m32n32k16,
+             input_type: f16, output_type: f32,
+             lda: 32, ldb: 32, ldc: 32, ldd: 32);
+  var inner: int32 = 16;
+  while (inner < k) {
+    tensor_mma(a + inner, b + inner, d, d, shape: m32n32k16,
+               input_type: f16, output_type: f32,
+               lda: 32, ldb: 32, ldc: 32, ldd: 32);
+    inner = inner + 16;
+  }
+}

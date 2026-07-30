@@ -5,6 +5,129 @@
 
 // Statement and expression validation functions
 
+static int gpu_launch_abi_type(const Type *type) {
+  if (!type) {
+    return 0;
+  }
+  switch (type->kind) {
+  case TYPE_INT8:
+  case TYPE_INT16:
+  case TYPE_INT32:
+  case TYPE_INT64:
+  case TYPE_UINT8:
+  case TYPE_UINT16:
+  case TYPE_UINT32:
+  case TYPE_UINT64:
+  case TYPE_BOOL:
+  case TYPE_FLOAT32:
+  case TYPE_FLOAT64:
+  case TYPE_POINTER:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+static int type_checker_check_gpu_launch(TypeChecker *checker,
+                                         ASTNode *statement) {
+  GpuLaunchStatement *launch = (GpuLaunchStatement *)statement->data;
+  if (!launch || !launch->kernel) {
+    type_checker_set_error_at_location(checker, statement->location,
+                                       "Invalid GPU launch statement");
+    return 0;
+  }
+  if (!checker->current_function) {
+    type_checker_set_error_at_location(
+        checker, statement->location,
+        "GPU launch statements are only valid inside a host function");
+    return 0;
+  }
+  if (checker->current_function_decl &&
+      checker->current_function_decl->data &&
+      ((FunctionDeclaration *)checker->current_function_decl->data)
+          ->is_kernel) {
+    type_checker_set_error_at_location(
+        checker, statement->location,
+        "A GPU kernel cannot launch another kernel; launch from host code");
+    return 0;
+  }
+
+  Type *handle_type = type_checker_infer_type(checker, launch->kernel);
+  if (!handle_type) {
+    return 0;
+  }
+  if (!type_checker_is_integer_type(handle_type) &&
+      handle_type->kind != TYPE_POINTER &&
+      handle_type->kind != TYPE_FUNCTION_POINTER) {
+    type_checker_report_type_mismatch(checker, launch->kernel->location,
+                                      "integer or pointer GPU kernel handle",
+                                      handle_type->name);
+    return 0;
+  }
+
+  for (size_t d = 0; d < 3; d++) {
+    ASTNode *dims[2] = {launch->grid[d], launch->block[d]};
+    const char *labels[2] = {"grid", "block"};
+    for (size_t which = 0; which < 2; which++) {
+      Type *dim_type = type_checker_infer_type(checker, dims[which]);
+      if (!dim_type) {
+        return 0;
+      }
+      if (!type_checker_is_integer_type(dim_type)) {
+        type_checker_report_type_mismatch(checker, dims[which]->location,
+                                          "integer GPU launch dimension",
+                                          dim_type->name);
+        return 0;
+      }
+      long long constant = 0;
+      if (type_checker_eval_integer_constant(dims[which], &constant) &&
+          constant <= 0) {
+        type_checker_set_error_at_location(
+            checker, dims[which]->location,
+            "GPU %s dimension %zu must be greater than zero", labels[which],
+            d);
+        return 0;
+      }
+    }
+  }
+
+  Type *shared_type =
+      type_checker_infer_type(checker, launch->dynamic_shared_bytes);
+  Type *stream_type = type_checker_infer_type(checker, launch->stream);
+  if (!shared_type || !stream_type) {
+    return 0;
+  }
+  if (!type_checker_is_integer_type(shared_type)) {
+    type_checker_report_type_mismatch(
+        checker, launch->dynamic_shared_bytes->location,
+        "integer dynamic shared-memory byte count", shared_type->name);
+    return 0;
+  }
+  if (!type_checker_is_integer_type(stream_type) &&
+      stream_type->kind != TYPE_POINTER) {
+    type_checker_report_type_mismatch(checker, launch->stream->location,
+                                      "integer or pointer stream handle",
+                                      stream_type->name);
+    return 0;
+  }
+
+  for (size_t i = 0; i < launch->argument_count; i++) {
+    Type *arg_type = type_checker_infer_type(checker, launch->arguments[i]);
+    if (!arg_type) {
+      return 0;
+    }
+    if (!gpu_launch_abi_type(arg_type)) {
+      type_checker_set_error_at_location(
+          checker, launch->arguments[i]->location,
+          "GPU launch argument %zu has unsupported ABI type '%s'; use a "
+          "scalar or pointer value",
+          i, arg_type->name ? arg_type->name : "unknown");
+      return 0;
+    }
+  }
+  return 1;
+}
+
 int type_checker_check_if_statement(TypeChecker *checker,
                                            ASTNode *statement) {
   IfStatement *if_stmt = (IfStatement *)statement->data;
@@ -552,6 +675,35 @@ int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
     // Function call as statement (no return value used)
     Type *return_type = type_checker_infer_type(checker, statement);
     return return_type != NULL; // Error already reported if NULL
+  }
+
+  case AST_GPU_LAUNCH:
+    return type_checker_check_gpu_launch(checker, statement);
+
+  case AST_BARRIER_STATEMENT: {
+    BarrierStatement *barrier = (BarrierStatement *)statement->data;
+    FunctionDeclaration *owner =
+        checker->current_function_decl &&
+                checker->current_function_decl->type == AST_FUNCTION_DECLARATION
+            ? (FunctionDeclaration *)checker->current_function_decl->data
+            : NULL;
+    const unsigned supported = AST_MEMORY_REGION_WORKGROUP |
+                               AST_MEMORY_REGION_GLOBAL;
+    if (!owner || !owner->is_kernel) {
+      type_checker_set_error_at_location(
+          checker, statement->location,
+          "Barrier statements are only legal inside a GPU kernel");
+      return 0;
+    }
+    if (!barrier || barrier->memory_regions == 0 ||
+        (barrier->memory_regions & ~supported) != 0 ||
+        barrier->memory_order < AST_MEMORY_ORDER_ACQUIRE ||
+        barrier->memory_order > AST_MEMORY_ORDER_SEQ_CST) {
+      type_checker_set_error_at_location(checker, statement->location,
+                                         "Invalid barrier memory contract");
+      return 0;
+    }
+    return 1;
   }
 
   case AST_RETURN_STATEMENT: {

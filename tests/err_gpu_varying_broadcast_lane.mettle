@@ -1,0 +1,4 @@
+kernel varying_broadcast_lane(value: uint32, output: uint32*) {
+  var lane: uint32 = subgroup_local_id();
+  output[lane] = subgroup_broadcast(value, lane);
+}

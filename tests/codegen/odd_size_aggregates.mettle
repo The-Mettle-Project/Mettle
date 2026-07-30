@@ -1,0 +1,34 @@
+struct Rgb { r: uint8; g: uint8; b: uint8; }
+struct Five { a: int32; b: uint8; }
+struct Six { a: int32; b: int16; }
+struct Seven { a: int32; b: int16; c: uint8; }
+@noinline fn lum(c: Rgb) -> int32 { return (int32)c.r + (int32)c.g + (int32)c.b; }
+@noinline fn make_rgb(v: uint8) -> Rgb { var c: Rgb; c.r = v; c.g = v; c.b = v; return c; }
+@noinline fn sum5(f: Five) -> int32 { return f.a + (int32)f.b; }
+@noinline fn sum6(s: Six) -> int32 { return s.a + (int32)s.b; }
+@noinline fn sum7(s: Seven) -> int32 { return s.a + (int32)s.b + (int32)s.c; }
+var G_RGB: Rgb = { r: 10, g: 20, b: 30 };
+fn main() -> int32 {
+  var c: Rgb = { r: 1, g: 2, b: 3 };
+  if (lum(c) != 6) { return 1; }
+  var d: Rgb = c;
+  if (d.r != 1 || d.g != 2 || d.b != 3) { return 2; }
+  if (lum(make_rgb(5)) != 15) { return 3; }
+  if (G_RGB.r != 10 || G_RGB.g != 20 || G_RGB.b != 30) { return 4; }
+  var arr: Rgb[3] = [{ r: 1, g: 1, b: 1 }, { r: 2, g: 2, b: 2 }, { r: 3, g: 3, b: 3 }];
+  if (lum(arr[0]) != 3 || lum(arr[2]) != 9) { return 5; }
+  var f5: Five = { a: 100, b: 5 };
+  if (sum5(f5) != 105) { return 6; }
+  var s6: Six = { a: 100, b: 6 };
+  if (sum6(s6) != 106) { return 7; }
+  var s7: Seven = { a: 100, b: 6, c: 1 };
+  if (sum7(s7) != 107) { return 8; }
+  var a3: uint8[3] = [7, 8, 9];
+  var b3: uint8[3] = a3;
+  if ((int32)b3[0] != 7 || (int32)b3[2] != 9) { return 9; }
+  var a5: uint8[5] = [1, 2, 3, 4, 5];
+  var t: int32 = 0;
+  for i in 0..5 { t = t + (int32)a5[i]; }
+  if (t != 15) { return 10; }
+  return 0;
+}

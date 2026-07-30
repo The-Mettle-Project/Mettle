@@ -1,0 +1,101 @@
+// FP6 matrices use the neutral dense_subbyte contract: logical values are a
+// least-significant-bit-first six-bit stream, including logical leading-
+// dimension padding. The PTX backend alone expands them into byte containers
+// and selects Blackwell's block-scaled mxf8f6f4 instruction family.
+kernel tensor_mxfp6_m16n16k32(
+    a: uint8*, b: uint8*, c: float32*, d: float32*,
+    a_scale: uint8*, b_scale: uint8*) {
+  tensor_mma(a, b, c, d,
+             shape: m16n16k32,
+             a_type: e3m2, b_type: e2m3,
+             accumulator_type: f32, result_type: f32,
+             a_packing: dense_subbyte, b_packing: dense_subbyte,
+             a_scale_mode: block32, b_scale_mode: block32,
+             a_scale_type: ue8m0, b_scale_type: ue8m0,
+             a_scale: a_scale, b_scale: b_scale,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: 36, ldb: 36, ldc: 20, ldd: 24,
+             ldsa: 2, ldsb: 2);
+}
+
+// Connected products retain every f32 accumulator fragment; only the packed
+// operands and scale metadata are reloaded for each product.
+kernel tensor_mxfp6_chain3_m16n16k32(
+    a: uint8*, b: uint8*, c: float32*, d: float32*,
+    a_scale: uint8*, b_scale: uint8*) {
+  tensor_mma(a, b, c, d,
+             shape: m16n16k32,
+             a_type: e3m2, b_type: e2m3,
+             accumulator_type: f32, result_type: f32,
+             a_packing: dense_subbyte, b_packing: dense_subbyte,
+             a_scale_mode: block32, b_scale_mode: block32,
+             a_scale_type: ue8m0, b_scale_type: ue8m0,
+             a_scale: a_scale, b_scale: b_scale,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: 36, ldb: 36, ldc: 24, ldd: 24,
+             ldsa: 2, ldsb: 2);
+  tensor_mma(a, b, d, d,
+             shape: m16n16k32,
+             a_type: e3m2, b_type: e2m3,
+             accumulator_type: f32, result_type: f32,
+             a_packing: dense_subbyte, b_packing: dense_subbyte,
+             a_scale_mode: block32, b_scale_mode: block32,
+             a_scale_type: ue8m0, b_scale_type: ue8m0,
+             a_scale: a_scale, b_scale: b_scale,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: 36, ldb: 36, ldc: 24, ldd: 24,
+             ldsa: 2, ldsb: 2);
+  tensor_mma(a, b, d, d,
+             shape: m16n16k32,
+             a_type: e3m2, b_type: e2m3,
+             accumulator_type: f32, result_type: f32,
+             a_packing: dense_subbyte, b_packing: dense_subbyte,
+             a_scale_mode: block32, b_scale_mode: block32,
+             a_scale_type: ue8m0, b_scale_type: ue8m0,
+             a_scale: a_scale, b_scale: b_scale,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: 36, ldb: 36, ldc: 24, ldd: 24,
+             ldsa: 2, ldsb: 2);
+}
+
+// Every K32 step advances a dense FP6 byte pointer by inner*6/8 and the scale
+// grid by one UE8M0 byte. Inner is always a multiple of 32, so the bitstream
+// tile boundary is byte aligned without exposing PTX fragment details.
+kernel tensor_mxfp6_runtime_k_m16n16k32(
+    a: uint8*, b: uint8*, c: float32*, d: float32*,
+    a_scale: uint8*, b_scale: uint8*, k: int32,
+    lda: int32, ldb: int32, ldc: int32, ldd: int32) {
+  tensor_mma(a, b, c, d,
+             shape: m16n16k32,
+             a_type: e3m2, b_type: e2m3,
+             accumulator_type: f32, result_type: f32,
+             a_packing: dense_subbyte, b_packing: dense_subbyte,
+             a_scale_mode: block32, b_scale_mode: block32,
+             a_scale_type: ue8m0, b_scale_type: ue8m0,
+             a_scale: a_scale, b_scale: b_scale,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldc, ldd: ldd,
+             ldsa: 4, ldsb: 4);
+  var inner: int32 = 32;
+  while (inner < k) {
+    tensor_mma(a + inner * 3 / 4, b + inner * 3 / 4, d, d,
+               shape: m16n16k32,
+               a_type: e3m2, b_type: e2m3,
+               accumulator_type: f32, result_type: f32,
+               a_packing: dense_subbyte, b_packing: dense_subbyte,
+               a_scale_mode: block32, b_scale_mode: block32,
+               a_scale_type: ue8m0, b_scale_type: ue8m0,
+               a_scale: a_scale + inner / 32,
+               b_scale: b_scale + inner / 32,
+               a_layout: row, b_layout: col,
+               c_layout: row, d_layout: row,
+               lda: lda, ldb: ldb, ldc: ldd, ldd: ldd,
+               ldsa: 4, ldsb: 4);
+    inner = inner + 32;
+  }
+}

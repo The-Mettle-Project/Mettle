@@ -1,6 +1,6 @@
 # Translation validation: `--verify`
 
-Mettle can prove its own optimizer honest. With `--verify`, the compiler
+libmtlc can prove its own optimizer honest. With `--verify`, the backend
 validates **every optimization pass, on every function, during the compile**:
 whenever a pass changes a function's IR, the before-IR and after-IR are both
 executed by a built-in reference interpreter on identical generated inputs,

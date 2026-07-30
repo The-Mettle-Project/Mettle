@@ -1,0 +1,5 @@
+kernel divergent_subgroup(value: uint32) {
+  if (subgroup_local_id() == 0) {
+    var sum: uint32 = subgroup_reduce_add(value);
+  }
+}

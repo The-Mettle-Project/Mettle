@@ -1,0 +1,31 @@
+var log: int32[8];
+var n: int32 = 0;
+@noinline fn note(v: int32) { log[n] = v; n = n + 1; }
+@noinline fn ordered() -> int32 {
+  defer note(1);
+  defer note(2);
+  defer note(3);
+  return 0;
+}
+@noinline fn in_loop(k: int32) -> int32 {
+  var t: int32 = 0;
+  for i in 0..k { defer note(100 + i); t = t + 1; }
+  return t;
+}
+@noinline fn early(x: int32) -> int32 {
+  defer note(9);
+  if (x > 0) { return 1; }
+  return 2;
+}
+fn main() -> int32 {
+  ordered();
+  if (n != 3) { return 1; }
+  if (log[0] != 3 || log[1] != 2 || log[2] != 1) { return 2; }
+  n = 0;
+  if (in_loop(3) != 3) { return 3; }
+  if (n != 3) { return 4; }
+  n = 0;
+  if (early(1) != 1) { return 5; }
+  if (n != 1 || log[0] != 9) { return 6; }
+  return 0;
+}

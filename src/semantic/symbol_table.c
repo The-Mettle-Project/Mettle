@@ -2,9 +2,9 @@
 #define _GNU_SOURCE
 #endif
 #include "symbol_table.h"
-#include "../error/error_reporter.h"
-#include "../string_intern.h"
-#include "../common.h"
+#include "error/error_reporter.h"
+#include "string_intern.h"
+#include "common.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -618,6 +618,8 @@ Symbol *symbol_create(const char *name, SymbolKind kind, Type *type) {
   symbol->is_forward_declaration = 0;
   symbol->is_extern = 0;
   symbol->is_immutable = 0;
+  symbol->is_address_space_binding = 0;
+  symbol->address_space = MTLC_ADDRESS_SPACE_DEFAULT;
   symbol->is_builtin = 0;
   symbol->link_name = NULL;
   symbol->decl_line = 0;

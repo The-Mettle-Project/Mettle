@@ -1,0 +1,43 @@
+struct S1 { a: uint8; }
+struct S2 { a: uint16; }
+struct S3 { a: uint8; b: uint8; c: uint8; }
+struct S4 { a: int32; }
+struct S5 { a: int32; b: uint8; }
+struct S6 { a: int32; b: int16; }
+struct S7 { a: int32; b: int16; c: uint8; }
+struct S8 { a: int64; }
+struct S12 { a: int32; b: int32; c: int32; }
+struct S16 { a: int64; b: int64; }
+struct S24 { a: int64; b: int64; c: int64; }
+@noinline fn m1(v: uint8) -> S1 { var s: S1; s.a = v; return s; }
+@noinline fn m2(v: uint16) -> S2 { var s: S2; s.a = v; return s; }
+@noinline fn m3(v: uint8) -> S3 { var s: S3; s.a = v; s.b = v; s.c = v; return s; }
+@noinline fn m4(v: int32) -> S4 { var s: S4; s.a = v; return s; }
+@noinline fn m5(v: int32) -> S5 { var s: S5; s.a = v; s.b = 1; return s; }
+@noinline fn m6(v: int32) -> S6 { var s: S6; s.a = v; s.b = 2; return s; }
+@noinline fn m7(v: int32) -> S7 { var s: S7; s.a = v; s.b = 2; s.c = 3; return s; }
+@noinline fn m8(v: int64) -> S8 { var s: S8; s.a = v; return s; }
+@noinline fn m12(v: int32) -> S12 { var s: S12; s.a = v; s.b = v; s.c = v; return s; }
+@noinline fn m16(v: int64) -> S16 { var s: S16; s.a = v; s.b = v; return s; }
+@noinline fn m24(v: int64) -> S24 { var s: S24; s.a = v; s.b = v; s.c = v; return s; }
+fn main() -> int32 {
+  if ((int32)m1(7).a != 7) { return 1; }
+  if ((int32)m2(300).a != 300) { return 2; }
+  var r3: S3 = m3(4);
+  if ((int32)r3.a + (int32)r3.b + (int32)r3.c != 12) { return 3; }
+  if (m4(9).a != 9) { return 4; }
+  var r5: S5 = m5(10);
+  if (r5.a != 10 || (int32)r5.b != 1) { return 5; }
+  var r6: S6 = m6(11);
+  if (r6.a != 11 || (int32)r6.b != 2) { return 6; }
+  var r7: S7 = m7(12);
+  if (r7.a != 12 || (int32)r7.b != 2 || (int32)r7.c != 3) { return 7; }
+  if (m8(13) .a != 13) { return 8; }
+  var r12: S12 = m12(5);
+  if (r12.a + r12.b + r12.c != 15) { return 9; }
+  var r16: S16 = m16(6);
+  if (r16.a + r16.b != 12) { return 10; }
+  var r24: S24 = m24(7);
+  if (r24.a + r24.b + r24.c != 21) { return 11; }
+  return 0;
+}

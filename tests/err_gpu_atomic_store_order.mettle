@@ -1,0 +1,3 @@
+kernel invalid(counter: uint64*) {
+  atomic_store(counter, 0, 1, order: acquire);
+}

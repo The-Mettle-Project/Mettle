@@ -1,0 +1,37 @@
+// The x86 mnemonics are lexed as keywords everywhere, not only inside an `asm`
+// block. Declaring a field called `add` and initializing it in a literal both
+// accepted any identifier-like token; only reading it back through `.` or `->`
+// demanded a bare identifier, so these fields could be written and never read.
+
+struct Ops {
+  add: int32;
+  sub: int32;
+  mov: int32;
+  cmp: int32;
+  div: int32;
+  mul: int32;
+  inc: int32;
+  dec: int32;
+}
+
+struct Dispatch {
+  add: fn(int32, int32) -> int32;
+}
+
+@noinline fn plus(a: int32, b: int32) -> int32 { return a + b; }
+
+const TABLE: Dispatch = { add: &plus };
+
+fn main() -> int32 {
+  var o: Ops = { add: 1, sub: 2, mov: 3, cmp: 4, div: 5, mul: 6, inc: 7, dec: 8 };
+  if (o.add + o.sub + o.mov + o.cmp != 10) { return 1; }
+  if (o.div + o.mul + o.inc + o.dec != 26) { return 2; }
+  var p: Ops* = &o;
+  if (p->add != 1 || p->dec != 8) { return 3; }
+  p->add = 10;
+  if (o.add != 10) { return 4; }
+  if (TABLE.add(2, 3) != 5) { return 5; }
+  var add: int32 = 99;
+  if (add != 99) { return 6; }
+  return 0;
+}

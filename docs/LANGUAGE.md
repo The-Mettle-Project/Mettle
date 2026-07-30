@@ -1,6 +1,12 @@
 # Mettle Language Reference
 
-Mettle is a typed, assembly-inspired language that compiles to x86-64 assembly. This reference is split into focused documents for cohesion and clarity.
+Mettle is the **reference frontend** for [libmtlc](../README.md): a typed,
+assembly-inspired systems language. Its parser and semantic analysis lower
+Mettle source into the backend IR, which libmtlc optimizes and compiles to
+native machine code (x86-64 / ARM64) or GPU targets (PTX / SPIR-V). There is no
+external assembler and no assembly text anywhere in the pipeline. This reference
+documents the Mettle *language*; to drive the backend from a different frontend,
+see [Writing a frontend for libmtlc](embedding.md).
 
 ## Table of Contents
 
@@ -19,3 +25,6 @@ Mettle is a typed, assembly-inspired language that compiles to x86-64 assembly. 
 13. [Compilation](compilation.md)
 14. [Quick Reference](quick-reference.md)
 15. [Known Limitations](known-limitations.md)
+
+For the backend itself (the IR, optimizers, code generators, linker, and the
+public C API any frontend can drive) see the [documentation index](README.md).

@@ -1,0 +1,26 @@
+struct P2 { a: int32; b: int32; }
+struct P4 { a: int64; b: int64; c: int64; d: int64; }
+struct F2 { x: float64; y: float64; }
+@noinline fn direct_then_ints(s: P2, a: int32, b: int32) -> int32 { return s.a + s.b + a + b; }
+@noinline fn indirect_then_ints(s: P4, a: int32) -> int64 { return s.a + s.b + s.c + s.d + (int64)a; }
+@noinline fn two_structs(x: P2, y: P2) -> int32 { return x.a + x.b + y.a + y.b; }
+@noinline fn struct_and_float(s: P2, f: float64) -> float64 { return (float64)(s.a + s.b) + f; }
+@noinline fn floats_struct(f: F2, a: int32) -> float64 { return f.x + f.y + (float64)a; }
+@noinline fn ret_indirect(v: int64) -> P4 { var p: P4; p.a = v; p.b = v; p.c = v; p.d = v; return p; }
+@noinline fn deep(s: P4, a: int32, b: int32, c: int32, d: int32, e: int32) -> int64 {
+  return s.a + (int64)(a + b + c + d + e);
+}
+fn main() -> int32 {
+  var s: P2 = { a: 1, b: 2 };
+  if (direct_then_ints(s, 3, 4) != 10) { return 1; }
+  var q: P4 = { a: 1, b: 2, c: 3, d: 4 };
+  if (indirect_then_ints(q, 5) != 15) { return 2; }
+  if (two_structs(s, s) != 6) { return 3; }
+  if (struct_and_float(s, 0.5) != 3.5) { return 4; }
+  var f: F2 = { x: 1.5, y: 2.5 };
+  if (floats_struct(f, 1) != 5.0) { return 5; }
+  var r: P4 = ret_indirect(3);
+  if (r.a + r.b + r.c + r.d != 12) { return 6; }
+  if (deep(q, 1, 2, 3, 4, 5) != 16) { return 7; }
+  return 0;
+}

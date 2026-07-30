@@ -1,0 +1,177 @@
+// Aggregate literals: `[a, b, c]`, `[value; count]`, and `{ field: value }`.
+//
+// A literal has no type of its own; it takes the type of what it initializes,
+// and it is a compile-time constant, so the whole thing folds to the laid-out
+// bytes of the value. That is what makes a global aggregate constant possible
+// at all: the value goes into the object file's data, and the pointer-sized
+// holes in it (a function's address, another global's address, a string's
+// characters) become relocations the linker fills.
+//
+// Covered here:
+//
+//   1. Global `const` and `var` of array and struct type, including nesting,
+//      the repeat form, partial initialization (the tail stays zero), and
+//      fields written out of declaration order.
+//   2. Every element shape that needs more than plain bytes: float32/float64,
+//      bool, string, a function's address (a dispatch table), and another
+//      global's address.
+//   3. The same literals as local bindings, where they are copied in from the
+//      constant rather than stored element by element.
+//   4. Assignment forms: to a global, to a local, and to an array element.
+//
+// Exits 55 when everything holds, 1..N to name the first check that failed.
+
+struct Pt {
+  x: float64;
+  y: float64;
+}
+
+/* Exactly one machine word wide. The ABI passes an aggregate this size in a
+ * register, which is a different question from whether a GLOBAL of that type
+ * has a register-cacheable value: it does not, it is memory reached through an
+ * address. Reading one used to come back as whatever the allocator had last
+ * flushed over it. */
+struct Word {
+  lo: int32;
+  hi: int32;
+}
+
+struct Ent {
+  kind: int32;
+  flag: bool;
+  weight: float32;
+  name: string;
+  at: Pt;
+}
+
+struct Ops {
+  fast: fn(int32) -> int32;
+  slow: fn(int32) -> int32;
+}
+
+fn triple(v: int32) -> int32 { return v * 3; }
+fn quadruple(v: int32) -> int32 { return v * 4; }
+
+// Global constants: arrays, the repeat form, a partially written table, and a
+// struct whose fields are given out of order.
+const TABLE: int32[4] = [10, 20, 30, 40];
+const COEFF: float64[3] = [0.5, 1.5, 2.5];
+const FILLED: uint8[8] = [9; 8];
+const PARTIAL: int32[5] = [1, 2];
+const NESTED: Pt[2] = [{ x: 1.0, y: 2.0 }, { x: 3.0, y: 4.0 }];
+const SHUFFLED: Pt = { y: 8.0, x: 4.0 };
+const OMITTED: Pt = { x: 3.0 };
+const ONE: Ent = {
+  kind: 5,
+  flag: true,
+  weight: 2.5,
+  name: "entity",
+  at: { x: 9.5, y: 0.25 }
+};
+
+// A dispatch table: each entry is a link-time address, and the functions it
+// names must survive dead-function elimination even though nothing calls them
+// by name.
+const DISPATCH: Ops = { fast: &triple, slow: &quadruple };
+
+// Constants may be built from other constants and from sizeof.
+const WIDTH: int32 = 6;
+const DERIVED: int32[2] = [WIDTH * 2, sizeof(Pt)];
+
+// Mutable globals take literals too, and a pointer element may be the address
+// of another global or a null pointer.
+var g_counter: int32 = 11;
+const ALIASES: int32*[2] = [&g_counter, 0];
+var g_table: int32[4] = [1, 2, 3, 4];
+var g_point: Pt;
+
+// Word-sized aggregates, read and written through both a name and a pointer.
+const WORD: Word = { lo: 6, hi: 7 };
+const PAIR: int32[2] = [3, 4];
+var g_word: Word;
+
+fn main() -> int32 {
+  // Plain arrays.
+  if (TABLE[0] != 10 || TABLE[3] != 40) { return 1; }
+  if ((int32)(COEFF[1] * 10.0) != 15) { return 2; }
+  if (FILLED[0] != 9 || FILLED[7] != 9) { return 3; }
+
+  // Everything past the written prefix is zero, exactly as .bss would be.
+  if (PARTIAL[0] != 1 || PARTIAL[1] != 2) { return 4; }
+  if (PARTIAL[2] != 0 || PARTIAL[4] != 0) { return 5; }
+
+  // Nested aggregates and out-of-order / omitted fields.
+  if ((int32)NESTED[0].x != 1 || (int32)NESTED[1].y != 4) { return 6; }
+  if ((int32)SHUFFLED.x != 4 || (int32)SHUFFLED.y != 8) { return 7; }
+  if ((int32)OMITTED.x != 3 || (int32)OMITTED.y != 0) { return 8; }
+
+  // Mixed-element struct: integer, bool, float32, string, nested struct.
+  if (ONE.kind != 5) { return 9; }
+  if (!ONE.flag) { return 10; }
+  if ((int32)(ONE.weight * 2.0) != 5) { return 11; }
+  if ((int32)ONE.name.length != 6) { return 12; }
+  if ((int32)(ONE.at.y * 4.0) != 1) { return 13; }
+
+  // Relocated entries: function addresses and a data alias.
+  if (DISPATCH.fast(5) != 15) { return 14; }
+  if (DISPATCH.slow(5) != 20) { return 15; }
+  if (*ALIASES[0] != 11) { return 16; }
+  if (ALIASES[1] != 0) { return 17; }
+  g_counter = 12;
+  if (*ALIASES[0] != 12) { return 18; }
+
+  // Constant-expression elements.
+  if (DERIVED[0] != 12 || DERIVED[1] != 16) { return 19; }
+
+  // Mutable global initialized from a literal, then written.
+  if (g_table[2] != 3) { return 20; }
+  g_table[2] = 33;
+  if (g_table[2] != 33) { return 21; }
+
+  // The same literals as locals: copied in from the folded constant.
+  const LOCAL_TABLE: int32[6] = [1, 2, 3, 4, 5, 6];
+  var local_bytes: uint8[16] = [7; 16];
+  var local_pt: Pt = { x: 1.5, y: 2.5 };
+  var local_ents: Pt[3] = [{ x: 1.0, y: 1.0 }, { x: 2.0, y: 2.0 },
+                           { x: 3.0, y: 3.0 }];
+  var local_ent: Ent = { kind: 2, flag: false, weight: 1.0, name: "hi",
+                         at: { x: 0.5, y: 0.5 } };
+
+  if (LOCAL_TABLE[5] != 6) { return 22; }
+  if (local_bytes[0] != 7 || local_bytes[15] != 7) { return 23; }
+  if ((int32)(local_pt.y * 2.0) != 5) { return 24; }
+  if ((int32)local_ents[2].x != 3) { return 25; }
+  if (local_ent.kind != 2 || local_ent.flag) { return 26; }
+  if ((int32)local_ent.name.length != 2) { return 27; }
+
+  // Assignment: to a global, to a local, and to an array element.
+  g_point = { x: 7.0, y: 8.0 };
+  if ((int32)g_point.x != 7 || (int32)g_point.y != 8) { return 28; }
+
+  local_pt = { x: 40.0, y: 50.0 };
+  if ((int32)local_pt.x != 40 || (int32)local_pt.y != 50) { return 29; }
+
+  local_ents[1] = { x: 30.0, y: 31.0 };
+  if ((int32)local_ents[1].x != 30 || (int32)local_ents[1].y != 31) {
+    return 30;
+  }
+  if ((int32)local_ents[0].x != 1 || (int32)local_ents[2].x != 3) { return 31; }
+
+  // Word-sized aggregates: by name, and written through a pointer.
+  if (WORD.lo != 6 || WORD.hi != 7) { return 32; }
+  if (PAIR[0] != 3 || PAIR[1] != 4) { return 33; }
+
+  g_word = { lo: 1, hi: 2 };
+  if (g_word.lo != 1 || g_word.hi != 2) { return 34; }
+
+  var word_ptr: Word* = &g_word;
+  *word_ptr = { lo: 8, hi: 9 };
+  if (g_word.lo != 8 || g_word.hi != 9) { return 35; }
+  word_ptr->lo = 10;
+  if (g_word.lo != 10 || g_word.hi != 9) { return 36; }
+
+  var local_word: Word = { lo: 4, hi: 5 };
+  if (local_word.lo != 4 || local_word.hi != 5) { return 37; }
+
+  return 55;
+}

@@ -1,0 +1,3 @@
+kernel invalid_shape() {
+  private var scalar: float32;
+}

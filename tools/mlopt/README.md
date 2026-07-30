@@ -80,6 +80,60 @@ These enumerate every expression in their theory up to a cost bound and keep the
 cheapest per *exact* fingerprint (truth table / GF(2) matrix). The compiler looks
 an expression's fingerprint up and rewrites only when strictly cheaper.
 
+## The `gnn_oracle` successor (experimental, not shipped)
+
+A second architecture is being developed alongside the shipped one. It is not
+wired into the compiler: `gnn_genius.bin` is what `--ml-opt` loads, and nothing
+below changes that. See [`docs/ml-opt-oracle.md`](../../docs/ml-opt-oracle.md)
+for the design and rationale.
+
+| file | what |
+|------|------|
+| `obs.py` | observational-equivalence node features: evaluate each pure instruction on 8 pseudo-random leaf assignments, project the 512 resulting bits to 32 floats |
+| `obs_golden.py` | writes `obs_golden.txt`, the vectors the C port must reproduce |
+| `obs_gap.py` | measures how much value equality on real IR has no syntactic edge |
+| `gnn_oracle.py` | graph builder plus four nested variants (A baseline, B +OBS, C +pointer head, D +adaptive depth) |
+| `train_oracle.py` | multi-task trainer (action, pointer, liveness, validator-risk) |
+| `eval_oracle.py` | held-out evaluation including risk-head AUC and a threshold sweep |
+| `harvest.py` | compiles a corpus under the validator gate and turns its verdicts into labels |
+| `bakeoff.py` | the ablation driver: harvest, split, train all four, evaluate, report |
+| `export_oracle.py` | flattens an oracle checkpoint to the v2 `MLGO` blob |
+| `check_forward.py` | cross-checks the C forward pass against PyTorch node by node |
+| `split_audit.py` | measures how much the held-out set really is held out |
+| `sem_probe.py` | emits semantic-only reuse candidates as dispositions and reports the validator's verdicts (no model involved) |
+| `sem_runtime.py` | builds and runs each affected program with and without those rewrites |
+| `ptr_probe.py` | same question for targets the trained pointer head chooses (`METTLE_ML_PTR=1`) |
+| `risk_baseline.py` | trivial baselines the risk head has to beat |
+| `dagger_round.py` | one true DAgger round: model in the compiler, gate's verdicts become labels |
+| `summarize.py` | assembles every measurement into one report |
+
+The Python featurizer in `obs.py` and the C one in `src/ir/ml_obs.c` must agree
+bit for bit, for the same reason the nine original scalar features must: a
+divergence is invisible at runtime and shows up only as unexplained accuracy
+loss. `obs_golden.txt` pins that, `tests/ml_obs_parity_test.c` replays it, and
+the regression suite runs it as `ml_obs_python_parity`. Regenerate the vectors
+after ANY change to the probe scheme, the evaluation semantics, the projection,
+or the edge-eligibility rule, and bump `obs.OBS_VERSION` so stale graph caches
+are invalidated:
+
+```sh
+python obs_golden.py
+```
+
+Feature parity is necessary but not sufficient -- the same features through a
+mistranscribed forward pass still give different predictions. `check_forward.py`
+covers the rest by dumping the compiler's raw argmax with `METTLE_ML_ACTIONS`,
+rebuilding the same graphs in Python, and comparing node by node:
+
+```sh
+python check_forward.py --model _bakeoff/oracle_C.pt --blob oracle_C.bin \
+    --source ../../examples/binary_search/binary_search.mettle
+```
+
+One rule this enforces: **harvest raw IR text, never canonicalized text.** The
+compiler featurizes the dump exactly as written, so canonicalizing before
+labelling trains the model on text it will never see at compile time.
+
 ## Key sound transforms (also used to label training data)
 
 `liveness.py` (DCE), `gvn.py` (global value numbering), `affine.py` (linear-form

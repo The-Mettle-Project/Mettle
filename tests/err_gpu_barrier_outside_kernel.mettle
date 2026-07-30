@@ -1,0 +1,5 @@
+fn host_function() {
+  barrier(workgroup, acq_rel);
+}
+
+fn main() -> int64 { return 0; }

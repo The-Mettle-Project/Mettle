@@ -1,0 +1,10 @@
+// An extern's storage lives in another object file, so its value is not
+// available when this global's bytes are laid out.
+
+extern var errno_value: int32 = "errno";
+
+var saved: int32 = errno_value;
+
+fn main() -> int32 {
+  return saved;
+}

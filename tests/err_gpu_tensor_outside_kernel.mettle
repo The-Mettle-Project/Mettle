@@ -1,0 +1,7 @@
+fn host_tensor(a: uint16*, b: uint16*, c: float32*, d: float32*) {
+  tensor_mma(a, b, c, d, shape: m16n16k16, input_type: f16, output_type: f32);
+}
+
+fn main() -> int64 {
+  return 0;
+}

@@ -1,0 +1,21 @@
+struct Big { a: int64; b: int64; c: int64; }
+@noinline fn inner(a: int32, b: int32, c: int32, d: int32, e: int32, f: int32) -> int32 {
+  return a * 1 + b * 2 + c * 3 + d * 4 + e * 5 + f * 6;
+}
+@noinline fn middle(s: Big, a: int32, b: int32, c: int32, d: int32, e: int32) -> int64 {
+  return s.a + (int64)inner(a, b, c, d, e, 1);
+}
+@noinline fn outer(s: Big, x: int32) -> int64 {
+  return middle(s, x, x + 1, x + 2, x + 3, x + 4) + s.c;
+}
+@noinline fn viafp(f: fn(int32, int32, int32, int32, int32, int32) -> int32) -> int32 {
+  return f(1, 2, 3, 4, 5, 6);
+}
+fn main() -> int32 {
+  var s: Big = { a: 100, b: 200, c: 300 };
+  if (inner(1, 2, 3, 4, 5, 6) != 91) { return 1; }
+  if (middle(s, 1, 2, 3, 4, 5) != 100 + 61) { return 2; }
+  if (outer(s, 1) != 100 + 61 + 300) { return 3; }
+  if (viafp(&inner) != 91) { return 4; }
+  return 0;
+}

@@ -1,0 +1,32 @@
+// Exact bounded structured-2:4 regions.  A stores two f16/bf16 values per
+// logical K group in increasing selected-index order; metadata is the neutral
+// row-major uint8 [M][ceil(problem_k/4)] mask grid.  These are compiler and
+// offline-assembly fixtures only.
+
+kernel tensor_matmul_sparse_f16(
+    a: uint16*, b: uint16*, c: float32*, d: float32*, metadata: uint8*,
+    row_origin: uint32, column_origin: uint32,
+    problem_m: uint32, problem_n: uint32, problem_k: uint32,
+    lda: uint32, ldb: uint32, ldc: uint32, ldd: uint32) {
+  tensor_matmul(
+      a, b, c, d, row_origin, column_origin,
+      problem_m, problem_n, problem_k,
+      shape: m16n16k16, input_type: f16, output_type: f32,
+      a_layout: row, b_layout: col,
+      sparsity: structured_2_to_4, metadata: metadata,
+      lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+}
+
+kernel tensor_matmul_sparse_bf16_transpose_a(
+    a: uint16*, b: uint16*, c: float32*, d: float32*, metadata: uint8*,
+    row_origin: uint32, column_origin: uint32,
+    problem_m: uint32, problem_n: uint32, problem_k: uint32,
+    lda: uint32, ldb: uint32, ldc: uint32, ldd: uint32) {
+  tensor_matmul(
+      a, b, c, d, row_origin, column_origin,
+      problem_m, problem_n, problem_k,
+      shape: m16n16k16, input_type: bf16, output_type: f32,
+      a_layout: col, b_layout: col, transpose_a: true,
+      sparsity: structured_2_to_4, metadata: metadata,
+      lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+}

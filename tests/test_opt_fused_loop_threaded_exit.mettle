@@ -1,0 +1,71 @@
+// Regression: a vectorizable loop in the THEN branch of an if/else whose exit
+// branch gets forwarded by jump threading (the empty while_end block jumps
+// straight to the if/else join). The loop-fusion installers replace the whole
+// [header..back-edge] region with a straight-line SIMD kernel, deleting the
+// exit branch; before ir_fused_loop_exit_is_adjacent this made the fused THEN
+// branch fall through into the ELSE branch, running both (the ornith engine's
+// --release NaN). Self-checking: computes the same result with fusion-defeating
+// guards and compares. Exit 55 on match, 1 on divergence.
+import "std/mem";
+extern fn expf(x: float32) -> float32 = "expf";
+
+var sx: float32* = (float32*)0;
+var sao: float32* = (float32*)0;
+var rx: float32* = (float32*)0;
+var D: int64 = 64;
+
+fn fill(l: int64) {
+  var i: int64 = 0;
+  while (i < D) { sao[i] = (float32)((i + l) % 5) * 0.125; i = i + 1; }
+}
+
+// Fusible shape: both branches accumulate the SAME arrays; jump threading
+// forwards the then-loop's exit past the else block to the join.
+fn layer(l: int64) {
+  fill(l);
+  if ((l % 4) == 3) {
+    var d2: int64 = 0;
+    while (d2 < D) { sx[d2] = sx[d2] + sao[d2]; d2 = d2 + 1; }
+  } else {
+    var e: float32 = expf((float32)l * 0.01);
+    sao[0] = sao[0] + e * 0.0001;
+    var d3: int64 = 0;
+    while (d3 < D) { sx[d3] = sx[d3] + sao[d3]; d3 = d3 + 1; }
+  }
+}
+
+// Reference: identical logic with idiom-defeating guards (the self-compare is
+// always true for finite values, but blocks the affine-map recognizer).
+fn layer_ref(l: int64) {
+  fill(l);
+  if ((l % 4) == 3) {
+    var d2: int64 = 0;
+    while (d2 < D) { if (sao[d2] == sao[d2]) { rx[d2] = rx[d2] + sao[d2]; } d2 = d2 + 1; }
+  } else {
+    var e: float32 = expf((float32)l * 0.01);
+    sao[0] = sao[0] + e * 0.0001;
+    var d3: int64 = 0;
+    while (d3 < D) { if (sao[d3] == sao[d3]) { rx[d3] = rx[d3] + sao[d3]; } d3 = d3 + 1; }
+  }
+}
+
+fn main() -> int32 {
+  sx = (float32*)malloc(D * 4);
+  sao = (float32*)malloc(D * 4);
+  rx = (float32*)malloc(D * 4);
+  var i: int64 = 0;
+  while (i < D) { sx[i] = 0.0; rx[i] = 0.0; i = i + 1; }
+  var l: int64 = 0;
+  while (l < 8) { layer(l); l = l + 1; }
+  l = 0;
+  while (l < 8) { layer_ref(l); l = l + 1; }
+  i = 0;
+  while (i < D) {
+    var a: float32 = sx[i]; var b: float32 = rx[i];
+    if (a != a) { return 1; }
+    var d: float32 = a - b; if (d < 0.0) { d = 0.0 - d; }
+    if (d > 0.000001) { return 1; }
+    i = i + 1;
+  }
+  return 55;
+}

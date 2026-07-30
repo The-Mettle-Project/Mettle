@@ -1,0 +1,631 @@
+// Real-device differential kernels. This module is compiled with -O and loaded
+// through the CUDA Driver API by hardware_harness.c on both x86 development
+// GPUs and DGX Spark's AArch64/GB10 platform.
+
+extern fn sqrtf(x: float32) -> float32 = "sqrtf";
+extern fn expf(x: float32) -> float32 = "expf";
+extern fn rsqrtf(x: float32) -> float32 = "rsqrtf";
+extern fn h2f(bits: uint16) -> float32 = "h2f";
+
+// Contended global and workgroup atomics, plus a release/acquire message pass.
+// Four 64-thread workgroups exercise every u32/u64 RMW and CAS identity. The
+// host verifies final algebra, returned-old permutations, exactly one CAS
+// winner, per-workgroup totals, and visibility of the published payload.
+kernel atomic_litmus(state32: uint32*, state64: uint64*,
+                     tickets32: uint32*, tickets64: uint64*,
+                     cas32: uint32*, cas64: uint64*,
+                     shared_out32: uint32*, shared_out64: uint64*) {
+  workgroup var local32: uint32[1];
+  workgroup var local64: uint64[1];
+  var id: uint64 = (uint64)(block.x * block_dim.x + thread.x);
+  var zero: uint64 = 0;
+  var one32: uint32 = 1;
+  var one64: uint64 = 1;
+  var id32: uint32 = (uint32)id;
+  var bit32: uint32 = (uint32)1 << (uint32)(id % (uint64)32);
+  var bit64: uint64 = (uint64)1 << (uint64)(id % (uint64)64);
+
+  tickets32[id] = atomic_fetch_add(state32, 0, one32,
+                                    order: acq_rel, scope: device);
+  tickets64[id] = atomic_fetch_add(state64, 0, one64,
+                                    order: acq_rel, scope: device);
+  atomic_fetch_sub(state32, 1, one32, order: release, scope: device);
+  atomic_fetch_sub(state64, 1, one64, order: release, scope: device);
+  atomic_fetch_min(state32, 2, id32, order: relaxed, scope: device);
+  atomic_fetch_min(state64, 2, id, order: relaxed, scope: device);
+  atomic_fetch_max(state32, 3, id32, order: relaxed, scope: device);
+  atomic_fetch_max(state64, 3, id, order: relaxed, scope: device);
+  atomic_fetch_and(state32, 4, ~bit32, order: relaxed, scope: device);
+  atomic_fetch_and(state64, 4, ~bit64, order: relaxed, scope: device);
+  atomic_fetch_or(state32, 5, bit32, order: relaxed, scope: device);
+  atomic_fetch_or(state64, 5, bit64, order: relaxed, scope: device);
+  atomic_fetch_xor(state32, 6, bit32, order: relaxed, scope: device);
+  atomic_fetch_xor(state64, 6, bit64, order: relaxed, scope: device);
+  atomic_exchange(state32, 7, id32, order: relaxed, scope: device);
+  atomic_exchange(state64, 7, id, order: relaxed, scope: device);
+  cas32[id] = atomic_compare_exchange(
+      state32, 8, 0, id32 + one32,
+      success_order: acq_rel, failure_order: acquire, scope: device);
+  cas64[id] = atomic_compare_exchange(
+      state64, 8, 0, id + one64,
+      success_order: acq_rel, failure_order: acquire, scope: device);
+
+  if (thread.x == 0) {
+    local32[0] = 0;
+    local64[0] = 0;
+  }
+  barrier(workgroup, acq_rel);
+  atomic_fetch_add(local32, zero, one32, order: relaxed);
+  atomic_fetch_add(local64, zero, one64, order: relaxed);
+  barrier(workgroup, acq_rel);
+  if (thread.x == 0) {
+    shared_out32[block.x] = local32[0];
+    shared_out64[block.x] = local64[0];
+  }
+
+  // state32[16 + block*3 + {0,1,2}] is flag/payload/observed payload.
+  var message: uint64 = (uint64)16 + (uint64)block.x * (uint64)3;
+  if (thread.x == 0) {
+    state32[message + (uint64)1] = (uint32)(0x5a00 + block.x);
+    atomic_store(state32, message, one32, order: release, scope: device);
+  }
+  if (thread.x == 32) {
+    var observed: uint32 = 0;
+    while (observed == 0) {
+      observed = atomic_load(state32, message,
+                             order: acquire, scope: device);
+    }
+    state32[message + (uint64)2] = state32[message + (uint64)1];
+  }
+}
+
+kernel index_3d(out: int32*) {
+  var local_linear: int32 = (thread.z * block_dim.y + thread.y) * block_dim.x + thread.x;
+  var block_linear: int32 = (block.z * grid_dim.y + block.y) * grid_dim.x + block.x;
+  var block_threads: int32 = block_dim.x * block_dim.y * block_dim.z;
+  var base: int32 = (block_linear * block_threads + local_linear) * 12;
+  out[base + 0] = thread.x;
+  out[base + 1] = thread.y;
+  out[base + 2] = thread.z;
+  out[base + 3] = block.x;
+  out[base + 4] = block.y;
+  out[base + 5] = block.z;
+  out[base + 6] = block_dim.x;
+  out[base + 7] = block_dim.y;
+  out[base + 8] = block_dim.z;
+  out[base + 9] = grid_dim.x;
+  out[base + 10] = grid_dim.y;
+  out[base + 11] = grid_dim.z;
+}
+
+fn multiply_add(alpha: float32, x: float32, y: float32) -> float32 {
+  return alpha * x + y;
+}
+
+kernel saxpy_odd(alpha: float32, x: float32*, y: float32*, n: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < n) {
+    y[i] = multiply_add(alpha, x[i], y[i]);
+  }
+}
+
+kernel row_norm(inp: float32*, out: float32*, rows: int32, cols: int32) {
+  var row: int32 = block.x * block_dim.x + thread.x;
+  if (row < rows) {
+    var sum: float32 = 0.0;
+    var col: int32 = 0;
+    while (col < cols) {
+      var value: float32 = inp[row * cols + col];
+      sum = sum + value * value;
+      col = col + 1;
+    }
+    out[row] = sqrtf(sum);
+  }
+}
+
+kernel staged_copy(x: float32*, out: float32*, n: int32) {
+  workgroup var tile: float32[64];
+  private var scratch: int32[4];
+  var lane: int32 = thread.x;
+  var i: int32 = block.x * block_dim.x + lane;
+  scratch[0] = lane;
+  if (i < n) {
+    tile[lane] = x[i];
+  }
+  barrier(workgroup, global, acq_rel);
+  if (i < n) {
+    out[i] = tile[lane] + (float32)(scratch[0] - lane);
+  }
+}
+
+// One naturally aligned 16-byte transaction per lane. Native PTX profiles use
+// cp.async while portable profiles preserve the same result synchronously.
+kernel async_stage_u32x4(src: uint32*, out: uint32*) {
+  workgroup var tile: uint32[128];
+  var lane: int32 = thread.x;
+  var base: int32 = lane * 4;
+  async_copy_workgroup(&tile[base], src + base, 4,
+                       transaction: 16, cache: global);
+  async_copy_commit();
+  async_copy_wait(0);
+  barrier(workgroup, acq_rel);
+  out[base] = tile[(base + 124) % 128];
+  out[base + 1] = tile[(base + 125) % 128];
+  out[base + 2] = tile[(base + 126) % 128];
+  out[base + 3] = tile[(base + 127) % 128];
+}
+
+// Ordinary typed source: the shared optimizer, not either frontend or PTX,
+// recognizes the load/store staging contract and places WAIT after independent
+// register work but before the acquire/release workgroup barrier.
+kernel auto_stage_u32(src: uint32*, out: uint32*) {
+  workgroup var tile: uint32[32];
+  var lane: int32 = thread.x;
+  tile[lane] = src[lane];
+  var mix: uint32 = (uint32)lane * (uint32)1664525 + (uint32)1013904223;
+  barrier(workgroup, acq_rel);
+  out[lane] = tile[(lane + 31) % 32] ^ mix;
+}
+
+kernel dynamic_staged_copy(x: float32*, out: float32*, n: int32) {
+  workgroup var values: float32*;
+  workgroup var metadata: uint32*;
+  var lane: int32 = thread.x;
+  var i: int32 = block.x * block_dim.x + lane;
+  if (i < n) {
+    values[lane] = x[i];
+    metadata[64 + lane] = (uint32)i;
+  }
+  barrier(workgroup, acq_rel);
+  if (i < n) {
+    out[i] = values[lane] + (float32)(metadata[64 + lane] - (uint32)i);
+  }
+}
+
+kernel subgroup_contract(fsrc: float32*, fdst: float32*,
+                         usrc: uint32*, udst: uint32*, n: int32) {
+  var lane: uint32 = subgroup_local_id();
+  var i: int32 = block.x * block_dim.x + thread.x;
+  var fv: float32 = 0.0;
+  var uv: uint32 = 0;
+  if (i < n) {
+    fv = fsrc[i];
+    uv = usrc[i];
+  }
+  var fsum: float32 = subgroup_reduce_add(fv);
+  var usum: uint32 = subgroup_reduce_add(uv);
+  var ffirst: float32 = subgroup_broadcast(fv, 0);
+  var ufirst: uint32 = subgroup_broadcast(uv, 0);
+  if (i < n) {
+    fdst[i] = fsum + ffirst;
+    udst[i] = usum + ufirst + lane - lane;
+  }
+}
+
+kernel subgroup_extended(fsrc: float32*, fdst: float32*,
+                         usrc: uint32*, udst: uint32*, n: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  var fadd: float32 = 0.0;
+  var uadd: uint32 = 0;
+  var fmin_input: float32 = (float32)340282300000000000000000000000000000000.0;
+  var umin_input: uint32 = (uint32)4294967295;
+  var fmax_input: float32 = (float32)-340282300000000000000000000000000000000.0;
+  var umax_input: uint32 = 0;
+  if (i < n) {
+    fadd = fsrc[i];
+    uadd = usrc[i];
+    fmin_input = fadd;
+    umin_input = uadd;
+    fmax_input = fadd;
+    umax_input = uadd;
+  }
+  var fmin: float32 = subgroup_reduce_min(fmin_input);
+  var fmax: float32 = subgroup_reduce_max(fmax_input);
+  var finc: float32 = subgroup_scan_inclusive_add(fadd);
+  var fexc: float32 = subgroup_scan_exclusive_add(fadd);
+  var umin: uint32 = subgroup_reduce_min(umin_input);
+  var umax: uint32 = subgroup_reduce_max(umax_input);
+  var uinc: uint32 = subgroup_scan_inclusive_add(uadd);
+  var uexc: uint32 = subgroup_scan_exclusive_add(uadd);
+  if (i < n) {
+    fdst[i] = fmin;
+    fdst[n + i] = fmax;
+    fdst[n * 2 + i] = finc;
+    fdst[n * 3 + i] = fexc;
+    udst[i] = umin;
+    udst[n + i] = umax;
+    udst[n * 2 + i] = uinc;
+    udst[n * 3 + i] = uexc;
+  }
+}
+
+// Variable-source exchange and width-preserving ballot/vote coverage. The
+// hardware harness launches a partial final warp so an inactive source lane
+// takes the documented caller-value fallback.
+kernel subgroup_exchange_vote(usrc: uint32*, uout: uint32*,
+                              fsrc: float32*, fout: float32*) {
+  var lane: uint32 = subgroup_local_id();
+  var i: int32 = thread.x;
+  var source: uint32 = (lane * 5 + 7) % subgroup_size();
+  var predicate: bool = lane % 3 == 1;
+  var no_lane: bool = lane >= subgroup_size();
+  uout[i * 7] = subgroup_shuffle(usrc[i], source);
+  uout[i * 7 + 1] = subgroup_ballot(predicate, 0);
+  uout[i * 7 + 2] = subgroup_ballot(predicate, 1);
+  uout[i * 7 + 3] = (uint32)subgroup_any(predicate);
+  uout[i * 7 + 4] = (uint32)subgroup_all(lane < subgroup_size());
+  uout[i * 7 + 5] = (uint32)subgroup_all(predicate);
+  uout[i * 7 + 6] = (uint32)subgroup_any(no_lane);
+  fout[i] = subgroup_shuffle(fsrc[i], source);
+}
+
+// One implementation-sized subgroup owns a row. Each lane processes a strided
+// slice, so columns need not be a multiple of the subgroup width and can exceed
+// it. The two collectives sit after reconverged lane-local loops.
+kernel softmax_rows_f32(inp: float32*, out: float32*, rows: int32, cols: int32,
+                        ldin: int32, ldout: int32) {
+  var row: int32 = block.x;
+  var lane: int32 = (int32)subgroup_local_id();
+  var width: int32 = (int32)subgroup_size();
+  if (row < rows && cols > 0) {
+    var in_base: int64 = (int64)row * (int64)ldin;
+    var out_base: int64 = (int64)row * (int64)ldout;
+    var local_max: float32 = (float32)-340282300000000000000000000000000000000.0;
+    var col: int32 = lane;
+    while (col < cols) {
+      var value: float32 = inp[in_base + (int64)col];
+      if (value > local_max) {
+        local_max = value;
+      }
+      col = col + width;
+    }
+    var row_max: float32 = subgroup_reduce_max(local_max);
+    var local_sum: float32 = 0.0;
+    col = lane;
+    while (col < cols) {
+      local_sum = local_sum + expf(inp[in_base + (int64)col] - row_max);
+      col = col + width;
+    }
+    var row_sum: float32 = subgroup_reduce_add(local_sum);
+    col = lane;
+    while (col < cols) {
+      var normalized: float32 = expf(inp[in_base + (int64)col] - row_max) / row_sum;
+      out[out_base + (int64)col] = normalized;
+      col = col + width;
+    }
+  }
+}
+
+kernel layer_norm_rows_f32(inp: float32*, gamma: float32*, beta: float32*,
+                           out: float32*, rows: int32, cols: int32,
+                           ldin: int32, ldout: int32, epsilon: float32) {
+  var row: int32 = block.x;
+  var lane: int32 = (int32)subgroup_local_id();
+  var width: int32 = (int32)subgroup_size();
+  if (row < rows && cols > 0) {
+    var in_base: int64 = (int64)row * (int64)ldin;
+    var out_base: int64 = (int64)row * (int64)ldout;
+    var local_sum: float32 = 0.0;
+    var col: int32 = lane;
+    while (col < cols) {
+      local_sum = local_sum + inp[in_base + (int64)col];
+      col = col + width;
+    }
+    var row_sum: float32 = subgroup_reduce_add(local_sum);
+    var mean: float32 = row_sum / (float32)cols;
+    var local_squared: float32 = 0.0;
+    col = lane;
+    while (col < cols) {
+      var centered: float32 = inp[in_base + (int64)col] - mean;
+      local_squared = local_squared + centered * centered;
+      col = col + width;
+    }
+    var squared_sum: float32 = subgroup_reduce_add(local_squared);
+    var inverse_stddev: float32 = rsqrtf(squared_sum / (float32)cols + epsilon);
+    col = lane;
+    while (col < cols) {
+      var normalized: float32 = (inp[in_base + (int64)col] - mean) * inverse_stddev;
+      out[out_base + (int64)col] = normalized * gamma[col] + beta[col];
+      col = col + width;
+    }
+  }
+}
+
+kernel tensor_f16_f32(a: uint16*, b: uint16*, c: float32*, d: float32*, lda: int32, ldb: int32, ldc: int32, ldd: int32) {
+  tensor_mma(a, b, c, d, shape: m16n16k16, input_type: f16, output_type: f32, a_layout: row, b_layout: col, c_layout: row, d_layout: row, lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+}
+
+kernel tensor_fp8_m16n16k32(a: uint8*, b: uint8*, c: float32*, d: float32*, lda: int32, ldb: int32, ldc: int32, ldd: int32) {
+  tensor_mma(a, b, c, d,
+             shape: m16n16k32,
+             a_type: e4m3, b_type: e5m2,
+             accumulator_type: f32, result_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+}
+
+kernel tensor_fp8_m32n24k16_transposed(a: uint8*, b: uint8*, c: float32*, d: float32*, lda: int32, ldb: int32, ldc: int32, ldd: int32) {
+  tensor_mma(a, b, c, d,
+             shape: m32n24k16,
+             a_type: e5m2, b_type: e4m3,
+             accumulator_type: f32, result_type: f32,
+             a_layout: col, b_layout: row, c_layout: col, d_layout: col,
+             transpose_a: true, transpose_b: true,
+             lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+}
+/* Four connected operations remain four neutral whole-tile requests. The
+ * optimizer may fuse them, but no frontend or shared-IR surface exposes PTX
+ * fragments or promises a vendor instruction spelling. */
+kernel tensor_fp8_chain4_m16n16k32(
+    a: uint8*, b: uint8*, c: float32*, d: float32*,
+    lda: int32, ldb: int32, ldc: int32, ldd: int32) {
+  tensor_mma(a, b, c, d,
+             shape: m16n16k32,
+             a_type: e4m3, b_type: e5m2,
+             accumulator_type: f32, result_type: f32,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+  tensor_mma(a, b, d, d,
+             shape: m16n16k32,
+             a_type: e4m3, b_type: e5m2,
+             accumulator_type: f32, result_type: f32,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldd, ldd: ldd);
+  tensor_mma(a, b, d, d,
+             shape: m16n16k32,
+             a_type: e4m3, b_type: e5m2,
+             accumulator_type: f32, result_type: f32,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldd, ldd: ldd);
+  tensor_mma(a, b, d, d,
+             shape: m16n16k32,
+             a_type: e4m3, b_type: e5m2,
+             accumulator_type: f32, result_type: f32,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldd, ldd: ldd);
+}
+
+/* Runtime K remains ordinary neutral control flow. The optimizer proves the
+ * loop-carried D dependency and the backend retains both output subtiles. */
+kernel tensor_fp8_runtime_k_m16n16k32(
+    a: uint8*, b: uint8*, c: float32*, d: float32*, k: int32,
+    lda: int32, ldb: int32, ldc: int32, ldd: int32) {
+  tensor_mma(a, b, c, d,
+             shape: m16n16k32,
+             a_type: e4m3, b_type: e5m2,
+             accumulator_type: f32, result_type: f32,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+  var inner: int32 = 32;
+  while (inner < k) {
+    tensor_mma(a + inner, b + inner, d, d,
+               shape: m16n16k32,
+               a_type: e4m3, b_type: e5m2,
+               accumulator_type: f32, result_type: f32,
+               a_layout: row, b_layout: col,
+               c_layout: row, d_layout: row,
+               lda: lda, ldb: ldb, ldc: ldd, ldd: ldd);
+    inner = inner + 32;
+  }
+}
+
+// Four explicit K tiles give the target-neutral optimizer an exact sequential
+// accumulator chain. The optimized PTX must load C once, retain the fragment
+// across all four MMAs, and store D once; the hardware oracle below catches a
+// dropped, reordered, or double-counted tile independently of PTX inspection.
+kernel tensor_chain4(a: uint16*, b: uint16*, c: float32*, d: float32*,
+                     lda: int32, ldb: int32, ldc: int32, ldd: int32) {
+  var a1: uint16* = a + 16;
+  var a2: uint16* = a + 32;
+  var a3: uint16* = a + 48;
+  var b1: uint16* = b + 16;
+  var b2: uint16* = b + 32;
+  var b3: uint16* = b + 48;
+  tensor_mma(a, b, c, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+  tensor_mma(a1, b1, d, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldd, ldd: ldd);
+  tensor_mma(a2, b2, d, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldd, ldd: ldd);
+  tensor_mma(a3, b3, d, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldd, ldd: ldd);
+}
+
+// One subgroup owns each 16x16 output tile. The grid spans M/N and the uniform
+// loop spans K, reusing D as the accumulator after the first tile. M/N/K must
+// be positive multiples of 16; a separate tail strategy is required otherwise.
+kernel gemm_full_tiles_f16_f32(a: uint16*, b: uint16*, c: float32*, d: float32*,
+                               m: int32, n: int32, k: int32,
+                               lda: int32, ldb: int32, ldc: int32, ldd: int32) {
+  var tile_row: int64 = (int64)block.y * 16;
+  var tile_col: int64 = (int64)block.x * 16;
+  if (tile_row + 16 <= (int64)m && tile_col + 16 <= (int64)n &&
+      k >= 16 && k % 16 == 0) {
+    var a_tile: uint16* = a + tile_row * (int64)lda;
+    var b_tile: uint16* = b + tile_col * (int64)ldb;
+    var c_tile: float32* = c + tile_row * (int64)ldc + tile_col;
+    var d_tile: float32* = d + tile_row * (int64)ldd + tile_col;
+    tensor_mma(a_tile, b_tile, c_tile, d_tile,
+               shape: m16n16k16, input_type: f16, output_type: f32,
+               a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+               lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+    var inner: int32 = 16;
+    while (inner < k) {
+      tensor_mma(a_tile + inner, b_tile + inner, d_tile, d_tile,
+                 shape: m16n16k16, input_type: f16, output_type: f32,
+                 a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+                 lda: lda, ldb: ldb, ldc: ldd, ldd: ldd);
+      inner = inner + 16;
+    }
+  }
+}
+
+// One warp owns each logical 16x16 output tile. Complete tiles use resident
+// WMMA across the full K prefix; the same kernel handles M/N edges, K tails,
+// and K<16 without reading poisoned padding or requiring host-side dispatch.
+kernel gemm_tail_complete_f16_f32(a: uint16*, b: uint16*,
+                                  c: float32*, d: float32*,
+                                  m: int32, n: int32, k: int32,
+                                  lda: int32, ldb: int32,
+                                  ldc: int32, ldd: int32) {
+  var tile_row: int32 = block.y * 16;
+  var tile_col: int32 = block.x * 16;
+  var full_k: int32 = (k / 16) * 16;
+  var scalar_start: int32 = 0;
+  var full_output: bool = tile_row + 16 <= m && tile_col + 16 <= n;
+
+  if (full_output && full_k >= 16) {
+    var a_tile: uint16* = a + (int64)tile_row * (int64)lda;
+    var b_tile: uint16* = b + (int64)tile_col * (int64)ldb;
+    var c_tile: float32* = c + (int64)tile_row * (int64)ldc + (int64)tile_col;
+    var d_tile: float32* = d + (int64)tile_row * (int64)ldd + (int64)tile_col;
+    tensor_mma(a_tile, b_tile, c_tile, d_tile,
+               shape: m16n16k16, input_type: f16, output_type: f32,
+               a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+               lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+    var inner_tile: int32 = 16;
+    while (inner_tile < full_k) {
+      tensor_mma(a_tile + inner_tile, b_tile + inner_tile, d_tile, d_tile,
+                 shape: m16n16k16, input_type: f16, output_type: f32,
+                 a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+                 lda: lda, ldb: ldb, ldc: ldd, ldd: ldd);
+      inner_tile = inner_tile + 16;
+    }
+    scalar_start = full_k;
+  }
+
+  if (scalar_start > 0 && scalar_start < k) {
+    barrier(workgroup, global, acq_rel);
+  }
+  if (scalar_start == 0 || scalar_start < k) {
+    var output: int32 = thread.x;
+    while (output < 256) {
+      var row: int32 = tile_row + output / 16;
+      var col: int32 = tile_col + output % 16;
+      if (row < m && col < n) {
+        var acc: float32 = c[(int64)row * (int64)ldc + (int64)col];
+        if (scalar_start > 0) {
+          acc = d[(int64)row * (int64)ldd + (int64)col];
+        }
+        var inner: int32 = scalar_start;
+        while (inner < k) {
+          var av: float32 = h2f(a[(int64)row * (int64)lda + (int64)inner]);
+          var bv: float32 = h2f(b[(int64)col * (int64)ldb + (int64)inner]);
+          acc = acc + av * bv;
+          inner = inner + 1;
+        }
+        d[(int64)row * (int64)ldd + (int64)col] = acc;
+      }
+      output = output + block_dim.x;
+    }
+  }
+}
+
+kernel narrow_scalar_abi(i8: int8, u8: uint8, i16: int16, u16: uint16,
+                         flag: bool, out: int32*) {
+  if (flag) {
+    out[0] = (int32)i8 + (int32)u8 + (int32)i16 + (int32)u16;
+  }
+}
+
+// Double-buffered native-copy/tensor integration. One warp stages two exact
+// tiles, overlaps the second group with the first MMA, and keeps D resident
+// through the final wait/publication handoff.
+kernel tensor_pipeline_f16_f32(a: uint16*, b: uint16*,
+                               c: float32*, d: float32*) {
+  workgroup var a_stage: uint16[512];
+  workgroup var b_stage: uint16[512];
+  var lane: int32 = thread.x;
+  var base: int32 = lane * 8;
+  async_copy_workgroup(&a_stage[base], a + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_workgroup(&b_stage[base], b + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_commit();
+  async_copy_workgroup(&a_stage[256 + base], a + 256 + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_workgroup(&b_stage[256 + base], b + 256 + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_commit();
+  async_copy_wait(1);
+  barrier(workgroup, acq_rel);
+  tensor_mma(&a_stage[0], &b_stage[0], c, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: 16, ldb: 16, ldc: 16, ldd: 16);
+  async_copy_wait(0);
+  barrier(workgroup, acq_rel);
+  tensor_mma(&a_stage[256], &b_stage[256], d, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: 16, ldb: 16, ldc: 16, ldd: 16);
+}
+
+// Four groups establish that async/tensor residency is an N-stage contract,
+// including every wait/barrier handoff, rather than a double-buffer peephole.
+kernel tensor_pipeline4_f16_f32(a: uint16*, b: uint16*,
+                                c: float32*, d: float32*) {
+  workgroup var a_stage: uint16[1024];
+  workgroup var b_stage: uint16[1024];
+  var lane: int32 = thread.x;
+  var base: int32 = lane * 8;
+
+  async_copy_workgroup(&a_stage[base], a + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_workgroup(&b_stage[base], b + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_commit();
+  async_copy_workgroup(&a_stage[256 + base], a + 256 + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_workgroup(&b_stage[256 + base], b + 256 + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_commit();
+  async_copy_workgroup(&a_stage[512 + base], a + 512 + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_workgroup(&b_stage[512 + base], b + 512 + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_commit();
+  async_copy_workgroup(&a_stage[768 + base], a + 768 + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_workgroup(&b_stage[768 + base], b + 768 + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_commit();
+
+  async_copy_wait(3);
+  barrier(workgroup, acq_rel);
+  tensor_mma(&a_stage[0], &b_stage[0], c, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: 16, ldb: 16, ldc: 16, ldd: 16);
+  async_copy_wait(2);
+  barrier(workgroup, acq_rel);
+  tensor_mma(&a_stage[256], &b_stage[256], d, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: 16, ldb: 16, ldc: 16, ldd: 16);
+  async_copy_wait(1);
+  barrier(workgroup, acq_rel);
+  tensor_mma(&a_stage[512], &b_stage[512], d, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: 16, ldb: 16, ldc: 16, ldd: 16);
+  async_copy_wait(0);
+  barrier(workgroup, acq_rel);
+  tensor_mma(&a_stage[768], &b_stage[768], d, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: 16, ldb: 16, ldc: 16, ldd: 16);
+}

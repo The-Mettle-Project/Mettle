@@ -29,6 +29,11 @@ jobs:
         with:
           languages: c-cpp
 
+      # Only this repository's sources are analyzed: the backend is a
+      # dependency, and libmtlc's own CodeQL run covers it.
+      - name: Fetch and build libmtlc backend
+        run: ./get-libmtlc.sh
+
       - name: Build compiler
         run: make -j"$(nproc)"
 

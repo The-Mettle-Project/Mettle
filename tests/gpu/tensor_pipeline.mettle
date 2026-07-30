@@ -1,0 +1,38 @@
+// Two 16x16x16 half-input tiles are staged by one 32-lane workgroup. Group 0
+// is published before the first MMA; group 1 remains eligible to overlap that
+// MMA and is published only before the connected update. The neutral optimizer
+// may retain D across the wait/barrier handoff, but no source-level fragment ABI
+// or vendor operation is exposed.
+kernel tensor_pipeline_f16_f32(a: uint16*, b: uint16*,
+                               c: float32*, d: float32*) {
+  workgroup var a_stage: uint16[512];
+  workgroup var b_stage: uint16[512];
+  var lane: int32 = thread.x;
+  var base: int32 = lane * 8;
+
+  async_copy_workgroup(&a_stage[base], a + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_workgroup(&b_stage[base], b + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_commit();
+
+  async_copy_workgroup(&a_stage[256 + base], a + 256 + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_workgroup(&b_stage[256 + base], b + 256 + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_commit();
+
+  async_copy_wait(1);
+  barrier(workgroup, acq_rel);
+  tensor_mma(&a_stage[0], &b_stage[0], c, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: 16, ldb: 16, ldc: 16, ldd: 16);
+
+  async_copy_wait(0);
+  barrier(workgroup, acq_rel);
+  tensor_mma(&a_stage[256], &b_stage[256], d, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: 16, ldb: 16, ldc: 16, ldd: 16);
+}

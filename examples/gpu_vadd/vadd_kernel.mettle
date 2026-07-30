@@ -4,10 +4,7 @@
 // `kernel` marks a GPU entry point. The index built-ins read like CUDA:
 //   thread.x      threadIdx.x      block.x       blockIdx.x
 //   block_dim.x   blockDim.x       grid_dim.x    gridDim.x
-// (they lower to the gpu_* sreg intrinsics, declared extern below).
-extern fn gpu_tid_x() -> int32 = "gpu_tid_x";
-extern fn gpu_ntid_x() -> int32 = "gpu_ntid_x";
-extern fn gpu_ctaid_x() -> int32 = "gpu_ctaid_x";
+// (they lower to target-neutral index intrinsics; no declaration is required).
 
 kernel vadd(a: float32*, b: float32*, c: float32*, n: int32) {
   var i: int32 = block.x * block_dim.x + thread.x;

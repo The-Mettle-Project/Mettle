@@ -1,31 +1,979 @@
 // Mettle standard library: Math
+//
+// Implemented entirely in Mettle. Nothing here binds a C math library: the
+// elementary functions are built from IEEE 754 bit manipulation, exact argument
+// reduction, and polynomial kernels.
+//
+// Accuracy: the kernels carry enough terms that their truncation error sits
+// below one unit in the last place, so results are accurate to ~1 ulp for
+// arguments in the normal range. Trigonometric argument reduction uses a
+// two-part split of pi/2, which holds full precision for |x| up to roughly 1e8;
+// beyond that the reduction, and therefore the result, degrades.
+//
+// Constants are functions rather than `const` bindings because top-level `const`
+// is currently restricted to integers (see docs/known-limitations.md). They fold
+// to a single load, so `PI()` costs nothing over a literal.
 
-// C runtime externs
-export extern fn abs(x: int32) -> int32 = "abs";
+// ---------------------------------------------------------------------------
+// IEEE 754 bit access.
+//
+// A double is reinterpreted through a pointer cast, which the backend lowers to
+// a plain reload of the same stack slot.
+// ---------------------------------------------------------------------------
 
-// Integer minimum
-export fn min(a: int64, b: int64) -> int64 {
-  if (a < b) {
-    return a;
-  }
+export fn f64_bits(x: float64) -> int64 {
+  var v: float64 = x;
+  var pf: float64* = &v;
+  var pi: int64* = (int64*)pf;
+  return *pi;
+}
+
+export fn f64_from_bits(b: int64) -> float64 {
+  var v: int64 = b;
+  var pi: int64* = &v;
+  var pf: float64* = (float64*)pi;
+  return *pf;
+}
+
+fn EXP_MASK() -> int64 { return 0x7FF; }
+fn FRAC_MASK() -> int64 { return 0x000FFFFFFFFFFFFF; }
+
+// Raw biased exponent field, 0..2047.
+export fn f64_raw_exponent(x: float64) -> int32 {
+  return (int32)((f64_bits(x) >> 52) & EXP_MASK());
+}
+
+export fn INF() -> float64 { return f64_from_bits(0x7FF0000000000000); }
+export fn NAN() -> float64 { return f64_from_bits(0x7FF8000000000000); }
+
+// ---------------------------------------------------------------------------
+// Constants.
+// ---------------------------------------------------------------------------
+
+export fn PI() -> float64 { return 3.141592653589793; }
+export fn TAU() -> float64 { return 6.283185307179586; }
+export fn HALF_PI() -> float64 { return 1.5707963267948966; }
+export fn QUARTER_PI() -> float64 { return 0.7853981633974483; }
+export fn E() -> float64 { return 2.718281828459045; }
+export fn SQRT2() -> float64 { return 1.4142135623730951; }
+export fn SQRT1_2() -> float64 { return 0.7071067811865476; }
+export fn LN2() -> float64 { return 0.6931471805599453; }
+export fn LN10() -> float64 { return 2.302585092994046; }
+export fn LOG2E() -> float64 { return 1.4426950408889634; }
+export fn LOG10E() -> float64 { return 0.4342944819032518; }
+export fn LOG10_2() -> float64 { return 0.30102999566398120; }
+
+export fn EPSILON() -> float64 { return 2.220446049250313e-16; }
+export fn F32_EPSILON() -> float64 { return 1.1920928955078125e-07; }
+export fn MAX_FINITE() -> float64 { return 1.7976931348623157e308; }
+export fn MIN_POSITIVE() -> float64 { return 2.2250738585072014e-308; }
+
+export fn DEG_PER_RAD() -> float64 { return 57.29577951308232; }
+export fn RAD_PER_DEG() -> float64 { return 0.017453292519943295; }
+
+// Split constants. The high part has its low mantissa bits cleared so that
+// products with a modest integer are exact, leaving the low part to carry the
+// remainder. This is what keeps argument reduction from cancelling.
+fn LN2_HI() -> float64 { return 6.93147180369123816490e-01; }
+fn LN2_LO() -> float64 { return 1.90821492927058770002e-10; }
+fn PIO2_HI() -> float64 { return 1.57079632673412561417e+00; }
+fn PIO2_LO() -> float64 { return 6.07710050650619224932e-11; }
+
+// ---------------------------------------------------------------------------
+// Classification.
+// ---------------------------------------------------------------------------
+
+export fn is_nan(x: float64) -> int32 {
+  if (x != x) { return 1; }
+  return 0;
+}
+
+export fn is_inf(x: float64) -> int32 {
+  if (f64_raw_exponent(x) != 2047) { return 0; }
+  if ((f64_bits(x) & FRAC_MASK()) != 0) { return 0; }
+  return 1;
+}
+
+export fn is_finite(x: float64) -> int32 {
+  if (f64_raw_exponent(x) == 2047) { return 0; }
+  return 1;
+}
+
+export fn signbit(x: float64) -> int32 {
+  if (f64_bits(x) < 0) { return 1; }
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Sign and magnitude.
+// ---------------------------------------------------------------------------
+
+export fn fabs(x: float64) -> float64 {
+  if (x < 0.0) { return -x; }
+  if (x == 0.0) { return 0.0; }      // normalises -0.0
+  return x;
+}
+
+export fn copysign(magnitude: float64, sign: float64) -> float64 {
+  var m: float64 = fabs(magnitude);
+  if (signbit(sign) != 0) { return -m; }
+  return m;
+}
+
+export fn fsign(x: float64) -> float64 {
+  if (x > 0.0) { return 1.0; }
+  if (x < 0.0) { return -1.0; }
+  return 0.0;
+}
+
+export fn fmin(a: float64, b: float64) -> float64 {
+  if (is_nan(a) != 0) { return b; }
+  if (is_nan(b) != 0) { return a; }
+  if (a < b) { return a; }
   return b;
 }
 
-// Integer maximum
-export fn max(a: int64, b: int64) -> int64 {
-  if (a > b) {
-    return a;
-  }
+export fn fmax(a: float64, b: float64) -> float64 {
+  if (is_nan(a) != 0) { return b; }
+  if (is_nan(b) != 0) { return a; }
+  if (a > b) { return a; }
   return b;
 }
 
-// Integer clamping
-export fn clamp(value: int64, lo: int64, hi: int64) -> int64 {
-  if (value < lo) {
-    return lo;
-  }
-  if (value > hi) {
-    return hi;
-  }
+export fn fclamp(value: float64, lo: float64, hi: float64) -> float64 {
+  if (value < lo) { return lo; }
+  if (value > hi) { return hi; }
   return value;
+}
+
+export fn saturate(value: float64) -> float64 {
+  return fclamp(value, 0.0, 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// Exponent manipulation.
+// ---------------------------------------------------------------------------
+
+// x * 2^n, computed by building the power of two directly.
+export fn ldexp(x: float64, n: int32) -> float64 {
+  if (x == 0.0) { return x; }
+  if (is_finite(x) == 0) { return x; }
+
+  var r: float64 = x;
+  var e: int32 = n;
+  // Step in chunks so the constructed power of two always stays normal.
+  while (e > 1000) {
+    r = r * f64_from_bits((int64)(1023 + 1000) << 52);
+    e = e - 1000;
+    if (is_finite(r) == 0) { return r; }
+  }
+  while (e < -1000) {
+    r = r * f64_from_bits((int64)(1023 - 1000) << 52);
+    e = e + 1000;
+    if (r == 0.0) { return r; }
+  }
+  return r * f64_from_bits((int64)(1023 + e) << 52);
+}
+
+// Splits x into a mantissa in [0.5, 1) and an exponent, with x = m * 2^e.
+export fn frexp(x: float64, exponent_out: int32*) -> float64 {
+  *exponent_out = 0;
+  if (x == 0.0) { return x; }
+  if (is_finite(x) == 0) { return x; }
+
+  var v: float64 = x;
+  var extra: int32 = 0;
+  if (f64_raw_exponent(v) == 0) {
+    // Subnormal: scale into the normal range and account for it afterwards.
+    v = v * 18014398509481984.0;       // 2^54
+    extra = -54;
+  }
+
+  var b: int64 = f64_bits(v);
+  var e: int32 = (int32)((b >> 52) & EXP_MASK());
+  *exponent_out = e - 1022 + extra;
+
+  var m: float64 = f64_from_bits((b & FRAC_MASK()) | ((int64)1022 << 52));
+  if (v < 0.0) { return -m; }
+  return m;
+}
+
+// ---------------------------------------------------------------------------
+// Rounding. Doubles of magnitude 2^52 or greater are already integral, so the
+// int64 round trip is only used below that.
+// ---------------------------------------------------------------------------
+
+fn TWO_52() -> float64 { return 4503599627370496.0; }
+
+export fn trunc(x: float64) -> float64 {
+  if (is_finite(x) == 0) { return x; }
+  if (fabs(x) >= TWO_52()) { return x; }
+  return (float64)(int64)x;
+}
+
+export fn floor(x: float64) -> float64 {
+  var t: float64 = trunc(x);
+  if (is_finite(x) == 0) { return x; }
+  if (x < 0.0 && t != x) { return t - 1.0; }
+  return t;
+}
+
+export fn ceil(x: float64) -> float64 {
+  var t: float64 = trunc(x);
+  if (is_finite(x) == 0) { return x; }
+  if (x > 0.0 && t != x) { return t + 1.0; }
+  return t;
+}
+
+// Halfway cases round away from zero, matching C's round().
+export fn round(x: float64) -> float64 {
+  if (is_finite(x) == 0) { return x; }
+  if (fabs(x) >= TWO_52()) { return x; }
+  var t: float64 = trunc(x);
+  var d: float64 = x - t;
+  if (d >= 0.5) { return t + 1.0; }
+  if (d <= -0.5) { return t - 1.0; }
+  return t;
+}
+
+// Fractional part in [0, 1). Floor-based, so it stays continuous across zero.
+export fn fract(x: float64) -> float64 {
+  return x - floor(x);
+}
+
+// Exact remainder, by repeated subtraction of scaled divisors. Each subtraction
+// happens between values within a factor of two, so it is exact.
+export fn fmod(x: float64, y: float64) -> float64 {
+  if (is_nan(x) != 0 || is_nan(y) != 0) { return NAN(); }
+  if (is_inf(x) != 0 || y == 0.0) { return NAN(); }
+  if (is_inf(y) != 0) { return x; }
+
+  var a: float64 = fabs(x);
+  var b: float64 = fabs(y);
+  if (a < b) { return x; }
+
+  var ea: int32 = 0;
+  var eb: int32 = 0;
+  frexp(a, &ea);
+  frexp(b, &eb);
+
+  var k: int32 = ea - eb;
+  while (k >= 0) {
+    var t: float64 = ldexp(b, k);
+    if (t <= a) { a = a - t; }
+    k = k - 1;
+  }
+  return copysign(a, x);
+}
+
+// ---------------------------------------------------------------------------
+// Roots.
+// ---------------------------------------------------------------------------
+
+// Newton-Raphson on the reduced mantissa. The linear seed is accurate to about
+// four bits and each iteration doubles that, so five passes saturate a double.
+export fn sqrt(x: float64) -> float64 {
+  if (is_nan(x) != 0) { return x; }
+  if (x < 0.0) { return NAN(); }
+  if (x == 0.0) { return x; }
+  if (is_inf(x) != 0) { return x; }
+
+  var e: int32 = 0;
+  var m: float64 = frexp(x, &e);       // m in [0.5, 1)
+
+  // An even exponent lets the halving below stay exact.
+  if ((e & 1) != 0) {
+    m = m * 2.0;
+    e = e - 1;
+  }
+
+  var y: float64 = 0.41731 + 0.59016 * m;
+  y = 0.5 * (y + m / y);
+  y = 0.5 * (y + m / y);
+  y = 0.5 * (y + m / y);
+  y = 0.5 * (y + m / y);
+  y = 0.5 * (y + m / y);
+
+  return ldexp(y, e / 2);
+}
+
+export fn rsqrt(x: float64) -> float64 {
+  return 1.0 / sqrt(x);
+}
+
+// Overflow-safe magnitude of a 2-vector.
+export fn hypot(x: float64, y: float64) -> float64 {
+  var a: float64 = fabs(x);
+  var b: float64 = fabs(y);
+  if (is_inf(a) != 0 || is_inf(b) != 0) { return INF(); }
+  if (a < b) {
+    var t: float64 = a;
+    a = b;
+    b = t;
+  }
+  if (a == 0.0) { return 0.0; }
+  var r: float64 = b / a;
+  return a * sqrt(1.0 + r * r);
+}
+
+// ---------------------------------------------------------------------------
+// Exponential and logarithm.
+// ---------------------------------------------------------------------------
+
+// exp of a reduced argument, |r| <= ln2/2. Taylor to 1/16!, whose next term is
+// below 1e-22 over that interval.
+fn exp_kernel(r: float64) -> float64 {
+  var p: float64 = 4.779477332387385e-14;
+  p = p * r + 7.647163731819816e-13;
+  p = p * r + 1.1470745597729725e-11;
+  p = p * r + 1.6059043836821613e-10;
+  p = p * r + 2.08767569878681e-09;
+  p = p * r + 2.505210838544172e-08;
+  p = p * r + 2.755731922398589e-07;
+  p = p * r + 2.7557319223985893e-06;
+  p = p * r + 2.48015873015873e-05;
+  p = p * r + 1.984126984126984e-04;
+  p = p * r + 1.388888888888889e-03;
+  p = p * r + 8.333333333333333e-03;
+  p = p * r + 4.1666666666666664e-02;
+  p = p * r + 1.6666666666666666e-01;
+  p = p * r + 5.0e-01;
+  p = p * r + 1.0;
+  p = p * r + 1.0;
+  return p;
+}
+
+export fn exp(x: float64) -> float64 {
+  if (is_nan(x) != 0) { return x; }
+  if (x > 709.782712893384) { return INF(); }
+  if (x < -745.1332191019411) { return 0.0; }
+
+  var k: float64 = round(x * LOG2E());
+  // Two-part ln2 keeps the subtraction from cancelling.
+  var r: float64 = (x - k * LN2_HI()) - k * LN2_LO();
+  return ldexp(exp_kernel(r), (int32)k);
+}
+
+export fn exp2(x: float64) -> float64 {
+  if (is_nan(x) != 0) { return x; }
+  if (x > 1024.0) { return INF(); }
+  if (x < -1075.0) { return 0.0; }
+  var k: float64 = round(x);
+  var r: float64 = x - k;
+  return ldexp(exp_kernel(r * LN2()), (int32)k);
+}
+
+// exp(x) - 1, without the cancellation that subtracting 1 would cause for
+// small x.
+export fn expm1(x: float64) -> float64 {
+  if (is_nan(x) != 0) { return x; }
+  if (fabs(x) < 0.35) {
+    // x * (1 + x/2! + x^2/3! + ...), so the leading x is never rounded against
+    // a 1. Carried to 1/16! so truncation stays far below the rounding error;
+    // stopping at 1/8! would leave a 5e-10 relative error at the interval edge.
+    var p: float64 = 4.779477332387385e-14;
+    p = p * x + 7.647163731819816e-13;
+    p = p * x + 1.1470745597729725e-11;
+    p = p * x + 1.6059043836821613e-10;
+    p = p * x + 2.08767569878681e-09;
+    p = p * x + 2.505210838544172e-08;
+    p = p * x + 2.755731922398589e-07;
+    p = p * x + 2.7557319223985893e-06;
+    p = p * x + 2.48015873015873e-05;
+    p = p * x + 1.984126984126984e-04;
+    p = p * x + 1.388888888888889e-03;
+    p = p * x + 8.333333333333333e-03;
+    p = p * x + 4.1666666666666664e-02;
+    p = p * x + 1.6666666666666666e-01;
+    p = p * x + 5.0e-01;
+    p = p * x + 1.0;
+    return p * x;
+  }
+  return exp(x) - 1.0;
+}
+
+// log of a mantissa near 1, via the atanh series in s = (m-1)/(m+1). Over the
+// reduced interval |s| <= 0.1716, so s^2 <= 0.0295 and twelve terms suffice.
+fn log_kernel(m: float64) -> float64 {
+  var s: float64 = (m - 1.0) / (m + 1.0);
+  var z: float64 = s * s;
+
+  var p: float64 = 4.3478260869565216e-02;   // 1/23
+  p = p * z + 4.7619047619047616e-02;        // 1/21
+  p = p * z + 5.2631578947368418e-02;        // 1/19
+  p = p * z + 5.8823529411764705e-02;        // 1/17
+  p = p * z + 6.6666666666666666e-02;        // 1/15
+  p = p * z + 7.6923076923076927e-02;        // 1/13
+  p = p * z + 9.0909090909090912e-02;        // 1/11
+  p = p * z + 1.1111111111111111e-01;        // 1/9
+  p = p * z + 1.4285714285714285e-01;        // 1/7
+  p = p * z + 2.0e-01;                       // 1/5
+  p = p * z + 3.3333333333333331e-01;        // 1/3
+  p = p * z + 1.0;
+  return 2.0 * s * p;
+}
+
+export fn log(x: float64) -> float64 {
+  if (is_nan(x) != 0) { return x; }
+  if (x < 0.0) { return NAN(); }
+  if (x == 0.0) { return -INF(); }
+  if (is_inf(x) != 0) { return x; }
+
+  var e: int32 = 0;
+  var m: float64 = frexp(x, &e);       // m in [0.5, 1)
+
+  // Centre the mantissa on 1 so the series converges fastest.
+  if (m < SQRT1_2()) {
+    m = m * 2.0;
+    e = e - 1;
+  }
+
+  var ef: float64 = (float64)e;
+  return (ef * LN2_HI() + log_kernel(m)) + ef * LN2_LO();
+}
+
+export fn log2(x: float64) -> float64 {
+  if (is_nan(x) != 0) { return x; }
+  if (x < 0.0) { return NAN(); }
+  if (x == 0.0) { return -INF(); }
+  if (is_inf(x) != 0) { return x; }
+
+  var e: int32 = 0;
+  var m: float64 = frexp(x, &e);
+  if (m < SQRT1_2()) {
+    m = m * 2.0;
+    e = e - 1;
+  }
+  return (float64)e + log_kernel(m) * LOG2E();
+}
+
+export fn log10(x: float64) -> float64 {
+  if (is_nan(x) != 0) { return x; }
+  if (x < 0.0) { return NAN(); }
+  if (x == 0.0) { return -INF(); }
+  if (is_inf(x) != 0) { return x; }
+
+  var e: int32 = 0;
+  var m: float64 = frexp(x, &e);
+  if (m < SQRT1_2()) {
+    m = m * 2.0;
+    e = e - 1;
+  }
+  return (float64)e * LOG10_2() + log_kernel(m) * LOG10E();
+}
+
+// log(1 + x), accurate for small x where 1 + x would lose the low bits.
+export fn log1p(x: float64) -> float64 {
+  if (is_nan(x) != 0) { return x; }
+  if (x < -1.0) { return NAN(); }
+  if (x == -1.0) { return -INF(); }
+  if (fabs(x) < 0.2) {
+    // The kernel argument is formed without ever rounding 1 + x.
+    var s: float64 = x / (2.0 + x);
+    var z: float64 = s * s;
+    var p: float64 = 6.6666666666666666e-02;   // 1/15
+    p = p * z + 7.6923076923076927e-02;        // 1/13
+    p = p * z + 9.0909090909090912e-02;        // 1/11
+    p = p * z + 1.1111111111111111e-01;        // 1/9
+    p = p * z + 1.4285714285714285e-01;        // 1/7
+    p = p * z + 2.0e-01;                       // 1/5
+    p = p * z + 3.3333333333333331e-01;        // 1/3
+    p = p * z + 1.0;
+    return 2.0 * s * p;
+  }
+  return log(1.0 + x);
+}
+
+export fn cbrt(x: float64) -> float64 {
+  if (is_nan(x) != 0) { return x; }
+  if (x == 0.0) { return x; }
+  if (is_inf(x) != 0) { return x; }
+
+  var a: float64 = fabs(x);
+  var y: float64 = exp(log(a) * 0.3333333333333333);
+  // Newton on y^3 = a tightens the exp/log seed to full precision.
+  y = (2.0 * y + a / (y * y)) * 0.3333333333333333;
+  y = (2.0 * y + a / (y * y)) * 0.3333333333333333;
+  y = (2.0 * y + a / (y * y)) * 0.3333333333333333;
+  return copysign(y, x);
+}
+
+// ---------------------------------------------------------------------------
+// Powers.
+// ---------------------------------------------------------------------------
+
+// Exact for integer exponents by repeated squaring; otherwise 2^(y*log2 x).
+export fn pow(base: float64, exponent: float64) -> float64 {
+  if (exponent == 0.0) { return 1.0; }
+  if (is_nan(base) != 0) { return base; }
+  if (is_nan(exponent) != 0) { return exponent; }
+  if (base == 1.0) { return 1.0; }
+
+  // A modest whole-number exponent is worth doing exactly.
+  if (exponent == trunc(exponent) && fabs(exponent) <= 1024.0) {
+    var n: int64 = (int64)fabs(exponent);
+    var acc: float64 = 1.0;
+    var b: float64 = base;
+    while (n > 0) {
+      if ((n & 1) != 0) { acc = acc * b; }
+      b = b * b;
+      n = n >> 1;
+    }
+    if (exponent < 0.0) { return 1.0 / acc; }
+    return acc;
+  }
+
+  // A negative base has no real power for a fractional exponent.
+  if (base < 0.0) { return NAN(); }
+  if (base == 0.0) {
+    if (exponent < 0.0) { return INF(); }
+    return 0.0;
+  }
+  return exp2(exponent * log2(base));
+}
+
+// ---------------------------------------------------------------------------
+// Trigonometry.
+//
+// Reduced to |r| <= pi/4 against a two-part pi/2, then evaluated by Taylor
+// kernels carried past double precision over that interval.
+// ---------------------------------------------------------------------------
+
+fn sin_kernel(r: float64) -> float64 {
+  var z: float64 = r * r;
+  var p: float64 = -8.2206352466243297e-18;  // -1/19!
+  p = p * z + 2.8114572543455206e-15;        //  1/17!
+  p = p * z + -7.6471637318198165e-13;       // -1/15!
+  p = p * z + 1.6059043836821613e-10;        //  1/13!
+  p = p * z + -2.5052108385441720e-08;       // -1/11!
+  p = p * z + 2.7557319223985893e-06;        //  1/9!
+  p = p * z + -1.9841269841269841e-04;       // -1/7!
+  p = p * z + 8.3333333333333333e-03;        //  1/5!
+  p = p * z + -1.6666666666666666e-01;       // -1/3!
+  p = p * z + 1.0;
+  return r * p;
+}
+
+fn cos_kernel(r: float64) -> float64 {
+  var z: float64 = r * r;
+  var p: float64 = 4.1103176233121648e-19;   //  1/20!
+  p = p * z + -1.5619206968586226e-16;       // -1/18!
+  p = p * z + 4.7794773323873853e-14;        //  1/16!
+  p = p * z + -1.1470745597729725e-11;       // -1/14!
+  p = p * z + 2.0876756987868099e-09;        //  1/12!
+  p = p * z + -2.7557319223985893e-07;       // -1/10!
+  p = p * z + 2.4801587301587302e-05;        //  1/8!
+  p = p * z + -1.3888888888888889e-03;       // -1/6!
+  p = p * z + 4.1666666666666664e-02;        //  1/4!
+  p = p * z + -5.0e-01;                      // -1/2!
+  p = p * z + 1.0;
+  return p;
+}
+
+// Reduces x to r in [-pi/4, pi/4] and reports the quadrant.
+fn reduce_pio2(x: float64, quadrant_out: int32*) -> float64 {
+  var n: float64 = round(x * (2.0 / PI()));
+  *quadrant_out = (int32)((int64)n & 3);
+  return (x - n * PIO2_HI()) - n * PIO2_LO();
+}
+
+export fn sin(x: float64) -> float64 {
+  if (is_finite(x) == 0) { return NAN(); }
+  var q: int32 = 0;
+  var r: float64 = reduce_pio2(x, &q);
+  if (q == 0) { return sin_kernel(r); }
+  if (q == 1) { return cos_kernel(r); }
+  if (q == 2) { return -sin_kernel(r); }
+  return -cos_kernel(r);
+}
+
+export fn cos(x: float64) -> float64 {
+  if (is_finite(x) == 0) { return NAN(); }
+  var q: int32 = 0;
+  var r: float64 = reduce_pio2(x, &q);
+  if (q == 0) { return cos_kernel(r); }
+  if (q == 1) { return -sin_kernel(r); }
+  if (q == 2) { return -cos_kernel(r); }
+  return sin_kernel(r);
+}
+
+export fn tan(x: float64) -> float64 {
+  if (is_finite(x) == 0) { return NAN(); }
+  var q: int32 = 0;
+  var r: float64 = reduce_pio2(x, &q);
+  var s: float64 = sin_kernel(r);
+  var c: float64 = cos_kernel(r);
+  if ((q & 1) != 0) { return -c / s; }
+  return s / c;
+}
+
+// atan of |t| <= tan(pi/12), where the alternating series converges quickly.
+// atan(t) = t * P(t^2), where the coefficient of z^n is (-1)^n / (2n+1).
+fn atan_kernel(t: float64) -> float64 {
+  var z: float64 = t * t;
+  var p: float64 = -3.2258064516129031e-02;  // -1/31
+  p = p * z + 3.4482758620689655e-02;        //  1/29
+  p = p * z + -3.7037037037037035e-02;       // -1/27
+  p = p * z + 4.0e-02;                       //  1/25
+  p = p * z + -4.3478260869565216e-02;       // -1/23
+  p = p * z + 4.7619047619047616e-02;        //  1/21
+  p = p * z + -5.2631578947368418e-02;       // -1/19
+  p = p * z + 5.8823529411764705e-02;        //  1/17
+  p = p * z + -6.6666666666666666e-02;       // -1/15
+  p = p * z + 7.6923076923076927e-02;        //  1/13
+  p = p * z + -9.0909090909090912e-02;       // -1/11
+  p = p * z + 1.1111111111111111e-01;        //  1/9
+  p = p * z + -1.4285714285714285e-01;       // -1/7
+  p = p * z + 2.0e-01;                       //  1/5
+  p = p * z + -3.3333333333333331e-01;       // -1/3
+  p = p * z + 1.0;
+  return t * p;
+}
+
+export fn atan(x: float64) -> float64 {
+  if (is_nan(x) != 0) { return x; }
+  if (is_inf(x) != 0) { return copysign(HALF_PI(), x); }
+
+  var a: float64 = fabs(x);
+  var invert: int32 = 0;
+  if (a > 1.0) {
+    a = 1.0 / a;
+    invert = 1;
+  }
+
+  // Second reduction onto |t| <= tan(pi/12) using the addition formula.
+  var shifted: int32 = 0;
+  if (a > 0.26794919243112270) {
+    a = (a * 1.7320508075688772 - 1.0) / (1.7320508075688772 + a);
+    shifted = 1;
+  }
+
+  var r: float64 = atan_kernel(a);
+  if (shifted != 0) { r = r + 0.5235987755982989; }    // pi/6
+  if (invert != 0) { r = HALF_PI() - r; }
+  return copysign(r, x);
+}
+
+export fn atan2(y: float64, x: float64) -> float64 {
+  if (is_nan(x) != 0) { return x; }
+  if (is_nan(y) != 0) { return y; }
+
+  if (x == 0.0) {
+    if (y > 0.0) { return HALF_PI(); }
+    if (y < 0.0) { return -HALF_PI(); }
+    return 0.0;
+  }
+
+  var r: float64 = atan(y / x);
+  if (x > 0.0) { return r; }
+  if (y >= 0.0) { return r + PI(); }
+  return r - PI();
+}
+
+// The (1-x)(1+x) form keeps the radicand accurate as |x| approaches 1.
+export fn asin(x: float64) -> float64 {
+  if (is_nan(x) != 0) { return x; }
+  if (x > 1.0 || x < -1.0) { return NAN(); }
+  return atan2(x, sqrt((1.0 - x) * (1.0 + x)));
+}
+
+export fn acos(x: float64) -> float64 {
+  if (is_nan(x) != 0) { return x; }
+  if (x > 1.0 || x < -1.0) { return NAN(); }
+  return atan2(sqrt((1.0 - x) * (1.0 + x)), x);
+}
+
+// ---------------------------------------------------------------------------
+// Hyperbolics.
+// ---------------------------------------------------------------------------
+
+export fn sinh(x: float64) -> float64 {
+  if (is_finite(x) == 0) { return x; }
+  if (fabs(x) < 0.35) {
+    // expm1 avoids the cancellation in (e^x - e^-x) near zero.
+    var t: float64 = expm1(x);
+    return 0.5 * (t + t / (t + 1.0));
+  }
+  var e: float64 = exp(x);
+  return 0.5 * (e - 1.0 / e);
+}
+
+export fn cosh(x: float64) -> float64 {
+  if (is_nan(x) != 0) { return x; }
+  if (is_inf(x) != 0) { return INF(); }
+  var e: float64 = exp(fabs(x));
+  return 0.5 * (e + 1.0 / e);
+}
+
+export fn tanh(x: float64) -> float64 {
+  if (is_nan(x) != 0) { return x; }
+  if (x > 20.0) { return 1.0; }
+  if (x < -20.0) { return -1.0; }
+  var t: float64 = expm1(2.0 * x);
+  return t / (t + 2.0);
+}
+
+export fn asinh(x: float64) -> float64 {
+  if (is_finite(x) == 0) { return x; }
+  var a: float64 = fabs(x);
+  var r: float64 = log1p(a + a * a / (1.0 + sqrt(a * a + 1.0)));
+  return copysign(r, x);
+}
+
+export fn acosh(x: float64) -> float64 {
+  if (is_nan(x) != 0) { return x; }
+  if (x < 1.0) { return NAN(); }
+  if (is_inf(x) != 0) { return x; }
+  return log(x + sqrt((x - 1.0) * (x + 1.0)));
+}
+
+export fn atanh(x: float64) -> float64 {
+  if (is_nan(x) != 0) { return x; }
+  var a: float64 = fabs(x);
+  if (a > 1.0) { return NAN(); }
+  if (a == 1.0) { return copysign(INF(), x); }
+  var r: float64 = 0.5 * log1p(2.0 * a / (1.0 - a));
+  return copysign(r, x);
+}
+
+// ---------------------------------------------------------------------------
+// Angles.
+// ---------------------------------------------------------------------------
+
+export fn degrees(radians_in: float64) -> float64 {
+  return radians_in * DEG_PER_RAD();
+}
+
+export fn radians(degrees_in: float64) -> float64 {
+  return degrees_in * RAD_PER_DEG();
+}
+
+// Wraps into [lo, hi), for cyclic ranges.
+export fn wrap(value: float64, lo: float64, hi: float64) -> float64 {
+  var span: float64 = hi - lo;
+  if (span <= 0.0) { return lo; }
+  var t: float64 = fmod(value - lo, span);
+  if (t < 0.0) { t = t + span; }
+  return lo + t;
+}
+
+// Normalises an angle to [-PI, PI).
+export fn wrap_angle(a: float64) -> float64 {
+  return wrap(a, -PI(), PI());
+}
+
+// Shortest signed rotation carrying `from` onto `to`.
+export fn angle_diff(from: float64, to: float64) -> float64 {
+  return wrap_angle(to - from);
+}
+
+// ---------------------------------------------------------------------------
+// Interpolation.
+// ---------------------------------------------------------------------------
+
+export fn lerp(a: float64, b: float64, t: float64) -> float64 {
+  return a + (b - a) * t;
+}
+
+// Where `value` sits between a and b, as a fraction. Inverse of lerp.
+export fn inv_lerp(a: float64, b: float64, value: float64) -> float64 {
+  if (b == a) { return 0.0; }
+  return (value - a) / (b - a);
+}
+
+export fn remap(value: float64, in_lo: float64, in_hi: float64, out_lo: float64, out_hi: float64) -> float64 {
+  return lerp(out_lo, out_hi, inv_lerp(in_lo, in_hi, value));
+}
+
+// Hermite ease between two edges, clamped outside them.
+export fn smoothstep(edge0: float64, edge1: float64, x: float64) -> float64 {
+  var t: float64 = saturate(inv_lerp(edge0, edge1, x));
+  return t * t * (3.0 - 2.0 * t);
+}
+
+// Second-order variant, with zero curvature at both ends.
+export fn smootherstep(edge0: float64, edge1: float64, x: float64) -> float64 {
+  var t: float64 = saturate(inv_lerp(edge0, edge1, x));
+  return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
+// ---------------------------------------------------------------------------
+// Comparison.
+// ---------------------------------------------------------------------------
+
+// Absolute and relative tolerance together, so it stays useful near zero and at
+// large magnitudes alike.
+export fn approx_eq(a: float64, b: float64, tolerance: float64) -> int32 {
+  if (a == b) { return 1; }
+  var d: float64 = fabs(a - b);
+  if (d <= tolerance) { return 1; }
+  var scale: float64 = fmax(fabs(a), fabs(b));
+  if (d <= tolerance * scale) { return 1; }
+  return 0;
+}
+
+export fn approx_zero(x: float64, tolerance: float64) -> int32 {
+  if (fabs(x) <= tolerance) { return 1; }
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Integer helpers.
+// ---------------------------------------------------------------------------
+
+export fn abs(x: int32) -> int32 {
+  if (x < 0) { return -x; }
+  return x;
+}
+
+export fn labs(x: int64) -> int64 {
+  if (x < 0) { return -x; }
+  return x;
+}
+
+export fn min(a: int64, b: int64) -> int64 {
+  if (a < b) { return a; }
+  return b;
+}
+
+export fn max(a: int64, b: int64) -> int64 {
+  if (a > b) { return a; }
+  return b;
+}
+
+export fn clamp(value: int64, lo: int64, hi: int64) -> int64 {
+  if (value < lo) { return lo; }
+  if (value > hi) { return hi; }
+  return value;
+}
+
+export fn isign(x: int64) -> int64 {
+  if (x > 0) { return 1; }
+  if (x < 0) { return -1; }
+  return 0;
+}
+
+// Exponentiation by squaring. A negative exponent yields 0, since the result
+// would not be an integer.
+export fn ipow(base: int64, exponent: int32) -> int64 {
+  if (exponent < 0) { return 0; }
+  var result: int64 = 1;
+  var b: int64 = base;
+  var e: int32 = exponent;
+  while (e > 0) {
+    if ((e & 1) != 0) { result = result * b; }
+    b = b * b;
+    e = e >> 1;
+  }
+  return result;
+}
+
+// Largest r with r*r <= n.
+export fn isqrt(n: int64) -> int64 {
+  if (n <= 0) { return 0; }
+  if (n < 4) { return 1; }
+  var x: int64 = n;
+  var y: int64 = (x + 1) / 2;
+  while (y < x) {
+    x = y;
+    y = (x + n / x) / 2;
+  }
+  return x;
+}
+
+export fn gcd(a: int64, b: int64) -> int64 {
+  var x: int64 = labs(a);
+  var y: int64 = labs(b);
+  while (y != 0) {
+    var t: int64 = y;
+    y = x % y;
+    x = t;
+  }
+  return x;
+}
+
+export fn lcm(a: int64, b: int64) -> int64 {
+  if (a == 0 || b == 0) { return 0; }
+  return labs((a / gcd(a, b)) * b);
+}
+
+export fn is_pow2(n: int64) -> int32 {
+  if (n <= 0) { return 0; }
+  if ((n & (n - 1)) == 0) { return 1; }
+  return 0;
+}
+
+export fn next_pow2(n: int64) -> int64 {
+  if (n <= 1) { return 1; }
+  var v: int64 = n - 1;
+  v = v | (v >> 1);
+  v = v | (v >> 2);
+  v = v | (v >> 4);
+  v = v | (v >> 8);
+  v = v | (v >> 16);
+  v = v | (v >> 32);
+  return v + 1;
+}
+
+// Floor of the base-2 logarithm. Returns -1 for non-positive input.
+export fn ilog2(n: int64) -> int32 {
+  if (n <= 0) { return -1; }
+  var v: int64 = n;
+  var r: int32 = 0;
+  while (v > 1) {
+    v = v >> 1;
+    r = r + 1;
+  }
+  return r;
+}
+
+// Division rounding toward negative infinity, unlike the language's truncating
+// `/`. Keeps grid and tile indexing correct on the negative side of an axis.
+export fn idiv_floor(a: int64, b: int64) -> int64 {
+  if (b == 0) { return 0; }
+  var q: int64 = a / b;
+  if (a % b != 0) {
+    if ((a < 0) != (b < 0)) { q = q - 1; }
+  }
+  return q;
+}
+
+// Modulus paired with idiv_floor: the result carries the divisor's sign.
+export fn imod_floor(a: int64, b: int64) -> int64 {
+  if (b == 0) { return 0; }
+  return a - idiv_floor(a, b) * b;
+}
+
+// ---------------------------------------------------------------------------
+// float32 helpers, for storage-bound code that would otherwise pay for two
+// conversions per operation.
+// ---------------------------------------------------------------------------
+
+export fn f32_abs(x: float32) -> float32 {
+  if (x < 0.0) { return -x; }
+  return x;
+}
+
+export fn f32_min(a: float32, b: float32) -> float32 {
+  if (a < b) { return a; }
+  return b;
+}
+
+export fn f32_max(a: float32, b: float32) -> float32 {
+  if (a > b) { return a; }
+  return b;
+}
+
+export fn f32_clamp(value: float32, lo: float32, hi: float32) -> float32 {
+  if (value < lo) { return lo; }
+  if (value > hi) { return hi; }
+  return value;
+}
+
+export fn f32_lerp(a: float32, b: float32, t: float32) -> float32 {
+  return a + (b - a) * t;
+}
+
+export fn f32_sqrt(x: float32) -> float32 {
+  return (float32)sqrt((float64)x);
 }

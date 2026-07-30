@@ -1,0 +1,63 @@
+// Target-neutral native atomic coverage. No extern declarations or backend
+// spellings are involved: the frontend infers u32/u64 and storage provenance,
+// while order/scope remain explicit language-level semantics.
+
+kernel atomic_family(global32: uint32*, global64: uint64*,
+                     observed32: uint32*, observed64: uint64*) {
+  workgroup var shared32: uint32[4];
+  workgroup var shared64: uint64[4];
+  var zero: uint64 = 0;
+  var one32: uint32 = 1;
+  var one64: uint64 = 1;
+  var expected32: uint32 = 0;
+  var expected64: uint64 = 0;
+  var sink32: uint32 = 0;
+  var sink64: uint64 = 0;
+
+  sink32 = sink32 + atomic_fetch_add(global32, zero, one32,
+                                      order: relaxed, scope: device);
+  sink64 = sink64 + atomic_fetch_add(global64, zero, one64,
+                                      order: acquire, scope: system);
+  sink32 = sink32 + atomic_fetch_sub(global32, zero, one32,
+                                      order: release, scope: workgroup);
+  sink64 = sink64 + atomic_fetch_sub(global64, zero, one64,
+                                      order: acq_rel, scope: device);
+  sink32 = sink32 + atomic_fetch_min(global32, zero, one32,
+                                      order: seq_cst, scope: system);
+  sink64 = sink64 + atomic_fetch_min(global64, zero, one64);
+  sink32 = sink32 + atomic_fetch_max(global32, zero, one32);
+  sink64 = sink64 + atomic_fetch_max(global64, zero, one64);
+  sink32 = sink32 + atomic_fetch_and(global32, zero, one32);
+  sink64 = sink64 + atomic_fetch_and(global64, zero, one64);
+  sink32 = sink32 + atomic_fetch_or(global32, zero, one32);
+  sink64 = sink64 + atomic_fetch_or(global64, zero, one64);
+  sink32 = sink32 + atomic_fetch_xor(global32, zero, one32);
+  sink64 = sink64 + atomic_fetch_xor(global64, zero, one64);
+  sink32 = sink32 + atomic_exchange(global32, zero, one32);
+  sink64 = sink64 + atomic_exchange(global64, zero, one64);
+  sink32 = sink32 + atomic_compare_exchange(
+      global32, zero, expected32, one32,
+      success_order: acq_rel, failure_order: acquire, scope: device);
+  sink64 = sink64 + atomic_compare_exchange(
+      global64, zero, expected64, one64,
+      success_order: seq_cst, failure_order: seq_cst, scope: system);
+  sink32 = sink32 + atomic_load(global32, zero,
+                                order: acquire, scope: device);
+  sink64 = sink64 + atomic_load(global64, zero,
+                                order: seq_cst, scope: system);
+  atomic_store(global32, zero, one32, order: release, scope: device);
+  atomic_store(global64, zero, one64, order: seq_cst, scope: system);
+
+  // Storage and default scope are inferred as workgroup. These calls prove
+  // both fixed-width families lower to shared/Workgroup atomics as well.
+  sink32 = sink32 + atomic_fetch_add(shared32, zero, one32);
+  sink64 = sink64 + atomic_compare_exchange(
+      shared64, zero, expected64, one64,
+      order: acq_rel, failure_order: acquire);
+  sink32 = sink32 + atomic_load(shared32, zero, order: relaxed);
+  sink64 = sink64 + atomic_load(shared64, zero, order: acquire);
+  atomic_store(shared32, zero, one32, order: relaxed);
+  atomic_store(shared64, zero, one64, order: release);
+  observed32[0] = sink32;
+  observed64[0] = sink64;
+}

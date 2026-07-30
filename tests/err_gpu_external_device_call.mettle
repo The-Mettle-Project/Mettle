@@ -1,0 +1,5 @@
+extern fn host_only(value: int32) -> int32 = "host_only";
+
+kernel external_device_call(out: int32*) {
+  out[0] = host_only(1);
+}

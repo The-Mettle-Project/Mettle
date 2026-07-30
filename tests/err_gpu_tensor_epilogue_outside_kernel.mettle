@@ -1,0 +1,7 @@
+fn host_epilogue(d: float32*) {
+  tensor_epilogue(d, shape: m16n16, element_type: f32);
+}
+
+fn main() -> int64 {
+  return 0;
+}

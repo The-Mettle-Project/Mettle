@@ -1,5 +1,6 @@
 // AST->IR lowering: statement lowering (with defer scopes).
 #include "ir_lowering_internal.h"
+#include "frontend/mtlc_frontend.h"
 
 int ir_lower_statement_with_defers(IRLoweringContext *context,
                                           IRFunction *function,
@@ -54,10 +55,55 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     // checker rejects reassignment.
 
     IRInstruction local = {0};
+    Type *decl_type = ir_resolve_named_type(context, declaration->type_name);
+    if (!decl_type && declaration->initializer) {
+      decl_type = declaration->initializer->resolved_type;
+    }
     local.op = IR_OP_DECLARE_LOCAL;
     local.location = statement->location;
     local.dest = ir_operand_symbol(declaration->name);
     local.text = declaration->type_name;
+    local.value_type = mtlc_type_from_frontend(decl_type);
+    if (declaration->address_space != AST_ADDRESS_SPACE_DEFAULT) {
+      int is_static_storage =
+          decl_type && decl_type->kind == TYPE_ARRAY && decl_type->base_type &&
+          decl_type->array_size > 0 && decl_type->array_size <= UINT32_MAX;
+      int is_dynamic_workgroup_view =
+          decl_type && decl_type->kind == TYPE_POINTER && decl_type->base_type &&
+          declaration->address_space == AST_ADDRESS_SPACE_WORKGROUP;
+      if (!is_static_storage && !is_dynamic_workgroup_view) {
+        ir_operand_destroy(&local.dest);
+        ir_set_error(context,
+                     "Invalid GPU address-space declaration '%s' reached IR "
+                     "lowering",
+                     declaration->name);
+        return 0;
+      }
+      MtlcAddressSpace address_space =
+          declaration->address_space == AST_ADDRESS_SPACE_WORKGROUP
+              ? MTLC_ADDRESS_SPACE_WORKGROUP
+              : MTLC_ADDRESS_SPACE_PRIVATE;
+      MtlcType *element_type =
+          mtlc_type_from_frontend(decl_type->base_type);
+      const MtlcType *pointer_type =
+          mtlc_type_pointer_in(element_type, address_space);
+      if (!element_type || !pointer_type) {
+        ir_operand_destroy(&local.dest);
+        ir_set_error(context,
+                     "Unable to lower GPU address-space type for '%s'",
+                     declaration->name);
+        return 0;
+      }
+      local.op = IR_OP_ADDRESS_SPACE_ALLOC;
+      /* Zero is the neutral dynamic-workgroup-arena sentinel. It is never
+       * accepted for private storage or a fixed source array. */
+      local.rhs =
+          ir_operand_int(is_static_storage ? (long long)decl_type->array_size
+                                           : 0);
+      local.text = decl_type->base_type->name;
+      local.value_type = (MtlcType *)pointer_type;
+      local.address_space = address_space;
+    }
     // For inferred-type locals (`var x = expr;`) the declaration carries no
     // type_name. The binary/direct-object backend resolves a local's type from
     // this textual payload, so fall back to the name of the type the checker
@@ -79,17 +125,20 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     }
     ir_operand_destroy(&local.dest);
 
+    if (declaration->initializer &&
+        declaration->initializer->type == AST_AGGREGATE_LITERAL) {
+      /* The literal was folded to a constant image at type-check time; copy it
+       * in wholesale rather than lowering it as an expression. */
+      return ir_emit_aggregate_literal_copy_to_symbol(
+          context, function, declaration->name, declaration->initializer,
+          decl_type, statement->location);
+    }
+
     if (declaration->initializer) {
       IROperand value = ir_operand_none();
       if (!ir_lower_expression(context, function, declaration->initializer,
                                &value)) {
         return 0;
-      }
-      Type *decl_type = ir_resolve_named_type(context, declaration->type_name);
-      if (!decl_type) {
-        decl_type = declaration->initializer
-                        ? declaration->initializer->resolved_type
-                        : NULL;
       }
       if (ir_should_coerce_string_to_cstring(context, decl_type,
                                              declaration->initializer) &&
@@ -134,6 +183,35 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     if (!assignment || !assignment->value) {
       ir_set_error(context, "Malformed assignment statement");
       return 0;
+    }
+
+    /* An aggregate literal on the right is a folded constant, not something to
+     * evaluate: copy its image into the destination. */
+    if (assignment->value->type == AST_AGGREGATE_LITERAL) {
+      Type *literal_type = assignment->value->resolved_type;
+      if (assignment->variable_name) {
+        Type *assign_type =
+            ir_lookup_symbol_type(context, assignment->variable_name);
+        return ir_emit_aggregate_literal_copy_to_symbol(
+            context, function, assignment->variable_name, assignment->value,
+            assign_type ? assign_type : literal_type, statement->location);
+      }
+      if (!assignment->target) {
+        ir_set_error(context, "Assignment target is missing");
+        return 0;
+      }
+      IROperand literal_address = ir_operand_none();
+      Type *literal_target_type = NULL;
+      if (!ir_lower_lvalue_address(context, function, assignment->target,
+                                   &literal_address, &literal_target_type)) {
+        return 0;
+      }
+      int ok = ir_emit_aggregate_literal_copy(
+          context, function, &literal_address, assignment->value,
+          literal_target_type ? literal_target_type : literal_type,
+          statement->location);
+      ir_operand_destroy(&literal_address);
+      return ok;
     }
 
     IROperand value = ir_operand_none();
@@ -269,6 +347,128 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     int ok = ir_lower_expression(context, function, statement, &ignored);
     ir_operand_destroy(&ignored);
     return ok;
+  }
+
+  case AST_BARRIER_STATEMENT: {
+    BarrierStatement *source = (BarrierStatement *)statement->data;
+    if (!source) {
+      ir_set_error(context, "Malformed barrier statement");
+      return 0;
+    }
+    IRInstruction barrier = {0};
+    barrier.op = IR_OP_BARRIER;
+    barrier.location = statement->location;
+    barrier.memory_scope = MTLC_MEMORY_SCOPE_WORKGROUP;
+    if (source->memory_regions & AST_MEMORY_REGION_WORKGROUP)
+      barrier.memory_regions |= MTLC_MEMORY_REGION_WORKGROUP;
+    if (source->memory_regions & AST_MEMORY_REGION_GLOBAL)
+      barrier.memory_regions |= MTLC_MEMORY_REGION_GLOBAL;
+    switch (source->memory_order) {
+    case AST_MEMORY_ORDER_ACQUIRE:
+      barrier.memory_order = MTLC_MEMORY_ORDER_ACQUIRE;
+      break;
+    case AST_MEMORY_ORDER_RELEASE:
+      barrier.memory_order = MTLC_MEMORY_ORDER_RELEASE;
+      break;
+    case AST_MEMORY_ORDER_ACQ_REL:
+      barrier.memory_order = MTLC_MEMORY_ORDER_ACQ_REL;
+      break;
+    case AST_MEMORY_ORDER_SEQ_CST:
+      barrier.memory_order = MTLC_MEMORY_ORDER_SEQ_CST;
+      break;
+    default:
+      ir_set_error(context, "Invalid barrier memory order");
+      return 0;
+    }
+    return ir_emit(context, function, &barrier);
+  }
+
+  case AST_GPU_LAUNCH: {
+    GpuLaunchStatement *launch = (GpuLaunchStatement *)statement->data;
+    const size_t controls = IR_GPU_LAUNCH_CONTROL_ARGS;
+    const size_t total = controls + (launch ? launch->argument_count : 0u);
+    IROperand kernel = ir_operand_none();
+    IROperand *arguments = NULL;
+    MtlcType **argument_types = NULL;
+    if (!launch || !launch->kernel || !launch->dynamic_shared_bytes ||
+        !launch->stream) {
+      ir_set_error(context, "Malformed GPU launch statement");
+      return 0;
+    }
+    arguments = calloc(total, sizeof(*arguments));
+    argument_types = calloc(total, sizeof(*argument_types));
+    if (!arguments || !argument_types) {
+      free(arguments);
+      free(argument_types);
+      ir_set_error(context, "Out of memory while lowering GPU launch");
+      return 0;
+    }
+    if (!ir_lower_expression(context, function, launch->kernel, &kernel)) {
+      free(arguments);
+      free(argument_types);
+      return 0;
+    }
+    for (size_t d = 0; d < 3; d++) {
+      if (!ir_lower_expression(context, function, launch->grid[d],
+                               &arguments[d]) ||
+          !ir_lower_expression(context, function, launch->block[d],
+                               &arguments[3 + d])) {
+        goto gpu_launch_lower_fail;
+      }
+    }
+    if (!ir_lower_expression(context, function, launch->dynamic_shared_bytes,
+                             &arguments[6]) ||
+        !ir_lower_expression(context, function, launch->stream,
+                             &arguments[7])) {
+      goto gpu_launch_lower_fail;
+    }
+    for (size_t i = 0; i < launch->argument_count; i++) {
+      ASTNode *source_arg = launch->arguments[i];
+      Type *source_type = source_arg ? source_arg->resolved_type : NULL;
+      if (!ir_lower_expression(context, function, source_arg,
+                               &arguments[controls + i])) {
+        goto gpu_launch_lower_fail;
+      }
+      if (!source_type) {
+        source_type = ir_infer_expression_type(context, source_arg);
+      }
+      argument_types[controls + i] =
+          mtlc_type_from_frontend(source_type);
+      if (!argument_types[controls + i]) {
+        ir_set_error(context, "GPU launch argument has no backend ABI type");
+        goto gpu_launch_lower_fail;
+      }
+    }
+
+    {
+      IRInstruction instruction = {0};
+      instruction.op = IR_OP_GPU_LAUNCH;
+      instruction.location = statement->location;
+      instruction.lhs = kernel;
+      instruction.arguments = arguments;
+      instruction.argument_types = argument_types;
+      instruction.argument_count = total;
+      instruction.ast_ref = statement;
+      if (!ir_emit(context, function, &instruction)) {
+        goto gpu_launch_lower_fail;
+      }
+    }
+    ir_operand_destroy(&kernel);
+    for (size_t i = 0; i < total; i++) {
+      ir_operand_destroy(&arguments[i]);
+    }
+    free(arguments);
+    free(argument_types);
+    return 1;
+
+  gpu_launch_lower_fail:
+    ir_operand_destroy(&kernel);
+    for (size_t i = 0; i < total; i++) {
+      ir_operand_destroy(&arguments[i]);
+    }
+    free(arguments);
+    free(argument_types);
+    return 0;
   }
 
   case AST_RETURN_STATEMENT: {

@@ -2,12 +2,12 @@
 #define _GNU_SOURCE
 #endif
 #include "import_resolver.h"
-#include "../codegen/binary_emitter.h"
-#include "../compiler/compiler_context.h"
-#include "../lexer/lexer.h"
-#include "../parser/parser.h"
-#include "../string_intern.h"
-#include "../common.h"
+#include "codegen/binary_emitter.h"
+#include "compiler/compiler_context.h"
+#include "lexer/lexer.h"
+#include "parser/parser.h"
+#include "string_intern.h"
+#include "common.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1490,6 +1490,18 @@ static int rewrite_node_names(ASTNode *node, const NameRewrite *rewrites,
     return 1;
   }
 
+  case AST_GPU_LAUNCH:
+    /* A launch contains only expressions and introduces no bindings. Rewriting
+     * its children handles namespaced kernel-handle/argument references while
+     * keeping launch semantics independent of runtime function names. */
+    for (size_t i = 0; i < node->child_count; i++) {
+      if (!rewrite_node_names(node->children[i], rewrites, rewrite_count,
+                              bindings, binding_count, scope, 1)) {
+        return 0;
+      }
+    }
+    return 1;
+
   case AST_IDENTIFIER: {
     Identifier *identifier = (Identifier *)node->data;
     if (!identifier || !identifier->name ||
@@ -2538,6 +2550,11 @@ static void collect_dependency_names(ASTNode *node, char ***names,
     }
     return;
   }
+  case AST_GPU_LAUNCH:
+    for (size_t i = 0; i < node->child_count; i++) {
+      collect_dependency_names(node->children[i], names, count, capacity);
+    }
+    return;
   case AST_ASSIGNMENT: {
     Assignment *assign = (Assignment *)node->data;
     if (!assign) {
@@ -3046,6 +3063,12 @@ static void process_import_strs_in_node(ImportContext *ctx, ASTNode *node,
     }
     break;
   }
+  case AST_GPU_LAUNCH:
+    for (size_t i = 0; i < node->child_count; i++) {
+      process_import_strs_in_node(ctx, node->children[i], current_file_path,
+                                  had_error);
+    }
+    break;
   case AST_ASSIGNMENT: {
     Assignment *assign = (Assignment *)node->data;
     if (assign) {

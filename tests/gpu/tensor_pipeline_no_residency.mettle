@@ -1,0 +1,34 @@
+// The global marker store is observable between the two MMAs. Even though the
+// asynchronous groups themselves are balanced and published correctly, the
+// conservative staged-residency recognizer must leave both D stores intact.
+kernel tensor_pipeline_observable(a: uint16*, b: uint16*,
+                                  c: float32*, d: float32*,
+                                  marker: uint32*) {
+  workgroup var a_stage: uint16[512];
+  workgroup var b_stage: uint16[512];
+  var lane: int32 = thread.x;
+  var base: int32 = lane * 8;
+  async_copy_workgroup(&a_stage[base], a + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_workgroup(&b_stage[base], b + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_commit();
+  async_copy_workgroup(&a_stage[256 + base], a + 256 + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_workgroup(&b_stage[256 + base], b + 256 + base, 8,
+                       transaction: 16, cache: global);
+  async_copy_commit();
+  async_copy_wait(1);
+  barrier(workgroup, acq_rel);
+  tensor_mma(&a_stage[0], &b_stage[0], c, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: 16, ldb: 16, ldc: 16, ldd: 16);
+  marker[0] = 1;
+  async_copy_wait(0);
+  barrier(workgroup, acq_rel);
+  tensor_mma(&a_stage[256], &b_stage[256], d, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: 16, ldb: 16, ldc: 16, ldd: 16);
+}

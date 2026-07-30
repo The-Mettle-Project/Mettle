@@ -1,0 +1,18 @@
+// Mandatory OpenCL 2.0 atomic profile: no optional Int64Atomics capability.
+// This exists separately from atomic_kernels.mettle so spirv-val can check the
+// exact OpenCL environment rather than the core SPIR-V environment used for
+// optional u64 atomics.
+kernel atomic_u32_profile(global_state: uint32*, observed: uint32*) {
+  workgroup var local_state: uint32[1];
+  var zero: uint64 = 0;
+  var one: uint32 = 1;
+  var global_old: uint32 = atomic_load(
+      global_state, zero, order: acquire, scope: device);
+  atomic_store(global_state, zero, one,
+               order: release, scope: device);
+  var local_old: uint32 = atomic_load(
+      local_state, zero, order: relaxed, scope: workgroup);
+  atomic_store(local_state, zero, one,
+               order: seq_cst, scope: workgroup);
+  observed[0] = global_old + local_old;
+}

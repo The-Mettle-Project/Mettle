@@ -1,0 +1,88 @@
+// The operation remains one backend-neutral whole-tile tensor request. The PTX
+// backend owns the m16n8 register-fragment tiling selected for sm_89+.
+kernel tensor_fp8_m16n16k32(
+    a: uint8*, b: uint8*, c: float32*, d: float32*,
+    lda: int32, ldb: int32, ldc: int32, ldd: int32) {
+  tensor_mma(a, b, c, d,
+             shape: m16n16k32,
+             a_type: e4m3, b_type: e5m2,
+             accumulator_type: f32, result_type: f32,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+}
+
+// Six native subtiles exercise M/N decomposition, both transpose flags, and
+// the opposite memory layouts without exposing a PTX fragment to source.
+kernel tensor_fp8_m32n24k16_transposed(
+    a: uint8*, b: uint8*, c: float32*, d: float32*,
+    lda: int32, ldb: int32, ldc: int32, ldd: int32) {
+  tensor_mma(a, b, c, d,
+             shape: m32n24k16,
+             a_type: e5m2, b_type: e4m3,
+             accumulator_type: f32, result_type: f32,
+             a_layout: col, b_layout: row,
+             c_layout: col, d_layout: col,
+             transpose_a: true, transpose_b: true,
+             lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+}
+/* Four connected operations remain four neutral whole-tile requests. The
+ * optimizer may fuse them, but no frontend or shared-IR surface exposes PTX
+ * fragments or promises a vendor instruction spelling. */
+kernel tensor_fp8_chain4_m16n16k32(
+    a: uint8*, b: uint8*, c: float32*, d: float32*,
+    lda: int32, ldb: int32, ldc: int32, ldd: int32) {
+  tensor_mma(a, b, c, d,
+             shape: m16n16k32,
+             a_type: e4m3, b_type: e5m2,
+             accumulator_type: f32, result_type: f32,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+  tensor_mma(a, b, d, d,
+             shape: m16n16k32,
+             a_type: e4m3, b_type: e5m2,
+             accumulator_type: f32, result_type: f32,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldd, ldd: ldd);
+  tensor_mma(a, b, d, d,
+             shape: m16n16k32,
+             a_type: e4m3, b_type: e5m2,
+             accumulator_type: f32, result_type: f32,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldd, ldd: ldd);
+  tensor_mma(a, b, d, d,
+             shape: m16n16k32,
+             a_type: e4m3, b_type: e5m2,
+             accumulator_type: f32, result_type: f32,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldd, ldd: ldd);
+}
+
+/* Runtime K remains ordinary neutral control flow. The optimizer proves the
+ * loop-carried D dependency and the backend retains both output subtiles. */
+kernel tensor_fp8_runtime_k_m16n16k32(
+    a: uint8*, b: uint8*, c: float32*, d: float32*, k: int32,
+    lda: int32, ldb: int32, ldc: int32, ldd: int32) {
+  tensor_mma(a, b, c, d,
+             shape: m16n16k32,
+             a_type: e4m3, b_type: e5m2,
+             accumulator_type: f32, result_type: f32,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+  var inner: int32 = 32;
+  while (inner < k) {
+    tensor_mma(a + inner, b + inner, d, d,
+               shape: m16n16k32,
+               a_type: e4m3, b_type: e5m2,
+               accumulator_type: f32, result_type: f32,
+               a_layout: row, b_layout: col,
+               c_layout: row, d_layout: row,
+               lda: lda, ldb: ldb, ldc: ldd, ldd: ldd);
+    inner = inner + 32;
+  }
+}

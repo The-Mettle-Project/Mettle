@@ -2,12 +2,12 @@
 #define IR_LOWERING_INTERNAL_H
 
 // Shared internals for the AST->IR lowering pass, split across ir_lower*.c
-// modules. The public entry point ir_lower_program lives in ir.h; this
-// header exposes the cross-module lowering context, helper structs, and
-// static-helper prototypes.
+// modules. The public entry point ir_lower_program lives in ir_lowering.h (the
+// frontend-facing lowering header); this header exposes the cross-module
+// lowering context, helper structs, and static-helper prototypes.
 
-#include "ir.h"
-#include "../common.h"
+#include "ir_lowering.h" // ir.h + frontend AST/type headers + lowering entry points
+#include "common.h"
 #include "compiler/compiler_context.h"
 #include <limits.h>
 #include <stdarg.h>
@@ -42,6 +42,10 @@ typedef struct {
   /* Default SimdAttr from a function-level `@simd` decorator. A counted loop in
    * the body with no `@simd` of its own inherits this mode. */
   int current_function_simd_default;
+  /* The program being built. Lowering a local aggregate literal parks its
+   * folded image here as a hidden module constant and copies from it, so the
+   * value is laid out once in the object file rather than stored piecewise. */
+  IRProgram *program;
 } IRLoweringContext;
 
 typedef struct {
@@ -108,6 +112,22 @@ IROperand ir_clone_operand_local(const IROperand *operand);
 int ir_try_emit_aggregate_symbol_memcpy(
     IRLoweringContext *context, IRFunction *function, const char *dest_name,
     const IROperand *value, Type *dest_type, SourceLocation location);
+
+/* Copy a folded aggregate literal into a target. The literal is interned as a
+ * hidden module constant the first time it is lowered, so the copy is a plain
+ * block move from the object file's own data. */
+int ir_emit_aggregate_literal_copy(IRLoweringContext *context,
+                                   IRFunction *function,
+                                   const IROperand *dest_address,
+                                   ASTNode *literal_node, Type *dest_type,
+                                   SourceLocation location);
+
+int ir_emit_aggregate_literal_copy_to_symbol(IRLoweringContext *context,
+                                             IRFunction *function,
+                                             const char *dest_name,
+                                             ASTNode *literal_node,
+                                             Type *dest_type,
+                                             SourceLocation location);
 
 int ir_try_emit_aggregate_address_memcpy(IRLoweringContext *context,
                                          IRFunction *function,
@@ -287,6 +307,7 @@ int ir_type_storage_size(Type *type);
 
 int ir_type_array_element_stride(Type *element_type);
 
+int ir_type_is_unsigned_integer(Type *type);
 int ir_type_is_pointer(Type *type);
 
 int ir_emit_binary_instruction(IRLoweringContext *context,

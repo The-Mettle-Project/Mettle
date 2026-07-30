@@ -1,0 +1,20 @@
+// Baseline PTX profile coverage: no GB10-only formats or instructions.
+kernel tensor_epilogue_portable_f32_relu(d: float32*) {
+  tensor_epilogue(d, shape: m11n29, element_type: f32,
+                  activation: relu);
+}
+
+kernel tensor_epilogue_portable_f64_matrix_clamp(
+    d: float64*, bias: float64*, minimum: float64, maximum: float64) {
+  tensor_epilogue(d, shape: m7n9, element_type: f64,
+                  layout: col,
+                  bias_mode: matrix, bias: bias, bias_layout: row,
+                  activation: clamp,
+                  clamp_min: minimum, clamp_max: maximum,
+                  scope: workgroup);
+}
+
+kernel tensor_epilogue_portable_f16_row_bias(d: uint16*, bias: uint16*) {
+  tensor_epilogue(d, shape: m16n8, element_type: f16,
+                  bias_mode: row, bias: bias);
+}

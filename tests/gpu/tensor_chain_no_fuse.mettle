@@ -1,0 +1,36 @@
+// Broken accumulator connectivity must not fuse merely because descriptors
+// match. Each operation owns a different accumulator and destination.
+kernel tensor_chain_disconnected(a: uint16*, b: uint16*,
+                                 c0: float32*, d0: float32*,
+                                 c1: float32*, d1: float32*,
+                                 lda: int32, ldb: int32,
+                                 ldc: int32, ldd: int32) {
+  tensor_mma(a, b, c0, d0,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+  tensor_mma(a, b, c1, d1,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+}
+
+// Even valid D=A*B+C; D=A1*B1+D connectivity cannot cross an observable
+// instruction. This is intentionally an atomic so ordinary dead-store or
+// copy simplification cannot erase the legality boundary.
+kernel tensor_chain_intervening(a: uint16*, b: uint16*, c: float32*,
+                                d: float32*, marker: uint32*,
+                                lda: int32, ldb: int32,
+                                ldc: int32, ldd: int32) {
+  var zero: uint64 = 0;
+  var one: uint32 = 1;
+  tensor_mma(a, b, c, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+  atomic_store(marker, zero, one, order: relaxed, scope: device);
+  tensor_mma(a, b, d, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldd, ldd: ldd);
+}

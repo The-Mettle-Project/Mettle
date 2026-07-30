@@ -1,0 +1,9 @@
+// `&name` fills the whole slot as a relocation; there is no addend for it.
+
+var slot: int32 = 7;
+
+var past_end: int32* = &slot + 1;
+
+fn main() -> int32 {
+  return 0;
+}

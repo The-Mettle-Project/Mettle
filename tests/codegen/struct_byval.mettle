@@ -1,0 +1,25 @@
+struct Small { a: int32; b: int32; }
+struct Tiny { a: int16; }
+struct Big { a: int64; b: int64; c: int64; }
+struct Mixed { a: int32; f: float32; }
+@noinline fn take_small(s: Small) -> int32 { return s.a + s.b; }
+@noinline fn take_tiny(t: Tiny) -> int32 { return (int32)t.a; }
+@noinline fn take_big(b: Big) -> int64 { return b.a + b.b + b.c; }
+@noinline fn take_mixed(m: Mixed) -> float64 { return (float64)m.a + (float64)m.f; }
+@noinline fn make_small(a: int32, b: int32) -> Small { var s: Small; s.a = a; s.b = b; return s; }
+@noinline fn make_big(v: int64) -> Big { var b: Big; b.a = v; b.b = v; b.c = v; return b; }
+fn main() -> int32 {
+  var s: Small = { a: 3, b: 4 };
+  if (take_small(s) != 7) { return 1; }
+  var t: Tiny = { a: 9 };
+  if (take_tiny(t) != 9) { return 2; }
+  var b: Big = { a: 1, b: 2, c: 3 };
+  if (take_big(b) != 6) { return 3; }
+  var m: Mixed = { a: 2, f: 0.5 };
+  if (take_mixed(m) != 2.5) { return 4; }
+  var r: Small = make_small(10, 20);
+  if (r.a != 10 || r.b != 20) { return 5; }
+  var rb: Big = make_big(7);
+  if (rb.a + rb.b + rb.c != 21) { return 6; }
+  return 0;
+}

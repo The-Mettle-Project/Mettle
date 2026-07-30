@@ -1,0 +1,99 @@
+// Runtime audit for the range-driven rewrites: every function here is one the
+// optimizer is allowed to rewrite (a divide into a shift, a remainder into a
+// mask, a comparison into a constant), so a wrong range proof shows up as a
+// wrong VALUE, not merely as a missed optimization. The negative-input cases
+// exist to catch the opposite failure: a rewrite that fires when nothing
+// proved the operand non-negative.
+
+@noinline fn guarded_div(n: int64) -> int64 {
+  if (n >= 0) { return n / 8; }
+  return n / 8;                 // same expression, no proof: must round toward zero
+}
+
+@noinline fn guarded_mod(n: int64) -> int64 {
+  if (n > 0) { return n % 16; }
+  return n % 16;
+}
+
+@noinline fn unsigned_div(u: uint32) -> uint32 { return u / 64; }
+@noinline fn unsigned_mod(u: uint32) -> uint32 { return u % 64; }
+
+@noinline fn narrow_mask(u: uint8) -> int64 {
+  var v: int64 = (int64)u;
+  return v & 255;               // mask covers every bit a uint8 can carry
+}
+
+@noinline fn narrow_mask_zero(u: uint8) -> int64 {
+  var v: int64 = (int64)u;
+  return v & 65280;             // and this one covers none of them
+}
+
+@noinline fn decided(u: uint16) -> int64 {
+  if (u < 0) { return 1; }      // never
+  if (u > 100000) { return 2; } // never
+  return 3;
+}
+
+@noinline fn shift_chain(n: int64) -> int64 {
+  if (n < 0) { return -1; }
+  return (n / 4) / 8;           // two guarded divides collapse to one shift
+}
+
+@noinline fn counter_mod(limit: int64) -> int64 {
+  var i: int64 = 0;
+  var acc: int64 = 0;
+  while (i < limit) {
+    acc = acc + (i % 4);        // i is a monotone counter from 0
+    i = i + 1;
+  }
+  return acc;
+}
+
+// The bound a guard supplies need not be a literal: `i < n` bounds `i` by
+// whatever bounds `n`, which for a uint16 is 65534 -- enough to settle the
+// divide outright.
+@noinline fn symbolic_bound(i0: int64, n: uint16) -> int64 {
+  var i: int64 = i0;
+  if (i < 0) { return 0; }
+  if (i < (int64)n) { return i / 65536; }
+  return 1;
+}
+
+@noinline fn halving(x0: int64) -> int64 {
+  var x: int64 = x0;
+  var steps: int64 = 0;
+  while (x > 1) { x = x / 2; steps = steps + 1; }
+  return steps;
+}
+
+// A local whose address escapes must not be reasoned about across the call.
+@noinline fn bump(p: int64*) { *p = *p + 1; }
+
+@noinline fn escaped() -> int64 {
+  var x: int64 = 5;
+  bump(&x);
+  if (x != 6) { return 1; }
+  if (x % 2 == 0) { return 0; }
+  return 2;
+}
+
+fn main() -> int32 {
+  if (guarded_div(64) != 8) { return 1; }
+  if (guarded_div(-9) != -1) { return 2; }      // -9/8 truncates to -1, not -2
+  if (guarded_mod(33) != 1) { return 3; }
+  if (guarded_mod(-9) != -9 % 16) { return 4; }
+  if (unsigned_div(200) != 3) { return 5; }
+  if (unsigned_mod(200) != 8) { return 6; }
+  if (narrow_mask(200) != 200) { return 7; }
+  if (narrow_mask_zero(200) != 0) { return 8; }
+  if (decided(9) != 3) { return 9; }
+  if (shift_chain(1024) != 32) { return 10; }
+  if (shift_chain(-1) != -1) { return 11; }
+  if (counter_mod(10) != 13) { return 12; }     // 0+1+2+3+0+1+2+3+0+1
+  if (symbolic_bound(5, 100) != 0) { return 15; }
+  if (symbolic_bound(500, 100) != 1) { return 16; }
+  if (symbolic_bound(-1, 100) != 0) { return 17; }
+  if (halving(1024) != 10) { return 13; }
+  if (escaped() != 0) { return 14; }
+  return 0;
+}

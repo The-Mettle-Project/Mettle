@@ -1,6 +1,10 @@
 #ifndef AST_H
 #define AST_H
 
+#include "simd_attr.h"
+#include "source_location.h"
+#include "mtlc/memory.h"
+#include "mtlc/tensor.h"
 #include <stddef.h>
 
 typedef enum {
@@ -17,6 +21,7 @@ typedef enum {
   AST_ASSIGNMENT,
   AST_FUNCTION_CALL,
   AST_FUNC_PTR_CALL,
+  AST_GPU_LAUNCH,
   AST_RETURN_STATEMENT,
   AST_IF_STATEMENT,
   AST_WHILE_STATEMENT,
@@ -39,14 +44,13 @@ typedef enum {
   AST_NEW_EXPRESSION,
   AST_CAST_EXPRESSION,
   AST_LAMBDA_EXPRESSION,
-  AST_CLOSURE_ADAPT_EXPRESSION
+  AST_CLOSURE_ADAPT_EXPRESSION,
+  AST_BARRIER_STATEMENT,
+  AST_AGGREGATE_LITERAL
 } ASTNodeType;
 
-typedef struct {
-  size_t line;
-  size_t column;
-  const char *filename;
-} SourceLocation;
+/* SourceLocation moved to ../source_location.h so the backend IR can share it
+ * without depending on this AST header. */
 
 typedef struct ASTNode {
   ASTNodeType type;
@@ -70,6 +74,15 @@ typedef struct {
   char *file_path;
 } ImportStrExpression;
 
+/* Source-level storage intent. These names are frontend semantics: lowering
+ * maps them to backend-neutral IR address spaces, and no target dialect enters
+ * the AST. */
+typedef enum {
+  AST_ADDRESS_SPACE_DEFAULT = 0,
+  AST_ADDRESS_SPACE_WORKGROUP,
+  AST_ADDRESS_SPACE_PRIVATE
+} AstAddressSpace;
+
 typedef struct {
   char *name;
   char *type_name;
@@ -83,6 +96,7 @@ typedef struct {
   // exempt from the "explicit type required on var/const" rule. User-written
   // `var`/`const` declarations always leave this 0.
   int structural_type;
+  AstAddressSpace address_space;
 } VarDeclaration;
 
 typedef struct {
@@ -94,6 +108,7 @@ typedef struct {
   ASTNode *body;
   int is_exported;
   int is_extern;
+  int is_kernel;          // `kernel`: GPU entry point (not an ordinary function)
   char *link_name;
   char **type_params;
   char **type_param_traits;
@@ -204,6 +219,9 @@ typedef struct {
 typedef struct {
   char *function_name;
   ASTNode **arguments;
+  /* Optional names parallel to arguments. The reference grammar accepts these
+   * for compiler-native tensor and atomic operations. */
+  char **argument_names;
   size_t argument_count;
   ASTNode *object; // Non-null for method calls (obj.method(args))
   char **type_args;
@@ -211,6 +229,42 @@ typedef struct {
   int is_indirect_call; // 1 if callee is a variable with function pointer type
   struct Type *callee_closure_env; // non-NULL if the callee is a capturing
                                    // closure; set by the type checker
+  int is_gpu_index; /* parser-recognized thread/block/dimension member access */
+  int is_gpu_atomic;
+  MtlcAddressSpace atomic_address_space;
+  MtlcMemoryOrder atomic_memory_order;
+  MtlcMemoryOrder atomic_failure_order;
+  MtlcMemoryScope atomic_memory_scope;
+  int is_gpu_async_copy;
+  uint32_t async_copy_element_count;
+  uint32_t async_copy_transaction_bytes;
+  uint32_t async_copy_pending_groups;
+  MtlcAsyncCache async_copy_cache;
+  int is_tensor_transfer;
+  MtlcTensorTransferDesc tensor_transfer_desc;
+  size_t tensor_transfer_view_argument;
+  size_t tensor_transfer_coordinate_arguments[MTLC_TENSOR_MAX_RANK];
+  int is_tensor_mma;
+  /* Whole-matrix bounded region operation. It reuses the neutral tensor
+   * descriptor but is distinct from one exact tile in shared IR. */
+  int is_tensor_matmul;
+  MtlcTensorMmaDesc tensor_mma_desc;
+  size_t tensor_metadata_argument;
+  size_t tensor_a_scale_argument;
+  size_t tensor_b_scale_argument;
+  size_t tensor_a_stride_argument;
+  size_t tensor_b_stride_argument;
+  size_t tensor_c_stride_argument;
+  size_t tensor_d_stride_argument;
+  int is_tensor_epilogue;
+  MtlcTensorEpilogueDesc tensor_epilogue_desc;
+  size_t tensor_epilogue_bias_argument;
+  size_t tensor_epilogue_alpha_argument;
+  size_t tensor_epilogue_beta_argument;
+  size_t tensor_epilogue_clamp_min_argument;
+  size_t tensor_epilogue_clamp_max_argument;
+  size_t tensor_epilogue_stride_argument;
+  size_t tensor_epilogue_bias_stride_argument;
 } CallExpression;
 
 typedef struct {
@@ -218,6 +272,37 @@ typedef struct {
   ASTNode **arguments;
   size_t argument_count;
 } FuncPtrCall;
+
+/* Semantic GPU launch statement. Compact source launches synthesize the unused
+ * dimensions/shared/stream defaults; named source launches can populate the
+ * complete provider-neutral contract. `kernel` is a runtime launch handle,
+ * not a source function declaration. */
+typedef struct {
+  ASTNode *kernel;
+  ASTNode *grid[3];
+  ASTNode *block[3];
+  ASTNode *dynamic_shared_bytes;
+  ASTNode *stream;
+  ASTNode **arguments;
+  size_t argument_count;
+} GpuLaunchStatement;
+
+typedef enum {
+  AST_MEMORY_REGION_WORKGROUP = 1u << 0,
+  AST_MEMORY_REGION_GLOBAL = 1u << 1
+} AstMemoryRegion;
+
+typedef enum {
+  AST_MEMORY_ORDER_ACQUIRE = 1,
+  AST_MEMORY_ORDER_RELEASE,
+  AST_MEMORY_ORDER_ACQ_REL,
+  AST_MEMORY_ORDER_SEQ_CST
+} AstMemoryOrder;
+
+typedef struct {
+  unsigned memory_regions;
+  AstMemoryOrder memory_order;
+} BarrierStatement;
 
 typedef struct {
   char *variable_name;
@@ -274,6 +359,45 @@ typedef struct {
   ASTNode *index;
 } ArrayIndexExpression;
 
+/* One link-time address inside a folded aggregate image. A pointer, function
+ * pointer, or string element has no value until the linker places what it
+ * refers to, so the image leaves a pointer-sized hole and records what fills
+ * it. Exactly one of `symbol` and `string` is set. */
+typedef struct {
+  size_t offset;  // byte offset into the image
+  char *symbol;   // module symbol whose address goes here (`&f`, `&g`)
+  char *string;   // string-literal bytes to emit and point at
+  /* A `string` value is a pointer to a { chars, length } record, so the slot
+   * points at a record the backend builds; a `cstring` points straight at the
+   * characters. Only meaningful when `string` is set. */
+  int string_wants_record;
+} AggregateReloc;
+
+/* An aggregate literal: `[a, b, c]` or `[value; count]` for an array, and
+ * `{ field: value, ... }` for a struct. The literal has no type of its own -
+ * it takes the type of whatever it initializes, which is always spelled out in
+ * Mettle (every `var` and `const` states its type). Elements are also children
+ * of the node, so the node's destructor frees them; only the arrays here are
+ * owned by this struct. */
+typedef struct {
+  int is_struct;      // 1: `{ field: value }` form; 0: `[ element ]` form
+  ASTNode **elements; // borrowed; the nodes are children
+  char **field_names; // struct form only: one name per element
+  size_t element_count;
+  /* Array repeat form `[value; count]`: `elements[0]` is the repeated value and
+   * this is the count expression. NULL for the comma-separated form. */
+  ASTNode *repeat_count;
+  /* The folded value, filled in by the type checker. Aggregate literals are
+   * compile-time constants, so the whole thing collapses to a byte image plus
+   * the relocations that finish it at link time. Lowering copies these onto the
+   * IR module symbol; codegen blits them into the object file. Only the
+   * outermost literal of a nested group carries an image. */
+  unsigned char *image;
+  size_t image_size;
+  AggregateReloc *relocs;
+  size_t reloc_count;
+} AggregateLiteral;
+
 typedef struct {
   ASTNode *condition;
   ASTNode *body;
@@ -288,14 +412,8 @@ typedef struct {
 } IfStatement;
 
 // SIMD vectorization attribute on a loop (`@simd` / `@simd!`).
-typedef enum {
-  SIMD_ATTR_NONE = 0,     // no attribute
-  SIMD_ATTR_HINT = 1,     // `@simd`  : best-effort; warn if it can't vectorize
-  SIMD_ATTR_CONTRACT = 2, // `@simd!` : hard contract; compile error if it can't
-  SIMD_ATTR_REPORT = 3    // internal: `--explain` marks every unannotated loop
-                          // so the verifier can report what became of it;
-                          // never warns or errors, only emits notes
-} SimdAttr;
+/* SimdAttr moved to ../simd_attr.h so the backend IR/optimizer can share it
+ * without depending on this AST header. */
 
 typedef struct {
   ASTNode *condition;
@@ -377,6 +495,14 @@ ASTNode *ast_create_call_expression(const char *function_name,
 ASTNode *ast_create_func_ptr_call(ASTNode *function, ASTNode **arguments,
                                   size_t argument_count,
                                   SourceLocation location);
+ASTNode *ast_create_gpu_launch(ASTNode *kernel, ASTNode **grid,
+                               ASTNode **block,
+                               ASTNode *dynamic_shared_bytes, ASTNode *stream,
+                               ASTNode **arguments, size_t argument_count,
+                               SourceLocation location);
+ASTNode *ast_create_barrier_statement(unsigned memory_regions,
+                                      AstMemoryOrder memory_order,
+                                      SourceLocation location);
 ASTNode *ast_create_assignment(const char *variable_name, ASTNode *value,
                                SourceLocation location);
 ASTNode *ast_create_inline_asm(const char *assembly_code,
@@ -395,6 +521,13 @@ ASTNode *ast_create_member_access(ASTNode *object, const char *member,
                                   SourceLocation location);
 ASTNode *ast_create_array_index_expression(ASTNode *array, ASTNode *index,
                                            SourceLocation location);
+/* Takes ownership of `elements` and `field_names` (and of the name strings);
+ * `field_names` is NULL for the array form. Returns NULL on allocation
+ * failure, in which case the caller still owns its arrays. */
+ASTNode *ast_create_aggregate_literal(int is_struct, ASTNode **elements,
+                                      char **field_names, size_t element_count,
+                                      ASTNode *repeat_count,
+                                      SourceLocation location);
 ASTNode *ast_create_method_call(ASTNode *object, const char *method_name,
                                 ASTNode **arguments, size_t argument_count,
                                 SourceLocation location);

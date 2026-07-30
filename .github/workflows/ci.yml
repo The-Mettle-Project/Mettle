@@ -7,6 +7,10 @@ name: CI
 # - Linux GCC/Clang exercise the ELF/SysV backend;
 # - Linux sanitizers run the compiler under ASan/UBSan while compiling ELF programs.
 # The heavy differential fuzz sweep lives in fuzz-nightly.yml.
+#
+# Every job that builds the compiler first fetches libmtlc, the backend this
+# frontend links against, at the revision pinned in libmtlc.version. The
+# dependency is cached on that pin, so a normal run downloads nothing.
 
 on:
   push:
@@ -50,9 +54,10 @@ jobs:
         run: |
           set -euo pipefail
           bash -n install.sh
+          bash -n get-libmtlc.sh
           bash -n tools/test-elf-native.sh
           if command -v shellcheck >/dev/null 2>&1; then
-            shellcheck install.sh tools/test-elf-native.sh
+            shellcheck install.sh get-libmtlc.sh tools/test-elf-native.sh
           else
             echo "::warning::shellcheck is not installed on this runner; bash -n completed"
           fi
@@ -94,6 +99,18 @@ jobs:
           gcc --version
           python --version
           $PSVersionTable.PSVersion
+
+      - name: Cache libmtlc
+        uses: actions/cache@v4
+        with:
+          path: libmtlc
+          key: libmtlc-windows-gcc-${{ hashFiles('libmtlc.version') }}
+
+      - name: Fetch and build libmtlc backend
+        shell: pwsh
+        env:
+          METTLE_NO_CODEVIEW: "1"
+        run: .\get-libmtlc.ps1
 
       # build.bat builds the compiler, bundles stdlib/runtime, then runs
       # tests/run_tests.ps1 (full suite + 60-seed differential fuzz). It exits
@@ -147,6 +164,21 @@ jobs:
           clang --version
           $PSVersionTable.PSVersion
 
+      - name: Cache libmtlc
+        uses: actions/cache@v4
+        with:
+          path: libmtlc
+          key: libmtlc-windows-clang-${{ hashFiles('libmtlc.version') }}
+
+      - name: Fetch and build libmtlc backend with Clang
+        shell: pwsh
+        env:
+          METTLE_NO_CODEVIEW: "1"
+          CC: clang
+        run: |
+          $env:Path = "C:\msys64\clang64\bin;$env:Path"
+          .\get-libmtlc.ps1
+
       - name: Compile compiler with Clang
         shell: pwsh
         env:
@@ -181,6 +213,17 @@ jobs:
           ld --version | head -1
           make --version | head -1
 
+      - name: Cache libmtlc
+        uses: actions/cache@v4
+        with:
+          path: libmtlc
+          key: libmtlc-linux-${{ matrix.cc }}-${{ hashFiles('libmtlc.version') }}
+
+      - name: Fetch and build libmtlc backend
+        env:
+          CC: ${{ matrix.cc }}
+        run: ./get-libmtlc.sh
+
       - name: Build compiler
         run: |
           make clean
@@ -201,6 +244,15 @@ jobs:
       UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
     steps:
       - uses: actions/checkout@v4
+
+      # The backend is most of the compiler, so it has to be instrumented too:
+      # LIBMTLC_EXTRA_CFLAGS passes the sanitizer flags through to libmtlc's own
+      # build. A clean (uninstrumented) archive would link and run, but would
+      # leave the optimizer and codegen uncovered.
+      - name: Fetch and build libmtlc backend with ASan/UBSan
+        env:
+          LIBMTLC_EXTRA_CFLAGS: "-fsanitize=address,undefined -fno-sanitize-recover=all"
+        run: ./get-libmtlc.sh
 
       - name: Build compiler with ASan/UBSan
         run: |

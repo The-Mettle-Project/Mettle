@@ -1,0 +1,14 @@
+kernel tensor_wrong_scale_storage(
+    a: uint8*, b: uint8*, c: float32*, d: float32*,
+    a_scale: uint32*, b_scale: uint8*) {
+  tensor_mma(a, b, c, d,
+             shape: m16n16k64,
+             a_type: e2m1, b_type: e2m1,
+             accumulator_type: f32, result_type: f32,
+             a_packing: dense_subbyte, b_packing: dense_subbyte,
+             a_scale_mode: block32, b_scale_mode: block32,
+             a_scale_type: ue8m0, b_scale_type: ue8m0,
+             a_scale: a_scale, b_scale: b_scale,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row);
+}

@@ -1,0 +1,4 @@
+kernel invalid_rebind() {
+  private var scratch: int32[4];
+  scratch = scratch;
+}

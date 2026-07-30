@@ -1,0 +1,4 @@
+kernel varying_tensor_epilogue_pointer(d: float32*) {
+  var lane: uint32 = subgroup_local_id();
+  tensor_epilogue(d + lane, shape: m16n16, element_type: f32);
+}

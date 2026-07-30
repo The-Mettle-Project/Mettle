@@ -1,0 +1,19 @@
+// Runtime K accumulation. The target-neutral optimizer proves the linear loop
+// body has one connected MMA and no observation of D, then splits only the loop
+// exit through a neutral accumulator commit.
+kernel tensor_loop_runtime(a: uint16*, b: uint16*, c: float32*, d: float32*,
+                           k: int32, lda: int32, ldb: int32,
+                           ldc: int32, ldd: int32) {
+  tensor_mma(a, b, c, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+  var inner: int32 = 16;
+  while (inner < k) {
+    tensor_mma(a + inner, b + inner, d, d,
+               shape: m16n16k16, input_type: f16, output_type: f32,
+               a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+               lda: lda, ldb: ldb, ldc: ldd, ldd: ldd);
+    inner = inner + 16;
+  }
+}

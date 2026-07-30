@@ -204,7 +204,25 @@ function Build-Compiler {
     )
 
     Write-Log "Building $Label compiler..."
-    $build = Invoke-CapturedProcess -FilePath ".\build.bat" -WorkingDirectory $SourceRoot
+    # The baseline is an exported source tree, so it has no libmtlc of its own:
+    # the backend is a gitignored dependency and git archive does not carry it.
+    # Point the build at this checkout's copy, as an absolute path, so both the
+    # baseline and the current build link the same backend -- which is what
+    # makes the comparison a frontend comparison. A no-op for a build.bat that
+    # builds the backend itself and ignores the variable.
+    $previousLibmtlc = $env:LIBMTLC_DIR
+    if (-not $env:LIBMTLC_DIR) {
+        $localLibmtlc = Join-Path $Root "libmtlc"
+        if (Test-Path (Join-Path $localLibmtlc "include\mtlc\mtlc.h")) {
+            $env:LIBMTLC_DIR = [System.IO.Path]::GetFullPath($localLibmtlc)
+        }
+    }
+    try {
+        $build = Invoke-CapturedProcess -FilePath ".\build.bat" -WorkingDirectory $SourceRoot
+    }
+    finally {
+        $env:LIBMTLC_DIR = $previousLibmtlc
+    }
     if ($build.ExitCode -ne 0) {
         throw "$Label compiler build failed:`n$($build.Output)"
     }

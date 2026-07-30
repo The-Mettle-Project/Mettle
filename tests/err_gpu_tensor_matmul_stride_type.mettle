@@ -1,0 +1,9 @@
+kernel bad_tensor_matmul_stride_type(
+    a: uint16*, b: uint16*, c: float32*, d: float32*,
+    row: uint32, column: uint32, m: uint32, n: uint32, k: uint32,
+    lda: uint64) {
+  tensor_matmul(
+      a, b, c, d, row, column, m, n, k,
+      shape: m16n16k16, input_type: f16, output_type: f32,
+      lda: lda, ldb: 64, ldc: 64, ldd: 64);
+}
