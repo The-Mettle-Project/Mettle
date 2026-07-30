@@ -1,12 +1,18 @@
 @echo off
 REM Windows build script for Mettle
-REM Usage: build.bat [gcc|clang] [--skip-tests]
+REM Usage: build.bat [gcc|clang] [--skip-tests] [--backend-only]
 REM   Or set CC=clang before invoking (defaults to gcc).
+REM
+REM --backend-only stops after archiving bin\mtlc.lib: the libmtlc backend
+REM alone, with none of the reference frontend. That is what a downstream
+REM frontend needs -- the Mettle language repository fetches this tree and
+REM builds the archive this way, then links its own driver against it.
 
 setlocal
 
 REM Select compiler: args override CC env var; default gcc.
 set "SKIP_TESTS="
+set "BACKEND_ONLY="
 :parse_args
 if "%~1"=="" goto args_done
 if /I "%~1"=="clang" (
@@ -29,13 +35,24 @@ if /I "%~1"=="--no-tests" (
     shift
     goto parse_args
 )
+if /I "%~1"=="--backend-only" (
+    set "BACKEND_ONLY=1"
+    shift
+    goto parse_args
+)
+if /I "%~1"=="--libmtlc-only" (
+    set "BACKEND_ONLY=1"
+    shift
+    goto parse_args
+)
 echo Error: unknown argument '%~1'
-echo Usage: build.bat [gcc^|clang] [--skip-tests]
+echo Usage: build.bat [gcc^|clang] [--skip-tests] [--backend-only]
 exit /b 1
 
 :args_done
 if not defined CC set "CC=gcc"
 if defined METTLE_SKIP_TESTS set "SKIP_TESTS=1"
+if defined METTLE_BACKEND_ONLY set "BACKEND_ONLY=1"
 
 REM METTLE_INTERNAL_ALLOC builds the driver against src\mettle_alloc.c
 REM instead of the platform heap. Set METTLE_NO_INTERNAL_ALLOC=1 to fall
@@ -95,6 +112,10 @@ REM Compile source files
 echo Compiling common utilities...
 %CC% %CFLAGS% -c src\common.c -o obj\common.o
 if %ERRORLEVEL% NEQ 0 exit /b 1
+
+REM Everything from here to :compile_ir is the reference frontend, which a
+REM backend-only build has no use for.
+if defined BACKEND_ONLY goto compile_ir
 
 echo Compiling lexer...
 %CC% %CFLAGS% -c src\lexer\lexer.c -o obj\lexer\lexer.o
@@ -156,6 +177,7 @@ if %ERRORLEVEL% NEQ 0 exit /b 1
 %CC% %CFLAGS% -c src\semantic\monomorphize.c -o obj\semantic\monomorphize.o
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
+:compile_ir
 echo Compiling IR...
 for %%f in (src\ir\*.c) do (
     echo   %%~nxf
@@ -196,6 +218,10 @@ echo Compiling debug info...
 %CC% %CFLAGS% -c src\debug\debug_info.c -o obj\debug\debug_info.o
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
+REM The language runtime, the Tracy shim and the driver's allocator all belong
+REM to the frontend side; skip them for a backend-only build.
+if defined BACKEND_ONLY goto compile_diagnostics
+
 echo Compiling crash-handler runtime (opt-in: -d / -s / -g / IR trap)...
 %CC% %CFLAGS% -c src\runtime\crash_handler.c -o obj\runtime\crash_handler.o
 if %ERRORLEVEL% NEQ 0 exit /b 1
@@ -224,11 +250,15 @@ echo Compiling allocator...
 %CC% %CFLAGS% -c src\mettle_alloc.c -o obj\mettle_alloc.o
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
+:compile_diagnostics
 echo Compiling error reporter...
 %CC% %CFLAGS% -c src\error\error_reporter.c -o obj\error\error_reporter.o
 if %ERRORLEVEL% NEQ 0 exit /b 1
-%CC% %CFLAGS% -c src\error\error_explain.c -o obj\error\error_explain.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
+REM error_explain.c renders the driver's optimization report: frontend-side.
+if not defined BACKEND_ONLY (
+    %CC% %CFLAGS% -c src\error\error_explain.c -o obj\error\error_explain.o
+    if errorlevel 1 exit /b 1
+)
 
 echo Compiling compiler diagnostics...
 %CC% %CFLAGS% -c src\compiler\compiler_context.c -o obj\compiler\compiler_context.o
@@ -244,6 +274,8 @@ if %ERRORLEVEL% NEQ 0 exit /b 1
 %CC% %CFLAGS% -c src\mtlc_lib_fallbacks.c -o obj\mtlc_lib_fallbacks.o
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
+if defined BACKEND_ONLY goto archive_libmtlc
+
 echo Compiling frontend-to-backend type adapter...
 %CC% %CFLAGS% -c src\frontend\mtlc_type_from_frontend.c -o obj\frontend\mtlc_type_from_frontend.o
 if %ERRORLEVEL% NEQ 0 exit /b 1
@@ -253,6 +285,8 @@ if %ERRORLEVEL% NEQ 0 exit /b 1
 echo Compiling main...
 %CC% %CFLAGS% -c src\main.c -o obj\main.o
 if %ERRORLEVEL% NEQ 0 exit /b 1
+
+:archive_libmtlc
 
 REM ---------------------------------------------------------------------------
 REM Archive the standalone backend into libmtlc, then link the reference frontend
@@ -289,6 +323,15 @@ for %%o in (obj\compiler\*.o) do %AR% rcs bin\mtlc.lib %%o
 if not exist bin\mtlc.lib (
     echo Build failed: bin\mtlc.lib was not created.
     exit /b 1
+)
+
+REM A backend-only build is done here: the archive plus include\mtlc is
+REM everything a frontend links against.
+if defined BACKEND_ONLY (
+    echo.
+    echo libmtlc built: bin\mtlc.lib
+    echo   headers: include\mtlc ^(public API^), src ^(backend internals^)
+    exit /b 0
 )
 
 echo Linking mettle ^(reference frontend^) against libmtlc...
