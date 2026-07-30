@@ -34,6 +34,10 @@ typedef enum {
  * --explain wires its globals. Passing enabled=0 is the default no-op state. */
 void mir_annotate_set_enabled(int enabled);
 int mir_annotate_enabled(void);
+/* Run the analysis for its numbers alone: --explain-json arms the annotator to
+ * get per-loop cycles and port bottlenecks, but wants no asm listing and no
+ * .annot.json sidecar. */
+void mir_annotate_set_cost_only(int cost_only);
 void mir_annotate_set_output_path(const char *output_path);
 void mir_annotate_set_syntax(MirAnnotSyntax syntax);
 void mir_annotate_set_source_file(const char *source_file);

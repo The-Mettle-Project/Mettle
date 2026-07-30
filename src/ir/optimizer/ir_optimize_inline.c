@@ -110,6 +110,18 @@ static int ir_function_name_is_inline_denylisted(const char *name) {
          strcmp(name, "bench_unrolled") == 0;
 }
 
+/* The id of the refusal most recently produced here, for the structured half
+ * of the --explain report. The prose gets reworded as we learn how to say it
+ * better; the id is what a tool keys off, so the two are written together by
+ * IR_INLINE_WHY and cannot drift apart. Mirrors the vectorizer's bail ids. */
+static MTLC_THREAD_LOCAL const char *g_inline_refusal_code = NULL;
+
+#define IR_INLINE_WHY(target, id, text)                                        \
+  do {                                                                         \
+    *(target) = (text);                                                        \
+    g_inline_refusal_code = (id);                                              \
+  } while (0)
+
 /* When `why_not`/`fix` are non-NULL they receive a user-facing reason and an
  * actionable suggestion (static strings) every time this returns 0; --explain
  * reports them verbatim. A NULL fix means there is nothing actionable. */
@@ -126,12 +138,14 @@ static int ir_function_is_inline_candidate(const IRFunction *function,
   *why_not = NULL;
   *fix = NULL;
   if (!function || !function->name || function->instruction_count == 0) {
-    *why_not = "the callee has no body available to the inliner";
+    IR_INLINE_WHY(why_not, "callee-no-body",
+                  "the callee has no body available to the inliner");
     return 0;
   }
   /* `@noinline` is an absolute veto. */
   if (function->is_noinline) {
-    *why_not = "the callee is marked @noinline";
+    IR_INLINE_WHY(why_not, "callee-noinline",
+                  "the callee is marked @noinline");
     *fix = "remove @noinline if inlining is wanted here";
     return 0;
   }
@@ -145,17 +159,20 @@ static int ir_function_is_inline_candidate(const IRFunction *function,
   size_t nested_call_budget = ir_opt_inline_nested_call_budget(function);
 
   if (!forced && ir_function_name_is_inline_denylisted(function->name)) {
-    *why_not = "the callee is on the compiler's inline denylist "
-               "(a compile-time-blowup guard)";
+    IR_INLINE_WHY(why_not, "callee-denylisted",
+                  "the callee is on the compiler's inline denylist "
+                  "(a compile-time-blowup guard)");
     return 0;
   }
   if (!forced && function->parameter_count > IR_INLINE_MAX_PARAMETERS) {
-    *why_not = "the callee has more than 16 parameters";
+    IR_INLINE_WHY(why_not, "too-many-parameters",
+                  "the callee has more than 16 parameters");
     *fix = "pass a struct instead of a long parameter list";
     return 0;
   }
   if (function->parameter_count > 0 && !function->parameter_names) {
-    *why_not = "the callee's parameter names are unavailable to the inliner";
+    IR_INLINE_WHY(why_not, "callee-parameter-names",
+                  "the callee's parameter names are unavailable to the inliner");
     return 0;
   }
 
@@ -175,15 +192,17 @@ static int ir_function_is_inline_candidate(const IRFunction *function,
 
     non_nop_count++;
     if (!forced && non_nop_count > body_budget) {
-      *why_not = "the callee's body is over the profile-adjusted inline "
-                 "instruction budget";
+      IR_INLINE_WHY(why_not, "callee-over-budget",
+                    "the callee's body is over the profile-adjusted inline "
+                    "instruction budget");
       *fix = "mark the callee @inline to override the budget, or compile "
              "with --pgo so a measured-hot callee overrides it";
       return 0;
     }
 
     if (instruction->op == IR_OP_INLINE_ASM) {
-      *why_not = "the callee contains inline assembly";
+      IR_INLINE_WHY(why_not, "callee-inline-asm",
+                    "the callee contains inline assembly");
       return 0;
     }
 
@@ -238,13 +257,15 @@ static int ir_function_is_inline_candidate(const IRFunction *function,
    * working around a latent bug elsewhere in the optimizer. */
   if ((has_while_label && has_less_compare && has_greater_compare) ||
       (has_while_label && has_subtract) || (has_while_label && has_multiply)) {
-    *why_not = "the callee contains a loop the inliner currently declines "
-               "(a compiler limitation, not a problem in your code; the call "
-               "itself costs little next to the loop inside it)";
+    IR_INLINE_WHY(why_not, "callee-has-loop",
+                  "the callee contains a loop the inliner currently declines "
+                  "(a compiler limitation, not a problem in your code; the call "
+                  "itself costs little next to the loop inside it)");
     return 0;
   }
   if (!has_return) {
-    *why_not = "the callee has no return instruction the inliner can rewrite";
+    IR_INLINE_WHY(why_not, "callee-no-return",
+                  "the callee has no return instruction the inliner can rewrite");
     return 0;
   }
   return 1;
@@ -885,9 +906,17 @@ static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
           ir_function_is_inline_candidate(callee, NULL, NULL)) {
         if (ir_explain_enabled()) {
           char entity[160];
+          size_t weight = ir_function_non_nop_instruction_count(callee);
           snprintf(entity, sizeof(entity), "call to `%s`", instruction->text);
           ir_explain_remark(function->name, entity, instruction->location, 1,
                             "inlined", NULL, NULL, NULL);
+          ir_explain_remark_code("inlined");
+          ir_explain_remark_quantity("calleeInstructions", (long)weight);
+          /* A one-line wrapper going away is not news. Saying so lets a
+             reader collapse the routine majority and see the real decisions. */
+          if (weight <= IR_EXPLAIN_TRIVIAL_CALLEE_INSTRUCTIONS) {
+            ir_explain_remark_trivial();
+          }
         }
         if (!ir_inline_call_instruction(&vector, instruction, callee,
                                         (*inline_counter)++)) {
@@ -1100,14 +1129,17 @@ static void ir_inline_site_reason(IRFunction *caller,
                                   const char **fix) {
   *reason = NULL;
   *fix = NULL;
+  g_inline_refusal_code = NULL;
   if (callee != caller && ir_function_contains_simd_kernel(callee)) {
-    *reason = "the callee's loops were vectorized into SIMD kernels after "
-              "inlining ran; it stays a real call (the kernel runs the same "
-              "either way)";
+    IR_INLINE_WHY(reason, "callee-has-kernel",
+                  "the callee's loops were vectorized into SIMD kernels after "
+                  "inlining ran; it stays a real call (the kernel runs the same "
+                  "either way)");
     return;
   }
   if (callee == caller) {
-    *reason = "the call is directly recursive";
+    IR_INLINE_WHY(reason, "recursive",
+                  "the call is directly recursive");
     *fix = "bounded self-recursion expansion applies automatically; rewrite "
            "as a loop for full control";
   } else if (ir_function_non_nop_instruction_count(caller) >
@@ -1123,21 +1155,24 @@ static void ir_inline_site_reason(IRFunction *caller,
      * caller budget, so only cold one-shot sites can be refused for this
      * reason -- and for those, NOT inlining is the right call, so there is
      * deliberately no fix advice to hand out. */
-    *reason = "the calling function is over the profile-adjusted caller "
-              "budget, and this call site is not measured hot or inside a "
-              "loop -- it runs at most once per call of the function, so "
-              "keeping it a real call costs nothing measurable (loop-resident "
-              "calls, measured-hot sites, tiny call-free callees, and "
-              "@inline-marked callees still inline here)";
+    IR_INLINE_WHY(reason, "caller-over-budget",
+                  "the calling function is over the profile-adjusted caller "
+                  "budget, and this call site is not measured hot or inside a "
+                  "loop -- it runs at most once per call of the function, so "
+                  "keeping it a real call costs nothing measurable (loop-resident "
+                  "calls, measured-hot sites, tiny call-free callees, and "
+                  "@inline-marked callees still inline here)");
   } else if (instruction->argument_count > IR_INLINE_MAX_PARAMETERS ||
              instruction->argument_count != callee->parameter_count) {
-    *reason = "the call's argument count doesn't match what the inliner "
-              "handles for this callee";
+    IR_INLINE_WHY(reason, "argument-count",
+                  "the call's argument count doesn't match what the inliner "
+                  "handles for this callee");
   } else if (ir_function_is_inline_candidate(callee, reason, fix)) {
     /* Candidate-eligible but still here: the call site appeared late (a
      * nested inline in the final round) or rounds hit their cap. */
-    *reason = "inlining rounds reached their limit before this call could "
-              "be revisited";
+    IR_INLINE_WHY(reason, "rounds-exhausted",
+                  "inlining rounds reached their limit before this call could "
+                  "be revisited");
   }
 }
 
@@ -1173,6 +1208,7 @@ void ir_inline_explain_report_remaining(IRProgram *program) {
       const char *reason = NULL;
       const char *fix = NULL;
       ir_inline_site_reason(function, instruction, callee, &reason, &fix);
+      const char *refusal_code = g_inline_refusal_code;
 
       /* When the fix is "mark it @inline", PROVE it: re-run the candidate
        * check with the decorator pretend-applied. A pass means the call
@@ -1210,6 +1246,9 @@ void ir_inline_explain_report_remaining(IRProgram *program) {
       snprintf(entity, sizeof(entity), "call to `%s`", instruction->text);
       ir_explain_remark(function->name, entity, instruction->location, 0,
                         "NOT inlined", reason, fix, verified);
+      ir_explain_remark_code(refusal_code);
+      ir_explain_remark_quantity("calleeInstructions",
+                                 (long)ir_function_non_nop_instruction_count(callee));
     }
   }
 }

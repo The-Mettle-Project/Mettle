@@ -158,6 +158,7 @@ typedef struct {
 
 static MTLC_THREAD_LOCAL struct {
   int enabled;
+  int cost_only; /* measure for --explain-json; emit no listing or sidecar */
   MirAnnotSyntax syntax;
   char *output_path;
   char *source_file;
@@ -178,6 +179,9 @@ static void analyze_function(AnnotFunc *f);
 
 void mir_annotate_set_enabled(int enabled) { g.enabled = enabled ? 1 : 0; }
 int mir_annotate_enabled(void) { return g.enabled; }
+void mir_annotate_set_cost_only(int cost_only) {
+  g.cost_only = cost_only ? 1 : 0;
+}
 void mir_annotate_set_syntax(MirAnnotSyntax syntax) { g.syntax = syntax; }
 
 static char *dupstr(const char *s) {
@@ -2338,8 +2342,39 @@ static void free_all(void) {
   g.func_count = g.func_cap = 0;
 }
 
+/* Hand the cost model to the --explain report.
+ *
+ * The optimizer's report knows which loops it refused to vectorize; only
+ * codegen knows what those loops then cost. Publishing here joins the two
+ * without the IR layer having to know codegen exists: the same direction the
+ * backend gate already reports in. */
+static void publish_costs_to_explain(void) {
+  if (!ir_explain_enabled()) return;
+  for (size_t fi = 0; fi < g.func_count; fi++) {
+    const AnnotFunc *f = &g.funcs[fi];
+    ir_explain_backend_cost(f->name, f->file, f->spill_count, (int)f->reg_count,
+                            f->total_rthru, f->hot_cost, f->vec_ops,
+                            f->cost_estimated);
+    for (size_t li = 0; li < f->loop_count; li++) {
+      const Loop *l = &f->loops[li];
+      ir_explain_backend_loop(f->name, f->file, l->head_line, l->tail_line,
+                              l->depth, l->cycles_per_iter,
+                              res_name[l->bottleneck], l->has_kernel,
+                              l->has_estimated);
+    }
+  }
+}
+
 void mir_annotate_flush(void) {
   if (!g.enabled) return;
+  publish_costs_to_explain();
+  if (g.cost_only) {
+    /* Armed purely to measure for --explain-json: no listing, no sidecar. */
+    free_all();
+    free(g.q_fn);
+    g.q_fn = NULL;
+    return;
+  }
   if (g.q_hot || g.q_lo || g.q_fn) {
     /* Focused, tool-facing output: no giant listing or sidecar. */
     if (g.q_hot) write_hot_query();

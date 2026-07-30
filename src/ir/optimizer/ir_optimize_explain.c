@@ -176,24 +176,47 @@ static struct {
   int had_baseline;
 } g_digest;
 
+/* A named number a pass measured about one remark: an unroll factor, a trip
+ * count, how many instructions a callee weighs. Free-form on purpose -- a pass
+ * with something to count adds a quantity instead of a struct field, and the
+ * JSON carries it without any schema surgery. */
+typedef struct {
+  char *name;
+  long value;
+} IRExplainQuantity;
+
+#define IR_EXPLAIN_MAX_QUANTITIES 6
+
 /* One remark: an entity ("loop", "call to `f`") in a function, a colored
- * headline, and optional reason/fix detail lines. */
+ * headline, and optional reason/fix detail lines.
+ *
+ * The prose is for a person; `code` and the quantities are for tools. A
+ * consumer keying off `code` keeps working when the wording is improved, which
+ * the wording regularly is. */
 typedef struct {
   char *function_name;
   char *entity;
   size_t line;
   size_t column;
+  size_t end_line; /* last line of the construct; 0 = unknown */
   int positive; /* 1 = the optimizer did something good (green), 0 = declined */
   char *headline;
   char *reason;   /* may be NULL */
   char *fix;      /* may be NULL */
   char *verified; /* may be NULL: the fix was SIMULATED and proven to work */
+  char *code;     /* stable id for the decision; may be NULL */
   size_t depth;   /* loop nest depth (1 = top level); 0 = not a loop/unknown */
+  int trivial;    /* 1 = routine housekeeping a reader can collapse */
+  IRExplainQuantity quantities[IR_EXPLAIN_MAX_QUANTITIES];
+  size_t quantity_count;
 } IRExplainRemark;
 
 static MTLC_THREAD_LOCAL IRExplainRemark *g_remarks = NULL;
 static MTLC_THREAD_LOCAL size_t g_remark_count = 0;
 static MTLC_THREAD_LOCAL size_t g_remark_capacity = 0;
+/* Did the last ir_explain_remark call actually append? The detail stamps read
+ * this so a filtered remark's detail never lands on an unrelated one. */
+static MTLC_THREAD_LOCAL int g_last_remark_recorded = 0;
 
 /* Backend (codegen-stage) entries: per function, did it get the
  * register-allocating MIR backend or fall back to baseline codegen? */
@@ -505,10 +528,435 @@ static char *ir_explain_text_dup(const char *s) {
   return copy;
 }
 
+/* Non-nop instruction weight: what the inliner's budgets, the backend gate and
+ * this report all mean by "how big is this function". The inliner keeps a
+ * private copy for its hot paths; this is the one the report uses. */
+size_t ir_explain_instruction_weight(const IRFunction *function) {
+  if (!function) {
+    return 0;
+  }
+  size_t weight = 0;
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    if (function->instructions[i].op != IR_OP_NOP) {
+      weight++;
+    }
+  }
+  return weight;
+}
+
+/* ---- the codegen cost model ------------------------------------------------
+ * Published by mir_annotate once every function is encoded. The optimizer's
+ * half of the report says what it decided; this says what the decision costs,
+ * which is the difference between "this loop did not vectorize" and "this loop
+ * did not vectorize and runs 7.2 cycles an iteration, bottlenecked on p23". */
+typedef struct {
+  char *function_name;
+  size_t head_line;
+  size_t tail_line;
+  int depth;
+  int cycles_per_iter; /* centicycles */
+  const char *bottleneck;
+  int has_kernel;
+  int estimated;
+} IRExplainLoopCost;
+
+typedef struct {
+  char *function_name;
+  int spills;
+  int regs_used;
+  int total_rthru;
+  long hot_cost;
+  int vec_ops;
+  int estimated_spans;
+} IRExplainFunctionCost;
+
+static MTLC_THREAD_LOCAL IRExplainLoopCost *g_loop_costs = NULL;
+static MTLC_THREAD_LOCAL size_t g_loop_cost_count = 0;
+static MTLC_THREAD_LOCAL size_t g_loop_cost_capacity = 0;
+static MTLC_THREAD_LOCAL IRExplainFunctionCost *g_function_costs = NULL;
+static MTLC_THREAD_LOCAL size_t g_function_cost_count = 0;
+static MTLC_THREAD_LOCAL size_t g_function_cost_capacity = 0;
+
+void ir_explain_backend_loop(const char *function_name, const char *filename,
+                             size_t head_line, size_t tail_line, int depth,
+                             int cycles_per_iter, const char *bottleneck,
+                             int has_kernel, int estimated) {
+  if (!g_explain || !function_name || !ir_explain_file_enabled(filename)) {
+    return;
+  }
+  if (g_loop_cost_count == g_loop_cost_capacity) {
+    size_t grown_capacity = g_loop_cost_capacity ? g_loop_cost_capacity * 2 : 32;
+    IRExplainLoopCost *grown =
+        realloc(g_loop_costs, grown_capacity * sizeof(IRExplainLoopCost));
+    if (!grown) {
+      return;
+    }
+    g_loop_costs = grown;
+    g_loop_cost_capacity = grown_capacity;
+  }
+  IRExplainLoopCost *cost = &g_loop_costs[g_loop_cost_count++];
+  cost->function_name = ir_explain_strdup(function_name);
+  cost->head_line = head_line;
+  cost->tail_line = tail_line;
+  cost->depth = depth;
+  cost->cycles_per_iter = cycles_per_iter;
+  cost->bottleneck = bottleneck; /* static port-name table; not owned */
+  cost->has_kernel = has_kernel;
+  cost->estimated = estimated;
+}
+
+void ir_explain_backend_cost(const char *function_name, const char *filename,
+                             int spills, int regs_used, int total_rthru,
+                             long hot_cost, int vec_ops, int estimated_spans) {
+  if (!g_explain || !function_name || !ir_explain_file_enabled(filename)) {
+    return;
+  }
+  if (g_function_cost_count == g_function_cost_capacity) {
+    size_t grown_capacity =
+        g_function_cost_capacity ? g_function_cost_capacity * 2 : 32;
+    IRExplainFunctionCost *grown = realloc(
+        g_function_costs, grown_capacity * sizeof(IRExplainFunctionCost));
+    if (!grown) {
+      return;
+    }
+    g_function_costs = grown;
+    g_function_cost_capacity = grown_capacity;
+  }
+  IRExplainFunctionCost *cost = &g_function_costs[g_function_cost_count++];
+  cost->function_name = ir_explain_strdup(function_name);
+  cost->spills = spills;
+  cost->regs_used = regs_used;
+  cost->total_rthru = total_rthru;
+  cost->hot_cost = hot_cost;
+  cost->vec_ops = vec_ops;
+  cost->estimated_spans = estimated_spans;
+}
+
+/* ---- the pass ledger -------------------------------------------------------
+ * What each optimization pass actually did to this file: how often it ran, how
+ * often it changed something, and the net instructions it removed. A pass that
+ * runs forty times and never fires is as interesting as one that halves the
+ * function -- both are invisible in a report that only lists vectorization and
+ * inlining. Only collected under --explain, and only for the focus file. */
+#define IR_EXPLAIN_OPCODE_LIMIT ((size_t)IR_OP_SELECT + 1)
+#define IR_EXPLAIN_MAX_SITES 256
+#define IR_EXPLAIN_REPORTED_SITES 12
+#define IR_EXPLAIN_MAX_SHAPE_LINES 1024
+
+/* The shape of a function: how many of each opcode, and how many instructions
+ * sit on each source line. Diffing two shapes says what a pass actually did --
+ * "removed 8 loads and 8 stores at lines 38 and 39" rather than "changed
+ * something". Cheap enough to take twice per pass run, which is the price of
+ * the ledger being worth reading. */
+typedef struct {
+  int *opcodes;
+  size_t *lines;
+  int *line_counts;
+  size_t line_count;
+  size_t line_capacity;
+} IRExplainShape;
+
+/* One (function, line) the pass moved instructions at. */
+typedef struct {
+  char *function_name;
+  size_t line;
+  long delta; /* positive = instructions removed here */
+} IRExplainSite;
+
+typedef struct {
+  const char *name; /* static pass-name pointer; not owned */
+  size_t runs;
+  size_t changed_runs;
+  long instructions_removed; /* negative = the pass added instructions */
+  int *opcode_delta;         /* per-opcode net change, lazily allocated */
+  IRExplainSite *sites;
+  size_t site_count;
+  size_t site_capacity;
+} IRExplainPassEntry;
+
+#define IR_EXPLAIN_MAX_PASSES 128
+static MTLC_THREAD_LOCAL IRExplainPassEntry g_passes[IR_EXPLAIN_MAX_PASSES];
+static MTLC_THREAD_LOCAL size_t g_pass_count = 0;
+
+/* The two scratch shapes, reused for every pass run so the ledger allocates
+ * once rather than per pass. */
+static MTLC_THREAD_LOCAL IRExplainShape g_shape_before;
+static MTLC_THREAD_LOCAL IRExplainShape g_shape_after;
+
+static int ir_explain_shape_reserve(IRExplainShape *shape) {
+  if (!shape->opcodes) {
+    shape->opcodes = calloc(IR_EXPLAIN_OPCODE_LIMIT, sizeof(int));
+    if (!shape->opcodes) {
+      return 0;
+    }
+  }
+  if (!shape->lines) {
+    shape->lines = calloc(IR_EXPLAIN_MAX_SHAPE_LINES, sizeof(size_t));
+    shape->line_counts = calloc(IR_EXPLAIN_MAX_SHAPE_LINES, sizeof(int));
+    if (!shape->lines || !shape->line_counts) {
+      return 0;
+    }
+    shape->line_capacity = IR_EXPLAIN_MAX_SHAPE_LINES;
+  }
+  return 1;
+}
+
+/* Count the function into `shape`. Instructions run roughly in line order, so
+ * the last-line fast path turns the histogram into a linear scan in practice. */
+static int ir_explain_shape_take(IRExplainShape *shape,
+                                 const IRFunction *function) {
+  if (!ir_explain_shape_reserve(shape)) {
+    return 0;
+  }
+  memset(shape->opcodes, 0, IR_EXPLAIN_OPCODE_LIMIT * sizeof(int));
+  memset(shape->line_counts, 0, shape->line_capacity * sizeof(int));
+  shape->line_count = 0;
+
+  const char *own_file = function->instructions[0].location.filename;
+  size_t last = (size_t)-1;
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    if (instruction->op == IR_OP_NOP) {
+      continue;
+    }
+    if ((size_t)instruction->op < IR_EXPLAIN_OPCODE_LIMIT) {
+      shape->opcodes[instruction->op]++;
+    }
+    size_t line = instruction->location.line;
+    if (line == 0) {
+      continue;
+    }
+    /* An inlined callee's instructions carry ITS file's lines. Counting those
+     * would report sites at line numbers that mean nothing in the file the
+     * report is about, so only the function's own file contributes. */
+    if (own_file && instruction->location.filename &&
+        strcmp(instruction->location.filename, own_file) != 0) {
+      continue;
+    }
+    if (last < shape->line_count && shape->lines[last] == line) {
+      shape->line_counts[last]++;
+      continue;
+    }
+    size_t slot = (size_t)-1;
+    for (size_t s = 0; s < shape->line_count; s++) {
+      if (shape->lines[s] == line) {
+        slot = s;
+        break;
+      }
+    }
+    if (slot == (size_t)-1) {
+      if (shape->line_count >= shape->line_capacity) {
+        continue; /* pathologically wide function: the opcode delta still lands */
+      }
+      slot = shape->line_count++;
+      shape->lines[slot] = line;
+    }
+    shape->line_counts[slot]++;
+    last = slot;
+  }
+  return 1;
+}
+
+static void ir_explain_pass_record_site(IRExplainPassEntry *entry,
+                                        const char *function_name, size_t line,
+                                        long delta) {
+  for (size_t i = 0; i < entry->site_count; i++) {
+    if (entry->sites[i].line == line &&
+        strcmp(entry->sites[i].function_name, function_name) == 0) {
+      entry->sites[i].delta += delta;
+      return;
+    }
+  }
+  if (entry->site_count == entry->site_capacity) {
+    if (entry->site_capacity >= IR_EXPLAIN_MAX_SITES) {
+      return;
+    }
+    size_t grown_capacity = entry->site_capacity ? entry->site_capacity * 2 : 16;
+    IRExplainSite *grown =
+        realloc(entry->sites, grown_capacity * sizeof(IRExplainSite));
+    if (!grown) {
+      return;
+    }
+    entry->sites = grown;
+    entry->site_capacity = grown_capacity;
+  }
+  IRExplainSite *site = &entry->sites[entry->site_count++];
+  site->function_name = ir_explain_strdup(function_name);
+  site->line = line;
+  site->delta = delta;
+}
+
+/* Is this pass run worth measuring? */
+static int ir_explain_pass_tracked(const IRFunction *function) {
+  return g_explain && !g_explain_hypothesis && function &&
+         function->instruction_count > 0 &&
+         ir_explain_location_enabled(&function->instructions[0].location);
+}
+
+void ir_explain_pass_begin(const IRFunction *function) {
+  if (!ir_explain_pass_tracked(function)) {
+    return;
+  }
+  ir_explain_shape_take(&g_shape_before, function);
+}
+
+void ir_explain_pass_end(const IRFunction *function, const char *name,
+                         int changed) {
+  if (!name || !ir_explain_pass_tracked(function)) {
+    return;
+  }
+  IRExplainPassEntry *entry = NULL;
+  for (size_t i = 0; i < g_pass_count; i++) {
+    if (g_passes[i].name == name || strcmp(g_passes[i].name, name) == 0) {
+      entry = &g_passes[i];
+      break;
+    }
+  }
+  if (!entry) {
+    if (g_pass_count >= IR_EXPLAIN_MAX_PASSES) {
+      return;
+    }
+    entry = &g_passes[g_pass_count++];
+    memset(entry, 0, sizeof(*entry));
+    entry->name = name;
+  }
+  entry->runs++;
+  if (!changed) {
+    return; /* a clean run has nothing to describe */
+  }
+  entry->changed_runs++;
+
+  if (!ir_explain_shape_take(&g_shape_after, function) ||
+      !g_shape_before.opcodes) {
+    return;
+  }
+
+  long removed = 0;
+  if (!entry->opcode_delta) {
+    entry->opcode_delta = calloc(IR_EXPLAIN_OPCODE_LIMIT, sizeof(int));
+  }
+  for (size_t op = 0; op < IR_EXPLAIN_OPCODE_LIMIT; op++) {
+    int delta = g_shape_before.opcodes[op] - g_shape_after.opcodes[op];
+    removed += delta;
+    if (delta != 0 && entry->opcode_delta) {
+      entry->opcode_delta[op] += delta;
+    }
+  }
+  entry->instructions_removed += removed;
+
+  /* Where it happened: lines whose instruction count moved. */
+  for (size_t i = 0; i < g_shape_before.line_count; i++) {
+    size_t line = g_shape_before.lines[i];
+    int after = 0;
+    for (size_t j = 0; j < g_shape_after.line_count; j++) {
+      if (g_shape_after.lines[j] == line) {
+        after = g_shape_after.line_counts[j];
+        break;
+      }
+    }
+    int delta = g_shape_before.line_counts[i] - after;
+    if (delta != 0) {
+      ir_explain_pass_record_site(entry, function->name ? function->name : "?",
+                                  line, delta);
+    }
+  }
+  for (size_t j = 0; j < g_shape_after.line_count; j++) {
+    size_t line = g_shape_after.lines[j];
+    int existed = 0;
+    for (size_t i = 0; i < g_shape_before.line_count; i++) {
+      if (g_shape_before.lines[i] == line) {
+        existed = 1;
+        break;
+      }
+    }
+    if (!existed) {
+      ir_explain_pass_record_site(entry, function->name ? function->name : "?",
+                                  line, -g_shape_after.line_counts[j]);
+    }
+  }
+}
+
+/* ---- the per-function table ------------------------------------------------
+ * One row per function in the focus file: where it starts, what it weighed
+ * before and after optimization, and (merged in at flush time) how it fared in
+ * the backend. The report's spine -- everything else hangs off a function. */
+typedef struct {
+  char *name;
+  size_t line;
+  size_t instructions_before;
+  size_t instructions_after;
+  /* Tallied from the remarks before they are freed, because the section is
+   * written later -- once codegen has decided the backend half. */
+  size_t loops;
+  size_t loops_vectorized;
+  size_t calls_inlined;
+  size_t calls_refused;
+} IRExplainFunctionEntry;
+
+static MTLC_THREAD_LOCAL IRExplainFunctionEntry *g_functions = NULL;
+static MTLC_THREAD_LOCAL size_t g_function_count = 0;
+static MTLC_THREAD_LOCAL size_t g_function_capacity = 0;
+
+static IRExplainFunctionEntry *ir_explain_function_entry(const char *name) {
+  for (size_t i = 0; i < g_function_count; i++) {
+    if (strcmp(g_functions[i].name, name) == 0) {
+      return &g_functions[i];
+    }
+  }
+  if (g_function_count == g_function_capacity) {
+    size_t grown_capacity = g_function_capacity ? g_function_capacity * 2 : 32;
+    IRExplainFunctionEntry *grown =
+        realloc(g_functions, grown_capacity * sizeof(IRExplainFunctionEntry));
+    if (!grown) {
+      return NULL;
+    }
+    g_functions = grown;
+    g_function_capacity = grown_capacity;
+  }
+  IRExplainFunctionEntry *entry = &g_functions[g_function_count++];
+  entry->name = ir_explain_strdup(name);
+  entry->line = 0;
+  entry->instructions_before = 0;
+  entry->instructions_after = 0;
+  entry->loops = 0;
+  entry->loops_vectorized = 0;
+  entry->calls_inlined = 0;
+  entry->calls_refused = 0;
+  return entry;
+}
+
+void ir_explain_function_before(const IRFunction *function) {
+  if (!g_explain || g_explain_hypothesis || !function || !function->name ||
+      function->instruction_count == 0 ||
+      !ir_explain_location_enabled(&function->instructions[0].location)) {
+    return;
+  }
+  IRExplainFunctionEntry *entry = ir_explain_function_entry(function->name);
+  if (!entry) {
+    return;
+  }
+  entry->line = function->instructions[0].location.line;
+  entry->instructions_before = ir_explain_instruction_weight(function);
+  entry->instructions_after = entry->instructions_before;
+}
+
+void ir_explain_function_after(const IRFunction *function) {
+  if (!g_explain || g_explain_hypothesis || !function || !function->name ||
+      function->instruction_count == 0 ||
+      !ir_explain_location_enabled(&function->instructions[0].location)) {
+    return;
+  }
+  IRExplainFunctionEntry *entry = ir_explain_function_entry(function->name);
+  if (entry) {
+    entry->instructions_after = ir_explain_instruction_weight(function);
+  }
+}
+
 void ir_explain_remark(const char *function_name, const char *entity,
                        SourceLocation location, int positive,
                        const char *headline, const char *reason,
                        const char *fix, const char *verified) {
+  g_last_remark_recorded = 0;
   if (!g_explain || g_explain_hypothesis || !headline ||
       !ir_explain_location_enabled(&location)) {
     return;
@@ -542,12 +990,59 @@ void ir_explain_remark(const char *function_name, const char *entity,
   r->entity = ir_explain_text_dup(entity ? entity : "loop");
   r->line = location.line;
   r->column = location.column;
+  r->end_line = 0;
   r->positive = positive;
   r->headline = ir_explain_text_dup(headline);
   r->reason = ir_explain_text_dup(reason);
   r->fix = ir_explain_text_dup(fix);
   r->verified = ir_explain_text_dup(verified);
+  r->code = NULL;
   r->depth = 0;
+  r->trivial = 0;
+  r->quantity_count = 0;
+  g_last_remark_recorded = 1;
+}
+
+/* The remark most recently recorded, or NULL when the last ir_explain_remark
+ * call was filtered out (wrong file, hypothesis run, duplicate). Every stamp
+ * below goes through here, so a suppressed remark can never have its detail
+ * land on the previous one. */
+static IRExplainRemark *ir_explain_last_remark(void) {
+  if (!g_last_remark_recorded || g_remark_count == 0) {
+    return NULL;
+  }
+  return &g_remarks[g_remark_count - 1];
+}
+
+void ir_explain_remark_code(const char *code) {
+  IRExplainRemark *r = ir_explain_last_remark();
+  if (r && !r->code) {
+    r->code = ir_explain_text_dup(code);
+  }
+}
+
+void ir_explain_remark_extent(size_t end_line) {
+  IRExplainRemark *r = ir_explain_last_remark();
+  if (r && end_line >= r->line) {
+    r->end_line = end_line;
+  }
+}
+
+void ir_explain_remark_trivial(void) {
+  IRExplainRemark *r = ir_explain_last_remark();
+  if (r) {
+    r->trivial = 1;
+  }
+}
+
+void ir_explain_remark_quantity(const char *name, long value) {
+  IRExplainRemark *r = ir_explain_last_remark();
+  if (!r || !name || r->quantity_count >= IR_EXPLAIN_MAX_QUANTITIES) {
+    return;
+  }
+  IRExplainQuantity *q = &r->quantities[r->quantity_count++];
+  q->name = ir_explain_text_dup(name);
+  q->value = value;
 }
 
 /* Stamp the nest depth on the most recent loop remark at `line` (the
@@ -1025,6 +1520,27 @@ static void ir_explain_json_remark(const IRExplainRemark *r, const char *kind,
   if (r->depth > 0) {
     ir_explain_json_raw(",\"depth\":%zu", r->depth);
   }
+  /* Schema 2: the machine-readable half. `code` is the stable decision id,
+   * `column`/`endLine` the construct's extent, `trivial` marks housekeeping a
+   * reader can collapse, and `quantities` carries whatever the pass measured. */
+  ir_explain_json_raw(",\"code\":");
+  ir_explain_json_str(r->code);
+  ir_explain_json_raw(",\"column\":%zu", r->column);
+  if (r->end_line > 0) {
+    ir_explain_json_raw(",\"endLine\":%zu", r->end_line);
+  }
+  if (r->trivial) {
+    ir_explain_json_raw(",\"trivial\":true");
+  }
+  if (r->quantity_count > 0) {
+    ir_explain_json_raw(",\"quantities\":{");
+    for (size_t q = 0; q < r->quantity_count; q++) {
+      ir_explain_json_raw("%s", q ? "," : "");
+      ir_explain_json_str(r->quantities[q].name);
+      ir_explain_json_raw(":%ld", r->quantities[q].value);
+    }
+    ir_explain_json_raw("}");
+  }
   ir_explain_json_raw("}");
 }
 
@@ -1080,6 +1596,399 @@ static void ir_explain_memory_flush(void) {
     }
   }
   ir_explain_emit("\n");
+}
+
+/* Fold the remarks into their functions. Called while the remarks are still
+ * alive; the section itself is written after codegen. */
+static void ir_explain_tally_functions(void) {
+  for (size_t r = 0; r < g_remark_count; r++) {
+    const IRExplainRemark *remark = &g_remarks[r];
+    IRExplainFunctionEntry *f = NULL;
+    for (size_t i = 0; i < g_function_count; i++) {
+      if (strcmp(g_functions[i].name, remark->function_name) == 0) {
+        f = &g_functions[i];
+        break;
+      }
+    }
+    if (!f || !remark->entity) {
+      continue;
+    }
+    if (strcmp(remark->entity, "loop") == 0) {
+      f->loops++;
+      if (remark->positive) {
+        f->loops_vectorized++;
+      }
+    } else if (strncmp(remark->entity, "call", 4) == 0) {
+      if (remark->positive) {
+        f->calls_inlined++;
+      } else {
+        f->calls_refused++;
+      }
+    }
+  }
+}
+
+/* The per-function table: the weight the pipeline started and finished with,
+ * the decisions recorded against it, and how it fared in the backend. */
+static void ir_explain_functions_json(void) {
+  if (!g_explain_json) {
+    return;
+  }
+  ir_explain_json_raw("\"functions\":[");
+  for (size_t i = 0; i < g_function_count; i++) {
+    const IRExplainFunctionEntry *f = &g_functions[i];
+    int backend_ok = -1;
+    const char *backend_reason = NULL;
+    size_t backend_instructions = 0;
+    for (size_t b = 0; b < g_backend_count; b++) {
+      if (g_backend[b].function_name &&
+          strcmp(g_backend[b].function_name, f->name) == 0) {
+        backend_ok = g_backend[b].ok;
+        backend_reason = g_backend[b].detail;
+        backend_instructions = g_backend[b].instructions;
+        break;
+      }
+    }
+
+    ir_explain_json_raw("%s{\"fn\":", i ? "," : "");
+    ir_explain_json_str(f->name);
+    ir_explain_json_raw(",\"line\":%zu,\"instructionsBefore\":%zu,"
+                        "\"instructionsAfter\":%zu,\"loops\":%zu,"
+                        "\"loopsVectorized\":%zu,\"callsInlined\":%zu,"
+                        "\"callsRefused\":%zu",
+                        f->line, f->instructions_before, f->instructions_after,
+                        f->loops, f->loops_vectorized, f->calls_inlined,
+                        f->calls_refused);
+    if (backend_ok >= 0) {
+      ir_explain_json_raw(",\"backendOk\":%s,\"backendInstructions\":%zu",
+                          backend_ok ? "true" : "false", backend_instructions);
+      ir_explain_json_raw(",\"backendReason\":");
+      ir_explain_json_str(backend_ok ? NULL : backend_reason);
+    }
+    for (size_t c = 0; c < g_function_cost_count; c++) {
+      if (strcmp(g_function_costs[c].function_name, f->name) != 0) {
+        continue;
+      }
+      const IRExplainFunctionCost *cost = &g_function_costs[c];
+      ir_explain_json_raw(",\"spills\":%d,\"regsUsed\":%d,\"throughput\":%d,"
+                          "\"hotCost\":%ld,\"vectorOps\":%d,"
+                          "\"estimatedSpans\":%d",
+                          cost->spills, cost->regs_used, cost->total_rthru,
+                          cost->hot_cost, cost->vec_ops, cost->estimated_spans);
+      break;
+    }
+    ir_explain_json_raw("}");
+  }
+  ir_explain_json_raw("],");
+}
+
+/* A static hotness proxy: a loop body runs some multiple of its enclosing
+ * loop's iterations, and nothing here has measured frequencies unless --pgo
+ * ran. Ten per level, capped, is the same convention the codegen hot-cost
+ * weighting uses -- enough to sort by, never mistaken for a measurement. */
+static long ir_explain_depth_weight(int depth) {
+  long weight = 1;
+  for (int i = 0; i < depth && i < 3; i++) {
+    weight *= 10;
+  }
+  return weight;
+}
+
+/* The nest depth of the loop containing `line` in `function`, or 0 when the
+ * line is not inside one. Uses the loop extents the vectorizer stamped. */
+static int ir_explain_enclosing_depth(const char *function, size_t line) {
+  int deepest = 0;
+  for (size_t i = 0; i < g_loop_cost_count; i++) {
+    const IRExplainLoopCost *cost = &g_loop_costs[i];
+    if (strcmp(cost->function_name, function) != 0) {
+      continue;
+    }
+    if (line >= cost->head_line && line <= cost->tail_line &&
+        cost->depth + 1 > deepest) {
+      deepest = cost->depth + 1;
+    }
+  }
+  return deepest;
+}
+
+/* Every decision with a number on it, heaviest first.
+ *
+ * A long report is unreadable without an order, and line order is the wrong
+ * one: it puts a one-line inline in a cold path above the scalar loop that
+ * costs the program its afternoon. Loops are weighted by modelled cycles times
+ * nest depth; refused calls by the callee's weight times the depth of the loop
+ * they sit in. */
+static void ir_explain_hotspots_json(void) {
+  if (!g_explain_json) {
+    return;
+  }
+  ir_explain_json_raw("\"hotspots\":[");
+
+  typedef struct {
+    const char *function;
+    size_t line;
+    const char *kind;
+    const char *code;
+    long cost;
+  } Hotspot;
+
+  Hotspot *spots = calloc(g_loop_cost_count + g_remark_count, sizeof(Hotspot));
+  if (!spots) {
+    ir_explain_json_raw("],");
+    return;
+  }
+  size_t count = 0;
+
+  for (size_t i = 0; i < g_loop_cost_count; i++) {
+    const IRExplainLoopCost *cost = &g_loop_costs[i];
+    spots[count].function = cost->function_name;
+    spots[count].line = cost->head_line;
+    spots[count].kind = "loop";
+    spots[count].code = cost->has_kernel ? "vectorized" : NULL;
+    spots[count].cost =
+        (long)cost->cycles_per_iter * ir_explain_depth_weight(cost->depth);
+    count++;
+  }
+  for (size_t i = 0; i < g_remark_count; i++) {
+    const IRExplainRemark *r = &g_remarks[i];
+    if (r->positive || !r->entity || strncmp(r->entity, "call", 4) != 0) {
+      continue;
+    }
+    long weight = 0;
+    for (size_t q = 0; q < r->quantity_count; q++) {
+      if (strcmp(r->quantities[q].name, "calleeInstructions") == 0) {
+        weight = r->quantities[q].value;
+      }
+    }
+    if (weight <= 0) {
+      continue;
+    }
+    spots[count].function = r->function_name;
+    spots[count].line = r->line;
+    spots[count].kind = "call";
+    spots[count].code = r->code;
+    spots[count].cost =
+        weight * ir_explain_depth_weight(
+                     ir_explain_enclosing_depth(r->function_name, r->line));
+    count++;
+  }
+
+  /* Selection sort: the list is short and this keeps the output stable. */
+  for (size_t i = 0; i < count; i++) {
+    size_t best = i;
+    for (size_t j = i + 1; j < count; j++) {
+      if (spots[j].cost > spots[best].cost) {
+        best = j;
+      }
+    }
+    Hotspot swap = spots[i];
+    spots[i] = spots[best];
+    spots[best] = swap;
+
+    ir_explain_json_raw("%s{\"fn\":", i ? "," : "");
+    ir_explain_json_str(spots[i].function);
+    ir_explain_json_raw(",\"line\":%zu,\"kind\":", spots[i].line);
+    ir_explain_json_str(spots[i].kind);
+    ir_explain_json_raw(",\"code\":");
+    ir_explain_json_str(spots[i].code);
+    ir_explain_json_raw(",\"cost\":%ld}", spots[i].cost);
+  }
+  free(spots);
+  ir_explain_json_raw("],");
+}
+
+/* Who called whom, and what became of it: one edge per caller/callee pair with
+ * the sites inlined, the sites refused, and the callee's weight. Answers "where
+ * did this function actually go" without re-deriving it from the remark list. */
+static void ir_explain_call_graph_json(void) {
+  if (!g_explain_json) {
+    return;
+  }
+  ir_explain_json_raw("\"callGraph\":[");
+
+  typedef struct {
+    const char *caller;
+    char callee[96];
+    size_t inlined;
+    size_t refused;
+    long callee_instructions;
+  } Edge;
+
+  Edge *edges = calloc(g_remark_count ? g_remark_count : 1, sizeof(Edge));
+  if (!edges) {
+    ir_explain_json_raw("],");
+    return;
+  }
+  size_t edge_count = 0;
+
+  for (size_t i = 0; i < g_remark_count; i++) {
+    const IRExplainRemark *r = &g_remarks[i];
+    if (!r->entity || strncmp(r->entity, "call", 4) != 0) {
+      continue;
+    }
+    char callee[96];
+    ir_explain_entity_callee(r->entity, callee, sizeof(callee));
+    if (!callee[0]) {
+      continue;
+    }
+    Edge *edge = NULL;
+    for (size_t e = 0; e < edge_count; e++) {
+      if (strcmp(edges[e].caller, r->function_name) == 0 &&
+          strcmp(edges[e].callee, callee) == 0) {
+        edge = &edges[e];
+        break;
+      }
+    }
+    if (!edge) {
+      edge = &edges[edge_count++];
+      edge->caller = r->function_name;
+      snprintf(edge->callee, sizeof(edge->callee), "%s", callee);
+      edge->inlined = 0;
+      edge->refused = 0;
+      edge->callee_instructions = 0;
+    }
+    if (r->positive) {
+      edge->inlined++;
+    } else {
+      edge->refused++;
+    }
+    for (size_t q = 0; q < r->quantity_count; q++) {
+      if (strcmp(r->quantities[q].name, "calleeInstructions") == 0) {
+        edge->callee_instructions = r->quantities[q].value;
+      }
+    }
+  }
+
+  for (size_t e = 0; e < edge_count; e++) {
+    ir_explain_json_raw("%s{\"caller\":", e ? "," : "");
+    ir_explain_json_str(edges[e].caller);
+    ir_explain_json_raw(",\"callee\":");
+    ir_explain_json_str(edges[e].callee);
+    ir_explain_json_raw(",\"inlined\":%zu,\"refused\":%zu,"
+                        "\"calleeInstructions\":%ld}",
+                        edges[e].inlined, edges[e].refused,
+                        edges[e].callee_instructions);
+  }
+  free(edges);
+  ir_explain_json_raw("],");
+}
+
+/* Every loop the backend measured, whether or not the optimizer had anything
+ * to say about it. Keyed by function and head line so a consumer can join it
+ * onto the remarks. Cycles are centicycles: 720 is 7.2 cycles an iteration. */
+static void ir_explain_loop_costs_json(void) {
+  if (!g_explain_json) {
+    return;
+  }
+  ir_explain_json_raw("\"loops\":[");
+  for (size_t i = 0; i < g_loop_cost_count; i++) {
+    const IRExplainLoopCost *cost = &g_loop_costs[i];
+    ir_explain_json_raw("%s{\"fn\":", i ? "," : "");
+    ir_explain_json_str(cost->function_name);
+    ir_explain_json_raw(",\"line\":%zu,\"endLine\":%zu,\"depth\":%d,"
+                        "\"cyclesPerIter\":%d,\"bottleneck\":",
+                        cost->head_line, cost->tail_line, cost->depth,
+                        cost->cycles_per_iter);
+    ir_explain_json_str(cost->bottleneck);
+    ir_explain_json_raw(",\"hasKernel\":%s,\"estimated\":%s}",
+                        cost->has_kernel ? "true" : "false",
+                        cost->estimated ? "true" : "false");
+  }
+  ir_explain_json_raw("],");
+}
+
+/* The pass ledger, heaviest first: a reader wants the passes that moved the
+ * most instructions, not the alphabetical list. */
+static void ir_explain_passes_json(void) {
+  if (!g_explain_json) {
+    return;
+  }
+  ir_explain_json_raw("\"passes\":[");
+  size_t emitted = 0;
+  for (;;) {
+    size_t best = (size_t)-1;
+    long best_removed = 0;
+    size_t best_changed = 0;
+    for (size_t i = 0; i < g_pass_count; i++) {
+      if (g_passes[i].runs == 0) {
+        continue; /* already emitted: runs is zeroed as we go */
+      }
+      long removed = g_passes[i].instructions_removed;
+      if (best == (size_t)-1 || removed > best_removed ||
+          (removed == best_removed && g_passes[i].changed_runs > best_changed)) {
+        best = i;
+        best_removed = removed;
+        best_changed = g_passes[i].changed_runs;
+      }
+    }
+    if (best == (size_t)-1) {
+      break;
+    }
+    IRExplainPassEntry *entry = &g_passes[best];
+    ir_explain_json_raw("%s{\"pass\":", emitted++ ? "," : "");
+    ir_explain_json_str(entry->name);
+    ir_explain_json_raw(",\"runs\":%zu,\"changedRuns\":%zu,"
+                        "\"instructionsRemoved\":%ld",
+                        entry->runs, entry->changed_runs,
+                        entry->instructions_removed);
+
+    /* What it did: the opcodes it removed (positive) or introduced (negative).
+     * "-8 load, -8 store, +4 assign" is a pass description; "changed" is not. */
+    if (entry->opcode_delta) {
+      ir_explain_json_raw(",\"effects\":{");
+      size_t effects = 0;
+      for (size_t op = 0; op < IR_EXPLAIN_OPCODE_LIMIT; op++) {
+        if (entry->opcode_delta[op] == 0) {
+          continue;
+        }
+        ir_explain_json_raw("%s", effects++ ? "," : "");
+        ir_explain_json_str(ir_opcode_name((IROpcode)op));
+        ir_explain_json_raw(":%d", entry->opcode_delta[op]);
+      }
+      ir_explain_json_raw("}");
+    }
+
+    /* Where it happened: the lines it moved the most instructions at. */
+    if (entry->site_count > 0) {
+      ir_explain_json_raw(",\"sites\":[");
+      size_t shown = 0;
+      for (size_t round = 0; round < IR_EXPLAIN_REPORTED_SITES; round++) {
+        size_t pick = (size_t)-1;
+        long best_delta = 0;
+        for (size_t s = 0; s < entry->site_count; s++) {
+          long magnitude = entry->sites[s].delta < 0 ? -entry->sites[s].delta
+                                                     : entry->sites[s].delta;
+          if (magnitude > best_delta) {
+            best_delta = magnitude;
+            pick = s;
+          }
+        }
+        if (pick == (size_t)-1) {
+          break;
+        }
+        ir_explain_json_raw("%s{\"fn\":", shown++ ? "," : "");
+        ir_explain_json_str(entry->sites[pick].function_name);
+        ir_explain_json_raw(",\"line\":%zu,\"delta\":%ld}",
+                            entry->sites[pick].line, entry->sites[pick].delta);
+        entry->sites[pick].delta = 0; /* consumed */
+      }
+      ir_explain_json_raw("]");
+    }
+    ir_explain_json_raw("}");
+
+    for (size_t s = 0; s < entry->site_count; s++) {
+      free(entry->sites[s].function_name);
+    }
+    free(entry->sites);
+    entry->sites = NULL;
+    entry->site_count = 0;
+    entry->site_capacity = 0;
+    free(entry->opcode_delta);
+    entry->opcode_delta = NULL;
+    entry->runs = 0; /* consumed */
+  }
+  ir_explain_json_raw("],");
+  g_pass_count = 0;
 }
 
 void ir_explain_flush(void) {
@@ -1205,6 +2114,8 @@ void ir_explain_flush(void) {
   }
   ir_explain_json_raw("],");
 
+  ir_explain_tally_functions();
+
   /* --annotate-asm reads the remarks during codegen (which runs AFTER this
    * optimization-stage flush), so when retention is requested we keep them
    * alive; the one-shot compile leaks them at exit. */
@@ -1216,6 +2127,10 @@ void ir_explain_flush(void) {
       free(g_remarks[i].reason);
       free(g_remarks[i].fix);
       free(g_remarks[i].verified);
+      free(g_remarks[i].code);
+      for (size_t q = 0; q < g_remarks[i].quantity_count; q++) {
+        free(g_remarks[i].quantities[q].name);
+      }
     }
     free(g_remarks);
     g_remarks = NULL;
@@ -1329,7 +2244,9 @@ void ir_explain_finalize(int force_stderr) {
         const char *source = g_explain_focus_file
                                  ? ir_explain_path_basename(g_explain_focus_file)
                                  : "";
-        fprintf(out, "{\"schema\":1,\"source\":\"%s\",", source);
+        /* Schema 2 is additive: every schema 1 key still means what it did,
+         * so a consumer written against 1 keeps working unchanged. */
+        fprintf(out, "{\"schema\":2,\"source\":\"%s\",", source);
         fwrite(g_json_buf, 1, g_json_len, out);
         fprintf(out,
                 "\"stats\":{\"loopsVectorized\":%zu,\"loopsScalar\":%zu,"
@@ -1674,6 +2591,37 @@ void ir_explain_backend_flush(void) {
   }
 
   ir_explain_json_raw("]},");
+
+  /* Both need the backend decisions, so they land here rather than in the
+   * optimization-stage flush. */
+  ir_explain_functions_json();
+  ir_explain_loop_costs_json();
+  ir_explain_call_graph_json();
+  ir_explain_hotspots_json();
+  ir_explain_passes_json();
+
+  for (size_t i = 0; i < g_loop_cost_count; i++) {
+    free(g_loop_costs[i].function_name);
+  }
+  free(g_loop_costs);
+  g_loop_costs = NULL;
+  g_loop_cost_count = 0;
+  g_loop_cost_capacity = 0;
+  for (size_t i = 0; i < g_function_cost_count; i++) {
+    free(g_function_costs[i].function_name);
+  }
+  free(g_function_costs);
+  g_function_costs = NULL;
+  g_function_cost_count = 0;
+  g_function_cost_capacity = 0;
+
+  for (size_t i = 0; i < g_function_count; i++) {
+    free(g_functions[i].name);
+  }
+  free(g_functions);
+  g_functions = NULL;
+  g_function_count = 0;
+  g_function_capacity = 0;
 
   for (size_t i = 0; i < g_backend_count; i++) {
     free(g_backend[i].function_name);

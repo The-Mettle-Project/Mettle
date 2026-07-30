@@ -1298,6 +1298,7 @@ int ir_layout_factor_pass(IRProgram *program, int *changed) {
         }
         ir_explain_remark(fn->name, "allocation", site_location, 1, headline,
                           NULL, NULL, NULL);
+        ir_explain_remark_code("layout-optimized");
       }
 
       if (claimed_count < IR_ARRAY_COUNT(claimed_fn)) {

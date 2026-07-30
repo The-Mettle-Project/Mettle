@@ -485,6 +485,7 @@ int ir_prefetch_indirect_pass(IRFunction *function, int *changed) {
                         "software prefetch inserted for indirect access "
                         "(look-ahead distance covers the miss latency)",
                         NULL, NULL, NULL);
+      ir_explain_remark_code("prefetched");
     }
     if (changed) {
       *changed = 1;

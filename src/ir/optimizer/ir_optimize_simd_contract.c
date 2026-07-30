@@ -1436,6 +1436,30 @@ typedef struct {
   SourceLocation location;
 } IRSimdLoopRecord;
 
+/* The last source line the loop covers, for an editor that wants to highlight
+ * the construct rather than its header line. Inlined bodies carry their own
+ * file's lines, so only instructions from the loop's own file count. */
+static size_t ir_simd_loop_end_line(const IRFunction *function,
+                                    const IRSimdLoopRecord *loop) {
+  size_t last = loop->location.line;
+  if (!function) {
+    return last;
+  }
+  for (size_t i = loop->begin;
+       i <= loop->end && i < function->instruction_count; i++) {
+    const SourceLocation *at = &function->instructions[i].location;
+    if (at->line <= last) {
+      continue;
+    }
+    if (at->filename && loop->location.filename &&
+        strcmp(at->filename, loop->location.filename) != 0) {
+      continue;
+    }
+    last = at->line;
+  }
+  return last;
+}
+
 /* --explain: one remark per recorded loop, nest-aware:
  *   - vectorized at its own level        -> "vectorized -> <kernel>"
  *   - scalar but a nested loop vectorized -> "vectorized inner, scalar outer"
@@ -1498,6 +1522,8 @@ static void ir_explain_report_loops(const IRFunction *function,
       snprintf(headline, sizeof(headline), "vectorized \xE2\x86\x92 %s", desc);
       ir_explain_remark(function->name, "loop", L->location, 1, headline, NULL,
                         NULL, NULL);
+      ir_explain_remark_code("vectorized");
+      ir_explain_remark_extent(ir_simd_loop_end_line(function, L));
     } else if (any) {
       snprintf(reason, sizeof(reason),
                "only the innermost loop of a nest is vectorized; this loop "
@@ -1505,6 +1531,8 @@ static void ir_explain_report_loops(const IRFunction *function,
                inner_line);
       ir_explain_remark(function->name, "loop", L->location, 1,
                         "vectorized inner, scalar outer", reason, NULL, NULL);
+      ir_explain_remark_code("vectorized-inner");
+      ir_explain_remark_extent(ir_simd_loop_end_line(function, L));
     } else if (has_inner) {
       snprintf(reason, sizeof(reason),
                "the body contains a nested loop (line %zu), and only "
@@ -1513,6 +1541,8 @@ static void ir_explain_report_loops(const IRFunction *function,
                inner_line);
       ir_explain_remark(function->name, "loop", L->location, 0,
                         "NOT vectorized", reason, NULL, NULL);
+      ir_explain_remark_code("outer-of-nest");
+      ir_explain_remark_extent(ir_simd_loop_end_line(function, L));
     } else if (!ir_region_has_loop_label(function, L->begin, L->end)) {
       /* The unroller records a definitive "fully unrolled (N iterations)"
        * remark when it was the cause; only guess when nothing claimed it. */
@@ -1521,6 +1551,8 @@ static void ir_explain_report_loops(const IRFunction *function,
                           "eliminated \xE2\x80\x94 no loop remains after "
                           "optimization (fully unrolled or folded away)",
                           NULL, NULL, NULL);
+        ir_explain_remark_code("eliminated");
+        ir_explain_remark_extent(ir_simd_loop_end_line(function, L));
       }
     } else {
       int diagnosis = IR_SIMD_BAIL_NONE;
@@ -1610,6 +1642,8 @@ static void ir_explain_report_loops(const IRFunction *function,
       ir_explain_remark(function->name, "loop", L->location, 0,
                         "NOT vectorized", reason, fix[0] ? fix : NULL,
                         verified[0] ? verified : NULL);
+      ir_explain_remark_code(ir_simd_bail_id_name(diagnosis));
+      ir_explain_remark_extent(ir_simd_loop_end_line(function, L));
     }
     ir_explain_remark_loop_depth(L->location.line, nest_depth);
   }

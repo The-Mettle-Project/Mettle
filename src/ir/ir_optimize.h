@@ -69,6 +69,18 @@ void ir_explain_backend_function(const char *function_name,
                                  const char *filename, int ok,
                                  const char *detail, size_t instructions);
 void ir_explain_backend_flush(void);
+/* The codegen cost model, published by the MIR annotator once every function is
+ * encoded. The optimizer's half of the report says what it decided; this says
+ * what the decision costs, which is the difference between "this loop did not
+ * vectorize" and "and it runs 7.2 cycles an iteration, bottlenecked on p23".
+ * Cycles are centicycles. No-ops unless --explain is on. */
+void ir_explain_backend_loop(const char *function_name, const char *filename,
+                             size_t head_line, size_t tail_line, int depth,
+                             int cycles_per_iter, const char *bottleneck,
+                             int has_kernel, int estimated);
+void ir_explain_backend_cost(const char *function_name, const char *filename,
+                             int spills, int regs_used, int total_rthru,
+                             long hot_cost, int vec_ops, int estimated_spans);
 /* Finish a report for a non-native backend. The target-neutral optimizer has
  * already flushed its decisions; this adds an honest backend boundary instead
  * of pretending the native MIR eligibility report applies to PTX/SPIR-V. */

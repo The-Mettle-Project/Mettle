@@ -378,6 +378,10 @@ int ir_optimize_function_pipeline(IRFunction *function) {
     return 0;
   }
 
+  /* Weigh the function on the way in and out: the difference is what the whole
+   * pipeline achieved, which is the one number the per-pass ledger cannot show. */
+  ir_explain_function_before(function);
+
   {
     int pre_changed = 0;
     if (!ir_fuse_rotate_add_pass(function, &pre_changed)) {
@@ -404,6 +408,7 @@ int ir_optimize_function_pipeline(IRFunction *function) {
   t0 = ir_pass_time_begin();
   int ok = ir_function_rebuild_cfg(function);
   ir_pass_time_end("rebuild_cfg [stage]", t0);
+  ir_explain_function_after(function);
   return ok;
 }
 

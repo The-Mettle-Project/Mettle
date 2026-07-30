@@ -255,12 +255,14 @@ static int ir_run_named_pass(IRFunction *function, const IROptNamedPass *pass,
   IRVerifySnapshot *verify_snapshot = ir_verify_snapshot_take(function);
 
   mettle_compiler_ctx_set_pass_name(pass->name);
+  ir_explain_pass_begin(function);
   double t0 = ir_pass_time_begin();
   if (!pass->run(function, &changed)) {
     ir_trace_pass_event(pass->name, "failed", NULL, -1);
     mettle_compiler_ice(failure_message);
   }
   ir_pass_time_end(pass->name, t0);
+  ir_explain_pass_end(function, pass->name, changed);
 
   if (verify_snapshot) {
     ir_verify_maybe_sabotage(function, pass->name, &changed);
@@ -330,6 +332,7 @@ int ir_run_fixpoint_pass(IRFunction *function, IROptPassId pass_id,
 
   int pass_changed = 0;
   mettle_compiler_ctx_set_pass_name(pass_name);
+  ir_explain_pass_begin(function);
   double t0 = ir_pass_time_begin();
   if (!pass || !pass(function, &pass_changed)) {
     ir_verify_snapshot_free(verify_snapshot);
@@ -340,6 +343,7 @@ int ir_run_fixpoint_pass(IRFunction *function, IROptPassId pass_id,
     g_ir_pass_ms[pass_id] += ir_pass_now_ms() - t0;
     g_ir_pass_runs[pass_id]++;
   }
+  ir_explain_pass_end(function, pass_name, pass_changed);
 
   if (verify_snapshot) {
     ir_verify_maybe_sabotage(function, pass_name, &pass_changed);

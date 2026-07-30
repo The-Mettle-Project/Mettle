@@ -62,7 +62,7 @@ extern pid_t waitpid(pid_t pid, int *wstatus, int options);
 #ifdef METTLE_VERSION_RAW
 #define METTLE_VERSION METTLE_STRINGIFY(METTLE_VERSION_RAW)
 #else
-#define METTLE_VERSION "v0.13.0"
+#define METTLE_VERSION "v0.14.0"
 #endif
 #endif
 
@@ -3132,6 +3132,20 @@ static int compile_optimize_ir(IRProgram *ir_program, ASTNode *ast_program,
   ir_explain_set_json(options->explain_json ? 1 : 0);
   /* --annotate-asm: arm the codegen annotator before codegen runs, and keep the
    * optimization remarks alive so it can join them onto the emitted asm. */
+  /* --explain-json wants the codegen cost model (cycles per iteration, port
+   * bottleneck, spills) joined onto the optimizer's decisions, so arm the
+   * annotator for its numbers alone: no listing, no .annot.json sidecar. */
+  if (options->explain_json && !options->annotate_asm) {
+    mir_annotate_set_enabled(1);
+    mir_annotate_set_cost_only(1);
+    mir_annotate_set_output_path(options->output_filename);
+    mir_annotate_set_source_file(options->input_filename);
+  }
+  /* The call graph and the ranking are assembled after codegen, from the same
+   * remark table -- so it has to outlive the optimization-stage flush. */
+  if (options->explain_json) {
+    ir_explain_set_retain_remarks(1);
+  }
   if (options->annotate_asm) {
     mir_annotate_set_enabled(1);
     mir_annotate_set_syntax((MirAnnotSyntax)options->asm_syntax);
@@ -3860,17 +3874,19 @@ int compile_file(const char *input_filename, const char *output_filename,
     goto cleanup;
   }
 
+  /* The annotator goes first: it publishes the cost model (cycles per
+   * iteration, port bottlenecks, spills) into the --explain report, which the
+   * backend flush below then writes out. It also emits its own listing and
+   * .annot.json sidecar when --annotate-asm asked for them. */
+  if (options->annotate_asm || (options->explain_json && mir_annotate_enabled())) {
+    mir_annotate_flush();
+  }
+
   /* --explain: the MIR eligibility gate recorded, per function, whether it got
    * the register-allocating backend; print that section now that codegen ran.
    * (No-op unless --explain is on.) */
   if (options->explain && options->optimize) {
     ir_explain_backend_flush();
-  }
-
-  /* --annotate-asm: now that every function has been encoded, write the
-   * annotated listing (stdout) and the <stem>.annot.json sidecar. */
-  if (options->annotate_asm) {
-    mir_annotate_flush();
   }
 
   compiler_set_phase(PROFILE_PHASE_WRITE_OUTPUT);

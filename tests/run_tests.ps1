@@ -2723,13 +2723,56 @@ try {
     throw "De-inlined scale must report a loop regression. Output: $($run3.Substring(0, [Math]::Min(600, $run3.Length)))"
   }
   $json = Get-Content (Join-Path $exDir "demo.explain.json") -Raw | ConvertFrom-Json
-  if ($json.schema -ne 1) { throw "JSON schema field wrong" }
+  if ($json.schema -ne 2) { throw "JSON schema field wrong" }
   if ($json.stats.changesRegressed -lt 1) { throw "JSON regression count missing" }
   if (@($json.remarks).Count -lt 10) { throw "JSON remarks too few: $(@($json.remarks).Count)" }
   $regLoop = @($json.changes.entries | Where-Object { $_.direction -eq 'regressed' -and $_.kind -eq 'loop' })
   if ($regLoop.Count -lt 1 -or -not $regLoop[0].reason) { throw "JSON regressed-loop entry missing reason" }
   if (-not @($json.remarks | Where-Object { $_.kind -eq 'loop' -and $_.depth -ge 2 }).Count) {
     throw "JSON nest depth missing (matvec inner loop is depth 2)"
+  }
+  # Schema 2: the structured half. Prose is for people; these are what tools key off.
+  $coded = @($json.remarks | Where-Object { $_.code })
+  if ($coded.Count -lt 5) { throw "JSON remarks missing stable codes: $($coded.Count)" }
+  if (-not @($json.remarks | Where-Object { $_.code -eq 'int32-sum-narrow-acc' }).Count) {
+    throw "JSON missing the int32-sum-narrow-acc diagnosis id"
+  }
+  if (-not @($json.remarks | Where-Object { $_.kind -eq 'loop' -and $_.endLine -gt $_.line }).Count) {
+    throw "JSON loop remarks missing their source extent"
+  }
+  if (-not @($json.remarks | Where-Object { $_.trivial }).Count) {
+    throw "JSON missing trivial-inline classification"
+  }
+  if (@($json.functions).Count -lt 2) { throw "JSON per-function table missing" }
+  $mainFn = @($json.functions | Where-Object { $_.fn -eq 'main' })[0]
+  if (-not $mainFn -or $mainFn.instructionsBefore -le 0) { throw "JSON function weights missing" }
+  if (@($json.passes).Count -lt 5) { throw "JSON pass ledger missing" }
+  if (-not @($json.passes | Where-Object { $_.instructionsRemoved -gt 0 }).Count) {
+    throw "JSON pass ledger recorded no instruction deltas"
+  }
+  # A ledger entry has to say WHAT it did and WHERE, not just that it fired.
+  $described = @($json.passes | Where-Object { $_.effects -and $_.sites })
+  if ($described.Count -lt 3) {
+    throw "JSON pass ledger missing effects/sites: $($described.Count) described"
+  }
+  $vec = @($json.passes | Where-Object { $_.pass -eq 'simd_affine_map_float' })[0]
+  if (-not $vec) { throw "JSON pass ledger missing the vectorizer" }
+  $kernel = $vec.effects.PSObject.Properties | Where-Object { $_.Name -like 'simd_*' -and $_.Value -lt 0 }
+  if (-not $kernel) { throw "vectorizer ledger should report the kernel it introduced" }
+  $scalar = $vec.effects.PSObject.Properties | Where-Object { $_.Name -eq 'binary' -and $_.Value -gt 0 }
+  if (-not $scalar) { throw "vectorizer ledger should report the scalar work it removed" }
+  if (-not @($vec.sites | Where-Object { $_.fn -and $_.line -gt 0 }).Count) {
+    throw "vectorizer ledger missing the lines it changed"
+  }
+  if (@($json.loops).Count -lt 1) { throw "JSON per-loop cost model missing" }
+  if (-not @($json.loops | Where-Object { $_.cyclesPerIter -gt 0 -and $_.bottleneck }).Count) {
+    throw "JSON loop costs missing cycles or bottleneck port"
+  }
+  if (@($json.callGraph).Count -lt 1) { throw "JSON call graph missing" }
+  if (@($json.hotspots).Count -lt 1) { throw "JSON hotspot ranking missing" }
+  $ranked = @($json.hotspots)
+  if ($ranked.Count -gt 1 -and $ranked[0].cost -lt $ranked[-1].cost) {
+    throw "JSON hotspots are not ranked by cost"
   }
   Remove-Item Env:METTLE_EXPLAIN_REPORT_LINES -ErrorAction SilentlyContinue
   Write-CaseResult -Name "explain_changes_and_json" -Passed $true

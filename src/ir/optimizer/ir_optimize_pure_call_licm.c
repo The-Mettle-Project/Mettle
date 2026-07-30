@@ -282,6 +282,7 @@ static int pure_licm_hoist_one(IRProgram *program, IRFunction *function) {
             "`@pure` + loop-invariant arguments enable loop-invariant code "
             "motion",
             NULL, NULL);
+        ir_explain_remark_code("hoisted");
       }
       return 1;
     }

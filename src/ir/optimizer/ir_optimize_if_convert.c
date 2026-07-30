@@ -326,6 +326,7 @@ static int ir_ifconv_try_at(IRFunction *function, size_t branch_index,
                       "if-converted to branchless select (cmov): a "
                       "data-dependent branch became straight-line code",
                       NULL, NULL, NULL);
+    ir_explain_remark_code("if-converted");
   }
   if (changed) {
     *changed = 1;

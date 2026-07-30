@@ -40,6 +40,8 @@ Driver-facing views of the same machinery:
   optimization](pgo.md): `--ml-opt`, `--verify`, `--pgo`.
 - [Runtime model](runtime-model.md): what emitted programs assume of the OS.
 - [Diagnostics](diagnostics.md): the frontend-neutral diagnostics reporter.
+- [The `--explain-json` schema](explain-json.md): the machine-readable
+  optimization report editors and analysis tools read.
 
 A second, non-Mettle frontend that exercises the whole public API lives in
 [`examples/calc`](../examples/calc).

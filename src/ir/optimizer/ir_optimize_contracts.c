@@ -213,6 +213,7 @@ int ir_enforce_noalloc_contracts(IRProgram *program) {
                         "verified @noalloc \xE2\x80\x94 allocation-free on "
                         "every reachable path",
                         NULL, NULL, NULL);
+      ir_explain_remark_code("noalloc-verified");
     }
     free(state);
   }

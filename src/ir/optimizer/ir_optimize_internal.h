@@ -562,6 +562,39 @@ void ir_explain_remark(const char *function_name, const char *entity,
  * `line`; rendered into the JSON sidecar so tooling can rank scalar loops by
  * how deeply they nest (a static hotness proxy). */
 void ir_explain_remark_loop_depth(size_t line, size_t depth);
+/* Structured detail for the remark just recorded. Each is a no-op when that
+ * call was filtered out (wrong file, hypothesis run, duplicate), so a
+ * suppressed remark can never stamp its detail onto an unrelated one.
+ *
+ * `code` is the stable decision id a tool keys off instead of the prose --
+ * "control-flow", "inlined", "callee-has-loop". `extent` is the last line of
+ * the construct, so an editor can highlight a whole loop. `trivial` marks
+ * routine housekeeping (a one-line stdlib inline) that a reader can collapse.
+ * `quantity` records whatever the pass measured: an unroll factor, a trip
+ * count, a callee's instruction weight. */
+void ir_explain_remark_code(const char *code);
+void ir_explain_remark_extent(size_t end_line);
+void ir_explain_remark_trivial(void);
+void ir_explain_remark_quantity(const char *name, long value);
+
+/* A callee this small is a wrapper; inlining it is housekeeping, not a
+ * decision worth a reader's attention. Twelve IR instructions covers the
+ * `cstr`/`println`-shaped one-liners that otherwise outnumber the real
+ * remarks in any program that prints. */
+#define IR_EXPLAIN_TRIVIAL_CALLEE_INSTRUCTIONS 12
+
+/* The pass ledger: every pass run through the driver reports what it did, so
+ * the report can account for the whole pipeline instead of the two families
+ * that happen to record remarks. Called from the pass driver; a no-op unless
+ * --explain is on and the function belongs to the focus file. */
+size_t ir_explain_instruction_weight(const IRFunction *function);
+void ir_explain_pass_begin(const IRFunction *function);
+void ir_explain_pass_end(const IRFunction *function, const char *name,
+                         int changed);
+/* Function weight before and after the optimization pipeline, for the
+ * per-function table. */
+void ir_explain_function_before(const IRFunction *function);
+void ir_explain_function_after(const IRFunction *function);
 /* Hypothesis testing: deep-copy a function for fix simulation, suppress
  * remark recording while the cloned stages run, and re-run the optimization
  * stages on the clone (ir_optimize_pipeline.c). */
