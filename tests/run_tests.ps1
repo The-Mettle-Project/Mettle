@@ -3442,6 +3442,45 @@ foreach ($relFlag in @($true, $false)) {
   }
 }
 
+# Shared scaled index: `a[i] * b[i]` computes `i << 2` once after CSE, so one
+# scaled temp feeds two address adds. The SIB address fold used to demand a
+# single reader and dropped this shape onto its scale-1 fallback, which folded
+# the already-scaled value in as a unit index and addressed the wrong element.
+# Built debug + release + *_fallback so the MIR and legacy backends agree; the
+# bug was MIR-only and release-only, and the fallback columns prove that.
+foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")) {
+  $total++
+  try {
+    $exePath = Join-Path $tmpDir "test_shared_scaled_index_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($variant -like "release*") { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_shared_scaled_index.mettle", "-o", $exePath)
+
+    if ($variant -like "*_fallback") { $env:METTLE_MIR = "0" }
+    try {
+      $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    }
+    finally {
+      if ($variant -like "*_fallback") { Remove-Item Env:\METTLE_MIR -ErrorAction SilentlyContinue }
+    }
+    if ($LASTEXITCODE -ne 0) {
+      throw "shared-scaled-index build ($variant) failed: $buildOut"
+    }
+
+    & $exePath 2>&1 | Out-Null
+    # 1/2/3 name which of the three loops addressed the wrong element.
+    if ($LASTEXITCODE -ne 7) {
+      throw "shared-scaled-index ($variant) miscompiled (exit $LASTEXITCODE)"
+    }
+
+    Write-CaseResult -Name "shared_scaled_index_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "shared_scaled_index_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # Float narrowing paths: the three sites that must cvtsd2ss a float64-tracked
 # value into a float32 destination (MIR store, MIR return, inliner param
 # assign) â€” each was a distinct silent miscompile found by the v2 fuzzer.

@@ -113,6 +113,73 @@ static int materialize_into(MirFunction *fn, const MirOperand *op,
   }
 }
 
+static int mir_reg_in(BinaryGpRegister r, const BinaryGpRegister *set, int n) {
+  for (int i = 0; i < n; i++) {
+    if (set[i] == r) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* The register `op` already sits in, if any, without emitting anything.
+ *
+ * Staging picks have to know this up front. An operand resolved LATER may
+ * already be resident somewhere, and staging an earlier spilled operand into
+ * that register would destroy it before it is read. RDX is the case that bites:
+ * it is in the allocator's pool and is also the preferred index scratch. */
+static int mir_operand_fixed_reg(const MirFunction *fn, const MirOperand *op,
+                                 BinaryGpRegister *out) {
+  if (op->kind == MIR_OPK_VREG && op->vreg >= 0 &&
+      (size_t)op->vreg < fn->vreg_count && fn->vregs[op->vreg].in_register) {
+    *out = (BinaryGpRegister)fn->vregs[op->vreg].phys;
+    return 1;
+  }
+  if (op->kind == MIR_OPK_PHYS) {
+    *out = (BinaryGpRegister)op->phys;
+    return 1;
+  }
+  return 0;
+}
+
+/* Append `op`'s resident register to `set` if it has one. */
+static void mir_note_fixed_reg(const MirFunction *fn, const MirOperand *op,
+                               BinaryGpRegister *set, int *n) {
+  BinaryGpRegister r;
+  if (mir_operand_fixed_reg(fn, op, &r)) {
+    set[(*n)++] = r;
+  }
+}
+
+/* Pick a scratch register for staging a spilled operand: `preferred` unless it
+ * is already holding one of `avoid`.
+ *
+ * A [base + index*scale] access stages each spilled operand through a scratch,
+ * and two of them landing in the SAME register does not fail loudly: it encodes
+ * base and index as one register, so `[base + index*4]` silently becomes
+ * `[r11 + r11*4]` and the access reads the wrong address.
+ *
+ * The fallbacks are the reserved encoder scratches R10/R11 first, because those
+ * are outside the allocator's pool and so can never hold a live value. RDX is
+ * last: it IS allocatable, so it is only used where a caller already asked for
+ * it. Keeping each caller's original preference means a combination that
+ * encoded correctly before still encodes identically. */
+static BinaryGpRegister mir_pick_scratch(BinaryGpRegister preferred,
+                                         const BinaryGpRegister *avoid,
+                                         int avoid_n) {
+  if (!mir_reg_in(preferred, avoid, avoid_n)) {
+    return preferred;
+  }
+  static const BinaryGpRegister pool[3] = {SCRATCH_B, SCRATCH_A,
+                                           BINARY_GP_RDX};
+  for (int i = 0; i < 3; i++) {
+    if (!mir_reg_in(pool[i], avoid, avoid_n)) {
+      return pool[i];
+    }
+  }
+  return preferred;
+}
+
 /* Return the physical register currently holding `op`'s value, materializing
  * into `scratch` when the operand is a spill/immediate/home. */
 static BinaryGpRegister value_reg(MirFunction *fn, const MirOperand *op,
@@ -1087,14 +1154,24 @@ static int encode_mov(MirFunction *fn, const MirInst *in) {
     if (in->a.mem.index != MIR_VREG_NONE) {
       MirOperand bop = mir_op_vreg(in->a.mem.base);
       MirOperand iop = mir_op_vreg(in->a.mem.index);
-      BinaryGpRegister base_reg = value_reg(fn, &bop, SCRATCH_B, &ok);
+      /* Stage the spilled operands clear of the load target, of each other, and
+       * of whatever register the other one is already resident in. Avoiding
+       * only the target was not enough: a spilled base stages into SCRATCH_B,
+       * and a target in RDX then sent the index to SCRATCH_B as well, so base
+       * and index read one register. */
+      BinaryGpRegister taken[4];
+      int tn = 0;
+      taken[tn++] = target;
+      mir_note_fixed_reg(fn, &bop, taken, &tn);
+      mir_note_fixed_reg(fn, &iop, taken, &tn);
+      BinaryGpRegister base_reg =
+          value_reg(fn, &bop, mir_pick_scratch(SCRATCH_B, taken, tn), &ok);
       if (!ok) {
         return 0;
       }
-      /* Stage a spilled index in RDX, unless RDX is the load target. */
-      BinaryGpRegister idx_scratch =
-          (target == BINARY_GP_RDX) ? SCRATCH_B : BINARY_GP_RDX;
-      BinaryGpRegister index_reg = value_reg(fn, &iop, idx_scratch, &ok);
+      taken[tn++] = base_reg;
+      BinaryGpRegister index_reg =
+          value_reg(fn, &iop, mir_pick_scratch(BINARY_GP_RDX, taken, tn), &ok);
       if (!ok) {
         return 0;
       }
@@ -1124,18 +1201,42 @@ static int encode_mov(MirFunction *fn, const MirInst *in) {
   if (in->dst.kind == MIR_OPK_MEM) {
     int ok1, ok2;
     if (in->dst.mem.index != MIR_VREG_NONE) {
-      /* Stage base in RCX and index in RDX, value in RAX. For 4/8-byte stores
-       * emit one direct SIB `mov [base+idx*scale], val`; narrower widths lea
-       * the address into RCX and store through it. RAX/RCX/RDX are all free
-       * scratch inside a store encoding. */
+      /* For 4/8-byte stores emit one direct SIB `mov [base+idx*scale], val`;
+       * narrower widths lea the address into SCRATCH_B and store through it.
+       * Spilled operands stage through SCRATCH_B / RDX / SCRATCH_A. */
       MirOperand bop = mir_op_vreg(in->dst.mem.base);
       MirOperand iop = mir_op_vreg(in->dst.mem.index);
-      BinaryGpRegister base_reg = value_reg(fn, &bop, SCRATCH_B, &ok1);
-      BinaryGpRegister index_reg = value_reg(fn, &iop, BINARY_GP_RDX, &ok2);
-      if (!ok1 || !ok2) {
+      /* Three operands stage through three scratches here, so every pick has to
+       * clear both the scratches already handed out AND the registers the other
+       * operands are already resident in -- staging over a resident value
+       * destroys it before its read. Seed the set from all three up front,
+       * since base is staged before the value is even looked at. */
+      int needs_lea = !(in->width == 4 || in->width == 8);
+      BinaryGpRegister taken[6];
+      int tn = 0;
+      mir_note_fixed_reg(fn, &bop, taken, &tn);
+      mir_note_fixed_reg(fn, &iop, taken, &tn);
+      mir_note_fixed_reg(fn, &in->a, taken, &tn);
+
+      BinaryGpRegister base_reg =
+          value_reg(fn, &bop, mir_pick_scratch(SCRATCH_B, taken, tn), &ok1);
+      if (!ok1) {
         return 0;
       }
-      BinaryGpRegister val = value_reg(fn, &in->a, SCRATCH_A, &ok1);
+      taken[tn++] = base_reg;
+      /* The narrow-width path leas the address into SCRATCH_B after reading base
+       * and index, so those two may live there but the value may not. */
+      BinaryGpRegister index_reg =
+          value_reg(fn, &iop, mir_pick_scratch(BINARY_GP_RDX, taken, tn), &ok2);
+      if (!ok2) {
+        return 0;
+      }
+      taken[tn++] = index_reg;
+      if (needs_lea) {
+        taken[tn++] = SCRATCH_B;
+      }
+      BinaryGpRegister val =
+          value_reg(fn, &in->a, mir_pick_scratch(SCRATCH_A, taken, tn), &ok1);
       if (!ok1) {
         return 0;
       }
@@ -2180,15 +2281,26 @@ int mir_encode(MirFunction *fn) {
       int dst_in_reg = dst_is_reg(fn, &in->dst, &D);
       BinaryGpRegister target = dst_in_reg ? D : SCRATCH_A;
       MirOperand bop = mir_op_vreg(in->a.mem.base);
-      BinaryGpRegister base_reg = value_reg(fn, &bop, SCRATCH_B, &rok);
+      /* Same staging collision as the scaled LOAD above: keep base and index
+       * clear of the target and of each other, resident registers included. */
+      BinaryGpRegister taken[4];
+      int tn = 0;
+      taken[tn++] = target;
+      mir_note_fixed_reg(fn, &bop, taken, &tn);
+      MirOperand iop_probe = mir_op_vreg(in->a.mem.index);
+      if (in->a.mem.index != MIR_VREG_NONE) {
+        mir_note_fixed_reg(fn, &iop_probe, taken, &tn);
+      }
+      BinaryGpRegister base_reg =
+          value_reg(fn, &bop, mir_pick_scratch(SCRATCH_B, taken, tn), &rok);
       if (!rok) {
         break;
       }
+      taken[tn++] = base_reg;
       if (in->a.mem.index != MIR_VREG_NONE) {
         MirOperand iop = mir_op_vreg(in->a.mem.index);
-        BinaryGpRegister idx_scratch =
-            (target == BINARY_GP_RDX) ? SCRATCH_B : BINARY_GP_RDX;
-        BinaryGpRegister index_reg = value_reg(fn, &iop, idx_scratch, &rok);
+        BinaryGpRegister index_reg =
+            value_reg(fn, &iop, mir_pick_scratch(BINARY_GP_RDX, taken, tn), &rok);
         if (!rok) {
           break;
         }

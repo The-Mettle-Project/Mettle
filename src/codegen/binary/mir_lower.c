@@ -4701,7 +4701,15 @@ static void mir_compute_address_folds(const IRFunction *f,
       if (scaled->kind != IR_OPERAND_TEMP || !scaled->name) {
         continue;
       }
-      if (mir_temp_read_count(uses, scaled->name) != 1) {
+      /* The scaled index may have more than one reader: `a[i] * b[i]` reads one
+       * `i << 2` twice once CSE has folded the two copies together. Such an
+       * access still folds -- a SIB operand re-derives `i*4` for free -- but its
+       * producer has to stay for the other reader, so only retire the shift when
+       * this access is its sole reader. Refusing outright would drop the whole
+       * pair onto the scale-1 fallback, which folds the SCALED value as an
+       * index and gets the address wrong. */
+      int scaled_reads = mir_temp_read_count(uses, scaled->name);
+      if (scaled_reads < 1) {
         continue;
       }
       long si = mir_temp_def_index(uses, scaled->name);
@@ -4727,9 +4735,11 @@ static void mir_compute_address_folds(const IRFunction *f,
       folds[i].scale = scale;
       folds[i].disp = disp;
       skip[ai] = 1; /* the base+scaled add */
-      skip[si] = 1; /* the index scale */
-      if (offset_producer >= 0) {
-        skip[offset_producer] = 1; /* the index's constant offset */
+      if (scaled_reads == 1) {
+        skip[si] = 1; /* the index scale, read by this access alone */
+        if (offset_producer >= 0) {
+          skip[offset_producer] = 1; /* the index's constant offset */
+        }
       }
       break;
     }
