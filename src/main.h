@@ -37,6 +37,8 @@ typedef struct {
   int report_occupancy; /* --report-occupancy: with --emit-ptx, run ptxas -v
                            and print per-kernel registers plus the resulting
                            occupancy ceiling */
+  int report_sms; /* --sms=N: SM count for the occupancy report's whole-card
+                     fill thresholds; 0 = ask the local driver */
   int emit_spirv; /* --emit-spirv: lower declared kernels to SPIR-V, no object */
   int emit_arm64; /* --emit-arm64: lower scalar functions to an AArch64 ELF */
   int optimize;

@@ -970,7 +970,13 @@ mettle -O --emit-ptx --gpu-arch=gb10 kernels.mettle -o kernels.ptx
 # A forward-compatible development baseline is also available:
 mettle -O --emit-ptx --gpu-arch=portable kernels.mettle -o kernels.ptx
 
-# Per-kernel registers and the occupancy ceiling they imply, at compile time:
+# Per-kernel registers and the occupancy ceiling they imply, at compile time.
+# When the SM count is known (--sms=N, or the local driver when the flag is
+# absent), each line also prints the whole-card fill threshold -- the block
+# count below which a launch is work-limited and cannot reach its ceiling:
+#   attention: 50 registers, block 32 (1 warps/block, 24 blocks)
+#     -> 24/48 resident warps (50%), register-limited;
+#        full card = 864 blocks (36 SMs x 24)
 mettle -O --emit-ptx --gpu-arch=gb10 --report-occupancy kernels.mettle -o kernels.ptx
 
 # 2. build the host, linking the CUDA driver import stub (build-time only)
