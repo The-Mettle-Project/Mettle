@@ -1,0 +1,32 @@
+// Multi-warp warp-per-row matvec with a subgroup-uniform early return: the
+// verifier must accept `thread.x / 32` (and the shift / subgroup_size()
+// spellings) as subgroup-uniform, and `kernel(block = ...)` must compile.
+// Regression for the inference-engine feature requests 1 and 2.
+
+kernel(block = 256) row_div(w: float32*, out: float32*, d: int32) {
+  var row: int32 = block.x * 8 + thread.x / 32;
+  if (row >= d) { return; }
+  var lane: int32 = thread.x % 32;
+  var sum: float32 = w[row * 32 + lane];
+  var total: float32 = subgroup_reduce_add(sum);
+  if (lane == 0) { out[row] = total; }
+}
+
+kernel row_shift(w: float32*, out: float32*, d: int32) {
+  var row: int32 = block.x * 8 + (thread.x >> 5);
+  if (row >= d) { return; }
+  var total: float32 = subgroup_reduce_add(w[row]);
+  if (thread.x % 32 == 0) { out[row] = total; }
+}
+
+kernel row_size(w: float32*, out: float32*, d: int32) {
+  var row: int32 = block.x * 8 + thread.x / (int32)subgroup_size();
+  if (row >= d) { return; }
+  var total: float32 = subgroup_reduce_add(w[row]);
+  if (thread.x % 32 == 0) { out[row] = total; }
+}
+
+kernel(block = (64, 4, 1)) shaped(a: float32*, n: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < n) { a[i] = a[i] + 1.0; }
+}

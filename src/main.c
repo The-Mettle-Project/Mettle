@@ -2373,6 +2373,120 @@ static int add_link_argument(CompilerOptions *options, const char *argument) {
  * visible or its answer is unparseable, in which case the caller keeps the
  * project default (GB10 sm_121a), preserving cross-compile behavior on hosts
  * with no GPU. */
+/* --report-occupancy: assemble the just-written PTX with `ptxas -v` and print
+ * each kernel's registers per thread plus the occupancy ceiling they imply.
+ * The resource model is the documented 12.x upper bound (64K 32-bit registers
+ * and 48 resident warps per SM, 100KB shared memory, 24 resident blocks,
+ * 32-lane warps, register allocation unit 1), so the printed ceiling is an
+ * upper bound: real granularity can only lower it. A `kernel(block = ...)`
+ * declaration tightens the bound to whole resident blocks. */
+static void report_ptx_occupancy(const IRProgram *program,
+                                 const char *ptx_path, const char *arch) {
+  char cubin[512];
+  char command[1200];
+  snprintf(cubin, sizeof(cubin), "%s.occupancy.cubin", ptx_path);
+  snprintf(command, sizeof(command), "ptxas -v -arch=%s \"%s\" -o \"%s\" 2>&1",
+           arch ? arch : "sm_121a", ptx_path, cubin);
+#ifdef _WIN32
+  FILE *pipe = _popen(command, "r");
+#else
+  FILE *pipe = popen(command, "r");
+#endif
+  if (!pipe) {
+    fprintf(stderr, "--report-occupancy: could not run ptxas\n");
+    return;
+  }
+  printf("Occupancy report (%s; upper bound: 64K regs/SM, 48 warps/SM, "
+         "100KB smem/SM, allocation unit 1):\n",
+         arch ? arch : "sm_121a");
+  char line[512];
+  char entry[256] = {0};
+  long long entry_smem = 0;
+  int reported = 0;
+  while (fgets(line, sizeof(line), pipe)) {
+    char name[256];
+    if (sscanf(line, " ptxas info : Compiling entry function '%255[^']'",
+               name) == 1) {
+      snprintf(entry, sizeof(entry), "%s", name);
+      entry_smem = 0;
+      continue;
+    }
+    const char *used = strstr(line, "Used ");
+    if (!used || !entry[0]) {
+      continue;
+    }
+    int registers = 0;
+    if (sscanf(used, "Used %d registers", &registers) != 1) {
+      continue;
+    }
+    const char *smem = strstr(line, " bytes smem");
+    if (smem) {
+      const char *cursor = smem;
+      while (cursor > line && (cursor[-1] == ' ')) cursor--;
+      while (cursor > line && cursor[-1] >= '0' && cursor[-1] <= '9') cursor--;
+      entry_smem = atoll(cursor);
+    }
+    long long register_warp_limit =
+        registers > 0 ? 65536ll / ((long long)registers * 32) : 48;
+    if (register_warp_limit > 48) register_warp_limit = 48;
+
+    int block = 0;
+    for (size_t f = 0; program && f < program->function_count; f++) {
+      const IRFunction *function = program->functions[f];
+      if (function && function->is_kernel && function->name &&
+          strcmp(function->name, entry) == 0 && function->kernel_block[0] > 0) {
+        block = function->kernel_block[0] *
+                (function->kernel_block[1] > 0 ? function->kernel_block[1] : 1) *
+                (function->kernel_block[2] > 0 ? function->kernel_block[2] : 1);
+        break;
+      }
+    }
+
+    long long warps = register_warp_limit;
+    const char *limiter = registers > 0 && register_warp_limit < 48
+                              ? ", register-limited"
+                              : "";
+    if (block > 0) {
+      long long warps_per_block = (block + 31) / 32;
+      long long blocks = warps_per_block > 0
+                             ? register_warp_limit / warps_per_block
+                             : 0;
+      if (blocks > 24) blocks = 24;
+      if (entry_smem > 0) {
+        long long smem_blocks = 102400ll / entry_smem;
+        if (smem_blocks < blocks) {
+          blocks = smem_blocks;
+          limiter = ", shared-memory-limited";
+        }
+      }
+      warps = blocks * warps_per_block;
+      if (warps > 48) warps = 48;
+      if (warps < register_warp_limit && !*limiter) limiter = ", block-limited";
+      printf("  %s: %d registers, block %d (%lld warps/block, %lld blocks) -> "
+             "%lld/48 resident warps (%lld%%)%s\n",
+             entry, registers, block, warps_per_block, blocks, warps,
+             warps * 100 / 48, limiter);
+    } else {
+      printf("  %s: %d registers -> %lld/48 resident warps (%lld%%)%s\n",
+             entry, registers, warps, warps * 100 / 48, limiter);
+    }
+    reported = 1;
+    entry[0] = '\0';
+  }
+#ifdef _WIN32
+  int status = _pclose(pipe);
+#else
+  int status = pclose(pipe);
+#endif
+  remove(cubin);
+  if (!reported) {
+    fprintf(stderr,
+            "--report-occupancy: no ptxas resource report (is ptxas on PATH "
+            "and the target '%s' supported?); ptxas exit %d\n",
+            arch ? arch : "sm_121a", status);
+  }
+}
+
 static int detect_host_gpu_ptx_target(char *out, size_t out_size) {
 #ifdef _WIN32
   FILE *pipe = _popen(
@@ -2715,6 +2829,8 @@ int main(int argc, char *argv[]) {
         return 1;
       }
       options.ptx_tensor_tuple_budget = budget;
+    } else if (strcmp(argv[i], "--report-occupancy") == 0) {
+      options.report_occupancy = 1;
     } else if (strcmp(argv[i], "--emit-spirv") == 0) {
       options.emit_spirv = 1;
     } else if (strcmp(argv[i], "--emit-arm64") == 0) {
@@ -3651,6 +3767,9 @@ int compile_file(const char *input_filename, const char *output_filename,
       ir_explain_target_flush("PTX");
     }
     printf("Generated PTX: %s\n", output_filename);
+    if (options->report_occupancy) {
+      report_ptx_occupancy(ir_program, output_filename, options->ptx_target);
+    }
     result = 0;
     goto cleanup;
   }
@@ -4056,6 +4175,9 @@ void print_usage(const char *program_name) {
   printf("  --gpu-arch=A        PTX profile: gb10, portable (compute_75), sm_NN,\n"
          "                      or compute_NN (disables local GPU detection)\n");
   printf("  --ptx-version=M.m   Override the emitted PTX ISA version\n");
+  printf("  --report-occupancy  With --emit-ptx: run ptxas -v on the emitted\n"
+         "                      module and print each kernel's registers per\n"
+         "                      thread plus the occupancy ceiling they imply\n");
   printf("  --gpu-tensor-tuple-budget=N\n"
          "                      PTX resident-fragment ceiling (0=architecture\n"
          "                      default); enables measured resident/replay variants\n"

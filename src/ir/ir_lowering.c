@@ -145,6 +145,9 @@ IRFunction *ir_lower_function(IRLoweringContext *context,
   function->is_noalloc = function_data->is_noalloc;
   function->is_test = function_data->is_test;
   function->is_kernel = function_data->is_kernel;
+  function->kernel_block[0] = function_data->kernel_block[0];
+  function->kernel_block[1] = function_data->kernel_block[1];
+  function->kernel_block[2] = function_data->kernel_block[2];
   /* A function-level `@simd` decorator becomes the default mode for every
    * counted loop in the body that has no `@simd` of its own. */
   context->current_function_simd_default = function_data->simd_mode;
@@ -304,6 +307,24 @@ int ir_emit_simd_marker(IRLoweringContext *context, IRFunction *function,
   char buffer[48];
   snprintf(buffer, sizeof(buffer), IR_SIMD_MARKER_PREFIX "%c:%d:%d", which, id,
            mode);
+  IRInstruction instruction = {0};
+  instruction.op = IR_OP_NOP;
+  instruction.location = location;
+  instruction.text = buffer; // ir_emit deep-copies text
+  return ir_emit(context, function, &instruction);
+}
+
+// `@unroll(n)` loop marker: one IR_OP_NOP carrying "@@unroll:<factor>" placed
+// immediately before the loop's header label. The annotated-unroll pass finds
+// the next label, unrolls that loop when its shape allows, and clears the
+// marker either way.
+int ir_emit_unroll_marker(IRLoweringContext *context, IRFunction *function,
+                          int factor, SourceLocation location) {
+  if (!context || !function) {
+    return 0;
+  }
+  char buffer[32];
+  snprintf(buffer, sizeof(buffer), IR_UNROLL_MARKER_PREFIX "%d", factor);
   IRInstruction instruction = {0};
   instruction.op = IR_OP_NOP;
   instruction.location = location;

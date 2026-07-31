@@ -1,0 +1,7 @@
+import "std/gpu";
+fn main() -> int32 {
+  var h: int64 = 0;
+  var s: int64 = 0;
+  dispatch h[grid: (1, 1, 1), block: (32, 1, 1), stream: s](h) on s;
+  return 0;
+}

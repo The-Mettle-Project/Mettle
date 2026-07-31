@@ -618,6 +618,14 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
       }
     }
 
+    if (while_data->unroll_factor > 1 &&
+        !ir_emit_unroll_marker(context, function, while_data->unroll_factor,
+                               statement->location)) {
+      free(loop_start);
+      free(loop_end);
+      return 0;
+    }
+
     if (!ir_emit_label_instruction(context, function, loop_start,
                                    statement->location)) {
       free(loop_start);
@@ -708,6 +716,15 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
 
     if (!ir_lower_statement_or_expression(context, function,
                                           for_data->initializer)) {
+      free(condition_label);
+      free(step_label);
+      free(end_label);
+      return 0;
+    }
+
+    if (for_data->unroll_factor > 1 &&
+        !ir_emit_unroll_marker(context, function, for_data->unroll_factor,
+                               statement->location)) {
       free(condition_label);
       free(step_label);
       free(end_label);

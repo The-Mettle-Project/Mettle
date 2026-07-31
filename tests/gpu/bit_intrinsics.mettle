@@ -1,0 +1,25 @@
+// f32 <-> bits reinterpretation and dp4a packed-byte dot product.
+// Regression for the inference-engine feature requests 3 and 7.
+
+extern fn f32_from_bits(bits: uint32) -> float32 = "f32_from_bits";
+extern fn bits_from_f32(x: float32) -> uint32 = "bits_from_f32";
+extern fn dp4a_u32(a: uint32, b: uint32, c: uint32) -> uint32 = "dp4a_u32";
+extern fn dp4a_s32(a: int32, b: int32, c: int32) -> int32 = "dp4a_s32";
+
+kernel bits_roundtrip(src: uint32*, out: float32*, n: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < n) {
+    var v: float32 = f32_from_bits(src[i]);
+    var bits: uint32 = bits_from_f32(v * 2.0);
+    out[i] = f32_from_bits(bits | (uint32)0x80000000);
+  }
+}
+
+kernel packed_dot(a: uint32*, b: uint32*, out: int32*, n: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < n) {
+    var acc: int32 = dp4a_s32((int32)a[i], (int32)b[i], 0);
+    var uacc: uint32 = dp4a_u32(a[i], b[i], (uint32)7);
+    out[i] = acc + (int32)uacc;
+  }
+}

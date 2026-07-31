@@ -216,7 +216,11 @@ replaced with that finding rather than printed.
 Prefix a function with `@inline`/`@noinline` (inlining control), `@pure`
 (side-effect-free → loop-invariant calls hoisted out of loops), or
 `@simd`/`@simd!` (vectorization contract on every body loop). Decorators stack,
-take effect under `-O`/`--release`, and apply to functions only. See
+take effect under `-O`/`--release`, and apply to functions only — except
+`@simd` and `@unroll(n)`, which may also prefix a single loop. `@unroll(n)`
+(factor 2..16) partially unrolls a counted straight-line loop by `n` with the
+original loop kept as the remainder; it works in CPU functions and GPU
+kernels alike (see [gpu.md](gpu.md#loop-unrolling-unrolln)). See
 [Declarations](declarations.md#function-decorators).
 
 The `!` decorators are **contracts**: the compiler either delivers the
@@ -248,6 +252,8 @@ import "std/gpu";
 // ... gpu_init, gpu_module, gpu_func, gpu_malloc, gpu_to_device ...
 dispatch vadd[(n + 255) / 256, 256](da, db, dc, n);
 
+dispatch vadd[(n + 255) / 256, 256](da, db, dc, n) on compute_stream;
+
 dispatch gemm[grid: (tiles_n, tiles_m, batch),
               block: (32, 1, 1),
               shared: arena_bytes,
@@ -257,7 +263,12 @@ dispatch gemm[grid: (tiles_n, tiles_m, batch),
 Here `vadd` is the runtime function handle returned by `gpu_func`, not a
 compile-time reference to the source kernel declaration. `dispatch` preserves
 a typed, target-neutral launch in IR; the host backend alone marshals it for
-the selected runtime provider. The compact form supplies 1-D grid/block sizes.
+the selected runtime provider. The compact form supplies 1-D grid/block sizes;
+`... on s` enqueues it on stream `s`. A kernel that requires one launch shape
+declares it — `kernel(block = 256) matvec(...)` — and the emitted module
+(`.reqntid` / `LocalSize`) makes the driver reject any other geometry.
+`mettle -O --emit-ptx --report-occupancy` prints each kernel's registers and
+occupancy ceiling at compile time.
 The named form requires `grid: (x,y,z)` and `block: (x,y,z)` and optionally
 accepts `shared:` dynamic-arena bytes plus `stream:`; controls may be reordered.
 libmtlc's `mtlc_gpu_launch` builds the identical operation.

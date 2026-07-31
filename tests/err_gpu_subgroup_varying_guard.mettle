@@ -1,0 +1,15 @@
+// A subgroup collective behind a genuinely work-item-varying early return is
+// still rejected -- and with a clean diagnostic, not an internal-compiler-error
+// escalation (the second kernel exists so a wrongly attributed ICE would name
+// an unrelated function, as the original bug report observed).
+
+kernel bad(w: float32*, out: float32*, d: int32) {
+  if (thread.x >= d) { return; }
+  var total: float32 = subgroup_reduce_add(w[thread.x]);
+  if (thread.x == 0) { out[0] = total; }
+}
+
+kernel ffn_act(x: float32*, n: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < n) { x[i] = x[i] * 2.0; }
+}

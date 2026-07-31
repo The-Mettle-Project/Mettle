@@ -28,6 +28,31 @@ kernel vadd(a: float32*, b: float32*, c: float32*, n: int32) {
 }
 ```
 
+### Declaring the required block shape
+
+A kernel written for one launch geometry can declare it:
+
+```mettle
+kernel(block = 256) matvec(w: float32*, x: float32*, out: float32*,
+                           d: int32, n: int32) {
+  var row: int32 = block.x * 8 + thread.x / 32;
+  ...
+}
+
+kernel(block = (64, 4, 1)) tile(...) { ... }   // full three-dimensional form
+```
+
+The single-integer form means `block = (N, 1, 1)`. Dimensions must be positive
+integer literals and the block volume may not exceed 1024 work-items. The
+declaration is stamped into the emitted module: PTX emits `.reqntid`, so
+`cuLaunchKernel` rejects any launch whose block shape differs instead of
+running 7/8 of a multi-warp kernel against a garbage lane mapping; SPIR-V
+emits the `LocalSize` (reqd_work_group_size) execution mode so an OpenCL
+runtime enforces the same contract at enqueue. `--report-occupancy` also uses
+the declared shape to tighten its per-kernel occupancy bound to whole
+resident blocks. A kernel without the attribute keeps today's any-geometry
+behavior.
+
 ### Index built-ins
 
 Inside `--emit-ptx` compiles, the GPU thread/block indices are built-in member
@@ -60,6 +85,33 @@ PTX through `ptxas`; a CUDA Driver differential suite executes correctness and
 sanitizer cases on development hardware and has a stricter native GB10 mode.
 See the [GPU architecture and acceptance contract](gpu-architecture.md).
 
+Pointer indexing is typed at every width, including 16-bit elements: a
+`uint16*` (or `int16*`) load or store is one real 16-bit access
+(`ld.global.u16` / `st.global.u16` in PTX, a typed aligned access in SPIR-V)
+at any 2-aligned address, so formats whose blocks are 2-aligned but not
+4-aligned (GGML's 210-byte Q6_K, for example) do not fall back to per-byte
+loads.
+
+Two further intrinsic families cover custom number formats:
+
+```mettle
+extern fn f32_from_bits(bits: uint32) -> float32 = "f32_from_bits";
+extern fn bits_from_f32(x: float32) -> uint32 = "bits_from_f32";
+extern fn dp4a_u32(a: uint32, b: uint32, c: uint32) -> uint32 = "dp4a_u32";
+extern fn dp4a_s32(a: int32, b: int32, c: int32) -> int32 = "dp4a_s32";
+```
+
+`f32_from_bits` / `bits_from_f32` reinterpret a float32 and its IEEE-754
+encoding in either direction — one `mov.b32` in PTX, one `OpBitcast` in
+SPIR-V — so assembling or inspecting bit patterns (fp8, microscaling, and
+whatever ships next) needs no arithmetic reconstruction. `dp4a_u32` /
+`dp4a_s32` compute the four-way packed-byte dot product with 32-bit
+accumulate, `a0*b0 + a1*b1 + a2*b2 + a3*b3 + c`, over unsigned or signed
+bytes: PTX emits the native `dp4a.u32.u32` / `dp4a.s32.s32` instruction
+(available on every supported target), collapsing the shift/mask/convert/FMA
+chain of quantized decode; SPIR-V replays the exact byte semantics with
+scalar arithmetic.
+
 An ordinary function called by a kernel is emitted as a non-entry device helper
 in both PTX and SPIR-V. Reachability is transitive and unrelated host functions
 are omitted; `kernel` remains the only launch-entry marker. Direct calls with
@@ -67,6 +119,32 @@ scalar or pointer parameters/results are supported. Recursion, indirect calls,
 external calls, host launches from device code, and calling a kernel as a normal
 function are rejected by a shared IR call-graph verifier, so the rule is the
 same for every frontend and GPU backend.
+
+### Loop unrolling: `@unroll(n)`
+
+The PTX and SPIR-V backends do not unroll loops on their own — a kernel loop
+compiles exactly as written, one load per iteration. When a latency-bound
+inner loop wants its loads pipelined, annotate it:
+
+```mettle
+@unroll(4) while (j < n) {
+  sum = sum + w[row * n + j] * x[j];
+  j = j + 32;
+}
+```
+
+`@unroll(n)` (factor 2..16) partially unrolls a counted loop: a main loop
+runs `n` copies of the body per trip while `counter + step*(n-1)` still
+passes the loop test, and the original loop remains as the remainder, so
+iteration order, count, and side effects are preserved exactly for every
+trip count including zero. It applies to `while`/`for` loops of the shape
+`counter < limit` (or `<=`) with a straight-line body (no nested control
+flow) whose last counter update is `counter = counter + K` for a positive
+constant `K`; the counter must not be written elsewhere in the body and the
+limit must be loop-invariant. A loop outside that shape is left rolled — the
+annotation is a hint, not a contract — and the same annotation works in CPU
+functions under `-O`/`--release`. Register pressure is the trade-off:
+`--report-occupancy` shows what a factor costs.
 
 ### Static and launch-sized workgroup memory, private memory, and barriers
 
@@ -249,6 +327,29 @@ IDs, memory loads, and opaque call results are conservatively varying. Helper pa
 reachable call site. Collectives under control that is insufficiently uniform for their
 scope, varying-trip loops, and work-item-varying broadcast lanes are rejected
 without putting backend reconvergence rules in the frontend.
+
+One derivation of a local ID is additionally recognized as subgroup-uniform:
+`thread.x / 32`, `thread.x >> 5`, and `thread.x / subgroup_size()` (through
+plain copies and 32-bit-or-wider integer casts) name the subgroup a work-item
+belongs to, so the natural multi-warp warp-per-row shape passes the verifier:
+
+```mettle
+kernel(block = 256) matvec(w: float32*, x: float32*, out: float32*,
+                           d: int32, n: int32) {
+  var row: int32 = block.x * 8 + thread.x / 32;
+  if (row >= d) { return; }          // subgroup-uniform early return: accepted
+  ...
+  var total: float32 = subgroup_reduce_add(sum);
+}
+```
+
+The recognition carries the launch precondition that subgroups are formed
+from consecutive `thread.x` values with the x-extent a multiple of the
+subgroup width — a one-dimensional block, or any block whose `block_dim.x` is
+a multiple of 32. That is the CUDA linearization contract and the shape
+`kernel(block = ...)` declares; the literal `32` / `>> 5` spellings
+additionally assume the 32-lane PTX subgroup, while `subgroup_size()` is the
+portable spelling.
 
 PTX maps a subgroup to the 32-lane NVIDIA warp and uses `activemask`,
 `shfl.sync`, and `vote.sync`. The reduction guards every tree edge with the active mask, so a
@@ -817,6 +918,8 @@ fn main() -> int32 {
 ```
 dispatch KERNEL[grid, block](arg0, arg1, ...);
 
+dispatch KERNEL[grid, block](arg0, arg1, ...) on stream_handle;
+
 dispatch KERNEL[
   grid: (grid_x, grid_y, grid_z),
   block: (block_x, block_y, block_z),
@@ -832,6 +935,11 @@ dispatch KERNEL[
   `block`. `shared` and `stream` are optional, default to zero, and named
   controls may be reordered. Every statically known dimension must be positive;
   shared bytes are an integer and a stream is an integer or pointer handle.
+- `... on s;` enqueues the launch on stream `s` (a `gpu_stream_create()`
+  handle) without spelling the full named form — the sugar that lets a
+  compact launch overlap with a previous token's asynchronous readback.
+  It composes with either form but conflicts with an explicit `stream:`
+  control, which is rejected.
 - The arguments are passed by value. Device pointers are `int64` handles; scalars
   (`int32`, `float32`, ...) are forwarded with their natural width.
 
@@ -861,6 +969,9 @@ mettle -O --emit-ptx --gpu-arch=gb10 kernels.mettle -o kernels.ptx
 
 # A forward-compatible development baseline is also available:
 mettle -O --emit-ptx --gpu-arch=portable kernels.mettle -o kernels.ptx
+
+# Per-kernel registers and the occupancy ceiling they imply, at compile time:
+mettle -O --emit-ptx --gpu-arch=gb10 --report-occupancy kernels.mettle -o kernels.ptx
 
 # 2. build the host, linking the CUDA driver import stub (build-time only)
 mettle --build host.mettle -o host.exe \

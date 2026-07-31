@@ -34,6 +34,9 @@ typedef struct {
   int ptx_isa_major;
   int ptx_isa_minor;
   int ptx_tensor_tuple_budget; /* 0=arch default; backend-only residency knob */
+  int report_occupancy; /* --report-occupancy: with --emit-ptx, run ptxas -v
+                           and print per-kernel registers plus the resulting
+                           occupancy ceiling */
   int emit_spirv; /* --emit-spirv: lower declared kernels to SPIR-V, no object */
   int emit_arm64; /* --emit-arm64: lower scalar functions to an AArch64 ELF */
   int optimize;

@@ -1,0 +1,19 @@
+// 16-bit typed loads and stores through uint16* indexing, including
+// 2-aligned-but-not-4-aligned block offsets (GGML Q6_K's 210-byte blocks).
+// Regression for inference-engine feature request 4.
+
+extern fn h2f(bits: uint16) -> float32 = "h2f";
+
+kernel u16_block_tail(blocks: uint16*, out: float32*, nb: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < nb) {
+    var base: int32 = i * 105;
+    var d: uint16 = blocks[base + 104];
+    out[i] = h2f(d);
+  }
+}
+
+kernel u16_copy(src: uint16*, dst: uint16*, n: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < n) { dst[i] = src[i]; }
+}

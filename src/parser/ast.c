@@ -116,6 +116,9 @@ ASTNode *ast_clone_node(ASTNode *node) {
     dst->is_exported = src->is_exported;
     dst->is_extern = src->is_extern;
     dst->is_kernel = src->is_kernel;
+    dst->kernel_block[0] = src->kernel_block[0];
+    dst->kernel_block[1] = src->kernel_block[1];
+    dst->kernel_block[2] = src->kernel_block[2];
     dst->link_name = ast_copy_string(src->link_name);
     dst->type_param_count = src->type_param_count;
     dst->type_params = ast_copy_string_array(src->type_params, src->type_param_count);
@@ -667,6 +670,7 @@ ASTNode *ast_clone_node(ASTNode *node) {
     dst->body = src->body ? ast_clone_node(src->body) : NULL;
     dst->label = ast_copy_string(src->label);
     dst->simd_mode = src->simd_mode;
+    dst->unroll_factor = src->unroll_factor;
     if (dst->condition)
       ast_add_child(clone, dst->condition);
     if (dst->body)
@@ -688,6 +692,7 @@ ASTNode *ast_clone_node(ASTNode *node) {
     dst->body = src->body ? ast_clone_node(src->body) : NULL;
     dst->label = ast_copy_string(src->label);
     dst->simd_mode = src->simd_mode;
+    dst->unroll_factor = src->unroll_factor;
     if (dst->initializer)
       ast_add_child(clone, dst->initializer);
     if (dst->condition)
@@ -1408,6 +1413,9 @@ ASTNode *ast_create_function_declaration(const char *name, char **param_names,
   func_decl->is_exported = 0;
   func_decl->is_extern = 0;
   func_decl->is_kernel = 0;
+  func_decl->kernel_block[0] = 0;
+  func_decl->kernel_block[1] = 0;
+  func_decl->kernel_block[2] = 0;
   func_decl->link_name = NULL;
   func_decl->type_params = NULL;
   func_decl->type_param_traits = NULL;
@@ -2215,6 +2223,7 @@ ASTNode *ast_create_for_statement(ASTNode *initializer, ASTNode *condition,
   for_stmt->body = body;
   for_stmt->label = NULL;
   for_stmt->simd_mode = SIMD_ATTR_NONE;
+  for_stmt->unroll_factor = 0;
   node->data = for_stmt;
 
   if (initializer)

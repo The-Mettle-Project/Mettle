@@ -1,0 +1,9 @@
+// thread.x / 16 is NOT subgroup-uniform (16 is not the subgroup width): the
+// lane-quotient recognition must not overreach.
+
+kernel bad16(w: float32*, out: float32*, d: int32) {
+  var row: int32 = thread.x / 16;
+  if (row >= d) { return; }
+  var total: float32 = subgroup_reduce_add(w[row]);
+  if (thread.x % 32 == 0) { out[row] = total; }
+}
