@@ -2373,15 +2373,62 @@ static int add_link_argument(CompilerOptions *options, const char *argument) {
  * visible or its answer is unparseable, in which case the caller keeps the
  * project default (GB10 sm_121a), preserving cross-compile behavior on hosts
  * with no GPU. */
+/* SM count of the local device, for the occupancy report's machine-fill
+ * lines. The driver is loaded dynamically so the compiler keeps no link
+ * dependency on CUDA; any failure returns 0 and the report simply omits the
+ * absolute fill thresholds. */
+#ifdef _WIN32
+void *__stdcall LoadLibraryA(const char *name);
+void *__stdcall GetProcAddress(void *module, const char *name);
+#else
+#include <dlfcn.h>
+#endif
+
+static int detect_gpu_sm_count(void) {
+  int (*cu_init)(unsigned int) = NULL;
+  int (*cu_device_get)(int *, int) = NULL;
+  int (*cu_attribute)(int *, int, int) = NULL;
+#ifdef _WIN32
+  void *cuda = LoadLibraryA("nvcuda.dll");
+  if (!cuda) return 0;
+  cu_init = (int (*)(unsigned int))GetProcAddress(cuda, "cuInit");
+  cu_device_get = (int (*)(int *, int))GetProcAddress(cuda, "cuDeviceGet");
+  cu_attribute =
+      (int (*)(int *, int, int))GetProcAddress(cuda, "cuDeviceGetAttribute");
+#else
+  void *cuda = dlopen("libcuda.so.1", RTLD_LAZY);
+  if (!cuda) cuda = dlopen("libcuda.so", RTLD_LAZY);
+  if (!cuda) return 0;
+  cu_init = (int (*)(unsigned int))dlsym(cuda, "cuInit");
+  cu_device_get = (int (*)(int *, int))dlsym(cuda, "cuDeviceGet");
+  cu_attribute = (int (*)(int *, int, int))dlsym(cuda, "cuDeviceGetAttribute");
+#endif
+  int device = 0;
+  int count = 0;
+  if (!cu_init || !cu_device_get || !cu_attribute) return 0;
+  if (cu_init(0) != 0) return 0;
+  if (cu_device_get(&device, 0) != 0) return 0;
+  /* 16 = CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT */
+  if (cu_attribute(&count, 16, device) != 0) return 0;
+  return count > 0 ? count : 0;
+}
+
 /* --report-occupancy: assemble the just-written PTX with `ptxas -v` and print
  * each kernel's registers per thread plus the occupancy ceiling they imply.
  * The resource model is the documented 12.x upper bound (64K 32-bit registers
  * and 48 resident warps per SM, 100KB shared memory, 24 resident blocks,
  * 32-lane warps, register allocation unit 1), so the printed ceiling is an
  * upper bound: real granularity can only lower it. A `kernel(block = ...)`
- * declaration tightens the bound to whole resident blocks. */
+ * declaration tightens the bound to whole resident blocks.
+ *
+ * The per-SM ceiling says nothing about whether a launch carries enough work
+ * to reach it -- a 16-block launch on a 36-SM card is work-limited at any
+ * residency. When the SM count is known (--sms=N, or the local driver when
+ * the flag is absent), each line also prints the whole-card fill threshold,
+ * so a reader can put their grid size next to it. */
 static void report_ptx_occupancy(const IRProgram *program,
-                                 const char *ptx_path, const char *arch) {
+                                 const char *ptx_path, const char *arch,
+                                 int sm_count, int sm_count_is_local) {
   char cubin[512];
   char command[1200];
   snprintf(cubin, sizeof(cubin), "%s.occupancy.cubin", ptx_path);
@@ -2397,8 +2444,12 @@ static void report_ptx_occupancy(const IRProgram *program,
     return;
   }
   printf("Occupancy report (%s; upper bound: 64K regs/SM, 48 warps/SM, "
-         "100KB smem/SM, allocation unit 1):\n",
+         "100KB smem/SM, allocation unit 1",
          arch ? arch : "sm_121a");
+  if (sm_count > 0) {
+    printf("; %d SMs, %s", sm_count, sm_count_is_local ? "local GPU" : "--sms");
+  }
+  printf("):\n");
   char line[512];
   char entry[256] = {0};
   long long entry_smem = 0;
@@ -2463,12 +2514,24 @@ static void report_ptx_occupancy(const IRProgram *program,
       if (warps > 48) warps = 48;
       if (warps < register_warp_limit && !*limiter) limiter = ", block-limited";
       printf("  %s: %d registers, block %d (%lld warps/block, %lld blocks) -> "
-             "%lld/48 resident warps (%lld%%)%s\n",
+             "%lld/48 resident warps (%lld%%)%s",
              entry, registers, block, warps_per_block, blocks, warps,
              warps * 100 / 48, limiter);
+      if (sm_count > 0 && blocks > 0) {
+        /* The whole-card fill threshold: launches below this many blocks
+         * cannot reach the ceiling above no matter what it says. */
+        printf("; full card = %lld blocks (%d SMs x %lld)",
+               (long long)sm_count * blocks, sm_count, blocks);
+      }
+      printf("\n");
     } else {
-      printf("  %s: %d registers -> %lld/48 resident warps (%lld%%)%s\n",
+      printf("  %s: %d registers -> %lld/48 resident warps (%lld%%)%s",
              entry, registers, warps, warps * 100 / 48, limiter);
+      if (sm_count > 0 && warps > 0) {
+        printf("; full card = %lld warps (%d SMs x %lld)",
+               (long long)sm_count * warps, sm_count, warps);
+      }
+      printf("\n");
     }
     reported = 1;
     entry[0] = '\0';
@@ -2831,6 +2894,15 @@ int main(int argc, char *argv[]) {
       options.ptx_tensor_tuple_budget = budget;
     } else if (strcmp(argv[i], "--report-occupancy") == 0) {
       options.report_occupancy = 1;
+    } else if (strncmp(argv[i], "--sms=", 6) == 0) {
+      int sms = atoi(argv[i] + 6);
+      if (sms < 1 || sms > 1024) {
+        fprintf(stderr, "Error: --sms expects an SM count from 1 to 1024 "
+                        "(got '%s')\n",
+                argv[i] + 6);
+        return 1;
+      }
+      options.report_sms = sms;
     } else if (strcmp(argv[i], "--emit-spirv") == 0) {
       options.emit_spirv = 1;
     } else if (strcmp(argv[i], "--emit-arm64") == 0) {
@@ -3768,7 +3840,14 @@ int compile_file(const char *input_filename, const char *output_filename,
     }
     printf("Generated PTX: %s\n", output_filename);
     if (options->report_occupancy) {
-      report_ptx_occupancy(ir_program, output_filename, options->ptx_target);
+      int sm_count = options->report_sms;
+      int sm_count_is_local = 0;
+      if (sm_count <= 0) {
+        sm_count = detect_gpu_sm_count();
+        sm_count_is_local = sm_count > 0;
+      }
+      report_ptx_occupancy(ir_program, output_filename, options->ptx_target,
+                           sm_count, sm_count_is_local);
     }
     result = 0;
     goto cleanup;
@@ -4177,7 +4256,12 @@ void print_usage(const char *program_name) {
   printf("  --ptx-version=M.m   Override the emitted PTX ISA version\n");
   printf("  --report-occupancy  With --emit-ptx: run ptxas -v on the emitted\n"
          "                      module and print each kernel's registers per\n"
-         "                      thread plus the occupancy ceiling they imply\n");
+         "                      thread plus the occupancy ceiling they imply,\n"
+         "                      with whole-card fill thresholds when the SM\n"
+         "                      count is known\n");
+  printf("  --sms=N             SM count for those fill thresholds (default:\n"
+         "                      ask the local driver; omitted when neither\n"
+         "                      answers)\n");
   printf("  --gpu-tensor-tuple-budget=N\n"
          "                      PTX resident-fragment ceiling (0=architecture\n"
          "                      default); enables measured resident/replay variants\n"
