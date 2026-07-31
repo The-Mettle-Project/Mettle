@@ -17,5 +17,6 @@ fn main() -> int32 {
              block: (32, 4, 1),
              grid: (7, 3, 2),
              shared: shared_bytes](da, db, dc, n, scale);
+  dispatch k[(n + 255) / 256, 256](da, db, dc, n, scale) on stream;
   return gpu_stub_finish();
 }

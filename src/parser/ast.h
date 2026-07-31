@@ -109,6 +109,9 @@ typedef struct {
   int is_exported;
   int is_extern;
   int is_kernel;          // `kernel`: GPU entry point (not an ordinary function)
+  // `kernel(block = N)` / `kernel(block = (x, y, z))`: the launch block shape
+  // this kernel requires. All zero when undeclared.
+  int kernel_block[3];
   char *link_name;
   char **type_params;
   char **type_param_traits;
@@ -420,6 +423,7 @@ typedef struct {
   ASTNode *body;
   char *label; // Optional label for labeled break/continue; NULL if unlabeled
   int simd_mode; // SimdAttr: vectorization attribute requested on this loop
+  int unroll_factor; // `@unroll(n)` requested on this loop; 0 if absent
 } WhileStatement;
 
 typedef struct {
@@ -429,6 +433,7 @@ typedef struct {
   ASTNode *body;
   char *label; // Optional label
   int simd_mode; // SimdAttr: vectorization attribute requested on this loop
+  int unroll_factor; // `@unroll(n)` requested on this loop; 0 if absent
 } ForStatement;
 
 typedef struct {

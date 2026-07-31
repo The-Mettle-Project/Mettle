@@ -28,6 +28,10 @@
  * intrinsic landed between them, enforces the contract, and clears the
  * markers. Emitted by ir_lowering.c. */
 #define IR_SIMD_MARKER_PREFIX "@@simd:"
+/* `@unroll(n)` loop marker: an IR_OP_NOP carrying "@@unroll:<factor>" placed
+ * immediately before the loop's header label. Consumed (cleared) by the
+ * annotated-unroll pass; transparent to every backend like the SIMD markers. */
+#define IR_UNROLL_MARKER_PREFIX "@@unroll:"
 
 typedef enum {
   IR_OPERAND_NONE,
@@ -553,6 +557,11 @@ typedef struct {
   int is_noalloc;         // `@noalloc` : proven allocation-free or error
   int is_test;            // `@test`    : compile-time unit test (mettle test)
   int is_kernel;          // GPU entry point; ordinary functions are not entries
+  /* `kernel(block = ...)`: the launch block shape this kernel requires.
+   * All zero when undeclared. PTX emits .reqntid so the driver rejects a
+   * mismatched launch instead of running it with a garbage lane mapping;
+   * SPIR-V emits the LocalSize execution mode. */
+  int kernel_block[3];
 } IRFunction;
 
 typedef struct {

@@ -6339,6 +6339,14 @@ static void emit_function(IRProgram *program, size_t fi, CodeGenerator *gen,
     }
   }
   sb_puts(&sig, "\n)\n");
+  if (func->is_kernel && func->kernel_block[0] > 0) {
+    /* `kernel(block = ...)`: the driver refuses a mismatched launch geometry
+     * at cuLaunchKernel instead of running 7/8 of the block with a garbage
+     * lane mapping. */
+    sb_printf(&sig, ".reqntid %d, %d, %d\n", func->kernel_block[0],
+              func->kernel_block[1] > 0 ? func->kernel_block[1] : 1,
+              func->kernel_block[2] > 0 ? func->kernel_block[2] : 1);
+  }
 
   /* Address-space allocations are declarations, so emit them before
    * executable instructions and bind each semantic pointer to a .b64 register.
@@ -7159,6 +7167,52 @@ static void emit_function(IRProgram *program, size_t fi, CodeGenerator *gen,
         char dn[24];
         reg_name(PC_B32, dv.idx, dn);
         sb_printf(&fn.body, "\tcvt.u32.u16 %s, %s;\n", dn, hn);
+        if (in->dest.name)
+          bind_value(&fn, in->dest.name, dv);
+      } else if (intrinsic == MTLC_INTRINSIC_GPU_F32_FROM_BITS &&
+                 in->argument_count >= 1) {
+        /* f32_from_bits(u32): reinterpret an IEEE-754 bit pattern as float32.
+         * One mov.b32 across register files; no arithmetic reconstruction. */
+        char a[24];
+        use_as(&fn, &in->arguments[0], PC_B32, a);
+        PtxVal dv = {.cls = PC_F32};
+        dv = destination_value(&fn, &in->dest, dv);
+        char dn[24];
+        reg_name(PC_F32, dv.idx, dn);
+        sb_printf(&fn.body, "\tmov.b32 %s, %s;\n", dn, a);
+        if (in->dest.name)
+          bind_value(&fn, in->dest.name, dv);
+      } else if (intrinsic == MTLC_INTRINSIC_GPU_F32_TO_BITS &&
+                 in->argument_count >= 1) {
+        /* bits_from_f32(x): the float32's IEEE-754 encoding as uint32. */
+        char a[24];
+        use_as(&fn, &in->arguments[0], PC_F32, a);
+        PtxVal dv = {.cls = PC_B32, .is_unsigned = 1};
+        dv = destination_value(&fn, &in->dest, dv);
+        char dn[24];
+        reg_name(PC_B32, dv.idx, dn);
+        sb_printf(&fn.body, "\tmov.b32 %s, %s;\n", dn, a);
+        if (in->dest.name)
+          bind_value(&fn, in->dest.name, dv);
+      } else if ((intrinsic == MTLC_INTRINSIC_GPU_DP4A_U32 ||
+                  intrinsic == MTLC_INTRINSIC_GPU_DP4A_S32) &&
+                 in->argument_count >= 3) {
+        /* dp4a(a, b, c): four-way packed-byte dot product with 32-bit
+         * accumulate. Collapses the shift/mask/convert/FMA chain of quantized
+         * decode to one instruction (sm_61+; every supported target qualifies). */
+        int is_signed = intrinsic == MTLC_INTRINSIC_GPU_DP4A_S32;
+        char a[24];
+        char b[24];
+        char c[24];
+        use_as(&fn, &in->arguments[0], PC_B32, a);
+        use_as(&fn, &in->arguments[1], PC_B32, b);
+        use_as(&fn, &in->arguments[2], PC_B32, c);
+        PtxVal dv = {.cls = PC_B32, .is_unsigned = !is_signed};
+        dv = destination_value(&fn, &in->dest, dv);
+        char dn[24];
+        reg_name(PC_B32, dv.idx, dn);
+        sb_printf(&fn.body, "\tdp4a.%s %s, %s, %s, %s;\n",
+                  is_signed ? "s32.s32" : "u32.u32", dn, a, b, c);
         if (in->dest.name)
           bind_value(&fn, in->dest.name, dv);
       } else if (intrinsic >= MTLC_INTRINSIC_GPU_SQRT_F32 &&

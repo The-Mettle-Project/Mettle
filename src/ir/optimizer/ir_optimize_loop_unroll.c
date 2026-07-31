@@ -1462,3 +1462,360 @@ int ir_match_null_trap_diamond(const IRFunction *function,
  *
  * Generality: this pass triggers on any pointer-reading loop whose pointer
  * is invariant. Grep, word_count, and any byte-walking loop benefit. */
+
+/* ---- `@unroll(n)`: partial unroll of an annotated counted loop. ----
+ *
+ * Marker: an IR_OP_NOP carrying "@@unroll:<factor>" immediately before the
+ * loop's header label (emitted by the frontend for `@unroll(n)` loops).
+ * Recognized shape:
+ *
+ *   header:  t = counter < limit        ; or <=; integer compare, counter lhs
+ *            branch_zero t -> end
+ *            ...straight-line body, no labels or branches...
+ *            counter = counter + step   ; any positive constant step, last
+ *            jump header
+ *
+ * The counter must be written only by that increment inside the body, and a
+ * symbol/temp limit must not be written there. The transform inserts a
+ * factor-wide main loop before the original loop and keeps the original as
+ * the remainder:
+ *
+ *   main:    g0 = counter + step*(factor-1)
+ *            g1 = g0 < limit            ; same comparison operator
+ *            branch_zero g1 -> header
+ *            body x factor              ; body-private temps renamed per copy
+ *            jump main
+ *   header:  ...original loop, unchanged...
+ *
+ * Iteration order, count, and side effects are preserved exactly; the guard
+ * only asks whether the next `factor` iterations all pass the loop test.
+ * The marker is consumed when the transform fires and is left in place
+ * otherwise, so a later fixpoint iteration can retry once cleanup passes have
+ * simplified the loop into shape. */
+
+static int ir_unroll_annotated_body_op_safe(const IRInstruction *in) {
+  switch (in->op) {
+  case IR_OP_NOP:
+    /* A nested annotation marker means a nested loop follows: bail. */
+    return !(in->text &&
+             strncmp(in->text, IR_UNROLL_MARKER_PREFIX,
+                     strlen(IR_UNROLL_MARKER_PREFIX)) == 0);
+  case IR_OP_BINARY:
+  case IR_OP_UNARY:
+  case IR_OP_ASSIGN:
+  case IR_OP_CAST:
+  case IR_OP_ROTATE_ADD:
+  case IR_OP_DECLARE_LOCAL:
+  case IR_OP_LOAD:
+  case IR_OP_STORE:
+  case IR_OP_ADDRESS_OF:
+  case IR_OP_SELECT:
+  case IR_OP_CALL:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+static int ir_unroll_annotated_parse_increment(const IRFunction *function,
+                                               size_t body_start,
+                                               size_t body_end,
+                                               const char *counter_symbol,
+                                               size_t *increment_index,
+                                               size_t *producer_index_out,
+                                               long long *step_out) {
+  *producer_index_out = (size_t)-1;
+  for (size_t i = body_end; i > body_start;) {
+    i--;
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op == IR_OP_NOP) continue;
+    if (in->op == IR_OP_BINARY && !in->is_float && in->text &&
+        strcmp(in->text, "+") == 0 && in->dest.kind == IR_OPERAND_SYMBOL &&
+        in->dest.name && strcmp(in->dest.name, counter_symbol) == 0 &&
+        in->lhs.kind == IR_OPERAND_SYMBOL && in->lhs.name &&
+        strcmp(in->lhs.name, counter_symbol) == 0 &&
+        in->rhs.kind == IR_OPERAND_INT && in->rhs.int_value > 0) {
+      *increment_index = i;
+      *step_out = in->rhs.int_value;
+      return 1;
+    }
+    if (in->op == IR_OP_ASSIGN && in->dest.kind == IR_OPERAND_SYMBOL &&
+        in->dest.name && strcmp(in->dest.name, counter_symbol) == 0 &&
+        in->lhs.kind == IR_OPERAND_TEMP && in->lhs.name) {
+      size_t producer_index = 0;
+      if (!ir_find_last_writer_before(function, i, IR_OPERAND_TEMP,
+                                      in->lhs.name, &producer_index) ||
+          producer_index < body_start) {
+        return 0;
+      }
+      const IRInstruction *producer = &function->instructions[producer_index];
+      if (producer->op != IR_OP_BINARY || producer->is_float ||
+          !producer->text || strcmp(producer->text, "+") != 0) {
+        return 0;
+      }
+      if (producer->lhs.kind == IR_OPERAND_SYMBOL && producer->lhs.name &&
+          strcmp(producer->lhs.name, counter_symbol) == 0 &&
+          producer->rhs.kind == IR_OPERAND_INT &&
+          producer->rhs.int_value > 0) {
+        *increment_index = i;
+        *producer_index_out = producer_index;
+        *step_out = producer->rhs.int_value;
+        return 1;
+      }
+      return 0;
+    }
+    return 0;
+  }
+  return 0;
+}
+
+static int ir_unroll_annotated_append_clone(IRInstructionVector *vector,
+                                            const IRInstruction *source) {
+  IRInstruction cloned = {0};
+  if (!ir_clone_instruction_plain(source, &cloned) ||
+      !ir_instruction_vector_append_move(vector, &cloned)) {
+    ir_instruction_destroy_storage(&cloned);
+    return 0;
+  }
+  return 1;
+}
+
+static int ir_unroll_annotated_try_marker(IRFunction *function,
+                                          size_t marker_index, int factor,
+                                          int *changed) {
+  size_t header_index = 0;
+  if (!ir_find_next_non_nop(function, marker_index + 1, &header_index)) {
+    return 1;
+  }
+  const IRInstruction *header = &function->instructions[header_index];
+  if (header->op != IR_OP_LABEL || !header->text) {
+    return 1;
+  }
+  const char *header_label = header->text;
+
+  size_t compare_index = 0;
+  if (!ir_find_next_non_nop(function, header_index + 1, &compare_index)) {
+    return 1;
+  }
+  const IRInstruction *compare = &function->instructions[compare_index];
+  if (compare->op != IR_OP_BINARY || compare->is_float || !compare->text ||
+      (strcmp(compare->text, "<") != 0 && strcmp(compare->text, "<=") != 0) ||
+      compare->dest.kind != IR_OPERAND_TEMP || !compare->dest.name ||
+      compare->lhs.kind != IR_OPERAND_SYMBOL || !compare->lhs.name) {
+    return 1;
+  }
+  const char *counter_symbol = compare->lhs.name;
+  const IROperand *limit = &compare->rhs;
+  if (limit->kind != IR_OPERAND_INT && limit->kind != IR_OPERAND_SYMBOL &&
+      limit->kind != IR_OPERAND_TEMP) {
+    return 1;
+  }
+
+  size_t branch_index = 0;
+  if (!ir_find_next_non_nop(function, compare_index + 1, &branch_index)) {
+    return 1;
+  }
+  const IRInstruction *branch = &function->instructions[branch_index];
+  if (branch->op != IR_OP_BRANCH_ZERO || !branch->text ||
+      branch->lhs.kind != IR_OPERAND_TEMP || !branch->lhs.name ||
+      strcmp(branch->lhs.name, compare->dest.name) != 0) {
+    return 1;
+  }
+
+  size_t jump_index = (size_t)-1;
+  for (size_t j = branch_index + 1; j < function->instruction_count; j++) {
+    const IRInstruction *probe = &function->instructions[j];
+    if (probe->op == IR_OP_JUMP && probe->text &&
+        strcmp(probe->text, header_label) == 0) {
+      jump_index = j;
+      break;
+    }
+    if (!ir_unroll_annotated_body_op_safe(probe)) {
+      return 1;
+    }
+  }
+  if (jump_index == (size_t)-1) {
+    return 1;
+  }
+
+  size_t body_start = branch_index + 1;
+  size_t increment_index = 0;
+  size_t producer_index = (size_t)-1;
+  long long step = 0;
+  if (!ir_unroll_annotated_parse_increment(function, body_start, jump_index,
+                                           counter_symbol, &increment_index,
+                                           &producer_index, &step)) {
+    return 1;
+  }
+  (void)producer_index;
+
+  /* The counter may be written only by the increment; a named limit must be
+   * loop-invariant. */
+  for (size_t j = body_start; j < jump_index; j++) {
+    if (j == increment_index) continue;
+    const IRInstruction *in = &function->instructions[j];
+    if (in->op == IR_OP_NOP || in->op == IR_OP_STORE) continue;
+    if (in->dest.kind == IR_OPERAND_SYMBOL && in->dest.name &&
+        strcmp(in->dest.name, counter_symbol) == 0) {
+      return 1;
+    }
+    if ((limit->kind == IR_OPERAND_SYMBOL || limit->kind == IR_OPERAND_TEMP) &&
+        in->dest.kind == limit->kind && in->dest.name && limit->name &&
+        strcmp(in->dest.name, limit->name) == 0) {
+      return 1;
+    }
+  }
+
+  long long lead = step * (long long)(factor - 1);
+
+  IRInstructionVector vector = {0};
+  for (size_t i = 0; i < header_index; i++) {
+    if (i == marker_index) continue; /* consume the marker */
+    if (!ir_unroll_annotated_append_clone(&vector, &function->instructions[i]))
+      goto fail;
+  }
+
+  char main_label[64];
+  char guard_add[64];
+  char guard_cmp[64];
+  snprintf(main_label, sizeof(main_label), "ir_unroll_main_%zu", marker_index);
+  snprintf(guard_add, sizeof(guard_add), ".unroll%zu_g0", marker_index);
+  snprintf(guard_cmp, sizeof(guard_cmp), ".unroll%zu_g1", marker_index);
+
+  {
+    IRInstruction label = {0};
+    label.op = IR_OP_LABEL;
+    label.location = header->location;
+    label.text = mettle_strdup(main_label);
+    if (!label.text || !ir_instruction_vector_append_move(&vector, &label)) {
+      ir_instruction_destroy_storage(&label);
+      goto fail;
+    }
+  }
+  {
+    IRInstruction add = {0};
+    add.op = IR_OP_BINARY;
+    add.location = header->location;
+    add.text = mettle_strdup("+");
+    add.dest = ir_operand_temp(guard_add);
+    add.lhs = ir_operand_symbol(counter_symbol);
+    add.rhs = ir_operand_int(lead);
+    if (!add.text || !add.dest.name || !add.lhs.name ||
+        !ir_instruction_vector_append_move(&vector, &add)) {
+      ir_instruction_destroy_storage(&add);
+      goto fail;
+    }
+  }
+  {
+    IRInstruction cmp = {0};
+    cmp.op = IR_OP_BINARY;
+    cmp.location = header->location;
+    cmp.text = mettle_strdup(compare->text);
+    cmp.dest = ir_operand_temp(guard_cmp);
+    cmp.lhs = ir_operand_temp(guard_add);
+    cmp.rhs = limit->kind == IR_OPERAND_INT
+                  ? ir_operand_int(limit->int_value)
+                  : (limit->kind == IR_OPERAND_SYMBOL
+                         ? ir_operand_symbol(limit->name)
+                         : ir_operand_temp(limit->name));
+    if (!cmp.text || !cmp.dest.name || !cmp.lhs.name ||
+        (limit->kind != IR_OPERAND_INT && !cmp.rhs.name) ||
+        !ir_instruction_vector_append_move(&vector, &cmp)) {
+      ir_instruction_destroy_storage(&cmp);
+      goto fail;
+    }
+  }
+  {
+    IRInstruction guard = {0};
+    guard.op = IR_OP_BRANCH_ZERO;
+    guard.location = header->location;
+    guard.text = mettle_strdup(header_label);
+    guard.lhs = ir_operand_temp(guard_cmp);
+    if (!guard.text || !guard.lhs.name ||
+        !ir_instruction_vector_append_move(&vector, &guard)) {
+      ir_instruction_destroy_storage(&guard);
+      goto fail;
+    }
+  }
+
+  {
+    IrUnrollTempSet private_temps = {0};
+    if (!ir_unroll_collect_private_temps(function, body_start, jump_index,
+                                         &private_temps)) {
+      ir_unroll_temp_set_destroy(&private_temps);
+      goto fail;
+    }
+    for (int copy = 0; copy < factor; copy++) {
+      for (size_t b = body_start; b < jump_index; b++) {
+        const IRInstruction *in = &function->instructions[b];
+        if (in->op == IR_OP_NOP) continue;
+        IRInstruction cloned = {0};
+        if (!ir_clone_instruction_plain(in, &cloned) ||
+            !ir_unroll_rename_copy_temps(
+                &cloned, &private_temps,
+                (long long)marker_index * 16 + copy) ||
+            !ir_instruction_vector_append_move(&vector, &cloned)) {
+          ir_instruction_destroy_storage(&cloned);
+          ir_unroll_temp_set_destroy(&private_temps);
+          goto fail;
+        }
+      }
+    }
+    ir_unroll_temp_set_destroy(&private_temps);
+  }
+
+  {
+    IRInstruction back = {0};
+    back.op = IR_OP_JUMP;
+    back.location = header->location;
+    back.text = mettle_strdup(main_label);
+    if (!back.text || !ir_instruction_vector_append_move(&vector, &back)) {
+      ir_instruction_destroy_storage(&back);
+      goto fail;
+    }
+  }
+
+  for (size_t i = header_index; i < function->instruction_count; i++) {
+    if (!ir_unroll_annotated_append_clone(&vector, &function->instructions[i]))
+      goto fail;
+  }
+
+  if (!ir_function_replace_instructions(function, &vector)) {
+    goto fail;
+  }
+  *changed = 1;
+  return 1;
+
+fail:
+  ir_instruction_vector_destroy(&vector);
+  return 0;
+}
+
+int ir_unroll_annotated_loops_pass(IRFunction *function, int *changed) {
+  if (!function || !changed) {
+    return 0;
+  }
+  size_t prefix_len = strlen(IR_UNROLL_MARKER_PREFIX);
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op != IR_OP_NOP || !in->text ||
+        strncmp(in->text, IR_UNROLL_MARKER_PREFIX, prefix_len) != 0) {
+      continue;
+    }
+    int factor = atoi(in->text + prefix_len);
+    if (factor < 2 || factor > 16) {
+      continue;
+    }
+    int fired = 0;
+    if (!ir_unroll_annotated_try_marker(function, i, factor, &fired)) {
+      return 0;
+    }
+    if (fired) {
+      /* Indices shifted; the fixpoint driver reruns this pass for any
+       * remaining markers. */
+      *changed = 1;
+      return 1;
+    }
+  }
+  return 1;
+}

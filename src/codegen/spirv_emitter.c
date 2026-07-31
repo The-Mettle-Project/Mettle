@@ -42,6 +42,7 @@ enum {
   Op_ExtInst = 12,
   Op_MemoryModel = 14,
   Op_EntryPoint = 15,
+  Op_ExecutionMode = 16,
   Op_Capability = 17,
   Op_TypeVoid = 19,
   Op_TypeBool = 20,
@@ -269,7 +270,8 @@ typedef struct {
 } CacheEnt;
 
 typedef struct {
-  Wb caps, extimports, memmodel, entrypoints, decorations, typesconsts, functions;
+  Wb caps, extimports, memmodel, entrypoints, execmodes, decorations,
+      typesconsts, functions;
   uint32_t next_id;
   CacheEnt *cache; /* types + constants + pointer types, keyed by string */
   size_t ncache, capcache;
@@ -895,6 +897,14 @@ static SpvDesc call_result_desc(SpvFn *fn, const IRInstruction *in) {
   } else if (intrinsic == MTLC_INTRINSIC_GPU_F32_TO_F16_BITS) {
     r.kind = MTLC_TYPE_UINT32;
     r.is_unsigned = 1;
+  } else if (intrinsic == MTLC_INTRINSIC_GPU_F32_FROM_BITS) {
+    r.kind = MTLC_TYPE_FLOAT32;
+  } else if (intrinsic == MTLC_INTRINSIC_GPU_F32_TO_BITS ||
+             intrinsic == MTLC_INTRINSIC_GPU_DP4A_U32) {
+    r.kind = MTLC_TYPE_UINT32;
+    r.is_unsigned = 1;
+  } else if (intrinsic == MTLC_INTRINSIC_GPU_DP4A_S32) {
+    r.kind = MTLC_TYPE_INT32;
   } else if (is_math_intrinsic(intrinsic)) {
     r.kind = MTLC_TYPE_FLOAT32;
   } else if (is_atomic_intrinsic(intrinsic)) {
@@ -1483,6 +1493,71 @@ static void emit_call(SpvFn *fn, const IRInstruction *in) {
     uint32_t r = new_id(m);
     emitv(&m->functions, Op_UConvert, 3, u32, r, b16);
     if (in->dest.name) store_name(fn, in->dest.name, r);
+    return;
+  }
+  if (intrinsic == MTLC_INTRINSIC_GPU_F32_FROM_BITS &&
+      in->argument_count >= 1) {
+    uint32_t a = materialize(fn, &in->arguments[0], MTLC_TYPE_UINT32);
+    uint32_t f32 = type_float(m, 32);
+    uint32_t r = new_id(m);
+    emitv(&m->functions, Op_Bitcast, 3, f32, r, a);
+    if (in->dest.name) store_name(fn, in->dest.name, r);
+    return;
+  }
+  if (intrinsic == MTLC_INTRINSIC_GPU_F32_TO_BITS &&
+      in->argument_count >= 1) {
+    uint32_t a = materialize(fn, &in->arguments[0], MTLC_TYPE_FLOAT32);
+    uint32_t u32 = type_int(m, 32);
+    uint32_t r = new_id(m);
+    emitv(&m->functions, Op_Bitcast, 3, u32, r, a);
+    if (in->dest.name) store_name(fn, in->dest.name, r);
+    return;
+  }
+  if ((intrinsic == MTLC_INTRINSIC_GPU_DP4A_U32 ||
+       intrinsic == MTLC_INTRINSIC_GPU_DP4A_S32) &&
+      in->argument_count >= 3) {
+    /* No portable SPIR-V 1.0/OpenCL dot-product capability: replay the exact
+     * semantics as four byte extractions, multiplies, and adds. Unsigned bytes
+     * mask; signed bytes sign-extend via shift-left + arithmetic shift-right. */
+    int is_signed = intrinsic == MTLC_INTRINSIC_GPU_DP4A_S32;
+    MtlcTypeKind kind = is_signed ? MTLC_TYPE_INT32 : MTLC_TYPE_UINT32;
+    uint32_t a = materialize(fn, &in->arguments[0], kind);
+    uint32_t b = materialize(fn, &in->arguments[1], kind);
+    uint32_t acc = materialize(fn, &in->arguments[2], kind);
+    uint32_t i32 = type_int(m, 32);
+    for (unsigned byte = 0; byte < 4; byte++) {
+      uint32_t ea;
+      uint32_t eb;
+      if (is_signed) {
+        uint32_t left = const_u32(m, 24u - byte * 8u);
+        uint32_t right = const_u32(m, 24u);
+        uint32_t la = new_id(m);
+        emitv(&m->functions, Op_ShiftLeftLogical, 4, i32, la, a, left);
+        ea = new_id(m);
+        emitv(&m->functions, Op_ShiftRightArithmetic, 4, i32, ea, la, right);
+        uint32_t lb = new_id(m);
+        emitv(&m->functions, Op_ShiftLeftLogical, 4, i32, lb, b, left);
+        eb = new_id(m);
+        emitv(&m->functions, Op_ShiftRightArithmetic, 4, i32, eb, lb, right);
+      } else {
+        uint32_t shift = const_u32(m, byte * 8u);
+        uint32_t mask = const_u32(m, 0xFFu);
+        uint32_t sa = new_id(m);
+        emitv(&m->functions, Op_ShiftRightLogical, 4, i32, sa, a, shift);
+        ea = new_id(m);
+        emitv(&m->functions, Op_BitwiseAnd, 4, i32, ea, sa, mask);
+        uint32_t sb = new_id(m);
+        emitv(&m->functions, Op_ShiftRightLogical, 4, i32, sb, b, shift);
+        eb = new_id(m);
+        emitv(&m->functions, Op_BitwiseAnd, 4, i32, eb, sb, mask);
+      }
+      uint32_t product = new_id(m);
+      emitv(&m->functions, Op_IMul, 4, i32, product, ea, eb);
+      uint32_t next = new_id(m);
+      emitv(&m->functions, Op_IAdd, 4, i32, next, acc, product);
+      acc = next;
+    }
+    if (in->dest.name) store_name(fn, in->dest.name, acc);
     return;
   }
   if (is_math_intrinsic(intrinsic) && in->argument_count >= 1) {
@@ -2224,6 +2299,15 @@ static uint32_t emit_device_function(SpvMod *m, IRFunction *func,
     }
     emit_ops(&m->entrypoints, Op_EntryPoint, &ep);
     wb_free(&ep);
+    if (func->kernel_block[0] > 0) {
+      /* `kernel(block = ...)`: the required launch shape as the LocalSize
+       * (reqd_work_group_size) execution mode, so an OpenCL consumer rejects
+       * a mismatched enqueue. */
+      emitv(&m->execmodes, Op_ExecutionMode, 5, func_id,
+            17u /* LocalSize */, (uint32_t)func->kernel_block[0],
+            (uint32_t)(func->kernel_block[1] > 0 ? func->kernel_block[1] : 1),
+            (uint32_t)(func->kernel_block[2] > 0 ? func->kernel_block[2] : 1));
+    }
   }
 
   for (size_t i = 0; i < fn.nbinds; i++) free(fn.binds[i].name);
@@ -2355,6 +2439,7 @@ int spirv_emit_program(IRProgram *program, CodeGenerator *generator, FILE *out,
   write_section(out, &m.extimports);
   write_section(out, &m.memmodel);
   write_section(out, &m.entrypoints);
+  write_section(out, &m.execmodes);
   write_section(out, &m.decorations);
   write_section(out, &m.typesconsts);
   write_section(out, &m.functions);
@@ -2364,6 +2449,7 @@ cleanup:
   wb_free(&m.extimports);
   wb_free(&m.memmodel);
   wb_free(&m.entrypoints);
+  wb_free(&m.execmodes);
   wb_free(&m.decorations);
   wb_free(&m.typesconsts);
   wb_free(&m.functions);

@@ -269,6 +269,7 @@ typedef struct {
   X(FUSE_ROTATE_ADD, "fuse_rotate_add")                                      \
   X(STRENGTH_REDUCE_ROTATE_LOOPS, "strength_reduce_rotate_loops")            \
   X(UNROLL_SMALL_CONST_BOUND_LOOPS, "unroll_small_const_bound_loops")         \
+  X(UNROLL_ANNOTATED_LOOPS, "unroll_annotated_loops")                         \
   X(FOLD_POPCOUNT_BYTE_LOOP, "fold_popcount_byte_loop")                      \
   X(FUSE_POPCOUNT_BUFFER_LOOP, "fuse_popcount_buffer_loop")                  \
   X(COLLATZ_ODD_STEP_FOLD, "collatz_odd_step_fold")                          \
@@ -461,6 +462,7 @@ int ir_loop_body_has_nested_while(IRFunction *function, size_t start,
                                          size_t end);
 int ir_loop_body_opcode_is_unroll_safe(IROpcode op);
 int ir_lower_bound_i32_pass(IRFunction *function, int *changed);
+int ir_unroll_annotated_loops_pass(IRFunction *function, int *changed);
 
 char *ir_make_inline_name(const char *prefix, const char *kind,
                                  const char *base);

@@ -69,6 +69,10 @@ static const IRIntrinsicName g_ir_intrinsics[] = {
     {"expf", MTLC_INTRINSIC_GPU_EXP_F32, 1},
     {"h2f", MTLC_INTRINSIC_GPU_F16_BITS_TO_F32, 1},
     {"f2h", MTLC_INTRINSIC_GPU_F32_TO_F16_BITS, 1},
+    {"f32_from_bits", MTLC_INTRINSIC_GPU_F32_FROM_BITS, 1},
+    {"bits_from_f32", MTLC_INTRINSIC_GPU_F32_TO_BITS, 1},
+    {"dp4a_u32", MTLC_INTRINSIC_GPU_DP4A_U32, 3},
+    {"dp4a_s32", MTLC_INTRINSIC_GPU_DP4A_S32, 3},
     {"atomic_min_u32", MTLC_INTRINSIC_GPU_ATOMIC_MIN_U32, 3},
     {"atomic_min_u64", MTLC_INTRINSIC_GPU_ATOMIC_MIN_U64, 3},
     {"atomic_add_u32", MTLC_INTRINSIC_GPU_ATOMIC_ADD_U32, 3},
@@ -4015,6 +4019,14 @@ enum {
 typedef struct {
   const char *name; /* borrowed from IR */
   unsigned char rank;
+  /* Lane decomposition: the value is W*s + l where s is subgroup-uniform,
+   * W is the subgroup width, and l is the caller's lane (0 <= l < W), so
+   * dividing it by W yields a subgroup-uniform value. thread.x has that shape
+   * under the documented launch precondition (a one-dimensional block, or a
+   * block x-extent that is a multiple of the subgroup width). */
+  unsigned char lane_affine;
+  /* The value is the subgroup width itself (a subgroup_size() result). */
+  unsigned char subgroup_width;
 } IRGpuUniformSlot;
 
 typedef struct {
@@ -4099,6 +4111,124 @@ static unsigned char ir_gpu_uniform_operand(const IRGpuUniformMap *map,
   }
 }
 
+static const IRGpuUniformSlot *ir_gpu_uniform_operand_slot(
+    const IRGpuUniformMap *map, const IROperand *operand) {
+  if (!operand ||
+      (operand->kind != IR_OPERAND_TEMP && operand->kind != IR_OPERAND_SYMBOL))
+    return NULL;
+  return ir_gpu_uniform_slot((IRGpuUniformMap *)map, operand->name, 0);
+}
+
+/* A cast keeps a lane decomposition only when it is value-preserving for the
+ * small nonnegative id/width magnitudes involved: any 32-bit-or-wider integer
+ * target qualifies; a narrowing or float cast does not (a truncated or
+ * rounded id no longer floors to its subgroup index). The frontend stamps the
+ * target type name in text; builder-created casts carry value_type instead. */
+static int ir_gpu_cast_preserves_lane_shape(const IRInstruction *instruction) {
+  if (instruction->op != IR_OP_CAST || instruction->dest.float_bits != 0)
+    return 0;
+  if (instruction->text) {
+    return strcmp(instruction->text, "int32") == 0 ||
+           strcmp(instruction->text, "uint32") == 0 ||
+           strcmp(instruction->text, "int64") == 0 ||
+           strcmp(instruction->text, "uint64") == 0;
+  }
+  if (!instruction->value_type) return 0;
+  switch (instruction->value_type->kind) {
+  case MTLC_TYPE_INT32:
+  case MTLC_TYPE_UINT32:
+  case MTLC_TYPE_INT64:
+  case MTLC_TYPE_UINT64:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+/* Downward fixpoint over the lane-shape flags: assume every defined name has
+ * both shapes, then strip the assumption wherever some reachable definition
+ * fails to produce it. DECLARE_LOCAL is a binding, not a value definition, and
+ * is skipped exactly as the rank fixpoint skips it. */
+static void ir_gpu_uniform_map_mark_lane_shapes(const IRFunction *function,
+                                                IRGpuUniformMap *map) {
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    if (!ir_gpu_instruction_defines_dest(instruction) ||
+        instruction->op == IR_OP_DECLARE_LOCAL)
+      continue;
+    IRGpuUniformSlot *slot = ir_gpu_uniform_slot(map, instruction->dest.name, 0);
+    if (!slot) continue;
+    slot->lane_affine = 1;
+    slot->subgroup_width = 1;
+  }
+  int changed = 1;
+  while (changed) {
+    changed = 0;
+    for (size_t i = 0; i < function->instruction_count; i++) {
+      const IRInstruction *instruction = &function->instructions[i];
+      if (!ir_gpu_instruction_defines_dest(instruction) ||
+          instruction->op == IR_OP_DECLARE_LOCAL)
+        continue;
+      IRGpuUniformSlot *slot =
+          ir_gpu_uniform_slot(map, instruction->dest.name, 0);
+      if (!slot || (!slot->lane_affine && !slot->subgroup_width)) continue;
+      unsigned char def_lane = 0;
+      unsigned char def_width = 0;
+      if (instruction->op == IR_OP_CALL) {
+        if (instruction->intrinsic == MTLC_INTRINSIC_GPU_LOCAL_ID_X)
+          def_lane = 1;
+        else if (instruction->intrinsic == MTLC_INTRINSIC_GPU_SUBGROUP_SIZE)
+          def_width = 1;
+      } else if (instruction->op == IR_OP_ASSIGN ||
+                 ir_gpu_cast_preserves_lane_shape(instruction)) {
+        const IRGpuUniformSlot *source =
+            ir_gpu_uniform_operand_slot(map, &instruction->lhs);
+        if (source) {
+          def_lane = source->lane_affine;
+          def_width = source->subgroup_width;
+        }
+      }
+      if (slot->lane_affine && !def_lane) {
+        slot->lane_affine = 0;
+        changed = 1;
+      }
+      if (slot->subgroup_width && !def_width) {
+        slot->subgroup_width = 0;
+        changed = 1;
+      }
+    }
+  }
+}
+
+/* thread.x / 32, thread.x >> 5, and thread.x / subgroup_size() name the warp
+ * (subgroup) a work-item belongs to: every lane of a subgroup computes the
+ * same quotient, so the result ranks subgroup-uniform rather than varying.
+ * The literal spellings assume the 32-lane PTX subgroup width; the
+ * subgroup_size() spelling is the portable form. Integer division only --
+ * float division does not floor away the lane term. */
+static int ir_gpu_binary_is_subgroup_quotient(const IRGpuUniformMap *map,
+                                              const IRInstruction *instruction) {
+  if (instruction->op != IR_OP_BINARY || instruction->is_float ||
+      !instruction->text)
+    return 0;
+  int is_div = strcmp(instruction->text, "/") == 0;
+  int is_shr = strcmp(instruction->text, ">>") == 0;
+  if (!is_div && !is_shr) return 0;
+  const IRGpuUniformSlot *lhs =
+      ir_gpu_uniform_operand_slot(map, &instruction->lhs);
+  if (!lhs || !lhs->lane_affine) return 0;
+  if (instruction->rhs.kind == IR_OPERAND_INT) {
+    long long divisor = instruction->rhs.int_value;
+    return is_div ? divisor == 32 : divisor == 5;
+  }
+  if (is_div) {
+    const IRGpuUniformSlot *rhs =
+        ir_gpu_uniform_operand_slot(map, &instruction->rhs);
+    return rhs && rhs->subgroup_width;
+  }
+  return 0;
+}
+
 static unsigned char ir_gpu_uniform_arguments(const IRGpuUniformMap *map,
                                               const IRInstruction *instruction) {
   unsigned char rank = IR_GPU_UNIFORM_WORKGROUP;
@@ -4158,6 +4288,10 @@ static unsigned char ir_gpu_intrinsic_result_uniformity(
   case MTLC_INTRINSIC_GPU_EXP_F32:
   case MTLC_INTRINSIC_GPU_F16_BITS_TO_F32:
   case MTLC_INTRINSIC_GPU_F32_TO_F16_BITS:
+  case MTLC_INTRINSIC_GPU_F32_FROM_BITS:
+  case MTLC_INTRINSIC_GPU_F32_TO_BITS:
+  case MTLC_INTRINSIC_GPU_DP4A_U32:
+  case MTLC_INTRINSIC_GPU_DP4A_S32:
     return ir_gpu_uniform_arguments(map, instruction);
   case MTLC_INTRINSIC_GPU_WORKGROUP_BARRIER:
     return IR_GPU_UNIFORM_WORKGROUP;
@@ -4188,6 +4322,10 @@ static unsigned char ir_gpu_instruction_result_uniformity(
   case IR_OP_CAST:
     return lhs;
   case IR_OP_BINARY:
+    if (ir_gpu_binary_is_subgroup_quotient(map, instruction)) {
+      return IR_GPU_UNIFORM_SUBGROUP;
+    }
+    return lhs > rhs ? lhs : rhs;
   case IR_OP_SELECT:
     return lhs > rhs ? lhs : rhs;
   case IR_OP_LOAD:
@@ -4237,6 +4375,7 @@ static int ir_gpu_uniform_map_build(const IRFunction *function,
       goto fail;
     }
   }
+  ir_gpu_uniform_map_mark_lane_shapes(function, map);
 
   /* Mutable locals and loops need a small monotone fixed point. Each name can
    * rise at most twice, so instruction_count+1 rounds is a hard upper bound. */

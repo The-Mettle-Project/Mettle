@@ -52,6 +52,14 @@ typedef enum {
   MTLC_INTRINSIC_GPU_EXP_F32,
   MTLC_INTRINSIC_GPU_F16_BITS_TO_F32,
   MTLC_INTRINSIC_GPU_F32_TO_F16_BITS,
+  /* Bit reinterpretation between an f32 value and its IEEE-754 encoding. */
+  MTLC_INTRINSIC_GPU_F32_FROM_BITS,
+  MTLC_INTRINSIC_GPU_F32_TO_BITS,
+  /* Four-way packed-byte dot product with 32-bit accumulate:
+   * dest = a0*b0 + a1*b1 + a2*b2 + a3*b3 + c over the four bytes of a and b,
+   * unsigned (U32) or signed (S32) byte interpretation. */
+  MTLC_INTRINSIC_GPU_DP4A_U32,
+  MTLC_INTRINSIC_GPU_DP4A_S32,
   MTLC_INTRINSIC_GPU_ATOMIC_MIN_U32,
   MTLC_INTRINSIC_GPU_ATOMIC_MIN_U64,
   MTLC_INTRINSIC_GPU_ATOMIC_ADD_U32,

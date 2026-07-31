@@ -121,6 +121,9 @@ static const IROptScheduledPass g_ir_fixpoint_passes[] = {
     IR_OPT_PASS_WHEN_ALL(UNROLL_SMALL_CONST_BOUND_LOOPS,
                          ir_unroll_small_const_bound_loops_pass,
                          IR_OPT_LABEL_JUMP),
+    IR_OPT_PASS_WHEN_ALL(UNROLL_ANNOTATED_LOOPS,
+                         ir_unroll_annotated_loops_pass,
+                         IR_OPT_LABEL_JUMP),
     IR_OPT_PASS_WHEN_ALL(FOLD_POPCOUNT_BYTE_LOOP,
                          ir_fold_popcount_byte_loop_pass,
                          IR_OPT_LABEL_JUMP | IR_OPT_FEATURE_BRANCH_ZERO |
@@ -210,6 +213,9 @@ static const IROptFixpointStage g_ir_fixpoint_stage = {
  * intentionally target-neutral: no vector opcodes, rotate fusion, host memory
  * intrinsics, prefetch, or target-specific cost model. */
 static const IROptScheduledPass g_ir_portable_fixpoint_passes[] = {
+    IR_OPT_PASS_WHEN_ALL(UNROLL_ANNOTATED_LOOPS,
+                         ir_unroll_annotated_loops_pass,
+                         IR_OPT_LABEL_JUMP),
     IR_OPT_PASS_ALWAYS(COPY_AND_CONSTANT_PROPAGATION,
                        ir_copy_and_constant_propagation_pass),
     IR_OPT_PASS_ALWAYS(FUSE_TENSOR_MMA_CHAINS,
@@ -464,6 +470,11 @@ static int ir_optimize_portable_program_pipeline(
     fprintf(stderr, "GPU optimization eligibility failed: %s\n",
             graph_error ? graph_error : "invalid device module");
     free(graph_error);
+    /* That message is the user diagnostic (uniformity violation, recursive
+     * device call graph, ...). Marking it a user error keeps the driver from
+     * escalating to an internal-compiler-error report attributed to whatever
+     * function happened to hold the compiler context last. */
+    ir_optimize_note_user_error();
     ir_verify_end_program();
     ir_function_index_reset();
     return 0;

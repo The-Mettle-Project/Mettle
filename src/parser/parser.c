@@ -554,6 +554,7 @@ typedef struct {
   int is_noalloc;         // `@noalloc`
   int is_test;            // `@test`: compile-time unit test (mettle test)
   int simd_mode; // SimdAttr from `@simd` / `@simd!` (SIMD_ATTR_NONE if absent)
+  int unroll_factor; // `@unroll(n)` on a loop; 0 if absent
 } ParsedDecorators;
 
 // Consume a run of `@ident[!]` decorators into `out`. Assumes the current token
@@ -569,6 +570,7 @@ static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
   out->is_noalloc = 0;
   out->is_test = 0;
   out->simd_mode = SIMD_ATTR_NONE;
+  out->unroll_factor = 0;
 
   while (parser->current_token.type == TOKEN_AT) {
     parser_advance(parser); // consume '@'
@@ -629,10 +631,37 @@ static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
         out->simd_mode = SIMD_ATTR_CONTRACT;
         parser_advance(parser); // consume '!'
       }
+    } else if (strcmp(name, "unroll") == 0) {
+      if (out->unroll_factor) {
+        parser_set_error(parser, "Duplicate '@unroll' decorator");
+        return 0;
+      }
+      parser_advance(parser); // consume 'unroll'
+      if (!parser_expect(parser, TOKEN_LPAREN)) {
+        parser_set_error(parser, "Expected '(factor)' after '@unroll'");
+        return 0;
+      }
+      if (parser->current_token.type != TOKEN_NUMBER ||
+          strchr(parser->current_token.value, '.')) {
+        parser_set_error(parser,
+                         "Expected an integer unroll factor in '@unroll(n)'");
+        return 0;
+      }
+      long long factor = strtoll(parser->current_token.value, NULL, 0);
+      if (factor < 2 || factor > 16) {
+        parser_set_error(parser, "'@unroll' factor must be between 2 and 16");
+        return 0;
+      }
+      out->unroll_factor = (int)factor;
+      parser_advance(parser);
+      if (!parser_expect(parser, TOKEN_RPAREN)) {
+        return 0;
+      }
     } else {
       parser_set_error(parser,
                        "Unknown decorator after '@' (expected 'inline', "
-                       "'noinline', 'pure', 'noalloc', 'test', or 'simd')");
+                       "'noinline', 'pure', 'noalloc', 'test', 'simd', or "
+                       "'unroll')");
       return 0;
     }
   }
@@ -670,6 +699,12 @@ ASTNode *parser_parse_declaration(Parser *parser) {
     if (fd->is_extern) {
       parser_set_error(parser,
                        "Decorators cannot be applied to extern functions");
+      ast_destroy_node(decl);
+      return NULL;
+    }
+    if (decos.unroll_factor) {
+      parser_set_error(parser,
+                       "'@unroll' applies to a loop, not a function");
       ast_destroy_node(decl);
       return NULL;
     }
@@ -922,8 +957,9 @@ ASTNode *parser_parse_statement(Parser *parser) {
                        "to a function, not a loop");
       return NULL;
     }
-    if (decos.simd_mode == SIMD_ATTR_NONE) {
-      parser_set_error(parser, "Expected a '@simd' decorator before a loop");
+    if (decos.simd_mode == SIMD_ATTR_NONE && !decos.unroll_factor) {
+      parser_set_error(
+          parser, "Expected a '@simd' or '@unroll' decorator before a loop");
       return NULL;
     }
 
@@ -932,11 +968,14 @@ ASTNode *parser_parse_statement(Parser *parser) {
       return NULL;
     if (loop->type == AST_FOR_STATEMENT) {
       ((ForStatement *)loop->data)->simd_mode = decos.simd_mode;
+      ((ForStatement *)loop->data)->unroll_factor = decos.unroll_factor;
     } else if (loop->type == AST_WHILE_STATEMENT) {
       ((WhileStatement *)loop->data)->simd_mode = decos.simd_mode;
+      ((WhileStatement *)loop->data)->unroll_factor = decos.unroll_factor;
     } else {
-      parser_set_error(parser,
-                       "'@simd' must be applied to a 'for' or 'while' loop");
+      parser_set_error(
+          parser,
+          "'@simd' / '@unroll' must be applied to a 'for' or 'while' loop");
       ast_destroy_node(loop);
       return NULL;
     }
@@ -3335,6 +3374,69 @@ ASTNode *parser_parse_function_declaration(Parser *parser) {
   int is_kernel = parser->current_token.type == TOKEN_KERNEL;
   parser_advance(parser);
 
+  /* `kernel(block = 256)` / `kernel(block = (x, y, z))`: the launch block
+   * shape this kernel requires. Recorded on the declaration so the backends
+   * can stamp it into the module (.reqntid / LocalSize) and the launch is
+   * rejected by the driver instead of running with a garbage lane mapping. */
+  int kernel_block[3] = {0, 0, 0};
+  if (is_kernel && parser->current_token.type == TOKEN_LPAREN) {
+    parser_advance(parser);
+    if (parser->current_token.type != TOKEN_IDENTIFIER ||
+        strcmp(parser->current_token.value, "block") != 0) {
+      parser_set_error(parser,
+                       "Expected 'block' in kernel attribute list "
+                       "(kernel(block = N) or kernel(block = (x, y, z)))");
+      return NULL;
+    }
+    parser_advance(parser);
+    if (!parser_expect(parser, TOKEN_EQUALS)) {
+      return NULL;
+    }
+    int dims = 1;
+    int grouped = parser->current_token.type == TOKEN_LPAREN;
+    if (grouped) {
+      parser_advance(parser);
+      dims = 3;
+    }
+    long long product = 1;
+    for (int d = 0; d < dims; d++) {
+      if (d && !parser_expect(parser, TOKEN_COMMA)) {
+        return NULL;
+      }
+      if (parser->current_token.type != TOKEN_NUMBER ||
+          strchr(parser->current_token.value, '.')) {
+        parser_set_error(parser,
+                         "Kernel block dimensions must be positive integer "
+                         "literals");
+        return NULL;
+      }
+      long long value = strtoll(parser->current_token.value, NULL, 0);
+      if (value < 1 || value > 1024) {
+        parser_set_error(parser,
+                         "Kernel block dimension must be between 1 and 1024");
+        return NULL;
+      }
+      kernel_block[d] = (int)value;
+      product *= value;
+      parser_advance(parser);
+    }
+    if (grouped && !parser_expect(parser, TOKEN_RPAREN)) {
+      return NULL;
+    }
+    if (dims == 1) {
+      kernel_block[1] = 1;
+      kernel_block[2] = 1;
+    }
+    if (product > 1024) {
+      parser_set_error(parser,
+                       "Kernel block volume must not exceed 1024 work-items");
+      return NULL;
+    }
+    if (!parser_expect(parser, TOKEN_RPAREN)) {
+      return NULL;
+    }
+  }
+
   // Expect function name
   if (!parser_is_identifier_like(parser->current_token.type)) {
     parser_set_error(parser, "Expected function name after 'fn'");
@@ -3513,6 +3615,9 @@ ASTNode *parser_parse_function_declaration(Parser *parser) {
   if (func_decl && func_decl->data) {
     FunctionDeclaration *func_data = (FunctionDeclaration *)func_decl->data;
     func_data->is_kernel = is_kernel;
+    func_data->kernel_block[0] = kernel_block[0];
+    func_data->kernel_block[1] = kernel_block[1];
+    func_data->kernel_block[2] = kernel_block[2];
     if (link_name) {
       func_data->link_name = strdup(link_name);
       if (!func_data->link_name) {
@@ -4440,6 +4545,7 @@ ASTNode *parser_parse_while_statement(Parser *parser) {
   while_data->body = body;
   while_data->label = NULL;
   while_data->simd_mode = SIMD_ATTR_NONE;
+  while_data->unroll_factor = 0;
   while_node->data = while_data;
 
   ast_add_child(while_node, condition);
@@ -4632,6 +4738,7 @@ static ASTNode *parser_parse_dispatch_statement(Parser *parser) {
   ASTNode *block[3] = {NULL, NULL, NULL};
   ASTNode *shared = NULL;
   ASTNode *stream = NULL;
+  int stream_was_named = 0;
   ASTNode *args[64];
   size_t nargs = 0;
 
@@ -4704,7 +4811,10 @@ static ASTNode *parser_parse_dispatch_statement(Parser *parser) {
       if (option == 1) have_grid = 1;
       else if (option == 2) have_block = 1;
       else if (option == 3) have_shared = 1;
-      else have_stream = 1;
+      else {
+        have_stream = 1;
+        stream_was_named = 1;
+      }
 
       parser_advance(parser); // control name
       if (!parser_expect(parser, TOKEN_COLON)) DISP_FAIL();
@@ -4787,6 +4897,28 @@ static ASTNode *parser_parse_dispatch_statement(Parser *parser) {
   }
   if (!parser_expect(parser, TOKEN_RPAREN)) {
     DISP_FAIL();
+  }
+
+  /* `dispatch K[grid, block](args) on s;` -- enqueue on an explicit stream.
+   * Sugar over the named `stream:` control, so the compact form can overlap
+   * launches with transfers without spelling the full three-dimensional
+   * geometry. */
+  if (parser->current_token.type == TOKEN_IDENTIFIER &&
+      strcmp(parser->current_token.value, "on") == 0) {
+    if (stream_was_named) {
+      parser_set_error(parser,
+                       "Dispatch stream is already given by the named "
+                       "'stream:' control; drop one of the two");
+      DISP_FAIL();
+    }
+    parser_advance(parser); // consume 'on'
+    ast_destroy_node(stream);
+    stream = parser_parse_expression(parser);
+    if (!stream) {
+      if (!parser->has_error)
+        parser_set_error(parser, "Expected a stream expression after 'on'");
+      DISP_FAIL();
+    }
   }
 
   ASTNode *launch = ast_create_gpu_launch(kernel, grid, block, shared, stream,

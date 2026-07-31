@@ -1,0 +1,18 @@
+// `@unroll(n)` on a runtime-trip kernel inner loop: the strided matvec
+// accumulation the inference engine's decode is bound by.
+// Regression for inference-engine feature request 5.
+
+kernel(block = 256) matvec8(w: float32*, x: float32*, out: float32*,
+                            d: int32, n: int32) {
+  var row: int32 = block.x * 8 + thread.x / 32;
+  if (row >= d) { return; }
+  var lane: int32 = thread.x % 32;
+  var sum: float32 = 0.0;
+  var j: int32 = lane;
+  @unroll(4) while (j < n) {
+    sum = sum + w[row * n + j] * x[j];
+    j = j + 32;
+  }
+  var total: float32 = subgroup_reduce_add(sum);
+  if (lane == 0) { out[row] = total; }
+}
