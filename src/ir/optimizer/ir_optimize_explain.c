@@ -162,6 +162,12 @@ static void ir_explain_emit(const char *fmt, ...) {
   g_report_len += (size_t)needed;
 }
 
+/* Where the "where to start" plan goes, and whether it still owes the report a
+ * block. The plan ranks codegen results that only exist after the optimization
+ * report has been written, so it is rendered last and spliced back into place. */
+static MTLC_THREAD_LOCAL size_t g_plan_offset = 0;
+static MTLC_THREAD_LOCAL int g_plan_pending = 0;
+
 /* Digest stats collected while the sections render, for the one-paragraph
  * stderr summary that accompanies a file-diverted report. */
 static struct {
@@ -1956,9 +1962,30 @@ static size_t ir_explain_rank_fixes(int apply_filter, size_t *order,
   return shown;
 }
 
+/* A whole-function fallback, ready to print as a line of the plan. Built after
+ * codegen (that is when the eligibility gate has run), which is why the plan is
+ * rendered late and spliced back into the report at the point it belongs. */
+typedef struct {
+  char location[160];      /* "main (252 instrs)" */
+  char function_name[128]; /* the same function, for the JSON sidecar */
+  char why[224];           /* the gate's reason, and the loop it is about */
+  const char *fix;
+  size_t instructions_sort;
+} IRExplainBackendPlan;
+/* Two at most. A third repeats the same lesson and pushes out the loop work. */
+#define IR_EXPLAIN_BACKEND_PLAN_MAX 2
+static size_t ir_explain_collect_backend_plan(IRExplainBackendPlan *out);
+
 static void ir_explain_render_start_here(void) {
   size_t order[IR_EXPLAIN_START_MAX];
   size_t actionable = 0, missed = 0;
+
+  /* Whole-function fallbacks lead the plan. A loop remark is a prediction about
+   * one loop; a fallback is a measurement over a whole function that already
+   * happened, and it costs every value in that function a register. Ranking it
+   * under a per-loop heuristic would put the smaller number first. */
+  IRExplainBackendPlan backend_plan[IR_EXPLAIN_BACKEND_PLAN_MAX];
+  size_t backend_shown = ir_explain_collect_backend_plan(backend_plan);
 
   /* The same ranking, for tools. An editor showing a "what to fix" panel
    * should not have to re-derive the order from the remark list and guess at
@@ -1971,16 +1998,29 @@ static void ir_explain_render_start_here(void) {
     size_t whole =
         ir_explain_rank_fixes(0, order, all_sites, &all_missed, &all_actionable);
     ir_explain_json_raw("\"startHere\":[");
+    for (size_t i = 0; i < backend_shown; i++) {
+      ir_explain_json_raw("%s{\"kind\":\"backend\",\"fn\":", i ? "," : "");
+      ir_explain_json_str(backend_plan[i].function_name);
+      ir_explain_json_raw(",\"instructions\":%zu,\"why\":",
+                          backend_plan[i].instructions_sort);
+      ir_explain_json_str(backend_plan[i].why);
+      ir_explain_json_raw(",\"fix\":");
+      ir_explain_json_str(backend_plan[i].fix);
+      ir_explain_json_raw(",\"proven\":false}");
+    }
     for (size_t i = 0; i < whole; i++) {
       const IRExplainRemark *r = &g_remarks[order[i]];
-      ir_explain_json_raw("%s{\"fn\":", i ? "," : "");
+      ir_explain_json_raw("%s{\"kind\":\"remark\",\"fn\":",
+                          (i || backend_shown) ? "," : "");
       ir_explain_json_str(r->function_name);
       ir_explain_json_raw(",\"line\":%zu,\"code\":", r->line);
       ir_explain_json_str(r->code);
       ir_explain_json_raw(",\"fix\":");
       ir_explain_json_str(r->fix);
-      ir_explain_json_raw(",\"proven\":%s,\"depth\":%zu,\"sites\":%zu}",
-                          r->verified ? "true" : "false", r->depth,
+      ir_explain_json_raw(",\"proven\":%s,\"stillBlocked\":%s,\"depth\":%zu,"
+                          "\"sites\":%zu}",
+                          r->verified ? "true" : "false",
+                          r->partial ? "true" : "false", r->depth,
                           all_sites[i]);
     }
     ir_explain_json_raw("],");
@@ -1989,7 +2029,7 @@ static void ir_explain_render_start_here(void) {
   size_t sites[IR_EXPLAIN_START_MAX];
   size_t shown = ir_explain_rank_fixes(1, order, sites, &missed, &actionable);
 
-  if (shown == 0) {
+  if (shown == 0 && backend_shown == 0) {
     /* Silence is ambiguous: it could mean a clean file or a report that
      * forgot to say. One line, and only when there was something to miss. */
     if (missed > 0) {
@@ -2014,17 +2054,40 @@ static void ir_explain_render_start_here(void) {
       location_width = len;
     }
   }
+  for (size_t i = 0; i < backend_shown; i++) {
+    size_t len = strlen(backend_plan[i].location);
+    if (len > location_width) {
+      location_width = len;
+    }
+  }
 
   ir_explain_emit("  %swhere to start%s (%zu of %zu missed optimization%s "
                   "ha%s a fix; \"proven\" = applied to a clone and re-checked, "
                   "\"step 1\" = applied and the loop still needs more):\n",
                   clr(EXPLAIN_BOLD), clr(EXPLAIN_RESET), actionable, missed,
                   missed == 1 ? "" : "s", actionable == 1 ? "s" : "ve");
-  const IRExplainRemark *lead = &g_remarks[order[0]];
-  snprintf(g_digest.start_here, sizeof(g_digest.start_here), "%s:%zu  %s",
-           lead->function_name, lead->line, lead->fix);
-  g_digest.start_here_proven = lead->verified ? 1 : 0;
+  if (backend_shown > 0) {
+    snprintf(g_digest.start_here, sizeof(g_digest.start_here), "%s  %s",
+             backend_plan[0].location, backend_plan[0].fix);
+    g_digest.start_here_proven = 0;
+  } else {
+    const IRExplainRemark *lead = &g_remarks[order[0]];
+    snprintf(g_digest.start_here, sizeof(g_digest.start_here), "%s:%zu  %s",
+             lead->function_name, lead->line, lead->fix);
+    g_digest.start_here_proven = lead->verified ? 1 : 0;
+  }
 
+  size_t rank = 0;
+  for (size_t i = 0; i < backend_shown; i++) {
+    char fix[200];
+    ir_explain_fit(backend_plan[i].fix, 84, fix, sizeof(fix));
+    ir_explain_emit("    %zu. %s%-6s%s %-*s  %s\n", ++rank, clr(EXPLAIN_RED),
+                    "spills", clr(EXPLAIN_RESET), (int)location_width,
+                    backend_plan[i].location, fix);
+    ir_explain_emit("       %s%-6s %-*s  %s%s\n", clr(EXPLAIN_DIM), "",
+                    (int)location_width, "", backend_plan[i].why,
+                    clr(EXPLAIN_RESET));
+  }
   for (size_t i = 0; i < shown; i++) {
     const IRExplainRemark *r = &g_remarks[order[i]];
     char fix[200];
@@ -2038,7 +2101,7 @@ static void ir_explain_render_start_here(void) {
     /* The caveat has to survive the truncation that trims the fix text, or the
      * plan reads as "do this and you are done" for a fix we know is partial. */
     const char *status = r->verified ? "proven" : (r->partial ? "step 1" : "");
-    ir_explain_emit("    %zu. %s%-6s%s %-*s  %s%s\n", i + 1,
+    ir_explain_emit("    %zu. %s%-6s%s %-*s  %s%s\n", ++rank,
                     clr(r->verified ? EXPLAIN_GREEN : EXPLAIN_DIM), status,
                     clr(EXPLAIN_RESET), (int)location_width, location[i], fix,
                     spread);
@@ -2585,7 +2648,11 @@ void ir_explain_flush(void) {
           ir_explain_remark_compare);
   }
   ir_explain_render_changes();
-  ir_explain_render_start_here();
+  /* The plan belongs here, and half of what it ranks does not exist yet: the
+   * eligibility gate runs during codegen, after this flush. Remember the spot
+   * and fill it in once the whole report is assembled. */
+  g_plan_offset = g_report_len;
+  g_plan_pending = 1;
 
   size_t json_remark_count = 0;
   ir_explain_json_raw("\"remarks\":[");
@@ -2769,31 +2836,31 @@ void ir_explain_flush(void) {
 
   ir_explain_tally_functions();
 
-  /* --annotate-asm reads the remarks during codegen (which runs AFTER this
-   * optimization-stage flush), so when retention is requested we keep them
-   * alive; the one-shot compile leaks them at exit. */
-  if (!g_explain_retain_remarks) {
-    for (size_t i = 0; i < g_remark_count; i++) {
-      free(g_remarks[i].function_name);
-      free(g_remarks[i].entity);
-      free(g_remarks[i].headline);
-      free(g_remarks[i].reason);
-      free(g_remarks[i].fix);
-      free(g_remarks[i].verified);
-      free(g_remarks[i].partial);
-      free(g_remarks[i].code);
-      for (size_t q = 0; q < g_remarks[i].quantity_count; q++) {
-        free(g_remarks[i].quantities[q].name);
-      }
-    }
-    free(g_remarks);
-    g_remarks = NULL;
-    g_remark_count = 0;
-    g_remark_capacity = 0;
-  }
-
   /* Memory diagnostics land after "remarks" and before "backend". */
   ir_explain_memory_flush();
+}
+
+/* The remarks outlive this flush: --annotate-asm reads them during codegen, and
+ * the backend section (also after codegen) needs them to name the loop that
+ * made a function ineligible. Released once the report is written. */
+static void ir_explain_release_remarks(void) {
+  for (size_t i = 0; i < g_remark_count; i++) {
+    free(g_remarks[i].function_name);
+    free(g_remarks[i].entity);
+    free(g_remarks[i].headline);
+    free(g_remarks[i].reason);
+    free(g_remarks[i].fix);
+    free(g_remarks[i].verified);
+    free(g_remarks[i].partial);
+    free(g_remarks[i].code);
+    for (size_t q = 0; q < g_remarks[i].quantity_count; q++) {
+      free(g_remarks[i].quantities[q].name);
+    }
+  }
+  free(g_remarks);
+  g_remarks = NULL;
+  g_remark_count = 0;
+  g_remark_capacity = 0;
 }
 
 /* ---- backend (codegen) section ------------------------------------------- */
@@ -2982,10 +3049,40 @@ static int ir_explain_write_plain(FILE *out) {
   return 1;
 }
 
+/* Render the deferred plan and put it back where it belongs: after the changes
+ * block, before the remarks. Splicing beats printing it at the end -- the plan
+ * is the first thing a reader should meet, and a report that opens with the
+ * detail and closes with the summary gets read in the wrong order. */
+static void ir_explain_splice_plan(void) {
+  if (!g_plan_pending) {
+    return;
+  }
+  g_plan_pending = 0;
+  if (g_plan_offset > g_report_len) {
+    return;
+  }
+  size_t tail_len = g_report_len - g_plan_offset;
+  char *tail = tail_len ? malloc(tail_len) : NULL;
+  if (tail_len && !tail) {
+    ir_explain_render_start_here(); /* at the end beats not at all */
+    return;
+  }
+  if (tail) {
+    memcpy(tail, g_report_buf + g_plan_offset, tail_len);
+  }
+  g_report_len = g_plan_offset;
+  ir_explain_render_start_here();
+  if (tail) {
+    ir_explain_emit("%.*s", (int)tail_len, tail);
+    free(tail);
+  }
+}
+
 void ir_explain_finalize(int force_stderr) {
   if (!g_explain || !g_report_buf || g_report_len == 0) {
     return;
   }
+  ir_explain_splice_plan();
 
   size_t threshold = IR_EXPLAIN_STDERR_MAX_LINES;
   const char *env = getenv("METTLE_EXPLAIN_REPORT_LINES");
@@ -3121,14 +3218,151 @@ void ir_explain_finalize(int force_stderr) {
   g_report_len = 0;
   g_report_cap = 0;
   memset(&g_digest, 0, sizeof(g_digest));
+  if (!g_explain_retain_remarks) {
+    ir_explain_release_remarks();
+  }
 }
 
-/* Translate the MIR gate's terse reason codes ("op:37", "params>4", ...) into
- * a sentence, plus -- where the family is understood -- what falling back
- * actually COSTS and what (if anything) the user can do about it. "op:N"
- * carries an IROpcode; SIMD kernels get their own family because the common
- * misreading is "my vectorized function is slow now" (it isn't: the kernel
- * runs at full speed, only surrounding scalar code spills). */
+/* Past this many optimized IR instructions, a whole-function fallback stops
+ * being a curiosity and becomes the biggest single cost in the report: every
+ * value in a function this size goes through the stack. Below it, splitting the
+ * function out costs the reader more than the spills do. */
+#define IR_EXPLAIN_BACKEND_LARGE_INSTRUCTIONS 64
+
+/* True when `callee` had a loop of its own vectorized. */
+static int ir_explain_function_vectorized(const char *callee) {
+  for (size_t i = 0; i < g_remark_count; i++) {
+    const IRExplainRemark *r = &g_remarks[i];
+    if (r->code && strcmp(r->code, "vectorized") == 0 && r->function_name &&
+        callee && strcmp(r->function_name, callee) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* The calls this function inlined that brought a vectorized loop in with them.
+ * Writes "kernel inlined from `imap` @ line 19" (or a list) into `buf` and
+ * returns the first such line, or 0 when there are none. */
+static size_t ir_explain_inlined_kernel_calls(const char *function_name,
+                                              char *buf, size_t cap) {
+  size_t first = 0, listed = 0, w = 0;
+  buf[0] = '\0';
+  for (size_t i = 0; i < g_remark_count && listed < 3; i++) {
+    const IRExplainRemark *r = &g_remarks[i];
+    if (!r->code || strcmp(r->code, "inlined") != 0 || !r->function_name ||
+        !function_name || strcmp(r->function_name, function_name) != 0) {
+      continue;
+    }
+    char callee[128];
+    ir_explain_entity_callee(r->entity, callee, sizeof(callee));
+    if (!ir_explain_function_vectorized(callee)) {
+      continue;
+    }
+    if (!listed) {
+      w = (size_t)snprintf(buf, cap, "kernel inlined from ");
+      first = r->line;
+    }
+    int n = snprintf(buf + w, cap > w ? cap - w : 0, "%s`%s` @ line %zu",
+                     listed ? ", " : "", callee, r->line);
+    if (n < 0) {
+      break;
+    }
+    w += (size_t)n;
+    listed++;
+  }
+  if (!listed) {
+    buf[0] = '\0';
+  }
+  return first;
+}
+
+/* Where this function's vectorized loops are, when a SIMD kernel is what made
+ * it ineligible. Falling back is always ABOUT a construct in the source, and
+ * "contains simd_vloop_i32" is not something a reader can act on without being
+ * told which loop that is. Writes "loop @ line 29" or "loops @ lines 12, 20,
+ * 29" into `buf` and returns the first line, or returns 0 and leaves `buf`
+ * empty when no vectorized loop was recorded for the function. A function that
+ * inlined several kernels gets all of them listed: picking one would be a
+ * guess, and the list is short enough to read. */
+#define IR_EXPLAIN_KERNEL_LINES_MAX 4
+static size_t ir_explain_kernel_loop_lines(const char *function_name, char *buf,
+                                           size_t cap) {
+  size_t lines[IR_EXPLAIN_KERNEL_LINES_MAX];
+  size_t found = 0, total = 0;
+  if (buf && cap) {
+    buf[0] = '\0';
+  }
+  for (size_t i = 0; i < g_remark_count; i++) {
+    const IRExplainRemark *r = &g_remarks[i];
+    if (!r->code || strcmp(r->code, "vectorized") != 0) {
+      continue;
+    }
+    if (!r->function_name || !function_name ||
+        strcmp(r->function_name, function_name) != 0) {
+      continue;
+    }
+    total++;
+    if (found < IR_EXPLAIN_KERNEL_LINES_MAX) {
+      lines[found++] = r->line;
+    }
+  }
+  if (found == 0) {
+    /* No kernel of its own. A function reaches this gate with a kernel it
+     * never wrote all the time: inlining brings the callee's vectorized loop
+     * in with it. Pointing at the call is what lets the reader act -- the
+     * loop to move out is on the other side of it. */
+    return buf && cap ? ir_explain_inlined_kernel_calls(function_name, buf, cap)
+                      : 0;
+  }
+  if (!buf || !cap) {
+    return lines[0];
+  }
+  size_t w = (size_t)snprintf(buf, cap, found == 1 ? "loop @ line " :
+                                                     "loops @ lines ");
+  for (size_t i = 0; i < found && w < cap; i++) {
+    int n = snprintf(buf + w, cap - w, "%s%zu", i ? ", " : "", lines[i]);
+    if (n < 0) {
+      break;
+    }
+    w += (size_t)n;
+  }
+  if (total > found && w < cap) {
+    snprintf(buf + w, cap - w, " and %zu more", total - found);
+  }
+  return lines[0];
+}
+
+/* True when the gate declined because of a SIMD kernel it cannot pass through,
+ * as opposed to something about the function itself. The two need opposite
+ * advice, and only the kernel families have a loop to point the reader at. */
+static int ir_explain_backend_detail_is_kernel(const char *detail) {
+  if (!detail) {
+    return 0;
+  }
+  if (strncmp(detail, "op:", 3) == 0) {
+    int op = atoi(detail + 3);
+    return op >= (int)IR_OP_COUNT_WORD_STARTS &&
+           op <= (int)IR_OP_SIMD_OUTER_LANE_F64;
+  }
+  return strncmp(detail, "simd_fill:", 10) == 0 ||
+         strncmp(detail, "affine_map:", 11) == 0 ||
+         strncmp(detail, "slp_mac:", 8) == 0 ||
+         strncmp(detail, "silu:", 5) == 0 ||
+         strncmp(detail, "kernel:", 7) == 0 ||
+         strncmp(detail, "vloop:", 6) == 0;
+}
+
+/* Translate the MIR gate's terse reason codes ("op:37", "vloop:width", ...)
+ * into a sentence, plus what falling back actually COSTS and what the user can
+ * do about it.
+ *
+ * Two families, and they need opposite advice. A SIMD kernel the allocator
+ * cannot pass through still runs at full vector speed; only the scalar code
+ * around it spills, so on a small function there is nothing worth doing. Every
+ * other cause spills the whole function for a construct the reader chose. Both
+ * turn actionable once the function is large, which is why size decides whether
+ * the advice is an instruction or a note. */
 static void ir_explain_backend_reason(const IRExplainBackendEntry *e, char *buf,
                                       size_t cap, const char **consequence,
                                       const char **fix, int *advisory) {
@@ -3141,59 +3375,201 @@ static void ir_explain_backend_reason(const IRExplainBackendEntry *e, char *buf,
     snprintf(buf, cap, "declined by the eligibility gate");
     return;
   }
+  int large = e->instructions >= IR_EXPLAIN_BACKEND_LARGE_INSTRUCTIONS;
+  const char *kernel_consequence =
+      "the kernel itself runs at full vector speed; only the scalar code "
+      "around it keeps values on the stack";
+  const char *whole_consequence =
+      "every value in the function is kept on the stack instead of in "
+      "registers";
+
+  /* Shared closing for every SIMD-kernel cause: same consequence, same fix,
+   * and the fix names the loop to move when there is one to name. */
+  const char *kernel_family = NULL;
+  char kernel_desc[192];
+  kernel_desc[0] = '\0';
+
   if (strncmp(e->detail, "op:", 3) == 0) {
     int op = atoi(e->detail + 3);
     if (op >= (int)IR_OP_COUNT_WORD_STARTS &&
         op <= (int)IR_OP_SIMD_OUTER_LANE_F64) {
-      snprintf(buf, cap,
+      snprintf(kernel_desc, sizeof(kernel_desc),
                "contains the SIMD kernel `%s`, which the register allocator "
                "doesn't cover yet",
                ir_opcode_name((IROpcode)op));
-      *consequence =
-          "the kernel itself runs at full vector speed; only the scalar code "
-          "around it keeps values on the stack";
-      *fix = "nothing for small functions; if a LARGE function mixes a kernel "
-             "with hot scalar code, move the kernel loop into its own small "
-             "function so the scalar part keeps the register allocator";
-      *advisory = 1;
+      kernel_family = kernel_desc;
+    } else {
+      snprintf(buf, cap,
+               "contains `%s`, which the register allocator doesn't cover yet",
+               ir_opcode_name((IROpcode)op));
+      *consequence = whole_consequence;
       return;
     }
-    snprintf(buf, cap,
-             "contains `%s`, which the register allocator doesn't cover yet",
-             ir_opcode_name((IROpcode)op));
-    *consequence = "every value in the function is kept on the stack instead "
-                   "of in registers";
-    return;
-  }
-  if (strcmp(e->detail, "call_unsupported") == 0) {
+  } else if (strncmp(e->detail, "simd_fill:", 10) == 0 ||
+             strncmp(e->detail, "affine_map:", 11) == 0 ||
+             strncmp(e->detail, "slp_mac:", 8) == 0 ||
+             strncmp(e->detail, "silu:", 5) == 0 ||
+             strncmp(e->detail, "kernel:", 7) == 0) {
+    /* A kernel whose inline-passthrough subset doesn't cover this loop's exact
+     * shape (a mode-2 fill, an affine map with a runtime coefficient). */
+    const char *kernel = "a SIMD kernel";
+    if (strncmp(e->detail, "simd_fill:", 10) == 0) {
+      kernel = "the fill kernel `simd_fill`";
+    } else if (strncmp(e->detail, "affine_map:", 11) == 0) {
+      kernel = "the affine-map kernel `simd_affine_map`";
+    } else if (strncmp(e->detail, "slp_mac:", 8) == 0) {
+      kernel = "the multiply-accumulate kernel `simd_slp_mac`";
+    } else if (strncmp(e->detail, "silu:", 5) == 0) {
+      kernel = "the SiLU kernel `simd_silu`";
+    }
+    snprintf(kernel_desc, sizeof(kernel_desc),
+             "contains %s in a form the register allocator's inline "
+             "passthrough doesn't cover yet",
+             kernel);
+    kernel_family = kernel_desc;
+  } else if (strcmp(e->detail, "vloop:reduce") == 0) {
+    snprintf(kernel_desc, sizeof(kernel_desc),
+             "contains a vectorized '+' reduction (`s = s + expr`); the "
+             "allocator's inline passthrough covers element-wise maps only");
+    kernel_family = kernel_desc;
+  } else if (strcmp(e->detail, "vloop:width") == 0) {
+    snprintf(kernel_desc, sizeof(kernel_desc),
+             "contains a general-vectorized loop over int32 or float32 lanes; "
+             "the allocator's inline passthrough covers float64 lanes only");
+    kernel_family = kernel_desc;
+  } else if (strncmp(e->detail, "vloop:", 6) == 0) {
+    snprintf(kernel_desc, sizeof(kernel_desc),
+             "contains a general-vectorized loop whose operands the allocator "
+             "cannot marshal (%s)",
+             e->detail + 6);
+    kernel_family = kernel_desc;
+  } else if (strcmp(e->detail, "call_unsupported") == 0) {
     snprintf(buf, cap, "contains a call form the register allocator doesn't "
                        "support yet");
-    *consequence = "every value in the function is kept on the stack instead "
-                   "of in registers";
+    *consequence = whole_consequence;
     return;
-  }
-  /* A SIMD kernel whose inline-passthrough subset doesn't yet cover this loop's
-   * exact shape (e.g. a mode-2 fill, or an affine map with a runtime
-   * coefficient). The kernel still vectorizes; only the scalar code around it
-   * keeps values on the stack -- the same consequence as an unsupported op. */
-  if (strncmp(e->detail, "simd_fill:", 10) == 0 ||
-      strncmp(e->detail, "affine_map:", 11) == 0) {
-    const char *kernel =
-        e->detail[0] == 's' ? "simd_fill" : "simd_affine_map_f32";
+  } else if (strcmp(e->detail, "call_indirect_unsupported") == 0) {
+    snprintf(buf, cap, "calls through a function pointer, which the register "
+                       "allocator doesn't cover yet");
+    *consequence = whole_consequence;
+    *fix = "call the target directly where it is known at compile time";
+    return;
+  } else if (strcmp(e->detail, "sig:float_stack_param") == 0) {
     snprintf(buf, cap,
-             "contains the SIMD kernel `%s` in a form the register allocator's "
-             "inline passthrough doesn't cover yet",
-             kernel);
-    *consequence =
-        "the kernel itself runs at full vector speed; only the scalar code "
-        "around it keeps values on the stack";
-    *fix = "nothing needed for a small function; a different shape of the same "
-           "kernel (a simpler fill/map) inlines into register-allocated code";
+             "takes a float argument past the register-argument slots, which "
+             "the allocator's calling convention doesn't cover yet");
+    *consequence = whole_consequence;
+    *fix = "pass the floats in a struct, or reorder the parameters so the "
+           "floats land in the first four";
+    return;
+  } else if (strncmp(e->detail, "sig:params", 10) == 0) {
+    snprintf(buf, cap,
+             "takes more arguments than the allocator's calling convention "
+             "covers");
+    *consequence = whole_consequence;
+    *fix = "group the arguments into a struct and pass a pointer to it";
+    return;
+  } else if (strcmp(e->detail, "sig:param_nonscalar") == 0 ||
+             strcmp(e->detail, "sig:return_nonscalar") == 0 ||
+             strcmp(e->detail, "sig:arg_layout") == 0) {
+    snprintf(buf, cap,
+             "passes or returns an aggregate by value, which the allocator's "
+             "calling convention doesn't cover yet");
+    *consequence = whole_consequence;
+    *fix = "pass a pointer to the aggregate instead of the value";
+    return;
+  } else if (strcmp(e->detail, "global_access") == 0) {
+    snprintf(buf, cap, "reads or writes a global, which the register allocator "
+                       "doesn't cover yet");
+    *consequence = whole_consequence;
+    *fix = "read the global once into a local at the top of the function";
+    return;
+  } else if (strcmp(e->detail, "declare_local:nonscalar") == 0) {
+    snprintf(buf, cap,
+             "declares a struct or array local, which the register allocator "
+             "doesn't cover yet");
+    *consequence = whole_consequence;
+    return;
+  } else {
+    snprintf(buf, cap,
+             "declined by the eligibility gate; the gate's reason code is `%s` "
+             "and no plain-language translation exists for it yet",
+             e->detail);
+    *consequence = whole_consequence;
+    *fix = "nothing to change in your code: this is a gap in the compiler's "
+           "reporting as well as in the register allocator";
     *advisory = 1;
     return;
   }
-  snprintf(buf, cap, "declined by the eligibility gate (reason code: %s)",
-           e->detail);
+
+  /* One SIMD-kernel ending for all of the above. */
+  snprintf(buf, cap, "%s", kernel_family);
+  *consequence = kernel_consequence;
+  if (large) {
+    *fix = "move the vectorized loop into a function of its own: the kernel "
+           "keeps its speed there, and the scalar code left behind gets the "
+           "register allocator back";
+  } else {
+    *fix = "nothing worth doing at this size: the spills are confined to the "
+           "scalar code around a kernel that already runs at full speed";
+    *advisory = 1;
+  }
+}
+
+static size_t ir_explain_collect_backend_plan(IRExplainBackendPlan *out) {
+  size_t found = 0;
+  for (size_t i = 0; i < g_backend_count; i++) {
+    const IRExplainBackendEntry *e = &g_backend[i];
+    if (e->ok || e->instructions < IR_EXPLAIN_BACKEND_LARGE_INSTRUCTIONS) {
+      continue;
+    }
+    /* --explain=SELECTOR narrows the prose, and a fallback answers to the
+     * function it happened in: name that function and it belongs, otherwise
+     * the reader asked about something else. */
+    if (g_explain_filter && (!e->function_name ||
+                             strcmp(g_explain_filter, e->function_name) != 0)) {
+      continue;
+    }
+    char reason[256];
+    const char *consequence = NULL, *fix = NULL;
+    int advisory = 0;
+    ir_explain_backend_reason(e, reason, sizeof(reason), &consequence, &fix,
+                              &advisory);
+    if (advisory || !fix) {
+      continue; /* nothing to do about it is not a plan entry */
+    }
+    /* Insert by size: the largest fallback is the most expensive one. */
+    size_t at = found;
+    while (at > 0 && e->instructions > out[at - 1].instructions_sort) {
+      at--;
+    }
+    if (at >= IR_EXPLAIN_BACKEND_PLAN_MAX) {
+      continue;
+    }
+    for (size_t j = found < IR_EXPLAIN_BACKEND_PLAN_MAX
+                         ? found
+                         : IR_EXPLAIN_BACKEND_PLAN_MAX - 1;
+         j > at; j--) {
+      out[j] = out[j - 1];
+    }
+    snprintf(out[at].function_name, sizeof(out[at].function_name), "%s",
+             e->function_name ? e->function_name : "?");
+    snprintf(out[at].location, sizeof(out[at].location), "%s (%zu instrs)",
+             out[at].function_name, e->instructions);
+    char lines[96];
+    lines[0] = '\0';
+    if (ir_explain_backend_detail_is_kernel(e->detail)) {
+      ir_explain_kernel_loop_lines(e->function_name, lines, sizeof(lines));
+    }
+    snprintf(out[at].why, sizeof(out[at].why), "%s%s%s", reason,
+             lines[0] ? ": " : "", lines[0] ? lines : "");
+    out[at].fix = fix;
+    out[at].instructions_sort = e->instructions;
+    if (found < IR_EXPLAIN_BACKEND_PLAN_MAX) {
+      found++;
+    }
+  }
+  return found;
 }
 
 /* Sort helper: biggest functions first -- size is where baseline codegen
@@ -3359,17 +3735,36 @@ void ir_explain_backend_flush(void) {
           if (strcmp(best_reason, reason_j) != 0) {
             continue;
           }
+          /* Name the loop per member, not in the shared fix: one group can
+           * hold functions whose kernels sit on different lines, and a single
+           * line quoted above them would be wrong for all but one. */
+          char lines[96];
+          lines[0] = '\0';
+          size_t kernel_line =
+              ir_explain_backend_detail_is_kernel(g_backend[j].detail)
+                  ? ir_explain_kernel_loop_lines(g_backend[j].function_name,
+                                                 lines, sizeof(lines))
+                  : 0;
+          char where[112];
+          where[0] = '\0';
+          if (kernel_line) {
+            snprintf(where, sizeof(where), ", %s", lines);
+          }
           int n = snprintf(list + written, sizeof(list) - written,
-                           "%s%s (%zu)", shown ? ", " : "",
-                           g_backend[j].function_name, g_backend[j].instructions);
+                           "%s%s (%zu%s)", shown ? ", " : "",
+                           g_backend[j].function_name,
+                           g_backend[j].instructions, where);
           if (n < 0 || (size_t)n >= sizeof(list) - written) {
             break;
           }
           written += (size_t)n;
           ir_explain_json_raw("%s{\"fn\":", shown ? "," : "");
           ir_explain_json_str(g_backend[j].function_name);
-          ir_explain_json_raw(",\"instructions\":%zu}",
-                              g_backend[j].instructions);
+          ir_explain_json_raw(",\"instructions\":%zu", g_backend[j].instructions);
+          if (kernel_line) {
+            ir_explain_json_raw(",\"kernelLine\":%zu", kernel_line);
+          }
+          ir_explain_json_raw("}");
           shown++;
         }
         ir_explain_json_raw("]}");
@@ -3413,6 +3808,10 @@ void ir_explain_backend_flush(void) {
   ir_explain_call_graph_json();
   ir_explain_hotspots_json();
   ir_explain_passes_json();
+
+  /* Every section the plan ranks now exists. Render it before the tables it
+   * reads are released. */
+  ir_explain_splice_plan();
 
   for (size_t i = 0; i < g_loop_cost_count; i++) {
     free(g_loop_costs[i].function_name);

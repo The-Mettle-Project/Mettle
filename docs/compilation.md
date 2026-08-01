@@ -243,11 +243,22 @@ names never produce a misleading suggestion.
 input file and why. It reads top to bottom in three parts.
 
 **Where to start.** The findings that have a fix, ranked by what the compiler
-can stand behind. A fix marked `proven` was applied to a clone of the function
-and re-checked, so the advice is a result rather than a belief. Then advice
-that names a cause, ahead of the fallback checklist the compiler falls back on
-when it cannot. Then loop depth: the same fix inside a nested loop is worth
-more.
+can stand behind.
+
+A line marked `spills` comes first. It is a whole function that missed the
+register-allocating backend, so every value in it goes through the stack: a
+cost already measured over the whole function, where every other line is a
+prediction about one loop. The line says how large the function is and which
+construct made it ineligible, including the common case where the function
+never wrote the construct and inlining brought it in.
+
+Then the loop and call findings. A fix marked `proven` was applied to a clone of
+the function and re-checked, so the advice is a result rather than a belief. A
+fix marked `step 1` was also applied to a clone, and the loop still did not
+vectorize: it is worth making and it is not the whole job, and the remark says
+what blocks the loop next. Then advice that names a cause, ahead of the
+checklist the compiler falls back on when it cannot. Then loop depth: the same
+fix inside a nested loop is worth more.
 
 One line per distinct piece of advice, with `(+N more sites)` where the same
 change is needed in several places: four loops wanting the same edit are one
@@ -259,8 +270,10 @@ stable decision code, then the source it is about, then the reason, the fix,
 and the proof:
 
 ```text
-  where to start (2 of 3 missed optimizations have a fix; "proven" = the compiler applied it to a clone and re-checked):
-    1. proven sum_bytes:27  declare the accumulator as int64
+  where to start (2 of 3 missed optimizations have a fix; "proven" = applied to a clone and re-checked, "step 1" = applied and the loop still needs more):
+    1. spills main (282 instrs)  move the vectorized loop into a function of its own
+                                 contains the affine-map kernel `simd_affine_map` in a form the register allocator's inline passthrough doesn't cover yet: kernel inlined from `saxpy` @ line 157
+    2. proven sum_bytes:27       declare the accumulator as int64
 
   saxpy (loop @ line 12): vectorized -> vfmadd231ps, 8-wide float32  [vectorized]
   sum_bytes (loop @ line 27): NOT vectorized  [byte-sum-narrow-acc]
@@ -277,7 +290,12 @@ bracketed code.
 
 **The memory and backend sections.** Compile-time memory-safety findings, then
 which functions reached the register-allocating backend and what stopped the
-rest.
+rest. Functions are grouped by cause, largest first, and each cause is a
+sentence about the code rather than the gate's internal reason code. A SIMD
+kernel the allocator cannot pass through gets the opposite advice from
+everything else: the kernel still runs at full vector speed, so on a small
+function there is nothing worth doing, and only past 64 optimized IR
+instructions does moving the loop into its own function pay for itself.
 
 Two more things the report does on its own. A re-run leads with what changed
 since the last `--explain` build, regressions first, using a baseline written

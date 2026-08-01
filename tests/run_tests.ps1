@@ -250,8 +250,15 @@ $cases = @(
       # grouped by cause with consequence text and sizes
       'backend report: explain_demo\.mettle',
       'optimized IR instructions are in register-allocated code',
-      'contains the SIMD kernel `simd_affine_map_f32`',
+      'contains the affine-map kernel `simd_affine_map` in a form the register allocator',
       'consequence: the kernel itself runs at full vector speed',
+      # A whole-function fallback leads the plan: it is a measured cost over a
+      # whole function, where a loop remark is a prediction about one loop. It
+      # also names the calls that brought the kernel in -- main never wrote a
+      # vectorized loop of its own, so "contains simd_affine_map" alone would
+      # point at nothing the reader could find.
+      'spills main \(\d+ instrs\)',
+      'kernel inlined from `saxpy` @ line \d+',
       # dependence analysis: a non-reassociable loop-carried recurrence (the
       # LCG/hash shape) is diagnosed as a genuine scalar floor, naming the
       # carried operators -- not the generic "no vectorizer recognized" fallback
@@ -273,7 +280,7 @@ $cases = @(
       'calls: \d+ inlined, \d+ kept as real calls',
       'backend: \d+/\d+ functions register-allocated',
       # the digest names what to do, not just how the build went
-      'start with: \[proven\] matvec:38  hoist invariant index math',
+      'start with: main \(\d+ instrs\)  move the vectorized loop into a function of its own',
       'full report \(\d+ lines\): .*explain_sidecar\.explain\.txt'
     )
     OutputMustNotMatch = @(
@@ -748,6 +755,30 @@ $cases = @(
     OutputMustNotMatch = @(
       'where to start',
       'missed optimization'
+    )
+  },
+  @{
+    # Every gate reason code has to reach the reader as a sentence about their
+    # code. `vloop:reduce` used to print as "declined by the eligibility gate
+    # (reason code: vloop:shape)", which names nothing anyone can act on. It
+    # must say which shape, name the loop, and -- on a function this small --
+    # say plainly that the spills are not worth chasing.
+    Name          = "explain_backend_gate_reasons"
+    Path          = "tests/test_vloop_general.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--explain=freduce64")
+    Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
+    OutputMustMatch = @(
+      "contains a vectorized '\+' reduction \(``s = s \+ expr``\); the allocator's inline passthrough covers element-wise maps only",
+      'freduce64 \(\d+, loop @ line \d+\)',
+      'note: nothing worth doing at this size',
+      # a large fallback in another function keeps its actionable fix
+      'fix: move the vectorized loop into a function of its own'
+    )
+    OutputMustNotMatch = @(
+      'reason code: vloop',
+      # the plan honours the selector: main's fallback is not what was asked for
+      'spills main'
     )
   },
   @{
@@ -3002,11 +3033,15 @@ try {
     throw "JSON loop costs missing cycles or bottleneck port"
   }
   # The triage a tool renders as a fix-it panel: same ranking as the prose
-  # "where to start", proven fixes first, and the fix untruncated.
+  # "where to start". Whole-function codegen fallbacks lead (a measured cost,
+  # not a per-loop prediction), then proven fixes, and the fix is untruncated.
   $start = @($json.startHere)
   if ($start.Count -lt 1) { throw "JSON startHere ranking missing" }
-  if (-not $start[0].proven) { throw "JSON startHere should lead with a proven fix" }
-  if (-not $start[0].fix -or -not $start[0].code) { throw "JSON startHere entry incomplete" }
+  if ($start[0].kind -ne "backend") { throw "JSON startHere should lead with the codegen fallback" }
+  if (-not $start[0].why -or -not $start[0].instructions) { throw "JSON backend entry incomplete" }
+  $firstRemark = @($start | Where-Object { $_.kind -eq "remark" })[0]
+  if (-not $firstRemark.proven) { throw "JSON startHere should lead its remarks with a proven fix" }
+  if (-not $firstRemark.fix -or -not $firstRemark.code) { throw "JSON startHere entry incomplete" }
   if (@($start | Where-Object { $_.proven }).Count -lt 2) {
     throw "JSON startHere lost the proven fixes"
   }

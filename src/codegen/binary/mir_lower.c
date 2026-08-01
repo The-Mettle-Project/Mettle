@@ -1782,10 +1782,17 @@ int mir_function_is_eligible(CodeGenerator *generator,
       const char *vnames[4];
       const IROperand *vsrcs[4];
       int vn = 0;
-      if (in->argument_count < 7 || !in->arguments ||
-          in->arguments[0].int_value != 0 /* reduce_op: maps only */ ||
-          in->float_bits != 64) {
+      if (in->argument_count < 7 || !in->arguments) {
         return mir_trace_bail(ir_function, "vloop:shape");
+      }
+      /* Split by cause: the two uncovered shapes are a reduction and a
+       * non-float64 lane width, and --explain can name the source construct
+       * for each only if the gate says which one it was. */
+      if (in->arguments[0].int_value != 0 /* reduce_op: maps only */) {
+        return mir_trace_bail(ir_function, "vloop:reduce");
+      }
+      if (in->float_bits != 64) {
+        return mir_trace_bail(ir_function, "vloop:width");
       }
       if (code_generator_vloop_collect_dist(in, 0, vnames, vsrcs, &vn) < 0 ||
           vn > 3) {
