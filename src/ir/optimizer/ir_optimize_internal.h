@@ -663,6 +663,12 @@ const char *ir_simd_bail_id_name(int id);
  * violation must not eat the report). */
 void ir_explain_flush(void);
 void ir_explain_finalize(int force_stderr);
+/* --explain=SELECTOR: narrow the PROSE report to one slice of it. Accepts
+ * `missed`, `fixable`, `proven`, `loops`, `calls`, a function name, or a
+ * decision code. The JSON sidecar ignores it and stays whole-file. The string
+ * must outlive the compile (argv does). */
+void ir_explain_set_filter(const char *selector);
+const char *ir_explain_filter(void);
 /* True when a remark for this (line, entity) is already recorded -- lets a
  * later pass skip a weaker guess when a definitive remark exists (e.g. the
  * unroller's "fully unrolled" beats the verifier's "no loop remains"). */

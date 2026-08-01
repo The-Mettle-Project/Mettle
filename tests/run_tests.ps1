@@ -643,6 +643,42 @@ $cases = @(
       'print_int \(call to'
     )
   },
+  @{
+    # --explain=SELECTOR narrows the prose. Each verdict carries its stable
+    # decision code, the source the finding is about is quoted, and the report
+    # leads with the fixes the compiler proved.
+    Name          = "explain_selector"
+    Path          = "tests/explain_demo.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--explain=sum_ints")
+    Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
+    OutputMustMatch = @(
+      'where to start',
+      'proven sum_ints:76',
+      'sum_ints \(loop @ line 76\): NOT vectorized  \[int32-sum-narrow-acc\]',
+      # the loop body itself, quoted under the verdict
+      '77 \|     s = s \+ a\[i\];',
+      'findings hidden by --explain=sum_ints',
+      'mettle explain int32-sum-narrow-acc'
+    )
+    OutputMustNotMatch = @(
+      'saxpy \(loop',
+      'sum_bytes \(loop'
+    )
+  },
+  @{
+    # A selector nobody can satisfy says what the selectors are instead of
+    # printing an empty section.
+    Name          = "explain_selector_unknown"
+    Path          = "tests/explain_demo.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--explain=nosuchthing")
+    Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
+    OutputMustMatch = @(
+      'nothing matches --explain=nosuchthing',
+      'selectors: missed, fixable, proven, loops, calls'
+    )
+  },
   @{ Name = "err_decorator_on_loop"; Path = "tests/err_decorator_on_loop.mettle"; ShouldSucceed = $false; Pattern = "apply to a function, not a loop" },
   @{ Name = "err_decorator_unknown"; Path = "tests/err_decorator_unknown.mettle"; ShouldSucceed = $false; Pattern = "Unknown decorator after" },
   @{ Name = "err_decorator_conflict"; Path = "tests/err_decorator_conflict.mettle"; ShouldSucceed = $false; Pattern = "mutually exclusive" },

@@ -1,0 +1,35 @@
+L	saxpy	0	V	12
+L	with_call	0	V	19
+C	with_call	scale	0	I	20
+L	sum_bytes	0	S	27
+L	matvec	0	S	36
+L	matvec	1	S	38
+L	apply_bias	0	S	61
+C	apply_bias	bias	0	I	62
+L	sum_ints	0	S	76
+L	sum_shorts	0	S	86
+L	apply_damp	0	V	99
+C	apply_damp	damp	0	I	100
+L	skew	0	S	109
+C	chain	step1	0	I	123
+C	chain	step1	1	I	123
+C	chain	step1	2	I	123
+L	lcg_hash	0	S	133
+L	main	0	S	146
+L	main	1	S	153
+C	main	saxpy	0	I	157
+C	main	with_call	0	R	158
+C	main	matvec	0	I	159
+L	main	2	S	162
+C	main	sum_bytes	0	I	163
+C	main	apply_bias	0	I	163
+L	main	3	S	166
+C	main	sum_ints	0	I	167
+C	main	sum_shorts	0	I	167
+C	main	apply_damp	0	I	168
+C	main	norm2	0	I	169
+C	main	chain	0	I	169
+C	main	skew	0	I	169
+C	main	opaque	0	I	170
+C	main	tiny_fixed	0	I	170
+C	main	lcg_hash	0	R	171

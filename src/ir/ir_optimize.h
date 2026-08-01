@@ -89,6 +89,11 @@ void ir_explain_target_flush(const char *target_name);
 void ir_explain_set_output_path(const char *path);
 /* --explain-json: also write a machine-readable <output-stem>.explain.json. */
 void ir_explain_set_json(int enabled);
+/* --explain=SELECTOR: narrow the PROSE report to one slice of it. Accepts
+ * `missed`, `fixable`, `proven`, `loops`, `calls`, a function name, or a
+ * decision code. The JSON sidecar ignores it and stays whole-file. The string
+ * must outlive the compile (argv does). */
+void ir_explain_set_filter(const char *selector);
 /* --annotate-asm: keep the optimization remark table alive past the
  * optimization-stage flush so the codegen annotator (which runs later) can read
  * it. The remarks then leak at process exit -- fine for a one-shot compile. */

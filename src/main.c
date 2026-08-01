@@ -2795,6 +2795,11 @@ int main(int argc, char *argv[]) {
       options.simd_report = 1;
     } else if (strcmp(argv[i], "--explain") == 0) {
       options.explain = 1;
+    } else if (strncmp(argv[i], "--explain=", 10) == 0) {
+      /* A whole program's report runs to hundreds of lines. The selector cuts
+       * the prose down to the slice asked for; the JSON sidecar stays whole. */
+      options.explain = 1;
+      options.explain_filter = argv[i] + 10;
     } else if (strcmp(argv[i], "--explain-all") == 0) {
       /* Whole-program report: no focus-file filter, so imported modules'
        * loops and calls are analyzed too (stdlib included). */
@@ -3362,6 +3367,7 @@ static int compile_optimize_ir(IRProgram *ir_program, ASTNode *ast_program,
   /* Large --explain reports divert to `<output-stem>.explain.txt`. */
   ir_explain_set_output_path(options->output_filename);
   ir_explain_set_json(options->explain_json ? 1 : 0);
+  ir_explain_set_filter(options->explain_filter);
   /* --annotate-asm: arm the codegen annotator before codegen runs, and keep the
    * optimization remarks alive so it can join them onto the emitted asm. */
   /* --explain-json wants the codegen cost model (cycles per iteration, port
@@ -4335,6 +4341,9 @@ void print_usage(const char *program_name) {
          "                      whenever the optimizer declined (needs -O/--release).\n"
          "                      Re-runs lead with what CHANGED since the last build,\n"
          "                      regressions first\n");
+  printf("  --explain=SELECTOR  Narrow the report to one slice of it: missed,\n"
+         "                      fixable, proven, loops, calls, a function name, or a\n"
+         "                      decision code (the id in brackets after a verdict)\n");
   printf("  --explain-json      Also write <output-stem>.explain.json (machine-\n"
          "                      readable report; implies --explain)\n");
   printf("  --annotate-asm      Print the emitted assembly annotated with the codegen\n"

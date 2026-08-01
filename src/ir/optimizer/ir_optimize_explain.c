@@ -252,6 +252,49 @@ void ir_optimize_set_explain(int enabled, const char *focus_file) {
 
 int ir_explain_enabled(void) { return g_explain; }
 
+/* ---- prose filter (--explain=SELECTOR) -------------------------------------
+ * A whole program's report runs to hundreds of lines, and most of it is the
+ * compiler doing the right thing. The selector narrows the prose to the part
+ * the reader asked about. The JSON sidecar is never filtered: a tool wants the
+ * whole picture and does its own narrowing. */
+
+static MTLC_THREAD_LOCAL const char *g_explain_filter = NULL;
+
+void ir_explain_set_filter(const char *selector) {
+  g_explain_filter = (selector && selector[0]) ? selector : NULL;
+}
+
+const char *ir_explain_filter(void) { return g_explain_filter; }
+
+static int ir_explain_remark_selected(const IRExplainRemark *r) {
+  const char *f = g_explain_filter;
+  if (!f) {
+    return 1;
+  }
+  if (strcmp(f, "missed") == 0) {
+    return !r->positive;
+  }
+  if (strcmp(f, "fixable") == 0) {
+    return !r->positive && r->fix != NULL;
+  }
+  if (strcmp(f, "proven") == 0) {
+    return r->verified != NULL;
+  }
+  if (strcmp(f, "loops") == 0) {
+    return r->entity && strcmp(r->entity, "loop") == 0;
+  }
+  if (strcmp(f, "calls") == 0) {
+    return r->entity && strncmp(r->entity, "call to ", 8) == 0;
+  }
+  /* Otherwise a name: the function the decision was made in, or the decision
+   * code itself, so both `--explain=saxpy` and `--explain=dot-shape-address`
+   * do what they look like they do. */
+  if (r->function_name && strcmp(r->function_name, f) == 0) {
+    return 1;
+  }
+  return r->code && strcmp(r->code, f) == 0;
+}
+
 void ir_explain_set_retain_remarks(int enabled) {
   g_explain_retain_remarks = enabled ? 1 : 0;
 }
@@ -1696,7 +1739,7 @@ static void ir_explain_render_start_here(void) {
 
   for (size_t i = 0; i < g_remark_count; i++) {
     const IRExplainRemark *r = &g_remarks[i];
-    if (r->positive) {
+    if (r->positive || !ir_explain_remark_selected(r)) {
       continue;
     }
     missed++;
@@ -2297,6 +2340,7 @@ void ir_explain_flush(void) {
   size_t json_remark_count = 0;
   ir_explain_json_raw("\"remarks\":[");
 
+  size_t shown_remarks = 0;
   if (g_remark_count == 0) {
     ir_explain_emit("  (no loops or calls to report)\n\n");
   } else {
@@ -2306,6 +2350,11 @@ void ir_explain_flush(void) {
       if (suppressed && suppressed[i]) {
         continue;
       }
+      /* The selector hides prose only. The JSON sidecar and the digest
+       * tallies below stay whole-file, so a filtered run and an unfiltered
+       * one produce the same machine-readable document. */
+      int show = ir_explain_remark_selected(r);
+      shown_remarks += show ? 1 : 0;
 
       /* Fold a run of identical call refusals into one entry. */
       if (suppressed && ir_explain_remark_foldable(r)) {
@@ -2322,25 +2371,27 @@ void ir_explain_flush(void) {
           char callees[512];
           ir_explain_group_callee_list(g_remarks, i, callees,
                                        sizeof(callees));
-          ir_explain_emit("  %s%s%s (%zu calls, lines %zu-%zu): %s%s%s%s\n",
-                          clr(EXPLAIN_BOLD), r->function_name,
-                          clr(EXPLAIN_RESET), group_count, r->line, last_line,
-                          clr(r->positive ? EXPLAIN_GREEN : EXPLAIN_RED),
-                          r->headline, clr(EXPLAIN_RESET),
-                          ir_explain_code_tag(r));
-          ir_explain_emit("      %s%s reason: %s%s\n", clr(EXPLAIN_DIM),
-                          glyph_elbow(), r->reason, clr(EXPLAIN_RESET));
-          if (r->fix) {
-            ir_explain_emit("      %s%s fix: %s%s\n", clr(EXPLAIN_DIM),
-                            glyph_elbow(), r->fix, clr(EXPLAIN_RESET));
+          if (show) {
+            ir_explain_emit("  %s%s%s (%zu calls, lines %zu-%zu): %s%s%s%s\n",
+                            clr(EXPLAIN_BOLD), r->function_name,
+                            clr(EXPLAIN_RESET), group_count, r->line, last_line,
+                            clr(r->positive ? EXPLAIN_GREEN : EXPLAIN_RED),
+                            r->headline, clr(EXPLAIN_RESET),
+                            ir_explain_code_tag(r));
+            ir_explain_emit("      %s%s reason: %s%s\n", clr(EXPLAIN_DIM),
+                            glyph_elbow(), r->reason, clr(EXPLAIN_RESET));
+            if (r->fix) {
+              ir_explain_emit("      %s%s fix: %s%s\n", clr(EXPLAIN_DIM),
+                              glyph_elbow(), r->fix, clr(EXPLAIN_RESET));
+            }
+            if (r->verified) {
+              ir_explain_emit("      %s%s verified: %s%s%s\n", clr(EXPLAIN_DIM),
+                              glyph_elbow(), clr(EXPLAIN_GREEN), r->verified,
+                              clr(EXPLAIN_RESET));
+            }
+            ir_explain_emit("      %s%s calls: %s%s\n", clr(EXPLAIN_DIM),
+                            glyph_elbow(), callees, clr(EXPLAIN_RESET));
           }
-          if (r->verified) {
-            ir_explain_emit("      %s%s verified: %s%s%s\n", clr(EXPLAIN_DIM),
-                            glyph_elbow(), clr(EXPLAIN_GREEN), r->verified,
-                            clr(EXPLAIN_RESET));
-          }
-          ir_explain_emit("      %s%s calls: %s%s\n", clr(EXPLAIN_DIM),
-                          glyph_elbow(), callees, clr(EXPLAIN_RESET));
           if (strcmp(r->headline, "NOT inlined") == 0) {
             g_digest.calls_refused += group_count;
           }
@@ -2356,29 +2407,32 @@ void ir_explain_flush(void) {
         }
       }
 
-      ir_explain_emit("  %s%s%s (%s @ line %zu): %s%s%s%s\n", clr(EXPLAIN_BOLD),
-                      r->function_name, clr(EXPLAIN_RESET), r->entity, r->line,
-                      clr(r->positive ? EXPLAIN_GREEN : EXPLAIN_RED),
-                      r->headline, clr(EXPLAIN_RESET),
-                      ir_explain_code_tag(r));
-      /* The line itself, but only where there is something to act on: quoting
-       * the source under every successful inline would treble the report and
-       * say nothing. */
-      if (r->reason) {
-        ir_explain_echo_source_range(r->line, r->end_line);
-      }
-      if (r->reason) {
-        ir_explain_emit("      %s%s reason: %s%s\n", clr(EXPLAIN_DIM),
-                        glyph_elbow(), r->reason, clr(EXPLAIN_RESET));
-      }
-      if (r->fix) {
-        ir_explain_emit("      %s%s fix: %s%s\n", clr(EXPLAIN_DIM),
-                        glyph_elbow(), r->fix, clr(EXPLAIN_RESET));
+      if (show) {
+        ir_explain_emit("  %s%s%s (%s @ line %zu): %s%s%s%s\n",
+                        clr(EXPLAIN_BOLD), r->function_name, clr(EXPLAIN_RESET),
+                        r->entity, r->line,
+                        clr(r->positive ? EXPLAIN_GREEN : EXPLAIN_RED),
+                        r->headline, clr(EXPLAIN_RESET),
+                        ir_explain_code_tag(r));
+        /* The line itself, but only where there is something to act on:
+         * quoting the source under every successful inline would treble the
+         * report and say nothing. */
+        if (r->reason) {
+          ir_explain_echo_source_range(r->line, r->end_line);
+          ir_explain_emit("      %s%s reason: %s%s\n", clr(EXPLAIN_DIM),
+                          glyph_elbow(), r->reason, clr(EXPLAIN_RESET));
+        }
+        if (r->fix) {
+          ir_explain_emit("      %s%s fix: %s%s\n", clr(EXPLAIN_DIM),
+                          glyph_elbow(), r->fix, clr(EXPLAIN_RESET));
+        }
+        if (r->verified) {
+          ir_explain_emit("      %s%s verified: %s%s%s\n", clr(EXPLAIN_DIM),
+                          glyph_elbow(), clr(EXPLAIN_GREEN), r->verified,
+                          clr(EXPLAIN_RESET));
+        }
       }
       if (r->verified) {
-        ir_explain_emit("      %s%s verified: %s%s%s\n", clr(EXPLAIN_DIM),
-                        glyph_elbow(), clr(EXPLAIN_GREEN), r->verified,
-                        clr(EXPLAIN_RESET));
         g_digest.fixes_verified++;
       }
       /* Digest tallies (loop/call outcomes by entity + headline). */
@@ -2409,18 +2463,35 @@ void ir_explain_flush(void) {
     }
     free(suppressed);
 
+    /* A selector that matched nothing is a question the report failed to
+     * answer, so say what the selector accepts rather than printing a blank
+     * section and letting the reader guess. */
+    if (g_explain_filter && shown_remarks == 0) {
+      ir_explain_emit("  nothing matches --explain=%s (%zu findings in this "
+                      "file)\n",
+                      g_explain_filter, g_remark_count);
+      ir_explain_emit("  %sselectors: missed, fixable, proven, loops, calls, "
+                      "a function name, or a decision code%s\n",
+                      clr(EXPLAIN_DIM), clr(EXPLAIN_RESET));
+    } else if (g_explain_filter && shown_remarks < g_remark_count) {
+      ir_explain_emit("  %s%zu of %zu findings hidden by --explain=%s%s\n",
+                      clr(EXPLAIN_DIM), g_remark_count - shown_remarks,
+                      g_remark_count, g_explain_filter, clr(EXPLAIN_RESET));
+    }
+
     /* Close the loop between the one-line verdict and the paragraph behind it.
      * The example names a code the reader can actually see above, preferring a
      * refusal, since that is the line they want explained. */
     const char *sample = NULL;
-    for (size_t i = 0; i < g_remark_count && !sample; i++) {
+    for (size_t i = 0; i < g_remark_count && !sample && shown_remarks; i++) {
       if (!g_remarks[i].positive && g_remarks[i].code &&
-          g_remarks[i].code[0]) {
+          g_remarks[i].code[0] && ir_explain_remark_selected(&g_remarks[i])) {
         sample = g_remarks[i].code;
       }
     }
-    for (size_t i = 0; i < g_remark_count && !sample; i++) {
-      if (g_remarks[i].code && g_remarks[i].code[0]) {
+    for (size_t i = 0; i < g_remark_count && !sample && shown_remarks; i++) {
+      if (g_remarks[i].code && g_remarks[i].code[0] &&
+          ir_explain_remark_selected(&g_remarks[i])) {
         sample = g_remarks[i].code;
       }
     }
