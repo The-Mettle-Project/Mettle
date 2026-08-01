@@ -1,7 +1,14 @@
 // `mettle explain <CODE>`: extended documentation for diagnostic codes,
 // modeled on `rustc --explain`. One entry per stable code.
+//
+// Two tables live here. DOCS covers the compile diagnostics (E0001..E0007,
+// M0101..M0112). DECISIONS covers the optimizer decision codes the --explain
+// report prints in brackets after each verdict, so a reader who sees
+// `[dot-shape-address]` in the report can ask for the long version of it
+// without leaving the terminal.
 #include "error_explain.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 typedef struct {
@@ -161,14 +168,637 @@ static const ErrorCodeDoc DOCS[] = {
      "\n"
      "Fix: finish all uses of derived pointers before freeing the base,\n"
      "or free later.\n"},
+    {"M0113", "Dereference of a null pointer",
+     "The pointer was assigned null and never reassigned before this use,\n"
+     "so the dereference traps the moment it runs.\n"
+     "\n"
+     "Fix: assign a real address first, or guard the access:\n"
+     "    if (p != 0) { ... }\n"
+     "\n"
+     "Only reported when the null assignment and the use are provably on\n"
+     "the same path, so this is a fact rather than a suspicion.\n"},
+    {"M0114", "Dereference of an unmapped constant address",
+     "The pointer holds a small integer constant. The low 64K of the\n"
+     "address space is never mapped on any supported platform, so this\n"
+     "dereference faults.\n"
+     "\n"
+     "Usually a placeholder that was never filled in, or an integer that\n"
+     "was cast to a pointer by mistake.\n"},
+    {"M0115", "Shift count at or past the operand width",
+     "Shifting a 32-bit value by 32, or a 64-bit value by 64, does not\n"
+     "produce zero. The hardware masks the count (x86 uses the low 5 or 6\n"
+     "bits), so `x << 32` on an int32 is `x << 0`, which is `x`.\n"
+     "\n"
+     "Fix: shift by less than the width, or widen the operand first:\n"
+     "    var wide: int64 = (int64)x;\n"
+     "    var shifted: int64 = wide << 32;\n"},
+    {"M0116", "Division or modulo by a constant zero",
+     "The divisor is the literal zero, so the operation traps the moment it\n"
+     "executes. This is a hard error: no input can make it work.\n"
+     "\n"
+     "Fix: correct the constant, or guard the divisor when it is meant to\n"
+     "be a variable.\n"},
+    {"M0117", "Loop index runs past the end of the array",
+     "The loop's upper bound and the array's length are both known at\n"
+     "compile time, and the bound is the larger. The final iteration reads\n"
+     "or writes past the end.\n"
+     "\n"
+     "Example:\n"
+     "    var a: int64[8];\n"
+     "    for i in 0..9 { a[i] = i; }   // M0117: valid indexes are 0..7\n"
+     "\n"
+     "Fix: match the bound to the length. Indexes are 0-based, so an array\n"
+     "of 8 runs 0..7 and an off-by-one here is the usual cause.\n"},
 };
 
-static void print_code_list(void) {
-  printf("Diagnostic codes:\n");
-  for (size_t i = 0; i < sizeof(DOCS) / sizeof(DOCS[0]); i++) {
-    printf("  %s  %s\n", DOCS[i].code, DOCS[i].title);
+/* ---- optimizer decision codes ----------------------------------------------
+ * The `--explain` report tags every verdict with one of these, and the
+ * `--explain-json` sidecar carries the same string in its `code` field. The
+ * prose in the report is one line, because a report of forty one-liners is
+ * readable and a report of forty paragraphs is not. The paragraph lives here.
+ *
+ * `group` sorts the index; `applies` is the one-line gloss the index shows. */
+
+typedef enum {
+  DECISION_VECTOR_REFUSAL,
+  DECISION_INLINE_REFUSAL,
+  DECISION_APPLIED
+} DecisionGroup;
+
+typedef struct {
+  const char *code;
+  DecisionGroup group;
+  const char *title;
+  const char *body;
+} DecisionDoc;
+
+static const DecisionDoc DECISIONS[] = {
+    /* ---- vectorization refusals ------------------------------------------ */
+    {"call-in-body", DECISION_VECTOR_REFUSAL,
+     "The loop body calls a function",
+     "A SIMD kernel runs eight lanes at once. A call runs one. So a loop that\n"
+     "calls anything on every iteration cannot become a kernel until the call\n"
+     "is gone.\n"
+     "\n"
+     "The inliner runs first and removes most of these on its own, so a loop\n"
+     "that still reports this one has a call the inliner declined. The remark\n"
+     "for that call, on the same line, says which rule stopped it.\n"
+     "\n"
+     "Fix: mark the callee @inline, or lift the call out of the loop when its\n"
+     "result does not change between iterations.\n"},
+    {"extern-call-in-body", DECISION_VECTOR_REFUSAL,
+     "The loop body calls an external function",
+     "The body calls a function declared `extern`. The compiler has no body\n"
+     "for it, so it can never inline the call away, and the loop can never\n"
+     "vectorize while the call is there.\n"
+     "\n"
+     "Fix: move the extern call out of the loop. Where the loop computes the\n"
+     "values and the extern call only consumes them, split it in two: a\n"
+     "vectorizable loop that fills a buffer, then one call.\n"},
+    {"indirect-call", DECISION_VECTOR_REFUSAL,
+     "The loop body calls through a function pointer",
+     "The callee is not known until the loop runs, so there is nothing to\n"
+     "inline and no kernel to match.\n"
+     "\n"
+     "Fix: where the pointer holds the same function for the whole loop,\n"
+     "switch on it once outside and write a direct call in each arm. Each arm\n"
+     "then vectorizes on its own.\n"},
+    {"alloc-in-body", DECISION_VECTOR_REFUSAL,
+     "The loop body allocates",
+     "Every iteration runs `new`. Allocation is a call into the allocator, it\n"
+     "can fail, and it has an order the lanes would have to keep.\n"
+     "\n"
+     "Fix: allocate once before the loop and reuse the buffer.\n"},
+    {"inline-asm", DECISION_VECTOR_REFUSAL,
+     "The loop body contains inline assembly",
+     "The compiler treats an asm block as opaque. It cannot know which\n"
+     "registers or memory the block touches, so it cannot prove the lanes are\n"
+     "independent.\n"
+     "\n"
+     "Fix: move the asm out of the loop, or accept the scalar loop. Hand-written\n"
+     "asm in a hot loop is usually already the vector code you wanted.\n"},
+    {"control-flow", DECISION_VECTOR_REFUSAL,
+     "The loop body branches",
+     "The body has a nested loop or a data-dependent `if`. Lanes execute in\n"
+     "lockstep, so a branch that goes one way for lane 3 and the other way for\n"
+     "lane 4 has no single instruction to be.\n"
+     "\n"
+     "Note the compiler already if-converts short branches into masked\n"
+     "arithmetic where it can (see `if-converted`). This code fires when the\n"
+     "branch was too big or too effectful for that.\n"
+     "\n"
+     "Fixes:\n"
+     "  - hoist the condition out when it does not depend on the index\n"
+     "  - replace a small `if` with arithmetic: `x = c * a + (1 - c) * b`\n"
+     "  - split one loop into two, each with a straight-line body\n"},
+    {"early-exit", DECISION_VECTOR_REFUSAL,
+     "The loop can leave before its trip count",
+     "A `break` or an early `return` means the number of iterations is not\n"
+     "known when the loop starts. A kernel that processes eight elements per\n"
+     "step could run past the element the loop meant to stop at.\n"
+     "\n"
+     "Fix: where the search and the work are separable, do the work in a\n"
+     "counted loop and the search in its own. A `break` on the last iteration\n"
+     "costs nothing to keep scalar.\n"},
+    {"int16-elements", DECISION_VECTOR_REFUSAL,
+     "16-bit integer elements have no kernel",
+     "The loop loads or stores int16/uint16. Mettle ships kernels for 8-bit\n"
+     "and 32-bit integers and for both float widths, but not for 16-bit.\n"
+     "\n"
+     "Fix: widen the array to int32. The loop then runs eight lanes at a time\n"
+     "instead of one, which more than pays for the extra memory in a hot loop.\n"
+     "Where the values fit in a byte, int8 is faster still.\n"
+     "\n"
+     "This is a gap in the compiler, not a fact about your code. The report\n"
+     "simulates the widening and tells you which kernel you would get.\n"},
+    {"int64-elements", DECISION_VECTOR_REFUSAL,
+     "64-bit integer elements have no kernel",
+     "The loop loads or stores int64/uint64. There is no 64-bit integer kernel\n"
+     "yet, so the loop stays scalar.\n"
+     "\n"
+     "Fix: use int32 where the range allows it. Four lanes per vector become\n"
+     "eight. Where the values genuinely need 64 bits, this loop is at its\n"
+     "floor for now.\n"},
+    {"serial-recurrence", DECISION_VECTOR_REFUSAL,
+     "The loop carries a serial recurrence",
+     "A value is computed from its own previous value through an operation\n"
+     "that does not reassociate: `*`, `/`, a shift, or a bitwise or xor op.\n"
+     "Iteration 2 cannot start until iteration 1 has finished, so the lanes\n"
+     "form a chain rather than eight independent pieces of work.\n"
+     "\n"
+     "This is the one refusal that is a fact about the algorithm rather than a\n"
+     "gap in the compiler. A hash, a linear congruential generator, an IIR\n"
+     "filter: the running state IS the algorithm, and the loop is already at\n"
+     "its scalar floor.\n"
+     "\n"
+     "What does vectorize: `+` and `-` reductions. Those reassociate, so the\n"
+     "compiler splits them into per-lane partial sums and adds the lanes at\n"
+     "the end.\n"
+     "\n"
+     "Fix: none, unless the algorithm itself can change. Some hashes have a\n"
+     "parallel form that hashes N independent streams and combines them.\n"},
+    {"mixed-float-widths", DECISION_VECTOR_REFUSAL,
+     "The loop mixes float32 and float64",
+     "One vector register holds eight float32 or four float64. A loop that\n"
+     "touches both would need two lane counts at once, and the conversion\n"
+     "between them costs more than the kernel saves.\n"
+     "\n"
+     "Fix: pick one width for the whole loop. Convert on the way in or on the\n"
+     "way out, outside the loop.\n"},
+    {"byte-sum-narrow-acc", DECISION_VECTOR_REFUSAL,
+     "Byte sum into an accumulator narrower than int64",
+     "Summing bytes has a very fast kernel (`vpsadbw`, 32 bytes per step), but\n"
+     "it accumulates into int64: 32 lanes of a byte each can carry further\n"
+     "than 32 bits, and the kernel will not silently give you a different\n"
+     "answer from the scalar loop.\n"
+     "\n"
+     "Example:\n"
+     "    var total: int64 = 0;\n"
+     "    for i in 0..n {\n"
+     "        total = total + (int64)data[i];\n"
+     "    }\n"
+     "\n"
+     "Fix: declare the accumulator int64. The report simulates that change,\n"
+     "re-runs the optimizer, and only prints the advice once the loop really\n"
+     "does vectorize with it.\n"},
+    {"int32-sum-narrow-acc", DECISION_VECTOR_REFUSAL,
+     "int32 sum into an accumulator narrower than int64",
+     "Same rule as `byte-sum-narrow-acc`, one width up. The int32 sum kernel\n"
+     "(`vpaddd`) folds eight lanes into an int64 accumulator, because eight\n"
+     "int32 values summed can overflow int32 while the scalar loop, adding one\n"
+     "at a time, would not have.\n"
+     "\n"
+     "Fix: declare the accumulator int64. The elements stay int32; only the\n"
+     "running total widens.\n"},
+    {"inlined-param-local", DECISION_VECTOR_REFUSAL,
+     "An inlined parameter copy survived in the body",
+     "The inliner left a `__inl_*` temporary inside the loop, and the\n"
+     "recognizers see a local write per iteration where they expected a plain\n"
+     "array access.\n"
+     "\n"
+     "This is a compiler limitation, not a problem in your code. Report the\n"
+     "loop if you hit it: the shape that produced it is worth fixing.\n"},
+    {"body-local", DECISION_VECTOR_REFUSAL,
+     "A local is declared inside the loop body",
+     "The recognizers match on a straight run of loads, arithmetic and stores.\n"
+     "A local declared in the body adds a stack slot written every iteration,\n"
+     "which none of the shapes cover.\n"
+     "\n"
+     "Fix: declare the variable before the loop and assign it inside, or fold\n"
+     "the expression into the statement that uses it.\n"},
+    {"dot-shape-address", DECISION_VECTOR_REFUSAL,
+     "Dot product with an address the kernel cannot follow",
+     "The loop is a float multiply-accumulate, which is exactly the FMA dot\n"
+     "product kernel's shape, but the addresses do not match. The kernel needs\n"
+     "each base to be a plain pointer indexed by the loop counter: `a[i]`, not\n"
+     "`a[r * cols + i]`.\n"
+     "\n"
+     "Example, an inner product over one row of a matrix:\n"
+     "    for r in 0..rows {\n"
+     "        var row: float32* = &m[r * cols];   // hoisted, invariant here\n"
+     "        for c in 0..cols {\n"
+     "            acc = acc + row[c] * x[c];      // now `base[i]`\n"
+     "        }\n"
+     "    }\n"
+     "\n"
+     "Fix: lift the invariant part of the index into a pointer before the loop.\n"
+     "The report checks first: when the other half of the index changes every\n"
+     "iteration the access really is non-unit-stride, and the report says so\n"
+     "instead of giving advice that cannot work.\n"},
+    {"store-only-fill", DECISION_VECTOR_REFUSAL,
+     "Fill loop the fill kernel could not claim",
+     "The loop writes the same value over and over, which is the fill shape,\n"
+     "but one of the kernel's requirements was not met. The remark names\n"
+     "which, because the answer differs:\n"
+     "\n"
+     "  - Several stores in one body. The kernel fills one region per loop.\n"
+     "    Split it into one loop per destination and each becomes a kernel.\n"
+     "\n"
+     "  - 1-byte elements. The kernel covers 2, 4 and 8 bytes. This is a gap\n"
+     "    in the compiler; there is nothing to change in the loop.\n"
+     "\n"
+     "  - A stack array as the destination. `a[i]` on a local array recomputes\n"
+     "    the array's address every iteration, and the kernel indexes off one\n"
+     "    invariant base. Bind it once and write through the pointer:\n"
+     "        var p: float32* = &a[0];\n"
+     "        for i in 0..n { p[i] = 1.0; }\n"
+     "    The generated code is the same either way; only the shape the\n"
+     "    recognizer sees changes.\n"
+     "\n"
+     "  - An address the kernel cannot follow. It handles `a[i]`, `a[c + i]`\n"
+     "    with `c` invariant, and a pointer walked by a constant stride. Lift\n"
+     "    the invariant part of the index into a base pointer before the loop.\n"},
+    {"unrecognized-shape", DECISION_VECTOR_REFUSAL,
+     "No recognizer claimed this loop",
+     "The honest fallback. The compiler ruled out every disqualifier it can\n"
+     "detect and still found no kernel for the loop, so it says that rather\n"
+     "than guessing at a cause.\n"
+     "\n"
+     "What does vectorize, as a checklist:\n"
+     "  - unit-stride accesses, `a[i]` and not `a[i * k]`\n"
+     "  - int8, int32, float32 or float64 elements\n"
+     "  - a straight-line body: no calls, no branches, no allocation\n"
+     "  - one of the known shapes: a map (`a[i] = expr`), a `+` reduction\n"
+     "    (`s = s + expr`), a dot product, or a fill\n"
+     "\n"
+     "A loop that meets all of that and still lands here is worth reporting.\n"},
+
+    /* ---- inlining refusals ----------------------------------------------- */
+    {"callee-no-body", DECISION_INLINE_REFUSAL,
+     "The callee has no body to inline",
+     "The function is declared but not defined in this program: an `extern`,\n"
+     "or a runtime entry point. There is nothing to copy into the caller.\n"
+     "\n"
+     "This is not a problem. A call to a C function or an OS API is a call.\n"},
+    {"callee-noinline", DECISION_INLINE_REFUSAL,
+     "The callee is marked @noinline",
+     "An absolute veto. @noinline is not a hint, and no budget or heuristic\n"
+     "overrides it.\n"
+     "\n"
+     "Fix: remove @noinline where inlining is what you want. Where it is on\n"
+     "the function deliberately (to keep a call boundary for profiling, or to\n"
+     "shape code layout), this remark is the compiler agreeing with you.\n"
+     "\n"
+     "The report simulates removing it and tells you what inlining would have\n"
+     "unlocked, so the cost of the decorator is visible rather than assumed.\n"},
+    {"callee-denylisted", DECISION_INLINE_REFUSAL,
+     "The callee is on the compiler's inline denylist",
+     "A small set of names is refused by hand, as a guard against compile-time\n"
+     "blowup in shapes known to explode.\n"
+     "\n"
+     "Fix: mark the callee @inline to override the denylist. Watch compile\n"
+     "time afterwards, since that is the cost the guard exists to prevent.\n"},
+    {"too-many-parameters", DECISION_INLINE_REFUSAL,
+     "The callee takes more than 16 parameters",
+     "Past sixteen parameters the inliner's argument-binding work grows faster\n"
+     "than the inlining is worth.\n"
+     "\n"
+     "Fix: pass a struct. That is usually the better interface anyway, and it\n"
+     "brings the function back under the cap.\n"},
+    {"callee-parameter-names", DECISION_INLINE_REFUSAL,
+     "The callee's parameter names are unavailable",
+     "The inliner binds arguments to parameters by name, and this callee\n"
+     "reached the optimizer without them.\n"
+     "\n"
+     "A compiler limitation rather than anything in your code.\n"},
+    {"callee-over-budget", DECISION_INLINE_REFUSAL,
+     "The callee's body is over the inline size budget",
+     "Inlining copies the body into every call site, so a large callee called\n"
+     "in ten places makes the program larger and the instruction cache colder.\n"
+     "The budget is the line the compiler draws, and --pgo moves that line for\n"
+     "callees measured hot.\n"
+     "\n"
+     "Fixes:\n"
+     "  - mark the callee @inline to override the budget\n"
+     "  - compile with --pgo, so a measured-hot callee earns the larger budget\n"
+     "    on evidence rather than on a decorator\n"
+     "\n"
+     "Before printing the @inline advice the report applies it to a scratch\n"
+     "copy and re-runs the check, so it never suggests a decorator that a\n"
+     "structural guard behind the budget would refuse anyway.\n"},
+    {"callee-call-count", DECISION_INLINE_REFUSAL,
+     "The callee makes more calls than the inline call-count budget allows",
+     "The callee's body is small enough, but it is mostly calls to other\n"
+     "functions: a glue routine that orchestrates helpers. Inlining one of\n"
+     "those copies the orchestration into the caller and gains nothing, since\n"
+     "the calls it makes are still calls.\n"
+     "\n"
+     "Fix: mark the callee @inline to override the cap, where the caller\n"
+     "really does benefit from seeing through the glue.\n"},
+    {"callee-inline-asm", DECISION_INLINE_REFUSAL,
+     "The callee contains inline assembly",
+     "An asm block can depend on the frame it was written for. Copying it into\n"
+     "another function is not safe in general, so the inliner does not.\n"
+     "\n"
+     "A structural guard: @inline does not override it.\n"},
+    {"callee-has-loop", DECISION_INLINE_REFUSAL,
+     "The callee contains a loop the inliner declines",
+     "A compiler limitation, not a problem in your code.\n"
+     "\n"
+     "The cost is small either way: next to a loop, the call that reaches it\n"
+     "is noise. Where the loop is hot, look at its own remark instead. That is\n"
+     "where the time goes.\n"},
+    {"callee-no-return",  DECISION_INLINE_REFUSAL,
+     "The callee has no return instruction to rewrite",
+     "Inlining works by rewriting the callee's returns into assignments in the\n"
+     "caller. A body with no return has nothing to rewrite. A function that\n"
+     "only ever traps or loops forever looks like this.\n"
+     "\n"
+     "A structural guard: @inline does not override it.\n"},
+    {"callee-has-kernel", DECISION_INLINE_REFUSAL,
+     "The callee's loops became SIMD kernels",
+     "Not a refusal to worry about. The callee's loops vectorized, which\n"
+     "happens after inlining runs, so the call survives to the end of the\n"
+     "pipeline and gets reported here.\n"
+     "\n"
+     "The kernel runs at the same speed either way. One call to reach it is\n"
+     "not measurable against the loop it contains.\n"},
+    {"recursive", DECISION_INLINE_REFUSAL,
+     "The call is directly recursive",
+     "A function calling itself cannot be inlined without bound. Mettle\n"
+     "expands bounded self-recursion automatically where it can prove the\n"
+     "depth; this remark is what is left over.\n"
+     "\n"
+     "Fix: rewrite as a loop where the recursion is hot and the depth is not\n"
+     "provable. A loop also gives the vectorizer something to work with.\n"},
+    {"caller-over-budget", DECISION_INLINE_REFUSAL,
+     "The calling function is over its budget and this site is cold",
+     "The caller has grown past the point where more inlining pays, and this\n"
+     "particular call site is neither inside a loop nor measured hot. It runs\n"
+     "at most once per call of the caller, so leaving it a real call costs\n"
+     "nothing you can measure.\n"
+     "\n"
+     "Sites exempt from this rule, and so still inlined: calls inside loops,\n"
+     "sites measured hot under --pgo, tiny call-free callees, and callees\n"
+     "marked @inline.\n"
+     "\n"
+     "There is deliberately no fix advice. For a cold one-shot site, not\n"
+     "inlining is the right answer.\n"},
+    {"argument-count", DECISION_INLINE_REFUSAL,
+     "The call's argument count does not match the callee",
+     "The site passes a different number of arguments than the callee declares,\n"
+     "or more than the inliner handles. A variadic call looks like this.\n"
+     "\n"
+     "A structural guard: @inline does not override it.\n"},
+    {"rounds-exhausted", DECISION_INLINE_REFUSAL,
+     "Inlining rounds ran out before this call was revisited",
+     "The callee passes every check. The call site only appeared late, exposed\n"
+     "by an earlier round of inlining, and the round limit was reached before\n"
+     "the inliner came back to it.\n"
+     "\n"
+     "Fix: mark the callee @inline, which raises its priority. Deep call\n"
+     "chains hit this most: each level of nesting costs a round.\n"},
+
+    /* ---- applied optimizations ------------------------------------------- */
+    {"vectorized", DECISION_APPLIED,
+     "The loop became a SIMD kernel",
+     "The whole loop now runs as vector instructions, several elements per\n"
+     "step. The remark names the kernel and the width, for example\n"
+     "`vfmadd231ps, 8-wide float32`, so you can check that the width matches\n"
+     "the element type you meant to use.\n"},
+    {"vectorized-inner", DECISION_APPLIED,
+     "The inner loop of a nest became a kernel",
+     "The inner loop vectorized and the outer loop stays scalar, driving it.\n"
+     "This is the normal outcome for a nest, and usually the one you want: the\n"
+     "inner loop is where the elements are.\n"},
+    {"outer-of-nest", DECISION_APPLIED,
+     "The outer loop of a nest, reported for context",
+     "Recorded so the report accounts for every loop rather than going quiet\n"
+     "about the outer one. Only innermost loops vectorize. The verdict that\n"
+     "matters is on the inner loop's own remark.\n"},
+    {"eliminated", DECISION_APPLIED,
+     "The loop was removed",
+     "The optimizer proved the loop had no effect anyone could observe, or\n"
+     "folded it to a constant, so it emits nothing at all.\n"
+     "\n"
+     "Worth a glance in a benchmark. A loop that was meant to measure\n"
+     "something and got eliminated measures nothing.\n"},
+    {"inlined", DECISION_APPLIED,
+     "The call was inlined",
+     "The callee's body was copied into the caller and the call is gone. This\n"
+     "is also what makes the surrounding loop vectorizable, since a call in\n"
+     "the body would have blocked it.\n"},
+    {"unrolled", DECISION_APPLIED,
+     "The loop was unrolled",
+     "The body was replicated so fewer iterations do more work each, which\n"
+     "removes counter arithmetic and branch overhead. A loop with a constant\n"
+     "trip count small enough is unrolled fully, and then no loop is left.\n"},
+    {"hoisted", DECISION_APPLIED,
+     "A call was lifted out of the loop",
+     "The callee is @pure and its arguments do not change across iterations,\n"
+     "so the result cannot change either. It is computed once before the loop.\n"
+     "\n"
+     "This is what @pure buys. Without it the compiler must assume the call\n"
+     "could do anything, and must repeat it.\n"},
+    {"if-converted", DECISION_APPLIED,
+     "A branch became branchless arithmetic",
+     "A short `if` in the body was rewritten as a select or a mask, so both\n"
+     "sides are computed and one is chosen. That removes a mispredictable\n"
+     "branch, and it is what lets a loop with a small conditional vectorize.\n"},
+    {"prefetched", DECISION_APPLIED,
+     "A prefetch was inserted",
+     "The loop walks memory with a stride the compiler can see ahead of, so it\n"
+     "asks for the line some iterations early. This hides part of the memory\n"
+     "latency on a loop whose limit is bandwidth rather than arithmetic.\n"},
+    {"layout-optimized", DECISION_APPLIED,
+     "A data layout was reshaped",
+     "Fields or elements were reordered so the accesses in the hot loop fall\n"
+     "in the same cache lines. Nothing in the program's meaning changes.\n"},
+    {"noalloc-verified", DECISION_APPLIED,
+     "The @noalloc contract holds",
+     "The function is marked @noalloc, and the compiler walked everything it\n"
+     "can reach and found no allocation on any path. The contract is proved,\n"
+     "not assumed. A violation would have been a compile error, not a warning.\n"},
+};
+
+#define DOCS_COUNT (sizeof(DOCS) / sizeof(DOCS[0]))
+#define DECISIONS_COUNT (sizeof(DECISIONS) / sizeof(DECISIONS[0]))
+
+static const char *decision_group_title(DecisionGroup group) {
+  switch (group) {
+  case DECISION_VECTOR_REFUSAL:
+    return "Why a loop did not vectorize";
+  case DECISION_INLINE_REFUSAL:
+    return "Why a call was not inlined";
+  case DECISION_APPLIED:
+    return "What the optimizer applied";
   }
-  printf("\nRun `mettle explain <CODE>` for details on one of them.\n");
+  return "Optimizer decisions";
+}
+
+static void print_code_list(void) {
+  printf("Diagnostic codes (compile errors and warnings):\n");
+  for (size_t i = 0; i < DOCS_COUNT; i++) {
+    printf("  %-22s %s\n", DOCS[i].code, DOCS[i].title);
+  }
+
+  const DecisionGroup groups[] = {DECISION_VECTOR_REFUSAL,
+                                  DECISION_INLINE_REFUSAL, DECISION_APPLIED};
+  for (size_t g = 0; g < sizeof(groups) / sizeof(groups[0]); g++) {
+    printf("\n%s (--explain decision codes):\n",
+           decision_group_title(groups[g]));
+    for (size_t i = 0; i < DECISIONS_COUNT; i++) {
+      if (DECISIONS[i].group == groups[g]) {
+        printf("  %-22s %s\n", DECISIONS[i].code, DECISIONS[i].title);
+      }
+    }
+  }
+
+  printf("\nRun `mettle explain <CODE>` for details on any of them, for "
+         "example:\n");
+  printf("  mettle explain E0004\n");
+  printf("  mettle explain dot-shape-address\n");
+}
+
+/* Strip the punctuation a code picks up when it is pasted out of a report:
+ * brackets from `[E0004]`, backticks and quotes from prose, and a trailing
+ * comma or period. Case is left alone; the callers fold it themselves. */
+static void normalize_code(const char *code, char *out, size_t cap) {
+  size_t n = 0;
+  for (const char *p = code; *p && n + 1 < cap; p++) {
+    if (*p == '[' || *p == ']' || *p == '`' || *p == '\'' || *p == '"' ||
+        *p == ',' || *p == '.') {
+      continue;
+    }
+    out[n++] = *p;
+  }
+  out[n] = '\0';
+}
+
+static int code_equal_fold(const char *a, const char *b) {
+  for (; *a && *b; a++, b++) {
+    char ca = *a, cb = *b;
+    if (ca >= 'A' && ca <= 'Z') {
+      ca = (char)(ca - 'A' + 'a');
+    }
+    if (cb >= 'A' && cb <= 'Z') {
+      cb = (char)(cb - 'A' + 'a');
+    }
+    /* '_' and '-' are the same separator as far as a reader is concerned. */
+    if (ca == '_') {
+      ca = '-';
+    }
+    if (cb == '_') {
+      cb = '-';
+    }
+    if (ca != cb) {
+      return 0;
+    }
+  }
+  return *a == '\0' && *b == '\0';
+}
+
+/* Does `code` contain `fragment`, ignoring case and treating '_' as '-'? */
+static int code_contains_fold(const char *code, const char *fragment) {
+  size_t n = strlen(fragment);
+  size_t len = strlen(code);
+  if (n == 0 || n > len) {
+    return 0;
+  }
+  for (size_t start = 0; start + n <= len; start++) {
+    size_t k = 0;
+    for (; k < n; k++) {
+      char a = code[start + k], b = fragment[k];
+      if (a >= 'A' && a <= 'Z') {
+        a = (char)(a - 'A' + 'a');
+      }
+      if (b >= 'A' && b <= 'Z') {
+        b = (char)(b - 'A' + 'a');
+      }
+      if (a == '_') {
+        a = '-';
+      }
+      if (b == '_') {
+        b = '-';
+      }
+      if (a != b) {
+        break;
+      }
+    }
+    if (k == n) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Edit distance, capped at a small band: the suggestion is only worth making
+ * when the input is close, so anything past `limit` returns limit + 1. */
+static size_t edit_distance(const char *a, const char *b, size_t limit) {
+  size_t la = strlen(a), lb = strlen(b);
+  if (la > lb ? la - lb > limit : lb - la > limit) {
+    return limit + 1;
+  }
+  size_t row[128];
+  if (lb + 1 > sizeof(row) / sizeof(row[0])) {
+    return limit + 1;
+  }
+  for (size_t j = 0; j <= lb; j++) {
+    row[j] = j;
+  }
+  for (size_t i = 1; i <= la; i++) {
+    size_t diagonal = row[0];
+    row[0] = i;
+    for (size_t j = 1; j <= lb; j++) {
+      size_t previous = row[j];
+      char ca = a[i - 1], cb = b[j - 1];
+      if (ca >= 'A' && ca <= 'Z') {
+        ca = (char)(ca - 'A' + 'a');
+      }
+      if (cb >= 'A' && cb <= 'Z') {
+        cb = (char)(cb - 'A' + 'a');
+      }
+      size_t substitute = diagonal + (ca == cb ? 0 : 1);
+      size_t insert = row[j - 1] + 1;
+      size_t remove = row[j] + 1;
+      size_t best = substitute < insert ? substitute : insert;
+      row[j] = best < remove ? best : remove;
+      diagonal = previous;
+    }
+  }
+  return row[lb];
+}
+
+/* The closest known code to `code`, or NULL when nothing is close enough. */
+static const char *nearest_code(const char *code) {
+  const char *best = NULL;
+  size_t best_distance = 4; /* anything further away is not a typo */
+
+  for (size_t i = 0; i < DECISIONS_COUNT; i++) {
+    size_t d = edit_distance(code, DECISIONS[i].code, best_distance);
+    if (d < best_distance) {
+      best_distance = d;
+      best = DECISIONS[i].code;
+    }
+  }
+  for (size_t i = 0; i < DOCS_COUNT; i++) {
+    size_t d = edit_distance(code, DOCS[i].code, best_distance);
+    if (d < best_distance) {
+      best_distance = d;
+      best = DOCS[i].code;
+    }
+  }
+  return best;
 }
 
 int mettle_explain_error_code(const char *code) {
@@ -177,27 +807,61 @@ int mettle_explain_error_code(const char *code) {
     return 0;
   }
 
-  /* Accept lowercase and codes pasted with brackets: "[E0004]" */
-  char normalized[16];
-  size_t n = 0;
-  for (const char *p = code; *p && n < sizeof(normalized) - 1; p++) {
-    if (*p == '[' || *p == ']')
-      continue;
-    char c = *p;
-    if (c >= 'a' && c <= 'z')
-      c = (char)(c - 'a' + 'A');
-    normalized[n++] = c;
-  }
-  normalized[n] = '\0';
+  char normalized[128];
+  normalize_code(code, normalized, sizeof(normalized));
 
-  for (size_t i = 0; i < sizeof(DOCS) / sizeof(DOCS[0]); i++) {
-    if (strcmp(DOCS[i].code, normalized) == 0) {
+  for (size_t i = 0; i < DOCS_COUNT; i++) {
+    if (code_equal_fold(DOCS[i].code, normalized)) {
       printf("%s: %s\n\n%s", DOCS[i].code, DOCS[i].title, DOCS[i].body);
       return 0;
     }
   }
 
-  fprintf(stderr, "error: unknown diagnostic code '%s'\n\n", code);
-  print_code_list();
+  for (size_t i = 0; i < DECISIONS_COUNT; i++) {
+    if (code_equal_fold(DECISIONS[i].code, normalized)) {
+      printf("%s: %s\n", DECISIONS[i].code, DECISIONS[i].title);
+      printf("(%s, reported by --explain)\n\n%s",
+             decision_group_title(DECISIONS[i].group), DECISIONS[i].body);
+      return 0;
+    }
+  }
+
+  /* A fragment of a code, which is what anyone types when they remember the
+   * distinctive half of it. One hit resolves; several list, since guessing
+   * between them would be worse than showing the choice. */
+  if (strlen(normalized) >= 3) {
+    const DecisionDoc *only = NULL;
+    size_t hits = 0;
+    for (size_t i = 0; i < DECISIONS_COUNT; i++) {
+      if (code_contains_fold(DECISIONS[i].code, normalized)) {
+        only = &DECISIONS[i];
+        hits++;
+      }
+    }
+    if (hits == 1) {
+      printf("%s: %s\n", only->code, only->title);
+      printf("(%s, reported by --explain)\n\n%s",
+             decision_group_title(only->group), only->body);
+      return 0;
+    }
+    if (hits > 1) {
+      printf("'%s' matches %zu codes:\n", code, hits);
+      for (size_t i = 0; i < DECISIONS_COUNT; i++) {
+        if (code_contains_fold(DECISIONS[i].code, normalized)) {
+          printf("  %-22s %s\n", DECISIONS[i].code, DECISIONS[i].title);
+        }
+      }
+      return 0;
+    }
+  }
+
+  fprintf(stderr, "error: unknown code '%s'\n", code);
+  const char *near = nearest_code(normalized);
+  if (near) {
+    fprintf(stderr, "help: did you mean `%s`? Run `mettle explain %s`\n", near,
+            near);
+  } else {
+    fprintf(stderr, "help: run `mettle explain list` for the full index\n");
+  }
   return 1;
 }

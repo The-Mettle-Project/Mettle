@@ -28,31 +28,6 @@ kernel vadd(a: float32*, b: float32*, c: float32*, n: int32) {
 }
 ```
 
-### Declaring the required block shape
-
-A kernel written for one launch geometry can declare it:
-
-```mettle
-kernel(block = 256) matvec(w: float32*, x: float32*, out: float32*,
-                           d: int32, n: int32) {
-  var row: int32 = block.x * 8 + thread.x / 32;
-  ...
-}
-
-kernel(block = (64, 4, 1)) tile(...) { ... }   // full three-dimensional form
-```
-
-The single-integer form means `block = (N, 1, 1)`. Dimensions must be positive
-integer literals and the block volume may not exceed 1024 work-items. The
-declaration is stamped into the emitted module: PTX emits `.reqntid`, so
-`cuLaunchKernel` rejects any launch whose block shape differs instead of
-running 7/8 of a multi-warp kernel against a garbage lane mapping; SPIR-V
-emits the `LocalSize` (reqd_work_group_size) execution mode so an OpenCL
-runtime enforces the same contract at enqueue. `--report-occupancy` also uses
-the declared shape to tighten its per-kernel occupancy bound to whole
-resident blocks. A kernel without the attribute keeps today's any-geometry
-behavior.
-
 ### Index built-ins
 
 Inside `--emit-ptx` compiles, the GPU thread/block indices are built-in member
@@ -85,105 +60,6 @@ PTX through `ptxas`; a CUDA Driver differential suite executes correctness and
 sanitizer cases on development hardware and has a stricter native GB10 mode.
 See the [GPU architecture and acceptance contract](gpu-architecture.md).
 
-Pointer indexing is typed at every width, including 16-bit elements: a
-`uint16*` (or `int16*`) load or store is one real 16-bit access
-(`ld.global.u16` / `st.global.u16` in PTX, a typed aligned access in SPIR-V)
-at any 2-aligned address, so formats whose blocks are 2-aligned but not
-4-aligned (GGML's 210-byte Q6_K, for example) do not fall back to per-byte
-loads.
-
-Two further intrinsic families cover custom number formats:
-
-```mettle
-extern fn f32_from_bits(bits: uint32) -> float32 = "f32_from_bits";
-extern fn bits_from_f32(x: float32) -> uint32 = "bits_from_f32";
-extern fn dp4a_u32(a: uint32, b: uint32, c: uint32) -> uint32 = "dp4a_u32";
-extern fn dp4a_s32(a: int32, b: int32, c: int32) -> int32 = "dp4a_s32";
-```
-
-`f32_from_bits` / `bits_from_f32` reinterpret a float32 and its IEEE-754
-encoding in either direction — one `mov.b32` in PTX, one `OpBitcast` in
-SPIR-V — so assembling or inspecting bit patterns (fp8, microscaling, and
-whatever ships next) needs no arithmetic reconstruction. `dp4a_u32` /
-`dp4a_s32` compute the four-way packed-byte dot product with 32-bit
-accumulate, `a0*b0 + a1*b1 + a2*b2 + a3*b3 + c`, over unsigned or signed
-bytes: PTX emits the native `dp4a.u32.u32` / `dp4a.s32.s32` instruction
-(available on every supported target), collapsing the shift/mask/convert/FMA
-chain of quantized decode; SPIR-V replays the exact byte semantics with
-scalar arithmetic.
-
-`dp2a_lo_*` / `dp2a_hi_*` are the mixed-width siblings: two 16-bit halves of
-the first operand against the low or high byte pair of the second.
-`prmt_b32(a, b, selector)` gathers four bytes out of the `{b:a}` octet by
-selector nibbles, which is the byte shuffling nibble-quant decode otherwise
-spends shifts and masks on.
-
-### Vector transfers
-
-`load4_f32` / `load4_u32` and `store4_f32` / `store4_u32` move four
-consecutive 32-bit elements in one 128-bit transaction:
-
-```mettle
-extern fn load4_f32(src: float32*, dst: float32*) = "load4_f32";
-
-private var v: float32[4];
-load4_f32(w + i * 4, &v[0]);       // one ld.global.v4.f32
-var s: float32 = v[0] * v[1] + v[2] * v[3];
-```
-
-The vector side is the global pointer; the scalar side is four ordinary
-accesses, which `ptxas` keeps in registers when it is a small
-constant-indexed private array. Both addresses must be 16-byte aligned, a
-source contract as it is for async copies. The portable SPIR-V profile moves
-the same four elements as four scalar accesses: same values and order,
-without the single transaction.
-
-### Packed half precision
-
-Two fp16 lanes ride in one 32-bit value with native two-at-a-time
-arithmetic, which is where the fp16 throughput actually is:
-
-```mettle
-extern fn hfma2(a: uint32, b: uint32, c: uint32) -> uint32 = "hfma2";
-extern fn h2f_lo(p: uint32) -> float32 = "h2f_lo";
-extern fn f2h2(lo: float32, hi: float32) -> uint32 = "f2h2";
-
-var acc: uint32 = f2h2(0.0, 0.0);
-acc = hfma2(w[i], x[i], acc);              // one fma.rn.f16x2, two lanes
-out[i] = h2f_lo(acc) + h2f_hi(acc);
-```
-
-`hadd2`, `hmul2`, and `hfma2` lower to PTX `add/mul/fma.rn.f16x2`;
-`h2f_lo` / `h2f_hi` widen one lane, `f2h2` packs two. `bf2f` and `f2bf`
-convert bfloat16, the latter rounding to nearest even in integer arithmetic
-so it holds on every target rather than only where `cvt.rn.bf16.f32` does.
-SPIR-V replays each lane separately.
-
-These are packed intrinsics over a `uint32` carrier, not a first-class
-`float16` scalar type: Mettle's scalar types are unchanged, and half-precision
-storage is still a `uint16*` (as it is for the tensor operations). A real
-`float16` scalar would have to work on every backend including x86, which is
-a type-system change rather than a kernel feature.
-
-### Looking inside a kernel
-
-```mettle
-extern fn gpu_print(fmt: cstring) = "gpu_print";
-extern fn gpu_print_i32(fmt: cstring, v: int32) = "gpu_print_i32";
-extern fn gpu_print_f32(fmt: cstring, v: float32) = "gpu_print_f32";
-extern fn gpu_print_2i32(fmt: cstring, a: int32, b: int32) = "gpu_print_2i32";
-extern fn gpu_assert(cond: int32) = "gpu_assert";
-```
-
-`gpu_print*` writes through the device print buffer (PTX `vprintf`). The
-format must be a literal; the argument shape is in the name, and the values
-follow the C varargs rules the device runtime reads them back with. Formats
-are pooled at module scope, so repeating one costs nothing.
-
-`gpu_assert(cond)` traps the launch at the offending lane when `cond` is
-false, but only under `--gpu-checks`. Without the flag it emits nothing, so
-assertions can stay in shipped source.
-
 An ordinary function called by a kernel is emitted as a non-entry device helper
 in both PTX and SPIR-V. Reachability is transitive and unrelated host functions
 are omitted; `kernel` remains the only launch-entry marker. Direct calls with
@@ -191,32 +67,6 @@ scalar or pointer parameters/results are supported. Recursion, indirect calls,
 external calls, host launches from device code, and calling a kernel as a normal
 function are rejected by a shared IR call-graph verifier, so the rule is the
 same for every frontend and GPU backend.
-
-### Loop unrolling: `@unroll(n)`
-
-The PTX and SPIR-V backends do not unroll loops on their own — a kernel loop
-compiles exactly as written, one load per iteration. When a latency-bound
-inner loop wants its loads pipelined, annotate it:
-
-```mettle
-@unroll(4) while (j < n) {
-  sum = sum + w[row * n + j] * x[j];
-  j = j + 32;
-}
-```
-
-`@unroll(n)` (factor 2..16) partially unrolls a counted loop: a main loop
-runs `n` copies of the body per trip while `counter + step*(n-1)` still
-passes the loop test, and the original loop remains as the remainder, so
-iteration order, count, and side effects are preserved exactly for every
-trip count including zero. It applies to `while`/`for` loops of the shape
-`counter < limit` (or `<=`) with a straight-line body (no nested control
-flow) whose last counter update is `counter = counter + K` for a positive
-constant `K`; the counter must not be written elsewhere in the body and the
-limit must be loop-invariant. A loop outside that shape is left rolled — the
-annotation is a hint, not a contract — and the same annotation works in CPU
-functions under `-O`/`--release`. Register pressure is the trade-off:
-`--report-occupancy` shows what a factor costs.
 
 ### Static and launch-sized workgroup memory, private memory, and barriers
 
@@ -399,29 +249,6 @@ IDs, memory loads, and opaque call results are conservatively varying. Helper pa
 reachable call site. Collectives under control that is insufficiently uniform for their
 scope, varying-trip loops, and work-item-varying broadcast lanes are rejected
 without putting backend reconvergence rules in the frontend.
-
-One derivation of a local ID is additionally recognized as subgroup-uniform:
-`thread.x / 32`, `thread.x >> 5`, and `thread.x / subgroup_size()` (through
-plain copies and 32-bit-or-wider integer casts) name the subgroup a work-item
-belongs to, so the natural multi-warp warp-per-row shape passes the verifier:
-
-```mettle
-kernel(block = 256) matvec(w: float32*, x: float32*, out: float32*,
-                           d: int32, n: int32) {
-  var row: int32 = block.x * 8 + thread.x / 32;
-  if (row >= d) { return; }          // subgroup-uniform early return: accepted
-  ...
-  var total: float32 = subgroup_reduce_add(sum);
-}
-```
-
-The recognition carries the launch precondition that subgroups are formed
-from consecutive `thread.x` values with the x-extent a multiple of the
-subgroup width — a one-dimensional block, or any block whose `block_dim.x` is
-a multiple of 32. That is the CUDA linearization contract and the shape
-`kernel(block = ...)` declares; the literal `32` / `>> 5` spellings
-additionally assume the 32-lane PTX subgroup, while `subgroup_size()` is the
-portable spelling.
 
 PTX maps a subgroup to the 32-lane NVIDIA warp and uses `activemask`,
 `shfl.sync`, and `vote.sync`. The reduction guards every tree edge with the active mask, so a
@@ -985,79 +812,10 @@ fn main() -> int32 {
 }
 ```
 
-### Declaring kernels host-side
-
-A kernel handle from `gpu_func` is an opaque `int64`, so a `dispatch` through
-one is unchecked: swap two arguments and the launch compiles and reads
-garbage. Declare the kernel host-side instead and `dispatch` checks the call
-like any other:
-
-```mettle
-extern kernel(block = 256) vadd(a: float32*, b: float32*, c: float32*,
-                                n: int32);
-
-dispatch vadd[(n + 255) / 256, 256](da, db, dc, n);   // checked
-dispatch vadd[work: n](da, db, dc, n);                // grid computed
-```
-
-An `extern kernel` declaration names a kernel defined in a separately
-compiled device module. It carries the signature and nothing else: no host
-symbol is emitted for it, and the launch handle is resolved by name from the
-module `gpu_module` loaded (or the one named by `gpu_module_bind`), cached
-after the first launch. Argument count, argument types, and the declared
-block shape are all checked at compile time; a device pointer may be passed
-as the `int64` handle it is on the host.
-
-`work: N` launches enough blocks to cover N work items at the declared block
-shape, so the host stops mirroring `(d + 7) / 8, 256` at every call site. A
-kernel that spends a whole subgroup per work item says so, and the grid
-follows:
-
-```mettle
-kernel(block = 256, per = warp) matvec(w: float32*, x: float32*,
-                                       out: float32*, n: int32, d: int32) {
-  var row: int32 = block.x * 8 + thread.x / 32;   // 8 warps per block
-  ...
-}
-
-dispatch matvec[work: d](dw, dx, dout, n, d);     // ceil(d / 8) blocks
-```
-
-`per = thread` is the default. `--report-launches` lists every dispatch site
-with the geometry the compiler can fold, and an explicit block that
-contradicts the declaration is a compile error rather than a launch the
-driver refuses.
-
-### Launch graphs
-
-A decode step is a fixed sequence of launches whose shapes never change, so
-the per-launch enqueue cost is pure overhead. Capture the sequence once and
-replay it:
-
-```mettle
-if (exec == 0) {
-  gpu_graph_capture_begin(stream);
-  dispatch norm[work: dim](...) on stream;
-  dispatch matvec[work: d](...) on stream;
-  exec = gpu_graph_capture_end(stream);
-} else {
-  gpu_graph_launch(exec, stream);
-}
-```
-
-Everything between begin and end must enqueue on that stream and must not
-synchronize: a capture records work rather than running it, so a readback in
-the middle deadlocks. Buffer addresses are baked into the graph, contents are
-not, which is what lets one capture serve every token. Capture-once and
-replay-after is left to the caller rather than hidden in a block form,
-because which iteration captures is a decision only the caller can make.
-
 ### The `dispatch` statement
 
 ```
 dispatch KERNEL[grid, block](arg0, arg1, ...);
-
-dispatch KERNEL[grid, block](arg0, arg1, ...) on stream_handle;
 
 dispatch KERNEL[
   grid: (grid_x, grid_y, grid_z),
@@ -1074,11 +832,6 @@ dispatch KERNEL[
   `block`. `shared` and `stream` are optional, default to zero, and named
   controls may be reordered. Every statically known dimension must be positive;
   shared bytes are an integer and a stream is an integer or pointer handle.
-- `... on s;` enqueues the launch on stream `s` (a `gpu_stream_create()`
-  handle) without spelling the full named form — the sugar that lets a
-  compact launch overlap with a previous token's asynchronous readback.
-  It composes with either form but conflicts with an explicit `stream:`
-  control, which is rejected.
 - The arguments are passed by value. Device pointers are `int64` handles; scalars
   (`int32`, `float32`, ...) are forwarded with their natural width.
 
@@ -1108,15 +861,6 @@ mettle -O --emit-ptx --gpu-arch=gb10 kernels.mettle -o kernels.ptx
 
 # A forward-compatible development baseline is also available:
 mettle -O --emit-ptx --gpu-arch=portable kernels.mettle -o kernels.ptx
-
-# Per-kernel registers and the occupancy ceiling they imply, at compile time.
-# When the SM count is known (--sms=N, or the local driver when the flag is
-# absent), each line also prints the whole-card fill threshold -- the block
-# count below which a launch is work-limited and cannot reach its ceiling:
-#   attention: 50 registers, block 32 (1 warps/block, 24 blocks)
-#     -> 24/48 resident warps (50%), register-limited;
-#        full card = 864 blocks (36 SMs x 24)
-mettle -O --emit-ptx --gpu-arch=gb10 --report-occupancy kernels.mettle -o kernels.ptx
 
 # 2. build the host, linking the CUDA driver import stub (build-time only)
 mettle --build host.mettle -o host.exe \

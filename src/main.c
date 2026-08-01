@@ -62,7 +62,7 @@ extern pid_t waitpid(pid_t pid, int *wstatus, int options);
 #ifdef METTLE_VERSION_RAW
 #define METTLE_VERSION METTLE_STRINGIFY(METTLE_VERSION_RAW)
 #else
-#define METTLE_VERSION "v0.15.1"
+#define METTLE_VERSION "v0.14.0"
 #endif
 #endif
 
@@ -390,18 +390,6 @@ static void print_doc_reference(const char *argv0, const char *relative_path) {
   free(docs_dir);
 }
 
-static int host_emits_pe(void) {
-  return binary_target_format_host_default() == BINARY_TARGET_FORMAT_COFF_WIN64;
-}
-
-static const char *example_executable_name(void) {
-  return host_emits_pe() ? "app.exe" : "app";
-}
-
-static const char *example_object_name(void) {
-  return host_emits_pe() ? "app.obj" : "app.o";
-}
-
 /* Single source of truth for the help-topic list. Referenced by print_usage,
  * the topic dispatcher, and the unknown-topic error so they cannot drift. */
 #define METTLE_HELP_TOPICS "build, runtime (alias: heap, gc), interop, stdlib, web, diagnostics (alias: errors), verify, test (alias: trace)"
@@ -430,10 +418,9 @@ static int print_help_topic(const char *program_name, const char *argv0,
   if (strcmp(topic, "build") == 0 || strcmp(topic, "compile") == 0) {
     printf("build - compile, assemble, and link an executable\n\n");
     printf("  Common:\n");
-    printf("    mettle --build app.mettle -o %s\n", example_executable_name());
-    printf("    mettle --build --release app.mettle -o %s              "
-           "   (optimized, stripped)\n",
-           example_executable_name());
+    printf("    mettle --build app.mettle -o app.exe\n");
+    printf("    mettle --build --release app.mettle -o app.exe              "
+           "   (optimized, stripped)\n");
     printf("\n");
     printf("  Notes:\n");
     printf("    --build emits a COFF object and links with the internal PE "
@@ -508,20 +495,24 @@ static int print_help_topic(const char *program_name, const char *argv0,
       strcmp(topic, "warnings") == 0) {
     printf("diagnostics - compile errors, warnings, and tooling output\n\n");
     printf("  Every diagnostic carries a stable code (E0001..E0007, "
-           "M0101..M0112), a source snippet\n");
+           "M0101..M0117), a source snippet\n");
     printf("  with the offending range underlined, and a help suggestion. The "
            "compiler recovers after\n");
     printf("  errors, so one compile reports every problem in the file.\n\n");
     printf("  mettle explain <CODE>       extended docs for a code (try: "
            "mettle explain E0004)\n");
-    printf("  mettle explain list         index of every diagnostic code\n");
+    printf("  mettle explain list         index of every code\n");
     printf("  --error-format=json         one JSON object per diagnostic on "
            "stderr, for editors/CI\n");
     printf("  NO_COLOR / CLICOLOR_FORCE   disable / force ANSI colors\n\n");
     printf("  Warnings include unused variables (prefix a name with '_' to "
            "opt out), unreachable code,\n");
     printf("  and compile-time memory-safety findings (use-after-free, leaks, "
-           "double free, ...).\n");
+           "double free, ...).\n\n");
+    printf("  `explain` also covers the optimizer's decision codes, the ids "
+           "--explain prints in\n");
+    printf("  brackets after each verdict: mettle explain "
+           "dot-shape-address\n");
     print_doc_reference(argv0, "diagnostics.md");
     return 0;
   }
@@ -621,21 +612,7 @@ static char *default_executable_filename(const char *input_filename) {
     return NULL;
   }
 
-  BinaryTargetFormat host_format = binary_target_format_host_default();
-  if (host_format != BINARY_TARGET_FORMAT_ELF_X64 &&
-      host_format != BINARY_TARGET_FORMAT_ELF_ARM64) {
-    return replace_extension(input_filename, ".exe");
-  }
-
-  /* An extensionless input would name its own source, so suffix that one
-   * instead of overwriting it. */
-  char *stem = replace_extension(input_filename, "");
-  if (stem && stem[0] != '\0' && strcmp(stem, input_filename) != 0) {
-    return stem;
-  }
-
-  free(stem);
-  return build_sidecar_filename(input_filename, ".out");
+  return replace_extension(input_filename, ".exe");
 }
 
 static const char *default_object_output_filename(void) {
@@ -2453,6 +2430,19 @@ static int detect_gpu_sm_count(void) {
  * residency. When the SM count is known (--sms=N, or the local driver when
  * the flag is absent), each line also prints the whole-card fill threshold,
  * so a reader can put their grid size next to it. */
+/* `ptxas -v` writes its resource numbers as "<N> bytes <what>". Scan back from
+ * the label to the digits that belong to it. */
+static long long ptxas_bytes_before(const char *line, const char *label) {
+  const char *found = strstr(line, label);
+  if (!found) return -1;
+  const char *cursor = found;
+  while (cursor > line && cursor[-1] == ' ') cursor--;
+  const char *end = cursor;
+  while (cursor > line && cursor[-1] >= '0' && cursor[-1] <= '9') cursor--;
+  if (cursor == end) return -1;
+  return atoll(cursor);
+}
+
 static void report_ptx_occupancy(const IRProgram *program,
                                  const char *ptx_path, const char *arch,
                                  int sm_count, int sm_count_is_local) {
@@ -2480,13 +2470,33 @@ static void report_ptx_occupancy(const IRProgram *program,
   char line[512];
   char entry[256] = {0};
   long long entry_smem = 0;
+  long long spill_stores = 0;
+  long long spill_loads = 0;
+  long long stack_frame = 0;
   int reported = 0;
+  int any_spill = 0;
   while (fgets(line, sizeof(line), pipe)) {
     char name[256];
     if (sscanf(line, " ptxas info : Compiling entry function '%255[^']'",
                name) == 1) {
       snprintf(entry, sizeof(entry), "%s", name);
       entry_smem = 0;
+      spill_stores = 0;
+      spill_loads = 0;
+      stack_frame = 0;
+      continue;
+    }
+    /* The "Function properties" line precedes this entry's "Used" line and
+     * carries the stack frame and spill traffic. Spilling to local memory is
+     * a worse signal than any occupancy percentage: it is a per-access
+     * memory round trip the register allocator could not avoid. */
+    long long stores = ptxas_bytes_before(line, "bytes spill stores");
+    if (stores >= 0) {
+      long long loads = ptxas_bytes_before(line, "bytes spill loads");
+      long long frame = ptxas_bytes_before(line, "bytes stack frame");
+      spill_stores = stores;
+      spill_loads = loads > 0 ? loads : 0;
+      stack_frame = frame > 0 ? frame : 0;
       continue;
     }
     const char *used = strstr(line, "Used ");
@@ -2497,12 +2507,9 @@ static void report_ptx_occupancy(const IRProgram *program,
     if (sscanf(used, "Used %d registers", &registers) != 1) {
       continue;
     }
-    const char *smem = strstr(line, " bytes smem");
-    if (smem) {
-      const char *cursor = smem;
-      while (cursor > line && (cursor[-1] == ' ')) cursor--;
-      while (cursor > line && cursor[-1] >= '0' && cursor[-1] <= '9') cursor--;
-      entry_smem = atoll(cursor);
+    long long smem = ptxas_bytes_before(line, "bytes smem");
+    if (smem >= 0) {
+      entry_smem = smem;
     }
     long long register_warp_limit =
         registers > 0 ? 65536ll / ((long long)registers * 32) : 48;
@@ -2550,7 +2557,6 @@ static void report_ptx_occupancy(const IRProgram *program,
         printf("; full card = %lld blocks (%d SMs x %lld)",
                (long long)sm_count * blocks, sm_count, blocks);
       }
-      printf("\n");
     } else {
       printf("  %s: %d registers -> %lld/48 resident warps (%lld%%)%s",
              entry, registers, warps, warps * 100 / 48, limiter);
@@ -2558,8 +2564,15 @@ static void report_ptx_occupancy(const IRProgram *program,
         printf("; full card = %lld warps (%d SMs x %lld)",
                (long long)sm_count * warps, sm_count, warps);
       }
-      printf("\n");
     }
+    if (spill_stores > 0 || spill_loads > 0) {
+      printf("; SPILLS %lld bytes stored, %lld loaded", spill_stores,
+             spill_loads);
+      any_spill = 1;
+    } else if (stack_frame > 0) {
+      printf("; %lld byte stack frame", stack_frame);
+    }
+    printf("\n");
     reported = 1;
     entry[0] = '\0';
   }
@@ -2569,6 +2582,10 @@ static void report_ptx_occupancy(const IRProgram *program,
   int status = pclose(pipe);
 #endif
   remove(cubin);
+  if (any_spill) {
+    printf("  note: a spilling kernel pays a local-memory round trip per "
+           "spilled access; that costs more than the residency above.\n");
+  }
   if (!reported) {
     fprintf(stderr,
             "--report-occupancy: no ptxas resource report (is ptxas on PATH "
@@ -2782,6 +2799,11 @@ int main(int argc, char *argv[]) {
       options.simd_report = 1;
     } else if (strcmp(argv[i], "--explain") == 0) {
       options.explain = 1;
+    } else if (strncmp(argv[i], "--explain=", 10) == 0) {
+      /* A whole program's report runs to hundreds of lines. The selector cuts
+       * the prose down to the slice asked for; the JSON sidecar stays whole. */
+      options.explain = 1;
+      options.explain_filter = argv[i] + 10;
     } else if (strcmp(argv[i], "--explain-all") == 0) {
       /* Whole-program report: no focus-file filter, so imported modules'
        * loops and calls are analyzed too (stdlib included). */
@@ -3091,12 +3113,9 @@ int main(int argc, char *argv[]) {
       return 1;
     }
 
-    /* ELF objects conventionally use .o; COFF uses .obj. ELF executables carry
-     * no extension, so append rather than replace: replacing would read the
-     * stem of a dotted name as an extension and build my.app into my.o. */
-    object_output_filename =
-        elf_build ? build_sidecar_filename(build_output_filename, ".o")
-                  : replace_extension(build_output_filename, ".obj");
+    /* ELF objects conventionally use .o; COFF uses .obj. */
+    object_output_filename = replace_extension(
+        build_output_filename, elf_build ? ".o" : ".obj");
     if (!object_output_filename) {
       fprintf(stderr, "Error: Failed to determine object output path\n");
       free(build_output_filename);
@@ -3352,6 +3371,7 @@ static int compile_optimize_ir(IRProgram *ir_program, ASTNode *ast_program,
   /* Large --explain reports divert to `<output-stem>.explain.txt`. */
   ir_explain_set_output_path(options->output_filename);
   ir_explain_set_json(options->explain_json ? 1 : 0);
+  ir_explain_set_filter(options->explain_filter);
   /* --annotate-asm: arm the codegen annotator before codegen runs, and keep the
    * optimization remarks alive so it can join them onto the emitted asm. */
   /* --explain-json wants the codegen cost model (cycles per iteration, port
@@ -4252,7 +4272,8 @@ void print_usage(const char *program_name) {
   printf("Usage: %s [options] <input.mettle>\n", program_name);
   printf("       %s help [topic]\n", program_name);
   printf("       %s docs [topic]\n", program_name);
-  printf("       %s explain <CODE>   Explain a diagnostic code (e.g. E0004, M0103; 'list' for all)\n",
+  printf("       %s explain <CODE>   Explain a code: a diagnostic (E0004, M0103) or an --explain\n"
+         "                            decision (dot-shape-address); 'list' for the index\n",
          program_name);
   printf("       %s test <file> [--filter=S]   Run @test functions in the compile-time\n"
          "                           interpreter (instant; no codegen or linking)\n",
@@ -4325,6 +4346,9 @@ void print_usage(const char *program_name) {
          "                      whenever the optimizer declined (needs -O/--release).\n"
          "                      Re-runs lead with what CHANGED since the last build,\n"
          "                      regressions first\n");
+  printf("  --explain=SELECTOR  Narrow the report to one slice of it: missed,\n"
+         "                      fixable, proven, loops, calls, a function name, or a\n"
+         "                      decision code (the id in brackets after a verdict)\n");
   printf("  --explain-json      Also write <output-stem>.explain.json (machine-\n"
          "                      readable report; implies --explain)\n");
   printf("  --annotate-asm      Print the emitted assembly annotated with the codegen\n"
@@ -4387,18 +4411,13 @@ void print_usage(const char *program_name) {
   printf("  --debug-compiler    Track compiler context for internal error reports\n");
   printf("  -h, --help          Show this help message\n");
   printf("\nExamples:\n");
-  printf("  %s app.mettle -o %s\n", program_name, example_object_name());
+  printf("  %s app.mettle -o app.obj\n", program_name);
   printf("      Compile to a native object file.\n");
-  printf("  %s --build app.mettle -o %s\n", program_name,
-         example_executable_name());
-  printf("      Self-contained build: %s\n",
-         host_emits_pe() ? "COFF object + internal PE linker."
-                         : "ELF object + native linker.");
-  printf("  %s --build --release app.mettle -o %s\n", program_name,
-         example_executable_name());
+  printf("  %s --build app.mettle -o app.exe\n", program_name);
+  printf("      Self-contained build: COFF object + internal PE linker.\n");
+  printf("  %s --build --release app.mettle -o app.exe\n", program_name);
   printf("      Optimized, comment-stripped release build.\n");
-  printf("  %s --build --tracy app.mettle -o %s\n", program_name,
-         example_executable_name());
+  printf("  %s --build --tracy app.mettle -o app.exe\n", program_name);
   printf("      Build with Tracy instrumentation (set TRACY_DIR or "
          "--tracy-dir).\n");
   printf("\nHelp:\n");

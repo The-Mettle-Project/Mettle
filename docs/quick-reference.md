@@ -216,11 +216,7 @@ replaced with that finding rather than printed.
 Prefix a function with `@inline`/`@noinline` (inlining control), `@pure`
 (side-effect-free → loop-invariant calls hoisted out of loops), or
 `@simd`/`@simd!` (vectorization contract on every body loop). Decorators stack,
-take effect under `-O`/`--release`, and apply to functions only — except
-`@simd` and `@unroll(n)`, which may also prefix a single loop. `@unroll(n)`
-(factor 2..16) partially unrolls a counted straight-line loop by `n` with the
-original loop kept as the remainder; it works in CPU functions and GPU
-kernels alike (see [gpu.md](gpu.md#loop-unrolling-unrolln)). See
+take effect under `-O`/`--release`, and apply to functions only. See
 [Declarations](declarations.md#function-decorators).
 
 The `!` decorators are **contracts**: the compiler either delivers the
@@ -252,42 +248,16 @@ import "std/gpu";
 // ... gpu_init, gpu_module, gpu_func, gpu_malloc, gpu_to_device ...
 dispatch vadd[(n + 255) / 256, 256](da, db, dc, n);
 
-dispatch vadd[(n + 255) / 256, 256](da, db, dc, n) on compute_stream;
-
 dispatch gemm[grid: (tiles_n, tiles_m, batch),
               block: (32, 1, 1),
               shared: arena_bytes,
               stream: compute_stream](a, b, c, d, m, n, k);
 ```
 
-Declare the kernel host-side and `dispatch` checks the call and sizes the
-grid itself:
-
-```mettle
-extern kernel(block = 256) vadd(a: float32*, b: float32*, c: float32*,
-                                n: int32);
-extern kernel(block = 256, per = warp) matvec(w: float32*, x: float32*,
-                                              out: float32*, n: int32,
-                                              d: int32);
-
-dispatch vadd[work: n](da, db, dc, n);      // grid = ceil(n / 256)
-dispatch matvec[work: d](dw, dx, dout, n, d);  // grid = ceil(d / 8)
-```
-
-Argument count and types are checked against the declaration, the handle is
-resolved by name from the loaded module, and an explicit block that
-contradicts the declaration is a compile error. `--report-launches` lists
-every dispatch site.
-
-In the older untyped form, `vadd` is the runtime function handle returned by
-`gpu_func`, not a compile-time reference to the source kernel declaration. `dispatch` preserves
+Here `vadd` is the runtime function handle returned by `gpu_func`, not a
+compile-time reference to the source kernel declaration. `dispatch` preserves
 a typed, target-neutral launch in IR; the host backend alone marshals it for
-the selected runtime provider. The compact form supplies 1-D grid/block sizes;
-`... on s` enqueues it on stream `s`. A kernel that requires one launch shape
-declares it — `kernel(block = 256) matvec(...)` — and the emitted module
-(`.reqntid` / `LocalSize`) makes the driver reject any other geometry.
-`mettle -O --emit-ptx --report-occupancy` prints each kernel's registers and
-occupancy ceiling at compile time.
+the selected runtime provider. The compact form supplies 1-D grid/block sizes.
 The named form requires `grid: (x,y,z)` and `block: (x,y,z)` and optionally
 accepts `shared:` dynamic-arena bytes plus `stream:`; controls may be reordered.
 libmtlc's `mtlc_gpu_launch` builds the identical operation.

@@ -49,7 +49,7 @@ help: for more about this error, run `mettle explain E0003`
   to opt out (`var _x: ...`). Only the main compile unit is checked;
   imported modules stay quiet.
 - `Unreachable code` - a statement follows a `return`/terminator.
-- Memory-safety warnings and errors (`M0101`..`M0112`): use-after-free,
+- Memory-safety warnings and errors (`M0101`..`M0117`): use-after-free,
   double free, leaks, out-of-bounds constant indexing, escaping stack
   addresses, and borrow-checker lifetime findings. See
   [borrow-checker.md](borrow-checker.md). `M0101` and `M0102` also cover the
@@ -59,16 +59,28 @@ help: for more about this error, run `mettle explain E0003`
 
 ## `mettle explain <CODE>`
 
-Extended documentation for any diagnostic code, with an example and how to
-fix it:
+Extended documentation for any code, with an example and how to fix it:
 
 ```
 $ mettle explain E0004
 $ mettle explain M0103
-$ mettle explain list      # index of every code
+$ mettle explain dot-shape-address    # an --explain decision code
+$ mettle explain list                 # index of every code
 ```
 
-Codes are stable across compiler versions:
+The lookup is forgiving: it folds case, treats `_` and `-` alike, and strips
+brackets and backticks so a code pasted out of a report works. A fragment
+resolves when it is unique (`mettle explain dot` prints `dot-shape-address`)
+and lists the candidates when it is not (`mettle explain budget` shows both
+budget refusals). A typo gets the nearest code.
+
+Two families of code share the command. Diagnostic codes name a compile error
+or warning. Decision codes name an optimizer verdict: the `--explain` report
+prints one in brackets after every line, and `--explain-json` carries the same
+string in its `code` field. See [The `--explain-json` schema](explain-json.md)
+for the full list.
+
+Diagnostic codes are stable across compiler versions:
 
 | Code | Meaning |
 |------|---------|
@@ -79,7 +91,10 @@ Codes are stable across compiler versions:
 | E0005 | Scope error |
 | E0006 | I/O error |
 | E0007 | Internal compiler error |
-| M0101..M0112 | Memory-safety findings (`mettle explain list`) |
+| M0101..M0117 | Memory-safety findings (`mettle explain list`) |
+
+A memory finding reports under its own `M` code rather than the generic
+`E0003`, so `mettle explain M0107` works on the diagnostic in front of you.
 
 ## Machine-readable output: `--error-format=json`
 
@@ -108,7 +123,9 @@ Windows consoles get VT sequences enabled automatically.
 ## Related tooling
 
 - `--explain` / `--explain-json` - optimization decision report (what
-  vectorized/inlined and why not).
+  vectorized/inlined and why not). `--explain=SELECTOR` narrows the prose to
+  `missed`, `fixable`, `proven`, `loops`, `calls`, one function, or one
+  decision code.
 - `--annotate-asm`, `--annotate-lines=A-B` - codegen provenance.
 - Compile-time memory diagnostics run automatically; disable interprocedural
   analysis with `METTLE_NO_MEM_INTERPROC=1`.

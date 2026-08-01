@@ -24,6 +24,19 @@
 //          freed -- now seen THROUGH borrowing helpers, and fed by
 //          wrapper allocators (`make() -> malloc(...)`)           warning
 //
+// The borrow-lifetime and constant-fault findings share the walker:
+//   M0110  borrowed interior pointer outlives its scope           warning
+//   M0111  borrow invalidated by realloc                          warning
+//   M0112  borrow invalidated by free                             warning
+//   M0113  dereference of a provably null pointer                 warning
+//   M0114  dereference of an unmapped constant address            warning
+//   M0115  shift count at or past the operand width               warning
+//   M0116  division or modulo by a constant zero                   ERROR
+//   M0117  loop index runs past the end of the array               ERROR
+//
+// Every finding reports under its own code, not the generic E0003, so
+// `mettle explain M0107` works on the diagnostic the reader is looking at.
+//
 // The analysis is deliberately conservative: definite-bug states are only
 // set on the function's straight-line spine, anything inside a branch or
 // loop demotes to "maybe" and stays silent, and only DEFINITE summaries
@@ -289,7 +302,12 @@ static MemLocal *mem_add_local(MemCtx *ctx, const char *name,
 
 /* ---- diagnostics -------------------------------------------------------------- */
 
-static void mem_warn(MemCtx *ctx, SourceLocation loc, const char *fmt, ...) {
+/* Every finding here reports under its own M-code rather than the generic
+ * E0003 its ErrorType implies, so the reader can run `mettle explain M0107`
+ * on the diagnostic in front of them. The code travels to three places at
+ * once: the diagnostic, the --explain memory section, and the JSON sidecar. */
+static void mem_warn(MemCtx *ctx, const char *code, SourceLocation loc,
+                     const char *fmt, ...) {
   char message[512];
   va_list args;
   if (ctx->mode == MEM_MODE_SUMMARY) {
@@ -300,12 +318,13 @@ static void mem_warn(MemCtx *ctx, SourceLocation loc, const char *fmt, ...) {
   va_end(args);
   error_reporter_add_warning(ctx->checker->error_reporter, ERROR_SEMANTIC, loc,
                              message);
+  error_reporter_set_last_code(ctx->checker->error_reporter, code);
   ir_explain_memory_note(
       error_reporter_current_filename(ctx->checker->error_reporter), 0,
-      loc.line, message, NULL);
+      loc.line, code, message, NULL);
 }
 
-static void mem_warn_suggest(MemCtx *ctx, SourceLocation loc,
+static void mem_warn_suggest(MemCtx *ctx, const char *code, SourceLocation loc,
                              const char *suggestion, const char *fmt, ...) {
   char message[512];
   va_list args;
@@ -318,13 +337,14 @@ static void mem_warn_suggest(MemCtx *ctx, SourceLocation loc,
   error_reporter_add_warning_with_suggestion(ctx->checker->error_reporter,
                                              ERROR_SEMANTIC, loc, message,
                                              suggestion);
+  error_reporter_set_last_code(ctx->checker->error_reporter, code);
   ir_explain_memory_note(
       error_reporter_current_filename(ctx->checker->error_reporter), 0,
-      loc.line, message, suggestion);
+      loc.line, code, message, suggestion);
 }
 
-static void mem_error(MemCtx *ctx, SourceLocation loc, const char *suggestion,
-                      const char *fmt, ...) {
+static void mem_error(MemCtx *ctx, const char *code, SourceLocation loc,
+                      const char *suggestion, const char *fmt, ...) {
   char message[512];
   va_list args;
   if (ctx->mode != MEM_MODE_LOCAL) {
@@ -336,9 +356,10 @@ static void mem_error(MemCtx *ctx, SourceLocation loc, const char *suggestion,
   error_reporter_add_error_with_suggestion(ctx->checker->error_reporter,
                                            ERROR_SEMANTIC, loc, message,
                                            suggestion);
+  error_reporter_set_last_code(ctx->checker->error_reporter, code);
   ir_explain_memory_note(
       error_reporter_current_filename(ctx->checker->error_reporter), 1,
-      loc.line, message, suggestion);
+      loc.line, code, message, suggestion);
   ctx->checker->has_error = 1;
   ctx->had_error = 1;
 }
@@ -547,7 +568,7 @@ static void mem_check_null_deref(MemCtx *ctx, ASTNode *pointer_expr,
              "Assign a valid address first, or guard the access with "
              "`if (%s != 0)`",
              local->name);
-    mem_warn_suggest(ctx, loc, suggestion,
+    mem_warn_suggest(ctx, "M0113", loc, suggestion,
                      "`%s` is null here (assigned at line %zu and never "
                      "reassigned); this dereference will trap at runtime",
                      local->name, local->null_loc.line);
@@ -555,7 +576,7 @@ static void mem_check_null_deref(MemCtx *ctx, ASTNode *pointer_expr,
     return;
   }
   if (local->is_wild) {
-    mem_warn(ctx, loc,
+    mem_warn(ctx, "M0114", loc,
              "`%s` points at the constant address %lld (assigned at line "
              "%zu); the low 64K of the address space is never mapped, so "
              "this dereference will fault",
@@ -584,7 +605,7 @@ static void mem_check_borrow_use(MemCtx *ctx, MemLocal *local,
              "Copy the value out before the block ends, or widen `%s`'s scope "
              "so it outlives `%s`",
              via, local->name);
-    mem_warn_suggest(ctx, loc, suggestion,
+    mem_warn_suggest(ctx, "M0110", loc, suggestion,
                      "Use of `%s` after the scope of `%s` ended at line %zu; "
                      "`%s` borrows into `%s`, whose storage is reclaimed when "
                      "its block exits, so this pointer is dangling",
@@ -593,7 +614,7 @@ static void mem_check_borrow_use(MemCtx *ctx, MemLocal *local,
     char suggestion[200];
     snprintf(suggestion, sizeof(suggestion),
              "Re-derive `%s` from `%s` after the `realloc`", local->name, via);
-    mem_warn_suggest(ctx, loc, suggestion,
+    mem_warn_suggest(ctx, "M0111", loc, suggestion,
                      "Use of `%s` after `%s` was reallocated at line %zu; "
                      "`realloc` may move the block, so this pointer is "
                      "dangling",
@@ -604,7 +625,7 @@ static void mem_check_borrow_use(MemCtx *ctx, MemLocal *local,
              "Take the borrow after the last `free`, or copy the value out "
              "before freeing `%s`",
              via);
-    mem_warn_suggest(ctx, loc, suggestion,
+    mem_warn_suggest(ctx, "M0112", loc, suggestion,
                      "Use of `%s` after `%s` was freed at line %zu; `%s` "
                      "borrows into `%s`'s block, so this is use-after-free "
                      "through an interior pointer",
@@ -704,20 +725,20 @@ static void mem_check_use(MemCtx *ctx, MemLocal *local, SourceLocation loc) {
                "`%s` and `%s` name the same block; free it once, after the "
                "last use of either",
                local->name, local->freed_alias);
-      mem_warn_suggest(ctx, loc, suggestion,
+      mem_warn_suggest(ctx, "M0101", loc, suggestion,
                        "Use of `%s` after the block it shares with `%s` was "
                        "freed at line %zu; freeing one alias frees the block "
                        "both names point to, so this is use-after-free",
                        local->name, local->freed_alias, local->freed_loc.line);
     } else {
-      mem_warn(ctx, loc,
+      mem_warn(ctx, "M0101", loc,
                "Use of `%s` after it was freed (freed at line %zu); this is "
                "use-after-free",
                local->name, local->freed_loc.line);
     }
     local->freed = MEM_FREED_MAYBE; /* one report per free site */
   } else if (ctx->mode == MEM_MODE_INTERPROC && local->freed_via != NULL) {
-    mem_warn(ctx, loc,
+    mem_warn(ctx, "M0108", loc,
              "Use of `%s` after the call to `%s` at line %zu freed it; this "
              "is use-after-free",
              local->name, local->freed_via, local->freed_loc.line);
@@ -757,27 +778,27 @@ static void mem_free_event(MemCtx *ctx, MemLocal *local, SourceLocation loc,
     int involves_call = local->freed_via != NULL || via != NULL;
     if (ctx->mode == MEM_MODE_LOCAL && !involves_call) {
       if (local->freed_alias) {
-        mem_warn(ctx, loc,
+        mem_warn(ctx, "M0102", loc,
                  "Double free of `%s`: it aliases `%s`, already freed at line "
                  "%zu",
                  local->name, local->freed_alias, local->freed_loc.line);
       } else {
-        mem_warn(ctx, loc, "Double free of `%s` (already freed at line %zu)",
+        mem_warn(ctx, "M0102", loc, "Double free of `%s` (already freed at line %zu)",
                  local->name, local->freed_loc.line);
       }
     } else if (ctx->mode == MEM_MODE_INTERPROC && involves_call) {
       if (via && local->freed_via) {
-        mem_warn(ctx, loc,
+        mem_warn(ctx, "M0109", loc,
                  "Double free of `%s`: the call to `%s` frees it, but the "
                  "call to `%s` at line %zu already did",
                  local->name, via, local->freed_via, local->freed_loc.line);
       } else if (via) {
-        mem_warn(ctx, loc,
+        mem_warn(ctx, "M0109", loc,
                  "Double free of `%s`: the call to `%s` frees it, but it was "
                  "already freed at line %zu",
                  local->name, via, local->freed_loc.line);
       } else {
-        mem_warn(ctx, loc,
+        mem_warn(ctx, "M0109", loc,
                  "Double free of `%s`: already freed by the call to `%s` at "
                  "line %zu",
                  local->name, local->freed_via, local->freed_loc.line);
@@ -886,7 +907,7 @@ static void mem_check_mem_op(MemCtx *ctx, CallExpression *call,
     long long capacity = mem_dest_capacity(
         ctx, call->arguments[MEM_OPS[i].dest_index], &array_name);
     if (capacity > 0 && size > capacity) {
-      mem_error(ctx, loc,
+      mem_error(ctx, "M0106", loc,
                 "Shrink the copy, or grow the destination array",
                 "`%s` writes %lld bytes into `%s`, which only has %lld bytes "
                 "left at this offset; this corrupts the stack frame",
@@ -919,7 +940,7 @@ static void mem_check_const_index(MemCtx *ctx, ASTNode *expr) {
       char suggestion[128];
       snprintf(suggestion, sizeof(suggestion),
                "Valid indexes for `%s` are 0..%lld", local->name, count - 1);
-      mem_error(ctx, expr->location, suggestion,
+      mem_error(ctx, "M0105", expr->location, suggestion,
                 "Index %lld is out of bounds for `%s` (%s)", value,
                 local->name, local->type_name);
     }
@@ -952,7 +973,7 @@ static void mem_check_const_index(MemCtx *ctx, ASTNode *expr) {
                "0..%lld",
                local->name, target->name, local->points_to_offset,
                count - 1 - local->points_to_offset);
-      mem_error(ctx, expr->location, suggestion,
+      mem_error(ctx, "M0105", expr->location, suggestion,
                 "Index %lld through `%s` lands at `%s[%lld]`, out of bounds "
                 "for %s",
                 value, local->name, target->name, effective,
@@ -1027,7 +1048,7 @@ static void mem_check_const_arithmetic(MemCtx *ctx, BinaryExpression *binary,
     if (type_checker_eval_integer_constant_with_checker(ctx->checker,
                                                         binary->right, &value) &&
         value == 0) {
-      mem_error(ctx, loc, "Fix the constant, or guard the divisor",
+      mem_error(ctx, "M0116", loc, "Fix the constant, or guard the divisor",
                 "%s by a constant zero; this traps the moment it executes",
                 strcmp(binary->operator, "/") == 0 ? "Division" : "Modulo");
     }
@@ -1052,7 +1073,7 @@ static void mem_check_const_arithmetic(MemCtx *ctx, BinaryExpression *binary,
     }
     long long width = (long long)left_type->size * 8;
     if (value < 0 || value >= width) {
-      mem_warn(ctx, loc,
+      mem_warn(ctx, "M0115", loc,
                "Shift by %lld on a %lld-bit value (`%s`); the hardware masks "
                "the shift count, so this does not produce the zero the code "
                "reads as",
@@ -1236,7 +1257,7 @@ static void mem_find_oob_iv_indexes(MemCtx *ctx, ASTNode *node, const char *iv,
                      "Valid indexes for `%s` are 0..%lld", local->name,
                      count - 1);
           }
-          mem_error(ctx, node->location, suggestion,
+          mem_error(ctx, "M0117", node->location, suggestion,
                     "This loop runs `%s` up to %lld, but `%s` has %lld "
                     "element%s (valid indexes 0..%lld); the final iteration "
                     "reads or writes past the end",
@@ -1626,7 +1647,7 @@ static void mem_apply_assignment(MemCtx *ctx, const char *name, ASTNode *value,
    * outlives the frame it points into. */
   MemLocal *stack_target = mem_addr_of_stack(ctx, value);
   if (stack_target && ctx->mode == MEM_MODE_LOCAL) {
-    mem_warn(ctx, loc,
+    mem_warn(ctx, "M0104", loc,
              "Global `%s` is assigned the address of stack local `%s`; that "
              "address is dangling as soon as this function returns",
              name, stack_target->name);
@@ -1763,7 +1784,7 @@ static void mem_walk_statement(MemCtx *ctx, ASTNode *statement) {
       }
       if (stack_target) {
         if (via) {
-          mem_error(ctx, ret->value->location,
+          mem_error(ctx, "M0103", ret->value->location,
                     "Allocate the memory (`new` / `malloc`) or have the "
                     "caller pass a buffer in",
                     "Returning `%s`, which points at stack local `%s`; the "
@@ -1771,7 +1792,7 @@ static void mem_walk_statement(MemCtx *ctx, ASTNode *statement) {
                     "caller receives a dangling pointer",
                     via, stack_target->name);
         } else {
-          mem_error(ctx, ret->value->location,
+          mem_error(ctx, "M0103", ret->value->location,
                     "Allocate the memory (`new` / `malloc`) or have the "
                     "caller pass a buffer in",
                     "Returning the address of stack local `%s`; the frame is "
@@ -2082,13 +2103,13 @@ int type_checker_check_program_memory(TypeChecker *checker, ASTNode *program) {
                  "it on every path out of `%s`",
                  local->name, fn->name);
         if (local->alloc_via) {
-          mem_warn_suggest(&ctx, local->alloc_loc, suggestion,
+          mem_warn_suggest(&ctx, "M0107", local->alloc_loc, suggestion,
                            "`%s` holds the allocation `%s` returns, but it "
                            "is never freed, returned, stored, or passed on; "
                            "the allocation leaks when `%s` returns",
                            local->name, local->alloc_via, fn->name);
         } else {
-          mem_warn_suggest(&ctx, local->alloc_loc, suggestion,
+          mem_warn_suggest(&ctx, "M0107", local->alloc_loc, suggestion,
                            "`%s` is allocated here but never freed, "
                            "returned, stored, or passed on; the allocation "
                            "leaks when `%s` returns",

@@ -50,6 +50,7 @@ typedef struct {
                       inlining) for the main input file, with reasons */
   int explain_all; /* --explain-all: drop the focus filter (whole program) */
   int explain_json; /* --explain-json: machine-readable .explain.json sidecar */
+  const char *explain_filter; /* --explain=SELECTOR: narrow the prose report */
   int annotate_asm; /* --annotate-asm: emit asm annotated with codegen decisions
                        (a listing on stdout + <stem>.annot.json sidecar) */
   int asm_syntax;   /* 0=intel, 1=att, 2=both (matches MirAnnotSyntax) */

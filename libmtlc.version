@@ -16,4 +16,4 @@
 # driver also calls into backend headers directly, so a pin older than a call
 # site in src/main.c fails to compile rather than silently misbehaving --
 # libmtlc has to have the API before this can point at it.
-8ca5748e34fdb0d0fb6422926dbf4b5932ee8060
+d0c04d411ab2f0f59b19b68a95207b720647e9bf

@@ -325,7 +325,9 @@ $cases = @(
       # loop the inliner structurally declines, so the simulation withdraws
       # the @inline suggestion and says the driver loop is correctly scalar
       'each iteration calls `row_scale`, and `@inline` cannot help: the callee contains a loop',
-      'fix: nothing to change on this line: this loop is a driver'
+      # advice that says there is nothing to change is labelled a note, not a
+      # fix, and never reaches the "where to start" ranking
+      'note: nothing to change on this line: this loop is a driver'
     )
     OutputMustNotMatch = @(
       # the withdrawn advice must not survive anywhere in the report

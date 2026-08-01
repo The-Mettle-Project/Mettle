@@ -1,0 +1,42 @@
+// The fill vectorizer refuses for several distinct reasons. Each gets its own
+// diagnosis, because the generic "your address is wrong" message told a writer
+// who had already written `a[i]` to go and write `a[i]`.
+
+// Several stores in one body: the kernel fills one region per loop.
+fn two_regions(p: float32*, q: float32*, n: int32) {
+    var i: int32 = 0;
+    while (i < n) { p[i] = 1.0; q[i] = 2.0; i = i + 1; }
+}
+
+// 1-byte elements: no kernel at that width yet.
+fn byte_fill(p: uint8*, n: int32) {
+    var i: int32 = 0;
+    while (i < n) { p[i] = 7; i = i + 1; }
+}
+
+// A stack array: its address is retaken every iteration.
+fn local_fill(n: int32) -> float32 {
+    var a: float32[64];
+    var i: int32 = 0;
+    while (i < n) { a[i] = 1.0; i = i + 1; }
+    return a[0];
+}
+
+// The same array bound to a pointer once: this one vectorizes, which is what
+// makes the advice above a fact rather than a hope.
+fn local_fill_bound(n: int32) -> float32 {
+    var a: float32[64];
+    var p: float32* = &a[0];
+    var i: int32 = 0;
+    while (i < n) { p[i] = 1.0; i = i + 1; }
+    return a[0];
+}
+
+fn main() -> int32 {
+    var a: float32[64];
+    var b: float32[64];
+    var c: uint8[64];
+    two_regions(&a[0], &b[0], 64);
+    byte_fill(&c[0], 64);
+    return (int32)(local_fill(64) + local_fill_bound(64)) + (int32)c[0];
+}

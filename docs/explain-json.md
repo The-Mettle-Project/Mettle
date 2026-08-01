@@ -28,6 +28,7 @@ Two rules the schema keeps:
 | `schema` | Format version. Currently `2`. |
 | `source` | Basename of the focus file. |
 | `changes` | What flipped since the previous explain build of this file. |
+| `startHere` | The top five findings that have a fix, ranked the way the prose report ranks them. |
 | `remarks` | Every optimizer decision: loops, calls, branches, allocations, contracts. |
 | `functions` | One row per function: weight in and out, decisions, backend outcome, cost. |
 | `loops` | What the backend measured about each loop: cycles, bottleneck port, depth. |
@@ -53,15 +54,21 @@ One entry per decision the optimizer made.
 | `headline` | The one-line verdict. |
 | `reason` | Why, when it declined. May be null. |
 | `fix` | What to change. May be null. |
-| `verified` | Set only when the compiler **applied that fix to a clone, re-ran its own optimizer, and confirmed the result**. Never a guess. |
+| `verified` | Set only when the compiler **applied that fix to a clone, re-ran its own optimizer, and confirmed the result**. Never a guess. The kernel it names is the one the edit produces: each simulation is pinned in the test suite against the same loop written by hand. |
 | `code` | The stable decision id. See below. |
 | `callee` | For calls, the callee's name. |
 | `depth` | Loop nest depth, 1 for a top-level loop. |
 | `trivial` | `true` for housekeeping a reader can collapse: inlining a one-line stdlib wrapper. |
+| `advisory` | `true` when `fix` says there is nothing to change: the loop is at its floor, or the gap is the compiler's. Not work to do, and never ranked in `startHere`. |
 | `quantities` | Whatever the pass measured: `calleeInstructions`, `iterations`. |
 | `count`, `lineEnd`, `calls` | Present when a run of identical refusals was folded into one entry. |
 
 ### Decision ids
+
+Every id has a page of its own. `mettle explain <id>` prints what the compiler saw, whether it
+is a gap in the compiler or a fact about the code, and what to change. `mettle explain list`
+indexes them. The prose report prints the id in brackets after each verdict, so the line and its
+long form are one command apart.
 
 Vectorization refusals use the analyzer's own diagnosis ids:
 
@@ -71,14 +78,32 @@ Vectorization refusals use the analyzer's own diagnosis ids:
 `body-local`, `dot-shape-address`, `store-only-fill`, `unrecognized-shape`
 
 Inlining refusals: `callee-no-body`, `callee-noinline`, `callee-denylisted`,
-`too-many-parameters`, `callee-parameter-names`, `callee-over-budget`, `callee-inline-asm`,
-`callee-has-loop`, `callee-no-return`, `callee-has-kernel`, `recursive`, `caller-over-budget`,
-`argument-count`, `rounds-exhausted`
+`too-many-parameters`, `callee-parameter-names`, `callee-over-budget`, `callee-call-count`,
+`callee-inline-asm`, `callee-has-loop`, `callee-no-return`, `callee-has-kernel`, `recursive`,
+`caller-over-budget`, `argument-count`, `rounds-exhausted`
 
 Positive outcomes: `vectorized`, `vectorized-inner`, `outer-of-nest`, `eliminated`, `inlined`,
 `unrolled`, `hoisted`, `if-converted`, `prefetched`, `layout-optimized`, `noalloc-verified`
 
 A new diagnosis adds an id. It never hides under an existing one.
+
+## `startHere`
+
+Line order answers "what happened". This answers "what do I change", and an editor showing a
+fix-it panel should not have to re-derive the order or guess at the tie-breaks.
+
+| Field | |
+|--|--|
+| `fn`, `line` | Which finding. Join onto `remarks` by (`fn`, `line`). |
+| `code` | Its stable decision id. |
+| `fix` | The full suggestion, untruncated (the prose report cuts it to fit a line). |
+| `proven` | `true` when the compiler applied the fix to a clone, re-ran its own optimizer, and confirmed it. |
+| `depth` | Loop nest depth, a sort key after `proven` and specificity. |
+| `sites` | How many findings this entry stands for. One line per distinct piece of advice: four loops needing the same change are one decision and four edits. Advice, not code, because one code can cover several causes with different fixes. |
+
+At most five entries, one per distinct fix, and empty when nothing in the file has a fix. Advice
+that says there is nothing to change (`advisory`) is never here. Unlike the prose report, this array
+ignores `--explain=SELECTOR`.
 
 ## `functions`
 
@@ -167,7 +192,8 @@ what makes this section work.
 `memory` carries the compile-time memory-safety findings for the file (`severity`, `line`,
 `headline`, `fix`). `backend` reports register-allocation coverage: `ok`, `total`, `instructions`,
 `okInstructions`, and `groups` of functions that missed it, each with the `reason`, the
-`consequence`, a `fix`, and its `members`.
+`consequence`, a `fix`, and its `members`. A group's `fix` carries `advisory: true` when it says
+nothing needs doing, matching the `note:` the prose report prints for it.
 
 ## Consumers
 
