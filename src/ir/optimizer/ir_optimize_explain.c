@@ -1823,14 +1823,18 @@ static size_t ir_explain_rank_fixes(int apply_filter, size_t *order,
     /* One line per kind of work. Four sites needing the same change are one
      * decision to make and four edits to do; showing them as four entries
      * spends the whole list on one idea. The site named is the first the
-     * ranking reached, and the count says how far the work spreads. Proven
-     * and depth still order the entries, because a code's sites almost
-     * always share both. */
-    if (r->code) {
+     * ranking reached, and the count says how far the work spreads.
+     *
+     * Folding on the advice, not the code. One code can cover several
+     * distinct causes with distinct fixes -- store-only-fill alone has three
+     * -- and folding those together hides real work behind unrelated work,
+     * including hiding a proven fix behind an unproven one. */
+    if (r->code && r->fix) {
       int folded = 0;
       for (size_t j = 0; j < shown; j++) {
         const IRExplainRemark *p = &g_remarks[order[j]];
-        if (p->code && strcmp(p->code, r->code) == 0) {
+        if (p->code && p->fix && strcmp(p->code, r->code) == 0 &&
+            strcmp(p->fix, r->fix) == 0) {
           sites[j]++;
           folded = 1;
           break;

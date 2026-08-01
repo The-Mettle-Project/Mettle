@@ -1341,6 +1341,75 @@ static int ir_simd_mutate_dot_row_pointer(IRFunction *clone, size_t begin,
   return variant_index_seen ? IR_SIMD_FIX_INAPPLICABLE : 0;
 }
 
+/* "bind the array to a pointer once before the loop" (store-only-fill on a
+ * stack array). The fill kernel indexes off an invariant base SYMBOL; a stack
+ * array's address is retaken inside the body, so the store's base is a fresh
+ * temp every iteration and no kernel claims it.
+ *
+ * The rewrite is the source change: the in-body `%t <- &@a` becomes a pointer
+ * local declared before the loop, and the address add reads that symbol. Like
+ * the row-pointer mutator, this reshapes the clone rather than executing it;
+ * the claim being tested is whether the recognizer accepts the shape the user
+ * would produce, and the clone is discarded either way.
+ *
+ * Returns 0 for the other store-only-fill causes (several stores, byte
+ * elements), whose loops have no in-body address-of to hoist, so they never
+ * pick up a proof they have not earned. */
+static int ir_simd_mutate_fill_base_pointer(IRFunction *clone, size_t begin,
+                                            size_t end) {
+  int rewrites = 0;
+  int past_header = 0;
+
+  for (size_t i = begin + 1; i < end; i++) {
+    IRInstruction *addr_of = &clone->instructions[i];
+    if (addr_of->op == IR_OP_LABEL) {
+      if (addr_of->text && (strstr(addr_of->text, "ir_while_") != NULL ||
+                            strstr(addr_of->text, "ir_for_cond_") != NULL)) {
+        past_header = 1;
+      }
+      continue;
+    }
+    if (!past_header || addr_of->op != IR_OP_ADDRESS_OF ||
+        addr_of->lhs.kind != IR_OPERAND_SYMBOL || !addr_of->lhs.name ||
+        addr_of->dest.kind != IR_OPERAND_TEMP || !addr_of->dest.name) {
+      continue;
+    }
+    const char *declared =
+        ir_function_local_declared_type(clone, addr_of->lhs.name);
+    if (!declared || !strchr(declared, '[')) {
+      continue; /* not a stack array: nothing to bind */
+    }
+
+    /* The address add that consumes it: `%addr = %base + %scaled`. */
+    IRInstruction *addr = NULL;
+    for (size_t k = i + 1; k < end; k++) {
+      IRInstruction *cand = &clone->instructions[k];
+      if (cand->op == IR_OP_BINARY && !cand->is_float && cand->text &&
+          strcmp(cand->text, "+") == 0 &&
+          cand->lhs.kind == IR_OPERAND_TEMP && cand->lhs.name &&
+          strcmp(cand->lhs.name, addr_of->dest.name) == 0) {
+        addr = cand;
+        break;
+      }
+    }
+    if (!addr) {
+      continue;
+    }
+
+    /* Point the address add at the array symbol itself and drop the
+     * per-iteration address-of. That is what binding a pointer once achieves
+     * from the kernel's side: one invariant base for the whole loop instead
+     * of a fresh temp each time round. */
+    ir_operand_destroy(&addr->lhs);
+    addr->lhs = ir_operand_symbol(addr_of->lhs.name);
+    ir_instruction_destroy_storage(addr_of);
+    memset(addr_of, 0, sizeof(*addr_of));
+    addr_of->op = IR_OP_NOP;
+    rewrites++;
+  }
+  return rewrites > 0;
+}
+
 /* The transform table: which diagnoses have a paired fix simulation. Growing
  * the hypothesis engine = adding a mutator and one row here.
  * `inapplicable_fix` (optional) replaces the advice when the mutator returns
@@ -1354,6 +1423,7 @@ static const struct {
     {IR_SIMD_BAIL_I32_SUM_NARROW_ACC, ir_simd_mutate_i32_sum_int64, NULL},
     {IR_SIMD_BAIL_INT16_ELEMENTS, ir_simd_mutate_int16_to_i32, NULL},
     {IR_SIMD_BAIL_INT64_ELEMENTS, ir_simd_mutate_int64_to_i32, NULL},
+    {IR_SIMD_BAIL_STORE_ONLY_FILL, ir_simd_mutate_fill_base_pointer, NULL},
     {IR_SIMD_BAIL_DOT_SHAPE_ADDRESS, ir_simd_mutate_dot_row_pointer,
      "none via hoisting -- re-checked: the index half that is not the loop "
      "counter changes every iteration, so it cannot be hoisted out; this "

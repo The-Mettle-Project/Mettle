@@ -249,9 +249,9 @@ that names a cause, ahead of the fallback checklist the compiler falls back on
 when it cannot. Then loop depth: the same fix inside a nested loop is worth
 more.
 
-One line per kind of work, with `(+N more sites)` where the same change is
-needed in several places: four loops wanting the same edit are one decision to
-make. Advice that says there is nothing to change is labelled `note:` rather
+One line per distinct piece of advice, with `(+N more sites)` where the same
+change is needed in several places: four loops wanting the same edit are one
+decision to make. Advice that says there is nothing to change is labelled `note:` rather
 than `fix:` and never appears here, so the list stays a list of work.
 
 **The findings**, in source order. One line per decision, tagged with its

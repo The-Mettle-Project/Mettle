@@ -694,7 +694,16 @@ $cases = @(
       'local_fill_bound \(loop @ line \d+\): vectorized',
       # three loops miss the kernel; only two of them have work to do,
       # because the byte-width gap is the compiler's and not the code's
-      'where to start \(2 of 3 missed optimizations have a fix'
+      'where to start \(2 of 3 missed optimizations have a fix',
+      # the stack-array advice is not believed, it is checked: the
+      # compiler binds the pointer on a clone and re-runs, and the kernel
+      # it names is the one local_fill_bound actually gets below
+      'verified: simulated that fix and re-ran the optimizer: this loop then vectorizes -> 16-byte splat stores',
+      # so it leads the triage, ahead of the unproven split advice; and
+      # the two live side by side rather than folding, because one code
+      # here covers three different causes with three different fixes
+      '1\. proven local_fill:\d+  bind the array to a pointer once',
+      '2\.        two_regions:\d+  split it into one loop per destination'
     )
     OutputMustNotMatch = @(
       # the advice that could not be followed
