@@ -1821,8 +1821,10 @@ static size_t ir_explain_rank_fixes(int apply_filter, size_t *order,
 
     /* One line per kind of work. Four sites needing the same change are one
      * decision to make and four edits to do; showing them as four entries
-     * spends the whole list on one idea. The representative site is the
-     * best-ranked of them, and the count says how far the work spreads. */
+     * spends the whole list on one idea. The site named is the first the
+     * ranking reached, and the count says how far the work spreads. Proven
+     * and depth still order the entries, because a code's sites almost
+     * always share both. */
     if (r->code) {
       int folded = 0;
       for (size_t j = 0; j < shown; j++) {
