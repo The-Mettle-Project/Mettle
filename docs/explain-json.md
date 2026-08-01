@@ -28,7 +28,7 @@ Two rules the schema keeps:
 | `schema` | Format version. Currently `2`. |
 | `source` | Basename of the focus file. |
 | `changes` | What flipped since the previous explain build of this file. |
-| `startHere` | The top five findings that have a fix, ranked the way the prose report ranks them. |
+| `startHere` | The top findings that have a fix, ranked the way the prose report ranks them. Each entry carries a `kind`: `backend` for a whole function that missed the register allocator (fields `fn`, `instructions`, `why`, `fix`), `remark` for a loop or call decision (fields `fn`, `line`, `code`, `fix`, `proven`, `stillBlocked`, `depth`, `sites`). `backend` entries come first: they are a measured cost over a whole function, where a remark is a prediction about one loop. |
 | `remarks` | Every optimizer decision: loops, calls, branches, allocations, contracts. |
 | `functions` | One row per function: weight in and out, decisions, backend outcome, cost. |
 | `loops` | What the backend measured about each loop: cycles, bottleneck port, depth. |
@@ -55,6 +55,7 @@ One entry per decision the optimizer made.
 | `reason` | Why, when it declined. May be null. |
 | `fix` | What to change. May be null. |
 | `verified` | Set only when the compiler **applied that fix to a clone, re-ran its own optimizer, and confirmed the result**. Never a guess. The kernel it names is the one the edit produces: each simulation is pinned in the test suite against the same loop written by hand. |
+| `stillBlocked` | Set when the compiler applied that fix to a clone and the loop **still** did not vectorize: the text is the obstacle that surfaced next. `fix` remains worth making, and it is not the whole job. Mutually exclusive with `verified`, and shown as `step 1` in the prose plan. |
 | `code` | The stable decision id. See below. |
 | `callee` | For calls, the callee's name. |
 | `depth` | Loop nest depth, 1 for a top-level loop. |
@@ -194,6 +195,14 @@ what makes this section work.
 `okInstructions`, and `groups` of functions that missed it, each with the `reason`, the
 `consequence`, a `fix`, and its `members`. A group's `fix` carries `advisory: true` when it says
 nothing needs doing, matching the `note:` the prose report prints for it.
+
+Whether a group is advisory turns on how big its functions are. A SIMD kernel the allocator cannot
+pass through costs only the scalar code around it, which on a small function is not worth an edit;
+past 64 optimized IR instructions the same fallback is the largest single cost in the file, so the
+advice becomes an instruction and the group is ranked into `startHere`. Each member carries a
+`kernelLine` when the report can say which loop the kernel came from, including the case where the
+function never wrote one: inlining brings a callee's vectorized loop in with it, and the member
+line then names the call instead.
 
 ## Consumers
 

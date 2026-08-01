@@ -189,7 +189,7 @@ $cases = @(
     Path          = "tests/err_simd_contract_cf.mettle"
     ShouldSucceed = $false
     Args          = @("-O")
-    Pattern       = "@simd! loop was not vectorized: the loop body has its own control flow"
+    Pattern       = "@simd! loop was not vectorized: the loop body branches on data"
   },
   @{
     # A pointer-deref loop with no user control flow must NOT be misreported as
@@ -264,8 +264,15 @@ $cases = @(
       # grouped by cause with consequence text and sizes
       'backend report: explain_demo\.mettle',
       'optimized IR instructions are in register-allocated code',
-      'contains the SIMD kernel `simd_affine_map_f32`',
+      'contains the affine-map kernel `simd_affine_map` in a form the register allocator',
       'consequence: the kernel itself runs at full vector speed',
+      # A whole-function fallback leads the plan: it is a measured cost over a
+      # whole function, where a loop remark is a prediction about one loop. It
+      # also names the calls that brought the kernel in -- main never wrote a
+      # vectorized loop of its own, so "contains simd_affine_map" alone would
+      # point at nothing the reader could find.
+      'spills main \(\d+ instrs\)',
+      'kernel inlined from `saxpy` @ line \d+',
       # dependence analysis: a non-reassociable loop-carried recurrence (the
       # LCG/hash shape) is diagnosed as a genuine scalar floor, naming the
       # carried operators -- not the generic "no vectorizer recognized" fallback
@@ -657,6 +664,71 @@ $cases = @(
     OutputMustNotMatch = @(
       'print_int \(loop',
       'print_int \(call to'
+    )
+  },
+  @{
+    # A nest that arrives by inlining. The inliner drops `@simd` markers from
+    # the copy it makes, so the callee's loop leaves no record and the driver
+    # loop reads as a leaf -- which used to make the classifier blame the inner
+    # loop's exit test on a data-dependent `if` and prescribe a branchless
+    # rewrite for a body containing no branch. The verdict must be the nest, and
+    # it must name the call that brought the loop in.
+    Name          = "explain_inlined_nest"
+    Path          = "tests/explain_inlined_nest.mettle"
+    ShouldSucceed = $true
+    Args          = @("-O", "--explain=main")
+    Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
+    OutputMustMatch = @(
+      'main \(loop @ line 31\): NOT vectorized  \[outer-of-nest\]',
+      "the call to ``sum_bytes`` on line 32 was inlined, so that callee's loop \(line 13\) now sits in this body",
+      'note: nothing to change on this line'
+    )
+    OutputMustNotMatch = @(
+      'branches on data',
+      'branchless'
+    )
+  },
+  @{
+    # A fix that is correct and not sufficient. The simulation applies it, sees
+    # the loop stay scalar, and reports the obstacle that surfaced next -- so
+    # the caveat reaches the reader before the edit does, in the action plan
+    # ("step 1") as well as in the remark.
+    Name          = "explain_partial_fix"
+    Path          = "tests/explain_partial_fix.mettle"
+    ShouldSucceed = $true
+    Args          = @("-O", "--explain=row_energy")
+    Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
+    OutputMustMatch = @(
+      'step 1 row_energy:13',
+      'fix: declare `value` before the loop.*\(first step only\)',
+      'still blocked: re-checked with that change applied: the loop still does not vectorize'
+    )
+    OutputMustNotMatch = @(
+      'verified:'
+    )
+  },
+  @{
+    # Every gate reason code has to reach the reader as a sentence about their
+    # code. `vloop:reduce` used to print as "declined by the eligibility gate
+    # (reason code: vloop:shape)", which names nothing anyone can act on. It
+    # must say which shape, name the loop, and -- on a function this small --
+    # say plainly that the spills are not worth chasing.
+    Name          = "explain_backend_gate_reasons"
+    Path          = "tests/test_vloop_general.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--explain=freduce64")
+    Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
+    OutputMustMatch = @(
+      "contains a vectorized '\+' reduction \(``s = s \+ expr``\); the allocator's inline passthrough covers element-wise maps only",
+      'freduce64 \(\d+, loop @ line \d+\)',
+      'note: nothing worth doing at this size',
+      # a large fallback in another function keeps its actionable fix
+      'fix: move the vectorized loop into a function of its own'
+    )
+    OutputMustNotMatch = @(
+      'reason code: vloop',
+      # the plan honours the selector: main's fallback is not what was asked for
+      'spills main'
     )
   },
   @{ Name = "err_decorator_on_loop"; Path = "tests/err_decorator_on_loop.mettle"; ShouldSucceed = $false; Pattern = "apply to a function, not a loop" },

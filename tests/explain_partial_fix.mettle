@@ -1,0 +1,32 @@
+import "std/io";
+
+// A loop with two independent obstacles stacked on one another. The body-local
+// `value` is the one the diagnosis names, and hoisting it is a real fix -- but
+// the loop still will not vectorize afterwards, so advice that stops there
+// costs the reader an edit and a rebuild to learn nothing. The report has to
+// simulate the fix, find that the loop is still scalar, and say what blocks it
+// next before the reader touches the file.
+
+fn row_energy(pixels: float32*, width: int32, row: int32) -> float32 {
+    var energy: float32 = 0.0;
+
+    for x in 0..width {
+        var value: float32 = pixels[row * width + x];
+        energy = energy + value * value;
+    }
+
+    return energy;
+}
+
+fn main() -> int32 {
+    var buf: float32[256];
+    var p: float32* = &buf[0];
+
+    for i in 0..256 {
+        p[i] = (float32)i;
+    }
+
+    print_int((int32)row_energy(p, 32, 3));
+    newline();
+    return 0;
+}
