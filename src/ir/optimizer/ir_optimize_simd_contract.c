@@ -454,6 +454,23 @@ static const char *ir_region_find_serial_recurrence(const IRFunction *function,
   return NULL;
 }
 
+/* The element type of a declared array type: "float32[64]" -> "float32".
+ * Falls back to a readable placeholder so the advice still parses as English
+ * when the declaration is a shape this does not model. */
+static void ir_type_element_name(const char *declared, char *out, size_t cap) {
+  const char *bracket = declared ? strchr(declared, '[') : NULL;
+  size_t n = bracket ? (size_t)(bracket - declared) : 0;
+  while (n > 0 && declared[n - 1] == ' ') {
+    n--;
+  }
+  if (n == 0 || n >= cap) {
+    snprintf(out, cap, "T");
+    return;
+  }
+  memcpy(out, declared, n);
+  out[n] = '\0';
+}
+
 /* --explain: a deeper diagnosis than ir_simd_bail_reason, split into a reason
  * (what blocked vectorization), a fix (what the user can change), and a
  * machine-readable IRSimdBailId every branch must set. Best-effort but never
@@ -477,9 +494,16 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
   int has_byte_load = 0, has_i32_load = 0, has_int_accum = 0;
   const char *int_accum_sym = NULL;
   int has_float_accum = 0, has_float_mul = 0;
-  int load_count = 0, store_count = 0;
+  int load_count = 0, store_count = 0, byte_store_count = 0;
   int past_header = 0; /* seen the loop's own header label yet? */
   const char *body_local = NULL;
+  /* A stack array whose address the body re-takes every iteration
+   * (`%t <- &@a` inside the loop). The kernels index off an invariant base
+   * SYMBOL, so a base that is a fresh temp each iteration never matches --
+   * even though the source reads `a[i]`, which is exactly the shape the
+   * generic advice would tell the writer to produce. Naming the array lets
+   * the fill diagnosis below give advice that can actually be followed. */
+  const char *rebased_array = NULL;
 
   for (size_t i = begin + 1; i < end; i++) {
     const IRInstruction *ins = &function->instructions[i];
@@ -508,6 +532,17 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
       if (past_header && !body_local && ins->dest.kind == IR_OPERAND_SYMBOL &&
           ins->dest.name) {
         body_local = ins->dest.name;
+      }
+      break;
+    case IR_OP_ADDRESS_OF:
+      /* `%t <- &@a` in the body: record the array it names, once. */
+      if (!rebased_array && ins->lhs.kind == IR_OPERAND_SYMBOL &&
+          ins->lhs.name) {
+        const char *declared =
+            ir_function_local_declared_type(function, ins->lhs.name);
+        if (declared && strchr(declared, '[')) {
+          rebased_array = ins->lhs.name;
+        }
       }
       break;
     case IR_OP_CALL:
@@ -545,12 +580,15 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
       break;
     case IR_OP_LOAD:
     case IR_OP_STORE: {
+      long long sz = (ins->rhs.kind == IR_OPERAND_INT) ? ins->rhs.int_value : 4;
       if (ins->op == IR_OP_LOAD) {
         load_count++;
       } else {
         store_count++;
+        if (sz == 1) {
+          byte_store_count++;
+        }
       }
-      long long sz = (ins->rhs.kind == IR_OPERAND_INT) ? ins->rhs.int_value : 4;
       if (ins->is_float) {
         if (sz == 4) {
           has_f32 = 1;
@@ -852,15 +890,62 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
     return;
   }
   if (store_count > 0 && load_count == 0) {
-    snprintf(reason, reason_cap,
-             "the loop only writes an invariant value (a fill/init pattern), "
-             "but its store address did not match the fill vectorizer's "
-             "shapes: a unit-stride element `a[i]`, `a[c + i]` with `c` a "
-             "loop-invariant scalar, or a pointer walked by a constant stride");
-    snprintf(fix, fix_cap,
-             "hoist the invariant part of the index into a base pointer before "
-             "the loop (`var row = &a[c]; ... row[i] = v;`) so the write is a "
-             "plain unit-stride `row[i]`");
+    /* Three causes are distinguishable here, and the generic address message
+     * is wrong for all of them: it tells a writer who already wrote `a[i]` to
+     * make the index unit-stride. Check the specific ones first. */
+    if (store_count > 1) {
+      snprintf(reason, reason_cap,
+               "the body writes %d destinations; the fill kernel fills one "
+               "region per loop, so a body with several stores has no single "
+               "region to fill",
+               store_count);
+      snprintf(fix, fix_cap,
+               "split it into one loop per destination; each becomes its own "
+               "fill kernel");
+      IR_SIMD_SET_DIAG(IR_SIMD_BAIL_STORE_ONLY_FILL);
+      return;
+    }
+    if (byte_store_count == store_count) {
+      snprintf(reason, reason_cap,
+               "the loop fills 1-byte elements, and the fill kernel covers "
+               "2-, 4- and 8-byte elements only");
+      snprintf(fix, fix_cap,
+               "nothing to change here: this is a gap in the compiler, not a "
+               "problem with the loop");
+      IR_SIMD_SET_DIAG(IR_SIMD_BAIL_STORE_ONLY_FILL);
+      return;
+    }
+    if (rebased_array) {
+      /* The writer already wrote `a[i]`. Telling them to make the index
+       * unit-stride would be advice they have followed, so name the real
+       * obstacle: a stack array's address is retaken each iteration, and the
+       * kernel needs one invariant base. Binding a pointer once fixes it and
+       * costs nothing at runtime. */
+      char element[64];
+      ir_type_element_name(
+          ir_function_local_declared_type(function, rebased_array), element,
+          sizeof(element));
+      snprintf(reason, reason_cap,
+               "the loop fills the stack array `%s`, whose address is retaken "
+               "on every iteration; the fill kernel indexes off one invariant "
+               "base pointer, and a fresh base each iteration is not one",
+               rebased_array);
+      snprintf(fix, fix_cap,
+               "bind the array to a pointer once before the loop "
+               "(`var p: %s* = &%s[0];`) and write `p[i]` in the body",
+               element, rebased_array);
+    } else {
+      snprintf(reason, reason_cap,
+               "the loop only writes an invariant value (a fill/init pattern), "
+               "but its store address did not match the fill vectorizer's "
+               "shapes: a unit-stride element `a[i]`, `a[c + i]` with `c` a "
+               "loop-invariant scalar, or a pointer walked by a constant "
+               "stride");
+      snprintf(fix, fix_cap,
+               "hoist the invariant part of the index into a base pointer "
+               "before the loop (`var row = &a[c]; ... row[i] = v;`) so the "
+               "write is a plain unit-stride `row[i]`");
+    }
     IR_SIMD_SET_DIAG(IR_SIMD_BAIL_STORE_ONLY_FILL);
     return;
   }

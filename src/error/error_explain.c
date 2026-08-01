@@ -406,13 +406,28 @@ static const DecisionDoc DECISIONS[] = {
      "iteration the access really is non-unit-stride, and the report says so\n"
      "instead of giving advice that cannot work.\n"},
     {"store-only-fill", DECISION_VECTOR_REFUSAL,
-     "Fill loop with an address the fill kernel cannot follow",
+     "Fill loop the fill kernel could not claim",
      "The loop writes the same value over and over, which is the fill shape,\n"
-     "but the store address did not match. The fill kernel handles `a[i]`,\n"
-     "`a[c + i]` with `c` invariant, and a pointer walked by a constant stride.\n"
+     "but one of the kernel's requirements was not met. The remark names\n"
+     "which, because the answer differs:\n"
      "\n"
-     "Fix: lift the invariant part of the index into a base pointer before the\n"
-     "loop, so the write is a plain `row[i]`.\n"},
+     "  - Several stores in one body. The kernel fills one region per loop.\n"
+     "    Split it into one loop per destination and each becomes a kernel.\n"
+     "\n"
+     "  - 1-byte elements. The kernel covers 2, 4 and 8 bytes. This is a gap\n"
+     "    in the compiler; there is nothing to change in the loop.\n"
+     "\n"
+     "  - A stack array as the destination. `a[i]` on a local array recomputes\n"
+     "    the array's address every iteration, and the kernel indexes off one\n"
+     "    invariant base. Bind it once and write through the pointer:\n"
+     "        var p: float32* = &a[0];\n"
+     "        for i in 0..n { p[i] = 1.0; }\n"
+     "    The generated code is the same either way; only the shape the\n"
+     "    recognizer sees changes.\n"
+     "\n"
+     "  - An address the kernel cannot follow. It handles `a[i]`, `a[c + i]`\n"
+     "    with `c` invariant, and a pointer walked by a constant stride. Lift\n"
+     "    the invariant part of the index into a base pointer before the loop.\n"},
     {"unrecognized-shape", DECISION_VECTOR_REFUSAL,
      "No recognizer claimed this loop",
      "The honest fallback. The compiler ruled out every disqualifier it can\n"

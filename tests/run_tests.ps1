@@ -671,6 +671,31 @@ $cases = @(
     )
   },
   @{
+    # The fill refusals name the cause that actually applies. The generic
+    # "your store address did not match" message used to fire for all of
+    # them, telling a writer who had already written `a[i]` to write `a[i]`.
+    # The last function proves the stack-array advice: same loop, pointer
+    # bound once, and it vectorizes.
+    Name          = "explain_fill_causes"
+    Path          = "tests/explain_fill_causes.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--explain=loops")
+    Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
+    OutputMustMatch = @(
+      'the body writes 2 destinations; the fill kernel fills one region per loop',
+      'fix: split it into one loop per destination',
+      'the loop fills 1-byte elements, and the fill kernel covers 2-, 4- and 8-byte elements only',
+      'fix: nothing to change here: this is a gap in the compiler',
+      'the loop fills the stack array `a`, whose address is retaken on every iteration',
+      'fix: bind the array to a pointer once before the loop \(`var p: float32\* = &a\[0\];`\)',
+      'local_fill_bound \(loop @ line \d+\): vectorized'
+    )
+    OutputMustNotMatch = @(
+      # the advice that could not be followed
+      'its store address did not match the fill vectorizer'
+    )
+  },
+  @{
     # A selector nobody can satisfy says what the selectors are instead of
     # printing an empty section.
     Name          = "explain_selector_unknown"
