@@ -313,7 +313,9 @@ $cases = @(
       # loop the inliner structurally declines, so the simulation withdraws
       # the @inline suggestion and says the driver loop is correctly scalar
       'each iteration calls `row_scale`, and `@inline` cannot help: the callee contains a loop',
-      'fix: nothing to change on this line: this loop is a driver'
+      # advice that says there is nothing to change is labelled a note,
+      # not a fix, and never reaches the "where to start" ranking
+      'note: nothing to change on this line: this loop is a driver'
     )
     OutputMustNotMatch = @(
       # the withdrawn advice must not survive anywhere in the report
@@ -685,10 +687,14 @@ $cases = @(
       'the body writes 2 destinations; the fill kernel fills one region per loop',
       'fix: split it into one loop per destination',
       'the loop fills 1-byte elements, and the fill kernel covers 2-, 4- and 8-byte elements only',
-      'fix: nothing to change here: this is a gap in the compiler',
+      # a compiler gap is a note, not a fix: it must not be ranked as work
+      'note: nothing to change here: this is a gap in the compiler',
       'the loop fills the stack array `a`, whose address is retaken on every iteration',
       'fix: bind the array to a pointer once before the loop \(`var p: float32\* = &a\[0\];`\)',
-      'local_fill_bound \(loop @ line \d+\): vectorized'
+      'local_fill_bound \(loop @ line \d+\): vectorized',
+      # three loops miss the kernel; only two of them have work to do,
+      # because the byte-width gap is the compiler's and not the code's
+      'where to start \(2 of 3 missed optimizations have a fix'
     )
     OutputMustNotMatch = @(
       # the advice that could not be followed

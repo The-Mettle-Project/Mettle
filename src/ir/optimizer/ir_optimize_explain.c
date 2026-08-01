@@ -211,6 +211,11 @@ typedef struct {
   char *code;     /* stable id for the decision; may be NULL */
   size_t depth;   /* loop nest depth (1 = top level); 0 = not a loop/unknown */
   int trivial;    /* 1 = routine housekeeping a reader can collapse */
+  /* 1 = the `fix` text says there is nothing to change: the loop is at its
+     floor, or the gap belongs to the compiler. Worth printing, but not an
+     instruction, so the triage never ranks it and the prose labels it a
+     note rather than a fix. */
+  int advisory;
   IRExplainQuantity quantities[IR_EXPLAIN_MAX_QUANTITIES];
   size_t quantity_count;
 } IRExplainRemark;
@@ -1198,6 +1203,7 @@ void ir_explain_remark(const char *function_name, const char *entity,
   r->code = NULL;
   r->depth = 0;
   r->trivial = 0;
+  r->advisory = 0;
   r->quantity_count = 0;
   g_last_remark_recorded = 1;
 }
@@ -1231,6 +1237,13 @@ void ir_explain_remark_trivial(void) {
   IRExplainRemark *r = ir_explain_last_remark();
   if (r) {
     r->trivial = 1;
+  }
+}
+
+void ir_explain_remark_advisory(void) {
+  IRExplainRemark *r = ir_explain_last_remark();
+  if (r) {
+    r->advisory = 1;
   }
 }
 
@@ -1769,14 +1782,24 @@ static void ir_explain_fit(const char *text, size_t width, char *out,
   snprintf(out + cut, cap - cut, " ...");
 }
 
+/* Did the compiler identify what blocked this loop, or fall back to "no
+ * recognizer claimed it"? The fallback's advice is the same checklist
+ * everywhere, so it sorts below any diagnosis that names a cause. */
+static int ir_explain_names_a_cause(const IRExplainRemark *r) {
+  return !(r->code && strcmp(r->code, "unrecognized-shape") == 0);
+}
+
 /* Rank the findings that have a fix into `order`, heaviest first, and return
  * how many entries it holds. `missed_out` counts every missed optimization and
  * `actionable_out` the subset with a fix. With `apply_filter` the ranking is
  * over the selected slice only; without it, over the whole file. */
 static size_t ir_explain_rank_fixes(int apply_filter, size_t *order,
-                                    size_t *missed_out,
+                                    size_t *sites, size_t *missed_out,
                                     size_t *actionable_out) {
   size_t shown = 0, actionable = 0, missed = 0;
+  for (size_t i = 0; i < IR_EXPLAIN_START_MAX; i++) {
+    sites[i] = 1;
+  }
 
   for (size_t i = 0; i < g_remark_count; i++) {
     const IRExplainRemark *r = &g_remarks[i];
@@ -1791,18 +1814,51 @@ static size_t ir_explain_rank_fixes(int apply_filter, size_t *order,
       continue;
     }
     missed++;
-    if (!r->fix) {
+    if (!r->fix || r->advisory) {
       continue;
     }
     actionable++;
-    /* Insertion sort into the top-N: proven first, then deepest, then
-     * earliest, so the same file always produces the same order. */
+
+    /* One line per kind of work. Four sites needing the same change are one
+     * decision to make and four edits to do; showing them as four entries
+     * spends the whole list on one idea. The representative site is the
+     * best-ranked of them, and the count says how far the work spreads. */
+    if (r->code) {
+      int folded = 0;
+      for (size_t j = 0; j < shown; j++) {
+        const IRExplainRemark *p = &g_remarks[order[j]];
+        if (p->code && strcmp(p->code, r->code) == 0) {
+          sites[j]++;
+          folded = 1;
+          break;
+        }
+      }
+      if (folded) {
+        continue;
+      }
+    }
+
+    /* Insertion sort into the top-N: proven first, then advice specific to
+     * this loop, then deepest, then earliest, so the same file always
+     * produces the same order.
+     *
+     * The specificity key matters on a real program. `unrecognized-shape` is
+     * the fallback the compiler reaches when it cannot name a cause, and its
+     * advice is the same checklist at every site; without this key a file
+     * with many such loops fills the list with one repeated sentence and
+     * buries the diagnoses that name a cause. */
     size_t at = shown;
     while (at > 0) {
       const IRExplainRemark *p = &g_remarks[order[at - 1]];
       int r_proven = r->verified ? 1 : 0, p_proven = p->verified ? 1 : 0;
+      int r_named = ir_explain_names_a_cause(r), p_named =
+                                                    ir_explain_names_a_cause(p);
       if (r_proven != p_proven) {
         if (r_proven < p_proven) {
+          break;
+        }
+      } else if (r_named != p_named) {
+        if (r_named < p_named) {
           break;
         }
       } else if (r->depth != p->depth) {
@@ -1820,8 +1876,10 @@ static size_t ir_explain_rank_fixes(int apply_filter, size_t *order,
     for (size_t j = shown < IR_EXPLAIN_START_MAX ? shown : IR_EXPLAIN_START_MAX - 1;
          j > at; j--) {
       order[j] = order[j - 1];
+      sites[j] = sites[j - 1];
     }
     order[at] = i;
+    sites[at] = 1;
     if (shown < IR_EXPLAIN_START_MAX) {
       shown++;
     }
@@ -1842,7 +1900,9 @@ static void ir_explain_render_start_here(void) {
    * there is nothing to do, so the document's shape does not vary. */
   if (g_explain_json) {
     size_t all_missed = 0, all_actionable = 0;
-    size_t whole = ir_explain_rank_fixes(0, order, &all_missed, &all_actionable);
+    size_t all_sites[IR_EXPLAIN_START_MAX];
+    size_t whole =
+        ir_explain_rank_fixes(0, order, all_sites, &all_missed, &all_actionable);
     ir_explain_json_raw("\"startHere\":[");
     for (size_t i = 0; i < whole; i++) {
       const IRExplainRemark *r = &g_remarks[order[i]];
@@ -1852,13 +1912,15 @@ static void ir_explain_render_start_here(void) {
       ir_explain_json_str(r->code);
       ir_explain_json_raw(",\"fix\":");
       ir_explain_json_str(r->fix);
-      ir_explain_json_raw(",\"proven\":%s,\"depth\":%zu}",
-                          r->verified ? "true" : "false", r->depth);
+      ir_explain_json_raw(",\"proven\":%s,\"depth\":%zu,\"sites\":%zu}",
+                          r->verified ? "true" : "false", r->depth,
+                          all_sites[i]);
     }
     ir_explain_json_raw("],");
   }
 
-  size_t shown = ir_explain_rank_fixes(1, order, &missed, &actionable);
+  size_t sites[IR_EXPLAIN_START_MAX];
+  size_t shown = ir_explain_rank_fixes(1, order, sites, &missed, &actionable);
 
   if (shown == 0) {
     /* Silence is ambiguous: it could mean a clean file or a report that
@@ -1899,15 +1961,27 @@ static void ir_explain_render_start_here(void) {
   for (size_t i = 0; i < shown; i++) {
     const IRExplainRemark *r = &g_remarks[order[i]];
     char fix[200];
-    ir_explain_fit(r->fix, 84, fix, sizeof(fix));
-    ir_explain_emit("    %zu. %s%-6s%s %-*s  %s\n", i + 1,
+    char spread[48] = "";
+    if (sites[i] > 1) {
+      snprintf(spread, sizeof(spread), " %s(+%zu more site%s)%s",
+               clr(EXPLAIN_DIM), sites[i] - 1, sites[i] == 2 ? "" : "s",
+               clr(EXPLAIN_RESET));
+    }
+    ir_explain_fit(r->fix, sites[i] > 1 ? 66 : 84, fix, sizeof(fix));
+    ir_explain_emit("    %zu. %s%-6s%s %-*s  %s%s\n", i + 1,
                     clr(r->verified ? EXPLAIN_GREEN : EXPLAIN_DIM),
                     r->verified ? "proven" : "", clr(EXPLAIN_RESET),
-                    (int)location_width, location[i], fix);
+                    (int)location_width, location[i], fix, spread);
   }
-  if (actionable > shown) {
+  /* The lines above stand for `covered` findings, not `shown` of them, since
+   * each folds its own sites. The remainder is what no line represents. */
+  size_t covered = 0;
+  for (size_t i = 0; i < shown; i++) {
+    covered += sites[i];
+  }
+  if (actionable > covered) {
     ir_explain_emit("       %s... and %zu more below%s\n", clr(EXPLAIN_DIM),
-                    actionable - shown, clr(EXPLAIN_RESET));
+                    actionable - covered, clr(EXPLAIN_RESET));
   }
   ir_explain_emit("\n");
 }
@@ -1956,6 +2030,9 @@ static void ir_explain_json_remark(const IRExplainRemark *r, const char *kind,
   }
   if (r->trivial) {
     ir_explain_json_raw(",\"trivial\":true");
+  }
+  if (r->advisory) {
+    ir_explain_json_raw(",\"advisory\":true");
   }
   if (r->quantity_count > 0) {
     ir_explain_json_raw(",\"quantities\":{");
@@ -2524,8 +2601,12 @@ void ir_explain_flush(void) {
                           glyph_elbow(), r->reason, clr(EXPLAIN_RESET));
         }
         if (r->fix) {
-          ir_explain_emit("      %s%s fix: %s%s\n", clr(EXPLAIN_DIM),
-                          glyph_elbow(), r->fix, clr(EXPLAIN_RESET));
+          /* "fix: nothing to change here" is a contradiction. Where the
+           * advice describes the loop instead of instructing anyone, the
+           * label says so. */
+          ir_explain_emit("      %s%s %s: %s%s\n", clr(EXPLAIN_DIM),
+                          glyph_elbow(), r->advisory ? "note" : "fix", r->fix,
+                          clr(EXPLAIN_RESET));
         }
         if (r->verified) {
           ir_explain_emit("      %s%s verified: %s%s%s\n", clr(EXPLAIN_DIM),

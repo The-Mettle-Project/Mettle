@@ -59,6 +59,7 @@ One entry per decision the optimizer made.
 | `callee` | For calls, the callee's name. |
 | `depth` | Loop nest depth, 1 for a top-level loop. |
 | `trivial` | `true` for housekeeping a reader can collapse: inlining a one-line stdlib wrapper. |
+| `advisory` | `true` when `fix` says there is nothing to change: the loop is at its floor, or the gap is the compiler's. Not work to do, and never ranked in `startHere`. |
 | `quantities` | Whatever the pass measured: `calleeInstructions`, `iterations`. |
 | `count`, `lineEnd`, `calls` | Present when a run of identical refusals was folded into one entry. |
 
@@ -97,10 +98,12 @@ fix-it panel should not have to re-derive the order or guess at the tie-breaks.
 | `code` | Its stable decision id. |
 | `fix` | The full suggestion, untruncated (the prose report cuts it to fit a line). |
 | `proven` | `true` when the compiler applied the fix to a clone, re-ran its own optimizer, and confirmed it. |
-| `depth` | Loop nest depth, the second sort key after `proven`. |
+| `depth` | Loop nest depth, a sort key after `proven` and specificity. |
+| `sites` | How many findings this entry stands for. One line per decision code: four loops needing the same change are one decision and four edits. |
 
-At most five entries, and empty when nothing in the file has a fix. Unlike the prose report, this
-array ignores `--explain=SELECTOR`.
+At most five entries, one per decision code, and empty when nothing in the file has a fix. Advice
+that says there is nothing to change (`advisory`) is never here. Unlike the prose report, this array
+ignores `--explain=SELECTOR`.
 
 ## `functions`
 

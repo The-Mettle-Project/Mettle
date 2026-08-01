@@ -316,6 +316,17 @@ const char *ir_simd_bail_id_name(int id) {
     }                                                                          \
   } while (0)
 
+/* The advice just written tells the reader there is nothing to change: the
+ * loop is at its floor, or the gap is the compiler's. It is still worth
+ * printing, since "this is fine" is an answer, but it is not a fix and the
+ * report's triage must not rank it as one. */
+#define IR_SIMD_MARK_ADVISORY()                                                \
+  do {                                                                         \
+    if (advisory_out) {                                                        \
+      *advisory_out = 1;                                                       \
+    }                                                                          \
+  } while (0)
+
 /* ---- loop-carried recurrence detection (dependence analysis) ---------------
  * A reduction whose only carried operation reassociates ('+'/'-') is NOT a
  * serial bottleneck -- the lanes can sum partials and combine at the end, and
@@ -478,10 +489,13 @@ static void ir_type_element_name(const char *declared, char *out, size_t cap) {
  * the region. Empty fix = nothing actionable. */
 static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
                                  size_t end, char *reason, size_t reason_cap,
-                                 char *fix, size_t fix_cap,
-                                 int *diagnosis_out) {
+                                 char *fix, size_t fix_cap, int *diagnosis_out,
+                                 int *advisory_out) {
   reason[0] = '\0';
   fix[0] = '\0';
+  if (advisory_out) {
+    *advisory_out = 0;
+  }
   IR_SIMD_SET_DIAG(IR_SIMD_BAIL_UNRECOGNIZED_SHAPE);
 
   const char *callee = NULL;
@@ -663,6 +677,7 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
                "scalar loop is the right code; if the call is loop-invariant, "
                "hoist it; if it is hot compute, replace it with Mettle code "
                "so the inliner can take it");
+      IR_SIMD_MARK_ADVISORY();
       IR_SIMD_SET_DIAG(IR_SIMD_BAIL_EXTERN_CALL_IN_BODY);
       return;
     }
@@ -815,6 +830,7 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
                "divide, shift, and bitwise/xor recurrences are inherently "
                "serial -- if this running state IS the algorithm (a hash, an "
                "RNG, an IIR filter), the loop is already at its scalar floor");
+      IR_SIMD_MARK_ADVISORY();
       IR_SIMD_SET_DIAG(IR_SIMD_BAIL_SERIAL_RECURRENCE);
       return;
     }
@@ -912,6 +928,7 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
       snprintf(fix, fix_cap,
                "nothing to change here: this is a gap in the compiler, not a "
                "problem with the loop");
+      IR_SIMD_MARK_ADVISORY();
       IR_SIMD_SET_DIAG(IR_SIMD_BAIL_STORE_ONLY_FILL);
       return;
     }
@@ -1653,8 +1670,9 @@ static void ir_explain_report_loops(const IRFunction *function,
       }
     } else {
       int diagnosis = IR_SIMD_BAIL_NONE;
+      int advisory = 0;
       ir_simd_explain_bail(function, L->begin, L->end, reason, sizeof(reason),
-                           fix, sizeof(fix), &diagnosis);
+                           fix, sizeof(fix), &diagnosis, &advisory);
       /* When the diagnosis has a paired hypothesis transform, simulate the
        * suggested fix and let the vectorizer itself confirm it. A proven-
        * inapplicable fix is REPLACED, never printed -- bad advice with a
@@ -1700,6 +1718,7 @@ static void ir_explain_report_loops(const IRFunction *function,
                    "and scalar is the right code for it -- the vectorizable "
                    "work is inside `%s`, so check the remarks on its loops",
                    callee);
+          advisory = 1;
         } else if (sim == 1) {
           if (was_noinline) {
             /* The right advice for a vetoed callee is removing the veto;
@@ -1733,12 +1752,18 @@ static void ir_explain_report_loops(const IRFunction *function,
                    "then vectorizes \xE2\x86\x92 %s",
                    kernel_desc);
         } else if (sim == IR_SIMD_FIX_INAPPLICABLE && inapplicable_fix) {
+          /* The simulation disproved the advice, so what is left describes
+           * the loop rather than instructing anyone. */
           snprintf(fix, sizeof(fix), "%s", inapplicable_fix);
+          advisory = 1;
         }
       }
       ir_explain_remark(function->name, "loop", L->location, 0,
                         "NOT vectorized", reason, fix[0] ? fix : NULL,
                         verified[0] ? verified : NULL);
+      if (advisory) {
+        ir_explain_remark_advisory();
+      }
       ir_explain_remark_code(ir_simd_bail_id_name(diagnosis));
       ir_explain_remark_extent(ir_simd_loop_end_line(function, L));
     }

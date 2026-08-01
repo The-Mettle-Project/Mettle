@@ -244,8 +244,15 @@ input file and why. It reads top to bottom in three parts.
 
 **Where to start.** The findings that have a fix, ranked by what the compiler
 can stand behind. A fix marked `proven` was applied to a clone of the function
-and re-checked, so the advice is a result rather than a belief. After that,
-loop depth: the same fix inside a nested loop is worth more.
+and re-checked, so the advice is a result rather than a belief. Then advice
+that names a cause, ahead of the fallback checklist the compiler falls back on
+when it cannot. Then loop depth: the same fix inside a nested loop is worth
+more.
+
+One line per kind of work, with `(+N more sites)` where the same change is
+needed in several places: four loops wanting the same edit are one decision to
+make. Advice that says there is nothing to change is labelled `note:` rather
+than `fix:` and never appears here, so the list stays a list of work.
 
 **The findings**, in source order. One line per decision, tagged with its
 stable decision code, then the source it is about, then the reason, the fix,

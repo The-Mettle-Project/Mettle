@@ -1216,6 +1216,7 @@ void ir_inline_explain_report_remaining(IRProgram *program) {
        * structural guard hides behind the discretionary cap that fired
        * first), so the fix is corrected rather than printed as-is. */
       const char *verified = NULL;
+      int advisory = 0;
       char corrected_fix[320];
       if (fix && strstr(fix, "@inline") && !callee->is_inline &&
           !callee->is_noinline) {
@@ -1233,11 +1234,15 @@ void ir_inline_explain_report_remaining(IRProgram *program) {
            * line restating it would be noise. */
           fix = NULL;
         } else {
+          /* The simulation disproved the advice. What is left explains why
+           * the obvious suggestion fails; it does not instruct anyone, so
+           * the report must not rank it as work to do. */
           snprintf(corrected_fix, sizeof(corrected_fix),
                    "none -- re-checked with @inline "
                    "pretend-applied and it still won't inline: %s",
                    forced_reason ? forced_reason : "a structural guard");
           fix = corrected_fix;
+          advisory = 1;
         }
         callee->is_inline = saved;
       }
@@ -1246,6 +1251,9 @@ void ir_inline_explain_report_remaining(IRProgram *program) {
       snprintf(entity, sizeof(entity), "call to `%s`", instruction->text);
       ir_explain_remark(function->name, entity, instruction->location, 0,
                         "NOT inlined", reason, fix, verified);
+      if (advisory) {
+        ir_explain_remark_advisory();
+      }
       ir_explain_remark_code(refusal_code);
       ir_explain_remark_quantity("calleeInstructions",
                                  (long)ir_function_non_nop_instruction_count(callee));

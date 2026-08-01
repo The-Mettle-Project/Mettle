@@ -577,6 +577,10 @@ void ir_explain_remark_loop_depth(size_t line, size_t depth);
 void ir_explain_remark_code(const char *code);
 void ir_explain_remark_extent(size_t end_line);
 void ir_explain_remark_trivial(void);
+/* Mark the last remark's advice as descriptive rather than actionable: it
+ * says the loop is already right, or that the gap belongs to the compiler.
+ * The prose labels it "note" instead of "fix", and the triage skips it. */
+void ir_explain_remark_advisory(void);
 void ir_explain_remark_quantity(const char *name, long value);
 
 /* A callee this small is a wrapper; inlining it is housekeeping, not a
