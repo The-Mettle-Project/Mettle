@@ -171,7 +171,8 @@ what makes this section work.
 
 ## Consumers
 
-- The CLion plugin in [`tools/clion-plugin`](../tools/clion-plugin) reads all of it.
+- The CLion plugin in the [MettleMisc](https://github.com/The-Mettle-Project/MettleMisc)
+  project reads all of it.
 - `tests/run_tests.ps1` pins the shape in `explain_changes_and_json`.
 
 ## See also
