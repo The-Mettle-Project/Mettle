@@ -1968,7 +1968,9 @@ static size_t ir_explain_rank_fixes(int apply_filter, size_t *order,
 typedef struct {
   char location[160];      /* "main (252 instrs)" */
   char function_name[128]; /* the same function, for the JSON sidecar */
-  char why[224];           /* the gate's reason, and the loop it is about */
+  /* The gate's reason, and the loop it is about. Sized to hold both whole: a
+     reason is up to 256 and the loop list up to 96. */
+  char why[384];
   const char *fix;
   size_t instructions_sort;
 } IRExplainBackendPlan;
