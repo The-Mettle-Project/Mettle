@@ -45,7 +45,32 @@ export extern fn cuLaunchKernel(f: int64, gx: uint32, gy: uint32, gz: uint32,
                                       sharedBytes: uint32, stream: int64,
                                       kernelParams: int64*, extra: int64*) -> int32 = "cuLaunchKernel";
 export extern fn cuCtxSynchronize() -> int32 = "cuCtxSynchronize";
+// Stream capture and graphs: record a launch sequence once, replay it as one
+// submission. CU_STREAM_CAPTURE_MODE_THREAD_LOCAL = 1.
+export extern fn cuStreamBeginCapture_v2(stream: int64, mode: int32) -> int32 = "cuStreamBeginCapture_v2";
+export extern fn cuStreamEndCapture(stream: int64, graphOut: int64*) -> int32 = "cuStreamEndCapture";
+export extern fn cuGraphInstantiateWithFlags(execOut: int64*, graph: int64, flags: int64) -> int32 = "cuGraphInstantiateWithFlags";
+export extern fn cuGraphLaunch(exec: int64, stream: int64) -> int32 = "cuGraphLaunch";
+export extern fn cuGraphExecDestroy(exec: int64) -> int32 = "cuGraphExecDestroy";
+export extern fn cuGraphDestroy(graph: int64) -> int32 = "cuGraphDestroy";
 extern fn __mtlc_gpu_process_exit(code: int32) = "exit";
+// Diagnostics for the typed-dispatch failures below, declared here rather than
+// imported so this module keeps depending on nothing but the driver and libc.
+extern fn __mtlc_gpu_fputs(text: cstring, stream: cstring) -> int32 = "fputs";
+extern fn __mtlc_gpu_iob(index: int32) -> cstring = "__acrt_iob_func";
+
+// std/gpu depends on the driver and libc only, so it converts its own string
+// literals rather than importing std/io for cstr.
+fn __mtlc_gpu_cstr(s: string) -> cstring { return s.chars; }
+
+fn __mtlc_gpu_fail(part1: cstring, part2: cstring, part3: cstring) {
+  var err: cstring = __mtlc_gpu_iob(2);
+  __mtlc_gpu_fputs(part1, err);
+  __mtlc_gpu_fputs(part2, err);
+  __mtlc_gpu_fputs(part3, err);
+  __mtlc_gpu_fputs(__mtlc_gpu_cstr("\n"), err);
+  __mtlc_gpu_process_exit(1);
+}
 
 // ---- ergonomic helpers (return handles directly; 0 on failure) ----
 
@@ -64,6 +89,9 @@ export fn gpu_init() -> int64 {
 export fn gpu_module(ptx_image: uint8*) -> int64 {
   var mod: int64 = 0;
   if (cuModuleLoadData(&mod, ptx_image) != 0) { return 0; }
+  // Typed `dispatch` resolves declared kernel names against the module loaded
+  // most recently; gpu_module_bind overrides that when several are live.
+  gpu_module_bind(mod);
   return mod;
 }
 
@@ -212,6 +240,110 @@ export fn gpu_launch_on(f: int64, grid: int32, block: int32,
                         stream: int64, params: int64*, nargs: int32) -> int32 {
   return gpu_launch_3d(f, grid, 1, 1, block, 1, 1, 0, stream,
                        params, nargs);
+}
+
+// ---- launch graphs ----
+//
+// A decode step is a fixed sequence of launches whose shapes never change; the
+// per-launch enqueue cost is then pure overhead. Capture the sequence once on
+// a stream and replay it as a single submission:
+//
+//   var g: int64 = gpu_graph_capture_begin(stream);
+//   dispatch norm[work: dim](...) on stream;
+//   dispatch matvec[work: d](...) on stream;
+//   var exec: int64 = gpu_graph_capture_end(stream);
+//   ...
+//   gpu_graph_launch(exec, stream);   // every token after the first
+//
+// Everything between begin and end must enqueue on `stream` and must not
+// synchronize; a capture records work rather than running it, so a readback in
+// the middle deadlocks. Buffer ADDRESSES are baked into the graph, contents are
+// not: a replay reads whatever the buffers hold at replay time, which is what
+// makes one capture serve every token.
+
+// Begin capturing `stream`. Returns 0 on success, the driver status otherwise.
+export fn gpu_graph_capture_begin(stream: int64) -> int32 {
+  return cuStreamBeginCapture_v2(stream, 1); // THREAD_LOCAL
+}
+
+// End the capture and instantiate the recorded graph. Returns an executable
+// graph handle (0 on failure) ready for gpu_graph_launch. The intermediate
+// graph object is released; the executable owns what it needs.
+export fn gpu_graph_capture_end(stream: int64) -> int64 {
+  var graph: int64 = 0;
+  if (cuStreamEndCapture(stream, &graph) != 0) { return 0; }
+  if (graph == 0) { return 0; }
+  var exec: int64 = 0;
+  var rc: int32 = cuGraphInstantiateWithFlags(&exec, graph, 0);
+  cuGraphDestroy(graph);
+  if (rc != 0) { return 0; }
+  return exec;
+}
+
+export fn gpu_graph_launch(exec: int64, stream: int64) -> int32 {
+  return cuGraphLaunch(exec, stream);
+}
+
+export fn gpu_graph_destroy(exec: int64) -> int32 {
+  return cuGraphExecDestroy(exec);
+}
+
+// ---- typed dispatch: kernel handles resolved by name ----
+//
+// `extern kernel name(...)` declares a kernel host-side; `dispatch name[...]`
+// then checks its arguments and resolves the handle through the two functions
+// below rather than through a host variable holding a gpu_func result.
+//
+// The module a name resolves against is the one gpu_module loaded last, or one
+// named explicitly with gpu_module_bind. Resolution is cached: the compiler
+// passes a string literal, so the same name arrives as the same pointer every
+// time and a hit costs a pointer compare rather than a driver call.
+
+var g_gpu_bound_module: int64 = 0;
+var g_gpu_kernel_names: int64[128];
+var g_gpu_kernel_handles: int64[128];
+var g_gpu_kernel_count: int32 = 0;
+
+// Make `mod` the module that typed dispatch resolves names against. gpu_module
+// does this for the module it loads, so an ordinary one-module program never
+// calls this; a program juggling several modules uses it to say which is live.
+export fn gpu_module_bind(mod: int64) -> int64 {
+  var previous: int64 = g_gpu_bound_module;
+  g_gpu_bound_module = mod;
+  // A rebind invalidates every cached handle: the same name in a different
+  // module is a different function.
+  if (previous != mod) { g_gpu_kernel_count = 0; }
+  return previous;
+}
+
+export fn gpu_module_bound() -> int64 { return g_gpu_bound_module; }
+
+// Resolve (and cache) a kernel handle for typed dispatch. Terminates the
+// process on failure: a launch of a kernel the module does not define cannot
+// be made to do anything sensible, and returning 0 would enqueue against a
+// null handle.
+export fn mtlc_gpu_kernel_handle(name: cstring) -> int64 {
+  var key: int64 = (int64)name;
+  var i: int32 = 0;
+  while (i < g_gpu_kernel_count) {
+    if (g_gpu_kernel_names[i] == key) { return g_gpu_kernel_handles[i]; }
+    i = i + 1;
+  }
+  if (g_gpu_bound_module == 0) {
+    __mtlc_gpu_fail(__mtlc_gpu_cstr("mettle: dispatch of kernel '"), name,
+                    __mtlc_gpu_cstr("' before any GPU module was loaded"));
+  }
+  var handle: int64 = gpu_func(g_gpu_bound_module, name);
+  if (handle == 0) {
+    __mtlc_gpu_fail(__mtlc_gpu_cstr("mettle: the loaded GPU module defines no kernel '"),
+                    name, __mtlc_gpu_cstr("'"));
+  }
+  if (g_gpu_kernel_count < 128) {
+    g_gpu_kernel_names[g_gpu_kernel_count] = key;
+    g_gpu_kernel_handles[g_gpu_kernel_count] = handle;
+    g_gpu_kernel_count = g_gpu_kernel_count + 1;
+  }
+  return handle;
 }
 
 // Synchronous launch helper for diagnostics or one-off kernels where immediate

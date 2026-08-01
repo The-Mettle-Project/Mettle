@@ -537,6 +537,14 @@ static void populate_module_symbols(IRProgram *program, ASTNode *ast_program,
       if (!fd || !fd->name) {
         continue;
       }
+      /* `extern kernel` names a device entry point, not a host symbol. It
+       * exists so `dispatch` can check its arguments; the handle is resolved
+       * from the loaded GPU module at run time. Emitting a module symbol for
+       * it would make the host linker look for a definition that is, by
+       * construction, on the other side of the PTX boundary. */
+      if (fd->is_extern && fd->is_kernel) {
+        continue;
+      }
       Symbol *s = symbol_table_lookup(st, fd->name);
       IRModuleSymbol entry = {0};
       entry.name = fd->name;

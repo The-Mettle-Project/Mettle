@@ -39,6 +39,8 @@ typedef struct {
                            occupancy ceiling */
   int report_sms; /* --sms=N: SM count for the occupancy report's whole-card
                      fill thresholds; 0 = ask the local driver */
+  int gpu_checks; /* --gpu-checks: emit kernel-side assertion traps */
+  int report_launches; /* --report-launches: list every dispatch site */
   int emit_spirv; /* --emit-spirv: lower declared kernels to SPIR-V, no object */
   int emit_arm64; /* --emit-arm64: lower scalar functions to an AArch64 ELF */
   int optimize;

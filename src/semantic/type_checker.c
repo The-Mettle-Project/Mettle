@@ -206,6 +206,14 @@ int type_checker_register_function_signature(TypeChecker *checker,
   func_symbol->data.function.parameter_names = param_names_copy;
   func_symbol->data.function.parameter_types = param_types;
   func_symbol->data.function.return_type = return_type;
+  /* Kernel identity travels with the signature: this pre-registration is the
+   * symbol a `dispatch` earlier in the file resolves against, so it has to
+   * know the declaration was a `kernel` and what block shape it declared. */
+  func_symbol->is_kernel = func_decl->is_kernel;
+  func_symbol->kernel_block[0] = func_decl->kernel_block[0];
+  func_symbol->kernel_block[1] = func_decl->kernel_block[1];
+  func_symbol->kernel_block[2] = func_decl->kernel_block[2];
+  func_symbol->kernel_threads_per_item = func_decl->kernel_threads_per_item;
   func_symbol->is_extern = func_decl->is_extern;
   if (func_decl->is_extern) {
     const char *effective_link_name = type_checker_decl_link_name(

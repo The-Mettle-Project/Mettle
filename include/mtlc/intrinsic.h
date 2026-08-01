@@ -60,6 +60,40 @@ typedef enum {
    * unsigned (U32) or signed (S32) byte interpretation. */
   MTLC_INTRINSIC_GPU_DP4A_U32,
   MTLC_INTRINSIC_GPU_DP4A_S32,
+  /* Four-way packed dot product over 16-bit halves, low or high pair, with
+   * 32-bit accumulate. The building block dp4a is for byte lanes. */
+  MTLC_INTRINSIC_GPU_DP2A_LO_U32,
+  MTLC_INTRINSIC_GPU_DP2A_LO_S32,
+  MTLC_INTRINSIC_GPU_DP2A_HI_U32,
+  MTLC_INTRINSIC_GPU_DP2A_HI_S32,
+  /* Byte permute: gather four bytes from a 64-bit value pair by a selector
+   * nibble each. The nibble-unpacking primitive quantized decode wants. */
+  MTLC_INTRINSIC_GPU_PRMT_B32,
+  /* 128-bit vector load/store: four consecutive 32-bit elements moved in one
+   * memory transaction. (src, dst) pointers; the element count is the name. */
+  MTLC_INTRINSIC_GPU_LOAD4_F32,
+  MTLC_INTRINSIC_GPU_LOAD4_U32,
+  MTLC_INTRINSIC_GPU_STORE4_F32,
+  MTLC_INTRINSIC_GPU_STORE4_U32,
+  /* Kernel-side diagnostics. printf writes through the device print buffer;
+   * the format is a literal and the argument shape is in the name. assert
+   * traps the launch when its condition is false. */
+  /* Packed half precision: two fp16 lanes in one 32-bit value, with native
+   * two-at-a-time arithmetic, plus the lane extraction and packing around it.
+   * bfloat16 rides the same carrier with its own conversions. */
+  MTLC_INTRINSIC_GPU_HADD2,
+  MTLC_INTRINSIC_GPU_HMUL2,
+  MTLC_INTRINSIC_GPU_HFMA2,
+  MTLC_INTRINSIC_GPU_H2F_LO,
+  MTLC_INTRINSIC_GPU_H2F_HI,
+  MTLC_INTRINSIC_GPU_F2H2,
+  MTLC_INTRINSIC_GPU_BF2F,
+  MTLC_INTRINSIC_GPU_F2BF,
+  MTLC_INTRINSIC_GPU_PRINT,
+  MTLC_INTRINSIC_GPU_PRINT_I32,
+  MTLC_INTRINSIC_GPU_PRINT_F32,
+  MTLC_INTRINSIC_GPU_PRINT_2I32,
+  MTLC_INTRINSIC_GPU_ASSERT,
   MTLC_INTRINSIC_GPU_ATOMIC_MIN_U32,
   MTLC_INTRINSIC_GPU_ATOMIC_MIN_U64,
   MTLC_INTRINSIC_GPU_ATOMIC_ADD_U32,

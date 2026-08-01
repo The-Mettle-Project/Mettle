@@ -1,0 +1,8 @@
+import "std/gpu";
+extern kernel(block = 256) vadd(a: float32*, b: float32*, c: float32*, n: int32);
+fn main() -> int32 {
+  var d: int64 = 0;
+  var f: float32 = 1.0;
+  dispatch vadd[1, 256](d, d, d, f);
+  return 0;
+}

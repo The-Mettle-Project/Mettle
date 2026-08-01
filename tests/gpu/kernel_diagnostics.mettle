@@ -1,0 +1,22 @@
+// Kernel-side printf and assertions. The traps are emitted only under
+// --gpu-checks; the prints always are.
+extern fn gpu_print(fmt: cstring) = "gpu_print";
+extern fn gpu_print_i32(fmt: cstring, v: int32) = "gpu_print_i32";
+extern fn gpu_print_f32(fmt: cstring, v: float32) = "gpu_print_f32";
+extern fn gpu_print_2i32(fmt: cstring, a: int32, b: int32) = "gpu_print_2i32";
+extern fn gpu_assert(cond: int32) = "gpu_assert";
+
+kernel(block = 256) traced(x: float32*, n: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  gpu_assert(n > 0);
+  if (i == 0) {
+    gpu_print("kernel entered\n");
+    gpu_print_i32("n = %d\n", n);
+    gpu_print_f32("x[0] = %f\n", x[0]);
+    gpu_print_2i32("block %d thread %d\n", block.x, thread.x);
+  }
+  if (i < n) {
+    gpu_assert(i >= 0);
+    x[i] = x[i] * 2.0;
+  }
+}

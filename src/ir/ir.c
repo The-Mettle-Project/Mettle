@@ -73,6 +73,28 @@ static const IRIntrinsicName g_ir_intrinsics[] = {
     {"bits_from_f32", MTLC_INTRINSIC_GPU_F32_TO_BITS, 1},
     {"dp4a_u32", MTLC_INTRINSIC_GPU_DP4A_U32, 3},
     {"dp4a_s32", MTLC_INTRINSIC_GPU_DP4A_S32, 3},
+    {"dp2a_lo_u32", MTLC_INTRINSIC_GPU_DP2A_LO_U32, 3},
+    {"dp2a_lo_s32", MTLC_INTRINSIC_GPU_DP2A_LO_S32, 3},
+    {"dp2a_hi_u32", MTLC_INTRINSIC_GPU_DP2A_HI_U32, 3},
+    {"dp2a_hi_s32", MTLC_INTRINSIC_GPU_DP2A_HI_S32, 3},
+    {"prmt_b32", MTLC_INTRINSIC_GPU_PRMT_B32, 3},
+    {"hadd2", MTLC_INTRINSIC_GPU_HADD2, 2},
+    {"hmul2", MTLC_INTRINSIC_GPU_HMUL2, 2},
+    {"hfma2", MTLC_INTRINSIC_GPU_HFMA2, 3},
+    {"h2f_lo", MTLC_INTRINSIC_GPU_H2F_LO, 1},
+    {"h2f_hi", MTLC_INTRINSIC_GPU_H2F_HI, 1},
+    {"f2h2", MTLC_INTRINSIC_GPU_F2H2, 2},
+    {"bf2f", MTLC_INTRINSIC_GPU_BF2F, 1},
+    {"f2bf", MTLC_INTRINSIC_GPU_F2BF, 1},
+    {"gpu_print", MTLC_INTRINSIC_GPU_PRINT, 1},
+    {"gpu_print_i32", MTLC_INTRINSIC_GPU_PRINT_I32, 2},
+    {"gpu_print_f32", MTLC_INTRINSIC_GPU_PRINT_F32, 2},
+    {"gpu_print_2i32", MTLC_INTRINSIC_GPU_PRINT_2I32, 3},
+    {"gpu_assert", MTLC_INTRINSIC_GPU_ASSERT, 1},
+    {"load4_f32", MTLC_INTRINSIC_GPU_LOAD4_F32, 2},
+    {"load4_u32", MTLC_INTRINSIC_GPU_LOAD4_U32, 2},
+    {"store4_f32", MTLC_INTRINSIC_GPU_STORE4_F32, 2},
+    {"store4_u32", MTLC_INTRINSIC_GPU_STORE4_U32, 2},
     {"atomic_min_u32", MTLC_INTRINSIC_GPU_ATOMIC_MIN_U32, 3},
     {"atomic_min_u64", MTLC_INTRINSIC_GPU_ATOMIC_MIN_U64, 3},
     {"atomic_add_u32", MTLC_INTRINSIC_GPU_ATOMIC_ADD_U32, 3},
@@ -4292,7 +4314,35 @@ static unsigned char ir_gpu_intrinsic_result_uniformity(
   case MTLC_INTRINSIC_GPU_F32_TO_BITS:
   case MTLC_INTRINSIC_GPU_DP4A_U32:
   case MTLC_INTRINSIC_GPU_DP4A_S32:
+  case MTLC_INTRINSIC_GPU_DP2A_LO_U32:
+  case MTLC_INTRINSIC_GPU_DP2A_LO_S32:
+  case MTLC_INTRINSIC_GPU_DP2A_HI_U32:
+  case MTLC_INTRINSIC_GPU_DP2A_HI_S32:
+  case MTLC_INTRINSIC_GPU_PRMT_B32:
+  case MTLC_INTRINSIC_GPU_HADD2:
+  case MTLC_INTRINSIC_GPU_HMUL2:
+  case MTLC_INTRINSIC_GPU_HFMA2:
+  case MTLC_INTRINSIC_GPU_H2F_LO:
+  case MTLC_INTRINSIC_GPU_H2F_HI:
+  case MTLC_INTRINSIC_GPU_F2H2:
+  case MTLC_INTRINSIC_GPU_BF2F:
+  case MTLC_INTRINSIC_GPU_F2BF:
     return ir_gpu_uniform_arguments(map, instruction);
+  case MTLC_INTRINSIC_GPU_LOAD4_F32:
+  case MTLC_INTRINSIC_GPU_LOAD4_U32:
+  case MTLC_INTRINSIC_GPU_STORE4_F32:
+  case MTLC_INTRINSIC_GPU_STORE4_U32:
+    /* Memory movers: the values they land are as varying as any load. */
+    return IR_GPU_UNIFORM_VARYING;
+  case MTLC_INTRINSIC_GPU_PRINT:
+  case MTLC_INTRINSIC_GPU_PRINT_I32:
+  case MTLC_INTRINSIC_GPU_PRINT_F32:
+  case MTLC_INTRINSIC_GPU_PRINT_2I32:
+  case MTLC_INTRINSIC_GPU_ASSERT:
+    /* Diagnostics return nothing and constrain nothing: a per-lane print or
+     * trap is deliberately allowed in divergent control flow, which is where
+     * it is most wanted. */
+    return IR_GPU_UNIFORM_WORKGROUP;
   case MTLC_INTRINSIC_GPU_WORKGROUP_BARRIER:
     return IR_GPU_UNIFORM_WORKGROUP;
   case MTLC_INTRINSIC_NONE:

@@ -562,6 +562,7 @@ typedef struct {
    * mismatched launch instead of running it with a garbage lane mapping;
    * SPIR-V emits the LocalSize execution mode. */
   int kernel_block[3];
+  int kernel_threads_per_item;
 } IRFunction;
 
 typedef struct {

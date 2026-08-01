@@ -903,8 +903,31 @@ static SpvDesc call_result_desc(SpvFn *fn, const IRInstruction *in) {
              intrinsic == MTLC_INTRINSIC_GPU_DP4A_U32) {
     r.kind = MTLC_TYPE_UINT32;
     r.is_unsigned = 1;
-  } else if (intrinsic == MTLC_INTRINSIC_GPU_DP4A_S32) {
+  } else if (intrinsic == MTLC_INTRINSIC_GPU_DP4A_S32 ||
+             intrinsic == MTLC_INTRINSIC_GPU_DP2A_LO_S32 ||
+             intrinsic == MTLC_INTRINSIC_GPU_DP2A_HI_S32) {
     r.kind = MTLC_TYPE_INT32;
+  } else if (intrinsic == MTLC_INTRINSIC_GPU_DP2A_LO_U32 ||
+             intrinsic == MTLC_INTRINSIC_GPU_DP2A_HI_U32 ||
+             intrinsic == MTLC_INTRINSIC_GPU_PRMT_B32) {
+    r.kind = MTLC_TYPE_UINT32;
+    r.is_unsigned = 1;
+  } else if (intrinsic == MTLC_INTRINSIC_GPU_H2F_LO ||
+             intrinsic == MTLC_INTRINSIC_GPU_H2F_HI ||
+             intrinsic == MTLC_INTRINSIC_GPU_BF2F) {
+    r.kind = MTLC_TYPE_FLOAT32;
+  } else if (intrinsic == MTLC_INTRINSIC_GPU_HADD2 ||
+             intrinsic == MTLC_INTRINSIC_GPU_HMUL2 ||
+             intrinsic == MTLC_INTRINSIC_GPU_HFMA2 ||
+             intrinsic == MTLC_INTRINSIC_GPU_F2H2 ||
+             intrinsic == MTLC_INTRINSIC_GPU_F2BF) {
+    r.kind = MTLC_TYPE_UINT32;
+    r.is_unsigned = 1;
+  } else if (intrinsic == MTLC_INTRINSIC_GPU_LOAD4_F32 ||
+             intrinsic == MTLC_INTRINSIC_GPU_LOAD4_U32 ||
+             intrinsic == MTLC_INTRINSIC_GPU_STORE4_F32 ||
+             intrinsic == MTLC_INTRINSIC_GPU_STORE4_U32) {
+    r.kind = MTLC_TYPE_VOID;
   } else if (is_math_intrinsic(intrinsic)) {
     r.kind = MTLC_TYPE_FLOAT32;
   } else if (is_atomic_intrinsic(intrinsic)) {
@@ -1558,6 +1581,301 @@ static void emit_call(SpvFn *fn, const IRInstruction *in) {
       acc = next;
     }
     if (in->dest.name) store_name(fn, in->dest.name, acc);
+    return;
+  }
+  if ((intrinsic == MTLC_INTRINSIC_GPU_DP2A_LO_U32 ||
+       intrinsic == MTLC_INTRINSIC_GPU_DP2A_LO_S32 ||
+       intrinsic == MTLC_INTRINSIC_GPU_DP2A_HI_U32 ||
+       intrinsic == MTLC_INTRINSIC_GPU_DP2A_HI_S32) &&
+      in->argument_count >= 3) {
+    /* No portable SPIR-V mixed-width dot product: replay the exact semantics.
+     * Two 16-bit halves of a against the low or high byte pair of b. */
+    int is_signed = intrinsic == MTLC_INTRINSIC_GPU_DP2A_LO_S32 ||
+                    intrinsic == MTLC_INTRINSIC_GPU_DP2A_HI_S32;
+    int is_high = intrinsic == MTLC_INTRINSIC_GPU_DP2A_HI_U32 ||
+                  intrinsic == MTLC_INTRINSIC_GPU_DP2A_HI_S32;
+    MtlcTypeKind kind = is_signed ? MTLC_TYPE_INT32 : MTLC_TYPE_UINT32;
+    uint32_t a = materialize(fn, &in->arguments[0], kind);
+    uint32_t b = materialize(fn, &in->arguments[1], kind);
+    uint32_t acc = materialize(fn, &in->arguments[2], kind);
+    uint32_t i32 = type_int(m, 32);
+    for (unsigned half = 0; half < 2; half++) {
+      uint32_t ea;
+      uint32_t eb;
+      unsigned byte_index = (is_high ? 2u : 0u) + half;
+      if (is_signed) {
+        uint32_t half_left = const_u32(m, 16u - half * 16u);
+        uint32_t half_right = const_u32(m, 16u);
+        uint32_t byte_left = const_u32(m, 24u - byte_index * 8u);
+        uint32_t byte_right = const_u32(m, 24u);
+        uint32_t la = new_id(m);
+        emitv(&m->functions, Op_ShiftLeftLogical, 4, i32, la, a, half_left);
+        ea = new_id(m);
+        emitv(&m->functions, Op_ShiftRightArithmetic, 4, i32, ea, la,
+              half_right);
+        uint32_t lb = new_id(m);
+        emitv(&m->functions, Op_ShiftLeftLogical, 4, i32, lb, b, byte_left);
+        eb = new_id(m);
+        emitv(&m->functions, Op_ShiftRightArithmetic, 4, i32, eb, lb,
+              byte_right);
+      } else {
+        uint32_t half_shift = const_u32(m, half * 16u);
+        uint32_t half_mask = const_u32(m, 0xFFFFu);
+        uint32_t byte_shift = const_u32(m, byte_index * 8u);
+        uint32_t byte_mask = const_u32(m, 0xFFu);
+        uint32_t sa = new_id(m);
+        emitv(&m->functions, Op_ShiftRightLogical, 4, i32, sa, a, half_shift);
+        ea = new_id(m);
+        emitv(&m->functions, Op_BitwiseAnd, 4, i32, ea, sa, half_mask);
+        uint32_t sb = new_id(m);
+        emitv(&m->functions, Op_ShiftRightLogical, 4, i32, sb, b, byte_shift);
+        eb = new_id(m);
+        emitv(&m->functions, Op_BitwiseAnd, 4, i32, eb, sb, byte_mask);
+      }
+      uint32_t product = new_id(m);
+      emitv(&m->functions, Op_IMul, 4, i32, product, ea, eb);
+      uint32_t next = new_id(m);
+      emitv(&m->functions, Op_IAdd, 4, i32, next, acc, product);
+      acc = next;
+    }
+    if (in->dest.name) store_name(fn, in->dest.name, acc);
+    return;
+  }
+  if ((intrinsic == MTLC_INTRINSIC_GPU_HADD2 ||
+       intrinsic == MTLC_INTRINSIC_GPU_HMUL2 ||
+       intrinsic == MTLC_INTRINSIC_GPU_HFMA2) &&
+      in->argument_count >= 2) {
+    /* SPIR-V 1.0 OpenCL has no packed-half arithmetic type, so each lane is
+     * converted, computed in f16, and repacked. Same values, one lane at a
+     * time; the packed instruction is a PTX-side win only. */
+    int is_fma = intrinsic == MTLC_INTRINSIC_GPU_HFMA2;
+    uint32_t a = materialize(fn, &in->arguments[0], MTLC_TYPE_UINT32);
+    uint32_t b = materialize(fn, &in->arguments[1], MTLC_TYPE_UINT32);
+    uint32_t c = is_fma ? materialize(fn, &in->arguments[2], MTLC_TYPE_UINT32)
+                        : 0;
+    uint32_t i32 = type_int(m, 32);
+    uint32_t i16 = type_int(m, 16);
+    uint32_t h = type_float(m, 16);
+    uint32_t result = const_u32(m, 0);
+    for (unsigned lane = 0; lane < 2; lane++) {
+      uint32_t shift = const_u32(m, lane * 16u);
+      uint32_t mask = const_u32(m, 0xFFFFu);
+      uint32_t values[3];
+      unsigned operand_count = is_fma ? 3u : 2u;
+      uint32_t sources[3] = {a, b, c};
+      for (unsigned operand = 0; operand < operand_count; operand++) {
+        uint32_t moved = new_id(m);
+        emitv(&m->functions, Op_ShiftRightLogical, 4, i32, moved,
+              sources[operand], shift);
+        uint32_t masked = new_id(m);
+        emitv(&m->functions, Op_BitwiseAnd, 4, i32, masked, moved, mask);
+        uint32_t narrowed = new_id(m);
+        emitv(&m->functions, Op_UConvert, 3, i16, narrowed, masked);
+        values[operand] = new_id(m);
+        emitv(&m->functions, Op_Bitcast, 3, h, values[operand], narrowed);
+      }
+      uint32_t computed = new_id(m);
+      if (intrinsic == MTLC_INTRINSIC_GPU_HADD2) {
+        emitv(&m->functions, Op_FAdd, 4, h, computed, values[0], values[1]);
+      } else {
+        uint32_t product = new_id(m);
+        emitv(&m->functions, Op_FMul, 4, h, product, values[0], values[1]);
+        if (is_fma) {
+          emitv(&m->functions, Op_FAdd, 4, h, computed, product, values[2]);
+        } else {
+          computed = product;
+        }
+      }
+      uint32_t back = new_id(m);
+      emitv(&m->functions, Op_Bitcast, 3, i16, back, computed);
+      uint32_t widened = new_id(m);
+      emitv(&m->functions, Op_UConvert, 3, i32, widened, back);
+      uint32_t placed = new_id(m);
+      emitv(&m->functions, Op_ShiftLeftLogical, 4, i32, placed, widened, shift);
+      uint32_t merged = new_id(m);
+      emitv(&m->functions, Op_BitwiseOr, 4, i32, merged, result, placed);
+      result = merged;
+    }
+    if (in->dest.name) store_name(fn, in->dest.name, result);
+    return;
+  }
+  if ((intrinsic == MTLC_INTRINSIC_GPU_H2F_LO ||
+       intrinsic == MTLC_INTRINSIC_GPU_H2F_HI) &&
+      in->argument_count >= 1) {
+    uint32_t a = materialize(fn, &in->arguments[0], MTLC_TYPE_UINT32);
+    uint32_t i32 = type_int(m, 32);
+    uint32_t i16 = type_int(m, 16);
+    uint32_t h = type_float(m, 16);
+    uint32_t f32 = type_float(m, 32);
+    uint32_t moved = a;
+    if (intrinsic == MTLC_INTRINSIC_GPU_H2F_HI) {
+      moved = new_id(m);
+      emitv(&m->functions, Op_ShiftRightLogical, 4, i32, moved, a,
+            const_u32(m, 16u));
+    }
+    uint32_t narrowed = new_id(m);
+    emitv(&m->functions, Op_UConvert, 3, i16, narrowed, moved);
+    uint32_t half = new_id(m);
+    emitv(&m->functions, Op_Bitcast, 3, h, half, narrowed);
+    uint32_t widened = new_id(m);
+    emitv(&m->functions, Op_FConvert, 3, f32, widened, half);
+    if (in->dest.name) store_name(fn, in->dest.name, widened);
+    return;
+  }
+  if (intrinsic == MTLC_INTRINSIC_GPU_F2H2 && in->argument_count >= 2) {
+    uint32_t i32 = type_int(m, 32);
+    uint32_t i16 = type_int(m, 16);
+    uint32_t h = type_float(m, 16);
+    uint32_t result = const_u32(m, 0);
+    for (unsigned lane = 0; lane < 2; lane++) {
+      uint32_t value = materialize(fn, &in->arguments[lane], MTLC_TYPE_FLOAT32);
+      uint32_t narrowed = new_id(m);
+      emitv(&m->functions, Op_FConvert, 3, h, narrowed, value);
+      uint32_t bits = new_id(m);
+      emitv(&m->functions, Op_Bitcast, 3, i16, bits, narrowed);
+      uint32_t widened = new_id(m);
+      emitv(&m->functions, Op_UConvert, 3, i32, widened, bits);
+      uint32_t placed = new_id(m);
+      emitv(&m->functions, Op_ShiftLeftLogical, 4, i32, placed, widened,
+            const_u32(m, lane * 16u));
+      uint32_t merged = new_id(m);
+      emitv(&m->functions, Op_BitwiseOr, 4, i32, merged, result, placed);
+      result = merged;
+    }
+    if (in->dest.name) store_name(fn, in->dest.name, result);
+    return;
+  }
+  if (intrinsic == MTLC_INTRINSIC_GPU_BF2F && in->argument_count >= 1) {
+    uint32_t a = materialize(fn, &in->arguments[0], MTLC_TYPE_UINT32);
+    uint32_t i32 = type_int(m, 32);
+    uint32_t f32 = type_float(m, 32);
+    uint32_t shifted = new_id(m);
+    emitv(&m->functions, Op_ShiftLeftLogical, 4, i32, shifted, a,
+          const_u32(m, 16u));
+    uint32_t result = new_id(m);
+    emitv(&m->functions, Op_Bitcast, 3, f32, result, shifted);
+    if (in->dest.name) store_name(fn, in->dest.name, result);
+    return;
+  }
+  if (intrinsic == MTLC_INTRINSIC_GPU_F2BF && in->argument_count >= 1) {
+    uint32_t a = materialize(fn, &in->arguments[0], MTLC_TYPE_FLOAT32);
+    uint32_t i32 = type_int(m, 32);
+    uint32_t bits = new_id(m);
+    emitv(&m->functions, Op_Bitcast, 3, i32, bits, a);
+    uint32_t low = new_id(m);
+    emitv(&m->functions, Op_ShiftRightLogical, 4, i32, low, bits,
+          const_u32(m, 16u));
+    uint32_t carry = new_id(m);
+    emitv(&m->functions, Op_BitwiseAnd, 4, i32, carry, low, const_u32(m, 1u));
+    uint32_t bias = new_id(m);
+    emitv(&m->functions, Op_IAdd, 4, i32, bias, carry, const_u32(m, 32767u));
+    uint32_t rounded = new_id(m);
+    emitv(&m->functions, Op_IAdd, 4, i32, rounded, bits, bias);
+    uint32_t result = new_id(m);
+    emitv(&m->functions, Op_ShiftRightLogical, 4, i32, result, rounded,
+          const_u32(m, 16u));
+    if (in->dest.name) store_name(fn, in->dest.name, result);
+    return;
+  }
+  if (intrinsic == MTLC_INTRINSIC_GPU_PRMT_B32 && in->argument_count >= 3) {
+    /* prmt gathers four bytes out of {b:a} by selector nibbles. Replayed as
+     * four selects; the portable profile has no byte-permute instruction.
+     * Only the plain (non-replicate) selector mode is modeled, which is the
+     * mode the sign-extension variants are not. */
+    uint32_t a = materialize(fn, &in->arguments[0], MTLC_TYPE_UINT32);
+    uint32_t b = materialize(fn, &in->arguments[1], MTLC_TYPE_UINT32);
+    uint32_t selector = materialize(fn, &in->arguments[2], MTLC_TYPE_UINT32);
+    uint32_t i32 = type_int(m, 32);
+    uint32_t result = const_u32(m, 0);
+    for (unsigned lane = 0; lane < 4; lane++) {
+      /* index = (selector >> (lane*4)) & 7; source = index < 4 ? a : b */
+      uint32_t nibble_shift = const_u32(m, lane * 4u);
+      uint32_t shifted_selector = new_id(m);
+      emitv(&m->functions, Op_ShiftRightLogical, 4, i32, shifted_selector,
+            selector, nibble_shift);
+      uint32_t index = new_id(m);
+      emitv(&m->functions, Op_BitwiseAnd, 4, i32, index, shifted_selector,
+            const_u32(m, 7u));
+      uint32_t from_high = new_id(m);
+      emitv(&m->functions, Op_ShiftRightLogical, 4, i32, from_high, index,
+            const_u32(m, 2u));
+      uint32_t picks_b = new_id(m);
+      emitv(&m->functions, Op_INotEqual, 4, type_bool(m), picks_b, from_high,
+            const_u32(m, 0u));
+      uint32_t source = new_id(m);
+      emitv(&m->functions, Op_Select, 5, i32, source, picks_b, b, a);
+      uint32_t byte_in_word = new_id(m);
+      emitv(&m->functions, Op_BitwiseAnd, 4, i32, byte_in_word, index,
+            const_u32(m, 3u));
+      uint32_t byte_shift = new_id(m);
+      emitv(&m->functions, Op_ShiftLeftLogical, 4, i32, byte_shift,
+            byte_in_word, const_u32(m, 3u));
+      uint32_t moved = new_id(m);
+      emitv(&m->functions, Op_ShiftRightLogical, 4, i32, moved, source,
+            byte_shift);
+      uint32_t byte_value = new_id(m);
+      emitv(&m->functions, Op_BitwiseAnd, 4, i32, byte_value, moved,
+            const_u32(m, 0xFFu));
+      uint32_t placed = new_id(m);
+      emitv(&m->functions, Op_ShiftLeftLogical, 4, i32, placed, byte_value,
+            const_u32(m, lane * 8u));
+      uint32_t merged = new_id(m);
+      emitv(&m->functions, Op_BitwiseOr, 4, i32, merged, result, placed);
+      result = merged;
+    }
+    if (in->dest.name) store_name(fn, in->dest.name, result);
+    return;
+  }
+  if ((intrinsic == MTLC_INTRINSIC_GPU_LOAD4_F32 ||
+       intrinsic == MTLC_INTRINSIC_GPU_LOAD4_U32 ||
+       intrinsic == MTLC_INTRINSIC_GPU_STORE4_F32 ||
+       intrinsic == MTLC_INTRINSIC_GPU_STORE4_U32) &&
+      in->argument_count >= 2) {
+    /* The portable profile moves the same four elements as four scalar
+     * accesses: same values, same order, without the 128-bit transaction PTX
+     * gets. Vectorizing this needs a device profile with vector loads. */
+    int is_load = intrinsic == MTLC_INTRINSIC_GPU_LOAD4_F32 ||
+                  intrinsic == MTLC_INTRINSIC_GPU_LOAD4_U32;
+    MtlcTypeKind elem = (intrinsic == MTLC_INTRINSIC_GPU_LOAD4_F32 ||
+                         intrinsic == MTLC_INTRINSIC_GPU_STORE4_F32)
+                            ? MTLC_TYPE_FLOAT32
+                            : MTLC_TYPE_UINT32;
+    SpvDesc vector_desc = operand_desc(fn, &in->arguments[0]);
+    SpvDesc scalar_desc = operand_desc(fn, &in->arguments[1]);
+    uint32_t vector_base = materialize(fn, &in->arguments[0], MTLC_TYPE_UINT64);
+    uint32_t scalar_base = materialize(fn, &in->arguments[1], MTLC_TYPE_UINT64);
+    uint32_t u64 = type_int(m, 64);
+    uint32_t element_type = kind_type(m, elem);
+    for (unsigned lane = 0; lane < 4; lane++) {
+      uint32_t vector_address = vector_base;
+      uint32_t scalar_address = scalar_base;
+      if (lane != 0) {
+        uint32_t offset =
+            const_scalar_int(m, MTLC_TYPE_UINT64, (long long)(lane * 4u));
+        vector_address = new_id(m);
+        scalar_address = new_id(m);
+        emitv(&m->functions, Op_IAdd, 4, u64, vector_address, vector_base,
+              offset);
+        emitv(&m->functions, Op_IAdd, 4, u64, scalar_address, scalar_base,
+              offset);
+      }
+      uint32_t vector_pointer = typed_memory_ptr(fn, vector_address, elem,
+                                                 vector_desc.address_space);
+      uint32_t scalar_pointer = typed_memory_ptr(fn, scalar_address, elem,
+                                                 scalar_desc.address_space);
+      uint32_t value = new_id(m);
+      if (is_load) {
+        emitv(&m->functions, Op_Load, 5, element_type, value, vector_pointer,
+              (unsigned)MemAccess_Aligned, 4u);
+        emitv(&m->functions, Op_Store, 4, scalar_pointer, value,
+              (unsigned)MemAccess_Aligned, 4u);
+      } else {
+        emitv(&m->functions, Op_Load, 5, element_type, value, scalar_pointer,
+              (unsigned)MemAccess_Aligned, 4u);
+        emitv(&m->functions, Op_Store, 4, vector_pointer, value,
+              (unsigned)MemAccess_Aligned, 4u);
+      }
+    }
     return;
   }
   if (is_math_intrinsic(intrinsic) && in->argument_count >= 1) {

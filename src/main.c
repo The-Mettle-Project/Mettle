@@ -2426,6 +2426,19 @@ static int detect_gpu_sm_count(void) {
  * residency. When the SM count is known (--sms=N, or the local driver when
  * the flag is absent), each line also prints the whole-card fill threshold,
  * so a reader can put their grid size next to it. */
+/* `ptxas -v` writes its resource numbers as "<N> bytes <what>". Scan back from
+ * the label to the digits that belong to it. */
+static long long ptxas_bytes_before(const char *line, const char *label) {
+  const char *found = strstr(line, label);
+  if (!found) return -1;
+  const char *cursor = found;
+  while (cursor > line && cursor[-1] == ' ') cursor--;
+  const char *end = cursor;
+  while (cursor > line && cursor[-1] >= '0' && cursor[-1] <= '9') cursor--;
+  if (cursor == end) return -1;
+  return atoll(cursor);
+}
+
 static void report_ptx_occupancy(const IRProgram *program,
                                  const char *ptx_path, const char *arch,
                                  int sm_count, int sm_count_is_local) {
@@ -2453,13 +2466,33 @@ static void report_ptx_occupancy(const IRProgram *program,
   char line[512];
   char entry[256] = {0};
   long long entry_smem = 0;
+  long long spill_stores = 0;
+  long long spill_loads = 0;
+  long long stack_frame = 0;
   int reported = 0;
+  int any_spill = 0;
   while (fgets(line, sizeof(line), pipe)) {
     char name[256];
     if (sscanf(line, " ptxas info : Compiling entry function '%255[^']'",
                name) == 1) {
       snprintf(entry, sizeof(entry), "%s", name);
       entry_smem = 0;
+      spill_stores = 0;
+      spill_loads = 0;
+      stack_frame = 0;
+      continue;
+    }
+    /* The "Function properties" line precedes this entry's "Used" line and
+     * carries the stack frame and spill traffic. Spilling to local memory is
+     * a worse signal than any occupancy percentage: it is a per-access
+     * memory round trip the register allocator could not avoid. */
+    long long stores = ptxas_bytes_before(line, "bytes spill stores");
+    if (stores >= 0) {
+      long long loads = ptxas_bytes_before(line, "bytes spill loads");
+      long long frame = ptxas_bytes_before(line, "bytes stack frame");
+      spill_stores = stores;
+      spill_loads = loads > 0 ? loads : 0;
+      stack_frame = frame > 0 ? frame : 0;
       continue;
     }
     const char *used = strstr(line, "Used ");
@@ -2470,12 +2503,9 @@ static void report_ptx_occupancy(const IRProgram *program,
     if (sscanf(used, "Used %d registers", &registers) != 1) {
       continue;
     }
-    const char *smem = strstr(line, " bytes smem");
-    if (smem) {
-      const char *cursor = smem;
-      while (cursor > line && (cursor[-1] == ' ')) cursor--;
-      while (cursor > line && cursor[-1] >= '0' && cursor[-1] <= '9') cursor--;
-      entry_smem = atoll(cursor);
+    long long smem = ptxas_bytes_before(line, "bytes smem");
+    if (smem >= 0) {
+      entry_smem = smem;
     }
     long long register_warp_limit =
         registers > 0 ? 65536ll / ((long long)registers * 32) : 48;
@@ -2523,7 +2553,6 @@ static void report_ptx_occupancy(const IRProgram *program,
         printf("; full card = %lld blocks (%d SMs x %lld)",
                (long long)sm_count * blocks, sm_count, blocks);
       }
-      printf("\n");
     } else {
       printf("  %s: %d registers -> %lld/48 resident warps (%lld%%)%s",
              entry, registers, warps, warps * 100 / 48, limiter);
@@ -2531,8 +2560,15 @@ static void report_ptx_occupancy(const IRProgram *program,
         printf("; full card = %lld warps (%d SMs x %lld)",
                (long long)sm_count * warps, sm_count, warps);
       }
-      printf("\n");
     }
+    if (spill_stores > 0 || spill_loads > 0) {
+      printf("; SPILLS %lld bytes stored, %lld loaded", spill_stores,
+             spill_loads);
+      any_spill = 1;
+    } else if (stack_frame > 0) {
+      printf("; %lld byte stack frame", stack_frame);
+    }
+    printf("\n");
     reported = 1;
     entry[0] = '\0';
   }
@@ -2542,6 +2578,10 @@ static void report_ptx_occupancy(const IRProgram *program,
   int status = pclose(pipe);
 #endif
   remove(cubin);
+  if (any_spill) {
+    printf("  note: a spilling kernel pays a local-memory round trip per "
+           "spilled access; that costs more than the residency above.\n");
+  }
   if (!reported) {
     fprintf(stderr,
             "--report-occupancy: no ptxas resource report (is ptxas on PATH "
@@ -2894,6 +2934,10 @@ int main(int argc, char *argv[]) {
       options.ptx_tensor_tuple_budget = budget;
     } else if (strcmp(argv[i], "--report-occupancy") == 0) {
       options.report_occupancy = 1;
+    } else if (strcmp(argv[i], "--gpu-checks") == 0) {
+      options.gpu_checks = 1;
+    } else if (strcmp(argv[i], "--report-launches") == 0) {
+      options.report_launches = 1;
     } else if (strncmp(argv[i], "--sms=", 6) == 0) {
       int sms = atoi(argv[i] + 6);
       if (sms < 1 || sms > 1024) {
@@ -3516,6 +3560,7 @@ int compile_file(const char *input_filename, const char *output_filename,
   }
   type_checker =
       type_checker_create_with_error_reporter(symbol_table, error_reporter);
+  type_checker_set_launch_report(options->report_launches);
   if (!parser || !type_checker) {
     compiler_profile_add(&profile, PROFILE_PHASE_INIT, phase_start);
     error_reporter_add_error(error_reporter, ERROR_INTERNAL,
@@ -3824,7 +3869,8 @@ int compile_file(const char *input_filename, const char *output_filename,
     PtxEmitOptions ptx_options = {options->ptx_target,
                                    options->ptx_isa_major,
                                    options->ptx_isa_minor,
-                                   options->ptx_tensor_tuple_budget};
+                                   options->ptx_tensor_tuple_budget,
+                                   options->gpu_checks};
     int ok = ptx_emit_program(ir_program, code_generator, ptx_out,
                               &ptx_options, &ptx_err);
     fclose(ptx_out);
@@ -4262,6 +4308,11 @@ void print_usage(const char *program_name) {
   printf("  --sms=N             SM count for those fill thresholds (default:\n"
          "                      ask the local driver; omitted when neither\n"
          "                      answers)\n");
+  printf("  --gpu-checks        Emit the trap for each kernel-side\n"
+         "                      gpu_assert; without it they cost nothing\n");
+  printf("  --report-launches   List every dispatch site with the grid and\n"
+         "                      block the compiler can fold, and the kernel\n"
+         "                      each names\n");
   printf("  --gpu-tensor-tuple-budget=N\n"
          "                      PTX resident-fragment ceiling (0=architecture\n"
          "                      default); enables measured resident/replay variants\n"

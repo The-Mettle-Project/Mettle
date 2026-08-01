@@ -148,6 +148,7 @@ IRFunction *ir_lower_function(IRLoweringContext *context,
   function->kernel_block[0] = function_data->kernel_block[0];
   function->kernel_block[1] = function_data->kernel_block[1];
   function->kernel_block[2] = function_data->kernel_block[2];
+  function->kernel_threads_per_item = function_data->kernel_threads_per_item;
   /* A function-level `@simd` decorator becomes the default mode for every
    * counted loop in the body that has no `@simd` of its own. */
   context->current_function_simd_default = function_data->simd_mode;

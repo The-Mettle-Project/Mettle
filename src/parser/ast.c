@@ -119,6 +119,7 @@ ASTNode *ast_clone_node(ASTNode *node) {
     dst->kernel_block[0] = src->kernel_block[0];
     dst->kernel_block[1] = src->kernel_block[1];
     dst->kernel_block[2] = src->kernel_block[2];
+    dst->kernel_threads_per_item = src->kernel_threads_per_item;
     dst->link_name = ast_copy_string(src->link_name);
     dst->type_param_count = src->type_param_count;
     dst->type_params = ast_copy_string_array(src->type_params, src->type_param_count);
@@ -398,6 +399,16 @@ ASTNode *ast_clone_node(ASTNode *node) {
     ASTNode *built = ast_create_gpu_launch(
         kernel, grid, block, shared, stream, args, src->argument_count,
         node->location);
+    if (built && built->data) {
+      GpuLaunchStatement *dst = (GpuLaunchStatement *)built->data;
+      dst->typed_kernel = src->typed_kernel;
+      dst->kernel_block[0] = src->kernel_block[0];
+      dst->kernel_block[1] = src->kernel_block[1];
+      dst->kernel_block[2] = src->kernel_block[2];
+      dst->kernel_threads_per_item = src->kernel_threads_per_item;
+      dst->work = ast_clone_node(src->work);
+      ast_add_child(built, dst->work);
+    }
     free(args);
     free(clone);
     return built;
@@ -1416,6 +1427,7 @@ ASTNode *ast_create_function_declaration(const char *name, char **param_names,
   func_decl->kernel_block[0] = 0;
   func_decl->kernel_block[1] = 0;
   func_decl->kernel_block[2] = 0;
+  func_decl->kernel_threads_per_item = 0;
   func_decl->link_name = NULL;
   func_decl->type_params = NULL;
   func_decl->type_param_traits = NULL;

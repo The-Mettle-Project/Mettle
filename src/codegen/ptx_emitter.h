@@ -10,6 +10,9 @@ typedef struct {
   int isa_major;      /* `.version` major component */
   int isa_minor;      /* `.version` minor component */
   int tensor_tuple_budget; /* 0 = architecture default; otherwise 1..4096 */
+  /* --gpu-checks: emit the trap for `gpu_assert`. Off by default, so a
+   * shipped kernel pays nothing for assertions left in the source. */
+  int checks;
 } PtxEmitOptions;
 
 /* Lower an IR program to NVIDIA PTX text (one `.visible .entry` per kernel),

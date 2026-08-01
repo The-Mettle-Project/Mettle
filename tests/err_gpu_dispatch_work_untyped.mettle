@@ -1,0 +1,6 @@
+import "std/gpu";
+fn main() -> int32 {
+  var handle: int64 = 0;
+  dispatch handle[work: 100](handle);
+  return 0;
+}
