@@ -472,6 +472,155 @@ static const char *glyph_arrow(void) {
   return ir_explain_use_unicode() ? "\xE2\x86\x92" : "->";
 }
 
+/* ---- source echo ------------------------------------------------------------
+ * A verdict that says "line 38" makes the reader open the file to find out
+ * which loop it means. Printing the line costs one row and answers that, the
+ * way the error diagnostics have always done it.
+ *
+ * The focus file is read once, on the first echo, and held as an index of line
+ * starts. Only the focus file: with --explain-all the remarks come from several
+ * files and a remark carries no filename of its own, so the report stays quiet
+ * rather than quoting the wrong file. */
+
+/* A loop up to this many lines long is quoted whole. */
+#define IR_EXPLAIN_ECHO_MAX_LINES 5
+
+static MTLC_THREAD_LOCAL char *g_source_text = NULL;
+static MTLC_THREAD_LOCAL char **g_source_lines = NULL;
+static MTLC_THREAD_LOCAL size_t g_source_line_count = 0;
+static MTLC_THREAD_LOCAL int g_source_tried = 0;
+
+static void ir_explain_source_load(void) {
+  if (g_source_tried) {
+    return;
+  }
+  g_source_tried = 1;
+  if (!g_explain_focus_file) {
+    return;
+  }
+  FILE *in = fopen(g_explain_focus_file, "rb");
+  if (!in) {
+    return;
+  }
+  if (fseek(in, 0, SEEK_END) != 0) {
+    fclose(in);
+    return;
+  }
+  long size = ftell(in);
+  if (size <= 0 || size > (1L << 24)) {
+    fclose(in);
+    return;
+  }
+  rewind(in);
+  char *text = malloc((size_t)size + 1);
+  if (!text) {
+    fclose(in);
+    return;
+  }
+  size_t read = fread(text, 1, (size_t)size, in);
+  fclose(in);
+  text[read] = '\0';
+
+  size_t lines = 1;
+  for (size_t i = 0; i < read; i++) {
+    lines += (text[i] == '\n') ? 1 : 0;
+  }
+  char **index = calloc(lines + 1, sizeof(char *));
+  if (!index) {
+    free(text);
+    return;
+  }
+  size_t at = 0;
+  index[at++] = text;
+  for (size_t i = 0; i < read; i++) {
+    if (text[i] == '\n') {
+      text[i] = '\0';
+      if (i > 0 && text[i - 1] == '\r') {
+        text[i - 1] = '\0';
+      }
+      if (at <= lines) {
+        index[at++] = text + i + 1;
+      }
+    }
+  }
+  g_source_text = text;
+  g_source_lines = index;
+  g_source_line_count = at;
+}
+
+static void ir_explain_source_free(void) {
+  free(g_source_lines);
+  g_source_lines = NULL;
+  free(g_source_text);
+  g_source_text = NULL;
+  g_source_line_count = 0;
+  g_source_tried = 0;
+}
+
+/* Columns of leading whitespace on `line`, or (size_t)-1 when it is blank. */
+static size_t ir_explain_source_indent(size_t line) {
+  const char *text = g_source_lines[line - 1];
+  size_t n = 0;
+  while (text[n] == ' ' || text[n] == '\t') {
+    n++;
+  }
+  return text[n] ? n : (size_t)-1;
+}
+
+static void ir_explain_echo_one(size_t line, size_t strip) {
+  const char *text = g_source_lines[line - 1];
+  size_t skip = 0;
+  while (skip < strip && (text[skip] == ' ' || text[skip] == '\t')) {
+    skip++;
+  }
+  text += skip;
+  if (!*text) {
+    return;
+  }
+  char cut[132];
+  if (strlen(text) >= sizeof(cut) - 4) {
+    memcpy(cut, text, sizeof(cut) - 5);
+    memcpy(cut + sizeof(cut) - 5, " ...", 5);
+    text = cut;
+  }
+  ir_explain_emit("   %s%5zu |%s %s\n", clr(EXPLAIN_DIM), line,
+                  clr(EXPLAIN_RESET), text);
+}
+
+/* Echo the source a remark is about. A short loop is quoted whole, so the
+ * reader sees the accumulator or the index expression the advice refers to
+ * without opening the file; anything longer shows its first line, because a
+ * forty-line loop pasted into a report helps nobody. The shared indentation is
+ * stripped and the relative shape kept. */
+static void ir_explain_echo_source_range(size_t line, size_t end_line) {
+  ir_explain_source_load();
+  if (!g_source_lines || line == 0 || line > g_source_line_count) {
+    return;
+  }
+  size_t last = line;
+  if (end_line > line && end_line <= g_source_line_count &&
+      end_line - line <= IR_EXPLAIN_ECHO_MAX_LINES - 1) {
+    last = end_line;
+  }
+  size_t strip = (size_t)-1;
+  for (size_t l = line; l <= last; l++) {
+    size_t indent = ir_explain_source_indent(l);
+    if (indent < strip) {
+      strip = indent;
+    }
+  }
+  if (strip == (size_t)-1) {
+    strip = 0;
+  }
+  for (size_t l = line; l <= last; l++) {
+    ir_explain_echo_one(l, strip);
+  }
+}
+
+static void ir_explain_echo_source(size_t line) {
+  ir_explain_echo_source_range(line, 0);
+}
+
 /* ---- remark store -------------------------------------------------------- */
 
 static char *ir_explain_strdup(const char *s) {
@@ -1729,6 +1878,7 @@ static void ir_explain_memory_flush(void) {
                     clr(n->severity ? EXPLAIN_RED : EXPLAIN_BOLD),
                     n->severity ? "error" : "warning", clr(EXPLAIN_RESET),
                     n->line, n->headline);
+    ir_explain_echo_source(n->line);
     if (n->fix) {
       ir_explain_emit("      %s%s fix: %s%s\n", clr(EXPLAIN_DIM), glyph_elbow(),
                       n->fix, clr(EXPLAIN_RESET));
@@ -2211,6 +2361,12 @@ void ir_explain_flush(void) {
                       clr(r->positive ? EXPLAIN_GREEN : EXPLAIN_RED),
                       r->headline, clr(EXPLAIN_RESET),
                       ir_explain_code_tag(r));
+      /* The line itself, but only where there is something to act on: quoting
+       * the source under every successful inline would treble the report and
+       * say nothing. */
+      if (r->reason) {
+        ir_explain_echo_source_range(r->line, r->end_line);
+      }
       if (r->reason) {
         ir_explain_emit("      %s%s reason: %s%s\n", clr(EXPLAIN_DIM),
                         glyph_elbow(), r->reason, clr(EXPLAIN_RESET));
@@ -2441,6 +2597,7 @@ void ir_explain_finalize(int force_stderr) {
   g_mem_capacity = 0;
   free(g_mem_focus);
   g_mem_focus = NULL;
+  ir_explain_source_free();
 
   if (!diverted) {
     fwrite(g_report_buf, 1, g_report_len, stderr);
