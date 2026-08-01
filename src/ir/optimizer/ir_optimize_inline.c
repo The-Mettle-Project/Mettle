@@ -238,9 +238,9 @@ static int ir_function_is_inline_candidate(const IRFunction *function,
         instruction->op == IR_OP_CALL_INDIRECT) {
       call_count++;
       if (!forced && call_count > nested_call_budget) {
-        *why_not =
-            "the callee makes more calls of its own than the profile-adjusted "
-            "inline call-count budget allows";
+        IR_INLINE_WHY(why_not, "callee-call-count",
+                      "the callee makes more calls of its own than the "
+                      "profile-adjusted inline call-count budget allows");
         *fix = "mark the callee @inline to override the call-count cap";
         return 0;
       }
@@ -1234,7 +1234,7 @@ void ir_inline_explain_report_remaining(IRProgram *program) {
           fix = NULL;
         } else {
           snprintf(corrected_fix, sizeof(corrected_fix),
-                   "none \xE2\x80\x94 re-checked with @inline "
+                   "none -- re-checked with @inline "
                    "pretend-applied and it still won't inline: %s",
                    forced_reason ? forced_reason : "a structural guard");
           fix = corrected_fix;

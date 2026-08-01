@@ -1548,7 +1548,7 @@ static void ir_explain_report_loops(const IRFunction *function,
        * remark when it was the cause; only guess when nothing claimed it. */
       if (!ir_explain_has_remark_at(L->location.line, "loop")) {
         ir_explain_remark(function->name, "loop", L->location, 1,
-                          "eliminated \xE2\x80\x94 no loop remains after "
+                          "eliminated: no loop remains after "
                           "optimization (fully unrolled or folded away)",
                           NULL, NULL, NULL);
         ir_explain_remark_code("eliminated");

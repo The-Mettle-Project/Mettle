@@ -210,7 +210,7 @@ int ir_enforce_noalloc_contracts(IRProgram *program) {
     } else if (ir_explain_enabled() && function->instruction_count > 0) {
       ir_explain_remark(function->name, "function",
                         function->instructions[0].location, 1,
-                        "verified @noalloc \xE2\x80\x94 allocation-free on "
+                        "verified @noalloc: allocation-free on "
                         "every reachable path",
                         NULL, NULL, NULL);
       ir_explain_remark_code("noalloc-verified");
