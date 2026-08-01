@@ -501,14 +501,18 @@ static int print_help_topic(const char *program_name, const char *argv0,
     printf("  errors, so one compile reports every problem in the file.\n\n");
     printf("  mettle explain <CODE>       extended docs for a code (try: "
            "mettle explain E0004)\n");
-    printf("  mettle explain list         index of every diagnostic code\n");
+    printf("  mettle explain list         index of every code\n");
     printf("  --error-format=json         one JSON object per diagnostic on "
            "stderr, for editors/CI\n");
     printf("  NO_COLOR / CLICOLOR_FORCE   disable / force ANSI colors\n\n");
     printf("  Warnings include unused variables (prefix a name with '_' to "
            "opt out), unreachable code,\n");
     printf("  and compile-time memory-safety findings (use-after-free, leaks, "
-           "double free, ...).\n");
+           "double free, ...).\n\n");
+    printf("  `explain` also covers the optimizer's decision codes, the ids "
+           "--explain prints in\n");
+    printf("  brackets after each verdict: mettle explain "
+           "dot-shape-address\n");
     print_doc_reference(argv0, "diagnostics.md");
     return 0;
   }
@@ -4268,7 +4272,8 @@ void print_usage(const char *program_name) {
   printf("Usage: %s [options] <input.mettle>\n", program_name);
   printf("       %s help [topic]\n", program_name);
   printf("       %s docs [topic]\n", program_name);
-  printf("       %s explain <CODE>   Explain a diagnostic code (e.g. E0004, M0103; 'list' for all)\n",
+  printf("       %s explain <CODE>   Explain a code: a diagnostic (E0004, M0103) or an --explain\n"
+         "                            decision (dot-shape-address); 'list' for the index\n",
          program_name);
   printf("       %s test <file> [--filter=S]   Run @test functions in the compile-time\n"
          "                           interpreter (instant; no codegen or linking)\n",
