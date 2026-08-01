@@ -276,7 +276,8 @@ Two more things the report does on its own. A re-run leads with what changed
 since the last `--explain` build, regressions first, using a baseline written
 beside the output. And a report past 200 lines goes to
 `<output-stem>.explain.txt` with a digest on stderr, so a large program does
-not flood the terminal.
+not flood the terminal. The digest carries the first "where to start" entry,
+so the short form still says what to do rather than only how the build went.
 
 `--explain=SELECTOR` narrows the prose to one slice: `missed` drops the
 successes, `fixable` keeps only what has a fix, `proven` keeps what the

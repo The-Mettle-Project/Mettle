@@ -174,6 +174,10 @@ static struct {
   size_t changes_improved;
   size_t changes_regressed;
   int had_baseline;
+  /* The first "where to start" entry. A diverted report shows counts, and
+     counts do not tell anyone what to do; this line does. */
+  char start_here[240];
+  int start_here_proven;
 } g_digest;
 
 /* A named number a pass measured about one remark: an unroll factor, a trip
@@ -1805,6 +1809,11 @@ static void ir_explain_render_start_here(void) {
                   "and re-checked):\n",
                   clr(EXPLAIN_BOLD), clr(EXPLAIN_RESET), actionable, missed,
                   missed == 1 ? "" : "s", actionable == 1 ? "s" : "ve");
+  const IRExplainRemark *lead = &g_remarks[order[0]];
+  snprintf(g_digest.start_here, sizeof(g_digest.start_here), "%s:%zu  %s",
+           lead->function_name, lead->line, lead->fix);
+  g_digest.start_here_proven = lead->verified ? 1 : 0;
+
   for (size_t i = 0; i < shown; i++) {
     const IRExplainRemark *r = &g_remarks[order[i]];
     char fix[200];
@@ -2713,6 +2722,15 @@ void ir_explain_finalize(int force_stderr) {
       fprintf(stderr,
               "  backend: %zu/%zu functions register-allocated\n",
               g_digest.backend_ok, g_digest.backend_total);
+    }
+    /* Counts say how the build went; this says what to do about it. */
+    if (g_digest.start_here[0]) {
+      char lead[200];
+      ir_explain_fit(g_digest.start_here, 96, lead, sizeof(lead));
+      fprintf(stderr, "  start with: %s%s%s%s\n",
+              g_digest.start_here_proven ? clr(EXPLAIN_GREEN) : "",
+              g_digest.start_here_proven ? "[proven] " : "", lead,
+              clr(EXPLAIN_RESET));
     }
     fprintf(stderr, "  full report (%zu lines): %s%s%s\n\n",
             ir_explain_report_lines(), clr(EXPLAIN_BOLD), sidecar,

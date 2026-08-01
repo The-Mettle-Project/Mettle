@@ -272,6 +272,8 @@ $cases = @(
       'loops: \d+ vectorized, \d+ scalar; \d+ fix suggestions verified',
       'calls: \d+ inlined, \d+ kept as real calls',
       'backend: \d+/\d+ functions register-allocated',
+      # the digest names what to do, not just how the build went
+      'start with: \[proven\] matvec:38  hoist invariant index math',
       'full report \(\d+ lines\): .*explain_sidecar\.explain\.txt'
     )
     OutputMustNotMatch = @(
