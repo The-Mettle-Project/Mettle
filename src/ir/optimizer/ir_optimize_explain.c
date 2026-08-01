@@ -1067,6 +1067,23 @@ int ir_explain_has_remark_at(size_t line, const char *entity) {
   return 0;
 }
 
+/* The bracketed decision id that follows a verdict, ready to paste into
+ * `mettle explain`. Empty when the pass recorded no id (positive housekeeping
+ * remarks mostly), so the line reads exactly as it did before. Two rotating
+ * buffers let one emit call carry two tags. */
+static const char *ir_explain_code_tag(const IRExplainRemark *r) {
+  static MTLC_THREAD_LOCAL char buf[2][96];
+  static MTLC_THREAD_LOCAL int slot = 0;
+  if (!r->code || !r->code[0] || strcmp(r->code, "none") == 0) {
+    return "";
+  }
+  char *out = buf[slot];
+  slot = (slot + 1) & 1;
+  snprintf(out, sizeof(buf[0]), "  %s[%s]%s", clr(EXPLAIN_DIM), r->code,
+           clr(EXPLAIN_RESET));
+  return out;
+}
+
 static int ir_explain_remark_compare(const void *a, const void *b) {
   const IRExplainRemark *ra = a, *rb = b;
   if (ra->line != rb->line) {
@@ -1485,6 +1502,128 @@ static void ir_explain_print_header(const char *what) {
   ir_explain_emit("\n%s%s %s: %s %s%s%s%s%s%s\n", clr(EXPLAIN_BOLD), rule,
                   what, file, rule, rule, rule, rule, rule,
                   clr(EXPLAIN_RESET));
+}
+
+/* ---- "where to start" -------------------------------------------------------
+ * The remark list is in source order, which is the right order to read a file
+ * in and the wrong order to decide what to do. A report of forty findings
+ * answers "what happened"; this block answers "what do I change", which is the
+ * question the reader actually arrived with.
+ *
+ * Ranked by what the compiler can stand behind: a fix it applied to a clone
+ * and re-checked outranks one it merely believes, and a fix inside a nested
+ * loop outranks the same fix at top level. */
+
+#define IR_EXPLAIN_START_MAX 5
+
+/* Copy `text` into `out`, cut at `width` on a word boundary with an ellipsis.
+ * The full sentence is a few lines below in the report, so this is a signpost
+ * rather than a summary. */
+static void ir_explain_fit(const char *text, size_t width, char *out,
+                           size_t cap) {
+  if (!text) {
+    out[0] = '\0';
+    return;
+  }
+  size_t len = strlen(text);
+  if (len <= width || width + 4 >= cap) {
+    snprintf(out, cap, "%s", text);
+    return;
+  }
+  size_t cut = width;
+  while (cut > width / 2 && text[cut] != ' ') {
+    cut--;
+  }
+  if (text[cut] != ' ') {
+    cut = width;
+  }
+  memcpy(out, text, cut);
+  snprintf(out + cut, cap - cut, " ...");
+}
+
+static void ir_explain_render_start_here(void) {
+  size_t order[IR_EXPLAIN_START_MAX];
+  size_t shown = 0, actionable = 0, missed = 0;
+
+  for (size_t i = 0; i < g_remark_count; i++) {
+    const IRExplainRemark *r = &g_remarks[i];
+    if (r->positive) {
+      continue;
+    }
+    missed++;
+    if (!r->fix) {
+      continue;
+    }
+    actionable++;
+    /* Insertion sort into the top-N: proven first, then deepest, then
+     * earliest, so the same file always produces the same order. */
+    size_t at = shown;
+    while (at > 0) {
+      const IRExplainRemark *p = &g_remarks[order[at - 1]];
+      int r_proven = r->verified ? 1 : 0, p_proven = p->verified ? 1 : 0;
+      if (r_proven != p_proven) {
+        if (r_proven < p_proven) {
+          break;
+        }
+      } else if (r->depth != p->depth) {
+        if (r->depth < p->depth) {
+          break;
+        }
+      } else {
+        break;
+      }
+      at--;
+    }
+    if (at >= IR_EXPLAIN_START_MAX) {
+      continue;
+    }
+    for (size_t j = shown < IR_EXPLAIN_START_MAX ? shown : IR_EXPLAIN_START_MAX - 1;
+         j > at; j--) {
+      order[j] = order[j - 1];
+    }
+    order[at] = i;
+    if (shown < IR_EXPLAIN_START_MAX) {
+      shown++;
+    }
+  }
+
+  if (shown == 0) {
+    return;
+  }
+
+  /* One pass to size the location column, so the fixes line up and the block
+   * scans as a list rather than as ragged prose. */
+  size_t location_width = 0;
+  char location[IR_EXPLAIN_START_MAX][160];
+  for (size_t i = 0; i < shown; i++) {
+    const IRExplainRemark *r = &g_remarks[order[i]];
+    snprintf(location[i], sizeof(location[0]), "%s:%zu", r->function_name,
+             r->line);
+    size_t len = strlen(location[i]);
+    if (len > location_width) {
+      location_width = len;
+    }
+  }
+
+  ir_explain_emit("  %swhere to start%s (%zu of %zu missed optimization%s "
+                  "ha%s a fix; \"proven\" = the compiler applied it to a clone "
+                  "and re-checked):\n",
+                  clr(EXPLAIN_BOLD), clr(EXPLAIN_RESET), actionable, missed,
+                  missed == 1 ? "" : "s", actionable == 1 ? "s" : "ve");
+  for (size_t i = 0; i < shown; i++) {
+    const IRExplainRemark *r = &g_remarks[order[i]];
+    char fix[200];
+    ir_explain_fit(r->fix, 84, fix, sizeof(fix));
+    ir_explain_emit("    %zu. %s%-6s%s %-*s  %s\n", i + 1,
+                    clr(r->verified ? EXPLAIN_GREEN : EXPLAIN_DIM),
+                    r->verified ? "proven" : "", clr(EXPLAIN_RESET),
+                    (int)location_width, location[i], fix);
+  }
+  if (actionable > shown) {
+    ir_explain_emit("       %s... and %zu more below%s\n", clr(EXPLAIN_DIM),
+                    actionable - shown, clr(EXPLAIN_RESET));
+  }
+  ir_explain_emit("\n");
 }
 
 /* One remark as a JSON object in the "remarks" array. `kind` is explicit so
@@ -2003,6 +2142,7 @@ void ir_explain_flush(void) {
           ir_explain_remark_compare);
   }
   ir_explain_render_changes();
+  ir_explain_render_start_here();
 
   size_t json_remark_count = 0;
   ir_explain_json_raw("\"remarks\":[");
@@ -2032,11 +2172,12 @@ void ir_explain_flush(void) {
           char callees[512];
           ir_explain_group_callee_list(g_remarks, i, callees,
                                        sizeof(callees));
-          ir_explain_emit("  %s%s%s (%zu calls, lines %zu-%zu): %s%s%s\n",
+          ir_explain_emit("  %s%s%s (%zu calls, lines %zu-%zu): %s%s%s%s\n",
                           clr(EXPLAIN_BOLD), r->function_name,
                           clr(EXPLAIN_RESET), group_count, r->line, last_line,
                           clr(r->positive ? EXPLAIN_GREEN : EXPLAIN_RED),
-                          r->headline, clr(EXPLAIN_RESET));
+                          r->headline, clr(EXPLAIN_RESET),
+                          ir_explain_code_tag(r));
           ir_explain_emit("      %s%s reason: %s%s\n", clr(EXPLAIN_DIM),
                           glyph_elbow(), r->reason, clr(EXPLAIN_RESET));
           if (r->fix) {
@@ -2065,10 +2206,11 @@ void ir_explain_flush(void) {
         }
       }
 
-      ir_explain_emit("  %s%s%s (%s @ line %zu): %s%s%s\n", clr(EXPLAIN_BOLD),
+      ir_explain_emit("  %s%s%s (%s @ line %zu): %s%s%s%s\n", clr(EXPLAIN_BOLD),
                       r->function_name, clr(EXPLAIN_RESET), r->entity, r->line,
                       clr(r->positive ? EXPLAIN_GREEN : EXPLAIN_RED),
-                      r->headline, clr(EXPLAIN_RESET));
+                      r->headline, clr(EXPLAIN_RESET),
+                      ir_explain_code_tag(r));
       if (r->reason) {
         ir_explain_emit("      %s%s reason: %s%s\n", clr(EXPLAIN_DIM),
                         glyph_elbow(), r->reason, clr(EXPLAIN_RESET));
@@ -2110,6 +2252,27 @@ void ir_explain_flush(void) {
       }
     }
     free(suppressed);
+
+    /* Close the loop between the one-line verdict and the paragraph behind it.
+     * The example names a code the reader can actually see above, preferring a
+     * refusal, since that is the line they want explained. */
+    const char *sample = NULL;
+    for (size_t i = 0; i < g_remark_count && !sample; i++) {
+      if (!g_remarks[i].positive && g_remarks[i].code &&
+          g_remarks[i].code[0]) {
+        sample = g_remarks[i].code;
+      }
+    }
+    for (size_t i = 0; i < g_remark_count && !sample; i++) {
+      if (g_remarks[i].code && g_remarks[i].code[0]) {
+        sample = g_remarks[i].code;
+      }
+    }
+    if (sample) {
+      ir_explain_emit("  %sthe bracketed id after a verdict has a longer "
+                      "explanation: mettle explain %s%s\n",
+                      clr(EXPLAIN_DIM), sample, clr(EXPLAIN_RESET));
+    }
     ir_explain_emit("\n");
   }
   ir_explain_json_raw("],");
