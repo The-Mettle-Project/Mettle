@@ -1,0 +1,11 @@
+// Every type mismatch that has a concrete answer gets one in the help line:
+// a cast, an address-of, a dereference, or the right literal syntax.
+fn main() -> int32 {
+    var truncated: int32 = 2.5;
+    var quoted: string = 42;
+    var unquoted: int32 = "hi";
+    var here: int32 = 1;
+    var address: int32* = here;
+    var value: int32 = &here;
+    return truncated + unquoted + value + address[0] + (int32)quoted[0];
+}

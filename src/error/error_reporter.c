@@ -1058,28 +1058,136 @@ char *error_reporter_closest_candidate(const char *name,
 }
 
 /* Returns a heap-allocated suggestion string the caller must free, or NULL. */
+/* ---- type-mismatch suggestions ---------------------------------------------
+ * A message that names two types tells the reader what is wrong. The help
+ * line has to tell them what to type instead. Mettle converts nothing
+ * implicitly, so nearly every mismatch has a concrete answer: a cast, an `&`,
+ * a `*`, a comparison. */
+
+static int type_name_is_pointer(const char *name) {
+  size_t n = name ? strlen(name) : 0;
+  return n > 0 && name[n - 1] == '*';
+}
+
+/* Name with one level of pointer removed: "int32*" -> "int32". */
+static void type_name_pointee(const char *name, char *out, size_t cap) {
+  size_t n = strlen(name);
+  if (n > 0 && name[n - 1] == '*') {
+    n--;
+  }
+  while (n > 0 && name[n - 1] == ' ') {
+    n--;
+  }
+  if (n >= cap) {
+    n = cap - 1;
+  }
+  memcpy(out, name, n);
+  out[n] = '\0';
+}
+
+static int type_name_is_integer(const char *name) {
+  return strncmp(name, "int", 3) == 0 || strncmp(name, "uint", 4) == 0 ||
+         strcmp(name, "char") == 0;
+}
+
+static int type_name_is_float(const char *name) {
+  return strcmp(name, "float32") == 0 || strcmp(name, "float64") == 0;
+}
+
+static int type_name_is_numeric(const char *name) {
+  return !type_name_is_pointer(name) &&
+         (type_name_is_integer(name) || type_name_is_float(name));
+}
+
 char *error_reporter_suggest_for_type_mismatch(const char *expected,
                                                const char *actual) {
-  if (!expected || !actual)
+  if (!expected || !actual || strcmp(expected, actual) == 0)
     return NULL;
 
   char buf[256];
 
-  /* Suggest explicit casting between int32/int64 */
-  if ((strcmp(expected, "int32") == 0 && strcmp(actual, "int64") == 0) ||
-      (strcmp(expected, "int64") == 0 && strcmp(actual, "int32") == 0)) {
-    snprintf(buf, sizeof(buf), "consider explicit casting: (%s)value", expected);
+  /* A string literal where a number belongs, and the reverse. These are
+     typos rather than conversions, so they get their own wording. */
+  if (type_name_is_numeric(expected) && strcmp(actual, "string") == 0) {
+    return mettle_strdup("drop the quotes: a numeric literal is 42, not \"42\"");
+  }
+  if (strcmp(expected, "string") == 0 && type_name_is_numeric(actual)) {
+    return mettle_strdup("quote it: a string literal is \"42\", not 42");
+  }
+
+  /* string and cstring differ in representation, not in what they hold. */
+  if ((strcmp(expected, "cstring") == 0 && strcmp(actual, "string") == 0) ||
+      (strcmp(expected, "string") == 0 && strcmp(actual, "cstring") == 0)) {
+    snprintf(buf, sizeof(buf), "cast between the two representations: (%s)value",
+             expected);
     return mettle_strdup(buf);
   }
 
-  /* Suggest string literal for string type */
-  if (strcmp(expected, "string") == 0 && strcmp(actual, "int32") == 0) {
-    return mettle_strdup("use string literal with double quotes: \"value\"");
+  /* Numeric to numeric: always a cast, since Mettle converts nothing on its
+     own. Say which direction loses information, because that is the part a
+     reader wants to think about before adding the cast. */
+  if (type_name_is_numeric(expected) && type_name_is_numeric(actual)) {
+    if (type_name_is_float(actual) && type_name_is_integer(expected)) {
+      snprintf(buf, sizeof(buf),
+               "cast explicitly: (%s)value. The fraction is discarded, not "
+               "rounded",
+               expected);
+    } else if (type_name_is_integer(actual) && type_name_is_float(expected)) {
+      snprintf(buf, sizeof(buf), "cast explicitly: (%s)value", expected);
+    } else {
+      snprintf(buf, sizeof(buf),
+               "cast explicitly: (%s)value. Check the value fits, since a "
+               "narrowing cast wraps rather than trapping",
+               expected);
+    }
+    return mettle_strdup(buf);
   }
 
-  /* Suggest numeric literal for numeric types */
-  if (strstr(expected, "int") && strcmp(actual, "string") == 0) {
-    return mettle_strdup("use numeric literal without quotes: 42");
+  /* bool against a number: Mettle has no truthiness, so say what to compare. */
+  if (strcmp(expected, "bool") == 0 && type_name_is_numeric(actual)) {
+    return mettle_strdup("compare explicitly: `value != 0`");
+  }
+  if (type_name_is_numeric(expected) && strcmp(actual, "bool") == 0) {
+    snprintf(buf, sizeof(buf), "cast the boolean: (%s)value, which is 0 or 1",
+             expected);
+    return mettle_strdup(buf);
+  }
+
+  /* Pointer against value: one `&` or one `*` apart is the common slip, so
+     check for it before falling back to the generic advice. */
+  if (type_name_is_pointer(expected) && !type_name_is_pointer(actual)) {
+    char pointee[128];
+    type_name_pointee(expected, pointee, sizeof(pointee));
+    if (strcmp(pointee, actual) == 0) {
+      return mettle_strdup("take the address: `&value`");
+    }
+    snprintf(buf, sizeof(buf),
+             "a '%s' is a pointer; pass an address (`&value`) or a value "
+             "already of that type",
+             expected);
+    return mettle_strdup(buf);
+  }
+  if (!type_name_is_pointer(expected) && type_name_is_pointer(actual)) {
+    char pointee[128];
+    type_name_pointee(actual, pointee, sizeof(pointee));
+    if (strcmp(pointee, expected) == 0) {
+      return mettle_strdup("read through the pointer: `*value` or `value[0]`");
+    }
+    snprintf(buf, sizeof(buf),
+             "'%s' is a pointer and '%s' is not; dereference it, or change the "
+             "declared type to '%s'",
+             actual, expected, actual);
+    return mettle_strdup(buf);
+  }
+
+  /* Two pointers to different things: a cast is possible but rarely what the
+     writer meant, so lead with the likelier cause. */
+  if (type_name_is_pointer(expected) && type_name_is_pointer(actual)) {
+    snprintf(buf, sizeof(buf),
+             "these point at different types; check the declaration, or cast "
+             "deliberately with (%s)value",
+             expected);
+    return mettle_strdup(buf);
   }
 
   return NULL;

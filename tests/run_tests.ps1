@@ -1388,6 +1388,21 @@ $cases = @(
   @{ Name = "err_deref_non_pointer"; Path = "tests/err_deref_non_pointer.mettle"; ShouldSucceed = $false; Pattern = "Dereference operator requires a pointer operand" },
   @{ Name = "err_address_of_non_lvalue"; Path = "tests/err_address_of_non_lvalue.mettle"; ShouldSucceed = $false; Pattern = "Address-of operator requires an assignable expression" },
   @{ Name = "err_pointer_type_mismatch"; Path = "tests/err_pointer_type_mismatch.mettle"; ShouldSucceed = $false; Pattern = "Type mismatch" },
+  @{
+    # A type mismatch names two types; the help line has to say what to type
+    # instead. Mettle converts nothing implicitly, so each of these has a
+    # concrete answer rather than a restatement of the error.
+    Name          = "err_type_mismatch_help"
+    Path          = "tests/err_type_mismatch_help.mettle"
+    ShouldSucceed = $false
+    OutputMustMatch = @(
+      'help: cast explicitly: \(int32\)value\. The fraction is discarded, not rounded',
+      'help: quote it: a string literal is "42", not 42',
+      'help: drop the quotes: a numeric literal is 42, not "42"',
+      'help: take the address: `&value`',
+      'help: read through the pointer: `\*value` or `value\[0\]`'
+    )
+  },
   @{ Name = "err_use_before_init"; Path = "tests/err_use_before_init.mettle"; ShouldSucceed = $false; Pattern = "before initialization" },
   @{ Name = "err_array_index_oob_const"; Path = "tests/err_array_index_oob_const.mettle"; ShouldSucceed = $false; Pattern = "out of bounds" },
   @{ Name = "err_array_index_oob_const_negative"; Path = "tests/err_array_index_oob_const_negative.mettle"; ShouldSucceed = $false; Pattern = "out of bounds" },

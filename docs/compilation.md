@@ -285,6 +285,21 @@ compiler confirmed, `loops` and `calls` split by kind, and anything else is
 read as a function name and then as a decision code. The JSON sidecar ignores
 the selector and stays whole-file.
 
+### Type-mismatch suggestions
+
+Mettle converts nothing implicitly, so a mismatch almost always has one
+concrete answer. The `help:` line gives it rather than restating the error:
+
+| Situation | Suggestion |
+|---|---|
+| number where a string belongs | quote it: a string literal is `"42"` |
+| string where a number belongs | drop the quotes |
+| numeric to numeric | cast explicitly, and what the cast costs (a discarded fraction, a wrapping narrow) |
+| value where a pointer belongs | take the address: `&value` |
+| pointer where a value belongs | read through it: `*value` or `value[0]` |
+| number where a `bool` belongs | compare explicitly: `value != 0` |
+| `string` against `cstring` | cast between the two representations |
+
 ## Runtime Crash Tracebacks
 
 Compile with `-s` or `-d` to embed runtime crash traceback support in the generated program. This adds failure-path-only metadata for Mettle function names and source locations and installs a crash handler at program startup. The crash handler is **cross-platform**: Windows uses a Structured Exception Handler, and POSIX (Linux/macOS) uses a `sigaction` handler running on an alternate signal stack. Both produce the same symbolized stack-trace format from the same embedded debug-info tables.
