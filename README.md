@@ -3,8 +3,8 @@
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/The-Mettle-Project/Mettle/development/docs/assets/mettle-dark.svg" />
-  <img src="https://raw.githubusercontent.com/The-Mettle-Project/Mettle/development/docs/assets/mettle-light.svg" alt="Mettle" width="120" height="120" />
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/docs/assets/mettle-dark.svg" />
+  <img src="https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/docs/assets/mettle-light.svg" alt="Mettle" width="120" height="120" />
 </picture>
 
 # Mettle
