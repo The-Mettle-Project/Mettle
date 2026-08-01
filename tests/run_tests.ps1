@@ -722,6 +722,42 @@ $cases = @(
     )
   },
   @{
+    # A reason can run past 300 columns, and a terminal folds that at column 0,
+    # which dissolves the `\_ reason:` tree the report is shaped around. Only a
+    # terminal gets the wrapped form; a pipe keeps one line per fact so a
+    # pattern matching a whole reason keeps matching one. METTLE_EXPLAIN_COLUMNS
+    # forces the width, since a test harness never has a terminal.
+    Name          = "explain_wraps_for_a_terminal"
+    Path          = "tests/explain_demo.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--explain=matvec")
+    Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0"; METTLE_EXPLAIN_COLUMNS = "80" }
+    OutputMustMatch = @(
+      # the fold happens on a space, and the continuation indents inside the
+      # elbow so it still reads as subordinate to its verdict
+      'the body contains a nested loop \(line 38\), and only innermost\r?\n {9}loops are vectorized',
+      # the source echo keeps its gutter
+      '38 \| for c in 0\.\.cols \{'
+    )
+    OutputMustNotMatch = @(
+      # and the unwrapped form of that same reason is gone, so the fold is
+      # real rather than an extra copy
+      'nested loop \(line 38\), and only innermost loops are vectorized'
+    )
+  },
+  @{
+    # The same file without a forced width stays one line per fact, so grep
+    # over a redirected report still returns whole reasons.
+    Name          = "explain_unwrapped_when_redirected"
+    Path          = "tests/explain_demo.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--explain=matvec")
+    Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
+    OutputMustMatch = @(
+      'the body contains a nested loop \(line 38\), and only innermost loops are vectorized'
+    )
+  },
+  @{
     # A selector nobody can satisfy says what the selectors are instead of
     # printing an empty section.
     Name          = "explain_selector_unknown"

@@ -13,6 +13,7 @@
 #define explain_isatty _isatty
 #define explain_fileno _fileno
 #else
+#include <sys/ioctl.h>
 #include <unistd.h>
 #define explain_isatty isatty
 #define explain_fileno fileno
@@ -2767,6 +2768,122 @@ static char *ir_explain_sidecar_path(void) {
   return ir_explain_derived_path(".explain.txt");
 }
 
+/* ---- wrapping ---------------------------------------------------------------
+ * The report is built one line per fact, and a reason can run past 300
+ * columns. A terminal folds that at column 0, so the `\_ reason:` tree the
+ * report is shaped around dissolves into a wall.
+ *
+ * Wrapping happens here, at the moment of writing to a terminal, and nowhere
+ * else. A redirected run, a pipe into grep and the `.explain.txt` sidecar all
+ * keep the one-line-per-fact form, so a pattern that matches a whole reason
+ * keeps matching one. Only the interactive reader gets the typeset version,
+ * which is the only reader whose width we know. */
+
+static int ir_explain_terminal_columns(void) {
+#ifdef _WIN32
+  CONSOLE_SCREEN_BUFFER_INFO info;
+  HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+  if (h != INVALID_HANDLE_VALUE && GetConsoleScreenBufferInfo(h, &info)) {
+    int width = info.srWindow.Right - info.srWindow.Left + 1;
+    if (width > 0) {
+      return width;
+    }
+  }
+#else
+  struct winsize ws;
+  if (ioctl(explain_fileno(stderr), TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
+    return (int)ws.ws_col;
+  }
+#endif
+  return 0;
+}
+
+/* Visible columns in `line` (ANSI escape sequences occupy none), counting a
+ * UTF-8 sequence as the one column its glyph takes. */
+static size_t ir_explain_visible_width(const char *line, size_t len) {
+  size_t width = 0;
+  for (size_t i = 0; i < len; i++) {
+    if (line[i] == '\x1b') {
+      while (i < len && line[i] != 'm') {
+        i++;
+      }
+      continue;
+    }
+    if (((unsigned char)line[i] & 0xC0) != 0x80) {
+      width++;
+    }
+  }
+  return width;
+}
+
+/* Fold one already-rendered line to `columns`, breaking on spaces and
+ * indenting continuations three columns inside the line's own indent, so a
+ * wrapped detail still reads as subordinate to its verdict. Colors survive
+ * the break: the sequence that opened the line has not been reset yet. */
+static void ir_explain_write_wrapped_line(FILE *out, const char *line,
+                                          size_t len, size_t columns) {
+  size_t indent = 0;
+  while (indent < len && line[indent] == ' ') {
+    indent++;
+  }
+  size_t hang = indent + 3;
+  if (hang + 24 > columns) {
+    hang = indent; /* a narrow terminal needs the width more than the shape */
+  }
+
+  size_t start = 0;
+  size_t budget = columns;
+  while (start < len) {
+    if (ir_explain_visible_width(line + start, len - start) <= budget) {
+      fwrite(line + start, 1, len - start, out);
+      break;
+    }
+    /* Walk forward to the last space that still fits. */
+    size_t width = 0, i = start, last_space = 0;
+    while (i < len && width <= budget) {
+      if (line[i] == '\x1b') {
+        while (i < len && line[i] != 'm') {
+          i++;
+        }
+        i++;
+        continue;
+      }
+      if (line[i] == ' ' && i > start) {
+        last_space = i;
+      }
+      if (((unsigned char)line[i] & 0xC0) != 0x80) {
+        width++;
+      }
+      i++;
+    }
+    if (last_space <= start) {
+      /* One unbreakable run (a path, a long identifier): let it overflow
+         rather than cutting it in half. */
+      fwrite(line + start, 1, len - start, out);
+      break;
+    }
+    fwrite(line + start, 1, last_space - start, out);
+    fputc('\n', out);
+    for (size_t s = 0; s < hang; s++) {
+      fputc(' ', out);
+    }
+    start = last_space + 1;
+    budget = columns > hang ? columns - hang : columns;
+  }
+  fputc('\n', out);
+}
+
+static void ir_explain_write_wrapped(FILE *out, size_t columns) {
+  size_t start = 0;
+  for (size_t i = 0; i <= g_report_len; i++) {
+    if (i == g_report_len || g_report_buf[i] == '\n') {
+      ir_explain_write_wrapped_line(out, g_report_buf + start, i - start,
+                                    columns);
+      start = i + 1;
+    }
+  }
+}
+
 /* Write the buffer with ANSI color sequences stripped (the report renders
  * with stderr in mind; a file must stay plain). */
 static int ir_explain_write_plain(FILE *out) {
@@ -2856,7 +2973,24 @@ void ir_explain_finalize(int force_stderr) {
   ir_explain_source_free();
 
   if (!diverted) {
-    fwrite(g_report_buf, 1, g_report_len, stderr);
+    /* Only a terminal gets the wrapped form, and only when it is narrower
+     * than the report. Everything else stays one line per fact.
+     *
+     * METTLE_EXPLAIN_COLUMNS forces a width, which is how the wrapping is
+     * tested (a test harness never has a terminal) and how someone whose
+     * terminal misreports its size can pin one. */
+    int fd = explain_fileno(stderr);
+    int columns = (fd >= 0 && explain_isatty(fd)) ? ir_explain_terminal_columns()
+                                                  : 0;
+    const char *forced = getenv("METTLE_EXPLAIN_COLUMNS");
+    if (forced && forced[0]) {
+      columns = atoi(forced);
+    }
+    if (columns >= 40) {
+      ir_explain_write_wrapped(stderr, (size_t)columns);
+    } else {
+      fwrite(g_report_buf, 1, g_report_len, stderr);
+    }
   } else {
     /* The digest: the report's conclusions in five lines, plus the path.
      * Regressions lead -- they must never hide inside a sidecar. */

@@ -286,6 +286,12 @@ beside the output. And a report past 200 lines goes to
 not flood the terminal. The digest carries the first "where to start" entry,
 so the short form still says what to do rather than only how the build went.
 
+A reason can run past 300 columns. Written to a terminal the report folds to
+that terminal's width, indenting continuations inside the elbow so the tree
+still reads. Redirected, piped or written to the sidecar it stays one line per
+fact, so `grep reason:` returns whole reasons. `METTLE_EXPLAIN_COLUMNS` forces
+a width.
+
 `--explain=SELECTOR` narrows the prose to one slice: `missed` drops the
 successes, `fixable` keeps only what has a fix, `proven` keeps what the
 compiler confirmed, `loops` and `calls` split by kind, and anything else is
