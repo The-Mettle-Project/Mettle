@@ -260,8 +260,27 @@ dispatch gemm[grid: (tiles_n, tiles_m, batch),
               stream: compute_stream](a, b, c, d, m, n, k);
 ```
 
-Here `vadd` is the runtime function handle returned by `gpu_func`, not a
-compile-time reference to the source kernel declaration. `dispatch` preserves
+Declare the kernel host-side and `dispatch` checks the call and sizes the
+grid itself:
+
+```mettle
+extern kernel(block = 256) vadd(a: float32*, b: float32*, c: float32*,
+                                n: int32);
+extern kernel(block = 256, per = warp) matvec(w: float32*, x: float32*,
+                                              out: float32*, n: int32,
+                                              d: int32);
+
+dispatch vadd[work: n](da, db, dc, n);      // grid = ceil(n / 256)
+dispatch matvec[work: d](dw, dx, dout, n, d);  // grid = ceil(d / 8)
+```
+
+Argument count and types are checked against the declaration, the handle is
+resolved by name from the loaded module, and an explicit block that
+contradicts the declaration is a compile error. `--report-launches` lists
+every dispatch site.
+
+In the older untyped form, `vadd` is the runtime function handle returned by
+`gpu_func`, not a compile-time reference to the source kernel declaration. `dispatch` preserves
 a typed, target-neutral launch in IR; the host backend alone marshals it for
 the selected runtime provider. The compact form supplies 1-D grid/block sizes;
 `... on s` enqueues it on stream `s`. A kernel that requires one launch shape

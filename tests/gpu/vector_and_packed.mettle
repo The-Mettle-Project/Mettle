@@ -1,0 +1,68 @@
+// 128-bit vector transfers, packed-byte and packed-half arithmetic, byte
+// permute, and the kernel-side diagnostics.
+extern fn load4_f32(src: float32*, dst: float32*) = "load4_f32";
+extern fn store4_f32(dst: float32*, src: float32*) = "store4_f32";
+extern fn load4_u32(src: uint32*, dst: uint32*) = "load4_u32";
+extern fn store4_u32(dst: uint32*, src: uint32*) = "store4_u32";
+extern fn dp2a_lo_s32(a: int32, b: int32, c: int32) -> int32 = "dp2a_lo_s32";
+extern fn dp2a_hi_u32(a: uint32, b: uint32, c: uint32) -> uint32 = "dp2a_hi_u32";
+extern fn prmt_b32(a: uint32, b: uint32, sel: uint32) -> uint32 = "prmt_b32";
+extern fn hadd2(a: uint32, b: uint32) -> uint32 = "hadd2";
+extern fn hmul2(a: uint32, b: uint32) -> uint32 = "hmul2";
+extern fn hfma2(a: uint32, b: uint32, c: uint32) -> uint32 = "hfma2";
+extern fn h2f_lo(p: uint32) -> float32 = "h2f_lo";
+extern fn h2f_hi(p: uint32) -> float32 = "h2f_hi";
+extern fn f2h2(lo: float32, hi: float32) -> uint32 = "f2h2";
+extern fn bf2f(bits: uint32) -> float32 = "bf2f";
+extern fn f2bf(x: float32) -> uint32 = "f2bf";
+
+// Four floats per lane per transaction instead of one.
+kernel(block = 256) vector_dot(w: float32*, x: float32*, out: float32*,
+                               quads: int32) {
+  private var wv: float32[4];
+  private var xv: float32[4];
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < quads) {
+    load4_f32(w + i * 4, &wv[0]);
+    load4_f32(x + i * 4, &xv[0]);
+    var s: float32 = wv[0] * xv[0] + wv[1] * xv[1];
+    s = s + wv[2] * xv[2] + wv[3] * xv[3];
+    store4_f32(out + i * 4, &wv[0]);
+    out[i] = s;
+  }
+}
+
+kernel(block = 256) vector_copy_u32(src: uint32*, dst: uint32*, quads: int32) {
+  private var v: uint32[4];
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < quads) {
+    load4_u32(src + i * 4, &v[0]);
+    store4_u32(dst + i * 4, &v[0]);
+  }
+}
+
+kernel(block = 256) packed_int(a: uint32*, b: uint32*, out: int32*, n: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < n) {
+    var lo: int32 = dp2a_lo_s32((int32)a[i], (int32)b[i], 0);
+    var hi: uint32 = dp2a_hi_u32(a[i], b[i], (uint32)0);
+    var shuffled: uint32 = prmt_b32(a[i], b[i], (uint32)0x4321);
+    out[i] = lo + (int32)hi + (int32)shuffled;
+  }
+}
+
+// Two fp16 lanes per arithmetic instruction, widened once at the end.
+kernel(block = 256) packed_half(w: uint32*, x: uint32*, out: float32*,
+                                pairs: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < pairs) {
+    var acc: uint32 = hfma2(w[i], x[i], f2h2(0.0, 0.0));
+    acc = hadd2(acc, hmul2(w[i], x[i]));
+    out[i] = h2f_lo(acc) + h2f_hi(acc);
+  }
+}
+
+kernel(block = 256) bfloat_pass(src: uint32*, out: uint32*, n: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < n) { out[i] = f2bf(bf2f(src[i]) * 2.0); }
+}

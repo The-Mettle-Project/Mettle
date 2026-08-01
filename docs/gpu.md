@@ -112,6 +112,78 @@ bytes: PTX emits the native `dp4a.u32.u32` / `dp4a.s32.s32` instruction
 chain of quantized decode; SPIR-V replays the exact byte semantics with
 scalar arithmetic.
 
+`dp2a_lo_*` / `dp2a_hi_*` are the mixed-width siblings: two 16-bit halves of
+the first operand against the low or high byte pair of the second.
+`prmt_b32(a, b, selector)` gathers four bytes out of the `{b:a}` octet by
+selector nibbles, which is the byte shuffling nibble-quant decode otherwise
+spends shifts and masks on.
+
+### Vector transfers
+
+`load4_f32` / `load4_u32` and `store4_f32` / `store4_u32` move four
+consecutive 32-bit elements in one 128-bit transaction:
+
+```mettle
+extern fn load4_f32(src: float32*, dst: float32*) = "load4_f32";
+
+private var v: float32[4];
+load4_f32(w + i * 4, &v[0]);       // one ld.global.v4.f32
+var s: float32 = v[0] * v[1] + v[2] * v[3];
+```
+
+The vector side is the global pointer; the scalar side is four ordinary
+accesses, which `ptxas` keeps in registers when it is a small
+constant-indexed private array. Both addresses must be 16-byte aligned, a
+source contract as it is for async copies. The portable SPIR-V profile moves
+the same four elements as four scalar accesses: same values and order,
+without the single transaction.
+
+### Packed half precision
+
+Two fp16 lanes ride in one 32-bit value with native two-at-a-time
+arithmetic, which is where the fp16 throughput actually is:
+
+```mettle
+extern fn hfma2(a: uint32, b: uint32, c: uint32) -> uint32 = "hfma2";
+extern fn h2f_lo(p: uint32) -> float32 = "h2f_lo";
+extern fn f2h2(lo: float32, hi: float32) -> uint32 = "f2h2";
+
+var acc: uint32 = f2h2(0.0, 0.0);
+acc = hfma2(w[i], x[i], acc);              // one fma.rn.f16x2, two lanes
+out[i] = h2f_lo(acc) + h2f_hi(acc);
+```
+
+`hadd2`, `hmul2`, and `hfma2` lower to PTX `add/mul/fma.rn.f16x2`;
+`h2f_lo` / `h2f_hi` widen one lane, `f2h2` packs two. `bf2f` and `f2bf`
+convert bfloat16, the latter rounding to nearest even in integer arithmetic
+so it holds on every target rather than only where `cvt.rn.bf16.f32` does.
+SPIR-V replays each lane separately.
+
+These are packed intrinsics over a `uint32` carrier, not a first-class
+`float16` scalar type: Mettle's scalar types are unchanged, and half-precision
+storage is still a `uint16*` (as it is for the tensor operations). A real
+`float16` scalar would have to work on every backend including x86, which is
+a type-system change rather than a kernel feature.
+
+### Looking inside a kernel
+
+```mettle
+extern fn gpu_print(fmt: cstring) = "gpu_print";
+extern fn gpu_print_i32(fmt: cstring, v: int32) = "gpu_print_i32";
+extern fn gpu_print_f32(fmt: cstring, v: float32) = "gpu_print_f32";
+extern fn gpu_print_2i32(fmt: cstring, a: int32, b: int32) = "gpu_print_2i32";
+extern fn gpu_assert(cond: int32) = "gpu_assert";
+```
+
+`gpu_print*` writes through the device print buffer (PTX `vprintf`). The
+format must be a literal; the argument shape is in the name, and the values
+follow the C varargs rules the device runtime reads them back with. Formats
+are pooled at module scope, so repeating one costs nothing.
+
+`gpu_assert(cond)` traps the launch at the offending lane when `cond` is
+false, but only under `--gpu-checks`. Without the flag it emits nothing, so
+assertions can stay in shipped source.
+
 An ordinary function called by a kernel is emitted as a non-entry device helper
 in both PTX and SPIR-V. Reachability is transitive and unrelated host functions
 are omitted; `kernel` remains the only launch-entry marker. Direct calls with
@@ -912,6 +984,73 @@ fn main() -> int32 {
   return 0;
 }
 ```
+
+### Declaring kernels host-side
+
+A kernel handle from `gpu_func` is an opaque `int64`, so a `dispatch` through
+one is unchecked: swap two arguments and the launch compiles and reads
+garbage. Declare the kernel host-side instead and `dispatch` checks the call
+like any other:
+
+```mettle
+extern kernel(block = 256) vadd(a: float32*, b: float32*, c: float32*,
+                                n: int32);
+
+dispatch vadd[(n + 255) / 256, 256](da, db, dc, n);   // checked
+dispatch vadd[work: n](da, db, dc, n);                // grid computed
+```
+
+An `extern kernel` declaration names a kernel defined in a separately
+compiled device module. It carries the signature and nothing else: no host
+symbol is emitted for it, and the launch handle is resolved by name from the
+module `gpu_module` loaded (or the one named by `gpu_module_bind`), cached
+after the first launch. Argument count, argument types, and the declared
+block shape are all checked at compile time; a device pointer may be passed
+as the `int64` handle it is on the host.
+
+`work: N` launches enough blocks to cover N work items at the declared block
+shape, so the host stops mirroring `(d + 7) / 8, 256` at every call site. A
+kernel that spends a whole subgroup per work item says so, and the grid
+follows:
+
+```mettle
+kernel(block = 256, per = warp) matvec(w: float32*, x: float32*,
+                                       out: float32*, n: int32, d: int32) {
+  var row: int32 = block.x * 8 + thread.x / 32;   // 8 warps per block
+  ...
+}
+
+dispatch matvec[work: d](dw, dx, dout, n, d);     // ceil(d / 8) blocks
+```
+
+`per = thread` is the default. `--report-launches` lists every dispatch site
+with the geometry the compiler can fold, and an explicit block that
+contradicts the declaration is a compile error rather than a launch the
+driver refuses.
+
+### Launch graphs
+
+A decode step is a fixed sequence of launches whose shapes never change, so
+the per-launch enqueue cost is pure overhead. Capture the sequence once and
+replay it:
+
+```mettle
+if (exec == 0) {
+  gpu_graph_capture_begin(stream);
+  dispatch norm[work: dim](...) on stream;
+  dispatch matvec[work: d](...) on stream;
+  exec = gpu_graph_capture_end(stream);
+} else {
+  gpu_graph_launch(exec, stream);
+}
+```
+
+Everything between begin and end must enqueue on that stream and must not
+synchronize: a capture records work rather than running it, so a readback in
+the middle deadlocks. Buffer addresses are baked into the graph, contents are
+not, which is what lets one capture serve every token. Capture-once and
+replay-after is left to the caller rather than hidden in a block form,
+because which iteration captures is a decision only the caller can make.
 
 ### The `dispatch` statement
 

@@ -1074,16 +1074,16 @@ int type_checker_process_declaration(TypeChecker *checker,
           "GPU kernel '%s' must be declared at top level", func_decl->name);
       return 0;
     }
-    if (func_decl->is_kernel && func_decl->is_extern) {
+    /* `extern kernel name(params);` is the host-side declaration of a kernel
+     * defined in a separately compiled device module. It carries the signature
+     * so `dispatch` can check its arguments, and it never has a body. A
+     * non-extern `kernel` is a definition and must. */
+    if (func_decl->is_kernel && !func_decl->is_extern && !func_decl->body) {
       type_checker_set_error_at_location(
           checker, declaration->location,
-          "GPU kernel '%s' cannot be an extern declaration", func_decl->name);
-      return 0;
-    }
-    if (func_decl->is_kernel && !func_decl->body) {
-      type_checker_set_error_at_location(
-          checker, declaration->location,
-          "GPU kernel '%s' must have a body", func_decl->name);
+          "GPU kernel '%s' must have a body (an 'extern kernel' declaration "
+          "names one defined in a device module)",
+          func_decl->name);
       return 0;
     }
     if (func_decl->is_extern &&
@@ -1221,6 +1221,11 @@ int type_checker_process_declaration(TypeChecker *checker,
     func_symbol->data.function.parameter_names = param_names_copy;
     func_symbol->data.function.parameter_types = param_types;
     func_symbol->data.function.return_type = return_type;
+    func_symbol->is_kernel = func_decl->is_kernel;
+    func_symbol->kernel_block[0] = func_decl->kernel_block[0];
+    func_symbol->kernel_block[1] = func_decl->kernel_block[1];
+    func_symbol->kernel_block[2] = func_decl->kernel_block[2];
+    func_symbol->kernel_threads_per_item = func_decl->kernel_threads_per_item;
     func_symbol->is_extern = func_decl->is_extern;
     if (func_decl->is_extern) {
       const char *effective_link_name = type_checker_decl_link_name(

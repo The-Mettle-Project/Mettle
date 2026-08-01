@@ -5,6 +5,17 @@
 
 // Statement and expression validation functions
 
+/* --report-launches: print every dispatch site with its geometry, the half of
+ * the occupancy question the device-side report cannot see. Set by the driver
+ * before checking begins. */
+static int g_report_launches = 0;
+static int g_report_launches_header = 0;
+
+void type_checker_set_launch_report(int enabled) {
+  g_report_launches = enabled;
+  g_report_launches_header = 0;
+}
+
 static int gpu_launch_abi_type(const Type *type) {
   if (!type) {
     return 0;
@@ -52,17 +63,126 @@ static int type_checker_check_gpu_launch(TypeChecker *checker,
     return 0;
   }
 
-  Type *handle_type = type_checker_infer_type(checker, launch->kernel);
-  if (!handle_type) {
-    return 0;
+  /* Two forms of launch target. `dispatch NAME[...]` where NAME is a declared
+   * `extern kernel` is checked against that signature like an ordinary call,
+   * and its handle is resolved by name at lowering. Anything else is the
+   * original untyped form: an opaque runtime handle from gpu_func, which the
+   * compiler cannot check beyond its being an integer or pointer. */
+  Symbol *kernel_symbol = NULL;
+  if (launch->kernel->type == AST_IDENTIFIER && launch->kernel->data) {
+    const char *name = ((Identifier *)launch->kernel->data)->name;
+    Symbol *symbol = name ? symbol_table_lookup(checker->symbol_table, name)
+                          : NULL;
+    if (symbol && symbol->kind == SYMBOL_FUNCTION && symbol->is_kernel) {
+      kernel_symbol = symbol;
+    }
   }
-  if (!type_checker_is_integer_type(handle_type) &&
-      handle_type->kind != TYPE_POINTER &&
-      handle_type->kind != TYPE_FUNCTION_POINTER) {
-    type_checker_report_type_mismatch(checker, launch->kernel->location,
-                                      "integer or pointer GPU kernel handle",
-                                      handle_type->name);
-    return 0;
+
+  if (kernel_symbol) {
+    launch->typed_kernel = 1;
+    launch->kernel_block[0] = kernel_symbol->kernel_block[0];
+    launch->kernel_block[1] = kernel_symbol->kernel_block[1];
+    launch->kernel_block[2] = kernel_symbol->kernel_block[2];
+    launch->kernel_threads_per_item = kernel_symbol->kernel_threads_per_item;
+    size_t expected = kernel_symbol->data.function.parameter_count;
+    if (launch->argument_count != expected) {
+      type_checker_set_error_at_location(
+          checker, statement->location,
+          "GPU kernel '%s' takes %zu argument%s, but this dispatch passes %zu",
+          kernel_symbol->name, expected, expected == 1 ? "" : "s",
+          launch->argument_count);
+      return 0;
+    }
+    for (size_t i = 0; i < launch->argument_count; i++) {
+      Type *arg_type = type_checker_infer_type(checker, launch->arguments[i]);
+      if (!arg_type) {
+        return 0;
+      }
+      Type *param_type = kernel_symbol->data.function.parameter_types
+                             ? kernel_symbol->data.function.parameter_types[i]
+                             : NULL;
+      if (!param_type) {
+        continue;
+      }
+      /* A device pointer is an int64 handle on the host: the address lives in
+       * device memory and the host never dereferences it. Accept an integer
+       * for a pointer parameter, which is the whole existing calling
+       * convention, but keep every other pair exact. */
+      int device_handle_for_pointer = param_type->kind == TYPE_POINTER &&
+                                      type_checker_is_integer_type(arg_type);
+      if (!device_handle_for_pointer &&
+          !type_checker_is_assignable(checker, param_type, arg_type)) {
+        type_checker_report_type_mismatch_node(
+            checker, launch->arguments[i],
+            param_type->name ? param_type->name : "?",
+            arg_type->name ? arg_type->name : "?");
+        if (kernel_symbol->data.function.parameter_names &&
+            kernel_symbol->data.function.parameter_names[i] &&
+            checker->error_reporter) {
+          char label[224];
+          snprintf(label, sizeof(label),
+                   "kernel '%s' parameter '%s' expects '%s', this argument is "
+                   "'%s'",
+                   kernel_symbol->name,
+                   kernel_symbol->data.function.parameter_names[i],
+                   param_type->name ? param_type->name : "?",
+                   arg_type->name ? arg_type->name : "?");
+          error_reporter_set_last_label(checker->error_reporter, label);
+        }
+        type_checker_note_declared_here(checker, kernel_symbol, "kernel");
+        return 0;
+      }
+    }
+  } else {
+    if (launch->work) {
+      type_checker_set_error_at_location(
+          checker, statement->location,
+          "Dispatch 'work:' needs the kernel's declared block shape; declare "
+          "it host-side with 'extern kernel' and dispatch it by name");
+      return 0;
+    }
+    Type *handle_type = type_checker_infer_type(checker, launch->kernel);
+    if (!handle_type) {
+      return 0;
+    }
+    if (!type_checker_is_integer_type(handle_type) &&
+        handle_type->kind != TYPE_POINTER &&
+        handle_type->kind != TYPE_FUNCTION_POINTER) {
+      type_checker_report_type_mismatch(checker, launch->kernel->location,
+                                        "integer or pointer GPU kernel handle",
+                                        handle_type->name);
+      return 0;
+    }
+  }
+
+  if (launch->work) {
+    if (launch->kernel_block[0] <= 0) {
+      type_checker_set_error_at_location(
+          checker, statement->location,
+          "Dispatch 'work:' needs a 'kernel(block = ...)' declaration on '%s' "
+          "to size the grid",
+          kernel_symbol && kernel_symbol->name ? kernel_symbol->name
+                                               : "the kernel");
+      return 0;
+    }
+    Type *work_type = type_checker_infer_type(checker, launch->work);
+    if (!work_type) {
+      return 0;
+    }
+    if (!type_checker_is_integer_type(work_type)) {
+      type_checker_report_type_mismatch(checker, launch->work->location,
+                                        "integer GPU work count",
+                                        work_type->name);
+      return 0;
+    }
+    long long constant = 0;
+    if (type_checker_eval_integer_constant(launch->work, &constant) &&
+        constant <= 0) {
+      type_checker_set_error_at_location(
+          checker, launch->work->location,
+          "GPU work count must be greater than zero");
+      return 0;
+    }
   }
 
   for (size_t d = 0; d < 3; d++) {
@@ -124,6 +244,107 @@ static int type_checker_check_gpu_launch(TypeChecker *checker,
           i, arg_type->name ? arg_type->name : "unknown");
       return 0;
     }
+  }
+
+  /* A declared kernel launched with an explicit block shape that contradicts
+   * its declaration is a launch the driver will refuse (the module carries
+   * .reqntid). When both are known at compile time, refuse it here instead,
+   * where the message can name both shapes. */
+  if (kernel_symbol && !launch->work && launch->kernel_block[0] > 0) {
+    long long actual[3] = {0, 0, 0};
+    int all_constant = 1;
+    for (size_t d = 0; d < 3; d++) {
+      if (!type_checker_eval_integer_constant(launch->block[d], &actual[d])) {
+        all_constant = 0;
+        break;
+      }
+    }
+    if (all_constant) {
+      long long declared[3] = {launch->kernel_block[0],
+                               launch->kernel_block[1] > 0
+                                   ? launch->kernel_block[1]
+                                   : 1,
+                               launch->kernel_block[2] > 0
+                                   ? launch->kernel_block[2]
+                                   : 1};
+      if (actual[0] != declared[0] || actual[1] != declared[1] ||
+          actual[2] != declared[2]) {
+        type_checker_set_error_at_location(
+            checker, statement->location,
+            "GPU kernel '%s' declares block (%lld, %lld, %lld) but this "
+            "dispatch launches (%lld, %lld, %lld); the driver would reject it",
+            kernel_symbol->name, declared[0], declared[1], declared[2],
+            actual[0], actual[1], actual[2]);
+        return 0;
+      }
+    }
+  }
+
+  if (g_report_launches) {
+    long long grid[3] = {0, 0, 0};
+    long long block[3] = {0, 0, 0};
+    int grid_known = 1;
+    int block_known = 1;
+    if (!g_report_launches_header) {
+      printf("Launch report (grid and block where the compiler can fold "
+             "them):\n");
+      g_report_launches_header = 1;
+    }
+    for (size_t d = 0; d < 3; d++) {
+      if (!type_checker_eval_integer_constant(launch->grid[d], &grid[d]))
+        grid_known = 0;
+      if (!type_checker_eval_integer_constant(launch->block[d], &block[d]))
+        block_known = 0;
+    }
+    printf("  %s:%llu: %s",
+           statement->location.filename ? statement->location.filename : "?",
+           (unsigned long long)statement->location.line,
+           kernel_symbol && kernel_symbol->name ? kernel_symbol->name
+                                                : "<runtime handle>");
+    if (launch->work) {
+      long long work = 0;
+      long long threads = launch->kernel_block[0] *
+                          (launch->kernel_block[1] > 0 ? launch->kernel_block[1]
+                                                       : 1) *
+                          (launch->kernel_block[2] > 0 ? launch->kernel_block[2]
+                                                       : 1);
+      /* Work items per block, not threads per block: a `per = warp` kernel
+       * spends 32 threads on each item. */
+      long long per_item = launch->kernel_threads_per_item > 0
+                               ? launch->kernel_threads_per_item
+                               : 1;
+      long long items = threads / per_item;
+      if (type_checker_eval_integer_constant(launch->work, &work) &&
+          items > 0) {
+        printf(" work %lld -> grid %lld", work, (work + items - 1) / items);
+      } else {
+        printf(" work <runtime> -> grid <runtime>");
+      }
+      printf(", block %lld (declared", threads);
+      if (per_item > 1) {
+        printf(", %lld items/block", items);
+      }
+      printf(")");
+    } else {
+      if (grid_known) {
+        printf(" grid (%lld, %lld, %lld)", grid[0], grid[1], grid[2]);
+      } else {
+        printf(" grid <runtime>");
+      }
+      if (block_known) {
+        printf(", block (%lld, %lld, %lld)", block[0], block[1], block[2]);
+      } else {
+        printf(", block <runtime>");
+      }
+    }
+    if (kernel_symbol && launch->kernel_block[0] <= 0) {
+      printf("  [no declared block]");
+    }
+    if (!kernel_symbol) {
+      printf("  [untyped handle: declare it with 'extern kernel' to check "
+             "arguments]");
+    }
+    printf("\n");
   }
   return 1;
 }

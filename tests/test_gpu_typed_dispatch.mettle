@@ -1,0 +1,40 @@
+// Typed dispatch: `extern kernel` declares a device entry point host-side, so
+// `dispatch` checks its arguments and resolves the handle by name, and
+// `work:` sizes the grid from the declared block shape.
+import "std/gpu";
+
+extern kernel(block = 256) vadd(a: float32*, b: float32*, c: float32*, n: int32);
+extern kernel(block = (64, 4, 1)) shaped(x: float32*, n: int32);
+extern kernel plain(x: float32*, n: int32);
+// One subgroup per work item: a block of 256 covers 8 rows, not 256.
+extern kernel(block = 256, per = warp) warp_rows(w: float32*, out: float32*,
+                                                 d: int32);
+
+fn main() -> int32 {
+  var da: int64 = 0;
+  var db: int64 = 0;
+  var dc: int64 = 0;
+  var n: int32 = 4096;
+
+  // Both spellings of the same launch: the second computes the first's grid.
+  dispatch vadd[(n + 255) / 256, 256](da, db, dc, n);
+  dispatch vadd[work: n](da, db, dc, n);
+
+  // A three-dimensional declared block; work counts whole work items.
+  dispatch shaped[work: n](da, n);
+
+  // Named controls and the stream sugar still apply to a typed launch.
+  var stream: int64 = 0;
+  dispatch vadd[grid: (16, 1, 1), block: (256, 1, 1)](da, db, dc, n);
+  dispatch vadd[work: n](da, db, dc, n) on stream;
+  dispatch plain[8, 128](da, n);
+
+  // A warp-per-row kernel: work counts rows, and the grid divides by the
+  // warps per block rather than the threads.
+  dispatch warp_rows[work: 300](da, db, 300);
+
+  // The untyped handle form is unchanged: an opaque int64 from gpu_func.
+  var handle: int64 = 0;
+  dispatch handle[1, 64](da, n);
+  return 0;
+}

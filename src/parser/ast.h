@@ -112,6 +112,10 @@ typedef struct {
   // `kernel(block = N)` / `kernel(block = (x, y, z))`: the launch block shape
   // this kernel requires. All zero when undeclared.
   int kernel_block[3];
+  // `kernel(block = N, per = warp)`: how many threads one work item costs,
+  // which is what `dispatch k[work: n]` divides by. 0 or 1 is one thread per
+  // item; 32 is one subgroup per item, the shape of a warp-per-row matvec.
+  int kernel_threads_per_item;
   char *link_name;
   char **type_params;
   char **type_param_traits;
@@ -288,6 +292,18 @@ typedef struct {
   ASTNode *stream;
   ASTNode **arguments;
   size_t argument_count;
+  /* Set by the type checker when `kernel` named a declared `extern kernel`:
+   * the arguments were checked against its signature, and the launch handle is
+   * resolved from that name at lowering instead of read from a host variable. */
+  int typed_kernel;
+  /* `work: N` -- launch enough blocks to cover N work items at the kernel's
+   * declared block shape. grid[] is synthesized from it. */
+  ASTNode *work;
+  /* The declared kernel's `kernel(block = ...)`, copied by the type checker so
+   * lowering can size a `work:` grid. All zero when undeclared. */
+  int kernel_block[3];
+  /* Threads one work item costs, from the declaration's `per`. */
+  int kernel_threads_per_item;
 } GpuLaunchStatement;
 
 typedef enum {

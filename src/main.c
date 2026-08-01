@@ -390,6 +390,18 @@ static void print_doc_reference(const char *argv0, const char *relative_path) {
   free(docs_dir);
 }
 
+static int host_emits_pe(void) {
+  return binary_target_format_host_default() == BINARY_TARGET_FORMAT_COFF_WIN64;
+}
+
+static const char *example_executable_name(void) {
+  return host_emits_pe() ? "app.exe" : "app";
+}
+
+static const char *example_object_name(void) {
+  return host_emits_pe() ? "app.obj" : "app.o";
+}
+
 /* Single source of truth for the help-topic list. Referenced by print_usage,
  * the topic dispatcher, and the unknown-topic error so they cannot drift. */
 #define METTLE_HELP_TOPICS "build, runtime (alias: heap, gc), interop, stdlib, web, diagnostics (alias: errors), verify, test (alias: trace)"
@@ -418,9 +430,10 @@ static int print_help_topic(const char *program_name, const char *argv0,
   if (strcmp(topic, "build") == 0 || strcmp(topic, "compile") == 0) {
     printf("build - compile, assemble, and link an executable\n\n");
     printf("  Common:\n");
-    printf("    mettle --build app.mettle -o app.exe\n");
-    printf("    mettle --build --release app.mettle -o app.exe              "
-           "   (optimized, stripped)\n");
+    printf("    mettle --build app.mettle -o %s\n", example_executable_name());
+    printf("    mettle --build --release app.mettle -o %s              "
+           "   (optimized, stripped)\n",
+           example_executable_name());
     printf("\n");
     printf("  Notes:\n");
     printf("    --build emits a COFF object and links with the internal PE "
@@ -608,7 +621,21 @@ static char *default_executable_filename(const char *input_filename) {
     return NULL;
   }
 
-  return replace_extension(input_filename, ".exe");
+  BinaryTargetFormat host_format = binary_target_format_host_default();
+  if (host_format != BINARY_TARGET_FORMAT_ELF_X64 &&
+      host_format != BINARY_TARGET_FORMAT_ELF_ARM64) {
+    return replace_extension(input_filename, ".exe");
+  }
+
+  /* An extensionless input would name its own source, so suffix that one
+   * instead of overwriting it. */
+  char *stem = replace_extension(input_filename, "");
+  if (stem && stem[0] != '\0' && strcmp(stem, input_filename) != 0) {
+    return stem;
+  }
+
+  free(stem);
+  return build_sidecar_filename(input_filename, ".out");
 }
 
 static const char *default_object_output_filename(void) {
@@ -2894,6 +2921,10 @@ int main(int argc, char *argv[]) {
       options.ptx_tensor_tuple_budget = budget;
     } else if (strcmp(argv[i], "--report-occupancy") == 0) {
       options.report_occupancy = 1;
+    } else if (strcmp(argv[i], "--gpu-checks") == 0) {
+      options.gpu_checks = 1;
+    } else if (strcmp(argv[i], "--report-launches") == 0) {
+      options.report_launches = 1;
     } else if (strncmp(argv[i], "--sms=", 6) == 0) {
       int sms = atoi(argv[i] + 6);
       if (sms < 1 || sms > 1024) {
@@ -3060,9 +3091,12 @@ int main(int argc, char *argv[]) {
       return 1;
     }
 
-    /* ELF objects conventionally use .o; COFF uses .obj. */
-    object_output_filename = replace_extension(
-        build_output_filename, elf_build ? ".o" : ".obj");
+    /* ELF objects conventionally use .o; COFF uses .obj. ELF executables carry
+     * no extension, so append rather than replace: replacing would read the
+     * stem of a dotted name as an extension and build my.app into my.o. */
+    object_output_filename =
+        elf_build ? build_sidecar_filename(build_output_filename, ".o")
+                  : replace_extension(build_output_filename, ".obj");
     if (!object_output_filename) {
       fprintf(stderr, "Error: Failed to determine object output path\n");
       free(build_output_filename);
@@ -3516,6 +3550,7 @@ int compile_file(const char *input_filename, const char *output_filename,
   }
   type_checker =
       type_checker_create_with_error_reporter(symbol_table, error_reporter);
+  type_checker_set_launch_report(options->report_launches);
   if (!parser || !type_checker) {
     compiler_profile_add(&profile, PROFILE_PHASE_INIT, phase_start);
     error_reporter_add_error(error_reporter, ERROR_INTERNAL,
@@ -3824,7 +3859,8 @@ int compile_file(const char *input_filename, const char *output_filename,
     PtxEmitOptions ptx_options = {options->ptx_target,
                                    options->ptx_isa_major,
                                    options->ptx_isa_minor,
-                                   options->ptx_tensor_tuple_budget};
+                                   options->ptx_tensor_tuple_budget,
+                                   options->gpu_checks};
     int ok = ptx_emit_program(ir_program, code_generator, ptx_out,
                               &ptx_options, &ptx_err);
     fclose(ptx_out);
@@ -4262,6 +4298,11 @@ void print_usage(const char *program_name) {
   printf("  --sms=N             SM count for those fill thresholds (default:\n"
          "                      ask the local driver; omitted when neither\n"
          "                      answers)\n");
+  printf("  --gpu-checks        Emit the trap for each kernel-side\n"
+         "                      gpu_assert; without it they cost nothing\n");
+  printf("  --report-launches   List every dispatch site with the grid and\n"
+         "                      block the compiler can fold, and the kernel\n"
+         "                      each names\n");
   printf("  --gpu-tensor-tuple-budget=N\n"
          "                      PTX resident-fragment ceiling (0=architecture\n"
          "                      default); enables measured resident/replay variants\n"
@@ -4346,13 +4387,18 @@ void print_usage(const char *program_name) {
   printf("  --debug-compiler    Track compiler context for internal error reports\n");
   printf("  -h, --help          Show this help message\n");
   printf("\nExamples:\n");
-  printf("  %s app.mettle -o app.obj\n", program_name);
+  printf("  %s app.mettle -o %s\n", program_name, example_object_name());
   printf("      Compile to a native object file.\n");
-  printf("  %s --build app.mettle -o app.exe\n", program_name);
-  printf("      Self-contained build: COFF object + internal PE linker.\n");
-  printf("  %s --build --release app.mettle -o app.exe\n", program_name);
+  printf("  %s --build app.mettle -o %s\n", program_name,
+         example_executable_name());
+  printf("      Self-contained build: %s\n",
+         host_emits_pe() ? "COFF object + internal PE linker."
+                         : "ELF object + native linker.");
+  printf("  %s --build --release app.mettle -o %s\n", program_name,
+         example_executable_name());
   printf("      Optimized, comment-stripped release build.\n");
-  printf("  %s --build --tracy app.mettle -o app.exe\n", program_name);
+  printf("  %s --build --tracy app.mettle -o %s\n", program_name,
+         example_executable_name());
   printf("      Build with Tracy instrumentation (set TRACY_DIR or "
          "--tracy-dir).\n");
   printf("\nHelp:\n");

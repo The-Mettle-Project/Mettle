@@ -1,0 +1,7 @@
+import "std/gpu";
+extern kernel plain(x: float32*, n: int32);
+fn main() -> int32 {
+  var d: int64 = 0;
+  dispatch plain[work: 100](d, 4);
+  return 0;
+}

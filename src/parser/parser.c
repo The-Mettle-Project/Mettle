@@ -723,13 +723,21 @@ ASTNode *parser_parse_declaration(Parser *parser) {
     return parser_parse_import_declaration(parser);
   case TOKEN_EXTERN: {
     parser_advance(parser); // consume 'extern'
+    /* `extern kernel name(params);` declares, host-side, a kernel defined in a
+     * separately compiled device module: the signature `dispatch` checks its
+     * arguments against. */
     if (parser->current_token.type == TOKEN_FUNCTION ||
-        parser->current_token.type == TOKEN_FN) {
+        parser->current_token.type == TOKEN_FN ||
+        parser->current_token.type == TOKEN_KERNEL) {
       ASTNode *decl = parser_parse_function_declaration(parser);
       if (decl && decl->data) {
         FunctionDeclaration *func_data = (FunctionDeclaration *)decl->data;
         if (func_data->body != NULL) {
-          parser_set_error(parser, "Extern functions must not have a body");
+          parser_set_error(parser,
+                           func_data->is_kernel
+                               ? "An 'extern kernel' declaration must not have "
+                                 "a body; the device module defines it"
+                               : "Extern functions must not have a body");
           ast_destroy_node(decl);
           return NULL;
         }
@@ -740,7 +748,7 @@ ASTNode *parser_parse_declaration(Parser *parser) {
     if (parser->current_token.type == TOKEN_VAR) {
       return parser_parse_extern_var_declaration(parser);
     }
-    parser_set_error(parser, "Expected 'fn' or 'var' after 'extern'");
+    parser_set_error(parser, "Expected 'fn', 'kernel', or 'var' after 'extern'");
     return NULL;
   }
   case TOKEN_EXPORT: {
@@ -3379,6 +3387,7 @@ ASTNode *parser_parse_function_declaration(Parser *parser) {
    * can stamp it into the module (.reqntid / LocalSize) and the launch is
    * rejected by the driver instead of running with a garbage lane mapping. */
   int kernel_block[3] = {0, 0, 0};
+  int kernel_threads_per_item = 0;
   if (is_kernel && parser->current_token.type == TOKEN_LPAREN) {
     parser_advance(parser);
     if (parser->current_token.type != TOKEN_IDENTIFIER ||
@@ -3431,6 +3440,43 @@ ASTNode *parser_parse_function_declaration(Parser *parser) {
       parser_set_error(parser,
                        "Kernel block volume must not exceed 1024 work-items");
       return NULL;
+    }
+    /* `per = thread` (the default) or `per = warp`: how many threads one unit
+     * of work costs. A warp-per-row matvec covers block_volume/32 rows per
+     * block, not block_volume, and `dispatch k[work: n]` has to know which. */
+    if (parser->current_token.type == TOKEN_COMMA) {
+      parser_advance(parser);
+      if (parser->current_token.type != TOKEN_IDENTIFIER ||
+          strcmp(parser->current_token.value, "per") != 0) {
+        parser_set_error(parser,
+                         "Expected 'per' after the kernel block shape "
+                         "(kernel(block = N, per = warp))");
+        return NULL;
+      }
+      parser_advance(parser);
+      if (!parser_expect(parser, TOKEN_EQUALS)) {
+        return NULL;
+      }
+      if (parser->current_token.type != TOKEN_IDENTIFIER) {
+        parser_set_error(parser, "Expected 'thread' or 'warp' after 'per ='");
+        return NULL;
+      }
+      if (strcmp(parser->current_token.value, "warp") == 0) {
+        kernel_threads_per_item = 32;
+      } else if (strcmp(parser->current_token.value, "thread") == 0) {
+        kernel_threads_per_item = 1;
+      } else {
+        parser_set_error(parser, "Kernel 'per' must be 'thread' or 'warp'");
+        return NULL;
+      }
+      if (product % (kernel_threads_per_item > 0 ? kernel_threads_per_item : 1)
+          != 0) {
+        parser_set_error(parser,
+                         "A 'per = warp' kernel needs a block volume that is a "
+                         "whole number of 32-lane warps");
+        return NULL;
+      }
+      parser_advance(parser);
     }
     if (!parser_expect(parser, TOKEN_RPAREN)) {
       return NULL;
@@ -3618,6 +3664,7 @@ ASTNode *parser_parse_function_declaration(Parser *parser) {
     func_data->kernel_block[0] = kernel_block[0];
     func_data->kernel_block[1] = kernel_block[1];
     func_data->kernel_block[2] = kernel_block[2];
+    func_data->kernel_threads_per_item = kernel_threads_per_item;
     if (link_name) {
       func_data->link_name = strdup(link_name);
       if (!func_data->link_name) {
@@ -4738,6 +4785,7 @@ static ASTNode *parser_parse_dispatch_statement(Parser *parser) {
   ASTNode *block[3] = {NULL, NULL, NULL};
   ASTNode *shared = NULL;
   ASTNode *stream = NULL;
+  ASTNode *work = NULL;
   int stream_was_named = 0;
   ASTNode *args[64];
   size_t nargs = 0;
@@ -4751,6 +4799,7 @@ static ASTNode *parser_parse_dispatch_statement(Parser *parser) {
     }                                                                          \
     ast_destroy_node(shared);                                                  \
     ast_destroy_node(stream);                                                  \
+    ast_destroy_node(work);                                                    \
     for (size_t _i = 0; _i < nargs; _i++)                                      \
       ast_destroy_node(args[_i]);                                              \
     return NULL;                                                               \
@@ -4799,18 +4848,21 @@ static ASTNode *parser_parse_dispatch_statement(Parser *parser) {
       else if (!strcmp(parser->current_token.value, "block")) option = 2;
       else if (!strcmp(parser->current_token.value, "shared")) option = 3;
       else if (!strcmp(parser->current_token.value, "stream")) option = 4;
+      else if (!strcmp(parser->current_token.value, "work")) option = 5;
       else {
         parser_set_error(parser, "Unknown named dispatch control");
         DISP_FAIL();
       }
       if ((option == 1 && have_grid) || (option == 2 && have_block) ||
-          (option == 3 && have_shared) || (option == 4 && have_stream)) {
+          (option == 3 && have_shared) || (option == 4 && have_stream) ||
+          (option == 5 && work)) {
         parser_set_error(parser, "Duplicate named dispatch control");
         DISP_FAIL();
       }
       if (option == 1) have_grid = 1;
       else if (option == 2) have_block = 1;
       else if (option == 3) have_shared = 1;
+      else if (option == 5) { /* `work` is recorded by its parse below */ }
       else {
         have_stream = 1;
         stream_was_named = 1;
@@ -4840,7 +4892,8 @@ static ASTNode *parser_parse_dispatch_statement(Parser *parser) {
           DISP_FAIL();
         }
       } else {
-        ASTNode **value = option == 3 ? &shared : &stream;
+        ASTNode **value = option == 3 ? &shared
+                                      : (option == 5 ? &work : &stream);
         *value = parser_parse_expression(parser);
         if (!*value) DISP_FAIL();
       }
@@ -4857,9 +4910,19 @@ static ASTNode *parser_parse_dispatch_statement(Parser *parser) {
         DISP_FAIL();
       }
     }
-    if (!have_grid || !have_block) {
+    /* `work:` replaces both: the grid comes from the work count divided by
+     * the kernel's declared block shape, which the type checker supplies. */
+    if (work) {
+      if (have_grid) {
+        parser_set_error(parser,
+                         "Dispatch 'work:' computes the grid; drop 'grid:'");
+        DISP_FAIL();
+      }
+    } else if (!have_grid || !have_block) {
       parser_set_error(parser,
-                       "Named dispatch controls require grid and block");
+                       "Named dispatch controls require grid and block, or "
+                       "'work:' to size the launch from the kernel's "
+                       "declared block");
       DISP_FAIL();
     }
     if (!parser_expect(parser, TOKEN_RBRACKET)) DISP_FAIL();
@@ -4867,6 +4930,14 @@ static ASTNode *parser_parse_dispatch_statement(Parser *parser) {
 
   if (!shared) shared = ast_create_number_literal(0, loc, 10);
   if (!stream) stream = ast_create_number_literal(0, loc, 10);
+  /* A `work:` launch carries placeholder geometry: lowering replaces it with
+   * the work count divided by the kernel's declared block shape. */
+  if (work) {
+    for (size_t d = 0; d < 3; d++) {
+      if (!grid[d]) grid[d] = ast_create_number_literal(1, loc, 10);
+      if (!block[d]) block[d] = ast_create_number_literal(1, loc, 10);
+    }
+  }
   if (!grid[1] || !grid[2] || !block[1] || !block[2] || !shared || !stream) {
     parser_set_error(parser, "Out of memory creating GPU launch controls");
     DISP_FAIL();
@@ -4926,6 +4997,11 @@ static ASTNode *parser_parse_dispatch_statement(Parser *parser) {
   if (!launch) {
     parser_set_error(parser, "Out of memory creating GPU launch");
     DISP_FAIL();
+  }
+  if (work) {
+    GpuLaunchStatement *data = (GpuLaunchStatement *)launch->data;
+    data->work = work;
+    ast_add_child(launch, work);
   }
 #undef DISP_FAIL
   return launch;
