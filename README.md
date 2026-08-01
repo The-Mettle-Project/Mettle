@@ -3,8 +3,8 @@
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/The-Mettle-Project/Mettle/development/mettle-syntax/icons/mettle-dark.svg" />
-  <img src="https://raw.githubusercontent.com/The-Mettle-Project/Mettle/development/mettle-syntax/icons/mettle-light.svg" alt="Mettle" width="120" height="120" />
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/The-Mettle-Project/Mettle/development/docs/assets/mettle-dark.svg" />
+  <img src="https://raw.githubusercontent.com/The-Mettle-Project/Mettle/development/docs/assets/mettle-light.svg" alt="Mettle" width="120" height="120" />
 </picture>
 
 # Mettle
@@ -166,10 +166,13 @@ stdlib/         standard library
 tests/          regression tests; run_tests.ps1 on Windows
 examples/       benchmarks and demos
 tools/          ELF tests, benchmarks, fuzz scripts, upstream sync
-mettle-syntax/  VS Code / Cursor extension
 docs/           language and tooling reference
 libmtlc/        the backend dependency (fetched, gitignored)
 ```
+
+The editor extensions are not here either: they live in
+[MettleMisc](https://github.com/The-Mettle-Project/MettleMisc), which versions
+on its own schedule and which neither the build nor the test suite depends on.
 
 The optimizers, code generators and linkers are not here. They are in
 [libmtlc](https://github.com/The-Mettle-Project/libmtlc), which is upstream of
@@ -215,7 +218,9 @@ include-path rules, and how to sync frontend changes back from upstream.
 
 ## Editor support
 
-The [mettle-syntax](mettle-syntax/) extension turns VS Code or Cursor into a full Mettle IDE: debugging on F5, go to definition, rename, completion, an interactive `--explain` dashboard, and compiler-backed diagnostics. Everything runs against the compiler in your workspace; no separate language server.
+The editor extensions live in their own project, [MettleMisc](https://github.com/The-Mettle-Project/MettleMisc): `mettle-syntax` for VS Code and Cursor, and `clion-plugin` for CLion and the rest of the IntelliJ family.
+
+The VS Code extension turns the editor into a full Mettle IDE: debugging on F5, go to definition, rename, completion, an interactive `--explain` dashboard, and compiler-backed diagnostics. Everything runs against the compiler in your workspace; no separate language server.
 
 ## License
 

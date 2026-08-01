@@ -46,9 +46,11 @@ tests/          regression tests; run_tests.ps1 on Windows
 tools/          ELF tests, benchmarks, fuzz scripts, ML optimizer, upstream sync
 examples/       runnable samples and benchmarks
 docs/           language and tooling reference
-mettle-syntax/  VS Code extension
 libmtlc/        the backend dependency (fetched, gitignored)
 ```
+
+The VS Code and JetBrains extensions live in a separate project,
+[MettleMisc](https://github.com/The-Mettle-Project/MettleMisc).
 
 ## Building the compiler
 

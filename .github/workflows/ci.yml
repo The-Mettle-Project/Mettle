@@ -34,11 +34,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
       - name: Validate GitHub Actions workflows
         shell: bash
         run: |
@@ -76,10 +71,6 @@ jobs:
             }
           }
           if ($failed) { exit 1 }
-
-      - name: Validate VS Code extension package
-        working-directory: mettle-syntax
-        run: npm run check
 
   build-and-test:
     name: Build & test (windows gcc)

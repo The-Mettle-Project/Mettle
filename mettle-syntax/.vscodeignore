@@ -1,8 +1,0 @@
-.git/**
-.github/**
-node_modules/**
-out/**
-dist/**
-*.vsix
-scripts/**
-test-lint.mettle
