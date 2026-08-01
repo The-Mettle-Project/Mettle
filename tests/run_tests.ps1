@@ -369,7 +369,7 @@ $cases = @(
     Name          = "err_mem_return_stack"
     Path          = "tests/err_mem_return_stack.mettle"
     ShouldSucceed = $false
-    Pattern       = 'Returning the address of stack local `values`'
+    Pattern       = 'error\[M0103\]: Returning the address of stack local `values`'
   },
   @{
     # Memory diagnostics: constant index past a stack array's end is an error
@@ -385,7 +385,7 @@ $cases = @(
     Name          = "err_mem_op_overflow"
     Path          = "tests/err_mem_op_overflow.mettle"
     ShouldSucceed = $false
-    Pattern       = '`mem_zero` writes 128 bytes into `buf`, which only has 64'
+    Pattern       = 'error\[M0106\]: `mem_zero` writes 128 bytes into `buf`, which only has 64'
   },
   @{
     # Loop-bound analysis: `j <= 8` over int32[8] provably reads a[8] on the
@@ -393,21 +393,21 @@ $cases = @(
     Name          = "err_mem_loop_oob"
     Path          = "tests/err_mem_loop_oob.mettle"
     ShouldSucceed = $false
-    Pattern       = 'This loop runs `j` up to 8, but `a` has 8 elements'
+    Pattern       = 'error\[M0117\]: This loop runs `j` up to 8, but `a` has 8 elements'
   },
   @{
     # Constant arithmetic: division by a literal zero is a guaranteed trap.
     Name          = "err_mem_div_zero"
     Path          = "tests/err_mem_div_zero.mettle"
     ShouldSucceed = $false
-    Pattern       = 'Division by a constant zero'
+    Pattern       = 'error\[M0116\]: Division by a constant zero'
   },
   @{
     # Constant out-of-bounds THROUGH a pointer alias: p = &a[2], p[6] = a[8].
     Name          = "err_mem_ptr_alias_oob"
     Path          = "tests/err_mem_ptr_alias_oob.mettle"
     ShouldSucceed = $false
-    Pattern       = 'Index 6 through `p` lands at `a\[8\]`, out of bounds'
+    Pattern       = 'error\[M0105\]: Index 6 through `p` lands at `a\[8\]`, out of bounds'
   },
   @{
     # Memory diagnostics that warn without failing the build: double free,
@@ -418,13 +418,15 @@ $cases = @(
     Path          = "tests/warn_mem_diagnostics.mettle"
     ShouldSucceed = $true
     OutputMustMatch = @(
-      'Double free of `p` \(already freed at line \d+\)',
-      'Use of `p` after it was freed',
-      'Global `STASH` is assigned the address of stack local `slot`',
-      '`scratch` is allocated here but never freed',
-      '`p` is null here \(assigned at line \d+ and never reassigned\)',
-      'Shift by 32 on a 32-bit value',
-      '`p` points at the constant address 64'
+      # each finding reports under its own M-code, not the generic E0003, so
+      # `mettle explain M0102` works on the diagnostic in front of the reader
+      'warning\[M0102\]: Double free of `p` \(already freed at line \d+\)',
+      'warning\[M0101\]: Use of `p` after it was freed',
+      'warning\[M0104\]: Global `STASH` is assigned the address of stack local `slot`',
+      'warning\[M0107\]: `scratch` is allocated here but never freed',
+      'warning\[M0113\]: `p` is null here \(assigned at line \d+ and never reassigned\)',
+      'warning\[M0115\]: Shift by 32 on a 32-bit value',
+      'warning\[M0114\]: `p` points at the constant address 64'
     )
     OutputMustNotMatch = @(
       'Use of `scratch`',

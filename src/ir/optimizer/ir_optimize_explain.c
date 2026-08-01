@@ -235,6 +235,7 @@ static MTLC_THREAD_LOCAL size_t g_backend_capacity = 0;
 typedef struct {
   int severity; /* 0 = warning, 1 = error */
   size_t line;
+  char *code; /* stable finding id (M0101..), may be NULL */
   char *headline;
   char *fix; /* may be NULL */
 } IRExplainMemNote;
@@ -348,7 +349,8 @@ void ir_explain_memory_set_collect(int enabled, const char *focus_file) {
 }
 
 void ir_explain_memory_note(const char *file, int severity, size_t line,
-                            const char *headline, const char *fix) {
+                            const char *code, const char *headline,
+                            const char *fix) {
   if (!g_mem_collect || !headline) {
     return;
   }
@@ -370,6 +372,7 @@ void ir_explain_memory_note(const char *file, int severity, size_t line,
   IRExplainMemNote *n = &g_mem[g_mem_count++];
   n->severity = severity ? 1 : 0;
   n->line = line;
+  n->code = code ? strdup(code) : NULL;
   n->headline = strdup(headline);
   n->fix = fix ? strdup(fix) : NULL;
 }
@@ -1886,7 +1889,9 @@ static void ir_explain_memory_flush(void) {
       const IRExplainMemNote *n = &g_mem[i];
       ir_explain_json_raw("%s{\"severity\":", i ? "," : "");
       ir_explain_json_str(n->severity ? "error" : "warning");
-      ir_explain_json_raw(",\"line\":%zu,\"headline\":", n->line);
+      ir_explain_json_raw(",\"line\":%zu,\"code\":", n->line);
+      ir_explain_json_str(n->code);
+      ir_explain_json_raw(",\"headline\":");
       ir_explain_json_str(n->headline);
       ir_explain_json_raw(",\"fix\":");
       ir_explain_json_str(n->fix);
@@ -1917,10 +1922,15 @@ static void ir_explain_memory_flush(void) {
                   warnings, warnings == 1 ? "" : "s");
   for (size_t i = 0; i < g_mem_count; i++) {
     const IRExplainMemNote *n = &g_mem[i];
-    ir_explain_emit("  %s%s%s (line %zu): %s\n",
+    char code_tag[32] = "";
+    if (n->code) {
+      snprintf(code_tag, sizeof(code_tag), "  %s[%s]%s", clr(EXPLAIN_DIM),
+               n->code, clr(EXPLAIN_RESET));
+    }
+    ir_explain_emit("  %s%s%s (line %zu): %s%s\n",
                     clr(n->severity ? EXPLAIN_RED : EXPLAIN_BOLD),
                     n->severity ? "error" : "warning", clr(EXPLAIN_RESET),
-                    n->line, n->headline);
+                    n->line, n->headline, code_tag);
     ir_explain_echo_source(n->line);
     if (n->fix) {
       ir_explain_emit("      %s%s fix: %s%s\n", clr(EXPLAIN_DIM), glyph_elbow(),
@@ -2659,6 +2669,7 @@ void ir_explain_finalize(int force_stderr) {
   g_json_cap = 0;
 
   for (size_t i = 0; i < g_mem_count; i++) {
+    free(g_mem[i].code);
     free(g_mem[i].headline);
     free(g_mem[i].fix);
   }

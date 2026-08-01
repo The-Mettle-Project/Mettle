@@ -102,6 +102,10 @@ static int error_reporter_should_use_color(void) {
   return cached;
 }
 
+/* The code a diagnostic reports under: its own, when an analysis stamped a
+   finer one (the memory checker's M0101..M0112), otherwise its type's. */
+static const char *error_report_code(const ErrorReport *error);
+
 /* Return the short error-code string for an ErrorType */
 static const char *error_type_code(ErrorType type) {
   switch (type) {
@@ -114,6 +118,13 @@ static const char *error_type_code(ErrorType type) {
   case ERROR_INTERNAL: return ERROR_CODE_INTERNAL;
   default:             return "E????";
   }
+}
+
+static const char *error_report_code(const ErrorReport *error) {
+  if (error->code_override && error->code_override[0]) {
+    return error->code_override;
+  }
+  return error_type_code(error->type);
 }
 
 static size_t error_reporter_count_digits(size_t n) {
@@ -178,6 +189,7 @@ void error_reporter_destroy(ErrorReporter *reporter) {
     free(reporter->errors[i].suggestion);
     free(reporter->errors[i].code_snippet);
     free(reporter->errors[i].span_label);
+    free(reporter->errors[i].code_override);
   }
 
   for (size_t i = 0; i < reporter->source_count; i++) {
@@ -380,6 +392,7 @@ static void error_reporter_add_report(ErrorReporter *reporter,
   error->code_snippet =
       error_reporter_get_line_from_source(source_code, span.line);
   error->span_label = NULL;
+  error->code_override = NULL;
 
   reporter->count++;
 }
@@ -443,6 +456,15 @@ void error_reporter_set_last_label(ErrorReporter *reporter, const char *label) {
   ErrorReport *last = &reporter->errors[reporter->count - 1];
   free(last->span_label);
   last->span_label = mettle_strdup(label);
+}
+
+void error_reporter_set_last_code(ErrorReporter *reporter, const char *code) {
+  if (!reporter || !code || reporter->count == 0 ||
+      reporter->last_add_suppressed)
+    return;
+  ErrorReport *last = &reporter->errors[reporter->count - 1];
+  free(last->code_override);
+  last->code_override = mettle_strdup(code);
 }
 
 void error_reporter_add_note_of_span(ErrorReporter *reporter, SourceSpan span,
@@ -534,7 +556,7 @@ static void error_reporter_print_errors_json(ErrorReporter *reporter) {
     if (e->severity == DIAG_SEVERITY_NOTE_OF)
       continue;
     fprintf(DIAG_STREAM, "{\"severity\":\"%s\",\"code\":\"%s\",\"message\":",
-            severity_json_name(e->severity), error_type_code(e->type));
+            severity_json_name(e->severity), error_report_code(e));
     diag_json_string(e->message);
     fprintf(DIAG_STREAM, ",\"file\":");
     diag_json_string(e->filename ? e->filename : "");
@@ -639,7 +661,7 @@ void error_reporter_print_errors(ErrorReporter *reporter) {
       if (reporter->errors[i].severity == DIAG_SEVERITY_ERROR) {
         fprintf(DIAG_STREAM,
                 "%shelp%s: for more about this error, run `mettle explain %s`\n",
-                cyan, reset, error_type_code(reporter->errors[i].type));
+                cyan, reset, error_report_code(&reporter->errors[i]));
         break;
       }
     }
@@ -712,7 +734,7 @@ void error_reporter_print_error(ErrorReporter *reporter,
   } else {
     fprintf(DIAG_STREAM, "%s%s[%s]%s: %s\n",
             severity_color, severity_text,
-            error_type_code(error->type),
+            error_report_code(error),
             reset, error->message);
   }
 

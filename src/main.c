@@ -495,7 +495,7 @@ static int print_help_topic(const char *program_name, const char *argv0,
       strcmp(topic, "warnings") == 0) {
     printf("diagnostics - compile errors, warnings, and tooling output\n\n");
     printf("  Every diagnostic carries a stable code (E0001..E0007, "
-           "M0101..M0112), a source snippet\n");
+           "M0101..M0117), a source snippet\n");
     printf("  with the offending range underlined, and a help suggestion. The "
            "compiler recovers after\n");
     printf("  errors, so one compile reports every problem in the file.\n\n");

@@ -168,6 +168,47 @@ static const ErrorCodeDoc DOCS[] = {
      "\n"
      "Fix: finish all uses of derived pointers before freeing the base,\n"
      "or free later.\n"},
+    {"M0113", "Dereference of a null pointer",
+     "The pointer was assigned null and never reassigned before this use,\n"
+     "so the dereference traps the moment it runs.\n"
+     "\n"
+     "Fix: assign a real address first, or guard the access:\n"
+     "    if (p != 0) { ... }\n"
+     "\n"
+     "Only reported when the null assignment and the use are provably on\n"
+     "the same path, so this is a fact rather than a suspicion.\n"},
+    {"M0114", "Dereference of an unmapped constant address",
+     "The pointer holds a small integer constant. The low 64K of the\n"
+     "address space is never mapped on any supported platform, so this\n"
+     "dereference faults.\n"
+     "\n"
+     "Usually a placeholder that was never filled in, or an integer that\n"
+     "was cast to a pointer by mistake.\n"},
+    {"M0115", "Shift count at or past the operand width",
+     "Shifting a 32-bit value by 32, or a 64-bit value by 64, does not\n"
+     "produce zero. The hardware masks the count (x86 uses the low 5 or 6\n"
+     "bits), so `x << 32` on an int32 is `x << 0`, which is `x`.\n"
+     "\n"
+     "Fix: shift by less than the width, or widen the operand first:\n"
+     "    var wide: int64 = (int64)x;\n"
+     "    var shifted: int64 = wide << 32;\n"},
+    {"M0116", "Division or modulo by a constant zero",
+     "The divisor is the literal zero, so the operation traps the moment it\n"
+     "executes. This is a hard error: no input can make it work.\n"
+     "\n"
+     "Fix: correct the constant, or guard the divisor when it is meant to\n"
+     "be a variable.\n"},
+    {"M0117", "Loop index runs past the end of the array",
+     "The loop's upper bound and the array's length are both known at\n"
+     "compile time, and the bound is the larger. The final iteration reads\n"
+     "or writes past the end.\n"
+     "\n"
+     "Example:\n"
+     "    var a: int64[8];\n"
+     "    for i in 0..9 { a[i] = i; }   // M0117: valid indexes are 0..7\n"
+     "\n"
+     "Fix: match the bound to the length. Indexes are 0-based, so an array\n"
+     "of 8 runs 0..7 and an off-by-one here is the usual cause.\n"},
 };
 
 /* ---- optimizer decision codes ----------------------------------------------

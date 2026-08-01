@@ -49,7 +49,7 @@ help: for more about this error, run `mettle explain E0003`
   to opt out (`var _x: ...`). Only the main compile unit is checked;
   imported modules stay quiet.
 - `Unreachable code` - a statement follows a `return`/terminator.
-- Memory-safety warnings and errors (`M0101`..`M0112`): use-after-free,
+- Memory-safety warnings and errors (`M0101`..`M0117`): use-after-free,
   double free, leaks, out-of-bounds constant indexing, escaping stack
   addresses, and borrow-checker lifetime findings. See
   [borrow-checker.md](borrow-checker.md). `M0101` and `M0102` also cover the
@@ -90,7 +90,10 @@ Diagnostic codes are stable across compiler versions:
 | E0005 | Scope error |
 | E0006 | I/O error |
 | E0007 | Internal compiler error |
-| M0101..M0112 | Memory-safety findings (`mettle explain list`) |
+| M0101..M0117 | Memory-safety findings (`mettle explain list`) |
+
+A memory finding reports under its own `M` code rather than the generic
+`E0003`, so `mettle explain M0107` works on the diagnostic in front of you.
 
 ## Machine-readable output: `--error-format=json`
 

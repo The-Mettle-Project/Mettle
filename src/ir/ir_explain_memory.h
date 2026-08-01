@@ -27,11 +27,13 @@
 void ir_explain_memory_set_collect(int enabled, const char *focus_file);
 
 /* Record one emitted memory diagnostic. `severity` is 0 for a warning, 1 for
- * an error. `file` is the diagnostic's source file (may be NULL). `headline`
- * is the message; `fix` is the suggested remedy (may be NULL). Strings are
- * copied. No-op unless collection is enabled and the file passes the focus
- * filter. */
+ * an error. `file` is the diagnostic's source file (may be NULL). `code` is
+ * the stable finding id (M0101..), so the report can point at
+ * `mettle explain <code>`; may be NULL. `headline` is the message; `fix` is
+ * the suggested remedy (may be NULL). Strings are copied. No-op unless
+ * collection is enabled and the file passes the focus filter. */
 void ir_explain_memory_note(const char *file, int severity, size_t line,
-                            const char *headline, const char *fix);
+                            const char *code, const char *headline,
+                            const char *fix);
 
 #endif /* IR_EXPLAIN_MEMORY_H */

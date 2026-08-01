@@ -602,6 +602,14 @@ Diagnostic family, from `src/semantic/type_checker_memory.c`:
 | M0110 | Borrowed interior pointer outlives its scope | warning |
 | M0111 | Borrowed pointer invalidated by `realloc` | warning |
 | M0112 | Borrowed pointer invalidated by `free` | warning |
+| M0113 | Dereference of a provably null pointer | warning |
+| M0114 | Dereference of an unmapped constant address | warning |
+| M0115 | Shift count at or past the operand width | warning |
+| M0116 | Division or modulo by a constant zero | **error** |
+| M0117 | Loop index runs past the end of the array | **error** |
+
+Each finding reports under its own code rather than the generic `E0003`, so
+`mettle explain M0107` works from the diagnostic itself.
 
 Set `METTLE_NO_MEM_INTERPROC=1` to disable the interprocedural phase.
 
