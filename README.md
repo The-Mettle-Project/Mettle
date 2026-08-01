@@ -1,5 +1,3 @@
-
-
 <div align="center">
 
 <picture>
@@ -9,60 +7,31 @@
 
 # Mettle
 
-**A from-scratch systems language that compiles straight to native x86-64.**
+**A systems language with its own compiler, all the way down.**
 
-Its own backend, linker, and source-level debugger. No LLVM, no VM, no managed runtime.
+Native x86-64, its own linker, its own source-level debugger, and a CUDA backend.
+No LLVM, no VM, no managed runtime.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 &nbsp;![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-2b6cb0.svg)
-&nbsp;![Codegen](https://img.shields.io/badge/codegen-native%20x86--64-2f855a.svg)
 &nbsp;![Dependencies](https://img.shields.io/badge/dependencies-no%20LLVM%20%C2%B7%20no%20VM-c53030.svg)
-&nbsp;![Backend](https://img.shields.io/badge/backend-libmtlc-2b6cb0.svg)
-&nbsp;![GPU](https://img.shields.io/badge/GPU-CUDA%20%2F%20PTX-805ad5.svg)
-
-[**Documentation**](docs/LANGUAGE.md)
-&nbsp;·&nbsp; [**Install**](#install)
-&nbsp;·&nbsp; [**Examples**](examples/)
-&nbsp;·&nbsp; [**GitHub**](https://github.com/The-Mettle-Project/Mettle)
-&nbsp;·&nbsp; [**Releases**](https://github.com/The-Mettle-Project/Mettle/releases)
 
 </div>
 
 ---
 
-Mettle compiles `.mettle` source to native x86-64. On Windows, `mettle --build` produces a PE executable using a built-in linker. On Linux, it produces ELF and links with the system toolchain.
-
-This repository is the language and its compiler frontend. The backend it compiles against is [**libmtlc**](https://github.com/The-Mettle-Project/libmtlc): the IR, the optimizers, code generation, and native linking. Building from source fetches it; see [Build from source](#build-from-source) and [Mettle and libmtlc](docs/mettle-and-libmtlc.md). Installing a release needs nothing extra, because the released compiler already has it linked in.
-
-## Features
-
-- Static types, pointers, structs, enums, closures, and `defer`/`errdefer`
-- Direct calls to C and OS APIs; a bundled stdlib for I/O, memory, math, and more
-- **Compile-time memory diagnostics**: use-after-free, double free, leaks, and dangling pointers caught at compile time, with no annotations. Interprocedural and zero false positives. See [borrow checker](docs/borrow-checker.md).
-- **AVX2 auto-vectorizer** that beats `gcc -O3` on several kernels, plus `@simd` / `@simd!` contracts (vectorize or fail the build)
-- **`--explain`**: the compiler reports every optimization decision, why loops did or didn't vectorize, and flags regressions since your last build. Suggested fixes are verified by simulation before they're printed. `--explain-json` for CI.
-- **Optimization contracts**: `@inline!` and `@noalloc` fail the build with the compiler's reason if the guarantee can't be met
-- **Built-in source-level debugger**: breakpoints, stepping, live variable read/write via `--debug-hooks`. No gdb, no PDB, no DWARF.
-- **GPU offload to NVIDIA**: write `kernel` functions and launch with `dispatch K[grid, block](args)`. Native CUDA/PTX backend, no `nvcc`. See [GPU offload](docs/gpu.md).
-- **Crash forensics**: with `-s`, faults report what the bad address is (null field access, freed heap block, etc.); `--native-heap` catches use-after-free at the faulting instruction
-- Optional Tracy profiling, runtime timing, and debug stack traces
-
-Windows is the most complete target (internal PE linker, Win32 GUI via `std/ui`). Linux supports builds, a libc-backed stdlib, and compiler development. See [known limitations](docs/known-limitations.md).
-
 ## Example
-
-Save as `hello.mettle`:
 
 ```mettle
 import "std/io";
 
 fn fib(n: int32) -> int64 {
-  if (n <= 1) { return n; }
+  if (n <= 1) { return (int64)n; }
   var a: int64 = 0;
   var b: int64 = 1;
   var i: int32 = 2;
   while (i <= n) {
-    var next = a + b;
+    var next: int64 = a + b;
     a = b;
     b = next;
     i = i + 1;
@@ -79,9 +48,12 @@ fn main() -> int32 {
 ```
 
 ```bash
-mettle --build hello.mettle -o hello
-./hello          # Windows: .\hello.exe
+mettle --build hello.mettle
+./hello              # Windows: .\hello.exe
 ```
+
+Types are always written out. Mettle infers no binding types, so every `var`
+carries one.
 
 ## Install
 
@@ -97,99 +69,71 @@ curl -fsSL https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/inst
 irm https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/install.ps1 | iex
 ```
 
-Installs to `~/.mettle` (Linux) or `%LOCALAPPDATA%\Mettle` (Windows) and updates user PATH. No root or admin required. Pin a release with `--version v0.13.0` (Linux) or `-Version v0.13.0` (Windows).
+Installs to `~/.mettle` or `%LOCALAPPDATA%\Mettle` and updates your PATH. No root
+or admin. Pin a version with `--version v0.15.1` (Linux) or `-Version v0.15.1`
+(Windows).
+
+## What it does
+
+**Memory safety without annotations.** A whole-program borrow analyser reports
+use-after-free, double free, leaks, dangling returns, and pointers invalidated
+by `realloc`, at compile time and across function boundaries. You write no
+lifetimes and no ownership markers; it infers everything, and it is built to
+report nothing it cannot prove. See [the borrow analyser](docs/borrow-checker.md).
+
+**An optimizer that explains itself.** `--explain` prints what the optimizer did
+to every loop and call, why a loop did or did not vectorize, and what changed
+since your last build. Suggested fixes are simulated before they are printed, so
+a suggestion has already been shown to work. `--explain-json` for CI.
+
+**Contracts that fail the build.** `@simd!` requires a loop to vectorize,
+`@inline!` requires every call site to inline, and `@noalloc` requires a proven
+allocation-free call graph. If the compiler cannot deliver one, it stops and
+says which site defeated it.
+
+**An AVX2 auto-vectorizer** covering reductions, maps, dot products, byte and
+quantized-integer kernels, and some serial recurrences. It beats `gcc -O3` on
+several kernels in the benchmark suite.
+
+**GPU offload to NVIDIA**, straight to PTX with no `nvcc` and no CUDA runtime.
+Write `kernel` functions, declare them host-side, and launch:
+
+```mettle
+extern kernel(block = 256) vadd(a: float32*, b: float32*, c: float32*, n: int32);
+
+dispatch vadd[work: n](da, db, dc, n);
+```
+
+Arguments are type-checked against the declaration, the grid is computed from the
+declared block, and the launch handle resolves by name. Also: subgroup
+collectives, atomics, tensor-core operations, kernel-side `printf`, and a
+compile-time occupancy report. See [GPU offload](docs/gpu.md).
+
+**A debugger with no external format.** Breakpoints, stepping, and live variable
+read and write over `--debug-hooks`. No gdb, no PDB, no DWARF.
+
+**Compile-time execution.** `@test` functions run in the compiler's interpreter
+via `mettle test`, with no binary produced. `mettle trace` interprets one
+function and prints a line-by-line value trace. `--pgo` interprets `main()` at
+build time and feeds the measured call frequencies back into the optimizer.
+
+**Crash forensics.** With `-s`, a fault reports what the bad address actually was
+(a null field access, a freed heap block) instead of an address.
+`--native-heap` catches use-after-free at the faulting instruction.
+
+Windows is the most complete target: internal PE linker, Win32 GUI through
+`std/ui`. Linux builds, links against libc, and is fully supported for compiler
+development. See [known limitations](docs/known-limitations.md).
 
 ## Build from source
 
-Mettle needs [libmtlc](https://github.com/The-Mettle-Project/libmtlc), its
-compiler backend. One command fetches the pinned revision and builds it; after
-that the build is offline.
+Mettle compiles against [libmtlc](https://github.com/The-Mettle-Project/libmtlc),
+its backend: the IR, the optimizers, code generation, and native linking. One
+command fetches the pinned revision and builds it; after that the build is
+offline. Installing a release needs none of this, because the released compiler
+already has the backend linked in.
 
 **Windows** (gcc or clang):
-
-```powershell
-.\get-libmtlc.ps1    # fetch + build the backend into .\libmtlc
-.\build.bat          # default: gcc
-.\build.bat clang
-```
-
-**Linux / macOS**:
-
-```bash
-./get-libmtlc.sh     # fetch + build the backend into ./libmtlc
-make                 # bin/mettle + bundled stdlib/ and runtime/
-make install         # optional: /usr/local/bin, stdlib, runtime
-```
-
-The revision is pinned in [`libmtlc.version`](libmtlc.version). Already have a
-libmtlc checkout? Point at it and skip the download:
-
-```bash
-make LIBMTLC_DIR=../libmtlc
-```
-
-Typical release build:
-
-```bash
-./bin/mettle --build --release hello.mettle -o hello
-```
-
-Common flags: `--release` / `-O`, `--explain`, `--debug-hooks`, `-d` / `-s` / `-g`, `--native-heap`. Full list: `mettle --help`.
-
-## Documentation
-
-- [Language reference](docs/LANGUAGE.md)
-- [Borrow checker](docs/borrow-checker.md)
-- [Control flow](docs/control-flow.md)
-- [GPU offload](docs/gpu.md)
-- [Compilation](docs/compilation.md)
-- [Imports](docs/imports.md)
-- [Runtime model](docs/runtime-model.md)
-- [Standard library](docs/standard-library.md)
-- [C interop](docs/c-interop.md)
-- [Known limitations](docs/known-limitations.md)
-- [Mettle and libmtlc](docs/mettle-and-libmtlc.md) — the frontend/backend boundary
-
-`mettle docs` prints paths to these files next to the compiler binary.
-
-## Repository layout
-
-```
-src/lexer/      lexer
-src/parser/     parser and AST
-src/semantic/   imports, monomorphization, type checking, memory safety
-src/ir/         AST to IR lowering (the IR itself is libmtlc's)
-src/frontend/   adapters from Mettle types onto the backend's
-src/main.c      the compiler driver
-src/runtime/    optional helper objects (crash traces, atomics, ...)
-stdlib/         standard library
-tests/          regression tests; run_tests.ps1 on Windows
-examples/       benchmarks and demos
-tools/          ELF tests, benchmarks, fuzz scripts, upstream sync
-docs/           language and tooling reference
-libmtlc/        the backend dependency (fetched, gitignored)
-```
-
-The editor extensions are not here either: they live in
-[MettleMisc](https://github.com/The-Mettle-Project/MettleMisc), which versions
-on its own schedule and which neither the build nor the test suite depends on.
-
-The optimizers, code generators and linkers are not here. They are in
-[libmtlc](https://github.com/The-Mettle-Project/libmtlc), which is upstream of
-this repository: both halves are developed there, and `tools/sync-from-libmtlc.ps1`
-brings the Mettle half back over.
-
-## Examples and benchmarks
-
-Runnable samples live under [examples/](examples/). Benchmark suites pair Mettle, C, and Rust:
-
-```powershell
-.\tools\benchmark\run-benchmarks.ps1
-```
-
-## Development
-
-**Windows** (primary CI: full test suite):
 
 ```powershell
 .\get-libmtlc.ps1
@@ -197,7 +141,7 @@ Runnable samples live under [examples/](examples/). Benchmark suites pair Mettle
 .\tests\run_tests.ps1
 ```
 
-**Linux** (native ELF backend):
+**Linux**:
 
 ```bash
 ./get-libmtlc.sh
@@ -205,22 +149,30 @@ make -j"$(nproc)"
 bash tools/test-elf-native.sh
 ```
 
-Working on the backend at the same time? Build against your checkout instead of
-the pinned download, and both halves rebuild together:
+The revision is pinned in [`libmtlc.version`](libmtlc.version). To work on both
+halves at once, build against a checkout instead of the download and they rebuild
+together:
 
 ```powershell
-$env:LIBMTLC_DIR = "..\libmtlc"
-.\build.bat
+$env:LIBMTLC_DIR = "..\libmtlc"    # Linux: make LIBMTLC_DIR=../libmtlc
 ```
 
 See [Mettle and libmtlc](docs/mettle-and-libmtlc.md) for the boundary, the
-include-path rules, and how to sync frontend changes back from upstream.
+include-path rules, and how frontend changes sync back from upstream.
 
-## Editor support
 
-The editor extensions live in their own project, [MettleMisc](https://github.com/The-Mettle-Project/MettleMisc): `mettle-syntax` for VS Code and Cursor, and `clion-plugin` for CLion and the rest of the IntelliJ family.
+Two things are deliberately elsewhere. The optimizers, code generators and
+linkers live in [libmtlc](https://github.com/The-Mettle-Project/libmtlc), which
+is upstream of this repository.
 
-The VS Code extension turns the editor into a full Mettle IDE: debugging on F5, go to definition, rename, completion, an interactive `--explain` dashboard, and compiler-backed diagnostics. Everything runs against the compiler in your workspace; no separate language server.
+## Examples and benchmarks
+
+Runnable samples live in [examples/](examples/). The benchmark suites pair
+Mettle against C:
+
+```powershell
+.\tools\benchmark\run-benchmarks.ps1
+```
 
 ## License
 
