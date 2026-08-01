@@ -696,6 +696,26 @@ $cases = @(
     )
   },
   @{
+    # The outer loop of a nest is not a missed optimization: only innermost
+    # loops vectorize, so its remark points at the inner loop's problem rather
+    # than being a second one. It still gets a remark, and it must not raise
+    # the count "where to start" quotes -- with nothing but outer-of-nest
+    # selected there is no triage block at all.
+    Name          = "explain_nest_not_a_miss"
+    Path          = "tests/explain_demo.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--explain=outer-of-nest")
+    Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
+    OutputMustMatch = @(
+      'matvec \(loop @ line \d+\): NOT vectorized  \[outer-of-nest\]',
+      'only innermost loops are vectorized'
+    )
+    OutputMustNotMatch = @(
+      'where to start',
+      'missed optimization'
+    )
+  },
+  @{
     # A selector nobody can satisfy says what the selectors are instead of
     # printing an empty section.
     Name          = "explain_selector_unknown"

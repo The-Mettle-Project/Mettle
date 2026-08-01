@@ -1715,9 +1715,14 @@ static void ir_explain_print_header(const char *what) {
 
 #define IR_EXPLAIN_START_MAX 5
 
-/* Copy `text` into `out`, cut at `width` on a word boundary with an ellipsis.
- * The full sentence is a few lines below in the report, so this is a signpost
- * rather than a summary. */
+/* Copy `text` into `out`, cut at `width` with an ellipsis. The full sentence is
+ * a few lines below in the report, so this is a signpost rather than a summary.
+ *
+ * A fix line is usually an imperative clause followed by a parenthesised
+ * example, and cutting inside the example leaves a fragment that reads as
+ * damage ("... (e.g. `var row: float32* = ..."). So: drop the whole example
+ * when the clause before it still carries the instruction, and otherwise fall
+ * back to a word boundary. */
 static void ir_explain_fit(const char *text, size_t width, char *out,
                            size_t cap) {
   if (!text) {
@@ -1729,12 +1734,36 @@ static void ir_explain_fit(const char *text, size_t width, char *out,
     snprintf(out, cap, "%s", text);
     return;
   }
-  size_t cut = width;
-  while (cut > width / 2 && text[cut] != ' ') {
-    cut--;
+
+  /* An open parenthesis at the cut means the cut lands inside an example. */
+  size_t depth = 0, opened_at = 0;
+  int inside = 0;
+  for (size_t i = 0; i < width; i++) {
+    if (text[i] == '(') {
+      if (depth++ == 0) {
+        opened_at = i;
+        inside = 1;
+      }
+    } else if (text[i] == ')' && depth > 0) {
+      if (--depth == 0) {
+        inside = 0;
+      }
+    }
   }
-  if (text[cut] != ' ') {
-    cut = width;
+
+  size_t cut = width;
+  if (inside && opened_at > width / 2) {
+    cut = opened_at; /* keep the clause, drop the example */
+    while (cut > 0 && text[cut - 1] == ' ') {
+      cut--;
+    }
+  } else {
+    while (cut > width / 2 && text[cut] != ' ') {
+      cut--;
+    }
+    if (text[cut] != ' ') {
+      cut = width;
+    }
   }
   memcpy(out, text, cut);
   snprintf(out + cut, cap - cut, " ...");
@@ -1752,6 +1781,13 @@ static size_t ir_explain_rank_fixes(int apply_filter, size_t *order,
   for (size_t i = 0; i < g_remark_count; i++) {
     const IRExplainRemark *r = &g_remarks[i];
     if (r->positive || (apply_filter && !ir_explain_remark_selected(r))) {
+      continue;
+    }
+    /* The outer loop of a nest is never a missed optimization: only
+     * innermost loops vectorize, so its remark is a signpost to the inner
+     * loop's problem, not a second problem. Counting it turns one finding
+     * into "1 of 2" and reads as though something else went wrong. */
+    if (r->code && strcmp(r->code, "outer-of-nest") == 0) {
       continue;
     }
     missed++;

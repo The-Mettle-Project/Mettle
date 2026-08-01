@@ -949,11 +949,23 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
     IR_SIMD_SET_DIAG(IR_SIMD_BAIL_STORE_ONLY_FILL);
     return;
   }
-  snprintf(reason, reason_cap, "no vectorizer recognized this loop's shape");
+  /* Reaching here means every disqualifier above was checked and none held,
+   * so the honest statement is that no recognizer claimed the loop, not a
+   * guess at which requirement it missed.
+   *
+   * "by the time the vectorizers ran" is load-bearing. The report quotes the
+   * source line right above this, and that line may still show a call the
+   * inliner has since removed; without the qualifier the sentence reads as a
+   * denial of what the reader can see. */
+  snprintf(reason, reason_cap,
+           "no vectorizer recognized this loop's shape: by the time the "
+           "vectorizers ran, its body had no call, branch, unsupported "
+           "element width or carried dependence left to blame");
   snprintf(fix, fix_cap,
-           "vectorizable shapes are unit-stride accesses (a[i], not a[i*k]) "
-           "over int8/int32/float32/float64 with a straight-line body: maps "
-           "(a[i] = expr), '+' reductions (s = s + expr), and dot products");
+           "compare the loop against the shapes that do vectorize: "
+           "unit-stride `a[i]` (not `a[i*k]`) over int8/int32/float32/float64, "
+           "a straight-line body, and one of a map (`a[i] = expr`), a '+' "
+           "reduction (`s = s + expr`), or a dot product");
 }
 
 /* ---- fix hypothesis simulation ---------------------------------------------
