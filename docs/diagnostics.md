@@ -68,10 +68,11 @@ $ mettle explain dot-shape-address    # an --explain decision code
 $ mettle explain list                 # index of every code
 ```
 
-The lookup is forgiving: it folds case, treats `_` and `-` alike, strips
-brackets and backticks so a code pasted out of a report works, matches a
-substring (`mettle explain dot` finds `dot-shape-address`), and suggests the
-nearest code on a typo.
+The lookup is forgiving: it folds case, treats `_` and `-` alike, and strips
+brackets and backticks so a code pasted out of a report works. A fragment
+resolves when it is unique (`mettle explain dot` prints `dot-shape-address`)
+and lists the candidates when it is not (`mettle explain budget` shows both
+budget refusals). A typo gets the nearest code.
 
 Two families of code share the command. Diagnostic codes name a compile error
 or warning. Decision codes name an optimizer verdict: the `--explain` report

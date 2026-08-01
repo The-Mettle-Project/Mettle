@@ -693,6 +693,40 @@ static int code_equal_fold(const char *a, const char *b) {
   return *a == '\0' && *b == '\0';
 }
 
+/* Does `code` contain `fragment`, ignoring case and treating '_' as '-'? */
+static int code_contains_fold(const char *code, const char *fragment) {
+  size_t n = strlen(fragment);
+  size_t len = strlen(code);
+  if (n == 0 || n > len) {
+    return 0;
+  }
+  for (size_t start = 0; start + n <= len; start++) {
+    size_t k = 0;
+    for (; k < n; k++) {
+      char a = code[start + k], b = fragment[k];
+      if (a >= 'A' && a <= 'Z') {
+        a = (char)(a - 'A' + 'a');
+      }
+      if (b >= 'A' && b <= 'Z') {
+        b = (char)(b - 'A' + 'a');
+      }
+      if (a == '_') {
+        a = '-';
+      }
+      if (b == '_') {
+        b = '-';
+      }
+      if (a != b) {
+        break;
+      }
+    }
+    if (k == n) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 /* Edit distance, capped at a small band: the suggestion is only worth making
  * when the input is close, so anything past `limit` returns limit + 1. */
 static size_t edit_distance(const char *a, const char *b, size_t limit) {
@@ -730,17 +764,11 @@ static size_t edit_distance(const char *a, const char *b, size_t limit) {
   return row[lb];
 }
 
-/* The closest known code to `code`, or NULL when nothing is close enough.
- * Substring hits win outright, so `explain dot` finds `dot-shape-address`. */
+/* The closest known code to `code`, or NULL when nothing is close enough. */
 static const char *nearest_code(const char *code) {
   const char *best = NULL;
   size_t best_distance = 4; /* anything further away is not a typo */
 
-  for (size_t i = 0; i < DECISIONS_COUNT; i++) {
-    if (strlen(code) >= 3 && strstr(DECISIONS[i].code, code)) {
-      return DECISIONS[i].code;
-    }
-  }
   for (size_t i = 0; i < DECISIONS_COUNT; i++) {
     size_t d = edit_distance(code, DECISIONS[i].code, best_distance);
     if (d < best_distance) {
@@ -779,6 +807,35 @@ int mettle_explain_error_code(const char *code) {
       printf("%s: %s\n", DECISIONS[i].code, DECISIONS[i].title);
       printf("(%s, reported by --explain)\n\n%s",
              decision_group_title(DECISIONS[i].group), DECISIONS[i].body);
+      return 0;
+    }
+  }
+
+  /* A fragment of a code, which is what anyone types when they remember the
+   * distinctive half of it. One hit resolves; several list, since guessing
+   * between them would be worse than showing the choice. */
+  if (strlen(normalized) >= 3) {
+    const DecisionDoc *only = NULL;
+    size_t hits = 0;
+    for (size_t i = 0; i < DECISIONS_COUNT; i++) {
+      if (code_contains_fold(DECISIONS[i].code, normalized)) {
+        only = &DECISIONS[i];
+        hits++;
+      }
+    }
+    if (hits == 1) {
+      printf("%s: %s\n", only->code, only->title);
+      printf("(%s, reported by --explain)\n\n%s",
+             decision_group_title(only->group), only->body);
+      return 0;
+    }
+    if (hits > 1) {
+      printf("'%s' matches %zu codes:\n", code, hits);
+      for (size_t i = 0; i < DECISIONS_COUNT; i++) {
+        if (code_contains_fold(DECISIONS[i].code, normalized)) {
+          printf("  %-22s %s\n", DECISIONS[i].code, DECISIONS[i].title);
+        }
+      }
       return 0;
     }
   }
