@@ -59,16 +59,27 @@ help: for more about this error, run `mettle explain E0003`
 
 ## `mettle explain <CODE>`
 
-Extended documentation for any diagnostic code, with an example and how to
-fix it:
+Extended documentation for any code, with an example and how to fix it:
 
 ```
 $ mettle explain E0004
 $ mettle explain M0103
-$ mettle explain list      # index of every code
+$ mettle explain dot-shape-address    # an --explain decision code
+$ mettle explain list                 # index of every code
 ```
 
-Codes are stable across compiler versions:
+The lookup is forgiving: it folds case, treats `_` and `-` alike, strips
+brackets and backticks so a code pasted out of a report works, matches a
+substring (`mettle explain dot` finds `dot-shape-address`), and suggests the
+nearest code on a typo.
+
+Two families of code share the command. Diagnostic codes name a compile error
+or warning. Decision codes name an optimizer verdict: the `--explain` report
+prints one in brackets after every line, and `--explain-json` carries the same
+string in its `code` field. See [The `--explain-json` schema](explain-json.md)
+for the full list.
+
+Diagnostic codes are stable across compiler versions:
 
 | Code | Meaning |
 |------|---------|
@@ -108,7 +119,9 @@ Windows consoles get VT sequences enabled automatically.
 ## Related tooling
 
 - `--explain` / `--explain-json` - optimization decision report (what
-  vectorized/inlined and why not).
+  vectorized/inlined and why not). `--explain=SELECTOR` narrows the prose to
+  `missed`, `fixable`, `proven`, `loops`, `calls`, one function, or one
+  decision code.
 - `--annotate-asm`, `--annotate-lines=A-B` - codegen provenance.
 - Compile-time memory diagnostics run automatically; disable interprocedural
   analysis with `METTLE_NO_MEM_INTERPROC=1`.

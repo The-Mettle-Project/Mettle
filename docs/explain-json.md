@@ -63,6 +63,11 @@ One entry per decision the optimizer made.
 
 ### Decision ids
 
+Every id has a page of its own. `mettle explain <id>` prints what the compiler saw, whether it
+is a gap in the compiler or a fact about the code, and what to change. `mettle explain list`
+indexes them. The prose report prints the id in brackets after each verdict, so the line and its
+long form are one command apart.
+
 Vectorization refusals use the analyzer's own diagnosis ids:
 
 `call-in-body`, `extern-call-in-body`, `indirect-call`, `alloc-in-body`, `inline-asm`,
@@ -71,9 +76,9 @@ Vectorization refusals use the analyzer's own diagnosis ids:
 `body-local`, `dot-shape-address`, `store-only-fill`, `unrecognized-shape`
 
 Inlining refusals: `callee-no-body`, `callee-noinline`, `callee-denylisted`,
-`too-many-parameters`, `callee-parameter-names`, `callee-over-budget`, `callee-inline-asm`,
-`callee-has-loop`, `callee-no-return`, `callee-has-kernel`, `recursive`, `caller-over-budget`,
-`argument-count`, `rounds-exhausted`
+`too-many-parameters`, `callee-parameter-names`, `callee-over-budget`, `callee-call-count`,
+`callee-inline-asm`, `callee-has-loop`, `callee-no-return`, `callee-has-kernel`, `recursive`,
+`caller-over-budget`, `argument-count`, `rounds-exhausted`
 
 Positive outcomes: `vectorized`, `vectorized-inner`, `outer-of-nest`, `eliminated`, `inlined`,
 `unrolled`, `hoisted`, `if-converted`, `prefetched`, `layout-optimized`, `noalloc-verified`

@@ -31,7 +31,7 @@ Available topics: `build`, `runtime` (aliases `heap`, `gc`), `interop`, `stdlib`
 
 ## Options
 
-`-o <file>` output object file (default `output.obj` / `output.o`, or executable path when used with `--build`). `-i <file>` input file (alternative to positional argument). `-I <dir>` add import search directory (repeatable). `--stdlib <dir>` set stdlib root (default auto-detects bundled stdlib near the compiler binary, then falls back to `./stdlib`). `--build` build a native executable: Windows uses a COFF object + the internal PE linker by default; Linux emits an ELF object and links it with `gcc -no-pie`. `--static` adds static Linux linking, and `--musl` uses `musl-gcc -static`. `--emit-obj` emit a native object (the default). `--linker <internal|auto|gcc|msvc>` choose the Windows linker path (**default: `internal`**). `--link-arg <arg>` pass an extra linker argument in `--build` mode for additional DLLs/import libraries. `--tracy` link `std/tracy` with the Tracy profiler (requires `--build`; set `TRACY_DIR` or `--tracy-dir`). `--tracy-dir <dir>` Tracy repo root for `--tracy`. `--prelude` auto-import `std/prelude` (std/io, std/math, std/conv, std/mem, std/process, std/net). `-d`/`--debug` debug mode and embedded runtime crash traceback support. `-g`/`--debug-symbols` generate debug symbols. `-l`/`--line-mapping` source line mapping. `-s`/`--stack-trace` embeds runtime crash traceback support without the rest of debug mode. `-O`/`--optimize` enable optimizations. `-r`/`--release` enables `-O`, removes unreachable functions, and disables generated runtime null/bounds checks in IR lowering. `--profile-runtime` emit function-level runtime timing hooks and print a sorted report at process exit. `--emit-ptx` compile each function to an NVIDIA PTX `.entry` (the GPU backend) instead of a native object; see [GPU Offload](gpu.md). `--emit-spirv` compile each function to a SPIR-V `Kernel` entry point (OpenCL 2.0 environment) instead of a native object; see [GPU Offload](gpu.md). `--simd-report` (with `-O`/`--release`) print a note for every `@simd` loop saying whether it vectorized and into which kernel. `--explain` (with `-O`/`--release`) print a grouped optimization report for the main input file. Per loop: vectorized (into which instruction-level kernel, e.g. `vfmadd231ps, 8-wide float32`) or `NOT vectorized` with a `└ reason:` and, when actionable, a `└ fix:` line; per call: inlined or not, with the same reason/fix treatment; loop nests are summarized (`vectorized inner, scalar outer`); a final backend section shows which functions got the register-allocating backend vs baseline codegen and why. No annotations required; remarks from imported modules are filtered out. `-h`/`--help` print usage. See [Imports](imports.md) for path resolution and `-I`/`--stdlib` details.
+`-o <file>` output object file (default `output.obj` / `output.o`, or executable path when used with `--build`). `-i <file>` input file (alternative to positional argument). `-I <dir>` add import search directory (repeatable). `--stdlib <dir>` set stdlib root (default auto-detects bundled stdlib near the compiler binary, then falls back to `./stdlib`). `--build` build a native executable: Windows uses a COFF object + the internal PE linker by default; Linux emits an ELF object and links it with `gcc -no-pie`. `--static` adds static Linux linking, and `--musl` uses `musl-gcc -static`. `--emit-obj` emit a native object (the default). `--linker <internal|auto|gcc|msvc>` choose the Windows linker path (**default: `internal`**). `--link-arg <arg>` pass an extra linker argument in `--build` mode for additional DLLs/import libraries. `--tracy` link `std/tracy` with the Tracy profiler (requires `--build`; set `TRACY_DIR` or `--tracy-dir`). `--tracy-dir <dir>` Tracy repo root for `--tracy`. `--prelude` auto-import `std/prelude` (std/io, std/math, std/conv, std/mem, std/process, std/net). `-d`/`--debug` debug mode and embedded runtime crash traceback support. `-g`/`--debug-symbols` generate debug symbols. `-l`/`--line-mapping` source line mapping. `-s`/`--stack-trace` embeds runtime crash traceback support without the rest of debug mode. `-O`/`--optimize` enable optimizations. `-r`/`--release` enables `-O`, removes unreachable functions, and disables generated runtime null/bounds checks in IR lowering. `--profile-runtime` emit function-level runtime timing hooks and print a sorted report at process exit. `--emit-ptx` compile each function to an NVIDIA PTX `.entry` (the GPU backend) instead of a native object; see [GPU Offload](gpu.md). `--emit-spirv` compile each function to a SPIR-V `Kernel` entry point (OpenCL 2.0 environment) instead of a native object; see [GPU Offload](gpu.md). `--simd-report` (with `-O`/`--release`) print a note for every `@simd` loop saying whether it vectorized and into which kernel. `--explain` (with `-O`/`--release`) print a grouped optimization report for the main input file; `--explain=SELECTOR` narrows it to `missed`, `fixable`, `proven`, `loops`, `calls`, one function, or one decision code. Per loop: vectorized (into which instruction-level kernel, e.g. `vfmadd231ps, 8-wide float32`) or `NOT vectorized` with a `└ reason:` and, when actionable, a `└ fix:` line; per call: inlined or not, with the same reason/fix treatment; loop nests are summarized (`vectorized inner, scalar outer`); a final backend section shows which functions got the register-allocating backend vs baseline codegen and why. No annotations required; remarks from imported modules are filtered out. `-h`/`--help` print usage. See [Imports](imports.md) for path resolution and `-I`/`--stdlib` details.
 <!-- Target-qualified device/native modes. -->
 GPU/native target qualification: `--emit-ptx` and `--emit-spirv` emit only
 functions declared with `kernel`; ordinary `fn` declarations are not entry
@@ -236,6 +236,53 @@ The suggestion is scope-aware: only symbols actually reachable from the
 error site are considered. If nothing is close enough, the diagnostic falls
 back to the generic "declare it before using it" guidance, so unrelated
 names never produce a misleading suggestion.
+
+### The `--explain` report
+
+`--explain` (with `-O`/`--release`) prints what the optimizer did to the main
+input file and why. It reads top to bottom in three parts.
+
+**Where to start.** The findings that have a fix, ranked by what the compiler
+can stand behind. A fix marked `proven` was applied to a clone of the function
+and re-checked, so the advice is a result rather than a belief. After that,
+loop depth: the same fix inside a nested loop is worth more.
+
+**The findings**, in source order. One line per decision, tagged with its
+stable decision code, then the source it is about, then the reason, the fix,
+and the proof:
+
+```text
+  where to start (2 of 3 missed optimizations have a fix; "proven" = the compiler applied it to a clone and re-checked):
+    1. proven sum_bytes:27  declare the accumulator as int64
+
+  saxpy (loop @ line 12): vectorized -> vfmadd231ps, 8-wide float32  [vectorized]
+  sum_bytes (loop @ line 27): NOT vectorized  [byte-sum-narrow-acc]
+      27 | for i in 0..n {
+      28 |     total = total + (int32)data[i];
+      \_ reason: this is a byte-sum loop, but the vpsadbw kernel accumulates into int64
+      \_ fix: declare the accumulator as int64
+      \_ verified: simulated that fix and re-ran the optimizer: this loop then vectorizes -> vpsadbw
+```
+
+A loop of five lines or fewer is quoted whole; anything longer shows its first
+line. `mettle explain byte-sum-narrow-acc` prints the paragraph behind the
+bracketed code.
+
+**The memory and backend sections.** Compile-time memory-safety findings, then
+which functions reached the register-allocating backend and what stopped the
+rest.
+
+Two more things the report does on its own. A re-run leads with what changed
+since the last `--explain` build, regressions first, using a baseline written
+beside the output. And a report past 200 lines goes to
+`<output-stem>.explain.txt` with a digest on stderr, so a large program does
+not flood the terminal.
+
+`--explain=SELECTOR` narrows the prose to one slice: `missed` drops the
+successes, `fixable` keeps only what has a fix, `proven` keeps what the
+compiler confirmed, `loops` and `calls` split by kind, and anything else is
+read as a function name and then as a decision code. The JSON sidecar ignores
+the selector and stays whole-file.
 
 ## Runtime Crash Tracebacks
 
