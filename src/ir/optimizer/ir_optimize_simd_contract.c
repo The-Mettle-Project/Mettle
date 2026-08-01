@@ -1572,6 +1572,37 @@ static int ir_simd_mutate_fill_base_pointer(IRFunction *clone, size_t begin,
   return rewrites > 0;
 }
 
+/* Hoist the body's local declaration above the loop header, which is what
+ * "declare it before the loop" does to the instruction stream. A DECLARE_LOCAL
+ * names storage and carries no value (the initializer lowers to a separate
+ * store), so moving it changes nothing the loop computes. */
+static int ir_simd_mutate_hoist_body_local(IRFunction *clone, size_t begin,
+                                           size_t end) {
+  size_t header = 0, decl = 0;
+  for (size_t i = begin + 1; i < end && i < clone->instruction_count; i++) {
+    IRInstruction *ins = &clone->instructions[i];
+    if (ins->op == IR_OP_LABEL) {
+      if (!header && ir_label_is_loop_header(ins->text)) {
+        header = i;
+      }
+      continue;
+    }
+    if (header && ins->op == IR_OP_DECLARE_LOCAL &&
+        ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name) {
+      decl = i;
+      break;
+    }
+  }
+  if (!header || !decl) {
+    return 0;
+  }
+  IRInstruction saved = clone->instructions[decl];
+  memmove(&clone->instructions[header + 1], &clone->instructions[header],
+          (decl - header) * sizeof(IRInstruction));
+  clone->instructions[header] = saved;
+  return 1;
+}
+
 /* The transform table: which diagnoses have a paired fix simulation. Growing
  * the hypothesis engine = adding a mutator and one row here.
  * `inapplicable_fix` (optional) replaces the advice when the mutator returns
@@ -1587,6 +1618,7 @@ static const struct {
     {IR_SIMD_BAIL_INT64_ELEMENTS, ir_simd_mutate_int64_to_i32, NULL},
     {IR_SIMD_BAIL_STORE_ONLY_FILL, ir_simd_mutate_fill_base_pointer, NULL},
     {IR_SIMD_BAIL_MIXED_FLOAT_WIDTHS, ir_simd_mutate_single_float_width, NULL},
+    {IR_SIMD_BAIL_BODY_LOCAL, ir_simd_mutate_hoist_body_local, NULL},
     {IR_SIMD_BAIL_DOT_SHAPE_ADDRESS, ir_simd_mutate_dot_row_pointer,
      "none via hoisting -- re-checked: the index half that is not the loop "
      "counter changes every iteration, so it cannot be hoisted out; this "
@@ -1597,10 +1629,18 @@ static const struct {
  * the real optimization stages (remark recording suppressed), re-locate the
  * loop by marker id (indexes shift), and check whether a kernel claimed it.
  * On success fills `desc` with the kernel description and returns 1; returns
- * IR_SIMD_FIX_INAPPLICABLE when the mutator proved the fix unwritable. */
+ * IR_SIMD_FIX_INAPPLICABLE when the mutator proved the fix unwritable.
+ *
+ * When the fix applied but the loop stayed scalar, the run also holds the
+ * answer to the question the reader asks next: what blocks it NOW. Diagnosing
+ * the mutated clone yields that, and the caller reports the advice as a first
+ * step instead of implying it finishes the job. IR_SIMD_FIX_PARTIAL says
+ * `next_reason` was filled. */
+#define IR_SIMD_FIX_PARTIAL 2
 static int ir_explain_simulate_fix(const IRFunction *function, size_t begin,
                                    size_t end, IRSimdFixMutator mutate,
-                                   char *desc, size_t desc_cap) {
+                                   int diagnosis, char *desc, size_t desc_cap,
+                                   char *next_reason, size_t next_reason_cap) {
   int marker_id = ir_simd_marker_id_at(function, begin);
   if (marker_id < 0) {
     return 0;
@@ -1629,6 +1669,20 @@ static int ir_explain_simulate_fix(const IRFunction *function, size_t begin,
     if (kernel) {
       ir_explain_kernel_desc(kernel, desc, desc_cap);
       verified = 1;
+    } else if (next_reason && next_reason_cap) {
+      int next_diagnosis = IR_SIMD_BAIL_NONE, next_advisory = 0;
+      char scratch[320];
+      ir_simd_explain_bail(clone, new_begin, new_end, next_reason,
+                           next_reason_cap, scratch, sizeof(scratch),
+                           &next_diagnosis, &next_advisory);
+      /* Only a NEW obstacle is worth reporting. The same diagnosis coming back
+       * means the mutator did not move the loop at all, and repeating it as
+       * though it were the next step would send the reader in a circle. */
+      if (next_diagnosis != IR_SIMD_BAIL_NONE && next_diagnosis != diagnosis) {
+        verified = IR_SIMD_FIX_PARTIAL;
+      } else {
+        next_reason[0] = '\0';
+      }
     }
   }
   ir_function_destroy(clone);
@@ -1638,19 +1692,23 @@ static int ir_explain_simulate_fix(const IRFunction *function, size_t begin,
 /* Run the fix simulation paired with `diagnosis`, if any. Returns 1 and fills
  * `desc` when the simulated fix was accepted by the optimizer; returns
  * IR_SIMD_FIX_INAPPLICABLE (and sets *inapplicable_fix_out to the replacement
- * advice) when the mutator proved the suggested fix unwritable. */
+ * advice) when the mutator proved the suggested fix unwritable; returns
+ * IR_SIMD_FIX_PARTIAL (filling `next_reason`/`next_fix`) when the fix applied
+ * cleanly and the loop still did not vectorize. */
 static int ir_explain_try_fix_for_diagnosis(const IRFunction *function,
                                             size_t begin, size_t end,
                                             int diagnosis, char *desc,
                                             size_t desc_cap,
-                                            const char **inapplicable_fix_out) {
+                                            const char **inapplicable_fix_out,
+                                            char *next_reason,
+                                            size_t next_reason_cap) {
   size_t transform_count =
       sizeof(g_simd_fix_transforms) / sizeof(g_simd_fix_transforms[0]);
   for (size_t t = 0; t < transform_count; t++) {
     if ((int)g_simd_fix_transforms[t].diagnosis == diagnosis) {
       int result = ir_explain_simulate_fix(
-          function, begin, end, g_simd_fix_transforms[t].mutate, desc,
-          desc_cap);
+          function, begin, end, g_simd_fix_transforms[t].mutate, diagnosis,
+          desc, desc_cap, next_reason, next_reason_cap);
       if (result == IR_SIMD_FIX_INAPPLICABLE && inapplicable_fix_out) {
         *inapplicable_fix_out = g_simd_fix_transforms[t].inapplicable_fix;
       }
@@ -1952,8 +2010,8 @@ static void ir_explain_report_loops(const IRFunction *function,
        * suggested fix and let the vectorizer itself confirm it. A proven-
        * inapplicable fix is REPLACED, never printed -- bad advice with a
        * confident tone is the failure mode this whole report exists to end. */
-      char verified[512];
-      verified[0] = '\0';
+      char verified[512], partial[512];
+      verified[0] = partial[0] = '\0';
       char kernel_desc[128];
       if (diagnosis == IR_SIMD_BAIL_CALL_IN_BODY) {
         /* Program-level simulation: pretend-@inline the callee, re-run the
@@ -2017,10 +2075,12 @@ static void ir_explain_report_loops(const IRFunction *function,
         }
       } else {
         const char *inapplicable_fix = NULL;
-        int sim = ir_explain_try_fix_for_diagnosis(function, L->begin, L->end,
-                                                   diagnosis, kernel_desc,
-                                                   sizeof(kernel_desc),
-                                                   &inapplicable_fix);
+        char next_reason[320];
+        next_reason[0] = '\0';
+        int sim = ir_explain_try_fix_for_diagnosis(
+            function, L->begin, L->end, diagnosis, kernel_desc,
+            sizeof(kernel_desc), &inapplicable_fix, next_reason,
+            sizeof(next_reason));
         if (sim == 1) {
           snprintf(verified, sizeof(verified),
                    "simulated that fix and re-ran the optimizer: this loop "
@@ -2031,11 +2091,25 @@ static void ir_explain_report_loops(const IRFunction *function,
            * the loop rather than instructing anyone. */
           snprintf(fix, sizeof(fix), "%s", inapplicable_fix);
           advisory = 1;
+        } else if (sim == IR_SIMD_FIX_PARTIAL && next_reason[0]) {
+          /* The fix is right and it is not enough. Saying so, and naming what
+           * surfaces next, beats letting the reader make the edit and find the
+           * verdict unchanged. The next obstacle goes on its own line: spliced
+           * into the fix it buries the one thing to do first. */
+          size_t used = strlen(fix);
+          snprintf(fix + used, sizeof(fix) - used, " (first step only)");
+          snprintf(partial, sizeof(partial),
+                   "re-checked with that change applied: the loop still does "
+                   "not vectorize, because %s",
+                   next_reason);
         }
       }
       ir_explain_remark(function->name, "loop", L->location, 0,
                         "NOT vectorized", reason, fix[0] ? fix : NULL,
                         verified[0] ? verified : NULL);
+      if (partial[0]) {
+        ir_explain_remark_partial(partial);
+      }
       if (advisory) {
         ir_explain_remark_advisory();
       }

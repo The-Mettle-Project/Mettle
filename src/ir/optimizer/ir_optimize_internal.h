@@ -581,6 +581,12 @@ void ir_explain_remark_trivial(void);
  * says the loop is already right, or that the gap belongs to the compiler.
  * The prose labels it "note" instead of "fix", and the triage skips it. */
 void ir_explain_remark_advisory(void);
+/* Mark the last remark's fix as a first step that was simulated, applied
+ * cleanly, and left the loop scalar. `what_still_blocks` is the obstacle that
+ * surfaced next. Distinct from `verified` (the fix finishes the job) and from
+ * silence (nobody checked): the reader learns to expect a second edit before
+ * making the first. */
+void ir_explain_remark_partial(const char *what_still_blocks);
 void ir_explain_remark_quantity(const char *name, long value);
 
 /* A callee this small is a wrapper; inlining it is housekeeping, not a

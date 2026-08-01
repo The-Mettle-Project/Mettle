@@ -55,6 +55,7 @@ One entry per decision the optimizer made.
 | `reason` | Why, when it declined. May be null. |
 | `fix` | What to change. May be null. |
 | `verified` | Set only when the compiler **applied that fix to a clone, re-ran its own optimizer, and confirmed the result**. Never a guess. The kernel it names is the one the edit produces: each simulation is pinned in the test suite against the same loop written by hand. |
+| `stillBlocked` | Set when the compiler applied that fix to a clone and the loop **still** did not vectorize: the text is the obstacle that surfaced next. `fix` remains worth making, and it is not the whole job. Mutually exclusive with `verified`, and shown as `step 1` in the prose plan. |
 | `code` | The stable decision id. See below. |
 | `callee` | For calls, the callee's name. |
 | `depth` | Loop nest depth, 1 for a top-level loop. |

@@ -751,6 +751,25 @@ $cases = @(
     )
   },
   @{
+    # A fix that is correct and not sufficient. The simulation applies it, sees
+    # the loop stay scalar, and reports the obstacle that surfaced next -- so
+    # the caveat reaches the reader before the edit does, in the action plan
+    # ("step 1") as well as in the remark.
+    Name          = "explain_partial_fix"
+    Path          = "tests/explain_partial_fix.mettle"
+    ShouldSucceed = $true
+    Args          = @("-O", "--explain=row_energy")
+    Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
+    OutputMustMatch = @(
+      'step 1 row_energy:13',
+      'fix: declare `value` before the loop.*\(first step only\)',
+      'still blocked: re-checked with that change applied: the loop still does not vectorize'
+    )
+    OutputMustNotMatch = @(
+      'verified:'
+    )
+  },
+  @{
     # A nest that arrives by inlining. The inliner drops `@simd` markers from
     # the copy it makes, so the callee's loop leaves no record and the driver
     # loop reads as a leaf -- which used to make the classifier blame the inner

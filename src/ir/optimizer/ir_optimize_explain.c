@@ -209,6 +209,11 @@ typedef struct {
   char *reason;   /* may be NULL */
   char *fix;      /* may be NULL */
   char *verified; /* may be NULL: the fix was SIMULATED and proven to work */
+  /* May be NULL. The fix was SIMULATED, applied cleanly, and the loop still
+     did not vectorize: what this holds is the obstacle that surfaced next.
+     A fix worth making that does not finish the job on its own, which is a
+     different claim from both "proven" and "unknown". */
+  char *partial;
   char *code;     /* stable id for the decision; may be NULL */
   size_t depth;   /* loop nest depth (1 = top level); 0 = not a loop/unknown */
   int trivial;    /* 1 = routine housekeeping a reader can collapse */
@@ -1201,6 +1206,7 @@ void ir_explain_remark(const char *function_name, const char *entity,
   r->reason = ir_explain_text_dup(reason);
   r->fix = ir_explain_text_dup(fix);
   r->verified = ir_explain_text_dup(verified);
+  r->partial = NULL;
   r->code = NULL;
   r->depth = 0;
   r->trivial = 0;
@@ -1245,6 +1251,14 @@ void ir_explain_remark_advisory(void) {
   IRExplainRemark *r = ir_explain_last_remark();
   if (r) {
     r->advisory = 1;
+  }
+}
+
+void ir_explain_remark_partial(const char *what_still_blocks) {
+  IRExplainRemark *r = ir_explain_last_remark();
+  if (r && what_still_blocks && what_still_blocks[0]) {
+    free(r->partial);
+    r->partial = ir_explain_text_dup(what_still_blocks);
   }
 }
 
@@ -1386,7 +1400,8 @@ static int ir_explain_remarks_groupable(const IRExplainRemark *a,
          ir_explain_str_eq(a->headline, b->headline) &&
          ir_explain_str_eq(a->reason, b->reason) &&
          ir_explain_str_eq(a->fix, b->fix) &&
-         ir_explain_str_eq(a->verified, b->verified);
+         ir_explain_str_eq(a->verified, b->verified) &&
+         ir_explain_str_eq(a->partial, b->partial);
 }
 
 /* The callee name inside a "call to `f`" entity; "?" when unparsable. */
@@ -2001,8 +2016,8 @@ static void ir_explain_render_start_here(void) {
   }
 
   ir_explain_emit("  %swhere to start%s (%zu of %zu missed optimization%s "
-                  "ha%s a fix; \"proven\" = the compiler applied it to a clone "
-                  "and re-checked):\n",
+                  "ha%s a fix; \"proven\" = applied to a clone and re-checked, "
+                  "\"step 1\" = applied and the loop still needs more):\n",
                   clr(EXPLAIN_BOLD), clr(EXPLAIN_RESET), actionable, missed,
                   missed == 1 ? "" : "s", actionable == 1 ? "s" : "ve");
   const IRExplainRemark *lead = &g_remarks[order[0]];
@@ -2020,10 +2035,13 @@ static void ir_explain_render_start_here(void) {
                clr(EXPLAIN_RESET));
     }
     ir_explain_fit(r->fix, sites[i] > 1 ? 66 : 84, fix, sizeof(fix));
+    /* The caveat has to survive the truncation that trims the fix text, or the
+     * plan reads as "do this and you are done" for a fix we know is partial. */
+    const char *status = r->verified ? "proven" : (r->partial ? "step 1" : "");
     ir_explain_emit("    %zu. %s%-6s%s %-*s  %s%s\n", i + 1,
-                    clr(r->verified ? EXPLAIN_GREEN : EXPLAIN_DIM),
-                    r->verified ? "proven" : "", clr(EXPLAIN_RESET),
-                    (int)location_width, location[i], fix, spread);
+                    clr(r->verified ? EXPLAIN_GREEN : EXPLAIN_DIM), status,
+                    clr(EXPLAIN_RESET), (int)location_width, location[i], fix,
+                    spread);
   }
   /* The lines above stand for `covered` findings, not `shown` of them, since
    * each folds its own sites. The remainder is what no line represents. */
@@ -2061,6 +2079,8 @@ static void ir_explain_json_remark(const IRExplainRemark *r, const char *kind,
   ir_explain_json_str(r->fix);
   ir_explain_json_raw(",\"verified\":");
   ir_explain_json_str(r->verified);
+  ir_explain_json_raw(",\"stillBlocked\":");
+  ir_explain_json_str(r->partial);
   ir_explain_json_raw(",\"callee\":");
   ir_explain_json_str(callee);
   if (count > 1) {
@@ -2619,6 +2639,11 @@ void ir_explain_flush(void) {
                               glyph_elbow(), clr(EXPLAIN_GREEN), r->verified,
                               clr(EXPLAIN_RESET));
             }
+            if (r->partial) {
+              ir_explain_emit("      %s%s still blocked: %s%s\n",
+                              clr(EXPLAIN_DIM), glyph_elbow(), r->partial,
+                              clr(EXPLAIN_RESET));
+            }
             ir_explain_emit("      %s%s calls: %s%s\n", clr(EXPLAIN_DIM),
                             glyph_elbow(), callees, clr(EXPLAIN_RESET));
           }
@@ -2664,6 +2689,10 @@ void ir_explain_flush(void) {
           ir_explain_emit("      %s%s verified: %s%s%s\n", clr(EXPLAIN_DIM),
                           glyph_elbow(), clr(EXPLAIN_GREEN), r->verified,
                           clr(EXPLAIN_RESET));
+        }
+        if (r->partial) {
+          ir_explain_emit("      %s%s still blocked: %s%s\n", clr(EXPLAIN_DIM),
+                          glyph_elbow(), r->partial, clr(EXPLAIN_RESET));
         }
       }
       if (r->verified) {
@@ -2751,6 +2780,7 @@ void ir_explain_flush(void) {
       free(g_remarks[i].reason);
       free(g_remarks[i].fix);
       free(g_remarks[i].verified);
+      free(g_remarks[i].partial);
       free(g_remarks[i].code);
       for (size_t q = 0; q < g_remarks[i].quantity_count; q++) {
         free(g_remarks[i].quantities[q].name);
