@@ -2844,6 +2844,15 @@ try {
   if (-not @($json.loops | Where-Object { $_.cyclesPerIter -gt 0 -and $_.bottleneck }).Count) {
     throw "JSON loop costs missing cycles or bottleneck port"
   }
+  # The triage a tool renders as a fix-it panel: same ranking as the prose
+  # "where to start", proven fixes first, and the fix untruncated.
+  $start = @($json.startHere)
+  if ($start.Count -lt 1) { throw "JSON startHere ranking missing" }
+  if (-not $start[0].proven) { throw "JSON startHere should lead with a proven fix" }
+  if (-not $start[0].fix -or -not $start[0].code) { throw "JSON startHere entry incomplete" }
+  if (@($start | Where-Object { $_.proven }).Count -lt 2) {
+    throw "JSON startHere lost the proven fixes"
+  }
   if (@($json.callGraph).Count -lt 1) { throw "JSON call graph missing" }
   if (@($json.hotspots).Count -lt 1) { throw "JSON hotspot ranking missing" }
   $ranked = @($json.hotspots)

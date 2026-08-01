@@ -28,6 +28,7 @@ Two rules the schema keeps:
 | `schema` | Format version. Currently `2`. |
 | `source` | Basename of the focus file. |
 | `changes` | What flipped since the previous explain build of this file. |
+| `startHere` | The top five findings that have a fix, ranked the way the prose report ranks them. |
 | `remarks` | Every optimizer decision: loops, calls, branches, allocations, contracts. |
 | `functions` | One row per function: weight in and out, decisions, backend outcome, cost. |
 | `loops` | What the backend measured about each loop: cycles, bottleneck port, depth. |
@@ -84,6 +85,22 @@ Positive outcomes: `vectorized`, `vectorized-inner`, `outer-of-nest`, `eliminate
 `unrolled`, `hoisted`, `if-converted`, `prefetched`, `layout-optimized`, `noalloc-verified`
 
 A new diagnosis adds an id. It never hides under an existing one.
+
+## `startHere`
+
+Line order answers "what happened". This answers "what do I change", and an editor showing a
+fix-it panel should not have to re-derive the order or guess at the tie-breaks.
+
+| Field | |
+|--|--|
+| `fn`, `line` | Which finding. Join onto `remarks` by (`fn`, `line`). |
+| `code` | Its stable decision id. |
+| `fix` | The full suggestion, untruncated (the prose report cuts it to fit a line). |
+| `proven` | `true` when the compiler applied the fix to a clone, re-ran its own optimizer, and confirmed it. |
+| `depth` | Loop nest depth, the second sort key after `proven`. |
+
+At most five entries, and empty when nothing in the file has a fix. Unlike the prose report, this
+array ignores `--explain=SELECTOR`.
 
 ## `functions`
 

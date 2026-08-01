@@ -1740,13 +1740,18 @@ static void ir_explain_fit(const char *text, size_t width, char *out,
   snprintf(out + cut, cap - cut, " ...");
 }
 
-static void ir_explain_render_start_here(void) {
-  size_t order[IR_EXPLAIN_START_MAX];
+/* Rank the findings that have a fix into `order`, heaviest first, and return
+ * how many entries it holds. `missed_out` counts every missed optimization and
+ * `actionable_out` the subset with a fix. With `apply_filter` the ranking is
+ * over the selected slice only; without it, over the whole file. */
+static size_t ir_explain_rank_fixes(int apply_filter, size_t *order,
+                                    size_t *missed_out,
+                                    size_t *actionable_out) {
   size_t shown = 0, actionable = 0, missed = 0;
 
   for (size_t i = 0; i < g_remark_count; i++) {
     const IRExplainRemark *r = &g_remarks[i];
-    if (r->positive || !ir_explain_remark_selected(r)) {
+    if (r->positive || (apply_filter && !ir_explain_remark_selected(r))) {
       continue;
     }
     missed++;
@@ -1785,8 +1790,49 @@ static void ir_explain_render_start_here(void) {
       shown++;
     }
   }
+  *missed_out = missed;
+  *actionable_out = actionable;
+  return shown;
+}
+
+static void ir_explain_render_start_here(void) {
+  size_t order[IR_EXPLAIN_START_MAX];
+  size_t actionable = 0, missed = 0;
+
+  /* The same ranking, for tools. An editor showing a "what to fix" panel
+   * should not have to re-derive the order from the remark list and guess at
+   * the tie-breaks. Ranked over the whole file, since --explain=SELECTOR
+   * narrows the prose and leaves the sidecar alone. Always emitted, empty when
+   * there is nothing to do, so the document's shape does not vary. */
+  if (g_explain_json) {
+    size_t all_missed = 0, all_actionable = 0;
+    size_t whole = ir_explain_rank_fixes(0, order, &all_missed, &all_actionable);
+    ir_explain_json_raw("\"startHere\":[");
+    for (size_t i = 0; i < whole; i++) {
+      const IRExplainRemark *r = &g_remarks[order[i]];
+      ir_explain_json_raw("%s{\"fn\":", i ? "," : "");
+      ir_explain_json_str(r->function_name);
+      ir_explain_json_raw(",\"line\":%zu,\"code\":", r->line);
+      ir_explain_json_str(r->code);
+      ir_explain_json_raw(",\"fix\":");
+      ir_explain_json_str(r->fix);
+      ir_explain_json_raw(",\"proven\":%s,\"depth\":%zu}",
+                          r->verified ? "true" : "false", r->depth);
+    }
+    ir_explain_json_raw("],");
+  }
+
+  size_t shown = ir_explain_rank_fixes(1, order, &missed, &actionable);
 
   if (shown == 0) {
+    /* Silence is ambiguous: it could mean a clean file or a report that
+     * forgot to say. One line, and only when there was something to miss. */
+    if (missed > 0) {
+      ir_explain_emit("  %s%zu missed optimization%s in this file, none with a "
+                      "fix the compiler can name%s\n\n",
+                      clr(EXPLAIN_DIM), missed, missed == 1 ? "" : "s",
+                      clr(EXPLAIN_RESET));
+    }
     return;
   }
 
