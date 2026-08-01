@@ -1280,6 +1280,51 @@ int ir_explain_has_remark_at(size_t line, const char *entity) {
   return 0;
 }
 
+size_t ir_explain_inlined_calls_in_range(const char *function_name,
+                                         size_t first_line, size_t last_line,
+                                         size_t *callee_line, char *callee_out,
+                                         size_t callee_cap) {
+  size_t hits = 0;
+  if (callee_out && callee_cap) {
+    callee_out[0] = '\0';
+  }
+  if (callee_line) {
+    *callee_line = 0;
+  }
+  for (size_t i = 0; i < g_remark_count; i++) {
+    const IRExplainRemark *r = &g_remarks[i];
+    if (!r->positive || r->line < first_line || r->line > last_line) {
+      continue;
+    }
+    if (!r->function_name || !function_name ||
+        strcmp(r->function_name, function_name) != 0) {
+      continue;
+    }
+    if (!r->code || strcmp(r->code, "inlined") != 0) {
+      continue;
+    }
+    hits++;
+    if (hits > 1) {
+      continue; /* ambiguous: the caller must not name one of several */
+    }
+    if (callee_line) {
+      *callee_line = r->line;
+    }
+    /* The entity reads "call to `name`"; hand back just the name. */
+    const char *open = r->entity ? strchr(r->entity, '`') : NULL;
+    const char *close = open ? strchr(open + 1, '`') : NULL;
+    if (open && close && callee_out && callee_cap) {
+      size_t n = (size_t)(close - open - 1);
+      if (n >= callee_cap) {
+        n = callee_cap - 1;
+      }
+      memcpy(callee_out, open + 1, n);
+      callee_out[n] = '\0';
+    }
+  }
+  return hits;
+}
+
 /* The bracketed decision id that follows a verdict, ready to paste into
  * `mettle explain`. Empty when the pass recorded no id (positive housekeeping
  * remarks mostly), so the line reads exactly as it did before. Two rotating

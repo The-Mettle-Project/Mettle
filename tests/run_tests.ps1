@@ -175,7 +175,7 @@ $cases = @(
     Path          = "tests/err_simd_contract_cf.mettle"
     ShouldSucceed = $false
     Args          = @("-O")
-    Pattern       = "@simd! loop was not vectorized: the loop body has its own control flow"
+    Pattern       = "@simd! loop was not vectorized: the loop body branches on data"
   },
   @{
     # A pointer-deref loop with no user control flow must NOT be misreported as
@@ -748,6 +748,28 @@ $cases = @(
     OutputMustNotMatch = @(
       'where to start',
       'missed optimization'
+    )
+  },
+  @{
+    # A nest that arrives by inlining. The inliner drops `@simd` markers from
+    # the copy it makes, so the callee's loop leaves no record and the driver
+    # loop reads as a leaf -- which used to make the classifier blame the inner
+    # loop's exit test on a data-dependent `if` and prescribe a branchless
+    # rewrite for a body containing no branch. The verdict must be the nest, and
+    # it must name the call that brought the loop in.
+    Name          = "explain_inlined_nest"
+    Path          = "tests/explain_inlined_nest.mettle"
+    ShouldSucceed = $true
+    Args          = @("-O", "--explain=main")
+    Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
+    OutputMustMatch = @(
+      'main \(loop @ line 31\): NOT vectorized  \[outer-of-nest\]',
+      "the call to ``sum_bytes`` on line 32 was inlined, so that callee's loop \(line 13\) now sits in this body",
+      'note: nothing to change on this line'
+    )
+    OutputMustNotMatch = @(
+      'branches on data',
+      'branchless'
     )
   },
   @{

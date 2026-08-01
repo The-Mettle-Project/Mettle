@@ -1,0 +1,39 @@
+import "std/io";
+
+// A driver loop whose body reads as straight-line source but receives a loop
+// through inlining. The `while` below contains no branch the writer wrote; the
+// only branches in its final IR are the exit test and back-edge of `sum_bytes`'
+// own loop, which landed here when the call was inlined. Diagnosing that as a
+// data-dependent `if` (and prescribing a branchless rewrite) is advice about
+// code the reader never wrote, so the report has to name the inlined call.
+
+fn sum_bytes(px: uint8*, n: int32) -> int32 {
+    var total: int32 = 0;
+
+    for i in 0..n {
+        total = total + (int32)px[i];
+    }
+
+    return total;
+}
+
+fn main() -> int32 {
+    var bytes: uint8[128];
+    var p: uint8* = &bytes[0];
+
+    for i in 0..128 {
+        p[i] = (uint8)((i * 17 + 3) % 251);
+    }
+
+    var repeated: int32 = 0;
+    var pass: int32 = 0;
+
+    while (pass < 8) {
+        repeated = repeated + sum_bytes(p, 128);
+        pass = pass + 1;
+    }
+
+    print_int(repeated);
+    newline();
+    return 0;
+}

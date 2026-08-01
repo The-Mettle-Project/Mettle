@@ -146,6 +146,56 @@ static int ir_region_has_loop_label(const IRFunction *function, size_t begin,
   return 0;
 }
 
+/* A loop's ENTRY label, as opposed to any of the other labels a loop emits.
+ * `while` lowers to `ir_while_N` (entry) plus `ir_while_end_N` (exit), and the
+ * exit contains the entry's name as a prefix -- so a plain substring test
+ * counts one loop twice. Anything that walks headers to find nesting has to
+ * tell them apart. */
+static int ir_label_is_loop_header(const char *label) {
+  if (!label) {
+    return 0;
+  }
+  if (strstr(label, "ir_for_cond_") != NULL) {
+    return 1;
+  }
+  return strstr(label, "ir_while_") != NULL &&
+         strstr(label, "ir_while_end_") == NULL;
+}
+
+/* The source line of a loop header nested strictly inside (begin, end), or 0
+ * when the region holds a single loop.
+ *
+ * The `@simd` marker records cannot answer this: the inliner deliberately drops
+ * markers from an inlined copy, so a loop that arrived with an inlined call
+ * leaves no record behind. Without a structural check the outer loop reads as a
+ * leaf, and the leaf classifier then blames the INNER loop's exit test on a
+ * data-dependent `if` and prescribes a branchless rewrite -- for a body whose
+ * source contains no branch at all. Past the region's own header, a second
+ * header can only belong to a nested loop. */
+static size_t ir_region_inner_loop_line(const IRFunction *function,
+                                        size_t begin, size_t end) {
+  int seen_header = 0;
+  for (size_t i = begin + 1; i < end; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op != IR_OP_LABEL || !ir_label_is_loop_header(ins->text)) {
+      continue;
+    }
+    if (!seen_header) {
+      seen_header = 1;
+      continue;
+    }
+    /* Labels carry no location of their own; take the first instruction after
+     * the header that does. */
+    for (size_t j = i + 1; j < end; j++) {
+      if (function->instructions[j].location.line) {
+        return function->instructions[j].location.line;
+      }
+    }
+    return 0;
+  }
+  return 0;
+}
+
 /* A branch/jump whose target is one of the runtime-check labels the lowerer
  * injects (null-check, bounds-check). These appear per pointer/array access at
  * -O (they're absent at --release), so they must NOT count as user control flow
@@ -248,9 +298,16 @@ static const char *ir_simd_bail_reason(const IRFunction *function, size_t begin,
   if (has_asm) {
     return "the loop body contains inline assembly";
   }
+  if (ir_region_inner_loop_line(function, begin, end)) {
+    /* Check the nest BEFORE the branch count: an inner loop's own exit test
+     * and back-edge are extra branches, and calling those a data-dependent
+     * branch sends the reader looking for an `if` that is not there. */
+    return "the loop body contains a nested loop (possibly from an inlined "
+           "call); only the innermost loop of a nest vectorizes";
+  }
   if (branch_count > 1 || jump_count > 1) {
-    return "the loop body has its own control flow (a nested loop or a "
-           "data-dependent branch); only straight-line loop bodies vectorize";
+    return "the loop body branches on data (an `if` or `&&`/`||` per "
+           "iteration); only straight-line loop bodies vectorize";
   }
   if (has_i16) {
     return "the loop accesses 16-bit integers, which have no vectorizer "
@@ -1804,6 +1861,27 @@ static void ir_explain_report_loops(const IRFunction *function,
         inner_line = loops[m].location.line;
       }
     }
+    /* A nest the records cannot see: the inlined callee's loops carry no
+     * markers. Fall back to the labels, and name the call that brought the
+     * loop in so the advice matches what the reader wrote. */
+    size_t inlined_loop_from_line = 0;
+    char inlined_loop_callee[128];
+    inlined_loop_callee[0] = '\0';
+    if (!has_inner) {
+      size_t structural = ir_region_inner_loop_line(function, L->begin, L->end);
+      if (structural) {
+        has_inner = 1;
+        inner_line = structural;
+        size_t last = ir_simd_loop_end_line(function, L);
+        if (ir_explain_inlined_calls_in_range(
+                function->name, L->location.line, last ? last : L->location.line,
+                &inlined_loop_from_line, inlined_loop_callee,
+                sizeof(inlined_loop_callee)) != 1) {
+          inlined_loop_from_line = 0;
+          inlined_loop_callee[0] = '\0';
+        }
+      }
+    }
 
     char headline[192], reason[320], fix[320];
     if (own) {
@@ -1824,14 +1902,35 @@ static void ir_explain_report_loops(const IRFunction *function,
       ir_explain_remark_code("vectorized-inner");
       ir_explain_remark_extent(ir_simd_loop_end_line(function, L));
     } else if (has_inner) {
-      snprintf(reason, sizeof(reason),
-               "the body contains a nested loop (line %zu), and only "
-               "innermost loops are vectorized; the inner loop did not "
-               "vectorize either -- see its remark",
-               inner_line);
+      if (inlined_loop_callee[0]) {
+        /* The reader's source shows a call here, not a loop. Say where the
+         * loop came from, or the advice reads as being about code they never
+         * wrote. */
+        snprintf(reason, sizeof(reason),
+                 "the call to `%s` on line %zu was inlined, so that callee's "
+                 "loop (line %zu) now sits in this body; only innermost loops "
+                 "are vectorized",
+                 inlined_loop_callee, inlined_loop_from_line, inner_line);
+        snprintf(fix, sizeof(fix),
+                 "nothing to change on this line: this loop drives the work, "
+                 "and the vectorizable part is `%s`'s loop -- see the remark "
+                 "on line %zu",
+                 inlined_loop_callee, inner_line);
+      } else {
+        snprintf(reason, sizeof(reason),
+                 "the body contains a nested loop (line %zu), and only "
+                 "innermost loops are vectorized; the inner loop did not "
+                 "vectorize either -- see its remark",
+                 inner_line);
+        snprintf(fix, sizeof(fix),
+                 "nothing to change on this line: this loop drives the nest, "
+                 "so the fix belongs on the inner loop at line %zu",
+                 inner_line);
+      }
       ir_explain_remark(function->name, "loop", L->location, 0,
-                        "NOT vectorized", reason, NULL, NULL);
+                        "NOT vectorized", reason, fix, NULL);
       ir_explain_remark_code("outer-of-nest");
+      ir_explain_remark_advisory();
       ir_explain_remark_extent(ir_simd_loop_end_line(function, L));
     } else if (!ir_region_has_loop_label(function, L->begin, L->end)) {
       /* The unroller records a definitive "fully unrolled (N iterations)"

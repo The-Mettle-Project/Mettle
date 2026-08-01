@@ -677,6 +677,16 @@ const char *ir_explain_filter(void);
  * later pass skip a weaker guess when a definitive remark exists (e.g. the
  * unroller's "fully unrolled" beats the verifier's "no loop remains"). */
 int ir_explain_has_remark_at(size_t line, const char *entity);
+/* How many calls `function_name` had INLINED between `first_line` and
+ * `last_line`, with the callee's name and call line handed back when there is
+ * exactly one. The loop report uses it to explain a nested loop the reader
+ * cannot see: after inlining, a callee's loops sit in the caller's body, and
+ * "the body contains a nested loop" is baffling advice for source that reads
+ * as a single call. Naming the call that brought it makes it followable. */
+size_t ir_explain_inlined_calls_in_range(const char *function_name,
+                                         size_t first_line, size_t last_line,
+                                         size_t *callee_line, char *callee_out,
+                                         size_t callee_cap);
 /* Instruction-level description of a vectorized kernel op for headlines. */
 void ir_explain_kernel_desc(const IRInstruction *ins, char *buf, size_t cap);
 /* --explain: after all inlining rounds, record a remark for every surviving
