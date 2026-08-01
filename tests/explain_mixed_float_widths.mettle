@@ -1,0 +1,44 @@
+// A loop mixing float32 and float64 gets no kernel. The advice names which
+// width to keep, and the compiler proves it by retyping the minority on a
+// clone and re-running its own vectorizer.
+//
+// Each mixed loop is followed by the same loop written in one width. The two
+// must report the same kernel: that is what makes the simulated claim a
+// result rather than a prediction.
+
+fn mostly32(a: float32*, b: float64*, n: int32) {
+    for i in 0..n {
+        a[i] = a[i] + (float32)b[i];
+    }
+}
+
+fn single32(a: float32*, b: float32*, n: int32) {
+    for i in 0..n {
+        a[i] = a[i] + b[i];
+    }
+}
+
+fn mostly64(a: float64*, b: float64*, c: float32*, n: int32) {
+    for i in 0..n {
+        a[i] = b[i] + (float64)c[i];
+    }
+}
+
+fn single64(a: float64*, b: float64*, c: float64*, n: int32) {
+    for i in 0..n {
+        a[i] = b[i] + c[i];
+    }
+}
+
+fn main() -> int32 {
+    var f32a: float32[64];
+    var f32b: float32[64];
+    var f64a: float64[64];
+    var f64b: float64[64];
+    var f64c: float64[64];
+    mostly32(&f32a[0], &f64a[0], 64);
+    single32(&f32a[0], &f32b[0], 64);
+    mostly64(&f64a[0], &f64b[0], &f32a[0], 64);
+    single64(&f64a[0], &f64b[0], &f64c[0], 64);
+    return (int32)f32a[0] + (int32)f64a[0];
+}

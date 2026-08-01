@@ -465,6 +465,11 @@ static const char *ir_region_find_serial_recurrence(const IRFunction *function,
   return NULL;
 }
 
+/* Which float width dominates the region's memory traffic (defined with the
+ * fix simulations below, and used by the diagnosis to name it). */
+static long long ir_simd_majority_float_width(const IRFunction *function,
+                                              size_t begin, size_t end);
+
 /* The element type of a declared array type: "float32[64]" -> "float32".
  * Falls back to a readable placeholder so the advice still parses as English
  * when the declaration is a shape this does not model. */
@@ -836,10 +841,27 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
     }
   }
   if (has_f32 && has_f64) {
+    /* Naming the width turns "pick one" into an instruction, and it is the
+     * width the paired simulation converges on, so the kernel the report
+     * promises is the one this edit produces. The minority is what a reader
+     * would retype: it is the odd array out. */
+    long long keep = ir_simd_majority_float_width(function, begin, end);
     snprintf(reason, reason_cap,
              "the loop mixes float32 and float64 elements; each kernel "
              "handles one width");
-    snprintf(fix, fix_cap, "keep the loop in a single float width");
+    if (keep == 4) {
+      snprintf(fix, fix_cap,
+               "keep the loop in float32: the float64 accesses are the "
+               "minority, so retype those arrays (or convert outside the "
+               "loop)");
+    } else if (keep == 8) {
+      snprintf(fix, fix_cap,
+               "keep the loop in float64: the float32 accesses are the "
+               "minority, so retype those arrays (or convert outside the "
+               "loop)");
+    } else {
+      snprintf(fix, fix_cap, "keep the loop in a single float width");
+    }
     IR_SIMD_SET_DIAG(IR_SIMD_BAIL_MIXED_FLOAT_WIDTHS);
     return;
   }
@@ -1151,6 +1173,89 @@ static int ir_simd_mutate_int64_to_i32(IRFunction *clone, size_t begin,
   return ir_simd_retype_int_elems_to_i32(clone, begin, end, 8, 3);
 }
 
+/* Which float width dominates the region's memory traffic, or 0 when the
+ * region is not mixed. The minority is what a reader would retype, and it is
+ * what the mutator below converges, so the kernel the simulation names is the
+ * kernel that edit produces. */
+static long long ir_simd_majority_float_width(const IRFunction *function,
+                                              size_t begin, size_t end) {
+  int f32 = 0, f64 = 0;
+  for (size_t i = begin + 1; i < end; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if ((ins->op != IR_OP_LOAD && ins->op != IR_OP_STORE) || !ins->is_float ||
+        ins->rhs.kind != IR_OPERAND_INT) {
+      continue;
+    }
+    if (ins->rhs.int_value == 4) {
+      f32++;
+    } else if (ins->rhs.int_value == 8) {
+      f64++;
+    }
+  }
+  if (!f32 || !f64) {
+    return 0;
+  }
+  return (f32 >= f64) ? 4 : 8;
+}
+
+/* Mutator for IR_SIMD_BAIL_MIXED_FLOAT_WIDTHS ("keep the loop in one float
+ * width"). Retypes the minority width onto the majority, scale shifts and
+ * all, and lets the real vectorizer say whether one width was the only thing
+ * in the way. */
+static int ir_simd_mutate_single_float_width(IRFunction *clone, size_t begin,
+                                             size_t end) {
+  long long keep = ir_simd_majority_float_width(clone, begin, end);
+  if (!keep) {
+    return 0;
+  }
+  long long drop = (keep == 4) ? 8 : 4;
+  long long keep_shift = (keep == 4) ? 2 : 3;
+  long long drop_shift = (keep == 4) ? 3 : 2;
+
+  /* Temps loaded at the dropped width. Retyping the load leaves the width
+   * cast that consumed it behind, and the recognizers still see it; the
+   * reader's edit deletes that cast along with the type. Only casts fed by a
+   * load this pass retyped are touched, so an int-to-float conversion (real
+   * work) is never mistaken for width bookkeeping. */
+  char retyped[32][64];
+  size_t retyped_count = 0;
+
+  int rewrote = 0;
+  for (size_t i = begin + 1; i < end; i++) {
+    IRInstruction *ins = &clone->instructions[i];
+    if ((ins->op == IR_OP_LOAD || ins->op == IR_OP_STORE) && ins->is_float &&
+        ins->rhs.kind == IR_OPERAND_INT && ins->rhs.int_value == drop) {
+      ins->rhs.int_value = keep;
+      rewrote = 1;
+      if (ins->op == IR_OP_LOAD && ins->dest.kind == IR_OPERAND_TEMP &&
+          ins->dest.name && retyped_count < 32) {
+        snprintf(retyped[retyped_count], sizeof(retyped[0]), "%s",
+                 ins->dest.name);
+        retyped_count++;
+      }
+      continue;
+    }
+    /* The index scale that went with the dropped width. */
+    if (ins->op == IR_OP_BINARY && !ins->is_float && ins->text &&
+        strcmp(ins->text, "<<") == 0 && ins->rhs.kind == IR_OPERAND_INT &&
+        ins->rhs.int_value == drop_shift &&
+        ins->lhs.kind == IR_OPERAND_SYMBOL) {
+      ins->rhs.int_value = keep_shift;
+      continue;
+    }
+    if (ins->op == IR_OP_CAST && ins->is_float &&
+        ins->lhs.kind == IR_OPERAND_TEMP && ins->lhs.name) {
+      for (size_t r = 0; r < retyped_count; r++) {
+        if (strcmp(retyped[r], ins->lhs.name) == 0) {
+          ins->op = IR_OP_ASSIGN; /* both sides are `keep` wide now */
+          break;
+        }
+      }
+    }
+  }
+  return rewrote;
+}
+
 /* True when some instruction in (begin, end) writes the symbol `sym`. */
 static int ir_simd_symbol_written_in_region(const IRFunction *function,
                                             size_t begin, size_t end,
@@ -1424,6 +1529,7 @@ static const struct {
     {IR_SIMD_BAIL_INT16_ELEMENTS, ir_simd_mutate_int16_to_i32, NULL},
     {IR_SIMD_BAIL_INT64_ELEMENTS, ir_simd_mutate_int64_to_i32, NULL},
     {IR_SIMD_BAIL_STORE_ONLY_FILL, ir_simd_mutate_fill_base_pointer, NULL},
+    {IR_SIMD_BAIL_MIXED_FLOAT_WIDTHS, ir_simd_mutate_single_float_width, NULL},
     {IR_SIMD_BAIL_DOT_SHAPE_ADDRESS, ir_simd_mutate_dot_row_pointer,
      "none via hoisting -- re-checked: the index half that is not the loop "
      "counter changes every iteration, so it cannot be hoisted out; this "

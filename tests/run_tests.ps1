@@ -711,6 +711,26 @@ $cases = @(
     )
   },
   @{
+    # A mixed-width float loop gets no kernel. The advice names which width to
+    # keep, and the compiler proves it: it retypes the minority on a clone and
+    # re-runs its own vectorizer. Each mixed loop is followed by the same loop
+    # written in one width, and the kernel named by the simulation must be the
+    # kernel that one actually gets, in both directions.
+    Name          = "explain_mixed_float_widths"
+    Path          = "tests/explain_mixed_float_widths.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--explain=loops")
+    Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
+    OutputMustMatch = @(
+      'fix: keep the loop in float32: the float64 accesses are the minority',
+      'verified: simulated that fix and re-ran the optimizer: this loop then vectorizes -> vfmadd231ps, 8-wide float32 affine map',
+      'single32 \(loop @ line \d+\): vectorized -> vfmadd231ps, 8-wide float32 affine map',
+      'fix: keep the loop in float64: the float32 accesses are the minority',
+      'verified: simulated that fix and re-ran the optimizer: this loop then vectorizes -> 4-wide float64 element-wise map',
+      'single64 \(loop @ line \d+\): vectorized -> 4-wide float64 element-wise map'
+    )
+  },
+  @{
     # The outer loop of a nest is not a missed optimization: only innermost
     # loops vectorize, so its remark points at the inner loop's problem rather
     # than being a second one. It still gets a remark, and it must not raise
