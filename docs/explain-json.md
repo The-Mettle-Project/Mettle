@@ -192,7 +192,8 @@ what makes this section work.
 `memory` carries the compile-time memory-safety findings for the file (`severity`, `line`,
 `headline`, `fix`). `backend` reports register-allocation coverage: `ok`, `total`, `instructions`,
 `okInstructions`, and `groups` of functions that missed it, each with the `reason`, the
-`consequence`, a `fix`, and its `members`.
+`consequence`, a `fix`, and its `members`. A group's `fix` carries `advisory: true` when it says
+nothing needs doing, matching the `note:` the prose report prints for it.
 
 ## Consumers
 

@@ -3052,9 +3052,12 @@ void ir_explain_finalize(int force_stderr) {
  * runs at full speed, only surrounding scalar code spills). */
 static void ir_explain_backend_reason(const IRExplainBackendEntry *e, char *buf,
                                       size_t cap, const char **consequence,
-                                      const char **fix) {
+                                      const char **fix, int *advisory) {
   *consequence = NULL;
   *fix = NULL;
+  /* The same distinction the loop remarks draw: advice that says nothing
+     needs doing is a note, not an instruction. */
+  *advisory = 0;
   if (!e->detail) {
     snprintf(buf, cap, "declined by the eligibility gate");
     return;
@@ -3073,6 +3076,7 @@ static void ir_explain_backend_reason(const IRExplainBackendEntry *e, char *buf,
       *fix = "nothing for small functions; if a LARGE function mixes a kernel "
              "with hot scalar code, move the kernel loop into its own small "
              "function so the scalar part keeps the register allocator";
+      *advisory = 1;
       return;
     }
     snprintf(buf, cap,
@@ -3106,6 +3110,7 @@ static void ir_explain_backend_reason(const IRExplainBackendEntry *e, char *buf,
         "around it keeps values on the stack";
     *fix = "nothing needed for a small function; a different shape of the same "
            "kernel (a simpler fill/map) inlines into register-allocated code";
+    *advisory = 1;
     return;
   }
   snprintf(buf, cap, "declined by the eligibility gate (reason code: %s)",
@@ -3180,6 +3185,7 @@ void ir_explain_backend_flush(void) {
         /* Pick the ungrouped reason with the largest remaining total. */
         char best_reason[256];
         const char *best_consequence = NULL, *best_fix = NULL;
+        int best_advisory = 0;
         size_t best_total = 0, best_first = (size_t)-1;
         for (size_t i = 0; i < g_backend_count; i++) {
           if (g_backend[i].ok || (grouped && grouped[i])) {
@@ -3187,8 +3193,9 @@ void ir_explain_backend_flush(void) {
           }
           char reason_i[256];
           const char *cons_i, *fix_i;
+          int advisory_i = 0;
           ir_explain_backend_reason(&g_backend[i], reason_i, sizeof(reason_i),
-                                    &cons_i, &fix_i);
+                                    &cons_i, &fix_i, &advisory_i);
           size_t total_i = 0;
           for (size_t j = i; j < g_backend_count; j++) {
             if (g_backend[j].ok || (grouped && grouped[j])) {
@@ -3196,8 +3203,9 @@ void ir_explain_backend_flush(void) {
             }
             char reason_j[256];
             const char *cj, *fj;
+            int aj = 0;
             ir_explain_backend_reason(&g_backend[j], reason_j,
-                                      sizeof(reason_j), &cj, &fj);
+                                      sizeof(reason_j), &cj, &fj, &aj);
             if (strcmp(reason_i, reason_j) == 0) {
               total_i += g_backend[j].instructions;
             }
@@ -3206,6 +3214,7 @@ void ir_explain_backend_flush(void) {
             snprintf(best_reason, sizeof(best_reason), "%s", reason_i);
             best_consequence = cons_i;
             best_fix = fix_i;
+            best_advisory = advisory_i;
             best_total = total_i;
             best_first = i;
           }
@@ -3223,8 +3232,9 @@ void ir_explain_backend_flush(void) {
           }
           char reason_j[256];
           const char *cj, *fj;
+          int aj = 0;
           ir_explain_backend_reason(&g_backend[j], reason_j, sizeof(reason_j),
-                                    &cj, &fj);
+                                    &cj, &fj, &aj);
           if (strcmp(best_reason, reason_j) == 0) {
             members++;
           }
@@ -3238,8 +3248,9 @@ void ir_explain_backend_flush(void) {
                           clr(EXPLAIN_RESET));
         }
         if (best_fix) {
-          ir_explain_emit("      %s%s fix: %s%s\n", clr(EXPLAIN_DIM),
-                          glyph_elbow(), best_fix, clr(EXPLAIN_RESET));
+          ir_explain_emit("      %s%s %s: %s%s\n", clr(EXPLAIN_DIM),
+                          glyph_elbow(), best_advisory ? "note" : "fix",
+                          best_fix, clr(EXPLAIN_RESET));
         }
         ir_explain_json_raw("%s{\"reason\":", json_group_count++ ? "," : "");
         ir_explain_json_str(best_reason);
@@ -3249,6 +3260,9 @@ void ir_explain_backend_flush(void) {
         ir_explain_json_str(best_consequence);
         ir_explain_json_raw(",\"fix\":");
         ir_explain_json_str(best_fix);
+        if (best_advisory) {
+          ir_explain_json_raw(",\"advisory\":true");
+        }
         ir_explain_json_raw(",\"members\":[");
         size_t shown = 0;
         char list[512];
@@ -3260,8 +3274,9 @@ void ir_explain_backend_flush(void) {
           }
           char reason_j[256];
           const char *cj, *fj;
+          int aj = 0;
           ir_explain_backend_reason(&g_backend[j], reason_j, sizeof(reason_j),
-                                    &cj, &fj);
+                                    &cj, &fj, &aj);
           if (strcmp(best_reason, reason_j) != 0) {
             continue;
           }
@@ -3294,8 +3309,9 @@ void ir_explain_backend_flush(void) {
           }
           char reason_j[256];
           const char *cj, *fj;
+          int aj = 0;
           ir_explain_backend_reason(&g_backend[j], reason_j, sizeof(reason_j),
-                                    &cj, &fj);
+                                    &cj, &fj, &aj);
           if (grouped && strcmp(best_reason, reason_j) == 0) {
             grouped[j] = 1;
           }
