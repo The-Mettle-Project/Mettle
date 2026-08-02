@@ -21,6 +21,7 @@ static IRProgram *ir_lowering_fail(IRProgram *ir_program,
                                    char **error_message) {
   ir_program_destroy(ir_program);
   ir_lowering_free_control_stack(context);
+  ir_local_bindings_reset(context);
   if (error_message) {
     *error_message = context->error_message
                          ? context->error_message
@@ -96,6 +97,7 @@ IRProgram *ir_lower_program(ASTNode *program, TypeChecker *type_checker,
   }
 
   ir_lowering_free_control_stack(&context);
+  ir_local_bindings_reset(&context);
 
   if (context.error_message) {
     if (error_message) {
@@ -152,6 +154,7 @@ IRFunction *ir_lower_function(IRLoweringContext *context,
   /* A function-level `@simd` decorator becomes the default mode for every
    * counted loop in the body that has no `@simd` of its own. */
   context->current_function_simd_default = function_data->simd_mode;
+  ir_local_bindings_reset(context);
   if (!ir_function_set_parameters(function,
                                   (const char **)function_data->parameter_names,
                                   (const char **)function_data->parameter_types,

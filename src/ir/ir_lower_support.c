@@ -1,6 +1,141 @@
 // AST->IR lowering: runtime checks and control-flow (break/continue) frames.
 #include "ir_lowering_internal.h"
 
+/* Local name bindings. See IRLocalBinding for why a redeclaration at a
+ * different type needs a name of its own. */
+
+void ir_local_scope_enter(IRLoweringContext *context) {
+  if (context) {
+    context->local_scope_depth++;
+  }
+}
+
+void ir_local_scope_leave(IRLoweringContext *context) {
+  if (!context) {
+    return;
+  }
+  for (size_t i = context->local_binding_count; i-- > 0;) {
+    if (context->local_bindings[i].depth < context->local_scope_depth) {
+      break;
+    }
+    context->local_bindings[i].active = 0;
+  }
+  if (context->local_scope_depth > 0) {
+    context->local_scope_depth--;
+  }
+}
+
+void ir_local_bindings_reset(IRLoweringContext *context) {
+  if (!context) {
+    return;
+  }
+  for (size_t i = 0; i < context->local_binding_count; i++) {
+    if (context->local_bindings[i].owns_ir_name) {
+      free((char *)context->local_bindings[i].ir_name);
+    }
+  }
+  free(context->local_bindings);
+  context->local_bindings = NULL;
+  context->local_binding_count = 0;
+  context->local_binding_capacity = 0;
+  context->local_scope_depth = 0;
+  context->local_rename_serial = 0;
+}
+
+static int ir_local_type_text_matches(const char *a, const char *b) {
+  if (!a || !b) {
+    return a == b;
+  }
+  return strcmp(a, b) == 0;
+}
+
+const char *ir_local_bind(IRLoweringContext *context, const char *name,
+                          const char *type_text) {
+  if (!context || !name) {
+    return name;
+  }
+
+  const char *ir_name = NULL;
+  int seen = 0;
+  int owns = 0;
+  for (size_t i = 0; i < context->local_binding_count; i++) {
+    const IRLocalBinding *b = &context->local_bindings[i];
+    if (strcmp(b->name, name) != 0) {
+      continue;
+    }
+    seen = 1;
+    /* A redeclaration at the same type shares the earlier binding's slot, so
+     * it keeps its name and the emitted IR is unchanged. */
+    if (ir_local_type_text_matches(b->type_text, type_text)) {
+      ir_name = b->ir_name;
+      break;
+    }
+  }
+  if (!ir_name) {
+    if (!seen) {
+      ir_name = name;
+    } else {
+      size_t len = strlen(name) + 24;
+      char *renamed = (char *)malloc(len);
+      if (!renamed) {
+        /* Out of memory: keep the source name. The declaration still lowers;
+         * it just shares a slot the way it did before, as no rename happened. */
+        return name;
+      }
+      /* `$$`, not `$`: SROA names a split field `<member>$<offset>`, so a
+       * single `$` could collide with the scalars of a same-named struct in
+       * the same function. Source identifiers cannot contain either. */
+      snprintf(renamed, len, "%s$$%d", name, ++context->local_rename_serial);
+      ir_name = renamed;
+      owns = 1;
+    }
+  }
+
+  if (context->local_binding_count == context->local_binding_capacity) {
+    size_t grown = context->local_binding_capacity
+                       ? context->local_binding_capacity * 2
+                       : 8;
+    IRLocalBinding *items = (IRLocalBinding *)realloc(
+        context->local_bindings, grown * sizeof(IRLocalBinding));
+    if (!items) {
+      if (owns) {
+        free((char *)ir_name);
+      }
+      return name;
+    }
+    context->local_bindings = items;
+    context->local_binding_capacity = grown;
+  }
+
+  IRLocalBinding *slot = &context->local_bindings[context->local_binding_count++];
+  slot->name = name;
+  slot->ir_name = ir_name;
+  slot->type_text = type_text;
+  slot->depth = context->local_scope_depth;
+  slot->active = 1;
+  slot->owns_ir_name = owns;
+  return ir_name;
+}
+
+const IRLocalBinding *ir_local_binding_find(IRLoweringContext *context,
+                                            const char *name) {
+  if (!context || !name) {
+    return NULL;
+  }
+  for (size_t i = context->local_binding_count; i-- > 0;) {
+    const IRLocalBinding *b = &context->local_bindings[i];
+    if (b->active && strcmp(b->name, name) == 0) {
+      return b;
+    }
+  }
+  return NULL;
+}
+
+const char *ir_local_ir_name(IRLoweringContext *context, const char *name) {
+  const IRLocalBinding *b = ir_local_binding_find(context, name);
+  return b ? b->ir_name : name;
+}
+
 int ir_emit_runtime_trap_ex(IRLoweringContext *context,
                                    IRFunction *function,
                                    SourceLocation location, uint32_t kind,

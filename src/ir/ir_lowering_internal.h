@@ -21,6 +21,22 @@ typedef struct {
   char *user_label; // optional source-level label for labeled break/continue
 } IRControlFrame;
 
+/* One local's binding in the function being lowered. A local is addressed by
+ * name all the way down to the backends, which key their slot, float, string
+ * and declared-type tables on that name; two same-named locals in different
+ * scopes would therefore share one frame slot and one type. A redeclaration at
+ * a different type gets a distinct IR name here, and uses resolve to the
+ * innermost binding still in scope. Same-typed redeclarations keep the source
+ * name and share the slot, exactly as before. */
+typedef struct {
+  const char *name;      /* source name, borrowed from the AST */
+  const char *ir_name;   /* what the IR calls it: `name`, or an owned rename */
+  const char *type_text; /* declared type name at this binding, may be NULL */
+  int depth;             /* scope depth this binding was declared at */
+  int active;            /* cleared once its scope has been left */
+  int owns_ir_name;      /* ir_name was allocated here and must be freed */
+} IRLocalBinding;
+
 typedef struct {
   int next_temp_id;
   int next_label_id;
@@ -46,6 +62,12 @@ typedef struct {
    * folded image here as a hidden module constant and copies from it, so the
    * value is laid out once in the object file rather than stored piecewise. */
   IRProgram *program;
+  /* Locals of the function being lowered, oldest first; reset per function. */
+  IRLocalBinding *local_bindings;
+  size_t local_binding_count;
+  size_t local_binding_capacity;
+  int local_scope_depth;
+  int local_rename_serial;
 } IRLoweringContext;
 
 typedef struct {
@@ -104,6 +126,20 @@ int ir_coerce_string_operand_to_cstring(IRLoweringContext *context,
 int ir_lower_statement_or_expression(IRLoweringContext *context,
                                             IRFunction *function,
                                             ASTNode *node);
+
+void ir_local_scope_enter(IRLoweringContext *context);
+
+void ir_local_scope_leave(IRLoweringContext *context);
+
+void ir_local_bindings_reset(IRLoweringContext *context);
+
+const char *ir_local_bind(IRLoweringContext *context, const char *name,
+                          const char *type_text);
+
+const char *ir_local_ir_name(IRLoweringContext *context, const char *name);
+
+const IRLocalBinding *ir_local_binding_find(IRLoweringContext *context,
+                                            const char *name);
 
 int ir_emit_local_declaration(IRLoweringContext *context,
                                      IRFunction *function,

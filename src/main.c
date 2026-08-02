@@ -2960,6 +2960,8 @@ int main(int argc, char *argv[]) {
       options.emit_spirv = 1;
     } else if (strcmp(argv[i], "--emit-arm64") == 0) {
       options.emit_arm64 = 1;
+    } else if (strcmp(argv[i], "--emit-arm64-obj") == 0) {
+      options.emit_arm64_obj = 1;
     } else if (strcmp(argv[i], "-g") == 0 ||
                strcmp(argv[i], "--debug-symbols") == 0) {
       options.generate_debug_symbols = 1;
@@ -3047,6 +3049,29 @@ int main(int argc, char *argv[]) {
     free((void *)options.link_arguments);
     return 1;
   }
+
+  if (options.emit_arm64_obj && options.emit_arm64) {
+    fprintf(stderr,
+            "Error: --emit-arm64 (self-contained AArch64 executable) and "
+            "--emit-arm64-obj (AArch64 relocatable object) are different "
+            "outputs; pick one\n");
+    free((void *)options.import_directories);
+    free((void *)options.link_arguments);
+    return 1;
+  }
+
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+  if (options.emit_arm64_obj && build_executable) {
+    fprintf(stderr,
+            "Error: --emit-arm64-obj cannot be combined with --build on an "
+            "x86-64 host: the object is AArch64 and this host's linker cannot "
+            "link it. Link it on an ARM machine, or use --emit-arm64 for a "
+            "self-contained executable\n");
+    free((void *)options.import_directories);
+    free((void *)options.link_arguments);
+    return 1;
+  }
+#endif
 
   if (build_executable) {
     options.emit_object = 1;
@@ -3351,15 +3376,32 @@ static IRGlobalIntConst *collect_global_int_consts(ASTNode *program,
   return consts;
 }
 
+/* Whether this compile's object output is an AArch64 relocatable object: on an
+ * ARM host that is every object; elsewhere it is what --emit-arm64-obj asks
+ * for, which is how an x86-64 host reaches (and tests) that backend. */
+static int compile_targets_arm64_object(const CompilerOptions *options) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+  (void)options;
+  return 1;
+#else
+  return options && options->emit_arm64_obj;
+#endif
+}
+
 static int compile_optimize_ir(IRProgram *ir_program, ASTNode *ast_program,
                                CompilerOptions *options) {
   IROptimizeOptions ir_optimize_options = {0};
-  int target_neutral =
-      options->emit_arm64 || options->emit_ptx || options->emit_spirv;
+  int target_neutral = options->emit_arm64 || options->emit_ptx ||
+                       options->emit_spirv ||
+                       compile_targets_arm64_object(options);
   if (options->ml_opt && target_neutral) {
     fprintf(stderr,
             "Error: --ml-opt is not target-neutral and cannot be combined "
-            "with --emit-arm64, --emit-ptx, or --emit-spirv\n");
+            "with --emit-arm64, --emit-arm64-obj, --emit-ptx, or "
+            "--emit-spirv%s\n",
+            compile_targets_arm64_object(options) && !options->emit_arm64_obj
+                ? " (this host emits AArch64 objects)"
+                : "");
     return 0;
   }
   ir_optimize_options.preserve_function_boundaries =
@@ -3487,6 +3529,7 @@ int compile_file(const char *input_filename, const char *output_filename,
                  CompilerOptions *options) {
   CompilerProfile profile;
   double phase_start = 0.0;
+  const int arm64_object_output = compile_targets_arm64_object(options);
 
   compiler_profile_init(&profile, options && options->profile);
 
@@ -3800,11 +3843,11 @@ int compile_file(const char *input_filename, const char *output_filename,
   ir_lowering_set_explain(options->explain && options->optimize &&
                           !options->emit_ptx && !options->emit_spirv);
 
+  /* --emit-arm64 keeps the checks: its traps print the message and exit(1)
+   * like the x86 backend's, so debug semantics match across targets. (The
+   * exclusion dated from bring-up, when the trap calls could not lower.) */
   int emit_runtime_checks =
-      (options->release || options->emit_ptx || options->emit_spirv ||
-       options->emit_arm64)
-          ? 0
-          : 1;
+      (options->release || options->emit_ptx || options->emit_spirv) ? 0 : 1;
   compiler_set_phase(PROFILE_PHASE_IR_LOWERING);
   phase_start = compiler_profile_begin(&profile);
   int ir_ok = compile_lower_to_ir(program, type_checker, symbol_table,
@@ -3962,25 +4005,45 @@ int compile_file(const char *input_filename, const char *output_filename,
     goto cleanup;
   }
 
-  /* --emit-arm64: lower the scalar-integer subset of every function directly to
-   * an AArch64 ELF executable (from-scratch backend, no external assembler). A
-   * `_start` calls main() and exits with its return value. No optimization (the
-   * direct IR backend consumes the unoptimized IR shape), no x86 object. */
+  /* --emit-arm64: lower the scalar subset of every function directly to a
+   * self-contained AArch64 ELF executable (from-scratch backend, no external
+   * assembler and no linker). A `_start` calls main() and exits with its return
+   * value; module globals and the freestanding allocator live in a second,
+   * writable segment. No x86 object.
+   *
+   * -O/--release runs the target-neutral half of the optimizer: scalar and
+   * control-flow transforms that keep the shared IR instruction set. The x86
+   * SIMD idiom recognizers stay off -- they form ops this backend has no
+   * encoding for -- so what reaches the lowering is the same shape it already
+   * consumes, just less of it. */
   if (options->emit_arm64) {
+    if (options->optimize && !compile_optimize_ir(ir_program, program, options)) {
+      result = 1;
+      goto cleanup;
+    }
     Arm64Emit ae;
+    unsigned char *arm64_data = NULL;
+    size_t arm64_data_len = 0;
     arm64_emit_init(&ae);
-    int ok = arm64_ir_encode_program(&ae, ir_program, "main") &&
+    int ok = arm64_ir_encode_program(&ae, ir_program, "main", &arm64_data,
+                                     &arm64_data_len) &&
              arm64_emit_finalize(&ae);
     if (ok) {
-      ok = arm64_write_elf(output_filename, ae.code.data, ae.code.len);
+      ok = arm64_write_elf(output_filename, ae.code.data, ae.code.len,
+                           arm64_data, arm64_data_len);
       if (!ok) {
-        fprintf(stderr, "Error: could not write AArch64 ELF '%s'\n",
-                output_filename);
+        fprintf(stderr,
+                "Error: could not write AArch64 ELF '%s' (I/O failure, or the "
+                "program's %zu bytes of code reach the fixed address of the "
+                "writable segment; use the object path for a program this "
+                "large)\n",
+                output_filename, ae.code.len);
       }
     } else {
-      fprintf(stderr, "Error: AArch64 lowering failed (an op outside the "
-                      "supported scalar subset, or an unresolved call)\n");
+      fprintf(stderr, "Error: AArch64 lowering failed: %s\n",
+              arm64_error_reason(&ae));
     }
+    free(arm64_data);
     arm64_emit_free(&ae);
     if (!ok) {
       result = 1;
@@ -4115,13 +4178,12 @@ int compile_file(const char *input_filename, const char *output_filename,
 
   compiler_set_phase(PROFILE_PHASE_CODEGEN);
   phase_start = compiler_profile_begin(&profile);
-#if defined(__aarch64__) || defined(_M_ARM64)
   /* The native Arm path is a first-class IR backend. It deliberately bypasses
-   * the x86 MIR/encoder while sharing the frontend-neutral IR and linker flow. */
-  int codegen_ok = 1;
-#else
-  int codegen_ok = compile_generate_code(code_generator);
-#endif
+   * the x86 MIR/encoder while sharing the frontend-neutral IR and linker flow.
+   * An ARM host takes it for every object; --emit-arm64-obj asks for it from
+   * any host, which is what lets an x86-64 box exercise and test it. */
+  int codegen_ok = arm64_object_output ? 1
+                                       : compile_generate_code(code_generator);
   compiler_profile_add(&profile, PROFILE_PHASE_CODEGEN, phase_start);
   if (!codegen_ok) {
     result = 1;
@@ -4145,31 +4207,31 @@ int compile_file(const char *input_filename, const char *output_filename,
 
   compiler_set_phase(PROFILE_PHASE_WRITE_OUTPUT);
   phase_start = compiler_profile_begin(&profile);
-#if defined(__aarch64__) || defined(_M_ARM64)
-  char arm64_error[512] = {0};
-  if (!arm64_ir_write_object(ir_program, output_filename, arm64_error,
-                             sizeof(arm64_error))) {
-    compiler_profile_add(&profile, PROFILE_PHASE_WRITE_OUTPUT, phase_start);
-    fprintf(stderr, "Error: Could not create AArch64 object file '%s': %s\n",
-            output_filename,
-            arm64_error[0] ? arm64_error : "Unknown error");
-    result = 1;
-    goto cleanup;
+  if (arm64_object_output) {
+    char arm64_error[512] = {0};
+    if (!arm64_ir_write_object(ir_program, output_filename, arm64_error,
+                               sizeof(arm64_error))) {
+      compiler_profile_add(&profile, PROFILE_PHASE_WRITE_OUTPUT, phase_start);
+      fprintf(stderr, "Error: Could not create AArch64 object file '%s': %s\n",
+              output_filename,
+              arm64_error[0] ? arm64_error : "Unknown error");
+      result = 1;
+      goto cleanup;
+    }
+  } else {
+    BinaryEmitter *binary_emitter =
+        code_generator_get_binary_emitter(code_generator);
+    if (!binary_emitter_write_object_file(binary_emitter, output_filename)) {
+      compiler_profile_add(&profile, PROFILE_PHASE_WRITE_OUTPUT, phase_start);
+      fprintf(stderr, "Error: Could not create object file '%s': %s\n",
+              output_filename,
+              binary_emitter_get_error(binary_emitter)
+                  ? binary_emitter_get_error(binary_emitter)
+                  : "Unknown error");
+      result = 1;
+      goto cleanup;
+    }
   }
-#else
-  BinaryEmitter *binary_emitter =
-      code_generator_get_binary_emitter(code_generator);
-  if (!binary_emitter_write_object_file(binary_emitter, output_filename)) {
-    compiler_profile_add(&profile, PROFILE_PHASE_WRITE_OUTPUT, phase_start);
-    fprintf(stderr, "Error: Could not create object file '%s': %s\n",
-            output_filename,
-            binary_emitter_get_error(binary_emitter)
-                ? binary_emitter_get_error(binary_emitter)
-                : "Unknown error");
-    result = 1;
-    goto cleanup;
-  }
-#endif
   compiler_profile_add(&profile, PROFILE_PHASE_WRITE_OUTPUT, phase_start);
 
   // Generate debug information files if requested
@@ -4305,6 +4367,12 @@ void print_usage(const char *program_name) {
   printf("  --build             Compile and link to an executable (COFF/PE on "
          "Windows, ELF on Linux)\n");
   printf("  --emit-obj          Emit a native object directly (default)\n");
+  printf("  --emit-arm64        Emit a self-contained AArch64 Linux "
+         "executable\n");
+  printf("  --emit-arm64-obj    Emit an AArch64 relocatable object (link it "
+         "on an\n"
+         "                      ARM machine); the default output on an ARM "
+         "host\n");
   printf("  --emit-ptx          Emit declared kernels as NVIDIA PTX (targets the\n"
          "                      local GPU when one is visible via nvidia-smi;\n"
          "                      otherwise DGX Spark GB10, PTX 8.8 / sm_121a)\n");
