@@ -1,0 +1,13 @@
+// A frame past the 4095-byte subtract-immediate. The old prologue subtracted
+// the size VIA A REGISTER, and in the shifted-register encoding Rd=31 is XZR,
+// not SP: the subtraction went to the zero register, sp never moved, and the
+// whole function ran above the top of its stack. sum(0..599)=179700, mod 251 -> 235
+fn main() -> int64 {
+  var a: int32[600];
+  var i: int32 = 0;
+  while (i < 600) { a[i] = i; i = i + 1; }
+  var t: int64 = 0;
+  i = 0;
+  while (i < 600) { t = t + (int64)a[i]; i = i + 1; }
+  return t % 251;
+}

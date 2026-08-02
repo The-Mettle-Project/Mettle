@@ -1,0 +1,21 @@
+// The same local name declared with DIFFERENT types in sibling scopes. The
+// classification maps were keyed by name with first-declaration-wins, so the
+// float64 `v` in block one made every later `v` read as a float: its integer
+// bits decoded as a denormal (~0) and the compare went the wrong way.
+// 12 + 3 = 15
+//
+// NOTE: the x86-64 backend currently returns 12 -- it has this same
+// first-declaration-wins bug (task filed); this manifest entry asserts the
+// correct answer, so do not "fix" it to match x86.
+fn main() -> int64 {
+  var total: int64 = 0;
+  {
+    var v: float64 = 6.25;
+    total = total + (int64)(v * 2.0);        // 12
+  }
+  {
+    var v: uint64 = 200;
+    if (v > 100) { total = total + 3; }      // 200-as-double is ~1e-321
+  }
+  return total;
+}

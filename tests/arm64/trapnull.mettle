@@ -1,0 +1,8 @@
+// A null dereference must trap: print the message and exit(1), matching x86.
+// The --emit-arm64 path used to compile with runtime checks stripped.
+fn main() -> int32 {
+  var x: int32 = 1;
+  var p: int32* = &x;
+  if (x == 1) { p = 0; }
+  return *p;
+}

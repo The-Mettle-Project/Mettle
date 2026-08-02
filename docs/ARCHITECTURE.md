@@ -1672,10 +1672,22 @@ and AAELF64 CALL26, page-address, low-12, and absolute-data relocations. The
 lowering is deliberately simple and non-optimizing: every value homes to a stack
 slot, and each instruction loads its operands, computes, and stores its result.
 It covers scalar integers and floats, control flow, pointers and `address_of`,
-module globals, heap allocation, direct calls, and calls through a function
-pointer. The SIMD super-ops and aggregate-by-value calls are not part of the
-AArch64 surface; each one that is missing names itself when lowering stops, so a
-failure says which op in which function it was.
+module globals, heap allocation, structs and arrays, runtime bounds/null traps,
+direct calls, calls through a function pointer, and aggregate parameters and
+returns. The SIMD super-ops are not part of the AArch64 surface; an op that is
+missing names itself when lowering stops, so a failure says which op in which
+function it was.
+
+Aggregates follow one internal convention on both output paths: a composite
+wider than a register travels as its ADDRESS (arguments by reference, returns
+through a caller buffer whose address rides in x8, the AAPCS64 indirect-result
+register), while a composite that fits in a register travels packed. A `string`
+is a 16-byte { chars, length } record, so a string literal used as a value is
+the address of such a record, and the IR's bare aggregate-local names read as
+addresses only in load/store address positions -- everywhere else the frontend
+has already chosen how the value travels. Local names reused across sibling
+scopes with different types are re-classified at each declaration; the maps are
+not first-declaration-wins.
 
 A function's address becomes a value through the same two mechanisms globals
 use: page/lo12 relocations against the function symbol in an object, and a
@@ -1693,6 +1705,19 @@ by default:
 - **NaN ordering.** FCMP leaves `N=0,Z=0,C=1,V=1` when either operand is NaN,
   and both LT and LE read TRUE under those flags. `<` and `<=` therefore lower
   to MI and LS, which are false when unordered, as IEEE-754 requires.
+- **Float widths.** A float value is a bit pattern at its own width, and
+  fmov'ing a float32 pattern into a d register reads it as a denormal, not a
+  widened value. Mixed-width arithmetic runs at the instruction's promoted
+  width with fcvt on the narrower operand; literals adapt to context;
+  assignments convert to the destination's declared width.
+- **Narrow integers.** Locals and parameters of size 1/2/4 store and load at
+  their declared width with the right extension, so `int8` arithmetic wraps
+  and assigning a wide value to an `int32` local truncates.
+- **Register 31.** In the shifted-register data-processing encodings Rd=31 is
+  XZR, not SP. The large-frame prologue once subtracted the frame size via a
+  register and moved nothing; frames now lower sp with two subtract-immediates
+  (24-bit reach), and slot accesses past the scaled-offset field's 32760-byte
+  limit go through a computed base instead of silently truncating into it.
 
 The explicit `--emit-arm64` flag writes a self-contained static executable with
 its own `_start`, for assembler-free and linker-free bring-up. It has no libc,
@@ -1707,7 +1732,10 @@ so it carries two things an object file gets from the system instead:
   syscalls: `malloc`/`calloc`/`free` (a bump pointer over anonymous `mmap`,
   where `free` is a no-op and memory is never reused, which is also why a fresh
   block is always zero), `puts`, `putchar`, `write`, `strlen`, `memcpy`,
-  `memmove`, `memset`, `exit`, and `abort`.
+  `memmove`, `memset`, `exit`, and `abort`. String `+` composes the malloc and
+  memcpy stubs into one fresh block holding the new record and its characters;
+  runtime traps compose `puts` with the exit syscall, so a null deref or bounds
+  failure prints its message and exits 1 exactly as on x86.
 
 ## 6.13 NVIDIA PTX
 

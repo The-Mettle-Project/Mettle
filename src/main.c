@@ -3800,11 +3800,11 @@ int compile_file(const char *input_filename, const char *output_filename,
   ir_lowering_set_explain(options->explain && options->optimize &&
                           !options->emit_ptx && !options->emit_spirv);
 
+  /* --emit-arm64 keeps the checks: its traps print the message and exit(1)
+   * like the x86 backend's, so debug semantics match across targets. (The
+   * exclusion dated from bring-up, when the trap calls could not lower.) */
   int emit_runtime_checks =
-      (options->release || options->emit_ptx || options->emit_spirv ||
-       options->emit_arm64)
-          ? 0
-          : 1;
+      (options->release || options->emit_ptx || options->emit_spirv) ? 0 : 1;
   compiler_set_phase(PROFILE_PHASE_IR_LOWERING);
   phase_start = compiler_profile_begin(&profile);
   int ir_ok = compile_lower_to_ir(program, type_checker, symbol_table,

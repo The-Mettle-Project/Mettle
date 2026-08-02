@@ -236,16 +236,21 @@ int arm64_emit_prologue(Arm64Emit *e, int frame_bytes, const Arm64Reg *saved,
     ok = arm64_emit_word(e, arm64_sub_imm(1, ARM64_SP, ARM64_SP,
                                           (uint32_t)frame_bytes, 0));
   } else if (ok && frame_bytes > 4095) {
-    /* Large frame: materialize the size in the IP0 scratch (x16) and subtract
-     * via register. The epilogue restores sp from x29, so no symmetric work. */
+    /* Large frame: two subtract-immediates (the second shifted by 12) reach 24
+     * bits and keep sp in the SP-capable immediate slot. The old form
+     * subtracted VIA A REGISTER -- and in the shifted-register encoding, Rd=31
+     * is XZR, not SP: the subtraction went to the zero register, sp never
+     * moved, and every big-frame function ran above the top of its stack. The
+     * epilogue restores sp from x29, so no symmetric work. */
     uint32_t v = (uint32_t)frame_bytes;
-    ok = arm64_emit_word(e, arm64_movz(1, ARM64_X16, (uint16_t)(v & 0xFFFF), 0));
-    if (ok && (v >> 16)) {
-      ok = arm64_emit_word(e,
-                           arm64_movk(1, ARM64_X16, (uint16_t)(v >> 16), 1));
+    if (v > 0xFFFFFF) {
+      arm64_fail(e, "frame of %d bytes exceeds the 16MB prologue reach",
+                 frame_bytes);
+      return 0;
     }
-    ok = ok && arm64_emit_word(e, arm64_sub_reg(1, ARM64_SP, ARM64_SP,
-                                                ARM64_X16));
+    ok = arm64_emit_word(e, arm64_sub_imm(1, ARM64_SP, ARM64_SP, v & 0xFFF,
+                                          0)) &&
+         arm64_emit_word(e, arm64_sub_imm(1, ARM64_SP, ARM64_SP, v >> 12, 1));
   }
   for (int i = 0; ok && i < n_saved; i++) {
     ok = arm64_emit_word(e, arm64_str_imm(1, saved[i], ARM64_SP, 8 * i));

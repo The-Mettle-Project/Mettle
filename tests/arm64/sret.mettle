@@ -1,0 +1,31 @@
+// A 16-byte struct returned by value: comes back through the x8 buffer, lands
+// in locals, struct fields, and array elements without clobbering neighbours.
+// 1+2+4+8+16 = 31
+struct Rect { left: int32; top: int32; right: int32; bottom: int32; }
+struct Config { rect: Rect; tag: int32; }
+fn make_rect(base: int32) -> Rect {
+  var r: Rect;
+  r.left = base + 1; r.top = base + 2; r.right = base + 3; r.bottom = base + 4;
+  return r;
+}
+fn rect_ok(r: Rect, base: int32) -> int32 {
+  if (r.left != base + 1) { return 0; }
+  if (r.bottom != base + 4) { return 0; }
+  return 1;
+}
+fn main() -> int64 {
+  var r: int64 = 0;
+  var plain: Rect = make_rect(0);
+  if (rect_ok(plain, 0) == 1) { r = r + 1; }
+  var cfg: Config;
+  cfg.tag = 99;
+  cfg.rect = make_rect(20);
+  if (rect_ok(cfg.rect, 20) == 1) { r = r + 2; }
+  if (cfg.tag == 99) { r = r + 4; }
+  var arr: Rect[4];
+  arr[0] = make_rect(60);
+  arr[2] = make_rect(50);
+  if (rect_ok(arr[2], 50) == 1) { r = r + 8; }
+  if (rect_ok(arr[0], 60) == 1) { r = r + 16; }
+  return r;
+}

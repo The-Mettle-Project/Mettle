@@ -146,10 +146,12 @@ covered by an eleven-argument CUDA launch ABI gate.
 
 The lowering model remains deliberately simple and non-optimizing: values are
 homed to stack slots around scalar integer, pointer, load/store, address-of,
-float, control-flow, heap-allocation, direct-call, and indirect-call (function
-pointer) operations. Aggregate-by-value calls and optimized SIMD IR are not yet
-an AArch64 surface; an op that is missing names itself and its function when
-lowering stops, rather than reporting a generic failure.
+float, control-flow, heap-allocation, direct-call, indirect-call (function
+pointer), aggregate, and runtime-check operations. Aggregates wider than a
+register travel as their address (arguments by reference, returns through the
+x8 result buffer); register-sized ones travel packed. Optimized SIMD IR is not
+yet an AArch64 surface; an op that is missing names itself and its function
+when lowering stops, rather than reporting a generic failure.
 
 Because this path computes in 64-bit registers, two comparison cases need
 explicit handling: unsigned values (tracked from declared types, `is_unsigned`,

@@ -22,3 +22,11 @@ gvar 20
 heapsum 236
 fnptr 249
 aggcopy 248
+f32ptr 41
+narrow 31
+bigframe 235
+scopes 15
+sret 31
+trapnull 1
+f32glob 150
+strcat 24
