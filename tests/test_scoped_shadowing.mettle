@@ -1,0 +1,68 @@
+import "std/io";
+
+// Two locals that share a name but not a type. Locals are addressed by name all
+// the way to the backends, which key their frame slot, float and declared-type
+// tables on that name, so both bindings used to land in one slot at one type:
+// the float64 `v` here made the uint64 `v` compare as a float (its bits decode
+// as a denormal, so `v > 100` was false), and the Quad `v` overran the 8-byte
+// slot the int64 `v` had already claimed.
+
+struct Quad { a: int64; b: int64; c: int64; d: int64; }
+
+fn siblings() -> int64 {
+  var total: int64 = 0;
+  {
+    var v: float64 = 6.25;
+    total = total + (int64)(v * 2.0);
+  }
+  {
+    var v: uint64 = 200;
+    if (v > 100) { total = total + 3; }
+  }
+  return total;
+}
+
+fn nested() -> int64 {
+  var v: int64 = 5;
+  {
+    var v: float64 = 6.25;
+    if (v > 6.0) { }
+  }
+  return v;
+}
+
+fn widened() -> int64 {
+  var guard: int64 = 20;
+  {
+    var v: int64 = 1;
+    guard = guard - v;
+  }
+  {
+    var v: Quad;
+    v.a = 1; v.b = 2; v.c = 3; v.d = 4;
+    guard = guard - v.d + v.a;
+  }
+  return guard;
+}
+
+fn same_type_shares() -> int64 {
+  var total: int64 = 0;
+  {
+    var v: int64 = 3;
+    total = total + v;
+  }
+  {
+    var v: int64 = 4;
+    total = total + v;
+  }
+  return total;
+}
+
+fn main() -> int32 {
+  if (siblings() != 15) { println(cstr("scoped_shadowing siblings WRONG")); return 1; }
+  if (nested() != 5) { println(cstr("scoped_shadowing nested WRONG")); return 2; }
+  if (widened() != 16) { println(cstr("scoped_shadowing widened WRONG")); return 3; }
+  if (same_type_shares() != 7) { println(cstr("scoped_shadowing same_type WRONG")); return 4; }
+  println(cstr("scoped_shadowing OK"));
+  return 0;
+}

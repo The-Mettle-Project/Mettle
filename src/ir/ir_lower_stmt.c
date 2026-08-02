@@ -17,21 +17,26 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
       return 1;
     }
     if (!defers) {
+      ir_local_scope_enter(context);
       for (size_t i = 0; i < program->declaration_count; i++) {
         if (!ir_lower_statement_with_defers(context, function,
                                             program->declarations[i], NULL)) {
+          ir_local_scope_leave(context);
           return 0;
         }
       }
+      ir_local_scope_leave(context);
       return 1;
     }
 
     IRDeferScope block_scope = {0};
     block_scope.parent = defers;
+    ir_local_scope_enter(context);
     for (size_t i = 0; i < program->declaration_count; i++) {
       if (!ir_lower_statement_with_defers(
               context, function, program->declarations[i], &block_scope)) {
         ir_defer_stack_free(&block_scope.stack);
+        ir_local_scope_leave(context);
         return 0;
       }
     }
@@ -39,6 +44,7 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     int ok =
         ir_emit_deferred_calls_non_err(context, function, &block_scope.stack);
     ir_defer_stack_free(&block_scope.stack);
+    ir_local_scope_leave(context);
     return ok;
   }
 
@@ -59,9 +65,19 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     if (!decl_type && declaration->initializer) {
       decl_type = declaration->initializer->resolved_type;
     }
+    /* Bind before anything is emitted: a name already declared in this
+     * function at a different type gets one of its own, so the two do not
+     * share a frame slot (and a type) in the backends. */
+    const char *decl_type_text = declaration->type_name;
+    if (!decl_type_text && declaration->initializer &&
+        declaration->initializer->resolved_type) {
+      decl_type_text = declaration->initializer->resolved_type->name;
+    }
+    const char *local_name =
+        ir_local_bind(context, declaration->name, decl_type_text);
     local.op = IR_OP_DECLARE_LOCAL;
     local.location = statement->location;
-    local.dest = ir_operand_symbol(declaration->name);
+    local.dest = ir_operand_symbol(local_name);
     local.text = declaration->type_name;
     local.value_type = mtlc_type_from_frontend(decl_type);
     if (declaration->address_space != AST_ADDRESS_SPACE_DEFAULT) {
@@ -130,7 +146,7 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
       /* The literal was folded to a constant image at type-check time; copy it
        * in wholesale rather than lowering it as an expression. */
       return ir_emit_aggregate_literal_copy_to_symbol(
-          context, function, declaration->name, declaration->initializer,
+          context, function, local_name, declaration->initializer,
           decl_type, statement->location);
     }
 
@@ -148,14 +164,14 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
         return 0;
       }
       if (ir_try_emit_aggregate_symbol_memcpy(context, function,
-                                              declaration->name, &value,
+                                              local_name, &value,
                                               decl_type, statement->location)) {
         ir_operand_destroy(&value);
       } else {
         IRInstruction assign = {0};
         assign.op = IR_OP_ASSIGN;
         assign.location = statement->location;
-        assign.dest = ir_operand_symbol(declaration->name);
+        assign.dest = ir_operand_symbol(local_name);
         assign.lhs = value;
         ir_assign_apply_float_bits(
             &assign, &assign.lhs,
@@ -193,7 +209,9 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
         Type *assign_type =
             ir_lookup_symbol_type(context, assignment->variable_name);
         return ir_emit_aggregate_literal_copy_to_symbol(
-            context, function, assignment->variable_name, assignment->value,
+            context, function,
+            ir_local_ir_name(context, assignment->variable_name),
+            assignment->value,
             assign_type ? assign_type : literal_type, statement->location);
       }
       if (!assignment->target) {
@@ -220,6 +238,10 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     }
 
     if (assignment->variable_name) {
+      const IRLocalBinding *binding =
+          ir_local_binding_find(context, assignment->variable_name);
+      const char *target_name =
+          binding ? binding->ir_name : assignment->variable_name;
       Type *assign_type =
           ir_lookup_symbol_type(context, assignment->variable_name);
       if (!assign_type && assignment->value) {
@@ -233,7 +255,7 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
         return 0;
       }
       if (ir_try_emit_aggregate_symbol_memcpy(
-              context, function, assignment->variable_name, &value,
+              context, function, target_name, &value,
               assign_type, statement->location)) {
         ir_operand_destroy(&value);
         return 1;
@@ -243,22 +265,23 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
         IRInstruction assign = {0};
         assign.op = IR_OP_ASSIGN;
         assign.location = statement->location;
-        assign.dest = ir_operand_symbol(assignment->variable_name);
+        assign.dest = ir_operand_symbol(target_name);
         assign.lhs = value;
-        /* Target float width for the narrowing/widening on store. Prefer the
-         * symbol table, but its function scope is usually popped by lowering
-         * time, so fall back to the declared type recorded on the emitted
-         * DECLARE_LOCAL. Without this, a float64 expression assigned into a
-         * float32 local kept the float64 width and stored the wrong 4 bytes.
-         * Gate the IR scan on a floating RHS so non-float assigns stay O(1). */
+        /* Target float width for the narrowing/widening on store. A local's
+         * own binding is authoritative -- the symbol table is keyed by source
+         * name, so a shadowed local resolves there to whichever declaration
+         * won. Otherwise the symbol table, then (for an inferred local, which
+         * has no declared type text) the emitted DECLARE_LOCAL. Gate that IR
+         * scan on a floating RHS so non-float assigns stay O(1). */
         int target_float_bits =
-            ir_symbol_float_bits(context, assignment->variable_name);
+            binding ? ir_named_type_float_bits(context, binding->type_text)
+                    : ir_symbol_float_bits(context, assignment->variable_name);
         if (target_float_bits == 0 && assignment->value &&
             assignment->value->resolved_type &&
             (assignment->value->resolved_type->kind == TYPE_FLOAT32 ||
              assignment->value->resolved_type->kind == TYPE_FLOAT64)) {
           target_float_bits = ir_local_declared_float_bits(
-              context, function, assignment->variable_name);
+              context, function, target_name);
         }
         ir_assign_apply_float_bits(&assign, &assign.lhs, target_float_bits);
         if (!assign.dest.name) {

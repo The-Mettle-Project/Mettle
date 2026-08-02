@@ -3621,6 +3621,40 @@ foreach ($relFlag in @($true, $false)) {
   }
 }
 
+# Two locals sharing a name but not a type. Every backend table that describes a
+# local -- frame slot, declared type, float width -- is keyed by name, so the two
+# bindings shared one slot at one type: a uint64 declared after a float64 of the
+# same name compared as a float, and a struct declared after a scalar overran the
+# scalar's slot. The lowering now gives the second binding a name of its own.
+foreach ($relFlag in @($true, $false)) {
+  $total++
+  $variant = if ($relFlag) { "release" } else { "debug" }
+  try {
+    $exePath = Join-Path $tmpDir "test_scoped_shadowing_$variant.exe"
+    $buildArgs = @("--build")
+    if ($relFlag) { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_scoped_shadowing.mettle", "-o", $exePath)
+
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "scoped-shadowing build ($variant) failed: $buildOut"
+    }
+    $runOut = & $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "scoped-shadowing ($variant) failed (exit $LASTEXITCODE): $runOut"
+    }
+    if ($runOut -notmatch "scoped_shadowing OK") {
+      throw "scoped-shadowing ($variant) did not print OK: $runOut"
+    }
+
+    Write-CaseResult -Name "scoped_shadowing_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "scoped_shadowing_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # The MIR encoder stages a spilled base/index/value through a scratch register.
 # RDX was a candidate, but RDX is in the allocator's pool: staging over the live
 # loop counter it held made the counter run past its bound and the release build
@@ -6492,6 +6526,128 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "arm64_source" -Passed $false -Reason $_.Exception.Message
+}
+
+# The AArch64 *object* backend, from an x86-64 host. It used to be reachable
+# only on an ARM machine (the driver picked it with #if defined(__aarch64__)),
+# so every change to the shared lowering went untested off ARM. --emit-arm64-obj
+# asks any host for it. Checked structurally -- an AArch64 REL object with the
+# expected relocation -- because this host has no linker that could take one.
+$total++
+try {
+  # ELF64 header: e_type at 0x10, e_machine at 0x12; section headers at e_shoff
+  # with e_shnum entries of e_shentsize, names in section e_shstrndx.
+  function Get-ElfSectionSize([byte[]]$bytes, [string]$wanted) {
+    $shoff = [BitConverter]::ToUInt64($bytes, 0x28)
+    $shentsize = [BitConverter]::ToUInt16($bytes, 0x3A)
+    $shnum = [BitConverter]::ToUInt16($bytes, 0x3C)
+    $shstrndx = [BitConverter]::ToUInt16($bytes, 0x3E)
+    $strtab = [BitConverter]::ToUInt64($bytes, [int]($shoff + $shstrndx * $shentsize + 0x18))
+    for ($i = 0; $i -lt $shnum; $i++) {
+      $sh = [int]($shoff + $i * $shentsize)
+      $nameOff = [int]($strtab + [BitConverter]::ToUInt32($bytes, $sh))
+      $end = $nameOff
+      while ($bytes[$end] -ne 0) { $end++ }
+      $name = [Text.Encoding]::ASCII.GetString($bytes, $nameOff, $end - $nameOff)
+      if ($name -eq $wanted) { return [BitConverter]::ToUInt64($bytes, $sh + 0x20) }
+    }
+    return -1
+  }
+
+  $objDir = Join-Path $tmpDir "arm64obj"
+  New-Item -ItemType Directory -Force -Path $objDir | Out-Null
+  $names = Get-Content tests\arm64\expected.txt |
+    ForEach-Object { ($_ -split '\s+')[0] } | Where-Object { $_ }
+  foreach ($n in $names) {
+    $obj = Join-Path $objDir "$n.o"
+    & $CompilerPath --emit-arm64-obj "tests\arm64\$n.mettle" -o $obj 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "mettle --emit-arm64-obj failed on $n.mettle"
+    }
+    $bytes = [IO.File]::ReadAllBytes($obj)
+    if ($bytes[0] -ne 0x7F -or $bytes[1] -ne 0x45 -or $bytes[2] -ne 0x4C -or $bytes[3] -ne 0x46) {
+      throw "$n.o is not an ELF file"
+    }
+    $etype = [BitConverter]::ToUInt16($bytes, 0x10)
+    $emachine = [BitConverter]::ToUInt16($bytes, 0x12)
+    if ($etype -ne 1) { throw "$n.o is ELF type $etype, expected 1 (REL)" }
+    if ($emachine -ne 183) { throw "$n.o is machine $emachine, expected 183 (AArch64)" }
+  }
+
+  # A call to an undefined external has to leave a relocation behind for the
+  # linker; native_link.mettle calls libc's putchar.
+  $extObj = Join-Path $objDir "native_link.o"
+  & $CompilerPath --emit-arm64-obj tests\arm64\native_link.mettle -o $extObj 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "mettle --emit-arm64-obj failed on native_link.mettle"
+  }
+  $extBytes = [IO.File]::ReadAllBytes($extObj)
+  $relaSize = Get-ElfSectionSize $extBytes ".rela.text"
+  if ($relaSize -le 0) {
+    throw "native_link.o has no .rela.text relocations for its extern call"
+  }
+
+  Write-CaseResult -Name "arm64_object" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "arm64_object" -Passed $false -Reason $_.Exception.Message
+}
+
+# The same fixtures at -O. --emit-arm64 used to emit before the optimizer ran,
+# so --release was accepted and silently ignored; it now runs the optimizer's
+# target-neutral half (scalar and control-flow transforms that keep the shared
+# IR instruction set) and lowers the result. Same answers as the debug build.
+# trapnull is excluded: release strips runtime checks on every target, so its
+# deliberate null dereference faults instead of printing and exiting 1 -- the
+# x86 release build faults on it too.
+$total++
+try {
+  $relDir = Join-Path $tmpDir "arm64rel"
+  New-Item -ItemType Directory -Force -Path $relDir | Out-Null
+  $relNames = Get-Content tests\arm64\expected.txt |
+    Where-Object { $_ -and ($_ -split '\s+')[0] -ne "trapnull" }
+  Set-Content -Encoding ascii (Join-Path $relDir "manifest.txt") $relNames
+  foreach ($line in $relNames) {
+    $n = ($line -split '\s+')[0]
+    $elf = Join-Path $relDir "$n.elf"
+    & $CompilerPath --emit-arm64 --release "tests\arm64\$n.mettle" -o $elf 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $elf)) {
+      throw "mettle --emit-arm64 --release failed on $n.mettle"
+    }
+  }
+
+  $wsl = Get-Command wsl -ErrorAction SilentlyContinue
+  if ($wsl -and $relDir -match '^[A-Za-z]:\\') {
+    $toWsl = {
+      param($p)
+      "/mnt/" + $p.Substring(0, 1).ToLower() + ($p.Substring(2) -replace '\\', '/')
+    }
+    $wslScript = & $toWsl (Resolve-Path (Join-Path $PSScriptRoot "arm64_qemu_run.sh")).Path
+    $runOut = & wsl bash $wslScript (& $toWsl $relDir) 2>&1 | Out-String
+    $code = $LASTEXITCODE
+    if ($code -eq 0) {
+      Write-Host ($runOut.Trim())
+    }
+    elseif ($code -eq 64) {
+      Write-Host "[SKIP] arm64_source_release execution (qemu-aarch64 not found; all fixtures lowered)"
+    }
+    elseif ($code -eq 1) {
+      throw "AArch64 --release program(s) produced wrong result under qemu:`n$runOut"
+    }
+    else {
+      Write-Host "[SKIP] arm64_source_release execution (qemu run unavailable: exit $code)"
+    }
+  }
+  else {
+    Write-Host "[SKIP] arm64_source_release execution (no WSL; all fixtures lowered)"
+  }
+
+  Write-CaseResult -Name "arm64_source_release" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "arm64_source_release" -Passed $false -Reason $_.Exception.Message
 }
 
 # General reduction-unrolling vectorizer: correctness on non-benchmark

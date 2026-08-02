@@ -797,7 +797,9 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
         *out_type = ir_infer_expression_type(context, expression);
       }
     }
-    return ir_emit_address_of_symbol(context, function, identifier->name,
+    return ir_emit_address_of_symbol(context, function,
+                                     ir_local_ir_name(context,
+                                                      identifier->name),
                                      expression->location, out_address);
   }
 

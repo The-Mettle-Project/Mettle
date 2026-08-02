@@ -43,6 +43,10 @@ typedef struct {
   int report_launches; /* --report-launches: list every dispatch site */
   int emit_spirv; /* --emit-spirv: lower declared kernels to SPIR-V, no object */
   int emit_arm64; /* --emit-arm64: lower scalar functions to an AArch64 ELF */
+  /* --emit-arm64-obj: emit an AArch64 relocatable object instead of a host
+   * one. This is the path an ARM host takes by default; the flag makes it
+   * reachable (and testable) from an x86-64 host too. */
+  int emit_arm64_obj;
   int optimize;
   int release;
   int simd_report; /* --simd-report: note what each `@simd` loop became */

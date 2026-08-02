@@ -551,9 +551,12 @@ static void populate_module_symbols(IRProgram *program, ASTNode *ast_program,
       entry.kind = IR_MODSYM_FUNCTION;
       entry.is_extern = fd->is_extern;
       entry.is_kernel = fd->is_kernel;
-      entry.has_body =
-          fd->body != NULL &&
-          program_has_function_body(program, &body_set, fd->name);
+      /* Whether the MODULE defines this function, not whether this particular
+       * declaration carries the body: a forward declaration and its later
+       * definition each add a symbol entry, and lookups find the first. Asking
+       * fd->body made the forward declaration's entry claim there was no body,
+       * so a backend that skips body-less symbols skipped the definition. */
+      entry.has_body = program_has_function_body(program, &body_set, fd->name);
       entry.link_name = s ? s->link_name : NULL;
       entry.type = s ? mtlc_type_from_frontend(s->type) : NULL;
       if (s && s->kind == SYMBOL_FUNCTION) {

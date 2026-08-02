@@ -214,6 +214,11 @@ typedef struct {
   int size;
   int is_float;
   int float_bits;
+  /* Set when a LOAD of this slot said its scalar is unsigned. Only loads carry
+   * that flag, so it is folded in rather than matched: a store recording the
+   * slot first says nothing about signedness. Without it a uint8 field's
+   * replacement scalar was declared int8 and its value sign-extended. */
+  int is_unsigned;
   char *name; /* synthesized scalar local name, owned */
 } IRSroaSlot;
 

@@ -809,7 +809,8 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
                                            out_value);
     }
 
-    *out_value = ir_operand_symbol(identifier->name);
+    *out_value =
+        ir_operand_symbol(ir_local_ir_name(context, identifier->name));
     if (!out_value->name) {
       ir_set_error(context, "Out of memory while lowering identifier");
       return 0;
@@ -1230,7 +1231,8 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
         return 0;
       }
       for (size_t i = 0; i < lam->captured_count; i++)
-        args[i] = ir_operand_symbol(lam->captured_names[i]);
+        args[i] = ir_operand_symbol(
+            ir_local_ir_name(context, lam->captured_names[i]));
       IRInstruction call = {0};
       call.op = IR_OP_CALL;
       call.location = expression->location;

@@ -30,3 +30,5 @@ sret 31
 trapnull 1
 f32glob 150
 strcat 24
+shadow 25
+wideagg 201

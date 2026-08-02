@@ -1,0 +1,38 @@
+// Local shadowing, where the shadowing declaration has a different type from
+// the one it hides. Locals are addressed by name all the way to the backends,
+// so both used to share one frame slot and one type classification.
+//
+// `inner` shadows a live outer local from a nested scope: the outer `v` must
+// survive the inner one and still read as an int64 afterwards.
+// `wide` shadows an 8-byte local with a 32-byte struct in a sibling scope: the
+// slot has to be the struct's size, or the writes run off the end of it.
+// inner() = 5, wide() = 20 - 1 - 4 + 1 = 16, so 5 + 4 + 16 = 25
+
+struct Quad { a: int64; b: int64; c: int64; d: int64; }
+
+fn inner() -> int64 {
+  var v: int64 = 5;
+  {
+    var v: float64 = 6.25;
+    if (v > 6.0) { }
+  }
+  return v;
+}
+
+fn wide() -> int64 {
+  var guard: int64 = 20;
+  {
+    var v: int64 = 1;
+    guard = guard - v;
+  }
+  {
+    var v: Quad;
+    v.a = 1; v.b = 2; v.c = 3; v.d = 4;
+    guard = guard - v.d + v.a;
+  }
+  return guard;
+}
+
+fn main() -> int64 {
+  return inner() + 4 + wide();
+}

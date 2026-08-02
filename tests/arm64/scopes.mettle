@@ -4,9 +4,9 @@
 // bits decoded as a denormal (~0) and the compare went the wrong way.
 // 12 + 3 = 15
 //
-// NOTE: the x86-64 backend currently returns 12 -- it has this same
-// first-declaration-wins bug (task filed); this manifest entry asserts the
-// correct answer, so do not "fix" it to match x86.
+// The lowering now gives the second `v` an IR name of its own, so both
+// backends resolve each binding's own type. See shadow.mettle for the nested
+// and differently-sized cases.
 fn main() -> int64 {
   var total: int64 = 0;
   {

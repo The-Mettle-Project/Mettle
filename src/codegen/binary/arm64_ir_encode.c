@@ -2,6 +2,7 @@
 #include "codegen/binary_emitter.h"
 #include "codegen/binary_emitter_internal.h"
 
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,13 +14,17 @@
 #define ELF_BASE 0x400000u
 #define ELF_HDRS 176u /* Ehdr + 2 Phdr */
 
-/* The writable segment loads at a FIXED virtual address, 2MiB above the code,
- * so a global's address is a compile-time constant: this path emits a bare
- * executable with no relocations to defer it to, and the code size is not known
- * while the code that references a global is being emitted. arm64_write_elf
- * rejects a program whose text would reach that far. */
-#define ELF_DATA_VADDR (ELF_BASE + 0x200000u)
-#define ELF_TEXT_LIMIT 0x200000u
+/* The writable segment loads at a FIXED virtual address, so a global's address
+ * is a compile-time constant: this path emits a bare executable with no
+ * relocations to defer it to, and the code size is not known while the code
+ * that references a global is being emitted. The address is what the text may
+ * not grow into, so it sits a gigabyte up -- an address is materialized from
+ * 16-bit fields, and one whose only non-zero field is bits 16..31 costs exactly
+ * what the old 2MiB gap did. arm64_write_elf still rejects text that reaches
+ * it, but nothing this backend can emit gets close. Address space, not file
+ * size: the segment's file offset still follows the text. */
+#define ELF_DATA_VADDR 0x40000000u
+#define ELF_TEXT_LIMIT (ELF_DATA_VADDR - ELF_BASE)
 
 /* The first bytes of the writable segment are the bump allocator's state, which
  * the malloc stub reads and writes; module globals follow. */
@@ -913,6 +918,20 @@ static int emit_external_call(Arm64Emit *e, Arm64ObjectContext *object,
                                BINARY_RELOCATION_ARM64_CALL26, link_name);
 }
 
+/* Call one of the C runtime entry points the lowering composes higher-level
+ * operations from. The self-contained executable emits its own freestanding
+ * stub and branches to it; an object leaves a CALL26 relocation for the linker
+ * to resolve against the real libc. Same name either way -- the stubs are named
+ * for the functions they stand in for. */
+static int emit_runtime_call(Arm64Emit *e, Arm64ObjectContext *object,
+                             const IRProgram *prog, LblMap *fns, int stub) {
+  if (object) {
+    return emit_external_call(e, object, prog, RUNTIME_STUBS[stub].name);
+  }
+  arm64_emit_bl(e, label_for(e, fns, RUNTIME_STUBS[stub].name));
+  return 1;
+}
+
 /* rd = &function. An object defers it to page/lo12 relocations against the
  * function's symbol, exactly as for a global; the self-contained executable has
  * no relocations, so it patches the absolute address into a movz/movk quartet
@@ -1519,11 +1538,37 @@ static Arm64Reg address_operand(Arm64Emit *e, SlotMap *s, const AggMap *ag,
   return load_into(e, s, op, dest);
 }
 
+/* Past this many bytes a record is copied by a loop rather than unrolled: two
+ * instructions per eight bytes stops being a good trade, and the scaled
+ * ldr/str offset field runs out at 32760 regardless. */
+#define ARM64_COPY_UNROLL_MAX 128
+
 /* Copy `size` bytes from [src] to [dst], widest access first. Both are
  * addresses; offsets stay naturally aligned for each access width. */
 static void emit_fixed_copy(Arm64Emit *e, Arm64Reg dst, Arm64Reg src,
                             int size) {
   int off = 0;
+  if (size > ARM64_COPY_UNROLL_MAX) {
+    /* Walk the 8-byte bulk through private cursors so the caller's dst/src
+     * survive the copy. X13-X15 are live only inside the freestanding stubs,
+     * which never copy a record. */
+    int words = size / 8;
+    int loop = arm64_new_label(e);
+    arm64_emit_word(e, arm64_mov_reg(1, ARM64_X13, dst));
+    arm64_emit_word(e, arm64_mov_reg(1, ARM64_X14, src));
+    emit_imm(e, ARM64_X15, (uint64_t)words);
+    arm64_bind_label(e, loop);
+    arm64_emit_word(e, arm64_ldr_imm(1, R_AUX, ARM64_X14, 0));
+    arm64_emit_word(e, arm64_str_imm(1, R_AUX, ARM64_X13, 0));
+    arm64_emit_word(e, arm64_add_imm(1, ARM64_X14, ARM64_X14, 8, 0));
+    arm64_emit_word(e, arm64_add_imm(1, ARM64_X13, ARM64_X13, 8, 0));
+    arm64_emit_word(e, arm64_sub_imm(1, ARM64_X15, ARM64_X15, 1, 0));
+    arm64_emit_cbnz(e, 1, ARM64_X15, loop);
+    /* The cursors now point at the tail, so it copies from offset zero. */
+    dst = ARM64_X13;
+    src = ARM64_X14;
+    size -= words * 8;
+  }
   while (size - off >= 8) {
     arm64_emit_word(e, arm64_ldr_imm(1, R_AUX, src, off));
     arm64_emit_word(e, arm64_str_imm(1, R_AUX, dst, off));
@@ -1586,7 +1631,7 @@ static int fn_aggregate_return_size(const IRProgram *prog, const char *name) {
     return 0;
   }
   size_t size = mtlc_type_size(symbol->return_type);
-  return size > 8 && size <= 64 ? (int)size : 0;
+  return size > 8 && size <= INT_MAX ? (int)size : 0;
 }
 
 /* Slot names for the sret plumbing (interned literals, so slot_alloc's
@@ -1750,13 +1795,20 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
   if (sret_size) {
     slot_alloc(&slots, SRET_SAVE_SLOT, 8);
   }
+  /* One buffer, sized for the widest record any call in this function returns:
+   * the callee writes its result through x8 into it. */
+  int sret_buffer = 0;
   for (size_t i = 0; i < fn->instruction_count; i++) {
     const IRInstruction *in = &fn->instructions[i];
-    if (in->op == IR_OP_CALL &&
-        fn_aggregate_return_size(prog, in->text) > 0) {
-      slot_alloc(&slots, SRET_BUFFER_SLOT, 64);
-      break;
+    if (in->op == IR_OP_CALL) {
+      int ret = fn_aggregate_return_size(prog, in->text);
+      if (ret > sret_buffer) {
+        sret_buffer = ret;
+      }
     }
+  }
+  if (sret_buffer) {
+    slot_alloc(&slots, SRET_BUFFER_SLOT, sret_buffer);
   }
   for (size_t i = 0; i < fn->instruction_count; i++) {
     if (binary_is_string_concat(&fn->instructions[i])) {
@@ -1982,7 +2034,7 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
     case IR_OP_LOAD: {
       int size = in->rhs.kind == IR_OPERAND_INT ? (int)in->rhs.int_value : 8;
       Arm64Reg addr = address_operand(e, &slots, &ag, &in->lhs, R_LHS);
-      if (size > 8 && size <= 64) {
+      if (size > 8) {
         /* A wide load produces an aggregate VALUE, which travels as its
          * address. Into an aggregate local: copy the bytes. Into a temp: the
          * loaded address IS the value. */
@@ -2005,7 +2057,7 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
     case IR_OP_STORE: {
       int size = in->rhs.kind == IR_OPERAND_INT ? (int)in->rhs.int_value : 8;
       Arm64Reg addr = address_operand(e, &slots, &ag, &in->dest, R_LHS);
-      if (size > 8 && size <= 64) {
+      if (size > 8) {
         /* Wide store: copy the source record's bytes through the pointer. */
         Arm64Reg src;
         if (in->lhs.kind == IR_OPERAND_SYMBOL &&
@@ -2037,7 +2089,7 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
         /* result = a + b over { chars, length } records. One block holds the
          * new record and its characters (record first, chars at +16); bump
          * memory is fresh-zero, so the NUL after the copied bytes is free. */
-        if (object || !fns) {
+        if (!object && !fns) {
           arm64_fail(e, "string concatenation in '%s' needs the runtime "
                         "kernel, which this path does not provide",
                      fn->name);
@@ -2068,7 +2120,7 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
         arm64_emit_word(e, arm64_ldr_imm(1, R_RHS, R_RHS, 8));
         arm64_emit_word(e, arm64_add_reg(1, ARM64_X0, R_LHS, R_RHS));
         arm64_emit_word(e, arm64_add_imm(1, ARM64_X0, ARM64_X0, 17, 0));
-        arm64_emit_bl(e, label_for(e, fns, RUNTIME_STUBS[STUB_MALLOC].name));
+        emit_runtime_call(e, object, prog, fns, STUB_MALLOC);
         emit_slot_str(e, ARM64_X0, off_dst);
         /* record: chars = block+16; length = len(a) + len(b) */
         arm64_emit_word(e, arm64_add_imm(1, R_LHS, ARM64_X0, 16, 0));
@@ -2085,7 +2137,7 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
         emit_slot_ldr(e, R_LHS, off_a);
         arm64_emit_word(e, arm64_ldr_imm(1, ARM64_X1, R_LHS, 0));
         arm64_emit_word(e, arm64_ldr_imm(1, ARM64_X2, R_LHS, 8));
-        arm64_emit_bl(e, label_for(e, fns, RUNTIME_STUBS[STUB_MEMCPY].name));
+        emit_runtime_call(e, object, prog, fns, STUB_MEMCPY);
         /* memcpy(block+16+a.len, b.chars, b.len) */
         emit_slot_ldr(e, ARM64_X0, off_dst);
         arm64_emit_word(e, arm64_add_imm(1, ARM64_X0, ARM64_X0, 16, 0));
@@ -2095,7 +2147,14 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
         emit_slot_ldr(e, R_LHS, off_b);
         arm64_emit_word(e, arm64_ldr_imm(1, ARM64_X1, R_LHS, 0));
         arm64_emit_word(e, arm64_ldr_imm(1, ARM64_X2, R_LHS, 8));
-        arm64_emit_bl(e, label_for(e, fns, RUNTIME_STUBS[STUB_MEMCPY].name));
+        emit_runtime_call(e, object, prog, fns, STUB_MEMCPY);
+        /* Terminate. The freestanding allocator hands back fresh-zero memory,
+         * so this is redundant there, but libc's malloc does not. */
+        emit_slot_ldr(e, ARM64_X0, off_dst);
+        arm64_emit_word(e, arm64_ldr_imm(1, R_LHS, ARM64_X0, 8));
+        arm64_emit_word(e, arm64_add_imm(1, ARM64_X0, ARM64_X0, 16, 0));
+        arm64_emit_word(e, arm64_add_reg(1, ARM64_X0, ARM64_X0, R_LHS));
+        arm64_emit_word(e, arm64_strb_imm(ARM64_XZR, ARM64_X0, 0));
         /* The block's start IS the result record. */
         emit_slot_ldr(e, R_RES, off_dst);
         if (in->dest.kind == IR_OPERAND_SYMBOL &&

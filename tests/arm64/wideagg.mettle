@@ -1,0 +1,50 @@
+// Records wider than the old 64-byte ceiling. A composite travels as its
+// address and is copied byte-for-byte; the copy used to be unrolled, so
+// anything past 64 bytes was declined and the lowering stopped with "no
+// 96-byte scalar store". Copies now unroll up to 128 bytes and loop past that,
+// with the odd tail copied from the cursors the loop leaves behind.
+//
+// `Mid` is 96 bytes: over the old ceiling, still unrolled.
+// `Wide` is 200 bytes plus a 3-byte tail: the loop, then 2 + 1 bytes.
+// 96 + 5 + 100 = 201
+
+struct Mid {
+  a: int64; b: int64; c: int64; d: int64; e: int64; f: int64;
+  g: int64; h: int64; i: int64; j: int64; k: int64; l: int64;
+}
+
+struct Wide {
+  head: int64;
+  body: int64[24];
+  t0: int8; t1: int8; t2: int8;
+}
+
+fn mid(seed: int64) -> Mid {
+  var m: Mid;
+  m.a = seed; m.b = 2; m.c = 3; m.d = 4; m.e = 5; m.f = 6;
+  m.g = 7; m.h = 8; m.i = 9; m.j = 10; m.k = 11; m.l = 91;
+  return m;
+}
+
+fn take_mid(v: Mid) -> int64 { return v.a + v.l; }
+
+fn wide() -> int64 {
+  var w: Wide;
+  w.head = 4;
+  var i: int64 = 0;
+  while (i < 24) { w.body[i] = i; i = i + 1; }
+  w.t0 = 1; w.t1 = 2; w.t2 = 3;
+
+  var copy: Wide = w;
+  var sum: int64 = copy.head + (int64)copy.t0 + (int64)copy.t1 + (int64)copy.t2;
+  i = 0;
+  while (i < 24) { sum = sum + copy.body[i]; i = i + 1; }
+  return sum; // 4 + 6 + 276 = 286 -> checked by the caller
+}
+
+fn main() -> int64 {
+  var m: Mid = mid(5);
+  var total: int64 = take_mid(m) + m.k;  // 5 + 91 + 11 = 107
+  if (wide() != 286) { return 1; }
+  return total + 94;
+}

@@ -17,19 +17,20 @@
  * argument, dynamic offset) disqualifies it and it is left untouched. */
 
 static const char *ir_builtin_scalar_type_for_slot(int size, int is_float,
-                                                    int float_bits) {
+                                                    int float_bits,
+                                                    int is_unsigned) {
   if (is_float) {
     return float_bits == 32 ? "float32" : "float64";
   }
   switch (size) {
   case 1:
-    return "int8";
+    return is_unsigned ? "uint8" : "int8";
   case 2:
-    return "int16";
+    return is_unsigned ? "uint16" : "int16";
   case 4:
-    return "int32";
+    return is_unsigned ? "uint32" : "int32";
   default:
-    return "int64";
+    return is_unsigned ? "uint64" : "int64";
   }
 }
 
@@ -64,7 +65,7 @@ static int ir_sroa_scalar_access_width(int size) {
 
 static int ir_sroa_note_slot(IRSroaSlot *slots, size_t *slot_count,
                              long long offset, int size, int is_float,
-                             int float_bits) {
+                             int float_bits, int is_unsigned) {
   IRSroaSlot *slot = ir_sroa_find_slot(slots, *slot_count, offset);
   if (!slot) {
     if (*slot_count >= IR_SROA_MAX_SLOTS) {
@@ -75,10 +76,14 @@ static int ir_sroa_note_slot(IRSroaSlot *slots, size_t *slot_count,
     slot->size = size;
     slot->is_float = is_float;
     slot->float_bits = float_bits;
+    slot->is_unsigned = is_unsigned;
     slot->name = NULL;
     return 1;
   }
 
+  if (is_unsigned) {
+    slot->is_unsigned = 1;
+  }
   return slot->size == size && slot->is_float == is_float &&
          slot->float_bits == float_bits;
 }
@@ -289,7 +294,8 @@ static int ir_sroa_transform_all(IRFunction *function,
           char *nm = ir_sroa_scalar_name(fm->name, slots[s].offset);
           decl.dest = nm ? ir_operand_symbol(nm) : ir_operand_none();
           decl.text = mettle_strdup(ir_builtin_scalar_type_for_slot(
-              slots[s].size, slots[s].is_float, slots[s].float_bits));
+              slots[s].size, slots[s].is_float, slots[s].float_bits,
+              slots[s].is_unsigned));
           free(nm);
           if (!decl.dest.name || !decl.text ||
               !ir_instruction_vector_append_move(&vec, &decl)) {
@@ -713,7 +719,8 @@ int ir_sroa_pass(IRFunction *function, int *changed) {
             continue;
           }
           if (!ir_sroa_note_slot(rec->slots, &rec->slot_count, ae->offset,
-                                 size, insn->is_float, insn->float_bits)) {
+                                 size, insn->is_float, insn->float_bits,
+                                 insn->is_unsigned)) {
             /* Mixed-width / mixed-class access of one offset: decline. */
             rec->eligible = 0;
           }
@@ -756,7 +763,8 @@ int ir_sroa_pass(IRFunction *function, int *changed) {
             continue;
           }
           if (!ir_sroa_note_slot(rec->slots, &rec->slot_count, ae->offset,
-                                 size, insn->is_float, insn->float_bits)) {
+                                 size, insn->is_float, insn->float_bits,
+                                 insn->is_unsigned)) {
             rec->eligible = 0;
           }
           continue;

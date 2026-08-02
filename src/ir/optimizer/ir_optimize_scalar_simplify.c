@@ -661,6 +661,68 @@ static long long ir_narrow_folded(const MtlcType *type, long long value) {
  * comparisons fold at operand width regardless of dest. Sign-sensitive ops
  * are skipped when the instruction is unsigned: the evaluator computes
  * signed semantics. */
+/* Declared integer width of a type name, as bits (0 = a full 64) plus
+ * signedness. Returns 0 for NULL, or for anything that is not an integer. */
+static int ir_declared_integer_width(const char *type, int *bits_out,
+                                     int *unsigned_out) {
+  static const struct {
+    const char *name;
+    int bits;
+    int is_unsigned;
+  } WIDTHS[] = {
+      {"int64", 0, 0},  {"uint64", 0, 1},  {"int32", 32, 0}, {"uint32", 32, 1},
+      {"int16", 16, 0}, {"uint16", 16, 1}, {"int8", 8, 0},   {"uint8", 8, 1},
+      {"bool", 8, 1},
+  };
+  if (!type) {
+    return 0;
+  }
+  for (size_t i = 0; i < sizeof(WIDTHS) / sizeof(WIDTHS[0]); i++) {
+    if (strcmp(type, WIDTHS[i].name) == 0) {
+      *bits_out = WIDTHS[i].bits;
+      *unsigned_out = WIDTHS[i].is_unsigned;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Wrap a constant assigned into a narrow integer local to that local's width.
+ * The store truncates, so the wrapped value is what the next reader loads --
+ * but propagation recorded (and forwarded) the unwrapped one. The fold below
+ * narrows a BINARY that writes the home directly; `var b: int8 = a + 1` is
+ * lowered as a BINARY into a temp followed by this ASSIGN, so it kept 128 and
+ * a later `b == -128` folded false. */
+static void ir_cp_wrap_assign_to_home(const IRFunction *function,
+                                      IRInstruction *instruction,
+                                      int *any_changed) {
+  if (!instruction || instruction->op != IR_OP_ASSIGN ||
+      instruction->is_float ||
+      instruction->dest.kind != IR_OPERAND_SYMBOL || !instruction->dest.name ||
+      instruction->lhs.kind != IR_OPERAND_INT) {
+    return;
+  }
+  int bits = 0;
+  int is_unsigned = 0;
+  const char *type =
+      ir_function_local_declared_type((IRFunction *)function,
+                                      instruction->dest.name);
+  if (!ir_declared_integer_width(type, &bits, &is_unsigned) || bits == 0) {
+    return;
+  }
+  long long value = instruction->lhs.int_value;
+  int shift = 64 - bits;
+  long long wrapped =
+      is_unsigned ? (long long)(((unsigned long long)value << shift) >> shift)
+                  : (value << shift) >> shift;
+  if (wrapped != value) {
+    instruction->lhs.int_value = wrapped;
+    if (any_changed) {
+      *any_changed = 1;
+    }
+  }
+}
+
 static void ir_cp_fold_constant_binary(const IRFunction *function,
                                        const IRTempValueMap *temp_map,
                                        const IRTempValueMap *symbol_map,
@@ -697,31 +759,10 @@ static void ir_cp_fold_constant_binary(const IRFunction *function,
                                  (IRFunction *)function,
                                  instruction->dest.name)
                            : NULL;
-    if (!type) {
-      return; /* global or untracked local: width unknown, don't fold */
-    }
-    if (strcmp(type, "int64") == 0) {
-      narrow_bits = 0;
-    } else if (strcmp(type, "uint64") == 0) {
-      narrow_bits = 0;
-      narrow_unsigned = 1;
-    } else if (strcmp(type, "int32") == 0) {
-      narrow_bits = 32;
-    } else if (strcmp(type, "int16") == 0) {
-      narrow_bits = 16;
-    } else if (strcmp(type, "int8") == 0) {
-      narrow_bits = 8;
-    } else if (strcmp(type, "uint32") == 0) {
-      narrow_bits = 32;
-      narrow_unsigned = 1;
-    } else if (strcmp(type, "uint16") == 0) {
-      narrow_bits = 16;
-      narrow_unsigned = 1;
-    } else if (strcmp(type, "uint8") == 0 || strcmp(type, "bool") == 0) {
-      narrow_bits = 8;
-      narrow_unsigned = 1;
-    } else {
-      return; /* pointer/float/struct-typed home: not an integer fold */
+    /* No type is a global or untracked local, and anything that is not an
+     * integer is a pointer/float/struct home: width unknown, don't fold. */
+    if (!ir_declared_integer_width(type, &narrow_bits, &narrow_unsigned)) {
+      return;
     }
   }
   /* The evaluator computes signed semantics, so a sign-sensitive op on an
@@ -900,6 +941,7 @@ int ir_copy_and_constant_propagation_pass(IRFunction *function,
 
       ir_cp_fold_constant_binary(function, &map, &symbol_map, instruction,
                                  &any_changed);
+      ir_cp_wrap_assign_to_home(function, instruction, &any_changed);
 
       if (ir_instruction_writes_temp(instruction) && instruction->dest.name) {
         ir_temp_value_map_remove(&map, instruction->dest.name);
