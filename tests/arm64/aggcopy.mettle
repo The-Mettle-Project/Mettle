@@ -1,0 +1,19 @@
+// Whole-struct assignment of an odd-sized struct must copy exactly its bytes
+// and leave the source alone, and a module-level float const must be read as a
+// float (its bit pattern reinterpreted, not converted from an integer).
+// 3+8+7 = 18, 3+208+7 = 218, plus (int64)(1.5 * 8.0) = 12 -> 248
+const RATE = 1.5;
+struct S3 {
+  f0: uint8;
+  f1: uint8;
+  f2: uint8;
+}
+fn main() -> int64 {
+  var sv: S3;
+  sv.f0 = (uint8)3; sv.f1 = (uint8)8; sv.f2 = (uint8)7;
+  var sc: S3 = sv;
+  sc.f1 = (uint8)208;
+  var total: int64 = (int64)sv.f0 + (int64)sv.f1 + (int64)sv.f2;
+  total = total + (int64)sc.f0 + (int64)sc.f1 + (int64)sc.f2;
+  return total + (int64)(RATE * 8.0);
+}

@@ -1,0 +1,16 @@
+// IEEE-754 ordering against NaN: every ordered comparison is false and only !=
+// is true. FCMP leaves N=0,Z=0,C=1,V=1 when unordered, where LT and LE both read
+// TRUE, so `<` and `<=` must use MI and LS. -> 32
+fn nan_of(z: float64) -> float64 { return z / z; }
+fn main() -> int64 {
+  var zero: float64 = 0.0;
+  var n: float64 = nan_of(zero);
+  var r: int64 = 0;
+  if (n < 1.0) { r = r + 1; }
+  if (n <= 1.0) { r = r + 2; }
+  if (n > 1.0) { r = r + 4; }
+  if (n >= 1.0) { r = r + 8; }
+  if (n == 1.0) { r = r + 16; }
+  if (n != 1.0) { r = r + 32; }
+  return r;
+}

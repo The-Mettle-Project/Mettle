@@ -16,3 +16,9 @@ ptr 99
 array 30
 floatcalc 35
 floatfn 110
+ucmp 7
+fnan 32
+gvar 20
+heapsum 236
+fnptr 249
+aggcopy 248

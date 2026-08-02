@@ -1,0 +1,14 @@
+// Module globals live in the executable's writable segment, shared across
+// calls. Before that segment existed each function got its own stack slot named
+// `counter` and every write was lost on return. 3+3+7+7 -> 20
+var counter: int64 = 0;
+var scale: int64 = 3;
+fn bump() -> int64 { counter = counter + scale; return counter; }
+fn main() -> int64 {
+  bump();
+  bump();
+  scale = 7;
+  bump();
+  bump();
+  return counter;
+}

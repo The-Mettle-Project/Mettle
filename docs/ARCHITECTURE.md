@@ -1669,11 +1669,45 @@ scalar tail reads the low 4 bytes.
 `arm64_ir_encode.c` writes an ELF64 relocatable object (`EM_AARCH64`) with
 AAPCS64 calls (independent x0-x7 and v0-v7 banks, 8-byte overflow stack slots)
 and AAELF64 CALL26, page-address, low-12, and absolute-data relocations. The
-lowering is deliberately simple and non-optimizing: values home to stack slots
-around scalar integer, control-flow, and direct-call operations. Floats,
-aggregates, `address_of`, and the SIMD super-ops are not part of the AArch64
-surface. The explicit `--emit-arm64` flag keeps an older self-contained `_start`
-smoke-executable path for assembler-free bring-up.
+lowering is deliberately simple and non-optimizing: every value homes to a stack
+slot, and each instruction loads its operands, computes, and stores its result.
+It covers scalar integers and floats, control flow, pointers and `address_of`,
+module globals, heap allocation, direct calls, and calls through a function
+pointer. The SIMD super-ops and aggregate-by-value calls are not part of the
+AArch64 surface; each one that is missing names itself when lowering stops, so a
+failure says which op in which function it was.
+
+A function's address becomes a value through the same two mechanisms globals
+use: page/lo12 relocations against the function symbol in an object, and a
+movz/movk quartet patched at finalize time in the self-contained executable.
+Neither can be a branch displacement, which is why function pointers need it.
+
+Two things the lowering must get right that a 64-bit-everything model gets wrong
+by default:
+
+- **Unsigned ordering.** This path computes in 64-bit registers, so a `uint64`
+  with its high bit set looks negative to the signed condition codes. It
+  tracks which values are unsigned (declared types, `is_unsigned`, pointers,
+  propagated across assignments) and picks LO/LS/HI/HS over LT/LE/GT/GE, and
+  UDIV/LSR over SDIV/ASR.
+- **NaN ordering.** FCMP leaves `N=0,Z=0,C=1,V=1` when either operand is NaN,
+  and both LT and LE read TRUE under those flags. `<` and `<=` therefore lower
+  to MI and LS, which are false when unordered, as IEEE-754 requires.
+
+The explicit `--emit-arm64` flag writes a self-contained static executable with
+its own `_start`, for assembler-free and linker-free bring-up. It has no libc,
+so it carries two things an object file gets from the system instead:
+
+- A **writable second PT_LOAD segment** at a fixed virtual address, holding
+  module globals and the allocator's state. The address is fixed because there
+  are no relocations to defer a global's address to, and the code size is not
+  known while the code referencing a global is being emitted. A program whose
+  text would reach that address is rejected rather than silently overlapped.
+- **Freestanding C runtime stubs**, emitted only when called, built on raw
+  syscalls: `malloc`/`calloc`/`free` (a bump pointer over anonymous `mmap`,
+  where `free` is a no-op and memory is never reused, which is also why a fresh
+  block is always zero), `puts`, `putchar`, `write`, `strlen`, `memcpy`,
+  `memmove`, `memset`, `exit`, and `abort`.
 
 ## 6.13 NVIDIA PTX
 

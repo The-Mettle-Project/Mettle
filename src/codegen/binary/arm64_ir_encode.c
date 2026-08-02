@@ -7,11 +7,36 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Load address and header size of the single PT_LOAD segment (see
- * arm64_write_elf). An embedded string's virtual address is ELF_BASE +
- * ELF_HDRS + its byte offset in the code blob. */
+/* Load address and header size of the self-contained executable's two PT_LOAD
+ * segments (see arm64_write_elf). An embedded string's virtual address is
+ * ELF_BASE + ELF_HDRS + its byte offset in the code blob. */
 #define ELF_BASE 0x400000u
-#define ELF_HDRS 120u
+#define ELF_HDRS 176u /* Ehdr + 2 Phdr */
+
+/* The writable segment loads at a FIXED virtual address, 2MiB above the code,
+ * so a global's address is a compile-time constant: this path emits a bare
+ * executable with no relocations to defer it to, and the code size is not known
+ * while the code that references a global is being emitted. arm64_write_elf
+ * rejects a program whose text would reach that far. */
+#define ELF_DATA_VADDR (ELF_BASE + 0x200000u)
+#define ELF_TEXT_LIMIT 0x200000u
+
+/* The first bytes of the writable segment are the bump allocator's state, which
+ * the malloc stub reads and writes; module globals follow. */
+#define HEAP_CURSOR_OFF 0u  /* uint64: next free heap byte */
+#define HEAP_END_OFF 8u     /* uint64: one past the mapped heap */
+#define DATA_RESERVED 16u
+
+/* AArch64 Linux syscall numbers and the `svc #0` word, for the freestanding
+ * paths that cannot call libc. */
+#define SYS_WRITE 64
+#define SYS_EXIT 93
+#define SYS_MMAP 222
+#define ARM64_SVC0 0xD4000001u
+/* Bytes of address space each heap mmap claims, on top of the request that
+ * forced it. Anonymous mappings are lazily backed, so this costs no memory
+ * until it is touched. */
+#define HEAP_ARENA_BYTES 0x4000000u /* 64 MiB */
 
 /* Scratch registers: lhs, rhs, result, and an aux for msub (modulo). */
 #define R_LHS ARM64_X9
@@ -30,6 +55,19 @@ typedef struct {
 /* Stack-slot map: each distinct name gets a byte offset into the frame. Scalars
  * and pointers take 8 bytes; an array local takes count*elem_size (8-aligned)
  * so &array + i*elem_size addresses its elements. */
+/* Writable data image for the self-contained executable: the allocator state
+ * followed by every module global, each at a fixed offset. The object path
+ * leaves this NULL and goes through .data/.bss relocations instead. */
+typedef struct {
+  unsigned char *bytes;
+  size_t len;
+  size_t cap;
+  const char **names; /* module-variable name -> */
+  size_t *offs;       /*   byte offset into `bytes` */
+  int count;
+  int name_cap;
+} Arm64Data;
+
 typedef struct {
   const char **names;
   int *offs;
@@ -37,14 +75,61 @@ typedef struct {
   int cap;
   int frame; /* running total bytes */
   Arm64ObjectContext *object;
+  /* Set on both paths, so a module global is recognized as one no matter which
+   * output we are producing. Without it every global silently became a
+   * per-function stack slot and writes to it were lost between calls. */
+  const IRProgram *program;
+  const Arm64Data *data;  /* self-contained path only */
+  struct LblMap *fns;     /* function name -> entry label, for &function */
+  const struct AggMap *aggregates; /* locals that ARE an object, not a value */
 } SlotMap;
 
 static const IRModuleSymbol *module_variable(const SlotMap *slots,
                                              const char *name) {
-  if (!slots || !slots->object || !name) return NULL;
+  if (!slots || !slots->program || !name) return NULL;
   const IRModuleSymbol *symbol =
-      ir_program_lookup_symbol(slots->object->program, name);
+      ir_program_lookup_symbol(slots->program, name);
   return symbol && symbol->kind == IR_MODSYM_VARIABLE ? symbol : NULL;
+}
+
+/* Every C runtime entry point the self-contained executable provides itself.
+ * `needs_malloc` records the one inter-stub dependency, so referencing calloc
+ * also pulls in malloc. */
+typedef enum {
+  STUB_MALLOC, STUB_CALLOC, STUB_FREE, STUB_PUTS, STUB_PUTCHAR, STUB_WRITE,
+  STUB_STRLEN, STUB_MEMCPY, STUB_MEMMOVE, STUB_MEMSET, STUB_EXIT, STUB_ABORT,
+  STUB_COUNT
+} Arm64StubId;
+
+static const struct {
+  const char *name;
+  int needs_malloc;
+} RUNTIME_STUBS[STUB_COUNT] = {
+    {"malloc", 0},  {"calloc", 1},  {"free", 0},    {"puts", 0},
+    {"putchar", 0}, {"write", 0},   {"strlen", 0},  {"memcpy", 0},
+    {"memmove", 0}, {"memset", 0},  {"exit", 0},    {"abort", 0},
+};
+
+/* Index of the runtime stub named `name`, or -1. `mettle_heap_zeroed` is the
+ * allocator IR_OP_NEW lowers to, and bump memory is already zeroed. */
+static int runtime_stub_index(const char *name) {
+  if (!name) return -1;
+  if (strcmp(name, "mettle_heap_zeroed") == 0) return STUB_MALLOC;
+  for (int i = 0; i < STUB_COUNT; i++) {
+    if (strcmp(name, RUNTIME_STUBS[i].name) == 0) return i;
+  }
+  return -1;
+}
+
+/* Byte offset of a global in the data image, or -1 if it has none. */
+static long data_offset_of(const Arm64Data *d, const char *name) {
+  if (!d || !name) return -1;
+  for (int i = 0; i < d->count; i++) {
+    if (d->names[i] == name || strcmp(d->names[i], name) == 0) {
+      return (long)d->offs[i];
+    }
+  }
+  return -1;
 }
 
 static const char *module_link_name(const IRModuleSymbol *symbol) {
@@ -59,11 +144,17 @@ static int object_add_relocation(Arm64Emit *e, Arm64ObjectContext *object,
   if (!object || !symbol ||
       !binary_emitter_add_relocation(object->emitter, object->text_section,
                                      offset, kind, symbol, 0)) {
-    e->error = 1;
+    arm64_fail(e, "could not relocate a reference to '%s'",
+               symbol ? symbol : "(null)");
     return 0;
   }
   return 1;
 }
+
+static void emit_imm(Arm64Emit *e, Arm64Reg rd, uint64_t v);
+static int label_for(Arm64Emit *e, struct LblMap *m, const char *name);
+static int prog_fn_index(const IRProgram *prog, const char *name);
+static void emit_lea_local(Arm64Emit *e, Arm64Reg rd, int off);
 
 /* rd = &symbol using the ELF small position-independent code model. The two
  * zero-immediate instructions are completed by AAELF64 page/lo12 relocations. */
@@ -80,6 +171,26 @@ static void emit_symbol_address(Arm64Emit *e, Arm64ObjectContext *object,
   arm64_emit_word(e, arm64_add_imm(1, rd, rd, 0, 0));
   object_add_relocation(e, object, at,
                         BINARY_RELOCATION_ARM64_ADD_ABS_LO12_NC, symbol);
+}
+
+/* rd = &global, whichever output we are producing: a page/lo12 relocation pair
+ * in an object, or the constant address of its slot in the self-contained
+ * executable's fixed writable segment. */
+static void emit_global_address(Arm64Emit *e, const SlotMap *s, Arm64Reg rd,
+                                const IRModuleSymbol *global) {
+  const char *link_name = module_link_name(global);
+  if (s->object) {
+    emit_symbol_address(e, s->object, rd, link_name);
+    return;
+  }
+  long off = data_offset_of(s->data, link_name);
+  if (off < 0 && global) off = data_offset_of(s->data, global->name);
+  if (off < 0) {
+    arm64_fail(e, "global '%s' has no slot in the data image",
+               link_name ? link_name : "(unnamed)");
+    return;
+  }
+  emit_imm(e, rd, (uint64_t)ELF_DATA_VADDR + (uint64_t)off);
 }
 
 static int module_type_size(const MtlcType *type) {
@@ -137,6 +248,15 @@ static int type_elem_size(const char *t) {
   return 8;
 }
 
+/* True for a type that lives in memory as an object rather than as a value in a
+ * register: a struct, an array, or a `string` (a { chars, length } record). The
+ * IR names such a local where it means the local's ADDRESS. */
+static int type_is_aggregate(const MtlcType *t) {
+  if (!t) return 0;
+  return t->kind == MTLC_TYPE_STRUCT || t->kind == MTLC_TYPE_ARRAY ||
+         t->kind == MTLC_TYPE_STRING;
+}
+
 /* Frame bytes a DECLARE_LOCAL needs from its type text (e.g. "int64[4]"). */
 static int local_size_bytes(const char *text) {
   if (!text) return 8;
@@ -152,6 +272,17 @@ static int local_size_bytes(const char *text) {
     return total > 0 ? total : 8;
   }
   return 8;
+}
+
+/* Frame bytes a DECLARE_LOCAL needs. The resolved type wins when there is one:
+ * an aggregate local IS its object, so it must be allocated at full size, not
+ * as one 8-byte word. */
+static int declare_local_size(const IRInstruction *in) {
+  if (in->value_type) {
+    size_t size = mtlc_type_size(in->value_type);
+    if (size > 0 && size < (size_t)1 << 24) return (int)size;
+  }
+  return local_size_bytes(in->text);
 }
 
 /* Find or allocate `name`'s slot (size rounded up to 8); returns its offset. */
@@ -216,7 +347,7 @@ static uint64_t ieee_bits(const IROperand *op) {
 
 /* A name -> emit-label-id map, shared use for both branch labels (per function)
  * and function entry labels (whole program). */
-typedef struct {
+typedef struct LblMap {
   const char **names;
   int *ids;
   int count;
@@ -236,7 +367,7 @@ static int label_for(Arm64Emit *e, LblMap *m, const char *name) {
     if (n) m->names = n;
     if (ids) m->ids = ids;
     if (!n || !ids) {
-      e->error = 1;
+      arm64_fail(e, "out of memory growing the label map");
       return 0;
     }
     m->cap = cap;
@@ -260,11 +391,46 @@ static void emit_imm(Arm64Emit *e, Arm64Reg rd, uint64_t v) {
  * IR does not reliably tag a float on every operand use, yet the AAPCS64 ABI
  * passes/returns floats in v-registers -- so calls, returns, and arguments must
  * know float-ness. */
-typedef struct {
+typedef struct StrSet {
   const char **names;
   int count;
   int cap;
 } StrSet;
+
+/* Aggregate locals and their byte sizes. */
+typedef struct AggMap {
+  const char **names;
+  int *sizes;
+  int count;
+  int cap;
+} AggMap;
+
+/* Size of the aggregate local `name`, or 0 when it is an ordinary value. */
+static int agg_size_of(const AggMap *m, const char *name) {
+  if (!m || !name) return 0;
+  for (int i = 0; i < m->count; i++) {
+    if (m->names[i] == name || strcmp(m->names[i], name) == 0) {
+      return m->sizes[i];
+    }
+  }
+  return 0;
+}
+
+static void agg_add(AggMap *m, const char *name, int size) {
+  if (!name || size <= 0 || agg_size_of(m, name)) return;
+  if (m->count == m->cap) {
+    int cap = m->cap ? m->cap * 2 : 16;
+    const char **n = realloc(m->names, (size_t)cap * sizeof(*n));
+    int *z = realloc(m->sizes, (size_t)cap * sizeof(*z));
+    if (n) m->names = n;
+    if (z) m->sizes = z;
+    if (!n || !z) return;
+    m->cap = cap;
+  }
+  m->names[m->count] = name;
+  m->sizes[m->count] = size;
+  m->count++;
+}
 
 static int set_has(const StrSet *s, const char *n) {
   if (!n) return 0;
@@ -305,6 +471,15 @@ static int prog_fn_index(const IRProgram *prog, const char *name) {
  * flags) lets a call result be recognized as float. */
 static void build_float_set(const IRFunction *fn, const IRProgram *prog,
                             const int *retf, StrSet *fs) {
+  /* Module-level float variables count too. Their names carry no float_bits on
+   * the operand, so without this a global `const RATE = 1.5` reads as an
+   * integer and its bit pattern gets converted instead of reinterpreted. */
+  for (size_t i = 0; prog && i < prog->module_symbol_count; i++) {
+    const IRModuleSymbol *symbol = &prog->module_symbols[i];
+    if (symbol->kind == IR_MODSYM_VARIABLE && mtlc_type_is_float(symbol->type)) {
+      set_add(fs, symbol->name);
+    }
+  }
   for (size_t i = 0; i < fn->parameter_count; i++) {
     if (fn->parameter_types && fn->parameter_types[i] &&
         strstr(fn->parameter_types[i], "float")) {
@@ -347,6 +522,88 @@ static void build_float_set(const IRFunction *fn, const IRProgram *prog,
   }
 }
 
+static int cmp_cond(const char *op);
+
+static int type_is_unsigned(const MtlcType *t) {
+  if (!t) return 0;
+  switch (t->kind) {
+  case MTLC_TYPE_UINT8:
+  case MTLC_TYPE_UINT16:
+  case MTLC_TYPE_UINT32:
+  case MTLC_TYPE_UINT64:
+  case MTLC_TYPE_POINTER:
+  case MTLC_TYPE_FUNCTION_POINTER:
+  case MTLC_TYPE_STRING:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+/* Does this type name spell an unsigned integer or a pointer? Parameter and
+ * DECLARE_LOCAL types reach the backend as text, not as an MtlcType. "uint" also
+ * covers "uint8[16]"; a '*' anywhere makes it a pointer. */
+static int type_text_is_unsigned(const char *t) {
+  return t && (strstr(t, "uint") != NULL || strchr(t, '*') != NULL);
+}
+
+/* Populate `us` with every value name in `fn` that holds an unsigned integer or
+ * a pointer. Comparisons and shifts of those need the unsigned condition codes:
+ * on a 64-bit compare, ARM64_LT on 0x8000000000000000 answers the reverse of
+ * what uint64 ordering says. Mirrors build_float_set, including its fixpoint
+ * over assignment chains. */
+static void build_unsigned_set(const IRFunction *fn, StrSet *us) {
+  for (size_t i = 0; i < fn->parameter_count; i++) {
+    if (fn->parameter_types && type_text_is_unsigned(fn->parameter_types[i])) {
+      set_add(us, fn->parameter_names[i]);
+    }
+  }
+  for (size_t i = 0; i < fn->instruction_count; i++) {
+    const IRInstruction *in = &fn->instructions[i];
+    if (in->op == IR_OP_DECLARE_LOCAL && in->dest.name &&
+        (type_text_is_unsigned(in->text) || type_is_unsigned(in->value_type))) {
+      set_add(us, in->dest.name);
+    }
+  }
+  for (int pass = 0; pass < 4; pass++) {
+    for (size_t i = 0; i < fn->instruction_count; i++) {
+      const IRInstruction *in = &fn->instructions[i];
+      if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL)
+        continue;
+      switch (in->op) {
+      case IR_OP_LOAD:
+      case IR_OP_UNARY:
+        if (in->is_unsigned) set_add(us, in->dest.name);
+        break;
+      case IR_OP_BINARY:
+        /* A comparison yields 0/1 whatever its operands were, so it must not
+         * mark its own destination unsigned-by-inheritance; every other binary
+         * result carries its operands' signedness. */
+        if ((in->is_unsigned || type_is_unsigned(in->value_type)) &&
+            in->text && cmp_cond(in->text) < 0) {
+          set_add(us, in->dest.name);
+        }
+        break;
+      case IR_OP_ADDRESS_OF:
+        set_add(us, in->dest.name);
+        break;
+      case IR_OP_CAST:
+        if (type_is_unsigned(in->value_type)) set_add(us, in->dest.name);
+        break;
+      case IR_OP_ASSIGN:
+        if ((in->lhs.kind == IR_OPERAND_TEMP ||
+             in->lhs.kind == IR_OPERAND_SYMBOL) &&
+            set_has(us, in->lhs.name)) {
+          set_add(us, in->dest.name);
+        }
+        break;
+      default:
+        break;
+      }
+    }
+  }
+}
+
 static int fn_returns_float(const IRFunction *fn, const IRProgram *prog,
                             const int *retf) {
   StrSet fs = {0};
@@ -381,7 +638,7 @@ static void emit_string_literal_address(Arm64Emit *e, Arm64ObjectContext *object
                                       BINARY_SYMBOL_LOCAL,
                                       object->rodata_section, offset,
                                       strlen(str) + 1)) {
-      e->error = 1;
+      arm64_fail(e, "could not place a string literal in .rodata");
       return;
     }
     emit_symbol_address(e, object, dest, symbol);
@@ -406,13 +663,29 @@ static int emit_external_call(Arm64Emit *e, Arm64ObjectContext *object,
   const char *link_name = callee ? module_link_name(callee) : name;
   if (!binary_emitter_find_symbol(object->emitter, link_name) &&
       !binary_emitter_declare_external(object->emitter, link_name)) {
-    e->error = 1;
+    arm64_fail(e, "could not declare external symbol '%s'", link_name);
     return 0;
   }
   size_t call_offset = arm64_here(e);
   arm64_emit_word(e, arm64_bl(0));
   return object_add_relocation(e, object, call_offset,
                                BINARY_RELOCATION_ARM64_CALL26, link_name);
+}
+
+/* rd = &function. An object defers it to page/lo12 relocations against the
+ * function's symbol, exactly as for a global; the self-contained executable has
+ * no relocations, so it patches the absolute address into a movz/movk quartet
+ * once the label lands. Either way a function's address becomes a value, which
+ * a PC-relative branch displacement cannot express. */
+static void emit_function_address(Arm64Emit *e, SlotMap *s, Arm64Reg rd,
+                                  const char *name) {
+  if (s->object) {
+    const IRModuleSymbol *symbol = module_function(s->program, name);
+    emit_symbol_address(e, s->object, rd,
+                        symbol ? module_link_name(symbol) : name);
+    return;
+  }
+  arm64_emit_label_address(e, rd, label_for(e, s->fns, name));
 }
 
 /* Load an IR value operand (temp/local/int/float/string) into `dest` as raw
@@ -437,22 +710,26 @@ static Arm64Reg load_into(Arm64Emit *e, SlotMap *s, const IROperand *op,
         off < 0 && op->kind == IR_OPERAND_SYMBOL ? module_variable(s, op->name)
                                                  : NULL;
     if (global) {
-      const char *link_name = module_link_name(global);
-      emit_symbol_address(e, s->object, ARM64_X16, link_name);
+      emit_global_address(e, s, ARM64_X16, global);
       emit_load_sized(e, dest, ARM64_X16, module_type_size(global->type),
                       module_type_signed(global->type));
       return dest;
     }
+    if (off < 0 && op->kind == IR_OPERAND_SYMBOL &&
+        prog_fn_index(s->program, op->name) >= 0) {
+      emit_function_address(e, s, dest, op->name); /* a function as a value */
+      return dest;
+    }
     if (off < 0) off = slot_off(s, op->name);
     if (off < 0) {
-      e->error = 1;
+      arm64_fail(e, "no stack slot for '%s'", op->name ? op->name : "(unnamed)");
       return dest;
     }
     arm64_emit_word(e, arm64_ldr_imm(1, dest, ARM64_SP, off));
     return dest;
   }
   default:
-    e->error = 1;
+    arm64_fail(e, "operand kind %d cannot be loaded", (int)op->kind);
     return dest;
   }
 }
@@ -465,13 +742,14 @@ static void store_dest(Arm64Emit *e, SlotMap *s, const IROperand *dst,
           ? module_variable(s, dst->name)
           : NULL;
   if (global) {
-    emit_symbol_address(e, s->object, ARM64_X16, module_link_name(global));
+    emit_global_address(e, s, ARM64_X16, global);
     emit_store_sized(e, src, ARM64_X16, module_type_size(global->type));
     return;
   }
   if (off < 0) off = slot_off(s, dst->name);
   if (off < 0) {
-    e->error = 1;
+    arm64_fail(e, "no stack slot for destination '%s'",
+               dst && dst->name ? dst->name : "(unnamed)");
     return;
   }
   arm64_emit_word(e, arm64_str_imm(1, src, ARM64_SP, off));
@@ -488,6 +766,8 @@ static void emit_lea_local(Arm64Emit *e, Arm64Reg rd, int off) {
   }
 }
 
+/* Condition code for a signed integer comparison, or -1 if `op` is not a
+ * comparison at all (callers use that as the "is this a compare?" test). */
 static int cmp_cond(const char *op) {
   if (strcmp(op, "==") == 0) return ARM64_EQ;
   if (strcmp(op, "!=") == 0) return ARM64_NE;
@@ -498,16 +778,67 @@ static int cmp_cond(const char *op) {
   return -1;
 }
 
-static void lower_binary(Arm64Emit *e, SlotMap *s, const IRInstruction *in) {
+/* Unsigned twin: LO/LS/HI/HS read the carry flag instead of N-vs-V, so a value
+ * with the high bit set orders above a small one instead of below it. */
+static int cmp_cond_unsigned(const char *op) {
+  if (strcmp(op, "<") == 0) return ARM64_CC;  /* LO */
+  if (strcmp(op, "<=") == 0) return ARM64_LS;
+  if (strcmp(op, ">") == 0) return ARM64_HI;
+  if (strcmp(op, ">=") == 0) return ARM64_CS; /* HS */
+  return cmp_cond(op);                        /* ==/!= are sign-agnostic */
+}
+
+/* Condition code to read FCMP's flags. An unordered compare (either operand
+ * NaN) sets N=0,Z=0,C=1,V=1, where LT and LE both come out TRUE -- so `<` and
+ * `<=` must use MI and LS, which are false there. GT/GE/EQ are already false
+ * and NE already true under those flags, which is what IEEE-754 requires. */
+static int cmp_cond_float(const char *op) {
+  if (strcmp(op, "<") == 0) return ARM64_MI;
+  if (strcmp(op, "<=") == 0) return ARM64_LS;
+  return cmp_cond(op);
+}
+
+/* True when this binary's integer operands must be ordered as unsigned. `us`
+ * holds the names the function's unsigned/pointer values live under. */
+static int binary_is_unsigned(const StrSet *us, const IRInstruction *in) {
+  if (in->is_unsigned || type_is_unsigned(in->value_type)) return 1;
+  const IROperand *ops[2] = {&in->lhs, &in->rhs};
+  for (int k = 0; k < 2; k++) {
+    if ((ops[k]->kind == IR_OPERAND_TEMP ||
+         ops[k]->kind == IR_OPERAND_SYMBOL) &&
+        set_has(us, ops[k]->name)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Put one operand of a float binary into FP register `fd` at width `d`. A float
+ * operand carries an IEEE bit pattern, so it moves across as bits; an integer
+ * operand (`x + 1`, or a mixed-type expression the frontend left unconverted)
+ * has to be CONVERTED, since reinterpreting its bits as a double is nonsense. */
+static void load_float_operand(Arm64Emit *e, SlotMap *s, const StrSet *fs,
+                               const IROperand *op, int d, int fd,
+                               Arm64Reg scratch) {
+  Arm64Reg bits = load_into(e, s, op, scratch);
+  if (operand_is_float(fs, op)) {
+    arm64_emit_word(e, arm64_fmov_gp(d, fd, bits));
+  } else {
+    arm64_emit_word(e, arm64_scvtf(d, fd, bits));
+  }
+}
+
+static void lower_binary(Arm64Emit *e, SlotMap *s, const StrSet *fs,
+                         const StrSet *us, const IRInstruction *in) {
   const char *op = in->text;
 
-  /* Floating-point binary: load operand bits into d0/d1, operate, store the
+  /* Floating-point binary: get both operands into d0/d1, operate, store the
    * result bits. A comparison yields a 0/1 integer via fcmp + cset. */
   if (in->is_float) {
     int d = in->float_bits != 32;
-    arm64_emit_word(e, arm64_fmov_gp(d, 0, load_into(e, s, &in->lhs, R_LHS)));
-    arm64_emit_word(e, arm64_fmov_gp(d, 1, load_into(e, s, &in->rhs, R_RHS)));
-    int fcc = cmp_cond(op);
+    load_float_operand(e, s, fs, &in->lhs, d, 0, R_LHS);
+    load_float_operand(e, s, fs, &in->rhs, d, 1, R_RHS);
+    int fcc = cmp_cond(op) < 0 ? -1 : cmp_cond_float(op);
     if (fcc >= 0) {
       arm64_emit_word(e, arm64_fcmp(d, 0, 1));
       arm64_emit_word(e, arm64_cset(1, R_RES, (Arm64Cond)fcc));
@@ -520,7 +851,7 @@ static void lower_binary(Arm64Emit *e, SlotMap *s, const IRInstruction *in) {
     } else if (strcmp(op, "/") == 0) {
       arm64_emit_word(e, arm64_fdiv(d, 0, 0, 1));
     } else {
-      e->error = 1;
+      arm64_fail(e, "float binary operator '%s' has no AArch64 lowering", op);
       return;
     }
     if (fcc < 0) {
@@ -530,9 +861,10 @@ static void lower_binary(Arm64Emit *e, SlotMap *s, const IRInstruction *in) {
     return;
   }
 
+  int uns = binary_is_unsigned(us, in);
   Arm64Reg a = load_into(e, s, &in->lhs, R_LHS);
   Arm64Reg b = load_into(e, s, &in->rhs, R_RHS);
-  int cc = cmp_cond(op);
+  int cc = cmp_cond(op) < 0 ? -1 : (uns ? cmp_cond_unsigned(op) : cmp_cond(op));
   if (cc >= 0) {
     arm64_emit_word(e, arm64_cmp_reg(1, a, b));
     arm64_emit_word(e, arm64_cset(1, R_RES, (Arm64Cond)cc));
@@ -543,11 +875,11 @@ static void lower_binary(Arm64Emit *e, SlotMap *s, const IRInstruction *in) {
   } else if (strcmp(op, "*") == 0) {
     arm64_emit_word(e, arm64_mul(1, R_RES, a, b));
   } else if (strcmp(op, "/") == 0) {
-    arm64_emit_word(e, in->is_unsigned ? arm64_udiv(1, R_RES, a, b)
-                                       : arm64_sdiv(1, R_RES, a, b));
+    arm64_emit_word(e, uns ? arm64_udiv(1, R_RES, a, b)
+                           : arm64_sdiv(1, R_RES, a, b));
   } else if (strcmp(op, "%") == 0) {
-    arm64_emit_word(e, in->is_unsigned ? arm64_udiv(1, R_AUX, a, b)
-                                       : arm64_sdiv(1, R_AUX, a, b));
+    arm64_emit_word(e, uns ? arm64_udiv(1, R_AUX, a, b)
+                           : arm64_sdiv(1, R_AUX, a, b));
     arm64_emit_word(e, arm64_msub(1, R_RES, R_AUX, b, a));
   } else if (strcmp(op, "&") == 0) {
     arm64_emit_word(e, arm64_and_reg(1, R_RES, a, b));
@@ -558,10 +890,10 @@ static void lower_binary(Arm64Emit *e, SlotMap *s, const IRInstruction *in) {
   } else if (strcmp(op, "<<") == 0) {
     arm64_emit_word(e, arm64_lslv(1, R_RES, a, b));
   } else if (strcmp(op, ">>") == 0) {
-    arm64_emit_word(e, in->is_unsigned ? arm64_lsrv(1, R_RES, a, b)
-                                       : arm64_asrv(1, R_RES, a, b));
+    arm64_emit_word(e, uns ? arm64_lsrv(1, R_RES, a, b)
+                           : arm64_asrv(1, R_RES, a, b));
   } else {
-    e->error = 1;
+    arm64_fail(e, "binary operator '%s' has no AArch64 lowering", op);
     return;
   }
   store_dest(e, s, &in->dest, R_RES);
@@ -578,7 +910,7 @@ static void lower_unary(Arm64Emit *e, SlotMap *s, const IRInstruction *in) {
     arm64_emit_word(e, arm64_cmp_imm(1, a, 0, 0));
     arm64_emit_word(e, arm64_cset(1, R_RES, ARM64_EQ));
   } else {
-    e->error = 1;
+    arm64_fail(e, "unary operator '%s' has no AArch64 lowering", op);
     return;
   }
   store_dest(e, s, &in->dest, R_RES);
@@ -591,23 +923,38 @@ static const IRModuleSymbol *module_function(const IRProgram *program,
   return symbol && symbol->kind == IR_MODSYM_FUNCTION ? symbol : NULL;
 }
 
-static int call_arg_is_float(const IRProgram *program,
-                             const IRInstruction *call, size_t index,
-                             const StrSet *floats) {
+/* Declared type of argument `index`, from the callee's signature when the call
+ * names one and from the instruction's own argument_types otherwise -- an
+ * indirect call has no name, so that array is the only signature it carries. */
+static const MtlcType *call_arg_type(const IRProgram *program,
+                                     const IRInstruction *call, size_t index) {
   const IRModuleSymbol *callee = module_function(program, call->text);
   if (callee && index < callee->param_count && callee->param_types &&
       callee->param_types[index]) {
-    return mtlc_type_is_float(callee->param_types[index]);
+    return callee->param_types[index];
+  }
+  if (call->argument_types && index < call->argument_count &&
+      call->argument_types[index]) {
+    return call->argument_types[index];
+  }
+  return NULL;
+}
+
+static int call_arg_is_float(const IRProgram *program,
+                             const IRInstruction *call, size_t index,
+                             const StrSet *floats) {
+  const MtlcType *type = call_arg_type(program, call, index);
+  if (type) {
+    return mtlc_type_is_float(type);
   }
   return operand_is_float(floats, &call->arguments[index]);
 }
 
 static int call_arg_float_bits(const IRProgram *program,
                                const IRInstruction *call, size_t index) {
-  const IRModuleSymbol *callee = module_function(program, call->text);
-  if (callee && index < callee->param_count && callee->param_types &&
-      callee->param_types[index]) {
-    return callee->param_types[index]->kind == MTLC_TYPE_FLOAT32 ? 32 : 64;
+  const MtlcType *type = call_arg_type(program, call, index);
+  if (type) {
+    return type->kind == MTLC_TYPE_FLOAT32 ? 32 : 64;
   }
   return call->arguments[index].float_bits == 32 ? 32 : 64;
 }
@@ -637,12 +984,14 @@ static int max_outgoing_stack(Arm64Emit *e, const IRFunction *fn,
   int maximum = 0;
   for (size_t i = 0; i < fn->instruction_count; i++) {
     const IRInstruction *call = &fn->instructions[i];
-    if (call->op != IR_OP_CALL || !call->text ||
-        strcmp(call->text, "cstr") == 0 || call->argument_count == 0) {
+    int indirect = call->op == IR_OP_CALL_INDIRECT;
+    if ((call->op != IR_OP_CALL && !indirect) || call->argument_count == 0 ||
+        (!indirect && (!call->text || strcmp(call->text, "cstr") == 0))) {
       continue;
     }
     if (call->argument_count > (size_t)INT32_MAX) {
-      e->error = 1;
+      arm64_fail(e, "call to '%s' has an implausible argument count",
+                 indirect ? "(indirect)" : call->text);
       return 0;
     }
     int count = (int)call->argument_count;
@@ -652,7 +1001,8 @@ static int max_outgoing_stack(Arm64Emit *e, const IRFunction *fn,
     if (!is_float || !locations) {
       free(is_float);
       free(locations);
-      e->error = 1;
+      arm64_fail(e, "out of memory laying out the arguments of '%s'",
+                 indirect ? "(indirect)" : call->text);
       return 0;
     }
     for (int k = 0; k < count; k++) {
@@ -660,7 +1010,8 @@ static int max_outgoing_stack(Arm64Emit *e, const IRFunction *fn,
     }
     int bytes = 0;
     if (!arm64_compute_arg_layout(is_float, count, locations, &bytes)) {
-      e->error = 1;
+      arm64_fail(e, "cannot lay out the %d arguments of '%s' under AAPCS64",
+                 count, indirect ? "(indirect)" : call->text);
     }
     if (bytes > maximum) maximum = bytes;
     free(is_float);
@@ -670,17 +1021,149 @@ static int max_outgoing_stack(Arm64Emit *e, const IRFunction *fn,
   return (maximum + 15) & ~15;
 }
 
+/* Does this operand need a frame slot? Temps always do; a named symbol does
+ * unless it is a module global (which lives in .data) or a function (whose name
+ * denotes its code address, not storage). */
+static int operand_needs_slot(const SlotMap *slots, const IRProgram *prog,
+                              const IROperand *op) {
+  if (op->kind == IR_OPERAND_TEMP) return 1;
+  if (op->kind != IR_OPERAND_SYMBOL || !op->name) return 0;
+  if (module_variable(slots, op->name)) return 0;
+  return prog_fn_index(prog, op->name) < 0;
+}
+
+/* Aggregate LOCALS in `fn`: names whose slot holds the object itself, so naming
+ * one can only mean its address. A `string` local is a { chars, length } record
+ * and `*@msg [8]` reads chars out of it; loading the slot instead would read
+ * the first eight characters and use them as a pointer.
+ *
+ * Parameters are deliberately absent. An aggregate is passed by reference here,
+ * so a parameter's slot holds a POINTER to the caller's object and naming it
+ * must keep loading that pointer. */
+static void build_aggregate_set(const IRFunction *fn, AggMap *ag) {
+  for (size_t i = 0; i < fn->instruction_count; i++) {
+    const IRInstruction *in = &fn->instructions[i];
+    if (in->op == IR_OP_DECLARE_LOCAL && in->dest.name &&
+        type_is_aggregate(in->value_type)) {
+      agg_add(ag, in->dest.name, declare_local_size(in));
+    }
+  }
+}
+
+/* Address of a load's or store's memory operand. A `string` local is a
+ * { chars, length } record and the IR names it bare where it means "&msg": the
+ * slot IS the record, so `*@msg [8]` reads its chars field. Loading the slot
+ * instead read the first eight characters and used them as a pointer.
+ *
+ * Only this position gets the rule. Elsewhere -- a call argument, a return --
+ * the frontend has already chosen how the aggregate travels (a small struct
+ * goes packed in a register), and overriding that corrupts it. */
+static Arm64Reg address_operand(Arm64Emit *e, SlotMap *s, const AggMap *ag,
+                                const IROperand *op, Arm64Reg dest) {
+  if (op->kind == IR_OPERAND_SYMBOL && agg_size_of(ag, op->name) > 0) {
+    int off = slot_find(s, op->name);
+    if (off >= 0) {
+      emit_lea_local(e, dest, off);
+      return dest;
+    }
+  }
+  return load_into(e, s, op, dest);
+}
+
+/* Copy `size` bytes from [src] to [dst], widest access first. Both are
+ * addresses; offsets stay naturally aligned for each access width. */
+static void emit_fixed_copy(Arm64Emit *e, Arm64Reg dst, Arm64Reg src,
+                            int size) {
+  int off = 0;
+  while (size - off >= 8) {
+    arm64_emit_word(e, arm64_ldr_imm(1, R_AUX, src, off));
+    arm64_emit_word(e, arm64_str_imm(1, R_AUX, dst, off));
+    off += 8;
+  }
+  if (size - off >= 4) {
+    arm64_emit_word(e, arm64_ldr_imm(0, R_AUX, src, off));
+    arm64_emit_word(e, arm64_str_imm(0, R_AUX, dst, off));
+    off += 4;
+  }
+  if (size - off >= 2) {
+    arm64_emit_word(e, arm64_ldrh_imm(R_AUX, src, off));
+    arm64_emit_word(e, arm64_strh_imm(R_AUX, dst, off));
+    off += 2;
+  }
+  if (size - off >= 1) {
+    arm64_emit_word(e, arm64_ldrb_imm(R_AUX, src, off));
+    arm64_emit_word(e, arm64_strb_imm(R_AUX, dst, off));
+  }
+}
+
+/* Place a call's arguments where AAPCS64 wants them. GP and FP registers are
+ * independent banks; overflow values go to the frame's reserved outgoing-call
+ * area at [sp,#stack_offset]. Shared by direct and indirect calls, and needed
+ * for real 11-argument C ABIs like cuLaunchKernel, not just synthetic tests. */
+static int emit_call_arguments(Arm64Emit *e, SlotMap *slots,
+                               const IRProgram *prog, const StrSet *fs,
+                               const IRInstruction *in) {
+  if (in->argument_count == 0) return 1;
+  const char *who = in->text ? in->text : "(indirect)";
+  int count = (int)in->argument_count;
+  int *is_float = malloc((size_t)count * sizeof(*is_float));
+  Arm64ArgLocation *locations = malloc((size_t)count * sizeof(*locations));
+  if (!is_float || !locations) {
+    free(is_float);
+    free(locations);
+    arm64_fail(e, "out of memory laying out the arguments of '%s'", who);
+    return 0;
+  }
+  for (int k = 0; k < count; k++) {
+    is_float[k] = call_arg_is_float(prog, in, (size_t)k, fs);
+  }
+  if (!arm64_compute_arg_layout(is_float, count, locations, NULL)) {
+    arm64_fail(e, "cannot lay out the %d arguments of '%s' under AAPCS64",
+               count, who);
+  }
+  for (int k = 0; k < count && !e->error; k++) {
+    const IROperand *arg = &in->arguments[k];
+    Arm64ArgLocation location = locations[k];
+    if (location.kind == ARM64_ARG_IN_VEC_REGISTER) {
+      /* The parameter is float. An argument that is not (a literal `3` for a
+       * float64 parameter) must be converted, not bit-reinterpreted. */
+      int is_double = call_arg_float_bits(prog, in, (size_t)k) != 32;
+      load_float_operand(e, slots, fs, arg, is_double, (int)location.reg,
+                         R_LHS);
+    } else if (location.kind == ARM64_ARG_IN_GP_REGISTER) {
+      load_into(e, slots, arg, location.reg);
+    } else {
+      load_into(e, slots, arg, R_LHS);
+      arm64_emit_word(
+          e, arm64_str_imm(1, R_LHS, ARM64_SP, location.stack_offset));
+    }
+  }
+  free(is_float);
+  free(locations);
+  return !e->error;
+}
+
 /* Lower one function body. `fns` maps callee names to entry labels so IR_OP_CALL
- * can resolve a cross-function bl; `prog`/`retf` drive the float ABI (which
- * callees return floats). All may be NULL for the single-function path. */
+ * can resolve a cross-function bl (and so a function's address can be taken);
+ * `prog`/`retf` drive the float ABI (which callees return floats); `object` and
+ * `data` select where globals live, and exactly one of them is set. All may be
+ * NULL for the single-function path. */
 static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
                            const IRProgram *prog, const int *retf,
-                           Arm64ObjectContext *object) {
+                           Arm64ObjectContext *object, const Arm64Data *data) {
   SlotMap slots = {0};
   LblMap labels = {0};
   StrSet fs = {0};
+  StrSet us = {0};
+  AggMap ag = {0};
   build_float_set(fn, prog, retf, &fs);
+  build_unsigned_set(fn, &us);
+  build_aggregate_set(fn, &ag);
   slots.object = object;
+  slots.program = prog;
+  slots.data = data;
+  slots.fns = fns;
+  slots.aggregates = &ag;
   slots.frame = max_outgoing_stack(e, fn, prog, &fs);
 
   /* Slot allocation order: parameters first (so x0../v0.. home to known
@@ -693,25 +1176,20 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
     const IRInstruction *in = &fn->instructions[i];
     if (in->op == IR_OP_DECLARE_LOCAL && in->dest.kind == IR_OPERAND_SYMBOL &&
         in->dest.name) {
-      slot_alloc(&slots, in->dest.name, local_size_bytes(in->text));
+      slot_alloc(&slots, in->dest.name, declare_local_size(in));
     }
   }
   for (size_t i = 0; i < fn->instruction_count; i++) {
     const IRInstruction *in = &fn->instructions[i];
     const IROperand *ops[3] = {&in->dest, &in->lhs, &in->rhs};
     for (int k = 0; k < 3; k++) {
-      if (ops[k]->kind == IR_OPERAND_TEMP ||
-          (ops[k]->kind == IR_OPERAND_SYMBOL &&
-           !module_variable(&slots, ops[k]->name))) {
+      if (operand_needs_slot(&slots, prog, ops[k])) {
         slot_off(&slots, ops[k]->name);
       }
     }
     for (size_t k = 0; k < in->argument_count; k++) {
-      const IROperand *a = &in->arguments[k];
-      if (a->kind == IR_OPERAND_TEMP ||
-          (a->kind == IR_OPERAND_SYMBOL &&
-           !module_variable(&slots, a->name))) {
-        slot_off(&slots, a->name);
+      if (operand_needs_slot(&slots, prog, &in->arguments[k])) {
+        slot_off(&slots, in->arguments[k].name);
       }
     }
   }
@@ -731,7 +1209,7 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
     if (!is_float || !locations) {
       free(is_float);
       free(locations);
-      e->error = 1;
+      arm64_fail(e, "out of memory homing the parameters of '%s'", fn->name);
       goto done;
     }
     for (int i = 0; i < count; i++) {
@@ -739,7 +1217,8 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
       is_float[i] = type && strstr(type, "float") != NULL;
     }
     if (!arm64_compute_arg_layout(is_float, count, locations, NULL)) {
-      e->error = 1;
+      arm64_fail(e, "cannot lay out the %d parameters of '%s' under AAPCS64",
+                 count, fn->name);
     }
     for (int i = 0; i < count && !e->error; i++) {
       int off = slot_off(&slots, fn->parameter_names[i]);
@@ -787,9 +1266,25 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
       arm64_emit_bcond(e, ARM64_EQ, label_for(e, &labels, in->text));
       break;
     }
-    case IR_OP_ASSIGN:
+    case IR_OP_ASSIGN: {
+      /* `@sc <- @sv` between two aggregate locals is a whole-object copy. Any
+       * other assignment (including a string local taking a literal, which
+       * stores only the chars word) is a one-word move. */
+      int bytes = in->dest.kind == IR_OPERAND_SYMBOL
+                      ? agg_size_of(&ag, in->dest.name)
+                      : 0;
+      int source = in->lhs.kind == IR_OPERAND_SYMBOL
+                       ? agg_size_of(&ag, in->lhs.name)
+                       : 0;
+      if (bytes > 0 && source > 0) {
+        emit_lea_local(e, R_LHS, slot_off(&slots, in->lhs.name));
+        emit_lea_local(e, R_RHS, slot_off(&slots, in->dest.name));
+        emit_fixed_copy(e, R_RHS, R_LHS, bytes < source ? bytes : source);
+        break;
+      }
       store_dest(e, &slots, &in->dest, load_into(e, &slots, &in->lhs, R_LHS));
       break;
+    }
     case IR_OP_CAST: {
       int srcf = in->is_float;
       int dstf = in->dest.float_bits != 0;
@@ -827,7 +1322,10 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
               ? module_variable(&slots, in->lhs.name)
               : NULL;
       if (global) {
-        emit_symbol_address(e, object, R_RES, module_link_name(global));
+        emit_global_address(e, &slots, R_RES, global);
+      } else if (slot_find(&slots, in->lhs.name) < 0 &&
+                 prog_fn_index(prog, in->lhs.name) >= 0) {
+        emit_function_address(e, &slots, R_RES, in->lhs.name);
       } else {
         emit_lea_local(e, R_RES, slot_off(&slots, in->lhs.name));
       }
@@ -836,7 +1334,7 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
     }
     case IR_OP_LOAD: {
       int size = in->rhs.kind == IR_OPERAND_INT ? (int)in->rhs.int_value : 8;
-      Arm64Reg addr = load_into(e, &slots, &in->lhs, R_LHS);
+      Arm64Reg addr = address_operand(e, &slots, &ag, &in->lhs, R_LHS);
       emit_load_sized(e, R_RES, addr, size,
                       !in->is_unsigned && !in->is_float);
       store_dest(e, &slots, &in->dest, R_RES);
@@ -844,20 +1342,24 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
     }
     case IR_OP_STORE: {
       int size = in->rhs.kind == IR_OPERAND_INT ? (int)in->rhs.int_value : 8;
-      Arm64Reg addr = load_into(e, &slots, &in->dest, R_LHS);
+      Arm64Reg addr = address_operand(e, &slots, &ag, &in->dest, R_LHS);
       Arm64Reg val = load_into(e, &slots, &in->lhs, R_RHS);
       emit_store_sized(e, val, addr, size);
       break;
     }
     case IR_OP_BINARY:
-      lower_binary(e, &slots, in);
+      lower_binary(e, &slots, &fs, &us, in);
       break;
     case IR_OP_UNARY:
       lower_unary(e, &slots, in);
       break;
     case IR_OP_CALL: {
       if (!fns || !in->text) {
-        e->error = 1;
+        arm64_fail(e, in->text
+                          ? "'%s' calls '%s', but this path lowers one function"
+                            " in isolation"
+                          : "'%s' contains a call with no callee name%s",
+                   fn->name, in->text ? in->text : "");
         break;
       }
       /* cstr("literal"): embed the bytes in the loaded segment (branched over),
@@ -877,7 +1379,7 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
               !binary_emitter_define_symbol(
                   object->emitter, symbol, BINARY_SYMBOL_LOCAL,
                   object->rodata_section, offset, strlen(str) + 1)) {
-            e->error = 1;
+            arm64_fail(e, "could not place a cstr literal in .rodata");
             break;
           }
           emit_symbol_address(e, object, R_RES, symbol);
@@ -914,62 +1416,30 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
           if (!emit_external_call(e, object, prog, "exit")) break;
         } else {
           emit_imm(e, ARM64_X0, 1);
-          arm64_emit_word(e, arm64_movz(1, ARM64_X8, 93, 0)); /* exit */
-          arm64_emit_word(e, 0xD4000001u);                    /* svc #0 */
+          arm64_emit_word(e, arm64_movz(1, ARM64_X8, SYS_EXIT, 0));
+          arm64_emit_word(e, ARM64_SVC0);
         }
         break;
       }
-      /* Marshal through one AAPCS64 layout. GP and FP registers are independent
-       * banks; overflow values occupy the frame's reserved outgoing-call area
-       * at [sp,#stack_offset]. This is required for cuLaunchKernel's 11-argument
-       * C ABI, not merely for synthetic many-argument tests. */
-      if (in->argument_count > 0) {
-        int count = (int)in->argument_count;
-        int *is_float = malloc((size_t)count * sizeof(*is_float));
-        Arm64ArgLocation *locations =
-            malloc((size_t)count * sizeof(*locations));
-        if (!is_float || !locations) {
-          free(is_float);
-          free(locations);
-          e->error = 1;
-          break;
-        }
-        for (int k = 0; k < count; k++) {
-          is_float[k] = call_arg_is_float(prog, in, (size_t)k, &fs);
-        }
-        if (!arm64_compute_arg_layout(is_float, count, locations, NULL)) {
-          e->error = 1;
-        }
-        for (int k = 0; k < count && !e->error; k++) {
-          const IROperand *arg = &in->arguments[k];
-          Arm64ArgLocation location = locations[k];
-          if (location.kind == ARM64_ARG_IN_VEC_REGISTER) {
-            int is_double =
-                call_arg_float_bits(prog, in, (size_t)k) != 32;
-            arm64_emit_word(
-                e, arm64_fmov_gp(is_double, (int)location.reg,
-                                 load_into(e, &slots, arg, R_LHS)));
-          } else if (location.kind == ARM64_ARG_IN_GP_REGISTER) {
-            load_into(e, &slots, arg, location.reg);
-          } else {
-            load_into(e, &slots, arg, R_LHS);
-            arm64_emit_word(e, arm64_str_imm(1, R_LHS, ARM64_SP,
-                                             location.stack_offset));
-          }
-        }
-        free(is_float);
-        free(locations);
-        if (e->error) break;
-      }
+      if (!emit_call_arguments(e, &slots, prog, &fs, in)) break;
 
+      int stub = object ? -1 : runtime_stub_index(in->text);
       if (prog_fn_index(prog, in->text) >= 0) {
         arm64_emit_bl(e, label_for(e, fns, in->text));
       } else if (object) {
         if (!emit_external_call(e, object, prog, in->text)) {
           break;
         }
+      } else if (stub >= 0) {
+        /* Resolved to a stub this backend writes itself. Branch to the
+         * canonical name so aliases (mettle_heap_zeroed) share one body. */
+        arm64_emit_bl(e, label_for(e, fns, RUNTIME_STUBS[stub].name));
       } else {
-        e->error = 1;
+        arm64_fail(e,
+                   "'%s' calls '%s', which is neither in this program, a "
+                   "runtime stub, nor an external symbol (the self-contained "
+                   "ELF has no linker)",
+                   fn->name, in->text);
         break;
       }
       if (in->dest.kind == IR_OPERAND_TEMP ||
@@ -983,6 +1453,55 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
         } else {
           store_dest(e, &slots, &in->dest, ARM64_X0);
         }
+      }
+      break;
+    }
+    case IR_OP_CALL_INDIRECT: {
+      /* Call through a function pointer in `lhs`. Arguments go first: loading a
+       * global operand borrows x16, so the callee address must land there only
+       * once every argument is already in place. x16 is the AAPCS64 IP0 scratch,
+       * which is exactly what an indirect branch target may use. */
+      if (!emit_call_arguments(e, &slots, prog, &fs, in)) break;
+      load_into(e, &slots, &in->lhs, ARM64_X16);
+      arm64_emit_word(e, arm64_blr(ARM64_X16));
+      if (in->dest.kind == IR_OPERAND_TEMP ||
+          in->dest.kind == IR_OPERAND_SYMBOL) {
+        if (call_returns_float(prog, in, retf) || set_has(&fs, in->dest.name)) {
+          int d = call_return_float_bits(prog, in) != 32;
+          arm64_emit_word(e, arm64_fmov_to_gp(d, R_RES, 0));
+          store_dest(e, &slots, &in->dest, R_RES);
+        } else {
+          store_dest(e, &slots, &in->dest, ARM64_X0);
+        }
+      }
+      break;
+    }
+    case IR_OP_NEW: {
+      /* Heap allocation of `rhs` bytes, zeroed. The object path calls libc's
+       * calloc(1, size); the self-contained path branches to the bump
+       * allocator, whose memory is already zero. */
+      Arm64Reg size_reg = object ? ARM64_X1 : ARM64_X0;
+      if (in->rhs.kind == IR_OPERAND_NONE ||
+          (in->rhs.kind == IR_OPERAND_INT && in->rhs.int_value <= 0)) {
+        emit_imm(e, size_reg, 8);
+      } else if (in->rhs.kind == IR_OPERAND_INT) {
+        emit_imm(e, size_reg, (uint64_t)in->rhs.int_value);
+      } else {
+        load_into(e, &slots, &in->rhs, size_reg);
+      }
+      if (object) {
+        emit_imm(e, ARM64_X0, 1);
+        if (!emit_external_call(e, object, prog, "calloc")) break;
+      } else if (fns) {
+        arm64_emit_bl(e, label_for(e, fns, RUNTIME_STUBS[STUB_MALLOC].name));
+      } else {
+        arm64_fail(e, "'%s' allocates, but this path lowers one function in "
+                      "isolation", fn->name);
+        break;
+      }
+      if (in->dest.kind == IR_OPERAND_TEMP ||
+          in->dest.kind == IR_OPERAND_SYMBOL) {
+        store_dest(e, &slots, &in->dest, ARM64_X0);
       }
       break;
     }
@@ -1002,7 +1521,8 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
       arm64_emit_epilogue(e, frame, NULL, 0);
       break;
     default:
-      e->error = 1;
+      arm64_fail(e, "'%s' uses %s, which has no AArch64 lowering", fn->name,
+                 ir_opcode_name(in->op));
       break;
     }
   }
@@ -1013,11 +1533,14 @@ done:
   free(labels.names);
   free(labels.ids);
   free(fs.names);
+  free(us.names);
+  free(ag.names);
+  free(ag.sizes);
   return e->error ? 0 : 1;
 }
 
 int arm64_ir_encode_function(Arm64Emit *e, const IRFunction *fn) {
-  return encode_function(e, fn, NULL, NULL, NULL, NULL);
+  return encode_function(e, fn, NULL, NULL, NULL, NULL, NULL);
 }
 
 /* I/O intrinsics we provide as hand-written AArch64 stubs (a direct write(2)
@@ -1101,14 +1624,16 @@ static void emit_int_print(Arm64Emit *e, int with_newline) {
   arm64_emit_word(e, arm64_add_imm(1, ARM64_X2, ARM64_SP, 32, 0));  /* end */
   arm64_emit_word(e, arm64_sub_reg(1, ARM64_X2, ARM64_X2, ARM64_X1)); /* len */
   arm64_emit_word(e, arm64_movz(1, ARM64_X0, 1, 0));               /* fd=stdout */
-  arm64_emit_word(e, arm64_movz(1, ARM64_X8, 64, 0));             /* write */
-  arm64_emit_word(e, 0xD4000001u);                                /* svc #0 */
+  arm64_emit_word(e, arm64_movz(1, ARM64_X8, SYS_WRITE, 0));
+  arm64_emit_word(e, ARM64_SVC0);
   arm64_emit_epilogue(e, 32, NULL, 0);
 }
 
 /* Emit a leaf that writes the NUL-terminated cstring in x0 to stdout (then a
- * newline if with_newline): strlen, then write(1, ptr, len). */
-static void emit_str_print(Arm64Emit *e, int with_newline) {
+ * newline if with_newline): strlen, then write(1, ptr, len). `zero_result`
+ * returns 0 instead of whatever the write syscall left in x0, which is what
+ * puts(3) promises. */
+static void emit_str_print(Arm64Emit *e, int with_newline, int zero_result) {
   int l_scan = arm64_new_label(e);
   int l_write = arm64_new_label(e);
   arm64_emit_prologue(e, 16, NULL, 0);
@@ -1124,18 +1649,419 @@ static void emit_str_print(Arm64Emit *e, int with_newline) {
   arm64_emit_word(e, arm64_mov_reg(1, ARM64_X1, ARM64_X0));   /* buf = ptr */
   arm64_emit_word(e, arm64_mov_reg(1, ARM64_X2, ARM64_X10));  /* len */
   arm64_emit_word(e, arm64_movz(1, ARM64_X0, 1, 0));          /* fd=stdout */
-  arm64_emit_word(e, arm64_movz(1, ARM64_X8, 64, 0));         /* write */
-  arm64_emit_word(e, 0xD4000001u);                            /* svc #0 */
+  arm64_emit_word(e, arm64_movz(1, ARM64_X8, SYS_WRITE, 0));
+  arm64_emit_word(e, ARM64_SVC0);
   if (with_newline) {
     arm64_emit_word(e, arm64_movz(1, ARM64_X11, 10, 0));      /* '\n' */
     arm64_emit_word(e, arm64_strb_imm(ARM64_X11, ARM64_SP, 0));
     arm64_emit_word(e, arm64_mov_sp(ARM64_X1, ARM64_SP));     /* buf = sp */
     arm64_emit_word(e, arm64_movz(1, ARM64_X2, 1, 0));        /* len=1 */
     arm64_emit_word(e, arm64_movz(1, ARM64_X0, 1, 0));
-    arm64_emit_word(e, arm64_movz(1, ARM64_X8, 64, 0));
-    arm64_emit_word(e, 0xD4000001u);
+    arm64_emit_word(e, arm64_movz(1, ARM64_X8, SYS_WRITE, 0));
+    arm64_emit_word(e, ARM64_SVC0);
+  }
+  if (zero_result) {
+    arm64_emit_word(e, arm64_movz(1, ARM64_X0, 0, 0));
   }
   arm64_emit_epilogue(e, 16, NULL, 0);
+}
+
+/* ---- freestanding C runtime stubs --------------------------------------- *
+ *
+ * The self-contained executable has no libc and no linker, so a call to malloc
+ * or puts has nothing to resolve to. These hand-written leaves stand in for the
+ * handful of C runtime entry points Mettle programs actually reach, built on
+ * raw AArch64 Linux syscalls. They are emitted only when a program calls them.
+ *
+ * The allocator is a bump pointer over anonymous mmap: free() is a no-op and
+ * memory is never reused, which is why malloc can also serve calloc and `new`
+ * (a fresh mmap page is already zero). That is the right trade for a target
+ * whose job is to run a program to completion and exit. */
+
+/* x0 = malloc(x0): bump the cursor kept in the writable segment, mapping a
+ * fresh arena when the current one cannot satisfy the request. */
+static void emit_stub_malloc(Arm64Emit *e) {
+  int l_grow = arm64_new_label(e);
+  int l_fits = arm64_new_label(e);
+  int l_oom = arm64_new_label(e);
+
+  arm64_emit_prologue(e, 0, NULL, 0);
+  /* x9 = (size + 15) & ~15 -- keep every block 16-byte aligned. */
+  arm64_emit_word(e, arm64_add_imm(1, ARM64_X9, ARM64_X0, 15, 0));
+  arm64_emit_word(e, arm64_movn(1, ARM64_X10, 15, 0)); /* ~15 */
+  arm64_emit_word(e, arm64_and_reg(1, ARM64_X9, ARM64_X9, ARM64_X10));
+
+  emit_imm(e, ARM64_X11, (uint64_t)ELF_DATA_VADDR);
+  arm64_emit_word(e, arm64_ldr_imm(1, ARM64_X12, ARM64_X11, HEAP_CURSOR_OFF));
+  arm64_emit_word(e, arm64_ldr_imm(1, ARM64_X13, ARM64_X11, HEAP_END_OFF));
+  arm64_emit_word(e, arm64_add_reg(1, ARM64_X14, ARM64_X12, ARM64_X9));
+  arm64_emit_word(e, arm64_cmp_reg(1, ARM64_X14, ARM64_X13));
+  arm64_emit_bcond(e, ARM64_LS, l_fits); /* unsigned <=: room in this arena */
+
+  arm64_bind_label(e, l_grow);
+  /* mmap(NULL, arena + request, PROT_READ|PROT_WRITE,
+   *      MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) */
+  emit_imm(e, ARM64_X15, HEAP_ARENA_BYTES);
+  arm64_emit_word(e, arm64_add_reg(1, ARM64_X15, ARM64_X15, ARM64_X9));
+  arm64_emit_word(e, arm64_movz(1, ARM64_X0, 0, 0));
+  arm64_emit_mov(e, 1, ARM64_X1, ARM64_X15);
+  arm64_emit_word(e, arm64_movz(1, ARM64_X2, 3, 0));    /* RW */
+  arm64_emit_word(e, arm64_movz(1, ARM64_X3, 0x22, 0)); /* PRIVATE|ANON */
+  arm64_emit_word(e, arm64_movn(1, ARM64_X4, 0, 0));    /* fd = -1 */
+  arm64_emit_word(e, arm64_movz(1, ARM64_X5, 0, 0));
+  arm64_emit_word(e, arm64_movz(1, ARM64_X8, SYS_MMAP, 0));
+  arm64_emit_word(e, ARM64_SVC0);
+  /* mmap reports failure as a small negative errno. Linux preserves x1..x30
+   * across a syscall, so x9/x15 still hold the request and arena sizes. */
+  arm64_emit_word(e, arm64_cmp_imm(1, ARM64_X0, 0, 0));
+  arm64_emit_bcond(e, ARM64_LT, l_oom);
+  arm64_emit_mov(e, 1, ARM64_X12, ARM64_X0);
+  arm64_emit_word(e, arm64_add_reg(1, ARM64_X13, ARM64_X0, ARM64_X15));
+  arm64_emit_word(e, arm64_add_reg(1, ARM64_X14, ARM64_X12, ARM64_X9));
+  emit_imm(e, ARM64_X11, (uint64_t)ELF_DATA_VADDR);
+  arm64_emit_word(e, arm64_str_imm(1, ARM64_X13, ARM64_X11, HEAP_END_OFF));
+
+  arm64_bind_label(e, l_fits);
+  arm64_emit_word(e, arm64_str_imm(1, ARM64_X14, ARM64_X11, HEAP_CURSOR_OFF));
+  arm64_emit_mov(e, 1, ARM64_X0, ARM64_X12);
+  arm64_emit_epilogue(e, 0, NULL, 0);
+
+  arm64_bind_label(e, l_oom);
+  arm64_emit_word(e, arm64_movz(1, ARM64_X0, 0, 0));
+  arm64_emit_epilogue(e, 0, NULL, 0);
+}
+
+/* x0 = calloc(x0 count, x1 size). Bump-allocated memory comes straight from a
+ * fresh anonymous mapping, so it is already zero. */
+static void emit_stub_calloc(Arm64Emit *e, int malloc_label) {
+  arm64_emit_prologue(e, 0, NULL, 0);
+  arm64_emit_word(e, arm64_mul(1, ARM64_X0, ARM64_X0, ARM64_X1));
+  arm64_emit_bl(e, malloc_label);
+  arm64_emit_epilogue(e, 0, NULL, 0);
+}
+
+/* free(x0): nothing to do -- the bump allocator never reuses a block. */
+static void emit_stub_free(Arm64Emit *e) {
+  arm64_emit_prologue(e, 0, NULL, 0);
+  arm64_emit_epilogue(e, 0, NULL, 0);
+}
+
+/* x0 = putchar(x0): write the low byte to stdout and hand it back. */
+static void emit_stub_putchar(Arm64Emit *e) {
+  arm64_emit_prologue(e, 16, NULL, 0);
+  arm64_emit_word(e, arm64_strb_imm(ARM64_X0, ARM64_SP, 0));
+  arm64_emit_mov(e, 1, ARM64_X9, ARM64_X0);
+  arm64_emit_mov(e, 1, ARM64_X1, ARM64_SP);
+  arm64_emit_word(e, arm64_movz(1, ARM64_X2, 1, 0));
+  arm64_emit_word(e, arm64_movz(1, ARM64_X0, 1, 0)); /* fd = stdout */
+  arm64_emit_word(e, arm64_movz(1, ARM64_X8, SYS_WRITE, 0));
+  arm64_emit_word(e, ARM64_SVC0);
+  arm64_emit_mov(e, 1, ARM64_X0, ARM64_X9);
+  arm64_emit_epilogue(e, 16, NULL, 0);
+}
+
+/* x0 = write(x0 fd, x1 buf, x2 count). */
+static void emit_stub_write(Arm64Emit *e) {
+  arm64_emit_prologue(e, 0, NULL, 0);
+  arm64_emit_word(e, arm64_movz(1, ARM64_X8, SYS_WRITE, 0));
+  arm64_emit_word(e, ARM64_SVC0);
+  arm64_emit_epilogue(e, 0, NULL, 0);
+}
+
+/* x0 = strlen(x0). */
+static void emit_stub_strlen(Arm64Emit *e) {
+  int l_scan = arm64_new_label(e);
+  int l_done = arm64_new_label(e);
+  arm64_emit_prologue(e, 0, NULL, 0);
+  arm64_emit_mov(e, 1, ARM64_X9, ARM64_X0);
+  arm64_emit_word(e, arm64_movz(1, ARM64_X10, 0, 0));
+  arm64_bind_label(e, l_scan);
+  arm64_emit_word(e, arm64_ldrb_imm(ARM64_X11, ARM64_X9, 0));
+  arm64_emit_cbz(e, 0, ARM64_X11, l_done);
+  arm64_emit_word(e, arm64_add_imm(1, ARM64_X9, ARM64_X9, 1, 0));
+  arm64_emit_word(e, arm64_add_imm(1, ARM64_X10, ARM64_X10, 1, 0));
+  arm64_emit_b(e, l_scan);
+  arm64_bind_label(e, l_done);
+  arm64_emit_mov(e, 1, ARM64_X0, ARM64_X10);
+  arm64_emit_epilogue(e, 0, NULL, 0);
+}
+
+/* x0 = memcpy(x0 dst, x1 src, x2 n), byte at a time -- the encoder has no
+ * register-offset addressing, so both ends walk forward. */
+static void emit_stub_memcpy(Arm64Emit *e) {
+  int l_loop = arm64_new_label(e);
+  int l_done = arm64_new_label(e);
+  arm64_emit_prologue(e, 0, NULL, 0);
+  arm64_emit_mov(e, 1, ARM64_X9, ARM64_X0);
+  arm64_emit_cbz(e, 1, ARM64_X2, l_done);
+  arm64_bind_label(e, l_loop);
+  arm64_emit_word(e, arm64_ldrb_imm(ARM64_X11, ARM64_X1, 0));
+  arm64_emit_word(e, arm64_strb_imm(ARM64_X11, ARM64_X9, 0));
+  arm64_emit_word(e, arm64_add_imm(1, ARM64_X1, ARM64_X1, 1, 0));
+  arm64_emit_word(e, arm64_add_imm(1, ARM64_X9, ARM64_X9, 1, 0));
+  arm64_emit_word(e, arm64_sub_imm(1, ARM64_X2, ARM64_X2, 1, 0));
+  arm64_emit_cbnz(e, 1, ARM64_X2, l_loop);
+  arm64_bind_label(e, l_done);
+  arm64_emit_epilogue(e, 0, NULL, 0);
+}
+
+/* x0 = memmove(x0 dst, x1 src, x2 n): copy backwards when the destination
+ * overlaps above the source, forwards otherwise. */
+static void emit_stub_memmove(Arm64Emit *e) {
+  int l_fwd = arm64_new_label(e);
+  int l_bloop = arm64_new_label(e);
+  int l_floop = arm64_new_label(e);
+  int l_done = arm64_new_label(e);
+  arm64_emit_prologue(e, 0, NULL, 0);
+  arm64_emit_cbz(e, 1, ARM64_X2, l_done);
+  arm64_emit_word(e, arm64_cmp_reg(1, ARM64_X0, ARM64_X1));
+  arm64_emit_bcond(e, ARM64_LS, l_fwd); /* dst <= src: forward is safe */
+  arm64_emit_word(e, arm64_add_reg(1, ARM64_X9, ARM64_X0, ARM64_X2));
+  arm64_emit_word(e, arm64_add_reg(1, ARM64_X10, ARM64_X1, ARM64_X2));
+  arm64_bind_label(e, l_bloop);
+  arm64_emit_word(e, arm64_sub_imm(1, ARM64_X9, ARM64_X9, 1, 0));
+  arm64_emit_word(e, arm64_sub_imm(1, ARM64_X10, ARM64_X10, 1, 0));
+  arm64_emit_word(e, arm64_ldrb_imm(ARM64_X11, ARM64_X10, 0));
+  arm64_emit_word(e, arm64_strb_imm(ARM64_X11, ARM64_X9, 0));
+  arm64_emit_word(e, arm64_sub_imm(1, ARM64_X2, ARM64_X2, 1, 0));
+  arm64_emit_cbnz(e, 1, ARM64_X2, l_bloop);
+  arm64_emit_b(e, l_done);
+  arm64_bind_label(e, l_fwd);
+  arm64_emit_mov(e, 1, ARM64_X9, ARM64_X0);
+  arm64_bind_label(e, l_floop);
+  arm64_emit_word(e, arm64_ldrb_imm(ARM64_X11, ARM64_X1, 0));
+  arm64_emit_word(e, arm64_strb_imm(ARM64_X11, ARM64_X9, 0));
+  arm64_emit_word(e, arm64_add_imm(1, ARM64_X1, ARM64_X1, 1, 0));
+  arm64_emit_word(e, arm64_add_imm(1, ARM64_X9, ARM64_X9, 1, 0));
+  arm64_emit_word(e, arm64_sub_imm(1, ARM64_X2, ARM64_X2, 1, 0));
+  arm64_emit_cbnz(e, 1, ARM64_X2, l_floop);
+  arm64_bind_label(e, l_done);
+  arm64_emit_epilogue(e, 0, NULL, 0);
+}
+
+/* x0 = memset(x0 dst, x1 byte, x2 n). */
+static void emit_stub_memset(Arm64Emit *e) {
+  int l_loop = arm64_new_label(e);
+  int l_done = arm64_new_label(e);
+  arm64_emit_prologue(e, 0, NULL, 0);
+  arm64_emit_mov(e, 1, ARM64_X9, ARM64_X0);
+  arm64_emit_cbz(e, 1, ARM64_X2, l_done);
+  arm64_bind_label(e, l_loop);
+  arm64_emit_word(e, arm64_strb_imm(ARM64_X1, ARM64_X9, 0));
+  arm64_emit_word(e, arm64_add_imm(1, ARM64_X9, ARM64_X9, 1, 0));
+  arm64_emit_word(e, arm64_sub_imm(1, ARM64_X2, ARM64_X2, 1, 0));
+  arm64_emit_cbnz(e, 1, ARM64_X2, l_loop);
+  arm64_bind_label(e, l_done);
+  arm64_emit_epilogue(e, 0, NULL, 0);
+}
+
+/* exit(x0) / abort(): leave through the exit syscall, which never returns. */
+static void emit_stub_exit(Arm64Emit *e, int fixed_status) {
+  if (fixed_status >= 0) {
+    arm64_emit_word(e, arm64_movz(1, ARM64_X0, (uint16_t)fixed_status, 0));
+  }
+  arm64_emit_word(e, arm64_movz(1, ARM64_X8, SYS_EXIT, 0));
+  arm64_emit_word(e, ARM64_SVC0);
+}
+
+static void emit_runtime_stub(Arm64Emit *e, int id, int malloc_label) {
+  switch (id) {
+  case STUB_MALLOC: emit_stub_malloc(e); break;
+  case STUB_CALLOC: emit_stub_calloc(e, malloc_label); break;
+  case STUB_FREE: emit_stub_free(e); break;
+  case STUB_PUTS: emit_str_print(e, 1, 1); break;
+  case STUB_PUTCHAR: emit_stub_putchar(e); break;
+  case STUB_WRITE: emit_stub_write(e); break;
+  case STUB_STRLEN: emit_stub_strlen(e); break;
+  case STUB_MEMCPY: emit_stub_memcpy(e); break;
+  case STUB_MEMMOVE: emit_stub_memmove(e); break;
+  case STUB_MEMSET: emit_stub_memset(e); break;
+  case STUB_EXIT: emit_stub_exit(e, -1); break;
+  case STUB_ABORT: emit_stub_exit(e, 134); break;
+  default: arm64_fail(e, "internal: no runtime stub %d", id); break;
+  }
+}
+
+/* ---- writable data image for the self-contained executable --------------- */
+
+static void data_free(Arm64Data *d) {
+  free(d->bytes);
+  free(d->names);
+  free(d->offs);
+  memset(d, 0, sizeof(*d));
+}
+
+/* Grow the image by `n` zero bytes at `align`, returning the new region's
+ * offset, or (size_t)-1 on allocation failure. */
+static size_t data_reserve(Arm64Data *d, size_t n, size_t align) {
+  if (align < 1) align = 1;
+  size_t off = (d->len + align - 1) & ~(align - 1);
+  size_t need = off + n;
+  if (need > d->cap) {
+    size_t cap = d->cap ? d->cap : 256;
+    while (cap < need) cap *= 2;
+    unsigned char *grown = realloc(d->bytes, cap);
+    if (!grown) return (size_t)-1;
+    d->bytes = grown;
+    d->cap = cap;
+  }
+  memset(d->bytes + d->len, 0, need - d->len);
+  d->len = need;
+  return off;
+}
+
+static int data_name(Arm64Data *d, const char *name, size_t off) {
+  if (d->count == d->name_cap) {
+    int cap = d->name_cap ? d->name_cap * 2 : 16;
+    const char **n = realloc(d->names, (size_t)cap * sizeof(*n));
+    size_t *o = realloc(d->offs, (size_t)cap * sizeof(*o));
+    if (n) d->names = n;
+    if (o) d->offs = o;
+    if (!n || !o) return 0;
+    d->name_cap = cap;
+  }
+  d->names[d->count] = name;
+  d->offs[d->count] = off;
+  d->count++;
+  return 1;
+}
+
+/* Lay out and initialize every module global. Two passes: reserve all the slots
+ * first, so an initializer that points at another global (or at string
+ * characters appended during the fill) can be resolved to its final absolute
+ * address -- this path has no relocations, only constants. */
+static int build_data_image(Arm64Data *d, const IRProgram *prog, Arm64Emit *e) {
+  if (data_reserve(d, DATA_RESERVED, 8) == (size_t)-1) {
+    arm64_fail(e, "out of memory building the data image");
+    return 0;
+  }
+  for (size_t i = 0; i < prog->module_symbol_count; i++) {
+    const IRModuleSymbol *s = &prog->module_symbols[i];
+    if (s->kind != IR_MODSYM_VARIABLE || s->is_extern) continue;
+    if (!s->type) {
+      arm64_fail(e, "global '%s' has no type", s->name);
+      return 0;
+    }
+    if (s->has_unfoldable_initializer) {
+      arm64_fail(e,
+                 "global '%s' needs its initializer evaluated at startup, "
+                 "which the self-contained AArch64 executable cannot do",
+                 s->name);
+      return 0;
+    }
+    /* A string value is a { chars, length } record, like everywhere else. */
+    size_t size = s->type->kind == MTLC_TYPE_STRING ? 16
+                                                    : mtlc_type_size(s->type);
+    size_t align = s->type->alignment ? s->type->alignment : 8;
+    if (size == 0) {
+      arm64_fail(e, "global '%s' has zero size", s->name);
+      return 0;
+    }
+    size_t off = data_reserve(d, size, align);
+    if (off == (size_t)-1 ||
+        !data_name(d, module_link_name(s), off) ||
+        (module_link_name(s) != s->name && !data_name(d, s->name, off))) {
+      arm64_fail(e, "out of memory reserving global '%s'", s->name);
+      return 0;
+    }
+  }
+
+  for (size_t i = 0; i < prog->module_symbol_count; i++) {
+    const IRModuleSymbol *s = &prog->module_symbols[i];
+    if (s->kind != IR_MODSYM_VARIABLE || s->is_extern) continue;
+    long base = data_offset_of(d, module_link_name(s));
+    if (base < 0) continue;
+    unsigned char *slot = d->bytes + base;
+
+    if (s->type->kind == MTLC_TYPE_STRING) {
+      if (!s->has_initializer || !s->init_string) continue;
+      size_t length = strlen(s->init_string);
+      size_t chars = data_reserve(d, length + 1, 1);
+      if (chars == (size_t)-1) {
+        arm64_fail(e, "out of memory storing the text of global '%s'", s->name);
+        return 0;
+      }
+      memcpy(d->bytes + chars, s->init_string, length + 1);
+      slot = d->bytes + base; /* data_reserve may have moved the buffer */
+      uint64_t address = (uint64_t)ELF_DATA_VADDR + (uint64_t)chars;
+      uint64_t encoded_length = (uint64_t)length;
+      memcpy(slot, &address, 8);
+      memcpy(slot + 8, &encoded_length, 8);
+      continue;
+    }
+
+    if (s->type->kind == MTLC_TYPE_STRUCT || s->type->kind == MTLC_TYPE_ARRAY) {
+      if (!s->init_bytes || s->init_bytes_size == 0) continue; /* zeroed */
+      size_t size = mtlc_type_size(s->type);
+      size_t n = s->init_bytes_size < size ? s->init_bytes_size : size;
+      memcpy(slot, s->init_bytes, n);
+      for (size_t r = 0; r < s->init_reloc_count; r++) {
+        const IRInitReloc *reloc = &s->init_relocs[r];
+        uint64_t address = 0;
+        if (reloc->symbol) {
+          long target = data_offset_of(d, reloc->symbol);
+          if (target < 0) {
+            arm64_fail(e,
+                       "global '%s' points at '%s', which the self-contained "
+                       "AArch64 executable cannot address",
+                       s->name, reloc->symbol);
+            return 0;
+          }
+          address = (uint64_t)ELF_DATA_VADDR + (uint64_t)target;
+        } else {
+          size_t length = reloc->string ? strlen(reloc->string) : 0;
+          size_t chars = data_reserve(d, length + 1, 1);
+          if (chars == (size_t)-1) {
+            arm64_fail(e, "out of memory storing a string in global '%s'",
+                       s->name);
+            return 0;
+          }
+          memcpy(d->bytes + chars, reloc->string ? reloc->string : "",
+                 length + 1);
+          address = (uint64_t)ELF_DATA_VADDR + (uint64_t)chars;
+          if (reloc->string_wants_record) {
+            size_t record = data_reserve(d, 16, 8);
+            if (record == (size_t)-1) {
+              arm64_fail(e, "out of memory storing a string record in '%s'",
+                         s->name);
+              return 0;
+            }
+            uint64_t encoded_length = (uint64_t)length;
+            memcpy(d->bytes + record, &address, 8);
+            memcpy(d->bytes + record + 8, &encoded_length, 8);
+            address = (uint64_t)ELF_DATA_VADDR + (uint64_t)record;
+          }
+        }
+        if (reloc->offset + 8 > size) continue;
+        memcpy(d->bytes + base + reloc->offset, &address, 8);
+      }
+      continue;
+    }
+
+    if (!s->has_initializer) continue;
+    size_t size = mtlc_type_size(s->type);
+    if (size == 0 || size > 8) {
+      arm64_fail(e, "global '%s' has an unsupported scalar size %u", s->name,
+                 (unsigned)size);
+      return 0;
+    }
+    unsigned char bytes[8] = {0};
+    if (s->init_is_float) {
+      double value = 0.0;
+      memcpy(&value, &s->init_bits, 8);
+      if (s->type->kind == MTLC_TYPE_FLOAT32) {
+        float narrowed = (float)value;
+        memcpy(bytes, &narrowed, 4);
+      } else {
+        memcpy(bytes, &value, 8);
+      }
+    } else {
+      uint64_t bits = (uint64_t)s->init_bits;
+      memcpy(bytes, &bits, size);
+    }
+    memcpy(slot, bytes, size);
+  }
+  return 1;
 }
 
 /* Index of the function named `name`, or -1. */
@@ -1149,8 +2075,15 @@ static int find_fn(const IRProgram *prog, const char *name) {
 }
 
 int arm64_ir_encode_program(Arm64Emit *e, const IRProgram *prog,
-                            const char *entry) {
+                            const char *entry, unsigned char **data_out,
+                            size_t *data_len_out) {
   LblMap fns = {0};
+  Arm64Data data = {0};
+  /* Where this code will be loaded, so a label offset can become a function's
+   * run-time address (see arm64_emit_label_address). */
+  e->code_vaddr = (uint64_t)ELF_BASE + ELF_HDRS;
+  if (data_out) *data_out = NULL;
+  if (data_len_out) *data_len_out = 0;
   if (!entry) {
     entry = "main";
   }
@@ -1162,7 +2095,14 @@ int arm64_ir_encode_program(Arm64Emit *e, const IRProgram *prog,
     free(reach);
     free(queue);
     free(retf);
-    e->error = 1;
+    arm64_fail(e, "out of memory walking the call graph from '%s'", entry);
+    return 0;
+  }
+  if (!build_data_image(&data, prog, e)) {
+    free(reach);
+    free(queue);
+    free(retf);
+    data_free(&data);
     return 0;
   }
 
@@ -1184,56 +2124,122 @@ int arm64_ir_encode_program(Arm64Emit *e, const IRProgram *prog,
    * would call are not pulled in). Only reachable functions are emitted. */
   int qh = 0, qt = 0;
   int start = find_fn(prog, entry);
-  if (start >= 0) {
-    queue[qt++] = start;
+  if (start < 0) {
+    free(reach);
+    free(queue);
+    free(retf);
+    free(fns.names);
+    free(fns.ids);
+    data_free(&data);
+    arm64_fail(e, "no entry function '%s' in this program", entry);
+    return 0;
   }
+  /* Mark on enqueue, not on dequeue, so `queue` cannot hold more than one entry
+   * per function -- it is sized for exactly that. */
+  reach[start] = 1;
+  queue[qt++] = start;
   while (qh < qt) {
     int fi = queue[qh++];
-    if (reach[fi]) {
-      continue;
-    }
-    reach[fi] = 1;
     const IRFunction *f = prog->functions[fi];
     if (io_leaf(f->name)) {
       continue; /* leaf: do not follow into the stdlib body */
     }
     for (size_t k = 0; k < f->instruction_count; k++) {
       const IRInstruction *in = &f->instructions[k];
-      if (in->op == IR_OP_CALL && in->text) {
-        int ci = find_fn(prog, in->text);
+      /* A callee by name, plus any function named as a VALUE: nothing calls a
+       * function pointer's target by name, but its address is taken. */
+      const char *referenced[5] = {
+          in->op == IR_OP_CALL ? in->text : NULL,
+          in->dest.kind == IR_OPERAND_SYMBOL ? in->dest.name : NULL,
+          in->lhs.kind == IR_OPERAND_SYMBOL ? in->lhs.name : NULL,
+          in->rhs.kind == IR_OPERAND_SYMBOL ? in->rhs.name : NULL, NULL};
+      for (int o = 0; o < 4; o++) {
+        if (!referenced[o]) continue;
+        int ci = find_fn(prog, referenced[o]);
         if (ci >= 0 && !reach[ci]) {
+          reach[ci] = 1;
+          queue[qt++] = ci;
+        }
+      }
+      for (size_t a = 0; a < in->argument_count; a++) {
+        if (in->arguments[a].kind != IR_OPERAND_SYMBOL) continue;
+        int ci = find_fn(prog, in->arguments[a].name);
+        if (ci >= 0 && !reach[ci]) {
+          reach[ci] = 1;
           queue[qt++] = ci;
         }
       }
     }
   }
 
+  /* Which C runtime stubs the reachable code needs. Computed from the same test
+   * the call sites use, so every branch a body emits finds a bound label. */
+  int stub_used[STUB_COUNT] = {0};
+  /* cstr("literal") is folded at the call site and needs no body. cstr(value)
+   * cannot be, so it becomes a real bl and its body must be emitted. */
+  int cstr_needs_body = 0;
+  for (size_t i = 0; i < n; i++) {
+    if (!reach[i]) continue;
+    const IRFunction *f = prog->functions[i];
+    if (io_leaf(f->name)) continue;
+    for (size_t k = 0; k < f->instruction_count; k++) {
+      const IRInstruction *in = &f->instructions[k];
+      if (in->op == IR_OP_NEW) {
+        stub_used[STUB_MALLOC] = 1;
+      } else if (in->op == IR_OP_CALL && in->text &&
+                 find_fn(prog, in->text) < 0) {
+        int id = runtime_stub_index(in->text);
+        if (id >= 0) stub_used[id] = 1;
+      } else if (in->op == IR_OP_CALL && in->text &&
+                 strcmp(in->text, "cstr") == 0 &&
+                 (in->argument_count == 0 ||
+                  in->arguments[0].kind != IR_OPERAND_STRING)) {
+        cstr_needs_body = 1;
+      }
+    }
+  }
+  for (int i = 0; i < STUB_COUNT; i++) {
+    if (stub_used[i] && RUNTIME_STUBS[i].needs_malloc) stub_used[STUB_MALLOC] = 1;
+  }
+
   /* _start: call the entry function, then exit(x0). */
   arm64_emit_bl(e, label_for(e, &fns, entry));
-  arm64_emit_word(e, arm64_movz(1, ARM64_X8, 93, 0)); /* exit syscall */
-  arm64_emit_word(e, 0xD4000001u);                    /* svc #0 */
+  arm64_emit_word(e, arm64_movz(1, ARM64_X8, SYS_EXIT, 0));
+  arm64_emit_word(e, ARM64_SVC0);
 
   for (size_t i = 0; i < n && !e->error; i++) {
     if (!reach[i]) {
       continue;
     }
     const IRFunction *fn = prog->functions[i];
-    /* cstr is fully inlined at call sites; it is never the target of a bl, so
-     * its label is unreferenced and it needs no body. */
-    if (strcmp(fn->name, "cstr") == 0) {
+    /* cstr is folded at call sites that pass a literal, so it is usually never
+     * the target of a bl and needs no body at all. */
+    if (strcmp(fn->name, "cstr") == 0 && !cstr_needs_body) {
       continue;
     }
     arm64_bind_label(e, label_for(e, &fns, fn->name));
     int with_newline = 0, is_string = 0;
     if (io_stub_intrinsic(fn->name, &with_newline, &is_string)) {
       if (is_string) {
-        emit_str_print(e, with_newline);
+        emit_str_print(e, with_newline, 0);
       } else {
         emit_int_print(e, with_newline);
       }
-    } else if (!encode_function(e, fn, &fns, prog, retf, NULL)) {
+    } else if (!encode_function(e, fn, &fns, prog, retf, NULL, &data)) {
       break;
     }
+  }
+
+  /* Runtime stub bodies last: their labels were created by the calls above, and
+   * calloc branches to malloc, so malloc's label must exist before either body
+   * is emitted. */
+  int malloc_label = stub_used[STUB_MALLOC]
+                         ? label_for(e, &fns, RUNTIME_STUBS[STUB_MALLOC].name)
+                         : -1;
+  for (int i = 0; i < STUB_COUNT && !e->error; i++) {
+    if (!stub_used[i]) continue;
+    arm64_bind_label(e, label_for(e, &fns, RUNTIME_STUBS[i].name));
+    emit_runtime_stub(e, i, malloc_label);
   }
 
   free(reach);
@@ -1241,7 +2247,19 @@ int arm64_ir_encode_program(Arm64Emit *e, const IRProgram *prog,
   free(retf);
   free(fns.names);
   free(fns.ids);
-  return e->error ? 0 : 1;
+  if (e->error) {
+    data_free(&data);
+    return 0;
+  }
+  /* Hand the image to the caller to place in the executable's writable
+   * segment; it owns the buffer from here. */
+  if (data_out && data_len_out) {
+    *data_out = data.bytes;
+    *data_len_out = data.len;
+    data.bytes = NULL;
+  }
+  data_free(&data);
+  return 1;
 }
 
 static void arm64_object_error(char *error, size_t capacity,
@@ -1549,20 +2567,23 @@ int arm64_ir_write_object(const IRProgram *prog, const char *path, char *error,
     arm64_bind_label(&code,
                      label_for(&code, &functions, function->name));
     if (!encode_function(&code, function, &functions, prog, returns_float,
-                         &object)) {
+                         &object, NULL)) {
       break;
     }
     const char *link_name = symbol ? module_link_name(symbol) : function->name;
     if (!binary_emitter_define_symbol(
             emitter, link_name, BINARY_SYMBOL_GLOBAL, object.text_section,
             start, arm64_here(&code) - start)) {
-      code.error = 1;
+      arm64_fail(&code, "could not define the symbol for '%s'", link_name);
       break;
     }
   }
   if (code.error || !arm64_emit_finalize(&code)) {
+    /* The lowering's own reason is the specific one; the emitter's error is a
+     * fallback for failures that never reached arm64_fail. */
     arm64_object_error(error, error_capacity,
-                       binary_emitter_get_error(emitter)
+                       code.reason[0] ? code.reason
+                       : binary_emitter_get_error(emitter)
                            ? binary_emitter_get_error(emitter)
                            : "AArch64 IR lowering failed");
     goto cleanup;
@@ -1591,26 +2612,55 @@ static void w16(unsigned char *p, uint16_t v) { memcpy(p, &v, 2); }
 static void w32(unsigned char *p, uint32_t v) { memcpy(p, &v, 4); }
 static void w64(unsigned char *p, uint64_t v) { memcpy(p, &v, 8); }
 
-int arm64_write_elf(const char *path, const unsigned char *code, size_t len) {
+int arm64_write_elf(const char *path, const unsigned char *code, size_t len,
+                    const unsigned char *data, size_t data_len) {
   unsigned char h[ELF_HDRS];
   memset(h, 0, sizeof(h));
-  uint64_t total = ELF_HDRS + len;
+  uint64_t text_total = ELF_HDRS + len;
+  /* The writable segment loads at a fixed address (see ELF_DATA_VADDR), so the
+   * text must not grow into it. A program that big belongs on the object path,
+   * where the linker places everything. */
+  if (text_total >= ELF_TEXT_LIMIT) {
+    return 0;
+  }
+  /* p_offset and p_vaddr must agree modulo the page size. ELF_DATA_VADDR is
+   * page-aligned, so a page-aligned file offset satisfies that; the extra page
+   * keeps the two segments off a shared page. */
+  uint64_t data_off = ((text_total + 0xFFFu) & ~(uint64_t)0xFFF) + 0x1000u;
+  uint64_t data_size = data_len ? data_len : 8;
+
   h[0] = 0x7F; h[1] = 'E'; h[2] = 'L'; h[3] = 'F';
   h[4] = 2; h[5] = 1; h[6] = 1;
   w16(h + 16, 2); w16(h + 18, 183); w32(h + 20, 1);
   w64(h + 24, ELF_BASE + ELF_HDRS); w64(h + 32, 64); w64(h + 40, 0);
-  w32(h + 48, 0); w16(h + 52, 64); w16(h + 54, 56); w16(h + 56, 1);
+  w32(h + 48, 0); w16(h + 52, 64); w16(h + 54, 56); w16(h + 56, 2);
   unsigned char *ph = h + 64;
-  w32(ph + 0, 1); w32(ph + 4, 5); w64(ph + 8, 0);
+  w32(ph + 0, 1); w32(ph + 4, 5); w64(ph + 8, 0); /* PT_LOAD, R+X */
   w64(ph + 16, ELF_BASE); w64(ph + 24, ELF_BASE);
-  w64(ph + 32, total); w64(ph + 40, total); w64(ph + 48, 0x1000);
+  w64(ph + 32, text_total); w64(ph + 40, text_total); w64(ph + 48, 0x1000);
+  ph += 56;
+  w32(ph + 0, 1); w32(ph + 4, 6); w64(ph + 8, data_off); /* PT_LOAD, R+W */
+  w64(ph + 16, ELF_DATA_VADDR); w64(ph + 24, ELF_DATA_VADDR);
+  w64(ph + 32, data_size); w64(ph + 40, data_size); w64(ph + 48, 0x1000);
 
   FILE *f = fopen(path, "wb");
   if (!f) {
     return 0;
   }
+  static const unsigned char zeros[512] = {0};
   int ok = fwrite(h, 1, ELF_HDRS, f) == ELF_HDRS &&
            fwrite(code, 1, len, f) == len;
+  for (uint64_t at = text_total; ok && at < data_off;) {
+    size_t chunk = (size_t)(data_off - at);
+    if (chunk > sizeof(zeros)) chunk = sizeof(zeros);
+    ok = fwrite(zeros, 1, chunk, f) == chunk;
+    at += chunk;
+  }
+  if (ok && data_len) {
+    ok = fwrite(data, 1, data_len, f) == data_len;
+  } else if (ok) {
+    ok = fwrite(zeros, 1, 8, f) == 8;
+  }
   fclose(f);
   return ok;
 }

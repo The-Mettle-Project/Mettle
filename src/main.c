@@ -3962,25 +3962,36 @@ int compile_file(const char *input_filename, const char *output_filename,
     goto cleanup;
   }
 
-  /* --emit-arm64: lower the scalar-integer subset of every function directly to
-   * an AArch64 ELF executable (from-scratch backend, no external assembler). A
-   * `_start` calls main() and exits with its return value. No optimization (the
-   * direct IR backend consumes the unoptimized IR shape), no x86 object. */
+  /* --emit-arm64: lower the scalar subset of every function directly to a
+   * self-contained AArch64 ELF executable (from-scratch backend, no external
+   * assembler and no linker). A `_start` calls main() and exits with its return
+   * value; module globals and the freestanding allocator live in a second,
+   * writable segment. No optimization (the direct IR backend consumes the
+   * unoptimized IR shape), no x86 object. */
   if (options->emit_arm64) {
     Arm64Emit ae;
+    unsigned char *arm64_data = NULL;
+    size_t arm64_data_len = 0;
     arm64_emit_init(&ae);
-    int ok = arm64_ir_encode_program(&ae, ir_program, "main") &&
+    int ok = arm64_ir_encode_program(&ae, ir_program, "main", &arm64_data,
+                                     &arm64_data_len) &&
              arm64_emit_finalize(&ae);
     if (ok) {
-      ok = arm64_write_elf(output_filename, ae.code.data, ae.code.len);
+      ok = arm64_write_elf(output_filename, ae.code.data, ae.code.len,
+                           arm64_data, arm64_data_len);
       if (!ok) {
-        fprintf(stderr, "Error: could not write AArch64 ELF '%s'\n",
-                output_filename);
+        fprintf(stderr,
+                "Error: could not write AArch64 ELF '%s' (I/O failure, or the "
+                "program's %zu bytes of code reach the fixed address of the "
+                "writable segment; use the object path for a program this "
+                "large)\n",
+                output_filename, ae.code.len);
       }
     } else {
-      fprintf(stderr, "Error: AArch64 lowering failed (an op outside the "
-                      "supported scalar subset, or an unresolved call)\n");
+      fprintf(stderr, "Error: AArch64 lowering failed: %s\n",
+              arm64_error_reason(&ae));
     }
+    free(arm64_data);
     arm64_emit_free(&ae);
     if (!ok) {
       result = 1;

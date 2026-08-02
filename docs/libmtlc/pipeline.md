@@ -146,10 +146,26 @@ covered by an eleven-argument CUDA launch ABI gate.
 
 The lowering model remains deliberately simple and non-optimizing: values are
 homed to stack slots around scalar integer, pointer, load/store, address-of,
-float, control-flow, and direct-call operations. Aggregates and optimized SIMD
-IR are not yet an AArch64 surface. The driver's explicit `--emit-arm64` option
-retains the older self-contained `_start` smoke executable for assembler-free
-bring-up; ordinary AArch64 Linux object/build commands use the relocatable path.
+float, control-flow, heap-allocation, direct-call, and indirect-call (function
+pointer) operations. Aggregate-by-value calls and optimized SIMD IR are not yet
+an AArch64 surface; an op that is missing names itself and its function when
+lowering stops, rather than reporting a generic failure.
+
+Because this path computes in 64-bit registers, two comparison cases need
+explicit handling: unsigned values (tracked from declared types, `is_unsigned`,
+and pointers, then propagated across assignments) use LO/LS/HI/HS rather than
+the signed condition codes, and float `<` and `<=` use MI and LS, which read
+false when FCMP reports unordered, as IEEE-754 requires of any comparison with
+NaN. A function's address, which a branch displacement cannot express, comes
+from page/lo12 relocations against the function symbol.
+
+The driver's explicit `--emit-arm64` option retains the self-contained `_start`
+executable for assembler-free and linker-free bring-up; ordinary AArch64 Linux
+object/build commands use the relocatable path. Having no libc, the
+self-contained form carries a fixed-address writable segment for module globals
+and emits freestanding syscall-based stubs (bump-pointer `malloc`/`calloc`/
+`free`, `puts`, `putchar`, `write`, `strlen`, `memcpy`, `memmove`, `memset`,
+`exit`, `abort`) for the calls it cannot defer to a linker.
 
 ### NVIDIA PTX
 

@@ -43,7 +43,7 @@ static int label_id(Arm64Emit *e, LabelMap *m, const char *name) {
     }
   }
   if (m->count >= 256) {
-    e->error = 1;
+    arm64_fail(e, "more than 256 labels in one function");
     return 0;
   }
   int id = arm64_new_label(e);
@@ -75,7 +75,8 @@ static Arm64Reg op_reg(Arm64Emit *e, const MirOperand *op, Arm64Reg scratch) {
     emit_mov_imm(e, scratch, (uint64_t)op->imm);
     return scratch;
   }
-  e->error = 1;
+  arm64_fail(e, "MIR operand kind %d cannot be placed in a register",
+             (int)op->kind);
   return scratch;
 }
 
@@ -247,7 +248,9 @@ int arm64_mir_encode_seq(Arm64Emit *e, const MirInst *insns, size_t count) {
       break;
 
     default:
-      e->error = 1;
+      /* Numeric, not mir_opcode_name(): this file is linked on its own by
+       * tests/arm64_emit_test.c, and naming opcodes would drag in mir.c. */
+      arm64_fail(e, "MIR opcode %d has no AArch64 lowering", (int)in->op);
       break;
     }
   }
@@ -277,7 +280,7 @@ static Arm64Reg vload(Arm64Emit *e, const MirOperand *op, Arm64Reg scratch) {
   if (op->kind == MIR_OPK_PHYS) {
     return (Arm64Reg)op->phys;
   }
-  e->error = 1;
+  arm64_fail(e, "MIR operand kind %d cannot be loaded", (int)op->kind);
   return scratch;
 }
 
@@ -396,7 +399,9 @@ int arm64_mir_encode_vregs(Arm64Emit *e, const MirInst *insns, size_t count,
       break;
 
     default:
-      e->error = 1;
+      /* Numeric, not mir_opcode_name(): this file is linked on its own by
+       * tests/arm64_emit_test.c, and naming opcodes would drag in mir.c. */
+      arm64_fail(e, "MIR opcode %d has no AArch64 lowering", (int)in->op);
       break;
     }
   }
