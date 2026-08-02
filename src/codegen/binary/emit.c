@@ -4305,11 +4305,19 @@ static int binary_emit_binary_float(CodeGenerator *generator,
   } else if (strcmp(op, "==") == 0 || strcmp(op, "!=") == 0 ||
              strcmp(op, "<") == 0 || strcmp(op, "<=") == 0 ||
              strcmp(op, ">") == 0 || strcmp(op, ">=") == 0) {
+    /* ucomis sets ZF=PF=CF=1 when either operand is NaN, so the below/
+     * below-or-equal conditions read TRUE on unordered. `<` and `<=` therefore
+     * compare rhs against lhs and test above/above-or-equal, which are the
+     * conditions that are false on unordered — every ordered comparison
+     * involving a NaN must be false. */
+    int swap = (strcmp(op, "<") == 0 || strcmp(op, "<=") == 0);
+    BinaryXmmRegister cmp_lhs = swap ? BINARY_XMM1 : BINARY_XMM0;
+    BinaryXmmRegister cmp_rhs = swap ? BINARY_XMM0 : BINARY_XMM1;
     int cmp_ok = (fbits == 32)
-                     ? binary_emit_ucomiss_xmm_xmm(&context->code,
-                                                   BINARY_XMM0, BINARY_XMM1)
-                     : binary_emit_ucomisd_xmm_xmm(&context->code,
-                                                   BINARY_XMM0, BINARY_XMM1);
+                     ? binary_emit_ucomiss_xmm_xmm(&context->code, cmp_lhs,
+                                                   cmp_rhs)
+                     : binary_emit_ucomisd_xmm_xmm(&context->code, cmp_lhs,
+                                                   cmp_rhs);
     if (!cmp_ok) {
       goto emit_failure;
     }
@@ -4331,10 +4339,10 @@ static int binary_emit_binary_float(CodeGenerator *generator,
         goto emit_failure;
       }
     } else if (strcmp(op, "<") == 0) {
-      condition_opcode = 0x92;
+      condition_opcode = 0x97; /* seta on the swapped compare */
       is_compare = 1;
     } else if (strcmp(op, "<=") == 0) {
-      condition_opcode = 0x96;
+      condition_opcode = 0x93; /* setae on the swapped compare */
       is_compare = 1;
     } else if (strcmp(op, ">") == 0) {
       condition_opcode = 0x97;

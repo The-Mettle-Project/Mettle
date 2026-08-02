@@ -8901,6 +8901,8 @@ $runFixtures = @(
      What = "a nested call passed something wrong" },
   @{ Name = "float_conv"; Path = "tests/codegen/float_conv.mettle"
      What = "a codegen check failed" },
+  @{ Name = "float_nan_compare"; Path = "tests/codegen/float_nan_compare.mettle"
+     What = "an ordered float comparison against NaN came back true" },
   @{ Name = "unsigned_loops"; Path = "tests/codegen/unsigned_loops.mettle"
      What = "a codegen check failed" },
   @{ Name = "defer_scopes"; Path = "tests/codegen/defer_scopes.mettle"

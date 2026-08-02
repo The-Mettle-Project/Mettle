@@ -1,0 +1,81 @@
+/* IEEE-754: every ordered comparison against a NaN is false, and `!=` is the
+ * only comparison that is true. The x86 hazard is ucomis setting ZF=PF=CF=1 on
+ * unordered, which makes the below / below-or-equal conditions read TRUE; the
+ * arm64 hazard is FCMP leaving N=0,Z=0,C=1,V=1, which makes LT and LE read
+ * TRUE. Both backends must compare so that `<` and `<=` are false on NaN. */
+
+@noinline fn nan64(z: float64) -> float64 { return z / z; }
+@noinline fn nan32(z: float32) -> float32 { return z / z; }
+
+/* Bit i is set for the i'th comparison that came back true. */
+@noinline fn score64(n: float64, k: float64) -> int64 {
+  var r: int64 = 0;
+  if (n < k)  { r = r + 1; }
+  if (n <= k) { r = r + 2; }
+  if (n > k)  { r = r + 4; }
+  if (n >= k) { r = r + 8; }
+  if (n == k) { r = r + 16; }
+  if (n != k) { r = r + 32; }
+  return r;
+}
+
+@noinline fn score32(n: float32, k: float32) -> int64 {
+  var r: int64 = 0;
+  if (n < k)  { r = r + 1; }
+  if (n <= k) { r = r + 2; }
+  if (n > k)  { r = r + 4; }
+  if (n >= k) { r = r + 8; }
+  if (n == k) { r = r + 16; }
+  if (n != k) { r = r + 32; }
+  return r;
+}
+
+/* Same six comparisons, but each result is materialized as a 0/1 value first
+ * rather than fused into a branch -- a separate lowering path. */
+@noinline fn score64_values(n: float64, k: float64) -> int64 {
+  var lt: bool = n < k;
+  var le: bool = n <= k;
+  var gt: bool = n > k;
+  var ge: bool = n >= k;
+  var eq: bool = n == k;
+  var ne: bool = n != k;
+  var r: int64 = 0;
+  if (lt) { r = r + 1; }
+  if (le) { r = r + 2; }
+  if (gt) { r = r + 4; }
+  if (ge) { r = r + 8; }
+  if (eq) { r = r + 16; }
+  if (ne) { r = r + 32; }
+  return r;
+}
+
+fn main() -> int32 {
+  var zero64: float64 = 0.0;
+  var zero32: float32 = 0.0;
+  var n64: float64 = nan64(zero64);
+  var n32: float32 = nan32(zero32);
+
+  /* NaN on the left: only `!=` is true. */
+  if (score64(n64, 1.0) != 32) { return 1; }
+  if (score32(n32, 1.0) != 32) { return 2; }
+  if (score64_values(n64, 1.0) != 32) { return 3; }
+
+  /* NaN on the right, and NaN against itself. */
+  if (score64(1.0, n64) != 32) { return 4; }
+  if (score64(n64, n64) != 32) { return 5; }
+  if (score64_values(1.0, n64) != 32) { return 6; }
+
+  /* Ordered operands still compare normally: 1 < 2 sets `<`, `<=`, `!=`. */
+  if (score64(1.0, 2.0) != 35) { return 7; }
+  if (score64(2.0, 1.0) != 44) { return 8; }
+  if (score64(1.0, 1.0) != 26) { return 9; }
+  if (score32(1.0, 2.0) != 35) { return 10; }
+  if (score64_values(1.0, 2.0) != 35) { return 11; }
+  if (score64_values(1.0, 1.0) != 26) { return 12; }
+
+  /* Negative zero compares equal to zero, and -1 orders below both. */
+  if (score64(-0.0, 0.0) != 26) { return 13; }
+  if (score64(-1.0, -0.0) != 35) { return 14; }
+
+  return 0;
+}
