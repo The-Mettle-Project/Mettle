@@ -98,6 +98,64 @@ Type *type_checker_parse_array_type(TypeChecker *checker,
   return array_type;
 }
 
+int type_checker_ensure_multi_return_type(TypeChecker *checker,
+                                          FunctionDeclaration *function) {
+  if (!checker || !function || function->return_type_count < 2 ||
+      !function->return_type) {
+    return 0;
+  }
+
+  Type *existing = type_checker_get_type_by_name(checker, function->return_type);
+  if (existing) {
+    return existing->kind == TYPE_STRUCT &&
+           existing->field_count == function->return_type_count;
+  }
+
+  Type **field_types = calloc(function->return_type_count, sizeof(Type *));
+  char **field_names = calloc(function->return_type_count, sizeof(char *));
+  if (!field_types || !field_names) {
+    free(field_types);
+    free(field_names);
+    return 0;
+  }
+
+  for (size_t i = 0; i < function->return_type_count; i++) {
+    field_types[i] = type_checker_get_type_by_name(
+        checker, function->return_types[i]);
+    field_names[i] = malloc(32);
+    if (!field_types[i] || !field_names[i]) {
+      for (size_t j = 0; j <= i; j++) {
+        free(field_names[j]);
+      }
+      free(field_names);
+      free(field_types);
+      return 0;
+    }
+    snprintf(field_names[i], 32, "_%zu", i);
+  }
+
+  Type *tuple_type = type_create_struct(function->return_type, field_names,
+                                        field_types, function->return_type_count);
+  for (size_t i = 0; i < function->return_type_count; i++) {
+    free(field_names[i]);
+  }
+  free(field_names);
+  free(field_types);
+  if (!tuple_type) {
+    return 0;
+  }
+
+  Symbol *tuple_symbol = symbol_create(function->return_type, SYMBOL_STRUCT,
+                                        tuple_type);
+  if (!tuple_symbol ||
+      !symbol_table_declare(checker->symbol_table, tuple_symbol)) {
+    symbol_destroy(tuple_symbol);
+    type_destroy(tuple_type);
+    return 0;
+  }
+  return 1;
+}
+
 Type *type_checker_parse_pointer_type(TypeChecker *checker,
                                              const char *name) {
   if (!checker || !name) {

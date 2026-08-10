@@ -145,6 +145,11 @@ int type_checker_register_function_signature(TypeChecker *checker,
   if (!func_decl || !func_decl->name)
     return 0;
 
+  if (func_decl->return_type_count > 0 &&
+      !type_checker_ensure_multi_return_type(checker, func_decl)) {
+    return 0;
+  }
+
   Symbol *existing =
       symbol_table_lookup_current_scope(checker->symbol_table, func_decl->name);
   if (existing)

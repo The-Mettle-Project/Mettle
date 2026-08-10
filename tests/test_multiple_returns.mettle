@@ -1,0 +1,20 @@
+fn solve() -> (float64, float64, float64) {
+  return (0.8, 1.2, 2.4);
+}
+
+fn main() -> int32 {
+  var x: float64 = 0.0;
+  var y: float64 = 0.0;
+  var z: float64 = 0.0;
+  (x, y, z) = solve();
+  if (x < 0.79 || x > 0.81) {
+    return 1;
+  }
+  if (y < 1.19 || y > 1.21) {
+    return 2;
+  }
+  if (z < 2.39 || z > 2.41) {
+    return 3;
+  }
+  return 0;
+}

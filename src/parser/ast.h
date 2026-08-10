@@ -89,7 +89,7 @@ typedef struct {
   ASTNode *initializer;
   int is_extern;
   int is_exported;
-  int is_const; // declared with `const`: immutable, compile-time integer value
+  int is_const; // declared with `const`: immutable binding
   char *link_name;
   // Set on compiler-synthesized bindings whose type is determined structurally
   // (e.g. a range-`for` loop counter takes the type of its bound), which are
@@ -105,6 +105,8 @@ typedef struct {
   char **parameter_types;
   size_t parameter_count;
   char *return_type;
+  char **return_types;
+  size_t return_type_count;
   ASTNode *body;
   int is_exported;
   int is_extern;
@@ -327,6 +329,8 @@ typedef struct {
   char *variable_name;
   ASTNode *value;
   ASTNode *target; // Non-null for struct field assignment (obj.field = expr)
+  ASTNode **targets;
+  size_t target_count;
 } Assignment;
 
 typedef struct {
@@ -467,6 +471,8 @@ typedef struct {
 
 typedef struct {
   ASTNode *value;
+  ASTNode **values;
+  size_t value_count;
 } ReturnStatement;
 
 typedef struct {
@@ -526,6 +532,8 @@ ASTNode *ast_create_barrier_statement(unsigned memory_regions,
                                       SourceLocation location);
 ASTNode *ast_create_assignment(const char *variable_name, ASTNode *value,
                                SourceLocation location);
+ASTNode *ast_create_multi_assignment(ASTNode **targets, size_t target_count,
+                                     ASTNode *value, SourceLocation location);
 ASTNode *ast_create_inline_asm(const char *assembly_code,
                                SourceLocation location);
 ASTNode *ast_create_identifier(const char *name, SourceLocation location);

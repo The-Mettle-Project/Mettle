@@ -3261,6 +3261,9 @@ static void adapt_walk(ASTNode *node, const char *current_return_type,
     if (rs && rs->value) {
       adapt_wrap_if_needed(&rs->value, node, current_return_type, top_decls,
                            top_count, cache, program, prog, had_error);
+      if (rs->values && rs->value_count > 0) {
+        rs->values[0] = rs->value;
+      }
     }
   } else if (node->type == AST_FUNCTION_CALL) {
     CallExpression *call = (CallExpression *)node->data;

@@ -2,6 +2,205 @@
 #include "ir_lowering_internal.h"
 #include "frontend/mtlc_frontend.h"
 
+static int ir_lower_multi_return_value(IRLoweringContext *context,
+                                       IRFunction *function,
+                                       ReturnStatement *return_statement,
+                                       IROperand *out_value,
+                                       SourceLocation location) {
+  Type *tuple_type = ir_resolve_named_type(context,
+                                           context->current_return_type_name);
+  char *tuple_name = NULL;
+
+  if (!tuple_type || tuple_type->kind != TYPE_STRUCT ||
+      !return_statement || return_statement->value_count != tuple_type->field_count) {
+    ir_set_error(context, "Malformed multiple return value");
+    return 0;
+  }
+  tuple_name = ir_new_label_name(context, "multi_return_value");
+  if (!tuple_name ||
+      !ir_emit_local_declaration(context, function, tuple_name,
+                                 tuple_type->name, location)) {
+    free(tuple_name);
+    return 0;
+  }
+
+  for (size_t i = 0; i < tuple_type->field_count; i++) {
+    Type *field_type = tuple_type->field_types[i];
+    ASTNode *source = return_statement->values[i];
+    IROperand component = ir_operand_none();
+    IROperand base = ir_operand_none();
+    IROperand field_address = ir_operand_none();
+    IRInstruction add = {0};
+    IRInstruction store = {0};
+
+    if (!field_type || field_type->kind == TYPE_STRUCT ||
+        field_type->kind == TYPE_ARRAY ||
+        !ir_lower_expression(context, function, source, &component) ||
+        !ir_emit_address_of_symbol(context, function, tuple_name, location,
+                                   &base) ||
+        !ir_make_temp_operand(context, &field_address)) {
+      ir_operand_destroy(&component);
+      ir_operand_destroy(&base);
+      ir_operand_destroy(&field_address);
+      free(tuple_name);
+      return 0;
+    }
+    add.op = IR_OP_BINARY;
+    add.location = location;
+    add.dest = field_address;
+    add.lhs = base;
+    add.rhs = ir_operand_int((long long)tuple_type->field_offsets[i]);
+    add.text = "+";
+    if (!ir_emit(context, function, &add)) {
+      ir_operand_destroy(&component);
+      ir_operand_destroy(&field_address);
+      ir_operand_destroy(&base);
+      free(tuple_name);
+      return 0;
+    }
+    store.op = IR_OP_STORE;
+    store.location = location;
+    store.dest = field_address;
+    store.lhs = component;
+    store.rhs = ir_operand_int(ir_type_storage_size(field_type));
+    if (field_type->kind == TYPE_FLOAT32 || field_type->kind == TYPE_FLOAT64) {
+      ir_assign_apply_float_bits(&store, &store.lhs,
+                                 ir_type_float_bits(field_type));
+    }
+    if (!ir_emit(context, function, &store)) {
+      ir_operand_destroy(&component);
+      ir_operand_destroy(&field_address);
+      ir_operand_destroy(&base);
+      free(tuple_name);
+      return 0;
+    }
+    ir_operand_destroy(&component);
+    ir_operand_destroy(&field_address);
+    ir_operand_destroy(&base);
+  }
+
+  *out_value = ir_operand_symbol(tuple_name);
+  free(tuple_name);
+  return out_value->name != NULL;
+}
+
+static int ir_lower_multi_assignment(IRLoweringContext *context,
+                                      IRFunction *function,
+                                      Assignment *assignment,
+                                      SourceLocation location) {
+  Type *tuple_type = assignment && assignment->value
+                         ? assignment->value->resolved_type
+                         : NULL;
+  IROperand value = ir_operand_none();
+  char *tuple_name = NULL;
+  int ok = 0;
+
+  if (!assignment || assignment->target_count < 2 || !assignment->value ||
+      !tuple_type || tuple_type->kind != TYPE_STRUCT ||
+      tuple_type->field_count != assignment->target_count) {
+    ir_set_error(context, "Malformed multiple return assignment");
+    return 0;
+  }
+  if (!ir_lower_expression(context, function, assignment->value, &value)) {
+    return 0;
+  }
+
+  tuple_name = ir_new_label_name(context, "multi_return");
+  if (!tuple_name ||
+      !ir_emit_local_declaration(context, function, tuple_name,
+                                 tuple_type->name, location) ||
+      (!ir_try_emit_aggregate_symbol_memcpy(context, function, tuple_name,
+                                             &value, tuple_type, location) &&
+       !ir_emit_symbol_assignment(context, function, tuple_name, &value,
+                                  location))) {
+    ir_operand_destroy(&value);
+    free(tuple_name);
+    return 0;
+  }
+
+  for (size_t i = 0; i < assignment->target_count; i++) {
+    ASTNode *target = assignment->targets[i];
+    Identifier *identifier = target ? (Identifier *)target->data : NULL;
+    Type *field_type = tuple_type->field_types[i];
+    IROperand base = ir_operand_none();
+    IROperand field_address = ir_operand_none();
+    IROperand field_value = ir_operand_none();
+    IRInstruction add = {0};
+    IRInstruction load = {0};
+    IRInstruction store = {0};
+
+    if (!target || target->type != AST_IDENTIFIER || !identifier ||
+        !identifier->name || !field_type || field_type->kind == TYPE_STRUCT ||
+        field_type->kind == TYPE_ARRAY) {
+      ir_set_error(context,
+                   "Multiple return assignment currently needs scalar targets");
+      goto cleanup;
+    }
+    if (!ir_emit_address_of_symbol(context, function, tuple_name, location,
+                                   &base) ||
+        !ir_make_temp_operand(context, &field_address)) {
+      goto cleanup;
+    }
+    add.op = IR_OP_BINARY;
+    add.location = location;
+    add.dest = field_address;
+    add.lhs = base;
+    add.rhs = ir_operand_int((long long)tuple_type->field_offsets[i]);
+    add.text = "+";
+    if (!ir_emit(context, function, &add) ||
+        !ir_make_temp_operand(context, &field_value)) {
+      goto cleanup;
+    }
+    load.op = IR_OP_LOAD;
+    load.location = location;
+    load.dest = field_value;
+    load.lhs = field_address;
+    load.rhs = ir_operand_int(ir_type_storage_size(field_type));
+    ir_load_apply_float_type(&load, field_type);
+    ir_load_apply_unsigned(&load, field_type);
+    if (!ir_emit(context, function, &load)) {
+      goto cleanup;
+    }
+    field_value.float_bits = load.dest.float_bits;
+
+    store.op = IR_OP_ASSIGN;
+    store.location = location;
+    store.dest = ir_operand_symbol(
+        ir_local_ir_name(context, identifier->name));
+    store.lhs = field_value;
+    {
+      const IRLocalBinding *binding =
+          ir_local_binding_find(context, identifier->name);
+      int target_bits =
+          binding ? ir_named_type_float_bits(context, binding->type_text)
+                  : ir_symbol_float_bits(context, identifier->name);
+      ir_assign_apply_float_bits(&store, &store.lhs, target_bits);
+    }
+    if (!store.dest.name || !ir_emit(context, function, &store)) {
+      goto cleanup;
+    }
+    ir_operand_destroy(&store.dest);
+    ir_operand_destroy(&field_value);
+    ir_operand_destroy(&field_address);
+    ir_operand_destroy(&base);
+    continue;
+
+  cleanup:
+    ir_operand_destroy(&store.dest);
+    ir_operand_destroy(&field_value);
+    ir_operand_destroy(&field_address);
+    ir_operand_destroy(&base);
+    ir_operand_destroy(&value);
+    free(tuple_name);
+    return 0;
+  }
+
+  ok = 1;
+  ir_operand_destroy(&value);
+  free(tuple_name);
+  return ok;
+}
+
 int ir_lower_statement_with_defers(IRLoweringContext *context,
                                           IRFunction *function,
                                           ASTNode *statement,
@@ -199,6 +398,11 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     if (!assignment || !assignment->value) {
       ir_set_error(context, "Malformed assignment statement");
       return 0;
+    }
+
+    if (assignment->target_count > 0) {
+      return ir_lower_multi_assignment(context, function, assignment,
+                                       statement->location);
     }
 
     /* An aggregate literal on the right is a folded constant, not something to
@@ -574,7 +778,10 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     ReturnStatement *ret = (ReturnStatement *)statement->data;
     IROperand value = ir_operand_none();
     if (ret && ret->value) {
-      if (!ir_lower_expression(context, function, ret->value, &value)) {
+      if (ret->value_count > 1
+              ? !ir_lower_multi_return_value(context, function, ret, &value,
+                                             statement->location)
+              : !ir_lower_expression(context, function, ret->value, &value)) {
         return 0;
       }
       Type *return_type =

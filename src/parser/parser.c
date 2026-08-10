@@ -945,6 +945,111 @@ static ASTNode *parser_parse_assignment_from_target(Parser *parser,
 
 static ASTNode *parser_parse_dispatch_statement(Parser *parser);
 
+static ASTNode *parser_parse_parenthesized_assignment(Parser *parser) {
+  if (!parser || parser->current_token.type != TOKEN_LPAREN) {
+    return NULL;
+  }
+
+  SourceLocation location = parser_current_location(parser);
+  parser_advance(parser);
+  size_t capacity = 4;
+  size_t target_count = 0;
+  ASTNode **targets = calloc(capacity, sizeof(ASTNode *));
+  if (!targets) {
+    return NULL;
+  }
+
+  ASTNode *first = parser_parse_expression(parser);
+  if (!first) {
+    free(targets);
+    return NULL;
+  }
+  targets[target_count++] = first;
+  if (parser->current_token.type != TOKEN_COMMA) {
+    if (!parser_expect(parser, TOKEN_RPAREN)) {
+      ast_destroy_node(first);
+      free(targets);
+      return NULL;
+    }
+    if (parser_is_assignment_token(parser->current_token.type)) {
+      ASTNode *assignment = parser_parse_assignment_from_target(parser, first);
+      free(targets);
+      return assignment;
+    }
+    free(targets);
+    return first;
+  }
+
+  while (parser->current_token.type == TOKEN_COMMA) {
+    parser_advance(parser);
+    ASTNode *target = parser_parse_expression(parser);
+    if (!target) {
+      for (size_t i = 0; i < target_count; i++) {
+        ast_destroy_node(targets[i]);
+      }
+      free(targets);
+      return NULL;
+    }
+    if (target_count == capacity) {
+      capacity *= 2;
+      ASTNode **grown = realloc(targets, capacity * sizeof(ASTNode *));
+      if (!grown) {
+        ast_destroy_node(target);
+        for (size_t i = 0; i < target_count; i++) {
+          ast_destroy_node(targets[i]);
+        }
+        free(targets);
+        return NULL;
+      }
+      targets = grown;
+    }
+    targets[target_count++] = target;
+  }
+
+  if (!parser_expect(parser, TOKEN_RPAREN)) {
+    for (size_t i = 0; i < target_count; i++) {
+      ast_destroy_node(targets[i]);
+    }
+    free(targets);
+    return NULL;
+  }
+  if (!parser_is_assignment_token(parser->current_token.type)) {
+    parser_set_error(parser, "A multiple return list must assign to targets");
+    for (size_t i = 0; i < target_count; i++) {
+      ast_destroy_node(targets[i]);
+    }
+    free(targets);
+    return NULL;
+  }
+  if (parser->current_token.type != TOKEN_EQUALS) {
+    parser_set_error(parser, "Multiple return assignment only supports '='");
+    for (size_t i = 0; i < target_count; i++) {
+      ast_destroy_node(targets[i]);
+    }
+    free(targets);
+    return NULL;
+  }
+  parser_advance(parser);
+  ASTNode *value = parser_parse_expression(parser);
+  if (!value) {
+    for (size_t i = 0; i < target_count; i++) {
+      ast_destroy_node(targets[i]);
+    }
+    free(targets);
+    return NULL;
+  }
+  ASTNode *assignment = ast_create_multi_assignment(targets, target_count,
+                                                     value, location);
+  if (!assignment) {
+    for (size_t i = 0; i < target_count; i++) {
+      ast_destroy_node(targets[i]);
+    }
+    free(targets);
+    ast_destroy_node(value);
+  }
+  return assignment;
+}
+
 ASTNode *parser_parse_statement(Parser *parser) {
   if (!parser)
     return NULL;
@@ -1059,6 +1164,11 @@ ASTNode *parser_parse_statement(Parser *parser) {
     return parser_parse_block(parser);
   default:
     break;
+  }
+
+  if (parser->current_token.type == TOKEN_LPAREN &&
+      parser->peek_token.type == TOKEN_IDENTIFIER) {
+    return parser_parse_parenthesized_assignment(parser);
   }
 
   ASTNode *expr = parser_parse_expression(parser);
@@ -1810,6 +1920,74 @@ static int parser_identifier_name_is(ASTNode *expr, const char *name) {
 
 static int parser_parse_parameter_list(Parser *parser, char ***out_names,
                                        char ***out_types, size_t *out_count);
+
+static char **parser_parse_multi_return_types(Parser *parser,
+                                              size_t *out_count) {
+  if (!parser || !out_count || parser->current_token.type != TOKEN_LPAREN) {
+    return NULL;
+  }
+
+  *out_count = 0;
+  parser_advance(parser);
+  size_t capacity = 4;
+  char **types = calloc(capacity, sizeof(char *));
+  if (!types) {
+    return NULL;
+  }
+
+  while (parser->current_token.type != TOKEN_RPAREN &&
+         parser->current_token.type != TOKEN_EOF && !parser->has_error) {
+    char *type = parser_parse_type_annotation(parser);
+    if (!type) {
+      if (!parser->has_error) {
+        parser_set_error(parser, "Expected return type in multiple return list");
+      }
+      parser_free_string_array(types, *out_count);
+      return NULL;
+    }
+    if (*out_count == capacity) {
+      capacity *= 2;
+      char **grown = realloc(types, capacity * sizeof(char *));
+      if (!grown) {
+        free(type);
+        parser_free_string_array(types, *out_count);
+        return NULL;
+      }
+      types = grown;
+    }
+    types[(*out_count)++] = type;
+    if (parser->current_token.type != TOKEN_COMMA) {
+      break;
+    }
+    parser_advance(parser);
+  }
+
+  if (!parser_expect(parser, TOKEN_RPAREN)) {
+    parser_free_string_array(types, *out_count);
+    *out_count = 0;
+    return NULL;
+  }
+  if (*out_count < 2) {
+    parser_set_error(parser, "Multiple return types require at least two types");
+    parser_free_string_array(types, *out_count);
+    *out_count = 0;
+    return NULL;
+  }
+  return types;
+}
+
+static char *parser_make_multi_return_name(const char *function_name) {
+  const char *prefix = "__mettle_multi_return_";
+  if (!function_name) {
+    return NULL;
+  }
+  size_t length = strlen(prefix) + strlen(function_name) + 1;
+  char *name = malloc(length);
+  if (name) {
+    snprintf(name, length, "%s%s", prefix, function_name);
+  }
+  return name;
+}
 
 /* Anonymous function (lambda) expression: `fn(params) [-> ret] { body }`. In
  * expression position `fn` always begins a lambda; the type spelling
@@ -3541,12 +3719,21 @@ ASTNode *parser_parse_function_declaration(Parser *parser) {
 
   // Optional return type: '-> type' (or ': type' for compatibility)
   char *return_type = NULL;
+  char **return_types = NULL;
+  size_t return_type_count = 0;
   char *link_name = NULL;
   if (parser->current_token.type == TOKEN_ARROW ||
       parser->current_token.type == TOKEN_COLON) {
     parser_advance(parser); // consume return separator
 
-    return_type = parser_parse_type_annotation(parser);
+    if (parser->current_token.type == TOKEN_LPAREN) {
+      return_types = parser_parse_multi_return_types(parser, &return_type_count);
+      return_type = return_types
+                        ? parser_make_multi_return_name(func_name)
+                        : NULL;
+    } else {
+      return_type = parser_parse_type_annotation(parser);
+    }
     if (!return_type) {
       if (!parser->has_error) {
         parser_set_error(parser, "Expected return type after return separator");
@@ -3562,6 +3749,7 @@ ASTNode *parser_parse_function_declaration(Parser *parser) {
                                   func_type_param_count);
       free(func_name);
       free(link_name);
+      parser_free_string_array(return_types, return_type_count);
       return NULL;
     }
   }
@@ -3581,6 +3769,7 @@ ASTNode *parser_parse_function_declaration(Parser *parser) {
     free(func_name);
     free(return_type);
     free(link_name);
+    parser_free_string_array(return_types, return_type_count);
     return NULL;
   }
 
@@ -3598,6 +3787,7 @@ ASTNode *parser_parse_function_declaration(Parser *parser) {
                                   func_type_param_count);
       free(func_name);
       free(return_type);
+      parser_free_string_array(return_types, return_type_count);
       return NULL;
     }
     link_name = strdup(parser->current_token.value);
@@ -3612,6 +3802,7 @@ ASTNode *parser_parse_function_declaration(Parser *parser) {
       free(param_types);
       free(func_name);
       free(return_type);
+      parser_free_string_array(return_types, return_type_count);
       return NULL;
     }
   }
@@ -3633,6 +3824,7 @@ ASTNode *parser_parse_function_declaration(Parser *parser) {
       free(func_name);
       free(return_type);
       free(link_name);
+      parser_free_string_array(return_types, return_type_count);
       return NULL;
     }
   } else if (parser->current_token.type == TOKEN_SEMICOLON ||
@@ -3653,6 +3845,7 @@ ASTNode *parser_parse_function_declaration(Parser *parser) {
     free(func_name);
     free(return_type);
     free(link_name);
+    parser_free_string_array(return_types, return_type_count);
     return NULL;
   }
 
@@ -3661,6 +3854,10 @@ ASTNode *parser_parse_function_declaration(Parser *parser) {
                                       param_count, return_type, body, location);
   if (func_decl && func_decl->data) {
     FunctionDeclaration *func_data = (FunctionDeclaration *)func_decl->data;
+    func_data->return_types = return_types;
+    func_data->return_type_count = return_type_count;
+    return_types = NULL;
+    return_type_count = 0;
     func_data->is_kernel = is_kernel;
     func_data->kernel_block[0] = kernel_block[0];
     func_data->kernel_block[1] = kernel_block[1];
@@ -3695,6 +3892,7 @@ ASTNode *parser_parse_function_declaration(Parser *parser) {
   free(func_name);
   free(return_type);
   free(link_name);
+  parser_free_string_array(return_types, return_type_count);
   for (size_t i = 0; i < param_count; i++) {
     free(param_names[i]);
     free(param_types[i]);
@@ -4394,17 +4592,103 @@ ASTNode *parser_parse_return_statement(Parser *parser) {
   parser_advance(parser); // consume 'return'
 
   ASTNode *value = NULL;
+  ASTNode **values = NULL;
+  size_t value_count = 0;
   if (parser->current_token.type != TOKEN_SEMICOLON &&
       parser->current_token.type != TOKEN_NEWLINE) {
-    value = parser_parse_expression(parser);
+    if (parser->current_token.type == TOKEN_LPAREN) {
+      ParserSavedState saved = parser_save_state(parser);
+      parser->error_message = NULL;
+      parser->error_reporter = NULL;
+      value = parser_parse_expression(parser);
+      if (value && parser->current_token.type != TOKEN_COMMA) {
+        parser->error_reporter = saved.error_reporter;
+        parser_discard_saved_state(&saved);
+      } else {
+        if (value) {
+          ast_destroy_node(value);
+          value = NULL;
+        }
+        parser_restore_state(parser, &saved);
+        parser_discard_saved_state(&saved);
+
+        parser_advance(parser); // consume '('
+        value = parser_parse_expression(parser);
+        if (!value) {
+          return NULL;
+        }
+        size_t capacity = 4;
+        values = calloc(capacity, sizeof(ASTNode *));
+        if (!values) {
+          ast_destroy_node(value);
+          return NULL;
+        }
+        values[value_count++] = value;
+        while (parser->current_token.type == TOKEN_COMMA) {
+          parser_advance(parser);
+          ASTNode *next = parser_parse_expression(parser);
+          if (!next) {
+            for (size_t i = 0; i < value_count; i++) {
+              ast_destroy_node(values[i]);
+            }
+            free(values);
+            return NULL;
+          }
+          if (value_count == capacity) {
+            capacity *= 2;
+            ASTNode **grown = realloc(values, capacity * sizeof(ASTNode *));
+            if (!grown) {
+              ast_destroy_node(next);
+              for (size_t i = 0; i < value_count; i++) {
+                ast_destroy_node(values[i]);
+              }
+              free(values);
+              return NULL;
+            }
+            values = grown;
+          }
+          values[value_count++] = next;
+        }
+        if (!parser_expect(parser, TOKEN_RPAREN)) {
+          for (size_t i = 0; i < value_count; i++) {
+            ast_destroy_node(values[i]);
+          }
+          free(values);
+          return NULL;
+        }
+      }
+    } else {
+      value = parser_parse_expression(parser);
+    }
   }
 
   ASTNode *return_stmt = ast_create_node(AST_RETURN_STATEMENT, location);
   if (return_stmt && value) {
     ReturnStatement *ret_data = malloc(sizeof(ReturnStatement));
-    ret_data->value = value;
+    if (!ret_data) {
+      ast_destroy_node(value);
+      free(values);
+      free(return_stmt);
+      return NULL;
+    }
+    if (value_count == 0) {
+      values = malloc(sizeof(ASTNode *));
+      if (!values) {
+        ast_destroy_node(value);
+        free(ret_data);
+        free(return_stmt);
+        return NULL;
+      }
+      values[0] = value;
+      value_count = 1;
+    }
+    ret_data->value = values[0];
+    ret_data->values = values;
+    ret_data->value_count = value_count;
     return_stmt->data = ret_data;
-    ast_add_child(return_stmt, value);
+    for (size_t i = 0; i < value_count; i++) {
+      ast_add_child(return_stmt, values[i]);
+    }
   }
 
   return return_stmt;

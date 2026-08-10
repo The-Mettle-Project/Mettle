@@ -30,6 +30,9 @@ typedef struct TrackedBufferExtent {
 Type *type_checker_parse_array_type(TypeChecker *checker,
                                            const char *name);
 
+int type_checker_ensure_multi_return_type(TypeChecker *checker,
+                                          FunctionDeclaration *function);
+
 Type *type_checker_parse_pointer_type(TypeChecker *checker,
                                              const char *name);
 

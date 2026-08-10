@@ -67,6 +67,26 @@ fn greet() {  // void return
 }
 ```
 
+A function can return more than one value by listing the types in parentheses.
+The caller assigns the values to a matching list of names.
+
+```mettle
+fn solve() -> (float64, float64, float64) {
+  return (0.8, 1.2, 2.4);
+}
+
+fn main() -> int32 {
+  var x: float64 = 0.0;
+  var y: float64 = 0.0;
+  var z: float64 = 0.0;
+  (x, y, z) = solve();
+  return 0;
+}
+```
+
+Each returned value must match its target type. The list form supports scalar
+values and names declared in the current scope.
+
 A function named `main` with signature `() -> int32` serves as the program entry point when present. The compiler emits `_start` which calls `main` and passes its return value to the runtime.
 
 ## Function decorators

@@ -1349,6 +1349,7 @@ $cases = @(
   @{ Name = "defer_block_statement"; Path = "tests/test_defer_block_statement.mettle"; ShouldSucceed = $true },
   @{ Name = "errdefer_assignment_statement"; Path = "tests/test_errdefer_assignment_statement.mettle"; ShouldSucceed = $true },
   @{ Name = "defer_global_assignment"; Path = "tests/test_defer_global_assignment.mettle"; ShouldSucceed = $true },
+  @{ Name = "multiple_returns"; Path = "tests/test_multiple_returns.mettle"; ShouldSucceed = $true },
   @{
     Name            = "errdefer_implicit_fallthrough"
     Path            = "tests/test_errdefer_implicit_fallthrough.mettle"

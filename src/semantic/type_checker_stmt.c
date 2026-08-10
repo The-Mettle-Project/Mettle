@@ -929,9 +929,61 @@ int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
 
   case AST_RETURN_STATEMENT: {
     ReturnStatement *ret_stmt = (ReturnStatement *)statement->data;
-    if (ret_stmt && ret_stmt->value) {
+    size_t return_count = ret_stmt
+                              ? (ret_stmt->value_count
+                                     ? ret_stmt->value_count
+                                     : (ret_stmt->value ? 1 : 0))
+                              : 0;
+    if (ret_stmt && return_count > 0) {
+      Type *func_return_type = checker->current_function
+                                   ? checker->current_function->data.function
+                                         .return_type
+                                   : NULL;
+      FunctionDeclaration *function_decl =
+          checker->current_function_decl &&
+                  checker->current_function_decl->type == AST_FUNCTION_DECLARATION
+              ? (FunctionDeclaration *)checker->current_function_decl->data
+              : NULL;
+
+      if (function_decl && function_decl->return_type_count > 0) {
+        if (return_count != function_decl->return_type_count) {
+          type_checker_set_error_at_location(
+              checker, statement->location,
+              "Function '%s' returns %zu values but this return has %zu",
+              function_decl->name, function_decl->return_type_count,
+              return_count);
+          return 0;
+        }
+        for (size_t i = 0; i < return_count; i++) {
+          ASTNode *value = ret_stmt->values ? ret_stmt->values[i]
+                                            : (i == 0 ? ret_stmt->value : NULL);
+          Type *value_type = type_checker_infer_type(checker, value);
+          Type *expected_type = func_return_type->field_types[i];
+          if (!value_type) {
+            return 0;
+          }
+          if (!type_checker_is_assignable(checker, expected_type,
+                                          value_type)) {
+            type_checker_report_type_mismatch(checker, value->location,
+                                              expected_type->name,
+                                              value_type->name);
+            return 0;
+          }
+        }
+        return 1;
+      }
+
+      if (return_count > 1) {
+        type_checker_set_error_at_location(
+            checker, statement->location,
+            "This function has one return value, but this return has %zu",
+            return_count);
+        return 0;
+      }
+
+      ASTNode *value = ret_stmt->values ? ret_stmt->values[0] : ret_stmt->value;
       // Check if return value type matches function return type
-      Type *value_type = type_checker_infer_type(checker, ret_stmt->value);
+      Type *value_type = type_checker_infer_type(checker, value);
       if (!value_type) {
         // Error already reported by type_checker_infer_type if it failed
         // Only set generic error if no specific error was set
@@ -944,13 +996,11 @@ int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
       }
 
       if (checker->current_function) {
-        Type *func_return_type =
-            checker->current_function->data.function.return_type;
         if (!(func_return_type->kind == TYPE_POINTER &&
-              type_checker_is_null_pointer_constant(ret_stmt->value)) &&
+              type_checker_is_null_pointer_constant(value)) &&
             !type_checker_is_assignable(checker, func_return_type,
                                         value_type)) {
-          type_checker_report_type_mismatch(checker, ret_stmt->value->location,
+          type_checker_report_type_mismatch(checker, value->location,
                                             func_return_type->name,
                                             value_type->name);
           return 0;
@@ -960,12 +1010,12 @@ int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
             type_checker_ast_contains_node_type(checker->current_function_decl,
                                                 AST_ERRDEFER_STATEMENT)) {
           long long constant_value = 0;
-          if (type_checker_eval_integer_constant(ret_stmt->value,
+          if (type_checker_eval_integer_constant(value,
                                                  &constant_value) &&
               constant_value != 0) {
             error_reporter_add_warning(
                 checker->error_reporter, ERROR_SEMANTIC,
-                ret_stmt->value->location,
+                value->location,
                 "Non-zero constant return in function with errdefer will "
                 "trigger errdefer by convention");
           }
@@ -974,6 +1024,19 @@ int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
         type_checker_set_error_at_location(
             checker, statement->location,
             "Return statement outside of a function");
+        return 0;
+      }
+    }
+    if (checker->current_function_decl &&
+        checker->current_function_decl->type == AST_FUNCTION_DECLARATION) {
+      FunctionDeclaration *function_decl =
+          (FunctionDeclaration *)checker->current_function_decl->data;
+      if (function_decl && function_decl->return_type_count > 0 &&
+          return_count == 0) {
+        type_checker_set_error_at_location(
+            checker, statement->location,
+            "Function '%s' must return %zu values", function_decl->name,
+            function_decl->return_type_count);
         return 0;
       }
     }

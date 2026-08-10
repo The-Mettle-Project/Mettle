@@ -112,6 +112,9 @@ ASTNode *ast_clone_node(ASTNode *node) {
     }
     dst->name = ast_intern_string(src->name);
     dst->return_type = ast_intern_string(src->return_type);
+    dst->return_type_count = src->return_type_count;
+    dst->return_types = ast_copy_string_array(src->return_types,
+                                               src->return_type_count);
     dst->parameter_count = src->parameter_count;
     dst->is_exported = src->is_exported;
     dst->is_extern = src->is_extern;
@@ -432,6 +435,26 @@ ASTNode *ast_clone_node(ASTNode *node) {
     dst->variable_name = ast_intern_string(src->variable_name);
     dst->value = src->value ? ast_clone_node(src->value) : NULL;
     dst->target = src->target ? ast_clone_node(src->target) : NULL;
+    dst->targets = NULL;
+    dst->target_count = src->target_count;
+    if (src->target_count > 0) {
+      dst->targets = calloc(src->target_count, sizeof(ASTNode *));
+      if (!dst->targets) {
+        free(dst);
+        free(clone);
+        return NULL;
+      }
+      for (size_t i = 0; i < src->target_count; i++) {
+        dst->targets[i] = ast_clone_node(src->targets[i]);
+        if (!dst->targets[i]) {
+          free(dst->targets);
+          free(dst);
+          free(clone);
+          return NULL;
+        }
+        ast_add_child(clone, dst->targets[i]);
+      }
+    }
     if (dst->target)
       ast_add_child(clone, dst->target);
     if (dst->value)
@@ -626,9 +649,32 @@ ASTNode *ast_clone_node(ASTNode *node) {
         free(clone);
         return NULL;
       }
-      dst->value = src->value ? ast_clone_node(src->value) : NULL;
-      if (dst->value)
-        ast_add_child(clone, dst->value);
+      dst->value = NULL;
+      dst->values = NULL;
+      dst->value_count = src->value_count ? src->value_count
+                                          : (src->value ? 1 : 0);
+      if (dst->value_count > 0) {
+        dst->values = calloc(dst->value_count, sizeof(ASTNode *));
+        if (!dst->values) {
+          free(dst);
+          free(clone);
+          return NULL;
+        }
+        for (size_t i = 0; i < dst->value_count; i++) {
+          ASTNode *source_value = src->values
+                                      ? src->values[i]
+                                      : (i == 0 ? src->value : NULL);
+          dst->values[i] = source_value ? ast_clone_node(source_value) : NULL;
+          if (!dst->values[i]) {
+            free(dst->values);
+            free(dst);
+            free(clone);
+            return NULL;
+          }
+          ast_add_child(clone, dst->values[i]);
+        }
+        dst->value = dst->values[0];
+      }
       clone->data = dst;
     }
     break;
@@ -922,6 +968,10 @@ void ast_destroy_node(ASTNode *node) {
     if (func_decl) {
       ast_free_string(func_decl->name);
       ast_free_string(func_decl->return_type);
+      for (size_t i = 0; i < func_decl->return_type_count; i++) {
+        ast_free_string(func_decl->return_types[i]);
+      }
+      free(func_decl->return_types);
       ast_free_string(func_decl->link_name);
       for (size_t i = 0; i < func_decl->parameter_count; i++) {
         ast_free_string(func_decl->parameter_names[i]);
@@ -1080,6 +1130,7 @@ void ast_destroy_node(ASTNode *node) {
     Assignment *assignment = (Assignment *)node->data;
     if (assignment) {
       ast_free_string(assignment->variable_name);
+      free(assignment->targets);
       free(assignment);
     }
     break;
@@ -1241,6 +1292,7 @@ void ast_destroy_node(ASTNode *node) {
   case AST_RETURN_STATEMENT: {
     ReturnStatement *ret_stmt = (ReturnStatement *)node->data;
     if (ret_stmt) {
+      free(ret_stmt->values);
       free(ret_stmt);
     }
     break;
@@ -1419,6 +1471,8 @@ ASTNode *ast_create_function_declaration(const char *name, char **param_names,
 
   func_decl->name = ast_intern_string(name);
   func_decl->return_type = ast_intern_string(return_type);
+  func_decl->return_types = NULL;
+  func_decl->return_type_count = 0;
   func_decl->parameter_count = param_count;
   func_decl->body = body;
   func_decl->is_exported = 0;
@@ -1855,12 +1909,41 @@ ASTNode *ast_create_assignment(const char *variable_name, ASTNode *value,
   assignment->variable_name = ast_intern_string(variable_name);
   assignment->value = value;
   assignment->target = NULL;
+  assignment->targets = NULL;
+  assignment->target_count = 0;
   node->data = assignment;
 
   if (value) {
     ast_add_child(node, value);
   }
 
+  return node;
+}
+
+ASTNode *ast_create_multi_assignment(ASTNode **targets, size_t target_count,
+                                     ASTNode *value, SourceLocation location) {
+  if (!targets || target_count < 2 || !value) {
+    return NULL;
+  }
+
+  ASTNode *node = ast_create_node(AST_ASSIGNMENT, location);
+  Assignment *assignment = node ? malloc(sizeof(Assignment)) : NULL;
+  if (!node || !assignment) {
+    free(assignment);
+    free(node);
+    return NULL;
+  }
+
+  assignment->variable_name = NULL;
+  assignment->value = value;
+  assignment->target = NULL;
+  assignment->targets = targets;
+  assignment->target_count = target_count;
+  node->data = assignment;
+  for (size_t i = 0; i < target_count; i++) {
+    ast_add_child(node, targets[i]);
+  }
+  ast_add_child(node, value);
   return node;
 }
 
@@ -2204,6 +2287,8 @@ ASTNode *ast_create_field_assignment(ASTNode *target, ASTNode *value,
   assignment->variable_name = NULL; // Not a simple variable assignment
   assignment->value = value;
   assignment->target = target;
+  assignment->targets = NULL;
+  assignment->target_count = 0;
   node->data = assignment;
 
   if (target) {

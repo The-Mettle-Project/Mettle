@@ -1152,6 +1152,14 @@ int type_checker_process_declaration(TypeChecker *checker,
 
     // Resolve return type
     Type *return_type = NULL;
+    if (func_decl->return_type_count > 0 &&
+        !type_checker_ensure_multi_return_type(checker, func_decl)) {
+      type_checker_set_error_at_location(
+          checker, declaration->location,
+          "Could not build the multiple return type for function '%s'",
+          func_decl->name);
+      return 0;
+    }
     if (func_decl->return_type) {
       return_type =
           type_checker_get_type_by_name(checker, func_decl->return_type);
@@ -1503,6 +1511,58 @@ int type_checker_process_declaration(TypeChecker *checker,
       type_checker_set_error_at_location(checker, declaration->location,
                                          "Invalid assignment statement");
       return 0;
+    }
+
+    if (assignment->target_count > 0) {
+      Type *value_type = type_checker_infer_type(checker, assignment->value);
+      if (!value_type || value_type->kind != TYPE_STRUCT ||
+          value_type->field_count != assignment->target_count) {
+        type_checker_set_error_at_location(
+            checker, assignment->value->location,
+            "Multiple assignment needs a matching multiple return value");
+        return 0;
+      }
+
+      for (size_t i = 0; i < assignment->target_count; i++) {
+        ASTNode *target = assignment->targets[i];
+        if (!target || target->type != AST_IDENTIFIER) {
+          type_checker_set_error_at_location(
+              checker, target ? target->location : declaration->location,
+              "Multiple return assignment targets must be identifiers");
+          return 0;
+        }
+        Identifier *identifier = (Identifier *)target->data;
+        Symbol *symbol = identifier && identifier->name
+                             ? symbol_table_lookup(checker->symbol_table,
+                                                   identifier->name)
+                             : NULL;
+        if (!symbol || (symbol->kind != SYMBOL_VARIABLE &&
+                        symbol->kind != SYMBOL_PARAMETER)) {
+          type_checker_report_undefined_symbol(
+              checker, target->location,
+              identifier && identifier->name ? identifier->name : "<invalid>",
+              "variable");
+          return 0;
+        }
+        if (symbol->is_immutable) {
+          type_checker_set_error_at_location(
+              checker, target->location, "'%s' is a constant and cannot be assigned to",
+              identifier->name);
+          return 0;
+        }
+        Type *field_type = value_type->field_types[i];
+        if (!type_checker_is_assignable(checker, symbol->type, field_type)) {
+          type_checker_report_type_mismatch(checker, target->location,
+                                            symbol->type->name,
+                                            field_type->name);
+          return 0;
+        }
+        if (checker->current_function && symbol->scope &&
+            symbol->scope->type != SCOPE_GLOBAL) {
+          type_checker_init_tracker_set_initialized(checker, identifier->name);
+        }
+      }
+      return 1;
     }
 
     // Complex assignment target: obj.field = value or arr[i] = value
