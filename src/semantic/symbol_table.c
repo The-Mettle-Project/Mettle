@@ -656,6 +656,11 @@ Symbol *symbol_create(const char *name, SymbolKind kind, Type *type) {
     break;
   }
 
+  symbol->has_constant_value = 0;
+  symbol->constant_is_float = 0;
+  symbol->constant_integer_value = 0;
+  symbol->constant_float_value = 0.0;
+
   return symbol;
 }
 

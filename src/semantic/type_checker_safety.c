@@ -20,9 +20,29 @@ int type_checker_is_lvalue_expression(ASTNode *expression) {
   }
 }
 
-int type_checker_eval_integer_constant_with_checker(TypeChecker *checker,
-                                                           ASTNode *expression,
-                                                           long long *out_value) {
+typedef struct {
+  int is_float;
+  long long int_value;
+  double float_value;
+} TypeCheckerConstant;
+
+static void type_checker_constant_from_int(TypeCheckerConstant *value,
+                                           long long int_value) {
+  value->is_float = 0;
+  value->int_value = int_value;
+  value->float_value = (double)int_value;
+}
+
+static void type_checker_constant_from_float(TypeCheckerConstant *value,
+                                             double float_value) {
+  value->is_float = 1;
+  value->int_value = (long long)float_value;
+  value->float_value = float_value;
+}
+
+static int type_checker_eval_numeric_constant(TypeChecker *checker,
+                                              ASTNode *expression,
+                                              TypeCheckerConstant *out_value) {
   if (!expression || !out_value) {
     return 0;
   }
@@ -31,9 +51,13 @@ int type_checker_eval_integer_constant_with_checker(TypeChecker *checker,
   case AST_NUMBER_LITERAL: {
     NumberLiteral *literal = (NumberLiteral *)expression->data;
     if (!literal || literal->is_float) {
-      return 0;
+      if (!literal) {
+        return 0;
+      }
+      type_checker_constant_from_float(out_value, literal->float_value);
+      return 1;
     }
-    *out_value = literal->int_value;
+    type_checker_constant_from_int(out_value, literal->int_value);
     return 1;
   }
 
@@ -46,11 +70,20 @@ int type_checker_eval_integer_constant_with_checker(TypeChecker *checker,
     Symbol *symbol = checker ? symbol_table_lookup(checker->symbol_table,
                                                    identifier->name)
                              : NULL;
-    if (!symbol || symbol->kind != SYMBOL_CONSTANT) {
+    if (!symbol || (symbol->kind != SYMBOL_CONSTANT &&
+                    !symbol->has_constant_value)) {
       return 0;
     }
 
-    *out_value = symbol->data.constant.value;
+    if (symbol->has_constant_value && symbol->constant_is_float) {
+      type_checker_constant_from_float(out_value,
+                                       symbol->constant_float_value);
+    } else {
+      long long value = symbol->has_constant_value
+                            ? symbol->constant_integer_value
+                            : symbol->data.constant.value;
+      type_checker_constant_from_int(out_value, value);
+    }
     return 1;
   }
 
@@ -71,15 +104,15 @@ int type_checker_eval_integer_constant_with_checker(TypeChecker *checker,
       return 0;
     }
 
-    *out_value = (long long)type->size;
+    type_checker_constant_from_int(out_value, (long long)type->size);
     return 1;
   }
 
   case AST_UNARY_EXPRESSION: {
     UnaryExpression *unary_expr = (UnaryExpression *)expression->data;
-    long long operand = 0;
+    TypeCheckerConstant operand = {0};
     if (!unary_expr || !unary_expr->operator || !unary_expr->operand ||
-        !type_checker_eval_integer_constant_with_checker(
+        !type_checker_eval_numeric_constant(
             checker, unary_expr->operand, &operand)) {
       return 0;
     }
@@ -89,7 +122,21 @@ int type_checker_eval_integer_constant_with_checker(TypeChecker *checker,
       return 1;
     }
     if (strcmp(unary_expr->operator, "-") == 0) {
-      *out_value = -operand;
+      if (operand.is_float) {
+        type_checker_constant_from_float(out_value, -operand.float_value);
+      } else {
+        type_checker_constant_from_int(out_value, -operand.int_value);
+      }
+      return 1;
+    }
+    if (strcmp(unary_expr->operator, "!") == 0) {
+      int is_zero = operand.is_float ? operand.float_value == 0.0
+                                     : operand.int_value == 0;
+      type_checker_constant_from_int(out_value, is_zero);
+      return 1;
+    }
+    if (strcmp(unary_expr->operator, "~") == 0 && !operand.is_float) {
+      type_checker_constant_from_int(out_value, ~operand.int_value);
       return 1;
     }
     return 0;
@@ -97,73 +144,143 @@ int type_checker_eval_integer_constant_with_checker(TypeChecker *checker,
 
   case AST_BINARY_EXPRESSION: {
     BinaryExpression *binary_expr = (BinaryExpression *)expression->data;
-    long long left = 0;
-    long long right = 0;
+    TypeCheckerConstant left = {0};
+    TypeCheckerConstant right = {0};
     if (!binary_expr || !binary_expr->operator || !binary_expr->left ||
         !binary_expr->right ||
-        !type_checker_eval_integer_constant_with_checker(
+        !type_checker_eval_numeric_constant(
             checker, binary_expr->left, &left) ||
-        !type_checker_eval_integer_constant_with_checker(
+        !type_checker_eval_numeric_constant(
             checker, binary_expr->right, &right)) {
       return 0;
     }
 
+    if (left.is_float || right.is_float) {
+      double left_value = left.is_float ? left.float_value
+                                        : (double)left.int_value;
+      double right_value = right.is_float ? right.float_value
+                                          : (double)right.int_value;
+      const char *operator = binary_expr->operator;
+      if (strcmp(operator, "+") == 0) {
+        type_checker_constant_from_float(out_value,
+                                         left_value + right_value);
+        return 1;
+      }
+      if (strcmp(operator, "-") == 0) {
+        type_checker_constant_from_float(out_value,
+                                         left_value - right_value);
+        return 1;
+      }
+      if (strcmp(operator, "*") == 0) {
+        type_checker_constant_from_float(out_value,
+                                         left_value * right_value);
+        return 1;
+      }
+      if (strcmp(operator, "/") == 0) {
+        if (right_value == 0.0) {
+          return 0;
+        }
+        type_checker_constant_from_float(out_value,
+                                         left_value / right_value);
+        return 1;
+      }
+      if (strcmp(operator, "==") == 0) {
+        type_checker_constant_from_int(out_value, left_value == right_value);
+        return 1;
+      }
+      if (strcmp(operator, "!=") == 0) {
+        type_checker_constant_from_int(out_value, left_value != right_value);
+        return 1;
+      }
+      if (strcmp(operator, "<") == 0) {
+        type_checker_constant_from_int(out_value, left_value < right_value);
+        return 1;
+      }
+      if (strcmp(operator, "<=") == 0) {
+        type_checker_constant_from_int(out_value, left_value <= right_value);
+        return 1;
+      }
+      if (strcmp(operator, ">") == 0) {
+        type_checker_constant_from_int(out_value, left_value > right_value);
+        return 1;
+      }
+      if (strcmp(operator, ">=") == 0) {
+        type_checker_constant_from_int(out_value, left_value >= right_value);
+        return 1;
+      }
+      if (strcmp(operator, "&&") == 0) {
+        type_checker_constant_from_int(
+            out_value, (left_value != 0.0) && (right_value != 0.0));
+        return 1;
+      }
+      if (strcmp(operator, "||") == 0) {
+        type_checker_constant_from_int(
+            out_value, (left_value != 0.0) || (right_value != 0.0));
+        return 1;
+      }
+      return 0;
+    }
+
+    long long left_value = left.int_value;
+    long long right_value = right.int_value;
     if (strcmp(binary_expr->operator, "+") == 0) {
-      *out_value = left + right;
+      type_checker_constant_from_int(out_value, left_value + right_value);
       return 1;
     }
     if (strcmp(binary_expr->operator, "-") == 0) {
-      *out_value = left - right;
+      type_checker_constant_from_int(out_value, left_value - right_value);
       return 1;
     }
     if (strcmp(binary_expr->operator, "*") == 0) {
-      *out_value = left * right;
+      type_checker_constant_from_int(out_value, left_value * right_value);
       return 1;
     }
     if (strcmp(binary_expr->operator, "/") == 0) {
-      if (right == 0) {
+      if (right_value == 0) {
         return 0;
       }
-      *out_value = left / right;
+      type_checker_constant_from_int(out_value, left_value / right_value);
       return 1;
     }
     if (strcmp(binary_expr->operator, "%") == 0) {
-      if (right == 0) {
+      if (right_value == 0) {
         return 0;
       }
-      *out_value = left % right;
+      type_checker_constant_from_int(out_value, left_value % right_value);
       return 1;
     }
     if (strcmp(binary_expr->operator, "==") == 0) {
-      *out_value = left == right;
+      type_checker_constant_from_int(out_value, left_value == right_value);
       return 1;
     }
     if (strcmp(binary_expr->operator, "!=") == 0) {
-      *out_value = left != right;
+      type_checker_constant_from_int(out_value, left_value != right_value);
       return 1;
     }
     if (strcmp(binary_expr->operator, "<") == 0) {
-      *out_value = left < right;
+      type_checker_constant_from_int(out_value, left_value < right_value);
       return 1;
     }
     if (strcmp(binary_expr->operator, "<=") == 0) {
-      *out_value = left <= right;
+      type_checker_constant_from_int(out_value, left_value <= right_value);
       return 1;
     }
     if (strcmp(binary_expr->operator, ">") == 0) {
-      *out_value = left > right;
+      type_checker_constant_from_int(out_value, left_value > right_value);
       return 1;
     }
     if (strcmp(binary_expr->operator, ">=") == 0) {
-      *out_value = left >= right;
+      type_checker_constant_from_int(out_value, left_value >= right_value);
       return 1;
     }
     if (strcmp(binary_expr->operator, "&&") == 0) {
-      *out_value = (left != 0) && (right != 0);
+      type_checker_constant_from_int(out_value,
+                                     (left_value != 0) && (right_value != 0));
       return 1;
     }
     if (strcmp(binary_expr->operator, "||") == 0) {
-      *out_value = (left != 0) || (right != 0);
+      type_checker_constant_from_int(out_value,
+                                     (left_value != 0) || (right_value != 0));
       return 1;
     }
     return 0;
@@ -172,6 +289,31 @@ int type_checker_eval_integer_constant_with_checker(TypeChecker *checker,
   default:
     return 0;
   }
+}
+
+int type_checker_eval_integer_constant_with_checker(TypeChecker *checker,
+                                                    ASTNode *expression,
+                                                    long long *out_value) {
+  TypeCheckerConstant value = {0};
+  if (!out_value || !type_checker_eval_numeric_constant(checker, expression,
+                                                         &value) ||
+      value.is_float) {
+    return 0;
+  }
+  *out_value = value.int_value;
+  return 1;
+}
+
+int type_checker_eval_float_constant_with_checker(TypeChecker *checker,
+                                                 ASTNode *expression,
+                                                 double *out_value) {
+  TypeCheckerConstant value = {0};
+  if (!out_value || !type_checker_eval_numeric_constant(checker, expression,
+                                                         &value)) {
+    return 0;
+  }
+  *out_value = value.is_float ? value.float_value : (double)value.int_value;
+  return 1;
 }
 
 int type_checker_eval_integer_constant(ASTNode *expression,

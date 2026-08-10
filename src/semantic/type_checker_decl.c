@@ -875,7 +875,7 @@ int type_checker_process_declaration(TypeChecker *checker,
         (!current_scope || current_scope->type == SCOPE_GLOBAL) &&
         /* An integer `const` gets the more specific diagnostic from its own
          * fold below; everything else lands here. */
-        !(var_decl->is_const && type_checker_is_integer_type(var_type)) &&
+         !(var_decl->is_const && type_checker_is_numeric_type(var_type)) &&
         !layoutable_global_initializer(checker, var_type, var_decl->initializer,
                                       1)) {
       type_checker_set_error_at_location(
@@ -889,12 +889,16 @@ int type_checker_process_declaration(TypeChecker *checker,
       poisoned = 1;
     }
 
+    int has_folded_value = 0;
+    int folded_is_float = 0;
+    long long folded_integer_value = 0;
+    double folded_float_value = 0.0;
+
     // A `const` declaration binds an immutable value and must be initialized.
-    // An integer const is folded at every use site (SYMBOL_CONSTANT) at global
-    // scope and needs no storage. A const of any other type (float, string,
-    // ...) cannot be folded, so it is registered as an immutable variable with
-    // normal storage and initializer codegen. Reassignment is rejected via the
-    // immutable flag in either case.
+    // Numeric consts must fold at compile time. Integer globals use the
+    // storage free symbol form. Other numeric consts keep normal storage when
+    // the backend needs an address, but carry the folded value for later const
+    // expressions.
     if (var_decl->is_const) {
       if (!var_decl->initializer) {
         type_checker_set_error_at_location(
@@ -902,23 +906,31 @@ int type_checker_process_declaration(TypeChecker *checker,
             "Constant '%s' must have an initializer", var_decl->name);
         return 0;
       }
-      // Integer consts fold to a compile-time value: at global scope they are
-      // registered as SYMBOL_CONSTANT (folded at every use, no storage). A
-      // non-integer const (float/string/aggregate) is not folded; it falls
-      // through to immutable-variable registration below and gets normal global
-      // (or local) storage. The initializer's assignability was validated above.
-      if (!poisoned && type_checker_is_integer_type(var_type)) {
+      if (!poisoned && type_checker_is_numeric_type(var_type)) {
         long long const_value = 0;
-        if (!type_checker_eval_integer_constant_with_checker(
-                checker, var_decl->initializer, &const_value)) {
+        double float_value = 0.0;
+        int is_float = type_checker_is_floating_type(var_type);
+        int evaluated = is_float
+                            ? type_checker_eval_float_constant_with_checker(
+                                  checker, var_decl->initializer, &float_value)
+                            : type_checker_eval_integer_constant_with_checker(
+                                  checker, var_decl->initializer, &const_value);
+        if (!evaluated) {
           type_checker_set_error_at_location(
               checker, var_decl->initializer->location,
-              "Constant '%s' initializer must be a compile-time integer "
-              "constant expression",
+              is_float
+                  ? "Constant '%s' initializer must be a compile-time "
+                    "constant expression"
+                  : "Constant '%s' initializer must be a compile-time integer "
+                    "constant expression",
               var_decl->name);
           return 0;
         }
-        if (current_scope && current_scope->type == SCOPE_GLOBAL) {
+        has_folded_value = 1;
+        folded_is_float = is_float;
+        folded_integer_value = const_value;
+        folded_float_value = float_value;
+        if (current_scope && current_scope->type == SCOPE_GLOBAL && !is_float) {
           if (symbol_table_lookup_current_scope(checker->symbol_table,
                                                 var_decl->name)) {
             type_checker_report_duplicate_declaration(
@@ -934,6 +946,8 @@ int type_checker_process_declaration(TypeChecker *checker,
             return 0;
           }
           const_symbol->data.constant.value = const_value;
+          const_symbol->has_constant_value = 1;
+          const_symbol->constant_integer_value = const_value;
           const_symbol->is_initialized = 1;
           if (!symbol_table_declare(checker->symbol_table, const_symbol)) {
             type_checker_report_duplicate_declaration(
@@ -943,13 +957,9 @@ int type_checker_process_declaration(TypeChecker *checker,
           }
           return 1;
         }
-        // Local integer const: fall through to immutable variable registration.
+        // Local numeric consts and global float consts use normal storage.
       }
-      // Local const (any type) and non-integer global const (float, string,
-      // ...): fall through to immutable-variable registration; storage and the
-      // initializer are emitted like a normal variable, and the immutable flag
-      // below rejects reassignment. Global float/string globals now load
-      // correctly in the direct-object backend, so they are no longer rejected.
+      // Non numeric consts use normal storage and the immutable flag below.
     }
 
     // Check for duplicate declaration in current scope.
@@ -1010,6 +1020,12 @@ int type_checker_process_declaration(TypeChecker *checker,
 
     var_symbol->is_extern = var_decl->is_extern;
     var_symbol->is_immutable = var_decl->is_const;
+    if (has_folded_value) {
+      var_symbol->has_constant_value = 1;
+      var_symbol->constant_is_float = folded_is_float;
+      var_symbol->constant_integer_value = folded_integer_value;
+      var_symbol->constant_float_value = folded_float_value;
+    }
     var_symbol->is_address_space_binding =
         var_decl->address_space != AST_ADDRESS_SPACE_DEFAULT;
     var_symbol->address_space =

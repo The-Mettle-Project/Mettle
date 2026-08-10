@@ -50,8 +50,33 @@ Type *type_checker_parse_array_type(TypeChecker *checker,
   errno = 0;
   char *end_ptr = NULL;
   unsigned long long array_size_ull = strtoull(size_start, &end_ptr, 10);
-  if (errno != 0 || !end_ptr || end_ptr != rbracket || array_size_ull == 0 ||
-      array_size_ull > SIZE_MAX) {
+  if (errno != 0 || !end_ptr || end_ptr != rbracket) {
+    size_t size_name_len = (size_t)(rbracket - size_start);
+    char *size_name = malloc(size_name_len + 1);
+    if (!size_name) {
+      return NULL;
+    }
+    memcpy(size_name, size_start, size_name_len);
+    size_name[size_name_len] = '\0';
+    Symbol *size_symbol = symbol_table_lookup(checker->symbol_table,
+                                              size_name);
+    free(size_name);
+    if (!size_symbol ||
+        (!size_symbol->has_constant_value &&
+         size_symbol->kind != SYMBOL_CONSTANT) ||
+        size_symbol->constant_is_float ||
+        !type_checker_is_integer_type(size_symbol->type)) {
+      return NULL;
+    }
+    long long constant_size = size_symbol->has_constant_value
+                                  ? size_symbol->constant_integer_value
+                                  : size_symbol->data.constant.value;
+    if (constant_size <= 0) {
+      return NULL;
+    }
+    array_size_ull = (unsigned long long)constant_size;
+  }
+  if (array_size_ull == 0 || array_size_ull > SIZE_MAX) {
     return NULL;
   }
 

@@ -18,7 +18,7 @@ var z = 1 + 2;              // ERROR: 'z' requires an explicit type
 
 Arrays and structs may be initialized with an [aggregate literal](expressions.md#aggregate-literals), or left uninitialized, in which case they start zeroed.
 
-(Only two kinds of binding get their type structurally rather than by annotation: a range-`for` loop counter takes the type of its bound, and a top-level `const` - which is integer-only - takes its literal's type. Neither is inferred from an arbitrary expression.)
+(Only two kinds of binding get their type structurally rather than by annotation: a range-`for` loop counter takes the type of its bound, and a top-level `const` takes its initializer's type. Neither is inferred from an arbitrary expression.)
 
 ## Constants
 
@@ -26,7 +26,7 @@ Constants are declared with `const`, a name, an optional type, and a required in
 
 ```mettle
 const MAX: int32 = 100;
-const STEP = 4;            // top-level const is integer-only; type is its literal's
+const STEP = 4;            // top-level const gets its initializer's type
 const BOUND = MAX - STEP;  // may reference earlier constants
 
 fn main() -> int32 {
@@ -36,7 +36,7 @@ fn main() -> int32 {
 }
 ```
 
-A **top-level** `const` of **integer** type is folded directly into the machine code at every use site and occupies no storage, so its initializer must be a compile-time constant integer expression: integer literals, `sizeof`, other constants, and arithmetic, bitwise, and comparison operators over them. Because its value is a compile-time literal, an integer top-level `const` may omit the type annotation. A **local** `const` must state its type, like any local binding.
+A numeric `const`, with integer or float type, must have a compile-time constant initializer. It may use literals, earlier numeric constants, `sizeof`, and operators that the type checker can evaluate. A top-level integer `const` is folded directly into machine code at each use and occupies no storage. Float constants still get normal storage when code may take their address. A top-level numeric `const` may omit its type annotation. A local `const` must state its type, like any local binding.
 
 A top-level `const` of any other type gets normal storage in the object file, initialized to its value. Float, string, and **aggregate** constants all work at global scope:
 
@@ -49,7 +49,7 @@ const ORIGIN: Pt = { x: 1.0, y: 2.0 };
 
 Because a global's storage is laid out at compile time, an aggregate one must be initialized with an [aggregate literal](expressions.md#aggregate-literals) whose elements are all compile-time constants. A call has nothing to lay out and is rejected with a source location. There is no module initializer that could run one.
 
-A **local** (function-scope) `const` may have any type, and its initializer follows the same rules as any local variable initializer, so it may be a call.
+A **local** (function-scope) `const` may have any type. Numeric local constants need a compile-time initializer. Other local constants follow the same rules as local variables, so they may use a call.
 
 ## Functions
 

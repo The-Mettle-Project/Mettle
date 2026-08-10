@@ -114,6 +114,12 @@ typedef struct Symbol {
   const char *decl_file;
   /* Set on every scope-chain lookup; drives unused-variable warnings. */
   int is_used;
+  /* A numeric const keeps its folded value here even when it needs normal
+   * storage, such as a local float const. */
+  int has_constant_value;
+  int constant_is_float;
+  long long constant_integer_value;
+  double constant_float_value;
   union {
     struct {
       int register_id;

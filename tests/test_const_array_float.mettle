@@ -1,0 +1,19 @@
+const SLOT_COUNT: int32 = 4 + 8;
+const RATE: float64 = 0.8 * 1.0;
+
+fn main() -> int32 {
+  var values: int32[SLOT_COUNT];
+  values[0] = 7;
+  var count: int32 = SLOT_COUNT;
+  var scaled: float64 = RATE * 10.0;
+  if (values[0] != 7) {
+    return 1;
+  }
+  if (count != 12) {
+    return 2;
+  }
+  if (scaled < 7.99 || scaled > 8.01) {
+    return 3;
+  }
+  return 0;
+}

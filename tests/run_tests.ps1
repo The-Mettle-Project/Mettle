@@ -737,6 +737,7 @@ $cases = @(
   @{ Name = "err_decorator_on_struct"; Path = "tests/err_decorator_on_struct.mettle"; ShouldSucceed = $false; Pattern = "may only precede a function declaration" },
   @{ Name = "err_decorator_after_export"; Path = "tests/err_decorator_after_export.mettle"; ShouldSucceed = $false; Pattern = "Decorators must precede 'export'" },
   @{ Name = "const_top_level"; Path = "tests/test_const_top_level.mettle"; ShouldSucceed = $true },
+  @{ Name = "const_array_float"; Path = "tests/test_const_array_float.mettle"; ShouldSucceed = $true },
   @{ Name = "lambda"; Path = "tests/test_lambda.mettle"; ShouldSucceed = $true },
   @{ Name = "err_var_inferred"; Path = "tests/err_var_inferred.mettle"; ShouldSucceed = $false; Pattern = "requires an explicit type" },
   @{ Name = "closure_capture"; Path = "tests/test_closure_capture.mettle"; ShouldSucceed = $true },
@@ -750,6 +751,7 @@ $cases = @(
   @{ Name = "err_const_no_init"; Path = "tests/err_const_no_init.mettle"; ShouldSucceed = $false; Pattern = "Constant declaration requires an initializer" },
   @{ Name = "err_const_assign"; Path = "tests/err_const_assign.mettle"; ShouldSucceed = $false; Pattern = "is a constant and cannot be assigned to" },
   @{ Name = "err_const_nonconst"; Path = "tests/err_const_nonconst.mettle"; ShouldSucceed = $false; Pattern = "compile-time integer constant expression" },
+  @{ Name = "err_const_float_nonconst"; Path = "tests/err_const_float_nonconst.mettle"; ShouldSucceed = $false; Pattern = "compile-time constant expression" },
   # A global is laid out at compile time and there is no module initializer, so a
   # run-time initializer must be a diagnostic with a source location - it used to
   # reach the direct-object backend and abort as an internal compiler error.

@@ -43,6 +43,10 @@ int type_checker_eval_integer_constant_with_checker(TypeChecker *checker,
                                                            ASTNode *expression,
                                                            long long *out_value);
 
+int type_checker_eval_float_constant_with_checker(TypeChecker *checker,
+                                                  ASTNode *expression,
+                                                  double *out_value);
+
 /* Compile-time memory diagnostics (type_checker_memory.c). Phase 1 runs per
  * function after the body type-checks, while the function scope is still
  * live: use-after-free, double free, dangling stack addresses, constant

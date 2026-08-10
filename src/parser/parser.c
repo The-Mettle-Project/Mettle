@@ -1644,7 +1644,8 @@ static char *parser_parse_type_annotation(Parser *parser) {
 
   parser_advance(parser); // consume '['
 
-  if (parser->current_token.type != TOKEN_NUMBER) {
+  if (parser->current_token.type != TOKEN_NUMBER &&
+      parser->current_token.type != TOKEN_IDENTIFIER) {
     free(type_name);
     parser_set_error(parser, "Expected array size after '['");
     return NULL;

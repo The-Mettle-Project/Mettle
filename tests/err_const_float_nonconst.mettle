@@ -1,0 +1,9 @@
+fn side() -> float64 {
+  return 0.8;
+}
+
+const BAD: float64 = side();
+
+fn main() -> int32 {
+  return 0;
+}
