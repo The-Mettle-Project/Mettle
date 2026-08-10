@@ -1,6 +1,7 @@
 #ifndef MAIN_H
 #define MAIN_H
 
+#include "parser/parser.h"
 #include "codegen/code_generator.h"
 #include "debug/debug_info.h"
 #include "error/error_explain.h"
@@ -9,7 +10,6 @@
 #include "ir/ir_pgo.h"
 #include "ir/ir_verify.h"
 #include "lexer/lexer.h"
-#include "parser/parser.h"
 #include "semantic/register_allocator.h"
 #include "semantic/symbol_table.h"
 #include "semantic/monomorphize.h"
