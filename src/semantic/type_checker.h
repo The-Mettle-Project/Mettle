@@ -105,6 +105,10 @@ void type_checker_report_duplicate_declaration_prev(TypeChecker *checker,
                                                     SourceLocation location,
                                                     const char *symbol_name,
                                                     const Symbol *previous);
+void type_checker_report_parameter_shadow(TypeChecker *checker,
+                                          SourceLocation location,
+                                          const char *symbol_name,
+                                          const Symbol *parameter);
 /* --report-launches: print each `dispatch` site's geometry as it is checked. */
 void type_checker_set_launch_report(int enabled);
 

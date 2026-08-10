@@ -1579,6 +1579,8 @@ $cases = @(
      OutputMustNotMatch = @("Expected '\(', found identifier", "due to [4-9] previous") },
   @{ Name = "diag_dup_note"; Path = "tests/diag_dup_note.mettle"; ShouldSucceed = $false
      OutputMustMatch = @("Duplicate declaration of 'x'", "previous declaration of 'x' is here") },
+  @{ Name = "err_shadow_parameter"; Path = "tests/err_shadow_parameter.mettle"; ShouldSucceed = $false
+     OutputMustMatch = @("Variable 'side' shadows parameter 'side'", "function parameter 'side' is declared here") },
   @{ Name = "diag_call_notes"; Path = "tests/diag_call_notes.mettle"; ShouldSucceed = $false
      OutputMustMatch = @("expects 2 arguments, got 3", "\^\^\^ expected 2 arguments, got 3", "function 'add' defined here") },
   @{ Name = "diag_label_mismatch"; Path = "tests/diag_label_mismatch.mettle"; ShouldSucceed = $false

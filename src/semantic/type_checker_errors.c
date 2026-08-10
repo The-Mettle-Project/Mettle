@@ -286,3 +286,44 @@ void type_checker_report_duplicate_declaration(TypeChecker *checker,
         checker->error_reporter, ERROR_SEMANTIC, span, error_msg, suggestion);
   }
 }
+
+void type_checker_report_parameter_shadow(TypeChecker *checker,
+                                          SourceLocation location,
+                                          const char *symbol_name,
+                                          const Symbol *parameter) {
+  if (!checker || !symbol_name)
+    return;
+
+  char error_msg[512];
+  snprintf(error_msg, sizeof(error_msg), "Variable '%s' shadows parameter '%s'",
+           symbol_name, symbol_name);
+
+  checker->has_error = 1;
+  free(checker->error_message);
+  checker->error_message = strdup(error_msg);
+
+  if (checker->error_reporter) {
+    char suggestion[256];
+    snprintf(suggestion, sizeof(suggestion),
+             "use a different name so the parameter remains visible");
+    SourceSpan span = source_span_from_location(location, strlen(symbol_name));
+    span = error_reporter_span_snap_to_token(checker->error_reporter, span,
+                                             symbol_name);
+    error_reporter_add_error_with_span_and_suggestion(
+        checker->error_reporter, ERROR_SEMANTIC, span, error_msg, suggestion);
+
+    if (parameter && parameter->decl_line) {
+      char note[256];
+      snprintf(note, sizeof(note), "function parameter '%s' is declared here",
+               symbol_name);
+      SourceSpan parameter_span =
+          source_span_create(parameter->decl_line, parameter->decl_column,
+                             strlen(symbol_name));
+      parameter_span.filename = parameter->decl_file;
+      parameter_span = error_reporter_span_snap_to_token(
+          checker->error_reporter, parameter_span, symbol_name);
+      error_reporter_add_note_of_span(checker->error_reporter, parameter_span,
+                                      note);
+    }
+  }
+}

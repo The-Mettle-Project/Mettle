@@ -2190,7 +2190,9 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
     }
 
     /* Variable with function pointer type can be called like a function */
-    if (func_symbol->kind == SYMBOL_VARIABLE && func_symbol->type &&
+    if ((func_symbol->kind == SYMBOL_VARIABLE ||
+         func_symbol->kind == SYMBOL_PARAMETER) &&
+        func_symbol->type &&
         func_symbol->type->kind == TYPE_FUNCTION_POINTER) {
       call->is_indirect_call = 1;
       Type *fp_type = func_symbol->type;
@@ -2258,7 +2260,8 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
 
     if (func_symbol->kind != SYMBOL_FUNCTION) {
       const char *symbol_type =
-          (func_symbol->kind == SYMBOL_VARIABLE) ? "variable"
+          (func_symbol->kind == SYMBOL_VARIABLE ||
+           func_symbol->kind == SYMBOL_PARAMETER) ? "variable"
           : (func_symbol->kind == SYMBOL_STRUCT) ? "struct"
                                                  : "symbol";
       char error_msg[512];

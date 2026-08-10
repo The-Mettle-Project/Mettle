@@ -1,0 +1,8 @@
+fn gaitsim(side: int32) -> int32 {
+  var side: int32 = 7;
+  return side;
+}
+
+fn main() -> int32 {
+  return gaitsim(3);
+}

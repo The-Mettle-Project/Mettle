@@ -55,6 +55,8 @@ A **local** (function-scope) `const` may have any type, and its initializer foll
 
 Functions are declared with `fn`, a name, parameters in parentheses, an optional return type, and a body. The return type can use `->` or `:`. Omitting the return type indicates a void function (no return value).
 
+A local variable cannot use the name of a function parameter. A local variable may still use the name of a module global.
+
 ```mettle
 fn add(a: int32, b: int32) -> int32 {
   return a + b;

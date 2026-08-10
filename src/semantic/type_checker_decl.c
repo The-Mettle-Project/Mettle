@@ -27,6 +27,31 @@ static int gpu_kernel_scalar_type(const Type *type) {
   }
 }
 
+static Symbol *find_enclosing_parameter(TypeChecker *checker,
+                                        const char *name) {
+  if (!checker || !checker->symbol_table || !name) {
+    return NULL;
+  }
+
+  Scope *function_scope =
+      symbol_table_get_current_scope(checker->symbol_table);
+  while (function_scope && function_scope->type != SCOPE_FUNCTION) {
+    function_scope = function_scope->parent;
+  }
+  if (!function_scope) {
+    return NULL;
+  }
+
+  for (size_t i = 0; i < function_scope->symbol_count; i++) {
+    Symbol *symbol = function_scope->symbols[i];
+    if (symbol && symbol->kind == SYMBOL_PARAMETER && symbol->name &&
+        strcmp(symbol->name, name) == 0) {
+      return symbol;
+    }
+  }
+  return NULL;
+}
+
 /* Can this expression become bytes in the object file's data section?
  *
  * A global has no initializer to run: its value is laid out at compile time, so
@@ -639,6 +664,15 @@ int type_checker_process_declaration(TypeChecker *checker,
           "Extern variable '%s' requires an explicit type annotation",
           var_decl->name);
       return 0;
+    }
+
+    if (current_scope && current_scope->type != SCOPE_GLOBAL) {
+      Symbol *parameter = find_enclosing_parameter(checker, var_decl->name);
+      if (parameter) {
+        type_checker_report_parameter_shadow(checker, declaration->location,
+                                             var_decl->name, parameter);
+        return 0;
+      }
     }
 
     Type *var_type = NULL;
@@ -1337,7 +1371,7 @@ int type_checker_process_declaration(TypeChecker *checker,
     if (func_decl->parameter_count > 0) {
       for (size_t i = 0; i < func_decl->parameter_count; i++) {
         Symbol *param_symbol =
-            symbol_create(func_decl->parameter_names[i], SYMBOL_VARIABLE,
+            symbol_create(func_decl->parameter_names[i], SYMBOL_PARAMETER,
                           active_param_types ? active_param_types[i] : NULL);
         if (!param_symbol) {
           type_checker_set_error_at_location(
@@ -1351,6 +1385,9 @@ int type_checker_process_declaration(TypeChecker *checker,
             active_param_types[i]->kind == TYPE_POINTER) {
           param_symbol->address_space = MTLC_ADDRESS_SPACE_GLOBAL;
         }
+        param_symbol->decl_line = declaration->location.line;
+        param_symbol->decl_column = declaration->location.column;
+        param_symbol->decl_file = declaration->location.filename;
         if (!symbol_table_declare(checker->symbol_table, param_symbol)) {
           type_checker_report_duplicate_declaration(
               checker, declaration->location, func_decl->parameter_names[i]);
