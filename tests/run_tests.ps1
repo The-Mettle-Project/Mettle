@@ -1348,6 +1348,7 @@ $cases = @(
   @{ Name = "errdefer_top_level"; Path = "tests/test_errdefer_top_level.mettle"; ShouldSucceed = $false; Pattern = "Defer statement outside of a function|Errdefer statement outside of a function" },
   @{ Name = "defer_block_statement"; Path = "tests/test_defer_block_statement.mettle"; ShouldSucceed = $true },
   @{ Name = "errdefer_assignment_statement"; Path = "tests/test_errdefer_assignment_statement.mettle"; ShouldSucceed = $true },
+  @{ Name = "defer_global_assignment"; Path = "tests/test_defer_global_assignment.mettle"; ShouldSucceed = $true },
   @{
     Name            = "errdefer_implicit_fallthrough"
     Path            = "tests/test_errdefer_implicit_fallthrough.mettle"

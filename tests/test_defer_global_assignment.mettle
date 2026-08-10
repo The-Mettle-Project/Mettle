@@ -1,0 +1,15 @@
+var gfk_ik: int32 = 0;
+
+fn worker() -> int32 {
+  gfk_ik = 7;
+  defer gfk_ik = 0;
+  return gfk_ik;
+}
+
+fn main() -> int32 {
+  var seen: int32 = worker();
+  if (seen != 7) {
+    return 1;
+  }
+  return gfk_ik;
+}
