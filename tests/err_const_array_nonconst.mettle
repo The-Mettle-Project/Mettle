@@ -1,0 +1,6 @@
+var COUNT: int32 = 4;
+var values: int32[COUNT];
+
+fn main() -> int32 {
+  return values[0];
+}

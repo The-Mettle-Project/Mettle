@@ -736,8 +736,9 @@ $cases = @(
   @{ Name = "err_decorator_conflict"; Path = "tests/err_decorator_conflict.mettle"; ShouldSucceed = $false; Pattern = "mutually exclusive" },
   @{ Name = "err_decorator_on_struct"; Path = "tests/err_decorator_on_struct.mettle"; ShouldSucceed = $false; Pattern = "may only precede a function declaration" },
   @{ Name = "err_decorator_after_export"; Path = "tests/err_decorator_after_export.mettle"; ShouldSucceed = $false; Pattern = "Decorators must precede 'export'" },
-  @{ Name = "const_top_level"; Path = "tests/test_const_top_level.mettle"; ShouldSucceed = $true },
-  @{ Name = "const_array_float"; Path = "tests/test_const_array_float.mettle"; ShouldSucceed = $true },
+    @{ Name = "const_top_level"; Path = "tests/test_const_top_level.mettle"; ShouldSucceed = $true },
+    @{ Name = "const_array_float"; Path = "tests/test_const_array_float.mettle"; ShouldSucceed = $true },
+    @{ Name = "err_const_array_nonconst"; Path = "tests/err_const_array_nonconst.mettle"; ShouldSucceed = $false },
   @{ Name = "lambda"; Path = "tests/test_lambda.mettle"; ShouldSucceed = $true },
   @{ Name = "err_var_inferred"; Path = "tests/err_var_inferred.mettle"; ShouldSucceed = $false; Pattern = "requires an explicit type" },
   @{ Name = "closure_capture"; Path = "tests/test_closure_capture.mettle"; ShouldSucceed = $true },
@@ -1348,8 +1349,11 @@ $cases = @(
   @{ Name = "errdefer_top_level"; Path = "tests/test_errdefer_top_level.mettle"; ShouldSucceed = $false; Pattern = "Defer statement outside of a function|Errdefer statement outside of a function" },
   @{ Name = "defer_block_statement"; Path = "tests/test_defer_block_statement.mettle"; ShouldSucceed = $true },
   @{ Name = "errdefer_assignment_statement"; Path = "tests/test_errdefer_assignment_statement.mettle"; ShouldSucceed = $true },
-  @{ Name = "defer_global_assignment"; Path = "tests/test_defer_global_assignment.mettle"; ShouldSucceed = $true },
-  @{ Name = "multiple_returns"; Path = "tests/test_multiple_returns.mettle"; ShouldSucceed = $true },
+    @{ Name = "defer_global_assignment"; Path = "tests/test_defer_global_assignment.mettle"; ShouldSucceed = $true },
+    @{ Name = "multiple_returns"; Path = "tests/test_multiple_returns.mettle"; ShouldSucceed = $true },
+    @{ Name = "multiple_returns_global"; Path = "tests/test_multiple_returns_global.mettle"; ShouldSucceed = $true },
+    @{ Name = "err_multiple_returns_count"; Path = "tests/err_multiple_returns_count.mettle"; ShouldSucceed = $false; Pattern = "returns 2 values but this return has 1" },
+    @{ Name = "err_multiple_returns_empty"; Path = "tests/err_multiple_returns_empty.mettle"; ShouldSucceed = $false; Pattern = "must return 2 values" },
   @{
     Name            = "errdefer_implicit_fallthrough"
     Path            = "tests/test_errdefer_implicit_fallthrough.mettle"

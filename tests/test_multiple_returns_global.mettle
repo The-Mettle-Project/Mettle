@@ -1,0 +1,21 @@
+var gx: float32 = 0.0;
+var gy: int32 = 0;
+var gz: float64 = 0.0;
+
+fn solve() -> (float32, int32, float64) {
+  return (1.5, 7, 2.25);
+}
+
+fn main() -> int32 {
+  (gx, gy, gz) = solve();
+  if (gx < 1.49 || gx > 1.51) {
+    return 1;
+  }
+  if (gy != 7) {
+    return 2;
+  }
+  if (gz < 2.24 || gz > 2.26) {
+    return 3;
+  }
+  return 0;
+}

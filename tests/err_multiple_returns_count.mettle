@@ -1,0 +1,7 @@
+fn bad() -> (int32, int32) {
+  return 1;
+}
+
+fn main() -> int32 {
+  return 0;
+}
