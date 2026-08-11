@@ -82,8 +82,9 @@ flowchart LR
    `.exe` with only the compiler binary: its own COFF emitter and its own PE
    linker, resolving imports by DLL name so no Windows SDK import libraries
    are needed.
-3. **Runtime: none.** A typical compiled program links libc and nothing else.
-   No GC, no allocator state, no init or shutdown, no background threads.
+3. **Runtime: owned.** Every product links Mettle's startup and freestanding
+   service layer. It links no C or compiler runtime. There is no GC, scheduler,
+   or background service.
 4. **The backend must be genuinely reusable.** The boundary is enforced by
    test gates, not convention (section 8.2).
 
@@ -570,9 +571,9 @@ reassociate.
 
 Implementation: `src/semantic/type_checker_memory.c`.
 
-There is no heap manager. `new T`, heap-needing array literals, and string
-concatenation lower directly to libc `calloc`; freeing is manual through
-`std/mem`. Locals, structs, and fixed arrays are stack value types.
+There is no managed heap. `new T`, heap array literals, and string joins lower
+to the owned zeroed allocator. Freeing is manual through `std/mem`. Locals,
+structs, and fixed arrays are stack value types.
 
 The distinctive piece is the borrow checker: **an advisory, inference-only
 analysis with a zero-false-positive budget**. No ownership syntax, no
@@ -1809,10 +1810,9 @@ symbolized backtraces with no `.debug_*` sections at all.
 `src/linker/`, about 2500 lines. `mtlc_build_executable` and the driver's
 `--build` do: emit object, synthesize startup, resolve, emit image, clean up.
 
-**Startup.** A startup object is generated in memory exporting
-`mainCRTStartup`: it initializes CRT arguments via `__getmainargs` when `main`
-wants argc/argv, calls `main`, and exits with its result. With `-s` it calls
-`mettle_crash_startup` first.
+**Startup.** A startup object generated in memory exports `mettle_start`. It
+gets argc and argv from the owned Windows runtime, calls `main`, and exits with
+the Windows process API. With `-s` it calls `mettle_crash_startup` first.
 
 **Symbol resolution** (`link_resolution_build`, symbol_resolve.c:759) runs
 `init_sections`, `load_objects`, `merge_sections`, `build_symbols`,
@@ -1867,19 +1867,15 @@ the compile-speed budget absorbs.
 
 ## 7.2 ELF hosts
 
-There is no internal ELF linker. The object links with the system toolchain:
-`gcc -no-pie` by default, a direct `ld` fast path that skips gcc spec
-processing, and `--static` / `--musl` variants. The same contract covers x86-64
-and AArch64 Linux. The Linux path automatically includes bundled helper objects
-for POSIX shims, atomics, stack tracebacks, and profiling when the generated
-object references them.
+The normal ELF path uses `ld` with Mettle's startup and freestanding runtime.
+A GCC fallback disables startup and every default library. `--static` is a
+compatible no op and `--musl` fails. The same dependency rule covers x86_64
+and AArch64 Linux.
 
 ## 7.3 The runtime
 
-There is almost nothing, which is the point. The entry is the emitted startup
-object; there is no runtime initialization, and a typical program links libc
-only. Four opt-in helper objects link only when the generated object references
-their symbols:
+The entry object initializes Mettle's small service layer. Four optional owned
+objects link only when generated code refers to their symbols:
 
 - **`crash_handler.o`** (927 lines): a Windows `SetUnhandledExceptionFilter`
   or a POSIX `sigaction` handler on an **alternate signal stack** (so a
@@ -1960,7 +1956,8 @@ Three mechanisms, all enforced by the suite:
 3. **The audit gate.** `libmtlc_selfcontained` computes the archive's external
    symbol closure with `nm` (undefined minus defined across all members) and
    fails if anything matches the project's naming conventions. The allowed
-   remainder is libc, kernel32-level Win32 imports, and compiler intrinsics.
+   remainder is restricted to the linker GOT marker on Linux and explicit OS
+   imports on Windows.
 
 Two gates prove the positive direction: `calc_frontend` builds and runs a
 non-Mettle frontend against the archive alone, and `public_api` drives the full
@@ -1974,7 +1971,7 @@ builder surface to all four targets.
 - **Types are borrowed forever.** The registry and symbol table store
   `MtlcType *` by reference and never free.
 - **Per-compile mutable state is thread-local.** The compiler session context
-  uses FLS or pthread keys; the explain and annotate sinks and the pointer-type
+  uses owned FLS or native TLS; the explain and annotate sinks and the pointer-type
   intern cache use `MTLC_THREAD_LOCAL`. The rule for new code: a mutable
   file-scope variable in the archive must be thread-local or it is a bug. This
   is what lets two frontends compile concurrently on separate threads.

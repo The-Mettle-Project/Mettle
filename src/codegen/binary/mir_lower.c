@@ -1271,6 +1271,8 @@ int mir_function_is_eligible(CodeGenerator *generator,
   MirFunction scratch_fn;
   memset(&scratch_fn, 0, sizeof(scratch_fn));
   int globals_ok = 1;
+  int has_global_write = 0;
+  int has_call = 0;
   for (size_t i = 0; i < ir_function->parameter_count; i++) {
     if (ir_function->parameter_names[i]) {
       mir_name_map_get_or_add(&defined, &scratch_fn,
@@ -1299,6 +1301,9 @@ int mir_function_is_eligible(CodeGenerator *generator,
    * call boundary. */
   for (size_t i = 0; i < ir_function->instruction_count && globals_ok; i++) {
     const IRInstruction *in = &ir_function->instructions[i];
+    if (in->op == IR_OP_CALL || in->op == IR_OP_CALL_INDIRECT) {
+      has_call = 1;
+    }
     /* An undefined SYMBOL written here is a global STORE. */
     if (in->dest.kind == IR_OPERAND_SYMBOL && in->dest.name) {
       int found = 0;
@@ -1311,6 +1316,9 @@ int mir_function_is_eligible(CodeGenerator *generator,
       if (!found && !mir_name_is_global_scalar(generator, in->dest.name)) {
         globals_ok = 0;
         break;
+      }
+      if (!found) {
+        has_global_write = 1;
       }
     }
     /* An undefined SYMBOL read must be a global scalar. */
@@ -1358,6 +1366,14 @@ int mir_function_is_eligible(CodeGenerator *generator,
   mir_function_destroy(&scratch_fn);
   if (!globals_ok) {
     return mir_trace_bail(ir_function, "global_access");
+  }
+  /* The global cache writes every changed global before each call. A cache
+   * value that was reloaded after a prior call is clean, and writing it before
+   * the next call can overwrite another thread's newer value before a lock is
+   * acquired. Keep functions that mix global writes and calls on the baseline
+   * path, which reads and writes global memory at each source operation. */
+  if (has_global_write && has_call) {
+    return mir_trace_bail(ir_function, "global_write_with_call");
   }
 
   for (size_t i = 0; i < ir_function->instruction_count; i++) {

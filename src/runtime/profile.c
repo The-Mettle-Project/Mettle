@@ -2,16 +2,15 @@
 #include "crash_handler.h"
 
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <windows.h>
 #else
-#include <fcntl.h>
 #include <time.h>
 #include <sys/time.h>
-#include <unistd.h>
 #endif
 
 extern uint64_t mettle_profile_name_count;
@@ -677,7 +676,7 @@ static void mettle_profile_report_operations(
   }
 }
 
-/* The runtime deliberately avoids libc stdio (the from-scratch internal linker
+/* The runtime uses Mettle's owned stdio (the internal linker
  * for --build resolves no __mingw_fprintf), so the sidecar is built in a
  * growable byte buffer and written with one OS call. */
 typedef struct {
@@ -775,19 +774,20 @@ static int mprof_write_file(const char *path, const char *data, size_t length) {
   CloseHandle(handle);
   return written_total == length;
 #else
-  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  FILE *file = fopen(path, "wb");
   size_t written_total = 0;
-  if (fd < 0) {
+  if (!file) {
     return 0;
   }
   while (written_total < length) {
-    ssize_t written = write(fd, data + written_total, length - written_total);
-    if (written <= 0) {
+    size_t written = fwrite(data + written_total, 1,
+                            length - written_total, file);
+    if (written == 0) {
       break;
     }
-    written_total += (size_t)written;
+    written_total += written;
   }
-  close(fd);
+  fclose(file);
   return written_total == length;
 #endif
 }

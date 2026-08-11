@@ -1,18 +1,9 @@
 // Mettle standard library: Networking (POSIX – Linux / macOS)
 //
 // Provides raw socket operations for TCP/UDP networking on POSIX platforms.
-// Socket functions are in libc on both Linux and macOS; no extra link flags
-// are required for the basic socket API.
-//
-// However, this module requires stdlib/posix_helpers.c for thread-safe
-// errno access and atomic spin-lock operations. Compile and link it:
-//
-//   Linux:  gcc -o myapp output.s stdlib/posix_helpers.c -lpthread
-//   macOS:  gcc -o myapp output.s stdlib/posix_helpers.c
-//
-// For crash tracebacks (-d/-s) or std/thread atomics, also link:
-//   gcc -o myapp output.s stdlib/posix_helpers.c \
-//       src/runtime/crash_handler.c src/runtime/atomics.c -lpthread
+// Mettle's owned runtime provides the socket, error, close, and atomic ABI
+// symbols with direct Linux system calls. No host library or helper source is
+// needed.
 //
 // Usage pattern with defer for automatic cleanup:
 //   var sock: int64 = socket(AF_INET_POSIX(), SOCK_STREAM_POSIX(), IPPROTO_TCP_POSIX());
@@ -105,7 +96,7 @@ export extern fn posix_send(fd: int64, buf: cstring, len: int64, flags: int32) -
 export extern fn posix_recv(fd: int64, buf: cstring, len: int64, flags: int32) -> int64 = "recv";
 
 // ─── Address utilities ────────────────────────────────────────────────────────
-// These live in libc on both Linux and macOS; no extra link flags needed.
+// The owned runtime provides these socket ABI names.
 export extern fn htons(hostshort: int32) -> int32 = "htons";
 export extern fn htonl(hostlong: int32) -> int32 = "htonl";
 export extern fn ntohs(netshort: int32) -> int32 = "ntohs";
@@ -113,9 +104,7 @@ export extern fn ntohl(netlong: int32) -> int32 = "ntohl";
 export extern fn inet_addr(cp: cstring) -> int32 = "inet_addr";
 
 // ─── Error reporting ────────────────────────────────────────────────────────
-// errno is a thread-local variable on POSIX.  We expose it through a tiny
-// C helper (posix_get_errno in posix_helpers.c) rather than reading the TLS
-// slot directly.  The helper is linked via stdlib/posix_helpers.c.
+// The owned runtime keeps the error value in its thread local state.
 export extern fn posix_get_errno() -> int32 = "posix_get_errno";
 
 export fn net_posix_last_error() -> int32 {
@@ -124,9 +113,8 @@ export fn net_posix_last_error() -> int32 {
 
 // ─── Spin-lock helpers ───────────────────────────────────────────────────────
 // POSIX equivalent of the Win32 spin-lock helpers in std/thread.
-// Uses sched_yield() (from <sched.h>, in libc) to yield the CPU while
-// spinning, and GCC/Clang __sync built-ins for atomic compare-and-swap.
-// These are provided by posix_helpers.c.
+// Uses the owned yield system call while
+// spinning. The owned runtime supplies the target atomic operations.
 export extern fn posix_cas_i32(ptr: int32*, expected: int32, desired: int32) -> int32 = "posix_cas_i32";
 export extern fn posix_yield() = "posix_yield";
 export extern fn posix_atomic_exchange_i32(ptr: int32*, val: int32) -> int32 = "posix_atomic_exchange_i32";

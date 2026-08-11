@@ -23,12 +23,3 @@ int string_is_interned(const char *value) {
   (void)value;
   return 0;
 }
-
-#ifdef _WIN32
-#include "runtime/crash_handler.h"
-/* Generic name when the full Mettle crash reporter is not linked. */
-const char *mettle_crash_exception_name(DWORD code) {
-  (void)code;
-  return "exception";
-}
-#endif

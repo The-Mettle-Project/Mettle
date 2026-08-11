@@ -1,11 +1,8 @@
 // Mettle standard library: I/O (native ELF / Linux)
 //
-// Linux counterpart to std/io. Identical libc-backed implementation, except the
-// standard streams come from glibc's `stdin`/`stdout`/`stderr` globals rather
-// than the MSVCRT `__acrt_iob_func` accessor used on Windows. The import
-// resolver picks this file over io.mettle automatically on the native ELF
-// target, so `import "std/io"` works unchanged on both platforms and routes
-// through the same C runtime routines.
+// Linux counterpart to std/io. Mettle's runtime owns the stream objects and
+// implements each file and console call with Linux system calls. The import
+// resolver picks this file over io.mettle on the native ELF target.
 
 // ─── Console output ─────────────────────────────────────────────────────────
 export extern fn puts(msg: cstring) -> int32;
@@ -77,15 +74,14 @@ export extern fn fgets(buf: cstring, size: int32, fp: cstring) -> cstring = "fge
 export extern fn fflush(fp: cstring) -> int32 = "fflush";
 
 // ─── Standard streams ─────────────────────────────────────────────────────────
-// On Linux, glibc exposes stdin/stdout/stderr as FILE* global variables.
-// We bind them directly as extern data symbols (no MSVCRT __acrt_iob_func).
-extern var libc_stdin: cstring = "stdin";
-extern var libc_stdout: cstring = "stdout";
-extern var libc_stderr: cstring = "stderr";
+// The owned runtime exports its stdin, stdout, and stderr stream handles.
+extern var runtime_stdin: cstring = "stdin";
+extern var runtime_stdout: cstring = "stdout";
+extern var runtime_stderr: cstring = "stderr";
 
-export fn get_stdin() -> cstring  { return libc_stdin; }
-export fn get_stdout() -> cstring { return libc_stdout; }
-export fn get_stderr() -> cstring { return libc_stderr; }
+export fn get_stdin() -> cstring  { return runtime_stdin; }
+export fn get_stdout() -> cstring { return runtime_stdout; }
+export fn get_stderr() -> cstring { return runtime_stderr; }
 
 // Write message to stderr (no newline)
 export fn print_err(msg: cstring) {

@@ -1,6 +1,7 @@
 #include "compiler_crash.h"
 #include "compiler_context.h"
 #include "../runtime/crash_handler.h"
+#include "../runtime/owned.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,8 +14,6 @@
 #include <windows.h>
 #include <dbghelp.h>
 #else
-#include <dlfcn.h>
-#include <execinfo.h>
 #include <signal.h>
 #include <unistd.h>
 #endif
@@ -199,69 +198,35 @@ static void mettle_compiler_write_backtrace_with_context(FILE *output,
   }
 }
 #else
-static int mettle_compiler_frame_is_internal(const char *name) {
-  if (!name || name[0] == '\0') {
-    return 0;
-  }
-
-  return strstr(name, "mettle_compiler_write_backtrace") != NULL ||
-         strstr(name, "mettle_compiler_write_frame") != NULL ||
-         strstr(name, "mettle_compiler_ice_report") != NULL ||
-         strstr(name, "mettle_compiler_signal_handler") != NULL ||
-         strstr(name, "backtrace") != NULL;
-}
-
 static void mettle_compiler_write_frame(FILE *output, void *frame_address,
-                                        size_t index) {
-  Dl_info info;
-
-  fprintf(output, "  #%zu ", index);
-
-  if (dladdr(frame_address, &info) && info.dli_sname &&
-      !mettle_compiler_frame_is_internal(info.dli_sname)) {
-    fprintf(output, "%s", info.dli_sname);
-    if (info.dli_saddr) {
-      fprintf(output, "+0x%tx", (char *)frame_address - (char *)info.dli_saddr);
-    }
-    if (info.dli_fname) {
-      fprintf(output, " in %s", info.dli_fname);
-    }
-  } else {
-    fprintf(output, "%p", frame_address);
-  }
-
-  fprintf(output, " (%p)\n", frame_address);
+                                         size_t index) {
+  fprintf(output, "  #%zu %p\n", index, frame_address);
 }
 
 static void mettle_compiler_write_backtrace_with_context(FILE *output,
-                                                         void *context) {
-  void *frames[MAX_BACKTRACE_FRAMES];
-  int frame_count = 0;
-  size_t frame_index = 0;
-
+                                                          void *context) {
   (void)context;
-
   if (!output) {
     return;
   }
-
   fprintf(output, "\nCompiler backtrace:\n");
-  frame_count = backtrace(frames, MAX_BACKTRACE_FRAMES);
-  for (int i = 0; i < frame_count; i++) {
-    Dl_info info;
-    int skip = 0;
 
-    if (dladdr(frames[i], &info) && info.dli_sname &&
-        mettle_compiler_frame_is_internal(info.dli_sname)) {
-      skip = 1;
+  void **frame = (void **)__builtin_frame_address(0);
+  for (size_t index = 0; frame && index < MAX_BACKTRACE_FRAMES; index++) {
+    void **next = (void **)frame[0];
+    void *return_address = frame[1];
+    if (!return_address) {
+      break;
     }
-
-    if (skip) {
-      continue;
+    if (index >= 2) {
+      mettle_compiler_write_frame(output, return_address, index - 2);
     }
-
-    mettle_compiler_write_frame(output, frames[i], frame_index);
-    frame_index++;
+    if (!next || next <= frame || (uintptr_t)next - (uintptr_t)frame >
+                                      16u * 1024u * 1024u ||
+        ((uintptr_t)next & (sizeof(void *) - 1u)) != 0) {
+      break;
+    }
+    frame = next;
   }
 }
 #endif
@@ -370,15 +335,15 @@ void mettle_compiler_crash_install(int argc, char **argv) {
 #if defined(_WIN32) || defined(_WIN64)
   SetUnhandledExceptionFilter(mettle_compiler_unhandled_exception_filter);
 #else
-  struct sigaction sa;
-  memset(&sa, 0, sizeof(sa));
-  sa.sa_sigaction = mettle_compiler_signal_handler;
-  sigemptyset(&sa.sa_mask);
-  sa.sa_flags = SA_SIGINFO;
-  sigaction(SIGSEGV, &sa, NULL);
-  sigaction(SIGBUS, &sa, NULL);
-  sigaction(SIGFPE, &sa, NULL);
-  sigaction(SIGILL, &sa, NULL);
-  sigaction(SIGABRT, &sa, NULL);
+  (void)mettle_install_signal_handler(
+      SIGSEGV, (void (*)(int, void *, void *))mettle_compiler_signal_handler);
+  (void)mettle_install_signal_handler(
+      SIGBUS, (void (*)(int, void *, void *))mettle_compiler_signal_handler);
+  (void)mettle_install_signal_handler(
+      SIGFPE, (void (*)(int, void *, void *))mettle_compiler_signal_handler);
+  (void)mettle_install_signal_handler(
+      SIGILL, (void (*)(int, void *, void *))mettle_compiler_signal_handler);
+  (void)mettle_install_signal_handler(
+      SIGABRT, (void (*)(int, void *, void *))mettle_compiler_signal_handler);
 #endif
 }

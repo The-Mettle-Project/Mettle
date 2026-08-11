@@ -11,8 +11,12 @@
 #ifdef _WIN32
 #include <io.h>
 #include <windows.h>
+#ifndef isatty
 #define isatty _isatty
+#endif
+#ifndef fileno
 #define fileno _fileno
+#endif
 #else
 #include <unistd.h>
 #endif

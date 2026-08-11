@@ -717,7 +717,7 @@ static int binary_emitter_write_coff_object_file(BinaryEmitter *emitter,
   }
   /* The COFF writer emits the header, section table, and symbol table as many
    * tiny 2/4-byte fwrites. A large stdio buffer collapses those into memory
-   * copies instead of one libc/syscall round trip per field. */
+   * copies instead of one host write call per field. */
   setvbuf(file, NULL, _IOFBF, 1 << 20);
 
   uint32_t *section_name_offsets = NULL;

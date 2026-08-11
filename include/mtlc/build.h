@@ -10,7 +10,7 @@
  * locals/parameters, referenced by opaque MtlcValue handles; control flow is
  * explicit labels and branches (the frontend lowers its own if/while/for). A
  * function whose body you emit is a definition; declare an `extern` function to
- * reference a symbol linked from elsewhere (e.g. a C runtime routine).
+ * reference a symbol from the owned runtime or an explicit OS API.
  *
  *   MtlcBuilder *b = mtlc_builder_create();
  *   const MtlcType *i64 = mtlc_type_scalar(MTLC_TYPE_INT64);
@@ -158,7 +158,8 @@ MtlcFn *mtlc_builder_function(MtlcBuilder *builder, const char *name,
                              size_t param_count, int is_extern);
 
 /* Declare a body-less external function -- a symbol resolved at link time,
- * such as a C runtime routine. This is mtlc_builder_function's is_extern form
+ * such as an owned runtime routine or explicit OS API. This is
+ * mtlc_builder_function's is_extern form
  * with an unambiguous result: it returns 1 on success and 0 on failure, where
  * the general entry point returns NULL for both. `param_names` may be NULL
  * when the names do not matter, which for an extern they usually do not. */
@@ -424,7 +425,7 @@ void mtlc_gpu_launch(MtlcFn *fn, MtlcValue kernel_handle, MtlcDim3 grid,
                      const MtlcType *const *arg_types, size_t arg_count);
 
 /* Real address of a function symbol (defined or extern-declared): usable as
- * a callback for OS/CRT APIs and with mtlc_call_indirect. */
+ * a callback for OS APIs and with mtlc_call_indirect. */
 MtlcValue mtlc_function_address(MtlcFn *fn, const char *name);
 
 /* Call through a function-pointer value with `arg_count` arguments. Without a

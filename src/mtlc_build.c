@@ -1511,7 +1511,7 @@ void mtlc_gpu_launch(MtlcFn *fn, MtlcValue kernel_handle, MtlcDim3 grid,
 
 /* Real address of a function symbol (defined here or a declared extern):
  * IR_OP_ADDRESS_OF on a function name lowers to a RIP-relative lea with a
- * relocation, so the value is callable by the OS/CRT and comparable. */
+ * relocation, so the value is callable by the OS and comparable. */
 MtlcValue mtlc_function_address(MtlcFn *fn, const char *name) {
   if (!fn || !name) {
     if (fn) {

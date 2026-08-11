@@ -1,12 +1,9 @@
 // Mettle standard library: Threading (POSIX – Linux / macOS)
 //
-// Thin wrappers around pthreads and POSIX synchronisation APIs.
-// This module is for Linux and macOS only.  On Windows, use std/thread
-// (Win32 threading) instead.
-//
-// Link flags:
-//   Linux:  gcc -o myapp output.s -lpthread
-//   macOS:  gcc -o myapp output.s   (pthreads are in libSystem, no -lpthread needed)
+// Source compatible POSIX thread names for Linux. Mettle owns every symbol in
+// this module and implements it with clone, futex, and direct system calls.
+// No pthread library or C runtime is linked. New code should use std/thread,
+// which provides one API on Windows and Linux.
 //
 // Thread entry: pass a function pointer fn(cstring) -> cstring. The function
 // receives the arg and returns a value (use 0 for void). Example:
@@ -22,12 +19,9 @@
 //   pthread_join(t, 0);
 
 // ─── pthread_t / pthread_mutex_t ─────────────────────────────────────────────
-// On Linux x86-64, pthread_t is an unsigned long (8 bytes).
-// On macOS, pthread_t is a pointer (8 bytes).
-// We represent both as int64.
+// The owned runtime represents a thread handle as int64.
 //
-// pthread_mutex_t is an opaque struct (40 bytes on Linux, 56 bytes on macOS).
-// We allocate it on the heap via malloc and pass it as cstring (void*).
+// The public helper allocates opaque storage and passes it as cstring.
 
 // ─── Thread lifecycle ────────────────────────────────────────────────────────
 // pthread_create(thread*, attr*, start_routine*, arg*) -> int (0 = success)
@@ -80,8 +74,8 @@ export extern fn pthread_cond_signal(cond: cstring) -> int32 = "pthread_cond_sig
 export extern fn pthread_cond_broadcast(cond: cstring) -> int32 = "pthread_cond_broadcast";
 
 // ─── Sleep ───────────────────────────────────────────────────────────────────
-// usleep(microseconds) – sleep for the given number of microseconds.
-// 1 ms = 1000 µs.  Available in libc; no extra link flags needed.
+// usleep sleeps for the given number of microseconds through the owned runtime.
+// 1 ms = 1000 microseconds.
 export extern fn usleep(usec: uint32) -> int32 = "usleep";
 
 // nanosleep is more precise but requires a timespec struct (two int64 fields).
@@ -89,25 +83,7 @@ export extern fn usleep(usec: uint32) -> int32 = "usleep";
 export extern fn nanosleep(req: cstring, rem: cstring) -> int32 = "nanosleep";
 
 // ─── Atomic helpers (via C bridge) ──────────────────────────────────────────
-// GCC/Clang __sync built-ins are compiler intrinsics; we expose them through
-// a small C helper so Mettle can call them without inline assembly.
-//
-// Add the following to a C file compiled alongside your program:
-//
-//   // posix_sync_helpers.c
-//   #include <sched.h>
-//   int posix_cas_i32(int *ptr, int expected, int desired) {
-//       return __sync_val_compare_and_swap(ptr, expected, desired);
-//   }
-//   void posix_yield(void) { sched_yield(); }
-//   int posix_atomic_exchange_i32(int *ptr, int val) {
-//       return __sync_lock_test_and_set(ptr, val);
-//   }
-//   int posix_atomic_add_i32(int *ptr, int val) {
-//       return __sync_fetch_and_add(ptr, val);
-//   }
-//
-// Link flags: none (sched_yield is in libc; __sync builtins are inlined).
+// The owned runtime emits target atomics and calls the yield system call.
 
 export extern fn posix_cas_i32(ptr: int32*, expected: int32, desired: int32) -> int32 = "posix_cas_i32";
 export extern fn posix_yield() = "posix_yield";
@@ -141,8 +117,7 @@ export fn posix_spin_unlock(lock_var: int32*) {
 // Returns a cstring (pointer to the heap-allocated pthread_mutex_t).
 // The caller must call mutex_destroy_posix() and free() when done.
 //
-// pthread_mutex_t size: 40 bytes on Linux x86-64, 56 bytes on macOS.
-// We allocate 64 bytes to cover both platforms.
+// The owned mutex ABI fits in this fixed 64 byte compatibility allocation.
 import "std/mem";
 
 export fn mutex_create_posix() -> cstring {

@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdarg.h>
 
-/* MSVC/UCRT and clang-on-Windows (without MinGW) omit POSIX strcasecmp. */
+/* Some Windows C compilers omit the POSIX strcasecmp declaration. */
 #if defined(_WIN32) && !defined(__MINGW32__)
 #include <string.h>
 #ifndef strcasecmp
@@ -23,9 +23,9 @@ typedef ptrdiff_t ssize_t;
  * diagnostic state (the --explain report/remarks and the --annotate-asm capture)
  * thread-local so two frontends can drive libmtlc concurrently on separate
  * threads without clobbering each other -- i.e. the backend has no shared
- * mutable global state. (MettleCompilerContext already uses FLS/pthread_key.)
- * On MinGW __thread pulls in libwinpthread; the driver links -static so the
- * shipped mettle.exe stays self-contained. */
+ * mutable global state. MettleCompilerContext uses the owned TLS layer too.
+ * The freestanding host supplies __emutls_get_address on Windows and native
+ * thread pointer setup on Linux, so this does not pull in a thread library. */
 #if defined(_MSC_VER)
 #define MTLC_THREAD_LOCAL __declspec(thread)
 #else

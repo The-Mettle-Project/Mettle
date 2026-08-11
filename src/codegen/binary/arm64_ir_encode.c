@@ -105,7 +105,7 @@ static const IRModuleSymbol *module_variable(const SlotMap *slots,
   return symbol && symbol->kind == IR_MODSYM_VARIABLE ? symbol : NULL;
 }
 
-/* Every C runtime entry point the self-contained executable provides itself.
+/* Every owned runtime entry point the self contained executable provides.
  * `needs_malloc` records the one inter-stub dependency, so referencing calloc
  * also pulls in malloc. */
 typedef enum {
@@ -918,10 +918,10 @@ static int emit_external_call(Arm64Emit *e, Arm64ObjectContext *object,
                                BINARY_RELOCATION_ARM64_CALL26, link_name);
 }
 
-/* Call one of the C runtime entry points the lowering composes higher-level
+/* Call one of the owned runtime entry points used by higher level
  * operations from. The self-contained executable emits its own freestanding
  * stub and branches to it; an object leaves a CALL26 relocation for the linker
- * to resolve against the real libc. Same name either way -- the stubs are named
+ * to resolve against the full owned runtime. The names match in both paths
  * for the functions they stand in for. */
 static int emit_runtime_call(Arm64Emit *e, Arm64ObjectContext *object,
                              const IRProgram *prog, LblMap *fns, int stub) {
@@ -2149,7 +2149,7 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
         arm64_emit_word(e, arm64_ldr_imm(1, ARM64_X2, R_LHS, 8));
         emit_runtime_call(e, object, prog, fns, STUB_MEMCPY);
         /* Terminate. The freestanding allocator hands back fresh-zero memory,
-         * so this is redundant there, but libc's malloc does not. */
+         * so this is redundant there, but the general allocator need not. */
         emit_slot_ldr(e, ARM64_X0, off_dst);
         arm64_emit_word(e, arm64_ldr_imm(1, R_LHS, ARM64_X0, 8));
         arm64_emit_word(e, arm64_add_imm(1, ARM64_X0, ARM64_X0, 16, 0));
@@ -2215,10 +2215,8 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
         }
         break;
       }
-      /* Runtime traps: a plain relocatable object may only assume libc
-       * (matching the x86 backend without stack-trace support), so
-       * mettle_crash_trap[_ex] lowers to puts(message); exit(1). The legacy
-       * self-contained product has no libc and exits via the raw syscall. */
+      /* Runtime traps in a relocatable object lower to owned puts and exit.
+       * The compact self contained image exits through its local syscall. */
       if (strcmp(in->text, "mettle_crash_trap_ex") == 0 ||
           strcmp(in->text, "mettle_crash_trap") == 0) {
         size_t msg_index =
@@ -2317,8 +2315,8 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
       break;
     }
     case IR_OP_NEW: {
-      /* Heap allocation of `rhs` bytes, zeroed. The object path calls libc's
-       * calloc(1, size); the self-contained path branches to the bump
+      /* Heap allocation of `rhs` bytes, zeroed. The object path calls owned
+       * calloc(1, size); the self contained path branches to the bump
        * allocator, whose memory is already zero. */
       Arm64Reg size_reg = object ? ARM64_X1 : ARM64_X0;
       if (in->rhs.kind == IR_OPERAND_NONE ||
@@ -2526,11 +2524,11 @@ static void emit_str_print(Arm64Emit *e, int with_newline, int zero_result) {
   arm64_emit_epilogue(e, 16, NULL, 0);
 }
 
-/* ---- freestanding C runtime stubs --------------------------------------- *
+/* ---- compact owned runtime stubs --------------------------------------- *
  *
- * The self-contained executable has no libc and no linker, so a call to malloc
+ * The self contained executable has no external runtime or linker, so malloc
  * or puts has nothing to resolve to. These hand-written leaves stand in for the
- * handful of C runtime entry points Mettle programs actually reach, built on
+ * small set of runtime entry points that reachable Mettle code needs, built on
  * raw AArch64 Linux syscalls. They are emitted only when a program calls them.
  *
  * The allocator is a bump pointer over anonymous mmap: free() is a no-op and
@@ -3073,7 +3071,7 @@ int arm64_ir_encode_program(Arm64Emit *e, const IRProgram *prog,
     }
   }
 
-  /* Which C runtime stubs the reachable code needs. Computed from the same test
+  /* Which compact runtime stubs the reachable code needs. Computed from the same test
    * the call sites use, so every branch a body emits finds a bound label. */
   int stub_used[STUB_COUNT] = {0};
   /* cstr("literal") is folded at the call site and needs no body. cstr(value)

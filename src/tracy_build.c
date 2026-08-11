@@ -1,6 +1,7 @@
 #include "tracy_build.h"
 
 #include "common.h"
+#include "runtime/owned.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -78,27 +79,14 @@ static char *tracy_replace_extension(const char *path, const char *extension) {
 }
 
 static int tracy_directory_exists(const char *path) {
-#ifdef _WIN32
-  struct _stat st;
   if (!path || path[0] == '\0') {
     return 0;
   }
-  return _stat(path, &st) == 0 && (st.st_mode & _S_IFDIR) != 0;
-#else
-  struct stat st;
-  if (!path || path[0] == '\0') {
-    return 0;
-  }
-  return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
-#endif
+  return mettle_path_is_directory(path);
 }
 
 static int tracy_file_exists(const char *path) {
-#ifdef _WIN32
-  return _access(path, 0) == 0;
-#else
-  return access(path, F_OK) == 0;
-#endif
+  return mettle_path_exists(path);
 }
 
 static int tracy_run_command(const char *command) {
@@ -352,11 +340,7 @@ int tracy_save_directory_config(const char *directory, char **error_out) {
     return 0;
   }
 
-#ifdef _WIN32
-  _mkdir(config_dir);
-#else
-  mkdir(config_dir, 0755);
-#endif
+  (void)mettle_make_directory(config_dir);
 
   config_path = tracy_join_paths(config_dir, "tracy_dir");
   free(config_dir);

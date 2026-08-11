@@ -3,7 +3,6 @@
 #endif
 #include "main.h"
 #include "common.h"
-#include "mettle_alloc.h"
 #include "codegen/binary/startup.h"
 #include "codegen/binary/mir_annotate.h"
 #include "codegen/binary_emitter.h"
@@ -14,6 +13,8 @@
 #include "string_intern.h"
 #include "compiler/compiler_context.h"
 #include "compiler/compiler_crash.h"
+#include "runtime/owned.h"
+#include "runtime/verify_owned.h"
 #include "tracy_build.h"
 #include "ir/ir.h"
 #include "ir/ir_lowering.h" // ir_lower_program / ir_lowering_set_explain (frontend boundary)
@@ -44,13 +45,6 @@ __declspec(dllimport) int __stdcall QueryPerformanceCounter(MettleQpcTicks *coun
 #include <limits.h>
 #include <sys/stat.h>
 #include <unistd.h>
-/* waitpid lives in <sys/wait.h>, but that header transitively pulls in
- * <sys/ucontext.h>, whose REG_R8.. enumerators collide with the compiler's
- * own register enum in semantic/register_allocator.h. Forward-declare the one
- * function we need instead (mirroring the manual QueryPerformanceCounter decls
- * used on Windows to dodge the windows.h/lexer.h clash). The wait-status
- * encoding decoded at the call site is the stable Linux/musl layout. */
-extern pid_t waitpid(pid_t pid, int *wstatus, int options);
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
@@ -163,11 +157,6 @@ static void compiler_profile_print_compile(const CompilerProfile *profile,
             mettle_compiler_phase_name((MettleCompilerPhase)i), ms, percent);
   }
   fprintf(stderr, "  %-20s %9.3f ms  %6.2f%%\n", "total", total_ms, 100.0);
-#if METTLE_ALLOC_ACTIVE
-  /* Allocation volume is the single biggest lever on these numbers, so report it
-   * alongside them rather than making it a separate flag. */
-  mettle_alloc_report();
-#endif
 }
 
 static void compiler_set_phase(MettleCompilerPhase phase) {
@@ -178,13 +167,7 @@ static int directory_exists(const char *path) {
   if (!path || path[0] == '\0') {
     return 0;
   }
-#ifdef _WIN32
-  struct _stat st;
-  return _stat(path, &st) == 0 && (st.st_mode & _S_IFDIR) != 0;
-#else
-  struct stat st;
-  return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
-#endif
+  return mettle_path_is_directory(path);
 }
 
 static char *join_paths(const char *left, const char *right) {
@@ -247,9 +230,11 @@ static char *get_executable_path(const char *argv0) {
   cached = 1;
 
 #ifdef _WIN32
-  char *program_path = NULL;
-  if (_get_pgmptr(&program_path) == 0 && program_path &&
-      program_path[0] != '\0') {
+  char program_path[4096];
+  long long path_length =
+      mettle_executable_path(program_path, sizeof(program_path));
+  if (path_length > 0 && path_length < (long long)sizeof(program_path)) {
+    program_path[path_length] = '\0';
     cached_path = strdup(program_path);
     return cached_path ? strdup(cached_path) : NULL;
   }
@@ -276,7 +261,7 @@ static char *get_executable_path(const char *argv0) {
   return strdup(cached_path);
 #else
   char buffer[PATH_MAX + 1];
-  ssize_t len = readlink("/proc/self/exe", buffer, PATH_MAX);
+  ssize_t len = (ssize_t)mettle_readlink("/proc/self/exe", buffer, PATH_MAX);
   if (len > 0) {
     buffer[len] = '\0';
     cached_path = strdup(buffer);
@@ -438,14 +423,14 @@ static int print_help_topic(const char *program_name, const char *argv0,
 
   if (strcmp(topic, "runtime") == 0 || strcmp(topic, "heap") == 0 ||
       strcmp(topic, "gc") == 0) {
-    printf("runtime - Mettle's (lack of a) language runtime\n\n");
-    printf("  No GC, no async scheduler, no heap manager, no thread pool, no "
-           "mandatory startup shim.\n");
-    printf("  A typical program links libc and nothing else. `new`, array "
-           "literals, and string concatenation\n");
-    printf("  call calloc(1, n) directly.\n\n");
-    printf("  Two opt-in helper objects ship with the compiler and are linked "
-           "only when referenced:\n");
+    printf("runtime - Mettle's owned freestanding runtime\n\n");
+    printf("  No GC, C runtime, compiler runtime, async scheduler, or thread "
+           "pool.\n");
+    printf("  Startup, heap, files, text conversion, clocks, threads, sockets, "
+           "and process calls\n");
+    printf("  use Mettle code and direct OS calls. Linked executables are "
+           "checked before success.\n\n");
+    printf("  Optional owned helper objects are linked only when referenced:\n");
     printf("    crash_handler.o - symbolized backtraces; linked when an object "
            "references mettle_crash_*\n");
     printf("                      (compiled with -d, -s, -g, or with IR "
@@ -730,163 +715,78 @@ static int mettle_elf_keep_symbols(const CompilerOptions *options) {
           compiler_options_use_profile_runtime(options));
 }
 
-/* Links the ELF executable by invoking ld directly, reproducing the link line
- * the gcc driver would build (crt1/crti/crtbegin + objects + -lc -lpthread +
- * crtend/crtn against the glibc dynamic linker). The gcc driver itself costs
- * ~140ms per link in spec processing and collect2 while ld links these
- * programs in under 10ms; with mettle's own compile around 10ms the driver
- * would otherwise dominate total build time. Quiet on failure (stderr is
- * dropped in the child): the caller falls back to the gcc driver, which
- * reports any real link error. Returns 0 on success. */
-static int mettle_link_elf_direct(const char *object_filename,
+/* Link a static ELF image from Mettle owned startup and runtime objects. */
+static int mettle_link_elf_direct(const char *startup_object,
+                                  const char *object_filename,
                                   const char *executable_filename,
-                                  const char *posix_helpers_object,
-                                  const char *atomics_object,
+                                  const char *freestanding_object,
                                   const char *crash_handler_object,
                                   const char *profile_object,
                                   int strip_symbols) {
-  char *crt1 = NULL;
-  char *crti = NULL;
-  char *crtn = NULL;
-  char *crtbegin = NULL;
-  char *crtend = NULL;
-  char *libc_dir = NULL;
-  char *gcc_lib_dir = NULL;
-  const char *argv_list[32];
+  const char *argv_list[24];
   size_t argc_used = 0u;
   int result = 1;
-  pid_t pid;
-  int status = 0;
 
-  /* Non-glibc layouts (e.g. musl) keep using the gcc driver. */
-  if (access(METTLE_ELF_DYNAMIC_LINKER, F_OK) != 0) {
+  if (!startup_object || !object_filename || !executable_filename ||
+      !freestanding_object) {
     return 1;
   }
 
-  crt1 = mettle_gcc_print_file_name("crt1.o");
-  crtbegin = mettle_gcc_print_file_name("crtbegin.o");
-  if (!crt1 || !crtbegin) {
-    goto cleanup;
-  }
-  crti = mettle_sibling_path(crt1, "crti.o");
-  crtn = mettle_sibling_path(crt1, "crtn.o");
-  crtend = mettle_sibling_path(crtbegin, "crtend.o");
-  libc_dir = mettle_sibling_path(crt1, "");
-  gcc_lib_dir = mettle_sibling_path(crtbegin, "");
-  if (!crti || !crtn || !crtend || !libc_dir || !gcc_lib_dir) {
-    goto cleanup;
-  }
-  if (access(crti, F_OK) != 0 || access(crtn, F_OK) != 0 ||
-      access(crtend, F_OK) != 0) {
-    goto cleanup;
-  }
-
   argv_list[argc_used++] = "ld";
-  argv_list[argc_used++] = "--eh-frame-hdr";
   argv_list[argc_used++] = "--gc-sections";
-  /* Merge the read-only and executable LOAD segments (the pre-binutils-2.31
-   * layout): separate-code spends up to two 4K pages of file padding per
-   * binary for page-exact W^X mapping, a poor trade for small executables
-   * whose code is non-PIE at a fixed base to begin with. */
   argv_list[argc_used++] = "-z";
   argv_list[argc_used++] = "noseparate-code";
+  argv_list[argc_used++] = "-e";
+  argv_list[argc_used++] = "_start";
   if (strip_symbols) {
     argv_list[argc_used++] = "-s";
   }
-  argv_list[argc_used++] = "-dynamic-linker";
-  argv_list[argc_used++] = METTLE_ELF_DYNAMIC_LINKER;
   argv_list[argc_used++] = "-o";
   argv_list[argc_used++] = executable_filename;
-  argv_list[argc_used++] = crt1;
-  argv_list[argc_used++] = crti;
-  argv_list[argc_used++] = crtbegin;
+  argv_list[argc_used++] = startup_object;
+  argv_list[argc_used++] = freestanding_object;
   argv_list[argc_used++] = object_filename;
-  if (posix_helpers_object) {
-    argv_list[argc_used++] = posix_helpers_object;
-  }
-  if (atomics_object) {
-    argv_list[argc_used++] = atomics_object;
-  }
   if (crash_handler_object) {
     argv_list[argc_used++] = crash_handler_object;
   }
   if (profile_object) {
     argv_list[argc_used++] = profile_object;
   }
-  argv_list[argc_used++] = "-L";
-  argv_list[argc_used++] = libc_dir;
-  argv_list[argc_used++] = "-L";
-  argv_list[argc_used++] = gcc_lib_dir;
-  argv_list[argc_used++] = "-lc";
-  argv_list[argc_used++] = "-lpthread";
-  argv_list[argc_used++] = crtend;
-  argv_list[argc_used++] = crtn;
   argv_list[argc_used] = NULL;
 
-  pid = fork();
-  if (pid == 0) {
-    /* Errors from a failed direct link would be confusing noise: the caller
-     * retries through the gcc driver, which reports anything real. A failed
-     * redirect only makes a failed link noisier, so it is not checked. */
-    if (!freopen("/dev/null", "w", stdout) ||
-        !freopen("/dev/null", "w", stderr)) {
-    }
-    execvp("ld", (char *const *)argv_list);
-    _exit(127);
-  }
-  if (pid > 0 && waitpid(pid, &status, 0) >= 0 && (status & 0x7f) == 0 &&
-      ((status >> 8) & 0xff) == 0) {
+  if (mettle_run_process("ld", argv_list) == 0) {
     result = 0;
   }
 
-cleanup:
-  free(crt1);
-  free(crti);
-  free(crtn);
-  free(crtbegin);
-  free(crtend);
-  free(libc_dir);
-  free(gcc_lib_dir);
   return result;
 }
 
-/* Links a native ELF executable by invoking the system C compiler (gcc). gcc
- * supplies the C runtime startup (crt1.o/crti.o/crtn.o, hence `_start`), the
- * dynamic linker, and libc, so the program runs on the same C runtime routines
- * (allocator, stdio, errno) as the Windows build links against MSVCRT. The
- * resulting binary is dynamically linked against the target's libc — the
- * accepted tradeoff for a consistent runtime across Windows and Linux.
- * Used on ELF hosts (Linux); does not depend on the Windows-only link helpers
- * below. Returns 0 on success. */
+/* Links a native ELF executable from Mettle's startup, freestanding runtime,
+ * and generated object. The direct path invokes ld. The fallback invokes gcc
+ * only as a linker driver with startup files, default libraries, and compiler
+ * support libraries disabled. The finished ELF must pass the dependency gate.
+ * Used on ELF hosts. Returns 0 on success. */
 static int mettle_link_elf_executable(const char *object_filename,
                                       const char *executable_filename,
                                       const CompilerOptions *options,
                                       const char *runtime_directory) {
   char **argv_list = NULL;
-  char *posix_helpers_object = NULL;
-  char *atomics_object = NULL;
   char *crash_handler_object = NULL;
   char *profile_object = NULL;
-  const char *cc = (options && options->musl_link) ? "musl-gcc" : "gcc";
+  char *freestanding_object = NULL;
+  char *startup_object = NULL;
+  const char *cc = "gcc";
   int result = 1;
   int profile_runtime =
       options && compiler_options_use_profile_runtime(options) ? 1 : 0;
   int stack_trace = options && options->generate_stack_trace_support ? 1 : 0;
 
-  /* Auto-link the Linux-side runtime helpers so users don't have to manage
-   * link flags themselves (mirroring how the Windows internal PE linker
-   * resolves ws2_32.dll / kernel32.dll automatically). Specifically:
-   *  - bin/runtime/posix_helpers.o provides posix_get_errno + the Win32-style
-   *    threading shims (mettle_thread_create etc.) std/thread (Linux variant)
-   *    binds to.
-   *  - bin/runtime/atomics.o provides mettle_atomic_* used by std/thread.
-   *  - -lpthread provides pthread_create/join/mutex/etc. (no cost when
-   *    unreferenced — libpthread is merged into libc on modern glibc).
-   * The unused-section elimination in ld drops anything the program does not
-   * reference, so always-linking these is essentially free. */
+  /* The bundled runtime owns the Linux ABI used by the standard library. Its
+   * threads use clone and futex. Its files, clocks, sockets, and processes use
+   * direct system calls. No host library appears on the link line.
+   */
   if (runtime_directory) {
-    posix_helpers_object = join_paths(runtime_directory, "posix_helpers.o");
-    atomics_object = join_paths(runtime_directory, "atomics.o");
+    freestanding_object = join_paths(runtime_directory, "freestanding.o");
     if (stack_trace || profile_runtime) {
       crash_handler_object = join_paths(runtime_directory, "crash_handler.o");
     }
@@ -895,39 +795,41 @@ static int mettle_link_elf_executable(const char *object_filename,
     }
   }
 
-  /* gcc -no-pie "<program.o>" "<posix_helpers.o>" "<atomics.o>" -o "<exe>"
-   * -lpthread [user link args]. crt1.o (supplied by gcc) provides `_start`,
-   * which calls the program's `main` directly per the SysV C startup contract;
-   * the backend's `main` already takes argc(RDI)/argv(RSI) in SysV order.
-   * `-no-pie` is required because the backend emits non-position-independent
-   * code (direct R_X86_64_PC32 relocations), which a PIE link (the default on
-   * modern gcc) rejects. */
+  startup_object = replace_extension(executable_filename, ".startup.o");
+  if (!freestanding_object || access(freestanding_object, F_OK) != 0) {
+    fprintf(stderr,
+            "Error: Required freestanding runtime object not found in '%s'\n",
+            runtime_directory ? runtime_directory : "");
+    goto cleanup;
+  }
+  if (!startup_object ||
+      binary_write_program_startup_object(
+          startup_object, profile_runtime, stack_trace,
+          options && options->main_wants_argc_argv ? 1 : 0) != 0) {
+    fprintf(stderr, "Error: Could not generate freestanding ELF startup\n");
+    goto cleanup;
+  }
+
+  /* The generated startup object defines _start and passes argc and argv to
+   * main. The backend emits non-position-independent code, so the fallback
+   * driver receives -no-pie as well as all three no-runtime switches. */
   if ((stack_trace || profile_runtime) && !crash_handler_object) {
     fprintf(stderr,
             "Error: Could not locate bundled crash_handler.o for Linux runtime "
             "support\n");
-    free(posix_helpers_object);
-    free(atomics_object);
-    return 1;
+    goto cleanup;
   }
   if (profile_runtime && !profile_object) {
     fprintf(stderr,
             "Error: Could not locate bundled profile.o for Linux runtime "
             "profiling\n");
-    free(posix_helpers_object);
-    free(atomics_object);
-    free(crash_handler_object);
-    return 1;
+    goto cleanup;
   }
 
-  /* Fast path: link with ld directly. --static/--musl builds (library group
-   * ordering and musl specs are the driver's job) and builds with user
-   * --link-arg values (gcc-flavoured flags like -Wl,...) keep the driver;
-   * everything else only falls back to it when the direct link fails. */
-  if (!(options && (options->static_link || options->musl_link)) &&
-      !(options && options->link_argument_count > 0) &&
-      mettle_link_elf_direct(object_filename, executable_filename,
-                             posix_helpers_object, atomics_object,
+  /* Use ld directly when no caller link arguments need driver parsing. */
+  if (!(options && options->link_argument_count > 0) &&
+      mettle_link_elf_direct(startup_object, object_filename,
+                             executable_filename, freestanding_object,
                              crash_handler_object, profile_object,
                              !mettle_elf_keep_symbols(options)) == 0) {
     result = 0;
@@ -941,42 +843,35 @@ static int mettle_link_elf_executable(const char *object_filename,
    * into unintended options (CWE-88). Each --link-arg is forwarded as exactly
    * one argv element, matching how it was collected at parse time. */
   if (result != 0) {
-    /* Upper bound: cc, -no-pie, -Wl,--gc-sections, -s, -static, object, -o,
-     * executable, -lpthread (9) + up to 4 runtime objects + every link
-     * argument + NULL terminator. */
-    size_t max_args = 9u + 4u + 1u +
-                      (options ? options->link_argument_count : 0u);
+    /* Upper bound for controls, output, runtime objects, caller arguments,
+     * and the NULL terminator. */
+    size_t max_args = 20u + 6u + 1u +
+                       (options ? options->link_argument_count : 0u);
     size_t argc_used = 0u;
-    pid_t pid;
-    int status = 0;
 
     argv_list = malloc(sizeof(*argv_list) * max_args);
     if (!argv_list) {
       fprintf(stderr, "Error: Failed to allocate ELF link argv\n");
-      free(posix_helpers_object);
-      free(atomics_object);
-      free(crash_handler_object);
-      free(profile_object);
-      return 1;
+      goto cleanup;
     }
 
     /* execvp does not modify argv contents; the const casts are safe. */
     argv_list[argc_used++] = (char *)cc;
+    argv_list[argc_used++] = (char *)"-nostdlib";
+    argv_list[argc_used++] = (char *)"-nostartfiles";
+    argv_list[argc_used++] = (char *)"-nodefaultlibs";
     argv_list[argc_used++] = (char *)"-no-pie";
     argv_list[argc_used++] = (char *)"-Wl,--gc-sections";
+    argv_list[argc_used++] = (char *)"-Wl,-e,_start";
     if (!mettle_elf_keep_symbols(options)) {
       argv_list[argc_used++] = (char *)"-s";
     }
-    if (options && (options->static_link || options->musl_link)) {
+    if (options && options->static_link) {
       argv_list[argc_used++] = (char *)"-static";
     }
+    argv_list[argc_used++] = startup_object;
+    argv_list[argc_used++] = freestanding_object;
     argv_list[argc_used++] = (char *)object_filename;
-    if (posix_helpers_object) {
-      argv_list[argc_used++] = posix_helpers_object;
-    }
-    if (atomics_object) {
-      argv_list[argc_used++] = atomics_object;
-    }
     if (crash_handler_object) {
       argv_list[argc_used++] = crash_handler_object;
     }
@@ -985,7 +880,6 @@ static int mettle_link_elf_executable(const char *object_filename,
     }
     argv_list[argc_used++] = (char *)"-o";
     argv_list[argc_used++] = (char *)executable_filename;
-    argv_list[argc_used++] = (char *)"-lpthread";
     if (options) {
       for (size_t i = 0; i < options->link_argument_count; i++) {
         const char *arg = options->link_arguments[i];
@@ -997,34 +891,22 @@ static int mettle_link_elf_executable(const char *object_filename,
     }
     argv_list[argc_used] = NULL;
 
-    pid = fork();
-    if (pid < 0) {
-      fprintf(stderr, "Error: Failed to fork to run %s: %s\n", cc,
-              strerror(errno));
-    } else if (pid == 0) {
-      execvp(cc, argv_list);
-      /* Reached only if exec failed. */
-      fprintf(stderr, "Error: Failed to execute %s: %s\n", cc,
-              strerror(errno));
-      _exit(127);
-    } else if (waitpid(pid, &status, 0) < 0) {
-      fprintf(stderr, "Error: Failed to wait for %s: %s\n", cc,
-              strerror(errno));
-    } else if ((status & 0x7f) == 0 && ((status >> 8) & 0xff) == 0) {
-      /* (status & 0x7f) == 0 means a normal exit (no terminating signal);
-       * (status >> 8) & 0xff is the exit code — i.e. WIFEXITED && WEXITSTATUS
-       * == 0 without pulling in <sys/wait.h>. */
+    if (mettle_run_process(cc, (const char *const *)argv_list) == 0) {
       result = 0;
     } else {
       fprintf(stderr, "Error: %s failed to produce an ELF executable\n", cc);
     }
   }
 
+cleanup:
+  if (startup_object) {
+    unlink(startup_object);
+  }
   free(argv_list);
-  free(posix_helpers_object);
-  free(atomics_object);
   free(crash_handler_object);
   free(profile_object);
+  free(freestanding_object);
+  free(startup_object);
   return result;
 }
 #endif /* !_WIN32 */
@@ -1226,8 +1108,8 @@ static int collect_internal_link_imports(const CompilerOptions *options,
                                           StringList *import_dll_names,
                                           char **error_message_out) {
   static const char *default_import_dlls[] = {
-      "kernel32.dll", "ucrtbase.dll", "msvcrt.dll", "ws2_32.dll",
-      "user32.dll",   "gdi32.dll",    "advapi32.dll", "winmm.dll"};
+      "kernel32.dll", "ws2_32.dll", "user32.dll",
+      "gdi32.dll",    "advapi32.dll", "winmm.dll"};
   size_t i = 0u;
   StringList search_directories = {0};
 
@@ -1538,20 +1420,7 @@ static int run_system_command(const char *command) {
 }
 
 static int windows_tool_exists(const char *tool_name) {
-  if (!tool_name || tool_name[0] == '\0') {
-    return 0;
-  }
-
-  size_t command_len = strlen(tool_name) + 32;
-  char *command = malloc(command_len);
-  if (!command) {
-    return 0;
-  }
-
-  snprintf(command, command_len, "where %s >nul 2>&1", tool_name);
-  int result = run_system_command(command);
-  free(command);
-  return result == 0;
+  return mettle_find_executable(tool_name);
 }
 
 static int write_internal_startup_object(const char *path, int profile_runtime,
@@ -1570,7 +1439,7 @@ static int mettle_link_internal(const char **object_paths,
                                   const char *executable_filename,
                                   int include_shell32,
                                   const CompilerOptions *options) {
-  LinkResolutionOptions resolution_options = {"mainCRTStartup", 16u, 1};
+  LinkResolutionOptions resolution_options = {"mettle_start", 16u, 1};
   LinkResolution *resolution = NULL;
   PeEmissionOptions emission_options = {0};
   StringList import_library_paths = {0};
@@ -1698,62 +1567,46 @@ static int mettle_link_objects_with_gxx(const char **object_paths,
 }
 
 static int mettle_link_object_with_gcc(const char *object_filename,
-                                          const char *executable_filename,
-                                          const char *const *runtime_objects,
-                                          size_t runtime_object_count,
-                                          const CompilerOptions *options) {
-  size_t gcc_len = strlen(object_filename) + strlen(executable_filename) + 192;
+                                        const char *executable_filename,
+                                        const char *const *runtime_objects,
+                                        size_t runtime_object_count,
+                                        const CompilerOptions *options) {
+  size_t link_argument_count = options ? options->link_argument_count : 0u;
+  size_t capacity = 11u + runtime_object_count + link_argument_count;
+  const char **arguments = calloc(capacity, sizeof(*arguments));
+  size_t count = 0u;
+  int result;
+  if (!arguments) {
+    fprintf(stderr, "Error: Failed to allocate GCC arguments\n");
+    return 1;
+  }
+
+  arguments[count++] = "gcc";
+  arguments[count++] = "-nostdlib";
+  arguments[count++] = "-nostartfiles";
+  arguments[count++] = "-nodefaultlibs";
+  arguments[count++] = "-Wl,--disable-runtime-pseudo-reloc";
+  arguments[count++] = "-Wl,-e,mettle_start,--gc-sections";
+  arguments[count++] = object_filename;
   for (size_t i = 0; i < runtime_object_count; i++) {
-    if (runtime_objects[i] && runtime_objects[i][0] != '\0') {
-      gcc_len += strlen(runtime_objects[i]) + 1;
+    if (runtime_objects[i] && runtime_objects[i][0]) {
+      arguments[count++] = runtime_objects[i];
     }
   }
+  arguments[count++] = "-o";
+  arguments[count++] = executable_filename;
+  arguments[count++] = "-lkernel32";
   if (options) {
     for (size_t i = 0; i < options->link_argument_count; i++) {
-      if (options->link_arguments[i]) {
-        gcc_len += strlen(options->link_arguments[i]) + 1;
+      if (options->link_arguments[i] && options->link_arguments[i][0]) {
+        arguments[count++] = options->link_arguments[i];
       }
     }
   }
+  arguments[count] = NULL;
 
-  char *gcc_command = malloc(gcc_len);
-  if (!gcc_command) {
-    fprintf(stderr, "Error: Failed to allocate GCC command\n");
-    return 1;
-  }
-
-  size_t offset = 0;
-  if (!append_argument_text(gcc_command, gcc_len, &offset,
-                            "gcc -nostartfiles ") ||
-      !append_quoted_argument(gcc_command, gcc_len, &offset, object_filename)) {
-    free(gcc_command);
-    fprintf(stderr, "Error: Failed to build GCC object link command\n");
-    return 1;
-  }
-  for (size_t i = 0; i < runtime_object_count; i++) {
-    if (!runtime_objects[i] || runtime_objects[i][0] == '\0') {
-      continue;
-    }
-    if (!append_argument_text(gcc_command, gcc_len, &offset, " ") ||
-        !append_quoted_argument(gcc_command, gcc_len, &offset,
-                                runtime_objects[i])) {
-      free(gcc_command);
-      fprintf(stderr, "Error: Failed to build GCC object link command\n");
-      return 1;
-    }
-  }
-  if (!append_argument_text(gcc_command, gcc_len, &offset, " -o ") ||
-      !append_quoted_argument(gcc_command, gcc_len, &offset,
-                              executable_filename) ||
-      !append_argument_text(gcc_command, gcc_len, &offset, " -lkernel32") ||
-      !append_gcc_link_arguments(gcc_command, gcc_len, &offset, options)) {
-    free(gcc_command);
-    fprintf(stderr, "Error: Failed to build GCC object link command\n");
-    return 1;
-  }
-
-  int result = run_system_command(gcc_command);
-  free(gcc_command);
+  result = mettle_run_process("gcc", arguments);
+  free(arguments);
   if (result != 0) {
     fprintf(stderr, "Warning: GCC object link step failed\n");
     return 1;
@@ -1787,8 +1640,10 @@ static int mettle_link_object_with_link(const char *object_filename,
   }
 
   size_t offset = 0;
-  if (!append_argument_text(link_command, link_len, &offset,
-                            "link.exe /nologo /subsystem:console /out:") ||
+  if (!append_argument_text(
+          link_command, link_len, &offset,
+          "link.exe /nologo /nodefaultlib /entry:mettle_start "
+          "/subsystem:console /out:") ||
       !append_quoted_argument(link_command, link_len, &offset,
                               executable_filename) ||
       !append_argument_text(link_command, link_len, &offset, " ") ||
@@ -1810,7 +1665,7 @@ static int mettle_link_object_with_link(const char *object_filename,
     }
   }
   if (!append_argument_text(link_command, link_len, &offset,
-                            " kernel32.lib msvcrt.lib") ||
+                             " kernel32.lib") ||
       !append_msvc_link_arguments(link_command, link_len, &offset, options)) {
     free(link_command);
     fprintf(stderr, "Error: Failed to build MSVC object link command\n");
@@ -1834,6 +1689,7 @@ static int mettle_link_object_file(const char *object_filename,
       options ? options->linker_mode : LINKER_MODE_AUTO;
   int has_gcc = 0;
   int has_link = 0;
+  char *external_startup_object = NULL;
 
   if (!object_filename || !executable_filename || !runtime_directory) {
     fprintf(stderr, "Error: Missing build inputs for executable generation\n");
@@ -1891,12 +1747,22 @@ static int mettle_link_object_file(const char *object_filename,
    * Stack buffers, so the error paths above/below need no extra frees. */
   char debug_gcc_object[1024];
   char debug_msvc_object[1024];
+  char freestanding_gcc_object[1024];
+  char freestanding_msvc_object[1024];
   int needs_debug = object_needs_debug_runtime(object_filename) ||
                     (options && options->debug_hooks);
   snprintf(debug_gcc_object, sizeof(debug_gcc_object), "%s/debug.o",
            runtime_directory);
   snprintf(debug_msvc_object, sizeof(debug_msvc_object), "%s/debug.obj",
            runtime_directory);
+  snprintf(freestanding_gcc_object, sizeof(freestanding_gcc_object),
+           "%s/freestanding.o", runtime_directory);
+  snprintf(freestanding_msvc_object, sizeof(freestanding_msvc_object),
+           "%s/freestanding.obj", runtime_directory);
+
+  const char *freestanding_object =
+      (_access(freestanding_msvc_object, 0) == 0) ? freestanding_msvc_object
+                                                  : freestanding_gcc_object;
 
   int use_tracy = compiler_options_use_tracy(options);
   int needs_tracy_helpers =
@@ -1911,6 +1777,35 @@ static int mettle_link_object_file(const char *object_filename,
       join_paths(runtime_directory, "tracy_helpers.obj");
   if (!tracy_helpers_gcc_object || !tracy_helpers_msvc_object) {
     fprintf(stderr, "Error: Failed to allocate Tracy build paths\n");
+    free(tracy_helpers_gcc_object);
+    free(tracy_helpers_msvc_object);
+    free(crash_gcc_object);
+    free(crash_msvc_object);
+    free(atomics_gcc_object);
+    free(atomics_msvc_object);
+    free(profile_gcc_object);
+    free(profile_msvc_object);
+    return 1;
+  }
+  if (use_tracy) {
+    fprintf(stderr,
+            "Error: --tracy cannot use the external TracyClient in owned "
+            "runtime mode because it requires a C++ runtime. Use "
+            "--profile-runtime instead.\n");
+    free(tracy_helpers_gcc_object);
+    free(tracy_helpers_msvc_object);
+    free(crash_gcc_object);
+    free(crash_msvc_object);
+    free(atomics_gcc_object);
+    free(atomics_msvc_object);
+    free(profile_gcc_object);
+    free(profile_msvc_object);
+    return 1;
+  }
+  if (_access(freestanding_object, 0) != 0) {
+    fprintf(stderr,
+            "Error: Required freestanding runtime object not found in '%s'\n",
+            runtime_directory);
     free(tracy_helpers_gcc_object);
     free(tracy_helpers_msvc_object);
     free(crash_gcc_object);
@@ -2045,7 +1940,7 @@ static int mettle_link_object_file(const char *object_filename,
 
   if (linker_mode == LINKER_MODE_INTERNAL || linker_mode == LINKER_MODE_AUTO) {
     size_t object_capacity =
-        6u + (use_tracy ? 2u : (needs_tracy_helpers ? 1u : 0u)) +
+        7u + (use_tracy ? 2u : (needs_tracy_helpers ? 1u : 0u)) +
         (options ? options->link_argument_count : 0u);
     const char **object_paths = calloc(object_capacity, sizeof(const char *));
     const char *crash_object = NULL;
@@ -2136,6 +2031,7 @@ static int mettle_link_object_file(const char *object_filename,
       }
 
       object_paths[object_count++] = startup_object;
+      object_paths[object_count++] = freestanding_object;
       object_paths[object_count++] = object_filename;
       if (crash_object) {
         object_paths[object_count++] = crash_object;
@@ -2198,9 +2094,26 @@ static int mettle_link_object_file(const char *object_filename,
     }
   }
 
+  if ((has_gcc && linker_mode != LINKER_MODE_MSVC) ||
+      (has_link && linker_mode != LINKER_MODE_GCC)) {
+    external_startup_object =
+        replace_extension(executable_filename, ".external-startup.obj");
+    if (!external_startup_object ||
+        write_internal_startup_object(
+            external_startup_object, profile_runtime,
+            options && options->generate_stack_trace_support ? 1 : 0,
+            options && options->main_wants_argc_argv ? 1 : 0) != 0) {
+      fprintf(stderr, "Error: Failed to generate external-linker startup object\n");
+      goto cleanup;
+    }
+  }
+
   if (has_gcc && linker_mode != LINKER_MODE_MSVC) {
-    const char *runtime_objects[6] = {NULL, NULL, NULL, NULL, NULL, NULL};
+    const char *runtime_objects[8] = {NULL, NULL, NULL, NULL,
+                                      NULL, NULL, NULL, NULL};
     size_t runtime_object_count = 0u;
+    runtime_objects[runtime_object_count++] = external_startup_object;
+    runtime_objects[runtime_object_count++] = freestanding_gcc_object;
     if (needs_crash) {
       if (_access(crash_gcc_object, 0) != 0) {
         fprintf(stderr,
@@ -2249,8 +2162,11 @@ static int mettle_link_object_file(const char *object_filename,
   }
 
   if (has_link && linker_mode != LINKER_MODE_GCC) {
-    const char *runtime_objects[6] = {NULL, NULL, NULL, NULL, NULL, NULL};
+    const char *runtime_objects[8] = {NULL, NULL, NULL, NULL,
+                                      NULL, NULL, NULL, NULL};
     size_t runtime_object_count = 0u;
+    runtime_objects[runtime_object_count++] = external_startup_object;
+    runtime_objects[runtime_object_count++] = freestanding_object;
     if (needs_crash) {
       const char *crash_object = (_access(crash_msvc_object, 0) == 0)
                                      ? crash_msvc_object
@@ -2317,6 +2233,10 @@ static int mettle_link_object_file(const char *object_filename,
           "Error: Failed to link executable with the available linker backends\n");
 
 cleanup:
+  if (external_startup_object) {
+    _unlink(external_startup_object);
+  }
+  free(external_startup_object);
   tracy_free_artifacts(&tracy_artifacts);
   free(tracy_directory);
   free(tracy_error);
@@ -2377,44 +2297,27 @@ static int add_link_argument(CompilerOptions *options, const char *argument) {
  * visible or its answer is unparseable, in which case the caller keeps the
  * project default (GB10 sm_121a), preserving cross-compile behavior on hosts
  * with no GPU. */
-/* SM count of the local device, for the occupancy report's machine-fill
- * lines. The driver is loaded dynamically so the compiler keeps no link
- * dependency on CUDA; any failure returns 0 and the report simply omits the
- * absolute fill thresholds. */
-#ifdef _WIN32
-void *__stdcall LoadLibraryA(const char *name);
-void *__stdcall GetProcAddress(void *module, const char *name);
-#else
-#include <dlfcn.h>
-#endif
-
 static int detect_gpu_sm_count(void) {
-  int (*cu_init)(unsigned int) = NULL;
-  int (*cu_device_get)(int *, int) = NULL;
-  int (*cu_attribute)(int *, int, int) = NULL;
 #ifdef _WIN32
-  void *cuda = LoadLibraryA("nvcuda.dll");
-  if (!cuda) return 0;
-  cu_init = (int (*)(unsigned int))GetProcAddress(cuda, "cuInit");
-  cu_device_get = (int (*)(int *, int))GetProcAddress(cuda, "cuDeviceGet");
-  cu_attribute =
-      (int (*)(int *, int, int))GetProcAddress(cuda, "cuDeviceGetAttribute");
+  FILE *pipe = _popen(
+      "nvidia-smi --query-gpu=multiprocessor_count --format=csv,noheader 2>nul",
+      "r");
 #else
-  void *cuda = dlopen("libcuda.so.1", RTLD_LAZY);
-  if (!cuda) cuda = dlopen("libcuda.so", RTLD_LAZY);
-  if (!cuda) return 0;
-  cu_init = (int (*)(unsigned int))dlsym(cuda, "cuInit");
-  cu_device_get = (int (*)(int *, int))dlsym(cuda, "cuDeviceGet");
-  cu_attribute = (int (*)(int *, int, int))dlsym(cuda, "cuDeviceGetAttribute");
+  FILE *pipe = popen(
+      "nvidia-smi --query-gpu=multiprocessor_count --format=csv,noheader 2>/dev/null",
+      "r");
 #endif
-  int device = 0;
+  if (!pipe) return 0;
+  char line[64] = {0};
+  const char *read = fgets(line, sizeof(line), pipe);
+#ifdef _WIN32
+  int status = _pclose(pipe);
+#else
+  int status = pclose(pipe);
+#endif
   int count = 0;
-  if (!cu_init || !cu_device_get || !cu_attribute) return 0;
-  if (cu_init(0) != 0) return 0;
-  if (cu_device_get(&device, 0) != 0) return 0;
-  /* 16 = CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT */
-  if (cu_attribute(&count, 16, device) != 0) return 0;
-  return count > 0 ? count : 0;
+  if (!read || status != 0 || sscanf(line, "%d", &count) != 1) return 0;
+  return count > 0 && count < 100000 ? count : 0;
 }
 
 /* --report-occupancy: assemble the just-written PTX with `ptxas -v` and print
@@ -3101,6 +3004,30 @@ int main(int argc, char *argv[]) {
                   host_format == BINARY_TARGET_FORMAT_ELF_ARM64;
 
   if (build_executable) {
+    if (options.musl_link) {
+      fprintf(stderr,
+              "Error: --musl is not available in owned runtime mode because "
+              "Mettle does not link a C library\n");
+      free((void *)options.import_directories);
+      free((void *)options.link_arguments);
+      free(auto_stdlib_directory);
+      free(auto_runtime_directory);
+      return 1;
+    }
+    for (size_t i = 0; i < options.link_argument_count; i++) {
+      if (mettle_link_argument_uses_forbidden_runtime(
+              options.link_arguments[i])) {
+        fprintf(stderr,
+                "Error: --link-arg '%s' names a forbidden C or compiler "
+                "runtime\n",
+                options.link_arguments[i]);
+        free((void *)options.import_directories);
+        free((void *)options.link_arguments);
+        free(auto_stdlib_directory);
+        free(auto_runtime_directory);
+        return 1;
+      }
+    }
 #ifndef _WIN32
     if (!elf_build) {
       fprintf(stderr,
@@ -3173,6 +3100,18 @@ int main(int argc, char *argv[]) {
                                      build_output_filename,
                                      auto_runtime_directory, &options);
 #endif
+    if (result == 0) {
+      char ownership_error[256];
+      if (!mettle_verify_owned_executable(build_output_filename,
+                                           ownership_error,
+                                           sizeof(ownership_error))) {
+        fprintf(stderr,
+                "Error: Refusing linked output '%s': %s\n",
+                build_output_filename, ownership_error);
+        remove(build_output_filename);
+        result = 1;
+      }
+    }
     if (result == 0) {
       printf("Built executable '%s'\n", build_output_filename);
     }
@@ -3719,12 +3658,12 @@ int compile_file(const char *input_filename, const char *output_filename,
   } else {
     import_options.stdlib_directory = "stdlib";
   }
-  /* Prefer `<name>.linux.mettle` std variants when targeting native ELF so the
-   * stdlib resolves syscall-based modules on Linux. Mirrors the elf_build check
-   * used elsewhere in main(). */
+  /* Select standard library OS variants from the output target, not the host
+   * that runs the compiler. Both AArch64 modes emit Linux ELF even when a
+   * Windows compiler produces them. */
   import_options.target_is_elf =
-      (binary_target_format_host_default() == BINARY_TARGET_FORMAT_ELF_X64) ? 1
-                                                                            : 0;
+      (options && (options->emit_arm64 || options->emit_arm64_obj)) ||
+      binary_target_format_host_default() == BINARY_TARGET_FORMAT_ELF_X64;
 
   // Auto-inject the standard prelude only when --prelude was specified, and
   // std/alloc when --native-heap was specified (it provides the mettle_heap_*
@@ -4474,8 +4413,9 @@ void print_usage(const char *program_name) {
          "debugger (requires -O0; used by the editor's F5)\n");
   printf("  --native-heap       Route new/malloc/calloc/realloc/free through "
          "the Mettle allocator (std/alloc)\n");
-  printf("  --static            On Linux, link executable statically\n");
-  printf("  --musl              On Linux, link statically with musl-gcc\n");
+  printf("  --static            Accepted for compatibility; owned ELF builds are "
+         "always static\n");
+  printf("  --musl              Rejected; owned runtime builds never link musl\n");
   printf("  --debug-compiler    Track compiler context for internal error reports\n");
   printf("  -h, --help          Show this help message\n");
   printf("\nExamples:\n");

@@ -4,13 +4,20 @@ The standard library lives under `stdlib/`. Modules are imported by path. The `s
 
 ## Platform Support
 
-The compiler and most stdlib modules work on Linux and Windows. libmtlc emits native `elf64` objects on Linux and `win64` (COFF) objects on Windows, with no external assembler. Use `make` to build the toolchain on Linux and macOS; use `build.bat` on Windows.
+The compiler and standard library support Windows x86_64, Linux x86_64, and
+Linux AArch64. libmtlc emits native COFF and ELF64 objects with no external
+assembler. Use `make` on Linux and `build.bat` on Windows.
 
-**Cross-platform modules:** `std/io`, `std/mem`, `std/math`, `std/conv`, and `std/process` use the C runtime and work on both Linux and Windows.
+**Cross platform modules:** `std/io`, `std/mem`, `std/math`, `std/conv`,
+`std/process`, `std/dir`, `std/net`, and `std/thread` bind to Mettle's owned
+runtime and work on Windows and Linux.
 
-**Windows-only:** `std/win32` provides native Win32 bindings, `std/net` provides Winsock2 bindings, `std/thread` provides Win32 threading bindings, and `std/ui` provides a Win32 GUI layer. They do not work on Linux. Programs that import these modules or use `--prelude` (which includes `std/net`) will fail to link on Linux with undefined references to Win32 symbols. For networking/threading on Linux, use `std/net_posix` and `std/thread_posix` respectively.
+**Windows only:** `std/win32` and `std/ui` expose Win32 services. `std/net` and
+`std/thread` select Linux variants through the import resolver when needed.
 
-**Linux/macOS:** `std/net_posix` provides POSIX socket bindings and `std/thread_posix` provides pthread-based threading. These modules require linking with `stdlib/posix_helpers.c`.
+**Linux compatibility:** `std/net_posix` and `std/thread_posix` keep older
+source APIs. Their symbols still come from the owned syscall runtime. They do
+not link a POSIX or pthread library.
 
 ## std/io
 
@@ -18,7 +25,10 @@ Console and file I/O. `puts` writes a null-terminated string and appends a newli
 
 ## std/mem
 
-Memory management. C runtime functions: `malloc`, `calloc`, `realloc`, `free`, `memset`, `memcpy`, `memmove`, `memcmp`. Helpers: `alloc_zeroed` (allocate and zero-initialize), `buf_dup` (allocate and copy a buffer). Use `malloc`/`free` for buffers, C interop, and explicit lifetimes. `new` emits direct zero-initialized `calloc` allocation. See [Heap Allocation](heap-allocation.md).
+Memory management. The owned runtime exports `malloc`, `calloc`, `realloc`,
+`free`, `memset`, `memcpy`, `memmove`, and `memcmp`. Helpers include
+`alloc_zeroed` and `buf_dup`. `new` uses the same owned zeroed allocator. See
+[Heap Allocation](heap-allocation.md).
 
 ## std/math
 
@@ -54,7 +64,8 @@ Accuracy: kernels carry enough terms that truncation error sits below the roundi
 
 ## std/conv
 
-Conversions and character classification. C runtime: `atoi`, `atol`. Digit helpers: `digit_to_char`, `char_to_digit`. Classification: `is_digit`, `is_upper`, `is_lower`, `is_alpha`, `is_alnum`, `is_space`. Case conversion: `to_lower`, `to_upper`. String utilities: `strlen`, `streq`, `strncmp(buf, offset, needle, buf_len)`.
+Conversions and character classification. The owned runtime supplies `atoi`,
+`atol`, and `strlen`. The rest of the module uses Mettle code.
 
 ## std/process
 
@@ -64,7 +75,9 @@ Process control. `exit` terminates the program with an exit code. `rand`, `srand
 
 Native Win32 bindings for Windows-only programs. The module exports prefixed raw bindings such as `Win32_GetLastError`, `Win32_GetStdHandle`, `Win32_WriteFile`, `Win32_GetSystemMetrics`, and `Win32_MessageBoxA`, plus friendlier wrappers such as `win32_last_error`, `win32_stdout`, `win32_write_stdout`, `win32_get_system_metrics`, `win32_tick_count64`, and `win32_sleep_ms`.
 
-The internal PE linker probes common Win32 DLLs directly (`kernel32`, `user32`, `gdi32`, `advapi32`, `ws2_32`, plus the C runtime DLLs), so `mettle --build --emit-obj --linker internal` can call those APIs without a C bridge or import-library link flags. External GCC/MSVC linking may still need the matching `-l...` or `.lib` arguments.
+The internal PE linker probes explicit Win32 DLLs such as `kernel32`, `user32`,
+`gdi32`, `advapi32`, and `ws2_32`. It does not probe C runtime DLLs. External
+linkers still need an import library for any extra OS or vendor DLL.
 
 ## std/ui
 
@@ -141,11 +154,15 @@ See `examples/ui_demo/ui_demo.mettle` for a documentation browser that dynamical
 
 ## std/system
 
-Process spawning. `system(cmd: cstring) -> int32` runs a shell command via the C runtime. Use for invoking mettle, nasm, gcc, git, curl, etc. On Windows invokes cmd.exe; on Linux invokes sh -c.
+Process spawning. `system(cmd: cstring) -> int32` uses the owned process layer.
+It starts `cmd.exe /c` with CreateProcess on Windows and `sh -c` with direct
+process system calls on Linux.
 
 ## std/dir
 
-Directory and file operations. Requires linking `stdlib/dir_helpers.c`. `dir_exists(path: cstring) -> int32` returns 1 if the path is an existing directory. `dir_create(path: cstring) -> int32` creates a directory (returns 0 on success). `file_exists(path: cstring) -> int32` returns 1 if the path is an existing regular file. `getcwd(buf: cstring, size: int32) -> int32` fills `buf` with the current working directory (returns 0 on success). `dir_list_md_files(root_dir, paths_buf, paths_size, max_files) -> int32` recursively lists `.md` files under `root_dir`, writing null-separated relative paths into `paths_buf`. Cross-platform (Windows and Linux).
+Directory and file operations backed by the owned runtime. Directory scans use
+FindFirstFile on Windows and getdents on Linux. No helper source or link flag is
+needed.
 
 ## std/http
 
@@ -170,15 +187,8 @@ For HTTP responses, prefer sending header and body in separate `send_all` calls.
 
 ## std/net_posix
 
-POSIX socket bindings for Linux and macOS. Does not work on Windows. Socket functions are in libc on both platforms; no extra link flags are required for basic sockets. However, this module requires `stdlib/posix_helpers.c` for thread-safe errno access and atomic spin-lock operations.
-
-Link command:
-```bash
-# Linux
-gcc -o myapp output.o stdlib/posix_helpers.c -lpthread
-# macOS  
-gcc -o myapp output.o stdlib/posix_helpers.c
-```
+Compatibility socket bindings for Linux. The names map to the owned socket,
+error, close, and atomic ABI. No helper source or host library is needed.
 
 Constants include address/socket/protocol values (`AF_INET_POSIX`, `SOCK_STREAM_POSIX`, `IPPROTO_TCP_POSIX`) and socket options (`SOL_SOCKET_POSIX`, `SO_REUSEADDR_POSIX`). Note: macOS uses different values for `SOL_SOCKET` (0xFFFF) and `SO_REUSEADDR` (4) than Linux (1 and 2).
 
@@ -207,11 +217,15 @@ Windows Win32 thread primitives. Includes:
 
 ## std/thread_posix
 
-pthread-based threading for Linux and macOS. Includes `pthread_create`, `pthread_join`, mutexes, and atomics. Requires linking with `stdlib/posix_helpers.c` and `-lpthread` on Linux. `pthread_create` accepts a function pointer `fn(cstring) -> cstring` for the thread entry; pass `&my_thread_proc` directly.
+Source compatible thread names for Linux. `pthread_create`, `pthread_join`,
+mutexes, condition variables, sleep, and atomics use owned clone and futex code.
+No pthread library is linked.
 
 ## std/tracy
 
-[Tracy](https://github.com/wolfpld/tracy) real-time profiler bindings. Use `mettle --build --tracy` to compile and link the Tracy client automatically (see `docs/compilation.md`). Without `--tracy`, `mettle --build` still links a no-op stub from `bin/runtime/tracy_helpers.o` when the program references `std/tracy`.
+[Tracy](https://github.com/wolfpld/tracy) ABI bindings. The owned build links a
+local no op helper when code refers to this module. External TracyClient.cpp is
+rejected because it needs a C++ runtime. Use `--profile-runtime` for profiling.
 
 **Zones:** `tracy_zone`, `tracy_zone_colored`, `tracy_zone_on_demand` (respects `tracy_connected()` for on-demand builds). End with `defer tracy_scope_end(z)` (alias of `tracy_zone_end`). Zone text/name/value/color helpers available.
 

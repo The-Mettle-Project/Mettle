@@ -54,12 +54,9 @@ if not defined CC set "CC=gcc"
 if defined METTLE_SKIP_TESTS set "SKIP_TESTS=1"
 if defined METTLE_BACKEND_ONLY set "BACKEND_ONLY=1"
 
-REM METTLE_INTERNAL_ALLOC builds the driver against src\mettle_alloc.c
-REM instead of the platform heap. Set METTLE_NO_INTERNAL_ALLOC=1 to fall
-REM back to malloc (e.g. to attribute a regression). A sanitizer build needs
-REM no variable: the allocator detects one and stands down.
-set CFLAGS=-Wall -Wextra -std=c99 -g -O2 -D_GNU_SOURCE -Isrc -Iinclude -fno-omit-frame-pointer
-if not defined METTLE_NO_INTERNAL_ALLOC set "CFLAGS=%CFLAGS% -DMETTLE_INTERNAL_ALLOC"
+REM Every source file binds to the owned host ABI through host_redirect.h.
+set CFLAGS=-Wall -Wextra -std=c99 -g -O2 -D_GNU_SOURCE -Isrc -Iinclude -fno-omit-frame-pointer -ffreestanding -fno-builtin -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -include src/runtime/host_redirect.h
+set RUNTIME_CFLAGS=-std=c99 -O2 -D_GNU_SOURCE -Isrc -ffreestanding -fno-builtin -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -mno-stack-arg-probe -ffunction-sections -fdata-sections
 if /I "%CC%"=="clang" set "CFLAGS=%CFLAGS% -D_CRT_NONSTDC_NO_DEPRECATE -D_CRT_SECURE_NO_WARNINGS"
 REM Release builds stamp the version via METTLE_VERSION (e.g. set by release.yml);
 REM dev builds fall back to the default in main.c.
@@ -218,36 +215,42 @@ echo Compiling debug info...
 %CC% %CFLAGS% -c src\debug\debug_info.c -o obj\debug\debug_info.o
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
+echo Compiling required freestanding program runtime...
+%CC% %RUNTIME_CFLAGS% -c src\runtime\freestanding.c -o obj\runtime\freestanding.o
+if %ERRORLEVEL% NEQ 0 exit /b 1
+
+echo Compiling owned host runtime and startup...
+%CC% %RUNTIME_CFLAGS% -include src/runtime/host_prefix.h -c src\runtime\freestanding.c -o obj\runtime\host_runtime.o
+if %ERRORLEVEL% NEQ 0 exit /b 1
+%CC% %RUNTIME_CFLAGS% -c src\runtime\host_startup.c -o obj\runtime\host_startup.o
+if %ERRORLEVEL% NEQ 0 exit /b 1
+
 REM The language runtime, the Tracy shim and the driver's allocator all belong
 REM to the frontend side; skip them for a backend-only build.
 if defined BACKEND_ONLY goto compile_diagnostics
 
 echo Compiling crash-handler runtime (opt-in: -d / -s / -g / IR trap)...
-%CC% %CFLAGS% -c src\runtime\crash_handler.c -o obj\runtime\crash_handler.o
+%CC% %RUNTIME_CFLAGS% -c src\runtime\crash_handler.c -o obj\runtime\crash_handler.o
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
 echo Compiling atomics helpers (opt-in: std/thread)...
-%CC% %CFLAGS% -c src\runtime\atomics.c -o obj\runtime\atomics.o
+%CC% %RUNTIME_CFLAGS% -DMETTLE_ATOMICS_IN_FREESTANDING -c src\runtime\atomics.c -o obj\runtime\atomics.o
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
 echo Compiling profile runtime (opt-in: --profile-runtime)...
-%CC% %CFLAGS% -c src\runtime\profile.c -o obj\runtime\profile.o
+%CC% %RUNTIME_CFLAGS% -c src\runtime\profile.c -o obj\runtime\profile.o
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
 echo Compiling debug runtime (opt-in: --debug-hooks)...
-%CC% %CFLAGS% -c src\runtime\debug.c -o obj\runtime\debug.o
+%CC% %RUNTIME_CFLAGS% -c src\runtime\debug.c -o obj\runtime\debug.o
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
 echo Compiling Tracy helper stubs (opt-in: std/tracy without --tracy)...
-%CC% %CFLAGS% -c stdlib\tracy_helpers.c -o obj\runtime\tracy_helpers.o
+%CC% %RUNTIME_CFLAGS% -c stdlib\tracy_helpers.c -o obj\runtime\tracy_helpers.o
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
 echo Compiling Tracy build support...
 %CC% %CFLAGS% -c src\tracy_build.c -o obj\tracy_build.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-echo Compiling allocator...
-%CC% %CFLAGS% -c src\mettle_alloc.c -o obj\mettle_alloc.o
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
 :compile_diagnostics
@@ -272,6 +275,10 @@ if %ERRORLEVEL% NEQ 0 exit /b 1
 %CC% %CFLAGS% -c src\mtlc_build.c -o obj\mtlc_build.o
 if %ERRORLEVEL% NEQ 0 exit /b 1
 %CC% %CFLAGS% -c src\mtlc_lib_fallbacks.c -o obj\mtlc_lib_fallbacks.o
+if %ERRORLEVEL% NEQ 0 exit /b 1
+%CC% %CFLAGS% -c src\mtlc_crash_fallback.c -o obj\mtlc_crash_fallback.o
+if %ERRORLEVEL% NEQ 0 exit /b 1
+%CC% %CFLAGS% -c src\runtime\verify_owned.c -o obj\runtime\verify_owned.o
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
 if defined BACKEND_ONLY goto archive_libmtlc
@@ -319,26 +326,56 @@ REM The diagnostics reporter is frontend-neutral (raw source text + SourceLocati
 REM no AST) and the backend comptime interpreter reports through it -> libmtlc.
 %AR% rcs bin\mtlc.lib obj\error\error_reporter.o
 for %%o in (obj\compiler\*.o) do %AR% rcs bin\mtlc.lib %%o
-%AR% rcs bin\mtlc.lib obj\common.o obj\mtlc_api.o obj\mtlc_build.o obj\mtlc_lib_fallbacks.o
+%AR% rcs bin\mtlc.lib obj\common.o obj\mtlc_api.o obj\mtlc_build.o obj\mtlc_lib_fallbacks.o obj\mtlc_crash_fallback.o obj\runtime\verify_owned.o
+%AR% rcs bin\mtlc.lib obj\runtime\host_runtime.o
 if not exist bin\mtlc.lib (
     echo Build failed: bin\mtlc.lib was not created.
+    exit /b 1
+)
+ld -r --disable-runtime-pseudo-reloc --whole-archive bin\mtlc.lib --no-whole-archive -o obj\runtime\libmtlc-closure.o
+if errorlevel 1 (
+    echo Build failed: could not compute the libmtlc symbol closure.
+    exit /b 1
+)
+nm -u obj\runtime\libmtlc-closure.o | findstr /V /C:"__imp_" >nul
+if not errorlevel 1 (
+    echo Build failed: libmtlc contains unresolved non-OS symbols.
+    nm -u obj\runtime\libmtlc-closure.o
+    exit /b 1
+)
+nm -u obj\runtime\libmtlc-closure.o | findstr /I /R /C:"__imp_malloc$" /C:"__imp_calloc$" /C:"__imp_realloc$" /C:"__imp_free$" /C:"__imp_memcpy$" /C:"__imp_memset$" /C:"__imp_printf$" /C:"__imp_fprintf$" /C:"__imp_strtod$" /C:"msvcrt" /C:"ucrt" /C:"vcruntime" /C:"libgcc" /C:"libwinpthread" >nul
+if not errorlevel 1 (
+    echo Build failed: libmtlc imports a C or compiler runtime symbol.
+    nm -u obj\runtime\libmtlc-closure.o
     exit /b 1
 )
 
 REM A backend-only build is done here: the archive plus include\mtlc is
 REM everything a frontend links against.
 if defined BACKEND_ONLY (
+    if exist bin\runtime rmdir /S /Q bin\runtime
+    xcopy src\runtime bin\runtime\ /E /I /Y >nul
+    copy /Y obj\runtime\freestanding.o bin\runtime\freestanding.o >nul
+    copy /Y obj\runtime\freestanding.o bin\runtime\freestanding.obj >nul
     echo.
     echo libmtlc built: bin\mtlc.lib
     echo   headers: include\mtlc ^(public API^), src ^(backend internals^)
+    echo   runtime: bin\runtime\freestanding.obj
     exit /b 0
 )
 
 echo Linking mettle ^(reference frontend^) against libmtlc...
-%CC% obj\lexer\lexer.o obj\parser\ast.o obj\parser\parser.o obj\semantic\symbol_table.o obj\semantic\type_checker.o obj\semantic\type_checker_types.o obj\semantic\type_checker_errors.o obj\semantic\type_checker_safety.o obj\semantic\type_checker_init_tracker.o obj\semantic\type_checker_decl.o obj\semantic\type_checker_match.o obj\semantic\type_checker_stmt.o obj\semantic\type_checker_expr.o obj\semantic\type_checker_aggregate.o obj\semantic\type_checker_tensor_epilogue.o obj\semantic\type_checker_memory.o obj\semantic\register_allocator.o obj\semantic\import_resolver.o obj\semantic\monomorphize.o obj\ir\ir_lowering.o obj\ir\ir_lower_address.o obj\ir\ir_lower_defer.o obj\ir\ir_lower_expr.o obj\ir\ir_lower_stmt.o obj\ir\ir_lower_support.o obj\ir\ir_lower_switch_match.o obj\ir\ir_lower_types.o obj\frontend\mtlc_type_from_frontend.o obj\frontend\mtlc_lower_module.o obj\error\error_explain.o obj\runtime\crash_handler.o obj\tracy_build.o obj\mettle_alloc.o obj\main.o bin\mtlc.lib -static -o bin\mettle.exe %LDFLAGS%
+set "LDFLAGS=%LDFLAGS% -Wl,--disable-runtime-pseudo-reloc"
+%CC% -nostdlib -nostartfiles -nodefaultlibs -Wl,--entry,mettle_start -Wl,--subsystem,console obj\runtime\host_startup.o obj\lexer\lexer.o obj\parser\ast.o obj\parser\parser.o obj\semantic\symbol_table.o obj\semantic\type_checker.o obj\semantic\type_checker_types.o obj\semantic\type_checker_errors.o obj\semantic\type_checker_safety.o obj\semantic\type_checker_init_tracker.o obj\semantic\type_checker_decl.o obj\semantic\type_checker_match.o obj\semantic\type_checker_stmt.o obj\semantic\type_checker_expr.o obj\semantic\type_checker_aggregate.o obj\semantic\type_checker_tensor_epilogue.o obj\semantic\type_checker_memory.o obj\semantic\register_allocator.o obj\semantic\import_resolver.o obj\semantic\monomorphize.o obj\ir\ir_lowering.o obj\ir\ir_lower_address.o obj\ir\ir_lower_defer.o obj\ir\ir_lower_expr.o obj\ir\ir_lower_stmt.o obj\ir\ir_lower_support.o obj\ir\ir_lower_switch_match.o obj\ir\ir_lower_types.o obj\frontend\mtlc_type_from_frontend.o obj\frontend\mtlc_lower_module.o obj\error\error_explain.o obj\tracy_build.o obj\main.o bin\mtlc.lib -o bin\mettle.exe -lkernel32 -ldbghelp %LDFLAGS%
 
 if %ERRORLEVEL% NEQ 0 (
     echo Build failed!
+    exit /b 1
+)
+objdump -p bin\mettle.exe | findstr /I /C:"msvcrt" /C:"ucrt" /C:"vcruntime" /C:"api-ms-win-crt" /C:"libgcc" /C:"libwinpthread" >nul
+if %ERRORLEVEL% EQU 0 (
+    echo Build failed: bin\mettle.exe imports a forbidden C or compiler runtime.
+    objdump -p bin\mettle.exe | findstr /I "DLL Name"
     exit /b 1
 )
 
@@ -349,6 +386,10 @@ xcopy stdlib bin\stdlib\ /E /I /Y >nul
 echo Bundling runtime into bin\runtime...
 if exist bin\runtime rmdir /S /Q bin\runtime
 xcopy src\runtime bin\runtime\ /E /I /Y >nul
+copy /Y obj\runtime\freestanding.o bin\runtime\freestanding.o >nul
+copy /Y obj\runtime\freestanding.o bin\runtime\freestanding.obj >nul
+copy /Y obj\runtime\host_startup.o bin\runtime\host_startup.o >nul
+copy /Y obj\runtime\host_startup.o bin\runtime\host_startup.obj >nul
 copy /Y obj\runtime\crash_handler.o bin\runtime\crash_handler.o >nul
 copy /Y obj\runtime\crash_handler.o bin\runtime\crash_handler.obj >nul
 copy /Y obj\runtime\atomics.o bin\runtime\atomics.o >nul

@@ -1,0 +1,28 @@
+// Directory API gate for the owned Windows and Linux runtime.
+
+import "std/dir";
+import "std/io";
+
+fn main() -> int32 {
+  if (dir_exists("docs") == 0) {
+    println("DIR OWNED FAIL: dir");
+    return 1;
+  }
+  if (file_exists("docs/runtime-model.md") == 0) {
+    println("DIR OWNED FAIL: file");
+    return 1;
+  }
+  var current: uint8[1024];
+  if (getcwd(&current[0], 1024) != 0) {
+    println("DIR OWNED FAIL: cwd");
+    return 1;
+  }
+  var paths: uint8[16384];
+  var count: int32 = dir_list_md_files("docs", &paths[0], 16384, 128);
+  if (count <= 0) {
+    println("DIR OWNED FAIL: list");
+    return 1;
+  }
+  println("DIR OWNED OK");
+  return 0;
+}

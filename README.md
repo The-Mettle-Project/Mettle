@@ -139,7 +139,7 @@ The backend carries no dependency on the Mettle frontend, and three suite gates 
 
 - **`libmtlc_selfcontained`** fails the build if the archive's external symbol closure reaches into frontend or driver code.
 - **`calc_frontend`** builds a second, non-Mettle frontend, [`examples/calc`](examples/calc/) (a tiny C-like language in one file), against the library alone and runs the executable it produces.
-- **`public_api`** drives the full public API through globals, extern libc calls, pointer memory, casts, and all four targets, then runs the native result.
+- **`public_api`** drives the full public API through globals, owned runtime calls, pointer memory, casts, and all four targets, then runs the native result.
 
 ## The Mettle frontend
 

@@ -31,8 +31,12 @@ Available topics: `build`, `runtime` (aliases `heap`, `gc`), `interop`, `stdlib`
 
 ## Options
 
-`-o <file>` output object file (default `output.obj` / `output.o`, or executable path when used with `--build`). `-i <file>` input file (alternative to positional argument). `-I <dir>` add import search directory (repeatable). `--stdlib <dir>` set stdlib root (default auto-detects bundled stdlib near the compiler binary, then falls back to `./stdlib`). `--build` build a native executable: Windows uses a COFF object + the internal PE linker by default; Linux emits an ELF object and links it with `gcc -no-pie`. `--static` adds static Linux linking, and `--musl` uses `musl-gcc -static`. `--emit-obj` emit a native object (the default). `--linker <internal|auto|gcc|msvc>` choose the Windows linker path (**default: `internal`**). `--link-arg <arg>` pass an extra linker argument in `--build` mode for additional DLLs/import libraries. `--tracy` link `std/tracy` with the Tracy profiler (requires `--build`; set `TRACY_DIR` or `--tracy-dir`). `--tracy-dir <dir>` Tracy repo root for `--tracy`. `--prelude` auto-import `std/prelude` (std/io, std/math, std/conv, std/mem, std/process, std/net). `-d`/`--debug` debug mode and embedded runtime crash traceback support. `-g`/`--debug-symbols` generate debug symbols. `-l`/`--line-mapping` source line mapping. `-s`/`--stack-trace` embeds runtime crash traceback support without the rest of debug mode. `-O`/`--optimize` enable optimizations. `-r`/`--release` enables `-O`, removes unreachable functions, and disables generated runtime null/bounds checks in IR lowering. `--profile-runtime` emit function-level runtime timing hooks and print a sorted report at process exit. `--emit-ptx` compile each function to an NVIDIA PTX `.entry` (the GPU backend) instead of a native object; see [GPU Offload](gpu.md). `--emit-spirv` compile each function to a SPIR-V `Kernel` entry point (OpenCL 2.0 environment) instead of a native object; see [GPU Offload](gpu.md). `--simd-report` (with `-O`/`--release`) print a note for every `@simd` loop saying whether it vectorized and into which kernel. `--explain` (with `-O`/`--release`) print a grouped optimization report for the main input file; `--explain=SELECTOR` narrows it to `missed`, `fixable`, `proven`, `loops`, `calls`, one function, or one decision code. Per loop: vectorized (into which instruction-level kernel, e.g. `vfmadd231ps, 8-wide float32`) or `NOT vectorized` with a `└ reason:` and, when actionable, a `└ fix:` line; per call: inlined or not, with the same reason/fix treatment; loop nests are summarized (`vectorized inner, scalar outer`); a final backend section shows which functions got the register-allocating backend vs baseline codegen and why. No annotations required; remarks from imported modules are filtered out. `-h`/`--help` print usage. See [Imports](imports.md) for path resolution and `-I`/`--stdlib` details.
+`-o <file>` output object file (default `output.obj` / `output.o`, or executable path when used with `--build`). `-i <file>` input file (alternative to positional argument). `-I <dir>` add import search directory (repeatable). `--stdlib <dir>` set the stdlib root (default: bundled stdlib, then `./stdlib`). `--build` builds a native executable with Mettle's startup and owned runtime. Windows uses COFF and the internal PE linker by default. Linux emits a static ELF executable. `--static` is a compatible no op. `--musl` is rejected. `--emit-obj` emits a native object. `--emit-arm64` emits a direct self contained AArch64 Linux image. `--emit-arm64-obj` emits an AArch64 Linux object for the full owned runtime link path. `--linker <internal|auto|gcc|msvc>` selects the Windows linker path. `--link-arg <arg>` passes an extra linker argument, subject to the owned runtime dependency gate. `--tracy` is rejected because external Tracy needs a C++ runtime. Use `--profile-runtime` instead. `--prelude` imports `std/prelude`. `-d`, `-g`, `-l`, and `-s` control debug output, symbols, line maps, and crash traces. `-O` and `--release` enable optimization. `--emit-ptx` and `--emit-spirv` emit GPU modules. `--simd-report` and `--explain` report optimizer choices. `-h` and `--help` print usage. See [Imports](imports.md) for import paths and stdlib selection.
 <!-- Target-qualified device/native modes. -->
+Runtime rule: every native build supplies Mettle's startup and freestanding
+runtime. Linux output is always static. `--static` is a compatible no op.
+`--musl` and `--tracy` fail because they would add a C or C++ runtime.
+
 GPU/native target qualification: `--emit-ptx` and `--emit-spirv` emit only
 functions declared with `kernel`; ordinary `fn` declarations are not entry
 points. Without `--gpu-arch`, PTX targets the local GPU (compute capability
@@ -44,8 +48,8 @@ onward); with no visible GPU it falls back to PTX 8.8 / `sm_121a` for GB10. Use
 (`0` uses the architecture default), allowing an external measurement harness
 to compare resident and exact-replay variants without changing source or shared
 IR. Native Linux object/build
-emission supports x86-64 and AArch64: Arm uses ELF64/AAPCS64 and the system
-`gcc -no-pie` link contract. The explicit `--emit-arm64` command is the older
+emission supports x86-64 and AArch64. Arm uses ELF64 and AAPCS64 with owned
+startup and service code. The explicit `--emit-arm64` command is the older
 self-contained smoke product, not the normal native object path.
 
 ## Compilation Pipeline
@@ -81,7 +85,12 @@ The AST and symbol/type metadata intern name-bearing strings (identifier names, 
 2. Optional extra libraries: `mettle --build main.mettle -o main.exe --link-arg -lcustomdll`
 3. External linker fallback: `mettle --build --linker auto main.mettle -o main.exe`
 
-`--build` keeps compilation inside Mettle's COFF object emitter, bundled runtime objects, and internal PE linker. That path does not require `NASM`, `gcc`, or `link.exe` for the target executable. The internal linker probes common Win32 DLLs directly (`kernel32`, `user32`, `gdi32`, `advapi32`, `ws2_32`, `ucrtbase`, and `msvcrt`), so `std/win32`, `std/thread`, and `std/net` work without hand-written C bridge objects or default import-library flags. `--linker auto` tries the internal linker first and falls back to external linkers if needed. Four optional helper objects ship with the Mettle installation: `crash_handler.o` (linked only for `-d`/`-s`/`-g` or IR null/bounds traps), `atomics.o` (linked only when `std/thread` interlocked atomics are referenced), `profile.o` (linked when `--profile-runtime` is used), and `tracy_helpers.o` (no-op stub when `std/tracy` is referenced without `--tracy`). `--build` pulls them in automatically when needed.
+`--build` keeps compilation inside Mettle's COFF object emitter, owned runtime,
+and internal PE linker. That path needs no target C toolchain. The linker probes
+Win32 DLLs such as `kernel32`, `user32`, `gdi32`, `advapi32`, and `ws2_32`.
+It never probes a C runtime DLL. `--linker auto` may use GCC or link.exe as a
+linker only. Both fallback paths disable default startup and libraries.
+Optional crash, profile, debug, and atomic code uses the same owned ABI.
 
 ### Linux Flow
 
@@ -91,11 +100,19 @@ On Linux, `--build` uses the native ELF backend end to end:
 mettle --build main.mettle -o main
 ```
 
-The compiler emits an ELF object, then links it with the platform C toolchain (`gcc -no-pie` by default). The Linux linker path automatically includes bundled helper objects for POSIX shims, atomics, stack tracebacks, and runtime profiling when the generated object references them. `--static` switches to `gcc -static`; `--musl` switches to `musl-gcc -static`.
+The compiler emits an ELF object and links it with `ld` plus Mettle's startup
+and freestanding runtime. If it needs GCC to parse extra linker arguments, it
+uses GCC only as a driver with all startup and default libraries disabled.
+The result is a static `ET_EXEC` file with no interpreter or dynamic section.
 
 The Linux path supports the syscall-backed standard-library variants (`*.linux.mettle`), runtime stack traces (`-d`/`-s`), `--profile-runtime`, and embedded DWARF sections in ELF objects.
 
 ### Tracy profiling (`--tracy`)
+
+Owned runtime mode rejects external Tracy because TracyClient.cpp needs a C++
+runtime. Use `--profile-runtime`, which ships as owned runtime code. The old
+Tracy setup text below applies only to unsupported custom builds that relax the
+owned runtime rule.
 
 Build with live Tracy instrumentation (compiles `stdlib/tracy_helpers.c` and `TracyClient.cpp` from your Tracy repo):
 
@@ -199,7 +216,9 @@ Omit either object when the corresponding symbols are not referenced.
 
 For concurrency, import `std/thread` (Windows) or `std/thread_posix` and call `CreateThread`/`pthread_create` directly. Mettle has no built-in `async`/`spawn`/`Channel<T>` keywords.
 
-**Programs with `main(argc, argv)`:** If your entry point has the signature `fn main(argc: int32, argv: cstring*) -> int32`, Windows startup calls CRT `__getmainargs` before `main`. No Mettle argv shim is required.
+**Programs with `main(argc, argv)`:** If your entry point has the signature
+`fn main(argc: int32, argv: cstring*) -> int32`, the owned startup parses the
+Windows command line or reads the initial Linux process stack before `main`.
 
 ## Compiler Diagnostics
 
@@ -333,9 +352,9 @@ concrete answer. The `help:` line gives it rather than restating the error:
 
 ## Runtime Crash Tracebacks
 
-Compile with `-s` or `-d` to embed runtime crash traceback support in the generated program. This adds failure-path-only metadata for Mettle function names and source locations and installs a crash handler at program startup. The crash handler is **cross-platform**: Windows uses a Structured Exception Handler, and POSIX (Linux/macOS) uses a `sigaction` handler running on an alternate signal stack. Both produce the same symbolized stack-trace format from the same embedded debug-info tables.
+Compile with `-s` or `-d` to embed runtime crash traceback support in the generated program. This adds failure path metadata for Mettle function names and source locations and installs the owned crash handler at startup. Windows uses the Windows exception API. Linux uses raw signal syscalls. Both produce the same stack trace format from the same embedded tables.
 
-On the default **`--build` (direct COFF) path**, `-s` works without NASM: the compiler embeds `mettle_debug_functions` / `mettle_debug_locations` in the object, emits a `mettle_crash_startup` helper that calls `mettle_crash_install` and `mettle_crash_register_image`, and the internal linker's `mainCRTStartup` calls `mettle_crash_startup` before `main`. IR null/bounds traps call `mettle_crash_trap` when `-s` is active (otherwise they use `puts`/`exit` with no backtrace). Example:
+On the default `--build` path, `-s` works without an assembler. The compiler embeds `mettle_debug_functions` and `mettle_debug_locations`, then Mettle's own entry calls `mettle_crash_startup` before `main`. IR null and bounds traps call `mettle_crash_trap` when `-s` is active. Example:
 
 ```powershell
 mettle --build -s tests\test_runtime_null_deref_check.mettle -o demo.exe
@@ -352,7 +371,9 @@ Stack trace:
 - `-d` enables debug output and also implies embedded runtime crash tracebacks.
 - `--release` still disables generated null/bounds runtime checks, so only native crashes remain traceable there.
 
-A fatal fault prints the exception/signal, the faulting address (with a hint when it is a null-pointer dereference), and a symbolized stack trace. Compiler-generated null-dereference and array-bounds traps print the same traceback shape. Frames without registered Mettle debug info (libc/CRT) show as `<unknown>`, the same on both platforms.
+A fatal fault prints the exception or signal, the faulting address, and a
+symbolized stack trace. Compiler generated null and bounds traps print the same
+shape. Frames outside registered Mettle debug info show as `<unknown>`.
 
 Windows example (native access violation):
 

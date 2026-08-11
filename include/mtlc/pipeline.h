@@ -60,12 +60,10 @@ int mtlc_emit_object(MtlcContext *ctx, MtlcModule *module, const char *path);
 int mtlc_emit(MtlcContext *ctx, MtlcModule *module, MtlcArch arch,
               const char *path);
 
-/* Compile the module all the way to a native executable at `output_path`: emit
- * a temporary object, synthesize the C-runtime startup that calls the program's
- * `main`, and link. On Windows this uses libmtlc's own internal PE linker
- * (imports resolved by DLL name -- no external toolchain); on ELF hosts it
- * invokes the system C compiler to link the object. Returns 1 on success, 0 on
- * error. */
+/* Compile the module to a native executable at `output_path`. The context must
+ * name libmtlc's runtime directory with mtlc_context_set_runtime_directory.
+ * The result uses Mettle startup, allocation, memory, and I/O code. It never
+ * links a C runtime. Returns 1 on success and 0 on error. */
 int mtlc_build_executable(MtlcContext *ctx, MtlcModule *module,
                           const char *output_path);
 

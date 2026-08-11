@@ -65,8 +65,9 @@ Three mechanisms, all enforced by the suite:
 3. **The audit gate.** `libmtlc_selfcontained` in `tests/run_tests.ps1`
    computes the archive's external symbol closure with `nm` (undefined minus
    defined across all members) and fails if anything in it matches the
-   project's naming conventions. The allowed remainder is libc, kernel32-level
-   Win32 imports, and compiler intrinsics.
+   project's naming conventions. The current build also combines the whole
+   archive. Linux permits only the linker supplied GOT marker. Windows permits
+   only explicit OS imports.
 
 Two more gates prove the positive direction: `calc_frontend` builds and runs a
 non-Mettle frontend against the archive alone, and `public_api` drives the
@@ -83,14 +84,14 @@ full builder surface to all four targets.
   are immortal by construction; the reference frontend's translation arena
   outlives its compile.
 - **Per-compile mutable state is thread-local.** The compiler session context
-  uses FLS/pthread keys; the explain/annotate diagnostic sinks and the
+  uses owned FLS or native TLS; the explain/annotate diagnostic sinks and the
   pointer-type intern cache use `MTLC_THREAD_LOCAL` (`common.h`). The rule for
   new code: a mutable file-scope variable in the archive must be thread-local
   or it is a bug. This is what lets two frontends compile concurrently on
   separate threads.
-- **The driver's `-static` link.** On MinGW, `__thread` pulls a libwinpthread
-  DLL dependency; the reference driver links `-static` so `mettle.exe` stays
-  a single file. Frontends linking the archive make their own choice.
+- **Owned thread local storage.** The Windows runtime implements the compiler
+  emulated TLS ABI with FLS. Linux startup and clone paths install each thread
+  pointer. Frontends do not select another thread runtime.
 
 ## The x86-64 path in one paragraph
 

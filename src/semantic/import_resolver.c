@@ -8,6 +8,7 @@
 #include "../parser/parser.h"
 #include "../string_intern.h"
 #include "../common.h"
+#include "../runtime/owned.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,17 +36,10 @@ static char *canonicalize_path(const char *path) {
   if (!path) {
     return NULL;
   }
-#ifdef _WIN32
-  char *full = _fullpath(NULL, path, 0);
+  char *full = mettle_realpath(path, NULL);
   if (full) {
     return full;
   }
-#else
-  char *full = realpath(path, NULL);
-  if (full) {
-    return full;
-  }
-#endif
   return strdup(path);
 }
 
@@ -3213,16 +3207,12 @@ static void process_import_strs_in_node(ImportContext *ctx, ASTNode *node,
 }
 
 // A guarded import (`import "..." if windows|linux;`) is included only when its
-// platform matches the build target. The compiler targets its host, so the
-// active platform follows the host object format (ELF => linux, else windows).
-static int import_platform_matches(const char *guard) {
+// platform matches the requested output target.
+static int import_platform_matches(const char *guard, int target_is_elf) {
   if (!guard) {
     return 1; // unconditional import
   }
-  const char *target =
-      (binary_target_format_host_default() == BINARY_TARGET_FORMAT_ELF_X64)
-          ? "linux"
-          : "windows";
+  const char *target = target_is_elf ? "linux" : "windows";
   return strcmp(guard, target) == 0;
 }
 
@@ -3265,7 +3255,9 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
 
       // Drop imports guarded for a different platform before resolving them,
       // so a platform-specific module is never even looked up off-target.
-      if (!import_platform_matches(import_decl->platform_guard)) {
+      if (!import_platform_matches(
+              import_decl->platform_guard,
+              ctx && ctx->options && ctx->options->target_is_elf)) {
         ast_destroy_node(decl);
         continue;
       }

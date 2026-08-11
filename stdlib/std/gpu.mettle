@@ -55,11 +55,11 @@ export extern fn cuGraphExecDestroy(exec: int64) -> int32 = "cuGraphExecDestroy"
 export extern fn cuGraphDestroy(graph: int64) -> int32 = "cuGraphDestroy";
 extern fn __mtlc_gpu_process_exit(code: int32) = "exit";
 // Diagnostics for the typed-dispatch failures below, declared here rather than
-// imported so this module keeps depending on nothing but the driver and libc.
+// imported so this module depends only on the driver and Mettle's runtime.
 extern fn __mtlc_gpu_fputs(text: cstring, stream: cstring) -> int32 = "fputs";
 extern fn __mtlc_gpu_iob(index: int32) -> cstring = "__acrt_iob_func";
 
-// std/gpu depends on the driver and libc only, so it converts its own string
+// std/gpu depends on the driver and Mettle's runtime, so it converts its string
 // literals rather than importing std/io for cstr.
 fn __mtlc_gpu_cstr(s: string) -> cstring { return s.chars; }
 

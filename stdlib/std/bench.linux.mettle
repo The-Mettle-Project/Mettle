@@ -1,7 +1,7 @@
 // High-resolution timing for benchmarks (native ELF / Linux).
 //
-// Linux counterpart to std/bench. Uses libc clock_gettime(CLOCK_MONOTONIC)
-// instead of Windows' QueryPerformanceCounter. The import resolver picks this
+// Linux counterpart to std/bench. Uses the owned clock_gettime ABI, which
+// issues the Linux clock syscall. The import resolver picks this
 // file over bench.mettle automatically on the native ELF target, so
 // `import "std/bench"` works unchanged on both platforms.
 

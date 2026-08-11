@@ -161,11 +161,11 @@ false when FCMP reports unordered, as IEEE-754 requires of any comparison with
 NaN. A function's address, which a branch displacement cannot express, comes
 from page/lo12 relocations against the function symbol.
 
-The driver's explicit `--emit-arm64` option retains the self-contained `_start`
-executable for assembler-free and linker-free bring-up; ordinary AArch64 Linux
-object/build commands use the relocatable path. Having no libc, the
-self-contained form carries a fixed-address writable segment for module globals
-and emits freestanding syscall-based stubs (bump-pointer `malloc`/`calloc`/
+The driver's explicit `--emit-arm64` option retains the compact `_start`
+executable for assembler free and linker free tests. Ordinary AArch64 Linux
+object and build commands use the relocatable path plus the full owned runtime.
+The compact form carries a fixed address writable segment for module globals
+and emits syscall based stubs (bump pointer `malloc`/`calloc`/
 `free`, `puts`, `putchar`, `write`, `strlen`, `memcpy`, `memmove`, `memset`,
 `exit`, `abort`) for the calls it cannot defer to a linker.
 
@@ -354,23 +354,22 @@ temporaries.
 
 **Windows (the internal PE linker).** No external toolchain and no Windows SDK:
 
-1. A startup object is generated in memory code, exporting `mainCRTStartup`:
-   it initializes the C runtime arguments (via `__getmainargs` when `main`
-   wants `argc/argv`), calls `main`, and exits with its result.
+1. A startup object exports `mettle_start`. It initializes the owned runtime,
+   parses arguments when needed, calls `main`, and exits through Kernel32.
 2. `link_resolution_build` merges the startup and program objects, resolving
-   symbols with `mainCRTStartup` as the entry.
-3. `pe_emit_executable` writes the PE image, building the import table **by
-   DLL name** from `kernel32.dll`, `ucrtbase.dll`, and `msvcrt.dll`; an
-   undefined symbol that any of those exports becomes an import. That is why
-   extern `malloc`/`putchar`/`printf` need no import libraries.
+   symbols with `mettle_start` as the entry.
+3. `pe_emit_executable` writes the PE image. Owned runtime names resolve from
+   bundled objects. OS externs resolve from explicit Win32 DLLs. A final import
+   audit rejects C and compiler runtime DLL names.
 
 The Mettle driver's `--build` uses the same linker with a wider default DLL
 set and user-supplied `--link-arg` libraries; the library entry point keeps
 the minimal set.
 
-**ELF hosts.** The object is linked with the system C compiler
-(`cc -no-pie <obj> -o <out>`), which supplies crt startup and libc. The same
-contract is used for x86-64 and AArch64 Linux objects.
+**ELF hosts.** The object links with Mettle's `_start` and freestanding runtime.
+The direct path uses `ld`. A GCC fallback disables its startup and all default
+libraries. The output must be static `ET_EXEC` with no interpreter or dynamic
+section. The same rule covers x86_64 and AArch64 Linux objects.
 
 ## Verifying the pipeline
 

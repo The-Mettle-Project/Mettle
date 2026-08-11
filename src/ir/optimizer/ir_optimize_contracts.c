@@ -35,7 +35,7 @@ static int noalloc_name_is_allocator(const char *name) {
   return 0;
 }
 
-/* Externs we KNOW don't allocate: libc math, raw memory/string inspection,
+/* Externs known not to allocate: owned math, raw memory and string inspection,
  * and the compiler's own trap helpers (they terminate the process). Anything
  * else outside the program is unprovable and therefore a violation. */
 static int noalloc_name_is_known_clean(const char *name) {

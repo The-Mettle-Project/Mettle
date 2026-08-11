@@ -24,9 +24,8 @@
  * immediately. Windows-complete; on other platforms the hooks are no-ops
  * for now. */
 
-/* Use MSVCRT's printf/strtod family directly: MinGW's C99-conformance
- * wrappers (__mingw_snprintf, __mingw_strtod, ...) are static-library code
- * the internal PE linker has no runtime for. Must precede every include. */
+/* Keep MinGW headers from redirecting these calls to compiler library
+ * wrappers. Mettle's owned runtime provides the selected ABI symbols. */
 #if defined(_WIN32) || defined(_WIN64)
 #define __USE_MINGW_ANSI_STDIO 0
 #endif
@@ -41,16 +40,18 @@
 
 #include <windows.h>
 
-/* Route the printf family through MSVCRT's _vsnprintf (declared by the
- * headers), with the explicit NUL termination MS's variant does not
- * guarantee. */
+/* Bind the formatter to the plain symbol that the owned runtime exports.
+ * The asm name avoids MinGW's dllimport declaration. */
+extern int dbg_owned_vsnprintf(char *buffer, size_t cap, const char *format,
+                               va_list args) __asm__("vsnprintf");
+
 static int dbg_snprintf_impl(char *buffer, size_t cap, const char *format,
                              ...) {
   va_list args;
   int written;
   if (!buffer || cap == 0) return 0;
   va_start(args, format);
-  written = _vsnprintf(buffer, cap - 1, format, args);
+  written = dbg_owned_vsnprintf(buffer, cap, format, args);
   va_end(args);
   buffer[cap - 1] = '\0';
   return written < 0 ? (int)(cap - 1) : written;
@@ -60,7 +61,7 @@ static int dbg_vsnprintf_impl(char *buffer, size_t cap, const char *format,
                               va_list args) {
   int written;
   if (!buffer || cap == 0) return 0;
-  written = _vsnprintf(buffer, cap - 1, format, args);
+  written = dbg_owned_vsnprintf(buffer, cap, format, args);
   buffer[cap - 1] = '\0';
   return written < 0 ? (int)(cap - 1) : written;
 }
@@ -68,11 +69,20 @@ static int dbg_vsnprintf_impl(char *buffer, size_t cap, const char *format,
 #define snprintf dbg_snprintf_impl
 #define vsnprintf dbg_vsnprintf_impl
 
-/* MinGW's stdlib.h redirects strtod to its __strtod helper; alias straight
- * to the MSVCRT export instead. */
-extern double dbg_msvcrt_strtod(const char *str, char **end) __asm__("strtod");
+/* MinGW's stdlib.h redirects strtod to a compiler helper. Bind to the plain
+ * symbol that Mettle's owned runtime exports. */
+extern double dbg_owned_strtod(const char *str, char **end) __asm__("strtod");
 #undef strtod
-#define strtod dbg_msvcrt_strtod
+#define strtod dbg_owned_strtod
+
+extern int64_t dbg_owned_strtoi64(const char *str, char **end, int base)
+    __asm__("_strtoi64");
+extern uint64_t dbg_owned_strtoui64(const char *str, char **end, int base)
+    __asm__("_strtoui64");
+#undef _strtoi64
+#undef _strtoui64
+#define _strtoi64 dbg_owned_strtoi64
+#define _strtoui64 dbg_owned_strtoui64
 
 extern uint64_t mettle_profile_name_count;
 extern const char *mettle_profile_names[];

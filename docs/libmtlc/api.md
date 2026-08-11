@@ -378,8 +378,8 @@ MtlcFn *mtlc_builder_function(MtlcBuilder *builder, const char *name,
 
 Declares a function. `name` and every `param_names[i]` are copied. Types are
 borrowed (use canonical descriptors). With `is_extern` nonzero this declares a
-body-less external symbol resolved at link time (libc functions work on the
-executable path) and **returns NULL by design**; do not treat that NULL as an
+body-less external symbol resolved at link time. Owned runtime and explicit OS
+symbols work on the executable path. It **returns NULL by design**; do not treat that NULL as an
 error. Otherwise it returns a function builder to emit the body into.
 
 ```c
@@ -1029,13 +1029,12 @@ int mtlc_build_executable(MtlcContext *ctx, MtlcModule *module,
                           const char *output_path);
 ```
 
-The whole back half in one call: emits a temporary object, synthesizes the
-C-runtime startup that calls the module's `main`, links, and deletes the
-temporaries. On Windows this uses libmtlc's own PE linker with imports resolved
-by DLL name from `kernel32.dll`, `ucrtbase.dll`, and `msvcrt.dll` (no Windows
-SDK import libraries needed), so extern libc calls like `malloc` and `putchar`
-just work. On ELF hosts it invokes the system C compiler (`cc -no-pie`) to
-link. Returns 1/0; failures report through the context's diagnostic handler, or
+The whole back half in one call: emits a temporary object, synthesizes Mettle's
+startup, links the owned runtime, checks the output, and deletes temporary
+files. Windows uses libmtlc's PE linker. ELF uses direct static linking when
+possible and a no defaults GCC driver fallback otherwise. Owned names such as
+`malloc` and `putchar` need no host library. Returns 1/0; failures report
+through the context's diagnostic handler, or
 `mtlc_context_last_error` if you installed none.
 
 ---

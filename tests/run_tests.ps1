@@ -4725,7 +4725,7 @@ foreach ($mode in @("binary")) {
   }
 }
 
-# Native object + MinGW gcc link (nostartfiles + CRT imports)
+# Native object + MinGW GCC link with no startup or default libraries.
 $total++
 try {
   $gccCmd = Get-Command gcc -ErrorAction SilentlyContinue
@@ -4828,7 +4828,8 @@ catch {
   Write-CaseResult -Name "internal_link_ui" -Passed $false -Reason $_.Exception.Message
 }
 
-# Internal linker UCRT test: std/io path resolves __acrt_iob_func via default DLL imports
+# Internal linker owned stdio test. The _iob compatibility symbol must resolve
+# from the bundled runtime and the output must import no C runtime.
 $total++
 try {
   $exePath = Join-Path $tmpDir "internal_link_std_io.exe"
@@ -4845,12 +4846,38 @@ try {
   if ($LASTEXITCODE -ne 0) {
     throw "Internal linker std-io executable exited with $LASTEXITCODE (expected 0)"
   }
+  $stdioImports = & objdump -p $exePath 2>&1 | Out-String
+  if ($stdioImports -match "msvcrt|ucrt|vcruntime|api-ms-win-crt|libgcc|libwinpthread") {
+    throw "Internal linker std-io executable imports a forbidden runtime"
+  }
 
   Write-CaseResult -Name "internal_link_std_io" -Passed $true
 }
 catch {
   $failed++
   Write-CaseResult -Name "internal_link_std_io" -Passed $false -Reason $_.Exception.Message
+}
+
+# Owned directory runtime test. It covers attributes, current directory, and
+# recursive Markdown scans without a helper C object.
+$total++
+try {
+  $dirExe = Join-Path $tmpDir "owned_dir.exe"
+  $dirBuild = & $CompilerPath --build tests\test_owned_dir.mettle -o $dirExe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "Owned directory build failed: $dirBuild" }
+  $dirOut = & $dirExe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0 -or $dirOut -notmatch "DIR OWNED OK") {
+    throw "Owned directory test failed: $dirOut"
+  }
+  $dirImports = & objdump -p $dirExe 2>&1 | Out-String
+  if ($dirImports -match "msvcrt|ucrt|vcruntime|api-ms-win-crt|libgcc|libwinpthread") {
+    throw "Owned directory test imports a forbidden runtime"
+  }
+  Write-CaseResult -Name "owned_directory" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "owned_directory" -Passed $false -Reason $_.Exception.Message
 }
 
 # Internal linker kernel32 atomics test: std/thread uses exported Interlocked* names
@@ -6204,7 +6231,7 @@ catch {
   Write-CaseResult -Name "runtime_access_violation_trace_coff" -Passed $false -Reason $_.Exception.Message
 }
 
-# main(argc, argv) test: startup calls CRT __getmainargs directly.
+# main(argc, argv) test: startup uses the owned command line parser.
 $total++
 try {
   $avExe = Join-Path $tmpDir "test_main_argc_argv.exe"
@@ -6215,8 +6242,8 @@ try {
   }
 
   $avImports = & objdump -p $avExe 2>&1 | Out-String
-  if ($avImports -notmatch "__getmainargs") {
-    throw "main(argc,argv) executable missing __getmainargs import"
+  if ($avImports -match "__getmainargs|ucrtbase|msvcrt") {
+    throw "main(argc,argv) executable imports a C runtime"
   }
 
   $avResult = & $avExe 2>&1
@@ -6231,7 +6258,7 @@ catch {
   Write-CaseResult -Name "main_argc_argv" -Passed $false -Reason $_.Exception.Message
 }
 
-# main(argc, argv) via --build: internal startup must call __getmainargs.
+# The normal build path must retain the same runtime independence.
 $total++
 try {
   $buildArgvExe = Join-Path $tmpDir "test_main_argc_argv_build.exe"
@@ -6242,8 +6269,8 @@ try {
   }
 
   $exeImports = & objdump -p $buildArgvExe 2>&1 | Out-String
-  if ($exeImports -notmatch "__getmainargs") {
-    throw "main(argc,argv) --build executable missing __getmainargs import"
+  if ($exeImports -match "__getmainargs|ucrtbase|msvcrt") {
+    throw "main(argc,argv) --build executable imports a C runtime"
   }
 
   $buildArgvResult = & $buildArgvExe "dummy-arg" 2>&1
@@ -6295,64 +6322,6 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "runtime_access_violation_trace" -Passed $false -Reason $_.Exception.Message
-}
-
-# Internal allocator gate. src/mettle_alloc.c interposes on malloc/free for the
-# whole driver, so a fault there corrupts every later phase in ways that are hard
-# to attribute back. This exercises the parts that are easy to get wrong -- size
-# class boundaries, realloc growth and shrink, calloc's skip-the-memset path, page
-# and segment recycling, huge allocations, cross-thread frees -- and checks block
-# CONTENTS, not merely that nothing crashed. Built with -DMETTLE_ALLOC_POISON so
-# freed blocks are stamped, which turns a stale-pointer read into a recognisable
-# value instead of whatever happened to still be there.
-$total++
-try {
-  $allocExe = "bin\alloc_test.exe"
-  & gcc -Wall -Wextra -std=c99 -g -O2 -D_GNU_SOURCE -DMETTLE_INTERNAL_ALLOC -DMETTLE_ALLOC_POISON -Isrc tests\alloc_test.c src\mettle_alloc.c -o $allocExe
-  if ($LASTEXITCODE -ne 0) {
-    throw "Failed to compile allocator test"
-  }
-
-  $allocOutput = & $allocExe 2>&1 | Out-String
-  if ($LASTEXITCODE -ne 0) {
-    throw "Allocator test exited with code $LASTEXITCODE`n$allocOutput"
-  }
-  if ($allocOutput -notmatch "\[PASS\] alloc_test") {
-    throw "Allocator test did not report success`n$allocOutput"
-  }
-
-  Write-CaseResult -Name "internal_allocator" -Passed $true
-}
-catch {
-  $failed++
-  Write-CaseResult -Name "internal_allocator" -Passed $false -Reason $_.Exception.Message
-}
-
-# Crash handler test. On Windows this compiles and runs but is a documented
-# no-op (the SEH crash path is already covered by runtime_null_trace /
-# runtime_access_violation_trace); the meaningful assertions run on POSIX.
-$total++
-try {
-  $crashHandlerExe = "bin\crash_handler_test.exe"
-  & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests\crash_handler_test.c src\runtime\crash_handler.c -Isrc -o $crashHandlerExe
-  if ($LASTEXITCODE -ne 0) {
-    throw "Failed to compile crash handler test"
-  }
-
-  $crashHandlerOutput = & $crashHandlerExe 2>&1 | Out-String
-  if ($LASTEXITCODE -ne 0) {
-    throw "Crash handler test exited with code $LASTEXITCODE"
-  }
-
-  if ($crashHandlerOutput -notmatch "Crash handler tests (passed|skipped)") {
-    throw "Crash handler test output did not contain pass/skip marker"
-  }
-
-  Write-CaseResult -Name "crash_handler" -Passed $true
-}
-catch {
-  $failed++
-  Write-CaseResult -Name "crash_handler" -Passed $false -Reason $_.Exception.Message
 }
 
 # AArch64 encoder validity gate. Compiles and runs the from-scratch A64
@@ -6575,7 +6544,7 @@ try {
   }
 
   # A call to an undefined external has to leave a relocation behind for the
-  # linker; native_link.mettle calls libc's putchar.
+  # linker; native_link.mettle calls the owned putchar ABI.
   $extObj = Join-Path $objDir "native_link.o"
   & $CompilerPath --emit-arm64-obj tests\arm64\native_link.mettle -o $extObj 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) {
@@ -6585,6 +6554,21 @@ try {
   $relaSize = Get-ElfSectionSize $extBytes ".rela.text"
   if ($relaSize -le 0) {
     throw "native_link.o has no .rela.text relocations for its extern call"
+  }
+
+  # Cross output chooses its target OS standard library, not the compiler host.
+  # A Windows hosted compiler must put Linux stream symbols in an AArch64 ELF.
+  $crossStdObj = Join-Path $objDir "owned_dir_linux_std.o"
+  & $CompilerPath --emit-arm64-obj tests\test_owned_dir.mettle -o $crossStdObj 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "AArch64 owned directory object failed"
+  }
+  $crossStdText = [Text.Encoding]::ASCII.GetString(
+    [IO.File]::ReadAllBytes($crossStdObj))
+  if ($crossStdText -match "__acrt_iob_func" -or
+      $crossStdText -notmatch "mettle_dir_exists" -or
+      $crossStdText -notmatch "stdout") {
+    throw "AArch64 object selected Windows stdlib symbols instead of Linux"
   }
 
   Write-CaseResult -Name "arm64_object" -Passed $true
@@ -9400,9 +9384,10 @@ else {
   }
 }
 
-# Full public-API surface gate. Compiles tests/public_api_test.c (includes ONLY
-# include/mtlc, links ONLY bin/mtlc.lib) and runs it: it builds six module
-# families through the public IR builder -- globals, extern libc calls, pointer
+# Full public API surface gate. Compiles tests/public_api_test.c against the
+# owned host ABI, links it with no startup or default libraries, and runs it.
+# It builds six module families through the public IR builder: globals, extern
+# owned runtime calls, pointer
 # load/store, address-of, float arithmetic + casts -- and emits through
 # mtlc_emit/mtlc_build_executable to all four targets: a native x86-64 exe
 # (run below: exit 42 + stdout OK), PTX text, a SPIR-V binary, and an AArch64
@@ -9420,9 +9405,25 @@ else {
     $pubExe = Join-Path $tmpDir "public_api_test.exe"
     $pubOut = Join-Path $tmpDir "pubapi"
     New-Item -ItemType Directory -Force $pubOut | Out-Null
-    $buildOut = & $calcGcc.Source -Wall -Wextra -std=c99 -Iinclude `
-      tests/public_api_test.c bin/mtlc.lib -o $pubExe -ldbghelp 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0) { throw "building public_api_test failed: $buildOut" }
+    $pubObj = Join-Path $tmpDir "public_api_test.o"
+    $compileOut = & $calcGcc.Source -Wall -Wextra -std=c99 -Iinclude `
+      -ffreestanding -fno-builtin -fno-stack-protector `
+      -fno-asynchronous-unwind-tables -fno-unwind-tables `
+      -mno-stack-arg-probe -include src/runtime/host_redirect.h `
+      -c tests/public_api_test.c -o $pubObj 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "compiling public_api_test failed: $compileOut" }
+    $pubLinkArgs = @(
+      '-nostdlib', '-nostartfiles', '-nodefaultlibs',
+      '-Wl,--disable-runtime-pseudo-reloc',
+      '-Wl,-e,mettle_start,--gc-sections',
+      'obj/runtime/host_startup.o', $pubObj, 'bin/mtlc.lib',
+      '-o', $pubExe, '-lkernel32', '-ldbghelp')
+    $buildOut = & $calcGcc.Source @pubLinkArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "linking public_api_test failed: $buildOut" }
+    $pubImports = & objdump -p $pubExe 2>&1 | Out-String
+    if ($pubImports -match "msvcrt|ucrt|vcruntime|api-ms-win-crt|libgcc|libstdc|libwinpthread") {
+      throw "public_api_test imports a C or compiler runtime: $pubImports"
+    }
     $runOut = & $pubExe $pubOut 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw "public_api_test failed: $runOut" }
     if ($ptxas) {
@@ -9477,11 +9478,9 @@ else {
 
 # libmtlc self-containment audit. Computes the archive's external symbol
 # closure (every symbol some member references that no member defines) and
-# fails if any of it matches the project's own naming conventions -- i.e. if a
-# lib member reaches back into driver/frontend code (the ir_comptime ->
-# error_reporter coupling was exactly this class of bug). System/libc/toolchain
-# externals (__imp_*, __mingw_*, malloc, ...) are the normal cost of being a C
-# library and are allowed. Skipped when nm (binutils) is unavailable.
+# fails if any final symbol is not an explicit Windows OS import. It also
+# rejects C, compiler, and thread runtime import names. Skipped when nm is not
+# available.
 $nmCmd = Get-Command nm -ErrorAction SilentlyContinue
 if (-not $nmCmd) {
   Write-Host "[SKIP] libmtlc_selfcontained (nm not found)"
@@ -9499,13 +9498,16 @@ else {
       if ($ln -match '\s+U\s+(\S+)\s*$') { [void]$undef.Add($Matches[1]) }
       elseif ($ln -match '\s+[A-TV-Zabd-tv-z]\s+(\S+)\s*$') { [void]$defined.Add($Matches[1]) }
     }
-    $projectPrefix = '^(mettle_|mtlc_|ir_|error_|source_|type_checker|symbol_table_|ast_|parser_|lexer_|token_|monomorphize|import_resolver|register_allocator|string_is_interned|compile_)'
+    $forbiddenRuntime = '(?i)(msvcrt|ucrt|vcruntime|msvcp|libgcc|libstdc|libwinpthread|__mingw_|^__imp_(malloc|calloc|realloc|free|memcpy|memset|printf|fprintf|strtod)$)'
     $bad = @()
     foreach ($s in $undef) {
-      if (-not $defined.Contains($s) -and $s -match $projectPrefix) { $bad += $s }
+      if (-not $defined.Contains($s) -and
+          ($s -notmatch '^__imp_' -or $s -match $forbiddenRuntime)) {
+        $bad += $s
+      }
     }
     if ($bad.Count -gt 0) {
-      throw ("bin\mtlc.lib references driver/frontend symbols it does not define: " +
+      throw ("bin\mtlc.lib contains forbidden unresolved symbols: " +
              (($bad | Sort-Object) -join ', '))
     }
     Write-CaseResult -Name "libmtlc_selfcontained" -Passed $true

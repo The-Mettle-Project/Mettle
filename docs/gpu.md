@@ -867,8 +867,8 @@ mettle --build host.mettle -o host.exe \
   --link-arg "<CUDA>/lib/x64/cuda.lib"        # Windows x86-64
 ```
 
-The host links `nvcuda` (the OS driver), exactly as a Mettle program links
-`kernel32` or libc; there is no bundled CUDA DLL. At run time the driver JITs
+The host links `nvcuda`, the OS driver, as an explicit vendor API. There is no
+bundled CUDA DLL. At run time the driver JITs
 the PTX to SASS for the installed GPU.
 
 GPU `-O` is intentionally backend-agnostic. It runs shared scalar/CFG
@@ -881,8 +881,8 @@ SIMD/idiom pipeline and ML optimizer are not allowed to shape PTX or SPIR-V
 modules.
 
 On DGX Spark, build and run the Mettle compiler natively. Ordinary compile and
-`--build` commands emit/link AArch64 ELF64 objects; AAPCS64 external calls,
-global/string addresses, libc linkage, and the eleven-argument
+`--build` commands emit and link AArch64 ELF64 objects. AAPCS64 external calls,
+global and string addresses, owned runtime linkage, and the eleven argument
 `cuLaunchKernel` call shape are CI-gated on native Arm. `--emit-arm64` remains a
 separate self-contained smoke executable for bring-up, while
 `mtlc_emit(MTLC_ARCH_ARM64)` is the relocatable cross-host product.

@@ -2299,6 +2299,7 @@ int code_generator_binary_emit_runtime_trap_call(
   const char *trap_symbol =
       is_trap_ex ? "mettle_crash_trap_ex" : "mettle_crash_trap";
   size_t message_arg_index = is_trap_ex ? 1u : 0u;
+  const BinaryAbi *abi = code_generator_binary_active_abi();
 
   if (!generator || !context || !instruction ||
       instruction->argument_count == 0) {
@@ -2312,11 +2313,10 @@ int code_generator_binary_emit_runtime_trap_call(
         instruction->argument_count > message_arg_index
             ? &instruction->arguments[message_arg_index]
             : &instruction->arguments[0];
-    /* Abort via libc puts(message) + exit(1). The first argument register and
+    /* Abort through the owned puts(message) and exit(1) ABI. The first register and
      * the shadow-space reservation come from the active ABI (MS-x64 RCX + 32B
-     * shadow; SysV RDI + no shadow) so the calls into the C runtime are correct
+     * shadow; SysV RDI + no shadow) so calls into the owned runtime are correct
      * on both platforms. */
-    const BinaryAbi *abi = code_generator_binary_active_abi();
     BinaryGpRegister arg0 = abi->int_param_registers[0];
     int shadow = abi->shadow_space_size;
 
@@ -2417,9 +2417,18 @@ int code_generator_binary_emit_runtime_trap_call(
   }
 
   if (is_trap_ex) {
+    size_t register_count = abi->int_param_count;
+    int stack_argument_count = register_count < 6 ? 6 - (int)register_count : 0;
+    int call_frame_size =
+        abi->shadow_space_size + stack_argument_count * 8;
+    BinaryGpRegister arg0_target =
+        register_count > 4 ? abi->int_param_registers[4] : BINARY_GP_RAX;
+    BinaryGpRegister arg1_target =
+        register_count > 5 ? abi->int_param_registers[5] : BINARY_GP_RAX;
     if (instruction->argument_count < 4 ||
         instruction->arguments[0].kind != IR_OPERAND_INT ||
-        instruction->arguments[1].kind != IR_OPERAND_STRING) {
+        instruction->arguments[1].kind != IR_OPERAND_STRING ||
+        register_count < 4) {
       code_generator_set_error(
           generator,
           "Invalid mettle_crash_trap_ex call in function '%s'",
@@ -2428,63 +2437,69 @@ int code_generator_binary_emit_runtime_trap_call(
       return 0;
     }
 
-    if (!binary_emit_sub_rsp_imm32(&context->code, 48) ||
+    if (!binary_emit_sub_rsp_imm32(&context->code, call_frame_size) ||
         !binary_emit_mov_reg_imm64(
-            &context->code, BINARY_GP_RCX,
+            &context->code, abi->int_param_registers[0],
             (unsigned long long)instruction->arguments[0].int_value) ||
         !code_generator_binary_emit_cstring_literal_address(
             generator, context,
             instruction->arguments[1].name ? instruction->arguments[1].name : "",
-            BINARY_GP_RDX) ||
-        !binary_emit_lea_reg_rip_placeholder(&context->code, BINARY_GP_R8,
-                                             &displacement_offset) ||
+            abi->int_param_registers[1]) ||
+        !binary_emit_lea_reg_rip_placeholder(
+            &context->code, abi->int_param_registers[2],
+            &displacement_offset) ||
         !binary_label_fixup_table_add(&context->label_fixups, trap_pc_label,
                                       displacement_offset) ||
-        !binary_emit_mov_reg_reg(&context->code, BINARY_GP_R9, BINARY_GP_RBP)) {
+        !binary_emit_mov_reg_reg(&context->code, abi->int_param_registers[3],
+                                 BINARY_GP_RBP)) {
       free(trap_pc_label);
       return 0;
     }
 
     if (instruction->arguments[2].kind == IR_OPERAND_INT) {
       if (!binary_emit_mov_reg_imm64(
-              &context->code, BINARY_GP_RAX,
-              (unsigned long long)instruction->arguments[2].int_value) ||
-          !binary_emit_mov_mem_reg(&context->code, BINARY_GP_RSP, 32,
-                                   BINARY_GP_RAX)) {
+              &context->code, arg0_target,
+              (unsigned long long)instruction->arguments[2].int_value)) {
         free(trap_pc_label);
         return 0;
       }
     } else if (!code_generator_binary_emit_operand_load(
                    generator, context, &instruction->arguments[2],
-                   BINARY_GP_RAX) ||
-               !binary_emit_mov_mem_reg(&context->code, BINARY_GP_RSP, 32,
-                                        BINARY_GP_RAX)) {
+                    arg0_target)) {
+      free(trap_pc_label);
+      return 0;
+    }
+    if (register_count <= 4 &&
+        !binary_emit_mov_mem_reg(&context->code, BINARY_GP_RSP,
+                                 abi->shadow_space_size, arg0_target)) {
       free(trap_pc_label);
       return 0;
     }
 
     if (instruction->arguments[3].kind == IR_OPERAND_INT) {
       if (!binary_emit_mov_reg_imm64(
-              &context->code, BINARY_GP_RAX,
-              (unsigned long long)instruction->arguments[3].int_value) ||
-          !binary_emit_mov_mem_reg(&context->code, BINARY_GP_RSP, 40,
-                                   BINARY_GP_RAX)) {
+              &context->code, arg1_target,
+              (unsigned long long)instruction->arguments[3].int_value)) {
         free(trap_pc_label);
         return 0;
       }
     } else if (!code_generator_binary_emit_operand_load(
                    generator, context, &instruction->arguments[3],
-                   BINARY_GP_RAX) ||
-               !binary_emit_mov_mem_reg(&context->code, BINARY_GP_RSP, 40,
-                                        BINARY_GP_RAX)) {
+                    arg1_target)) {
+      free(trap_pc_label);
+      return 0;
+    }
+    if (register_count <= 5 &&
+        !binary_emit_mov_mem_reg(&context->code, BINARY_GP_RSP,
+                                 abi->shadow_space_size + 8, arg1_target)) {
       free(trap_pc_label);
       return 0;
     }
 
     if (!binary_emit_call_placeholder(&context->code, &displacement_offset) ||
         !binary_call_relocation_table_add(&context->call_relocations,
-                                            trap_symbol, displacement_offset) ||
-        !binary_emit_add_rsp_imm32(&context->code, 48)) {
+                                          trap_symbol, displacement_offset) ||
+        !binary_emit_add_rsp_imm32(&context->code, call_frame_size)) {
       if (!generator->has_error) {
         code_generator_set_error(generator,
                                  "Out of memory while emitting runtime trap "
@@ -2504,29 +2519,29 @@ int code_generator_binary_emit_runtime_trap_call(
             generator, context,
             instruction->arguments[0].name ? instruction->arguments[0].name
                                              : "",
-            BINARY_GP_RCX)) {
+            abi->int_param_registers[0])) {
       free(trap_pc_label);
       return 0;
     }
   } else if (!code_generator_binary_emit_operand_load(
-                 generator, context, &instruction->arguments[0],
-                 BINARY_GP_RCX)) {
+                  generator, context, &instruction->arguments[0],
+                  abi->int_param_registers[0])) {
     free(trap_pc_label);
     return 0;
   }
 
-  if (!binary_emit_lea_reg_rip_placeholder(&context->code, BINARY_GP_RDX,
-                                           &displacement_offset) ||
+  if (!binary_emit_lea_reg_rip_placeholder(
+          &context->code, abi->int_param_registers[1],
+          &displacement_offset) ||
       !binary_label_fixup_table_add(&context->label_fixups, trap_pc_label,
                                     displacement_offset) ||
-      !binary_emit_mov_reg_reg(&context->code, BINARY_GP_R8, BINARY_GP_RBP) ||
-      !binary_emit_sub_rsp_imm32(&context->code,
-                                 BINARY_WIN64_SHADOW_SPACE_SIZE) ||
+      !binary_emit_mov_reg_reg(&context->code, abi->int_param_registers[2],
+                               BINARY_GP_RBP) ||
+      !binary_emit_sub_rsp_imm32(&context->code, abi->shadow_space_size) ||
       !binary_emit_call_placeholder(&context->code, &displacement_offset) ||
       !binary_call_relocation_table_add(&context->call_relocations, trap_symbol,
                                         displacement_offset) ||
-      !binary_emit_add_rsp_imm32(&context->code,
-                                 BINARY_WIN64_SHADOW_SPACE_SIZE)) {
+      !binary_emit_add_rsp_imm32(&context->code, abi->shadow_space_size)) {
     if (!generator->has_error) {
       code_generator_set_error(generator,
                                "Out of memory while emitting runtime trap "

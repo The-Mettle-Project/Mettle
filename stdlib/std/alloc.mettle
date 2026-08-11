@@ -20,7 +20,7 @@
 //
 // Thread safety: every public heap operation takes the heap's spinlock, so a
 // single MemHeap (including the process-global one behind mx_*) is safe to share
-// across threads — matching the OS heap (HeapAlloc / libc malloc) it replaces
+// across threads, matching the owned process heap it replaces
 // under --native-heap. Internal *_nolock cores do the real work so that
 // compound operations (calloc, realloc) hold the lock exactly once and never
 // self-deadlock. The lock is a short-critical-section spinlock; for heavily
@@ -558,7 +558,7 @@ export fn mx_stats() -> MemStats {
 // When the compiler is invoked with --native-heap it auto-injects this module
 // and rewrites `new` and the malloc/calloc/realloc/free intercepts to call
 // these fixed-name shims instead of the OS heap manager (Win32 HeapAlloc /
-// libc). They are `export`ed so the codegen reachability pass keeps them as
+// default owned heap). They are `export`ed so code reachability keeps them as
 // roots even though the calls are injected at emit time and are invisible to
 // the IR call graph. They run on the (thread-safe) process-global heap.
 

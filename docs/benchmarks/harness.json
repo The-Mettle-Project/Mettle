@@ -145,7 +145,7 @@
     {
       "name": "memcpy_bench",
       "kind": "runtime",
-      "description": "memcpy 256 KB buffer x 200 (memory bandwidth / libc memcpy path)",
+      "description": "memcpy 256 KB buffer x 200 (owned memory copy path)",
       "mettle_source": "examples/memcpy_bench/memcpy_bench.mettle",
       "mettle_exe": "examples/memcpy_bench/memcpy_bench.exe",
       "c_source": "examples/memcpy_bench/memcpy_bench.c",
@@ -156,7 +156,7 @@
     {
       "name": "memset_bench",
       "kind": "runtime",
-      "description": "memset 256 KB buffer x 200 (fill bandwidth / libc memset path)",
+      "description": "memset 256 KB buffer x 200 (owned memory fill path)",
       "mettle_source": "examples/memset_bench/memset_bench.mettle",
       "mettle_exe": "examples/memset_bench/memset_bench.exe",
       "c_source": "examples/memset_bench/memset_bench.c",

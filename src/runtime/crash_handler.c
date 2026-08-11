@@ -1,4 +1,5 @@
 #include "crash_handler.h"
+#include "owned.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,8 +13,6 @@
 #define STATUS_STACK_BUFFER_OVERRUN ((DWORD)0xC0000409)
 #endif
 #else
-#include <errno.h>
-#include <fcntl.h>
 #include <signal.h>
 #include <unistd.h>
 #if defined(__linux__) || defined(__APPLE__)
@@ -40,41 +39,6 @@ static PVOID g_runtime_debug_vectored_handler = NULL;
 static volatile sig_atomic_t g_runtime_debug_handler_installed = 0;
 static volatile sig_atomic_t g_runtime_debug_in_handler = 0;
 #endif
-
-void mettle_crash_write_stderr_bytes(const char *text, size_t length) {
-  if (!text || length == 0) {
-    return;
-  }
-
-#if defined(_WIN32) || defined(_WIN64)
-  HANDLE stderr_handle = GetStdHandle(STD_ERROR_HANDLE);
-  if (stderr_handle && stderr_handle != INVALID_HANDLE_VALUE) {
-    DWORD written = 0;
-    WriteFile(stderr_handle, text, (DWORD)length, &written, NULL);
-  } else {
-    OutputDebugStringA(text);
-  }
-#else
-  size_t offset = 0;
-  while (offset < length) {
-    ssize_t n = write(STDERR_FILENO, text + offset, length - offset);
-    if (n < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      break;
-    }
-    offset += (size_t)n;
-  }
-#endif
-}
-
-void mettle_crash_write_stderr(const char *text) {
-  if (!text) {
-    return;
-  }
-  mettle_crash_write_stderr_bytes(text, strlen(text));
-}
 
 static void mettle_crash_write_decimal_uintptr(uintptr_t value) {
   char buffer[32];
@@ -131,11 +95,7 @@ static void mettle_crash_write_newline(void);
  * quarantined (freed) heap block, returning the block's usable byte count
  * when it does and 0 otherwise. Lets the access-violation report say
  * "use-after-free" instead of printing an anonymous pointer. */
-long long (*mettle_crash_heap_classifier)(void *address) = 0;
-
-void mettle_crash_set_heap_classifier(long long (*classifier)(void *)) {
-  mettle_crash_heap_classifier = classifier;
-}
+extern long long (*mettle_crash_heap_classifier)(void *address);
 
 /* One line of insight about WHAT a faulting address is. The raw pointer
  * value rarely tells the user anything; its neighborhood usually does. */
@@ -212,8 +172,6 @@ const char *mettle_crash_exception_name(DWORD code) {
   }
 }
 #else
-static int g_runtime_probe_pipe[2] = {-1, -1};
-
 static const char *mettle_crash_signal_name(int signo) {
   switch (signo) {
   case SIGSEGV:
@@ -255,30 +213,7 @@ static int mettle_crash_address_is_readable(const void *address,
   uintptr_t region_end = region_start + info.RegionSize;
   return start >= region_start && start + length <= region_end;
 #else
-  if (g_runtime_probe_pipe[1] < 0) {
-    return 0;
-  }
-  for (;;) {
-    ssize_t n = write(g_runtime_probe_pipe[1], address, length);
-    if (n >= 0) {
-      char sink[64];
-      ssize_t remaining = n;
-      while (remaining > 0) {
-        ssize_t got = read(g_runtime_probe_pipe[0], sink,
-                           sizeof(sink) < (size_t)remaining ? sizeof(sink)
-                                                            : (size_t)remaining);
-        if (got <= 0) {
-          break;
-        }
-        remaining -= got;
-      }
-      return 1;
-    }
-    if (errno == EINTR) {
-      continue;
-    }
-    return 0;
-  }
+  return mettle_address_is_readable(address, (unsigned long long)length);
 #endif
 }
 
@@ -851,34 +786,13 @@ void mettle_crash_install(void) {
   }
   g_runtime_debug_handler_installed = 1;
 
-  if (g_runtime_probe_pipe[0] < 0) {
-    if (pipe(g_runtime_probe_pipe) == 0) {
-      (void)fcntl(g_runtime_probe_pipe[0], F_SETFL, O_NONBLOCK);
-      (void)fcntl(g_runtime_probe_pipe[1], F_SETFL, O_NONBLOCK);
-    } else {
-      g_runtime_probe_pipe[0] = -1;
-      g_runtime_probe_pipe[1] = -1;
-    }
-  }
-
-  static char alt_stack_storage[64 * 1024];
-  stack_t alt_stack;
-  alt_stack.ss_sp = alt_stack_storage;
-  alt_stack.ss_size = sizeof(alt_stack_storage);
-  alt_stack.ss_flags = 0;
-  (void)sigaltstack(&alt_stack, NULL);
-
-  struct sigaction sa;
-  memset(&sa, 0, sizeof(sa));
-  sa.sa_sigaction = mettle_crash_crash_signal_handler;
-  sigemptyset(&sa.sa_mask);
-  sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
-
-  (void)sigaction(SIGSEGV, &sa, NULL);
-  (void)sigaction(SIGBUS, &sa, NULL);
-  (void)sigaction(SIGFPE, &sa, NULL);
-  (void)sigaction(SIGILL, &sa, NULL);
-  (void)sigaction(SIGABRT, &sa, NULL);
+  void (*handler)(int, void *, void *) =
+      (void (*)(int, void *, void *))mettle_crash_crash_signal_handler;
+  (void)mettle_install_signal_handler(SIGSEGV, handler);
+  (void)mettle_install_signal_handler(SIGBUS, handler);
+  (void)mettle_install_signal_handler(SIGFPE, handler);
+  (void)mettle_install_signal_handler(SIGILL, handler);
+  (void)mettle_install_signal_handler(SIGABRT, handler);
 #endif
 }
 

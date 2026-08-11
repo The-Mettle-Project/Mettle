@@ -162,7 +162,8 @@ var p: MyStruct* = new MyStruct;
 
 **Initialization:** `new` allocates memory that is **zeroed**. All bytes of the allocated object are set to zero before the pointer is returned.
 
-**Allocation failure:** `new` uses the platform C runtime `calloc`. If allocation fails, the result is null.
+**Allocation failure:** `new` uses the owned zeroed allocator. If allocation
+fails, the result is null.
 
 ## Expression Evaluation Order
 

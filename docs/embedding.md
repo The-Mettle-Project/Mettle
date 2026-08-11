@@ -130,16 +130,17 @@ system install with a pkg-config file:
 
 ```bash
 make install-libmtlc PREFIX=/usr/local   # honors DESTDIR
-cc $(pkg-config --cflags --libs libmtlc) my_frontend.c
+cc $(pkg-config --cflags libmtlc) -c my_frontend.c -o my_frontend.o
+cc my_frontend.o $(pkg-config --libs libmtlc) -o my_frontend
 ```
 
-The Mettle driver, standard library, and runtime are not part of any of this; a
-frontend links the library alone.
+The frontend links libmtlc's owned host runtime and startup through the package
+flags. It does not link a host C runtime.
 
 ## Scope of the builder today
 
 `mtlc/build.h` covers the imperative core a real language needs: functions
-(including `extern` declarations resolved at link time, so libc works), module
+(including `extern` declarations resolved from the owned runtime or an OS API), module
 globals with initializers, parameters, locals, assignment, integer/float
 arithmetic and comparisons, casts (including int/pointer conversions), pointer
 types (`mtlc_type_pointer`), memory (`mtlc_load` / `mtlc_store` /

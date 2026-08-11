@@ -1,5 +1,7 @@
 #include "atomics.h"
 
+#if !defined(METTLE_ATOMICS_IN_FREESTANDING)
+
 #if defined(_WIN32) || defined(_WIN64)
 #include <windows.h>
 #endif
@@ -37,3 +39,5 @@ int32_t mettle_atomic_dec_i32(int32_t *target) {
   return (int32_t)__sync_sub_and_fetch(target, 1);
 #endif
 }
+
+#endif

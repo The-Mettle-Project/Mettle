@@ -1,155 +1,96 @@
-# Runtime Model
+# Owned Runtime Model
 
-Programs libmtlc emits have no GC, async scheduler, heap manager, thread pool,
-or startup shim that every program must link.
+Every native Mettle product uses a runtime that this project owns. It does not
+link libc, a C startup package, a compiler support library, pthread, musl, UCRT,
+MSVCRT, or a C++ runtime.
 
-A typical program links **libc only**. The backend emits `mainCRTStartup`
-(Windows) or `_start` (Linux), calls your `main`, and exits. Heap use goes
-straight to `calloc(1, n)`. There is no `runtime_init`, `runtime_shutdown`,
-background thread, or allocator state baked into the output.
+Mettle still has no garbage collector, async scheduler, thread pool, or hidden
+background service. The required runtime is small, but it is real. It owns the
+startup path and each basic service that generated code and libmtlc need.
 
-This page covers what gets emitted, the two optional helper objects in
-`src/runtime/`, and when the linker pulls them in. The table below uses Mettle
-language features to name what the frontend lowers; the compiler output column
-is the backend's.
+## Required runtime
 
-## Call boundary
-
-| Mettle feature | Compiler output | Linked at build time |
+| Service | Windows x86_64 | Linux x86_64 and AArch64 |
 |---|---|---|
-| `main` / `main(argc, argv)` | Startup object calls `__getmainargs` on Windows or reads `argc`/`argv` from the stack on Linux, then calls `main` and exits | libc |
-| `new T`, array literals, `string + string` | `extern calloc`; `call calloc` with `(1, size)` | libc `calloc` |
-| `std/win32` / `std/net` / `std/thread` | `extern` to DLL symbols (`CreateFileA`, etc.) | Win32 DLLs |
-| `std/thread` interlocked atomics | `extern mettle_atomic_*`; `call mettle_atomic_*` | `atomics.o` |
-| Null/bounds traps (normal build), `-d` / `-s` | `extern mettle_crash_trap_ex` (or `mettle_crash_trap`); startup via `mettle_crash_startup` | `crash_handler.o` |
-| `-g` / `--debug-symbols` alone | No crash hooks unless `-s`/`-d` or IR traps reference `mettle_crash_*` | usually nothing extra |
-| `--release` | Traps off; startup skips crash-handler init | nothing extra |
+| Entry | `mettle_start` | `_start` |
+| Arguments | `GetCommandLineA` parser | Initial process stack |
+| Exit | `ExitProcess` | `exit` system call |
+| Heap | Process heap APIs | Anonymous memory maps |
+| Files and console | Kernel32 file APIs | File system calls |
+| Threads | Kernel32 thread and wait APIs | `clone` and `futex` system calls |
+| Thread local state | Fiber local storage | Owned TLS image and thread pointer setup |
+| Sockets | Winsock when requested | Socket system calls |
+| Clocks | Kernel32 clocks | Clock system calls |
+| Process launch | `CreateProcessA` | `fork`, `execve`, and `wait4` system calls |
 
-Older Mettle shipped a large runtime (GC, async executor, coroutine scheduler, channels, tracked heap). That code is removed. What remains are two small helper objects, linked only when referenced.
+The source lives in `src/runtime/freestanding.c`. It does not include a standard
+C header. It compiles with freestanding flags and has no unresolved symbol on
+Linux. Its Windows object refers only to OS imports.
 
-## Helper objects
+The runtime exports familiar ABI names such as `malloc`, `calloc`, `memcpy`,
+`puts`, `strtod`, `clock_gettime`, and `pthread_create`. Those names do not mean
+that a host C library supplies them. Mettle supplies them. The POSIX thread
+names exist only as a source compatibility layer over the owned clone and futex
+code.
 
-Sources live in `src/runtime/`. Installed copies sit under `bin/runtime/` (local build) or `runtime/` (installer). The linker includes a helper only if the emitted object has undefined symbols with the matching prefix.
+## Startup objects
 
-### `crash_handler.o`
+`src/codegen/binary/startup.c` writes the target startup object. It supports the
+Windows x86_64 COFF ABI, the Linux x86_64 ELF ABI, and the Linux AArch64 ELF ABI.
+The startup code initializes the owned runtime, passes arguments to `main`, runs
+optional diagnostic hooks, and exits through the OS.
 
-Linked when the object references `mettle_crash_*`. That happens if you pass:
+`src/runtime/host_startup.c` provides the same entry contract for the reference
+compiler and for C programs that embed libmtlc.
 
-- `-d` / `--debug`
-- `-s` / `--stack-trace`
-- or you build without `--release` and IR null/bounds checks are enabled **and** you also pass `-s` or `-d` so trap sites call `mettle_crash_trap` (without `-s`, dev builds still trap but use `puts`/`exit` with no symbolized backtrace)
+## Optional owned code
 
-Provides:
+The linker adds these objects only when a program asks for their feature:
 
-- Windows: vectored SEH handler. POSIX: `sigaction` on an alternate stack. Both catch access violations and similar faults.
-- Frame-pointer walk plus compiler-embedded debug tables (`MettleCrashFunctionInfo`, `MettleCrashLocationInfo`, `MettleCrashTrapSiteInfo`) for symbolized backtraces. On `--build`, these live in COFF `.rdata` as `mettle_debug_header`, `mettle_debug_functions`, `mettle_debug_locations`, `mettle_debug_trap_sites`, and `mettle_debug_image`.
-- `mettle_crash_trap_ex(kind, msg, pc, fp, arg0, arg1)`: trap sites call this when `-s` is active; prints a rich report (kind, file:line:column, source snippet with caret, dynamic index/length for bounds checks) and a symbolized stack trace, then exits with status 1.
+* `crash_handler.o` prints source locations and stack frames.
+* `profile.o` records and prints the runtime profile.
+* `debug.o` implements interactive debug hooks on Windows.
+* `tracy_helpers.o` supplies the local no op Tracy ABI when external Tracy is
+  not in use.
 
-Example (`mettle --build -s`):
+These objects use the same owned ABI. They do not add a host runtime.
 
-```text
-Fatal error: null pointer dereference
-  --> app.mettle:9:10 in main
-   |
-9 |   return *p;
-   |          ^ null pointer dereference
-Stack trace:
-  #0 main at app.mettle:9:10 (0x000000014000106A)
-```
+External Tracy needs a C++ runtime, so `--tracy` fails in owned runtime mode.
+Use `--profile-runtime` for the built in profiler.
 
-Native fault example:
+## Link rules
 
-```text
-Unhandled runtime exception 0xC0000005 (access violation)
-Attempted to write inaccessible memory at 0x0000000000000001
-  --> app.mettle:3:3 in leaf_crash
-Stack trace:
-  #0 leaf_crash at app.mettle:3:3 (0x0000000140001086)
-  #1 main at app.mettle:11:1 (0x0000000140001120)
-```
+Windows uses the internal PE linker by default. The GCC fallback passes
+`-nostdlib`, `-nostartfiles`, and `-nodefaultlibs`, selects `mettle_start`, and
+links only requested OS libraries.
 
-Without `-d`, `-s`, or `-g`, and with `--release`, this object is not linked.
+Linux uses `ld` directly when it can. Its GCC fallback uses GCC only as a linker
+driver and passes the same three no runtime switches. Every Linux executable is
+a static `ET_EXEC` image. `--static` remains as a compatible no op. `--musl`
+fails because linking musl would break the owned runtime rule.
 
-### `atomics.o`
+## Hard checks
 
-Linked when the object references `mettle_atomic_*`. That happens when you use `std/thread` (Windows) or `std/thread_posix` and call:
+Mettle audits each executable before it reports success.
 
-- `atomic_compare_exchange_i32`
-- `atomic_exchange_i32`
-- `atomic_inc_i32`
-- `atomic_dec_i32`
+For PE32+ it reads normal and delayed import tables and rejects names for UCRT,
+MSVCRT, VCRuntime, the Microsoft C++ library, libgcc, libstdc++, and
+libwinpthread.
 
-Each wrapper is a few lines over Win32 `Interlocked*` or GCC `__sync_*` builtins. Mettle cannot call `__sync_*` as normal externs and has no inline assembly, so these live in a linkable object.
+For ELF64 it requires `ET_EXEC` and rejects `PT_INTERP` and `PT_DYNAMIC`.
 
-`CreateThread` / `pthread_create` without those four helpers does not pull in `atomics.o`.
+The driver also rejects link arguments that name a C, compiler, or thread
+runtime. Build scripts audit the compiler itself. The libmtlc build combines the
+whole archive and checks its final external symbol set.
 
-## `--build`
+## Target rule
 
-`mettle --build` scans the emitted object and links helpers as needed. You do not pass them on the command line.
+A new native target is not complete until it has all four parts:
 
-```text
-mettle --build hello.mettle -o hello.exe
-  → hello.obj
-  → libc only
-```
+1. An owned entry object.
+2. An owned service layer for every ABI symbol that code generation can emit.
+3. A link path with all default startup and libraries disabled.
+4. A format check that rejects hidden runtime dependencies.
 
-```text
-mettle --build -s hello.mettle -o hello.exe
-  → hello.obj (mettle_crash_* referenced)
-  → libc + crash_handler.o
-```
-
-```text
-mettle --build hello.mettle -o hello.exe   (uses std/thread atomics)
-  → libc + atomics.o
-```
-
-```text
-mettle --build -s hello.mettle -o hello.exe   (crash traces + atomics)
-  → libc + crash_handler.o + atomics.o
-```
-
-## Manual gcc link
-
-With `-nostartfiles` (Mettle supplies `mainCRTStartup` / `_start`, not the CRT entry):
-
-```bash
-# no helpers
-gcc -nostartfiles main.o -o main -lkernel32
-
-# crash tracebacks (-d / -s / -g, or non-release with traps)
-gcc -nostartfiles main.o path/to/runtime/crash_handler.o -o main -lkernel32
-
-# std/thread atomics
-gcc -nostartfiles main.o path/to/runtime/atomics.o -o main -lkernel32
-
-# both
-gcc -nostartfiles main.o \
-    path/to/runtime/crash_handler.o \
-    path/to/runtime/atomics.o \
-    -o main -lkernel32
-```
-
-## "Runtime: none" in the README
-
-Means no required runtime objects, no managed services, no hidden init/shutdown. Helpers are opt-in. `crash_handler.o` is diagnostics only; neither helper runs before `main`, spawns background work, or owns memory.
-
-Rough analogy: these objects are like `crt0.o` for C: small linker glue, not a language runtime.
-
-## Why two objects
-
-`gc.o` used to bundle everything. Splitting by symbol prefix keeps link size minimal:
-
-- `--release`, no thread atomics: zero helpers
-- `-d` only: `crash_handler.o`
-- atomics only: `atomics.o`
-
-`objdump -t` on the binary shows which `mettle_crash_*` / `mettle_atomic_*` symbols came from which file.
-
-## Possible future removal
-
-`atomics.o`: on Windows, `std/thread` could extern `Interlocked*` from `kernel32.dll` directly. POSIX still needs compiler inline asm or a user C shim (same pattern as `posix_helpers.c` for `std/net_posix`).
-
-`crash_handler.o`: harder to drop without losing line-level backtraces from `-d`/`-s`/`-g`. Opt-in linking already keeps it out of release builds that do not ask for it.
-
-Both helpers are stable for now; ABI is not expected to change.
+This rule applies to the reference compiler, libmtlc embedders, generated
+programs, optional diagnostics, and both internal and external linker paths.

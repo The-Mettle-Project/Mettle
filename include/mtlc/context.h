@@ -43,6 +43,12 @@ const char *mtlc_context_last_error(const MtlcContext *ctx);
  * what happened after this call. */
 void mtlc_context_clear_error(MtlcContext *ctx);
 
+/* Directory containing libmtlc's target runtime objects. Executable builds
+ * require freestanding.obj on Windows or freestanding.o on ELF hosts. The
+ * context copies the path. Returns 1 on success. */
+int mtlc_context_set_runtime_directory(MtlcContext *ctx, const char *path);
+const char *mtlc_context_runtime_directory(const MtlcContext *ctx);
+
 /* Optimization level: 0 = none, >=1 = the classical pipeline. */
 void mtlc_context_set_opt_level(MtlcContext *ctx, int level);
 int mtlc_context_opt_level(const MtlcContext *ctx);

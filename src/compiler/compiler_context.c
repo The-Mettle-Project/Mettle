@@ -8,8 +8,6 @@
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <windows.h>
-#else
-#include <pthread.h>
 #endif
 
 static MettleCompilerContext g_default_compiler_context = {0};
@@ -44,28 +42,56 @@ static MettleCompilerContext *mettle_compiler_ctx_storage(void) {
   return ctx;
 }
 #else
-static pthread_once_t g_compiler_context_once = PTHREAD_ONCE_INIT;
-static pthread_key_t g_compiler_context_key;
+typedef struct MettleCompilerContextSlot {
+  unsigned long thread_id;
+  int used;
+  MettleCompilerContext context;
+} MettleCompilerContextSlot;
 
-static void mettle_compiler_context_key_init(void) {
-  (void)pthread_key_create(&g_compiler_context_key, free);
+#define METTLE_COMPILER_CONTEXT_SLOT_COUNT 64
+
+extern unsigned int mettle_thread_current_id(void);
+
+static volatile int g_compiler_context_lock = 0;
+static MettleCompilerContextSlot
+    g_compiler_context_slots[METTLE_COMPILER_CONTEXT_SLOT_COUNT];
+
+static void mettle_compiler_context_lock(void) {
+  while (__atomic_exchange_n(&g_compiler_context_lock, 1, __ATOMIC_ACQUIRE)) {
+  }
+}
+
+static void mettle_compiler_context_unlock(void) {
+  __atomic_store_n(&g_compiler_context_lock, 0, __ATOMIC_RELEASE);
 }
 
 static MettleCompilerContext *mettle_compiler_ctx_storage(void) {
-  MettleCompilerContext *ctx = NULL;
+  unsigned long thread_id = (unsigned long)mettle_thread_current_id();
+  MettleCompilerContextSlot *free_slot = NULL;
 
-  (void)pthread_once(&g_compiler_context_once, mettle_compiler_context_key_init);
-  ctx = (MettleCompilerContext *)pthread_getspecific(g_compiler_context_key);
-  if (!ctx) {
-    ctx = (MettleCompilerContext *)calloc(1, sizeof(MettleCompilerContext));
-    if (!ctx) {
-      return &g_default_compiler_context;
+  mettle_compiler_context_lock();
+  for (size_t i = 0; i < METTLE_COMPILER_CONTEXT_SLOT_COUNT; i++) {
+    MettleCompilerContextSlot *slot = &g_compiler_context_slots[i];
+    if (slot->used && slot->thread_id == thread_id) {
+      mettle_compiler_context_unlock();
+      return &slot->context;
     }
-    ctx->phase = METTLE_COMPILER_PHASE_UNKNOWN;
-    ctx->ir_instruction_index = IR_INSTRUCTION_INDEX_NONE;
-    (void)pthread_setspecific(g_compiler_context_key, ctx);
+    if (!slot->used && !free_slot) {
+      free_slot = slot;
+    }
   }
-  return ctx;
+
+  if (!free_slot) {
+    mettle_compiler_context_unlock();
+    return &g_default_compiler_context;
+  }
+  memset(free_slot, 0, sizeof(*free_slot));
+  free_slot->thread_id = thread_id;
+  free_slot->used = 1;
+  free_slot->context.phase = METTLE_COMPILER_PHASE_UNKNOWN;
+  free_slot->context.ir_instruction_index = IR_INSTRUCTION_INDEX_NONE;
+  mettle_compiler_context_unlock();
+  return &free_slot->context;
 }
 #endif
 

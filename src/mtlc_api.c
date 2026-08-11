@@ -17,6 +17,8 @@
 #include "ir/ml_opt.h"
 #include "linker/pe_emitter.h"
 #include "linker/symbol_resolve.h"
+#include "runtime/owned.h"
+#include "runtime/verify_owned.h"
 
 #include <ctype.h>
 #include <stdarg.h>
@@ -72,6 +74,7 @@ struct MtlcContext {
   int ptx_isa_major;
   int ptx_isa_minor;
   int ptx_tensor_tuple_budget;
+  char runtime_directory[1024];
   MtlcDiagHandler diag_handler;
   void *diag_user_data;
   char last_error[512];
@@ -134,6 +137,19 @@ void mtlc_context_clear_error(MtlcContext *ctx) {
     ctx->last_error[0] = '\0';
     ctx->has_error = 0;
   }
+}
+
+int mtlc_context_set_runtime_directory(MtlcContext *ctx, const char *path) {
+  size_t length = path ? strlen(path) : 0;
+  if (!ctx || !path || length == 0 || length >= sizeof(ctx->runtime_directory)) {
+    return 0;
+  }
+  memcpy(ctx->runtime_directory, path, length + 1);
+  return 1;
+}
+
+const char *mtlc_context_runtime_directory(const MtlcContext *ctx) {
+  return ctx && ctx->runtime_directory[0] ? ctx->runtime_directory : NULL;
 }
 
 MtlcContext *mtlc_context_create(void) {
@@ -495,9 +511,10 @@ int mtlc_emit(MtlcContext *ctx, MtlcModule *module, MtlcArch arch,
  * import libraries are needed. */
 static int link_pe_internal(MtlcContext *ctx, const char **object_paths,
                             size_t object_count, const char *output_path) {
-  static const char *const import_dlls[] = {"kernel32.dll", "ucrtbase.dll",
-                                             "msvcrt.dll"};
-  LinkResolutionOptions resolution_options = {"mainCRTStartup", 16u, 1};
+  static const char *const import_dlls[] = {
+      "kernel32.dll", "ws2_32.dll", "user32.dll", "gdi32.dll",
+      "advapi32.dll", "winmm.dll"};
+  LinkResolutionOptions resolution_options = {"mettle_start", 16u, 1};
   LinkResolution *resolution = NULL;
   PeEmissionOptions emission = {0};
   char *error_message = NULL;
@@ -533,23 +550,36 @@ int mtlc_build_executable(MtlcContext *ctx, MtlcModule *module,
     return 0;
   }
   int wants_argc_argv = module->ir->main_wants_argc_argv;
+  const char *runtime_directory = mtlc_context_runtime_directory(ctx);
+  if (!runtime_directory) {
+    mtlc_diag(ctx, MTLC_DIAG_ERROR,
+              "mtlc_build_executable: set the libmtlc runtime directory first");
+    return 0;
+  }
 
   /* temp paths derived from the output path */
   size_t base_len = strlen(output_path);
   char *obj_path = (char *)malloc(base_len + 16);
   char *startup_path = (char *)malloc(base_len + 24);
-  if (!obj_path || !startup_path) {
+  size_t runtime_len = strlen(runtime_directory);
+  char *runtime_path = (char *)malloc(runtime_len + 32);
+  if (!obj_path || !startup_path || !runtime_path) {
     free(obj_path);
     free(startup_path);
+    free(runtime_path);
     mtlc_diag(ctx, MTLC_DIAG_ERROR, "out of memory building temporary paths");
     return 0;
   }
 #ifdef _WIN32
   snprintf(obj_path, base_len + 16, "%s.mtlcobj.obj", output_path);
   snprintf(startup_path, base_len + 24, "%s.mtlcstart.obj", output_path);
+  snprintf(runtime_path, runtime_len + 32, "%s/freestanding.obj",
+           runtime_directory);
 #else
   snprintf(obj_path, base_len + 16, "%s.mtlcobj.o", output_path);
   snprintf(startup_path, base_len + 24, "%s.mtlcstart.o", output_path);
+  snprintf(runtime_path, runtime_len + 32, "%s/freestanding.o",
+           runtime_directory);
 #endif
 
   int result = 0;
@@ -557,44 +587,61 @@ int mtlc_build_executable(MtlcContext *ctx, MtlcModule *module,
     goto done;
   }
 
-#ifdef _WIN32
-  /* binary_write_program_startup_object returns 0 on success (non-zero fails). */
+  {
+    FILE *runtime_file = fopen(runtime_path, "rb");
+    if (!runtime_file) {
+      mtlc_diag(ctx, MTLC_DIAG_ERROR,
+                "required freestanding runtime object not found at '%s'",
+                runtime_path);
+      goto done;
+    }
+    fclose(runtime_file);
+  }
+
   if (binary_write_program_startup_object(startup_path, 0, 0,
-                                          wants_argc_argv) != 0) {
+                                           wants_argc_argv) != 0) {
     mtlc_diag(ctx, MTLC_DIAG_ERROR,
-              "could not write the C-runtime startup object");
+              "could not write the freestanding startup object");
     goto done;
   }
+
+#ifdef _WIN32
   {
-    const char *objects[2] = {startup_path, obj_path};
-    result = link_pe_internal(ctx, objects, 2, output_path);
+    const char *objects[3] = {startup_path, runtime_path, obj_path};
+    result = link_pe_internal(ctx, objects, 3, output_path);
   }
 #else
-  /* ELF hosts: the system C toolchain provides crt startup + links the object. */
   {
-    size_t cmd_len = strlen(obj_path) + strlen(output_path) + 64;
-    char *cmd = (char *)malloc(cmd_len);
-    if (!cmd) {
+    const char *link_arguments[] = {
+        "ld",        "--gc-sections", "-z",     "noseparate-code",
+        "-e",        "_start",        "-o",     output_path,
+        startup_path, runtime_path,     obj_path,  NULL,
+    };
+    result = mettle_run_process("ld", link_arguments) == 0;
+    if (!result) {
       mtlc_diag(ctx, MTLC_DIAG_ERROR,
-                "out of memory building the link command");
-    } else {
-      snprintf(cmd, cmd_len, "cc -no-pie \"%s\" -o \"%s\"", obj_path,
-               output_path);
-      result = (system(cmd) == 0);
-      if (!result) {
-        mtlc_diag(ctx, MTLC_DIAG_ERROR,
-                  "the system C compiler failed to link '%s'", output_path);
-      }
-      free(cmd);
+                "the system linker failed to link '%s'", output_path);
     }
-    (void)wants_argc_argv;
   }
 #endif
+
+  if (result) {
+    char ownership_error[256];
+    if (!mettle_verify_owned_executable(output_path, ownership_error,
+                                         sizeof(ownership_error))) {
+      mtlc_diag(ctx, MTLC_DIAG_ERROR,
+                "refusing linked output '%s': %s", output_path,
+                ownership_error);
+      remove(output_path);
+      result = 0;
+    }
+  }
 
 done:
   remove(obj_path);
   remove(startup_path);
   free(obj_path);
   free(startup_path);
+  free(runtime_path);
   return result;
 }

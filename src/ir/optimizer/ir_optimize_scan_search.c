@@ -2358,11 +2358,11 @@ int ir_simd_slp_mac_i8_pass(IRFunction *function, int *changed) {
 }
 
 /* In-place vectorization of `a[i] = expf(a[i])` over a float32 array: a counted
- * unit-stride loop whose body loads a float, calls the libc `expf`, and stores
+ * unit stride loop whose body loads a float, calls the owned `expf`, and stores
  * the result back to the same element. Like a compiler's libm vectorizer
  * (libmvec/SVML), it replaces the call loop with an AVX2 polynomial exp
  * (IR_OP_SIMD_EXP_F32). Matched by the math-function call + element-wise map
- * shape, not a benchmark. The result tracks libc expf within tolerance. */
+ * shape, not a benchmark. The result tracks the owned expf within tolerance. */
 static int ir_try_vectorize_exp_f32_at(IRFunction *function, size_t header_index,
                                        int *changed) {
   if (!function || header_index + 4 >= function->instruction_count) {
