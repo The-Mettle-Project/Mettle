@@ -67,9 +67,9 @@ static int type_checker_eval_numeric_constant(TypeChecker *checker,
       return 0;
     }
 
-    Symbol *symbol = checker ? symbol_table_lookup(checker->symbol_table,
-                                                   identifier->name)
-                             : NULL;
+    Symbol *symbol = checker
+                         ? type_checker_resolve_identifier(checker, identifier)
+                         : NULL;
     if (!symbol || (symbol->kind != SYMBOL_CONSTANT &&
                     !symbol->has_constant_value)) {
       return 0;

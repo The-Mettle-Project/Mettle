@@ -6,6 +6,13 @@ and the standard library. The backend it compiles against is
 project; [Mettle and libmtlc](mettle-and-libmtlc.md) draws that line and
 explains how the dependency is fetched and pinned.
 
+## Direction
+
+[Ideology](ideology.md) is the decision procedure behind the rest of these
+pages: the four commitments the compiler already holds, the argument that
+control over compile time, bind time and run time is one feature rather than
+three, and the list of things that do not ship regardless of benefit.
+
 ## The language
 
 Start at the [language reference index](LANGUAGE.md). The individual chapters:

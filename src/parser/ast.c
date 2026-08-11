@@ -470,6 +470,7 @@ ASTNode *ast_clone_node(ASTNode *node) {
       return NULL;
     }
     dst->name = ast_intern_string(src->name);
+    dst->scope_id = src->scope_id;
     clone->data = dst;
     break;
   }
@@ -1965,7 +1966,9 @@ ASTNode *ast_create_inline_asm(const char *assembly_code,
   return node;
 }
 
-ASTNode *ast_create_identifier(const char *name, SourceLocation location) {
+ASTNode *ast_create_identifier_with_scope(const char *name,
+                                          ASTScopeId scope_id,
+                                          SourceLocation location) {
   ASTNode *node = ast_create_node(AST_IDENTIFIER, location);
   if (!node)
     return NULL;
@@ -1977,9 +1980,15 @@ ASTNode *ast_create_identifier(const char *name, SourceLocation location) {
   }
 
   identifier->name = ast_intern_string(name);
+  identifier->scope_id = scope_id;
   node->data = identifier;
 
   return node;
+}
+
+ASTNode *ast_create_identifier(const char *name, SourceLocation location) {
+  return ast_create_identifier_with_scope(name, AST_SCOPE_ID_UNRESOLVED,
+                                          location);
 }
 
 ASTNode *ast_create_number_literal(long long int_value,

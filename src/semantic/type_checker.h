@@ -141,4 +141,8 @@ Type *type_checker_check_binary_expression(TypeChecker *checker,
                                            BinaryExpression *binop,
                                            SourceLocation location);
 
+/* Resolve an AST identifier and record the scope that owns its binding. */
+Symbol *type_checker_resolve_identifier(TypeChecker *checker,
+                                        Identifier *identifier);
+
 #endif // TYPE_CHECKER_H

@@ -86,7 +86,7 @@ static int layoutable_global_initializer(TypeChecker *checker,
     const Identifier *identifier = (const Identifier *)expression->data;
     const Symbol *symbol =
         (checker && identifier && identifier->name)
-            ? symbol_table_lookup(checker->symbol_table, identifier->name)
+            ? type_checker_resolve_identifier(checker, (Identifier *)identifier)
             : NULL;
     return !symbol || !symbol->is_extern;
   }
@@ -1533,8 +1533,8 @@ int type_checker_process_declaration(TypeChecker *checker,
         }
         Identifier *identifier = (Identifier *)target->data;
         Symbol *symbol = identifier && identifier->name
-                             ? symbol_table_lookup(checker->symbol_table,
-                                                   identifier->name)
+                             ? type_checker_resolve_identifier(checker,
+                                                               identifier)
                              : NULL;
         if (!symbol || (symbol->kind != SYMBOL_VARIABLE &&
                         symbol->kind != SYMBOL_PARAMETER)) {

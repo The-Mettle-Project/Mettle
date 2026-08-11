@@ -64,6 +64,7 @@ typedef enum { SCOPE_GLOBAL, SCOPE_FUNCTION, SCOPE_BLOCK } ScopeType;
 
 typedef struct Scope {
   ScopeType type;
+  size_t scope_id;
   struct Scope *parent;
   struct Symbol **symbols;
   size_t symbol_count;
@@ -151,6 +152,7 @@ typedef struct Symbol {
 typedef struct SymbolTable {
   Scope *current_scope;
   Scope *global_scope;
+  size_t next_scope_id;
 } SymbolTable;
 
 // Function declarations

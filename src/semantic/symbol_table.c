@@ -6,6 +6,7 @@
 #include "string_intern.h"
 #include "common.h"
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 
 static int symbol_table_names_equal(const char *lhs, const char *rhs) {
@@ -236,6 +237,7 @@ SymbolTable *symbol_table_create(void) {
   }
 
   table->global_scope->type = SCOPE_GLOBAL;
+  table->global_scope->scope_id = 0;
   table->global_scope->parent = NULL;
   table->global_scope->symbols = NULL;
   table->global_scope->symbol_count = 0;
@@ -244,6 +246,7 @@ SymbolTable *symbol_table_create(void) {
   table->global_scope->name_index_bucket_count = 0;
 
   table->current_scope = table->global_scope;
+  table->next_scope_id = 1;
 
   return table;
 }
@@ -308,7 +311,13 @@ int symbol_table_enter_scope(SymbolTable *table, ScopeType type) {
   if (!new_scope)
     return 0;
 
+  if (table->next_scope_id == SIZE_MAX) {
+    free(new_scope);
+    return 0;
+  }
+
   new_scope->type = type;
+  new_scope->scope_id = table->next_scope_id++;
   new_scope->parent = table->current_scope;
   new_scope->symbols = NULL;
   new_scope->symbol_count = 0;

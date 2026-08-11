@@ -500,9 +500,8 @@ static Type *type_checker_atomic_builtin(TypeChecker *checker,
   int fixed_space = 0;
   if (call->arguments[0]->type == AST_IDENTIFIER &&
       call->arguments[0]->data) {
-    const char *name = ((Identifier *)call->arguments[0]->data)->name;
-    Symbol *symbol = name ? symbol_table_lookup(checker->symbol_table, name)
-                          : NULL;
+    Identifier *identifier = (Identifier *)call->arguments[0]->data;
+    Symbol *symbol = type_checker_resolve_identifier(checker, identifier);
     if (symbol && symbol->address_space != MTLC_ADDRESS_SPACE_DEFAULT) {
       inferred_space = symbol->address_space;
       fixed_space = symbol->is_address_space_binding ||
@@ -1748,7 +1747,7 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
 
   case AST_IDENTIFIER: {
     Identifier *id = (Identifier *)expression->data;
-    Symbol *symbol = symbol_table_lookup(checker->symbol_table, id->name);
+    Symbol *symbol = type_checker_resolve_identifier(checker, id);
     if (!symbol) {
       type_checker_report_undefined_symbol(checker, expression->location,
                                            id->name, "variable");
@@ -1961,7 +1960,7 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
       if (unop->operand->type == AST_IDENTIFIER) {
         Identifier *id = (Identifier *)unop->operand->data;
         if (id && id->name) {
-          Symbol *sym = symbol_table_lookup(checker->symbol_table, id->name);
+          Symbol *sym = type_checker_resolve_identifier(checker, id);
           if (sym && sym->kind == SYMBOL_FUNCTION) {
             // Taking address of a function - create function pointer type
             Type **param_types = sym->data.function.parameter_types;
@@ -2155,8 +2154,7 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
         call->function_name) {
       Identifier *recv_id = (Identifier *)call->object->data;
       if (recv_id && recv_id->name) {
-        Symbol *recv_sym =
-            symbol_table_lookup(checker->symbol_table, recv_id->name);
+        Symbol *recv_sym = type_checker_resolve_identifier(checker, recv_id);
         if (recv_sym && recv_sym->kind == SYMBOL_ENUM) {
           /* Drop the receiver — leak-free: the identifier node is owned by
            * the AST tree and freed when the program is freed. */
@@ -2394,7 +2392,7 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
     if (func_type->kind != TYPE_FUNCTION_POINTER &&
         fp_call->function->type == AST_IDENTIFIER) {
       Identifier *id = (Identifier *)fp_call->function->data;
-      Symbol *sym = symbol_table_lookup(checker->symbol_table, id->name);
+      Symbol *sym = type_checker_resolve_identifier(checker, id);
       if (sym && sym->kind == SYMBOL_FUNCTION) {
         Type **param_types = sym->data.function.parameter_types;
         size_t param_count = sym->data.function.parameter_count;
@@ -2470,8 +2468,7 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
     if (member->object && member->object->type == AST_IDENTIFIER) {
       Identifier *obj_id = (Identifier *)member->object->data;
       if (obj_id && obj_id->name) {
-        Symbol *enum_sym =
-            symbol_table_lookup(checker->symbol_table, obj_id->name);
+        Symbol *enum_sym = type_checker_resolve_identifier(checker, obj_id);
         if (enum_sym && enum_sym->kind == SYMBOL_ENUM && enum_sym->type) {
           Type *enum_ty = enum_sym->type;
           if (enum_ty->kind == TYPE_ENUM) {

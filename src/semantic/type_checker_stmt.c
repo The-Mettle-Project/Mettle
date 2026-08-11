@@ -70,9 +70,8 @@ static int type_checker_check_gpu_launch(TypeChecker *checker,
    * compiler cannot check beyond its being an integer or pointer. */
   Symbol *kernel_symbol = NULL;
   if (launch->kernel->type == AST_IDENTIFIER && launch->kernel->data) {
-    const char *name = ((Identifier *)launch->kernel->data)->name;
-    Symbol *symbol = name ? symbol_table_lookup(checker->symbol_table, name)
-                          : NULL;
+    Identifier *identifier = (Identifier *)launch->kernel->data;
+    Symbol *symbol = type_checker_resolve_identifier(checker, identifier);
     if (symbol && symbol->kind == SYMBOL_FUNCTION && symbol->is_kernel) {
       kernel_symbol = symbol;
     }
@@ -640,8 +639,7 @@ int type_checker_check_switch_statement(TypeChecker *checker,
       if (!case_eval_ok &&
           case_clause->value->type == AST_IDENTIFIER) {
         Identifier *cid = (Identifier *)case_clause->value->data;
-        Symbol *csym =
-            symbol_table_lookup(checker->symbol_table, cid->name);
+        Symbol *csym = type_checker_resolve_identifier(checker, cid);
         if (csym && csym->kind == SYMBOL_CONSTANT) {
           case_value = csym->data.constant.value;
           case_eval_ok = 1;
@@ -656,7 +654,7 @@ int type_checker_check_switch_statement(TypeChecker *checker,
           Identifier *cma_obj = (Identifier *)cma->object->data;
           if (cma_obj && cma_obj->name) {
             Symbol *enum_sym =
-                symbol_table_lookup(checker->symbol_table, cma_obj->name);
+                type_checker_resolve_identifier(checker, cma_obj);
             if (enum_sym && enum_sym->kind == SYMBOL_ENUM) {
               Symbol *vsym =
                   symbol_table_lookup(checker->symbol_table, cma->member);
@@ -708,8 +706,7 @@ int type_checker_check_switch_statement(TypeChecker *checker,
         if (!high_eval_ok &&
             case_clause->value_high->type == AST_IDENTIFIER) {
           Identifier *hid = (Identifier *)case_clause->value_high->data;
-          Symbol *hsym =
-              symbol_table_lookup(checker->symbol_table, hid->name);
+          Symbol *hsym = type_checker_resolve_identifier(checker, hid);
           if (hsym && hsym->kind == SYMBOL_CONSTANT) {
             case_high_value = hsym->data.constant.value;
             high_eval_ok = 1;

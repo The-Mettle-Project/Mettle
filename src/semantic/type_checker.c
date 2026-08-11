@@ -1,6 +1,21 @@
 // Type checker: lifecycle, function-signature registration, program driver.
 #include "type_checker_internal.h"
 
+Symbol *type_checker_resolve_identifier(TypeChecker *checker,
+                                        Identifier *identifier) {
+  if (!checker || !checker->symbol_table || !identifier ||
+      !identifier->name) {
+    return NULL;
+  }
+
+  Symbol *symbol =
+      symbol_table_lookup(checker->symbol_table, identifier->name);
+  if (symbol && symbol->scope) {
+    identifier->scope_id = symbol->scope->scope_id;
+  }
+  return symbol;
+}
+
 TypeChecker *type_checker_create(SymbolTable *symbol_table) {
   return type_checker_create_with_error_reporter(symbol_table, NULL);
 }

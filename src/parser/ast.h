@@ -7,6 +7,12 @@
 #include "mtlc/tensor.h"
 #include <stddef.h>
 
+/* A parsed identifier has no binding until semantic analysis resolves it.
+ * Scope ids are stable for the lifetime of one symbol table and let later
+ * passes distinguish two bindings that share a source name. */
+typedef size_t ASTScopeId;
+#define AST_SCOPE_ID_UNRESOLVED ((ASTScopeId)-1)
+
 typedef enum {
   AST_PROGRAM,
   AST_IMPORT,
@@ -335,6 +341,7 @@ typedef struct {
 
 typedef struct {
   char *name;
+  ASTScopeId scope_id;
 } Identifier;
 
 typedef struct {
@@ -537,6 +544,9 @@ ASTNode *ast_create_multi_assignment(ASTNode **targets, size_t target_count,
 ASTNode *ast_create_inline_asm(const char *assembly_code,
                                SourceLocation location);
 ASTNode *ast_create_identifier(const char *name, SourceLocation location);
+ASTNode *ast_create_identifier_with_scope(const char *name,
+                                          ASTScopeId scope_id,
+                                          SourceLocation location);
 ASTNode *ast_create_number_literal(long long int_value,
                                    SourceLocation location,
                                    unsigned char int_radix);

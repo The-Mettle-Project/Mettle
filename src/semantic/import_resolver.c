@@ -1554,6 +1554,7 @@ static int rewrite_node_names(ASTNode *node, const NameRewrite *rewrites,
           return 0;
         }
         identifier->name = (char *)string_intern(qualified);
+        identifier->scope_id = AST_SCOPE_ID_UNRESOLVED;
         free(qualified);
         if (!identifier->name) {
           free(identifier);
