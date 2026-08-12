@@ -1,21 +1,56 @@
 # Documentation
 
-This repository is **Mettle**: the language, its compiler frontend, the driver,
-and the standard library. The backend it compiles against is
-[**libmtlc**](https://github.com/The-Mettle-Project/libmtlc), a separate
-project; [Mettle and libmtlc](mettle-and-libmtlc.md) draws that line and
-explains how the dependency is fetched and pinned.
+This repository is **libmtlc**, a reusable native compiler backend, plus
+**Mettle**, the reference frontend that drives it. The docs are organized the
+same way.
 
-## Direction
+## The backend: libmtlc
 
-[Ideology](ideology.md) is the decision procedure behind the rest of these
-pages: the four commitments the compiler already holds, the argument that
-control over compile time, bind time and run time is one feature rather than
-three, and the list of things that do not ship regardless of benefit.
+libmtlc owns the IR, the optimizers, code generation for four targets (x86-64
+with AVX2, ARM64, NVIDIA PTX, SPIR-V), and linking. Any frontend can build IR
+and drive it through the public C API in [`include/mtlc/`](../include/mtlc/).
 
-## The language
+**The [libmtlc reference](libmtlc/README.md)** is the backend's own
+documentation set:
 
-Start at the [language reference index](LANGUAGE.md). The individual chapters:
+- [Getting started](embedding.md): the tutorial (build IR, optimize, emit,
+  link) with a complete non-Mettle example.
+- [API reference](libmtlc/api.md): every public function, with ownership,
+  lifetime, error, and thread-safety contracts.
+- [The IR model](libmtlc/ir.md): values, instructions, control-flow rules,
+  module tables, and per-consumer IR shape requirements.
+- [The type system](libmtlc/types.md): `MtlcType` kinds, layout, canonical
+  constructors, and the immortality contract.
+- [The pipeline](libmtlc/pipeline.md): the optimizer pass families, the
+  ML-opt validation gate, each code generator's product and limits, linking.
+- [Internals](libmtlc/internals.md): source layout, self-containment
+  invariants, and how to extend the backend.
+
+Driver-facing views of the same machinery:
+
+- [Compilation](compilation.md): the `mettle` driver and its options.
+- [Linker and build pipelines](linker-build-pipelines.md): which linker runs
+  for each `--build` combination.
+- [GPU offload](gpu.md): the PTX and SPIR-V targets from Mettle source.
+- [GPU architecture and acceptance contract](gpu-architecture.md): the GB10 /
+  AArch64 target matrix, frontend/backend boundary, honest gap table, and the
+  gates required before making parity or performance claims.
+- [ML-driven IR optimization](ml-opt.md), [Translation
+  validation](translation-validation.md), [Profile-guided
+  optimization](pgo.md): `--ml-opt`, `--verify`, `--pgo`.
+- [Runtime model](runtime-model.md): what emitted programs assume of the OS.
+- [Diagnostics](diagnostics.md): the frontend-neutral diagnostics reporter.
+- [The `--explain-json` schema](explain-json.md): the machine-readable
+  optimization report editors and analysis tools read.
+
+A second, non-Mettle frontend that exercises the whole public API lives in
+[`examples/calc`](../examples/calc).
+
+## The reference frontend: the Mettle language
+
+Mettle is a typed, assembly-inspired systems language. These document the
+*language* the reference frontend implements (see the
+[language reference index](LANGUAGE.md)):
 
 - [Lexical structure](lexical-structure.md), [Types](types.md),
   [Declarations](declarations.md), [Expressions](expressions.md),
@@ -27,54 +62,7 @@ Start at the [language reference index](LANGUAGE.md). The individual chapters:
 - [Compile-time execution](testing.md) (`mettle test` / `trace`),
   [Quick reference](quick-reference.md), [Known limitations](known-limitations.md)
 
-## The compiler
-
-- [Compilation](compilation.md): the `mettle` driver and its options.
-- [Diagnostics](diagnostics.md): how errors and warnings are reported.
-- [Linker and build pipelines](linker-build-pipelines.md): which linker runs
-  for each `--build` combination.
-- [Runtime model](runtime-model.md): what emitted programs assume of the OS.
-- [Mettle and libmtlc](mettle-and-libmtlc.md): what this repository owns, what
-  the backend owns, and how to build and sync across the two.
-
-## Optimization and GPU offload
-
-These are driver-facing views of machinery that lives in libmtlc. The flags are
-Mettle's; the passes behind them are the backend's.
-
-- [ML-driven IR optimization](ml-opt.md) and [the ML-opt
-  oracle](ml-opt-oracle.md): `--ml-opt`.
-- [Translation validation](translation-validation.md): `--verify`.
-- [Profile-guided optimization](pgo.md): `--pgo`.
-- [The `--explain-json` schema](explain-json.md): the machine-readable
-  optimization report editors and analysis tools read.
-- [GPU offload](gpu.md): the PTX and SPIR-V targets from Mettle source.
-- [GPU architecture and acceptance contract](gpu-architecture.md): the GB10 /
-  AArch64 target matrix, the frontend/backend boundary, an honest gap table,
-  and the gates required before making parity or performance claims.
-
-## The backend
-
-libmtlc has its own documentation set, in its own repository: the [API
-reference](https://github.com/The-Mettle-Project/libmtlc/blob/main/docs/libmtlc/api.md),
-[the IR model](https://github.com/The-Mettle-Project/libmtlc/blob/main/docs/libmtlc/ir.md),
-[the type system](https://github.com/The-Mettle-Project/libmtlc/blob/main/docs/libmtlc/types.md),
-[the pipeline and per-target
-limits](https://github.com/The-Mettle-Project/libmtlc/blob/main/docs/libmtlc/pipeline.md),
-and [internals](https://github.com/The-Mettle-Project/libmtlc/blob/main/docs/libmtlc/internals.md).
-[Writing a frontend for
-libmtlc](https://github.com/The-Mettle-Project/libmtlc/blob/main/docs/embedding.md)
-is the tutorial for driving the backend from a language that is not Mettle, and
-[the end-to-end
-architecture](https://github.com/The-Mettle-Project/libmtlc/blob/main/docs/ARCHITECTURE.md)
-is the single-document deep dive across both halves.
-
-Those links track libmtlc's `main`, while
-[`libmtlc.version`](../libmtlc.version) pins a specific commit — so read them at
-that commit when the difference matters. A fetched dependency carries the same
-docs at `libmtlc/docs/`, always at the pinned revision.
-
 ## Contributing
 
-See [CONTRIBUTING.md](../CONTRIBUTING.md) for the build and test workflow.
-Backend changes belong upstream in libmtlc, not here.
+See [CONTRIBUTING.md](../CONTRIBUTING.md) for the build/test workflow and the
+rules that keep the backend frontend-agnostic.

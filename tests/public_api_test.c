@@ -6,8 +6,8 @@
  *
  * Builds six module families through mtlc/build.h and emits through
  * mtlc/pipeline.h:
- *   1. native:  globals (read+write), extern malloc + putchar (libc via the
- *      internal PE linker), pointer load/store, address-of local, float
+ *   1. native:  globals (read+write), owned malloc + putchar, pointer
+ *      load/store, address-of local, float
  *      arithmetic + cast, optimizer on -> <outdir>/pubapi_native.exe
  *      (the harness runs it: expects exit code 42 and stdout "OK")
  *   2. gpu:     a float32* kernel -> PTX text (checked: ".entry") and a SPIR-V
@@ -496,7 +496,7 @@ static MtlcModule *build_native_module(void) {
   /* module global, read AND written below */
   mtlc_builder_global(b, "counter", i64, 40, /*extern=*/0);
 
-  /* libc externs, resolved by the internal PE linker from msvcrt/ucrtbase */
+  /* Runtime externs resolved by libmtlc's freestanding program object. */
   {
     const char *pn[] = {"size"};
     const MtlcType *pt[] = {i64};
@@ -2491,6 +2491,10 @@ int main(int argc, char **argv) {
       mtlc_context_ptx_isa_minor(ctx) != 8 ||
       mtlc_context_ptx_tensor_tuple_budget(ctx) != 0) {
     return fail("default GB10 PTX context profile");
+  }
+  if (!mtlc_context_set_runtime_directory(ctx, "bin/runtime") ||
+      strcmp(mtlc_context_runtime_directory(ctx), "bin/runtime") != 0) {
+    return fail("freestanding runtime context path");
   }
   if (mtlc_context_set_ptx_target(ctx, "sm_bad", 8, 8)) {
     return fail("malformed PTX target accepted");

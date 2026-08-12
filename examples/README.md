@@ -1,13 +1,17 @@
 # Examples
 
-Runnable Mettle programs. Most double as the runtime benchmark suite, pairing a
-`.mettle` implementation against C and Rust versions of the same kernel.
+Runnable programs for the two halves of the repo. Most are written in the Mettle
+reference frontend and double as the runtime benchmark suite; [`calc/`](calc/)
+is a second, non-Mettle frontend that drives the libmtlc backend directly through
+its public API.
 
-Driving the [libmtlc](https://github.com/The-Mettle-Project/libmtlc) backend from
-a language that is not Mettle is a different exercise, and lives in that
-repository: [`examples/calc`](https://github.com/The-Mettle-Project/libmtlc/tree/main/examples/calc)
-is a tiny C-like language whose entire compiler is one file, using only the
-public `mtlc/` headers.
+## A second frontend for libmtlc
+
+[`calc/`](calc/) is a tiny C-like language whose entire compiler is one file. It
+uses only the public headers in [`include/mtlc/`](../include/mtlc/) and links
+only the library, lowering its own parse into libmtlc IR and compiling it to a
+native executable. See [`calc/README.md`](calc/README.md) and
+[docs/embedding.md](../docs/embedding.md).
 
 ## Benchmark examples
 

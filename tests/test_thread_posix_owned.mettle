@@ -1,0 +1,51 @@
+// Compatibility API gate for the owned Linux clone and futex runtime.
+
+import "std/io";
+import "std/mem";
+import "std/thread_posix";
+
+export var owned_mutex: cstring = 0;
+export var owned_count: int32 = 0;
+
+fn owned_worker(arg: cstring) -> cstring {
+  var i: int32 = 0;
+  while (i < 2000) {
+    pthread_mutex_lock(owned_mutex);
+    owned_count = owned_count + 1;
+    pthread_mutex_unlock(owned_mutex);
+    i = i + 1;
+  }
+  return arg;
+}
+
+fn main() -> int32 {
+  owned_mutex = mutex_create_posix();
+  if (owned_mutex == 0) {
+    println("PTHREAD OWNED FAIL: mutex");
+    return 1;
+  }
+
+  var first: int64 = 0;
+  var second: int64 = 0;
+  if (pthread_create(&first, 0, &owned_worker, 0) != 0 ||
+      pthread_create(&second, 0, &owned_worker, 0) != 0) {
+    println("PTHREAD OWNED FAIL: create");
+    return 1;
+  }
+  if (thread_join_posix(first) != 0 || thread_join_posix(second) != 0) {
+    println("PTHREAD OWNED FAIL: join");
+    return 1;
+  }
+  if (owned_count != 4000) {
+    println("PTHREAD OWNED FAIL: count");
+    println_int(owned_count);
+    return 1;
+  }
+  if (mutex_destroy_posix(owned_mutex) != 0) {
+    println("PTHREAD OWNED FAIL: destroy");
+    return 1;
+  }
+  free(owned_mutex);
+  println("PTHREAD OWNED OK");
+  return 0;
+}

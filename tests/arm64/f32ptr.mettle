@@ -1,0 +1,37 @@
+// float32 travelling through pointers, parameters and returns. Every step here
+// used to decode a 32-bit pattern as a double, which reads as a denormal and
+// quietly yields ~0 rather than faulting:
+//   - "float32*" matched strstr(type, "float"), so a POINTER parameter was
+//     classified as a float and passed in a vector register while the caller
+//     passed it in a GP register;
+//   - a cast's and a comparison's float_bits describe their RESULT, so both
+//     were 0 and the width had to come from the operand;
+//   - `x + 1.5` ran in double because the literal's nominal width won, and the
+//     literal itself was built as a double pattern and then read as a single;
+//   - a float32-returning call's result width was never recorded.
+// 28 + 5 + 7 + 1 = 41
+fn addall(x: float32*, n: int32) -> float32 {
+  var s: float32 = 0.0;
+  var i: int32 = 0;
+  while (i < n) { s = s + x[i]; i = i + 1; }
+  return s;
+}
+fn first(x: float32*) -> float32 { return x[0]; }
+fn main() -> int64 {
+  var xs: float32[8];
+  var i: int32 = 0;
+  while (i < 8) { xs[i] = (float32)i; i = i + 1; }
+  var total: int64 = (int64)(int32)addall(&xs[0], 8);   // 0+1+..+7 = 28
+
+  var v: float32 = 3.5;
+  var p: float32* = &v;
+  *p = *p + 1.5;
+  total = total + (int64)(int32)v;                      // 5
+
+  xs[3] = 7.25;
+  total = total + (int64)(int32)first(&xs[3]);          // 7
+
+  var a: float32 = 1.5;
+  if (a < 2.0) { total = total + 1; }                   // compare at 32 bits
+  return total;
+}

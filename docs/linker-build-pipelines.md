@@ -25,7 +25,7 @@ Optional: `objdump -x` / `llvm-readobj` on the object and final PE for symbol an
 
 ## Binary Emitter To Internal Linker Relocation Map
 
-The object backend records relocations in [`binary_emitter_map_relocation_kind`](https://github.com/The-Mettle-Project/libmtlc/blob/main/src/codegen/binary_emitter.c). The internal linker applies them in [`link_apply_relocations`](https://github.com/The-Mettle-Project/libmtlc/blob/main/src/linker/relocation.c):
+The object backend records relocations in [`binary_emitter_map_relocation_kind`](../src/codegen/binary_emitter.c). The internal linker applies them in [`link_apply_relocations`](../src/linker/relocation.c):
 
 | `BinaryRelocationKind` | AMD64 COFF type | Width |
 | --- | --- | --- |
@@ -38,7 +38,7 @@ Unsupported COFF relocation types in a merged input fail with a clear error from
 
 ## ELF Relocations
 
-The ELF writer in [`elf_emitter.c`](https://github.com/The-Mettle-Project/libmtlc/blob/main/src/codegen/elf_emitter.c) maps the same `BinaryRelocationKind` values to ELF x86-64 types, then leaves resolution to the system linker:
+The ELF writer in [`elf_emitter.c`](../src/codegen/elf_emitter.c) maps the same `BinaryRelocationKind` values to ELF x86-64 types, then leaves resolution to the system linker:
 
 | `BinaryRelocationKind` | ELF x86-64 type | Implicit addend |
 | --- | --- | --- |

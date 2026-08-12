@@ -1,10 +1,10 @@
 // Mettle standard library: System
 //
-// Process spawning via C runtime system().
+// Process spawning through Mettle's owned process layer.
 // Use for running shell commands (Mettle, nasm, gcc, git, curl, etc.).
 //
-// On Windows: invokes cmd.exe /c <cmd>
-// On Linux: invokes sh -c <cmd>
+// On Windows: invokes cmd.exe /c <cmd> with CreateProcess.
+// On Linux: invokes sh -c <cmd> with fork and execve system calls.
 //
 // Returns the command's exit status, or -1 on error.
 

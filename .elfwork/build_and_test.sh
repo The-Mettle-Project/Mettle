@@ -3,40 +3,29 @@
 # startup-object emitter harness, then compiles + links + runs Mettle programs
 # with bare `ld` (no libc) to validate the self-contained _start.
 #
-# Needs the libmtlc backend in place (./get-libmtlc.sh, or LIBMTLC_DIR pointing
-# at a checkout): the startup-object emitter is the backend's.
-#
 # Usage: bash .elfwork/build_and_test.sh
 set -u
 cd "$(dirname "$0")/.."
 W="$PWD/.elfwork"
-LIBMTLC_DIR=${LIBMTLC_DIR:-libmtlc}
-
-if [ ! -f "$LIBMTLC_DIR/include/mtlc/mtlc.h" ]; then
-  echo "libmtlc not found in '$LIBMTLC_DIR'. Run ./get-libmtlc.sh first."
-  exit 1
-fi
 
 echo "== building compiler =="
-# Through the Makefile, so the frontend/backend split stays in one place.
-make -j"$(nproc 2>/dev/null || echo 2)" LIBMTLC_DIR="$LIBMTLC_DIR" >"$W/cc.log" 2>&1 \
-  || { echo "COMPILER BUILD FAILED"; cat "$W/cc.log"; exit 1; }
-cp bin/mettle "$W/mettle"
+gcc -std=c99 -O1 -D_GNU_SOURCE -Isrc -fno-omit-frame-pointer \
+  src/common.c src/lexer/*.c src/parser/*.c src/semantic/*.c src/ir/*.c \
+  src/codegen/*.c src/codegen/binary/*.c src/linker/*.c src/error/*.c \
+  src/debug/*.c src/compiler/*.c src/main.c src/tracy_build.c \
+  -o "$W/mettle" -rdynamic 2>"$W/cc.log" || { echo "COMPILER BUILD FAILED"; cat "$W/cc.log"; exit 1; }
 
 echo "== building startup-object harnesses =="
-# noargs (main_wants_argc_argv=0) and argv (=1) variants. The emitter and every
-# translation unit it needs live in libmtlc.
-L="$LIBMTLC_DIR/src"
+# noargs (main_wants_argc_argv=0) and argv (=1) variants
 for variant in 0 1; do
   cat > "$W/h_$variant.c" <<EOF
 int binary_write_program_startup_object(const char*,int,int,int);
 int main(void){return binary_write_program_startup_object("$W/start_$variant.o",0,0,$variant);}
 EOF
-  gcc -std=c99 -O1 -D_GNU_SOURCE -I"$LIBMTLC_DIR/include" -I"$L" -I"$L/codegen" \
-    "$W/h_$variant.c" \
-    "$L/common.c" "$L/error/error_reporter.c" \
-    "$L/codegen/binary_emitter.c" "$L/codegen/elf_emitter.c" \
-    "$L/codegen/binary/encoders.c" "$L/codegen/binary/support.c" "$L/codegen/binary/startup.c" \
+  gcc -std=c99 -O1 -D_GNU_SOURCE -Isrc -Isrc/codegen "$W/h_$variant.c" \
+    src/common.c src/lexer/lexer.c src/error/error_reporter.c \
+    src/codegen/binary_emitter.c src/codegen/elf_emitter.c \
+    src/codegen/binary/encoders.c src/codegen/binary/support.c src/codegen/binary/startup.c \
     -o "$W/h_$variant" 2>"$W/h_$variant.log" || { echo "HARNESS $variant FAILED"; cat "$W/h_$variant.log"; exit 1; }
   "$W/h_$variant" || { echo "startup emit $variant failed"; exit 1; }
 done

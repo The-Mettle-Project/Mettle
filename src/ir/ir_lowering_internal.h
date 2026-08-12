@@ -7,7 +7,7 @@
 // lowering context, helper structs, and static-helper prototypes.
 
 #include "ir_lowering.h" // ir.h + frontend AST/type headers + lowering entry points
-#include "common.h"
+#include "../common.h"
 #include "compiler/compiler_context.h"
 #include <limits.h>
 #include <stdarg.h>

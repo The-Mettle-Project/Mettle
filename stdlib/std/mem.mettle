@@ -3,7 +3,8 @@
 // Raw memory management and buffer operations.
 // For runtime-tracked heap objects, use the `new` keyword instead.
 
-// ─── C runtime memory functions ─────────────────────────────────────────────
+// Owned runtime memory functions
+// These ABI names bind to Mettle's owned allocator and memory code.
 export extern fn malloc(size: int64) -> cstring = "malloc";
 export extern fn calloc(count: int64, size: int64) -> cstring = "calloc";
 export extern fn realloc(ptr: cstring, size: int64) -> cstring = "realloc";
@@ -15,9 +16,9 @@ export extern fn memcmp(a: cstring, b: cstring, size: int64) -> int32 = "memcmp"
 
 // ─── Native memory operations ───────────────────────────────────────────────
 //
-// Pure-Mettle byte operations, independent of the C runtime. They move 8 bytes
+// Pure Mettle byte operations. They move 8 bytes
 // at a time on the bulk of the range and clean up the unaligned tail one byte
-// at a time, so they are competitive with libc memcpy/memset on hot paths and
+// at a time for the bulk range and
 // give Mettle a self-contained primitive surface that the auto-vectorizer can
 // pick up. `byte` arguments use only the low 8 bits.
 

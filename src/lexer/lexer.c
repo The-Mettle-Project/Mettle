@@ -1,6 +1,6 @@
 #include "lexer.h"
 #include "common.h"
-#include "string_intern.h"
+#include "../string_intern.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>

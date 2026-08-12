@@ -3,10 +3,9 @@
 // Linux counterpart to std/thread. Exposes the SAME public API as std/thread
 // (CreateThread/WaitForSingleObject/CloseHandle/Sleep/CreateMutexA/etc.) so a
 // single `import "std/thread"` works on both Windows and Linux. Underneath it
-// calls pthreads via thin C trampolines in src/runtime/posix_helpers.c, which
-// the compiler auto-links along with -lpthread when std/thread is imported on
-// Linux. Interlocked* atomics use the same cross-platform mettle_atomic_*
-// runtime symbols as the Windows module.
+// calls the owned runtime, which uses clone and futex directly. No pthread or
+// C runtime library is linked. Interlocked atomics use the same owned
+// mettle_atomic_* symbols as the Windows module.
 //
 // The import resolver picks this file over thread.mettle automatically on the
 // native ELF target.
@@ -18,7 +17,7 @@ export fn WAIT_TIMEOUT() -> uint32 { return 258; }
 export fn WAIT_FAILED() -> uint32 { return 0xFFFFFFFF; }
 
 // ─── Thread lifecycle ────────────────────────────────────────────────────────
-// Win32-shape signatures bound to pthreads-backed C helpers.
+// Win32 shape signatures bound to owned clone and futex helpers.
 export extern fn CreateThread(lpThreadAttributes: cstring, dwStackSize: uint64, lpStartAddress: fn(cstring) -> uint32, lpParameter: cstring, dwCreationFlags: uint32, lpThreadId: uint32*) -> int64 = "mettle_thread_create";
 export extern fn CloseHandle(hObject: int64) -> int32 = "mettle_thread_close";
 export extern fn WaitForSingleObject(hHandle: int64, dwMilliseconds: uint32) -> uint32 = "mettle_thread_wait";

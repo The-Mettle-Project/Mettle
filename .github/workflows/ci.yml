@@ -1,16 +1,12 @@
 name: CI
 
 # Fast PR signal plus deeper compiler guards:
-# - workflow/script/package hygiene catches broken automation and editor support;
+# - workflow/script hygiene catches broken automation;
 # - Windows GCC runs the full ABI/runtime/regression suite and deterministic fuzz gate;
 # - Windows Clang compile-only catches compiler portability warnings quickly;
 # - Linux GCC/Clang exercise the ELF/SysV backend;
 # - Linux sanitizers run the compiler under ASan/UBSan while compiling ELF programs.
 # The heavy differential fuzz sweep lives in fuzz-nightly.yml.
-#
-# Every job that builds the compiler first fetches libmtlc, the backend this
-# frontend links against, at the revision pinned in libmtlc.version. The
-# dependency is cached on that pin, so a normal run downloads nothing.
 
 on:
   push:
@@ -49,10 +45,9 @@ jobs:
         run: |
           set -euo pipefail
           bash -n install.sh
-          bash -n get-libmtlc.sh
           bash -n tools/test-elf-native.sh
           if command -v shellcheck >/dev/null 2>&1; then
-            shellcheck install.sh get-libmtlc.sh tools/test-elf-native.sh
+            shellcheck install.sh tools/test-elf-native.sh
           else
             echo "::warning::shellcheck is not installed on this runner; bash -n completed"
           fi
@@ -90,18 +85,6 @@ jobs:
           gcc --version
           python --version
           $PSVersionTable.PSVersion
-
-      - name: Cache libmtlc
-        uses: actions/cache@v4
-        with:
-          path: libmtlc
-          key: libmtlc-windows-gcc-${{ hashFiles('libmtlc.version') }}
-
-      - name: Fetch and build libmtlc backend
-        shell: pwsh
-        env:
-          METTLE_NO_CODEVIEW: "1"
-        run: .\get-libmtlc.ps1
 
       # build.bat builds the compiler, bundles stdlib/runtime, then runs
       # tests/run_tests.ps1 (full suite + 60-seed differential fuzz). It exits
@@ -155,21 +138,6 @@ jobs:
           clang --version
           $PSVersionTable.PSVersion
 
-      - name: Cache libmtlc
-        uses: actions/cache@v4
-        with:
-          path: libmtlc
-          key: libmtlc-windows-clang-${{ hashFiles('libmtlc.version') }}
-
-      - name: Fetch and build libmtlc backend with Clang
-        shell: pwsh
-        env:
-          METTLE_NO_CODEVIEW: "1"
-          CC: clang
-        run: |
-          $env:Path = "C:\msys64\clang64\bin;$env:Path"
-          .\get-libmtlc.ps1
-
       - name: Compile compiler with Clang
         shell: pwsh
         env:
@@ -204,17 +172,6 @@ jobs:
           ld --version | head -1
           make --version | head -1
 
-      - name: Cache libmtlc
-        uses: actions/cache@v4
-        with:
-          path: libmtlc
-          key: libmtlc-linux-${{ matrix.cc }}-${{ hashFiles('libmtlc.version') }}
-
-      - name: Fetch and build libmtlc backend
-        env:
-          CC: ${{ matrix.cc }}
-        run: ./get-libmtlc.sh
-
       - name: Build compiler
         run: |
           make clean
@@ -226,6 +183,163 @@ jobs:
       - name: Native ELF backend tests
         run: bash tools/test-elf-native.sh
 
+  # Native AArch64 gate for the DGX Spark toolchain path: compiler bootstrap,
+  # relocatable host objects and external linking, the 11-argument CUDA launch
+  # ABI, portable/GB10 PTX, SPIR-V, and the legacy self-contained smoke product.
+  # CUDA hardware execution remains in the DGX acceptance suite.
+  gpu-arm64:
+    name: GPU toolchain (linux arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build compiler natively on AArch64
+        run: |
+          test "$(uname -m)" = "aarch64"
+          make -j"$(nproc)" CC=gcc
+
+      - name: Emit frontend-agnostic GPU modules
+        run: |
+          ./bin/mettle --emit-ptx --gpu-arch=portable tests/gpu/compute_kernels.mettle -o /tmp/mettle-portable.ptx
+          grep -qx '.version 6.4' /tmp/mettle-portable.ptx
+          grep -qx '.target compute_75' /tmp/mettle-portable.ptx
+          ./bin/mettle --emit-ptx --gpu-arch=gb10 tests/gpu/compute_kernels.mettle -o /tmp/mettle-gb10.ptx
+          grep -qx '.version 8.8' /tmp/mettle-gb10.ptx
+          grep -qx '.target sm_121a' /tmp/mettle-gb10.ptx
+          ./bin/mettle -O --emit-ptx --gpu-arch=gb10 tests/gpu/tensor_transfer.mettle -o /tmp/mettle-gb10-transfer.ptx
+          test "$(grep -c 'mtlc.tensor_transfer native-tma' /tmp/mettle-gb10-transfer.ptx)" -eq 2
+          test "$(grep -c 'mtlc.tensor_transfer cooperative-fallback' /tmp/mettle-gb10-transfer.ptx)" -eq 5
+          test "$(grep -c 'fence.proxy.async.shared::cta' /tmp/mettle-gb10-transfer.ptx)" -eq 2
+          ./bin/mettle -O --emit-ptx --gpu-arch=gb10 tests/gpu/tensor_sparse.mettle -o /tmp/mettle-gb10-sparse.ptx
+          test "$(grep -c 'mma.sp::ordered_metadata.*f32.f16.f16.f32' /tmp/mettle-gb10-sparse.ptx)" -eq 10
+          test "$(grep -c 'mma.sp::ordered_metadata.*f32.bf16.bf16.f32' /tmp/mettle-gb10-sparse.ptx)" -eq 2
+          test "$(grep -c 'popc.b32' /tmp/mettle-gb10-sparse.ptx)" -eq 48
+          test "$(grep -c 'mtlc.tensor_chain resident native-mma sparse-f16-2to4' /tmp/mettle-gb10-sparse.ptx)" -eq 1
+          test "$(grep -c 'mtlc.tensor_loop resident native-mma sparse-f16-2to4' /tmp/mettle-gb10-sparse.ptx)" -eq 1
+          if grep -q 'tcgen05' /tmp/mettle-gb10-sparse.ptx; then exit 1; fi
+          ./bin/mettle -O --emit-ptx --gpu-arch=gb10 tests/gpu/tensor_tiled.mettle -o /tmp/mettle-gb10-tiled.ptx
+          test "$(grep -c 'mtlc.tensor_mma tiled' /tmp/mettle-gb10-tiled.ptx)" -eq 13
+          test "$(grep -c 'subtiles=4 reuse=A' /tmp/mettle-gb10-tiled.ptx)" -eq 12
+          test "$(grep -c 'subtiles=2 reuse=B' /tmp/mettle-gb10-tiled.ptx)" -eq 1
+          grep -q 'mtlc.tensor_chain resident tiles=2 subtiles=4 tuple_peak=56 budget=96' /tmp/mettle-gb10-tiled.ptx
+          ./bin/mettle -O --emit-ptx --gpu-arch=gb10 tests/gpu/tensor_epilogue.mettle -o /tmp/mettle-gb10-epilogue.ptx
+          test "$(grep -c 'mtlc.tensor_epilogue cooperative-memory' /tmp/mettle-gb10-epilogue.ptx)" -eq 5
+          test "$(grep -c 'bar.warp.sync' /tmp/mettle-gb10-epilogue.ptx)" -eq 8
+          ./bin/mettle -O --emit-ptx --gpu-arch=gb10 tests/gpu/tensor_epilogue_fused.mettle -o /tmp/mettle-gb10-epilogue-fused.ptx
+          test "$(grep -c 'mtlc.tensor_epilogue resident' /tmp/mettle-gb10-epilogue-fused.ptx)" -eq 4
+          test "$(grep -c 'mtlc.tensor_epilogue cooperative-memory' /tmp/mettle-gb10-epilogue-fused.ptx)" -eq 3
+          test "$(grep -c 'mtlc.tensor_epilogue resident handoff group=1 stable-wmma' /tmp/mettle-gb10-epilogue-fused.ptx)" -eq 2
+          grep -q 'mtlc.tensor_loop resident group=1 subtiles=4 tuple_peak=56 budget=96' /tmp/mettle-gb10-tiled.ptx
+          ./bin/mettle -O --dump-ir --emit-ptx --gpu-arch=gb10 tests/gpu/tensor_matmul.mettle -o /tmp/mettle-gb10-matmul.ptx
+          grep -q 'tensor_matmul region=m16n16 k_chunk=16' /tmp/mettle-gb10-matmul.ptx.ir
+          test "$(grep -c 'mtlc.tensor_matmul native interior runtime-K resident stable-wmma' /tmp/mettle-gb10-matmul.ptx)" -eq 5
+          test "$(grep -c 'mtlc.tensor_matmul cooperative-full exact M/N/K edge replay' /tmp/mettle-gb10-matmul.ptx)" -eq 5
+          test "$(grep -c 'mtlc.tensor_matmul cooperative-tail exact M/N/K edge replay' /tmp/mettle-gb10-matmul.ptx)" -eq 5
+          ./bin/mettle -O --emit-ptx --gpu-arch=gb10 --gpu-tensor-tuple-budget=1 tests/gpu/tensor_matmul.mettle -o /tmp/mettle-gb10-matmul-budget1.ptx
+          test "$(grep -c 'mtlc.tensor_matmul cooperative-only: native accumulator exceeds tensor tuple budget' /tmp/mettle-gb10-matmul-budget1.ptx)" -eq 5
+          if grep -q 'wmma.mma' /tmp/mettle-gb10-matmul-budget1.ptx; then exit 1; fi
+          ./bin/mettle -O --emit-ptx --gpu-arch=gb10 tests/gpu/tensor_matmul_transpose.mettle -o /tmp/mettle-gb10-matmul-transpose.ptx
+          test "$(grep -c 'mtlc.tensor_matmul native interior runtime-K resident stable-wmma' /tmp/mettle-gb10-matmul-transpose.ptx)" -eq 3
+          test "$(grep -c 'mtlc.tensor_matmul cooperative-full exact M/N/K edge replay' /tmp/mettle-gb10-matmul-transpose.ptx)" -eq 3
+          test "$(grep -c 'mtlc.tensor_matmul cooperative-tail exact M/N/K edge replay' /tmp/mettle-gb10-matmul-transpose.ptx)" -eq 3
+          test "$(grep -c 'wmma.mma.sync' /tmp/mettle-gb10-matmul-transpose.ptx)" -eq 6
+          ./bin/mettle -O --emit-ptx --gpu-arch=gb10 tests/gpu/tensor_matmul_fp8.mettle -o /tmp/mettle-gb10-matmul-fp8.ptx
+          test "$(grep -c 'mtlc.tensor_matmul native interior runtime-K resident direct-mma' /tmp/mettle-gb10-matmul-fp8.ptx)" -eq 2
+          test "$(grep -c 'mtlc.tensor_matmul cooperative-full exact M/N/K edge replay' /tmp/mettle-gb10-matmul-fp8.ptx)" -eq 2
+          test "$(grep -c 'mtlc.tensor_matmul cooperative-tail exact M/N/K edge replay' /tmp/mettle-gb10-matmul-fp8.ptx)" -eq 2
+          test "$(grep -c 'cvt.rn.f16x2.e4m3x2' /tmp/mettle-gb10-matmul-fp8.ptx)" -eq 4
+          test "$(grep -c 'cvt.rn.f16x2.e5m2x2' /tmp/mettle-gb10-matmul-fp8.ptx)" -eq 4
+          test "$(grep -c 'mma.sync' /tmp/mettle-gb10-matmul-fp8.ptx)" -eq 8
+          if grep -q 'wmma.mma' /tmp/mettle-gb10-matmul-fp8.ptx; then exit 1; fi
+          ./bin/mettle -O --emit-ptx --gpu-arch=gb10 --gpu-tensor-tuple-budget=1 tests/gpu/tensor_matmul_fp8.mettle -o /tmp/mettle-gb10-matmul-fp8-budget1.ptx
+          test "$(grep -c 'mtlc.tensor_matmul cooperative-only: native accumulator exceeds tensor tuple budget' /tmp/mettle-gb10-matmul-fp8-budget1.ptx)" -eq 2
+          if grep -Eq 'wmma.mma|mma.sync' /tmp/mettle-gb10-matmul-fp8-budget1.ptx; then exit 1; fi
+          ./bin/mettle -O --emit-ptx --gpu-arch=gb10 tests/gpu/tensor_matmul_scaled.mettle -o /tmp/mettle-gb10-matmul-scaled.ptx
+          test "$(grep -c 'mtlc.tensor_matmul native interior runtime-K resident direct-mma' /tmp/mettle-gb10-matmul-scaled.ptx)" -eq 4
+          test "$(grep -c 'mtlc.tensor_matmul cooperative-full exact M/N/K edge replay' /tmp/mettle-gb10-matmul-scaled.ptx)" -eq 4
+          test "$(grep -c 'mtlc.tensor_matmul cooperative-tail exact M/N/K edge replay' /tmp/mettle-gb10-matmul-scaled.ptx)" -eq 4
+          test "$(grep -c 'mtlc.tensor_matmul dense-subbyte byte-alignment guard' /tmp/mettle-gb10-matmul-scaled.ptx)" -eq 4
+          test "$(grep -c 'mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e3m2.e2m3.f32.ue8m0' /tmp/mettle-gb10-matmul-scaled.ptx)" -eq 4
+          test "$(grep -c 'mma.sync.aligned.m16n8k64.row.col.kind::mxf4.block_scale.scale_vec::2X.f32.e2m1.e2m1.f32.ue8m0' /tmp/mettle-gb10-matmul-scaled.ptx)" -eq 4
+          test "$(grep -c 'mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3' /tmp/mettle-gb10-matmul-scaled.ptx)" -eq 4
+          if grep -Eq 'cvt.rn.f16x2.(e2m1|e2m3|e3m2)x2|wmma.mma' /tmp/mettle-gb10-matmul-scaled.ptx; then exit 1; fi
+          ./bin/mettle -O --emit-ptx --gpu-arch=gb10 --gpu-tensor-tuple-budget=1 tests/gpu/tensor_matmul_scaled.mettle -o /tmp/mettle-gb10-matmul-scaled-budget1.ptx
+          test "$(grep -c 'mtlc.tensor_matmul cooperative-only: native accumulator exceeds tensor tuple budget' /tmp/mettle-gb10-matmul-scaled-budget1.ptx)" -eq 4
+          if grep -Eq 'wmma.mma|mma.sync' /tmp/mettle-gb10-matmul-scaled-budget1.ptx; then exit 1; fi
+          ./bin/mettle -O --emit-ptx --gpu-arch=gb10 tests/gpu/tensor_matmul_sparse.mettle -o /tmp/mettle-gb10-matmul-sparse.ptx
+          test "$(grep -c 'mtlc.tensor_matmul native interior runtime-K resident direct-mma' /tmp/mettle-gb10-matmul-sparse.ptx)" -eq 2
+          test "$(grep -c 'mtlc.tensor_matmul cooperative-full exact M/N/K edge replay' /tmp/mettle-gb10-matmul-sparse.ptx)" -eq 2
+          test "$(grep -c 'mtlc.tensor_matmul cooperative-tail exact M/N/K edge replay' /tmp/mettle-gb10-matmul-sparse.ptx)" -eq 2
+          test "$(grep -c 'mma.sp::ordered_metadata.sync.aligned.m16n8k16' /tmp/mettle-gb10-matmul-sparse.ptx)" -eq 8
+          test "$(grep -Ec '@%p[0-9]+ ld.global.b16' /tmp/mettle-gb10-matmul-sparse.ptx)" -eq 4
+          if grep -q 'wmma.mma' /tmp/mettle-gb10-matmul-sparse.ptx; then exit 1; fi
+          ./bin/mettle -O --emit-ptx --gpu-arch=gb10 --gpu-tensor-tuple-budget=1 tests/gpu/tensor_matmul_sparse.mettle -o /tmp/mettle-gb10-matmul-sparse-budget1.ptx
+          test "$(grep -c 'mtlc.tensor_matmul cooperative-only: native accumulator exceeds tensor tuple budget' /tmp/mettle-gb10-matmul-sparse-budget1.ptx)" -eq 2
+          if grep -Eq 'wmma.mma|mma.sp' /tmp/mettle-gb10-matmul-sparse-budget1.ptx; then exit 1; fi
+          if command -v ptxas >/dev/null 2>&1; then
+            python3 tools/gpu/ptxas_profile.py --arch sm_121a --max-registers 56 --require-zero-spills --pretty -o /tmp/mettle-gb10-sparse.resources.json /tmp/mettle-gb10-sparse.ptx
+            python3 tools/gpu/ptxas_profile.py --arch sm_121a --max-registers 64 --require-zero-spills --pretty -o /tmp/mettle-gb10-tiled.resources.json /tmp/mettle-gb10-tiled.ptx
+            python3 tools/gpu/ptxas_profile.py --arch sm_121a --max-registers 40 --require-zero-spills --pretty -o /tmp/mettle-gb10-matmul.resources.json /tmp/mettle-gb10-matmul.ptx
+            python3 tools/gpu/ptxas_profile.py --arch sm_121a --max-registers 40 --require-zero-spills --pretty -o /tmp/mettle-gb10-matmul-transpose.resources.json /tmp/mettle-gb10-matmul-transpose.ptx
+            python3 tools/gpu/ptxas_profile.py --arch sm_121a --max-registers 64 --require-zero-spills --pretty -o /tmp/mettle-gb10-matmul-fp8.resources.json /tmp/mettle-gb10-matmul-fp8.ptx
+            python3 tools/gpu/ptxas_profile.py --arch sm_121a --max-registers 80 --require-zero-spills --pretty -o /tmp/mettle-gb10-matmul-scaled.resources.json /tmp/mettle-gb10-matmul-scaled.ptx
+            python3 tools/gpu/ptxas_profile.py --arch sm_121a --max-registers 56 --require-zero-spills --pretty -o /tmp/mettle-gb10-matmul-sparse.resources.json /tmp/mettle-gb10-matmul-sparse.ptx
+          fi
+          ./bin/mettle --emit-spirv tests/gpu/compute_kernels.mettle -o /tmp/mettle-kernels.spv
+          test "$(od -An -tx4 -N4 /tmp/mettle-kernels.spv | tr -d ' ')" = "07230203"
+
+      - name: Upload offline GB10 resource evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64-gb10-offline-resources
+          path: /tmp/mettle-gb10-*.resources.json
+          if-no-files-found: ignore
+
+      - name: Compile the cross-host CUDA harness without loading CUDA
+        run: |
+          gcc -std=c11 -O2 -Wall -Wextra -Werror tests/gpu/hardware_harness.c -o /tmp/mettle-gpu-harness -ldl -lm
+          bash -n tests/gpu/run_hardware_tests.sh
+
+      - name: Run exact matrix-region semantics natively on AArch64 CPU
+        run: |
+          gcc -std=c11 -O2 -Wall -Wextra -Werror tests/tensor_matmul_oracle.c -o /tmp/mettle-tensor-matmul-oracle
+          /tmp/mettle-tensor-matmul-oracle | grep -q 'structured 2:4, FP8/FP6/FP4 block scales, packed streams, K=0, and no-op bounds OK'
+
+      - name: Execute AArch64 backend smoke test natively
+        run: |
+          ./bin/mettle --emit-arm64 tests/arm64/sum.mettle -o /tmp/mettle-arm64-sum
+          chmod +x /tmp/mettle-arm64-sum
+          set +e
+          /tmp/mettle-arm64-sum
+          status=$?
+          set -e
+          test "$status" -eq 55
+
+      - name: Link native AArch64 objects and external libc calls
+        run: |
+          ./bin/mettle tests/arm64/sum.mettle -o /tmp/mettle-arm64-sum.o
+          readelf -h /tmp/mettle-arm64-sum.o | grep -q 'Type:.*REL'
+          readelf -h /tmp/mettle-arm64-sum.o | grep -q 'Machine:.*AArch64'
+          gcc -no-pie /tmp/mettle-arm64-sum.o -o /tmp/mettle-arm64-sum-linked
+          set +e
+          /tmp/mettle-arm64-sum-linked
+          status=$?
+          set -e
+          test "$status" -eq 55
+
+          ./bin/mettle tests/arm64/native_link.mettle -o /tmp/mettle-arm64-libc.o
+          readelf -r /tmp/mettle-arm64-libc.o | grep -q 'R_AARCH64_CALL26.*putchar'
+          gcc -no-pie /tmp/mettle-arm64-libc.o -o /tmp/mettle-arm64-libc
+          test "$(/tmp/mettle-arm64-libc)" = "A"
+
+      - name: Verify native GPU launch ABI without CUDA hardware
+        run: |
+          ./bin/mettle tests/test_gpu_dispatch.mettle -o /tmp/mettle-arm64-gpu.o
+          readelf -r /tmp/mettle-arm64-gpu.o | grep -q 'R_AARCH64_CALL26.*cuLaunchKernel'
+          gcc -no-pie /tmp/mettle-arm64-gpu.o tests/arm64/cuda_launch_stub.c -o /tmp/mettle-arm64-gpu
+          /tmp/mettle-arm64-gpu
+
   sanitize:
     name: Sanitizers (linux gcc)
     runs-on: ubuntu-latest
@@ -235,15 +349,6 @@ jobs:
       UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
     steps:
       - uses: actions/checkout@v4
-
-      # The backend is most of the compiler, so it has to be instrumented too:
-      # LIBMTLC_EXTRA_CFLAGS passes the sanitizer flags through to libmtlc's own
-      # build. A clean (uninstrumented) archive would link and run, but would
-      # leave the optimizer and codegen uncovered.
-      - name: Fetch and build libmtlc backend with ASan/UBSan
-        env:
-          LIBMTLC_EXTRA_CFLAGS: "-fsanitize=address,undefined -fno-sanitize-recover=all"
-        run: ./get-libmtlc.sh
 
       - name: Build compiler with ASan/UBSan
         run: |

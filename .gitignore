@@ -1,15 +1,15 @@
 ﻿bin/
 obj/
-# The libmtlc backend dependency, fetched by get-libmtlc.ps1 / get-libmtlc.sh at
-# the revision pinned in libmtlc.version. Never committed: it is somebody
-# else's tree. See docs/mettle-and-libmtlc.md.
-libmtlc/
+dist/
 .claude/
 .cursor/
-.idea/
 web/
 .tmp/
-lib/
+.tmp_gpu/
+# Anchored to the repo root: only the top-level lib/ build dir. A bare `lib/`
+# also matched tests/lib/ (the import-test fixture modules), so they never got
+# committed and every import test failed on a fresh CI checkout.
+/lib/
 tests/_tmp_*
 tmp_repro/
 .html
@@ -39,5 +39,27 @@ _mlopt.disp
 _mlopt.explain
 *.mprof
 ui_test.mettle
+# gnn_oracle experiment scratch: harvested corpora, built-graph caches, and
+# checkpoints. Multi-GB and fully reproducible from tools/mlopt/bakeoff.py.
+# Deliberately NOT `tools/mlopt/*.pt`: gnn_genius.pt and its predecessors are
+# tracked artifacts, and a broad rule here would quietly shadow them.
+tools/mlopt/_bakeoff/
+tools/mlopt/_graphcache/
+tools/mlopt/_bakeoff.log
+tools/mlopt/oracle_*.pt
+tools/mlopt/oracle_*.bin
+tools/mlopt/_auto_dagger.sh
+tools/mlopt/_auto_summary.sh
+tools/mlopt/_dagger.log
+
 promotion/
+# Discord bot: deployed straight to mikoshi (/home/claude/mettlebot), not shipped
+# with the toolchain. Keep bot.env out of a repo whatever else happens to it.
+tools/discord-bot/
+examples/cad/
 .vs/
+tests/profiler_test.mettle
+tests/parse_stress_test.mettle
+
+# JetBrains IDE project config, per-developer.
+.idea/

@@ -2,7 +2,8 @@
 //
 // String/number conversions, character classification, and encoding helpers.
 
-// ─── C runtime conversions ──────────────────────────────────────────────────
+// Owned runtime conversions
+// These ABI names bind to Mettle's owned conversion code.
 export extern fn atoi(s: cstring) -> int32 = "atoi";
 export extern fn atol(s: cstring) -> int64 = "atol";
 

@@ -2,15 +2,15 @@
 //
 // Linux counterpart to std/net. Exposes the SAME public API as std/net (the
 // Winsock-flavoured one) so a single `import "std/net"` works on both Windows
-// and Linux without source-level changes. Internally it calls POSIX libc:
+// and Linux without source-level changes. It calls owned socket ABI symbols:
 // most BSD-socket function names (socket/bind/listen/accept/send/recv/connect/
 // shutdown/setsockopt/htons/htonl/ntohs/ntohl/inet_addr) are identical between
-// Winsock and POSIX libc and bind directly; the Windows-only names
+// Winsock and Linux and bind directly; the Windows-only names
 // (WSAStartup/WSACleanup/closesocket/WSAGetLastError) become thin wrappers.
 //
 // The import resolver picks this file over net.mettle automatically on the
-// native ELF target. posix_helpers.o (-> posix_get_errno) and -lpthread are
-// auto-appended to the link line by the compiler when net is imported on Linux.
+// native ELF target. The runtime implements the Linux side with direct system
+// calls and keeps its error value in owned thread local storage.
 
 import "std/mem";
 import "std/thread";
@@ -21,7 +21,7 @@ export var net_ref_count: int32 = 0;
 export var net_ref_lock: int32 = 0;
 
 // ─── Address family / socket type / protocol constants ──────────────────────
-// AF_INET/SOCK_*/IPPROTO_* values match between Winsock and POSIX libc.
+// AF_INET/SOCK_*/IPPROTO_* values match between Winsock and Linux.
 // SOL_SOCKET and SO_REUSEADDR differ (Linux: 1 and 2; Windows: 0xFFFF and 4).
 export fn AF_INET() -> int32     { return 2; }
 export fn SOCK_STREAM() -> int32 { return 1; }
@@ -64,7 +64,7 @@ export extern fn ntohl(netlong: int32) -> int32 = "ntohl";
 export extern fn inet_addr(cp: cstring) -> int32 = "inet_addr";
 
 // ─── Windows-only names: no-ops / errno bridges on Linux ────────────────────
-// WSAStartup / WSACleanup: Linux libc needs no global init. Accept and ignore.
+// WSAStartup / WSACleanup: Linux needs no global init. Accept and ignore.
 export fn WSAStartup(version: int32, wsa_data: cstring) -> int32 { return 0; }
 export fn WSACleanup() -> int32 { return 0; }
 

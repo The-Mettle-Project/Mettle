@@ -1,0 +1,114 @@
+name: DGX Spark hardware
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [dgx-spark-hardware]
+
+permissions:
+  contents: read
+
+jobs:
+  correctness:
+    name: AArch64 / GB10 correctness and sanitizers
+    runs-on: [self-hosted, Linux, ARM64, dgx-spark]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build natively for DGX Spark
+        run: make -j"$(nproc)" DGX_SPARK=1
+      - name: Assemble unqualified native paths without device execution
+        run: |
+          ./bin/mettle -O --emit-ptx --gpu-arch=gb10 tests/gpu/tensor_transfer.mettle -o /tmp/mettle-gb10-transfer.ptx
+          python3 tools/gpu/ptxas_profile.py --arch sm_121a --max-registers 32 --require-zero-spills --pretty -o /tmp/mettle-gb10-transfer.resources.json /tmp/mettle-gb10-transfer.ptx
+          test "$(grep -c 'mtlc.tensor_transfer native-tma' /tmp/mettle-gb10-transfer.ptx)" -eq 2
+          test "$(grep -c 'mtlc.tensor_transfer cooperative-fallback' /tmp/mettle-gb10-transfer.ptx)" -eq 5
+          ./bin/mettle -O --emit-ptx --gpu-arch=gb10 tests/gpu/tensor_sparse.mettle -o /tmp/mettle-gb10-sparse.ptx
+          python3 tools/gpu/ptxas_profile.py --arch sm_121a --max-registers 56 --require-zero-spills --pretty -o /tmp/mettle-gb10-sparse.resources.json /tmp/mettle-gb10-sparse.ptx
+          test "$(grep -c 'mma.sp::ordered_metadata.*f32.f16.f16.f32' /tmp/mettle-gb10-sparse.ptx)" -eq 10
+          test "$(grep -c 'mma.sp::ordered_metadata.*f32.bf16.bf16.f32' /tmp/mettle-gb10-sparse.ptx)" -eq 2
+          test "$(grep -c 'popc.b32' /tmp/mettle-gb10-sparse.ptx)" -eq 48
+          test "$(grep -c 'mtlc.tensor_chain resident native-mma sparse-f16-2to4' /tmp/mettle-gb10-sparse.ptx)" -eq 1
+          test "$(grep -c 'mtlc.tensor_loop resident native-mma sparse-f16-2to4' /tmp/mettle-gb10-sparse.ptx)" -eq 1
+          if grep -q 'tcgen05' /tmp/mettle-gb10-sparse.ptx; then exit 1; fi
+          ./bin/mettle -O --emit-ptx --gpu-arch=gb10 tests/gpu/tensor_tiled.mettle -o /tmp/mettle-gb10-tiled.ptx
+          python3 tools/gpu/ptxas_profile.py --arch sm_121a --max-registers 64 --require-zero-spills --pretty -o /tmp/mettle-gb10-tiled.resources.json /tmp/mettle-gb10-tiled.ptx
+          test "$(grep -c 'mtlc.tensor_mma tiled' /tmp/mettle-gb10-tiled.ptx)" -eq 13
+          grep -q 'mtlc.tensor_chain resident tiles=2 subtiles=4 tuple_peak=56 budget=96' /tmp/mettle-gb10-tiled.ptx
+          grep -q 'mtlc.tensor_loop resident group=1 subtiles=4 tuple_peak=56 budget=96' /tmp/mettle-gb10-tiled.ptx
+          ./bin/mettle -O --emit-ptx --gpu-arch=gb10 tests/gpu/tensor_epilogue.mettle -o /tmp/mettle-gb10-epilogue.ptx
+          python3 tools/gpu/ptxas_profile.py --arch sm_121a --max-registers 24 --require-zero-spills --pretty -o /tmp/mettle-gb10-epilogue.resources.json /tmp/mettle-gb10-epilogue.ptx
+          test "$(grep -c 'mtlc.tensor_epilogue cooperative-memory' /tmp/mettle-gb10-epilogue.ptx)" -eq 5
+          test "$(grep -c 'cvt.f32.bf16' /tmp/mettle-gb10-epilogue.ptx)" -eq 2
+          test "$(grep -c 'bar.warp.sync' /tmp/mettle-gb10-epilogue.ptx)" -eq 8
+          if grep -q 'wmma\|mma.sync' /tmp/mettle-gb10-epilogue.ptx; then exit 1; fi
+          ./bin/mettle -O --emit-ptx --gpu-arch=gb10 tests/gpu/tensor_epilogue_fused.mettle -o /tmp/mettle-gb10-epilogue-fused.ptx
+          python3 tools/gpu/ptxas_profile.py --arch sm_121a --max-registers 72 --require-zero-spills --pretty -o /tmp/mettle-gb10-epilogue-fused.resources.json /tmp/mettle-gb10-epilogue-fused.ptx
+          test "$(grep -c 'mtlc.tensor_epilogue resident' /tmp/mettle-gb10-epilogue-fused.ptx)" -eq 4
+          test "$(grep -c 'mtlc.tensor_epilogue cooperative-memory' /tmp/mettle-gb10-epilogue-fused.ptx)" -eq 3
+          grep -q 'resident native-mma fp8 tiles=2 subtiles=2' /tmp/mettle-gb10-epilogue-fused.ptx
+          grep -q 'resident handoff group=1 stable-wmma' /tmp/mettle-gb10-epilogue-fused.ptx
+          test "$(grep -c 'mtlc.tensor_epilogue resident handoff group=1 stable-wmma' /tmp/mettle-gb10-epilogue-fused.ptx)" -eq 2
+          ./bin/mettle -O --dump-ir --emit-ptx --gpu-arch=gb10 tests/gpu/tensor_matmul.mettle -o /tmp/mettle-gb10-matmul.ptx
+          python3 tools/gpu/ptxas_profile.py --arch sm_121a --max-registers 40 --require-zero-spills --pretty -o /tmp/mettle-gb10-matmul.resources.json /tmp/mettle-gb10-matmul.ptx
+          grep -q 'tensor_matmul region=m16n16 k_chunk=16' /tmp/mettle-gb10-matmul.ptx.ir
+          test "$(grep -c 'mtlc.tensor_matmul native interior runtime-K resident stable-wmma' /tmp/mettle-gb10-matmul.ptx)" -eq 5
+          test "$(grep -c 'mtlc.tensor_matmul cooperative-full exact M/N/K edge replay' /tmp/mettle-gb10-matmul.ptx)" -eq 5
+          test "$(grep -c 'mtlc.tensor_matmul cooperative-tail exact M/N/K edge replay' /tmp/mettle-gb10-matmul.ptx)" -eq 5
+          ./bin/mettle -O --emit-ptx --gpu-arch=gb10 tests/gpu/tensor_matmul_transpose.mettle -o /tmp/mettle-gb10-matmul-transpose.ptx
+          python3 tools/gpu/ptxas_profile.py --arch sm_121a --max-registers 40 --require-zero-spills --pretty -o /tmp/mettle-gb10-matmul-transpose.resources.json /tmp/mettle-gb10-matmul-transpose.ptx
+          test "$(grep -c 'mtlc.tensor_matmul native interior runtime-K resident stable-wmma' /tmp/mettle-gb10-matmul-transpose.ptx)" -eq 3
+          test "$(grep -c 'mtlc.tensor_matmul cooperative-full exact M/N/K edge replay' /tmp/mettle-gb10-matmul-transpose.ptx)" -eq 3
+          test "$(grep -c 'mtlc.tensor_matmul cooperative-tail exact M/N/K edge replay' /tmp/mettle-gb10-matmul-transpose.ptx)" -eq 3
+          test "$(grep -c 'wmma.mma.sync' /tmp/mettle-gb10-matmul-transpose.ptx)" -eq 6
+          ./bin/mettle -O --emit-ptx --gpu-arch=gb10 tests/gpu/tensor_matmul_fp8.mettle -o /tmp/mettle-gb10-matmul-fp8.ptx
+          python3 tools/gpu/ptxas_profile.py --arch sm_121a --max-registers 64 --require-zero-spills --pretty -o /tmp/mettle-gb10-matmul-fp8.resources.json /tmp/mettle-gb10-matmul-fp8.ptx
+          test "$(grep -c 'mtlc.tensor_matmul native interior runtime-K resident direct-mma' /tmp/mettle-gb10-matmul-fp8.ptx)" -eq 2
+          test "$(grep -c 'mtlc.tensor_matmul cooperative-full exact M/N/K edge replay' /tmp/mettle-gb10-matmul-fp8.ptx)" -eq 2
+          test "$(grep -c 'mtlc.tensor_matmul cooperative-tail exact M/N/K edge replay' /tmp/mettle-gb10-matmul-fp8.ptx)" -eq 2
+          test "$(grep -c 'cvt.rn.f16x2.e4m3x2' /tmp/mettle-gb10-matmul-fp8.ptx)" -eq 4
+          test "$(grep -c 'cvt.rn.f16x2.e5m2x2' /tmp/mettle-gb10-matmul-fp8.ptx)" -eq 4
+          test "$(grep -c 'mma.sync' /tmp/mettle-gb10-matmul-fp8.ptx)" -eq 8
+          if grep -q 'wmma.mma' /tmp/mettle-gb10-matmul-fp8.ptx; then exit 1; fi
+          ./bin/mettle -O --emit-ptx --gpu-arch=gb10 --gpu-tensor-tuple-budget=1 tests/gpu/tensor_matmul_fp8.mettle -o /tmp/mettle-gb10-matmul-fp8-budget1.ptx
+          test "$(grep -c 'mtlc.tensor_matmul cooperative-only: native accumulator exceeds tensor tuple budget' /tmp/mettle-gb10-matmul-fp8-budget1.ptx)" -eq 2
+          if grep -Eq 'wmma.mma|mma.sync' /tmp/mettle-gb10-matmul-fp8-budget1.ptx; then exit 1; fi
+          ./bin/mettle -O --emit-ptx --gpu-arch=gb10 tests/gpu/tensor_matmul_scaled.mettle -o /tmp/mettle-gb10-matmul-scaled.ptx
+          python3 tools/gpu/ptxas_profile.py --arch sm_121a --max-registers 80 --require-zero-spills --pretty -o /tmp/mettle-gb10-matmul-scaled.resources.json /tmp/mettle-gb10-matmul-scaled.ptx
+          test "$(grep -c 'mtlc.tensor_matmul native interior runtime-K resident direct-mma' /tmp/mettle-gb10-matmul-scaled.ptx)" -eq 4
+          test "$(grep -c 'mtlc.tensor_matmul cooperative-full exact M/N/K edge replay' /tmp/mettle-gb10-matmul-scaled.ptx)" -eq 4
+          test "$(grep -c 'mtlc.tensor_matmul cooperative-tail exact M/N/K edge replay' /tmp/mettle-gb10-matmul-scaled.ptx)" -eq 4
+          test "$(grep -c 'mtlc.tensor_matmul dense-subbyte byte-alignment guard' /tmp/mettle-gb10-matmul-scaled.ptx)" -eq 4
+          test "$(grep -c 'mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e3m2.e2m3.f32.ue8m0' /tmp/mettle-gb10-matmul-scaled.ptx)" -eq 4
+          test "$(grep -c 'mma.sync.aligned.m16n8k64.row.col.kind::mxf4.block_scale.scale_vec::2X.f32.e2m1.e2m1.f32.ue8m0' /tmp/mettle-gb10-matmul-scaled.ptx)" -eq 4
+          test "$(grep -c 'mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3' /tmp/mettle-gb10-matmul-scaled.ptx)" -eq 4
+          if grep -Eq 'cvt.rn.f16x2.(e2m1|e2m3|e3m2)x2|wmma.mma' /tmp/mettle-gb10-matmul-scaled.ptx; then exit 1; fi
+          ./bin/mettle -O --emit-ptx --gpu-arch=gb10 --gpu-tensor-tuple-budget=1 tests/gpu/tensor_matmul_scaled.mettle -o /tmp/mettle-gb10-matmul-scaled-budget1.ptx
+          test "$(grep -c 'mtlc.tensor_matmul cooperative-only: native accumulator exceeds tensor tuple budget' /tmp/mettle-gb10-matmul-scaled-budget1.ptx)" -eq 4
+          if grep -Eq 'wmma.mma|mma.sync' /tmp/mettle-gb10-matmul-scaled-budget1.ptx; then exit 1; fi
+          ./bin/mettle -O --emit-ptx --gpu-arch=gb10 tests/gpu/tensor_matmul_sparse.mettle -o /tmp/mettle-gb10-matmul-sparse.ptx
+          python3 tools/gpu/ptxas_profile.py --arch sm_121a --max-registers 56 --require-zero-spills --pretty -o /tmp/mettle-gb10-matmul-sparse.resources.json /tmp/mettle-gb10-matmul-sparse.ptx
+          test "$(grep -c 'mtlc.tensor_matmul native interior runtime-K resident direct-mma' /tmp/mettle-gb10-matmul-sparse.ptx)" -eq 2
+          test "$(grep -c 'mtlc.tensor_matmul cooperative-full exact M/N/K edge replay' /tmp/mettle-gb10-matmul-sparse.ptx)" -eq 2
+          test "$(grep -c 'mtlc.tensor_matmul cooperative-tail exact M/N/K edge replay' /tmp/mettle-gb10-matmul-sparse.ptx)" -eq 2
+          test "$(grep -c 'mma.sp::ordered_metadata.sync.aligned.m16n8k16' /tmp/mettle-gb10-matmul-sparse.ptx)" -eq 8
+          test "$(grep -Ec '@%p[0-9]+ ld.global.b16' /tmp/mettle-gb10-matmul-sparse.ptx)" -eq 4
+          if grep -q 'wmma.mma' /tmp/mettle-gb10-matmul-sparse.ptx; then exit 1; fi
+          ./bin/mettle -O --emit-ptx --gpu-arch=gb10 --gpu-tensor-tuple-budget=1 tests/gpu/tensor_matmul_sparse.mettle -o /tmp/mettle-gb10-matmul-sparse-budget1.ptx
+          test "$(grep -c 'mtlc.tensor_matmul cooperative-only: native accumulator exceeds tensor tuple budget' /tmp/mettle-gb10-matmul-sparse-budget1.ptx)" -eq 2
+          if grep -Eq 'wmma.mma|mma.sp' /tmp/mettle-gb10-matmul-sparse-budget1.ptx; then exit 1; fi
+          ./bin/mettle -O --emit-ptx --gpu-arch=gb10 tests/gpu/tensor_chain.mettle -o /tmp/mettle-gb10-chain-resident.ptx
+          ./bin/mettle -O --emit-ptx --gpu-arch=gb10 --gpu-tensor-tuple-budget=31 tests/gpu/tensor_chain.mettle -o /tmp/mettle-gb10-chain-replay.ptx
+          python3 tools/gpu/ptxas_profile.py --arch sm_121a --max-registers 64 --require-zero-spills --pretty -o /tmp/mettle-gb10-chain-resident.resources.json /tmp/mettle-gb10-chain-resident.ptx
+          python3 tools/gpu/ptxas_profile.py --arch sm_121a --max-registers 48 --require-zero-spills --pretty -o /tmp/mettle-gb10-chain-replay.resources.json /tmp/mettle-gb10-chain-replay.ptx
+          python3 tools/gpu/ptxas_select.py --candidate resident=/tmp/mettle-gb10-chain-resident.resources.json --candidate replay=/tmp/mettle-gb10-chain-replay.resources.json --entry tensor_chain4 --threads-per-block 32 --registers-per-sm 65536 --shared-memory-per-sm 102400 --max-warps-per-sm 48 --max-blocks-per-sm 24 --warp-size 32 --register-allocation-unit-per-warp 1 --policy pareto --pretty -o /tmp/mettle-gb10-chain.selection.json
+          python3 -c 'import json; d=json.load(open("/tmp/mettle-gb10-chain.selection.json", encoding="utf-8")); e=d["entries"]["tensor_chain4"]; assert e["selected"] is None and set(e["pareto_frontier"]) == {"resident", "replay"}'
+      - name: Archive offline resource profiles
+        uses: actions/upload-artifact@v4
+        with:
+          name: gb10-offline-resource-profiles
+          path: |
+            /tmp/mettle-gb10-*.resources.json
+            /tmp/mettle-gb10-*.selection.json
+      - name: Run qualified real-device gates (experimental TMA excluded)
+        run: bash tests/gpu/run_hardware_tests.sh --require-gb10 --sanitizer

@@ -1,5 +1,5 @@
 // Test: main with argc and argv (command-line arguments)
-// Windows startup emits __getmainargs directly; no argv shim is required.
+// Mettle startup parses the native command line without a C runtime.
 
 import "std/conv";
 

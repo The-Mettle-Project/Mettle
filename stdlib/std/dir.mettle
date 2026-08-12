@@ -1,8 +1,6 @@
 // Mettle standard library: Directory and file operations
 //
-// Cross-platform helpers. Requires linking stdlib/dir_helpers.c.
-//
-// Build: add stdlib/dir_helpers.c to your compile and link.
+// Cross platform helpers supplied by Mettle's owned runtime.
 
 export extern fn mettle_dir_exists(path: cstring) -> int32 = "mettle_dir_exists";
 export extern fn mettle_dir_create(path: cstring) -> int32 = "mettle_dir_create";

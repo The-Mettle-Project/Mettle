@@ -1,5 +1,5 @@
-#include "compiler/compiler_context.h"
-#include "compiler/compiler_crash.h"
+#include "../src/compiler/compiler_context.h"
+#include "../src/compiler/compiler_crash.h"
 
 #include <stdio.h>
 #include <string.h>

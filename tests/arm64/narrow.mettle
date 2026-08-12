@@ -1,0 +1,27 @@
+// Narrow scalar locals must be stored and loaded at their DECLARED width. Every
+// value used to live in an 8-byte slot accessed 8 bytes at a time, so assigning
+// a wide value to a narrow local kept all 64 bits and int8 arithmetic never
+// wrapped. 1 + 2 + 4 + 8 + 16 = 31
+fn widen(x: int8) -> int64 { return (int64)x; }
+fn main() -> int64 {
+  var r: int64 = 0;
+
+  var wide: int64 = 4294967297;      // 0x1_0000_0001
+  var narrow: int32 = wide;
+  if (narrow == 1) { r = r + 1; }
+
+  var a: int8 = 127;
+  var b: int8 = a + 1;               // two's complement wrap
+  if (b == -128) { r = r + 2; }
+
+  var c: int8 = -128;
+  var d: int8 = c - 1;
+  if (d == 127) { r = r + 4; }
+
+  var u: uint8 = 250;
+  var v: uint8 = u + 10;             // wraps to 4, zero-extended
+  if (v == 4) { r = r + 8; }
+
+  if (widen(b) == -128) { r = r + 16; }   // narrow parameter sign-extends
+  return r;
+}

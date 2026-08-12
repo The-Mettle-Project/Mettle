@@ -1,57 +1,21 @@
 # Heap Allocation
 
-Mettle has no garbage collector and no heap manager. `new`, array literals that need heap storage, and string concatenation lower to a direct C runtime call:
+Mettle has no garbage collector. `new`, heap array literals, and string joins
+allocate zeroed memory through the owned runtime.
 
-```asm
-calloc(1, size)
-```
+On Windows the runtime asks the process heap for raw storage. On Linux it maps
+anonymous pages and manages blocks itself. Neither path calls a C allocator.
 
-There is no tracing, root scanning, safepoint, shutdown sweep, or Mettle-side allocator state. The operating system reclaims the memory at process exit unless user code explicitly manages a buffer through `std/mem`.
+Allocation failure returns null. Code that needs a checked policy should test
+the result before use.
 
-For the wider picture (helper objects, what `--build` links, the runtime-model story), see [Runtime Model](runtime-model.md). This page covers only the language semantics of `new` and where allocation happens.
+`std/mem` exports the owned `malloc`, `calloc`, `realloc`, and `free` ABI.
+`std/alloc` adds explicit heaps, size classes, and statistics in Mettle code.
+`--native-heap` routes generated heap calls through that standard library heap.
 
-## When to use `new`
+Memory has an explicit lifetime. Free a buffer with the API that created it.
+Do not free stack storage or an OS handle. The runtime checks its own allocation
+headers but does not add automatic object lifetime or tracing.
 
-```mettle
-struct Point { x: int32; y: int32; }
-
-fn main() -> int32 {
-  var p: Point* = new Point;
-  p.x = 10;
-  p.y = 20;
-  return p.x + p.y;
-}
-```
-
-- Returns a pointer to a zero-initialized region of memory sized for the type.
-- The memory comes from libc `calloc`; failure semantics follow `calloc` (returns `null`, no exception).
-- Lifetime is "until process exit" unless `free` is called explicitly through `std/mem`.
-
-## When to use `std/mem` instead
-
-Use `std/mem` (`malloc`/`calloc`/`realloc`/`free`) for:
-
-- Buffers with explicit lifetime.
-- C interop where ownership crosses the boundary.
-- Long-running ownership where leaks matter (servers, long-lived processes).
-
-## String concatenation
-
-`string + string` allocates a new buffer through the same `calloc(1, n)` call and copies both sides into it. This is a normal heap allocation; no separate string runtime exists.
-
-```mettle
-var greeting: string = "Hello, " + name;
-```
-
-## Linking impact
-
-`new` and string concatenation **do not link any Mettle helper objects**. The emitted code calls libc `calloc` directly. A program that uses `new` heavily but does not enable crash tracebacks (`-d`/`-s`/`-g`) or `std/thread` atomics links zero Mettle runtime objects.
-
-If you build manually:
-
-```bash
-mettle main.mettle -o main.obj
-gcc -nostartfiles main.obj -o main.exe -lkernel32
-```
-
-For the rules around the two opt-in helper objects, see [Runtime Model — Helper objects](runtime-model.md#helper-objects).
+The linker always includes the small freestanding runtime object. Section
+collection removes services that the program does not call.

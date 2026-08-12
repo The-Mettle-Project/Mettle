@@ -2,15 +2,16 @@
 
 Mettle is a frontend. It owns the language: lexing, parsing, type checking,
 memory safety analysis, monomorphization, and lowering to IR. Everything after
-that IR exists is [**libmtlc**](https://github.com/The-Mettle-Project/libmtlc),
-a separate project: the optimizers, code generation for x86-64 / ARM64 / PTX /
-SPIR-V, and native PE and ELF linking.
+that IR exists is **libmtlc**: the optimizers, code generation for x86-64 /
+ARM64 / PTX / SPIR-V, and native PE and ELF linking.
 
-This repository does not contain a backend. It fetches one.
+They are two halves of one toolchain and they live in one repository. The
+boundary between them is real and enforced by the build, not by a repository
+split.
 
 ```mermaid
 flowchart LR
-  subgraph mettle [This repository]
+  subgraph frontend [Mettle frontend]
     src[".mettle source"] --> lex["Lexer<br/>src/lexer"]
     lex --> parse["Parser, AST<br/>src/parser"]
     parse --> sem["Imports, monomorphize,<br/>type check, memory safety<br/>src/semantic"]
@@ -18,7 +19,7 @@ flowchart LR
     driver["Driver<br/>src/main.c"]
     rt["Language runtime<br/>src/runtime, stdlib"]
   end
-  subgraph libmtlc [libmtlc dependency]
+  subgraph backend [libmtlc backend]
     ir["IR core"]
     opt["Classical optimizer"]
     ml["GNN ML-opt +<br/>translation validation"]
@@ -32,63 +33,55 @@ flowchart LR
   rt -.linked into.-> exe
 ```
 
-## Why the split
+## What each side owns
 
-The two halves are developed together in the libmtlc monorepo, which carries the
-backend and the reference Mettle frontend side by side. That is where the
-day-to-day work happens. This repository is the Mettle product: the language,
-its compiler, the standard library, the docs, the examples, the installer and
-the editor tooling, with the backend as a versioned dependency.
-
-The practical consequence is that **libmtlc is upstream**. A backend change
-lands there and arrives here on the next sync and version bump.
-
-## Getting the dependency
-
-`libmtlc.version` pins a revision. The fetchers read it, download that revision
-of the libmtlc source, unpack it into `libmtlc/`, and build the static archive:
-
-```bash
-./get-libmtlc.sh          # Linux, macOS
-```
-
-```powershell
-.\get-libmtlc.ps1         # Windows
-```
-
-`libmtlc/` is gitignored. Nothing about the backend is committed here except the
-pinned revision.
-
-Overrides, on both fetchers:
-
-| | |
+| Frontend | libmtlc |
 |--|--|
-| `LIBMTLC_VERSION` | build against a different tag, branch or commit than the pin |
-| `LIBMTLC_DIR` | use a libmtlc checkout you already have, instead of downloading |
-| `LIBMTLC_SKIP_BUILD` / `-SkipBuild` | download only |
-| `LIBMTLC_FORCE` / `-Force` | re-download and rebuild |
+| `src/lexer`, `src/parser`, `src/semantic` | `src/ir` (core), `src/ir/optimizer` |
+| `src/ir/ir_lower*.c` (AST to IR) | `src/codegen`, `src/linker` |
+| `src/frontend` (frontend type to `MtlcType`) | `src/compiler`, `src/debug` |
+| `src/main.c` (the driver) | `src/common.c`, `src/error/error_reporter.c` |
+| `src/error/error_explain.c` (`--explain` output) | `src/mtlc_*.c` (the public API) |
+| `src/runtime`, `stdlib` | `include/mtlc` |
 
-`LIBMTLC_DIR` is the one to reach for when working on both halves at once. A
-directory with a `.git` in it is treated as yours and never overwritten:
+`src/error` splits because the two files do different jobs: the diagnostics
+reporter renders against raw source text and a `SourceLocation` with no AST, so
+libmtlc's compile-time interpreter reports through it and owns it. The
+`--explain` renderer is Mettle's own optimization report.
 
-```bash
-make LIBMTLC_DIR=../libmtlc
-```
+The Makefile is where that boundary is written down. `BACKEND_SOURCES` and
+`FRONTEND_SOURCES` are two disjoint lists, and the backend list is what goes
+into the archive. Adding a translation unit means deciding which list it joins.
+
+## Building the backend alone
 
 ```powershell
-$env:LIBMTLC_DIR = "..\libmtlc"; .\build.bat
+.\build.bat --backend-only    # bin\mtlc.lib
 ```
 
-## Why a source dependency, and not the released library
+```bash
+make libmtlc                  # bin/libmtlc.a
+make install-libmtlc          # headers + archive + libmtlc.pc
+make dist-libmtlc             # staged into dist/libmtlc, no root needed
+```
 
-libmtlc publishes a prebuilt backend bundle: the public API in `include/mtlc/`
-plus a static library. That bundle is aimed at a *foreign* frontend, one that
-builds IR through `mtlc/build.h` and drives it through `mtlc/pipeline.h` and
-touches nothing else. [`examples/calc`](https://github.com/The-Mettle-Project/libmtlc/tree/main/examples/calc)
-in the libmtlc repository is exactly that.
+That archive is the whole point of keeping the line clean: it carries no
+frontend at all, and any frontend that lowers into the IR can drive it.
+[`examples/calc`](../examples/calc) is a small non-Mettle frontend that does
+exactly that, through the public API alone.
 
-Mettle's driver is not that. It reaches past the public API into the backend's
-own headers, because it drives machinery the public surface does not expose:
+The build checks this rather than trusting it. After archiving, it relocatably
+links the archive and fails if a single non-OS symbol is left unresolved — a
+backend that had picked up a frontend dependency would not survive that.
+
+## Why the driver is not a normal consumer
+
+libmtlc's public surface is `include/mtlc/`: build IR through `mtlc/build.h`,
+run it through `mtlc/pipeline.h`, touch nothing else. `examples/calc` is that
+consumer.
+
+Mettle's driver is not. It reaches past the public API into the backend's own
+headers, because it drives machinery the public surface does not expose:
 
 | Driver feature | Backend header it needs |
 |--|--|
@@ -102,92 +95,31 @@ own headers, because it drives machinery the public surface does not expose:
 | The internal PE linker and startup synthesis | `linker/pe_emitter.h`, `codegen/binary/startup.h` |
 | Compile-time interpreter, ICE reporting | `ir/ir_comptime.h`, `compiler/compiler_context.h`, `compiler/compiler_crash.h` |
 
-Twenty-eight backend headers in total. A prebuilt bundle ships twelve.
+Twenty-eight backend headers in total; a published bundle ships twelve.
 
-So Mettle takes libmtlc as **source**, pinned to one revision, and builds the
-archive from it. Headers and library then come from the same commit by
-construction, which is the failure this arrangement is chosen to avoid: a
-vendored header set that has drifted from the library beside it produces a
-crash at a struct-layout boundary, not a compile error.
+That coupling is the reason the two halves share a repository. Split across two,
+the driver's header set and the archive beside it drift, and a mismatched struct
+layout is a crash at runtime rather than an error at compile time. Together,
+they come from the same commit by construction.
 
-Mettle is a tightly coupled first-party frontend, and this file is the record of
-that. Narrowing the driver onto `include/mtlc/` alone would be a real
-improvement, and it is not what this repository does today.
+Narrowing the driver onto `include/mtlc/` alone would be a real improvement, and
+it is not what this repository does today.
 
 ## The include path
 
-The build compiles with, in this order:
+The build compiles with:
 
 ```
--Isrc -Ilibmtlc/include -Ilibmtlc/src
+-Isrc -Iinclude
 ```
 
-`-Isrc` is first and that ordering matters. libmtlc's tree carries its own copy
-of the reference frontend, so `libmtlc/src/parser/ast.h` exists too; putting our
-`src` ahead of it means this repository's headers always win, and only the
-backend headers we do not have fall through to the dependency.
+Every header in the tree resolves through those two. A frontend file reaching a
+backend header and a backend file reaching another backend header both work,
+because `src` is on the path.
 
-For that to work, a frontend source file cannot reach a backend header with a
-relative path. `#include "../ir/ir.h"` resolves against the including file's own
-directory, which here is ours, not libmtlc's. So every such include is written
-in include-path form:
-
-```c
-#include "ir/ir.h"          /* libmtlc/src/ir/ir.h        */
-#include "common.h"         /* libmtlc/src/common.h       */
-#include "mtlc/type.h"      /* libmtlc/include/mtlc/type.h */
-#include "symbol_table.h"   /* ours, same directory        */
-```
-
-`tools/sync-from-libmtlc.ps1` applies that rewrite automatically. It is the only
-source difference between the frontend here and the frontend in libmtlc's tree.
-
-## Syncing from upstream
-
-```powershell
-.\tools\sync-from-libmtlc.ps1 -LibmtlcDir ..\libmtlc
-```
-
-The script copies the Mettle half out of a libmtlc checkout, rewrites the
-includes, and skips the backend. Its file lists *are* the frontend/backend
-boundary in executable form: a new frontend translation unit in libmtlc has to
-be added to `$FrontendFiles` before it will appear here.
-
-Two things it deliberately leaves alone:
-
-- **`tests/run_tests.ps1`** is repo-local. It takes a `-LibmtlcDir`, points the
-  handful of harnesses that compile backend translation units at the dependency,
-  and drops libmtlc's own boundary audits. New upstream cases are ported by
-  hand; the script prints a reminder with both line counts.
-- **`Makefile`, `build.bat`, `install.*`, `README.md`** are this repository's
-  own, because they build a frontend against a dependency rather than a monorepo.
-
-After a sync, move the pin in `libmtlc.version` to match, then rebuild:
-
-```powershell
-.\get-libmtlc.ps1
-.\build.bat
-```
-
-## What each side owns
-
-| This repository | libmtlc |
-|--|--|
-| `src/lexer`, `src/parser`, `src/semantic` | `src/ir` (core), `src/ir/optimizer` |
-| `src/ir/ir_lower*.c` (AST to IR) | `src/codegen`, `src/linker` |
-| `src/frontend` (frontend type to `MtlcType`) | `src/compiler`, `src/debug` |
-| `src/main.c` (the driver), `src/mettle_alloc.c` | `src/common.c`, `src/error/error_reporter.c` |
-| `src/error/error_explain.c` (`--explain` output) | `src/mtlc_*.c` (the public API) |
-| `src/runtime`, `stdlib` | `include/mtlc` |
-
-`src/error` splits because the two files do different jobs: the diagnostics
-reporter renders against raw source text and a `SourceLocation` with no AST, so
-libmtlc's compile-time interpreter reports through it and owns it. The
-`--explain` renderer is Mettle's own optimization report.
-
-## Building without the network
-
-`get-libmtlc.sh` and `get-libmtlc.ps1` are the only steps that need network
-access, and only when the pinned revision is not already unpacked. With
-`libmtlc/` populated, or `LIBMTLC_DIR` pointed at a checkout, `make` and
-`build.bat` are entirely offline.
+One wart, from the years these halves spent in separate repositories: the tree
+carries two spellings of the same include. Backend files mostly use a relative
+form, `#include "../ir/ir.h"`, and frontend files mostly use the include-path
+form, `#include "ir/ir.h"`. Both resolve to `src/ir/ir.h` and both compile.
+Normalizing on the include-path form is a mechanical cleanup nobody has done
+yet.

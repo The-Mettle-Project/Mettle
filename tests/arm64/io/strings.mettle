@@ -1,0 +1,14 @@
+import "std/io";
+// A `string` local is a { chars, length } record, and the IR names it bare where
+// it means the record's ADDRESS: `*@msg [8]` reads the chars field out of it.
+// Treating the local as one 8-byte chars pointer made that load read the first
+// eight characters and then branch through them as an address.
+fn main() -> int32 {
+  var msg1: string = "Hello from println!";
+  println(msg1);
+  var msg2: string = "Hello from ";
+  print(msg2);
+  var msg3: string = "print!\n";
+  print(msg3);
+  return 0;
+}

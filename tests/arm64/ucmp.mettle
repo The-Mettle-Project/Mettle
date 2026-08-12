@@ -1,0 +1,12 @@
+// Unsigned ordering. 0x8000000000000000 is above 1 as a uint64 but below it as
+// an int64, so the signed condition codes (LT/LE/GT/GE) answer the reverse and
+// the lowering must reach for LO/LS/HI/HS instead. -> 7
+fn main() -> int64 {
+  var big: uint64 = 9223372036854775808;
+  var one: uint64 = 1;
+  var r: int64 = 0;
+  if (big > one) { r = r + 1; }
+  if (one < big) { r = r + 2; }
+  if (big >= one) { r = r + 4; }
+  return r;
+}

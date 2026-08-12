@@ -1,0 +1,14 @@
+// Sum 1..10 = 55 with a while loop, plus a helper and if/else.
+fn max(a, b) {
+  if (a > b) { return a; } else { return b; }
+}
+
+fn main() {
+  var sum = 0;
+  var i = 1;
+  while (i <= 10) {
+    sum = sum + i;
+    i = i + 1;
+  }
+  return max(sum, 42);   // max(55, 42) = 55
+}

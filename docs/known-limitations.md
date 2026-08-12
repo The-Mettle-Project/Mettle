@@ -111,7 +111,7 @@ Arrays follow the same rule as in [Types - Array Types](types.md#array-types): t
 ### Heap
 
 - There is no garbage collector and no heap manager. `new` and string concatenation emit direct `calloc(1, size)` calls; allocations are reclaimed by the OS at process exit unless user code manages them explicitly.
-- String concatenation via `+` allocates through the C runtime and does not require a Mettle heap runtime object.
+- String concatenation via `+` allocates through Mettle's owned heap.
 
 ### C Interoperability
 
@@ -139,4 +139,6 @@ Arrays follow the same rule as in [Types - Array Types](types.md#array-types): t
 
 ### Platform Support
 
-- `std/net` works on both Windows and Linux from a single `import "std/net"`. On Windows it binds Winsock2; on the native ELF/Linux target the import resolver automatically selects `std/net.linux`, which exposes the same public API over POSIX libc sockets (the Windows-only `WSAStartup`/`WSACleanup`/`closesocket`/`WSAGetLastError` names become thin wrappers). The compiler auto-appends `posix_helpers.o` and `-lpthread` to the link line when `net` is imported on Linux.
+- `std/net` works on Windows and Linux from one import. Windows binds Winsock2.
+  Linux selects `std/net.linux` and uses owned socket system calls. No thread or
+  C library is added.

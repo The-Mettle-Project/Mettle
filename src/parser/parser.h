@@ -1,8 +1,8 @@
 #ifndef PARSER_H
 #define PARSER_H
 
-#include "error/error_reporter.h"
-#include "lexer/lexer.h"
+#include "../error/error_reporter.h"
+#include "../lexer/lexer.h"
 #include "ast.h"
 
 typedef struct {

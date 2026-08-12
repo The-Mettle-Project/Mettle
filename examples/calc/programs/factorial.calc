@@ -1,0 +1,9 @@
+// Recursion: 5! = 120  ->  process exit code 120.
+fn fact(n) {
+  if (n < 2) { return 1; }
+  return n * fact(n - 1);
+}
+
+fn main() {
+  return fact(5);
+}

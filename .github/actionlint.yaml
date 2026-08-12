@@ -1,0 +1,5 @@
+self-hosted-runner:
+  # Labels used by .github/workflows/dgx-spark.yml for the DGX Spark
+  # hardware runner (manual/repository dispatch only).
+  labels:
+    - dgx-spark

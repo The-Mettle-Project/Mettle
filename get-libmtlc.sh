@@ -1,127 +1,114 @@
 #!/bin/sh
-# Fetch the libmtlc backend that Mettle compiles against (Linux, macOS).
+# libmtlc fetcher: get ONLY the backend (headers + static library), no driver.
 #
-#   ./get-libmtlc.sh
+#   curl -fsSL https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/get-libmtlc.sh | sh
 #
-# Mettle is a frontend: it lexes, parses, type-checks and lowers .mettle source
-# into libmtlc's IR. Everything after that -- optimization, code generation,
-# linking -- is libmtlc (https://github.com/The-Mettle-Project/libmtlc). This
-# script downloads the libmtlc source at the revision pinned in libmtlc.version,
-# unpacks it into ./libmtlc, and builds the static archive the driver links.
+# Downloads the prebuilt libmtlc release for this platform and unpacks it into
+# ./libmtlc (include/ + lib/). That folder is everything a frontend links
+# against. No root, no toolchain, no compiler driver.
 #
-# The download is a source checkout, not a release bundle: the driver uses the
-# backend's own headers, so headers and archive must come from one revision. A
-# prebuilt release ships only the public mtlc/ API, which is the surface for a
-# foreign frontend rather than for Mettle's own driver.
+# Environment overrides:
+#   LIBMTLC_VERSION   a specific tag (e.g. v0.13.0) instead of latest
+#   LIBMTLC_DIR       where to unpack (default: ./libmtlc)
+#   LIBMTLC_BASE_URL  a mirror or local test server standing in for GitHub
 #
-# Overrides:
-#   LIBMTLC_VERSION   a tag, branch or commit SHA instead of libmtlc.version
-#   LIBMTLC_DIR       where to unpack (default ./libmtlc)
-#   LIBMTLC_SKIP_BUILD=1   download only; do not build the archive
-#   LIBMTLC_FORCE=1        re-download even if the pinned revision is present
+# Flags: --version <tag>, --dir <path>, --help
+
 set -eu
 
-REPO="The-Mettle-Project/libmtlc"
-# Clear CDPATH before any cd: a value in the environment would send us somewhere
-# else entirely. Unset rather than `CDPATH= cd`, which shellcheck reads as a
-# botched assignment (SC1007).
-unset CDPATH
-ROOT=$(cd -- "$(dirname -- "$0")" && pwd)
-DIR=${LIBMTLC_DIR:-"$ROOT/libmtlc"}
-STAMP="$DIR/.libmtlc-revision"
+REPO="The-Mettle-Project/Mettle"
+VERSION="${LIBMTLC_VERSION:-}"
+DIR="${LIBMTLC_DIR:-./libmtlc}"
 
-say()  { printf '\033[34m%s\033[0m\n' "$1"; }
-ok()   { printf '\033[32mok %s\033[0m\n' "$1"; }
-warn() { printf '\033[33mwarning: %s\033[0m\n' "$1" >&2; }
-die()  { printf '\033[31merror: %s\033[0m\n' "$1" >&2; exit 1; }
-
-# --- the pinned revision -----------------------------------------------------
-VERSION=${LIBMTLC_VERSION:-}
-if [ -z "$VERSION" ] && [ -f "$ROOT/libmtlc.version" ]; then
-  VERSION=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$ROOT/libmtlc.version" \
-            | grep -v '^$' | head -n 1 || true)
-fi
-[ -n "$VERSION" ] || VERSION=main
-
-printf 'libmtlc %s\n' "$VERSION"
-
-# --- download ----------------------------------------------------------------
-# A local git checkout is left completely alone: that is the point of
-# LIBMTLC_DIR when you are working on both halves at once.
-if [ -d "$DIR/.git" ] && [ ! -f "$STAMP" ]; then
-  say "$DIR is a git checkout; leaving it untouched"
-elif [ -f "$STAMP" ] && [ "${LIBMTLC_FORCE:-0}" != "1" ] &&
-     [ "$(tr -d ' \t\r\n' < "$STAMP")" = "$VERSION" ]; then
-  say "$DIR is already at $VERSION (set LIBMTLC_FORCE=1 to re-download)"
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  BOLD="$(printf '\033[1m')"; GREEN="$(printf '\033[32m')"
+  YELLOW="$(printf '\033[33m')"; BLUE="$(printf '\033[34m')"; RESET="$(printf '\033[0m')"
 else
-  URL="https://codeload.github.com/$REPO/tar.gz/$VERSION"
-  say "Downloading $URL"
-  TMP=$(mktemp -d)
-  trap 'rm -rf "$TMP"' EXIT INT TERM
-
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$URL" -o "$TMP/libmtlc.tar.gz" ||
-      die "download failed. Does $REPO have a revision '$VERSION'? See https://github.com/$REPO"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$TMP/libmtlc.tar.gz" "$URL" ||
-      die "download failed. Does $REPO have a revision '$VERSION'? See https://github.com/$REPO"
-  else
-    die "need curl or wget to download libmtlc."
-  fi
-
-  say "Unpacking to $DIR"
-  mkdir -p "$TMP/x"
-  tar -xzf "$TMP/libmtlc.tar.gz" -C "$TMP/x"
-  UNPACKED=$(find "$TMP/x" -mindepth 1 -maxdepth 1 -type d | head -n 1)
-  [ -n "$UNPACKED" ] || die "the archive was empty."
-  for probe in include/mtlc/mtlc.h src/ir/ir.h Makefile; do
-    [ -f "$UNPACKED/$probe" ] || die "the archive is missing $probe (unexpected layout)."
-  done
-
-  rm -rf "$DIR"
-  mkdir -p "$(dirname "$DIR")"
-  mv "$UNPACKED" "$DIR"
-  printf '%s\n' "$VERSION" > "$STAMP"
-  ok "unpacked libmtlc $VERSION into $DIR"
+  BOLD=""; GREEN=""; YELLOW=""; BLUE=""; RESET=""
 fi
+say()  { printf '%s%s%s\n' "$BLUE" "$1" "$RESET"; }
+ok()   { printf '%sok%s %s\n' "$GREEN" "$RESET" "$1"; }
+die()  { printf '%serror:%s %s\n' "$YELLOW" "$RESET" "$1" >&2; exit 1; }
 
-# --- build the archive -------------------------------------------------------
-# libmtlc's own Makefile owns the object list, so the backend is described in
-# exactly one place. Its `libmtlc` target builds the archive alone, without
-# libmtlc's copy of the driver.
-if [ "${LIBMTLC_SKIP_BUILD:-0}" = "1" ]; then
-  say "skipping the build (LIBMTLC_SKIP_BUILD=1)"
-  exit 0
-fi
+usage() {
+  cat <<EOF
+${BOLD}get-libmtlc${RESET}: download the libmtlc backend (headers + static library)
 
-for candidate in lib/libmtlc.a lib/mtlc.lib bin/libmtlc.a bin/mtlc.lib; do
-  if [ -f "$DIR/$candidate" ] && [ "${LIBMTLC_FORCE:-0}" != "1" ]; then
-    ok "using the archive already present at $DIR/$candidate"
-    exit 0
-  fi
+Usage: get-libmtlc.sh [--version <tag>] [--dir <path>]
+Environment: LIBMTLC_VERSION, LIBMTLC_DIR, LIBMTLC_BASE_URL
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --version) VERSION="${2:-}"; shift 2 ;;
+    --dir)     DIR="${2:-}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option: $1 (try --help)" ;;
+  esac
 done
 
-[ -f "$DIR/Makefile" ] || die "$DIR/Makefile not found; cannot build the backend."
-command -v make >/dev/null 2>&1 || die "make not found; install it to build libmtlc."
+need() { command -v "$1" >/dev/null 2>&1; }
 
-# Build the archive with the same compiler and flags the driver will use.
-# libmtlc's Makefile hard-assigns CC, so this has to come in on the command
-# line to take effect. LIBMTLC_EXTRA_CFLAGS is how a sanitizer build gets the
-# backend instrumented too -- without it, most of the compiler is uncovered.
-say "Building the backend archive (this takes a few minutes)"
-if [ -n "${LIBMTLC_EXTRA_CFLAGS:-}" ]; then
-  set -- libmtlc ${CC:+CC="$CC"} EXTRA_CFLAGS="$LIBMTLC_EXTRA_CFLAGS"
+os="$(uname -s)"; arch="$(uname -m)"
+case "$os" in
+  Linux) platform="linux" ;;
+  Darwin) die "macOS is not supported yet: libmtlc emits ELF and COFF, not Mach-O." ;;
+  *) die "unsupported OS '$os'. libmtlc ships Linux and Windows builds (use get-libmtlc.ps1 on Windows)." ;;
+esac
+case "$arch" in
+  x86_64|amd64) arch="x64" ;;
+  *) die "unsupported architecture '$arch'. libmtlc currently targets x86-64." ;;
+esac
+target="${platform}-${arch}"
+
+if need curl; then
+  dl() { curl -fsSL "$1" -o "$2"; }; dl_stdout() { curl -fsSL "$1"; }
+elif need wget; then
+  dl() { wget -qO "$2" "$1"; }; dl_stdout() { wget -qO - "$1"; }
 else
-  set -- libmtlc ${CC:+CC="$CC"}
+  die "need curl or wget."
 fi
-if ! make -C "$DIR" "$@"; then
-  warn "the 'libmtlc' target failed; trying a full libmtlc build"
-  shift
-  make -C "$DIR" "$@" || die "building libmtlc failed."
+need tar || die "need tar to unpack the archive."
+
+if [ -z "$VERSION" ]; then
+  say "Finding the latest release..."
+  VERSION="$(dl_stdout "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
+    | grep -m1 '"tag_name"' \
+    | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')" || true
+  [ -n "$VERSION" ] || die "could not determine the latest release. Set LIBMTLC_VERSION=vX.Y.Z."
 fi
 
-[ -f "$DIR/bin/libmtlc.a" ] || die "the build finished but $DIR/bin/libmtlc.a is missing."
-ok "built $DIR/bin/libmtlc.a"
-echo
-echo "Now build Mettle:"
-echo "  make"
+bundle="libmtlc-${VERSION}-${target}"
+base_url="${LIBMTLC_BASE_URL:-https://github.com/$REPO/releases/download/${VERSION}}"
+url="${base_url}/${bundle}.tar.gz"
+
+printf '%sFetching libmtlc %s%s%s for %s%s%s\n' \
+  "$BOLD" "$GREEN" "$VERSION" "$RESET$BOLD" "$GREEN" "$target" "$RESET"
+
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/libmtlc.XXXXXX")"
+trap 'rm -rf "$tmp"' EXIT INT TERM
+
+say "Downloading $url"
+dl "$url" "$tmp/libmtlc.tar.gz" || die "download failed. Does $VERSION ship a $target libmtlc asset? See https://github.com/$REPO/releases."
+[ -s "$tmp/libmtlc.tar.gz" ] || die "downloaded archive is empty."
+
+say "Unpacking to $DIR"
+tar -xzf "$tmp/libmtlc.tar.gz" -C "$tmp" || die "failed to unpack the archive."
+src="$tmp/libmtlc"; [ -d "$src" ] || src="$tmp"
+[ -f "$src/lib/libmtlc.a" ] || die "archive did not contain lib/libmtlc.a (unexpected layout)."
+
+rm -rf "$DIR"
+mkdir -p "$(dirname "$DIR")"
+cp -R "$src" "$DIR"
+ok "Installed libmtlc to $DIR"
+
+cat <<EOF
+
+Link a frontend with:
+  ${BOLD}cc -I$DIR/include app.c $DIR/lib/libmtlc.a -o app${RESET}
+Or, if a pkg-config file shipped:
+  ${BOLD}cc \$(PKG_CONFIG_PATH=$DIR/lib/pkgconfig pkg-config --cflags --libs libmtlc) app.c${RESET}
+
+API reference: ${BLUE}https://github.com/$REPO/blob/main/docs/libmtlc/api.md${RESET}
+EOF

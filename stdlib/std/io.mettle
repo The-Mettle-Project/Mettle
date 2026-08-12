@@ -92,7 +92,7 @@ export extern fn fflush(fp: cstring) -> int32 = "fflush";
 
 // ─── Standard streams (accessed via C helpers) ──────────────────────────────
 // On Windows, stdin/stdout/stderr are macros expanding to __acrt_iob_func(n).
-// We expose them through the C runtime's _iob accessor.
+// The owned Windows runtime exposes them through its _iob ABI adapter.
 export extern fn __acrt_iob_func(index: int32) -> cstring = "__acrt_iob_func";
 
 export fn get_stdin() -> cstring  { return __acrt_iob_func(0); }

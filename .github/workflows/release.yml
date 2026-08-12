@@ -1,9 +1,11 @@
 name: Release
 
 # On a version tag (v*), build the compiler on each platform, run the suite as
-# a gate, then package the compiler with its bundled stdlib/runtime and attach
-# it to the GitHub Release: a Windows .zip and a Linux .tar.gz. The one-line
-# installers (install.sh / install.ps1) download these artifacts.
+# a gate, then package and attach two kinds of asset to the GitHub Release:
+#   - the full toolchain (compiler + bundled stdlib/runtime), a Windows .zip and
+#     a Linux .tar.gz, fetched by install.sh / install.ps1;
+#   - the backend only (headers + static library), libmtlc-<tag>-<target>.{zip,
+#     tar.gz}, fetched by get-libmtlc.sh / get-libmtlc.ps1.
 
 on:
   push:
@@ -30,14 +32,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      # The backend comes from libmtlc at the revision pinned in
-      # libmtlc.version, so a release records exactly which backend it shipped.
-      - name: Fetch and build libmtlc backend
-        shell: pwsh
-        env:
-          METTLE_NO_CODEVIEW: "1"
-        run: .\get-libmtlc.ps1
 
       # Build + full suite (build.bat runs the gate); a tag must pass tests to ship.
       # METTLE_VERSION stamps the version into the binary (build.bat reads it);
@@ -71,6 +65,21 @@ jobs:
           echo "zip=$zip" >> $env:GITHUB_OUTPUT
           Write-Host "Packaged $zip"
 
+      # The backend-only asset (headers + mtlc.lib) that get-libmtlc.ps1 fetches.
+      - name: Stage libmtlc backend
+        id: libmtlc
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ([string]::IsNullOrWhiteSpace($tag) -or $tag -eq 'development' -or $tag -eq 'main') {
+            $tag = "${{ github.event.inputs.tag }}"
+          }
+          .\tools\dist-libmtlc.ps1
+          $zip = "libmtlc-$tag-windows-x64.zip"
+          Compress-Archive -Path dist\libmtlc -DestinationPath $zip -Force
+          echo "zip=$zip" >> $env:GITHUB_OUTPUT
+          Write-Host "Packaged $zip"
+
       # Build the GUI installer (Inno Setup) from the bundle build.bat produced.
       # ISCC ships on the windows-latest image; install it if the image changes.
       - name: Build GUI installer
@@ -100,6 +109,7 @@ jobs:
           name: mettle-windows-x64
           path: |
             ${{ steps.stage.outputs.zip }}
+            ${{ steps.libmtlc.outputs.zip }}
             ${{ steps.installer.outputs.setup }}
           retention-days: 30
 
@@ -109,6 +119,7 @@ jobs:
         with:
           files: |
             ${{ steps.stage.outputs.zip }}
+            ${{ steps.libmtlc.outputs.zip }}
             ${{ steps.installer.outputs.setup }}
           generate_release_notes: true
 
@@ -118,9 +129,6 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-
-      - name: Fetch and build libmtlc backend
-        run: ./get-libmtlc.sh
 
       - name: Build compiler
         run: |
@@ -157,18 +165,37 @@ jobs:
           echo "tar=$tar" >> "$GITHUB_OUTPUT"
           echo "Packaged $tar"
 
+      # The backend-only asset (headers + libmtlc.a) that get-libmtlc.sh fetches.
+      - name: Stage libmtlc backend
+        id: libmtlc
+        shell: bash
+        run: |
+          tag="${{ github.ref_name }}"
+          if [ -z "$tag" ] || [ "$tag" = "development" ] || [ "$tag" = "main" ]; then
+            tag="${{ github.event.inputs.tag }}"
+          fi
+          make dist-libmtlc
+          tar="libmtlc-$tag-linux-x64.tar.gz"
+          tar -C dist -czf "$tar" libmtlc
+          echo "tar=$tar" >> "$GITHUB_OUTPUT"
+          echo "Packaged $tar"
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.stage.outputs.tar }}
-          path: ${{ steps.stage.outputs.tar }}
+          path: |
+            ${{ steps.stage.outputs.tar }}
+            ${{ steps.libmtlc.outputs.tar }}
           retention-days: 30
 
       - name: Attach to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ steps.stage.outputs.tar }}
+          files: |
+            ${{ steps.stage.outputs.tar }}
+            ${{ steps.libmtlc.outputs.tar }}
           # Notes are generated once by the windows job; regenerating here would
           # append a duplicate auto-notes block to the release body.
           generate_release_notes: false

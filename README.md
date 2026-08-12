@@ -127,16 +127,13 @@ development. See [known limitations](docs/known-limitations.md).
 
 ## Build from source
 
-Mettle compiles against [libmtlc](https://github.com/The-Mettle-Project/libmtlc),
-its backend: the IR, the optimizers, code generation, and native linking. One
-command fetches the pinned revision and builds it; after that the build is
-offline. Installing a release needs none of this, because the released compiler
-already has the backend linked in.
+This repository is the whole toolchain: the language and its frontend, and
+**libmtlc** — the IR, the optimizers, code generation and native linking — under
+the same `src/`. There is nothing to fetch. The build is offline.
 
 **Windows** (gcc or clang):
 
 ```powershell
-.\get-libmtlc.ps1
 .\build.bat
 .\tests\run_tests.ps1
 ```
@@ -144,26 +141,24 @@ already has the backend linked in.
 **Linux**:
 
 ```bash
-./get-libmtlc.sh
 make -j"$(nproc)"
 bash tools/test-elf-native.sh
 ```
 
-The revision is pinned in [`libmtlc.version`](libmtlc.version). To work on both
-halves at once, build against a checkout instead of the download and they rebuild
-together:
+To build the backend on its own — the archive a foreign frontend links against,
+with none of the Mettle frontend in it:
 
 ```powershell
-$env:LIBMTLC_DIR = "..\libmtlc"    # Linux: make LIBMTLC_DIR=../libmtlc
+.\build.bat --backend-only   # Linux: make libmtlc
 ```
 
-See [Mettle and libmtlc](docs/mettle-and-libmtlc.md) for the boundary, the
-include-path rules, and how frontend changes sync back from upstream.
+See [Mettle and libmtlc](docs/mettle-and-libmtlc.md) for where the frontend ends
+and the backend begins, and why that line is worth keeping inside one repository.
 
 
-Two things are deliberately elsewhere. The optimizers, code generators and
-linkers live in [libmtlc](https://github.com/The-Mettle-Project/libmtlc), which
-is upstream of this repository.
+The editor extensions are deliberately elsewhere: they live in
+[MettleMisc](https://github.com/The-Mettle-Project/MettleMisc) — `mettle-syntax`
+for VS Code and Cursor, and `clion-plugin` for the IntelliJ family.
 
 ## Examples and benchmarks
 

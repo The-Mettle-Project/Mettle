@@ -63,7 +63,7 @@ capability rejection, and PTX, SPIR-V, x86-64, and AArch64 products.
 | Typed index/math/atomic intrinsics | working foundation | public semantic enum is carried on IR calls; native Mettle `thread`/`block`/`block_dim`/`grid_dim` XYZ access and type-directed atomics need no declaration; PTX/SPIR-V no longer infer GPU behavior from call-name strings |
 | Neutral typed host-launch IR | working foundation | compact source launch remains compatible, while named `dispatch` now exposes reorderable 3-D grid/block, dynamic shared bytes, and stream; public builders carry the identical operation and exact argument types; host lowering alone marshals provider parameters; CPU stubs validate every control and natural-width argument, cross-host AArch64 object emission covers nontrivial values, and enqueue failures are checked |
 | Streams, events, async copies/allocations, managed memory, 3-D launch runtime | API foundation | CUDA Driver bindings and neutral `gpu_*` wrappers exist; hardware integration tests are still required |
-| Native build and GPU module emission on AArch64 | CI-gated | compiler builds on `ubuntu-24.04-arm`; native ELF64 objects link/run with libc while PTX/SPIR-V and the static smoke product emit natively |
+| Native build and GPU module emission on AArch64 | CI-gated | compiler builds on `ubuntu-24.04-arm`; native ELF64 objects link with the owned static runtime while PTX, SPIR-V, and the compact image emit natively |
 | Native Mettle CUDA host ABI on AArch64 | CI-gated foundation | compact and full named source launches run through AAPCS64 `cuLaunchKernel` linkage against a hardware-free provider that checks all 11 arguments, nontrivial XYZ geometry, dynamic shared bytes, and stream; real `libcuda`/GB10 execution remains a DGX gate |
 | Explicit pointer address spaces and device storage | assembler-, validator-, and device-validated foundation | public types distinguish generic/global/workgroup/constant/private; fixed Mettle arrays lower to neutral static workgroup/private allocations; a `workgroup var arena: T*` lowers to a typed view of the launch-provided dynamic arena, with multiple views intentionally aliasing one base; PTX uses one module-scope external shared array and SPIR-V one hidden Workgroup pointer kernel argument; ptxas/spirv-val pass and a partitioned two-view CUDA launch passes memcheck/racecheck on compute 12.0; OpenCL host binding is not yet execution-tested |
 | Neutral asynchronous workgroup staging | assembler-, validator-, and device-validated foundation | source and public APIs emit balanced global-to-workgroup copy/commit/wait groups with 4/8/16-byte transactions and explicit cache hints; CFG verification rejects unbalanced exits; PTX sm_80+ uses native `cp.async`, portable PTX/SPIR-V replay typed synchronous copies, and compiler-owned PTX workgroup storage is at least 32-byte aligned; explicit and optimizer-generated overlap pass numerical hardware tests on compute 12.0, while GB10 execution remains unproven |
@@ -115,8 +115,8 @@ edge launch shapes.
 ### 2. AArch64 host completeness
 
 - Done: relocatable AArch64 ELF objects, AAPCS64 register/stack calls,
-  function/global/string relocations, libc/CUDA extern symbols, and the same
-  `gcc -no-pie` linker contract as x86-64 Linux.
+  function, global, and string relocations, owned runtime and CUDA extern
+  symbols, and the same static dependency rule as x86_64 Linux.
 - Pending: native AArch64 DWARF/debug tables and broader aggregate/SIMD IR.
 - Run the full standard-library and runtime suite natively on AArch64.
 - Audit all host atomics and lock-free structures under the Arm memory model.

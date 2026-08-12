@@ -1,8 +1,8 @@
 #ifndef IMPORT_RESOLVER_H
 #define IMPORT_RESOLVER_H
 
-#include "error/error_reporter.h"
-#include "parser/ast.h"
+#include "../error/error_reporter.h"
+#include "../parser/ast.h"
 #include <stddef.h>
 
 typedef struct {

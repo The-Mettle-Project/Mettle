@@ -97,7 +97,7 @@ fn main() -> int32 {
   for i in 0..n { if (fabs64(out[i] - (float64)i * 2.0) > 0.0001) { bad = bad + 1; } }
 
   // vsilu_gate: af[i] = silu(g) * u, compared to the scalar ref_silu (the
-  // vectorized exp poly tracks libc expf within tolerance).
+  // vectorized exp poly tracks the owned expf within tolerance).
   for i in 0..n { af[i] = (float32)(i % 13) - 6.0; bf[i] = (float32)(i % 5) + 0.5; }
   vsilu_gate(&af[0], &bf[0], n);
   for i in 0..n {

@@ -1,0 +1,10 @@
+// A float32 global updated with promoted (double) arithmetic must read back as
+// float32: convert at the assignment, don't store the low half of the double.
+// 25 + 125 = 150
+var Fw: float64 = 2.5;
+var Gw: float32 = 1.25;
+fn main() -> int64 {
+  Fw = Fw + 0.0;
+  Gw = Gw + 0.0;
+  return (int64)(Fw * 10.0) + (int64)(Gw * 100.0);
+}

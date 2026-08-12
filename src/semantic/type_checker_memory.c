@@ -44,7 +44,7 @@
 // trusted, so the false-positive budget is zero.
 
 #include "type_checker_internal.h"
-#include "ir/ir_explain_memory.h"
+#include "../ir/ir_explain_memory.h"
 
 #define MEM_MAX_LOCALS 256
 #define MEM_MAX_PARAMS 32

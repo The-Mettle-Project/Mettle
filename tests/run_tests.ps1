@@ -3,24 +3,10 @@ param(
   [switch]$BuildCompiler,
   [switch]$SkipRuntime,
   [switch]$SkipDeterminism,
-  [int]$FuzzCount = 60,
-  # The libmtlc dependency. A handful of cases compile backend translation
-  # units directly (the ARM64 encoder, the ML observation parity check) or link
-  # the archive, so they need to know where the backend lives. Everything else
-  # drives bin\mettle.exe and does not care.
-  [string]$LibmtlcDir = $(if ($env:LIBMTLC_DIR) { $env:LIBMTLC_DIR } else { "libmtlc" })
+  [int]$FuzzCount = 60
 )
 
 $ErrorActionPreference = "Continue"
-
-# Resolved once; a case that needs the backend skips itself when it is absent
-# rather than failing, so the suite still runs without a fetched dependency.
-$LibmtlcSrc = Join-Path $LibmtlcDir "src"
-$LibmtlcInc = Join-Path $LibmtlcDir "include"
-$LibmtlcLib = @("bin\mtlc.lib", "lib\mtlc.lib", "bin\libmtlc.a", "lib\libmtlc.a") |
-  ForEach-Object { Join-Path $LibmtlcDir $_ } |
-  Where-Object { Test-Path $_ } | Select-Object -First 1
-$HaveLibmtlcSrc = Test-Path (Join-Path $LibmtlcSrc "ir\ir.h")
 
 function Write-CaseResult {
   param(
@@ -293,6 +279,8 @@ $cases = @(
       'loops: \d+ vectorized, \d+ scalar; \d+ fix suggestions verified',
       'calls: \d+ inlined, \d+ kept as real calls',
       'backend: \d+/\d+ functions register-allocated',
+      # the digest names what to do, not just how the build went
+      'start with: main \(\d+ instrs\)  move the vectorized loop into a function of its own',
       'full report \(\d+ lines\): .*explain_sidecar\.explain\.txt'
     )
     OutputMustNotMatch = @(
@@ -332,8 +320,8 @@ $cases = @(
       # loop the inliner structurally declines, so the simulation withdraws
       # the @inline suggestion and says the driver loop is correctly scalar
       'each iteration calls `row_scale`, and `@inline` cannot help: the callee contains a loop',
-      # advice that says there is nothing to change is labelled a note, not a
-      # fix, and never reaches the "where to start" ranking
+      # advice that says there is nothing to change is labelled a note,
+      # not a fix, and never reaches the "where to start" ranking
       'note: nothing to change on this line: this loop is a driver'
     )
     OutputMustNotMatch = @(
@@ -392,7 +380,7 @@ $cases = @(
     Name          = "err_mem_return_stack"
     Path          = "tests/err_mem_return_stack.mettle"
     ShouldSucceed = $false
-    Pattern       = 'Returning the address of stack local `values`'
+    Pattern       = 'error\[M0103\]: Returning the address of stack local `values`'
   },
   @{
     # Memory diagnostics: constant index past a stack array's end is an error
@@ -408,7 +396,7 @@ $cases = @(
     Name          = "err_mem_op_overflow"
     Path          = "tests/err_mem_op_overflow.mettle"
     ShouldSucceed = $false
-    Pattern       = '`mem_zero` writes 128 bytes into `buf`, which only has 64'
+    Pattern       = 'error\[M0106\]: `mem_zero` writes 128 bytes into `buf`, which only has 64'
   },
   @{
     # Loop-bound analysis: `j <= 8` over int32[8] provably reads a[8] on the
@@ -416,21 +404,21 @@ $cases = @(
     Name          = "err_mem_loop_oob"
     Path          = "tests/err_mem_loop_oob.mettle"
     ShouldSucceed = $false
-    Pattern       = 'This loop runs `j` up to 8, but `a` has 8 elements'
+    Pattern       = 'error\[M0117\]: This loop runs `j` up to 8, but `a` has 8 elements'
   },
   @{
     # Constant arithmetic: division by a literal zero is a guaranteed trap.
     Name          = "err_mem_div_zero"
     Path          = "tests/err_mem_div_zero.mettle"
     ShouldSucceed = $false
-    Pattern       = 'Division by a constant zero'
+    Pattern       = 'error\[M0116\]: Division by a constant zero'
   },
   @{
     # Constant out-of-bounds THROUGH a pointer alias: p = &a[2], p[6] = a[8].
     Name          = "err_mem_ptr_alias_oob"
     Path          = "tests/err_mem_ptr_alias_oob.mettle"
     ShouldSucceed = $false
-    Pattern       = 'Index 6 through `p` lands at `a\[8\]`, out of bounds'
+    Pattern       = 'error\[M0105\]: Index 6 through `p` lands at `a\[8\]`, out of bounds'
   },
   @{
     # Memory diagnostics that warn without failing the build: double free,
@@ -441,13 +429,15 @@ $cases = @(
     Path          = "tests/warn_mem_diagnostics.mettle"
     ShouldSucceed = $true
     OutputMustMatch = @(
-      'Double free of `p` \(already freed at line \d+\)',
-      'Use of `p` after it was freed',
-      'Global `STASH` is assigned the address of stack local `slot`',
-      '`scratch` is allocated here but never freed',
-      '`p` is null here \(assigned at line \d+ and never reassigned\)',
-      'Shift by 32 on a 32-bit value',
-      '`p` points at the constant address 64'
+      # each finding reports under its own M-code, not the generic E0003, so
+      # `mettle explain M0102` works on the diagnostic in front of the reader
+      'warning\[M0102\]: Double free of `p` \(already freed at line \d+\)',
+      'warning\[M0101\]: Use of `p` after it was freed',
+      'warning\[M0104\]: Global `STASH` is assigned the address of stack local `slot`',
+      'warning\[M0107\]: `scratch` is allocated here but never freed',
+      'warning\[M0113\]: `p` is null here \(assigned at line \d+ and never reassigned\)',
+      'warning\[M0115\]: Shift by 32 on a 32-bit value',
+      'warning\[M0114\]: `p` points at the constant address 64'
     )
     OutputMustNotMatch = @(
       'Use of `scratch`',
@@ -667,44 +657,104 @@ $cases = @(
     )
   },
   @{
-    # A nest that arrives by inlining. The inliner drops `@simd` markers from
-    # the copy it makes, so the callee's loop leaves no record and the driver
-    # loop reads as a leaf -- which used to make the classifier blame the inner
-    # loop's exit test on a data-dependent `if` and prescribe a branchless
-    # rewrite for a body containing no branch. The verdict must be the nest, and
-    # it must name the call that brought the loop in.
-    Name          = "explain_inlined_nest"
-    Path          = "tests/explain_inlined_nest.mettle"
+    # --explain=SELECTOR narrows the prose. Each verdict carries its stable
+    # decision code, the source the finding is about is quoted, and the report
+    # leads with the fixes the compiler proved.
+    Name          = "explain_selector"
+    Path          = "tests/explain_demo.mettle"
     ShouldSucceed = $true
-    Args          = @("-O", "--explain=main")
+    Args          = @("--release", "--explain=sum_ints")
     Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
     OutputMustMatch = @(
-      'main \(loop @ line 31\): NOT vectorized  \[outer-of-nest\]',
-      "the call to ``sum_bytes`` on line 32 was inlined, so that callee's loop \(line 13\) now sits in this body",
-      'note: nothing to change on this line'
+      'where to start',
+      'proven sum_ints:76',
+      'sum_ints \(loop @ line 76\): NOT vectorized  \[int32-sum-narrow-acc\]',
+      # the loop body itself, quoted under the verdict
+      '77 \|     s = s \+ a\[i\];',
+      'findings hidden by --explain=sum_ints',
+      'mettle explain int32-sum-narrow-acc'
     )
     OutputMustNotMatch = @(
-      'branches on data',
-      'branchless'
+      'saxpy \(loop',
+      'sum_bytes \(loop'
     )
   },
   @{
-    # A fix that is correct and not sufficient. The simulation applies it, sees
-    # the loop stay scalar, and reports the obstacle that surfaced next -- so
-    # the caveat reaches the reader before the edit does, in the action plan
-    # ("step 1") as well as in the remark.
-    Name          = "explain_partial_fix"
-    Path          = "tests/explain_partial_fix.mettle"
+    # The fill refusals name the cause that actually applies. The generic
+    # "your store address did not match" message used to fire for all of
+    # them, telling a writer who had already written `a[i]` to write `a[i]`.
+    # The last function proves the stack-array advice: same loop, pointer
+    # bound once, and it vectorizes.
+    Name          = "explain_fill_causes"
+    Path          = "tests/explain_fill_causes.mettle"
     ShouldSucceed = $true
-    Args          = @("-O", "--explain=row_energy")
+    Args          = @("--release", "--explain=loops")
     Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
     OutputMustMatch = @(
-      'step 1 row_energy:13',
-      'fix: declare `value` before the loop.*\(first step only\)',
-      'still blocked: re-checked with that change applied: the loop still does not vectorize'
+      'the body writes 2 destinations; the fill kernel fills one region per loop',
+      'fix: split it into one loop per destination',
+      'the loop fills 1-byte elements, and the fill kernel covers 2-, 4- and 8-byte elements only',
+      # a compiler gap is a note, not a fix: it must not be ranked as work
+      'note: nothing to change here: this is a gap in the compiler',
+      'the loop fills the stack array `a`, whose address is retaken on every iteration',
+      'fix: bind the array to a pointer once before the loop \(`var p: float32\* = &a\[0\];`\)',
+      'local_fill_bound \(loop @ line \d+\): vectorized',
+      # three loops miss the kernel; only two of them have work to do,
+      # because the byte-width gap is the compiler's and not the code's
+      'where to start \(2 of 3 missed optimizations have a fix',
+      # the stack-array advice is not believed, it is checked: the
+      # compiler binds the pointer on a clone and re-runs, and the kernel
+      # it names is the one local_fill_bound actually gets below
+      'verified: simulated that fix and re-ran the optimizer: this loop then vectorizes -> 16-byte splat stores',
+      # so it leads the triage, ahead of the unproven split advice; and
+      # the two live side by side rather than folding, because one code
+      # here covers three different causes with three different fixes
+      '1\. proven local_fill:\d+  bind the array to a pointer once',
+      '2\.        two_regions:\d+  split it into one loop per destination'
     )
     OutputMustNotMatch = @(
-      'verified:'
+      # the advice that could not be followed
+      'its store address did not match the fill vectorizer'
+    )
+  },
+  @{
+    # A mixed-width float loop gets no kernel. The advice names which width to
+    # keep, and the compiler proves it: it retypes the minority on a clone and
+    # re-runs its own vectorizer. Each mixed loop is followed by the same loop
+    # written in one width, and the kernel named by the simulation must be the
+    # kernel that one actually gets, in both directions.
+    Name          = "explain_mixed_float_widths"
+    Path          = "tests/explain_mixed_float_widths.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--explain=loops")
+    Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
+    OutputMustMatch = @(
+      'fix: keep the loop in float32: the float64 accesses are the minority',
+      'verified: simulated that fix and re-ran the optimizer: this loop then vectorizes -> vfmadd231ps, 8-wide float32 affine map',
+      'single32 \(loop @ line \d+\): vectorized -> vfmadd231ps, 8-wide float32 affine map',
+      'fix: keep the loop in float64: the float32 accesses are the minority',
+      'verified: simulated that fix and re-ran the optimizer: this loop then vectorizes -> 4-wide float64 element-wise map',
+      'single64 \(loop @ line \d+\): vectorized -> 4-wide float64 element-wise map'
+    )
+  },
+  @{
+    # The outer loop of a nest is not a missed optimization: only innermost
+    # loops vectorize, so its remark points at the inner loop's problem rather
+    # than being a second one. It still gets a remark, and it must not raise
+    # the count "where to start" quotes -- with nothing but outer-of-nest
+    # selected there is no triage block at all.
+    Name          = "explain_nest_not_a_miss"
+    Path          = "tests/explain_demo.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--explain=outer-of-nest")
+    Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
+    OutputMustMatch = @(
+      'matvec \(loop @ line \d+\): NOT vectorized  \[outer-of-nest\]',
+      'only innermost loops are vectorized'
+    )
+    OutputMustNotMatch = @(
+      'where to start',
+      'missed optimization'
     )
   },
   @{
@@ -731,14 +781,102 @@ $cases = @(
       'spills main'
     )
   },
+  @{
+    # A fix that is correct and not sufficient. The simulation applies it, sees
+    # the loop stay scalar, and reports the obstacle that surfaced next -- so
+    # the caveat reaches the reader before the edit does, in the action plan
+    # ("step 1") as well as in the remark.
+    Name          = "explain_partial_fix"
+    Path          = "tests/explain_partial_fix.mettle"
+    ShouldSucceed = $true
+    Args          = @("-O", "--explain=row_energy")
+    Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
+    OutputMustMatch = @(
+      'step 1 row_energy:13',
+      'fix: declare `value` before the loop.*\(first step only\)',
+      'still blocked: re-checked with that change applied: the loop still does not vectorize'
+    )
+    OutputMustNotMatch = @(
+      'verified:'
+    )
+  },
+  @{
+    # A nest that arrives by inlining. The inliner drops `@simd` markers from
+    # the copy it makes, so the callee's loop leaves no record and the driver
+    # loop reads as a leaf -- which used to make the classifier blame the inner
+    # loop's exit test on a data-dependent `if` and prescribe a branchless
+    # rewrite for a body containing no branch. The verdict must be the nest, and
+    # it must name the call that brought the loop in.
+    Name          = "explain_inlined_nest"
+    Path          = "tests/explain_inlined_nest.mettle"
+    ShouldSucceed = $true
+    Args          = @("-O", "--explain=main")
+    Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
+    OutputMustMatch = @(
+      'main \(loop @ line 31\): NOT vectorized  \[outer-of-nest\]',
+      "the call to ``sum_bytes`` on line 32 was inlined, so that callee's loop \(line 13\) now sits in this body",
+      'note: nothing to change on this line'
+    )
+    OutputMustNotMatch = @(
+      'branches on data',
+      'branchless'
+    )
+  },
+  @{
+    # A reason can run past 300 columns, and a terminal folds that at column 0,
+    # which dissolves the `\_ reason:` tree the report is shaped around. Only a
+    # terminal gets the wrapped form; a pipe keeps one line per fact so a
+    # pattern matching a whole reason keeps matching one. METTLE_EXPLAIN_COLUMNS
+    # forces the width, since a test harness never has a terminal.
+    Name          = "explain_wraps_for_a_terminal"
+    Path          = "tests/explain_demo.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--explain=matvec")
+    Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0"; METTLE_EXPLAIN_COLUMNS = "80" }
+    OutputMustMatch = @(
+      # the fold happens on a space, and the continuation indents inside the
+      # elbow so it still reads as subordinate to its verdict
+      'the body contains a nested loop \(line 38\), and only innermost\r?\n {9}loops are vectorized',
+      # the source echo keeps its gutter
+      '38 \| for c in 0\.\.cols \{'
+    )
+    OutputMustNotMatch = @(
+      # and the unwrapped form of that same reason is gone, so the fold is
+      # real rather than an extra copy
+      'nested loop \(line 38\), and only innermost loops are vectorized'
+    )
+  },
+  @{
+    # The same file without a forced width stays one line per fact, so grep
+    # over a redirected report still returns whole reasons.
+    Name          = "explain_unwrapped_when_redirected"
+    Path          = "tests/explain_demo.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--explain=matvec")
+    Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
+    OutputMustMatch = @(
+      'the body contains a nested loop \(line 38\), and only innermost loops are vectorized'
+    )
+  },
+  @{
+    # A selector nobody can satisfy says what the selectors are instead of
+    # printing an empty section.
+    Name          = "explain_selector_unknown"
+    Path          = "tests/explain_demo.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--explain=nosuchthing")
+    Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
+    OutputMustMatch = @(
+      'nothing matches --explain=nosuchthing',
+      'selectors: missed, fixable, proven, loops, calls'
+    )
+  },
   @{ Name = "err_decorator_on_loop"; Path = "tests/err_decorator_on_loop.mettle"; ShouldSucceed = $false; Pattern = "apply to a function, not a loop" },
   @{ Name = "err_decorator_unknown"; Path = "tests/err_decorator_unknown.mettle"; ShouldSucceed = $false; Pattern = "Unknown decorator after" },
   @{ Name = "err_decorator_conflict"; Path = "tests/err_decorator_conflict.mettle"; ShouldSucceed = $false; Pattern = "mutually exclusive" },
   @{ Name = "err_decorator_on_struct"; Path = "tests/err_decorator_on_struct.mettle"; ShouldSucceed = $false; Pattern = "may only precede a function declaration" },
   @{ Name = "err_decorator_after_export"; Path = "tests/err_decorator_after_export.mettle"; ShouldSucceed = $false; Pattern = "Decorators must precede 'export'" },
-    @{ Name = "const_top_level"; Path = "tests/test_const_top_level.mettle"; ShouldSucceed = $true },
-    @{ Name = "const_array_float"; Path = "tests/test_const_array_float.mettle"; ShouldSucceed = $true },
-    @{ Name = "err_const_array_nonconst"; Path = "tests/err_const_array_nonconst.mettle"; ShouldSucceed = $false },
+  @{ Name = "const_top_level"; Path = "tests/test_const_top_level.mettle"; ShouldSucceed = $true },
   @{ Name = "lambda"; Path = "tests/test_lambda.mettle"; ShouldSucceed = $true },
   @{ Name = "err_var_inferred"; Path = "tests/err_var_inferred.mettle"; ShouldSucceed = $false; Pattern = "requires an explicit type" },
   @{ Name = "closure_capture"; Path = "tests/test_closure_capture.mettle"; ShouldSucceed = $true },
@@ -752,7 +890,6 @@ $cases = @(
   @{ Name = "err_const_no_init"; Path = "tests/err_const_no_init.mettle"; ShouldSucceed = $false; Pattern = "Constant declaration requires an initializer" },
   @{ Name = "err_const_assign"; Path = "tests/err_const_assign.mettle"; ShouldSucceed = $false; Pattern = "is a constant and cannot be assigned to" },
   @{ Name = "err_const_nonconst"; Path = "tests/err_const_nonconst.mettle"; ShouldSucceed = $false; Pattern = "compile-time integer constant expression" },
-  @{ Name = "err_const_float_nonconst"; Path = "tests/err_const_float_nonconst.mettle"; ShouldSucceed = $false; Pattern = "compile-time constant expression" },
   # A global is laid out at compile time and there is no module initializer, so a
   # run-time initializer must be a diagnostic with a source location - it used to
   # reach the direct-object backend and abort as an internal compiler error.
@@ -1349,11 +1486,6 @@ $cases = @(
   @{ Name = "errdefer_top_level"; Path = "tests/test_errdefer_top_level.mettle"; ShouldSucceed = $false; Pattern = "Defer statement outside of a function|Errdefer statement outside of a function" },
   @{ Name = "defer_block_statement"; Path = "tests/test_defer_block_statement.mettle"; ShouldSucceed = $true },
   @{ Name = "errdefer_assignment_statement"; Path = "tests/test_errdefer_assignment_statement.mettle"; ShouldSucceed = $true },
-    @{ Name = "defer_global_assignment"; Path = "tests/test_defer_global_assignment.mettle"; ShouldSucceed = $true },
-    @{ Name = "multiple_returns"; Path = "tests/test_multiple_returns.mettle"; ShouldSucceed = $true },
-    @{ Name = "multiple_returns_global"; Path = "tests/test_multiple_returns_global.mettle"; ShouldSucceed = $true },
-    @{ Name = "err_multiple_returns_count"; Path = "tests/err_multiple_returns_count.mettle"; ShouldSucceed = $false; Pattern = "returns 2 values but this return has 1" },
-    @{ Name = "err_multiple_returns_empty"; Path = "tests/err_multiple_returns_empty.mettle"; ShouldSucceed = $false; Pattern = "must return 2 values" },
   @{
     Name            = "errdefer_implicit_fallthrough"
     Path            = "tests/test_errdefer_implicit_fallthrough.mettle"
@@ -1444,6 +1576,21 @@ $cases = @(
   @{ Name = "err_deref_non_pointer"; Path = "tests/err_deref_non_pointer.mettle"; ShouldSucceed = $false; Pattern = "Dereference operator requires a pointer operand" },
   @{ Name = "err_address_of_non_lvalue"; Path = "tests/err_address_of_non_lvalue.mettle"; ShouldSucceed = $false; Pattern = "Address-of operator requires an assignable expression" },
   @{ Name = "err_pointer_type_mismatch"; Path = "tests/err_pointer_type_mismatch.mettle"; ShouldSucceed = $false; Pattern = "Type mismatch" },
+  @{
+    # A type mismatch names two types; the help line has to say what to type
+    # instead. Mettle converts nothing implicitly, so each of these has a
+    # concrete answer rather than a restatement of the error.
+    Name          = "err_type_mismatch_help"
+    Path          = "tests/err_type_mismatch_help.mettle"
+    ShouldSucceed = $false
+    OutputMustMatch = @(
+      'help: cast explicitly: \(int32\)value\. The fraction is discarded, not rounded',
+      'help: quote it: a string literal is "42", not 42',
+      'help: drop the quotes: a numeric literal is 42, not "42"',
+      'help: take the address: `&value`',
+      'help: read through the pointer: `\*value` or `value\[0\]`'
+    )
+  },
   @{ Name = "err_use_before_init"; Path = "tests/err_use_before_init.mettle"; ShouldSucceed = $false; Pattern = "before initialization" },
   @{ Name = "err_array_index_oob_const"; Path = "tests/err_array_index_oob_const.mettle"; ShouldSucceed = $false; Pattern = "out of bounds" },
   @{ Name = "err_array_index_oob_const_negative"; Path = "tests/err_array_index_oob_const_negative.mettle"; ShouldSucceed = $false; Pattern = "out of bounds" },
@@ -1556,15 +1703,15 @@ $cases = @(
   @{ Name = "err_gpu_kernel_block_range"; Path = "tests/err_gpu_kernel_block_range.mettle"; ShouldSucceed = $false; Pattern = "Kernel block dimension must be between 1 and 1024" },
   @{ Name = "err_gpu_dispatch_on_stream_conflict"; Path = "tests/err_gpu_dispatch_on_stream_conflict.mettle"; ShouldSucceed = $false; Pattern = "already given by the named 'stream:' control" },
   @{ Name = "gpu_typed_dispatch"; Path = "tests/test_gpu_typed_dispatch.mettle"; ShouldSucceed = $true; Args = @("--emit-obj") },
-  @{ Name = "err_gpu_dispatch_arg_type"; Path = "tests/err_gpu_dispatch_arg_type.mettle"; ShouldSucceed = $false; Pattern = "expected 'int32', found 'float32'" },
-  @{ Name = "err_gpu_dispatch_arg_count"; Path = "tests/err_gpu_dispatch_arg_count.mettle"; ShouldSucceed = $false; Pattern = "GPU kernel 'vadd' takes 4 arguments, but this dispatch passes 3" },
-  @{ Name = "err_gpu_dispatch_work_no_block"; Path = "tests/err_gpu_dispatch_work_no_block.mettle"; ShouldSucceed = $false; Pattern = "needs a 'kernel\(block = ...\)' declaration" },
-  @{ Name = "err_gpu_dispatch_work_untyped"; Path = "tests/err_gpu_dispatch_work_untyped.mettle"; ShouldSucceed = $false; Pattern = "declare it host-side with 'extern kernel'" },
-  @{ Name = "err_gpu_dispatch_block_mismatch"; Path = "tests/err_gpu_dispatch_block_mismatch.mettle"; ShouldSucceed = $false; Pattern = "declares block \(256, 1, 1\) but this dispatch launches \(32, 1, 1\)" },
   @{ Name = "gpu_vector_and_packed"; Path = "tests/gpu/vector_and_packed.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10") },
   @{ Name = "gpu_vector_and_packed_spirv"; Path = "tests/gpu/vector_and_packed.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-spirv") },
   @{ Name = "gpu_kernel_diagnostics"; Path = "tests/gpu/kernel_diagnostics.mettle"; ShouldSucceed = $true; Args = @("--emit-ptx", "--gpu-arch=gb10") },
   @{ Name = "gpu_kernel_diagnostics_checked"; Path = "tests/gpu/kernel_diagnostics.mettle"; ShouldSucceed = $true; Args = @("--emit-ptx", "--gpu-arch=gb10", "--gpu-checks") },
+  @{ Name = "err_gpu_dispatch_block_mismatch"; Path = "tests/err_gpu_dispatch_block_mismatch.mettle"; ShouldSucceed = $false; Pattern = "declares block \(256, 1, 1\) but this dispatch launches \(32, 1, 1\)" },
+  @{ Name = "err_gpu_dispatch_arg_type"; Path = "tests/err_gpu_dispatch_arg_type.mettle"; ShouldSucceed = $false; Pattern = "expected 'int32', found 'float32'" },
+  @{ Name = "err_gpu_dispatch_arg_count"; Path = "tests/err_gpu_dispatch_arg_count.mettle"; ShouldSucceed = $false; Pattern = "GPU kernel 'vadd' takes 4 arguments, but this dispatch passes 3" },
+  @{ Name = "err_gpu_dispatch_work_no_block"; Path = "tests/err_gpu_dispatch_work_no_block.mettle"; ShouldSucceed = $false; Pattern = "needs a 'kernel\(block = ...\)' declaration" },
+  @{ Name = "err_gpu_dispatch_work_untyped"; Path = "tests/err_gpu_dispatch_work_untyped.mettle"; ShouldSucceed = $false; Pattern = "declare it host-side with 'extern kernel'" },
   @{ Name = "gpu_hardware_ai_kernels"; Path = "tests/gpu/hardware_kernels.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10") },
   @{ Name = "gpu_native_fp8"; Path = "tests/gpu/tensor_native_fp8.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10") },
   @{ Name = "err_gpu_native_fp8_portable"; Path = "tests/gpu/tensor_native_fp8.mettle"; ShouldSucceed = $false; Args = @("-O", "--emit-ptx", "--gpu-arch=portable"); Pattern = "FP8 mma\.sync requires PTX 8\.4 and sm_89 or newer" },
@@ -1587,8 +1734,6 @@ $cases = @(
      OutputMustNotMatch = @("Expected '\(', found identifier", "due to [4-9] previous") },
   @{ Name = "diag_dup_note"; Path = "tests/diag_dup_note.mettle"; ShouldSucceed = $false
      OutputMustMatch = @("Duplicate declaration of 'x'", "previous declaration of 'x' is here") },
-  @{ Name = "err_shadow_parameter"; Path = "tests/err_shadow_parameter.mettle"; ShouldSucceed = $false
-     OutputMustMatch = @("Variable 'side' shadows parameter 'side'", "function parameter 'side' is declared here") },
   @{ Name = "diag_call_notes"; Path = "tests/diag_call_notes.mettle"; ShouldSucceed = $false
      OutputMustMatch = @("expects 2 arguments, got 3", "\^\^\^ expected 2 arguments, got 3", "function 'add' defined here") },
   @{ Name = "diag_label_mismatch"; Path = "tests/diag_label_mismatch.mettle"; ShouldSucceed = $false
@@ -2225,19 +2370,14 @@ catch {
 
 # OBS Python/C parity. The ml-opt model trains on node features computed in
 # Python (tools/mlopt/obs.py) and runs on node features computed in C
-# (libmtlc's src/ir/ml_obs.c). A divergence between them does not crash or warn
-# - the model just reads different inputs at compile time than it trained on,
-# and the only symptom is optimization quality silently degrading. This replays
-# the golden vectors so that failure mode is a build error instead. The feature
-# extractor is the backend's, so this needs the libmtlc sources.
+# (src/ir/ml_obs.c). A divergence between them does not crash or warn - the
+# model just reads different inputs at compile time than it trained on, and the
+# only symptom is optimization quality silently degrading. This replays the
+# golden vectors so that failure mode is a build error instead.
 $total++
-if (-not $HaveLibmtlcSrc) {
-  Write-Host "[SKIP] ml_obs_python_parity (libmtlc sources not found in $LibmtlcDir)"
-}
-else {
 try {
   $obsExe = "bin\ml_obs_parity_test.exe"
-  & gcc -Wall -Wextra -std=c11 -g -O1 -Isrc "-I$LibmtlcInc" "-I$LibmtlcSrc" tests\ml_obs_parity_test.c (Join-Path $LibmtlcSrc "ir\ml_obs.c") -o $obsExe -lm
+  & gcc -Wall -Wextra -std=c11 -g -O1 -Isrc -Iinclude tests\ml_obs_parity_test.c src\ir\ml_obs.c -o $obsExe -lm
   if ($LASTEXITCODE -ne 0) {
     throw "Failed to compile OBS parity test"
   }
@@ -2253,7 +2393,6 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "ml_obs_python_parity" -Passed $false -Reason $_.Exception.Message
-}
 }
 
 
@@ -2893,6 +3032,19 @@ try {
   if (-not @($json.loops | Where-Object { $_.cyclesPerIter -gt 0 -and $_.bottleneck }).Count) {
     throw "JSON loop costs missing cycles or bottleneck port"
   }
+  # The triage a tool renders as a fix-it panel: same ranking as the prose
+  # "where to start". Whole-function codegen fallbacks lead (a measured cost,
+  # not a per-loop prediction), then proven fixes, and the fix is untruncated.
+  $start = @($json.startHere)
+  if ($start.Count -lt 1) { throw "JSON startHere ranking missing" }
+  if ($start[0].kind -ne "backend") { throw "JSON startHere should lead with the codegen fallback" }
+  if (-not $start[0].why -or -not $start[0].instructions) { throw "JSON backend entry incomplete" }
+  $firstRemark = @($start | Where-Object { $_.kind -eq "remark" })[0]
+  if (-not $firstRemark.proven) { throw "JSON startHere should lead its remarks with a proven fix" }
+  if (-not $firstRemark.fix -or -not $firstRemark.code) { throw "JSON startHere entry incomplete" }
+  if (@($start | Where-Object { $_.proven }).Count -lt 2) {
+    throw "JSON startHere lost the proven fixes"
+  }
   if (@($json.callGraph).Count -lt 1) { throw "JSON call graph missing" }
   if (@($json.hotspots).Count -lt 1) { throw "JSON hotspot ranking missing" }
   $ranked = @($json.hotspots)
@@ -3469,6 +3621,40 @@ foreach ($relFlag in @($true, $false)) {
   }
 }
 
+# Two locals sharing a name but not a type. Every backend table that describes a
+# local -- frame slot, declared type, float width -- is keyed by name, so the two
+# bindings shared one slot at one type: a uint64 declared after a float64 of the
+# same name compared as a float, and a struct declared after a scalar overran the
+# scalar's slot. The lowering now gives the second binding a name of its own.
+foreach ($relFlag in @($true, $false)) {
+  $total++
+  $variant = if ($relFlag) { "release" } else { "debug" }
+  try {
+    $exePath = Join-Path $tmpDir "test_scoped_shadowing_$variant.exe"
+    $buildArgs = @("--build")
+    if ($relFlag) { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_scoped_shadowing.mettle", "-o", $exePath)
+
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "scoped-shadowing build ($variant) failed: $buildOut"
+    }
+    $runOut = & $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "scoped-shadowing ($variant) failed (exit $LASTEXITCODE): $runOut"
+    }
+    if ($runOut -notmatch "scoped_shadowing OK") {
+      throw "scoped-shadowing ($variant) did not print OK: $runOut"
+    }
+
+    Write-CaseResult -Name "scoped_shadowing_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "scoped_shadowing_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # The MIR encoder stages a spilled base/index/value through a scratch register.
 # RDX was a candidate, but RDX is in the allocator's pool: staging over the live
 # loop counter it held made the counter run past its bound and the release build
@@ -3695,7 +3881,7 @@ foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")
       $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
     }
     finally {
-      if ($variant -like "*_fallback") { $env:METTLE_MIR = "" }
+      if ($variant -like "*_fallback") { Remove-Item Env:\METTLE_MIR -ErrorAction SilentlyContinue }
     }
     if ($LASTEXITCODE -ne 0) {
       throw "shared-scaled-index build ($variant) failed: $buildOut"
@@ -4035,10 +4221,6 @@ foreach ($relFlag in @($true, $false)) {
 
 # COFF reader test: parse Mettle and GCC-produced COFF objects
 $total++
-if (-not $HaveLibmtlcSrc) {
-  Write-Host "[SKIP] coff_reader (libmtlc sources not found in $LibmtlcDir)"
-}
-else {
 try {
   $coffReaderExe = Join-Path $tmpDir "coff_reader_test.exe"
   $basicObjPath = Join-Path $tmpDir "coff_reader_basic.obj"
@@ -4047,7 +4229,7 @@ try {
   $gccSourcePath = Join-Path $tmpDir "coff_reader_gcc_input.c"
   $gccObjPath = Join-Path $tmpDir "coff_reader_gcc_input.o"
 
-  $compileHarness = & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests\coff_reader_test.c (Join-Path $LibmtlcSrc "common.c") src\lexer\lexer.c (Join-Path $LibmtlcSrc "error\error_reporter.c") (Join-Path $LibmtlcSrc "linker\coff_reader.c") -Isrc "-I$LibmtlcInc" "-I$LibmtlcSrc" -o $coffReaderExe 2>&1 | Out-String
+  $compileHarness = & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests\coff_reader_test.c src\common.c src\lexer\lexer.c src\error\error_reporter.c src\linker\coff_reader.c -Isrc -o $coffReaderExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "COFF reader harness compile failed: $compileHarness"
   }
@@ -4093,14 +4275,9 @@ catch {
   $failed++
   Write-CaseResult -Name "coff_reader" -Passed $false -Reason $_.Exception.Message
 }
-}
 
 # Linker symbol resolution test: merge sections, resolve externals, and reject invalid symbol graphs
 $total++
-if (-not $HaveLibmtlcSrc) {
-  Write-Host "[SKIP] symbol_resolve (libmtlc sources not found in $LibmtlcDir)"
-}
-else {
 try {
   $symbolResolveExe = Join-Path $tmpDir "symbol_resolve_test.exe"
   $fnEntryObj = Join-Path $tmpDir "linker_merge_entry.obj"
@@ -4113,7 +4290,7 @@ try {
   $dupBObj = Join-Path $tmpDir "linker_duplicate_b.obj"
   $unresolvedObj = Join-Path $tmpDir "linker_unresolved_entry.obj"
 
-  $compileHarness = & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests\symbol_resolve_test.c (Join-Path $LibmtlcSrc "common.c") src\lexer\lexer.c (Join-Path $LibmtlcSrc "error\error_reporter.c") (Join-Path $LibmtlcSrc "linker\coff_reader.c") (Join-Path $LibmtlcSrc "linker\symbol_resolve.c") (Join-Path $LibmtlcSrc "codegen\binary_emitter.c") (Join-Path $LibmtlcSrc "codegen\elf_emitter.c") -Isrc "-I$LibmtlcInc" "-I$LibmtlcSrc" "-I$LibmtlcSrc\codegen" -o $symbolResolveExe 2>&1 | Out-String
+  $compileHarness = & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests\symbol_resolve_test.c src\common.c src\lexer\lexer.c src\error\error_reporter.c src\linker\coff_reader.c src\linker\symbol_resolve.c src\codegen\binary_emitter.c src\codegen\elf_emitter.c -Isrc -Isrc\codegen -o $symbolResolveExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Symbol-resolve harness compile failed: $compileHarness"
   }
@@ -4151,18 +4328,13 @@ catch {
   $failed++
   Write-CaseResult -Name "symbol_resolve" -Passed $false -Reason $_.Exception.Message
 }
-}
 
 # Linker relocation test: apply merged-image relocations for REL32, ADDR64, ADDR32NB, and SECREL
 $total++
-if (-not $HaveLibmtlcSrc) {
-  Write-Host "[SKIP] relocation (libmtlc sources not found in $LibmtlcDir)"
-}
-else {
 try {
   $relocationExe = Join-Path $tmpDir "relocation_test.exe"
 
-  $compileHarness = & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests\relocation_test.c (Join-Path $LibmtlcSrc "common.c") src\lexer\lexer.c (Join-Path $LibmtlcSrc "error\error_reporter.c") (Join-Path $LibmtlcSrc "linker\coff_reader.c") (Join-Path $LibmtlcSrc "linker\symbol_resolve.c") (Join-Path $LibmtlcSrc "linker\relocation.c") (Join-Path $LibmtlcSrc "codegen\binary_emitter.c") (Join-Path $LibmtlcSrc "codegen\elf_emitter.c") -Isrc "-I$LibmtlcInc" "-I$LibmtlcSrc" "-I$LibmtlcSrc\codegen" -o $relocationExe 2>&1 | Out-String
+  $compileHarness = & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests\relocation_test.c src\common.c src\lexer\lexer.c src\error\error_reporter.c src\linker\coff_reader.c src\linker\symbol_resolve.c src\linker\relocation.c src\codegen\binary_emitter.c src\codegen\elf_emitter.c -Isrc -Isrc\codegen -o $relocationExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Relocation harness compile failed: $compileHarness"
   }
@@ -4178,18 +4350,13 @@ catch {
   $failed++
   Write-CaseResult -Name "relocation" -Passed $false -Reason $_.Exception.Message
 }
-}
 
 # PE emitter test: write a minimal PE32+ image, verify headers/sections, and run it
 $total++
-if (-not $HaveLibmtlcSrc) {
-  Write-Host "[SKIP] pe_emitter (libmtlc sources not found in $LibmtlcDir)"
-}
-else {
 try {
   $peEmitterExe = Join-Path $tmpDir "pe_emitter_test.exe"
 
-  $compileHarness = & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests\pe_emitter_test.c (Join-Path $LibmtlcSrc "common.c") src\lexer\lexer.c (Join-Path $LibmtlcSrc "error\error_reporter.c") (Join-Path $LibmtlcSrc "linker\coff_reader.c") (Join-Path $LibmtlcSrc "linker\symbol_resolve.c") (Join-Path $LibmtlcSrc "linker\relocation.c") (Join-Path $LibmtlcSrc "linker\pe_emitter.c") (Join-Path $LibmtlcSrc "linker\import_lib.c") (Join-Path $LibmtlcSrc "codegen\binary_emitter.c") (Join-Path $LibmtlcSrc "codegen\elf_emitter.c") -Isrc "-I$LibmtlcInc" "-I$LibmtlcSrc" "-I$LibmtlcSrc\codegen" -o $peEmitterExe 2>&1 | Out-String
+  $compileHarness = & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests\pe_emitter_test.c src\common.c src\lexer\lexer.c src\error\error_reporter.c src\linker\coff_reader.c src\linker\symbol_resolve.c src\linker\relocation.c src\linker\pe_emitter.c src\linker\import_lib.c src\codegen\binary_emitter.c src\codegen\elf_emitter.c -Isrc -Isrc\codegen -o $peEmitterExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "PE-emitter harness compile failed: $compileHarness"
   }
@@ -4204,7 +4371,6 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "pe_emitter" -Passed $false -Reason $_.Exception.Message
-}
 }
 
 # Internal linker basic test: direct object build uses native PE emission for default imports
@@ -4559,7 +4725,7 @@ foreach ($mode in @("binary")) {
   }
 }
 
-# Native object + MinGW gcc link (nostartfiles + CRT imports)
+# Native object + MinGW GCC link with no startup or default libraries.
 $total++
 try {
   $gccCmd = Get-Command gcc -ErrorAction SilentlyContinue
@@ -4662,7 +4828,8 @@ catch {
   Write-CaseResult -Name "internal_link_ui" -Passed $false -Reason $_.Exception.Message
 }
 
-# Internal linker UCRT test: std/io path resolves __acrt_iob_func via default DLL imports
+# Internal linker owned stdio test. The _iob compatibility symbol must resolve
+# from the bundled runtime and the output must import no C runtime.
 $total++
 try {
   $exePath = Join-Path $tmpDir "internal_link_std_io.exe"
@@ -4679,12 +4846,38 @@ try {
   if ($LASTEXITCODE -ne 0) {
     throw "Internal linker std-io executable exited with $LASTEXITCODE (expected 0)"
   }
+  $stdioImports = & objdump -p $exePath 2>&1 | Out-String
+  if ($stdioImports -match "msvcrt|ucrt|vcruntime|api-ms-win-crt|libgcc|libwinpthread") {
+    throw "Internal linker std-io executable imports a forbidden runtime"
+  }
 
   Write-CaseResult -Name "internal_link_std_io" -Passed $true
 }
 catch {
   $failed++
   Write-CaseResult -Name "internal_link_std_io" -Passed $false -Reason $_.Exception.Message
+}
+
+# Owned directory runtime test. It covers attributes, current directory, and
+# recursive Markdown scans without a helper C object.
+$total++
+try {
+  $dirExe = Join-Path $tmpDir "owned_dir.exe"
+  $dirBuild = & $CompilerPath --build tests\test_owned_dir.mettle -o $dirExe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "Owned directory build failed: $dirBuild" }
+  $dirOut = & $dirExe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0 -or $dirOut -notmatch "DIR OWNED OK") {
+    throw "Owned directory test failed: $dirOut"
+  }
+  $dirImports = & objdump -p $dirExe 2>&1 | Out-String
+  if ($dirImports -match "msvcrt|ucrt|vcruntime|api-ms-win-crt|libgcc|libwinpthread") {
+    throw "Owned directory test imports a forbidden runtime"
+  }
+  Write-CaseResult -Name "owned_directory" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "owned_directory" -Passed $false -Reason $_.Exception.Message
 }
 
 # Internal linker kernel32 atomics test: std/thread uses exported Interlocked* names
@@ -6038,7 +6231,7 @@ catch {
   Write-CaseResult -Name "runtime_access_violation_trace_coff" -Passed $false -Reason $_.Exception.Message
 }
 
-# main(argc, argv) test: startup calls CRT __getmainargs directly.
+# main(argc, argv) test: startup uses the owned command line parser.
 $total++
 try {
   $avExe = Join-Path $tmpDir "test_main_argc_argv.exe"
@@ -6049,8 +6242,8 @@ try {
   }
 
   $avImports = & objdump -p $avExe 2>&1 | Out-String
-  if ($avImports -notmatch "__getmainargs") {
-    throw "main(argc,argv) executable missing __getmainargs import"
+  if ($avImports -match "__getmainargs|ucrtbase|msvcrt") {
+    throw "main(argc,argv) executable imports a C runtime"
   }
 
   $avResult = & $avExe 2>&1
@@ -6065,7 +6258,7 @@ catch {
   Write-CaseResult -Name "main_argc_argv" -Passed $false -Reason $_.Exception.Message
 }
 
-# main(argc, argv) via --build: internal startup must call __getmainargs.
+# The normal build path must retain the same runtime independence.
 $total++
 try {
   $buildArgvExe = Join-Path $tmpDir "test_main_argc_argv_build.exe"
@@ -6076,8 +6269,8 @@ try {
   }
 
   $exeImports = & objdump -p $buildArgvExe 2>&1 | Out-String
-  if ($exeImports -notmatch "__getmainargs") {
-    throw "main(argc,argv) --build executable missing __getmainargs import"
+  if ($exeImports -match "__getmainargs|ucrtbase|msvcrt") {
+    throw "main(argc,argv) --build executable imports a C runtime"
   }
 
   $buildArgvResult = & $buildArgvExe "dummy-arg" 2>&1
@@ -6131,80 +6324,17 @@ catch {
   Write-CaseResult -Name "runtime_access_violation_trace" -Passed $false -Reason $_.Exception.Message
 }
 
-# Internal allocator gate. src/mettle_alloc.c interposes on malloc/free for the
-# whole driver, so a fault there corrupts every later phase in ways that are hard
-# to attribute back. This exercises the parts that are easy to get wrong -- size
-# class boundaries, realloc growth and shrink, calloc's skip-the-memset path, page
-# and segment recycling, huge allocations, cross-thread frees -- and checks block
-# CONTENTS, not merely that nothing crashed. Built with -DMETTLE_ALLOC_POISON so
-# freed blocks are stamped, which turns a stale-pointer read into a recognisable
-# value instead of whatever happened to still be there.
-$total++
-try {
-  $allocExe = "bin\alloc_test.exe"
-  & gcc -Wall -Wextra -std=c99 -g -O2 -D_GNU_SOURCE -DMETTLE_INTERNAL_ALLOC -DMETTLE_ALLOC_POISON -Isrc tests\alloc_test.c src\mettle_alloc.c -o $allocExe
-  if ($LASTEXITCODE -ne 0) {
-    throw "Failed to compile allocator test"
-  }
-
-  $allocOutput = & $allocExe 2>&1 | Out-String
-  if ($LASTEXITCODE -ne 0) {
-    throw "Allocator test exited with code $LASTEXITCODE`n$allocOutput"
-  }
-  if ($allocOutput -notmatch "\[PASS\] alloc_test") {
-    throw "Allocator test did not report success`n$allocOutput"
-  }
-
-  Write-CaseResult -Name "internal_allocator" -Passed $true
-}
-catch {
-  $failed++
-  Write-CaseResult -Name "internal_allocator" -Passed $false -Reason $_.Exception.Message
-}
-
-# Crash handler test. On Windows this compiles and runs but is a documented
-# no-op (the SEH crash path is already covered by runtime_null_trace /
-# runtime_access_violation_trace); the meaningful assertions run on POSIX.
-$total++
-try {
-  $crashHandlerExe = "bin\crash_handler_test.exe"
-  & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests\crash_handler_test.c src\runtime\crash_handler.c -Isrc -o $crashHandlerExe
-  if ($LASTEXITCODE -ne 0) {
-    throw "Failed to compile crash handler test"
-  }
-
-  $crashHandlerOutput = & $crashHandlerExe 2>&1 | Out-String
-  if ($LASTEXITCODE -ne 0) {
-    throw "Crash handler test exited with code $LASTEXITCODE"
-  }
-
-  if ($crashHandlerOutput -notmatch "Crash handler tests (passed|skipped)") {
-    throw "Crash handler test output did not contain pass/skip marker"
-  }
-
-  Write-CaseResult -Name "crash_handler" -Passed $true
-}
-catch {
-  $failed++
-  Write-CaseResult -Name "crash_handler" -Passed $false -Reason $_.Exception.Message
-}
-
 # AArch64 encoder validity gate. Compiles and runs the from-scratch A64
 # instruction encoder against ground-truth constants from the ARM Architecture
 # Reference Manual (RET=0xD65F03C0, the stp x29,x30,[sp,#-16]! prologue, ...)
 # plus an encode->decode round-trip across the register/immediate range. This
 # is the AArch64 analogue of the PTX/ptxas gate below: it validates the hardest
 # layer (instruction encodings) with no external assembler and no ARM hardware,
-# since the test is pure 32-bit math that runs on the build host. The encoder is
-# the backend's, so this needs the libmtlc sources.
+# since the test is pure 32-bit math that runs on the build host.
 $total++
-if (-not $HaveLibmtlcSrc) {
-  Write-Host "[SKIP] arm64_encoder (libmtlc sources not found in $LibmtlcDir)"
-}
-else {
 try {
   $arm64Exe = "bin\arm64_encode_test.exe"
-  & gcc -Wall -Wextra -std=c99 -g -O0 -Isrc "-I$LibmtlcInc" "-I$LibmtlcSrc" tests\arm64_encode_test.c (Join-Path $LibmtlcSrc "codegen\binary\arm64_encode.c") (Join-Path $LibmtlcSrc "codegen\binary\arm64_disasm.c") (Join-Path $LibmtlcSrc "codegen\binary\arm64_abi.c") -o $arm64Exe
+  & gcc -Wall -Wextra -std=c99 -g -O0 -Isrc -Iinclude tests\arm64_encode_test.c src\codegen\binary\arm64_encode.c src\codegen\binary\arm64_disasm.c src\codegen\binary\arm64_abi.c -o $arm64Exe
   if ($LASTEXITCODE -ne 0) {
     throw "Failed to compile AArch64 encoder test"
   }
@@ -6223,7 +6353,6 @@ catch {
   $failed++
   Write-CaseResult -Name "arm64_encoder" -Passed $false -Reason $_.Exception.Message
 }
-}
 
 # AArch64 emit-layer + execution gate. Emits complete AAPCS64 functions
 # (prologue/body/epilogue with branch fixups), validates each by decoding every
@@ -6234,15 +6363,10 @@ catch {
 # code checked against the expected result -- the semantic proof that the
 # generated machine code runs on AArch64 without ARM hardware. Execution is
 # skipped (not failed) when no emulator is present, like the ptxas gate.
-# The emit layer is the backend's, so this needs the libmtlc sources.
 $total++
-if (-not $HaveLibmtlcSrc) {
-  Write-Host "[SKIP] arm64_emit (libmtlc sources not found in $LibmtlcDir)"
-}
-else {
 try {
   $arm64EmitExe = "bin\arm64_emit_test.exe"
-  & gcc -Wall -Wextra -std=c99 -g -O0 -Isrc "-I$LibmtlcInc" "-I$LibmtlcSrc" tests\arm64_emit_test.c (Join-Path $LibmtlcSrc "codegen\binary\arm64_encode.c") (Join-Path $LibmtlcSrc "codegen\binary\arm64_emit.c") (Join-Path $LibmtlcSrc "codegen\binary\arm64_disasm.c") (Join-Path $LibmtlcSrc "codegen\binary\arm64_mir_encode.c") -o $arm64EmitExe
+  & gcc -Wall -Wextra -std=c99 -g -O0 -Isrc -Iinclude tests\arm64_emit_test.c src\codegen\binary\arm64_encode.c src\codegen\binary\arm64_emit.c src\codegen\binary\arm64_disasm.c src\codegen\binary\arm64_mir_encode.c -o $arm64EmitExe
   if ($LASTEXITCODE -ne 0) {
     throw "Failed to compile AArch64 emit test"
   }
@@ -6291,7 +6415,6 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "arm64_emit" -Passed $false -Reason $_.Exception.Message
-}
 }
 
 # Real-source -> AArch64 gate. Drives the REAL compiler ($CompilerPath
@@ -6372,6 +6495,143 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "arm64_source" -Passed $false -Reason $_.Exception.Message
+}
+
+# The AArch64 *object* backend, from an x86-64 host. It used to be reachable
+# only on an ARM machine (the driver picked it with #if defined(__aarch64__)),
+# so every change to the shared lowering went untested off ARM. --emit-arm64-obj
+# asks any host for it. Checked structurally -- an AArch64 REL object with the
+# expected relocation -- because this host has no linker that could take one.
+$total++
+try {
+  # ELF64 header: e_type at 0x10, e_machine at 0x12; section headers at e_shoff
+  # with e_shnum entries of e_shentsize, names in section e_shstrndx.
+  function Get-ElfSectionSize([byte[]]$bytes, [string]$wanted) {
+    $shoff = [BitConverter]::ToUInt64($bytes, 0x28)
+    $shentsize = [BitConverter]::ToUInt16($bytes, 0x3A)
+    $shnum = [BitConverter]::ToUInt16($bytes, 0x3C)
+    $shstrndx = [BitConverter]::ToUInt16($bytes, 0x3E)
+    $strtab = [BitConverter]::ToUInt64($bytes, [int]($shoff + $shstrndx * $shentsize + 0x18))
+    for ($i = 0; $i -lt $shnum; $i++) {
+      $sh = [int]($shoff + $i * $shentsize)
+      $nameOff = [int]($strtab + [BitConverter]::ToUInt32($bytes, $sh))
+      $end = $nameOff
+      while ($bytes[$end] -ne 0) { $end++ }
+      $name = [Text.Encoding]::ASCII.GetString($bytes, $nameOff, $end - $nameOff)
+      if ($name -eq $wanted) { return [BitConverter]::ToUInt64($bytes, $sh + 0x20) }
+    }
+    return -1
+  }
+
+  $objDir = Join-Path $tmpDir "arm64obj"
+  New-Item -ItemType Directory -Force -Path $objDir | Out-Null
+  $names = Get-Content tests\arm64\expected.txt |
+    ForEach-Object { ($_ -split '\s+')[0] } | Where-Object { $_ }
+  foreach ($n in $names) {
+    $obj = Join-Path $objDir "$n.o"
+    & $CompilerPath --emit-arm64-obj "tests\arm64\$n.mettle" -o $obj 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "mettle --emit-arm64-obj failed on $n.mettle"
+    }
+    $bytes = [IO.File]::ReadAllBytes($obj)
+    if ($bytes[0] -ne 0x7F -or $bytes[1] -ne 0x45 -or $bytes[2] -ne 0x4C -or $bytes[3] -ne 0x46) {
+      throw "$n.o is not an ELF file"
+    }
+    $etype = [BitConverter]::ToUInt16($bytes, 0x10)
+    $emachine = [BitConverter]::ToUInt16($bytes, 0x12)
+    if ($etype -ne 1) { throw "$n.o is ELF type $etype, expected 1 (REL)" }
+    if ($emachine -ne 183) { throw "$n.o is machine $emachine, expected 183 (AArch64)" }
+  }
+
+  # A call to an undefined external has to leave a relocation behind for the
+  # linker; native_link.mettle calls the owned putchar ABI.
+  $extObj = Join-Path $objDir "native_link.o"
+  & $CompilerPath --emit-arm64-obj tests\arm64\native_link.mettle -o $extObj 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "mettle --emit-arm64-obj failed on native_link.mettle"
+  }
+  $extBytes = [IO.File]::ReadAllBytes($extObj)
+  $relaSize = Get-ElfSectionSize $extBytes ".rela.text"
+  if ($relaSize -le 0) {
+    throw "native_link.o has no .rela.text relocations for its extern call"
+  }
+
+  # Cross output chooses its target OS standard library, not the compiler host.
+  # A Windows hosted compiler must put Linux stream symbols in an AArch64 ELF.
+  $crossStdObj = Join-Path $objDir "owned_dir_linux_std.o"
+  & $CompilerPath --emit-arm64-obj tests\test_owned_dir.mettle -o $crossStdObj 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "AArch64 owned directory object failed"
+  }
+  $crossStdText = [Text.Encoding]::ASCII.GetString(
+    [IO.File]::ReadAllBytes($crossStdObj))
+  if ($crossStdText -match "__acrt_iob_func" -or
+      $crossStdText -notmatch "mettle_dir_exists" -or
+      $crossStdText -notmatch "stdout") {
+    throw "AArch64 object selected Windows stdlib symbols instead of Linux"
+  }
+
+  Write-CaseResult -Name "arm64_object" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "arm64_object" -Passed $false -Reason $_.Exception.Message
+}
+
+# The same fixtures at -O. --emit-arm64 used to emit before the optimizer ran,
+# so --release was accepted and silently ignored; it now runs the optimizer's
+# target-neutral half (scalar and control-flow transforms that keep the shared
+# IR instruction set) and lowers the result. Same answers as the debug build.
+# trapnull is excluded: release strips runtime checks on every target, so its
+# deliberate null dereference faults instead of printing and exiting 1 -- the
+# x86 release build faults on it too.
+$total++
+try {
+  $relDir = Join-Path $tmpDir "arm64rel"
+  New-Item -ItemType Directory -Force -Path $relDir | Out-Null
+  $relNames = Get-Content tests\arm64\expected.txt |
+    Where-Object { $_ -and ($_ -split '\s+')[0] -ne "trapnull" }
+  Set-Content -Encoding ascii (Join-Path $relDir "manifest.txt") $relNames
+  foreach ($line in $relNames) {
+    $n = ($line -split '\s+')[0]
+    $elf = Join-Path $relDir "$n.elf"
+    & $CompilerPath --emit-arm64 --release "tests\arm64\$n.mettle" -o $elf 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $elf)) {
+      throw "mettle --emit-arm64 --release failed on $n.mettle"
+    }
+  }
+
+  $wsl = Get-Command wsl -ErrorAction SilentlyContinue
+  if ($wsl -and $relDir -match '^[A-Za-z]:\\') {
+    $toWsl = {
+      param($p)
+      "/mnt/" + $p.Substring(0, 1).ToLower() + ($p.Substring(2) -replace '\\', '/')
+    }
+    $wslScript = & $toWsl (Resolve-Path (Join-Path $PSScriptRoot "arm64_qemu_run.sh")).Path
+    $runOut = & wsl bash $wslScript (& $toWsl $relDir) 2>&1 | Out-String
+    $code = $LASTEXITCODE
+    if ($code -eq 0) {
+      Write-Host ($runOut.Trim())
+    }
+    elseif ($code -eq 64) {
+      Write-Host "[SKIP] arm64_source_release execution (qemu-aarch64 not found; all fixtures lowered)"
+    }
+    elseif ($code -eq 1) {
+      throw "AArch64 --release program(s) produced wrong result under qemu:`n$runOut"
+    }
+    else {
+      Write-Host "[SKIP] arm64_source_release execution (qemu run unavailable: exit $code)"
+    }
+  }
+  else {
+    Write-Host "[SKIP] arm64_source_release execution (no WSL; all fixtures lowered)"
+  }
+
+  Write-CaseResult -Name "arm64_source_release" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "arm64_source_release" -Passed $false -Reason $_.Exception.Message
 }
 
 # General reduction-unrolling vectorizer: correctness on non-benchmark
@@ -6504,17 +6764,10 @@ catch {
   Write-CaseResult -Name "profile_runtime_ops" -Passed $false -Reason $_.Exception.Message
 }
 
-# Internal-compiler-error report. Mixed: the lexer and the crash-handler
-# runtime are ours, the compiler context, IR and crash reporter are libmtlc's,
-# so the harness pulls translation units from both sides.
-$total++
-if (-not $HaveLibmtlcSrc) {
-  Write-Host "[SKIP] compiler_ice_report (libmtlc sources not found in $LibmtlcDir)"
-}
-else {
 try {
+  $total++
   $iceExe = Join-Path $tmpDir "compiler_ice_report_test.exe"
-  $iceCompile = & gcc -Wall -Wextra -std=c99 -g -O0 -Isrc "-I$LibmtlcInc" "-I$LibmtlcSrc" tests\compiler_ice_report_test.c (Join-Path $LibmtlcSrc "common.c") src\lexer\lexer.c (Join-Path $LibmtlcSrc "compiler\compiler_context.c") (Join-Path $LibmtlcSrc "compiler\compiler_crash.c") src\runtime\crash_handler.c (Join-Path $LibmtlcSrc "ir\ir.c") -o $iceExe -ldbghelp 2>&1 | Out-String
+  $iceCompile = & gcc -Wall -Wextra -std=c99 -g -O0 -Isrc -Iinclude tests\compiler_ice_report_test.c src\common.c src\lexer\lexer.c src\compiler\compiler_context.c src\compiler\compiler_crash.c src\runtime\crash_handler.c src\ir\ir.c -o $iceExe -ldbghelp 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "compiler ICE report harness compile failed: $iceCompile"
   }
@@ -6542,7 +6795,6 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "compiler_ice_report" -Passed $false -Reason $_.Exception.Message
-}
 }
 
 # PTX backend validity gate. Emission and structural/profile checks always run.
@@ -8789,6 +9041,8 @@ $runFixtures = @(
      What = "a nested call passed something wrong" },
   @{ Name = "float_conv"; Path = "tests/codegen/float_conv.mettle"
      What = "a codegen check failed" },
+  @{ Name = "float_nan_compare"; Path = "tests/codegen/float_nan_compare.mettle"
+     What = "an ordered float comparison against NaN came back true" },
   @{ Name = "unsigned_loops"; Path = "tests/codegen/unsigned_loops.mettle"
      What = "a codegen check failed" },
   @{ Name = "defer_scopes"; Path = "tests/codegen/defer_scopes.mettle"
@@ -9057,29 +9311,64 @@ foreach ($src in @("tests/gpu/compute_kernels.mettle",
   }
 }
 
-# ---------------------------------------------------------------------------
-# Gates that link the libmtlc archive directly. They prove the backend this
-# build was made against actually works end to end. libmtlc's own suite audits
-# its internal boundaries -- archive self-containment, and the non-Mettle calc
-# frontend that proves the backend is frontend-agnostic -- which is that
-# repository's job, not this one's.
-# ---------------------------------------------------------------------------
+# libmtlc frontend-agnostic gate. Builds the calc example -- a non-Mettle
+# frontend that includes ONLY include/mtlc and links ONLY bin/mtlc.lib -- then
+# compiles two .calc programs to native executables and asserts their computed
+# exit codes. This exercises the whole public API path end to end (IR builder ->
+# optimizer -> native x86-64 codegen -> internal PE link) with no Mettle
+# frontend in the loop, proving libmtlc is frontend-agnostic. Skipped if gcc is
+# unavailable (it links the example against the static library).
 $calcGcc = Get-Command gcc -ErrorAction SilentlyContinue
+if (-not $calcGcc) {
+  Write-Host "[SKIP] calc_frontend (gcc not found)"
+}
+elseif (-not (Test-Path "bin\mtlc.lib")) {
+  Write-Host "[SKIP] calc_frontend (bin\mtlc.lib not present)"
+}
+else {
+  $total++
+  try {
+    $calcExe = Join-Path $tmpDir "calc.exe"
+    $buildOut = & $calcGcc.Source -Wall -Wextra -std=c99 -Iinclude `
+      examples/calc/calc.c bin/mtlc.lib -o $calcExe -ldbghelp 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "building the calc frontend failed: $buildOut" }
+    $cases = @(
+      @{ src = "examples/calc/programs/factorial.calc"; expect = 120 },
+      @{ src = "examples/calc/programs/loops.calc"; expect = 55 }
+    )
+    foreach ($c in $cases) {
+      $name = [System.IO.Path]::GetFileNameWithoutExtension($c.src)
+      $exe = Join-Path $tmpDir ("calc_" + $name + ".exe")
+      $emit = & $calcExe $c.src $exe 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) { throw "calc failed on $($c.src): $emit" }
+      if (-not (Test-Path $exe)) { throw "no executable produced for $($c.src)" }
+      & $exe | Out-Null
+      if ($LASTEXITCODE -ne $c.expect) {
+        throw "$($c.src): exit code $LASTEXITCODE, expected $($c.expect)"
+      }
+    }
+    Write-CaseResult -Name "calc_frontend" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "calc_frontend" -Passed $false -Reason $_.Exception.Message
+  }
+}
 
 # Optimizer unit gate: loop-carried float symbols must not become temps before
 # loop unrolling, which would clone several producers under one temp name.
 if (-not $calcGcc) {
   Write-Host "[SKIP] optimizer_float_copy (gcc not found)"
 }
-elseif (-not $LibmtlcLib) {
-  Write-Host "[SKIP] optimizer_float_copy (no libmtlc archive found in $LibmtlcDir)"
+elseif (-not (Test-Path "bin\mtlc.lib")) {
+  Write-Host "[SKIP] optimizer_float_copy (bin\mtlc.lib not present)"
 }
 else {
   $total++
   try {
     $floatCopyExe = Join-Path $tmpDir "optimizer_float_copy_test.exe"
-    $buildOut = & $calcGcc.Source -Wall -Wextra -std=c99 -Isrc "-I$LibmtlcInc" "-I$LibmtlcSrc" `
-      tests/optimizer_float_copy_test.c $LibmtlcLib -o $floatCopyExe -ldbghelp 2>&1 | Out-String
+    $buildOut = & $calcGcc.Source -Wall -Wextra -std=c99 -Isrc -Iinclude `
+      tests/optimizer_float_copy_test.c bin/mtlc.lib -o $floatCopyExe -ldbghelp 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
       throw "building optimizer_float_copy_test failed: $buildOut"
     }
@@ -9095,9 +9384,10 @@ else {
   }
 }
 
-# Full public-API surface gate. Compiles tests/public_api_test.c (includes ONLY
-# include/mtlc, links ONLY bin/mtlc.lib) and runs it: it builds six module
-# families through the public IR builder -- globals, extern libc calls, pointer
+# Full public API surface gate. Compiles tests/public_api_test.c against the
+# owned host ABI, links it with no startup or default libraries, and runs it.
+# It builds six module families through the public IR builder: globals, extern
+# owned runtime calls, pointer
 # load/store, address-of, float arithmetic + casts -- and emits through
 # mtlc_emit/mtlc_build_executable to all four targets: a native x86-64 exe
 # (run below: exit 42 + stdout OK), PTX text, a SPIR-V binary, and an AArch64
@@ -9106,8 +9396,8 @@ else {
 if (-not $calcGcc) {
   Write-Host "[SKIP] public_api (gcc not found)"
 }
-elseif (-not $LibmtlcLib) {
-  Write-Host "[SKIP] public_api (no libmtlc archive found in $LibmtlcDir)"
+elseif (-not (Test-Path "bin\mtlc.lib")) {
+  Write-Host "[SKIP] public_api (bin\mtlc.lib not present)"
 }
 else {
   $total++
@@ -9115,9 +9405,25 @@ else {
     $pubExe = Join-Path $tmpDir "public_api_test.exe"
     $pubOut = Join-Path $tmpDir "pubapi"
     New-Item -ItemType Directory -Force $pubOut | Out-Null
-    $buildOut = & $calcGcc.Source -Wall -Wextra -std=c99 "-I$LibmtlcInc" `
-      tests/public_api_test.c $LibmtlcLib -o $pubExe -ldbghelp 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0) { throw "building public_api_test failed: $buildOut" }
+    $pubObj = Join-Path $tmpDir "public_api_test.o"
+    $compileOut = & $calcGcc.Source -Wall -Wextra -std=c99 -Iinclude `
+      -ffreestanding -fno-builtin -fno-stack-protector `
+      -fno-asynchronous-unwind-tables -fno-unwind-tables `
+      -mno-stack-arg-probe -include src/runtime/host_redirect.h `
+      -c tests/public_api_test.c -o $pubObj 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "compiling public_api_test failed: $compileOut" }
+    $pubLinkArgs = @(
+      '-nostdlib', '-nostartfiles', '-nodefaultlibs',
+      '-Wl,--disable-runtime-pseudo-reloc',
+      '-Wl,-e,mettle_start,--gc-sections',
+      'obj/runtime/host_startup.o', $pubObj, 'bin/mtlc.lib',
+      '-o', $pubExe, '-lkernel32', '-ldbghelp')
+    $buildOut = & $calcGcc.Source @pubLinkArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "linking public_api_test failed: $buildOut" }
+    $pubImports = & objdump -p $pubExe 2>&1 | Out-String
+    if ($pubImports -match "msvcrt|ucrt|vcruntime|api-ms-win-crt|libgcc|libstdc|libwinpthread") {
+      throw "public_api_test imports a C or compiler runtime: $pubImports"
+    }
     $runOut = & $pubExe $pubOut 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw "public_api_test failed: $runOut" }
     if ($ptxas) {
@@ -9167,6 +9473,48 @@ else {
   catch {
     $failed++
     Write-CaseResult -Name "public_api" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# libmtlc self-containment audit. Computes the archive's external symbol
+# closure (every symbol some member references that no member defines) and
+# fails if any final symbol is not an explicit Windows OS import. It also
+# rejects C, compiler, and thread runtime import names. Skipped when nm is not
+# available.
+$nmCmd = Get-Command nm -ErrorAction SilentlyContinue
+if (-not $nmCmd) {
+  Write-Host "[SKIP] libmtlc_selfcontained (nm not found)"
+}
+elseif (-not (Test-Path "bin\mtlc.lib")) {
+  Write-Host "[SKIP] libmtlc_selfcontained (bin\mtlc.lib not present)"
+}
+else {
+  $total++
+  try {
+    $nmLines = & $nmCmd.Source "bin\mtlc.lib" 2>$null
+    $defined = New-Object System.Collections.Generic.HashSet[string]
+    $undef = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($ln in $nmLines) {
+      if ($ln -match '\s+U\s+(\S+)\s*$') { [void]$undef.Add($Matches[1]) }
+      elseif ($ln -match '\s+[A-TV-Zabd-tv-z]\s+(\S+)\s*$') { [void]$defined.Add($Matches[1]) }
+    }
+    $forbiddenRuntime = '(?i)(msvcrt|ucrt|vcruntime|msvcp|libgcc|libstdc|libwinpthread|__mingw_|^__imp_(malloc|calloc|realloc|free|memcpy|memset|printf|fprintf|strtod)$)'
+    $bad = @()
+    foreach ($s in $undef) {
+      if (-not $defined.Contains($s) -and
+          ($s -notmatch '^__imp_' -or $s -match $forbiddenRuntime)) {
+        $bad += $s
+      }
+    }
+    if ($bad.Count -gt 0) {
+      throw ("bin\mtlc.lib contains forbidden unresolved symbols: " +
+             (($bad | Sort-Object) -join ', '))
+    }
+    Write-CaseResult -Name "libmtlc_selfcontained" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "libmtlc_selfcontained" -Passed $false -Reason $_.Exception.Message
   }
 }
 

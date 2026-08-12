@@ -10,10 +10,10 @@
 #ifndef IR_LOWERING_H
 #define IR_LOWERING_H
 
-#include "ir/ir.h"
-#include "parser/ast.h"
-#include "semantic/symbol_table.h"
-#include "semantic/type_checker.h"
+#include "ir.h"
+#include "../parser/ast.h"
+#include "../semantic/symbol_table.h"
+#include "../semantic/type_checker.h"
 
 /* Lower a type-checked AST program into a backend IR program. Returns NULL on
  * failure with *error_message set. emit_runtime_checks selects whether bounds/

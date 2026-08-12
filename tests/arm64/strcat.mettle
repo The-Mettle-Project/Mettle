@@ -1,0 +1,13 @@
+import "std/io";
+// String + string: one fresh block holds the new { chars, length } record and
+// its characters; bump memory is zero, so the trailing NUL is free. Verifies
+// text, length arithmetic, and chaining.
+fn main() -> int64 {
+  var hello: string = "Hello, ";
+  var world: string = "World!";
+  var result: string = hello + world;
+  println(result);
+  var chained: string = result + " And again.";
+  println(chained);
+  return (int64)chained.length; // 13 + 11 = 24
+}

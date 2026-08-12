@@ -24,14 +24,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Before init on purpose. CodeQL analyzes what it sees compiled while
-      # tracing, so building the backend after init would pull libmtlc's sources
-      # into this repository's results -- a dependency's code, in duplicate with
-      # libmtlc's own CodeQL run. Building it first leaves only our frontend in
-      # the traced build.
-      - name: Fetch and build libmtlc backend
-        run: ./get-libmtlc.sh
-
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
