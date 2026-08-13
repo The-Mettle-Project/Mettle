@@ -344,25 +344,18 @@ jobs:
     name: Sanitizers (linux gcc)
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    env:
-      ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
-      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build compiler with ASan/UBSan
+      # bin/mettle links no libc, so the ASan and UBSan runtimes have nothing to
+      # attach to. Trapping UBSan needs no runtime: a failed check is a SIGILL.
+      - name: Build compiler with trapping UBSan
         run: |
           make clean
           make -j"$(nproc)" \
-            EXTRA_CFLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all" \
-            LDFLAGS="-rdynamic -pthread -ldl -lm -fsanitize=address,undefined"
-          # Keep the compiler binary instrumented, but bundle normal runtime
-          # objects for programs the compiler builds. Generated executables do
-          # not link the sanitizer runtimes, so sanitized helper objects would
-          # fail at link time before the compiler itself gets exercised.
-          make bundle-runtime EXTRA_CFLAGS=""
+            EXTRA_CFLAGS="-fsanitize=undefined -fsanitize-trap=undefined"
 
-      - name: Exercise sanitized compiler
+      - name: Exercise the instrumented compiler
         run: |
           ./bin/mettle --version
           bash tools/test-elf-native.sh

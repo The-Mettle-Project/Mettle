@@ -12,6 +12,12 @@ DGX_SPARK_CFLAGS ?= -march=armv9.2-a
 ifeq ($(DGX_SPARK),1)
 CFLAGS += $(DGX_SPARK_CFLAGS)
 endif
+# Outline atomics reach libgcc's __aarch64_* helpers, which nothing here links.
+ifneq (,$(filter aarch64% arm64%,$(shell $(CC) -dumpmachine 2>/dev/null)))
+ARCH_CFLAGS := $(shell $(CC) -mno-outline-atomics -E -x c /dev/null > /dev/null 2>&1 \
+	&& echo -mno-outline-atomics)
+CFLAGS += $(ARCH_CFLAGS)
+endif
 LDFLAGS =
 SRCDIR = src
 OBJDIR = obj
@@ -121,7 +127,7 @@ RUNTIME_OBJ_CFLAGS = $(FREESTANDING_CFLAGS) -D_GNU_SOURCE -Isrc
 FREESTANDING_CFLAGS = -std=c99 -O2 -ffreestanding -fno-builtin \
 	-fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables \
 	-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
-	-ffunction-sections -fdata-sections
+	-ffunction-sections -fdata-sections $(ARCH_CFLAGS)
 HOST_BACKEND_CFLAGS = -ffreestanding -fno-builtin -fno-stack-protector \
 	-fno-asynchronous-unwind-tables -fno-unwind-tables \
 	-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \

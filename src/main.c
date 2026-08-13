@@ -48,6 +48,10 @@ __declspec(dllimport) int __stdcall QueryPerformanceCounter(MettleQpcTicks *coun
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
+/* clang's limits.h only chains to the host header when __STDC_HOSTED__ is 1. */
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 #endif
 
 #define METTLE_STRINGIFY_(x) #x
