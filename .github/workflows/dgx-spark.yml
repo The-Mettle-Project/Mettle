@@ -14,7 +14,7 @@ jobs:
     runs-on: [self-hosted, Linux, ARM64, dgx-spark]
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build natively for DGX Spark
         run: make -j"$(nproc)" DGX_SPARK=1
       - name: Assemble unqualified native paths without device execution
@@ -104,7 +104,7 @@ jobs:
           python3 tools/gpu/ptxas_select.py --candidate resident=/tmp/mettle-gb10-chain-resident.resources.json --candidate replay=/tmp/mettle-gb10-chain-replay.resources.json --entry tensor_chain4 --threads-per-block 32 --registers-per-sm 65536 --shared-memory-per-sm 102400 --max-warps-per-sm 48 --max-blocks-per-sm 24 --warp-size 32 --register-allocation-unit-per-warp 1 --policy pareto --pretty -o /tmp/mettle-gb10-chain.selection.json
           python3 -c 'import json; d=json.load(open("/tmp/mettle-gb10-chain.selection.json", encoding="utf-8")); e=d["entries"]["tensor_chain4"]; assert e["selected"] is None and set(e["pareto_frontier"]) == {"resident", "replay"}'
       - name: Archive offline resource profiles
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: gb10-offline-resource-profiles
           path: |

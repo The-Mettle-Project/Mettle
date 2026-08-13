@@ -5,7 +5,7 @@ name: CI
 # - Windows GCC runs the full ABI/runtime/regression suite and deterministic fuzz gate;
 # - Windows Clang compile-only catches compiler portability warnings quickly;
 # - Linux GCC/Clang exercise the ELF/SysV backend;
-# - Linux sanitizers run the compiler under ASan/UBSan while compiling ELF programs.
+# - Linux sanitizers run the compiler under trapping UBSan while compiling ELF programs.
 # The heavy differential fuzz sweep lives in fuzz-nightly.yml.
 
 on:
@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Validate GitHub Actions workflows
         shell: bash
@@ -72,10 +72,10 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Python (for differential fuzzer)
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -108,7 +108,7 @@ jobs:
 
       - name: Upload assembly artifacts on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: failed-test-output
           path: ${{ steps.artifacts.outputs.dir }}/**
@@ -120,7 +120,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up MSYS2 Clang
         uses: msys2/setup-msys2@v2
@@ -164,7 +164,7 @@ jobs:
       matrix:
         cc: [gcc, clang]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Show toolchain versions
         run: |
@@ -192,7 +192,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build compiler natively on AArch64
         run: |
@@ -290,7 +290,7 @@ jobs:
           test "$(od -An -tx4 -N4 /tmp/mettle-kernels.spv | tr -d ' ')" = "07230203"
 
       - name: Upload offline GB10 resource evidence
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: linux-arm64-gb10-offline-resources
           path: /tmp/mettle-gb10-*.resources.json
@@ -345,7 +345,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # bin/mettle links no libc, so the ASan and UBSan runtimes have nothing to
       # attach to. Trapping UBSan needs no runtime: a failed check is a SIGILL.
