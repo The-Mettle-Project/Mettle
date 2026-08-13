@@ -240,14 +240,55 @@ static int safety_prove_constant(const IRFunction *function, size_t check_index,
   return offset <= access->extent - access->size;
 }
 
-/* Read `iv * stride` out of the instruction that produced the offset. This is
- * the shape lowering emits for every subscript: the index, then a multiply by
- * the element width. */
+/* Read an index as `variable + constant`, which is how `a[i]` and `a[i + 2]`
+ * both arrive. A bare variable is the same thing with a zero constant. */
+static int safety_index_is_affine(const IRFunction *function, size_t before,
+                                  const IROperand *index, const char **name_out,
+                                  long long *addend_out) {
+  if (index->kind == IR_OPERAND_SYMBOL && index->name) {
+    *name_out = index->name;
+    *addend_out = 0;
+    return 1;
+  }
+  if (index->kind != IR_OPERAND_TEMP || !index->name) {
+    return 0;
+  }
+  const IRInstruction *producer =
+      ir_find_temp_producer_before(function, before, index->name);
+  if (!producer || producer->is_float) {
+    return 0;
+  }
+  if (producer->op == IR_OP_ASSIGN) {
+    return safety_index_is_affine(function, before, &producer->lhs, name_out,
+                                  addend_out);
+  }
+  if (producer->op != IR_OP_BINARY || !producer->text ||
+      producer->lhs.kind != IR_OPERAND_SYMBOL || !producer->lhs.name ||
+      producer->rhs.kind != IR_OPERAND_INT) {
+    return 0;
+  }
+  if (strcmp(producer->text, "+") == 0) {
+    *name_out = producer->lhs.name;
+    *addend_out = producer->rhs.int_value;
+    return 1;
+  }
+  if (strcmp(producer->text, "-") == 0) {
+    *name_out = producer->lhs.name;
+    *addend_out = -producer->rhs.int_value;
+    return 1;
+  }
+  return 0;
+}
+
+/* Read `(iv + addend) * stride` out of the instruction that produced the
+ * offset. This is the shape lowering emits for every subscript: the index,
+ * then a multiply by the element width. */
 static int safety_offset_is_scaled_symbol(const IRFunction *function,
                                           size_t check_index,
                                           const IROperand *offset,
                                           const char **iv_out,
-                                          long long *stride_out) {
+                                          long long *stride_out,
+                                          long long *addend_out) {
   if (offset->kind != IR_OPERAND_TEMP || !offset->name) {
     return 0;
   }
@@ -255,11 +296,14 @@ static int safety_offset_is_scaled_symbol(const IRFunction *function,
       ir_find_temp_producer_before(function, check_index, offset->name);
   if (!producer || producer->op != IR_OP_BINARY || producer->is_float ||
       !producer->text || strcmp(producer->text, "*") != 0 ||
-      producer->lhs.kind != IR_OPERAND_SYMBOL || !producer->lhs.name ||
       producer->rhs.kind != IR_OPERAND_INT || producer->rhs.int_value <= 0) {
     return 0;
   }
-  *iv_out = producer->lhs.name;
+  size_t producer_index = (size_t)(producer - function->instructions);
+  if (!safety_index_is_affine(function, producer_index, &producer->lhs, iv_out,
+                              addend_out)) {
+    return 0;
+  }
   *stride_out = producer->rhs.int_value;
   return 1;
 }
@@ -285,57 +329,74 @@ static int safety_symbol_written_between(const IRFunction *function,
   return 0;
 }
 
-/* `<temp> = iv + 1`, the first half of lowering's unfolded step. */
-static int safety_is_add_one(const IRInstruction *instruction,
-                             const char *iv) {
-  return instruction && instruction->op == IR_OP_BINARY &&
-         !instruction->is_float && instruction->text &&
-         strcmp(instruction->text, "+") == 0 &&
-         ir_operand_is_symbol_named(&instruction->lhs, iv) &&
-         ir_operand_is_int_value(&instruction->rhs, 1);
+/* `<anything> = iv + <positive constant>`, the arithmetic half of a step. */
+static int safety_read_step_add(const IRInstruction *instruction,
+                                const char *iv, long long *step_out) {
+  if (!instruction || instruction->op != IR_OP_BINARY ||
+      instruction->is_float || !instruction->text ||
+      strcmp(instruction->text, "+") != 0 ||
+      !ir_operand_is_symbol_named(&instruction->lhs, iv) ||
+      instruction->rhs.kind != IR_OPERAND_INT ||
+      instruction->rhs.int_value <= 0) {
+    return 0;
+  }
+  *step_out = instruction->rhs.int_value;
+  return 1;
 }
 
-/* Confirm the loop advances its index by exactly one, and report which
+/* Read how far the loop advances its index each iteration, and report which
  * instructions do it.
  *
+ * The body is searched rather than just its last instruction, because a loop
+ * often advances more than one counter and only one of them is the index this
+ * access uses. Exactly one write to it is required, which is also what proves
+ * nothing else in the body moves it.
+ *
  * Two shapes, because this pass runs before the optimizer: lowering emits the
- * step as a pair, `t = i + 1` followed by `i = t`, and copy propagation folds
- * that into the single `i = i + 1` every recognizer downstream expects. Both
+ * step as a pair, `t = i + 3` followed by `i = t`, and copy propagation folds
+ * that into the single `i = i + 3` every recognizer downstream expects. Both
  * mean the same thing and both have to be read here. */
-static int safety_loop_steps_by_one(const IRFunction *function,
-                                    const IRWhileLoopBounds *loop,
-                                    const char *iv, size_t *step_first,
-                                    size_t *step_last) {
-  size_t last = loop->jump_index;
-  while (last > loop->branch_index + 1) {
-    last--;
-    if (function->instructions[last].op != IR_OP_NOP) {
-      break;
+static int safety_loop_step(const IRFunction *function,
+                            const IRWhileLoopBounds *loop, const char *iv,
+                            long long *step_out, size_t *step_first,
+                            size_t *step_last) {
+  size_t write_index = 0;
+  size_t write_count = 0;
+  for (size_t i = loop->branch_index + 1;
+       i < loop->jump_index && i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    if (instruction->dest.kind == IR_OPERAND_SYMBOL &&
+        instruction->dest.name && strcmp(instruction->dest.name, iv) == 0) {
+      write_index = i;
+      write_count++;
     }
   }
-  if (last <= loop->branch_index) {
+  if (write_count != 1) {
     return 0;
   }
 
-  const IRInstruction *tail = &function->instructions[last];
-  if (ir_try_parse_direct_unit_increment(tail, iv)) {
-    *step_first = last;
-    *step_last = last;
+  const IRInstruction *write = &function->instructions[write_index];
+  if (safety_read_step_add(write, iv, step_out)) {
+    *step_first = write_index;
+    *step_last = write_index;
     return 1;
   }
 
-  if (tail->op != IR_OP_ASSIGN ||
-      !ir_operand_is_symbol_named(&tail->dest, iv) ||
-      tail->lhs.kind != IR_OPERAND_TEMP || !tail->lhs.name) {
+  if (write->op != IR_OP_ASSIGN || write->lhs.kind != IR_OPERAND_TEMP ||
+      !write->lhs.name) {
     return 0;
   }
   const IRInstruction *add =
-      ir_find_temp_producer_before(function, last, tail->lhs.name);
-  if (!safety_is_add_one(add, iv)) {
+      ir_find_temp_producer_before(function, write_index, write->lhs.name);
+  if (!safety_read_step_add(add, iv, step_out)) {
     return 0;
   }
-  *step_first = (size_t)(add - function->instructions);
-  *step_last = last;
+  size_t add_index = (size_t)(add - function->instructions);
+  if (add_index <= loop->branch_index || add_index >= loop->jump_index) {
+    return 0; /* the arithmetic is not in this body, so it is not the step */
+  }
+  *step_first = add_index;
+  *step_last = write_index;
   return 1;
 }
 
@@ -356,11 +417,15 @@ static int safety_prove_loop_bound(IRFunction *function, size_t check_index,
 
   const char *iv = NULL;
   long long stride = 0;
+  long long addend = 0;
   if (!safety_offset_is_scaled_symbol(function, check_index, access->offset,
-                                      &iv, &stride)) {
+                                      &iv, &stride, &addend)) {
     safety_trace("the offset is not an index scaled by a constant width",
                  access->location.line);
     return 0;
+  }
+  if (addend < 0) {
+    return 0; /* the loop's lower bound says nothing about a negative offset */
   }
 
   /* Innermost enclosing loop stepping this variable. Scanning outward matters:
@@ -401,9 +466,10 @@ static int safety_prove_loop_bound(IRFunction *function, size_t check_index,
     }
     size_t step_first = 0;
     size_t step_last = 0;
-    if (!safety_loop_steps_by_one(function, &loop, iv, &step_first,
-                                  &step_last)) {
-      safety_trace("the loop index does not step by one",
+    long long step = 0;
+    if (!safety_loop_step(function, &loop, iv, &step, &step_first,
+                          &step_last)) {
+      safety_trace("the loop index does not step by a constant",
                    access->location.line);
       return 0;
     }
@@ -415,8 +481,9 @@ static int safety_prove_loop_bound(IRFunction *function, size_t check_index,
       return 0;
     }
 
-    /* `iv < bound` with a unit step from zero tops out at bound - 1. */
-    long long highest = (bound - 1) * stride;
+    /* `iv < bound` stepping from zero tops out at the largest multiple of the
+     * step below bound, which is at most bound - 1 whatever the step is. */
+    long long highest = (bound - 1 + addend) * stride;
     if (highest < 0 || access->size > access->extent) {
       return 0;
     }
@@ -456,14 +523,122 @@ static int safety_prove(IRFunction *function, size_t check_index,
  */
 
 typedef struct {
-  size_t header_index; /* the loop label the check moves in front of */
-  long long stride;
-  long long size;
+  size_t header_index;    /* the loop label the check moves in front of */
+  long long stride;       /* bytes per element */
+  long long primary_step; /* how far the tested variable moves each iteration */
+  long long index_step;   /* how far the indexing variable moves */
+  long long adjust;       /* the tested variable tops out at bound + adjust */
+  long long addend;       /* the index is that variable plus this */
+  long long size;         /* bytes the access touches */
   long long access_kind;
   IROperand base;  /* owned */
   IROperand bound; /* owned */
   SourceLocation location;
 } SafetyHoist;
+
+/* What a loop does to its index, read off the header. */
+typedef struct {
+  IRWhileLoopBounds bounds;
+  const char *iv;
+  long long step;       /* constant, greater than zero */
+  long long adjust;     /* highest index reached is `bound + adjust` */
+  const IROperand *bound;
+  size_t step_first;
+  size_t step_last;
+} SafetyLoopForm;
+
+/* Read the loop's test and step.
+ *
+ * The test is `index <op> bound` for `<` or `<=`, where the index may carry a
+ * constant of its own: `while (i + 3 <= len)` is how a loop consuming three
+ * bytes at a time says where it stops. Each spelling gives a different highest
+ * index, and getting that wrong by one is the difference between checking what
+ * the loop touches and checking a byte past it. */
+static int safety_parse_loop_form(const IRFunction *function,
+                                  size_t header_index, SafetyLoopForm *form) {
+  if (header_index + 4 >= function->instruction_count) {
+    return 0;
+  }
+  const IRInstruction *header = &function->instructions[header_index];
+  if (header->op != IR_OP_LABEL || !ir_label_is_while_header(header->text)) {
+    return 0;
+  }
+
+  /* Find the exit test, then work back to what computed it. A test that needs
+   * arithmetic of its own, as `i + 3 <= len` does, puts that arithmetic
+   * between the header and the compare, so counting instructions forward from
+   * the header finds the wrong one. */
+  size_t branch_index = 0;
+  int found_branch = 0;
+  for (size_t i = header_index + 1; i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    if (instruction->op == IR_OP_BRANCH_ZERO) {
+      branch_index = i;
+      found_branch = 1;
+      break;
+    }
+    if (instruction->op == IR_OP_LABEL || instruction->op == IR_OP_JUMP ||
+        instruction->op == IR_OP_BRANCH_EQ) {
+      return 0;
+    }
+  }
+  if (!found_branch) {
+    return 0;
+  }
+
+  const IRInstruction *branch = &function->instructions[branch_index];
+  if (!branch->text || branch->lhs.kind != IR_OPERAND_TEMP ||
+      !branch->lhs.name) {
+    return 0;
+  }
+  const IRInstruction *compare =
+      ir_find_temp_producer_before(function, branch_index, branch->lhs.name);
+  if (!compare || compare->op != IR_OP_BINARY || compare->is_float ||
+      !compare->text) {
+    return 0;
+  }
+  size_t compare_index = (size_t)(compare - function->instructions);
+  if (compare_index <= header_index) {
+    return 0;
+  }
+
+  long long index_addend = 0;
+  if (!safety_index_is_affine(function, compare_index, &compare->lhs,
+                              &form->iv, &index_addend)) {
+    return 0;
+  }
+  if (strcmp(compare->text, "<") == 0) {
+    form->adjust = -index_addend - 1;
+  } else if (strcmp(compare->text, "<=") == 0) {
+    form->adjust = -index_addend;
+  } else {
+    return 0;
+  }
+
+  form->bounds.compare_index = compare_index;
+  form->bounds.branch_index = branch_index;
+  form->bounds.loop_label = header->text;
+  form->bounds.exit_label = branch->text;
+  form->bounds.jump_index = (size_t)-1;
+  for (size_t i = branch_index + 1; i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    if (instruction->op == IR_OP_JUMP && instruction->text &&
+        strcmp(instruction->text, form->bounds.loop_label) == 0) {
+      form->bounds.jump_index = i;
+      break;
+    }
+    if (instruction->op == IR_OP_LABEL && instruction->text &&
+        strcmp(instruction->text, form->bounds.exit_label) == 0) {
+      break;
+    }
+  }
+  if (form->bounds.jump_index == (size_t)-1) {
+    return 0;
+  }
+
+  form->bound = &compare->rhs;
+  return 1;
+}
 
 /* An operand whose value cannot change across [start, end). */
 static int safety_operand_invariant_in(const IRFunction *function, size_t start,
@@ -525,149 +700,232 @@ static int safety_try_hoist(IRFunction *function, size_t check_index,
 
   const char *iv = NULL;
   long long stride = 0;
+  long long addend = 0;
   if (!safety_offset_is_scaled_symbol(function, check_index, access->offset,
-                                      &iv, &stride)) {
+                                      &iv, &stride, &addend)) {
+    safety_trace("the index is not a variable plus a constant",
+                 access->location.line);
     return 0;
   }
-  /* An access no wider than its step is what makes the hoisted length
-   * `(bound - 1) * stride + size` collapse to zero or less for a loop that
-   * never runs, which is what lets the check go in unguarded. A wider access
-   * would also reach past the range that expression describes. */
-  if (access->size > stride) {
+  /* An access no wider than its element is what keeps the hoisted length from
+   * reaching past the range the expression describes. */
+  if (access->size > stride || addend < 0) {
+    safety_trace("the access is wider than its element, or reaches backwards",
+                 access->location.line);
     return 0;
   }
 
+  int saw_loop = 0;
   for (size_t header = check_index; header-- > 0;) {
-    if (function->instructions[header].op != IR_OP_LABEL ||
-        !ir_label_is_while_header(function->instructions[header].text)) {
+    SafetyLoopForm form;
+    if (!safety_parse_loop_form(function, header, &form)) {
       continue;
     }
-    IRWhileLoopBounds loop;
-    if (!ir_find_while_loop_bounds(function, header, &loop) ||
-        loop.jump_index == (size_t)-1) {
+    if (check_index <= form.bounds.branch_index ||
+        check_index >= form.bounds.jump_index) {
       continue;
     }
-    if (check_index <= loop.branch_index || check_index >= loop.jump_index) {
-      continue;
-    }
+    saw_loop = 1;
 
-    const IRInstruction *compare = &function->instructions[loop.compare_index];
-    if (!compare->lhs.name || strcmp(compare->lhs.name, iv) != 0) {
-      continue;
-    }
-
-    size_t step_first = 0;
-    size_t step_last = 0;
-    if (!ir_iv_zero_at_header(function, header, iv) ||
-        !safety_loop_steps_by_one(function, &loop, iv, &step_first,
-                                  &step_last) ||
-        safety_symbol_written_between(function, loop.branch_index + 1,
-                                      loop.jump_index, iv, step_first,
-                                      step_last)) {
-      safety_trace("the loop index is not a plain zero-based counter",
+    /* The variable the loop tests, and the one this access indexes by, need
+     * not be the same. A loop reading three bytes and writing four advances
+     * two counters; the test bounds one of them, and the other is pinned to it
+     * by both starting at zero and both stepping by a constant, so after the
+     * same number of iterations each is that count times its own step. */
+    size_t primary_first = 0;
+    size_t primary_last = 0;
+    if (!ir_iv_zero_at_header(function, header, form.iv) ||
+        !safety_loop_step(function, &form.bounds, form.iv, &form.step,
+                          &primary_first, &primary_last)) {
+      safety_trace("the tested variable is not a plain zero-based counter",
                    access->location.line);
       return 0;
     }
-    if (!safety_body_is_straight_line(function, &loop)) {
+
+    long long index_step = form.step;
+    if (strcmp(form.iv, iv) != 0) {
+      size_t index_first = 0;
+      size_t index_last = 0;
+      if (!ir_iv_zero_at_header(function, header, iv) ||
+          !safety_loop_step(function, &form.bounds, iv, &index_step,
+                            &index_first, &index_last)) {
+        safety_trace("the indexing variable is not a plain zero-based counter",
+                     access->location.line);
+        return 0;
+      }
+    }
+
+    if (!safety_body_is_straight_line(function, &form.bounds)) {
       safety_trace("the loop body branches or calls, so one check for the "
                    "whole range would not describe what it touches",
                    access->location.line);
       return 0;
     }
-    if (!safety_operand_invariant_in(function, loop.branch_index + 1,
-                                     loop.jump_index, access->base) ||
-        !safety_operand_invariant_in(function, loop.branch_index + 1,
-                                     loop.jump_index, &compare->rhs)) {
+    if (!safety_operand_invariant_in(function, form.bounds.branch_index + 1,
+                                     form.bounds.jump_index, access->base) ||
+        !safety_operand_invariant_in(function, form.bounds.branch_index + 1,
+                                     form.bounds.jump_index, form.bound)) {
       safety_trace("the pointer or the loop bound changes inside the loop",
                    access->location.line);
       return 0;
     }
     /* The hoisted check is emitted in front of the header, so both operands
      * have to be settled by then. */
-    if (!safety_operand_invariant_in(function, header, loop.jump_index,
+    if (!safety_operand_invariant_in(function, header, form.bounds.jump_index,
                                      access->base)) {
       return 0;
     }
 
     out->header_index = header;
     out->stride = stride;
+    out->primary_step = form.step;
+    out->index_step = index_step;
+    out->adjust = form.adjust;
+    out->addend = addend;
     out->size = access->size;
     out->access_kind = access->access_kind;
     out->location = access->location;
     if (!ir_operand_clone(access->base, &out->base)) {
       return 0;
     }
-    if (!ir_operand_clone(&compare->rhs, &out->bound)) {
+    if (!ir_operand_clone(form.bound, &out->bound)) {
       ir_operand_destroy(&out->base);
       return 0;
     }
     return 1;
   }
+  safety_trace(saw_loop ? "the enclosing loop does not step this index"
+                        : "no enclosing loop this pass can read",
+               access->location.line);
   return 0;
 }
 
-/* Emit the one check that stands in for all of the loop's.
+/* Emit the one check that stands in for all of the loop's:
  *
- *   check(base, 0, (bound - 1) * stride + size)
+ *   top     = bound + adjust            highest index the loop reaches
+ *   settled = (top / step) * step       the last value it actually takes
+ *   length  = settled * stride + size   one past the last byte it reads
+ *   runs    = top >= 0                  zero when the loop never runs at all
+ *   check(base, 0, length * runs)
  *
- * The length is the last byte the final iteration reads, rather than
- * bound * stride. The two agree whenever the element width equals the step,
- * and hoisting is only attempted when the width does not exceed it, which is
- * also what makes the expression come out zero or negative for a loop that
- * never runs. The runtime treats that as nothing to check, so no guard branch
- * is needed.
+ * Rounding down to a multiple of the step matters once the step is more than
+ * one: a loop counting by three stops at the largest multiple of three below
+ * its bound, and using the bound itself would check up to two bytes the loop
+ * never reads. On an exactly sized buffer those two bytes are the difference
+ * between silence and accusing a correct program. The division is skipped
+ * where the step is one, which is most loops.
  *
- * Leaving the branch out is not only cheaper. A label immediately before a
- * loop header stops the recognizers' backward scan for the induction
- * variable's initial value, so guarding here would cost the loop its
- * vectorization, which is most of what hoisting was for. */
+ * Multiplying by `runs` rather than branching around the check is what keeps
+ * this free: a label immediately before a loop header stops the recognizers'
+ * backward scan for the induction variable's initial value, so a guard branch
+ * here would cost the loop its vectorization, which is most of what hoisting
+ * was for. */
 static int safety_emit_hoisted(IRInstructionVector *out,
                                const SafetyHoist *hoist) {
+  enum { SAFETY_HOIST_TEMPS = 7 };
   unsigned id = g_safety_next_id++;
-  char last[64];
-  char scaled[64];
-  char length[64];
-  snprintf(last, sizeof(last), SAFETY_TEMP_PREFIX "hl%u", id);
-  snprintf(scaled, sizeof(scaled), SAFETY_TEMP_PREFIX "hs%u", id);
-  snprintf(length, sizeof(length), SAFETY_TEMP_PREFIX "hn%u", id);
+  static const char *const tags[SAFETY_HOIST_TEMPS] = {"ht", "hq", "hm",
+                                                       "hi", "hs", "hn", "hr"};
+  char names[SAFETY_HOIST_TEMPS][64];
+  IROperand temps[SAFETY_HOIST_TEMPS];
+  for (int t = 0; t < SAFETY_HOIST_TEMPS; t++) {
+    snprintf(names[t], sizeof(names[t]), SAFETY_TEMP_PREFIX "%s%u", tags[t],
+             id);
+    temps[t] = ir_operand_temp(names[t]);
+  }
+  IROperand *top = &temps[0];
+  IROperand *rounds = &temps[1];
+  IROperand *highest = &temps[2];
+  IROperand *index = &temps[3];
+  IROperand *scaled = &temps[4];
+  IROperand *length = &temps[5];
+  IROperand *runs = &temps[6];
 
-  IROperand one = ir_operand_int(1);
+  IROperand adjust = ir_operand_int(hoist->adjust);
+  IROperand primary_step = ir_operand_int(hoist->primary_step);
+  IROperand index_step = ir_operand_int(hoist->index_step);
+  IROperand addend = ir_operand_int(hoist->addend);
   IROperand stride = ir_operand_int(hoist->stride);
   IROperand size = ir_operand_int(hoist->size);
-  IROperand last_operand = ir_operand_temp(last);
-  IROperand scaled_operand = ir_operand_temp(scaled);
-  IROperand length_operand = ir_operand_temp(length);
+  IROperand zero = ir_operand_int(0);
   int ok = 0;
 
-  if (!last_operand.name || !scaled_operand.name || !length_operand.name) {
+  for (int t = 0; t < SAFETY_HOIST_TEMPS; t++) {
+    if (!temps[t].name) {
+      goto done;
+    }
+  }
+
+  /* How far the tested variable gets. */
+  if (!safety_emit_binary(out, hoist->location, "+", names[0], &hoist->bound,
+                          &adjust, 0)) {
     goto done;
   }
 
-  if (!safety_emit_binary(out, hoist->location, "-", last, &hoist->bound, &one,
-                          0) ||
-      !safety_emit_binary(out, hoist->location, "*", scaled, &last_operand,
+  /* How many times the body runs, less one, and from that the last value the
+   * indexing variable takes. Dividing is what pins the two counters together;
+   * where the tested variable steps by one it is already the count. */
+  const IROperand *last_index = top;
+  if (hoist->primary_step > 1) {
+    if (!safety_emit_binary(out, hoist->location, "/", names[1], top,
+                            &primary_step, 0)) {
+      goto done;
+    }
+    last_index = rounds;
+  }
+  if (hoist->index_step != 1 || last_index != top) {
+    if (!safety_emit_binary(out, hoist->location, "*", names[2], last_index,
+                            &index_step, 0)) {
+      goto done;
+    }
+    last_index = highest;
+  }
+
+  if (hoist->addend != 0) {
+    if (!safety_emit_binary(out, hoist->location, "+", names[3], last_index,
+                            &addend, 0)) {
+      goto done;
+    }
+    last_index = index;
+  }
+
+  if (!safety_emit_binary(out, hoist->location, "*", names[4], last_index,
                           &stride, 0) ||
-      !safety_emit_binary(out, hoist->location, "+", length, &scaled_operand,
-                          &size, 0)) {
+      !safety_emit_binary(out, hoist->location, "+", names[5], scaled, &size,
+                          0) ||
+      !safety_emit_binary(out, hoist->location, ">=", names[6], top, &zero,
+                          0)) {
+    goto done;
+  }
+
+  char guarded[64];
+  snprintf(guarded, sizeof(guarded), SAFETY_TEMP_PREFIX "hg%u", id);
+  IROperand guarded_operand = ir_operand_temp(guarded);
+  if (!guarded_operand.name ||
+      !safety_emit_binary(out, hoist->location, "*", guarded, length, runs,
+                          0)) {
+    ir_operand_destroy(&guarded_operand);
     goto done;
   }
 
   IROperand arguments[5];
   if (!ir_operand_clone(&hoist->base, &arguments[0])) {
+    ir_operand_destroy(&guarded_operand);
     goto done;
   }
   arguments[1] = ir_operand_int(0);
-  arguments[2] = length_operand;
+  arguments[2] = guarded_operand;
   arguments[3] = ir_operand_int(hoist->access_kind);
   arguments[4] = ir_operand_int((long long)hoist->location.line);
   ok = safety_emit_call(out, hoist->location, "mettle_safety_check", arguments,
                         5);
   ir_operand_destroy(&arguments[0]);
+  ir_operand_destroy(&guarded_operand);
 
 done:
-  ir_operand_destroy(&last_operand);
-  ir_operand_destroy(&scaled_operand);
-  ir_operand_destroy(&length_operand);
+  for (int t = 0; t < SAFETY_HOIST_TEMPS; t++) {
+    ir_operand_destroy(&temps[t]);
+  }
   return ok;
 }
 

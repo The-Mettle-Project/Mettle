@@ -2585,6 +2585,34 @@ try {
   if ($LASTEXITCODE -ne 17) {
     throw "hoisting changed the answer or rejected a correct loop: expected 17, got $LASTEXITCODE`n$hoistOut"
   }
+
+  # A loop advancing two counters at different rates. The test bounds one and
+  # says nothing about the other, so the range for the second is worked out
+  # from how many times the body runs. The buffer is exactly the size the loop
+  # needs, so a range one byte too large rejects a correct program, and the
+  # short version proves a range one byte too small would miss the overrun.
+  $exactExe = Join-Path $tmpDir "safe_hoist_counters.exe"
+  & $CompilerPath --build --safe --release tests\test_safe_hoist_counters.mettle -o $exactExe 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "--safe build of test_safe_hoist_counters failed"
+  }
+  $exactOut = & $exactExe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 61) {
+    throw "an exactly sized buffer was rejected or the answer changed: expected 61, got $LASTEXITCODE`n$exactOut"
+  }
+
+  $shortExe = Join-Path $tmpDir "safe_hoist_counters_short.exe"
+  & $CompilerPath --build --safe --release tests\test_safe_hoist_counters_short.mettle -o $shortExe 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "--safe build of test_safe_hoist_counters_short failed"
+  }
+  $shortOut = & $shortExe 2>&1 | Out-String
+  if ($LASTEXITCODE -eq 0) {
+    throw "a buffer one byte too small ran to completion under --safe"
+  }
+  if ($shortOut -notmatch "outside its allocation") {
+    throw "the short buffer trapped for the wrong reason:`n$shortOut"
+  }
   Write-CaseResult -Name "safe_mode_hoist_range" -Passed $true
 }
 catch {

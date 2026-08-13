@@ -1,0 +1,38 @@
+// The loop from test_safe_hoist_counters.mettle with an output buffer one byte
+// too small. The overrun is on the counter the loop's test says nothing about,
+// so catching it depends on the range being worked out from how many times the
+// body runs rather than from the test alone.
+import "std/io";
+import "std/mem";
+
+fn encode(src: cstring, len: int64, dst: cstring) -> int64 {
+  var i: int64 = 0;
+  var o: int64 = 0;
+  while (i + 3 <= len) {
+    dst[o] = src[i];
+    dst[o + 1] = src[i + 1];
+    dst[o + 2] = src[i + 2];
+    dst[o + 3] = (int8)61;
+    i = i + 3;
+    o = o + 4;
+  }
+  return o;
+}
+
+fn main() -> int32 {
+  var len: int64 = 60;
+  var src: cstring = malloc(len);
+  var i: int64 = 0;
+  while (i < len) {
+    src[i] = (int8)7;
+    i = i + 1;
+  }
+
+  // The loop writes 80 bytes; this is 79.
+  var dst: cstring = malloc(79);
+  var written: int64 = encode(src, len, dst);
+
+  free(src);
+  free(dst);
+  return (int32)written;
+}

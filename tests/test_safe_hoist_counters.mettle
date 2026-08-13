@@ -1,0 +1,46 @@
+// A loop advancing two counters at different rates, which is what any encoder
+// looks like: read three bytes, write four. The test bounds the reading
+// counter and says nothing about the writing one, so the range checked for the
+// output buffer is worked out from how many times the body runs.
+//
+// Getting that by one in either direction is the whole risk. The output buffer
+// here is exactly the size the loop needs, so a range even one byte too large
+// rejects a correct program; test_safe_hoist_counters_short.mettle is the same
+// loop with one byte too few, and must trap.
+import "std/io";
+import "std/mem";
+
+fn encode(src: cstring, len: int64, dst: cstring) -> int64 {
+  var i: int64 = 0;
+  var o: int64 = 0;
+  while (i + 3 <= len) {
+    dst[o] = src[i];
+    dst[o + 1] = src[i + 1];
+    dst[o + 2] = src[i + 2];
+    dst[o + 3] = (int8)61;
+    i = i + 3;
+    o = o + 4;
+  }
+  return o;
+}
+
+fn main() -> int32 {
+  var len: int64 = 60;
+  var src: cstring = malloc(len);
+  var i: int64 = 0;
+  while (i < len) {
+    src[i] = (int8)7;
+    i = i + 1;
+  }
+
+  // 60 bytes in threes is 20 rounds, each writing four bytes: exactly 80.
+  var dst: cstring = malloc(80);
+  var written: int64 = encode(src, len, dst);
+
+  var last: int32 = (int32)dst[79];
+  free(src);
+  free(dst);
+
+  // 80 written, last byte is the 61 the loop puts there.
+  return (int32)(written - 80) + last;
+}
