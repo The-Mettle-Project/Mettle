@@ -2396,6 +2396,33 @@ catch {
 }
 
 
+# Safety runtime. Under --safe the compiler leaves a check wherever it could
+# not prove an access in bounds, and this is the half that answers it: which
+# accesses are inside their allocation, which run off the end, and which touch
+# memory that has been freed. Every answer here is a correctness claim with no
+# compiler involvement, so it is tested on its own.
+$total++
+try {
+  $safetyExe = Join-Path $tmpDir "safety_runtime_test.exe"
+  $compileSafety = & gcc -Wall -Wextra -std=c99 -g -O1 -D_GNU_SOURCE -Isrc tests\safety_runtime_test.c src\runtime\safety.c -o $safetyExe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "Safety runtime harness compile failed: $compileSafety"
+  }
+  $safetyOutput = & $safetyExe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "Safety runtime test failed:`n$safetyOutput"
+  }
+  if ($safetyOutput -notmatch "RESULT: PASS") {
+    throw "Safety runtime test did not report PASS:`n$safetyOutput"
+  }
+  Write-CaseResult -Name "safety_runtime" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "safety_runtime" -Passed $false -Reason $_.Exception.Message
+}
+
+
 # Native heap: build with --native-heap and confirm new/malloc/calloc/realloc/
 # free route through std/alloc's Mettle allocator (mettle_heap_*), stay correct
 # at runtime, and do NOT emit the Win32 HeapAlloc/calloc path for `new`.

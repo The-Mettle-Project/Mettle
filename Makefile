@@ -156,9 +156,11 @@ bundle-runtime: $(HOST_STARTUP_OBJECT) | $(BINDIR)
 	$(CC) $(RUNTIME_OBJ_CFLAGS) -DMETTLE_ATOMICS_IN_FREESTANDING \
 		-c $(RUNTIMEDIR)/atomics.c -o $(OBJDIR)/runtime/atomics.o
 	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/crash_handler.c -o $(OBJDIR)/runtime/crash_handler.o
+	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/safety.c        -o $(OBJDIR)/runtime/safety.o
 	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/profile.c       -o $(OBJDIR)/runtime/profile.o
 	cp $(OBJDIR)/runtime/atomics.o       $(BINDIR)/runtime/atomics.o
 	cp $(OBJDIR)/runtime/crash_handler.o $(BINDIR)/runtime/crash_handler.o
+	cp $(OBJDIR)/runtime/safety.o        $(BINDIR)/runtime/safety.o
 	cp $(OBJDIR)/runtime/profile.o       $(BINDIR)/runtime/profile.o
 
 $(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
