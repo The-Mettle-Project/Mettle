@@ -1,0 +1,11 @@
+// A program-defined symbol must beat the freestanding runtime's definition of
+// the same name instead of failing the link on a duplicate symbol. Runtime
+// objects contribute defaults; see docs/linker-build-pipelines.md.
+//
+// Exit 77 = the module's strlen won. Exit 5 would mean the runtime's strlen
+// ("hello") won, and a duplicate-symbol error means the override was lost.
+import "shadow_runtime";
+
+fn main() -> int32 {
+  return (int32)strlen("hello");
+}

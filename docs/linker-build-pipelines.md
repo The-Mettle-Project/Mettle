@@ -15,6 +15,30 @@ On Linux, `--build` always uses the ELF object backend. The `--linker` modes app
 
 **Regression triage:** If a bug appears only on `--linker internal`, prioritize `src/linker` and the binary emitter's COFF output. If internal linking is correct but `--linker gcc` or `--linker msvc` is wrong, suspect command-line parity, startup, or default libraries in `src/main.c` before deep-diving relocations.
 
+## Runtime Symbols Are Overridable Defaults
+
+The bundled runtime objects (`freestanding.o` above all, plus `crash_handler.o`,
+`atomics.o`, `profile.o`, `debug.o` and the Tracy helpers) put their symbols into
+the same flat namespace as the program. `freestanding.o` alone defines around 330
+C names, so without special handling any Mettle program or stdlib module defining
+`strlen`, `exp`, `malloc` and so on would fail the link on a duplicate symbol.
+
+The internal linker therefore treats those objects' definitions as *defaults*: a
+definition from a program object replaces one from a runtime object, in either
+arrival order. Two program-object definitions of the same name are still an
+error, as are two runtime definitions. `main.c` and `mtlc_api.c` mark the runtime
+inputs via `LinkResolutionOptions.object_is_runtime_default`.
+
+This does not reroute the runtime's own calls. A relocation whose own object also
+defines the symbol is bound locally in `relocation.c`, before the global symbol
+table is consulted, so `freestanding.o` keeps calling its own `strlen` even when
+the program supplies one.
+
+Note this applies to `--linker internal` only. Under `--linker gcc` the system
+linker sees two strong definitions and still rejects the link, so the standard
+library avoids the C names outright (`std/conv` exports `cstr_len`, not
+`strlen`).
+
 ## Artifacts To Capture
 
 1. Full compiler/link stdout and stderr.

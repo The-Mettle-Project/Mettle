@@ -55,22 +55,45 @@ if defined METTLE_SKIP_TESTS set "SKIP_TESTS=1"
 if defined METTLE_BACKEND_ONLY set "BACKEND_ONLY=1"
 
 REM Every source file binds to the owned host ABI through host_redirect.h.
-set CFLAGS=-Wall -Wextra -std=c99 -g -O2 -D_GNU_SOURCE -Isrc -Iinclude -fno-omit-frame-pointer -ffreestanding -fno-builtin -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -include src/runtime/host_redirect.h
+REM The compiler's own TUs keep Win64 unwind tables. StackWalk64 in the crash
+REM handler unwinds x64 frames through .pdata/.xdata, so dropping them blinds
+REM the ICE backtrace, and gcc 15.2 segfaults in the -gcodeview emitter when
+REM -fno-asynchronous-unwind-tables removes them. .pdata is inert data: it
+REM pulls in no unwinder, so the owned-runtime audit below is unaffected.
+set CFLAGS=-Wall -Wextra -std=c99 -g -O2 -D_GNU_SOURCE -Isrc -Iinclude -fno-omit-frame-pointer -ffreestanding -fno-builtin -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -include src/runtime/host_redirect.h
 set RUNTIME_CFLAGS=-std=c99 -O2 -D_GNU_SOURCE -Isrc -ffreestanding -fno-builtin -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -mno-stack-arg-probe -ffunction-sections -fdata-sections
-if /I "%CC%"=="clang" set "CFLAGS=%CFLAGS% -D_CRT_NONSTDC_NO_DEPRECATE -D_CRT_SECURE_NO_WARNINGS"
+REM This build is mingw-ABI throughout: GNU ld, ar/nm, --entry, and the
+REM __imp_-only archive audit. A stock LLVM install defaults to
+REM x86_64-pc-windows-msvc, which emits _fltused, _tls_index and UCRT calls
+REM the owned runtime does not provide, so pin clang to the GNU target.
+REM On MSYS2 CLANG64 clang that is already the default and this is a no-op.
+REM -femulated-tls picks the TLS model the owned runtime actually implements:
+REM __thread through __emutls_get_address, which is what gcc emits on mingw by
+REM default. Native Windows TLS instead wants _tls_index from the CRT's tlssup.
+set "CCTARGET="
+if /I "%CC%"=="clang" (
+    set "CCTARGET=--target=x86_64-w64-windows-gnu"
+    set "CFLAGS=%CFLAGS% --target=x86_64-w64-windows-gnu -femulated-tls -D_CRT_NONSTDC_NO_DEPRECATE -D_CRT_SECURE_NO_WARNINGS"
+    set "RUNTIME_CFLAGS=%RUNTIME_CFLAGS% --target=x86_64-w64-windows-gnu -femulated-tls"
+)
 REM Release builds stamp the version via METTLE_VERSION (e.g. set by release.yml);
 REM dev builds fall back to the default in main.c.
 if defined METTLE_VERSION set "CFLAGS=%CFLAGS% -DMETTLE_VERSION_RAW=%METTLE_VERSION%"
 REM CodeView debug info lets DbgHelp resolve ICE backtraces to file:line on Windows.
-REM Some MinGW gcc builds ICE in the CodeView emitter on large functions, so allow
-REM opting out via METTLE_NO_CODEVIEW=1 (used by CI). The .pdb link flag is dropped
+REM Opt out via METTLE_NO_CODEVIEW=1 (used by CI). The .pdb link flag is dropped
 REM with it since there is no CodeView data to emit.
+REM clang stays on DWARF: its CodeView emitter names the pre-emulation symbol of
+REM every __thread variable, and under -femulated-tls nothing defines those, so
+REM the archive audit below sees a screenful of undefined g_* symbols.
 if defined METTLE_NO_CODEVIEW (
     set "LDFLAGS=-ldbghelp"
 ) else (
-    if /I "%CC%"=="gcc" set "CFLAGS=%CFLAGS% -gcodeview"
-    if /I "%CC%"=="clang" set "CFLAGS=%CFLAGS% -gcodeview"
-    set "LDFLAGS=-ldbghelp -Wl,--pdb,bin\mettle.pdb"
+    if /I "%CC%"=="gcc" (
+        set "CFLAGS=%CFLAGS% -gcodeview"
+        set "LDFLAGS=-ldbghelp -Wl,--pdb,bin\mettle.pdb"
+    ) else (
+        set "LDFLAGS=-ldbghelp"
+    )
 )
 
 REM Check if selected compiler is available
@@ -366,7 +389,7 @@ if defined BACKEND_ONLY (
 
 echo Linking mettle ^(reference frontend^) against libmtlc...
 set "LDFLAGS=%LDFLAGS% -Wl,--disable-runtime-pseudo-reloc"
-%CC% -nostdlib -nostartfiles -nodefaultlibs -Wl,--entry,mettle_start -Wl,--subsystem,console obj\runtime\host_startup.o obj\lexer\lexer.o obj\parser\ast.o obj\parser\parser.o obj\semantic\symbol_table.o obj\semantic\type_checker.o obj\semantic\type_checker_types.o obj\semantic\type_checker_errors.o obj\semantic\type_checker_safety.o obj\semantic\type_checker_init_tracker.o obj\semantic\type_checker_decl.o obj\semantic\type_checker_match.o obj\semantic\type_checker_stmt.o obj\semantic\type_checker_expr.o obj\semantic\type_checker_aggregate.o obj\semantic\type_checker_tensor_epilogue.o obj\semantic\type_checker_memory.o obj\semantic\register_allocator.o obj\semantic\import_resolver.o obj\semantic\monomorphize.o obj\ir\ir_lowering.o obj\ir\ir_lower_address.o obj\ir\ir_lower_defer.o obj\ir\ir_lower_expr.o obj\ir\ir_lower_stmt.o obj\ir\ir_lower_support.o obj\ir\ir_lower_switch_match.o obj\ir\ir_lower_types.o obj\frontend\mtlc_type_from_frontend.o obj\frontend\mtlc_lower_module.o obj\error\error_explain.o obj\tracy_build.o obj\main.o bin\mtlc.lib -o bin\mettle.exe -lkernel32 -ldbghelp %LDFLAGS%
+%CC% %CCTARGET% -nostdlib -nostartfiles -nodefaultlibs -Wl,--entry,mettle_start -Wl,--subsystem,console obj\runtime\host_startup.o obj\lexer\lexer.o obj\parser\ast.o obj\parser\parser.o obj\semantic\symbol_table.o obj\semantic\type_checker.o obj\semantic\type_checker_types.o obj\semantic\type_checker_errors.o obj\semantic\type_checker_safety.o obj\semantic\type_checker_init_tracker.o obj\semantic\type_checker_decl.o obj\semantic\type_checker_match.o obj\semantic\type_checker_stmt.o obj\semantic\type_checker_expr.o obj\semantic\type_checker_aggregate.o obj\semantic\type_checker_tensor_epilogue.o obj\semantic\type_checker_memory.o obj\semantic\register_allocator.o obj\semantic\import_resolver.o obj\semantic\monomorphize.o obj\ir\ir_lowering.o obj\ir\ir_lower_address.o obj\ir\ir_lower_defer.o obj\ir\ir_lower_expr.o obj\ir\ir_lower_stmt.o obj\ir\ir_lower_support.o obj\ir\ir_lower_switch_match.o obj\ir\ir_lower_types.o obj\frontend\mtlc_type_from_frontend.o obj\frontend\mtlc_lower_module.o obj\error\error_explain.o obj\tracy_build.o obj\main.o bin\mtlc.lib -o bin\mettle.exe -lkernel32 -ldbghelp %LDFLAGS%
 
 if %ERRORLEVEL% NEQ 0 (
     echo Build failed!

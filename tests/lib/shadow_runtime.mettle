@@ -1,0 +1,6 @@
+// Deliberately exports a name the freestanding runtime also defines. The
+// runtime's strlen counts bytes to the NUL; this one is a marker value, so the
+// test can tell which definition the linker bound.
+export fn strlen(s: cstring) -> int64 {
+  return 77;
+}

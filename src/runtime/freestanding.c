@@ -112,6 +112,35 @@ int memcmp(const void *left, const void *right, mt_size count) {
   return 0;
 }
 
+#if defined(MTLC_HOST_PREFIX_H)
+/*
+ * As the host runtime the definitions above are renamed to mtlc_host_*, but a
+ * compiler still lowers struct copies and zero-init to calls that name memcpy
+ * and memset literally, and no macro can reach those. Export the plain names
+ * as well, for the same reason ___chkstk_ms below is written in asm.
+ */
+#undef memcpy
+#undef memset
+#undef memmove
+#undef memcmp
+
+void *memcpy(void *destination, const void *source, mt_size count) {
+  return mtlc_host_memcpy(destination, source, count);
+}
+
+void *memset(void *destination, int value, mt_size count) {
+  return mtlc_host_memset(destination, value, count);
+}
+
+void *memmove(void *destination, const void *source, mt_size count) {
+  return mtlc_host_memmove(destination, source, count);
+}
+
+int memcmp(const void *left, const void *right, mt_size count) {
+  return mtlc_host_memcmp(left, right, count);
+}
+#endif
+
 mt_size strlen(const char *text) {
   mt_size length = 0;
   if (!text) {
@@ -3793,20 +3822,7 @@ int toupper(int character) {
                                                : character;
 }
 
-double fabs(double value) { return value < 0.0 ? -value : value; }
-
-float sqrtf(float value) {
-  if (value <= 0.0f) {
-    return value == 0.0f ? value : 0.0f / 0.0f;
-  }
-  float estimate = value >= 1.0f ? value : 1.0f;
-  for (int i = 0; i < 16; i++) {
-    estimate = 0.5f * (estimate + value / estimate);
-  }
-  return estimate;
-}
-
-double exp(double value) {
+static double mt_exp(double value) {
   if (value > 709.0) {
     return 1.0 / 0.0;
   }
@@ -3840,20 +3856,48 @@ double exp(double value) {
   return result;
 }
 
-float expf(float value) { return (float)exp((double)value); }
-
-double tanh(double value) {
+static double mt_tanh(double value) {
   if (value > 20.0) {
     return 1.0;
   }
   if (value < -20.0) {
     return -1.0;
   }
-  double twice = exp(value * 2.0);
+  double twice = mt_exp(value * 2.0);
   return (twice - 1.0) / (twice + 1.0);
 }
 
-float tanhf(float value) { return (float)tanh((double)value); }
+/* Program ABI: Mettle code binds these by name, e.g.
+ * `extern fn expf(x: float32) -> float32 = "expf"`, and the float vectorizers
+ * recognize a call to expf. */
+float sqrtf(float value) {
+  if (value <= 0.0f) {
+    return value == 0.0f ? value : 0.0f / 0.0f;
+  }
+  float estimate = value >= 1.0f ? value : 1.0f;
+  for (int i = 0; i < 16; i++) {
+    estimate = 0.5f * (estimate + value / estimate);
+  }
+  return estimate;
+}
+
+float expf(float value) { return (float)mt_exp((double)value); }
+
+float tanhf(float value) { return (float)mt_tanh((double)value); }
+
+#if defined(MTLC_HOST_PREFIX_H)
+/*
+ * Host-only. These back mtlc_host_fabs/exp/tanh for the compiler's own
+ * optimizer and GNN. On the program side std/math implements fabs, exp and
+ * tanh in Mettle, so exporting them here too would make every program that
+ * imports std/math fail to link on a duplicate symbol.
+ */
+double fabs(double value) { return value < 0.0 ? -value : value; }
+
+double exp(double value) { return mt_exp(value); }
+
+double tanh(double value) { return mt_tanh(value); }
+#endif
 
 int __popcountdi2(mt_u64 value) {
   int count = 0;

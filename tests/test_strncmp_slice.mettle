@@ -16,11 +16,11 @@ fn main() -> int32 {
   buf[10] = 'h';
 
   var len: int32 = 11;
-  if (strncmp(&buf[0], 5, "health", len) == 0) {
-    if (strncmp(&buf[0], 5, "heal", len) == 0) {
+  if (cstr_ncmp(&buf[0], 5, "health", len) == 0) {
+    if (cstr_ncmp(&buf[0], 5, "heal", len) == 0) {
       return 2;
     }
-    if (strncmp(&buf[0], 5, "healthz", len) == 0) {
+    if (cstr_ncmp(&buf[0], 5, "healthz", len) == 0) {
       return 3;
     }
     return 0;

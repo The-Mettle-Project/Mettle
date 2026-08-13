@@ -510,11 +510,13 @@ int mtlc_emit(MtlcContext *ctx, MtlcModule *module, MtlcArch arch,
  * libmtlc's internal linker. Imports are resolved by DLL name, so no Windows SDK
  * import libraries are needed. */
 static int link_pe_internal(MtlcContext *ctx, const char **object_paths,
+                            const unsigned char *object_is_runtime_default,
                             size_t object_count, const char *output_path) {
   static const char *const import_dlls[] = {
       "kernel32.dll", "ws2_32.dll", "user32.dll", "gdi32.dll",
       "advapi32.dll", "winmm.dll"};
-  LinkResolutionOptions resolution_options = {"mettle_start", 16u, 1};
+  LinkResolutionOptions resolution_options = {"mettle_start", 16u, 1,
+                                              object_is_runtime_default};
   LinkResolution *resolution = NULL;
   PeEmissionOptions emission = {0};
   char *error_message = NULL;
@@ -608,7 +610,9 @@ int mtlc_build_executable(MtlcContext *ctx, MtlcModule *module,
 #ifdef _WIN32
   {
     const char *objects[3] = {startup_path, runtime_path, obj_path};
-    result = link_pe_internal(ctx, objects, 3, output_path);
+    /* Only the freestanding runtime contributes overridable defaults. */
+    static const unsigned char objects_are_default[3] = {0u, 1u, 0u};
+    result = link_pe_internal(ctx, objects, objects_are_default, 3, output_path);
   }
 #else
   {

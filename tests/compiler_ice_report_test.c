@@ -4,6 +4,20 @@
 #include <stdio.h>
 #include <string.h>
 
+/* crash_handler.c reaches for these, but they live in the freestanding runtime
+ * and this harness is an ordinary hosted build that does not link it. */
+void mettle_crash_write_stderr_bytes(const char *text, size_t length);
+void mettle_crash_write_stderr(const char *text);
+long long (*mettle_crash_heap_classifier)(void *address) = NULL;
+
+void mettle_crash_write_stderr_bytes(const char *text, size_t length) {
+  fwrite(text, 1, length, stderr);
+}
+
+void mettle_crash_write_stderr(const char *text) {
+  mettle_crash_write_stderr_bytes(text, strlen(text));
+}
+
 int main(void) {
   IRInstruction instruction = {0};
   char line[256];

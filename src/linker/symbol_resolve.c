@@ -566,12 +566,24 @@ static int link_resolution_record_global_symbol(
   }
 
   if (global_symbol->is_defined) {
-    mettle_set_error(
-        error_message_out,
-        "Duplicate external symbol '%s' in '%s' and object index %zu",
-        object_symbol->name, input->path ? input->path : "<unknown>",
-        global_symbol->defining_object_index);
-    return 0;
+    const LinkedInputObject *holder =
+        &resolution->objects[global_symbol->defining_object_index];
+    /* A runtime default loses to a real definition, whichever order they
+     * arrive in. Relocations inside an object that defines the symbol itself
+     * are bound locally (see relocation.c), so replacing the global definition
+     * redirects other objects without rerouting the runtime's own calls. */
+    if (holder->is_runtime_default && !input->is_runtime_default) {
+      /* fall through and let the program definition take over */
+    } else if (!holder->is_runtime_default && input->is_runtime_default) {
+      return 1;
+    } else {
+      mettle_set_error(
+          error_message_out,
+          "Duplicate external symbol '%s' in '%s' and object index %zu",
+          object_symbol->name, input->path ? input->path : "<unknown>",
+          global_symbol->defining_object_index);
+      return 0;
+    }
   }
 
   global_symbol->is_defined = 1;
@@ -791,8 +803,18 @@ int link_resolution_build(const char **object_paths, size_t object_count,
   }
 
   if (!link_resolution_load_objects(resolution, object_paths, object_count,
-                                    error_message_out) ||
-      !link_resolution_merge_sections(resolution, section_alignment,
+                                    error_message_out)) {
+    goto cleanup;
+  }
+  if (options && options->object_is_runtime_default) {
+    size_t i = 0;
+    for (i = 0; i < resolution->object_count; i++) {
+      resolution->objects[i].is_runtime_default =
+          options->object_is_runtime_default[i] ? 1 : 0;
+    }
+  }
+
+  if (!link_resolution_merge_sections(resolution, section_alignment,
                                       error_message_out) ||
       !link_resolution_build_symbols(resolution, error_message_out) ||
       !link_resolution_assign_virtual_addresses(resolution, section_alignment) ||

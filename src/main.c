@@ -1435,11 +1435,13 @@ static int write_internal_startup_object(const char *path, int profile_runtime,
  * vs emit-obj+internal vs emit-obj+external GCC). */
 
 static int mettle_link_internal(const char **object_paths,
+                                  const unsigned char *object_is_runtime_default,
                                   size_t object_count,
                                   const char *executable_filename,
                                   int include_shell32,
                                   const CompilerOptions *options) {
-  LinkResolutionOptions resolution_options = {"mettle_start", 16u, 1};
+  LinkResolutionOptions resolution_options = {"mettle_start", 16u, 1,
+                                              object_is_runtime_default};
   LinkResolution *resolution = NULL;
   PeEmissionOptions emission_options = {0};
   StringList import_library_paths = {0};
@@ -1943,6 +1945,10 @@ static int mettle_link_object_file(const char *object_filename,
         7u + (use_tracy ? 2u : (needs_tracy_helpers ? 1u : 0u)) +
         (options ? options->link_argument_count : 0u);
     const char **object_paths = calloc(object_capacity, sizeof(const char *));
+    /* Parallel to object_paths: 1 marks a bundled runtime object, whose
+     * definitions a program object is allowed to replace. calloc leaves the
+     * program's own objects (and any -Wl object arguments) at 0. */
+    unsigned char *object_is_default = calloc(object_capacity, 1u);
     const char *crash_object = NULL;
     const char *atomics_object = NULL;
     const char *profile_object = NULL;
@@ -1951,8 +1957,10 @@ static int mettle_link_object_file(const char *object_filename,
     size_t object_count = 0u;
     int startup_ready = 0;
 
-    if (!object_paths) {
+    if (!object_paths || !object_is_default) {
       fprintf(stderr, "Error: Failed to allocate internal-linker object list\n");
+      free(object_paths);
+      free(object_is_default);
       goto cleanup;
     }
 
@@ -1961,6 +1969,7 @@ static int mettle_link_object_file(const char *object_filename,
         fprintf(stderr,
                 "Error: Failed to allocate internal-linker startup object path\n");
         free(object_paths);
+        free(object_is_default);
         goto cleanup;
       }
       fprintf(stderr,
@@ -1975,6 +1984,7 @@ static int mettle_link_object_file(const char *object_filename,
                 "Error: Failed to generate internal-linker startup object\n");
         free(startup_object);
         free(object_paths);
+        free(object_is_default);
         goto cleanup;
       }
       fprintf(stderr,
@@ -2003,6 +2013,7 @@ static int mettle_link_object_file(const char *object_filename,
                   "Error: Bundled profile runtime object not found in '%s'\n",
                   runtime_directory);
           free(object_paths);
+          free(object_is_default);
           if (startup_object) {
             if (startup_ready) {
               _unlink(startup_object);
@@ -2020,6 +2031,7 @@ static int mettle_link_object_file(const char *object_filename,
                   "Error: Bundled debug runtime object not found in '%s'\n",
                   runtime_directory);
           free(object_paths);
+          free(object_is_default);
           if (startup_object) {
             if (startup_ready) {
               _unlink(startup_object);
@@ -2031,30 +2043,39 @@ static int mettle_link_object_file(const char *object_filename,
       }
 
       object_paths[object_count++] = startup_object;
+      object_is_default[object_count] = 1u;
       object_paths[object_count++] = freestanding_object;
       object_paths[object_count++] = object_filename;
       if (crash_object) {
+        object_is_default[object_count] = 1u;
         object_paths[object_count++] = crash_object;
       }
       if (atomics_object) {
+        object_is_default[object_count] = 1u;
         object_paths[object_count++] = atomics_object;
       }
       if (profile_object) {
+        object_is_default[object_count] = 1u;
         object_paths[object_count++] = profile_object;
       }
       if (debug_object) {
+        object_is_default[object_count] = 1u;
         object_paths[object_count++] = debug_object;
       }
       if (use_tracy) {
+        object_is_default[object_count] = 1u;
         object_paths[object_count++] = tracy_artifacts.helpers_object;
+        object_is_default[object_count] = 1u;
         object_paths[object_count++] = tracy_artifacts.client_object;
       } else if (needs_tracy_helpers && tracy_helpers_object) {
+        object_is_default[object_count] = 1u;
         object_paths[object_count++] = tracy_helpers_object;
       }
       if (!append_internal_link_object_args(options, object_paths,
                                             object_capacity, &object_count)) {
         fprintf(stderr, "Error: Too many internal-linker object arguments\n");
         free(object_paths);
+        free(object_is_default);
         if (startup_object) {
           if (startup_ready) {
             _unlink(startup_object);
@@ -2064,8 +2085,8 @@ static int mettle_link_object_file(const char *object_filename,
         goto cleanup;
       }
 
-      if (mettle_link_internal(object_paths, object_count, executable_filename, 0,
-                                 options) == 0) {
+      if (mettle_link_internal(object_paths, object_is_default, object_count,
+                                 executable_filename, 0, options) == 0) {
         build_result = 0;
       } else if (linker_mode == LINKER_MODE_INTERNAL) {
         fprintf(stderr, "Error: Internal linker failed to produce an executable\n");
@@ -2087,6 +2108,7 @@ static int mettle_link_object_file(const char *object_filename,
       free(startup_object);
     }
     free(object_paths);
+    free(object_is_default);
 
     if (build_result == 0 || linker_mode == LINKER_MODE_INTERNAL ||
         (!has_gcc && !has_link)) {

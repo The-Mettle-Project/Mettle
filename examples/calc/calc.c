@@ -482,6 +482,12 @@ int main(int argc, char **argv) {
   mtlc_context_set_diagnostic_handler(ctx, on_backend_diagnostic, NULL);
   mtlc_context_set_opt_level(ctx, 1);
   mtlc_context_set_whole_program(ctx, 1);
+  /* Where the linker picks up freestanding.o and host_startup.o. This example
+   * runs from the repository root; point MTLC_RUNTIME_DIR at an installed tree
+   * instead. */
+  const char *runtime_dir = getenv("MTLC_RUNTIME_DIR");
+  mtlc_context_set_runtime_directory(ctx,
+                                     runtime_dir ? runtime_dir : "bin/runtime");
   int ok = mtlc_optimize(ctx, module) &&
            mtlc_build_executable(ctx, module, argv[2]);
   if (ok) {

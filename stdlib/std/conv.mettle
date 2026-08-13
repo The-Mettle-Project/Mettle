@@ -72,8 +72,11 @@ export fn to_upper(c: int32) -> int32 {
 
 // ─── String utilities ───────────────────────────────────────────────────────
 
-// Return the length of a null-terminated C string
-export fn strlen(s: cstring) -> int64 {
+// Return the length of a null-terminated C string.
+// Named cstr_len, not strlen: the freestanding runtime is linked into every
+// program and already defines strlen, and a module export shares that flat
+// symbol namespace.
+export fn cstr_len(s: cstring) -> int64 {
   var i: int64 = 0;
   while (s[i] != 0) {
     i = i + 1;
@@ -194,7 +197,7 @@ export fn streq(a: cstring, b: cstring) -> int32 {
 
 // Compare buf[offset..] with a string, bounded by buf_len.
 // Returns 0 on exact match, non-zero otherwise.
-export fn strncmp(buf: cstring, offset: int32, needle: string, buf_len: int32) -> int32 {
+export fn cstr_ncmp(buf: cstring, offset: int32, needle: string, buf_len: int32) -> int32 {
   if (offset < 0) { return -1; }
   if (buf_len < 0) { return -1; }
   if (offset > buf_len) { return -1; }

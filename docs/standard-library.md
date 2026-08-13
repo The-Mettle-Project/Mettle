@@ -64,8 +64,14 @@ Accuracy: kernels carry enough terms that truncation error sits below the roundi
 
 ## std/conv
 
-Conversions and character classification. The owned runtime supplies `atoi`,
-`atol`, and `strlen`. The rest of the module uses Mettle code.
+Conversions and character classification. The owned runtime supplies `atoi` and
+`atol`. The rest of the module uses Mettle code.
+
+String helpers are named `cstr_len` and `cstr_ncmp` rather than `strlen` and
+`strncmp`. The freestanding runtime is linked into every program and defines the
+C names already, and a module export lands in that same flat symbol namespace.
+A program may still define such a name: runtime symbols are defaults that a
+program object overrides (see docs/linker-build-pipelines.md).
 
 ## std/process
 

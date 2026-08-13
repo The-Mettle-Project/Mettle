@@ -125,14 +125,14 @@ export fn tracy_zone_begin(
   var z: TracyZone;
   var name_len: int64 = 0;
   if (name != 0) {
-    name_len = strlen(name);
+    name_len = cstr_len(name);
   }
   mettle_tracy_zone_begin(
     line,
     file,
-    strlen(file),
+    cstr_len(file),
     func_name,
-    strlen(func_name),
+    cstr_len(func_name),
     name,
     name_len,
     color,
@@ -195,14 +195,14 @@ export fn tracy_zone_text(zone: TracyZone, text: cstring) {
   if (text == 0) {
     return;
   }
-  mettle_tracy_zone_text(zone, text, strlen(text));
+  mettle_tracy_zone_text(zone, text, cstr_len(text));
 }
 
 export fn tracy_zone_name(zone: TracyZone, text: cstring) {
   if (text == 0) {
     return;
   }
-  mettle_tracy_zone_name(zone, text, strlen(text));
+  mettle_tracy_zone_name(zone, text, cstr_len(text));
 }
 
 export fn tracy_zone_color(zone: TracyZone, color: uint32) {
@@ -263,14 +263,14 @@ export fn tracy_message(text: cstring) {
   if (text == 0) {
     return;
   }
-  mettle_tracy_message(text, strlen(text));
+  mettle_tracy_message(text, cstr_len(text));
 }
 
 export fn tracy_message_colored(text: cstring, color: uint32) {
   if (text == 0) {
     return;
   }
-  mettle_tracy_message_colored(text, strlen(text), color);
+  mettle_tracy_message_colored(text, cstr_len(text), color);
 }
 
 export fn tracy_message_literal(text: cstring) {
@@ -281,7 +281,7 @@ export fn tracy_app_info(text: cstring) {
   if (text == 0) {
     return;
   }
-  mettle_tracy_app_info(text, strlen(text));
+  mettle_tracy_app_info(text, cstr_len(text));
 }
 
 // ─── Memory events (custom allocators) ───────────────────────────────────────

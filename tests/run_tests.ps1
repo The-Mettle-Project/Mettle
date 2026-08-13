@@ -2607,6 +2607,53 @@ catch {
   Write-CaseResult -Name "global_aggregates_and_fnptr" -Passed $false -Reason $_.Exception.Message
 }
 
+# Runtime symbols are overridable defaults. freestanding.o is linked into every
+# program and defines ~330 C names, so a program defining one of them must win
+# rather than fail the link on a duplicate symbol. 77 = the module's strlen was
+# bound; 5 would mean the runtime's won. Overriding must not reroute the
+# runtime's own calls either: freestanding.c's fputs calls strlen internally, so
+# puts("hello") still has to emit exactly "hello". Internal linker only -- GNU ld
+# rejects the duplicate, which is why std/conv exports cstr_len, not strlen.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "runtime_symbol_override.exe"
+  $buildOut = & $CompilerPath --build --linker internal -I tests/lib "tests\test_runtime_symbol_override.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "runtime symbol override build failed: $buildOut"
+  }
+  & $exePath 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 77) {
+    throw "runtime symbol override exited with $LASTEXITCODE (expected 77)"
+  }
+
+  $hijackSource = Join-Path $tmpDir "runtime_symbol_override_hijack.mettle"
+  @(
+    'import "shadow_runtime";'
+    ''
+    'extern fn puts(s: cstring) -> int32 = "puts";'
+    ''
+    'fn main() -> int32 {'
+    '  puts("hello");'
+    '  return (int32)strlen("hello");'
+    '}'
+  ) | Set-Content -Path $hijackSource -Encoding utf8
+  $hijackExe = Join-Path $tmpDir "runtime_symbol_override_hijack.exe"
+  $buildOut = & $CompilerPath --build --linker internal -I tests/lib $hijackSource -o $hijackExe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "runtime symbol override hijack build failed: $buildOut"
+  }
+  $printed = & $hijackExe | Out-String
+  if ($printed.Trim() -ne "hello") {
+    throw "the runtime's own strlen was rerouted: puts printed '$($printed.Trim())'"
+  }
+
+  Write-CaseResult -Name "runtime_symbol_override" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "runtime_symbol_override" -Passed $false -Reason $_.Exception.Message
+}
+
 # Word-sized global aggregates: a global struct or array of exactly 1/2/4/8
 # bytes is memory reached through an address, not a value the MIR global cache
 # may hold in a register. Caching one gave it a vreg nothing defines, and the

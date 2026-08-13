@@ -64,9 +64,14 @@ Then compile a `.calc` program to a native binary and run it:
 module to the backend:
 
 ```c
+mtlc_context_set_runtime_directory(ctx, "bin/runtime"); // freestanding.o, host_startup.o
 mtlc_optimize(ctx, module);              // classical optimizer (fold, inline, ...)
 mtlc_build_executable(ctx, module, out); // native x86-64 codegen + internal PE link
 ```
+
+`mtlc_build_executable` needs the runtime directory: it links `freestanding.o`
+and `host_startup.o` from there. `calc` defaults to `bin/runtime` so it runs
+from the repository root, and reads `MTLC_RUNTIME_DIR` for an installed tree.
 
 Two things worth copying into a real frontend:
 

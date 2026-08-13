@@ -54,6 +54,9 @@ typedef struct {
   size_t *section_alignments;
   LinkedObjectSymbol *symbols;
   size_t symbol_count;
+  /* A bundled runtime object: its definitions are defaults a program object may
+   * replace. See object_is_runtime_default in LinkResolutionOptions. */
+  int is_runtime_default;
 } LinkedInputObject;
 
 typedef struct {
@@ -71,6 +74,14 @@ typedef struct {
   const char *entry_symbol_name;
   size_t section_alignment;
   int allow_unresolved_externals;
+  /* Optional, parallel to object_paths: non-zero marks a bundled runtime
+   * object. The runtime and the standard library share one flat symbol
+   * namespace, so freestanding.o alone puts ~330 C names in front of every
+   * program. Marking those definitions as defaults lets a program (or a
+   * stdlib module, e.g. std/conv's strlen) define the same name and win,
+   * instead of failing the link on a duplicate symbol. Two program-object
+   * definitions of one name are still an error. NULL means "no defaults". */
+  const unsigned char *object_is_runtime_default;
 } LinkResolutionOptions;
 
 typedef struct {
