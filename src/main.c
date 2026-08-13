@@ -4110,6 +4110,16 @@ int compile_file(const char *input_filename, const char *output_filename,
     goto cleanup;
   }
 
+  /* --safe: describe each allocation to the runtime once the allocator is
+   * settled, so a pointer check has something to resolve against. Before
+   * optimization for the same reason the routing above is: the bookkeeping
+   * calls should inline and move like any others. */
+  if (emit_safety_checks && !ir_safety_register_allocations(ir_program)) {
+    fprintf(stderr, "Error: Failed to instrument allocations for --safe\n");
+    result = 1;
+    goto cleanup;
+  }
+
   if (compiler_options_use_profile_runtime(options)) {
     if (!ir_profile_instrument_program(ir_program)) {
       fprintf(stderr, "Error: Failed to instrument IR for runtime profiling\n");

@@ -1,0 +1,11 @@
+// The pointer outlives the block. Every byte it names is still mapped and
+// still readable, so only the shadow map can tell that the allocation behind
+// it is gone.
+import "std/mem";
+
+fn main() -> int32 {
+  var p: cstring = malloc(16);
+  p[0] = 42;
+  free(p);
+  return (int32)p[0];
+}

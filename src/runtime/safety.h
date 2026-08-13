@@ -54,11 +54,27 @@ typedef enum {
  * replaces the old record, which is what an allocator reusing a block wants. */
 void mettle_safety_register(void *pointer, uint64_t size);
 
-/* Retire the allocation starting exactly at `pointer`. Every granule it
- * covered becomes unowned, so a pointer kept across the free traps on its next
- * use. Retiring an address that is not a live allocation start is ignored:
- * freeing foreign memory is not an error the runtime can judge. */
+/* Retire the allocation starting exactly at `pointer`. The granules keep
+ * naming it, so a pointer kept across the free is reported as use-after-free
+ * rather than read back as untracked memory. Retiring an address that is not a
+ * live allocation start is ignored: freeing foreign memory is not an error the
+ * runtime can judge. */
 void mettle_safety_unregister(void *pointer);
+
+/* Bracket a call into a Mettle-implemented allocator, which is the one thing
+ * that legitimately touches memory the model calls dead. It writes a header
+ * below the pointer it returns, it poisons blocks the program has released,
+ * and it hands a recycled block back only after clearing it. Checked against
+ * the model those reads as overruns and use-after-free, and they are neither.
+ *
+ * Bracketing the CALL rather than exempting a function is what keeps this
+ * precise. The allocator reaches for the same byte-filling helpers ordinary
+ * code does, and those stay fully checked everywhere else; only the work done
+ * on the allocator's behalf is skipped. Nested calls count, so an allocator
+ * calling itself unwinds correctly, and the count is per thread, so one thread
+ * allocating never blinds another. */
+void mettle_safety_enter_allocator(void);
+void mettle_safety_leave_allocator(void);
 
 /* Retire `old_pointer` and register `size` bytes at `new_pointer` as one step,
  * for a reallocation that may or may not have moved the block. */
@@ -68,12 +84,16 @@ void mettle_safety_reregister(void *old_pointer, void *new_pointer,
 /* The check itself. `base` is the pointer the access derives from and carries
  * the provenance; `offset` is the signed byte displacement applied to it and
  * `size` the number of bytes touched. Returns when the access is inside the
- * allocation that owns `base`, and does not return otherwise.
+ * allocation that owns `base`, and does not return otherwise. `line` is the
+ * source line, which the report falls back on when the build carries no debug
+ * information to resolve the return address against.
  *
- * `what` names the access in the trap message and must outlive the call; the
- * compiler passes a string literal. `line` is the source line of the access. */
+ * The access is deliberately not described in words. The crash handler already
+ * names the function, file, line and source text from the return address, and
+ * it does it better; passing a string as well would cost a load per check at
+ * every site, for a worse version of what the report already prints. */
 void mettle_safety_check(const void *base, int64_t offset, uint64_t size,
-                         uint32_t access_kind, const char *what, uint32_t line);
+                         uint32_t access_kind, uint32_t line);
 
 /* Counts for the end-of-run summary and for tests: how many checks ran, and
  * how many allocations are live. Both are advisory and lock-free. */

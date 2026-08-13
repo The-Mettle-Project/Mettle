@@ -110,10 +110,16 @@ static int safety_emit_call(IRInstructionVector *out, SourceLocation location,
   insn.op = IR_OP_CALL;
   insn.location = location;
   insn.text = mettle_strdup(callee);
-  insn.arguments = calloc(count, sizeof(IROperand));
-  if (!insn.text || !insn.arguments) {
+  if (!insn.text) {
     ir_instruction_destroy_storage(&insn);
     return 0;
+  }
+  if (count > 0) {
+    insn.arguments = calloc(count, sizeof(IROperand));
+    if (!insn.arguments) {
+      ir_instruction_destroy_storage(&insn);
+      return 0;
+    }
   }
   insn.argument_count = count;
   for (size_t i = 0; i < count; i++) {
@@ -216,7 +222,7 @@ static int safety_expand_extent(IRInstructionVector *out,
  * whichever one the computed address happens to land in. */
 static int safety_expand_region(IRInstructionVector *out,
                                 const SafetyAccess *access) {
-  IROperand arguments[6];
+  IROperand arguments[5];
   size_t built = 0;
   int ok = 0;
 
@@ -230,15 +236,11 @@ static int safety_expand_region(IRInstructionVector *out,
   built = 2;
   arguments[2] = ir_operand_int(access->size);
   arguments[3] = ir_operand_int(access->access_kind);
-  arguments[4] = ir_operand_string(access->what);
-  arguments[5] = ir_operand_int((long long)access->location.line);
-  built = 6;
-  if (arguments[4].kind != IR_OPERAND_STRING) {
-    goto done;
-  }
+  arguments[4] = ir_operand_int((long long)access->location.line);
+  built = 5;
 
   ok = safety_emit_call(out, access->location, "mettle_safety_check", arguments,
-                        6);
+                        5);
 
 done:
   for (size_t i = 0; i < built; i++) {
@@ -247,7 +249,70 @@ done:
   return ok;
 }
 
+/* ---- the one exempt module ------------------------------------------------- */
+
+/* An allocator is the one piece of code whose job is to touch memory that is
+ * not inside any live allocation. It writes a block header below the pointer
+ * it hands out, and it threads its free list through the bodies of blocks the
+ * program has already released. Checked against the model those accesses read
+ * as a header overrun and a use-after-free, and they are neither: the model is
+ * describing the allocator's own bookkeeping as if it were program memory.
+ *
+ * So the allocator is exempt, identified by role rather than by path: it is
+ * whichever source file defines the heap entry points. Nothing else is exempt,
+ * and the exemption costs no coverage of the program itself, because the
+ * program only reaches this memory through pointers the allocator returned. */
+static const char *safety_allocator_source(const IRProgram *program) {
+  for (size_t i = 0; i < program->function_count; i++) {
+    const IRFunction *function = program->functions[i];
+    if (function && function->name &&
+        strncmp(function->name, "mettle_heap_", 12) == 0) {
+      return function->location.filename;
+    }
+  }
+  return NULL;
+}
+
+static int safety_function_is_allocator(const IRFunction *function,
+                                        const char *allocator_source) {
+  if (!allocator_source || !function) {
+    return 0;
+  }
+  if (function->name && strncmp(function->name, "mettle_heap_", 12) == 0) {
+    return 1;
+  }
+  return function->location.filename &&
+         strcmp(function->location.filename, allocator_source) == 0;
+}
+
 /* ---- driver ---------------------------------------------------------------- */
+
+/* Drop every check in a function without expanding any of them. */
+static int safety_strip_function(IRFunction *function, IRSafetyStats *stats) {
+  IRInstructionVector out = {0};
+  if (!ir_instruction_vector_reserve(&out, function->instruction_count)) {
+    return 0;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    IRInstruction *instruction = &function->instructions[i];
+    if (instruction->op == IR_OP_SAFETY_CHECK) {
+      if (stats) {
+        stats->emitted++;
+        stats->exempt++;
+      }
+      continue;
+    }
+    if (!ir_instruction_vector_append_move(&out, instruction)) {
+      ir_instruction_vector_destroy(&out);
+      return 0;
+    }
+  }
+  if (!ir_function_replace_instructions(function, &out)) {
+    ir_instruction_vector_destroy(&out);
+    return 0;
+  }
+  return 1;
+}
 
 static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
   int found = 0;
@@ -318,9 +383,288 @@ int ir_safety_resolve_program(IRProgram *program, IRSafetyStats *stats) {
     return 1;
   }
   g_safety_next_id = 0;
+  const char *allocator_source = safety_allocator_source(program);
   for (size_t i = 0; i < program->function_count; i++) {
     IRFunction *function = program->functions[i];
-    if (function && !safety_resolve_function(function, stats)) {
+    if (!function) {
+      continue;
+    }
+    int resolved =
+        safety_function_is_allocator(function, allocator_source)
+            ? safety_strip_function(function, stats)
+            : safety_resolve_function(function, stats);
+    if (!resolved) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+/* ---- telling the runtime where the heap is --------------------------------- */
+
+typedef enum {
+  SAFETY_ALLOC_NONE = 0,
+  SAFETY_ALLOC_SIZE,    /* arguments[0] is the byte count */
+  SAFETY_ALLOC_PRODUCT, /* arguments[0] * arguments[1] is the byte count */
+  SAFETY_ALLOC_REALLOC, /* arguments[0] the old block, arguments[1] the size */
+  SAFETY_ALLOC_FREE     /* arguments[0] is the block being retired */
+} SafetyAllocKind;
+
+/* Whether the callee is the Mettle-implemented allocator rather than the libc
+ * one. Only the former needs bracketing: its body is Mettle code that lowering
+ * has checked, and it reaches for the same helpers ordinary code does. The
+ * libc allocator is C, never carries a check, and needs no bracket. */
+static int safety_callee_is_mettle_allocator(const IRInstruction *instruction) {
+  return instruction->op == IR_OP_CALL && instruction->text &&
+         strncmp(instruction->text, "mettle_heap_", 12) == 0;
+}
+
+/* Both spellings of every entry point: the libc names a program calls by
+ * default, and the std/alloc names --native-heap rewrites them to. This runs
+ * after that rewrite, so only one set is ever present, but matching both keeps
+ * the two flags independent. */
+static SafetyAllocKind safety_classify_call(const IRInstruction *instruction) {
+  if (instruction->op != IR_OP_CALL || !instruction->text) {
+    return SAFETY_ALLOC_NONE;
+  }
+  const char *callee = instruction->text;
+  size_t arguments = instruction->argument_count;
+
+  if (arguments == 1 &&
+      (strcmp(callee, "malloc") == 0 ||
+       strcmp(callee, "mettle_heap_alloc") == 0 ||
+       strcmp(callee, "mettle_heap_zeroed") == 0)) {
+    return SAFETY_ALLOC_SIZE;
+  }
+  if (arguments == 2 && (strcmp(callee, "calloc") == 0 ||
+                         strcmp(callee, "mettle_heap_calloc") == 0)) {
+    return SAFETY_ALLOC_PRODUCT;
+  }
+  if (arguments == 2 && (strcmp(callee, "realloc") == 0 ||
+                         strcmp(callee, "mettle_heap_realloc") == 0)) {
+    return SAFETY_ALLOC_REALLOC;
+  }
+  if (arguments == 1 && (strcmp(callee, "free") == 0 ||
+                         strcmp(callee, "mettle_heap_free") == 0)) {
+    return SAFETY_ALLOC_FREE;
+  }
+  return SAFETY_ALLOC_NONE;
+}
+
+static int safety_emit_register(IRInstructionVector *out,
+                                SourceLocation location,
+                                const IROperand *pointer,
+                                const IROperand *size) {
+  IROperand arguments[2];
+  if (!ir_operand_clone(pointer, &arguments[0])) {
+    return 0;
+  }
+  if (!ir_operand_clone(size, &arguments[1])) {
+    ir_operand_destroy(&arguments[0]);
+    return 0;
+  }
+  int ok = safety_emit_call(out, location, "mettle_safety_register", arguments,
+                            2);
+  ir_operand_destroy(&arguments[0]);
+  ir_operand_destroy(&arguments[1]);
+  return ok;
+}
+
+static int safety_emit_one_pointer_call(IRInstructionVector *out,
+                                        SourceLocation location,
+                                        const char *callee,
+                                        const IROperand *pointer) {
+  IROperand argument;
+  if (!ir_operand_clone(pointer, &argument)) {
+    return 0;
+  }
+  int ok = safety_emit_call(out, location, callee, &argument, 1);
+  ir_operand_destroy(&argument);
+  return ok;
+}
+
+static int safety_emit_reregister(IRInstructionVector *out,
+                                  SourceLocation location,
+                                  const IROperand *old_pointer,
+                                  const IROperand *new_pointer,
+                                  const IROperand *size) {
+  IROperand arguments[3];
+  size_t built = 0;
+  int ok = 0;
+
+  if (!ir_operand_clone(old_pointer, &arguments[0])) {
+    return 0;
+  }
+  built = 1;
+  if (!ir_operand_clone(new_pointer, &arguments[1])) {
+    goto done;
+  }
+  built = 2;
+  if (!ir_operand_clone(size, &arguments[2])) {
+    goto done;
+  }
+  built = 3;
+  ok = safety_emit_call(out, location, "mettle_safety_reregister", arguments,
+                        3);
+
+done:
+  for (size_t i = 0; i < built; i++) {
+    ir_operand_destroy(&arguments[i]);
+  }
+  return ok;
+}
+
+/* The size `new T` asks for. Mirrors what --native-heap's rewrite does with
+ * the same operand, including its eight byte fallback for a missing one. */
+static IROperand safety_new_size(const IRInstruction *instruction) {
+  if (instruction->rhs.kind == IR_OPERAND_NONE ||
+      (instruction->rhs.kind == IR_OPERAND_INT &&
+       instruction->rhs.int_value <= 0)) {
+    return ir_operand_int(8);
+  }
+  return instruction->rhs;
+}
+
+static int safety_register_function(IRFunction *function) {
+  int found = 0;
+  for (size_t i = 0; i < function->instruction_count && !found; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    found = instruction->op == IR_OP_NEW ||
+            safety_classify_call(instruction) != SAFETY_ALLOC_NONE;
+  }
+  if (!found) {
+    return 1;
+  }
+
+  IRInstructionVector out = {0};
+  if (!ir_instruction_vector_reserve(&out, function->instruction_count + 16)) {
+    return 0;
+  }
+
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    IRInstruction *instruction = &function->instructions[i];
+    SafetyAllocKind kind = safety_classify_call(instruction);
+    int is_new = instruction->op == IR_OP_NEW;
+    SourceLocation location = instruction->location;
+
+    if (kind == SAFETY_ALLOC_NONE && !is_new) {
+      if (!ir_instruction_vector_append_move(&out, instruction)) {
+        ir_instruction_vector_destroy(&out);
+        return 0;
+      }
+      continue;
+    }
+
+    /* Retire the block before the call that releases it, not after. Between
+     * the two the allocator has not handed the memory out yet, so no other
+     * thread can register something else over it. */
+    if (kind == SAFETY_ALLOC_FREE) {
+      if (!safety_emit_one_pointer_call(&out, location,
+                                        "mettle_safety_unregister",
+                                        &instruction->arguments[0])) {
+        ir_instruction_vector_destroy(&out);
+        return 0;
+      }
+    }
+
+    /* How many bytes the call is about to hand back. calloc states it as a
+     * product, which is multiplied out here, before the call, so only the one
+     * result has its live range stretched across it instead of both factors. */
+    IROperand size = ir_operand_none();
+    IROperand product_operand = ir_operand_none();
+    if (is_new) {
+      size = safety_new_size(instruction);
+    } else if (kind == SAFETY_ALLOC_SIZE) {
+      size = instruction->arguments[0];
+    } else if (kind == SAFETY_ALLOC_REALLOC) {
+      size = instruction->arguments[1];
+    } else if (kind == SAFETY_ALLOC_PRODUCT) {
+      char product[64];
+      snprintf(product, sizeof(product), SAFETY_TEMP_PREFIX "n%u",
+               g_safety_next_id++);
+      product_operand = ir_operand_temp(product);
+      if (!product_operand.name ||
+          !safety_emit_binary(&out, location, "*", product,
+                              &instruction->arguments[0],
+                              &instruction->arguments[1], 1)) {
+        ir_operand_destroy(&product_operand);
+        ir_instruction_vector_destroy(&out);
+        return 0;
+      }
+      size = product_operand;
+    }
+
+    /* These alias the instruction's own storage, which the vector takes over
+     * below and keeps alive for the rest of this function. */
+    IROperand result = instruction->dest;
+    IROperand old_pointer = kind == SAFETY_ALLOC_REALLOC
+                                ? instruction->arguments[0]
+                                : ir_operand_none();
+    int bracket = safety_callee_is_mettle_allocator(instruction);
+
+    if (bracket && !safety_emit_call(&out, location,
+                                     "mettle_safety_enter_allocator", NULL,
+                                     0)) {
+      ir_operand_destroy(&product_operand);
+      ir_instruction_vector_destroy(&out);
+      return 0;
+    }
+
+    if (!ir_instruction_vector_append_move(&out, instruction)) {
+      ir_operand_destroy(&product_operand);
+      ir_instruction_vector_destroy(&out);
+      return 0;
+    }
+
+    if (bracket && !safety_emit_call(&out, location,
+                                     "mettle_safety_leave_allocator", NULL,
+                                     0)) {
+      ir_operand_destroy(&product_operand);
+      ir_instruction_vector_destroy(&out);
+      return 0;
+    }
+
+    /* A result nobody keeps cannot be reached through, so there is nothing to
+     * describe. Freeing has already been handled above. */
+    int ok = 1;
+    if (result.kind != IR_OPERAND_NONE && kind != SAFETY_ALLOC_FREE) {
+      ok = kind == SAFETY_ALLOC_REALLOC
+               ? safety_emit_reregister(&out, location, &old_pointer, &result,
+                                        &size)
+               : safety_emit_register(&out, location, &result, &size);
+    }
+    ir_operand_destroy(&product_operand);
+    if (!ok) {
+      ir_instruction_vector_destroy(&out);
+      return 0;
+    }
+  }
+
+  if (!ir_function_replace_instructions(function, &out)) {
+    ir_instruction_vector_destroy(&out);
+    return 0;
+  }
+  ir_function_clear_cfg(function);
+  return 1;
+}
+
+int ir_safety_register_allocations(IRProgram *program) {
+  if (!program) {
+    return 1;
+  }
+  const char *allocator_source = safety_allocator_source(program);
+  for (size_t i = 0; i < program->function_count; i++) {
+    IRFunction *function = program->functions[i];
+    if (!function) {
+      continue;
+    }
+    /* Exempt for the same reason its accesses are: the calls it makes to
+     * itself are the allocator working, not the program allocating, and
+     * describing them would register a block once per layer. */
+    if (safety_function_is_allocator(function, allocator_source)) {
+      continue;
+    }
+    if (!safety_register_function(function)) {
       return 0;
     }
   }

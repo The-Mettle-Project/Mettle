@@ -1,0 +1,16 @@
+// Past the end of a heap block. Nothing about the size is visible in the
+// index, so this can only be caught by asking the runtime which allocation the
+// pointer came from.
+import "std/mem";
+
+fn main() -> int32 {
+  var p: cstring = malloc(16);
+  var i: int32 = 8;
+
+  if (i != 0) {
+    i = i + 8;
+  }
+
+  p[i] = 7;
+  return (int32)p[i];
+}

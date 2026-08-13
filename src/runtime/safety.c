@@ -345,6 +345,19 @@ void mettle_safety_reregister(void *old_pointer, void *new_pointer,
   mettle_safety_register(new_pointer, size);
 }
 
+/* Per thread, so one thread inside the allocator never suppresses another's
+ * checks. Nesting is counted rather than flagged: the allocator's entry points
+ * call one another. */
+static __thread unsigned g_safety_allocator_depth;
+
+void mettle_safety_enter_allocator(void) { g_safety_allocator_depth++; }
+
+void mettle_safety_leave_allocator(void) {
+  if (g_safety_allocator_depth > 0) {
+    g_safety_allocator_depth--;
+  }
+}
+
 /* ---- reporting ------------------------------------------------------------ */
 
 static void safety_append(char *buffer, size_t capacity, size_t *offset,
@@ -384,7 +397,6 @@ static char g_safety_message[512];
 
 typedef struct {
   const char *headline;
-  const char *what;
   uint32_t line;
   int64_t offset;
   uint64_t size;
@@ -401,10 +413,6 @@ static void safety_report_and_trap(const SafetyFailure *failure,
 
   safety_append(g_safety_message, capacity, &at, "Fatal error: ");
   safety_append(g_safety_message, capacity, &at, failure->headline);
-  if (failure->what && failure->what[0]) {
-    safety_append(g_safety_message, capacity, &at, " in ");
-    safety_append(g_safety_message, capacity, &at, failure->what);
-  }
   safety_append(g_safety_message, capacity, &at, ": ");
   safety_append_unsigned(g_safety_message, capacity, &at, failure->size);
   safety_append(g_safety_message, capacity, &at, " bytes at offset ");
@@ -427,15 +435,16 @@ static void safety_report_and_trap(const SafetyFailure *failure,
 /* ---- the check ------------------------------------------------------------ */
 
 void mettle_safety_check(const void *base, int64_t offset, uint64_t size,
-                         uint32_t access_kind, const char *what,
-                         uint32_t line) {
+                         uint32_t access_kind, uint32_t line) {
   (void)access_kind;
+  if (g_safety_allocator_depth != 0) {
+    return;
+  }
   __atomic_add_fetch(&g_safety_check_count, 1, __ATOMIC_RELAXED);
 
   void *program_counter = __builtin_return_address(0);
   void *frame_pointer = __builtin_frame_address(0);
   SafetyFailure failure;
-  failure.what = what;
   failure.line = line;
   failure.offset = offset;
   failure.size = size;

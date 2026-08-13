@@ -1,0 +1,16 @@
+// The pointer handed to realloc, used after the block may have moved. The
+// standard leaves it indeterminate whether it still names anything; the shadow
+// map settles it by retiring the old block when the new one is described.
+import "std/mem";
+
+fn main() -> int32 {
+  var p: cstring = malloc(16);
+  p[0] = 3;
+
+  var q: cstring = realloc(p, 4096);
+  q[40] = 9;
+
+  var stale: int32 = (int32)p[0];
+  free(q);
+  return stale;
+}

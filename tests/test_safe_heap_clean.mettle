@@ -1,0 +1,31 @@
+// Correct heap use across the shapes the instrumentation has to get right:
+// allocate and fill to the last byte, grow through realloc and use the space
+// the growth added, and free exactly once at the end.
+import "std/mem";
+
+fn main() -> int32 {
+  var p: cstring = malloc(16);
+  var i: int32 = 0;
+  while (i < 16) {
+    p[i] = (int8)i;
+    i = i + 1;
+  }
+  var last: int32 = (int32)p[15];
+
+  p = realloc(p, 64);
+  var j: int32 = 16;
+  while (j < 64) {
+    p[j] = (int8)1;
+    j = j + 1;
+  }
+  var grown: int32 = (int32)p[63];
+  free(p);
+
+  var zeroed: cstring = calloc(8, 4);
+  zeroed[31] = (int8)2;
+  var tail: int32 = (int32)zeroed[31];
+  free(zeroed);
+
+  // 15 + 1 + 2 = 18
+  return last + grown + tail;
+}

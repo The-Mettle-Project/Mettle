@@ -2472,6 +2472,57 @@ catch {
 }
 
 
+# --safe on the heap, where the extent is not in the code and only the runtime
+# shadow map can answer. Run against both allocators: the libc one is C the
+# instrumentation never enters, while --native-heap routes to std/alloc, which
+# is Mettle code that writes block headers and poisons freed blocks. Those
+# accesses are outside the model by design, so the allocator call is bracketed;
+# without that bracket correct programs trap, which is why the clean case is
+# checked on both paths rather than one.
+$total++
+try {
+  $allocators = @{ "libc" = @(); "native" = @("--native-heap") }
+  foreach ($allocator in $allocators.Keys) {
+    $extra = $allocators[$allocator]
+
+    $cleanExe = Join-Path $tmpDir "safe_heap_clean.$allocator.exe"
+    & $CompilerPath --build --safe --release @extra tests\test_safe_heap_clean.mettle -o $cleanExe 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "--safe build of test_safe_heap_clean failed on $allocator"
+    }
+    $cleanOut = & $cleanExe 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 18) {
+      throw "correct heap code failed under --safe on ${allocator}: expected 18, got $LASTEXITCODE`n$cleanOut"
+    }
+
+    $bad = @{
+      "test_safe_heap_overflow"  = "outside its allocation"
+      "test_safe_use_after_free" = "after it was freed"
+      "test_safe_realloc_stale"  = "after it was freed"
+    }
+    foreach ($case in $bad.Keys) {
+      $exe = Join-Path $tmpDir "$case.$allocator.exe"
+      & $CompilerPath --build --safe --release @extra "tests\$case.mettle" -o $exe 2>&1 | Out-Null
+      if ($LASTEXITCODE -ne 0) {
+        throw "--safe build of $case failed on $allocator"
+      }
+      $caseOut = & $exe 2>&1 | Out-String
+      if ($LASTEXITCODE -eq 0) {
+        throw "$case ran to completion under --safe on $allocator"
+      }
+      if ($caseOut -notmatch $bad[$case]) {
+        throw "$case trapped on $allocator without reporting '$($bad[$case])':`n$caseOut"
+      }
+    }
+  }
+  Write-CaseResult -Name "safe_mode_heap" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "safe_mode_heap" -Passed $false -Reason $_.Exception.Message
+}
+
+
 # Native heap: build with --native-heap and confirm new/malloc/calloc/realloc/
 # free route through std/alloc's Mettle allocator (mettle_heap_*), stay correct
 # at runtime, and do NOT emit the Win32 HeapAlloc/calloc path for `new`.

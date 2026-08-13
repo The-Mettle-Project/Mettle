@@ -1,4 +1,4 @@
-/* Exercises the checked-access safety runtime on its own.
+﻿/* Exercises the checked-access safety runtime on its own.
  *
  * Everything here is a claim about what the runtime must answer, independent
  * of any compiler work: which accesses are inside their allocation, which run
@@ -92,8 +92,8 @@ int main(void) {
   CASE("in bounds read", 0, {
     char *block = (char *)aligned_block(64);
     mettle_safety_register(block, 64);
-    mettle_safety_check(block, 0, 4, READ, "a[0]", 10);
-    mettle_safety_check(block, 60, 4, READ, "a[15]", 11);
+    mettle_safety_check(block, 0, 4, READ, 10);
+    mettle_safety_check(block, 60, 4, READ, 11);
     mettle_safety_unregister(block);
     free_block(block);
   });
@@ -101,7 +101,7 @@ int main(void) {
   CASE("one past the end", 1, {
     char *block = (char *)aligned_block(64);
     mettle_safety_register(block, 64);
-    mettle_safety_check(block, 64, 1, READ, "a[64]", 20);
+    mettle_safety_check(block, 64, 1, READ, 20);
     mettle_safety_unregister(block);
     free_block(block);
   });
@@ -110,7 +110,7 @@ int main(void) {
   CASE("straddling the end", 1, {
     char *block = (char *)aligned_block(64);
     mettle_safety_register(block, 64);
-    mettle_safety_check(block, 61, 4, READ, "a[i]", 21);
+    mettle_safety_check(block, 61, 4, READ, 21);
     mettle_safety_unregister(block);
     free_block(block);
   });
@@ -118,7 +118,7 @@ int main(void) {
   CASE("negative index", 1, {
     char *block = (char *)aligned_block(64);
     mettle_safety_register(block, 64);
-    mettle_safety_check(block, -4, 4, READ, "a[-1]", 22);
+    mettle_safety_check(block, -4, 4, READ, 22);
     mettle_safety_unregister(block);
     free_block(block);
   });
@@ -131,7 +131,7 @@ int main(void) {
     char *second = (char *)aligned_block(64);
     mettle_safety_register(first, 64);
     mettle_safety_register(second, 64);
-    mettle_safety_check(first, (int64_t)(second - first), 4, READ, "a[i]", 30);
+    mettle_safety_check(first, (int64_t)(second - first), 4, READ, 30);
     mettle_safety_unregister(first);
     mettle_safety_unregister(second);
     free_block(first);
@@ -142,7 +142,7 @@ int main(void) {
     char *block = (char *)aligned_block(64);
     mettle_safety_register(block, 64);
     mettle_safety_unregister(block);
-    mettle_safety_check(block, 0, 4, READ, "p[0]", 40);
+    mettle_safety_check(block, 0, 4, READ, 40);
     free_block(block);
   });
 
@@ -150,15 +150,15 @@ int main(void) {
     char *block = (char *)aligned_block(64);
     mettle_safety_register(block, 64);
     mettle_safety_unregister(block);
-    mettle_safety_check(block + 32, 0, 4, READ, "q[0]", 41);
+    mettle_safety_check(block + 32, 0, 4, READ, 41);
     free_block(block);
   });
 
   CASE("interior pointer while live", 0, {
     char *block = (char *)aligned_block(64);
     mettle_safety_register(block, 64);
-    mettle_safety_check(block + 32, 0, 4, READ, "q[0]", 42);
-    mettle_safety_check(block + 32, -32, 4, READ, "q[-8]", 43);
+    mettle_safety_check(block + 32, 0, 4, READ, 42);
+    mettle_safety_check(block + 32, -32, 4, READ, 43);
     mettle_safety_unregister(block);
     free_block(block);
   });
@@ -166,7 +166,7 @@ int main(void) {
   CASE("interior pointer past the end", 1, {
     char *block = (char *)aligned_block(64);
     mettle_safety_register(block, 64);
-    mettle_safety_check(block + 32, 32, 4, READ, "q[8]", 44);
+    mettle_safety_check(block + 32, 32, 4, READ, 44);
     mettle_safety_unregister(block);
     free_block(block);
   });
@@ -176,18 +176,18 @@ int main(void) {
    * reject correct programs. */
   CASE("untracked memory", 0, {
     char stack_bytes[64];
-    mettle_safety_check(stack_bytes, 0, 4, READ, "x", 50);
+    mettle_safety_check(stack_bytes, 0, 4, READ, 50);
   });
 
   CASE("null base", 1,
-       { mettle_safety_check(NULL, 0, 4, READ, "p[0]", 51); });
+       { mettle_safety_check(NULL, 0, 4, READ, 51); });
 
   CASE("old pointer after realloc", 1, {
     char *old_block = (char *)aligned_block(64);
     char *new_block = (char *)aligned_block(128);
     mettle_safety_register(old_block, 64);
     mettle_safety_reregister(old_block, new_block, 128);
-    mettle_safety_check(old_block, 0, 4, READ, "p[0]", 60);
+    mettle_safety_check(old_block, 0, 4, READ, 60);
     free_block(old_block);
     free_block(new_block);
   });
@@ -197,7 +197,7 @@ int main(void) {
     char *new_block = (char *)aligned_block(128);
     mettle_safety_register(old_block, 64);
     mettle_safety_reregister(old_block, new_block, 128);
-    mettle_safety_check(new_block, 120, 8, READ, "p[15]", 61);
+    mettle_safety_check(new_block, 120, 8, READ, 61);
     mettle_safety_unregister(new_block);
     free_block(old_block);
     free_block(new_block);
@@ -208,7 +208,7 @@ int main(void) {
     mettle_safety_register(block, 64);
     mettle_safety_unregister(block);
     mettle_safety_register(block, 64);
-    mettle_safety_check(block, 60, 4, READ, "a[15]", 70);
+    mettle_safety_check(block, 60, 4, READ, 70);
     mettle_safety_unregister(block);
     free_block(block);
   });
@@ -224,7 +224,7 @@ int main(void) {
     char *block = (char *)aligned_block(64);
     for (int round = 0; round < 100000; round++) {
       mettle_safety_register(block, 64);
-      mettle_safety_check(block, 0, 4, READ, "a[0]", 71);
+      mettle_safety_check(block, 0, 4, READ, 71);
       mettle_safety_unregister(block);
     }
     free_block(block);
@@ -248,9 +248,9 @@ int main(void) {
     size_t size = 4u * 1024u * 1024u;
     char *block = (char *)aligned_block(size);
     mettle_safety_register(block, size);
-    mettle_safety_check(block, 0, 8, READ, "a[0]", 80);
-    mettle_safety_check(block, (int64_t)size - 8, 8, READ, "a[last]", 81);
-    mettle_safety_check(block + size / 2, 0, 8, READ, "mid", 82);
+    mettle_safety_check(block, 0, 8, READ, 80);
+    mettle_safety_check(block, (int64_t)size - 8, 8, READ, 81);
+    mettle_safety_check(block + size / 2, 0, 8, READ, 82);
     mettle_safety_unregister(block);
     free_block(block);
   });
@@ -259,7 +259,7 @@ int main(void) {
     size_t size = 4u * 1024u * 1024u;
     char *block = (char *)aligned_block(size);
     mettle_safety_register(block, size);
-    mettle_safety_check(block, (int64_t)size, 1, READ, "a[n]", 83);
+    mettle_safety_check(block, (int64_t)size, 1, READ, 83);
     mettle_safety_unregister(block);
     free_block(block);
   });
@@ -269,7 +269,7 @@ int main(void) {
   CASE("unaligned size tail", 1, {
     char *block = (char *)aligned_block(48);
     mettle_safety_register(block, 20);
-    mettle_safety_check(block, 20, 1, READ, "a[20]", 90);
+    mettle_safety_check(block, 20, 1, READ, 90);
     mettle_safety_unregister(block);
     free_block(block);
   });
