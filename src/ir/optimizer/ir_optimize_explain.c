@@ -287,6 +287,7 @@ static MTLC_THREAD_LOCAL int g_safety_have_totals = 0;
 static MTLC_THREAD_LOCAL char *g_safety_focus = NULL;
 static MTLC_THREAD_LOCAL size_t g_safety_emitted = 0;
 static MTLC_THREAD_LOCAL size_t g_safety_proved = 0;
+static MTLC_THREAD_LOCAL size_t g_safety_hoisted = 0;
 static MTLC_THREAD_LOCAL size_t g_safety_exempt = 0;
 static MTLC_THREAD_LOCAL size_t g_safety_extent_tests = 0;
 static MTLC_THREAD_LOCAL size_t g_safety_region_calls = 0;
@@ -420,14 +421,16 @@ void ir_explain_safety_note(const char *file, size_t line,
   note->kind = (int)kind;
 }
 
-void ir_explain_safety_totals(size_t emitted, size_t proved, size_t exempt,
-                              size_t extent_tests, size_t region_calls) {
+void ir_explain_safety_totals(size_t emitted, size_t proved, size_t hoisted,
+                              size_t exempt, size_t extent_tests,
+                              size_t region_calls) {
   if (!g_safety_collect) {
     return;
   }
   g_safety_have_totals = 1;
   g_safety_emitted = emitted;
   g_safety_proved = proved;
+  g_safety_hoisted = hoisted;
   g_safety_exempt = exempt;
   g_safety_extent_tests = extent_tests;
   g_safety_region_calls = region_calls;
@@ -2271,10 +2274,12 @@ static void ir_explain_safety_flush(void) {
     ir_explain_json_raw("\"safety\":{\"enabled\":%s",
                         g_safety_have_totals ? "true" : "false");
     if (g_safety_have_totals) {
-      ir_explain_json_raw(",\"accesses\":%zu,\"proved\":%zu,\"exempt\":%zu"
-                          ",\"extentTests\":%zu,\"regionCalls\":%zu",
-                          g_safety_emitted, g_safety_proved, g_safety_exempt,
-                          g_safety_extent_tests, g_safety_region_calls);
+      ir_explain_json_raw(",\"accesses\":%zu,\"proved\":%zu,\"hoisted\":%zu"
+                          ",\"exempt\":%zu,\"extentTests\":%zu"
+                          ",\"regionCalls\":%zu",
+                          g_safety_emitted, g_safety_proved, g_safety_hoisted,
+                          g_safety_exempt, g_safety_extent_tests,
+                          g_safety_region_calls);
     }
     ir_explain_json_raw(",\"survivors\":[");
     for (size_t i = 0; i < g_safety_count; i++) {
@@ -2300,11 +2305,15 @@ static void ir_explain_safety_flush(void) {
   }
 
   size_t survivors = g_safety_extent_tests + g_safety_region_calls;
-  ir_explain_emit("  %zu access%s checked, %zu proved safe at compile time"
-                  " (%zu%%), %zu still checked at run time\n",
-                  g_safety_emitted, g_safety_emitted == 1 ? "" : "es",
-                  g_safety_proved,
-                  (g_safety_proved * 100) / g_safety_emitted, survivors);
+  size_t settled = g_safety_proved + g_safety_hoisted;
+  ir_explain_emit("  %zu access%s, %zu settled at compile time (%zu%%), "
+                  "%zu checked at run time\n",
+                  g_safety_emitted, g_safety_emitted == 1 ? "" : "es", settled,
+                  (settled * 100) / g_safety_emitted, survivors);
+  ir_explain_emit("  %s%zu proved in place, %zu folded into a check covering "
+                  "a whole loop%s\n",
+                  clr(EXPLAIN_DIM), g_safety_proved, g_safety_hoisted,
+                  clr(EXPLAIN_RESET));
   if (g_safety_exempt > 0) {
     ir_explain_emit("  %s%zu inside the allocator, which is not checked%s\n",
                     clr(EXPLAIN_DIM), g_safety_exempt, clr(EXPLAIN_RESET));

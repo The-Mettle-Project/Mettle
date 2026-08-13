@@ -35,8 +35,12 @@ void ir_explain_safety_note(const char *file, size_t line,
                             const char *function_name,
                             IRSafetySurvivorKind kind);
 
-/* Record the totals for the whole program. Called once, after the pass. */
-void ir_explain_safety_totals(size_t emitted, size_t proved, size_t exempt,
-                              size_t extent_tests, size_t region_calls);
+/* Record the totals for the whole program. Called once, after the pass. Every
+ * access lowering marked ends up in exactly one of these, so they must add up:
+ * a summary that quietly drops an outcome is worse than none, because the
+ * arithmetic looks wrong and the reader cannot tell which number to trust. */
+void ir_explain_safety_totals(size_t emitted, size_t proved, size_t hoisted,
+                              size_t exempt, size_t extent_tests,
+                              size_t region_calls);
 
 #endif /* IR_EXPLAIN_SAFETY_H */

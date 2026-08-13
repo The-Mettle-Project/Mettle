@@ -46,13 +46,13 @@ through.
 Measured against the same programs built without the flag, best of nine,
 interleaved:
 
-| Benchmark | Overhead | Accesses | Proved or hoisted | Still checked |
+| Benchmark | Overhead | Accesses | Settled at compile time | Checked at run time |
 |---|---|---|---|---|
-| dot_product | 1.04x | 34 | 8 | 26 |
-| crc32 | 1.84x | 31 | 4 | 27 |
-| binary_search | 2.26x | 33 | 5 | 28 |
+| dot_product | 1.01x | 34 | 8 | 26 |
+| crc32 | 1.80x | 31 | 4 | 27 |
+| binary_search | 2.28x | 33 | 5 | 28 |
 | base64_encode | 3.18x | 57 | 15 | 42 |
-| heapsort | 15.0x | 54 | 16 | 38 |
+| heapsort | 15.3x | 54 | 16 | 38 |
 
 The spread is the whole story, and heapsort is the honest end of it. Its inner
 loop indexes by values that come out of comparisons, so nothing in the program
@@ -70,12 +70,16 @@ merely expensive, they block the kernel that does the work.
 
 ```
 -- memory safety: base64_encode.mettle ----------
-  57 accesses checked, 4 proved safe at compile time (7%), 42 still checked at run time
-  0 compare against a known extent, 42 ask the runtime which allocation the pointer came from
-  line 20 in base64_encode: the object's size is not known here, so the runtime
+  57 accesses, 15 settled at compile time (26%), 42 checked at run time
+  4 proved in place, 11 folded into a check covering a whole loop
+  3 compare against a known extent, 39 ask the runtime which allocation the pointer came from
+  line 30 in base64_encode: the object's size is not known here, so the runtime
   is asked which allocation the pointer came from
-      20 | dst[o] = alpha[(b0 >> 2) & 63];
+      30 | var c0: int32 = (int32)(uint8)src[i];
 ```
+
+Every access lands in exactly one of those buckets and they add up, so a run
+that looks wrong can be read rather than guessed at.
 
 `METTLE_SAFETY_TRACE=1` prints why each proof gave up, which from the outside
 is otherwise indistinguishable from a limit of the analysis.
