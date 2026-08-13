@@ -1,0 +1,38 @@
+// Anti-rot: a loop shape a vectorizer claims, walked past the end.
+//
+// A recognizer scans a loop body for the pattern it knows and ignores the
+// rest, then replaces the whole body. If it claims a body holding a --safe
+// check, the check is erased with it and the program runs unchecked in exactly
+// the hot loop the mode exists to cover. Nothing else notices, which is why
+// this is a test and not a comment.
+//
+// The correct outcome is a trap: the loop stays scalar and checked. Getting it
+// vectorized is the elision pass's job, by proving the check away first.
+import "std/io";
+import "std/mem";
+
+fn dot(a: int32*, b: int32*, n: int64) -> int64 {
+  var sum: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    sum = sum + (int64)a[i] * (int64)b[i];
+    i = i + 1;
+  }
+  return sum;
+}
+
+fn main() -> int32 {
+  var n: int64 = 64;
+  var a: int32* = (int32*)malloc(n * 4);
+  var b: int32* = (int32*)malloc(n * 4);
+  var i: int64 = 0;
+  while (i < n) {
+    a[i] = 1;
+    b[i] = 1;
+    i = i + 1;
+  }
+
+  var s: int64 = dot(a, b, n + 64);
+  println_int(s);
+  return (int32)(s % 128);
+}

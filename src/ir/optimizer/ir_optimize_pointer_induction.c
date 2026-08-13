@@ -1,4 +1,4 @@
-#include "ir_optimize_internal.h"
+﻿#include "ir_optimize_internal.h"
 
 /* ---- recovered optimizer passes ---- */
 int ir_instruction_insert_move(IRFunction *function, size_t index,
@@ -432,7 +432,7 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
     return 1;
   }
 
-  if (ir_loop_body_has_nested_while(function, body_start, body_end)) {
+  if (ir_loop_body_is_unclaimable(function, body_start, body_end)) {
     return 1;
   }
 
@@ -481,7 +481,7 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
   }
 
   /* Set when an iv-indexed access cannot be converted to a pointer-walk (its
-   * base is not an i32 ptr param — e.g. a local pointer like (int32*)&G[off]).
+   * base is not an i32 ptr param â€” e.g. a local pointer like (int32*)&G[off]).
    * Such an access keeps the induction variable (and its `iv << 2` byte-offset
    * shift) live, but the transform unconditionally drops the iv increment and
    * shift. Half-converting would leave the surviving access referencing a

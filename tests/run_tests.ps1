@@ -2523,6 +2523,52 @@ catch {
 }
 
 
+# --safe against the vectorizers, which is where the mode is easiest to lose
+# silently. A recognizer scans a loop body for the pattern it knows, ignores
+# what it does not, and then replaces the whole body; one that claims a body
+# holding a check erases the check with it, and the program runs unchecked in
+# exactly the hot loop the mode exists to cover. Nothing warns.
+#
+# One fixture per recognizer family, each overrunning a heap block inside a
+# loop that shape would otherwise claim. All must trap at --release with the
+# vectorizers on, and none may trap without --safe. A new recognizer that
+# forgets to check whether the body is claimable fails here.
+$total++
+try {
+  $shapes = @("test_safe_vec_dot", "test_safe_vec_sum", "test_safe_vec_fill",
+              "test_safe_vec_map")
+  foreach ($shape in $shapes) {
+    $safeExe = Join-Path $tmpDir "$shape.safe.exe"
+    & $CompilerPath --build --safe --release "tests\$shape.mettle" -o $safeExe 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "--safe build of $shape failed"
+    }
+    $safeOut = & $safeExe 2>&1 | Out-String
+    if ($LASTEXITCODE -eq 0) {
+      throw "$shape ran to completion under --safe --release; a recognizer claimed the loop body and erased the check"
+    }
+    if ($safeOut -notmatch "outside its allocation") {
+      throw "$shape trapped for the wrong reason:`n$safeOut"
+    }
+
+    $baseExe = Join-Path $tmpDir "$shape.base.exe"
+    & $CompilerPath --build --release "tests\$shape.mettle" -o $baseExe 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "baseline build of $shape failed"
+    }
+    $baseOut = & $baseExe 2>&1 | Out-String
+    if ($baseOut -match "outside its allocation") {
+      throw "$shape trapped without --safe, so the case proves nothing about the check"
+    }
+  }
+  Write-CaseResult -Name "safe_mode_vectorizer_keeps_checks" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "safe_mode_vectorizer_keeps_checks" -Passed $false -Reason $_.Exception.Message
+}
+
+
 # Native heap: build with --native-heap and confirm new/malloc/calloc/realloc/
 # free route through std/alloc's Mettle allocator (mettle_heap_*), stay correct
 # at runtime, and do NOT emit the Win32 HeapAlloc/calloc path for `new`.

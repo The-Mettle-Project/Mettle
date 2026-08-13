@@ -1,0 +1,28 @@
+// Anti-rot for the elementwise-map recognizers, which claim a load, arithmetic
+// and store loop. See test_safe_vec_dot.mettle for what this class of test is
+// guarding against.
+import "std/io";
+import "std/mem";
+
+fn scale(dst: int32*, src: int32*, n: int64) {
+  var i: int64 = 0;
+  while (i < n) {
+    dst[i] = src[i] * 3;
+    i = i + 1;
+  }
+}
+
+fn main() -> int32 {
+  var n: int64 = 64;
+  var dst: int32* = (int32*)malloc(n * 4);
+  var src: int32* = (int32*)malloc(n * 4);
+  var i: int64 = 0;
+  while (i < n) {
+    src[i] = 2;
+    i = i + 1;
+  }
+
+  scale(dst, src, n + 64);
+  println_int((int64)dst[0]);
+  return (int32)dst[0];
+}

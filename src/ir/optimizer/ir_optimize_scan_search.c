@@ -1,4 +1,4 @@
-#include "ir_optimize_internal.h"
+﻿#include "ir_optimize_internal.h"
 
 static int ir_make_simd_minmax_i32(IRInstruction *out, SourceLocation location,
                                    const char *minv_symbol,
@@ -89,7 +89,7 @@ static int ir_try_fuse_lower_bound_i32_at(IRFunction *function,
       exit_label_index <= bounds.branch_index) {
     return 1;
   }
-  if (ir_loop_body_has_nested_while(function, bounds.branch_index + 1,
+  if (ir_loop_body_is_unclaimable(function, bounds.branch_index + 1,
                                     exit_label_index)) {
     return 1;
   }
@@ -389,7 +389,7 @@ static int ir_try_vectorize_simd_minmax_i32_at(IRFunction *function,
   if (!function || !ir_find_while_loop_bounds(function, header_index, &bounds)) {
     return 1;
   }
-  if (ir_loop_body_has_nested_while(function, bounds.branch_index + 1,
+  if (ir_loop_body_is_unclaimable(function, bounds.branch_index + 1,
                                     bounds.jump_index)) {
     return 1;
   }
@@ -508,7 +508,7 @@ static int ir_try_fuse_prefix_sum_i32_at(IRFunction *function,
   if (!function || !ir_find_while_loop_bounds(function, header_index, &bounds)) {
     return 1;
   }
-  if (ir_loop_body_has_nested_while(function, bounds.branch_index + 1,
+  if (ir_loop_body_is_unclaimable(function, bounds.branch_index + 1,
                                     bounds.jump_index)) {
     return 1;
   }
@@ -686,7 +686,7 @@ static int ir_try_vectorize_simd_minmax_ptr_at(IRFunction *function,
   if (!function || !ir_find_while_loop_bounds(function, header_index, &bounds)) {
     return 1;
   }
-  if (ir_loop_body_has_nested_while(function, bounds.branch_index + 1,
+  if (ir_loop_body_is_unclaimable(function, bounds.branch_index + 1,
                                     bounds.jump_index)) {
     return 1;
   }
@@ -749,7 +749,7 @@ static int ir_try_fuse_prefix_sum_ptr_at(IRFunction *function,
   if (!function || !ir_find_while_loop_bounds(function, header_index, &bounds)) {
     return 1;
   }
-  if (ir_loop_body_has_nested_while(function, bounds.branch_index + 1,
+  if (ir_loop_body_is_unclaimable(function, bounds.branch_index + 1,
                                     bounds.jump_index)) {
     return 1;
   }
@@ -993,7 +993,7 @@ static int ir_try_vectorize_dot_i32_at(IRFunction *function, size_t header_index
     return 1; /* threaded exit: fusing would delete the exit edge */
   }
 
-  if (ir_loop_body_has_nested_while(function, branch_index + 1, jump_index)) {
+  if (ir_loop_body_is_unclaimable(function, branch_index + 1, jump_index)) {
     ir_operand_destroy(&len);
     return 1;
   }
@@ -1167,7 +1167,7 @@ static int ir_try_vectorize_dot_i8_at(IRFunction *function, size_t header_index,
     ir_operand_destroy(&len);
     return 1; /* threaded exit: fusing would delete the exit edge */
   }
-  if (ir_loop_body_has_nested_while(function, branch_index + 1, jump_index)) {
+  if (ir_loop_body_is_unclaimable(function, branch_index + 1, jump_index)) {
     ir_operand_destroy(&len);
     return 1;
   }
@@ -1739,7 +1739,7 @@ static int ir_try_vectorize_slp_mac_i32_at(IRFunction *function,
     }
   }
   if (jump_index == (size_t)-1 ||
-      ir_loop_body_has_nested_while(function, branch_index + 1, jump_index)) {
+      ir_loop_body_is_unclaimable(function, branch_index + 1, jump_index)) {
     return 1;
   }
   if (!ir_fused_loop_exit_is_adjacent(function, jump_index, branch->text)) {
@@ -2132,7 +2132,7 @@ static int ir_try_vectorize_slp_mac_i8_at(IRFunction *function,
     }
   }
   if (jump_index == (size_t)-1 ||
-      ir_loop_body_has_nested_while(function, branch_index + 1, jump_index)) {
+      ir_loop_body_is_unclaimable(function, branch_index + 1, jump_index)) {
     return 1;
   }
   if (!ir_fused_loop_exit_is_adjacent(function, jump_index, branch->text)) {
@@ -2404,7 +2404,7 @@ static int ir_try_vectorize_exp_f32_at(IRFunction *function, size_t header_index
     }
   }
   if (jump_index == (size_t)-1 ||
-      ir_loop_body_has_nested_while(function, branch_index + 1, jump_index)) {
+      ir_loop_body_is_unclaimable(function, branch_index + 1, jump_index)) {
     return 1;
   }
   if (!ir_fused_loop_exit_is_adjacent(function, jump_index, branch->text)) {
@@ -2572,7 +2572,7 @@ static int ir_try_vectorize_silu_f32_at(IRFunction *function,
     }
   }
   if (jump_index == (size_t)-1 ||
-      ir_loop_body_has_nested_while(function, branch_index + 1, jump_index)) {
+      ir_loop_body_is_unclaimable(function, branch_index + 1, jump_index)) {
     return 1;
   }
   if (!ir_fused_loop_exit_is_adjacent(function, jump_index, branch->text)) {

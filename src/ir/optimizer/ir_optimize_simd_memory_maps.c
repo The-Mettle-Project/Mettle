@@ -1,4 +1,4 @@
-#include "ir_optimize_internal.h"
+﻿#include "ir_optimize_internal.h"
 
 int ir_find_while_loop_bounds(IRFunction *function, size_t header_index,
                                      IRWhileLoopBounds *out) {
@@ -400,7 +400,7 @@ static int ir_try_vectorize_simd_scale_i32_at(IRFunction *function,
   if (!function || !ir_find_while_loop_bounds(function, header_index, &bounds)) {
     return 1;
   }
-  if (ir_loop_body_has_nested_while(function, bounds.branch_index + 1,
+  if (ir_loop_body_is_unclaimable(function, bounds.branch_index + 1,
                                     bounds.jump_index)) {
     return 1;
   }
@@ -528,7 +528,7 @@ static int ir_try_vectorize_simd_reverse_copy_i32_at(IRFunction *function,
   if (!function || !ir_find_while_loop_bounds(function, header_index, &bounds)) {
     return 1;
   }
-  if (ir_loop_body_has_nested_while(function, bounds.branch_index + 1,
+  if (ir_loop_body_is_unclaimable(function, bounds.branch_index + 1,
                                     bounds.jump_index)) {
     return 1;
   }
@@ -781,7 +781,7 @@ static int ir_try_vectorize_simd_clamp_i32_at(IRFunction *function,
   if (!function || !ir_find_while_loop_bounds(function, header_index, &bounds)) {
     return 1;
   }
-  if (ir_loop_body_has_nested_while(function, bounds.branch_index + 1,
+  if (ir_loop_body_is_unclaimable(function, bounds.branch_index + 1,
                                     bounds.jump_index)) {
     return 1;
   }
@@ -951,7 +951,7 @@ static int ir_try_vectorize_simd_clamp_ptr_at(IRFunction *function,
   if (!function || !ir_find_while_loop_bounds(function, header_index, &bounds)) {
     return 1;
   }
-  if (ir_loop_body_has_nested_while(function, bounds.branch_index + 1,
+  if (ir_loop_body_is_unclaimable(function, bounds.branch_index + 1,
                                     bounds.jump_index)) {
     return 1;
   }

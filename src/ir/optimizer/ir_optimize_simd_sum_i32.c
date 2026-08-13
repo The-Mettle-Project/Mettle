@@ -1,4 +1,4 @@
-#include "ir_optimize_internal.h"
+﻿#include "ir_optimize_internal.h"
 
 /* -------------------------------------------------------------------------- */
 /* int32 array horizontal sum -> IR_OP_SIMD_SUM_I32                           */
@@ -112,8 +112,23 @@ int ir_fused_loop_exit_is_adjacent(const IRFunction *function,
   return 0;
 }
 
-int ir_loop_body_has_nested_while(IRFunction *function, size_t start,
-                                         size_t end) {
+int ir_range_has_safety_call(const IRFunction *function, size_t start,
+                                    size_t end) {
+  if (!function) {
+    return 0;
+  }
+  for (size_t i = start; i < end && i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_CALL && ins->text &&
+        strncmp(ins->text, "mettle_safety_", 14) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+int ir_loop_body_is_unclaimable(IRFunction *function, size_t start,
+                                       size_t end) {
   if (!function) {
     return 0;
   }
@@ -125,7 +140,7 @@ int ir_loop_body_has_nested_while(IRFunction *function, size_t start,
     }
   }
 
-  return 0;
+  return ir_range_has_safety_call(function, start, end);
 }
 
 /* True if the reduction accumulator `sym` is declared int64 (a local). Used to
@@ -208,7 +223,7 @@ static int ir_try_vectorize_sum_i32_at(IRFunction *function, size_t header_index
     return 1; /* threaded exit: fusing would delete the exit edge */
   }
 
-  if (ir_loop_body_has_nested_while(function, branch_index + 1, jump_index)) {
+  if (ir_loop_body_is_unclaimable(function, branch_index + 1, jump_index)) {
     return 1;
   }
 
@@ -540,7 +555,7 @@ static int ir_try_vectorize_sum_u8_at(IRFunction *function, size_t header_index,
     return 1; /* threaded exit: fusing would delete the exit edge */
   }
 
-  if (ir_loop_body_has_nested_while(function, branch_index + 1, jump_index)) {
+  if (ir_loop_body_is_unclaimable(function, branch_index + 1, jump_index)) {
     return 1;
   }
 
@@ -761,7 +776,7 @@ static int ir_try_vectorize_byte_map_at(IRFunction *function,
     }
   }
   if (jump_index == (size_t)-1 ||
-      ir_loop_body_has_nested_while(function, branch_index + 1, jump_index)) {
+      ir_loop_body_is_unclaimable(function, branch_index + 1, jump_index)) {
     return 1;
   }
   if (!ir_fused_loop_exit_is_adjacent(function, jump_index, exit_label)) {
@@ -967,7 +982,7 @@ static int ir_try_vectorize_lcg_at(IRFunction *function, size_t header_index,
     }
   }
   if (jump_index == (size_t)-1 ||
-      ir_loop_body_has_nested_while(function, branch_index + 1, jump_index)) {
+      ir_loop_body_is_unclaimable(function, branch_index + 1, jump_index)) {
     return 1;
   }
   if (!ir_fused_loop_exit_is_adjacent(function, jump_index, branch->text)) {

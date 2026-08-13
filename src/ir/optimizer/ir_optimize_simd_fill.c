@@ -1,4 +1,4 @@
-#include "ir_optimize_internal.h"
+﻿#include "ir_optimize_internal.h"
 
 /* -------------------------------------------------------------------------- */
 /* Invariant fill -> IR_OP_SIMD_FILL (the memset / frame-clear class)          */
@@ -254,7 +254,7 @@ static int ir_fill_frame(IRFunction *function, size_t header_index,
     }
   }
   if (jump_index == (size_t)-1 ||
-      ir_loop_body_has_nested_while(function, branch_index + 1, jump_index)) {
+      ir_loop_body_is_unclaimable(function, branch_index + 1, jump_index)) {
     return 1;
   }
   if (!ir_fused_loop_exit_is_adjacent(function, jump_index, branch->text)) {

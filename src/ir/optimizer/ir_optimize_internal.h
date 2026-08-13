@@ -463,8 +463,28 @@ int ir_label_value_map_merge_incoming(IRLabelValueMap *map,
                                              const char *label,
                                              const IRTempValueMap *incoming,
                                              int *changed);
-int ir_loop_body_has_nested_while(IRFunction *function, size_t start,
-                                         size_t end);
+/* Whether a loop body is off limits to a recognizer that would replace it
+ * wholesale. Two reasons, and both mean the same thing: the instructions in
+ * this range are not all accounted for by the shape being matched.
+ *
+ * A nested loop is the long-standing one. A --safe check is the other, and it
+ * matters more, because a recognizer that matched anyway would erase the check
+ * along with the body and leave the program unchecked in exactly the hot loop
+ * the mode exists to cover. Recognizers scan for the pattern they know and
+ * ignore what they do not, so nothing else would notice.
+ *
+ * Bailing here is the correct outcome, not a missed opportunity: the loop runs
+ * scalar and checked. Getting it vectorized is the elision pass's job, by
+ * proving the check away first, which leaves a body with nothing in it to
+ * drop. */
+int ir_loop_body_is_unclaimable(IRFunction *function, size_t start,
+                                       size_t end);
+
+/* Whether any instruction in [start, end) is --safe bookkeeping: the access
+ * check itself, or the calls that tell the runtime where the heap is. Erasing
+ * or reordering any of them changes what the program checks. */
+int ir_range_has_safety_call(const IRFunction *function, size_t start,
+                                    size_t end);
 int ir_loop_body_opcode_is_unroll_safe(IROpcode op);
 int ir_lower_bound_i32_pass(IRFunction *function, int *changed);
 int ir_unroll_annotated_loops_pass(IRFunction *function, int *changed);
