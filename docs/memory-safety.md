@@ -161,6 +161,17 @@ reads as unowned and is allowed through. A foreign library's pointer is not
 something the runtime can judge, and trapping on it would reject correct
 programs, which is the one thing this design refuses to do.
 
+**A pointer walked clear of every allocation.** This is the same rule biting a
+pointer that did start out valid. `p = p + n` far enough, and `p` no longer
+lands inside anything the runtime knows, so the access reads as untracked
+rather than as an overrun. What carries provenance here is the pointer's
+value, and a value outside every live region carries none: the runtime cannot
+tell which allocation it should have belonged to. Indexing (`p[i]`) is
+unaffected, since the base is still the pointer the allocation handed out and
+only the displacement moves. Catching the walked-off case needs bounds
+travelling with the pointer, which is the fat-pointer design this one avoids
+in order to leave the ABI alone.
+
 **Pointers into stack locals.** Globals are described to the runtime once at
 the top of `main`, so a pointer taken into one is checked wherever it is
 carried. Stack objects are not, because avoiding two of them sharing a

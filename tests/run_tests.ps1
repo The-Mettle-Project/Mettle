@@ -2567,6 +2567,59 @@ catch {
 }
 
 
+# --safe must not change what a correct program computes and must not reject
+# one. Real programs are what tests that: the fixtures above are written to
+# exercise a mechanism, while these were written to sort and encode and
+# multiply, and between them cover the shapes the elision reasons about
+# (a vectorized reduction, two counters at different rates, data-dependent
+# indices, a table lookup, a pointer walked along an array, a bound computed
+# from other values).
+#
+# Running the full examples directory this way found both bugs the mechanism
+# tests missed: a hoisted check naming a bound the loop header had not computed
+# yet, and a benchmark that was already walking off its array four elements at
+# a time.
+$total++
+try {
+  $corpus = @("dot_product", "base64_encode", "heapsort", "crc32",
+              "binary_search", "sort_insertion", "transpose", "aos_sum")
+  foreach ($name in $corpus) {
+    $src = "examples\$name\$name.mettle"
+    if (-not (Test-Path $src)) { continue }
+
+    $baseExe = Join-Path $tmpDir "corpus_$name.base.exe"
+    $safeExe = Join-Path $tmpDir "corpus_$name.safe.exe"
+    & $CompilerPath --build --release $src -o $baseExe 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "baseline build of $name failed"
+    }
+    & $CompilerPath --build --release --safe $src -o $safeExe 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "--safe build of $name failed"
+    }
+
+    $baseOut = & $baseExe 2>&1 | Out-String
+    $baseCode = $LASTEXITCODE
+    $safeOut = & $safeExe 2>&1 | Out-String
+    $safeCode = $LASTEXITCODE
+    if ($baseCode -ne $safeCode) {
+      throw "$name exited $baseCode without --safe and $safeCode with it:`n$safeOut"
+    }
+    # Timings differ run to run; everything else must match exactly.
+    $strippedBase = ($baseOut -replace "\d+\s*(us|ms|ns)", "T") -replace "\s+", " "
+    $strippedSafe = ($safeOut -replace "\d+\s*(us|ms|ns)", "T") -replace "\s+", " "
+    if ($strippedBase -ne $strippedSafe) {
+      throw "$name printed different output under --safe:`nwithout: $strippedBase`nwith:    $strippedSafe"
+    }
+  }
+  Write-CaseResult -Name "safe_mode_corpus_unchanged" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "safe_mode_corpus_unchanged" -Passed $false -Reason $_.Exception.Message
+}
+
+
 # --safe against the vectorizers, which is where the mode is easiest to lose
 # silently. A recognizer scans a loop body for the pattern it knows, ignores
 # what it does not, and then replaces the whole body; one that claims a body

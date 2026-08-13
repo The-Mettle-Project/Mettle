@@ -893,18 +893,19 @@ static int safety_try_hoist(IRFunction *function, size_t check_index,
                    access->location.line);
       return 0;
     }
-    if (!safety_operand_invariant_in(function, form.bounds.branch_index + 1,
-                                     form.bounds.jump_index, access->base) ||
-        !safety_operand_invariant_in(function, form.bounds.branch_index + 1,
-                                     form.bounds.jump_index, form.bound)) {
-      safety_trace("the pointer or the loop bound changes inside the loop",
-                   access->location.line);
-      return 0;
-    }
-    /* The hoisted check is emitted in front of the header, so both operands
-     * have to be settled by then. */
+    /* The hoisted check is emitted in front of the header, so both the pointer
+     * and the bound have to be settled by then. Scanning from the header
+     * rather than from the body is what makes that true of the bound: a test
+     * like `while (i < rows * cols)` computes it between the header and the
+     * compare, and a check placed in front of the header would name a value
+     * that does not exist yet. */
     if (!safety_operand_invariant_in(function, header, form.bounds.jump_index,
-                                     access->base)) {
+                                     access->base) ||
+        !safety_operand_invariant_in(function, header, form.bounds.jump_index,
+                                     form.bound)) {
+      safety_trace("the pointer or the loop bound is not settled before the "
+                   "loop starts",
+                   access->location.line);
       return 0;
     }
 

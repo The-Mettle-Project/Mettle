@@ -22,13 +22,13 @@ fn fill_data(data: int32*, seed: int32) {
 
 fn insertion_sort(data: int32*, len: int32) {
   var i: int32 = 1;
-  var cur: int32* = data + 4;
+  var cur: int32* = data + 1;
   while (i < len) {
     var key: int32 = *cur;
     var scan: int32* = cur;
     var j: int32 = i - 1;
     while (j >= 0) {
-      var prev: int32* = scan - 4;
+      var prev: int32* = scan - 1;
       var current: int32 = *prev;
       if (current <= key) {
         break;
@@ -38,7 +38,7 @@ fn insertion_sort(data: int32*, len: int32) {
       j = j - 1;
     }
     *scan = key;
-    cur = cur + 4;
+    cur = cur + 1;
     i = i + 1;
   }
 }
