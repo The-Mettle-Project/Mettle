@@ -27,8 +27,14 @@
  * Memory the program never registers reads as unowned, and an access to it is
  * allowed rather than trapped. Foreign libraries hand back pointers Mettle did
  * not allocate and cannot describe; trapping on them would reject correct
- * programs, which is the one thing this design refuses to do. Coverage is
- * therefore complete for memory Mettle owns and silent elsewhere.
+ * programs, which is the one thing this design refuses to do.
+ *
+ * What the compiler registers today is the heap. Stack locals and globals are
+ * not, so a pointer taken into one and carried elsewhere goes unchecked.
+ * Indexing them directly is fully covered without the map, because their size
+ * is in the program and the check is a comparison against a constant; closing
+ * the rest needs the compiler to align and register them. See
+ * docs/memory-safety.md.
  */
 
 #include <stddef.h>

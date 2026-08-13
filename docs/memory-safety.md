@@ -1,0 +1,200 @@
+# Checked access: `--safe`
+
+Mettle's bounds and null checks exist only in debug builds. `--release` drops
+them, which is why a program that reads past an array there returns whatever
+happened to be in the next words rather than saying so. That is the ordinary
+bargain in a systems language: you can have the checks or you can have the
+speed.
+
+`--safe` refuses the bargain. It checks every memory access at every
+optimization level, and then spends the compiler's effort proving the checks
+away rather than deleting them unproven. The question stops being "can we
+afford to check" and becomes "how much of the checking can we prove is
+unnecessary".
+
+```bash
+mettle --build --release --safe app.mettle -o app.exe
+```
+
+## What it catches
+
+Everything below is caught at `--release`, with the optimizer on:
+
+| | Example |
+|---|---|
+| Reading or writing past an array | `var a: int32[4]; a[i]` where `i` reaches 4 |
+| A negative index | `a[-1]`, including through a computed index |
+| Past the end of a heap block | `p = malloc(16); p[16]` |
+| Use after free | `free(p); p[0]` |
+| Use after free through another pointer | `q = p; free(q); p[0]` |
+| A pointer kept across `realloc` | `q = realloc(p, n); p[0]` |
+| Running off one allocation into the next | `p` and `q` adjacent, `p[distance_to_q]` |
+| A null dereference | `p = 0; p[0]` |
+
+The last two are worth separating out, because they are what an address-only
+check gets wrong.
+
+An access is bounded by *the allocation its pointer came from*, not by whatever
+allocation the computed address happens to land in. So the check is handed the
+base pointer and the displacement separately, and resolves the base. Walking
+off the end of one live block into another live block is still caught, which a
+check that only asked "is this address inside something live" would wave
+through.
+
+## What it costs
+
+Measured against the same programs built without the flag, best of nine,
+interleaved:
+
+| Benchmark | Overhead | Accesses | Proved or hoisted | Still checked |
+|---|---|---|---|---|
+| dot_product | 1.04x | 34 | 8 | 26 |
+| crc32 | 1.84x | 31 | 4 | 27 |
+| binary_search | 2.26x | 33 | 5 | 28 |
+| base64_encode | 3.18x | 57 | 15 | 42 |
+| heapsort | 15.0x | 54 | 16 | 38 |
+
+The spread is the whole story, and heapsort is the honest end of it. Its inner
+loop indexes by values that come out of comparisons, so nothing in the program
+says what they can be, and every access pays a call into the runtime. That is
+the cost of checking code no argument can settle.
+
+At the other end, dot_product is free. Not because its accesses are provable,
+but because a loop walking `a[i]` for `i` in `[0, n)` touches one contiguous
+range, so one check covers what a check per element was covering. What makes
+that matter more than the arithmetic saved: the loop body is then empty of
+calls again, and the vectorizer takes it back. Checks in a hot loop are not
+merely expensive, they block the kernel that does the work.
+
+`--explain` reports where a program sits:
+
+```
+-- memory safety: base64_encode.mettle ----------
+  57 accesses checked, 4 proved safe at compile time (7%), 42 still checked at run time
+  0 compare against a known extent, 42 ask the runtime which allocation the pointer came from
+  line 20 in base64_encode: the object's size is not known here, so the runtime
+  is asked which allocation the pointer came from
+      20 | dst[o] = alpha[(b0 >> 2) & 63];
+```
+
+`METTLE_SAFETY_TRACE=1` prints why each proof gave up, which from the outside
+is otherwise indistinguishable from a limit of the analysis.
+
+## How the checks go away
+
+Five arguments, tried in order. Each is a claim that the access can never leave
+its object, and a wrong claim is a miscompile that reads as a safe program, so
+anything that cannot be pinned down exactly leaves the check alone.
+
+**A constant index.** `a[3]` against a fixed-size object. This needs a short
+walk back through the instructions, because lowering scales every subscript
+through a multiply into a temporary, so even `a[3]` arrives as a temporary
+rather than as the twelve it obviously is.
+
+**A counted loop over a fixed-size object.** `for i in 0..8` over `int32[8]`
+reaches at most offset 28, and the object is 32 bytes. The index has to start
+at zero and step by a constant, nothing else in the body may move it, and the
+bound has to be a constant.
+
+**An index its own arithmetic bounds.** `alpha[(bits >> 2) & 63]` cannot leave
+`[0, 63]` whatever `bits` holds, because a non-negative mask clears every
+higher bit including the sign. That is the shape of every table lookup.
+
+**One check for a loop's whole range.** Where the object's size is not known,
+a counted loop still touches one contiguous range, so the per-element checks
+become a single check in front of the loop. The range must be exactly what the
+loop touches: too large accuses a correct program, too small misses a real
+overrun. That is why the body has to be straight line, since a conditional
+access touches a subset, and why it must contain no calls, since one of them
+could free the block partway through.
+
+The loop shapes this reads are wider than the simplest one. The test may carry
+arithmetic (`while (i + 3 <= len)`), the index may step by more than one, and
+the variable an access indexes by need not be the one the test bounds: a loop
+reading three bytes and writing four advances two counters, and the second is
+pinned to the first by both starting at zero and both stepping by a constant.
+
+**One check for a bounded index.** A masked index reaches the same range every
+iteration, so where the object's size is unknown the check still lifts out of
+the loop, with a constant length.
+
+## The shape of the implementation
+
+The compiler marks every access during lowering and resolves the marks
+immediately afterwards, before the optimizer runs. Nothing downstream ever sees
+a safety opcode: the optimizer, the interpreter and all three code generators
+work on ordinary IR.
+
+Running before the optimizer is deliberate. Loops still have the canonical
+shape the bound proofs read most easily, and a foreign opcode drifting through
+a pass schedule full of exact-shape recognizers would be silently mishandled.
+The cost is that a check which would become provable only after inlining stays.
+
+There is a related hazard worth naming, because it bit during development. A
+loop recognizer scans a body for the pattern it knows, ignores what it does
+not, and then replaces the whole body. Handed a loop containing a check, it
+matched anyway and erased the check along with everything else, so the mode was
+silently absent in exactly the hot loops it exists to cover. Recognizers now
+refuse a body holding safety bookkeeping, and one fixture per recognizer family
+holds them to it.
+
+At run time, a map from address to owning allocation answers what survives. It
+is a three-level table over the address space holding one region id per
+16-byte granule, and ids index descriptors carrying each allocation's start and
+length. Freeing does not clear the granules; it marks the descriptor dead and
+leaves them naming it, which is what lets a pointer kept across the free be
+reported as use-after-free rather than read back as untracked memory. The
+descriptor is reclaimed once a later allocation has taken every granule it
+held.
+
+Pointers stay ordinary machine pointers. The ABI, struct layouts and every
+foreign call are exactly as they were.
+
+## What it does not catch
+
+**Memory Mettle did not allocate.** Anything the runtime was never told about
+reads as unowned and is allowed through. A foreign library's pointer is not
+something the runtime can judge, and trapping on it would reject correct
+programs, which is the one thing this design refuses to do.
+
+**Pointers into stack locals and globals.** These are registered nowhere, so
+they fall under the rule above. Indexing such an object directly is fully
+checked, since its size is right there in the program and the check is a
+comparison against a constant; it is only a pointer taken into one and carried
+elsewhere that goes unchecked. Closing this needs the compiler to align and
+register those objects, which is not done yet.
+
+**The allocator itself.** An allocator writes a header below the pointer it
+returns, threads its free list through the bodies of released blocks, and
+poisons them on the way out. Against the model those read as an overrun and a
+use-after-free, and they are neither, so the module defining the heap entry
+points is not checked and calls into it are bracketed so work done on its
+behalf is skipped as well.
+
+**Reuse.** Once a freed block has been handed out again, a stale pointer to it
+resolves to the new owner and is bounds-checked against that. No scheme without
+a quarantine can do better, and how long reuse is delayed is the allocator's
+policy rather than the checker's.
+
+**Anything that is not a memory access.** Integer overflow, uninitialized
+reads, and data races are all out of scope. The compile-time memory analyzer
+([docs/borrow-checker.md](borrow-checker.md)) covers some of that ground
+statically and reports leaks, which nothing here does.
+
+## Trying it
+
+```bash
+mettle --build --release --safe tests/test_safe_use_after_free.mettle -o uaf.exe
+./uaf.exe
+```
+
+```
+Fatal error: use of memory after it was freed: 1 bytes at offset 0 of a 16 byte
+allocation (line 10)
+```
+
+The fixtures under `tests/test_safe_*.mettle` cover both directions. Each bad
+program is built with and without the flag, so the trap is shown to come from
+the check rather than from some unrelated change, and each clean program is
+required to return the same answer either way. Several are sized so that a
+range one byte too large would reject them.

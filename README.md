@@ -81,6 +81,14 @@ by `realloc`, at compile time and across function boundaries. You write no
 lifetimes and no ownership markers; it infers everything, and it is built to
 report nothing it cannot prove. See [the borrow analyser](docs/borrow-checker.md).
 
+**Checked access that mostly is not there.** `--safe` checks every memory
+access at every optimization level, then proves the checks away: a constant
+index, a counter the loop already bounds, an index its own arithmetic bounds,
+or one check standing in for a whole loop's range. What is left is reported by
+`--explain`, with a reason per line. A vectorized dot product pays 1.04x; code
+whose indices come out of comparisons pays a good deal more. See
+[checked access](docs/memory-safety.md).
+
 **An optimizer that explains itself.** `--explain` prints what the optimizer did
 to every loop and call, why a loop did or did not vectorize, and what changed
 since your last build. Suggested fixes are simulated before they are printed, so
