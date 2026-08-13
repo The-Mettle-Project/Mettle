@@ -7,6 +7,7 @@
 #include "ir_optimize_internal.h"
 #include "../ir_explain_safety.h"
 #include "../ir_safety.h"
+#include <time.h>
 
 /* Distinct from lowering's ".t%d" temps and from every label prefix the
  * recognizers match on, so a resolved check can never be mistaken for one. */
@@ -15,17 +16,29 @@
 
 static unsigned g_safety_next_id;
 
+static int safety_env_flag(const char *name, int *cache) {
+  if (*cache < 0) {
+    const char *value = getenv(name);
+    *cache = value && value[0] && value[0] != '0';
+  }
+  return *cache;
+}
+
 /* METTLE_SAFETY_TRACE=1 prints why a proof gave up. A check that survives is
  * either a real limit of the analysis or a shape it should have recognized,
  * and from the outside those look identical: both are just a check that is
  * still there. Same purpose as the backend's mir_call_trace. */
 static int safety_trace_enabled(void) {
   static int state = -1;
-  if (state < 0) {
-    const char *value = getenv("METTLE_SAFETY_TRACE");
-    state = value && value[0] && value[0] != '0';
-  }
-  return state;
+  return safety_env_flag("METTLE_SAFETY_TRACE", &state);
+}
+
+/* METTLE_SAFETY_TIME=1 reports how long resolving took. Separate from the
+ * trace because that prints a line per unproven access, which on a large input
+ * costs far more than the work being measured. */
+static int safety_time_enabled(void) {
+  static int state = -1;
+  return safety_env_flag("METTLE_SAFETY_TIME", &state);
 }
 
 static void safety_trace(const char *reason, size_t line) {
@@ -154,6 +167,36 @@ static int safety_emit_call(IRInstructionVector *out, SourceLocation location,
   }
   return 1;
 }
+
+/* What a loop does to its index, read off the header. */
+typedef struct {
+  size_t header_index;
+  IRWhileLoopBounds bounds;
+  const char *iv;
+  long long step;       /* constant, greater than zero */
+  long long adjust;     /* highest index reached is `bound + adjust` */
+  const IROperand *bound;
+  size_t step_first;
+  size_t step_last;
+} SafetyLoopForm;
+
+/* Every loop in the function, in source order, so scanning it backwards finds
+ * the innermost one containing a given instruction first.
+ *
+ * Built once per function because it used to be rebuilt per check: each one
+ * scanned backwards over every preceding instruction hunting for a header, and
+ * parsed each candidate forwards. On one function holding eight thousand
+ * accesses that cost several seconds on its own, and grew faster than the
+ * input did. */
+typedef struct {
+  SafetyLoopForm *items;
+  size_t count;
+  size_t capacity;
+} SafetyLoopList;
+
+/* Innermost loop whose body holds `index`, or NULL. */
+static const SafetyLoopForm *safety_enclosing_loop(const SafetyLoopList *loops,
+                                                  size_t index);
 
 /* ---- proving a check cannot fail ------------------------------------------- */
 /*
@@ -479,7 +522,9 @@ static int safety_loop_step(const IRFunction *function,
  * assumes; nothing else in the body may move it, or the increment is not the
  * whole story; and the bound has to be a constant, or there is no largest
  * offset to compare against. */
-static int safety_prove_loop_bound(IRFunction *function, size_t check_index,
+static int safety_prove_loop_bound(IRFunction *function,
+                                   const SafetyLoopList *loops,
+                                   size_t check_index,
                                    const SafetyAccess *access) {
   if (access->extent == IR_SAFETY_EXTENT_UNKNOWN || access->size <= 0) {
     return 0;
@@ -498,38 +543,33 @@ static int safety_prove_loop_bound(IRFunction *function, size_t check_index,
     return 0; /* the loop's lower bound says nothing about a negative offset */
   }
 
-  /* Innermost enclosing loop stepping this variable. Scanning outward matters:
+  /* Innermost enclosing loop stepping this variable. Working outward matters:
    * a check in a nested loop is indexed by the inner variable, and the outer
    * loop's bound says nothing about it. */
-  for (size_t header = check_index; header-- > 0;) {
-    if (function->instructions[header].op != IR_OP_LABEL ||
-        !ir_label_is_while_header(function->instructions[header].text)) {
-      continue;
-    }
-    IRWhileLoopBounds loop;
-    if (!ir_find_while_loop_bounds(function, header, &loop) ||
-        loop.jump_index == (size_t)-1) {
-      continue;
-    }
-    if (check_index <= loop.branch_index || check_index >= loop.jump_index) {
+  for (size_t i = loops->count; i-- > 0;) {
+    const SafetyLoopForm *loop = &loops->items[i];
+    if (check_index <= loop->bounds.branch_index ||
+        check_index >= loop->bounds.jump_index) {
       continue; /* the check is not in this loop's body */
     }
-
-    const IRInstruction *compare = &function->instructions[loop.compare_index];
-    if (!compare->lhs.name || strcmp(compare->lhs.name, iv) != 0) {
+    if (strcmp(loop->iv, iv) != 0) {
       continue; /* this loop steps a different variable; keep looking outward */
     }
+
     long long bound = 0;
-    if (!safety_constant_value(function, loop.compare_index, &compare->rhs, 0,
-                               &bound)) {
+    if (!safety_constant_value(function, loop->bounds.compare_index,
+                               loop->bound, 0, &bound)) {
       safety_trace("the loop bound is not a constant", access->location.line);
       return 0;
     }
-    if (bound <= 0) {
+    /* `iv <op> bound` becomes `iv <= bound + adjust`, whichever way the test
+     * was spelled. */
+    long long highest_index = bound + loop->adjust;
+    if (highest_index < 0) {
       return 1; /* the body never runs, so the access never happens */
     }
 
-    if (!ir_iv_zero_at_header(function, header, iv)) {
+    if (!ir_iv_zero_at_header(function, loop->header_index, iv)) {
       safety_trace("the loop index does not start at zero",
                    access->location.line);
       return 0;
@@ -537,23 +577,21 @@ static int safety_prove_loop_bound(IRFunction *function, size_t check_index,
     size_t step_first = 0;
     size_t step_last = 0;
     long long step = 0;
-    if (!safety_loop_step(function, &loop, iv, &step, &step_first,
+    if (!safety_loop_step(function, &loop->bounds, iv, &step, &step_first,
                           &step_last)) {
       safety_trace("the loop index does not step by a constant",
                    access->location.line);
       return 0;
     }
-    if (safety_symbol_written_between(function, loop.branch_index + 1,
-                                      loop.jump_index, iv, step_first,
+    if (safety_symbol_written_between(function, loop->bounds.branch_index + 1,
+                                      loop->bounds.jump_index, iv, step_first,
                                       step_last)) {
       safety_trace("the loop index is assigned inside the body",
                    access->location.line);
       return 0;
     }
 
-    /* `iv < bound` stepping from zero tops out at the largest multiple of the
-     * step below bound, which is at most bound - 1 whatever the step is. */
-    long long highest = (bound - 1 + addend) * stride;
+    long long highest = (highest_index + addend) * stride;
     if (highest < 0 || access->size > access->extent) {
       return 0;
     }
@@ -589,10 +627,10 @@ static int safety_prove_masked_index(const IRFunction *function,
   return highest <= access->extent - access->size;
 }
 
-static int safety_prove(IRFunction *function, size_t check_index,
-                        const SafetyAccess *access) {
+static int safety_prove(IRFunction *function, const SafetyLoopList *loops,
+                        size_t check_index, const SafetyAccess *access) {
   return safety_prove_constant(function, check_index, access) ||
-         safety_prove_loop_bound(function, check_index, access) ||
+         safety_prove_loop_bound(function, loops, check_index, access) ||
          safety_prove_masked_index(function, check_index, access);
 }
 
@@ -631,16 +669,6 @@ typedef struct {
   SourceLocation location;
 } SafetyHoist;
 
-/* What a loop does to its index, read off the header. */
-typedef struct {
-  IRWhileLoopBounds bounds;
-  const char *iv;
-  long long step;       /* constant, greater than zero */
-  long long adjust;     /* highest index reached is `bound + adjust` */
-  const IROperand *bound;
-  size_t step_first;
-  size_t step_last;
-} SafetyLoopForm;
 
 /* Read the loop's test and step.
  *
@@ -710,6 +738,7 @@ static int safety_parse_loop_form(const IRFunction *function,
     return 0;
   }
 
+  form->header_index = header_index;
   form->bounds.compare_index = compare_index;
   form->bounds.branch_index = branch_index;
   form->bounds.loop_label = header->text;
@@ -787,8 +816,9 @@ static int safety_body_is_straight_line(const IRFunction *function,
   return 1;
 }
 
-static int safety_try_hoist(IRFunction *function, size_t check_index,
-                            const SafetyAccess *access, SafetyHoist *out) {
+static int safety_try_hoist(IRFunction *function, const SafetyLoopList *loops,
+                            size_t check_index, const SafetyAccess *access,
+                            SafetyHoist *out) {
   if (access->extent != IR_SAFETY_EXTENT_UNKNOWN || access->size <= 0) {
     return 0;
   }
@@ -821,38 +851,30 @@ static int safety_try_hoist(IRFunction *function, size_t check_index,
   }
 
   if (masked) {
-    for (size_t header = check_index; header-- > 0;) {
-      SafetyLoopForm form;
-      if (!safety_parse_loop_form(function, header, &form)) {
-        continue;
-      }
-      if (check_index <= form.bounds.branch_index ||
-          check_index >= form.bounds.jump_index) {
-        continue;
-      }
-      if (!safety_body_is_straight_line(function, &form.bounds) ||
-          !safety_operand_invariant_in(function, header, form.bounds.jump_index,
-                                       access->base)) {
-        return 0;
-      }
-      out->header_index = header;
-      out->constant_length = masked_upper * masked_stride + access->size;
-      out->access_kind = access->access_kind;
-      out->location = access->location;
-      return ir_operand_clone(access->base, &out->base);
+    const SafetyLoopForm *innermost = safety_enclosing_loop(loops, check_index);
+    if (!innermost) {
+      safety_trace("the index is bounded but there is no loop to lift the "
+                   "check out of",
+                   access->location.line);
+      return 0;
     }
-    safety_trace("the index is bounded but there is no loop to lift the check "
-                 "out of",
-                 access->location.line);
-    return 0;
+    if (!safety_body_is_straight_line(function, &innermost->bounds) ||
+        !safety_operand_invariant_in(function, innermost->header_index,
+                                     innermost->bounds.jump_index,
+                                     access->base)) {
+      return 0;
+    }
+    out->header_index = innermost->header_index;
+    out->constant_length = masked_upper * masked_stride + access->size;
+    out->access_kind = access->access_kind;
+    out->location = access->location;
+    return ir_operand_clone(access->base, &out->base);
   }
 
   int saw_loop = 0;
-  for (size_t header = check_index; header-- > 0;) {
-    SafetyLoopForm form;
-    if (!safety_parse_loop_form(function, header, &form)) {
-      continue;
-    }
+  for (size_t loop_index = loops->count; loop_index-- > 0;) {
+    SafetyLoopForm form = loops->items[loop_index];
+    size_t header = form.header_index;
     if (check_index <= form.bounds.branch_index ||
         check_index >= form.bounds.jump_index) {
       continue;
@@ -1192,6 +1214,55 @@ done:
   return ok;
 }
 
+/* ---- the loops, gathered once ----------------------------------------------- */
+
+static const SafetyLoopForm *safety_enclosing_loop(const SafetyLoopList *loops,
+                                                   size_t index) {
+  for (size_t i = loops->count; i-- > 0;) {
+    const SafetyLoopForm *loop = &loops->items[i];
+    if (index > loop->bounds.branch_index && index < loop->bounds.jump_index) {
+      return loop;
+    }
+  }
+  return NULL;
+}
+
+static void safety_loop_list_destroy(SafetyLoopList *loops) {
+  free(loops->items);
+  loops->items = NULL;
+  loops->count = 0;
+  loops->capacity = 0;
+}
+
+/* Source order, so a backward scan meets the innermost enclosing loop first:
+ * an inner loop's header comes after its outer loop's. */
+static int safety_loop_list_build(IRFunction *function, SafetyLoopList *loops) {
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    if (instruction->op != IR_OP_LABEL ||
+        !ir_label_is_while_header(instruction->text)) {
+      continue;
+    }
+    SafetyLoopForm form;
+    if (!safety_parse_loop_form(function, i, &form)) {
+      continue;
+    }
+    if (loops->count == loops->capacity) {
+      size_t capacity = loops->capacity ? loops->capacity * 2 : 8;
+      SafetyLoopForm *grown =
+          realloc(loops->items, capacity * sizeof(SafetyLoopForm));
+      if (!grown) {
+        safety_loop_list_destroy(loops);
+        return 0;
+      }
+      loops->items = grown;
+      loops->capacity = capacity;
+    }
+    loops->items[loops->count++] = form;
+  }
+  return 1;
+}
+
 /* ---- the one exempt module ------------------------------------------------- */
 
 /* An allocator is the one piece of code whose job is to touch memory that is
@@ -1276,7 +1347,13 @@ static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
   unsigned char *outcome = calloc(function->instruction_count, 1);
   SafetyHoist *hoists = calloc(check_count, sizeof(SafetyHoist));
   size_t hoist_count = 0;
+  SafetyLoopList loops = {0};
   if (!outcome || !hoists) {
+    free(outcome);
+    free(hoists);
+    return 0;
+  }
+  if (!safety_loop_list_build(function, &loops)) {
     free(outcome);
     free(hoists);
     return 0;
@@ -1291,15 +1368,16 @@ static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
     if (!safety_read(instruction, &access)) {
       goto fail;
     }
-    if (safety_prove(function, i, &access)) {
+    if (safety_prove(function, &loops, i, &access)) {
       outcome[i] = SAFETY_PROVED;
       continue;
     }
-    if (safety_try_hoist(function, i, &access, &hoists[hoist_count])) {
+    if (safety_try_hoist(function, &loops, i, &access, &hoists[hoist_count])) {
       hoist_count++;
       outcome[i] = SAFETY_HOISTED;
     }
   }
+  safety_loop_list_destroy(&loops);
 
   IRInstructionVector out = {0};
   if (!ir_instruction_vector_reserve(&out, function->instruction_count + 16)) {
@@ -1390,6 +1468,7 @@ static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
   return 1;
 
 fail:
+  safety_loop_list_destroy(&loops);
   for (size_t h = 0; h < hoist_count; h++) {
     ir_operand_destroy(&hoists[h].base);
     ir_operand_destroy(&hoists[h].bound);
@@ -1403,6 +1482,7 @@ int ir_safety_resolve_program(IRProgram *program, IRSafetyStats *stats) {
   if (!program) {
     return 1;
   }
+  clock_t started = safety_time_enabled() ? clock() : 0;
   g_safety_next_id = 0;
   const char *allocator_source = safety_allocator_source(program);
   for (size_t i = 0; i < program->function_count; i++) {
@@ -1417,6 +1497,14 @@ int ir_safety_resolve_program(IRProgram *program, IRSafetyStats *stats) {
     if (!resolved) {
       return 0;
     }
+  }
+  if (safety_time_enabled()) {
+    /* Ticks rather than a converted figure: clock()'s units do not reliably
+     * match CLOCKS_PER_SEC across the toolchains this builds with, and a
+     * number in the wrong units is worse than none. Runs are comparable, which
+     * is what this is for. */
+    fprintf(stderr, "safety: resolving took %lld ticks\n",
+            (long long)(clock() - started));
   }
   return 1;
 }
@@ -1686,10 +1774,6 @@ static int safety_describe_globals(IRProgram *program, IRFunction *entry) {
         symbol->name && symbol->type && symbol->type->size > 0) {
       described++;
     }
-  }
-  if (safety_trace_enabled()) {
-    fprintf(stderr, "safety: describing %zu of %zu module symbols\n", described,
-            program->module_symbol_count);
   }
   if (described == 0) {
     return 1;
