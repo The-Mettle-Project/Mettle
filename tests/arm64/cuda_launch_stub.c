@@ -2,6 +2,7 @@
  * additionally verifies the AAPCS64 placement of all eleven cuLaunchKernel
  * arguments, including the three overflow arguments carried on the stack. */
 #include <stdint.h>
+#include <stdio.h>
 
 static int launch_calls;
 
@@ -16,6 +17,9 @@ int cuLaunchKernel(int64_t function, uint32_t gx, uint32_t gy, uint32_t gz,
   } else if (launch_calls == 1) {
     valid = valid && gx == 7 && gy == 3 && gz == 2 && bx == 32 &&
             by == 4 && bz == 1 && shared_bytes == 4096 && stream == 99;
+  } else if (launch_calls == 2) {
+    valid = valid && gx == 4 && gy == 1 && gz == 1 && bx == 256 &&
+            by == 1 && bz == 1 && shared_bytes == 0 && stream == 99;
   } else {
     valid = 0;
   }
@@ -26,7 +30,7 @@ int cuLaunchKernel(int64_t function, uint32_t gx, uint32_t gy, uint32_t gz,
   return 0;
 }
 
-int gpu_stub_finish(void) { return launch_calls == 2 ? 0 : 96; }
+int gpu_stub_finish(void) { return launch_calls == 3 ? 0 : 96; }
 
 /* Link-only no-op stubs for the rest of the CUDA driver surface std/gpu
  * binds. The dispatch test never calls these; they exist because linking the
@@ -91,4 +95,22 @@ int cuEventElapsedTime(float *ms, int64_t start, int64_t end) {
   if (ms) *ms = 0.0f;
   (void)start; (void)end;
   return 0;
+}
+int cuStreamBeginCapture_v2(int64_t stream, int32_t mode) {
+  (void)stream; (void)mode; return 0;
+}
+int cuStreamEndCapture(int64_t stream, int64_t *graph) {
+  (void)stream; return stub_out64(graph);
+}
+int cuGraphInstantiateWithFlags(int64_t *exec, int64_t graph, int64_t flags) {
+  (void)graph; (void)flags; return stub_out64(exec);
+}
+int cuGraphLaunch(int64_t exec, int64_t stream) { (void)exec; (void)stream; return 0; }
+int cuGraphExecDestroy(int64_t exec) { (void)exec; return 0; }
+int cuGraphDestroy(int64_t graph) { (void)graph; return 0; }
+
+/* std/gpu reaches stderr through the UCRT spelling. The bundled runtime
+ * defines it, but this link is plain glibc. */
+void *__acrt_iob_func(int index) {
+  return index == 0 ? (void *)stdin : index == 1 ? (void *)stdout : (void *)stderr;
 }
