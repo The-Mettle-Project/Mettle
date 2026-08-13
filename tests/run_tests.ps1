@@ -2613,6 +2613,29 @@ try {
   if ($shortOut -notmatch "outside its allocation") {
     throw "the short buffer trapped for the wrong reason:`n$shortOut"
   }
+
+  # A table lookup indexed by a masked value. The bound comes from the mask,
+  # not from any loop counter, and the table is exactly the size the mask
+  # allows, so a range one byte too large rejects a correct program.
+  $maskExe = Join-Path $tmpDir "safe_masked_index.exe"
+  & $CompilerPath --build --safe --release tests\test_safe_masked_index.mettle -o $maskExe 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "--safe build of test_safe_masked_index failed"
+  }
+  $maskOut = & $maskExe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 41) {
+    throw "an exactly sized table was rejected or the answer changed: expected 41, got $LASTEXITCODE`n$maskOut"
+  }
+
+  $maskShortExe = Join-Path $tmpDir "safe_masked_index_short.exe"
+  & $CompilerPath --build --safe --release tests\test_safe_masked_index_short.mettle -o $maskShortExe 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "--safe build of test_safe_masked_index_short failed"
+  }
+  $maskShortOut = & $maskShortExe 2>&1 | Out-String
+  if ($maskShortOut -notmatch "outside its allocation") {
+    throw "a table one byte smaller than the mask allows was not caught:`n$maskShortOut"
+  }
   Write-CaseResult -Name "safe_mode_hoist_range" -Passed $true
 }
 catch {

@@ -280,6 +280,76 @@ static int safety_index_is_affine(const IRFunction *function, size_t before,
   return 0;
 }
 
+/* The largest value an index can take, when that follows from the arithmetic
+ * alone rather than from any loop.
+ *
+ * Masking is the case worth reading: `alpha[(bits >> 2) & 63]` cannot leave
+ * [0, 63] whatever `bits` holds, because a non-negative mask clears every
+ * higher bit including the sign. That is the shape of every table lookup, and
+ * it bounds the access without knowing anything about the surrounding code. */
+static int safety_index_upper_bound(const IRFunction *function, size_t before,
+                                    const IROperand *index, int depth,
+                                    long long *upper_out) {
+  if (index->kind == IR_OPERAND_INT) {
+    if (index->int_value < 0) {
+      return 0;
+    }
+    *upper_out = index->int_value;
+    return 1;
+  }
+  if (index->kind != IR_OPERAND_TEMP || !index->name || depth > 4) {
+    return 0;
+  }
+  const IRInstruction *producer =
+      ir_find_temp_producer_before(function, before, index->name);
+  if (!producer || producer->is_float) {
+    return 0;
+  }
+  if (producer->op == IR_OP_ASSIGN) {
+    return safety_index_upper_bound(function, before, &producer->lhs, depth + 1,
+                                    upper_out);
+  }
+  if (producer->op != IR_OP_BINARY || !producer->text ||
+      strcmp(producer->text, "&") != 0) {
+    return 0;
+  }
+  if (producer->rhs.kind == IR_OPERAND_INT && producer->rhs.int_value >= 0) {
+    *upper_out = producer->rhs.int_value;
+    return 1;
+  }
+  if (producer->lhs.kind == IR_OPERAND_INT && producer->lhs.int_value >= 0) {
+    *upper_out = producer->lhs.int_value;
+    return 1;
+  }
+  return 0;
+}
+
+/* Read the index out of the multiply lowering emits for a subscript, and
+ * report the largest value it can take. */
+static int safety_offset_upper_bound(const IRFunction *function,
+                                     size_t check_index,
+                                     const IROperand *offset,
+                                     long long *stride_out,
+                                     long long *upper_out) {
+  if (offset->kind != IR_OPERAND_TEMP || !offset->name) {
+    return 0;
+  }
+  const IRInstruction *producer =
+      ir_find_temp_producer_before(function, check_index, offset->name);
+  if (!producer || producer->op != IR_OP_BINARY || producer->is_float ||
+      !producer->text || strcmp(producer->text, "*") != 0 ||
+      producer->rhs.kind != IR_OPERAND_INT || producer->rhs.int_value <= 0) {
+    return 0;
+  }
+  size_t producer_index = (size_t)(producer - function->instructions);
+  if (!safety_index_upper_bound(function, producer_index, &producer->lhs, 0,
+                                upper_out)) {
+    return 0;
+  }
+  *stride_out = producer->rhs.int_value;
+  return 1;
+}
+
 /* Read `(iv + addend) * stride` out of the instruction that produced the
  * offset. This is the shape lowering emits for every subscript: the index,
  * then a multiply by the element width. */
@@ -499,10 +569,31 @@ static int safety_prove_loop_bound(IRFunction *function, size_t check_index,
   return 0;
 }
 
+/* The index is masked into a range the object already covers. */
+static int safety_prove_masked_index(const IRFunction *function,
+                                     size_t check_index,
+                                     const SafetyAccess *access) {
+  if (access->extent == IR_SAFETY_EXTENT_UNKNOWN || access->size <= 0) {
+    return 0;
+  }
+  long long stride = 0;
+  long long upper = 0;
+  if (!safety_offset_upper_bound(function, check_index, access->offset, &stride,
+                                 &upper)) {
+    return 0;
+  }
+  long long highest = upper * stride;
+  if (highest < 0 || access->size > access->extent) {
+    return 0;
+  }
+  return highest <= access->extent - access->size;
+}
+
 static int safety_prove(IRFunction *function, size_t check_index,
                         const SafetyAccess *access) {
   return safety_prove_constant(function, check_index, access) ||
-         safety_prove_loop_bound(function, check_index, access);
+         safety_prove_loop_bound(function, check_index, access) ||
+         safety_prove_masked_index(function, check_index, access);
 }
 
 /* ---- hoisting a loop's checks into one ------------------------------------- */
@@ -523,7 +614,11 @@ static int safety_prove(IRFunction *function, size_t check_index,
  */
 
 typedef struct {
-  size_t header_index;    /* the loop label the check moves in front of */
+  size_t header_index; /* the loop label the check moves in front of */
+  /* When the reach of the access follows from the arithmetic alone, as a
+   * masked index does, the range is this many bytes and none of the loop
+   * fields below are read. */
+  long long constant_length;
   long long stride;       /* bytes per element */
   long long primary_step; /* how far the tested variable moves each iteration */
   long long index_step;   /* how far the indexing variable moves */
@@ -698,19 +793,56 @@ static int safety_try_hoist(IRFunction *function, size_t check_index,
     return 0;
   }
 
+  /* An index the arithmetic already bounds, such as a masked table lookup,
+   * reaches the same range on every iteration. One check for that range stands
+   * in for all of them, and its length is a constant. */
+  long long masked_stride = 0;
+  long long masked_upper = 0;
+  int masked = safety_offset_upper_bound(function, check_index, access->offset,
+                                         &masked_stride, &masked_upper);
+
   const char *iv = NULL;
   long long stride = 0;
   long long addend = 0;
-  if (!safety_offset_is_scaled_symbol(function, check_index, access->offset,
+  if (!masked &&
+      !safety_offset_is_scaled_symbol(function, check_index, access->offset,
                                       &iv, &stride, &addend)) {
-    safety_trace("the index is not a variable plus a constant",
+    safety_trace("the index is neither a counter nor bounded by its own "
+                 "arithmetic",
                  access->location.line);
     return 0;
   }
   /* An access no wider than its element is what keeps the hoisted length from
    * reaching past the range the expression describes. */
-  if (access->size > stride || addend < 0) {
+  if (!masked && (access->size > stride || addend < 0)) {
     safety_trace("the access is wider than its element, or reaches backwards",
+                 access->location.line);
+    return 0;
+  }
+
+  if (masked) {
+    for (size_t header = check_index; header-- > 0;) {
+      SafetyLoopForm form;
+      if (!safety_parse_loop_form(function, header, &form)) {
+        continue;
+      }
+      if (check_index <= form.bounds.branch_index ||
+          check_index >= form.bounds.jump_index) {
+        continue;
+      }
+      if (!safety_body_is_straight_line(function, &form.bounds) ||
+          !safety_operand_invariant_in(function, header, form.bounds.jump_index,
+                                       access->base)) {
+        return 0;
+      }
+      out->header_index = header;
+      out->constant_length = masked_upper * masked_stride + access->size;
+      out->access_kind = access->access_kind;
+      out->location = access->location;
+      return ir_operand_clone(access->base, &out->base);
+    }
+    safety_trace("the index is bounded but there is no loop to lift the check "
+                 "out of",
                  access->location.line);
     return 0;
   }
@@ -822,6 +954,22 @@ static int safety_try_hoist(IRFunction *function, size_t check_index,
  * was for. */
 static int safety_emit_hoisted(IRInstructionVector *out,
                                const SafetyHoist *hoist) {
+  /* A range the arithmetic already settled needs no arithmetic of its own. */
+  if (hoist->constant_length > 0) {
+    IROperand arguments[5];
+    if (!ir_operand_clone(&hoist->base, &arguments[0])) {
+      return 0;
+    }
+    arguments[1] = ir_operand_int(0);
+    arguments[2] = ir_operand_int(hoist->constant_length);
+    arguments[3] = ir_operand_int(hoist->access_kind);
+    arguments[4] = ir_operand_int((long long)hoist->location.line);
+    int emitted = safety_emit_call(out, hoist->location, "mettle_safety_check",
+                                   arguments, 5);
+    ir_operand_destroy(&arguments[0]);
+    return emitted;
+  }
+
   enum { SAFETY_HOIST_TEMPS = 7 };
   unsigned id = g_safety_next_id++;
   static const char *const tags[SAFETY_HOIST_TEMPS] = {"ht", "hq", "hm",

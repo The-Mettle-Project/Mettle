@@ -1,0 +1,40 @@
+// The lookup from test_safe_masked_index.mettle against a table one byte too
+// small for the range the mask allows. Whether this is caught depends on the
+// bound coming from the mask rather than from any loop counter.
+import "std/io";
+import "std/mem";
+
+fn encode(src: cstring, len: int64, dst: cstring, table: cstring) {
+  var i: int64 = 0;
+  while (i < len) {
+    dst[i] = table[(int64)src[i] & 63];
+    i = i + 1;
+  }
+}
+
+fn main() -> int32 {
+  var len: int64 = 32;
+  var src: cstring = malloc(len);
+  var dst: cstring = malloc(len);
+  // The mask allows indices up to 63, so this is one byte short.
+  var table: cstring = malloc(63);
+
+  var i: int64 = 0;
+  while (i < 63) {
+    table[i] = (int8)(i + 1);
+    i = i + 1;
+  }
+  var j: int64 = 0;
+  while (j < len) {
+    src[j] = (int8)(j * 7);
+    j = j + 1;
+  }
+
+  encode(src, len, dst, table);
+  var probe: int32 = (int32)dst[0];
+
+  free(src);
+  free(dst);
+  free(table);
+  return probe;
+}

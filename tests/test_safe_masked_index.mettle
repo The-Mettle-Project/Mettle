@@ -1,0 +1,46 @@
+// A table lookup indexed by a masked value, which is what every encoder's
+// alphabet lookup looks like. The index cannot leave [0, 63] whatever the
+// input holds, because a non-negative mask clears every higher bit including
+// the sign, so one check for that range stands in for all of them.
+//
+// The table here is exactly 64 bytes, so a range even one byte too large would
+// reject it. test_safe_masked_index_short.mettle is the same lookup against a
+// table one byte too small and must trap.
+import "std/io";
+import "std/mem";
+
+fn encode(src: cstring, len: int64, dst: cstring, table: cstring) {
+  var i: int64 = 0;
+  while (i < len) {
+    dst[i] = table[(int64)src[i] & 63];
+    i = i + 1;
+  }
+}
+
+fn main() -> int32 {
+  var len: int64 = 32;
+  var src: cstring = malloc(len);
+  var dst: cstring = malloc(len);
+  var table: cstring = malloc(64);
+
+  var i: int64 = 0;
+  while (i < 64) {
+    table[i] = (int8)(i + 41);
+    i = i + 1;
+  }
+  var j: int64 = 0;
+  while (j < len) {
+    src[j] = (int8)(j * 7);
+    j = j + 1;
+  }
+
+  encode(src, len, dst, table);
+  var probe: int32 = (int32)dst[0];
+
+  free(src);
+  free(dst);
+  free(table);
+
+  // src[0] is 0, so the lookup reads table[0], which holds 41.
+  return probe;
+}
