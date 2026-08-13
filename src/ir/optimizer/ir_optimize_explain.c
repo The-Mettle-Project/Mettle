@@ -1,6 +1,7 @@
 #include "ir_optimize_internal.h"
 #include "common.h"
 #include "../ir_explain_memory.h"
+#include "../ir_explain_safety.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -267,6 +268,29 @@ static MTLC_THREAD_LOCAL size_t g_mem_capacity = 0;
 static MTLC_THREAD_LOCAL int g_mem_collect = 0;
 static MTLC_THREAD_LOCAL char *g_mem_focus = NULL; /* basename to filter by, or NULL */
 
+/* ---- --safe accounting (fed by the safety pass, before the optimizer) ---- */
+typedef struct {
+  size_t line;
+  char *function_name; /* may be NULL */
+  int kind;            /* IRSafetySurvivorKind */
+} IRExplainSafetyNote;
+
+/* Enough to show the shape of what is left without turning the report into a
+ * listing. The totals are exact regardless; only the per-line detail stops. */
+#define IR_EXPLAIN_SAFETY_MAX_NOTES 64
+
+static MTLC_THREAD_LOCAL IRExplainSafetyNote *g_safety = NULL;
+static MTLC_THREAD_LOCAL size_t g_safety_count = 0;
+static MTLC_THREAD_LOCAL size_t g_safety_capacity = 0;
+static MTLC_THREAD_LOCAL int g_safety_collect = 0;
+static MTLC_THREAD_LOCAL int g_safety_have_totals = 0;
+static MTLC_THREAD_LOCAL char *g_safety_focus = NULL;
+static MTLC_THREAD_LOCAL size_t g_safety_emitted = 0;
+static MTLC_THREAD_LOCAL size_t g_safety_proved = 0;
+static MTLC_THREAD_LOCAL size_t g_safety_exempt = 0;
+static MTLC_THREAD_LOCAL size_t g_safety_extent_tests = 0;
+static MTLC_THREAD_LOCAL size_t g_safety_region_calls = 0;
+
 void ir_optimize_set_explain(int enabled, const char *focus_file) {
   g_explain = enabled;
   g_explain_focus_file = focus_file;
@@ -355,6 +379,58 @@ static const char *ir_explain_path_basename(const char *path) {
     }
   }
   return base;
+}
+
+void ir_explain_safety_set_collect(int enabled, const char *focus_file) {
+  g_safety_collect = enabled;
+  free(g_safety_focus);
+  g_safety_focus = NULL;
+  if (enabled && focus_file) {
+    const char *base = ir_explain_path_basename(focus_file);
+    if (base && *base) {
+      g_safety_focus = strdup(base);
+    }
+  }
+}
+
+void ir_explain_safety_note(const char *file, size_t line,
+                            const char *function_name,
+                            IRSafetySurvivorKind kind) {
+  if (!g_safety_collect || g_safety_count >= IR_EXPLAIN_SAFETY_MAX_NOTES) {
+    return;
+  }
+  /* An access with an unknown file is kept rather than risk dropping a real
+   * survivor, the same call the memory notes make. */
+  if (g_safety_focus && file &&
+      strcmp(ir_explain_path_basename(file), g_safety_focus) != 0) {
+    return;
+  }
+  if (g_safety_count >= g_safety_capacity) {
+    size_t new_cap = g_safety_capacity ? g_safety_capacity * 2 : 16;
+    IRExplainSafetyNote *grown = realloc(g_safety, new_cap * sizeof(*grown));
+    if (!grown) {
+      return;
+    }
+    g_safety = grown;
+    g_safety_capacity = new_cap;
+  }
+  IRExplainSafetyNote *note = &g_safety[g_safety_count++];
+  note->line = line;
+  note->function_name = function_name ? strdup(function_name) : NULL;
+  note->kind = (int)kind;
+}
+
+void ir_explain_safety_totals(size_t emitted, size_t proved, size_t exempt,
+                              size_t extent_tests, size_t region_calls) {
+  if (!g_safety_collect) {
+    return;
+  }
+  g_safety_have_totals = 1;
+  g_safety_emitted = emitted;
+  g_safety_proved = proved;
+  g_safety_exempt = exempt;
+  g_safety_extent_tests = extent_tests;
+  g_safety_region_calls = region_calls;
 }
 
 void ir_explain_memory_set_collect(int enabled, const char *focus_file) {
@@ -2183,6 +2259,82 @@ static void ir_explain_json_remark(const IRExplainRemark *r, const char *kind,
   ir_explain_json_raw("}");
 }
 
+/* Render what --safe did: how many accesses were checked, how many the
+ * compiler proved could not fail, and where the rest are.
+ *
+ * The proportion is the whole point of the mode, so it leads. A survivor is
+ * usually actionable: a constant-extent comparison is a couple of
+ * instructions, while a runtime call means the compiler could not see how
+ * large the object was, which is often a loop bound it could have been told. */
+static void ir_explain_safety_flush(void) {
+  if (g_explain_json) {
+    ir_explain_json_raw("\"safety\":{\"enabled\":%s",
+                        g_safety_have_totals ? "true" : "false");
+    if (g_safety_have_totals) {
+      ir_explain_json_raw(",\"accesses\":%zu,\"proved\":%zu,\"exempt\":%zu"
+                          ",\"extentTests\":%zu,\"regionCalls\":%zu",
+                          g_safety_emitted, g_safety_proved, g_safety_exempt,
+                          g_safety_extent_tests, g_safety_region_calls);
+    }
+    ir_explain_json_raw(",\"survivors\":[");
+    for (size_t i = 0; i < g_safety_count; i++) {
+      const IRExplainSafetyNote *n = &g_safety[i];
+      ir_explain_json_raw("%s{\"line\":%zu,\"kind\":", i ? "," : "", n->line);
+      ir_explain_json_str(n->kind == IR_SAFETY_SURVIVOR_REGION ? "runtime"
+                                                              : "extent");
+      ir_explain_json_raw(",\"function\":");
+      ir_explain_json_str(n->function_name);
+      ir_explain_json_raw("}");
+    }
+    ir_explain_json_raw("]},");
+  }
+
+  if (!g_explain || !g_safety_have_totals) {
+    return;
+  }
+  ir_explain_print_header("memory safety");
+  if (g_safety_emitted == 0) {
+    ir_explain_emit("  %sno memory accesses to check in this file%s\n\n",
+                    clr(EXPLAIN_DIM), clr(EXPLAIN_RESET));
+    return;
+  }
+
+  size_t survivors = g_safety_extent_tests + g_safety_region_calls;
+  ir_explain_emit("  %zu access%s checked, %zu proved safe at compile time"
+                  " (%zu%%), %zu still checked at run time\n",
+                  g_safety_emitted, g_safety_emitted == 1 ? "" : "es",
+                  g_safety_proved,
+                  (g_safety_proved * 100) / g_safety_emitted, survivors);
+  if (g_safety_exempt > 0) {
+    ir_explain_emit("  %s%zu inside the allocator, which is not checked%s\n",
+                    clr(EXPLAIN_DIM), g_safety_exempt, clr(EXPLAIN_RESET));
+  }
+  if (survivors > 0) {
+    ir_explain_emit("  %zu compare against a known extent, %zu ask the "
+                    "runtime which allocation the pointer came from\n",
+                    g_safety_extent_tests, g_safety_region_calls);
+  }
+
+  for (size_t i = 0; i < g_safety_count; i++) {
+    const IRExplainSafetyNote *n = &g_safety[i];
+    const char *why =
+        n->kind == IR_SAFETY_SURVIVOR_REGION
+            ? "the object's size is not known here, so the runtime is asked "
+              "which allocation the pointer came from"
+            : "the index is not a constant and no loop bounds it, so it is "
+              "compared against the object's extent";
+    ir_explain_emit("  %sline %zu%s%s%s: %s\n", clr(EXPLAIN_BOLD), n->line,
+                    clr(EXPLAIN_RESET), n->function_name ? " in " : "",
+                    n->function_name ? n->function_name : "", why);
+    ir_explain_echo_source(n->line);
+  }
+  if (survivors > g_safety_count) {
+    ir_explain_emit("  %s(%zu more not listed)%s\n", clr(EXPLAIN_DIM),
+                    survivors - g_safety_count, clr(EXPLAIN_RESET));
+  }
+  ir_explain_emit("\n");
+}
+
 /* Render the memory diagnostics the type checker handed us: a JSON "memory"
  * array (always emitted so the document's comma chain stays valid) and a prose
  * "memory report" section. Called at the tail of ir_explain_flush, so it lands
@@ -2839,6 +2991,7 @@ void ir_explain_flush(void) {
   ir_explain_tally_functions();
 
   /* Memory diagnostics land after "remarks" and before "backend". */
+  ir_explain_safety_flush();
   ir_explain_memory_flush();
 }
 

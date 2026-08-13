@@ -3898,12 +3898,19 @@ int compile_file(const char *input_filename, const char *output_filename,
    * what cannot fail, compile the rest into ordinary instructions. Every later
    * stage, the interpreter included, sees IR with no safety opcodes in it. */
   if (emit_safety_checks) {
+    /* Collection has to be armed before the pass, which runs well before the
+     * optimizer's own --explain state comes up. */
+    ir_explain_safety_set_collect(options->explain && options->optimize,
+                                  input_filename);
     IRSafetyStats safety_stats = {0};
     if (!ir_safety_resolve_program(ir_program, &safety_stats)) {
       mettle_compiler_ice_report("Safety check resolution failed", NULL);
       result = 1;
       goto cleanup;
     }
+    ir_explain_safety_totals(safety_stats.emitted, safety_stats.proved,
+                             safety_stats.exempt, safety_stats.extent_tests,
+                             safety_stats.region_calls);
   }
 
   mettle_compiler_ctx_set_ir_program(ir_program);

@@ -7,6 +7,7 @@
 #include "error/error_explain.h"
 #include "error/error_reporter.h"
 #include "ir/ir_comptime.h"
+#include "ir/ir_explain_safety.h"
 #include "ir/ir_pgo.h"
 #include "ir/ir_safety.h"
 #include "ir/ir_verify.h"
