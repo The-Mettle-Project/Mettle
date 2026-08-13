@@ -2569,6 +2569,30 @@ catch {
 }
 
 
+# Hoisting a loop's checks into one covering the range it walks. The range has
+# to be exactly what the loop touches: too large accuses a correct program, too
+# small misses a real overrun. The zero-trip loop is the sharp edge, since the
+# pointer handed to it may never have been valid and a check taken before the
+# loop would look at it anyway.
+$total++
+try {
+  $hoistExe = Join-Path $tmpDir "safe_hoist_clean.exe"
+  & $CompilerPath --build --safe --release tests\test_safe_hoist_clean.mettle -o $hoistExe 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "--safe build of test_safe_hoist_clean failed"
+  }
+  $hoistOut = & $hoistExe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 17) {
+    throw "hoisting changed the answer or rejected a correct loop: expected 17, got $LASTEXITCODE`n$hoistOut"
+  }
+  Write-CaseResult -Name "safe_mode_hoist_range" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "safe_mode_hoist_range" -Passed $false -Reason $_.Exception.Message
+}
+
+
 # Native heap: build with --native-heap and confirm new/malloc/calloc/realloc/
 # free route through std/alloc's Mettle allocator (mettle_heap_*), stay correct
 # at runtime, and do NOT emit the Win32 HeapAlloc/calloc path for `new`.

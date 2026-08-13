@@ -1,0 +1,46 @@
+// Hoisting replaces a loop's per-element checks with one covering the range
+// the loop walks. These are the cases where getting that range wrong would
+// show: a loop that runs zero times, a loop that runs once, and a loop that
+// touches the very last byte of its buffer.
+//
+// The zero-trip case is the pointed one. The hoisted length comes out zero or
+// negative there, and the pointer may never have been valid, so a check that
+// looked at it would reject a correct program.
+import "std/io";
+import "std/mem";
+
+fn total(data: int32*, n: int64) -> int64 {
+  var sum: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    sum = sum + (int64)data[i];
+    i = i + 1;
+  }
+  return sum;
+}
+
+fn main() -> int32 {
+  var n: int64 = 16;
+  var block: cstring = malloc(n * 4);
+  var data: int32* = (int32*)block;
+  var i: int64 = 0;
+  while (i < n) {
+    data[i] = 1;
+    i = i + 1;
+  }
+
+  // The whole buffer, including its last element.
+  var all: int64 = total(data, n);
+  // One element.
+  var one: int64 = total(data, 1);
+  // Zero elements: the loop never runs and nothing may be checked.
+  var none: int64 = total(data, 0);
+  // Zero elements through a pointer that was never valid.
+  var wild: int32* = 0;
+  var wild_total: int64 = total(wild, 0);
+
+  free(block);
+
+  // 16 + 1 + 0 + 0 = 17
+  return (int32)(all + one + none + wild_total);
+}

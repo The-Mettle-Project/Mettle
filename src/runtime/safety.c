@@ -399,7 +399,7 @@ typedef struct {
   const char *headline;
   uint32_t line;
   int64_t offset;
-  uint64_t size;
+  int64_t size;
   uint64_t extent;
   int have_extent;
 } SafetyFailure;
@@ -414,7 +414,7 @@ static void safety_report_and_trap(const SafetyFailure *failure,
   safety_append(g_safety_message, capacity, &at, "Fatal error: ");
   safety_append(g_safety_message, capacity, &at, failure->headline);
   safety_append(g_safety_message, capacity, &at, ": ");
-  safety_append_unsigned(g_safety_message, capacity, &at, failure->size);
+  safety_append_signed(g_safety_message, capacity, &at, failure->size);
   safety_append(g_safety_message, capacity, &at, " bytes at offset ");
   safety_append_signed(g_safety_message, capacity, &at, failure->offset);
   if (failure->have_extent) {
@@ -434,9 +434,14 @@ static void safety_report_and_trap(const SafetyFailure *failure,
 
 /* ---- the check ------------------------------------------------------------ */
 
-void mettle_safety_check(const void *base, int64_t offset, uint64_t size,
+void mettle_safety_check(const void *base, int64_t offset, int64_t size,
                          uint32_t access_kind, uint32_t line) {
   (void)access_kind;
+  /* Before anything else, including the null test: an access of no bytes
+   * reaches no memory, so there is nothing about `base` worth asking. */
+  if (size <= 0) {
+    return;
+  }
   if (g_safety_allocator_depth != 0) {
     return;
   }
@@ -483,8 +488,9 @@ void mettle_safety_check(const void *base, int64_t offset, uint64_t size,
 
   uintptr_t address = start + (uintptr_t)offset;
   uint64_t extent = region->size;
-  if (size > extent || address < region->start ||
-      (uint64_t)(address - region->start) > extent - size) {
+  uint64_t width = (uint64_t)size; /* positive: the early return handled the rest */
+  if (width > extent || address < region->start ||
+      (uint64_t)(address - region->start) > extent - width) {
     failure.headline = "memory access outside its allocation";
     safety_report_and_trap(&failure, program_counter, frame_pointer);
   }

@@ -438,6 +438,239 @@ static int safety_prove(IRFunction *function, size_t check_index,
          safety_prove_loop_bound(function, check_index, access);
 }
 
+/* ---- hoisting a loop's checks into one ------------------------------------- */
+/*
+ * When the object's size is not known, a check per access means a call per
+ * access, and in a tight loop that is the whole cost of the mode. But a
+ * counted loop walking `base[i]` for i in [0, bound) touches one contiguous
+ * range, and one check covers the lot. So the check moves out of the loop and
+ * becomes a statement about the range, and the body is left with nothing in
+ * it, which is also what lets the vectorizers claim it again.
+ *
+ * Correctness rests on the range being exactly what the loop touches, no more
+ * and no less. More would trap on a correct program; less would miss a real
+ * overrun. That is why the body has to be straight line (a conditional access
+ * touches a subset, so checking the whole range could accuse a program that
+ * never reads the far end) and why it must contain no calls (one of them could
+ * free the block partway through, which a check taken beforehand would miss).
+ */
+
+typedef struct {
+  size_t header_index; /* the loop label the check moves in front of */
+  long long stride;
+  long long size;
+  long long access_kind;
+  IROperand base;  /* owned */
+  IROperand bound; /* owned */
+  SourceLocation location;
+} SafetyHoist;
+
+/* An operand whose value cannot change across [start, end). */
+static int safety_operand_invariant_in(const IRFunction *function, size_t start,
+                                       size_t end, const IROperand *operand) {
+  if (operand->kind == IR_OPERAND_INT) {
+    return 1;
+  }
+  if ((operand->kind != IR_OPERAND_SYMBOL && operand->kind != IR_OPERAND_TEMP) ||
+      !operand->name) {
+    return 0;
+  }
+  for (size_t i = start; i < end && i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    if (instruction->dest.name &&
+        strcmp(instruction->dest.name, operand->name) == 0) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+/* Every iteration runs every instruction, and none of them can release the
+ * memory being walked. A jump back to the header is the loop closing and is
+ * expected; anything else branching is not. */
+static int safety_body_is_straight_line(const IRFunction *function,
+                                        const IRWhileLoopBounds *loop) {
+  for (size_t i = loop->branch_index + 1; i < loop->jump_index; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    switch (instruction->op) {
+    case IR_OP_LABEL:
+    case IR_OP_JUMP:
+    case IR_OP_BRANCH_ZERO:
+    case IR_OP_BRANCH_EQ:
+    case IR_OP_RETURN:
+      return 0;
+    case IR_OP_CALL:
+    case IR_OP_CALL_INDIRECT:
+    case IR_OP_NEW:
+    case IR_OP_GPU_LAUNCH:
+      /* The checks themselves are about to be removed, so they do not count
+       * against the body; anything else could free what the loop is walking. */
+      if (instruction->op == IR_OP_CALL && instruction->text &&
+          strncmp(instruction->text, "mettle_safety_", 14) == 0) {
+        continue;
+      }
+      return 0;
+    default:
+      continue;
+    }
+  }
+  return 1;
+}
+
+static int safety_try_hoist(IRFunction *function, size_t check_index,
+                            const SafetyAccess *access, SafetyHoist *out) {
+  if (access->extent != IR_SAFETY_EXTENT_UNKNOWN || access->size <= 0) {
+    return 0;
+  }
+
+  const char *iv = NULL;
+  long long stride = 0;
+  if (!safety_offset_is_scaled_symbol(function, check_index, access->offset,
+                                      &iv, &stride)) {
+    return 0;
+  }
+  /* An access no wider than its step is what makes the hoisted length
+   * `(bound - 1) * stride + size` collapse to zero or less for a loop that
+   * never runs, which is what lets the check go in unguarded. A wider access
+   * would also reach past the range that expression describes. */
+  if (access->size > stride) {
+    return 0;
+  }
+
+  for (size_t header = check_index; header-- > 0;) {
+    if (function->instructions[header].op != IR_OP_LABEL ||
+        !ir_label_is_while_header(function->instructions[header].text)) {
+      continue;
+    }
+    IRWhileLoopBounds loop;
+    if (!ir_find_while_loop_bounds(function, header, &loop) ||
+        loop.jump_index == (size_t)-1) {
+      continue;
+    }
+    if (check_index <= loop.branch_index || check_index >= loop.jump_index) {
+      continue;
+    }
+
+    const IRInstruction *compare = &function->instructions[loop.compare_index];
+    if (!compare->lhs.name || strcmp(compare->lhs.name, iv) != 0) {
+      continue;
+    }
+
+    size_t step_first = 0;
+    size_t step_last = 0;
+    if (!ir_iv_zero_at_header(function, header, iv) ||
+        !safety_loop_steps_by_one(function, &loop, iv, &step_first,
+                                  &step_last) ||
+        safety_symbol_written_between(function, loop.branch_index + 1,
+                                      loop.jump_index, iv, step_first,
+                                      step_last)) {
+      safety_trace("the loop index is not a plain zero-based counter",
+                   access->location.line);
+      return 0;
+    }
+    if (!safety_body_is_straight_line(function, &loop)) {
+      safety_trace("the loop body branches or calls, so one check for the "
+                   "whole range would not describe what it touches",
+                   access->location.line);
+      return 0;
+    }
+    if (!safety_operand_invariant_in(function, loop.branch_index + 1,
+                                     loop.jump_index, access->base) ||
+        !safety_operand_invariant_in(function, loop.branch_index + 1,
+                                     loop.jump_index, &compare->rhs)) {
+      safety_trace("the pointer or the loop bound changes inside the loop",
+                   access->location.line);
+      return 0;
+    }
+    /* The hoisted check is emitted in front of the header, so both operands
+     * have to be settled by then. */
+    if (!safety_operand_invariant_in(function, header, loop.jump_index,
+                                     access->base)) {
+      return 0;
+    }
+
+    out->header_index = header;
+    out->stride = stride;
+    out->size = access->size;
+    out->access_kind = access->access_kind;
+    out->location = access->location;
+    if (!ir_operand_clone(access->base, &out->base)) {
+      return 0;
+    }
+    if (!ir_operand_clone(&compare->rhs, &out->bound)) {
+      ir_operand_destroy(&out->base);
+      return 0;
+    }
+    return 1;
+  }
+  return 0;
+}
+
+/* Emit the one check that stands in for all of the loop's.
+ *
+ *   check(base, 0, (bound - 1) * stride + size)
+ *
+ * The length is the last byte the final iteration reads, rather than
+ * bound * stride. The two agree whenever the element width equals the step,
+ * and hoisting is only attempted when the width does not exceed it, which is
+ * also what makes the expression come out zero or negative for a loop that
+ * never runs. The runtime treats that as nothing to check, so no guard branch
+ * is needed.
+ *
+ * Leaving the branch out is not only cheaper. A label immediately before a
+ * loop header stops the recognizers' backward scan for the induction
+ * variable's initial value, so guarding here would cost the loop its
+ * vectorization, which is most of what hoisting was for. */
+static int safety_emit_hoisted(IRInstructionVector *out,
+                               const SafetyHoist *hoist) {
+  unsigned id = g_safety_next_id++;
+  char last[64];
+  char scaled[64];
+  char length[64];
+  snprintf(last, sizeof(last), SAFETY_TEMP_PREFIX "hl%u", id);
+  snprintf(scaled, sizeof(scaled), SAFETY_TEMP_PREFIX "hs%u", id);
+  snprintf(length, sizeof(length), SAFETY_TEMP_PREFIX "hn%u", id);
+
+  IROperand one = ir_operand_int(1);
+  IROperand stride = ir_operand_int(hoist->stride);
+  IROperand size = ir_operand_int(hoist->size);
+  IROperand last_operand = ir_operand_temp(last);
+  IROperand scaled_operand = ir_operand_temp(scaled);
+  IROperand length_operand = ir_operand_temp(length);
+  int ok = 0;
+
+  if (!last_operand.name || !scaled_operand.name || !length_operand.name) {
+    goto done;
+  }
+
+  if (!safety_emit_binary(out, hoist->location, "-", last, &hoist->bound, &one,
+                          0) ||
+      !safety_emit_binary(out, hoist->location, "*", scaled, &last_operand,
+                          &stride, 0) ||
+      !safety_emit_binary(out, hoist->location, "+", length, &scaled_operand,
+                          &size, 0)) {
+    goto done;
+  }
+
+  IROperand arguments[5];
+  if (!ir_operand_clone(&hoist->base, &arguments[0])) {
+    goto done;
+  }
+  arguments[1] = ir_operand_int(0);
+  arguments[2] = length_operand;
+  arguments[3] = ir_operand_int(hoist->access_kind);
+  arguments[4] = ir_operand_int((long long)hoist->location.line);
+  ok = safety_emit_call(out, hoist->location, "mettle_safety_check", arguments,
+                        5);
+  ir_operand_destroy(&arguments[0]);
+
+done:
+  ir_operand_destroy(&last_operand);
+  ir_operand_destroy(&scaled_operand);
+  ir_operand_destroy(&length_operand);
+  return ok;
+}
+
 /* ---- the two survivor shapes ----------------------------------------------- */
 
 /* The object's size is a compile time constant, so the whole check is one
@@ -628,14 +861,20 @@ static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
     return 1;
   }
 
-  /* Prove first, rewrite second. The proofs read the instructions that produced
-   * a check's operands, and rewriting moves instructions out of the array as it
-   * goes, so a proof running mid-rewrite would look back at emptied slots and
-   * conclude it knows nothing. */
-  unsigned char *proved = calloc(function->instruction_count, 1);
-  if (!proved) {
+  /* Decide first, rewrite second. The proofs read the instructions that
+   * produced a check's operands, and rewriting moves instructions out of the
+   * array as it goes, so a proof running mid-rewrite would look back at
+   * emptied slots and conclude it knows nothing. */
+  enum { SAFETY_KEEP = 0, SAFETY_PROVED = 1, SAFETY_HOISTED = 2 };
+  unsigned char *outcome = calloc(function->instruction_count, 1);
+  SafetyHoist *hoists = calloc(check_count, sizeof(SafetyHoist));
+  size_t hoist_count = 0;
+  if (!outcome || !hoists) {
+    free(outcome);
+    free(hoists);
     return 0;
   }
+
   for (size_t i = 0; i < function->instruction_count; i++) {
     IRInstruction *instruction = &function->instructions[i];
     if (instruction->op != IR_OP_SAFETY_CHECK) {
@@ -643,25 +882,39 @@ static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
     }
     SafetyAccess access;
     if (!safety_read(instruction, &access)) {
-      free(proved);
-      return 0;
+      goto fail;
     }
-    proved[i] = safety_prove(function, i, &access) ? 1u : 0u;
+    if (safety_prove(function, i, &access)) {
+      outcome[i] = SAFETY_PROVED;
+      continue;
+    }
+    if (safety_try_hoist(function, i, &access, &hoists[hoist_count])) {
+      hoist_count++;
+      outcome[i] = SAFETY_HOISTED;
+    }
   }
 
   IRInstructionVector out = {0};
   if (!ir_instruction_vector_reserve(&out, function->instruction_count + 16)) {
-    free(proved);
-    return 0;
+    goto fail;
   }
 
   for (size_t i = 0; i < function->instruction_count; i++) {
     IRInstruction *instruction = &function->instructions[i];
+
+    /* A loop's hoisted checks go in front of its header. */
+    for (size_t h = 0; h < hoist_count; h++) {
+      if (hoists[h].header_index == i &&
+          !safety_emit_hoisted(&out, &hoists[h])) {
+        ir_instruction_vector_destroy(&out);
+        goto fail;
+      }
+    }
+
     if (instruction->op != IR_OP_SAFETY_CHECK) {
       if (!ir_instruction_vector_append_move(&out, instruction)) {
         ir_instruction_vector_destroy(&out);
-        free(proved);
-        return 0;
+        goto fail;
       }
       continue;
     }
@@ -669,16 +922,21 @@ static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
     SafetyAccess access;
     if (!safety_read(instruction, &access)) {
       ir_instruction_vector_destroy(&out);
-      free(proved);
-      return 0;
+      goto fail;
     }
     if (stats) {
       stats->emitted++;
     }
 
-    if (proved[i]) {
+    if (outcome[i] == SAFETY_PROVED) {
       if (stats) {
         stats->proved++;
+      }
+      continue;
+    }
+    if (outcome[i] == SAFETY_HOISTED) {
+      if (stats) {
+        stats->hoisted++;
       }
       continue;
     }
@@ -705,20 +963,33 @@ static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
     }
     if (!expanded) {
       ir_instruction_vector_destroy(&out);
-      free(proved);
-      return 0;
+      goto fail;
     }
     /* The check is not moved into `out`: its operands were cloned into the
      * replacement, and ir_function_replace_instructions frees what is left of
      * the old array below. */
   }
 
-  free(proved);
+  for (size_t h = 0; h < hoist_count; h++) {
+    ir_operand_destroy(&hoists[h].base);
+    ir_operand_destroy(&hoists[h].bound);
+  }
+  free(hoists);
+  free(outcome);
   if (!ir_function_replace_instructions(function, &out)) {
     ir_instruction_vector_destroy(&out);
     return 0;
   }
   return 1;
+
+fail:
+  for (size_t h = 0; h < hoist_count; h++) {
+    ir_operand_destroy(&hoists[h].base);
+    ir_operand_destroy(&hoists[h].bound);
+  }
+  free(hoists);
+  free(outcome);
+  return 0;
 }
 
 int ir_safety_resolve_program(IRProgram *program, IRSafetyStats *stats) {

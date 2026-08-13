@@ -24,6 +24,7 @@
 typedef struct {
   size_t emitted;      /* accesses lowering marked */
   size_t proved;       /* deleted: the access cannot be out of bounds */
+  size_t hoisted;      /* folded into one check covering a whole loop's range */
   size_t exempt;       /* dropped: inside the allocator, which is not checked */
   size_t extent_tests; /* survivors that compile to a compare and branch */
   size_t region_calls; /* survivors that have to ask the runtime */

@@ -88,11 +88,19 @@ void mettle_safety_reregister(void *old_pointer, void *new_pointer,
  * source line, which the report falls back on when the build carries no debug
  * information to resolve the return address against.
  *
+ * A size of zero or less means the access touches nothing and returns at once,
+ * before `base` is even looked at. That is what lets the compiler replace a
+ * whole loop's checks with one covering the range the loop walks: the length
+ * it computes comes out zero or negative for a loop that never runs, and a
+ * loop that never runs may well have been handed a pointer that was never
+ * valid. Without the early return that pointer would be accused, and the
+ * alternative is a branch around the check at every hoist site.
+ *
  * The access is deliberately not described in words. The crash handler already
  * names the function, file, line and source text from the return address, and
  * it does it better; passing a string as well would cost a load per check at
  * every site, for a worse version of what the report already prints. */
-void mettle_safety_check(const void *base, int64_t offset, uint64_t size,
+void mettle_safety_check(const void *base, int64_t offset, int64_t size,
                          uint32_t access_kind, uint32_t line);
 
 /* Counts for the end-of-run summary and for tests: how many checks ran, and
