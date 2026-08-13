@@ -1,0 +1,27 @@
+// The same pointer into a global, used correctly across its whole extent.
+// Describing globals to the runtime must not make correct code trap, and the
+// first and last elements are where an off-by-one in the described range would
+// show.
+import "std/io";
+
+var TABLE: int32[4];
+
+fn read_at(p: int32*, i: int32) -> int32 {
+  return p[i];
+}
+
+fn main() -> int32 {
+  var i: int32 = 0;
+  while (i < 4) {
+    TABLE[i] = i + 1;
+    i = i + 1;
+  }
+
+  var first: int32 = read_at(&TABLE[0], 0);
+  var last: int32 = read_at(&TABLE[0], 3);
+  // An interior pointer, read to the end from there.
+  var tail: int32 = read_at(&TABLE[2], 1);
+
+  // 1 + 4 + 4 = 9
+  return first + last + tail;
+}

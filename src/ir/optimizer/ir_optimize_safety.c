@@ -1668,15 +1668,106 @@ static int safety_register_function(IRFunction *function) {
   return 1;
 }
 
+/* ---- describing the globals ------------------------------------------------ */
+
+/* Module variables sit at fixed addresses for the whole run, so one sweep at
+ * the top of `main` describes them all and nothing ever retires them.
+ *
+ * This only matters for a pointer taken into a global and carried somewhere
+ * else. Indexing one directly never reaches the map at all: the size is right
+ * there in the program, so the check is a comparison against a constant, or is
+ * proved away outright. */
+static int safety_describe_globals(IRProgram *program, IRFunction *entry) {
+  size_t described = 0;
+  for (size_t i = 0; i < program->module_symbol_count; i++) {
+    const IRModuleSymbol *symbol = &program->module_symbols[i];
+    if (symbol->kind == IR_MODSYM_VARIABLE && !symbol->is_extern &&
+        symbol->name && symbol->type && symbol->type->size > 0) {
+      described++;
+    }
+  }
+  if (safety_trace_enabled()) {
+    fprintf(stderr, "safety: describing %zu of %zu module symbols\n", described,
+            program->module_symbol_count);
+  }
+  if (described == 0) {
+    return 1;
+  }
+
+  IRInstructionVector out = {0};
+  if (!ir_instruction_vector_reserve(&out,
+                                     entry->instruction_count + described * 2)) {
+    return 0;
+  }
+
+  for (size_t i = 0; i < program->module_symbol_count; i++) {
+    const IRModuleSymbol *symbol = &program->module_symbols[i];
+    if (symbol->kind != IR_MODSYM_VARIABLE || symbol->is_extern ||
+        !symbol->name || !symbol->type || symbol->type->size == 0) {
+      continue;
+    }
+
+    char address[96];
+    snprintf(address, sizeof(address), SAFETY_TEMP_PREFIX "g%u",
+             g_safety_next_id++);
+    IROperand size_operand = ir_operand_int((long long)symbol->type->size);
+
+    /* The instruction gets its own copies: appending moves it into the vector,
+     * which then owns whatever names it holds. */
+    IRInstruction take = {0};
+    take.op = IR_OP_ADDRESS_OF;
+    take.location = entry->location;
+    take.dest = ir_operand_temp(address);
+    take.lhs = ir_operand_symbol(symbol->name);
+    if (!take.dest.name || !take.lhs.name) {
+      ir_instruction_destroy_storage(&take);
+      ir_instruction_vector_destroy(&out);
+      return 0;
+    }
+    if (!ir_instruction_vector_append_move(&out, &take)) {
+      ir_instruction_destroy_storage(&take);
+      ir_instruction_vector_destroy(&out);
+      return 0;
+    }
+
+    IROperand address_operand = ir_operand_temp(address);
+    int ok = address_operand.name &&
+             safety_emit_register(&out, entry->location, &address_operand,
+                                  &size_operand);
+    ir_operand_destroy(&address_operand);
+    if (!ok) {
+      ir_instruction_vector_destroy(&out);
+      return 0;
+    }
+  }
+
+  for (size_t i = 0; i < entry->instruction_count; i++) {
+    if (!ir_instruction_vector_append_move(&out, &entry->instructions[i])) {
+      ir_instruction_vector_destroy(&out);
+      return 0;
+    }
+  }
+  if (!ir_function_replace_instructions(entry, &out)) {
+    ir_instruction_vector_destroy(&out);
+    return 0;
+  }
+  ir_function_clear_cfg(entry);
+  return 1;
+}
+
 int ir_safety_register_allocations(IRProgram *program) {
   if (!program) {
     return 1;
   }
   const char *allocator_source = safety_allocator_source(program);
+  IRFunction *entry = NULL;
   for (size_t i = 0; i < program->function_count; i++) {
     IRFunction *function = program->functions[i];
     if (!function) {
       continue;
+    }
+    if (function->name && strcmp(function->name, "main") == 0) {
+      entry = function;
     }
     /* Exempt for the same reason its accesses are: the calls it makes to
      * itself are the allocator working, not the program allocating, and
@@ -1687,6 +1778,9 @@ int ir_safety_register_allocations(IRProgram *program) {
     if (!safety_register_function(function)) {
       return 0;
     }
+  }
+  if (entry && !safety_describe_globals(program, entry)) {
+    return 0;
   }
   return 1;
 }

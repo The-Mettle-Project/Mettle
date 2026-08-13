@@ -2523,6 +2523,50 @@ catch {
 }
 
 
+# A pointer taken into a global and carried elsewhere. Indexing a global
+# directly never reaches the runtime at all, since its size is in the program;
+# this is the case that needs the globals described, and the clean fixture
+# reads the first and last element through such a pointer, where an off-by-one
+# in the described range would show.
+$total++
+try {
+  $globalCleanExe = Join-Path $tmpDir "safe_global_clean.exe"
+  & $CompilerPath --build --safe --release tests\test_safe_global_clean.mettle -o $globalCleanExe 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "--safe build of test_safe_global_clean failed"
+  }
+  $globalCleanOut = & $globalCleanExe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 9) {
+    throw "correct use of a global was rejected or the answer changed: expected 9, got $LASTEXITCODE`n$globalCleanOut"
+  }
+
+  $globalBadExe = Join-Path $tmpDir "safe_global_pointer.exe"
+  & $CompilerPath --build --safe --release tests\test_safe_global_pointer.mettle -o $globalBadExe 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "--safe build of test_safe_global_pointer failed"
+  }
+  $globalBadOut = & $globalBadExe 2>&1 | Out-String
+  if ($globalBadOut -notmatch "outside its allocation") {
+    throw "an overrun through a pointer into a global was not caught:`n$globalBadOut"
+  }
+
+  $globalBaseExe = Join-Path $tmpDir "safe_global_pointer.base.exe"
+  & $CompilerPath --build --release tests\test_safe_global_pointer.mettle -o $globalBaseExe 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "baseline build of test_safe_global_pointer failed"
+  }
+  $globalBaseOut = & $globalBaseExe 2>&1 | Out-String
+  if ($globalBaseOut -match "outside its allocation") {
+    throw "the overrun trapped without --safe, so the case proves nothing"
+  }
+  Write-CaseResult -Name "safe_mode_globals" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "safe_mode_globals" -Passed $false -Reason $_.Exception.Message
+}
+
+
 # --safe against the vectorizers, which is where the mode is easiest to lose
 # silently. A recognizer scans a loop body for the pattern it knows, ignores
 # what it does not, and then replaces the whole body; one that claims a body

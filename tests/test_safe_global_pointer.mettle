@@ -1,0 +1,19 @@
+// A pointer taken into a global and carried into another function, indexed
+// past the end. Nothing at the access site says how large the object is, so
+// catching this depends on the globals having been described to the runtime.
+import "std/io";
+
+var TABLE: int32[4];
+
+fn read_at(p: int32*, i: int32) -> int32 {
+  return p[i];
+}
+
+fn main() -> int32 {
+  TABLE[0] = 1;
+  var i: int32 = 4;
+  if (i != 0) {
+    i = i + 60;
+  }
+  return read_at(&TABLE[0], i);
+}

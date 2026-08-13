@@ -29,12 +29,12 @@
  * not allocate and cannot describe; trapping on them would reject correct
  * programs, which is the one thing this design refuses to do.
  *
- * What the compiler registers today is the heap. Stack locals and globals are
- * not, so a pointer taken into one and carried elsewhere goes unchecked.
- * Indexing them directly is fully covered without the map, because their size
- * is in the program and the check is a comparison against a constant; closing
- * the rest needs the compiler to align and register them. See
- * docs/memory-safety.md.
+ * What the compiler describes today is the heap and the module's globals.
+ * Stack locals are not, because keeping two of them out of the same granule
+ * needs the frame layout to align what it registers, so a pointer taken into a
+ * local and carried elsewhere goes unchecked. Indexing one directly is fully
+ * covered without the map, because its size is in the program and the check is
+ * a comparison against a constant. See docs/memory-safety.md.
  */
 
 #include <stddef.h>

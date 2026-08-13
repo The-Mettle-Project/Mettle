@@ -157,12 +157,13 @@ reads as unowned and is allowed through. A foreign library's pointer is not
 something the runtime can judge, and trapping on it would reject correct
 programs, which is the one thing this design refuses to do.
 
-**Pointers into stack locals and globals.** These are registered nowhere, so
-they fall under the rule above. Indexing such an object directly is fully
-checked, since its size is right there in the program and the check is a
-comparison against a constant; it is only a pointer taken into one and carried
-elsewhere that goes unchecked. Closing this needs the compiler to align and
-register those objects, which is not done yet.
+**Pointers into stack locals.** Globals are described to the runtime once at
+the top of `main`, so a pointer taken into one is checked wherever it is
+carried. Stack objects are not, because avoiding two of them sharing a
+16-byte granule needs the frame layout to align what it registers, so a
+pointer taken into a local and passed elsewhere goes unchecked. Indexing a
+local directly is fully covered without the map, since its size is right there
+in the program and the check is a comparison against a constant.
 
 **The allocator itself.** An allocator writes a header below the pointer it
 returns, threads its free list through the bodies of released blocks, and
