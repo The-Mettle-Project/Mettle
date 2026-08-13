@@ -332,8 +332,44 @@ typedef enum {
    * else-value (each a temp/symbol/int). Emitted by ir_optimize_if_convert.c
    * to replace a data-dependent register-only if/else diamond, lowered to a
    * cmov so an unpredictable branch becomes straight-line code. */
-  IR_OP_SELECT
+  IR_OP_SELECT,
+  /* `--safe`: one memory access that has not yet been proved in bounds.
+   *
+   * Short-lived by design. Lowering emits these, ir_safety_resolve_program()
+   * runs immediately afterwards to delete the ones it can prove and rewrite
+   * the rest into ordinary compares, branches and calls, and nothing past that
+   * point ever sees the opcode. The optimizer, the interpreter and every code
+   * generator are therefore untouched by it.
+   *
+   * Operands live in `arguments` rather than lhs/rhs so that passes which walk
+   * the argument vector generically already treat them as inputs:
+   *   arguments[0]  base pointer the access derives from (carries provenance)
+   *   arguments[1]  signed byte offset applied to that base
+   *   arguments[2]  bytes touched, always a constant
+   *   arguments[3]  byte extent of the object when it is known statically,
+   *                 or IR_SAFETY_EXTENT_UNKNOWN when only the runtime can say
+   *   arguments[4]  IR_SAFETY_ACCESS_READ or IR_SAFETY_ACCESS_WRITE
+   * `text` is a short source-level spelling of the access for the message. */
+  IR_OP_SAFETY_CHECK
 } IROpcode;
+
+/* arguments[3] of IR_OP_SAFETY_CHECK when the object's size is not a compile
+ * time constant, so the check has to ask the runtime which allocation the base
+ * pointer belongs to. */
+#define IR_SAFETY_EXTENT_UNKNOWN (-1)
+
+/* arguments[4] of IR_OP_SAFETY_CHECK. Mirrors MettleSafetyAccessKind in
+ * src/runtime/safety.h, which is the value passed through to the runtime. */
+#define IR_SAFETY_ACCESS_READ 0
+#define IR_SAFETY_ACCESS_WRITE 1
+
+/* Fixed positions inside IR_OP_SAFETY_CHECK's argument vector. */
+#define IR_SAFETY_ARG_BASE 0u
+#define IR_SAFETY_ARG_OFFSET 1u
+#define IR_SAFETY_ARG_SIZE 2u
+#define IR_SAFETY_ARG_EXTENT 3u
+#define IR_SAFETY_ARG_ACCESS 4u
+#define IR_SAFETY_ARG_COUNT 5u
 
 #define IR_GPU_LAUNCH_CONTROL_ARGS 8u
 

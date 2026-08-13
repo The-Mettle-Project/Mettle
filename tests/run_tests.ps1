@@ -2423,6 +2423,55 @@ catch {
 }
 
 
+# --safe end to end. The ordinary bounds check is gone at --release, so the
+# baseline case reads past the array and returns whatever was there. Each bad
+# program is built both ways: --safe must trap, and the same program without it
+# must not, which is what shows the check is doing the catching rather than
+# some unrelated change in codegen.
+$total++
+try {
+  $safeClean = Join-Path $tmpDir "safe_clean.exe"
+  & $CompilerPath --build --safe --release tests\test_safe_clean.mettle -o $safeClean 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "--safe build of test_safe_clean failed"
+  }
+  & $safeClean 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 98) {
+    throw "Correct code changed its answer under --safe: expected 98, got $LASTEXITCODE"
+  }
+
+  foreach ($case in @("test_safe_bounds_overflow", "test_safe_bounds_negative")) {
+    $safeExe = Join-Path $tmpDir "$case.safe.exe"
+    & $CompilerPath --build --safe --release "tests\$case.mettle" -o $safeExe 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "--safe build of $case failed"
+    }
+    $safeOut = & $safeExe 2>&1 | Out-String
+    if ($LASTEXITCODE -eq 0) {
+      throw "$case ran to completion under --safe; the access should have trapped"
+    }
+    if ($safeOut -notmatch "outside its bounds") {
+      throw "$case trapped under --safe without naming the access:`n$safeOut"
+    }
+
+    $baseExe = Join-Path $tmpDir "$case.base.exe"
+    & $CompilerPath --build --release "tests\$case.mettle" -o $baseExe 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "baseline build of $case failed"
+    }
+    $baseOut = & $baseExe 2>&1 | Out-String
+    if ($baseOut -match "outside its bounds") {
+      throw "$case trapped without --safe, so the case proves nothing about the check"
+    }
+  }
+  Write-CaseResult -Name "safe_mode_bounds" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "safe_mode_bounds" -Passed $false -Reason $_.Exception.Message
+}
+
+
 # Native heap: build with --native-heap and confirm new/malloc/calloc/realloc/
 # free route through std/alloc's Mettle allocator (mettle_heap_*), stay correct
 # at runtime, and do NOT emit the Win32 HeapAlloc/calloc path for `new`.

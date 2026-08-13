@@ -333,6 +333,47 @@ int ir_emit_bounds_check(IRLoweringContext *context,
   return 1;
 }
 
+int ir_emit_safety_check(IRLoweringContext *context, IRFunction *function,
+                         SourceLocation location, const IROperand *base,
+                         const IROperand *offset, long long access_size,
+                         long long extent, int access_kind, const char *what) {
+  if (!context || !function || !base || !offset) {
+    return 0;
+  }
+  if (!context->emit_safety_checks) {
+    return 1;
+  }
+  /* A zero-width access reads nothing, and an object of unknown element size
+   * gives the check no range to test. Neither can fail, so neither is worth a
+   * check. */
+  if (access_size <= 0) {
+    return 1;
+  }
+
+  IRInstruction check = {0};
+  check.op = IR_OP_SAFETY_CHECK;
+  check.location = location;
+  check.text = (char *)what;
+  check.arguments = calloc(IR_SAFETY_ARG_COUNT, sizeof(IROperand));
+  if (!check.arguments) {
+    ir_set_error(context, "Out of memory while lowering safety check");
+    return 0;
+  }
+  check.argument_count = IR_SAFETY_ARG_COUNT;
+  check.arguments[IR_SAFETY_ARG_BASE] = ir_operand_copy(base);
+  check.arguments[IR_SAFETY_ARG_OFFSET] = ir_operand_copy(offset);
+  check.arguments[IR_SAFETY_ARG_SIZE] = ir_operand_int(access_size);
+  check.arguments[IR_SAFETY_ARG_EXTENT] = ir_operand_int(extent);
+  check.arguments[IR_SAFETY_ARG_ACCESS] = ir_operand_int(access_kind);
+
+  int emitted = ir_emit(context, function, &check);
+  for (size_t i = 0; i < IR_SAFETY_ARG_COUNT; i++) {
+    ir_operand_destroy(&check.arguments[i]);
+  }
+  free(check.arguments);
+  return emitted;
+}
+
 int ir_push_labeled_control_frame(IRLoweringContext *context,
                                          const char *break_label,
                                          const char *continue_label,

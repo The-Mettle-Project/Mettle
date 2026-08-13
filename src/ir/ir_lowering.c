@@ -34,7 +34,7 @@ static IRProgram *ir_lowering_fail(IRProgram *ir_program,
 
 IRProgram *ir_lower_program(ASTNode *program, TypeChecker *type_checker,
                             SymbolTable *symbol_table, char **error_message,
-                            int emit_runtime_checks) {
+                            int emit_runtime_checks, int emit_safety_checks) {
   if (error_message) {
     *error_message = NULL;
   }
@@ -59,6 +59,7 @@ IRProgram *ir_lower_program(ASTNode *program, TypeChecker *type_checker,
   context.type_checker = type_checker;
   context.symbol_table = symbol_table;
   context.emit_runtime_checks = emit_runtime_checks ? 1 : 0;
+  context.emit_safety_checks = emit_safety_checks ? 1 : 0;
   context.program = ir_program;
 
   Program *program_data = (Program *)program->data;

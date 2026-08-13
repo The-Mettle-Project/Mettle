@@ -1,0 +1,12 @@
+// --safe must catch this at --release, where the ordinary bounds check is gone.
+// The index is computed through a branch so nothing can fold it away.
+fn main() -> int32 {
+  var arr: int32[4];
+  var i: int32 = 3;
+
+  if (i != 0) {
+    i = i + 1;
+  }
+
+  return arr[i];
+}

@@ -2,6 +2,61 @@
 #include "ir_lowering_internal.h"
 #include "frontend/mtlc_frontend.h" // mtlc_type_from_frontend
 
+/* Spell an access the way the source did, for a --safe failure message. The
+ * report already carries the file and line; this is what makes it read as the
+ * programmer's own expression rather than a temp number. Anything the walk
+ * does not recognize contributes "?", which is honest and still points at the
+ * right shape. */
+static void ir_safety_describe(const ASTNode *expression, char *buffer,
+                               size_t capacity, int depth) {
+  if (!buffer || capacity == 0) {
+    return;
+  }
+  buffer[0] = '\0';
+  if (!expression || depth > 4) {
+    snprintf(buffer, capacity, "?");
+    return;
+  }
+
+  switch (expression->type) {
+  case AST_IDENTIFIER: {
+    const Identifier *identifier = (const Identifier *)expression->data;
+    snprintf(buffer, capacity, "%s",
+             identifier && identifier->name ? identifier->name : "?");
+    return;
+  }
+  case AST_INDEX_EXPRESSION: {
+    const ArrayIndexExpression *index =
+        (const ArrayIndexExpression *)expression->data;
+    char inner[96];
+    ir_safety_describe(index ? index->array : NULL, inner, sizeof(inner),
+                       depth + 1);
+    snprintf(buffer, capacity, "%s[]", inner);
+    return;
+  }
+  case AST_MEMBER_ACCESS: {
+    const MemberAccess *member = (const MemberAccess *)expression->data;
+    char inner[96];
+    ir_safety_describe(member ? member->object : NULL, inner, sizeof(inner),
+                       depth + 1);
+    snprintf(buffer, capacity, "%s.%s", inner,
+             member && member->member ? member->member : "?");
+    return;
+  }
+  case AST_UNARY_EXPRESSION: {
+    const UnaryExpression *unary = (const UnaryExpression *)expression->data;
+    char inner[96];
+    ir_safety_describe(unary ? unary->operand : NULL, inner, sizeof(inner),
+                       depth + 1);
+    snprintf(buffer, capacity, "*%s", inner);
+    return;
+  }
+  default:
+    snprintf(buffer, capacity, "?");
+    return;
+  }
+}
+
 /* Park a local aggregate literal's folded image in the module as a hidden
  * constant, and hand back its name.
  *
@@ -812,13 +867,20 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
 
     IROperand object_address = ir_operand_none();
     Type *object_type = ir_infer_expression_type(context, member->object);
+    /* A field reached through a pointer is checked once the field's offset and
+     * width are known, a few statements below. Reaching one through an inline
+     * struct needs no check: the object's own storage is what bounds it, and
+     * whatever produced that storage was checked already. */
+    int base_is_pointer = 0;
 
     if (object_type && object_type->kind == TYPE_POINTER) {
       if (!ir_lower_expression(context, function, member->object,
                                &object_address)) {
         return 0;
       }
-      if (!ir_emit_null_check(context, function, expression->location,
+      base_is_pointer = 1;
+      if (!context->emit_safety_checks &&
+          !ir_emit_null_check(context, function, expression->location,
                               &object_address)) {
         ir_operand_destroy(&object_address);
         return 0;
@@ -856,6 +918,21 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
 
     if (out_type) {
       *out_type = field_type;
+    }
+
+    if (base_is_pointer) {
+      char described[128];
+      ir_safety_describe(expression, described, sizeof(described), 0);
+      IROperand field_offset_operand = ir_operand_int((long long)field_offset);
+      int checked = ir_emit_safety_check(
+          context, function, expression->location, &object_address,
+          &field_offset_operand, (long long)field_type->size,
+          IR_SAFETY_EXTENT_UNKNOWN, IR_SAFETY_ACCESS_READ, described);
+      ir_operand_destroy(&field_offset_operand);
+      if (!checked) {
+        ir_operand_destroy(&object_address);
+        return 0;
+      }
     }
 
     IROperand field_address = ir_operand_none();
@@ -933,18 +1010,24 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
       return 0;
     }
 
-    if (array_type->kind == TYPE_POINTER && !is_address_space_allocation &&
-        !ir_emit_null_check(context, function, expression->location, &base)) {
-      ir_operand_destroy(&base);
-      ir_operand_destroy(&index);
-      return 0;
-    }
-    if (array_type->kind == TYPE_ARRAY &&
-        !ir_emit_bounds_check(context, function, expression->location, &index,
-                              array_type->array_size)) {
-      ir_operand_destroy(&base);
-      ir_operand_destroy(&index);
-      return 0;
+    /* --safe supersedes both legacy checks here. Its check traps on a null
+     * base with a better message, and it compares the scaled byte offset
+     * without sign, so a negative index fails the same comparison as an
+     * oversized one instead of slipping past a signed `index < length`. */
+    if (!context->emit_safety_checks) {
+      if (array_type->kind == TYPE_POINTER && !is_address_space_allocation &&
+          !ir_emit_null_check(context, function, expression->location, &base)) {
+        ir_operand_destroy(&base);
+        ir_operand_destroy(&index);
+        return 0;
+      }
+      if (array_type->kind == TYPE_ARRAY &&
+          !ir_emit_bounds_check(context, function, expression->location, &index,
+                                array_type->array_size)) {
+        ir_operand_destroy(&base);
+        ir_operand_destroy(&index);
+        return 0;
+      }
     }
 
     IROperand scaled = ir_operand_none();
@@ -967,6 +1050,30 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
       ir_operand_destroy(&base);
       ir_operand_destroy(&index);
       return 0;
+    }
+
+    /* An inline array carries its own length, so the check is a comparison
+     * against a constant the compiler already holds. Through a pointer, only
+     * the runtime knows how large the allocation is.
+     *
+     * Address-space allocations are workgroup and private GPU storage, whose
+     * bounds the device enforces and whose address is not a host pointer the
+     * shadow map could describe. */
+    if (!is_address_space_allocation) {
+      long long extent = IR_SAFETY_EXTENT_UNKNOWN;
+      if (array_type->kind == TYPE_ARRAY && array_type->array_size > 0) {
+        extent = (long long)array_type->array_size * element_size;
+      }
+      char described[128];
+      ir_safety_describe(expression, described, sizeof(described), 0);
+      if (!ir_emit_safety_check(context, function, expression->location, &base,
+                                &scaled, element_size, extent,
+                                IR_SAFETY_ACCESS_READ, described)) {
+        ir_operand_destroy(&scaled);
+        ir_operand_destroy(&base);
+        ir_operand_destroy(&index);
+        return 0;
+      }
     }
 
     IROperand address = ir_operand_none();
@@ -1020,8 +1127,25 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
       return 0;
     }
 
-    if (!ir_emit_null_check(context, function, expression->location,
-                            &pointer_value)) {
+    if (context->emit_safety_checks) {
+      long long pointee_size =
+          operand_type && operand_type->base_type
+              ? (long long)operand_type->base_type->size
+              : 0;
+      char described[128];
+      ir_safety_describe(expression, described, sizeof(described), 0);
+      IROperand zero_offset = ir_operand_int(0);
+      int checked = ir_emit_safety_check(
+          context, function, expression->location, &pointer_value, &zero_offset,
+          pointee_size, IR_SAFETY_EXTENT_UNKNOWN, IR_SAFETY_ACCESS_READ,
+          described);
+      ir_operand_destroy(&zero_offset);
+      if (!checked) {
+        ir_operand_destroy(&pointer_value);
+        return 0;
+      }
+    } else if (!ir_emit_null_check(context, function, expression->location,
+                                   &pointer_value)) {
       ir_operand_destroy(&pointer_value);
       return 0;
     }

@@ -1,0 +1,34 @@
+// Correct code stays silent under --safe and keeps its answer. Every access
+// here is in bounds: the fill walks the array under its own length, the reads
+// use constant indices, and the pointer walk stays inside what it allocated.
+import "std/mem";
+
+fn sum_pair(values: int32*) -> int32 {
+  return values[0] + values[1];
+}
+
+fn main() -> int32 {
+  var arr: int32[8];
+  var i: int32 = 0;
+  while (i < 8) {
+    arr[i] = i * 3;
+    i = i + 1;
+  }
+
+  var total: int32 = 0;
+  var j: int32 = 0;
+  while (j < 8) {
+    total = total + arr[j];
+    j = j + 1;
+  }
+
+  var block: cstring = malloc(16);
+  var heap: int32* = (int32*)block;
+  heap[0] = 5;
+  heap[1] = 9;
+  total = total + sum_pair(heap);
+  free(block);
+
+  // 3 * (0+1+2+3+4+5+6+7) = 84, plus 5 + 9 = 98
+  return total;
+}

@@ -1308,6 +1308,10 @@ static int object_needs_debug_runtime(const char *object_path) {
   return object_needs_runtime_object(object_path, "mettle_dbg_");
 }
 
+static int object_needs_safety_runtime(const char *object_path) {
+  return object_needs_runtime_object(object_path, "mettle_safety_");
+}
+
 static int object_needs_tracy_helpers(const char *object_path) {
   return object_needs_runtime_object(object_path, "mettle_tracy_");
 }
@@ -1761,6 +1765,20 @@ static int mettle_link_object_file(const char *object_filename,
            runtime_directory);
   snprintf(debug_msvc_object, sizeof(debug_msvc_object), "%s/debug.obj",
            runtime_directory);
+
+  /* --safe: the shadow map behind mettle_safety_check. A program whose checks
+   * all compiled to constant-extent comparisons never names it and does not
+   * pay for it. It reports through the crash handler, so it drags that in. */
+  char safety_gcc_object[1024];
+  char safety_msvc_object[1024];
+  int needs_safety = object_needs_safety_runtime(object_filename);
+  snprintf(safety_gcc_object, sizeof(safety_gcc_object), "%s/safety.o",
+           runtime_directory);
+  snprintf(safety_msvc_object, sizeof(safety_msvc_object), "%s/safety.obj",
+           runtime_directory);
+  if (needs_safety) {
+    needs_crash = 1;
+  }
   snprintf(freestanding_gcc_object, sizeof(freestanding_gcc_object),
            "%s/freestanding.o", runtime_directory);
   snprintf(freestanding_msvc_object, sizeof(freestanding_msvc_object),
@@ -1946,7 +1964,7 @@ static int mettle_link_object_file(const char *object_filename,
 
   if (linker_mode == LINKER_MODE_INTERNAL || linker_mode == LINKER_MODE_AUTO) {
     size_t object_capacity =
-        7u + (use_tracy ? 2u : (needs_tracy_helpers ? 1u : 0u)) +
+        8u + (use_tracy ? 2u : (needs_tracy_helpers ? 1u : 0u)) +
         (options ? options->link_argument_count : 0u);
     const char **object_paths = calloc(object_capacity, sizeof(const char *));
     /* Parallel to object_paths: 1 marks a bundled runtime object, whose
@@ -1957,6 +1975,7 @@ static int mettle_link_object_file(const char *object_filename,
     const char *atomics_object = NULL;
     const char *profile_object = NULL;
     const char *debug_object = NULL;
+    const char *safety_object = NULL;
     char *startup_object = replace_extension(executable_filename, ".startup.obj");
     size_t object_count = 0u;
     int startup_ready = 0;
@@ -2045,6 +2064,25 @@ static int mettle_link_object_file(const char *object_filename,
           goto cleanup;
         }
       }
+      if (needs_safety) {
+        safety_object = (_access(safety_msvc_object, 0) == 0)
+                            ? safety_msvc_object
+                            : safety_gcc_object;
+        if (_access(safety_object, 0) != 0) {
+          fprintf(stderr,
+                  "Error: Bundled safety runtime object not found in '%s'\n",
+                  runtime_directory);
+          free(object_paths);
+          free(object_is_default);
+          if (startup_object) {
+            if (startup_ready) {
+              _unlink(startup_object);
+            }
+            free(startup_object);
+          }
+          goto cleanup;
+        }
+      }
 
       object_paths[object_count++] = startup_object;
       object_is_default[object_count] = 1u;
@@ -2065,6 +2103,10 @@ static int mettle_link_object_file(const char *object_filename,
       if (debug_object) {
         object_is_default[object_count] = 1u;
         object_paths[object_count++] = debug_object;
+      }
+      if (safety_object) {
+        object_is_default[object_count] = 1u;
+        object_paths[object_count++] = safety_object;
       }
       if (use_tracy) {
         object_is_default[object_count] = 1u;
@@ -2135,7 +2177,7 @@ static int mettle_link_object_file(const char *object_filename,
   }
 
   if (has_gcc && linker_mode != LINKER_MODE_MSVC) {
-    const char *runtime_objects[8] = {NULL, NULL, NULL, NULL,
+    const char *runtime_objects[9] = {NULL, NULL, NULL, NULL, NULL,
                                       NULL, NULL, NULL, NULL};
     size_t runtime_object_count = 0u;
     runtime_objects[runtime_object_count++] = external_startup_object;
@@ -2167,6 +2209,15 @@ static int mettle_link_object_file(const char *object_filename,
       }
       runtime_objects[runtime_object_count++] = profile_gcc_object;
     }
+    if (needs_safety) {
+      if (_access(safety_gcc_object, 0) != 0) {
+        fprintf(stderr,
+                "Error: Bundled safety runtime object not found in '%s'\n",
+                runtime_directory);
+        goto cleanup;
+      }
+      runtime_objects[runtime_object_count++] = safety_gcc_object;
+    }
     if (needs_debug) {
       if (_access(debug_gcc_object, 0) != 0) {
         fprintf(stderr,
@@ -2188,7 +2239,7 @@ static int mettle_link_object_file(const char *object_filename,
   }
 
   if (has_link && linker_mode != LINKER_MODE_GCC) {
-    const char *runtime_objects[8] = {NULL, NULL, NULL, NULL,
+    const char *runtime_objects[9] = {NULL, NULL, NULL, NULL, NULL,
                                       NULL, NULL, NULL, NULL};
     size_t runtime_object_count = 0u;
     runtime_objects[runtime_object_count++] = external_startup_object;
@@ -2228,6 +2279,18 @@ static int mettle_link_object_file(const char *object_filename,
         goto cleanup;
       }
       runtime_objects[runtime_object_count++] = profile_object;
+    }
+    if (needs_safety) {
+      const char *msvc_safety_object = (_access(safety_msvc_object, 0) == 0)
+                                           ? safety_msvc_object
+                                           : safety_gcc_object;
+      if (_access(msvc_safety_object, 0) != 0) {
+        fprintf(stderr,
+                "Error: Bundled safety runtime object not found in '%s'\n",
+                runtime_directory);
+        goto cleanup;
+      }
+      runtime_objects[runtime_object_count++] = msvc_safety_object;
     }
     if (needs_debug) {
       const char *msvc_debug_object = (_access(debug_msvc_object, 0) == 0)
@@ -2927,6 +2990,8 @@ int main(int argc, char *argv[]) {
       options.profile_runtime = 1;
     } else if (strcmp(argv[i], "--debug-hooks") == 0) {
       options.debug_hooks = 1;
+    } else if (strcmp(argv[i], "--safe") == 0) {
+      options.safe = 1;
     } else if (strcmp(argv[i], "--native-heap") == 0) {
       options.native_heap = 1;
     } else if (strcmp(argv[i], "--static") == 0) {
@@ -3258,11 +3323,12 @@ static int compile_type_check(TypeChecker *type_checker, ASTNode *program,
 
 static int compile_lower_to_ir(ASTNode *program, TypeChecker *type_checker,
                                SymbolTable *symbol_table,
-                               int emit_runtime_checks,
+                               int emit_runtime_checks, int emit_safety_checks,
                                IRProgram **out_ir_program,
                                char **out_ir_error) {
-  *out_ir_program = ir_lower_program(program, type_checker, symbol_table,
-                                     out_ir_error, emit_runtime_checks);
+  *out_ir_program =
+      ir_lower_program(program, type_checker, symbol_table, out_ir_error,
+                       emit_runtime_checks, emit_safety_checks);
   if (!*out_ir_program) {
     mettle_compiler_ice_report("IR lowering failed",
                                *out_ir_error ? *out_ir_error : NULL);
@@ -3813,15 +3879,31 @@ int compile_file(const char *input_filename, const char *output_filename,
    * exclusion dated from bring-up, when the trap calls could not lower.) */
   int emit_runtime_checks =
       (options->release || options->emit_ptx || options->emit_spirv) ? 0 : 1;
+  /* The device backends have their own bounds story (--gpu-checks) and their
+   * pointers are not host addresses the shadow map could describe. */
+  int emit_safety_checks =
+      options->safe && !options->emit_ptx && !options->emit_spirv;
   compiler_set_phase(PROFILE_PHASE_IR_LOWERING);
   phase_start = compiler_profile_begin(&profile);
   int ir_ok = compile_lower_to_ir(program, type_checker, symbol_table,
-                                   emit_runtime_checks, &ir_program,
-                                   &ir_error_message);
+                                   emit_runtime_checks, emit_safety_checks,
+                                   &ir_program, &ir_error_message);
   compiler_profile_add(&profile, PROFILE_PHASE_IR_LOWERING, phase_start);
   if (!ir_ok) {
     result = 1;
     goto cleanup;
+  }
+
+  /* Resolve the access marks before anything else looks at the IR: prove away
+   * what cannot fail, compile the rest into ordinary instructions. Every later
+   * stage, the interpreter included, sees IR with no safety opcodes in it. */
+  if (emit_safety_checks) {
+    IRSafetyStats safety_stats = {0};
+    if (!ir_safety_resolve_program(ir_program, &safety_stats)) {
+      mettle_compiler_ice_report("Safety check resolution failed", NULL);
+      result = 1;
+      goto cleanup;
+    }
   }
 
   mettle_compiler_ctx_set_ir_program(ir_program);
@@ -4437,6 +4519,8 @@ void print_usage(const char *program_name) {
          "--profile-runtime\n");
   printf("  --debug-hooks       Instrument for the interactive source-level "
          "debugger (requires -O0; used by the editor's F5)\n");
+  printf("  --safe              Check every memory access the compiler cannot "
+         "prove in bounds (kept under --release)\n");
   printf("  --native-heap       Route new/malloc/calloc/realloc/free through "
          "the Mettle allocator (std/alloc)\n");
   printf("  --static            Accepted for compatibility; owned ELF builds are "

@@ -1937,6 +1937,8 @@ const char *ir_opcode_name(IROpcode op) {
     return "prefetch";
   case IR_OP_SELECT:
     return "select";
+  case IR_OP_SAFETY_CHECK:
+    return "safety_check";
   case IR_OP_BINARY:
     return "binary";
   case IR_OP_ROTATE_ADD:

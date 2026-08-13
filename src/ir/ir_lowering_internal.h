@@ -47,6 +47,12 @@ typedef struct {
   TypeChecker *type_checker;
   SymbolTable *symbol_table;
   int emit_runtime_checks;
+  /* `--safe`: emit an IR_OP_SAFETY_CHECK at every memory access. Independent
+   * of emit_runtime_checks, which is the debug-build null and bounds trap and
+   * is off under --release. Safety checks are emitted at every optimization
+   * level, because the proving happens in ir_safety_resolve_program() rather
+   * than by dropping the checks. */
+  int emit_safety_checks;
   /* Declared return type name of the function currently being lowered. Used
    * to give a width-less float literal in `return <lit>;` the correct
    * single/double precision (literals always infer to float64 otherwise). */
@@ -267,6 +273,17 @@ int ir_emit_null_check(IRLoweringContext *context, IRFunction *function,
 int ir_emit_bounds_check(IRLoweringContext *context,
                                 IRFunction *function, SourceLocation location,
                                 const IROperand *index, size_t array_size);
+
+/* `--safe`: record one access for ir_safety_resolve_program() to prove or
+ * check. `base` carries the provenance and `offset` the signed byte
+ * displacement from it; `extent` is the object's size in bytes when that is a
+ * compile time constant and IR_SAFETY_EXTENT_UNKNOWN when it is not. `what` is
+ * a short source-level spelling used in the failure message. A no-op when
+ * --safe is off. */
+int ir_emit_safety_check(IRLoweringContext *context, IRFunction *function,
+                         SourceLocation location, const IROperand *base,
+                         const IROperand *offset, long long access_size,
+                         long long extent, int access_kind, const char *what);
 
 int ir_push_labeled_control_frame(IRLoweringContext *context,
                                          const char *break_label,

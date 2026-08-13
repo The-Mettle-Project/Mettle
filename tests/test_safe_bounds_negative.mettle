@@ -1,0 +1,13 @@
+// A negative index. The check compares the byte offset without sign, so this
+// fails the same comparison an oversized index does; a signed `index < length`
+// would wave it straight through.
+fn main() -> int32 {
+  var arr: int32[4];
+  var i: int32 = 0;
+
+  if (i == 0) {
+    i = 0 - 1;
+  }
+
+  return arr[i];
+}

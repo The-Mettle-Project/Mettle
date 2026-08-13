@@ -8,6 +8,7 @@
 #include "error/error_reporter.h"
 #include "ir/ir_comptime.h"
 #include "ir/ir_pgo.h"
+#include "ir/ir_safety.h"
 #include "ir/ir_verify.h"
 #include "lexer/lexer.h"
 #include "semantic/register_allocator.h"
@@ -49,6 +50,11 @@ typedef struct {
   int emit_arm64_obj;
   int optimize;
   int release;
+  /* --safe: check every memory access that cannot be proved in bounds, at any
+   * optimization level. Unlike the debug-build null and bounds traps, this is
+   * not dropped by --release; what --release changes is how many of the checks
+   * survive the proving step. */
+  int safe;
   int simd_report; /* --simd-report: note what each `@simd` loop became */
   int explain;     /* --explain: report optimization decisions (vectorization,
                       inlining) for the main input file, with reasons */
