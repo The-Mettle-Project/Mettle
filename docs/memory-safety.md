@@ -59,12 +59,14 @@ back and the median of the per-pair ratios taken:
 | crc32 | 1.00x | 31 | 4 | 27 |
 | word_count | 1.00x | 31 | 5 | 26 |
 | transpose | 1.00x | 35 | 6 | 29 |
+| popcount | 1.01x | 31 | 4 | 27 |
 | minmax_scan | 1.02x | 34 | 6 | 28 |
 | base64_encode | 1.02x | 57 | 15 | 42 |
 | reverse_i32 | 1.04x | 33 | 7 | 26 |
 | matvec | 1.05x | 37 | 8 | 29 |
+| grep | 1.05x | 32 | 4 | 28 |
 | binary_search | 1.08x | 33 | 5 | 28 |
-| heapsort | 1.88x | 54 | 16 | 38 |
+| heapsort | 1.64x | 54 | 16 | 38 |
 
 Only a quarter to a third of accesses are settled at compile time, and the
 overhead is still mostly nothing at all. That is because the two halves work on
@@ -150,6 +152,29 @@ name. `var N: int32 = 32;` at the top of a file is a constant in everything but
 spelling, and a stride of N is a known stride once nothing in the program
 assigns N. That is checked across the whole program, and taking N's address
 counts as assigning it.
+
+**A call in the body does not stop any of this.** One check standing in for a
+loop's worth is taken before the loop runs, so what matters is not whether the
+body calls out but whether the call can reach something that takes the memory
+away. A loop around a helper is one of the commonest shapes there is, and a
+helper that computes cannot free anything, so the question is asked of the
+call graph rather than assumed:
+
+- a callee whose body is in this program is read, and everything it calls
+- `free` and `realloc` are the answer, under either spelling
+- a call through a pointer, a launch, or inline assembly is refused
+- so is a write to anything that is not the callee's own local, since the
+  pointer the loop walks could be reachable that way
+- an extern with no body here is refused, except for the handful of C library
+  entry points whose contracts say what they do
+
+The caller has to hold up its end too: if it handed out the address of the
+pointer, the bound or the counter, a callee could move one of them, and a range
+worked out before the loop would stop describing what the loop walks.
+
+`popcount` and `grep` are what this was worth. Both are a byte loop around a
+helper, both were several times the unchecked build, and both are now level
+with it.
 
 heapsort is the honest end. Its sift-down indexes by `child` and `swap_idx`,
 which no loop bounds, so the checks stay and land in a loop that is already
@@ -297,12 +322,11 @@ reads, and data races are all out of scope. The compile-time memory analyzer
 ([docs/borrow-checker.md](borrow-checker.md)) covers some of that ground
 statically and reports leaks, which nothing here does.
 
-**A loop that calls out.** The whole-loop check is taken before the loop runs,
-so it cannot speak for memory a callee frees halfway through. A loop whose body
-calls anything therefore keeps its per-access checks, and keeps the call in its
-body that stops it vectorizing. `grep` and `popcount` are both this: a byte loop
-around a helper, several times the unchecked build and staying there until the
-helper inlines.
+**A loop that calls something which can free.** The whole-loop check is taken
+before the loop runs, so it cannot speak for memory a callee takes away
+halfway through. Where that is a real possibility the loop keeps its per-access
+checks, which is what makes the use-after-free reportable; see above for how
+the question is decided.
 
 ## Trying it
 
