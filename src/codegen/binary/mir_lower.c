@@ -4393,6 +4393,27 @@ static int mir_temp_use_build(const IRFunction *f, MirTempUseIndex *ix) {
         addr_read = &in->dest;
       }
     }
+    /* The argument vector is an input vector. Call arguments live there, and
+     * so do the third operand of a SELECT and the operands of every SIMD
+     * kernel. Counting only lhs/rhs/dest made a temp whose only reader is a
+     * call argument look unread, and the address folds below retire a
+     * producer they believe has exactly one reader -- so `%t = i << 2;
+     * f(%t); ... = base[%t]` folded `i*4` into the load's SIB and deleted the
+     * shift, leaving the call reading a register nothing wrote. Rare in
+     * ordinary code and universal under --safe, where every checked access is
+     * `check(base, off, ...)` followed by a load through the same `off`. */
+    for (size_t a = 0; a < in->argument_count; a++) {
+      const IROperand *arg = &in->arguments[a];
+      if (arg->kind != IR_OPERAND_TEMP || !arg->name) {
+        continue;
+      }
+      MirTempUse *e = mir_temp_use_slot(ix, arg->name);
+      if (!e) {
+        mir_temp_use_destroy(ix);
+        return 0;
+      }
+      e->reads++;
+    }
     for (int k = 0; k < nreads; k++) {
       MirTempUse *e = mir_temp_use_slot(ix, reads[k]->name);
       if (!e) {
