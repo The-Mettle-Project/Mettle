@@ -824,20 +824,64 @@ static int safety_body_has_no_calls(const IRFunction *function,
   return 1;
 }
 
-/* Every iteration runs every instruction, and none of them can release the
- * memory being walked. A jump back to the header is the loop closing and is
- * expected; anything else branching is not. */
-static int safety_body_is_straight_line(const IRFunction *function,
-                                        const IRWhileLoopBounds *loop) {
+/* Whether `label` is defined inside the loop's body.
+ *
+ * A branch that lands inside the body is internal shape; one that lands
+ * anywhere else leaves the loop, and the trip count then stops being the thing
+ * the header test says it is. The header and exit labels are deliberately not
+ * body labels: a jump to either is a `continue` or a `break`, and a `break`
+ * is exactly what makes a whole-range check claim iterations that never ran. */
+static int safety_label_is_in_body(const IRFunction *function,
+                                   const IRWhileLoopBounds *loop,
+                                   const char *label) {
+  if (!label) {
+    return 0;
+  }
+  for (size_t i = loop->branch_index + 1; i < loop->jump_index; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    if (instruction->op == IR_OP_LABEL && instruction->text &&
+        strcmp(instruction->text, label) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Every iteration the loop begins runs the access being hoisted, and nothing
+ * in the body can release the memory it walks.
+ *
+ * The body may branch, as long as every branch stays inside it. An `if/else`
+ * that rejoins does not change how many times the loop runs, so a check
+ * covering the range the header test describes still describes exactly what
+ * the loop will touch. What must be refused is anything that cuts the loop
+ * short -- a `break`, a `return`, a jump to the exit label -- because then the
+ * later elements are never reached and a whole-range check would accuse a
+ * program that did nothing wrong.
+ *
+ * `access_index` must therefore dominate the body: it has to sit ahead of the
+ * first branch, so that reaching the top of an iteration means performing it.
+ * An access buried inside an `if` runs on some iterations and not others, and
+ * one check for the whole range would over-claim in the same way. */
+static int safety_body_runs_access_every_iteration(
+    const IRFunction *function, const IRWhileLoopBounds *loop,
+    size_t access_index) {
+  int seen_branch = 0;
   for (size_t i = loop->branch_index + 1; i < loop->jump_index; i++) {
     const IRInstruction *instruction = &function->instructions[i];
     switch (instruction->op) {
+    case IR_OP_RETURN:
+      return 0;
     case IR_OP_LABEL:
+      seen_branch = 1;
+      continue;
     case IR_OP_JUMP:
     case IR_OP_BRANCH_ZERO:
     case IR_OP_BRANCH_EQ:
-    case IR_OP_RETURN:
-      return 0;
+      if (!safety_label_is_in_body(function, loop, instruction->text)) {
+        return 0;
+      }
+      seen_branch = 1;
+      continue;
     case IR_OP_CALL:
     case IR_OP_CALL_INDIRECT:
     case IR_OP_NEW:
@@ -851,6 +895,18 @@ static int safety_body_is_straight_line(const IRFunction *function,
       return 0;
     default:
       continue;
+    }
+  }
+  /* The access has to be reached before the body's control flow can skip it.
+   * Scanning for the first branch and comparing indices says the same thing
+   * more cheaply than a dominance computation, and errs the safe way. */
+  if (seen_branch) {
+    for (size_t i = loop->branch_index + 1; i < loop->jump_index; i++) {
+      IROpcode op = function->instructions[i].op;
+      if (op == IR_OP_LABEL || op == IR_OP_JUMP || op == IR_OP_BRANCH_ZERO ||
+          op == IR_OP_BRANCH_EQ) {
+        return access_index < i;
+      }
     }
   }
   return 1;
@@ -898,7 +954,8 @@ static int safety_try_hoist(IRFunction *function, const SafetyLoopList *loops,
                    access->location.line);
       return 0;
     }
-    if (!safety_body_is_straight_line(function, &innermost->bounds) ||
+    if (!safety_body_runs_access_every_iteration(function, &innermost->bounds,
+                                                 check_index) ||
         !safety_operand_invariant_in(function, innermost->header_index,
                                      innermost->bounds.jump_index,
                                      access->base)) {
@@ -949,9 +1006,11 @@ static int safety_try_hoist(IRFunction *function, const SafetyLoopList *loops,
       }
     }
 
-    if (!safety_body_is_straight_line(function, &form.bounds)) {
-      safety_trace("the loop body branches or calls, so one check for the "
-                   "whole range would not describe what it touches",
+    if (!safety_body_runs_access_every_iteration(function, &form.bounds,
+                                                 check_index)) {
+      safety_trace("the loop body can skip this access or leave early, so one "
+                   "check for the whole range would not describe what it "
+                   "touches",
                    access->location.line);
       return 0;
     }

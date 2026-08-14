@@ -2619,6 +2619,45 @@ catch {
   Write-CaseResult -Name "safe_mode_stack" -Passed $false -Reason $_.Exception.Message
 }
 
+# One check covering a whole loop's range is only honest when the loop really
+# does walk that range. The body may branch, so long as it rejoins and the
+# access sits ahead of the branch; a loop that can break out, or an access the
+# body reaches only sometimes, keeps its per-access checks. Getting this wrong
+# is silent in one direction (an overrun the hoist stopped describing) and
+# loud in the other (a correct program accused), so both are pinned here.
+try {
+  $hoistExe = Join-Path $tmpDir "test_safe_hoist_branchy.exe"
+  & $CompilerPath --build --safe --release "tests\test_safe_hoist_branchy.mettle" -o $hoistExe 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "--safe build of test_safe_hoist_branchy failed"
+  }
+  $hoistOut = & $hoistExe 2>&1 | Out-String
+  if ($hoistOut -notmatch "outside its allocation") {
+    throw "a loop whose body branches and rejoins walked off its array uncaught:`n$hoistOut"
+  }
+
+  $hoistClean = @(
+    @{ Name = "test_safe_hoist_break_clean";       Expect = "walk=36" },
+    @{ Name = "test_safe_hoist_conditional_clean"; Expect = "guarded=36" }
+  )
+  foreach ($case in $hoistClean) {
+    $exe = Join-Path $tmpDir "$($case.Name).exe"
+    & $CompilerPath --build --safe --release "tests\$($case.Name).mettle" -o $exe 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "--safe build of $($case.Name) failed"
+    }
+    $out = & $exe 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or $out -notmatch [regex]::Escape($case.Expect)) {
+      throw "a loop that stays in bounds was rejected in $($case.Name): expected '$($case.Expect)', got exit $LASTEXITCODE`n$out"
+    }
+  }
+  Write-CaseResult -Name "safe_mode_hoist_branchy" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "safe_mode_hoist_branchy" -Passed $false -Reason $_.Exception.Message
+}
+
 
 # --safe must not change what a correct program computes and must not reject
 # one. Real programs are what tests that: the fixtures above are written to

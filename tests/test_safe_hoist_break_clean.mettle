@@ -1,0 +1,36 @@
+// The case the whole-range hoist must refuse: a loop that can leave early.
+//
+// The bound says 1000 elements and the array holds 8, but the loop breaks
+// before it ever reaches the ninth. Hoisting one check for the range the
+// header test describes would accuse a program that stays in bounds, so a
+// loop that can cut itself short keeps its per-access checks. Exits 0.
+import "std/io";
+
+fn walk(p: int32*, n: int32) -> int32 {
+  var s: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    // The access is ahead of the branch, so only the early exit disqualifies
+    // the hoist. That is the condition under test.
+    s = s + p[i];
+    if (s >= 36) {
+      break;
+    }
+    i = i + 1;
+  }
+  return s;
+}
+
+fn main() -> int32 {
+  var small: int32[8];
+  var i: int32 = 0;
+  while (i < 8) {
+    small[i] = i + 1;
+    i = i + 1;
+  }
+  // 1 + 2 + ... + 8 = 36, so it breaks on the eighth element, still in bounds.
+  var got: int32 = walk(&small[0], 1000);
+  print("walk=");
+  println_int((int64)got);
+  return 0;
+}

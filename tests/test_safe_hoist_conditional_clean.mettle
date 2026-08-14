@@ -1,0 +1,32 @@
+// The other case the whole-range hoist must refuse: an access the body reaches
+// only on some iterations.
+//
+// The loop runs 1000 times over an 8-element array but indexes it only while
+// the index is in range. One check for the whole range would accuse a program
+// that never leaves its allocation, so an access behind a branch keeps its
+// per-access check. Exits 0.
+import "std/io";
+
+fn guarded(p: int32*, n: int32) -> int32 {
+  var s: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    if (i < 8) {
+      s = s + p[i];
+    }
+    i = i + 1;
+  }
+  return s;
+}
+
+fn main() -> int32 {
+  var small: int32[8];
+  var i: int32 = 0;
+  while (i < 8) {
+    small[i] = i + 1;
+    i = i + 1;
+  }
+  print("guarded=");
+  println_int((int64)guarded(&small[0], 1000));
+  return 0;
+}

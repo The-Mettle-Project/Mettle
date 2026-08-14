@@ -1,0 +1,32 @@
+// A loop whose body branches but always rejoins, with the access ahead of the
+// branch. The trip count is exactly what the header test says, so one check
+// covering the whole range describes what the loop touches -- and this walks
+// off the end of `small`, so that check has to catch it.
+import "std/io";
+
+fn total(p: int32*, n: int32) -> int32 {
+  var s: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    var v: int32 = p[i];
+    if (v > 0) {
+      s = s + v;
+    } else {
+      s = s - v;
+    }
+    i = i + 1;
+  }
+  return s;
+}
+
+fn main() -> int32 {
+  var small: int32[8];
+  var i: int32 = 0;
+  while (i < 8) {
+    small[i] = i + 1;
+    i = i + 1;
+  }
+  // 100 elements out of an 8-element array.
+  println_int((int64)total(&small[0], 100));
+  return 0;
+}
