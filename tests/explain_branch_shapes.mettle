@@ -1,0 +1,99 @@
+// Loop shapes whose bodies branch, and which used to collapse into one remark
+// ("the loop body branches on data ... compute both arms branchlessly"). That
+// advice is right for one of these and wrong for the rest, so each has to be
+// told apart by what its `if` is doing.
+import "std/io";
+
+// A local declared per iteration: the compiler hoists the declaration itself
+// now, so this vectorizes rather than asking the writer to move it.
+fn scale_pass(dst: float64*, src: float64*, n: int64, k: float64) -> int64 {
+    var i: int64 = 0;
+    while (i < n) {
+        var v: float64 = src[i] * k;
+        dst[i] = v + 1.0;
+        i = i + 1;
+    }
+    return n;
+}
+
+// A running extremum: vectorizes. Seeded from a[0] and started at 1, it does
+// not -- and the remark has to say THAT, not blame the branch.
+fn extent_from_first(a: float64*, n: int64) -> float64 {
+    var hi: float64 = a[0];
+    var i: int64 = 1;
+    while (i < n) {
+        if (a[i] > hi) { hi = a[i]; }
+        i = i + 1;
+    }
+    return hi;
+}
+
+// A predicated count. The branchless form IS a '+' reduction, so there is a
+// real edit to name here.
+fn count_above(a: float64*, n: int64, t: float64) -> int64 {
+    var c: int64 = 0;
+    var i: int64 = 0;
+    while (i < n) {
+        if (a[i] > t) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
+// A clamp before a store: a compiler gap, and nothing for the writer to do.
+fn clamp_all(a: float64*, n: int64, lim: float64) -> int64 {
+    var i: int64 = 0;
+    while (i < n) {
+        var v: float64 = a[i];
+        if (v > lim) { v = lim; }
+        a[i] = v;
+        i = i + 1;
+    }
+    return n;
+}
+
+// A stride the layout dictates: telling this writer to use `a[i]` is telling
+// them to store their pixels differently.
+fn green_sum(rgb: int32*, n: int64) -> int64 {
+    var s: int64 = 0;
+    var i: int64 = 0;
+    while (i < n) {
+        s = s + (int64)rgb[i * 3 + 1];
+        i = i + 1;
+    }
+    return s;
+}
+
+// Unit-stride, but off `base + invariant` rather than `base`.
+fn row_sum(m: int32*, cols: int64, r: int64) -> int64 {
+    var s: int64 = 0;
+    var c: int64 = 0;
+    while (c < cols) {
+        s = s + (int64)m[r * cols + c];
+        c = c + 1;
+    }
+    return s;
+}
+
+fn main() -> int32 {
+    var a: float64[64];
+    var b: float64[64];
+    var g: int32[192];
+    var pa: float64* = &a[0];
+    var pb: float64* = &b[0];
+    var pg: int32* = &g[0];
+    var i: int32 = 0;
+    while (i < 64) { a[i] = (float64)(i % 17) - 8.0; b[i] = 0.0; i = i + 1; }
+    i = 0;
+    while (i < 192) { g[i] = i % 23; i = i + 1; }
+
+    scale_pass(pb, pa, 64, 2.0);
+    var acc: int64 = (int64)extent_from_first(pa, 64);
+    acc = acc + count_above(pa, 64, 0.0);
+    acc = acc + clamp_all(pb, 64, 5.0);
+    acc = acc + green_sum(pg, 64);
+    acc = acc + row_sum(pg, 8, 3);
+    print_int(acc);
+    newline();
+    return 0;
+}

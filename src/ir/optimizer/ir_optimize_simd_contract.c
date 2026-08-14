@@ -209,6 +209,384 @@ static int ir_label_is_runtime_check(const char *label) {
          strstr(label, "trap_bounds") != NULL || strstr(label, "in_bounds") != NULL;
 }
 
+/* What a data-dependent `if` in a loop body is actually doing.
+ *
+ * "Compute both arms and select arithmetically" is sound counsel for a
+ * predicated store and no help at all for a running maximum, which has no
+ * arithmetic form to rewrite into -- and which now vectorizes on its own when
+ * the rest of the loop allows it, so a reader who followed that advice would
+ * be rewriting a loop the compiler had already declined for some other reason.
+ * Naming the shape is what makes the sentence after it worth acting on. */
+typedef enum {
+  IR_BRANCH_SHAPE_OTHER = 0,
+  IR_BRANCH_SHAPE_EXTREMUM,    /* if (v > m) { m = v; } */
+  IR_BRANCH_SHAPE_COUNT,       /* if (cond) { c = c + 1; } */
+  IR_BRANCH_SHAPE_CLAMP_STORE  /* if (v > hi) { v = hi; } ... a[i] = v; */
+} IRBranchShape;
+
+/* The symbol a diamond's arm writes, plus what kind of write it is. `at` is
+ * the BRANCH_ZERO; the arm runs to its jump-to-end. */
+static IRBranchShape ir_classify_one_diamond(const IRFunction *function,
+                                             size_t at, size_t end,
+                                             const IRInstruction *compare,
+                                             const char **written_out) {
+  size_t jump = at + 1;
+  size_t write = 0;
+  int found = 0;
+
+  for (; jump < end; jump++) {
+    IROpcode op = function->instructions[jump].op;
+    if (op == IR_OP_JUMP) {
+      break;
+    }
+    if (op == IR_OP_LABEL || op == IR_OP_BRANCH_ZERO || op == IR_OP_BRANCH_EQ) {
+      return IR_BRANCH_SHAPE_OTHER;
+    }
+  }
+  if (jump >= end) {
+    return IR_BRANCH_SHAPE_OTHER;
+  }
+  /* An arm may do more than one thing (`v = lim; clipped = clipped + 1;`).
+   * The write that names a tested operand is the one the shape is about; the
+   * others are bookkeeping alongside it. */
+  for (size_t i = at + 1; i < jump; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (!ir_instruction_writes_destination(ins) ||
+        ins->dest.kind != IR_OPERAND_SYMBOL || !ins->dest.name) {
+      continue;
+    }
+    found++;
+    if (!write) {
+      write = i;
+    }
+    if (compare && (ir_operand_is_symbol_named(&compare->lhs, ins->dest.name) ||
+                    ir_operand_is_symbol_named(&compare->rhs, ins->dest.name))) {
+      write = i;
+      break;
+    }
+  }
+  if (!found) {
+    return IR_BRANCH_SHAPE_OTHER;
+  }
+  {
+    const IRInstruction *w = &function->instructions[write];
+    int writes_tested_operand =
+        compare && (ir_operand_is_symbol_named(&compare->lhs, w->dest.name) ||
+                    ir_operand_is_symbol_named(&compare->rhs, w->dest.name));
+    *written_out = w->dest.name;
+    /* `c = c + <x>`: a predicated count, or a conditional running sum. */
+    if (!writes_tested_operand && w->op == IR_OP_BINARY && w->text &&
+        w->text[0] == '+' && !w->text[1] &&
+        (ir_operand_is_symbol_named(&w->lhs, w->dest.name) ||
+         ir_operand_is_symbol_named(&w->rhs, w->dest.name))) {
+      return IR_BRANCH_SHAPE_COUNT;
+    }
+    /* A tested operand copied back UNCHANGED is an extremum. Recomputing it
+     * (`v = 0.0 - v`, an absolute value) is a different shape entirely, and
+     * calling that a running maximum would name the wrong variable. The copy
+     * is either the other tested operand by name, or the load temp behind it:
+     * an arm that re-reads `a[i]` writes a fresh temp for the same element. */
+    if (writes_tested_operand && w->op == IR_OP_LOAD) {
+      return IR_BRANCH_SHAPE_EXTREMUM;
+    }
+    if (writes_tested_operand && w->op == IR_OP_ASSIGN && w->lhs.name) {
+      const IROperand *other =
+          ir_operand_is_symbol_named(&compare->lhs, w->dest.name)
+              ? &compare->rhs
+              : &compare->lhs;
+      if (other->name && strcmp(other->name, w->lhs.name) == 0) {
+        return IR_BRANCH_SHAPE_EXTREMUM;
+      }
+      if (w->lhs.kind == IR_OPERAND_TEMP) {
+        const IRInstruction *src =
+            ir_find_temp_producer_before(function, write, w->lhs.name);
+        /* A cast counts: `(int32)bytes[i]` is still the element that was
+         * tested, only widened. Arithmetic does not. */
+        if (src && (src->op == IR_OP_LOAD || src->op == IR_OP_CAST)) {
+          return IR_BRANCH_SHAPE_EXTREMUM;
+        }
+      }
+    }
+    if (writes_tested_operand) {
+      return IR_BRANCH_SHAPE_CLAMP_STORE;
+    }
+    return IR_BRANCH_SHAPE_OTHER;
+  }
+}
+
+/* The dominant shape among the region's data-dependent diamonds, with the
+ * symbol the arm writes. A clamp's two diamonds (a low bound and a high one)
+ * report as one clamp; a mixed body reports OTHER. */
+static IRBranchShape ir_region_branch_shape(const IRFunction *function,
+                                            size_t begin, size_t end,
+                                            const char **written_out) {
+  IRBranchShape shape = IR_BRANCH_SHAPE_OTHER;
+  int seen = 0;
+  int has_store = 0;
+  size_t body_lo = begin + 1;
+  size_t exit_test = (size_t)-1;
+
+  /* The loop's own exit test is the first branch after its header. It is the
+   * trip count, not a decision about an element, and counting it as one leaves
+   * every real diamond looking like a mixed body. */
+  for (size_t i = begin; i < end; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_LABEL && ir_label_is_loop_header(ins->text)) {
+      for (size_t j = i + 1; j < end; j++) {
+        if (function->instructions[j].op == IR_OP_BRANCH_ZERO ||
+            function->instructions[j].op == IR_OP_BRANCH_EQ) {
+          exit_test = j;
+          break;
+        }
+      }
+      body_lo = (exit_test == (size_t)-1) ? i + 1 : exit_test + 1;
+      break;
+    }
+  }
+  for (size_t i = body_lo; i < end; i++) {
+    if (function->instructions[i].op == IR_OP_STORE) {
+      has_store = 1;
+    }
+  }
+  for (size_t i = body_lo; i < end; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    const IRInstruction *compare = NULL;
+    const char *written = NULL;
+    IRBranchShape one;
+    if (ins->op != IR_OP_BRANCH_ZERO || ir_label_is_runtime_check(ins->text)) {
+      continue;
+    }
+    for (size_t j = i; j > body_lo; j--) {
+      const IRInstruction *c = &function->instructions[j - 1];
+      if (c->op == IR_OP_BINARY && c->dest.kind == IR_OPERAND_TEMP &&
+          c->dest.name && ir_operand_is_temp_named(&ins->lhs, c->dest.name)) {
+        compare = c;
+        break;
+      }
+    }
+    one = ir_classify_one_diamond(function, i, end, compare, &written);
+    if (one == IR_BRANCH_SHAPE_EXTREMUM && has_store) {
+      /* A tested value written back and then stored is a clamp, not a
+       * reduction: the running state is the element, not an accumulator. */
+      one = IR_BRANCH_SHAPE_CLAMP_STORE;
+    } else if (one == IR_BRANCH_SHAPE_CLAMP_STORE && !has_store) {
+      one = IR_BRANCH_SHAPE_OTHER; /* nothing stored: not a clamp */
+    }
+    if (!seen) {
+      shape = one;
+      *written_out = written;
+      seen = 1;
+    } else if (one != shape) {
+      return IR_BRANCH_SHAPE_OTHER;
+    }
+  }
+  return seen ? shape : IR_BRANCH_SHAPE_OTHER;
+}
+
+/* The loop counter of the while-loop whose header opens this region, or NULL.
+ * The header's compare is `iv < bound`, and its left side names the counter. */
+static const char *ir_region_loop_counter(const IRFunction *function,
+                                          size_t begin, size_t end) {
+  for (size_t i = begin; i < end; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    size_t cmp = 0;
+    if (ins->op != IR_OP_LABEL || !ir_label_is_loop_header(ins->text)) {
+      continue;
+    }
+    if (!ir_find_next_non_nop(function, i + 1, &cmp) || cmp >= end) {
+      return NULL;
+    }
+    {
+      const IRInstruction *c = &function->instructions[cmp];
+      if (c->op != IR_OP_BINARY || c->is_float || !c->text ||
+          strcmp(c->text, "<") != 0 || c->lhs.kind != IR_OPERAND_SYMBOL ||
+          !c->lhs.name) {
+        return NULL;
+      }
+      /* Pointer induction can rewrite the exit test to walk a pointer while
+       * the source's counter lives on, still indexing the arrays the test no
+       * longer mentions. The index math is what these diagnoses read, so take
+       * the counter the body increments by one. */
+      if (!ir_symbol_contains(c->lhs.name, "__ptr_")) {
+        return c->lhs.name;
+      }
+      for (size_t j = cmp + 1; j < end; j++) {
+        const IRInstruction *step = &function->instructions[j];
+        if (step->op == IR_OP_BINARY && !step->is_float && step->text &&
+            strcmp(step->text, "+") == 0 &&
+            step->dest.kind == IR_OPERAND_SYMBOL && step->dest.name &&
+            !ir_symbol_contains(step->dest.name, "__ptr_") &&
+            ir_operand_is_symbol_named(&step->lhs, step->dest.name) &&
+            ir_operand_is_int_value(&step->rhs, 1)) {
+          return step->dest.name;
+        }
+      }
+    }
+    return NULL;
+  }
+  return NULL;
+}
+
+/* The element stride of an address index, in elements, or 0 when the index is
+ * not an affine function of the counter this understands. `elem_size` is the
+ * access width in bytes, so a byte offset of `iv << 3` on a 4-byte access is a
+ * stride of two. */
+static long long ir_index_element_stride(const IRFunction *function,
+                                         size_t before, const IROperand *index,
+                                         const char *iv, long long elem_size,
+                                         int depth) {
+  const IRInstruction *p = NULL;
+  if (!index || !iv || elem_size <= 0 || depth > 4) {
+    return 0;
+  }
+  if (ir_operand_is_symbol_named(index, iv)) {
+    return elem_size == 1 ? 1 : 0; /* raw counter: one element only at width 1 */
+  }
+  if (index->kind != IR_OPERAND_TEMP || !index->name) {
+    return 0;
+  }
+  p = ir_find_temp_producer_before(function, before, index->name);
+  if (!p || p->op != IR_OP_BINARY || p->is_float || !p->text) {
+    return 0;
+  }
+  /* `X << k` and `X * k` both scale; `X + c` shifts the start without changing
+   * the stride. */
+  if ((strcmp(p->text, "<<") == 0 || strcmp(p->text, "*") == 0) &&
+      p->rhs.kind == IR_OPERAND_INT) {
+    long long scale = strcmp(p->text, "<<") == 0
+                          ? (p->rhs.int_value < 40 ? (1LL << p->rhs.int_value)
+                                                   : 0)
+                          : p->rhs.int_value;
+    if (scale <= 0) {
+      return 0;
+    }
+    if (ir_operand_is_symbol_named(&p->lhs, iv)) {
+      return (scale % elem_size) ? 0 : scale / elem_size;
+    }
+    {
+      long long inner = ir_index_element_stride(function, before, &p->lhs, iv,
+                                                1, depth + 1);
+      if (!inner) {
+        return 0;
+      }
+      return ((inner * scale) % elem_size) ? 0 : (inner * scale) / elem_size;
+    }
+  }
+  if (strcmp(p->text, "+") == 0) {
+    if (p->rhs.kind == IR_OPERAND_INT) {
+      return ir_index_element_stride(function, before, &p->lhs, iv, elem_size,
+                                     depth + 1);
+    }
+    if (p->lhs.kind == IR_OPERAND_INT) {
+      return ir_index_element_stride(function, before, &p->rhs, iv, elem_size,
+                                     depth + 1);
+    }
+  }
+  return 0;
+}
+
+/* Does the region access memory with a stride greater than one element? The
+ * kernels all walk their bases by one vector per iteration, so `a[i*3]` is
+ * outside every one of them -- and saying so beats the catch-all, which tells
+ * a reader whose index is already what they meant to write to go make it
+ * unit-stride. */
+static long long ir_region_strided_access(const IRFunction *function,
+                                          size_t begin, size_t end) {
+  const char *iv = ir_region_loop_counter(function, begin, end);
+  long long worst = 0;
+  if (!iv) {
+    return 0;
+  }
+  for (size_t i = begin + 1; i < end; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    const IROperand *addr = NULL;
+    const IRInstruction *sum = NULL;
+    long long size = 0;
+    long long stride = 0;
+    if (ins->op == IR_OP_LOAD) {
+      addr = &ins->lhs;
+    } else if (ins->op == IR_OP_STORE) {
+      addr = &ins->dest;
+    } else {
+      continue;
+    }
+    if (addr->kind != IR_OPERAND_TEMP || !addr->name ||
+        ins->rhs.kind != IR_OPERAND_INT) {
+      continue;
+    }
+    size = ins->rhs.int_value;
+    sum = ir_find_temp_producer_before(function, i, addr->name);
+    if (!sum || sum->op != IR_OP_BINARY || !sum->text ||
+        strcmp(sum->text, "+") != 0 || sum->lhs.kind != IR_OPERAND_SYMBOL) {
+      continue;
+    }
+    stride = ir_index_element_stride(function, i, &sum->rhs, iv, size, 0);
+    if (stride > worst) {
+      worst = stride;
+    }
+  }
+  return worst > 1 ? worst : 0;
+}
+
+/* Does an access index the counter PLUS something that does not vary -- the
+ * `m[row * cols + c]` of every row-major inner loop? The access is perfectly
+ * unit-stride; it just is not `base[i]`, which is the only address form the
+ * kernels index off. Naming the invariant term turns the catch-all into an
+ * edit: bind it to a pointer before the loop. Returns 1 and fills `element`
+ * with the base array's name when it finds one. */
+static int ir_region_invariant_index_term(const IRFunction *function,
+                                          size_t begin, size_t end,
+                                          const char **base_out) {
+  const char *iv = ir_region_loop_counter(function, begin, end);
+  if (!iv) {
+    return 0;
+  }
+  for (size_t i = begin + 1; i < end; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    const IROperand *addr = NULL;
+    const IRInstruction *sum = NULL;
+    const IRInstruction *scale = NULL;
+    const IRInstruction *inner = NULL;
+    if (ins->op == IR_OP_LOAD) {
+      addr = &ins->lhs;
+    } else if (ins->op == IR_OP_STORE) {
+      addr = &ins->dest;
+    } else {
+      continue;
+    }
+    if (addr->kind != IR_OPERAND_TEMP || !addr->name) {
+      continue;
+    }
+    sum = ir_find_temp_producer_before(function, i, addr->name);
+    if (!sum || sum->op != IR_OP_BINARY || !sum->text ||
+        strcmp(sum->text, "+") != 0 || sum->lhs.kind != IR_OPERAND_SYMBOL ||
+        sum->rhs.kind != IR_OPERAND_TEMP || !sum->rhs.name) {
+      continue;
+    }
+    scale = ir_find_temp_producer_before(function, i, sum->rhs.name);
+    if (!scale || scale->op != IR_OP_BINARY || !scale->text ||
+        strcmp(scale->text, "<<") != 0 || scale->lhs.kind != IR_OPERAND_TEMP ||
+        !scale->lhs.name) {
+      continue;
+    }
+    inner = ir_find_temp_producer_before(function, i, scale->lhs.name);
+    if (!inner || inner->op != IR_OP_BINARY || !inner->text ||
+        strcmp(inner->text, "+") != 0) {
+      continue;
+    }
+    /* One side the counter, the other a runtime value -- not a literal, which
+     * the address folder handles on its own. */
+    if ((ir_operand_is_symbol_named(&inner->lhs, iv) &&
+         inner->rhs.kind != IR_OPERAND_INT) ||
+        (ir_operand_is_symbol_named(&inner->rhs, iv) &&
+         inner->lhs.kind != IR_OPERAND_INT)) {
+      *base_out = sum->lhs.name;
+      return 1;
+    }
+  }
+  return 0;
+}
+
 /* Forward decl: the dependence-analysis recurrence finder lives further down
  * (next to the deeper --explain diagnosis that shares it). */
 static const char *ir_region_find_serial_recurrence(const IRFunction *function,
@@ -361,6 +739,10 @@ const char *ir_simd_bail_id_name(int id) {
   case IR_SIMD_BAIL_BODY_LOCAL:          return "body-local";
   case IR_SIMD_BAIL_DOT_SHAPE_ADDRESS:   return "dot-shape-address";
   case IR_SIMD_BAIL_STORE_ONLY_FILL:     return "store-only-fill";
+  case IR_SIMD_BAIL_EXTREMUM_SHAPE:      return "extremum-shape";
+  case IR_SIMD_BAIL_PREDICATED_COUNT:    return "predicated-count";
+  case IR_SIMD_BAIL_CLAMP_STORE:         return "clamp-store";
+  case IR_SIMD_BAIL_STRIDED_ACCESS:      return "strided-access";
   case IR_SIMD_BAIL_UNRECOGNIZED_SHAPE:  return "unrecognized-shape";
   }
   return "unknown";
@@ -815,6 +1197,68 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
       IR_SIMD_SET_DIAG(IR_SIMD_BAIL_EARLY_EXIT);
       return;
     }
+    {
+      const char *written = NULL;
+      IRBranchShape shape =
+          ir_region_branch_shape(function, begin, end, &written);
+      if (shape == IR_BRANCH_SHAPE_EXTREMUM) {
+        /* A running extremum HAS a kernel (vmaxps/vmaxpd/vpmaxsd), so the
+         * branch is not what stopped this one. Say what did, or the reader
+         * rewrites a loop whose branch was never the problem. */
+        const char *acc_type =
+            written ? ir_function_local_declared_type(function, written) : NULL;
+        snprintf(reason, reason_cap,
+                 "this is a running %s -- a shape that does vectorize -- but "
+                 "the kernel did not claim it%s%s%s",
+                 "minimum/maximum",
+                 acc_type ? " (`" : "", acc_type ? written : "",
+                 acc_type ? "` is the accumulator)" : "");
+        if (acc_type && strcmp(acc_type, "float64") != 0 &&
+            strcmp(acc_type, "float32") != 0 && strcmp(acc_type, "int32") != 0) {
+          snprintf(fix, fix_cap,
+                   "declare `%s` as float32, float64 or int32: the extremum "
+                   "kernel carries those lane widths, and `%s` is %s",
+                   written, written, acc_type);
+        } else {
+          snprintf(fix, fix_cap,
+                   "the extremum kernel needs the counter to start at 0 and "
+                   "the compared value to come from `base[i]` over float32, "
+                   "float64 or int32 elements -- a scan starting at 1 (after "
+                   "seeding from `a[0]`), or one widening narrower elements, "
+                   "falls outside it");
+        }
+        IR_SIMD_SET_DIAG(IR_SIMD_BAIL_EXTREMUM_SHAPE);
+        return;
+      }
+      if (shape == IR_BRANCH_SHAPE_COUNT) {
+        snprintf(reason, reason_cap,
+                 "the body counts (or sums) under a condition -- `%s` is "
+                 "updated only on the taken arm -- and no kernel covers a "
+                 "predicated accumulator yet",
+                 written ? written : "the accumulator");
+        snprintf(fix, fix_cap,
+                 "make the accumulation unconditional so the body is straight "
+                 "line: `%s = %s + (int32)(a[i] > t)` accumulates every "
+                 "iteration and vectorizes as an int32 '+' reduction",
+                 written ? written : "c", written ? written : "c");
+        IR_SIMD_SET_DIAG(IR_SIMD_BAIL_PREDICATED_COUNT);
+        return;
+      }
+      if (shape == IR_BRANCH_SHAPE_CLAMP_STORE) {
+        snprintf(reason, reason_cap,
+                 "the body clamps or selects a value before storing it (`%s` "
+                 "is rewritten on the taken arm); the map kernels take a "
+                 "straight-line expression, and no kernel lowers a clamp to "
+                 "vmin/vmax yet",
+                 written ? written : "a local");
+        snprintf(fix, fix_cap,
+                 "nothing to change here: this is a gap in the compiler, not a "
+                 "problem with the loop");
+        IR_SIMD_MARK_ADVISORY();
+        IR_SIMD_SET_DIAG(IR_SIMD_BAIL_CLAMP_STORE);
+        return;
+      }
+    }
     snprintf(reason, reason_cap,
              "the loop body branches on data (an `if` or `&&`/`||` per "
              "iteration); only straight-line bodies vectorize");
@@ -1044,6 +1488,46 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
     }
     IR_SIMD_SET_DIAG(IR_SIMD_BAIL_STORE_ONLY_FILL);
     return;
+  }
+  {
+    /* Before the catch-all: a stride the reader wrote deliberately. Telling
+     * them to "use unit-stride `a[i]`" is not advice for `rgb[i*3+1]` -- the
+     * layout is the point -- so name the stride and say it is a gap. */
+    long long stride = ir_region_strided_access(function, begin, end);
+    if (stride > 1) {
+      snprintf(reason, reason_cap,
+               "the loop steps %lld elements at a time (`a[i*%lld]` or "
+               "similar); every kernel walks its arrays one contiguous vector "
+               "per iteration, so no gather/scatter shape is covered",
+               stride, stride);
+      snprintf(fix, fix_cap,
+               "nothing to change here unless the layout can change: %s "
+               "arrays (one per component) make each loop unit-stride and all "
+               "of them vectorize",
+               "separate");
+      IR_SIMD_MARK_ADVISORY();
+      IR_SIMD_SET_DIAG(IR_SIMD_BAIL_STRIDED_ACCESS);
+      return;
+    }
+  }
+  {
+    /* The row-major inner loop. Unit-stride, but indexed off `base + invariant`
+     * rather than `base`, which is the one address form the kernels walk. */
+    const char *base = NULL;
+    if (ir_region_invariant_index_term(function, begin, end, &base)) {
+      snprintf(reason, reason_cap,
+               "the accesses into `%s` add a loop-invariant term to the "
+               "counter (`%s[k + i]`); the kernels walk one base pointer from "
+               "element 0, so the index must be the counter alone",
+               base, base);
+      snprintf(fix, fix_cap,
+               "bind the row to a pointer before the loop (`var row = &%s[k];`) "
+               "and index it with the counter (`row[i]`) -- same addresses, and "
+               "the shape the kernels read",
+               base);
+      IR_SIMD_SET_DIAG(IR_SIMD_BAIL_DOT_SHAPE_ADDRESS);
+      return;
+    }
   }
   /* Reaching here means every disqualifier above was checked and none held,
    * so the honest statement is that no recognizer claimed the loop, not a

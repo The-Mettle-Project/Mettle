@@ -782,6 +782,36 @@ $cases = @(
     )
   },
   @{
+    # Six loop bodies that branch or index off-pattern, each with its own
+    # remark. They used to share one: "the loop body branches on data ...
+    # compute both arms branchlessly", which is real advice for the predicated
+    # count, no advice at all for a running maximum (a shape that vectorizes),
+    # and actively wrong for a stride the data layout dictates. The test pins
+    # that they stay told apart -- and that the body-local declaration in
+    # scale_pass is hoisted by the compiler rather than billed to the reader.
+    Name          = "explain_branch_shapes"
+    Path          = "tests/explain_branch_shapes.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--explain=loops")
+    Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
+    OutputMustMatch = @(
+      'scale_pass \(loop @ line 11\): vectorized',
+      'extent_from_first \(loop @ line 24\): NOT vectorized  \[extremum-shape\]',
+      'a shape that does vectorize -- but the kernel did not claim it \(`hi` is the accumulator\)',
+      'count_above \(loop @ line 36\): NOT vectorized  \[predicated-count\]',
+      'c = c \+ \(int32\)\(a\[i\] > t\)',
+      'clamp_all \(loop @ line 46\): NOT vectorized  \[clamp-store\]',
+      'green_sum \(loop @ line 60\): NOT vectorized  \[strided-access\]',
+      'the loop steps 3 elements at a time',
+      'row_sum \(loop @ line 71\): NOT vectorized  \[dot-shape-address\]',
+      'add a loop-invariant term to the counter'
+    )
+    OutputMustNotMatch = @(
+      # the catch-all must not be reached for any of them
+      'the loop body branches on data'
+    )
+  },
+  @{
     # A fix that is correct and not sufficient. The simulation applies it, sees
     # the loop stay scalar, and reports the obstacle that surfaced next -- so
     # the caveat reaches the reader before the edit does, in the action plan
@@ -793,7 +823,7 @@ $cases = @(
     Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
     OutputMustMatch = @(
       'step 1 row_energy:13',
-      'fix: declare `value` before the loop.*\(first step only\)',
+      'fix: use int32 elements and declare the accumulator as int64.*\(first step only\)',
       'still blocked: re-checked with that change applied: the loop still does not vectorize'
     )
     OutputMustNotMatch = @(
@@ -6002,6 +6032,29 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "simd_vloop_general" -Passed $false -Reason $_.Exception.Message
+}
+
+# Running extrema (simd_vloop reduce_op max/min). This is the one recognizer
+# that claims a body with a branch, so its guard rails are what rot: the
+# broadcast seed (trip counts either side of both lane splits, zero included),
+# NaN losing the comparison the way `>` does rather than the way MAXPS's src1
+# would, both operand orders, and signed int32 lanes. Kernels are @simd! so the
+# build asserts they vectorize; references iterate backwards and stay scalar.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "minmax_reduce.exe"
+  $buildOut = & $CompilerPath --build --release "tests/test_simd_minmax_reduce.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "release build failed (a @simd! kernel stopped vectorizing?): $buildOut" }
+  if (-not (Test-Path $exePath)) { throw "release build produced no executable" }
+  & $exePath 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "a vectorized extremum diverged from its scalar reference ($LASTEXITCODE failures)"
+  }
+  Write-CaseResult -Name "simd_minmax_reduce" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "simd_minmax_reduce" -Passed $false -Reason $_.Exception.Message
 }
 
 # Early-exit search skip-ahead (simd_find): find/memchr/mismatch loops keep

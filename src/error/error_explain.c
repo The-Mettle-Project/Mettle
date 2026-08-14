@@ -428,6 +428,62 @@ static const DecisionDoc DECISIONS[] = {
      "  - An address the kernel cannot follow. It handles `a[i]`, `a[c + i]`\n"
      "    with `c` invariant, and a pointer walked by a constant stride. Lift\n"
      "    the invariant part of the index into a base pointer before the loop.\n"},
+    {"extremum-shape", DECISION_VECTOR_REFUSAL,
+     "Running minimum/maximum the kernel just missed",
+     "`if (a[i] > best) { best = a[i]; }` is a shape the compiler vectorizes:\n"
+     "it reads the diamond as the operator it is and emits vmaxps/vmaxpd (or\n"
+     "vpmaxsd for int32), seeding every lane with the accumulator's incoming\n"
+     "value. So the branch is not what stopped this loop. Something else did:\n"
+     "\n"
+     "  - The counter does not start at 0. A scan seeded from `a[0]` and run\n"
+     "    from `i = 1` is outside the kernel, which treats the loop's bound as\n"
+     "    an element count from the base. Start at 0 and seed the accumulator\n"
+     "    with a sentinel instead.\n"
+     "\n"
+     "  - The elements are narrower than the accumulator. `(int32)bytes[i]`\n"
+     "    widens per element; the kernel's lanes are the element width. This\n"
+     "    is a gap, not a problem with the loop.\n"
+     "\n"
+     "  - The accumulator is not float32, float64 or int32. Those are the\n"
+     "    lane widths the extremum kernel carries. uint32 is refused because\n"
+     "    vpmaxsd compares signed.\n"
+     "\n"
+     "  - The body also stores. Then it is a clamp, not a reduction -- see\n"
+     "    `mettle explain clamp-store`.\n"},
+    {"predicated-count", DECISION_VECTOR_REFUSAL,
+     "An accumulator updated only on the taken arm",
+     "`if (a[i] > t) { c = c + 1; }` accumulates under a condition. No kernel\n"
+     "covers a predicated accumulator, but the branchless form of the same\n"
+     "loop is an ordinary '+' reduction, which does vectorize:\n"
+     "\n"
+     "    c = c + (int32)(a[i] > t);\n"
+     "\n"
+     "The comparison produces 0 or 1, so the total is identical and the body\n"
+     "becomes straight line. The same rewrite works for a conditional sum\n"
+     "(multiply the addend by the comparison instead of adding one).\n"},
+    {"clamp-store", DECISION_VECTOR_REFUSAL,
+     "A value clamped or selected before it is stored",
+     "`if (v > hi) { v = hi; }` before `a[i] = v` is a clamp: the arm rewrites\n"
+     "the element rather than an accumulator. The hardware op is vminps/\n"
+     "vmaxps and the loop is otherwise a plain map, but no kernel lowers a\n"
+     "clamp yet, so this is a gap in the compiler.\n"
+     "\n"
+     "There is nothing to change in the loop. Written branchlessly it may\n"
+     "still not vectorize -- the select has no kernel either.\n"},
+    {"strided-access", DECISION_VECTOR_REFUSAL,
+     "The loop steps more than one element at a time",
+     "`rgb[i * 3 + 1]`, `dst[i * 2]`, and any other non-unit stride. Every\n"
+     "kernel walks its arrays one contiguous vector per iteration, so a\n"
+     "strided access has no kernel to land in -- there is no gather or\n"
+     "scatter form.\n"
+     "\n"
+     "The stride is usually the data layout, not an accident, so there is\n"
+     "often nothing to change. When the layout IS free, splitting an\n"
+     "interleaved array into one array per component makes every loop over it\n"
+     "unit-stride:\n"
+     "\n"
+     "    // instead of rgb[i*3+0], rgb[i*3+1], rgb[i*3+2]\n"
+     "    r[i], g[i], b[i]        // three loops, all vectorized\n"},
     {"unrecognized-shape", DECISION_VECTOR_REFUSAL,
      "No recognizer claimed this loop",
      "The honest fallback. The compiler ruled out every disqualifier it can\n"
