@@ -450,11 +450,25 @@ static int ir_symbol_is_uint8_ptr(const IRFunction *function,
  * base[0..len). EVERY recognizer that replays a counted loop as 0..bound must
  * call this (or prove the start some other way): `var j = 3; while (j < n)`
  * silently summing/mapping the skipped prefix was a real --release miscompile. */
+int ir_instruction_is_safety_scaffolding(const IRInstruction *instruction) {
+  if (!instruction) {
+    return 0;
+  }
+  if (instruction->op == IR_OP_CALL && instruction->text &&
+      strncmp(instruction->text, "mettle_safety_", 14) == 0) {
+    return 1;
+  }
+  return instruction->dest.kind == IR_OPERAND_TEMP && instruction->dest.name &&
+         strncmp(instruction->dest.name, IR_SAFETY_TEMP_PREFIX,
+                 sizeof(IR_SAFETY_TEMP_PREFIX) - 1) == 0;
+}
+
 int ir_iv_zero_at_header(const IRFunction *function, size_t header_index,
                          const char *iv) {
   for (size_t i = header_index; i-- > 0;) {
     const IRInstruction *ins = &function->instructions[i];
-    if (ins->op == IR_OP_NOP || ins->op == IR_OP_DECLARE_LOCAL) {
+    if (ins->op == IR_OP_NOP || ins->op == IR_OP_DECLARE_LOCAL ||
+        ir_instruction_is_safety_scaffolding(ins)) {
       continue;
     }
     if (ins->op == IR_OP_LABEL || ins->op == IR_OP_JUMP ||

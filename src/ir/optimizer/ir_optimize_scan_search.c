@@ -236,7 +236,8 @@ static int ir_verify_minmax_preloop_init(const IRFunction *function,
     if (ins->op == IR_OP_LABEL) {
       break;
     }
-    if (ins->op == IR_OP_NOP || ins->op == IR_OP_DECLARE_LOCAL) {
+    if (ins->op == IR_OP_NOP || ins->op == IR_OP_DECLARE_LOCAL ||
+        ir_instruction_is_safety_scaffolding(ins)) {
       continue;
     }
     if (ins->op == IR_OP_ASSIGN &&

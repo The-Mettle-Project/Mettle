@@ -799,6 +799,21 @@ int ir_simd_sum_float_pass(IRFunction *function, int *changed);
 int ir_simd_sum_i32_pass(IRFunction *function, int *changed);
 int ir_simd_sum_u8_pass(IRFunction *function, int *changed);
 int ir_simd_fill_pass(IRFunction *function, int *changed);
+/* Temps the `--safe` pass introduces. Named apart from everything else so a
+ * recognizer can tell its own working out from the checking machinery's. */
+#define IR_SAFETY_TEMP_PREFIX ".safe"
+
+/* Whether this instruction is `--safe` scaffolding rather than the program:
+ * the arithmetic working out the range a hoisted check covers, or the check
+ * itself.
+ *
+ * A recognizer scanning back from a loop header to see how the loop was set up
+ * stops at the first write it does not recognize. Hoisting a check puts half a
+ * dozen of those in exactly that window, so without this, proving a loop's
+ * accesses safe enough to lift the check out would cost the loop its
+ * vectorization -- which is most of what lifting it out was for. */
+int ir_instruction_is_safety_scaffolding(const IRInstruction *instruction);
+
 int ir_iv_zero_at_header(const IRFunction *function, size_t header_index,
                          const char *iv);
 int ir_simd_byte_map_pass(IRFunction *function, int *changed);

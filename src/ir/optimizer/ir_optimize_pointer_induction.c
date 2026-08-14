@@ -185,7 +185,8 @@ int ir_ptr_induction_iv_start_value(const IRFunction *function,
     if (ins->op == IR_OP_LABEL) {
       break;
     }
-    if (ins->op == IR_OP_NOP || ins->op == IR_OP_DECLARE_LOCAL) {
+    if (ins->op == IR_OP_NOP || ins->op == IR_OP_DECLARE_LOCAL ||
+        ir_instruction_is_safety_scaffolding(ins)) {
       continue;
     }
     if (ins->op == IR_OP_ASSIGN &&
