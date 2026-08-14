@@ -1,24 +1,22 @@
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/docs/assets/mettle-dark.svg" />
-  <img src="https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/docs/assets/mettle-light.svg" alt="Mettle" width="120" height="120" />
+  <source
+    media="(prefers-color-scheme: dark)"
+    srcset="https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/docs/assets/mettle-dark.svg"
+    width="120" height="120" />
+  <img
+    src="https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/docs/assets/mettle-light.svg"
+    alt="Mettle" width="120" height="120" />
 </picture>
 
 # Mettle
 
-**A systems language with its own compiler, all the way down.**
+**A systems language that brings its own compiler, linker, debugger and GPU backend.**
 
-Native x86-64, its own linker, its own source-level debugger, and a CUDA backend.
-No LLVM, no VM, no managed runtime.
-
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-&nbsp;![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-2b6cb0.svg)
-&nbsp;![Dependencies](https://img.shields.io/badge/dependencies-no%20LLVM%20%C2%B7%20no%20VM-c53030.svg)
+It compiles straight to 64 bit x86. No LLVM. No virtual machine. No garbage collector.
 
 </div>
-
----
 
 ## Example
 
@@ -49,64 +47,60 @@ fn main() -> int32 {
 
 ```bash
 mettle --build hello.mettle
-./hello              # Windows: .\hello.exe
+./hello           # on Windows, .\hello.exe
 ```
 
-Types are always written out. Mettle infers no binding types, so every `var`
-carries one.
+Types are always written out, on every `var`.
 
 ## Install
 
-**Linux (x86-64)**
+Linux:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/install.sh | sh
 ```
 
-**Windows (x86-64), PowerShell**
+Windows, in PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/install.ps1 | iex
 ```
 
-Installs to `~/.mettle` or `%LOCALAPPDATA%\Mettle` and updates your PATH. No root
-or admin. Pin a version with `--version v0.15.1` (Linux) or `-Version v0.15.1`
-(Windows).
+It installs to `~/.mettle` or `%LOCALAPPDATA%\Mettle` and puts that on your PATH.
+Neither needs root or admin.
 
 ## What it does
 
-**Memory safety without annotations.** A whole-program borrow analyser reports
-use-after-free, double free, leaks, dangling returns, and pointers invalidated
-by `realloc`, at compile time and across function boundaries. You write no
-lifetimes and no ownership markers; it infers everything, and it is built to
-report nothing it cannot prove. See [the borrow analyser](docs/borrow-checker.md).
+**Finds memory bugs while it compiles.** It reads the whole program and reports
+use after free, double free, leaks, dangling returns, and pointers `realloc`
+left stale. You write no lifetimes and no ownership markers. It infers them. It
+reports only what it can prove. See
+[the memory analyser](docs/borrow-checker.md).
 
-**Checked access you can afford to leave on.** `--safe` checks every memory
-access at every optimization level, then proves away what it can: a constant
-index, a counter the loop already bounds, an index its own arithmetic bounds,
-one check standing in for a whole loop's range. What it cannot prove is
-compared against an allocation the loop resolved once, so a surviving check is
-a few instructions rather than a call. A vectorized dot product pays nothing,
-a CRC 1.04x, a heapsort whose indices come out of comparisons 2.5x. `--explain`
-reports every survivor with a reason. See
-[checked access](docs/memory-safety.md).
+**Checks the rest as it runs, cheaply enough to ship.** `--safe` checks every
+memory access at every optimization level. It then proves away what it can: a
+constant index, a counter its loop already bounds, an index its own arithmetic
+bounds, one check covering a whole loop. Whatever is left compares against an
+allocation the loop resolved once. A surviving check costs a few instructions. A
+vectorized dot product pays nothing, a CRC 1.04x, a heapsort whose indices come
+out of comparisons 2.5x. See [checked access](docs/memory-safety.md).
 
-**An optimizer that explains itself.** `--explain` prints what the optimizer did
-to every loop and call, why a loop did or did not vectorize, and what changed
-since your last build. Suggested fixes are simulated before they are printed, so
-a suggestion has already been shown to work. `--explain-json` for CI.
+**Says what the optimizer did.** `--explain` prints what became of every loop and
+every call, what stopped a loop from vectorizing, and what changed since your
+last build. It simulates each suggested fix before printing it. Every suggestion
+has already been shown to work. Use `--explain-json` in CI.
 
-**Contracts that fail the build.** `@simd!` requires a loop to vectorize,
-`@inline!` requires every call site to inline, and `@noalloc` requires a proven
-allocation-free call graph. If the compiler cannot deliver one, it stops and
-says which site defeated it.
+**Fails the build when a promise breaks.** `@simd!` demands that a loop
+vectorize, `@inline!` that every call site inline, `@noalloc` that a call graph
+allocate nothing. When the compiler cannot deliver, it stops and names the site
+that defeated it.
 
-**An AVX2 auto-vectorizer** covering reductions, maps, dot products, byte and
-quantized-integer kernels, and some serial recurrences. It beats `gcc -O3` on
-several kernels in the benchmark suite.
+**Vectorizes for AVX2** across reductions, maps, dot products, byte kernels,
+kernels over quantized integers, and some serial recurrences. It beats
+`gcc -O3` on several kernels in the benchmark suite.
 
-**GPU offload to NVIDIA**, straight to PTX with no `nvcc` and no CUDA runtime.
-Write `kernel` functions, declare them host-side, and launch:
+**Offloads to NVIDIA GPUs**, straight to PTX, with no `nvcc` and no CUDA
+runtime. Write `kernel` functions, declare them on the host, and launch them:
 
 ```mettle
 extern kernel(block = 256) vadd(a: float32*, b: float32*, c: float32*, n: int32);
@@ -114,71 +108,65 @@ extern kernel(block = 256) vadd(a: float32*, b: float32*, c: float32*, n: int32)
 dispatch vadd[work: n](da, db, dc, n);
 ```
 
-Arguments are type-checked against the declaration, the grid is computed from the
-declared block, and the launch handle resolves by name. Also: subgroup
-collectives, atomics, tensor-core operations, kernel-side `printf`, and a
-compile-time occupancy report. See [GPU offload](docs/gpu.md).
+Arguments are checked against the declaration. The grid follows from the declared
+block. Subgroup collectives, atomics, tensor core operations, `printf` inside a
+kernel, and an occupancy report at build time all work. See
+[GPU offload](docs/gpu.md).
 
-**A debugger with no external format.** Breakpoints, stepping, and live variable
-read and write over `--debug-hooks`. No gdb, no PDB, no DWARF.
+**Runs your code while it compiles.** `@test` functions run in the compiler and
+produce no binary. `mettle trace` interprets one function and prints its values
+line by line. `--pgo` runs `main` at build time and feeds the call counts it
+measured back to the optimizer.
 
-**Compile-time execution.** `@test` functions run in the compiler's interpreter
-via `mettle test`, with no binary produced. `mettle trace` interprets one
-function and prints a line-by-line value trace. `--pgo` interprets `main()` at
-build time and feeds the measured call frequencies back into the optimizer.
+**Debugs and reports crashes without outside tools.** Breakpoints, stepping, and
+reading and writing live variables over `--debug-hooks`, with no gdb, no PDB and
+no DWARF. Build with `-s` and a fault reports what the bad address was, such as a
+null field or a freed block.
 
-**Crash forensics.** With `-s`, a fault reports what the bad address actually was
-(a null field access, a freed heap block) instead of an address.
-`--native-heap` catches use-after-free at the faulting instruction.
-
-Windows is the most complete target: internal PE linker, Win32 GUI through
-`std/ui`. Linux builds, links against libc, and is fully supported for compiler
-development. See [known limitations](docs/known-limitations.md).
+Windows is the most complete target, with an internal PE linker and `std/ui` for
+windows and controls. Linux builds, links against libc, and fully supports
+compiler development. See [what is missing](docs/known-limitations.md).
 
 ## Build from source
 
-This repository is the whole toolchain: the language and its frontend, and
-**libmtlc** — the IR, the optimizers, code generation and native linking — under
-the same `src/`. There is nothing to fetch. The build is offline.
+This repository holds the whole toolchain under one `src/`: the language and its
+frontend, and **libmtlc**, which is the IR, the optimizers, code generation and
+native linking. There is nothing to fetch. The build runs offline.
 
-**Windows** (gcc or clang):
+Windows, with gcc or clang:
 
 ```powershell
 .\build.bat
 .\tests\run_tests.ps1
 ```
 
-**Linux**:
+Linux:
 
 ```bash
 make -j"$(nproc)"
 bash tools/test-elf-native.sh
 ```
 
-To build the backend on its own — the archive a foreign frontend links against,
-with none of the Mettle frontend in it:
+For the backend alone, the archive another frontend links against:
 
 ```powershell
-.\build.bat --backend-only   # Linux: make libmtlc
+.\build.bat --backend-only
 ```
 
-See [Mettle and libmtlc](docs/mettle-and-libmtlc.md) for where the frontend ends
-and the backend begins, and why that line is worth keeping inside one repository.
+See [Mettle and libmtlc](docs/mettle-and-libmtlc.md) for the line between the
+frontend and the backend.
 
-
-The editor extensions are deliberately elsewhere: they live in
-[MettleMisc](https://github.com/The-Mettle-Project/MettleMisc) — `mettle-syntax`
-for VS Code and Cursor, and `clion-plugin` for the IntelliJ family.
-
-## Examples and benchmarks
-
-Runnable samples live in [examples/](examples/). The benchmark suites pair
-Mettle against C:
+Samples live in [examples/](examples/). The benchmark suites pair Mettle against
+C:
 
 ```powershell
 .\tools\benchmark\run-benchmarks.ps1
 ```
 
+The editor extensions live in
+[MettleMisc](https://github.com/The-Mettle-Project/MettleMisc): `mettle-syntax`
+for VS Code and Cursor, `clion-plugin` for the IntelliJ family.
+
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Apache 2.0. See [LICENSE](LICENSE).
