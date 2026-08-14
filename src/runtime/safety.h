@@ -29,12 +29,14 @@
  * not allocate and cannot describe; trapping on them would reject correct
  * programs, which is the one thing this design refuses to do.
  *
- * What the compiler describes today is the heap and the module's globals.
- * Stack locals are not, because keeping two of them out of the same granule
- * needs the frame layout to align what it registers, so a pointer taken into a
- * local and carried elsewhere goes unchecked. Indexing one directly is fully
- * covered without the map, because its size is in the program and the check is
- * a comparison against a constant. See docs/memory-safety.md.
+ * Heap blocks are described as they are allocated, globals once at start-up,
+ * and a stack local for as long as its frame is alive. Locals are described
+ * only where a pointer to one actually leaves the function, because indexing
+ * one directly never reaches this map: the size is in the program, so that
+ * check is a comparison against a constant. A described local is aligned and
+ * padded to the granule, since two objects sharing one cannot both be
+ * described and the runtime will not guess between them. See
+ * docs/memory-safety.md.
  */
 
 #include <stddef.h>

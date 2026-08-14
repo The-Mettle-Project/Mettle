@@ -2567,6 +2567,59 @@ catch {
 }
 
 
+# Pointers into stack locals. Indexing a local directly never reaches the
+# runtime, since its size is in the program; this is the case that needs the
+# local described for as long as its frame lives.
+#
+# The neighbours fixture is the one that earns its keep. Two eight-byte locals
+# laid out back to back share one unit of the runtime's map, and the runtime
+# refuses to guess which of two objects owns a shared unit, so both would go
+# uncovered. Locals the compiler describes are aligned so they cannot share;
+# with that alignment removed this fixture returns 30 instead of trapping,
+# which is how it was confirmed to be testing the alignment and not the
+# layout it happened to get.
+$total++
+try {
+  $stackCleanExe = Join-Path $tmpDir "safe_stack_clean.exe"
+  & $CompilerPath --build --safe --release tests\test_safe_stack_clean.mettle -o $stackCleanExe 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "--safe build of test_safe_stack_clean failed"
+  }
+  $stackCleanOut = & $stackCleanExe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 1021) {
+    throw "correct use of stack pointers was rejected or the answer changed: expected 1021, got $LASTEXITCODE`n$stackCleanOut"
+  }
+
+  $stackBad = @("test_safe_stack_pointer", "test_safe_stack_neighbours")
+  foreach ($case in $stackBad) {
+    $safeExe = Join-Path $tmpDir "$case.safe.exe"
+    & $CompilerPath --build --safe --release "tests\$case.mettle" -o $safeExe 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "--safe build of $case failed"
+    }
+    $safeOut = & $safeExe 2>&1 | Out-String
+    if ($safeOut -notmatch "outside its allocation") {
+      throw "an overrun through a pointer into a stack local was not caught in ${case}:`n$safeOut"
+    }
+
+    $baseExe = Join-Path $tmpDir "$case.base.exe"
+    & $CompilerPath --build --release "tests\$case.mettle" -o $baseExe 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "baseline build of $case failed"
+    }
+    $baseOut = & $baseExe 2>&1 | Out-String
+    if ($baseOut -match "outside its allocation") {
+      throw "$case trapped without --safe, so the case proves nothing"
+    }
+  }
+  Write-CaseResult -Name "safe_mode_stack" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "safe_mode_stack" -Passed $false -Reason $_.Exception.Message
+}
+
+
 # --safe must not change what a correct program computes and must not reject
 # one. Real programs are what tests that: the fixtures above are written to
 # exercise a mechanism, while these were written to sort and encode and

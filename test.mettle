@@ -1,0 +1,13 @@
+fn sum_bounded(data: int32*, n: int64) -> int64 {
+    var acc: int64 = 0;
+    for i in 0..n {
+        acc += (int64)data[i];
+    }
+    return acc;
+}
+
+fn main() -> int32 {
+    var table: int32[8] = [3, 1, 4, 1, 5, 9, 2, 6];
+    var total: int64 = sum_bounded(&table[0], 8);
+    return (int32)total;
+}

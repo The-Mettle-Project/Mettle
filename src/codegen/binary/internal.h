@@ -8,6 +8,12 @@
 
 #define BINARY_TEXT_SECTION_ALIGNMENT 16
 #define BINARY_FUNCTION_STACK_SLOT_SIZE 8
+
+/* Resolution of the --safe runtime's address-to-object map, mirroring
+ * METTLE_SAFETY_GRANULE in src/runtime/safety.h. A local the compiler
+ * describes to that map is aligned and padded to this so it cannot share a
+ * unit with the local beside it; see the comment at its use in abi.c. */
+#define BINARY_SAFETY_GRANULE 16
 #define BINARY_WIN64_REGISTER_ARG_COUNT 4
 #define BINARY_WIN64_SHADOW_SPACE_SIZE 32
 #define BINARY_STACK_PAGE_SIZE 4096
@@ -765,6 +771,8 @@ int code_generator_binary_operand_uses_temp(const IROperand *operand, const char
 int code_generator_binary_operator_is_commutative(const char *op);
 int code_generator_binary_parameter_is_indirect( CodeGenerator *generator, BinaryFunctionContext *context, const char *name);
 int code_generator_binary_prepare_function_context( CodeGenerator *generator, IRFunction *ir_function, BinaryFunctionContext *context);
+int binary_function_local_is_safety_described(const IRFunction *function,
+                                              const char *name);
 void binary_operand_type_index_destroy(BinaryOperandTypeIndex *ix);
 int code_generator_binary_promote_hot_symbols( CodeGenerator *generator, BinaryFunctionContext *context, IRFunction *ir_function);
 int code_generator_binary_resolve_fixups(CodeGenerator *generator, BinaryFunctionContext *context, size_t return_offset);

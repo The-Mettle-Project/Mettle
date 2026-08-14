@@ -1,0 +1,53 @@
+// Correct use of pointers into stack locals, across the shapes describing them
+// has to get right: the whole extent of an array, an interior pointer read to
+// the end from where it starts, a local reached through a nested call, and a
+// function called repeatedly so its frame is described and retired many times.
+import "std/io";
+
+fn read_at(p: int32*, i: int32) -> int32 {
+  return p[i];
+}
+
+fn sum_through(p: int32*, n: int32) -> int32 {
+  var total: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    total = total + read_at(p, i);
+    i = i + 1;
+  }
+  return total;
+}
+
+fn frame_churn(seed: int32) -> int32 {
+  var scratch: int32[4];
+  scratch[0] = seed;
+  scratch[1] = seed + 1;
+  scratch[2] = seed + 2;
+  scratch[3] = seed + 3;
+  return read_at(&scratch[0], 3);
+}
+
+fn main() -> int32 {
+  var a: int32[4];
+  var i: int32 = 0;
+  while (i < 4) {
+    a[i] = i + 1;
+    i = i + 1;
+  }
+
+  var first: int32 = read_at(&a[0], 0);
+  var last: int32 = read_at(&a[0], 3);
+  var tail: int32 = read_at(&a[2], 1);
+  var whole: int32 = sum_through(&a[0], 4);
+
+  // The same frame described and retired a thousand times over.
+  var churn: int32 = 0;
+  var round: int32 = 0;
+  while (round < 1000) {
+    churn = frame_churn(round);
+    round = round + 1;
+  }
+
+  // 1 + 4 + 4 + 10 + 1002 = 1021
+  return first + last + tail + whole + churn;
+}

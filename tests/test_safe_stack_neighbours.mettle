@@ -1,0 +1,34 @@
+// Two small locals side by side, each reached through a pointer, with the
+// first read one element past its end.
+//
+// This is the case the alignment exists for. The runtime resolves an address
+// to its owning object at 16-byte resolution, and these are eight bytes each,
+// so laid out back to back they would share one unit. The runtime refuses to
+// guess which of two objects owns a shared unit, so both would go uncovered,
+// and the overrun below is exactly the access that lands in the shared one.
+// Locals the compiler describes are therefore given a unit to themselves.
+import "std/io";
+
+fn peek(p: int32*, i: int32) -> int32 {
+  return p[i];
+}
+
+fn main() -> int32 {
+  var a: int32[2];
+  var b: int32[2];
+  a[0] = 1;
+  a[1] = 2;
+  b[0] = 30;
+  b[1] = 40;
+
+  // Both addresses leave, so both locals are described.
+  var from_b: int32 = peek(&b[0], 0);
+
+  var i: int32 = 1;
+  if (from_b != 0) {
+    i = i + 1;
+  }
+
+  // One element past the end of `a`, which is where `b` would be.
+  return peek(&a[0], i) + from_b;
+}

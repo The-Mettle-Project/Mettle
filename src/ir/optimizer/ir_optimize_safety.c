@@ -2077,6 +2077,281 @@ static int safety_register_function(IRFunction *function) {
   return 1;
 }
 
+/* ---- describing the stack ---------------------------------------------------- */
+/*
+ * Indexing a local never needs the runtime: its size is in the program, so the
+ * check is a comparison against a constant or is proved away. What needs the
+ * runtime is a pointer taken into a local and carried somewhere the size no
+ * longer travels with it, and until now that pointer resolved to nothing and
+ * the access went unexamined.
+ *
+ * Only locals whose address genuinely leaves are described. Every indexed
+ * array has its address taken in the IR, so registering on that alone would
+ * charge two calls per invocation to functions that never needed it.
+ */
+
+#define SAFETY_MAX_ESCAPE_TEMPS 64
+
+typedef struct {
+  const char *names[SAFETY_MAX_ESCAPE_TEMPS];
+  size_t count;
+  int overflowed;
+} SafetyTempSet;
+
+static int safety_temp_set_has(const SafetyTempSet *set, const IROperand *op) {
+  if (op->kind != IR_OPERAND_TEMP || !op->name) {
+    return 0;
+  }
+  for (size_t i = 0; i < set->count; i++) {
+    if (strcmp(set->names[i], op->name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void safety_temp_set_add(SafetyTempSet *set, const IROperand *op) {
+  if (op->kind != IR_OPERAND_TEMP || !op->name || safety_temp_set_has(set, op)) {
+    return;
+  }
+  if (set->count == SAFETY_MAX_ESCAPE_TEMPS) {
+    set->overflowed = 1;
+    return;
+  }
+  set->names[set->count++] = op->name;
+}
+
+/* Whether a pointer to `local` reaches anywhere its size does not.
+ *
+ * Reading or writing through the address here is not that: those accesses
+ * carry the local's extent already. Handing the address to a call, storing it
+ * into memory, returning it, or parking it in a variable all are, because from
+ * that point the program can reach the object without anything saying how
+ * large it is.
+ *
+ * Conservative in the direction that costs speed rather than coverage: an
+ * address chain too long to follow, or a shape not recognized, counts as
+ * escaping. */
+static int safety_local_address_escapes(const IRFunction *function,
+                                        const char *local) {
+  SafetyTempSet addresses = {{0}, 0, 0};
+
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+
+    if (instruction->op == IR_OP_ADDRESS_OF &&
+        ir_operand_is_symbol_named(&instruction->lhs, local)) {
+      safety_temp_set_add(&addresses, &instruction->dest);
+      continue;
+    }
+    if (addresses.count == 0) {
+      continue;
+    }
+
+    switch (instruction->op) {
+    case IR_OP_BINARY:
+    case IR_OP_ASSIGN:
+    case IR_OP_CAST:
+      /* Address arithmetic and copies carry the pointer along. Landing in a
+       * variable rather than a temporary is already out of reach. */
+      if (safety_temp_set_has(&addresses, &instruction->lhs) ||
+          safety_temp_set_has(&addresses, &instruction->rhs)) {
+        if (instruction->dest.kind == IR_OPERAND_SYMBOL) {
+          return 1;
+        }
+        safety_temp_set_add(&addresses, &instruction->dest);
+      }
+      break;
+    case IR_OP_LOAD:
+      /* lhs is the address being read through, which is not an escape. */
+      break;
+    case IR_OP_STORE:
+      /* dest is the address, lhs the value: storing the pointer is an escape,
+       * storing through it is not. */
+      if (safety_temp_set_has(&addresses, &instruction->lhs)) {
+        return 1;
+      }
+      break;
+    case IR_OP_SAFETY_CHECK:
+      break; /* the checks themselves are not a use of the program's */
+    case IR_OP_RETURN:
+      if (safety_temp_set_has(&addresses, &instruction->lhs)) {
+        return 1;
+      }
+      break;
+    default:
+      for (size_t a = 0; a < instruction->argument_count; a++) {
+        if (safety_temp_set_has(&addresses, &instruction->arguments[a])) {
+          return 1;
+        }
+      }
+      if (safety_temp_set_has(&addresses, &instruction->lhs) ||
+          safety_temp_set_has(&addresses, &instruction->rhs)) {
+        return 1;
+      }
+      break;
+    }
+  }
+
+  return addresses.overflowed && addresses.count > 0;
+}
+
+/* `t = &local; call mettle_safety_<what>(t, ...)`. */
+static int safety_emit_local_note(IRInstructionVector *out, const char *callee,
+                                  const char *local, long long size,
+                                  SourceLocation location) {
+  char address[64];
+  snprintf(address, sizeof(address), SAFETY_TEMP_PREFIX "k%u",
+           g_safety_next_id++);
+
+  IRInstruction take = {0};
+  take.op = IR_OP_ADDRESS_OF;
+  take.location = location;
+  take.dest = ir_operand_temp(address);
+  take.lhs = ir_operand_symbol(local);
+  if (!take.dest.name || !take.lhs.name) {
+    ir_instruction_destroy_storage(&take);
+    return 0;
+  }
+  if (!ir_instruction_vector_append_move(out, &take)) {
+    ir_instruction_destroy_storage(&take);
+    return 0;
+  }
+
+  IROperand arguments[2];
+  arguments[0] = ir_operand_temp(address);
+  arguments[1] = ir_operand_int(size);
+  int ok = arguments[0].name &&
+           safety_emit_call(out, location, callee, arguments,
+                            size > 0 ? 2u : 1u);
+  ir_operand_destroy(&arguments[0]);
+  return ok;
+}
+
+typedef struct {
+  const char *name;
+  long long size;
+  SourceLocation location;
+} SafetyStackLocal;
+
+/* Register every escaping local at function entry and retire it at every exit.
+ *
+ * At entry rather than where the declaration appears, because the slot exists
+ * for the whole frame either way, and a declaration inside a loop would
+ * otherwise re-register once per iteration. */
+static int safety_describe_stack(IRProgram *program, IRFunction *function) {
+  size_t declared = 0;
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    if (function->instructions[i].op == IR_OP_DECLARE_LOCAL) {
+      declared++;
+    }
+  }
+  if (declared == 0) {
+    return 1;
+  }
+
+  /* Sized to what the function actually declares rather than to a fixed cap.
+   * A cap would silently stop describing locals past it, and a coverage hole
+   * that depends on how many variables a function happens to have is not one
+   * anybody would think to look for. */
+  SafetyStackLocal *locals = calloc(declared, sizeof(SafetyStackLocal));
+  if (!locals) {
+    return 0;
+  }
+  size_t count = 0;
+
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    if (instruction->op != IR_OP_DECLARE_LOCAL ||
+        instruction->dest.kind != IR_OPERAND_SYMBOL || !instruction->dest.name ||
+        !instruction->text) {
+      continue;
+    }
+    MtlcType *type = instruction->value_type
+                         ? instruction->value_type
+                         : ir_program_lookup_type(program, instruction->text);
+    if (!type || type->size == 0) {
+      continue;
+    }
+    if (!safety_local_address_escapes(function, instruction->dest.name)) {
+      continue;
+    }
+    locals[count].name = instruction->dest.name;
+    locals[count].size = (long long)type->size;
+    locals[count].location = instruction->location;
+    count++;
+    if (safety_trace_enabled()) {
+      fprintf(stderr, "safety: describing local %s (%zu bytes) in %s\n",
+              instruction->dest.name, type->size,
+              function->name ? function->name : "?");
+    }
+  }
+  if (count == 0) {
+    free(locals);
+    return 1;
+  }
+
+  IRInstructionVector out = {0};
+  if (!ir_instruction_vector_reserve(&out,
+                                     function->instruction_count + count * 6)) {
+    free(locals);
+    return 0;
+  }
+
+  for (size_t l = 0; l < count; l++) {
+    if (!safety_emit_local_note(&out, "mettle_safety_register", locals[l].name,
+                                locals[l].size, locals[l].location)) {
+      ir_instruction_vector_destroy(&out);
+      free(locals);
+      return 0;
+    }
+  }
+
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    IRInstruction *instruction = &function->instructions[i];
+    if (instruction->op == IR_OP_RETURN) {
+      for (size_t l = 0; l < count; l++) {
+        if (!safety_emit_local_note(&out, "mettle_safety_unregister",
+                                    locals[l].name, 0, locals[l].location)) {
+          ir_instruction_vector_destroy(&out);
+          free(locals);
+          return 0;
+        }
+      }
+    }
+    if (!ir_instruction_vector_append_move(&out, instruction)) {
+      ir_instruction_vector_destroy(&out);
+      free(locals);
+      return 0;
+    }
+  }
+
+  /* A function that runs off the end has no return to hang the retirement on,
+   * so it goes last. Retiring a slot twice is harmless; leaving one live after
+   * the frame is gone is not, because the next frame reusing that memory would
+   * be described as the old local. */
+  const IRInstruction *last =
+      out.count > 0 ? &out.items[out.count - 1] : NULL;
+  if (!last || last->op != IR_OP_RETURN) {
+    for (size_t l = 0; l < count; l++) {
+      if (!safety_emit_local_note(&out, "mettle_safety_unregister",
+                                  locals[l].name, 0, locals[l].location)) {
+        ir_instruction_vector_destroy(&out);
+        free(locals);
+        return 0;
+      }
+    }
+  }
+
+  free(locals);
+  if (!ir_function_replace_instructions(function, &out)) {
+    ir_instruction_vector_destroy(&out);
+    return 0;
+  }
+  ir_function_clear_cfg(function);
+  return 1;
+}
+
 /* ---- describing the globals ------------------------------------------------ */
 
 /* Module variables sit at fixed addresses for the whole run, so one sweep at
@@ -2180,7 +2455,8 @@ int ir_safety_register_allocations(IRProgram *program) {
     if (safety_function_is_allocator(function, allocator_source)) {
       continue;
     }
-    if (!safety_register_function(function)) {
+    if (!safety_register_function(function) ||
+        !safety_describe_stack(program, function)) {
       return 0;
     }
   }

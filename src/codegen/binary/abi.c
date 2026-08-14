@@ -19,6 +19,48 @@ int code_generator_binary_get_local_offset(BinaryFunctionContext *context,
   return binary_named_slot_table_get_offset(&context->local_slots, name);
 }
 
+/* Whether `--safe` describes this local to its runtime map, which is asked by
+ * the frame layout so it can give the local a unit of that map to itself.
+ *
+ * Read off the IR rather than passed in as a flag: the pass that decides which
+ * locals are worth describing has already said so, by emitting a registration
+ * whose argument is the address of the local. Nothing else needs to agree on
+ * the criteria, and a change to them cannot leave the two out of step. */
+int binary_function_local_is_safety_described(const IRFunction *function,
+                                              const char *name) {
+  if (!function || !name) {
+    return 0;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *call = &function->instructions[i];
+    if (call->op != IR_OP_CALL || !call->text || call->argument_count == 0 ||
+        strcmp(call->text, "mettle_safety_register") != 0 ||
+        call->arguments[0].kind != IR_OPERAND_TEMP ||
+        !call->arguments[0].name) {
+      continue;
+    }
+    /* The address is taken immediately before the call, so a short walk back
+     * finds it without a general search. */
+    for (size_t back = i; back-- > 0;) {
+      const IRInstruction *take = &function->instructions[back];
+      if (take->op != IR_OP_ADDRESS_OF ||
+          take->dest.kind != IR_OPERAND_TEMP || !take->dest.name ||
+          strcmp(take->dest.name, call->arguments[0].name) != 0) {
+        if (i - back > 4) {
+          break;
+        }
+        continue;
+      }
+      if (take->lhs.kind == IR_OPERAND_SYMBOL && take->lhs.name &&
+          strcmp(take->lhs.name, name) == 0) {
+        return 1;
+      }
+      break;
+    }
+  }
+  return 0;
+}
+
 int code_generator_binary_get_temp_offset(BinaryFunctionContext *context,
                                                  const char *name) {
   return binary_named_slot_table_get_offset(&context->temp_slots, name);
@@ -1487,6 +1529,7 @@ int code_generator_binary_prepare_function_context(
     int local_alignment = 0;
     int local_storage_size = 0;
     int scalar_local = 0;
+    int safety_described = 0;
     int existing_offset = 0;
 
     if (!instruction || instruction->op != IR_OP_DECLARE_LOCAL) {
@@ -1527,6 +1570,29 @@ int code_generator_binary_prepare_function_context(
 
     local_storage_size = scalar_local ? BINARY_FUNCTION_STACK_SLOT_SIZE
                                       : (int)local_type->size;
+
+    /* --safe: a local this function hands to the safety runtime is described
+     * to a map that resolves an address to its owning object at 16-byte
+     * resolution. Two objects sharing one of those units cannot both be
+     * described, and the runtime refuses to guess between them, so the one
+     * that matters most goes uncovered: an overrun of a few bytes lands in the
+     * unit the object shares with its neighbour. Giving these their own units
+     * is what makes the coverage real. Only the locals the pass chose to
+     * describe pay the padding. */
+    safety_described =
+        binary_function_local_is_safety_described(ir_function,
+                                                  instruction->dest.name);
+    if (safety_described) {
+      if (local_alignment < BINARY_SAFETY_GRANULE) {
+        local_alignment = BINARY_SAFETY_GRANULE;
+      }
+      if (local_storage_size > 0 &&
+          local_storage_size < INT_MAX - (BINARY_SAFETY_GRANULE - 1)) {
+        local_storage_size =
+            (local_storage_size + BINARY_SAFETY_GRANULE - 1) /
+            BINARY_SAFETY_GRANULE * BINARY_SAFETY_GRANULE;
+      }
+    }
     if (local_storage_size <= 0) {
       code_generator_set_error(generator,
                                "Invalid local storage size in function '%s'",

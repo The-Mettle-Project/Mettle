@@ -1,0 +1,21 @@
+// A pointer taken into a stack local and carried into another function, read
+// well past the end. Nothing at the access site says how large the object is,
+// so catching this depends on the local having been described to the runtime
+// for as long as its frame is alive.
+import "std/io";
+
+fn read_at(p: int32*, i: int32) -> int32 {
+  return p[i];
+}
+
+fn main() -> int32 {
+  var a: int32[4];
+  a[0] = 1;
+
+  var i: int32 = 4;
+  if (i != 0) {
+    i = i + 60;
+  }
+
+  return read_at(&a[0], i);
+}

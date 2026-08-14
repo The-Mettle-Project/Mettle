@@ -30,16 +30,23 @@ Everything below is caught at `--release`, with the optimizer on:
 | A pointer kept across `realloc` | `q = realloc(p, n); p[0]` |
 | Running off one allocation into the next | `p` and `q` adjacent, `p[distance_to_q]` |
 | A null dereference | `p = 0; p[0]` |
+| Past a stack local, through a pointer | `f(&a[0], i)` where `i` leaves `a` |
+| Past a global, through a pointer | `f(&TABLE[0], i)` |
 
-The last two are worth separating out, because they are what an address-only
-check gets wrong.
+Two of those are worth separating out.
 
-An access is bounded by *the allocation its pointer came from*, not by whatever
-allocation the computed address happens to land in. So the check is handed the
-base pointer and the displacement separately, and resolves the base. Walking
-off the end of one live block into another live block is still caught, which a
-check that only asked "is this address inside something live" would wave
+**Running off one allocation into the next** is what an address-only check gets
+wrong. An access is bounded by *the allocation its pointer came from*, not by
+whatever allocation the computed address happens to land in. So the check is
+handed the base pointer and the displacement separately, and resolves the base.
+A check that only asked "is this address inside something live" would wave it
 through.
+
+**Through a pointer** is the case that needs the runtime at all. Indexing a
+local or a global directly never reaches it: the size is right there in the
+program, so the check is a comparison against a constant, or is proved away.
+It is only once a pointer into one is carried somewhere the size does not
+travel with it that anything has to be looked up.
 
 ## What it costs
 
@@ -165,7 +172,17 @@ holds them to it.
 At run time, a map from address to owning allocation answers what survives. It
 is a three-level table over the address space holding one region id per
 16-byte granule, and ids index descriptors carrying each allocation's start and
-length. Freeing does not clear the granules; it marks the descriptor dead and
+length. Heap blocks are described as they are allocated, globals once at the
+top of `main`, and a stack local for as long as its frame is alive, though only
+where a pointer to it actually leaves: every indexed array has its address
+taken, and describing on that alone would charge two calls per call to
+functions that never needed it.
+
+A described local is also aligned and padded to the map's 16-byte resolution,
+because two objects sharing one of those units cannot both be described and the
+runtime refuses to guess between them. Without that, the access most worth
+catching is the one that goes uncovered: an overrun of a few bytes lands
+exactly in the unit an object shares with its neighbour. Freeing does not clear the granules; it marks the descriptor dead and
 leaves them naming it, which is what lets a pointer kept across the free be
 reported as use-after-free rather than read back as untracked memory. The
 descriptor is reclaimed once a later allocation has taken every granule it
@@ -192,13 +209,7 @@ only the displacement moves. Catching the walked-off case needs bounds
 travelling with the pointer, which is the fat-pointer design this one avoids
 in order to leave the ABI alone.
 
-**Pointers into stack locals.** Globals are described to the runtime once at
-the top of `main`, so a pointer taken into one is checked wherever it is
-carried. Stack objects are not, because avoiding two of them sharing a
-16-byte granule needs the frame layout to align what it registers, so a
-pointer taken into a local and passed elsewhere goes unchecked. Indexing a
-local directly is fully covered without the map, since its size is right there
-in the program and the check is a comparison against a constant.
+
 
 **The allocator itself.** An allocator writes a header below the pointer it
 returns, threads its free list through the bodies of released blocks, and
