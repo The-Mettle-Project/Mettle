@@ -1,0 +1,35 @@
+// A loop around a helper, walked one element past the end.
+//
+// The other half of letting a call stay in the body: the one check that
+// replaced the per-access ones still has to catch the overrun. If its range
+// comes out short the loop runs unexamined, and a body with a call in it is
+// exactly where that would be least likely to be noticed.
+import "std/io";
+import "std/mem";
+
+fn weigh(v: int32) -> int32 {
+  return v * 2;
+}
+
+fn direct(a: int32*, n: int32) -> int32 {
+  var total: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    total = total + weigh(a[i]);
+    i = i + 1;
+  }
+  return total;
+}
+
+fn main() -> int32 {
+  var n: int32 = 16;
+  var a: int32* = (int32*)malloc((int64)n * 4);
+  var i: int32 = 0;
+  while (i < n) {
+    a[i] = 1;
+    i = i + 1;
+  }
+  print(cstr("unreached="));
+  println_int((int64)direct(a, n + 1));
+  return 0;
+}

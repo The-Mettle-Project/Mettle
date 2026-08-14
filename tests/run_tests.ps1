@@ -2704,6 +2704,53 @@ catch {
   Write-CaseResult -Name "safe_mode_affine_index" -Passed $false -Reason $_.Exception.Message
 }
 
+# A loop whose body calls out. The check that covers a whole loop is taken
+# before the loop runs, so what matters is not whether the body has a call in it
+# but whether that call can reach anything that takes the memory away.
+#
+# All three answers are pinned. A loop around a helper that computes folds, and
+# its buffer is sized to exactly what it walks so an over-wide range trips here.
+# The same loop walked one past the end still traps, so the one check that
+# replaced the per-access ones is not short. And a loop that frees what it is
+# walking, two calls deep and behind a branch, keeps its per-access checks and
+# reports the use-after-free -- getting that one wrong is completely silent.
+try {
+  $callClean = Join-Path $tmpDir "safe_call_clean.exe"
+  & $CompilerPath --build --safe --release tests\test_safe_call_clean.mettle -o $callClean 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "--safe build of test_safe_call_clean failed"
+  }
+  $callOut = & $callClean 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0 -or $callOut -notmatch "calls=112") {
+    throw "loops around a helper were rejected or the answer changed: expected calls=112, got exit $LASTEXITCODE`n$callOut"
+  }
+
+  $callShort = Join-Path $tmpDir "safe_call_short.exe"
+  & $CompilerPath --build --safe --release tests\test_safe_call_short.mettle -o $callShort 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "--safe build of test_safe_call_short failed"
+  }
+  $shortOut = & $callShort 2>&1 | Out-String
+  if ($shortOut -notmatch "outside its allocation") {
+    throw "a loop around a helper walked past its buffer uncaught:`n$shortOut"
+  }
+
+  $callFrees = Join-Path $tmpDir "safe_call_frees.exe"
+  & $CompilerPath --build --safe --release tests\test_safe_call_frees.mettle -o $callFrees 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "--safe build of test_safe_call_frees failed"
+  }
+  $freesOut = & $callFrees 2>&1 | Out-String
+  if ($freesOut -notmatch "after it was freed") {
+    throw "a loop that freed what it was walking kept reading uncaught:`n$freesOut"
+  }
+  Write-CaseResult -Name "safe_mode_call_in_body" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "safe_mode_call_in_body" -Passed $false -Reason $_.Exception.Message
+}
+
 
 # --safe must not change what a correct program computes and must not reject
 # one. Real programs are what tests that: the fixtures above are written to

@@ -1,0 +1,48 @@
+// A loop whose body calls something that frees what the loop is walking.
+//
+// A check lifted out of a loop is taken before the loop runs, so it cannot
+// speak for memory a callee takes away halfway through. Loops around a helper
+// are common enough that refusing all of them gave up too much, so the pass
+// asks what the callee actually reaches instead. This is the case that has to
+// come out the other way: the release is two calls deep and behind a branch,
+// and the accesses after it are use-after-free.
+//
+// Getting this wrong is silent. The checks would be replaced by one taken
+// before the free happened, the reads afterwards would go unexamined, and the
+// mode would report nothing at all.
+import "std/io";
+import "std/mem";
+
+fn inner_release(p: int32*) {
+  free((cstring)p);
+}
+
+fn release(p: int32*) {
+  inner_release(p);
+}
+
+fn walk(a: int32*, n: int32) -> int32 {
+  var total: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    total = total + a[i];
+    if (i == 3) {
+      release(a);
+    }
+    i = i + 1;
+  }
+  return total;
+}
+
+fn main() -> int32 {
+  var n: int32 = 32;
+  var a: int32* = (int32*)malloc((int64)n * 4);
+  var i: int32 = 0;
+  while (i < n) {
+    a[i] = 1;
+    i = i + 1;
+  }
+  print(cstr("unreached="));
+  println_int((int64)walk(a, n));
+  return 0;
+}

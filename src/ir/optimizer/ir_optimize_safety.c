@@ -928,6 +928,254 @@ static int safety_operand_invariant_in(const IRFunction *function, size_t start,
   return 1;
 }
 
+/* ---- what a call in the body can do to the memory ------------------------- *
+ *
+ * A hoisted check speaks for a range of bytes before the loop runs, and a span
+ * resolved once speaks for an allocation's extent across the whole loop.
+ * Neither survives something freeing the block partway through, and a call is
+ * the only thing in a body that can do that.
+ *
+ * Refusing every body with a call in it was the easy reading of that, and it
+ * gives up far too much: a loop around a helper is one of the commonest shapes
+ * there is, and a helper that computes cannot take memory away from anyone. So
+ * the question asked is whether this callee, or anything it reaches, can
+ * release memory -- not whether the body has a call in it.
+ *
+ * The whole program is here, so this is answered rather than assumed. What is
+ * refused is what cannot be answered: a callee with no body in this program, a
+ * call through a pointer, a launch, and inline assembly. A write to anything
+ * that is not the callee's own local is refused too, since the pointer the
+ * loop walks, its bound and its counter may all be reachable that way. */
+
+/* The program being resolved, for reading what a callee does. Set for the
+ * duration of one resolve; the pass is not reentrant. */
+static const IRProgram *g_safety_program;
+
+static int safety_callee_can_release(const char *name, int depth);
+
+/* C library entry points that cannot release the caller's memory.
+ *
+ * Reading, writing, comparing and computing are all any of these do. The list
+ * is deliberately short and deliberately only standard names: a function this
+ * program declares extern for itself stays refused, because its contract is
+ * not something the compiler knows. */
+static int safety_extern_cannot_release(const char *name) {
+  static const char *const known[] = {
+      "memcmp",  "memchr", "memcpy", "memmove", "memset",  "strlen",
+      "strcmp",  "strncmp", "strchr", "strrchr", "strstr",  "strcpy",
+      "strncpy", "strcat",  "abs",    "labs",    "llabs",
+      "sin",     "cos",     "tan",    "asin",    "acos",    "atan",
+      "atan2",   "sinh",    "cosh",   "tanh",    "exp",     "exp2",
+      "log",     "log2",    "log10",  "pow",     "sqrt",    "cbrt",
+      "fabs",    "floor",   "ceil",   "round",   "trunc",   "fmod",
+      "fmin",    "fmax",    "sinf",   "cosf",    "tanf",    "expf",
+      "logf",    "powf",    "sqrtf",  "fabsf",   "floorf",  "ceilf",
+      "roundf",  "truncf",  "fmodf"};
+  for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
+    if (strcmp(name, known[i]) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Entry points that take memory away. Both spellings, since --native-heap
+ * rewrites one set to the other and this runs on whichever survived. */
+static int safety_name_releases_memory(const char *callee) {
+  return strcmp(callee, "free") == 0 || strcmp(callee, "realloc") == 0 ||
+         strcmp(callee, "mettle_heap_free") == 0 ||
+         strcmp(callee, "mettle_heap_realloc") == 0;
+}
+
+static const IRFunction *safety_find_function(const char *name) {
+  if (!g_safety_program || !name) {
+    return NULL;
+  }
+  for (size_t i = 0; i < g_safety_program->function_count; i++) {
+    const IRFunction *function = g_safety_program->functions[i];
+    if (function && function->name && strcmp(function->name, name) == 0) {
+      return function;
+    }
+  }
+  return NULL;
+}
+
+/* Is this name one of the function's own parameters or locals? A write to
+ * anything else outlives the call, and could be the very pointer the check was
+ * taken against. */
+static int safety_name_is_functions_own(const IRFunction *function,
+                                        const char *name) {
+  for (size_t i = 0; i < function->parameter_count; i++) {
+    if (function->parameter_names && function->parameter_names[i] &&
+        strcmp(function->parameter_names[i], name) == 0) {
+      return 1;
+    }
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op == IR_OP_DECLARE_LOCAL && in->dest.kind == IR_OPERAND_SYMBOL &&
+        in->dest.name && strcmp(in->dest.name, name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Verdicts, so a helper called from several loops is read once. Cleared with
+ * the rest of the per-program state. */
+enum { SAFETY_CALLEE_CACHE_MAX = 512 };
+typedef struct {
+  const char *name; /* borrowed from the IR */
+  int verdict;
+  int visiting;
+} SafetyCalleeVerdict;
+static SafetyCalleeVerdict g_safety_callee_cache[SAFETY_CALLEE_CACHE_MAX];
+static int g_safety_callee_cache_count;
+
+static SafetyCalleeVerdict *safety_callee_slot(const char *name) {
+  for (int i = 0; i < g_safety_callee_cache_count; i++) {
+    if (strcmp(g_safety_callee_cache[i].name, name) == 0) {
+      return &g_safety_callee_cache[i];
+    }
+  }
+  if (g_safety_callee_cache_count >= SAFETY_CALLEE_CACHE_MAX) {
+    return NULL;
+  }
+  SafetyCalleeVerdict *slot =
+      &g_safety_callee_cache[g_safety_callee_cache_count++];
+  slot->name = name;
+  slot->verdict = -1;
+  slot->visiting = 0;
+  return slot;
+}
+
+static int safety_function_can_release(const IRFunction *function, int depth) {
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    switch (in->op) {
+    case IR_OP_CALL_INDIRECT:
+    case IR_OP_GPU_LAUNCH:
+    case IR_OP_INLINE_ASM:
+      return 1;
+    case IR_OP_CALL:
+      if (!in->text || safety_callee_can_release(in->text, depth + 1)) {
+        return 1;
+      }
+      break;
+    default:
+      break;
+    }
+    /* Allocation is not release: taking a new block leaves every live one
+     * where it was. Reallocation is, and it is a call, so it is caught above. */
+    if (ir_instruction_writes_destination(in) &&
+        in->dest.kind == IR_OPERAND_SYMBOL && in->dest.name &&
+        !safety_name_is_functions_own(function, in->dest.name)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int safety_callee_can_release(const char *name, int depth) {
+  if (!name || depth > 16) {
+    return 1;
+  }
+  if (strncmp(name, "mettle_safety_", 14) == 0) {
+    return 0; /* the checking machinery itself, about to be rewritten */
+  }
+  if (safety_name_releases_memory(name)) {
+    return 1;
+  }
+  const IRFunction *callee = safety_find_function(name);
+  if (!callee) {
+    /* No body here to read. That is the end of it for a function this program
+     * declares, but not for the handful the C library defines: their contracts
+     * say what they do, and none of them can take memory away from the caller.
+     * A loop around memcmp or sqrt is common enough that refusing it was most
+     * of what the call restriction still cost. Looked up only after the
+     * program's own functions, so a definition here always wins. */
+    return !safety_extern_cannot_release(name);
+  }
+  SafetyCalleeVerdict *slot = safety_callee_slot(name);
+  if (!slot) {
+    return 1;
+  }
+  if (slot->verdict >= 0) {
+    return slot->verdict;
+  }
+  if (slot->visiting) {
+    /* A cycle. Assuming the back edge releases nothing is safe: releasing is
+     * found by reaching a free, and every function in the cycle is still read
+     * in full by the walk that is already in progress. */
+    return 0;
+  }
+  slot->visiting = 1;
+  int verdict = safety_function_can_release(callee, depth);
+  slot->visiting = 0;
+  slot->verdict = verdict;
+  return verdict;
+}
+
+/* Whether the address of this symbol is taken anywhere in the function.
+ *
+ * A callee cannot reach one of the caller's locals otherwise, which is what
+ * lets a call in the body be judged on what it frees alone. If the loop handed
+ * out the address of its own bound or counter, a callee could move it, and the
+ * range worked out before the loop would stop describing what the loop walks.
+ * The callee analysis refuses writes to anything that is not the callee's own,
+ * so a global cannot be moved that way either; this covers the rest. */
+static int safety_symbol_escapes(const IRFunction *function, const char *name) {
+  if (!name) {
+    return 0;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op == IR_OP_ADDRESS_OF && in->lhs.kind == IR_OPERAND_SYMBOL &&
+        in->lhs.name && strcmp(in->lhs.name, name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int safety_operand_escapes(const IRFunction *function,
+                                  const IROperand *operand) {
+  return operand && operand->kind == IR_OPERAND_SYMBOL &&
+         safety_symbol_escapes(function, operand->name);
+}
+
+/* Does the body call out at all? Asked only to decide whether the escape
+ * question above has to be asked; a body with no call in it cannot hand
+ * anything to anyone. */
+static int safety_body_calls_out(const IRFunction *function,
+                                 const IRWhileLoopBounds *loop) {
+  for (size_t i = loop->branch_index + 1;
+       i < loop->jump_index && i < function->instruction_count; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if ((in->op == IR_OP_CALL &&
+         (!in->text || strncmp(in->text, "mettle_safety_", 14) != 0)) ||
+        in->op == IR_OP_CALL_INDIRECT || in->op == IR_OP_NEW) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Whether this instruction, sitting in a loop body, can take away the memory
+ * the loop walks. */
+static int safety_body_instruction_can_release(const IRInstruction *in) {
+  switch (in->op) {
+  case IR_OP_CALL_INDIRECT:
+  case IR_OP_GPU_LAUNCH:
+  case IR_OP_INLINE_ASM:
+    return 1;
+  case IR_OP_CALL:
+    return !in->text || safety_callee_can_release(in->text, 0);
+  default:
+    return 0;
+  }
+}
+
 /* Nothing in the body can release the memory the loop is walking. Weaker than
  * requiring a straight line, deliberately: to reuse one resolved allocation
  * across many accesses it only matters that the allocation outlives them, not
@@ -937,18 +1185,8 @@ static int safety_body_has_no_calls(const IRFunction *function,
                                     const IRWhileLoopBounds *loop) {
   for (size_t i = loop->branch_index + 1;
        i < loop->jump_index && i < function->instruction_count; i++) {
-    const IRInstruction *instruction = &function->instructions[i];
-    if (instruction->op == IR_OP_NEW || instruction->op == IR_OP_GPU_LAUNCH ||
-        instruction->op == IR_OP_CALL_INDIRECT) {
+    if (safety_body_instruction_can_release(&function->instructions[i])) {
       return 0;
-    }
-    if (instruction->op == IR_OP_CALL) {
-      /* The checks themselves are about to be rewritten, so they do not count
-       * against the body; anything else could free what the loop is walking. */
-      if (!instruction->text ||
-          strncmp(instruction->text, "mettle_safety_", 14) != 0) {
-        return 0;
-      }
     }
   }
   return 1;
@@ -1014,15 +1252,15 @@ static int safety_body_runs_access_every_iteration(
       continue;
     case IR_OP_CALL:
     case IR_OP_CALL_INDIRECT:
-    case IR_OP_NEW:
     case IR_OP_GPU_LAUNCH:
-      /* The checks themselves are about to be removed, so they do not count
-       * against the body; anything else could free what the loop is walking. */
-      if (instruction->op == IR_OP_CALL && instruction->text &&
-          strncmp(instruction->text, "mettle_safety_", 14) == 0) {
-        continue;
+    case IR_OP_INLINE_ASM:
+      /* A call is fine where nothing it reaches can take the memory away. A
+       * loop around a helper that computes is one of the commonest shapes
+       * there is, and refusing it left the mode's worst cases exactly there. */
+      if (safety_body_instruction_can_release(instruction)) {
+        return 0;
       }
-      return 0;
+      continue;
     default:
       continue;
     }
@@ -1464,9 +1702,21 @@ static int safety_try_hoist(IRFunction *function, const SafetyLoopList *loops,
 
     if (!safety_body_runs_access_every_iteration(function, &form.bounds,
                                                  check_index)) {
-      safety_trace("the loop body can skip this access or leave early, so one "
-                   "check for the whole range would not describe what it "
-                   "touches",
+      safety_trace("the loop body can skip this access or leave early, or "
+                   "calls something that could free what it walks",
+                   access->location.line);
+      return 0;
+    }
+    /* A body that calls out may have handed the loop's own pointer, bound or
+     * counter to the callee, and a check worked out before the loop cannot
+     * survive any of the three being moved. */
+    if (safety_body_calls_out(function, &form.bounds) &&
+        (safety_operand_escapes(function, access->base) ||
+         safety_operand_escapes(function, form.bound) ||
+         safety_symbol_escapes(function, form.iv) ||
+         safety_symbol_escapes(function, shape.varying))) {
+      safety_trace("the loop hands out the address of its pointer, bound or "
+                   "counter, so a call in the body could move it",
                    access->location.line);
       return 0;
     }
@@ -2278,8 +2528,17 @@ static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
       continue;
     }
     if (!safety_body_has_no_calls(function, &loop->bounds)) {
-      safety_trace("the loop calls out, so what it walks could be freed "
-                   "under it",
+      safety_trace("the loop calls something that could free what it walks",
+                   access.location.line);
+      continue;
+    }
+    /* The span is the extent of the allocation the pointer named when the loop
+     * began. If the body handed that pointer's address out, a callee could
+     * point it somewhere else and the span would describe the wrong block. */
+    if (safety_body_calls_out(function, &loop->bounds) &&
+        safety_operand_escapes(function, access.base)) {
+      safety_trace("the loop hands out the address of the pointer it walks, so "
+                   "a call in the body could move it",
                    access.location.line);
       continue;
     }
@@ -2646,6 +2905,8 @@ int ir_safety_resolve_program(IRProgram *program, IRSafetyStats *stats) {
   if (!safety_declare_runtime(program)) {
     return 0;
   }
+  g_safety_program = program;
+  g_safety_callee_cache_count = 0;
   safety_const_globals_build(program);
   const char *allocator_source = safety_allocator_source(program);
   for (size_t i = 0; i < program->function_count; i++) {
@@ -2659,10 +2920,12 @@ int ir_safety_resolve_program(IRProgram *program, IRSafetyStats *stats) {
             : safety_resolve_function(function, stats);
     if (!resolved) {
       safety_const_globals_destroy();
+      g_safety_program = NULL;
       return 0;
     }
   }
   safety_const_globals_destroy();
+  g_safety_program = NULL;
   if (safety_time_enabled()) {
     /* Ticks rather than a converted figure: clock()'s units do not reliably
      * match CLOCKS_PER_SEC across the toolchains this builds with, and a
