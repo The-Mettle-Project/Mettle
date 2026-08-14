@@ -63,6 +63,15 @@ static const IROptNamedPass g_ir_pre_inline_passes[] = {
 };
 
 static const IROptNamedPass g_ir_post_fixpoint_passes[] = {
+    /* First, and after inlining: every recognizer below reads loop bodies, and
+     * a declaration sitting in one hides the shape from all of them. Inlining
+     * plants a fresh one per parameter of every call it folded into a body, so
+     * this has to run downstream of it. */
+    {"hoist_body_locals", ir_hoist_body_locals_pass},
+    /* Before pointer induction, which rewrites an int32 scan's counter into a
+     * walking pointer -- the extremum diamond then indexes off something no
+     * longer recognizable as the loop counter. */
+    {"simd_minmax_reduce", ir_simd_minmax_reduce_pass},
     {"induction_pointer", ir_pointer_induction_pass},
     /* After pointer induction so range-for fills (already converted to the
      * pointer-walk form) and while-loop fills (still indexed) both match. */

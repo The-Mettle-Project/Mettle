@@ -360,6 +360,7 @@ int ir_eliminate_unreachable_blocks_pass(IRFunction *function,
                                                 int *changed);
 int ir_eliminate_unreachable_straightline_pass(IRFunction *function,
                                                        int *changed);
+int ir_hoist_body_locals_pass(IRFunction *function, int *changed);
 int ir_find_label_index(const IRFunction *function, const char *label,
                                size_t *out_index);
 int ir_find_last_writer_before(const IRFunction *function, size_t before_index,
@@ -687,6 +688,10 @@ typedef enum {
   IR_SIMD_BAIL_BODY_LOCAL,         /* user local declared inside the body */
   IR_SIMD_BAIL_DOT_SHAPE_ADDRESS,  /* float MAC, address pattern unmatched */
   IR_SIMD_BAIL_STORE_ONLY_FILL,    /* writes-only fill/init pattern */
+  IR_SIMD_BAIL_EXTREMUM_SHAPE,     /* running min/max the kernel just missed */
+  IR_SIMD_BAIL_PREDICATED_COUNT,   /* `if (cond) { c = c + 1; }` */
+  IR_SIMD_BAIL_CLAMP_STORE,        /* `if (v > hi) v = hi;` then a[i] = v */
+  IR_SIMD_BAIL_STRIDED_ACCESS,     /* a[i*k] / a[i*k+c]: not unit stride */
   IR_SIMD_BAIL_UNRECOGNIZED_SHAPE  /* honest fallback: no cause identified */
 } IRSimdBailId;
 /* Stable lowercase-kebab name for an id (e.g. "byte-sum-narrow-acc"). */
@@ -795,6 +800,7 @@ int ir_simd_slp_mac_i8_pass(IRFunction *function, int *changed);
 int ir_simd_insertion_sort_i32_pass(IRFunction *function, int *changed);
 int ir_simd_memory_map_pass(IRFunction *function, int *changed);
 int ir_simd_minmax_i32_pass(IRFunction *function, int *changed);
+int ir_simd_minmax_reduce_pass(IRFunction *function, int *changed);
 int ir_simd_sum_float_pass(IRFunction *function, int *changed);
 int ir_simd_sum_i32_pass(IRFunction *function, int *changed);
 int ir_simd_sum_u8_pass(IRFunction *function, int *changed);

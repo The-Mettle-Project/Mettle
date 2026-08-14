@@ -35,6 +35,85 @@ static void ir_load_copy_replace_operand(IROperand *operand, const char *sym,
   operand->float_bits = float_bits;
 }
 
+/* A loop's entry label, as opposed to the exit label that carries it as a
+ * prefix (`ir_while_9` vs `ir_while_end_9`). */
+static int ir_cleanup_label_is_loop_header(const char *label) {
+  if (!label) {
+    return 0;
+  }
+  if (strstr(label, "ir_for_cond_") != NULL) {
+    return 1;
+  }
+  return strstr(label, "ir_while_") != NULL &&
+         strstr(label, "ir_while_end_") == NULL;
+}
+
+/* The latch: the last jump back to `label`. Everything between the header and
+ * it is the loop, body and nested loops alike. */
+static size_t ir_cleanup_loop_latch(const IRFunction *function, size_t header,
+                                    const char *label) {
+  size_t latch = 0;
+  for (size_t i = header + 1; i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_JUMP && ins->text && strcmp(ins->text, label) == 0) {
+      latch = i;
+    }
+  }
+  return latch;
+}
+
+/* Move a loop body's declarations above its header.
+ *
+ * `var v: int32 = a[i] * 2;` in a loop body lowers to a DECLARE_LOCAL followed
+ * by a separate store; the declaration names storage and carries no value, so
+ * where it sits is free. It is not free to the recognizers: each walks a body
+ * expecting load->compute->store and stops at the first instruction it does not
+ * model, so one declaration between a load and the arithmetic costs the loop
+ * its kernel. That is why `--explain` has been telling writers to "declare `v`
+ * before the loop" -- advice for an edit the compiler can make itself. Doing it
+ * here means idiomatic code (a named intermediate per iteration) vectorizes as
+ * readily as the same loop written as one expression. */
+int ir_hoist_body_locals_pass(IRFunction *function, int *changed) {
+  if (!function) {
+    return 0;
+  }
+  for (size_t header = 0; header < function->instruction_count; header++) {
+    const IRInstruction *label = &function->instructions[header];
+    size_t latch = 0;
+    size_t insert = header;
+
+    if (label->op != IR_OP_LABEL ||
+        !ir_cleanup_label_is_loop_header(label->text)) {
+      continue;
+    }
+    latch = ir_cleanup_loop_latch(function, header, label->text);
+    if (!latch) {
+      continue;
+    }
+
+    for (size_t i = header + 1; i < latch; i++) {
+      IRInstruction saved;
+      if (function->instructions[i].op != IR_OP_DECLARE_LOCAL ||
+          function->instructions[i].dest.kind != IR_OPERAND_SYMBOL) {
+        continue;
+      }
+      saved = function->instructions[i];
+      memmove(&function->instructions[insert + 1],
+              &function->instructions[insert],
+              (i - insert) * sizeof(IRInstruction));
+      function->instructions[insert] = saved;
+      insert++;
+      if (changed) {
+        *changed = 1;
+      }
+    }
+    /* The declarations landed before the header, so the header moved down by
+     * as many; resume the outer scan from it rather than re-reading them. */
+    header = insert;
+  }
+  return 1;
+}
+
 int ir_eliminate_load_symbol_copy_pass(IRFunction *function,
                                               int *changed) {
   if (!function) {
