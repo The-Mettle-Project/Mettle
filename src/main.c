@@ -3909,8 +3909,8 @@ int compile_file(const char *input_filename, const char *output_filename,
       goto cleanup;
     }
     ir_explain_safety_totals(safety_stats.emitted, safety_stats.proved,
-                             safety_stats.hoisted, safety_stats.exempt,
-                             safety_stats.extent_tests,
+                             safety_stats.hoisted, safety_stats.spanned,
+                             safety_stats.exempt, safety_stats.extent_tests,
                              safety_stats.region_calls);
   }
 

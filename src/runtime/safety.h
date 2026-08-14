@@ -109,9 +109,31 @@ void mettle_safety_reregister(void *old_pointer, void *new_pointer,
 void mettle_safety_check(const void *base, int64_t offset, int64_t size,
                          uint32_t access_kind, uint32_t line);
 
-/* Counts for the end-of-run summary and for tests: how many checks ran, and
- * how many allocations are live. Both are advisory and lock-free. */
-uint64_t mettle_safety_check_count(void);
+/* Bytes from `base` to the end of the live allocation it belongs to.
+ *
+ * For code that will check many accesses against one pointer, this is asked
+ * once and the accesses become `(unsigned)offset <= span - size`, which is a
+ * subtract, a compare and a branch rather than a call and a walk through the
+ * shadow map. That is the difference between a checked inner loop costing a
+ * few percent and costing several times the work it does.
+ *
+ * The comparison is a fast path, never a verdict. Failing it means asking
+ * mettle_safety_check properly, which is what keeps this exact: an access
+ * behind an interior pointer has a negative offset and fails the unsigned
+ * compare, and the full check then allows it. So the answers here only have to
+ * be safe in one direction.
+ *
+ * A huge value where nothing owns the address, since the full check would let
+ * those through anyway. Zero where the allocation is gone, so every access
+ * goes the long way round and is reported as the use-after-free it is. */
+int64_t mettle_safety_span(const void *base);
+
+/* Live allocations, for tests. Advisory and lock-free.
+ *
+ * There is deliberately no count of checks performed. Keeping one meant a
+ * locked read-modify-write on a shared line for every access in the program,
+ * which measured as a large part of what a check cost, to feed an accessor
+ * nothing called. */
 uint64_t mettle_safety_live_region_count(void);
 
 /* Distinct descriptor slots ever handed out. A program that allocates and

@@ -288,6 +288,7 @@ static MTLC_THREAD_LOCAL char *g_safety_focus = NULL;
 static MTLC_THREAD_LOCAL size_t g_safety_emitted = 0;
 static MTLC_THREAD_LOCAL size_t g_safety_proved = 0;
 static MTLC_THREAD_LOCAL size_t g_safety_hoisted = 0;
+static MTLC_THREAD_LOCAL size_t g_safety_spanned = 0;
 static MTLC_THREAD_LOCAL size_t g_safety_exempt = 0;
 static MTLC_THREAD_LOCAL size_t g_safety_extent_tests = 0;
 static MTLC_THREAD_LOCAL size_t g_safety_region_calls = 0;
@@ -422,8 +423,8 @@ void ir_explain_safety_note(const char *file, size_t line,
 }
 
 void ir_explain_safety_totals(size_t emitted, size_t proved, size_t hoisted,
-                              size_t exempt, size_t extent_tests,
-                              size_t region_calls) {
+                              size_t spanned, size_t exempt,
+                              size_t extent_tests, size_t region_calls) {
   if (!g_safety_collect) {
     return;
   }
@@ -431,6 +432,7 @@ void ir_explain_safety_totals(size_t emitted, size_t proved, size_t hoisted,
   g_safety_emitted = emitted;
   g_safety_proved = proved;
   g_safety_hoisted = hoisted;
+  g_safety_spanned = spanned;
   g_safety_exempt = exempt;
   g_safety_extent_tests = extent_tests;
   g_safety_region_calls = region_calls;
@@ -2275,18 +2277,19 @@ static void ir_explain_safety_flush(void) {
                         g_safety_have_totals ? "true" : "false");
     if (g_safety_have_totals) {
       ir_explain_json_raw(",\"accesses\":%zu,\"proved\":%zu,\"hoisted\":%zu"
-                          ",\"exempt\":%zu,\"extentTests\":%zu"
-                          ",\"regionCalls\":%zu",
+                          ",\"spanned\":%zu,\"exempt\":%zu"
+                          ",\"extentTests\":%zu,\"regionCalls\":%zu",
                           g_safety_emitted, g_safety_proved, g_safety_hoisted,
-                          g_safety_exempt, g_safety_extent_tests,
-                          g_safety_region_calls);
+                          g_safety_spanned, g_safety_exempt,
+                          g_safety_extent_tests, g_safety_region_calls);
     }
     ir_explain_json_raw(",\"survivors\":[");
     for (size_t i = 0; i < g_safety_count; i++) {
       const IRExplainSafetyNote *n = &g_safety[i];
       ir_explain_json_raw("%s{\"line\":%zu,\"kind\":", i ? "," : "", n->line);
-      ir_explain_json_str(n->kind == IR_SAFETY_SURVIVOR_REGION ? "runtime"
-                                                              : "extent");
+      ir_explain_json_str(n->kind == IR_SAFETY_SURVIVOR_REGION  ? "runtime"
+                          : n->kind == IR_SAFETY_SURVIVOR_SPAN ? "span"
+                                                               : "extent");
       ir_explain_json_raw(",\"function\":");
       ir_explain_json_str(n->function_name);
       ir_explain_json_raw("}");
@@ -2304,7 +2307,8 @@ static void ir_explain_safety_flush(void) {
     return;
   }
 
-  size_t survivors = g_safety_extent_tests + g_safety_region_calls;
+  size_t survivors =
+      g_safety_extent_tests + g_safety_region_calls + g_safety_spanned;
   size_t settled = g_safety_proved + g_safety_hoisted;
   ir_explain_emit("  %zu access%s, %zu settled at compile time (%zu%%), "
                   "%zu checked at run time\n",
@@ -2319,9 +2323,11 @@ static void ir_explain_safety_flush(void) {
                     clr(EXPLAIN_DIM), g_safety_exempt, clr(EXPLAIN_RESET));
   }
   if (survivors > 0) {
-    ir_explain_emit("  %zu compare against a known extent, %zu ask the "
-                    "runtime which allocation the pointer came from\n",
-                    g_safety_extent_tests, g_safety_region_calls);
+    ir_explain_emit("  %zu compare against a known extent, %zu against an "
+                    "allocation the loop resolves once, %zu ask the runtime "
+                    "which allocation the pointer came from\n",
+                    g_safety_extent_tests, g_safety_spanned,
+                    g_safety_region_calls);
   }
 
   for (size_t i = 0; i < g_safety_count; i++) {
@@ -2330,6 +2336,9 @@ static void ir_explain_safety_flush(void) {
         n->kind == IR_SAFETY_SURVIVOR_REGION
             ? "the object's size is not known here, so the runtime is asked "
               "which allocation the pointer came from"
+        : n->kind == IR_SAFETY_SURVIVOR_SPAN
+            ? "nothing bounds the index, but the pointer holds still, so the "
+              "loop resolves its allocation once and this compares against it"
             : "the index is not a constant and no loop bounds it, so it is "
               "compared against the object's extent";
     ir_explain_emit("  %sline %zu%s%s%s: %s\n", clr(EXPLAIN_BOLD), n->line,

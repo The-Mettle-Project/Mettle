@@ -58,12 +58,17 @@ typedef struct {
   uint32_t next_free;
 } SafetyRegion;
 
+#if defined(__GNUC__)
+#define SAFETY_COLD __attribute__((noinline, cold))
+#else
+#define SAFETY_COLD
+#endif
+
 static uint32_t **g_safety_l1[SAFETY_L1_SIZE];
 static SafetyRegion *g_safety_blocks[SAFETY_MAX_BLOCKS];
 static uint32_t g_safety_region_next = SAFETY_ID_FIRST;
 static uint32_t g_safety_region_free;
 static volatile long g_safety_lock;
-static volatile uint64_t g_safety_check_count;
 static volatile uint64_t g_safety_live_regions;
 
 /* ---- platform memory ------------------------------------------------------ */
@@ -332,7 +337,7 @@ void mettle_safety_unregister(void *pointer) {
       __atomic_store_n(&region->state, (uint32_t)SAFETY_STATE_DEAD,
                        __ATOMIC_RELEASE);
       __atomic_sub_fetch(&g_safety_live_regions, 1, __ATOMIC_RELAXED);
-    }
+        }
   }
   safety_unlock();
 }
@@ -434,21 +439,23 @@ static void safety_report_and_trap(const SafetyFailure *failure,
 
 /* ---- the check ------------------------------------------------------------ */
 
-void mettle_safety_check(const void *base, int64_t offset, int64_t size,
-                         uint32_t access_kind, uint32_t line) {
-  (void)access_kind;
-  /* Before anything else, including the null test: an access of no bytes
-   * reaches no memory, so there is nothing about `base` worth asking. */
-  if (size <= 0) {
-    return;
-  }
+/* Everything a failing check needs and a passing one must not pay for.
+ *
+ * Kept out of line and cold so the fast path holds no frame, captures no
+ * return address, and builds no report. It re-derives what it needs, which
+ * costs nothing on a path that ends the process. */
+SAFETY_COLD static void safety_check_failed(const void *base, int64_t offset,
+                                            int64_t size, uint32_t line,
+                                            void *program_counter,
+                                            void *frame_pointer) {
+  /* Only here, because only a failing access can be the allocator's. Its
+   * headers and poisoned blocks are the accesses that reach this point, and
+   * asking a thread-local on every check to spare them would charge the whole
+   * program for the exception. */
   if (g_safety_allocator_depth != 0) {
     return;
   }
-  __atomic_add_fetch(&g_safety_check_count, 1, __ATOMIC_RELAXED);
 
-  void *program_counter = __builtin_return_address(0);
-  void *frame_pointer = __builtin_frame_address(0);
   SafetyFailure failure;
   failure.line = line;
   failure.offset = offset;
@@ -462,12 +469,10 @@ void mettle_safety_check(const void *base, int64_t offset, int64_t size,
     return;
   }
 
-  uintptr_t start = (uintptr_t)base;
-  uint32_t id = safety_lookup(start);
-  if (id == SAFETY_ID_UNOWNED || id == SAFETY_ID_CONTESTED) {
-    return;
+  uint32_t id = safety_lookup((uintptr_t)base);
+  if (id < SAFETY_ID_FIRST) {
+    return; /* unowned or contested: not ours to judge */
   }
-
   const SafetyRegion *region = safety_region(id);
   if (!region) {
     return;
@@ -479,25 +484,87 @@ void mettle_safety_check(const void *base, int64_t offset, int64_t size,
 
   failure.extent = region->size;
   failure.have_extent = 1;
+  failure.headline = state == (uint32_t)SAFETY_STATE_DEAD
+                         ? "use of memory after it was freed"
+                         : "memory access outside its allocation";
+  safety_report_and_trap(&failure, program_counter, frame_pointer);
+}
 
-  if (state == (uint32_t)SAFETY_STATE_DEAD) {
-    failure.headline = "use of memory after it was freed";
-    safety_report_and_trap(&failure, program_counter, frame_pointer);
+void mettle_safety_check(const void *base, int64_t offset, int64_t size,
+                         uint32_t access_kind, uint32_t line) {
+  (void)access_kind;
+  /* An access of no bytes reaches no memory, so there is nothing about `base`
+   * worth asking. This is also what lets a loop's checks be replaced by one
+   * covering its range without a guard branch: the length comes out zero or
+   * less for a loop that never runs. */
+  if (size <= 0) {
     return;
   }
 
+  uintptr_t start = (uintptr_t)base;
   uintptr_t address = start + (uintptr_t)offset;
-  uint64_t extent = region->size;
-  uint64_t width = (uint64_t)size; /* positive: the early return handled the rest */
-  if (width > extent || address < region->start ||
-      (uint64_t)(address - region->start) > extent - width) {
-    failure.headline = "memory access outside its allocation";
-    safety_report_and_trap(&failure, program_counter, frame_pointer);
+
+  /* Walk the map: find the allocation, confirm the access is inside it and
+   * that it is still live. Everything else a check might need to do belongs to
+   * the access that fails, and lives in safety_check_failed. */
+  uint32_t *slot = safety_slot(start, 0);
+  if (slot) {
+    uint32_t id = __atomic_load_n(slot, __ATOMIC_RELAXED);
+    if (id >= SAFETY_ID_FIRST) {
+      const SafetyRegion *region = safety_region(id);
+      if (region &&
+          __atomic_load_n(&region->state, __ATOMIC_RELAXED) ==
+              (uint32_t)SAFETY_STATE_LIVE) {
+        uint64_t extent = region->size;
+        uint64_t width = (uint64_t)size;
+        if (width <= extent && address >= region->start &&
+            (uint64_t)(address - region->start) <= extent - width) {
+          return;
+        }
+      }
+      safety_check_failed(base, offset, size, line,
+                          __builtin_return_address(0),
+                          __builtin_frame_address(0));
+      return;
+    }
+  }
+
+  /* No live allocation owns this address. Allowed, except for the one case
+   * worth naming: a null pointer is nobody's memory by mistake, not by
+   * provenance. */
+  if (!base) {
+    safety_check_failed(base, offset, size, line, __builtin_return_address(0),
+                        __builtin_frame_address(0));
   }
 }
 
-uint64_t mettle_safety_check_count(void) {
-  return __atomic_load_n(&g_safety_check_count, __ATOMIC_RELAXED);
+int64_t mettle_safety_span(const void *base) {
+  /* Large enough that no real access can exceed it, small enough that adding
+   * an access width to it cannot overflow. */
+  const int64_t unbounded = (int64_t)1 << 56;
+
+  if (!base) {
+    return 0;
+  }
+  uintptr_t start = (uintptr_t)base;
+  uint32_t *slot = safety_slot(start, 0);
+  if (!slot) {
+    return unbounded;
+  }
+  uint32_t id = __atomic_load_n(slot, __ATOMIC_RELAXED);
+  if (id < SAFETY_ID_FIRST) {
+    return unbounded;
+  }
+  const SafetyRegion *region = safety_region(id);
+  if (!region || __atomic_load_n(&region->state, __ATOMIC_RELAXED) !=
+                     (uint32_t)SAFETY_STATE_LIVE) {
+    return 0;
+  }
+  uintptr_t end = region->start + region->size;
+  if (start < region->start || start >= end) {
+    return 0;
+  }
+  return (int64_t)(end - start);
 }
 
 uint64_t mettle_safety_live_region_count(void) {
@@ -532,6 +599,5 @@ void mettle_safety_reset(void) {
   g_safety_region_next = SAFETY_ID_FIRST;
   g_safety_region_free = 0;
   __atomic_store_n(&g_safety_live_regions, 0, __ATOMIC_RELAXED);
-  __atomic_store_n(&g_safety_check_count, 0, __ATOMIC_RELAXED);
   safety_unlock();
 }

@@ -168,10 +168,19 @@ static int safety_emit_call(IRInstructionVector *out, SourceLocation location,
   return 1;
 }
 
-/* What a loop does to its index, read off the header. */
+/* A loop, and what it does to its index when that can be read off the header.
+ *
+ * The two halves are separate because they answer different questions. Where a
+ * loop starts and ends is enough to resolve a pointer once and compare against
+ * it, and every loop has that. What its index does is needed to argue about
+ * which elements it reaches, and plenty of loops do not say: `while (child <=
+ * end)` in a sift-down steps nothing this can read. Refusing to record such a
+ * loop at all, which is what the first version did, denied the cheap
+ * transformation to exactly the code that needed it most. */
 typedef struct {
   size_t header_index;
   IRWhileLoopBounds bounds;
+  int has_index;        /* the fields below mean anything */
   const char *iv;
   long long step;       /* constant, greater than zero */
   long long adjust;     /* highest index reached is `bound + adjust` */
@@ -552,6 +561,9 @@ static int safety_prove_loop_bound(IRFunction *function,
         check_index >= loop->bounds.jump_index) {
       continue; /* the check is not in this loop's body */
     }
+    if (!loop->has_index) {
+      continue; /* this loop's test says nothing about any index */
+    }
     if (strcmp(loop->iv, iv) != 0) {
       continue; /* this loop steps a different variable; keep looking outward */
     }
@@ -725,19 +737,6 @@ static int safety_parse_loop_form(const IRFunction *function,
     return 0;
   }
 
-  long long index_addend = 0;
-  if (!safety_index_is_affine(function, compare_index, &compare->lhs,
-                              &form->iv, &index_addend)) {
-    return 0;
-  }
-  if (strcmp(compare->text, "<") == 0) {
-    form->adjust = -index_addend - 1;
-  } else if (strcmp(compare->text, "<=") == 0) {
-    form->adjust = -index_addend;
-  } else {
-    return 0;
-  }
-
   form->header_index = header_index;
   form->bounds.compare_index = compare_index;
   form->bounds.branch_index = branch_index;
@@ -760,6 +759,21 @@ static int safety_parse_loop_form(const IRFunction *function,
     return 0;
   }
 
+  /* Where the loop runs is settled. Whether its test also says what the index
+   * does is a separate question, and a loop that does not say is still a loop
+   * worth knowing about. */
+  form->has_index = 0;
+  long long index_addend = 0;
+  if (safety_index_is_affine(function, compare_index, &compare->lhs, &form->iv,
+                             &index_addend)) {
+    if (strcmp(compare->text, "<") == 0) {
+      form->adjust = -index_addend - 1;
+      form->has_index = 1;
+    } else if (strcmp(compare->text, "<=") == 0) {
+      form->adjust = -index_addend;
+      form->has_index = 1;
+    }
+  }
   form->bound = &compare->rhs;
   return 1;
 }
@@ -779,6 +793,32 @@ static int safety_operand_invariant_in(const IRFunction *function, size_t start,
     if (instruction->dest.name &&
         strcmp(instruction->dest.name, operand->name) == 0) {
       return 0;
+    }
+  }
+  return 1;
+}
+
+/* Nothing in the body can release the memory the loop is walking. Weaker than
+ * requiring a straight line, deliberately: to reuse one resolved allocation
+ * across many accesses it only matters that the allocation outlives them, not
+ * that every access happens. Branches are fine, because each access still
+ * carries its own comparison. */
+static int safety_body_has_no_calls(const IRFunction *function,
+                                    const IRWhileLoopBounds *loop) {
+  for (size_t i = loop->branch_index + 1;
+       i < loop->jump_index && i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    if (instruction->op == IR_OP_NEW || instruction->op == IR_OP_GPU_LAUNCH ||
+        instruction->op == IR_OP_CALL_INDIRECT) {
+      return 0;
+    }
+    if (instruction->op == IR_OP_CALL) {
+      /* The checks themselves are about to be rewritten, so they do not count
+       * against the body; anything else could free what the loop is walking. */
+      if (!instruction->text ||
+          strncmp(instruction->text, "mettle_safety_", 14) != 0) {
+        return 0;
+      }
     }
   }
   return 1;
@@ -876,7 +916,7 @@ static int safety_try_hoist(IRFunction *function, const SafetyLoopList *loops,
     SafetyLoopForm form = loops->items[loop_index];
     size_t header = form.header_index;
     if (check_index <= form.bounds.branch_index ||
-        check_index >= form.bounds.jump_index) {
+        check_index >= form.bounds.jump_index || !form.has_index) {
       continue;
     }
     saw_loop = 1;
@@ -1214,6 +1254,108 @@ done:
   return ok;
 }
 
+/* ---- resolving a pointer once, comparing per access ------------------------- */
+/*
+ * Where nothing about an index can be settled, the access still has to be
+ * checked, and a check that walks the shadow map is a call and four dependent
+ * loads. But a loop that indexes one pointer asks about the same allocation
+ * every time, and how far that allocation runs is loop-invariant even when the
+ * indices are not.
+ *
+ * So the allocation is resolved once in front of the loop, and each access
+ * becomes `(unsigned)offset > span - size`, which is a subtract, a compare and
+ * a branch that is never taken. Failing it is not a verdict: it calls the full
+ * check, which is what keeps this exact for interior pointers reading
+ * backwards, for dead allocations, and for anything else the comparison alone
+ * cannot judge.
+ *
+ * This is what makes a checked heapsort possible. Its indices come out of
+ * comparisons so nothing bounds them, and every access was paying for a walk
+ * to be told the same thing about the same array.
+ */
+
+static int safety_expand_region(IRInstructionVector *out,
+                                const SafetyAccess *access);
+
+typedef struct {
+  size_t header_index;
+  IROperand base; /* owned */
+  char temp[64];  /* the span this loop resolves once */
+  SourceLocation location;
+} SafetySpan;
+
+static int safety_operand_same(const IROperand *a, const IROperand *b) {
+  if (a->kind != b->kind) {
+    return 0;
+  }
+  if (a->kind == IR_OPERAND_INT) {
+    return a->int_value == b->int_value;
+  }
+  return a->name && b->name && strcmp(a->name, b->name) == 0;
+}
+
+/* `span = mettle_safety_span(base)`, emitted in front of the loop. */
+static int safety_emit_span_resolve(IRInstructionVector *out,
+                                    const SafetySpan *span) {
+  IRInstruction call = {0};
+  call.op = IR_OP_CALL;
+  call.location = span->location;
+  call.text = mettle_strdup("mettle_safety_span");
+  call.dest = ir_operand_temp(span->temp);
+  call.arguments = calloc(1, sizeof(IROperand));
+  if (!call.text || !call.dest.name || !call.arguments) {
+    ir_instruction_destroy_storage(&call);
+    return 0;
+  }
+  call.argument_count = 1;
+  if (!ir_operand_clone(&span->base, &call.arguments[0]) ||
+      !ir_instruction_vector_append_move(out, &call)) {
+    ir_instruction_destroy_storage(&call);
+    return 0;
+  }
+  return 1;
+}
+
+/* The access itself: compare against the resolved span, and only ask properly
+ * when that comparison says something might be wrong. */
+static int safety_emit_span_check(IRInstructionVector *out,
+                                  const SafetyAccess *access,
+                                  const char *span_temp) {
+  unsigned id = g_safety_next_id++;
+  char limit[64];
+  char bad[64];
+  char ok_label[64];
+  snprintf(limit, sizeof(limit), SAFETY_TEMP_PREFIX "sl%u", id);
+  snprintf(bad, sizeof(bad), SAFETY_TEMP_PREFIX "sb%u", id);
+  snprintf(ok_label, sizeof(ok_label), "ir_safe_in_%u", id);
+
+  IROperand span_operand = ir_operand_temp(span_temp);
+  IROperand limit_operand = ir_operand_temp(limit);
+  IROperand size_operand = ir_operand_int(access->size);
+  int ok = 0;
+
+  if (!span_operand.name || !limit_operand.name) {
+    goto done;
+  }
+  /* Comparing without sign is what covers both ends at once: a negative offset
+   * reads as an enormous unsigned value and fails, which sends it to the full
+   * check rather than rejecting it. */
+  if (!safety_emit_binary(out, access->location, "-", limit, &span_operand,
+                          &size_operand, 0) ||
+      !safety_emit_binary(out, access->location, ">", bad, access->offset,
+                          &limit_operand, 1) ||
+      !safety_emit_branch_zero(out, access->location, bad, ok_label)) {
+    goto done;
+  }
+  ok = safety_expand_region(out, access) &&
+       safety_emit_label(out, access->location, ok_label);
+
+done:
+  ir_operand_destroy(&span_operand);
+  ir_operand_destroy(&limit_operand);
+  return ok;
+}
+
 /* ---- the loops, gathered once ----------------------------------------------- */
 
 static const SafetyLoopForm *safety_enclosing_loop(const SafetyLoopList *loops,
@@ -1343,19 +1485,31 @@ static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
    * produced a check's operands, and rewriting moves instructions out of the
    * array as it goes, so a proof running mid-rewrite would look back at
    * emptied slots and conclude it knows nothing. */
-  enum { SAFETY_KEEP = 0, SAFETY_PROVED = 1, SAFETY_HOISTED = 2 };
+  enum {
+    SAFETY_KEEP = 0,
+    SAFETY_PROVED = 1,
+    SAFETY_HOISTED = 2,
+    SAFETY_SPANNED = 3
+  };
   unsigned char *outcome = calloc(function->instruction_count, 1);
   SafetyHoist *hoists = calloc(check_count, sizeof(SafetyHoist));
+  SafetySpan *spans = calloc(check_count, sizeof(SafetySpan));
+  size_t *span_of = calloc(function->instruction_count, sizeof(size_t));
   size_t hoist_count = 0;
+  size_t span_count = 0;
   SafetyLoopList loops = {0};
-  if (!outcome || !hoists) {
+  if (!outcome || !hoists || !spans || !span_of) {
     free(outcome);
     free(hoists);
+    free(spans);
+    free(span_of);
     return 0;
   }
   if (!safety_loop_list_build(function, &loops)) {
     free(outcome);
     free(hoists);
+    free(spans);
+    free(span_of);
     return 0;
   }
 
@@ -1375,7 +1529,40 @@ static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
     if (safety_try_hoist(function, &loops, i, &access, &hoists[hoist_count])) {
       hoist_count++;
       outcome[i] = SAFETY_HOISTED;
+      continue;
     }
+
+    /* Nothing settles the index, so the access keeps a check. But if it is in
+     * a loop that cannot release what it is walking, and the pointer holds
+     * still, resolving the allocation once turns the check from a call into a
+     * comparison. */
+    const SafetyLoopForm *loop = safety_enclosing_loop(&loops, i);
+    if (!loop || !safety_body_has_no_calls(function, &loop->bounds) ||
+        !safety_operand_invariant_in(function, loop->header_index,
+                                     loop->bounds.jump_index, access.base)) {
+      continue;
+    }
+    size_t found = span_count;
+    for (size_t s = 0; s < span_count; s++) {
+      if (spans[s].header_index == loop->header_index &&
+          safety_operand_same(&spans[s].base, access.base)) {
+        found = s;
+        break;
+      }
+    }
+    if (found == span_count) {
+      SafetySpan *fresh = &spans[span_count];
+      fresh->header_index = loop->header_index;
+      fresh->location = access.location;
+      snprintf(fresh->temp, sizeof(fresh->temp), SAFETY_TEMP_PREFIX "sp%u",
+               g_safety_next_id++);
+      if (!ir_operand_clone(access.base, &fresh->base)) {
+        goto fail;
+      }
+      span_count++;
+    }
+    span_of[i] = found;
+    outcome[i] = SAFETY_SPANNED;
   }
   safety_loop_list_destroy(&loops);
 
@@ -1387,10 +1574,18 @@ static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
   for (size_t i = 0; i < function->instruction_count; i++) {
     IRInstruction *instruction = &function->instructions[i];
 
-    /* A loop's hoisted checks go in front of its header. */
+    /* A loop's hoisted checks and resolved pointers go in front of its
+     * header. */
     for (size_t h = 0; h < hoist_count; h++) {
       if (hoists[h].header_index == i &&
           !safety_emit_hoisted(&out, &hoists[h])) {
+        ir_instruction_vector_destroy(&out);
+        goto fail;
+      }
+    }
+    for (size_t s = 0; s < span_count; s++) {
+      if (spans[s].header_index == i &&
+          !safety_emit_span_resolve(&out, &spans[s])) {
         ir_instruction_vector_destroy(&out);
         goto fail;
       }
@@ -1423,6 +1618,18 @@ static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
       if (stats) {
         stats->hoisted++;
       }
+      continue;
+    }
+    if (outcome[i] == SAFETY_SPANNED) {
+      if (!safety_emit_span_check(&out, &access, spans[span_of[i]].temp)) {
+        ir_instruction_vector_destroy(&out);
+        goto fail;
+      }
+      if (stats) {
+        stats->spanned++;
+      }
+      ir_explain_safety_note(access.location.filename, access.location.line,
+                             function->name, IR_SAFETY_SURVIVOR_SPAN);
       continue;
     }
 
@@ -1459,6 +1666,11 @@ static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
     ir_operand_destroy(&hoists[h].base);
     ir_operand_destroy(&hoists[h].bound);
   }
+  for (size_t s = 0; s < span_count; s++) {
+    ir_operand_destroy(&spans[s].base);
+  }
+  free(spans);
+  free(span_of);
   free(hoists);
   free(outcome);
   if (!ir_function_replace_instructions(function, &out)) {
@@ -1473,6 +1685,11 @@ fail:
     ir_operand_destroy(&hoists[h].base);
     ir_operand_destroy(&hoists[h].bound);
   }
+  for (size_t s = 0; s < span_count; s++) {
+    ir_operand_destroy(&spans[s].base);
+  }
+  free(spans);
+  free(span_of);
   free(hoists);
   free(outcome);
   return 0;
