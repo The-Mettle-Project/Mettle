@@ -50,24 +50,52 @@ travel with it that anything has to be looked up.
 
 ## What it costs
 
-Measured against the same programs built without the flag, best of nine,
-interleaved:
+Measured against the same programs built without the flag, both timed back to
+back and the median of the per-pair ratios taken:
 
 | Benchmark | Overhead | Accesses | Settled at compile time | Checked at run time |
 |---|---|---|---|---|
 | dot_product | 1.00x | 34 | 8 | 26 |
-| crc32 | 1.04x | 31 | 4 | 27 |
-| binary_search | 1.55x | 33 | 5 | 28 |
-| heapsort | 2.50x | 54 | 16 | 38 |
-| base64_encode | 3.20x | 57 | 15 | 42 |
+| crc32 | 1.00x | 31 | 4 | 27 |
+| word_count | 1.00x | 31 | 5 | 26 |
+| transpose | 1.00x | 35 | 4 | 31 |
+| base64_encode | 1.01x | 57 | 15 | 42 |
+| binary_search | 1.08x | 33 | 5 | 28 |
+| matvec | 1.54x | 37 | 6 | 31 |
+| heapsort | 2.00x | 54 | 16 | 38 |
 
-Only a quarter of accesses are settled at compile time, and the overhead is
-still mostly between nothing and half again. That is because the two halves
-work on different things. Proving removes a check; where nothing can be
-proved, the remaining job is to make the check cheap, and a check that walks
-the map to ask which allocation a pointer belongs to costs around a hundred
-cycles while a comparison against an answer already in a register costs about
-three.
+Only a quarter to a third of accesses are settled at compile time, and the
+overhead is still mostly nothing at all. That is because the two halves work on
+different things. Proving removes a check; where nothing can be proved, the
+remaining job is to make the check cheap, and a check that walks the map to ask
+which allocation a pointer belongs to costs around a hundred cycles while a
+comparison against an answer already in a register costs about three.
+
+The third thing that has to be true is that the checks do not cost the program
+its ordinary code quality. A check is a call, and for a while any function
+holding one lost register allocation entirely, because the backend defers a
+function whose callee it cannot find a signature for and the runtime's entry
+points were never declared. Declaring them took `--safe` from compiling the
+whole program with the spill-everything backend to compiling essentially all of
+it with the register allocator, which is most of what the figures above
+changed. A checked build should differ from an unchecked one by its checks and
+nothing else.
+
+Being a call costs a second thing, and it is subtler. The allocator has to
+assume a call happens, so every value live across one needs a register the call
+would not clobber -- and there are seven of those. A nested loop carrying two
+pointers, two counters, two resolved spans and two indices has spent them all
+before it reaches the value it just loaded, which then goes to the stack on
+every iteration; a float accumulator has nowhere to live at all, because no XMM
+register survives a call on both calling conventions. So the two runtime calls
+the checking machinery puts in loops give some registers back. The check saves
+and restores RAX and the volatile XMM lanes around itself, which costs nothing
+because it is entered only when the comparison in front of it fails. The span
+resolution saves the XMM lanes, which costs eight instructions -- but the
+compiler hoisted it in front of the loop, so that is once per loop against once
+per element. Where the allocator ends up using none of the registers this hands
+back, the saving is dropped again rather than paid for nothing. `transpose` and
+`matvec` are the two this is measurable on: 1.5x and 2.9x before it.
 
 So a loop that indexes one pointer resolves that allocation once in front of
 itself, and each access inside becomes a subtract, a compare, and a branch that
@@ -83,8 +111,20 @@ element was covering, and the loop body is then empty of calls again and the
 vectorizer takes it back. Checks in a hot loop are not merely expensive: they
 block the kernel that does the work.
 
-base64_encode is the honest end. Eleven accesses per round, each already down
-to a few instructions, against a round that does not do much more than that.
+That is why the whole-range check is worth reaching for even where the loop is
+not a straight line. The body may branch, so long as it rejoins: an `if/else`
+inside the loop does not change how many times the loop runs, so a check
+covering the range the header test describes still describes what the loop will
+touch. What it may not do is leave early. A loop that can `break`, or an access
+the body reaches only on some iterations, keeps its per-access checks, because
+one check for the whole range would claim iterations that never happened and
+accuse a program that stayed in bounds. word_count is the shape this buys: a
+byte loop whose body is a four-way comparison, back to the SIMD scan it had
+without the flag.
+
+heapsort is the honest end. Its sift-down indexes by `child` and `swap_idx`,
+which no loop bounds, so the checks stay and land in a loop that is already
+mostly compare-and-swap.
 
 `--explain` reports where a program sits:
 
