@@ -2191,21 +2191,35 @@ int mir_encode(MirFunction *fn) {
     }
     case MIR_REP_MOVSB:
     case MIR_REP_STOSB: {
-      /* The argument marshalling ran already, so RCX/RDX/R8 hold
-       * destination/source-or-fill/count exactly as for the call this replaces.
-       * Take the destination into RAX first (it is the return value, and RCX is
-       * about to become the counter), then run the string operation with RSI
-       * and RDI saved around it -- the allocator may be holding live values in
-       * both, since they are nonvolatile. */
+      /* The argument marshalling ran already, so the first three integer
+       * argument registers of the ACTIVE convention hold
+       * destination/source-or-fill/count exactly as for the call this replaces:
+       * RCX/RDX/R8 under Win64, RDI/RSI/RDX under SysV. Naming them literally
+       * would copy a SysV memset's fill byte in as its destination.
+       *
+       * Take the destination into RAX first (it is the return value, and the
+       * register holding it is about to become the counter or the fill), then
+       * run the string operation with RSI and RDI saved around it -- the
+       * allocator may be holding live values in both, since they are
+       * nonvolatile under Win64. RDI and RSI are loaded before the counter,
+       * which is an argument register under neither convention, so no move
+       * overwrites a source another still has to read. */
       BinaryCodeBuffer *code = &ctx->code;
-      int rep_ok =
-          binary_emit_mov_reg_reg(code, BINARY_GP_RAX, BINARY_GP_RCX) &&
-          binary_emit_push_reg(code, BINARY_GP_RDI) &&
-          binary_emit_mov_reg_reg(code, BINARY_GP_RDI, BINARY_GP_RCX) &&
-          binary_emit_mov_reg_reg(code, BINARY_GP_RCX, BINARY_GP_R8);
+      const BinaryAbi *rep_abi = code_generator_binary_active_abi();
+      if (!rep_abi || rep_abi->int_param_count < 3) {
+        ok = enc_err(fn, "no argument registers for an inline block copy");
+        break;
+      }
+      BinaryGpRegister rep_dst = rep_abi->int_param_registers[0];
+      BinaryGpRegister rep_src = rep_abi->int_param_registers[1];
+      BinaryGpRegister rep_count = rep_abi->int_param_registers[2];
+      int rep_ok = binary_emit_mov_reg_reg(code, BINARY_GP_RAX, rep_dst) &&
+                   binary_emit_push_reg(code, BINARY_GP_RDI);
       if (rep_ok && in->op == MIR_REP_MOVSB) {
         rep_ok = binary_emit_push_reg(code, BINARY_GP_RSI) &&
-                 binary_emit_mov_reg_reg(code, BINARY_GP_RSI, BINARY_GP_RDX) &&
+                 binary_emit_mov_reg_reg(code, BINARY_GP_RDI, rep_dst) &&
+                 binary_emit_mov_reg_reg(code, BINARY_GP_RSI, rep_src) &&
+                 binary_emit_mov_reg_reg(code, BINARY_GP_RCX, rep_count) &&
                  binary_code_buffer_append_u8(code, 0xFC) &&  /* cld */
                  binary_code_buffer_append_u8(code, 0xF3) &&  /* rep  */
                  binary_code_buffer_append_u8(code, 0xA4) &&  /* movsb */
@@ -2214,8 +2228,10 @@ int mir_encode(MirFunction *fn) {
         /* stosb fills from AL, and RAX currently holds the destination, so the
          * fill byte goes in through RAX only after the destination is safe in
          * RDI -- and RAX has to be put back afterwards to return it. */
-        rep_ok = binary_emit_push_reg(code, BINARY_GP_RAX) &&
-                 binary_emit_mov_reg_reg(code, BINARY_GP_RAX, BINARY_GP_RDX) &&
+        rep_ok = binary_emit_mov_reg_reg(code, BINARY_GP_RDI, rep_dst) &&
+                 binary_emit_mov_reg_reg(code, BINARY_GP_RCX, rep_count) &&
+                 binary_emit_push_reg(code, BINARY_GP_RAX) &&
+                 binary_emit_mov_reg_reg(code, BINARY_GP_RAX, rep_src) &&
                  binary_code_buffer_append_u8(code, 0xFC) &&  /* cld */
                  binary_code_buffer_append_u8(code, 0xF3) &&  /* rep  */
                  binary_code_buffer_append_u8(code, 0xAA) &&  /* stosb */

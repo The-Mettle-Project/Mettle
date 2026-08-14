@@ -243,8 +243,8 @@ typedef enum {
    * copying, which is how this was found. RSI and RDI are nonvolatile and are
    * saved and restored around the sequence, so a value the allocator parked in
    * either survives. */
-  MIR_REP_MOVSB,  /* memcpy(rcx, rdx, r8) -> rax */
-  MIR_REP_STOSB,  /* memset(rcx, edx, r8) -> rax */
+  MIR_REP_MOVSB,  /* memcpy(arg0, arg1, arg2) -> rax */
+  MIR_REP_STOSB,  /* memset(arg0, arg1, arg2) -> rax */
   MIR_STORE_OUTARG,/* store outgoing stack call argument a to [rsp + b.imm].
                       Used for the 5th+ GP argument (beyond the ABI's argument
                       registers); the prologue reserves the outgoing region. The

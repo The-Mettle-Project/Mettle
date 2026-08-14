@@ -165,6 +165,34 @@ fn main() -> int32 {
   return v;
 }'
 
+# memcpy and memset become the inline string operation in the register
+# allocating backend, taking their arguments from wherever the call marshalling
+# left them. Naming Win64's registers reads a SysV memset's fill byte as its
+# destination, so this walks the bytes and checks the returned pointer, which is
+# the destination and comes back in RAX. The live values either side of the copy
+# are there to make the allocator hold registers across it.
+run_case block_copy 0 'import "std/mem";
+@noinline fn fill_and_copy(dst: cstring, src: cstring, n: int64) -> int64 {
+  var live: int64 = n * 3 + 1;
+  if (memset(src, 65, n) != src) { return 0; }
+  if (memcpy(dst, src, n) != dst) { return 0; }
+  return live;
+}
+fn main() -> int32 {
+  var dst: uint8[64];
+  var src: uint8[64];
+  var i: int32 = 0;
+  while (i < 64) { dst[i] = 0; src[i] = 0; i = i + 1; }
+  if (fill_and_copy((cstring)((int64)&dst[0]), (cstring)((int64)&src[0]), 64)
+      != 193) { return 1; }
+  i = 0;
+  while (i < 64) {
+    if (dst[i] != 65) { return 2; }
+    i = i + 1;
+  }
+  return 0;
+}'
+
 # std/thread with the Win32 API (CreateThread / WaitForSingleObject /
 # CloseHandle) works on Linux through clone and futex.
 run_case_out unified_thread 0 'worker ran
