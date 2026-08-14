@@ -4235,6 +4235,22 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
               code_generator_binary_resolved_type_is_signed_integer(lt);
         }
       }
+      /* Read off the IR, exactly as the fallback layout does: the safety pass
+       * has already said which locals it describes, by emitting a registration
+       * whose argument is the address of one. A described local's home must
+       * cover whole granules, so the neighbour it sits next to cannot share
+       * one and blind them both. */
+      if (!is_param &&
+          binary_function_local_is_safety_described(irf, in->lhs.name)) {
+        fn->vregs[src.vreg].home_granule = 1;
+        if (lt) {
+          size_t sz = code_generator_abi_type_size(lt);
+          int need = (int)((sz + 7) & ~(size_t)7);
+          if (need > fn->vregs[src.vreg].home_bytes) {
+            fn->vregs[src.vreg].home_bytes = need;
+          }
+        }
+      }
     }
     return mir_emit1(fn, MIR_LEA_LOCAL, dst, src, mir_op_none(), 8, 0, 0);
   }

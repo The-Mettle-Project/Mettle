@@ -1,9 +1,26 @@
 #include "codegen/binary/mir.h"
 #include "../../common.h" /* mettle_fnv1a_hash */
+#include "internal.h"     /* BINARY_SAFETY_GRANULE */
 
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Bytes of stack home for an address-taken value, advancing `*base` first when
+ * the home has to start on a granule boundary. Homes grow downward from a
+ * 16-byte-aligned rbp and `spill_offset` is the far end, so an offset that is a
+ * multiple of the granule puts the object's first byte on one. See
+ * MirVreg::home_granule. */
+static int mir_home_bytes_for(const MirVreg *vr, int *base) {
+  int home = vr->home_bytes > 0 ? vr->home_bytes : 8;
+  if (vr->home_granule) {
+    home = (home + BINARY_SAFETY_GRANULE - 1) / BINARY_SAFETY_GRANULE *
+           BINARY_SAFETY_GRANULE;
+    *base = (*base + BINARY_SAFETY_GRANULE - 1) / BINARY_SAFETY_GRANULE *
+            BINARY_SAFETY_GRANULE;
+  }
+  return home;
+}
 
 /* Linear-scan register allocation over MIR.
  *
@@ -1465,7 +1482,7 @@ static int mir_regalloc_color(MirFunction *fn) {
   for (size_t v = 0; v < fn->vreg_count; v++) {
     MirVreg *vr = &fn->vregs[v];
     if (vr->address_taken) {
-      int home = vr->home_bytes > 0 ? vr->home_bytes : 8;
+      int home = mir_home_bytes_for(vr, &next_spill);
       next_spill += home;
       vr->assigned = 1;
       vr->in_register = 0;
@@ -1752,7 +1769,7 @@ int mir_regalloc(MirFunction *fn) {
       /* A struct local owns a multi-slot home (home_bytes); the slot offset is
        * the FAR (highest) end since homes grow downward from rbp, so the home
        * spans [rbp - offset .. rbp - offset + home_bytes). */
-      int home = vr->home_bytes > 0 ? vr->home_bytes : 8;
+      int home = mir_home_bytes_for(vr, &next_spill_offset);
       next_spill_offset += home;
       vr->assigned = 1;
       vr->in_register = 0;

@@ -81,6 +81,14 @@ typedef struct {
    * printed with a minus sign whenever the residue was nonzero. */
   int home_width;
   int home_signed;
+  /* `--safe`: this local is described to the safety runtime, whose map resolves
+   * an address to its owning object at METTLE_SAFETY_GRANULE resolution. Two
+   * described objects sharing one of those units cannot both be covered -- the
+   * runtime marks the unit contested and neither is ever accused -- and a small
+   * overrun lands in exactly the unit an object shares with its neighbour. So
+   * the home gets a unit to itself: start aligned to the granule and size
+   * padded up to it. Same rule the fallback frame layout applies in abi.c. */
+  int home_granule;
   /* Set for values defined by the prologue (parameters and the hidden
    * indirect-return pointer): they are ALL simultaneously live from function
    * entry, each arriving in its own incoming ABI register. Two such values must

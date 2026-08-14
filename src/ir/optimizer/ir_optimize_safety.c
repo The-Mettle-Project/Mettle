@@ -1798,12 +1798,72 @@ fail:
   return 0;
 }
 
+/* Declare the runtime entry points this pass calls.
+ *
+ * Without these the calls name functions the program never declared, and the
+ * register-allocating backend defers any function containing a call it cannot
+ * find a signature for. That turned `--safe` into "compile the whole program
+ * with the spill-everything backend": every function holding a single check
+ * lost register allocation, which cost far more than the checks did. */
+static int safety_declare_runtime(IRProgram *program) {
+  const MtlcType *pointer = mtlc_type_pointer(mtlc_type_scalar(MTLC_TYPE_INT8));
+  const MtlcType *i64 = mtlc_type_scalar(MTLC_TYPE_INT64);
+  const MtlcType *u32 = mtlc_type_scalar(MTLC_TYPE_UINT32);
+  const MtlcType *u64 = mtlc_type_scalar(MTLC_TYPE_UINT64);
+  const MtlcType *nothing = mtlc_type_scalar(MTLC_TYPE_VOID);
+  if (!pointer || !i64 || !u32 || !u64 || !nothing) {
+    return 1; /* no signatures available: the calls still work, unallocated */
+  }
+
+  const MtlcType *check_params[5] = {pointer, i64, i64, u32, u32};
+  const MtlcType *span_params[1] = {pointer};
+  const MtlcType *register_params[2] = {pointer, u64};
+  const MtlcType *unregister_params[1] = {pointer};
+  const MtlcType *reregister_params[3] = {pointer, pointer, u64};
+
+  const struct {
+    const char *name;
+    const MtlcType *return_type;
+    const MtlcType **params;
+    size_t param_count;
+  } entries[] = {
+      {"mettle_safety_check", nothing, check_params, 5},
+      {"mettle_safety_span", i64, span_params, 1},
+      {"mettle_safety_register", nothing, register_params, 2},
+      {"mettle_safety_unregister", nothing, unregister_params, 1},
+      {"mettle_safety_reregister", nothing, reregister_params, 3},
+      {"mettle_safety_enter_allocator", nothing, NULL, 0},
+      {"mettle_safety_leave_allocator", nothing, NULL, 0},
+  };
+
+  for (size_t e = 0; e < sizeof(entries) / sizeof(entries[0]); e++) {
+    if (ir_program_lookup_symbol(program, entries[e].name)) {
+      continue;
+    }
+    IRModuleSymbol entry = {0};
+    entry.name = (char *)entries[e].name;
+    entry.kind = IR_MODSYM_FUNCTION;
+    entry.is_extern = 1;
+    entry.return_type = (MtlcType *)entries[e].return_type;
+    entry.type = (MtlcType *)entries[e].return_type;
+    entry.param_types = (MtlcType **)entries[e].params;
+    entry.param_count = entries[e].param_count;
+    if (!ir_program_add_symbol(program, &entry)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 int ir_safety_resolve_program(IRProgram *program, IRSafetyStats *stats) {
   if (!program) {
     return 1;
   }
   clock_t started = safety_time_enabled() ? clock() : 0;
   g_safety_next_id = 0;
+  if (!safety_declare_runtime(program)) {
+    return 0;
+  }
   const char *allocator_source = safety_allocator_source(program);
   for (size_t i = 0; i < program->function_count; i++) {
     IRFunction *function = program->functions[i];
