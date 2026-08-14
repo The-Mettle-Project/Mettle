@@ -1,0 +1,95 @@
+// Every index shape the whole-loop check now reads, each over a buffer sized
+// to exactly what the loop touches.
+//
+// The point of the exact sizing is the over-claiming direction. A hoisted
+// check states a byte range, and getting that range one element too wide is
+// silent on a generously sized buffer and an accusation on a snug one. Every
+// loop here stays inside its allocation, so any of these trapping means the
+// range being computed is wider than the range being walked.
+//
+// Exits 0.
+import "std/io";
+import "std/mem";
+
+var DIM: int32 = 8;
+
+// A counter that does not start at zero. The range is [1, n).
+fn from_one(a: int32*, n: int32) -> int32 {
+  var total: int32 = 0;
+  var i: int32 = 1;
+  while (i < n) {
+    total = total + a[i];
+    i = i + 1;
+  }
+  return total;
+}
+
+// A displacement the loop holds still, added to the counter.
+fn displaced(m: int32*, base: int32, n: int32) -> int32 {
+  var total: int32 = 0;
+  var j: int32 = 0;
+  while (j < n) {
+    total = total + m[base + j];
+    j = j + 1;
+  }
+  return total;
+}
+
+// A counter running backwards through the array: coefficient -1.
+fn reversed(a: int32*, n: int32) -> int32 {
+  var total: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    total = total + a[n - 1 - i];
+    i = i + 1;
+  }
+  return total;
+}
+
+// A counter scaled by a stride, walking a column. DIM is a global the program
+// never writes, so the stride is known even though it is not spelled `const`.
+fn column(m: int32*, col: int32) -> int32 {
+  var total: int32 = 0;
+  var r: int32 = 0;
+  while (r < DIM) {
+    total = total + m[r * DIM + col];
+    r = r + 1;
+  }
+  return total;
+}
+
+// A counter starting from a value settled just before the loop, stepping by a
+// constant: the shape a blocked multiply walks its rows with.
+fn from_runtime(m: int32*, row_base: int32, n: int32) -> int32 {
+  var total: int32 = 0;
+  var idx: int32 = row_base;
+  var k: int32 = 0;
+  while (k < n) {
+    total = total + m[idx];
+    idx = idx + 1;
+    k = k + 1;
+  }
+  return total;
+}
+
+fn main() -> int32 {
+  var cells: int32 = DIM * DIM;
+  var m: int32* = (int32*)malloc((int64)cells * 4);
+  var i: int32 = 0;
+  while (i < cells) {
+    m[i] = 1;
+    i = i + 1;
+  }
+
+  var got: int32 = 0;
+  got = got + from_one(&m[0], cells);          // 63
+  got = got + displaced(&m[0], DIM, DIM);      // 8
+  got = got + reversed(&m[0], cells);          // 64
+  got = got + column(&m[0], DIM - 1);          // 8
+  got = got + from_runtime(&m[0], cells - DIM, DIM); // 8
+
+  print(cstr("affine="));
+  println_int((int64)got);
+  free((cstring)m);
+  return 0;
+}

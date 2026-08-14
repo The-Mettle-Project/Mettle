@@ -280,6 +280,27 @@ static int safety_constant_value(const IRFunction *function, size_t before,
     return safety_constant_value(function, before, &producer->lhs, depth + 1,
                                  out);
   }
+  /* A cast to a 64-bit integer cannot change what the value is, and the source
+   * writes them: this pass runs before the optimizer, so `idx + (int64)N` still
+   * carries the cast and a step of N would otherwise read as no step at all.
+   * The narrower targets are not read through, since those can change it. */
+  if (producer->op == IR_OP_CAST) {
+    if (!producer->text) {
+      return 0;
+    }
+    int to_signed = strcmp(producer->text, "int64") == 0;
+    if (!to_signed && strcmp(producer->text, "uint64") != 0) {
+      return 0;
+    }
+    long long inner = 0;
+    if (!safety_constant_value(function, before, &producer->lhs, depth + 1,
+                               &inner) ||
+        (!to_signed && inner < 0)) {
+      return 0;
+    }
+    *out = inner;
+    return 1;
+  }
   if (producer->op != IR_OP_BINARY || !producer->text) {
     return 0;
   }
@@ -442,6 +463,46 @@ static int safety_offset_upper_bound(const IRFunction *function,
 /* Read `(iv + addend) * stride` out of the instruction that produced the
  * offset. This is the shape lowering emits for every subscript: the index,
  * then a multiply by the element width. */
+/* Split `offset` into the index and the element width it is scaled by. The
+ * index itself is left alone: what it is made of depends on which loop is
+ * asking, so it is read separately, once per candidate. */
+static int safety_offset_scaling(const IRFunction *function, size_t check_index,
+                                 const IROperand *offset,
+                                 const IROperand **index_out,
+                                 long long *stride_out) {
+  if (offset->kind != IR_OPERAND_TEMP || !offset->name) {
+    return 0;
+  }
+  const IRInstruction *producer =
+      ir_find_temp_producer_before(function, check_index, offset->name);
+  if (!producer || producer->op != IR_OP_BINARY || producer->is_float ||
+      !producer->text) {
+    return 0;
+  }
+  if (strcmp(producer->text, "*") == 0 &&
+      producer->rhs.kind == IR_OPERAND_INT && producer->rhs.int_value > 0) {
+    *index_out = &producer->lhs;
+    *stride_out = producer->rhs.int_value;
+    return 1;
+  }
+  /* Lowering scales a power-of-two element width with a shift as often as a
+   * multiply, and the two mean the same thing here. */
+  if (strcmp(producer->text, "<<") == 0 &&
+      producer->rhs.kind == IR_OPERAND_INT && producer->rhs.int_value >= 0 &&
+      producer->rhs.int_value < 32) {
+    *index_out = &producer->lhs;
+    *stride_out = 1LL << producer->rhs.int_value;
+    return 1;
+  }
+  /* A byte array scales by one, so lowering emits no scaling at all and the
+   * offset IS the index. Reading it that way costs nothing on the wider
+   * elements either: the coefficient the form comes back with is then in bytes
+   * rather than elements, and every use of it below is in bytes anyway. */
+  *index_out = offset;
+  *stride_out = 1;
+  return 1;
+}
+
 static int safety_offset_is_scaled_symbol(const IRFunction *function,
                                           size_t check_index,
                                           const IROperand *offset,
@@ -488,18 +549,26 @@ static int safety_symbol_written_between(const IRFunction *function,
   return 0;
 }
 
-/* `<anything> = iv + <positive constant>`, the arithmetic half of a step. */
-static int safety_read_step_add(const IRInstruction *instruction,
+/* `<anything> = iv + <positive constant>`, the arithmetic half of a step.
+ *
+ * The constant is read through any widening the source wrote: this pass runs
+ * before the optimizer, so `idx = idx + (int64)N` still has the cast in it and
+ * a step of N reads as no step at all without looking past it. */
+static int safety_read_step_add(const IRFunction *function, size_t before,
+                                const IRInstruction *instruction,
                                 const char *iv, long long *step_out) {
   if (!instruction || instruction->op != IR_OP_BINARY ||
       instruction->is_float || !instruction->text ||
       strcmp(instruction->text, "+") != 0 ||
-      !ir_operand_is_symbol_named(&instruction->lhs, iv) ||
-      instruction->rhs.kind != IR_OPERAND_INT ||
-      instruction->rhs.int_value <= 0) {
+      !ir_operand_is_symbol_named(&instruction->lhs, iv)) {
     return 0;
   }
-  *step_out = instruction->rhs.int_value;
+  long long step = 0;
+  if (!safety_constant_value(function, before, &instruction->rhs, 0, &step) ||
+      step <= 0) {
+    return 0;
+  }
+  *step_out = step;
   return 1;
 }
 
@@ -535,7 +604,7 @@ static int safety_loop_step(const IRFunction *function,
   }
 
   const IRInstruction *write = &function->instructions[write_index];
-  if (safety_read_step_add(write, iv, step_out)) {
+  if (safety_read_step_add(function, write_index, write, iv, step_out)) {
     *step_first = write_index;
     *step_last = write_index;
     return 1;
@@ -547,10 +616,13 @@ static int safety_loop_step(const IRFunction *function,
   }
   const IRInstruction *add =
       ir_find_temp_producer_before(function, write_index, write->lhs.name);
-  if (!safety_read_step_add(add, iv, step_out)) {
+  if (!add) {
     return 0;
   }
   size_t add_index = (size_t)(add - function->instructions);
+  if (!safety_read_step_add(function, add_index, add, iv, step_out)) {
+    return 0;
+  }
   if (add_index <= loop->branch_index || add_index >= loop->jump_index) {
     return 0; /* the arithmetic is not in this body, so it is not the step */
   }
@@ -706,15 +778,36 @@ typedef struct {
    * masked index does, the range is this many bytes and none of the loop
    * fields below are read. */
   long long constant_length;
-  long long stride;       /* bytes per element */
-  long long primary_step; /* how far the tested variable moves each iteration */
-  long long index_step;   /* how far the indexing variable moves */
-  long long adjust;       /* the tested variable tops out at bound + adjust */
-  long long addend;       /* the index is that variable plus this */
-  long long size;         /* bytes the access touches */
+  long long stride;        /* bytes per element */
+  long long primary_step;  /* how far the tested variable moves each iteration */
+  long long index_step;    /* how far the indexing variable moves */
+  long long primary_start; /* the tested variable's first value */
+  long long index_start;   /* the indexing variable's first value */
+  long long adjust;        /* the tested variable tops out at bound + adjust */
+  long long coeff;         /* index = coeff * counter + invariant + constant */
+  long long constant;
+  long long size; /* bytes the access touches */
   long long access_kind;
   IROperand base;  /* owned */
   IROperand bound; /* owned */
+  /* The runtime term the index is displaced by, as it was written in the loop.
+   * Re-read rather than referenced, because the expression that computed it
+   * often lives inside the body and has to be worked out again in front of the
+   * header; `function` and `bounds` are what that re-reading needs. */
+  IROperand invariant; /* owned; kind NONE when absent */
+  int has_invariant;
+  /* Where the indexing counter began, when that is not a constant: the row
+   * offset a blocked matrix multiply starts each inner loop from. Added to
+   * index_start rather than replacing it. */
+  IROperand index_start_value; /* owned; kind NONE when absent */
+  int has_index_start;
+  /* Where to start looking for what computed the displacement. It is the
+   * access's own position, not the header's: the expression usually lives
+   * inside the body, and searching back from the header would find some
+   * earlier definition of the same temp, or none. */
+  size_t invariant_at;
+  const IRFunction *function; /* borrowed */
+  IRWhileLoopBounds bounds;
   SourceLocation location;
 } SafetyHoist;
 
@@ -949,6 +1042,311 @@ static int safety_body_runs_access_every_iteration(
   return 1;
 }
 
+/* ---- reading an index as a line ------------------------------------------- *
+ *
+ * Most indices that are not a bare counter are still a straight line in one:
+ * `mat[base + j]`, `b[j * N + i]`, `src[n - 1 - i]`. Each moves by a fixed
+ * amount per iteration, so each touches one contiguous range, and one check
+ * covers the range exactly as it does for `a[i]`.
+ *
+ * The form is `coeff * varying + invariant + constant`. Splitting it needs a
+ * loop to be relative to, since the same expression is a counter in one loop
+ * and a fixed value in the one outside it, so the reading happens once per
+ * candidate loop rather than once per access. */
+
+/* Does the body write this symbol? The induction variable does, by its step,
+ * which is what makes it the varying one. */
+static int safety_symbol_written_in_body(const IRFunction *function,
+                                         const IRWhileLoopBounds *loop,
+                                         const char *symbol) {
+  for (size_t i = loop->branch_index + 1;
+       i < loop->jump_index && i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    if (instruction->dest.kind == IR_OPERAND_SYMBOL &&
+        instruction->dest.name &&
+        strcmp(instruction->dest.name, symbol) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Whether the value this operand names differs from one iteration to the next.
+ * A temp settled before the loop cannot; one computed inside it varies exactly
+ * when what it was computed from does. Anything this cannot read is treated as
+ * varying, which only costs a hoist. */
+static int safety_value_varies(const IRFunction *function, size_t before,
+                               const IRWhileLoopBounds *loop,
+                               const IROperand *operand, int depth) {
+  if (!operand || depth > 8) {
+    return 1;
+  }
+  if (operand->kind == IR_OPERAND_INT) {
+    return 0;
+  }
+  if (operand->kind == IR_OPERAND_SYMBOL && operand->name) {
+    return safety_symbol_written_in_body(function, loop, operand->name);
+  }
+  if (operand->kind != IR_OPERAND_TEMP || !operand->name) {
+    return 1;
+  }
+  const IRInstruction *producer =
+      ir_find_temp_producer_before(function, before, operand->name);
+  if (!producer) {
+    return 1;
+  }
+  size_t at = (size_t)(producer - function->instructions);
+  if (at <= loop->branch_index) {
+    return 0; /* computed before the loop began */
+  }
+  if (producer->op != IR_OP_BINARY && producer->op != IR_OP_ASSIGN &&
+      producer->op != IR_OP_CAST) {
+    return 1;
+  }
+  return safety_value_varies(function, at, loop, &producer->lhs, depth + 1) ||
+         (producer->rhs.kind != IR_OPERAND_NONE &&
+          safety_value_varies(function, at, loop, &producer->rhs, depth + 1));
+}
+
+/* Whether a loop-invariant value can be named in front of the header: either it
+ * already is one, or it is a small expression over values that are, which the
+ * check can simply compute again there. `mat[i * dim + j]` needs the second
+ * form, since `i * dim` is worked out inside the inner loop and the temp
+ * holding it does not exist before the header. */
+static int safety_invariant_available(const IRFunction *function, size_t before,
+                                      size_t header,
+                                      const IRWhileLoopBounds *loop,
+                                      const IROperand *operand, int depth) {
+  if (!operand || depth > 6) {
+    return 0;
+  }
+  if (operand->kind == IR_OPERAND_INT) {
+    return 1;
+  }
+  if (operand->kind == IR_OPERAND_SYMBOL && operand->name) {
+    return safety_operand_invariant_in(function, header, loop->jump_index,
+                                       operand);
+  }
+  if (operand->kind != IR_OPERAND_TEMP || !operand->name) {
+    return 0;
+  }
+  const IRInstruction *producer =
+      ir_find_temp_producer_before(function, before, operand->name);
+  if (!producer) {
+    return 0;
+  }
+  size_t at = (size_t)(producer - function->instructions);
+  if (at < header) {
+    return 1; /* already settled where the check will go */
+  }
+  if (producer->op == IR_OP_ASSIGN || producer->op == IR_OP_CAST) {
+    return safety_invariant_available(function, at, header, loop,
+                                      &producer->lhs, depth + 1);
+  }
+  if (producer->op != IR_OP_BINARY || producer->is_float || !producer->text) {
+    return 0;
+  }
+  if (strcmp(producer->text, "+") != 0 && strcmp(producer->text, "-") != 0 &&
+      strcmp(producer->text, "*") != 0 && strcmp(producer->text, "<<") != 0) {
+    return 0;
+  }
+  return safety_invariant_available(function, at, header, loop, &producer->lhs,
+                                    depth + 1) &&
+         safety_invariant_available(function, at, header, loop, &producer->rhs,
+                                    depth + 1);
+}
+
+/* `index = coeff * varying + invariant + constant`, read relative to one loop.
+ * `varying` is NULL when the whole index holds still, which is worth hoisting
+ * too: the same element checked once instead of once per iteration. */
+typedef struct {
+  long long coeff;
+  const char *varying;        /* borrowed from the IR */
+  const IROperand *invariant; /* borrowed from the IR; NULL when absent */
+  long long constant;
+} SafetyIndexForm;
+
+static int safety_index_form_merge(SafetyIndexForm *into,
+                                   const SafetyIndexForm *add, long long sign) {
+  if (add->varying) {
+    if (into->varying) {
+      if (strcmp(into->varying, add->varying) != 0) {
+        return 0; /* two moving parts is not a line in one of them */
+      }
+      into->coeff += sign * add->coeff;
+    } else {
+      into->varying = add->varying;
+      into->coeff = sign * add->coeff;
+    }
+  }
+  if (add->invariant) {
+    if (into->invariant) {
+      return 0; /* only one runtime term is carried into the check */
+    }
+    if (sign < 0) {
+      return 0; /* a subtracted runtime term would need its own negation */
+    }
+    into->invariant = add->invariant;
+  }
+  into->constant += sign * add->constant;
+  return 1;
+}
+
+static int safety_read_index_form(const IRFunction *function, size_t before,
+                                  size_t header, const IRWhileLoopBounds *loop,
+                                  const IROperand *index, int depth,
+                                  SafetyIndexForm *out) {
+  if (!index || depth > 6) {
+    return 0;
+  }
+  memset(out, 0, sizeof(*out));
+
+  if (index->kind == IR_OPERAND_INT) {
+    out->constant = index->int_value;
+    return 1;
+  }
+  /* A subtree that holds still is one term, whatever its shape. That is what
+   * keeps `i * dim` together instead of trying to make a line out of it. */
+  if (!safety_value_varies(function, before, loop, index, 0)) {
+    if (!safety_invariant_available(function, before, header, loop, index, 0)) {
+      return 0;
+    }
+    out->invariant = index;
+    return 1;
+  }
+  if (index->kind == IR_OPERAND_SYMBOL && index->name) {
+    out->varying = index->name;
+    out->coeff = 1;
+    return 1;
+  }
+  if (index->kind != IR_OPERAND_TEMP || !index->name) {
+    return 0;
+  }
+  const IRInstruction *producer =
+      ir_find_temp_producer_before(function, before, index->name);
+  if (!producer || producer->is_float) {
+    return 0;
+  }
+  size_t at = (size_t)(producer - function->instructions);
+  if (producer->op == IR_OP_ASSIGN) {
+    return safety_read_index_form(function, at, header, loop, &producer->lhs,
+                                  depth + 1, out);
+  }
+  if (producer->op != IR_OP_BINARY || !producer->text) {
+    return 0;
+  }
+
+  SafetyIndexForm lhs;
+  SafetyIndexForm rhs;
+  if (!safety_read_index_form(function, at, header, loop, &producer->lhs,
+                              depth + 1, &lhs) ||
+      !safety_read_index_form(function, at, header, loop, &producer->rhs,
+                              depth + 1, &rhs)) {
+    return 0;
+  }
+
+  if (strcmp(producer->text, "+") == 0) {
+    *out = lhs;
+    return safety_index_form_merge(out, &rhs, 1);
+  }
+  if (strcmp(producer->text, "-") == 0) {
+    *out = lhs;
+    return safety_index_form_merge(out, &rhs, -1);
+  }
+  /* Scaling, but only by something the compiler knows: a runtime factor on the
+   * moving part would make the distance between iterations a runtime value the
+   * length below cannot be written in terms of. */
+  const SafetyIndexForm *scaled = NULL;
+  long long factor = 0;
+  if (strcmp(producer->text, "*") == 0) {
+    if (!lhs.varying && !lhs.invariant) {
+      scaled = &rhs;
+      factor = lhs.constant;
+    } else if (!rhs.varying && !rhs.invariant) {
+      scaled = &lhs;
+      factor = rhs.constant;
+    }
+  } else if (strcmp(producer->text, "<<") == 0 && !rhs.varying &&
+             !rhs.invariant && rhs.constant >= 0 && rhs.constant < 32) {
+    scaled = &lhs;
+    factor = 1LL << rhs.constant;
+  }
+  if (!scaled || (scaled->invariant && factor != 1)) {
+    return 0; /* a scaled runtime term has no place to go in the form */
+  }
+  out->varying = scaled->varying;
+  out->coeff = scaled->coeff * factor;
+  out->invariant = scaled->invariant;
+  out->constant = scaled->constant * factor;
+  return 1;
+}
+
+/* The value a counter holds when the loop is entered. Like
+ * ir_iv_zero_at_header, but reports the constant rather than insisting it is
+ * zero: a scan starting at one covers `[1, n)`, which is as describable a range
+ * as `[0, n)` and was being turned down only because the code asked the
+ * narrower question. */
+static int safety_iv_start_at_header(const IRFunction *function,
+                                     size_t header_index,
+                                     const IRWhileLoopBounds *loop,
+                                     const char *iv, long long *start_out,
+                                     const IROperand **start_operand_out) {
+  *start_out = 0;
+  *start_operand_out = NULL;
+  for (size_t i = header_index; i-- > 0;) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_NOP || ins->op == IR_OP_DECLARE_LOCAL) {
+      continue;
+    }
+    if (ins->op == IR_OP_LABEL || ins->op == IR_OP_JUMP ||
+        ins->op == IR_OP_BRANCH_ZERO || ins->op == IR_OP_BRANCH_EQ) {
+      return 0; /* another path reaches the loop; the value is not settled */
+    }
+    if (!ir_instruction_writes_destination(ins) ||
+        !ir_operand_is_symbol_named(&ins->dest, iv)) {
+      continue;
+    }
+    /* `idx = (int64)col` widens straight into the counter, so the initializer
+     * is as often a cast as an assignment. Only the 64-bit targets are read
+     * through: a narrower one can change the value being started from. */
+    if (ins->op == IR_OP_CAST) {
+      if (ins->is_float || !ins->text ||
+          (strcmp(ins->text, "int64") != 0 &&
+           strcmp(ins->text, "uint64") != 0)) {
+        return 0;
+      }
+    } else if (ins->op != IR_OP_ASSIGN) {
+      return 0;
+    }
+    if (ins->lhs.kind == IR_OPERAND_INT) {
+      *start_out = ins->lhs.int_value;
+      return 1;
+    }
+    /* A counter can start somewhere the compiler does not know, as the row
+     * offsets of a blocked matrix multiply do, and the range is still exactly
+     * describable: it just begins at a value the check works out rather than
+     * one written into it. */
+    const IROperand *source = &ins->lhs;
+    if (source->kind == IR_OPERAND_TEMP && source->name) {
+      const IRInstruction *p =
+          ir_find_temp_producer_before(function, i, source->name);
+      if (p && (p->op == IR_OP_CAST || p->op == IR_OP_ASSIGN) && !p->is_float) {
+        if (p->lhs.kind == IR_OPERAND_INT) {
+          *start_out = p->lhs.int_value;
+          return 1;
+        }
+        source = &p->lhs;
+      }
+    }
+    if (safety_invariant_available(function, i, header_index, loop, source, 0)) {
+      *start_operand_out = source;
+      return 1;
+    }
+    return 0;
+  }
+  return 0;
+}
+
 static int safety_try_hoist(IRFunction *function, const SafetyLoopList *loops,
                             size_t check_index, const SafetyAccess *access,
                             SafetyHoist *out) {
@@ -964,21 +1362,14 @@ static int safety_try_hoist(IRFunction *function, const SafetyLoopList *loops,
   int masked = safety_offset_upper_bound(function, check_index, access->offset,
                                          &masked_stride, &masked_upper);
 
-  const char *iv = NULL;
+  /* The offset is the index scaled by the element width. Only the scaling has
+   * to be read here; what the index itself is made of is read once per
+   * candidate loop below, since the answer depends on which loop is asking. */
+  const IROperand *index = NULL;
   long long stride = 0;
-  long long addend = 0;
-  if (!masked &&
-      !safety_offset_is_scaled_symbol(function, check_index, access->offset,
-                                      &iv, &stride, &addend)) {
-    safety_trace("the index is neither a counter nor bounded by its own "
-                 "arithmetic",
-                 access->location.line);
-    return 0;
-  }
-  /* An access no wider than its element is what keeps the hoisted length from
-   * reaching past the range the expression describes. */
-  if (!masked && (access->size > stride || addend < 0)) {
-    safety_trace("the access is wider than its element, or reaches backwards",
+  if (!masked && !safety_offset_scaling(function, check_index, access->offset,
+                                        &index, &stride)) {
+    safety_trace("the offset is not an index scaled by a constant width",
                  access->location.line);
     return 0;
   }
@@ -1015,29 +1406,57 @@ static int safety_try_hoist(IRFunction *function, const SafetyLoopList *loops,
     }
     saw_loop = 1;
 
+    /* What the index is made of, as this loop sees it. */
+    SafetyIndexForm shape;
+    if (!safety_read_index_form(function, check_index, header, &form.bounds,
+                                index, 0, &shape)) {
+      safety_trace("the index is neither a line in one counter nor bounded by "
+                   "its own arithmetic",
+                   access->location.line);
+      return 0;
+    }
+    if (!shape.varying || shape.coeff == 0) {
+      continue; /* nothing this loop does moves it; ask the loop outside */
+    }
+
     /* The variable the loop tests, and the one this access indexes by, need
      * not be the same. A loop reading three bytes and writing four advances
      * two counters; the test bounds one of them, and the other is pinned to it
-     * by both starting at zero and both stepping by a constant, so after the
-     * same number of iterations each is that count times its own step. */
+     * by both starting where it starts and stepping by a constant, so after
+     * the same number of iterations each has travelled its own step times the
+     * count. */
     size_t primary_first = 0;
     size_t primary_last = 0;
-    if (!ir_iv_zero_at_header(function, header, form.iv) ||
+    long long primary_start = 0;
+    const IROperand *primary_start_operand = NULL;
+    if (!safety_iv_start_at_header(function, header, &form.bounds, form.iv,
+                                   &primary_start, &primary_start_operand) ||
+        primary_start_operand ||
         !safety_loop_step(function, &form.bounds, form.iv, &form.step,
                           &primary_first, &primary_last)) {
-      safety_trace("the tested variable is not a plain zero-based counter",
+      safety_trace("the tested variable is not a counter that starts at a "
+                   "known value and steps by a constant",
                    access->location.line);
       return 0;
     }
 
     long long index_step = form.step;
-    if (strcmp(form.iv, iv) != 0) {
+    long long index_start = primary_start;
+    const IROperand *index_start_operand = NULL;
+    if (strcmp(form.iv, shape.varying) != 0) {
       size_t index_first = 0;
       size_t index_last = 0;
-      if (!ir_iv_zero_at_header(function, header, iv) ||
-          !safety_loop_step(function, &form.bounds, iv, &index_step,
+      if (!safety_iv_start_at_header(function, header, &form.bounds,
+                                     shape.varying, &index_start,
+                                     &index_start_operand)) {
+        safety_trace("the indexing variable does not start from a value "
+                     "settled before the loop",
+                     access->location.line);
+        return 0;
+      }
+      if (!safety_loop_step(function, &form.bounds, shape.varying, &index_step,
                             &index_first, &index_last)) {
-        safety_trace("the indexing variable is not a plain zero-based counter",
+        safety_trace("the indexing variable does not step by a constant",
                      access->location.line);
         return 0;
       }
@@ -1071,17 +1490,44 @@ static int safety_try_hoist(IRFunction *function, const SafetyLoopList *loops,
     out->stride = stride;
     out->primary_step = form.step;
     out->index_step = index_step;
+    out->primary_start = primary_start;
+    out->index_start = index_start;
     out->adjust = form.adjust;
-    out->addend = addend;
+    out->coeff = shape.coeff;
+    out->constant = shape.constant;
     out->size = access->size;
     out->access_kind = access->access_kind;
     out->location = access->location;
+    out->function = function;
+    out->bounds = form.bounds;
+    out->has_invariant = 0;
+    out->has_index_start = 0;
+    out->invariant_at = check_index;
     if (!ir_operand_clone(access->base, &out->base)) {
       return 0;
     }
     if (!ir_operand_clone(form.bound, &out->bound)) {
       ir_operand_destroy(&out->base);
       return 0;
+    }
+    if (shape.invariant) {
+      if (!ir_operand_clone(shape.invariant, &out->invariant)) {
+        ir_operand_destroy(&out->base);
+        ir_operand_destroy(&out->bound);
+        return 0;
+      }
+      out->has_invariant = 1;
+    }
+    if (index_start_operand) {
+      if (!ir_operand_clone(index_start_operand, &out->index_start_value)) {
+        ir_operand_destroy(&out->base);
+        ir_operand_destroy(&out->bound);
+        if (out->has_invariant) {
+          ir_operand_destroy(&out->invariant);
+        }
+        return 0;
+      }
+      out->has_index_start = 1;
     }
     return 1;
   }
@@ -1091,13 +1537,143 @@ static int safety_try_hoist(IRFunction *function, const SafetyLoopList *loops,
   return 0;
 }
 
+/* ---- building the check's arithmetic -------------------------------------- *
+ *
+ * A small scratchpad, because the range now takes a dozen instructions in the
+ * worst case and threading the failure and the ownership of each temp through
+ * by hand was the bulk of the previous version. Every temp handed out is kept
+ * and released together; a failure anywhere is remembered and makes every
+ * later call a no-op, so the sequence reads as arithmetic rather than as error
+ * handling. */
+enum { SAFETY_BUILD_MAX = 32 };
+
+typedef struct {
+  IRInstructionVector *out;
+  SourceLocation location;
+  unsigned id;
+  int seq;
+  int failed;
+  IROperand owned[SAFETY_BUILD_MAX];
+  int owned_count;
+  /* Handed back once something has gone wrong, so the arithmetic below can go
+   * on being written as arithmetic without a null check per step. */
+  IROperand nowhere;
+} SafetyBuild;
+
+static void safety_build_init(SafetyBuild *b, IRInstructionVector *out,
+                              SourceLocation location) {
+  memset(b, 0, sizeof(*b));
+  b->out = out;
+  b->location = location;
+  b->id = g_safety_next_id++;
+}
+
+static void safety_build_release(SafetyBuild *b) {
+  for (int i = 0; i < b->owned_count; i++) {
+    ir_operand_destroy(&b->owned[i]);
+  }
+  b->owned_count = 0;
+}
+
+/* A named operand needs its name; a literal has none and needs none. Asking
+ * for a name unconditionally rejected every constant leaf, which is most of
+ * them: the `256` in `i * 256`. */
+static int safety_operand_is_usable(const IROperand *operand) {
+  if (operand->kind == IR_OPERAND_INT || operand->kind == IR_OPERAND_FLOAT) {
+    return 1;
+  }
+  return (operand->kind == IR_OPERAND_TEMP ||
+          operand->kind == IR_OPERAND_SYMBOL) &&
+         operand->name != NULL;
+}
+
+/* Park an operand this builder owns, and hand back a stable pointer to it. */
+static const IROperand *safety_build_keep(SafetyBuild *b, IROperand *value) {
+  if (b->failed || b->owned_count >= SAFETY_BUILD_MAX ||
+      !safety_operand_is_usable(value)) {
+    b->failed = 1;
+    ir_operand_destroy(value);
+    return &b->nowhere;
+  }
+  b->owned[b->owned_count] = *value;
+  return &b->owned[b->owned_count++];
+}
+
+/* `fresh = lhs <op> rhs`. Returns a pointer that stays valid until release. */
+static const IROperand *safety_build(SafetyBuild *b, const char *op,
+                                     const IROperand *lhs,
+                                     const IROperand *rhs) {
+  if (b->failed) {
+    return lhs;
+  }
+  char name[64];
+  snprintf(name, sizeof(name), SAFETY_TEMP_PREFIX "h%u_%d", b->id, b->seq++);
+  if (!safety_emit_binary(b->out, b->location, op, name, lhs, rhs, 0)) {
+    b->failed = 1;
+    return lhs;
+  }
+  IROperand fresh = ir_operand_temp(name);
+  return safety_build_keep(b, &fresh);
+}
+
+/* Name a loop-invariant value in front of the header, working it out again
+ * there when the expression that produced it lives inside the body. Mirrors
+ * safety_invariant_available, which already decided this would succeed. */
+static const IROperand *safety_build_invariant(SafetyBuild *b,
+                                               const IRFunction *function,
+                                               size_t before, size_t header,
+                                               const IRWhileLoopBounds *loop,
+                                               const IROperand *operand,
+                                               int depth) {
+  if (b->failed || depth > 6) {
+    b->failed = 1;
+    return operand;
+  }
+  if (operand->kind == IR_OPERAND_TEMP && operand->name) {
+    const IRInstruction *producer =
+        ir_find_temp_producer_before(function, before, operand->name);
+    if (producer) {
+      size_t at = (size_t)(producer - function->instructions);
+      if (at >= header) {
+        if (producer->op == IR_OP_ASSIGN || producer->op == IR_OP_CAST) {
+          return safety_build_invariant(b, function, at, header, loop,
+                                        &producer->lhs, depth + 1);
+        }
+        if (producer->op == IR_OP_BINARY && producer->text) {
+          const IROperand *lhs = safety_build_invariant(
+              b, function, at, header, loop, &producer->lhs, depth + 1);
+          const IROperand *rhs = safety_build_invariant(
+              b, function, at, header, loop, &producer->rhs, depth + 1);
+          return safety_build(b, producer->text, lhs, rhs);
+        }
+        b->failed = 1;
+        return operand;
+      }
+    }
+  }
+  IROperand copy;
+  if (!ir_operand_clone(operand, &copy)) {
+    b->failed = 1;
+    return operand;
+  }
+  return safety_build_keep(b, &copy);
+}
+
 /* Emit the one check that stands in for all of the loop's:
  *
- *   top     = bound + adjust            highest index the loop reaches
- *   settled = (top / step) * step       the last value it actually takes
- *   length  = settled * stride + size   one past the last byte it reads
- *   runs    = top >= 0                  zero when the loop never runs at all
- *   check(base, 0, length * runs)
+ *   top     = bound + adjust            highest value the test allows
+ *   span    = top - start               how far the counter travels
+ *   travel  = (span / step) * index_step   how far the index travels with it
+ *   length  = travel * |coeff| * stride + size    the bytes it covers
+ *   runs    = span >= 0                 zero when the loop never runs at all
+ *   check(base, low * stride, length * runs)
+ *
+ * Rounding down to a multiple of the step matters once the step is more than
+ * one: a loop counting by three stops at the largest multiple of three below
+ * its bound, and using the bound itself would check up to two bytes the loop
+ * never reads. On an exactly sized buffer those two bytes are the difference
+ * between silence and accusing a correct program. The division is skipped
+ * where the step is one, which is most loops.
  *
  * Rounding down to a multiple of the step matters once the step is more than
  * one: a loop counting by three stops at the largest multiple of three below
@@ -1129,110 +1705,101 @@ static int safety_emit_hoisted(IRInstructionVector *out,
     return emitted;
   }
 
-  enum { SAFETY_HOIST_TEMPS = 7 };
-  unsigned id = g_safety_next_id++;
-  static const char *const tags[SAFETY_HOIST_TEMPS] = {"ht", "hq", "hm",
-                                                       "hi", "hs", "hn", "hr"};
-  char names[SAFETY_HOIST_TEMPS][64];
-  IROperand temps[SAFETY_HOIST_TEMPS];
-  for (int t = 0; t < SAFETY_HOIST_TEMPS; t++) {
-    snprintf(names[t], sizeof(names[t]), SAFETY_TEMP_PREFIX "%s%u", tags[t],
-             id);
-    temps[t] = ir_operand_temp(names[t]);
-  }
-  IROperand *top = &temps[0];
-  IROperand *rounds = &temps[1];
-  IROperand *highest = &temps[2];
-  IROperand *index = &temps[3];
-  IROperand *scaled = &temps[4];
-  IROperand *length = &temps[5];
-  IROperand *runs = &temps[6];
+  SafetyBuild build;
+  safety_build_init(&build, out, hoist->location);
 
   IROperand adjust = ir_operand_int(hoist->adjust);
+  IROperand primary_start = ir_operand_int(hoist->primary_start);
   IROperand primary_step = ir_operand_int(hoist->primary_step);
   IROperand index_step = ir_operand_int(hoist->index_step);
-  IROperand addend = ir_operand_int(hoist->addend);
   IROperand stride = ir_operand_int(hoist->stride);
   IROperand size = ir_operand_int(hoist->size);
   IROperand zero = ir_operand_int(0);
-  int ok = 0;
 
-  for (int t = 0; t < SAFETY_HOIST_TEMPS; t++) {
-    if (!temps[t].name) {
-      goto done;
-    }
+  /* The highest value the test allows, and how far that is from where the
+   * counter began. */
+  const IROperand *top =
+      safety_build(&build, "+", &hoist->bound, &adjust);
+  const IROperand *span = top;
+  if (hoist->primary_start != 0) {
+    span = safety_build(&build, "-", top, &primary_start);
   }
 
-  /* How far the tested variable gets. */
-  if (!safety_emit_binary(out, hoist->location, "+", names[0], &hoist->bound,
-                          &adjust, 0)) {
-    goto done;
-  }
-
-  /* How many times the body runs, less one, and from that the last value the
-   * indexing variable takes. Dividing is what pins the two counters together;
-   * where the tested variable steps by one it is already the count. */
-  const IROperand *last_index = top;
+  /* Iterations less one, and from that how far the indexing counter travels.
+   * Dividing is what pins two counters together; where the tested variable
+   * steps by one it is already the count. */
+  const IROperand *rounds = span;
   if (hoist->primary_step > 1) {
-    if (!safety_emit_binary(out, hoist->location, "/", names[1], top,
-                            &primary_step, 0)) {
-      goto done;
+    rounds = safety_build(&build, "/", span, &primary_step);
+  }
+  const IROperand *travel = rounds;
+  if (hoist->index_step != 1) {
+    travel = safety_build(&build, "*", rounds, &index_step);
+  }
+
+  /* Bytes from the first element the loop touches to one past the last. The
+   * displacement drops out of it, since both ends carry the same one, and so
+   * does where the counter started. */
+  long long reach = hoist->coeff < 0 ? -hoist->coeff : hoist->coeff;
+  IROperand per_step = ir_operand_int(reach * hoist->stride);
+  const IROperand *spanned = safety_build(&build, "*", travel, &per_step);
+  const IROperand *length = safety_build(&build, "+", spanned, &size);
+  const IROperand *runs = safety_build(&build, ">=", span, &zero);
+  const IROperand *guarded = safety_build(&build, "*", length, runs);
+
+  /* Where the counter stands at the low end of the range. A positive
+   * coefficient puts that at the first iteration; a negative one puts it at
+   * the last, so the travel has to be walked back to reach it. */
+  IROperand index_start = ir_operand_int(hoist->index_start);
+  const IROperand *counter = &index_start;
+  if (hoist->has_index_start) {
+    const IROperand *from = safety_build_invariant(
+        &build, hoist->function, hoist->invariant_at, hoist->header_index,
+        &hoist->bounds, &hoist->index_start_value, 0);
+    counter = hoist->index_start != 0
+                  ? safety_build(&build, "+", from, &index_start)
+                  : from;
+  }
+  if (hoist->coeff < 0) {
+    counter = safety_build(&build, "+", counter, travel);
+  }
+
+  /* And the index there: the counter scaled, displaced, and shifted by
+   * whatever constant the expression carried. */
+  const IROperand *low = counter;
+  if (hoist->coeff != 1) {
+    IROperand coeff = ir_operand_int(hoist->coeff);
+    low = safety_build(&build, "*", counter, &coeff);
+  }
+  if (hoist->constant != 0) {
+    IROperand constant = ir_operand_int(hoist->constant);
+    low = safety_build(&build, "+", low, &constant);
+  }
+  if (hoist->has_invariant) {
+    const IROperand *displacement = safety_build_invariant(
+        &build, hoist->function, hoist->invariant_at, hoist->header_index,
+        &hoist->bounds, &hoist->invariant, 0);
+    low = safety_build(&build, "+", low, displacement);
+  }
+  const IROperand *offset = low;
+  if (hoist->stride != 1) {
+    offset = safety_build(&build, "*", low, &stride);
+  }
+
+  int ok = 0;
+  if (!build.failed) {
+    IROperand arguments[5];
+    if (ir_operand_clone(&hoist->base, &arguments[0])) {
+      arguments[1] = *offset;
+      arguments[2] = *guarded;
+      arguments[3] = ir_operand_int(hoist->access_kind);
+      arguments[4] = ir_operand_int((long long)hoist->location.line);
+      ok = safety_emit_call(out, hoist->location, "mettle_safety_check",
+                            arguments, 5);
+      ir_operand_destroy(&arguments[0]);
     }
-    last_index = rounds;
   }
-  if (hoist->index_step != 1 || last_index != top) {
-    if (!safety_emit_binary(out, hoist->location, "*", names[2], last_index,
-                            &index_step, 0)) {
-      goto done;
-    }
-    last_index = highest;
-  }
-
-  if (hoist->addend != 0) {
-    if (!safety_emit_binary(out, hoist->location, "+", names[3], last_index,
-                            &addend, 0)) {
-      goto done;
-    }
-    last_index = index;
-  }
-
-  if (!safety_emit_binary(out, hoist->location, "*", names[4], last_index,
-                          &stride, 0) ||
-      !safety_emit_binary(out, hoist->location, "+", names[5], scaled, &size,
-                          0) ||
-      !safety_emit_binary(out, hoist->location, ">=", names[6], top, &zero,
-                          0)) {
-    goto done;
-  }
-
-  char guarded[64];
-  snprintf(guarded, sizeof(guarded), SAFETY_TEMP_PREFIX "hg%u", id);
-  IROperand guarded_operand = ir_operand_temp(guarded);
-  if (!guarded_operand.name ||
-      !safety_emit_binary(out, hoist->location, "*", guarded, length, runs,
-                          0)) {
-    ir_operand_destroy(&guarded_operand);
-    goto done;
-  }
-
-  IROperand arguments[5];
-  if (!ir_operand_clone(&hoist->base, &arguments[0])) {
-    ir_operand_destroy(&guarded_operand);
-    goto done;
-  }
-  arguments[1] = ir_operand_int(0);
-  arguments[2] = guarded_operand;
-  arguments[3] = ir_operand_int(hoist->access_kind);
-  arguments[4] = ir_operand_int((long long)hoist->location.line);
-  ok = safety_emit_call(out, hoist->location, "mettle_safety_check", arguments,
-                        5);
-  ir_operand_destroy(&arguments[0]);
-  ir_operand_destroy(&guarded_operand);
-
-done:
-  for (int t = 0; t < SAFETY_HOIST_TEMPS; t++) {
-    ir_operand_destroy(&temps[t]);
-  }
+  safety_build_release(&build);
   return ok;
 }
 
@@ -1862,6 +2429,12 @@ static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
   for (size_t h = 0; h < hoist_count; h++) {
     ir_operand_destroy(&hoists[h].base);
     ir_operand_destroy(&hoists[h].bound);
+    if (hoists[h].has_invariant) {
+      ir_operand_destroy(&hoists[h].invariant);
+    }
+    if (hoists[h].has_index_start) {
+      ir_operand_destroy(&hoists[h].index_start_value);
+    }
   }
   for (size_t s = 0; s < span_count; s++) {
     ir_operand_destroy(&spans[s].base);
@@ -1882,6 +2455,12 @@ fail:
   for (size_t h = 0; h < hoist_count; h++) {
     ir_operand_destroy(&hoists[h].base);
     ir_operand_destroy(&hoists[h].bound);
+    if (hoists[h].has_invariant) {
+      ir_operand_destroy(&hoists[h].invariant);
+    }
+    if (hoists[h].has_index_start) {
+      ir_operand_destroy(&hoists[h].index_start_value);
+    }
   }
   for (size_t s = 0; s < span_count; s++) {
     ir_operand_destroy(&spans[s].base);

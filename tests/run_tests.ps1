@@ -2658,6 +2658,52 @@ catch {
   Write-CaseResult -Name "safe_mode_hoist_branchy" -Passed $false -Reason $_.Exception.Message
 }
 
+# An index that is a straight line in one counter, in every shape the whole-loop
+# check reads: a counter starting somewhere other than zero, a displacement the
+# loop holds still, a counter running backwards, one scaled by a stride, and one
+# starting from a value settled just before the loop.
+#
+# Both directions matter and both are silent when wrong. A range one element too
+# wide accuses a program that never left its allocation, which is why the clean
+# case sizes every buffer to exactly what its loop walks. A range one element too
+# narrow lets the overrun through unexamined, which is the mode going missing
+# from the loops it exists for, so each shape is also walked one past the end.
+try {
+  $affineClean = Join-Path $tmpDir "safe_affine_clean.exe"
+  & $CompilerPath --build --safe --release tests\test_safe_affine_clean.mettle -o $affineClean 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "--safe build of test_safe_affine_clean failed"
+  }
+  $affineOut = & $affineClean 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0 -or $affineOut -notmatch "affine=151") {
+    throw "an exactly sized buffer was rejected or the answer changed: expected affine=151, got exit $LASTEXITCODE`n$affineOut"
+  }
+
+  $affineShort = Join-Path $tmpDir "safe_affine_short.exe"
+  & $CompilerPath --build --safe --release tests\test_safe_affine_short.mettle -o $affineShort 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "--safe build of test_safe_affine_short failed"
+  }
+  $shapes = @(
+    @{ Arg = "1"; What = "a counter starting at one" },
+    @{ Arg = "2"; What = "a displaced counter" },
+    @{ Arg = "3"; What = "a counter running backwards" },
+    @{ Arg = "4"; What = "a counter scaled by a stride" },
+    @{ Arg = "5"; What = "a counter starting from a runtime value" }
+  )
+  foreach ($shape in $shapes) {
+    $shapeOut = & $affineShort $shape.Arg 2>&1 | Out-String
+    if ($shapeOut -notmatch "outside its allocation") {
+      throw "$($shape.What) walked one element past the end uncaught:`n$shapeOut"
+    }
+  }
+  Write-CaseResult -Name "safe_mode_affine_index" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "safe_mode_affine_index" -Passed $false -Reason $_.Exception.Message
+}
+
 
 # --safe must not change what a correct program computes and must not reject
 # one. Real programs are what tests that: the fixtures above are written to
