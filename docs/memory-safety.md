@@ -48,23 +48,36 @@ interleaved:
 
 | Benchmark | Overhead | Accesses | Settled at compile time | Checked at run time |
 |---|---|---|---|---|
-| dot_product | 1.01x | 34 | 8 | 26 |
-| crc32 | 1.80x | 31 | 4 | 27 |
-| binary_search | 2.28x | 33 | 5 | 28 |
-| base64_encode | 3.18x | 57 | 15 | 42 |
-| heapsort | 15.3x | 54 | 16 | 38 |
+| dot_product | 1.00x | 34 | 8 | 26 |
+| crc32 | 1.04x | 31 | 4 | 27 |
+| binary_search | 1.55x | 33 | 5 | 28 |
+| heapsort | 2.50x | 54 | 16 | 38 |
+| base64_encode | 3.20x | 57 | 15 | 42 |
 
-The spread is the whole story, and heapsort is the honest end of it. Its inner
-loop indexes by values that come out of comparisons, so nothing in the program
-says what they can be, and every access pays a call into the runtime. That is
-the cost of checking code no argument can settle.
+Only a quarter of accesses are settled at compile time, and the overhead is
+still mostly between nothing and half again. That is because the two halves
+work on different things. Proving removes a check; where nothing can be
+proved, the remaining job is to make the check cheap, and a check that walks
+the map to ask which allocation a pointer belongs to costs around a hundred
+cycles while a comparison against an answer already in a register costs about
+three.
 
-At the other end, dot_product is free. Not because its accesses are provable,
-but because a loop walking `a[i]` for `i` in `[0, n)` touches one contiguous
-range, so one check covers what a check per element was covering. What makes
-that matter more than the arithmetic saved: the loop body is then empty of
-calls again, and the vectorizer takes it back. Checks in a hot loop are not
-merely expensive, they block the kernel that does the work.
+So a loop that indexes one pointer resolves that allocation once in front of
+itself, and each access inside becomes a subtract, a compare, and a branch that
+is never taken. Failing the comparison is not a verdict: it calls the full
+check, which is what keeps this exact for an interior pointer reading
+backwards, for an allocation that has been freed, and for anything else the
+comparison alone cannot judge. heapsort went from 15.3x to 2.5x on that change
+alone, without a single extra access being proved.
+
+dot_product is free for a different reason. A loop walking `a[i]` for `i` in
+`[0, n)` touches one contiguous range, so one check covers what a check per
+element was covering, and the loop body is then empty of calls again and the
+vectorizer takes it back. Checks in a hot loop are not merely expensive: they
+block the kernel that does the work.
+
+base64_encode is the honest end. Eleven accesses per round, each already down
+to a few instructions, against a round that does not do much more than that.
 
 `--explain` reports where a program sits:
 
@@ -72,7 +85,8 @@ merely expensive, they block the kernel that does the work.
 -- memory safety: base64_encode.mettle ----------
   57 accesses, 15 settled at compile time (26%), 42 checked at run time
   4 proved in place, 11 folded into a check covering a whole loop
-  3 compare against a known extent, 39 ask the runtime which allocation the pointer came from
+  3 compare against a known extent, 23 against an allocation the loop resolves
+  once, 16 ask the runtime which allocation the pointer came from
   line 30 in base64_encode: the object's size is not known here, so the runtime
   is asked which allocation the pointer came from
       30 | var c0: int32 = (int32)(uint8)src[i];
@@ -121,6 +135,12 @@ pinned to the first by both starting at zero and both stepping by a constant.
 **One check for a bounded index.** A masked index reaches the same range every
 iteration, so where the object's size is unknown the check still lifts out of
 the loop, with a constant length.
+
+What none of those settle still gets checked, but against an allocation the
+enclosing loop resolved once rather than by asking the runtime each time. That
+applies wherever the loop cannot release what it is walking and the pointer
+either holds still or is a fixed one displaced, which covers most indexing
+even when nothing about the index itself can be argued.
 
 ## The shape of the implementation
 
