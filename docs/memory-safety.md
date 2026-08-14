@@ -58,11 +58,13 @@ back and the median of the per-pair ratios taken:
 | dot_product | 1.00x | 34 | 8 | 26 |
 | crc32 | 1.00x | 31 | 4 | 27 |
 | word_count | 1.00x | 31 | 5 | 26 |
-| transpose | 1.00x | 35 | 4 | 31 |
-| base64_encode | 1.01x | 57 | 15 | 42 |
+| transpose | 1.00x | 35 | 6 | 29 |
+| minmax_scan | 1.02x | 34 | 6 | 28 |
+| base64_encode | 1.02x | 57 | 15 | 42 |
+| reverse_i32 | 1.04x | 33 | 7 | 26 |
+| matvec | 1.05x | 37 | 8 | 29 |
 | binary_search | 1.08x | 33 | 5 | 28 |
-| matvec | 1.54x | 37 | 6 | 31 |
-| heapsort | 2.00x | 54 | 16 | 38 |
+| heapsort | 1.88x | 54 | 16 | 38 |
 
 Only a quarter to a third of accesses are settled at compile time, and the
 overhead is still mostly nothing at all. That is because the two halves work on
@@ -121,6 +123,33 @@ one check for the whole range would claim iterations that never happened and
 accuse a program that stayed in bounds. word_count is the shape this buys: a
 byte loop whose body is a four-way comparison, back to the SIMD scan it had
 without the flag.
+
+The index does not have to be the counter. It has to be a straight line in one,
+which is what most of them turn out to be once the arithmetic is read rather
+than pattern-matched:
+
+| Written | Read as |
+|---|---|
+| `a[i]` starting from 1 | the counter, from where it starts |
+| `mat[base + j]` | the counter displaced by a value the loop holds still |
+| `src[n - 1 - i]` | the counter with a coefficient of -1, walked backwards |
+| `b[j * N + i]` | the counter scaled by N, displaced by `i` |
+| `m[idx]`, `idx = row_base; idx++` | a counter that starts somewhere only the run knows |
+
+Each gives a first and a last index, and the bytes between them are one
+contiguous range whatever the coefficient does in between: an allocation is
+contiguous, so checking from the lowest byte to the highest is exactly checking
+every byte the loop touches, gaps included. A negative coefficient puts the low
+end at the last iteration rather than the first, and that is the whole of the
+difference. `reverse_i32` and `minmax_scan` are the two this is most visible on;
+both go from several times the unchecked build to level with it, because the
+loop body ends up empty of checks and the vectorizer takes it back.
+
+Reading the arithmetic that way also means reading what the program means by a
+name. `var N: int32 = 32;` at the top of a file is a constant in everything but
+spelling, and a stride of N is a known stride once nothing in the program
+assigns N. That is checked across the whole program, and taking N's address
+counts as assigning it.
 
 heapsort is the honest end. Its sift-down indexes by `child` and `swap_idx`,
 which no loop bounds, so the checks stay and land in a loop that is already
@@ -267,6 +296,13 @@ policy rather than the checker's.
 reads, and data races are all out of scope. The compile-time memory analyzer
 ([docs/borrow-checker.md](borrow-checker.md)) covers some of that ground
 statically and reports leaks, which nothing here does.
+
+**A loop that calls out.** The whole-loop check is taken before the loop runs,
+so it cannot speak for memory a callee frees halfway through. A loop whose body
+calls anything therefore keeps its per-access checks, and keeps the call in its
+body that stops it vectorizing. `grep` and `popcount` are both this: a byte loop
+around a helper, several times the unchecked build and staying there until the
+helper inlines.
 
 ## Trying it
 
