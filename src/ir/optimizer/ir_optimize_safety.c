@@ -1284,6 +1284,55 @@ typedef struct {
   SourceLocation location;
 } SafetySpan;
 
+/* Follow a base pointer back to the name it was copied from.
+ *
+ * Lowering reads a pointer into a fresh temporary at each use, so the operand
+ * a check carries is defined inside the loop even when the pointer itself
+ * never moves. Taken at face value that says the pointer changes every
+ * iteration, and it was enough to decline the cheap form for every access in
+ * base64_encode. Copies and pointer casts pass the same address along, so the
+ * name behind them is what the span should be keyed on. */
+static const IROperand *safety_base_root(const IRFunction *function,
+                                         size_t before, const IROperand *base,
+                                         const IROperand **delta_out,
+                                         size_t *delta_from, int depth) {
+  if (base->kind != IR_OPERAND_TEMP || !base->name || depth > 4) {
+    return base;
+  }
+  const IRInstruction *producer =
+      ir_find_temp_producer_before(function, before, base->name);
+  if (!producer || producer->is_float) {
+    return base;
+  }
+  size_t producer_index = (size_t)(producer - function->instructions);
+
+  if (producer->op == IR_OP_ASSIGN || producer->op == IR_OP_CAST) {
+    if (producer->lhs.kind != IR_OPERAND_SYMBOL &&
+        producer->lhs.kind != IR_OPERAND_TEMP) {
+      return base;
+    }
+    return safety_base_root(function, producer_index, &producer->lhs,
+                            delta_out, delta_from, depth + 1);
+  }
+
+  /* `root + something`, where the something moves each iteration. The pointer
+   * really does move, so it cannot be resolved once; but what it moves within
+   * does not, so the comparison is made against the root's span with the
+   * displacement folded into the offset. Only the fast comparison is rebased.
+   * A failure still calls the check with the pointer the program actually
+   * used, so nothing about what counts as a violation changes. */
+  if (producer->op == IR_OP_BINARY && producer->text &&
+      strcmp(producer->text, "+") == 0 && !*delta_out &&
+      (producer->lhs.kind == IR_OPERAND_SYMBOL ||
+       producer->lhs.kind == IR_OPERAND_TEMP)) {
+    *delta_out = &producer->rhs;
+    *delta_from = producer_index;
+    return safety_base_root(function, producer_index, &producer->lhs,
+                            delta_out, delta_from, depth + 1);
+  }
+  return base;
+}
+
 static int safety_operand_same(const IROperand *a, const IROperand *b) {
   if (a->kind != b->kind) {
     return 0;
@@ -1320,29 +1369,47 @@ static int safety_emit_span_resolve(IRInstructionVector *out,
  * when that comparison says something might be wrong. */
 static int safety_emit_span_check(IRInstructionVector *out,
                                   const SafetyAccess *access,
-                                  const char *span_temp) {
+                                  const char *span_temp,
+                                  const IROperand *delta) {
   unsigned id = g_safety_next_id++;
   char limit[64];
+  char total[64];
   char bad[64];
   char ok_label[64];
   snprintf(limit, sizeof(limit), SAFETY_TEMP_PREFIX "sl%u", id);
+  snprintf(total, sizeof(total), SAFETY_TEMP_PREFIX "st%u", id);
   snprintf(bad, sizeof(bad), SAFETY_TEMP_PREFIX "sb%u", id);
   snprintf(ok_label, sizeof(ok_label), "ir_safe_in_%u", id);
 
   IROperand span_operand = ir_operand_temp(span_temp);
   IROperand limit_operand = ir_operand_temp(limit);
+  IROperand total_operand = ir_operand_temp(total);
   IROperand size_operand = ir_operand_int(access->size);
   int ok = 0;
 
-  if (!span_operand.name || !limit_operand.name) {
+  if (!span_operand.name || !limit_operand.name || !total_operand.name) {
     goto done;
   }
+  if (!safety_emit_binary(out, access->location, "-", limit, &span_operand,
+                          &size_operand, 0)) {
+    goto done;
+  }
+
+  /* Where the pointer was reached through arithmetic, the displacement joins
+   * the offset so both are measured from the same root. */
+  const IROperand *measured = access->offset;
+  if (delta) {
+    if (!safety_emit_binary(out, access->location, "+", total, access->offset,
+                            delta, 0)) {
+      goto done;
+    }
+    measured = &total_operand;
+  }
+
   /* Comparing without sign is what covers both ends at once: a negative offset
    * reads as an enormous unsigned value and fails, which sends it to the full
    * check rather than rejecting it. */
-  if (!safety_emit_binary(out, access->location, "-", limit, &span_operand,
-                          &size_operand, 0) ||
-      !safety_emit_binary(out, access->location, ">", bad, access->offset,
+  if (!safety_emit_binary(out, access->location, ">", bad, measured,
                           &limit_operand, 1) ||
       !safety_emit_branch_zero(out, access->location, bad, ok_label)) {
     goto done;
@@ -1353,6 +1420,7 @@ static int safety_emit_span_check(IRInstructionVector *out,
 done:
   ir_operand_destroy(&span_operand);
   ir_operand_destroy(&limit_operand);
+  ir_operand_destroy(&total_operand);
   return ok;
 }
 
@@ -1495,14 +1563,17 @@ static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
   SafetyHoist *hoists = calloc(check_count, sizeof(SafetyHoist));
   SafetySpan *spans = calloc(check_count, sizeof(SafetySpan));
   size_t *span_of = calloc(function->instruction_count, sizeof(size_t));
+  const IROperand **span_delta =
+      calloc(function->instruction_count, sizeof(const IROperand *));
   size_t hoist_count = 0;
   size_t span_count = 0;
   SafetyLoopList loops = {0};
-  if (!outcome || !hoists || !spans || !span_of) {
+  if (!outcome || !hoists || !spans || !span_of || !span_delta) {
     free(outcome);
     free(hoists);
     free(spans);
     free(span_of);
+    free(span_delta);
     return 0;
   }
   if (!safety_loop_list_build(function, &loops)) {
@@ -1510,6 +1581,7 @@ static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
     free(hoists);
     free(spans);
     free(span_of);
+    free(span_delta);
     return 0;
   }
 
@@ -1537,15 +1609,42 @@ static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
      * still, resolving the allocation once turns the check from a call into a
      * comparison. */
     const SafetyLoopForm *loop = safety_enclosing_loop(&loops, i);
-    if (!loop || !safety_body_has_no_calls(function, &loop->bounds) ||
-        !safety_operand_invariant_in(function, loop->header_index,
-                                     loop->bounds.jump_index, access.base)) {
+    if (!loop) {
+      safety_trace("not in any loop, so there is nothing to resolve against",
+                   access.location.line);
       continue;
     }
+    if (!safety_body_has_no_calls(function, &loop->bounds)) {
+      safety_trace("the loop calls out, so what it walks could be freed "
+                   "under it",
+                   access.location.line);
+      continue;
+    }
+    const IROperand *delta = NULL;
+    size_t delta_from = 0;
+    const IROperand *root =
+        safety_base_root(function, i, access.base, &delta, &delta_from, 0);
+    if (!safety_operand_invariant_in(function, loop->header_index,
+                                     loop->bounds.jump_index, root)) {
+      safety_trace("the pointer moves inside the loop and is not a fixed one "
+                   "displaced, so one resolution would not describe it",
+                   access.location.line);
+      continue;
+    }
+    /* The displacement is read again where the check sits, so it has to still
+     * hold what it held where the pointer was formed. */
+    if (delta && !safety_operand_invariant_in(function, delta_from + 1, i,
+                                              delta)) {
+      safety_trace("the displacement changes between forming the pointer and "
+                   "using it",
+                   access.location.line);
+      continue;
+    }
+
     size_t found = span_count;
     for (size_t s = 0; s < span_count; s++) {
       if (spans[s].header_index == loop->header_index &&
-          safety_operand_same(&spans[s].base, access.base)) {
+          safety_operand_same(&spans[s].base, root)) {
         found = s;
         break;
       }
@@ -1556,12 +1655,13 @@ static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
       fresh->location = access.location;
       snprintf(fresh->temp, sizeof(fresh->temp), SAFETY_TEMP_PREFIX "sp%u",
                g_safety_next_id++);
-      if (!ir_operand_clone(access.base, &fresh->base)) {
+      if (!ir_operand_clone(root, &fresh->base)) {
         goto fail;
       }
       span_count++;
     }
     span_of[i] = found;
+    span_delta[i] = delta;
     outcome[i] = SAFETY_SPANNED;
   }
   safety_loop_list_destroy(&loops);
@@ -1621,7 +1721,8 @@ static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
       continue;
     }
     if (outcome[i] == SAFETY_SPANNED) {
-      if (!safety_emit_span_check(&out, &access, spans[span_of[i]].temp)) {
+      if (!safety_emit_span_check(&out, &access, spans[span_of[i]].temp,
+                                  span_delta[i])) {
         ir_instruction_vector_destroy(&out);
         goto fail;
       }
@@ -1671,6 +1772,7 @@ static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
   }
   free(spans);
   free(span_of);
+  free(span_delta);
   free(hoists);
   free(outcome);
   if (!ir_function_replace_instructions(function, &out)) {
@@ -1690,6 +1792,7 @@ fail:
   }
   free(spans);
   free(span_of);
+  free(span_delta);
   free(hoists);
   free(outcome);
   return 0;
