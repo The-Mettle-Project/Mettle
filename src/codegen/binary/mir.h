@@ -97,6 +97,21 @@ typedef struct {
    * judged disjoint by the strict-overlap test and wrongly share a register
    * (the parallel param-homing move would then clobber one with the other). */
   int entry_live;
+  /* Set with crosses_call when EVERY call the range spans preserves RAX (see
+   * MirInst::preserves_rax). Such a value may take RAX in addition to the
+   * callee-saved pool.
+   *
+   * This is what makes a checked inner loop keep its values in registers. A
+   * `--safe` check is a comparison and a call that does not happen, but the
+   * allocator has to assume it does, so everything live across it needs a
+   * register the call would not clobber -- and there are only seven. A nested
+   * loop carrying two pointers, two counters, two resolved spans and two
+   * indices has spent them all before it reaches the value it just loaded,
+   * which then goes to the stack on every iteration. One more register is the
+   * difference (`transpose`). */
+  int crosses_preserving_only;
+  /* The same question for the volatile XMM lanes, asked of preserves_xmm. */
+  int crosses_xmm_preserving_only;
 } MirVreg;
 #define MIR_LIVE_NONE (-1)
 
@@ -217,6 +232,19 @@ typedef enum {
   /* calls / return (Stage 3 for full ABI; declared now for completeness) */
   MIR_CALL,       /* call sym; clobbers volatiles */
   MIR_CALL_INDIRECT, /* call a(reg); clobbers volatiles */
+  /* `memcpy`/`memset` performed inline as a string operation instead of called.
+   * Operands arrive in the ordinary call-argument registers, marshalled by the
+   * same preceding MIR_MOVs a call would use, and RAX is left holding the
+   * destination so the return value moves out exactly as a call's would.
+   *
+   * These exist because the fallback emitter has always inlined them, and a
+   * plain call reaches the runtime's byte-at-a-time definition instead -- so a
+   * function moving to the register allocator would otherwise get ~8x slower at
+   * copying, which is how this was found. RSI and RDI are nonvolatile and are
+   * saved and restored around the sequence, so a value the allocator parked in
+   * either survives. */
+  MIR_REP_MOVSB,  /* memcpy(rcx, rdx, r8) -> rax */
+  MIR_REP_STOSB,  /* memset(rcx, edx, r8) -> rax */
   MIR_STORE_OUTARG,/* store outgoing stack call argument a to [rsp + b.imm].
                       Used for the 5th+ GP argument (beyond the ABI's argument
                       registers); the prologue reserves the outgoing region. The
@@ -350,6 +378,13 @@ typedef enum {
  * opcode is one edit here instead of five. */
 int mir_op_is_inline_kernel(MirOpcode op);
 
+/* The volatile XMM lanes MIR allocates scalar floats from. Shared because a
+ * preserving call has to save exactly the set the allocator hands out; the two
+ * drifting apart would lose a float across a check. XMM4/XMM5 are left as
+ * encoder scratch. */
+#define MIR_XMM_POOL_COUNT 4
+extern const BinaryXmmRegister MIR_XMM_POOL[MIR_XMM_POOL_COUNT];
+
 /* One MIR instruction. dst/a/b are the general operand slots; mem is the address
  * for load/store/lea; width is the operation width in bytes; cc holds an x86
  * condition opcode for SETCC/CMOVCC/JCC. ir_index records the source IR
@@ -365,6 +400,18 @@ typedef struct {
   unsigned char cc;/* x86 condition opcode for SETCC/CMOVCC/JCC */
   int ir_index;    /* source IR index, or -1 */
   const void *aux; /* MIR_SIMD_VLOOP: borrowed const IRInstruction* (the DAG) */
+  /* MIR_CALL: the encoder saves and restores RAX around this call, so a value
+   * may live in RAX across it. Set for the `--safe` check, which is entered
+   * only when the comparison in front of it fails -- on a correct program,
+   * never. See MirVreg::crosses_preserving_only. */
+  int preserves_rax;
+  /* MIR_CALL: likewise for the volatile XMM lanes (MIR_XMM_POOL). Set for the
+   * `--safe` check and for the span resolution the check compares against.
+   * Span is a real call that really runs, but the compiler hoists it in front
+   * of the loop, so paying eight instructions there buys the loop body its
+   * float accumulator -- otherwise the accumulator is reloaded and restored
+   * once per element. See MirVreg::crosses_xmm_preserving_only. */
+  int preserves_xmm;
 } MirInst;
 
 /* Upper bound on the operands one inline kernel stages through frame slots.
@@ -516,6 +563,16 @@ typedef struct {
   /* Bytes of spill area the allocator appended below the existing frame; the
    * encoder grows the prologue allocation by this much. */
   int spill_bytes;
+
+  /* Frame slot where a RAX-preserving call parks RAX, in the same form as a
+   * vreg's spill_offset. Zero when the function has no such call. A slot rather
+   * than a push: the call's stack arguments and shadow space are addressed off
+   * rsp, so moving rsp between them and the call would misplace both. */
+  int preserve_slot;
+  /* Far end of the block the same call parks the volatile XMM lanes in, one
+   * eight-byte slot per MIR_XMM_POOL entry (MIR floats are scalars). Lane i
+   * lives at frame_base - preserve_xmm_slot + i*8. */
+  int preserve_xmm_slot;
 
   /* Max bytes of outgoing stack-argument space any call in this function needs
    * (for calls with more GP arguments than the ABI has argument registers).

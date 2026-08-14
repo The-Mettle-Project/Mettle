@@ -416,6 +416,8 @@ static const char *scalar_mnemonic(const MirInst *in) {
   case MIR_JMP: return "jmp";
   case MIR_CALL:
   case MIR_CALL_INDIRECT: return "call";
+  case MIR_REP_MOVSB: return "rep movsb";
+  case MIR_REP_STOSB: return "rep stosb";
   case MIR_RET: return "ret";
   case MIR_CQO: return "cqo";
   case MIR_FADD: return in->width == 4 ? "addss" : "addsd";

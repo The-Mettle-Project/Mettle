@@ -877,6 +877,46 @@ static int xmm_load_fimm(MirFunction *fn, uint64_t bits,
          binary_emit_movq_xmm_reg(code, target, SCRATCH_A);
 }
 
+/* Park (save=1) or recover (save=0) the registers a preserving call promises to
+ * leave alone: RAX and the volatile XMM lanes. These are the registers the
+ * allocator hands to values that span only such calls, which is what lets a
+ * checked inner loop keep its working set — the loaded element, the float
+ * accumulator — out of memory. The cost lands entirely on a path a correct
+ * program does not take.
+ *
+ * Frame slots rather than pushes: the call's stack arguments and shadow space
+ * are addressed off rsp, and moving rsp between writing them and making the
+ * call would put both in the wrong place. */
+static int mir_emit_preserve_volatiles(MirFunction *fn, const MirInst *in,
+                                       int save) {
+  BinaryCodeBuffer *code = &fn->context->code;
+  BinaryGpRegister base = frame_base(fn);
+  if (in->preserves_rax && fn->preserve_slot > 0) {
+    if (save) {
+      if (!binary_emit_mov_mem_reg(code, base,
+                                   frame_disp(fn, -fn->preserve_slot),
+                                   BINARY_GP_RAX)) {
+        return 0;
+      }
+    } else if (!binary_emit_mov_reg_mem(code, BINARY_GP_RAX, base,
+                                        frame_disp(fn, -fn->preserve_slot))) {
+      return 0;
+    }
+  }
+  if (!in->preserves_xmm || fn->preserve_xmm_slot <= 0) {
+    return 1;
+  }
+  for (size_t i = 0; i < MIR_XMM_POOL_COUNT; i++) {
+    int disp = frame_disp(fn, -fn->preserve_xmm_slot + (int)i * 8);
+    /* movsd, the widest scalar MIR keeps in an XMM lane. */
+    if (!simd_emit_prefixed_xmm_mem_disp(code, 0xF2, save ? 0x11 : 0x10,
+                                         MIR_XMM_POOL[i], base, disp)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 /* Float spill slots are GP-width stack homes; reload/store via a GP reg so no
  * scalar-memory SSE encoders are needed. */
 static int xmm_spill_load(MirFunction *fn, const MirVreg *v,
@@ -2128,9 +2168,61 @@ int mir_encode(MirFunction *fn) {
       const char *link =
           code_generator_get_link_symbol_name(fn->generator, in->dst.sym);
       size_t off = 0;
+      /* A preserving call parks RAX in its frame slot and puts it back, so a
+       * value the allocator placed there survives (MirInst::preserves_rax). The
+       * arguments are already marshalled and none of them is RAX, and the slot
+       * is addressed off the frame rather than pushed, because the call's stack
+       * arguments and shadow space are measured from rsp. */
+      int keep = in->preserves_rax || in->preserves_xmm;
+      if (keep && !mir_emit_preserve_volatiles(fn, in, 1)) {
+        ok = enc_err(fn, "out of memory saving registers across a checked call");
+        break;
+      }
       if (!link || !binary_emit_call_placeholder(&ctx->code, &off) ||
           !binary_call_relocation_table_add(&ctx->call_relocations, link, off)) {
         ok = enc_err(fn, "out of memory emitting call");
+        break;
+      }
+      if (keep && !mir_emit_preserve_volatiles(fn, in, 0)) {
+        ok = enc_err(fn,
+                     "out of memory restoring registers across a checked call");
+      }
+      break;
+    }
+    case MIR_REP_MOVSB:
+    case MIR_REP_STOSB: {
+      /* The argument marshalling ran already, so RCX/RDX/R8 hold
+       * destination/source-or-fill/count exactly as for the call this replaces.
+       * Take the destination into RAX first (it is the return value, and RCX is
+       * about to become the counter), then run the string operation with RSI
+       * and RDI saved around it -- the allocator may be holding live values in
+       * both, since they are nonvolatile. */
+      BinaryCodeBuffer *code = &ctx->code;
+      int rep_ok =
+          binary_emit_mov_reg_reg(code, BINARY_GP_RAX, BINARY_GP_RCX) &&
+          binary_emit_push_reg(code, BINARY_GP_RDI) &&
+          binary_emit_mov_reg_reg(code, BINARY_GP_RDI, BINARY_GP_RCX) &&
+          binary_emit_mov_reg_reg(code, BINARY_GP_RCX, BINARY_GP_R8);
+      if (rep_ok && in->op == MIR_REP_MOVSB) {
+        rep_ok = binary_emit_push_reg(code, BINARY_GP_RSI) &&
+                 binary_emit_mov_reg_reg(code, BINARY_GP_RSI, BINARY_GP_RDX) &&
+                 binary_code_buffer_append_u8(code, 0xFC) &&  /* cld */
+                 binary_code_buffer_append_u8(code, 0xF3) &&  /* rep  */
+                 binary_code_buffer_append_u8(code, 0xA4) &&  /* movsb */
+                 binary_emit_pop_reg(code, BINARY_GP_RSI);
+      } else if (rep_ok) {
+        /* stosb fills from AL, and RAX currently holds the destination, so the
+         * fill byte goes in through RAX only after the destination is safe in
+         * RDI -- and RAX has to be put back afterwards to return it. */
+        rep_ok = binary_emit_push_reg(code, BINARY_GP_RAX) &&
+                 binary_emit_mov_reg_reg(code, BINARY_GP_RAX, BINARY_GP_RDX) &&
+                 binary_code_buffer_append_u8(code, 0xFC) &&  /* cld */
+                 binary_code_buffer_append_u8(code, 0xF3) &&  /* rep  */
+                 binary_code_buffer_append_u8(code, 0xAA) &&  /* stosb */
+                 binary_emit_pop_reg(code, BINARY_GP_RAX);
+      }
+      if (!rep_ok || !binary_emit_pop_reg(code, BINARY_GP_RDI)) {
+        ok = enc_err(fn, "out of memory emitting inline block copy");
       }
       break;
     }

@@ -78,14 +78,120 @@ static const BinaryGpRegister MIR_GP_EXTRA[] = {
  * base, and several of those kernels borrow stack with a balanced `sub rsp` or
  * push a register mid-body. rsp is therefore not stable across them, and an
  * rsp-relative slot address would land inside the kernel's own scratch. */
+/* Everything that clobbers the caller-saved set without naming it in operands,
+ * so a value living across one must be in a register the clobber cannot reach.
+ * The inline block copies belong here for the same reason a call does: they
+ * leave the destination in RAX and run the counter down in RCX, and neither is
+ * an operand the clobber index can see. */
+static int mir_op_is_call_barrier(MirOpcode op) {
+  return op == MIR_CALL || op == MIR_CALL_INDIRECT || op == MIR_REP_MOVSB ||
+         op == MIR_REP_STOSB || mir_op_is_inline_kernel(op);
+}
+
 static int mir_fn_has_calls(const MirFunction *fn) {
   for (size_t i = 0; i < fn->insn_count; i++) {
     /* An inline kernel clobbers the ABI argument/caller-saved registers, so the
      * function must be treated as non-leaf: RCX/RDX/R8/R9 are unsafe to reclaim
      * into the general pool (the kernel overwrites them). */
-    if (fn->insns[i].op == MIR_CALL ||
-        fn->insns[i].op == MIR_CALL_INDIRECT ||
-        mir_op_is_inline_kernel(fn->insns[i].op)) {
+    if (mir_op_is_call_barrier(fn->insns[i].op)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Mark every value that spans a clobber barrier, and note whether all of the
+ * barriers it spans were RAX-preserving calls. Shared by both allocators so the
+ * two cannot drift on what counts as a call. */
+static void mir_mark_crosses_call(MirFunction *fn) {
+  for (size_t v = 0; v < fn->vreg_count; v++) {
+    fn->vregs[v].crosses_call = 0;
+    fn->vregs[v].crosses_preserving_only = 1;
+    fn->vregs[v].crosses_xmm_preserving_only = 1;
+  }
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    if (!mir_op_is_call_barrier(fn->insns[i].op)) {
+      continue;
+    }
+    int is_call = fn->insns[i].op == MIR_CALL;
+    int keeps_rax = is_call && fn->insns[i].preserves_rax;
+    int keeps_xmm = is_call && fn->insns[i].preserves_xmm;
+    int c = (int)i;
+    for (size_t v = 0; v < fn->vreg_count; v++) {
+      MirVreg *vr = &fn->vregs[v];
+      if (vr->live_start != MIR_LIVE_NONE && vr->live_start < c &&
+          vr->live_end > c) {
+        vr->crosses_call = 1;
+        if (!keeps_rax) {
+          vr->crosses_preserving_only = 0;
+        }
+        if (!keeps_xmm) {
+          vr->crosses_xmm_preserving_only = 0;
+        }
+      }
+    }
+  }
+}
+
+/* Drop the save and restore wherever the allocator did not, in the end, put
+ * anything in a preserved register.
+ *
+ * The slots have to be reserved before colouring and the answer is only known
+ * after it, so this is the earliest the question can be asked. It matters: a
+ * function with no float work at all would otherwise store and reload four XMM
+ * lanes at every check, including the ones the compiler hoisted in front of a
+ * loop and which therefore really run. */
+static void mir_drop_unused_preserves(MirFunction *fn) {
+  int need_gp = 0;
+  int need_xmm = 0;
+  for (size_t v = 0; v < fn->vreg_count; v++) {
+    const MirVreg *vr = &fn->vregs[v];
+    if (!vr->in_register || !vr->crosses_call) {
+      continue;
+    }
+    if (vr->rclass == MIR_RC_GP && vr->phys == (int)BINARY_GP_RAX) {
+      need_gp = 1;
+    } else if (vr->rclass == MIR_RC_XMM) {
+      for (size_t i = 0; i < MIR_XMM_POOL_COUNT; i++) {
+        if (vr->phys == (int)MIR_XMM_POOL[i]) {
+          need_xmm = 1;
+        }
+      }
+    }
+  }
+  if (!need_gp) {
+    fn->preserve_slot = 0;
+  }
+  if (!need_xmm) {
+    fn->preserve_xmm_slot = 0;
+  }
+}
+
+/* The cross-call pool as `vr` sees it: the callee-saved base, plus RAX when
+ * every call its range spans preserves RAX. RAX goes last so a value still
+ * prefers a register that costs the prologue nothing. `buffer` holds
+ * MIR_GP_CROSSCALL_POOL_EXT entries. */
+static size_t mir_cross_pool_for(const MirVreg *vr,
+                                 const BinaryGpRegister *base, size_t base_n,
+                                 BinaryGpRegister *buffer) {
+  size_t n = 0;
+  for (; n < base_n; n++) {
+    buffer[n] = base[n];
+  }
+  if (vr->crosses_preserving_only) {
+    buffer[n++] = BINARY_GP_RAX;
+  }
+  return n;
+}
+
+/* Does this function hold a call the encoder saves registers around? Each kind
+ * needs its own frame slots to park them in. */
+static int mir_fn_has_preserving_call(const MirFunction *fn, int xmm) {
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    if (fn->insns[i].op != MIR_CALL) {
+      continue;
+    }
+    if (xmm ? fn->insns[i].preserves_xmm : fn->insns[i].preserves_rax) {
       return 1;
     }
   }
@@ -105,7 +211,9 @@ static int mir_fn_has_calls(const MirFunction *fn) {
  * shrank the whole function's pool (radix_sort). */
 static int mir_fn_has_real_calls(const MirFunction *fn) {
   for (size_t i = 0; i < fn->insn_count; i++) {
-    if (fn->insns[i].op == MIR_CALL || fn->insns[i].op == MIR_CALL_INDIRECT) {
+    if (fn->insns[i].op == MIR_CALL || fn->insns[i].op == MIR_CALL_INDIRECT ||
+        fn->insns[i].op == MIR_REP_MOVSB ||
+        fn->insns[i].op == MIR_REP_STOSB) {
       return 1;
     }
   }
@@ -193,6 +301,8 @@ static size_t mir_build_gp_leaf_pool(BinaryGpRegister *out, size_t param_count,
 /* Max cross-call GP pool: Win64 can also use RSI/RDI (nonvolatile there), while
  * SysV must keep them out because calls may clobber argument registers. */
 #define MIR_GP_CROSSCALL_POOL_MAX 7
+/* Room for the one register a preserving call gives back on top of the pool. */
+#define MIR_GP_CROSSCALL_POOL_EXT (MIR_GP_CROSSCALL_POOL_MAX + 1)
 
 static size_t mir_build_gp_crosscall_pool(BinaryGpRegister *out) {
   size_t n = 0;
@@ -214,9 +324,8 @@ static size_t mir_build_gp_crosscall_pool(BinaryGpRegister *out) {
  * float scratch registers the encoder uses (analogous to RAX/RCX for GP) — for
  * staging spilled/immediate float operands and breaking non-commutative
  * aliasing. All are caller-saved, so a leaf function need not preserve them. */
-static const BinaryXmmRegister MIR_XMM_POOL[] = {
+const BinaryXmmRegister MIR_XMM_POOL[MIR_XMM_POOL_COUNT] = {
     BINARY_XMM0, BINARY_XMM1, BINARY_XMM2, BINARY_XMM3};
-#define MIR_XMM_POOL_COUNT (sizeof(MIR_XMM_POOL) / sizeof(MIR_XMM_POOL[0]))
 
 /* Second-tier XMM pool: xmm8..xmm15. These are callee-saved on Win64 (the
  * prologue saves/restores the ones used) and caller-saved on SysV; either way a
@@ -929,7 +1038,12 @@ static uint32_t mir_color_reg_mask(const MirFunction *fn, MirVregId v,
                                    size_t gp_cross_n, int allow_rbp) {
   const MirVreg *vr = &fn->vregs[v];
   uint32_t m = 0;
+  BinaryGpRegister cross_ext[MIR_GP_CROSSCALL_POOL_EXT];
   if (vr->rclass == MIR_RC_GP) {
+    if (vr->crosses_call) {
+      gp_cross_n = mir_cross_pool_for(vr, gp_cross_pool, gp_cross_n, cross_ext);
+      gp_cross_pool = cross_ext;
+    }
     const BinaryGpRegister *pool =
         vr->crosses_call ? gp_cross_pool : gp_leaf_pool;
     size_t n = vr->crosses_call ? gp_cross_n : gp_leaf_n;
@@ -963,9 +1077,14 @@ static uint32_t mir_color_reg_mask(const MirFunction *fn, MirVregId v,
                                     vr->live_end)) {
       m |= 1u << BINARY_GP_RBP;
     }
-  } else if (vr->rclass == MIR_RC_XMM && !vr->crosses_call) {
-    /* Volatile xmm0-3 then callee-saved xmm8-15. A cross-call XMM has no
-     * register that survives the call on BOTH ABIs, so it stays memory (m=0).
+  } else if (vr->rclass == MIR_RC_XMM &&
+             (!vr->crosses_call || vr->crosses_xmm_preserving_only)) {
+    /* Volatile xmm0-3 then callee-saved xmm8-15. A cross-call XMM ordinarily
+     * has no register that survives the call on BOTH ABIs, so it stays memory
+     * (m=0) -- unless every call it spans is a preserving one, which saves and
+     * restores the volatile lanes along with RAX. That is what keeps the
+     * accumulator of a checked float reduction in a register instead of loading
+     * and storing it once per element (`matvec`).
      * When the function homes a float argument into an XMM register (xmm0-3),
      * those volatile lanes are excluded from the pool — exactly as the GP arg
      * registers always are — so no allocated value sits in an outgoing argument
@@ -975,8 +1094,13 @@ static uint32_t mir_color_reg_mask(const MirFunction *fn, MirVregId v,
         m |= 1u << MIR_XMM_POOL[i];
       }
     }
-    for (size_t i = 0; i < MIR_XMM_NONVOL_POOL_COUNT; i++) {
-      m |= 1u << MIR_XMM_NONVOL_POOL[i];
+    /* xmm8-15 only where no call is in range at all: they are callee-saved on
+     * Win64 but caller-saved on SysV, and the preserving call saves the four
+     * lanes above, not these. */
+    if (!vr->crosses_call) {
+      for (size_t i = 0; i < MIR_XMM_NONVOL_POOL_COUNT; i++) {
+        m |= 1u << MIR_XMM_NONVOL_POOL[i];
+      }
     }
   }
   return m;
@@ -1459,26 +1583,19 @@ static int mir_regalloc_report_saved(MirFunction *fn) {
 static int mir_regalloc_color(MirFunction *fn) {
   mir_compute_liveness(fn);
   mir_compute_coalesce_hints(fn);
-  for (size_t v = 0; v < fn->vreg_count; v++) {
-    fn->vregs[v].crosses_call = 0;
-  }
-  for (size_t i = 0; i < fn->insn_count; i++) {
-    if (fn->insns[i].op != MIR_CALL &&
-        fn->insns[i].op != MIR_CALL_INDIRECT &&
-        !mir_op_is_inline_kernel(fn->insns[i].op)) {
-      continue;
-    }
-    int c = (int)i;
-    for (size_t v = 0; v < fn->vreg_count; v++) {
-      MirVreg *vr = &fn->vregs[v];
-      if (vr->live_start != MIR_LIVE_NONE && vr->live_start < c &&
-          vr->live_end > c) {
-        vr->crosses_call = 1;
-      }
-    }
-  }
+  mir_mark_crosses_call(fn);
 
   int next_spill = fn->context ? fn->context->raw_frame_size : 0;
+  fn->preserve_slot = 0;
+  fn->preserve_xmm_slot = 0;
+  if (mir_fn_has_preserving_call(fn, 0)) {
+    next_spill += 8;
+    fn->preserve_slot = next_spill;
+  }
+  if (mir_fn_has_preserving_call(fn, 1)) {
+    next_spill += (int)MIR_XMM_POOL_COUNT * 8;
+    fn->preserve_xmm_slot = next_spill;
+  }
   for (size_t v = 0; v < fn->vreg_count; v++) {
     MirVreg *vr = &fn->vregs[v];
     if (vr->address_taken) {
@@ -1507,6 +1624,7 @@ static int mir_regalloc_color(MirFunction *fn) {
     fn->has_error = 1;
     return 0;
   }
+  mir_drop_unused_preserves(fn);
   fn->spill_bytes = next_spill - (fn->context ? fn->context->raw_frame_size : 0);
   if (!mir_regalloc_report_saved(fn)) {
     fn->has_error = 1;
@@ -1693,27 +1811,10 @@ int mir_regalloc(MirFunction *fn) {
    * (defined before the call, used after it). Such values must survive the
    * callee's clobber of caller-saved registers. (A value defined by the call's
    * return, or whose last use is feeding an argument, does not span it.) */
-  for (size_t v = 0; v < fn->vreg_count; v++) {
-    fn->vregs[v].crosses_call = 0;
-  }
-  for (size_t i = 0; i < fn->insn_count; i++) {
-    /* An inline kernel clobbers the caller-saved set (RAX/RCX/RDX/R8/R9/R10/R11
-     * + xmm0..) exactly like a call, so a value spanning one must also live in a
-     * callee-saved register or spill. */
-    if (fn->insns[i].op != MIR_CALL &&
-        fn->insns[i].op != MIR_CALL_INDIRECT &&
-        !mir_op_is_inline_kernel(fn->insns[i].op)) {
-      continue;
-    }
-    int c = (int)i;
-    for (size_t v = 0; v < fn->vreg_count; v++) {
-      MirVreg *vr = &fn->vregs[v];
-      if (vr->live_start != MIR_LIVE_NONE && vr->live_start < c &&
-          vr->live_end > c) {
-        vr->crosses_call = 1;
-      }
-    }
-  }
+  /* An inline kernel clobbers the caller-saved set (RAX/RCX/RDX/R8/R9/R10/R11
+   * + xmm0..) exactly like a call, so a value spanning one must also live in a
+   * callee-saved register or spill. */
+  mir_mark_crosses_call(fn);
 
   size_t order_count = 0;
   MirVregId *order = mir_order_by_start(fn, &order_count);
@@ -1758,6 +1859,16 @@ int mir_regalloc(MirFunction *fn) {
    * [rbp - (base_frame + (k+1)*8)]. We record only the running total here and
    * store each vreg's own positive offset. */
   int next_spill_offset = fn->context ? fn->context->raw_frame_size : 0;
+  fn->preserve_slot = 0;
+  fn->preserve_xmm_slot = 0;
+  if (mir_fn_has_preserving_call(fn, 0)) {
+    next_spill_offset += 8;
+    fn->preserve_slot = next_spill_offset;
+  }
+  if (mir_fn_has_preserving_call(fn, 1)) {
+    next_spill_offset += (int)MIR_XMM_POOL_COUNT * 8;
+    fn->preserve_xmm_slot = next_spill_offset;
+  }
 
   /* Address-taken values must be memory-resident; give each a stack slot up
    * front (independent of liveness — one may be written only through its alias
@@ -1850,7 +1961,10 @@ int mir_regalloc(MirFunction *fn) {
      * callee-saved pool (GP), or must spill (XMM has no callee-saved lane in our
      * allocatable set). */
     if (!got_reg && cv->rclass == MIR_RC_XMM) {
-      if (!cv->crosses_call) {
+      /* A value spanning only preserving calls may take the volatile lanes:
+       * those are exactly what such a call saves and restores. It may not take
+       * xmm8-15, which are callee-saved on Win64 but not on SysV. */
+      if (!cv->crosses_call || cv->crosses_xmm_preserving_only) {
         /* Skip the volatile xmm0-3 when they serve as outgoing float-argument
          * registers (see has_xmm_arg_call / mir_color_reg_mask). */
         for (size_t p = 0; !fn->has_xmm_arg_call && p < MIR_XMM_POOL_COUNT; p++) {
@@ -1865,7 +1979,9 @@ int mir_regalloc(MirFunction *fn) {
           }
         }
         /* Spill to the callee-saved xmm8..15 tier before the stack. */
-        for (size_t p = 0; !got_reg && p < MIR_XMM_NONVOL_POOL_COUNT; p++) {
+        for (size_t p = 0;
+             !got_reg && !cv->crosses_call && p < MIR_XMM_NONVOL_POOL_COUNT;
+             p++) {
           BinaryXmmRegister reg = MIR_XMM_NONVOL_POOL[p];
           if (xmm_held_by[reg] == -1) {
             xmm_held_by[reg] = cur;
@@ -1878,10 +1994,12 @@ int mir_regalloc(MirFunction *fn) {
         }
       }
     } else if (!got_reg) {
+      BinaryGpRegister cross_ext[MIR_GP_CROSSCALL_POOL_EXT];
+      size_t cross_ext_n =
+          mir_cross_pool_for(cv, gp_cross_pool, gp_cross_pool_count, cross_ext);
       const BinaryGpRegister *pool =
-          cv->crosses_call ? gp_cross_pool : gp_leaf_pool;
-      size_t pool_n =
-          cv->crosses_call ? gp_cross_pool_count : gp_leaf_pool_count;
+          cv->crosses_call ? cross_ext : gp_leaf_pool;
+      size_t pool_n = cv->crosses_call ? cross_ext_n : gp_leaf_pool_count;
       /* A narrowing extend wants a register OTHER than the one it extends:
        * `mov r8d, r9d` is renamed away by the hardware for free, while
        * `mov r8d, r8d` cannot be (it zeroes the upper half in place) and costs
@@ -2006,6 +2124,7 @@ int mir_regalloc(MirFunction *fn) {
     }
   }
 
+  mir_drop_unused_preserves(fn);
   fn->spill_bytes =
       next_spill_offset - (fn->context ? fn->context->raw_frame_size : 0);
 

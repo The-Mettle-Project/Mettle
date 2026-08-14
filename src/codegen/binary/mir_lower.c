@@ -3703,9 +3703,41 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
         return 0;
       }
     }
-    if (!mir_emit1(fn, MIR_CALL, mir_op_symbol(in->text), mir_op_none(),
+    /* memcpy/memset with the ordinary three arguments: the marshalling above
+     * already put them where the inline string operation wants them, so the
+     * call becomes the operation itself. Matches what the fallback emitter
+     * does; see MIR_REP_MOVSB. memmove keeps its call -- the overlap test is
+     * worth a real callee, and being slower than the fallback there is not a
+     * correctness matter. */
+    MirOpcode call_op = MIR_CALL;
+    if (in->argument_count == 3 && in->text && !ret_indirect) {
+      if (strcmp(in->text, "memcpy") == 0) {
+        call_op = MIR_REP_MOVSB;
+      } else if (strcmp(in->text, "memset") == 0) {
+        call_op = MIR_REP_STOSB;
+      }
+    }
+    if (!mir_emit1(fn, call_op, mir_op_symbol(in->text), mir_op_none(),
                    mir_op_none(), 8, 0, 0)) {
       return 0;
+    }
+    /* The two `--safe` runtime calls that sit in or around hot loops, marked by
+     * name because they are the ones the checking machinery puts there.
+     *
+     * The check is reached only when the comparison in front of it fails, which
+     * on a correct program is never, so saving anything around it is free. The
+     * span resolution does run, but once in front of the loop rather than per
+     * element, so it is worth eight instructions to leave the loop body's float
+     * registers alone. Span returns its answer in RAX and so cannot promise
+     * it. See MirVreg::crosses_preserving_only. */
+    if (call_op == MIR_CALL && in->text) {
+      MirInst *call = &fn->insns[fn->insn_count - 1];
+      if (strcmp(in->text, "mettle_safety_check") == 0) {
+        call->preserves_rax = 1;
+        call->preserves_xmm = 1;
+      } else if (strcmp(in->text, "mettle_safety_span") == 0) {
+        call->preserves_xmm = 1;
+      }
     }
     if (ret_indirect) {
       /* The struct result was written into the dest local's home by the callee;
