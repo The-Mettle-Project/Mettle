@@ -1,8 +1,12 @@
 # Contributing to Mettle
 
-Mettle is a systems language built from scratch. It compiles straight to 64 bit
-x86, with no LLVM, no virtual machine and no garbage collector. This guide
-covers how to build it, test it, and land a change.
+Thanks for your interest in Mettle. It is a systems language built from
+scratch, compiling straight to 64 bit x86, with no LLVM, no virtual machine and
+no garbage collector. This guide covers how to build it, test it, and land a
+change.
+
+Plenty of it is unusual, and some of it will surprise you. Ask when something
+looks wrong. Often it is.
 
 ## Where the change belongs
 
@@ -90,7 +94,7 @@ executable form.
 
 ## Testing
 
-Every change passes the regression suite before it goes up for review.
+Every change needs to pass the regression suite before it goes up for review.
 
 On Windows, which is what CI runs in full:
 
@@ -166,7 +170,7 @@ Windows, and run the differential fuzzer for anything touching generated code.
 
 CI runs Windows GCC with the full suite and the fuzz gate, Windows Clang for
 compilation, Linux GCC and Clang over the ELF backend, and Linux ASan and
-UBSan. Every job goes green.
+UBSan. All of them need to be green.
 
 Describe the change, the platforms you tested, and for optimizer or code
 generation work, how you established correctness: the fuzzer, `--verify`,
@@ -177,7 +181,11 @@ benchmark numbers.
 Open an issue with a small `.mettle` reproducer, the exact command line
 including `--release` and any flags, the platform and host compiler, what you
 expected, and what you got. For a suspected miscompile, say whether it
-reproduces at `-O0`, at `--release`, or at both. That alone narrows it down.
+reproduces at `-O0`, at `--release`, or at both. That alone narrows it down a
+long way.
+
+A bug report is a contribution. So is telling us the build fought you, or that
+a page of this guide made no sense.
 
 ## License
 
