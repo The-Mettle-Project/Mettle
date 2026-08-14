@@ -2310,6 +2310,444 @@ int ir_auto_vectorize_pass(IRFunction *function, int *changed) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Running extrema: `if (v > best) { best = v; }` -> a min/max VLOOP reduction  */
+/*                                                                             */
+/* The one loop shape a writer cannot phrase without a branch. Every other      */
+/* reduction is an expression (`s = s + x`), so the straight-line-body rule     */
+/* costs nothing; a running max has no operator to write, so the same rule      */
+/* used to send every peak-finder, extent scan and clamp bound down the scalar  */
+/* path. The diamond IS the operator here, so this recognizer reads it as one   */
+/* rather than asking the body to be branchless first.                          */
+/*                                                                             */
+/* Both accumulators of a min-and-max scan are claimed, each as its own kernel  */
+/* (two passes over the array, still far ahead of one scalar pass).             */
+/* -------------------------------------------------------------------------- */
+#define IR_MINMAX_MAX_ACCUMULATORS 2
+
+/* The integer DAG builder lives with the integer vectorizer below. */
+static int vloop_build_int(IRFunction *function, size_t before,
+                           const IROperand *op, const char *iv, VLoopDag *d);
+
+typedef struct {
+  const char *acc;    /* the accumulator symbol the diamond updates */
+  int is_max;         /* 1: keeps the larger; 0: keeps the smaller */
+  IROperand value;    /* the compared element, owned */
+  size_t cmp_index;   /* where to build the value's DAG from */
+  size_t end;         /* one past the diamond's last instruction */
+} IRMinMaxDiamond;
+
+/* Two operands naming the same value. The compare and the assignment often
+ * disagree textually: `var v = a[i]; if (v < lo) { lo = v; }` compares the
+ * local but assigns the load temp it was copied from, because copy propagation
+ * reaches the assignment and not the compare. */
+static int ir_minmax_same_operand(const IRFunction *function, size_t body_lo,
+                                  size_t before, const IROperand *a,
+                                  const IROperand *b) {
+  if (!a || !b || !a->name || !b->name) {
+    return 0;
+  }
+  if (a->kind == b->kind && strcmp(a->name, b->name) == 0) {
+    return 1;
+  }
+  /* Chase a body-local copy in either direction. */
+  for (size_t i = body_lo; i < before; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op != IR_OP_ASSIGN || ins->dest.kind != IR_OPERAND_SYMBOL ||
+        !ins->dest.name || !ins->lhs.name) {
+      continue;
+    }
+    if ((ir_operand_is_symbol_named(&ins->dest, a->name) &&
+         strcmp(ins->lhs.name, b->name) == 0) ||
+        (ir_operand_is_symbol_named(&ins->dest, b->name) &&
+         strcmp(ins->lhs.name, a->name) == 0)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Does the taken arm write back the very value the compare tested?
+ *
+ * Written plainly -- `if (a[i] > m) { m = a[i]; }` -- it does not look like it
+ * in the IR: the arm is its own basic block, so nothing folds its `a[i]` into
+ * the one the compare already loaded, and the arm re-derives the index, re-adds
+ * the base and loads again. Both halves are still the same element, which is
+ * what has to be proven: decode each side's address back to a base indexed by
+ * the loop counter and require the pair to agree. */
+static int ir_minmax_arm_restates_value(IRFunction *function, size_t body_lo,
+                                        const IRInstruction *arm,
+                                        size_t arm_index,
+                                        const IROperand *tested,
+                                        const char *iv) {
+  if (arm->op == IR_OP_ASSIGN) {
+    return ir_minmax_same_operand(function, body_lo, arm_index, tested,
+                                  &arm->lhs);
+  }
+  if (arm->op == IR_OP_LOAD && arm->lhs.kind == IR_OPERAND_TEMP &&
+      arm->lhs.name && tested->kind == IR_OPERAND_TEMP && tested->name) {
+    const char *tested_base = NULL;
+    const char *arm_base = NULL;
+    int tested_bits = 0;
+    int arm_bits = 0;
+    return ir_decode_float_indexed_load(function, arm_index, tested->name, iv,
+                                        &tested_base, &tested_bits) &&
+           ir_decode_float_indexed_address(function, arm_index, arm->lhs.name,
+                                           iv, &arm_base, &arm_bits) &&
+           tested_bits == arm_bits && tested_base && arm_base &&
+           strcmp(tested_base, arm_base) == 0;
+  }
+  return 0;
+}
+
+/* Match `if (v REL acc) { acc = v; }` starting at `at`, which must be the
+ * compare. Fills `out` and returns 1; returns 0 if the shape is anything else.
+ *
+ * The lowered form is fixed: compare, branch-past, assign, jump-to-end, then
+ * the two empty labels the `if` leaves behind. */
+static int ir_match_minmax_diamond(IRFunction *function, size_t at,
+                                   size_t body_lo, size_t body_hi,
+                                   const char *iv, IRMinMaxDiamond *out) {
+  const IRInstruction *cmp = &function->instructions[at];
+  size_t branch = 0, assign = 0, jump = 0, next_label = 0, end_label = 0;
+  const IROperand *acc_side = NULL;
+  const IROperand *val_side = NULL;
+  int acc_is_left = 0;
+
+  if (cmp->op != IR_OP_BINARY || !cmp->text || cmp->dest.kind != IR_OPERAND_TEMP ||
+      !cmp->dest.name ||
+      (strcmp(cmp->text, "<") != 0 && strcmp(cmp->text, ">") != 0)) {
+    return 0;
+  }
+  if (!ir_find_next_non_nop(function, at + 1, &branch) || branch >= body_hi) {
+    return 0;
+  }
+  {
+    const IRInstruction *br = &function->instructions[branch];
+    if (br->op != IR_OP_BRANCH_ZERO || !br->text ||
+        !ir_operand_is_temp_named(&br->lhs, cmp->dest.name)) {
+      return 0;
+    }
+    /* The arm runs to its jump-to-end. It is a block, not one instruction: a
+     * plainly written `m = a[i]` re-derives the address there. */
+    for (jump = branch + 1; jump < body_hi; jump++) {
+      IROpcode op = function->instructions[jump].op;
+      if (op == IR_OP_JUMP) {
+        break;
+      }
+      if (op == IR_OP_LABEL || op == IR_OP_BRANCH_ZERO ||
+          op == IR_OP_BRANCH_EQ || op == IR_OP_STORE || op == IR_OP_CALL ||
+          op == IR_OP_CALL_INDIRECT || op == IR_OP_RETURN) {
+        return 0;
+      }
+    }
+    if (jump >= body_hi) {
+      return 0;
+    }
+    /* The accumulator's update is the arm's last act. */
+    assign = jump;
+    while (assign > branch + 1 &&
+           function->instructions[assign - 1].op == IR_OP_NOP) {
+      assign--;
+    }
+    if (assign == branch + 1) {
+      return 0; /* empty arm */
+    }
+    assign--;
+    if (!ir_find_next_non_nop(function, jump + 1, &next_label) ||
+        next_label >= body_hi ||
+        !ir_find_next_non_nop(function, next_label + 1, &end_label) ||
+        end_label >= body_hi) {
+      return 0;
+    }
+  }
+  {
+    const IRInstruction *br = &function->instructions[branch];
+    const IRInstruction *as = &function->instructions[assign];
+    const IRInstruction *jp = &function->instructions[jump];
+    const IRInstruction *nl = &function->instructions[next_label];
+    const IRInstruction *el = &function->instructions[end_label];
+    if (!ir_instruction_writes_destination(as) ||
+        as->dest.kind != IR_OPERAND_SYMBOL || !as->dest.name ||
+        jp->op != IR_OP_JUMP || !jp->text ||
+        nl->op != IR_OP_LABEL || !nl->text || strcmp(nl->text, br->text) != 0 ||
+        el->op != IR_OP_LABEL || !el->text || strcmp(el->text, jp->text) != 0) {
+      return 0;
+    }
+    /* Nothing else in the arm may write a symbol -- the kernel keeps only the
+     * accumulator, so any other surviving effect would be dropped. */
+    for (size_t i = branch + 1; i < jump; i++) {
+      const IRInstruction *ins = &function->instructions[i];
+      if (i != assign && ir_instruction_writes_destination(ins) &&
+          ins->dest.kind == IR_OPERAND_SYMBOL) {
+        return 0;
+      }
+    }
+    /* The accumulator is whichever compare operand the arm writes back. */
+    if (ir_operand_is_symbol_named(&cmp->lhs, as->dest.name)) {
+      acc_side = &cmp->lhs;
+      val_side = &cmp->rhs;
+      acc_is_left = 1;
+    } else if (ir_operand_is_symbol_named(&cmp->rhs, as->dest.name)) {
+      acc_side = &cmp->rhs;
+      val_side = &cmp->lhs;
+    } else {
+      return 0;
+    }
+    if (!ir_minmax_arm_restates_value(function, body_lo, as, assign, val_side,
+                                      iv)) {
+      return 0;
+    }
+    out->acc = acc_side->name;
+    /* `acc < v` and `v > acc` both keep the larger; the operand order is what
+     * flips the sense, not the operator. */
+    out->is_max = acc_is_left ? (strcmp(cmp->text, "<") == 0)
+                              : (strcmp(cmp->text, ">") == 0);
+    out->cmp_index = at;
+    out->end = end_label + 1;
+    if (!ir_operand_clone(val_side, &out->value)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+/* An accumulator whose lanes the kernel can carry: a float of the loop's width,
+ * or a signed int32 (vpmaxsd/vpminsd are signed, so uint32 is refused). */
+static int ir_minmax_acc_width(const IRFunction *function, const char *acc,
+                               int *is_int_out) {
+  const char *ty = ir_function_local_declared_type(function, acc);
+  if (!ty) {
+    ty = ir_function_param_declared_type(function, acc);
+  }
+  if (!ty) {
+    return 0;
+  }
+  if (strcmp(ty, "float64") == 0) {
+    *is_int_out = 0;
+    return 64;
+  }
+  if (strcmp(ty, "float32") == 0) {
+    *is_int_out = 0;
+    return 32;
+  }
+  if (strcmp(ty, "int32") == 0) {
+    *is_int_out = 1;
+    return 32;
+  }
+  return 0;
+}
+
+static int ir_try_vectorize_minmax_at(IRFunction *function, size_t header_index,
+                                      int *changed) {
+  const char *iv_symbol = NULL;
+  size_t branch_index = 0;
+  size_t jump_index = 0;
+  IROperand bound = {0};
+  int matched = 0;
+  IRMinMaxDiamond diamonds[IR_MINMAX_MAX_ACCUMULATORS];
+  int n_diamonds = 0;
+  IRInstruction fused[IR_MINMAX_MAX_ACCUMULATORS];
+  int width_bits = 0;
+  int is_int = 0;
+  int ok = 1;
+
+  memset(diamonds, 0, sizeof(diamonds));
+  memset(fused, 0, sizeof(fused));
+
+  if (!ir_float_reduction_frame(function, header_index, &iv_symbol,
+                                &branch_index, &jump_index, &bound, &matched)) {
+    return 0;
+  }
+  if (!matched) {
+    return 1;
+  }
+
+  /* Walk the body once: collect the diamonds, and refuse anything else that
+   * carries control flow or touches memory. Everything between them must be
+   * the plain load/compute the value is built from. */
+  for (size_t i = branch_index + 1; i < jump_index && ok;) {
+    const IRInstruction *ins = &function->instructions[i];
+    IRMinMaxDiamond d;
+    memset(&d, 0, sizeof(d));
+    if (ir_match_minmax_diamond(function, i, branch_index + 1, jump_index,
+                                iv_symbol, &d)) {
+      if (n_diamonds >= IR_MINMAX_MAX_ACCUMULATORS) {
+        ir_operand_destroy(&d.value);
+        ok = 0;
+        break;
+      }
+      diamonds[n_diamonds++] = d;
+      i = d.end;
+      continue;
+    }
+    if (ins->op == IR_OP_STORE || ins->op == IR_OP_CALL ||
+        ins->op == IR_OP_CALL_INDIRECT || ins->op == IR_OP_LABEL ||
+        ins->op == IR_OP_JUMP || ins->op == IR_OP_BRANCH_ZERO ||
+        ins->op == IR_OP_BRANCH_EQ || ins->op == IR_OP_RETURN) {
+      ok = 0;
+      break;
+    }
+    i++;
+  }
+  if (!ok || n_diamonds == 0) {
+    goto refuse;
+  }
+
+  /* One width for every accumulator: the kernels share the loop's element
+   * layout, and a float32 extremum next to a float64 one would need two. */
+  for (int k = 0; k < n_diamonds; k++) {
+    int k_int = 0;
+    int w = ir_minmax_acc_width(function, diamonds[k].acc, &k_int);
+    if (!w || strcmp(diamonds[k].acc, iv_symbol) == 0) {
+      goto refuse;
+    }
+    if (k == 0) {
+      width_bits = w;
+      is_int = k_int;
+    } else if (w != width_bits || k_int != is_int) {
+      goto refuse;
+    }
+    for (int j = 0; j < k; j++) {
+      if (strcmp(diamonds[j].acc, diamonds[k].acc) == 0) {
+        goto refuse; /* two diamonds racing on one accumulator */
+      }
+    }
+  }
+  /* An int32 scan tracking BOTH extrema has a dedicated kernel downstream that
+   * folds them in one pass; two passes here would be the worse trade. */
+  if (is_int && n_diamonds == 2) {
+    goto refuse;
+  }
+
+  /* No symbol may be written in the body except the induction variable, the
+   * accumulators (by their own arm), and per-iteration locals the DAG builder
+   * will substitute away. */
+  for (size_t i = branch_index + 1; i < jump_index; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    int is_acc_write = 0;
+    if (!ir_instruction_writes_destination(ins) ||
+        ins->dest.kind != IR_OPERAND_SYMBOL || !ins->dest.name) {
+      continue;
+    }
+    for (int k = 0; k < n_diamonds; k++) {
+      if (strcmp(ins->dest.name, diamonds[k].acc) == 0) {
+        is_acc_write = 1;
+        /* Only the diamond's own arm may write it. */
+        if (i < diamonds[k].cmp_index || i >= diamonds[k].end) {
+          goto refuse;
+        }
+      }
+    }
+    if (is_acc_write || strcmp(ins->dest.name, iv_symbol) == 0) {
+      continue;
+    }
+    if (ir_symbol_live_after_loop(function, jump_index + 1, ins->dest.name)) {
+      goto refuse;
+    }
+  }
+  if (ir_symbol_live_after_loop(function, jump_index + 1, iv_symbol)) {
+    goto refuse;
+  }
+
+  for (int k = 0; k < n_diamonds; k++) {
+    VLoopDag d;
+    int root = -1;
+    int depth = 0;
+    memset(&d, 0, sizeof(d));
+    d.width_bits = width_bits;
+    d.is_int = is_int;
+    d.body_lo = branch_index + 1;
+    d.body_hi = jump_index;
+    if (bound.kind == IR_OPERAND_INT) {
+      d.iota_bound_known = 1;
+      d.iota_bound = bound.int_value;
+    }
+    root = is_int ? vloop_build_int(function, diamonds[k].cmp_index,
+                                    &diamonds[k].value, iv_symbol, &d)
+                  : vloop_build(function, diamonds[k].cmp_index,
+                                &diamonds[k].value, iv_symbol, &d);
+    if (root < 0 || d.overflow) {
+      goto refuse;
+    }
+    for (int a = 0; a < d.n_arrays; a++) {
+      if (!ir_symbol_is_float_array_base(function, d.arrays[a])) {
+        goto refuse;
+      }
+    }
+    /* An accumulator reaching a DAG would make the kernels depend on each
+     * other's running value, which separate passes cannot reproduce. */
+    for (int s = 0; s < d.n_scalars; s++) {
+      for (int j = 0; j < n_diamonds; j++) {
+        if (d.scalars[s] && strcmp(d.scalars[s], diamonds[j].acc) == 0) {
+          goto refuse;
+        }
+      }
+    }
+    depth = vloop_eval_depth(&d, root);
+    if (depth > VLOOP_REG_BUDGET - 1 || d.n_arrays > VLOOP_MAX_ARRAYS) {
+      goto refuse;
+    }
+    fused[k].op = is_int ? IR_OP_SIMD_VLOOP_I32 : IR_OP_SIMD_VLOOP_F64;
+    fused[k].location = function->instructions[header_index].location;
+    fused[k].is_float = !is_int;
+    fused[k].float_bits = width_bits;
+    fused[k].dest = ir_operand_symbol(diamonds[k].acc);
+    if (!ir_operand_clone(&bound, &fused[k].lhs) ||
+        !vloop_serialize_into(&fused[k], &d, diamonds[k].is_max ? 2 : 3, root,
+                              depth)) {
+      goto refuse;
+    }
+  }
+
+  /* Install: one kernel per accumulator, in the slots the loop's header and
+   * first body instruction occupied. */
+  for (int k = 0; k < n_diamonds; k++) {
+    ir_instruction_destroy_storage(&function->instructions[header_index + k]);
+    function->instructions[header_index + k] = fused[k];
+    memset(&fused[k], 0, sizeof(fused[k]));
+  }
+  for (size_t i = header_index + (size_t)n_diamonds; i <= jump_index; i++) {
+    ir_instruction_make_nop(&function->instructions[i]);
+  }
+  if (changed) {
+    *changed = 1;
+  }
+  ir_operand_destroy(&bound);
+  for (int k = 0; k < n_diamonds; k++) {
+    ir_operand_destroy(&diamonds[k].value);
+  }
+  return 1;
+
+refuse:
+  ir_operand_destroy(&bound);
+  for (int k = 0; k < n_diamonds; k++) {
+    ir_operand_destroy(&diamonds[k].value);
+  }
+  for (int k = 0; k < IR_MINMAX_MAX_ACCUMULATORS; k++) {
+    if (fused[k].op != IR_OP_NOP || fused[k].arguments) {
+      ir_instruction_destroy_storage(&fused[k]);
+      memset(&fused[k], 0, sizeof(fused[k]));
+    }
+  }
+  return 1;
+}
+
+int ir_simd_minmax_reduce_pass(IRFunction *function, int *changed) {
+  if (!function) {
+    return 0;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    if (function->instructions[i].op == IR_OP_LABEL &&
+        ir_label_is_while_header(function->instructions[i].text)) {
+      if (!ir_try_vectorize_minmax_at(function, i, changed)) {
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
+/* -------------------------------------------------------------------------- */
 /* Integer twin of the general auto-vectorizer -> IR_OP_SIMD_VLOOP_I32         */
 /*                                                                             */
 /* int32/uint32 unit-stride maps and '+' reductions over + - * & | ^ and       */

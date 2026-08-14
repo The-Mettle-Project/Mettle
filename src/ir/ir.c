@@ -2561,9 +2561,13 @@ static int ir_format_instruction_line(const IRInstruction *instruction,
                             ? instruction->arguments[2].int_value
                             : -1;
     written = snprintf(buffer, buffer_size, "%s %s %s(%s nodes=%lld)", dest,
-                       reduce_op == 1 ? "+=" : "<-",
+                       reduce_op >= 1 ? "+=" : "<-",
                        ir_opcode_name(instruction->op),
-                       reduce_op == 1 ? "reduce" : "map", n_nodes);
+                       reduce_op == 1   ? "reduce"
+                       : reduce_op == 2 ? "max"
+                       : reduce_op == 3 ? "min"
+                                        : "map",
+                       n_nodes);
     break;
   }
   case IR_OP_SIMD_FIND: {

@@ -1855,7 +1855,10 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
     }
     unsigned long long dest_base = 0;
     IRInterpValue acc;
-    if (reduce_op == 1) {
+    /* 0 = map (dest is a base address), 1 = '+', 2 = max, 3 = min (dest is the
+     * accumulator's current value). */
+    int is_acc = (reduce_op >= 1 && reduce_op <= 3);
+    if (is_acc) {
       if (!ii_fetch(machine, frame, &insn->dest, &acc)) {
         return 0;
       }
@@ -1865,8 +1868,8 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
       }
     }
 
-    double acc_f = reduce_op == 1 ? ii_as_float(&acc) : 0.0;
-    long long acc_i = reduce_op == 1 ? ii_as_int(&acc) : 0;
+    double acc_f = is_acc ? ii_as_float(&acc) : 0.0;
+    long long acc_i = is_acc ? ii_as_int(&acc) : 0;
 
     double vals_f[64];
     long long vals_i[64];
@@ -1953,6 +1956,22 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
         } else {
           acc_f += vals_f[root];
         }
+      } else if (reduce_op == 2 || reduce_op == 3) {
+        /* `if (v > acc) { acc = v; }`: the element only wins an ordered
+         * compare, so a NaN leaves the accumulator alone -- the same rule the
+         * kernel gets from MAXPS/MINPS returning src2 when unordered. */
+        if (is_int) {
+          long long v = (long long)(int)vals_i[root];
+          long long a = (long long)(int)acc_i;
+          if (reduce_op == 2 ? v > a : v < a) {
+            acc_i = v;
+          }
+        } else {
+          double v = is_f32 ? (double)(float)vals_f[root] : vals_f[root];
+          if (reduce_op == 2 ? v > acc_f : v < acc_f) {
+            acc_f = v;
+          }
+        }
       } else {
         unsigned long long addr =
             dest_base + (unsigned long long)i * (unsigned long long)elem_size;
@@ -1970,7 +1989,7 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
         return 0;
       }
     }
-    if (reduce_op == 1) {
+    if (is_acc) {
       IRInterpValue out = is_int ? ii_int_value(acc_i) : ii_float_value(acc_f);
       return ii_store_dest(machine, frame, &insn->dest, &out);
     }

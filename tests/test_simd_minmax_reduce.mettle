@@ -1,0 +1,181 @@
+// Correctness coverage for the running-extremum vectorizer (simd_vloop with
+// reduce_op max/min). The kernel reads the `if (v > m) { m = v; }` diamond as
+// the operator it is, so unlike every other recognizer it claims a body that
+// branches -- which makes its guard rails the thing worth pinning:
+//
+//   - a seed broadcast into every lane, so a trip count of 0, 3, 8 or 40 all
+//     come out exactly right (the counts below straddle both lane splits)
+//   - NaN losing the comparison, matching `>` rather than MAXPS's src1
+//   - both operand orders (`v > m` and `m < v`) meaning the same thing
+//   - a compared value that is an expression, not a bare load
+//   - int32 lanes signed (vpmaxsd), floats at both widths
+//
+// Kernels are @simd! so the --release build asserts they vectorize. References
+// iterate backwards, a shape the vectorizer refuses, so they stay scalar in the
+// same binary. Returns the number of failures (0 = all correct).
+import "std/io";
+
+fn max_f64(a: float64*, n: int32) -> float64 {
+  var m: float64 = -1000000.0;
+  @simd! for i in 0..n { if (a[i] > m) { m = a[i]; } }
+  return m;
+}
+fn max_f64_ref(a: float64*, n: int32) -> float64 {
+  var m: float64 = -1000000.0;
+  var i: int32 = n - 1;
+  while (i >= 0) { if (a[i] > m) { m = a[i]; } i = i - 1; }
+  return m;
+}
+
+fn min_f64(a: float64*, n: int32) -> float64 {
+  var m: float64 = 1000000.0;
+  @simd! for i in 0..n { if (a[i] < m) { m = a[i]; } }
+  return m;
+}
+fn min_f64_ref(a: float64*, n: int32) -> float64 {
+  var m: float64 = 1000000.0;
+  var i: int32 = n - 1;
+  while (i >= 0) { if (a[i] < m) { m = a[i]; } i = i - 1; }
+  return m;
+}
+
+// The accumulator on the left: `m < v` keeps the larger, same as `v > m`.
+fn max_f64_flipped(a: float64*, n: int32) -> float64 {
+  var m: float64 = -1000000.0;
+  @simd! for i in 0..n { if (m < a[i]) { m = a[i]; } }
+  return m;
+}
+
+fn max_f32(a: float32*, n: int32) -> float32 {
+  var m: float32 = -1000000.0;
+  @simd! for i in 0..n { if (a[i] > m) { m = a[i]; } }
+  return m;
+}
+fn max_f32_ref(a: float32*, n: int32) -> float32 {
+  var m: float32 = -1000000.0;
+  var i: int32 = n - 1;
+  while (i >= 0) { if (a[i] > m) { m = a[i]; } i = i - 1; }
+  return m;
+}
+
+fn min_f32(a: float32*, n: int32) -> float32 {
+  var m: float32 = 1000000.0;
+  @simd! for i in 0..n { if (a[i] < m) { m = a[i]; } }
+  return m;
+}
+fn min_f32_ref(a: float32*, n: int32) -> float32 {
+  var m: float32 = 1000000.0;
+  var i: int32 = n - 1;
+  while (i >= 0) { if (a[i] < m) { m = a[i]; } i = i - 1; }
+  return m;
+}
+
+fn max_i32(a: int32*, n: int32) -> int32 {
+  var m: int32 = -2000000000;
+  @simd! for i in 0..n { if (a[i] > m) { m = a[i]; } }
+  return m;
+}
+fn max_i32_ref(a: int32*, n: int32) -> int32 {
+  var m: int32 = -2000000000;
+  var i: int32 = n - 1;
+  while (i >= 0) { if (a[i] > m) { m = a[i]; } i = i - 1; }
+  return m;
+}
+
+fn min_i32(a: int32*, n: int32) -> int32 {
+  var m: int32 = 2000000000;
+  @simd! for i in 0..n { if (a[i] < m) { m = a[i]; } }
+  return m;
+}
+fn min_i32_ref(a: int32*, n: int32) -> int32 {
+  var m: int32 = 2000000000;
+  var i: int32 = n - 1;
+  while (i >= 0) { if (a[i] < m) { m = a[i]; } i = i - 1; }
+  return m;
+}
+
+// The compared value is a DAG, not a bare load: the largest squared difference.
+// Named once, which is both how it gets written and what the recognizer can
+// prove -- the arm has to restate the tested value, and it does that by naming
+// it or by re-reading the same element, not by recomputing the arithmetic.
+fn max_sqdiff(a: float64*, b: float64*, n: int32) -> float64 {
+  var m: float64 = 0.0;
+  var d: float64 = 0.0;
+  @simd! for i in 0..n {
+    d = (a[i] - b[i]) * (a[i] - b[i]);
+    if (d > m) { m = d; }
+  }
+  return m;
+}
+fn max_sqdiff_ref(a: float64*, b: float64*, n: int32) -> float64 {
+  var m: float64 = 0.0;
+  var i: int32 = n - 1;
+  while (i >= 0) {
+    var d: float64 = (a[i] - b[i]) * (a[i] - b[i]);
+    if (d > m) { m = d; }
+    i = i - 1;
+  }
+  return m;
+}
+
+fn eq64(x: float64, y: float64) -> int32 {
+  var d: float64 = x - y;
+  if (d < 0.0) { d = 0.0 - d; }
+  if (d < 0.0000001) { return 1; }
+  return 0;
+}
+
+fn main() -> int32 {
+  var N: int32 = 40;
+  var d: float64[40];
+  var e: float64[40];
+  var f: float32[40];
+  var g: int32[40];
+  var counts: int32[9];
+  var bad: int32 = 0;
+
+  var i: int32 = 0;
+  while (i < N) {
+    var t: int32 = (i * 37 + 11) % 71 - 35;
+    d[i] = (float64)t * 0.5;
+    e[i] = (float64)((i * 13 + 5) % 41 - 20) * 0.25;
+    f[i] = (float32)t * 0.5;
+    g[i] = t * 1000;
+    i = i + 1;
+  }
+
+  // Either side of the 4- and 8-lane splits, and no iterations at all.
+  counts[0] = 0; counts[1] = 1; counts[2] = 3; counts[3] = 4; counts[4] = 5;
+  counts[5] = 7; counts[6] = 8; counts[7] = 9; counts[8] = 40;
+
+  var pd: float64* = &d[0];
+  var pe: float64* = &e[0];
+  var pf: float32* = &f[0];
+  var pg: int32* = &g[0];
+
+  var c: int32 = 0;
+  while (c < 9) {
+    var n: int32 = counts[c];
+    if (eq64(max_f64(pd, n), max_f64_ref(pd, n)) == 0) { bad = bad + 1; }
+    if (eq64(min_f64(pd, n), min_f64_ref(pd, n)) == 0) { bad = bad + 1; }
+    if (eq64(max_f64_flipped(pd, n), max_f64_ref(pd, n)) == 0) { bad = bad + 1; }
+    if (eq64((float64)max_f32(pf, n), (float64)max_f32_ref(pf, n)) == 0) { bad = bad + 1; }
+    if (eq64((float64)min_f32(pf, n), (float64)min_f32_ref(pf, n)) == 0) { bad = bad + 1; }
+    if (max_i32(pg, n) != max_i32_ref(pg, n)) { bad = bad + 1; }
+    if (min_i32(pg, n) != min_i32_ref(pg, n)) { bad = bad + 1; }
+    if (eq64(max_sqdiff(pd, pe, n), max_sqdiff_ref(pd, pe, n)) == 0) { bad = bad + 1; }
+    c = c + 1;
+  }
+
+  // A NaN element must lose the comparison and leave the running value alone,
+  // exactly as `>` does -- the kernel gets that from MAXPS returning src2 on an
+  // unordered compare, which is why the data is src1 and the accumulator src2.
+  var zero: float64 = 0.0;
+  d[7] = zero / zero;
+  if (eq64(max_f64(pd, 40), max_f64_ref(pd, 40)) == 0) { bad = bad + 1; }
+  if (eq64(min_f64(pd, 40), min_f64_ref(pd, 40)) == 0) { bad = bad + 1; }
+
+  print_int(bad);
+  newline();
+  return bad;
+}

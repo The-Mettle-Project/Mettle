@@ -668,6 +668,17 @@ int wcs_avx_vsubpd_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
 int wcs_avx_vdivpd_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
   return wcs_avx_vpd_ymm(b, 0x5E, dst, s1, s2);
 }
+/* MAXPD/MINPD return src2 when either operand is NaN. The min/max reduction
+ * kernel relies on that: passing the loaded data as src1 and the running
+ * accumulator as src2 reproduces `if (v > m) { m = v; }` exactly, NaN
+ * included -- a NaN element loses the comparison and leaves the accumulator
+ * alone, in both the scalar loop and the vector one. */
+int wcs_avx_vminpd_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
+  return wcs_avx_vpd_ymm(b, 0x5D, dst, s1, s2);
+}
+int wcs_avx_vmaxpd_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
+  return wcs_avx_vpd_ymm(b, 0x5F, dst, s1, s2);
+}
 
 /* vcvtdq2pd ymm, xmm/m128 — VEX.256.F3.0F.WIG E6 /r: 4 int32 -> 4 f64. */
 int wcs_avx_vcvtdq2pd_ymm_xmm(BinaryCodeBuffer *b, int dst, int src) {
@@ -870,6 +881,46 @@ int wcs_reduce_ps_acc_to_rax(BinaryCodeBuffer *b) {
          wcs_sse_f2(b, 0x7C, 2, 2) &&   /* haddps xmm2, xmm2 -> lane0 = sum */
          binary_emit_addss_xmm_xmm(b, BINARY_XMM3, BINARY_XMM2) &&
          wcs_movd_reg_xmm(b, BINARY_GP_RAX, BINARY_XMM3);
+}
+
+/* Fold a min/max reduction's packed accumulator in ymm2 to one value in RAX.
+ *
+ * No scalar partner to merge in: the accumulator was SEEDED with the incoming
+ * value broadcast across every lane, so each lane already carries it and the
+ * tree fold below reaches the same answer as the scalar loop for any trip
+ * count, zero included. The packed form (maxpd, not maxsd) is used all the way
+ * down; only lane 0 is read at the end, and the wider op needs no extra
+ * encoders. */
+int wcs_reduce_pd_minmax_to_rax(BinaryCodeBuffer *b, int is_max) {
+  unsigned char op = is_max ? 0x5F : 0x5D;
+  return wcs_avx_vextractf128(b, 0, 2, 1) && wcs_avx_vzeroupper(b) &&
+         wcs_sse_66(b, op, 2, 0) &&      /* xmm2 = 2 lanes */
+         wcs_pshufd(b, 0, 2, 0xEE) &&    /* xmm0 = high qword */
+         wcs_sse_66(b, op, 2, 0) &&      /* xmm2 lane0 = result */
+         binary_emit_movq_reg_xmm(b, BINARY_GP_RAX, BINARY_XMM2);
+}
+
+int wcs_reduce_ps_minmax_to_rax(BinaryCodeBuffer *b, int is_max) {
+  unsigned char op = is_max ? 0x5F : 0x5D;
+  return wcs_avx_vextractf128(b, 0, 2, 1) && wcs_avx_vzeroupper(b) &&
+         wcs_sse_0f(b, op, 2, 0) &&      /* xmm2 = 4 lanes */
+         wcs_pshufd(b, 0, 2, 0xEE) &&
+         wcs_sse_0f(b, op, 2, 0) &&      /* xmm2 = 2 lanes */
+         wcs_pshufd(b, 0, 2, 0x01) &&
+         wcs_sse_0f(b, op, 2, 0) &&      /* xmm2 lane0 = result */
+         wcs_movd_reg_xmm(b, BINARY_GP_RAX, BINARY_XMM2);
+}
+
+/* int32 twin. The result is sign-extended: the accumulator's 8-byte home holds
+ * a canonically extended 32-bit value, and movd zero-extends. */
+int wcs_reduce_ymm_i32_minmax_to_rax(BinaryCodeBuffer *b, int is_max) {
+  int (*fold)(BinaryCodeBuffer *, int, int) = is_max ? wcs_pmaxsd : wcs_pminsd;
+  return wcs_avx_vextracti128(b, 0, 2, 1) && wcs_avx_vzeroupper(b) &&
+         fold(b, 2, 0) &&
+         wcs_pshufd(b, 0, 2, 0xEE) && fold(b, 2, 0) &&
+         wcs_pshufd(b, 0, 2, 0x01) && fold(b, 2, 0) &&
+         wcs_movd_reg_xmm(b, BINARY_GP_RAX, BINARY_XMM2) &&
+         binary_emit_movsxd_reg_reg32(b, BINARY_GP_RAX, BINARY_GP_RAX);
 }
 
 /* The reduced lane lands in R9 via movd, which zero-extends; sign-extend it to

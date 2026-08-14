@@ -4166,16 +4166,22 @@ void ir_explain_kernel_desc(const IRInstruction *ins, char *buf, size_t cap) {
     return;
   case IR_OP_SIMD_VLOOP_F64: {
     int f32 = ins->float_bits == 32;
-    int reduce = ins->argument_count > 0 && ins->arguments[0].int_value == 1;
+    long long r = ins->argument_count > 0 ? ins->arguments[0].int_value : 0;
     snprintf(buf, cap, "%s-wide %s %s (AVX2 general vectorizer)",
              f32 ? "8" : "4", f32 ? "float32" : "float64",
-             reduce ? "'+' reduction" : "element-wise map");
+             r == 1   ? "'+' reduction"
+             : r == 2 ? (f32 ? "vmaxps max reduction" : "vmaxpd max reduction")
+             : r == 3 ? (f32 ? "vminps min reduction" : "vminpd min reduction")
+                      : "element-wise map");
     return;
   }
   case IR_OP_SIMD_VLOOP_I32: {
-    int reduce = ins->argument_count > 0 && ins->arguments[0].int_value == 1;
+    long long r = ins->argument_count > 0 ? ins->arguments[0].int_value : 0;
     snprintf(buf, cap, "8-wide int32 %s (AVX2 general vectorizer, bit-exact)",
-             reduce ? "'+' reduction" : "element-wise map");
+             r == 1   ? "'+' reduction"
+             : r == 2 ? "vpmaxsd max reduction"
+             : r == 3 ? "vpminsd min reduction"
+                      : "element-wise map");
     return;
   }
   case IR_OP_SIMD_FIND: {

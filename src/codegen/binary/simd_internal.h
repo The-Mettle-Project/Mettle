@@ -97,6 +97,8 @@ int wcs_avx_vsubps_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);
 int wcs_avx_vdivps_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);
 int wcs_avx_vminps_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);
 int wcs_avx_vmaxps_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);
+int wcs_avx_vminpd_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);
+int wcs_avx_vmaxpd_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);
 int wcs_avx_vroundps_ymm(BinaryCodeBuffer *b, int dst, int src, unsigned char imm);
 int wcs_avx_vcvttps2dq_ymm(BinaryCodeBuffer *b, int dst, int src);
 int wcs_avx_vcvtdq2ps_ymm(BinaryCodeBuffer *b, int dst, int src);
@@ -147,6 +149,9 @@ int wcs_broadcast_i32_to_ymm(BinaryCodeBuffer *b, int ymm, int gpr);
 int wcs_reduce_ymm_i32_sum_to_rax(BinaryCodeBuffer *b, int src);
 int wcs_reduce_pd_acc_to_rax(BinaryCodeBuffer *b);
 int wcs_reduce_ps_acc_to_rax(BinaryCodeBuffer *b);
+int wcs_reduce_pd_minmax_to_rax(BinaryCodeBuffer *b, int is_max);
+int wcs_reduce_ps_minmax_to_rax(BinaryCodeBuffer *b, int is_max);
+int wcs_reduce_ymm_i32_minmax_to_rax(BinaryCodeBuffer *b, int is_max);
 int wcs_horizontal_pminsd_to_reg(BinaryCodeBuffer *b, int xmm, int gpr);
 int wcs_horizontal_pmaxsd_to_reg(BinaryCodeBuffer *b, int xmm, int gpr);
 

@@ -844,12 +844,15 @@ int code_generator_binary_emit_simd_vloop_f64(
   int n_consts = (int)args[4].int_value;
   int n_scalars = (int)args[5].int_value;
   int depth = (int)args[6].int_value;
-  int is_reduce = (reduce_op == 1);
+  /* reduce_op: 0 = element-wise map, 1 = '+' reduction, 2 = max, 3 = min. */
+  const int is_minmax = (reduce_op == 2 || reduce_op == 3);
+  const int is_max = (reduce_op == 2);
+  int is_reduce = (reduce_op == 1) || is_minmax;
   const int *kPool = is_reduce ? kPoolReduce : kPoolMap;
   int pool_n = is_reduce ? 3 : 4;
   size_t expect =
       (size_t)(7 + n_arrays + n_scalars + 3 * n_nodes + n_consts);
-  if ((reduce_op != 0 && reduce_op != 1) || n_arrays < 0 ||
+  if ((reduce_op < 0 || reduce_op > 3) || n_arrays < 0 ||
       n_arrays > VLOOP_KERNEL_MAX_BASES || n_nodes <= 0 ||
       n_nodes > VLOOP_KERNEL_MAX_NODES || n_consts < 0 || n_scalars < 0 ||
       depth > pool_n || root < 0 || root >= n_nodes ||
@@ -1013,7 +1016,25 @@ int code_generator_binary_emit_simd_vloop_f64(
    * int form instead loads it into RAX at finalize, because
    * wcs_accumulate_xmm0_i32_to_rax accumulates the lane sum INTO RAX (the
    * sum_i32 convention). */
-  if (is_reduce) {
+  if (is_minmax) {
+    /* Seed every lane with the incoming accumulator instead of an identity:
+     * min/max has no additive zero, and a broadcast seed is also what makes a
+     * short trip count (or none at all) come out exactly right -- the fold at
+     * the end then needs no separate scalar partner. */
+    if (!code_generator_binary_emit_operand_load(generator, context,
+                                                 &instruction->dest,
+                                                 BINARY_GP_RAX)) {
+      return 0;
+    }
+    if (f32) { /* 32-bit lanes: f32 or i32, both a raw dword broadcast */
+      if (!wcs_broadcast_i32_to_ymm(b, 2, BINARY_GP_RAX)) {
+        return 0;
+      }
+    } else if (!binary_emit_movq_xmm_reg(b, BINARY_XMM2, BINARY_GP_RAX) ||
+               !wcs_avx_vbroadcastsd_ymm_xmm(b, 2, 2)) {
+      return 0;
+    }
+  } else if (is_reduce) {
     if (i32) {
       if (!wcs_avx_vpxor_ymm(b, 2, 2, 2)) {
         return 0;
@@ -1139,7 +1160,19 @@ int code_generator_binary_emit_simd_vloop_f64(
       code_generator_set_error(generator, "vloop root");
       return 0;
     }
-    if (is_reduce) {
+    if (is_minmax) {
+      /* Data as src1, accumulator as src2: MAXPS/MINPS return src2 on an
+       * unordered compare, so a NaN element leaves the accumulator alone --
+       * exactly what `if (v > m) { m = v; }` does. */
+      if (!(i32 ? (is_max ? wcs_avx_vpmaxsd_ymm(b, 2, vstk[0], 2)
+                          : wcs_avx_vpminsd_ymm(b, 2, vstk[0], 2))
+                : (f32 ? (is_max ? wcs_avx_vmaxps_ymm(b, 2, vstk[0], 2)
+                                 : wcs_avx_vminps_ymm(b, 2, vstk[0], 2))
+                       : (is_max ? wcs_avx_vmaxpd_ymm(b, 2, vstk[0], 2)
+                                 : wcs_avx_vminpd_ymm(b, 2, vstk[0], 2))))) {
+        return 0;
+      }
+    } else if (is_reduce) {
       if (!(i32 ? wcs_avx_vpaddd_ymm(b, 2, 2, vstk[0]) /* acc += lanes */
                 : (f32 ? wcs_avx_vaddps_ymm(b, 2, 2, vstk[0])
                        : wcs_avx_vaddpd_ymm(b, 2, 2, vstk[0])))) {
@@ -1269,7 +1302,26 @@ int code_generator_binary_emit_simd_vloop_f64(
         vstk[nv++] = ra;
       }
     }
-    if (is_reduce) {
+    if (is_minmax) {
+      /* Only lane 0 of the tail value is meaningful, and min/max has no
+       * identity to pad the rest with -- so splat lane 0 across the register
+       * and fold it in whole. Every lane then sees the same element, which
+       * leaves the packed accumulator exactly where one more scalar step
+       * would have put it. */
+      int R = vstk[0];
+      if (!(f32 ? wcs_avx_vpbroadcastd_ymm(b, R, R)
+                : wcs_avx_vbroadcastsd_ymm_xmm(b, R, R))) {
+        return 0;
+      }
+      if (!(i32 ? (is_max ? wcs_avx_vpmaxsd_ymm(b, 2, R, 2)
+                          : wcs_avx_vpminsd_ymm(b, 2, R, 2))
+                : (f32 ? (is_max ? wcs_avx_vmaxps_ymm(b, 2, R, 2)
+                                 : wcs_avx_vminps_ymm(b, 2, R, 2))
+                       : (is_max ? wcs_avx_vmaxpd_ymm(b, 2, R, 2)
+                                 : wcs_avx_vminpd_ymm(b, 2, R, 2))))) {
+        return 0;
+      }
+    } else if (is_reduce) {
       if (i32) {
         /* lane 0 carries the addend, lanes 1..7 zeros: fold into ymm2. */
         if (!wcs_avx_vpaddd_ymm(b, 2, 2, vstk[0])) {
@@ -1315,14 +1367,21 @@ int code_generator_binary_emit_simd_vloop_f64(
      * and drop accumulator lanes). i32 loads the prior accumulator value into
      * RAX first: wcs_reduce_ymm_i32_sum_to_rax accumulates the lane sum INTO
      * RAX (and clobbers R10, which the count loop is done with). */
-    if (i32 && !code_generator_binary_emit_operand_load(generator, context,
-                                                        &instruction->dest,
-                                                        BINARY_GP_RAX)) {
+    if (!is_minmax && i32 &&
+        !code_generator_binary_emit_operand_load(generator, context,
+                                                 &instruction->dest,
+                                                 BINARY_GP_RAX)) {
       return 0;
     }
-    if (!(i32 ? wcs_reduce_ymm_i32_sum_to_rax(b, 2)
-              : (f32 ? wcs_reduce_ps_acc_to_rax(b)
-                     : wcs_reduce_pd_acc_to_rax(b)))) {
+    if (is_minmax) {
+      if (!(i32 ? wcs_reduce_ymm_i32_minmax_to_rax(b, is_max)
+                : (f32 ? wcs_reduce_ps_minmax_to_rax(b, is_max)
+                       : wcs_reduce_pd_minmax_to_rax(b, is_max)))) {
+        return 0;
+      }
+    } else if (!(i32 ? wcs_reduce_ymm_i32_sum_to_rax(b, 2)
+                     : (f32 ? wcs_reduce_ps_acc_to_rax(b)
+                            : wcs_reduce_pd_acc_to_rax(b)))) {
       return 0;
     }
     /* The 64-bit fold can carry bits past 32 (the helper sign-extends and
