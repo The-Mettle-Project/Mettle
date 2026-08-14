@@ -224,12 +224,49 @@ static const SafetyLoopForm *safety_enclosing_loop(const SafetyLoopList *loops,
  * twelve it obviously is. The walk is deliberately shallow: this runs before
  * the optimizer's constant folding, and its job is to see through lowering's
  * own scaffolding, not to re-implement that pass. */
+/* Globals the program never writes, with the value they were given.
+ *
+ * A global `var` nothing ever assigns is a constant in all but spelling, and
+ * that is how a dimension is usually written: `var N: int32 = 32;`. Read as
+ * what it is, a stride of N is a known stride, which is the difference between
+ * a loop's checks folding into one and staying where they are. Gathered once
+ * per program, since the answer is a property of the whole of it. */
+typedef struct {
+  char **names;      /* owned, sorted */
+  long long *values;
+  size_t count;
+} SafetyConstGlobals;
+
+static SafetyConstGlobals g_safety_const_globals;
+
+static int safety_const_global_value(const char *name, long long *out) {
+  size_t lo = 0;
+  size_t hi = g_safety_const_globals.count;
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    int order = strcmp(g_safety_const_globals.names[mid], name);
+    if (order == 0) {
+      *out = g_safety_const_globals.values[mid];
+      return 1;
+    }
+    if (order < 0) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return 0;
+}
+
 static int safety_constant_value(const IRFunction *function, size_t before,
                                  const IROperand *operand, int depth,
                                  long long *out) {
   if (operand->kind == IR_OPERAND_INT) {
     *out = operand->int_value;
     return 1;
+  }
+  if (operand->kind == IR_OPERAND_SYMBOL && operand->name) {
+    return safety_const_global_value(operand->name, out);
   }
   if (operand->kind != IR_OPERAND_TEMP || !operand->name || depth > 4) {
     return 0;
@@ -1914,6 +1951,113 @@ static int safety_declare_runtime(IRProgram *program) {
   return 1;
 }
 
+/* Is this name written, or its address taken, anywhere in the program? Either
+ * makes it something other than the constant its initializer suggests. */
+static int safety_global_is_settled(const IRProgram *program,
+                                    const char *name) {
+  for (size_t f = 0; f < program->function_count; f++) {
+    const IRFunction *function = program->functions[f];
+    if (!function) {
+      continue;
+    }
+    for (size_t i = 0; i < function->instruction_count; i++) {
+      const IRInstruction *in = &function->instructions[i];
+      if (in->op == IR_OP_ADDRESS_OF && in->lhs.kind == IR_OPERAND_SYMBOL &&
+          in->lhs.name && strcmp(in->lhs.name, name) == 0) {
+        return 0;
+      }
+      if (ir_instruction_writes_destination(in) &&
+          in->dest.kind == IR_OPERAND_SYMBOL && in->dest.name &&
+          strcmp(in->dest.name, name) == 0) {
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
+static int safety_const_globals_order(const void *a, const void *b) {
+  const size_t *left = (const size_t *)a;
+  const size_t *right = (const size_t *)b;
+  return strcmp(g_safety_const_globals.names[*left],
+                g_safety_const_globals.names[*right]);
+}
+
+static void safety_const_globals_destroy(void) {
+  for (size_t i = 0; i < g_safety_const_globals.count; i++) {
+    free(g_safety_const_globals.names[i]);
+  }
+  free(g_safety_const_globals.names);
+  free(g_safety_const_globals.values);
+  memset(&g_safety_const_globals, 0, sizeof(g_safety_const_globals));
+}
+
+static void safety_const_globals_build(const IRProgram *program) {
+  memset(&g_safety_const_globals, 0, sizeof(g_safety_const_globals));
+  size_t capacity = program->module_symbol_count;
+  if (capacity == 0) {
+    return;
+  }
+  g_safety_const_globals.names = (char **)calloc(capacity, sizeof(char *));
+  g_safety_const_globals.values =
+      (long long *)calloc(capacity, sizeof(long long));
+  if (!g_safety_const_globals.names || !g_safety_const_globals.values) {
+    safety_const_globals_destroy();
+    return;
+  }
+  for (size_t s = 0; s < program->module_symbol_count; s++) {
+    const IRModuleSymbol *symbol = &program->module_symbols[s];
+    if (symbol->kind != IR_MODSYM_VARIABLE || symbol->is_extern ||
+        !symbol->has_initializer || symbol->init_is_float ||
+        symbol->init_string || symbol->init_bytes || !symbol->name) {
+      continue;
+    }
+    if (!safety_global_is_settled(program, symbol->name)) {
+      continue;
+    }
+    char *copy = mettle_strdup(symbol->name);
+    if (!copy) {
+      safety_const_globals_destroy();
+      return;
+    }
+    g_safety_const_globals.names[g_safety_const_globals.count] = copy;
+    g_safety_const_globals.values[g_safety_const_globals.count] =
+        symbol->init_bits;
+    g_safety_const_globals.count++;
+  }
+  /* Sorted so the lookup, which every constant fold reaches, is a search
+   * rather than a scan of every global in the program. */
+  size_t count = g_safety_const_globals.count;
+  if (count < 2) {
+    return;
+  }
+  size_t *order = (size_t *)malloc(count * sizeof(size_t));
+  if (!order) {
+    return;
+  }
+  for (size_t i = 0; i < count; i++) {
+    order[i] = i;
+  }
+  qsort(order, count, sizeof(size_t), safety_const_globals_order);
+  char **names = (char **)malloc(count * sizeof(char *));
+  long long *values = (long long *)malloc(count * sizeof(long long));
+  if (names && values) {
+    for (size_t i = 0; i < count; i++) {
+      names[i] = g_safety_const_globals.names[order[i]];
+      values[i] = g_safety_const_globals.values[order[i]];
+    }
+    free(g_safety_const_globals.names);
+    free(g_safety_const_globals.values);
+    g_safety_const_globals.names = names;
+    g_safety_const_globals.values = values;
+  } else {
+    free(names);
+    free(values);
+    g_safety_const_globals.count = 0; /* unsorted is unsearchable */
+  }
+  free(order);
+}
+
 int ir_safety_resolve_program(IRProgram *program, IRSafetyStats *stats) {
   if (!program) {
     return 1;
@@ -1923,6 +2067,7 @@ int ir_safety_resolve_program(IRProgram *program, IRSafetyStats *stats) {
   if (!safety_declare_runtime(program)) {
     return 0;
   }
+  safety_const_globals_build(program);
   const char *allocator_source = safety_allocator_source(program);
   for (size_t i = 0; i < program->function_count; i++) {
     IRFunction *function = program->functions[i];
@@ -1934,9 +2079,11 @@ int ir_safety_resolve_program(IRProgram *program, IRSafetyStats *stats) {
             ? safety_strip_function(function, stats)
             : safety_resolve_function(function, stats);
     if (!resolved) {
+      safety_const_globals_destroy();
       return 0;
     }
   }
+  safety_const_globals_destroy();
   if (safety_time_enabled()) {
     /* Ticks rather than a converted figure: clock()'s units do not reliably
      * match CLOCKS_PER_SEC across the toolchains this builds with, and a
