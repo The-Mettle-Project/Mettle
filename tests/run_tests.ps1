@@ -4622,6 +4622,68 @@ foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")
   }
 }
 
+# A global array or struct is read and written through its address, which used
+# to decline the whole function at the eligibility gate (`addressof:unsupported`)
+# and put every value in the frame on the stack. Any global's address is one
+# RIP-relative LEA, so all of these belong on the allocated path. Run against
+# the fallback backend too, since only memory (never a cache vreg) is
+# authoritative for an aggregate global.
+foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")) {
+  $total++
+  try {
+    $exePath = Join-Path $tmpDir "test_mir_global_aggregate_addr_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($variant -like "release*") { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_mir_global_aggregate_addr.mettle", "-o", $exePath)
+
+    if ($variant -like "*_fallback") { $env:METTLE_MIR = "0" }
+    try {
+      $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    }
+    finally {
+      if ($variant -like "*_fallback") { Remove-Item Env:\METTLE_MIR -ErrorAction SilentlyContinue }
+    }
+    if ($LASTEXITCODE -ne 0) {
+      throw "mir-global-aggregate-addr build ($variant) failed: $buildOut"
+    }
+
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 42) {
+      throw "mir-global-aggregate-addr ($variant) miscompiled (exit $LASTEXITCODE)"
+    }
+
+    Write-CaseResult -Name "mir_global_aggregate_addr_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "mir_global_aggregate_addr_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# Anti-rot guard for the case above: correctness alone cannot tell the allocated
+# path from the fallback, so assert the coverage the gate is supposed to give.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "test_mir_global_aggregate_addr_cover.exe"
+  $coverOut = & $CompilerPath "--build" "--emit-obj" "--linker" "internal" "--release" `
+    "--explain" "tests\test_mir_global_aggregate_addr.mettle" "-o" $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "mir-global-aggregate-addr coverage build failed: $coverOut"
+  }
+  if ($coverOut -notmatch '(\d+)/(\d+) functions reaching codegen') {
+    throw "no backend coverage line in --explain output"
+  }
+  if ($Matches[1] -ne $Matches[2]) {
+    throw ("only {0}/{1} functions register-allocated; a global aggregate's " +
+           "address declined the eligibility gate again") -f $Matches[1], $Matches[2]
+  }
+  Write-CaseResult -Name "mir_global_aggregate_addr_coverage" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "mir_global_aggregate_addr_coverage" -Passed $false -Reason $_.Exception.Message
+}
+
 # MIR inline float32 affine-map passthrough: IR_OP_SIMD_AFFINE_MAP_F32 (the
 # float-copy / saxpy / `a*x+c` class) runs through the register-allocating
 # backend with its compile-time coefficients baked into the kernel broadcasts,

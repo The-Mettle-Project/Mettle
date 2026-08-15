@@ -119,16 +119,22 @@ static int mir_kernel_slot_estimate(const IRInstruction *in) {
   return slots;
 }
 
-/* True if `name` resolves to a read-accessible global scalar — a value we can
- * cache in a register at function entry (used by both the eligibility gate and
- * the entry-load emitter, so they agree exactly on what counts as cacheable). */
-static int mir_name_is_global_scalar(CodeGenerator *g, const char *name) {
+/* True if `name` resolves to a global variable of any type. Its storage has a
+ * link-time address, so `&name` is always one RIP-relative LEA. */
+static int mir_name_is_global_variable(CodeGenerator *g, const char *name) {
   if (!g || !g->ir_program || !name) {
     return 0;
   }
   const CgSym *s = code_generator_lookup_symbol(g, name);
-  if (!s || s->kind != CG_SYM_VARIABLE || !s->scope ||
-      s->scope->type != CG_SCOPE_GLOBAL) {
+  return s && s->kind == CG_SYM_VARIABLE && s->scope &&
+         s->scope->type == CG_SCOPE_GLOBAL;
+}
+
+/* True if `name` resolves to a read-accessible global scalar — a value we can
+ * cache in a register at function entry (used by both the eligibility gate and
+ * the entry-load emitter, so they agree exactly on what counts as cacheable). */
+static int mir_name_is_global_scalar(CodeGenerator *g, const char *name) {
+  if (!mir_name_is_global_variable(g, name)) {
     return 0;
   }
   return code_generator_binary_symbol_is_scalar_accessible(g, name);
@@ -983,10 +989,12 @@ static MirAddrofKind mir_addressof_kind(CodeGenerator *g,
   int is_param = 0;
   MtlcType *t = mir_local_or_param_type(g, ir_function, in->lhs.name, &is_param);
   if (!t) {
-    /* Not a local/param: a global (or extern). Only a plain scalar global is
-     * supported (cached, kept coherent via flush/reload around pointer ops). */
-    return mir_name_is_global_scalar(g, in->lhs.name) ? MIR_ADDROF_GLOBAL
-                                                      : MIR_ADDROF_UNSUPPORTED;
+    /* Not a local/param: a global (or extern). Any global's address is a
+     * RIP-relative LEA. A scalar one is additionally register-cached, so the
+     * flush/reload around pointer ops keeps cache and memory coherent; an
+     * aggregate is never cached, leaving memory authoritative on its own. */
+    return mir_name_is_global_variable(g, in->lhs.name) ? MIR_ADDROF_GLOBAL
+                                                        : MIR_ADDROF_UNSUPPORTED;
   }
   if (t->kind == MTLC_TYPE_STRING) {
     return MIR_ADDROF_UNSUPPORTED; /* string has its own (fat-pointer) address form */

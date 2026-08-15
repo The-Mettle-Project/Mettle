@@ -1,0 +1,105 @@
+// A global array or struct is reached through its address, so the whole
+// function used to fall to spill-everything codegen. Every value below is
+// checked against its hand-computed result, and the harness separately asserts
+// the register-allocating backend took all of these functions.
+
+struct Pt { x: int32; y: int32; }
+
+var SRC: int32[64];
+var DST: int32[64];
+var GRID: Pt[8];
+var ORIGIN: Pt;
+var SCALAR: int32 = 5;
+var BYTES: uint8[32];
+var REALS: float64[8];
+
+fn fill_src(n: int32) {
+  var i: int32 = 0;
+  while (i < n) {
+    SRC[i] = i * 3 + 1;
+    i = i + 1;
+  }
+}
+
+fn map_src(n: int32) -> int64 {
+  var sum: int64 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    var v: int32 = SRC[i] * 2 - 1;
+    DST[i] = v;
+    sum = sum + (int64)v;
+    i = i + 1;
+  }
+  return sum;
+}
+
+fn fill_structs() -> int32 {
+  ORIGIN.x = 11;
+  ORIGIN.y = 22;
+  var i: int32 = 0;
+  while (i < 8) {
+    GRID[i].x = i;
+    GRID[i].y = i * i;
+    i = i + 1;
+  }
+  return ORIGIN.x + ORIGIN.y + GRID[7].y;
+}
+
+fn fill_bytes() -> int32 {
+  var i: int32 = 0;
+  while (i < 32) {
+    BYTES[i] = (uint8)(i * 7);
+    i = i + 1;
+  }
+  var acc: int32 = 0;
+  var j: int32 = 0;
+  while (j < 32) {
+    acc = acc + (int32)BYTES[j];
+    j = j + 1;
+  }
+  return acc;
+}
+
+fn fill_reals() -> float64 {
+  var i: int32 = 0;
+  while (i < 8) {
+    REALS[i] = (float64)i * 0.5;
+    i = i + 1;
+  }
+  var acc: float64 = 0.0;
+  var j: int32 = 0;
+  while (j < 8) {
+    acc = acc + REALS[j];
+    j = j + 1;
+  }
+  return acc;
+}
+
+// A scalar global keeps its register cache; an aliasing pointer must still see
+// and publish writes through that cache.
+fn scalar_alias() -> int32 {
+  var p: int32* = &SCALAR;
+  *p = SCALAR + 3;
+  return SCALAR;
+}
+
+fn main() -> int32 {
+  fill_src(64);
+  if (SRC[0] != 1 || SRC[63] != 190) { return 1; }
+
+  // DST[i] = 6i + 1, so the sum over 0..63 is 6*2016 + 64.
+  if (map_src(64) != 12160) { return 2; }
+  if (DST[63] != 379) { return 3; }
+
+  if (fill_structs() != 82) { return 4; }
+  if (GRID[3].x != 3 || GRID[3].y != 9) { return 5; }
+
+  // 7 * (0 + 1 + ... + 31) = 7 * 496; the largest byte is 217, so none wrap.
+  if (fill_bytes() != 3472) { return 6; }
+
+  if (fill_reals() != 14.0) { return 7; }
+
+  if (scalar_alias() != 8) { return 8; }
+
+  return 42;
+}
