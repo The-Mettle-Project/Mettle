@@ -4660,6 +4660,65 @@ foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")
   }
 }
 
+# If-conversion in the general vectorizer: an `if` whose arms only choose a
+# value becomes a lane select, so a clamp, a ReLU and a floor all reach the same
+# kernel however the source spells them. Run with the pass disabled as well, to
+# check the vector answer against the scalar one it replaces.
+foreach ($variant in @("release", "debug", "release_scalar")) {
+  $total++
+  try {
+    $exePath = Join-Path $tmpDir "test_vloop_if_conversion_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($variant -like "release*") { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_vloop_if_conversion.mettle", "-o", $exePath)
+
+    if ($variant -eq "release_scalar") { $env:METTLE_SKIP_PASS = "auto_vectorize_int" }
+    try {
+      $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    }
+    finally {
+      if ($variant -eq "release_scalar") { Remove-Item Env:\METTLE_SKIP_PASS -ErrorAction SilentlyContinue }
+    }
+    if ($LASTEXITCODE -ne 0) {
+      throw "vloop-if-conversion build ($variant) failed: $buildOut"
+    }
+
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 42) {
+      throw "vloop-if-conversion ($variant) miscompiled (exit $LASTEXITCODE)"
+    }
+
+    Write-CaseResult -Name "vloop_if_conversion_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "vloop_if_conversion_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# Anti-rot guard for the case above. A select that quietly stops being claimed
+# still passes every correctness check, just slowly, so name each loop and
+# require a vectorized verdict for it.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "test_vloop_if_conversion_cover.exe"
+  $coverOut = & $CompilerPath "--build" "--emit-obj" "--linker" "internal" "--release" `
+    "--explain" "tests\test_vloop_if_conversion.mettle" "-o" $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "vloop-if-conversion coverage build failed: $coverOut"
+  }
+  foreach ($fn in @("clamp_two_sided", "relu", "ceiling_then_double", "floor_reversed")) {
+    if ($coverOut -notmatch "$fn \(loop @ line \d+\): vectorized") {
+      throw "$fn no longer vectorizes; if-conversion stopped claiming its select"
+    }
+  }
+  Write-CaseResult -Name "vloop_if_conversion_coverage" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "vloop_if_conversion_coverage" -Passed $false -Reason $_.Exception.Message
+}
+
 # Anti-rot guard for the case above: correctness alone cannot tell the allocated
 # path from the fallback, so assert the coverage the gate is supposed to give.
 $total++

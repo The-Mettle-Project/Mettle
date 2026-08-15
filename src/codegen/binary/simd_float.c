@@ -766,6 +766,8 @@ int code_generator_binary_emit_simd_affine_map_f32(
 #define VLOOP_K_SHL 11
 #define VLOOP_K_SAR 12
 #define VLOOP_K_SHR 13
+#define VLOOP_K_MIN 14
+#define VLOOP_K_MAX 15
 #define VLOOP_KERNEL_REGS 4
 #define VLOOP_KERNEL_MAX_NODES 48
 #define VLOOP_KERNEL_MAX_BASES 4
@@ -1179,6 +1181,15 @@ int code_generator_binary_emit_simd_vloop_f64(
                    : (tag == VLOOP_K_OR ? wcs_avx_vpor_ymm(b, ra, ra, rb)
                                         : wcs_avx_vpxor_ymm(b, ra, ra, rb));
           break;
+        case VLOOP_K_MIN:
+        case VLOOP_K_MAX:
+          if (!i32) {
+            code_generator_set_error(generator, "vloop float minmax");
+            return 0;
+          }
+          ok = tag == VLOOP_K_MIN ? wcs_avx_vpminsd_ymm(b, ra, ra, rb)
+                                  : wcs_avx_vpmaxsd_ymm(b, ra, ra, rb);
+          break;
         default: code_generator_set_error(generator, "vloop op"); return 0;
         }
         if (!ok) {
@@ -1331,6 +1342,8 @@ int code_generator_binary_emit_simd_vloop_f64(
         case VLOOP_K_AND: ok = wcs_avx_vpand_ymm(b, ra, ra, rb); break;
         case VLOOP_K_OR: ok = wcs_avx_vpor_ymm(b, ra, ra, rb); break;
         case VLOOP_K_XOR: ok = wcs_avx_vpxor_ymm(b, ra, ra, rb); break;
+        case VLOOP_K_MIN: ok = wcs_avx_vpminsd_ymm(b, ra, ra, rb); break;
+        case VLOOP_K_MAX: ok = wcs_avx_vpmaxsd_ymm(b, ra, ra, rb); break;
         default: return 0;
         }
         if (!ok) {

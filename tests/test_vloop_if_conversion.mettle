@@ -1,0 +1,105 @@
+// An `if` that only chooses a value is a value, not control flow. Each map
+// below is checked element by element against the scalar answer computed in
+// main, so a wrong lane fails whether or not the loop vectorized. The harness
+// separately asserts that all four DO vectorize.
+
+import "std/mem";
+
+fn clamp_two_sided(src: int32*, dst: int32*, n: int64) {
+  var i: int64 = 0;
+  while (i < n) {
+    var v: int32 = src[i];
+    if (v < -100) { v = -100; }
+    if (v > 100) { v = 100; }
+    dst[i] = v;
+    i = i + 1;
+  }
+}
+
+fn relu(src: int32*, dst: int32*, n: int64) {
+  var i: int64 = 0;
+  while (i < n) {
+    var v: int32 = src[i];
+    if (v < 0) { v = 0; }
+    dst[i] = v;
+    i = i + 1;
+  }
+}
+
+// An explicit else arm, and arithmetic after the choice.
+fn ceiling_then_double(src: int32*, dst: int32*, n: int64) {
+  var i: int64 = 0;
+  while (i < n) {
+    var v: int32 = src[i];
+    if (v > 50) { v = 50; } else { v = v; }
+    dst[i] = v * 2;
+    i = i + 1;
+  }
+}
+
+// The constant on the left: the operand order flips which side survives, and
+// the kernel has to read that off the compare rather than off the spelling.
+fn floor_reversed(src: int32*, dst: int32*, n: int64) {
+  var i: int64 = 0;
+  while (i < n) {
+    var v: int32 = src[i];
+    if (7 > v) { v = 7; }
+    dst[i] = v;
+    i = i + 1;
+  }
+}
+
+fn main() -> int32 {
+  // Not a multiple of the 8-wide vector, so the scalar remainder runs too.
+  var n: int64 = 1003;
+  var a: int32* = (int32*)malloc(n * 4);
+  var b: int32* = (int32*)malloc(n * 4);
+  if (a == 0 || b == 0) { return 1; }
+
+  var i: int64 = 0;
+  while (i < n) {
+    a[i] = (int32)((i * 37 + 11) % 997 - 498);
+    i = i + 1;
+  }
+
+  clamp_two_sided(a, b, n);
+  i = 0;
+  while (i < n) {
+    var e: int32 = a[i];
+    if (e < -100) { e = -100; }
+    if (e > 100) { e = 100; }
+    if (b[i] != e) { return 2; }
+    i = i + 1;
+  }
+
+  relu(a, b, n);
+  i = 0;
+  while (i < n) {
+    var r: int32 = a[i];
+    if (r < 0) { r = 0; }
+    if (b[i] != r) { return 3; }
+    i = i + 1;
+  }
+
+  ceiling_then_double(a, b, n);
+  i = 0;
+  while (i < n) {
+    var c: int32 = a[i];
+    if (c > 50) { c = 50; }
+    if (b[i] != c * 2) { return 4; }
+    i = i + 1;
+  }
+
+  floor_reversed(a, b, n);
+  i = 0;
+  while (i < n) {
+    var f: int32 = a[i];
+    if (7 > f) { f = 7; }
+    if (b[i] != f) { return 5; }
+    i = i + 1;
+  }
+
+  free((cstring)a);
+  free((cstring)b);
+  return 42;
+}

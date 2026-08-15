@@ -649,9 +649,27 @@ static void ir_affine_map_terms_destroy(IRAffineMapTerms *terms) {
   memset(terms, 0, sizeof(*terms));
 }
 
-static int ir_float_map_body_is_safe(IRFunction *function, size_t lo,
-                                     size_t hi, const char *iv_symbol,
-                                     size_t *store_index_out) {
+/* An `if` in a loop body whose arms only choose a value. See the if-conversion
+ * block below, which is where one is turned into a lane select. */
+typedef struct VLoopDiamond {
+  size_t branch_index; /* the branch_zero */
+  size_t then_lo, then_hi;
+  size_t else_lo, else_hi; /* else_lo == else_hi when there is no else arm */
+  size_t end;              /* one past the closing label */
+  const char *sym;         /* the one symbol the arms assign */
+  int has_else;
+} VLoopDiamond;
+
+static int vloop_match_diamond(const IRFunction *function, size_t at,
+                               size_t body_hi, VLoopDiamond *out);
+
+/* `allow_diamonds` admits a body whose branches all bound value diamonds. The
+ * DAG builder still has the last word: a diamond it cannot fold into a select
+ * returns no root, and the loop stays scalar. */
+static int ir_float_map_body_is_safe_ex(IRFunction *function, size_t lo,
+                                        size_t hi, const char *iv_symbol,
+                                        size_t *store_index_out,
+                                        int allow_diamonds) {
   size_t store_count = 0;
 
   if (!function || !store_index_out) {
@@ -663,6 +681,22 @@ static int ir_float_map_body_is_safe(IRFunction *function, size_t lo,
       store_count++;
       *store_index_out = i;
       continue;
+    }
+    if (allow_diamonds) {
+      VLoopDiamond dm;
+      if (ins->op == IR_OP_BRANCH_ZERO &&
+          vloop_match_diamond(function, i, hi, &dm)) {
+        /* The kernel deletes the body, so a value chosen here and read after
+         * the loop would vanish with it. */
+        if (ir_symbol_live_after_loop(function, hi + 1, dm.sym)) {
+          return 0;
+        }
+        i = dm.end - 1;
+        continue;
+      }
+      if (ins->op == IR_OP_LABEL || ins->op == IR_OP_JUMP) {
+        continue; /* the labels a matched diamond leaves behind */
+      }
     }
     if (ir_instruction_writes_symbol(ins) &&
         !ir_operand_is_symbol_named(&ins->dest, iv_symbol)) {
@@ -683,6 +717,13 @@ static int ir_float_map_body_is_safe(IRFunction *function, size_t lo,
   }
 
   return store_count == 1;
+}
+
+static int ir_float_map_body_is_safe(IRFunction *function, size_t lo, size_t hi,
+                                     const char *iv_symbol,
+                                     size_t *store_index_out) {
+  return ir_float_map_body_is_safe_ex(function, lo, hi, iv_symbol,
+                                      store_index_out, 0);
 }
 
 static int ir_affine_map_add_bias(IRAffineMapTerms *terms,
@@ -1365,6 +1406,8 @@ int ir_simd_i2f_reduce_pass(IRFunction *function, int *changed) {
 #define VLOOP_VN_SHL 11   /* int lanes only; op0 = node, op1 = literal count */
 #define VLOOP_VN_SAR 12   /* int lanes only; arithmetic >> by a literal count */
 #define VLOOP_VN_SHR 13   /* int lanes only; logical >> by a literal count */
+#define VLOOP_VN_MIN 14   /* int lanes only; signed per-lane minimum */
+#define VLOOP_VN_MAX 15   /* int lanes only; signed per-lane maximum */
 
 #define VLOOP_MAX_NODES 48
 #define VLOOP_MAX_ARRAYS 4 /* loaded bases; +dst must keep distinct bases <= 4 */
@@ -3022,33 +3065,319 @@ static int vloop_int_binop_tag(const char *text) {
   return -1;
 }
 
-/* Integer twin of vloop_resolve_body_local: fold a per-iteration local's
- * defining expression into the DAG in place of the symbol. Same three
- * conditions -- written exactly once in the body, dead after the loop, and a
- * bounded substitution depth so mutually-referential locals refuse rather than
- * recurse without end. */
-static int vloop_resolve_body_local_int(IRFunction *function, const char *sym,
-                                        const char *iv, VLoopDag *d) {
-  const IRInstruction *def = NULL;
-  size_t def_idx = 0;
-  int result = -1;
-
-  if (!sym || d->resolve_depth >= VLOOP_MAX_RESOLVE_DEPTH || d->overflow) {
-    return -1;
+/* ---- if-conversion: a conditional assignment becomes a lane select --------
+ *
+ * `if (v < lo) { v = lo; }` is a value, not control flow: every lane computes
+ * both sides and keeps one. Matching the shape here rather than in a per-kernel
+ * recognizer is what lets one clamp, one saturation and one running extremum
+ * share a path, whatever order the source writes them in.
+ *
+ * The lowered form of an `if` is fixed:
+ *
+ *     %t = <condition>
+ *     branch_zero %t -> Lelse
+ *     <then arm>
+ *     jump Lend
+ *   Lelse:
+ *     <else arm, possibly empty>
+ *   Lend:
+ *
+ * Only the branch-free arms are matched: a nested `if`, a store, or a call
+ * inside one refuses, since the kernel would have to reproduce an effect a
+ * masked lane must not have. */
+/* True if [lo,hi) is straight-line value code that assigns `*sym` at most once
+ * and touches nothing else that outlives a lane. */
+static int vloop_arm_is_pure(const IRFunction *function, size_t lo, size_t hi,
+                             const char **sym) {
+  int writes = 0;
+  for (size_t i = lo; i < hi; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_NOP) {
+      continue;
+    }
+    if (ins->op == IR_OP_STORE || ins->op == IR_OP_CALL ||
+        ins->op == IR_OP_CALL_INDIRECT || ins->op == IR_OP_LABEL ||
+        ins->op == IR_OP_JUMP || ins->op == IR_OP_BRANCH_ZERO ||
+        ins->op == IR_OP_BRANCH_EQ || ins->op == IR_OP_RETURN ||
+        ins->op == IR_OP_INLINE_ASM || ins->op == IR_OP_ADDRESS_OF) {
+      return 0;
+    }
+    if (!ir_instruction_writes_destination(ins)) {
+      continue;
+    }
+    if (ins->dest.kind == IR_OPERAND_TEMP) {
+      continue; /* an arm-local temp the DAG builder folds away */
+    }
+    if (ins->dest.kind != IR_OPERAND_SYMBOL || !ins->dest.name) {
+      return 0;
+    }
+    if (*sym && strcmp(*sym, ins->dest.name) != 0) {
+      return 0; /* two symbols in one diamond: not a single select */
+    }
+    *sym = ins->dest.name;
+    if (++writes > 1) {
+      return 0;
+    }
   }
-  for (size_t i = d->body_lo; i < d->body_hi; i++) {
+  return 1;
+}
+
+/* Match a value diamond whose branch sits at `at`. */
+static int vloop_match_diamond(const IRFunction *function, size_t at,
+                               size_t body_hi, struct VLoopDiamond *out) {
+  const IRInstruction *br = &function->instructions[at];
+  size_t jump = 0, else_label = 0, end_label = 0, probe = 0;
+  const char *sym = NULL;
+
+  if (br->op != IR_OP_BRANCH_ZERO || !br->text ||
+      br->lhs.kind != IR_OPERAND_TEMP || !br->lhs.name) {
+    return 0;
+  }
+  for (jump = at + 1; jump < body_hi; jump++) {
+    if (function->instructions[jump].op == IR_OP_JUMP) {
+      break;
+    }
+  }
+  if (jump >= body_hi || !function->instructions[jump].text) {
+    return 0;
+  }
+  if (!ir_find_next_non_nop(function, jump + 1, &else_label) ||
+      else_label >= body_hi) {
+    return 0;
+  }
+  {
+    const IRInstruction *el = &function->instructions[else_label];
+    if (el->op != IR_OP_LABEL || !el->text ||
+        strcmp(el->text, br->text) != 0) {
+      return 0;
+    }
+  }
+  /* Everything from the else label to the label the then arm jumps to is the
+   * else arm. With no else, the two labels are adjacent. */
+  end_label = else_label;
+  for (probe = else_label + 1; probe < body_hi; probe++) {
+    const IRInstruction *ins = &function->instructions[probe];
+    if (ins->op == IR_OP_LABEL && ins->text &&
+        strcmp(ins->text, function->instructions[jump].text) == 0) {
+      end_label = probe;
+      break;
+    }
+  }
+  if (end_label == else_label || end_label >= body_hi) {
+    return 0;
+  }
+  memset(out, 0, sizeof(*out));
+  out->branch_index = at;
+  out->then_lo = at + 1;
+  out->then_hi = jump;
+  out->else_lo = else_label + 1;
+  out->else_hi = end_label;
+  out->end = end_label + 1;
+  if (!vloop_arm_is_pure(function, out->then_lo, out->then_hi, &sym)) {
+    return 0;
+  }
+  if (!vloop_arm_is_pure(function, out->else_lo, out->else_hi, &sym)) {
+    return 0;
+  }
+  if (!sym) {
+    return 0; /* a diamond assigning nothing is not a value */
+  }
+  for (probe = out->else_lo; probe < out->else_hi; probe++) {
+    const IRInstruction *ins = &function->instructions[probe];
+    if (ins->op != IR_OP_NOP) {
+      out->has_else = 1;
+      break;
+    }
+  }
+  out->sym = sym;
+  return 1;
+}
+
+/* The instruction assigning `sym` in [lo,hi), or NULL when the arm leaves it
+ * alone (which means the arm keeps the value that reached the diamond). */
+static const IRInstruction *vloop_arm_assign(const IRFunction *function,
+                                             size_t lo, size_t hi,
+                                             const char *sym, size_t *idx_out) {
+  for (size_t i = lo; i < hi; i++) {
     const IRInstruction *ins = &function->instructions[i];
     if (ir_instruction_writes_destination(ins) &&
         ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name &&
         strcmp(ins->dest.name, sym) == 0) {
-      if (def) {
-        return -1; /* written more than once: not a per-iteration alias */
-      }
-      def = ins;
-      def_idx = i;
+      *idx_out = i;
+      return ins;
     }
   }
-  if (!def || ir_symbol_live_after_loop(function, d->body_hi + 1, sym)) {
+  return NULL;
+}
+
+static int vloop_build_int(IRFunction *function, size_t before,
+                           const IROperand *op, const char *iv, VLoopDag *d);
+static int vloop_resolve_def_int(IRFunction *function, const IRInstruction *def,
+                                 size_t def_idx, const char *iv, VLoopDag *d);
+
+/* Two operands naming the same value. Enough to tell `v = lo` from `v = hi`
+ * when both sit beside the compare that chose between them. */
+static int vloop_operand_same(const IROperand *a, const IROperand *b) {
+  if (!a || !b || a->kind != b->kind) {
+    return 0;
+  }
+  switch (a->kind) {
+  case IR_OPERAND_INT:
+    return a->int_value == b->int_value;
+  case IR_OPERAND_TEMP:
+  case IR_OPERAND_SYMBOL:
+    return a->name && b->name && strcmp(a->name, b->name) == 0;
+  default:
+    return 0;
+  }
+}
+
+/* Which compare operand an arm hands back: 0 = the compare's left, 1 = its
+ * right, -1 = neither. An arm that assigns nothing hands back the value that
+ * reached the diamond, which is what the compare read of `sym` names. */
+static int vloop_arm_side(const IRInstruction *cmp, const IRInstruction *as,
+                          const char *sym) {
+  const IROperand *value = NULL;
+  if (!as) {
+    if (ir_operand_is_symbol_named(&cmp->lhs, sym)) {
+      return 0;
+    }
+    if (ir_operand_is_symbol_named(&cmp->rhs, sym)) {
+      return 1;
+    }
+    return -1;
+  }
+  if (as->op != IR_OP_ASSIGN && as->op != IR_OP_CAST) {
+    return -1;
+  }
+  value = &as->lhs;
+  if (vloop_operand_same(value, &cmp->lhs)) {
+    return 0;
+  }
+  if (vloop_operand_same(value, &cmp->rhs)) {
+    return 1;
+  }
+  return -1;
+}
+
+/* Fold one value diamond into a lane minimum or maximum.
+ *
+ * A select whose arms are the two compared values IS a min or a max, and that
+ * is one instruction rather than a compare and a blend, and two ymm registers
+ * shallower. Deciding it here, off the compare's operands, means the source may
+ * spell it as a clamp, a saturation, a running extremum or a ternary, in either
+ * operand order, and reach the same kernel. A select over anything else refuses
+ * and the loop stays scalar. */
+static int vloop_diamond_node(IRFunction *function, const VLoopDiamond *dm,
+                              const char *sym, const char *iv, VLoopDag *d) {
+  const IRInstruction *br = &function->instructions[dm->branch_index];
+  const IRInstruction *cmp = NULL;
+  const IRInstruction *then_as = NULL;
+  const IRInstruction *else_as = NULL;
+  size_t then_idx = 0, else_idx = 0;
+  int then_side, else_side, lhs_node, rhs_node, lt, gt, keeps_min;
+
+  if (br->lhs.kind != IR_OPERAND_TEMP || !br->lhs.name) {
+    return -1;
+  }
+  cmp = ir_find_temp_producer_before(function, dm->branch_index, br->lhs.name);
+  if (!cmp || cmp->op != IR_OP_BINARY || cmp->is_float || !cmp->text) {
+    return -1;
+  }
+  lt = strcmp(cmp->text, "<") == 0 || strcmp(cmp->text, "<=") == 0;
+  gt = strcmp(cmp->text, ">") == 0 || strcmp(cmp->text, ">=") == 0;
+  if (!lt && !gt) {
+    return -1;
+  }
+  /* A signed compare is what vpminsd and vpmaxsd carry. */
+  if (cmp->is_unsigned) {
+    return -1;
+  }
+  then_as = vloop_arm_assign(function, dm->then_lo, dm->then_hi, sym, &then_idx);
+  else_as = vloop_arm_assign(function, dm->else_lo, dm->else_hi, sym, &else_idx);
+  then_side = vloop_arm_side(cmp, then_as, sym);
+  else_side = vloop_arm_side(cmp, else_as, sym);
+  if (then_side < 0 || else_side < 0 || then_side == else_side) {
+    return -1;
+  }
+  /* `a < b ? a : b` keeps the smaller; flipping the operator or the arm order
+   * flips which side survives. */
+  keeps_min = (then_side == 0) ? lt : gt;
+  lhs_node = vloop_build_int(function, dm->branch_index, &cmp->lhs, iv, d);
+  if (lhs_node < 0) {
+    return -1;
+  }
+  rhs_node = vloop_build_int(function, dm->branch_index, &cmp->rhs, iv, d);
+  if (rhs_node < 0) {
+    return -1;
+  }
+  return vloop_add_node(d, keeps_min ? VLOOP_VN_MIN : VLOOP_VN_MAX, lhs_node,
+                        rhs_node);
+}
+
+/* Resolve `sym` where its writes are guarded: find the last one that has
+ * happened by `stop` and build from there. The kernel replays the node list as
+ * a tree, so this builds only the nodes the value actually needs. */
+static int vloop_resolve_predicated_int(IRFunction *function, const char *sym,
+                                        const char *iv, size_t stop,
+                                        VLoopDag *d) {
+  VLoopDiamond last_dm;
+  const IRInstruction *last_def = NULL;
+  size_t last_def_idx = 0;
+  int have_dm = 0;
+  size_t i = d->body_lo;
+  int result;
+
+  memset(&last_dm, 0, sizeof(last_dm));
+  if (d->resolve_depth >= VLOOP_MAX_RESOLVE_DEPTH || d->overflow) {
+    return -1;
+  }
+  if (stop > d->body_hi) {
+    stop = d->body_hi;
+  }
+  while (i < stop) {
+    const IRInstruction *ins = &function->instructions[i];
+    VLoopDiamond dm;
+    if (ins->op == IR_OP_BRANCH_ZERO &&
+        vloop_match_diamond(function, i, d->body_hi, &dm)) {
+      if (dm.end > stop) {
+        break; /* the read sits inside this diamond: it sees the prior value */
+      }
+      if (strcmp(dm.sym, sym) == 0) {
+        last_dm = dm;
+        have_dm = 1;
+        last_def = NULL;
+      }
+      i = dm.end;
+      continue;
+    }
+    if (ir_instruction_writes_destination(ins) &&
+        ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name &&
+        strcmp(ins->dest.name, sym) == 0) {
+      last_def = ins;
+      last_def_idx = i;
+      have_dm = 0;
+    }
+    i++;
+  }
+  d->resolve_depth++;
+  if (have_dm) {
+    result = vloop_diamond_node(function, &last_dm, sym, iv, d);
+  } else if (last_def) {
+    result = vloop_resolve_def_int(function, last_def, last_def_idx, iv, d);
+  } else {
+    result = -1;
+  }
+  d->resolve_depth--;
+  return result;
+}
+
+/* Fold one definition of a per-iteration local into the DAG. */
+static int vloop_resolve_def_int(IRFunction *function, const IRInstruction *def,
+                                 size_t def_idx, const char *iv, VLoopDag *d) {
+  int result = -1;
+
+  if (!def || d->resolve_depth >= VLOOP_MAX_RESOLVE_DEPTH || d->overflow) {
     return -1;
   }
   d->resolve_depth++;
@@ -3114,6 +3443,42 @@ static int vloop_resolve_body_local_int(IRFunction *function, const char *sym,
   return result;
 }
 
+/* Integer twin of vloop_resolve_body_local: fold a per-iteration local's
+ * defining expression into the DAG in place of the symbol. The local must be
+ * dead after the loop, since the fused kernel deletes the body. One unguarded
+ * definition folds directly; several mean the writes are guarded, and the
+ * predicated walk turns each guard into a select. */
+static int vloop_resolve_body_local_int(IRFunction *function, const char *sym,
+                                        const char *iv, size_t read_at,
+                                        VLoopDag *d) {
+  const IRInstruction *def = NULL;
+  size_t def_idx = 0;
+  int n_defs = 0;
+
+  if (!sym || d->resolve_depth >= VLOOP_MAX_RESOLVE_DEPTH || d->overflow) {
+    return -1;
+  }
+  for (size_t i = d->body_lo; i < d->body_hi; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ir_instruction_writes_destination(ins) &&
+        ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name &&
+        strcmp(ins->dest.name, sym) == 0) {
+      if (!def) {
+        def = ins;
+        def_idx = i;
+      }
+      n_defs++;
+    }
+  }
+  if (!def || ir_symbol_live_after_loop(function, d->body_hi + 1, sym)) {
+    return -1;
+  }
+  if (n_defs > 1) {
+    return vloop_resolve_predicated_int(function, sym, iv, read_at, d);
+  }
+  return vloop_resolve_def_int(function, def, def_idx, iv, d);
+}
+
 static int vloop_build_int(IRFunction *function, size_t before,
                            const IROperand *op, const char *iv, VLoopDag *d) {
   if (!op || d->overflow) {
@@ -3140,7 +3505,7 @@ static int vloop_build_int(IRFunction *function, size_t before,
        * declaration out of the body -- which the compiler now does -- leaves
        * the WRITE inside it, so without this the named-intermediate form of
        * every int map stays scalar. */
-      return vloop_resolve_body_local_int(function, op->name, iv, d);
+      return vloop_resolve_body_local_int(function, op->name, iv, before, d);
     }
     {
       const char *ty = ir_function_local_declared_type(function, op->name);
@@ -3265,8 +3630,8 @@ static int ir_match_int_map_at(IRFunction *function, size_t header_index,
   if (!matched) {
     return 1;
   }
-  if (!ir_float_map_body_is_safe(function, branch_index + 1, jump_index,
-                                 iv_symbol, &store_index)) {
+  if (!ir_float_map_body_is_safe_ex(function, branch_index + 1, jump_index,
+                                    iv_symbol, &store_index, 1)) {
     return 1;
   }
 
