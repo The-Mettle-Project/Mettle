@@ -4750,7 +4750,8 @@ try {
   if ($LASTEXITCODE -ne 0) {
     throw "hoist-global-bases coverage build failed: $coverOut"
   }
-  foreach ($fn in @("fill_src", "map_src", "clamp_src_into_dst", "fill_reals")) {
+  foreach ($fn in @("fill_src", "map_src", "sum_dst", "clamp_src_into_dst",
+                    "fill_reals")) {
     if ($coverOut -notmatch "$fn \(loop @ line \d+\): vectorized") {
       throw "$fn no longer vectorizes; a global array's base stopped being hoisted"
     }

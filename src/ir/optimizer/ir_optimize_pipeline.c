@@ -51,6 +51,10 @@ typedef enum {
   { IR_OPT_PASS_##id, fn, {all_features, any_features} }
 
 static const IROptNamedPass g_ir_pre_inline_passes[] = {
+    /* Ahead of every recognizer in every later stage: a global array's base is
+     * computed inside the body, where none of them reads it as a base. Runs
+     * again after inlining, which plants fresh bodies of its own. */
+    {"hoist_global_bases", ir_hoist_global_bases_pass},
     {"simd_minmax_i32", ir_simd_minmax_i32_pass},
     {"prefix_sum_i32", ir_prefix_sum_i32_pass},
     {"induction_pointer", ir_pointer_induction_pass},

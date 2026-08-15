@@ -220,7 +220,9 @@ static int ir_try_vectorize_sum_i32_at(IRFunction *function, size_t header_index
       strcmp(compare->text, "<") != 0 ||
       compare->dest.kind != IR_OPERAND_TEMP || !compare->dest.name ||
       compare->lhs.kind != IR_OPERAND_SYMBOL || !compare->lhs.name ||
-      compare->rhs.kind != IR_OPERAND_SYMBOL || !compare->rhs.name ||
+      (compare->rhs.kind != IR_OPERAND_SYMBOL &&
+       compare->rhs.kind != IR_OPERAND_INT) ||
+      (compare->rhs.kind == IR_OPERAND_SYMBOL && !compare->rhs.name) ||
       branch->op != IR_OP_BRANCH_ZERO ||
       !ir_operand_is_temp_named(&branch->lhs, compare->dest.name) ||
       !branch->text) {
@@ -230,7 +232,10 @@ static int ir_try_vectorize_sum_i32_at(IRFunction *function, size_t header_index
   iv_symbol = compare->lhs.name;
   exit_label = branch->text;
 
-  if (!ir_symbol_is_sum_loop_bound(function, compare->rhs.name)) {
+  /* A literal trip count is as good a bound as a symbol: the kernel takes
+   * the count as an operand either way. */
+  if (compare->rhs.kind == IR_OPERAND_SYMBOL &&
+      !ir_symbol_is_sum_loop_bound(function, compare->rhs.name)) {
     return 1;
   }
 
@@ -563,7 +568,9 @@ static int ir_try_vectorize_sum_u8_at(IRFunction *function, size_t header_index,
       strcmp(compare->text, "<") != 0 ||
       compare->dest.kind != IR_OPERAND_TEMP || !compare->dest.name ||
       compare->lhs.kind != IR_OPERAND_SYMBOL || !compare->lhs.name ||
-      compare->rhs.kind != IR_OPERAND_SYMBOL || !compare->rhs.name ||
+      (compare->rhs.kind != IR_OPERAND_SYMBOL &&
+       compare->rhs.kind != IR_OPERAND_INT) ||
+      (compare->rhs.kind == IR_OPERAND_SYMBOL && !compare->rhs.name) ||
       branch->op != IR_OP_BRANCH_ZERO ||
       !ir_operand_is_temp_named(&branch->lhs, compare->dest.name) ||
       !branch->text) {
@@ -573,7 +580,10 @@ static int ir_try_vectorize_sum_u8_at(IRFunction *function, size_t header_index,
   iv_symbol = compare->lhs.name;
   exit_label = branch->text;
 
-  if (!ir_symbol_is_sum_loop_bound(function, compare->rhs.name)) {
+  /* A literal trip count is as good a bound as a symbol: the kernel takes
+   * the count as an operand either way. */
+  if (compare->rhs.kind == IR_OPERAND_SYMBOL &&
+      !ir_symbol_is_sum_loop_bound(function, compare->rhs.name)) {
     return 1;
   }
   if (!ir_iv_zero_at_header(function, header_index, iv_symbol)) {
@@ -791,7 +801,9 @@ static int ir_try_vectorize_byte_map_at(IRFunction *function,
       strcmp(compare->text, "<") != 0 ||
       compare->dest.kind != IR_OPERAND_TEMP || !compare->dest.name ||
       compare->lhs.kind != IR_OPERAND_SYMBOL || !compare->lhs.name ||
-      compare->rhs.kind != IR_OPERAND_SYMBOL || !compare->rhs.name ||
+      (compare->rhs.kind != IR_OPERAND_SYMBOL &&
+       compare->rhs.kind != IR_OPERAND_INT) ||
+      (compare->rhs.kind == IR_OPERAND_SYMBOL && !compare->rhs.name) ||
       branch->op != IR_OP_BRANCH_ZERO ||
       !ir_operand_is_temp_named(&branch->lhs, compare->dest.name) ||
       !branch->text) {
@@ -800,7 +812,10 @@ static int ir_try_vectorize_byte_map_at(IRFunction *function,
   iv_symbol = compare->lhs.name;
   exit_label = branch->text;
 
-  if (!ir_symbol_is_sum_loop_bound(function, compare->rhs.name)) {
+  /* A literal trip count is as good a bound as a symbol: the kernel takes
+   * the count as an operand either way. */
+  if (compare->rhs.kind == IR_OPERAND_SYMBOL &&
+      !ir_symbol_is_sum_loop_bound(function, compare->rhs.name)) {
     return 1;
   }
   if (!ir_iv_zero_at_header(function, header_index, iv_symbol)) {
