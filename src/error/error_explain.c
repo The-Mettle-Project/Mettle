@@ -452,15 +452,22 @@ static const DecisionDoc DECISIONS[] = {
      "    `mettle explain clamp-store`.\n"},
     {"predicated-count", DECISION_VECTOR_REFUSAL,
      "An accumulator updated only on the taken arm",
-     "`if (a[i] > t) { c = c + 1; }` accumulates under a condition. No kernel\n"
-     "covers a predicated accumulator, but the branchless form of the same\n"
-     "loop is an ordinary '+' reduction, which does vectorize:\n"
+     "Over int32 elements, `if (a[i] > t) { c = c + 1; }` and\n"
+     "`if (a[i] < 0) { s = s + a[i]; }` both vectorize: the comparison already\n"
+     "holds 0 or 1, so the compiler multiplies the addend by it and the body\n"
+     "becomes straight line.\n"
      "\n"
-     "    c = c + (int32)(a[i] > t);\n"
+     "This code fires when that rewrite does not apply. Three shapes it will\n"
+     "not take:\n"
      "\n"
-     "The comparison produces 0 or 1, so the total is identical and the body\n"
-     "becomes straight line. The same rewrite works for a conditional sum\n"
-     "(multiply the addend by the comparison instead of adding one).\n"},
+     "  - Float elements. There is no predicated float reduction, and the\n"
+     "    branchless form has no kernel either, so there is nothing to change\n"
+     "    in the loop.\n"
+     "  - An else arm that also writes the accumulator. That is a select on a\n"
+     "    loop-carried value, not an accumulate; there is no one addend.\n"
+     "  - A guard that is not a comparison. `if (a[i] & 6)` fires on 2, 4 and\n"
+     "    6 alike, so multiplying by it would add those instead of 1. Write\n"
+     "    the test as `(a[i] & 6) != 0` and it converts.\n"},
     {"clamp-store", DECISION_VECTOR_REFUSAL,
      "A value clamped or selected before it is stored",
      "`if (v > hi) { v = hi; }` before `a[i] = v` is a clamp, and over int32\n"

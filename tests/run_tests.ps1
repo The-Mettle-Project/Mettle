@@ -799,7 +799,7 @@ $cases = @(
       'extent_from_first \(loop @ line 24\): NOT vectorized  \[extremum-shape\]',
       'a shape that does vectorize -- but the kernel did not claim it \(`hi` is the accumulator\)',
       'count_above \(loop @ line 36\): NOT vectorized  \[predicated-count\]',
-      'c = c \+ \(int32\)\(a\[i\] > t\)',
+      'over float elements there is nothing to change here',
       'clamp_all \(loop @ line 46\): NOT vectorized  \[clamp-store\]',
       'green_sum \(loop @ line 60\): NOT vectorized  \[strided-access\]',
       'the loop steps 3 elements at a time',

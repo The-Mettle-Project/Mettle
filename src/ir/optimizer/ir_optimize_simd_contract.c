@@ -1233,15 +1233,21 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
       }
       if (shape == IR_BRANCH_SHAPE_COUNT) {
         snprintf(reason, reason_cap,
-                 "the body counts (or sums) under a condition -- `%s` is "
-                 "updated only on the taken arm -- and no kernel covers a "
-                 "predicated accumulator yet",
+                 "the body accumulates into `%s` under a condition. Over int32 "
+                 "elements that is made unconditional and vectorized, so this "
+                 "one is out for one of three reasons: the elements are float "
+                 "(no kernel, and the branchless form has none either), the "
+                 "guard is not a comparison (`if (x & 6)` fires on 2, 4 and 6 "
+                 "alike, and the addend would be multiplied by those), or an "
+                 "else arm writes `%s` too, which is a select rather than an "
+                 "accumulate",
+                 written ? written : "the accumulator",
                  written ? written : "the accumulator");
         snprintf(fix, fix_cap,
-                 "make the accumulation unconditional so the body is straight "
-                 "line: `%s = %s + (int32)(a[i] > t)` accumulates every "
-                 "iteration and vectorizes as an int32 '+' reduction",
-                 written ? written : "c", written ? written : "c");
+                 "over int32 elements, spell the guard as a comparison "
+                 "(`(x & 6) != 0`) or make the two arms accumulate one addend "
+                 "rather than two; over float elements there is nothing to "
+                 "change here, and rewriting it branchlessly will not help");
         IR_SIMD_SET_DIAG(IR_SIMD_BAIL_PREDICATED_COUNT);
         return;
       }
