@@ -16,6 +16,10 @@ int type_checker_check_match_statement(TypeChecker *checker,
   Type *subject_type = type_checker_infer_type(checker, match->expression);
   if (!subject_type)
     return 0;
+  if (type_checker_reject_comptime_escape(checker, match->expression->location,
+                                          subject_type)) {
+    return 0;
+  }
 
   if (subject_type->kind != TYPE_TAGGED_ENUM) {
     type_checker_set_error_at_location(
@@ -151,6 +155,10 @@ Type *type_checker_check_match_expression(TypeChecker *checker,
   Type *subject_type = type_checker_infer_type(checker, match->expression);
   if (!subject_type)
     return NULL;
+  if (type_checker_reject_comptime_escape(checker, match->expression->location,
+                                          subject_type)) {
+    return NULL;
+  }
 
   if (subject_type->kind != TYPE_TAGGED_ENUM) {
     type_checker_set_error_at_location(

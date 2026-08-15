@@ -1,0 +1,11 @@
+// A sequence is observable but not holdable: it has no runtime representation.
+
+struct Point {
+  x: int32;
+  y: int32;
+}
+
+fn main() -> int32 {
+  var held: int64 = typeof(Point).fields;
+  return (int32)held;
+}

@@ -89,8 +89,19 @@ static int type_checker_eval_numeric_constant(TypeChecker *checker,
 
   case AST_FUNCTION_CALL: {
     CallExpression *call = (CallExpression *)expression->data;
-    if (!call || !call->function_name ||
-        strcmp(call->function_name, "sizeof") != 0 ||
+    if (!call || !call->function_name) {
+      return 0;
+    }
+    if (strcmp(call->function_name, "offsetof") == 0) {
+      long long offset = 0;
+      if (!type_checker_eval_offsetof(checker, call, expression->location,
+                                      &offset)) {
+        return 0;
+      }
+      type_checker_constant_from_int(out_value, offset);
+      return 1;
+    }
+    if (strcmp(call->function_name, "sizeof") != 0 ||
         call->argument_count != 1 || !call->arguments[0] ||
         call->arguments[0]->type != AST_IDENTIFIER) {
       return 0;
@@ -106,6 +117,25 @@ static int type_checker_eval_numeric_constant(TypeChecker *checker,
 
     type_checker_constant_from_int(out_value, (long long)type->size);
     return 1;
+  }
+
+  /* `f.offset` and friends: a Field member is a compile-time integer, so it
+   * belongs in every constant context sizeof and offsetof already reach. */
+  case AST_MEMBER_ACCESS: {
+    ComptimeValue folded = comptime_none();
+    if (!checker ||
+        !type_checker_eval_comptime(checker, expression, &folded)) {
+      return 0;
+    }
+    if (folded.kind == COMPTIME_INT) {
+      type_checker_constant_from_int(out_value, folded.as.int_value);
+      return 1;
+    }
+    if (folded.kind == COMPTIME_FLOAT) {
+      type_checker_constant_from_float(out_value, folded.as.float_value);
+      return 1;
+    }
+    return 0;
   }
 
   case AST_UNARY_EXPRESSION: {
@@ -352,7 +382,286 @@ Type *type_checker_resolve_sizeof_argument(TypeChecker *checker,
     return NULL;
   }
 
+  if (type_contains_comptime_only(type)) {
+    type_checker_reject_no_runtime_repr(checker, arg->location, type);
+    return NULL;
+  }
+
   return type;
+}
+
+int type_checker_eval_offsetof(TypeChecker *checker, CallExpression *call,
+                               SourceLocation location, long long *out_offset) {
+  if (!checker || !call || !out_offset) {
+    return 0;
+  }
+  if (call->argument_count != 1 || !call->arguments || !call->arguments[0]) {
+    type_checker_set_error_at_location(
+        checker, location, "offsetof expects exactly one field argument");
+    return 0;
+  }
+
+  ASTNode *arg = call->arguments[0];
+  Type *arg_type = type_checker_infer_type(checker, arg);
+  if (!arg_type) {
+    return 0;
+  }
+  if (arg_type->kind != TYPE_FIELD) {
+    type_checker_set_error_at_location(
+        checker, arg->location,
+        "offsetof expects a compile-time Field (for example Point.x)");
+    return 0;
+  }
+
+  ComptimeValue value = comptime_none();
+  if (!type_checker_eval_comptime(checker, arg, &value) ||
+      value.kind != COMPTIME_FIELD_REF) {
+    type_checker_set_error_at_location(
+        checker, arg->location,
+        "offsetof argument must be a compile-time Field value");
+    return 0;
+  }
+
+  Type *owner =
+      type_checker_type_from_index(checker, value.as.field_ref.type_index);
+  TypeField field;
+  if (!owner ||
+      !type_field_at(owner, value.as.field_ref.field_index, &field)) {
+    type_checker_set_error_at_location(
+        checker, arg->location,
+        "offsetof could not read that field from the type table");
+    return 0;
+  }
+  if (field.byte_offset > (size_t)LLONG_MAX) {
+    type_checker_set_error_at_location(checker, arg->location,
+                                       "field offset does not fit in int64");
+    return 0;
+  }
+  *out_offset = (long long)field.byte_offset;
+  return 1;
+}
+
+Type *type_checker_resolve_typeof_argument(TypeChecker *checker,
+                                           CallExpression *call,
+                                           SourceLocation location) {
+  if (!checker || !call) {
+    return NULL;
+  }
+
+  if (call->argument_count != 1 || !call->arguments || !call->arguments[0]) {
+    type_checker_set_error_at_location(
+        checker, location, "typeof expects exactly one argument");
+    return NULL;
+  }
+
+  ASTNode *arg = call->arguments[0];
+  if (arg->type == AST_IDENTIFIER && arg->data) {
+    Identifier *id = (Identifier *)arg->data;
+    if (id && id->name) {
+      Type *named = type_checker_get_type_by_name(checker, id->name);
+      Symbol *symbol = type_checker_resolve_identifier(checker, id);
+      if (named && (!symbol || symbol->kind == SYMBOL_STRUCT ||
+                    symbol->kind == SYMBOL_ENUM)) {
+        return named;
+      }
+    }
+  }
+
+  Type *inferred = type_checker_infer_type(checker, arg);
+  if (!inferred) {
+    return NULL;
+  }
+  return inferred;
+}
+
+static int eval_comptime_from_symbol(TypeChecker *checker, Symbol *symbol,
+                                     ComptimeValue *out_value) {
+  if (!symbol || !out_value) {
+    return 0;
+  }
+  if (!comptime_is_none(symbol->comptime_value)) {
+    *out_value = symbol->comptime_value;
+    return 1;
+  }
+  if (symbol->kind == SYMBOL_STRUCT || symbol->kind == SYMBOL_ENUM) {
+    if (!symbol->type) {
+      return 0;
+    }
+    uint32_t index = type_checker_intern_type(checker, symbol->type);
+    if (index == UINT32_MAX) {
+      return 0;
+    }
+    *out_value = comptime_type_ref(index);
+    return 1;
+  }
+  if (symbol->has_constant_value) {
+    if (symbol->constant_is_float) {
+      *out_value = comptime_float(symbol->constant_float_value);
+    } else {
+      *out_value = comptime_int(symbol->constant_integer_value);
+    }
+    return 1;
+  }
+  if (symbol->kind == SYMBOL_CONSTANT) {
+    *out_value = comptime_int(symbol->data.constant.value);
+    return 1;
+  }
+  return 0;
+}
+
+int type_checker_eval_comptime(TypeChecker *checker, ASTNode *expression,
+                               ComptimeValue *out_value) {
+  if (!checker || !expression || !out_value) {
+    return 0;
+  }
+  *out_value = comptime_none();
+
+  switch (expression->type) {
+  case AST_NUMBER_LITERAL: {
+    NumberLiteral *literal = (NumberLiteral *)expression->data;
+    if (!literal) {
+      return 0;
+    }
+    if (literal->is_float) {
+      *out_value = comptime_float(literal->float_value);
+    } else {
+      *out_value = comptime_int(literal->int_value);
+    }
+    return 1;
+  }
+
+  case AST_IDENTIFIER: {
+    Identifier *identifier = (Identifier *)expression->data;
+    if (!identifier || !identifier->name) {
+      return 0;
+    }
+    Symbol *symbol = type_checker_resolve_identifier(checker, identifier);
+    if (eval_comptime_from_symbol(checker, symbol, out_value)) {
+      return 1;
+    }
+    Type *named = type_checker_get_type_by_name(checker, identifier->name);
+    if (named) {
+      uint32_t index = type_checker_intern_type(checker, named);
+      if (index == UINT32_MAX) {
+        return 0;
+      }
+      *out_value = comptime_type_ref(index);
+      return 1;
+    }
+    return 0;
+  }
+
+  case AST_FUNCTION_CALL: {
+    CallExpression *call = (CallExpression *)expression->data;
+    if (!call || !call->function_name) {
+      return 0;
+    }
+    if (strcmp(call->function_name, "offsetof") == 0) {
+      long long offset = 0;
+      if (!type_checker_eval_offsetof(checker, call, expression->location,
+                                      &offset)) {
+        return 0;
+      }
+      *out_value = comptime_int(offset);
+      return 1;
+    }
+    if (strcmp(call->function_name, "typeof") == 0) {
+      Type *referred = type_checker_resolve_typeof_argument(
+          checker, call, expression->location);
+      if (!referred) {
+        return 0;
+      }
+      uint32_t index = type_checker_intern_type(checker, referred);
+      if (index == UINT32_MAX) {
+        return 0;
+      }
+      *out_value = comptime_type_ref(index);
+      return 1;
+    }
+    if (strcmp(call->function_name, "sizeof") == 0) {
+      Type *sized = type_checker_resolve_sizeof_argument(
+          checker, call, expression->location);
+      if (!sized) {
+        return 0;
+      }
+      *out_value = comptime_int((long long)sized->size);
+      return 1;
+    }
+    return 0;
+  }
+
+  case AST_MEMBER_ACCESS: {
+    MemberAccess *member = (MemberAccess *)expression->data;
+    if (!member || !member->object || !member->member) {
+      return 0;
+    }
+    ComptimeValue owner = comptime_none();
+    if (!type_checker_eval_comptime(checker, member->object, &owner)) {
+      return 0;
+    }
+    if (owner.kind == COMPTIME_FIELD_REF) {
+      return type_checker_eval_field_member(checker, owner, member->member,
+                                            out_value);
+    }
+    if (owner.kind == COMPTIME_SEQUENCE) {
+      return type_checker_eval_sequence_member(checker, owner, member->member,
+                                               out_value);
+    }
+    if (owner.kind != COMPTIME_TYPE_REF) {
+      return 0;
+    }
+    Type *referred =
+        type_checker_type_from_index(checker, owner.as.type_ref.type_index);
+    if (!referred) {
+      return 0;
+    }
+    /* `Color.Red` on a plain enum reads the member off the type table rather
+     * than the variant's bare global, so a compiler-registered enum that
+     * deliberately declares no bare globals still folds. */
+    if (referred->kind == TYPE_ENUM) {
+      for (size_t i = 0; i < referred->enum_member_count; i++) {
+        if (referred->enum_member_names[i] &&
+            strcmp(referred->enum_member_names[i], member->member) == 0) {
+          *out_value = comptime_int(referred->enum_member_values[i]);
+          return 1;
+        }
+      }
+      /* Not a variant, so fall through: an enum type answers the same shape
+       * queries every other type does (`typeof(Color).kind`). */
+    }
+    /* A struct field named the same as a query wins: the program's own
+     * declaration is never shadowed by the reflection surface. */
+    int field_index = type_get_field_index(referred, member->member);
+    if (field_index >= 0) {
+      *out_value = comptime_field_ref(owner.as.type_ref.type_index,
+                                      (uint32_t)field_index);
+      return 1;
+    }
+    return type_checker_eval_type_member(checker, owner, member->member,
+                                         out_value);
+  }
+
+  case AST_INDEX_EXPRESSION: {
+    ArrayIndexExpression *index_expr =
+        (ArrayIndexExpression *)expression->data;
+    if (!index_expr || !index_expr->array || !index_expr->index) {
+      return 0;
+    }
+    ComptimeValue sequence = comptime_none();
+    ComptimeValue subscript = comptime_none();
+    if (!type_checker_eval_comptime(checker, index_expr->array, &sequence) ||
+        sequence.kind != COMPTIME_SEQUENCE ||
+        !type_checker_eval_comptime(checker, index_expr->index, &subscript) ||
+        subscript.kind != COMPTIME_INT) {
+      return 0;
+    }
+    return type_checker_eval_sequence_index(sequence, subscript.as.int_value,
+                                            out_value);
+  }
+
+  default:
+    return 0;
+  }
 }
 
 int type_checker_validate_static_assert(TypeChecker *checker,
@@ -371,6 +680,14 @@ int type_checker_validate_static_assert(TypeChecker *checker,
   long long value = 0;
   if (!type_checker_eval_integer_constant_with_checker(
           checker, call->arguments[0], &value)) {
+    /* Folding failed, which says the condition is not constant but not why.
+     * Type checking the condition first surfaces the real reason -- an unknown
+     * query, a sequence index out of range -- and only when that comes back
+     * clean is "not a constant" actually the whole story. */
+    if (call->arguments[0] &&
+        !type_checker_infer_type(checker, call->arguments[0])) {
+      return 0;
+    }
     type_checker_set_error_at_location(
         checker, call->arguments[0] ? call->arguments[0]->location : location,
         "static_assert condition must be a compile-time integer expression");

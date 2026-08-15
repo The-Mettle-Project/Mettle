@@ -71,6 +71,16 @@ typedef struct {
   char *source_code;
 } ErrorReporterSource;
 
+/* One link in the chain of code-generating contexts a diagnostic was reported
+   from, e.g. "expanded from comptime-for iteration 1 (field `x`)". Frames
+   are pushed by the stage doing the generating and are attached to every
+   diagnostic raised while they are live, so attribution is captured as the
+   diagnostic is created rather than reconstructed afterwards. */
+typedef struct {
+  SourceSpan span;
+  char *message;
+} ErrorNoteFrame;
+
 typedef struct {
   ErrorReport *errors;
   size_t count;
@@ -86,6 +96,12 @@ typedef struct {
   /* Set when the most recent add was suppressed as a duplicate/cascade, so
      follow-up label/note attachments know to skip themselves too. */
   int last_add_suppressed;
+  /* Live expansion chain, outermost first. */
+  ErrorNoteFrame *note_frames;
+  size_t note_frame_count;
+  size_t note_frame_capacity;
+  /* Guards the note frames from attaching themselves to their own notes. */
+  int emitting_note_frames;
 } ErrorReporter;
 
 ErrorReporter *error_reporter_create(const char *filename,
@@ -147,6 +163,17 @@ void error_reporter_set_last_code(ErrorReporter *reporter, const char *code);
    diagnostic, e.g. "function 'add' defined here". */
 void error_reporter_add_note_of_span(ErrorReporter *reporter, SourceSpan span,
                                      const char *message);
+
+/* Push a context frame naming the code-generating step now in progress. Every
+   error and warning added until the matching pop carries the whole live chain
+   as notes, so a diagnostic raised inside generated code always names what
+   generated it and where. `span` should point at the source the programmer
+   wrote (the `comptime for` keyword), not at the generated node. Returns 1 on
+   success; on failure nothing is pushed and the caller must not pop. */
+int error_reporter_push_note_frame(ErrorReporter *reporter, SourceSpan span,
+                                   const char *message);
+void error_reporter_pop_note_frame(ErrorReporter *reporter);
+size_t error_reporter_note_frame_depth(const ErrorReporter *reporter);
 /* Switch diagnostic printing to newline-delimited JSON (for tooling). */
 void error_reporter_set_format_json(int enabled);
 int error_reporter_format_json(void);

@@ -1,0 +1,11 @@
+// An unknown Type query names the ones that exist rather than failing vaguely.
+
+struct Point {
+  x: int32;
+  y: int32;
+}
+
+fn main() -> int32 {
+  static_assert(typeof(Point).stride == 8);
+  return 0;
+}

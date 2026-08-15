@@ -38,6 +38,8 @@ fn main() -> int32 {
 
 A numeric `const`, with integer or float type, must have a compile-time constant initializer. It may use literals, earlier numeric constants, `sizeof`, and operators that the type checker can evaluate. A top-level integer `const` is folded directly into machine code at each use and occupies no storage. Float constants still get normal storage when code may take their address. A top-level numeric `const` may omit its type annotation. A local `const` must state its type, like any local binding.
 
+A `const` of type `Type` or `Field` is a compile-time reflection binding: it holds a TypeRef or FieldRef and occupies no storage. `Type` and `Field` cannot be used as `var` types, function parameters, return types, or struct fields.
+
 A top-level `const` of any other type gets normal storage in the object file, initialized to its value. Float, string, and **aggregate** constants all work at global scope:
 
 ```mettle

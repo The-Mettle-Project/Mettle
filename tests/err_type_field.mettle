@@ -1,0 +1,9 @@
+// Type has no runtime representation, so it cannot be a struct field.
+
+struct Holder {
+  t: Type;
+}
+
+fn main() -> int32 {
+  return 0;
+}

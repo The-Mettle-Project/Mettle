@@ -1,0 +1,5 @@
+// offsetof reads a FieldRef from the type table, not a runtime value.
+
+fn main() -> int32 {
+  return (int32)offsetof(1);
+}

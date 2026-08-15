@@ -2008,6 +2008,71 @@ static ImportPathCacheEntry *g_import_path_cache = NULL;
 static size_t g_import_path_cache_count = 0;
 static size_t g_import_path_cache_capacity = 0;
 
+/* Resolved file path -> the module spelling it was imported as. Reflection
+ * qualifies type names with this, so `.name` can tell two modules' `Point`
+ * apart. Keyed on the resolved path rather than the import edge, so a type
+ * reports the module it was DEFINED in no matter how many hops of transitive
+ * import reached it. Both strings are interned and outlive the compile. */
+typedef struct {
+  const char *path;
+  const char *module;
+} ModuleNameEntry;
+
+static ModuleNameEntry *g_module_names = NULL;
+static size_t g_module_name_count = 0;
+static size_t g_module_name_capacity = 0;
+
+static void module_name_registry_reset(void) {
+  free(g_module_names);
+  g_module_names = NULL;
+  g_module_name_count = 0;
+  g_module_name_capacity = 0;
+}
+
+/* First spelling wins: a file reached as both "std/net" and "../std/net" is
+ * one module, and picking the first keeps the answer stable within a build. */
+static void module_name_registry_record(const char *resolved_path,
+                                        const char *module_name) {
+  if (!resolved_path || !module_name) {
+    return;
+  }
+  const char *path = string_intern(resolved_path);
+  if (!path) {
+    return;
+  }
+  for (size_t i = 0; i < g_module_name_count; i++) {
+    if (g_module_names[i].path == path) {
+      return;
+    }
+  }
+  if (g_module_name_count == g_module_name_capacity) {
+    size_t next = g_module_name_capacity ? g_module_name_capacity * 2 : 32;
+    ModuleNameEntry *grown =
+        realloc(g_module_names, next * sizeof(ModuleNameEntry));
+    if (!grown) {
+      return;
+    }
+    g_module_names = grown;
+    g_module_name_capacity = next;
+  }
+  g_module_names[g_module_name_count].path = path;
+  g_module_names[g_module_name_count].module = string_intern(module_name);
+  g_module_name_count++;
+}
+
+const char *import_resolver_module_for_file(const char *resolved_path) {
+  if (!resolved_path || !g_module_names) {
+    return NULL;
+  }
+  for (size_t i = 0; i < g_module_name_count; i++) {
+    if (g_module_names[i].path == resolved_path ||
+        strcmp(g_module_names[i].path, resolved_path) == 0) {
+      return g_module_names[i].module;
+    }
+  }
+  return NULL;
+}
+
 static void import_path_cache_reset(void) {
   for (size_t i = 0; i < g_import_path_cache_count; i++) {
     free(g_import_path_cache[i].key);
@@ -3367,6 +3432,7 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
         continue;
       }
       mettle_compiler_ctx_set_current_filename(full_path);
+      module_name_registry_record(full_path, import_decl->module_name);
 
       size_t parse_error_count_before =
           ctx->reporter ? (size_t)error_reporter_get_error_count(ctx->reporter)
@@ -3836,6 +3902,7 @@ int resolve_imports_with_options(ASTNode *program, const char *base_path,
 
   /* Fresh path-resolution caches per top-level compilation. */
   import_path_cache_reset();
+  module_name_registry_reset();
   deps_walk_cache_reset();
 
   ImportContext ctx;
@@ -3896,7 +3963,10 @@ int resolve_imports_with_options(ASTNode *program, const char *base_path,
   free(ctx.active_files);
   free(ctx.import_chain);
 
-  /* Release cache memory; it is rebuilt fresh on the next top-level resolve. */
+  /* Release cache memory; it is rebuilt fresh on the next top-level resolve.
+   * The module-name registry is deliberately NOT released here: the type
+   * checker reads it after resolution to qualify type names, and it is reset
+   * at the start of the next top-level resolve instead. */
   import_path_cache_reset();
   deps_walk_cache_reset();
 

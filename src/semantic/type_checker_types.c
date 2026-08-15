@@ -92,10 +92,11 @@ Type *type_checker_parse_array_type(TypeChecker *checker,
 
   array_type->base_type = base_type;
   array_type->array_size = array_size;
-  array_type->size = base_type->size * array_size;
-  array_type->alignment = base_type->alignment;
-
-  return array_type;
+  if (!type_compute_layout(array_type)) {
+    type_destroy(array_type);
+    return NULL;
+  }
+  return type_checker_canon_type(checker, array_type);
 }
 
 int type_checker_ensure_multi_return_type(TypeChecker *checker,
@@ -203,9 +204,11 @@ Type *type_checker_parse_pointer_type(TypeChecker *checker,
     }
 
     pointer_type->base_type = current;
-    pointer_type->size = 8;
-    pointer_type->alignment = 8;
-    current = pointer_type;
+    if (!type_compute_layout(pointer_type)) {
+      type_destroy(pointer_type);
+      return NULL;
+    }
+    current = type_checker_canon_type(checker, pointer_type);
   }
 
   return current;
@@ -458,6 +461,7 @@ int type_checker_types_equal(const Type *lhs, const Type *rhs) {
 
   switch (lhs->kind) {
   case TYPE_POINTER:
+  case TYPE_SLICE:
     return type_checker_types_equal(lhs->base_type, rhs->base_type);
   case TYPE_ARRAY:
     return lhs->array_size == rhs->array_size &&
@@ -527,8 +531,7 @@ void type_checker_init_builtin_types(TypeChecker *checker) {
   checker->builtin_cstring = type_create(TYPE_POINTER, "cstring");
   if (checker->builtin_cstring) {
     checker->builtin_cstring->base_type = checker->builtin_uint8;
-    checker->builtin_cstring->size = 8;
-    checker->builtin_cstring->alignment = 8;
+    type_compute_layout(checker->builtin_cstring);
   }
 
   // Create built-in string type backed by a uint8* and length
@@ -537,22 +540,19 @@ void type_checker_init_builtin_types(TypeChecker *checker) {
     checker->builtin_string->size = 16;
     checker->builtin_string->alignment = 8;
 
-    checker->builtin_string->field_count = 2;
-    checker->builtin_string->field_names = malloc(2 * sizeof(char *));
-    checker->builtin_string->field_types = malloc(2 * sizeof(Type *));
-    checker->builtin_string->field_offsets = malloc(2 * sizeof(size_t));
-
-    checker->builtin_string->field_names[0] = strdup("chars");
-    checker->builtin_string->field_types[0] =
-        type_create(TYPE_POINTER, "uint8*");
-    checker->builtin_string->field_types[0]->base_type = checker->builtin_uint8;
-    checker->builtin_string->field_types[0]->size = 8;
-    checker->builtin_string->field_types[0]->alignment = 8;
-    checker->builtin_string->field_offsets[0] = 0;
-
-    checker->builtin_string->field_names[1] = strdup("length");
-    checker->builtin_string->field_types[1] = checker->builtin_uint64;
-    checker->builtin_string->field_offsets[1] = 8;
+    if (!type_alloc_fields(checker->builtin_string, 2)) {
+      return;
+    }
+    Type *chars = type_create(TYPE_POINTER, "uint8*");
+    if (chars) {
+      chars->base_type = checker->builtin_uint8;
+      type_compute_layout(chars);
+      chars = type_checker_canon_type(checker, chars);
+    }
+    type_set_field(checker->builtin_string, 0, "chars", chars, 0);
+    type_set_field(checker->builtin_string, 1, "length", checker->builtin_uint64,
+                   0);
+    type_compute_layout(checker->builtin_string);
   }
 
   // Create built-in void type
@@ -561,6 +561,41 @@ void type_checker_init_builtin_types(TypeChecker *checker) {
     checker->builtin_void->size = 0;
     checker->builtin_void->alignment = 1;
   }
+
+  /* Type and Field are comptime-only: size 0, no backend kind. */
+  checker->builtin_type = type_create(TYPE_TYPE, "Type");
+  if (checker->builtin_type) {
+    checker->builtin_type->size = 0;
+    checker->builtin_type->alignment = 0;
+  }
+  checker->builtin_field = type_create(TYPE_FIELD, "Field");
+  if (checker->builtin_field) {
+    checker->builtin_field->size = 0;
+    checker->builtin_field->alignment = 0;
+  }
+  checker->builtin_sequence = type_create(TYPE_SEQUENCE, "Sequence");
+  if (checker->builtin_sequence) {
+    checker->builtin_sequence->size = 0;
+    checker->builtin_sequence->alignment = 0;
+  }
+
+  type_checker_intern_type(checker, checker->builtin_int8);
+  type_checker_intern_type(checker, checker->builtin_int16);
+  type_checker_intern_type(checker, checker->builtin_int32);
+  type_checker_intern_type(checker, checker->builtin_int64);
+  type_checker_intern_type(checker, checker->builtin_uint8);
+  type_checker_intern_type(checker, checker->builtin_uint16);
+  type_checker_intern_type(checker, checker->builtin_uint32);
+  type_checker_intern_type(checker, checker->builtin_uint64);
+  type_checker_intern_type(checker, checker->builtin_bool);
+  type_checker_intern_type(checker, checker->builtin_float32);
+  type_checker_intern_type(checker, checker->builtin_float64);
+  type_checker_intern_type(checker, checker->builtin_string);
+  type_checker_intern_type(checker, checker->builtin_cstring);
+  type_checker_intern_type(checker, checker->builtin_void);
+  type_checker_intern_type(checker, checker->builtin_type);
+  type_checker_intern_type(checker, checker->builtin_field);
+  type_checker_intern_type(checker, checker->builtin_sequence);
 
   // Register 'true' and 'false' as global bool constants so user code can
   // reference them as plain identifiers without any extra keyword machinery.
@@ -615,6 +650,14 @@ Type *type_checker_get_type_by_name(TypeChecker *checker, const char *name) {
     return checker->builtin_cstring;
   if (strcmp(name, "void") == 0)
     return checker->builtin_void;
+  if (strcmp(name, "Type") == 0)
+    return checker->builtin_type;
+  if (strcmp(name, "Field") == 0)
+    return checker->builtin_field;
+  if (strcmp(name, "Kind") == 0) {
+    type_checker_register_kind_enum(checker);
+    return checker->builtin_kind;
+  }
 
   // Check for function pointer types: fn(...)->R (thin) or Fn(...)->R (closure).
   if (strncmp(name, "fn(", 3) == 0 || strncmp(name, "Fn(", 3) == 0) {
@@ -807,6 +850,11 @@ int type_checker_is_cast_valid(Type *from, Type *to) {
   if (!from || !to)
     return 0;
 
+  /* Reflection types have no runtime representation, so they cannot be
+   * cast to or from anything — including each other. */
+  if (type_is_comptime_only(from) || type_is_comptime_only(to))
+    return type_checker_types_equal(from, to);
+
   if (type_checker_types_equal(from, to))
     return 1;
 
@@ -851,6 +899,10 @@ int type_checker_is_cast_valid(Type *from, Type *to) {
 
 int type_checker_is_assignable(TypeChecker *checker, Type *dest_type,
                                Type *src_type) {
+  if (type_is_comptime_only(dest_type) || type_is_comptime_only(src_type)) {
+    return dest_type && src_type &&
+           type_checker_types_equal(dest_type, src_type);
+  }
   if (!checker || !dest_type || !src_type)
     return 0;
 
@@ -995,4 +1047,187 @@ Type *type_checker_default_integer_literal_type(TypeChecker *checker,
     return checker->builtin_int64;
   }
   return checker->builtin_uint64;
+}
+
+Type *type_checker_canon_type(TypeChecker *checker, Type *type) {
+  if (!checker || !type) {
+    return type;
+  }
+  if (type->type_table_index != UINT32_MAX) {
+    return type;
+  }
+  for (size_t i = 0; i < checker->type_table_count; i++) {
+    Type *existing = checker->type_table[i];
+    if (!existing || existing == type ||
+        !type_checker_types_equal(existing, type)) {
+      continue;
+    }
+    /* cstring and uint8* are both pointer-to-uint8 but are distinct types. */
+    if (existing->name && type->name &&
+        strcmp(existing->name, type->name) != 0) {
+      continue;
+    }
+    type_destroy(type);
+    return existing;
+  }
+  if (type_checker_intern_type(checker, type) == UINT32_MAX) {
+    return type;
+  }
+  return type;
+}
+
+uint32_t type_checker_intern_type(TypeChecker *checker, Type *type) {
+  if (!checker || !type) {
+    return UINT32_MAX;
+  }
+  if (type->type_table_index != UINT32_MAX) {
+    return type->type_table_index;
+  }
+  if (checker->type_table_count == checker->type_table_capacity) {
+    size_t next = checker->type_table_capacity
+                      ? checker->type_table_capacity * 2
+                      : 32;
+    Type **grown = realloc(checker->type_table, next * sizeof(Type *));
+    if (!grown) {
+      return UINT32_MAX;
+    }
+    checker->type_table = grown;
+    checker->type_table_capacity = next;
+  }
+  if (checker->type_table_count > UINT32_MAX) {
+    return UINT32_MAX;
+  }
+  uint32_t index = (uint32_t)checker->type_table_count;
+  checker->type_table[checker->type_table_count++] = type;
+  type->type_table_index = index;
+  return index;
+}
+
+Type *type_checker_type_from_index(const TypeChecker *checker, uint32_t index) {
+  if (!checker || index == UINT32_MAX ||
+      (size_t)index >= checker->type_table_count) {
+    return NULL;
+  }
+  return checker->type_table[index];
+}
+
+/* A type graph has cycles: `struct ArenaChunk { next: ArenaChunk* }` reaches
+ * itself through its own field. Aggregates are recorded on the way down so a
+ * cycle is walked once rather than forever. Only aggregates need recording --
+ * pointer, array, slice and function types can only cycle by passing through
+ * one. */
+typedef struct {
+  const Type **types;
+  size_t count;
+  size_t capacity;
+} TypeVisitSet;
+
+static int type_visit_set_enter(TypeVisitSet *seen, const Type *type) {
+  for (size_t i = 0; i < seen->count; i++) {
+    if (seen->types[i] == type) {
+      return 0;
+    }
+  }
+  if (seen->count == seen->capacity) {
+    size_t next = seen->capacity ? seen->capacity * 2 : 16;
+    const Type **grown = realloc(seen->types, next * sizeof(const Type *));
+    if (!grown) {
+      return 0; /* treat as already seen: stop descending rather than crash */
+    }
+    seen->types = grown;
+    seen->capacity = next;
+  }
+  seen->types[seen->count++] = type;
+  return 1;
+}
+
+static int type_contains_comptime_only_seen(const Type *type,
+                                            TypeVisitSet *seen) {
+  if (!type) {
+    return 0;
+  }
+  if (type_is_comptime_only(type)) {
+    return 1;
+  }
+  if (type->kind == TYPE_POINTER || type->kind == TYPE_ARRAY ||
+      type->kind == TYPE_SLICE) {
+    return type_contains_comptime_only_seen(type->base_type, seen);
+  }
+  if (type->kind == TYPE_FUNCTION_POINTER) {
+    if (type_contains_comptime_only_seen(type->fn_return_type, seen)) {
+      return 1;
+    }
+    for (size_t i = 0; i < type->fn_param_count; i++) {
+      if (type_contains_comptime_only_seen(type->fn_param_types[i], seen)) {
+        return 1;
+      }
+    }
+    return 0;
+  }
+  if (type->kind == TYPE_STRUCT) {
+    if (!type_visit_set_enter(seen, type)) {
+      return 0;
+    }
+    for (size_t i = 0; i < type->field_count; i++) {
+      if (type_contains_comptime_only_seen(type->field_types[i], seen)) {
+        return 1;
+      }
+    }
+  }
+  if (type->kind == TYPE_TAGGED_ENUM) {
+    if (!type_visit_set_enter(seen, type)) {
+      return 0;
+    }
+    for (size_t i = 0; i < type->tagged_variant_count; i++) {
+      if (type_contains_comptime_only_seen(type->tagged_variant_payloads[i],
+                                           seen)) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+int type_contains_comptime_only(const Type *type) {
+  TypeVisitSet seen = {NULL, 0, 0};
+  int result = type_contains_comptime_only_seen(type, &seen);
+  free(seen.types);
+  return result;
+}
+
+Type *type_checker_type_value(TypeChecker *checker, Type *referred,
+                              ASTNode *expression) {
+  if (!checker || !referred || !checker->builtin_type) {
+    return NULL;
+  }
+  uint32_t index = type_checker_intern_type(checker, referred);
+  if (index == UINT32_MAX) {
+    if (expression) {
+      type_checker_set_error_at_location(
+          checker, expression->location,
+          "Out of memory while interning type '%s'",
+          referred->name ? referred->name : "<anonymous>");
+    }
+    return NULL;
+  }
+  return checker->builtin_type;
+}
+
+Type *type_checker_field_value(TypeChecker *checker, Type *owner,
+                               uint32_t field_index, ASTNode *expression) {
+  if (!checker || !owner || !checker->builtin_field) {
+    return NULL;
+  }
+  uint32_t index = type_checker_intern_type(checker, owner);
+  if (index == UINT32_MAX) {
+    if (expression) {
+      type_checker_set_error_at_location(
+          checker, expression->location,
+          "Out of memory while interning type '%s'",
+          owner->name ? owner->name : "<anonymous>");
+    }
+    return NULL;
+  }
+  (void)field_index;
+  return checker->builtin_field;
 }

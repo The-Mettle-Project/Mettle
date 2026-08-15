@@ -1749,9 +1749,27 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
     Identifier *id = (Identifier *)expression->data;
     Symbol *symbol = type_checker_resolve_identifier(checker, id);
     if (!symbol) {
+      Type *named = id && id->name
+                        ? type_checker_get_type_by_name(checker, id->name)
+                        : NULL;
+      if (named) {
+        return type_checker_type_value(checker, named, expression);
+      }
       type_checker_report_undefined_symbol(checker, expression->location,
                                            id->name, "variable");
       return NULL;
+    }
+    if (symbol->kind == SYMBOL_STRUCT || symbol->kind == SYMBOL_ENUM) {
+      if (!symbol->type) {
+        type_checker_set_error_at_location(
+            checker, expression->location,
+            "Type '%s' has no complete definition", id->name);
+        return NULL;
+      }
+      return type_checker_type_value(checker, symbol->type, expression);
+    }
+    if (type_is_comptime_only(symbol->type)) {
+      return symbol->type;
     }
     if (checker->current_function &&
         (symbol->kind == SYMBOL_VARIABLE || symbol->kind == SYMBOL_PARAMETER) &&
@@ -1994,6 +2012,10 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
       if (!operand_type) {
         return NULL;
       }
+      if (type_checker_reject_comptime_escape(checker, unop->operand->location,
+                                              operand_type)) {
+        return NULL;
+      }
 
       const char *operand_name =
           operand_type->name ? operand_type->name : "unknown";
@@ -2022,6 +2044,10 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
       if (!operand_type) {
         return NULL;
       }
+      if (type_checker_reject_comptime_escape(checker, unop->operand->location,
+                                              operand_type)) {
+        return NULL;
+      }
       if (type_checker_is_null_pointer_constant(unop->operand)) {
         type_checker_set_error_at_location(checker, expression->location,
                                            "Null pointer dereference");
@@ -2038,6 +2064,10 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
 
     Type *operand_type = type_checker_infer_type(checker, unop->operand);
     if (!operand_type) {
+      return NULL;
+    }
+    if (type_checker_reject_comptime_escape(checker, unop->operand->location,
+                                            operand_type)) {
       return NULL;
     }
 
@@ -2085,6 +2115,24 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
             type_checker_resolve_sizeof_argument(checker, call,
                                                  expression->location);
         return sized_type ? checker->builtin_int64 : NULL;
+      }
+
+      if (strcmp(call->function_name, "offsetof") == 0) {
+        long long offset = 0;
+        if (!type_checker_eval_offsetof(checker, call, expression->location,
+                                        &offset)) {
+          return NULL;
+        }
+        return checker->builtin_int64;
+      }
+
+      if (strcmp(call->function_name, "typeof") == 0) {
+        Type *referred = type_checker_resolve_typeof_argument(
+            checker, call, expression->location);
+        if (!referred) {
+          return NULL;
+        }
+        return type_checker_type_value(checker, referred, expression);
       }
 
       if (strcmp(call->function_name, "static_assert") == 0) {
@@ -2209,6 +2257,10 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
         Type *arg_type = type_checker_infer_type(checker, call->arguments[i]);
         if (!arg_type)
           return NULL;
+        if (type_checker_reject_comptime_escape(
+                checker, call->arguments[i]->location, arg_type)) {
+          return NULL;
+        }
         Type *param_type = fp_type->fn_param_types[i];
         int is_null =
             (param_type && param_type->kind == TYPE_POINTER &&
@@ -2342,6 +2394,10 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
         // Error already set by type inference
         return NULL;
       }
+      if (type_checker_reject_comptime_escape(
+              checker, call->arguments[i]->location, arg_type)) {
+        return NULL;
+      }
 
       Type *param_type = func_symbol->data.function.parameter_types[i];
       int is_null_pointer_arg =
@@ -2472,9 +2528,18 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
         if (enum_sym && enum_sym->kind == SYMBOL_ENUM && enum_sym->type) {
           Type *enum_ty = enum_sym->type;
           if (enum_ty->kind == TYPE_ENUM) {
-            /* Plain enum variants live as global SYMBOL_CONSTANTs of the enum
-             * type. Look up the variant by its bare name and confirm it
-             * belongs to this enum. */
+            /* The type table records every plain enum's members, so resolve
+             * against that first. A user enum also publishes its variants as
+             * bare globals and is found either way; `Kind` deliberately
+             * publishes none, and is only reachable through here. */
+            for (size_t i = 0; i < enum_ty->enum_member_count; i++) {
+              if (enum_ty->enum_member_names[i] &&
+                  strcmp(enum_ty->enum_member_names[i], member->member) == 0) {
+                return enum_ty;
+              }
+            }
+            /* Fall back to the bare global for enums declared before the
+             * member table was populated. */
             Symbol *variant_sym =
                 symbol_table_lookup(checker->symbol_table, member->member);
             if (variant_sym && variant_sym->kind == SYMBOL_CONSTANT &&
@@ -2511,6 +2576,88 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
     if (object_type && object_type->kind == TYPE_POINTER &&
         object_type->base_type) {
       object_type = object_type->base_type;
+    }
+    if (object_type && object_type->kind == TYPE_TYPE) {
+      ComptimeValue owner = comptime_none();
+      if (!type_checker_eval_comptime(checker, member->object, &owner) ||
+          owner.kind != COMPTIME_TYPE_REF) {
+        type_checker_set_error_at_location(
+            checker, expression->location,
+            "field access on 'Type' requires a compile-time type value");
+        return NULL;
+      }
+      Type *referred =
+          type_checker_type_from_index(checker, owner.as.type_ref.type_index);
+      if (!referred) {
+        type_checker_set_error_at_location(
+            checker, expression->location,
+            "field access on 'Type' refers to an unknown type");
+        return NULL;
+      }
+      /* A declared field wins over a query of the same name: reflection must
+       * never shadow what the program itself wrote. */
+      int field_index = type_get_field_index(referred, member->member);
+      if (field_index >= 0) {
+        return type_checker_field_value(checker, referred,
+                                        (uint32_t)field_index, expression);
+      }
+      if (!type_checker_type_member_exists(member->member)) {
+        type_checker_set_error_at_location(
+            checker, expression->location,
+            "type '%s' has no field or query '%s'; a Type answers 'kind', "
+            "'name', 'size', 'align', 'fields', 'pointee', 'element', "
+            "and 'len'",
+            referred->name ? referred->name : "<anonymous>", member->member);
+        return NULL;
+      }
+      ComptimeValue queried = comptime_none();
+      if (!type_checker_eval_type_member(checker, owner, member->member,
+                                         &queried)) {
+        type_checker_set_error_at_location(
+            checker, expression->location,
+            "type '%s' cannot answer '.%s'",
+            referred->name ? referred->name : "<anonymous>", member->member);
+        return NULL;
+      }
+      if (strcmp(member->member, "kind") == 0) {
+        return type_checker_kind_result(checker, queried, expression);
+      }
+      return type_checker_comptime_result(checker, queried, expression);
+    }
+    if (object_type && object_type->kind == TYPE_SEQUENCE) {
+      ComptimeValue answered = comptime_none();
+      if (!type_checker_eval_comptime(checker, expression, &answered)) {
+        type_checker_set_error_at_location(
+            checker, expression->location,
+            "a compile-time sequence answers only '.len'; '%s' is not a query",
+            member->member);
+        return NULL;
+      }
+      return type_checker_comptime_result(checker, answered, expression);
+    }
+    if (object_type && object_type->kind == TYPE_FIELD) {
+      if (!type_checker_field_member_exists(member->member)) {
+        type_checker_set_error_at_location(
+            checker, expression->location,
+            "'Field' has no member '%s'; it has 'name', 'type', 'offset', and "
+            "'index'. Ask '.type' about the field's type, for example "
+            "'%s.type.size'",
+            member->member,
+            member->object && member->object->type == AST_IDENTIFIER &&
+                    member->object->data
+                ? ((Identifier *)member->object->data)->name
+                : "field");
+        return NULL;
+      }
+      ComptimeValue value = comptime_none();
+      if (!type_checker_eval_comptime(checker, expression, &value)) {
+        type_checker_set_error_at_location(
+            checker, expression->location,
+            "'.%s' needs a compile-time Field on its left", member->member);
+        return NULL;
+      }
+      return type_checker_comptime_result(checker, value,
+                                          expression);
     }
     if (object_type && (object_type->kind == TYPE_STRUCT ||
                         object_type->kind == TYPE_STRING)) {
@@ -2554,8 +2701,28 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
       return NULL;
     }
 
+    /* `typeof(T).fields[i]` is answered here, not loaded: a sequence has no
+     * storage, and the subscript has to be a compile-time constant because
+     * there is nothing to index at run time. */
+    if (array_type->kind == TYPE_SEQUENCE) {
+      ComptimeValue element = comptime_none();
+      if (!type_checker_eval_comptime(checker, expression, &element)) {
+        type_checker_set_error_at_location(
+            checker, expression->location,
+            "a compile-time sequence needs a constant index that is in range");
+        return NULL;
+      }
+      return type_checker_comptime_result(checker, element, expression);
+    }
+
     Type *index_type = type_checker_infer_type(checker, idx->index);
     if (!index_type) {
+      return NULL;
+    }
+    if (type_checker_reject_comptime_escape(checker, idx->array->location,
+                                            array_type) ||
+        type_checker_reject_comptime_escape(checker, idx->index->location,
+                                            index_type)) {
       return NULL;
     }
 
@@ -2665,10 +2832,18 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
                                          "Unknown target type for cast");
       return NULL;
     }
+    if (type_checker_reject_no_runtime_repr(checker, expression->location,
+                                            target_type)) {
+      return NULL;
+    }
 
     Type *operand_type = type_checker_infer_type(checker, cast_expr->operand);
     if (!operand_type) {
       return NULL; // Error already reported
+    }
+    if (type_checker_reject_comptime_escape(checker, cast_expr->operand->location,
+                                            operand_type)) {
+      return NULL;
     }
 
     if (!type_checker_is_cast_valid(operand_type, target_type)) {
@@ -2710,7 +2885,14 @@ int type_checker_check_expression(TypeChecker *checker, ASTNode *expression) {
 
   // Use type inference to validate the expression
   Type *expr_type = type_checker_infer_type(checker, expression);
-  return expr_type != NULL; // Error already reported if NULL
+  if (!expr_type) {
+    return 0;
+  }
+  if (type_checker_reject_comptime_escape(checker, expression->location,
+                                          expr_type)) {
+    return 0;
+  }
+  return 1;
 }
 
 // Enhanced binary expression type checking
@@ -2725,6 +2907,12 @@ Type *type_checker_check_binary_expression(TypeChecker *checker,
 
   if (!left_type || !right_type) {
     return NULL; // Error already reported
+  }
+  if (type_checker_reject_comptime_escape(checker, binop->left->location,
+                                          left_type) ||
+      type_checker_reject_comptime_escape(checker, binop->right->location,
+                                          right_type)) {
+    return NULL;
   }
 
   const char *op = binop->operator;

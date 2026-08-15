@@ -47,6 +47,29 @@ int ir_lower_call_expression(IRLoweringContext *context,
     return 0;
   }
 
+  if (strcmp(call->function_name, "typeof") == 0) {
+    if (context->type_checker && context->type_checker->builtin_type) {
+      type_checker_reject_comptime_escape(context->type_checker,
+                                          expression->location,
+                                          context->type_checker->builtin_type);
+    }
+    ir_set_error(context,
+                 "value of type 'Type' cannot escape into runtime code");
+    return 0;
+  }
+
+  if (strcmp(call->function_name, "offsetof") == 0) {
+    long long offset = 0;
+    if (!context->type_checker ||
+        !type_checker_eval_offsetof(context->type_checker, call,
+                                    expression->location, &offset)) {
+      ir_set_error(context, "Unable to lower offsetof expression");
+      return 0;
+    }
+    *out_value = ir_operand_int(offset);
+    return 1;
+  }
+
   if (strcmp(call->function_name, "sizeof") == 0) {
     if (call->argument_count != 1 || !call->arguments ||
         !call->arguments[0] || call->arguments[0]->type != AST_IDENTIFIER) {
@@ -61,6 +84,15 @@ int ir_lower_call_expression(IRLoweringContext *context,
                      : NULL;
     if (!type || type->size > (size_t)LLONG_MAX) {
       ir_set_error(context, "Unable to lower sizeof expression");
+      return 0;
+    }
+    if (type_contains_comptime_only(type)) {
+      if (context->type_checker) {
+        type_checker_reject_no_runtime_repr(context->type_checker,
+                                            expression->location, type);
+      }
+      ir_set_error(context, "type '%s' has no runtime representation",
+                   type->name ? type->name : "Type");
       return 0;
     }
 
@@ -754,6 +786,37 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
   }
 
   *out_value = ir_operand_none();
+
+  /* Type and Field are comptime-only. If one reached lowering, the type
+   * checker missed an escape; report it as a user diagnostic, never an ICE. */
+  if (expression->resolved_type &&
+      type_is_comptime_only(expression->resolved_type)) {
+    if (context->type_checker) {
+      type_checker_reject_comptime_escape(context->type_checker,
+                                          expression->location,
+                                          expression->resolved_type);
+    }
+    ir_set_error(context,
+                 "value of type '%s' cannot escape into runtime code",
+                 expression->resolved_type->name
+                     ? expression->resolved_type->name
+                     : "Type");
+    return 0;
+  }
+
+  /* A Field member read (`f.offset`) is folded to a literal by const eval, so
+   * one still shaped like a member access here means the fold was skipped and
+   * there is no storage to load from. Report it, never load garbage. */
+  if (expression->type == AST_MEMBER_ACCESS) {
+    MemberAccess *member = (MemberAccess *)expression->data;
+    if (member && member->object && member->object->resolved_type &&
+        type_is_comptime_only(member->object->resolved_type)) {
+      ir_set_error(context,
+                   "compile-time field member '%s' was not folded",
+                   member->member ? member->member : "<unknown>");
+      return 0;
+    }
+  }
 
   switch (expression->type) {
   case AST_NUMBER_LITERAL: {

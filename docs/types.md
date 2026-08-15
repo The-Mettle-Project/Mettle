@@ -13,6 +13,7 @@ The following sizes and alignments apply on x86-64. Use these when laying out st
 | `int32`, `uint32`, `float32` | 4 | 4 |
 | `int64`, `uint64`, `float64`, pointers, plain enums | 8 | 8 |
 | `string` | 16 | 8 |
+| `Type`, `Field` | none | none |
 
 Struct and array sizes are derived from their fields and element types. Pointers and plain integer-valued enums are 8 bytes. Tagged enums are sized from their tag and largest payload.
 
@@ -319,6 +320,149 @@ fn main() -> int32 {
 ```
 
 The compiler performs **monomorphization** before type checking: each unique instantiation becomes a concrete type or function. There is no runtime generics; all type parameters are resolved at compile time.
+
+Struct layout is computed in the frontend type table (declaration order,
+natural alignment, C padding rules), including byte offset and — for a
+bitfield — bit offset and width. `offsetof(Point.x)` folds that byte offset
+during const eval. Enum types record variant names and values on the same
+table. Pointers answer their pointee; arrays answer element type and length;
+slices (when present) answer element type and a runtime length.
+
+## Compile-time `Type` and `Field`
+
+Reflection values are compile-time values, not a second type system. A type name in value position is a `Type` value (a TypeRef: an index into the compiler's type table). A field of such a value is a `Field` value (a FieldRef: `{type_index, field_index}`).
+
+```mettle
+struct Point {
+  x: int32;
+  y: int32;
+}
+
+const T: Type = int32;           // or typeof(int32), or typeof(n)
+const F: Field = Point.x;        // or typeof(Point).x
+```
+
+`Type` and `Field` have **no runtime representation**. They cannot be stored in a `var`, appear as a function parameter or return type, sit in a struct field, or otherwise escape into runtime code. Bind them with `const` and use them only at compile time. `sizeof(Type)` is rejected for the same reason.
+
+`typeof` is a compile-time builtin. A type name is taken as that type; any other argument is typed as an expression and `typeof` yields that expression's type.
+
+## Reflection queries
+
+A `Type` and a `Field` are asked about themselves with ordinary member access. Every query folds during const eval, so all of them are visible to `static_assert` and none reaches the backend.
+
+| On a `Type` | Answers |
+|---|---|
+| `.kind` | a `Kind` (see below) |
+| `.name` | module-qualified name, e.g. `"std/net.Point"` |
+| `.size`, `.align` | `int64` bytes |
+| `.fields` | a compile-time sequence of `Field` |
+| `.pointee` | the pointed-to `Type` (pointers only) |
+| `.element` | the element `Type` (arrays and slices) |
+| `.len` | element count (sized arrays only) |
+
+| On a `Field` | Answers |
+|---|---|
+| `.name` | the field's own name, unqualified |
+| `.type` | the field's `Type` |
+| `.offset` | byte offset within its owner |
+| `.index` | declaration position |
+
+A `Field` answers nothing about its type directly: ask `.type` and compose, as in `f.type.size` or `f.type.kind`. A declared field always wins over a query of the same name, so a struct with a field called `size` is unaffected by the reflection surface.
+
+```mettle
+static_assert(typeof(Point).kind == Kind.Struct);
+static_assert(typeof(Point).fields.len == 2);
+static_assert(typeof(Point).fields[1].type.size == 4);
+static_assert(typeof(Point*).pointee.size == 8);
+static_assert(typeof(int32[4]).len == 4);
+```
+
+`typeof` accepts a type or an expression, including types spelled with `*` or `[N]`: `typeof(Point*)` and `typeof(n)` both work.
+
+### Names are module-qualified
+
+`.name` on a user-declared type reports the module it was **defined** in, whatever import path reached it: `std/arena.Arena`, not `arena.Arena` or a filesystem path. A type declared in the root program is qualified by its file stem. Builtins and structural types answer their own already-unambiguous spelling (`int32`, `Point*`).
+
+This is deliberate and worth understanding before the name reaches a wire format. A bare name cannot distinguish two modules that each declare `Point`, and Mettle has no compile-time string operations, so a bare name could never be turned back into a qualified one. The cost is the mirror image: a qualified name is coupled to file layout, so **moving a module renames its types**. A generator that writes these names into a wire format should pin them rather than assume `.name` is stable across a refactor.
+
+### `Kind`
+
+`.kind` answers with `Kind`, an enum the compiler registers itself, so reflection needs no import and no `--prelude`. Its variants are reachable **only** qualified — `Kind.Struct`, never a bare `Struct` — precisely so that reflection does not claim common names like `Struct`, `Array`, or `Bool` out of every program's namespace.
+
+`Kind` covers `Void`, `Bool`, `Int8`…`Int64`, `Uint8`…`Uint64`, `Float32`, `Float64`, `String`, `Pointer`, `Array`, `Slice`, `Struct`, `Enum`, `TaggedEnum`, and `FunctionPointer`. Integer and float widths stay distinct, because telling `int32` from `int64` is exactly what a wire-format generator needs. It deliberately has no `Type` or `Field` variant: those exist only at compile time, so no value you can reflect on ever has one.
+
+### Inspecting and budgeting expansion
+
+Generated code that cannot be read cannot be reviewed, so expansion is inspectable and its cost is on the record.
+
+`mettle expand <file>` prints the program as Mettle source after expansion, with each generated block carrying the same note a diagnostic raised inside it would carry:
+
+```
+// expanded from comptime-for iteration 2 (field `seq`)
+{
+    total = (((total + 4) + (4 * 100)) + 1);
+}
+```
+
+Where a node has no faithful source spelling the printer says so inline, as a marked comment, and reports on stderr that the output is not a complete program. It does not guess: a printer that silently misrepresents generated code is worse than none, because it is believed.
+
+`--report-expansion` prints what each site cost, and `--expansion-budget=N` makes that a contract -- over budget fails the build and names the site responsible:
+
+```
+comptime expansion: 2 sites, 84 nodes generated
+  packet.mettle:18:3  Packet  3 iterations, 84 nodes
+  packet.mettle:25:3  Empty   0 iterations, 0 nodes
+```
+
+A program that expands nothing reports `no sites; nothing generated`. That absence is stated rather than implied, for the same reason `Kind` is registered only on first mention: a cost you cannot confirm you avoided is one you are still paying in doubt.
+
+### Sequences
+
+`.fields` is a real compile-time value, not a special form only legal in `comptime for`. It answers `.len` and `[i]`, and nothing else — a program can observe a sequence but never hold one, and a `Sequence` has no runtime representation, exactly like `Type` and `Field`. The subscript must be a compile-time constant in range, since there is nothing to index at run time.
+
+## `comptime for`
+
+`comptime for` iterates a compile-time sequence and expands to one copy of its body per element, before any of the body is type checked:
+
+```mettle
+struct Packet {
+  kind: uint8;
+  seq: uint32;
+  payload: int64;
+}
+
+fn main() -> int32 {
+  var total: int64 = 0;
+  comptime for f in typeof(Packet).fields {
+    static_assert(f.size > 0);
+    total = total + f.offset + f.size;
+  }
+  return (int32)total;
+}
+```
+
+`comptime` is contextual, not a reserved word: only `comptime` immediately followed by `for` starts one of these, so `comptime` remains usable as an ordinary identifier. `typeof(T).fields` is the only compile-time sequence today. A type with no fields expands to nothing, which is not an error.
+
+Expansion happens **before** the body is type checked, and each copy is checked separately. That is the point of the construct rather than an implementation detail: `f.offset`, `f.size`, and `f.type` differ per iteration, so a body can be valid for one field and rejected for the next.
+
+Because the copies are checked separately, a diagnostic inside one has to say which copy it came from. Every error and warning raised while checking an expansion carries a note naming the iteration and the field, with the caret on the `comptime for` the programmer wrote:
+
+```
+error[E0003]: static_assert failed
+  --> mixed.mettle:12:18
+   |
+12 |     static_assert(f.size == 8);
+   |                  ^
+note: expanded from comptime-for iteration 1 (field `small`)
+  --> mixed.mettle:11:3
+   |
+11 |   comptime for f in typeof(Mixed).fields {
+   |   ^^^^^^^^
+```
+
+Nested expansions report the whole chain, outermost first.
+
+The binding is a `Field`, and it is scoped to its own expansion, so it cannot be seen by surrounding code and cannot shadow anything the programmer wrote. It is a compile-time value like any other `Type` or `Field`: it cannot be cast, stored, or otherwise leaked into runtime code. Generated code is checked exactly as hand-written code is, contracts included.
 
 **Constraints:** Trait bounds are supported. Declare a trait, satisfy it with `impl Trait for Type`, and constrain generic parameters with inline bounds such as `T: Name`, multiple inline bounds such as `T: Addable + SignedNumber`, or a trailing `where` clause.
 

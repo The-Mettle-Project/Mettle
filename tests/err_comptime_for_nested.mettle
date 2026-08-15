@@ -1,0 +1,16 @@
+// Nested expansions report the whole chain, outermost first, so a diagnostic
+// inside generated code names every step that produced it.
+
+struct Pair {
+  a: int8;
+  b: int32;
+}
+
+fn main() -> int32 {
+  comptime for outer in typeof(Pair).fields {
+    comptime for inner in typeof(Pair).fields {
+      static_assert(outer.type.size == inner.type.size);
+    }
+  }
+  return 0;
+}

@@ -1050,9 +1050,100 @@ static ASTNode *parser_parse_parenthesized_assignment(Parser *parser) {
   return assignment;
 }
 
+/* `comptime for <binding> in <sequence> { <body> }`.
+ *
+ * `comptime` is contextual, the same way `in` is: no token and no keyword is
+ * reserved for it, so a program that already uses `comptime` as a name keeps
+ * working. Only `comptime` immediately followed by `for` starts one of these.
+ *
+ * The binding carries no type annotation because it is bound to a `Field` by
+ * the expander, which is the one type it can ever have. The body is always
+ * braced -- an expansion is a block, and a block is what gives each iteration
+ * its own scope. */
+static ASTNode *parser_parse_comptime_for(Parser *parser) {
+  SourceLocation location = parser_current_location(parser);
+  parser_advance(parser); // consume the contextual `comptime`
+  if (!parser_expect(parser, TOKEN_FOR)) {
+    return NULL;
+  }
+
+  if (!parser_is_identifier_like(parser->current_token.type)) {
+    parser_set_error(parser,
+                     "Expected a binding name after 'comptime for'");
+    return NULL;
+  }
+  char *binding_name = strdup(parser->current_token.value);
+  if (!binding_name) {
+    return NULL;
+  }
+  parser_advance(parser);
+
+  if (parser->current_token.type == TOKEN_COLON) {
+    parser_set_error(parser,
+                     "A 'comptime for' binding is always a 'Field'; drop the "
+                     "type annotation");
+    free(binding_name);
+    return NULL;
+  }
+
+  // Contextual `in`, the same spelling the range-based `for` uses.
+  if (!parser_is_identifier_like(parser->current_token.type) ||
+      strcmp(parser->current_token.value, "in") != 0) {
+    parser_set_error(parser,
+                     "Expected 'in' after the 'comptime for' binding");
+    free(binding_name);
+    return NULL;
+  }
+  parser_advance(parser);
+
+  ASTNode *sequence = parser_parse_expression(parser);
+  if (!sequence) {
+    if (!parser->has_error) {
+      parser_set_error(parser,
+                       "Expected a compile-time sequence after 'in', for "
+                       "example 'typeof(T).fields'");
+    }
+    free(binding_name);
+    return NULL;
+  }
+
+  if (parser->current_token.type != TOKEN_LBRACE) {
+    parser_set_error(parser, "Expected '{' to open the 'comptime for' body");
+    free(binding_name);
+    ast_destroy_node(sequence);
+    return NULL;
+  }
+
+  ASTNode *body = parser_parse_block(parser);
+  if (!body) {
+    free(binding_name);
+    ast_destroy_node(sequence);
+    return NULL;
+  }
+
+  ASTNode *node =
+      ast_create_comptime_for(binding_name, sequence, body, location);
+  free(binding_name);
+  if (!node) {
+    ast_destroy_node(sequence);
+    ast_destroy_node(body);
+    return NULL;
+  }
+  return node;
+}
+
 ASTNode *parser_parse_statement(Parser *parser) {
   if (!parser)
     return NULL;
+
+  // Contextual `comptime for`: only this exact pair starts a compile-time
+  // loop, so `comptime` stays available as an ordinary identifier.
+  if (parser_is_identifier_like(parser->current_token.type) &&
+      parser->current_token.value &&
+      strcmp(parser->current_token.value, "comptime") == 0 &&
+      parser->peek_token.type == TOKEN_FOR) {
+    return parser_parse_comptime_for(parser);
+  }
 
   // Vectorization attribute on a loop: `@simd` / `@simd!`.
   //   @simd  for i in 0..n { ... }   -> best-effort hint (warn if not vectorized)
@@ -2286,7 +2377,10 @@ ASTNode *parser_parse_primary_expression(Parser *parser) {
 
   SourceLocation location = parser_current_location(parser);
 
-  if (parser_is_identifier_like(parser->current_token.type)) {
+  if (parser_is_identifier_like(parser->current_token.type) ||
+      parser_is_type_keyword(parser->current_token.type)) {
+    /* Type names (`int32`, `string`, ...) are compile-time Type values in
+     * expression position, not a parallel type-level grammar. */
     ASTNode *result =
         ast_create_identifier(parser->current_token.value, location);
     parser_advance(parser);
@@ -2768,6 +2862,48 @@ ASTNode *parser_parse_postfix_expression(Parser *parser) {
       char **argument_names = NULL;
       size_t arg_count = 0;
 
+      /* Set when typeof's argument was read as a type, so the ordinary
+       * argument parse below knows the list is already complete. */
+      int typeof_type_argument = 0;
+      /* `typeof` takes either a type or an expression, and only one of those
+       * is spelled with `*` or `[N]`. Try the type reading first and fall back
+       * to the expression parse, so `typeof(Point*)` and `typeof(n)` both
+       * work without the grammar having to tell them apart up front. */
+      if (parser_identifier_name_is(expr, "typeof") &&
+          parser->current_token.type != TOKEN_RPAREN) {
+        ParserSavedState typeof_saved = parser_save_state(parser);
+        SourceLocation type_location = parser_current_location(parser);
+        parser->error_message = NULL;
+        parser->error_reporter = NULL;
+
+        char *type_name = parser_parse_type_annotation(parser);
+        int is_type = type_name && !parser->has_error &&
+                      parser->current_token.type == TOKEN_RPAREN &&
+                      (strchr(type_name, '*') || strchr(type_name, '['));
+
+        parser->error_reporter = typeof_saved.error_reporter;
+        if (!is_type) {
+          free(type_name);
+          parser_restore_state(parser, &typeof_saved);
+          parser_discard_saved_state(&typeof_saved);
+        } else {
+          parser_discard_saved_state(&typeof_saved);
+          ASTNode *type_arg = ast_create_identifier(type_name, type_location);
+          free(type_name);
+          arguments = malloc(sizeof(ASTNode *));
+          if (!type_arg || !arguments) {
+            ast_destroy_node(type_arg);
+            free(arguments);
+            ast_destroy_node(expr);
+            parser_set_error(parser, "Out of memory parsing typeof");
+            return NULL;
+          }
+          arguments[0] = type_arg;
+          arg_count = 1;
+          typeof_type_argument = 1;
+        }
+      }
+
       if (parser_identifier_name_is(expr, "sizeof")) {
         SourceLocation type_location = parser_current_location(parser);
         if (parser->current_token.type == TOKEN_RPAREN) {
@@ -2809,7 +2945,8 @@ ASTNode *parser_parse_postfix_expression(Parser *parser) {
           ast_destroy_node(expr);
           return NULL;
         }
-      } else if (parser->current_token.type != TOKEN_RPAREN) {
+      } else if (!typeof_type_argument &&
+                 parser->current_token.type != TOKEN_RPAREN) {
         do {
           char *argument_name = NULL;
           if (compiler_named_call &&

@@ -1,0 +1,14 @@
+// Field access on a Type value folds to a comptime FieldRef.
+
+struct Point {
+  x: int32;
+  y: int32;
+}
+
+const FX: Field = Point.x;
+const FY: Field = typeof(Point).y;
+const F_VIA: Field = FX;
+
+fn main() -> int32 {
+  return 0;
+}

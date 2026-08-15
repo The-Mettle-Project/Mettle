@@ -581,6 +581,11 @@ static void populate_module_symbols(IRProgram *program, ASTNode *ast_program,
       entry.is_extern = vd->is_extern;
       entry.link_name = s ? s->link_name : NULL;
       if (s && s->kind == SYMBOL_CONSTANT) {
+        /* Type/Field reflection consts have no runtime representation and
+         * must not become module symbols. */
+        if (type_is_comptime_only(s->type)) {
+          continue;
+        }
         entry.kind = IR_MODSYM_CONSTANT;
         entry.const_value = s->data.constant.value;
         entry.type = mtlc_type_from_frontend(s->type);

@@ -258,6 +258,18 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     // reaches this local-statement path. A local `const` is an immutable local
     // variable: it gets normal storage and initialization here, and the type
     // checker rejects reassignment.
+    //
+    // Type/Field consts are the exception: they have no runtime representation,
+    // so they must not become locals even inside a function.
+    if (declaration->is_const) {
+      Type *const_type = ir_resolve_named_type(context, declaration->type_name);
+      if (!const_type && declaration->initializer) {
+        const_type = declaration->initializer->resolved_type;
+      }
+      if (type_is_comptime_only(const_type)) {
+        return 1;
+      }
+    }
 
     IRInstruction local = {0};
     Type *decl_type = ir_resolve_named_type(context, declaration->type_name);

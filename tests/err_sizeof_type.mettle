@@ -1,0 +1,5 @@
+// sizeof is not defined for Type: it has no runtime representation.
+
+fn main() -> int32 {
+  return sizeof(Type);
+}

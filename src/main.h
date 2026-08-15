@@ -85,6 +85,16 @@ typedef struct {
   const char *trace_function;
   const char *const *trace_args;
   size_t trace_arg_count;
+  /* `mettle expand <file>`: print the program as source after compile-time
+   * expansion, instead of generating code. */
+  int expand_mode;
+  /* --report-expansion: print what each `comptime for` site cost. */
+  int report_expansion;
+  /* --expansion-budget=N: fail the build if expansion generates more than N
+   * nodes. `expansion_budget_set` distinguishes "no budget" from a budget of
+   * zero, which is a meaningful thing to require. */
+  size_t expansion_budget;
+  int expansion_budget_set;
   int emit_object;
   int generate_debug_symbols;
   int generate_line_mapping;

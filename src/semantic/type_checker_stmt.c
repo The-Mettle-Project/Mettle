@@ -361,6 +361,10 @@ int type_checker_check_if_statement(TypeChecker *checker,
   if (!condition_type) {
     return 0;
   }
+  if (type_checker_reject_comptime_escape(checker, if_stmt->condition->location,
+                                          condition_type)) {
+    return 0;
+  }
 
   if (!type_checker_is_numeric_type(condition_type)) {
     type_checker_report_type_mismatch(checker, if_stmt->condition->location,
@@ -390,6 +394,12 @@ int type_checker_check_if_statement(TypeChecker *checker,
     Type *elif_cond_type =
         type_checker_infer_type(checker, if_stmt->else_ifs[i].condition);
     if (!elif_cond_type) {
+      free(init_snapshot);
+      return 0;
+    }
+    if (type_checker_reject_comptime_escape(
+            checker, if_stmt->else_ifs[i].condition->location,
+            elif_cond_type)) {
       free(init_snapshot);
       return 0;
     }
@@ -480,6 +490,13 @@ int type_checker_check_for_statement(TypeChecker *checker,
       symbol_table_exit_scope(checker->symbol_table);
       return 0;
     }
+    if (type_checker_reject_comptime_escape(checker, for_stmt->condition->location,
+                                            cond_type)) {
+      free(post_init_snapshot);
+      type_checker_init_tracker_exit_scope(checker);
+      symbol_table_exit_scope(checker->symbol_table);
+      return 0;
+    }
     if (!type_checker_is_numeric_type(cond_type)) {
       type_checker_report_type_mismatch(checker,
                                         for_stmt->condition->location,
@@ -530,6 +547,10 @@ int type_checker_check_switch_statement(TypeChecker *checker,
   Type *switch_type =
       type_checker_infer_type(checker, switch_stmt->expression);
   if (!switch_type) {
+    return 0;
+  }
+  if (type_checker_reject_comptime_escape(
+          checker, switch_stmt->expression->location, switch_type)) {
     return 0;
   }
   if (!type_checker_is_integer_type(switch_type)) {
@@ -892,7 +913,14 @@ int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
   case AST_FUNCTION_CALL: {
     // Function call as statement (no return value used)
     Type *return_type = type_checker_infer_type(checker, statement);
-    return return_type != NULL; // Error already reported if NULL
+    if (!return_type) {
+      return 0;
+    }
+    if (type_checker_reject_comptime_escape(checker, statement->location,
+                                            return_type)) {
+      return 0;
+    }
+    return 1;
   }
 
   case AST_GPU_LAUNCH:
@@ -959,6 +987,10 @@ int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
           if (!value_type) {
             return 0;
           }
+          if (type_checker_reject_comptime_escape(checker, value->location,
+                                                  value_type)) {
+            return 0;
+          }
           if (!type_checker_is_assignable(checker, expected_type,
                                           value_type)) {
             type_checker_report_type_mismatch(checker, value->location,
@@ -989,6 +1021,10 @@ int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
               checker, ret_stmt->value->location,
               "Cannot infer type of return value");
         }
+        return 0;
+      }
+      if (type_checker_reject_comptime_escape(checker, value->location,
+                                              value_type)) {
         return 0;
       }
 
@@ -1056,6 +1092,10 @@ int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
         type_checker_infer_type(checker, while_stmt->condition);
     if (!condition_type) {
       return 0; // Error already reported
+    }
+    if (type_checker_reject_comptime_escape(
+            checker, while_stmt->condition->location, condition_type)) {
+      return 0;
     }
 
     // Condition should be a numeric type (treated as boolean)
@@ -1125,15 +1165,42 @@ int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
   case AST_INLINE_ASM:
     return 1;
 
+  /* Expansion rewrites a `comptime for` where its enclosing block can see it,
+   * so one arriving here sits where a block cannot be spliced in. */
+  case AST_COMPTIME_FOR:
+    type_checker_set_error_at_location(
+        checker, statement->location,
+        "'comptime for' must be a statement in a block, not a bare branch body");
+    return 0;
+
   case AST_PROGRAM: {
     // A block of statements
     Program *block = (Program *)statement->data;
     if (block) {
+      /* Const eval rewrites the block before any of it is checked: a `comptime for`
+       * becomes one copy of its body per field, and each copy is checked
+       * against a different field type from here on. */
+      int expanded_ok = type_checker_expand_comptime_block(checker, statement);
+
+      /* If this block is itself an expansion, every diagnostic raised while
+       * checking it names the iteration that generated it. The frame is live
+       * for the whole check, nested frames included, so a `comptime for` inside a
+       * `comptime for` reports the full chain. */
+      SourceSpan expansion_origin;
+      const char *expansion_note =
+          type_checker_expansion_note(checker, statement, &expansion_origin);
+      int note_frame_pushed =
+          expansion_note && checker->error_reporter &&
+          error_reporter_push_note_frame(checker->error_reporter,
+                                         expansion_origin, expansion_note);
+
       // Enter a new nested scope
       if (!symbol_table_enter_scope(checker->symbol_table, SCOPE_BLOCK)) {
         type_checker_set_error_at_location(
             checker, statement->location,
             "Out of memory while entering block scope");
+        if (note_frame_pushed)
+          error_reporter_pop_note_frame(checker->error_reporter);
         return 0;
       }
       if (!type_checker_init_tracker_enter_scope(checker)) {
@@ -1141,13 +1208,23 @@ int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
             checker, statement->location,
             "Out of memory while entering initialization analysis scope");
         symbol_table_exit_scope(checker->symbol_table);
+        if (note_frame_pushed)
+          error_reporter_pop_note_frame(checker->error_reporter);
         return 0;
       }
 
+      /* The binding is declared in the expansion's own scope, so it cannot be
+       * seen by anything outside the body the programmer wrote. */
+      int block_ok = expanded_ok &&
+                     type_checker_declare_expansion_binding(checker, statement);
       int reached_terminator = 0;
-      int block_ok = 1;
       for (size_t i = 0; i < statement->child_count; i++) {
         ASTNode *child = statement->children[i];
+        /* A directive still standing here is one the expander refused and has
+         * already reported on. Checking it again would only cascade. */
+        if (child && child->type == AST_COMPTIME_FOR) {
+          continue;
+        }
         if (reached_terminator && checker->error_reporter && child) {
           error_reporter_add_warning(
               checker->error_reporter, ERROR_SEMANTIC, child->location,
@@ -1167,6 +1244,8 @@ int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
         type_checker_warn_unused_locals(checker);
       type_checker_init_tracker_exit_scope(checker);
       symbol_table_exit_scope(checker->symbol_table);
+      if (note_frame_pushed)
+        error_reporter_pop_note_frame(checker->error_reporter);
       if (!block_ok)
         return 0;
     }

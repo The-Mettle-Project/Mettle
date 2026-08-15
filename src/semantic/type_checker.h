@@ -1,6 +1,7 @@
 #ifndef TYPE_CHECKER_H
 #define TYPE_CHECKER_H
 
+#include <stdio.h>
 #include "error/error_reporter.h"
 #include "parser/ast.h"
 
@@ -9,6 +10,12 @@ struct SymbolTable;
 struct Type;
 struct Symbol;
 struct TrackedBufferExtent;
+/* Blocks produced by `comptime for` expansion, keyed by block. Opaque
+   here; the table and everything that reads it live in comptime_expand.c. */
+typedef struct ComptimeExpansionTable ComptimeExpansionTable;
+/* Backing store for comptime sequence values, with one memoized run per
+   (type, query). Opaque here; it lives in type_query.c. */
+typedef struct ComptimeSequenceArena ComptimeSequenceArena;
 
 #include "symbol_table.h"
 
@@ -32,6 +39,28 @@ typedef struct {
   Type *builtin_string;
   Type *builtin_cstring;
   Type *builtin_void;
+  /* Compile-time only reflection types. Type is the type of a TypeRef;
+   * Field is the type of a FieldRef. Neither has a runtime representation. */
+  Type *builtin_type;
+  Type *builtin_field;
+  Type *builtin_sequence;
+
+  /* Interned types, indexed by TypeRef.type_index / FieldRef.type_index. */
+  Type **type_table;
+  size_t type_table_count;
+  size_t type_table_capacity;
+
+  /* Created on the first `comptime for`; NULL in a program that has none. */
+  ComptimeExpansionTable *expansions;
+
+  /* `Kind`, the enum `.kind` answers with. Registered by the compiler rather
+   * than declared in a prelude, so reflection needs no import and no flag, and
+   * its variants are reachable only as `Kind.Struct` -- they are deliberately
+   * not inserted as bare globals, which would claim names like `Struct` and
+   * `Array` out of every program's namespace. */
+  Type *builtin_kind;
+  /* Created on the first sequence query; NULL in a program with none. */
+  ComptimeSequenceArena *sequences;
 
   // Generic enum template cache: uninstantiated enum AST nodes
   ASTNode **generic_enum_templates;
@@ -125,6 +154,108 @@ void type_checker_note_declared_here(TypeChecker *checker,
 void type_checker_warn_unused_locals(TypeChecker *checker);
 void type_checker_register_test_builtin(TypeChecker *checker, const char *name,
                                         size_t parameter_count);
+
+/* Intern `type` in the checker's type table and return its index. Already
+ * interned types keep their first index. Returns UINT32_MAX on failure. */
+uint32_t type_checker_intern_type(TypeChecker *checker, Type *type);
+Type *type_checker_type_from_index(const TypeChecker *checker,
+                                   uint32_t index);
+/* Intern `type` or return an already-interned structurally equal type.
+ * Duplicates are destroyed. Pointer/array/slice types go through this so
+ * the table can answer pointee/element/len from a stable TypeRef. */
+Type *type_checker_canon_type(TypeChecker *checker, Type *type);
+
+/* Replace every `comptime for` directly inside `block` with its expansions:
+ * one clone of the body per field, spliced into the block in field order.
+ * Runs before the block's statements are checked, because each expansion is
+ * checked against a different field type. Returns 0 with a diagnostic
+ * reported if a directive could not expand, leaving `block` unmodified. */
+int type_checker_expand_comptime_block(TypeChecker *checker, ASTNode *block);
+
+/* The expansion note for `block`, or NULL if `block` is ordinary source. The
+ * caller pushes it as a reporter note frame around the block's check so every
+ * diagnostic raised inside names the iteration that produced the code. */
+const char *type_checker_expansion_note(TypeChecker *checker,
+                                        const ASTNode *block,
+                                        SourceSpan *out_origin);
+
+/* Bind the `comptime for` variable in the current scope if `block` is an
+ * expansion. Call after entering the block's scope; no-op for other blocks. */
+int type_checker_declare_expansion_binding(TypeChecker *checker,
+                                           const ASTNode *block);
+
+void type_checker_expansions_destroy(ComptimeExpansionTable *table);
+
+/* What compile-time expansion cost. The ledger exists from the first
+ * metaprogram so build time can never be spent here unattributed. */
+size_t type_checker_expansion_site_count(const TypeChecker *checker);
+size_t type_checker_expansion_total_nodes(const TypeChecker *checker);
+void type_checker_report_expansion(const TypeChecker *checker, FILE *out);
+/* Fail with a located diagnostic when expansion generated more than `budget`
+ * nodes, naming the site that generated the most. */
+int type_checker_check_expansion_budget(TypeChecker *checker, size_t budget);
+
+/* Fold `offsetof(Field)` to a byte offset from the type table. */
+int type_checker_eval_offsetof(TypeChecker *checker, CallExpression *call,
+                               SourceLocation location, long long *out_offset);
+
+/* Fold a compile-time expression. Returns 0 when the expression is not one. */
+int type_checker_eval_comptime(TypeChecker *checker, ASTNode *expression,
+                               ComptimeValue *out_value);
+
+/* Reflection queries. Each folds to an ordinary compile-time value, so none of
+ * them has a runtime representation. A struct field whose name collides with a
+ * query wins: the program's own declaration is never shadowed.
+ *   Type:  kind, name, size, align, fields, pointee, element, len
+ *   Field: name, type, offset, index
+ * `name` is module-qualified for user-declared types and bare for a field. */
+int type_checker_type_member_exists(const char *member);
+int type_checker_eval_type_member(TypeChecker *checker,
+                                  ComptimeValue type_value, const char *member,
+                                  ComptimeValue *out_value);
+int type_checker_field_member_exists(const char *member);
+int type_checker_eval_field_member(TypeChecker *checker, ComptimeValue field,
+                                   const char *member,
+                                   ComptimeValue *out_value);
+/* A sequence answers `len` and `[i]`, and nothing else: observable without
+ * being a container the program can hold. */
+int type_checker_eval_sequence_member(TypeChecker *checker,
+                                      ComptimeValue sequence,
+                                      const char *member,
+                                      ComptimeValue *out_value);
+int type_checker_eval_sequence_index(ComptimeValue sequence, long long index,
+                                     ComptimeValue *out_value);
+
+/* Register `Kind` and its qualified-only variants. Call once, after the
+ * builtin types exist and the global scope is open. */
+void type_checker_register_kind_enum(TypeChecker *checker);
+/* Compute and intern `type`'s module-qualified name from the file it was
+ * declared in. No-op if already set. */
+void type_checker_set_qualified_name(TypeChecker *checker, Type *type,
+                                     const char *filename);
+/* Type a folded query answer, baking scalar answers into the AST. */
+Type *type_checker_comptime_result(TypeChecker *checker, ComptimeValue value,
+                                   ASTNode *expression);
+/* As above, but types the answer as `Kind` so it compares against Kind.X. */
+Type *type_checker_kind_result(TypeChecker *checker, ComptimeValue value,
+                               ASTNode *expression);
+void type_checker_sequences_destroy(ComptimeSequenceArena *arena);
+
+/* 1 if `type` or any nested pointer/array/function/struct payload is a
+ * comptime-only Type or Field. */
+int type_contains_comptime_only(const Type *type);
+
+/* Report that `type` (Type or Field, or a type that contains one) cannot
+ * exist at runtime. Returns 1 if a diagnostic was issued. */
+int type_checker_reject_no_runtime_repr(TypeChecker *checker,
+                                        SourceLocation location,
+                                        const Type *type);
+
+/* Report that a Type/Field value is being used as a runtime value. Returns 1
+ * if a diagnostic was issued. */
+int type_checker_reject_comptime_escape(TypeChecker *checker,
+                                        SourceLocation location,
+                                        const Type *type);
 
 // Struct type processing functions
 int type_checker_process_struct_declaration(TypeChecker *checker,

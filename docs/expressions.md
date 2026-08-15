@@ -65,7 +65,7 @@ A trailing comma is allowed in both forms. Array literals may be written across 
 
 ## Identifiers and Member Access
 
-An identifier denotes a variable, parameter, or function. Member access uses `.` for struct fields and string fields. Pointer field access uses `->`.
+An identifier denotes a variable, parameter, or function. A built-in type name (`int32`, `string`, ...) in value position is a compile-time `Type` value. Member access uses `.` for struct fields and string fields; on a `Type` value it yields a compile-time `Field`. Pointer field access uses `->`. `offsetof(Point.x)` is a compile-time integer: the byte offset of that field from the frontend type table.
 
 ```mettle
 x

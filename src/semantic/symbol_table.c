@@ -169,6 +169,7 @@ static int symbol_table_types_compatible(const Type *lhs, const Type *rhs) {
     return lhs->array_size == rhs->array_size &&
            symbol_table_types_compatible(lhs->base_type, rhs->base_type);
   case TYPE_POINTER:
+  case TYPE_SLICE:
     return symbol_table_types_compatible(lhs->base_type, rhs->base_type);
   case TYPE_STRUCT:
     if (lhs->name && rhs->name) {
@@ -436,14 +437,21 @@ Type *type_create(TypeKind kind, const char *name) {
   type->field_names = NULL;
   type->field_types = NULL;
   type->field_offsets = NULL;
+  type->field_bit_offsets = NULL;
+  type->field_bit_widths = NULL;
   type->field_count = 0;
   type->tagged_variant_names = NULL;
   type->tagged_variant_tags = NULL;
   type->tagged_variant_payloads = NULL;
   type->tagged_variant_count = 0;
+  type->enum_member_names = NULL;
+  type->enum_member_values = NULL;
+  type->enum_member_count = 0;
   type->tagged_data_offset = 0;
   type->tagged_data_size = 0;
   type->generic_template_name = NULL;
+  type->type_table_index = UINT32_MAX;
+  type->qualified_name = NULL;
 
   // Set default sizes
   switch (kind) {
@@ -496,6 +504,21 @@ void type_destroy(Type *type) {
 
     if (type->field_offsets) {
       free(type->field_offsets);
+    }
+    if (type->field_bit_offsets) {
+      free(type->field_bit_offsets);
+    }
+    if (type->field_bit_widths) {
+      free(type->field_bit_widths);
+    }
+    if (type->enum_member_names) {
+      for (size_t i = 0; i < type->enum_member_count; i++) {
+        mettle_free_string(type->enum_member_names[i]);
+      }
+      free(type->enum_member_names);
+    }
+    if (type->enum_member_values) {
+      free(type->enum_member_values);
     }
     if (type->fn_param_types) {
       free(type->fn_param_types);
@@ -669,6 +692,7 @@ Symbol *symbol_create(const char *name, SymbolKind kind, Type *type) {
   symbol->constant_is_float = 0;
   symbol->constant_integer_value = 0;
   symbol->constant_float_value = 0.0;
+  symbol->comptime_value = comptime_none();
 
   return symbol;
 }
@@ -855,54 +879,21 @@ Type *type_create_struct(const char *name, char **field_names,
     return NULL;
   }
 
-  struct_type->field_count = field_count;
-
-  // Allocate arrays for field information
-  struct_type->field_names = malloc(field_count * sizeof(char *));
-  struct_type->field_types = malloc(field_count * sizeof(Type *));
-  struct_type->field_offsets = malloc(field_count * sizeof(size_t));
-
-  if (!struct_type->field_names || !struct_type->field_types ||
-      !struct_type->field_offsets) {
+  if (!type_alloc_fields(struct_type, field_count)) {
     type_destroy(struct_type);
     return NULL;
   }
 
-  // Copy field information and calculate offsets
-  size_t current_offset = 0;
-  size_t max_alignment = 1;
-
   for (size_t i = 0; i < field_count; i++) {
-    // Copy field name
-    struct_type->field_names[i] = (char *)string_intern(field_names[i]);
-    if (!struct_type->field_names[i]) {
+    if (!type_set_field(struct_type, i, field_names[i], field_types[i], 0)) {
       type_destroy(struct_type);
       return NULL;
     }
-
-    // Reference field type (don't duplicate)
-    struct_type->field_types[i] = field_types[i];
-
-    // Calculate field alignment and offset
-    size_t field_alignment = field_types[i]->alignment;
-    if (field_alignment > max_alignment) {
-      max_alignment = field_alignment;
-    }
-
-    // Align current offset to field alignment
-    size_t padding = (field_alignment - (current_offset % field_alignment)) %
-                     field_alignment;
-    current_offset += padding;
-
-    struct_type->field_offsets[i] = current_offset;
-    current_offset += field_types[i]->size;
   }
-
-  // Calculate total struct size with final padding
-  size_t final_padding =
-      (max_alignment - (current_offset % max_alignment)) % max_alignment;
-  struct_type->size = current_offset + final_padding;
-  struct_type->alignment = max_alignment;
+  if (!type_compute_layout(struct_type)) {
+    type_destroy(struct_type);
+    return NULL;
+  }
 
   return struct_type;
 }
@@ -937,4 +928,24 @@ size_t type_get_field_offset(Type *struct_type, const char *field_name) {
   }
 
   return 0; // Field not found
+}
+
+int type_is_comptime_only(const Type *type) {
+  return type && (type->kind == TYPE_TYPE || type->kind == TYPE_FIELD ||
+                  type->kind == TYPE_SEQUENCE);
+}
+
+int type_get_field_index(const Type *struct_type, const char *field_name) {
+  if (!struct_type ||
+      (struct_type->kind != TYPE_STRUCT && struct_type->kind != TYPE_STRING) ||
+      !field_name) {
+    return -1;
+  }
+
+  for (size_t i = 0; i < struct_type->field_count; i++) {
+    if (symbol_table_names_equal(struct_type->field_names[i], field_name)) {
+      return (int)i;
+    }
+  }
+  return -1;
 }

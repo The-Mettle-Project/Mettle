@@ -1,0 +1,14 @@
+// `.fields` is the only compile-time sequence, and the message says so rather
+// than reporting that something unspecified went wrong.
+
+struct Point {
+  x: int32;
+  y: int32;
+}
+
+fn main() -> int32 {
+  comptime for f in typeof(Point).members {
+    static_assert(f.type.size > 0);
+  }
+  return 0;
+}

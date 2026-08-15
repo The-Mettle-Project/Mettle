@@ -124,6 +124,14 @@ static MtlcTypeKind translate_kind(TypeKind kind) {
     return MTLC_TYPE_TAGGED_ENUM;
   case TYPE_VOID:
     return MTLC_TYPE_VOID;
+  case TYPE_SLICE:
+    /* Frontend slice descriptor; backend sees the 16-byte {ptr,len} image
+     * via the frontend-computed size, not a distinct MtlcTypeKind. */
+    return MTLC_TYPE_STRUCT;
+  case TYPE_TYPE:
+  case TYPE_FIELD:
+    /* Frontend-only; these have no backend representation. */
+    return MTLC_TYPE_VOID;
   }
   return MTLC_TYPE_VOID;
 }

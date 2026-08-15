@@ -1,0 +1,12 @@
+// Indexing a sequence out of range is a compile-time error: there is nothing
+// to read at run time, so the subscript must be a constant that is in bounds.
+
+struct Point {
+  x: int32;
+  y: int32;
+}
+
+fn main() -> int32 {
+  static_assert(typeof(Point).fields[7].offset == 0);
+  return 0;
+}

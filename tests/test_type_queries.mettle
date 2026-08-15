@@ -1,0 +1,53 @@
+// The reflection query surface. Every one of these folds during const eval, so
+// static_assert can see all of them and none reaches the backend.
+
+struct Point {
+  x: int32;
+  y: int32;
+}
+
+enum Color {
+  Red,
+  Green
+}
+
+// Shape: kind, size, align.
+static_assert(typeof(Point).kind == Kind.Struct);
+static_assert(typeof(int32).kind == Kind.Int32);
+static_assert(typeof(float64).kind == Kind.Float64);
+static_assert(typeof(bool).kind == Kind.Bool);
+static_assert(typeof(Color).kind == Kind.Enum);
+static_assert(typeof(Point).size == 8);
+static_assert(typeof(Point).align == 4);
+static_assert(typeof(int64).align == 8);
+
+// Sequences answer len and index.
+static_assert(typeof(Point).fields.len == 2);
+static_assert(typeof(Point).fields[0].offset == 0);
+static_assert(typeof(Point).fields[1].offset == 4);
+static_assert(typeof(Point).fields[1].index == 1);
+static_assert(typeof(Point).fields[1].type.size == 4);
+static_assert(typeof(Point).fields[0].type.kind == Kind.Int32);
+
+// Structural queries. A pointer answers its pointee, an array its element and
+// length; the type table hands back the same interned type either way.
+static_assert(typeof(Point*).kind == Kind.Pointer);
+static_assert(typeof(Point*).pointee.size == 8);
+static_assert(typeof(Point*).pointee.kind == Kind.Struct);
+static_assert(typeof(int32[4]).kind == Kind.Array);
+static_assert(typeof(int32[4]).len == 4);
+static_assert(typeof(int32[4]).element.size == 4);
+static_assert(typeof(int32[4]).size == 16);
+
+// A declared field always wins over a query of the same name.
+struct Shadow {
+  size: int64;
+  name: int32;
+}
+static_assert(offsetof(Shadow.size) == 0);
+static_assert(offsetof(Shadow.name) == 8);
+static_assert(typeof(Shadow).fields[0].offset == 0);
+
+fn main() -> int32 {
+  return 0;
+}

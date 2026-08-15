@@ -68,7 +68,12 @@ static const ErrorCodeDoc DOCS[] = {
      "Fixes:\n"
      "  - change the declared type to match the value, or the value to\n"
      "    match the type\n"
-     "  - for numeric conversions, cast explicitly: (int32)value\n"},
+     "  - for numeric conversions, cast explicitly: (int32)value\n"
+     "\n"
+     "`Type` and `Field` are compile-time reflection values (a TypeRef is\n"
+     "a type-table index; a FieldRef is {type_index, field_index}). They\n"
+     "have no runtime representation and cannot escape into runtime code.\n"
+     "Bind them with `const` and keep them at compile time.\n"},
     {"E0005", "Scope error",
      "A name was used outside the region where it is visible. Variables\n"
      "live from their declaration to the end of the enclosing block.\n"

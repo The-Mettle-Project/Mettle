@@ -1,0 +1,14 @@
+// A Field answers name/type/offset/index. Anything about the field's type is
+// asked of `.type`, so `.size` is not a Field query.
+
+struct Point {
+  x: int32;
+  y: int32;
+}
+
+fn main() -> int32 {
+  comptime for f in typeof(Point).fields {
+    static_assert(f.size == 4);
+  }
+  return 0;
+}

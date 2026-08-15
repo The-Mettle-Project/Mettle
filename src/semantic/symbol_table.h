@@ -2,7 +2,9 @@
 #define SYMBOL_TABLE_H
 
 #include "mtlc/memory.h"
+#include "comptime_value.h"
 #include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 
 typedef enum {
@@ -21,10 +23,18 @@ typedef enum {
   TYPE_FUNCTION_POINTER,
   TYPE_POINTER,
   TYPE_ARRAY,
+  TYPE_SLICE, /* fat pointer {ptr, len}; element is base_type, length is runtime */
   TYPE_STRUCT,
   TYPE_ENUM,
   TYPE_TAGGED_ENUM,
-  TYPE_VOID
+  TYPE_VOID,
+  /* Compile-time only. A TypeRef / FieldRef value has this type. There is no
+   * matching MtlcTypeKind: these never reach the backend. */
+  TYPE_TYPE,
+  TYPE_FIELD,
+  /* A `.fields`-style comptime sequence. Answers `len` and `[i]`; a program
+   * can observe one but never hold one. */
+  TYPE_SEQUENCE
 } TypeKind;
 
 typedef struct Type {
@@ -42,22 +52,44 @@ typedef struct Type {
   // record whose field 0 is the code pointer and remaining fields are captures.
   struct Type *closure_env;
 
-  // Struct-specific fields
-  char **field_names;        // For structs - field names
-  struct Type **field_types; // For structs - field types
-  size_t *field_offsets;     // For structs - field memory offsets
-  size_t field_count;        // For structs - number of fields
+  // Struct-specific fields. Names are interned and live for the compile;
+  // do not strdup them. Layout (byte/bit offsets) is computed in the frontend
+  // by type_compute_layout so const eval can read it.
+  char **field_names;
+  struct Type **field_types;
+  size_t *field_offsets;
+  uint32_t *field_bit_offsets; /* bit position within the storage unit */
+  uint32_t *field_bit_widths;  /* 0 = whole field, not a bitfield */
+  size_t field_count;
 
   // Tagged enum variant info (TYPE_TAGGED_ENUM only)
   char **tagged_variant_names;
   int *tagged_variant_tags;              // discriminant value per variant
   struct Type **tagged_variant_payloads; // payload type per variant (NULL = none)
   size_t tagged_variant_count;
+
+  // Plain TYPE_ENUM members (interned names + integer values). Tagged enums
+  // keep their own arrays above; type_enum_variant_at reads the right one.
+  char **enum_member_names;
+  long long *enum_member_values;
+  size_t enum_member_count;
   size_t tagged_data_offset;   // byte offset of the data union inside the struct
   size_t tagged_data_size;     // size of the data union
 
   // Template info: for un-instantiated generic enum templates
   char *generic_template_name; // base name e.g. "Option" (NULL if not generic)
+
+  /* Index in the type checker's type table once interned. UINT32_MAX means
+   * the type has not been interned yet. TypeRef stores this index. */
+  uint32_t type_table_index;
+
+  /* Module-qualified spelling for a user-declared type, e.g. "std/net.Point",
+   * interned. This is what reflection's `.name` reports, because a bare name
+   * cannot distinguish two modules that both declare `Point` and there are no
+   * compile-time string operations to recover the module from. NULL for
+   * builtins and for structural types (pointers, arrays), whose `name` is
+   * already unambiguous. */
+  char *qualified_name;
 } Type;
 
 typedef enum { SCOPE_GLOBAL, SCOPE_FUNCTION, SCOPE_BLOCK } ScopeType;
@@ -121,6 +153,9 @@ typedef struct Symbol {
   int constant_is_float;
   long long constant_integer_value;
   double constant_float_value;
+  /* Folded compile-time value, including TypeRef / FieldRef. Numeric consts
+   * also keep the fields above so existing integer/float folders stay simple. */
+  ComptimeValue comptime_value;
   union {
     struct {
       int register_id;
@@ -190,5 +225,49 @@ Type *type_create_struct(const char *name, char **field_names,
                          Type **field_types, size_t field_count);
 Type *type_get_field_type(Type *struct_type, const char *field_name);
 size_t type_get_field_offset(Type *struct_type, const char *field_name);
+int type_get_field_index(const Type *struct_type, const char *field_name);
+
+/* One ordered struct (or string) field, as the type table answers it. */
+typedef struct TypeField {
+  const char *name; /* interned */
+  struct Type *type;
+  size_t byte_offset;
+  uint32_t bit_offset;
+  uint32_t bit_width; /* 0 = not a bitfield */
+} TypeField;
+
+typedef struct TypeEnumVariant {
+  const char *name; /* interned */
+  long long value;
+  struct Type *payload; /* NULL if the variant carries no payload */
+} TypeEnumVariant;
+
+int type_alloc_fields(Type *type, size_t field_count);
+int type_set_field(Type *type, size_t index, const char *name,
+                   Type *field_type, uint32_t bit_width);
+int type_compute_layout(Type *type);
+
+size_t type_field_count(const Type *type);
+int type_field_at(const Type *type, size_t index, TypeField *out);
+int type_field_by_name(const Type *type, const char *name, TypeField *out);
+
+int type_alloc_enum_members(Type *type, size_t count);
+int type_set_enum_member(Type *type, size_t index, const char *name,
+                         long long value);
+size_t type_enum_variant_count(const Type *type);
+int type_enum_variant_at(const Type *type, size_t index,
+                         TypeEnumVariant *out);
+
+/* Pointer -> pointee. Array/slice -> element. */
+Type *type_pointee(const Type *type);
+Type *type_element(const Type *type);
+/* Array: static length. Slice: 0 (length is runtime). Others: 0. */
+size_t type_len(const Type *type);
+int type_has_static_len(const Type *type);
+
+/* 1 if `type` is Type or Field: a comptime-only reflection type with no
+ * machine layout. Pointers, arrays, and other wrappers are not themselves
+ * comptime-only; use type_contains_comptime_only in the type checker. */
+int type_is_comptime_only(const Type *type);
 
 #endif // SYMBOL_TABLE_H

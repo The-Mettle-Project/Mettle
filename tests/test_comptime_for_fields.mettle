@@ -1,0 +1,36 @@
+// `comptime for` expands to one copy of its body per field, before the body is
+// type checked. Each copy folds a different offset, size, and index.
+//
+// A Field answers name/type/offset/index; anything about the field's TYPE is
+// asked of `.type`, so a width query composes as `f.type.size`.
+
+struct Packet {
+  kind: uint8;
+  seq: uint32;
+  payload: int64;
+}
+
+struct Empty {
+}
+
+fn main() -> int32 {
+  var total: int64 = 0;
+  comptime for f in typeof(Packet).fields {
+    static_assert(f.type.size > 0);
+    static_assert(f.type.kind != Kind.Struct);
+    total = total + f.offset + f.type.size * 100 + f.index;
+  }
+
+  // A type with no fields expands to nothing, which is an answer, not an error.
+  comptime for f in typeof(Empty).fields {
+    total = total + 9999;
+  }
+
+  // kind:    offset 0, size 1 -> 0 + 100 + 0 = 100
+  // seq:     offset 4, size 4 -> 4 + 400 + 1 = 405
+  // payload: offset 8, size 8 -> 8 + 800 + 2 = 810
+  if (total != 1315) {
+    return 1;
+  }
+  return 0;
+}

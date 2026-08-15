@@ -1,0 +1,9 @@
+// Type has no runtime representation, so it cannot be a return type.
+
+fn gives() -> Type {
+  return int32;
+}
+
+fn main() -> int32 {
+  return 0;
+}

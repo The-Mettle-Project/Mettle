@@ -72,6 +72,22 @@ Type *type_checker_resolve_sizeof_argument(TypeChecker *checker,
                                                   CallExpression *call,
                                                   SourceLocation location);
 
+Type *type_checker_resolve_typeof_argument(TypeChecker *checker,
+                                           CallExpression *call,
+                                           SourceLocation location);
+
+int type_checker_eval_offsetof(TypeChecker *checker, CallExpression *call,
+                               SourceLocation location, long long *out_offset);
+
+int type_checker_eval_comptime(TypeChecker *checker, ASTNode *expression,
+                               ComptimeValue *out_value);
+
+Type *type_checker_type_value(TypeChecker *checker, Type *referred,
+                              ASTNode *expression);
+
+Type *type_checker_field_value(TypeChecker *checker, Type *owner,
+                               uint32_t field_index, ASTNode *expression);
+
 int type_checker_validate_static_assert(TypeChecker *checker,
                                                CallExpression *call,
                                                SourceLocation location);

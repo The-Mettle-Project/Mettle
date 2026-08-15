@@ -455,7 +455,7 @@ string literal, `import_str`, binary, unary, member access, index, call,
 function-pointer call, `new`, cast, lambda, closure-adapt, and match
 expression. Note what is **absent**: no ternary, no struct literal, no array
 literal, no block expression, no `if` expression, no range expression outside
-`for`, no slices, no `typeof`/`alignof`/`offsetof`, no string interpolation, no
+`for`, no source-level slices, no `alignof`, no string interpolation, no
 operator overloading.
 
 ### Precedence, as implemented
@@ -510,7 +510,10 @@ var i: int64 = (int64)f;
 ```
 
 `sizeof` is not a keyword; it is an identifier special-cased by the postfix-call
-parser, and its argument is parsed as a type annotation.
+parser, and its argument is parsed as a type annotation. `typeof` is the same
+kind of builtin: it yields a compile-time `Type` value (a TypeRef) and has no
+runtime representation. `Type` and `Field` cannot escape into runtime code. `offsetof` takes a
+compile-time `Field` and folds the frontend type-table byte offset.
 
 ### Lambdas and closures
 

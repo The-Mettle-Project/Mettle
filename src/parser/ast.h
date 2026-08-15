@@ -52,7 +52,10 @@ typedef enum {
   AST_LAMBDA_EXPRESSION,
   AST_CLOSURE_ADAPT_EXPRESSION,
   AST_BARRIER_STATEMENT,
-  AST_AGGREGATE_LITERAL
+  AST_AGGREGATE_LITERAL,
+  /* `comptime for f in typeof(T).fields { ... }`. Replaced by its expansions
+   * during const eval, so no pass after the expander ever sees one. */
+  AST_COMPTIME_FOR
 } ASTNodeType;
 
 /* SourceLocation moved to ../source_location.h so the backend IR can share it
@@ -463,6 +466,20 @@ typedef struct {
   int unroll_factor; // `@unroll(n)` requested on this loop; 0 if absent
 } ForStatement;
 
+/* `comptime for <binding> in <sequence> { <body> }`.
+ *
+ * The sequence is a compile-time expression, not a runtime one: today the only
+ * form is `<type-expression>.fields`. The expander evaluates it, clones the
+ * body once per element, and splices the clones into the enclosing block. */
+typedef struct {
+  char *binding_name;
+  ASTNode *sequence;
+  ASTNode *body; // AST_PROGRAM block
+  /* Span of the `comptime for` keyword itself, so an expansion note points at
+   * the line the programmer wrote rather than at generated code. */
+  SourceLocation keyword_location;
+} ComptimeForStatement;
+
 typedef struct {
   ASTNode *value;
   ASTNode *value_high; // non-NULL for a range case `lo..hi`; `value` holds lo
@@ -583,6 +600,13 @@ ASTNode *ast_create_closure_adapt(ASTNode *inner, const char *ctor_name,
 ASTNode *ast_create_for_statement(ASTNode *initializer, ASTNode *condition,
                                   ASTNode *increment, ASTNode *body,
                                   SourceLocation location);
+/* Takes ownership of `sequence` and `body`; copies `binding_name`. */
+ASTNode *ast_create_comptime_for(const char *binding_name, ASTNode *sequence,
+                                 ASTNode *body, SourceLocation location);
+/* Replace a member access with the integer const eval folded it to. */
+int ast_fold_member_access_to_int(ASTNode *node, long long value);
+/* Same, for a query that folded to a string (`.name`). */
+int ast_fold_member_access_to_string(ASTNode *node, const char *value);
 ASTNode *ast_create_case_clause(ASTNode *value, ASTNode *body, int is_default,
                                 SourceLocation location);
 ASTNode *ast_create_switch_statement(ASTNode *expression, ASTNode **cases,

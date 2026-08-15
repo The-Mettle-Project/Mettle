@@ -1,0 +1,15 @@
+// The binding is a compile-time Field. Generated code gets exactly the trust
+// hand-written code gets, so it cannot smuggle one into a runtime value.
+
+struct Point {
+  x: int32;
+  y: int32;
+}
+
+fn main() -> int32 {
+  var leaked: int64 = 0;
+  comptime for f in typeof(Point).fields {
+    leaked = leaked + (int64)f;
+  }
+  return (int32)leaked;
+}

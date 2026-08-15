@@ -1,0 +1,5 @@
+// A Type value cannot escape into runtime code as a return value.
+
+fn main() -> int32 {
+  return int32;
+}

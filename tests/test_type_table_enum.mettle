@@ -1,0 +1,16 @@
+// Plain enum members are recorded on the type table (name + value) so
+// const eval can see them the same way it sees a folded integer const.
+
+enum Color {
+  Red = 1,
+  Green,
+  Blue = 10
+}
+
+static_assert(Red == 1);
+static_assert(Green == 2);
+static_assert(Blue == 10);
+
+fn main() -> int32 {
+  return (int32)(Red + Green + Blue);
+}

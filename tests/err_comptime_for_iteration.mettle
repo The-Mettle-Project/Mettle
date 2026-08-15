@@ -1,0 +1,15 @@
+// A body can be valid for one field and invalid for the next, which is why
+// each expansion is type checked separately. The diagnostic must name the
+// iteration that failed, not just the line the programmer wrote once.
+
+struct Mixed {
+  small: int8;
+  wide: int64;
+}
+
+fn main() -> int32 {
+  comptime for f in typeof(Mixed).fields {
+    static_assert(f.type.size == 8);
+  }
+  return 0;
+}

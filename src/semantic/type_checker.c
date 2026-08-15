@@ -1,4 +1,4 @@
-// Type checker: lifecycle, function-signature registration, program driver.
+﻿// Type checker: lifecycle, function-signature registration, program driver.
 #include "type_checker_internal.h"
 
 Symbol *type_checker_resolve_identifier(TypeChecker *checker,
@@ -10,6 +10,14 @@ Symbol *type_checker_resolve_identifier(TypeChecker *checker,
 
   Symbol *symbol =
       symbol_table_lookup(checker->symbol_table, identifier->name);
+  /* `Kind` is registered on first mention rather than at startup, so a program
+   * that never reflects allocates none of its type and interns none of its
+   * member names -- and --report-expansion can say so rather than ask you to
+   * assume it. */
+  if (!symbol && strcmp(identifier->name, "Kind") == 0) {
+    type_checker_register_kind_enum(checker);
+    symbol = symbol_table_lookup(checker->symbol_table, identifier->name);
+  }
   if (symbol && symbol->scope) {
     identifier->scope_id = symbol->scope->scope_id;
   }
@@ -62,6 +70,15 @@ type_checker_create_with_error_reporter(SymbolTable *symbol_table,
   checker->builtin_string = NULL;
   checker->builtin_cstring = NULL;
   checker->builtin_void = NULL;
+  checker->builtin_type = NULL;
+  checker->builtin_field = NULL;
+  checker->builtin_sequence = NULL;
+  checker->type_table = NULL;
+  checker->type_table_count = 0;
+  checker->type_table_capacity = 0;
+  checker->expansions = NULL;
+  checker->builtin_kind = NULL;
+  checker->sequences = NULL;
   checker->generic_enum_templates = NULL;
   checker->generic_enum_template_count = 0;
 
@@ -133,6 +150,12 @@ void type_checker_destroy(TypeChecker *checker) {
     type_destroy(checker->builtin_string);
     type_destroy(checker->builtin_cstring);
     type_destroy(checker->builtin_void);
+    type_destroy(checker->builtin_type);
+    type_destroy(checker->builtin_field);
+    type_destroy(checker->builtin_sequence);
+    free(checker->type_table);
+    type_checker_expansions_destroy(checker->expansions);
+    type_checker_sequences_destroy(checker->sequences);
     free(checker->generic_enum_templates);
 
     for (size_t i = 0; i < checker->tracked_var_count; i++) {

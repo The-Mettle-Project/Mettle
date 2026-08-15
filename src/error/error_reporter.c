@@ -163,6 +163,10 @@ ErrorReporter *error_reporter_create(const char *filename,
   reporter->current_filename = reporter->filename;
   reporter->current_source_code = reporter->source_code;
   reporter->last_add_suppressed = 0;
+  reporter->note_frames = NULL;
+  reporter->note_frame_count = 0;
+  reporter->note_frame_capacity = 0;
+  reporter->emitting_note_frames = 0;
   error_reporter_register_source(reporter, filename, source_code);
 
   return reporter;
@@ -200,6 +204,10 @@ void error_reporter_destroy(ErrorReporter *reporter) {
     free(reporter->sources[i].filename);
     free(reporter->sources[i].source_code);
   }
+  for (size_t i = 0; i < reporter->note_frame_count; i++) {
+    free(reporter->note_frames[i].message);
+  }
+  free(reporter->note_frames);
   free(reporter->sources);
   free(reporter->errors);
   free((char *)reporter->filename);
@@ -399,6 +407,72 @@ static void error_reporter_add_report(ErrorReporter *reporter,
   error->code_override = NULL;
 
   reporter->count++;
+
+  /* Attribute the diagnostic to the expansion that produced it, now, while the
+     chain that produced it is still live. Notes are emitted outermost first so
+     the reader walks in from the code they wrote. */
+  if (reporter->note_frame_count > 0 && !reporter->emitting_note_frames &&
+      (severity == DIAG_SEVERITY_ERROR || severity == DIAG_SEVERITY_WARNING)) {
+    reporter->emitting_note_frames = 1;
+    for (size_t i = 0; i < reporter->note_frame_count; i++) {
+      const ErrorNoteFrame *frame = &reporter->note_frames[i];
+      if (!frame->message)
+        continue;
+      error_reporter_add_report(reporter, DIAG_SEVERITY_NOTE_OF, frame->span,
+                                ERROR_SEMANTIC, frame->message, NULL);
+    }
+    reporter->emitting_note_frames = 0;
+    reporter->last_add_suppressed = 0;
+  }
+}
+
+/* The most recent diagnostic that is not one of its own attached notes. The
+   `_last` helpers below refine a diagnostic, so they have to skip past any
+   notes an expansion frame appended after it. */
+static ErrorReport *error_reporter_last_primary(ErrorReporter *reporter) {
+  for (size_t i = reporter->count; i > 0; i--) {
+    ErrorReport *candidate = &reporter->errors[i - 1];
+    if (candidate->severity != DIAG_SEVERITY_NOTE_OF)
+      return candidate;
+  }
+  return NULL;
+}
+
+int error_reporter_push_note_frame(ErrorReporter *reporter, SourceSpan span,
+                                   const char *message) {
+  if (!reporter || !message)
+    return 0;
+  if (reporter->note_frame_count == reporter->note_frame_capacity) {
+    size_t next =
+        reporter->note_frame_capacity ? reporter->note_frame_capacity * 2 : 4;
+    ErrorNoteFrame *grown =
+        realloc(reporter->note_frames, next * sizeof(ErrorNoteFrame));
+    if (!grown)
+      return 0;
+    reporter->note_frames = grown;
+    reporter->note_frame_capacity = next;
+  }
+  char *copy = mettle_strdup(message);
+  if (!copy)
+    return 0;
+  if (span.length == 0)
+    span.length = 1;
+  reporter->note_frames[reporter->note_frame_count].span = span;
+  reporter->note_frames[reporter->note_frame_count].message = copy;
+  reporter->note_frame_count++;
+  return 1;
+}
+
+void error_reporter_pop_note_frame(ErrorReporter *reporter) {
+  if (!reporter || reporter->note_frame_count == 0)
+    return;
+  reporter->note_frame_count--;
+  free(reporter->note_frames[reporter->note_frame_count].message);
+  reporter->note_frames[reporter->note_frame_count].message = NULL;
+}
+
+size_t error_reporter_note_frame_depth(const ErrorReporter *reporter) {
+  return reporter ? reporter->note_frame_count : 0;
 }
 
 static int er_ident_char(char c) {
@@ -443,8 +517,8 @@ void error_reporter_refine_last(ErrorReporter *reporter, const char *message) {
   if (!reporter || !message || reporter->count == 0 ||
       reporter->last_add_suppressed)
     return;
-  ErrorReport *last = &reporter->errors[reporter->count - 1];
-  if (last->severity != DIAG_SEVERITY_ERROR)
+  ErrorReport *last = error_reporter_last_primary(reporter);
+  if (!last || last->severity != DIAG_SEVERITY_ERROR)
     return;
   char *copy = mettle_strdup(message);
   if (!copy)
@@ -457,7 +531,9 @@ void error_reporter_set_last_label(ErrorReporter *reporter, const char *label) {
   if (!reporter || !label || reporter->count == 0 ||
       reporter->last_add_suppressed)
     return;
-  ErrorReport *last = &reporter->errors[reporter->count - 1];
+  ErrorReport *last = error_reporter_last_primary(reporter);
+  if (!last)
+    return;
   free(last->span_label);
   last->span_label = mettle_strdup(label);
 }
@@ -466,7 +542,9 @@ void error_reporter_set_last_code(ErrorReporter *reporter, const char *code) {
   if (!reporter || !code || reporter->count == 0 ||
       reporter->last_add_suppressed)
     return;
-  ErrorReport *last = &reporter->errors[reporter->count - 1];
+  ErrorReport *last = error_reporter_last_primary(reporter);
+  if (!last)
+    return;
   free(last->code_override);
   last->code_override = mettle_strdup(code);
 }

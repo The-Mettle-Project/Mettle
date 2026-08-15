@@ -1,0 +1,6 @@
+// A pointer to Type still has no runtime representation.
+
+fn main() -> int32 {
+  var p: Type*;
+  return 0;
+}

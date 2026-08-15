@@ -762,6 +762,24 @@ ASTNode *ast_clone_node(ASTNode *node) {
     clone->data = dst;
     break;
   }
+  case AST_COMPTIME_FOR: {
+    ComptimeForStatement *src = (ComptimeForStatement *)node->data;
+    ComptimeForStatement *dst = malloc(sizeof(ComptimeForStatement));
+    if (!dst) {
+      free(clone);
+      return NULL;
+    }
+    dst->binding_name = ast_intern_string(src->binding_name);
+    dst->sequence = src->sequence ? ast_clone_node(src->sequence) : NULL;
+    dst->body = src->body ? ast_clone_node(src->body) : NULL;
+    dst->keyword_location = src->keyword_location;
+    if (dst->sequence)
+      ast_add_child(clone, dst->sequence);
+    if (dst->body)
+      ast_add_child(clone, dst->body);
+    clone->data = dst;
+    break;
+  }
   case AST_SWITCH_STATEMENT: {
     SwitchStatement *src = (SwitchStatement *)node->data;
     SwitchStatement *dst = malloc(sizeof(SwitchStatement));
@@ -1269,6 +1287,15 @@ void ast_destroy_node(ASTNode *node) {
     CaseClause *case_clause = (CaseClause *)node->data;
     if (case_clause) {
       free(case_clause);
+    }
+    break;
+  }
+  case AST_COMPTIME_FOR: {
+    ComptimeForStatement *comptime_for = (ComptimeForStatement *)node->data;
+    if (comptime_for) {
+      /* `sequence` and `body` are children; the child walk frees them. */
+      ast_free_string(comptime_for->binding_name);
+      free(comptime_for);
     }
     break;
   }
@@ -2338,6 +2365,109 @@ ASTNode *ast_create_for_statement(ASTNode *initializer, ASTNode *condition,
     ast_add_child(node, condition);
   if (increment)
     ast_add_child(node, increment);
+  if (body)
+    ast_add_child(node, body);
+
+  return node;
+}
+
+/* Collapse a member access in place into an integer literal, keeping the
+ * node's address and location. Const eval uses this to bake a compile-time
+ * answer into the tree at the point it is known: a `comptime for` binding is
+ * only in scope while its expansion is checked, so no later pass could work
+ * the value out again. The node pointer is kept because parents hold it. */
+int ast_fold_member_access_to_int(ASTNode *node, long long value) {
+  if (!node || (node->type != AST_MEMBER_ACCESS &&
+                node->type != AST_INDEX_EXPRESSION)) {
+    return 0;
+  }
+  NumberLiteral *literal = malloc(sizeof(NumberLiteral));
+  if (!literal) {
+    return 0;
+  }
+  literal->int_value = value;
+  literal->is_float = 0;
+  literal->int_radix = 10;
+
+  for (size_t i = 0; i < node->child_count; i++) {
+    ast_destroy_node(node->children[i]);
+  }
+  free(node->children);
+  node->children = NULL;
+  node->child_count = 0;
+
+  if (node->type == AST_MEMBER_ACCESS) {
+    MemberAccess *member_access = (MemberAccess *)node->data;
+    if (member_access) {
+      ast_free_string(member_access->member);
+      free(member_access);
+    }
+  } else {
+    free(node->data);
+  }
+  node->type = AST_NUMBER_LITERAL;
+  node->data = literal;
+  return 1;
+}
+
+/* Same shape as the integer fold above, for `.name`. The string is interned by
+ * the caller, so the literal borrows it and the node owns nothing new. */
+int ast_fold_member_access_to_string(ASTNode *node, const char *value) {
+  if (!node || !value || (node->type != AST_MEMBER_ACCESS &&
+                          node->type != AST_INDEX_EXPRESSION)) {
+    return 0;
+  }
+  StringLiteral *literal = malloc(sizeof(StringLiteral));
+  if (!literal) {
+    return 0;
+  }
+  literal->value = ast_intern_string(value);
+  if (!literal->value) {
+    free(literal);
+    return 0;
+  }
+
+  for (size_t i = 0; i < node->child_count; i++) {
+    ast_destroy_node(node->children[i]);
+  }
+  free(node->children);
+  node->children = NULL;
+  node->child_count = 0;
+
+  if (node->type == AST_MEMBER_ACCESS) {
+    MemberAccess *member_access = (MemberAccess *)node->data;
+    if (member_access) {
+      ast_free_string(member_access->member);
+      free(member_access);
+    }
+  } else {
+    free(node->data);
+  }
+  node->type = AST_STRING_LITERAL;
+  node->data = literal;
+  return 1;
+}
+
+ASTNode *ast_create_comptime_for(const char *binding_name, ASTNode *sequence,
+                                 ASTNode *body, SourceLocation location) {
+  ASTNode *node = ast_create_node(AST_COMPTIME_FOR, location);
+  if (!node)
+    return NULL;
+
+  ComptimeForStatement *comptime_for = malloc(sizeof(ComptimeForStatement));
+  if (!comptime_for) {
+    free(node);
+    return NULL;
+  }
+
+  comptime_for->binding_name = ast_copy_string(binding_name);
+  comptime_for->sequence = sequence;
+  comptime_for->body = body;
+  comptime_for->keyword_location = location;
+  node->data = comptime_for;
+
+  if (sequence)
+    ast_add_child(node, sequence);
   if (body)
     ast_add_child(node, body);
 

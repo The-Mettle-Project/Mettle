@@ -3,6 +3,7 @@
 #endif
 #include "main.h"
 #include "common.h"
+#include "parser/ast_print.h"
 #include "codegen/binary/startup.h"
 #include "codegen/binary/mir_annotate.h"
 #include "codegen/binary_emitter.h"
@@ -2662,6 +2663,19 @@ int main(int argc, char *argv[]) {
     if (strcmp(argv[1], "explain") == 0) {
       return mettle_explain_error_code(argc >= 3 ? argv[2] : NULL);
     }
+    if (strcmp(argv[1], "expand") == 0) {
+      /* `mettle expand <file> [flags...]`: shift the subcommand out and let
+         the normal flag loop see the rest, the same way `test` does. */
+      options.expand_mode = 1;
+      for (int i = 1; i + 1 < argc; i++) {
+        argv[i] = argv[i + 1];
+      }
+      argc--;
+      if (argc < 2) {
+        fprintf(stderr, "usage: mettle expand <file.mettle>\n");
+        return 1;
+      }
+    }
     if (strcmp(argv[1], "test") == 0) {
       /* `mettle test <file> [--filter=S] [flags...]`: shift the subcommand
        * out and let the normal flag loop see the rest. */
@@ -2939,6 +2953,18 @@ int main(int argc, char *argv[]) {
       options.gpu_checks = 1;
     } else if (strcmp(argv[i], "--report-launches") == 0) {
       options.report_launches = 1;
+    } else if (strcmp(argv[i], "--report-expansion") == 0) {
+      options.report_expansion = 1;
+    } else if (strncmp(argv[i], "--expansion-budget=", 19) == 0) {
+      long long budget = atoll(argv[i] + 19);
+      if (budget < 0) {
+        fprintf(stderr, "--expansion-budget must not be negative\n");
+        return 1;
+      }
+      /* 0 is a real budget (expand nothing), so remember that one was asked
+         for rather than inferring it from the number. */
+      options.expansion_budget = (size_t)budget;
+      options.expansion_budget_set = 1;
     } else if (strncmp(argv[i], "--sms=", 6) == 0) {
       int sms = atoi(argv[i] + 6);
       if (sms < 1 || sms > 1024) {
@@ -3306,6 +3332,13 @@ static int compile_monomorphize(ASTNode *program,
   return 1;
 }
 
+/* `mettle expand`'s bridge to the expansion table: the printer asks what
+ * generated a block, and this answers with the same note a diagnostic raised
+ * inside that block would carry, so the two always agree. */
+static const char *expand_annotate(void *context, const ASTNode *block) {
+  return type_checker_expansion_note((TypeChecker *)context, block, NULL);
+}
+
 static int compile_type_check(TypeChecker *type_checker, ASTNode *program,
                               ErrorReporter *error_reporter) {
   if (!type_checker_check_program(type_checker, program)) {
@@ -3330,6 +3363,13 @@ static int compile_lower_to_ir(ASTNode *program, TypeChecker *type_checker,
       ir_lower_program(program, type_checker, symbol_table, out_ir_error,
                        emit_runtime_checks, emit_safety_checks);
   if (!*out_ir_program) {
+    /* A comptime-only Type/Field that slipped into lowering is a user
+     * diagnostic, already on the reporter. Do not wrap it as an ICE. */
+    if (type_checker && type_checker->error_reporter &&
+        error_reporter_has_errors(type_checker->error_reporter)) {
+      error_reporter_print_errors(type_checker->error_reporter);
+      return 0;
+    }
     mettle_compiler_ice_report("IR lowering failed",
                                *out_ir_error ? *out_ir_error : NULL);
     return 0;
@@ -3829,6 +3869,32 @@ int compile_file(const char *input_filename, const char *output_filename,
   compiler_profile_add(&profile, PROFILE_PHASE_TYPE_CHECK, phase_start);
   if (!tc_ok) {
     result = 1;
+    goto cleanup;
+  }
+
+  /* Expansion has run by now, so the ledger is complete and the AST is the
+     expanded one. A budget is a contract: check it before anything downstream
+     benefits from work the author did not authorize. */
+  if (options->expansion_budget_set &&
+      !type_checker_check_expansion_budget(type_checker,
+                                           options->expansion_budget)) {
+    error_reporter_print_errors(error_reporter);
+    result = 1;
+    goto cleanup;
+  }
+  if (options->report_expansion) {
+    type_checker_report_expansion(type_checker, stdout);
+  }
+  if (options->expand_mode) {
+    size_t unprintable =
+        ast_print_program(stdout, program, expand_annotate, type_checker);
+    if (unprintable > 0) {
+      fprintf(stderr,
+              "\nnote: %zu node%s had no source form and were printed as "
+              "marked comments; this output is not a complete program\n",
+              unprintable, unprintable == 1 ? "" : "s");
+    }
+    result = 0;
     goto cleanup;
   }
 

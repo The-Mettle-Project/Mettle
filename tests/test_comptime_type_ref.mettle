@@ -1,0 +1,18 @@
+// Type names and typeof() fold to comptime TypeRef values. They occupy no
+// storage and never reach runtime code.
+
+struct Point {
+  x: int32;
+  y: int32;
+}
+
+const T_NAME: Type = int32;
+const T_TYPEOF: Type = typeof(int32);
+const T_STRUCT: Type = Point;
+const T_ALIAS: Type = T_NAME;
+
+fn main() -> int32 {
+  var n: int32 = 7;
+  const T_EXPR: Type = typeof(n);
+  return 0;
+}

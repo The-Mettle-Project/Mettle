@@ -1,0 +1,46 @@
+// Frontend type-table layout is available during const eval: field byte
+// offsets (via offsetof on a FieldRef) and sizeof of structs and arrays.
+
+struct Point {
+  x: int32;
+  y: int32;
+}
+
+struct Mixed {
+  a: int8;
+  b: int32;
+  c: int8;
+}
+
+struct Nested {
+  p: Point;
+  n: int64;
+}
+
+const OX: int64 = offsetof(Point.x);
+const OY: int64 = offsetof(Point.y);
+const OB: int64 = offsetof(Mixed.b);
+const OC: int64 = offsetof(Mixed.c);
+const ON: int64 = offsetof(Nested.n);
+const SZ_POINT: int64 = sizeof(Point);
+const SZ_MIXED: int64 = sizeof(Mixed);
+const SZ_ARR: int64 = sizeof(int32[4]);
+
+static_assert(offsetof(Point.x) == 0);
+static_assert(offsetof(Point.y) == 4);
+static_assert(sizeof(Point) == 8);
+static_assert(offsetof(Mixed.a) == 0);
+static_assert(offsetof(Mixed.b) == 4);
+static_assert(offsetof(Mixed.c) == 8);
+static_assert(sizeof(Mixed) == 12);
+static_assert(offsetof(Nested.p) == 0);
+static_assert(offsetof(Nested.n) == 8);
+static_assert(sizeof(Nested) == 16);
+static_assert(sizeof(int32[4]) == 16);
+
+const FX: Field = Point.x;
+static_assert(offsetof(FX) == 0);
+
+fn main() -> int32 {
+  return (int32)(OX + OY + OB + OC + ON + SZ_POINT + SZ_MIXED + SZ_ARR);
+}

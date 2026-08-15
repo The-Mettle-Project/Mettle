@@ -922,6 +922,74 @@ $cases = @(
   @{ Name = "err_const_no_init"; Path = "tests/err_const_no_init.mettle"; ShouldSucceed = $false; Pattern = "Constant declaration requires an initializer" },
   @{ Name = "err_const_assign"; Path = "tests/err_const_assign.mettle"; ShouldSucceed = $false; Pattern = "is a constant and cannot be assigned to" },
   @{ Name = "err_const_nonconst"; Path = "tests/err_const_nonconst.mettle"; ShouldSucceed = $false; Pattern = "compile-time integer constant expression" },
+  @{ Name = "comptime_type_ref"; Path = "tests/test_comptime_type_ref.mettle"; ShouldSucceed = $true },
+  @{ Name = "comptime_field_ref"; Path = "tests/test_comptime_field_ref.mettle"; ShouldSucceed = $true },
+  @{ Name = "type_table_layout"; Path = "tests/test_type_table_layout.mettle"; ShouldSucceed = $true },
+  @{ Name = "type_table_enum"; Path = "tests/test_type_table_enum.mettle"; ShouldSucceed = $true },
+  @{ Name = "err_offsetof_not_field"; Path = "tests/err_offsetof_not_field.mettle"; ShouldSucceed = $false
+     Pattern = "offsetof expects a compile-time Field"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_type_var"; Path = "tests/err_type_var.mettle"; ShouldSucceed = $false
+     Pattern = "type 'Type' has no runtime representation"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_type_param"; Path = "tests/err_type_param.mettle"; ShouldSucceed = $false
+     Pattern = "type 'Type' has no runtime representation"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_type_return"; Path = "tests/err_type_return.mettle"; ShouldSucceed = $false
+     Pattern = "type 'Type' has no runtime representation"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_type_field"; Path = "tests/err_type_field.mettle"; ShouldSucceed = $false
+     Pattern = "type 'Type' has no runtime representation"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_type_escape_return"; Path = "tests/err_type_escape_return.mettle"; ShouldSucceed = $false
+     Pattern = "cannot escape into runtime code"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_type_escape_arg"; Path = "tests/err_type_escape_arg.mettle"; ShouldSucceed = $false
+     Pattern = "cannot escape into runtime code"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_field_var"; Path = "tests/err_field_var.mettle"; ShouldSucceed = $false
+     Pattern = "type 'Field' has no runtime representation"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_type_pointer"; Path = "tests/err_type_pointer.mettle"; ShouldSucceed = $false
+     Pattern = "no runtime representation"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_sizeof_type"; Path = "tests/err_sizeof_type.mettle"; ShouldSucceed = $false
+     Pattern = "no runtime representation"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_type_address"; Path = "tests/err_type_address.mettle"; ShouldSucceed = $false
+     Pattern = "cannot escape into runtime code"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "comptime_for_fields"; Path = "tests/test_comptime_for_fields.mettle"; ShouldSucceed = $true },
+  @{ Name = "type_queries"; Path = "tests/test_type_queries.mettle"; ShouldSucceed = $true },
+  @{ Name = "err_type_query_unknown"; Path = "tests/err_type_query_unknown.mettle"; ShouldSucceed = $false
+     Pattern = "has no field or query"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_field_query_unknown"; Path = "tests/err_field_query_unknown.mettle"; ShouldSucceed = $false
+     Pattern = "'Field' has no member"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_sequence_escape"; Path = "tests/err_sequence_escape.mettle"; ShouldSucceed = $false
+     Pattern = "no runtime representation|cannot escape into runtime code"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_sequence_index_range"; Path = "tests/err_sequence_index_range.mettle"; ShouldSucceed = $false
+     Pattern = "constant index that is in range"
+     OutputMustNotMatch = @("internal compiler error") },
+  # Each expansion is checked on its own, so a body valid for one field and
+  # invalid for the next fails on exactly that iteration -- and says which.
+  @{ Name = "err_comptime_for_iteration"; Path = "tests/err_comptime_for_iteration.mettle"; ShouldSucceed = $false
+     Pattern = 'static_assert failed'
+     OutputMustMatch = @('expanded from comptime-for iteration 1 \(field .small.\)')
+     OutputMustNotMatch = @("internal compiler error", 'iteration 2') },
+  @{ Name = "err_comptime_for_nested"; Path = "tests/err_comptime_for_nested.mettle"; ShouldSucceed = $false
+     Pattern = 'static_assert failed'
+     OutputMustMatch = @('expanded from comptime-for iteration 1 \(field .a.\)',
+                         'expanded from comptime-for iteration 2 \(field .b.\)')
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_comptime_for_bad_sequence"; Path = "tests/err_comptime_for_bad_sequence.mettle"; ShouldSucceed = $false
+     Pattern = "the only compile-time sequence is"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_comptime_for_escape"; Path = "tests/err_comptime_for_escape.mettle"; ShouldSucceed = $false
+     Pattern = "cannot escape into runtime code"
+     OutputMustNotMatch = @("internal compiler error") },
   # A global is laid out at compile time and there is no module initializer, so a
   # run-time initializer must be a diagnostic with a source location - it used to
   # reach the direct-object backend and abort as an internal compiler error.
@@ -2151,6 +2219,97 @@ foreach ($case in $cases) {
 
 # SIMD correctness: build release binaries with the direct object backend and
 # run adversarial runtime harnesses for each fused AVX2 family.
+# `comptime for` folds a different offset/size/index into each expansion, so the
+# only way to know the expansion was correct is to run it: the program checks
+# the accumulated total itself and returns non-zero if any field is wrong.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "comptime_for_fields.exe"
+  if (Test-Path $exePath) { Remove-Item -Path $exePath -Force -ErrorAction SilentlyContinue }
+  $buildOut = & $CompilerPath --build --release "tests\test_comptime_for_fields.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "build failed: $buildOut" }
+  & $exePath *> $null
+  if ($LASTEXITCODE -ne 0) {
+    throw "expansion produced wrong constants; program returned $LASTEXITCODE"
+  }
+  Write-CaseResult -Name "comptime_for_fields_runtime" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "comptime_for_fields_runtime" -Passed $false -Reason $_.Exception.Message
+}
+
+# `mettle expand` must show generated code as readable source, attributed to
+# the iteration that produced it, with the same note a diagnostic would carry.
+$total++
+try {
+  $out = & $CompilerPath expand "tests\test_comptime_for_fields.mettle" 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "expand failed: $out" }
+  foreach ($expected in @(
+      "expanded from comptime-for iteration 1 (field ``kind``)",
+      "expanded from comptime-for iteration 3 (field ``payload``)",
+      "struct Packet {")) {
+    if ($out -notmatch [regex]::Escape($expected)) { throw "missing '$expected' in: $out" }
+  }
+  # The directive itself must be gone: expansion replaced it.
+  if ($out -match "comptime for") { throw "expand still shows an unexpanded directive: $out" }
+  # Each iteration folded a different offset, which is the whole point.
+  foreach ($folded in @("total + 0", "total + 4", "total + 8")) {
+    if ($out -notmatch [regex]::Escape($folded)) { throw "missing folded '$folded' in: $out" }
+  }
+  Write-CaseResult -Name "expand_shows_generated_source" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "expand_shows_generated_source" -Passed $false -Reason $_.Exception.Message
+}
+
+# Expansion keeps a ledger, and a budget is a contract that fails the build.
+$total++
+try {
+  $used = & $CompilerPath --report-expansion "tests\test_comptime_for_fields.mettle" 2>&1 | Out-String
+  if ($used -notmatch "comptime expansion: 2 sites") { throw "ledger wrong: $used" }
+  if ($used -notmatch "3 iterations") { throw "ledger missing iteration count: $used" }
+
+  # A program that expands nothing must say so: an absence you can point at.
+  $none = & $CompilerPath --report-expansion "tests\test_type_table_enum.mettle" 2>&1 | Out-String
+  if ($none -notmatch "no sites; nothing generated") { throw "absence not reported: $none" }
+
+  $over = & $CompilerPath --expansion-budget=10 "tests\test_comptime_for_fields.mettle" 2>&1 | Out-String
+  if ($LASTEXITCODE -eq 0) { throw "budget of 10 should have failed the build" }
+  if ($over -notmatch "over the budget of 10") { throw "budget error unclear: $over" }
+
+  & $CompilerPath --expansion-budget=100000 "tests\test_comptime_for_fields.mettle" *> $null
+  if ($LASTEXITCODE -ne 0) { throw "a budget above the real cost should compile" }
+  Write-CaseResult -Name "expansion_ledger_and_budget" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "expansion_ledger_and_budget" -Passed $false -Reason $_.Exception.Message
+}
+
+# `.name` is module-qualified, and a string is not foldable, so the only way to
+# check the qualification is to run the program and read what it printed.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "type_names.exe"
+  if (Test-Path $exePath) { Remove-Item -Path $exePath -Force -ErrorAction SilentlyContinue }
+  $buildOut = & $CompilerPath --build "tests\test_type_names.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "build failed: $buildOut" }
+  $runOut = & $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "name lengths wrong; program returned $LASTEXITCODE`: $runOut" }
+  foreach ($expected in @("declared=test_type_names.Point", "builtin=int32", "field=y")) {
+    if ($runOut -notmatch [regex]::Escape($expected)) {
+      throw "expected '$expected' in output: $runOut"
+    }
+  }
+  Write-CaseResult -Name "type_names_qualified" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "type_names_qualified" -Passed $false -Reason $_.Exception.Message
+}
+
 $simdRuntimeCases = @(
   @{
     Name            = "simd_correctness_int"

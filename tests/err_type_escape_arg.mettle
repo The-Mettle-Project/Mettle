@@ -1,0 +1,9 @@
+// A Type value cannot be passed to a runtime function.
+
+fn take(n: int32) -> int32 {
+  return n;
+}
+
+fn main() -> int32 {
+  return take(int32);
+}

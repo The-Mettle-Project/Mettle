@@ -153,6 +153,12 @@ int type_checker_process_struct_declaration(TypeChecker *checker,
   if (!decl || !decl->name) {
     return 0;
   }
+  if (strcmp(decl->name, "Type") == 0 || strcmp(decl->name, "Field") == 0) {
+    type_checker_set_error_at_location(
+        checker, struct_decl->location,
+        "'%s' is a reserved compile-time type name", decl->name);
+    return 0;
+  }
 
   // Check if struct already exists
   Symbol *existing =
@@ -203,49 +209,38 @@ int type_checker_process_struct_declaration(TypeChecker *checker,
       free(field_types);
       return 0;
     }
+    if (type_checker_reject_no_runtime_repr(checker, struct_decl->location,
+                                            field_types[i])) {
+      free(field_types);
+      return 0;
+    }
   }
 
-  // Populate the placeholder in place: copy field names, attach field types,
-  // and compute offsets/size/alignment. Mirrors type_create_struct, but
-  // operates on the already-registered placeholder so that any pointers
-  // captured during field resolution remain valid.
-  struct_type->field_count = decl->field_count;
-  struct_type->field_names = malloc(decl->field_count * sizeof(char *));
-  struct_type->field_types = malloc(decl->field_count * sizeof(Type *));
-  struct_type->field_offsets = malloc(decl->field_count * sizeof(size_t));
-  if (!struct_type->field_names || !struct_type->field_types ||
-      !struct_type->field_offsets) {
+  /* Populate the placeholder in place so pointers captured during field
+   * resolution stay valid. Layout is computed here, in the frontend. */
+  if (!type_alloc_fields(struct_type, decl->field_count)) {
     free(field_types);
     return 0;
   }
-
-  size_t current_offset = 0;
-  size_t max_alignment = 1;
   for (size_t i = 0; i < decl->field_count; i++) {
-    struct_type->field_names[i] = (char *)string_intern(decl->field_names[i]);
-    struct_type->field_types[i] = field_types[i];
-    size_t field_alignment = field_types[i]->alignment;
-    if (field_alignment == 0) {
-      /* A pointer to a not-yet-populated struct still has pointer size and
-       * alignment because pointers are sized independently of their pointee.
-       * Other zero-alignment cases shouldn't happen for first-class types. */
-      field_alignment = 1;
+    if (!type_set_field(struct_type, i, decl->field_names[i], field_types[i],
+                        0)) {
+      free(field_types);
+      return 0;
     }
-    if (field_alignment > max_alignment) {
-      max_alignment = field_alignment;
-    }
-    size_t padding = (field_alignment - (current_offset % field_alignment)) %
-                     field_alignment;
-    current_offset += padding;
-    struct_type->field_offsets[i] = current_offset;
-    current_offset += field_types[i]->size;
   }
-  size_t final_padding =
-      (max_alignment - (current_offset % max_alignment)) % max_alignment;
-  struct_type->size = current_offset + final_padding;
-  struct_type->alignment = max_alignment;
+  if (!type_compute_layout(struct_type)) {
+    free(field_types);
+    type_checker_set_error_at_location(
+        checker, struct_decl->location,
+        "Failed to compute layout for struct '%s'", decl->name);
+    return 0;
+  }
 
   free(field_types);
+  type_checker_intern_type(checker, struct_type);
+  type_checker_set_qualified_name(checker, struct_type,
+                                  struct_decl->location.filename);
   return 1;
 }
 
@@ -315,13 +310,14 @@ Type *type_checker_build_tagged_enum_type(TypeChecker *checker,
 
   for (size_t i = 0; i < enum_decl->variant_count; i++) {
     te->tagged_variant_names[i] =
-        strdup(enum_decl->variants[i].name);
+        (char *)string_intern(enum_decl->variants[i].name);
     te->tagged_variant_tags[i] = (int)i;
     const char *pt = enum_decl->variants[i].payload_type;
     te->tagged_variant_payloads[i] =
         pt ? type_checker_get_type_by_name(checker, pt) : NULL;
   }
 
+  type_checker_intern_type(checker, te);
   return te;
 }
 
@@ -331,6 +327,8 @@ int type_checker_process_tagged_enum(TypeChecker *checker,
 
   Type *te =
       type_checker_build_tagged_enum_type(checker, enum_decl->name, enum_decl);
+  type_checker_set_qualified_name(checker, te,
+                                  enum_decl_node->location.filename);
   if (!te) {
     type_checker_set_error_at_location(checker, enum_decl_node->location,
                                        "Failed to create tagged enum type '%s'",
@@ -541,6 +539,15 @@ int type_checker_process_enum_declaration(TypeChecker *checker,
   }
   new_enum_type->size = 8;
   new_enum_type->alignment = 8;
+  if (!type_alloc_enum_members(new_enum_type, enum_decl->variant_count)) {
+    type_destroy(new_enum_type);
+    type_checker_set_error_at_location(checker, enum_decl_node->location,
+                                       "Out of memory recording enum members");
+    return 0;
+  }
+  type_checker_intern_type(checker, new_enum_type);
+  type_checker_set_qualified_name(checker, new_enum_type,
+                                  enum_decl_node->location.filename);
 
   Symbol *enum_symbol =
       symbol_create(enum_decl->name, SYMBOL_ENUM, new_enum_type);
@@ -590,6 +597,7 @@ int type_checker_process_enum_declaration(TypeChecker *checker,
     sym->data.constant.value = current_val;
     sym->is_initialized = 1;
     symbol_table_insert(checker->symbol_table, sym);
+    type_set_enum_member(new_enum_type, i, variant->name, current_val);
     current_val++;
   }
 
@@ -802,7 +810,12 @@ int type_checker_process_declaration(TypeChecker *checker,
           poisoned = 1;
         }
         // Type specified: validate assignment compatibility
-        else if (!(type_checker_type_accepts_null_pointer(var_type) &&
+        else if (type_is_comptime_only(init_type) &&
+                 !type_is_comptime_only(var_type)) {
+          type_checker_reject_comptime_escape(
+              checker, var_decl->initializer->location, init_type);
+          poisoned = 1;
+        } else if (!(type_checker_type_accepts_null_pointer(var_type) &&
               type_checker_is_null_pointer_constant(var_decl->initializer)) &&
             !type_checker_is_assignable(checker, var_type, init_type)) {
           type_checker_report_type_mismatch_node(checker, var_decl->initializer,
@@ -837,6 +850,62 @@ int type_checker_process_declaration(TypeChecker *checker,
           "Variable '%s' must have either a type annotation or an initializer",
           var_decl->name);
       return 0;
+    }
+
+    if (var_type && type_contains_comptime_only(var_type)) {
+      if (!var_decl->is_const || !type_is_comptime_only(var_type)) {
+        type_checker_reject_no_runtime_repr(checker, declaration->location,
+                                            var_type);
+        return 0;
+      }
+      if (!var_decl->initializer) {
+        type_checker_set_error_at_location(
+            checker, declaration->location,
+            "Constant '%s' must have an initializer", var_decl->name);
+        return 0;
+      }
+      if (poisoned) {
+        return 0;
+      }
+      ComptimeValue folded = comptime_none();
+      if (!type_checker_eval_comptime(checker, var_decl->initializer,
+                                      &folded) ||
+          (var_type->kind == TYPE_TYPE && folded.kind != COMPTIME_TYPE_REF) ||
+          (var_type->kind == TYPE_FIELD &&
+           folded.kind != COMPTIME_FIELD_REF)) {
+        type_checker_set_error_at_location(
+            checker, var_decl->initializer->location,
+            "Constant '%s' initializer must be a compile-time %s value",
+            var_decl->name, var_type->name);
+        return 0;
+      }
+      if (symbol_table_lookup_current_scope(checker->symbol_table,
+                                            var_decl->name)) {
+        type_checker_report_duplicate_declaration(
+            checker, declaration->location, var_decl->name);
+        return 0;
+      }
+      Symbol *const_symbol =
+          symbol_create(var_decl->name, SYMBOL_CONSTANT, var_type);
+      if (!const_symbol) {
+        type_checker_set_error_at_location(
+            checker, declaration->location,
+            "Failed to create symbol for constant '%s'", var_decl->name);
+        return 0;
+      }
+      const_symbol->comptime_value = folded;
+      const_symbol->is_initialized = 1;
+      const_symbol->is_immutable = 1;
+      const_symbol->decl_line = declaration->location.line;
+      const_symbol->decl_column = declaration->location.column;
+      const_symbol->decl_file = declaration->location.filename;
+      if (!symbol_table_declare(checker->symbol_table, const_symbol)) {
+        type_checker_report_duplicate_declaration(
+            checker, declaration->location, var_decl->name);
+        symbol_destroy(const_symbol);
+        return 0;
+      }
+      return 1;
     }
 
     /* A global's storage is laid out in the object file, so its value has to be
@@ -1168,6 +1237,10 @@ int type_checker_process_declaration(TypeChecker *checker,
                                              func_decl->return_type, "type");
         return 0;
       }
+      if (type_checker_reject_no_runtime_repr(checker, declaration->location,
+                                              return_type)) {
+        return 0;
+      }
     } else {
       return_type = checker->builtin_void;
     }
@@ -1210,6 +1283,11 @@ int type_checker_process_declaration(TypeChecker *checker,
           type_checker_report_undefined_symbol(checker, declaration->location,
                                                func_decl->parameter_types[i],
                                                "type");
+          free(param_types);
+          return 0;
+        }
+        if (type_checker_reject_no_runtime_repr(checker, declaration->location,
+                                                param_types[i])) {
           free(param_types);
           return 0;
         }
@@ -1795,6 +1873,10 @@ int type_checker_process_declaration(TypeChecker *checker,
             checker, assignment->value->location,
             "Cannot infer type of assignment value");
       }
+      return 0;
+    }
+    if (type_checker_reject_comptime_escape(
+            checker, assignment->value->location, value_type)) {
       return 0;
     }
 

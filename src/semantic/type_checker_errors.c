@@ -287,6 +287,121 @@ void type_checker_report_duplicate_declaration(TypeChecker *checker,
   }
 }
 
+static const char *comptime_only_type_name(const Type *type) {
+  if (!type) {
+    return "Type";
+  }
+  if (type->kind == TYPE_FIELD ||
+      (type->name && strcmp(type->name, "Field") == 0)) {
+    return "Field";
+  }
+  if (type_is_comptime_only(type) && type->name) {
+    return type->name;
+  }
+  if (type->kind == TYPE_FIELD) {
+    return "Field";
+  }
+  return type->name ? type->name : "Type";
+}
+
+static const Type *comptime_only_payload(const Type *type) {
+  if (!type) {
+    return NULL;
+  }
+  if (type_is_comptime_only(type)) {
+    return type;
+  }
+  if (type->kind == TYPE_POINTER || type->kind == TYPE_ARRAY ||
+      type->kind == TYPE_SLICE) {
+    return comptime_only_payload(type->base_type);
+  }
+  if (type->kind == TYPE_FUNCTION_POINTER) {
+    if (type_contains_comptime_only(type->fn_return_type)) {
+      return comptime_only_payload(type->fn_return_type);
+    }
+    for (size_t i = 0; i < type->fn_param_count; i++) {
+      if (type_contains_comptime_only(type->fn_param_types[i])) {
+        return comptime_only_payload(type->fn_param_types[i]);
+      }
+    }
+  }
+  if (type->kind == TYPE_STRUCT) {
+    for (size_t i = 0; i < type->field_count; i++) {
+      if (type_contains_comptime_only(type->field_types[i])) {
+        return comptime_only_payload(type->field_types[i]);
+      }
+    }
+  }
+  return type;
+}
+
+int type_checker_reject_no_runtime_repr(TypeChecker *checker,
+                                        SourceLocation location,
+                                        const Type *type) {
+  if (!checker || !type_contains_comptime_only(type)) {
+    return 0;
+  }
+
+  const Type *payload = comptime_only_payload(type);
+  const char *name = comptime_only_type_name(payload ? payload : type);
+  char error_msg[512];
+  if (type_is_comptime_only(type)) {
+    snprintf(error_msg, sizeof(error_msg),
+             "type '%s' has no runtime representation", name);
+  } else {
+    snprintf(error_msg, sizeof(error_msg),
+             "type '%s' has no runtime representation, so it cannot appear "
+             "inside '%s'",
+             name, type->name ? type->name : "this type");
+  }
+
+  checker->has_error = 1;
+  free(checker->error_message);
+  checker->error_message = strdup(error_msg);
+
+  if (checker->error_reporter) {
+    SourceSpan span = source_span_from_location(location, name ? strlen(name) : 1);
+    span = error_reporter_span_snap_to_token(checker->error_reporter, span, name);
+    error_reporter_add_error_with_span_and_suggestion(
+        checker->error_reporter, ERROR_TYPE, span, error_msg,
+        "'Type' and 'Field' are compile-time reflection values; bind them "
+        "with `const` and use them only at compile time");
+    error_reporter_set_last_label(checker->error_reporter,
+                                  "no runtime representation");
+  }
+  return 1;
+}
+
+int type_checker_reject_comptime_escape(TypeChecker *checker,
+                                        SourceLocation location,
+                                        const Type *type) {
+  if (!checker || !type_is_comptime_only(type)) {
+    return 0;
+  }
+
+  const char *name = comptime_only_type_name(type);
+  char error_msg[512];
+  snprintf(error_msg, sizeof(error_msg),
+           "value of type '%s' cannot escape into runtime code", name);
+
+  checker->has_error = 1;
+  free(checker->error_message);
+  checker->error_message = strdup(error_msg);
+
+  if (checker->error_reporter) {
+    SourceSpan span = source_span_from_location(location, name ? strlen(name) : 1);
+    span = error_reporter_span_snap_to_token(checker->error_reporter, span, name);
+    error_reporter_add_error_with_span_and_suggestion(
+        checker->error_reporter, ERROR_TYPE, span, error_msg,
+        "'Type' and 'Field' exist only at compile time; they cannot be "
+        "stored, returned, passed to a function, or used in a runtime "
+        "expression");
+    error_reporter_set_last_label(checker->error_reporter,
+                                  "compile-time only");
+  }
+  return 1;
+}
+
 void type_checker_report_parameter_shadow(TypeChecker *checker,
                                           SourceLocation location,
                                           const char *symbol_name,
