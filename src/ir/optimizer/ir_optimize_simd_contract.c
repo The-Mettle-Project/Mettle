@@ -743,6 +743,7 @@ const char *ir_simd_bail_id_name(int id) {
   case IR_SIMD_BAIL_PREDICATED_COUNT:    return "predicated-count";
   case IR_SIMD_BAIL_CLAMP_STORE:         return "clamp-store";
   case IR_SIMD_BAIL_STRIDED_ACCESS:      return "strided-access";
+  case IR_SIMD_BAIL_UNBOUNDED_SHIFT:     return "unbounded-shift";
   case IR_SIMD_BAIL_UNRECOGNIZED_SHAPE:  return "unrecognized-shape";
   }
   return "unknown";
@@ -1507,6 +1508,35 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
                "separate");
       IR_SIMD_MARK_ADVISORY();
       IR_SIMD_SET_DIAG(IR_SIMD_BAIL_STRIDED_ACCESS);
+      return;
+    }
+  }
+  {
+    /* A `>>` the lanes cannot take. Every other integer op is congruent mod
+     * 2^32, so 32-bit lanes reproduce it whatever width the scalar used; a
+     * right shift reads bits back DOWN, and a lane that wrapped where the
+     * scalar did not would shift different ones. The recognizer takes the
+     * shift only where the shifted value is provably inside int32, and a
+     * runtime factor in the expression makes that unprovable. */
+    int shift_count = 0;
+    for (size_t i = begin + 1; i < end; i++) {
+      const IRInstruction *ins = &function->instructions[i];
+      if (ins->op == IR_OP_BINARY && !ins->is_float && ins->text &&
+          strcmp(ins->text, ">>") == 0 && ins->rhs.kind == IR_OPERAND_INT) {
+        shift_count++;
+      }
+    }
+    if (shift_count > 0 && load_count > 0 && store_count > 0) {
+      snprintf(reason, reason_cap,
+               "the body shifts right, and the value being shifted cannot be "
+               "shown to stay inside int32; the lanes are 32 bits wide, so a "
+               "shift is only reproduced exactly when no wider intermediate "
+               "could have been shifted");
+      snprintf(fix, fix_cap,
+               "constant factors are provable (`(r*77 + g*150 + b*29) >> 8` "
+               "vectorizes) -- a runtime one is not; masking the value first "
+               "(`(x & 65535) >> 8`) bounds it and the kernel then takes it");
+      IR_SIMD_SET_DIAG(IR_SIMD_BAIL_UNBOUNDED_SHIFT);
       return;
     }
   }

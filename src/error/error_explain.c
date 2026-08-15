@@ -484,6 +484,27 @@ static const DecisionDoc DECISIONS[] = {
      "\n"
      "    // instead of rgb[i*3+0], rgb[i*3+1], rgb[i*3+2]\n"
      "    r[i], g[i], b[i]        // three loops, all vectorized\n"},
+    {"unbounded-shift", DECISION_VECTOR_REFUSAL,
+     "A right shift whose input cannot be bounded",
+     "Integer lanes are 32 bits wide. `+ - * & | ^ <<` are congruent mod 2^32 --\n"
+     "the low 32 bits of a result depend only on the low 32 bits of its inputs\n"
+     "-- so a lane reproduces them whatever width the scalar code used. `>>`\n"
+     "is the exception: it reads bits back DOWN, so a lane that wrapped where\n"
+     "the scalar did not would shift different bits in.\n"
+     "\n"
+     "The kernel therefore takes a right shift only where the shifted value is\n"
+     "provably inside int32. Constant factors are provable:\n"
+     "\n"
+     "    dst[i] = (uint8)((r[i]*77 + g[i]*150 + b[i]*29) >> 8);\n"
+     "\n"
+     "reaches 65280 at the very most, so it vectorizes. A runtime weight does\n"
+     "not:\n"
+     "\n"
+     "    dst[i] = (uint8)((s[i]*a + d[i]*(255-a)) >> 8);   // `a` unbounded\n"
+     "\n"
+     "Masking first makes it provable, at the cost of one extra op per lane:\n"
+     "\n"
+     "    dst[i] = (uint8)(((s[i]*a + d[i]*(255-a)) & 65535) >> 8);\n"},
     {"unrecognized-shape", DECISION_VECTOR_REFUSAL,
      "No recognizer claimed this loop",
      "The honest fallback. The compiler ruled out every disqualifier it can\n"
