@@ -4768,6 +4768,16 @@ try {
       throw "$fn no longer vectorizes; if-conversion stopped claiming its select"
     }
   }
+  # An int32 vector kernel must also run INSIDE an allocated frame. Without the
+  # vloop passthrough one SIMD op puts every value in the function on the stack,
+  # so vectorizing a loop would cost the rest of the function its registers.
+  if ($coverOut -notmatch '(\d+)/(\d+) functions reaching codegen') {
+    throw "no backend coverage line in --explain output"
+  }
+  if ($Matches[1] -ne $Matches[2]) {
+    throw ("only {0}/{1} functions register-allocated; an int32 vloop stopped " +
+           "passing through the MIR backend") -f $Matches[1], $Matches[2]
+  }
   Write-CaseResult -Name "vloop_if_conversion_coverage" -Passed $true
 }
 catch {

@@ -1796,27 +1796,38 @@ int mir_function_is_eligible(CodeGenerator *generator,
       }
       break;
     }
+    case IR_OP_SIMD_VLOOP_I32:
     case IR_OP_SIMD_VLOOP_F64: {
-      /* Inline general-vectorized-loop passthrough (float64 MAPS only). The DAG
-       * is carried by reference at lowering; here we only gate the marshalling:
-       * a map (not a reduction), float64 lanes, and <=3 distinct base pointers
-       * so the element count still fits in an ABI arg register (RCX/RDX/R8/R9)
-       * alongside them. Integer/float32 vloops and reductions stay in the
-       * fallback. */
+      /* Inline general-vectorized-loop passthrough, for MAPS of any lane width.
+       * The DAG is carried by reference at lowering; here we only gate the
+       * marshalling: a map (not a reduction) and <=3 distinct base pointers, so
+       * the element count still fits in an ABI arg register (RCX/RDX/R8/R9)
+       * alongside them. The kernel emitter reads the lane kind off the opcode
+       * and float_bits, so f64x4, f32x8, i32x8 and byte elements all share this
+       * path. Reductions stay in the fallback: their result lands in an
+       * accumulator this marshalling does not carry back. */
       const char *vnames[4];
       const IROperand *vsrcs[4];
+      const int vi32 = (in->op == IR_OP_SIMD_VLOOP_I32);
       int vn = 0;
       if (in->argument_count < 7 || !in->arguments) {
         return mir_trace_bail(ir_function, "vloop:shape");
       }
-      /* Split by cause: the two uncovered shapes are a reduction and a
-       * non-float64 lane width, and --explain can name the source construct
-       * for each only if the gate says which one it was. */
+      /* Split by cause: --explain can name the source construct behind an
+       * uncovered shape only if the gate says which one it was. */
       if (in->arguments[0].int_value != 0 /* reduce_op: maps only */) {
         return mir_trace_bail(ir_function, "vloop:reduce");
       }
-      if (in->float_bits != 64) {
+      if (vi32 ? (in->float_bits != 32 && in->float_bits != 8)
+               : (in->float_bits != 64 && in->float_bits != 32)) {
         return mir_trace_bail(ir_function, "vloop:width");
+      }
+      /* A runtime invariant scalar is broadcast by reading the symbol from its
+       * stack home, and an allocated frame need never have written one. Only
+       * the bases and the count are marshalled through registers, so a DAG that
+       * reads a scalar by name belongs in the fallback until they are too. */
+      if (in->arguments[5].int_value != 0) {
+        return mir_trace_bail(ir_function, "vloop:scalars");
       }
       if (code_generator_vloop_collect_dist(in, 0, vnames, vsrcs, &vn) < 0 ||
           vn > 3) {
@@ -4152,11 +4163,12 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
                      mir_op_imm(b_bits), mir_op_imm(c_bits), 8, 0, flags);
   }
 
+  case IR_OP_SIMD_VLOOP_I32:
   case IR_OP_SIMD_VLOOP_F64: {
-    /* Inline general vloop (float64 map): marshal the <=3 distinct base pointers
-     * into RCX/RDX/R8/R9 (kGp order, matching the kernel's dist) and the element
-     * count into the next arg register; the kernel reads its DAG from the
-     * borrowed IRInstruction in `aux`. */
+    /* Inline general vloop (any lane width, maps only): marshal the <=3 distinct
+     * base pointers into RCX/RDX/R8/R9 (kGp order, matching the kernel's dist)
+     * and the element count into the next arg register; the kernel reads its DAG
+     * from the borrowed IRInstruction in `aux`. */
     static const int kGp[4] = {BINARY_GP_RCX, BINARY_GP_RDX, BINARY_GP_R8,
                                BINARY_GP_R9};
     const char *vnames[4];
