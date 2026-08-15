@@ -93,6 +93,59 @@ static int ir_decode_float_indexed_address(IRFunction *function, size_t before,
   return 1;
 }
 
+/* Byte twin of the two decoders above. A 1-byte element needs no scaling, so
+ * the address is `base + iv` with no shift between them -- the shape the
+ * decoders above are built to see through, and therefore the shape they
+ * refuse. */
+static int ir_decode_byte_indexed_address(IRFunction *function, size_t before,
+                                          const char *addr_temp,
+                                          const char *iv,
+                                          const char **base_out) {
+  const IRInstruction *addr = NULL;
+  if (!addr_temp || !iv || !base_out) {
+    return 0;
+  }
+  addr = ir_find_temp_producer_before(function, before, addr_temp);
+  if (!addr || addr->op != IR_OP_BINARY || addr->is_float || !addr->text ||
+      strcmp(addr->text, "+") != 0) {
+    return 0;
+  }
+  if (addr->lhs.kind == IR_OPERAND_SYMBOL && addr->lhs.name &&
+      ir_operand_is_symbol_named(&addr->rhs, iv)) {
+    *base_out = addr->lhs.name;
+    return 1;
+  }
+  if (addr->rhs.kind == IR_OPERAND_SYMBOL && addr->rhs.name &&
+      ir_operand_is_symbol_named(&addr->lhs, iv)) {
+    *base_out = addr->rhs.name;
+    return 1;
+  }
+  return 0;
+}
+
+/* `%t <- *(base + iv) [1]`, with how the byte widens into the int32 lane. */
+static int ir_decode_byte_indexed_load(IRFunction *function, size_t before,
+                                       const char *load_temp, const char *iv,
+                                       const char **base_out,
+                                       int *unsigned_out) {
+  const IRInstruction *load = NULL;
+  if (!load_temp || !iv || !base_out || !unsigned_out) {
+    return 0;
+  }
+  load = ir_find_temp_producer_before(function, before, load_temp);
+  if (!load || load->op != IR_OP_LOAD || load->lhs.kind != IR_OPERAND_TEMP ||
+      !load->lhs.name || load->rhs.kind != IR_OPERAND_INT ||
+      load->rhs.int_value != 1) {
+    return 0;
+  }
+  if (!ir_decode_byte_indexed_address(function, before, load->lhs.name, iv,
+                                      base_out)) {
+    return 0;
+  }
+  *unsigned_out = load->is_unsigned ? 1 : 0;
+  return 1;
+}
+
 /* A symbol is an acceptable float-array base if it is a function parameter, a
  * declared local (covers inlined-callee parameter copies), or a GLOBAL the
  * function never writes and never takes the address of -- real programs (an
@@ -1310,6 +1363,8 @@ int ir_simd_i2f_reduce_pass(IRFunction *function, int *changed) {
 #define VLOOP_VN_OR 9     /* int lanes only */
 #define VLOOP_VN_XOR 10   /* int lanes only */
 #define VLOOP_VN_SHL 11   /* int lanes only; op0 = node, op1 = literal count */
+#define VLOOP_VN_SAR 12   /* int lanes only; arithmetic >> by a literal count */
+#define VLOOP_VN_SHR 13   /* int lanes only; logical >> by a literal count */
 
 #define VLOOP_MAX_NODES 48
 #define VLOOP_MAX_ARRAYS 4 /* loaded bases; +dst must keep distinct bases <= 4 */
@@ -1335,6 +1390,11 @@ typedef struct {
   int n_scalars;
   int width_bits;
   int is_int; /* 0 = float lanes (width_bits 32/64), 1 = int32 lanes */
+  /* Element width in MEMORY, which int lanes decouple from lane width: 32 by
+   * default, or 8 for a byte map, where the loads widen into int32 lanes and
+   * the store truncates back. Every array in one DAG shares it. */
+  int elem_bits;
+  int elem_unsigned; /* byte elements: zero-extend (uint8) vs sign-extend */
   size_t body_lo; /* loop body region, for symbol-invariance checks */
   size_t body_hi;
   int has_iota;
@@ -1713,7 +1773,8 @@ static int vloop_eval_depth(const VLoopDag *d, int node) {
   if (vloop_tag_is_leaf(n->tag)) {
     return 1; /* leaf: LOAD / IOTA / CONST / SCALAR */
   }
-  if (n->tag == VLOOP_VN_SHL) {
+  if (n->tag == VLOOP_VN_SHL || n->tag == VLOOP_VN_SAR ||
+      n->tag == VLOOP_VN_SHR) {
     return vloop_eval_depth(d, n->op0); /* unary, evaluated in place */
   }
   int da = vloop_eval_depth(d, n->op0);
@@ -2656,6 +2717,7 @@ static int ir_try_vectorize_minmax_at(IRFunction *function, size_t header_index,
     memset(&d, 0, sizeof(d));
     d.width_bits = width_bits;
     d.is_int = is_int;
+    d.elem_bits = 32; /* lane width == element width for these */
     d.body_lo = branch_index + 1;
     d.body_hi = jump_index;
     if (bound.kind == IR_OPERAND_INT) {
@@ -2780,6 +2842,176 @@ static int vloop_int_cast_is_transparent(const char *ty) {
                 strcmp(ty, "int") == 0);
 }
 
+/* The value range a DAG node can take, or 0 when this cannot bound it.
+ *
+ * `+ - * & | ^ <<` are all congruent mod 2^32: the low 32 bits of a result
+ * depend only on the low 32 bits of its inputs, so 32-bit lanes reproduce them
+ * whatever width the scalar code used. `>>` is the exception -- it reads bits
+ * back DOWN, so a lane that wrapped where the scalar did not shifts different
+ * bits in. Bounding the shifted value inside int32 rules that out: no wrap can
+ * have happened, so both sides shift the same number.
+ *
+ * That bound is exactly what an image kernel's weighted sum has -- byte
+ * elements times constant weights, `(r*77 + g*150 + b*29) >> 8` reaching 65280
+ * at the very most. A runtime weight is unbounded and refused, which is the
+ * honest answer: nothing here can prove that one did not overflow. */
+#define VLOOP_RANGE_LIMIT 1099511627776LL /* 2^40: past this, give up */
+
+static int vloop_int_node_range(const VLoopDag *d, int node, long long *lo_out,
+                                long long *hi_out, int depth) {
+  const VLoopNode *n = NULL;
+  long long alo = 0, ahi = 0, blo = 0, bhi = 0;
+  int b_known = 0;
+
+  if (node < 0 || node >= d->n_nodes || depth > VLOOP_MAX_RESOLVE_DEPTH) {
+    return 0;
+  }
+  n = &d->nodes[node];
+  switch (n->tag) {
+  case VLOOP_VN_LOAD:
+    if (d->elem_bits == 8) {
+      *lo_out = d->elem_unsigned > 0 ? 0 : -128;
+      *hi_out = d->elem_unsigned > 0 ? 255 : 127;
+    } else {
+      *lo_out = -2147483648LL;
+      *hi_out = 2147483647LL;
+    }
+    return 1;
+  case VLOOP_VN_CONST:
+    if (n->op0 < 0 || n->op0 >= d->n_consts) {
+      return 0;
+    }
+    *lo_out = d->iconsts[n->op0];
+    *hi_out = d->iconsts[n->op0];
+    return 1;
+  case VLOOP_VN_IOTA:
+    if (!d->iota_bound_known || d->iota_bound <= 0) {
+      return 0;
+    }
+    *lo_out = 0;
+    *hi_out = d->iota_bound - 1;
+    return 1;
+  case VLOOP_VN_SCALAR:
+    return 0; /* a runtime invariant: nothing here bounds it */
+  default:
+    break;
+  }
+  {
+    /* A mask bounds its result however unbounded the other side was, so the
+     * operands' ranges are looked up but not required up front. */
+    int a_known = vloop_int_node_range(d, n->op0, &alo, &ahi, depth + 1);
+    b_known = vloop_int_node_range(d, n->op1, &blo, &bhi, depth + 1);
+    if (n->tag == VLOOP_VN_AND) {
+      if (b_known && blo == bhi && blo >= 0) {
+        *lo_out = 0;
+        *hi_out = blo;
+      } else if (a_known && alo == ahi && alo >= 0) {
+        *lo_out = 0;
+        *hi_out = alo;
+      } else if (a_known && b_known && alo >= 0 && blo >= 0) {
+        *lo_out = 0;
+        *hi_out = ahi < bhi ? ahi : bhi;
+      } else {
+        return 0;
+      }
+      return 1;
+    }
+    if (!a_known) {
+      return 0;
+    }
+  }
+  switch (n->tag) {
+  case VLOOP_VN_SHL:
+    if (n->op1 < 0 || n->op1 > 30) {
+      return 0;
+    }
+    *lo_out = alo << n->op1;
+    *hi_out = ahi << n->op1;
+    break;
+  case VLOOP_VN_SAR:
+  case VLOOP_VN_SHR:
+    if (n->op1 < 0 || n->op1 > 31) {
+      return 0;
+    }
+    /* A shift only shrinks magnitude; the bounds hold either way round. */
+    *lo_out = alo >> n->op1 < 0 ? alo : alo >> n->op1;
+    *hi_out = ahi >> n->op1;
+    if (*lo_out > *hi_out) {
+      return 0;
+    }
+    break;
+  case VLOOP_VN_ADD:
+  case VLOOP_VN_SUB:
+  case VLOOP_VN_MUL: {
+    if (!b_known) {
+      return 0;
+    }
+    if (n->tag == VLOOP_VN_ADD) {
+      *lo_out = alo + blo;
+      *hi_out = ahi + bhi;
+    } else if (n->tag == VLOOP_VN_SUB) {
+      *lo_out = alo - bhi;
+      *hi_out = ahi - blo;
+    } else {
+      long long c[4];
+      c[0] = alo * blo;
+      c[1] = alo * bhi;
+      c[2] = ahi * blo;
+      c[3] = ahi * bhi;
+      *lo_out = c[0];
+      *hi_out = c[0];
+      for (int k = 1; k < 4; k++) {
+        if (c[k] < *lo_out) *lo_out = c[k];
+        if (c[k] > *hi_out) *hi_out = c[k];
+      }
+    }
+    break;
+  }
+  case VLOOP_VN_OR:
+  case VLOOP_VN_XOR: {
+    /* Non-negative operands keep the result below the next power of two above
+     * either bound; anything with a sign bit in play is not worth modelling. */
+    if (!b_known || alo < 0 || blo < 0) {
+      return 0;
+    }
+    {
+      long long m = ahi > bhi ? ahi : bhi;
+      long long p = 1;
+      while (p <= m && p < VLOOP_RANGE_LIMIT) {
+        p <<= 1;
+      }
+      *lo_out = 0;
+      *hi_out = p - 1;
+    }
+    break;
+  }
+  default:
+    return 0;
+  }
+  if (*lo_out < -VLOOP_RANGE_LIMIT || *hi_out > VLOOP_RANGE_LIMIT) {
+    return 0;
+  }
+  return 1;
+}
+
+/* Is this node's value provably inside int32, so a right shift of it reads the
+ * same bits in a lane as it does in the scalar loop? */
+static int vloop_int_fits_int32(const VLoopDag *d, int node) {
+  long long lo = 0, hi = 0;
+  if (!vloop_int_node_range(d, node, &lo, &hi, 0)) {
+    return 0;
+  }
+  return lo >= -2147483648LL && hi <= 2147483647LL;
+}
+
+/* Which right shift a `>>` becomes: an unsigned expression shifts zeros in
+ * (vpsrld), a signed one replicates the sign (vpsrad). The lowerer records that
+ * on the instruction so its constant folder does not fold a shift with the
+ * wrong signedness, and the same bit answers it here. */
+static int vloop_int_shift_right_kind(const IRInstruction *ins) {
+  return ins->is_unsigned ? VLOOP_VN_SHR : VLOOP_VN_SAR;
+}
+
 static int vloop_int_binop_tag(const char *text) {
   if (strcmp(text, "+") == 0) return VLOOP_VN_ADD;
   if (strcmp(text, "-") == 0) return VLOOP_VN_SUB;
@@ -2788,6 +3020,98 @@ static int vloop_int_binop_tag(const char *text) {
   if (strcmp(text, "|") == 0) return VLOOP_VN_OR;
   if (strcmp(text, "^") == 0) return VLOOP_VN_XOR;
   return -1;
+}
+
+/* Integer twin of vloop_resolve_body_local: fold a per-iteration local's
+ * defining expression into the DAG in place of the symbol. Same three
+ * conditions -- written exactly once in the body, dead after the loop, and a
+ * bounded substitution depth so mutually-referential locals refuse rather than
+ * recurse without end. */
+static int vloop_resolve_body_local_int(IRFunction *function, const char *sym,
+                                        const char *iv, VLoopDag *d) {
+  const IRInstruction *def = NULL;
+  size_t def_idx = 0;
+  int result = -1;
+
+  if (!sym || d->resolve_depth >= VLOOP_MAX_RESOLVE_DEPTH || d->overflow) {
+    return -1;
+  }
+  for (size_t i = d->body_lo; i < d->body_hi; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ir_instruction_writes_destination(ins) &&
+        ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name &&
+        strcmp(ins->dest.name, sym) == 0) {
+      if (def) {
+        return -1; /* written more than once: not a per-iteration alias */
+      }
+      def = ins;
+      def_idx = i;
+    }
+  }
+  if (!def || ir_symbol_live_after_loop(function, d->body_hi + 1, sym)) {
+    return -1;
+  }
+  d->resolve_depth++;
+  if (def->op == IR_OP_BINARY && !def->is_float && def->text) {
+    int tag = vloop_int_binop_tag(def->text);
+    if (tag >= 0) {
+      int a = vloop_build_int(function, def_idx, &def->lhs, iv, d);
+      int b = (a < 0) ? -1 : vloop_build_int(function, def_idx, &def->rhs, iv, d);
+      if (a >= 0 && b >= 0) {
+        result = vloop_add_node(d, tag, a, b);
+      }
+    } else if (strcmp(def->text, "<<") == 0 &&
+               def->rhs.kind == IR_OPERAND_INT && def->rhs.int_value >= 0 &&
+               def->rhs.int_value < 32) {
+      int a = vloop_build_int(function, def_idx, &def->lhs, iv, d);
+      result = (a < 0) ? -1
+                       : vloop_add_node(d, VLOOP_VN_SHL, a,
+                                        (int)def->rhs.int_value);
+    } else if (strcmp(def->text, ">>") == 0 &&
+               def->rhs.kind == IR_OPERAND_INT && def->rhs.int_value >= 0 &&
+               def->rhs.int_value < 32) {
+      int a = vloop_build_int(function, def_idx, &def->lhs, iv, d);
+      result = (a < 0 || !vloop_int_fits_int32(d, a))
+                   ? -1
+                   : vloop_add_node(d, vloop_int_shift_right_kind(def), a,
+                                    (int)def->rhs.int_value);
+    }
+  } else if (def->op == IR_OP_ASSIGN || def->op == IR_OP_CAST) {
+    /* A cast into the local is transparent when it keeps at least the 32 bits
+     * the lanes carry; narrower ones fold sign back in and are refused. */
+    if (def->op == IR_OP_ASSIGN ||
+        (def->text && vloop_int_cast_is_transparent(def->text))) {
+      result = vloop_build_int(function, def_idx, &def->lhs, iv, d);
+    }
+  } else if (def->op == IR_OP_LOAD && def->lhs.kind == IR_OPERAND_TEMP &&
+             def->lhs.name && def->rhs.kind == IR_OPERAND_INT) {
+    /* `var x = a[i]` lowers to a LOAD straight into the symbol; rebuild it as
+     * an indexed array load by decoding the address. */
+    const char *base = NULL;
+    int bits = 0;
+    int ai = -1;
+    if (d->elem_bits == 8 && def->rhs.int_value == 1 &&
+        ir_decode_byte_indexed_address(function, def_idx, def->lhs.name, iv,
+                                       &base)) {
+      int is_unsigned = def->is_unsigned ? 1 : 0;
+      if (d->elem_unsigned < 0) {
+        d->elem_unsigned = is_unsigned;
+      }
+      if (is_unsigned == d->elem_unsigned) {
+        ai = vloop_intern_array(d, base);
+      }
+    } else if (d->elem_bits != 8 && def->rhs.int_value == 4 &&
+               ir_decode_float_indexed_address(function, def_idx, def->lhs.name,
+                                               iv, &base, &bits) &&
+               bits == 32) {
+      ai = vloop_intern_array(d, base);
+    }
+    if (ai >= 0) {
+      result = vloop_add_node(d, VLOOP_VN_LOAD, ai, 0);
+    }
+  }
+  d->resolve_depth--;
+  return result;
 }
 
 static int vloop_build_int(IRFunction *function, size_t before,
@@ -2810,7 +3134,13 @@ static int vloop_build_int(IRFunction *function, size_t before,
       return vloop_add_node(d, VLOOP_VN_IOTA, 0, 0);
     }
     if (vloop_symbol_written_in_body(function, d, op->name)) {
-      return -1;
+      /* Same substitution the float builder does: a per-iteration local
+       * (`var v: int32 = (int32)src[i];`) is not a broadcast value, but its
+       * defining expression can be folded into the DAG. Hoisting the
+       * declaration out of the body -- which the compiler now does -- leaves
+       * the WRITE inside it, so without this the named-intermediate form of
+       * every int map stays scalar. */
+      return vloop_resolve_body_local_int(function, op->name, iv, d);
     }
     {
       const char *ty = ir_function_local_declared_type(function, op->name);
@@ -2824,7 +3154,37 @@ static int vloop_build_int(IRFunction *function, size_t before,
       }
     }
   }
-  /* array load a[iv]: 4-byte elements only (the shape decoder pins iv<<2) */
+  /* array load a[iv]. Whether that is a 4-byte element read straight into the
+   * lane or a byte widened into it is fixed for the whole DAG by the store the
+   * matcher found: one loop cannot mix the two, because the kernel walks every
+   * base by the same element stride. */
+  if (op->kind == IR_OPERAND_TEMP && d->elem_bits == 8) {
+    const char *base = NULL;
+    int is_unsigned = 0;
+    if (ir_decode_byte_indexed_load(function, before, op->name, iv, &base,
+                                    &is_unsigned)) {
+      /* One widening rule per kernel: a uint8 array beside an int8 one would
+       * need two, and the lanes carry only the one. */
+      if (d->elem_unsigned < 0) {
+        d->elem_unsigned = is_unsigned;
+      } else if (is_unsigned != d->elem_unsigned) {
+        return -1;
+      }
+      {
+        int ai = vloop_intern_array(d, base);
+        return ai < 0 ? -1 : vloop_add_node(d, VLOOP_VN_LOAD, ai, 0);
+      }
+    }
+    {
+      /* Any OTHER load in a byte kernel is an element the lanes cannot walk
+       * alongside the rest. Arithmetic temps fall through to the DAG below. */
+      const IRInstruction *from =
+          ir_find_temp_producer_before(function, before, op->name);
+      if (from && from->op == IR_OP_LOAD) {
+        return -1;
+      }
+    }
+  }
   if (op->kind == IR_OPERAND_TEMP) {
     const char *base = NULL;
     int bits = 0;
@@ -2850,6 +3210,15 @@ static int vloop_build_int(IRFunction *function, size_t before,
       int a = vloop_build_int(function, pidx, &p->lhs, iv, d);
       return a < 0 ? -1
                    : vloop_add_node(d, VLOOP_VN_SHL, a, (int)p->rhs.int_value);
+    }
+    if (strcmp(p->text, ">>") == 0 && p->rhs.kind == IR_OPERAND_INT &&
+        p->rhs.int_value >= 0 && p->rhs.int_value <= 31) {
+      int a = vloop_build_int(function, pidx, &p->lhs, iv, d);
+      if (a < 0 || !vloop_int_fits_int32(d, a)) {
+        return -1;
+      }
+      return vloop_add_node(d, vloop_int_shift_right_kind(p), a,
+                            (int)p->rhs.int_value);
     }
     int tag = vloop_int_binop_tag(p->text);
     if (tag < 0) {
@@ -2906,19 +3275,53 @@ static int ir_match_int_map_at(IRFunction *function, size_t header_index,
       (store->lhs.kind != IR_OPERAND_TEMP &&
        store->lhs.kind != IR_OPERAND_SYMBOL &&
        store->lhs.kind != IR_OPERAND_INT) ||
-      store->rhs.kind != IR_OPERAND_INT || store->rhs.int_value != 4 ||
-      !ir_decode_float_indexed_address(function, store_index, store->dest.name,
-                                       iv_symbol, &dst_base, &store_bits) ||
-      store_bits != 32) {
+      store->rhs.kind != IR_OPERAND_INT) {
     return 1;
   }
 
   memset(d, 0, sizeof(*d));
   d->width_bits = 32;
   d->is_int = 1;
+  d->elem_bits = 32;
   d->body_lo = branch_index + 1;
   d->body_hi = jump_index;
-  root = vloop_build_int(function, store_index, &store->lhs, iv_symbol, d);
+
+  if (store->rhs.int_value == 1) {
+    /* A byte map: the lanes are still int32 (every op congruent mod 2^32, so
+     * the arithmetic is the scalar loop's exactly), and only the traffic at
+     * either end narrows -- widen on load, truncate on store. That truncation
+     * is what the store does anyway, so a `(uint8)` cast in front of it is an
+     * identity and must not be read as a narrowing the lanes have to model. */
+    const IROperand *value = &store->lhs;
+    d->elem_bits = 8;
+    d->elem_unsigned = -1; /* the first byte load fixes it for the kernel */
+    if (!ir_decode_byte_indexed_address(function, store_index,
+                                        store->dest.name, iv_symbol,
+                                        &dst_base)) {
+      return 1;
+    }
+    if (value->kind == IR_OPERAND_TEMP && value->name) {
+      const IRInstruction *cast =
+          ir_find_temp_producer_before(function, store_index, value->name);
+      if (cast && cast->op == IR_OP_CAST && cast->text &&
+          (strcmp(cast->text, "uint8") == 0 ||
+           strcmp(cast->text, "int8") == 0)) {
+        value = &cast->lhs;
+      }
+    }
+    root = vloop_build_int(function, store_index, value, iv_symbol, d);
+    if (d->elem_unsigned < 0) {
+      return 1; /* nothing widened: a fill, which has its own kernel */
+    }
+  } else if (store->rhs.int_value == 4 &&
+             ir_decode_float_indexed_address(function, store_index,
+                                             store->dest.name, iv_symbol,
+                                             &dst_base, &store_bits) &&
+             store_bits == 32) {
+    root = vloop_build_int(function, store_index, &store->lhs, iv_symbol, d);
+  } else {
+    return 1;
+  }
   if (root < 0 || d->overflow) {
     return 1;
   }
@@ -2994,7 +3397,11 @@ static int ir_try_vectorize_int_map_at(IRFunction *function,
 
   fused.op = IR_OP_SIMD_VLOOP_I32;
   fused.location = function->instructions[header_index].location;
-  fused.float_bits = 32;
+  /* float_bits carries the ELEMENT width for this opcode: 32 for int32
+   * elements, 8 for a byte map (int32 lanes either way). is_unsigned then says
+   * how the byte widens into the lane. */
+  fused.float_bits = d.elem_bits;
+  fused.is_unsigned = (d.elem_bits == 8) ? (d.elem_unsigned != 0) : 0;
   fused.dest = ir_operand_symbol(dst_base);
   fused.lhs = bound; /* take ownership of the cloned bound operand */
   if (!vloop_serialize_into(&fused, &d, /*reduce_op=*/0, root, depth)) {
@@ -3087,6 +3494,7 @@ static int ir_try_vectorize_int_reduce_at(IRFunction *function,
   memset(&d, 0, sizeof(d));
   d.width_bits = 32;
   d.is_int = 1;
+  d.elem_bits = 32; /* byte reductions belong to the vpsadbw sum kernel */
   d.body_lo = branch_index + 1;
   d.body_hi = jump_index;
   root = vloop_build_int(function, reduce_index, addend, iv_symbol, &d);

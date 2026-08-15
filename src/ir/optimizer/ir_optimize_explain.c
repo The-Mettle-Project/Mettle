@@ -4177,6 +4177,13 @@ void ir_explain_kernel_desc(const IRInstruction *ins, char *buf, size_t cap) {
   }
   case IR_OP_SIMD_VLOOP_I32: {
     long long r = ins->argument_count > 0 ? ins->arguments[0].int_value : 0;
+    if (ins->float_bits == 8) {
+      snprintf(buf, cap,
+               "8-wide %s byte map widened to int32 lanes (AVX2 general "
+               "vectorizer, bit-exact)",
+               ins->is_unsigned ? "uint8" : "int8");
+      return;
+    }
     snprintf(buf, cap, "8-wide int32 %s (AVX2 general vectorizer, bit-exact)",
              r == 1   ? "'+' reduction"
              : r == 2 ? "vpmaxsd max reduction"

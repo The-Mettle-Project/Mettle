@@ -6057,6 +6057,31 @@ catch {
   Write-CaseResult -Name "simd_minmax_reduce" -Passed $false -Reason $_.Exception.Message
 }
 
+# Byte element-wise maps: uint8/int8 in memory, int32 in the lanes. The
+# arithmetic is the int32 kernel's and stays bit-exact; the new parts are the
+# widening load (both extensions), the truncating store that must touch one
+# byte and not its neighbours, and the pack-plus-permute that folds eight
+# int32 lanes back into eight contiguous bytes. Trip counts straddle the
+# 8-element step so the byte-at-a-time tail runs too, and every destination is
+# checked past the run to catch a store that widened. Kernels are @simd! so the
+# build asserts they vectorize; references iterate backwards and stay scalar.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "byte_map.exe"
+  $buildOut = & $CompilerPath --build --release "tests/test_simd_byte_map.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "release build failed (a @simd! kernel stopped vectorizing?): $buildOut" }
+  if (-not (Test-Path $exePath)) { throw "release build produced no executable" }
+  & $exePath 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "a vectorized byte map diverged from its scalar reference ($LASTEXITCODE mismatches)"
+  }
+  Write-CaseResult -Name "simd_byte_map" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "simd_byte_map" -Passed $false -Reason $_.Exception.Message
+}
+
 # Early-exit search skip-ahead (simd_find): find/memchr/mismatch loops keep
 # their scalar body (every exit path replays natively) but fast-forward the
 # counter with an 8-wide int32 / 32-wide byte compare+movemask kernel. The

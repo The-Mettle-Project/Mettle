@@ -823,6 +823,27 @@ int wcs_avx_vpslld_ymm_imm(BinaryCodeBuffer *b, int dst, int src,
          binary_code_buffer_append_u8(b, imm);
 }
 
+/* The two right shifts share opcode 0x72 with the left one and differ only in
+ * the /digit: /2 shifts zeros in (unsigned), /4 replicates the sign. Which one
+ * a `>>` becomes is the shifted expression's own signedness. */
+int wcs_avx_vpsrld_ymm_imm(BinaryCodeBuffer *b, int dst, int src,
+                           unsigned char imm) {
+  return wcs_vex3(b, 1, 1, 1, 0, 2, dst, src) &&
+         binary_code_buffer_append_u8(b, 0x72) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | (2 << 3) | (dst & 7))) &&
+         binary_code_buffer_append_u8(b, imm);
+}
+
+int wcs_avx_vpsrad_ymm_imm(BinaryCodeBuffer *b, int dst, int src,
+                           unsigned char imm) {
+  return wcs_vex3(b, 1, 1, 1, 0, 4, dst, src) &&
+         binary_code_buffer_append_u8(b, 0x72) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | (4 << 3) | (dst & 7))) &&
+         binary_code_buffer_append_u8(b, imm);
+}
+
 /* vmovups ymm, [base+disp] (load) — VEX.256.0F.WIG 10. A 256-bit load is
  * data-agnostic, so this serves both pd and ps. */
 int wcs_avx_vmovups_ymm_mem(BinaryCodeBuffer *b, int dst, int base,
@@ -1081,6 +1102,51 @@ int wcs_avx_vpmovzxbd_ymm_mem(BinaryCodeBuffer *b, int dst, int base,
   return wcs_vex3(b, 2, 1, 1, 0, dst, base, 0) &&
          binary_code_buffer_append_u8(b, 0x31) &&
          wcs_avx_modrm_mem_disp(b, dst, base, displacement);
+}
+
+/* vpmovsxbd ymm, m64 — VEX.256.66.0F38.WIG 21 /r: eight int8 sign-extended
+ * into eight int32 lanes. The signed twin of the zero-extending form above;
+ * which one a byte kernel uses is the array's declared signedness. */
+int wcs_avx_vpmovsxbd_ymm_mem(BinaryCodeBuffer *b, int dst, int base,
+                              int displacement) {
+  return wcs_vex3(b, 2, 1, 1, 0, dst, base, 0) &&
+         binary_code_buffer_append_u8(b, 0x21) &&
+         wcs_avx_modrm_mem_disp(b, dst, base, displacement);
+}
+
+/* vpackusdw ymm — VEX.256.66.0F38.WIG 2B /r: dwords to words, unsigned
+ * saturating, within each 128-bit lane. */
+int wcs_avx_vpackusdw_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
+  return wcs_avx_0f38_ymm(b, 0x2B, dst, s1, s2);
+}
+
+/* vpackuswb ymm — VEX.256.66.0F.WIG 67 /r: words to bytes, unsigned
+ * saturating, within each 128-bit lane. */
+int wcs_avx_vpackuswb_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
+  return wcs_avx_vpd_ymm(b, 0x67, dst, s1, s2);
+}
+
+/* vpextrb [base+disp], xmm, 0 — VEX.128.66.0F3A.W0 14 /r ib. Stores lane 0's
+ * low byte and nothing else, which is what a byte kernel's scalar tail needs:
+ * a 4-byte store would take three neighbours with it. */
+int wcs_avx_vpextrb_mem_xmm(BinaryCodeBuffer *b, int base, int displacement,
+                            int xmm) {
+  return wcs_vex3(b, 3, 1, 0, 0, xmm, base, 0) &&
+         binary_code_buffer_append_u8(b, 0x14) &&
+         wcs_avx_modrm_mem_disp(b, xmm, base, displacement) &&
+         binary_code_buffer_append_u8(b, 0x00);
+}
+
+/* vpermq ymm, ymm, imm8 — VEX.256.66.0F3A.W1 00 /r ib. The one op here that
+ * crosses the 128-bit lane boundary, which is what a byte kernel needs: the
+ * in-lane packs leave the two halves of a result eight lanes apart. */
+int wcs_avx_vpermq_ymm(BinaryCodeBuffer *b, int dst, int src,
+                       unsigned char imm) {
+  return wcs_vex3(b, 3, 1, 1, 1, dst, src, 0) &&
+         binary_code_buffer_append_u8(b, 0x00) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (src & 7))) &&
+         binary_code_buffer_append_u8(b, imm);
 }
 
 /* vmovd xmm, r/m32 — VEX.128.66.0F.W0 6E /r. The VEX form is mandatory inside

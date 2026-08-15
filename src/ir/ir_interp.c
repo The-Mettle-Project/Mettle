@@ -366,6 +366,17 @@ static int ii_read_i32(IRInterpMachine *m, unsigned long long a, int *v) {
 static int ii_write_i32(IRInterpMachine *m, unsigned long long a, int v) {
   return ii_mem_write(m, a, 4, (unsigned int)v);
 }
+/* A byte widened into an int32 lane, and the truncation back. */
+static int ii_read_byte_as_i32(IRInterpMachine *m, unsigned long long a,
+                               int is_unsigned, int *v) {
+  unsigned long long raw;
+  if (!ii_mem_read(m, a, 1, &raw)) return 0;
+  *v = is_unsigned ? (int)(unsigned char)raw : (int)(signed char)raw;
+  return 1;
+}
+static int ii_write_byte(IRInterpMachine *m, unsigned long long a, int v) {
+  return ii_mem_write(m, a, 1, (unsigned long long)(unsigned char)(unsigned int)v);
+}
 static int ii_read_f64(IRInterpMachine *m, unsigned long long a, double *v) {
   unsigned long long raw;
   if (!ii_mem_read(m, a, 8, &raw)) return 0;
@@ -1814,7 +1825,10 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
     }
     int is_int = insn->op == IR_OP_SIMD_VLOOP_I32;
     int is_f32 = !is_int && insn->float_bits == 32;
-    long long elem_size = is_int || is_f32 ? 4 : 8;
+    /* Byte elements with int32 lanes: only the memory traffic narrows. */
+    int elem8 = is_int && insn->float_bits == 8;
+    int elem8_unsigned = elem8 && insn->is_unsigned;
+    long long elem_size = elem8 ? 1 : (is_int || is_f32 ? 4 : 8);
 
     unsigned long long arrays[32];
     double scalars_f[16];
@@ -1884,7 +1898,13 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
           case 0: { /* LOAD */
             if (op0 < 0 || op0 >= n_arrays) { ii_fail(machine, IR_INTERP_UNSUPPORTED, "vloop load idx"); return 0; }
             int e;
-            if (!ii_read_i32(machine, arrays[op0] + (unsigned long long)i * 4, &e)) return 0;
+            unsigned long long at =
+                arrays[op0] + (unsigned long long)i * (unsigned long long)elem_size;
+            if (elem8) {
+              if (!ii_read_byte_as_i32(machine, at, elem8_unsigned, &e)) return 0;
+            } else if (!ii_read_i32(machine, at, &e)) {
+              return 0;
+            }
             v = e;
             break;
           }
@@ -1898,6 +1918,8 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
           case 9: v = (long long)(int)((int)vals_i[op0] | (int)vals_i[op1]); break;
           case 10: v = (long long)(int)((int)vals_i[op0] ^ (int)vals_i[op1]); break;
           case 11: v = (long long)(int)((unsigned int)(int)vals_i[op0] << (op1 & 31)); break;
+          case 12: v = (long long)(int)((int)vals_i[op0] >> (op1 & 31)); break;
+          case 13: v = (long long)(int)((unsigned int)(int)vals_i[op0] >> (op1 & 31)); break;
           default:
             ii_fail(machine, IR_INTERP_UNSUPPORTED, "vloop int node tag");
             return 0;
@@ -1975,7 +1997,9 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
       } else {
         unsigned long long addr =
             dest_base + (unsigned long long)i * (unsigned long long)elem_size;
-        if (is_int) {
+        if (elem8) {
+          if (!ii_write_byte(machine, addr, (int)vals_i[root])) return 0;
+        } else if (is_int) {
           if (!ii_write_i32(machine, addr, (int)vals_i[root])) return 0;
         } else if (is_f32) {
           if (!ii_write_f32(machine, addr, (float)vals_f[root])) return 0;

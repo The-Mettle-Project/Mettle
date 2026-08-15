@@ -764,6 +764,8 @@ int code_generator_binary_emit_simd_affine_map_f32(
 #define VLOOP_K_OR 9
 #define VLOOP_K_XOR 10
 #define VLOOP_K_SHL 11
+#define VLOOP_K_SAR 12
+#define VLOOP_K_SHR 13
 #define VLOOP_KERNEL_REGS 4
 #define VLOOP_KERNEL_MAX_NODES 48
 #define VLOOP_KERNEL_MAX_BASES 4
@@ -816,6 +818,9 @@ int code_generator_binary_emit_simd_vloop_f64(
   static const BinaryGpRegister kGp[VLOOP_KERNEL_MAX_BASES] = {
       BINARY_GP_RCX, BINARY_GP_RDX, BINARY_GP_R8, BINARY_GP_R9};
   const int IOTA_CONST = 5;
+  /* ymm3 is the reduction's scalar accumulator; a byte MAP has no accumulator,
+   * so it borrows the register for the low-byte mask its store needs. */
+  const int BYTE_MASK = 3;
 
   if (!generator || !context || !instruction || instruction->argument_count < 7 ||
       !instruction->arguments || instruction->dest.kind != IR_OPERAND_SYMBOL) {
@@ -827,6 +832,17 @@ int code_generator_binary_emit_simd_vloop_f64(
     code_generator_set_error(generator, "simd_vloop bad float width");
     return 0;
   }
+  /* Byte elements with int32 lanes: the arithmetic is unchanged (every op
+   * congruent mod 2^32, so the lanes reproduce the scalar loop exactly) and
+   * only the traffic at either end narrows -- widen eight bytes into the lanes
+   * on load, truncate back to eight bytes on store. instruction->is_unsigned
+   * says which widening. */
+  const int elem8 = i32 && instruction->float_bits == 8;
+  const int elem8_unsigned = elem8 && instruction->is_unsigned;
+  if (i32 && instruction->float_bits != 32 && instruction->float_bits != 8) {
+    code_generator_set_error(generator, "simd_vloop bad int element width");
+    return 0;
+  }
   b = &context->code;
   /* f32 = single precision: f32x8 lanes (ps ops, 4-byte elements); f64x4 (pd
    * ops, 8-byte elements) otherwise. Int lanes are i32x8. All three stride 32
@@ -834,7 +850,9 @@ int code_generator_binary_emit_simd_vloop_f64(
    * raw 32-bit pattern is moved (loads, stores, broadcast slots). */
   const int f32 = i32 || (instruction->float_bits == 32);
   const int lanes = f32 ? 8 : 4;
-  const int elem_bytes = f32 ? 4 : 8;
+  const int elem_bytes = elem8 ? 1 : (f32 ? 4 : 8);
+  /* Bytes advance a base by one vector's worth of ELEMENTS, not of register. */
+  const int vec_stride = elem_bytes * lanes;
 
   const IROperand *args = instruction->arguments;
   long long reduce_op = args[0].int_value;
@@ -1016,6 +1034,12 @@ int code_generator_binary_emit_simd_vloop_f64(
    * int form instead loads it into RAX at finalize, because
    * wcs_accumulate_xmm0_i32_to_rax accumulates the lane sum INTO RAX (the
    * sum_i32 convention). */
+  if (elem8 && !is_reduce &&
+      (!binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, 0x000000FF000000FFULL) ||
+       !binary_emit_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) ||
+       !wcs_avx_vbroadcastsd_ymm_xmm(b, BYTE_MASK, 0))) {
+    return 0;
+  }
   if (is_minmax) {
     /* Seed every lane with the incoming accumulator instead of an identity:
      * min/max has no additive zero, and a broadcast seed is also what makes a
@@ -1076,7 +1100,10 @@ int code_generator_binary_emit_simd_vloop_f64(
         int R = pool[--nfree];
         int ok = 0;
         if (tag == VLOOP_K_LOAD) {
-          ok = wcs_avx_vmovups_ymm_mem(b, R, arr_reg[op0], 0);
+          ok = elem8 ? (elem8_unsigned
+                            ? wcs_avx_vpmovzxbd_ymm_mem(b, R, arr_reg[op0], 0)
+                            : wcs_avx_vpmovsxbd_ymm_mem(b, R, arr_reg[op0], 0))
+                     : wcs_avx_vmovups_ymm_mem(b, R, arr_reg[op0], 0);
         } else if (tag == VLOOP_K_CONST) {
           ok = wcs_avx_vmovups_ymm_mem(b, R, BINARY_GP_RSP, 32 * op0);
         } else if (tag == VLOOP_K_SCALAR) {
@@ -1093,13 +1120,19 @@ int code_generator_binary_emit_simd_vloop_f64(
           return 0;
         }
         vstk[nv++] = R;
-      } else if (tag == VLOOP_K_SHL) {
+      } else if (tag == VLOOP_K_SHL || tag == VLOOP_K_SAR ||
+                 tag == VLOOP_K_SHR) {
         if (nv < 1 || !i32) {
-          code_generator_set_error(generator, "vloop shl");
+          code_generator_set_error(generator, "vloop shift");
           return 0;
         }
         int ra = vstk[nv - 1]; /* unary: shift the stack top in place */
-        if (!wcs_avx_vpslld_ymm_imm(b, ra, ra, (unsigned char)op1)) {
+        if (!(tag == VLOOP_K_SHL
+                  ? wcs_avx_vpslld_ymm_imm(b, ra, ra, (unsigned char)op1)
+                  : tag == VLOOP_K_SAR
+                        ? wcs_avx_vpsrad_ymm_imm(b, ra, ra, (unsigned char)op1)
+                        : wcs_avx_vpsrld_ymm_imm(b, ra, ra,
+                                                 (unsigned char)op1))) {
           return 0;
         }
       } else {
@@ -1178,12 +1211,29 @@ int code_generator_binary_emit_simd_vloop_f64(
                        : wcs_avx_vaddpd_ymm(b, 2, 2, vstk[0])))) {
         return 0;
       }
+    } else if (elem8) {
+      /* Eight int32 lanes back down to eight contiguous bytes. Masking to the
+       * low byte first is what makes the two saturating packs exact: every
+       * value is then in 0..255, so neither one clamps and the result is the
+       * plain truncation the scalar store performs.
+       *
+       * The packs work within each 128-bit lane, which leaves the halves eight
+       * lanes apart; vpermq brings them together BEFORE the second pack, so
+       * the finished bytes land contiguously in the low quadword. */
+      int R = vstk[0];
+      if (!wcs_avx_vpand_ymm(b, R, R, BYTE_MASK) ||
+          !wcs_avx_vpackusdw_ymm(b, R, R, R) ||
+          !wcs_avx_vpermq_ymm(b, R, R, 0x08) ||
+          !wcs_avx_vpackuswb_ymm(b, R, R, R) ||
+          !wcs_movsd_mem_xmm(b, dst_reg, 0, R)) {
+        return 0;
+      }
     } else if (!wcs_avx_vmovups_mem_ymm(b, dst_reg, 0, vstk[0])) {
       return 0;
     }
   }
   for (int j = 0; j < n_dist; j++) {
-    if (!wcs_addsub_reg_imm8(b, kGp[j], 0, 32)) {
+    if (!wcs_addsub_reg_imm8(b, kGp[j], 0, vec_stride)) {
       return 0;
     }
   }
@@ -1224,7 +1274,16 @@ int code_generator_binary_emit_simd_vloop_f64(
       if (vloop_kernel_tag_is_leaf(tag)) {
         int R = pool[--nfree];
         int ok = 0;
-        if (tag == VLOOP_K_LOAD) {
+        if (tag == VLOOP_K_LOAD && elem8) {
+          /* Widen through a GP register: there is no scalar vpmovzxbd, and
+           * movzx/movsx name the two widenings directly. */
+          ok = (elem8_unsigned
+                    ? binary_emit_movzx_reg_mem8(b, BINARY_GP_RAX,
+                                                 (BinaryGpRegister)arr_reg[op0], 0)
+                    : binary_emit_movsx_reg_mem8(b, BINARY_GP_RAX,
+                                                 (BinaryGpRegister)arr_reg[op0], 0)) &&
+               wcs_avx_vmovd_xmm_reg(b, R, BINARY_GP_RAX);
+        } else if (tag == VLOOP_K_LOAD) {
           ok = i32 ? wcs_avx_vmovd_xmm_mem(b, R, arr_reg[op0], 0)
                    : (f32 ? wcs_movss_xmm_mem(b, R, arr_reg[op0], 0)
                           : wcs_movsd_xmm_mem(b, R, arr_reg[op0], 0));
@@ -1244,9 +1303,18 @@ int code_generator_binary_emit_simd_vloop_f64(
           return 0;
         }
         vstk[nv++] = R;
-      } else if (tag == VLOOP_K_SHL) {
-        int ra = vstk[nv - 1]; /* unary, in place; int lanes only */
-        if (!i32 || !wcs_avx_vpslld_ymm_imm(b, ra, ra, (unsigned char)op1)) {
+      } else if (tag == VLOOP_K_SHL || tag == VLOOP_K_SAR ||
+                 tag == VLOOP_K_SHR) {
+        /* Unary, in place. Every right shift maps a zero lane to zero, so the
+         * tail's zero-upper invariant survives them as it does the left one. */
+        int ra = vstk[nv - 1];
+        if (!i32 ||
+            !(tag == VLOOP_K_SHL
+                  ? wcs_avx_vpslld_ymm_imm(b, ra, ra, (unsigned char)op1)
+                  : tag == VLOOP_K_SAR
+                        ? wcs_avx_vpsrad_ymm_imm(b, ra, ra, (unsigned char)op1)
+                        : wcs_avx_vpsrld_ymm_imm(b, ra, ra,
+                                                 (unsigned char)op1))) {
           return 0;
         }
       } else if (i32) {
@@ -1331,6 +1399,12 @@ int code_generator_binary_emit_simd_vloop_f64(
                                                    (BinaryXmmRegister)vstk[0])
                        : binary_emit_addsd_xmm_xmm(b, BINARY_XMM3,
                                                    (BinaryXmmRegister)vstk[0]))) {
+        return 0;
+      }
+    } else if (elem8) {
+      /* The scalar store truncates to the low byte, which is exactly what the
+       * masked packs do eight at a time above. */
+      if (!wcs_avx_vpextrb_mem_xmm(b, dst_reg, 0, vstk[0])) {
         return 0;
       }
     } else if (!(i32 ? wcs_avx_vmovd_mem_xmm(b, dst_reg, 0, vstk[0])

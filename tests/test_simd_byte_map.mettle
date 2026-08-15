@@ -1,0 +1,144 @@
+// Correctness coverage for byte element-wise maps: uint8/int8 in memory, int32
+// in the lanes. The arithmetic is the int32 kernel's unchanged (every op
+// congruent mod 2^32, so bit-exact against the scalar loop); only the traffic
+// at either end is new, and that is where this pins things:
+//
+//   - the widening load, both zero- and sign-extending
+//   - the truncating store, which must touch one byte and not its neighbours
+//   - the two saturating packs plus the lane-crossing permute that turn eight
+//     int32 lanes back into eight contiguous bytes
+//   - a trip count with a tail, so the byte-at-a-time path runs too
+//   - `>>`, which is exact only where the shifted value provably fits in
+//     int32; a constant-weighted sum of bytes does, so these kernels take it
+//
+// Kernels are @simd! so the --release build asserts they vectorize. References
+// iterate backwards, a shape the vectorizer refuses, so they stay scalar in the
+// same binary. Returns the number of failures (0 = all correct).
+import "std/io";
+import "std/mem";
+
+fn brighten(dst: uint8*, src: uint8*, n: int32) {
+  @simd! for i in 0..n { dst[i] = (uint8)((int32)src[i] * 2 + 17); }
+}
+fn brighten_ref(dst: uint8*, src: uint8*, n: int32) {
+  var i: int32 = n - 1;
+  while (i >= 0) { dst[i] = (uint8)((int32)src[i] * 2 + 17); i = i - 1; }
+}
+
+fn combine(dst: uint8*, a: uint8*, b: uint8*, n: int32) {
+  @simd! for i in 0..n { dst[i] = (uint8)(((int32)a[i] + (int32)b[i]) * 3 - 7); }
+}
+fn combine_ref(dst: uint8*, a: uint8*, b: uint8*, n: int32) {
+  var i: int32 = n - 1;
+  while (i >= 0) { dst[i] = (uint8)(((int32)a[i] + (int32)b[i]) * 3 - 7); i = i - 1; }
+}
+
+// Constant weights bound the sum at 65280, so the shift is exact in 32 bits.
+fn gray3(dst: uint8*, r: uint8*, g: uint8*, b: uint8*, n: int32) {
+  @simd! for i in 0..n {
+    dst[i] = (uint8)(((int32)r[i] * 77 + (int32)g[i] * 150 + (int32)b[i] * 29) >> 8);
+  }
+}
+fn gray3_ref(dst: uint8*, r: uint8*, g: uint8*, b: uint8*, n: int32) {
+  var i: int32 = n - 1;
+  while (i >= 0) {
+    dst[i] = (uint8)(((int32)r[i] * 77 + (int32)g[i] * 150 + (int32)b[i] * 29) >> 8);
+    i = i - 1;
+  }
+}
+
+// A named intermediate per iteration: the declaration is hoisted and the write
+// substituted into the DAG, so this is the same kernel as the inline form.
+fn contrast(dst: uint8*, s: uint8*, n: int32) {
+  var v: int32 = 0;
+  @simd! for i in 0..n {
+    v = (int32)s[i];
+    dst[i] = (uint8)(((v - 128) * 3) >> 1);
+  }
+}
+fn contrast_ref(dst: uint8*, s: uint8*, n: int32) {
+  var i: int32 = n - 1;
+  while (i >= 0) {
+    var v: int32 = (int32)s[i];
+    dst[i] = (uint8)(((v - 128) * 3) >> 1);
+    i = i - 1;
+  }
+}
+
+// int8 elements sign-extend into the lanes, uint8 zero-extend. The difference
+// shows on any byte with the high bit set.
+fn signed_scale(dst: int8*, s: int8*, n: int32) {
+  @simd! for i in 0..n { dst[i] = (int8)((int32)s[i] * 3 + 1); }
+}
+fn signed_scale_ref(dst: int8*, s: int8*, n: int32) {
+  var i: int32 = n - 1;
+  while (i >= 0) { dst[i] = (int8)((int32)s[i] * 3 + 1); i = i - 1; }
+}
+
+fn main() -> int32 {
+  var a: uint8* = (uint8*)malloc(64);
+  var b: uint8* = (uint8*)malloc(64);
+  var c: uint8* = (uint8*)malloc(64);
+  var got: uint8* = (uint8*)malloc(64);
+  var want: uint8* = (uint8*)malloc(64);
+  var sa: int8* = (int8*)malloc(64);
+  var sgot: int8* = (int8*)malloc(64);
+  var swant: int8* = (int8*)malloc(64);
+  var counts: int32[9];
+  var bad: int32 = 0;
+
+  var i: int32 = 0;
+  while (i < 64) {
+    a[i] = (uint8)((i * 37 + 11) % 251);
+    b[i] = (uint8)((i * 13) % 199);
+    c[i] = (uint8)((i * 7 + 3) % 223);
+    sa[i] = (int8)((i * 29 + 5) % 251 - 125);
+    i = i + 1;
+  }
+
+  // Either side of the 8-element vector step, and no iterations at all.
+  counts[0] = 0; counts[1] = 1; counts[2] = 3; counts[3] = 7; counts[4] = 8;
+  counts[5] = 9; counts[6] = 16; counts[7] = 33; counts[8] = 40;
+
+  var k: int32 = 0;
+  while (k < 9) {
+    var n: int32 = counts[k];
+
+    // A sentinel past the run: the truncating store must not widen past its
+    // own byte, and the tail must not overrun the count.
+    var s: int32 = 0;
+    while (s < 64) { got[s] = 200; want[s] = 200; sgot[s] = 99; swant[s] = 99; s = s + 1; }
+
+    brighten(got, a, n); brighten_ref(want, a, n);
+    s = 0;
+    while (s < 64) { if (got[s] != want[s]) { bad = bad + 1; } s = s + 1; }
+
+    s = 0;
+    while (s < 64) { got[s] = 200; want[s] = 200; s = s + 1; }
+    combine(got, a, b, n); combine_ref(want, a, b, n);
+    s = 0;
+    while (s < 64) { if (got[s] != want[s]) { bad = bad + 1; } s = s + 1; }
+
+    s = 0;
+    while (s < 64) { got[s] = 200; want[s] = 200; s = s + 1; }
+    gray3(got, a, b, c, n); gray3_ref(want, a, b, c, n);
+    s = 0;
+    while (s < 64) { if (got[s] != want[s]) { bad = bad + 1; } s = s + 1; }
+
+    s = 0;
+    while (s < 64) { got[s] = 200; want[s] = 200; s = s + 1; }
+    contrast(got, a, n); contrast_ref(want, a, n);
+    s = 0;
+    while (s < 64) { if (got[s] != want[s]) { bad = bad + 1; } s = s + 1; }
+
+    signed_scale(sgot, sa, n); signed_scale_ref(swant, sa, n);
+    s = 0;
+    while (s < 64) { if (sgot[s] != swant[s]) { bad = bad + 1; } s = s + 1; }
+
+    k = k + 1;
+  }
+
+  print_int(bad);
+  newline();
+  return bad;
+}
