@@ -4660,6 +4660,44 @@ foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")
   }
 }
 
+# Every if-converted shape at seven lengths, against a scalar oracle in the
+# same program. Run with each contributing pass disabled in turn, so the
+# vectorized answer is checked against the scalar one it replaces rather than
+# only against itself.
+foreach ($variant in @("release", "debug", "no_vec", "no_accum", "no_hoist")) {
+  $total++
+  try {
+    $exePath = Join-Path $tmpDir "test_vloop_select_stress_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($variant -ne "debug") { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_vloop_select_stress.mettle", "-o", $exePath)
+
+    $skip = $null
+    if ($variant -eq "no_vec") { $skip = "auto_vectorize_int" }
+    if ($variant -eq "no_accum") { $skip = "if_convert_accumulate" }
+    if ($variant -eq "no_hoist") { $skip = "hoist_global_bases" }
+    if ($skip) { $env:METTLE_SKIP_PASS = $skip }
+    try {
+      $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    }
+    finally {
+      if ($skip) { Remove-Item Env:\METTLE_SKIP_PASS -ErrorAction SilentlyContinue }
+    }
+    if ($LASTEXITCODE -ne 0) {
+      throw "vloop-select-stress build ($variant) failed: $buildOut"
+    }
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 42) {
+      throw "vloop-select-stress ($variant) miscompiled (kernel $LASTEXITCODE)"
+    }
+    Write-CaseResult -Name "vloop_select_stress_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "vloop_select_stress_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # Counting under a condition. The comparison holds 0 or 1, so the accumulate is
 # made unconditional and the reduction kernels can read it. Run with the pass
 # disabled too, to check the rewritten answer against the branching one.

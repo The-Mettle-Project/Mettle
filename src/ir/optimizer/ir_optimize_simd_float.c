@@ -1461,6 +1461,16 @@ typedef struct {
   int resolve_depth; /* body-local substitution recursion guard */
   int iota_bound_known; /* the loop's trip count is a compile-time constant */
   long long iota_bound; /* that constant (iv ranges over [0, iota_bound)) */
+  /* Enclosing if-converted arms, innermost last. A name read inside an arm
+   * resolves within that arm first; failing that, to the value that reached the
+   * arm's diamond. Without this, resolving a name in the ELSE arm walked
+   * through the THEN arm and took its write. */
+  struct {
+    size_t lo;          /* first instruction of the arm */
+    size_t hi;          /* one past its last */
+    size_t incoming_hi; /* the diamond's branch: where the arm's input settled */
+  } regions[VLOOP_MAX_DIAMOND_DEPTH + 1];
+  int n_regions;
 } VLoopDag;
 
 #define VLOOP_MAX_RESOLVE_DEPTH 16
@@ -3435,6 +3445,7 @@ static int vloop_arm_value(IRFunction *function, const VLoopDiamond *dm,
   size_t lo = is_then ? dm->then_lo : dm->else_lo;
   size_t hi = is_then ? dm->then_hi : dm->else_hi;
   const IRInstruction *as = NULL;
+  int result;
   if (!vloop_region_assigns(function, lo, hi, name)) {
     return vloop_incoming_node(function, dm, name, iv, d);
   }
@@ -3442,7 +3453,18 @@ static int vloop_arm_value(IRFunction *function, const VLoopDiamond *dm,
   if (as) {
     return vloop_build_int(function, dm->branch_index, &as->lhs, iv, d);
   }
-  return vloop_resolve_region_int(function, name, lo, hi, iv, d);
+  /* The arm computes. Anything it reads resolves inside the arm, or from
+   * before the diamond; never from the other arm. */
+  if (d->n_regions >= VLOOP_MAX_DIAMOND_DEPTH) {
+    return -1;
+  }
+  d->regions[d->n_regions].lo = lo;
+  d->regions[d->n_regions].hi = hi;
+  d->regions[d->n_regions].incoming_hi = dm->branch_index;
+  d->n_regions++;
+  result = vloop_resolve_region_int(function, name, lo, hi, iv, d);
+  d->n_regions--;
+  return result;
 }
 
 /* Fold one value diamond into the DAG.
@@ -3554,8 +3576,13 @@ static int vloop_resolve_region_int(IRFunction *function, const char *name,
   for (size_t i = lo; i < hi;) {
     const IRInstruction *ins = &function->instructions[i];
     VLoopDiamond dm;
-    if (ins->op == IR_OP_BRANCH_ZERO &&
-        vloop_match_diamond(function, i, hi, &dm)) {
+    if (ins->op == IR_OP_BRANCH_ZERO) {
+      if (!vloop_match_diamond(function, i, hi, &dm)) {
+        /* A diamond that does not close inside this region means the region
+         * ends mid-arm. Walking on would read the other arm's writes as if
+         * they had happened. */
+        return -1;
+      }
       if (vloop_region_assigns(function, dm.then_lo, dm.else_hi, name)) {
         last_dm = dm;
         have_dm = 1;
@@ -3672,6 +3699,19 @@ static int vloop_resolve_body_local_int(IRFunction *function, const char *sym,
   }
   if (read_at > d->body_hi) {
     read_at = d->body_hi;
+  }
+  /* Innermost arm outwards: what this arm assigned, else what reached its
+   * diamond, and so on out to the loop body. */
+  for (int k = d->n_regions - 1; k >= 0; k--) {
+    size_t stop = read_at < d->regions[k].hi ? read_at : d->regions[k].hi;
+    if (stop > d->regions[k].lo) {
+      int found = vloop_resolve_region_int(function, sym, d->regions[k].lo, stop,
+                                           iv, d);
+      if (found >= 0) {
+        return found;
+      }
+    }
+    read_at = d->regions[k].incoming_hi;
   }
   return vloop_resolve_region_int(function, sym, d->body_lo, read_at, iv, d);
 }
