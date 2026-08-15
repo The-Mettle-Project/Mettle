@@ -1,5 +1,6 @@
 #include "ir.h"
 #include "../common.h"
+#include "../string_intern.h"
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -746,6 +747,23 @@ void ir_operand_destroy(IROperand *operand) {
   case IR_OPERAND_SYMBOL:
   case IR_OPERAND_STRING:
   case IR_OPERAND_LABEL:
+    /* Recognizer passes routinely cache an operand's name and keep using it
+     * while they build a replacement. If one is still held when the operand
+     * dies, poisoning turns a silent read of recycled heap into a name that
+     * cannot be mistaken for anything else. Without this the same defect
+     * surfaces as whatever small allocation happens to land in the freed slot
+     * -- a single character, a stray operator -- which reproduces perhaps one
+     * run in four and reads like a backend bug.
+     *
+     * Opt-in (-DMTLC_POISON_FREED_OPERANDS) so the default build provably pays
+     * nothing for it. Turn it on when a nondeterministic "Unknown IR temp"
+     * appears: it makes that whole class of defect reproduce every run, with a
+     * name no legitimate operand could have. */
+#ifdef MTLC_POISON_FREED_OPERANDS
+    if (operand->name && !string_is_interned(operand->name)) {
+      memset(operand->name, 0xA5, strlen(operand->name));
+    }
+#endif
     mettle_free_string(operand->name);
     break;
   default:

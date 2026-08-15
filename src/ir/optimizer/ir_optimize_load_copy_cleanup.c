@@ -757,7 +757,9 @@ int ir_if_convert_accumulate_pass(IRFunction *function, int *changed) {
         int addend_is_one =
             add->rhs.kind == IR_OPERAND_INT && add->rhs.int_value == 1;
 
-        ir_instruction_make_nop(&function->instructions[i]);
+        /* `cond` points into the branch's own operand, and retiring an
+         * instruction frees its operands. The branch is therefore NOPed only
+         * after both rewrites below have copied the name out of it. */
         if (addend_is_one) {
           /* `c = c + 1` under the condition IS `c = c + cond`. */
           ir_operand_destroy(&add->rhs);
@@ -797,6 +799,7 @@ int ir_if_convert_accumulate_pass(IRFunction *function, int *changed) {
           ir_instruction_destroy_storage(&function->instructions[jump]);
           function->instructions[jump] = sum;
         }
+        ir_instruction_make_nop(&function->instructions[i]);
         ir_instruction_make_nop(&function->instructions[else_label]);
         ir_instruction_make_nop(&function->instructions[end_label]);
         if (changed) {
