@@ -4660,6 +4660,52 @@ foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")
   }
 }
 
+# A sum kernel's base pointer, held in a local under an ordinary name. The rule
+# used to be a name match against the inliner's `_param_data` suffix, so whether
+# this vectorized depended on what the writer had called the variable.
+foreach ($variant in @("release", "debug")) {
+  $total++
+  try {
+    $exePath = Join-Path $tmpDir "test_sum_base_any_name_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($variant -eq "release") { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_sum_base_any_name.mettle", "-o", $exePath)
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "sum-base-any-name build ($variant) failed: $buildOut"
+    }
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 42) {
+      throw "sum-base-any-name ($variant) miscompiled (exit $LASTEXITCODE)"
+    }
+    Write-CaseResult -Name "sum_base_any_name_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "sum_base_any_name_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+$total++
+try {
+  $exePath = Join-Path $tmpDir "test_sum_base_any_name_cover.exe"
+  $coverOut = & $CompilerPath "--build" "--emit-obj" "--linker" "internal" "--release" `
+    "--explain" "tests\test_sum_base_any_name.mettle" "-o" $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "sum-base-any-name coverage build failed: $coverOut"
+  }
+  foreach ($fn in @("sum_via_local", "sum_direct")) {
+    if ($coverOut -notmatch "$fn \(loop @ line \d+\): vectorized") {
+      throw "$fn no longer vectorizes; the sum base rule went back to matching names"
+    }
+  }
+  Write-CaseResult -Name "sum_base_any_name_coverage" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "sum_base_any_name_coverage" -Passed $false -Reason $_.Exception.Message
+}
+
 # Hoisting a global array's base above its loop. A global's address was computed
 # inside the body, which hid the array from every recognizer at once, so a
 # program keeping its buffers at file scope vectorized nowhere.

@@ -1,0 +1,41 @@
+// The int32 sum kernel used to accept a base pointer only when it was a
+// parameter, or a local whose NAME ended in the inliner's `_param_data`. A
+// local holding the same pointer under any other name was refused, which meant
+// the shape vectorized or not depending on what the writer had called it.
+
+fn sum_via_local(a: int32*, n: int32) -> int64 {
+  var buf: int32* = a;
+  var total: int64 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    total = total + (int64)buf[i];
+    i = i + 1;
+  }
+  return total;
+}
+
+fn sum_direct(a: int32*, n: int32) -> int64 {
+  var total: int64 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    total = total + (int64)a[i];
+    i = i + 1;
+  }
+  return total;
+}
+
+fn main() -> int32 {
+  // Not a multiple of the 8-wide vector, so the scalar remainder runs too.
+  var d: int32[501];
+  var i: int32 = 0;
+  while (i < 501) {
+    d[i] = i * 2 - 300;
+    i = i + 1;
+  }
+
+  // 2 * (0 + ... + 500) - 300 * 501.
+  var expect: int64 = (int64)2 * (int64)125250 - (int64)150300;
+  if (sum_via_local(&d[0], 501) != expect) { return 1; }
+  if (sum_direct(&d[0], 501) != expect) { return 2; }
+  return 42;
+}

@@ -57,22 +57,53 @@ int ir_function_symbol_is_inlined_param(const IRFunction *function,
   return tag != NULL;
 }
 
+/* A local nothing reassigns holds one value for the whole function, which is
+ * what a base pointer or a trip count has to do. This is the property the two
+ * predicates below want; they used to ask for a name instead, matching the
+ * inliner's `_param_data` and `_param_len` suffixes, so a local that held the
+ * same value under any other name was refused. */
+static int ir_symbol_assigned_once(const IRFunction *function,
+                                   const char *symbol_name) {
+  int writes = 0;
+  if (!function || !symbol_name) {
+    return 0;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_DECLARE_LOCAL) {
+      continue;
+    }
+    if (ir_instruction_writes_destination(ins) &&
+        ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name &&
+        strcmp(ins->dest.name, symbol_name) == 0 && ++writes > 1) {
+      return 0;
+    }
+  }
+  return writes == 1;
+}
+
+static int ir_symbol_is_settled_local(const IRFunction *function,
+                                      const char *symbol_name,
+                                      const char *expected_type) {
+  const char *type = ir_function_local_declared_type(function, symbol_name);
+  if (!type || (expected_type && strcmp(type, expected_type) != 0)) {
+    return 0;
+  }
+  return ir_symbol_assigned_once(function, symbol_name);
+}
+
 int ir_symbol_is_sum_loop_bound(const IRFunction *function,
                                        const char *symbol_name) {
   return ir_function_symbol_is_parameter(function, symbol_name) ||
-         ir_function_symbol_is_inlined_param(function, symbol_name, "int32",
-                                             "_param_len") ||
-         ir_function_symbol_is_inlined_param(function, symbol_name, "int64",
-                                             "_param_n") ||
-         ir_function_symbol_is_inlined_param(function, symbol_name, "int64",
-                                             "_param_count");
+         ir_symbol_is_settled_local(function, symbol_name, "int32") ||
+         ir_symbol_is_settled_local(function, symbol_name, "int64");
 }
 
 int ir_symbol_is_sum_array_base(const IRFunction *function,
                                        const char *symbol_name) {
   return ir_function_symbol_is_parameter(function, symbol_name) ||
-         ir_function_symbol_is_inlined_param(function, symbol_name, "int32*",
-                                             "_param_data");
+         ir_symbol_is_settled_local(function, symbol_name, "int32*") ||
+         ir_symbol_is_settled_local(function, symbol_name, "uint32*");
 }
 
 int ir_label_is_while_header(const char *label) {
