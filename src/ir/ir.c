@@ -2837,6 +2837,64 @@ static MtlcType *ir_gpu_launch_params_type(IRProgram *program, size_t count) {
   return type;
 }
 
+/* Register `T*` for each scalar T, so a pass that needs to name a pointer type
+ * has one whether or not the source ever spelled it. Optimizer passes see the
+ * program only through its functions, and a local they declare must carry a
+ * type string the backend can resolve to a stack slot. */
+int ir_program_register_scalar_pointer_types(IRProgram *program) {
+  static const char *kElements[] = {"int8",    "uint8",   "int16",  "uint16",
+                                    "int32",   "uint32",  "int64",  "uint64",
+                                    "float32", "float64"};
+  if (!program) {
+    return 0;
+  }
+  for (size_t i = 0; i < sizeof(kElements) / sizeof(kElements[0]); i++) {
+    char name[32];
+    MtlcType *base = NULL;
+    MtlcType *type = NULL;
+    snprintf(name, sizeof(name), "%s*", kElements[i]);
+    if (ir_program_lookup_type(program, name)) {
+      continue;
+    }
+    base = ir_program_lookup_type(program, kElements[i]);
+    if (!base) {
+      continue;
+    }
+    if (program->owned_type_count == program->owned_type_capacity) {
+      size_t next = program->owned_type_capacity
+                        ? program->owned_type_capacity * 2
+                        : 8;
+      MtlcType **grown =
+          realloc(program->owned_types, next * sizeof(*program->owned_types));
+      if (!grown) {
+        return 0;
+      }
+      program->owned_types = grown;
+      program->owned_type_capacity = next;
+    }
+    type = calloc(1, sizeof(*type));
+    if (!type) {
+      return 0;
+    }
+    type->name = mettle_strdup(name);
+    if (!type->name) {
+      free(type);
+      return 0;
+    }
+    type->kind = MTLC_TYPE_POINTER;
+    type->base_type = base;
+    type->size = 8;
+    type->alignment = 8;
+    if (!ir_program_register_type(program, name, type)) {
+      free((char *)type->name);
+      free(type);
+      return 0;
+    }
+    program->owned_types[program->owned_type_count++] = type;
+  }
+  return 1;
+}
+
 static int ir_gpu_launch_append_local(IRFunction *out, const char *name,
                                       MtlcType *type,
                                       const IROperand *value,

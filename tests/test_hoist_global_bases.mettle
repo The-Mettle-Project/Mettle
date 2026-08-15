@@ -1,0 +1,100 @@
+// Buffers at file scope. Every loop below indexes a global array directly,
+// which used to compute the base inside the body where no recognizer could see
+// it. Values are checked against hand-computed results; the harness separately
+// asserts these loops now reach the vector kernels.
+
+var SRC: int32[512];
+var DST: int32[512];
+var BYTES: uint8[512];
+var REALS: float64[512];
+
+fn fill_src() {
+  var i: int32 = 0;
+  while (i < 512) {
+    SRC[i] = i * 3 + 1;
+    i = i + 1;
+  }
+}
+
+fn map_src() {
+  var i: int32 = 0;
+  while (i < 512) {
+    DST[i] = SRC[i] * 2 - 1;
+    i = i + 1;
+  }
+}
+
+fn sum_dst() -> int64 {
+  var s: int64 = 0;
+  var i: int32 = 0;
+  while (i < 512) {
+    s = s + (int64)DST[i];
+    i = i + 1;
+  }
+  return s;
+}
+
+// Two globals in one body, and a clamp over them: the hoist has to name both
+// bases, and if-conversion has to fold the branch on top of that.
+fn clamp_src_into_dst() {
+  var i: int32 = 0;
+  while (i < 512) {
+    var v: int32 = SRC[i];
+    if (v > 1000) { v = 1000; }
+    DST[i] = v;
+    i = i + 1;
+  }
+}
+
+fn fill_reals() -> float64 {
+  var i: int32 = 0;
+  while (i < 512) {
+    REALS[i] = (float64)i * 0.5;
+    i = i + 1;
+  }
+  var acc: float64 = 0.0;
+  var j: int32 = 0;
+  while (j < 512) {
+    acc = acc + REALS[j];
+    j = j + 1;
+  }
+  return acc;
+}
+
+fn fill_bytes() -> int32 {
+  var i: int32 = 0;
+  while (i < 512) {
+    BYTES[i] = (uint8)(i & 63);
+    i = i + 1;
+  }
+  var acc: int32 = 0;
+  var j: int32 = 0;
+  while (j < 512) {
+    acc = acc + (int32)BYTES[j];
+    j = j + 1;
+  }
+  return acc;
+}
+
+fn main() -> int32 {
+  fill_src();
+  if (SRC[0] != 1 || SRC[511] != 1534) { return 1; }
+
+  map_src();
+  if (DST[0] != 1 || DST[511] != 3067) { return 2; }
+
+  // DST[i] = 6i + 1, so the sum over 0..511 is 6*130816 + 512.
+  if (sum_dst() != 785408) { return 3; }
+
+  clamp_src_into_dst();
+  // SRC[i] = 3i + 1 crosses 1000 at i = 333.
+  if (DST[332] != 997 || DST[333] != 1000 || DST[511] != 1000) { return 4; }
+
+  // 0.5 * (0 + 1 + ... + 511) = 0.5 * 130816.
+  if (fill_reals() != 65408.0) { return 5; }
+
+  // Eight runs of 0..63, so 8 * 2016.
+  if (fill_bytes() != 16128) { return 6; }
+
+  return 42;
+}

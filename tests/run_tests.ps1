@@ -4660,6 +4660,62 @@ foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")
   }
 }
 
+# Hoisting a global array's base above its loop. A global's address was computed
+# inside the body, which hid the array from every recognizer at once, so a
+# program keeping its buffers at file scope vectorized nowhere.
+foreach ($variant in @("release", "debug", "release_scalar")) {
+  $total++
+  try {
+    $exePath = Join-Path $tmpDir "test_hoist_global_bases_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($variant -like "release*") { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_hoist_global_bases.mettle", "-o", $exePath)
+
+    if ($variant -eq "release_scalar") { $env:METTLE_SKIP_PASS = "hoist_global_bases" }
+    try {
+      $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    }
+    finally {
+      if ($variant -eq "release_scalar") { Remove-Item Env:\METTLE_SKIP_PASS -ErrorAction SilentlyContinue }
+    }
+    if ($LASTEXITCODE -ne 0) {
+      throw "hoist-global-bases build ($variant) failed: $buildOut"
+    }
+
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 42) {
+      throw "hoist-global-bases ($variant) miscompiled (exit $LASTEXITCODE)"
+    }
+
+    Write-CaseResult -Name "hoist_global_bases_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "hoist_global_bases_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# Anti-rot guard: without the hoist these loops are still correct, just scalar.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "test_hoist_global_bases_cover.exe"
+  $coverOut = & $CompilerPath "--build" "--emit-obj" "--linker" "internal" "--release" `
+    "--explain" "tests\test_hoist_global_bases.mettle" "-o" $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "hoist-global-bases coverage build failed: $coverOut"
+  }
+  foreach ($fn in @("fill_src", "map_src", "clamp_src_into_dst", "fill_reals")) {
+    if ($coverOut -notmatch "$fn \(loop @ line \d+\): vectorized") {
+      throw "$fn no longer vectorizes; a global array's base stopped being hoisted"
+    }
+  }
+  Write-CaseResult -Name "hoist_global_bases_coverage" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "hoist_global_bases_coverage" -Passed $false -Reason $_.Exception.Message
+}
+
 # If-conversion in the general vectorizer: an `if` whose arms only choose a
 # value becomes a lane select, so a clamp, a ReLU and a floor all reach the same
 # kernel however the source spells them. Run with the pass disabled as well, to
@@ -4724,17 +4780,25 @@ catch {
 $total++
 try {
   $exePath = Join-Path $tmpDir "test_mir_global_aggregate_addr_cover.exe"
-  $coverOut = & $CompilerPath "--build" "--emit-obj" "--linker" "internal" "--release" `
-    "--explain" "tests\test_mir_global_aggregate_addr.mettle" "-o" $exePath 2>&1 | Out-String
+  $env:METTLE_MIR_TRACE = "1"
+  try {
+    $coverOut = & $CompilerPath "--build" "--emit-obj" "--linker" "internal" "--release" `
+      "tests\test_mir_global_aggregate_addr.mettle" "-o" $exePath 2>&1 | Out-String
+  }
+  finally {
+    Remove-Item Env:\METTLE_MIR_TRACE -ErrorAction SilentlyContinue
+  }
   if ($LASTEXITCODE -ne 0) {
     throw "mir-global-aggregate-addr coverage build failed: $coverOut"
   }
-  if ($coverOut -notmatch '(\d+)/(\d+) functions reaching codegen') {
-    throw "no backend coverage line in --explain output"
+  if ($coverOut -notmatch 'MIR-(OK|BAIL)') {
+    throw "no MIR gate trace; METTLE_MIR_TRACE stopped reporting"
   }
-  if ($Matches[1] -ne $Matches[2]) {
-    throw ("only {0}/{1} functions register-allocated; a global aggregate's " +
-           "address declined the eligibility gate again") -f $Matches[1], $Matches[2]
+  # The gate may still decline a function for its own reasons (a SIMD kernel it
+  # has no passthrough for, say). What must never come back is declining one
+  # because it took a global aggregate's address.
+  if ($coverOut -match 'MIR-BAIL\s+(addressof|global_access)') {
+    throw "the gate declined a function with '$($Matches[1])'; a global aggregate's address stopped being addressable"
   }
   Write-CaseResult -Name "mir_global_aggregate_addr_coverage" -Passed $true
 }

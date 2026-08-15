@@ -114,6 +114,233 @@ int ir_hoist_body_locals_pass(IRFunction *function, int *changed) {
   return 1;
 }
 
+static const char *ir_hoist_element_pointer_type(const IRInstruction *mem) {
+  if (mem->rhs.kind != IR_OPERAND_INT) {
+    return NULL;
+  }
+  if (mem->is_float) {
+    return mem->rhs.int_value == 4 ? "float32*" : "float64*";
+  }
+  switch (mem->rhs.int_value) {
+  case 1: return mem->is_unsigned ? "uint8*" : "int8*";
+  case 2: return mem->is_unsigned ? "uint16*" : "int16*";
+  case 8: return mem->is_unsigned ? "uint64*" : "int64*";
+  default: return mem->is_unsigned ? "uint32*" : "int32*";
+  }
+}
+
+/* The address operand of a memory op, or NULL if it is not one. A store's dest
+ * is the address it writes through. */
+static const IROperand *ir_hoist_memory_address(const IRInstruction *ins) {
+  if (ins->op == IR_OP_LOAD) {
+    return &ins->lhs;
+  }
+  if (ins->op == IR_OP_STORE) {
+    return &ins->dest;
+  }
+  return NULL;
+}
+
+/* The element type reached through `addr_temp`, as a pointer type for the
+ * hoisted base's declaration. An index lands one `+` past the base, so follow
+ * that step as well as reading straight through. Returning NULL means nothing
+ * in the loop indexes off this address, and there is no base worth naming. */
+static const char *ir_hoist_base_pointer_type(const IRFunction *function,
+                                              size_t lo, size_t hi,
+                                              const char *addr_temp) {
+  for (size_t i = lo; i < hi; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    const IROperand *addr = ir_hoist_memory_address(ins);
+    const char *derived = NULL;
+    if (addr && ir_operand_is_temp_named(addr, addr_temp)) {
+      return ir_hoist_element_pointer_type(ins);
+    }
+    if (ins->op != IR_OP_BINARY || ins->is_float || !ins->text ||
+        strcmp(ins->text, "+") != 0 || ins->dest.kind != IR_OPERAND_TEMP ||
+        !ins->dest.name ||
+        !(ir_operand_is_temp_named(&ins->lhs, addr_temp) ||
+          ir_operand_is_temp_named(&ins->rhs, addr_temp))) {
+      continue;
+    }
+    derived = ins->dest.name;
+    for (size_t j = i + 1; j < hi; j++) {
+      const IRInstruction *mem = &function->instructions[j];
+      const IROperand *maddr = ir_hoist_memory_address(mem);
+      if (maddr && ir_operand_is_temp_named(maddr, derived)) {
+        return ir_hoist_element_pointer_type(mem);
+      }
+    }
+  }
+  return NULL;
+}
+
+/* True if `sym` names a global rather than anything this function declares. */
+static int ir_hoist_symbol_is_global(const IRFunction *function,
+                                     const char *sym) {
+  return sym && !ir_function_symbol_is_parameter(function, sym) &&
+         ir_function_local_declared_type(function, sym) == NULL;
+}
+
+static void ir_hoist_rename_temp_reads(IRFunction *function, size_t lo,
+                                       size_t hi, const char *temp,
+                                       const char *sym) {
+  for (size_t i = lo; i < hi; i++) {
+    IRInstruction *ins = &function->instructions[i];
+    IROperand *slots[3];
+    slots[0] = &ins->lhs;
+    slots[1] = &ins->rhs;
+    slots[2] = (ins->op == IR_OP_STORE) ? &ins->dest : NULL;
+    for (int k = 0; k < 3; k++) {
+      if (!slots[k] || !ir_operand_is_temp_named(slots[k], temp)) {
+        continue;
+      }
+      {
+        int float_bits = slots[k]->float_bits;
+        ir_operand_destroy(slots[k]);
+        *slots[k] = ir_operand_symbol(sym);
+        slots[k]->float_bits = float_bits;
+      }
+    }
+    for (size_t a = 0; a < ins->argument_count; a++) {
+      if (ir_operand_is_temp_named(&ins->arguments[a], temp)) {
+        int float_bits = ins->arguments[a].float_bits;
+        ir_operand_destroy(&ins->arguments[a]);
+        ins->arguments[a] = ir_operand_symbol(sym);
+        ins->arguments[a].float_bits = float_bits;
+      }
+    }
+  }
+}
+
+/* Reads of a temp anywhere outside [lo,hi). */
+static int ir_hoist_temp_escapes(const IRFunction *function, size_t lo,
+                                 size_t hi, const char *temp) {
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (i >= lo && i < hi) {
+      continue;
+    }
+    if (ir_operand_is_temp_named(&ins->lhs, temp) ||
+        ir_operand_is_temp_named(&ins->rhs, temp) ||
+        ir_operand_is_temp_named(&ins->dest, temp)) {
+      return 1;
+    }
+    for (size_t a = 0; a < ins->argument_count; a++) {
+      if (ir_operand_is_temp_named(&ins->arguments[a], temp)) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+/* Give a loop-invariant `&global` a name above the loop.
+ *
+ * `G[i]`, where G is a global array, lowers to `%t <- &@G` INSIDE the body and
+ * then indexes off the temp. Every recognizer reads a base as a symbol, so the
+ * temp hid the array from all of them at once: a program that keeps its buffers
+ * at file scope, which is how most C-shaped code is written, vectorized
+ * nowhere. `--explain` has been printing "hoist the invariant part of the index
+ * into a base pointer before the loop" for exactly this, which is advice for an
+ * edit the compiler can make itself.
+ *
+ * A global's address is a link-time constant, so the hoist is unconditional and
+ * needs no invariance proof. Doing it here rather than in each recognizer means
+ * every kernel gains global arrays at once, and none of them had to learn a
+ * second spelling of a base. */
+int ir_hoist_global_bases_pass(IRFunction *function, int *changed) {
+  if (!function) {
+    return 0;
+  }
+  for (size_t header = 0; header < function->instruction_count; header++) {
+    char loop_label[128];
+    size_t latch = 0;
+
+    {
+      const IRInstruction *label = &function->instructions[header];
+      if (label->op != IR_OP_LABEL ||
+          !ir_cleanup_label_is_loop_header(label->text) ||
+          snprintf(loop_label, sizeof(loop_label), "%s", label->text) >=
+              (int)sizeof(loop_label)) {
+        continue;
+      }
+    }
+    latch = ir_cleanup_loop_latch(function, header, loop_label);
+    if (!latch) {
+      continue;
+    }
+
+    /* Every insertion below can realloc the instruction array, so nothing here
+     * holds a pointer into it across one. */
+    for (size_t i = header + 1; i < latch; i++) {
+      char base_name[128];
+      char global[128];
+      char temp[128];
+      const char *ptr_type = NULL;
+      IRInstruction decl = {0};
+      IRInstruction init = {0};
+      int already = 0;
+
+      {
+        const IRInstruction *addr = &function->instructions[i];
+        if (addr->op != IR_OP_ADDRESS_OF ||
+            addr->dest.kind != IR_OPERAND_TEMP || !addr->dest.name ||
+            addr->lhs.kind != IR_OPERAND_SYMBOL || !addr->lhs.name ||
+            snprintf(global, sizeof(global), "%s", addr->lhs.name) >=
+                (int)sizeof(global) ||
+            snprintf(temp, sizeof(temp), "%s", addr->dest.name) >=
+                (int)sizeof(temp)) {
+          continue;
+        }
+      }
+      if (!ir_hoist_symbol_is_global(function, global)) {
+        continue;
+      }
+      ptr_type = ir_hoist_base_pointer_type(function, i, latch, temp);
+      if (!ptr_type || ir_hoist_temp_escapes(function, header, latch, temp)) {
+        continue;
+      }
+      /* Named per loop, so one body's several `&@G` share a base while a
+       * sibling loop gets its own and stays independent of this one's region. */
+      if (snprintf(base_name, sizeof(base_name), "__gbase_%s_%s", loop_label,
+                   global) >= (int)sizeof(base_name)) {
+        continue;
+      }
+      already = ir_function_local_declared_type(function, base_name) != NULL;
+
+      ir_hoist_rename_temp_reads(function, i, latch, temp, base_name);
+      ir_instruction_make_nop(&function->instructions[i]);
+      if (changed) {
+        *changed = 1;
+      }
+      if (already) {
+        continue;
+      }
+      decl.op = IR_OP_DECLARE_LOCAL;
+      decl.dest = ir_operand_symbol(base_name);
+      decl.text = mettle_strdup(ptr_type);
+      init.op = IR_OP_ADDRESS_OF;
+      init.dest = ir_operand_symbol(base_name);
+      init.lhs = ir_operand_symbol(global);
+      if (!decl.dest.name || !decl.text || !init.dest.name || !init.lhs.name ||
+          !ir_function_insert_instruction(function, header, &decl) ||
+          !ir_function_insert_instruction(function, header + 1, &init)) {
+        ir_instruction_destroy_storage(&decl);
+        ir_instruction_destroy_storage(&init);
+        return 0;
+      }
+      ir_instruction_destroy_storage(&decl);
+      ir_instruction_destroy_storage(&init);
+      /* The pair landed before the label, so the label, this instruction and
+       * the latch all sit two further along. */
+      header += 2;
+      i += 2;
+      latch += 2;
+    }
+  }
+  return 1;
+}
+
 int ir_eliminate_load_symbol_copy_pass(IRFunction *function,
                                               int *changed) {
   if (!function) {

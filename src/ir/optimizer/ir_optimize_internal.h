@@ -361,6 +361,7 @@ int ir_eliminate_unreachable_blocks_pass(IRFunction *function,
 int ir_eliminate_unreachable_straightline_pass(IRFunction *function,
                                                        int *changed);
 int ir_hoist_body_locals_pass(IRFunction *function, int *changed);
+int ir_hoist_global_bases_pass(IRFunction *function, int *changed);
 int ir_find_label_index(const IRFunction *function, const char *label,
                                size_t *out_index);
 int ir_find_last_writer_before(const IRFunction *function, size_t before_index,

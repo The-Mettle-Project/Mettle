@@ -68,6 +68,9 @@ static const IROptNamedPass g_ir_post_fixpoint_passes[] = {
      * plants a fresh one per parameter of every call it folded into a body, so
      * this has to run downstream of it. */
     {"hoist_body_locals", ir_hoist_body_locals_pass},
+    /* Beside it, and for the same reason: a global array's base is computed
+     * inside the body, where no recognizer reads it as a base. */
+    {"hoist_global_bases", ir_hoist_global_bases_pass},
     /* Before pointer induction, which rewrites an int32 scan's counter into a
      * walking pointer -- the extremum diamond then indexes off something no
      * longer recognizable as the loop counter. */
@@ -524,6 +527,9 @@ int ir_optimize_program_pipeline(IRProgram *program,
                           options ? options->explain_focus_file : NULL);
   ir_function_index_reset();
   ir_verify_begin_program(program);
+  /* hoist_global_bases declares a pointer local, which the backend resolves by
+   * name; a program whose source never spelled one would have no such type. */
+  ir_program_register_scalar_pointer_types(program);
 
   /* Fold never-written global integer vars to their initializer constants
    * first, so every later pass (strength reduction, vectorizers, TRE) sees

@@ -762,6 +762,7 @@ int ir_function_append_instruction(IRFunction *function,
                                    const IRInstruction *instruction);
 int ir_function_insert_instruction(IRFunction *function, size_t index,
                                    const IRInstruction *instruction);
+int ir_program_register_scalar_pointer_types(IRProgram *program);
 void ir_function_clear_cfg(IRFunction *function);
 int ir_function_rebuild_cfg(IRFunction *function);
 const IRBasicBlock *ir_function_blocks(IRFunction *function,
