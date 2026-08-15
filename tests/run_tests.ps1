@@ -4785,6 +4785,64 @@ catch {
   Write-CaseResult -Name "vloop_if_conversion_coverage" -Passed $false -Reason $_.Exception.Message
 }
 
+# Lane selects: a value chosen by a branch whose arms are NOT the two compared
+# values needs a real blend, not a minimum or a maximum. Covers the early-return
+# chain an inlined helper leaves behind, an if/else nest, and the two negated
+# compares (`<=`, `>=`) whose arms the kernel has to exchange.
+foreach ($variant in @("release", "debug", "release_scalar")) {
+  $total++
+  try {
+    $exePath = Join-Path $tmpDir "test_vloop_select_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($variant -like "release*") { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_vloop_select.mettle", "-o", $exePath)
+
+    if ($variant -eq "release_scalar") { $env:METTLE_SKIP_PASS = "auto_vectorize_int" }
+    try {
+      $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    }
+    finally {
+      if ($variant -eq "release_scalar") { Remove-Item Env:\METTLE_SKIP_PASS -ErrorAction SilentlyContinue }
+    }
+    if ($LASTEXITCODE -ne 0) {
+      throw "vloop-select build ($variant) failed: $buildOut"
+    }
+
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 42) {
+      throw "vloop-select ($variant) miscompiled (exit $LASTEXITCODE)"
+    }
+
+    Write-CaseResult -Name "vloop_select_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "vloop_select_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# Anti-rot guard: each of these is still correct when it stops being claimed,
+# just slower, so name the loops and require a vectorized verdict.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "test_vloop_select_cover.exe"
+  $coverOut = & $CompilerPath "--build" "--emit-obj" "--linker" "internal" "--release" `
+    "--explain" "tests\test_vloop_select.mettle" "-o" $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "vloop-select coverage build failed: $coverOut"
+  }
+  foreach ($fn in @("via_helper", "three_way", "negate_low", "ge_pick")) {
+    if ($coverOut -notmatch "$fn \(loop @ line \d+\): vectorized") {
+      throw "$fn no longer vectorizes; the lane select stopped being claimed"
+    }
+  }
+  Write-CaseResult -Name "vloop_select_coverage" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "vloop_select_coverage" -Passed $false -Reason $_.Exception.Message
+}
+
 # Anti-rot guard for the case above: correctness alone cannot tell the allocated
 # path from the fallback, so assert the coverage the gate is supposed to give.
 $total++

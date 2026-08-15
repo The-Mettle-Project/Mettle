@@ -768,9 +768,21 @@ int code_generator_binary_emit_simd_affine_map_f32(
 #define VLOOP_K_SHR 13
 #define VLOOP_K_MIN 14
 #define VLOOP_K_MAX 15
+#define VLOOP_K_CMPGT 16
+#define VLOOP_K_PAIR 17
+#define VLOOP_K_SELECT 18
 #define VLOOP_KERNEL_REGS 4
 #define VLOOP_KERNEL_MAX_NODES 48
 #define VLOOP_KERNEL_MAX_BASES 4
+#define VLOOP_KERNEL_POOL_MAX 6
+
+/* ymm registers a map's node stack may use. ymm0/1/2/4 always; ymm3 unless a
+ * byte map needs it for the store mask; ymm5 unless an iota occupies it. The
+ * recognizer and the kernel both size the pool here so neither can outrun the
+ * other. */
+int code_generator_vloop_pool_size(int elem8, int has_iota) {
+  return 4 + (elem8 ? 0 : 1) + (has_iota ? 0 : 1);
+}
 
 static int vloop_kernel_tag_is_leaf(int tag) {
   return tag == VLOOP_K_LOAD || tag == VLOOP_K_IOTA || tag == VLOOP_K_CONST ||
@@ -812,10 +824,10 @@ int code_generator_binary_emit_simd_vloop_f64(
     CodeGenerator *generator, BinaryFunctionContext *context,
     const IRInstruction *instruction, int operands_marshaled) {
   BinaryCodeBuffer *b = NULL;
-  /* ymm node-eval pools (volatile). Maps may use ymm0,1,2,4 (4-deep). '+'
-   * reductions reserve ymm2 = packed accumulator and xmm3 = scalar/prior
-   * accumulator, so their node pool is ymm0,1,4 (3-deep). ymm5 = iota const. */
-  static const int kPoolMap[4] = {0, 1, 2, 4};
+  /* ymm node-eval pools (volatile). A map's is sized below, once it is known
+   * whether ymm3 and ymm5 are spoken for. '+' reductions reserve ymm2 = packed
+   * accumulator and xmm3 = scalar/prior accumulator, so their node pool is
+   * ymm0,1,4 (3-deep). ymm5 = iota const. */
   static const int kPoolReduce[3] = {0, 1, 4};
   static const BinaryGpRegister kGp[VLOOP_KERNEL_MAX_BASES] = {
       BINARY_GP_RCX, BINARY_GP_RDX, BINARY_GP_R8, BINARY_GP_R9};
@@ -868,14 +880,12 @@ int code_generator_binary_emit_simd_vloop_f64(
   const int is_minmax = (reduce_op == 2 || reduce_op == 3);
   const int is_max = (reduce_op == 2);
   int is_reduce = (reduce_op == 1) || is_minmax;
-  const int *kPool = is_reduce ? kPoolReduce : kPoolMap;
-  int pool_n = is_reduce ? 3 : 4;
   size_t expect =
       (size_t)(7 + n_arrays + n_scalars + 3 * n_nodes + n_consts);
   if ((reduce_op < 0 || reduce_op > 3) || n_arrays < 0 ||
       n_arrays > VLOOP_KERNEL_MAX_BASES || n_nodes <= 0 ||
       n_nodes > VLOOP_KERNEL_MAX_NODES || n_consts < 0 || n_scalars < 0 ||
-      depth > pool_n || root < 0 || root >= n_nodes ||
+      root < 0 || root >= n_nodes ||
       instruction->argument_count != expect) {
     code_generator_set_error(generator, "Bad simd_vloop encoding");
     return 0;
@@ -905,6 +915,27 @@ int code_generator_binary_emit_simd_vloop_f64(
     if ((int)args[nodes_off + 3 * i].int_value == VLOOP_K_IOTA) {
       has_iota = 1;
     }
+  }
+  /* A map's node pool is every ymm this particular kernel does not otherwise
+   * need: ymm3 only carries a byte map's low-byte mask, ymm5 only an iota, so a
+   * map with neither has six to spend. ymm6 and up are callee-saved under Win64
+   * and stay out of it. code_generator_vloop_pool_size counts the same
+   * registers for the recognizer, which refuses a DAG deeper than this. */
+  int map_pool[VLOOP_KERNEL_POOL_MAX] = {0, 1, 2, 4, 0, 0};
+  int map_pool_n = 4;
+  if (!elem8) {
+    map_pool[map_pool_n++] = BYTE_MASK;
+  }
+  if (!has_iota) {
+    map_pool[map_pool_n++] = IOTA_CONST;
+  }
+  const int *kPool = is_reduce ? kPoolReduce : map_pool;
+  int pool_n = is_reduce ? 3 : map_pool_n;
+  if (pool_n != (is_reduce ? 3 : code_generator_vloop_pool_size(elem8,
+                                                                has_iota)) ||
+      depth > pool_n) {
+    code_generator_set_error(generator, "simd_vloop depth over pool");
+    return 0;
   }
   int arr_reg[VLOOP_KERNEL_MAX_BASES];
   for (int k = 0; k < n_arrays; k++) {
@@ -1083,7 +1114,7 @@ int code_generator_binary_emit_simd_vloop_f64(
     return 0;
   }
   {
-    int pool[4];
+    int pool[VLOOP_KERNEL_POOL_MAX];
     int nfree = pool_n;
     for (int i = 0; i < pool_n; i++) {
       pool[i] = kPool[i];
@@ -1137,6 +1168,32 @@ int code_generator_binary_emit_simd_vloop_f64(
                                                  (unsigned char)op1))) {
           return 0;
         }
+      } else if (tag == VLOOP_K_PAIR) {
+        /* Both values are already on the stack; the node exists only to give
+         * SELECT a third operand within a two-operand encoding. */
+        if (nv < 2) {
+          code_generator_set_error(generator, "vloop pair");
+          return 0;
+        }
+      } else if (tag == VLOOP_K_SELECT) {
+        /* mask ? then : else, as else ^ ((then ^ else) & mask). The mask is
+         * all-ones or all-zeros per lane, so the arithmetic picks one side
+         * whole, and it needs no register beyond the three already live. */
+        if (nv < 3 || !i32) {
+          code_generator_set_error(generator, "vloop select");
+          return 0;
+        }
+        int relse = vstk[--nv];
+        int rthen = vstk[--nv];
+        int rmask = vstk[--nv];
+        if (!wcs_avx_vpxor_ymm(b, rthen, rthen, relse) ||
+            !wcs_avx_vpand_ymm(b, rthen, rthen, rmask) ||
+            !wcs_avx_vpxor_ymm(b, rthen, rthen, relse)) {
+          return 0;
+        }
+        pool[nfree++] = relse;
+        pool[nfree++] = rmask;
+        vstk[nv++] = rthen;
       } else {
         if (nv < 2) {
           code_generator_set_error(generator, "vloop stack");
@@ -1183,12 +1240,15 @@ int code_generator_binary_emit_simd_vloop_f64(
           break;
         case VLOOP_K_MIN:
         case VLOOP_K_MAX:
+        case VLOOP_K_CMPGT:
           if (!i32) {
-            code_generator_set_error(generator, "vloop float minmax");
+            code_generator_set_error(generator, "vloop float compare");
             return 0;
           }
-          ok = tag == VLOOP_K_MIN ? wcs_avx_vpminsd_ymm(b, ra, ra, rb)
-                                  : wcs_avx_vpmaxsd_ymm(b, ra, ra, rb);
+          ok = tag == VLOOP_K_MIN
+                   ? wcs_avx_vpminsd_ymm(b, ra, ra, rb)
+                   : (tag == VLOOP_K_MAX ? wcs_avx_vpmaxsd_ymm(b, ra, ra, rb)
+                                         : wcs_avx_vpcmpgtd_ymm(b, ra, ra, rb));
           break;
         default: code_generator_set_error(generator, "vloop op"); return 0;
         }
@@ -1271,7 +1331,7 @@ int code_generator_binary_emit_simd_vloop_f64(
     return 0;
   }
   {
-    int pool[4];
+    int pool[VLOOP_KERNEL_POOL_MAX];
     int nfree = pool_n;
     for (int i = 0; i < pool_n; i++) {
       pool[i] = kPool[i];
@@ -1328,6 +1388,29 @@ int code_generator_binary_emit_simd_vloop_f64(
                                                  (unsigned char)op1))) {
           return 0;
         }
+      } else if (tag == VLOOP_K_PAIR) {
+        if (nv < 2) {
+          return 0;
+        }
+      } else if (tag == VLOOP_K_SELECT) {
+        /* Same bitwise select as the vector body. A zero lane compares equal,
+         * not greater, so the mask's upper lanes are zero and the blend keeps
+         * the else side there: zero stays zero and lane 0 is exact. */
+        int relse, rthen, rmask;
+        if (nv < 3 || !i32) {
+          return 0;
+        }
+        relse = vstk[--nv];
+        rthen = vstk[--nv];
+        rmask = vstk[--nv];
+        if (!wcs_avx_vpxor_ymm(b, rthen, rthen, relse) ||
+            !wcs_avx_vpand_ymm(b, rthen, rthen, rmask) ||
+            !wcs_avx_vpxor_ymm(b, rthen, rthen, relse)) {
+          return 0;
+        }
+        pool[nfree++] = relse;
+        pool[nfree++] = rmask;
+        vstk[nv++] = rthen;
       } else if (i32) {
         /* Integer tail ALU: full-width VEX ops on zero-upper values (every
          * leaf above loaded via VEX vmovd, and + - * & | ^ << all map zero
@@ -1344,6 +1427,7 @@ int code_generator_binary_emit_simd_vloop_f64(
         case VLOOP_K_XOR: ok = wcs_avx_vpxor_ymm(b, ra, ra, rb); break;
         case VLOOP_K_MIN: ok = wcs_avx_vpminsd_ymm(b, ra, ra, rb); break;
         case VLOOP_K_MAX: ok = wcs_avx_vpmaxsd_ymm(b, ra, ra, rb); break;
+        case VLOOP_K_CMPGT: ok = wcs_avx_vpcmpgtd_ymm(b, ra, ra, rb); break;
         default: return 0;
         }
         if (!ok) {

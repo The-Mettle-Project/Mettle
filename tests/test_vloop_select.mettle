@@ -1,0 +1,116 @@
+// A value chosen by a branch is a value. These are the shapes a helper leaves
+// behind once it is inlined, and the ones a hand-written nest produces: an
+// early-return chain, an if/else nest, and a negated compare. Each is checked
+// element by element against the same choice made in scalar code.
+
+import "std/mem";
+
+fn clamp_helper(x: int32, lo: int32, hi: int32) -> int32 {
+  if (x < lo) { return lo; }
+  if (x > hi) { return hi; }
+  return x;
+}
+
+// After inlining, all three returns land in one temp from three arms.
+fn via_helper(s: int32*, d: int32*, n: int64) {
+  var i: int64 = 0;
+  while (i < n) {
+    d[i] = clamp_helper(s[i], -100, 100);
+    i = i + 1;
+  }
+}
+
+// An if/else nest, where the arms are not the compared values, so the kernel
+// needs a real lane select rather than a minimum or a maximum.
+fn three_way(s: int32*, d: int32*, n: int64) {
+  var i: int64 = 0;
+  while (i < n) {
+    var v: int32 = s[i];
+    var r: int32 = 0;
+    if (v < -50) { r = v * 2; } else { if (v > 50) { r = v - 7; } else { r = v + 1000; } }
+    d[i] = r;
+    i = i + 1;
+  }
+}
+
+// `<=` is the negation of `>`, which the kernel takes by exchanging the arms.
+// Getting that backwards yields abs(v) where -abs(v) was written, so the two
+// halves of the input matter here.
+fn negate_low(s: int32*, d: int32*, n: int64) {
+  var i: int64 = 0;
+  while (i < n) {
+    var v: int32 = s[i];
+    var r: int32 = 0;
+    if (v <= 0) { r = 0 - v; } else { r = v; }
+    d[i] = r;
+    i = i + 1;
+  }
+}
+
+fn ge_pick(s: int32*, d: int32*, n: int64) {
+  var i: int64 = 0;
+  while (i < n) {
+    var v: int32 = s[i];
+    var r: int32 = 0;
+    if (v >= 10) { r = v * 3; } else { r = v - 3; }
+    d[i] = r;
+    i = i + 1;
+  }
+}
+
+fn main() -> int32 {
+  // Not a multiple of the 8-wide vector, so the scalar remainder runs too.
+  var n: int64 = 1003;
+  var a: int32* = (int32*)malloc(n * 4);
+  var b: int32* = (int32*)malloc(n * 4);
+  if (a == 0 || b == 0) { return 1; }
+
+  var i: int64 = 0;
+  while (i < n) {
+    a[i] = (int32)((i * 137 + 11) % 1301 - 650);
+    i = i + 1;
+  }
+
+  via_helper(a, b, n);
+  i = 0;
+  while (i < n) {
+    var e: int32 = a[i];
+    if (e < -100) { e = -100; } else { if (e > 100) { e = 100; } }
+    if (b[i] != e) { return 2; }
+    i = i + 1;
+  }
+
+  three_way(a, b, n);
+  i = 0;
+  while (i < n) {
+    var v: int32 = a[i];
+    var e2: int32 = v + 1000;
+    if (v < -50) { e2 = v * 2; } else { if (v > 50) { e2 = v - 7; } }
+    if (b[i] != e2) { return 3; }
+    i = i + 1;
+  }
+
+  negate_low(a, b, n);
+  i = 0;
+  while (i < n) {
+    var v3: int32 = a[i];
+    var e3: int32 = v3;
+    if (v3 <= 0) { e3 = 0 - v3; }
+    if (b[i] != e3) { return 4; }
+    i = i + 1;
+  }
+
+  ge_pick(a, b, n);
+  i = 0;
+  while (i < n) {
+    var v4: int32 = a[i];
+    var e4: int32 = v4 - 3;
+    if (v4 >= 10) { e4 = v4 * 3; }
+    if (b[i] != e4) { return 5; }
+    i = i + 1;
+  }
+
+  free((cstring)a);
+  free((cstring)b);
+  return 42;
+}
