@@ -463,13 +463,19 @@ static const DecisionDoc DECISIONS[] = {
      "(multiply the addend by the comparison instead of adding one).\n"},
     {"clamp-store", DECISION_VECTOR_REFUSAL,
      "A value clamped or selected before it is stored",
-     "`if (v > hi) { v = hi; }` before `a[i] = v` is a clamp: the arm rewrites\n"
-     "the element rather than an accumulator. The hardware op is vminps/\n"
-     "vmaxps and the loop is otherwise a plain map, but no kernel lowers a\n"
-     "clamp yet, so this is a gap in the compiler.\n"
+     "`if (v > hi) { v = hi; }` before `a[i] = v` is a clamp, and over int32\n"
+     "elements it vectorizes: the branch becomes vpminsd or vpmaxsd, or a\n"
+     "lane select when the arms are not the two compared values. A chain of\n"
+     "them, including the one an inlined helper's early returns leave behind,\n"
+     "folds the same way.\n"
      "\n"
-     "There is nothing to change in the loop. Written branchlessly it may\n"
-     "still not vectorize -- the select has no kernel either.\n"},
+     "This code fires when that conversion did not carry the loop. Two things\n"
+     "stop it: float32 and float64 elements, which have no select kernel yet,\n"
+     "and a nest deep enough that the values live at once outnumber the ymm\n"
+     "registers the kernel has, which is six for an int32 map. Three levels of\n"
+     "`if`/`else` over distinct expressions is past that.\n"
+     "\n"
+     "Splitting the deepest arm into its own loop is what usually helps.\n"},
     {"strided-access", DECISION_VECTOR_REFUSAL,
      "The loop steps more than one element at a time",
      "`rgb[i * 3 + 1]`, `dst[i * 2]`, and any other non-unit stride. Every\n"

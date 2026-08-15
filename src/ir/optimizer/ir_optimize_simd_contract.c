@@ -1247,14 +1247,16 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
       }
       if (shape == IR_BRANCH_SHAPE_CLAMP_STORE) {
         snprintf(reason, reason_cap,
-                 "the body clamps or selects a value before storing it (`%s` "
-                 "is rewritten on the taken arm); the map kernels take a "
-                 "straight-line expression, and no kernel lowers a clamp to "
-                 "vmin/vmax yet",
+                 "the body chooses `%s` under a condition before storing it. "
+                 "That shape does vectorize over int32 elements, as vpminsd, "
+                 "vpmaxsd or a lane select, so what stopped this one is either "
+                 "the element type (no float select kernel yet) or a nest too "
+                 "deep for the six ymm registers an int32 map has",
                  written ? written : "a local");
         snprintf(fix, fix_cap,
-                 "nothing to change here: this is a gap in the compiler, not a "
-                 "problem with the loop");
+                 "if the elements are int32, split the deepest arm into its own "
+                 "loop so fewer values are live at once; otherwise this is a "
+                 "gap in the compiler, not a problem with the loop");
         IR_SIMD_MARK_ADVISORY();
         IR_SIMD_SET_DIAG(IR_SIMD_BAIL_CLAMP_STORE);
         return;
@@ -1262,10 +1264,13 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
     }
     snprintf(reason, reason_cap,
              "the loop body branches on data (an `if` or `&&`/`||` per "
-             "iteration); only straight-line bodies vectorize");
+             "iteration). An `if` that only chooses a value is converted to a "
+             "lane select and does vectorize, so this one does something a "
+             "masked lane cannot: a store, a call, or a nest deeper than the "
+             "kernel has registers for");
     snprintf(fix, fix_cap,
-             "compute both arms and select arithmetically (branchless), or "
-             "split the work into two simpler loops");
+             "keep the arms to choosing a value, or split the work into two "
+             "simpler loops");
     IR_SIMD_SET_DIAG(IR_SIMD_BAIL_CONTROL_FLOW);
     return;
   }
