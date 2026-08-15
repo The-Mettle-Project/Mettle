@@ -771,6 +771,7 @@ int code_generator_binary_emit_simd_affine_map_f32(
 #define VLOOP_K_CMPGT 16
 #define VLOOP_K_PAIR 17
 #define VLOOP_K_SELECT 18
+#define VLOOP_K_CMPEQ 19
 #define VLOOP_KERNEL_REGS 4
 #define VLOOP_KERNEL_MAX_NODES 48
 #define VLOOP_KERNEL_MAX_BASES 4
@@ -1241,14 +1242,18 @@ int code_generator_binary_emit_simd_vloop_f64(
         case VLOOP_K_MIN:
         case VLOOP_K_MAX:
         case VLOOP_K_CMPGT:
+        case VLOOP_K_CMPEQ:
           if (!i32) {
             code_generator_set_error(generator, "vloop float compare");
             return 0;
           }
           ok = tag == VLOOP_K_MIN
                    ? wcs_avx_vpminsd_ymm(b, ra, ra, rb)
-                   : (tag == VLOOP_K_MAX ? wcs_avx_vpmaxsd_ymm(b, ra, ra, rb)
-                                         : wcs_avx_vpcmpgtd_ymm(b, ra, ra, rb));
+                   : tag == VLOOP_K_MAX
+                         ? wcs_avx_vpmaxsd_ymm(b, ra, ra, rb)
+                         : tag == VLOOP_K_CMPGT
+                               ? wcs_avx_vpcmpgtd_ymm(b, ra, ra, rb)
+                               : wcs_avx_vpcmpeqd_ymm(b, ra, ra, rb);
           break;
         default: code_generator_set_error(generator, "vloop op"); return 0;
         }
@@ -1428,6 +1433,7 @@ int code_generator_binary_emit_simd_vloop_f64(
         case VLOOP_K_MIN: ok = wcs_avx_vpminsd_ymm(b, ra, ra, rb); break;
         case VLOOP_K_MAX: ok = wcs_avx_vpmaxsd_ymm(b, ra, ra, rb); break;
         case VLOOP_K_CMPGT: ok = wcs_avx_vpcmpgtd_ymm(b, ra, ra, rb); break;
+        case VLOOP_K_CMPEQ: ok = wcs_avx_vpcmpeqd_ymm(b, ra, ra, rb); break;
         default: return 0;
         }
         if (!ok) {

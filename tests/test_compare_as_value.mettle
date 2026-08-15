@@ -1,0 +1,107 @@
+// A comparison read as a value. The lanes hold the compare's own answer, which
+// is all-ones or zero, so `& 1` narrows it to the 0 or 1 the source means and
+// `^ 1` negates it. Only `>` and `==` exist in the lanes: `<` is `>` with the
+// operands the other way round, and `<=`, `>=`, `!=` are the strict compare
+// negated. Each of those four rewrites is still plausible arithmetic when it is
+// backwards, so every operator is checked against the branching answer.
+
+import "std/mem";
+
+fn count_gt(a: int32*, n: int32, t: int32) -> int32 {
+  var c: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) { c = c + (int32)(a[i] > t); i = i + 1; }
+  return c;
+}
+
+fn count_lt(a: int32*, n: int32) -> int32 {
+  var c: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) { c = c + (int32)(a[i] < 0); i = i + 1; }
+  return c;
+}
+
+fn count_ge(a: int32*, n: int32) -> int32 {
+  var c: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) { c = c + (int32)(a[i] >= 100); i = i + 1; }
+  return c;
+}
+
+fn count_le(a: int32*, n: int32) -> int32 {
+  var c: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) { c = c + (int32)(a[i] <= -100); i = i + 1; }
+  return c;
+}
+
+fn count_eq(a: int32*, n: int32) -> int32 {
+  var c: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) { c = c + (int32)(a[i] == 7); i = i + 1; }
+  return c;
+}
+
+fn count_ne(a: int32*, n: int32) -> int32 {
+  var c: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) { c = c + (int32)(a[i] != 7); i = i + 1; }
+  return c;
+}
+
+// The same value in a map rather than a reduction: a mask, not a count.
+fn mask_map(a: int32*, d: int32*, n: int32) {
+  var i: int32 = 0;
+  while (i < n) { d[i] = a[i] * (int32)(a[i] > 0); i = i + 1; }
+}
+
+fn main() -> int32 {
+  // Not a multiple of the 8-wide vector, so the scalar remainder runs too.
+  var n: int32 = 1003;
+  var a: int32* = (int32*)malloc((int64)n * 4);
+  var d: int32* = (int32*)malloc((int64)n * 4);
+  if (a == 0 || d == 0) { return 1; }
+  var i: int32 = 0;
+  while (i < n) {
+    a[i] = (i * 137 + 11) % 401 - 200;
+    i = i + 1;
+  }
+
+  var e_gt: int32 = 0;
+  var e_lt: int32 = 0;
+  var e_ge: int32 = 0;
+  var e_le: int32 = 0;
+  var e_eq: int32 = 0;
+  var e_ne: int32 = 0;
+  i = 0;
+  while (i < n) {
+    var v: int32 = a[i];
+    if (v > 50) { e_gt = e_gt + 1; }
+    if (v < 0) { e_lt = e_lt + 1; }
+    if (v >= 100) { e_ge = e_ge + 1; }
+    if (v <= -100) { e_le = e_le + 1; }
+    if (v == 7) { e_eq = e_eq + 1; }
+    if (v != 7) { e_ne = e_ne + 1; }
+    i = i + 1;
+  }
+
+  if (count_gt(a, n, 50) != e_gt) { return 2; }
+  if (count_lt(a, n) != e_lt) { return 3; }
+  if (count_ge(a, n) != e_ge) { return 4; }
+  if (count_le(a, n) != e_le) { return 5; }
+  if (count_eq(a, n) != e_eq) { return 6; }
+  if (count_ne(a, n) != e_ne) { return 7; }
+
+  mask_map(a, d, n);
+  i = 0;
+  while (i < n) {
+    var w: int32 = 0;
+    if (a[i] > 0) { w = a[i]; }
+    if (d[i] != w) { return 8; }
+    i = i + 1;
+  }
+
+  free((cstring)a);
+  free((cstring)d);
+  return 42;
+}

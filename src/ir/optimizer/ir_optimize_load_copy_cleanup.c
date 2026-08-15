@@ -341,6 +341,285 @@ int ir_hoist_global_bases_pass(IRFunction *function, int *changed) {
   return 1;
 }
 
+/* True if `temp` is produced by a comparison, so it holds 0 or 1 rather than
+ * the merely-nonzero that `branch_zero` would also accept. */
+static int ir_accum_condition_is_boolean(const IRFunction *function, size_t at,
+                                         const char *temp) {
+  const IRInstruction *p = ir_find_temp_producer_before(function, at, temp);
+  if (!p || p->op != IR_OP_BINARY || p->is_float || !p->text) {
+    return 0;
+  }
+  return strcmp(p->text, "<") == 0 || strcmp(p->text, ">") == 0 ||
+         strcmp(p->text, "<=") == 0 || strcmp(p->text, ">=") == 0 ||
+         strcmp(p->text, "==") == 0 || strcmp(p->text, "!=") == 0;
+}
+
+/* Structural equality of two operands, and of the chains that compute two
+ * temps. Used to prove one load reads exactly what another already read. */
+static int ir_accum_operand_same(const IROperand *a, const IROperand *b) {
+  if (a->kind != b->kind) {
+    return 0;
+  }
+  switch (a->kind) {
+  case IR_OPERAND_NONE:
+    return 1;
+  case IR_OPERAND_INT:
+    return a->int_value == b->int_value;
+  case IR_OPERAND_TEMP:
+  case IR_OPERAND_SYMBOL:
+    return a->name && b->name && strcmp(a->name, b->name) == 0;
+  default:
+    return 0;
+  }
+}
+
+static int ir_accum_chain_same(const IRFunction *function, size_t at_a,
+                               const IROperand *a, size_t at_b,
+                               const IROperand *b, int depth) {
+  const IRInstruction *pa = NULL;
+  const IRInstruction *pb = NULL;
+  if (depth > 4) {
+    return 0;
+  }
+  if (a->kind != IR_OPERAND_TEMP || b->kind != IR_OPERAND_TEMP) {
+    return ir_accum_operand_same(a, b);
+  }
+  if (!a->name || !b->name) {
+    return 0;
+  }
+  pa = ir_find_temp_producer_before(function, at_a, a->name);
+  pb = ir_find_temp_producer_before(function, at_b, b->name);
+  if (!pa || !pb || pa->op != pb->op || pa->is_float != pb->is_float ||
+      pa->is_unsigned != pb->is_unsigned) {
+    return 0;
+  }
+  if (pa->op != IR_OP_BINARY && pa->op != IR_OP_ADDRESS_OF &&
+      pa->op != IR_OP_CAST) {
+    return 0; /* only pure address arithmetic is followed */
+  }
+  if ((pa->text == NULL) != (pb->text == NULL) ||
+      (pa->text && strcmp(pa->text, pb->text) != 0)) {
+    return 0;
+  }
+  {
+    size_t ia = (size_t)(pa - function->instructions);
+    size_t ib = (size_t)(pb - function->instructions);
+    return ir_accum_chain_same(function, ia, &pa->lhs, ib, &pb->lhs,
+                               depth + 1) &&
+           ir_accum_chain_same(function, ia, &pa->rhs, ib, &pb->rhs, depth + 1);
+  }
+}
+
+/* True if the LOAD at `at` reads exactly what some load in [lo, at) already
+ * read. Nothing between them writes memory (the caller admits no stores or
+ * calls), so hoisting it out of its guard can neither fault nor see a
+ * different value: the earlier load already touched that address. */
+static int ir_accum_load_is_redundant(const IRFunction *function, size_t lo,
+                                      size_t at) {
+  const IRInstruction *load = &function->instructions[at];
+  if (load->lhs.kind != IR_OPERAND_TEMP || !load->lhs.name) {
+    return 0;
+  }
+  for (size_t i = lo; i < at; i++) {
+    const IRInstruction *prior = &function->instructions[i];
+    if (prior->op != IR_OP_LOAD || prior->rhs.kind != IR_OPERAND_INT ||
+        load->rhs.kind != IR_OPERAND_INT ||
+        prior->rhs.int_value != load->rhs.int_value) {
+      continue;
+    }
+    if (ir_accum_chain_same(function, i, &prior->lhs, at, &load->lhs, 0)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Turn a counted-under-a-condition accumulator into an unconditional one.
+ *
+ * `if (a[i] > t) { c = c + 1; }` is the ordinary way to count matches, and no
+ * reduction kernel reads a body that branches. `--explain` has been telling
+ * writers to make the accumulation unconditional by multiplying in the
+ * comparison, which is exactly this rewrite, done by hand.
+ *
+ * The comparison already holds 0 or 1, so `c = c + X * cond` adds X on the
+ * iterations the branch would have taken and 0 on the rest. Doing it here
+ * rather than in a kernel means the int32 sum, the general reduction and the
+ * float sums all gain predicated counting together.
+ *
+ * The rewrite lands in the slots the branch and its jump occupied, so nothing
+ * moves and no instruction is inserted. */
+int ir_if_convert_accumulate_pass(IRFunction *function, int *changed) {
+  if (!function) {
+    return 0;
+  }
+  for (size_t header = 0; header < function->instruction_count; header++) {
+    const IRInstruction *label = &function->instructions[header];
+    size_t latch = 0;
+
+    if (label->op != IR_OP_LABEL ||
+        !ir_cleanup_label_is_loop_header(label->text)) {
+      continue;
+    }
+    latch = ir_cleanup_loop_latch(function, header, label->text);
+    if (!latch) {
+      continue;
+    }
+
+    for (size_t i = header + 1; i < latch; i++) {
+      const IRInstruction *br = &function->instructions[i];
+      size_t add_index = 0, jump = 0, else_label = 0, end_label = 0;
+      const char *cond = NULL;
+      const char *acc = NULL;
+
+      if (br->op != IR_OP_BRANCH_ZERO || !br->text ||
+          br->lhs.kind != IR_OPERAND_TEMP || !br->lhs.name) {
+        continue;
+      }
+      cond = br->lhs.name;
+      if (!ir_accum_condition_is_boolean(function, i, cond)) {
+        continue;
+      }
+      /* The arm writes one symbol, the accumulator. Everything else in it must
+       * be arithmetic into temps, and any load must be one the condition
+       * already performed, since the rewrite makes the arm unconditional. */
+      add_index = 0;
+      for (jump = i + 1; jump < latch; jump++) {
+        const IRInstruction *ins = &function->instructions[jump];
+        if (ins->op == IR_OP_JUMP) {
+          break;
+        }
+        if (ins->op == IR_OP_NOP) {
+          continue;
+        }
+        if (ins->op == IR_OP_LOAD) {
+          if (!ir_accum_load_is_redundant(function, header + 1, jump)) {
+            add_index = 0;
+            break;
+          }
+          continue;
+        }
+        if (ins->op == IR_OP_BINARY || ins->op == IR_OP_CAST ||
+            ins->op == IR_OP_UNARY) {
+          if (ins->dest.kind == IR_OPERAND_TEMP) {
+            continue;
+          }
+        } else {
+          add_index = 0;
+          break;
+        }
+        if (add_index) {
+          add_index = 0;
+          break;
+        }
+        add_index = jump;
+      }
+      if (!add_index || jump >= latch || !function->instructions[jump].text) {
+        continue;
+      }
+      {
+        const IRInstruction *add = &function->instructions[add_index];
+        if (add->op != IR_OP_BINARY || add->is_float || !add->text ||
+            strcmp(add->text, "+") != 0 ||
+            add->dest.kind != IR_OPERAND_SYMBOL || !add->dest.name ||
+            !ir_operand_is_symbol_named(&add->lhs, add->dest.name) ||
+            (add->rhs.kind != IR_OPERAND_INT &&
+             add->rhs.kind != IR_OPERAND_TEMP &&
+             add->rhs.kind != IR_OPERAND_SYMBOL)) {
+          continue;
+        }
+        acc = add->dest.name;
+      }
+      /* Both labels must follow, and the else arm must be empty: a value
+       * chosen on the other side is a select, not an accumulate. */
+      if (!ir_find_next_non_nop(function, jump + 1, &else_label) ||
+          else_label >= latch ||
+          !ir_find_next_non_nop(function, else_label + 1, &end_label) ||
+          end_label >= latch) {
+        continue;
+      }
+      {
+        const IRInstruction *el = &function->instructions[else_label];
+        const IRInstruction *en = &function->instructions[end_label];
+        if (el->op != IR_OP_LABEL || !el->text ||
+            strcmp(el->text, br->text) != 0 || en->op != IR_OP_LABEL ||
+            !en->text ||
+            strcmp(en->text, function->instructions[jump].text) != 0) {
+          continue;
+        }
+      }
+      /* Nothing else in the loop may write the accumulator, or the two writes
+       * would race in a way one unconditional add cannot reproduce. */
+      {
+        int other = 0;
+        for (size_t k = header + 1; k < latch; k++) {
+          if (k != add_index &&
+              ir_instruction_writes_destination(&function->instructions[k]) &&
+              ir_operand_is_symbol_named(&function->instructions[k].dest, acc)) {
+            other = 1;
+            break;
+          }
+        }
+        if (other) {
+          continue;
+        }
+      }
+      {
+        IRInstruction *add = &function->instructions[add_index];
+        int addend_is_one =
+            add->rhs.kind == IR_OPERAND_INT && add->rhs.int_value == 1;
+
+        ir_instruction_make_nop(&function->instructions[i]);
+        if (addend_is_one) {
+          /* `c = c + 1` under the condition IS `c = c + cond`. */
+          ir_operand_destroy(&add->rhs);
+          add->rhs = ir_operand_temp(cond);
+          if (!add->rhs.name) {
+            return 0;
+          }
+          ir_instruction_make_nop(&function->instructions[jump]);
+        } else {
+          /* The addend may be computed inside the arm, so the multiply has to
+           * follow it: it takes the accumulate's slot and the accumulate moves
+           * down into the one the jump occupied. */
+          char product[64];
+          IRInstruction mul = {0};
+          IRInstruction sum = {0};
+          snprintf(product, sizeof(product), ".ifacc%zu", add_index);
+          mul.op = IR_OP_BINARY;
+          mul.location = add->location;
+          mul.text = mettle_strdup("*");
+          mul.dest = ir_operand_temp(product);
+          mul.lhs = ir_operand_copy(&add->rhs);
+          mul.rhs = ir_operand_temp(cond);
+          sum.op = IR_OP_BINARY;
+          sum.location = add->location;
+          sum.text = mettle_strdup("+");
+          sum.dest = ir_operand_copy(&add->dest);
+          sum.lhs = ir_operand_copy(&add->lhs);
+          sum.rhs = ir_operand_temp(product);
+          if (!mul.text || !mul.dest.name || !mul.rhs.name || !sum.text ||
+              !sum.dest.name || !sum.lhs.name || !sum.rhs.name) {
+            ir_instruction_destroy_storage(&mul);
+            ir_instruction_destroy_storage(&sum);
+            return 0;
+          }
+          ir_instruction_destroy_storage(&function->instructions[add_index]);
+          function->instructions[add_index] = mul;
+          ir_instruction_destroy_storage(&function->instructions[jump]);
+          function->instructions[jump] = sum;
+        }
+        ir_instruction_make_nop(&function->instructions[else_label]);
+        ir_instruction_make_nop(&function->instructions[end_label]);
+        if (changed) {
+          *changed = 1;
+        }
+        i = end_label;
+      }
+    }
+  }
+  return 1;
+}
+
 int ir_eliminate_load_symbol_copy_pass(IRFunction *function,
                                               int *changed) {
   if (!function) {

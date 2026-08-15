@@ -1420,6 +1420,7 @@ int ir_simd_i2f_reduce_pass(IRFunction *function, int *changed) {
 #define VLOOP_VN_CMPGT 16 /* int lanes only; signed op0 > op1 */
 #define VLOOP_VN_PAIR 17  /* op0 = then value, op1 = else value */
 #define VLOOP_VN_SELECT 18 /* op0 = mask, op1 = pair */
+#define VLOOP_VN_CMPEQ 19 /* int lanes only; op0 == op1 */
 
 #define VLOOP_MAX_DIAMOND_DEPTH 4
 
@@ -3095,6 +3096,64 @@ static int vloop_int_binop_tag(const char *text) {
   return -1;
 }
 
+static int vloop_int_is_comparison(const char *text) {
+  return strcmp(text, "<") == 0 || strcmp(text, ">") == 0 ||
+         strcmp(text, "<=") == 0 || strcmp(text, ">=") == 0 ||
+         strcmp(text, "==") == 0 || strcmp(text, "!=") == 0;
+}
+
+/* A comparison read as a value: `c = c + (a[i] > t)` counts, and `x * (a[i] !=
+ * 0)` masks. The lanes hold the compare's own answer, which is all-ones or
+ * zero, so `& 1` narrows it to the 0 or 1 the source means and `^ 1` negates
+ * it. Both extra nodes take a broadcast constant, no register. */
+static int vloop_compare_value_node(IRFunction *function, size_t before,
+                                    const IRInstruction *cmp, const char *iv,
+                                    VLoopDag *d) {
+  int equality = strcmp(cmp->text, "==") == 0 || strcmp(cmp->text, "!=") == 0;
+  int negate = strcmp(cmp->text, "!=") == 0 || strcmp(cmp->text, "<=") == 0 ||
+               strcmp(cmp->text, ">=") == 0;
+  /* Only `>` and `==` exist in the lanes. `<` is `>` with the operands the
+   * other way round; `<=` and `>=` are the strict compare negated. */
+  int gt_left = strcmp(cmp->text, ">") == 0 || strcmp(cmp->text, "<=") == 0;
+  const IROperand *first = (equality || gt_left) ? &cmp->lhs : &cmp->rhs;
+  const IROperand *second = (equality || gt_left) ? &cmp->rhs : &cmp->lhs;
+  int a, b, mask, one, value;
+
+  if (cmp->is_unsigned) {
+    return -1; /* the lane compares are signed */
+  }
+  a = vloop_build_int(function, before, first, iv, d);
+  if (a < 0) {
+    return -1;
+  }
+  b = vloop_build_int(function, before, second, iv, d);
+  if (b < 0) {
+    return -1;
+  }
+  mask = vloop_add_node(d, equality ? VLOOP_VN_CMPEQ : VLOOP_VN_CMPGT, a, b);
+  if (mask < 0) {
+    return -1;
+  }
+  one = vloop_intern_iconst(d, 1);
+  if (one < 0) {
+    return -1;
+  }
+  one = vloop_add_node(d, VLOOP_VN_CONST, one, 0);
+  if (one < 0) {
+    return -1;
+  }
+  value = vloop_add_node(d, VLOOP_VN_AND, mask, one);
+  if (value < 0 || !negate) {
+    return value;
+  }
+  one = vloop_intern_iconst(d, 1);
+  if (one < 0) {
+    return -1;
+  }
+  one = vloop_add_node(d, VLOOP_VN_CONST, one, 0);
+  return one < 0 ? -1 : vloop_add_node(d, VLOOP_VN_XOR, value, one);
+}
+
 /* ---- if-conversion: a conditional assignment becomes a lane select --------
  *
  * `if (v < lo) { v = lo; }` is a value, not control flow: every lane computes
@@ -3535,7 +3594,9 @@ static int vloop_resolve_def_int(IRFunction *function, const IRInstruction *def,
   d->resolve_depth++;
   if (def->op == IR_OP_BINARY && !def->is_float && def->text) {
     int tag = vloop_int_binop_tag(def->text);
-    if (tag >= 0) {
+    if (vloop_int_is_comparison(def->text)) {
+      result = vloop_compare_value_node(function, def_idx, def, iv, d);
+    } else if (tag >= 0) {
       int a = vloop_build_int(function, def_idx, &def->lhs, iv, d);
       int b = (a < 0) ? -1 : vloop_build_int(function, def_idx, &def->rhs, iv, d);
       if (a >= 0 && b >= 0) {
@@ -3738,6 +3799,9 @@ static int vloop_build_int(IRFunction *function, size_t before,
       }
       return vloop_add_node(d, vloop_int_shift_right_kind(p), a,
                             (int)p->rhs.int_value);
+    }
+    if (vloop_int_is_comparison(p->text)) {
+      return vloop_compare_value_node(function, pidx, p, iv, d);
     }
     int tag = vloop_int_binop_tag(p->text);
     if (tag < 0) {

@@ -55,6 +55,7 @@ static const IROptNamedPass g_ir_pre_inline_passes[] = {
      * computed inside the body, where none of them reads it as a base. Runs
      * again after inlining, which plants fresh bodies of its own. */
     {"hoist_global_bases", ir_hoist_global_bases_pass},
+    {"if_convert_accumulate", ir_if_convert_accumulate_pass},
     {"simd_minmax_i32", ir_simd_minmax_i32_pass},
     {"prefix_sum_i32", ir_prefix_sum_i32_pass},
     {"induction_pointer", ir_pointer_induction_pass},
@@ -75,6 +76,9 @@ static const IROptNamedPass g_ir_post_fixpoint_passes[] = {
     /* Beside it, and for the same reason: a global array's base is computed
      * inside the body, where no recognizer reads it as a base. */
     {"hoist_global_bases", ir_hoist_global_bases_pass},
+    /* And a counted-under-a-condition accumulator, which no reduction kernel
+     * reads either. Both leave a straight-line body behind them. */
+    {"if_convert_accumulate", ir_if_convert_accumulate_pass},
     /* Before pointer induction, which rewrites an int32 scan's counter into a
      * walking pointer -- the extremum diamond then indexes off something no
      * longer recognizable as the loop counter. */

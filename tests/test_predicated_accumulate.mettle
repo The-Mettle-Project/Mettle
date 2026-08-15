@@ -1,0 +1,100 @@
+// Counting matches is `if (a[i] > t) { c = c + 1; }`, and no reduction kernel
+// reads a body that branches. The comparison already holds 0 or 1, so the
+// accumulate can be made unconditional. Two shapes below MUST refuse: an else
+// arm that also writes, and a guard that is not a comparison, where the value
+// tested is merely nonzero rather than 1.
+
+import "std/mem";
+
+fn count_matches(a: int32*, n: int32, t: int32) -> int32 {
+  var c: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    if (a[i] > t) { c = c + 1; }
+    i = i + 1;
+  }
+  return c;
+}
+
+// The addend is loaded inside the arm, at the address the condition already
+// read, so making it unconditional can neither fault nor read a new value.
+fn sum_negatives(a: int32*, n: int32) -> int32 {
+  var s: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    if (a[i] < 0) { s = s + a[i]; }
+    i = i + 1;
+  }
+  return s;
+}
+
+fn weighted_hits(a: int32*, n: int32, w: int32) -> int32 {
+  var s: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    if (a[i] == 5) { s = s + w; }
+    i = i + 1;
+  }
+  return s;
+}
+
+// Both arms write, so this is a select on a loop-carried value, not an
+// accumulate that can be made unconditional.
+fn two_sided(a: int32*, n: int32) -> int32 {
+  var s: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    if (a[i] > 0) { s = s + 1; } else { s = s - 1; }
+    i = i + 1;
+  }
+  return s;
+}
+
+// `a[i] & 6` is 0, 2, 4 or 6. The branch fires on any of the nonzero ones, so
+// multiplying the addend by it would add 2, 4 or 6 instead of 1.
+fn nonbool_guard(a: int32*, n: int32) -> int32 {
+  var s: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    if (a[i] & 6) { s = s + 1; }
+    i = i + 1;
+  }
+  return s;
+}
+
+fn main() -> int32 {
+  // Not a multiple of the 8-wide vector, so the scalar remainder runs too.
+  var n: int32 = 1003;
+  var a: int32* = (int32*)malloc((int64)n * 4);
+  if (a == 0) { return 1; }
+  var i: int32 = 0;
+  while (i < n) {
+    a[i] = (i * 137 + 11) % 401 - 200;
+    i = i + 1;
+  }
+
+  var e_count: int32 = 0;
+  var e_neg: int32 = 0;
+  var e_weight: int32 = 0;
+  var e_two: int32 = 0;
+  var e_mask: int32 = 0;
+  i = 0;
+  while (i < n) {
+    var v: int32 = a[i];
+    if (v > 50) { e_count = e_count + 1; }
+    if (v < 0) { e_neg = e_neg + v; }
+    if (v == 5) { e_weight = e_weight + 9; }
+    if (v > 0) { e_two = e_two + 1; } else { e_two = e_two - 1; }
+    if (v & 6) { e_mask = e_mask + 1; }
+    i = i + 1;
+  }
+
+  if (count_matches(a, n, 50) != e_count) { return 2; }
+  if (sum_negatives(a, n) != e_neg) { return 3; }
+  if (weighted_hits(a, n, 9) != e_weight) { return 4; }
+  if (two_sided(a, n) != e_two) { return 5; }
+  if (nonbool_guard(a, n) != e_mask) { return 6; }
+
+  free((cstring)a);
+  return 42;
+}

@@ -4660,6 +4660,114 @@ foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")
   }
 }
 
+# Counting under a condition. The comparison holds 0 or 1, so the accumulate is
+# made unconditional and the reduction kernels can read it. Run with the pass
+# disabled too, to check the rewritten answer against the branching one.
+foreach ($variant in @("release", "debug", "release_scalar")) {
+  $total++
+  try {
+    $exePath = Join-Path $tmpDir "test_predicated_accumulate_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($variant -like "release*") { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_predicated_accumulate.mettle", "-o", $exePath)
+
+    if ($variant -eq "release_scalar") { $env:METTLE_SKIP_PASS = "if_convert_accumulate" }
+    try {
+      $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    }
+    finally {
+      if ($variant -eq "release_scalar") { Remove-Item Env:\METTLE_SKIP_PASS -ErrorAction SilentlyContinue }
+    }
+    if ($LASTEXITCODE -ne 0) {
+      throw "predicated-accumulate build ($variant) failed: $buildOut"
+    }
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 42) {
+      throw "predicated-accumulate ($variant) miscompiled (exit $LASTEXITCODE)"
+    }
+    Write-CaseResult -Name "predicated_accumulate_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "predicated_accumulate_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# Anti-rot guard, in both directions: the three that must be claimed, and the
+# two that must not. Rewriting `if (a[i] & 6)` as a multiply would add 2, 4 or 6
+# where the branch added 1, and the arithmetic would still look plausible.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "test_predicated_accumulate_cover.exe"
+  $coverOut = & $CompilerPath "--build" "--emit-obj" "--linker" "internal" "--release" `
+    "--explain" "tests\test_predicated_accumulate.mettle" "-o" $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "predicated-accumulate coverage build failed: $coverOut"
+  }
+  foreach ($fn in @("count_matches", "sum_negatives", "weighted_hits")) {
+    if ($coverOut -notmatch "$fn \(loop @ line \d+\): vectorized") {
+      throw "$fn no longer vectorizes; the predicated accumulate stopped converting"
+    }
+  }
+  foreach ($fn in @("two_sided", "nonbool_guard")) {
+    if ($coverOut -match "$fn \(loop @ line \d+\): vectorized") {
+      throw "$fn vectorized; the accumulate rewrite is claiming a shape it cannot reproduce"
+    }
+  }
+  Write-CaseResult -Name "predicated_accumulate_coverage" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "predicated_accumulate_coverage" -Passed $false -Reason $_.Exception.Message
+}
+
+# Comparisons read as values: `c + (a[i] > t)` and `a[i] * (a[i] > 0)`. All six
+# operators, since `<` swaps the lane compare's operands and `<=`/`>=`/`!=`
+# negate it, and getting either backwards is still plausible arithmetic.
+foreach ($variant in @("release", "debug")) {
+  $total++
+  try {
+    $exePath = Join-Path $tmpDir "test_compare_as_value_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($variant -eq "release") { $buildArgs += "--release" }
+    $buildArgs += @("tests\test_compare_as_value.mettle", "-o", $exePath)
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "compare-as-value build ($variant) failed: $buildOut"
+    }
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 42) {
+      throw "compare-as-value ($variant) miscompiled (exit $LASTEXITCODE)"
+    }
+    Write-CaseResult -Name "compare_as_value_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "compare_as_value_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+$total++
+try {
+  $exePath = Join-Path $tmpDir "test_compare_as_value_cover.exe"
+  $coverOut = & $CompilerPath "--build" "--emit-obj" "--linker" "internal" "--release" `
+    "--explain" "tests\test_compare_as_value.mettle" "-o" $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "compare-as-value coverage build failed: $coverOut"
+  }
+  foreach ($fn in @("count_gt", "count_lt", "count_ge", "count_le", "count_eq",
+                    "count_ne", "mask_map")) {
+    if ($coverOut -notmatch "$fn \(loop @ line \d+\): vectorized") {
+      throw "$fn no longer vectorizes; a comparison stopped being a value"
+    }
+  }
+  Write-CaseResult -Name "compare_as_value_coverage" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "compare_as_value_coverage" -Passed $false -Reason $_.Exception.Message
+}
+
 # A sum kernel's base pointer, held in a local under an ordinary name. The rule
 # used to be a name match against the inliner's `_param_data` suffix, so whether
 # this vectorized depended on what the writer had called the variable.
