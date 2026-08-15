@@ -1222,11 +1222,11 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
                    written, written, acc_type);
         } else {
           snprintf(fix, fix_cap,
-                   "the extremum kernel needs the counter to start at 0 and "
-                   "the compared value to come from `base[i]` over float32, "
-                   "float64 or int32 elements -- a scan starting at 1 (after "
-                   "seeding from `a[0]`), or one widening narrower elements, "
-                   "falls outside it");
+                   "the extremum kernel needs the compared value to come from "
+                   "`base[i]` over float32, float64 or int32 elements, and the "
+                   "counter to start at 0 or at 1 after seeding from `a[0]`; "
+                   "one that widens narrower elements, or indexes anything "
+                   "else, falls outside it");
         }
         IR_SIMD_SET_DIAG(IR_SIMD_BAIL_EXTREMUM_SHAPE);
         return;

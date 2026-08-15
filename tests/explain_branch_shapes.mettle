@@ -16,8 +16,8 @@ fn scale_pass(dst: float64*, src: float64*, n: int64, k: float64) -> int64 {
     return n;
 }
 
-// A running extremum: vectorizes. Seeded from a[0] and started at 1, it does
-// not -- and the remark has to say THAT, not blame the branch.
+// A running extremum, seeded from a[0] and started at 1. Iteration 0 would
+// compare the seed with itself, so the counter is reset to 0 and it vectorizes.
 fn extent_from_first(a: float64*, n: int64) -> float64 {
     var hi: float64 = a[0];
     var i: int64 = 1;

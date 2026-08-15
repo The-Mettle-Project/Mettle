@@ -341,6 +341,195 @@ int ir_hoist_global_bases_pass(IRFunction *function, int *changed) {
   return 1;
 }
 
+/* `base + (iv << k)`, the address of `base[iv]`. Fills the base symbol and the
+ * element width the shift implies. */
+static int ir_scan_decode_indexed(const IRFunction *function, size_t before,
+                                  const char *addr_temp, const char *iv,
+                                  const char **base_out, long long *width_out) {
+  const IRInstruction *addr =
+      ir_find_temp_producer_before(function, before, addr_temp);
+  const IRInstruction *shl = NULL;
+  if (!addr || addr->op != IR_OP_BINARY || addr->is_float || !addr->text ||
+      strcmp(addr->text, "+") != 0 || addr->lhs.kind != IR_OPERAND_SYMBOL ||
+      !addr->lhs.name || addr->rhs.kind != IR_OPERAND_TEMP || !addr->rhs.name) {
+    return 0;
+  }
+  shl = ir_find_temp_producer_before(function, before, addr->rhs.name);
+  if (!shl || shl->op != IR_OP_BINARY || shl->is_float || !shl->text ||
+      strcmp(shl->text, "<<") != 0 ||
+      !ir_operand_is_symbol_named(&shl->lhs, iv) ||
+      shl->rhs.kind != IR_OPERAND_INT || shl->rhs.int_value < 0 ||
+      shl->rhs.int_value > 3) {
+    return 0;
+  }
+  *base_out = addr->lhs.name;
+  *width_out = 1LL << shl->rhs.int_value;
+  return 1;
+}
+
+/* The element a body instruction assigns to `sym`, when it assigns exactly
+ * `base[iv]` and nothing derived from it. */
+static int ir_scan_assigns_element(const IRFunction *function, size_t at,
+                                   const char *sym, const char *iv,
+                                   const char **base_out, long long *width_out) {
+  const IRInstruction *ins = &function->instructions[at];
+  const IRInstruction *load = ins;
+  if (!ir_operand_is_symbol_named(&ins->dest, sym)) {
+    return 0;
+  }
+  if (ins->op == IR_OP_ASSIGN && ins->lhs.kind == IR_OPERAND_TEMP &&
+      ins->lhs.name) {
+    load = ir_find_temp_producer_before(function, at, ins->lhs.name);
+  }
+  if (!load || load->op != IR_OP_LOAD || load->lhs.kind != IR_OPERAND_TEMP ||
+      !load->lhs.name || load->rhs.kind != IR_OPERAND_INT) {
+    return 0;
+  }
+  {
+    size_t li = (size_t)(load - function->instructions);
+    const char *base = NULL;
+    long long width = 0;
+    if (!ir_scan_decode_indexed(function, li, load->lhs.name, iv, &base,
+                                &width) ||
+        width != load->rhs.int_value) {
+      return 0;
+    }
+    *base_out = base;
+    *width_out = width;
+    return 1;
+  }
+}
+
+/* Start a scan seeded from the first element at 0 rather than 1.
+ *
+ * `var m = a[0]; var i = 1; while (i < n) { if (a[i] > m) { m = a[i]; } }` is
+ * how a maximum is usually written, and every kernel walks its arrays from
+ * element 0 and reads the compare bound as a count, so the recognizers refuse
+ * a counter that starts anywhere else. The awkward spelling, seeding from a
+ * sentinel and counting from 0, vectorized; the ordinary one did not.
+ *
+ * Iteration 0 is a no-op here: the body's only effect is to assign `m` an
+ * element of the same array at the same index, and at i == 0 that element is
+ * the seed `m` already holds. So the counter can start at 0 and the loop runs
+ * one extra iteration that cannot change anything. */
+int ir_normalize_scan_from_first_pass(IRFunction *function, int *changed) {
+  if (!function) {
+    return 0;
+  }
+  for (size_t header = 0; header < function->instruction_count; header++) {
+    const IRInstruction *label = &function->instructions[header];
+    size_t latch = 0;
+    size_t init_index = 0;
+    const char *iv = NULL;
+    const char *acc = NULL;
+    const char *base = NULL;
+    long long width = 0;
+    int found_init = 0;
+    int ok = 1;
+
+    if (label->op != IR_OP_LABEL ||
+        !ir_cleanup_label_is_loop_header(label->text)) {
+      continue;
+    }
+    latch = ir_cleanup_loop_latch(function, header, label->text);
+    if (!latch) {
+      continue;
+    }
+    {
+      size_t compare_index = 0;
+      const IRInstruction *cmp = NULL;
+      if (!ir_find_next_non_nop(function, header + 1, &compare_index) ||
+          compare_index >= latch) {
+        continue;
+      }
+      cmp = &function->instructions[compare_index];
+      if (cmp->op != IR_OP_BINARY || cmp->is_float || !cmp->text ||
+          strcmp(cmp->text, "<") != 0 || cmp->lhs.kind != IR_OPERAND_SYMBOL ||
+          !cmp->lhs.name) {
+        continue;
+      }
+      iv = cmp->lhs.name;
+    }
+    /* The counter's last setting before the loop must be the literal 1. */
+    for (size_t k = 0; k < header; k++) {
+      const IRInstruction *ins = &function->instructions[k];
+      if (ir_instruction_writes_destination(ins) &&
+          ir_operand_is_symbol_named(&ins->dest, iv)) {
+        init_index = k;
+        found_init = (ins->op == IR_OP_ASSIGN &&
+                      ins->lhs.kind == IR_OPERAND_INT && ins->lhs.int_value == 1);
+      }
+    }
+    if (!found_init) {
+      continue;
+    }
+    /* Every symbol the body writes, other than the counter, is one accumulator
+     * assigned exactly `base[iv]`. */
+    for (size_t k = header + 1; k < latch && ok; k++) {
+      const IRInstruction *ins = &function->instructions[k];
+      const char *b = NULL;
+      long long w = 0;
+      if (ins->op == IR_OP_STORE || ins->op == IR_OP_CALL ||
+          ins->op == IR_OP_CALL_INDIRECT || ins->op == IR_OP_INLINE_ASM ||
+          ins->op == IR_OP_ADDRESS_OF || ins->op == IR_OP_NEW) {
+        ok = 0;
+        break;
+      }
+      if (!ir_instruction_writes_destination(ins) ||
+          ins->dest.kind != IR_OPERAND_SYMBOL || !ins->dest.name ||
+          strcmp(ins->dest.name, iv) == 0) {
+        continue;
+      }
+      if (acc && strcmp(acc, ins->dest.name) != 0) {
+        ok = 0;
+        break;
+      }
+      if (!ir_scan_assigns_element(function, k, ins->dest.name, iv, &b, &w) ||
+          (base && strcmp(base, b) != 0) || (width && w != width)) {
+        ok = 0;
+        break;
+      }
+      acc = ins->dest.name;
+      base = b;
+      width = w;
+    }
+    if (!ok || !acc || !base) {
+      continue;
+    }
+    /* And its seed, before the loop, is that array's first element. */
+    {
+      const IRInstruction *seed = NULL;
+      for (size_t k = 0; k < header; k++) {
+        const IRInstruction *ins = &function->instructions[k];
+        if (ir_instruction_writes_destination(ins) &&
+            ir_operand_is_symbol_named(&ins->dest, acc)) {
+          seed = ins;
+        }
+        /* The base must not move between the seed and the loop. */
+        if (seed && ir_instruction_writes_destination(ins) &&
+            ir_operand_is_symbol_named(&ins->dest, base)) {
+          seed = NULL;
+          break;
+        }
+      }
+      if (!seed || seed->op != IR_OP_LOAD ||
+          !ir_operand_is_symbol_named(&seed->lhs, base) ||
+          seed->rhs.kind != IR_OPERAND_INT || seed->rhs.int_value != width) {
+        continue;
+      }
+    }
+    {
+      IRInstruction *init = &function->instructions[init_index];
+      ir_operand_destroy(&init->lhs);
+      init->lhs = ir_operand_int(0);
+      if (changed) {
+        *changed = 1;
+      }
+    }
+  }
+  return 1;
+}
+
 /* True if `temp` is produced by a comparison, so it holds 0 or 1 rather than
  * the merely-nonzero that `branch_zero` would also accept. */
 static int ir_accum_condition_is_boolean(const IRFunction *function, size_t at,

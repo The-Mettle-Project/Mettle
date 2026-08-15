@@ -24,6 +24,9 @@ fn k08(s: int32*, n: int32) -> int32 { var c: int32 = 0; var i: int32 = 0; while
 fn k09(n: int32) { var i: int32 = 0; while (i < n) { var v: int32 = GA[i]; if (v < 0) { v = 0 - v; } GB[i] = v; i = i + 1; } }
 fn k10(n: int32) -> int64 { var t: int64 = 0; var i: int32 = 0; while (i < n) { t = t + (int64)GB[i]; i = i + 1; } return t; }
 fn k11(n: int32) -> int32 { var c: int32 = 0; var i: int32 = 0; while (i < n) { if (GA[i] > 100) { c = c + 1; } i = i + 1; } return c; }
+// Extrema seeded from the first element, so the counter starts at 1.
+fn k12(s: int32*, n: int32) -> int32 { var m: int32 = s[0]; var i: int32 = 1; while (i < n) { if (s[i] > m) { m = s[i]; } i = i + 1; } return m; }
+fn k13(s: int32*, n: int32) -> int32 { var m: int32 = s[0]; var i: int32 = 1; while (i < n) { if (s[i] < m) { m = s[i]; } i = i + 1; } return m; }
 
 fn main() -> int32 {
   var sizes: int32[7];
@@ -71,6 +74,13 @@ fn main() -> int32 {
     while (i < n) { t10 = t10 + (int64)GB[i]; if (GA[i] > 100) { c11 = c11 + 1; } i = i + 1; }
     if (k10(n) != t10) { println(cstr("k10")); return 11; }
     if (k11(n) != c11) { println(cstr("k11")); return 12; }
+    // k12 / k13: seeded extrema. Undefined for n == 0, as in the source.
+    if (n > 0) {
+      var e12: int32 = s[0]; var e13: int32 = s[0]; i = 1;
+      while (i < n) { if (s[i] > e12) { e12 = s[i]; } if (s[i] < e13) { e13 = s[i]; } i = i + 1; }
+      if (k12(s, n) != e12) { println(cstr("k12")); return 13; }
+      if (k13(s, n) != e13) { println(cstr("k13")); return 14; }
+    }
     q = q + 1;
   }
   return 42;

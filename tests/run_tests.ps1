@@ -796,8 +796,10 @@ $cases = @(
     Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
     OutputMustMatch = @(
       'scale_pass \(loop @ line 11\): vectorized',
-      'extent_from_first \(loop @ line 24\): NOT vectorized  \[extremum-shape\]',
-      'a shape that does vectorize -- but the kernel did not claim it \(`hi` is the accumulator\)',
+      # Seeded from a[0] and counting from 1, which is how an extremum is
+      # usually written. Iteration 0 compares the seed with itself, so the
+      # counter is reset to 0 and the kernel claims it.
+      'extent_from_first \(loop @ line 24\): vectorized -> 4-wide float64 vmaxpd',
       'count_above \(loop @ line 36\): NOT vectorized  \[predicated-count\]',
       'over float elements there is nothing to change here',
       'clamp_all \(loop @ line 46\): NOT vectorized  \[clamp-store\]',
@@ -4664,7 +4666,7 @@ foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")
 # same program. Run with each contributing pass disabled in turn, so the
 # vectorized answer is checked against the scalar one it replaces rather than
 # only against itself.
-foreach ($variant in @("release", "debug", "no_vec", "no_accum", "no_hoist")) {
+foreach ($variant in @("release", "debug", "no_vec", "no_accum", "no_hoist", "no_scan")) {
   $total++
   try {
     $exePath = Join-Path $tmpDir "test_vloop_select_stress_$variant.exe"
@@ -4676,6 +4678,7 @@ foreach ($variant in @("release", "debug", "no_vec", "no_accum", "no_hoist")) {
     if ($variant -eq "no_vec") { $skip = "auto_vectorize_int" }
     if ($variant -eq "no_accum") { $skip = "if_convert_accumulate" }
     if ($variant -eq "no_hoist") { $skip = "hoist_global_bases" }
+    if ($variant -eq "no_scan") { $skip = "scan_from_first" }
     if ($skip) { $env:METTLE_SKIP_PASS = $skip }
     try {
       $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
