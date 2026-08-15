@@ -75,6 +75,18 @@ authority; what follows is the shape of the remaining gaps.
   an inlined helper leaves behind all become a lane minimum, maximum, or select.
   Arms that store, call, or write a second name do not: a masked lane cannot
   carry that effect.
+- **Counting under a condition vectorizes.** `if (a[i] > t) { c = c + 1; }` and
+  `if (a[i] < 0) { s = s + a[i]; }` are made unconditional by multiplying in the
+  comparison. Two shapes are not: an else arm that also writes the accumulator,
+  and a guard that is not a comparison, since `if (x & 6)` fires on 2, 4 and 6
+  alike. Write that one as `(x & 6) != 0` and it converts.
+- **A comparison is a value.** `c + (a[i] > t)` and `a[i] * (a[i] != 0)` become a
+  lane mask narrowed to 0 or 1, for all six operators.
+- **A scan may be seeded from its first element.** `var m = a[0]; var i = 1;` is
+  reset to start at 0, since iteration 0 would compare the seed with itself.
+- **Reductions over `^`, `&` and `|` have no kernel** and are reported as serial
+  recurrences, though they are associative. Only `+`, minimum and maximum
+  reduce.
 - **Float elements have no select kernel.** A clamp over `float32` or `float64`
   stays scalar. Minimum and maximum on floats are not the same operation as the
   branch when a lane holds NaN, so the kernel needs an ordered compare that is

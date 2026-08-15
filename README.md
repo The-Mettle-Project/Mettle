@@ -100,10 +100,10 @@ kernels over quantized integers, and some serial recurrences. It beats
 `gcc -O3` on several kernels in the benchmark suite.
 
 A branch that only picks a value is a value, not control flow, so a clamp, a
-floor, a ReLU and a running extremum all vectorize, in whatever order you
-write the tests and whether or not you factored them into a helper. Buffers
-declared at file scope reach the same kernels as pointers passed in.
-`--explain` names the reason for every loop it leaves alone.
+floor, a ReLU, a running extremum and a count of matches all vectorize, in
+whatever order you write the tests and whether or not you factored them into
+a helper. Buffers declared at file scope reach the same kernels as pointers
+passed in. `--explain` names the reason for every loop it leaves alone.
 
 **Offloads to NVIDIA GPUs**, straight to PTX, with no `nvcc` and no CUDA
 runtime. Write `kernel` functions, declare them on the host, and launch them:
