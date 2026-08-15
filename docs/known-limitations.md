@@ -65,6 +65,29 @@ A non-capturing lambda or `&func` can be passed anywhere an `Fn(...)` closure is
 
 - Unreachable-code analysis is block-local and conservative; some dead paths in complex control flow may not be diagnosed yet.
 
+### Vectorization
+
+`--explain` reports what became of every loop and why, so treat it as the
+authority; what follows is the shape of the remaining gaps.
+
+- **An `if` that only chooses a value vectorizes over int32 elements.** A clamp, a
+  floor, a ReLU, a running extremum, an if/else nest, and the early-return chain
+  an inlined helper leaves behind all become a lane minimum, maximum, or select.
+  Arms that store, call, or write a second name do not: a masked lane cannot
+  carry that effect.
+- **Float elements have no select kernel.** A clamp over `float32` or `float64`
+  stays scalar. Minimum and maximum on floats are not the same operation as the
+  branch when a lane holds NaN, so the kernel needs an ordered compare that is
+  not written yet.
+- **Depth is bounded by registers.** An int32 map has six ymm registers for its
+  value stack. Three levels of `if`/`else` over distinct expressions needs more
+  than that and stays scalar; splitting the deepest arm into its own loop fits.
+- **Reductions over a byte array need a 64-bit accumulator.** `acc: int32` summing
+  `uint8` elements is refused because the kernel widens to int64.
+- **Global arrays vectorize.** Their base is hoisted above the loop, so a program
+  that keeps its buffers at file scope reaches the same kernels as one passing
+  pointers.
+
 ---
 
 ## Memory, Pointers & Safety

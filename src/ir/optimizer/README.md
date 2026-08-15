@@ -1,5 +1,32 @@
 This directory holds the private implementation modules for `ir_optimize.c`.
 
+## A note on recognizers
+
+Several files here are named after a shape (`popcount_collatz`,
+`word_count_and_div_shift`, `shift_sort`) because they began as matchers for one
+program each. That is a trap worth naming: a recognizer keyed to an exact
+spelling answers "is this the loop I was written for?", so the same arithmetic
+written a little differently gets nothing, and the set of loops that vectorize
+comes to look like the set of loops someone benchmarked.
+
+Prefer, in order:
+
+1. **A property, not a name.** `ir_symbol_is_sum_array_base` once matched locals
+   whose name ended in the inliner's `_param_data`. It now asks whether the value
+   settles once, which is what the name was standing in for.
+2. **A normalization, not a second case.** A global array's base used to be
+   invisible to all twenty-eight kernels because it was computed inside the loop
+   body. `hoist_global_bases` names it above the loop, and every kernel gained
+   global arrays at once without learning a second spelling.
+3. **A general form, not another kernel.** The two `VLOOP` opcodes take an
+   arbitrary expression DAG over a counted unit-stride loop; if-conversion feeds
+   branches into the same DAG as selects. Growing those is worth more than
+   kernel twenty-nine, and shrinks the table rather than lengthening it.
+
+When a new shape does need its own kernel, pair it with a test that asserts the
+`--explain` verdict, not only the answer. A recognizer that quietly stops firing
+still passes every correctness test, just slowly.
+
 The public optimizer entrypoint remains `../ir_optimize.c`. The files here are
 compiled separately and share declarations through `ir_optimize_internal.h`.
 That header is intentionally private to the optimizer; it exists to keep pass
