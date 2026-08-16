@@ -1313,6 +1313,13 @@ static int object_needs_safety_runtime(const char *object_path) {
   return object_needs_runtime_object(object_path, "mettle_safety_");
 }
 
+/* `quiesce;` lowers to mettle_swap_apply, and staging reaches
+ * mettle_swap_stage. A program with no swap point names neither and does not
+ * link this object, which is the whole of what opting in costs. */
+static int object_needs_swap_runtime(const char *object_path) {
+  return object_needs_runtime_object(object_path, "mettle_swap_");
+}
+
 static int object_needs_tracy_helpers(const char *object_path) {
   return object_needs_runtime_object(object_path, "mettle_tracy_");
 }
@@ -1773,6 +1780,13 @@ static int mettle_link_object_file(const char *object_filename,
   char safety_gcc_object[1024];
   char safety_msvc_object[1024];
   int needs_safety = object_needs_safety_runtime(object_filename);
+  char swap_gcc_object[1024];
+  char swap_msvc_object[1024];
+  int needs_swap = object_needs_swap_runtime(object_filename);
+  snprintf(swap_gcc_object, sizeof(swap_gcc_object), "%s/swap.o",
+           runtime_directory);
+  snprintf(swap_msvc_object, sizeof(swap_msvc_object), "%s/swap.obj",
+           runtime_directory);
   snprintf(safety_gcc_object, sizeof(safety_gcc_object), "%s/safety.o",
            runtime_directory);
   snprintf(safety_msvc_object, sizeof(safety_msvc_object), "%s/safety.obj",
@@ -1977,6 +1991,7 @@ static int mettle_link_object_file(const char *object_filename,
     const char *profile_object = NULL;
     const char *debug_object = NULL;
     const char *safety_object = NULL;
+    const char *swap_object_internal = NULL;
     char *startup_object = replace_extension(executable_filename, ".startup.obj");
     size_t object_count = 0u;
     int startup_ready = 0;
@@ -2065,6 +2080,11 @@ static int mettle_link_object_file(const char *object_filename,
           goto cleanup;
         }
       }
+      if (needs_swap) {
+        swap_object_internal = (_access(swap_msvc_object, 0) == 0)
+                                   ? swap_msvc_object
+                                   : swap_gcc_object;
+      }
       if (needs_safety) {
         safety_object = (_access(safety_msvc_object, 0) == 0)
                             ? safety_msvc_object
@@ -2108,6 +2128,10 @@ static int mettle_link_object_file(const char *object_filename,
       if (safety_object) {
         object_is_default[object_count] = 1u;
         object_paths[object_count++] = safety_object;
+      }
+      if (swap_object_internal) {
+        object_is_default[object_count] = 1u;
+        object_paths[object_count++] = swap_object_internal;
       }
       if (use_tracy) {
         object_is_default[object_count] = 1u;
@@ -2210,6 +2234,18 @@ static int mettle_link_object_file(const char *object_filename,
       }
       runtime_objects[runtime_object_count++] = profile_gcc_object;
     }
+    if (needs_swap) {
+      const char *swap_object = (_access(swap_msvc_object, 0) == 0)
+                                    ? swap_msvc_object
+                                    : swap_gcc_object;
+      if (_access(swap_object, 0) != 0) {
+        fprintf(stderr,
+                "Error: Bundled swap runtime object not found in '%s'\n",
+                runtime_directory);
+        goto cleanup;
+      }
+      runtime_objects[runtime_object_count++] = swap_object;
+    }
     if (needs_safety) {
       if (_access(safety_gcc_object, 0) != 0) {
         fprintf(stderr,
@@ -2280,6 +2316,18 @@ static int mettle_link_object_file(const char *object_filename,
         goto cleanup;
       }
       runtime_objects[runtime_object_count++] = profile_object;
+    }
+    if (needs_swap) {
+      const char *msvc_swap_object = (_access(swap_msvc_object, 0) == 0)
+                                         ? swap_msvc_object
+                                         : swap_gcc_object;
+      if (_access(msvc_swap_object, 0) != 0) {
+        fprintf(stderr,
+                "Error: Bundled swap runtime object not found in '%s'\n",
+                runtime_directory);
+        goto cleanup;
+      }
+      runtime_objects[runtime_object_count++] = msvc_swap_object;
     }
     if (needs_safety) {
       const char *msvc_safety_object = (_access(safety_msvc_object, 0) == 0)

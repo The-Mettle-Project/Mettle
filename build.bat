@@ -269,6 +269,10 @@ echo Compiling memory-safety runtime (opt-in: --safe)...
 %CC% %RUNTIME_CFLAGS% -c src\runtime\safety.c -o obj\runtime\safety.o
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
+echo Compiling swap runtime (opt-in: quiesce)...
+%CC% %RUNTIME_CFLAGS% -c src\runtime\swap.c -o obj\runtime\swap.o
+if %ERRORLEVEL% NEQ 0 exit /b 1
+
 echo Compiling atomics helpers (opt-in: std/thread)...
 %CC% %RUNTIME_CFLAGS% -DMETTLE_ATOMICS_IN_FREESTANDING -c src\runtime\atomics.c -o obj\runtime\atomics.o
 if %ERRORLEVEL% NEQ 0 exit /b 1
@@ -430,6 +434,8 @@ copy /Y obj\runtime\crash_handler.o bin\runtime\crash_handler.o >nul
 copy /Y obj\runtime\crash_handler.o bin\runtime\crash_handler.obj >nul
 copy /Y obj\runtime\safety.o bin\runtime\safety.o >nul
 copy /Y obj\runtime\safety.o bin\runtime\safety.obj >nul
+copy /Y obj\runtime\swap.o bin\runtime\swap.o >nul
+copy /Y obj\runtime\swap.o bin\runtime\swap.obj >nul
 copy /Y obj\runtime\atomics.o bin\runtime\atomics.o >nul
 copy /Y obj\runtime\atomics.o bin\runtime\atomics.obj >nul
 copy /Y obj\runtime\profile.o bin\runtime\profile.o >nul

@@ -157,6 +157,42 @@ int type_checker_ensure_multi_return_type(TypeChecker *checker,
   return 1;
 }
 
+/* Pointer to an arbitrary type, built from the type rather than from its
+ * spelling. Address-of used to mangle "<name>*" and look the result up, which
+ * works while the name is a plain identifier and fails the moment it is not:
+ * `&slot` on a `fn(int32) -> int32` global asked for a type named
+ * "fn(int32) -> int32*", which nothing registers. */
+Type *type_checker_pointer_to(TypeChecker *checker, Type *base) {
+  if (!checker || !base) {
+    return NULL;
+  }
+  const char *base_name = base->name ? base->name : "ptr";
+  size_t pointer_name_len = strlen(base_name) + 2;
+  char *pointer_name = malloc(pointer_name_len);
+  if (!pointer_name) {
+    return NULL;
+  }
+  snprintf(pointer_name, pointer_name_len, "%s*", base_name);
+
+  Type *existing = type_checker_get_type_by_name(checker, pointer_name);
+  if (existing) {
+    free(pointer_name);
+    return existing;
+  }
+
+  Type *pointer_type = type_create(TYPE_POINTER, pointer_name);
+  free(pointer_name);
+  if (!pointer_type) {
+    return NULL;
+  }
+  pointer_type->base_type = base;
+  if (!type_compute_layout(pointer_type)) {
+    type_destroy(pointer_type);
+    return NULL;
+  }
+  return type_checker_canon_type(checker, pointer_type);
+}
+
 Type *type_checker_parse_pointer_type(TypeChecker *checker,
                                              const char *name) {
   if (!checker || !name) {

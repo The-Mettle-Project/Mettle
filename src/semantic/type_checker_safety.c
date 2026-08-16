@@ -1441,8 +1441,11 @@ int type_checker_statement_guarantees_termination(ASTNode *statement) {
   case AST_RETURN_STATEMENT:
   case AST_BREAK_STATEMENT:
   case AST_CONTINUE_STATEMENT:
-  case AST_QUIESCE_STATEMENT:
     return 1;
+  /* `quiesce;` transfers control nowhere: it applies staged swaps and falls
+   * through to the next statement, so everything after it is reachable. */
+  case AST_QUIESCE_STATEMENT:
+    return 0;
   case AST_IF_STATEMENT: {
     IfStatement *if_stmt = (IfStatement *)statement->data;
     if (!if_stmt || !if_stmt->then_branch || !if_stmt->else_branch) {

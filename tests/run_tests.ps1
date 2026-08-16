@@ -2609,6 +2609,50 @@ catch {
   Write-CaseResult -Name "swappable_keeps_call_boundary" -Passed $false -Reason $_.Exception.Message
 }
 
+# A function replaced in a running process. Staging records an intent and
+# changes nothing; `quiesce;` is the only place it takes effect. The program
+# checks each step itself and returns 42 only if every one held.
+foreach ($swapMode in @("debug", "release")) {
+  $total++
+  try {
+    $exe = Join-Path $tmpDir "hotswap_$swapMode.exe"
+    $buildArgs = @()
+    if ($swapMode -eq "release") { $buildArgs += "--release" }
+    $buildArgs += @("--build", "tests\test_hot_swap.mettle", "-o", $exe)
+    $out = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "hot swap ($swapMode) build failed: $out" }
+    & $exe *> $null
+    if ($LASTEXITCODE -ne 42) {
+      throw "hot swap ($swapMode) returned $LASTEXITCODE (expected 42; see the step codes in the fixture)"
+    }
+    Write-CaseResult -Name "hot_swap_$swapMode" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "hot_swap_$swapMode" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# The swap runtime is opt-in like every other component: a program with no
+# quiesce point never names mettle_swap_ and never links it.
+$total++
+try {
+  $exe = Join-Path $tmpDir "swap_excision.exe"
+  $out = & $CompilerPath --build "tests\runtime_excision_probe.mettle" -o $exe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "probe build failed: $out" }
+  $bytes = [IO.File]::ReadAllBytes($exe)
+  # mettle_swap_apply is called only by `quiesce;`, so its absence here is the
+  # absence of the whole component.
+  if ([Text.Encoding]::ASCII.GetString($bytes).Contains("mettle_swap_apply")) {
+    throw "the swap runtime was linked into a program with no quiesce point"
+  }
+  Write-CaseResult -Name "swap_runtime_excisable" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "swap_runtime_excisable" -Passed $false -Reason $_.Exception.Message
+}
+
 # Runtime excision: each optional component has to be absent from a binary that
 # did not ask for it, and the absence has to be checkable rather than asserted.
 # What is excisable is optional; what is mandatory is a tax, so this is the

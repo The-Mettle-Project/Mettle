@@ -1,0 +1,56 @@
+// A function replaced in a running process, at a point the program named.
+//
+// The staging call records an intent and changes nothing: the behaviour is
+// still the old one on the very next call. `quiesce;` is the only place the
+// intent takes effect, which is the whole design. Applying it on a timer, at a
+// safepoint the compiler picked, or inside the staging call itself would be
+// control flow at a point nobody wrote.
+//
+// The binding is a slot holding a function pointer, so applying a swap is one
+// pointer-sized store. No code is modified, no page is made writable, and a
+// caller already inside the old body finishes there.
+
+import "std/io"
+
+extern fn mettle_swap_stage(slot: rawptr, replacement: rawptr) -> int32;
+extern fn mettle_swap_pending() -> int64;
+
+fn policy_v1(n: int32) -> int32 {
+    return n + 1;
+}
+
+fn policy_v2(n: int32) -> int32 {
+    return n * 10;
+}
+
+var policy: fn(int32) -> int32 = &policy_v1;
+
+fn main() -> int32 {
+    var score: int32 = 0;
+
+    if (policy(5) != 6) { return 1; }          // old behaviour
+
+    mettle_swap_stage(&policy, &policy_v2);
+    if (mettle_swap_pending() != 1) { return 2; }
+
+    // Staged is not applied. Nothing has happened at a point the program did
+    // not authorize.
+    if (policy(5) != 6) { return 3; }
+
+    quiesce;
+
+    if (mettle_swap_pending() != 0) { return 4; }
+    if (policy(5) != 50) { return 5; }         // new behaviour
+
+    // A second quiesce with nothing staged is a no-op, not a repeat.
+    quiesce;
+    if (policy(5) != 50) { return 6; }
+
+    // Swapping back is the same mechanism.
+    mettle_swap_stage(&policy, &policy_v1);
+    quiesce;
+    if (policy(5) != 6) { return 7; }
+
+    score = 42;
+    return score;
+}

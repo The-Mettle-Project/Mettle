@@ -2099,6 +2099,12 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
       Type *pointer_type = type_checker_get_type_by_name(checker, pointer_name);
       free(pointer_name);
       if (!pointer_type) {
+        /* The spelling is not a registered name, which is ordinary for a
+         * function-pointer or other structural operand. Build the pointer
+         * from the type instead of from its spelling. */
+        pointer_type = type_checker_pointer_to(checker, operand_type);
+      }
+      if (!pointer_type) {
         type_checker_set_error_at_location(checker, expression->location,
                                            "Failed to resolve pointer type");
         return NULL;

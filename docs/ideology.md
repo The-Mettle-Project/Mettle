@@ -743,20 +743,19 @@ bounds. The first of those is the precondition for everything in Part III.
 
 **Before hot swap ships:**
 
-- A declared quiescence point. *(IV.4)* **Declaration landed; binding
-  outstanding.** `quiesce;` names the point, contextually, so a program
-  already using the name keeps working. `@swappable` is the opt-in unit, per
-  function, and it keeps the call boundary a swap has to redirect: it implies
-  noinline, and `@swappable @inline` is refused, because an inlined body has
-  no call to redirect and no single place to name. Verified under `--release`,
-  where an undecorated twin of the same body still inlines. `quiesce;` emits
-  nothing yet: the patch table it will poll does not exist, and emitting a
-  call into a runtime that has not been written would be control flow at a
-  point nothing can service. The binding model chosen is a patch table,
-  because a swap is then one atomic pointer store with the old body still
-  resident, and at a `quiesce` only the calling thread is quiescent, so
-  rewriting instructions under another thread is not available (IV.4 forbids
-  the stop-the-world that would make it safe).
+- ~~A declared quiescence point.~~ *(IV.4)* **Landed, and the swap works.**
+  `quiesce;` names the point, contextually, so a program already using the
+  name keeps working. `@swappable` is the opt-in unit, per function, and it
+  keeps the call boundary a swap redirects: it implies noinline, and
+  `@swappable @inline` is refused. Staging a swap records an intent and
+  changes nothing; `quiesce;` is the only place it takes effect, in both
+  `--release` and debug. The binding is a slot holding a function pointer, so
+  applying a swap is one pointer-sized store: no code is modified, no page is
+  made writable, and a caller already inside the old body finishes there.
+  Rewriting instructions instead would need every other thread halted, and
+  halting them is the unauthored control flow this document refuses. A program
+  with no quiesce point never names `mettle_swap_` and does not link the
+  runtime, which `swap_runtime_excisable` proves on every build.
 - ~~Layout-change detection with refusal as the default outcome.~~ *(IV.3)*
   **Landed.** `layoutof(T)` digests kind, size, alignment and every field's
   name, offset and width. Pinning it with `static_assert` makes a layout

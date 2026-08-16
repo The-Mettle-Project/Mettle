@@ -263,13 +263,21 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     return ok;
   }
 
-  /* A swap point emits nothing today: the patch table it will poll does not
-   * exist yet, and emitting a call to a runtime that has not been written
-   * would be control flow at a point nothing can service. When the binding
-   * lands, this is where the poll goes, and it is already the only place the
-   * program consented to one. */
-  case AST_QUIESCE_STATEMENT:
-    return 1;
+  /* The one place a staged swap is allowed to take effect. Applying it
+   * anywhere else, or on a timer, or at a safepoint the compiler chose, would
+   * be control flow at a point the programmer did not write. The call is the
+   * whole cost, and a program with no quiesce point never emits it and never
+   * links the swap runtime. */
+  case AST_QUIESCE_STATEMENT: {
+    IRInstruction apply = {0};
+    apply.op = IR_OP_CALL;
+    apply.location = statement->location;
+    apply.dest = ir_operand_none();
+    apply.text = "mettle_swap_apply";
+    apply.arguments = NULL;
+    apply.argument_count = 0;
+    return ir_emit(context, function, &apply);
+  }
 
   case AST_VAR_DECLARATION: {
     VarDeclaration *declaration = (VarDeclaration *)statement->data;

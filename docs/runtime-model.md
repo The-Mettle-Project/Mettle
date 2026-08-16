@@ -121,3 +121,52 @@ This is the property that has to hold before the runtime grows. What is
 excisable is optional; what is optional is a feature; what is mandatory is a
 tax. A component that cannot be left out has stopped being optional, and this
 gate is what would notice.
+
+## Code swapping
+
+A function can be replaced in a running process. The compiler's part is a
+boundary and a point; the runtime's part is a staged store.
+
+```mettle
+extern fn mettle_swap_stage(slot: rawptr, replacement: rawptr) -> int32;
+
+fn policy_v1(n: int32) -> int32 { return n + 1; }
+fn policy_v2(n: int32) -> int32 { return n * 10; }
+
+var policy: fn(int32) -> int32 = &policy_v1;
+
+fn main() -> int32 {
+    policy(5);                                  // 6
+    mettle_swap_stage(&policy, &policy_v2);
+    policy(5);                                  // still 6: staged, not applied
+    quiesce;
+    policy(5);                                  // 50
+    return 0;
+}
+```
+
+**Staging is not applying.** `mettle_swap_stage` records an intent. The call
+right after it still runs the old function. Only `quiesce;` applies staged
+swaps, so a replacement can never land halfway through an operation the
+programmer treated as one. Nothing is applied on a timer, at a safepoint the
+compiler chose, or inside the staging call.
+
+**The binding is a slot, not a patched instruction.** Applying a swap is one
+pointer-sized store. Nothing writes to executable memory, the process never
+needs W^X toggled, and a thread already inside the old body finishes there
+because that body is still resident. Rewriting instructions in place would
+need every other thread halted first, and stopping the world is exactly the
+unauthored control flow the runtime rules forbid.
+
+**`@swappable` keeps the boundary.** A swap redirects a call, so the call has
+to survive. The decorator implies `@noinline`, and `@swappable` with
+`@inline` is refused: an inlined body has no call to redirect and no single
+place to name.
+
+**It is opt-in and provable.** A program with no `quiesce;` never references
+`mettle_swap_` and never links `swap.o`, which the excision gate checks on
+every build. The cost of swappability is paid where it is asked for.
+
+The staging table is fixed-size and allocates nothing, so a swap cannot fail
+for want of memory at the moment a program is trying to replace the code that
+was going wrong. Restaging a slot replaces the earlier intent.
