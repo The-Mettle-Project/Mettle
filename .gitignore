@@ -63,3 +63,9 @@ tests/parse_stress_test.mettle
 
 # JetBrains IDE project config, per-developer.
 .idea/
+
+# --explain writes these next to the output stem: the prose sidecar, the
+# machine-readable report, and the baseline the next run diffs against.
+*.explain.txt
+*.explain.json
+*.explain.base
