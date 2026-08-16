@@ -98,7 +98,7 @@ int binary_emit_mov_reg_reg32(BinaryCodeBuffer *buffer,
 
 /* 32-bit reg-reg mov that ALWAYS emits, even for destination == source.
  * `mov r32, r32` zero-extends into the upper half, so the same-register form
- * is the canonical uint32 zero-extension — callers relying on that zeroing
+ * is the canonical uint32 zero-extension, callers relying on that zeroing
  * must use this, not binary_emit_mov_reg_reg32 (whose same-register no-op
  * would silently skip it). */
 /* 32-bit-operand-size forms of the ALU and unary encoders below. On x86-64 a

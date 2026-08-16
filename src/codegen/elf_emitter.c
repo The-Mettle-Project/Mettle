@@ -571,7 +571,7 @@ int binary_emitter_write_elf_object_file(BinaryEmitter *emitter,
     header->offset = offset;
     offset += header->size;
   }
-  /* symtab, strtab, shstrtab — find them by walking the tail headers. They were
+  /* symtab, strtab, shstrtab, find them by walking the tail headers. They were
    * appended in this order: [rela...] symtab strtab shstrtab. */
   size_t symtab_header_index = shstrtab_header_index - 2;
   size_t strtab_header_index = shstrtab_header_index - 1;

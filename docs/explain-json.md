@@ -145,7 +145,7 @@ costs the program its afternoon under a cold one-liner; this is the order to sho
 | `code` | Its stable id, when it has one. |
 | `cost` | Loops: modelled cycles times nest weight. Calls: callee weight times the nest weight of the loop containing the site. Ten per nest level, capped at three levels. |
 
-A static proxy, not a measurement — nothing here has run the program. With `--pgo` the frequencies
+A static proxy. Nothing here has run the program. With `--pgo` the frequencies
 are measured and the ranking follows them.
 
 ## `passes`

@@ -245,7 +245,7 @@ $cases = @(
       'verified: simulated that fix and re-ran the optimizer: this loop then vectorizes -> vfmadd231ps, 8-wide float32 FMA dot product',
       # proven-inapplicable advice is REPLACED, never printed: skew''s index
       # half mutates every iteration, so the hoist advice would be wrong
-      'none via hoisting -- re-checked: the index half that is not the loop counter changes every iteration',
+      'none via hoisting. Re-checked: the index half that is not the loop counter changes every iteration',
       # the expanded backend section: instruction-weighted coverage, bails
       # grouped by cause with consequence text and sizes
       'backend report: explain_demo\.mettle',

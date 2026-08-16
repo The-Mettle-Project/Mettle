@@ -106,7 +106,7 @@ authority; what follows is the shape of the remaining gaps.
 
 ### Struct-by-Value Function Arguments
 
-Structs work normally as **locals**: field access, whole-struct assignment, and `&s` all use the full laid-out size (assignment copies every byte, not just the first machine word). The same holds when the destination is a struct field, a nested field, an array element, or reached through a pointer — including when the value comes from a function returning an aggregate, which arrives through a hidden pointer.
+Structs work normally as **locals**: field access, whole-struct assignment, and `&s` all use the full laid-out size (assignment copies every byte, not just the first machine word). The same holds when the destination is a struct field, a nested field, an array element, or reached through a pointer, including when the value comes from a function returning an aggregate, which arrives through a hidden pointer.
 
 **Struct-by-value parameters and returns** follow the Microsoft x64 ABI's aggregate rule on Windows. A struct whose size is exactly 1, 2, 4, or 8 bytes is passed directly in one integer register. Other aggregate sizes, including structs larger than 8 bytes and odd-sized small structs such as 3-byte values, are passed and returned by **hidden pointer**:
 
@@ -159,6 +159,22 @@ Arrays follow the same rule as in [Types - Array Types](types.md#array-types): t
 ### Deferred Calls
 
 - A deferred direct call `defer fn(args...)` captures its **argument values at the defer point** (by value); the snapshots are replayed at scope exit. Deferred **method calls** (`defer obj.m(...)`) and **indirect/function-pointer calls** still re-evaluate their operands at scope exit (by reference); snapshot into a local first if you need the defer-point value.
+
+### Deferred statements skipped on four exit paths
+
+Four ways out of a scope run none of its deferred statements. Release the
+resource by hand on these paths. Verified against the compiler as of this
+writing; see [Control Flow](control-flow.md#what-defer-does-not-cover) for the
+programs and their output.
+
+- **`break`** leaves the loop body without running its deferred statements.
+- **`continue`** skips them for the iteration it leaves. Later iterations that
+  reach the end of the body run them as usual.
+- **`break name` and `continue name`** skip every deferred statement between
+  the jump and the labeled loop, including the labeled loop's own.
+- **A `switch` case body** never runs its deferred statements at all.
+
+`return` and reaching the end of a scope both work as documented.
 
 ### Error Defer
 

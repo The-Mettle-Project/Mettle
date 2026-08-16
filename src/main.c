@@ -843,8 +843,8 @@ static int mettle_link_elf_executable(const char *object_filename,
   /* Build the argv vector directly and exec the compiler via fork/execvp
    * instead of handing a constructed command string to system(). Because no
    * shell ever interprets the arguments, none of the caller-controlled
-   * strings — the object/executable filenames or the user-supplied
-   * --link-arg values — can inject shell commands (CWE-78) or be word-split
+   * strings, the object/executable filenames or the user-supplied
+   * --link-arg values, can inject shell commands (CWE-78) or be word-split
    * into unintended options (CWE-88). Each --link-arg is forwarded as exactly
    * one argv element, matching how it was collected at parse time. */
   if (result != 0) {
@@ -1440,7 +1440,7 @@ static int write_internal_startup_object(const char *path, int profile_runtime,
                                              main_wants_argc_argv);
 }
 
-/* Build → link routing is documented in docs/linker-build-pipelines.md (asm+GCC
+/* Build-to-link routing is documented in docs/linker-build-pipelines.md (asm+GCC
  * vs emit-obj+internal vs emit-obj+external GCC). */
 
 static int mettle_link_internal(const char **object_paths,

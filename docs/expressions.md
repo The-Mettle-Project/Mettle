@@ -112,7 +112,7 @@ Negation `-x`. Logical NOT `!x` (returns 1 if x is 0, otherwise 0). Dereference 
 
 **Null dereference:** In normal builds, the compiler emits runtime null checks for dynamic pointer dereference/indexing and traps with a fatal message on null. In `--release`, those generated checks are disabled; dereferencing a null pointer is undefined behavior and typically crashes. See [Types](types.md#pointer-types).
 
-**Address-of on non-lvalues:** Taking the address of a temporary or non-assignable expression is a compile error. For example, `&(x + 1)` and `&42` are invalid—the operand must be a variable, struct field, array element, or dereferenced pointer. The error message is "Address-of operator requires an assignable expression".
+**Address-of on non-lvalues:** Taking the address of a temporary or non-assignable expression is a compile error. For example, `&(x + 1)` and `&42` are invalid. The operand must be a variable, struct field, array element, or dereferenced pointer. The error message is "Address-of operator requires an assignable expression".
 
 ## Indexing
 
@@ -193,7 +193,7 @@ Casting across different sizes might result in zero-extension, sign-extension, o
 
 ## Boolean Context
 
-In control flow conditions (`if`, `while`, `for`), the condition must be a numeric type (integer or floating-point). Zero is false; non-zero is true. Pointers are not valid as conditions—use `ptr != 0` for null checks.
+In control flow conditions (`if`, `while`, `for`), the condition must be a numeric type (integer or floating-point). Zero is false; non-zero is true. A pointer is not a valid condition. Write `ptr != 0` to test for null.
 
 Comparison operators (`==`, `!=`, `<`, `<=`, `>`, `>=`) produce `int32` with value 0 (false) or 1 (true). These values can be used directly in conditions. See [Control Flow](control-flow.md).
 

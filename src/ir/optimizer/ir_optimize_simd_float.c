@@ -1,4 +1,4 @@
-﻿#include "ir_optimize_internal.h"
+#include "ir_optimize_internal.h"
 
 /* -------------------------------------------------------------------------- */
 /* float64/float32 horizontal sum -> IR_OP_SIMD_SUM_F64/F32                    */
@@ -1396,7 +1396,7 @@ int ir_simd_i2f_reduce_pass(IRFunction *function, int *changed) {
 /* reductions over either float width; the store/accumulator type pins it.     */
 /* -------------------------------------------------------------------------- */
 
-/* Node tags â€” must match the kernel decoder in simd_float.c. */
+/* Node tags , must match the kernel decoder in simd_float.c. */
 #define VLOOP_VN_LOAD 0  /* op0 = loaded-array index */
 #define VLOOP_VN_IOTA 1  /* (float64)iv, or the raw iv for int lanes */
 #define VLOOP_VN_CONST 2 /* op0 = constant index */
@@ -1591,7 +1591,7 @@ static int vloop_f64_narrows_exactly(double v) {
 /* A compile-time float literal: a FLOAT operand of the right width (or an
  * exactly-narrowable float64 literal in a float32 DAG), or a temp that is a
  * cast of an int/float literal to that width. Crucially this does NOT match
- * loop-invariant scalar *symbols* (parameters) â€” those are a runtime broadcast
+ * loop-invariant scalar *symbols* (parameters) , those are a runtime broadcast
  * handled via VLOOP_VN_SCALAR, so leaving them here makes the pass cleanly
  * refuse rather than miscompile. */
 static int vloop_operand_is_literal(IRFunction *function, size_t before,
@@ -5071,7 +5071,7 @@ static int ir_try_vectorize_outer_lane_at(IRFunction *function,
 
   /* Find the (single) inner while header in the outer body. ir_label_is_while_header
    * also matches the loop's *end* label (it contains "_lbl_ir_while_"), so skip
-   * any label naming a while-end marker â€” only true headers count. */
+   * any label naming a while-end marker , only true headers count. */
   long long inner_hdr = -1;
   for (size_t i = outer_branch + 1; i < outer_jump; i++) {
     const IRInstruction *ins = &function->instructions[i];

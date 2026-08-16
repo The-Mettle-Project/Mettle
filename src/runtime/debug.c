@@ -1,4 +1,4 @@
-﻿/* Mettle interactive debug runtime (opt-in: --debug-hooks).
+/* Mettle interactive debug runtime (opt-in: --debug-hooks).
  *
  * The compiler instruments the program with calls to the mettle_dbg_*
  * symbols below; the internal linker pulls this object in when it sees them

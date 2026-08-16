@@ -871,34 +871,34 @@ int type_checker_is_cast_valid(Type *from, Type *to) {
     return 0;
 
   /* Reflection types have no runtime representation, so they cannot be
-   * cast to or from anything — including each other. */
+   * cast to or from anything, including each other. */
   if (type_is_comptime_only(from) || type_is_comptime_only(to))
     return type_checker_types_equal(from, to);
 
   if (type_checker_types_equal(from, to))
     return 1;
 
-  // Numeric ↔ numeric
+  // Numeric <-> numeric
   if (type_checker_is_numeric_type(from) && type_checker_is_numeric_type(to))
     return 1;
 
-  // Pointer ↔ pointer
+  // Pointer <-> pointer
   if (from->kind == TYPE_POINTER && to->kind == TYPE_POINTER)
     return 1;
 
-  // Integer ↔ pointer
+  // Integer <-> pointer
   if ((type_checker_is_integer_type(from) && to->kind == TYPE_POINTER) ||
       (from->kind == TYPE_POINTER && type_checker_is_integer_type(to))) {
     return 1;
   }
 
-  // Pointer ↔ function pointer
+  // Pointer <-> function pointer
   if ((from->kind == TYPE_POINTER && to->kind == TYPE_FUNCTION_POINTER) ||
       (from->kind == TYPE_FUNCTION_POINTER && to->kind == TYPE_POINTER)) {
     return 1;
   }
 
-  // Integer ↔ function pointer
+  // Integer <-> function pointer
   if ((type_checker_is_integer_type(from) &&
        to->kind == TYPE_FUNCTION_POINTER) ||
       (from->kind == TYPE_FUNCTION_POINTER &&
@@ -906,7 +906,7 @@ int type_checker_is_cast_valid(Type *from, Type *to) {
     return 1;
   }
 
-  // Function pointer ↔ function pointer
+  // Function pointer <-> function pointer
   if (from->kind == TYPE_FUNCTION_POINTER &&
       to->kind == TYPE_FUNCTION_POINTER) {
     return 1;
@@ -1195,7 +1195,7 @@ Type *type_checker_default_integer_literal_type(TypeChecker *checker,
 
   /*
    * Decimal defaults follow signed widening so large magnitudes usable with
-   * unary minus (-2147483648 via -(int64)…). Hex/binary infer uint32 in the
+   * unary minus (-2147483648 via -(int64)...). Hex/binary infer uint32 in the
    * (INT32_MAX, UINT32_MAX] range so 0xFFFFFFFF and similar stay uint32-ish.
    */
   if (radix == 10u) {

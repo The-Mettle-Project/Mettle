@@ -757,9 +757,9 @@ static int parse_generic_type_name(const char *type_str, char **out_base,
   // Check for pointer suffix after '>' (e.g., "List<int32>*")
   const char *suffix = gt + 1;
   if (suffix < end && *suffix != '\0') {
-    // There's a suffix like "*" — we need to incorporate it
+    // There's a suffix like "*", we need to incorporate it
     // The base stays the same, but we need the caller to handle the suffix
-    // For simplicity, append the suffix to the last arg? No — the suffix
+    // For simplicity, append the suffix to the last arg? No, the suffix
     // applies to the whole generic type. We'll handle this by including
     // the suffix in the base name replacement later.
   }
@@ -2953,7 +2953,7 @@ static int g_adapt_counter;
 /* Name index over the top_decls snapshot (decl slot+1; 0 = empty). Duplicate
  * names keep every entry: linear probing places same-key entries along one
  * probe path in insertion order, so a lookup that continues to the first
- * empty bucket sees them in snapshot order — exactly what the old linear
+ * empty bucket sees them in snapshot order, exactly what the old linear
  * scans (first name match / first name+arity match) relied on. Consulted per
  * call expression, so a linear scan is O(calls x functions). */
 typedef struct {

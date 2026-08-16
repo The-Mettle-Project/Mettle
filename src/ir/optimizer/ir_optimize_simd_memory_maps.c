@@ -1,4 +1,4 @@
-﻿#include "ir_optimize_internal.h"
+#include "ir_optimize_internal.h"
 
 int ir_find_while_loop_bounds(IRFunction *function, size_t header_index,
                                      IRWhileLoopBounds *out) {

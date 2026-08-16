@@ -1337,8 +1337,8 @@ int code_generator_binary_emit_simd_clamp_i32(
     return 0;
   }
 
-  /* AVX2: clamp eight int32 per iteration — vpmaxsd against the lo broadcast,
-   * vpminsd against the hi broadcast — store, and fold into the ymm2 sum. */
+  /* AVX2: clamp eight int32 per iteration, vpmaxsd against the lo broadcast,
+   * vpminsd against the hi broadcast, store, and fold into the ymm2 sum. */
   if (!wcs_patch_here(b, j_vec) ||
       !wcs_avx_vmovdqu_ymm_mem(b, 0, BINARY_GP_RCX, 0) ||
       !wcs_avx_vpmaxsd_ymm(b, 0, 0, 4) ||

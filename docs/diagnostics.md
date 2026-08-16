@@ -34,10 +34,24 @@ help: for more about this error, run `mettle explain E0003`
   reports four errors, not one per rebuild. A variable whose initializer
   fails is still registered with its declared type, so later uses of it do
   not cascade into bogus `Undefined variable` errors.
-- **No parser cascades.** After a syntax error the parser resynchronizes at
-  the next statement boundary, and repeated errors at the same location are
-  suppressed. Contextual messages ("Expected '(' after 'if'") replace the
-  generic token mismatch instead of stacking on top of it.
+- **One mistake, one diagnostic.** A failed statement resynchronizes inside
+  the block it belongs to. The block still consumes its own closing brace, so
+  the rest of the function never reaches file scope to be read as broken
+  declarations. Repeated errors at one location are dropped as well.
+  `tests/err_syntax_no_cascade.mettle` and
+  `tests/err_syntax_missing_operand.mettle` assert the error count, so a
+  return of the old cascade fails the suite.
+- **The message names what the parser found.** A missing operand reports the
+  operator it was read past and the token that turned up instead, as in
+  `Expected an expression after '+', found ';'`. Where the construct is
+  known, the message names it: `Expected '(' after 'if'`.
+- **Advice comes from context.** A comma where `)` was due describes the
+  paren it belongs to. A parameter or argument list is told the list ends
+  there; a condition or a grouped expression is told it holds one value and
+  that Mettle has no tuples.
+- **Foreign keywords get named.** `let`, `def`, `func`, `int`, `float`,
+  `char` and the rest report the Mettle spelling in one line rather than
+  decomposing into grammar complaints.
 - **Typo suggestions.** Undefined names get a Levenshtein-based
   "did you mean 'count'?" over every symbol in scope.
 - **A summary footer** counts errors and warnings and names the `explain`

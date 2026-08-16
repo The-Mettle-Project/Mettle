@@ -71,7 +71,7 @@ frontend at all, and any frontend that lowers into the IR can drive it.
 exactly that, through the public API alone.
 
 The build checks this rather than trusting it. After archiving, it relocatably
-links the archive and fails if a single non-OS symbol is left unresolved — a
+links the archive and fails if a single non-OS symbol is left unresolved. It is a
 backend that had picked up a frontend dependency would not survive that.
 
 ## Why the driver is not a normal consumer

@@ -1,4 +1,4 @@
-﻿// Type checker: lifecycle, function-signature registration, program driver.
+// Type checker: lifecycle, function-signature registration, program driver.
 #include "type_checker_internal.h"
 
 Symbol *type_checker_resolve_identifier(TypeChecker *checker,

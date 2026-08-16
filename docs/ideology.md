@@ -1,8 +1,8 @@
 # Ideology
 
 This document is not a specification and not a roadmap. It is the decision
-procedure. When a proposal arrives — a feature, a flag, a syntax, a
-dependency — this is what it gets measured against.
+procedure. When a proposal arrives, whether a feature, a flag, a syntax, or a
+dependency, this is what it gets measured against.
 
 Specs say what the language does. Roadmaps say what it will do. This says what
 it *is*, and therefore what it must refuse, including things that would be
@@ -15,7 +15,7 @@ concrete question.
 
 ---
 
-## Part I — What Mettle already believes
+## Part I: What Mettle already believes
 
 Four commitments run through this compiler. None of them were written down as
 principles first; they were arrived at repeatedly, in unrelated subsystems, by
@@ -23,15 +23,15 @@ someone solving concrete problems the same way each time. That convergence is
 what makes them real, and it is why they get to constrain everything that comes
 next.
 
-### I.1 — The compiler never asserts what it has not proven
+### I.1: The compiler never asserts what it has not proven
 
 This is the deepest one, and it shows up in five places that were built years
 and subsystems apart:
 
 - **The borrow analyser reports nothing it cannot prove.** It is pure
   inference with no ownership syntax, and it "never rejects a program. It only
-  points at provable mistakes." A whole class of false-positive-driven misery —
-  the reason people fight their borrow checkers — was designed out by refusing
+  points at provable mistakes." A whole class of false-positive-driven misery,
+  the reason people fight their borrow checkers, was designed out by refusing
   to speak without proof.
 - **`--explain` simulates its own suggestions before printing them.** A
   compiler that says "try hoisting this bound" without checking is guessing at
@@ -40,7 +40,7 @@ and subsystems apart:
 - **Contracts fail the build rather than under-deliver.** `@simd!`, `@inline!`
   and `@noalloc` do not request an optimization, they require it, and when the
   compiler cannot deliver one it stops and names the site that defeated it.
-  The alternative — silently doing less than asked — is a lie told by omission,
+  The alternative, silently doing less than asked, is a lie told by omission,
   which is what every other optimizer does with every other pragma.
 - **`--verify` holds the optimizer to the same standard as user code.** Every
   pass, every function, executed before and after on identical inputs, and a
@@ -62,13 +62,13 @@ That sentence is the most important one in this repository. It says that
 trustworthiness does not have to come from every component being trustworthy.
 It can be manufactured, structurally, by a pipeline that refuses to emit
 anything it has not checked. Once you believe that, you can safely admit
-components you do not trust — a learned optimizer, a third-party pass, a
-user-written metaprogram, a patched-in function at runtime — because trust was
+components you do not trust (a learned optimizer, a third-party pass, a
+user-written metaprogram, a patched-in function at runtime) because trust was
 never the mechanism.
 
 Everything in Parts III, IV and V is an application of that one idea.
 
-### I.2 — One machine, many products
+### I.2: One machine, many products
 
 libmtlc contains a reference interpreter for its IR. That single artifact is
 the engine behind:
@@ -83,7 +83,7 @@ the engine behind:
 | the leak checker | the interpreter owns the heap, so every test is a sanitizer |
 
 Six products, one machine. This is not tidiness. It is the reason the semantics
-your tests run on are the semantics the optimizer is held to — the same
+your tests run on are the semantics the optimizer is held to, the same
 interpreter defines both, so they cannot drift. And it is the reason each new
 capability costs a fraction of what it would elsewhere: the expensive part was
 built once.
@@ -94,7 +94,7 @@ that reuses the interpreter starts with an enormous advantage over a proposal
 that does not, and should usually win even if it is slightly worse in the
 abstract.
 
-### I.3 — Pay for what you use, and be able to prove you didn't pay
+### I.3: Pay for what you use, and be able to prove you didn't pay
 
 The runtime model is not "we have no runtime." It is that helper objects are
 linked only when the emitted object references their symbol prefix, so
@@ -109,28 +109,28 @@ Note the pattern: it is not enough for the cost to be absent. The absence has
 to be *demonstrable*. A cost you cannot verify you avoided is a cost you are
 paying in anxiety.
 
-### I.4 — Infer the proofs, declare the intent
+### I.4: Infer the proofs, declare the intent
 
 Mettle infers no binding types. Every `var` carries one, and function-local
 `const` too. Meanwhile the borrow checker and the capability analysis are pure
 inference by design, and CONTRIBUTING explicitly forbids growing
 `@owned` / `@borrow`-style ownership annotations.
 
-Read together, those are not in tension — they are one rule stated twice:
+Read together, those are one rule stated twice:
 
 > **What the program means is written down. What the program is safe to do is
 > worked out.**
 
 Types are intent; you must say them. Lifetimes, aliasing, allocation behavior
 and vectorizability are consequences; the compiler must derive them. A language
-that inverts this — inferring meaning while demanding you annotate proofs — is
+that inverts this, inferring meaning while demanding you annotate proofs, is
 Rust, and it is why Rust is hard in exactly the places it is hard.
 
 This rule is directly load-bearing for macros, and Part III returns to it.
 
 ---
 
-## Part II — The thesis: control is the product
+## Part II: The thesis: control is the product
 
 Every systems language is fast. Speed is table stakes and has been for a
 decade. The interesting axis is what the language lets you *decide*.
@@ -150,13 +150,13 @@ Look at where the decisions actually sit today:
 Nobody occupies the bottom row. Zig gets one column and deliberately declines
 the third. Rust gets the third column half-right and pays for the first in a
 separate language. C gives you control over nothing and calls it freedom,
-because there is nothing to control — the pipeline has no exposed decisions,
+because there is nothing to control. The pipeline has no exposed decisions,
 so "you can do anything" means "you can do it all yourself."
 
 The thesis is that these are one feature, not three:
 
 > **Every point at which the language currently makes a decision on your behalf
-> should be a point at which you can make it instead — without leaving the
+> should be a point at which you can make it instead, without leaving the
 > language, and without losing the proof.**
 
 Three points, three axes:
@@ -172,20 +172,20 @@ Three points, three axes:
 
 The unifying clause is "without losing the proof." Anyone can hand over
 control; C did that in 1972. The difficult and differentiating part is handing
-over control while the pipeline keeps making guarantees — which is possible
+over control while the pipeline keeps making guarantees, which is possible
 here, and only here, because of I.1. Soundness is a property of the pipeline.
 So the pipeline can absorb a user-written metaprogram, a runtime-patched
 function, or a swapped allocator, and still refuse to emit something it has not
 checked.
 
-That is the product. Not speed, not safety — both are widely available.
+That is the product. Speed and safety are both widely available.
 **Control that does not cost you the guarantees.**
 
 ---
 
-## Part III — Compile time: the metaprogram
+## Part III: Compile time: the metaprogram
 
-### III.1 — One language, two execution times. Never a preprocessor.
+### III.1: One language, two execution times. Never a preprocessor.
 
 The single most consequential decision in this entire document:
 
@@ -207,7 +207,7 @@ what the templates meant all along. Four mechanisms for one job, each added
 because the previous one could not be repaired, and all four still present.
 
 Rust shipped `macro_rules!`, then discovered it was not enough and shipped
-procedural macros — which are a separate compilation target, operating on token
+procedural macros, which are a separate compilation target, operating on token
 streams, written against an unstable AST library, requiring their own crate.
 Then `const fn` for the compile-time evaluation those two could not do. Three
 mechanisms, two of which are effectively different languages, and a
@@ -230,7 +230,7 @@ mini-language, no `#if` layer. If a metaprogram needs a capability, that
 capability is added to Mettle, where everyone gets it and everything already
 knows how to check it.
 
-### III.2 — Six non-negotiables, each inherited
+### III.2: Six non-negotiables, each inherited
 
 The design constraints on metaprogramming are not imported from taste. Each one
 falls out of a commitment Mettle already holds.
@@ -277,7 +277,7 @@ existing corpus of macros is not possible.**
 
 33,040 lines of application code compile in 1.6 seconds through the internal PE
 linker. That number is not a benchmark boast; it is what makes `mettle test`
-feel instant, what makes `--verify`'s 2–4× multiplier affordable, and what
+feel instant, what makes `--verify`'s 2-4x multiplier affordable, and what
 would make a language server tractable by brute force where every other systems
 language had to build an incremental engine to get one.
 
@@ -288,8 +288,8 @@ collapse was gradual, unattributed, and irreversible by the time anyone
 measured it.
 
 So it gets measured from the first day: per-metaprogram compile cost,
-attributable, reportable, and — consistent with how `@simd!` and `@noalloc`
-already work — *contractable*, so a build can require that expansion stay
+attributable, reportable, and, consistent with how `@simd!` and `@noalloc`
+already work, *contractable*, so a build can require that expansion stay
 within a budget and fail if it does not. The compiler already knows how to
 refuse to compile a program that costs more than the author permitted.
 
@@ -299,12 +299,12 @@ refuse to compile a program that costs more than the author permitted.
 the same input producing the same output. Unrestricted compile-time I/O breaks
 that quietly.
 
-The answer is not prohibition — reading a table, a shader, a schema at build
+The answer is not prohibition. Reading a table, a shader, a schema at build
 time is one of the best reasons to have metaprogramming at all, and `import_str`
 already establishes the precedent. The answer is *declaration*: a metaprogram
 states the inputs it reads, the compiler hashes them, and determinism survives
 by being tracked rather than by being forbidden. Undeclared ambient I/O is
-refused. This is I.3 again — the cost is allowed, and the accounting is
+refused. This is I.3 again: the cost is allowed, and the accounting is
 mandatory.
 
 **6. A metaprogram cannot forge a contract.**
@@ -312,7 +312,7 @@ mandatory.
 `@noalloc` proves an allocation-free call graph. `@simd!` requires
 vectorization. If generated code could smuggle an allocation past `@noalloc`,
 or satisfy `@inline!` by construction rather than by proof, the contracts stop
-being proofs and become decorations — and I.1 is finished, not weakened.
+being proofs and become decorations, and I.1 is finished.
 
 **Contracts are checked on the expanded program, always, without exception.**
 A metaprogram is a source of code, not a source of authority. It gets exactly
@@ -321,7 +321,7 @@ output regardless of who produced it. This is `--ml-opt`'s architecture applied
 to a second untrusted producer, and it is the reason user metaprograms can be
 admitted at all.
 
-### III.3 — What the metaprogram is allowed to see
+### III.3: What the metaprogram is allowed to see
 
 A tempting design gives metaprograms access to compiler internals: the AST as
 the parser builds it, the IR as the optimizer sees it, the symbol tables.
@@ -336,7 +336,7 @@ The rule instead:
 Before type checking, it sees declarations and source structure. After, it sees
 types. It never sees register allocation, pass ordering, or IR internals,
 because those are libmtlc's business and libmtlc must stay free to change them
-— `include/mtlc/` is the only header surface a foreign frontend includes, and
+`include/mtlc/` is the only header surface a foreign frontend includes, and
 that boundary is worth more than any metaprogramming convenience.
 
 This is also I.4 in a new setting. A metaprogram declares intent and receives
@@ -344,7 +344,7 @@ meaning; it does not get privileged access to the machinery that computes
 proofs. The moment user code depends on how a proof is computed, the proof
 cannot be improved.
 
-### III.4 — What this is actually for
+### III.4: What this is actually for
 
 Not cleverness. Three concrete shapes, all of which currently cost real damage:
 
@@ -356,7 +356,7 @@ completeness checked, that entire class of defect stops existing.
 
 **Contracts that span a boundary the compiler cannot see.** DESCENT's wire
 format is a 16-byte player stride and a 22-byte input packet, hand-packed on
-both sides, with items addressed by index — so client and server must agree
+both sides, with items addressed by index, so client and server must agree
 bit-for-bit or players teleport into walls. Declared once, generated for both
 ends, size-asserted at compile time. The bug class disappears rather than being
 tested for.
@@ -372,9 +372,9 @@ what it makes *unnecessary*.
 
 ---
 
-## Part IV — Bind time: hot swap
+## Part IV: Bind time: hot swap
 
-### IV.1 — The claim
+### IV.1: The claim
 
 > **When source becomes running machine code is a decision, not a law of
 > nature.**
@@ -389,14 +389,14 @@ The distance from here to patching a function in a live process is *shorter for
 Mettle than for any other systems language*, and the reason is architectural,
 not incidental.
 
-### IV.2 — Why this matters more than it sounds
+### IV.2: Why this matters more than it sounds
 
 The argument is usually made about iteration speed, which undersells it. The
 real claim is about what is *observable*.
 
-A bug that requires a specific sequence of events to reach — the eleven-thousandth
+A bug that requires a specific sequence of events to reach, say the eleven-thousandth
 frame, the third round of a match, the state after a particular network
-reordering — is expensive to observe in proportion to how hard that state is to
+reordering, is expensive to observe in proportion to how hard that state is to
 reconstruct. When the fix requires a restart, every attempt pays full price for
 reaching the state again. That cost sets how many hypotheses get tested, which
 sets whether the bug gets understood or merely suppressed.
@@ -406,14 +406,14 @@ the expensive part and a restart destroys it. Hot swap does not make the
 compiler faster; it makes the *state* durable across a code change. That is a
 different quantity, and it is the one that was actually limiting.
 
-### IV.3 — What the ideology says about the hard part
+### IV.3: What the ideology says about the hard part
 
 Code is the easy half. State is the hard half, and this is where most hot-reload
 systems become unsound: they guess.
 
 > **The program declares what survives a swap. The compiler never guesses.**
 
-Silent state migration is a miscompile with a friendlier name — a value
+Silent state migration is a miscompile with a friendlier name: a value
 reinterpreted under a layout it was not written with. CONTRIBUTING says a single
 silent miscompile that escapes review is worse than a missed optimization; a
 silent state migration is the same event, relocated.
@@ -430,32 +430,32 @@ Three consequences:
   metaprogramming elsewhere cannot see the running process. Here they are the
   same system, and neither one alone is the interesting part.
 
-### IV.4 — Consent, again
+### IV.4: Consent, again
 
-The swap point is the program's decision — a quiescence point the programmer
+The swap point is the program's decision, a quiescence point the programmer
 names, such as the top of a frame loop. Never preemption, never a stop-the-world
 the program did not ask for. This is the same rule Part V applies to the
 runtime, and it is not a coincidence that it keeps recurring: **nothing runs at
 a point you did not author.**
 
 Swappability is per module and opt-in, so indirection is paid where requested
-and nowhere else — the helper-object linking model (I.3) applied to call
+and nowhere else, the helper-object linking model (I.3) applied to call
 binding.
 
 And it must work in release builds. A capability that exists only under `-d` is
 a debugging toy, and debugging toys do not get to shape a language. The
-interesting uses — live-tuning a shipped simulation, patching a running server,
-swapping a policy under load — are all release-mode uses.
+interesting uses (live-tuning a shipped simulation, patching a running server,
+swapping a policy under load) are all release-mode uses.
 
-### IV.5 — The part that is unique to Mettle
+### IV.5: The part that is unique to Mettle
 
 A hot swap asks: *is the new function compatible with the old one at this
 boundary?*
 
 `--verify` already answers a question of exactly that shape. It executes two
-versions of a function on generated inputs and compares every observable —
+versions of a function on generated inputs and compares every observable:
 return value, final buffer bytes, ordered extern-call trace with pointed-to
-bytes, touched globals — and reports divergence with a counterexample.
+bytes, and touched globals. It reports divergence with a counterexample.
 
 That is a swap gate. Not by analogy: the same machinery, pointed at the old and
 new function instead of the pre-pass and post-pass IR. A swap that changes
@@ -471,9 +471,9 @@ build a verified one.**
 
 ---
 
-## Part V — Run time: the honest runtime
+## Part V: Run time: the honest runtime
 
-### V.1 — The history, stated plainly
+### V.1: The history, stated plainly
 
 Mettle used to ship a large runtime: garbage collector, async executor,
 coroutine scheduler, channels, a tracked heap. It was removed. Programs now
@@ -486,8 +486,8 @@ The old runtime failed on three properties:
 
 - **It was mandatory.** Every program paid, including programs that used none
   of it.
-- **It was invisible.** Work happened at points the programmer did not write —
-  a collection, a scheduler tick — and nothing named the moment.
+- **It was invisible.** Work happened at points the programmer did not write,
+  a collection or a scheduler tick, and nothing named the moment.
 - **It was unremovable.** No flag produced a binary without it, and no tool
   proved it was gone.
 
@@ -495,7 +495,7 @@ It did not fail because it was a runtime. It failed because it was mandatory,
 invisible, and unremovable. Those are three fixable properties, and confusing
 them with the category is how a project ends up defining itself by an absence.
 
-### V.2 — Everyone has a runtime; most lie
+### V.2: Everyone has a runtime; most lie
 
 C has `crt0`, static initializers, `errno`'s thread-local machinery, `atexit`
 chains, and an allocator with its own locks and heuristics. Rust has a panic
@@ -505,7 +505,7 @@ rather than about linkers.
 
 Mettle is already more honest than either: `runtime-model.md` states exactly
 what is emitted and when, and the helpers are opt-in by symbol prefix. But the
-framing is still defensive — "rough analogy: these objects are like `crt0.o` for
+framing is still defensive: "rough analogy: these objects are like `crt0.o` for
 C: small linker glue, not a language runtime." That sentence is arguing with an
 accusation.
 
@@ -513,7 +513,7 @@ And Mettle already pays for a runtime in the place it matters most: generated
 null and bounds checks are runtime cost, present in every non-`--release`
 build, and they are one of the best things about the language.
 
-### V.3 — The four rules
+### V.3: The four rules
 
 A runtime is acceptable exactly when:
 
@@ -525,7 +525,7 @@ the cost, it is the *unauthored control flow*.
 
 **2. Excisable.** A build configuration produces a binary containing none of
 it, and the compiler can prove the absence. `@noalloc` already demonstrates
-this shape — a proven property of a call graph, not a promise. What is
+this shape: a proven property of a call graph. What is
 excisable is optional; what is optional is a feature; what is mandatory is a
 tax.
 
@@ -539,26 +539,26 @@ Substitutable without forking the compiler. Every serious program eventually
 replaces its allocator; the only question is whether the language helps or is
 worked around.
 
-### V.4 — What the four rules buy
+### V.4: What the four rules buy
 
 Each of the following is *forbidden* by a strict no-runtime stance, and each is
 something real programs need:
 
 - **Hot swap** needs a symbol table and a quiescence protocol. Part IV does not
   exist without a runtime; it just needs a small, consented one.
-- **Deterministic record/replay** needs hooks on the sources of nondeterminism —
+- **Deterministic record/replay** needs hooks on the sources of nondeterminism:
   clock, input, network, RNG. With them, a bug reached at frame 8,412 can be
   re-entered offline and fed to `mettle trace`. Without them it is reachable
   only by asking a human to reproduce it, which is how debugging worked before
   anyone measured how bad it was.
-- **Per-subsystem allocation policy** — arenas, frame allocators, pools. Every
+- **Per-subsystem allocation policy**: arenas, frame allocators, pools. Every
   game and every server builds these. Today they are built around the language
   with `std/mem`; a replaceable allocator makes them a supported shape, and
   makes `@noalloc`-style proofs available about *which* allocator a call graph
   reaches, not merely whether it allocates.
 - **A chosen panic boundary.** Process death is the right policy for a CLI and
   the wrong one for a frame loop or a request handler. The crash forensics
-  already exist and are excellent — symbolized backtrace, source snippet,
+  already exist and are excellent: symbolized backtrace, source snippet,
   faulting index and length. What is missing is the ability to say where
   recovery happens.
 - **Runtime-toggled instrumentation.** `--profile-runtime` and
@@ -569,13 +569,13 @@ Notice that every item is something the *programmer asked for at a point they
 wrote*. That is the whole distinction, and it is the entire content of the
 "acceptable runtime" idea.
 
-### V.5 — The line
+### V.5: The line
 
 > **No hidden control flow. No hidden allocation.**
 
 That is the test, and it is short enough to apply without arguing. If a feature
 requires the runtime to do something at a point the programmer did not author,
-it does not ship — no matter how good the feature is, no matter how small the
+it does not ship, no matter how good the feature is, no matter how small the
 cost, no matter who is asking.
 
 This is what makes the position defensible rather than a slow return to the
@@ -585,7 +585,7 @@ Nothing proposed here does.
 
 ---
 
-## Part VI — Why these are one product
+## Part VI: Why these are one product
 
 Presented as three features, this is a wish list. It is not three features.
 
@@ -613,23 +613,23 @@ written in this repository:
 
 Metaprograms are untrusted passes. Hot-swapped functions are untrusted passes.
 A replaced allocator is an untrusted pass. Mettle already knows how to build a
-pipeline that stays sound while admitting components it does not trust — it
+pipeline that stays sound while admitting components it does not trust. It
 does it today for a *neural network*. Extending that architecture to code the
 programmer wrote is not a leap. It is the obvious next application of a pattern
 that already works.
 
 ---
 
-## Part VII — Refusals
+## Part VII: Refusals
 
 Things that do not happen, regardless of the benefit, the benchmark, or who is
 asking. A design document without this section is a marketing document.
 
-1. **Codegen never routes through LLVM, Cranelift, or an external assembler** —
+1. **Codegen never routes through LLVM, Cranelift, or an external assembler.**
    not even as a reference oracle. Instructions are built from the ISA. This is
    already the ground rule; it is repeated here because it is the load-bearing
-   one. Everything distinctive in this document — the owned linker, the
-   verified swap, the 1.6-second build, translation validation — exists because
+   one. Everything distinctive in this document (the owned linker, the
+   verified swap, the 1.6-second build, translation validation) exists because
    the whole pipeline is in the building.
 
 2. **No diagnostic the compiler has not verified.** No suggestion that was not
@@ -671,7 +671,7 @@ asking. A design document without this section is a marketing document.
 
 ---
 
-## Part VIII — How to use this document
+## Part VIII: How to use this document
 
 For any proposal, in order. The first failure is disqualifying.
 
@@ -684,7 +684,8 @@ For any proposal, in order. The first failure is disqualifying.
    dramatically better than one that does not. *(I.2)*
 
 3. **Can a program that does not use it prove it paid nothing?**
-   Not "is the cost small" — is the absence demonstrable. *(I.3)*
+   The question is whether the absence is demonstrable, and not whether the
+   cost is small. *(I.3)*
 
 4. **Does it ask the programmer to annotate a proof, or to declare an intent?**
    Intent is written down. Proofs are inferred. *(I.4)*
@@ -698,7 +699,7 @@ For any proposal, in order. The first failure is disqualifying.
    area. *(VII.5)*
 
 7. **Can the compiler explain what it did?**
-   Expansion, swap decisions, migrations, runtime substitutions — all of it
+   Expansion, swap decisions, migrations, and runtime substitutions: all of it
    inspectable, attributable, diffable. If a stage cannot be explained, it will
    eventually be distrusted, and distrusted stages get worked around instead of
    used. *(I.1)*
@@ -710,7 +711,7 @@ For any proposal, in order. The first failure is disqualifying.
 
 ---
 
-## Part IX — Sequence
+## Part IX: Sequence
 
 Not a schedule. An ordering, where each item is a precondition for the next.
 
@@ -720,7 +721,7 @@ bounds. The first of those is the precondition for everything in Part III.
 
 **Before metaprogramming ships:**
 
-- Name resolution and hygiene settled. *(III.2.3 — the only hard ordering
+- Name resolution and hygiene settled. *(III.2.3, the only hard ordering
   constraint in this document; hygiene cannot be retrofitted onto an existing
   macro corpus.)*
 - `mettle expand`, built at the same time as expansion, not after. *(III.2.1)*
@@ -746,7 +747,7 @@ bounds. The first of those is the precondition for everything in Part III.
 ## Coda
 
 Mettle's advantage is not that it is fast, or safe, or dependency-free, though
-it is all three. It is that **the entire pipeline is inside the building** —
+it is all three. It is that **the entire pipeline is inside the building**,
 frontend, IR, optimizer, interpreter, code generator, linker, debugger. Nobody
 else has that, because nobody else was willing to write all of it.
 

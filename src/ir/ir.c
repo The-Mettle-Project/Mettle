@@ -1760,7 +1760,7 @@ IRModuleSymbol *ir_program_add_symbol(IRProgram *program,
  *
  * The linear scan below is called for every symbol reference codegen resolves,
  * and a frontend with many string literals pushes module_symbol_count into the
- * tens of thousands — O(references x symbols) strcmp dominated emission on
+ * tens of thousands, O(references x symbols) strcmp dominated emission on
  * large programs. Cache an open-addressing table keyed on the program, its
  * symbol count, and the array's base address (module_symbols reallocs as
  * symbols are added, so the table stores indices, never pointers), rebuilding

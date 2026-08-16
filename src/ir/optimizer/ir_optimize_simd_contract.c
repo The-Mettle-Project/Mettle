@@ -1114,7 +1114,7 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
     if (g_explain_program && !callee_fn) {
       snprintf(reason, reason_cap,
                "each iteration calls `%s`, an external function with no body "
-               "this compiler can see -- it can never be inlined, so this "
+               "this compiler can see, so it can never be inlined and this "
                "loop cannot vectorize as written",
                callee);
       snprintf(fix, fix_cap,
@@ -1192,8 +1192,8 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
       snprintf(fix, fix_cap,
                "pure searches DO vectorize: `if (a[i] == key) ...` (or != < > "
                "<= >=, key a constant/variable, or a[i] != b[i]) with nothing "
-               "else in the body becomes an 8-wide compare+movemask scan -- "
-               "split any per-iteration work out of this loop, or hoist the "
+               "else in the body becomes an 8-wide compare+movemask scan. "
+               "Split any per-iteration work out of this loop, or hoist the "
                "search into its own loop and process from the found index");
       IR_SIMD_SET_DIAG(IR_SIMD_BAIL_EARLY_EXIT);
       return;
@@ -1209,7 +1209,7 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
         const char *acc_type =
             written ? ir_function_local_declared_type(function, written) : NULL;
         snprintf(reason, reason_cap,
-                 "this is a running %s -- a shape that does vectorize -- but "
+                 "this is a running %s, a shape that does vectorize, but "
                  "the kernel did not claim it%s%s%s",
                  "minimum/maximum",
                  acc_type ? " (`" : "", acc_type ? written : "",
@@ -1346,7 +1346,7 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
       snprintf(fix, fix_cap,
                "'+'/'-' reductions reassociate and DO vectorize; multiply, "
                "divide, shift, and bitwise/xor recurrences are inherently "
-               "serial -- if this running state IS the algorithm (a hash, an "
+               "serial. If this running state IS the algorithm (a hash, an "
                "RNG, an IIR filter), the loop is already at its scalar floor");
       IR_SIMD_MARK_ADVISORY();
       IR_SIMD_SET_DIAG(IR_SIMD_BAIL_SERIAL_RECURRENCE);
@@ -1432,7 +1432,7 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
   if (has_float_mul && has_float_accum && load_count >= 2) {
     snprintf(reason, reason_cap,
              "this is a float multiply-accumulate (dot-product shape), but no "
-             "kernel matched its address pattern -- the bases must be plain "
+             "kernel matched its address pattern. The bases must be plain "
              "pointers indexed by the loop counter (base[i])");
     snprintf(fix, fix_cap,
              "hoist invariant index math into a pointer before the loop "
@@ -1545,7 +1545,7 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
                "could have been shifted");
       snprintf(fix, fix_cap,
                "constant factors are provable (`(r*77 + g*150 + b*29) >> 8` "
-               "vectorizes) -- a runtime one is not; masking the value first "
+               "vectorizes); a runtime one does not. Masking the value first "
                "(`(x & 65535) >> 8`) bounds it and the kernel then takes it");
       IR_SIMD_SET_DIAG(IR_SIMD_BAIL_UNBOUNDED_SHIFT);
       return;
@@ -1563,7 +1563,7 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
                base, base);
       snprintf(fix, fix_cap,
                "bind the row to a pointer before the loop (`var row = &%s[k];`) "
-               "and index it with the counter (`row[i]`) -- same addresses, and "
+               "and index it with the counter (`row[i]`): same addresses, and "
                "the shape the kernels read",
                base);
       IR_SIMD_SET_DIAG(IR_SIMD_BAIL_DOT_SHAPE_ADDRESS);
@@ -2145,7 +2145,7 @@ static const struct {
     {IR_SIMD_BAIL_MIXED_FLOAT_WIDTHS, ir_simd_mutate_single_float_width, NULL},
     {IR_SIMD_BAIL_BODY_LOCAL, ir_simd_mutate_hoist_body_local, NULL},
     {IR_SIMD_BAIL_DOT_SHAPE_ADDRESS, ir_simd_mutate_dot_row_pointer,
-     "none via hoisting -- re-checked: the index half that is not the loop "
+     "none via hoisting. Re-checked: the index half that is not the loop "
      "counter changes every iteration, so it cannot be hoisted out; this "
      "access is genuinely non-unit-stride"},
 };
@@ -2496,14 +2496,14 @@ static void ir_explain_report_loops(const IRFunction *function,
                  inlined_loop_callee, inlined_loop_from_line, inner_line);
         snprintf(fix, sizeof(fix),
                  "nothing to change on this line: this loop drives the work, "
-                 "and the vectorizable part is `%s`'s loop -- see the remark "
+                 "and the vectorizable part is `%s`'s loop. See the remark "
                  "on line %zu",
                  inlined_loop_callee, inner_line);
       } else {
         snprintf(reason, sizeof(reason),
                  "the body contains a nested loop (line %zu), and only "
                  "innermost loops are vectorized; the inner loop did not "
-                 "vectorize either -- see its remark",
+                 "vectorize either. See its remark",
                  inner_line);
         snprintf(fix, sizeof(fix),
                  "nothing to change on this line: this loop drives the nest, "
@@ -2562,7 +2562,7 @@ static void ir_explain_report_loops(const IRFunction *function,
             snprintf(reason, sizeof(reason),
                      "each iteration calls `%s`; even with it inlined, its "
                      "loops would land in this body, making this the outer "
-                     "loop of a nest -- and only innermost loops vectorize",
+                     "loop of a nest, and only innermost loops vectorize",
                      callee);
           } else {
             snprintf(reason, sizeof(reason),
@@ -2573,7 +2573,7 @@ static void ir_explain_report_loops(const IRFunction *function,
           }
           snprintf(fix, sizeof(fix),
                    "nothing to change on this line: this loop is a driver "
-                   "and scalar is the right code for it -- the vectorizable "
+                   "and scalar is the right code for it. The vectorizable "
                    "work is inside `%s`, so check the remarks on its loops",
                    callee);
           advisory = 1;

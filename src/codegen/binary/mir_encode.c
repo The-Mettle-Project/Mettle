@@ -10,13 +10,13 @@
  * Compute model: RAX is the primary scratch/accumulator and RCX the secondary;
  * RDX is reserved (future divide). Operand values come from their ALLOCATED
  * registers (or are materialized from a spill slot / immediate into a scratch),
- * never from per-temp stack homes — that is the whole point. Each MIR op
+ * never from per-temp stack homes, that is the whole point. Each MIR op
  * computes into RAX and writes the destination's register (or spill slot). The
  * extra reg-reg moves vs an optimal in-place scheme are cheap and removable
  * later; correctness first. */
 
-/* Encoder scratch registers. R10/R11 are pure scratch — not allocatable, and
- * not ABI argument registers on EITHER Win64 or SysV — so RAX/RCX/RDX are freed
+/* Encoder scratch registers. R10/R11 are pure scratch, not allocatable, and
+ * not ABI argument registers on EITHER Win64 or SysV, so RAX/RCX/RDX are freed
  * for the register allocator. Ops that need a HARDWARE register (divide's
  * RDX:RAX, variable shift's CL, setcc's byte target) name it explicitly. */
 #define SCRATCH_A BINARY_GP_R10
@@ -880,8 +880,8 @@ static int xmm_load_fimm(MirFunction *fn, uint64_t bits,
 /* Park (save=1) or recover (save=0) the registers a preserving call promises to
  * leave alone: RAX and the volatile XMM lanes. These are the registers the
  * allocator hands to values that span only such calls, which is what lets a
- * checked inner loop keep its working set — the loaded element, the float
- * accumulator — out of memory. The cost lands entirely on a path a correct
+ * checked inner loop keep its working set, the loaded element, the float
+ * accumulator, out of memory. The cost lands entirely on a path a correct
  * program does not take.
  *
  * Frame slots rather than pushes: the call's stack arguments and shadow space
@@ -1491,7 +1491,7 @@ static int mir_home_gp_param(MirFunction *fn, const MirParam *p,
     int ok = 1;
     if (p->width == 4) {
       /* movzx_reg_reg32: must emit even when D == arg (the regalloc often
-       * coalesces a param into its incoming register) — the skip-when-equal
+       * coalesces a param into its incoming register), the skip-when-equal
        * mov would silently drop the uint32 canonicalization. */
       ok = p->is_signed ? binary_emit_movsxd_reg_reg32(code, D, arg)
                         : binary_emit_movzx_reg_reg32(code, D, arg);

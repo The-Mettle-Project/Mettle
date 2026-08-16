@@ -1622,7 +1622,7 @@ MtlcValue mtlc_cast(MtlcFn *fn, MtlcValue value, const MtlcType *type) {
   /* is_float/float_bits on a CAST describe the SOURCE operand (ir_lowering's
    * contract; codegen picks cvttss2si vs cvttsd2si from it). The TARGET is
    * resolved from inst.text. Setting them from the target here made the
-   * emitter read a float32 source as already-64-bit — or, for a float->int
+   * emitter read a float32 source as already-64-bit, or, for a float->int
    * cast, as an integer, handing back the raw IEEE bit pattern. */
   if (vc.float_bits == 32 || vc.float_bits == 64) {
     inst.is_float = 1;

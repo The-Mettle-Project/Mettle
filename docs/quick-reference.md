@@ -137,8 +137,8 @@ fn dot(a: int8*, b: int8*, n: int32) -> int32 {
 contract. Both are checked under `-O`/`--release`; add `--simd-report` to see
 what each loop became. See [Control Flow](control-flow.md#vectorization-contracts).
 
-To see what the optimizer decided about **every** loop and call in your file —
-no annotations needed — compile with `--explain` (`-O`/`--release`):
+To see what the optimizer decided about **every** loop and call in your file,
+with no annotations needed, compile with `--explain` (`-O`/`--release`):
 
 ```
 saxpy (loop @ line 12): vectorized → vfmadd231ps, 8-wide float32 affine map
@@ -152,7 +152,7 @@ main (call to `opaque` @ line 74): NOT inlined
 
 Nests are summarized (`vectorized inner, scalar outer`), fully unrolled loops
 say so, and a backend section reports register-allocation coverage weighted by
-instructions — with the fallbacks grouped by cause, largest functions first,
+instructions, with the fallbacks grouped by cause, largest functions first,
 and a `consequence:`/`fix:` line per cause (e.g. a function containing a SIMD
 kernel still runs the kernel at full vector speed; only its scalar code
 spills):
@@ -173,7 +173,7 @@ diverts).
 
 Fix suggestions are **verified, not guessed**, where the compiler can prove
 them: it applies the suggested change to an internal clone, re-runs its own
-optimizer on it, and only then prints a `verified:` line —
+optimizer on it, and only then prints a `verified:` line,
 
 ```
 sum_bytes (loop @ line 27): NOT vectorized
@@ -190,12 +190,12 @@ NOT help, the report says that instead of giving advice that won't work.
 
 The verified library covers element-width fixes (int16/int64 → int32),
 accumulator widening (int32 and byte sums need an int64 accumulator), the
-dot-product row-pointer hoist, and call-in-the-loop fixes — for those the
+dot-product row-pointer hoist, and call-in-the-loop fixes. For those the
 compiler pretend-applies the decorator change, re-runs its own **inliner** on
 a clone of the caller, and proves lines like `simulated removing @noinline
 from damp ... this loop then vectorizes → vfmadd231ps`. And when a simulation
 proves the standard advice is *unwritable* (e.g. the index math genuinely
-changes every iteration — a real non-unit-stride access), the advice is
+changes every iteration, a real non-unit-stride access), the advice is
 replaced with that finding rather than printed.
 
 ## Function decorators
@@ -222,8 +222,8 @@ take effect under `-O`/`--release`, and apply to functions only. See
 The `!` decorators are **contracts**: the compiler either delivers the
 optimization or fails the build with the precise reason. `@inline!` errors on
 any call site that survives inlining (e.g. recursion, the caller's growth
-budget). `@noalloc` proves the function — and everything it can reach through
-direct calls — performs zero heap allocations: `new`, string `+`, allocator
+budget). `@noalloc` proves the function, and everything it can reach through
+direct calls, performs zero heap allocations: `new`, string `+`, allocator
 calls, unprovable externs, and function-pointer calls inside the reachable
 graph are all compile errors pointing at the offending site. Verified
 `@noalloc` functions are reported in `--explain`.

@@ -30,7 +30,7 @@
 #define ANSI_COLOR_RESET "\x1b[0m"
 #define ANSI_BOLD "\x1b[1m"
 
-/* Maximum source-line width in the snippet before truncation with "…" */
+/* Maximum source-line width in the snippet before truncation with "..." */
 #define SNIPPET_MAX_COLS 120
 
 /* All diagnostic output goes to stderr so it doesn't pollute stdout pipelines */
@@ -705,7 +705,7 @@ void error_reporter_print_errors(ErrorReporter *reporter) {
 
   for (size_t i = 0; i < reporter->count; i++) {
     const ErrorReport *e = &reporter->errors[i];
-    /* NOTE_OF entries are printed by their parent — skip here */
+    /* NOTE_OF entries are printed by their parent, skip here */
     if (e->severity == DIAG_SEVERITY_NOTE_OF)
       continue;
     error_reporter_print_error(reporter, e);

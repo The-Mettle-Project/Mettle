@@ -740,7 +740,7 @@ int code_generator_binary_emit_simd_affine_map_f32(
  * maps out[i] = DAG(a_k[i], i, consts, scalars) and '+' reductions. The element
  * kind comes from the opcode + instruction->float_bits: f64x4 lanes (pd ops,
  * 8B elements), f32x8 lanes (ps ops, 4B), or i32x8 lanes (vpaddd/vpsubd/
- * vpmulld/vpand/vpor/vpxor/vpslld, 4B) — all walk array bases by 32B per
+ * vpmulld/vpand/vpor/vpxor/vpslld, 4B), all walk array bases by 32B per
  * vector iteration. The DAG is replayed via a stack-machine of up to
  * VLOOP_KERNEL_REGS ymm registers; constants AND runtime invariant scalars are
  * broadcast once to a stack array and re-read. Float maps are bit-identical to

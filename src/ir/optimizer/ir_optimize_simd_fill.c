@@ -1,4 +1,4 @@
-﻿#include "ir_optimize_internal.h"
+#include "ir_optimize_internal.h"
 
 /* -------------------------------------------------------------------------- */
 /* Invariant fill -> IR_OP_SIMD_FILL (the memset / frame-clear class)          */

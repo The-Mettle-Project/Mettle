@@ -497,7 +497,7 @@ static const DecisionDoc DECISIONS[] = {
      "    lane widths the extremum kernel carries. uint32 is refused because\n"
      "    vpmaxsd compares signed.\n"
      "\n"
-     "  - The body also stores. Then it is a clamp, not a reduction -- see\n"
+     "  - The body also stores. Then it is a clamp, not a reduction. See\n"
      "    `mettle explain clamp-store`.\n"},
     {"predicated-count", DECISION_VECTOR_REFUSAL,
      "An accumulator updated only on the taken arm",
@@ -536,7 +536,7 @@ static const DecisionDoc DECISIONS[] = {
      "The loop steps more than one element at a time",
      "`rgb[i * 3 + 1]`, `dst[i * 2]`, and any other non-unit stride. Every\n"
      "kernel walks its arrays one contiguous vector per iteration, so a\n"
-     "strided access has no kernel to land in -- there is no gather or\n"
+     "strided access has no kernel to land in. There is no gather or\n"
      "scatter form.\n"
      "\n"
      "The stride is usually the data layout, not an accident, so there is\n"

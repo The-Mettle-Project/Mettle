@@ -1,7 +1,7 @@
 /* Frontend type-table layout and queries.
  *
  * Offsets, field names, enum members, and pointer/array/slice shape live on
- * Type and are filled here — before const eval, not in the backend. */
+ * Type and are filled here, before const eval, not in the backend. */
 #include "symbol_table.h"
 #include "string_intern.h"
 #include "common.h"
@@ -163,7 +163,7 @@ int type_compute_layout(Type *type) {
     type->alignment = 8;
     return 1;
   case TYPE_SLICE:
-    /* { pointer, length } — same shape as string. */
+    /* { pointer, length }, same shape as string. */
     type->size = 16;
     type->alignment = 8;
     return 1;

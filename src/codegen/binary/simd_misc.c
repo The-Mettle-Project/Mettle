@@ -58,7 +58,7 @@ int code_generator_binary_emit_simd_matmul_n32(
   if (!wcs_cmp_reg_imm32(b, BINARY_GP_R11, 32) ||
       !wcs_jcc(b, 0x83, &k_done)) return 0;
 
-  /* av = a[r12 + r9*4] — r11 holds row_base until clobbered for av load */
+  /* av = a[r12 + r9*4], r11 holds row_base until clobbered for av load */
   if (!wcs_mov_reg_reg32(b, BINARY_GP_RAX, BINARY_GP_R9) ||
       !wcs_shift_reg_imm(b, BINARY_GP_RAX, 0, 5) ||
       !wcs_add_reg_reg64(b, BINARY_GP_RAX, BINARY_GP_R11) ||
@@ -81,7 +81,7 @@ int code_generator_binary_emit_simd_matmul_n32(
 
   /* ymm2 = b[k][col..col+7] (8 packed int32); ymm4 = a[r][k] broadcast.
    * Lane-wise int32 multiply (low 32 bits = int32 wraparound semantics) and
-   * accumulate into ymm3 — eight result columns per iteration. */
+   * accumulate into ymm3, eight result columns per iteration. */
   if (!wcs_avx_vpmulld_ymm(b, 0, 2, 4) ||
       !wcs_avx_vpaddd_ymm(b, 3, 3, 0)) return 0;
 
@@ -97,7 +97,7 @@ int code_generator_binary_emit_simd_matmul_n32(
 
   if (!wcs_patch_here(b, k_done)) return 0;
 
-  /* store ymm3 (8 column results) to c[row*32+col..+7] — contiguous, so a
+  /* store ymm3 (8 column results) to c[row*32+col..+7], contiguous, so a
    * single 32-byte vmovdqu replaces the per-lane extract the SSE path needed. */
   if (!wcs_mov_reg_reg32(b, BINARY_GP_RAX, BINARY_GP_R9) ||
       !wcs_shift_reg_imm(b, BINARY_GP_RAX, 0, 5) ||
@@ -178,8 +178,8 @@ int code_generator_binary_emit_count_word_starts(
   }
 
   /* ---- vector loop: while (rdx >= 16) ---- (kept at SSE/128-bit width: this
-   * kernel is currently unreachable — no active recognizer emits
-   * IR_OP_COUNT_WORD_STARTS — so an AVX2 widening could not be runtime-verified.
+   * kernel is currently unreachable, no active recognizer emits
+   * IR_OP_COUNT_WORD_STARTS: so an AVX2 widening could not be runtime-verified.
    * Widen it together with reviving the word-count recognizer.) */
   size_t loop_top = b->size;
   /* cmp rdx, 16 ; jb tail */

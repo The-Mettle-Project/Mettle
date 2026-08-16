@@ -267,11 +267,11 @@ static void scope_destroy(Scope *scope) {
         for (size_t j = 0; j < symbol->data.function.parameter_count; j++) {
           free(symbol->data.function.parameter_names[j]);
           // Note: parameter_types[j] are shared builtin types owned by
-          // the type checker — do NOT type_destroy them here.
+          // the type checker, do NOT type_destroy them here.
         }
         free(symbol->data.function.parameter_names);
         free(symbol->data.function.parameter_types);
-        // Note: return_type is also a shared builtin type — do NOT destroy.
+        // Note: return_type is also a shared builtin type, do NOT destroy.
       }
       // Only destroy types owned by the symbol (struct types).
       // Builtin types (int32, float64, etc.) are shared singletons
@@ -708,11 +708,11 @@ void symbol_destroy(Symbol *symbol) {
     // Free function parameter names (strings we own)
     for (size_t i = 0; i < symbol->data.function.parameter_count; i++) {
       free(symbol->data.function.parameter_names[i]);
-      // Note: parameter_types[i] are shared builtin types — do NOT destroy
+      // Note: parameter_types[i] are shared builtin types, do NOT destroy
     }
     free(symbol->data.function.parameter_names);
     free(symbol->data.function.parameter_types);
-    // Note: return_type is a shared builtin type — do NOT destroy
+    // Note: return_type is a shared builtin type, do NOT destroy
   }
 
   // Only destroy types owned by the symbol (struct types)

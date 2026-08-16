@@ -450,7 +450,7 @@ int ir_label_is_while_header(const char *label);
 /* True when the first non-nop instruction after the loop's back-edge jump is
  * `label exit_label`. Every loop-fusion installer replaces the whole
  * [header..back-edge] region with a straight-line kernel, DELETING the exit
- * branch — which is only sound when falling out of the fused region lands
+ * branch, which is only sound when falling out of the fused region lands
  * exactly on the loop's exit label. Jump threading can forward the exit branch
  * PAST intervening code (e.g. an if/else's else block to the join), and fusing
  * such a loop would fall through into code the exit branch used to skip

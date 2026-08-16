@@ -32,8 +32,8 @@ typedef enum {
   MIR_RC_VEC = 2  /* packed SIMD vector in a YMM register (auto-vectorizer) */
 } MirRegClass;
 
-/* One virtual register: its class, byte width (1/2/4/8), and — filled in by the
- * allocator — either an assigned physical register or a spill-slot rbp offset. */
+/* One virtual register: its class, byte width (1/2/4/8), and, filled in by the
+ * allocator, either an assigned physical register or a spill-slot rbp offset. */
 typedef struct {
   MirRegClass rclass;
   int width; /* 1,2,4,8 (GP); 4,8 (XMM); per-lane byte width for VEC */
@@ -62,7 +62,7 @@ typedef struct {
    * encoder elides the `mov dst, a` copy. -1 (MIR_VREG_NONE) when absent. */
   int coalesce_hint;
   /* Set when this value's address is taken (IR_OP_ADDRESS_OF): it must be
-   * memory-resident — the allocator never assigns it a register, so every use
+   * memory-resident, the allocator never assigns it a register, so every use
    * loads and every def stores through its stack home, and a store through an
    * aliasing pointer is visible to a later by-name read. */
   int address_taken;
@@ -535,7 +535,7 @@ typedef struct {
   int scalar_return_signed;
 
   /* A float return type: declared width in bits (32/64). RETURN converts the
-   * value to this width before placing it in XMM0 — a float64-tracked temp
+   * value to this width before placing it in XMM0, a float64-tracked temp
    * returned from a float32 function must cvtsd2ss, not pass through raw. */
   int float_return_bits;
 

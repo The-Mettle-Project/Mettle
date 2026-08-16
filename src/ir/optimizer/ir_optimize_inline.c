@@ -1158,7 +1158,7 @@ static void ir_inline_site_reason(IRFunction *caller,
     IR_INLINE_WHY(reason, "caller-over-budget",
                   "the calling function is over the profile-adjusted caller "
                   "budget, and this call site is not measured hot or inside a "
-                  "loop -- it runs at most once per call of the function, so "
+                  "loop, so it runs at most once per call of the function and "
                   "keeping it a real call costs nothing measurable (loop-resident "
                   "calls, measured-hot sites, tiny call-free callees, and "
                   "@inline-marked callees still inline here)");
@@ -1238,7 +1238,7 @@ void ir_inline_explain_report_remaining(IRProgram *program) {
            * the obvious suggestion fails; it does not instruct anyone, so
            * the report must not rank it as work to do. */
           snprintf(corrected_fix, sizeof(corrected_fix),
-                   "none -- re-checked with @inline "
+                   "none. Re-checked with @inline "
                    "pretend-applied and it still won't inline: %s",
                    forced_reason ? forced_reason : "a structural guard");
           fix = corrected_fix;

@@ -1,4 +1,4 @@
-﻿#include "ir_optimize_internal.h"
+#include "ir_optimize_internal.h"
 
 static int ir_make_simd_minmax_i32(IRInstruction *out, SourceLocation location,
                                    const char *minv_symbol,

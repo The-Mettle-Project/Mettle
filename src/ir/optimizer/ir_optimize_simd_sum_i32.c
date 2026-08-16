@@ -1,4 +1,4 @@
-﻿#include "ir_optimize_internal.h"
+#include "ir_optimize_internal.h"
 
 /* -------------------------------------------------------------------------- */
 /* int32 array horizontal sum -> IR_OP_SIMD_SUM_I32                           */

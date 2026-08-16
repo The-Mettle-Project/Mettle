@@ -187,7 +187,7 @@ adversarial dtype coverage, and the actual GB10 run remain open gates.
 
 Gate: a published, reproducible GB10 suite compares correctness, compile time,
 latency, throughput, peak memory, and power against CUDA C++/cuBLAS, Triton, and
-representative SYCL/HIP paths. “Overcome” requires statistically defensible wins
+representative SYCL/HIP paths. "Overcome" requires statistically defensible wins
 on named workloads, not a favorable microbenchmark.
 
 ## Required test tiers

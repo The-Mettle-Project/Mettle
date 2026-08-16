@@ -2201,7 +2201,7 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
     /* Qualified tagged-enum constructor `EnumName.Variant(args)`: the parser
      * shapes this as a method call whose receiver is the enum-name identifier.
      * Strip the receiver so downstream code treats it as a direct constructor
-     * call on `Variant` — the variant constructor symbol already exists in the
+     * call on `Variant`, the variant constructor symbol already exists in the
      * global scope (registered at enum-decl time). */
     if (call && call->object && call->object->type == AST_IDENTIFIER &&
         call->function_name) {
@@ -2209,7 +2209,7 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
       if (recv_id && recv_id->name) {
         Symbol *recv_sym = type_checker_resolve_identifier(checker, recv_id);
         if (recv_sym && recv_sym->kind == SYMBOL_ENUM) {
-          /* Drop the receiver — leak-free: the identifier node is owned by
+          /* Drop the receiver, leak-free: the identifier node is owned by
            * the AST tree and freed when the program is freed. */
           call->object = NULL;
         }

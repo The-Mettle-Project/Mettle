@@ -1814,7 +1814,7 @@ int code_generator_binary_try_match_scaled_temp_address(
    * (param/local) always owns a stack slot. A temp, however, may have been
    * folded into the shift by the binary-expression chain peephole (e.g.
    * `t0 = n - 1; t1 = t0 << 2`), in which case t0 was never spilled and its
-   * slot holds stale data — re-reading it yields the wrong index (observed:
+   * slot holds stale data, re-reading it yields the wrong index (observed:
    * prefix_sum's `dst[n-1]` loaded dst[0]). Only fold pre-shift when the
    * index is a symbol; otherwise fall back to the plain address-add path,
    * which consumes the already-computed scaled temp directly. */
@@ -1951,7 +1951,7 @@ int code_generator_binary_emit_scaled_address_to_rax_disp(
    * symbol_assigned_register only ever reports Win64 non-volatile registers
    * (the R12-R15/RBX/RSI/RDI promotion pool), none of which alias the RAX
    * destination or the R10 index scratch, so the survivors can't be clobbered.
-   * This drops a redundant `mov` per fused array access — the dominant overhead
+   * This drops a redundant `mov` per fused array access, the dominant overhead
    * in tight indexing loops like matmul's inner kernel where the base pointer
    * and induction index are both promoted. */
   if (base->kind == IR_OPERAND_SYMBOL && base->name &&
@@ -1992,7 +1992,7 @@ int code_generator_binary_emit_scaled_address_to_rax(
       generator, context, base, index, scale, 0);
 }
 
-/* Match `Td = sym +/- C ; Ts = Td << k ; Ta = base + Ts ; <mem via Ta>` —
+/* Match `Td = sym +/- C ; Ts = Td << k ; Ta = base + Ts ; <mem via Ta>`,
  * an array access at a constant element offset from a symbol index, e.g.
  * `arr[i + 3]` or matmul's `c[c_idx + 1]` (and the b0_idx+{1,2,3} accesses
  * once the congruent-IV pass rewrites them). The constant element offset folds
@@ -2557,8 +2557,8 @@ int code_generator_binary_try_emit_binary_expression_chain(
 
   /* The consumer's left operand is the producer temp (RAX holds it after the
    * first emit). For a signedness-sensitive consumer op (div/mod/>>) that temp
-   * is the dividend/shiftee, so its signedness — the result type of the
-   * producer expression — decides DIV vs IDIV / SHR vs SAR. (div/mod/>> are
+   * is the dividend/shiftee, so its signedness, the result type of the
+   * producer expression, decides DIV vs IDIV / SHR vs SAR. (div/mod/>> are
    * non-commutative, so the commutative branch above never lands here with one
    * of them.) */
   /* Producer's result type baked onto the IR at lowering. */

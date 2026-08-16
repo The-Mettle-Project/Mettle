@@ -732,7 +732,7 @@ int code_generator_emit_binary_global_variable(CodeGenerator *generator,
  * collect_global_constants needs to know, per candidate global, whether any
  * instruction writes it (or takes its address). Asking
  * code_generator_binary_global_is_written per global rescans every instruction
- * of every function — O(globals x instructions) with a strcmp inside — which
+ * of every function, O(globals x instructions) with a strcmp inside, which
  * dominated codegen once a frontend with many string literals pushed module
  * globals into the tens of thousands. Build the set of written names in one
  * pass instead and answer each query from the table (the same cure
@@ -806,7 +806,7 @@ static int binary_written_set_contains(const BinaryWrittenSet *set,
   return 0;
 }
 
-/* Collect every symbol name the program writes or takes the address of —
+/* Collect every symbol name the program writes or takes the address of,
  * the same three cases code_generator_binary_global_is_written tests. */
 static int binary_written_set_build(BinaryWrittenSet *set,
                                     const IRProgram *ir_program) {

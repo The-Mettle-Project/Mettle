@@ -104,17 +104,17 @@ to the `fn` (or `export fn`) that follows.
 
 | Decorator | Meaning |
 |-----------|---------|
-| `@inline` | Force the function past the inliner's size, parameter-count, and call-count heuristics, the built-in benchmark denylist, and the caller-size budget (an over-budget caller normally only accepts tiny call-free callees). Structural blockers — most importantly inline assembly — still prevent inlining. |
+| `@inline` | Force the function past the inliner's size, parameter-count, and call-count heuristics, the built-in benchmark denylist, and the caller-size budget (an over-budget caller normally only accepts tiny call-free callees). Structural blockers still prevent inlining, inline assembly above all. |
 | `@inline!` | **Contract**: every call to this function must inline, or compilation fails at each surviving call site with the inliner's reason (recursion, a structural guard). Implies `@inline`. |
 | `@noinline` | Never inline this function. This is the user-facing way to keep a hot helper as its own call. |
-| `@pure` | Assert the function is free of side effects **and** safe to evaluate speculatively (it neither writes observable state nor traps in a way that depends on being reached). The optimizer may then evaluate a call once before a loop and reuse the result — see below. |
-| `@noalloc` | **Contract**: the function — and everything it can reach through direct calls — performs zero heap allocations, or compilation fails pointing at the allocation. This is a proof, not a lint: `new`, string `+` concatenation, allocator calls (`malloc`/`calloc`/...), calls to externs not known to be allocation-free, and calls through function pointers anywhere in the reachable graph all violate it. Known-clean libm/memory externs (`sqrtf`, `memcpy`, ...) are allowed. |
-| `@simd` / `@simd!` | Apply a vectorization contract to every counted loop in the body — see [Vectorization contracts](control-flow.md#vectorization-contracts). |
+| `@pure` | Assert the function is free of side effects **and** safe to evaluate speculatively (it neither writes observable state nor traps in a way that depends on being reached). The optimizer may then evaluate a call once before a loop and reuse the result. See below. |
+| `@noalloc` | **Contract**: the function, and everything it can reach through direct calls, performs zero heap allocations, or compilation fails pointing at the allocation. This is a proof, not a lint: `new`, string `+` concatenation, allocator calls (`malloc`/`calloc`/...), calls to externs not known to be allocation-free, and calls through function pointers anywhere in the reachable graph all violate it. Known-clean libm/memory externs (`sqrtf`, `memcpy`, ...) are allowed. |
+| `@simd` / `@simd!` | Apply a vectorization contract to every counted loop in the body. See [Vectorization contracts](control-flow.md#vectorization-contracts). |
 | `@test` | Mark a compile-time unit test. The function takes no parameters, returns `int64`, and treats `0` as pass. It is type-checked in every build but compiled out of normal binaries, and `mettle test` runs it in the compiler's IR interpreter. See [Testing](testing.md). |
 
 `@inline` and `@noinline` are mutually exclusive. Applying `@inline`,
-`@noinline`, `@pure`, or `@noalloc` to anything other than a function — a loop,
-a struct, an `extern` function — is a compile error. Only `@simd` and `@simd!`
+`@noinline`, `@pure`, or `@noalloc` to a loop, a struct, or an `extern`
+function is a compile error. Only `@simd` and `@simd!`
 may be attached to a statement, and only to a `for` or `while` loop. When a
 declaration is both decorated and exported, the decorators come first
 (`@inline export fn f()`, never `export @inline fn f()`). Decorators have
@@ -143,7 +143,7 @@ fn score(table: int32*, k: int32, items: int32*, n: int64) -> int64 {
 Hoisting is conservative: it fires only when every argument is loop-invariant
 **and** the loop body performs no memory store (a pure callee may read memory
 through a pointer argument, so a store in the loop could change what it reads).
-`@pure` is a *trusted* contract — the compiler does not verify purity, exactly as
+`@pure` is a *trusted* contract. The compiler does not verify purity, exactly as
 `@simd!` trusts the vectorizability claim. Marking an impure or
 non-speculation-safe function `@pure` is a program error.
 

@@ -1,4 +1,4 @@
-﻿/* Reflection queries: the member-access surface on `Type` and `Field`.
+/* Reflection queries: the member-access surface on `Type` and `Field`.
  *
  * `typeof(T)` already yielded a TypeRef; this is what you can ask one. Every
  * query folds during const eval to an ordinary compile-time value -- an int, a

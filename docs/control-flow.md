@@ -12,7 +12,7 @@ ptr->field = value;
 arr[i] = x;
 ```
 
-**Compound assignment** (`+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`) is syntactic sugar for `target = target OP value`, where `OP` is the corresponding binary operator. The left side must be the same kind of lvalue as for plain assignment. Compound assignment is a statement, not an expression—it does not produce a value for use in larger expressions. It is valid in `for`-loop initializers and increments.
+**Compound assignment** (`+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`) is syntactic sugar for `target = target OP value`, where `OP` is the corresponding binary operator. The left side must be the same kind of lvalue as for plain assignment. Compound assignment is a statement. It produces no value for use in a larger expression. It is valid in `for`-loop initializers and increments.
 
 ```mettle
 count += 1;
@@ -28,7 +28,7 @@ See [Lexical Structure](lexical-structure.md#operators-and-punctuation) for the 
 
 ## If and Else
 
-The `if` statement evaluates a condition. If true, the then branch runs. The optional `else` branch runs when the condition is false. The condition must be a **numeric type** (integer or floating-point); zero is false, non-zero is true. Pointers are not valid as conditions—use an explicit comparison: `if (ptr != 0)` to check for non-null, not `if (ptr)`.
+The `if` statement evaluates a condition. If true, the then branch runs. The optional `else` branch runs when the condition is false. The condition must be a **numeric type** (integer or floating-point); zero is false, non-zero is true. A pointer is not a valid condition. Compare it: write `if (ptr != 0)` to test for non-null.
 
 ```mettle
 if (x > 0) {
@@ -72,7 +72,7 @@ An infinite loop is written `while (1)`; the condition is always true.
 
 ## For
 
-The `for` loop has an initializer, condition, and increment. The initializer runs once. The condition is evaluated before each iteration; if false, the loop exits. The increment runs after each iteration. The initializer can declare a variable. Condition and increment are optional—`for (;;)` is a valid infinite loop.
+The `for` loop has an initializer, condition, and increment. The initializer runs once. The condition is evaluated before each iteration; if false, the loop exits. The increment runs after each iteration. The initializer can declare a variable. Condition and increment are optional, so `for (;;)` is a valid infinite loop.
 
 ```mettle
 for (var i: int32 = 0; i < 10; i = i + 1) {
@@ -127,11 +127,11 @@ Both attributes also apply to `while` loops. The diagnostic names the cause when
 it can determine it: a function call in the body, control flow (a nested loop or
 data-dependent branch), an unsupported element width (16- or 64-bit integers
 have no kernel), a loop-carried serial recurrence (a scalar computed from its
-own previous value through a non-reassociable operation — `*`, `/`, a shift, or
-a bitwise/xor op — so the iterations form a dependency chain, e.g. a hash, an
+own previous value through a non-reassociable operation (`*`, `/`, a shift, or
+a bitwise or xor op), so the iterations form a dependency chain, e.g. a hash, an
 RNG, or an IIR filter), or, when none of those apply, that no vectorizer
 recognized the loop's shape. The recurrence cause is found by backward
-data-flow analysis, and `+`/`-` reductions are excluded from it — those
+data-flow analysis, and `+`/`-` reductions are excluded from it, because those
 reassociate and vectorize.
 
 `@simd` may also sit on a **function**, where it becomes the default contract
@@ -148,7 +148,7 @@ for *every* counted loop in the body that does not carry its own `@simd`:
 
 A per-loop attribute always wins over the function default, so you can place a
 function-wide `@simd` and still relax (or tighten) an individual loop. Note that
-`@simd!` on a function is a hard contract on *all* its counted loops — if the
+`@simd!` on a function is a hard contract on *all* its counted loops. If the
 body mixes vectorizable and non-vectorizable loops, annotate the loops
 individually instead. See [Function decorators](declarations.md#function-decorators).
 
@@ -236,7 +236,7 @@ All arm bodies must have a compatible type, and because the expression has to pr
 
 `break` exits the innermost loop or switch. `continue` skips to the next iteration of the innermost loop. Both are context-checked; they are valid only inside loops or switches. Using them elsewhere is a compile error.
 
-**Important:** `break` and `continue` always target the **innermost** enclosing loop or switch. Inside nested loops, `break` exits only the inner loop. Inside a `switch` that is inside a loop, `break` exits the switch, not the loop—use `continue` to skip to the next loop iteration.
+**Important:** a bare `break` or `continue` targets the **innermost** enclosing loop or switch. Inside nested loops, `break` exits the inner loop and leaves the outer one running. Inside a `switch` that sits in a loop, `break` exits the switch and the loop keeps going; write `continue` to skip to the next loop iteration. To reach further out, label the loop and name it (see below).
 
 ```mettle
 while (1) {
@@ -285,8 +285,9 @@ Rules and limits:
   before.
 - Labels live in their own namespace and do not collide with variable or
   function names.
-- Deferred statements are still emitted before the jump, the same as for
-  unlabeled `break`/`continue`.
+- The jump skips every deferred statement between it and the labeled loop,
+  including the labeled loop's own. See
+  [What defer does not cover](#what-defer-does-not-cover).
 
 ## Return
 
@@ -309,401 +310,180 @@ if (ptr != 0 && ptr->field > 0) {
 
 ## Defer and Errdefer
 
-`defer` schedules a statement to execute when the current scope exits, while `errdefer` schedules a statement to execute when returning a non-zero value from the current function. Both follow **LIFO (Last In, First Out)** ordering - the most recently deferred statement executes first.
+`defer` runs a statement when the current scope exits. `errdefer` runs one when
+the function returns a non-zero value. Deferred statements run in reverse order
+of declaration, so the last one written runs first.
 
-### Syntax and Basic Behavior
+Every example below was compiled and run, and the output shown is what it
+printed.
 
-Defer statements use the `defer` or `errdefer` keyword followed by a statement:
-
-```mettle
-defer cleanup();          // Always runs on scope exit
-errdefer rollback();      // Runs on non-zero return
-```
-
-The current compiler accepts function calls, assignments, and blocks:
+### Forms
 
 ```mettle
-defer puts("cleanup");
-defer count = count + 1;
-defer {
+defer cleanup();          // a call
+defer count = count + 1;  // an assignment
+defer {                   // a block
   flush();
   close(handle);
 }
-errdefer handle_error_recovery();
+errdefer rollback();      // a call, on a non-zero return
 ```
 
-> **Argument capture:** A deferred **direct call** captures its argument values at the defer point (by value). In a loop, `defer print_int(i)` snapshots `i` as it is on that iteration, so the deferred calls see `0, 1, 2, …`, not the final value of `i`. **Method calls** (`defer obj.m(...)`) and **indirect/function-pointer calls** are the exception: they re-evaluate their operands at scope exit, so snapshot into a local first (`var current: int32 = i; defer obj.m(current);`) if you need the defer-point value.
-
-### Implementation Details
-
-**AST Representation:**
-- `defer` statements create `AST_DEFER_STATEMENT` nodes
-- `errdefer` statements create `AST_ERRDEFER_STATEMENT` nodes
-- Both contain a single `statement` field pointing to the deferred statement
-
-**IR Lowering Process:**
-1. **Stack Management:** Each scope has an `IRDeferStack` that tracks deferred statements
-2. **Scope Hierarchy:** `IRDeferScope` structures form a linked list, allowing nested scopes
-3. **Push Operation:** When encountering defer/errdefer, the compiler pushes the AST node onto the current scope's stack with an `is_err` flag
-4. **Emission:** At scope exit, the compiler emits deferred statements in reverse order (LIFO)
-
-**Data Structures:**
-```c
-typedef struct {
-    ASTNode *node;    // The defer/errdefer AST node
-    int is_err;       // 1 for errdefer, 0 for defer
-} IRDeferEntry;
-
-typedef struct {
-    IRDeferEntry *entries;
-    size_t count;
-    size_t capacity;
-} IRDeferStack;
-
-typedef struct {
-    IRDeferStack stack;
-    struct IRDeferScope *parent;  // Link to outer scope
-} IRDeferScope;
-```
-
-**Return Statement Handling:**
-For functions with errdefer statements, the compiler generates two code paths:
-1. **Error Path:** Emits both defer and errdefer statements
-2. **Success Path:** Emits only defer statements
-
-The return value is checked to determine which path to take, using generated labels like `errdefer_ok_N` and `errdefer_end_N`. This is convention-based: `0` means success and any non-zero return value is treated as an error, so `return 42;` also triggers `errdefer`.
-
-**Control Flow Integration:**
-- **Blocks:** Create new `IRDeferScope` with parent link to outer scope
-- **If/Else:** Each branch gets its own defer scope; deferred statements run when branch exits
-- **Loops:** Each iteration creates a new scope; deferred statements run at iteration end
-- **Break/Continue:** Trigger deferred statement emission before jumping
-
-The same success/error split is used for explicit `return` and for implicit fall-through at the end of a function body.
-
-### LIFO Ordering and Execution
-
-Deferred statements execute in reverse order of declaration. This is crucial for resource management where cleanup must happen in reverse of acquisition:
+A deferred direct call copies its argument values where the `defer` is written.
+In a loop, `defer print_int(i)` records `i` as it stands on that iteration, so
+the calls print `0`, `1`, `2`. Method calls and calls through a function pointer
+read their operands at scope exit, so copy the value into a local first if you
+need the one from the defer point:
 
 ```mettle
-func example() {
-  defer puts("first");    // Executes third
-  defer puts("second");   // Executes second  
-  defer puts("third");    // Executes first
-  
-  // Function body...
-  // Output: "third", "second", "first"
+var current: int32 = i;
+defer obj.m(current);
+```
+
+### Order
+
+```mettle
+fn lifo() -> int32 {
+  defer println("first");
+  defer println("second");
+  defer println("third");
+  println("body");
+  return 0;
 }
 ```
 
-**Mixed defer and errdefer:**
+```
+body
+third
+second
+first
+```
+
+### Scope
+
+A block runs its deferred statements when the block ends. The function runs its
+own when it returns.
+
 ```mettle
-func mixed_example() {
-  defer puts("always 1");
-  errdefer puts("error only");
-  defer puts("always 2");
-  
-  if (error_condition) {
-    return err();  // Output: "always 2", "error only", "always 1"
+fn nested() -> int32 {
+  defer println("outer cleanup");
+  {
+    defer println("inner cleanup");
+    println("inner body");
   }
-  
-  return ok();     // Output: "always 2", "always 1"
+  println("after block");
+  return 0;
 }
 ```
 
-### Scope-Level vs Function-Level Behavior
-
-**Function scope:** defer/errdefer execute when the function returns via any path (return, break from main loop, etc.)
-
-**Block scope:** defer/errdefer execute when the block exits, including if/else branches, loop bodies, and switch cases:
-
-```mettle
-func demo() {
-  defer puts("function exit");
-  
-  if (condition) {
-    defer puts("if branch exit");  // Runs before function defer
-    // ... branch code ...
-  } else {
-    defer puts("else branch exit");  // Runs before function defer
-    // ... else code ...
-  }
-  
-  // Output on condition=true: "if branch exit", "function exit"
-  // Output on condition=false: "else branch exit", "function exit"
-}
+```
+inner body
+inner cleanup
+after block
+outer cleanup
 ```
 
-### Control Flow Integration
-
-**Loops:** Each iteration gets its own defer scope. Deferred statements run at the end of each iteration. A deferred direct call snapshots its arguments by value on each iteration (see the callout above); method and indirect calls re-evaluate at scope exit.
+A loop body is a block, so a `defer` written inside one runs at the end of each
+iteration:
 
 ```mettle
-func loop_example() {
-  defer puts("function cleanup");
-  
+fn each() -> int32 {
   var i: int32 = 0;
   while (i < 3) {
-    defer puts("iteration cleanup");  // Runs each iteration
-    puts("iteration start");
+    defer println("iteration cleanup");
+    println("iteration start");
     i = i + 1;
-    
-    if (i == 2) {
-      break;  // Runs iteration defer, then function defer
-    }
   }
-  
-  // Output: "iteration start", "iteration cleanup", 
-  //         "iteration start", "iteration cleanup",
-  //         "function cleanup"
+  return 0;
 }
 ```
 
-**Switch statements:** Each case that creates a block gets its own defer scope:
+```
+iteration start
+iteration cleanup
+iteration start
+iteration cleanup
+iteration start
+iteration cleanup
+```
+
+### Errdefer
+
+`errdefer` is valid only inside a function. The rule is a convention on the
+return value: zero means success, and every other value means an error.
 
 ```mettle
-func switch_demo(value: int32) {
-  defer puts("function cleanup");
-  
-  switch (value) {
+fn work(n: int32) -> int32 {
+  defer println("defer always");
+  errdefer println("errdefer only");
+  if (n == 1) {
+    return 42;
+  }
+  return 0;
+}
+```
+
+`work(0)` prints `defer always`. `work(1)` prints `errdefer only`, then
+`defer always`. The same split applies when a function body ends without a
+`return`.
+
+### What defer does not cover
+
+Four ways out of a scope skip the deferred statements. Free the resource by
+hand on these paths.
+
+**`break` skips the loop body's deferred statements.**
+
+```mettle
+fn br() -> int32 {
+  var i: int32 = 0;
+  while (i < 3) {
+    defer println("iter defer");
+    println("iter body");
+    i = i + 1;
+    if (i == 1) { break; }
+  }
+  return 0;
+}
+```
+
+```
+iter body
+```
+
+**`continue` skips them for the iteration it leaves.** Later iterations that
+reach the end of the body run them as usual.
+
+**`break name` and `continue name` skip every deferred statement between the
+jump and the labeled loop,** including the labeled loop's own.
+
+**A `switch` case body never runs its deferred statements.** A `defer` written
+inside a case is dropped.
+
+```mettle
+fn sw() -> int32 {
+  switch (1) {
     case 1: {
-      defer puts("case 1 cleanup");
-      // ... case 1 code ...
-    }
-    case 2: {
-      defer puts("case 2 cleanup");
-      // ... case 2 code ...
-    }
-    default: {
-      defer puts("default cleanup");
-      // ... default code ...
+      defer println("case defer");   // never runs
+      println("case 1");
     }
   }
-  
-  // Only one case's defer runs, plus function defer
+  return 0;
 }
 ```
 
-Because `switch` allows fall-through, cleanup order becomes harder to reason about if execution crosses multiple case bodies. Prefer explicit `break` when a case owns deferred cleanup.
-
-**Break and Continue:** These statements trigger deferred statement emission before jumping:
-
-```mettle
-func control_flow_demo() {
-  defer puts("function cleanup");
-  
-  while (1) {
-    defer puts("iteration cleanup");
-    
-    if (early_exit) {
-      break;  // Runs "iteration cleanup", then "function cleanup"
-    }
-    
-    if (skip_iteration) {
-      continue;  // Runs "iteration cleanup", then next iteration
-    }
-  }
-}
+```
+case 1
 ```
 
-### Error Handling Patterns
+These four gaps are recorded in [Known Limitations](known-limitations.md).
 
-**Resource cleanup with error recovery:**
-```mettle
-func process_file(filename: string) {
-  var file: File* = fopen(filename, "r");
-  if (file == 0) {
-    return err();  // No defer to run yet
-  }
-  defer fclose(file);  // Always runs if file was opened
-  
-  var buffer: uint8* = malloc(4096);
-  if (buffer == 0) {
-    return err();  // Runs defer: fclose(file)
-  }
-  errdefer free(buffer);  // Only on error
-  
-  var data: string = read_file_content(file, buffer, 4096);
-  if (data.length == 0) {
-    return err();  // Runs errdefer: free(buffer), then defer: fclose(file)
-  }
-  
-  // Process successful data...
-  return ok();  // Runs only defer: fclose(file)
-}
-```
+### Cost
 
-**Nested error handling:**
-```mettle
-func nested_operations() {
-  defer puts("outer cleanup");
-  
-  var resource1: Resource* = acquire_resource();
-  if (resource1 == 0) {
-    return err();
-  }
-  defer release_resource(resource1);
-  
-  {
-    defer puts("inner cleanup");
-    
-    var resource2: Resource* = acquire_resource();
-    if (resource2 == 0) {
-      return err();  // Runs "inner cleanup", "release_resource(resource1)", "outer cleanup"
-    }
-    defer release_resource(resource2);
-    
-    if (processing_error) {
-      return err();  // Runs "release_resource(resource2)", "inner cleanup", 
-                   // "release_resource(resource1)", "outer cleanup"
-    }
-    
-    // Success path...
-    return ok();  // Runs "release_resource(resource2)", "inner cleanup", 
-                   // "release_resource(resource1)", "outer cleanup"
-  }
-}
-```
-
-### Common Pitfalls and Limitations
-
-**Top-level defer:** defer/errdefer can only be used inside functions:
-
-```mettle
-// ERROR: defer outside function
-defer puts("this fails");
-
-func valid_function() {
-  defer puts("this works");  // OK
-}
-```
-
-**Supported deferred statements:** `defer` and `errdefer` currently support function calls, assignments, and blocks:
-
-```mettle
-func example() {
-  defer close_file(file);    // OK
-  errdefer update_value(x);  // OK
-  defer x = 1;               // OK
-  errdefer {
-    x = x + 1;
-    update_value(x);
-  }
-}
-```
-
-**Argument capture:** A deferred direct call snapshots its argument values at the defer point, so each iteration's deferred call sees that iteration's value:
-
-```mettle
-while (i < 3) {
-  defer print_int(i);  // snapshots i = 0, then 1, then 2
-  i = i + 1;
-}
-```
-
-Method calls and indirect/function-pointer calls are the exception — they re-evaluate at scope exit — so copy into a local first if you need the defer-point value there.
-
-**Performance considerations:** Each defer statement adds runtime overhead for stack management and conditional execution. In performance-critical code, consider manual cleanup for simple cases.
-
-### Resource Management Patterns
-
-**File handling with multiple resources:**
-```mettle
-func copy_file(src: string, dst: string) {
-  var src_file: File* = fopen(src, "r");
-  if (src_file == 0) {
-    return err();
-  }
-  defer fclose(src_file);
-  
-  var dst_file: File* = fopen(dst, "w");
-  if (dst_file == 0) {
-    return err();
-  }
-  defer fclose(dst_file);  // Runs first (LIFO)
-  
-  var buffer: uint8* = malloc(4096);
-  if (buffer == 0) {
-    return err();
-  }
-  errdefer free(buffer);
-  
-  // Copy loop...
-  while (!feof(src_file)) {
-    var bytes: int32 = fread(buffer, 1, 4096, src_file);
-    if (bytes <= 0) {
-      return err();  // Free buffer, close dst_file, close src_file
-    }
-    fwrite(buffer, 1, bytes, dst_file);
-  }
-  
-  free(buffer);  // Manual cleanup before success return
-  return ok();     // Close dst_file, close src_file
-}
-```
-
-**Socket management in servers:**
-```mettle
-func handle_client_connection(client_socket: int32) {
-  defer close_socket(client_socket);
-  
-  // Set socket options
-  if (set_socket_options(client_socket) != 0) {
-    return err();  // Runs defer: close_socket(client_socket)
-  }
-  
-  var buffer: uint8* = malloc(8192);
-  if (buffer == 0) {
-    return err();
-  }
-  errdefer free(buffer);
-  
-  // Read request loop
-  while (1) {
-    var bytes: int32 = recv(client_socket, buffer, 8192, 0);
-    if (bytes <= 0) {
-      break;  // Client disconnected or error
-    }
-    
-    if (process_request(buffer, bytes) != 0) {
-      return err();  // Free buffer, close socket
-    }
-  }
-  
-  return ok();  // Free buffer, close socket
-}
-```
-
-**Memory allocation chains:**
-```mettle
-func complex_allocation_chain() {
-  var resource1: Resource* = allocate_resource();
-  if (resource1 == 0) {
-    return err();
-  }
-  defer free_resource(resource1);
-  
-  var resource2: Resource* = allocate_resource();
-  if (resource2 == 0) {
-    return err();
-  }
-  defer free_resource(resource2);
-  
-  var temp_buffer: uint8* = malloc(1024);
-  if (temp_buffer == 0) {
-    return err();
-  }
-  errdefer free(temp_buffer);  // Only on error
-  
-  if (complex_processing(resource1, resource2, temp_buffer) != 0) {
-    return err();  // Free temp_buffer, resource2, resource1
-  }
-  
-  // Success: manually clean up temp_buffer
-  free(temp_buffer);
-  return ok();     // Free resource2, resource1
-}
-```
+Each `defer` copies its arguments and adds the deferred statement to the exit
+path of its scope. A function with `errdefer` compiles two exit paths and picks
+one by testing the return value. Clean up by hand in a hot loop where that
+matters.
 
 ## Unreachable Code
 The compiler emits a warning for unreachable statements that appear after an unconditional `return`, `break`, or `continue` in the same block.

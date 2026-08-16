@@ -663,7 +663,7 @@ int code_generator_binary_emit_rep_movsb(
           &context->code, BINARY_GP_RDI, dst_addr_reg) ||
       !binary_emit_mov_reg_imm64(&context->code, BINARY_GP_RCX,
                                  (uint64_t)size) ||
-      /* cld (DF=0) — ensure forward direction. One byte 0xFC. */
+      /* cld (DF=0), ensure forward direction. One byte 0xFC. */
       !binary_code_buffer_append_u8(&context->code, 0xFC) ||
       /* rep movsb: 0xF3 0xA4. */
       !binary_code_buffer_append_u8(&context->code, 0xF3) ||
@@ -1466,7 +1466,7 @@ int code_generator_binary_emit_operand_load(
     }
     /* A local's symbol is usually out of scope in the symbol table by codegen
      * time (the scope was popped), so symbol_table_lookup returns NULL and the
-     * stack load would default to a signed 8-byte read — sign-extending a
+     * stack load would default to a signed 8-byte read, sign-extending a
      * narrow unsigned local (e.g. uint32) and corrupting its value. Resolve the
      * type from the IR (parameter signature / DECLARE_LOCAL) so the load uses
      * the correct width and signedness. */
@@ -4323,7 +4323,7 @@ static int binary_emit_binary_float(CodeGenerator *generator,
     /* ucomis sets ZF=PF=CF=1 when either operand is NaN, so the below/
      * below-or-equal conditions read TRUE on unordered. `<` and `<=` therefore
      * compare rhs against lhs and test above/above-or-equal, which are the
-     * conditions that are false on unordered — every ordered comparison
+     * conditions that are false on unordered, every ordered comparison
      * involving a NaN must be false. */
     int swap = (strcmp(op, "<") == 0 || strcmp(op, "<=") == 0);
     BinaryXmmRegister cmp_lhs = swap ? BINARY_XMM1 : BINARY_XMM0;

@@ -672,7 +672,7 @@ start/update/commit shape before either backend may consume the metadata.
 PTX applies the same tuple budget and emits `mtlc.tensor_loop resident ...` or
 `replay ...`; replay executes the original load/MMA/store semantics, while the
 resident path loads C once and delays D until the commit. A libmtlc frontend
-gets this result from ordinary builder control flow and tensor descriptors—no
+gets this result from ordinary builder control flow and tensor descriptors, with no
 Mettle-frontend marker exists. `--dump-ir` exposes the neutral residency roles,
 and `--explain` reports the legality decision plus the actual PTX/SPIR-V backend
 boundary.
@@ -759,8 +759,8 @@ multi-output/multi-K-tile and tail-complete tensor/scalar f16/f32 GEMMs above,
 they pass CPU numerical oracles on the compute-12.0 development GPU.
 
 These are correctness/expressiveness baselines plus three exact accumulator
-residency forms—straight-line chains, a single-update runtime K loop, and
-explicit N-stage asynchronous pipelines—not claims of general fusion or peak
+residency forms: straight-line chains, a single-update runtime K loop, and
+explicit N-stage asynchronous pipelines. They are not claims of general fusion or peak
 performance. Bounded-region M/N/K tail selection is now backend-generated for
 the documented `tensor_matmul` families; automatic launch-grid/batch tiling,
 pipeline rotation, multi-exit and opaque-fragment biased epilogue residency,

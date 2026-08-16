@@ -275,7 +275,7 @@ static int binary_emitter_find_symbol_index(const BinaryEmitter *emitter,
     return -1;
   }
 
-  /* Index not built yet (no symbols defined) — linear fallback. */
+  /* Index not built yet (no symbols defined), linear fallback. */
   for (size_t i = 0; i < emitter->symbol_count; i++) {
     if (emitter->symbols[i].name &&
         strcmp(emitter->symbols[i].name, name) == 0) {

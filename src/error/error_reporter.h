@@ -14,7 +14,7 @@ typedef enum {
 } ErrorType;
 
 /* Short labels printed in diagnostic header, e.g. [E0002].
-   Stable across compiler versions — useful for test grep and docs. */
+   Stable across compiler versions, useful for test grep and docs. */
 #define ERROR_CODE_LEXICAL   "E0001"
 #define ERROR_CODE_SYNTAX    "E0002"
 #define ERROR_CODE_SEMANTIC  "E0003"

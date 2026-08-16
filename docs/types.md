@@ -354,8 +354,8 @@ fn main() -> int32 {
 The compiler performs **monomorphization** before type checking: each unique instantiation becomes a concrete type or function. There is no runtime generics; all type parameters are resolved at compile time.
 
 Struct layout is computed in the frontend type table (declaration order,
-natural alignment, C padding rules), including byte offset and — for a
-bitfield — bit offset and width. `offsetof(Point.x)` folds that byte offset
+natural alignment, C padding rules), including byte offset, and for a bitfield
+the bit offset and width. `offsetof(Point.x)` folds that byte offset
 during const eval. Enum types record variant names and values on the same
 table. Pointers answer their pointee; arrays answer element type and length;
 slices (when present) answer element type and a runtime length.
@@ -419,9 +419,9 @@ This is deliberate and worth understanding before the name reaches a wire format
 
 ### `Kind`
 
-`.kind` answers with `Kind`, an enum the compiler registers itself, so reflection needs no import and no `--prelude`. Its variants are reachable **only** qualified — `Kind.Struct`, never a bare `Struct` — precisely so that reflection does not claim common names like `Struct`, `Array`, or `Bool` out of every program's namespace.
+`.kind` answers with `Kind`, an enum the compiler registers itself, so reflection needs no import and no `--prelude`. Its variants are reachable **only** qualified, as `Kind.Struct` and never as a bare `Struct`, precisely so that reflection does not claim common names like `Struct`, `Array`, or `Bool` out of every program's namespace.
 
-`Kind` covers `Void`, `Bool`, `Int8`…`Int64`, `Uint8`…`Uint64`, `Float32`, `Float64`, `String`, `Pointer`, `Array`, `Slice`, `Struct`, `Enum`, `TaggedEnum`, and `FunctionPointer`. Integer and float widths stay distinct, because telling `int32` from `int64` is exactly what a wire-format generator needs. It deliberately has no `Type` or `Field` variant: those exist only at compile time, so no value you can reflect on ever has one.
+`Kind` covers `Void`, `Bool`, `Int8`...`Int64`, `Uint8`...`Uint64`, `Float32`, `Float64`, `String`, `Pointer`, `Array`, `Slice`, `Struct`, `Enum`, `TaggedEnum`, and `FunctionPointer`. Integer and float widths stay distinct, because telling `int32` from `int64` is exactly what a wire-format generator needs. It deliberately has no `Type` or `Field` variant: those exist only at compile time, so no value you can reflect on ever has one.
 
 ### Inspecting and budgeting expansion
 
@@ -450,7 +450,7 @@ A program that expands nothing reports `no sites; nothing generated`. That absen
 
 ### Sequences
 
-`.fields` is a real compile-time value, not a special form only legal in `comptime for`. It answers `.len` and `[i]`, and nothing else — a program can observe a sequence but never hold one, and a `Sequence` has no runtime representation, exactly like `Type` and `Field`. The subscript must be a compile-time constant in range, since there is nothing to index at run time.
+`.fields` is a real compile-time value, not a special form only legal in `comptime for`. It answers `.len` and `[i]`, and nothing else: a program can observe a sequence but never hold one, and a `Sequence` has no runtime representation, exactly like `Type` and `Field`. The subscript must be a compile-time constant in range, since there is nothing to index at run time.
 
 ## `comptime for`
 
@@ -466,8 +466,8 @@ struct Packet {
 fn main() -> int32 {
   var total: int64 = 0;
   comptime for f in typeof(Packet).fields {
-    static_assert(f.size > 0);
-    total = total + f.offset + f.size;
+    static_assert(f.type.size > 0);
+    total = total + f.offset + f.type.size;
   }
   return (int32)total;
 }
@@ -475,21 +475,23 @@ fn main() -> int32 {
 
 `comptime` is contextual, not a reserved word: only `comptime` immediately followed by `for` starts one of these, so `comptime` remains usable as an ordinary identifier. `typeof(T).fields` is the only compile-time sequence today. A type with no fields expands to nothing, which is not an error.
 
-Expansion happens **before** the body is type checked, and each copy is checked separately. That is the point of the construct rather than an implementation detail: `f.offset`, `f.size`, and `f.type` differ per iteration, so a body can be valid for one field and rejected for the next.
+Expansion happens **before** the body is type checked, and each copy is checked separately. That is the point of the construct rather than an implementation detail: `f.offset`, `f.type`, and `f.type.size` differ per iteration, so a body can be valid for one field and rejected for the next.
 
 Because the copies are checked separately, a diagnostic inside one has to say which copy it came from. Every error and warning raised while checking an expansion carries a note naming the iteration and the field, with the caret on the `comptime for` the programmer wrote:
 
 ```
 error[E0003]: static_assert failed
-  --> mixed.mettle:12:18
+  --> mixed.mettle:9:18
    |
-12 |     static_assert(f.size == 8);
+ 8 |   comptime for f in typeof(Mixed).fields {
+ 9 |     static_assert(f.type.size == 8);
    |                  ^
-note: expanded from comptime-for iteration 1 (field `small`)
-  --> mixed.mettle:11:3
-   |
-11 |   comptime for f in typeof(Mixed).fields {
-   |   ^^^^^^^^
+10 |     total = total + f.offset;
+note: expanded from comptime-for iteration 2 (field `small`)
+  --> mixed.mettle:8:3
+  |
+8 |   comptime for f in typeof(Mixed).fields {
+  |   ^^^^^^^^
 ```
 
 Nested expansions report the whole chain, outermost first.

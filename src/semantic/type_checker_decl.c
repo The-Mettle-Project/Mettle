@@ -1,4 +1,4 @@
-﻿// Type checker: struct / enum / declaration processing.
+// Type checker: struct / enum / declaration processing.
 #include "type_checker_internal.h"
 
 /* The current PTX/SPIR-V kernel ABI is intentionally explicit: kernel
@@ -277,7 +277,7 @@ Type *type_checker_build_tagged_enum_type(TypeChecker *checker,
 
   // data starts at first offset >= 4 that satisfies alignment of payload
   size_t data_align = max_payload_align < 4 ? 4 : max_payload_align;
-  // align_up(4, data_align) â€“ tag is 4 bytes, then pad to data_align
+  // align_up(4, data_align) - tag is 4 bytes, then pad to data_align
   size_t data_offset = (4 + data_align - 1) & ~(data_align - 1);
   size_t total_size = max_payload_size > 0 ? data_offset + max_payload_size
                                            : data_offset;
@@ -365,7 +365,7 @@ int type_checker_process_tagged_enum(TypeChecker *checker,
 
 // ---------------------------------------------------------------------------
 // Instantiate a generic enum template for a concrete type argument string.
-// e.g. "Option<int32>" â†’ creates and registers Option__int32 if needed.
+// e.g. "Option<int32>" -> creates and registers Option__int32 if needed.
 // ---------------------------------------------------------------------------
 Type *type_checker_instantiate_generic_enum(TypeChecker *checker,
                                                     const char *generic_name,
@@ -423,7 +423,7 @@ Type *type_checker_instantiate_generic_enum(TypeChecker *checker,
   for (size_t i = 0; i < tmpl->variant_count; i++) {
     concrete_variants[i].name = tmpl->variants[i].name;
     concrete_variants[i].value = NULL;
-    // Substitute type parameter: if payload_type == type_param[0] â†’ use arg
+    // Substitute type parameter: if payload_type == type_param[0] -> use arg
     const char *orig_pt = tmpl->variants[i].payload_type;
     if (orig_pt && tmpl->type_param_count > 0 &&
         strcmp(orig_pt, tmpl->type_params[0]) == 0) {
@@ -495,7 +495,7 @@ int type_checker_process_enum_declaration(TypeChecker *checker,
     return 0;
   }
 
-  // If this enum has type parameters it's a generic template â€” store the AST
+  // If this enum has type parameters it's a generic template , store the AST
   // node for later monomorphization and do not register a concrete type now.
   if (enum_decl->type_param_count > 0) {
     ASTNode **new_tmpl = realloc(
@@ -509,7 +509,7 @@ int type_checker_process_enum_declaration(TypeChecker *checker,
     return 1;
   }
 
-  // Check whether any variant carries a payload â€” if so, it's a tagged enum.
+  // Check whether any variant carries a payload , if so, it's a tagged enum.
   int is_tagged = 0;
   for (size_t i = 0; i < enum_decl->variant_count; i++) {
     if (enum_decl->variants[i].payload_type) {

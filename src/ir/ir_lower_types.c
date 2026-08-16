@@ -176,7 +176,7 @@ int ir_local_declared_float_bits(IRLoweringContext *context,
  * value operand keeps its own width so the backend can detect a precision
  * mismatch (e.g. a float64 expression assigned to a float32 variable) and
  * emit the cvtsd2ss / cvtss2sd it needs. A bare float literal has no runtime
- * width, so re-round it to the target precision in place — no conversion is
+ * width, so re-round it to the target precision in place, no conversion is
  * required for it. No-op when bits is 0 (target is not floating). */
 void ir_assign_apply_float_bits(IRInstruction *instruction,
                                        IROperand *value, int bits) {
@@ -283,7 +283,7 @@ int ir_type_storage_size(Type *type) {
   return 8;
 }
 
-/* Memory stride between consecutive elements in an array — must match
+/* Memory stride between consecutive elements in an array, must match
  * laid-out sizeof(element), including structs > 8 bytes. Prefer this over
  * ir_type_storage_size() for base + index * stride address math only. */
 int ir_type_array_element_stride(Type *element_type) {

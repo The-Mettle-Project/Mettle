@@ -130,7 +130,7 @@ static int mir_name_is_global_variable(CodeGenerator *g, const char *name) {
          s->scope->type == CG_SCOPE_GLOBAL;
 }
 
-/* True if `name` resolves to a read-accessible global scalar — a value we can
+/* True if `name` resolves to a read-accessible global scalar, a value we can
  * cache in a register at function entry (used by both the eligibility gate and
  * the entry-load emitter, so they agree exactly on what counts as cacheable). */
 static int mir_name_is_global_scalar(CodeGenerator *g, const char *name) {
@@ -260,7 +260,7 @@ static MirVregId mir_name_map_get_or_add(MirNameMap *m, MirFunction *fn,
 }
 
 /* True if symbol `name` already has a vreg binding (param/local/cached
- * global). Symbols only — temps live in a separate namespace. */
+ * global). Symbols only, temps live in a separate namespace. */
 static int mir_name_map_has(const MirNameMap *m, const char *name) {
   if (m->bucket_count) {
     size_t b = mir_name_map_hash(name, 0) & (m->bucket_count - 1);
@@ -284,7 +284,7 @@ static int mir_name_map_has(const MirNameMap *m, const char *name) {
 /* Register-promoted globals. Each referenced global scalar is loaded once at
  * entry (MIR_LOAD_GLOBAL) into a cache vreg; `all` lists every cached global and
  * `names` the subset that is written (stored back before every return). In a
- * function that makes calls, memory — not the cache vreg — is authoritative
+ * function that makes calls, memory, not the cache vreg, is authoritative
  * across a call boundary: the written set is flushed before each call (so the
  * callee sees current values) and the full cached set is reloaded after (so we
  * observe any value the callee changed). Names are borrowed interned IR
@@ -360,7 +360,7 @@ static int mir_is_comparison(const char *op) {
   return mir_setcc_opcode(op, 0, &tmp);
 }
 
-/* jcc opcode (second byte) to take when an IR comparison is FALSE — i.e. the
+/* jcc opcode (second byte) to take when an IR comparison is FALSE, i.e. the
  * branch a `branch_zero` of the comparison result should take. */
 static int mir_false_jcc(const char *op, int is_unsigned, unsigned char *out) {
   if (strcmp(op, "==") == 0) { *out = 0x85; return 1; } /* jne */
@@ -440,7 +440,7 @@ static int mir_operand_is_unsigned(CodeGenerator *g, BinaryFunctionContext *ctx,
 
 /* Byte width that constrains an integer comparison operand: its scalar size for
  * a known <=4-byte integer, 8 for a 64-bit integer / pointer / unknown type, and
- * 0 for an INT literal (it constrains nothing — it follows the other operand). */
+ * 0 for an INT literal (it constrains nothing, it follows the other operand). */
 static int mir_cmp_operand_width(CodeGenerator *g, BinaryFunctionContext *ctx,
                                  const IROperand *op) {
   if (op->kind == IR_OPERAND_INT) {
@@ -463,7 +463,7 @@ static int mir_cmp_operand_width(CodeGenerator *g, BinaryFunctionContext *ctx,
  * 32-bit cmp when BOTH typed operands are exactly 4-byte (int32/uint32)
  * integers: the 32-bit cmp looks only at the low 32 bits, which are always the
  * true value (the carried garbage lives above bit 31), and the signed/unsigned
- * setcc/jcc the caller picks reads the 32-bit flags — correct for equality AND
+ * setcc/jcc the caller picks reads the 32-bit flags, correct for equality AND
  * ordering. 1/2-byte operands and any 8-byte/pointer operand (or missing type
  * info) keep the conservative 64-bit compare. `op` is currently unused but kept
  * so the policy can be refined per operator if ever needed. */
@@ -533,7 +533,7 @@ static int mir_type_is_mir_value(CodeGenerator *g, const char *type_name) {
 }
 
 /* An INDIRECT aggregate (struct/array by value, size>8 or non-power-of-2): the
- * Win64 ABI passes it BY REFERENCE — the caller copies it to a temp and passes
+ * Win64 ABI passes it BY REFERENCE, the caller copies it to a temp and passes
  * the address in a GP register. A parameter of this type therefore arrives as a
  * pointer, which MIR can hold as an 8-byte value; the body accesses fields
  * through that pointer (&@p yields the pointer, not a stack home). */
@@ -683,8 +683,8 @@ static int mir_indirect_type_home_bytes(CodeGenerator *g, MtlcType *t) {
  * through temps; a temp's struct size is recovered from its context: the
  * INDIRECT return type of the call that defines it, the INDIRECT param type of
  * a call that consumes it, or the type of a struct SYMBOL it is whole-struct
- * assigned to/from. (Resolution is via calls/symbols only — never transitively
- * through another temp — so it cannot recurse.) */
+ * assigned to/from. (Resolution is via calls/symbols only, never transitively
+ * through another temp, so it cannot recurse.) */
 static int mir_struct_temp_size(CodeGenerator *g, const IRFunction *irf,
                                 const char *name) {
   if (!g || !irf || !name || !g->ir_program) {
@@ -1010,7 +1010,7 @@ static MirAddrofKind mir_addressof_kind(CodeGenerator *g,
 
 /* Float bit-width (32/64) of a call-argument value operand for the eligibility
  * gate, which (unlike lowering) has no BinaryFunctionContext. Uses the operand's
- * own float_bits tag and the symbol table only — the same signals lowering's
+ * own float_bits tag and the symbol table only, the same signals lowering's
  * code_generator_binary_operand_float_bits treats as authoritative (it returns
  * the operand's float_bits first), so the gate and lowering agree on which args
  * are float. Returns 0 for a non-float or undeterminable operand (gate defers). */
@@ -1102,8 +1102,8 @@ static int mir_call_is_supported(CodeGenerator *g,
     }
     if (code_generator_binary_resolved_type_float_bits(pt) != 0) {
       /* Float parameter: homeable when (1) the argument is itself a float value
-       * (a float temp/local/param or a float literal) — an int->float implicit
-       * conversion at the call site is left to the fallback — and (2) it lands in
+       * (a float temp/local/param or a float literal), an int->float implicit
+       * conversion at the call site is left to the fallback, and (2) it lands in
        * an XMM register, not a stack slot. */
       if (mir_arg_float_bits(g, ir_function, arg) == 0) {
         mir_call_trace("arg_float_nonfloat_src");
@@ -1134,7 +1134,7 @@ static int mir_call_is_supported(CodeGenerator *g,
     if (code_generator_abi_classify(pt) == ABI_PASS_INDIRECT) {
       /* struct passed BY VALUE: the caller copies it to an outgoing temp and
        * passes the temp's address. The source must hold the struct in a LEA-able
-       * home — a struct LOCAL or a struct TEMP; a by-ref param source is
+       * home, a struct LOCAL or a struct TEMP; a by-ref param source is
        * deferred (its home holds a pointer, not the struct). */
       if (mir_operand_struct_home_size(g, ir_function, arg) == 0) {
         mir_call_trace("arg_struct_nonlocal");
@@ -1150,7 +1150,7 @@ static int mir_call_is_supported(CodeGenerator *g,
     if (arg->kind == IR_OPERAND_STRING &&
         !code_generator_binary_type_is_cstring(pt)) {
       /* A string literal is only lowered to a bare cstring (char* in one GP
-       * register) when the parameter is itself a cstring — matching the fallback
+       * register) when the parameter is itself a cstring, matching the fallback
        * emitter (emit_call_argument_load). A `string` fat-pointer parameter
        * ({chars,length}) needs the struct ABI, which MIR does not build yet. */
       mir_call_trace("arg_string_non_cstring");
@@ -1230,7 +1230,7 @@ int mir_function_is_eligible(CodeGenerator *generator,
      * stack frame (handled below). A FLOAT param landing on the stack is not
      * homed yet, so defer those functions to the fallback. An INDIRECT struct
      * return consumes the first integer argument slot as a hidden out-pointer,
-     * shifting every user parameter up by one — model that here so the on-stack
+     * shifting every user parameter up by one, model that here so the on-stack
      * detection matches the prologue's homing exactly. */
     int hidden = mir_type_is_indirect_aggregate(generator,
                                                 ir_function->return_type_name)
@@ -1302,7 +1302,7 @@ int mir_function_is_eligible(CodeGenerator *generator,
     return 0;
   }
   /* Any SYMBOL operand not defined in this function is a global access. It is
-   * eligible iff it is a plain scalar global (no address-of in scope — an
+   * eligible iff it is a plain scalar global (no address-of in scope, an
    * IR_OP_ADDRESS_OF would be rejected below, so no aliasing pointer can reach
    * it). Calls are fine: the lowering flushes written globals before each call
    * and reloads cached globals after, keeping memory authoritative across the
@@ -2059,7 +2059,7 @@ static int mir_emit_const_divmod(MirFunction *fn, MirOperand dst, MirOperand a,
    * ops). A vreg is safe to re-read directly: it never lives in RAX/RDX (those
    * are non-allocatable encoder scratch), so MULHI's RAX:RDX clobber cannot
    * corrupt it, and this function never writes `a` before its last read. Only an
-   * immediate (or other non-vreg) needs a fresh-vreg snapshot — copying it once
+   * immediate (or other non-vreg) needs a fresh-vreg snapshot, copying it once
    * avoids re-emitting a 10-byte movabs at each use. Skipping the copy for the
    * common register dividend removes one mov per div/mod in hot loops. */
   MirOperand A;
@@ -2393,7 +2393,7 @@ static int mir_call_may_write_globals(CodeGenerator *g, const IRFunction *irf,
 /* Emit a fixed-size byte copy of `size` bytes from [src_base] to [dst_base],
  * where both bases are pointer vregs. Lowered as a straight-line sequence of
  * load/store pairs through a fresh GP temp (8 bytes at a time, then a 4/2/1
- * tail) — exactly the [base + disp] memory MOVs the field-access path already
+ * tail), exactly the [base + disp] memory MOVs the field-access path already
  * uses, so it needs no new encoder support and the allocator schedules the
  * pointers and temps normally. Used to copy an INDIRECT struct into a caller's
  * hidden return slot (and, later, for whole-struct assignment and arguments). */
@@ -3224,7 +3224,7 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
      * (dw < source width) truncates to dw bytes then extends per dst signedness.
      * A WIDENING cast (dw >= source width) must extend from the SOURCE width per
      * the SOURCE signedness, because MIR computes in 64-bit and a narrow source
-     * value (e.g. a uint32 product) can carry garbage above its width — a plain
+     * value (e.g. a uint32 product) can carry garbage above its width, a plain
      * 64-bit move would carry that garbage into the wider value (e.g.
      * `(int64)(uint32_a * uint32_b)`). */
     MtlcType *st = code_generator_binary_get_operand_type_in_context(g, ctx, &in->lhs);
@@ -3296,7 +3296,7 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
       /* Coerce the value to the store width: a literal is materialized at
        * that width, and a float64-tracked arithmetic result narrows via
        * cvtsd2ss before a 4-byte store (a raw movss of a double's low dword
-       * silently stores garbage — 0 for round values). */
+       * silently stores garbage, 0 for round values). */
       MirOperand fval =
           coerce_float_operand(fn, g, ctx, map, &in->lhs, size);
       return mir_emit_fmov(fn, mem, fval, size);
@@ -3490,7 +3490,7 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
     /* Tag each positional slot's float class from the callee's parameter types so
      * the ABI layout routes float args to XMM registers. Without this every arg
      * defaults to integer and a float arg is homed into a GP register (and a
-     * float immediate then reaches the GP value path — an encoder error). */
+     * float immediate then reaches the GP value path, an encoder error). */
     {
       const CgSym *fc = g->ir_program
                        ? code_generator_lookup_symbol(g, in->text)
@@ -3640,7 +3640,7 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
     }
     /* Float register args: move each value into its XMM argument register,
      * converting to the parameter's precision (a float64-tracked temp passed to
-     * a float32 param narrows via cvtsd2ss — mirroring the fallback's
+     * a float32 param narrows via cvtsd2ss, mirroring the fallback's
      * emit_float_call_argument; a raw movss would hand the callee the low dword
      * of a double, zero for values like 2.0). Setting has_xmm_arg_call removes
      * XMM0..XMM3 from this function's allocation pool, so no arg source ever sits
@@ -3705,7 +3705,7 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
       }
       fn->vregs[dstsym.vreg].address_taken = 1;
       /* Size the dest's home to the whole struct (a struct LOCAL or struct TEMP
-       * — mir_operand_struct_home_size resolves a temp's size from the IR). */
+       *: mir_operand_struct_home_size resolves a temp's size from the IR). */
       {
         const IRFunction *dirf =
             ctx && ctx->function_name
@@ -3921,7 +3921,7 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
   case IR_OP_SIMD_SLP_MAC_I32: {
     /* Inline SLP MAC kernel. Marshal the three effective element pointers
      * (base + offset*4), the k count, and the byte row stride into
-     * RCX/RDX/R8/R9/RAX — like call-argument setup — then emit the pure-loop MIR
+     * RCX/RDX/R8/R9/RAX: like call-argument setup, then emit the pure-loop MIR
      * op. The lane count K is a compile-time constant (validated in
      * eligibility); the kernel advances b by the RAX stride each iteration. The
      * op is treated like a call by the allocator, so no live value occupies a
@@ -4995,7 +4995,7 @@ static int mir_lower_folded_access(MirFunction *fn, CodeGenerator *g,
 /* ---- loop rotation ------------------------------------------------------ */
 
 /* Rotate top-tested loops to bottom-tested ones. The lowering emits a while
- * loop as `label H; CMPBR cc -> Lexit; <body>; JMP H` — a fall-through test at
+ * loop as `label H; CMPBR cc -> Lexit; <body>; JMP H`, a fall-through test at
  * the top plus an unconditional back-jump every iteration (two branches/iter).
  * This rewrites it to `CMPBR cc -> Lexit (guard); H: <body>; CMPBR !cc -> H`,
  * so the back-edge is a single conditional branch and the top test runs once.
@@ -5005,7 +5005,7 @@ static int mir_lower_folded_access(MirFunction *fn, CodeGenerator *g,
  * targeting H, and (2) swapping `label H` with its following CMPBR so H now
  * marks the body start. Only safe when H is immediately followed by its CMPBR:
  * then the compare operands are loop-stable live values (a counter and a bound),
- * not temps computed by the header's condition evaluation — so re-testing them
+ * not temps computed by the header's condition evaluation, so re-testing them
  * at the back-edge (after the body's update) is exactly the loop condition. */
 /* Fuse `MOV d, s` immediately followed by `MOVSX/MOVZX d, d` into
  * `MOVSX/MOVZX d, s`: the extend overwrites d with the extension of its low
@@ -5708,7 +5708,7 @@ static void mir_rotate_loops(MirFunction *fn) {
     }
     /* The instruction right after the back-edge must be the header's exit label.
      * Otherwise the rotated loop's fall-through (the not-taken bottom test) would
-     * land on the wrong block — e.g. when the loop is the last statement in an
+     * land on the wrong block, e.g. when the loop is the last statement in an
      * `if` and its exit is the enclosing block's end, not a `while_end` here. */
     if (be + 1 >= fn->insn_count || fn->insns[be + 1].op != MIR_LABEL ||
         fn->insns[be + 1].dst.kind != MIR_OPK_LABEL ||
@@ -6232,7 +6232,7 @@ int code_generator_binary_emit_function_via_mir(
       /* A narrow integer return (int32/uint32/int16/...) must be canonicalized
        * before `mov rax`: MIR computes in 64-bit, so the value can carry garbage
        * above its width, and the Win64/SysV ABI leaves the high RAX bits
-       * undefined for a sub-64-bit return — a caller that uses the full register
+       * undefined for a sub-64-bit return, a caller that uses the full register
        * (e.g. `(int64)narrow_fn()`) would then read the garbage. Record the
        * return width/signedness so the RETURN lowering extends to canonical
        * 64-bit form. */
@@ -6281,7 +6281,7 @@ int code_generator_binary_emit_function_via_mir(
       }
     }
     /* Load each global (read or written) into its cache vreg once at entry.
-     * Scans dest/lhs/rhs AND call arguments — a global used only as a call
+     * Scans dest/lhs/rhs AND call arguments, a global used only as a call
      * argument (f(g)) must still be loaded, or the value path would resolve it
      * to an undefined vreg holding a stale register. */
     for (int k = 0;; k++) {
