@@ -247,6 +247,23 @@ int ir_emit_deferred_calls_non_err(IRLoweringContext *context,
   return ir_emit_deferred_calls_filtered(context, function, stack, 0);
 }
 
+/* A `break` or `continue` leaves every scope between the jump and the loop it
+   targets, so those scopes' deferred statements run first. `stop` is the
+   chain the loop was entered with and stays untouched: the loop is inside it,
+   and the jump does not leave it. `errdefer` entries are skipped, since they
+   belong to the function's return. */
+int ir_emit_defers_until_scope(IRLoweringContext *context,
+                               IRFunction *function, const IRDeferScope *from,
+                               const IRDeferScope *stop) {
+  for (const IRDeferScope *current = from; current && current != stop;
+       current = current->parent) {
+    if (!ir_emit_deferred_calls_non_err(context, function, &current->stack)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 int ir_emit_deferred_scopes(IRLoweringContext *context,
                                    IRFunction *function,
                                    const IRDeferScope *scope) {

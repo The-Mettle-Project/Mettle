@@ -959,7 +959,7 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     }
 
     if (!ir_push_labeled_control_frame(context, loop_end, loop_start,
-                                       while_data->label)) {
+                                       while_data->label, defers)) {
       free(loop_start);
       free(loop_end);
       return 0;
@@ -1068,7 +1068,7 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     }
 
     if (!ir_push_labeled_control_frame(context, end_label, step_label,
-                                       for_data->label)) {
+                                       for_data->label, defers)) {
       free(condition_label);
       free(step_label);
       free(end_label);
@@ -1127,7 +1127,7 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
   }
 
   case AST_SWITCH_STATEMENT:
-    return ir_lower_switch_statement(context, function, statement);
+    return ir_lower_switch_statement(context, function, statement, defers);
 
   case AST_MATCH_STATEMENT: {
     MatchStatement *m = (MatchStatement *)statement->data;
@@ -1145,8 +1145,8 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
   case AST_BREAK_STATEMENT: {
     LoopControlStatement *ctrl = (LoopControlStatement *)statement->data;
     const char *user_label = ctrl ? ctrl->target_label : NULL;
-    const char *target = user_label ? ir_find_labeled_break(context, user_label)
-                                    : ir_current_break_label(context);
+    const IRControlFrame *frame = ir_break_target_frame(context, user_label);
+    const char *target = frame ? frame->break_label : NULL;
     if (!target) {
       if (user_label) {
         ir_set_error(context, "'break %s' has no matching labeled loop",
@@ -1156,6 +1156,12 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
       }
       return 0;
     }
+    // The jump leaves every scope between here and the loop, so their
+    // deferred statements run before it.
+    if (!ir_emit_defers_until_scope(context, function, defers,
+                                    frame->defers)) {
+      return 0;
+    }
     return ir_emit_jump_instruction(context, function, target,
                                     statement->location);
   }
@@ -1163,9 +1169,8 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
   case AST_CONTINUE_STATEMENT: {
     LoopControlStatement *ctrl = (LoopControlStatement *)statement->data;
     const char *user_label = ctrl ? ctrl->target_label : NULL;
-    const char *target = user_label
-                             ? ir_find_labeled_continue(context, user_label)
-                             : ir_current_continue_label(context);
+    const IRControlFrame *frame = ir_continue_target_frame(context, user_label);
+    const char *target = frame ? frame->continue_label : NULL;
     if (!target) {
       if (user_label) {
         ir_set_error(context, "'continue %s' has no matching labeled loop",
@@ -1173,6 +1178,12 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
       } else {
         ir_set_error(context, "'continue' used outside loop");
       }
+      return 0;
+    }
+    // The iteration ends here, so the body's deferred statements run, exactly
+    // as they would on the path that falls off the end of the body.
+    if (!ir_emit_defers_until_scope(context, function, defers,
+                                    frame->defers)) {
       return 0;
     }
     return ir_emit_jump_instruction(context, function, target,

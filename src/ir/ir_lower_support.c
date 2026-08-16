@@ -377,7 +377,8 @@ int ir_emit_safety_check(IRLoweringContext *context, IRFunction *function,
 int ir_push_labeled_control_frame(IRLoweringContext *context,
                                          const char *break_label,
                                          const char *continue_label,
-                                         const char *user_label) {
+                                         const char *user_label,
+                                         IRDeferScope *defers) {
   if (!context) {
     return 0;
   }
@@ -401,6 +402,7 @@ int ir_push_labeled_control_frame(IRLoweringContext *context,
   frame->continue_label =
       continue_label ? mettle_strdup(continue_label) : NULL;
   frame->user_label = user_label ? mettle_strdup(user_label) : NULL;
+  frame->defers = defers;
   if ((break_label && !frame->break_label) ||
       (continue_label && !frame->continue_label) ||
       (user_label && !frame->user_label)) {
@@ -419,9 +421,10 @@ int ir_push_labeled_control_frame(IRLoweringContext *context,
 
 int ir_push_control_frame(IRLoweringContext *context,
                                  const char *break_label,
-                                 const char *continue_label) {
+                                 const char *continue_label,
+                                 IRDeferScope *defers) {
   return ir_push_labeled_control_frame(context, break_label, continue_label,
-                                       NULL);
+                                       NULL, defers);
 }
 
 void ir_pop_control_frame(IRLoweringContext *context) {
@@ -483,6 +486,49 @@ const char *ir_find_labeled_continue(IRLoweringContext *context,
     const IRControlFrame *frame = &context->control_stack[i - 1];
     if (frame->user_label && strcmp(frame->user_label, user_label) == 0) {
       return frame->continue_label;
+    }
+  }
+  return NULL;
+}
+
+/* The label lookups above answer where the jump goes. These answer which
+   frame owns it, which is what the deferred statements between here and there
+   are measured against. The search rules match one for one: a bare `break`
+   takes the innermost frame, a bare `continue` the innermost frame that has a
+   continue label (a switch has none), and a labeled form the frame carrying
+   that name. */
+const IRControlFrame *ir_break_target_frame(IRLoweringContext *context,
+                                            const char *user_label) {
+  if (!context || context->control_count == 0) {
+    return NULL;
+  }
+  if (!user_label) {
+    return &context->control_stack[context->control_count - 1];
+  }
+  for (size_t i = context->control_count; i > 0; i--) {
+    const IRControlFrame *frame = &context->control_stack[i - 1];
+    if (frame->user_label && strcmp(frame->user_label, user_label) == 0) {
+      return frame->break_label ? frame : NULL;
+    }
+  }
+  return NULL;
+}
+
+const IRControlFrame *ir_continue_target_frame(IRLoweringContext *context,
+                                               const char *user_label) {
+  if (!context || context->control_count == 0) {
+    return NULL;
+  }
+  for (size_t i = context->control_count; i > 0; i--) {
+    const IRControlFrame *frame = &context->control_stack[i - 1];
+    if (user_label) {
+      if (frame->user_label && strcmp(frame->user_label, user_label) == 0) {
+        return frame->continue_label ? frame : NULL;
+      }
+      continue;
+    }
+    if (frame->continue_label) {
+      return frame;
     }
   }
   return NULL;

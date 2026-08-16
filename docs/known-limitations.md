@@ -160,22 +160,6 @@ Arrays follow the same rule as in [Types - Array Types](types.md#array-types): t
 
 - A deferred direct call `defer fn(args...)` captures its **argument values at the defer point** (by value); the snapshots are replayed at scope exit. Deferred **method calls** (`defer obj.m(...)`) and **indirect/function-pointer calls** still re-evaluate their operands at scope exit (by reference); snapshot into a local first if you need the defer-point value.
 
-### Deferred statements skipped on four exit paths
-
-Four ways out of a scope run none of its deferred statements. Release the
-resource by hand on these paths. Verified against the compiler as of this
-writing; see [Control Flow](control-flow.md#what-defer-does-not-cover) for the
-programs and their output.
-
-- **`break`** leaves the loop body without running its deferred statements.
-- **`continue`** skips them for the iteration it leaves. Later iterations that
-  reach the end of the body run them as usual.
-- **`break name` and `continue name`** skip every deferred statement between
-  the jump and the labeled loop, including the labeled loop's own.
-- **A `switch` case body** never runs its deferred statements at all.
-
-`return` and reaching the end of a scope both work as documented.
-
 ### Error Defer
 
 - `errdefer` is function-only and convention-based. It is valid only inside functions, and any non-zero explicit return value is treated as an error.

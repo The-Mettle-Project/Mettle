@@ -88,7 +88,8 @@ done:
 }
 
 int ir_lower_switch_statement(IRLoweringContext *context,
-                                     IRFunction *function, ASTNode *statement) {
+                                     IRFunction *function, ASTNode *statement,
+                                     IRDeferScope *defers) {
   if (!context || !function || !statement ||
       statement->type != AST_SWITCH_STATEMENT) {
     return 0;
@@ -225,7 +226,7 @@ int ir_lower_switch_statement(IRLoweringContext *context,
   }
 
   // Emit cases.
-  if (!ir_push_control_frame(context, end_label, NULL)) {
+  if (!ir_push_control_frame(context, end_label, NULL, defers)) {
     for (size_t j = 0; j < switch_data->case_count; j++) {
       free(case_labels[j]);
     }
@@ -254,8 +255,11 @@ int ir_lower_switch_statement(IRLoweringContext *context,
       return 0;
     }
 
+    // The case body is a scope of its own. Passing the live defer chain lets
+    // a `defer` written inside a case run when that case ends, whether it
+    // falls through to the next label or breaks out.
     if (clause->body && !ir_lower_statement_with_defers(context, function,
-                                                        clause->body, NULL)) {
+                                                        clause->body, defers)) {
       ir_pop_control_frame(context);
       for (size_t j = 0; j < switch_data->case_count; j++) {
         free(case_labels[j]);

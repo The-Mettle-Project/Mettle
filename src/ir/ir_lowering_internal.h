@@ -15,10 +15,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+typedef struct IRDeferScope IRDeferScope;
+
 typedef struct {
   char *break_label;
   char *continue_label;
   char *user_label; // optional source-level label for labeled break/continue
+  /* The defer chain in effect where this loop or switch was entered. A
+     `break` or `continue` targeting this frame leaves every scope between the
+     jump and here, so those scopes' deferred statements run before it. */
+  IRDeferScope *defers;
 } IRControlFrame;
 
 /* One local's binding in the function being lowered. A local is addressed by
@@ -93,10 +99,10 @@ typedef struct {
   size_t capacity;
 } IRDeferStack;
 
-typedef struct IRDeferScope {
+struct IRDeferScope {
   IRDeferStack stack;
   struct IRDeferScope *parent;
-} IRDeferScope;
+};
 
 extern int g_ir_lowering_explain;
 
@@ -208,7 +214,8 @@ int ir_emit_switch_range_dispatch(IRLoweringContext *context,
                                          SourceLocation loc);
 
 int ir_lower_switch_statement(IRLoweringContext *context,
-                                     IRFunction *function, ASTNode *statement);
+                                     IRFunction *function, ASTNode *statement,
+                                     IRDeferScope *defers);
 
 int ir_lower_match_statement(IRLoweringContext *context,
                                     IRFunction *function, ASTNode *statement,
@@ -289,11 +296,13 @@ int ir_emit_safety_check(IRLoweringContext *context, IRFunction *function,
 int ir_push_labeled_control_frame(IRLoweringContext *context,
                                          const char *break_label,
                                          const char *continue_label,
-                                         const char *user_label);
+                                         const char *user_label,
+                                         IRDeferScope *defers);
 
 int ir_push_control_frame(IRLoweringContext *context,
                                  const char *break_label,
-                                 const char *continue_label);
+                                 const char *continue_label,
+                                 IRDeferScope *defers);
 
 void ir_pop_control_frame(IRLoweringContext *context);
 
@@ -306,6 +315,22 @@ const char *ir_find_labeled_break(IRLoweringContext *context,
 
 const char *ir_find_labeled_continue(IRLoweringContext *context,
                                             const char *user_label);
+
+/* The frame a `break` / `continue` written here would jump to. `user_label`
+   is NULL for the bare forms. Returns NULL when there is no such frame; the
+   caller reports that as the error. */
+const IRControlFrame *ir_break_target_frame(IRLoweringContext *context,
+                                            const char *user_label);
+
+const IRControlFrame *ir_continue_target_frame(IRLoweringContext *context,
+                                               const char *user_label);
+
+/* Run the deferred statements of every scope from `from` up to `stop`,
+   innermost first, leaving `stop` itself alone. `errdefer` entries are
+   skipped: they belong to the function's return, and a jump is not one. */
+int ir_emit_defers_until_scope(IRLoweringContext *context,
+                               IRFunction *function, const IRDeferScope *from,
+                               const IRDeferScope *stop);
 
 int ir_defer_stack_push(IRLoweringContext *context, IRDeferStack *stack,
                                ASTNode *node, int is_err);

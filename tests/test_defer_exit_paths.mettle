@@ -1,0 +1,137 @@
+// Deferred statements on the four exit paths that used to skip them:
+// break, continue, labeled break/continue, and a switch case body.
+//
+// Regression: each of these jumped straight to its target label without
+// emitting the deferred statements of the scopes it left, so a `defer free(p)`
+// in a loop leaked on every break. The printed order is the contract; it is
+// LIFO within a scope and innermost scope first.
+import "std/io";
+
+fn nested_break() -> int32 {
+  defer println("fn");
+  var i: int32 = 0;
+  while (i < 3) {
+    defer println("loop");
+    {
+      defer println("block");
+      {
+        defer println("inner");
+        if (i == 0) { break; }
+      }
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn nested_continue() -> int32 {
+  var i: int32 = 0;
+  while (i < 2) {
+    defer println("c-loop");
+    i = i + 1;
+    {
+      defer println("c-block");
+      if (i == 1) { continue; }
+    }
+    println("c-tail");
+  }
+  return 0;
+}
+
+// `break outer` leaves both loops, so both bodies' defers run, inner first.
+fn labeled_break() -> int32 {
+  outer: while (1) {
+    defer println("l-outer");
+    var j: int32 = 0;
+    while (j < 2) {
+      defer println("l-inner");
+      break outer;
+    }
+  }
+  return 0;
+}
+
+// `continue outer` ends the outer iteration, so the inner body's defer runs
+// and then the outer body's.
+fn labeled_continue() -> int32 {
+  var n: int32 = 0;
+  outer: while (n < 2) {
+    defer println("k-outer");
+    n = n + 1;
+    var j: int32 = 0;
+    while (j < 2) {
+      defer println("k-inner");
+      continue outer;
+    }
+  }
+  return 0;
+}
+
+// A case body is a scope. Its defer runs when the case ends, whether it falls
+// off the end or breaks out.
+fn switch_case(v: int32) -> int32 {
+  switch (v) {
+    case 1: {
+      defer println("s-case1");
+      println("s-body1");
+    }
+    case 2: {
+      defer println("s-case2");
+      println("s-body2");
+      break;
+    }
+  }
+  println("s-after");
+  return 0;
+}
+
+// A break inside a switch exits the switch only, so the enclosing loop's
+// defer must NOT run at the break; it runs when the iteration ends.
+fn switch_in_loop() -> int32 {
+  var i: int32 = 0;
+  while (i < 2) {
+    defer println("w-loop");
+    switch (i) {
+      case 0: {
+        defer println("w-case");
+        break;
+      }
+    }
+    println("w-after-switch");
+    i = i + 1;
+  }
+  return 0;
+}
+
+// errdefer belongs to the function's return. A break is not one.
+fn break_with_errdefer(n: int32) -> int32 {
+  errdefer println("e-err");
+  var i: int32 = 0;
+  while (i < 3) {
+    defer println("e-loop");
+    break;
+  }
+  return n;
+}
+
+fn main() -> int32 {
+  println("nested_break");
+  var a: int32 = nested_break();
+  println("nested_continue");
+  var b: int32 = nested_continue();
+  println("labeled_break");
+  var c: int32 = labeled_break();
+  println("labeled_continue");
+  var d: int32 = labeled_continue();
+  println("switch_case_1");
+  var e: int32 = switch_case(1);
+  println("switch_case_2");
+  var f: int32 = switch_case(2);
+  println("switch_in_loop");
+  var g: int32 = switch_in_loop();
+  println("errdefer_ok");
+  var h: int32 = break_with_errdefer(0);
+  println("errdefer_err");
+  var k: int32 = break_with_errdefer(7);
+  return 0;
+}

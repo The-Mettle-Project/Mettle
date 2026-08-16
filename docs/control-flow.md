@@ -285,9 +285,9 @@ Rules and limits:
   before.
 - Labels live in their own namespace and do not collide with variable or
   function names.
-- The jump skips every deferred statement between it and the labeled loop,
-  including the labeled loop's own. See
-  [What defer does not cover](#what-defer-does-not-cover).
+- The jump runs the deferred statements of every scope it leaves, innermost
+  first, including the labeled loop's own body. See
+  [Jumping out of a scope](#jumping-out-of-a-scope).
 
 ## Return
 
@@ -427,56 +427,86 @@ fn work(n: int32) -> int32 {
 `defer always`. The same split applies when a function body ends without a
 `return`.
 
-### What defer does not cover
+### Jumping out of a scope
 
-Four ways out of a scope skip the deferred statements. Free the resource by
-hand on these paths.
-
-**`break` skips the loop body's deferred statements.**
+`break` and `continue` run the deferred statements of every scope they leave,
+innermost first, before the jump. So does `return`.
 
 ```mettle
-fn br() -> int32 {
+fn scan() -> int32 {
   var i: int32 = 0;
   while (i < 3) {
-    defer println("iter defer");
-    println("iter body");
+    defer println("iteration cleanup");
+    println("iteration start");
     i = i + 1;
-    if (i == 1) { break; }
+    if (i == 2) { break; }
   }
+  println("after loop");
   return 0;
 }
 ```
 
 ```
-iter body
+iteration start
+iteration cleanup
+iteration start
+iteration cleanup
+after loop
 ```
 
-**`continue` skips them for the iteration it leaves.** Later iterations that
-reach the end of the body run them as usual.
-
-**`break name` and `continue name` skip every deferred statement between the
-jump and the labeled loop,** including the labeled loop's own.
-
-**A `switch` case body never runs its deferred statements.** A `defer` written
-inside a case is dropped.
+`break name` and `continue name` leave more scopes, so they run more. Both loop
+bodies below clean up, inner first:
 
 ```mettle
-fn sw() -> int32 {
-  switch (1) {
-    case 1: {
-      defer println("case defer");   // never runs
-      println("case 1");
+fn find() -> int32 {
+  outer: while (1) {
+    defer println("outer cleanup");
+    var j: int32 = 0;
+    while (j < 2) {
+      defer println("inner cleanup");
+      break outer;
     }
   }
+  println("after loops");
+  return 0;
+}
+```
+
+```
+inner cleanup
+outer cleanup
+after loops
+```
+
+A `switch` case body is a scope of its own, and it cleans up when the case
+ends, whether the case breaks out or falls through to the next label:
+
+```mettle
+fn pick(v: int32) -> int32 {
+  switch (v) {
+    case 1: {
+      defer println("case cleanup");
+      println("case 1");
+      break;
+    }
+  }
+  println("after switch");
   return 0;
 }
 ```
 
 ```
 case 1
+case cleanup
+after switch
 ```
 
-These four gaps are recorded in [Known Limitations](known-limitations.md).
+A `break` inside a `switch` exits the switch, so it runs the case body's
+deferred statements and leaves an enclosing loop's alone. Those run when the
+iteration ends, as usual.
+
+`errdefer` is the exception: it belongs to the function's return, and a jump is
+not one. A `break` past an `errdefer` does not fire it.
 
 ### Cost
 

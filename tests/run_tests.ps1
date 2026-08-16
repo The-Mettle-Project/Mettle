@@ -5826,6 +5826,57 @@ catch {
   Write-CaseResult -Name "internal_link_abi_float_return" -Passed $false -Reason $_.Exception.Message
 }
 
+# Deferred statements must run on every exit path, not only on `return` and
+# falling off the end of a scope. Regression: `break`, `continue`, labeled
+# `break`/`continue`, and a `switch` case body each jumped to their target
+# without emitting the deferred statements of the scopes they left, so a
+# `defer free(p)` in a loop leaked on every break. The order below is the
+# contract: LIFO within a scope, innermost scope first, and `errdefer` only on
+# a non-zero return.
+$deferExitPathsExpected = @(
+  "nested_break",
+  "inner", "block", "loop", "fn",
+  "nested_continue",
+  "c-block", "c-loop", "c-block", "c-tail", "c-loop",
+  "labeled_break",
+  "l-inner", "l-outer",
+  "labeled_continue",
+  "k-inner", "k-outer", "k-inner", "k-outer",
+  "switch_case_1",
+  "s-body1", "s-case1", "s-body2", "s-case2", "s-after",
+  "switch_case_2",
+  "s-body2", "s-case2", "s-after",
+  "switch_in_loop",
+  "w-case", "w-after-switch", "w-loop", "w-after-switch", "w-loop",
+  "errdefer_ok",
+  "e-loop",
+  "errdefer_err",
+  "e-loop", "e-err"
+) -join "`r`n"
+
+foreach ($deferMode in @("debug", "release")) {
+  $total++
+  $caseName = "defer_exit_paths_$deferMode"
+  try {
+    $exePath = Join-Path $tmpDir "$caseName.exe"
+    $extraArgs = @()
+    if ($deferMode -eq "release") { $extraArgs = @("--release") }
+    $buildOut = & $CompilerPath --build --linker internal @extraArgs tests\test_defer_exit_paths.mettle -o $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "defer exit-path build failed ($deferMode): $buildOut"
+    }
+    $runOut = (& $exePath 2>&1 | Out-String).TrimEnd()
+    if ($runOut -ne $deferExitPathsExpected) {
+      throw "defer exit-path output mismatch ($deferMode):`n--- expected ---`n$deferExitPathsExpected`n--- got ---`n$runOut"
+    }
+    Write-CaseResult -Name $caseName -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name $caseName -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # Whole-struct assignment must copy every byte, not just the first machine word.
 # Regression: structs > 8 bytes (ThreeI32, TwoF64, Mixed) used to keep only the
 # first 8 bytes; trailing fields were zero/garbage. Verify the binary path produces byte-perfect copies.
