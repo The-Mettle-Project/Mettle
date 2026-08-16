@@ -269,9 +269,8 @@ echo Compiling memory-safety runtime (opt-in: --safe)...
 %CC% %RUNTIME_CFLAGS% -c src\runtime\safety.c -o obj\runtime\safety.o
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
-echo Compiling swap runtime (opt-in: quiesce)...
-%CC% %RUNTIME_CFLAGS% -c src\runtime\swap.c -o obj\runtime\swap.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
+rem The swap runtime is written in Mettle and compiled by the compiler this
+rem build produces, so it is staged after bin\mettle.exe exists.
 
 echo Compiling atomics helpers (opt-in: std/thread)...
 %CC% %RUNTIME_CFLAGS% -DMETTLE_ATOMICS_IN_FREESTANDING -c src\runtime\atomics.c -o obj\runtime\atomics.o
@@ -434,8 +433,10 @@ copy /Y obj\runtime\crash_handler.o bin\runtime\crash_handler.o >nul
 copy /Y obj\runtime\crash_handler.o bin\runtime\crash_handler.obj >nul
 copy /Y obj\runtime\safety.o bin\runtime\safety.o >nul
 copy /Y obj\runtime\safety.o bin\runtime\safety.obj >nul
-copy /Y obj\runtime\swap.o bin\runtime\swap.o >nul
-copy /Y obj\runtime\swap.o bin\runtime\swap.obj >nul
+echo Compiling swap runtime from Mettle source...
+bin\mettle.exe --release --emit-obj src\runtime\swap.mettle -o bin\runtime\swap.o
+if %ERRORLEVEL% NEQ 0 exit /b 1
+copy /Y bin\runtime\swap.o bin\runtime\swap.obj >nul
 copy /Y obj\runtime\atomics.o bin\runtime\atomics.o >nul
 copy /Y obj\runtime\atomics.o bin\runtime\atomics.obj >nul
 copy /Y obj\runtime\profile.o bin\runtime\profile.o >nul

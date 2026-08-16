@@ -1,0 +1,105 @@
+// Staged code swaps, applied only at a quiesce point.
+//
+// This is a runtime component written in Mettle. V.3.3 asks that the runtime
+// be legible: readable as source, steppable in the same debugger, visible in
+// the same profiler, reporting through the same diagnostics. A component
+// written in C is none of those things to a Mettle programmer, so the newest
+// runtime component is the one that should lead.
+//
+// It is a fair first port because it touches no operating system at all: a
+// fixed table and pointer-sized stores. Nothing here needs a page mapped, a
+// handle opened, or a libc. It is compiled by the compiler it ships with,
+// after that compiler is built.
+//
+// A swap replaces a function in a running process. The hard half is not the
+// code, it is deciding *when*: a replacement that lands while the old body is
+// mid-execution, or between two operations that were meant to be one, is a
+// miscompile that happens to occur at run time.
+//
+// Mettle answers that by refusing to choose. The program names the moment with
+// `quiesce;`, and nothing is applied anywhere else. Staging a swap records an
+// intent; the intent takes effect at the next point the programmer wrote, and
+// at no other. That is the same rule the rest of the language follows: nothing
+// runs at a point you did not author.
+//
+// The binding is a slot, not a patched instruction. A swappable call reads a
+// function pointer from a slot and calls through it, so applying a swap is a
+// single pointer-sized store. Two consequences matter:
+//
+//  - It is sound without stopping the world. A thread already inside the old
+//    body keeps running the old body, which is still resident; only later
+//    calls see the new one. Rewriting instructions under a running thread
+//    would need every other thread halted, and halting them is exactly the
+//    unauthored control flow this design refuses.
+//  - Nothing is executable-page-writable. The process never needs W^X toggled,
+//    because no code is ever modified.
+//
+// The cost is one indirection per call, paid only by functions that opted in,
+// and a program that stages nothing never references these symbols and does
+// not link this object.
+
+// A fixed table rather than a growing one: this allocates nothing, so a swap
+// cannot fail for want of memory at the moment a program is trying to replace
+// the code that was going wrong. Staging past the limit is refused and says
+// so, which is a better failure than an allocation inside a quiesce point.
+const SWAP_MAX_PENDING: int64 = 256;
+
+var g_slots: int64[256];
+var g_replacements: int64[256];
+var g_pending_count: int64 = 0;
+
+// Record that `slot` should point at `replacement` from the next quiesce point
+// onward. Restaging a slot replaces the earlier intent: applying both in order
+// would reach the same end state, but it would burn table space and make the
+// pending count disagree with the number of slots that will move.
+export fn mettle_swap_stage(slot: rawptr, replacement: rawptr) -> int32 {
+    var slot_bits: int64 = (int64)slot;
+    if (slot_bits == 0) {
+        return 0;
+    }
+
+    var i: int64 = 0;
+    while (i < g_pending_count) {
+        if (g_slots[i] == slot_bits) {
+            g_replacements[i] = (int64)replacement;
+            return 1;
+        }
+        i = i + 1;
+    }
+
+    if (g_pending_count >= SWAP_MAX_PENDING) {
+        return 0;
+    }
+
+    g_slots[g_pending_count] = slot_bits;
+    g_replacements[g_pending_count] = (int64)replacement;
+    g_pending_count = g_pending_count + 1;
+    return 1;
+}
+
+// Apply every staged swap. This is what `quiesce;` lowers to, so it runs only
+// where the program said it may. Each store is pointer-sized and aligned, so a
+// caller already inside the old body finishes in the old body and the next
+// call takes the new one: there is no window in which a slot holds anything
+// other than one of the two functions.
+export fn mettle_swap_apply() -> int64 {
+    var applied: int64 = g_pending_count;
+    var i: int64 = 0;
+    while (i < g_pending_count) {
+        var target: int64* = (int64*)g_slots[i];
+        *target = g_replacements[i];
+        i = i + 1;
+    }
+    g_pending_count = 0;
+    return applied;
+}
+
+// How many swaps are staged and not yet applied.
+export fn mettle_swap_pending() -> int64 {
+    return g_pending_count;
+}
+
+// Drop staged swaps without applying them.
+export fn mettle_swap_discard() {
+    g_pending_count = 0;
+}

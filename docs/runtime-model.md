@@ -170,3 +170,24 @@ every build. The cost of swappability is paid where it is asked for.
 The staging table is fixed-size and allocates nothing, so a swap cannot fail
 for want of memory at the moment a program is trying to replace the code that
 was going wrong. Restaging a slot replaces the earlier intent.
+
+## The runtime is being written in Mettle
+
+A runtime you cannot inspect is indistinguishable from a runtime that is
+lying. The rule is that it reads as source, steps in the same debugger and
+appears in the same profiler, which a component written in C does not do for a
+Mettle programmer.
+
+The swap runtime is the first component to comply. `src/runtime/swap.mettle`
+is compiled by the compiler this build produces, after that compiler is
+linked, and staged into `bin/runtime/` beside its source. It is ordinary
+Mettle code, so `-d`, `--debug-hooks` and `--profile-runtime` reach it the
+same way they reach a program. It is also smaller than the C it replaced.
+
+The newest component leads rather than being exempt: a rule that applies only
+to future work is a rule nobody has tested. The remaining five
+(`crash_handler`, `profile`, `safety`, `debug`, `freestanding`) each call an
+operating system directly, so porting them needs Mettle bindings for page
+mapping, exception handling and process control first. `swap` was the honest
+place to start because it touches none of that: a fixed table and
+pointer-sized stores.

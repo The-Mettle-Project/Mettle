@@ -782,6 +782,17 @@ bounds. The first of those is the precondition for everything in Part III.
   emitted binary for a string only that component carries. It checks both
   directions, since an absence that is never present proves nothing.
 - Written in Mettle, in the same debugger, in the same profiler. *(V.3.3)*
+  **Started, and the pattern works.** The swap runtime is written in Mettle
+  (`src/runtime/swap.mettle`), compiled by the compiler it ships with, after
+  that compiler is built. It ships as source, steps in Mettle's own debugger
+  and appears in its own profiler because it is ordinary Mettle code, and it
+  came out smaller than the C it replaced. The newest runtime component leads
+  rather than being exempt. What remains is the older five, and they are
+  harder for a real reason rather than an accident of order: `crash_handler`,
+  `profile`, `safety`, `debug` and `freestanding` each reach an operating
+  system directly, so porting them means giving Mettle bindings for page
+  mapping, exception handling and process control first. `swap` was a fair
+  starting point precisely because it touches none of that.
 - The Part V.5 test applied to every single addition, individually, with no
   aggregate exceptions.
 

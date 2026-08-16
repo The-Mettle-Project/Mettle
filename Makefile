@@ -144,7 +144,7 @@ $(HOST_RUNTIME_OBJECT): $(RUNTIMEDIR)/freestanding.c \
 $(HOST_STARTUP_OBJECT): $(RUNTIMEDIR)/host_startup.c | $(OBJDIR)
 	$(CC) $(FREESTANDING_CFLAGS) -c $< -o $@
 
-bundle-runtime: $(HOST_STARTUP_OBJECT) | $(BINDIR)
+bundle-runtime: $(HOST_STARTUP_OBJECT) $(TARGET) | $(BINDIR)
 	rm -rf $(BINDIR)/runtime
 	cp -r $(RUNTIMEDIR) $(BINDIR)/runtime
 	$(CC) $(FREESTANDING_CFLAGS) -c $(RUNTIMEDIR)/freestanding.c -o $(OBJDIR)/runtime/freestanding.o
@@ -157,12 +157,11 @@ bundle-runtime: $(HOST_STARTUP_OBJECT) | $(BINDIR)
 		-c $(RUNTIMEDIR)/atomics.c -o $(OBJDIR)/runtime/atomics.o
 	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/crash_handler.c -o $(OBJDIR)/runtime/crash_handler.o
 	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/safety.c        -o $(OBJDIR)/runtime/safety.o
-	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/swap.c          -o $(OBJDIR)/runtime/swap.o
 	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/profile.c       -o $(OBJDIR)/runtime/profile.o
 	cp $(OBJDIR)/runtime/atomics.o       $(BINDIR)/runtime/atomics.o
 	cp $(OBJDIR)/runtime/crash_handler.o $(BINDIR)/runtime/crash_handler.o
 	cp $(OBJDIR)/runtime/safety.o        $(BINDIR)/runtime/safety.o
-	cp $(OBJDIR)/runtime/swap.o          $(BINDIR)/runtime/swap.o
+	$(TARGET) --release --emit-obj $(RUNTIMEDIR)/swap.mettle -o $(BINDIR)/runtime/swap.o
 	cp $(OBJDIR)/runtime/profile.o       $(BINDIR)/runtime/profile.o
 
 $(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
