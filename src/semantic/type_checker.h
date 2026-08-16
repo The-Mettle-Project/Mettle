@@ -16,6 +16,9 @@ typedef struct ComptimeExpansionTable ComptimeExpansionTable;
 /* Backing store for comptime sequence values, with one memoized run per
    (type, query). Opaque here; it lives in type_query.c. */
 typedef struct ComptimeSequenceArena ComptimeSequenceArena;
+/* One `comptime for` binding in effect outside any scope; see
+   comptime_bindings below. Defined in comptime_expand.c. */
+struct ComptimeBindingSlot;
 
 #include "symbol_table.h"
 
@@ -57,6 +60,15 @@ typedef struct {
 
   /* Created on the first `comptime for`; NULL in a program that has none. */
   ComptimeExpansionTable *expansions;
+
+  /* Expansion bindings in effect, innermost last. A statement-scope expansion
+   * puts its binding in the block's own scope; a module-scope one has no such
+   * scope to use, so its binding lives here for the length of one declaration.
+   * Both read the same expansion-table entry, so the two agree by
+   * construction. */
+  struct ComptimeBindingSlot *comptime_bindings;
+  size_t comptime_binding_count;
+  size_t comptime_binding_capacity;
 
   /* `Kind`, the enum `.kind` answers with. Registered by the compiler rather
    * than declared in a prelude, so reflection needs no import and no flag, and
@@ -205,8 +217,41 @@ Type *type_checker_canon_type(TypeChecker *checker, Type *type);
  * one clone of the body per field, spliced into the block in field order.
  * Runs before the block's statements are checked, because each expansion is
  * checked against a different field type. Returns 0 with a diagnostic
- * reported if a directive could not expand, leaving `block` unmodified. */
-int type_checker_expand_comptime_block(TypeChecker *checker, ASTNode *block);
+ * reported if a directive could not expand, leaving `block` unmodified.
+ *
+ * `module_scope` says what the block is a list of. Inside a function it is a
+ * list of statements, and each iteration is spliced in as one block, which is
+ * also the scope its binding lives in. At module scope it is a list of
+ * declarations, so the iteration's declarations are spliced in individually --
+ * a generated function has to land in the module, not in a nested scope that
+ * would take it back out again. */
+int type_checker_expand_comptime_block(TypeChecker *checker, ASTNode *block,
+                                       int module_scope);
+
+/* A generated module-scope declaration is checked with its iteration's binding
+ * in effect and its expansion note pushed, so `f.offset` resolves and every
+ * diagnostic names the iteration. Paired; `leave` undoes exactly what `enter`
+ * did. No-op for a declaration the programmer wrote. */
+typedef struct {
+  size_t bindings_pushed;
+  size_t notes_pushed;
+} ComptimeDeclScope;
+void type_checker_enter_expansion_decl(TypeChecker *checker,
+                                       const ASTNode *declaration,
+                                       ComptimeDeclScope *scope);
+void type_checker_leave_expansion_decl(TypeChecker *checker,
+                                       ComptimeDeclScope *scope);
+
+/* The binding a generated declaration is being checked under, or NULL. It is
+ * the same kind of symbol a statement-scope expansion puts in its block's
+ * scope, so the two resolve identically; only where it is kept differs. */
+Symbol *type_checker_lookup_expansion_binding(const TypeChecker *checker,
+                                              const char *name);
+
+/* Report every `ident(...)` that reached the checker unresolved. One can only
+ * survive expansion if its own directive failed, so this reports the misuse
+ * (an `ident(...)` outside any `comptime for`) rather than cascading. */
+int type_checker_check_composed_names(TypeChecker *checker, ASTNode *node);
 
 /* The expansion note for `block`, or NULL if `block` is ordinary source. The
  * caller pushes it as a reporter note frame around the block's check so every

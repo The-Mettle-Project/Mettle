@@ -1,0 +1,27 @@
+L	bytesum_before	0	S	18
+L	bytesum_after	0	V	24
+L	i16_before	0	S	32
+L	i16_after	0	V	38
+L	i64_before	0	S	46
+L	i64_after	0	V	52
+L	dot_before	0	S	60
+L	dot_after	0	V	67
+L	extremum_before	0	S	75
+L	extremum_after	0	V	81
+L	count_before	0	S	89
+L	count_after	0	V	95
+L	shift_before	0	S	102
+L	shift_after	0	V	107
+L	fill_before	0	S	114
+L	fill_after	0	V	119
+L	fill_after	1	V	121
+L	search_before	0	S	129
+L	search_after	0	V	134
+L	explainshift_before	0	S	145
+L	explainshift_after	0	V	150
+L	explainvshift_before	0	S	157
+L	explainvshift_after	0	V	162
+L	noinline_before	0	S	176
+C	noinline_before	scale_before	0	R	176
+L	noinline_after	0	V	183
+C	noinline_after	scale_after	0	I	183

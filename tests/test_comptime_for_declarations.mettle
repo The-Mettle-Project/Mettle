@@ -1,0 +1,98 @@
+// `comptime for` at module scope generates declarations, not statements. The
+// same directive, spliced into a list of declarations instead of a list of
+// statements.
+//
+// Each iteration needs a different name, so the name is composed from the
+// binding: `ident("prefix", f.name)` joins compile-time strings the way
+// `typeof` and `offsetof` are written, out of an identifier and call syntax.
+
+struct Packet {
+  kind: uint8;
+  seq: uint32;
+  payload: int64;
+}
+
+struct Empty {
+}
+
+// A struct, a constant and a function per field, all named from the field.
+comptime for f in typeof(Packet).fields {
+  struct ident("Slot_", f.name) {
+    at: int64;
+  }
+
+  const ident("OFFSET_", f.name): int64 = f.offset;
+
+  fn ident("end_of_", f.name)(base: int64) -> int64 {
+    return base + f.offset + f.type.size;
+  }
+}
+
+// A type with no fields generates nothing, which is an answer, not an error.
+comptime for f in typeof(Empty).fields {
+  fn ident("never_", f.name)() -> int64 {
+    return 0;
+  }
+}
+
+// A nested directive at module scope reads both bindings: there is no
+// enclosing scope holding the outer one, so the expansion carries it.
+struct Axis {
+  step: int16;
+}
+
+comptime for o in typeof(Axis).fields {
+  comptime for i in typeof(Axis).fields {
+    fn ident("both_", o.name, "_", i.name)() -> int64 {
+      return o.type.size * 10 + i.offset;
+    }
+  }
+}
+
+// A generated declaration is checked like any other, so a `@test` on one runs
+// under `mettle test` with no special handling anywhere.
+comptime for f in typeof(Packet).fields {
+  @test fn ident("offset_is_ordered_", f.name)() {
+    assert(f.offset >= f.index);
+  }
+}
+
+fn main() -> int32 {
+  // kind:    offset 0, size 1
+  // seq:     offset 4, size 4
+  // payload: offset 8, size 8
+  if (end_of_kind(0) != 1) {
+    return 1;
+  }
+  if (end_of_seq(100) != 108) {
+    return 2;
+  }
+  if (end_of_payload(0) != 16) {
+    return 3;
+  }
+
+  // The generated constants carry the same offsets.
+  if (OFFSET_kind != 0) {
+    return 4;
+  }
+  if (OFFSET_seq != 4) {
+    return 5;
+  }
+  if (OFFSET_payload != 8) {
+    return 6;
+  }
+
+  // The generated structs are ordinary types.
+  var slot: Slot_seq;
+  slot.at = 7;
+  if (slot.at != 7) {
+    return 7;
+  }
+
+  // step: size 2, offset 0
+  if (both_step_step() != 20) {
+    return 8;
+  }
+
+  return 0;
+}

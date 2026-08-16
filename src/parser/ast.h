@@ -106,6 +106,10 @@ typedef struct {
   // `var`/`const` declarations always leave this 0.
   int structural_type;
   AstAddressSpace address_space;
+  /* `ident("prefix", f.name)` in the name position: the parts to join, held
+   * until the expander resolves them and writes the answer into `name`. NULL
+   * on every declaration whose name was spelled out. */
+  ASTNode *composed_name;
 } VarDeclaration;
 
 typedef struct {
@@ -149,6 +153,8 @@ typedef struct {
   char **captured_types;
   size_t captured_count;
   char *env_struct_name;
+  /* See VarDeclaration::composed_name. */
+  ASTNode *composed_name;
 } FunctionDeclaration;
 
 // A thin function value (`&func`, or a non-capturing lambda) implicitly wrapped
@@ -176,6 +182,8 @@ typedef struct {
   char **type_params;
   char **type_param_traits;
   size_t type_param_count;
+  /* See VarDeclaration::composed_name. */
+  ASTNode *composed_name;
 } StructDeclaration;
 
 typedef struct {
@@ -607,6 +615,8 @@ ASTNode *ast_create_comptime_for(const char *binding_name, ASTNode *sequence,
 int ast_fold_member_access_to_int(ASTNode *node, long long value);
 /* Same, for a query that folded to a string (`.name`). */
 int ast_fold_member_access_to_string(ASTNode *node, const char *value);
+/* Replace an `ident(...)` call node with the identifier it composed. */
+int ast_fold_call_to_identifier(ASTNode *node, const char *name);
 ASTNode *ast_create_case_clause(ASTNode *value, ASTNode *body, int is_default,
                                 SourceLocation location);
 ASTNode *ast_create_switch_statement(ASTNode *expression, ASTNode **cases,

@@ -42,6 +42,16 @@ typedef struct {
    * target-neutral gpu_* intrinsics. Off for normal CPU compiles, so member
    * access on an ordinary struct named e.g. `block` is unaffected. */
   int gpu_mode;
+  /* How many `comptime for` bodies enclose the construct being parsed.
+   * `ident(...)` composes a declaration name only in here: outside, a function
+   * or struct the programmer happened to call `ident` keeps its name. */
+  int comptime_depth;
+  /* A composed name between being parsed and being attached to the declaration
+   * it names. A declaration parse that gives up in between abandons it, so the
+   * next one collects it and `parser_destroy` collects the last. That keeps the
+   * many error returns in the declaration parsers free of cleanup they would
+   * only get wrong. */
+  ASTNode *pending_composed_name;
 } Parser;
 
 // Function declarations

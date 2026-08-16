@@ -1,0 +1,49 @@
+struct Cell<T> {
+    value: T;
+
+    method get() -> T {
+        return this.value;
+    }
+}
+
+struct Pair<A, B> {
+    left: Cell<A>;
+    right: Cell<B>;
+}
+
+/* Declared before Point, so Cell<int32> has to land ahead of it while
+ * Cell<Point> lands after Point, which is declared further down. */
+struct Early {
+    c: Cell<int32>;
+    many: Cell<int32>[3];
+    p: Cell<int32>*;
+}
+
+struct Point {
+    x: int32;
+}
+
+struct Late {
+    c: Cell<Point>;
+    nested: Pair<int32, int64>;
+}
+
+fn main() -> int32 {
+    var e: Early;
+    e.c.value = 5;
+    e.many[2].value = 6;
+
+    var side: Cell<int32>;
+    side.value = 7;
+    e.p = &side;
+
+    var l: Late;
+    l.c.value.x = 8;
+    l.nested.left.value = 9;
+    l.nested.right.value = 7;
+
+    var wide: int64 = l.nested.right.get();
+    var from_early: int32 = e.c.get() + e.many[2].get() + e.p->get();
+    var from_late: int32 = l.c.get().x + l.nested.left.get() + (int32)wide;
+    return from_early + from_late;
+}

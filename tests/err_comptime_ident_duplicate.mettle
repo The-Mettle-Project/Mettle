@@ -1,0 +1,19 @@
+// A module-scope body whose declaration name does not come from the binding
+// generates the same name every iteration. One of those declarations is not in
+// the program, and a generator that quietly drops half its output is exactly
+// the under-delivery contracts exist to prevent.
+
+struct Pair {
+  a: int32;
+  b: int32;
+}
+
+comptime for f in typeof(Pair).fields {
+  fn probe() -> int64 {
+    return f.offset;
+  }
+}
+
+fn main() -> int32 {
+  return 0;
+}

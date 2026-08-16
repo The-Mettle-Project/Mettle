@@ -1,6 +1,32 @@
 // Type checker: expression type inference and checking.
 #include "type_checker_internal.h"
+#include "monomorphize.h"
 #include "string_intern.h"
+
+/* `p->m()` and `(*p).m()` both parse to a method call whose object is a deref of
+ * a pointer-to-struct. That spelling selects the lifted method that takes the
+ * receiver as a pointer, so the call passes `p` itself and the method can write
+ * through it. Returns the pointer expression, or NULL for a value receiver. */
+static ASTNode *type_checker_pointer_receiver(TypeChecker *checker,
+                                              ASTNode *object) {
+  UnaryExpression *unary = NULL;
+  Type *inner_type = NULL;
+
+  if (!object || object->type != AST_UNARY_EXPRESSION) {
+    return NULL;
+  }
+  unary = (UnaryExpression *)object->data;
+  if (!unary || !unary->operator|| strcmp(unary->operator, "*") != 0 ||
+      !unary->operand) {
+    return NULL;
+  }
+  inner_type = type_checker_infer_type(checker, unary->operand);
+  if (!inner_type || inner_type->kind != TYPE_POINTER || !inner_type->base_type ||
+      inner_type->base_type->kind != TYPE_STRUCT) {
+    return NULL;
+  }
+  return unary->operand;
+}
 
 Type *type_checker_method_receiver_struct_type(Type *receiver_type) {
   if (!receiver_type) {
@@ -21,6 +47,7 @@ int type_checker_desugar_struct_method_call(TypeChecker *checker,
                                                    CallExpression *call) {
   Type *receiver_type = NULL;
   Type *struct_type = NULL;
+  ASTNode *pointer_receiver = NULL;
   char *mangled_name = NULL;
   ASTNode **new_args = NULL;
   size_t name_len = 0;
@@ -42,16 +69,57 @@ int type_checker_desugar_struct_method_call(TypeChecker *checker,
     return 0;
   }
 
-  name_len = strlen(struct_type->name) + 1 + strlen(call->function_name) + 1;
-  mangled_name = malloc(name_len);
-  if (!mangled_name) {
-    type_checker_set_error_at_location(
-        checker, expression->location,
-        "Out of memory while resolving struct method call");
-    return 0;
+  /* A pointer receiver resolves to the pointer-taking form of the method, so
+   * that writes to `this` reach the caller's struct. Falling back to the value
+   * form keeps a hand-written `S_m(s: S)` free function callable as `p->m()`. */
+  pointer_receiver = type_checker_pointer_receiver(checker, call->object);
+  if (pointer_receiver) {
+    name_len = strlen(struct_type->name) + 1 + strlen(call->function_name) +
+               strlen(MONO_PTR_RECEIVER_SUFFIX) + 1;
+    mangled_name = malloc(name_len);
+    if (!mangled_name) {
+      type_checker_set_error_at_location(
+          checker, expression->location,
+          "Out of memory while resolving struct method call");
+      return 0;
+    }
+    snprintf(mangled_name, name_len, "%s_%s%s", struct_type->name,
+             call->function_name, MONO_PTR_RECEIVER_SUFFIX);
+    if (symbol_table_lookup(checker->symbol_table, mangled_name)) {
+      /* Drop the deref that the parser wrapped around the pointer, leaving the
+       * pointer itself as the receiver. The deref owned it as a child, so the
+       * call node adopts it before the now-empty deref is freed. */
+      ASTNode *deref = call->object;
+      UnaryExpression *unary = (UnaryExpression *)deref->data;
+      for (size_t i = 0; i < expression->child_count; i++) {
+        if (expression->children[i] == deref) {
+          expression->children[i] = pointer_receiver;
+          break;
+        }
+      }
+      unary->operand = NULL;
+      deref->child_count = 0;
+      ast_destroy_node(deref);
+      call->object = pointer_receiver;
+    } else {
+      free(mangled_name);
+      mangled_name = NULL;
+      pointer_receiver = NULL;
+    }
   }
-  snprintf(mangled_name, name_len, "%s_%s", struct_type->name,
-           call->function_name);
+
+  if (!mangled_name) {
+    name_len = strlen(struct_type->name) + 1 + strlen(call->function_name) + 1;
+    mangled_name = malloc(name_len);
+    if (!mangled_name) {
+      type_checker_set_error_at_location(
+          checker, expression->location,
+          "Out of memory while resolving struct method call");
+      return 0;
+    }
+    snprintf(mangled_name, name_len, "%s_%s", struct_type->name,
+             call->function_name);
+  }
 
   if (!symbol_table_lookup(checker->symbol_table, mangled_name)) {
     /* No method by this name. If the receiver struct has a function-pointer or
@@ -3047,9 +3115,15 @@ Type *type_checker_check_binary_expression(TypeChecker *checker,
 
       int left_is_null = type_checker_is_null_pointer_constant(binop->left);
       int right_is_null = type_checker_is_null_pointer_constant(binop->right);
+      /* A rawptr names no element type, so it compares against a pointer of
+       * any element type for the same reason it converts to one: both sides
+       * are an address. `if (memcpy(dst, src, n) != dst)` is the shape. */
+      int rawptr_pair = left_is_pointer && right_is_pointer &&
+                        (type_checker_is_rawptr_type(left_type) ||
+                         type_checker_is_rawptr_type(right_type));
       int comparable = (left_is_pointer && right_is_pointer &&
                         type_checker_types_equal(left_type, right_type)) ||
-                       (left_is_pointer && right_is_null) ||
+                       rawptr_pair || (left_is_pointer && right_is_null) ||
                        (right_is_pointer && left_is_null);
 
       if (!comparable) {

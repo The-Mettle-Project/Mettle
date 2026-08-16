@@ -1,0 +1,37 @@
+struct Cell<T> {
+    value: T;
+
+    method get() -> T {
+        return this.value;
+    }
+}
+
+struct Seeder {
+    seed: int32;
+
+    method make() -> int32 {
+        var c: Cell<int32>;
+        c.value = this.seed;
+        return c.get();
+    }
+}
+
+struct Wrapper<T> {
+    seed: T;
+
+    method make() -> T {
+        var c: Cell<T>;
+        c.value = this.seed;
+        return c.get();
+    }
+}
+
+fn main() -> int32 {
+    var s: Seeder;
+    s.seed = 20;
+
+    var w: Wrapper<int32>;
+    w.seed = 22;
+
+    return s.make() + w.make();
+}

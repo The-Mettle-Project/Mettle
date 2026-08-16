@@ -99,9 +99,18 @@ ASTNode *ast_clone_node(ASTNode *node) {
         src->initializer ? ast_clone_node(src->initializer) : NULL;
     if (dst->initializer)
       ast_add_child(clone, dst->initializer);
+    /* Not a child: a composed name is compile-time material that the expander
+     * consumes, and every pass that walks children runs after it is gone. */
+    dst->composed_name =
+        src->composed_name ? ast_clone_node(src->composed_name) : NULL;
     clone->data = dst;
     break;
   }
+  /* A method carries a FunctionDeclaration like the other two. It used to fall
+   * to the default case and clone to a node with NULL data, which every later
+   * pass then skipped as malformed -- that is how a monomorphized generic
+   * struct lost its methods. */
+  case AST_METHOD_DECLARATION:
   case AST_LAMBDA_EXPRESSION:
   case AST_FUNCTION_DECLARATION: {
     FunctionDeclaration *src = (FunctionDeclaration *)node->data;
@@ -159,6 +168,8 @@ ASTNode *ast_clone_node(ASTNode *node) {
     dst->body = src->body ? ast_clone_node(src->body) : NULL;
     if (dst->body)
       ast_add_child(clone, dst->body);
+    dst->composed_name =
+        src->composed_name ? ast_clone_node(src->composed_name) : NULL;
     clone->data = dst;
     break;
   }
@@ -198,6 +209,8 @@ ASTNode *ast_clone_node(ASTNode *node) {
     } else {
       dst->methods = NULL;
     }
+    dst->composed_name =
+        src->composed_name ? ast_clone_node(src->composed_name) : NULL;
     clone->data = dst;
     break;
   }
@@ -977,6 +990,7 @@ void ast_destroy_node(ASTNode *node) {
       ast_free_string(var_decl->name);
       ast_free_string(var_decl->type_name);
       ast_free_string(var_decl->link_name);
+      ast_destroy_node(var_decl->composed_name);
       free(var_decl);
     }
     break;
@@ -1011,6 +1025,7 @@ void ast_destroy_node(ASTNode *node) {
       free(func_decl->captured_names);
       free(func_decl->captured_types);
       ast_free_string(func_decl->env_struct_name);
+      ast_destroy_node(func_decl->composed_name);
       free(func_decl);
     }
     break;
@@ -1032,6 +1047,7 @@ void ast_destroy_node(ASTNode *node) {
       }
       free(struct_decl->type_params);
       free(struct_decl->type_param_traits);
+      ast_destroy_node(struct_decl->composed_name);
       free(struct_decl);
     }
     break;
@@ -1474,6 +1490,7 @@ ASTNode *ast_create_var_declaration(const char *name, const char *type_name,
   var_decl->structural_type = 0;
   var_decl->address_space = AST_ADDRESS_SPACE_DEFAULT;
   var_decl->link_name = NULL;
+  var_decl->composed_name = NULL;
   node->data = var_decl;
 
   if (initializer) {
@@ -1525,6 +1542,7 @@ ASTNode *ast_create_function_declaration(const char *name, char **param_names,
   func_decl->captured_types = NULL;
   func_decl->captured_count = 0;
   func_decl->env_struct_name = NULL;
+  func_decl->composed_name = NULL;
 
   if (param_count > 0) {
     func_decl->parameter_names = malloc(param_count * sizeof(char *));
@@ -1576,6 +1594,7 @@ ASTNode *ast_create_struct_declaration(const char *name, char **field_names,
   struct_decl->type_params = NULL;
   struct_decl->type_param_traits = NULL;
   struct_decl->type_param_count = 0;
+  struct_decl->composed_name = NULL;
 
   if (field_count > 0) {
     struct_decl->field_names = malloc(field_count * sizeof(char *));
@@ -2407,6 +2426,50 @@ int ast_fold_member_access_to_int(ASTNode *node, long long value) {
   }
   node->type = AST_NUMBER_LITERAL;
   node->data = literal;
+  return 1;
+}
+
+/* `ident("read_", f.name)` where a value goes, folded to the name it composed.
+ * Same shape as the folds above: the node becomes what it stood for, so nothing
+ * downstream has to know an `ident(...)` was ever there. */
+int ast_fold_call_to_identifier(ASTNode *node, const char *name) {
+  if (!node || !name || node->type != AST_FUNCTION_CALL) {
+    return 0;
+  }
+  Identifier *identifier = malloc(sizeof(Identifier));
+  if (!identifier) {
+    return 0;
+  }
+  identifier->name = ast_intern_string(name);
+  identifier->scope_id = 0;
+  if (!identifier->name) {
+    free(identifier);
+    return 0;
+  }
+
+  for (size_t i = 0; i < node->child_count; i++) {
+    ast_destroy_node(node->children[i]);
+  }
+  free(node->children);
+  node->children = NULL;
+  node->child_count = 0;
+
+  CallExpression *call = (CallExpression *)node->data;
+  if (call) {
+    ast_free_string(call->function_name);
+    free(call->arguments);
+    for (size_t i = 0; i < call->argument_count; i++) {
+      ast_free_string(call->argument_names ? call->argument_names[i] : NULL);
+    }
+    free(call->argument_names);
+    for (size_t i = 0; i < call->type_arg_count; i++) {
+      ast_free_string(call->type_args[i]);
+    }
+    free(call->type_args);
+    free(call);
+  }
+  node->type = AST_IDENTIFIER;
+  node->data = identifier;
   return 1;
 }
 

@@ -564,6 +564,15 @@ int type_checker_eval_comptime(TypeChecker *checker, ASTNode *expression,
     return 1;
   }
 
+  case AST_STRING_LITERAL: {
+    StringLiteral *literal = (StringLiteral *)expression->data;
+    if (!literal || !literal->value) {
+      return 0;
+    }
+    *out_value = comptime_string(string_intern(literal->value));
+    return out_value->as.string.value != NULL;
+  }
+
   case AST_IDENTIFIER: {
     Identifier *identifier = (Identifier *)expression->data;
     if (!identifier || !identifier->name) {

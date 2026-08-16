@@ -990,6 +990,22 @@ $cases = @(
   @{ Name = "err_comptime_for_escape"; Path = "tests/err_comptime_for_escape.mettle"; ShouldSucceed = $false
      Pattern = "cannot escape into runtime code"
      OutputMustNotMatch = @("internal compiler error") },
+  # At module scope the directive generates declarations. Each one needs a name
+  # of its own, and the failures around composing them are named individually
+  # rather than left to surface as a missing symbol somewhere downstream.
+  @{ Name = "comptime_for_declarations"; Path = "tests/test_comptime_for_declarations.mettle"; ShouldSucceed = $true },
+  @{ Name = "err_comptime_ident_duplicate"; Path = "tests/err_comptime_ident_duplicate.mettle"; ShouldSucceed = $false
+     Pattern = "generated two declarations named 'probe'"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_comptime_ident_outside"; Path = "tests/err_comptime_ident_outside.mettle"; ShouldSucceed = $false
+     Pattern = "needs a 'comptime for' around it"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_comptime_ident_not_string"; Path = "tests/err_comptime_ident_not_string.mettle"; ShouldSucceed = $false
+     Pattern = "joins compile-time strings"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_comptime_ident_in_type"; Path = "tests/err_comptime_ident_in_type.mettle"; ShouldSucceed = $false
+     Pattern = "composes a declaration's name, not a type"
+     OutputMustNotMatch = @("internal compiler error") },
   # A global is laid out at compile time and there is no module initializer, so a
   # run-time initializer must be a diagnostic with a source location - it used to
   # reach the direct-object backend and abort as an internal compiler error.
@@ -1180,6 +1196,10 @@ $cases = @(
   @{ Name = "generics_return_struct"; Path = "tests/test_generics_return_struct.mettle"; ShouldSucceed = $true },
   @{ Name = "generics_float"; Path = "tests/test_generics_float.mettle"; ShouldSucceed = $true },
   @{ Name = "generics_new_heap"; Path = "tests/test_generics_new_heap.mettle"; ShouldSucceed = $true },
+  @{ Name = "generics_struct_methods"; Path = "tests/test_generics_struct_methods.mettle"; ShouldSucceed = $true },
+  @{ Name = "generics_method_body_instantiation"; Path = "tests/test_generics_method_body_instantiation.mettle"; ShouldSucceed = $true },
+  @{ Name = "method_pointer_receiver"; Path = "tests/test_method_pointer_receiver.mettle"; ShouldSucceed = $true },
+  @{ Name = "generics_struct_field"; Path = "tests/test_generics_struct_field.mettle"; ShouldSucceed = $true },
   @{
     Name          = "import_trait_bound"
     Path          = "tests/test_import_trait_bound.mettle"
@@ -2304,6 +2324,86 @@ catch {
   Write-CaseResult -Name "comptime_for_fields_runtime" -Passed $false -Reason $_.Exception.Message
 }
 
+# A module-scope directive generates real declarations: the program calls the
+# functions, reads the constants and declares the structs it produced, and
+# returns non-zero if any of them carries the wrong field.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "comptime_for_declarations.exe"
+  if (Test-Path $exePath) { Remove-Item -Path $exePath -Force -ErrorAction SilentlyContinue }
+  $buildOut = & $CompilerPath --build --release "tests\test_comptime_for_declarations.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "build failed: $buildOut" }
+  & $exePath *> $null
+  if ($LASTEXITCODE -ne 0) {
+    throw "a generated declaration carried the wrong field; program returned $LASTEXITCODE"
+  }
+  Write-CaseResult -Name "comptime_for_declarations_runtime" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "comptime_for_declarations_runtime" -Passed $false -Reason $_.Exception.Message
+}
+
+# A generated declaration gets exactly the trust a written one gets, which is
+# none: `@test` on one runs, and `@noalloc` on one fails the build.
+$total++
+try {
+  $out = & $CompilerPath test "tests\test_comptime_for_declarations.mettle" 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "generated tests failed: $out" }
+  foreach ($expected in @("test offset_is_ordered_kind", "test offset_is_ordered_payload", "3 passed")) {
+    if ($out -notmatch [regex]::Escape($expected)) { throw "missing '$expected' in: $out" }
+  }
+
+  $contract = Join-Path $tmpDir "generated_noalloc.mettle"
+  @'
+struct P { a: int32; }
+struct Node { v: int32; }
+comptime for f in typeof(P).fields {
+  @noalloc fn ident("make_", f.name)() -> Node* {
+    return new Node;
+  }
+}
+fn main() -> int32 { return 0; }
+'@ | Set-Content -Path $contract -Encoding utf8
+  $out = & $CompilerPath --release $contract 2>&1 | Out-String
+  if ($LASTEXITCODE -eq 0) { throw "@noalloc on generated code did not fail the build: $out" }
+  # Matched piecewise: the console wraps a long error line, so the message is
+  # not guaranteed to arrive on one.
+  if ($out -notmatch "@noalloc" -or $out -notmatch "make_a" -or $out -notmatch "allocates") {
+    throw "contract failure did not name the generated function: $out"
+  }
+  Write-CaseResult -Name "generated_code_keeps_contracts" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "generated_code_keeps_contracts" -Passed $false -Reason $_.Exception.Message
+}
+
+# `mettle expand` must show generated declarations the same way it shows
+# generated blocks, and the ledger must count a module-scope site.
+$total++
+try {
+  $out = & $CompilerPath expand "tests\test_comptime_for_declarations.mettle" 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "expand failed: $out" }
+  foreach ($expected in @(
+      "fn end_of_kind(base: int64) -> int64",
+      "struct Slot_payload {",
+      "fn both_step_step() -> int64",
+      "expanded from comptime-for iteration 2 (field ``seq``)")) {
+    if ($out -notmatch [regex]::Escape($expected)) { throw "missing '$expected' in: $out" }
+  }
+  if ($out -match "ident\(") { throw "expand still shows an unresolved composed name: $out" }
+  if ($out -match "comptime for") { throw "expand still shows an unexpanded directive: $out" }
+
+  $used = & $CompilerPath --report-expansion "tests\test_comptime_for_declarations.mettle" 2>&1 | Out-String
+  if ($used -notmatch "3 iterations") { throw "ledger missing the module-scope site: $used" }
+  Write-CaseResult -Name "expand_shows_generated_declarations" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "expand_shows_generated_declarations" -Passed $false -Reason $_.Exception.Message
+}
+
 # `mettle expand` must show generated code as readable source, attributed to
 # the iteration that produced it, with the same note a diagnostic would carry.
 $total++
@@ -3423,6 +3523,10 @@ try {
     @{ Path = "tests\test_generics_new_heap.mettle"; ExitCode = 42; Label = "new-heap" },
     @{ Path = "tests\test_generics_full.mettle"; ExitCode = 30; Label = "full" },
     @{ Path = "tests\test_generics_in_control_flow.mettle"; ExitCode = 24; Label = "control-flow" },
+    @{ Path = "tests\test_generics_struct_methods.mettle"; ExitCode = 155; Label = "struct-methods" },
+    @{ Path = "tests\test_generics_method_body_instantiation.mettle"; ExitCode = 42; Label = "method-body-instantiation" },
+    @{ Path = "tests\test_method_pointer_receiver.mettle"; ExitCode = 42; Label = "pointer-receiver" },
+    @{ Path = "tests\test_generics_struct_field.mettle"; ExitCode = 42; Label = "struct-field-ordering" },
     @{ Path = "tests\test_trait_methods_generic_dispatch.mettle"; ExitCode = 42; Label = "trait-dispatch" }
   )
 

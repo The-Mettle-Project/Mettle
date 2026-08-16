@@ -119,7 +119,7 @@ fn main() -> int32 {
   if (r == 0) { return 2; }
   var buf: uint8[64];
   if (fgets(&buf[0], 64, r) == 0) { return 3; }
-  print(&buf[0]);
+  print_cstr(&buf[0]);
   fclose(r);
   return 0;
 }'
@@ -129,10 +129,10 @@ fn main() -> int32 {
 run_case bench_monotonic 0 'import "std/bench";
 import "std/process";
 fn main() -> int32 {
-  var t0: uint64 = bench_time_us();
+  var t0: int64 = bench_time_us();
   var i: int64 = 0; var acc: int64 = 0;
   while (i < 1000000) { acc = acc + i; i = i + 1; }
-  var t1: uint64 = bench_time_us();
+  var t1: int64 = bench_time_us();
   if (t1 < t0) { exit(1); }
   if (acc == 0) { exit(2); }
   return 0;

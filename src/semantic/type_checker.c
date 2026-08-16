@@ -8,8 +8,15 @@ Symbol *type_checker_resolve_identifier(TypeChecker *checker,
     return NULL;
   }
 
+  /* A generated module-scope declaration is checked with its `comptime for`
+   * binding in effect. A module has no scope to hold it in, so it is asked for
+   * first, and only while the declaration it belongs to is in flight. */
   Symbol *symbol =
-      symbol_table_lookup(checker->symbol_table, identifier->name);
+      type_checker_lookup_expansion_binding(checker, identifier->name);
+  if (symbol) {
+    return symbol;
+  }
+  symbol = symbol_table_lookup(checker->symbol_table, identifier->name);
   /* `Kind` is registered on first mention rather than at startup, so a program
    * that never reflects allocates none of its type and interns none of its
    * member names -- and --report-expansion can say so rather than ask you to
@@ -77,6 +84,9 @@ type_checker_create_with_error_reporter(SymbolTable *symbol_table,
   checker->type_table_count = 0;
   checker->type_table_capacity = 0;
   checker->expansions = NULL;
+  checker->comptime_bindings = NULL;
+  checker->comptime_binding_count = 0;
+  checker->comptime_binding_capacity = 0;
   checker->builtin_kind = NULL;
   checker->sequences = NULL;
   checker->generic_enum_templates = NULL;
@@ -155,6 +165,7 @@ void type_checker_destroy(TypeChecker *checker) {
     type_destroy(checker->builtin_sequence);
     free(checker->type_table);
     type_checker_expansions_destroy(checker->expansions);
+    free(checker->comptime_bindings);
     type_checker_sequences_destroy(checker->sequences);
     free(checker->generic_enum_templates);
 
@@ -279,6 +290,35 @@ int type_checker_register_function_signature(TypeChecker *checker,
   return 1;
 }
 
+/* Struct and enum registration, over either the declarations the programmer
+ * wrote or the ones expansion generated. Two sweeps rather than one because
+ * expansion sits between them: a directive reflects on a type, so the written
+ * types have to exist before it runs, and the types it generates only exist
+ * after. */
+static int type_checker_register_types(TypeChecker *checker, Program *prog,
+                                       int generated_only) {
+  int ok = 1;
+  for (size_t i = 0; i < prog->declaration_count; i++) {
+    ASTNode *decl = prog->declarations[i];
+    if (!decl || (decl->type != AST_STRUCT_DECLARATION &&
+                  decl->type != AST_ENUM_DECLARATION)) {
+      continue;
+    }
+    ComptimeDeclScope expansion;
+    type_checker_enter_expansion_decl(checker, decl, &expansion);
+    int is_generated = expansion.bindings_pushed > 0;
+    if (is_generated == generated_only) {
+      if (decl->type == AST_STRUCT_DECLARATION
+              ? !type_checker_process_struct_declaration(checker, decl)
+              : !type_checker_process_enum_declaration(checker, decl)) {
+        ok = 0;
+      }
+    }
+    type_checker_leave_expansion_decl(checker, &expansion);
+  }
+  return ok;
+}
+
 int type_checker_check_program(TypeChecker *checker, ASTNode *program) {
   if (!checker || !program || program->type != AST_PROGRAM) {
     return 0;
@@ -291,24 +331,41 @@ int type_checker_check_program(TypeChecker *checker, ASTNode *program) {
   // Pass 1: Register struct and enum types. On failure keep going so every
   // bad declaration is reported in one compile, not one per rebuild.
   int ok = 1;
-  for (size_t i = 0; i < prog->declaration_count; i++) {
-    ASTNode *decl = prog->declarations[i];
-    if (decl && decl->type == AST_STRUCT_DECLARATION) {
-      if (!type_checker_process_struct_declaration(checker, decl)) {
-        ok = 0;
-      }
-    } else if (decl && decl->type == AST_ENUM_DECLARATION) {
-      if (!type_checker_process_enum_declaration(checker, decl)) {
-        ok = 0;
-      }
-    }
+  if (!type_checker_register_types(checker, prog, 0)) {
+    ok = 0;
+  }
+
+  /* Pass 1.5: expand every module-scope `comptime for` into the declarations it
+     generates. It runs after the types are registered, because a directive
+     reflects on one (`typeof(T).fields`), and before anything looks for a
+     function to check, because what it generates is exactly that. From here on
+     nothing downstream can tell a generated declaration from a written one,
+     which is the point: contracts, diagnostics and the borrow checker all hold
+     generated code to the standard hand-written code is held to. */
+  if (!type_checker_expand_comptime_block(checker, program, 1)) {
+    ok = 0;
+  }
+  if (!type_checker_check_composed_names(checker, program)) {
+    ok = 0;
+  }
+  if (!ok)
+    return 0;
+
+  /* Types the expansion generated, registered in their own sweep so a
+     generated struct can be referred to by a generated function declared
+     before it, the same way written ones can. */
+  if (!type_checker_register_types(checker, prog, 1)) {
+    ok = 0;
   }
 
   // Pass 2: Register all function signatures so any function can call any other
   for (size_t i = 0; i < prog->declaration_count; i++) {
     ASTNode *decl = prog->declarations[i];
     if (decl && decl->type == AST_FUNCTION_DECLARATION) {
+      ComptimeDeclScope expansion;
+      type_checker_enter_expansion_decl(checker, decl, &expansion);
       type_checker_register_function_signature(checker, decl);
+      type_checker_leave_expansion_decl(checker, &expansion);
     }
   }
 
@@ -317,9 +374,12 @@ int type_checker_check_program(TypeChecker *checker, ASTNode *program) {
     ASTNode *decl = prog->declarations[i];
     if (decl && decl->type != AST_STRUCT_DECLARATION &&
         decl->type != AST_ENUM_DECLARATION) {
+      ComptimeDeclScope expansion;
+      type_checker_enter_expansion_decl(checker, decl, &expansion);
       if (!type_checker_process_declaration(checker, decl)) {
         ok = 0;
       }
+      type_checker_leave_expansion_decl(checker, &expansion);
     }
   }
 

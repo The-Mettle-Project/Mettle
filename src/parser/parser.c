@@ -79,6 +79,8 @@ Parser *parser_create_with_error_reporter(Lexer *lexer,
   parser->saw_lexical_error = 0;
   parser->source_filename = error_reporter_current_filename(error_reporter);
   parser->gpu_mode = 0;
+  parser->comptime_depth = 0;
+  parser->pending_composed_name = NULL;
 
   if (parser->current_token.type == TOKEN_ERROR) {
     parser_report_lexer_token_error(parser, &parser->current_token);
@@ -93,6 +95,7 @@ void parser_destroy(Parser *parser) {
   if (parser) {
     token_destroy(&parser->current_token);
     token_destroy(&parser->peek_token);
+    ast_destroy_node(parser->pending_composed_name);
     free(parser->error_message);
     free(parser);
   }
@@ -793,9 +796,20 @@ static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
   return 1;
 }
 
+static ASTNode *parser_parse_comptime_for(Parser *parser, int declarations);
+
 ASTNode *parser_parse_declaration(Parser *parser) {
   if (!parser)
     return NULL;
+
+  /* Contextual `comptime for` in declaration position: the body holds
+   * declarations, and its expansions are spliced into the enclosing module. */
+  if (parser_is_identifier_like(parser->current_token.type) &&
+      parser->current_token.value &&
+      strcmp(parser->current_token.value, "comptime") == 0 &&
+      parser->peek_token.type == TOKEN_FOR) {
+    return parser_parse_comptime_for(parser, 1);
+  }
 
   // Function decorators: `@inline` / `@noinline` / `@pure` / `@simd` may
   // prefix a (possibly `export`-qualified) function declaration. Parse the
@@ -1169,6 +1183,206 @@ static ASTNode *parser_parse_parenthesized_assignment(Parser *parser) {
   return assignment;
 }
 
+/* Enough of the parser's position to rewind a speculative parse. */
+typedef struct {
+  size_t lexer_position;
+  size_t lexer_line;
+  size_t lexer_column;
+  size_t lexer_continuation_depth;
+  Token current_token;
+  Token peek_token;
+  int has_error;
+  int had_error;
+  size_t error_count;
+  char *error_message;
+  ErrorReporter *error_reporter;
+} ParserSavedState;
+
+static ParserSavedState parser_save_state(Parser *parser);
+static void parser_restore_state(Parser *parser,
+                                 const ParserSavedState *state);
+static void parser_discard_saved_state(ParserSavedState *state);
+
+/* True where `ident(` starts a composed declaration name rather than naming a
+ * function the programmer wrote. Only inside a `comptime for`, so a program
+ * with its own `ident` is untouched. */
+static int parser_at_composed_name(Parser *parser) {
+  return parser->comptime_depth > 0 &&
+         parser_is_identifier_like(parser->current_token.type) &&
+         parser->current_token.value &&
+         strcmp(parser->current_token.value, "ident") == 0 &&
+         parser->peek_token.type == TOKEN_LPAREN;
+}
+
+/* `ident("prefix", f.name)` where a declaration's name goes.
+ *
+ * A metaprogram that generates one declaration per field needs each of them to
+ * have a different name, and the only compile-time strings in the language are
+ * the ones reflection answers with. So the name is composed the way `typeof`
+ * and `offsetof` were built: an identifier and call syntax, adding no
+ * punctuation the lexer did not already read.
+ *
+ * The parts stay unevaluated here. The expander joins them once per iteration,
+ * which is the only point at which the binding has a value. */
+static ASTNode *parser_parse_composed_name(Parser *parser) {
+  SourceLocation location = parser_current_location(parser);
+  parser_advance(parser); /* consume the contextual `ident` */
+  if (!parser_expect(parser, TOKEN_LPAREN)) {
+    return NULL;
+  }
+
+  ASTNode **parts = NULL;
+  size_t count = 0;
+  while (parser->current_token.type != TOKEN_RPAREN &&
+         parser->current_token.type != TOKEN_EOF && !parser->has_error) {
+    if (count > 0 && !parser_expect(parser, TOKEN_COMMA)) {
+      break;
+    }
+    ASTNode *part = parser_parse_expression(parser);
+    if (!part) {
+      if (!parser->has_error) {
+        parser_set_error(parser,
+                         "Expected a compile-time string in 'ident(...)'");
+      }
+      break;
+    }
+    ASTNode **grown = realloc(parts, (count + 1) * sizeof(ASTNode *));
+    if (!grown) {
+      ast_destroy_node(part);
+      break;
+    }
+    parts = grown;
+    parts[count++] = part;
+  }
+
+  if (parser->has_error || !parser_expect(parser, TOKEN_RPAREN)) {
+    for (size_t i = 0; i < count; i++) {
+      ast_destroy_node(parts[i]);
+    }
+    free(parts);
+    return NULL;
+  }
+  if (count == 0) {
+    parser_set_error(parser,
+                     "'ident()' composes a name from compile-time strings and "
+                     "needs at least one");
+    free(parts);
+    return NULL;
+  }
+
+  ASTNode *node = ast_create_call_expression("ident", parts, count, location);
+  free(parts);
+  if (!node) {
+    return NULL;
+  }
+  return node;
+}
+
+/* Read a declaration's name: either an identifier, or the `ident(...)` form
+ * that composes one. Exactly one of `*out_name` and `*out_composed` is set. */
+static int parser_parse_declaration_name(Parser *parser, const char *expected,
+                                         char **out_name,
+                                         ASTNode **out_composed) {
+  *out_name = NULL;
+  *out_composed = NULL;
+  /* Whatever the last declaration parse abandoned. */
+  ast_destroy_node(parser->pending_composed_name);
+  parser->pending_composed_name = NULL;
+
+  /* `ident("...")` reads as an attempt to compose a name wherever it appears:
+   * no parameter list starts with a string. Saying so beats letting it fail
+   * further along as a malformed parameter, and a function the programmer
+   * really did call `ident` is untouched, because its parameters are named. */
+  if (parser->comptime_depth == 0 &&
+      parser_is_identifier_like(parser->current_token.type) &&
+      parser->current_token.value &&
+      strcmp(parser->current_token.value, "ident") == 0 &&
+      parser->peek_token.type == TOKEN_LPAREN) {
+    ParserSavedState saved = parser_save_state(parser);
+    parser_advance(parser); /* `ident` */
+    parser_advance(parser); /* '(' */
+    int composes = parser->current_token.type == TOKEN_STRING;
+    parser_restore_state(parser, &saved);
+    parser_discard_saved_state(&saved);
+    if (composes) {
+      parser_set_error(parser,
+                       "'ident(...)' composes a name for generated code; it "
+                       "needs a 'comptime for' around it to generate any");
+      return 0;
+    }
+  }
+
+  if (parser_at_composed_name(parser)) {
+    *out_composed = parser_parse_composed_name(parser);
+    if (!*out_composed) {
+      return 0;
+    }
+    parser->pending_composed_name = *out_composed;
+    /* A placeholder, so anything that reaches for a name before the expander
+     * has run reads as unresolved rather than as a crash. */
+    *out_name = strdup("<ident>");
+    return *out_name != NULL;
+  }
+
+  if (!parser_is_identifier_like(parser->current_token.type)) {
+    parser_set_error(parser, expected);
+    return 0;
+  }
+  *out_name = strdup(parser->current_token.value);
+  parser_advance(parser);
+  return *out_name != NULL;
+}
+
+/* A `comptime for` body at module scope holds declarations, where one inside a
+ * function holds statements. The directive is the same either way; what
+ * differs is the list its expansions are spliced into. */
+static ASTNode *parser_parse_declaration_block(Parser *parser) {
+  SourceLocation location = parser_current_location(parser);
+  if (!parser_expect(parser, TOKEN_LBRACE)) {
+    return NULL;
+  }
+
+  ASTNode *block = ast_create_program();
+  if (!block) {
+    return NULL;
+  }
+  block->location = location;
+  Program *data = (Program *)block->data;
+
+  while (parser->current_token.type != TOKEN_RBRACE &&
+         parser->current_token.type != TOKEN_EOF && !parser->has_error) {
+    if (parser->current_token.type == TOKEN_NEWLINE ||
+        parser->current_token.type == TOKEN_SEMICOLON) {
+      parser_advance(parser);
+      continue;
+    }
+    ASTNode *declaration = parser_parse_declaration(parser);
+    if (!declaration) {
+      if (!parser->has_error) {
+        parser_set_error(parser,
+                         "Expected a declaration in this 'comptime for' body");
+      }
+      break;
+    }
+    ASTNode **grown =
+        realloc(data->declarations,
+                (data->declaration_count + 1) * sizeof(ASTNode *));
+    if (!grown) {
+      ast_destroy_node(declaration);
+      break;
+    }
+    data->declarations = grown;
+    data->declarations[data->declaration_count++] = declaration;
+    ast_add_child(block, declaration);
+  }
+
+  if (parser->has_error || !parser_expect(parser, TOKEN_RBRACE)) {
+    ast_destroy_node(block);
+    return NULL;
+  }
+  return block;
+}
+
 /* `comptime for <binding> in <sequence> { <body> }`.
  *
  * `comptime` is contextual, the same way `in` is: no token and no keyword is
@@ -1179,7 +1393,7 @@ static ASTNode *parser_parse_parenthesized_assignment(Parser *parser) {
  * the expander, which is the one type it can ever have. The body is always
  * braced -- an expansion is a block, and a block is what gives each iteration
  * its own scope. */
-static ASTNode *parser_parse_comptime_for(Parser *parser) {
+static ASTNode *parser_parse_comptime_for(Parser *parser, int declarations) {
   SourceLocation location = parser_current_location(parser);
   parser_advance(parser); // consume the contextual `comptime`
   if (!parser_expect(parser, TOKEN_FOR)) {
@@ -1233,7 +1447,10 @@ static ASTNode *parser_parse_comptime_for(Parser *parser) {
     return NULL;
   }
 
-  ASTNode *body = parser_parse_block(parser);
+  parser->comptime_depth++;
+  ASTNode *body = declarations ? parser_parse_declaration_block(parser)
+                               : parser_parse_block(parser);
+  parser->comptime_depth--;
   if (!body) {
     free(binding_name);
     ast_destroy_node(sequence);
@@ -1339,7 +1556,7 @@ ASTNode *parser_parse_statement(Parser *parser) {
       parser->current_token.value &&
       strcmp(parser->current_token.value, "comptime") == 0 &&
       parser->peek_token.type == TOKEN_FOR) {
-    return parser_parse_comptime_for(parser);
+    return parser_parse_comptime_for(parser, 0);
   }
 
   // Vectorization attribute on a loop: `@simd` / `@simd!`.
@@ -1921,6 +2138,15 @@ static char *parser_parse_type_annotation(Parser *parser) {
     free(ret);
     /* Continue to allow * and [] suffixes (e.g. fn()->int32* is nonsensical but
      * we handle it) */
+  } else if (parser_at_composed_name(parser)) {
+    /* A type annotation is a name the checker resolves, and resolution happens
+     * before the binding this would be composed from has a value. Naming the
+     * boundary beats a parse error further along that points at the wrong
+     * token. */
+    parser_set_error(parser,
+                     "'ident(...)' composes a declaration's name, not a type; "
+                     "write a generated type's name out where you use it");
+    return NULL;
   } else if (!parser_is_type_keyword(parser->current_token.type) &&
              !parser_is_identifier_like(parser->current_token.type)) {
     return NULL;
@@ -2856,20 +3082,6 @@ ASTNode *parser_parse_primary_expression(Parser *parser) {
     return NULL;
   }
 }
-
-typedef struct {
-  size_t lexer_position;
-  size_t lexer_line;
-  size_t lexer_column;
-  size_t lexer_continuation_depth;
-  Token current_token;
-  Token peek_token;
-  int has_error;
-  int had_error;
-  size_t error_count;
-  char *error_message;
-  ErrorReporter *error_reporter;
-} ParserSavedState;
 
 static ParserSavedState parser_save_state(Parser *parser) {
   ParserSavedState state;
@@ -3851,15 +4063,15 @@ ASTNode *parser_parse_var_declaration(Parser *parser) {
   }
 
   // Expect identifier
-  if (!parser_is_identifier_like(parser->current_token.type)) {
-    parser_set_error(parser,
-                     is_const ? "Expected identifier after 'const'"
-                              : "Expected identifier after 'var'");
+  char *var_name = NULL;
+  ASTNode *composed_name = NULL;
+  if (!parser_parse_declaration_name(parser,
+                                     is_const
+                                         ? "Expected identifier after 'const'"
+                                         : "Expected identifier after 'var'",
+                                     &var_name, &composed_name)) {
     return NULL;
   }
-
-  char *var_name = strdup(parser->current_token.value);
-  parser_advance(parser);
 
   char *type_name = NULL;
   ASTNode *initializer = NULL;
@@ -3916,7 +4128,11 @@ ASTNode *parser_parse_var_declaration(Parser *parser) {
     VarDeclaration *data = (VarDeclaration *)var_decl->data;
     data->is_const = is_const;
     data->address_space = address_space;
+    data->composed_name = composed_name;
+    composed_name = NULL;
+    parser->pending_composed_name = NULL;
   }
+  ast_destroy_node(composed_name);
 
   free(var_name);
   free(type_name);
@@ -4184,13 +4400,12 @@ ASTNode *parser_parse_function_declaration(Parser *parser) {
   }
 
   // Expect function name
-  if (!parser_is_identifier_like(parser->current_token.type)) {
-    parser_set_error(parser, "Expected function name after 'fn'");
+  char *func_name = NULL;
+  ASTNode *composed_name = NULL;
+  if (!parser_parse_declaration_name(parser, "Expected function name after 'fn'",
+                                     &func_name, &composed_name)) {
     return NULL;
   }
-
-  char *func_name = strdup(parser->current_token.value);
-  parser_advance(parser);
 
   char **func_type_params = NULL;
   char **func_type_param_traits = NULL;
@@ -4375,6 +4590,9 @@ ASTNode *parser_parse_function_declaration(Parser *parser) {
                                       param_count, return_type, body, location);
   if (func_decl && func_decl->data) {
     FunctionDeclaration *func_data = (FunctionDeclaration *)func_decl->data;
+    func_data->composed_name = composed_name;
+    composed_name = NULL;
+    parser->pending_composed_name = NULL;
     func_data->return_types = return_types;
     func_data->return_type_count = return_type_count;
     return_types = NULL;
@@ -4819,13 +5037,13 @@ ASTNode *parser_parse_struct_declaration(Parser *parser) {
   }
 
   // Expect struct name
-  if (!parser_is_identifier_like(parser->current_token.type)) {
-    parser_set_error(parser, "Expected struct name after 'struct'");
+  char *struct_name = NULL;
+  ASTNode *composed_name = NULL;
+  if (!parser_parse_declaration_name(
+          parser, "Expected struct name after 'struct'", &struct_name,
+          &composed_name)) {
     return NULL;
   }
-
-  char *struct_name = strdup(parser->current_token.value);
-  parser_advance(parser);
 
   char **type_params = NULL;
   char **type_param_traits = NULL;
@@ -4997,6 +5215,13 @@ ASTNode *parser_parse_struct_declaration(Parser *parser) {
   ASTNode *struct_decl = ast_create_struct_declaration(
       struct_name, field_names, field_types, field_count, methods, method_count,
       location);
+
+  if (struct_decl && struct_decl->data) {
+    ((StructDeclaration *)struct_decl->data)->composed_name = composed_name;
+    composed_name = NULL;
+    parser->pending_composed_name = NULL;
+  }
+  ast_destroy_node(composed_name);
 
   if (struct_decl && struct_decl->data && type_param_count > 0) {
     StructDeclaration *sd = (StructDeclaration *)struct_decl->data;

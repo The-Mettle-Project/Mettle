@@ -17,14 +17,46 @@
  * the contract checkers all walk ordinary blocks, and hold generated code to
  * exactly the standard hand-written code is held to. */
 #include "type_checker_internal.h"
+#include <ctype.h>
 
+/* One iteration's contribution to the context a generated node is checked in:
+ * the binding it introduced, and the note that says which iteration that was. */
+typedef struct {
+  const char *binding_name;
+  ComptimeValue binding_value;
+  const char *note;
+  SourceSpan origin;
+} ComptimeFrame;
+
+/* A generated node and every frame it was generated under, outermost first. A
+ * node from a nested `comptime for` at module scope needs all of them: the
+ * inner body can read the outer field, and there is no enclosing scope holding
+ * it the way there would be inside a function. */
 typedef struct {
   ASTNode *block;
   char *note;
   SourceSpan origin;
   const char *binding_name;
   ComptimeValue binding_value;
+  ComptimeFrame *inherited;
+  size_t inherited_count;
 } ComptimeExpansion;
+
+/* The binding stack. Each slot carries the note of the iteration that pushed
+ * it, so a node registered while it is in effect can inherit both. */
+struct ComptimeBindingSlot {
+  Symbol *symbol;
+  const char *note;
+  SourceSpan origin;
+};
+
+static int binding_push(TypeChecker *checker, const char *name,
+                        ComptimeValue value, SourceSpan origin,
+                        const char *note);
+static void binding_pop(TypeChecker *checker);
+static int resolve_composed_names(TypeChecker *checker, ASTNode *node);
+static int capture_inherited(TypeChecker *checker, ComptimeExpansion *entry,
+                             size_t count);
 
 /* What one `comptime for` site cost, so expansion can be held to a budget
  * rather than quietly becoming the reason builds got slow. Metaprogramming is
@@ -156,6 +188,7 @@ void type_checker_expansions_destroy(ComptimeExpansionTable *table) {
   }
   for (size_t i = 0; i < table->capacity; i++) {
     free(table->slots[i].note);
+    free(table->slots[i].inherited);
   }
   free(table->slots);
   free(table->costs);
@@ -279,17 +312,70 @@ static Type *resolve_field_sequence(TypeChecker *checker, ASTNode *sequence) {
   return referred;
 }
 
+/* What a diagnostic raised inside this iteration says about where it came from.
+ * Written once: `mettle expand` prints it as a comment and the reporter prints
+ * it as a note, and the two have to agree. */
+static void iteration_note(char *out, size_t capacity, const TypeField *field,
+                           size_t field_index) {
+  snprintf(out, capacity, "expanded from comptime-for iteration %zu (field `%s`)",
+           field_index + 1, field->name ? field->name : "<anonymous>");
+}
+
+/* Record a cloned expansion against the binding it runs under and the note that
+ * attributes it back to the `comptime for` that produced it. `inherit_count` is
+ * how many frames were in effect before this iteration pushed its own, which is
+ * exactly what the clone inherits. */
+static int register_expansion(TypeChecker *checker,
+                              ComptimeForStatement *directive, ASTNode *clone,
+                              const TypeField *field, uint32_t owner_index,
+                              size_t field_index, size_t inherit_count) {
+  char note[256];
+  iteration_note(note, sizeof(note), field, field_index);
+
+  ComptimeExpansion entry;
+  entry.block = clone;
+  entry.note = mettle_strdup(note);
+  entry.origin = source_span_from_location(directive->keyword_location,
+                                           strlen("comptime"));
+  entry.binding_name = string_intern(directive->binding_name);
+  entry.binding_value = comptime_field_ref(owner_index, (uint32_t)field_index);
+  entry.inherited = NULL;
+  entry.inherited_count = 0;
+
+  int captured = capture_inherited(checker, &entry, inherit_count);
+
+  if (!captured || !entry.note || !entry.binding_name ||
+      !expansion_table_put(checker->expansions, entry)) {
+    free(entry.inherited);
+    free(entry.note);
+    type_checker_set_error_at_location(
+        checker, directive->keyword_location,
+        "Out of memory recording 'comptime for' iteration %zu",
+        field_index + 1);
+    return 0;
+  }
+  return 1;
+}
+
+static int read_field(TypeChecker *checker, ComptimeForStatement *directive,
+                      Type *owner, size_t field_index, TypeField *out_field) {
+  if (type_field_at(owner, field_index, out_field)) {
+    return 1;
+  }
+  type_checker_set_error_at_location(
+      checker, directive->keyword_location,
+      "could not read field %zu of '%s' from the type table", field_index,
+      owner->name ? owner->name : "<anonymous>");
+  return 0;
+}
+
 /* Build one iteration: a clone of the body registered with the binding it runs
  * under and the note that attributes it back to the `comptime for`. */
 static ASTNode *expand_iteration(TypeChecker *checker,
                                  ComptimeForStatement *directive, Type *owner,
                                  uint32_t owner_index, size_t field_index) {
   TypeField field;
-  if (!type_field_at(owner, field_index, &field)) {
-    type_checker_set_error_at_location(
-        checker, directive->keyword_location,
-        "could not read field %zu of '%s' from the type table", field_index,
-        owner->name ? owner->name : "<anonymous>");
+  if (!read_field(checker, directive, owner, field_index, &field)) {
     return NULL;
   }
 
@@ -302,30 +388,487 @@ static ASTNode *expand_iteration(TypeChecker *checker,
     return NULL;
   }
 
+  /* A local declaration inside the body can compose its name too, and it is
+   * resolved here for the same reason a module-scope one is: this is the only
+   * point at which the binding has a value. */
+  SourceSpan origin = source_span_from_location(directive->keyword_location,
+                                                strlen("comptime"));
+  size_t inherit_count = checker->comptime_binding_count;
   char note[256];
-  snprintf(note, sizeof(note),
-           "expanded from comptime-for iteration %zu (field `%s`)",
-           field_index + 1, field.name ? field.name : "<anonymous>");
-
-  ComptimeExpansion entry;
-  entry.block = clone;
-  entry.note = mettle_strdup(note);
-  entry.origin = source_span_from_location(directive->keyword_location,
-                                           strlen("comptime"));
-  entry.binding_name = string_intern(directive->binding_name);
-  entry.binding_value = comptime_field_ref(owner_index, (uint32_t)field_index);
-
-  if (!entry.note || !entry.binding_name ||
-      !expansion_table_put(checker->expansions, entry)) {
-    free(entry.note);
-    ast_destroy_node(clone);
+  iteration_note(note, sizeof(note), &field, field_index);
+  if (!binding_push(checker, string_intern(directive->binding_name),
+                    comptime_field_ref(owner_index, (uint32_t)field_index),
+                    origin, note)) {
     type_checker_set_error_at_location(
         checker, directive->keyword_location,
-        "Out of memory recording 'comptime for' iteration %zu",
+        "Out of memory binding '%s' for iteration %zu", directive->binding_name,
         field_index + 1);
+    ast_destroy_node(clone);
+    return NULL;
+  }
+  int resolved = resolve_composed_names(checker, clone);
+  binding_pop(checker);
+
+  if (!resolved ||
+      !register_expansion(checker, directive, clone, &field, owner_index,
+                          field_index, inherit_count)) {
+    ast_destroy_node(clone);
     return NULL;
   }
   return clone;
+}
+
+/* The declaration name a generated node carries, for the collision check. */
+static const char *declaration_name(const ASTNode *node) {
+  switch (node->type) {
+  case AST_FUNCTION_DECLARATION: {
+    const FunctionDeclaration *decl = (const FunctionDeclaration *)node->data;
+    return decl ? decl->name : NULL;
+  }
+  case AST_STRUCT_DECLARATION: {
+    const StructDeclaration *decl = (const StructDeclaration *)node->data;
+    return decl ? decl->name : NULL;
+  }
+  case AST_VAR_DECLARATION: {
+    const VarDeclaration *decl = (const VarDeclaration *)node->data;
+    return decl ? decl->name : NULL;
+  }
+  case AST_ENUM_DECLARATION: {
+    const EnumDeclaration *decl = (const EnumDeclaration *)node->data;
+    return decl ? decl->name : NULL;
+  }
+  default:
+    return NULL;
+  }
+}
+
+/* One iteration at module scope: the body's declarations, cloned individually
+ * with their names composed, so each lands in the module rather than inside a
+ * block the module would have to look through.
+ *
+ * Appends to `out`; the caller owns everything appended either way. */
+static int expand_declaration_iteration(TypeChecker *checker,
+                                        ComptimeForStatement *directive,
+                                        Type *owner, uint32_t owner_index,
+                                        size_t field_index, ASTNode **out,
+                                        size_t *out_count) {
+  TypeField field;
+  if (!read_field(checker, directive, owner, field_index, &field)) {
+    return 0;
+  }
+
+  Program *body = (Program *)directive->body->data;
+  size_t body_count = body ? body->declaration_count : 0;
+
+  SourceSpan origin = source_span_from_location(directive->keyword_location,
+                                                strlen("comptime"));
+  size_t inherit_count = checker->comptime_binding_count;
+  char note[256];
+  iteration_note(note, sizeof(note), &field, field_index);
+  if (!binding_push(checker, string_intern(directive->binding_name),
+                    comptime_field_ref(owner_index, (uint32_t)field_index),
+                    origin, note)) {
+    type_checker_set_error_at_location(
+        checker, directive->keyword_location,
+        "Out of memory binding '%s' for iteration %zu",
+        directive->binding_name, field_index + 1);
+    return 0;
+  }
+
+  int ok = 1;
+  for (size_t i = 0; i < body_count && ok; i++) {
+    ASTNode *clone = ast_clone_node(body->declarations[i]);
+    if (!clone) {
+      type_checker_set_error_at_location(
+          checker, directive->keyword_location,
+          "Out of memory expanding 'comptime for' iteration %zu",
+          field_index + 1);
+      ok = 0;
+      break;
+    }
+    if (!resolve_composed_names(checker, clone) ||
+        !register_expansion(checker, directive, clone, &field, owner_index,
+                            field_index, inherit_count)) {
+      ast_destroy_node(clone);
+      ok = 0;
+      break;
+    }
+    out[(*out_count)++] = clone;
+  }
+
+  binding_pop(checker);
+  return ok;
+}
+
+/* Two iterations that generate the same name mean one of them is not in the
+ * program, and a generator that quietly drops half its output is the kind of
+ * under-delivery contracts exist to prevent. */
+static int check_generated_names(TypeChecker *checker,
+                                 ComptimeForStatement *directive,
+                                 ASTNode **generated, size_t count) {
+  for (size_t i = 0; i < count; i++) {
+    const char *name = declaration_name(generated[i]);
+    if (!name) {
+      continue;
+    }
+    for (size_t j = 0; j < i; j++) {
+      const char *other = declaration_name(generated[j]);
+      if (other && strcmp(name, other) == 0) {
+        type_checker_set_error_at_location(
+            checker, directive->keyword_location,
+            "this 'comptime for' generated two declarations named '%s'; "
+            "compose the name from the binding so each iteration differs, for "
+            "example 'ident(\"%s_\", %s.name)'",
+            name, name, directive->binding_name);
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
+/* The binding symbol, built the same way the statement-scope path builds it so
+ * a generated declaration sees exactly what a generated block would. */
+static Symbol *binding_symbol(TypeChecker *checker, const char *name,
+                              ComptimeValue value, SourceSpan origin) {
+  Symbol *symbol =
+      symbol_create((char *)name, SYMBOL_CONSTANT, checker->builtin_field);
+  if (!symbol) {
+    return NULL;
+  }
+  symbol->comptime_value = value;
+  symbol->is_initialized = 1;
+  symbol->is_immutable = 1;
+  symbol->decl_line = origin.line;
+  symbol->decl_column = origin.column;
+  symbol->decl_file = origin.filename;
+  return symbol;
+}
+
+static int binding_push(TypeChecker *checker, const char *name,
+                        ComptimeValue value, SourceSpan origin,
+                        const char *note) {
+  if (checker->comptime_binding_count == checker->comptime_binding_capacity) {
+    size_t next = checker->comptime_binding_capacity
+                      ? checker->comptime_binding_capacity * 2
+                      : 4;
+    struct ComptimeBindingSlot *grown =
+        realloc(checker->comptime_bindings,
+                next * sizeof(struct ComptimeBindingSlot));
+    if (!grown) {
+      return 0;
+    }
+    checker->comptime_bindings = grown;
+    checker->comptime_binding_capacity = next;
+  }
+  Symbol *symbol = binding_symbol(checker, name, value, origin);
+  if (!symbol) {
+    return 0;
+  }
+  struct ComptimeBindingSlot *slot =
+      &checker->comptime_bindings[checker->comptime_binding_count++];
+  slot->symbol = symbol;
+  slot->note = note;
+  slot->origin = origin;
+  return 1;
+}
+
+static void binding_pop(TypeChecker *checker) {
+  if (checker->comptime_binding_count > 0) {
+    symbol_destroy(
+        checker->comptime_bindings[--checker->comptime_binding_count].symbol);
+  }
+}
+
+Symbol *type_checker_lookup_expansion_binding(const TypeChecker *checker,
+                                              const char *name) {
+  if (!checker || !name) {
+    return NULL;
+  }
+  /* Innermost first: a nested `comptime for` reusing an outer binding's name
+   * gets its own value, which is what a scope would have done. */
+  for (size_t i = checker->comptime_binding_count; i > 0; i--) {
+    Symbol *binding = checker->comptime_bindings[i - 1].symbol;
+    if (binding && binding->name && strcmp(binding->name, name) == 0) {
+      return binding;
+    }
+  }
+  return NULL;
+}
+
+/* Snapshot the frames in effect, so a node generated by a nested directive can
+ * be checked later under the same context it was generated under. */
+static int capture_inherited(TypeChecker *checker, ComptimeExpansion *entry,
+                             size_t count) {
+  entry->inherited = NULL;
+  entry->inherited_count =
+      count <= checker->comptime_binding_count ? count
+                                               : checker->comptime_binding_count;
+  if (entry->inherited_count == 0) {
+    return 1;
+  }
+  entry->inherited = calloc(entry->inherited_count, sizeof(ComptimeFrame));
+  if (!entry->inherited) {
+    entry->inherited_count = 0;
+    return 0;
+  }
+  for (size_t i = 0; i < entry->inherited_count; i++) {
+    const struct ComptimeBindingSlot *slot = &checker->comptime_bindings[i];
+    entry->inherited[i].binding_name = slot->symbol ? slot->symbol->name : NULL;
+    entry->inherited[i].binding_value =
+        slot->symbol ? slot->symbol->comptime_value : comptime_none();
+    entry->inherited[i].note = slot->note;
+    entry->inherited[i].origin = slot->origin;
+  }
+  return 1;
+}
+
+static void push_frame(TypeChecker *checker, const char *binding_name,
+                       ComptimeValue binding_value, SourceSpan origin,
+                       const char *note, ComptimeDeclScope *scope) {
+  if (binding_push(checker, binding_name, binding_value, origin, note)) {
+    scope->bindings_pushed++;
+  }
+  if (note && checker->error_reporter &&
+      error_reporter_push_note_frame(checker->error_reporter, origin, note)) {
+    scope->notes_pushed++;
+  }
+}
+
+void type_checker_enter_expansion_decl(TypeChecker *checker,
+                                       const ASTNode *declaration,
+                                       ComptimeDeclScope *scope) {
+  scope->bindings_pushed = 0;
+  scope->notes_pushed = 0;
+  if (!checker || !declaration) {
+    return;
+  }
+  const ComptimeExpansion *entry =
+      expansion_table_get(checker->expansions, declaration);
+  if (!entry) {
+    return;
+  }
+  /* Outermost first, so the reported chain reads the way the source nests and
+   * an inner binding shadows an outer one of the same name. */
+  for (size_t i = 0; i < entry->inherited_count; i++) {
+    push_frame(checker, entry->inherited[i].binding_name,
+               entry->inherited[i].binding_value, entry->inherited[i].origin,
+               entry->inherited[i].note, scope);
+  }
+  push_frame(checker, entry->binding_name, entry->binding_value, entry->origin,
+             entry->note, scope);
+}
+
+void type_checker_leave_expansion_decl(TypeChecker *checker,
+                                       ComptimeDeclScope *scope) {
+  if (!checker || !scope) {
+    return;
+  }
+  while (scope->notes_pushed > 0) {
+    error_reporter_pop_note_frame(checker->error_reporter);
+    scope->notes_pushed--;
+  }
+  while (scope->bindings_pushed > 0) {
+    binding_pop(checker);
+    scope->bindings_pushed--;
+  }
+}
+
+/* A composed name has to be spellable, or the program it generates could not
+ * have been written by hand -- which is the standard generated code is held
+ * to everywhere else here. */
+static int is_identifier_text(const char *text) {
+  if (!text || !*text) {
+    return 0;
+  }
+  if (!isalpha((unsigned char)text[0]) && text[0] != '_') {
+    return 0;
+  }
+  for (const char *p = text + 1; *p; p++) {
+    if (!isalnum((unsigned char)*p) && *p != '_') {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+/* Join `ident("prefix", f.name)` into the name the declaration will carry.
+ * Evaluated here rather than during checking because this is the only point at
+ * which the iteration's binding has a value and the name is still changeable. */
+static const char *compose_name(TypeChecker *checker, ASTNode *composed) {
+  char joined[512];
+  size_t length = 0;
+  joined[0] = '\0';
+
+  for (size_t i = 0; i < composed->child_count; i++) {
+    ComptimeValue part = comptime_none();
+    if (!type_checker_eval_comptime(checker, composed->children[i], &part) ||
+        part.kind != COMPTIME_STRING || !part.as.string.value) {
+      type_checker_set_error_at_location(
+          checker, composed->children[i]->location,
+          "'ident(...)' joins compile-time strings; part %zu is not one "
+          "(a string literal or a '.name' query is)",
+          i + 1);
+      return NULL;
+    }
+    size_t part_length = strlen(part.as.string.value);
+    if (length + part_length + 1 > sizeof(joined)) {
+      type_checker_set_error_at_location(checker, composed->location,
+                                         "'ident(...)' composed a name longer "
+                                         "than %zu characters",
+                                         sizeof(joined) - 1);
+      return NULL;
+    }
+    memcpy(joined + length, part.as.string.value, part_length + 1);
+    length += part_length;
+  }
+
+  if (!is_identifier_text(joined)) {
+    type_checker_set_error_at_location(
+        checker, composed->location,
+        "'ident(...)' composed \"%s\", which is not a name a program could "
+        "have written",
+        joined);
+    return NULL;
+  }
+  return string_intern(joined);
+}
+
+/* Resolve every composed name in a freshly cloned expansion, with the
+ * iteration's binding in effect: the name a declaration takes, and every
+ * reference to one, so a generated declaration can be reached from the
+ * iteration that generated it. */
+static int resolve_composed_names(TypeChecker *checker, ASTNode *node) {
+  if (!node) {
+    return 1;
+  }
+
+  /* A nested `comptime for` resolves its own names when it expands, under its
+   * own binding. Reaching into it from out here would ask about a binding that
+   * does not have a value yet. */
+  if (node->type == AST_COMPTIME_FOR) {
+    return 1;
+  }
+
+  /* `ident(...)` where a value goes: the name of something this iteration
+   * generated. Folded to that name, so nothing after this pass sees a call to
+   * a function that was never declared. */
+  if (node->type == AST_FUNCTION_CALL) {
+    CallExpression *call = (CallExpression *)node->data;
+    if (call && call->function_name &&
+        strcmp(call->function_name, "ident") == 0) {
+      const char *name = compose_name(checker, node);
+      if (!name || !ast_fold_call_to_identifier(node, name)) {
+        if (name) {
+          type_checker_set_error_at_location(
+              checker, node->location,
+              "Out of memory resolving 'ident(...)'");
+        }
+        return 0;
+      }
+      return 1;
+    }
+  }
+
+  ASTNode **slot = NULL;
+  char **name_slot = NULL;
+  switch (node->type) {
+  case AST_FUNCTION_DECLARATION:
+  case AST_LAMBDA_EXPRESSION: {
+    FunctionDeclaration *decl = (FunctionDeclaration *)node->data;
+    if (decl) {
+      slot = &decl->composed_name;
+      name_slot = &decl->name;
+    }
+    break;
+  }
+  case AST_STRUCT_DECLARATION: {
+    StructDeclaration *decl = (StructDeclaration *)node->data;
+    if (decl) {
+      slot = &decl->composed_name;
+      name_slot = &decl->name;
+    }
+    break;
+  }
+  case AST_VAR_DECLARATION: {
+    VarDeclaration *decl = (VarDeclaration *)node->data;
+    if (decl) {
+      slot = &decl->composed_name;
+      name_slot = &decl->name;
+    }
+    break;
+  }
+  default:
+    break;
+  }
+
+  if (slot && *slot) {
+    const char *name = compose_name(checker, *slot);
+    if (!name) {
+      return 0;
+    }
+    *name_slot = (char *)name;
+    ast_destroy_node(*slot);
+    *slot = NULL;
+  }
+
+  for (size_t i = 0; i < node->child_count; i++) {
+    if (!resolve_composed_names(checker, node->children[i])) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+/* An `ident(...)` still standing after expansion was written where no
+ * `comptime for` could reach it. Reported here rather than left to fail as a
+ * missing name, which would point at the wrong thing. */
+int type_checker_check_composed_names(TypeChecker *checker, ASTNode *node) {
+  if (!checker || !node) {
+    return 1;
+  }
+  /* A directive still standing is one the expander refused and has already
+   * reported on. The unresolved names inside it are that failure, not a second
+   * one. */
+  if (node->type == AST_COMPTIME_FOR) {
+    return 1;
+  }
+  const ASTNode *composed = NULL;
+  switch (node->type) {
+  case AST_FUNCTION_DECLARATION:
+  case AST_LAMBDA_EXPRESSION: {
+    const FunctionDeclaration *decl = (const FunctionDeclaration *)node->data;
+    composed = decl ? decl->composed_name : NULL;
+    break;
+  }
+  case AST_STRUCT_DECLARATION: {
+    const StructDeclaration *decl = (const StructDeclaration *)node->data;
+    composed = decl ? decl->composed_name : NULL;
+    break;
+  }
+  case AST_VAR_DECLARATION: {
+    const VarDeclaration *decl = (const VarDeclaration *)node->data;
+    composed = decl ? decl->composed_name : NULL;
+    break;
+  }
+  default:
+    break;
+  }
+
+  int ok = 1;
+  if (composed) {
+    type_checker_set_error_at_location(
+        checker, node->location,
+        "'ident(...)' composes a name for generated code; it needs a "
+        "'comptime for' to generate it");
+    ok = 0;
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    if (!type_checker_check_composed_names(checker, node->children[i])) {
+      ok = 0;
+    }
+  }
+  return ok;
 }
 
 const char *type_checker_expansion_note(TypeChecker *checker,
@@ -356,8 +899,8 @@ int type_checker_declare_expansion_binding(TypeChecker *checker,
     return 1;
   }
 
-  Symbol *symbol = symbol_create((char *)entry->binding_name, SYMBOL_CONSTANT,
-                                 checker->builtin_field);
+  Symbol *symbol = binding_symbol(checker, entry->binding_name,
+                                  entry->binding_value, entry->origin);
   if (!symbol) {
     type_checker_set_error_at_location(
         checker, block->location,
@@ -365,12 +908,6 @@ int type_checker_declare_expansion_binding(TypeChecker *checker,
         entry->binding_name);
     return 0;
   }
-  symbol->comptime_value = entry->binding_value;
-  symbol->is_initialized = 1;
-  symbol->is_immutable = 1;
-  symbol->decl_line = entry->origin.line;
-  symbol->decl_column = entry->origin.column;
-  symbol->decl_file = entry->origin.filename;
 
   if (!symbol_table_declare(checker->symbol_table, symbol)) {
     symbol_destroy(symbol);
@@ -383,7 +920,8 @@ int type_checker_declare_expansion_binding(TypeChecker *checker,
   return 1;
 }
 
-int type_checker_expand_comptime_block(TypeChecker *checker, ASTNode *block) {
+static int expand_one_round(TypeChecker *checker, ASTNode *block,
+                            int module_scope) {
   if (!checker || !block || block->type != AST_PROGRAM) {
     return 1;
   }
@@ -428,25 +966,40 @@ int type_checker_expand_comptime_block(TypeChecker *checker, ASTNode *block) {
     ASTNode **owned = NULL;
     size_t incoming = 1;
 
+    ComptimeDeclScope outer = {0, 0};
+
     if (child && child->type == AST_COMPTIME_FOR) {
+      /* A directive this expansion generated is expanded under the binding
+       * that generated it, so a nested `comptime for` at module scope can
+       * still read the outer field. Inside a block the enclosing scope does
+       * this; a module has no such scope, so it is pushed around the round. */
+      type_checker_enter_expansion_decl(checker, child, &outer);
+
       ComptimeForStatement *directive = (ComptimeForStatement *)child->data;
       Type *owner =
           directive ? resolve_field_sequence(checker, directive->sequence)
                     : NULL;
       if (!owner) {
         ok = 0;
+        type_checker_leave_expansion_decl(checker, &outer);
         break;
       }
       if (!directive->body || !directive->binding_name) {
         type_checker_set_error_at_location(checker, child->location,
                                            "'comptime for' has no body");
         ok = 0;
+        type_checker_leave_expansion_decl(checker, &outer);
         break;
       }
 
       uint32_t owner_index = type_checker_intern_type(checker, owner);
       /* Zero fields expands to nothing, which is an answer, not an error. */
-      incoming = type_field_count(owner);
+      size_t iterations = type_field_count(owner);
+      Program *body = (Program *)directive->body->data;
+      size_t per_iteration =
+          module_scope ? (body ? body->declaration_count : 0) : 1;
+      incoming = iterations * per_iteration;
+
       if (incoming > 0) {
         owned = calloc(incoming, sizeof(ASTNode *));
         if (!owned) {
@@ -454,29 +1007,40 @@ int type_checker_expand_comptime_block(TypeChecker *checker, ASTNode *block) {
               checker, child->location,
               "Out of memory expanding 'comptime for'");
           ok = 0;
+          type_checker_leave_expansion_decl(checker, &outer);
           break;
         }
-        size_t generated = 0;
-        for (size_t f = 0; f < incoming; f++) {
-          owned[f] =
-              expand_iteration(checker, directive, owner, owner_index, f);
-          if (!owned[f]) {
-            ok = 0;
-            break;
+        size_t produced = 0;
+        for (size_t f = 0; f < iterations && ok; f++) {
+          if (module_scope) {
+            ok = expand_declaration_iteration(checker, directive, owner,
+                                              owner_index, f, owned, &produced);
+          } else {
+            owned[produced] =
+                expand_iteration(checker, directive, owner, owner_index, f);
+            ok = owned[produced] != NULL;
+            produced += ok ? 1 : 0;
           }
-          generated += ast_node_count(owned[f]);
         }
+        if (ok && module_scope) {
+          ok = check_generated_names(checker, directive, owned, produced);
+        }
+        /* A partial expansion is still counted: what a failed directive cost
+         * before it failed is real, and the ledger reports what happened. */
+        size_t generated = 0;
+        for (size_t k = 0; k < produced; k++) {
+          generated += ast_node_count(owned[k]);
+        }
+        incoming = produced;
         batch = owned;
-        if (ok) {
-          expansion_record_cost(checker->expansions,
-                                directive->keyword_location, owner->name,
-                                incoming, generated);
-        }
+        expansion_record_cost(checker->expansions, directive->keyword_location,
+                              owner->name, iterations, generated);
       } else {
         expansion_record_cost(checker->expansions, directive->keyword_location,
-                              owner->name, 0, 0);
+                              owner->name, iterations, 0);
       }
     }
+    type_checker_leave_expansion_decl(checker, &outer);
 
     if (ok && expanded_count + incoming > expanded_capacity) {
       size_t next = expanded_capacity ? expanded_capacity * 2 : 8;
@@ -537,4 +1101,35 @@ int type_checker_expand_comptime_block(TypeChecker *checker, ASTNode *block) {
   block->children = children;
   block->child_count = expanded_count;
   return 1;
+}
+
+int type_checker_expand_comptime_block(TypeChecker *checker, ASTNode *block,
+                                       int module_scope) {
+  if (!module_scope) {
+    /* A nested directive inside a block is reached again when that block is
+     * checked, so one round is all a block ever needs. */
+    return expand_one_round(checker, block, 0);
+  }
+
+  /* A directive that generates a directive leaves the new one in the module,
+   * where no later pass would look for it. So module scope expands until there
+   * is nothing left. Each round retires every directive it can see, and the
+   * ones it uncovers came from a shallower nesting level in the source, so the
+   * rounds are bounded by how deeply the program nested them. */
+  for (;;) {
+    if (!expand_one_round(checker, block, 1)) {
+      return 0;
+    }
+    Program *program = (Program *)block->data;
+    size_t remaining = 0;
+    for (size_t i = 0; program && i < program->declaration_count; i++) {
+      ASTNode *child = program->declarations[i];
+      if (child && child->type == AST_COMPTIME_FOR) {
+        remaining++;
+      }
+    }
+    if (remaining == 0) {
+      return 1;
+    }
+  }
 }

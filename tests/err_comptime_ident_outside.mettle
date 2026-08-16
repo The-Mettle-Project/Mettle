@@ -1,0 +1,11 @@
+// `ident(...)` composes a name for generated code. Written where nothing
+// generates anything, it is reported as that rather than left to fail further
+// along as a malformed parameter list.
+
+fn ident("orphan_", "name")() -> int32 {
+  return 0;
+}
+
+fn main() -> int32 {
+  return 0;
+}

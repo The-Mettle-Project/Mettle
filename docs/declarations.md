@@ -2,6 +2,8 @@
 
 Declarations introduce variables, functions, types, and other program elements. All declarations appear at top level or within struct bodies (for methods). Declarations are processed in order; a symbol must be declared before use, except for forward declarations.
 
+A declaration may also be generated, by a [`comptime for`](types.md#at-module-scope-generating-declarations) written between declarations. Its name is then composed with `ident("prefix", f.name)` so each iteration produces a different one. Everything below applies unchanged to a generated declaration: the checks, the decorators and the contracts all run on it exactly as they run on one written by hand.
+
 ## Variables
 
 Variables are declared with `var`, a name, a type, and an optional initializer. **Mettle never infers binding types**: every `var` (and every local `const`) must state its type explicitly - a declaration with an initializer but no type annotation is a compile error. The value `0` is a valid initializer for pointers (null).
@@ -224,6 +226,40 @@ fn main() -> int32 {
 
 The compiler monomorphizes each unique struct instantiation. Generic structs can have multiple type parameters. See [Types](types.md#generic-type-parameters).
 
+A generic struct declares [methods](#methods) the way any other struct does, and each instantiation gets its own copy. The type parameters stand in for concrete types throughout a method: in its parameter types, in its return type, and in its body, including a local whose type is another generic instantiation.
+
+```mettle
+struct Box<T> {
+  value: T;
+
+  method get() -> T {
+    return this.value;
+  }
+
+  method plus(other: T) -> T {
+    return this.value + other;
+  }
+}
+
+fn main() -> int32 {
+  var b: Box<int32>;
+  b.value = 10;
+  return b.plus(32);
+}
+```
+
+`Box<int32>` and `Box<float64>` are separate types with separate methods, so `plus` adds integers in one and floats in the other.
+
+An instantiation is a type like any other and can be a struct field, including through a pointer or an array. It does not need declaring: the compiler emits it ahead of the field that names it, so the usual rule that a field's type comes first is satisfied without writing anything down.
+
+```mettle
+struct Holder {
+  one: Box<int32>;
+  many: Box<int32>[4];
+  other: Box<float64>*;
+}
+```
+
 ## Structs and Enums
 
 Functions, variables, structs, and enums can be prefixed with `export` to make them visible to modules that import this file.
@@ -237,7 +273,7 @@ export enum Status {
 
 ## Methods
 
-Structs can define methods. The receiver is implicit (`this`). Methods are called with `obj.method(args)`. When the receiver is a struct value, the compiler passes it by value as the first argument; when it is a pointer, the pointer is passed.
+Structs can define methods. The receiver is implicit (`this`). Methods are called with `obj.method(args)`.
 
 ```mettle
 struct Vector3 {
@@ -256,6 +292,28 @@ fn main() -> int32 {
   return 0;
 }
 ```
+
+How the receiver is passed follows how it is spelled, the same way field access does. `obj.method()` passes the struct by value, so `this` is a copy and a write to it does not reach the caller. `ptr->method()` passes the pointer, so `this` names the caller's struct and a write does reach it. This is the distinction `.` and `->` already carry for fields: `obj.x` reads a value, `ptr->x` reads through a pointer.
+
+```mettle
+struct Counter {
+  n: int32;
+
+  method bump() -> int32 {
+    this.n = this.n + 1;
+    return this.n;
+  }
+}
+
+var c: Counter;
+c.n = 10;
+c.bump();          // this is a copy; c.n is still 10
+
+var p: Counter* = &c;
+p->bump();         // this is c; c.n is now 11
+```
+
+A method reached through a pointer is a separate function from the same method reached by value, and only the forms a program calls are emitted.
 
 ## Inline Assembly
 
