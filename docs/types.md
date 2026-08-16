@@ -484,6 +484,29 @@ If the two drift apart, the build fails and the diagnostic names the iteration t
 
 Equality is the whole surface. There is no concatenation, ordering, length, or substring, because each of those is a way to compute a name the program never wrote, and `ident(...)` already composes names under rules the compiler can check.
 
+### `layoutof`
+
+`layoutof(T)` folds to a compile-time integer digest of everything a stored value of `T` depends on: its kind, size and alignment, and for each field the name, byte offset, bit offset and width, and that field's own layout. A pointer field contributes that it is a pointer and its width, never its pointee's layout, so a self-referential struct terminates.
+
+The digest exists to be pinned:
+
+```mettle
+static_assert(layoutof(Player) == 7833040735491835555);
+```
+
+Once pinned, any change to the layout fails the build. That includes changes the size does not show:
+
+```mettle
+static_assert(layoutof(Player) != layoutof(Renamed));    // field renamed, same size
+static_assert(layoutof(Player) != layoutof(Reordered));  // fields swapped
+```
+
+A rename moves the digest even when every offset and width is unchanged, because the field's name is part of the contract: reading `health` where `hp` was written is the same defect as reading the wrong offset.
+
+This is what makes a stored or transmitted layout checkable rather than assumed. A value written by one build and read by another (a save file, a wire packet, a process that outlived a code change) is only sound while the layouts agree, and the compiler is the only thing that knows both. Pinning the digest turns "these agree" from a comment into a build failure.
+
+The digest is derived only from declared facts, so it is the same for the same declaration on every host and in every build mode. It is not stable across compiler versions that change the layout algorithm, which is the point: if the layout moves, the pin should break.
+
 ### `Kind`
 
 `.kind` answers with `Kind`, an enum the compiler registers itself, so reflection needs no import and no `--prelude`. Its variants are reachable **only** qualified, as `Kind.Struct` and never as a bare `Struct`, precisely so that reflection does not claim common names like `Struct`, `Array`, or `Bool` out of every program's namespace.

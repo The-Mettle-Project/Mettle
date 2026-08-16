@@ -280,6 +280,12 @@ int type_checker_check_expansion_budget(TypeChecker *checker, size_t budget);
 int type_checker_eval_offsetof(TypeChecker *checker, CallExpression *call,
                                SourceLocation location, long long *out_offset);
 
+/* Fold `layoutof(T)` to a digest of everything a stored value of T depends on:
+ * kind, size, alignment, and each field's name, offset, width and own layout.
+ * Pinning it with static_assert turns a layout change into a failed build. */
+int type_checker_eval_layoutof(TypeChecker *checker, CallExpression *call,
+                               SourceLocation location, long long *out_digest);
+
 /* Fold a compile-time expression. Returns 0 when the expression is not one. */
 int type_checker_eval_comptime(TypeChecker *checker, ASTNode *expression,
                                ComptimeValue *out_value);

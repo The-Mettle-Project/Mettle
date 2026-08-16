@@ -101,6 +101,15 @@ static int type_checker_eval_numeric_constant(TypeChecker *checker,
       type_checker_constant_from_int(out_value, offset);
       return 1;
     }
+    if (strcmp(call->function_name, "layoutof") == 0) {
+      long long digest = 0;
+      if (!type_checker_eval_layoutof(checker, call, expression->location,
+                                      &digest)) {
+        return 0;
+      }
+      type_checker_constant_from_int(out_value, digest);
+      return 1;
+    }
     if (strcmp(call->function_name, "sizeof") != 0 ||
         call->argument_count != 1 || !call->arguments[0] ||
         call->arguments[0]->type != AST_IDENTIFIER) {
@@ -471,6 +480,100 @@ static void append_field_names(const Type *owner, char *buffer, size_t size) {
   }
 }
 
+/* FNV-1a over a canonical rendering of a layout. Only declared facts feed it:
+ * kind, size, alignment, and each field's name, offset, width and own layout.
+ * No address, no pointer, no ordering that depends on how the compiler was
+ * built, so the digest is the same for the same declaration on every host. */
+static void layout_mix(uint64_t *hash, const void *bytes, size_t length) {
+  const unsigned char *p = (const unsigned char *)bytes;
+  for (size_t i = 0; i < length; i++) {
+    *hash ^= (uint64_t)p[i];
+    *hash *= 1099511628211ULL;
+  }
+}
+
+static void layout_mix_u64(uint64_t *hash, uint64_t value) {
+  unsigned char bytes[8];
+  for (int i = 0; i < 8; i++) {
+    bytes[i] = (unsigned char)((value >> (i * 8)) & 0xFF);
+  }
+  layout_mix(hash, bytes, sizeof(bytes));
+}
+
+static void layout_mix_str(uint64_t *hash, const char *s) {
+  layout_mix(hash, s ? s : "", s ? strlen(s) : 0);
+  layout_mix_u64(hash, 0x1F);
+}
+
+/* A pointer contributes that it is a pointer, never its pointee's layout: a
+ * self-referential struct would not terminate, and what a pointer field costs
+ * a layout is its width, which `size` already carries. */
+static void layout_digest(const Type *type, uint64_t *hash, int depth) {
+  if (!type || depth > 8) {
+    layout_mix_u64(hash, 0xDEAD);
+    return;
+  }
+  layout_mix_u64(hash, (uint64_t)type->kind);
+  layout_mix_u64(hash, (uint64_t)type->size);
+  layout_mix_u64(hash, (uint64_t)type->alignment);
+  if (type->kind == TYPE_POINTER) {
+    return;
+  }
+  size_t count = type_field_count(type);
+  layout_mix_u64(hash, (uint64_t)count);
+  for (size_t i = 0; i < count; i++) {
+    TypeField field;
+    if (!type_field_at((Type *)type, i, &field)) {
+      layout_mix_u64(hash, 0xBAD);
+      continue;
+    }
+    layout_mix_str(hash, field.name);
+    layout_mix_u64(hash, (uint64_t)field.byte_offset);
+    layout_mix_u64(hash, (uint64_t)field.bit_offset);
+    layout_mix_u64(hash, (uint64_t)field.bit_width);
+    layout_digest(field.type, hash, depth + 1);
+  }
+}
+
+int type_checker_eval_layoutof(TypeChecker *checker, CallExpression *call,
+                               SourceLocation location,
+                               long long *out_digest) {
+  if (!checker || !call || !out_digest) {
+    return 0;
+  }
+  if (call->argument_count != 1 || !call->arguments || !call->arguments[0]) {
+    type_checker_set_error_at_location(
+        checker, location,
+        "layoutof expects exactly one type (for example layoutof(Player))");
+    return 0;
+  }
+
+  ComptimeValue owner = comptime_none();
+  if (!type_checker_eval_comptime(checker, call->arguments[0], &owner) ||
+      owner.kind != COMPTIME_TYPE_REF) {
+    type_checker_set_error_at_location(
+        checker, call->arguments[0]->location,
+        "layoutof expects a compile-time type");
+    return 0;
+  }
+
+  Type *type =
+      type_checker_type_from_index(checker, owner.as.type_ref.type_index);
+  if (!type) {
+    type_checker_set_error_at_location(
+        checker, call->arguments[0]->location,
+        "layoutof could not read that type from the type table");
+    return 0;
+  }
+
+  uint64_t hash = 14695981039346656037ULL;
+  layout_digest(type, &hash, 0);
+  /* Clear the top bit so the digest is a positive int64 and compares the way
+   * a programmer writes it, without a sign surprise at the boundary. */
+  *out_digest = (long long)(hash & 0x7FFFFFFFFFFFFFFFULL);
+  return 1;
+}
+
 int type_checker_eval_fieldof(TypeChecker *checker, CallExpression *call,
                               SourceLocation location,
                               ComptimeValue *out_value) {
@@ -746,6 +849,15 @@ int type_checker_eval_comptime(TypeChecker *checker, ASTNode *expression,
     if (strcmp(call->function_name, "fieldof") == 0) {
       return type_checker_eval_fieldof(checker, call, expression->location,
                                        out_value);
+    }
+    if (strcmp(call->function_name, "layoutof") == 0) {
+      long long digest = 0;
+      if (!type_checker_eval_layoutof(checker, call, expression->location,
+                                      &digest)) {
+        return 0;
+      }
+      *out_value = comptime_int(digest);
+      return 1;
     }
     return 0;
   }

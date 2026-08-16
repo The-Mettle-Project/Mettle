@@ -944,6 +944,15 @@ $cases = @(
   @{ Name = "err_comptime_contract_mismatch"; Path = "tests/err_comptime_contract_mismatch.mettle"; ShouldSucceed = $false
      OutputMustMatch = @("static_assert failed", "expanded from comptime-for iteration 1 \(field ``id``\)")
      OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "layoutof"; Path = "tests/test_layoutof.mettle"; ShouldSucceed = $true },
+  # A pinned layout that no longer agrees must refuse the build. Detection is
+  # only worth having if the default outcome is refusal.
+  @{ Name = "err_layout_pin_broken"; Path = "tests/err_layout_pin_broken.mettle"; ShouldSucceed = $false
+     Pattern = "static_assert failed"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_layoutof_not_a_type"; Path = "tests/err_layoutof_not_a_type.mettle"; ShouldSucceed = $false
+     Pattern = "layoutof expects a compile-time type"
+     OutputMustNotMatch = @("internal compiler error") },
   @{ Name = "err_type_var"; Path = "tests/err_type_var.mettle"; ShouldSucceed = $false
      Pattern = "type 'Type' has no runtime representation"
      OutputMustNotMatch = @("internal compiler error") },

@@ -1,0 +1,10 @@
+// layoutof takes the type, not a value of it: a layout is a property of the
+// declaration, and asking a value for one would be asking the wrong thing.
+struct Player {
+    hp: int32
+}
+
+fn main() -> int32 {
+    var p: Player;
+    return (int32)layoutof(p);
+}

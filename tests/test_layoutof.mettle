@@ -1,0 +1,70 @@
+// `layoutof(T)` digests everything a stored value of T depends on: kind, size,
+// alignment, and each field's name, offset, width and own layout. Pinning it
+// turns a layout change into a failed build instead of a value reinterpreted
+// under a shape it was not written with.
+//
+// The assertions are relational rather than pinned to a constant, so they
+// state the properties the digest has to have without freezing the algorithm:
+// identical layouts agree, and every way a layout can differ disagrees.
+
+struct Player {
+    hp: int32
+    x: float64
+}
+
+// Same names, same types, same order: the same layout by every fact that
+// matters, so the digest has to agree.
+struct PlayerCopy {
+    hp: int32
+    x: float64
+}
+
+struct Renamed {
+    health: int32
+    x: float64
+}
+
+struct Reordered {
+    x: float64
+    hp: int32
+}
+
+struct Retyped {
+    hp: int64
+    x: float64
+}
+
+struct Extended {
+    hp: int32
+    x: float64
+    y: float64
+}
+
+static_assert(layoutof(Player) == layoutof(PlayerCopy));
+static_assert(layoutof(Player) != layoutof(Renamed));
+static_assert(layoutof(Player) != layoutof(Reordered));
+static_assert(layoutof(Player) != layoutof(Retyped));
+static_assert(layoutof(Player) != layoutof(Extended));
+
+// A rename alone moves the digest even though every offset and width is
+// unchanged, because a field's name is part of the contract a swap has to
+// honor: reading `health` where `hp` was written is the same defect.
+static_assert(typeof(Renamed).size == typeof(Player).size);
+
+// Non-struct types answer too, so a pinned wire scalar is checkable.
+static_assert(layoutof(int32) != layoutof(int64));
+static_assert(layoutof(int32) == layoutof(int32));
+
+fn main() -> int32 {
+    // The digest folds to a constant, so it is usable at run time without the
+    // type reaching the backend.
+    var a: int64 = layoutof(Player);
+    var b: int64 = layoutof(PlayerCopy);
+    if (a != b) {
+        return 1;
+    }
+    if (layoutof(Player) == layoutof(Reordered)) {
+        return 2;
+    }
+    return 0;
+}

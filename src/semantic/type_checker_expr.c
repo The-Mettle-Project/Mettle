@@ -2208,6 +2208,15 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
         return type_checker_type_value(checker, referred, expression);
       }
 
+      if (strcmp(call->function_name, "layoutof") == 0) {
+        long long digest = 0;
+        if (!type_checker_eval_layoutof(checker, call, expression->location,
+                                        &digest)) {
+          return NULL;
+        }
+        return checker->builtin_int64;
+      }
+
       if (strcmp(call->function_name, "fieldof") == 0) {
         ComptimeValue field = comptime_none();
         if (!type_checker_eval_fieldof(checker, call, expression->location,

@@ -86,6 +86,12 @@ int type_checker_eval_fieldof(TypeChecker *checker, CallExpression *call,
                               SourceLocation location,
                               ComptimeValue *out_value);
 
+/* `layoutof(T)`: a digest of everything a stored value of T depends on. Pin it
+ * with static_assert and a layout change fails the build instead of being
+ * reinterpreted under a shape it was not written with. */
+int type_checker_eval_layoutof(TypeChecker *checker, CallExpression *call,
+                               SourceLocation location, long long *out_digest);
+
 int type_checker_eval_comptime(TypeChecker *checker, ASTNode *expression,
                                ComptimeValue *out_value);
 

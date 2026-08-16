@@ -731,7 +731,13 @@ bounds. The first of those is the precondition for everything in Part III.
 **Before hot swap ships:**
 
 - A declared quiescence point. *(IV.4)*
-- Layout-change detection with refusal as the default outcome. *(IV.3)*
+- ~~Layout-change detection with refusal as the default outcome.~~ *(IV.3)*
+  **Landed.** `layoutof(T)` digests kind, size, alignment and every field's
+  name, offset and width. Pinning it with `static_assert` makes a layout
+  change fail the build, which is refusal as the default outcome. It detects
+  renames and reorderings that leave the size unchanged, and the metaprogram
+  that would write the migration can already read both layouts through
+  `typeof`, `fieldof` and compile-time string comparison.
 - Swap gating through the existing differential harness. *(IV.5)*
 
 **Before the runtime grows:**

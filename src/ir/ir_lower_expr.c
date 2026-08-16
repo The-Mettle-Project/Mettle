@@ -70,6 +70,29 @@ int ir_lower_call_expression(IRLoweringContext *context,
     return 1;
   }
 
+  if (strcmp(call->function_name, "layoutof") == 0) {
+    long long digest = 0;
+    if (!context->type_checker ||
+        !type_checker_eval_layoutof(context->type_checker, call,
+                                    expression->location, &digest)) {
+      ir_set_error(context, "Unable to lower layoutof expression");
+      return 0;
+    }
+    *out_value = ir_operand_int(digest);
+    return 1;
+  }
+
+  if (strcmp(call->function_name, "fieldof") == 0) {
+    if (context->type_checker && context->type_checker->builtin_field) {
+      type_checker_reject_comptime_escape(
+          context->type_checker, expression->location,
+          context->type_checker->builtin_field);
+    }
+    ir_set_error(context,
+                 "value of type 'Field' cannot escape into runtime code");
+    return 0;
+  }
+
   if (strcmp(call->function_name, "sizeof") == 0) {
     if (call->argument_count != 1 || !call->arguments ||
         !call->arguments[0] || call->arguments[0]->type != AST_IDENTIFIER) {

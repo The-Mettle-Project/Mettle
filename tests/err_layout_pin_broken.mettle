@@ -1,0 +1,14 @@
+// Pinning a layout is only worth anything if a disagreement refuses the build.
+// The pin below is deliberately not this struct's digest, standing in for a
+// pin written against an older shape of Player. Refusing is the honest answer:
+// "this layout changed and you have not said what that means".
+struct Player {
+    hp: int32
+    x: float64
+}
+
+static_assert(layoutof(Player) == 1);
+
+fn main() -> int32 {
+    return 0;
+}
