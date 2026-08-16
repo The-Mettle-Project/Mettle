@@ -56,10 +56,15 @@ int ir_verify_check_pass(IRFunction *function, IRVerifySnapshot *snapshot,
 /* Exit code contribution: number of divergences found this compile. */
 int ir_verify_divergence_count(void);
 
-/* How many generated input sets a check runs. Callers that report a passing
- * verdict need this: the check is a differential test over these sets, and a
- * verdict that does not say so reads as a proof it is not. */
+/* How many generated input sets the fixed table holds. Callers that report a
+ * passing verdict need this: the check is a differential test over these
+ * sets, and a verdict that does not say so reads as a proof it is not. */
 int ir_verify_input_run_count(void);
+
+/* How many input sets the most recent ir_verify_check_rewrite actually ran:
+ * the fixed table plus the boundary values harvested from the two functions,
+ * which varies per function. */
+int ir_verify_last_input_run_count(void);
 
 /* ---- standalone rewrite gate ----
  *

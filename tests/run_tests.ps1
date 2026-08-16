@@ -2606,12 +2606,15 @@ try {
   if ($LASTEXITCODE -eq 0) { throw "a changed signature should be refused: $out" }
   if ($out -notmatch "REFUSED") { throw "expected REFUSED for a signature change: $out" }
 
-  # Known limit, pinned deliberately: the generator does not try n = 100, so a
-  # difference that only shows there is not observed. If the input generator is
-  # widened this test fails, which is the reminder to revisit the claim.
+  # A boundary the fixed shape table never reaches. The gate harvests the
+  # constants these two functions compare against and tests both sides of
+  # each, so a difference that only appears at n = 100 is caught with that
+  # exact input. This case passed as OK before harvesting existed.
   $out = & $CompilerPath swap-check $swapFile --old far_v1 --new far_v2 2>&1 | Out-String
-  if ($out -notmatch "OK") {
-    throw "expected the documented limitation (n=100 not generated) to still hold: $out"
+  if ($LASTEXITCODE -eq 0) { throw "divergence at n=100 should have been caught: $out" }
+  if ($out -notmatch "DIVERGED") { throw "expected DIVERGED at the harvested boundary: $out" }
+  if ($out -notmatch "far_v2\(100\)") {
+    throw "expected the counterexample to name the harvested boundary input: $out"
   }
 
   Write-CaseResult -Name "swap_check_verdicts" -Passed $true

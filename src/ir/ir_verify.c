@@ -80,6 +80,13 @@ int ir_verify_divergence_count(void) { return (int)g_divergences; }
 
 int ir_verify_input_run_count(void) { return IRV_INPUT_RUNS; }
 
+/* How many input sets the most recent standalone check actually ran. The fixed
+ * table plus however many boundary values were harvested, which varies per
+ * function, so a caller reporting a verdict has to ask rather than assume. */
+static int g_last_input_runs = IRV_INPUT_RUNS;
+
+int ir_verify_last_input_run_count(void) { return g_last_input_runs; }
+
 static int irv_color(void) {
   static int cached = -1;
   if (cached < 0) {
@@ -543,12 +550,16 @@ static double irv_float_arg(int run, size_t param_index) {
  * values. Returns 0 on setup failure. */
 static int irv_setup_machine(IRInterpMachine *machine, IRFunction *shape,
                              const IRVParamInfo *params, size_t param_count,
-                             int run, IRInterpValue *args) {
+                             int run, IRInterpValue *args,
+                             const long long *harvested_value) {
   (void)shape;
   for (size_t p = 0; p < param_count; p++) {
     switch (params[p].kind) {
     case IRV_PARAM_INT:
-      args[p].i = irv_int_arg(run, p);
+      /* On a harvested run every integer parameter carries the boundary
+       * value: which parameter the comparison reads is not recorded, so
+       * setting all of them is what reaches it. */
+      args[p].i = harvested_value ? *harvested_value : irv_int_arg(run, p);
       args[p].f = 0;
       args[p].is_float = 0;
       break;
@@ -946,10 +957,85 @@ typedef struct {
  * snapshot's instructions (before) on generated inputs and compare every
  * observation. No counters, no quarantine, no restore, no printing - both
  * the --verify pass driver and the --ml-opt rewrite gate wrap this. */
+/* Extra input runs built from the constants a function actually compares
+ * against. The fixed table probes shapes (buffer spans, index pairs, negative
+ * values); it does not know that a function branches at 100, so an off-by-one
+ * at that boundary survives every run. Harvesting the constants and testing on
+ * either side of each one closes the gap the table structurally cannot.
+ *
+ * Bounded on purpose: this is differential testing, and its cost is paid on
+ * every check that uses it. */
+#define IRV_MAX_HARVESTED 6
+
+typedef struct {
+  long long values[IRV_MAX_HARVESTED * 2];
+  int count;
+} IRVHarvest;
+
+static void irv_harvest_push(IRVHarvest *h, long long v) {
+  if (h->count >= (int)(sizeof(h->values) / sizeof(h->values[0]))) {
+    return;
+  }
+  for (int i = 0; i < h->count; i++) {
+    if (h->values[i] == v) {
+      return;
+    }
+  }
+  h->values[h->count++] = v;
+}
+
+static void irv_harvest_stream(const IRInstruction *instructions, size_t count,
+                               IRVHarvest *h, int *distinct) {
+  for (size_t i = 0; i < count && *distinct < IRV_MAX_HARVESTED; i++) {
+    const IRInstruction *in = &instructions[i];
+    /* Only comparisons and branches: a constant a function is *tested*
+     * against is a boundary. Constants it merely computes with are not, and
+     * harvesting those would spend runs without probing anything. */
+    if (in->op != IR_OP_BINARY && in->op != IR_OP_BRANCH_ZERO &&
+        in->op != IR_OP_BRANCH_EQ) {
+      continue;
+    }
+    const IROperand *sides[2] = {&in->lhs, &in->rhs};
+    for (int s = 0; s < 2; s++) {
+      if (sides[s]->kind != IR_OPERAND_INT) {
+        continue;
+      }
+      long long c = sides[s]->int_value;
+      /* 0 and 1 are already covered by the fixed table; spending harvested
+       * runs on them buys nothing. */
+      if (c == 0 || c == 1) {
+        continue;
+      }
+      int before = h->count;
+      irv_harvest_push(h, c);
+      /* The value itself and one past it: an off-by-one at a boundary shows
+       * as a disagreement between exactly these two. */
+      irv_harvest_push(h, c + 1);
+      if (h->count != before) {
+        (*distinct)++;
+      }
+    }
+  }
+}
+
+static IRVCheckOutcome irv_check_function_ex(IRProgram *program,
+                                             IRFunction *function,
+                                             const IRVerifySnapshot *snapshot,
+                                             IRVCheckResult *result,
+                                             const IRVHarvest *harvest);
+
 static IRVCheckOutcome irv_check_function(IRProgram *program,
                                           IRFunction *function,
                                           const IRVerifySnapshot *snapshot,
                                           IRVCheckResult *result) {
+  return irv_check_function_ex(program, function, snapshot, result, NULL);
+}
+
+static IRVCheckOutcome irv_check_function_ex(IRProgram *program,
+                                          IRFunction *function,
+                                          const IRVerifySnapshot *snapshot,
+                                          IRVCheckResult *result,
+                                          const IRVHarvest *harvest) {
   result->why[0] = '\0';
   result->cex[0] = '\0';
   result->skip_reason[0] = '\0';
@@ -989,7 +1075,8 @@ static IRVCheckOutcome irv_check_function(IRProgram *program,
 
   int usable_inputs = 0;
   int stats = irv_stats_enabled();
-  for (int run = 0; run < IRV_INPUT_RUNS; run++) {
+  const int harvested = harvest ? harvest->count : 0;
+  for (int run = 0; run < IRV_INPUT_RUNS + harvested; run++) {
     double t0 = stats ? irv_now_ms() : 0.0;
     IRInterpMachine *machine_before = ir_interp_create(program);
     IRInterpMachine *machine_after = ir_interp_create(program);
@@ -1002,10 +1089,15 @@ static IRVCheckOutcome irv_check_function(IRProgram *program,
 
     IRInterpValue args_before[IRV_MAX_PARAMS];
     IRInterpValue args_after[IRV_MAX_PARAMS];
-    if (!irv_setup_machine(machine_before, function, params, param_count, run,
-                           args_before) ||
-        !irv_setup_machine(machine_after, function, params, param_count, run,
-                           args_after)) {
+    /* Runs past the fixed table carry a harvested boundary value; the buffer
+     * shape stays on the table's cycle so lengths remain in range. */
+    const long long *boundary =
+        (run >= IRV_INPUT_RUNS) ? &harvest->values[run - IRV_INPUT_RUNS] : NULL;
+    const int shape_run = (run >= IRV_INPUT_RUNS) ? 0 : run;
+    if (!irv_setup_machine(machine_before, function, params, param_count,
+                           shape_run, args_before, boundary) ||
+        !irv_setup_machine(machine_after, function, params, param_count,
+                           shape_run, args_after, boundary)) {
       ir_interp_destroy(machine_before);
       ir_interp_destroy(machine_after);
       continue;
@@ -1190,8 +1282,23 @@ IRVerifyRewriteVerdict ir_verify_check_rewrite(
     return IR_VERIFY_REWRITE_UNVERIFIABLE;
   }
 
+  /* The standalone gate compares two different functions, where a boundary
+   * one of them moved is exactly the interesting case. The per-pass --verify
+   * path deliberately does not harvest: it compares one function across a
+   * transformation, its table is tuned for that, and every build pays its
+   * cost. */
+  IRVHarvest harvest;
+  memset(&harvest, 0, sizeof(harvest));
+  int distinct = 0;
+  irv_harvest_stream(function->instructions, function->instruction_count,
+                     &harvest, &distinct);
+  irv_harvest_stream(snapshot->instructions, snapshot->instruction_count,
+                     &harvest, &distinct);
+  g_last_input_runs = IRV_INPUT_RUNS + harvest.count;
+
   IRVCheckResult result;
-  switch (irv_check_function(program, function, snapshot, &result)) {
+  switch (irv_check_function_ex(program, function, snapshot, &result,
+                                &harvest)) {
   case IRV_CHECK_DIVERGED:
     if (why && why_capacity) {
       snprintf(why, why_capacity, "%s", result.why);

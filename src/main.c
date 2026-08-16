@@ -3482,9 +3482,11 @@ static int compile_run_swap_check(IRProgram *ir_program,
      * inputs, so agreement across them is evidence and not equivalence, and a
      * verdict that reads as a proof would be the decoration III.2.6 refuses. */
     printf("swap-check: OK - '%s' matched '%s' on %d generated input sets\n",
-           new_name, old_name, ir_verify_input_run_count());
-    printf("  This is a differential test over generated inputs, not a proof. "
-           "Behavior on inputs outside those sets was not observed.\n");
+           new_name, old_name, ir_verify_last_input_run_count());
+    printf("  Inputs cover a fixed shape table plus the constants these two "
+           "functions compare against, tested on both sides of each.\n");
+    printf("  This is a differential test, not a proof: behavior on inputs "
+           "outside those sets was not observed.\n");
     return 0;
   case IR_VERIFY_REWRITE_DIVERGED:
     fprintf(stderr, "swap-check: DIVERGED - '%s' does not match '%s'\n",

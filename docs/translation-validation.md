@@ -182,23 +182,38 @@ checked" must never read as "checked and fine".
 
 **OK**, meaning the two agreed on every generated input set.
 
-### What OK does not mean
+### What OK covers, and what it does not
 
-It is a differential test over a fixed set of generated inputs, not a proof.
-Integer arguments come from a small table tuned for validating optimizer
-passes: a single `int32` parameter is tried at 5, 0, 7, 0, 2 and 1. A
-difference that only appears outside those values is not observed.
+Inputs come from two places. A fixed table probes shapes: buffer spans, index
+pairs, negative values, large magnitudes. On top of that, the gate harvests the
+integer constants the two functions actually **compare against** and tests each
+one and the value just past it, because a constant a function is tested against
+is a boundary and a boundary is where a rewrite goes wrong.
+
+That second half is what the fixed table structurally cannot do. These two
+differ at exactly `n == 100`:
 
 ```mettle
 fn far_v1(n: int32) -> int32 { if (n > 100)  { return 100; } return n; }
 fn far_v2(n: int32) -> int32 { if (n >= 100) { return 99;  } return n; }
 ```
 
-These differ at exactly `n == 100`, and `swap-check` reports OK, because no
-generated input reaches 100. The verdict says so in as many words rather than
-implying equivalence. Treat OK as evidence that raises confidence, and treat
-the input table as the limit on how much confidence it can raise.
+No entry in the shape table reaches 100, so before harvesting this pair was
+reported OK. Now it is caught, with the input named:
 
-`tests/swap_check_pairs.mettle` pins this case, so widening the input
-generator shows up as that test changing rather than as a claim quietly
-becoming stronger.
+```
+swap-check: DIVERGED - 'far_v2' does not match 'far_v1'
+  return value was 100, is now 99
+  (input set 6) far_v2(100)
+```
+
+It is still a differential test, not a proof. Harvesting reaches boundaries the
+functions name; it does not reach a boundary that emerges from arithmetic
+neither function writes as a constant, and it says nothing about inputs it did
+not try. The passing verdict reports how many input sets actually ran and says
+plainly that it is a test.
+
+Harvesting is bounded (at most six distinct constants) and applies only to this
+standalone gate. The per-pass `--verify` path deliberately does not harvest: it
+compares one function across a transformation, its table is tuned for that, and
+every build pays its cost.
