@@ -1,0 +1,22 @@
+// The cross-struct contract has to fail when the structs disagree, or the
+// static_assert in test_comptime_string_compare is decoration. Here the second
+// struct reorders two fields, so the names still all exist but the offsets no
+// longer line up.
+struct WireIn {
+    id: int32
+    stamp: float64
+    flags: int32
+}
+
+struct WireOut {
+    stamp: float64
+    id: int32
+    flags: int32
+}
+
+fn main() -> int32 {
+    comptime for f in typeof(WireIn).fields {
+        static_assert(f.offset == fieldof(WireOut, f.name).offset);
+    }
+    return 0;
+}

@@ -938,6 +938,12 @@ $cases = @(
   @{ Name = "err_fieldof_not_a_type"; Path = "tests/err_fieldof_not_a_type.mettle"; ShouldSucceed = $false
      Pattern = "fieldof expects a compile-time type"
      OutputMustNotMatch = @("internal compiler error") },
+  # The cross-struct contract must fail on a mismatch, or the matching
+  # static_assert in test_comptime_string_compare proves nothing. The
+  # expansion note has to name the iteration that failed.
+  @{ Name = "err_comptime_contract_mismatch"; Path = "tests/err_comptime_contract_mismatch.mettle"; ShouldSucceed = $false
+     OutputMustMatch = @("static_assert failed", "expanded from comptime-for iteration 1 \(field ``id``\)")
+     OutputMustNotMatch = @("internal compiler error") },
   @{ Name = "err_type_var"; Path = "tests/err_type_var.mettle"; ShouldSucceed = $false
      Pattern = "type 'Type' has no runtime representation"
      OutputMustNotMatch = @("internal compiler error") },
@@ -2359,6 +2365,31 @@ foreach ($fieldofMode in @("debug", "release")) {
   catch {
     $failed++
     Write-CaseResult -Name "fieldof_runtime_$fieldofMode" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# Compile-time string equality, and the contract it exists for: two structs
+# checked field-for-field by name at compile time. Every assert folds, so the
+# program only has to confirm the walk ran over all three fields.
+foreach ($strCmpMode in @("debug", "release")) {
+  $total++
+  try {
+    $exePath = Join-Path $tmpDir "comptime_string_compare_$strCmpMode.exe"
+    if (Test-Path $exePath) { Remove-Item -Path $exePath -Force -ErrorAction SilentlyContinue }
+    $buildArgs = @()
+    if ($strCmpMode -eq "release") { $buildArgs += "--release" }
+    $buildArgs += @("--build", "tests\test_comptime_string_compare.mettle", "-o", $exePath)
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "string compare ($strCmpMode) build failed: $buildOut" }
+    & $exePath *> $null
+    if ($LASTEXITCODE -ne 3) {
+      throw "string compare ($strCmpMode) returned $LASTEXITCODE (expected 3)"
+    }
+    Write-CaseResult -Name "comptime_string_compare_$strCmpMode" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "comptime_string_compare_$strCmpMode" -Passed $false -Reason $_.Exception.Message
   }
 }
 

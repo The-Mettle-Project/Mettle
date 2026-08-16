@@ -8,9 +8,10 @@
  * Three decisions are baked in here and are worth stating where they live:
  *
  *  - `.name` is module-qualified ("std/net.Point"). A bare name cannot tell two
- *    modules' `Point` apart, and with no compile-time string operations the
- *    module could never be recovered from a bare name. Builtins and structural
- *    types (pointers, arrays) answer their own unambiguous spelling.
+ *    modules' `Point` apart, and since compile-time strings compare but do not
+ *    concatenate, the module could never be recovered from a bare name.
+ *    Builtins and structural types (pointers, arrays) answer their own
+ *    unambiguous spelling.
  *
  *  - `.fields` is a real sequence value, not a special form. It is backed by an
  *    arena owned by the TypeChecker and memoized per (type, query), so the

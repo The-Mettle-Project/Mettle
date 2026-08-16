@@ -177,8 +177,35 @@ static int type_checker_eval_numeric_constant(TypeChecker *checker,
     TypeCheckerConstant left = {0};
     TypeCheckerConstant right = {0};
     if (!binary_expr || !binary_expr->operator || !binary_expr->left ||
-        !binary_expr->right ||
-        !type_checker_eval_numeric_constant(
+        !binary_expr->right) {
+      return 0;
+    }
+
+    /* Compile-time strings compare for equality. A `.name` read off the field
+     * table is how a metaprogram asks whether two declarations agree, so the
+     * comparison folds to 0 or 1 here instead of reaching the backend, which
+     * has no compile-time string to compare. Attempted before the numeric
+     * fold because a string operand is not a number and would fail it. */
+    if (checker && (strcmp(binary_expr->operator, "==") == 0 ||
+                    strcmp(binary_expr->operator, "!=") == 0)) {
+      ComptimeValue left_string = comptime_none();
+      ComptimeValue right_string = comptime_none();
+      if (type_checker_eval_comptime(checker, binary_expr->left,
+                                     &left_string) &&
+          left_string.kind == COMPTIME_STRING && left_string.as.string.value &&
+          type_checker_eval_comptime(checker, binary_expr->right,
+                                     &right_string) &&
+          right_string.kind == COMPTIME_STRING &&
+          right_string.as.string.value) {
+        int equal = strcmp(left_string.as.string.value,
+                           right_string.as.string.value) == 0;
+        type_checker_constant_from_int(
+            out_value, binary_expr->operator[0] == '!' ? !equal : equal);
+        return 1;
+      }
+    }
+
+    if (!type_checker_eval_numeric_constant(
             checker, binary_expr->left, &left) ||
         !type_checker_eval_numeric_constant(
             checker, binary_expr->right, &right)) {

@@ -1,0 +1,48 @@
+// Compile-time strings compare for equality, which is what turns a readable
+// field table into a checkable one. Reading `.name` was already possible;
+// asking whether two names agree was not, so a contract that spans two
+// declarations had nowhere to be stated.
+//
+// The shape below is the one that motivates it: two structs that must stay
+// field-for-field identical, checked at compile time instead of by a tool that
+// reimplements the language.
+
+struct WireIn {
+    id: int32
+    stamp: float64
+    flags: int32
+}
+
+struct WireOut {
+    id: int32
+    stamp: float64
+    flags: int32
+}
+
+// A literal, a field name, and two field names against each other.
+static_assert("a" == "a");
+static_assert("a" != "b");
+static_assert(typeof(WireIn).fields[0].name == "id");
+static_assert(typeof(WireIn).fields[0].name != typeof(WireIn).fields[1].name);
+
+// A type's name is module-qualified; a field's name is not.
+static_assert(typeof(WireIn).name == "test_comptime_string_compare.WireIn");
+static_assert(typeof(WireIn).fields[1].name == "stamp");
+
+// The contract: same arity, and every field agrees by name, offset and size.
+static_assert(typeof(WireIn).fields.len == typeof(WireOut).fields.len);
+
+fn main() -> int32 {
+    var checked: int32 = 0;
+
+    comptime for f in typeof(WireIn).fields {
+        // Look the same name up in the other struct. A name WireOut does not
+        // carry is a compile error naming the fields it does have.
+        static_assert(f.name == fieldof(WireOut, f.name).name);
+        static_assert(f.offset == fieldof(WireOut, f.name).offset);
+        static_assert(f.type.size == fieldof(WireOut, f.name).type.size);
+        checked = checked + 1;
+    }
+
+    return checked;   // 3
+}

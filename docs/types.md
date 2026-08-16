@@ -460,7 +460,29 @@ static_assert(typeof(int32[4]).len == 4);
 
 `.name` on a user-declared type reports the module it was **defined** in, whatever import path reached it: `std/arena.Arena`, not `arena.Arena` or a filesystem path. A type declared in the root program is qualified by its file stem. Builtins and structural types answer their own already-unambiguous spelling (`int32`, `Point*`).
 
-This is deliberate and worth understanding before the name reaches a wire format. A bare name cannot distinguish two modules that each declare `Point`, and Mettle has no compile-time string operations, so a bare name could never be turned back into a qualified one. The cost is the mirror image: a qualified name is coupled to file layout, so **moving a module renames its types**. A generator that writes these names into a wire format should pin them rather than assume `.name` is stable across a refactor.
+This is deliberate and worth understanding before the name reaches a wire format. A bare name cannot distinguish two modules that each declare `Point`, and compile-time strings compare but do not concatenate or slice, so a bare name could never be turned back into a qualified one. The cost is the mirror image: a qualified name is coupled to file layout, so **moving a module renames its types**. A generator that writes these names into a wire format should pin them rather than assume `.name` is stable across a refactor.
+
+### Comparing names
+
+Compile-time strings answer `==` and `!=`, and the result folds like any other compile-time integer, so it is available to `static_assert`:
+
+```mettle
+static_assert(typeof(Point).fields[0].name == "x");
+static_assert(typeof(Point).fields[0].name != typeof(Point).fields[1].name);
+```
+
+Reading a name and comparing two names are different capabilities, and the second is what lets a contract that spans two declarations be stated where it belongs. Checking that two structs stay field-for-field identical is the shape that motivates it:
+
+```mettle
+comptime for f in typeof(WireIn).fields {
+  static_assert(f.name   == fieldof(WireOut, f.name).name);
+  static_assert(f.offset == fieldof(WireOut, f.name).offset);
+}
+```
+
+If the two drift apart, the build fails and the diagnostic names the iteration that caught it. A field name the other struct does not carry is caught by `fieldof` first, which lists the names it does have.
+
+Equality is the whole surface. There is no concatenation, ordering, length, or substring, because each of those is a way to compute a name the program never wrote, and `ident(...)` already composes names under rules the compiler can check.
 
 ### `Kind`
 
