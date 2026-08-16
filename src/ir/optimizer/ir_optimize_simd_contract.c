@@ -146,6 +146,22 @@ static int ir_region_has_loop_label(const IRFunction *function, size_t begin,
   return 0;
 }
 
+static int ir_label_is_loop_header(const char *label);
+
+/* Loop headers in a region. Distinguishes "the body gained a loop" from "this
+   loop is still a loop", which a plain label test cannot. */
+static size_t ir_region_loop_header_count(const IRFunction *function,
+                                          size_t begin, size_t end) {
+  size_t count = 0;
+  for (size_t i = begin + 1; i < end; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_LABEL && ir_label_is_loop_header(ins->text)) {
+      count++;
+    }
+  }
+  return count;
+}
+
 /* A loop's ENTRY label, as opposed to any of the other labels a loop emits.
  * `while` lowers to `ir_while_N` (entry) plus `ir_while_end_N` (exit), and the
  * exit contains the entry's name as a prefix -- so a plain substring test
@@ -2366,17 +2382,25 @@ static int ir_explain_simulate_inline_fix(const IRFunction *function,
     if (ir_optimize_function_revectorize(clone)) {
       size_t new_begin = 0, new_end = 0;
       if (ir_simd_find_marker_region(clone, marker_id, &new_begin, &new_end)) {
-        int nest = ir_region_has_loop_label(clone, new_begin, new_end);
+        /* Loop HEADERS, not any label carrying a loop's name. `while` emits
+         * `ir_while_N` and `ir_while_end_N`, and a substring test counts the
+         * exit label as a surviving loop. That read every collapsed loop as
+         * still looping, so a verified fix was reported as disproven and the
+         * reader was told inlining is not the blocker when removing
+         * `@noinline` is the whole fix. */
+        size_t before = ir_region_loop_header_count(function, begin, end);
+        size_t after = ir_region_loop_header_count(clone, new_begin, new_end);
         const IRInstruction *kernel =
             ir_region_vectorized_ins(clone, new_begin, new_end, 1);
-        if (!nest && kernel) {
+        if (after == 0 && kernel) {
           ir_explain_kernel_desc(kernel, desc, desc_cap);
           verified = 1;
         } else {
           /* The callee inlined cleanly, yet the loop is still scalar: the
-           * @inline advice is disproven. Report whether the body is now a
-           * loop nest so the caller can say WHY it cannot vectorize. */
-          *nest_after_out = nest;
+           * @inline advice is disproven. Only a RISE in headers means the
+           * callee brought loops in; the loop's own header surviving just
+           * means it stayed scalar. */
+          *nest_after_out = (after > before);
           verified = -1;
         }
       }

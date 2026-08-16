@@ -135,4 +135,25 @@ fn search_after(a: int32*, n: int64, key: int32) -> int64 {
   return -1;
 }
 
+// ---- call-in-body: remove the @noinline that blocks the callee -----------
+// Regression: the simulation proved this fix and the result was thrown away.
+// The success guard tested for a surviving label carrying a loop's name, and
+// `while` leaves `ir_while_end_N` behind after it collapses, so every proven
+// fix here read as disproven and the reader was told inlining was not the
+// blocker.
+@noinline fn scale_before(x: int32) -> int32 { return x * 3; }
+fn noinline_before(a: int32*, n: int64) -> int32 {
+  var s: int32 = 0;
+  var i: int64 = 0;
+  while (i < n) { s = s + scale_before(a[i]); i = i + 1; }
+  return s;
+}
+fn scale_after(x: int32) -> int32 { return x * 3; }
+fn noinline_after(a: int32*, n: int64) -> int32 {
+  var s: int32 = 0;
+  var i: int64 = 0;
+  while (i < n) { s = s + scale_after(a[i]); i = i + 1; }
+  return s;
+}
+
 fn main() -> int32 { return 0; }

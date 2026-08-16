@@ -5843,7 +5843,8 @@ $fixAdvicePairs = @(
   @{ Name = "count";     Id = "predicated-count" },
   @{ Name = "shift";     Id = "unbounded-shift" },
   @{ Name = "fill";      Id = "store-only-fill" },
-  @{ Name = "search";    Id = "early-exit" }
+  @{ Name = "search";    Id = "early-exit" },
+  @{ Name = "noinline";  Id = "call-in-body" }
 )
 
 $total++
