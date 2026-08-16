@@ -26,7 +26,7 @@ See [Imports](imports.md) for path resolution and `import_str`.
 ## With Prelude
 
 ```mettle
-// Compile with: mettle --prelude main.mettle -o main.s
+// Compile with: mettle --prelude --build main.mettle -o main.exe
 fn main() -> int32 {
   println("Hello");
   return 0;

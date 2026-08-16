@@ -91,6 +91,10 @@ Function pointers are useful for callbacks, strategy patterns, and C interop:
 
 ```mettle
 // Callback pattern
+fn add(a: int32, b: int32) -> int32 {
+  return a + b;
+}
+
 fn apply(op: fn(int32, int32) -> int32, a: int32, b: int32) -> int32 {
   return op(a, b);
 }
@@ -123,6 +127,8 @@ A non-capturing lambda has the same `fn(params) -> ret` type as a named function
 A lambda that references a variable from an enclosing scope *captures* it, becoming a closure that carries its captured state:
 
 ```mettle
+import "std/io"
+
 fn main() -> int32 {
   var base: int32 = 10;
   var add: Fn(int32) -> int32 = fn(x: int32) -> int32 { return x + base; };  // captures base
@@ -147,6 +153,8 @@ Because a closure carries state, its type is distinct from a plain function poin
 Use `Fn(...)->R` to carry closures across function boundaries - returned from a factory, passed to a higher-order function, or stored in a struct field:
 
 ```mettle
+import "std/io"
+
 fn make_adder(n: int32) -> Fn(int32) -> int32 {
   return fn(x: int32) -> int32 { return x + n; };   // closure capturing n
 }
@@ -167,6 +175,8 @@ fn main() -> int32 {
 A closure (or plain function pointer) stored in a struct field is called through the field, including via a pointer-to-struct receiver:
 
 ```mettle
+import "std/io"
+
 struct Handler { on_event: Fn(int32) -> int32; }
 
 fn main() -> int32 {
@@ -183,6 +193,10 @@ fn main() -> int32 {
 A capturing closure and a thin `fn(...)->R` are not directly interchangeable (a thin pointer cannot carry an environment, and a closure call site reads a code pointer a thin value does not have) - but a plain function or non-capturing lambda can still be passed anywhere an `Fn(...)` is expected. The compiler transparently wraps it in a generated adapter so it dispatches through the closure calling convention:
 
 ```mettle
+import "std/io"
+
+fn apply_twice(f: Fn(int32) -> int32, v: int32) -> int32 { return f(f(v)); }
+
 fn plus_one(x: int32) -> int32 { return x + 1; }
 
 fn main() -> int32 {

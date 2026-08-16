@@ -272,7 +272,7 @@ mettle --build app.mettle -o app.exe --link-arg stdlib\tracy_helpers.obj --link-
 The prelude re-exports `std/io`, `std/math`, `std/conv`, `std/mem`, `std/process`, and `std/net`. Use with `--prelude` to automatically import these modules without explicit `import` statements. The prelude is opt-in; it is not loaded by default. On Linux, `--prelude` will fail at link time because it pulls in `std/net` (Windows-only). Use explicit imports instead.
 
 ```bash
-mettle --prelude main.mettle -o main.s
+mettle --prelude --build main.mettle -o main.exe
 ```
 
 ## std/gpu
