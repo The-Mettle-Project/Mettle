@@ -429,6 +429,10 @@ static void print_declaration(AstPrinter *printer, const ASTNode *node) {
     return;
   }
 
+  /* A module-scope expansion generates declarations rather than blocks, so the
+   * provenance line belongs here too, and reads the same either way. */
+  print_provenance(printer, node);
+
   switch (node->type) {
   case AST_STRUCT_DECLARATION: {
     const StructDeclaration *decl = (const StructDeclaration *)node->data;

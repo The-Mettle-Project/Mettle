@@ -1240,7 +1240,8 @@ int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
       /* Const eval rewrites the block before any of it is checked: a `comptime for`
        * becomes one copy of its body per field, and each copy is checked
        * against a different field type from here on. */
-      int expanded_ok = type_checker_expand_comptime_block(checker, statement);
+      int expanded_ok =
+          type_checker_expand_comptime_block(checker, statement, 0);
 
       /* If this block is itself an expansion, every diagnostic raised while
        * checking it names the iteration that generated it. The frame is live

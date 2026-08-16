@@ -1,0 +1,21 @@
+// A type annotation is a name the checker resolves, and resolution happens
+// before the binding a composed name would be built from has a value. The
+// boundary is named rather than half-supported.
+
+struct Point {
+  x: int32;
+}
+
+comptime for f in typeof(Point).fields {
+  struct ident("Slot_", f.name) {
+    at: int64;
+  }
+
+  fn ident("read_", f.name)(slot: ident("Slot_", f.name)*) -> int64 {
+    return slot.at;
+  }
+}
+
+fn main() -> int32 {
+  return 0;
+}

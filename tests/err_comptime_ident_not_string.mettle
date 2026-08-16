@@ -1,0 +1,16 @@
+// The parts of a composed name are compile-time strings. An offset is a
+// number, and joining it would mean inventing a spelling for one.
+
+struct Point {
+  x: int32;
+}
+
+comptime for f in typeof(Point).fields {
+  fn ident("at_", f.offset)() -> int64 {
+    return f.offset;
+  }
+}
+
+fn main() -> int32 {
+  return 0;
+}
