@@ -1,0 +1,59 @@
+struct Box<T> {
+    value: T;
+
+    method get() -> T {
+        return this.value;
+    }
+
+    method plus(other: T) -> T {
+        return this.value + other;
+    }
+}
+
+struct Tally<T> {
+    total: T;
+
+    method get() -> T {
+        return this.total;
+    }
+
+    method with_box(b: Box<T>) -> T {
+        return this.total + b.get();
+    }
+
+    method twice() -> T {
+        return this.get() + this.get();
+    }
+}
+
+fn main() -> int32 {
+    var bi: Box<int32>;
+    bi.value = 10;
+
+    var bl: Box<int64>;
+    bl.value = 100;
+
+    var bf: Box<float64>;
+    bf.value = 2.5;
+
+    var t: Tally<int32>;
+    t.total = 6;
+
+    var tl: Tally<int64>;
+    tl.total = 1;
+
+    var result: int32 = bi.get();
+    result = result + bi.plus(5);
+    result = result + t.with_box(bi);
+    result = result + t.twice();
+
+    var wide: int64 = tl.with_box(bl);
+    result = result + (int32)wide;
+
+    var f: float64 = bf.get();
+    if (f > 2.0) {
+        result = result + 1;
+    }
+
+    return result;
+}

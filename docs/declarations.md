@@ -226,6 +226,30 @@ fn main() -> int32 {
 
 The compiler monomorphizes each unique struct instantiation. Generic structs can have multiple type parameters. See [Types](types.md#generic-type-parameters).
 
+A generic struct declares [methods](#methods) the way any other struct does, and each instantiation gets its own copy. The type parameters stand in for concrete types throughout a method: in its parameter types, in its return type, and in its body, including a local whose type is another generic instantiation.
+
+```mettle
+struct Box<T> {
+  value: T;
+
+  method get() -> T {
+    return this.value;
+  }
+
+  method plus(other: T) -> T {
+    return this.value + other;
+  }
+}
+
+fn main() -> int32 {
+  var b: Box<int32>;
+  b.value = 10;
+  return b.plus(32);
+}
+```
+
+`Box<int32>` and `Box<float64>` are separate types with separate methods, so `plus` adds integers in one and floats in the other.
+
 ## Structs and Enums
 
 Functions, variables, structs, and enums can be prefixed with `export` to make them visible to modules that import this file.

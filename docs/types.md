@@ -351,7 +351,7 @@ fn main() -> int32 {
 }
 ```
 
-The compiler performs **monomorphization** before type checking: each unique instantiation becomes a concrete type or function. There is no runtime generics; all type parameters are resolved at compile time.
+The compiler performs **monomorphization** before type checking: each unique instantiation becomes a concrete type or function. There is no runtime generics; all type parameters are resolved at compile time. A generic struct's methods are part of its instantiation: each concrete type carries its own copies, with the type parameters substituted through their signatures and bodies.
 
 Struct layout is computed in the frontend type table (declaration order,
 natural alignment, C padding rules), including byte offset and — for a
