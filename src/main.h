@@ -88,6 +88,12 @@ typedef struct {
   /* `mettle expand <file>`: print the program as source after compile-time
    * expansion, instead of generating code. */
   int expand_mode;
+  /* `mettle swap-check <file> --old F --new G`: run the differential harness
+   * over two functions instead of over one function before and after a pass,
+   * answering whether G could replace F at a call boundary. */
+  int swap_check_mode;
+  const char *swap_old_name;
+  const char *swap_new_name;
   /* --report-expansion: print what each `comptime for` site cost. */
   int report_expansion;
   /* --expansion-budget=N: fail the build if expansion generates more than N

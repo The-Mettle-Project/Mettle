@@ -146,3 +146,59 @@ comparison) across the majority of pass applications that change nothing.
 `METTLE_VERIFY_STATS=1` prints a breakdown of where validation time went.
 Use `--verify` in CI, before releases, or whenever a release-mode result
 looks suspicious. It implies `-O`.
+
+## Pointing the same check at two functions: `swap-check`
+
+The question a hot swap asks is whether a new function is compatible with the
+old one at the call boundary it replaces. That is the same shape of question
+translation validation already answers, so the same machinery answers it,
+aimed at two functions instead of at one function before and after a pass:
+
+```bash
+mettle swap-check app.mettle --old render_v1 --new render_v2
+```
+
+The check runs on lowered IR before optimization, so the verdict is about what
+the two functions mean rather than about what any pass did to them. There are
+four outcomes.
+
+**REFUSED**, before any input is generated, when the signatures differ. A swap
+keeps the boundary it replaces; changing the signature changes every caller,
+which is a rebuild rather than a swap. This is also a soundness requirement:
+the gate runs the old body under the new function's signature, so comparing
+across different signatures would not mean anything.
+
+**DIVERGED**, with a counterexample naming the input:
+
+```
+swap-check: DIVERGED - 'near_v2' does not match 'near_v1'
+  return value was 5, is now 100
+  (input set 0) near_v2(5)
+```
+
+**UNVERIFIABLE** (exit code 2), when the gate cannot run these functions at
+all, reporting what blocked it. This is deliberately distinct from OK: "not
+checked" must never read as "checked and fine".
+
+**OK**, meaning the two agreed on every generated input set.
+
+### What OK does not mean
+
+It is a differential test over a fixed set of generated inputs, not a proof.
+Integer arguments come from a small table tuned for validating optimizer
+passes: a single `int32` parameter is tried at 5, 0, 7, 0, 2 and 1. A
+difference that only appears outside those values is not observed.
+
+```mettle
+fn far_v1(n: int32) -> int32 { if (n > 100)  { return 100; } return n; }
+fn far_v2(n: int32) -> int32 { if (n >= 100) { return 99;  } return n; }
+```
+
+These differ at exactly `n == 100`, and `swap-check` reports OK, because no
+generated input reaches 100. The verdict says so in as many words rather than
+implying equivalence. Treat OK as evidence that raises confidence, and treat
+the input table as the limit on how much confidence it can raise.
+
+`tests/swap_check_pairs.mettle` pins this case, so widening the input
+generator shows up as that test changing rather than as a claim quietly
+becoming stronger.

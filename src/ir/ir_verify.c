@@ -78,6 +78,8 @@ void ir_verify_set_enabled(int enabled) { g_enabled = enabled; }
 int ir_verify_enabled(void) { return g_enabled; }
 int ir_verify_divergence_count(void) { return (int)g_divergences; }
 
+int ir_verify_input_run_count(void) { return IRV_INPUT_RUNS; }
+
 static int irv_color(void) {
   static int cached = -1;
   if (cached < 0) {

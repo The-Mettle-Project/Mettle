@@ -56,6 +56,11 @@ int ir_verify_check_pass(IRFunction *function, IRVerifySnapshot *snapshot,
 /* Exit code contribution: number of divergences found this compile. */
 int ir_verify_divergence_count(void);
 
+/* How many generated input sets a check runs. Callers that report a passing
+ * verdict need this: the check is a differential test over these sets, and a
+ * verdict that does not say so reads as a proof it is not. */
+int ir_verify_input_run_count(void);
+
 /* ---- standalone rewrite gate ----
  *
  * The differential check is also usable OUTSIDE the --verify lifecycle, by

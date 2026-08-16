@@ -738,7 +738,15 @@ bounds. The first of those is the precondition for everything in Part III.
   renames and reorderings that leave the size unchanged, and the metaprogram
   that would write the migration can already read both layouts through
   `typeof`, `fieldof` and compile-time string comparison.
-- Swap gating through the existing differential harness. *(IV.5)*
+- Swap gating through the existing differential harness. *(IV.5)* **Mechanism
+  landed, coverage bounded.** `mettle swap-check <file> --old F --new G` aims
+  `ir_verify_check_rewrite` at two functions instead of at one function across
+  a pass, refusing a changed signature outright and reporting divergence with
+  a counterexample. What it does not yet have is inputs worth trusting a swap
+  to: the generator uses a fixed table tuned for pass validation, so a
+  difference that only appears at an untried value is reported OK. The verdict
+  says so. Before this gates a live process, the input generator is the thing
+  to strengthen, not the plumbing.
 
 **Before the runtime grows:**
 

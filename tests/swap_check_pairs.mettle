@@ -1,0 +1,42 @@
+// Fixtures for `mettle swap-check`. Each pair states one question the swap
+// gate has to answer at a call boundary.
+
+// Equivalent by algebra, different in shape: must pass.
+fn scale_v1(a: int32, b: int32) -> int32 {
+    return (a * 2) + (b * 2);
+}
+fn scale_v2(a: int32, b: int32) -> int32 {
+    return (a + b) * 2;
+}
+
+// Differs at n = 5, which the generator does try: must be caught.
+fn near_v1(n: int32) -> int32 {
+    if (n > 5) { return 100; }
+    return n;
+}
+fn near_v2(n: int32) -> int32 {
+    if (n >= 5) { return 100; }
+    return n;
+}
+
+// Differs only at n = 100, which the generator does not try. The gate reports
+// OK here, and that is the limit of the check rather than a claim about these
+// two functions. Pinned so the limitation stays visible and so widening the
+// input generator shows up as this test changing.
+fn far_v1(n: int32) -> int32 {
+    if (n > 100) { return 100; }
+    return n;
+}
+fn far_v2(n: int32) -> int32 {
+    if (n >= 100) { return 99; }
+    return n;
+}
+
+// A different boundary: must be refused before any input is generated.
+fn other_shape(a: int64, b: int32) -> int32 {
+    return b;
+}
+
+fn main() -> int32 {
+    return 0;
+}

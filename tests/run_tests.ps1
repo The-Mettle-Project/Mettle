@@ -2531,6 +2531,47 @@ catch {
   Write-CaseResult -Name "expand_prints_module_scope_asserts" -Passed $false -Reason $_.Exception.Message
 }
 
+# `mettle swap-check` points the differential harness at two functions instead
+# of at one function before and after a pass. Four verdicts have to hold: an
+# equivalent rewrite passes, a divergence inside the generated inputs is caught
+# with a counterexample, a changed signature is refused before any input runs,
+# and a passing verdict says it is a test rather than a proof.
+$total++
+try {
+  $swapFile = "tests\swap_check_pairs.mettle"
+
+  $out = & $CompilerPath swap-check $swapFile --old scale_v1 --new scale_v2 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "equivalent rewrite should pass: $out" }
+  if ($out -notmatch "OK") { throw "expected OK for the equivalent rewrite: $out" }
+  # A passing verdict must not read as equivalence.
+  if ($out -notmatch "not a proof") {
+    throw "a passing verdict must state that it is a differential test: $out"
+  }
+
+  $out = & $CompilerPath swap-check $swapFile --old near_v1 --new near_v2 2>&1 | Out-String
+  if ($LASTEXITCODE -eq 0) { throw "divergence at n=5 should have been caught: $out" }
+  if ($out -notmatch "DIVERGED") { throw "expected DIVERGED: $out" }
+  if ($out -notmatch "near_v2\(5\)") { throw "expected the counterexample naming the input: $out" }
+
+  $out = & $CompilerPath swap-check $swapFile --old near_v1 --new other_shape 2>&1 | Out-String
+  if ($LASTEXITCODE -eq 0) { throw "a changed signature should be refused: $out" }
+  if ($out -notmatch "REFUSED") { throw "expected REFUSED for a signature change: $out" }
+
+  # Known limit, pinned deliberately: the generator does not try n = 100, so a
+  # difference that only shows there is not observed. If the input generator is
+  # widened this test fails, which is the reminder to revisit the claim.
+  $out = & $CompilerPath swap-check $swapFile --old far_v1 --new far_v2 2>&1 | Out-String
+  if ($out -notmatch "OK") {
+    throw "expected the documented limitation (n=100 not generated) to still hold: $out"
+  }
+
+  Write-CaseResult -Name "swap_check_verdicts" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "swap_check_verdicts" -Passed $false -Reason $_.Exception.Message
+}
+
 # Expansion keeps a ledger, and a budget is a contract that fails the build.
 $total++
 try {

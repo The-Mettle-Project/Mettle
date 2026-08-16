@@ -2676,6 +2676,18 @@ int main(int argc, char *argv[]) {
         return 1;
       }
     }
+    if (strcmp(argv[1], "swap-check") == 0) {
+      options.swap_check_mode = 1;
+      for (int i = 1; i + 1 < argc; i++) {
+        argv[i] = argv[i + 1];
+      }
+      argc--;
+      if (argc < 2) {
+        fprintf(stderr,
+                "usage: mettle swap-check <file.mettle> --old <fn> --new <fn>\n");
+        return 1;
+      }
+    }
     if (strcmp(argv[1], "test") == 0) {
       /* `mettle test <file> [--filter=S] [flags...]`: shift the subcommand
        * out and let the normal flag loop see the rest. */
@@ -2953,6 +2965,10 @@ int main(int argc, char *argv[]) {
       options.gpu_checks = 1;
     } else if (strcmp(argv[i], "--report-launches") == 0) {
       options.report_launches = 1;
+    } else if (strcmp(argv[i], "--old") == 0 && i + 1 < argc) {
+      options.swap_old_name = argv[++i];
+    } else if (strcmp(argv[i], "--new") == 0 && i + 1 < argc) {
+      options.swap_new_name = argv[++i];
     } else if (strcmp(argv[i], "--report-expansion") == 0) {
       options.report_expansion = 1;
     } else if (strncmp(argv[i], "--expansion-budget=", 19) == 0) {
@@ -3352,6 +3368,141 @@ static int compile_type_check(TypeChecker *type_checker, ASTNode *program,
     return 0;
   }
   return 1;
+}
+
+/* `mettle swap-check <file> --old F --new G`
+ *
+ * A hot swap asks whether the new function is compatible with the old one at
+ * this boundary. Translation validation already answers a question of exactly
+ * that shape, so this points the same machinery at two functions instead of
+ * at one function before and after a pass: it runs both on generated inputs
+ * and compares every observable, reporting a counterexample on divergence.
+ *
+ * It runs on lowered IR before optimization, so the verdict is about what the
+ * two functions mean, not about what any pass did to them. */
+static IRFunction *swap_find_function(IRProgram *program, const char *name) {
+  if (!program || !name) {
+    return NULL;
+  }
+  for (size_t i = 0; i < program->function_count; i++) {
+    IRFunction *fn = program->functions[i];
+    if (fn && fn->name && strcmp(fn->name, name) == 0) {
+      return fn;
+    }
+  }
+  return NULL;
+}
+
+/* A swap replaces a function at a call boundary, so the boundary has to be the
+ * same one. The gate runs the old body under the new function's signature, so
+ * a mismatch here would not merely be an unswappable change, it would make the
+ * comparison meaningless. */
+static int swap_signatures_match(const IRFunction *old_fn,
+                                 const IRFunction *new_fn, char *why,
+                                 size_t why_capacity) {
+  if (old_fn->parameter_count != new_fn->parameter_count) {
+    snprintf(why, why_capacity,
+             "parameter count differs: '%s' takes %zu, '%s' takes %zu",
+             old_fn->name, old_fn->parameter_count, new_fn->name,
+             new_fn->parameter_count);
+    return 0;
+  }
+  for (size_t i = 0; i < old_fn->parameter_count; i++) {
+    const char *a = old_fn->parameter_types ? old_fn->parameter_types[i] : NULL;
+    const char *b = new_fn->parameter_types ? new_fn->parameter_types[i] : NULL;
+    if ((a == NULL) != (b == NULL) || (a && b && strcmp(a, b) != 0)) {
+      snprintf(why, why_capacity,
+               "parameter %zu differs: '%s' takes '%s', '%s' takes '%s'",
+               i + 1, old_fn->name, a ? a : "?", new_fn->name, b ? b : "?");
+      return 0;
+    }
+  }
+  const char *ra = old_fn->return_type_name;
+  const char *rb = new_fn->return_type_name;
+  if ((ra == NULL) != (rb == NULL) || (ra && rb && strcmp(ra, rb) != 0)) {
+    snprintf(why, why_capacity,
+             "return type differs: '%s' returns '%s', '%s' returns '%s'",
+             old_fn->name, ra ? ra : "?", new_fn->name, rb ? rb : "?");
+    return 0;
+  }
+  return 1;
+}
+
+static int compile_run_swap_check(IRProgram *ir_program,
+                                  const char *old_name,
+                                  const char *new_name) {
+  IRFunction *old_fn = swap_find_function(ir_program, old_name);
+  IRFunction *new_fn = swap_find_function(ir_program, new_name);
+  if (!old_fn) {
+    fprintf(stderr, "swap-check: no function named '%s' in this program\n",
+            old_name);
+    return 1;
+  }
+  if (!new_fn) {
+    fprintf(stderr, "swap-check: no function named '%s' in this program\n",
+            new_name);
+    return 1;
+  }
+  if (old_fn == new_fn) {
+    fprintf(stderr,
+            "swap-check: --old and --new name the same function ('%s')\n",
+            old_name);
+    return 1;
+  }
+
+  char why[512];
+  why[0] = '\0';
+  if (!swap_signatures_match(old_fn, new_fn, why, sizeof(why))) {
+    fprintf(stderr, "swap-check: REFUSED - %s\n", why);
+    fprintf(stderr,
+            "  A swap has to keep the boundary it replaces. Change the "
+            "signature and the callers change with it, which is a rebuild "
+            "rather than a swap.\n");
+    return 1;
+  }
+
+  IRVerifySnapshot *before = ir_verify_snapshot_capture(old_fn);
+  if (!before) {
+    fprintf(stderr, "swap-check: could not snapshot '%s'\n", old_name);
+    return 1;
+  }
+
+  char divergence[512];
+  char counterexample[512];
+  char skip_reason[256];
+  IRVerifyRewriteVerdict verdict = ir_verify_check_rewrite(
+      ir_program, new_fn, before, divergence, sizeof(divergence),
+      counterexample, sizeof(counterexample), skip_reason,
+      sizeof(skip_reason));
+  ir_verify_snapshot_free(before);
+
+  switch (verdict) {
+  case IR_VERIFY_REWRITE_VALIDATED:
+    /* Say what was actually checked. The harness runs a fixed set of generated
+     * inputs, so agreement across them is evidence and not equivalence, and a
+     * verdict that reads as a proof would be the decoration III.2.6 refuses. */
+    printf("swap-check: OK - '%s' matched '%s' on %d generated input sets\n",
+           new_name, old_name, ir_verify_input_run_count());
+    printf("  This is a differential test over generated inputs, not a proof. "
+           "Behavior on inputs outside those sets was not observed.\n");
+    return 0;
+  case IR_VERIFY_REWRITE_DIVERGED:
+    fprintf(stderr, "swap-check: DIVERGED - '%s' does not match '%s'\n",
+            new_name, old_name);
+    fprintf(stderr, "  %s\n", divergence);
+    if (counterexample[0]) {
+      fprintf(stderr, "  %s\n", counterexample);
+    }
+    return 1;
+  case IR_VERIFY_REWRITE_UNVERIFIABLE:
+  default:
+    /* Not a pass: the gate could not run these functions, which is a
+     * different answer from "they differ" and must not read as approval. */
+    fprintf(stderr,
+            "swap-check: UNVERIFIABLE - the gate could not run '%s': %s\n",
+            new_name, skip_reason[0] ? skip_reason : "unknown");
+    return 2;
+  }
 }
 
 static int compile_lower_to_ir(ASTNode *program, TypeChecker *type_checker,
@@ -3964,6 +4115,18 @@ int compile_file(const char *input_filename, const char *output_filename,
   compiler_profile_add(&profile, PROFILE_PHASE_IR_LOWERING, phase_start);
   if (!ir_ok) {
     result = 1;
+    goto cleanup;
+  }
+
+  if (options->swap_check_mode) {
+    if (!options->swap_old_name || !options->swap_new_name) {
+      fprintf(stderr,
+              "swap-check needs both functions: --old <fn> --new <fn>\n");
+      result = 1;
+      goto cleanup;
+    }
+    result = compile_run_swap_check(ir_program, options->swap_old_name,
+                                    options->swap_new_name);
     goto cleanup;
   }
 
