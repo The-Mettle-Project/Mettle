@@ -23,8 +23,13 @@
 #define MyAppName "Mettle"
 #define MyRepoUrl "https://github.com/The-Mettle-Project/Mettle"
 
+; The banner carries the version, so a release build whose version disagrees
+; with the art would ship the wrong number. Only version-shaped builds are
+; checked: release.yml packages dry runs under a label like "manual", where the
+; drawn version is not meant to match.
 #include "art\version.isi"
-#if ArtVersion != MyAppVersion
+#define VersionShaped (Copy(MyAppVersion, 1, 1) >= "0") && (Copy(MyAppVersion, 1, 1) <= "9")
+#if VersionShaped && (ArtVersion != MyAppVersion)
   #pragma message "wizard art was rendered for " + ArtVersion + ", this build is " + MyAppVersion
   #error Wizard art is stale; the version drawn on the banner is not this build's. Re-run: python installer/render_wizard_art.py --version=<this build's version>
 #endif

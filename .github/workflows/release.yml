@@ -82,6 +82,10 @@ jobs:
 
       # Build the GUI installer (Inno Setup) from the bundle build.bat produced.
       # ISCC ships on the windows-latest image; install it if the image changes.
+      # The wizard theming (WizardBackColorDynamicDark and the other DynamicDark
+      # directives, and PNG wizard images) needs Inno 6.7.0 or newer, so the
+      # engine version is checked before the build rather than after it fails on
+      # an unrecognized directive.
       - name: Build GUI installer
         id: installer
         shell: pwsh
@@ -95,9 +99,42 @@ jobs:
             choco install innosetup --no-progress -y
           }
           if (-not (Test-Path $iscc)) { $iscc = (Get-Command ISCC.exe).Source }
+
+          # ISCC carries no version resource; it reports the engine version when
+          # it compiles, so probe with a throwaway script.
+          function Get-IsccVersion($exe) {
+            $probe = Join-Path $env:RUNNER_TEMP "isccprobe.iss"
+            @"
+          [Setup]
+          AppName=Probe
+          AppVersion=1.0
+          DefaultDirName={autopf}\Probe
+          OutputDir=$env:RUNNER_TEMP
+          OutputBaseFilename=isccprobe
+          [Files]
+          "@ | Set-Content -Path $probe -Encoding utf8
+            $out = & $exe $probe 2>&1 | Out-String
+            if ($out -match 'Compiler engine version:\s*Inno Setup\s*([0-9][0-9.]*)') { return [version]$Matches[1] }
+            return $null
+          }
+
+          $have = Get-IsccVersion $iscc
+          if ($have -eq $null) { throw "could not determine the Inno Setup version of $iscc" }
+          Write-Host "Inno Setup engine $have"
+          if ($have -lt [version]'6.7.0') {
+            Write-Host "engine is older than 6.7.0; upgrading"
+            choco upgrade innosetup --no-progress -y --version=6.7.3
+            $have = Get-IsccVersion $iscc
+            Write-Host "Inno Setup engine now $have"
+          }
+          if ($have -lt [version]'6.7.0') {
+            throw "installer/Mettle.iss needs Inno Setup 6.7.0 or newer for its wizard theming; runner has $have"
+          }
+
           # Inno expects a numeric-ish AppVersion; strip a leading 'v'.
           $ver = $tag -replace '^v',''
           & $iscc "/DMyAppVersion=$ver" installer\Mettle.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
           $setup = "mettle-$tag-windows-x64-setup.exe"
           Copy-Item installer\out\Mettle-Setup.exe $setup -Force
           echo "setup=$setup" >> $env:GITHUB_OUTPUT
