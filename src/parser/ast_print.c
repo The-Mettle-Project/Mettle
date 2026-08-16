@@ -505,6 +505,13 @@ static void print_declaration(AstPrinter *printer, const ASTNode *node) {
     print_statement(printer, node);
     break;
 
+  /* A call at module scope is `static_assert(...)`, which the statement
+   * printer already writes. Reaching the default here would report a
+   * declaration the programmer wrote as having no source form. */
+  case AST_FUNCTION_CALL:
+    print_statement(printer, node);
+    break;
+
   default:
     print_unprintable(printer, "this declaration");
     fputc('\n', printer->out);

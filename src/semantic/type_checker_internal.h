@@ -80,6 +80,12 @@ Type *type_checker_resolve_typeof_argument(TypeChecker *checker,
 int type_checker_eval_offsetof(TypeChecker *checker, CallExpression *call,
                                SourceLocation location, long long *out_offset);
 
+/* `fieldof(T, "name")`: the Field `T.name` names, reached through a
+ * compile-time string so a metaprogram can compose the name it looks up. */
+int type_checker_eval_fieldof(TypeChecker *checker, CallExpression *call,
+                              SourceLocation location,
+                              ComptimeValue *out_value);
+
 int type_checker_eval_comptime(TypeChecker *checker, ASTNode *expression,
                                ComptimeValue *out_value);
 

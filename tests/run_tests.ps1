@@ -929,6 +929,15 @@ $cases = @(
   @{ Name = "err_offsetof_not_field"; Path = "tests/err_offsetof_not_field.mettle"; ShouldSucceed = $false
      Pattern = "offsetof expects a compile-time Field"
      OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_fieldof_unknown_field"; Path = "tests/err_fieldof_unknown_field.mettle"; ShouldSucceed = $false
+     OutputMustMatch = @("'Point' has no field named 'z'", "it has x, y")
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_fieldof_not_a_string"; Path = "tests/err_fieldof_not_a_string.mettle"; ShouldSucceed = $false
+     Pattern = "fieldof expects a compile-time string"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_fieldof_not_a_type"; Path = "tests/err_fieldof_not_a_type.mettle"; ShouldSucceed = $false
+     Pattern = "fieldof expects a compile-time type"
+     OutputMustNotMatch = @("internal compiler error") },
   @{ Name = "err_type_var"; Path = "tests/err_type_var.mettle"; ShouldSucceed = $false
      Pattern = "type 'Type' has no runtime representation"
      OutputMustNotMatch = @("internal compiler error") },
@@ -2327,6 +2336,32 @@ catch {
   Write-CaseResult -Name "comptime_for_fields_runtime" -Passed $false -Reason $_.Exception.Message
 }
 
+# `fieldof` folds a name lookup into an offset, a size and an index, so the
+# expansion is only observable by running it. Both backends: the constants are
+# folded in the checker, but the arithmetic around them is not.
+# Returns 8 + 8 + (4 + 8 + 4) = 32.
+foreach ($fieldofMode in @("debug", "release")) {
+  $total++
+  try {
+    $exePath = Join-Path $tmpDir "fieldof_$fieldofMode.exe"
+    if (Test-Path $exePath) { Remove-Item -Path $exePath -Force -ErrorAction SilentlyContinue }
+    $buildArgs = @()
+    if ($fieldofMode -eq "release") { $buildArgs += "--release" }
+    $buildArgs += @("--build", "tests\test_fieldof.mettle", "-o", $exePath)
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "fieldof ($fieldofMode) build failed: $buildOut" }
+    & $exePath *> $null
+    if ($LASTEXITCODE -ne 32) {
+      throw "fieldof ($fieldofMode) returned $LASTEXITCODE (expected 32)"
+    }
+    Write-CaseResult -Name "fieldof_runtime_$fieldofMode" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "fieldof_runtime_$fieldofMode" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # A module-scope directive generates real declarations: the program calls the
 # functions, reads the constants and declares the structs it produced, and
 # returns non-zero if any of them carries the wrong field.
@@ -2430,6 +2465,30 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "expand_shows_generated_source" -Passed $false -Reason $_.Exception.Message
+}
+
+# Expansion is inspectable, which means every declaration the programmer wrote
+# comes back as source. A module-scope `static_assert` used to reach the
+# printer's default arm and be reported as having no source form, which also
+# made expand disclaim the whole file as an incomplete program.
+$total++
+try {
+  $out = & $CompilerPath expand "tests\test_fieldof.mettle" 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "expand failed: $out" }
+  if ($out -match "no source form") {
+    throw "expand reported a declaration as unprintable: $out"
+  }
+  if ($out -match "not a complete program") {
+    throw "expand disclaimed the output despite printing every node: $out"
+  }
+  foreach ($expected in @('static_assert(', 'fieldof(Packet, "stamp")')) {
+    if ($out -notmatch [regex]::Escape($expected)) { throw "missing '$expected' in: $out" }
+  }
+  Write-CaseResult -Name "expand_prints_module_scope_asserts" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "expand_prints_module_scope_asserts" -Passed $false -Reason $_.Exception.Message
 }
 
 # Expansion keeps a ledger, and a budget is a contract that fails the build.

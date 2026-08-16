@@ -513,7 +513,10 @@ var i: int64 = (int64)f;
 parser, and its argument is parsed as a type annotation. `typeof` is the same
 kind of builtin: it yields a compile-time `Type` value (a TypeRef) and has no
 runtime representation. `Type` and `Field` cannot escape into runtime code. `offsetof` takes a
-compile-time `Field` and folds the frontend type-table byte offset.
+compile-time `Field` and folds the frontend type-table byte offset. `fieldof`
+takes a compile-time `Type` and a compile-time string and yields the `Field`
+that name designates, which is the only path into the field table a metaprogram
+can compose, since every other spelling needs the name written in the source.
 
 ### Lambdas and closures
 

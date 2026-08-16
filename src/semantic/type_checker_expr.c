@@ -2208,6 +2208,19 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
         return type_checker_type_value(checker, referred, expression);
       }
 
+      if (strcmp(call->function_name, "fieldof") == 0) {
+        ComptimeValue field = comptime_none();
+        if (!type_checker_eval_fieldof(checker, call, expression->location,
+                                       &field)) {
+          return NULL;
+        }
+        Type *owner = type_checker_type_from_index(
+            checker, field.as.field_ref.type_index);
+        return type_checker_field_value(checker, owner,
+                                        field.as.field_ref.field_index,
+                                        expression);
+      }
+
       if (strcmp(call->function_name, "static_assert") == 0) {
         return type_checker_validate_static_assert(checker, call,
                                                    expression->location)

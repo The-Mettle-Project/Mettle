@@ -1,0 +1,10 @@
+// A misspelled field name has to name the fields the type does have, so the
+// fix is readable without opening the declaration.
+struct Point {
+    x: int32
+    y: float64
+}
+
+fn main() -> int32 {
+    return (int32)fieldof(Point, "z").offset;
+}

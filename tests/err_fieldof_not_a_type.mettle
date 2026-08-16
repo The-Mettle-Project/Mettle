@@ -1,0 +1,10 @@
+// The first argument is a type, not a value of that type.
+struct Point {
+    x: int32
+    y: float64
+}
+
+fn main() -> int32 {
+    var p: Point;
+    return (int32)fieldof(p, "x").offset;
+}

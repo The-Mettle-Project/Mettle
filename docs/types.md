@@ -385,12 +385,43 @@ struct Point {
 }
 
 const T: Type = int32;           // or typeof(int32), or typeof(n)
-const F: Field = Point.x;        // or typeof(Point).x
+const F: Field = Point.x;        // or typeof(Point).x, or fieldof(Point, "x")
 ```
 
 `Type` and `Field` have **no runtime representation**. They cannot be stored in a `var`, appear as a function parameter or return type, sit in a struct field, or otherwise escape into runtime code. Bind them with `const` and use them only at compile time. `sizeof(Type)` is rejected for the same reason.
 
 `typeof` is a compile-time builtin. A type name is taken as that type; any other argument is typed as an expression and `typeof` yields that expression's type.
+
+### `fieldof`
+
+`Point.x` and `typeof(Point).x` both need the field name spelled in the source. `fieldof(T, name)` takes the name as a compile-time **string**, so a metaprogram can compose the name it looks up:
+
+```mettle
+const F: Field = fieldof(Point, "x");
+static_assert(fieldof(Point, "y").offset == 8);
+```
+
+The first argument is a type, either named directly or held in a `const T: Type`. The second is any compile-time string, which includes a `.name` read back out of the field table, so a walk can look each field up again without the name appearing in source:
+
+```mettle
+comptime for f in typeof(Packet).fields {
+  total = total + (int32)fieldof(Packet, f.name).type.size;
+}
+```
+
+The result is an ordinary `Field` and answers every `Field` query, so it composes with `offsetof`:
+
+```mettle
+static_assert(offsetof(fieldof(Packet, "stamp")) == 8);
+```
+
+A name that no field carries is a compile error that lists the names the type does have:
+
+```
+error[E0003]: 'Point' has no field named 'z'; it has x, y
+```
+
+Like `typeof` and `offsetof`, `fieldof` is spelled with an identifier and call syntax and adds no punctuation the lexer did not already read.
 
 ## Reflection queries
 

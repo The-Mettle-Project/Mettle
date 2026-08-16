@@ -1,0 +1,10 @@
+// The second argument is a compile-time string. An integer is the mistake a
+// programmer reaching for a field index would make.
+struct Point {
+    x: int32
+    y: float64
+}
+
+fn main() -> int32 {
+    return (int32)fieldof(Point, 0).offset;
+}

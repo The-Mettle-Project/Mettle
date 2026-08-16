@@ -1,0 +1,36 @@
+// `fieldof(T, "name")` reaches a Field through a compile-time string, which is
+// the one way into the field table that a metaprogram can compose: `T.x` and
+// `typeof(T).x` both need the name spelled in the source. Exercises a literal
+// name, a name carried by a Type const, composition with offsetof, a name read
+// back out of the field table itself, and use inside `comptime for`.
+
+struct Packet {
+    id: int32
+    stamp: float64
+    flags: int32
+}
+
+const T: Type = typeof(Packet);
+
+static_assert(fieldof(Packet, "id").index == 0);
+static_assert(fieldof(Packet, "stamp").offset == 8);
+static_assert(fieldof(T, "flags").type.size == 4);
+static_assert(offsetof(fieldof(Packet, "stamp")) == 8);
+
+fn main() -> int32 {
+    var total: int32 = 0;
+
+    // A Field reached by name answers the same queries one reached by
+    // spelling does.
+    const F: Field = fieldof(Packet, "stamp");
+    total = total + (int32)F.offset;              // 8
+    total = total + (int32)F.type.size;           // + 8
+
+    // The name can come from the field table, so a walk over `.fields` can
+    // look each field back up without the name ever appearing in source.
+    comptime for f in typeof(Packet).fields {
+        total = total + (int32)fieldof(Packet, f.name).type.size;
+    }                                             // + 4 + 8 + 4
+
+    return total;                                 // 32
+}

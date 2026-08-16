@@ -424,6 +424,92 @@ Type *type_checker_resolve_sizeof_argument(TypeChecker *checker,
   return type;
 }
 
+/* Name the fields a type does have, so a misspelling reads as a list rather
+ * than as "no such field". Truncates rather than growing without bound. */
+static void append_field_names(const Type *owner, char *buffer, size_t size) {
+  size_t used = 0;
+  buffer[0] = '\0';
+  for (size_t i = 0; i < owner->field_count; i++) {
+    TypeField field;
+    if (!type_field_at((Type *)owner, (uint32_t)i, &field) || !field.name) {
+      continue;
+    }
+    size_t need = strlen(field.name) + (used ? 2 : 0);
+    if (used + need + 4 >= size) {
+      snprintf(buffer + used, size - used, "%s...", used ? ", " : "");
+      return;
+    }
+    used += (size_t)snprintf(buffer + used, size - used, "%s%s",
+                             used ? ", " : "", field.name);
+  }
+}
+
+int type_checker_eval_fieldof(TypeChecker *checker, CallExpression *call,
+                              SourceLocation location,
+                              ComptimeValue *out_value) {
+  if (!checker || !call || !out_value) {
+    return 0;
+  }
+  if (call->argument_count != 2 || !call->arguments || !call->arguments[0] ||
+      !call->arguments[1]) {
+    type_checker_set_error_at_location(
+        checker, location,
+        "fieldof expects a type and a field name (for example "
+        "fieldof(Point, \"x\"))");
+    return 0;
+  }
+
+  ComptimeValue owner_value = comptime_none();
+  if (!type_checker_eval_comptime(checker, call->arguments[0], &owner_value) ||
+      owner_value.kind != COMPTIME_TYPE_REF) {
+    type_checker_set_error_at_location(
+        checker, call->arguments[0]->location,
+        "fieldof expects a compile-time type as its first argument");
+    return 0;
+  }
+
+  ComptimeValue name_value = comptime_none();
+  if (!type_checker_eval_comptime(checker, call->arguments[1], &name_value) ||
+      name_value.kind != COMPTIME_STRING || !name_value.as.string.value) {
+    type_checker_set_error_at_location(
+        checker, call->arguments[1]->location,
+        "fieldof expects a compile-time string as its second argument (a "
+        "string literal, or a `.name` query)");
+    return 0;
+  }
+
+  Type *owner =
+      type_checker_type_from_index(checker, owner_value.as.type_ref.type_index);
+  if (!owner) {
+    type_checker_set_error_at_location(
+        checker, call->arguments[0]->location,
+        "fieldof could not read that type from the type table");
+    return 0;
+  }
+
+  int field_index = type_get_field_index(owner, name_value.as.string.value);
+  if (field_index < 0) {
+    char names[256];
+    append_field_names(owner, names, sizeof(names));
+    if (names[0] != '\0') {
+      type_checker_set_error_at_location(
+          checker, call->arguments[1]->location,
+          "'%s' has no field named '%s'; it has %s",
+          owner->name ? owner->name : "<anonymous>",
+          name_value.as.string.value, names);
+    } else {
+      type_checker_set_error_at_location(
+          checker, call->arguments[1]->location, "'%s' has no fields",
+          owner->name ? owner->name : "<anonymous>");
+    }
+    return 0;
+  }
+
+  *out_value = comptime_field_ref(owner_value.as.type_ref.type_index,
+                                  (uint32_t)field_index);
+  return 1;
+}
+
 int type_checker_eval_offsetof(TypeChecker *checker, CallExpression *call,
                                SourceLocation location, long long *out_offset) {
   if (!checker || !call || !out_offset) {
@@ -629,6 +715,10 @@ int type_checker_eval_comptime(TypeChecker *checker, ASTNode *expression,
       }
       *out_value = comptime_int((long long)sized->size);
       return 1;
+    }
+    if (strcmp(call->function_name, "fieldof") == 0) {
+      return type_checker_eval_fieldof(checker, call, expression->location,
+                                       out_value);
     }
     return 0;
   }
