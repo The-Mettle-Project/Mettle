@@ -1,0 +1,8 @@
+// A group nested inside an argument list. The advice must describe the inner
+// group, not the argument list around it, and not a parameter list anywhere.
+fn take(a: int64) -> int64 { return a; }
+fn main() -> int32 {
+  var idx: int64 = 3;
+  var x: int64 = take((1, idx));
+  return 0;
+}

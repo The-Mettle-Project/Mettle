@@ -70,6 +70,10 @@ Parser *parser_create_with_error_reporter(Lexer *lexer,
   parser->error_message = NULL;
   parser->error_reporter = error_reporter;
   parser->error_recovery_mode = 0;
+  parser->previous_token_type = TOKEN_EOF;
+  parser->previous_token_text[0] = '\0';
+  parser->brace_depth = 0;
+  parser->group_context = NULL;
   parser->source_filename = error_reporter_current_filename(error_reporter);
   parser->gpu_mode = 0;
 
@@ -94,6 +98,17 @@ void parser_destroy(Parser *parser) {
 void parser_advance(Parser *parser) {
   if (!parser || parser->current_token.type == TOKEN_EOF)
     return;
+
+  parser->previous_token_type = parser->current_token.type;
+  parser->previous_token_text[0] = '\0';
+  if (parser->current_token.value) {
+    snprintf(parser->previous_token_text, sizeof(parser->previous_token_text),
+             "%s", parser->current_token.value);
+  }
+  if (parser->current_token.type == TOKEN_LBRACE)
+    parser->brace_depth++;
+  else if (parser->current_token.type == TOKEN_RBRACE && parser->brace_depth > 0)
+    parser->brace_depth--;
 
   token_destroy(&parser->current_token);
   parser->current_token = parser->peek_token;
@@ -283,11 +298,31 @@ int parser_expect(Parser *parser, TokenType type) {
 
   // Generate context-specific suggestions
   const char *suggestion = NULL;
+  char help_buf[PARSER_ERROR_BUF_SIZE];
   if (type == TOKEN_SEMICOLON) {
     suggestion = "add a semicolon ';' to end the statement";
   } else if (type == TOKEN_RPAREN &&
              parser->current_token.type == TOKEN_COMMA) {
-    suggestion = "check if you have an extra comma in the parameter list";
+    /* A comma where ')' was due means one of two different mistakes, and the
+       parser knows which: a list that ran on, or parentheses asked to hold
+       more than the one value they can hold. Mettle has no comma operator
+       and no tuples, so the second is never a list at all. */
+    const char *ctx = parser->group_context;
+    if (ctx && (strcmp(ctx, "parameter list") == 0 ||
+                strcmp(ctx, "argument list") == 0)) {
+      snprintf(help_buf, sizeof(help_buf),
+               "the %s ends here; drop the trailing ',' or close the list", ctx);
+    } else if (ctx) {
+      snprintf(help_buf, sizeof(help_buf),
+               "the %s holds one value, and Mettle has no tuples; remove the "
+               "',' and everything after it",
+               ctx);
+    } else {
+      snprintf(help_buf, sizeof(help_buf),
+               "parentheses group one value, and Mettle has no tuples; remove "
+               "the ',' and everything after it");
+    }
+    suggestion = help_buf;
   } else if (type == TOKEN_RBRACE && parser->current_token.type == TOKEN_EOF) {
     suggestion = "add a closing brace '}' to match the opening brace";
   } else if (type == TOKEN_COLON &&
@@ -415,6 +450,71 @@ void parser_synchronize(Parser *parser) {
   }
 }
 
+void parser_recover_in_block(Parser *parser, int block_depth) {
+  if (!parser)
+    return;
+
+  parser->error_recovery_mode = 1;
+  while (parser->current_token.type != TOKEN_EOF) {
+    if (parser->brace_depth <= block_depth) {
+      // The block's own closing brace ends the search; the block parser
+      // consumes it, so recovery must not.
+      if (parser->current_token.type == TOKEN_RBRACE)
+        break;
+      if (parser->current_token.type == TOKEN_SEMICOLON ||
+          parser->current_token.type == TOKEN_NEWLINE) {
+        parser_advance(parser);
+        break;
+      }
+    }
+    parser_advance(parser);
+  }
+  parser->error_recovery_mode = 0;
+  parser->group_context = NULL;
+}
+
+// Tokens that begin a top-level item. Recovery at file scope stops on one of
+// these so the rest of a broken function body is never read as declarations.
+static int parser_token_starts_declaration(TokenType type) {
+  switch (type) {
+  case TOKEN_IMPORT:
+  case TOKEN_EXPORT:
+  case TOKEN_EXTERN:
+  case TOKEN_FN:
+  case TOKEN_FUNCTION:
+  case TOKEN_KERNEL:
+  case TOKEN_STRUCT:
+  case TOKEN_ENUM:
+  case TOKEN_TRAIT:
+  case TOKEN_IMPL:
+  case TOKEN_VAR:
+  case TOKEN_CONST:
+  case TOKEN_AT:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+void parser_recover_to_declaration(Parser *parser) {
+  if (!parser)
+    return;
+
+  parser->error_recovery_mode = 1;
+  while (parser->current_token.type != TOKEN_EOF) {
+    if (parser->brace_depth == 0 &&
+        parser_token_starts_declaration(parser->current_token.type))
+      break;
+    parser_advance(parser);
+  }
+  parser->error_recovery_mode = 0;
+  parser->group_context = NULL;
+
+  parser->has_error = 0;
+  free(parser->error_message);
+  parser->error_message = NULL;
+}
+
 int parser_get_operator_precedence(TokenType type) {
   switch (type) {
   case TOKEN_DOT:
@@ -531,7 +631,7 @@ ASTNode *parser_parse_program(Parser *parser) {
     }
 
     if (parser->has_error) {
-      parser_recover_from_error(parser);
+      parser_recover_to_declaration(parser);
       // Hard guard against non-advancing recovery loops.
       if (parser->current_token.type != TOKEN_EOF &&
           parser->lexer->position == token_pos_before) {
@@ -1132,6 +1232,84 @@ static ASTNode *parser_parse_comptime_for(Parser *parser) {
   return node;
 }
 
+/* Words that declare something in C, Rust, Go, or Python and nothing in
+   Mettle. Naming the Mettle spelling once beats letting the reader work back
+   from a run of grammar complaints. */
+static const struct {
+  const char *word;
+  const char *message;
+  const char *help;
+} kForeignDeclarators[] = {
+    {"let", "'let' declares nothing in Mettle",
+     "locals start with 'var': var x: int64 = 0;"},
+    {"mut", "'mut' declares nothing in Mettle",
+     "every 'var' is already mutable: var x: int64 = 0;"},
+    {"auto", "Mettle infers no types, so 'auto' declares nothing",
+     "name the type: var x: int64 = 0;"},
+    {"def", "'def' declares nothing in Mettle",
+     "functions start with 'fn': fn name() -> int64 { ... }"},
+    {"func", "'func' declares nothing in Mettle",
+     "functions start with 'fn': fn name() -> int64 { ... }"},
+    {"int", "'int' is not a Mettle type",
+     "the integer types carry their width: int8, int16, int32, int64"},
+    {"uint", "'uint' is not a Mettle type",
+     "the unsigned types carry their width: uint8, uint16, uint32, uint64"},
+    {"unsigned", "'unsigned' is not a Mettle type",
+     "the unsigned types carry their width: uint8, uint16, uint32, uint64"},
+    {"signed", "'signed' is not a Mettle type",
+     "the signed types carry their width: int8, int16, int32, int64"},
+    {"long", "'long' is not a Mettle type", "write 'int64'"},
+    {"short", "'short' is not a Mettle type", "write 'int16'"},
+    {"char", "'char' is not a Mettle type",
+     "a byte is 'uint8'; text is 'string'"},
+    {"double", "'double' is not a Mettle type", "write 'float64'"},
+    {"float", "'float' is not a Mettle type",
+     "the float types carry their width: float32, float64"},
+    {"void", "'void' is not a Mettle type",
+     "a function that returns nothing leaves the '-> type' off"},
+};
+
+/* Two names in a row start no Mettle statement, so the reader has written a
+   declaration in another language's grammar. Say so and stop, rather than
+   letting the expression parser complain about the second name. Returns 1
+   when it reported. */
+static int parser_reject_foreign_declaration(Parser *parser) {
+  if (parser->current_token.type != TOKEN_IDENTIFIER &&
+      !(parser->current_token.type >= TOKEN_MOV &&
+        parser->current_token.type <= TOKEN_SYSCALL))
+    return 0;
+  if (parser->peek_token.type != TOKEN_IDENTIFIER &&
+      !parser_is_type_keyword(parser->peek_token.type))
+    return 0;
+  const char *word = parser->current_token.value;
+  if (!word)
+    return 0;
+
+  for (size_t i = 0; i < sizeof(kForeignDeclarators) / sizeof(*kForeignDeclarators);
+       i++) {
+    if (strcmp(word, kForeignDeclarators[i].word) != 0)
+      continue;
+    parser_set_error_with_suggestion(parser, kForeignDeclarators[i].message,
+                                     kForeignDeclarators[i].help);
+    if (parser->error_reporter)
+      error_reporter_set_last_label(parser->error_reporter,
+                                    "not a Mettle declaration");
+    return 1;
+  }
+
+  char message[PARSER_ERROR_BUF_SIZE];
+  char help[PARSER_ERROR_BUF_SIZE];
+  snprintf(message, sizeof(message),
+           "Expected an operator or the end of the statement after '%s', found "
+           "the name '%s'",
+           word, parser->peek_token.value ? parser->peek_token.value : "it");
+  snprintf(help, sizeof(help),
+           "a declaration names the type after the variable: var %s: %s = ...;",
+           parser->peek_token.value ? parser->peek_token.value : "name", word);
+  parser_set_error_with_suggestion(parser, message, help);
+  return 1;
+}
+
 ASTNode *parser_parse_statement(Parser *parser) {
   if (!parser)
     return NULL;
@@ -1261,6 +1439,9 @@ ASTNode *parser_parse_statement(Parser *parser) {
       parser->peek_token.type == TOKEN_IDENTIFIER) {
     return parser_parse_parenthesized_assignment(parser);
   }
+
+  if (parser_reject_foreign_declaration(parser))
+    return NULL;
 
   ASTNode *expr = parser_parse_expression(parser);
   if (!expr) {
@@ -2381,6 +2562,160 @@ static ASTNode *parser_parse_struct_literal(Parser *parser,
   return node;
 }
 
+// Name the token in front of the reader as concretely as the token allows:
+// its own text when it has text worth printing, otherwise its class.
+static void parser_describe_token(const Token *token, char *out, size_t cap) {
+  switch (token->type) {
+  case TOKEN_EOF:
+    snprintf(out, cap, "the end of the file");
+    return;
+  case TOKEN_NEWLINE:
+    snprintf(out, cap, "the end of the line");
+    return;
+  case TOKEN_STRING:
+    snprintf(out, cap, "a string literal");
+    return;
+  case TOKEN_ERROR:
+    snprintf(out, cap, "an invalid token");
+    return;
+  default:
+    break;
+  }
+  if (token->value && token->value[0] != '\0') {
+    snprintf(out, cap, "'%s'", token->value);
+    return;
+  }
+  snprintf(out, cap, "%s", token_type_to_string(token->type));
+}
+
+// True for keywords that open a statement. One of these in expression
+// position is nearly always a missing operand, not a misspelt name.
+static int parser_token_starts_statement(TokenType type) {
+  switch (type) {
+  case TOKEN_IF:
+  case TOKEN_ELSE:
+  case TOKEN_WHILE:
+  case TOKEN_FOR:
+  case TOKEN_RETURN:
+  case TOKEN_BREAK:
+  case TOKEN_CONTINUE:
+  case TOKEN_SWITCH:
+  case TOKEN_CASE:
+  case TOKEN_DEFAULT:
+  case TOKEN_VAR:
+  case TOKEN_CONST:
+  case TOKEN_FN:
+  case TOKEN_FUNCTION:
+  case TOKEN_STRUCT:
+  case TOKEN_ENUM:
+  case TOKEN_IMPORT:
+  case TOKEN_EXPORT:
+  case TOKEN_DEFER:
+  case TOKEN_ERRDEFER:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+// The expression parser ran out of grammar. Say what it was reading, what it
+// found instead, and what to write. This is the last stop for a large share
+// of the syntax errors a reader ever sees, so it earns the detail.
+static void parser_error_expected_expression(Parser *parser) {
+  char found[PARSER_PREV_TEXT_MAX + 24];
+  parser_describe_token(&parser->current_token, found, sizeof(found));
+
+  // What the parser had just read. It names the operator or keyword whose
+  // operand went missing, which is where the reader has to type.
+  char after[PARSER_PREV_TEXT_MAX + 16];
+  after[0] = '\0';
+  switch (parser->previous_token_type) {
+  case TOKEN_EQUALS:
+  case TOKEN_PLUS:
+  case TOKEN_MINUS:
+  case TOKEN_MULTIPLY:
+  case TOKEN_DIVIDE:
+  case TOKEN_PERCENT:
+  case TOKEN_AMPERSAND:
+  case TOKEN_PIPE:
+  case TOKEN_CARET:
+  case TOKEN_LSHIFT:
+  case TOKEN_RSHIFT:
+  case TOKEN_AND_AND:
+  case TOKEN_OR_OR:
+  case TOKEN_EQUALS_EQUALS:
+  case TOKEN_NOT_EQUALS:
+  case TOKEN_LESS_THAN:
+  case TOKEN_LESS_EQUALS:
+  case TOKEN_GREATER_THAN:
+  case TOKEN_GREATER_EQUALS:
+  case TOKEN_NOT:
+  case TOKEN_TILDE:
+  case TOKEN_DOT_DOT:
+  case TOKEN_COMMA:
+  case TOKEN_LPAREN:
+  case TOKEN_LBRACKET:
+  case TOKEN_RETURN:
+  case TOKEN_DISPATCH:
+  case TOKEN_NEW:
+    if (parser->previous_token_text[0] != '\0')
+      snprintf(after, sizeof(after), " after '%s'",
+               parser->previous_token_text);
+    else
+      snprintf(after, sizeof(after), " after %s",
+               token_type_to_string(parser->previous_token_type));
+    break;
+  default:
+    break;
+  }
+
+  char message[PARSER_ERROR_BUF_SIZE];
+  snprintf(message, sizeof(message), "Expected an expression%s, found %s",
+           after, found);
+
+  // A suggestion aimed at the shape of the mistake, not at the grammar.
+  char help[PARSER_ERROR_BUF_SIZE];
+  const char *suggestion = NULL;
+  TokenType found_type = parser->current_token.type;
+
+  if (found_type == TOKEN_SEMICOLON || found_type == TOKEN_NEWLINE) {
+    if (after[0] != '\0') {
+      snprintf(help, sizeof(help), "write the value that belongs%s", after);
+      suggestion = help;
+    } else {
+      suggestion = "the statement stops before it says anything; write a value";
+    }
+  } else if (found_type == TOKEN_EOF) {
+    suggestion = "the file ends in the middle of an expression";
+  } else if (found_type == TOKEN_RPAREN || found_type == TOKEN_RBRACKET ||
+             found_type == TOKEN_RBRACE) {
+    if (after[0] != '\0')
+      snprintf(help, sizeof(help), "the value that belongs%s is missing", after);
+    else
+      snprintf(help, sizeof(help), "%s closes a group that holds no value",
+               found);
+    suggestion = help;
+  } else if (found_type == TOKEN_COMMA) {
+    suggestion = "an item is missing between the commas";
+  } else if (found_type == TOKEN_EQUALS) {
+    suggestion = "'=' assigns a value; to compare two values write '=='";
+  } else if (parser_is_binary_operator(found_type)) {
+    snprintf(help, sizeof(help), "'%s' needs a value on its left",
+             parser->current_token.value ? parser->current_token.value : "?");
+    suggestion = help;
+  } else if (parser_token_starts_statement(found_type)) {
+    snprintf(help, sizeof(help),
+             "'%s' starts a statement and cannot stand in for a value",
+             parser->current_token.value ? parser->current_token.value : "it");
+    suggestion = help;
+  }
+
+  parser_set_error_with_suggestion(parser, message, suggestion);
+  if (parser->error_reporter)
+    error_reporter_set_last_label(parser->error_reporter,
+                                  "expected an expression here");
+}
+
 ASTNode *parser_parse_primary_expression(Parser *parser) {
   if (!parser)
     return NULL;
@@ -2453,11 +2788,15 @@ ASTNode *parser_parse_primary_expression(Parser *parser) {
   }
   case TOKEN_LPAREN: {
     parser_advance(parser); // consume '('
+    const char *saved_group = parser->group_context;
+    parser->group_context = "grouped expression";
     ASTNode *expr = parser_parse_expression(parser);
+    parser->group_context = "grouped expression";
     if (!parser_expect(parser, TOKEN_RPAREN)) {
       ast_destroy_node(expr);
       return NULL;
     }
+    parser->group_context = saved_group;
     return expr;
   }
   /* Aggregate literals. A '[' only reaches primary position when nothing
@@ -2494,7 +2833,7 @@ ASTNode *parser_parse_primary_expression(Parser *parser) {
     return new_expr;
   }
   default:
-    parser_set_error(parser, "Expected primary expression");
+    parser_error_expected_expression(parser);
     return NULL;
   }
 }
@@ -2790,12 +3129,15 @@ ASTNode *parser_parse_postfix_expression(Parser *parser) {
       if (parser_try_parse_generic_call_type_args(parser, &call_type_args,
                                                   &call_type_arg_count)) {
         parser_advance(parser); // consume '('
+        const char *saved_group = parser->group_context;
+        parser->group_context = "argument list";
 
         ASTNode **arguments = NULL;
         size_t arg_count = 0;
 
         if (parser->current_token.type != TOKEN_RPAREN) {
           do {
+            parser->group_context = "argument list";
             ASTNode *arg = parser_parse_expression(parser);
             if (!arg)
               break;
@@ -2811,6 +3153,7 @@ ASTNode *parser_parse_postfix_expression(Parser *parser) {
             }
           } while (1);
         }
+        parser->group_context = "argument list";
 
         if (!parser_expect(parser, TOKEN_RPAREN)) {
           for (size_t i = 0; i < arg_count; i++)
@@ -2822,6 +3165,7 @@ ASTNode *parser_parse_postfix_expression(Parser *parser) {
           ast_destroy_node(expr);
           return NULL;
         }
+        parser->group_context = saved_group;
 
         Identifier *id_data = (Identifier *)expr->data;
         char *func_name = strdup(id_data->name);
@@ -3001,6 +3345,7 @@ ASTNode *parser_parse_postfix_expression(Parser *parser) {
           }
         } while (1);
       }
+      parser->group_context = "argument list";
 
       if (!parser_expect(parser, TOKEN_RPAREN)) {
         for (size_t i = 0; i < arg_count; i++) {
@@ -3012,6 +3357,7 @@ ASTNode *parser_parse_postfix_expression(Parser *parser) {
         ast_destroy_node(expr);
         return NULL;
       }
+      parser->group_context = NULL;
 
       if (expr->type == AST_MEMBER_ACCESS) {
         // Method call: obj.method(args)
@@ -3637,11 +3983,17 @@ static int parser_parse_parameter_list(Parser *parser, char ***out_names,
   char **param_names = NULL;
   char **param_types = NULL;
   size_t param_count = 0;
+  parser->group_context = "parameter list";
 
   if (parser->current_token.type != TOKEN_RPAREN) {
     do {
       if (!parser_is_identifier_like(parser->current_token.type)) {
-        parser_set_error(parser, "Expected parameter name");
+        if (parser->current_token.type == TOKEN_RPAREN && param_count > 0)
+          parser_set_error_with_suggestion(
+              parser, "Expected a parameter name, found ')'",
+              "the parameter list ends with a ','; remove it");
+        else
+          parser_set_error(parser, "Expected a parameter name");
         goto fail;
       }
 
@@ -3680,6 +4032,7 @@ static int parser_parse_parameter_list(Parser *parser, char ***out_names,
   *out_names = param_names;
   *out_types = param_types;
   *out_count = param_count;
+  parser->group_context = NULL;
   return 1;
 
 fail:
@@ -3689,6 +4042,7 @@ fail:
   }
   free(param_names);
   free(param_types);
+  parser->group_context = NULL;
   return 0;
 }
 
@@ -4857,11 +5211,13 @@ ASTNode *parser_parse_if_statement(Parser *parser) {
     return NULL;
   }
 
+  parser->group_context = "condition of 'if'";
   ASTNode *condition = parser_parse_expression(parser);
   if (!condition) {
     return NULL;
   }
 
+  parser->group_context = "condition of 'if'";
   if (!parser_expect(parser, TOKEN_RPAREN)) {
     parser_set_error(parser, "Expected ')' after if condition");
     ast_destroy_node(condition);
@@ -4894,10 +5250,12 @@ ASTNode *parser_parse_if_statement(Parser *parser) {
         goto cleanup;
       }
 
+      parser->group_context = "condition of 'else if'";
       ASTNode *elif_cond = parser_parse_expression(parser);
       if (!elif_cond)
         goto cleanup;
 
+      parser->group_context = "condition of 'else if'";
       if (!parser_expect(parser, TOKEN_RPAREN)) {
         parser_set_error(parser, "Expected ')' after else if condition");
         ast_destroy_node(elif_cond);
@@ -4987,11 +5345,13 @@ ASTNode *parser_parse_while_statement(Parser *parser) {
     return NULL;
   }
 
+  parser->group_context = "condition of 'while'";
   ASTNode *condition = parser_parse_expression(parser);
   if (!condition) {
     return NULL;
   }
 
+  parser->group_context = "condition of 'while'";
   if (!parser_expect(parser, TOKEN_RPAREN)) {
     parser_set_error(parser, "Expected ')' after while condition");
     ast_destroy_node(condition);
@@ -5560,11 +5920,13 @@ ASTNode *parser_parse_switch_statement(Parser *parser) {
     return NULL;
   }
 
+  parser->group_context = "subject of 'switch'";
   ASTNode *expression = parser_parse_expression(parser);
   if (!expression) {
     return NULL;
   }
 
+  parser->group_context = "subject of 'switch'";
   if (!parser_expect(parser, TOKEN_RPAREN)) {
     ast_destroy_node(expression);
     return NULL;
@@ -5902,13 +6264,12 @@ ASTNode *parser_parse_block(Parser *parser) {
 
   Program *block_data = (Program *)block->data;
 
+  // Depth this block's body sits at, so recovery can find its closing brace.
+  const int body_depth = parser->brace_depth;
+
   // Parse statements until we hit '}'
   while (parser->current_token.type != TOKEN_RBRACE &&
          parser->current_token.type != TOKEN_EOF) {
-
-    if (parser->has_error) {
-      break;
-    }
 
     // Skip empty statements/newlines
     if (parser->current_token.type == TOKEN_NEWLINE ||
@@ -5936,11 +6297,24 @@ ASTNode *parser_parse_block(Parser *parser) {
            parser->current_token.type == TOKEN_NEWLINE)) {
         parser_expect_statement_end(parser);
       }
-    } else if (parser->has_error) {
-      break;
+      if (parser->has_error) {
+        // A statement parsed but its tail did not. Recover here too, so one
+        // stray token does not spill the rest of the body onto file scope.
+        parser_recover_in_block(parser, body_depth);
+        parser->has_error = 0;
+        free(parser->error_message);
+        parser->error_message = NULL;
+      }
     } else {
-      parser_set_error(parser, "Failed to parse statement in block");
-      break;
+      if (!parser->has_error)
+        parser_set_error(parser, "Expected a statement");
+      // Skip to the next statement in this same block and keep checking. The
+      // block still consumes its own '}', so one bad statement costs one
+      // diagnostic rather than a run of them from file scope.
+      parser_recover_in_block(parser, body_depth);
+      parser->has_error = 0;
+      free(parser->error_message);
+      parser->error_message = NULL;
     }
   }
 

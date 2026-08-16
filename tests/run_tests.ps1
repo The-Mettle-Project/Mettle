@@ -1947,7 +1947,19 @@ $cases = @(
   @{ Name = "err_trait_bound_missing_impl"; Path = "tests/err_trait_bound_missing_impl.mettle"; ShouldSucceed = $false; Pattern = "does not implement trait 'Addable'" },
   @{ Name = "err_trait_bound_missing_second_impl"; Path = "tests/err_trait_bound_missing_second_impl.mettle"; ShouldSucceed = $false; Pattern = "does not implement trait 'SignedNumber'" },
   @{ Name = "err_trait_method_missing_impl"; Path = "tests/err_trait_method_missing_impl.mettle"; ShouldSucceed = $false; Pattern = "missing trait method 'next_value'" },
-  @{ Name = "err_generics_generic_fn_ptr_address"; Path = "tests/err_generics_generic_fn_ptr_address.mettle"; ShouldSucceed = $false; Pattern = "Expected primary expression" },
+  @{ Name = "err_generics_generic_fn_ptr_address"; Path = "tests/err_generics_generic_fn_ptr_address.mettle"; ShouldSucceed = $false; Pattern = "Expected an expression" },
+
+  # Syntax diagnostics. Each of these guards a message that used to say
+  # nothing. The "1 previous error" patterns are the anti-cascade guards: one
+  # mistake has to cost one diagnostic, or these fail.
+  @{ Name = "err_syntax_missing_operand"; Path = "tests/err_syntax_missing_operand.mettle"; ShouldSucceed = $false; Pattern = "Expected an expression after '\+', found ';'" },
+  @{ Name = "err_syntax_missing_operand_once"; Path = "tests/err_syntax_missing_operand.mettle"; ShouldSucceed = $false; Pattern = "due to 1 previous error" },
+  @{ Name = "err_syntax_let_keyword"; Path = "tests/err_syntax_let_keyword.mettle"; ShouldSucceed = $false; Pattern = "'let' declares nothing in Mettle" },
+  @{ Name = "err_syntax_c_type_name"; Path = "tests/err_syntax_c_type_name.mettle"; ShouldSucceed = $false; Pattern = "'int' is not a Mettle type" },
+  @{ Name = "err_syntax_paren_comma"; Path = "tests/err_syntax_paren_comma.mettle"; ShouldSucceed = $false; Pattern = "the grouped expression holds one value" },
+  @{ Name = "err_syntax_nested_group_comma"; Path = "tests/err_syntax_nested_group_comma.mettle"; ShouldSucceed = $false; Pattern = "the grouped expression holds one value" },
+  @{ Name = "err_syntax_no_cascade"; Path = "tests/err_syntax_no_cascade.mettle"; ShouldSucceed = $false; Pattern = "due to 1 previous error" },
+  @{ Name = "err_syntax_no_cascade_msg"; Path = "tests/err_syntax_no_cascade.mettle"; ShouldSucceed = $false; Pattern = "Expected '\(' after 'if'" },
   # A `<` comparison whose right side makes the speculative type-argument parse
   # fail must backtrack without leaving the abandoned parse's diagnostic behind.
   @{ Name = "generic_call_lt_ambiguity"; Path = "tests/generic_call_lt_ambiguity.mettle"; ShouldSucceed = $true

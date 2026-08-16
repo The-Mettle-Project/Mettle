@@ -1,0 +1,5 @@
+// A C type name at the start of a statement gets the Mettle spelling.
+fn main() -> int32 {
+  int x = 1;
+  return 0;
+}

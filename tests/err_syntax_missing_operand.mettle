@@ -1,0 +1,6 @@
+// The operand after '+' is missing. The diagnostic must name '+' and the ';'
+// it found instead, and must not cascade into the rest of the body.
+fn main() -> int32 {
+  var x: int64 = 1 + ;
+  return 0;
+}

@@ -1311,10 +1311,63 @@ int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
     }
     return 1;
   }
-  default:
-    // Unknown statement type
-    type_checker_set_error_at_location(checker, statement->location,
-                                       "Unknown statement type");
+  default: {
+    /* Everything that reaches here is an expression standing where a
+       statement belongs. Name the shape and say what happens to its value,
+       so the reader knows whether they meant to assign it, call something,
+       or delete the line. */
+    const char *shape = "expression";
+    const char *why = "its value goes nowhere";
+    switch (statement->type) {
+    case AST_BINARY_EXPRESSION:
+      shape = "arithmetic or comparison";
+      why = "it computes a value and drops it";
+      break;
+    case AST_UNARY_EXPRESSION:
+      shape = "unary expression";
+      why = "it computes a value and drops it";
+      break;
+    case AST_IDENTIFIER:
+      shape = "name on its own";
+      why = "reading a name does nothing";
+      break;
+    case AST_NUMBER_LITERAL:
+    case AST_STRING_LITERAL:
+    case AST_AGGREGATE_LITERAL:
+      shape = "literal on its own";
+      why = "it computes a value and drops it";
+      break;
+    case AST_MEMBER_ACCESS:
+      shape = "field read";
+      why = "it computes a value and drops it";
+      break;
+    case AST_INDEX_EXPRESSION:
+      shape = "index read";
+      why = "it computes a value and drops it";
+      break;
+    case AST_CAST_EXPRESSION:
+      shape = "cast";
+      why = "it computes a value and drops it";
+      break;
+    case AST_NEW_EXPRESSION:
+      shape = "allocation";
+      why = "the memory it returns is lost at once";
+      break;
+    case AST_LAMBDA_EXPRESSION:
+      shape = "function literal";
+      why = "nothing holds it and nothing calls it";
+      break;
+    default:
+      break;
+    }
+    char message[256];
+    snprintf(message, sizeof(message), "This %s is not a statement: %s", shape,
+             why);
+    type_checker_set_error_at_location(checker, statement->location, message);
+    if (checker->error_reporter)
+      error_reporter_set_last_label(
+          checker->error_reporter, "this line has no effect");
     return 0;
+  }
   }
 }

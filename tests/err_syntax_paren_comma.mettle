@@ -1,0 +1,7 @@
+// A comma inside parentheses is not a parameter list. Mettle has no tuples,
+// so the advice must be about the group, not about a signature.
+fn main() -> int32 {
+  var idx: int64 = 1;
+  var x: int64 = (1, idx);
+  return 0;
+}

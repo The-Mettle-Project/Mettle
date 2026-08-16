@@ -5,6 +5,8 @@
 #include "../lexer/lexer.h"
 #include "ast.h"
 
+#define PARSER_PREV_TEXT_MAX 32
+
 typedef struct {
   Lexer *lexer;
   Token current_token;
@@ -15,6 +17,17 @@ typedef struct {
   char *error_message;
   ErrorReporter *error_reporter;
   int error_recovery_mode;
+  /* The token just consumed. Diagnostics name it when an expression turns up
+     missing, so the reader is told what the compiler was reading past. */
+  TokenType previous_token_type;
+  char previous_token_text[PARSER_PREV_TEXT_MAX];
+  /* '{' consumed minus '}' consumed. Error recovery uses it to stay inside
+     the block it started in and to find that block's own closing brace. */
+  int brace_depth;
+  /* What the innermost open '(' belongs to: "parameter list", "argument
+     list", "condition of 'if'", and so on. A diagnostic about the matching
+     ')' quotes this rather than guessing that every paren is a signature. */
+  const char *group_context;
   const char *source_filename;
   /* Set when compiling a GPU module. Enables the kernel index built-ins
    * (thread/block/block_dim/grid_dim member access on x/y/z) to desugar to
@@ -74,6 +87,12 @@ void parser_set_error_with_suggestion(Parser *parser, const char *message,
 void parser_refine_error(Parser *parser, const char *message);
 void parser_recover_from_error(Parser *parser);
 void parser_synchronize(Parser *parser);
+/* Skip to the next statement boundary that belongs to the block opened at
+   `block_depth`, leaving that block's own '}' unconsumed. */
+void parser_recover_in_block(Parser *parser, int block_depth);
+/* Skip to the next token that can begin a top-level declaration, past any
+   braces still open. */
+void parser_recover_to_declaration(Parser *parser);
 int parser_get_operator_precedence(TokenType type);
 int parser_is_binary_operator(TokenType type);
 int parser_is_unary_operator(TokenType type);

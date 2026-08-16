@@ -1,0 +1,5 @@
+// 'let' declares nothing in Mettle. Say so once and name 'var'.
+fn main() -> int32 {
+  let x: int64 = 1;
+  return 0;
+}
