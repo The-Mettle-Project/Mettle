@@ -3859,25 +3859,33 @@ catch {
 # Global float variables: compile with --build and verify they read back their
 # initializer (and survive mutation) instead of reading 0 from an uninitialized
 # XMM lane. Returns 25+125+35+30 = 215.
-$total++
-try {
-  $exePath = Join-Path $tmpDir "global_float_var.exe"
-  $buildOut = & $CompilerPath --build "tests\test_global_float_var.mettle" -o $exePath 2>&1 | Out-String
-  if ($LASTEXITCODE -ne 0) {
-    throw "Global float var build failed: $buildOut"
+# Both backends are checked: the fallback emitter and, under --release, the
+# register-allocating MIR path. The original miscompile lived in both, so
+# gating only one leaves half of it uncovered.
+foreach ($globalFloatMode in @("debug", "release")) {
+  $total++
+  try {
+    $exePath = Join-Path $tmpDir "global_float_var_$globalFloatMode.exe"
+    $buildArgs = @()
+    if ($globalFloatMode -eq "release") { $buildArgs += "--release" }
+    $buildArgs += @("--build", "tests\test_global_float_var.mettle", "-o", $exePath)
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "Global float var ($globalFloatMode) build failed: $buildOut"
+    }
+    if (-not (Test-Path $exePath)) {
+      throw "Global float var ($globalFloatMode) build did not produce an executable"
+    }
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 215) {
+      throw "Global float var ($globalFloatMode) exited with $LASTEXITCODE (expected 215)"
+    }
+    Write-CaseResult -Name "global_float_var_runtime_$globalFloatMode" -Passed $true
   }
-  if (-not (Test-Path $exePath)) {
-    throw "Global float var build did not produce an executable"
+  catch {
+    $failed++
+    Write-CaseResult -Name "global_float_var_runtime_$globalFloatMode" -Passed $false -Reason $_.Exception.Message
   }
-  & $exePath 2>&1 | Out-Null
-  if ($LASTEXITCODE -ne 215) {
-    throw "Global float var exited with $LASTEXITCODE (expected 215)"
-  }
-  Write-CaseResult -Name "global_float_var_runtime" -Passed $true
-}
-catch {
-  $failed++
-  Write-CaseResult -Name "global_float_var_runtime" -Passed $false -Reason $_.Exception.Message
 }
 
 # Switch range cases: compile with --build and verify inclusive-interval dispatch.
