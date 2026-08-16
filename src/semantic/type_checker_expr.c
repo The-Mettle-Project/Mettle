@@ -3047,9 +3047,15 @@ Type *type_checker_check_binary_expression(TypeChecker *checker,
 
       int left_is_null = type_checker_is_null_pointer_constant(binop->left);
       int right_is_null = type_checker_is_null_pointer_constant(binop->right);
+      /* A rawptr names no element type, so it compares against a pointer of
+       * any element type for the same reason it converts to one: both sides
+       * are an address. `if (memcpy(dst, src, n) != dst)` is the shape. */
+      int rawptr_pair = left_is_pointer && right_is_pointer &&
+                        (type_checker_is_rawptr_type(left_type) ||
+                         type_checker_is_rawptr_type(right_type));
       int comparable = (left_is_pointer && right_is_pointer &&
                         type_checker_types_equal(left_type, right_type)) ||
-                       (left_is_pointer && right_is_null) ||
+                       rawptr_pair || (left_is_pointer && right_is_null) ||
                        (right_is_pointer && left_is_null);
 
       if (!comparable) {

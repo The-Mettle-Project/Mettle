@@ -104,6 +104,12 @@ fn check_rawptr() {
 
   memset(a, 0, n * 4);
   expect("memset through rawptr", (int64)a[10], (int64)0);
+
+  // The returned address compares against the typed one it came from, which is
+  // how a caller checks that a block routine handed back its destination.
+  var same: int32 = 0;
+  if (memcpy(a, a, n * 4) == a) { same = 1; }
+  expect("rawptr compares with a typed pointer", (int64)same, (int64)1);
   free(a);
 }
 
