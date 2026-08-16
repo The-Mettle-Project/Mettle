@@ -1,0 +1,6 @@
+// An unterminated string. The lexical error names the problem; the grammar
+// complaints that follow a bad token are guesses and stay unprinted.
+fn main() -> int32 {
+  var s: string = "unterminated;
+  return 0;
+}

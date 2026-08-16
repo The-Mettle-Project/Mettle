@@ -1960,6 +1960,9 @@ $cases = @(
   @{ Name = "err_syntax_nested_group_comma"; Path = "tests/err_syntax_nested_group_comma.mettle"; ShouldSucceed = $false; Pattern = "the grouped expression holds one value" },
   @{ Name = "err_syntax_no_cascade"; Path = "tests/err_syntax_no_cascade.mettle"; ShouldSucceed = $false; Pattern = "due to 1 previous error" },
   @{ Name = "err_syntax_no_cascade_msg"; Path = "tests/err_syntax_no_cascade.mettle"; ShouldSucceed = $false; Pattern = "Expected '\(' after 'if'" },
+  @{ Name = "err_syntax_c_for_header"; Path = "tests/err_syntax_c_for_header.mettle"; ShouldSucceed = $false; Pattern = "A 'for' header needs 'in' or parentheses" },
+  @{ Name = "err_syntax_c_for_header_once"; Path = "tests/err_syntax_c_for_header.mettle"; ShouldSucceed = $false; Pattern = "due to 1 previous error" },
+  @{ Name = "err_syntax_lexical_no_cascade"; Path = "tests/err_syntax_lexical_no_cascade.mettle"; ShouldSucceed = $false; Pattern = "due to 1 previous error" },
   # A `<` comparison whose right side makes the speculative type-argument parse
   # fail must backtrack without leaving the abandoned parse's diagnostic behind.
   @{ Name = "generic_call_lt_ambiguity"; Path = "tests/generic_call_lt_ambiguity.mettle"; ShouldSucceed = $true

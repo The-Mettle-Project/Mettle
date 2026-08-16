@@ -28,6 +28,14 @@ typedef struct {
      list", "condition of 'if'", and so on. A diagnostic about the matching
      ')' quotes this rather than guessing that every paren is a signature. */
   const char *group_context;
+  /* Set when a loop or conditional header failed. Recovery then runs to that
+     construct's '{' rather than stopping at the first ';' inside the broken
+     header, so the body is still parsed and checked. */
+  int recover_at_body_brace;
+  /* Set once the lexer reports a bad token. From there the token stream is
+     guesswork, so syntax diagnostics after it are suppressed and the lexical
+     error stands alone. */
+  int saw_lexical_error;
   const char *source_filename;
   /* Set when compiling a GPU module. Enables the kernel index built-ins
    * (thread/block/block_dim/grid_dim member access on x/y/z) to desugar to

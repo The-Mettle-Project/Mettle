@@ -26,6 +26,7 @@ static void parser_report_lexer_token_error(Parser *parser,
 
   parser->has_error = 1;
   parser->had_error = 1;
+  parser->saw_lexical_error = 1;
   parser->error_count++;
   free(parser->error_message);
   parser->error_message = strdup(error_msg);
@@ -74,6 +75,8 @@ Parser *parser_create_with_error_reporter(Lexer *lexer,
   parser->previous_token_text[0] = '\0';
   parser->brace_depth = 0;
   parser->group_context = NULL;
+  parser->recover_at_body_brace = 0;
+  parser->saw_lexical_error = 0;
   parser->source_filename = error_reporter_current_filename(error_reporter);
   parser->gpu_mode = 0;
 
@@ -349,6 +352,11 @@ void parser_set_error_with_suggestion(Parser *parser, const char *message,
   free(parser->error_message);
   parser->error_message = strdup(message);
 
+  // A bad token leaves the stream unreliable, so every grammar complaint after
+  // it is a guess. The lexical error already names the real problem.
+  if (parser->saw_lexical_error)
+    return;
+
   // If we have an error reporter, add the error to it
   if (parser->error_reporter) {
     SourceLocation location = source_location_create(
@@ -461,8 +469,18 @@ void parser_recover_in_block(Parser *parser, int block_depth) {
       // consumes it, so recovery must not.
       if (parser->current_token.type == TOKEN_RBRACE)
         break;
-      if (parser->current_token.type == TOKEN_SEMICOLON ||
-          parser->current_token.type == TOKEN_NEWLINE) {
+      // A '{' here opens the body of the construct whose header just failed.
+      // Stopping in front of it lets that body parse as an ordinary block, so
+      // the statements inside are still checked and the header costs one
+      // diagnostic.
+      if (parser->current_token.type == TOKEN_LBRACE)
+        break;
+      // A broken loop header holds semicolons of its own (`for i = 0; i < n;`),
+      // so stopping at the first one would drop the rest of the header into
+      // the block as statements. Run to the body brace instead.
+      if (!parser->recover_at_body_brace &&
+          (parser->current_token.type == TOKEN_SEMICOLON ||
+           parser->current_token.type == TOKEN_NEWLINE)) {
         parser_advance(parser);
         break;
       }
@@ -471,6 +489,7 @@ void parser_recover_in_block(Parser *parser, int block_depth) {
   }
   parser->error_recovery_mode = 0;
   parser->group_context = NULL;
+  parser->recover_at_body_brace = 0;
 }
 
 // Tokens that begin a top-level item. Recovery at file scope stops on one of
@@ -5464,7 +5483,22 @@ static ASTNode *parser_parse_range_for(Parser *parser, SourceLocation location) 
   // Contextual `in`.
   if (!parser_is_identifier_like(parser->current_token.type) ||
       strcmp(parser->current_token.value, "in") != 0) {
-    parser_set_error(parser, "Expected 'in' in range-based for loop");
+    // `for i = 0; ...` is the C header written without its parentheses. Name
+    // the two forms Mettle has rather than complaining about a missing 'in'
+    // the reader never meant to write.
+    if (parser->current_token.type == TOKEN_EQUALS) {
+      char help[PARSER_ERROR_BUF_SIZE];
+      snprintf(help, sizeof(help),
+               "write the range as 'for %s in 0..n { ... }', or the counted "
+               "header inside parentheses as 'for (var %s: int64 = 0; %s < n; "
+               "%s = %s + 1) { ... }'",
+               var_name, var_name, var_name, var_name, var_name);
+      parser_set_error_with_suggestion(
+          parser, "A 'for' header needs 'in' or parentheses", help);
+      parser->recover_at_body_brace = 1;
+    } else {
+      parser_set_error(parser, "Expected 'in' in range-based for loop");
+    }
     free(var_name);
     free(type_name);
     return NULL;
