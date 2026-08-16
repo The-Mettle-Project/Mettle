@@ -496,6 +496,60 @@ Nested expansions report the whole chain, outermost first.
 
 The binding is a `Field`, and it is scoped to its own expansion, so it cannot be seen by surrounding code and cannot shadow anything the programmer wrote. It is a compile-time value like any other `Type` or `Field`: it cannot be cast, stored, or otherwise leaked into runtime code. Generated code is checked exactly as hand-written code is, contracts included.
 
+### At module scope: generating declarations
+
+A `comptime for` written between declarations rather than inside a function generates declarations. The directive is the same one; what differs is the list its expansions are spliced into.
+
+```mettle
+struct Packet {
+  kind: uint8;
+  seq: uint32;
+  payload: int64;
+}
+
+comptime for f in typeof(Packet).fields {
+  const ident("OFFSET_", f.name): int64 = f.offset;
+
+  fn ident("end_of_", f.name)(base: int64) -> int64 {
+    return base + f.offset + f.type.size;
+  }
+}
+
+fn main() -> int32 {
+  return (int32)(end_of_seq(0) + OFFSET_payload);
+}
+```
+
+That generates `OFFSET_kind`, `OFFSET_seq`, `OFFSET_payload` and the three `end_of_*` functions. Structs, enums and globals work the same way. This is what a table shredded across a switch is for: declare the shape once, generate the accessors, and adding a field adds its accessor rather than leaving one behind.
+
+Every iteration needs a name of its own, and `ident(...)` composes one from compile-time strings:
+
+```mettle
+ident("end_of_", f.name)     // end_of_kind, end_of_seq, end_of_payload
+```
+
+It is written the way `typeof` and `offsetof` are, out of an identifier and call syntax, and it adds no punctuation the lexer did not already read. Like `comptime`, it is contextual: `ident(...)` composes a name only inside a `comptime for` body, so a function the programmer happens to call `ident` is unaffected. Each part must evaluate to a compile-time string -- a string literal, or a `.name` query -- and the result must be a name the program could have been written with.
+
+`ident(...)` also stands where a value does, so an iteration can refer to what it generated:
+
+```mettle
+comptime for f in typeof(Packet).fields {
+  const ident("WIDTH_", f.name): int64 = f.type.size;
+  fn ident("width_of_", f.name)() -> int64 {
+    return ident("WIDTH_", f.name);
+  }
+}
+```
+
+Two boundaries are worth stating, because both are refusals rather than gaps waiting to be filled in quietly:
+
+- **`ident(...)` composes a declaration's name, not a type.** A type annotation is a name the checker resolves, and that happens before the binding has a value. Write a generated type's name out where you use it. Naming a generated type from inside the iteration that generated it is not expressible today, and the compiler says so rather than failing further along.
+- **Two iterations that compose the same name is an error.** A body whose declaration name does not come from the binding produces one name for every field, and all but one of those declarations would not be in the program. A generator that quietly drops half its output is the under-delivery contracts exist to prevent, so it fails the build and suggests composing the name.
+
+A directive that generates a directive is expanded too; module scope keeps expanding until nothing is left. A nested expansion carries the bindings of every directive that produced it, so an inner body can read the outer field and a diagnostic prints every step of the chain.
+
+Nothing after expansion can tell a generated declaration from a written one. `@noalloc` on a generated function is proven or fails the build, naming the generated function. `@test` on one runs under `mettle test`. `mettle expand` prints it as source with the iteration that produced it, and `--report-expansion` counts what it cost.
+
 **Constraints:** Trait bounds are supported. Declare a trait, satisfy it with `impl Trait for Type`, and constrain generic parameters with inline bounds such as `T: Name`, multiple inline bounds such as `T: Addable + SignedNumber`, or a trailing `where` clause.
 
 ```mettle

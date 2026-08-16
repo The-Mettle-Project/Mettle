@@ -2,6 +2,8 @@
 
 Declarations introduce variables, functions, types, and other program elements. All declarations appear at top level or within struct bodies (for methods). Declarations are processed in order; a symbol must be declared before use, except for forward declarations.
 
+A declaration may also be generated, by a [`comptime for`](types.md#at-module-scope-generating-declarations) written between declarations. Its name is then composed with `ident("prefix", f.name)` so each iteration produces a different one. Everything below applies unchanged to a generated declaration: the checks, the decorators and the contracts all run on it exactly as they run on one written by hand.
+
 ## Variables
 
 Variables are declared with `var`, a name, a type, and an optional initializer. **Mettle never infers binding types**: every `var` (and every local `const`) must state its type explicitly - a declaration with an initializer but no type annotation is a compile error. The value `0` is a valid initializer for pointers (null).

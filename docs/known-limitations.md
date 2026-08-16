@@ -59,6 +59,13 @@ A non-capturing lambda or `&func` can be passed anywhere an `Fn(...)` closure is
 
 - `switch` case values must be compile-time constant integer expressions. Inclusive range cases (`case lo..hi:`) are supported; both bounds must also be compile-time constant integers.
 
+### Compile-time expansion
+
+- **`typeof(T).fields` is the only compile-time sequence.** A `comptime for` iterates a struct's fields and nothing else. There is no way to declare a table of data and generate from it, and no compile-time string operations to build one with.
+- **`ident(...)` composes a declaration's name, not a type.** A type annotation is a name the checker resolves, and resolution happens before the binding has a value. A generated type can be named where it is used, but not from inside the iteration that generated it; the compiler reports this rather than failing further along.
+- **A `comptime for` reflects on the types the program wrote, not on the ones expansion generated.** Module-scope expansion runs after the written types are registered and before the generated ones are, so `typeof(GeneratedStruct).fields` reports an unknown type.
+- **The binding cannot appear where a type goes.** `f.type` answers queries such as `f.type.size` and `f.type.kind`, but cannot be written as a parameter, return, or field type.
+
 ---
 
 ## Compiler & Optimizations
