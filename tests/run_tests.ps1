@@ -2633,6 +2633,48 @@ foreach ($swapMode in @("debug", "release")) {
   }
 }
 
+# `==` / `!=` on strings compare contents, in both backends. Before this the
+# 16-byte record was compared as a scalar and `"ab" == "ab"` was false, which
+# compiled clean and warned about nothing.
+foreach ($strEqMode in @("debug", "release")) {
+  $total++
+  try {
+    $exe = Join-Path $tmpDir "stringeq_$strEqMode.exe"
+    $buildArgs = @()
+    if ($strEqMode -eq "release") { $buildArgs += "--release" }
+    $buildArgs += @("--build", "tests\test_string_equality.mettle", "-o", $exe)
+    $out = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "string equality ($strEqMode) build failed: $out" }
+    & $exe *> $null
+    if ($LASTEXITCODE -ne 77) {
+      throw "string equality ($strEqMode) returned $LASTEXITCODE (expected 77; the code names the case)"
+    }
+    Write-CaseResult -Name "string_equality_$strEqMode" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "string_equality_$strEqMode" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# String comparison is opt-in by use: a program that never compares strings
+# never names mettle_string_ and never links it.
+$total++
+try {
+  $exe = Join-Path $tmpDir "string_excision.exe"
+  $out = & $CompilerPath --build "tests\runtime_excision_probe.mettle" -o $exe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "probe build failed: $out" }
+  $bytes = [IO.File]::ReadAllBytes($exe)
+  if ([Text.Encoding]::ASCII.GetString($bytes).Contains("mettle_string_eq")) {
+    throw "the string runtime was linked into a program that compares no strings"
+  }
+  Write-CaseResult -Name "string_runtime_excisable" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "string_runtime_excisable" -Passed $false -Reason $_.Exception.Message
+}
+
 # The swap runtime is opt-in like every other component: a program with no
 # quiesce point never names mettle_swap_ and never links it.
 $total++

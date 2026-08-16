@@ -162,6 +162,7 @@ bundle-runtime: $(HOST_STARTUP_OBJECT) $(TARGET) | $(BINDIR)
 	cp $(OBJDIR)/runtime/crash_handler.o $(BINDIR)/runtime/crash_handler.o
 	cp $(OBJDIR)/runtime/safety.o        $(BINDIR)/runtime/safety.o
 	$(TARGET) --release --emit-obj $(RUNTIMEDIR)/swap.mettle -o $(BINDIR)/runtime/swap.o
+	$(TARGET) --release --emit-obj $(RUNTIMEDIR)/string.mettle -o $(BINDIR)/runtime/string.o
 	cp $(OBJDIR)/runtime/profile.o       $(BINDIR)/runtime/profile.o
 
 $(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)

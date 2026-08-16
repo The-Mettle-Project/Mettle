@@ -1320,6 +1320,12 @@ static int object_needs_swap_runtime(const char *object_path) {
   return object_needs_runtime_object(object_path, "mettle_swap_");
 }
 
+/* `==` and `!=` on strings compare contents through mettle_string_eq. A
+ * program that never compares strings never names it. */
+static int object_needs_string_runtime(const char *object_path) {
+  return object_needs_runtime_object(object_path, "mettle_string_");
+}
+
 static int object_needs_tracy_helpers(const char *object_path) {
   return object_needs_runtime_object(object_path, "mettle_tracy_");
 }
@@ -1783,6 +1789,13 @@ static int mettle_link_object_file(const char *object_filename,
   char swap_gcc_object[1024];
   char swap_msvc_object[1024];
   int needs_swap = object_needs_swap_runtime(object_filename);
+  char string_gcc_object[1024];
+  char string_msvc_object[1024];
+  int needs_string = object_needs_string_runtime(object_filename);
+  snprintf(string_gcc_object, sizeof(string_gcc_object), "%s/string.o",
+           runtime_directory);
+  snprintf(string_msvc_object, sizeof(string_msvc_object), "%s/string.obj",
+           runtime_directory);
   snprintf(swap_gcc_object, sizeof(swap_gcc_object), "%s/swap.o",
            runtime_directory);
   snprintf(swap_msvc_object, sizeof(swap_msvc_object), "%s/swap.obj",
@@ -1992,6 +2005,7 @@ static int mettle_link_object_file(const char *object_filename,
     const char *debug_object = NULL;
     const char *safety_object = NULL;
     const char *swap_object_internal = NULL;
+    const char *string_object_internal = NULL;
     char *startup_object = replace_extension(executable_filename, ".startup.obj");
     size_t object_count = 0u;
     int startup_ready = 0;
@@ -2080,6 +2094,11 @@ static int mettle_link_object_file(const char *object_filename,
           goto cleanup;
         }
       }
+      if (needs_string) {
+        string_object_internal = (_access(string_msvc_object, 0) == 0)
+                                     ? string_msvc_object
+                                     : string_gcc_object;
+      }
       if (needs_swap) {
         swap_object_internal = (_access(swap_msvc_object, 0) == 0)
                                    ? swap_msvc_object
@@ -2132,6 +2151,10 @@ static int mettle_link_object_file(const char *object_filename,
       if (swap_object_internal) {
         object_is_default[object_count] = 1u;
         object_paths[object_count++] = swap_object_internal;
+      }
+      if (string_object_internal) {
+        object_is_default[object_count] = 1u;
+        object_paths[object_count++] = string_object_internal;
       }
       if (use_tracy) {
         object_is_default[object_count] = 1u;
@@ -2234,6 +2257,12 @@ static int mettle_link_object_file(const char *object_filename,
       }
       runtime_objects[runtime_object_count++] = profile_gcc_object;
     }
+    if (needs_string) {
+      const char *string_object = (_access(string_msvc_object, 0) == 0)
+                                      ? string_msvc_object
+                                      : string_gcc_object;
+      runtime_objects[runtime_object_count++] = string_object;
+    }
     if (needs_swap) {
       const char *swap_object = (_access(swap_msvc_object, 0) == 0)
                                     ? swap_msvc_object
@@ -2316,6 +2345,12 @@ static int mettle_link_object_file(const char *object_filename,
         goto cleanup;
       }
       runtime_objects[runtime_object_count++] = profile_object;
+    }
+    if (needs_string) {
+      const char *msvc_string_object = (_access(string_msvc_object, 0) == 0)
+                                           ? string_msvc_object
+                                           : string_gcc_object;
+      runtime_objects[runtime_object_count++] = msvc_string_object;
     }
     if (needs_swap) {
       const char *msvc_swap_object = (_access(swap_msvc_object, 0) == 0)

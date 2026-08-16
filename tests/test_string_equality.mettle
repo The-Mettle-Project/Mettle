@@ -1,0 +1,44 @@
+// `==` and `!=` on strings compare contents.
+//
+// `string` is a borrowed view, a pointer and a length, and comparing two views
+// as machine values answers a question nobody asked: two views of the same
+// bytes are equal in the only sense the type has. The backend used to compare
+// the 16-byte record as a scalar, so `"ab" == "ab"` was false, `if (input ==
+// "quit")` never ran, and nothing warned.
+//
+// Each case returns its own code so a failure names itself.
+
+fn main() -> int32 {
+    var a: string = "ab";
+    var b: string = "ab";
+    var alias: string = a;
+
+    // Distinct variables holding equal bytes.
+    if (!(a == b)) { return 1; }
+    // A variable against a literal, which is the shape real code writes.
+    if (!(a == "ab")) { return 2; }
+    // Two literals.
+    if (!("ab" == "ab")) { return 3; }
+    // A copy shares the buffer; it was already equal by every field.
+    if (!(a == alias)) { return 4; }
+
+    // Different contents.
+    if (a == "zz") { return 5; }
+    if (!(a != "zz")) { return 6; }
+    if (a != "ab") { return 7; }
+
+    // A string built at run time has a different buffer and equal bytes,
+    // which is exactly the case a pointer comparison gets wrong.
+    var built: string = "a" + "b";
+    if (!(built == "ab")) { return 8; }
+    if (built != "ab") { return 9; }
+
+    // Length is part of the answer: a prefix is not the whole.
+    if ("a" == "ab") { return 10; }
+    if ("ab" == "a") { return 11; }
+
+    // Two empty views are equal whatever their pointers hold.
+    if (!("" == "")) { return 12; }
+
+    return 77;
+}

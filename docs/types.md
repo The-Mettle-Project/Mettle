@@ -268,6 +268,15 @@ var fp: cstring = fopen(path, "rb");
 
 **Creating strings at runtime:** There is no built-in constructor. To build a `string` from a `cstring` and length, assign the fields: `s.chars = ptr; s.length = len`. The `string` does not own the buffer; the caller is responsible for the lifetime of the data pointed to by `.chars`.
 
+**Comparison:** `==` and `!=` compare **contents**, matching `+`, which concatenates bytes rather than pointers. Two views of the same bytes are equal whatever buffers they point at, and length is part of the answer, so `"a" == "ab"` is false. Two empty strings are equal whatever their pointers hold.
+
+```mettle
+var built: string = "a" + "b";
+if (built == "ab") { ... }        // true: different buffer, same bytes
+```
+
+Comparison walks the bytes, so it costs length. Ordering (`<`, `>`) is not defined on `string`.
+
 **String assignment:** Assigning one `string` to another copies the 16-byte struct (the `.chars` pointer and `.length`). Both values then refer to the same underlying buffer. No deep copy of the character data occurs. To share a buffer, assignment is sufficient; to copy contents, allocate a new buffer and copy bytes (e.g. via `malloc` and `memcpy` from `std/mem`).
 
 ## Struct Types

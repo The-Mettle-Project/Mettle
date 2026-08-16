@@ -73,7 +73,7 @@ export fn mettle_swap_stage(slot: rawptr, replacement: rawptr) -> int32 {
 
     g_slots[g_pending_count] = slot_bits;
     g_replacements[g_pending_count] = (int64)replacement;
-    g_pending_count = g_pending_count + 1;
+    g_pending_count += 1;
     return 1;
 }
 

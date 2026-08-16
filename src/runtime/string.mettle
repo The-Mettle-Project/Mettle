@@ -1,0 +1,37 @@
+// String comparison, for `==` and `!=` on `string`.
+//
+// `string` is a borrowed view: a pointer and a length. Comparing two views as
+// machine values answers a question nobody asked, because two views of the
+// same bytes are equal in the only sense the type has. Before this existed the
+// backend compared the 16-byte record as if it were a scalar, and `"ab" ==
+// "ab"` was false. That compiled clean and warned about nothing, so
+// `if (input == "quit")` was a branch that never ran.
+//
+// Contents, then, and it matches `+`, which already concatenates contents
+// rather than pointers. Equal length and equal bytes: a view with no bytes
+// equals another with no bytes whatever either pointer holds.
+//
+// Written in Mettle for the reason every runtime component should be (V.3.3):
+// it reads as source, steps in the same debugger and appears in the same
+// profiler. It touches no operating system, so nothing here needs a binding
+// that does not exist yet.
+//
+// A program that never compares strings never names this symbol and never
+// links this object.
+
+export fn mettle_string_eq(a: string, b: string) -> int32 {
+    if (a.length != b.length) {
+        return 0;
+    }
+
+    var i: int64 = 0;
+    var n: int64 = (int64)a.length;
+    while (i < n) {
+        if (a.chars[i] != b.chars[i]) {
+            return 0;
+        }
+        i = i + 1;
+    }
+
+    return 1;
+}

@@ -437,6 +437,11 @@ echo Compiling swap runtime from Mettle source...
 bin\mettle.exe --release --emit-obj src\runtime\swap.mettle -o bin\runtime\swap.o
 if %ERRORLEVEL% NEQ 0 exit /b 1
 copy /Y bin\runtime\swap.o bin\runtime\swap.obj >nul
+
+echo Compiling string runtime from Mettle source...
+bin\mettle.exe --release --emit-obj src\runtime\string.mettle -o bin\runtime\string.o
+if %ERRORLEVEL% NEQ 0 exit /b 1
+copy /Y bin\runtime\string.o bin\runtime\string.obj >nul
 copy /Y obj\runtime\atomics.o bin\runtime\atomics.o >nul
 copy /Y obj\runtime\atomics.o bin\runtime\atomics.obj >nul
 copy /Y obj\runtime\profile.o bin\runtime\profile.o >nul

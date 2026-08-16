@@ -911,6 +911,83 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
       return 0;
     }
 
+    /* `==` / `!=` on strings compare contents. The generic binary path would
+     * compare the 16-byte record as a scalar, which answered no for two views
+     * of the same bytes and compiled without a word, so `if (input == "quit")`
+     * was a branch that never ran. Contents also match `+`, which already
+     * concatenates bytes rather than pointers. */
+    if (strcmp(binary->operator, "==") == 0 ||
+        strcmp(binary->operator, "!=") == 0) {
+      Type *left_type =
+          type_checker_infer_type(context->type_checker, binary->left);
+      Type *right_type =
+          type_checker_infer_type(context->type_checker, binary->right);
+      if (left_type && right_type && left_type->kind == TYPE_STRING &&
+          right_type->kind == TYPE_STRING) {
+        IROperand left = ir_operand_none();
+        IROperand right = ir_operand_none();
+        IROperand equal = ir_operand_none();
+        if (!ir_lower_expression(context, function, binary->left, &left)) {
+          return 0;
+        }
+        if (!ir_lower_expression(context, function, binary->right, &right)) {
+          ir_operand_destroy(&left);
+          return 0;
+        }
+        if (!ir_make_temp_operand(context, &equal)) {
+          ir_operand_destroy(&right);
+          ir_operand_destroy(&left);
+          return 0;
+        }
+
+        IROperand call_args[2];
+        call_args[0] = left;
+        call_args[1] = right;
+        IRInstruction call = {0};
+        call.op = IR_OP_CALL;
+        call.location = expression->location;
+        call.dest = equal;
+        call.text = "mettle_string_eq";
+        call.arguments = call_args;
+        call.argument_count = 2;
+        int call_ok = ir_emit(context, function, &call);
+        ir_operand_destroy(&right);
+        ir_operand_destroy(&left);
+        if (!call_ok) {
+          ir_operand_destroy(&equal);
+          return 0;
+        }
+
+        if (strcmp(binary->operator, "==") == 0) {
+          *out_value = equal;
+          return 1;
+        }
+
+        /* `!=` is the same answer inverted, and inverting it here keeps the
+         * runtime surface to one function. */
+        IROperand negated = ir_operand_none();
+        if (!ir_make_temp_operand(context, &negated)) {
+          ir_operand_destroy(&equal);
+          return 0;
+        }
+        IRInstruction invert = {0};
+        invert.op = IR_OP_BINARY;
+        invert.location = expression->location;
+        invert.dest = negated;
+        invert.lhs = equal;
+        invert.rhs = ir_operand_int(0);
+        invert.text = "==";
+        int invert_ok = ir_emit(context, function, &invert);
+        ir_operand_destroy(&equal);
+        if (!invert_ok) {
+          ir_operand_destroy(&negated);
+          return 0;
+        }
+        *out_value = negated;
+        return 1;
+      }
+    }
+
     // Keep string concatenation in AST form for codegen. The current IR binary
     // fallback models '+' as integer arithmetic, which is invalid for string
     // records.
