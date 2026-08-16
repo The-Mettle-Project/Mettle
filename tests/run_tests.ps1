@@ -5826,6 +5826,58 @@ catch {
   Write-CaseResult -Name "internal_link_abi_float_return" -Passed $false -Reason $_.Exception.Message
 }
 
+# Every `fix:` --explain prints must survive being carried out. The paired
+# functions in test_explain_fix_advice.mettle are one suggestion each: `_before`
+# is the loop that draws the advice, `_after` is that loop with the advice
+# applied literally. Advice that stops working fails here.
+#
+# Regression: these strings were hand-written and unrun. The unbounded-shift
+# advice offered the loop it was refusing as its example of one that works, and
+# the predicated-count advice asked for a spelling the reader had already used.
+$fixAdvicePairs = @(
+  @{ Name = "bytesum";   Id = "byte-sum-narrow-acc" },
+  @{ Name = "i16";       Id = "int16-elements" },
+  @{ Name = "i64";       Id = "int64-elements" },
+  @{ Name = "dot";       Id = "dot-shape-address" },
+  @{ Name = "extremum";  Id = "extremum-shape" },
+  @{ Name = "count";     Id = "predicated-count" },
+  @{ Name = "shift";     Id = "unbounded-shift" },
+  @{ Name = "fill";      Id = "store-only-fill" },
+  @{ Name = "search";    Id = "early-exit" }
+)
+
+$total++
+try {
+  $fixOut = & $CompilerPath tests\test_explain_fix_advice.mettle --release --explain 2>&1 | Out-String
+  $problems = @()
+  foreach ($pair in $fixAdvicePairs) {
+    $beforeLine = ($fixOut -split "`n" | Where-Object { $_ -match "\b$($pair.Name)_before \(loop" }) -join ""
+    $afterLines = @($fixOut -split "`n" | Where-Object { $_ -match "\b$($pair.Name)_after \(loop" })
+    if ($beforeLine -notmatch "NOT vectorized") {
+      $problems += "$($pair.Name)_before was expected to stay scalar; got: $beforeLine"
+    }
+    elseif ($beforeLine -notmatch [regex]::Escape("[$($pair.Id)]")) {
+      $problems += "$($pair.Name)_before was expected to report [$($pair.Id)]; got: $beforeLine"
+    }
+    if ($afterLines.Count -eq 0) {
+      $problems += "$($pair.Name)_after produced no loop remark"
+    }
+    foreach ($line in $afterLines) {
+      if ($line -notmatch "vectorized ->" -and $line -notmatch "vectorized →") {
+        $problems += "the fix for [$($pair.Id)] no longer vectorizes: $line"
+      }
+    }
+  }
+  if ($problems.Count -gt 0) {
+    throw ($problems -join "`n")
+  }
+  Write-CaseResult -Name "explain_fix_advice_applies" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "explain_fix_advice_applies" -Passed $false -Reason $_.Exception.Message
+}
+
 # Deferred statements must run on every exit path, not only on `return` and
 # falling off the end of a scope. Regression: `break`, `continue`, labeled
 # `break`/`continue`, and a `switch` case body each jumped to their target

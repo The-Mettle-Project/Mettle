@@ -744,6 +744,7 @@ const char *ir_simd_bail_id_name(int id) {
   case IR_SIMD_BAIL_CLAMP_STORE:         return "clamp-store";
   case IR_SIMD_BAIL_STRIDED_ACCESS:      return "strided-access";
   case IR_SIMD_BAIL_UNBOUNDED_SHIFT:     return "unbounded-shift";
+  case IR_SIMD_BAIL_VARIABLE_SHIFT:      return "variable-shift";
   case IR_SIMD_BAIL_UNRECOGNIZED_SHAPE:  return "unrecognized-shape";
   }
   return "unknown";
@@ -1216,10 +1217,15 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
                  acc_type ? "` is the accumulator)" : "");
         if (acc_type && strcmp(acc_type, "float64") != 0 &&
             strcmp(acc_type, "float32") != 0 && strcmp(acc_type, "int32") != 0) {
+          /* The lane width comes from the ELEMENTS, so widening the
+             accumulator alone moves nothing: the loop comes back refused for
+             the widening it now does in the body. Name the array. */
           snprintf(fix, fix_cap,
-                   "declare `%s` as float32, float64 or int32: the extremum "
-                   "kernel carries those lane widths, and `%s` is %s",
-                   written, written, acc_type);
+                   "widen the array to int32 elements (float32 and float64 "
+                   "work too): the extremum kernel carries those lane widths "
+                   "and these are %s. Declaring `%s` alone does not move it, "
+                   "because the width the kernel reads is the element's",
+                   acc_type, written);
         } else {
           snprintf(fix, fix_cap,
                    "the extremum kernel needs the compared value to come from "
@@ -1243,11 +1249,15 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
                  "accumulate",
                  written ? written : "the accumulator",
                  written ? written : "the accumulator");
+        /* Respelling the guard does not help: a guard on a computed value is
+           refused whatever it is compared against. Adding the comparison is
+           what the kernel takes, and it takes every comparison. */
         snprintf(fix, fix_cap,
-                 "over int32 elements, spell the guard as a comparison "
-                 "(`(x & 6) != 0`) or make the two arms accumulate one addend "
-                 "rather than two; over float elements there is nothing to "
-                 "change here, and rewriting it branchlessly will not help");
+                 "over int32 elements, add the comparison rather than "
+                 "branching on it: `%s = %s + ((a[i] & 6) != 0);` vectorizes, "
+                 "and so does any other comparison written that way. Over "
+                 "float elements there is nothing to change here",
+                 written ? written : "count", written ? written : "count");
         IR_SIMD_SET_DIAG(IR_SIMD_BAIL_PREDICATED_COUNT);
         return;
       }
@@ -1530,12 +1540,40 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
      * shift only where the shifted value is provably inside int32, and a
      * runtime factor in the expression makes that unprovable. */
     int shift_count = 0;
+    int variable_shift = 0;
     for (size_t i = begin + 1; i < end; i++) {
       const IRInstruction *ins = &function->instructions[i];
-      if (ins->op == IR_OP_BINARY && !ins->is_float && ins->text &&
-          strcmp(ins->text, ">>") == 0 && ins->rhs.kind == IR_OPERAND_INT) {
-        shift_count++;
+      if (ins->op != IR_OP_BINARY || ins->is_float || !ins->text) {
+        continue;
       }
+      int is_shift = strcmp(ins->text, ">>") == 0 ||
+                     strcmp(ins->text, "<<") == 0;
+      if (!is_shift) {
+        continue;
+      }
+      if (ins->rhs.kind == IR_OPERAND_INT) {
+        if (strcmp(ins->text, ">>") == 0) {
+          shift_count++;
+        }
+      } else {
+        variable_shift++;
+      }
+    }
+    /* A shift by a value the loop reads has no kernel at all, and no source
+       rewrite reaches one. Saying so beats dropping through to the catch-all,
+       which offers a shape checklist this loop already satisfies. */
+    if (variable_shift > 0 && load_count > 0) {
+      snprintf(reason, reason_cap,
+               "the body shifts by a value that is not a constant; the kernels "
+               "carry a shift only when the distance is written in the source, "
+               "so a distance read at run time has none");
+      snprintf(fix, fix_cap,
+               "nothing to change here unless the distance can be a constant: "
+               "a loop per distance, or a constant, both vectorize. This is a "
+               "gap in the compiler rather than a problem with the loop");
+      IR_SIMD_MARK_ADVISORY();
+      IR_SIMD_SET_DIAG(IR_SIMD_BAIL_VARIABLE_SHIFT);
+      return;
     }
     if (shift_count > 0 && load_count > 0 && store_count > 0) {
       snprintf(reason, reason_cap,
@@ -1543,10 +1581,14 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
                "shown to stay inside int32; the lanes are 32 bits wide, so a "
                "shift is only reproduced exactly when no wider intermediate "
                "could have been shifted");
+      /* The old text here offered `(r*77 + g*150 + b*29) >> 8` as the shape
+         that works. It is the shape being refused, so it read as the compiler
+         citing the reader's own code back as the counterexample. Masking is
+         the change that moves it, and it is the only one. */
       snprintf(fix, fix_cap,
-               "constant factors are provable (`(r*77 + g*150 + b*29) >> 8` "
-               "vectorizes); a runtime one does not. Masking the value first "
-               "(`(x & 65535) >> 8`) bounds it and the kernel then takes it");
+               "mask the value down to the bits the shift needs: "
+               "`(x & 65535) >> 8` bounds it inside int32 and the kernel then "
+               "takes it. A constant multiplier is not enough on its own");
       IR_SIMD_SET_DIAG(IR_SIMD_BAIL_UNBOUNDED_SHIFT);
       return;
     }
@@ -1582,11 +1624,16 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
            "no vectorizer recognized this loop's shape: by the time the "
            "vectorizers ran, its body had no call, branch, unsupported "
            "element width or carried dependence left to blame");
+  /* A checklist of what the kernels take, which is a description rather than
+     an instruction: it names no edit to this loop. Advisory keeps it out of
+     "where to start", where it used to outrank nothing and get read as the
+     compiler's best idea. The reader still sees it under the loop. */
   snprintf(fix, fix_cap,
            "compare the loop against the shapes that do vectorize: "
            "unit-stride `a[i]` (not `a[i*k]`) over int8/int32/float32/float64, "
            "a straight-line body, and one of a map (`a[i] = expr`), a '+' "
            "reduction (`s = s + expr`), or a dot product");
+  IR_SIMD_MARK_ADVISORY();
 }
 
 /* ---- fix hypothesis simulation ---------------------------------------------

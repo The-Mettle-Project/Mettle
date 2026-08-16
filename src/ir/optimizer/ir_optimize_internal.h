@@ -696,6 +696,7 @@ typedef enum {
   IR_SIMD_BAIL_CLAMP_STORE,        /* `if (v > hi) v = hi;` then a[i] = v */
   IR_SIMD_BAIL_STRIDED_ACCESS,     /* a[i*k] / a[i*k+c]: not unit stride */
   IR_SIMD_BAIL_UNBOUNDED_SHIFT,    /* `>>` whose input cannot be bounded in 32 bits */
+  IR_SIMD_BAIL_VARIABLE_SHIFT,     /* shift by a value the loop reads, not a constant */
   IR_SIMD_BAIL_UNRECOGNIZED_SHAPE  /* honest fallback: no cause identified */
 } IRSimdBailId;
 /* Stable lowercase-kebab name for an id (e.g. "byte-sum-narrow-acc"). */
