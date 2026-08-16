@@ -106,6 +106,11 @@ ASTNode *ast_clone_node(ASTNode *node) {
     clone->data = dst;
     break;
   }
+  /* A method carries a FunctionDeclaration like the other two. It used to fall
+   * to the default case and clone to a node with NULL data, which every later
+   * pass then skipped as malformed -- that is how a monomorphized generic
+   * struct lost its methods. */
+  case AST_METHOD_DECLARATION:
   case AST_LAMBDA_EXPRESSION:
   case AST_FUNCTION_DECLARATION: {
     FunctionDeclaration *src = (FunctionDeclaration *)node->data;

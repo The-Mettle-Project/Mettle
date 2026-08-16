@@ -1295,6 +1295,31 @@ static void collect_type_instantiations(ASTNode *node, MonoContext *ctx) {
     }
     break;
   }
+  case AST_STRUCT_DECLARATION: {
+    /* A method body is code like any other and may name a generic type. The
+     * template's own methods are skipped: they still name type parameters, and
+     * their instantiations are collected from the monomorphized copy. */
+    StructDeclaration *sd = (StructDeclaration *)node->data;
+    if (sd && sd->type_param_count == 0) {
+      for (size_t i = 0; i < sd->method_count; i++) {
+        ASTNode *method = sd->methods[i];
+        FunctionDeclaration *md =
+            method ? (FunctionDeclaration *)method->data : NULL;
+        if (!md) {
+          continue;
+        }
+        for (size_t p = 0; p < md->parameter_count; p++) {
+          record_generic_type_use(ctx, md->parameter_types[p],
+                                  method->location);
+        }
+        record_generic_type_use(ctx, md->return_type, method->location);
+        if (md->body) {
+          collect_type_instantiations(md->body, ctx);
+        }
+      }
+    }
+    break;
+  }
   case AST_PROGRAM: {
     Program *prog = (Program *)node->data;
     if (prog) {
@@ -1548,6 +1573,26 @@ static void rewrite_generic_references(ASTNode *node, MonoContext *ctx) {
                                              0);
         }
       }
+      for (size_t i = 0; i < sd->method_count; i++) {
+        ASTNode *method = sd->methods[i];
+        FunctionDeclaration *md =
+            method ? (FunctionDeclaration *)method->data : NULL;
+        if (!md) {
+          continue;
+        }
+        for (size_t p = 0; p < md->parameter_count; p++) {
+          if (md->parameter_types[p]) {
+            rewrite_generic_type_name_in_place(&md->parameter_types[p], NULL,
+                                               NULL, 0);
+          }
+        }
+        if (md->return_type) {
+          rewrite_generic_type_name_in_place(&md->return_type, NULL, NULL, 0);
+        }
+        if (md->body) {
+          rewrite_generic_references(md->body, ctx);
+        }
+      }
     }
     break;
   }
@@ -1749,6 +1794,44 @@ static ASTNode *create_monomorphized_struct(GenericDef *def,
     if (new_type) {
       mettle_free_string(sd->field_types[i]);
       sd->field_types[i] = new_type;
+    }
+  }
+
+  /* Methods are part of the instantiation, not of the template: their
+   * signatures and bodies name the type parameters the same way the fields do,
+   * so they take the same substitution before being lifted to top-level
+   * functions. */
+  for (size_t i = 0; i < sd->method_count; i++) {
+    ASTNode *method = sd->methods[i];
+    FunctionDeclaration *md =
+        method ? (FunctionDeclaration *)method->data : NULL;
+    if (!md) {
+      continue;
+    }
+
+    for (size_t p = 0; p < md->parameter_count; p++) {
+      char *new_type = substitute_type_string(
+          md->parameter_types[p], def->type_params, inst->type_args,
+          inst->type_arg_count, ctx);
+      if (new_type) {
+        mettle_free_string(md->parameter_types[p]);
+        md->parameter_types[p] = new_type;
+      }
+    }
+
+    if (md->return_type) {
+      char *new_type = substitute_type_string(
+          md->return_type, def->type_params, inst->type_args,
+          inst->type_arg_count, ctx);
+      if (new_type) {
+        mettle_free_string(md->return_type);
+        md->return_type = new_type;
+      }
+    }
+
+    if (md->body) {
+      substitute_types_in_ast(md->body, def->type_params, inst->type_args,
+                              inst->type_arg_count, ctx);
     }
   }
 
