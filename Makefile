@@ -28,7 +28,7 @@ RUNTIMEDIR = src/runtime
 # Install prefix for `make install` / `make install-libmtlc` (honors DESTDIR).
 PREFIX ?= /usr/local
 # Reported by mtlc_version(); keep in sync with src/mtlc_api.c.
-LIBMTLC_VERSION = 0.1.0
+LIBMTLC_VERSION = 0.2.0
 
 # Source files
 LEXER_SOURCES = $(SRCDIR)/lexer/lexer.c

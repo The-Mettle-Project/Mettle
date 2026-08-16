@@ -28,7 +28,7 @@
 
 /* ------------------------------------------------------------------ version */
 
-const char *mtlc_version(void) { return "libmtlc 0.1.0"; }
+const char *mtlc_version(void) { return "libmtlc 0.2.0"; }
 
 /* ------------------------------------------------------------------- target */
 

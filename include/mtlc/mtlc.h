@@ -29,7 +29,7 @@
 extern "C" {
 #endif
 
-/* Backend version string (e.g. "libmtlc 0.1.0"). */
+/* Backend version string (e.g. "libmtlc 0.2.0"). */
 const char *mtlc_version(void);
 
 #ifdef __cplusplus

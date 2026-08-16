@@ -158,7 +158,7 @@ to the kind name), so:
 
 Prefer `mtlc_type_array` and `mtlc_type_struct`: they compute the layout, intern
 the descriptor, and register a parseable name. `TAGGED_ENUM` and `ENUM` still
-have to be built by filling the struct yourself -- allocate it (statically, or
+have to be built by filling the struct yourself: allocate it (statically, or
 from an arena that outlives the module), set `kind`, `name`, `size`,
 `alignment`, and the layout arrays, and use it wherever a type is accepted.
 
@@ -182,7 +182,7 @@ Two limitations remain:
 
 1. **No aggregate locals through `mtlc_local`**: a struct value lives behind a
    pointer (a `malloc` result, or `mtlc_address_of` on storage you declared),
-   and field access is the pointer arithmetic above -- which is what it compiles
+   and field access is the pointer arithmetic above, which is what it compiles
    to anyway.
 2. The GPU and ARM64 emitters do not accept aggregates at all (see the
    [per-target table](ir.md#what-each-consumer-requires)).

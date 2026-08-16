@@ -2,8 +2,8 @@
 
 This is the design document for the successor to the `--ml-opt` model described
 in [`ml-opt.md`](ml-opt.md). That document describes what ships today. This one
-describes what is being built and why, and it is written to be read alongside the
-bake-off results in `tools/mlopt/_bakeoff/REPORT.md`.
+describes what is being built and why. The bake-off results it refers to are
+produced by the harness in [`tools/mlopt`](../tools/mlopt) and are not checked in.
 
 The shipped model (`gnn_genius`) is a relational GNN over the IR dataflow graph:
 one node per instruction, eight typed edges, nine scalar node features, six

@@ -51,5 +51,5 @@ through its own adapter (`src/frontend/`); nothing it does is available to it
 that is not available to you.
 
 Version: the API reports itself via `mtlc_version()` (currently
-`"libmtlc 0.1.0"`). Until 1.0, additions are expected and signatures may still
+`"libmtlc 0.2.0"`). Until 1.0, additions are expected and signatures may still
 move; the headers are the source of truth.

@@ -145,6 +145,13 @@ Windows consoles get VT sequences enabled automatically.
   vectorized/inlined and why not). `--explain=SELECTOR` narrows the prose to
   `missed`, `fixable`, `proven`, `loops`, `calls`, one function, or one
   decision code.
+  `--explain-all` widens the same report to imported modules and the stdlib.
 - `--annotate-asm`, `--annotate-lines=A-B` - codegen provenance.
+- `--annotate-hot[=N]` - the top N codegen hotspots, hottest loops by
+  cycles per iteration and functions by weighted cost. Defaults to 8.
+- `--profile-runtime-ops` - per-function runtime op-class counters, taken after
+  optimization.
+- `--debug-format <dwarf|stabs|map>` - debug information format, `dwarf` by
+  default.
 - Compile-time memory diagnostics run automatically; disable interprocedural
   analysis with `METTLE_NO_MEM_INTERPROC=1`.

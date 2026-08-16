@@ -530,7 +530,7 @@ Every iteration needs a name of its own, and `ident(...)` composes one from comp
 ident("end_of_", f.name)     // end_of_kind, end_of_seq, end_of_payload
 ```
 
-It is written the way `typeof` and `offsetof` are, out of an identifier and call syntax, and it adds no punctuation the lexer did not already read. Like `comptime`, it is contextual: `ident(...)` composes a name only inside a `comptime for` body, so a function the programmer happens to call `ident` is unaffected. Each part must evaluate to a compile-time string -- a string literal, or a `.name` query -- and the result must be a name the program could have been written with.
+It is written the way `typeof` and `offsetof` are, out of an identifier and call syntax, and it adds no punctuation the lexer did not already read. Like `comptime`, it is contextual: `ident(...)` composes a name only inside a `comptime for` body, so a function the programmer happens to call `ident` is unaffected. Each part must evaluate to a compile-time string, either a string literal or a `.name` query, and the result must be a name the program could have been written with.
 
 `ident(...)` also stands where a value does, so an iteration can refer to what it generated:
 

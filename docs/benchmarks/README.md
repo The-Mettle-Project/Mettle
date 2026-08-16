@@ -12,7 +12,7 @@ Each example under `examples/` ships a matched triple: `.mettle`, `.c`, and `.rs
 | `word_count` | Count words in a 256 KB buffer × 500 |
 | `grep` | Count lines containing `ERROR` in 1 MiB × 200 |
 | `sum_squares` | Sum 1²…100000² × 200 |
-| `collatz` | Collatz steps for n=1..100000 × 10 (heavy pass — not scaled to 200) |
+| `collatz` | Collatz steps for n=1..100000 × 10 (heavy pass, not scaled to 200) |
 | `byte_hash` | djb2 hash over 256 KB × 200 |
 | `prime_count` | Trial-division prime count to 50000 × 200 |
 | `matrix_mul` | Naive 32×32 int32 matrix multiply × 200 |
@@ -74,8 +74,8 @@ These are timed with `mettle --profile` (total compile ms).
 
 ## Output
 
-- `docs/benchmarks/latest.json` — canonical results (includes per-run timings, host info, summary stats)
-- `docs/benchmarks/latest.html` — self-contained HTML report with charts and comparison tables
-- `web/benchmarks.json` — mirror for the site (created on first run)
+- `docs/benchmarks/latest.json`: canonical results (includes per-run timings, host info, summary stats)
+- `docs/benchmarks/latest.html`: self-contained HTML report with charts and comparison tables
+- `web/benchmarks.json`: mirror for the site (created on first run)
 
 C benchmarks compile with `-O3` by default (see `defaults.c_flags` in `harness.json`).

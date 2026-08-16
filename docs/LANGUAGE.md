@@ -19,12 +19,16 @@ see [Writing a frontend for libmtlc](embedding.md).
 7. [Imports](imports.md)
 8. [Standard Library](standard-library.md)
 9. [Heap Allocation](heap-allocation.md)
-10. [GPU Offload](gpu.md)
-11. [Runtime Model](runtime-model.md)
-12. [C Interoperability](c-interop.md)
-13. [Compilation](compilation.md)
-14. [Quick Reference](quick-reference.md)
-15. [Known Limitations](known-limitations.md)
+10. [Borrow Checker](borrow-checker.md)
+11. [Memory Safety](memory-safety.md)
+12. [GPU Offload](gpu.md)
+13. [Runtime Model](runtime-model.md)
+14. [C Interoperability](c-interop.md)
+15. [Compilation](compilation.md)
+16. [Diagnostics](diagnostics.md)
+17. [Compile-Time Execution](testing.md)
+18. [Quick Reference](quick-reference.md)
+19. [Known Limitations](known-limitations.md)
 
 For the backend itself (the IR, optimizers, code generators, linker, and the
 public C API any frontend can drive) see the [documentation index](README.md).

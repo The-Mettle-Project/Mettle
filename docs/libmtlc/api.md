@@ -42,7 +42,7 @@ Umbrella header. Includes `context.h`, `diag.h`, `intrinsic.h`, `memory.h`,
 const char *mtlc_version(void);
 ```
 
-Returns a static version string, e.g. `"libmtlc 0.1.0"`. Never NULL, never
+Returns a static version string, e.g. `"libmtlc 0.2.0"`. Never NULL, never
 freed.
 
 ---
@@ -67,7 +67,7 @@ const char *mtlc_diag_severity_name(MtlcDiagSeverity severity);
 ```
 
 `message` is a complete sentence with no trailing newline, valid only for the
-duration of the call -- copy it if you keep it. Builder messages are prefixed
+duration of the call, so copy it if you keep it. Builder messages are prefixed
 with the API entry point that failed, so you learn which call was at fault:
 
 ```
@@ -77,7 +77,7 @@ mtlc_builder_finish: function 'main' branches to label 'nowhere', which is never
 
 `mtlc_diag_severity_name` returns `"error"`, `"warning"`, or `"note"`.
 
-Without a handler, errors go to `stderr` as `mtlc: <message>` -- the behavior
+Without a handler, errors go to `stderr` as `mtlc: <message>`, the behavior
 libmtlc has always had, so an existing consumer that installs nothing sees no
 change.
 
@@ -105,7 +105,7 @@ const char *mtlc_context_last_error(const MtlcContext *ctx);
 void mtlc_context_clear_error(MtlcContext *ctx);
 ```
 
-Route pipeline diagnostics -- optimize, ML-opt, codegen, link -- to `handler`
+Route pipeline diagnostics (optimize, ML-opt, codegen, link) to `handler`
 instead of `stderr`. `user_data` is passed back unchanged and is neither copied
 nor freed; a NULL handler restores the default.
 
@@ -339,7 +339,7 @@ that owns `fn`, which is the convenient form mid-body.
 
 Because `mtlc_builder_finish` consumes the builder on the failure path too, its
 message is gone by the time it returns NULL. Install a handler if you want to
-see errors as they happen -- including the ones only detectable at finish:
+see errors as they happen, including the ones only detectable at finish:
 
 ```c
 static void on_diag(void *user, MtlcDiagSeverity sev, const char *msg) {
@@ -1093,7 +1093,7 @@ not have to reproduce the backend's padding rules.
 
 `mtlc_type_struct` places each field at the next offset satisfying its own
 alignment, takes the struct's alignment from the widest field, and rounds the
-size up to that alignment -- the standard C rule. `name` becomes the registered
+size up to that alignment, the standard C rule. `name` becomes the registered
 type name; structs intern by it, so declaring the same name twice returns the
 first descriptor and a conflicting redeclaration returns NULL rather than
 silently shadowing.

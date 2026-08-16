@@ -37,7 +37,8 @@ Driver-facing views of the same machinery:
   gates required before making parity or performance claims.
 - [ML-driven IR optimization](ml-opt.md), [Translation
   validation](translation-validation.md), [Profile-guided
-  optimization](pgo.md): `--ml-opt`, `--verify`, `--pgo`.
+  optimization](pgo.md): `--ml-opt`, `--verify`, `--pgo`. The successor model
+  under development is described in [gnn_oracle](ml-opt-oracle.md).
 - [Runtime model](runtime-model.md): what emitted programs assume of the OS.
 - [Diagnostics](diagnostics.md): the frontend-neutral diagnostics reporter.
 - [The `--explain-json` schema](explain-json.md): the machine-readable
@@ -59,8 +60,18 @@ Mettle is a typed, assembly-inspired systems language. These document the
   [Standard library](standard-library.md)
 - [Heap allocation](heap-allocation.md), [Borrow checker](borrow-checker.md),
   [C interoperability](c-interop.md)
+- [Memory safety](memory-safety.md): `--safe`, what it checks, what it proves
+  away, and what it does not cover.
 - [Compile-time execution](testing.md) (`mettle test` / `trace`),
   [Quick reference](quick-reference.md), [Known limitations](known-limitations.md)
+
+## Design and rationale
+
+- [Ideology](ideology.md): the rules the language holds itself to, and what each
+  one costs.
+- [Architecture](ARCHITECTURE.md): the full pipeline, subsystem by subsystem.
+- [Mettle and libmtlc](mettle-and-libmtlc.md): where the frontend ends and the
+  backend begins, and how to build each half.
 
 ## Contributing
 

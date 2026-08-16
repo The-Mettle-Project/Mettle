@@ -261,6 +261,10 @@ names never produce a misleading suggestion.
 `--explain` (with `-O`/`--release`) prints what the optimizer did to the main
 input file and why. It reads top to bottom in three parts.
 
+The report covers the main input file only. `--explain-all` drops that filter
+and analyzes every module the program imports, the standard library included,
+which is what you want when the loop you care about was inlined from elsewhere.
+
 **Where to start.** The findings that have a fix, ranked by what the compiler
 can stand behind.
 
@@ -418,34 +422,33 @@ The warning threshold is currently fixed and may become configurable in a future
 
 ## Compiler debugging
 
-Use explicit dump flags to inspect the compiler pipeline. Artifacts are written
-next to `-o` (or under `--dump-dir` when set) using the output stem:
+`--dump-ir` writes the IR as a sidecar next to `-o`, appending `.ir` to the
+output name. Compiling to `app.obj` writes `app.obj.ir`. The dump is taken after
+optimization, so it shows what the backend received:
 
+| Flag              | Output                                             |
+| ----------------- | -------------------------------------------------- |
+| `--dump-ir`       | `<output>.ir`, the post-optimizer IR               |
+| `-d` / `--debug`  | the same sidecar, plus debug symbols and log output |
 
-| Flag                                   | Output                                                                                    |
-| -------------------------------------- | ----------------------------------------------------------------------------------------- |
-| `--dump-ir`                            | `{stem}.ir.before.mettle` and `{stem}.ir.after.mettle` (same as `--dump-ir=before,after`) |
-| `--dump-ir=before` / `--dump-ir=after` | Selected stage only                                                                       |
-| `--dump-ir-passes`                     | `{stem}.ir.pass-<label>.mettle` after optimization milestones (requires `-O`)             |
-| `--dump-ast`                           | `{stem}.ast.mettle` after type checking                                                   |
-| `--dump-mono`                          | `{stem}.mono.mettle` index plus `{stem}.mono.<mangled>.mettle` per expansion              |
-| `--dump-dir <dir>`                     | Directory for all dump files                                                              |
+Each function is printed as a header, then its basic blocks with instruction
+ranges and predecessor and successor edges:
 
-
-IR dumps include source locations (`; @file:line:col`), basic-block labels, and
-parameter types. `-d`/`--debug` also enables `--dump-ir=before,after` plus debug
-symbol generation.
+```
+function main {
+  block 0 <entry> [0..52] preds: - succs: -
+       1: local @s : int32
+       2: @s <- 0
+```
 
 ```powershell
 mettle --dump-ir -O app.mettle -o app.obj
-mettle --dump-ir-passes -O app.mettle -o app.obj
-mettle --dump-ast app.mettle -o app.obj
-mettle --dump-mono tests/test_generics_multiple_instantiations.mettle -o out.obj
-mettle help debug
 ```
 
-Helper scripts live under `tools/debug/` (`dump-compiler-artifacts.ps1`,
-`diff-ir.ps1`, `disasm-obj.ps1`).
+For optimization decisions, use `--explain`, which reports each loop and call
+the optimizer considered along with its reason. For per-pass behavior,
+`--verify` validates every pass against the reference interpreter and names the
+pass that diverges.
 
 With object emission or `--build`, `-g` embeds binary DWARF 4
 sections (`.debug_info`, `.debug_abbrev`, `.debug_line`, `.debug_str`,

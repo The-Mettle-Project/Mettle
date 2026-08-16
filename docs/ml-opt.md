@@ -158,6 +158,6 @@ Two further toggles control optional behavior. `METTLE_ML_AFFINE=1` enables the 
 
 ## Internals and Retraining
 
-See [`tools/mlopt/README.md`](../tools/mlopt/README.md) for the model architecture, the offline training and export pipeline, and how to rebuild `gnn_genius.bin`, `bw_lib.txt`, and `gf2_lib1.txt`. The fuller design history is in [`ml-ir-optimization-design.md`](ml-ir-optimization-design.md).
+See [`tools/mlopt/README.md`](../tools/mlopt/README.md) for the model architecture, the offline training and export pipeline, and how to rebuild `gnn_genius.bin`, `bw_lib.txt`, and `gf2_lib1.txt`.
 
 A successor architecture is in development and described in [`ml-opt-oracle.md`](ml-opt-oracle.md): semantic rather than syntactic node identity, a head that names the reuse target instead of only its class, adaptive depth, and training labels harvested from the validator's own verdicts on real IR. It is not wired into the compiler; `--ml-opt` loads `gnn_genius.bin` as described above.

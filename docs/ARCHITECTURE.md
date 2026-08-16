@@ -800,9 +800,8 @@ checking:
    the type demands it.
 
 Because instantiation happens on the AST before checking, each concrete
-instantiation is type-checked independently, and `--dump-mono` writes each
-expansion out as source. Monomorphization can re-lex and re-parse synthesized
-source.
+instantiation is type-checked independently. Monomorphization can re-lex and
+re-parse synthesized source.
 
 ## 3.5 Type checking and memory safety
 
@@ -2015,10 +2014,7 @@ fine-grained action tracking and an IR snapshot.
 
 | Flag | Output |
 |---|---|
-| `--dump-ast` | AST after type checking |
-| `--dump-mono` | index plus one file per generic expansion |
-| `--dump-ir[=before,after]` | IR text with source locations, block labels, parameter types |
-| `--dump-ir-passes` | IR after each optimization milestone |
+| `--dump-ir` | post-optimizer IR text with block labels and edges, written to `<output>.ir` |
 | `--explain` / `--explain-json` | per-loop vectorization and per-call inlining decisions with `reason:` and `fix:` lines |
 | `--simd-report` | per-`@simd`-loop vectorization outcome |
 | `--annotate-asm`, `--annotate-lines=A-B` | encoder decisions per source range |

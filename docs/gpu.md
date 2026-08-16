@@ -871,6 +871,18 @@ The host links `nvcuda`, the OS driver, as an explicit vendor API. There is no
 bundled CUDA DLL. At run time the driver JITs
 the PTX to SASS for the installed GPU.
 
+### Reporting and check flags
+
+| Flag | Effect |
+| --- | --- |
+| `--report-launches` | Lists every dispatch site with the grid and block the compiler can fold, and the kernel each one names |
+| `--report-occupancy` | With `--emit-ptx`, runs `ptxas -v` on the emitted module and prints each kernel's registers per thread and the occupancy ceiling they imply |
+| `--sms=N` | SM count used for the whole-card fill thresholds in that report. Defaults to asking the local driver, and the thresholds are omitted when no driver answers |
+| `--gpu-checks` | Emits the trap for each kernel-side `gpu_assert`. Without it those assertions cost nothing |
+
+`--report-occupancy` needs `ptxas` on `PATH`, since it reads that tool's own
+register and spill accounting.
+
 GPU `-O` is intentionally backend-agnostic. It runs shared scalar/CFG
 transformations only over kernel-reachable device functions and retains
 address spaces, memory order/scope, barriers, subgroup collectives, and tensor
