@@ -171,9 +171,9 @@ Reports past ~200 lines (real applications) are written to
 on stderr (`METTLE_EXPLAIN_REPORT_LINES` overrides the threshold; `0` never
 diverts).
 
-Fix suggestions are **verified, not guessed**, where the compiler can prove
-them: it applies the suggested change to an internal clone, re-runs its own
-optimizer on it, and only then prints a `verified:` line,
+A fix the compiler can prove carries a `verified:` line. It applies the change
+to an internal clone, re-runs its own optimizer on it, and prints the line only
+when a kernel claimed the loop,
 
 ```
 sum_bytes (loop @ line 27): NOT vectorized
@@ -190,13 +190,24 @@ NOT help, the report says that instead of giving advice that won't work.
 
 The verified library covers element-width fixes (int16/int64 → int32),
 accumulator widening (int32 and byte sums need an int64 accumulator), the
-dot-product row-pointer hoist, and call-in-the-loop fixes. For those the
+dot-product row-pointer hoist, the single-region fill, the body-local hoist,
+the single float width, and call-in-the-loop fixes. For the last of those the
 compiler pretend-applies the decorator change, re-runs its own **inliner** on
 a clone of the caller, and proves lines like `simulated removing @noinline
-from damp ... this loop then vectorizes → vfmadd231ps`. And when a simulation
+from damp ... this loop then vectorizes → vfmadd231ps`. When a simulation
 proves the standard advice is *unwritable* (e.g. the index math genuinely
 changes every iteration, a real non-unit-stride access), the advice is
-replaced with that finding rather than printed.
+replaced with that finding rather than printed. When the change applies and
+the loop still stays scalar, the advice is tagged `(first step only)` and a
+`still blocked:` line names what surfaces next.
+
+The diagnoses outside that library carry advice the compiler cannot simulate.
+It is checked a different way: `tests/test_explain_fix_advice.mettle` holds
+each suggestion beside the loop it is given for and beside that loop with the
+suggestion carried out, and the suite fails if the second half stops
+vectorizing. Advice that names no edit to the loop in front of it, such as the
+checklist printed when no cause could be identified, appears as `note:` and
+stays out of "where to start".
 
 ## Function decorators
 

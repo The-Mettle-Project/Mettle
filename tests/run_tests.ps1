@@ -5844,7 +5844,9 @@ $fixAdvicePairs = @(
   @{ Name = "shift";     Id = "unbounded-shift" },
   @{ Name = "fill";      Id = "store-only-fill" },
   @{ Name = "search";    Id = "early-exit" },
-  @{ Name = "noinline";  Id = "call-in-body" }
+  @{ Name = "noinline";  Id = "call-in-body" },
+  @{ Name = "explainshift";  Id = "unbounded-shift" },
+  @{ Name = "explainvshift"; Id = "variable-shift" }
 )
 
 $total++

@@ -489,13 +489,15 @@ static const DecisionDoc DECISIONS[] = {
      "    an element count from the base. Start at 0 and seed the accumulator\n"
      "    with a sentinel instead.\n"
      "\n"
+     "  - The elements are not float32, float64 or int32. Those are the lane\n"
+     "    widths the extremum kernel carries, and the width it reads is the\n"
+     "    ELEMENT's. A uint8 or int16 array stays scalar however the\n"
+     "    accumulator is declared, so widening `best` alone moves nothing;\n"
+     "    widen the array. uint32 is refused because vpmaxsd compares signed.\n"
+     "\n"
      "  - The elements are narrower than the accumulator. `(int32)bytes[i]`\n"
      "    widens per element; the kernel's lanes are the element width. This\n"
      "    is a gap, not a problem with the loop.\n"
-     "\n"
-     "  - The accumulator is not float32, float64 or int32. Those are the\n"
-     "    lane widths the extremum kernel carries. uint32 is refused because\n"
-     "    vpmaxsd compares signed.\n"
      "\n"
      "  - The body also stores. Then it is a clamp, not a reduction. See\n"
      "    `mettle explain clamp-store`.\n"},
@@ -514,9 +516,13 @@ static const DecisionDoc DECISIONS[] = {
      "    in the loop.\n"
      "  - An else arm that also writes the accumulator. That is a select on a\n"
      "    loop-carried value, not an accumulate; there is no one addend.\n"
-     "  - A guard that is not a comparison. `if (a[i] & 6)` fires on 2, 4 and\n"
-     "    6 alike, so multiplying by it would add those instead of 1. Write\n"
-     "    the test as `(a[i] & 6) != 0` and it converts.\n"},
+     "  - A guard on a computed value. The conversion reads a comparison of a\n"
+     "    loaded element (`a[i] > t`, `a[i] == 0`); `if (a[i] & 6)` is a test\n"
+     "    of an expression, and respelling it `(a[i] & 6) != 0` keeps it one.\n"
+     "    Add the comparison rather than branching on it and the kernel takes\n"
+     "    it, for any comparison:\n"
+     "\n"
+     "        c = c + ((a[i] & 6) != 0);\n"},
     {"clamp-store", DECISION_VECTOR_REFUSAL,
      "A value clamped or selected before it is stored",
      "`if (v > hi) { v = hi; }` before `a[i] = v` is a clamp, and over int32\n"
@@ -548,25 +554,40 @@ static const DecisionDoc DECISIONS[] = {
      "    r[i], g[i], b[i]        // three loops, all vectorized\n"},
     {"unbounded-shift", DECISION_VECTOR_REFUSAL,
      "A right shift whose input cannot be bounded",
-     "Integer lanes are 32 bits wide. `+ - * & | ^ <<` are congruent mod 2^32 --\n"
-     "the low 32 bits of a result depend only on the low 32 bits of its inputs\n"
-     "-- so a lane reproduces them whatever width the scalar code used. `>>`\n"
-     "is the exception: it reads bits back DOWN, so a lane that wrapped where\n"
-     "the scalar did not would shift different bits in.\n"
+     "Integer lanes are 32 bits wide. `+ - * & | ^ <<` are congruent mod 2^32,\n"
+     "so the low 32 bits of a result depend only on the low 32 bits of its\n"
+     "inputs and a lane reproduces them whatever width the scalar code used.\n"
+     "`>>` is the exception: it reads bits back DOWN, so a lane that wrapped\n"
+     "where the scalar did not would shift different bits in.\n"
      "\n"
-     "The kernel therefore takes a right shift only where the shifted value is\n"
-     "provably inside int32. Constant factors are provable:\n"
+     "The kernel takes a right shift only where the shifted value is provably\n"
+     "inside int32, and a multiply is not provable on its own. This is refused:\n"
      "\n"
-     "    dst[i] = (uint8)((r[i]*77 + g[i]*150 + b[i]*29) >> 8);\n"
+     "    dst[i] = (r[i]*77 + g[i]*150 + b[i]*29) >> 8;\n"
      "\n"
-     "reaches 65280 at the very most, so it vectorizes. A runtime weight does\n"
-     "not:\n"
+     "Masking bounds it, at the cost of one op per lane, and this vectorizes:\n"
      "\n"
-     "    dst[i] = (uint8)((s[i]*a + d[i]*(255-a)) >> 8);   // `a` unbounded\n"
+     "    dst[i] = ((r[i]*77 + g[i]*150 + b[i]*29) & 65535) >> 8;\n"
      "\n"
-     "Masking first makes it provable, at the cost of one extra op per lane:\n"
+     "Keep the destination int32. Narrowing the store to a `uint8*` puts the\n"
+     "loop outside the kernels for a separate reason, so masking alone will\n"
+     "not move it.\n"},
+    {"variable-shift", DECISION_VECTOR_REFUSAL,
+     "A shift by a distance read at run time",
+     "The kernels carry a shift only when the distance is written in the\n"
+     "source. A distance the loop reads has no kernel, in either direction:\n"
      "\n"
-     "    dst[i] = (uint8)(((s[i]*a + d[i]*(255-a)) & 65535) >> 8);\n"},
+     "    b[i] = a[i] >> k;      // `k` a parameter or a variable\n"
+     "    b[i] = a[i] << k;\n"
+     "\n"
+     "Both stay scalar. A constant distance vectorizes:\n"
+     "\n"
+     "    b[i] = a[i] >> 8;\n"
+     "\n"
+     "There is no source rewrite that reaches a kernel while the distance\n"
+     "stays a run-time value, so this is a gap in the compiler rather than a\n"
+     "problem with the loop. Splitting into one loop per distance works when\n"
+     "the distances are few and known.\n"},
     {"unrecognized-shape", DECISION_VECTOR_REFUSAL,
      "No recognizer claimed this loop",
      "The honest fallback. The compiler ruled out every disqualifier it can\n"
