@@ -728,15 +728,15 @@ bounds. The first of those is the precondition for everything in Part III.
   *(III.2.1)* **Landed**, and it prints every declaration the programmer
   wrote: a module-scope `static_assert` used to come back as a comment saying
   it had no source form, which also made expand disclaim the whole file.
-- Expansion-chain attribution in diagnostics and `trace`. *(III.2.2)*
-  **Diagnostics: landed.** Every error raised inside an expansion carries a
+- ~~Expansion-chain attribution in diagnostics and `trace`.~~ *(III.2.2)*
+  **Landed, both halves.** Every error raised inside an expansion carries a
   note naming the iteration and the field, gated by
-  `err_comptime_contract_mismatch`. **`trace`: partial.** It shows every
-  expansion's values against the line the programmer wrote (`total = 100,
-  505, 1315 (3x)`) but cannot name which iteration produced which, because
-  the expansion chain lives on the frontend's note frames and does not reach
-  the IR instructions the interpreter traces. Finishing this means carrying
-  expansion identity into the IR, which is the remaining work on this line.
+  `err_comptime_contract_mismatch`. `trace` names them too: each instruction
+  carries the expansion that generated it, so the values of one written line
+  separate per iteration (``(field `kind`) total = 100; (field `seq`) total =
+  505``) instead of merging into one run. The note reaches the IR because
+  lowering stamps it; the error reporter's note frames only exist while
+  checking, and the interpreter walks IR long afterwards.
 - ~~Comptime cost accounting, from the first metaprogram.~~ *(III.2.4,
   VII.10)* **Landed:** `--report-expansion` prints what each site cost and
   `--expansion-budget=N` makes it a contract that fails the build.

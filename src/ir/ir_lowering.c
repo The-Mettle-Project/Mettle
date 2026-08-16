@@ -263,6 +263,15 @@ char *ir_new_label_name(IRLoweringContext *context, const char *prefix) {
 
 int ir_emit(IRLoweringContext *context, IRFunction *function,
                    const IRInstruction *instruction) {
+  /* Single funnel for every instruction lowering produces, so the expansion
+   * stamp cannot be forgotten at one of the call sites. */
+  IRInstruction stamped;
+  if (context && context->current_expansion_note && instruction &&
+      !instruction->expansion_note) {
+    stamped = *instruction;
+    stamped.expansion_note = context->current_expansion_note;
+    instruction = &stamped;
+  }
   if (!ir_function_append_instruction(function, instruction)) {
     ir_set_error(context, "Out of memory while appending IR instruction");
     return 0;

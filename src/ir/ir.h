@@ -521,6 +521,16 @@ typedef struct {
    * the target type; for IR_OP_DECLARE_LOCAL the local's type. NULL when not
    * applicable or synthesized by the optimizer. */
   MtlcType *value_type;
+  /* Which `comptime for` iteration generated this instruction, already
+   * formatted the way a diagnostic says it ("iteration 1 (field `kind`)").
+   * NULL for anything the programmer wrote directly.
+   *
+   * Diagnostics carry this on the error reporter's note frames, which exist
+   * only while checking. The interpreter walks IR long after that, so `trace`
+   * could show an expansion's values but never say which iteration produced
+   * them. Borrowed from the type checker's expansion table, which outlives
+   * every consumer of the IR. */
+  const char *expansion_note;
 } IRInstruction;
 
 /* Compatibility mapping used at frontend/public-call boundaries. It is the

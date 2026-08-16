@@ -52,6 +52,10 @@ typedef struct {
   char *error_message;
   TypeChecker *type_checker;
   SymbolTable *symbol_table;
+  /* The expansion whose body is being lowered, stamped onto every instruction
+   * emitted while it is in effect. Saved and restored around each expanded
+   * block, so a nested expansion reports the innermost one. */
+  const char *current_expansion_note;
   int emit_runtime_checks;
   /* `--safe`: emit an IR_OP_SAFETY_CHECK at every memory access. Independent
    * of emit_runtime_checks, which is the debug-build null and bounds trap and

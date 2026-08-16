@@ -2507,6 +2507,37 @@ catch {
   Write-CaseResult -Name "expand_shows_generated_source" -Passed $false -Reason $_.Exception.Message
 }
 
+# III.2.2's second half: `trace` steps through an expansion, which means saying
+# which iteration produced which value. Before the IR carried the expansion
+# note these merged into one indistinguishable run ("total = 100, 505, 1315
+# (3x)") because the chain lived on the error reporter's note frames and never
+# reached the instructions the interpreter walks.
+$total++
+try {
+  $out = & $CompilerPath trace "tests\test_comptime_for_fields.mettle" main 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "trace failed: $out" }
+  foreach ($expected in @('(field `kind`) total = 100',
+                          '(field `seq`) total = 505',
+                          '(field `payload`) total = 1315')) {
+    if ($out -notmatch [regex]::Escape($expected)) {
+      throw "trace did not attribute the expansion: missing '$expected' in: $out"
+    }
+  }
+  # The merged form must be gone, or the values were not separated at all.
+  if ($out -match "100, 505, 1315") {
+    throw "trace still merges expansions into one run: $out"
+  }
+  # Code the programmer wrote carries no note.
+  if ($out -notmatch "<- total = 0") {
+    throw "written code should be annotated without an expansion note: $out"
+  }
+  Write-CaseResult -Name "trace_attributes_expansions" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "trace_attributes_expansions" -Passed $false -Reason $_.Exception.Message
+}
+
 # Expansion is inspectable, which means every declaration the programmer wrote
 # comes back as source. A module-scope `static_assert` used to reach the
 # printer's default arm and be reported as having no source form, which also

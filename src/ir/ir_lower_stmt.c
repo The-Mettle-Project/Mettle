@@ -215,16 +215,30 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     if (!program) {
       return 1;
     }
+    /* A block the expander generated carries the note naming its iteration.
+     * Stamp it for the duration so `trace` can attribute the values, and
+     * restore afterwards so a sibling block is not credited to it. */
+    const char *saved_expansion_note = context->current_expansion_note;
+    const char *block_note =
+        context->type_checker
+            ? type_checker_expansion_note(context->type_checker, statement,
+                                          NULL)
+            : NULL;
+    if (block_note) {
+      context->current_expansion_note = block_note;
+    }
     if (!defers) {
       ir_local_scope_enter(context);
       for (size_t i = 0; i < program->declaration_count; i++) {
         if (!ir_lower_statement_with_defers(context, function,
                                             program->declarations[i], NULL)) {
           ir_local_scope_leave(context);
+          context->current_expansion_note = saved_expansion_note;
           return 0;
         }
       }
       ir_local_scope_leave(context);
+      context->current_expansion_note = saved_expansion_note;
       return 1;
     }
 
@@ -236,6 +250,7 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
               context, function, program->declarations[i], &block_scope)) {
         ir_defer_stack_free(&block_scope.stack);
         ir_local_scope_leave(context);
+        context->current_expansion_note = saved_expansion_note;
         return 0;
       }
     }
@@ -244,6 +259,7 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
         ir_emit_deferred_calls_non_err(context, function, &block_scope.stack);
     ir_defer_stack_free(&block_scope.stack);
     ir_local_scope_leave(context);
+    context->current_expansion_note = saved_expansion_note;
     return ok;
   }
 

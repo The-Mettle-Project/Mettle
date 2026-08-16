@@ -2676,7 +2676,7 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
         IRInterpValue value;
         if (var && ii_var_read(machine, var, &value)) {
           machine->value_hook(machine->value_hook_ctx, insn->location.line,
-                              insn->dest.name, value);
+                              insn->dest.name, value, insn->expansion_note);
         }
         break;
       }

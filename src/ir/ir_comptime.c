@@ -279,6 +279,11 @@ int ir_comptime_run_tests(IRProgram *program, ErrorReporter *reporter,
 typedef struct {
   size_t line;
   const char *name;
+  /* The `comptime for` iteration that generated the instruction, or NULL for
+   * written code. Part of the entry's identity: without it every expansion of
+   * one written line merges into a single run of values with no way to tell
+   * which iteration produced which. */
+  const char *expansion_note;
   long long count;
   char samples[ICT_TRACE_SAMPLES][40];
   char last[40];
@@ -292,7 +297,7 @@ typedef struct {
 } ICTTraceLog;
 
 static void ict_trace_hook(void *ctx, size_t line, const char *name,
-                           IRInterpValue value) {
+                           IRInterpValue value, const char *expansion_note) {
   ICTTraceLog *log = (ICTTraceLog *)ctx;
   /* Compiler temps and synthesized locals are noise; show user symbols. */
   if (!name || name[0] == '.' || name[0] == '_') {
@@ -301,7 +306,8 @@ static void ict_trace_hook(void *ctx, size_t line, const char *name,
   ICTTraceEntry *entry = NULL;
   for (size_t i = 0; i < log->count; i++) {
     if (log->entries[i].line == line &&
-        strcmp(log->entries[i].name, name) == 0) {
+        strcmp(log->entries[i].name, name) == 0 &&
+        log->entries[i].expansion_note == expansion_note) {
       entry = &log->entries[i];
       break;
     }
@@ -314,6 +320,7 @@ static void ict_trace_hook(void *ctx, size_t line, const char *name,
     memset(entry, 0, sizeof(*entry));
     entry->line = line;
     entry->name = name;
+    entry->expansion_note = expansion_note;
   }
   char text[40];
   ict_format_value(&value, text, sizeof(text));
@@ -509,7 +516,20 @@ int ir_comptime_trace(IRProgram *program, ErrorReporter *reporter,
         if (entry->line != line) {
           continue;
         }
-        printf("%s%s %s = ", cyan, printed_any ? ";" : " <-", entry->name);
+        printf("%s%s ", cyan, printed_any ? ";" : " <-");
+        /* The diagnostic's wording is "expanded from comptime-for iteration 1
+         * (field `kind`)". Inline against source that is too long, so show
+         * the parenthesized subject, which is what distinguishes one
+         * iteration from the next. */
+        if (entry->expansion_note) {
+          const char *subject = strchr(entry->expansion_note, '(');
+          if (subject) {
+            printf("%s ", subject);
+          } else {
+            printf("[%s] ", entry->expansion_note);
+          }
+        }
+        printf("%s = ", entry->name);
         long long shown = entry->count < ICT_TRACE_SAMPLES
                               ? entry->count
                               : ICT_TRACE_SAMPLES;

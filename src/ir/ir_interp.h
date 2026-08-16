@@ -111,8 +111,13 @@ int ir_interp_buffer_freed(const IRInterpMachine *machine, size_t index);
 /* Line-level value tracing: after each executed instruction inside
  * `only_in` frames that writes a named destination, the hook receives the
  * source line, destination name, and new value. */
+/* `expansion_note` names the `comptime for` iteration that generated the
+ * instruction, or is NULL for code the programmer wrote directly. Several
+ * expansions of one written line otherwise report as one indistinguishable
+ * run of values. */
 typedef void (*IRInterpValueHook)(void *ctx, size_t line, const char *name,
-                                  IRInterpValue value);
+                                  IRInterpValue value,
+                                  const char *expansion_note);
 void ir_interp_set_value_hook(IRInterpMachine *machine, IRInterpValueHook hook,
                               void *ctx, const IRFunction *only_in);
 
