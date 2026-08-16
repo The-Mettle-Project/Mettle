@@ -721,12 +721,25 @@ bounds. The first of those is the precondition for everything in Part III.
 
 **Before metaprogramming ships:**
 
-- Name resolution and hygiene settled. *(III.2.3, the only hard ordering
+- ~~Name resolution and hygiene settled.~~ *(III.2.3, the only hard ordering
   constraint in this document; hygiene cannot be retrofitted onto an existing
-  macro corpus.)*
-- `mettle expand`, built at the same time as expansion, not after. *(III.2.1)*
+  macro corpus.)* **Landed** in `4e23760`, the commit III.2.3 cites.
+- ~~`mettle expand`, built at the same time as expansion, not after.~~
+  *(III.2.1)* **Landed**, and it prints every declaration the programmer
+  wrote: a module-scope `static_assert` used to come back as a comment saying
+  it had no source form, which also made expand disclaim the whole file.
 - Expansion-chain attribution in diagnostics and `trace`. *(III.2.2)*
-- Comptime cost accounting, from the first metaprogram. *(III.2.4, VII.10)*
+  **Diagnostics: landed.** Every error raised inside an expansion carries a
+  note naming the iteration and the field, gated by
+  `err_comptime_contract_mismatch`. **`trace`: partial.** It shows every
+  expansion's values against the line the programmer wrote (`total = 100,
+  505, 1315 (3x)`) but cannot name which iteration produced which, because
+  the expansion chain lives on the frontend's note frames and does not reach
+  the IR instructions the interpreter traces. Finishing this means carrying
+  expansion identity into the IR, which is the remaining work on this line.
+- ~~Comptime cost accounting, from the first metaprogram.~~ *(III.2.4,
+  VII.10)* **Landed:** `--report-expansion` prints what each site cost and
+  `--expansion-budget=N` makes it a contract that fails the build.
 
 **Before hot swap ships:**
 
