@@ -279,6 +279,40 @@ static int type_checker_eval_numeric_constant(TypeChecker *checker,
       type_checker_constant_from_int(out_value, left_value % right_value);
       return 1;
     }
+    /* Bitwise and shift folding. These are how a byte constant is usually
+     * written -- `1 << 7`, `0xF0 | 0x0F` -- so leaving them unfolded would
+     * make the range check refuse constants that plainly fit. A shift count
+     * at or past the width has no defined value to fold, so it is declined
+     * (the caller then treats the expression as non-constant). */
+    if (strcmp(binary_expr->operator, "&") == 0) {
+      type_checker_constant_from_int(out_value, left_value & right_value);
+      return 1;
+    }
+    if (strcmp(binary_expr->operator, "|") == 0) {
+      type_checker_constant_from_int(out_value, left_value | right_value);
+      return 1;
+    }
+    if (strcmp(binary_expr->operator, "^") == 0) {
+      type_checker_constant_from_int(out_value, left_value ^ right_value);
+      return 1;
+    }
+    if (strcmp(binary_expr->operator, "<<") == 0) {
+      if (right_value < 0 || right_value > 62 || left_value < 0) {
+        return 0;
+      }
+      if (left_value > (LLONG_MAX >> right_value)) {
+        return 0;
+      }
+      type_checker_constant_from_int(out_value, left_value << right_value);
+      return 1;
+    }
+    if (strcmp(binary_expr->operator, ">>") == 0) {
+      if (right_value < 0 || right_value > 63) {
+        return 0;
+      }
+      type_checker_constant_from_int(out_value, left_value >> right_value);
+      return 1;
+    }
     if (strcmp(binary_expr->operator, "==") == 0) {
       type_checker_constant_from_int(out_value, left_value == right_value);
       return 1;

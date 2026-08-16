@@ -748,6 +748,15 @@ int ir_simd_sum_u8_pass(IRFunction *function, int *changed) {
 
 #define BYTE_MAP_MAX_STEPS 16
 
+/* An integer type name, for the cast pass-through below. */
+static int ir_type_name_is_integer(const char *name) {
+  return name && (strcmp(name, "int8") == 0 || strcmp(name, "uint8") == 0 ||
+                  strcmp(name, "int16") == 0 || strcmp(name, "uint16") == 0 ||
+                  strcmp(name, "int32") == 0 || strcmp(name, "uint32") == 0 ||
+                  strcmp(name, "int64") == 0 || strcmp(name, "uint64") == 0 ||
+                  strcmp(name, "bool") == 0);
+}
+
 /* Maps a binary operator's text to its IRByteMapOp, or -1 if unsupported.
  * *commutative_out reports whether the constant may be on either side. */
 static int ir_byte_map_op_code(const char *text, int *commutative_out) {
@@ -901,6 +910,19 @@ static int ir_try_vectorize_byte_map_at(IRFunction *function,
         ir_operand_is_temp_named(&ins->lhs, cur)) {
       have_store = 1;
       dirty = 0;
+      continue;
+    }
+
+    /* cur = (intN)cur. Every operator in the chain is low-byte-determined and
+     * the only store is one byte wide, so an integer cast anywhere in the
+     * chain cannot change what is written. `buf[i] = (uint8)(buf[i] * 3 + 7);`
+     * is the same kernel as the uncast form, and now that a narrowing store
+     * has to say so, it is the form the source is written in. */
+    if (ins->op == IR_OP_CAST && !ins->is_float && cur &&
+        ins->dest.kind == IR_OPERAND_TEMP && ins->dest.name &&
+        ir_operand_is_temp_named(&ins->lhs, cur) &&
+        ir_type_name_is_integer(ins->text)) {
+      cur = ins->dest.name;
       continue;
     }
 

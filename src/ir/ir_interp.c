@@ -34,6 +34,16 @@ typedef struct {
   int slot_size;
   int slot_is_float;
   int slot_is_unsigned;
+  /* Declared integer width of a register-resident local or parameter, in
+     bytes, and its signedness. A write is narrowed to it, so a narrow local
+     wraps here exactly as it wraps in a register: without this an int32 that
+     overflows keeps all 64 bits and the interpreter disagrees with the
+     machine -- which would make mettle test, trace, --pgo and the two
+     differential gates disagree with the program they are describing.
+     0 means unknown (a temp, a global first touched by a write), which keeps
+     the full width. */
+  int value_size;
+  int value_is_unsigned;
 } IIVar;
 
 typedef struct {
@@ -572,10 +582,25 @@ static int ii_var_read(IRInterpMachine *machine, IIVar *var,
   return 1;
 }
 
+/* Narrow an integer to a declared width, the way a store to a narrow home
+   does. Signedness decides which extension refills the high bits. */
+static long long ii_narrow_int(long long v, int size, int is_unsigned) {
+  switch (size) {
+  case 1: return is_unsigned ? (long long)(unsigned char)v : (long long)(signed char)v;
+  case 2: return is_unsigned ? (long long)(unsigned short)v : (long long)(short)v;
+  case 4: return is_unsigned ? (long long)(unsigned int)v : (long long)(int)v;
+  default: return v;
+  }
+}
+
 static int ii_var_write(IRInterpMachine *machine, IIVar *var,
                         const IRInterpValue *value) {
   if (!var->slotted) {
     var->value = *value;
+    if (!var->value.is_float && var->value_size > 0 && var->value_size < 8) {
+      var->value.i =
+          ii_narrow_int(var->value.i, var->value_size, var->value_is_unsigned);
+    }
     return 1;
   }
   unsigned long long raw = 0;
@@ -2043,14 +2068,31 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
 
   int ok = 0;
 
-  /* Bind parameters. */
+  /* Bind parameters, each narrowed to its declared width the way the callee's
+   * home for it is. A parameter reassigned in the body wraps there too. */
   for (size_t i = 0; i < fn->parameter_count && i < arg_count; i++) {
     IIVar *var = ii_env_upsert(&frame.env, fn->parameter_names[i]);
     if (!var) {
       ii_fail(machine, IR_INTERP_TRAP, "out of memory");
       goto done;
     }
+    {
+      int psize = 8, pfloat = 0, punsigned = 0;
+      long long pcount = 1;
+      const char *ptype =
+          fn->parameter_types ? fn->parameter_types[i] : NULL;
+      if (ptype && ii_parse_local_type(ptype, &psize, &pcount, &pfloat,
+                                       &punsigned) &&
+          pcount == 1 && !pfloat) {
+        var->value_size = psize;
+        var->value_is_unsigned = punsigned;
+      }
+    }
     var->value = args[i];
+    if (!var->value.is_float && var->value_size > 0 && var->value_size < 8) {
+      var->value.i =
+          ii_narrow_int(var->value.i, var->value_size, var->value_is_unsigned);
+    }
   }
 
   /* Pre-scan: label table + address-taken local set. */
@@ -2209,6 +2251,11 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
           var->value.i = 0;
         }
       }
+      /* Remember the declared integer width even when the local lives in a
+       * "register" here, so a write wraps at the width the program asked for.
+       * Pointers are already 8 bytes, floats carry their own representation. */
+      var->value_size = is_float ? 0 : elem_size;
+      var->value_is_unsigned = is_unsigned;
       pc++;
       break;
     }

@@ -371,6 +371,60 @@ int ir_instruction_is_trivially_dead_if_dest_unused(
   }
 }
 
+/* True when a declared type name makes the SYMBOL denote storage rather than a
+ * value: a string, an array, a struct. `@a <- @b` on one of those is a block
+ * copy, so `@a` still names its own bytes afterwards -- rewriting a later use
+ * of `@a` to `@b` would send `*(@a + k) <- v` through the source instead, and
+ * when the source is a literal that means a write into rodata. Scalars,
+ * pointers and function pointers carry their whole value in the symbol. */
+static int ir_type_name_denotes_storage(const char *type) {
+  size_t len = type ? strlen(type) : 0;
+
+  if (len == 0 || type[len - 1] == '*') {
+    return 0; /* unknown, or a pointer */
+  }
+  if (strncmp(type, "fn(", 3) == 0 || strncmp(type, "Fn(", 3) == 0) {
+    return 0;
+  }
+  if (strcmp(type, "cstring") == 0 || strcmp(type, "rawptr") == 0 ||
+      strcmp(type, "bool") == 0 || strcmp(type, "float32") == 0 ||
+      strcmp(type, "float64") == 0 || strcmp(type, "void") == 0) {
+    return 0;
+  }
+  if (ir_int_type_name_info(type, NULL, NULL)) {
+    return 0;
+  }
+  return 1; /* string, T[N], a struct name */
+}
+
+int ir_storage_symbol_set_build(const IRFunction *function,
+                                IRTempValueMap *set) {
+  static const IROperand one = {.kind = IR_OPERAND_INT, .int_value = 1};
+
+  if (!function || !set) {
+    return 0;
+  }
+  if (function->parameter_names && function->parameter_types) {
+    for (size_t i = 0; i < function->parameter_count; i++) {
+      if (function->parameter_names[i] &&
+          ir_type_name_denotes_storage(function->parameter_types[i]) &&
+          !ir_temp_value_map_set(set, function->parameter_names[i], &one)) {
+        return 0;
+      }
+    }
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_DECLARE_LOCAL && ins->dest.kind == IR_OPERAND_SYMBOL &&
+        ins->dest.name && ir_type_name_denotes_storage(ins->text)) {
+      if (!ir_temp_value_map_set(set, ins->dest.name, &one)) {
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
 int ir_operand_is_propagatable_value(const IROperand *operand) {
   if (!operand) {
     return 0;
@@ -379,11 +433,18 @@ int ir_operand_is_propagatable_value(const IROperand *operand) {
   switch (operand->kind) {
   case IR_OPERAND_INT:
   case IR_OPERAND_FLOAT:
-  case IR_OPERAND_STRING:
   case IR_OPERAND_LABEL:
   case IR_OPERAND_SYMBOL:
   case IR_OPERAND_TEMP:
     return 1;
+  /* A string literal operand means different things in different positions:
+   * as a LOAD base it addresses the literal's 16-byte {chars, length} record
+   * (that is how a string-to-cstring coercion reads the pointer out), and as
+   * an ASSIGN value it is the character data. Propagating one from an assign
+   * into a load therefore reads the low byte of a pointer where the program
+   * asked for the first character. The frontend puts each literal in the
+   * position it means; the optimizer must leave it there. */
+  case IR_OPERAND_STRING:
   default:
     return 0;
   }

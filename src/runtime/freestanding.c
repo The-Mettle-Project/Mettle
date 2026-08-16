@@ -2784,6 +2784,23 @@ long ftell(void *stream) {
   return (long)position;
 }
 
+/* The 64-bit offset forms. `long` is 32 bits on Windows, so fseek/ftell above
+ * cannot address past 2 GB -- and a GGUF model file is routinely larger than
+ * that. The seek underneath has always been 64-bit (SetFilePointerEx takes an
+ * mt_i64); these are the entry points that let a program reach it, under the
+ * names the platform uses for them. */
+int _fseeki64(void *stream, mt_i64 offset, int origin) {
+  if (!stream || origin < 0 || origin > 2) {
+    mt_errno_value = 22;
+    return -1;
+  }
+  return mt_file_seek((MtFile *)stream, offset, origin) < 0 ? -1 : 0;
+}
+
+mt_i64 _ftelli64(void *stream) {
+  return stream ? mt_file_seek((MtFile *)stream, 0, 1) : -1;
+}
+
 void rewind(void *stream) {
   if (stream) {
     (void)mt_file_seek((MtFile *)stream, 0, 0);
@@ -3856,6 +3873,105 @@ static double mt_exp(double value) {
   return result;
 }
 
+/* Natural log. Split the value into m * 2^e with m in [1, 2), then run the
+ * atanh series on s = (m - 1) / (m + 1): over that range s stays under 1/3, so
+ * s^2 is under 1/9 and the terms below land well inside double precision. The
+ * scaling loops mirror mt_exp's rather than reaching for frexp, which this
+ * runtime does not have. */
+static double mt_log(double value) {
+  if (value < 0.0) {
+    return 0.0 / 0.0;
+  }
+  if (value == 0.0) {
+    return -1.0 / 0.0;
+  }
+  if (value != value || value == 1.0 / 0.0) {
+    return value;
+  }
+  int power = 0;
+  while (value >= 2.0) {
+    value *= 0.5;
+    power++;
+  }
+  while (value < 1.0) {
+    value *= 2.0;
+    power--;
+  }
+  double s = (value - 1.0) / (value + 1.0);
+  double s2 = s * s;
+  double term = s;
+  double sum = s;
+  for (int i = 3; i <= 25; i += 2) {
+    term *= s2;
+    sum += term / (double)i;
+  }
+  return 2.0 * sum + (double)power * 0.69314718055994530942;
+}
+
+static double mt_pow(double base, double exponent) {
+  if (exponent == 0.0) {
+    return 1.0;
+  }
+  if (base != base || exponent != exponent) {
+    return 0.0 / 0.0;
+  }
+  if (base == 0.0) {
+    return exponent > 0.0 ? 0.0 : 1.0 / 0.0;
+  }
+  if (base < 0.0) {
+    /* Defined only for an integer exponent; the sign comes from its parity. */
+    double truncated = (double)(long long)exponent;
+    if (truncated != exponent) {
+      return 0.0 / 0.0;
+    }
+    double magnitude = mt_exp(exponent * mt_log(-base));
+    return ((long long)exponent & 1) ? -magnitude : magnitude;
+  }
+  return mt_exp(exponent * mt_log(base));
+}
+
+/* Sine, reduced to [-pi/2, pi/2] before the Taylor series so twelve terms are
+ * comfortably inside double precision. The reduction is the plain subtract-a-
+ * multiple-of-2pi kind, which loses low bits once the argument is large enough
+ * that 2pi is no longer representable near it; past 2^52 nothing meaningful is
+ * left to reduce, so that range answers NaN rather than a confident wrong
+ * number. */
+static double mt_sin(double value) {
+  const double two_pi = 6.2831853071795864769;
+  const double pi = 3.1415926535897932385;
+  const double half_pi = 1.5707963267948966192;
+
+  if (value != value) {
+    return value;
+  }
+  if (value > 4503599627370496.0 || value < -4503599627370496.0) {
+    return 0.0 / 0.0;
+  }
+  value -= (double)(long long)(value / two_pi) * two_pi;
+  if (value > pi) {
+    value -= two_pi;
+  } else if (value < -pi) {
+    value += two_pi;
+  }
+  if (value > half_pi) {
+    value = pi - value;
+  } else if (value < -half_pi) {
+    value = -pi - value;
+  }
+  double squared = value * value;
+  double term = value;
+  double sum = value;
+  for (int i = 1; i <= 12; i++) {
+    term *= -squared / ((2.0 * (double)i) * (2.0 * (double)i + 1.0));
+    sum += term;
+  }
+  return sum;
+}
+
+static double mt_cos(double value) {
+  return mt_sin(value + 1.5707963267948966192);
+}
+
 static double mt_tanh(double value) {
   if (value > 20.0) {
     return 1.0;
@@ -3884,6 +4000,20 @@ float sqrtf(float value) {
 float expf(float value) { return (float)mt_exp((double)value); }
 
 float tanhf(float value) { return (float)mt_tanh((double)value); }
+
+/* The double forms of these live in std/math, written in Mettle; exporting
+ * them here as well would make every program that imports std/math fail to
+ * link on a duplicate symbol. The float forms have no Mettle counterpart, so
+ * they belong here next to sqrtf and expf. */
+float logf(float value) { return (float)mt_log((double)value); }
+
+float powf(float base, float exponent) {
+  return (float)mt_pow((double)base, (double)exponent);
+}
+
+float sinf(float value) { return (float)mt_sin((double)value); }
+
+float cosf(float value) { return (float)mt_cos((double)value); }
 
 #if defined(MTLC_HOST_PREFIX_H)
 /*

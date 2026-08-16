@@ -110,11 +110,11 @@ static int type_checker_check_gpu_launch(TypeChecker *checker,
       int device_handle_for_pointer = param_type->kind == TYPE_POINTER &&
                                       type_checker_is_integer_type(arg_type);
       if (!device_handle_for_pointer &&
-          !type_checker_is_assignable(checker, param_type, arg_type)) {
-        type_checker_report_type_mismatch_node(
-            checker, launch->arguments[i],
-            param_type->name ? param_type->name : "?",
-            arg_type->name ? arg_type->name : "?");
+          !type_checker_is_assignable_from(checker, param_type, arg_type,
+                                           launch->arguments[i])) {
+        type_checker_report_assign_mismatch(checker, launch->arguments[i],
+                                            launch->arguments[i]->location,
+                                            param_type, arg_type);
         if (kernel_symbol->data.function.parameter_names &&
             kernel_symbol->data.function.parameter_names[i] &&
             checker->error_reporter) {
@@ -348,6 +348,27 @@ static int type_checker_check_gpu_launch(TypeChecker *checker,
   return 1;
 }
 
+/* Fold one arm's end state into the running join. A missing arm and one that
+   cannot fall out of its own end both leave the join alone: neither reaches the
+   statement after the `if`. */
+static void type_checker_if_join_arm(TypeChecker *checker,
+                                     unsigned char *joined, size_t joined_count,
+                                     ASTNode *arm) {
+  unsigned char *arm_state = NULL;
+  size_t arm_count = 0;
+
+  if (!joined || !arm || type_checker_statement_guarantees_termination(arm)) {
+    return;
+  }
+  arm_state = type_checker_init_tracker_capture(checker, &arm_count);
+  if (!arm_state) {
+    return;
+  }
+  type_checker_init_tracker_join(
+      joined, arm_state, arm_count < joined_count ? arm_count : joined_count);
+  free(arm_state);
+}
+
 int type_checker_check_if_statement(TypeChecker *checker,
                                            ASTNode *statement) {
   IfStatement *if_stmt = (IfStatement *)statement->data;
@@ -372,60 +393,99 @@ int type_checker_check_if_statement(TypeChecker *checker,
     return 0;
   }
 
+  /* Initialization flow through the chain. Every arm is checked from the entry
+   * state; what reaches the statement after the `if` is the intersection of the
+   * paths that can get there. So a variable written on every path is
+   * initialized afterwards, and one written on some paths is not. An arm that
+   * returns, breaks or continues never reaches the join and does not constrain
+   * it. Without an `else` there is a fall-through path that writes nothing,
+   * which is the entry state; with one, every path is an arm. */
   size_t init_snapshot_count = 0;
   unsigned char *init_snapshot =
       type_checker_init_tracker_capture(checker, &init_snapshot_count);
+  unsigned char *joined = NULL;
   if (checker->tracked_var_count > 0 && !init_snapshot) {
     type_checker_set_error_at_location(
         checker, statement->location,
         "Out of memory while analyzing variable initialization flow");
     return 0;
   }
+  if (init_snapshot_count > 0) {
+    joined = malloc(init_snapshot_count * sizeof(unsigned char));
+    if (!joined) {
+      free(init_snapshot);
+      type_checker_set_error_at_location(
+          checker, statement->location,
+          "Out of memory while analyzing variable initialization flow");
+      return 0;
+    }
+    if (if_stmt->else_branch) {
+      /* Exhaustive: start from "initialized everywhere" and let the arms cut
+       * it down. If every arm terminates nothing is cut, and nothing reaches
+       * the join to read it either. */
+      memset(joined, 1, init_snapshot_count * sizeof(unsigned char));
+    } else {
+      memcpy(joined, init_snapshot,
+             init_snapshot_count * sizeof(unsigned char));
+    }
+  }
 
   if (if_stmt->then_branch &&
       !type_checker_check_statement(checker, if_stmt->then_branch)) {
+    free(joined);
     free(init_snapshot);
     return 0;
   }
+  type_checker_if_join_arm(checker, joined, init_snapshot_count,
+                           if_stmt->then_branch);
   type_checker_init_tracker_restore(checker, init_snapshot,
                                     init_snapshot_count);
 
   for (size_t i = 0; i < if_stmt->else_if_count; i++) {
     Type *elif_cond_type =
         type_checker_infer_type(checker, if_stmt->else_ifs[i].condition);
-    if (!elif_cond_type) {
-      free(init_snapshot);
-      return 0;
+    int elif_ok = elif_cond_type != NULL;
+    if (elif_ok && type_checker_reject_comptime_escape(
+                       checker, if_stmt->else_ifs[i].condition->location,
+                       elif_cond_type)) {
+      elif_ok = 0;
     }
-    if (type_checker_reject_comptime_escape(
-            checker, if_stmt->else_ifs[i].condition->location,
-            elif_cond_type)) {
-      free(init_snapshot);
-      return 0;
-    }
-    if (!type_checker_is_numeric_type(elif_cond_type)) {
+    if (elif_ok && !type_checker_is_numeric_type(elif_cond_type)) {
       type_checker_report_type_mismatch(
           checker, if_stmt->else_ifs[i].condition->location, "numeric type",
           elif_cond_type->name);
-      free(init_snapshot);
-      return 0;
+      elif_ok = 0;
     }
-    if (if_stmt->else_ifs[i].body &&
+    if (elif_ok && if_stmt->else_ifs[i].body &&
         !type_checker_check_statement(checker, if_stmt->else_ifs[i].body)) {
+      elif_ok = 0;
+    }
+    if (!elif_ok) {
+      free(joined);
       free(init_snapshot);
       return 0;
     }
+    type_checker_if_join_arm(checker, joined, init_snapshot_count,
+                             if_stmt->else_ifs[i].body);
     type_checker_init_tracker_restore(checker, init_snapshot,
                                       init_snapshot_count);
   }
 
   if (if_stmt->else_branch &&
       !type_checker_check_statement(checker, if_stmt->else_branch)) {
+    free(joined);
     free(init_snapshot);
     return 0;
   }
+  type_checker_if_join_arm(checker, joined, init_snapshot_count,
+                           if_stmt->else_branch);
   type_checker_init_tracker_restore(checker, init_snapshot,
                                     init_snapshot_count);
+  if (joined) {
+    type_checker_init_tracker_restore(checker, joined, init_snapshot_count);
+  }
+
+  free(joined);
   free(init_snapshot);
 
   return 1;
@@ -644,10 +704,11 @@ int type_checker_check_switch_statement(TypeChecker *checker,
         free(case_values);
         return 0;
       }
-      if (!type_checker_is_assignable(checker, switch_type, case_type)) {
-        type_checker_report_type_mismatch(checker,
-                                          case_clause->value->location,
-                                          switch_type->name, case_type->name);
+      if (!type_checker_is_assignable_from(checker, switch_type, case_type,
+                                           case_clause->value)) {
+        type_checker_report_assign_mismatch(checker, case_clause->value,
+                                            case_clause->value->location,
+                                            switch_type, case_type);
         checker->switch_depth--;
         free(init_snapshot);
         free(case_values);
@@ -711,10 +772,11 @@ int type_checker_check_switch_statement(TypeChecker *checker,
           return 0;
         }
         if (!type_checker_is_integer_type(high_type) ||
-            !type_checker_is_assignable(checker, switch_type, high_type)) {
-          type_checker_report_type_mismatch(
-              checker, case_clause->value_high->location, switch_type->name,
-              high_type->name);
+            !type_checker_is_assignable_from(checker, switch_type, high_type,
+                                             case_clause->value_high)) {
+          type_checker_report_assign_mismatch(checker, case_clause->value_high,
+                                              case_clause->value_high->location,
+                                              switch_type, high_type);
           checker->switch_depth--;
           free(init_snapshot);
           free(case_values);
@@ -991,11 +1053,10 @@ int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
                                                   value_type)) {
             return 0;
           }
-          if (!type_checker_is_assignable(checker, expected_type,
-                                          value_type)) {
-            type_checker_report_type_mismatch(checker, value->location,
-                                              expected_type->name,
-                                              value_type->name);
+          if (!type_checker_is_assignable_from(checker, expected_type,
+                                               value_type, value)) {
+            type_checker_report_assign_mismatch(checker, value, value->location,
+                                                expected_type, value_type);
             return 0;
           }
         }
@@ -1031,11 +1092,10 @@ int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
       if (checker->current_function) {
         if (!(func_return_type->kind == TYPE_POINTER &&
               type_checker_is_null_pointer_constant(value)) &&
-            !type_checker_is_assignable(checker, func_return_type,
-                                        value_type)) {
-          type_checker_report_type_mismatch(checker, value->location,
-                                            func_return_type->name,
-                                            value_type->name);
+            !type_checker_is_assignable_from(checker, func_return_type,
+                                             value_type, value)) {
+          type_checker_report_assign_mismatch(checker, value, value->location,
+                                              func_return_type, value_type);
           return 0;
         }
 

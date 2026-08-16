@@ -2,7 +2,7 @@
 // modeled on `rustc --explain`. One entry per stable code.
 //
 // Two tables live here. DOCS covers the compile diagnostics (E0001..E0007,
-// M0101..M0112). DECISIONS covers the optimizer decision codes the --explain
+// M0101..M0119). DECISIONS covers the optimizer decision codes the --explain
 // report prints in brackets after each verdict, so a reader who sees
 // `[dot-shape-address]` in the report can ask for the long version of it
 // without leaving the terminal.
@@ -59,8 +59,8 @@ static const ErrorCodeDoc DOCS[] = {
      "at the previous declaration / the function definition in a note.\n"},
     {"E0004", "Type mismatch",
      "A value of one type was used where a different type is required.\n"
-     "Mettle never infers `var`/local `const` binding types and does not\n"
-     "implicitly convert between most types, so both sides must line up.\n"
+     "Mettle never infers `var`/local `const` binding types, so both sides\n"
+     "must line up.\n"
      "\n"
      "Example:\n"
      "    var x: int64 = \"hello\";   // expected 'int64', found 'string'\n"
@@ -69,6 +69,11 @@ static const ErrorCodeDoc DOCS[] = {
      "  - change the declared type to match the value, or the value to\n"
      "    match the type\n"
      "  - for numeric conversions, cast explicitly: (int32)value\n"
+     "\n"
+     "Integers are the exception, and only in one direction: a conversion\n"
+     "that every value survives happens on its own (int32 -> int64), and one\n"
+     "that can change the value needs the cast. Those report M0119 rather\n"
+     "than this code, so `mettle explain M0119` has the rule.\n"
      "\n"
      "`Type` and `Field` are compile-time reflection values (a TypeRef is\n"
      "a type-table index; a FieldRef is {type_index, field_index}). They\n"
@@ -214,6 +219,45 @@ static const ErrorCodeDoc DOCS[] = {
      "\n"
      "Fix: match the bound to the length. Indexes are 0-based, so an array\n"
      "of 8 runs 0..7 and an off-by-one here is the usual cause.\n"},
+    {"M0118", "Integer out of range for its destination",
+     "A compile-time integer is stored somewhere that cannot hold it. The\n"
+     "value is known here, so this is a fact rather than a risk: the store\n"
+     "would keep the low bits and discard the rest.\n"
+     "\n"
+     "Example:\n"
+     "    var h: int32 = 2654435761;    // M0118: int32 holds ..2147483647\n"
+     "\n"
+     "Fixes:\n"
+     "  - widen the destination: `var h: int64 = 2654435761;`\n"
+     "  - pick the type that holds it: `var h: uint32 = 2654435761;`\n"
+     "  - cast, when the wrap is the point: `(int32)2654435761`\n"
+     "\n"
+     "The last one is not a workaround. A cast at the site is how a reader\n"
+     "learns the truncation was intended, which is the whole reason this is\n"
+     "reported instead of performed.\n"},
+    {"M0119", "Narrowing conversion needs a cast",
+     "A value flows into a type that cannot hold every value the source type\n"
+     "can. Mettle converts silently in one direction only:\n"
+     "\n"
+     "    Widen silently. Narrow loudly.\n"
+     "\n"
+     "So int32 -> int64 and uint32 -> int64 need nothing written, because\n"
+     "every value survives them. int64 -> int32, uint64 -> int64 and\n"
+     "int32 -> uint32 do, because some values do not.\n"
+     "\n"
+     "Example:\n"
+     "    fn f(n: int64) {\n"
+     "        var small: int32 = n;         // M0119\n"
+     "        var ok:    int32 = (int32)n;  // says the wrap is meant\n"
+     "    }\n"
+     "\n"
+     "A compile-time constant is exempt: its value is known, so\n"
+     "`var b: uint8 = 200;` is checked rather than refused (see M0118 for\n"
+     "the case where it does not fit).\n"
+     "\n"
+     "Two destinations sit outside the rule because they are not range\n"
+     "conversions: `bool` is a truth coercion, and an enum names a set.\n"
+     "Floating-point conversions are unchanged and still silent.\n"},
 };
 
 /* ---- optimizer decision codes ----------------------------------------------

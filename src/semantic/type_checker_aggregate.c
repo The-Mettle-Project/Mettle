@@ -571,12 +571,9 @@ static int aggregate_fold_element(TypeChecker *checker, ASTNode *element,
   }
   if (!(type_checker_type_accepts_null_pointer(type) &&
         type_checker_is_null_pointer_constant(element)) &&
-      !type_checker_is_assignable(checker, type, element_type)) {
-    type_checker_report_type_mismatch_node(checker, element,
-                                           type->name ? type->name : "?",
-                                           element_type->name
-                                               ? element_type->name
-                                               : "?");
+      !type_checker_is_assignable_from(checker, type, element_type, element)) {
+    type_checker_report_assign_mismatch(checker, element, element->location,
+                                        type, element_type);
     return 0;
   }
 

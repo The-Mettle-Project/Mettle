@@ -899,6 +899,12 @@ int ir_remainder_zero_test_to_mask_pass(IRFunction *function, int *changed);
 /* Width/signedness of a builtin integer type NAME ("uint16" -> 16, unsigned).
  * Returns 0 for anything else (pointers, floats, aggregates). */
 int ir_int_type_name_info(const char *name, int *bits_out, int *is_unsigned_out);
+/* One linear pass collecting the symbols whose declared type makes the NAME
+ * denote storage rather than a value (string, array, struct). A copy into one
+ * of those is a block copy, so it must not be recorded as an equality: the
+ * name still addresses its own bytes afterwards. */
+int ir_storage_symbol_set_build(const IRFunction *function,
+                                IRTempValueMap *set);
 int ir_try_parse_direct_unit_increment(const IRInstruction *instruction,
                                               const char *iv_symbol);
 int ir_unroll_small_const_bound_loops_pass(IRFunction *function,

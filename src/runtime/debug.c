@@ -117,6 +117,7 @@ static DbgKind dbg_classify_type(const char *type_name) {
   if (len > 0 && type_name[len - 1] == '*') return DBG_K_PTR;
   if (strchr(type_name, '[')) return DBG_K_OTHER;
   if (strcmp(type_name, "cstring") == 0) return DBG_K_PTR;
+  if (strcmp(type_name, "rawptr") == 0) return DBG_K_PTR;
   if (strncmp(type_name, "fn", 2) == 0 && (len == 2 || type_name[2] == '(')) return DBG_K_PTR;
   if (strcmp(type_name, "string") == 0) return DBG_K_STRING;
   if (strcmp(type_name, "bool") == 0) return DBG_K_BOOL;

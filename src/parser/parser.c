@@ -1370,6 +1370,16 @@ int parser_is_type_keyword(TokenType type) {
   return (type >= TOKEN_INT8 && type <= TOKEN_STRING_TYPE);
 }
 
+/* Built-in type names the lexer carries as plain identifiers rather than
+   keywords. Without them `(cstring)&p` reads as `cstring & p` -- a bitwise and
+   of the reflection value named `cstring` -- because the cast/grouping
+   disambiguation below only trusts a leading type keyword. Naming the three
+   here keeps the token set unchanged. */
+int parser_is_builtin_type_name(const char *text) {
+  return text && (strcmp(text, "bool") == 0 || strcmp(text, "cstring") == 0 ||
+                  strcmp(text, "rawptr") == 0);
+}
+
 static void parser_free_string_array(char **values, size_t count) {
   if (!values) {
     return;
@@ -2573,7 +2583,8 @@ ASTNode *parser_parse_cast_expression(Parser *parser) {
   // below to disambiguate `(name) <op> x` where <op> is both a unary and a
   // binary operator (`&`, `*`, `+`, `-`).
   int type_starts_with_keyword =
-      parser_is_type_keyword(parser->current_token.type);
+      parser_is_type_keyword(parser->current_token.type) ||
+      parser_is_builtin_type_name(parser->current_token.value);
 
   char *type_name = parser_parse_type_annotation(parser);
   if (!type_name || parser->has_error ||

@@ -43,6 +43,8 @@
 #define ferror mtlc_host_ferror
 #define fseek mtlc_host_fseek
 #define ftell mtlc_host_ftell
+#define _fseeki64 mtlc_host_fseeki64
+#define _ftelli64 mtlc_host_ftelli64
 #define rewind mtlc_host_rewind
 #define setvbuf mtlc_host_setvbuf
 #define fileno mtlc_host_fileno

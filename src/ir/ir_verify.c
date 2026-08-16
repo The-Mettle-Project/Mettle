@@ -431,6 +431,7 @@ typedef enum {
   IRV_PARAM_FLOAT,
   IRV_PARAM_BUFFER,
   IRV_PARAM_CSTRING,
+  IRV_PARAM_STRING,
   IRV_PARAM_UNSUPPORTED
 } IRVParamKind;
 
@@ -475,7 +476,18 @@ static IRVParamInfo irv_classify_param(const char *type) {
     info.kind = IRV_PARAM_FLOAT;
     return info;
   }
-  if (strcmp(type, "cstring") == 0) {
+  if (strcmp(type, "string") == 0) {
+    /* A string arrives as the address of its 16-byte {chars, length} record,
+     * which is what the lowering emits and what `*@s [8]` / `*(@s+8) [8]`
+     * read. Both the record and the bytes it points at are registered
+     * buffers, so a rewrite that disturbs either one diverges. */
+    info.kind = IRV_PARAM_STRING;
+    info.elem_size = 1;
+    return info;
+  }
+  if (strcmp(type, "cstring") == 0 || strcmp(type, "rawptr") == 0) {
+    /* A rawptr addresses bytes it does not name; the harness generates and
+     * compares the same byte buffer it does for a cstring. */
     info.kind = IRV_PARAM_CSTRING;
     info.elem_size = 1;
     return info;
@@ -557,6 +569,34 @@ static int irv_setup_machine(IRInterpMachine *machine, IRFunction *shape,
       text[len] = '\0';
       unsigned long long addr = ir_interp_add_buffer(machine, text, len + 1);
       free(text);
+      if (!addr) {
+        return 0;
+      }
+      args[p].i = (long long)addr;
+      args[p].f = 0;
+      args[p].is_float = 0;
+      break;
+    }
+    case IRV_PARAM_STRING: {
+      long long len = 7 + (long long)run * 3 + (long long)p;
+      unsigned char *text = (unsigned char *)malloc((size_t)len);
+      if (!text) {
+        return 0;
+      }
+      unsigned int seed = 0x5F3E11u ^ (unsigned int)(p * 613u + (size_t)run);
+      for (long long c = 0; c < len; c++) {
+        text[c] = (unsigned char)('a' + irv_lcg_next(&seed) % 26);
+      }
+      unsigned long long text_addr = ir_interp_add_buffer(machine, text, len);
+      free(text);
+      if (!text_addr) {
+        return 0;
+      }
+      unsigned char record[16];
+      unsigned long long length = (unsigned long long)len;
+      memcpy(record, &text_addr, 8);
+      memcpy(record + 8, &length, 8);
+      unsigned long long addr = ir_interp_add_buffer(machine, record, 16);
       if (!addr) {
         return 0;
       }
@@ -869,6 +909,9 @@ static void irv_format_call(const IRFunction *function,
                IRV_BUFFER_ELEMS[run]);
     } else if (params[i].kind == IRV_PARAM_CSTRING) {
       snprintf(value, sizeof(value), "<cstring>");
+    } else if (params[i].kind == IRV_PARAM_STRING) {
+      snprintf(value, sizeof(value), "<string:%lld>",
+               7 + (long long)run * 3 + (long long)i);
     } else {
       irv_format_value(&args[i], value, sizeof(value));
     }

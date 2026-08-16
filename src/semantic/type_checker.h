@@ -38,6 +38,11 @@ typedef struct {
   Type *builtin_float64;
   Type *builtin_string;
   Type *builtin_cstring;
+  /* A pointer with no element type: what an allocator hands out and what a
+     deallocator takes. It converts to and from any pointer, which is the whole
+     contract, and it cannot be indexed or offset because there is no element
+     size to do it with. */
+  Type *builtin_rawptr;
   Type *builtin_void;
   /* Compile-time only reflection types. Type is the type of a TypeRef;
    * Field is the type of a FieldRef. Neither has a runtime representation. */
@@ -113,8 +118,39 @@ int type_checker_get_type_rank(Type *type);
 // Type compatibility and conversion functions
 int type_checker_is_assignable(TypeChecker *checker, Type *dest_type,
                                Type *src_type);
+/* Assignability with the source expression in hand. Everything
+   type_checker_is_assignable accepts is accepted here, plus one case it cannot
+   see: a source that folds to a compile-time integer inside the destination's
+   range. The value is known at this point, so the conversion cannot lose
+   anything, and `var b: uint8 = 200;` needs no cast. */
+int type_checker_is_assignable_from(TypeChecker *checker, Type *dest_type,
+                                    Type *src_type, ASTNode *src_expr);
 int type_checker_is_implicitly_convertible(Type *from_type, Type *to_type);
 int type_checker_is_cast_valid(Type *from, Type *to);
+
+/* Value range of an integer (or bool) type. 0 when `type` is neither. */
+int type_checker_integer_bounds(const Type *type, long long *out_min,
+                                unsigned long long *out_max);
+/* Every value of `from` is representable in `to`. This is the line between the
+   conversions Mettle performs silently and the ones that need a cast at the
+   site: widen silently, narrow loudly. */
+int type_checker_int_conversion_is_value_preserving(const Type *from,
+                                                    const Type *to);
+/* `value`, read with `src_type`'s signedness, lies inside `dest_type`. */
+int type_checker_constant_fits_type(const Type *dest_type, const Type *src_type,
+                                    long long value);
+/* Report an element operation (index, dereference, offset) on a `rawptr`.
+   Always returns 1, so callers can write `if (reject(...)) return NULL;`. */
+int type_checker_reject_rawptr_element_use(TypeChecker *checker,
+                                           SourceLocation location,
+                                           const char *what);
+/* Report a value that cannot flow into `dest_type`. Picks M0118 when the
+   source is a compile-time integer out of range, M0119 when it is a narrowing
+   conversion, and the generic type mismatch otherwise. */
+void type_checker_report_assign_mismatch(TypeChecker *checker,
+                                         const ASTNode *src_expr,
+                                         SourceLocation location,
+                                         Type *dest_type, Type *src_type);
 void type_checker_set_error(TypeChecker *checker, const char *format, ...);
 void type_checker_set_error_at_location(TypeChecker *checker,
                                         SourceLocation location,

@@ -159,6 +159,133 @@ void type_checker_report_type_mismatch_node(TypeChecker *checker,
                                          expected, actual);
 }
 
+int type_checker_reject_rawptr_element_use(TypeChecker *checker,
+                                           SourceLocation location,
+                                           const char *what) {
+  char message[256];
+  char help[256];
+  SourceSpan span;
+
+  if (!checker) {
+    return 0;
+  }
+  snprintf(message, sizeof(message),
+           "cannot %s a 'rawptr': it has no element type", what);
+  snprintf(help, sizeof(help),
+           "give the address a type first: `var p: int32* = raw;` and %s that",
+           what);
+  checker->has_error = 1;
+  free(checker->error_message);
+  checker->error_message = strdup(message);
+  if (checker->error_reporter) {
+    span = source_span_from_location(location, 1);
+    error_reporter_add_error_with_span_and_suggestion(
+        checker->error_reporter, ERROR_TYPE, span, message, help);
+    error_reporter_set_last_label(checker->error_reporter,
+                                  "an address with no element type");
+  }
+  return 1;
+}
+
+/* Print an integer bound the way the source would spell it: unsigned maxima
+   above INT64_MAX do not fit the signed formatter. */
+static void type_checker_format_bounds(const Type *type, char *out,
+                                       size_t out_size) {
+  long long min = 0;
+  unsigned long long max = 0;
+  if (!type_checker_integer_bounds(type, &min, &max)) {
+    snprintf(out, out_size, "?");
+    return;
+  }
+  snprintf(out, out_size, "%lld..%llu", min, max);
+}
+
+void type_checker_report_assign_mismatch(TypeChecker *checker,
+                                         const ASTNode *src_expr,
+                                         SourceLocation location,
+                                         Type *dest_type, Type *src_type) {
+  const char *expected = dest_type && dest_type->name ? dest_type->name : "?";
+  const char *actual = src_type && src_type->name ? src_type->name : "?";
+  size_t span_length = src_expr ? type_checker_node_span_length(src_expr) : 1;
+  SourceLocation where = src_expr ? src_expr->location : location;
+  long long folded = 0;
+  int is_integer_pair = dest_type && src_type &&
+                        type_checker_is_integer_type(dest_type) &&
+                        type_checker_is_integer_type(src_type) &&
+                        dest_type->kind != TYPE_ENUM &&
+                        src_type->kind != TYPE_ENUM;
+  int folds = 0;
+  char message[512];
+  char help[320];
+  char bounds[80];
+  SourceSpan span;
+
+  if (!checker) {
+    return;
+  }
+  if (!is_integer_pair) {
+    type_checker_report_type_mismatch_span(checker, where, span_length,
+                                           expected, actual);
+    return;
+  }
+
+  folds = src_expr && type_checker_eval_integer_constant_with_checker(
+                          checker, (ASTNode *)src_expr, &folded);
+  type_checker_format_bounds(dest_type, bounds, sizeof(bounds));
+
+  if (folds) {
+    /* The value is known and does not fit: naming it, and the range it missed,
+     * is the whole diagnostic. Nothing here is a guess. */
+    int src_unsigned = src_type->kind == TYPE_UINT8 ||
+                       src_type->kind == TYPE_UINT16 ||
+                       src_type->kind == TYPE_UINT32 ||
+                       src_type->kind == TYPE_UINT64;
+    if (src_unsigned) {
+      snprintf(message, sizeof(message),
+               "Integer %llu is out of range for '%s'",
+               (unsigned long long)folded, expected);
+    } else {
+      snprintf(message, sizeof(message), "Integer %lld is out of range for '%s'",
+               folded, expected);
+    }
+    snprintf(help, sizeof(help),
+             "'%s' holds %s. Widen the type, or cast to say the wrap is meant: "
+             "(%s)value",
+             expected, bounds, expected);
+  } else {
+    snprintf(message, sizeof(message),
+             "Narrowing conversion from '%s' to '%s' needs a cast", actual,
+             expected);
+    snprintf(help, sizeof(help),
+             "cast explicitly: (%s)value. '%s' holds %s, so a value outside it "
+             "wraps rather than trapping",
+             expected, expected, bounds);
+  }
+
+  checker->has_error = 1;
+  free(checker->error_message);
+  checker->error_message = strdup(message);
+  if (!checker->error_reporter) {
+    return;
+  }
+  span = source_span_from_location(where, span_length);
+  error_reporter_add_error_with_span_and_suggestion(
+      checker->error_reporter, ERROR_TYPE, span, message, help);
+  error_reporter_set_last_code(checker->error_reporter,
+                               folds ? "M0118" : "M0119");
+  {
+    char label[192];
+    if (folds) {
+      snprintf(label, sizeof(label), "does not fit in '%s' (%s)", expected,
+               bounds);
+    } else {
+      snprintf(label, sizeof(label), "'%s' value stored as '%s'", actual,
+               expected);
+    }
+    error_reporter_set_last_label(checker->error_reporter, label);
+  }
+}
+
 /* Warn about locals declared in the current (about-to-close) scope that were
    never read. `_`-prefixed names opt out; only the main compile unit is
    checked so imported/stdlib code stays quiet. */

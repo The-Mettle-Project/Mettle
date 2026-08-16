@@ -167,7 +167,8 @@ static int mem_type_is_pointer(const char *type_name) {
   if (type_name[len - 1] == '*') {
     return 1;
   }
-  return strcmp(type_name, "cstring") == 0;
+  return strcmp(type_name, "cstring") == 0 ||
+         strcmp(type_name, "rawptr") == 0;
 }
 
 static long long mem_scalar_size(MemCtx *ctx, const char *type_name) {

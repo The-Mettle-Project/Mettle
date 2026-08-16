@@ -498,6 +498,11 @@ int type_checker_is_cstring_type(const Type *type) {
          strcmp(type->name, "cstring") == 0;
 }
 
+int type_checker_is_rawptr_type(const Type *type) {
+  return type && type->kind == TYPE_POINTER && type->name &&
+         strcmp(type->name, "rawptr") == 0;
+}
+
 // Built-in type system functions implementation
 
 void type_checker_init_builtin_types(TypeChecker *checker) {
@@ -562,6 +567,18 @@ void type_checker_init_builtin_types(TypeChecker *checker) {
     checker->builtin_void->alignment = 1;
   }
 
+  /* An address with no element type. The allocator hands one out and the
+   * deallocator takes one, so releasing an int32 buffer no longer requires
+   * claiming it holds characters. It converts to and from every pointer type,
+   * and only to them: with no element size there is nothing to index or offset
+   * by, and the checker's pointer arithmetic refuses it on those grounds. */
+  checker->builtin_rawptr = type_create(TYPE_POINTER, "rawptr");
+  if (checker->builtin_rawptr) {
+    checker->builtin_rawptr->base_type = checker->builtin_void;
+    checker->builtin_rawptr->size = 8;
+    checker->builtin_rawptr->alignment = 8;
+  }
+
   /* Type and Field are comptime-only: size 0, no backend kind. */
   checker->builtin_type = type_create(TYPE_TYPE, "Type");
   if (checker->builtin_type) {
@@ -592,6 +609,7 @@ void type_checker_init_builtin_types(TypeChecker *checker) {
   type_checker_intern_type(checker, checker->builtin_float64);
   type_checker_intern_type(checker, checker->builtin_string);
   type_checker_intern_type(checker, checker->builtin_cstring);
+  type_checker_intern_type(checker, checker->builtin_rawptr);
   type_checker_intern_type(checker, checker->builtin_void);
   type_checker_intern_type(checker, checker->builtin_type);
   type_checker_intern_type(checker, checker->builtin_field);
@@ -648,6 +666,8 @@ Type *type_checker_get_type_by_name(TypeChecker *checker, const char *name) {
     return checker->builtin_string;
   if (strcmp(name, "cstring") == 0)
     return checker->builtin_cstring;
+  if (strcmp(name, "rawptr") == 0)
+    return checker->builtin_rawptr;
   if (strcmp(name, "void") == 0)
     return checker->builtin_void;
   if (strcmp(name, "Type") == 0)
@@ -935,6 +955,26 @@ int type_checker_is_assignable(TypeChecker *checker, Type *dest_type,
     return 1;
   }
 
+  /* A rawptr is an address with no element type, so it converts to and from
+   * every pointer in both directions. That is the whole of the opaque-pointer
+   * contract, and it is what lets `var a: int32* = malloc(n);` be written
+   * without a cast and `free(a)` without pretending the bytes are characters.
+   * An array decays to it the same way it decays to a typed pointer, and a
+   * string's bytes are an address like any other -- every rawptr consumer
+   * takes an explicit length, so no terminator is implied the way a cstring
+   * implies one. */
+  if (type_checker_is_rawptr_type(dest_type) &&
+      (src_type->kind == TYPE_POINTER || src_type->kind == TYPE_ARRAY ||
+       src_type->kind == TYPE_FUNCTION_POINTER ||
+       src_type->kind == TYPE_STRING)) {
+    return 1;
+  }
+  if (type_checker_is_rawptr_type(src_type) &&
+      (dest_type->kind == TYPE_POINTER ||
+       dest_type->kind == TYPE_FUNCTION_POINTER)) {
+    return 1;
+  }
+
   /* Allow int8* (e.g. from &array[0] for int8[]) to cstring (uint8*) for C interop */
   if (dest_type->kind == TYPE_POINTER && src_type->kind == TYPE_POINTER &&
       dest_type->name && strcmp(dest_type->name, "cstring") == 0 &&
@@ -960,6 +1000,120 @@ int type_checker_is_assignable(TypeChecker *checker, Type *dest_type,
   return type_checker_is_implicitly_convertible(src_type, dest_type);
 }
 
+int type_checker_is_assignable_from(TypeChecker *checker, Type *dest_type,
+                                    Type *src_type, ASTNode *src_expr) {
+  long long folded = 0;
+
+  if (type_checker_is_assignable(checker, dest_type, src_type)) {
+    return 1;
+  }
+  /* Only the integer range rule has a constant escape: the destination is a
+   * range, the source folds to one number, and containment is decided rather
+   * than assumed. Everything else stays a type mismatch. */
+  if (!src_expr || !checker || !dest_type || !src_type ||
+      !type_checker_is_integer_type(dest_type) ||
+      !type_checker_is_integer_type(src_type) ||
+      dest_type->kind == TYPE_ENUM || src_type->kind == TYPE_ENUM) {
+    return 0;
+  }
+  if (!type_checker_eval_integer_constant_with_checker(checker, src_expr,
+                                                       &folded)) {
+    return 0;
+  }
+  return type_checker_constant_fits_type(dest_type, src_type, folded);
+}
+
+int type_checker_integer_bounds(const Type *type, long long *out_min,
+                                unsigned long long *out_max) {
+  long long min = 0;
+  unsigned long long max = 0;
+
+  if (!type) {
+    return 0;
+  }
+  switch (type->kind) {
+  /* A bool holds 0 or 1, so it widens into every integer type. */
+  case TYPE_BOOL:   min = 0;         max = 1ULL;       break;
+  case TYPE_INT8:   min = INT8_MIN;  max = INT8_MAX;   break;
+  case TYPE_INT16:  min = INT16_MIN; max = INT16_MAX;  break;
+  case TYPE_INT32:  min = INT32_MIN; max = INT32_MAX;  break;
+  case TYPE_INT64:  min = INT64_MIN; max = INT64_MAX;  break;
+  case TYPE_UINT8:  min = 0;         max = UINT8_MAX;  break;
+  case TYPE_UINT16: min = 0;         max = UINT16_MAX; break;
+  case TYPE_UINT32: min = 0;         max = UINT32_MAX; break;
+  case TYPE_UINT64: min = 0;         max = UINT64_MAX; break;
+  default:
+    return 0;
+  }
+  if (out_min) {
+    *out_min = min;
+  }
+  if (out_max) {
+    *out_max = max;
+  }
+  return 1;
+}
+
+int type_checker_int_conversion_is_value_preserving(const Type *from,
+                                                    const Type *to) {
+  long long from_min = 0, to_min = 0;
+  unsigned long long from_max = 0, to_max = 0;
+
+  if (!from || !to) {
+    return 0;
+  }
+  if (!type_checker_integer_bounds(to, &to_min, &to_max)) {
+    return 0;
+  }
+
+  /* An enum's value set is written down, so containment is decidable exactly
+   * rather than approximated by width: the conversion is value-preserving when
+   * every declared member fits. */
+  if (from->kind == TYPE_ENUM) {
+    if (from->enum_member_count == 0 || !from->enum_member_values) {
+      return 0;
+    }
+    for (size_t i = 0; i < from->enum_member_count; i++) {
+      long long value = from->enum_member_values[i];
+      if (value < to_min) {
+        return 0;
+      }
+      if (value >= 0 && (unsigned long long)value > to_max) {
+        return 0;
+      }
+    }
+    return 1;
+  }
+
+  if (!type_checker_integer_bounds(from, &from_min, &from_max)) {
+    return 0;
+  }
+  return to_min <= from_min && to_max >= from_max;
+}
+
+int type_checker_constant_fits_type(const Type *dest_type, const Type *src_type,
+                                    long long value) {
+  long long dest_min = 0;
+  unsigned long long dest_max = 0;
+
+  if (!type_checker_integer_bounds(dest_type, &dest_min, &dest_max)) {
+    return 0;
+  }
+  /* The folder carries every constant in a long long, so a value typed
+   * unsigned above INT64_MAX arrives as a negative bit pattern. Read it back
+   * with the signedness the source was given, not the container's. */
+  if (src_type && (src_type->kind == TYPE_UINT8 ||
+                   src_type->kind == TYPE_UINT16 ||
+                   src_type->kind == TYPE_UINT32 ||
+                   src_type->kind == TYPE_UINT64)) {
+    return (unsigned long long)value <= dest_max;
+  }
+  if (value < 0) {
+    return dest_min <= value;
+  }
+  return (unsigned long long)value <= dest_max;
+}
+
 int type_checker_is_implicitly_convertible(Type *from_type, Type *to_type) {
   if (!from_type || !to_type)
     return 0;
@@ -969,10 +1123,18 @@ int type_checker_is_implicitly_convertible(Type *from_type, Type *to_type) {
     return type_checker_types_equal(from_type, to_type);
   }
 
-  // Integer to integer conversions, including narrowing.
+  /* Integer to integer: widen silently, narrow loudly. A conversion that can
+   * change the value is written at the site, where a reader can see it; one
+   * that cannot is not worth writing. Two destinations sit outside the rule
+   * because they are not integer range conversions at all: `bool` is a truth
+   * coercion (a comparison's result is an int32 that every `var b: bool = x >
+   * y;` stores), and an enum names a set rather than a range. */
   if (type_checker_is_integer_type(from_type) &&
       type_checker_is_integer_type(to_type)) {
-    return 1;
+    if (to_type->kind == TYPE_BOOL || to_type->kind == TYPE_ENUM) {
+      return 1;
+    }
+    return type_checker_int_conversion_is_value_preserving(from_type, to_type);
   }
 
   // Integer to floating point conversions
@@ -996,6 +1158,15 @@ int type_checker_are_compatible(Type *type1, Type *type2) {
     return 0;
 
   if (type_checker_types_equal(type1, type2)) {
+    return 1;
+  }
+
+  /* Comparison and match-arm unification, not assignment. The narrowing rule
+   * governs where a value is stored; `i < len` stores nothing, so both sides
+   * are read at their own width and every integer stays comparable with every
+   * other. */
+  if (type_checker_is_integer_type(type1) &&
+      type_checker_is_integer_type(type2)) {
     return 1;
   }
 
@@ -1028,6 +1199,14 @@ Type *type_checker_default_integer_literal_type(TypeChecker *checker,
    * (INT32_MAX, UINT32_MAX] range so 0xFFFFFFFF and similar stay uint32-ish.
    */
   if (radix == 10u) {
+    /* A literal is never negative in source -- a leading '-' lexes as unary
+     * minus -- so a negative bit pattern here is a decimal past LLONG_MAX that
+     * the parser re-read unsigned. It is a uint64, and typing it int32 by its
+     * bit pattern (18446744073709551615 reading as -1) is how it used to reach
+     * codegen as the right bits for the wrong reason. */
+    if (literal->int_value < 0) {
+      return checker->builtin_uint64;
+    }
     if (literal->int_value >= INT32_MIN && literal->int_value <= INT32_MAX) {
       return checker->builtin_int32;
     }

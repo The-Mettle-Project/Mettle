@@ -79,6 +79,7 @@ int parser_is_binary_operator(TokenType type);
 int parser_is_unary_operator(TokenType type);
 int parser_is_identifier_like(TokenType type);
 int parser_is_type_keyword(TokenType type);
+int parser_is_builtin_type_name(const char *text);
 int parser_is_assignment_token(TokenType type);
 
 #endif // PARSER_H

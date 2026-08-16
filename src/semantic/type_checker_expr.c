@@ -2059,6 +2059,11 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
             "Dereference operator requires a pointer operand");
         return NULL;
       }
+      if (type_checker_is_rawptr_type(operand_type) &&
+          type_checker_reject_rawptr_element_use(checker, expression->location,
+                                                 "dereference")) {
+        return NULL;
+      }
       return operand_type->base_type;
     }
 
@@ -2266,10 +2271,11 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
             (param_type && param_type->kind == TYPE_POINTER &&
              type_checker_is_null_pointer_constant(call->arguments[i]));
         if (!is_null &&
-            !type_checker_is_assignable(checker, param_type, arg_type)) {
-          type_checker_report_type_mismatch(checker,
-                                            call->arguments[i]->location,
-                                            param_type->name, arg_type->name);
+            !type_checker_is_assignable_from(checker, param_type, arg_type,
+                                             call->arguments[i])) {
+          type_checker_report_assign_mismatch(checker, call->arguments[i],
+                                              call->arguments[i]->location,
+                                              param_type, arg_type);
           return NULL;
         }
       }
@@ -2297,10 +2303,11 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
         if (!arg_type) {
           return NULL;
         }
-        if (!type_checker_is_assignable(checker, payload_type, arg_type)) {
-          type_checker_report_type_mismatch(checker,
-                                            call->arguments[0]->location,
-                                            payload_type->name, arg_type->name);
+        if (!type_checker_is_assignable_from(checker, payload_type, arg_type,
+                                             call->arguments[0])) {
+          type_checker_report_assign_mismatch(checker, call->arguments[0],
+                                              call->arguments[0]->location,
+                                              payload_type, arg_type);
           return NULL;
         }
       }
@@ -2404,10 +2411,11 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
           (param_type && param_type->kind == TYPE_POINTER &&
            type_checker_is_null_pointer_constant(call->arguments[i]));
       if (!is_null_pointer_arg &&
-           !type_checker_is_assignable(checker, param_type, arg_type)) {
-        type_checker_report_type_mismatch_node(checker, call->arguments[i],
-                                               param_type->name,
-                                               arg_type->name);
+           !type_checker_is_assignable_from(checker, param_type, arg_type,
+                                            call->arguments[i])) {
+        type_checker_report_assign_mismatch(checker, call->arguments[i],
+                                            call->arguments[i]->location,
+                                            param_type, arg_type);
         if (func_symbol->data.function.parameter_names &&
             func_symbol->data.function.parameter_names[i] &&
             checker->error_reporter) {
@@ -2497,10 +2505,11 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
           (param_type && param_type->kind == TYPE_POINTER &&
            type_checker_is_null_pointer_constant(fp_call->arguments[i]));
       if (!is_null_pointer_arg &&
-          !type_checker_is_assignable(checker, param_type, arg_type)) {
-        type_checker_report_type_mismatch(checker,
-                                          fp_call->arguments[i]->location,
-                                          param_type->name, arg_type->name);
+          !type_checker_is_assignable_from(checker, param_type, arg_type,
+                                           fp_call->arguments[i])) {
+        type_checker_report_assign_mismatch(checker, fp_call->arguments[i],
+                                            fp_call->arguments[i]->location,
+                                            param_type, arg_type);
         return NULL;
       }
     }
@@ -2738,6 +2747,11 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
                                            "Indexed type has no element type");
         return NULL;
       }
+      if (type_checker_is_rawptr_type(array_type) &&
+          type_checker_reject_rawptr_element_use(checker, expression->location,
+                                                 "index")) {
+        return NULL;
+      }
       if (array_type->kind == TYPE_POINTER &&
           type_checker_is_null_pointer_constant(idx->array)) {
         type_checker_set_error_at_location(checker, idx->array->location,
@@ -2933,6 +2947,12 @@ Type *type_checker_check_binary_expression(TypeChecker *checker,
     int right_is_integer = type_checker_is_integer_type(right_type);
 
     if (left_is_pointer || right_is_pointer) {
+      if ((type_checker_is_rawptr_type(left_type) ||
+           type_checker_is_rawptr_type(right_type)) &&
+          type_checker_reject_rawptr_element_use(checker, location,
+                                                 "offset")) {
+        return NULL;
+      }
       if (strcmp(op, "+") == 0) {
         if (left_is_pointer && right_is_integer) {
           return left_type;

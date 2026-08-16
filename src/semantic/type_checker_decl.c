@@ -817,10 +817,11 @@ int type_checker_process_declaration(TypeChecker *checker,
           poisoned = 1;
         } else if (!(type_checker_type_accepts_null_pointer(var_type) &&
               type_checker_is_null_pointer_constant(var_decl->initializer)) &&
-            !type_checker_is_assignable(checker, var_type, init_type)) {
-          type_checker_report_type_mismatch_node(checker, var_decl->initializer,
-                                                 var_type->name,
-                                                 init_type->name);
+            !type_checker_is_assignable_from(checker, var_type, init_type,
+                                             var_decl->initializer)) {
+          type_checker_report_assign_mismatch(
+              checker, var_decl->initializer,
+              var_decl->initializer->location, var_type, init_type);
           poisoned = 1;
         }
       } else if (poisoned) {
@@ -1630,9 +1631,8 @@ int type_checker_process_declaration(TypeChecker *checker,
         }
         Type *field_type = value_type->field_types[i];
         if (!type_checker_is_assignable(checker, symbol->type, field_type)) {
-          type_checker_report_type_mismatch(checker, target->location,
-                                            symbol->type->name,
-                                            field_type->name);
+          type_checker_report_assign_mismatch(checker, NULL, target->location,
+                                              symbol->type, field_type);
           return 0;
         }
         if (checker->current_function && symbol->scope &&
@@ -1699,10 +1699,11 @@ int type_checker_process_declaration(TypeChecker *checker,
 
         if (!(type_checker_type_accepts_null_pointer(field_type) &&
               type_checker_is_null_pointer_constant(assignment->value)) &&
-            !type_checker_is_assignable(checker, field_type, value_type)) {
-          type_checker_report_type_mismatch(checker,
-                                            assignment->value->location,
-                                            field_type->name, value_type->name);
+            !type_checker_is_assignable_from(checker, field_type, value_type,
+                                             assignment->value)) {
+          type_checker_report_assign_mismatch(checker, assignment->value,
+                                              assignment->value->location,
+                                              field_type, value_type);
           return 0;
         }
 
@@ -1760,10 +1761,11 @@ int type_checker_process_declaration(TypeChecker *checker,
 
         if (!(type_checker_type_accepts_null_pointer(element_type) &&
               type_checker_is_null_pointer_constant(assignment->value)) &&
-            !type_checker_is_assignable(checker, element_type, value_type)) {
-          type_checker_report_type_mismatch(
-              checker, assignment->value->location, element_type->name,
-              value_type->name);
+            !type_checker_is_assignable_from(checker, element_type, value_type,
+                                             assignment->value)) {
+          type_checker_report_assign_mismatch(checker, assignment->value,
+                                              assignment->value->location,
+                                              element_type, value_type);
           return 0;
         }
 
@@ -1799,10 +1801,11 @@ int type_checker_process_declaration(TypeChecker *checker,
 
         if (!(type_checker_type_accepts_null_pointer(target_type) &&
               type_checker_is_null_pointer_constant(assignment->value)) &&
-            !type_checker_is_assignable(checker, target_type, value_type)) {
-          type_checker_report_type_mismatch(
-              checker, assignment->value->location, target_type->name,
-              value_type->name);
+            !type_checker_is_assignable_from(checker, target_type, value_type,
+                                             assignment->value)) {
+          type_checker_report_assign_mismatch(checker, assignment->value,
+                                              assignment->value->location,
+                                              target_type, value_type);
           return 0;
         }
 
@@ -1883,10 +1886,11 @@ int type_checker_process_declaration(TypeChecker *checker,
     // Validate assignment compatibility
     if (!(type_checker_type_accepts_null_pointer(var_symbol->type) &&
           type_checker_is_null_pointer_constant(assignment->value)) &&
-        !type_checker_is_assignable(checker, var_symbol->type, value_type)) {
-      type_checker_report_type_mismatch(checker, assignment->value->location,
-                                        var_symbol->type->name,
-                                        value_type->name);
+        !type_checker_is_assignable_from(checker, var_symbol->type, value_type,
+                                         assignment->value)) {
+      type_checker_report_assign_mismatch(checker, assignment->value,
+                                          assignment->value->location,
+                                          var_symbol->type, value_type);
       return 0;
     }
 

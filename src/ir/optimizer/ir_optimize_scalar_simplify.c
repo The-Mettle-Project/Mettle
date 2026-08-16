@@ -830,17 +830,20 @@ int ir_copy_and_constant_propagation_pass(IRFunction *function,
    * indexes (name -> last instruction position reading it) power the dead-
    * entry pruning at labels; rebuilt per iteration because propagation
    * rewrites operands. */
-  IRTempValueMap addr_taken, temp_last_use, sym_last_use;
+  IRTempValueMap addr_taken, temp_last_use, sym_last_use, storage_syms;
   if (!ir_temp_value_map_init(&addr_taken) ||
       !ir_temp_value_map_init(&temp_last_use) ||
       !ir_temp_value_map_init(&sym_last_use) ||
-      !ir_addr_taken_set_build(function, &addr_taken)) {
+      !ir_temp_value_map_init(&storage_syms) ||
+      !ir_addr_taken_set_build(function, &addr_taken) ||
+      !ir_storage_symbol_set_build(function, &storage_syms)) {
     ir_label_value_map_destroy(&label_in);
     ir_temp_value_map_destroy(&map);
     ir_temp_value_map_destroy(&symbol_map);
     ir_temp_value_map_destroy(&addr_taken);
     ir_temp_value_map_destroy(&temp_last_use);
     ir_temp_value_map_destroy(&sym_last_use);
+    ir_temp_value_map_destroy(&storage_syms);
     return 0;
   }
 
@@ -906,6 +909,7 @@ int ir_copy_and_constant_propagation_pass(IRFunction *function,
             ir_temp_value_map_destroy(&addr_taken);
     ir_temp_value_map_destroy(&temp_last_use);
     ir_temp_value_map_destroy(&sym_last_use);
+    ir_temp_value_map_destroy(&storage_syms);
             return 0;
           }
         }
@@ -920,6 +924,7 @@ int ir_copy_and_constant_propagation_pass(IRFunction *function,
             ir_temp_value_map_destroy(&addr_taken);
     ir_temp_value_map_destroy(&temp_last_use);
     ir_temp_value_map_destroy(&sym_last_use);
+    ir_temp_value_map_destroy(&storage_syms);
             return 0;
           }
         } else {
@@ -936,6 +941,7 @@ int ir_copy_and_constant_propagation_pass(IRFunction *function,
         ir_temp_value_map_destroy(&addr_taken);
     ir_temp_value_map_destroy(&temp_last_use);
     ir_temp_value_map_destroy(&sym_last_use);
+    ir_temp_value_map_destroy(&storage_syms);
         return 0;
       }
 
@@ -960,6 +966,7 @@ int ir_copy_and_constant_propagation_pass(IRFunction *function,
             ir_temp_value_map_destroy(&addr_taken);
     ir_temp_value_map_destroy(&temp_last_use);
     ir_temp_value_map_destroy(&sym_last_use);
+    ir_temp_value_map_destroy(&storage_syms);
             return 0;
           }
         }
@@ -972,7 +979,8 @@ int ir_copy_and_constant_propagation_pass(IRFunction *function,
 
         if (instruction->op == IR_OP_ASSIGN &&
             ir_operand_is_propagatable_value(&instruction->lhs) &&
-            instruction->dest.kind == IR_OPERAND_SYMBOL) {
+            instruction->dest.kind == IR_OPERAND_SYMBOL &&
+            !ir_temp_value_map_lookup(&storage_syms, instruction->dest.name)) {
           if (instruction->lhs.kind == IR_OPERAND_SYMBOL &&
               instruction->lhs.name &&
               strcmp(instruction->lhs.name, instruction->dest.name) == 0) {
@@ -986,6 +994,7 @@ int ir_copy_and_constant_propagation_pass(IRFunction *function,
             ir_temp_value_map_destroy(&addr_taken);
     ir_temp_value_map_destroy(&temp_last_use);
     ir_temp_value_map_destroy(&sym_last_use);
+    ir_temp_value_map_destroy(&storage_syms);
             return 0;
           }
         }
@@ -1025,6 +1034,7 @@ int ir_copy_and_constant_propagation_pass(IRFunction *function,
           ir_temp_value_map_destroy(&addr_taken);
     ir_temp_value_map_destroy(&temp_last_use);
     ir_temp_value_map_destroy(&sym_last_use);
+    ir_temp_value_map_destroy(&storage_syms);
           return 0;
         }
       }
@@ -1047,6 +1057,7 @@ int ir_copy_and_constant_propagation_pass(IRFunction *function,
   ir_label_value_map_destroy(&label_in);
   ir_temp_value_map_destroy(&map);
   ir_temp_value_map_destroy(&symbol_map);
+  ir_temp_value_map_destroy(&storage_syms);
   ir_temp_value_map_destroy(&addr_taken);
   ir_temp_value_map_destroy(&temp_last_use);
   ir_temp_value_map_destroy(&sym_last_use);

@@ -39,6 +39,7 @@ Type *type_checker_parse_pointer_type(TypeChecker *checker,
 int type_checker_types_equal(const Type *lhs, const Type *rhs);
 
 int type_checker_is_cstring_type(const Type *type);
+int type_checker_is_rawptr_type(const Type *type);
 
 int type_checker_is_lvalue_expression(ASTNode *expression);
 
@@ -182,6 +183,13 @@ unsigned char *type_checker_init_tracker_capture(TypeChecker *checker,
 void type_checker_init_tracker_restore(TypeChecker *checker,
                                               const unsigned char *snapshot,
                                               size_t count);
+
+/* Merge a branch's end state into `accumulator`: a variable survives the join
+   only where every path initialized it. Used to close an if/else chain, so a
+   variable written on all paths is initialized after it. */
+void type_checker_init_tracker_join(unsigned char *accumulator,
+                                           const unsigned char *branch,
+                                           size_t count);
 
 int type_checker_statement_guarantees_termination(ASTNode *statement);
 

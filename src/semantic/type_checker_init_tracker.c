@@ -196,3 +196,14 @@ void type_checker_init_tracker_restore(TypeChecker *checker,
   memcpy(checker->tracked_var_initialized, snapshot,
          limit * sizeof(unsigned char));
 }
+
+void type_checker_init_tracker_join(unsigned char *accumulator,
+                                           const unsigned char *branch,
+                                           size_t count) {
+  if (!accumulator || !branch) {
+    return;
+  }
+  for (size_t i = 0; i < count; i++) {
+    accumulator[i] = (unsigned char)(accumulator[i] && branch[i]);
+  }
+}

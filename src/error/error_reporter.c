@@ -107,7 +107,7 @@ static int error_reporter_should_use_color(void) {
 }
 
 /* The code a diagnostic reports under: its own, when an analysis stamped a
-   finer one (the memory checker's M0101..M0112), otherwise its type's. */
+   finer one (the memory/range checks' M0101..M0119), otherwise its type's. */
 static const char *error_report_code(const ErrorReport *error);
 
 /* Return the short error-code string for an ErrorType */

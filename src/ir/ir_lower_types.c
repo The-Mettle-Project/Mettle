@@ -6,6 +6,13 @@ int ir_type_is_cstring(Type *type) {
          strcmp(type->name, "cstring") == 0;
 }
 
+/* A string flowing to an untyped address wants the same `.chars` load a
+ * cstring destination gets: the record itself is not the address. */
+int ir_type_is_rawptr(Type *type) {
+  return type && type->kind == TYPE_POINTER && type->name &&
+         strcmp(type->name, "rawptr") == 0;
+}
+
 int ir_expression_is_string(IRLoweringContext *context,
                                    ASTNode *expression) {
   Type *type = ir_infer_expression_type(context, expression);
@@ -15,7 +22,7 @@ int ir_expression_is_string(IRLoweringContext *context,
 int ir_should_coerce_string_to_cstring(IRLoweringContext *context,
                                               Type *target_type,
                                               ASTNode *value_expression) {
-  return ir_type_is_cstring(target_type) &&
+  return (ir_type_is_cstring(target_type) || ir_type_is_rawptr(target_type)) &&
          ir_expression_is_string(context, value_expression);
 }
 

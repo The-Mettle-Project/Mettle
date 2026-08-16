@@ -60,7 +60,8 @@ typedef struct {
      "expected 'int64', found 'string'". Optional. */
   char *span_label;
   /* Overrides the code derived from `type`, for analyses with a finer code
-     range of their own: the memory checker reports M0101..M0112 rather than
+     range of their own: the memory and range checks report M0101..M0119
+     rather than
      the generic E0003 its findings would otherwise carry. NULL means use the
      type's code. */
   char *code_override;
@@ -155,7 +156,8 @@ SourceSpan error_reporter_span_snap_to_token(ErrorReporter *reporter,
 /* Attach an inline caret label to the most recently added diagnostic. */
 void error_reporter_set_last_label(ErrorReporter *reporter, const char *label);
 /* Stamp a finer code on the most recently added diagnostic, replacing the one
-   its ErrorType implies. The memory checker uses this to report M0101..M0112,
+   its ErrorType implies. The memory and range checks use this to report
+   M0101..M0119,
    so `mettle explain` can be reached from the diagnostic the reader is looking
    at. No-op if the last add was suppressed as a cascade. */
 void error_reporter_set_last_code(ErrorReporter *reporter, const char *code);
