@@ -631,7 +631,12 @@ int type_checker_process_declaration(TypeChecker *checker,
     }
     type_checker_set_error_at_location(
         checker, declaration->location,
-        "Unsupported top-level construct in declaration context");
+        "A call to '%s' cannot stand at file scope. File scope holds "
+        "declarations; move the call into a function body",
+        call && call->function_name ? call->function_name : "a function");
+    if (checker->error_reporter)
+      error_reporter_set_last_label(checker->error_reporter,
+                                    "this call needs a function to run in");
     return 0;
   }
 
@@ -1917,10 +1922,49 @@ int type_checker_process_declaration(TypeChecker *checker,
     return 1;
   }
 
-  default:
+  default: {
+    /* An expression or statement reached file scope, where only declarations
+       live. Name what it is so the reader can see which line to move. */
+    const char *shape = "statement";
+    switch (declaration->type) {
+    case AST_ASSIGNMENT:
+      shape = "assignment";
+      break;
+    case AST_BINARY_EXPRESSION:
+    case AST_UNARY_EXPRESSION:
+      shape = "expression";
+      break;
+    case AST_MEMBER_ACCESS:
+      shape = "field read";
+      break;
+    case AST_INDEX_EXPRESSION:
+      shape = "index read";
+      break;
+    case AST_IF_STATEMENT:
+      shape = "'if'";
+      break;
+    case AST_WHILE_STATEMENT:
+    case AST_FOR_STATEMENT:
+      shape = "loop";
+      break;
+    case AST_RETURN_STATEMENT:
+      shape = "'return'";
+      break;
+    case AST_SWITCH_STATEMENT:
+      shape = "'switch'";
+      break;
+    default:
+      break;
+    }
     type_checker_set_error_at_location(
         checker, declaration->location,
-        "Unsupported top-level construct in declaration context");
+        "This %s cannot stand at file scope. File scope holds declarations "
+        "(fn, struct, enum, var, const, import); move it into a function body",
+        shape);
+    if (checker->error_reporter)
+      error_reporter_set_last_label(checker->error_reporter,
+                                    "this needs a function to run in");
     return 0;
+  }
   }
 }

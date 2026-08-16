@@ -250,8 +250,11 @@ struct Vector3 {
   }
 }
 
-var v: Vector3;
-v.magnitude();
+fn main() -> int32 {
+  var v: Vector3;
+  var m: float64 = v.magnitude();
+  return 0;
+}
 ```
 
 ## Inline Assembly
