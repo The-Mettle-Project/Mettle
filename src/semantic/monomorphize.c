@@ -1296,11 +1296,14 @@ static void collect_type_instantiations(ASTNode *node, MonoContext *ctx) {
     break;
   }
   case AST_STRUCT_DECLARATION: {
-    /* A method body is code like any other and may name a generic type. The
-     * template's own methods are skipped: they still name type parameters, and
-     * their instantiations are collected from the monomorphized copy. */
+    /* A field type and a method body are both places a generic type can be
+     * named. The template's own are skipped: they still name type parameters,
+     * and their instantiations are collected from the monomorphized copy. */
     StructDeclaration *sd = (StructDeclaration *)node->data;
     if (sd && sd->type_param_count == 0) {
+      for (size_t i = 0; i < sd->field_count; i++) {
+        record_generic_type_use(ctx, sd->field_types[i], node->location);
+      }
       for (size_t i = 0; i < sd->method_count; i++) {
         ASTNode *method = sd->methods[i];
         FunctionDeclaration *md =
@@ -1462,10 +1465,27 @@ static void rewrite_generic_type_name_in_place(char **slot,
   char *base = NULL;
   char **args = NULL;
   size_t arg_count = 0;
+  const char *array_suffix = NULL;
+  int depth = 0;
 
   (void)type_params;
   (void)concrete_types;
   (void)type_param_count;
+
+  /* An array suffix belongs to the field, not to the type argument: the `[3]`
+   * of `Inner<int32>[3]` has to survive the rewrite, and the `[4]` of
+   * `Inner<int32[4]>` is part of the argument and must not be mistaken for it. */
+  for (size_t i = 0; i < len; i++) {
+    if (type_str[i] == '<') {
+      depth++;
+    } else if (type_str[i] == '>') {
+      depth--;
+    } else if (type_str[i] == '[' && depth == 0) {
+      array_suffix = type_str + i;
+      len = i;
+      break;
+    }
+  }
 
   while (len > 0 && type_str[len - 1] == '*') {
     ptr_count++;
@@ -1478,11 +1498,14 @@ static void rewrite_generic_type_name_in_place(char **slot,
 
   if (parse_generic_type_name(core, &base, &args, &arg_count)) {
     char *mangled = mangle_name(base, args, arg_count);
-    size_t new_len = strlen(mangled) + ptr_count + 1;
+    size_t new_len = strlen(mangled) + ptr_count +
+                     (array_suffix ? strlen(array_suffix) : 0) + 1;
     char *new_type = malloc(new_len);
     strcpy(new_type, mangled);
     for (size_t i = 0; i < ptr_count; i++)
       strcat(new_type, "*");
+    if (array_suffix)
+      strcat(new_type, array_suffix);
     mettle_free_string(*slot);
     *slot = new_type;
     free(mangled);
@@ -1771,6 +1794,13 @@ static ASTNode *create_monomorphized_struct(GenericDef *def,
 
   StructDeclaration *sd = (StructDeclaration *)clone->data;
 
+  /* Substituting a field type can discover a further instantiation, which
+   * reallocs ctx->instances and leaves `inst` dangling. The arrays these name
+   * are allocated per instantiation and do not move, so copying the handles out
+   * first is enough -- but nothing may read through `inst` past this point. */
+  char **type_args = inst->type_args;
+  size_t type_arg_count = inst->type_arg_count;
+
   // Set the mangled name
   mettle_free_string(sd->name);
   sd->name = strdup(inst->mangled_name);
@@ -1789,8 +1819,8 @@ static ASTNode *create_monomorphized_struct(GenericDef *def,
   // Substitute type params in field types
   for (size_t i = 0; i < sd->field_count; i++) {
     char *new_type = substitute_type_string(
-        sd->field_types[i], def->type_params, inst->type_args,
-        inst->type_arg_count, ctx);
+        sd->field_types[i], def->type_params, type_args,
+        type_arg_count, ctx);
     if (new_type) {
       mettle_free_string(sd->field_types[i]);
       sd->field_types[i] = new_type;
@@ -1811,8 +1841,8 @@ static ASTNode *create_monomorphized_struct(GenericDef *def,
 
     for (size_t p = 0; p < md->parameter_count; p++) {
       char *new_type = substitute_type_string(
-          md->parameter_types[p], def->type_params, inst->type_args,
-          inst->type_arg_count, ctx);
+          md->parameter_types[p], def->type_params, type_args,
+          type_arg_count, ctx);
       if (new_type) {
         mettle_free_string(md->parameter_types[p]);
         md->parameter_types[p] = new_type;
@@ -1821,8 +1851,8 @@ static ASTNode *create_monomorphized_struct(GenericDef *def,
 
     if (md->return_type) {
       char *new_type = substitute_type_string(
-          md->return_type, def->type_params, inst->type_args,
-          inst->type_arg_count, ctx);
+          md->return_type, def->type_params, type_args,
+          type_arg_count, ctx);
       if (new_type) {
         mettle_free_string(md->return_type);
         md->return_type = new_type;
@@ -1830,8 +1860,8 @@ static ASTNode *create_monomorphized_struct(GenericDef *def,
     }
 
     if (md->body) {
-      substitute_types_in_ast(md->body, def->type_params, inst->type_args,
-                              inst->type_arg_count, ctx);
+      substitute_types_in_ast(md->body, def->type_params, type_args,
+                              type_arg_count, ctx);
     }
   }
 
@@ -1846,6 +1876,11 @@ static ASTNode *create_monomorphized_function(GenericDef *def,
     return NULL;
 
   FunctionDeclaration *fd = (FunctionDeclaration *)clone->data;
+
+  /* As in create_monomorphized_struct: substitution can realloc ctx->instances
+   * out from under `inst`, so nothing below reads through it. */
+  char **type_args = inst->type_args;
+  size_t type_arg_count = inst->type_arg_count;
 
   // Set the mangled name
   mettle_free_string(fd->name);
@@ -1865,8 +1900,8 @@ static ASTNode *create_monomorphized_function(GenericDef *def,
   // Substitute type params in parameter types
   for (size_t i = 0; i < fd->parameter_count; i++) {
     char *new_type = substitute_type_string(
-        fd->parameter_types[i], def->type_params, inst->type_args,
-        inst->type_arg_count, ctx);
+        fd->parameter_types[i], def->type_params, type_args,
+        type_arg_count, ctx);
     if (new_type) {
       mettle_free_string(fd->parameter_types[i]);
       fd->parameter_types[i] = new_type;
@@ -1876,8 +1911,8 @@ static ASTNode *create_monomorphized_function(GenericDef *def,
   // Substitute type params in return type
   if (fd->return_type) {
     char *new_type = substitute_type_string(
-        fd->return_type, def->type_params, inst->type_args,
-        inst->type_arg_count, ctx);
+        fd->return_type, def->type_params, type_args,
+        type_arg_count, ctx);
     if (new_type) {
       mettle_free_string(fd->return_type);
       fd->return_type = new_type;
@@ -1886,8 +1921,8 @@ static ASTNode *create_monomorphized_function(GenericDef *def,
 
   // Substitute type params throughout the function body
   if (fd->body) {
-    substitute_types_in_ast(fd->body, def->type_params, inst->type_args,
-                            inst->type_arg_count, ctx);
+    substitute_types_in_ast(fd->body, def->type_params, type_args,
+                            type_arg_count, ctx);
   }
 
   return clone;
@@ -2542,7 +2577,11 @@ static int mono_emit_instantiation(MonoContext *ctx, Program *prog,
   prog->declaration_count++;
   ast_add_child(program, mono_node);
 
-  inst->emitted = 1;
+  /* Not `inst->emitted`: creating this one may have discovered others, which
+   * reallocs the array `inst` pointed into. Marking it through the index is
+   * what actually records the emission -- through the stale pointer it was
+   * written to freed memory, and the instantiation stayed marked unemitted. */
+  ctx->instances[index].emitted = 1;
   collect_type_instantiations(mono_node, ctx);
   return 1;
 }
@@ -3591,6 +3630,127 @@ int closure_adapt_program(ASTNode *program, ErrorReporter *reporter) {
   return had_error ? 0 : 1;
 }
 
+/* The base of a field type, with any `*` and `[N]` suffix dropped: `Box__int32`
+ * for all of `Box__int32`, `Box__int32*` and `Box__int32[4]`. */
+static size_t mono_base_type_length(const char *type_str) {
+  size_t length = strlen(type_str);
+  const char *bracket = strchr(type_str, '[');
+
+  if (bracket) {
+    length = (size_t)(bracket - type_str);
+  }
+  while (length > 0 && type_str[length - 1] == '*') {
+    length--;
+  }
+  return length;
+}
+
+static int mono_name_is(const char *name, const char *type_str,
+                        size_t base_length) {
+  return name && strlen(name) == base_length &&
+         strncmp(name, type_str, base_length) == 0;
+}
+
+static size_t mono_find_struct_index(Program *prog, const char *type_str,
+                                     size_t base_length) {
+  for (size_t i = 0; i < prog->declaration_count; i++) {
+    ASTNode *decl = prog->declarations[i];
+    StructDeclaration *sd = NULL;
+    if (!decl || decl->type != AST_STRUCT_DECLARATION) {
+      continue;
+    }
+    sd = (StructDeclaration *)decl->data;
+    if (sd && mono_name_is(sd->name, type_str, base_length)) {
+      return i;
+    }
+  }
+  return (size_t)-1;
+}
+
+static int mono_is_instantiated_struct(MonoContext *ctx, const char *type_str,
+                                       size_t base_length) {
+  for (size_t i = 0; i < ctx->instance_count; i++) {
+    if (ctx->instances[i].emitted &&
+        mono_name_is(ctx->instances[i].mangled_name, type_str, base_length)) {
+      GenericDef *def = find_generic_def(ctx, ctx->instances[i].generic_name);
+      return def && def->is_struct;
+    }
+  }
+  return 0;
+}
+
+static void mono_move_declaration(Program *prog, size_t from, size_t to) {
+  ASTNode *node = prog->declarations[from];
+
+  if (from <= to) {
+    return;
+  }
+  memmove(&prog->declarations[to + 1], &prog->declarations[to],
+          (from - to) * sizeof(ASTNode *));
+  prog->declarations[to] = node;
+}
+
+/* Instantiations are appended as they are discovered, which puts them after the
+ * code that asked for them. That is invisible for a local, whose type may name
+ * a struct declared later, but Mettle requires a struct field's type to be
+ * declared first, so `struct Holder { b: Box<int32>; }` named a type that came
+ * later in the program and failed with "Unknown type 'Box__int32'".
+ *
+ * Move each one to just before the first field that names it. Everything it
+ * depends on -- its type arguments, and whatever its template's fields name --
+ * is already declared before that field, since the field could name them too,
+ * so the new position is after its own dependencies and before its use. One
+ * forward sweep settles it: a declaration is only ever moved to the index being
+ * examined, which leaves the prefix behind that index untouched, and the
+ * moved-to index is re-examined so that a struct pulled forward can pull its
+ * own dependencies forward ahead of itself.
+ *
+ * That settles each instantiation with at most one move, so the move budget is
+ * their count. Two structs whose fields name each other exhaust it instead of
+ * chasing each other forever: no order satisfies them, which the type checker
+ * then reports the way it does for two hand-written structs. */
+static void mono_order_instantiations_before_use(MonoContext *ctx,
+                                                 Program *prog) {
+  size_t index = 0;
+  size_t budget = 0;
+
+  if (!ctx || !prog || ctx->instance_count == 0) {
+    return;
+  }
+  budget = ctx->instance_count;
+
+  while (index < prog->declaration_count) {
+    ASTNode *decl = prog->declarations[index];
+    StructDeclaration *sd = NULL;
+    int moved = 0;
+
+    if (decl && decl->type == AST_STRUCT_DECLARATION) {
+      sd = (StructDeclaration *)decl->data;
+    }
+    for (size_t f = 0; sd && f < sd->field_count; f++) {
+      const char *field_type = sd->field_types[f];
+      size_t base_length = field_type ? mono_base_type_length(field_type) : 0;
+      size_t declared_at = 0;
+
+      if (base_length == 0 ||
+          !mono_is_instantiated_struct(ctx, field_type, base_length)) {
+        continue;
+      }
+      declared_at = mono_find_struct_index(prog, field_type, base_length);
+      if (declared_at != (size_t)-1 && declared_at > index && budget > 0) {
+        mono_move_declaration(prog, declared_at, index);
+        budget--;
+        moved = 1;
+        break;
+      }
+    }
+
+    if (!moved) {
+      index++;
+    }
+  }
+}
+
 int monomorphize_program(ASTNode *program, ErrorReporter *reporter) {
   if (!program || program->type != AST_PROGRAM)
     return 1;
@@ -3637,6 +3797,10 @@ int monomorphize_program(ASTNode *program, ErrorReporter *reporter) {
 
     // Step 4: Rewrite all generic references to use mangled names
     rewrite_generic_references(program, &ctx);
+
+    /* Field types are mangled by now, so an instantiation used as a field can
+     * be recognized and moved ahead of the struct that names it. */
+    mono_order_instantiations_before_use(&ctx, prog);
   }
 
   if (!mono_rewrite_trait_method_calls(&ctx, program)) {

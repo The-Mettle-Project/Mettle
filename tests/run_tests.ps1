@@ -1199,6 +1199,7 @@ $cases = @(
   @{ Name = "generics_struct_methods"; Path = "tests/test_generics_struct_methods.mettle"; ShouldSucceed = $true },
   @{ Name = "generics_method_body_instantiation"; Path = "tests/test_generics_method_body_instantiation.mettle"; ShouldSucceed = $true },
   @{ Name = "method_pointer_receiver"; Path = "tests/test_method_pointer_receiver.mettle"; ShouldSucceed = $true },
+  @{ Name = "generics_struct_field"; Path = "tests/test_generics_struct_field.mettle"; ShouldSucceed = $true },
   @{
     Name          = "import_trait_bound"
     Path          = "tests/test_import_trait_bound.mettle"
@@ -3510,6 +3511,7 @@ try {
     @{ Path = "tests\test_generics_struct_methods.mettle"; ExitCode = 155; Label = "struct-methods" },
     @{ Path = "tests\test_generics_method_body_instantiation.mettle"; ExitCode = 42; Label = "method-body-instantiation" },
     @{ Path = "tests\test_method_pointer_receiver.mettle"; ExitCode = 42; Label = "pointer-receiver" },
+    @{ Path = "tests\test_generics_struct_field.mettle"; ExitCode = 42; Label = "struct-field-ordering" },
     @{ Path = "tests\test_trait_methods_generic_dispatch.mettle"; ExitCode = 42; Label = "trait-dispatch" }
   )
 

@@ -250,6 +250,16 @@ fn main() -> int32 {
 
 `Box<int32>` and `Box<float64>` are separate types with separate methods, so `plus` adds integers in one and floats in the other.
 
+An instantiation is a type like any other and can be a struct field, including through a pointer or an array. It does not need declaring: the compiler emits it ahead of the field that names it, so the usual rule that a field's type comes first is satisfied without writing anything down.
+
+```mettle
+struct Holder {
+  one: Box<int32>;
+  many: Box<int32>[4];
+  other: Box<float64>*;
+}
+```
+
 ## Structs and Enums
 
 Functions, variables, structs, and enums can be prefixed with `export` to make them visible to modules that import this file.
