@@ -2200,6 +2200,204 @@ static int mono_emit_impl_method_functions(MonoContext *ctx, ASTNode *program) {
   return 1;
 }
 
+/* Turn every `this` in a method body into `*this`, in place. The node is
+ * rewritten rather than replaced so that the parent's payload pointer and its
+ * child slot -- which both name this node -- stay correct without the walk
+ * needing to know what kind of parent it has. `this.x` becomes `(*this).x` and
+ * `return this` becomes `return *this`, which is what the body means once the
+ * receiver arrives as a pointer. */
+static void mono_this_to_deref(ASTNode *node) {
+  if (!node) {
+    return;
+  }
+
+  if (node->type == AST_IDENTIFIER) {
+    Identifier *id = (Identifier *)node->data;
+    if (id && id->name && strcmp(id->name, "this") == 0) {
+      ASTNode *inner = ast_create_identifier("this", node->location);
+      UnaryExpression *deref = inner ? malloc(sizeof(UnaryExpression)) : NULL;
+      char *op = deref ? mettle_strdup("*") : NULL;
+      if (!op) {
+        free(deref);
+        ast_destroy_node(inner);
+        return;
+      }
+      deref->operator= op;
+      deref->operand = inner;
+      mettle_free_string(id->name);
+      free(id);
+      node->type = AST_UNARY_EXPRESSION;
+      node->data = deref;
+      ast_add_child(node, inner);
+      return;
+    }
+  }
+
+  for (size_t i = 0; i < node->child_count; i++) {
+    mono_this_to_deref(node->children[i]);
+  }
+}
+
+typedef struct {
+  const char **names;
+  size_t count;
+  size_t capacity;
+} MonoNameSet;
+
+static int mono_name_set_has(const MonoNameSet *set, const char *name) {
+  if (!set || !name) {
+    return 0;
+  }
+  for (size_t i = 0; i < set->count; i++) {
+    if (strcmp(set->names[i], name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void mono_name_set_add(MonoNameSet *set, const char *name) {
+  if (!name || mono_name_set_has(set, name)) {
+    return;
+  }
+  if (set->count >= set->capacity) {
+    size_t capacity = set->capacity ? set->capacity * 2 : 8;
+    const char **grown = realloc(set->names, capacity * sizeof(const char *));
+    if (!grown) {
+      return;
+    }
+    set->names = grown;
+    set->capacity = capacity;
+  }
+  set->names[set->count++] = name;
+}
+
+/* Which method names some call reaches through a pointer, as `p->m()` -- which
+ * the parser has already turned into a call whose receiver is a deref. Only
+ * those get a pointer-taking copy, so a program that never calls a method
+ * through a pointer emits exactly the functions it did before, and `objdump -t`
+ * shows it. The test is the same one the type checker applies, minus the
+ * receiver's type, which is not known until later: this set is therefore a
+ * superset of what gets resolved, never a subset. */
+static void mono_collect_pointer_receiver_methods(ASTNode *node,
+                                                  MonoNameSet *set) {
+  if (!node) {
+    return;
+  }
+  if (node->type == AST_FUNCTION_CALL) {
+    CallExpression *call = (CallExpression *)node->data;
+    if (call && call->function_name && call->object &&
+        call->object->type == AST_UNARY_EXPRESSION) {
+      UnaryExpression *unary = (UnaryExpression *)call->object->data;
+      if (unary && unary->operator&& strcmp(unary->operator, "*") == 0) {
+        mono_name_set_add(set, call->function_name);
+      }
+    }
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    mono_collect_pointer_receiver_methods(node->children[i], set);
+  }
+}
+
+/* Build the free function a method call resolves to. `receiver_is_pointer`
+ * selects between the two forms the language distinguishes: `s.m(x)` passes the
+ * struct by value, `p->m(x)` passes the pointer, so each gets its own lifted
+ * function and the call site picks by how the receiver was spelled. The pointer
+ * form takes a cloned body with `this` dereferenced throughout; the value form
+ * takes the original body, which the struct declaration gives up. */
+static ASTNode *mono_lift_one_method(MonoContext *ctx, const char *struct_name,
+                                     ASTNode *method, int receiver_is_pointer) {
+  FunctionDeclaration *md = (FunctionDeclaration *)method->data;
+  const char *suffix = receiver_is_pointer ? MONO_PTR_RECEIVER_SUFFIX : "";
+  size_t mangled_len =
+      strlen(struct_name) + 1 + strlen(md->name) + strlen(suffix) + 1;
+  char *mangled = malloc(mangled_len);
+  if (!mangled) {
+    mono_report_error(ctx, method->location,
+                      "Out of memory lifting a struct method");
+    return NULL;
+  }
+  snprintf(mangled, mangled_len, "%s_%s%s", struct_name, md->name, suffix);
+
+  size_t count = md->parameter_count + 1;
+  char **names = calloc(count, sizeof(char *));
+  char **types = calloc(count, sizeof(char *));
+  if (!names || !types) {
+    free(mangled);
+    free(names);
+    free(types);
+    mono_report_error(ctx, method->location,
+                      "Out of memory lifting a struct method");
+    return NULL;
+  }
+  names[0] = mettle_strdup("this");
+  if (receiver_is_pointer) {
+    size_t len = strlen(struct_name) + 2;
+    types[0] = malloc(len);
+    if (types[0]) {
+      snprintf(types[0], len, "%s*", struct_name);
+    }
+  } else {
+    types[0] = mettle_strdup(struct_name);
+  }
+  int copied_ok = names[0] != NULL && types[0] != NULL;
+  for (size_t p = 0; copied_ok && p < md->parameter_count; p++) {
+    names[p + 1] = mettle_strdup(md->parameter_names[p]);
+    types[p + 1] = mettle_strdup(md->parameter_types[p]);
+    copied_ok = names[p + 1] != NULL && types[p + 1] != NULL;
+  }
+
+  ASTNode *body = NULL;
+  if (copied_ok) {
+    body = receiver_is_pointer ? ast_clone_node(md->body) : md->body;
+    if (body && receiver_is_pointer) {
+      mono_this_to_deref(body);
+    }
+  }
+
+  ASTNode *fn_node =
+      body ? ast_create_node(AST_FUNCTION_DECLARATION, method->location) : NULL;
+  FunctionDeclaration *fn =
+      fn_node ? calloc(1, sizeof(FunctionDeclaration)) : NULL;
+  if (!fn) {
+    for (size_t p = 0; p < count; p++) {
+      mettle_free_string(names[p]);
+      mettle_free_string(types[p]);
+    }
+    free(names);
+    free(types);
+    free(mangled);
+    if (body && receiver_is_pointer) {
+      ast_destroy_node(body);
+    }
+    if (fn_node) {
+      ast_destroy_node(fn_node);
+    }
+    mono_report_error(ctx, method->location,
+                      "Out of memory lifting a struct method");
+    return NULL;
+  }
+
+  fn->name = mangled;
+  fn->parameter_names = names;
+  fn->parameter_types = types;
+  fn->parameter_count = count;
+  fn->return_type = md->return_type ? mettle_strdup(md->return_type) : NULL;
+  fn->body = body;
+  fn->is_inline = md->is_inline;
+  fn->is_inline_contract = md->is_inline_contract;
+  fn->is_noinline = md->is_noinline;
+  fn->is_pure = md->is_pure;
+  fn->is_noalloc = md->is_noalloc;
+  fn->simd_mode = md->simd_mode;
+  if (!receiver_is_pointer) {
+    md->body = NULL; /* ownership moves to the lifted function */
+  }
+  fn_node->data = fn;
+  ast_add_child(fn_node, fn->body);
+  return fn_node;
+}
+
 /* `struct S { method m(a: T) -> R { ... } }` is called as `s.m(x)`, which the
  * type checker rewrites into a plain call to `S_m(s, x)`. Nothing ever created
  * S_m: the parser stored the method on the struct declaration and every later
@@ -2207,20 +2405,19 @@ static int mono_emit_impl_method_functions(MonoContext *ctx, ASTNode *program) {
  * (expected function 'S_m')" and methods only worked if you hand-wrote the free
  * function yourself.
  *
- * Lift each one into that free function: name it `S_m`, give it the receiver as
- * a leading parameter named `this` (which is what the body already calls it,
- * and which the parser will not accept as a user-written parameter name), and
- * append it to the program. The body moves across rather than being cloned --
- * the struct declaration keeps the method node for diagnostics, but its body
- * now belongs to the lifted function, so it is detached here to keep a single
- * owner.
- *
- * The receiver is passed by value, matching the call-site rewrite, which passes
- * the object expression as the first argument. `p->m()` already desugars to
- * `(*p).m()` in the parser, so a pointer receiver arrives dereferenced. */
+ * A method lifts once per receiver form the program actually uses: `S_m` takes
+ * the struct by value for `s.m(x)`, and `S_m<suffix>` takes `S*` for `p->m(x)`,
+ * so a method reached through a pointer can write to its receiver. The struct
+ * declaration keeps the method node for diagnostics but gives up its body, which
+ * the by-value function takes over; the pointer function gets a clone. */
 static int mono_lift_struct_methods(MonoContext *ctx, Program *prog,
                                     ASTNode *program) {
+  MonoNameSet pointer_methods = {0};
+  int ok = 1;
   size_t original_count = prog->declaration_count;
+
+  mono_collect_pointer_receiver_methods(program, &pointer_methods);
+
   for (size_t d = 0; d < original_count; d++) {
     ASTNode *decl = prog->declarations[d];
     if (!decl || decl->type != AST_STRUCT_DECLARATION) {
@@ -2246,89 +2443,40 @@ static int mono_lift_struct_methods(MonoContext *ctx, Program *prog,
         continue;
       }
 
-      size_t mangled_len = strlen(sd->name) + 1 + strlen(md->name) + 1;
-      char *mangled = malloc(mangled_len);
-      if (!mangled) {
-        mono_report_error(ctx, method->location,
-                          "Out of memory lifting a struct method");
-        return 0;
-      }
-      snprintf(mangled, mangled_len, "%s_%s", sd->name, md->name);
+      /* Pointer form first: it clones the body, which the value form consumes. */
+      for (int ptr = 1; ptr >= 0; ptr--) {
+        ASTNode *fn_node = NULL;
+        ASTNode **grown = NULL;
 
-      size_t count = md->parameter_count + 1;
-      char **names = calloc(count, sizeof(char *));
-      char **types = calloc(count, sizeof(char *));
-      if (!names || !types) {
-        free(mangled);
-        free(names);
-        free(types);
-        mono_report_error(ctx, method->location,
-                          "Out of memory lifting a struct method");
-        return 0;
-      }
-      names[0] = mettle_strdup("this");
-      types[0] = mettle_strdup(sd->name);
-      int copied_ok = names[0] != NULL && types[0] != NULL;
-      for (size_t p = 0; copied_ok && p < md->parameter_count; p++) {
-        names[p + 1] = mettle_strdup(md->parameter_names[p]);
-        types[p + 1] = mettle_strdup(md->parameter_types[p]);
-        copied_ok = names[p + 1] != NULL && types[p + 1] != NULL;
-      }
-
-      ASTNode *fn_node = copied_ok
-                             ? ast_create_node(AST_FUNCTION_DECLARATION,
-                                               method->location)
-                             : NULL;
-      FunctionDeclaration *fn =
-          fn_node ? calloc(1, sizeof(FunctionDeclaration)) : NULL;
-      if (!fn) {
-        for (size_t p = 0; p < count; p++) {
-          mettle_free_string(names[p]);
-          mettle_free_string(types[p]);
+        if (ptr && !mono_name_set_has(&pointer_methods, md->name)) {
+          continue;
         }
-        free(names);
-        free(types);
-        free(mangled);
-        if (fn_node) {
+
+        fn_node = mono_lift_one_method(ctx, sd->name, method, ptr);
+        if (!fn_node) {
+          ok = 0;
+          goto done;
+        }
+
+        grown = realloc(prog->declarations,
+                        (prog->declaration_count + 1) * sizeof(ASTNode *));
+        if (!grown) {
           ast_destroy_node(fn_node);
+          mono_report_error(ctx, method->location,
+                            "Failed to append a lifted struct method");
+          ok = 0;
+          goto done;
         }
-        mono_report_error(ctx, method->location,
-                          "Out of memory lifting a struct method");
-        return 0;
+        prog->declarations = grown;
+        prog->declarations[prog->declaration_count++] = fn_node;
+        ast_add_child(program, fn_node);
       }
-
-      fn->name = mangled;
-      fn->parameter_names = names;
-      fn->parameter_types = types;
-      fn->parameter_count = count;
-      fn->return_type =
-          md->return_type ? mettle_strdup(md->return_type) : NULL;
-      fn->body = md->body;
-      fn->is_inline = md->is_inline;
-      fn->is_inline_contract = md->is_inline_contract;
-      fn->is_noinline = md->is_noinline;
-      fn->is_pure = md->is_pure;
-      fn->is_noalloc = md->is_noalloc;
-      fn->simd_mode = md->simd_mode;
-      md->body = NULL; /* ownership moves to the lifted function */
-      fn_node->data = fn;
-      ast_add_child(fn_node, fn->body);
-
-      ASTNode **grown =
-          realloc(prog->declarations,
-                  (prog->declaration_count + 1) * sizeof(ASTNode *));
-      if (!grown) {
-        ast_destroy_node(fn_node);
-        mono_report_error(ctx, method->location,
-                          "Failed to append a lifted struct method");
-        return 0;
-      }
-      prog->declarations = grown;
-      prog->declarations[prog->declaration_count++] = fn_node;
-      ast_add_child(program, fn_node);
     }
   }
-  return 1;
+
+done:
+  free(pointer_methods.names);
+  return ok;
 }
 
 static int mono_emit_instantiation(MonoContext *ctx, Program *prog,

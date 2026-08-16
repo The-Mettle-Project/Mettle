@@ -263,7 +263,7 @@ export enum Status {
 
 ## Methods
 
-Structs can define methods. The receiver is implicit (`this`). Methods are called with `obj.method(args)`. When the receiver is a struct value, the compiler passes it by value as the first argument; when it is a pointer, the pointer is passed.
+Structs can define methods. The receiver is implicit (`this`). Methods are called with `obj.method(args)`.
 
 ```mettle
 struct Vector3 {
@@ -279,6 +279,28 @@ struct Vector3 {
 var v: Vector3;
 v.magnitude();
 ```
+
+How the receiver is passed follows how it is spelled, the same way field access does. `obj.method()` passes the struct by value, so `this` is a copy and a write to it does not reach the caller. `ptr->method()` passes the pointer, so `this` names the caller's struct and a write does reach it. This is the distinction `.` and `->` already carry for fields: `obj.x` reads a value, `ptr->x` reads through a pointer.
+
+```mettle
+struct Counter {
+  n: int32;
+
+  method bump() -> int32 {
+    this.n = this.n + 1;
+    return this.n;
+  }
+}
+
+var c: Counter;
+c.n = 10;
+c.bump();          // this is a copy; c.n is still 10
+
+var p: Counter* = &c;
+p->bump();         // this is c; c.n is now 11
+```
+
+A method reached through a pointer is a separate function from the same method reached by value, and only the forms a program calls are emitted.
 
 ## Inline Assembly
 

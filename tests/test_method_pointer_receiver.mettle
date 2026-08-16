@@ -1,0 +1,68 @@
+struct Counter {
+    n: int32;
+
+    method bump() -> int32 {
+        this.n = this.n + 1;
+        return this.n;
+    }
+
+    method get() -> int32 {
+        return this.n;
+    }
+}
+
+struct Cell<T> {
+    value: T;
+
+    method set(v: T) -> T {
+        this.value = v;
+        return this.value;
+    }
+
+    method get() -> T {
+        return this.value;
+    }
+}
+
+fn main() -> int32 {
+    var c: Counter;
+    c.n = 10;
+
+    /* A value receiver is a copy, so the write inside the method does not
+     * reach `c`. A pointer receiver passes the pointer, so it does. */
+    c.bump();
+    if (c.get() != 10) {
+        return 1;
+    }
+
+    var p: Counter* = &c;
+    p->bump();
+    p->bump();
+    if (c.get() != 12) {
+        return 2;
+    }
+
+    /* Same rule on a monomorphized generic struct, through the heap. */
+    var cell: Cell<int32>* = new Cell<int32>;
+    cell->value = 0;
+    cell->set(30);
+    if (cell->get() != 30) {
+        return 3;
+    }
+
+    var wide: Cell<int64>* = new Cell<int64>;
+    wide->value = 0;
+    wide->set(100);
+    if (wide->get() != 100) {
+        return 4;
+    }
+
+    var byval: Cell<int32>;
+    byval.value = 7;
+    byval.set(9);
+    if (byval.get() != 7) {
+        return 5;
+    }
+
+    return c.get() + cell->get();
+}
