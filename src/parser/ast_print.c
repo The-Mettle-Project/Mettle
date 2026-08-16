@@ -403,6 +403,11 @@ static void print_statement(AstPrinter *printer, const ASTNode *node) {
     fputs(";\n", printer->out);
     break;
 
+  case AST_QUIESCE_STATEMENT:
+    print_indent(printer);
+    fputs("quiesce;\n", printer->out);
+    break;
+
   case AST_DEFER_STATEMENT:
   case AST_ERRDEFER_STATEMENT: {
     const DeferStatement *defer = (const DeferStatement *)node->data;

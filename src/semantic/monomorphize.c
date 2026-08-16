@@ -2424,6 +2424,7 @@ static ASTNode *mono_lift_one_method(MonoContext *ctx, const char *struct_name,
   fn->is_noinline = md->is_noinline;
   fn->is_pure = md->is_pure;
   fn->is_noalloc = md->is_noalloc;
+  fn->is_swappable = md->is_swappable;
   fn->simd_mode = md->simd_mode;
   if (!receiver_is_pointer) {
     md->body = NULL; /* ownership moves to the lifted function */

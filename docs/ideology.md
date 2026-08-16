@@ -743,7 +743,20 @@ bounds. The first of those is the precondition for everything in Part III.
 
 **Before hot swap ships:**
 
-- A declared quiescence point. *(IV.4)*
+- A declared quiescence point. *(IV.4)* **Declaration landed; binding
+  outstanding.** `quiesce;` names the point, contextually, so a program
+  already using the name keeps working. `@swappable` is the opt-in unit, per
+  function, and it keeps the call boundary a swap has to redirect: it implies
+  noinline, and `@swappable @inline` is refused, because an inlined body has
+  no call to redirect and no single place to name. Verified under `--release`,
+  where an undecorated twin of the same body still inlines. `quiesce;` emits
+  nothing yet: the patch table it will poll does not exist, and emitting a
+  call into a runtime that has not been written would be control flow at a
+  point nothing can service. The binding model chosen is a patch table,
+  because a swap is then one atomic pointer store with the old body still
+  resident, and at a `quiesce` only the calling thread is quiescent, so
+  rewriting instructions under another thread is not available (IV.4 forbids
+  the stop-the-world that would make it safe).
 - ~~Layout-change detection with refusal as the default outcome.~~ *(IV.3)*
   **Landed.** `layoutof(T)` digests kind, size, alignment and every field's
   name, offset and width. Pinning it with `static_assert` makes a layout

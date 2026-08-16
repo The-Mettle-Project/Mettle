@@ -147,6 +147,7 @@ ASTNode *ast_clone_node(ASTNode *node) {
     dst->is_pure = src->is_pure;
     dst->is_noalloc = src->is_noalloc;
     dst->is_test = src->is_test;
+    dst->is_swappable = src->is_swappable;
     dst->simd_mode = src->simd_mode;
     dst->captured_count = src->captured_count;
     dst->captured_names =
@@ -1537,6 +1538,7 @@ ASTNode *ast_create_function_declaration(const char *name, char **param_names,
   func_decl->is_pure = 0;
   func_decl->is_noalloc = 0;
   func_decl->is_test = 0;
+  func_decl->is_swappable = 0;
   func_decl->simd_mode = SIMD_ATTR_NONE;
   func_decl->captured_names = NULL;
   func_decl->captured_types = NULL;
@@ -2601,6 +2603,10 @@ ASTNode *ast_create_switch_statement(ASTNode *expression, ASTNode **cases,
 
   node->data = switch_stmt;
   return node;
+}
+
+ASTNode *ast_create_quiesce_statement(SourceLocation location) {
+  return ast_create_node(AST_QUIESCE_STATEMENT, location);
 }
 
 ASTNode *ast_create_break_statement(SourceLocation location) {

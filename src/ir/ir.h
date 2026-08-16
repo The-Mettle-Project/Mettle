@@ -605,6 +605,12 @@ typedef struct {
   int is_pure;            // `@pure`    : side-effect-free; enables call LICM
   int is_noalloc;         // `@noalloc` : proven allocation-free or error
   int is_test;            // `@test`    : compile-time unit test (mettle test)
+  /* `@swappable`: may be replaced in a running process at a `quiesce` point.
+   * The swap redirects the call, so the call has to survive: lowering also
+   * sets is_noinline, because a body copied into ten callers has ten places
+   * to redirect and no boundary to name. Opting in is what buys that, so a
+   * function without the decorator pays nothing. */
+  int is_swappable;
   int is_kernel;          // GPU entry point; ordinary functions are not entries
   /* `kernel(block = ...)`: the launch block shape this kernel requires.
    * All zero when undeclared. PTX emits .reqntid so the driver rejects a

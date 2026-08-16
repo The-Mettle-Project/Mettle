@@ -675,6 +675,7 @@ typedef struct {
   int is_pure;            // `@pure`
   int is_noalloc;         // `@noalloc`
   int is_test;            // `@test`: compile-time unit test (mettle test)
+  int is_swappable;       // `@swappable`: may be replaced at a `quiesce` point
   int simd_mode; // SimdAttr from `@simd` / `@simd!` (SIMD_ATTR_NONE if absent)
   int unroll_factor; // `@unroll(n)` on a loop; 0 if absent
 } ParsedDecorators;
@@ -691,6 +692,7 @@ static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
   out->is_pure = 0;
   out->is_noalloc = 0;
   out->is_test = 0;
+  out->is_swappable = 0;
   out->simd_mode = SIMD_ATTR_NONE;
   out->unroll_factor = 0;
 
@@ -699,7 +701,7 @@ static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
     if (!parser_is_identifier_like(parser->current_token.type)) {
       parser_set_error(parser,
                        "Expected a decorator name after '@' (one of 'inline', "
-                       "'noinline', 'pure', 'noalloc', 'simd')");
+                       "'noinline', 'pure', 'noalloc', 'simd', 'swappable')");
       return 0;
     }
     const char *name = parser->current_token.value;
@@ -741,6 +743,13 @@ static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
         return 0;
       }
       out->is_test = 1;
+      parser_advance(parser);
+    } else if (strcmp(name, "swappable") == 0) {
+      if (out->is_swappable) {
+        parser_set_error(parser, "Duplicate '@swappable' decorator");
+        return 0;
+      }
+      out->is_swappable = 1;
       parser_advance(parser);
     } else if (strcmp(name, "simd") == 0) {
       if (out->simd_mode != SIMD_ATTR_NONE) {
@@ -791,6 +800,16 @@ static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
   if (out->is_inline && out->is_noinline) {
     parser_set_error(parser,
                      "'@inline' and '@noinline' are mutually exclusive");
+    return 0;
+  }
+  /* A swap replaces a function at its call boundary, so the boundary has to
+   * still be there. An inlined body has no call to redirect and no single
+   * place to redirect it: the copies are spread across every caller. */
+  if (out->is_swappable && out->is_inline) {
+    parser_set_error(parser,
+                     "'@swappable' and '@inline' are mutually exclusive: a "
+                     "swap replaces a function at its call boundary, and "
+                     "inlining removes that boundary");
     return 0;
   }
   return 1;
@@ -847,6 +866,7 @@ ASTNode *parser_parse_declaration(Parser *parser) {
     fd->is_pure = decos.is_pure;
     fd->is_noalloc = decos.is_noalloc;
     fd->is_test = decos.is_test;
+    fd->is_swappable = decos.is_swappable;
     fd->simd_mode = decos.simd_mode;
     return decl;
   }
@@ -1559,6 +1579,21 @@ ASTNode *parser_parse_statement(Parser *parser) {
     return parser_parse_comptime_for(parser, 0);
   }
 
+  // Contextual `quiesce;`: the swap point. Contextual the same way `comptime`
+  // is, so a program already using `quiesce` as a name keeps working. The
+  // semicolon is what tells the marker from a variable of that name, and the
+  // only thing it takes away is a bare `quiesce;` expression statement, which
+  // reads a value and discards it.
+  if (parser_is_identifier_like(parser->current_token.type) &&
+      parser->current_token.value &&
+      strcmp(parser->current_token.value, "quiesce") == 0 &&
+      parser->peek_token.type == TOKEN_SEMICOLON) {
+    SourceLocation location = parser_current_location(parser);
+    parser_advance(parser); // consume the contextual `quiesce`
+    parser_advance(parser); // consume ';'
+    return ast_create_quiesce_statement(location);
+  }
+
   // Vectorization attribute on a loop: `@simd` / `@simd!`.
   //   @simd  for i in 0..n { ... }   -> best-effort hint (warn if not vectorized)
   //   @simd! for i in 0..n { ... }   -> hard contract (compile error otherwise)
@@ -1569,10 +1604,10 @@ ASTNode *parser_parse_statement(Parser *parser) {
     if (!parser_parse_decorator_chain(parser, &decos))
       return NULL;
     if (decos.is_inline || decos.is_noinline || decos.is_pure ||
-        decos.is_noalloc) {
+        decos.is_noalloc || decos.is_swappable) {
       parser_set_error(parser,
-                       "'@inline', '@noinline', '@pure', and '@noalloc' apply "
-                       "to a function, not a loop");
+                       "'@inline', '@noinline', '@pure', '@noalloc', and "
+                       "'@swappable' apply to a function, not a loop");
       return NULL;
     }
     if (decos.simd_mode == SIMD_ATTR_NONE && !decos.unroll_factor) {

@@ -1204,6 +1204,13 @@ int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
     return type_checker_check_match_statement(checker, statement);
   }
 
+  /* `quiesce;` names a point where the program consents to a code swap.
+   * Nothing runs here that the programmer did not write, so there is nothing
+   * to check about the point itself; what a swap is allowed to change is
+   * checked against `layoutof` where the swap is proposed. */
+  case AST_QUIESCE_STATEMENT:
+    return 1;
+
   case AST_BREAK_STATEMENT:
     if (checker->loop_depth <= 0 && checker->switch_depth <= 0) {
       type_checker_set_error_at_location(

@@ -984,6 +984,7 @@ IRFunction *ir_function_create(const char *name) {
   function->is_pure = 0;
   function->is_noalloc = 0;
   function->is_test = 0;
+  function->is_swappable = 0;
   function->is_kernel = 0;
   return function;
 }

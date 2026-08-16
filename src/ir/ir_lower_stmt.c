@@ -263,6 +263,14 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     return ok;
   }
 
+  /* A swap point emits nothing today: the patch table it will poll does not
+   * exist yet, and emitting a call to a runtime that has not been written
+   * would be control flow at a point nothing can service. When the binding
+   * lands, this is where the poll goes, and it is already the only place the
+   * program consented to one. */
+  case AST_QUIESCE_STATEMENT:
+    return 1;
+
   case AST_VAR_DECLARATION: {
     VarDeclaration *declaration = (VarDeclaration *)statement->data;
     if (!declaration || !declaration->name) {

@@ -1,0 +1,5 @@
+// `@swappable` describes a function, not a loop.
+fn main() -> int32 {
+    @swappable for i in 0..3 { }
+    return 0;
+}

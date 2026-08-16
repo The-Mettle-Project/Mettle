@@ -37,6 +37,9 @@ typedef enum {
   AST_MATCH_STATEMENT,
   AST_BREAK_STATEMENT,
   AST_CONTINUE_STATEMENT,
+  /* `quiesce;` : a point the programmer names as safe to swap code at. Carries
+   * no data; the location is the whole content. */
+  AST_QUIESCE_STATEMENT,
   AST_DEFER_STATEMENT,
   AST_ERRDEFER_STATEMENT,
   AST_INLINE_ASM,
@@ -144,6 +147,11 @@ typedef struct {
   int is_noalloc;         // `@noalloc` : proven allocation-free or compile error
   int is_test;            // `@test`    : compile-time unit test; compiled out
                           //              of normal builds, run by `mettle test`
+  // `@swappable`: this function may be replaced in a running process at a
+  // `quiesce` point. Opting in is what buys the call binding that makes a
+  // swap possible, so a function without it pays nothing and can be proven
+  // to have paid nothing.
+  int is_swappable;
   int simd_mode;          // SimdAttr applied as the default to every body loop
   // Closure conversion metadata (set on AST_LAMBDA_EXPRESSION nodes only). A
   // capturing lambda records the variables it captures by value, their types,
@@ -622,6 +630,7 @@ ASTNode *ast_create_case_clause(ASTNode *value, ASTNode *body, int is_default,
 ASTNode *ast_create_switch_statement(ASTNode *expression, ASTNode **cases,
                                      size_t case_count,
                                      SourceLocation location);
+ASTNode *ast_create_quiesce_statement(SourceLocation location);
 ASTNode *ast_create_break_statement(SourceLocation location);
 ASTNode *ast_create_continue_statement(SourceLocation location);
 ASTNode *ast_create_labeled_break_statement(const char *label,

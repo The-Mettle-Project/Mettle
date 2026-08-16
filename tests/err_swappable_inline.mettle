@@ -1,0 +1,9 @@
+// A swap replaces a function at its call boundary. Forcing the body inline
+// removes the boundary, so the two decorators cannot both hold.
+@swappable @inline fn f(n: int32) -> int32 {
+    return n + 1;
+}
+
+fn main() -> int32 {
+    return f(1);
+}

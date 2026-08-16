@@ -945,6 +945,12 @@ $cases = @(
      OutputMustMatch = @("static_assert failed", "expanded from comptime-for iteration 1 \(field ``id``\)")
      OutputMustNotMatch = @("internal compiler error") },
   @{ Name = "layoutof"; Path = "tests/test_layoutof.mettle"; ShouldSucceed = $true },
+  @{ Name = "err_swappable_inline"; Path = "tests/err_swappable_inline.mettle"; ShouldSucceed = $false
+     Pattern = "'@swappable' and '@inline' are mutually exclusive"
+     OutputMustNotMatch = @("internal compiler error") },
+  @{ Name = "err_swappable_on_loop"; Path = "tests/err_swappable_on_loop.mettle"; ShouldSucceed = $false
+     Pattern = "apply to a function, not a loop"
+     OutputMustNotMatch = @("internal compiler error") },
   # A pinned layout that no longer agrees must refuse the build. Detection is
   # only worth having if the default outcome is refusal.
   @{ Name = "err_layout_pin_broken"; Path = "tests/err_layout_pin_broken.mettle"; ShouldSucceed = $false
@@ -2560,6 +2566,47 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "expand_prints_module_scope_asserts" -Passed $false -Reason $_.Exception.Message
+}
+
+# `@swappable` has to keep the call boundary a swap would redirect, including
+# under --release where the inliner is most aggressive. `policy` and `plain`
+# have identical bodies and differ only by the decorator, so the inliner's
+# verdict on the pair is what proves the decorator did it. `quiesce;` must
+# survive to a running program without emitting anything.
+$total++
+try {
+  $swapSrc = "tests\test_swappable_quiesce.mettle"
+  $out = & $CompilerPath --release --explain $swapSrc -o (Join-Path $tmpDir "swq.obj") 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "build failed: $out" }
+  if ($out -notmatch "call to ``policy``[^\r\n]*NOT inlined") {
+    throw "a @swappable function lost its call boundary under --release: $out"
+  }
+  if ($out -notmatch "call to ``plain``[^\r\n]*: inlined") {
+    throw "the undecorated twin should still inline, or the test proves nothing: $out"
+  }
+
+  foreach ($mode in @("debug", "release")) {
+    $exe = Join-Path $tmpDir "swq_$mode.exe"
+    $buildArgs = @()
+    if ($mode -eq "release") { $buildArgs += "--release" }
+    $buildArgs += @("--build", $swapSrc, "-o", $exe)
+    $bo = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "swappable ($mode) build failed: $bo" }
+    & $exe *> $null
+    if ($LASTEXITCODE -ne 20) {
+      throw "swappable ($mode) returned $LASTEXITCODE (expected 20)"
+    }
+  }
+
+  # Expansion is inspectable, and that includes the swap point.
+  $ex = & $CompilerPath expand $swapSrc 2>&1 | Out-String
+  if ($ex -notmatch "quiesce;") { throw "expand did not print the swap point: $ex" }
+
+  Write-CaseResult -Name "swappable_keeps_call_boundary" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "swappable_keeps_call_boundary" -Passed $false -Reason $_.Exception.Message
 }
 
 # Runtime excision: each optional component has to be absent from a binary that

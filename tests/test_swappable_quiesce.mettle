@@ -1,0 +1,27 @@
+// `@swappable` opts a function in to being replaced in a running process, and
+// `quiesce;` names the point where the program consents to that happening.
+//
+// The decorator has to keep the call boundary alive, including under --release,
+// because a swap redirects a call and an inlined body has no call to redirect.
+// `policy` and `plain` have identical bodies; only the decorator differs, so
+// the inliner's verdict on them is the whole test.
+
+@swappable fn policy(n: int32) -> int32 {
+    return n + 1;
+}
+
+fn plain(n: int32) -> int32 {
+    return n + 1;
+}
+
+fn main() -> int32 {
+    var total: int32 = 0;
+    var i: int32 = 0;
+    while (i < 4) {
+        // Consent, at a point the programmer wrote. Nothing runs here.
+        quiesce;
+        total = total + policy(i) + plain(i);
+        i = i + 1;
+    }
+    return total;   // 2*(1+2+3+4) = 20
+}
