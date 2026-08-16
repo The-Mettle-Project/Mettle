@@ -1,11 +1,11 @@
 import "std/io";
 
-fn then_err() { puts(cstr("THEN_ERR\n")); }
-fn then_ok() { puts(cstr("THEN_OK\n")); }
-fn else_err() { puts(cstr("ELSE_ERR\n")); }
-fn else_ok() { puts(cstr("ELSE_OK\n")); }
-fn outer_err() { puts(cstr("OUTER_ERR\n")); }
-fn outer_ok() { puts(cstr("OUTER_OK\n")); }
+fn then_err() { puts("THEN_ERR\n"); }
+fn then_ok() { puts("THEN_OK\n"); }
+fn else_err() { puts("ELSE_ERR\n"); }
+fn else_ok() { puts("ELSE_OK\n"); }
+fn outer_err() { puts("OUTER_ERR\n"); }
+fn outer_ok() { puts("OUTER_OK\n"); }
 
 fn main() -> int32 {
   errdefer outer_err();

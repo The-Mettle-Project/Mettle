@@ -56,7 +56,7 @@ fn against_library(a: cstring, b: cstring, n: int64) -> int64 {
 
 fn main() -> int32 {
   var n: int32 = 16;
-  var a: int32* = (int32*)malloc((int64)n * 4);
+  var a: int32* = malloc((int64)n * 4);
   var i: int32 = 0;
   while (i < n) {
     a[i] = 1;
@@ -78,9 +78,9 @@ fn main() -> int32 {
   got = got + (int64)transitive(a, n);     // 64
   got = got + against_library(p, q, bytes); // 16
 
-  print(cstr("calls="));
+  print("calls=");
   println_int(got);
-  free((cstring)a);
+  free(a);
   free(p);
   free(q);
   return 0;

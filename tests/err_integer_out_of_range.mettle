@@ -1,0 +1,25 @@
+// A compile-time integer that does not fit where it is stored is a fact, not a
+// risk: the value is known here. It reports M0118 and names the value and the
+// range it missed, rather than keeping the low bits and saying nothing.
+//
+// The constants that DO fit must stay silent -- that is what keeps
+// `var b: uint8 = 200;` from needing a cast.
+
+const SCALE = 2654435761;
+
+fn main() -> int32 {
+  // Fits: checked, accepted, no diagnostic.
+  var fits_u8: uint8 = 200;
+  var fits_u32: uint32 = 4294967295;
+  var fits_i8: int8 = 0 - 128;
+  var folded: uint8 = 1 << 7;
+
+  var hash: int32 = 2654435761;   // M0118: above int32's range
+  var via_const: int32 = SCALE;   // M0118: through a global const
+  var neg: uint32 = 0 - 1;        // M0118: below uint32's range
+  var byte: uint8 = 256;          // M0118: one past the top
+
+  var kept: int32 = (int32)fits_u8 + (int32)fits_u32 + (int32)fits_i8;
+  kept = kept + (int32)folded + hash + via_const;
+  return kept + (int32)neg + (int32)byte;
+}

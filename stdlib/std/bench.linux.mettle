@@ -9,12 +9,12 @@
 // tv_sec @0 (int64), tv_nsec @8 (int64). CLOCK_MONOTONIC = 1 on Linux.
 extern fn clock_gettime(clk_id: int32, ts: cstring) -> int32 = "clock_gettime";
 
-export fn bench_time_us() -> uint64 {
+export fn bench_time_us() -> int64 {
   var ts: uint8[16];
   if (clock_gettime(1, &ts[0]) != 0) {
     return 0;
   }
   var sec: int64 = *((int64*)&ts[0]);
   var nsec: int64 = *((int64*)&ts[8]);
-  return (uint64)(sec * 1000000 + nsec / 1000);
+  return sec * 1000000 + nsec / 1000;
 }

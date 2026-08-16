@@ -23,6 +23,6 @@ export fn main(argc: int32, argv: cstring*) -> int32 {
   if (load_slot(db) != 0) { return 3; }
   println("ok");
   db_close_file(db[0].data_fp);
-  free((cstring)db);
+  free(db);
   return 0;
 }

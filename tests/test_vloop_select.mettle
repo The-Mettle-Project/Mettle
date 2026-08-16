@@ -61,8 +61,8 @@ fn ge_pick(s: int32*, d: int32*, n: int64) {
 fn main() -> int32 {
   // Not a multiple of the 8-wide vector, so the scalar remainder runs too.
   var n: int64 = 1003;
-  var a: int32* = (int32*)malloc(n * 4);
-  var b: int32* = (int32*)malloc(n * 4);
+  var a: int32* = malloc(n * 4);
+  var b: int32* = malloc(n * 4);
   if (a == 0 || b == 0) { return 1; }
 
   var i: int64 = 0;
@@ -110,7 +110,7 @@ fn main() -> int32 {
     i = i + 1;
   }
 
-  free((cstring)a);
-  free((cstring)b);
+  free(a);
+  free(b);
   return 42;
 }

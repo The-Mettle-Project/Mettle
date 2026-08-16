@@ -59,9 +59,9 @@ fn main() -> int32 {
   if (sum_i2(1) != 1) { ok = 0; }              // single iteration
 
   if (ok == 1) {
-    println(cstr("closed_form_sum OK"));
+    println("closed_form_sum OK");
     return 0;
   }
-  println(cstr("closed_form_sum FAIL"));
+  println("closed_form_sum FAIL");
   return 1;
 }

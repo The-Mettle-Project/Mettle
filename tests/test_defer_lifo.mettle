@@ -1,7 +1,7 @@
 import "std/io";
 
-fn a() { puts(cstr("A\n")); }
-fn b() { puts(cstr("B\n")); }
+fn a() { puts("A\n"); }
+fn b() { puts("B\n"); }
 
 fn main() -> int32 {
   defer a();

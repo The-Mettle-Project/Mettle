@@ -112,10 +112,10 @@ fn main() -> int32 {
   var OUT: int64 = 4;
 
   // Model parameters (random but reproducible; a real engine loads these).
-  var w1: int8* = (int8*)malloc(H * IN);
-  var b1: int32* = (int32*)malloc(H * 4);
-  var w2: int8* = (int8*)malloc(OUT * H);
-  var b2: int32* = (int32*)malloc(OUT * 4);
+  var w1: int8* = malloc(H * IN);
+  var b1: int32* = malloc(H * 4);
+  var w2: int8* = malloc(OUT * H);
+  var b2: int32* = malloc(OUT * 4);
 
   var i: int64 = 0;
   while (i < H * IN) { w1[i] = (int8)next_byte(); i = i + 1; }
@@ -127,12 +127,12 @@ fn main() -> int32 {
   while (i < OUT) { b2[i] = next_byte() - 128; i = i + 1; }
 
   // Activation buffers.
-  var x: int8* = (int8*)malloc(IN);
-  var h_logits: int32* = (int32*)malloc(H * 4);
-  var h_q: int8* = (int8*)malloc(H);
-  var out_logits: int32* = (int32*)malloc(OUT * 4);
+  var x: int8* = malloc(IN);
+  var h_logits: int32* = malloc(H * 4);
+  var h_q: int8* = malloc(H);
+  var out_logits: int32* = malloc(OUT * 4);
 
-  println(cstr("minimal quantized MLP inference (16 -> 8 -> 4)"));
+  println("minimal quantized MLP inference (16 -> 8 -> 4)");
 
   var sample: int32 = 0;
   while (sample < 4) {
@@ -146,16 +146,16 @@ fn main() -> int32 {
     linear(h_q, H, w2, b2, OUT, out_logits);
     var cls: int32 = argmax(out_logits, OUT);
 
-    print(cstr("sample "));
+    print("sample ");
     print_int((int64)sample);
-    print(cstr(": logits [ "));
+    print(": logits [ ");
     var c: int64 = 0;
     while (c < OUT) {
       print_int((int64)out_logits[c]);
-      print(cstr(" "));
+      print(" ");
       c = c + 1;
     }
-    print(cstr("] -> class "));
+    print("] -> class ");
     println_int((int64)cls);
 
     sample = sample + 1;

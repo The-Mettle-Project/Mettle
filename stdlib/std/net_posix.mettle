@@ -194,15 +194,15 @@ export fn sockaddr_in_posix(ip: cstring, port: int32) -> cstring {
 
   // sin_port at offset 2 (2 bytes, network byte order = big-endian)
   var net_port: int32 = htons(port);
-  buf[2] = net_port;
-  buf[3] = net_port / 256;
+  buf[2] = (uint8)net_port;
+  buf[3] = (uint8)(net_port / 256);
 
   // sin_addr at offset 4 (4 bytes, already in network byte order from inet_addr)
   var addr: int32 = inet_addr(ip);
-  buf[4] = addr;
-  buf[5] = addr / 256;
-  buf[6] = addr / 65536;
-  buf[7] = addr / 16777216;
+  buf[4] = (uint8)addr;
+  buf[5] = (uint8)(addr / 256);
+  buf[6] = (uint8)(addr / 65536);
+  buf[7] = (uint8)(addr / 16777216);
 
   return buf;
 }
@@ -219,8 +219,8 @@ export fn sockaddr_in_any_posix(port: int32) -> cstring {
   buf[1] = 0;
 
   var net_port: int32 = htons(port);
-  buf[2] = net_port;
-  buf[3] = net_port / 256;
+  buf[2] = (uint8)net_port;
+  buf[3] = (uint8)(net_port / 256);
 
   // sin_addr = 0 (INADDR_ANY) – already zeroed by memset
 

@@ -19,13 +19,13 @@
 //
 //   fn work() {
 //     var z: TracyZone = tracy_zone_colored(
-//       cstr("work"), cstr("app.mettle"), 42, cstr("work"), tracy_color_update());
+//       "work", "app.mettle", 42, "work", tracy_color_update());
 //     defer tracy_scope_end(z);
 //     ...
 //   }
 //
 //   fn main() -> int32 {
-//     tracy_plot_setup_number(cstr("frame_ms"), 1, 1, tracy_color_render());
+//     tracy_plot_setup_number("frame_ms", 1, 1, tracy_color_render());
 //     while (running != 0) {
 //       do_frame();
 //       tracy_frame_mark();

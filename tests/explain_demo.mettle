@@ -86,7 +86,7 @@ fn sum_shorts(a: int16*, n: int32) -> int32 {
     for i in 0..n {
         s = s + (int32)a[i];
     }
-    return s;
+    return (int32)s;
 }
 
 // `@noinline` on the callee blocks the loop; the report simulates REMOVING

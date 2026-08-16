@@ -34,7 +34,7 @@ fn step(b: Body*, n: int32) -> int64 {
 }
 
 fn main() -> int32 {
-  var bodies: Body* = (Body*)malloc((int64)N * sizeof(Body));
+  var bodies: Body* = malloc((int64)N * sizeof(Body));
   var i: int32 = 0;
   while (i < N) {
     bodies[i].x = (int64)i;
@@ -47,14 +47,14 @@ fn main() -> int32 {
   var passes: int32 = 2000;
   println("Array-of-structs field walk: 65536 bodies x 2000 passes");
 
-  var t0: uint64 = bench_time_us();
+  var t0: int64 = bench_time_us();
   var acc: int64 = 0;
   var p: int32 = 0;
   while (p < passes) {
     acc = acc ^ step(bodies, N);
     p = p + 1;
   }
-  var elapsed_us: uint64 = bench_time_us() - t0;
+  var elapsed_us: int64 = bench_time_us() - t0;
 
   print("Checksum = ");
   println_int(acc);
@@ -62,6 +62,6 @@ fn main() -> int32 {
   print_int(elapsed_us);
   println(" us");
 
-  free((cstring)bodies);
+  free(bodies);
   return 0;
 }

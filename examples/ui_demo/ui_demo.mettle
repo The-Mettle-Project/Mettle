@@ -190,7 +190,7 @@ fn sort_doc_paths() {
 
 fn probe_docs_root(candidate: cstring) -> int32 {
   var marker: uint8[640];
-  path_join(candidate, cstr("LANGUAGE.md"), &marker[0], 640);
+  path_join(candidate, "LANGUAGE.md", &marker[0], 640);
   if (file_exists(&marker[0]) != 0) {
     cstr_copy(g_doc_root, candidate, 512);
     return 1;
@@ -199,16 +199,16 @@ fn probe_docs_root(candidate: cstring) -> int32 {
 }
 
 fn resolve_docs_root() -> int32 {
-  if (probe_docs_root(cstr("docs")) != 0) { return 1; }
-  if (probe_docs_root(cstr("..\\docs")) != 0) { return 1; }
-  if (probe_docs_root(cstr("..\\..\\docs")) != 0) { return 1; }
+  if (probe_docs_root("docs") != 0) { return 1; }
+  if (probe_docs_root("..\\docs") != 0) { return 1; }
+  if (probe_docs_root("..\\..\\docs") != 0) { return 1; }
 
   var cwd: uint8[512];
   if (getcwd(&cwd[0], 512) == 0) {
     var joined: uint8[640];
-    path_join(&cwd[0], cstr("docs"), &joined[0], 640);
+    path_join(&cwd[0], "docs", &joined[0], 640);
     if (probe_docs_root(&joined[0]) != 0) { return 1; }
-    path_join(&cwd[0], cstr("..\\docs"), &joined[0], 640);
+    path_join(&cwd[0], "..\\docs", &joined[0], 640);
     if (probe_docs_root(&joined[0]) != 0) { return 1; }
   }
   return 0;
@@ -279,7 +279,7 @@ fn doc_line_at(line_index: int32, out: cstring, out_len: int32) -> int32 {
   return out_pos;
 }
 
-fn cstr_len(text: cstring) -> int32 {
+fn ui_text_len(text: cstring) -> int32 {
   var i: int32 = 0;
   while (text[i] != 0) {
     i = i + 1;
@@ -343,20 +343,20 @@ fn display_strip_cr() {
 }
 
 fn md_heading_level(text: cstring) -> int32 {
-  if (cstr_starts_with(text, cstr("### ")) != 0) { return 3; }
-  if (cstr_starts_with(text, cstr("## ")) != 0) { return 2; }
-  if (cstr_starts_with(text, cstr("# ")) != 0) { return 1; }
+  if (cstr_starts_with(text, "### ") != 0) { return 3; }
+  if (cstr_starts_with(text, "## ") != 0) { return 2; }
+  if (cstr_starts_with(text, "# ") != 0) { return 1; }
   return 0;
 }
 
 fn md_strip_heading_prefix(text: cstring, out: cstring, out_len: int32) {
   var skip: int32 = 0;
-  if (cstr_starts_with(text, cstr("### ")) != 0) { skip = 4; }
-  else if (cstr_starts_with(text, cstr("## ")) != 0) { skip = 3; }
-  else if (cstr_starts_with(text, cstr("# ")) != 0) { skip = 2; }
-  else if (cstr_starts_with(text, cstr("- ")) != 0) { skip = 2; }
-  else if (cstr_starts_with(text, cstr("* ")) != 0) { skip = 2; }
-  else if (cstr_starts_with(text, cstr("> ")) != 0) { skip = 2; }
+  if (cstr_starts_with(text, "### ") != 0) { skip = 4; }
+  else if (cstr_starts_with(text, "## ") != 0) { skip = 3; }
+  else if (cstr_starts_with(text, "# ") != 0) { skip = 2; }
+  else if (cstr_starts_with(text, "- ") != 0) { skip = 2; }
+  else if (cstr_starts_with(text, "* ") != 0) { skip = 2; }
+  else if (cstr_starts_with(text, "> ") != 0) { skip = 2; }
   var i: int32 = 0;
   while (text[skip + i] != 0 && i + 1 < out_len) {
     out[i] = text[skip + i];
@@ -426,7 +426,7 @@ fn format_markdown_for_viewer() {
   while (line < g_doc_lines) {
     doc_line_at(line, &line_buf[0], 2048);
 
-    if (cstr_starts_with(&line_buf[0], cstr("```")) != 0) {
+    if (cstr_starts_with(&line_buf[0], "```") != 0) {
       if (in_code != 0) {
         in_code = 0;
         display_append_crlf();
@@ -439,7 +439,7 @@ fn format_markdown_for_viewer() {
     }
 
     if (in_code != 0) {
-      display_append_text(cstr("    "));
+      display_append_text("    ");
       display_append_text(&line_buf[0]);
       display_append_crlf();
       line = line + 1;
@@ -454,7 +454,7 @@ fn format_markdown_for_viewer() {
 
     if (md_is_rule(&line_buf[0]) != 0) {
       display_append_crlf();
-      display_append_text(cstr("----------------------------------------"));
+      display_append_text("----------------------------------------");
       display_append_crlf();
       line = line + 1;
       continue;
@@ -479,10 +479,10 @@ fn format_markdown_for_viewer() {
       continue;
     }
 
-    if (cstr_starts_with(&line_buf[0], cstr("- ")) != 0 || cstr_starts_with(&line_buf[0], cstr("* ")) != 0) {
+    if (cstr_starts_with(&line_buf[0], "- ") != 0 || cstr_starts_with(&line_buf[0], "* ") != 0) {
       md_strip_heading_prefix(&line_buf[0], &cleaned[0], 2048);
       md_strip_inline(&cleaned[0]);
-      display_append_text(cstr("  - "));
+      display_append_text("  - ");
       display_append_text(&cleaned[0]);
       display_append_crlf();
       line = line + 1;
@@ -492,7 +492,7 @@ fn format_markdown_for_viewer() {
     if (md_is_ordered_item(&line_buf[0]) != 0) {
       cstr_copy(&cleaned[0], &line_buf[0], 2048);
       md_strip_inline(&cleaned[0]);
-      display_append_text(cstr("  "));
+      display_append_text("  ");
       display_append_text(&cleaned[0]);
       display_append_crlf();
       line = line + 1;
@@ -508,10 +508,10 @@ fn format_markdown_for_viewer() {
       continue;
     }
 
-    if (cstr_starts_with(&line_buf[0], cstr("> ")) != 0) {
+    if (cstr_starts_with(&line_buf[0], "> ") != 0) {
       md_strip_heading_prefix(&line_buf[0], &cleaned[0], 2048);
       md_strip_inline(&cleaned[0]);
-      display_append_text(cstr("  > "));
+      display_append_text("  > ");
       display_append_text(&cleaned[0]);
       display_append_crlf();
       line = line + 1;
@@ -599,9 +599,9 @@ fn load_doc(index: int32) -> int32 {
   path_join(g_doc_root, rel, &full[0], 768);
   cstr_copy(g_current_rel, rel, 512);
 
-  var fp: cstring = fopen(&full[0], cstr("rb"));
+  var fp: cstring = fopen(&full[0], "rb");
   if (fp == 0) {
-    set_status(cstr("Could not open document."));
+    set_status("Could not open document.");
     display_reset();
     g_display_lines = 0;
     g_viewer_scroll = 0;
@@ -618,7 +618,7 @@ fn load_doc(index: int32) -> int32 {
     g_display_lines = 0;
     g_viewer_scroll = 0;
     g_viewer_content_height = 0;
-    set_status(cstr("Document is empty."));
+    set_status("Document is empty.");
     invalidate_after_doc_load();
     return 0;
   }
@@ -907,7 +907,7 @@ fn md_is_table_sep(text: cstring) -> int32 {
 }
 
 fn viewer_classify_line(raw: cstring, in_code: int32) -> int32 {
-  if (cstr_starts_with(raw, cstr("```")) != 0) {
+  if (cstr_starts_with(raw, "```") != 0) {
     return VIEWER_KIND_FENCE();
   }
   if (in_code != 0) {
@@ -923,13 +923,13 @@ fn viewer_classify_line(raw: cstring, in_code: int32) -> int32 {
   if (level == 1) { return VIEWER_KIND_H1(); }
   if (level == 2) { return VIEWER_KIND_H2(); }
   if (level == 3) { return VIEWER_KIND_H3(); }
-  if (cstr_starts_with(raw, cstr("- ")) != 0 || cstr_starts_with(raw, cstr("* ")) != 0) {
+  if (cstr_starts_with(raw, "- ") != 0 || cstr_starts_with(raw, "* ") != 0) {
     return VIEWER_KIND_BULLET();
   }
   if (md_is_ordered_item(raw) != 0) {
     return VIEWER_KIND_ORDERED();
   }
-  if (cstr_starts_with(raw, cstr("> ")) != 0) {
+  if (cstr_starts_with(raw, "> ") != 0) {
     return VIEWER_KIND_QUOTE();
   }
   if (md_is_table_sep(raw) != 0) {
@@ -944,7 +944,7 @@ fn viewer_classify_line(raw: cstring, in_code: int32) -> int32 {
 fn viewer_wrap_line_height(text: cstring, indent: int32) -> int32 {
   var width: int32 = viewer_text_right() - viewer_text_left() - indent;
   if (width < 120) { width = 120; }
-  var len: int32 = cstr_len(text);
+  var len: int32 = ui_text_len(text);
   if (len <= 0) { return 10; }
   var chars_per_line: int32 = width / 8;
   if (chars_per_line < 24) { chars_per_line = 24; }
@@ -1329,7 +1329,7 @@ fn draw_viewer_content(hdc: int64, theme: UiTheme) {
     text_rect = ui_make_rect(viewer_text_left(), top, viewer_text_right(), top + 24);
     ui_draw_text_rect_color(
       hdc, &text_rect,
-      cstr("Select a document from the sidebar."),
+      "Select a document from the sidebar.",
       theme.muted_text,
       UI_DT_LEFT() | UI_DT_SINGLELINE());
     return;
@@ -1417,39 +1417,39 @@ fn utf8_normalize_ascii(src: cstring, out: cstring, out_len: int32) {
 
     if (b0 == 226 && b1 == 128) {
       if (b2 == 148) {
-        write = utf8_copy_chunk(out, out_len, write, cstr(" - "));
+        write = utf8_copy_chunk(out, out_len, write, " - ");
         read = read + 3;
         continue;
       }
       if (b2 == 147) {
-        write = utf8_copy_chunk(out, out_len, write, cstr("-"));
+        write = utf8_copy_chunk(out, out_len, write, "-");
         read = read + 3;
         continue;
       }
       if (b2 == 153 || b2 == 152) {
-        write = utf8_copy_chunk(out, out_len, write, cstr("'"));
+        write = utf8_copy_chunk(out, out_len, write, "'");
         read = read + 3;
         continue;
       }
       if (b2 == 156 || b2 == 157) {
-        write = utf8_copy_chunk(out, out_len, write, cstr("\""));
+        write = utf8_copy_chunk(out, out_len, write, "\"");
         read = read + 3;
         continue;
       }
       if (b2 == 166) {
-        write = utf8_copy_chunk(out, out_len, write, cstr("..."));
+        write = utf8_copy_chunk(out, out_len, write, "...");
         read = read + 3;
         continue;
       }
       if (b2 == 162) {
-        write = utf8_copy_chunk(out, out_len, write, cstr("-"));
+        write = utf8_copy_chunk(out, out_len, write, "-");
         read = read + 3;
         continue;
       }
     }
 
     if (b0 == 226 && b1 == 134 && b2 == 146) {
-      write = utf8_copy_chunk(out, out_len, write, cstr("->"));
+      write = utf8_copy_chunk(out, out_len, write, "->");
       read = read + 3;
       continue;
     }
@@ -1576,12 +1576,12 @@ fn draw_sidebar_docs(hdc: int64, theme: UiTheme) {
 fn build_menu(hwnd: int64) {
   var menu: int64 = ui_menu_create();
   var file_menu: int64 = ui_menu_popup_create();
-  ui_menu_append_item(file_menu, ID_RELOAD(), cstr("Reload docs\tF5"));
+  ui_menu_append_item(file_menu, ID_RELOAD(), "Reload docs\tF5");
   ui_menu_append_separator(file_menu);
-  ui_menu_append_item(file_menu, ID_ABOUT(), cstr("About"));
+  ui_menu_append_item(file_menu, ID_ABOUT(), "About");
   ui_menu_append_separator(file_menu);
-  ui_menu_append_item(file_menu, ID_EXIT(), cstr("Exit\tEsc"));
-  ui_menu_append_popup(menu, file_menu, cstr("File"));
+  ui_menu_append_item(file_menu, ID_EXIT(), "Exit\tEsc");
+  ui_menu_append_popup(menu, file_menu, "File");
   ui_window_set_menu(hwnd, menu);
 }
 
@@ -1613,15 +1613,15 @@ fn compute_layout(hwnd: int64) {
 }
 
 fn build_controls(hwnd: int64) {
-  g_status_label = ui_label_create(hwnd, 0, 0, 400, 22, cstr("Loading docs..."), ID_STATUS());
+  g_status_label = ui_label_create(hwnd, 0, 0, 400, 22, "Loading docs...", ID_STATUS());
   g_theme_combo = ui_combobox_create(hwnd, 0, 0, 180, 160, ID_THEME());
 
   ui_control_set_font(g_status_label, g_small_font);
   ui_control_set_font(g_theme_combo, g_body_font);
 
-  ui_combobox_add(g_theme_combo, cstr("Blue"));
-  ui_combobox_add(g_theme_combo, cstr("Cyan"));
-  ui_combobox_add(g_theme_combo, cstr("Violet"));
+  ui_combobox_add(g_theme_combo, "Blue");
+  ui_combobox_add(g_theme_combo, "Cyan");
+  ui_combobox_add(g_theme_combo, "Violet");
   ui_combobox_select(g_theme_combo, 0);
 
   compute_layout(hwnd);
@@ -1641,13 +1641,13 @@ fn paint_client(hdc: int64) {
 
   var old_font: int64 = ui_select_object(hdc, g_title_font);
   var title_rect: UiRect = ui_make_rect(hero.left + 22, hero.top + 16, hero.right - 220, hero.top + 52);
-  ui_draw_text_rect_color(hdc, &title_rect, cstr("Mettle Documentation"), theme.accent_text, UI_DT_LEFT() | UI_DT_SINGLELINE());
+  ui_draw_text_rect_color(hdc, &title_rect, "Mettle Documentation", theme.accent_text, UI_DT_LEFT() | UI_DT_SINGLELINE());
   ui_select_object(hdc, old_font);
 
   var subtitle: UiRect = ui_make_rect(hero.left + 24, hero.top + 56, hero.right - 220, hero.bottom - 14);
   ui_draw_text_rect_color(
     hdc, &subtitle,
-    cstr("Browse docs/ from disk with native scrolling, wrapped prose, and readable headings."),
+    "Browse docs/ from disk with native scrolling, wrapped prose, and readable headings.",
     ui_rgb(229, 241, 255),
     UI_DT_LEFT() | UI_DT_WORDBREAK());
 
@@ -1666,7 +1666,7 @@ fn paint_client(hdc: int64) {
 
   old_font = ui_select_object(hdc, g_small_font);
   var sidebar_title: UiRect = ui_make_rect(g_content_left + 16, g_viewer_top + 12, g_sidebar_right - 12, g_viewer_top + 28);
-  ui_draw_text_rect_color(hdc, &sidebar_title, cstr("Documents"), theme.muted_text, UI_DT_SINGLELINE());
+  ui_draw_text_rect_color(hdc, &sidebar_title, "Documents", theme.muted_text, UI_DT_SINGLELINE());
   ui_select_object(hdc, old_font);
 
   draw_sidebar_docs(hdc, theme);
@@ -1704,11 +1704,11 @@ fn on_paint(hwnd: int64) {
 fn reload_docs() -> int32 {
   var keep_index: int32 = g_selected_doc;
   if (resolve_docs_root() == 0) {
-    set_status(cstr("Could not locate docs/ (expected LANGUAGE.md)."));
+    set_status("Could not locate docs/ (expected LANGUAGE.md).");
     return 0;
   }
   if (scan_docs() <= 0) {
-    set_status(cstr("No Markdown files found under docs/."));
+    set_status("No Markdown files found under docs/.");
     return 0;
   }
   if (keep_index < 0) { keep_index = 0; }
@@ -1782,8 +1782,8 @@ fn window_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 
     if (id == (uint32)ID_RELOAD()) { reload_docs(); return 0; }
     if (id == (uint32)ID_ABOUT()) {
       ui_alert(
-        hwnd, cstr("Mettle Documentation Browser"),
-        cstr("Click a document in the sidebar to open it.\nThe viewer converts Markdown to readable text.\nF5 reloads the catalog."));
+        hwnd, "Mettle Documentation Browser",
+        "Click a document in the sidebar to open it.\nThe viewer converts Markdown to readable text.\nF5 reloads the catalog.");
       return 0;
     }
 
@@ -1847,15 +1847,15 @@ fn main() -> int32 {
   if (ui_init() == 0) { return 1; }
   if (alloc_buffers() == 0) { return 1; }
 
-  g_title_font = ui_create_font(28, cstr("Segoe UI"), UI_FW_BOLD());
-  g_h1_font = ui_create_font(24, cstr("Segoe UI"), UI_FW_BOLD());
-  g_h2_font = ui_create_font(20, cstr("Segoe UI"), UI_FW_BOLD());
-  g_h3_font = ui_create_font(17, cstr("Segoe UI"), UI_FW_BOLD());
-  g_body_font = ui_create_font(16, cstr("Segoe UI"), UI_FW_NORMAL());
-  g_code_font = ui_create_font(14, cstr("Consolas"), UI_FW_NORMAL());
-  g_small_font = ui_create_font(13, cstr("Segoe UI"), UI_FW_NORMAL());
+  g_title_font = ui_create_font(28, "Segoe UI", UI_FW_BOLD());
+  g_h1_font = ui_create_font(24, "Segoe UI", UI_FW_BOLD());
+  g_h2_font = ui_create_font(20, "Segoe UI", UI_FW_BOLD());
+  g_h3_font = ui_create_font(17, "Segoe UI", UI_FW_BOLD());
+  g_body_font = ui_create_font(16, "Segoe UI", UI_FW_NORMAL());
+  g_code_font = ui_create_font(14, "Consolas", UI_FW_NORMAL());
+  g_small_font = ui_create_font(13, "Segoe UI", UI_FW_NORMAL());
 
-  g_main_window = ui_window_create_centered(cstr("Mettle Documentation"), 1080, 760, &window_proc);
+  g_main_window = ui_window_create_centered("Mettle Documentation", 1080, 760, &window_proc);
   if (g_main_window == 0) { return 2; }
 
   build_menu(g_main_window);
@@ -1863,7 +1863,7 @@ fn main() -> int32 {
   ui_window_show(g_main_window);
 
   if (reload_docs() == 0) {
-    set_status(cstr("Run from the repository root so docs/ can be found."));
+    set_status("Run from the repository root so docs/ can be found.");
   }
 
   return ui_run_message_loop();

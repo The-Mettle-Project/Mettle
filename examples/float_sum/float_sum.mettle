@@ -32,20 +32,20 @@ fn sum_array(a: float64*, n: int32) -> float64 {
 }
 
 fn main() -> int32 {
-  var a: float64* = (float64*)malloc((int64)N * 8);
+  var a: float64* = malloc((int64)N * 8);
   fill(a, N);
 
   var passes: int32 = 4000;
   println("float64 sum reduction: 65536 elems x 4000 passes");
 
-  var t0: uint64 = bench_time_us();
+  var t0: int64 = bench_time_us();
   var acc: float64 = 0.0;
   var p: int32 = 0;
   while (p < passes) {
     acc = acc + sum_array(a, N);
     p = p + 1;
   }
-  var elapsed_us: uint64 = bench_time_us() - t0;
+  var elapsed_us: int64 = bench_time_us() - t0;
 
   print("Checksum = ");
   println_int((int64)acc);
@@ -54,6 +54,6 @@ fn main() -> int32 {
   print_int(elapsed_us);
   println(" us");
 
-  free((cstring)a);
+  free(a);
   return 0;
 }

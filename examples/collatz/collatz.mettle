@@ -25,8 +25,7 @@ fn collatz_steps(n: int64) -> int64 {
 }
 
 fn main() -> int32 {
-  var header: string = "Collatz: sum of steps for n=1..100000";
-  println(cstr(header));
+  println("Collatz: sum of steps for n=1..100000");
 
   var sum: int64 = 0;
   var n: int64 = 1;
@@ -34,15 +33,13 @@ fn main() -> int32 {
     sum = sum + collatz_steps(n);
     n = n + 1;
   }
-  var result_str: string = "Sum (1..100000) = ";
-  print(cstr(result_str));
+  print("Sum (1..100000) = ");
   println_int(sum);
 
   var passes: int32 = 10;
-  var bench_header: string = "Benchmark: 10 passes (sum steps 1..100000 each)";
-  println(cstr(bench_header));
+  println("Benchmark: 10 passes (sum steps 1..100000 each)");
 
-  var t0: uint64 = bench_time_us();
+  var t0: int64 = bench_time_us();
   var p: int32 = 0;
   var bench_sum: int64 = 0;
   while (p < passes) {
@@ -53,22 +50,19 @@ fn main() -> int32 {
     }
     p = p + 1;
   }
-  var elapsed_us: uint64 = bench_time_us() - t0;
+  var elapsed_us: int64 = bench_time_us() - t0;
 
-  var sum_str: string = "Bench sum = ";
-  print(cstr(sum_str));
+  print("Bench sum = ");
   println_int(bench_sum);
 
-  var time_str: string = "Time: ";
-  print(cstr(time_str));
+  print("Time: ");
   print_int(elapsed_us);
-  println(cstr(" us"));
+  println(" us");
 
-  var per_pass: uint64 = elapsed_us / passes;
-  var us_str: string = "Per pass: ~";
-  print(cstr(us_str));
+  var per_pass: int64 = elapsed_us / passes;
+  print("Per pass: ~");
   print_int(per_pass);
-  println(cstr(" us"));
+  println(" us");
 
   return 0;
 }

@@ -7,15 +7,15 @@ fn main() -> int32 {
   var b: float32 = single_exit(0x3FC0);
   var c: float32 = with_early_return(0x3FC0);
   var d: float64 = with_early_return_f64(0x3FC0);
-  if (a < 1.49 || a > 1.51) { println(cstr("shadow_global no_branch WRONG")); return 1; }
-  if (b < 1.49 || b > 1.51) { println(cstr("shadow_global single_exit WRONG")); return 2; }
-  if (c < 1.49 || c > 1.51) { println(cstr("shadow_global early_return WRONG")); return 3; }
-  if (d < 1.49 || d > 1.51) { println(cstr("shadow_global early_return_f64 WRONG")); return 4; }
+  if (a < 1.49 || a > 1.51) { println("shadow_global no_branch WRONG"); return 1; }
+  if (b < 1.49 || b > 1.51) { println("shadow_global single_exit WRONG"); return 2; }
+  if (c < 1.49 || c > 1.51) { println("shadow_global early_return WRONG"); return 3; }
+  if (d < 1.49 || d > 1.51) { println("shadow_global early_return_f64 WRONG"); return 4; }
 
   var v: float32 = shadows_a_global_var(0x3FC0);
-  if (v < 1.49 || v > 1.51) { println(cstr("shadow_global shadowing WRONG")); return 5; }
+  if (v < 1.49 || v > 1.51) { println("shadow_global shadowing WRONG"); return 5; }
   if (gcounter != 7) {
-    print(cstr("shadow_global CLOBBERED gcounter="));
+    print("shadow_global CLOBBERED gcounter=");
     print_int(gcounter);
     newline();
     fflush(get_stdout());
@@ -25,14 +25,14 @@ fn main() -> int32 {
   bump(5);
   bump(6);
   if (gcounter != 18) {
-    print(cstr("shadow_global promotion BROKEN gcounter="));
+    print("shadow_global promotion BROKEN gcounter=");
     print_int(gcounter);
     newline();
     fflush(get_stdout());
     return 7;
   }
 
-  println(cstr("local_shadows_global OK"));
+  println("local_shadows_global OK");
   fflush(get_stdout());
   return 0;
 }

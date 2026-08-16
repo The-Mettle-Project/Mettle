@@ -38,9 +38,9 @@ fn write_i64(v: int64) {
 
 fn line_i64(label: cstring, v: int64) {
   write_s(label);
-  write_s(cstr(" "));
+  write_s(" ");
   write_i64(v);
-  write_s(cstr("\n"));
+  write_s("\n");
 }
 
 fn small4_value(s: Small4) -> int32 {
@@ -84,24 +84,24 @@ fn nested_big_sum() -> int32 {
 }
 
 fn main() -> int32 {
-  write_s(cstr("struct abi matrix\n"));
+  write_s("struct abi matrix\n");
 
   var s4: Small4;
   s4.a = 41;
-  line_i64(cstr("small4"), (int64)small4_value(s4));
+  line_i64("small4", (int64)small4_value(s4));
 
   var s8: Small8;
   s8.a = 11;
   s8.b = 22;
-  line_i64(cstr("small8"), (int64)small8_sum(s8));
+  line_i64("small8", (int64)small8_sum(s8));
 
   var odd: Odd3 = make_odd3(5, 6, 7);
-  line_i64(cstr("odd3"), (int64)odd3_sum(odd));
-  line_i64(cstr("odd3_return"), (int64)odd3_sum(make_odd3(9, 10, 11)));
+  line_i64("odd3", (int64)odd3_sum(odd));
+  line_i64("odd3_return", (int64)odd3_sum(make_odd3(9, 10, 11)));
 
   var big: Big3 = make_big(10, 20, 30);
-  line_i64(cstr("value_receiver_total"), (int64)value_receiver_total(big));
-  line_i64(cstr("nested_big"), (int64)nested_big_sum());
+  line_i64("value_receiver_total", (int64)value_receiver_total(big));
+  line_i64("nested_big", (int64)nested_big_sum());
 
   return 0;
 }

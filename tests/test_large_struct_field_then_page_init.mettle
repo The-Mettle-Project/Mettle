@@ -63,7 +63,7 @@ struct Db {
 }
 
 fn cache_load(db: Db*, page_id: int64) -> int32 {
-  db[0].data_fp = fopen("nul", cstr("r+b"));
+  db[0].data_fp = fopen("nul", "r+b");
   page_init_buf(&db[0].cache[0].data[0], page_id, 2);
   return 0;
 }

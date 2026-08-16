@@ -5,7 +5,7 @@ fn main() -> int32 {
   var b: uint32 = 3;
   var q: uint32 = a / b;
   var u8: uint8 = 255;
-  var q2: uint32 = u8 / 10;
+  var q2: uint32 = (uint32)u8 / 10;
   if (q == 3 && q2 == 25) {
     return 1;
   }

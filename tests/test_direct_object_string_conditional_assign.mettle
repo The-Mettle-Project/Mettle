@@ -11,6 +11,6 @@ fn emit_label(flag: int32) {
 fn main() -> int32 {
   emit_label(0);
   emit_label(1);
-  print(cstr("\n"));
+  print("\n");
   return 0;
 }

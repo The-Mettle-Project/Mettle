@@ -7,19 +7,19 @@ fn main() -> int64 {
   var r: int64 = 0;
 
   var wide: int64 = 4294967297;      // 0x1_0000_0001
-  var narrow: int32 = wide;
+  var narrow: int32 = (int32)wide;
   if (narrow == 1) { r = r + 1; }
 
   var a: int8 = 127;
-  var b: int8 = a + 1;               // two's complement wrap
+  var b: int8 = (int8)(a + 1);       // two's complement wrap
   if (b == -128) { r = r + 2; }
 
   var c: int8 = -128;
-  var d: int8 = c - 1;
+  var d: int8 = (int8)(c - 1);
   if (d == 127) { r = r + 4; }
 
   var u: uint8 = 250;
-  var v: uint8 = u + 10;             // wraps to 4, zero-extended
+  var v: uint8 = (uint8)(u + 10);    // wraps to 4, zero-extended
   if (v == 4) { r = r + 8; }
 
   if (widen(b) == -128) { r = r + 16; }   // narrow parameter sign-extends

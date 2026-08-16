@@ -28,7 +28,7 @@ fn build_list(nodes: cstring, order: int32*, count: int32) {
 fn main() -> int32 {
   var count: int32 = 64;
   var nodes: cstring = malloc((int64)count * NODE_BYTES);
-  var order: int32* = (int32*)malloc((int64)count * 4);
+  var order: int32* = malloc((int64)count * 4);
   if (nodes == 0 || order == 0) {
     println("malloc failed");
     return 1;
@@ -54,6 +54,6 @@ fn main() -> int32 {
 
   println("ptr_induction_two_loops OK");
   free(nodes);
-  free((cstring)order);
+  free(order);
   return 0;
 }

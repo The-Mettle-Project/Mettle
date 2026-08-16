@@ -26,26 +26,26 @@ fn transpose(a: int32*, b: int32*) {
 }
 
 fn main() -> int32 {
-  var a: int32* = (int32*)malloc((int64)N * N * 4);
-  var b: int32* = (int32*)malloc((int64)N * N * 4);
+  var a: int32* = malloc((int64)N * N * 4);
+  var b: int32* = malloc((int64)N * N * 4);
   var k: int32 = 0;
   while (k < N * N) {
-    a[k] = k * 2654435761;
+    a[k] = (int32)(k * 2654435761);
     k = k + 1;
   }
 
   var passes: int32 = 4000;
   println("256x256 int32 transpose x 4000 passes");
 
-  var t0: uint64 = bench_time_us();
+  var t0: int64 = bench_time_us();
   var acc: int64 = 0;
   var p: int32 = 0;
   while (p < passes) {
     transpose(a, b);
-    acc = acc + (int64)b[(N - 1) * N + 1] + (int64)b[N + (N - 1)];
+    acc = acc + b[(N - 1) * N + 1] + b[N + (N - 1)];
     p = p + 1;
   }
-  var elapsed_us: uint64 = bench_time_us() - t0;
+  var elapsed_us: int64 = bench_time_us() - t0;
 
   print("Checksum = ");
   println_int(acc);
@@ -53,7 +53,7 @@ fn main() -> int32 {
   print_int(elapsed_us);
   println(" us");
 
-  free((cstring)a);
-  free((cstring)b);
+  free(a);
+  free(b);
   return 0;
 }

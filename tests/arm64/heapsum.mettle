@@ -3,14 +3,14 @@
 import "std/mem";
 fn main() -> int64 {
   var n: int64 = 16;
-  var p: int64* = (int64*)malloc(n * 8);
+  var p: int64* = malloc(n * 8);
   var i: int64 = 0;
   while (i < n) { p[i] = i * i; i = i + 1; }
   var total: int64 = 0;
   i = 0;
   while (i < n) { total = total + p[i]; i = i + 1; }
-  free((cstring)p);
-  var q: int64* = (int64*)malloc(64);
+  free(p);
+  var q: int64* = malloc(64);
   q[0] = total;
   return q[0] % 251;
 }

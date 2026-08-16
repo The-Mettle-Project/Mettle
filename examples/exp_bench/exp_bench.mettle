@@ -17,16 +17,16 @@ fn fill(a: float32*, n: int64, v: float32) {
 
 fn main() -> int32 {
   var n: int64 = 65536;
-  var a: float32* = (float32*)malloc(n * 4);
-  var t0: uint64 = bench_time_us();
+  var a: float32* = malloc(n * 4);
+  var t0: int64 = bench_time_us();
   var p: int32 = 0;
   while (p < 4000) {
     fill(a, n, 0.3);
     exp_array(a, n);
     p = p + 1;
   }
-  var elapsed: uint64 = bench_time_us() - t0;
-  print(cstr("a0 x1e6 = ")); println_int((int64)(a[0] * 1000000.0));
-  print(cstr("Time: ")); print_int(elapsed); println(cstr(" us"));
+  var elapsed: int64 = bench_time_us() - t0;
+  print("a0 x1e6 = "); println_int((int64)(a[0] * 1000000.0));
+  print("Time: "); print_int(elapsed); println(" us");
   return 0;
 }

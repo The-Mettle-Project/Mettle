@@ -11,9 +11,9 @@ import "std/mem";
 import "std/bench";
 
 var pattern: string = "ERROR";
-var pattern_len: int64 = 5;
-var pattern_u64: uint64 = 0x524F525245;
-var pattern_mask: uint64 = 0xFFFFFFFFFF;
+const pattern_len: int64 = 5;
+const pattern_u64: uint64 = 0x524F525245;
+const pattern_mask: uint64 = 0xFFFFFFFFFF;
 
 fn pattern_matches(buf: cstring, i: int64, len: int64) -> int32 {
   if (i + pattern_len > len) {
@@ -27,7 +27,7 @@ fn pattern_matches(buf: cstring, i: int64, len: int64) -> int32 {
     }
     return 0;
   }
-  if (memcmp(buf + i, cstr(pattern), pattern_len) == 0) {
+  if (memcmp(buf + i, pattern, pattern_len) == 0) {
     return 1;
   }
   return 0;
@@ -63,7 +63,7 @@ fn main() -> int32 {
 
   var buf: cstring = malloc(buf_size);
   if (buf == 0) {
-    println(cstr("malloc failed"));
+    println("malloc failed");
     return 1;
   }
 
@@ -75,22 +75,19 @@ fn main() -> int32 {
     if (pos + chunk > buf_size) {
       chunk = buf_size - pos;
     }
-    memcpy(buf + pos, cstr(block), chunk);
+    memcpy(buf + pos, block, chunk);
     pos = pos + chunk;
   }
 
   var matches: int64 = grep_count(buf, buf_size);
 
-  var header: string = "Grep: count lines containing ERROR (1 MiB log buffer)";
-  println(cstr(header));
-  var result_str: string = "Matches = ";
-  print(cstr(result_str));
+  println("Grep: count lines containing ERROR (1 MiB log buffer)");
+  print("Matches = ");
   println_int(matches);
 
-  var bench_header: string = "Benchmark: 200 passes (grep_count)";
-  println(cstr(bench_header));
+  println("Benchmark: 200 passes (grep_count)");
 
-  var t0: uint64 = bench_time_us();
+  var t0: int64 = bench_time_us();
   var total: int64 = 0;
   var p: int32 = 0;
   while (p < passes) {
@@ -98,22 +95,19 @@ fn main() -> int32 {
     total = total + grep_count(buf + off, buf_size - off);
     p = p + 1;
   }
-  var elapsed_us: uint64 = bench_time_us() - t0;
+  var elapsed_us: int64 = bench_time_us() - t0;
 
-  var sum_str: string = "Total matches = ";
-  print(cstr(sum_str));
+  print("Total matches = ");
   println_int(total);
 
-  var time_str: string = "Time: ";
-  print(cstr(time_str));
+  print("Time: ");
   print_int(elapsed_us);
-  println(cstr(" us"));
+  println(" us");
 
-  var per_pass: uint64 = elapsed_us / passes;
-  var us_str: string = "Per pass: ~";
-  print(cstr(us_str));
+  var per_pass: int64 = elapsed_us / passes;
+  print("Per pass: ~");
   print_int(per_pass);
-  println(cstr(" us"));
+  println(" us");
 
   free(buf);
   return 0;

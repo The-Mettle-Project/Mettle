@@ -3,7 +3,7 @@ import "std/io";
 extern fn memcpy(dst: cstring, src: cstring, len: int32) -> cstring = "memcpy";
 
 fn main() -> int32 {
-  var s: cstring = cstr("ABCDEFGH");
+  var s: cstring = "ABCDEFGH";
   var p: cstring = s + 2;
   if (p[0] != 67) {
     return 1;

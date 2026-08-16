@@ -16,27 +16,27 @@ fn forward(off: int64) {
   var l: int64 = 0;
   while (l < 1) {
     load_f32(off, 3840, SNW);
-    print(cstr("[forward] SNW[0..3]*1e4= ")); var z: int64 = 0;
-    while (z < 4) { print_int((int64)(SNW[z]*10000.0)); print(cstr(" ")); z = z + 1; }
-    println(cstr(""));
+    print("[forward] SNW[0..3]*1e4= "); var z: int64 = 0;
+    while (z < 4) { print_int((int64)(SNW[z]*10000.0)); print(" "); z = z + 1; }
+    println("");
     l = l + 1;
   }
-  print_int(a+b+c+d+e+f+g+h); println(cstr(""));
+  print_int(a+b+c+d+e+f+g+h); println("");
 }
 
 fn main() -> int32 {
   WR = malloc(6000000000);
-  if (WR == 0) { println(cstr("malloc failed")); return 1; }
-  SNW = (float32*)malloc(4*4096);
+  if (WR == 0) { println("malloc failed"); return 1; }
+  SNW = malloc(4*4096);
   var off: int64 = 830194688;
   var p: float32* = (float32*)(&WR[off]);
   p[0] = 17.875; p[1] = 30.375; p[2] = 0.0; p[3] = 16.125;
-  print(cstr("[main] WR=")); print_int((int64)WR); println(cstr(""));
+  print("[main] WR="); print_int((int64)WR); println("");
 
   load_f32(off, 3840, SNW);
-  print(cstr("[main] load_f32 SNW[0..3]*1e4= ")); var z: int64 = 0;
-  while (z < 4) { print_int((int64)(SNW[z]*10000.0)); print(cstr(" ")); z = z + 1; }
-  println(cstr(""));
+  print("[main] load_f32 SNW[0..3]*1e4= "); var z: int64 = 0;
+  while (z < 4) { print_int((int64)(SNW[z]*10000.0)); print(" "); z = z + 1; }
+  println("");
 
   forward(off);
   return 0;

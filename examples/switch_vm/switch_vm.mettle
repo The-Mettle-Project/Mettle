@@ -49,8 +49,8 @@ fn run(ops: int32*, args: int64*) -> int64 {
 }
 
 fn main() -> int32 {
-  var ops: int32* = (int32*)malloc((int64)PROG * 4);
-  var args: int64* = (int64*)malloc((int64)PROG * 8);
+  var ops: int32* = malloc((int64)PROG * 4);
+  var args: int64* = malloc((int64)PROG * 8);
   var seed: int64 = 12345;
   var k: int32 = 0;
   while (k < PROG) {
@@ -63,14 +63,14 @@ fn main() -> int32 {
   var passes: int32 = 30000;
   println("Bytecode VM switch dispatch, 4096 ops x 30000 passes");
 
-  var t0: uint64 = bench_time_us();
+  var t0: int64 = bench_time_us();
   var acc: int64 = 0;
   var p: int32 = 0;
   while (p < passes) {
     acc = acc ^ run(ops, args);
     p = p + 1;
   }
-  var elapsed_us: uint64 = bench_time_us() - t0;
+  var elapsed_us: int64 = bench_time_us() - t0;
 
   print("Checksum = ");
   println_int(acc);
@@ -78,7 +78,7 @@ fn main() -> int32 {
   print_int(elapsed_us);
   println(" us");
 
-  free((cstring)ops);
-  free((cstring)args);
+  free(ops);
+  free(args);
   return 0;
 }

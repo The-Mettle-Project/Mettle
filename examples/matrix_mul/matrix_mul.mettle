@@ -8,11 +8,10 @@
 import "std/io";
 import "std/bench";
 
-var N: int32 = 32;
-var N2: int64 = 1024;
+const N: int32 = 32;
 
 fn mat_idx(row: int32, col: int32) -> int64 {
-  return (int64)row * (int64)N + (int64)col;
+  return (int64)row * N + col;
 }
 
 fn fill_matrix(m: int32*, seed: int32) {
@@ -27,7 +26,7 @@ fn fill_matrix(m: int32*, seed: int32) {
       idx = idx + 1;
       col = col + 1;
     }
-    row_base = row_base + (int64)N;
+    row_base = row_base + N;
     row = row + 1;
   }
 }
@@ -43,7 +42,7 @@ fn matmul(a: int32*, b: int32*, c: int32*) {
       var sum2: int32 = 0;
       var sum3: int32 = 0;
       var a_idx: int64 = row_base;
-      var b0_idx: int64 = (int64)col;
+      var b0_idx: int64 = col;
       var b1_idx: int64 = b0_idx + 1;
       var b2_idx: int64 = b0_idx + 2;
       var b3_idx: int64 = b0_idx + 3;
@@ -55,20 +54,20 @@ fn matmul(a: int32*, b: int32*, c: int32*) {
         sum2 = sum2 + av * b[b2_idx];
         sum3 = sum3 + av * b[b3_idx];
         a_idx = a_idx + 1;
-        b0_idx = b0_idx + (int64)N;
-        b1_idx = b1_idx + (int64)N;
-        b2_idx = b2_idx + (int64)N;
-        b3_idx = b3_idx + (int64)N;
+        b0_idx = b0_idx + N;
+        b1_idx = b1_idx + N;
+        b2_idx = b2_idx + N;
+        b3_idx = b3_idx + N;
         k = k + 1;
       }
-      var c_idx: int64 = row_base + (int64)col;
+      var c_idx: int64 = row_base + col;
       c[c_idx] = sum0;
       c[c_idx + 1] = sum1;
       c[c_idx + 2] = sum2;
       c[c_idx + 3] = sum3;
       col = col + 4;
     }
-    row_base = row_base + (int64)N;
+    row_base = row_base + N;
     row = row + 1;
   }
 }
@@ -78,8 +77,8 @@ fn trace_matrix(m: int32*) -> int64 {
   var i: int32 = 0;
   var idx: int64 = 0;
   while (i < N) {
-    sum = sum + (int64)m[idx];
-    idx = idx + (int64)N + 1;
+    sum = sum + m[idx];
+    idx = idx + N + 1;
     i = i + 1;
   }
   return sum;
@@ -94,19 +93,16 @@ fn main() -> int32 {
   fill_matrix(&a[0], 3);
   fill_matrix(&b[0], 7);
 
-  var header: string = "Matrix multiply: 32x32 int32 (naive)";
-  println(cstr(header));
+  println("Matrix multiply: 32x32 int32 (naive)");
 
   matmul(&a[0], &b[0], &c[0]);
   var check: int64 = trace_matrix(&c[0]);
-  var result_str: string = "Trace = ";
-  print(cstr(result_str));
+  print("Trace = ");
   println_int(check);
 
-  var bench_header: string = "Benchmark: 200 passes (matmul)";
-  println(cstr(bench_header));
+  println("Benchmark: 200 passes (matmul)");
 
-  var t0: uint64 = bench_time_us();
+  var t0: int64 = bench_time_us();
   var bench_sum: int64 = 0;
   var p: int32 = 0;
   while (p < passes) {
@@ -114,22 +110,19 @@ fn main() -> int32 {
     bench_sum = bench_sum + trace_matrix(&c[0]);
     p = p + 1;
   }
-  var elapsed_us: uint64 = bench_time_us() - t0;
+  var elapsed_us: int64 = bench_time_us() - t0;
 
-  var sum_str: string = "Bench sum = ";
-  print(cstr(sum_str));
+  print("Bench sum = ");
   println_int(bench_sum);
 
-  var time_str: string = "Time: ";
-  print(cstr(time_str));
+  print("Time: ");
   print_int(elapsed_us);
-  println(cstr(" us"));
+  println(" us");
 
-  var per_pass: uint64 = elapsed_us / passes;
-  var us_str: string = "Per pass: ~";
-  print(cstr(us_str));
+  var per_pass: int64 = elapsed_us / passes;
+  print("Per pass: ~");
   print_int(per_pass);
-  println(cstr(" us"));
+  println(" us");
 
   return 0;
 }

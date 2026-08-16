@@ -13,5 +13,5 @@ fn main() -> int32 {
 
   var a: int64 = strlen_c(msg);
   var b: int64 = strlen_c(&path_buf[0]);
-  return a + b + path_len;
+  return (int32)(a + b + path_len);
 }

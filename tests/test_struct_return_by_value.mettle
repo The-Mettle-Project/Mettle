@@ -41,9 +41,9 @@ fn write_i64(v: int64) {
 
 fn line_i64(label: cstring, v: int64) {
   write_s(label);
-  write_s(cstr(" "));
+  write_s(" ");
   write_i64(v);
-  write_s(cstr("\n"));
+  write_s("\n");
 }
 
 // 12-byte struct return.
@@ -74,27 +74,27 @@ fn sum_three(t: ThreeI32) -> int32 {
 }
 
 fn main() -> int32 {
-  write_s(cstr("struct return by value\n"));
+  write_s("struct return by value\n");
 
   // Read every field of a 12-byte return through a local variable.
   var t: ThreeI32 = make_three(11, 22, 33);
-  line_i64(cstr("three_a"), (int64)t.a);
-  line_i64(cstr("three_b"), (int64)t.b);
-  line_i64(cstr("three_c"), (int64)t.c);
+  line_i64("three_a", (int64)t.a);
+  line_i64("three_b", (int64)t.b);
+  line_i64("three_c", (int64)t.c);
 
   // Pass a struct-returning call directly into a struct-taking call. The
   // returned struct must survive long enough to be passed by value into
   // sum_three.
-  line_i64(cstr("chained_sum"), (int64)sum_three(make_three(1, 2, 3)));
+  line_i64("chained_sum", (int64)sum_three(make_three(1, 2, 3)));
 
   // 24-byte struct: read every field, ensuring nothing past byte 8 is lost.
   var s: Six = make_six();
-  line_i64(cstr("six_a"), (int64)s.a);
-  line_i64(cstr("six_b"), (int64)s.b);
-  line_i64(cstr("six_c"), (int64)s.c);
-  line_i64(cstr("six_d"), (int64)s.d);
-  line_i64(cstr("six_e"), (int64)s.e);
-  line_i64(cstr("six_f"), (int64)s.f);
+  line_i64("six_a", (int64)s.a);
+  line_i64("six_b", (int64)s.b);
+  line_i64("six_c", (int64)s.c);
+  line_i64("six_d", (int64)s.d);
+  line_i64("six_e", (int64)s.e);
+  line_i64("six_f", (int64)s.f);
 
   return 0;
 }

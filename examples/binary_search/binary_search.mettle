@@ -39,9 +39,9 @@ fn main() -> int32 {
   var queries: int64 = 50000;
   var passes: int32 = 200;
 
-  var arr: int32* = (int32*)malloc(n * 4);
+  var arr: int32* = malloc(n * 4);
   if (arr == 0) {
-    println(cstr("malloc failed"));
+    println("malloc failed");
     return 1;
   }
 
@@ -51,23 +51,23 @@ fn main() -> int32 {
     i = i + 1;
   }
 
-  println(cstr("Binary search: 65536 elements, 50000 queries x 200 passes"));
+  println("Binary search: 65536 elements, 50000 queries x 200 passes");
 
-  var t0: uint64 = bench_time_us();
+  var t0: int64 = bench_time_us();
   var bench_sum: int64 = 0;
   var p: int32 = 0;
   while (p < passes) {
     bench_sum = bench_sum + search_many(arr, n, queries);
     p = p + 1;
   }
-  var elapsed_us: uint64 = bench_time_us() - t0;
+  var elapsed_us: int64 = bench_time_us() - t0;
 
-  print(cstr("Bench sum = "));
+  print("Bench sum = ");
   println_int(bench_sum);
-  print(cstr("Time: "));
+  print("Time: ");
   print_int(elapsed_us);
-  println(cstr(" us"));
+  println(" us");
 
-  free((cstring)arr);
+  free(arr);
   return 0;
 }

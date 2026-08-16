@@ -45,9 +45,9 @@ fn write_i64(v: int64) {
 
 fn line_i64(label: cstring, v: int64) {
   write_s(label);
-  write_s(cstr(" "));
+  write_s(" ");
   write_i64(v);
-  write_s(cstr("\n"));
+  write_s("\n");
 }
 
 fn scaled(v: float64) -> int64 {
@@ -58,39 +58,39 @@ fn scaled(v: float64) -> int64 {
 }
 
 fn main() -> int32 {
-  write_s(cstr("struct copy repro\n"));
+  write_s("struct copy repro\n");
 
   var i0: TwoI32;
   i0.a = 11;
   i0.b = 22;
   var i1: TwoI32 = i0;
-  line_i64(cstr("two_i32_a"), (int64)i1.a);
-  line_i64(cstr("two_i32_b"), (int64)i1.b);
+  line_i64("two_i32_a", (int64)i1.a);
+  line_i64("two_i32_b", (int64)i1.b);
 
   var t0: ThreeI32;
   t0.a = 11;
   t0.b = 22;
   t0.c = 33;
   var t1: ThreeI32 = t0;
-  line_i64(cstr("three_i32_a"), (int64)t1.a);
-  line_i64(cstr("three_i32_b"), (int64)t1.b);
-  line_i64(cstr("three_i32_c"), (int64)t1.c);
+  line_i64("three_i32_a", (int64)t1.a);
+  line_i64("three_i32_b", (int64)t1.b);
+  line_i64("three_i32_c", (int64)t1.c);
 
   var f0: TwoF64;
   f0.a = -3.5;
   f0.b = 22.0;
   var f1: TwoF64 = f0;
-  line_i64(cstr("two_f64_a_mm"), scaled(f1.a));
-  line_i64(cstr("two_f64_b_mm"), scaled(f1.b));
+  line_i64("two_f64_a_mm", scaled(f1.a));
+  line_i64("two_f64_b_mm", scaled(f1.b));
 
   var m0: Mixed;
   m0.a = 11;
   m0.b = -3.5;
   m0.c = 22;
   var m1: Mixed = m0;
-  line_i64(cstr("mixed_a"), (int64)m1.a);
-  line_i64(cstr("mixed_b_mm"), scaled(m1.b));
-  line_i64(cstr("mixed_c"), (int64)m1.c);
+  line_i64("mixed_a", (int64)m1.a);
+  line_i64("mixed_b_mm", scaled(m1.b));
+  line_i64("mixed_c", (int64)m1.c);
 
   return 0;
 }

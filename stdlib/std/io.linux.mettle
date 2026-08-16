@@ -9,19 +9,30 @@ export extern fn puts(msg: cstring) -> int32;
 export extern fn putchar(c: int32) -> int32;
 export extern fn getchar() -> int32 = "getchar";
 
-// Convert a Mettle string to a C string (gets the underlying char pointer)
-export fn cstr(s: string) -> cstring {
-  return s.chars;
+// Write a string exactly as-is (no trailing newline).
+//
+// A `string` is a pointer and a length with no terminator, so this writes
+// `length` bytes and never scans for a NUL.
+export fn print(msg: string) {
+  if (msg.length > (uint64)0) {
+    fwrite(msg.chars, 1, (int64)msg.length, get_stdout());
+  }
 }
 
-// Output a null-terminated string exactly as-is (no trailing newline)
-export fn print(msg: cstring) {
-  fputs(msg, get_stdout());
+// Write a string followed by a newline.
+export fn println(msg: string) {
+  print(msg);
+  putchar(10);
 }
 
-// Output a null-terminated string followed by a newline
-export fn println(msg: cstring) {
-  puts(msg);
+// The boundary forms, for a pointer that arrived from C or from a byte buffer
+// the program NUL-terminated itself.
+export fn print_cstr(s: cstring) {
+  fputs(s, get_stdout());
+}
+
+export fn println_cstr(s: cstring) {
+  puts(s);
 }
 
 // Print a newline
@@ -47,7 +58,7 @@ export fn print_int(n: int64) {
   }
   while (n > 0) {
     pos = pos - 1;
-    buf[pos] = 48 + n - (n / 10) * 10;
+    buf[pos] = (uint8)(48 + n - (n / 10) * 10);
     n = n / 10;
   }
   if (neg != 0) {
@@ -84,12 +95,35 @@ export fn get_stdout() -> cstring { return runtime_stdout; }
 export fn get_stderr() -> cstring { return runtime_stderr; }
 
 // Write message to stderr (no newline)
-export fn print_err(msg: cstring) {
-  fputs(msg, get_stderr());
+export fn print_err(msg: string) {
+  if (msg.length > (uint64)0) {
+    fwrite(msg.chars, 1, (int64)msg.length, get_stderr());
+  }
 }
 
 // Write message to stderr followed by newline
-export fn println_err(msg: cstring) {
-  fputs(msg, get_stderr());
-  fputs(cstr("\n"), get_stderr());
+export fn println_err(msg: string) {
+  print_err(msg);
+  fwrite("\n".chars, 1, 1, get_stderr());
+}
+
+// ─── FFI string marshalling ─────────────────────────────────────────────────
+//
+// See std/io: `cstr` produces the NUL-terminated copy a C function needs, and
+// takes the allocator it comes from so the copy is in the signature. A string
+// LITERAL needs none of it -- it is already terminated in rodata.
+export fn cstr(s: string, alloc: fn(int64) -> rawptr) -> cstring {
+  var n: int64 = (int64)s.length;
+  var out: cstring = alloc(n + 1);
+  if (out == 0) {
+    return 0;
+  }
+  var src: cstring = s.chars;
+  var i: int64 = 0;
+  while (i < n) {
+    out[i] = src[i];
+    i = i + 1;
+  }
+  out[n] = 0;
+  return out;
 }

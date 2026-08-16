@@ -49,7 +49,7 @@ fn main() -> int32 {
   }
 
   var n: int32 = 512;
-  var data: int32* = (int32*)malloc((int64)n * 4);
+  var data: int32* = malloc((int64)n * 4);
   var i: int32 = 0;
   while (i < n) {
     data[i] = (i * 1103515245 + 12345) % 4096;
@@ -66,7 +66,7 @@ fn main() -> int32 {
     i = i + 1;
   }
 
-  free((cstring)data);
+  free(data);
   println("tail_recursion OK");
   return 0;
 }

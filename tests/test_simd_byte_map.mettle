@@ -76,14 +76,14 @@ fn signed_scale_ref(dst: int8*, s: int8*, n: int32) {
 }
 
 fn main() -> int32 {
-  var a: uint8* = (uint8*)malloc(64);
-  var b: uint8* = (uint8*)malloc(64);
-  var c: uint8* = (uint8*)malloc(64);
-  var got: uint8* = (uint8*)malloc(64);
-  var want: uint8* = (uint8*)malloc(64);
-  var sa: int8* = (int8*)malloc(64);
-  var sgot: int8* = (int8*)malloc(64);
-  var swant: int8* = (int8*)malloc(64);
+  var a: uint8* = malloc(64);
+  var b: uint8* = malloc(64);
+  var c: uint8* = malloc(64);
+  var got: uint8* = malloc(64);
+  var want: uint8* = malloc(64);
+  var sa: int8* = malloc(64);
+  var sgot: int8* = malloc(64);
+  var swant: int8* = malloc(64);
   var counts: int32[9];
   var bad: int32 = 0;
 

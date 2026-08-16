@@ -33,6 +33,6 @@ fn main() -> int32 {
 
   var total: int32 = first_char(local);
   total = total + identity_cstring("x")[0];
-  total = total + returned[0] + rebuilt.length + rebuilt.chars[1];
+  total = total + returned[0] + (int32)rebuilt.length + rebuilt.chars[1];
   return total - (111 + 120 + 104 + 2 + 107);
 }

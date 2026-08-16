@@ -136,13 +136,13 @@ var stats_buf: cstring = 0;
 
 // --- Small helpers -----------------------------------------------------------
 fn alloc_all() {
-  particles  = (Particle*)malloc((int64)300 * sizeof(Particle));
-  wells      = (Well*)malloc((int64)32 * sizeof(Well));
-  palette    = (int64*)malloc((int64)64 * 8);
-  star_brush = (int64*)malloc((int64)3 * 8);
-  star_x     = (int32*)malloc((int64)150 * 4);
-  star_y     = (int32*)malloc((int64)150 * 4);
-  star_b     = (int32*)malloc((int64)150 * 4);
+  particles  = malloc((int64)300 * sizeof(Particle));
+  wells      = malloc((int64)32 * sizeof(Well));
+  palette    = malloc((int64)64 * 8);
+  star_brush = malloc((int64)3 * 8);
+  star_x     = malloc((int64)150 * 4);
+  star_y     = malloc((int64)150 * 4);
+  star_b     = malloc((int64)150 * 4);
   stats_buf  = malloc(256);
 }
 
@@ -199,8 +199,8 @@ fn build_assets() {
   attract_brush = Ui_CreateSolidBrush(ui_rgb(255, 214, 96));
   repel_brush   = Ui_CreateSolidBrush(ui_rgb(110, 224, 255));
   null_pen      = Ui_GetStockObject(8);   // NULL_PEN
-  title_font    = ui_create_font(30, cstr("Segoe UI Semibold"), UI_FW_SEMIBOLD());
-  hud_font      = ui_create_font(17, cstr("Consolas"), UI_FW_NORMAL());
+  title_font    = ui_create_font(30, "Segoe UI Semibold", UI_FW_SEMIBOLD());
+  hud_font      = ui_create_font(17, "Consolas", UI_FW_NORMAL());
 }
 
 fn build_stars() {
@@ -346,22 +346,22 @@ fn draw_well(hdc: int64, w: int32) {
 
 fn draw_hud(hdc: int64) {
   var oldf: int64 = Ui_SelectObject(hdc, title_font);
-  ui_draw_text_transparent(hdc, 24, 16, cstr("Mettle Orbits"), ui_rgb(150, 205, 255));
+  ui_draw_text_transparent(hdc, 24, 16, "Mettle Orbits", ui_rgb(150, 205, 255));
 
   Ui_SelectObject(hdc, hud_font);
 
-  var state: cstring = cstr("RUNNING");
-  if (paused != 0) { state = cstr("PAUSED "); }
+  var state: cstring = "RUNNING";
+  if (paused != 0) { state = "PAUSED "; }
   c_sprintf(stats_buf,
-            cstr("particles %d     wells %d     %d fps     %s"),
+            "particles %d     wells %d     %d fps     %s",
             (int64)NUM_PARTICLES, (int64)well_count, (int64)fps, (int64)state);
   ui_draw_text_transparent(hdc, 25, 54, stats_buf, ui_rgb(196, 208, 230));
 
   ui_draw_text_transparent(hdc, 25, view_h - 56,
-    cstr("L-click: attractor    R-click: repeller    Space: pause    R: reset    C: clear    Esc: quit"),
+    "L-click: attractor    R-click: repeller    Space: pause    R: reset    C: clear    Esc: quit",
     ui_rgb(120, 135, 165));
   ui_draw_text_transparent(hdc, 25, view_h - 32,
-    cstr("native x86-64 .exe  -  compiled by Mettle to a COFF object + internal PE linker  -  no runtime"),
+    "native x86-64 .exe  -  compiled by Mettle to a COFF object + internal PE linker  -  no runtime",
     ui_rgb(92, 104, 134));
 
   Ui_SelectObject(hdc, oldf);
@@ -519,7 +519,7 @@ fn main() -> int32 {
   build_assets();
 
   var hwnd: int64 = ui_window_create_centered(
-    cstr("Mettle Orbits  -  native x86-64 gravity sandbox"),
+    "Mettle Orbits  -  native x86-64 gravity sandbox",
     WIN_W, WIN_H, &window_proc);
   if (hwnd == 0) {
     println("Failed to create window.");
@@ -551,8 +551,8 @@ fn main() -> int32 {
   // Result: steady frame pacing and frame-rate-independent motion.
   var msg: UiMsg;
   var running: int32 = 1;
-  var prev_us: uint64 = bench_time_us();
-  var accum_us: uint64 = 0;
+  var prev_us: int64 = bench_time_us();
+  var accum_us: int64 = 0;
 
   while (running != 0) {
     // Drain every pending message without blocking.
@@ -565,20 +565,20 @@ fn main() -> int32 {
     }
     if (running == 0) { break; }
 
-    var now_us: uint64 = bench_time_us();
-    var dt_us: uint64 = now_us - prev_us;
+    var now_us: int64 = bench_time_us();
+    var dt_us: int64 = now_us - prev_us;
     prev_us = now_us;
 
     // Guard against a huge dt after a stall/drag so we don't spiral.
-    if (dt_us > (uint64)(FRAME_US * MAX_STEPS)) {
-      dt_us = (uint64)(FRAME_US * MAX_STEPS);
+    if (dt_us > FRAME_US * MAX_STEPS) {
+      dt_us = FRAME_US * MAX_STEPS;
     }
     accum_us = accum_us + dt_us;
 
     var steps: int32 = 0;
-    while (accum_us >= (uint64)FRAME_US && steps < MAX_STEPS) {
+    while (accum_us >= FRAME_US && steps < MAX_STEPS) {
       if (paused == 0) { update_physics(); }
-      accum_us = accum_us - (uint64)FRAME_US;
+      accum_us = accum_us - FRAME_US;
       steps = steps + 1;
     }
     // If we hit the step cap, drop the backlog rather than carry it forward.
@@ -588,9 +588,9 @@ fn main() -> int32 {
     tick_fps();
 
     // Yield the rest of the frame budget instead of busy-spinning a core.
-    var spent_us: uint64 = bench_time_us() - now_us;
-    if (spent_us < (uint64)FRAME_US) {
-      var sleep_us: uint64 = (uint64)FRAME_US - spent_us;
+    var spent_us: int64 = bench_time_us() - now_us;
+    if (spent_us < FRAME_US) {
+      var sleep_us: int64 = FRAME_US - spent_us;
       Win_Sleep((uint32)(sleep_us / 1000));
     }
   }

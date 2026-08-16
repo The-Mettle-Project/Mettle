@@ -9,9 +9,9 @@ fn main() -> int32 {
 
   // ---- block mimicking k_f64 (reused names: ha/hb/hc/i/ok/ref) ----
   {
-    var ha: float64* = (float64*)malloc(n64 * 8);
-    var hb: float64* = (float64*)malloc(n64 * 8);
-    var hc: float64* = (float64*)malloc(n64 * 8);
+    var ha: float64* = malloc(n64 * 8);
+    var hb: float64* = malloc(n64 * 8);
+    var hc: float64* = malloc(n64 * 8);
     var i: int32 = 0;
     while (i < n) { ha[i] = (float64)i * 0.5 - 100.0; hb[i] = (float64)i * 0.25 + 1.0; hc[i] = ha[i] * hb[i]; i = i + 1; }
     var ok: int32 = 1; i = 0;
@@ -21,14 +21,14 @@ fn main() -> int32 {
       i = i + 1;
     }
     if (ok == 0) { fails = fails + 1; }
-    free((cstring)ha); free((cstring)hb); free((cstring)hc);
+    free(ha); free(hb); free(hc);
   }
 
   // ---- block mimicking k_i64 ----
   {
-    var ha: int64* = (int64*)malloc(n64 * 8);
-    var hb: int64* = (int64*)malloc(n64 * 8);
-    var hc: int64* = (int64*)malloc(n64 * 8);
+    var ha: int64* = malloc(n64 * 8);
+    var hb: int64* = malloc(n64 * 8);
+    var hc: int64* = malloc(n64 * 8);
     var i: int32 = 0;
     while (i < n) { ha[i] = (int64)i * 123 - 456; hb[i] = (int64)(i % 7) + 1; hc[i] = ha[i] * hb[i]; i = i + 1; }
     var ok: int32 = 1; i = 0;
@@ -37,16 +37,16 @@ fn main() -> int32 {
       i = i + 1;
     }
     if (ok == 0) { fails = fails + 1; }
-    free((cstring)ha); free((cstring)hb); free((cstring)hc);
+    free(ha); free(hb); free(hc);
   }
 
   // ---- block mimicking k_u32 (the signedness test, INLINED) ----
   {
-    var ha: uint32* = (uint32*)malloc(n64 * 4);
-    var hb: uint32* = (uint32*)malloc(n64 * 4);
-    var hc: uint32* = (uint32*)malloc(n64 * 4);
+    var ha: uint32* = malloc(n64 * 4);
+    var hb: uint32* = malloc(n64 * 4);
+    var hc: uint32* = malloc(n64 * 4);
     var i: int32 = 0;
-    while (i < n) { ha[i] = (uint32)i * 2654435761; hb[i] = (uint32)(i % 13) + 1; i = i + 1; }
+    while (i < n) { ha[i] = (uint32)i * (uint32)2654435761; hb[i] = (uint32)(i % 13) + 1; i = i + 1; }
     // compute reference on host then store to hc to exercise unsigned math
     i = 0;
     while (i < n) {
@@ -63,19 +63,19 @@ fn main() -> int32 {
       var ref: uint32 = x / y + x % y + (x >> 3);
       if (hc[i] != ref) { ok = 0; }
       // print to see actual values
-      print(cstr("x=")); print_int((int64)x);
-      print(cstr(" x/y=")); print_int((int64)(x / y));
-      print(cstr(" x%y=")); print_int((int64)(x % y));
-      print(cstr(" x>>3=")); print_int((int64)(x >> 3));
-      print(cstr(" castx=")); print_int((int64)x);
-      println(cstr(""));
+      print("x="); print_int((int64)x);
+      print(" x/y="); print_int((int64)(x / y));
+      print(" x%y="); print_int((int64)(x % y));
+      print(" x>>3="); print_int((int64)(x >> 3));
+      print(" castx="); print_int((int64)x);
+      println("");
       i = i + 1;
     }
-    if (ok == 0) { fails = fails + 1; println(cstr("  U32 BLOCK FAILED")); }
-    else { println(cstr("  U32 BLOCK OK")); }
-    free((cstring)ha); free((cstring)hb); free((cstring)hc);
+    if (ok == 0) { fails = fails + 1; println("  U32 BLOCK FAILED"); }
+    else { println("  U32 BLOCK OK"); }
+    free(ha); free(hb); free(hc);
   }
 
-  print(cstr("fails=")); print_int((int64)fails); println(cstr(""));
+  print("fails="); print_int((int64)fails); println("");
   return 0;
 }

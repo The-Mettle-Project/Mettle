@@ -5,7 +5,7 @@ fn main() -> int32 {
   var b: int8 = 1;
   var c: int8 = a + b;
   var d: int8 = -128;
-  var e: int8 = d - 1;
+  var e: int8 = (int8)(d - 1);
   if (c == -128 && e == 127) {
     return 1;
   }

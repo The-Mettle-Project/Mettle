@@ -56,10 +56,10 @@ fn main() -> int32 {
   var passes: int32 = 1500;
   var balls: Ball[100];
   var last: int32 = 0;
-  var t0: uint64 = bench_time_us();
+  var t0: int64 = bench_time_us();
   var it: int32 = 0;
   while (it < passes) { last = benchmark(&balls[0]); it = it + 1; }
-  var elapsed: uint64 = bench_time_us() - t0;
+  var elapsed: int64 = bench_time_us() - t0;
   println("Bounce");
   print("  result   = "); println_int((int64)last);
   println("  expected = 1331");

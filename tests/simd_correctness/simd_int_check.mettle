@@ -77,18 +77,18 @@ fn k_min(arr: int32*, n: int64) -> int32 {
 
 var g_fail: int32 = 0;
 
-fn fail(label: cstring, len: int64) -> int32 {
-  print(cstr("FAIL ")); print(label); print(cstr(" n=")); print_int(len);
-  println(cstr(""));
+fn fail(label: string, len: int64) -> int32 {
+  print("FAIL "); print(label); print(" n="); print_int(len);
+  println("");
   g_fail = g_fail + 1;
   return 0;
 }
 
 fn run_len(n: int64) -> int32 {
   var cap: int64 = n; if (cap < 1) { cap = 1; }
-  var a: int32* = (int32*)malloc(cap * 4);
-  var b: int32* = (int32*)malloc(cap * 4);
-  var dst: int32* = (int32*)malloc(cap * 4);
+  var a: int32* = malloc(cap * 4);
+  var b: int32* = malloc(cap * 4);
+  var dst: int32* = malloc(cap * 4);
 
   // Fill + compute references in the SAME loop (the store of a[i] means this
   // loop is not a pure reduction/scan, so no recognizer fuses it).
@@ -109,17 +109,17 @@ fn run_len(n: int64) -> int32 {
     i = i + 1;
   }
 
-  if (k_sum(a, n) != ref_sum) { fail(cstr("sum_i32"), n); }
-  if (k_dot(a, b, n) != ref_dot) { fail(cstr("dot_i32"), n); }
+  if (k_sum(a, n) != ref_sum) { fail("sum_i32", n); }
+  if (k_dot(a, b, n) != ref_dot) { fail("dot_i32", n); }
 
   // scale: dst[i] = a[i]*3 + 7; check elementwise (read-only) + returned sum.
   var ssum: int64 = k_scale(a, dst, n);
   var esum: int64 = 0; i = 0;
   while (i < n) {
-    if (dst[i] != a[i] * 3 + 7) { fail(cstr("scale val"), n); i = n; }
+    if (dst[i] != a[i] * 3 + 7) { fail("scale val", n); i = n; }
     else { esum = esum + (int64)(a[i] * 3 + 7); i = i + 1; }
   }
-  if (ssum != esum) { fail(cstr("scale sum"), n); }
+  if (ssum != esum) { fail("scale sum", n); }
 
   // clamp to [-500, 500]
   var csum: int64 = k_clamp(a, dst, n);
@@ -128,32 +128,32 @@ fn run_len(n: int64) -> int32 {
     var cv: int32 = a[i];
     if (cv < -500) { cv = -500; }
     if (cv > 500) { cv = 500; }
-    if (dst[i] != cv) { fail(cstr("clamp val"), n); i = n; }
+    if (dst[i] != cv) { fail("clamp val", n); i = n; }
     else { ecsum = ecsum + (int64)cv; i = i + 1; }
   }
-  if (csum != ecsum) { fail(cstr("clamp sum"), n); }
+  if (csum != ecsum) { fail("clamp sum", n); }
 
   // reverse
   var rsum: int64 = k_reverse(a, dst, n);
   i = 0;
   while (i < n) {
-    if (dst[i] != a[n - 1 - i]) { fail(cstr("reverse val"), n); i = n; }
+    if (dst[i] != a[n - 1 - i]) { fail("reverse val", n); i = n; }
     else { i = i + 1; }
   }
-  if (rsum != ref_sum) { fail(cstr("reverse sum"), n); }
+  if (rsum != ref_sum) { fail("reverse sum", n); }
 
   // minmax (needs n >= 1)
   if (n >= 1) {
-    if (k_min(a, n) != ref_min) { fail(cstr("minmax"), n); }
+    if (k_min(a, n) != ref_min) { fail("minmax", n); }
   }
 
-  free((cstring)a); free((cstring)b); free((cstring)dst);
+  free(a); free(b); free(dst);
   return 0;
 }
 
 fn main() -> int32 {
   // Lengths chosen to straddle the 8-lane vector width and scalar tails.
-  var lens: int64* = (int64*)malloc(32 * 8);
+  var lens: int64* = malloc(32 * 8);
   lens[0]=1; lens[1]=2; lens[2]=3; lens[3]=4; lens[4]=5; lens[5]=7; lens[6]=8;
   lens[7]=9; lens[8]=15; lens[9]=16; lens[10]=17; lens[11]=23; lens[12]=31;
   lens[13]=32; lens[14]=33; lens[15]=40; lens[16]=63; lens[17]=64; lens[18]=65;
@@ -163,7 +163,7 @@ fn main() -> int32 {
   var k: int64 = 0;
   while (k < 32) { run_len(lens[k]); k = k + 1; }
 
-  if (g_fail == 0) { println(cstr("INT SIMD: ALL OK")); return 0; }
-  print(cstr("INT SIMD FAILURES: ")); print_int((int64)g_fail); println(cstr(""));
+  if (g_fail == 0) { println("INT SIMD: ALL OK"); return 0; }
+  print("INT SIMD FAILURES: "); print_int((int64)g_fail); println("");
   return 1;
 }

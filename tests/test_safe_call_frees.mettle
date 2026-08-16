@@ -14,7 +14,7 @@ import "std/io";
 import "std/mem";
 
 fn inner_release(p: int32*) {
-  free((cstring)p);
+  free(p);
 }
 
 fn release(p: int32*) {
@@ -36,13 +36,13 @@ fn walk(a: int32*, n: int32) -> int32 {
 
 fn main() -> int32 {
   var n: int32 = 32;
-  var a: int32* = (int32*)malloc((int64)n * 4);
+  var a: int32* = malloc((int64)n * 4);
   var i: int32 = 0;
   while (i < n) {
     a[i] = 1;
     i = i + 1;
   }
-  print(cstr("unreached="));
+  print("unreached=");
   println_int((int64)walk(a, n));
   return 0;
 }

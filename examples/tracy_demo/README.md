@@ -77,7 +77,7 @@ import "std/tracy";
 
 fn work() {
   var z: TracyZone = tracy_zone_colored(
-    cstr("work"), cstr("myapp.mettle"), 42, cstr("work"), tracy_color_update());
+    "work", "myapp.mettle", 42, "work", tracy_color_update());
   defer tracy_scope_end(z);
   ...
 }

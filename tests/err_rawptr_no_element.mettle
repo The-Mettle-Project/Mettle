@@ -1,0 +1,20 @@
+// A rawptr is an address with no element type. It converts to and from every
+// pointer, which is the whole contract, but there is no element size to index,
+// dereference, or offset by -- so those are refused with the fix in the help.
+
+import "std/mem";
+
+fn main() -> int32 {
+  var raw: rawptr = malloc(64);
+
+  // Legal: give the address a type, then use it.
+  var typed: int32* = raw;
+  typed[0] = 7;
+
+  var a: int32 = raw[0];          // cannot index a 'rawptr'
+  var b: int32 = *raw;            // cannot dereference a 'rawptr'
+  var c: rawptr = raw + 8;        // cannot offset a 'rawptr'
+
+  free(raw);
+  return a + b + (int32)(int64)c + typed[0];
+}

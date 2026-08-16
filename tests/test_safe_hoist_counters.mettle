@@ -17,7 +17,7 @@ fn encode(src: cstring, len: int64, dst: cstring) -> int64 {
     dst[o] = src[i];
     dst[o + 1] = src[i + 1];
     dst[o + 2] = src[i + 2];
-    dst[o + 3] = (int8)61;
+    dst[o + 3] = (uint8)61;
     i = i + 3;
     o = o + 4;
   }
@@ -29,7 +29,7 @@ fn main() -> int32 {
   var src: cstring = malloc(len);
   var i: int64 = 0;
   while (i < len) {
-    src[i] = (int8)7;
+    src[i] = (uint8)7;
     i = i + 1;
   }
 

@@ -130,23 +130,23 @@ fn vmap_sqdiff_f32(out: float32*, a: float32*, b: float32*,
 }
 
 var g_fail: int32 = 0;
-fn fail(label: cstring, len: int64) -> int32 {
-  print(cstr("FAIL ")); print(label); print(cstr(" n=")); print_int(len);
-  println(cstr(""));
+fn fail(label: string, len: int64) -> int32 {
+  print("FAIL "); print(label); print(" n="); print_int(len);
+  println("");
   g_fail = g_fail + 1;
   return 0;
 }
 
 fn run_len(n: int64) -> int32 {
   var cap: int64 = n; if (cap < 1) { cap = 1; }
-  var a64: float64* = (float64*)malloc(cap * 8);
-  var b64: float64* = (float64*)malloc(cap * 8);
-  var c64: float64* = (float64*)malloc(cap * 8);
-  var o64: float64* = (float64*)malloc(cap * 8);
-  var a32: float32* = (float32*)malloc(cap * 4);
-  var b32: float32* = (float32*)malloc(cap * 4);
-  var c32: float32* = (float32*)malloc(cap * 4);
-  var o32: float32* = (float32*)malloc(cap * 4);
+  var a64: float64* = malloc(cap * 8);
+  var b64: float64* = malloc(cap * 8);
+  var c64: float64* = malloc(cap * 8);
+  var o64: float64* = malloc(cap * 8);
+  var a32: float32* = malloc(cap * 4);
+  var b32: float32* = malloc(cap * 4);
+  var c32: float32* = malloc(cap * 4);
+  var o32: float32* = malloc(cap * 4);
 
   var ref_sum: float64 = 0.0;
   var ref_dot: float64 = 0.0;
@@ -172,55 +172,55 @@ fn run_len(n: int64) -> int32 {
     i = i + 1;
   }
 
-  if (ks_f64(a64, n) != ref_sum) { fail(cstr("sum_f64"), n); }
-  if (kd_f64(a64, b64, n) != ref_dot) { fail(cstr("dot_f64"), n); }
+  if (ks_f64(a64, n) != ref_sum) { fail("sum_f64", n); }
+  if (kd_f64(a64, b64, n) != ref_dot) { fail("dot_f64", n); }
   // f32 references: compare via float64 widening of the f32 result against the
   // exact integer reference (values are integers, so the f32 sum is exact).
-  if ((float64)ks_f32(a32, n) != ref_sum) { fail(cstr("sum_f32"), n); }
-  if ((float64)kd_f32(a32, b32, n) != ref_dot) { fail(cstr("dot_f32"), n); }
+  if ((float64)ks_f32(a32, n) != ref_sum) { fail("sum_f32", n); }
+  if ((float64)kd_f32(a32, b32, n) != ref_dot) { fail("dot_f32", n); }
 
   // General auto-vectorizer checks run BEFORE the affine map below, which
   // overwrites b64 in place. map out[i]=(a[i]+b[i])*c[i] then sum the outputs;
   // and the sum-of-squares-plus reduction.
   vmap_combo(o64, a64, b64, c64, n);
-  if (ks_f64(o64, n) != ref_combo) { fail(cstr("vloop_map_combo"), n); }
-  if (vred_ssq(a64, b64, n) != ref_ssq) { fail(cstr("vloop_reduce_ssq"), n); }
+  if (ks_f64(o64, n) != ref_combo) { fail("vloop_map_combo", n); }
+  if (vred_ssq(a64, b64, n) != ref_ssq) { fail("vloop_reduce_ssq", n); }
 
   // float32 general-vectorizer checks (run before ka_f32 overwrites b32).
   vmap_combo_f32(o32, a32, b32, c32, n);
-  if ((float64)ks_f32(o32, n) != ref_combo) { fail(cstr("vloop_map_combo_f32"), n); }
-  if ((float64)vred_ssq_f32(a32, b32, n) != ref_ssq) { fail(cstr("vloop_reduce_ssq_f32"), n); }
+  if ((float64)ks_f32(o32, n) != ref_combo) { fail("vloop_map_combo_f32", n); }
+  if ((float64)vred_ssq_f32(a32, b32, n) != ref_ssq) { fail("vloop_reduce_ssq_f32", n); }
   vmap_div_f32(o32, a32, n);
-  if ((float64)ks_f32(o32, n) != 2.0 * ref_sum) { fail(cstr("vloop_map_div_f32"), n); }
+  if ((float64)ks_f32(o32, n) != 2.0 * ref_sum) { fail("vloop_map_div_f32", n); }
   // iota map: sum_{i=0}^{n-1} (3i+1) = 3*n*(n-1)/2 + n (exact int -> f32 here).
   vmap_iota_f32(o32, n);
   if ((float64)ks_f32(o32, n) != (float64)(3 * n * (n - 1) / 2 + n)) {
-    fail(cstr("vloop_map_iota_f32"), n);
+    fail("vloop_map_iota_f32", n);
   }
   // bare-f64-literal quadratic map (exactly-narrowable literals): sum the
   // outputs and compare to the exact integer reference sum 2*x*x + 3*x.
   vmap_lit_quad_f32(o32, a32, n);
-  if ((float64)ks_f32(o32, n) != ref_litquad) { fail(cstr("vloop_lit_quad_f32"), n); }
+  if ((float64)ks_f32(o32, n) != ref_litquad) { fail("vloop_lit_quad_f32", n); }
   // bare-f64-literal reduction (temp+ASSIGN accumulation form): sum 2*a[i].
-  if ((float64)vred_lit_f32(a32, n) != 2.0 * ref_sum) { fail(cstr("vloop_lit_red_f32"), n); }
+  if ((float64)vred_lit_f32(a32, n) != 2.0 * ref_sum) { fail("vloop_lit_red_f32", n); }
   // body-local substitution: SSD reduction and squared-difference map (run
   // before ka_f32 overwrites b32).
-  if ((float64)vred_ssd_f32(a32, b32, n) != ref_sqdiff) { fail(cstr("vloop_ssd_f32"), n); }
+  if ((float64)vred_ssd_f32(a32, b32, n) != ref_sqdiff) { fail("vloop_ssd_f32", n); }
   vmap_sqdiff_f32(o32, a32, b32, n);
-  if ((float64)ks_f32(o32, n) != ref_sqdiff) { fail(cstr("vloop_sqdiff_map_f32"), n); }
+  if ((float64)ks_f32(o32, n) != ref_sqdiff) { fail("vloop_sqdiff_map_f32", n); }
 
   ka_f64(a64, b64, n);
   ka_f32(a32, b32, n);
-  if (ks_f64(b64, n) != ref_affine) { fail(cstr("affine_f64"), n); }
-  if ((float64)ks_f32(b32, n) != ref_affine) { fail(cstr("affine_f32"), n); }
+  if (ks_f64(b64, n) != ref_affine) { fail("affine_f64", n); }
+  if ((float64)ks_f32(b32, n) != ref_affine) { fail("affine_f32", n); }
 
-  free((cstring)a64); free((cstring)b64); free((cstring)c64); free((cstring)o64);
-  free((cstring)a32); free((cstring)b32); free((cstring)c32); free((cstring)o32);
+  free(a64); free(b64); free(c64); free(o64);
+  free(a32); free(b32); free(c32); free(o32);
   return 0;
 }
 
 fn main() -> int32 {
-  var lens: int64* = (int64*)malloc(32 * 8);
+  var lens: int64* = malloc(32 * 8);
   lens[0]=1; lens[1]=2; lens[2]=3; lens[3]=4; lens[4]=5; lens[5]=7; lens[6]=8;
   lens[7]=9; lens[8]=15; lens[9]=16; lens[10]=17; lens[11]=23; lens[12]=31;
   lens[13]=32; lens[14]=33; lens[15]=40; lens[16]=63; lens[17]=64; lens[18]=65;
@@ -230,7 +230,7 @@ fn main() -> int32 {
   var k: int64 = 0;
   while (k < 32) { run_len(lens[k]); k = k + 1; }
 
-  if (g_fail == 0) { println(cstr("FLOAT SIMD: ALL OK")); return 0; }
-  print(cstr("FLOAT SIMD FAILURES: ")); print_int((int64)g_fail); println(cstr(""));
+  if (g_fail == 0) { println("FLOAT SIMD: ALL OK"); return 0; }
+  print("FLOAT SIMD FAILURES: "); print_int((int64)g_fail); println("");
   return 1;
 }

@@ -5,7 +5,7 @@ var g_bench_qpc_freq: int64 = 0;
 extern fn QueryPerformanceCounter(counter: int64*) -> int32 = "QueryPerformanceCounter";
 extern fn QueryPerformanceFrequency(frequency: int64*) -> int32 = "QueryPerformanceFrequency";
 
-export fn bench_time_us() -> uint64 {
+export fn bench_time_us() -> int64 {
   if (g_bench_qpc_freq == 0) {
     QueryPerformanceFrequency(&g_bench_qpc_freq);
   }
@@ -14,5 +14,5 @@ export fn bench_time_us() -> uint64 {
   if (g_bench_qpc_freq == 0) {
     return 0;
   }
-  return (uint64)((counter * 1000000) / g_bench_qpc_freq);
+  return (counter * 1000000) / g_bench_qpc_freq;
 }

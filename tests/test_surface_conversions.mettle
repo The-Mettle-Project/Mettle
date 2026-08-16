@@ -1,0 +1,170 @@
+// The surface the friction report changed, checked end to end at run time.
+//
+//   - implicit widening produces exactly what the explicit cast produced
+//   - a compile-time constant inside the destination's range needs no cast
+//   - `rawptr` allocation round-trips with no cast in either direction
+//   - print/println take a `string` and write its length, terminator or not
+//   - `cstr(s, alloc)` produces the terminated copy a C call needs
+//   - a variable written on every arm of an if/else is initialized after it
+//
+// Prints SURFACE OK when every check passes; each failure names itself.
+
+import "std/io";
+import "std/mem";
+
+var g_fail: int32 = 0;
+
+fn fail(what: string) {
+  print("FAIL ");
+  println(what);
+  g_fail = g_fail + 1;
+}
+
+fn expect(what: string, got: int64, want: int64) {
+  if (got != want) {
+    print("FAIL ");
+    print(what);
+    print(" got=");
+    print_int(got);
+    print(" want=");
+    println_int(want);
+    g_fail = g_fail + 1;
+  }
+}
+
+@noinline fn take_i64(x: int64) -> int64 { return x * 3; }
+@noinline fn widen_arg(a: int32) -> int64 { return take_i64(a); }
+@noinline fn widen_arg_cast(a: int32) -> int64 { return take_i64((int64)a); }
+@noinline fn widen_return(a: int32) -> int64 { return a; }
+@noinline fn widen_return_cast(a: int32) -> int64 { return (int64)a; }
+@noinline fn widen_u32(a: uint32) -> int64 { return a; }
+
+// A value at the edge of int32 is where a missing sign-extension would show.
+fn check_widening() {
+  var edge: int32 = 2147483647;
+  var low: int32 = 0 - 2147483648;
+  var big: uint32 = 4294967295;
+
+  expect("arg widening", widen_arg(edge), widen_arg_cast(edge));
+  expect("arg widening negative", widen_arg(low), widen_arg_cast(low));
+  expect("return widening", widen_return(edge), widen_return_cast(edge));
+  expect("return widening negative", widen_return(low), widen_return_cast(low));
+  expect("uint32 zero-extends", widen_u32(big), (int64)4294967295);
+
+  var stored: int64 = edge;
+  expect("local widening", stored * 3, (int64)6442450941);
+
+  var wide_arr: int64[4];
+  wide_arr[0] = edge;
+  wide_arr[1] = low;
+  expect("array store widening", wide_arr[0], (int64)2147483647);
+  expect("array store widening negative", wide_arr[1], (int64)-2147483648);
+
+  // bool is 0 or 1, so it widens into anything.
+  var flag: bool = true;
+  var as_i64: int64 = flag;
+  expect("bool widening", as_i64, (int64)1);
+}
+
+// The value is known, so the destination's range is checked rather than the
+// source type's. None of these needs a cast.
+fn check_constants() {
+  var b: uint8 = 200;
+  var s: int8 = 0 - 128;
+  var shifted: uint8 = 1 << 7;
+  var masked: uint8 = 0xF0 | 0x0F;
+  var u32max: uint32 = 4294967295;
+  var u64max: uint64 = 18446744073709551615;
+
+  expect("uint8 constant", (int64)b, (int64)200);
+  expect("int8 constant", (int64)s, (int64)-128);
+  expect("shifted constant", (int64)shifted, (int64)128);
+  expect("masked constant", (int64)masked, (int64)255);
+  expect("uint32 constant", (int64)u32max, (int64)4294967295);
+  if (u64max != 0xFFFFFFFFFFFFFFFF) { fail("uint64 decimal literal"); }
+}
+
+// malloc hands out an address with no element type; free takes one back.
+// Neither direction is spelled with a cast, and the buffer is int32 the whole
+// way through.
+fn check_rawptr() {
+  var n: int64 = 64;
+  var a: int32* = malloc(n * 4);
+  if (a == 0) { fail("malloc"); return; }
+  var i: int32 = 0;
+  while (i < 64) {
+    a[i] = i * 7;
+    i = i + 1;
+  }
+  expect("typed heap store", (int64)a[63], (int64)441);
+
+  var raw: rawptr = a;
+  var back: int32* = raw;
+  expect("rawptr round trip", (int64)back[10], (int64)70);
+
+  memset(a, 0, n * 4);
+  expect("memset through rawptr", (int64)a[10], (int64)0);
+  free(a);
+}
+
+fn check_strings() {
+  // A literal is a `string`: print writes its length, and nothing scans.
+  print("");
+  var greeting: string = "hello";
+  expect("literal length", (int64)greeting.length, (int64)5);
+
+  // A view over part of a buffer has no terminator at its end. print must not
+  // care; cstr is what produces one.
+  var buf: uint8[16];
+  var k: int32 = 0;
+  while (k < 16) { buf[k] = (uint8)(65 + k); k = k + 1; }
+  var view: string = "";
+  view.chars = &buf[0];
+  view.length = 4;
+
+  var copy: cstring = cstr(view, &malloc);
+  if (copy == 0) { fail("cstr allocation"); return; }
+  expect("cstr copies bytes", (int64)copy[0], (int64)65);
+  expect("cstr copies bytes", (int64)copy[3], (int64)68);
+  expect("cstr terminates", (int64)copy[4], (int64)0);
+  free(copy);
+
+  // The boundary form takes the terminated pointer the copy produced.
+  var term: cstring = cstr("boundary", &malloc);
+  if (term == 0) { fail("cstr allocation"); return; }
+  print_cstr(term);
+  println("");
+  free(term);
+}
+
+// A variable written on every arm reaches the join initialized. Before the
+// arms were intersected this was rejected as a use before initialization.
+fn check_init_join(x: int32) -> int32 {
+  var c: int32;
+  if (x > 0) {
+    c = 1;
+  } else if (x == 0) {
+    c = 2;
+  } else {
+    c = 3;
+  }
+  return c;
+}
+
+fn main() -> int32 {
+  check_widening();
+  check_constants();
+  check_rawptr();
+  check_strings();
+  expect("init join positive", (int64)check_init_join(5), (int64)1);
+  expect("init join zero", (int64)check_init_join(0), (int64)2);
+  expect("init join negative", (int64)check_init_join(0 - 5), (int64)3);
+
+  if (g_fail != 0) {
+    print("SURFACE FAILURES: ");
+    println_int((int64)g_fail);
+    return 1;
+  }
+  println("SURFACE OK");
+  return 0;
+}

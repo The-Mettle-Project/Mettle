@@ -50,7 +50,7 @@ fn uShr(x: uint32) -> uint32 {
 // Register-cached uint32 GLOBAL accumulator (leaf-function global promotion).
 fn gAcc(n: int32) -> uint32 {
   var i: int32 = 0;
-  while (i < n) { G = G + 2654435761; i = i + 1; }
+  while (i < n) { G = G + (uint32)2654435761; i = i + 1; }
   return G;
 }
 
@@ -65,7 +65,7 @@ fn castChain(x: int64) -> uint32 {
 fn u16A(a: uint32*, n: int32) -> uint16 {
   var s: uint16 = 0;
   var i: int32 = n - 1;
-  while (i >= 0) { s = s + (a[i] ^ 5); i = i - 1; }
+  while (i >= 0) { s = (uint16)(s + (a[i] ^ 5)); i = i - 1; }
   return s;
 }
 

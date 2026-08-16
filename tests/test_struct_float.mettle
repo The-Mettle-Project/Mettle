@@ -62,9 +62,9 @@ fn write_i64(v: int64) {
 
 fn line_i64(label: cstring, v: int64) {
   write_s(label);
-  write_s(cstr(" "));
+  write_s(" ");
   write_i64(v);
-  write_s(cstr("\n"));
+  write_s("\n");
 }
 
 fn line_i32(label: cstring, v: int32) {
@@ -126,81 +126,81 @@ fn fill_mixed(p: MixedProbe*) {
 
 fn probe_float_quad(prefix: cstring, p: FloatQuad*) {
   write_s(prefix);
-  write_s(cstr("\n"));
-  line_i64(cstr("  lx_mm"), scaled(p->lx, 1000.0));
-  line_i64(cstr("  lz_mm"), scaled(p->lz, 1000.0));
-  line_i64(cstr("  hx_mm"), scaled(p->hx, 1000.0));
-  line_i64(cstr("  hz_mm"), scaled(p->hz, 1000.0));
-  line_i32(cstr("  float_bounds"), float_bounds(p->lx, p->lz, p->hx, p->hz));
-  line_i32(cstr("  int_scaled_bounds"), int_scaled_bounds(p->lx, p->lz, p->hx, p->hz));
+  write_s("\n");
+  line_i64("  lx_mm", scaled(p->lx, 1000.0));
+  line_i64("  lz_mm", scaled(p->lz, 1000.0));
+  line_i64("  hx_mm", scaled(p->hx, 1000.0));
+  line_i64("  hz_mm", scaled(p->hz, 1000.0));
+  line_i32("  float_bounds", float_bounds(p->lx, p->lz, p->hx, p->hz));
+  line_i32("  int_scaled_bounds", int_scaled_bounds(p->lx, p->lz, p->hx, p->hz));
 }
 
 fn probe_engine_style(prefix: cstring, p: EngineStyleProbe*) {
   write_s(prefix);
-  write_s(cstr("\n"));
-  line_i32(cstr("  id"), p->id);
-  line_i32(cstr("  flags"), p->flags);
-  line_i64(cstr("  lx_mm"), scaled(p->lx, 1000.0));
-  line_i64(cstr("  lz_mm"), scaled(p->lz, 1000.0));
-  line_i64(cstr("  hx_mm"), scaled(p->hx, 1000.0));
-  line_i64(cstr("  hz_mm"), scaled(p->hz, 1000.0));
-  line_i32(cstr("  float_bounds"), float_bounds(p->lx, p->lz, p->hx, p->hz));
-  line_i32(cstr("  int_scaled_bounds"), int_scaled_bounds(p->lx, p->lz, p->hx, p->hz));
+  write_s("\n");
+  line_i32("  id", p->id);
+  line_i32("  flags", p->flags);
+  line_i64("  lx_mm", scaled(p->lx, 1000.0));
+  line_i64("  lz_mm", scaled(p->lz, 1000.0));
+  line_i64("  hx_mm", scaled(p->hx, 1000.0));
+  line_i64("  hz_mm", scaled(p->hz, 1000.0));
+  line_i32("  float_bounds", float_bounds(p->lx, p->lz, p->hx, p->hz));
+  line_i32("  int_scaled_bounds", int_scaled_bounds(p->lx, p->lz, p->hx, p->hz));
 }
 
 fn probe_mixed(prefix: cstring, p: MixedProbe*) {
   write_s(prefix);
-  write_s(cstr("\n"));
-  line_i32(cstr("  id"), p->id);
-  line_i32(cstr("  flags"), p->flags);
-  line_i32(cstr("  marker"), p->marker);
-  line_i64(cstr("  lx_mm"), scaled(p->lx, 1000.0));
-  line_i64(cstr("  lz_mm"), scaled(p->lz, 1000.0));
-  line_i64(cstr("  hx_mm"), scaled(p->hx, 1000.0));
-  line_i64(cstr("  hz_mm"), scaled(p->hz, 1000.0));
-  line_i32(cstr("  float_bounds"), float_bounds(p->lx, p->lz, p->hx, p->hz));
-  line_i32(cstr("  int_scaled_bounds"), int_scaled_bounds(p->lx, p->lz, p->hx, p->hz));
+  write_s("\n");
+  line_i32("  id", p->id);
+  line_i32("  flags", p->flags);
+  line_i32("  marker", p->marker);
+  line_i64("  lx_mm", scaled(p->lx, 1000.0));
+  line_i64("  lz_mm", scaled(p->lz, 1000.0));
+  line_i64("  hx_mm", scaled(p->hx, 1000.0));
+  line_i64("  hz_mm", scaled(p->hz, 1000.0));
+  line_i32("  float_bounds", float_bounds(p->lx, p->lz, p->hx, p->hz));
+  line_i32("  int_scaled_bounds", int_scaled_bounds(p->lx, p->lz, p->hx, p->hz));
 }
 
 fn main() -> int32 {
-  write_s(cstr("struct float repro\n"));
+  write_s("struct float repro\n");
 
   var fq: FloatQuad;
   fill_float_quad(&fq);
-  probe_float_quad(cstr("local FloatQuad"), &fq);
+  probe_float_quad("local FloatQuad", &fq);
   var fq_copy: FloatQuad = fq;
-  probe_float_quad(cstr("copied FloatQuad"), &fq_copy);
+  probe_float_quad("copied FloatQuad", &fq_copy);
 
   var es: EngineStyleProbe;
   fill_engine_style(&es);
-  probe_engine_style(cstr("local EngineStyleProbe"), &es);
+  probe_engine_style("local EngineStyleProbe", &es);
   var es_copy: EngineStyleProbe = es;
-  probe_engine_style(cstr("copied EngineStyleProbe"), &es_copy);
+  probe_engine_style("copied EngineStyleProbe", &es_copy);
 
   var mp: MixedProbe;
   fill_mixed(&mp);
-  probe_mixed(cstr("local MixedProbe"), &mp);
+  probe_mixed("local MixedProbe", &mp);
   var mp_copy: MixedProbe = mp;
-  probe_mixed(cstr("copied MixedProbe"), &mp_copy);
+  probe_mixed("copied MixedProbe", &mp_copy);
 
   var raw_es: cstring = calloc((int64)1, (int64)48);
   if (raw_es != 0) {
     var hp: EngineStyleProbe* = (EngineStyleProbe*)raw_es;
     fill_engine_style(hp);
-    probe_engine_style(cstr("heap EngineStyleProbe"), hp);
+    probe_engine_style("heap EngineStyleProbe", hp);
     free(raw_es);
   } else {
-    write_s(cstr("heap EngineStyleProbe allocation failed\n"));
+    write_s("heap EngineStyleProbe allocation failed\n");
   }
 
   var raw_mp: cstring = calloc((int64)1, (int64)64);
   if (raw_mp != 0) {
     var hm: MixedProbe* = (MixedProbe*)raw_mp;
     fill_mixed(hm);
-    probe_mixed(cstr("heap MixedProbe"), hm);
+    probe_mixed("heap MixedProbe", hm);
     free(raw_mp);
   } else {
-    write_s(cstr("heap MixedProbe allocation failed\n"));
+    write_s("heap MixedProbe allocation failed\n");
   }
 
   return 0;

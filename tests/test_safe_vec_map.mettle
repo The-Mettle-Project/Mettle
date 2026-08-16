@@ -14,8 +14,8 @@ fn scale(dst: int32*, src: int32*, n: int64) {
 
 fn main() -> int32 {
   var n: int64 = 64;
-  var dst: int32* = (int32*)malloc(n * 4);
-  var src: int32* = (int32*)malloc(n * 4);
+  var dst: int32* = malloc(n * 4);
+  var src: int32* = malloc(n * 4);
   var i: int64 = 0;
   while (i < n) {
     src[i] = 2;

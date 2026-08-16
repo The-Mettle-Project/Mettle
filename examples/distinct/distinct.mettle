@@ -46,21 +46,21 @@ fn main() -> int32 {
 
   var d: Foo = cast_foo(b);
 
-  print(cstr("a (Foo) = "));
+  print("a (Foo) = ");
   print_int(a.v);
-  println(cstr(""));
+  println("");
 
-  print(cstr("b (Bar) = "));
+  print("b (Bar) = ");
   print_int(b.v);
-  println(cstr(""));
+  println("");
 
-  print(cstr("c = cast[Bar]a + b (Bar) = "));
+  print("c = cast[Bar]a + b (Bar) = ");
   print_int(c.v);
-  println(cstr(""));
+  println("");
 
-  print(cstr("d = cast b (Foo) = "));
+  print("d = cast b (Foo) = ");
   print_int(d.v);
-  println(cstr(""));
+  println("");
 
   return c.v - 3;
 }

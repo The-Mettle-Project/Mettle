@@ -1,5 +1,5 @@
 import "std/io";
 fn main() -> int32 {
-  println(cstr("Hello, ARM!"));
+  println("Hello, ARM!");
   return 0;
 }

@@ -10,12 +10,12 @@ fn main() -> int32 {
   var a: cstring = mx_alloc((int64)64);
   mx_free(a);
   mx_free(a);                            // double free -> rejected
-  mx_free((cstring)0);                   // null free -> no-op (not counted)
+  mx_free(0);                   // null free -> no-op (not counted)
   var b: cstring = mx_alloc((int64)64);
   var c: cstring = mx_alloc((int64)64);
   if (b == 0 || c == 0 || b == c) { println("DF FAIL: free list corrupted"); return 1; }
 
-  mx_free((cstring)((int64)b + (int64)8)); // interior pointer -> rejected
+  mx_free((rawptr)((int64)b + (int64)8)); // interior pointer -> rejected
   mx_free(b);                            // legitimate
   mx_free(b);                            // double free -> rejected
 

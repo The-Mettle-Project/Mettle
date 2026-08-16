@@ -76,33 +76,33 @@ fn is_int_type(t: int64) -> int32 {
 
 // Print a known ggml tensor type name (the dtype of the weights), else the id.
 fn print_ggml_type(t: int64) {
-  if (t == 0) { print(cstr("F32")); return; }
-  if (t == 1) { print(cstr("F16")); return; }
-  if (t == 8) { print(cstr("Q8_0")); return; }
-  if (t == 12) { print(cstr("Q4_K")); return; }
-  if (t == 14) { print(cstr("Q6_K")); return; }
-  if (t == 15) { print(cstr("Q8_K")); return; }
-  print(cstr("type#")); print_int(t);
+  if (t == 0) { print("F32"); return; }
+  if (t == 1) { print("F16"); return; }
+  if (t == 8) { print("Q8_0"); return; }
+  if (t == 12) { print("Q4_K"); return; }
+  if (t == 14) { print("Q6_K"); return; }
+  if (t == 15) { print("Q8_K"); return; }
+  print("type#"); print_int(t);
 }
 
 fn main() -> int32 {
-  var path: cstring = cstr("C:/Users/Marquis/.lmstudio/models/lmstudio-community/gemma-4-12B-it-GGUF/gemma-4-12B-it-Q4_K_M.gguf");
-  var fp: cstring = fopen(path, cstr("rb"));
+  var path: cstring = "C:/Users/Marquis/.lmstudio/models/lmstudio-community/gemma-4-12B-it-GGUF/gemma-4-12B-it-Q4_K_M.gguf";
+  var fp: cstring = fopen(path, "rb");
   if (fp == 0) {
-    println(cstr("could not open file"));
+    println("could not open file");
     return 1;
   }
 
   // scratch buffers
-  var b: uint8* = (uint8*)malloc(16);     // small int reads
-  var scr: uint8* = (uint8*)malloc(128);  // skip chunks
-  var key: uint8* = (uint8*)malloc(128);  // metadata keys / tensor names
-  var val: uint8* = (uint8*)malloc(256);  // string values
+  var b: uint8* = malloc(16);     // small int reads
+  var scr: uint8* = malloc(128);  // skip chunks
+  var key: uint8* = malloc(128);  // metadata keys / tensor names
+  var val: uint8* = malloc(256);  // string values
 
   // ---- header ----
   fread(b, 1, 4, fp);
   if (b[0] != 71 || b[1] != 71 || b[2] != 85 || b[3] != 70) { // "GGUF"
-    println(cstr("not a GGUF file"));
+    println("not a GGUF file");
     fclose(fp);
     return 1;
   }
@@ -110,11 +110,11 @@ fn main() -> int32 {
   var n_tensors: int64 = read_u64v(fp, b);
   var n_kv: int64 = read_u64v(fp, b);
 
-  print(cstr("GGUF version ")); print_int(version);
-  print(cstr(",  ")); print_int(n_tensors);
-  print(cstr(" tensors,  ")); print_int(n_kv);
-  println(cstr(" metadata entries"));
-  println(cstr("------------------------------------------------------------"));
+  print("GGUF version "); print_int(version);
+  print(",  "); print_int(n_tensors);
+  print(" tensors,  "); print_int(n_kv);
+  println(" metadata entries");
+  println("------------------------------------------------------------");
 
   // ---- metadata key/value pairs ----
   var i: int64 = 0;
@@ -122,18 +122,18 @@ fn main() -> int32 {
     read_str(fp, b, scr, key, 128);
     var vtype: int64 = read_u32v(fp, b);
 
-    print(cstr("  "));
-    print((cstring)key);
-    print(cstr(" = "));
+    print("  ");
+    print_cstr((cstring)key);
+    print(" = ");
 
     if (vtype == 8) {                       // string
       read_str(fp, b, scr, val, 256);
-      println((cstring)val);
+      println_cstr((cstring)val);
     } else if (vtype == 9) {                // array
       var et: int64 = read_u32v(fp, b);
       var cnt: int64 = read_u64v(fp, b);
-      print(cstr("[array of ")); print_int(cnt);
-      print(cstr(" x type#")); print_int(et); println(cstr("]"));
+      print("[array of "); print_int(cnt);
+      print(" x type#"); print_int(et); println("]");
       // skip the elements
       if (et == 8) {
         var k: int64 = 0;
@@ -156,15 +156,15 @@ fn main() -> int32 {
       println_int(v);
     } else {                                // float scalar (f32/f64)
       skip_bytes(fp, scr, scalar_size(vtype));
-      println(cstr("(float)"));
+      println("(float)");
     }
     i = i + 1;
   }
 
   // ---- tensor table ----
-  println(cstr("------------------------------------------------------------"));
-  println(cstr("tensors (first 12):"));
-  var hist: int64* = (int64*)malloc(40 * 8);
+  println("------------------------------------------------------------");
+  println("tensors (first 12):");
+  var hist: int64* = malloc(40 * 8);
   var z: int64 = 0;
   while (z < 40) { hist[z] = 0; z = z + 1; }
 
@@ -185,26 +185,26 @@ fn main() -> int32 {
     if (gt >= 0 && gt < 40) { hist[gt] = hist[gt] + 1; }
 
     if (t < 12) {
-      print(cstr("  "));
-      print((cstring)key);
-      print(cstr("  ["));
+      print("  ");
+      print_cstr((cstring)key);
+      print("  [");
       print_int(d0);
-      if (ndim > 1) { print(cstr(" x ")); print_int(d1); }
-      print(cstr("]  "));
+      if (ndim > 1) { print(" x "); print_int(d1); }
+      print("]  ");
       print_ggml_type(gt);
-      println(cstr(""));
+      println("");
     }
     t = t + 1;
   }
 
-  println(cstr("------------------------------------------------------------"));
-  println(cstr("tensor dtype histogram:"));
+  println("------------------------------------------------------------");
+  println("tensor dtype histogram:");
   var h: int64 = 0;
   while (h < 40) {
     if (hist[h] > 0) {
-      print(cstr("  "));
+      print("  ");
       print_ggml_type(h);
-      print(cstr(": "));
+      print(": ");
       println_int(hist[h]);
     }
     h = h + 1;

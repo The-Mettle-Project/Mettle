@@ -165,25 +165,25 @@ export struct VkGraphicsPipelineCreateInfo {
 import "std/io";
 
 export fn main() -> int32 {
-  print(cstr("StageInfo "));
+  print("StageInfo ");
   print_int((int64)sizeof(VkPipelineShaderStageCreateInfo));
   newline();
-  print(cstr("GraphicsPipeline "));
+  print("GraphicsPipeline ");
   print_int((int64)sizeof(VkGraphicsPipelineCreateInfo));
   newline();
-  print(cstr("DepthStencil "));
+  print("DepthStencil ");
   print_int((int64)sizeof(VkPipelineDepthStencilStateCreateInfo));
   newline();
-  print(cstr("Raster "));
+  print("Raster ");
   print_int((int64)sizeof(VkPipelineRasterizationStateCreateInfo));
   newline();
-  print(cstr("ColorBlend "));
+  print("ColorBlend ");
   print_int((int64)sizeof(VkPipelineColorBlendStateCreateInfo));
   newline();
-  print(cstr("VertexInput "));
+  print("VertexInput ");
   print_int((int64)sizeof(VkPipelineVertexInputStateCreateInfo));
   newline();
-  print(cstr("Layout "));
+  print("Layout ");
   print_int((int64)sizeof(VkPipelineLayoutCreateInfo));
   newline();
   return 0;

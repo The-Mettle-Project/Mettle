@@ -23,8 +23,8 @@ fn dot(a: int32*, b: int32*, n: int64) -> int64 {
 
 fn main() -> int32 {
   var n: int64 = 64;
-  var a: int32* = (int32*)malloc(n * 4);
-  var b: int32* = (int32*)malloc(n * 4);
+  var a: int32* = malloc(n * 4);
+  var b: int32* = malloc(n * 4);
   var i: int64 = 0;
   while (i < n) {
     a[i] = 1;

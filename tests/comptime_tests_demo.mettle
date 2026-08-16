@@ -16,7 +16,7 @@ fn double_it(x: int64) -> int64 {
 extern fn malloc(size: int64) -> int64*;
 
 @test fn test_leak() -> int64 {
-    var p: int64* = (int64*)malloc(24);
+    var p: int64* = malloc(24);
     p[0] = 5;
     assert_eq(p[0], 5);
     return 0;

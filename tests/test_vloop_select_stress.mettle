@@ -32,54 +32,54 @@ fn main() -> int32 {
   var sizes: int32[7];
   sizes[0] = 0; sizes[1] = 1; sizes[2] = 7; sizes[3] = 8;
   sizes[4] = 9; sizes[5] = 63; sizes[6] = 2047;
-  var s: int32* = (int32*)malloc(2048 * 4);
-  var d: int32* = (int32*)malloc(2048 * 4);
-  var e: int32* = (int32*)malloc(2048 * 4);
+  var s: int32* = malloc(2048 * 4);
+  var d: int32* = malloc(2048 * 4);
+  var e: int32* = malloc(2048 * 4);
   var q: int32 = 0;
   while (q < 7) {
     var n: int32 = sizes[q];
     var i: int32 = 0;
-    while (i < 2048) { s[i] = (i * 2654435761 + q * 7919) % 511 - 255; GA[i] = s[i]; i = i + 1; }
+    while (i < 2048) { s[i] = (int32)((i * 2654435761 + q * 7919) % 511 - 255); GA[i] = s[i]; i = i + 1; }
 
     // k00
     k00(s, d, n); i = 0;
-    while (i < n) { var v: int32 = s[i]; if (v < -60) { v = -60; } if (v > 60) { v = 60; } if (d[i] != v) { print(cstr("k00 n=")); println_int((int64)n); return 1; } i = i + 1; }
+    while (i < n) { var v: int32 = s[i]; if (v < -60) { v = -60; } if (v > 60) { v = 60; } if (d[i] != v) { print("k00 n="); println_int((int64)n); return 1; } i = i + 1; }
     // k01
     k01(s, d, n); i = 0;
-    while (i < n) { var v1: int32 = s[i]; if (v1 > 60) { v1 = 60; } if (v1 < -60) { v1 = -60; } if (d[i] != v1) { println(cstr("k01")); return 2; } i = i + 1; }
+    while (i < n) { var v1: int32 = s[i]; if (v1 > 60) { v1 = 60; } if (v1 < -60) { v1 = -60; } if (d[i] != v1) { println("k01"); return 2; } i = i + 1; }
     // k02
     k02(s, d, n); i = 0;
-    while (i < n) { var v2: int32 = s[i]; if (v2 < 0) { v2 = 0; } if (d[i] != v2 * 2) { println(cstr("k02")); return 3; } i = i + 1; }
+    while (i < n) { var v2: int32 = s[i]; if (v2 < 0) { v2 = 0; } if (d[i] != v2 * 2) { println("k02"); return 3; } i = i + 1; }
     // k03
     k03(s, d, n); i = 0;
-    while (i < n) { var v3: int32 = s[i]; if (0 > v3) { v3 = 0; } else { v3 = v3 + 1; } if (d[i] != v3) { println(cstr("k03")); return 4; } i = i + 1; }
+    while (i < n) { var v3: int32 = s[i]; if (0 > v3) { v3 = 0; } else { v3 = v3 + 1; } if (d[i] != v3) { println("k03"); return 4; } i = i + 1; }
     // k04
     k04(s, d, n); i = 0;
-    while (i < n) { var v4: int32 = s[i]; var r4: int32 = v4; if (v4 <= -50) { r4 = v4 * 3; } else { if (v4 >= 50) { r4 = v4 - 9; } } if (d[i] != r4) { println(cstr("k04")); return 5; } i = i + 1; }
+    while (i < n) { var v4: int32 = s[i]; var r4: int32 = v4; if (v4 <= -50) { r4 = v4 * 3; } else { if (v4 >= 50) { r4 = v4 - 9; } } if (d[i] != r4) { println("k04"); return 5; } i = i + 1; }
     // k05
     k05(s, d, n); i = 0;
-    while (i < n) { var v5: int32 = 0; if (s[i] != 0) { v5 = s[i]; } if (d[i] != v5) { println(cstr("k05")); return 6; } i = i + 1; }
+    while (i < n) { var v5: int32 = 0; if (s[i] != 0) { v5 = s[i]; } if (d[i] != v5) { println("k05"); return 6; } i = i + 1; }
     // k06
     k06(s, d, n); i = 0;
-    while (i < n) { var v6: int32 = 1; if (s[i] < 0) { v6 = -1; } if (d[i] != v6) { println(cstr("k06")); return 7; } i = i + 1; }
+    while (i < n) { var v6: int32 = 1; if (s[i] < 0) { v6 = -1; } if (d[i] != v6) { println("k06"); return 7; } i = i + 1; }
     // k07 / k08
     var c7: int32 = 0; var c8: int32 = 0; i = 0;
     while (i < n) { if (s[i] < -100) { c7 = c7 + 3; } if (s[i] != 0) { c8 = c8 + s[i]; } i = i + 1; }
-    if (k07(s, n) != c7) { println(cstr("k07")); return 8; }
-    if (k08(s, n) != c8) { println(cstr("k08")); return 9; }
+    if (k07(s, n) != c7) { println("k07"); return 8; }
+    if (k08(s, n) != c8) { println("k08"); return 9; }
     // k09 / k10 / k11 over globals
     k09(n); i = 0;
-    while (i < n) { var v9: int32 = GA[i]; if (v9 < 0) { v9 = 0 - v9; } if (GB[i] != v9) { println(cstr("k09")); return 10; } i = i + 1; }
+    while (i < n) { var v9: int32 = GA[i]; if (v9 < 0) { v9 = 0 - v9; } if (GB[i] != v9) { println("k09"); return 10; } i = i + 1; }
     var t10: int64 = 0; var c11: int32 = 0; i = 0;
     while (i < n) { t10 = t10 + (int64)GB[i]; if (GA[i] > 100) { c11 = c11 + 1; } i = i + 1; }
-    if (k10(n) != t10) { println(cstr("k10")); return 11; }
-    if (k11(n) != c11) { println(cstr("k11")); return 12; }
+    if (k10(n) != t10) { println("k10"); return 11; }
+    if (k11(n) != c11) { println("k11"); return 12; }
     // k12 / k13: seeded extrema. Undefined for n == 0, as in the source.
     if (n > 0) {
       var e12: int32 = s[0]; var e13: int32 = s[0]; i = 1;
       while (i < n) { if (s[i] > e12) { e12 = s[i]; } if (s[i] < e13) { e13 = s[i]; } i = i + 1; }
-      if (k12(s, n) != e12) { println(cstr("k12")); return 13; }
-      if (k13(s, n) != e13) { println(cstr("k13")); return 14; }
+      if (k12(s, n) != e12) { println("k12"); return 13; }
+      if (k13(s, n) != e13) { println("k13"); return 14; }
     }
     q = q + 1;
   }

@@ -15,7 +15,7 @@ fn total(data: int32*, n: int64) -> int64 {
 
 fn main() -> int32 {
   var n: int64 = 64;
-  var data: int32* = (int32*)malloc(n * 4);
+  var data: int32* = malloc(n * 4);
   var i: int64 = 0;
   while (i < n) {
     data[i] = 1;

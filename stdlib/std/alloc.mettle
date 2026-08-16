@@ -346,7 +346,7 @@ fn mem_free_nolock(h: MemHeap*, p: cstring) {
 
 // Allocate `n` bytes from `h`. Returns 0 on bad input or OOM. Contents are
 // uninitialized (use mem_calloc to zero).
-export fn mem_alloc(h: MemHeap*, n: int64) -> cstring {
+export fn mem_alloc(h: MemHeap*, n: int64) -> rawptr {
   if (h == 0 || n <= (int64)0) {
     return 0;
   }
@@ -359,7 +359,7 @@ export fn mem_alloc(h: MemHeap*, n: int64) -> cstring {
 // Allocate `count * size` zero-filled bytes from `h`. Rejects a count*size
 // multiply that would overflow int64 (returns 0) so a wrapped-around small
 // request can never under-allocate behind a large logical size.
-export fn mem_calloc(h: MemHeap*, count: int64, size: int64) -> cstring {
+export fn mem_calloc(h: MemHeap*, count: int64, size: int64) -> rawptr {
   if (h == 0 || count <= (int64)0 || size <= (int64)0) {
     return 0;
   }
@@ -379,7 +379,7 @@ export fn mem_calloc(h: MemHeap*, count: int64, size: int64) -> cstring {
 
 // Free a block previously returned by mem_alloc/mem_calloc/mem_realloc on `h`.
 // Freeing 0 is a no-op. The block must belong to `h`.
-export fn mem_free(h: MemHeap*, p: cstring) {
+export fn mem_free(h: MemHeap*, p: rawptr) {
   if (h == 0 || p == 0) {
     return;
   }
@@ -391,7 +391,7 @@ export fn mem_free(h: MemHeap*, p: cstring) {
 // Resize a block, preserving its contents up to the smaller of old/new size.
 // realloc(h, 0, n) == alloc; realloc(h, p, 0) frees and returns 0. Returns 0 on
 // OOM with the original block left intact.
-export fn mem_realloc(h: MemHeap*, p: cstring, newsize: int64) -> cstring {
+export fn mem_realloc(h: MemHeap*, p: rawptr, newsize: int64) -> rawptr {
   if (p == 0) {
     return mem_alloc(h, newsize);
   }
@@ -533,19 +533,19 @@ export fn mem_default_heap() -> MemHeap* {
   return g_mem_default_heap;
 }
 
-export fn mx_alloc(n: int64) -> cstring {
+export fn mx_alloc(n: int64) -> rawptr {
   return mem_alloc(mem_default_heap(), n);
 }
 
-export fn mx_calloc(count: int64, size: int64) -> cstring {
+export fn mx_calloc(count: int64, size: int64) -> rawptr {
   return mem_calloc(mem_default_heap(), count, size);
 }
 
-export fn mx_realloc(p: cstring, newsize: int64) -> cstring {
+export fn mx_realloc(p: rawptr, newsize: int64) -> rawptr {
   return mem_realloc(mem_default_heap(), p, newsize);
 }
 
-export fn mx_free(p: cstring) {
+export fn mx_free(p: rawptr) {
   mem_free(mem_default_heap(), p);
 }
 
@@ -563,28 +563,28 @@ export fn mx_stats() -> MemStats {
 // the IR call graph. They run on the (thread-safe) process-global heap.
 
 // Backing for `new`: `n` zero-filled bytes.
-export fn mettle_heap_zeroed(n: int64) -> cstring {
+export fn mettle_heap_zeroed(n: int64) -> rawptr {
   return mem_calloc(mem_default_heap(), (int64)1, n);
 }
 
 // Backing for calloc: count*size zero-filled bytes with an overflow guard, so
 // the multiply happens in checked Mettle rather than as an unchecked register
 // imul in the backend.
-export fn mettle_heap_calloc(count: int64, size: int64) -> cstring {
+export fn mettle_heap_calloc(count: int64, size: int64) -> rawptr {
   return mem_calloc(mem_default_heap(), count, size);
 }
 
 // Backing for malloc: `n` uninitialized bytes.
-export fn mettle_heap_alloc(n: int64) -> cstring {
+export fn mettle_heap_alloc(n: int64) -> rawptr {
   return mem_alloc(mem_default_heap(), n);
 }
 
 // Backing for realloc.
-export fn mettle_heap_realloc(p: cstring, n: int64) -> cstring {
+export fn mettle_heap_realloc(p: rawptr, n: int64) -> rawptr {
   return mem_realloc(mem_default_heap(), p, n);
 }
 
 // Backing for `delete` and free.
-export fn mettle_heap_free(p: cstring) {
+export fn mettle_heap_free(p: rawptr) {
   mem_free(mem_default_heap(), p);
 }

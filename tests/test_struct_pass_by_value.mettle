@@ -36,9 +36,9 @@ fn write_i64(v: int64) {
 
 fn line_i64(label: cstring, v: int64) {
   write_s(label);
-  write_s(cstr(" "));
+  write_s(" ");
   write_i64(v);
-  write_s(cstr("\n"));
+  write_s("\n");
 }
 
 fn scaled(v: float64) -> int64 {
@@ -77,27 +77,27 @@ fn mixed_c(m: Mixed) -> int32 {
 }
 
 fn main() -> int32 {
-  write_s(cstr("struct pass by value\n"));
+  write_s("struct pass by value\n");
 
   var t: ThreeI32;
   t.a = 11;
   t.b = 22;
   t.c = 33;
 
-  line_i64(cstr("sum_three"), (int64)sum_three(t));
-  line_i64(cstr("third"), (int64)third(t));
+  line_i64("sum_three", (int64)sum_three(t));
+  line_i64("third", (int64)third(t));
 
   clobber(t);
-  line_i64(cstr("after_clobber_a"), (int64)t.a);
-  line_i64(cstr("after_clobber_b"), (int64)t.b);
-  line_i64(cstr("after_clobber_c"), (int64)t.c);
+  line_i64("after_clobber_a", (int64)t.a);
+  line_i64("after_clobber_b", (int64)t.b);
+  line_i64("after_clobber_c", (int64)t.c);
 
   var m: Mixed;
   m.a = 11;
   m.b = -3.5;
   m.c = 22;
-  line_i64(cstr("mixed_b_mm"), mixed_b_scaled(m));
-  line_i64(cstr("mixed_c"), (int64)mixed_c(m));
+  line_i64("mixed_b_mm", mixed_b_scaled(m));
+  line_i64("mixed_c", (int64)mixed_c(m));
 
   return 0;
 }

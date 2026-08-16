@@ -59,10 +59,10 @@ fn same_type_shares() -> int64 {
 }
 
 fn main() -> int32 {
-  if (siblings() != 15) { println(cstr("scoped_shadowing siblings WRONG")); return 1; }
-  if (nested() != 5) { println(cstr("scoped_shadowing nested WRONG")); return 2; }
-  if (widened() != 16) { println(cstr("scoped_shadowing widened WRONG")); return 3; }
-  if (same_type_shares() != 7) { println(cstr("scoped_shadowing same_type WRONG")); return 4; }
-  println(cstr("scoped_shadowing OK"));
+  if (siblings() != 15) { println("scoped_shadowing siblings WRONG"); return 1; }
+  if (nested() != 5) { println("scoped_shadowing nested WRONG"); return 2; }
+  if (widened() != 16) { println("scoped_shadowing widened WRONG"); return 3; }
+  if (same_type_shares() != 7) { println("scoped_shadowing same_type WRONG"); return 4; }
+  println("scoped_shadowing OK");
   return 0;
 }

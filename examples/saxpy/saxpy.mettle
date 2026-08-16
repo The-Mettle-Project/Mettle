@@ -5,8 +5,8 @@ import "std/bench";
 const N = 65536;
 
 fn main() -> int32 {
-  var x: float64* = (float64*)malloc((int64)N * 8);
-  var y: float64* = (float64*)malloc((int64)N * 8);
+  var x: float64* = malloc((int64)N * 8);
+  var y: float64* = malloc((int64)N * 8);
   var i: int32 = 0;
   while (i < N) {
     x[i] = (float64)i * 0.25 + 1.0;
@@ -18,8 +18,8 @@ fn main() -> int32 {
   var passes: int32 = 3000;
   println("float64 SAXPY y=a*x+y: 65536 elems x 3000 passes");
 
-  var t0: uint64 = bench_time_us();
-  var aseq: float64* = (float64*)malloc((int64)passes * 8);
+  var t0: int64 = bench_time_us();
+  var aseq: float64* = malloc((int64)passes * 8);
   var av: float64 = a; var pp: int32 = 0;
   while (pp < passes) {aseq[pp] = av; av = av * 1.0000001; pp = pp + 1;}
 
@@ -39,7 +39,7 @@ fn main() -> int32 {
     }
     base = base + TILE;
   }
-  var elapsed_us: uint64 = bench_time_us() - t0;
+  var elapsed_us: int64 = bench_time_us() - t0;
 
   print("Checksum = ");
   println_int((int64)y[0] + (int64)y[N - 1]);
@@ -47,7 +47,7 @@ fn main() -> int32 {
   print_int(elapsed_us);
   println(" us");
 
-  free((cstring)x);
-  free((cstring)y);
+  free(x);
+  free(y);
   return 0;
 }

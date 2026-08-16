@@ -97,9 +97,9 @@ fn main() -> int32 {
   }
 
   if (ok == 1) {
-    println(cstr("shift_loop OK"));
+    println("shift_loop OK");
     return 0;
   }
-  println(cstr("shift_loop FAIL"));
+  println("shift_loop FAIL");
   return 1;
 }

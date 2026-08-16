@@ -1,8 +1,8 @@
 import "std/io";
 
-fn before() { puts(cstr("BEFORE\n")); }
-fn inside() { puts(cstr("INSIDE\n")); }
-fn after() { puts(cstr("AFTER\n")); }
+fn before() { puts("BEFORE\n"); }
+fn inside() { puts("INSIDE\n"); }
+fn after() { puts("AFTER\n"); }
 
 fn main() -> int32 {
   before();

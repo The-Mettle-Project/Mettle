@@ -45,7 +45,7 @@ fn read_line(buf: cstring, max_len: int32) -> int32 {
       buf[i] = 0;
       return i;
     }
-    buf[i] = c;
+    buf[i] = (uint8)c;
     i = i + 1;
   }
   buf[max_len] = 0;
@@ -77,16 +77,16 @@ fn main() -> int32 {
   var target: int32 = rand_range_1_100();
   var guesses: int32 = 0;
 
-  println(cstr(welcome));
-  println(cstr(newline));
+  println(welcome);
+  println(newline);
 
   while (1) {
-    print(cstr(prompt));
+    print(prompt);
 
     var buf: uint8[32];
     var len: int32 = read_line(&buf[0], 31);
     if (len == 0) {
-      println(cstr(invalid));
+      println(invalid);
       continue;
     }
 
@@ -94,17 +94,17 @@ fn main() -> int32 {
     guesses = guesses + 1;
 
     if (guess < 1 || guess > 100) {
-      println(cstr(invalid));
+      println(invalid);
       continue;
     }
 
     if (guess < target) {
-      println(cstr(too_low));
+      println(too_low);
     } else if (guess > target) {
-      println(cstr(too_high));
+      println(too_high);
     } else {
-      println(cstr(correct));
-      print(cstr(guesses_label));
+      println(correct);
+      print(guesses_label);
       println_int(guesses);
       return 0;
     }

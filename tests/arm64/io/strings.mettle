@@ -4,11 +4,8 @@ import "std/io";
 // Treating the local as one 8-byte chars pointer made that load read the first
 // eight characters and then branch through them as an address.
 fn main() -> int32 {
-  var msg1: string = "Hello from println!";
-  println(msg1);
-  var msg2: string = "Hello from ";
-  print(msg2);
-  var msg3: string = "print!\n";
-  print(msg3);
+  println("Hello from println!");
+  print("Hello from ");
+  print("print!\n");
   return 0;
 }

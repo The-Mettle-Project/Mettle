@@ -1,7 +1,7 @@
 import "std/io";
 
-fn iter_defer() { puts(cstr("ITER_DEFER\n")); }
-fn iter_body() { puts(cstr("ITER_BODY\n")); }
+fn iter_defer() { puts("ITER_DEFER\n"); }
+fn iter_body() { puts("ITER_BODY\n"); }
 
 fn main() -> int32 {
   var i: int32 = 0;

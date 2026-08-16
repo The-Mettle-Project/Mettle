@@ -14,9 +14,9 @@ fn main() -> int32 {
     return 2;
   }
   scene_seed_default(sc);
-  scene_io_save(cstr(".tmp/test_direct_object_scene_save_names.mscene"), sc, cstr(""));
+  scene_io_save(".tmp/test_direct_object_scene_save_names.mscene", sc, "");
   scene_clear(sc);
-  scene_io_load(cstr(".tmp/test_direct_object_scene_save_names.mscene"), sc, meshes, cstr(""));
+  scene_io_load(".tmp/test_direct_object_scene_save_names.mscene", sc, meshes, "");
   var e: Entity* = scene_row(sc, 0);
   if (e == 0) {
     mesh_store_destroy(meshes);

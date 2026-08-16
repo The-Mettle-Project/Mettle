@@ -91,14 +91,14 @@ const BAD_WINDOW:  Window = { width: 1920, height: 1080, refresh_hz: 1000 };
 
 fn report<T>(label: cstring, obj: T*, names: cstring*, bounds: Range*, n: int32) {
   var bad: int32 = first_violation<T>(obj, bounds, n);
-  print(label);
+  print_cstr(label);
   if (bad < 0) {
     println(": ok");
     return;
   }
   var values: int32* = (int32*)obj;
   print(": ");
-  print(names[bad]);
+  print_cstr(names[bad]);
   print(" = ");
   print_int((int64)values[bad]);
   print(" is outside ");

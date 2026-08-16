@@ -39,7 +39,7 @@ fn main() -> int32 {
         total = total + scale(i, 3);
         i = i + 1;
     }
-    print(cstr("total="));
+    print("total=");
     println_int(total);
     return corner.x - corner.x;
 }

@@ -21,11 +21,11 @@ fn append(dst: cstring, dst_cap: int32, pos: int32, src: cstring) -> int32 {
 fn main() -> int32 {
   var buf: uint8[128];
   var out: cstring = (cstring)((int64)(&(buf[0])));
-  var p: int32 = append(out, 128, 0, cstr("Project: "));
-  p = append(out, 128, p, cstr("Untitled"));
-  p = append(out, 128, p, cstr("   Root: "));
-  p = append(out, 128, p, cstr("G:\\Projects\\Mettle\\examples"));
+  var p: int32 = append(out, 128, 0, "Project: ");
+  p = append(out, 128, p, "Untitled");
+  p = append(out, 128, p, "   Root: ");
+  p = append(out, 128, p, "G:\\Projects\\Mettle\\examples");
   out[p] = 0;
-  println(out);
+  println_cstr(out);
   return 0;
 }

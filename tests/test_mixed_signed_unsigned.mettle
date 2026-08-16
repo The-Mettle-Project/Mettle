@@ -11,8 +11,8 @@ fn take_i16(x: int16) -> int32 {
 fn main() -> int32 {
   var u8: uint8 = 255;
   var i8: int8 = -1;
-  var u16: uint16 = take_u16(u8);
-  var i16: int16 = take_i16(i8);
+  var u16: uint16 = (uint16)take_u16(u8);
+  var i16: int16 = (int16)take_i16(i8);
   if (u16 == 255 && i16 == -1) {
     return 1;
   }

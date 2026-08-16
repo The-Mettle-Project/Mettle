@@ -9,8 +9,7 @@
 
 import "std/io";
 
-function main() -> int32 {
-  var msg: string = "Hello, world!";
-  println(cstr(msg));
+fn main() -> int32 {
+  println("Hello, world!");
   return 0;
 }

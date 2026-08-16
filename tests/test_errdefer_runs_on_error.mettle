@@ -1,7 +1,7 @@
 import "std/io";
 
-fn ok() { puts(cstr("OK\n")); }
-fn err() { puts(cstr("ERR\n")); }
+fn ok() { puts("OK\n"); }
+fn err() { puts("ERR\n"); }
 
 fn main() -> int32 {
   errdefer err();

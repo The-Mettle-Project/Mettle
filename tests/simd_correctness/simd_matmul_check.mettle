@@ -69,10 +69,10 @@ fn rnd() -> int32 {
 }
 
 fn main() -> int32 {
-  var a: int32* = (int32*)malloc(1024 * 4);
-  var b: int32* = (int32*)malloc(1024 * 4);
-  var c: int32* = (int32*)malloc(1024 * 4);
-  var cref: int32* = (int32*)malloc(1024 * 4);
+  var a: int32* = malloc(1024 * 4);
+  var b: int32* = malloc(1024 * 4);
+  var c: int32* = malloc(1024 * 4);
+  var cref: int32* = malloc(1024 * 4);
 
   var i: int64 = 0;
   while (i < 1024) { a[i] = rnd(); b[i] = rnd(); i = i + 1; }
@@ -87,10 +87,10 @@ fn main() -> int32 {
     i = i + 1;
   }
 
-  if (fails == 0) { println(cstr("MATMUL SIMD: ALL OK (1024 cells)")); }
-  else { print(cstr("MATMUL FAILURES: ")); print_int((int64)fails); println(cstr("")); }
+  if (fails == 0) { println("MATMUL SIMD: ALL OK (1024 cells)"); }
+  else { print("MATMUL FAILURES: "); print_int((int64)fails); println(""); }
 
-  free((cstring)a); free((cstring)b); free((cstring)c); free((cstring)cref);
+  free(a); free(b); free(c); free(cref);
   if (fails == 0) { return 0; }
   return 1;
 }

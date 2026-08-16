@@ -59,7 +59,7 @@ fn clean(n: int32) -> int32 {
 fn clean_guarded_null(n: int32) -> int32 {
     var p: int32* = 0;
     if (n > 0) {
-        p = (int32*)malloc(8);
+        p = malloc(8);
     }
     if (p != 0) {
         return p[0];

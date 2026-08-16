@@ -1,0 +1,55 @@
+// The compile-time interpreter is the machine behind `mettle test`, `trace`,
+// `--pgo`, `--verify` and the `--ml-opt` gate. If it does not wrap a narrow
+// integer where a register does, those five disagree with the program they
+// describe -- and the differential gates report a miscompile that is really a
+// disagreement about semantics. These run with no codegen at all, so what they
+// pin is the interpreter's arithmetic, not the backend's.
+
+@test fn int32_local_wraps() {
+  var big: int32 = 1000000000;
+  var v: int32 = big * 3 + 7;              // 3000000007 does not fit int32
+  assert(v == 0 - 1294967289);
+  var widened: int64 = v;                  // and the wrap sign-extends
+  assert(widened == 0 - 1294967289);
+}
+
+@test fn uint32_local_wraps() {
+  var big: uint32 = 4000000000;
+  var v: uint32 = big + big;
+  assert(v == (uint32)3705032704);         // wraps mod 2^32, zero-extended
+  var widened: int64 = v;
+  assert(widened == (int64)3705032704);
+}
+
+@test fn narrow_locals_wrap() {
+  var a: int8 = 127;
+  var b: int8 = (int8)(a + 1);
+  assert(b == 0 - 128);
+
+  var u: uint8 = 250;
+  var w: uint8 = (uint8)(u + 10);
+  assert(w == 4);
+
+  var s: int16 = 32767;
+  var t: int16 = (int16)(s + 1);
+  assert(t == 0 - 32768);
+}
+
+@test fn parameter_arrives_narrowed() {
+  assert(wrap_i32(1000000000) == 0 - 1294967289);
+  assert(wrap_u8(300) == 44);
+}
+
+fn wrap_i32(x: int32) -> int64 {
+  var v: int32 = x * 3 + 7;
+  return v;
+}
+
+fn wrap_u8(x: int32) -> int64 {
+  var v: uint8 = (uint8)x;
+  return (int64)v;
+}
+
+fn main() -> int32 {
+  return 0;
+}

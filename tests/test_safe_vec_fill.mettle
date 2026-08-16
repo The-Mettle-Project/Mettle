@@ -13,7 +13,7 @@ fn fill(data: int32*, n: int64, value: int32) {
 
 fn main() -> int32 {
   var n: int64 = 64;
-  var data: int32* = (int32*)malloc(n * 4);
+  var data: int32* = malloc(n * 4);
 
   fill(data, n + 64, 7);
   println_int((int64)data[0]);

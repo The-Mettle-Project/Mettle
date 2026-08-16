@@ -34,7 +34,7 @@ fn main() -> int32 {
 
   var buf: cstring = malloc(buf_size);
   if (buf == 0) {
-    println(cstr("malloc failed"));
+    println("malloc failed");
     return 1;
   }
 
@@ -44,26 +44,26 @@ fn main() -> int32 {
     if (pos + chunk > buf_size) {
       chunk = buf_size - pos;
     }
-    memcpy(buf + pos, cstr(template), chunk);
+    memcpy(buf + pos, template, chunk);
     pos = pos + chunk;
   }
 
-  println(cstr("Popcount: 256 KB buffer x 200 passes"));
+  println("Popcount: 256 KB buffer x 200 passes");
 
-  var t0: uint64 = bench_time_us();
+  var t0: int64 = bench_time_us();
   var bench_sum: int64 = 0;
   var p: int32 = 0;
   while (p < passes) {
     bench_sum = bench_sum + popcount_buffer(buf, buf_size);
     p = p + 1;
   }
-  var elapsed_us: uint64 = bench_time_us() - t0;
+  var elapsed_us: int64 = bench_time_us() - t0;
 
-  print(cstr("Bench sum = "));
+  print("Bench sum = ");
   println_int(bench_sum);
-  print(cstr("Time: "));
+  print("Time: ");
   print_int(elapsed_us);
-  println(cstr(" us"));
+  println(" us");
 
   free(buf);
   return 0;

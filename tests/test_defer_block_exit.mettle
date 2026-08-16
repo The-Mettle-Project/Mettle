@@ -1,8 +1,8 @@
 import "std/io";
 
-fn inner_defer() { puts(cstr("INNER\n")); }
-fn after_block() { puts(cstr("AFTER\n")); }
-fn outer_defer() { puts(cstr("OUTER\n")); }
+fn inner_defer() { puts("INNER\n"); }
+fn after_block() { puts("AFTER\n"); }
+fn outer_defer() { puts("OUTER\n"); }
 
 fn main() -> int32 {
   defer outer_defer();

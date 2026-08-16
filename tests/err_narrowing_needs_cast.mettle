@@ -1,0 +1,34 @@
+// Widen silently, narrow loudly. Every position a value can flow into has to
+// report the narrowing, not just a declaration: an argument, a return, a struct
+// field, and an array element are all places a value lands.
+//
+// The widenings below are deliberate: none of them may report anything.
+
+struct Box { small: int32; }
+
+fn takes_i32(x: int32) -> int32 { return x; }
+
+fn returns_i32(n: int64) -> int32 {
+  return n;                       // M0119: return position
+}
+
+fn main() -> int32 {
+  var wide: int64 = 5000000000;
+  var u: uint64 = 1;
+
+  // Widening: silent, and the file would fail differently if these reported.
+  var ok_wide: int64 = takes_i32(7);
+  var ok_bool: int32 = 1 > 0;
+
+  var narrow: int32 = wide;       // M0119: declaration
+  var arr: int32[4];
+  arr[0] = wide;                  // M0119: array element
+  var b: Box;
+  b.small = wide;                 // M0119: struct field
+  narrow = takes_i32(wide);       // M0119: argument
+  var from_unsigned: int64 = u;   // M0119: uint64 does not fit int64
+
+  var total: int32 = narrow + (int32)ok_wide + ok_bool;
+  total = total + returns_i32(wide) + arr[0] + b.small;
+  return total + (int32)from_unsigned;
+}

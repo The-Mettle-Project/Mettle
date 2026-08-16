@@ -41,7 +41,7 @@ fn qs(pi: ProbIndex*, lo: int32, hi: int32) {
 
 fn main() -> int32 {
   var n: int32 = 259;
-  var pi: ProbIndex* = (ProbIndex*)malloc((int64)n * (int64)sizeof(ProbIndex));
+  var pi: ProbIndex* = malloc((int64)n * (int64)sizeof(ProbIndex));
   var k: int32 = 0;
   while (k < n) {
     pi[k].prob = rand_f32();
@@ -50,20 +50,20 @@ fn main() -> int32 {
   }
   qs(pi, 0, n - 1);
   if (spins > 1000000) {
-    println(cstr("rotate_backedge SPUN"));
+    println("rotate_backedge SPUN");
     fflush(get_stdout());
     return 1;
   }
   k = 1;
   while (k < n) {
     if (pi[k - 1].prob < pi[k].prob) {
-      println(cstr("rotate_backedge UNSORTED"));
+      println("rotate_backedge UNSORTED");
       fflush(get_stdout());
       return 2;
     }
     k = k + 1;
   }
-  println(cstr("rotate_backedge OK"));
+  println("rotate_backedge OK");
   fflush(get_stdout());
   return 0;
 }

@@ -217,7 +217,7 @@ fn arena_install_chunk(a: Arena*, ch: ArenaChunk*) {
 // Hot path is straight-line: align the current head's `used`, check that the
 // request fits, bump, return the pointer. Slow paths handle oversized
 // requests, exhausted current chunk, and freelist reuse.
-export fn arena_alloc_aligned(a: Arena*, n: int64, align: int64) -> cstring {
+export fn arena_alloc_aligned(a: Arena*, n: int64, align: int64) -> rawptr {
   if (a == 0 || n < (int64)0) {
     return 0;
   }
@@ -288,13 +288,13 @@ export fn arena_alloc_aligned(a: Arena*, n: int64, align: int64) -> cstring {
 }
 
 // 8-byte aligned alloc. Common case.
-export fn arena_alloc(a: Arena*, n: int64) -> cstring {
+export fn arena_alloc(a: Arena*, n: int64) -> rawptr {
   return arena_alloc_aligned(a, n, arena_default_alignment());
 }
 
 // Zeroed alloc. Equivalent to arena_alloc followed by memset(0); we just call
 // memset here since the chunk's backing store from malloc is uninitialized.
-export fn arena_alloc_zeroed(a: Arena*, n: int64) -> cstring {
+export fn arena_alloc_zeroed(a: Arena*, n: int64) -> rawptr {
   var p: cstring = arena_alloc(a, n);
   if (p == 0 || n <= (int64)0) {
     return p;

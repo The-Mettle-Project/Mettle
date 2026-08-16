@@ -77,7 +77,7 @@ fn main() -> int32 {
 
   // Pool C: escaped pointer (stored to memory) -> must be left untouched.
   var pc: cstring = malloc((int64)n * 16);
-  var side: int64* = (int64*)malloc(8);
+  var side: int64* = malloc(8);
   if (pc == 0 || side == 0) { return 1; }
   side[0] = (int64)pc;
   i = 0;
@@ -100,7 +100,7 @@ fn main() -> int32 {
     return 1;
   }
   free(pc);
-  free((cstring)side);
+  free(side);
 
   println("layout OK");
   return 0;

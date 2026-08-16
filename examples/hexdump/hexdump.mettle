@@ -12,9 +12,9 @@
 import "std/io";
 
 // Convert nibble (0-15) to hex char
-fn nibble_to_hex(n: int32) -> int32 {
-  if (n < 10) { return n + 48; }
-  return n + 87;
+fn nibble_to_hex(n: int64) -> uint8 {
+  if (n < 10) { return (uint8)(n + 48); }
+  return (uint8)(n + 87);
 }
 
 // Write one byte as two hex chars to buf at offset, advance
@@ -55,7 +55,7 @@ fn format_ascii_line(buf: cstring, data: cstring, count: int32) -> int32 {
     if (i < count) {
       var c: int32 = data[i];
       if (c >= 32 && c <= 126) {
-        buf[i] = c;
+        buf[i] = (uint8)c;
       } else {
         buf[i] = 46;
       }
@@ -86,14 +86,14 @@ var mode_r: string = "rb";
 
 fn main(argc: int32, argv: cstring*) -> int32 {
   if (argc < 2) {
-    println(cstr(err_usage));
+    println(err_usage);
     return 1;
   }
 
   var filename: cstring = argv[1];
-  var fp: cstring = fopen(filename, cstr(mode_r));
+  var fp: cstring = fopen(filename, mode_r);
   if (fp == 0) {
-    println(cstr(err_open));
+    println(err_open);
     return 1;
   }
   defer fclose(fp);
@@ -115,14 +115,14 @@ fn main(argc: int32, argv: cstring*) -> int32 {
     line[pos] = 32;
     pos = pos + 1;
 
-    var hex_len: int32 = format_hex_line(&line[pos], &buf[0], n);
+    var hex_len: int32 = format_hex_line(&line[pos], &buf[0], (int32)n);
     pos = pos + hex_len;
     line[pos] = 32;
     pos = pos + 1;
     line[pos] = 124;
     pos = pos + 1;
 
-    var ascii_len: int32 = format_ascii_line(&line[pos], &buf[0], n);
+    var ascii_len: int32 = format_ascii_line(&line[pos], &buf[0], (int32)n);
     pos = pos + ascii_len;
     line[pos] = 124;
     pos = pos + 1;
@@ -130,7 +130,7 @@ fn main(argc: int32, argv: cstring*) -> int32 {
     pos = pos + 1;
     line[pos] = 0;
 
-    print(&line[0]);
+    print_cstr(&line[0]);
 
     offset = offset + n;
     total_read = total_read + n;

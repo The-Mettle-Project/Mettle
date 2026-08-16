@@ -5,8 +5,8 @@ fn takes_i8(x: int8) -> int16 {
 
 fn main() -> int32 {
   var a: uint16 = 511;
-  var b: int8 = a;
+  var b: int8 = (int8)a;
   var c: int16 = b;
-  var d: int16 = takes_i8(a);
+  var d: int16 = takes_i8((int8)a);
   return c + d;
 }

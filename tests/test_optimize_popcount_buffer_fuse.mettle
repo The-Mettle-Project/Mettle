@@ -22,6 +22,6 @@ fn popcount_buffer(buf: cstring, len: int64) -> int64 {
 }
 
 fn main() -> int32 {
-  var data: cstring = cstr("0123456789abcdef");
+  var data: cstring = "0123456789abcdef";
   return (int32)popcount_buffer(data, 16);
 }

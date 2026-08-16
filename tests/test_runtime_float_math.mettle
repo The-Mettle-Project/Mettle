@@ -1,0 +1,82 @@
+// The float-suffixed math the owned runtime exports. Mettle code binds these
+// by name at the C boundary (`extern fn powf(...) = "powf"`), and nothing else
+// provides them: the double forms live in std/math, written in Mettle, so the
+// runtime deliberately exports only the `f` forms.
+//
+// Checked against constants computed independently, to a tolerance that is
+// loose enough for float32 rounding and tight enough to catch a wrong series.
+// Prints RUNTIME MATH OK when every check passes.
+
+import "std/io";
+
+extern fn sqrtf(x: float32) -> float32 = "sqrtf";
+extern fn expf(x: float32) -> float32 = "expf";
+extern fn logf(x: float32) -> float32 = "logf";
+extern fn powf(a: float32, b: float32) -> float32 = "powf";
+extern fn sinf(x: float32) -> float32 = "sinf";
+extern fn cosf(x: float32) -> float32 = "cosf";
+extern fn tanhf(x: float32) -> float32 = "tanhf";
+
+var g_fail: int32 = 0;
+
+fn close(what: string, got: float32, want: float32) {
+  var d: float32 = got - want;
+  if (d < 0.0) { d = 0.0 - d; }
+  var scale: float32 = want;
+  if (scale < 0.0) { scale = 0.0 - scale; }
+  if (scale < 1.0) { scale = 1.0; }
+  if (d > scale * 0.000005) {
+    print("FAIL ");
+    print(what);
+    print(" got*1e6=");
+    print_int((int64)(got * 1000000.0));
+    print(" want*1e6=");
+    println_int((int64)(want * 1000000.0));
+    g_fail = g_fail + 1;
+  }
+}
+
+fn main() -> int32 {
+  close("sqrtf(2)", sqrtf(2.0), 1.4142135623730951);
+  close("sqrtf(1e6)", sqrtf(1000000.0), 1000.0);
+
+  close("expf(1)", expf(1.0), 2.718281828459045);
+  close("expf(-3)", expf(0.0 - 3.0), 0.049787068367863944);
+
+  close("logf(e)", logf(2.718281828459045), 1.0);
+  close("logf(1)", logf(1.0), 0.0);
+  close("logf(1000)", logf(1000.0), 6.907755278982137);
+  close("logf(0.001)", logf(0.001), 0.0 - 6.907755278982137);
+
+  // The RoPE shape the LLM engine uses: theta ^ (2i / d).
+  close("powf(2,10)", powf(2.0, 10.0), 1024.0);
+  close("powf(10,-3)", powf(10.0, 0.0 - 3.0), 0.001);
+  close("powf(1000000,0.25)", powf(1000000.0, 0.25), 31.622776601683793);
+  close("powf(x,0)", powf(7.5, 0.0), 1.0);
+  close("powf(-2,3)", powf(0.0 - 2.0, 3.0), 0.0 - 8.0);
+  close("powf(-2,2)", powf(0.0 - 2.0, 2.0), 4.0);
+
+  close("sinf(0)", sinf(0.0), 0.0);
+  close("sinf(pi/6)", sinf(0.5235987755982988), 0.5);
+  close("sinf(pi/2)", sinf(1.5707963267948966), 1.0);
+  close("sinf(pi)", sinf(3.141592653589793), 0.0);
+  close("sinf(-pi/2)", sinf(0.0 - 1.5707963267948966), 0.0 - 1.0);
+  close("sinf(10)", sinf(10.0), 0.0 - 0.5440211108893698);
+  close("sinf(100)", sinf(100.0), 0.0 - 0.5063656411097588);
+
+  close("cosf(0)", cosf(0.0), 1.0);
+  close("cosf(pi/3)", cosf(1.0471975511965976), 0.5);
+  close("cosf(pi)", cosf(3.141592653589793), 0.0 - 1.0);
+  close("cosf(10)", cosf(10.0), 0.0 - 0.8390715290764524);
+
+  close("tanhf(0)", tanhf(0.0), 0.0);
+  close("tanhf(1)", tanhf(1.0), 0.7615941559557649);
+
+  if (g_fail != 0) {
+    print("RUNTIME MATH FAILURES: ");
+    println_int((int64)g_fail);
+    return 1;
+  }
+  println("RUNTIME MATH OK");
+  return 0;
+}

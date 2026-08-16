@@ -1,9 +1,9 @@
 import "std/io";
 
-fn block_err() { puts(cstr("BLOCK_ERR\n")); }
-fn block_ok() { puts(cstr("BLOCK_OK\n")); }
-fn outer_err() { puts(cstr("OUTER_ERR\n")); }
-fn outer_ok() { puts(cstr("OUTER_OK\n")); }
+fn block_err() { puts("BLOCK_ERR\n"); }
+fn block_ok() { puts("BLOCK_OK\n"); }
+fn outer_err() { puts("OUTER_ERR\n"); }
+fn outer_ok() { puts("OUTER_OK\n"); }
 
 fn main() -> int32 {
   errdefer outer_err();

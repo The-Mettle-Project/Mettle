@@ -58,8 +58,8 @@ fn mask_map(a: int32*, d: int32*, n: int32) {
 fn main() -> int32 {
   // Not a multiple of the 8-wide vector, so the scalar remainder runs too.
   var n: int32 = 1003;
-  var a: int32* = (int32*)malloc((int64)n * 4);
-  var d: int32* = (int32*)malloc((int64)n * 4);
+  var a: int32* = malloc((int64)n * 4);
+  var d: int32* = malloc((int64)n * 4);
   if (a == 0 || d == 0) { return 1; }
   var i: int32 = 0;
   while (i < n) {
@@ -101,7 +101,7 @@ fn main() -> int32 {
     i = i + 1;
   }
 
-  free((cstring)a);
-  free((cstring)d);
+  free(a);
+  free(d);
   return 42;
 }

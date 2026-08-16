@@ -74,7 +74,7 @@ fn from_runtime(m: int32*, row_base: int32, n: int32) -> int32 {
 
 fn main() -> int32 {
   var cells: int32 = DIM * DIM;
-  var m: int32* = (int32*)malloc((int64)cells * 4);
+  var m: int32* = malloc((int64)cells * 4);
   var i: int32 = 0;
   while (i < cells) {
     m[i] = 1;
@@ -88,8 +88,8 @@ fn main() -> int32 {
   got = got + column(&m[0], DIM - 1);          // 8
   got = got + from_runtime(&m[0], cells - DIM, DIM); // 8
 
-  print(cstr("affine="));
+  print("affine=");
   println_int((int64)got);
-  free((cstring)m);
+  free(m);
   return 0;
 }

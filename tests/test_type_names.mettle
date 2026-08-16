@@ -19,26 +19,26 @@ fn main() -> int32 {
 
   // "test_type_names.Point"
   if (declared.length != 21) {
-    println(cstr("declared name length wrong"));
+    println("declared name length wrong");
     return 1;
   }
   // "int32"
   if (builtin.length != 5) {
-    println(cstr("builtin name length wrong"));
+    println("builtin name length wrong");
     return 2;
   }
   // A field name is bare: it is already unique inside its type, and the
   // module belongs on the owning type's name.
   if (field.length != 1) {
-    println(cstr("field name length wrong"));
+    println("field name length wrong");
     return 3;
   }
 
-  print(cstr("declared="));
+  print("declared=");
   println(declared);
-  print(cstr("builtin="));
+  print("builtin=");
   println(builtin);
-  print(cstr("field="));
+  print("field=");
   println(field);
   return 0;
 }

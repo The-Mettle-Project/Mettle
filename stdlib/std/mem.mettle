@@ -5,14 +5,24 @@
 
 // Owned runtime memory functions
 // These ABI names bind to Mettle's owned allocator and memory code.
-export extern fn malloc(size: int64) -> cstring = "malloc";
-export extern fn calloc(count: int64, size: int64) -> cstring = "calloc";
-export extern fn realloc(ptr: cstring, size: int64) -> cstring = "realloc";
-export extern fn free(ptr: cstring) = "free";
-export extern fn memset(ptr: cstring, value: int32, size: int64) -> cstring = "memset";
-export extern fn memcpy(dest: cstring, src: cstring, size: int64) -> cstring = "memcpy";
-export extern fn memmove(dest: cstring, src: cstring, size: int64) -> cstring = "memmove";
-export extern fn memcmp(a: cstring, b: cstring, size: int64) -> int32 = "memcmp";
+//
+// Allocation is typed: these hand out and take `rawptr`, an address with no
+// element type, which converts to and from any pointer. So
+//
+//     var a: int32* = malloc((int64)N * N * 4);
+//     ...
+//     free(a);
+//
+// needs no cast in either direction, and releasing an int32 buffer no longer
+// requires claiming it holds characters.
+export extern fn malloc(size: int64) -> rawptr = "malloc";
+export extern fn calloc(count: int64, size: int64) -> rawptr = "calloc";
+export extern fn realloc(ptr: rawptr, size: int64) -> rawptr = "realloc";
+export extern fn free(ptr: rawptr) = "free";
+export extern fn memset(ptr: rawptr, value: int32, size: int64) -> rawptr = "memset";
+export extern fn memcpy(dest: rawptr, src: rawptr, size: int64) -> rawptr = "memcpy";
+export extern fn memmove(dest: rawptr, src: rawptr, size: int64) -> rawptr = "memmove";
+export extern fn memcmp(a: rawptr, b: rawptr, size: int64) -> int32 = "memcmp";
 
 // ─── Native memory operations ───────────────────────────────────────────────
 //
@@ -177,12 +187,12 @@ export fn mem_find_byte(p: cstring, value: int32, n: int64) -> int64 {
 // ─── Buffer helpers ─────────────────────────────────────────────────────────
 
 // Allocate a zero-initialized buffer of `n` bytes.
-export fn alloc_zeroed(n: int64) -> cstring {
+export fn alloc_zeroed(n: int64) -> rawptr {
   return calloc(1, n);
 }
 
 // Copy `len` bytes from src into a freshly allocated buffer.
-export fn buf_dup(src: cstring, len: int64) -> cstring {
+export fn buf_dup(src: rawptr, len: int64) -> rawptr {
   if (len <= 0) { return 0; }
   var dst: cstring = malloc(len);
   if (dst == 0) { return 0; }

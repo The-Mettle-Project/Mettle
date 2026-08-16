@@ -42,7 +42,7 @@ fn main() -> int32 {
   var a: cstring = malloc(buf_size);
   var b: cstring = malloc(buf_size);
   if (a == 0 || b == 0) {
-    println(cstr("malloc failed"));
+    println("malloc failed");
     return 1;
   }
 
@@ -52,8 +52,8 @@ fn main() -> int32 {
     if (pos + tchunk > buf_size) {
       tchunk = buf_size - pos;
     }
-    memcpy(a + pos, cstr(template), tchunk);
-    memcpy(b + pos, cstr(template), tchunk);
+    memcpy(a + pos, template, tchunk);
+    memcpy(b + pos, template, tchunk);
     pos = pos + tchunk;
   }
 
@@ -64,23 +64,23 @@ fn main() -> int32 {
     i = i + 8192;
   }
 
-  println(cstr("Byte compare: 256 KB in 4 KB chunks x 200 passes"));
+  println("Byte compare: 256 KB in 4 KB chunks x 200 passes");
 
   var passes: int32 = 200;
-  var t0: uint64 = bench_time_us();
+  var t0: int64 = bench_time_us();
   var bench_sum: int64 = 0;
   var p: int32 = 0;
   while (p < passes) {
     bench_sum = bench_sum + compare_chunks(a, b, buf_size, chunk);
     p = p + 1;
   }
-  var elapsed_us: uint64 = bench_time_us() - t0;
+  var elapsed_us: int64 = bench_time_us() - t0;
 
-  print(cstr("Bench sum = "));
+  print("Bench sum = ");
   println_int(bench_sum);
-  print(cstr("Time: "));
+  print("Time: ");
   print_int(elapsed_us);
-  println(cstr(" us"));
+  println(" us");
 
   free(a);
   free(b);

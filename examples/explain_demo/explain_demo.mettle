@@ -78,12 +78,12 @@ fn lo_byte(x: int64) -> int64 {
 }
 
 fn main() -> int32 {
-  println(cstr("--explain showcase"));
+  println("--explain showcase");
 
   var n: int64 = 4096;
-  var a: int32* = (int32*)malloc(n * 4);
+  var a: int32* = malloc(n * 4);
   if (a == 0) {
-    println(cstr("malloc failed"));
+    println("malloc failed");
     return 1;
   }
   var i: int64 = 0;
@@ -98,26 +98,26 @@ fn main() -> int32 {
   var shuffled: int64 = shuffle(blended);
   var divisor: int64 = gcd(blended, shuffled) + lo_byte(shuffled);
 
-  print(cstr("array_sum  = ")); println_int(total);
-  print(cstr("step       = ")); println_int(mixed);
-  print(cstr("bit_blend  = ")); println_int(blended);
-  print(cstr("shuffle    = ")); println_int(shuffled);
-  print(cstr("gcd+lo     = ")); println_int(divisor);
+  print("array_sum  = "); println_int(total);
+  print("step       = "); println_int(mixed);
+  print("bit_blend  = "); println_int(blended);
+  print("shuffle    = "); println_int(shuffled);
+  print("gcd+lo     = "); println_int(divisor);
 
   // Small benchmark so the example does real work and reports a time.
   var passes: int32 = 2000;
-  var t0: uint64 = bench_time_us();
+  var t0: int64 = bench_time_us();
   var bench_sum: int64 = 0;
   var p: int32 = 0;
   while (p < passes) {
     bench_sum = bench_sum + shuffle(bit_blend(total, step(p, 64), bench_sum));
     p = p + 1;
   }
-  var elapsed_us: uint64 = bench_time_us() - t0;
+  var elapsed_us: int64 = bench_time_us() - t0;
 
-  print(cstr("Bench sum  = ")); println_int(bench_sum);
-  print(cstr("Time: ")); print_int(elapsed_us); println(cstr(" us"));
+  print("Bench sum  = "); println_int(bench_sum);
+  print("Time: "); print_int(elapsed_us); println(" us");
 
-  free((cstring)a);
+  free(a);
   return 0;
 }

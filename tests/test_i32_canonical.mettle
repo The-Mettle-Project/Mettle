@@ -21,7 +21,7 @@ fn sShr(x: int32) -> int32 {
 
 fn wideAssignDiv(x: int32) -> int32 {
   var wide: int64 = (int64)x + 9;
-  var t: int32 = wide;
+  var t: int32 = (int32)wide;
   var q: int32 = t / 7;
   return q;
 }
@@ -33,14 +33,14 @@ fn gDiv(x: int32) -> int32 {
 }
 
 fn s16Div(x: int16) -> int32 {
-  var t: int16 = x + 5;
-  var q: int16 = t / 3;
+  var t: int16 = (int16)(x + 5);
+  var q: int16 = (int16)(t / 3);
   return q;
 }
 
 fn s8Div(x: int8) -> int32 {
-  var t: int8 = x + 2;
-  var q: int8 = t / 3;
+  var t: int8 = (int8)(x + 2);
+  var q: int8 = (int8)(t / 3);
   return q;
 }
 

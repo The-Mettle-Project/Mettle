@@ -104,7 +104,7 @@ export fn int_to_dec(buf: cstring, n: int64) -> int32 {
   }
 
   while (value <= -10 || value >= 10) {
-    var digit: int32 = value % 10;
+    var digit: int32 = (int32)(value % 10);
     if (digit < 0) {
       digit = 0 - digit;
     }
@@ -113,7 +113,7 @@ export fn int_to_dec(buf: cstring, n: int64) -> int32 {
     value = value / 10;
   }
 
-  var final_digit: int32 = value;
+  var final_digit: int32 = (int32)value;
   if (final_digit < 0) {
     final_digit = 0 - final_digit;
   }
@@ -122,7 +122,7 @@ export fn int_to_dec(buf: cstring, n: int64) -> int32 {
 
   var i: int32 = digits - 1;
   while (i >= 0) {
-    buf[pos] = digit_to_char(tmp[i]);
+    buf[pos] = (uint8)digit_to_char(tmp[i]);
     pos = pos + 1;
     i = i - 1;
   }

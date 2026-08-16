@@ -3,8 +3,7 @@
 
 fn main() -> int32 {
   // std/io: print and println are available natively
-  var greeting: string = "Hello from the prelude!";
-  println(cstr(greeting));
+  println("Hello from the prelude!");
 
   // std/math: min, max, clamp
   var a: int64 = min(10, 20);

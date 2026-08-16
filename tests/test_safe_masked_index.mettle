@@ -25,12 +25,12 @@ fn main() -> int32 {
 
   var i: int64 = 0;
   while (i < 64) {
-    table[i] = (int8)(i + 41);
+    table[i] = (uint8)(i + 41);
     i = i + 1;
   }
   var j: int64 = 0;
   while (j < len) {
-    src[j] = (int8)(j * 7);
+    src[j] = (uint8)(j * 7);
     j = j + 1;
   }
 

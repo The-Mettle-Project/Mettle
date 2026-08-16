@@ -15,8 +15,8 @@ fn qdot(a: int8*, b: int8*, n: int64) -> int32 {
 
 fn main() -> int32 {
   var n: int64 = 64;
-  var a: int8* = (int8*)malloc(n);
-  var b: int8* = (int8*)malloc(n);
+  var a: int8* = malloc(n);
+  var b: int8* = malloc(n);
   for i: int64 in 0..n {
     a[i] = (int8)2;
     b[i] = (int8)3;

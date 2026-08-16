@@ -42,13 +42,13 @@ fn main() -> int32 {
   var flags: uint8[5000];
 
   var last: int32 = 0;
-  var t0: uint64 = bench_time_us();
+  var t0: int64 = bench_time_us();
   var it: int32 = 0;
   while (it < passes) {
     last = benchmark(&flags[0]);
     it = it + 1;
   }
-  var elapsed: uint64 = bench_time_us() - t0;
+  var elapsed: int64 = bench_time_us() - t0;
 
   println("Sieve");
   print("  result   = "); println_int((int64)last);

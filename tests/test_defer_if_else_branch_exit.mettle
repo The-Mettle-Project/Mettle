@@ -1,10 +1,10 @@
 import "std/io";
 
-fn then_defer() { puts(cstr("THEN_DEFER\n")); }
-fn else_defer() { puts(cstr("ELSE_DEFER\n")); }
-fn then_body() { puts(cstr("THEN_BODY\n")); }
-fn else_body() { puts(cstr("ELSE_BODY\n")); }
-fn after_if() { puts(cstr("AFTER_IF\n")); }
+fn then_defer() { puts("THEN_DEFER\n"); }
+fn else_defer() { puts("ELSE_DEFER\n"); }
+fn then_body() { puts("THEN_BODY\n"); }
+fn else_body() { puts("ELSE_BODY\n"); }
+fn after_if() { puts("AFTER_IF\n"); }
 
 fn main() -> int32 {
   if (1) {

@@ -1,11 +1,11 @@
 import "std/io";
 
-fn a() { puts(cstr("A\n")); }
-fn b() { puts(cstr("B\n")); }
-fn c() { puts(cstr("C\n")); }
-fn d() { puts(cstr("D\n")); }
-fn e() { puts(cstr("E\n")); }
-fn f() { puts(cstr("F\n")); }
+fn a() { puts("A\n"); }
+fn b() { puts("B\n"); }
+fn c() { puts("C\n"); }
+fn d() { puts("D\n"); }
+fn e() { puts("E\n"); }
+fn f() { puts("F\n"); }
 
 fn main() -> int32 {
   defer a();

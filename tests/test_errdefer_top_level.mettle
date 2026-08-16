@@ -1,5 +1,5 @@
 import "std/io";
 
-fn foo() { puts(cstr("FOO\n")); }
+fn foo() { puts("FOO\n"); }
 
 errdefer foo();

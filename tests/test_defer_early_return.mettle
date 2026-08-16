@@ -1,6 +1,6 @@
 import "std/io";
 
-fn a() { puts(cstr("A\n")); }
+fn a() { puts("A\n"); }
 
 fn main() -> int32 {
   defer a();

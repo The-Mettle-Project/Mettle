@@ -59,7 +59,7 @@ fn main() -> int32 {
   free(buf);
   free(z);
   free(r);
-  free((cstring)v);
+  free(v);
 
   var st: MemStats = mx_stats();
   if (st.total_allocs < (int64)4) { println("not routed to native heap"); return 1; }

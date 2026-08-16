@@ -60,8 +60,8 @@ fn kern(src: uint8*, dst: float32*, nblocks: int64) {
 
 fn main() -> int32 {
   var nb: int64 = 2;
-  var src: uint8* = (uint8*)malloc(nb * 110);
-  var dst: float32* = (float32*)malloc(nb * 256 * 4);
+  var src: uint8* = malloc(nb * 110);
+  var dst: float32* = malloc(nb * 256 * 4);
   var k: int64 = 0;
   while (k < nb * 110) {
     src[k] = (uint8)((k * 37 + 11) & 0xFF);
@@ -106,13 +106,13 @@ fn main() -> int32 {
   }
 
   if (bad != 0) {
-    print(cstr("mir_scratch_clobber MISMATCH count="));
+    print("mir_scratch_clobber MISMATCH count=");
     print_int(bad);
     newline();
     fflush(get_stdout());
     return 1;
   }
-  println(cstr("mir_scratch_clobber OK"));
+  println("mir_scratch_clobber OK");
   fflush(get_stdout());
   return 0;
 }

@@ -26,14 +26,14 @@ fn pipeline_stack_with_calls(ctx: VkContext*) -> int32 {
   stages[0].flags = (uint32)0;
   stages[0].stage = (uint32)1;
   stages[0].module_handle = (int64)1;
-  stages[0].p_name = (int64)cstr("main");
+  stages[0].p_name = (int64)"main";
   stages[0].p_specialization_info = (int64)0;
   stages[1].s_type = VK_ST_PIPELINE_SHADER_STAGE_CREATE_INFO();
   stages[1].p_next = (int64)0;
   stages[1].flags = (uint32)0;
   stages[1].stage = (uint32)16;
   stages[1].module_handle = (int64)2;
-  stages[1].p_name = (int64)cstr("main");
+  stages[1].p_name = (int64)"main";
   stages[1].p_specialization_info = (int64)0;
   var stages_base: int64 = (int64)(&(stages[0]));
 

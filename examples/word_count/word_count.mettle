@@ -37,7 +37,7 @@ fn main() -> int32 {
 
   var buf: cstring = malloc(buf_size);
   if (buf == 0) {
-    println(cstr("malloc failed"));
+    println("malloc failed");
     return 1;
   }
 
@@ -47,46 +47,40 @@ fn main() -> int32 {
     if (pos + chunk > buf_size) {
       chunk = buf_size - pos;
     }
-    memcpy(buf + pos, cstr(template), chunk);
+    memcpy(buf + pos, template, chunk);
     pos = pos + chunk;
   }
 
   var wc: int64 = word_count(buf, buf_size);
 
   var passes: int32 = 200;
-  var t0: uint64 = bench_time_us();
+  var t0: int64 = bench_time_us();
   var total: int64 = 0;
   var p: int32 = 0;
   while (p < passes) {
     total = total + word_count(buf, buf_size);
     p = p + 1;
   }
-  var elapsed_us: uint64 = bench_time_us() - t0;
+  var elapsed_us: int64 = bench_time_us() - t0;
 
-  var header: string = "Word count: 256 KB buffer (a b pattern)";
-  println(cstr(header));
+  println("Word count: 256 KB buffer (a b pattern)");
 
-  var result_str: string = "Words = ";
-  print(cstr(result_str));
+  print("Words = ");
   println_int(wc);
 
-  var bench_header: string = "Benchmark: 200 passes (word_count)";
-  println(cstr(bench_header));
+  println("Benchmark: 200 passes (word_count)");
 
-  var sum_str: string = "Total words = ";
-  print(cstr(sum_str));
+  print("Total words = ");
   println_int(total);
 
-  var time_str: string = "Time: ";
-  print(cstr(time_str));
+  print("Time: ");
   print_int(elapsed_us);
-  println(cstr(" us"));
+  println(" us");
 
-  var per_pass: uint64 = elapsed_us / passes;
-  var us_str: string = "Per pass: ~";
-  print(cstr(us_str));
+  var per_pass: int64 = elapsed_us / passes;
+  print("Per pass: ~");
   print_int(per_pass);
-  println(cstr(" us"));
+  println(" us");
 
   free(buf);
   return 0;

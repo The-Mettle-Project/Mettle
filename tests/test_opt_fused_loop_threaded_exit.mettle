@@ -50,9 +50,9 @@ fn layer_ref(l: int64) {
 }
 
 fn main() -> int32 {
-  sx = (float32*)malloc(D * 4);
-  sao = (float32*)malloc(D * 4);
-  rx = (float32*)malloc(D * 4);
+  sx = malloc(D * 4);
+  sao = malloc(D * 4);
+  rx = malloc(D * 4);
   var i: int64 = 0;
   while (i < D) { sx[i] = 0.0; rx[i] = 0.0; i = i + 1; }
   var l: int64 = 0;

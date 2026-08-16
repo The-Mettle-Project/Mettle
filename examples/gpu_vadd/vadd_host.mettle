@@ -10,23 +10,23 @@ import "std/mem";
 import "std/gpu";
 
 fn main() -> int32 {
-  if (gpu_init() == 0) { println(cstr("GPU init failed")); return 1; }
+  if (gpu_init() == 0) { println("GPU init failed"); return 1; }
 
   // load the emitted PTX module and resolve the kernel
-  var fp: cstring = fopen(cstr("vadd_kernel.ptx"), cstr("rb"));
-  if (fp == 0) { println(cstr("open vadd_kernel.ptx failed (emit it first)")); return 1; }
-  var ptx: uint8* = (uint8*)malloc(65536);
+  var fp: cstring = fopen("vadd_kernel.ptx", "rb");
+  if (fp == 0) { println("open vadd_kernel.ptx failed (emit it first)"); return 1; }
+  var ptx: uint8* = malloc(65536);
   var pl: int64 = fread((cstring)ptx, 1, 65535, fp); fclose(fp); ptx[pl] = 0;
   var mod: int64 = gpu_module(ptx);
-  var vadd: int64 = gpu_func(mod, cstr("vadd"));
-  if (vadd == 0) { println(cstr("kernel 'vadd' not found")); return 1; }
+  var vadd: int64 = gpu_func(mod, "vadd");
+  if (vadd == 0) { println("kernel 'vadd' not found"); return 1; }
 
   // host data: a[i]=i, b[i]=2i  ->  expect c[i]=3i
   var n: int32 = 1 << 20;
   var bytes: int64 = (int64)n * 4;
-  var ha: float32* = (float32*)malloc(bytes);
-  var hb: float32* = (float32*)malloc(bytes);
-  var hc: float32* = (float32*)malloc(bytes);
+  var ha: float32* = malloc(bytes);
+  var hb: float32* = malloc(bytes);
+  var hc: float32* = malloc(bytes);
   var i: int32 = 0;
   while (i < n) { ha[i] = (float32)i; hb[i] = (float32)(2 * i); i = i + 1; }
 
@@ -45,10 +45,10 @@ fn main() -> int32 {
 
   var ok: int32 = 1; i = 0;
   while (i < n) { if (hc[i] != (float32)(3 * i)) { ok = 0; } i = i + 1; }
-  print(cstr("c[1]=")); print_int((int64)hc[1]);
-  print(cstr("  c[n-1]=")); print_int((int64)hc[n - 1]); println(cstr(""));
-  if (ok == 1) { println(cstr("GPU vadd correct (kernel + dispatch)")); }
-  else { println(cstr("MISMATCH")); }
+  print("c[1]="); print_int((int64)hc[1]);
+  print("  c[n-1]="); print_int((int64)hc[n - 1]); println("");
+  if (ok == 1) { println("GPU vadd correct (kernel + dispatch)"); }
+  else { println("MISMATCH"); }
 
   gpu_free(da); gpu_free(db); gpu_free(dc);
   return 0;

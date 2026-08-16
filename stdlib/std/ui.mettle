@@ -585,7 +585,7 @@ export fn ui_init() -> int32 {
   wnd_class.cursor = Ui_LoadCursorA(0, (cstring)(int64)UI_IDC_ARROW());
   wnd_class.background = (int64)(UI_COLOR_WINDOW() + 1);
   wnd_class.menu_name = 0;
-  wnd_class.class_name = cstr(UI_CLASS_NAME);
+  wnd_class.class_name = UI_CLASS_NAME;
   wnd_class.icon_sm = 0;
 
   if (Ui_RegisterClassExA(&wnd_class) == 0) {
@@ -600,7 +600,7 @@ export fn ui_shutdown() {
   if (ui_class_registered == 0) {
     return;
   }
-  Ui_UnregisterClassA(cstr(UI_CLASS_NAME), ui_app_instance);
+  Ui_UnregisterClassA(UI_CLASS_NAME, ui_app_instance);
   ui_class_registered = 0;
 }
 
@@ -634,7 +634,7 @@ export fn ui_window_create(title: cstring, x: int32, y: int32, width: int32, hei
   var proc_addr: int64 = (int64)proc;
   return Ui_CreateWindowExA(
     UI_WS_EX_APPWINDOW(),
-    cstr(UI_CLASS_NAME),
+    UI_CLASS_NAME,
     title,
     UI_WS_OVERLAPPEDWINDOW() | UI_WS_CLIPCHILDREN(),
     x,
@@ -999,47 +999,47 @@ export fn ui_control_create_raw(parent: int64, class_name: cstring, text: cstrin
 }
 
 export fn ui_button_create(parent: int64, x: int32, y: int32, width: int32, height: int32, label: cstring, control_id: int32) -> int64 {
-  return ui_control_create_raw(parent, cstr("BUTTON"), label, ui_rect_xywh(x, y, width, height), UI_WS_TABSTOP() | UI_BS_PUSHBUTTON(), 0, control_id);
+  return ui_control_create_raw(parent, "BUTTON", label, ui_rect_xywh(x, y, width, height), UI_WS_TABSTOP() | UI_BS_PUSHBUTTON(), 0, control_id);
 }
 
 export fn ui_button_create_default(parent: int64, x: int32, y: int32, width: int32, height: int32, label: cstring, control_id: int32) -> int64 {
-  return ui_control_create_raw(parent, cstr("BUTTON"), label, ui_rect_xywh(x, y, width, height), UI_WS_TABSTOP() | UI_BS_DEFPUSHBUTTON(), 0, control_id);
+  return ui_control_create_raw(parent, "BUTTON", label, ui_rect_xywh(x, y, width, height), UI_WS_TABSTOP() | UI_BS_DEFPUSHBUTTON(), 0, control_id);
 }
 
 export fn ui_checkbox_create(parent: int64, x: int32, y: int32, width: int32, height: int32, label: cstring, control_id: int32) -> int64 {
-  return ui_control_create_raw(parent, cstr("BUTTON"), label, ui_rect_xywh(x, y, width, height), UI_WS_TABSTOP() | UI_BS_AUTOCHECKBOX(), 0, control_id);
+  return ui_control_create_raw(parent, "BUTTON", label, ui_rect_xywh(x, y, width, height), UI_WS_TABSTOP() | UI_BS_AUTOCHECKBOX(), 0, control_id);
 }
 
 export fn ui_radio_create(parent: int64, x: int32, y: int32, width: int32, height: int32, label: cstring, control_id: int32) -> int64 {
-  return ui_control_create_raw(parent, cstr("BUTTON"), label, ui_rect_xywh(x, y, width, height), UI_WS_TABSTOP() | UI_BS_AUTORADIOBUTTON(), 0, control_id);
+  return ui_control_create_raw(parent, "BUTTON", label, ui_rect_xywh(x, y, width, height), UI_WS_TABSTOP() | UI_BS_AUTORADIOBUTTON(), 0, control_id);
 }
 
 export fn ui_groupbox_create(parent: int64, x: int32, y: int32, width: int32, height: int32, label: cstring, control_id: int32) -> int64 {
-  return ui_control_create_raw(parent, cstr("BUTTON"), label, ui_rect_xywh(x, y, width, height), UI_BS_GROUPBOX(), 0, control_id);
+  return ui_control_create_raw(parent, "BUTTON", label, ui_rect_xywh(x, y, width, height), UI_BS_GROUPBOX(), 0, control_id);
 }
 
 export fn ui_label_create(parent: int64, x: int32, y: int32, width: int32, height: int32, text: cstring, control_id: int32) -> int64 {
-  return ui_control_create_raw(parent, cstr("STATIC"), text, ui_rect_xywh(x, y, width, height), UI_SS_LEFT(), 0, control_id);
+  return ui_control_create_raw(parent, "STATIC", text, ui_rect_xywh(x, y, width, height), UI_SS_LEFT(), 0, control_id);
 }
 
 export fn ui_label_create_center(parent: int64, x: int32, y: int32, width: int32, height: int32, text: cstring, control_id: int32) -> int64 {
-  return ui_control_create_raw(parent, cstr("STATIC"), text, ui_rect_xywh(x, y, width, height), UI_SS_CENTER() | UI_SS_CENTERIMAGE(), 0, control_id);
+  return ui_control_create_raw(parent, "STATIC", text, ui_rect_xywh(x, y, width, height), UI_SS_CENTER() | UI_SS_CENTERIMAGE(), 0, control_id);
 }
 
 export fn ui_textbox_create(parent: int64, x: int32, y: int32, width: int32, height: int32, control_id: int32) -> int64 {
-  return ui_control_create_raw(parent, cstr("EDIT"), cstr(""), ui_rect_xywh(x, y, width, height), UI_WS_TABSTOP() | UI_WS_BORDER() | UI_ES_LEFT() | UI_ES_AUTOHSCROLL(), UI_WS_EX_CLIENTEDGE(), control_id);
+  return ui_control_create_raw(parent, "EDIT", "", ui_rect_xywh(x, y, width, height), UI_WS_TABSTOP() | UI_WS_BORDER() | UI_ES_LEFT() | UI_ES_AUTOHSCROLL(), UI_WS_EX_CLIENTEDGE(), control_id);
 }
 
 export fn ui_textbox_create_multiline(parent: int64, x: int32, y: int32, width: int32, height: int32, control_id: int32) -> int64 {
-  return ui_control_create_raw(parent, cstr("EDIT"), cstr(""), ui_rect_xywh(x, y, width, height), UI_WS_TABSTOP() | UI_WS_BORDER() | UI_WS_VSCROLL() | UI_ES_LEFT() | UI_ES_MULTILINE() | UI_ES_AUTOVSCROLL(), UI_WS_EX_CLIENTEDGE(), control_id);
+  return ui_control_create_raw(parent, "EDIT", "", ui_rect_xywh(x, y, width, height), UI_WS_TABSTOP() | UI_WS_BORDER() | UI_WS_VSCROLL() | UI_ES_LEFT() | UI_ES_MULTILINE() | UI_ES_AUTOVSCROLL(), UI_WS_EX_CLIENTEDGE(), control_id);
 }
 
 export fn ui_listbox_create(parent: int64, x: int32, y: int32, width: int32, height: int32, control_id: int32) -> int64 {
-  return ui_control_create_raw(parent, cstr("LISTBOX"), cstr(""), ui_rect_xywh(x, y, width, height), UI_WS_TABSTOP() | UI_WS_BORDER() | UI_WS_VSCROLL() | UI_LBS_NOTIFY(), UI_WS_EX_CLIENTEDGE(), control_id);
+  return ui_control_create_raw(parent, "LISTBOX", "", ui_rect_xywh(x, y, width, height), UI_WS_TABSTOP() | UI_WS_BORDER() | UI_WS_VSCROLL() | UI_LBS_NOTIFY(), UI_WS_EX_CLIENTEDGE(), control_id);
 }
 
 export fn ui_combobox_create(parent: int64, x: int32, y: int32, width: int32, height: int32, control_id: int32) -> int64 {
-  return ui_control_create_raw(parent, cstr("COMBOBOX"), cstr(""), ui_rect_xywh(x, y, width, height), UI_WS_TABSTOP() | UI_CBS_DROPDOWNLIST() | UI_CBS_AUTOHSCROLL(), 0, control_id);
+  return ui_control_create_raw(parent, "COMBOBOX", "", ui_rect_xywh(x, y, width, height), UI_WS_TABSTOP() | UI_CBS_DROPDOWNLIST() | UI_CBS_AUTOHSCROLL(), 0, control_id);
 }
 
 export fn ui_control_set_text(control: int64, text: cstring) {

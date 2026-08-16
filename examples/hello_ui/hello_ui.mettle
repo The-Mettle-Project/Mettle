@@ -12,7 +12,7 @@
 
 import "std/ui";
 
-function on_paint(hwnd: int64) {
+fn on_paint(hwnd: int64) {
   var ps: UiPaintStruct;
   var hdc: int64 = ui_begin_paint(hwnd, &ps);
   var width: int32 = ui_client_width(hwnd);
@@ -20,13 +20,13 @@ function on_paint(hwnd: int64) {
 
   ui_fill_rect_color(hdc, 0, 0, width, height, ui_rgb(245, 247, 250));
   ui_fill_rect_color(hdc, 0, 0, width, 80, ui_rgb(58, 123, 213));
-  ui_draw_text_color(hdc, 24, 28, cstr("Hello, world!"), ui_rgb(255, 255, 255), ui_rgb(58, 123, 213));
-  ui_draw_text(hdc, 24, 100, cstr("This is a Mettle GUI application."));
+  ui_draw_text_color(hdc, 24, 28, "Hello, world!", ui_rgb(255, 255, 255), ui_rgb(58, 123, 213));
+  ui_draw_text(hdc, 24, 100, "This is a Mettle GUI application.");
 
   ui_end_paint(hwnd, &ps);
 }
 
-function window_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 {
+fn window_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 {
   if (msg == UI_WM_PAINT()) {
     on_paint(hwnd);
     return 0;
@@ -38,12 +38,12 @@ function window_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> 
   return ui_def_window_proc(hwnd, msg, wparam, lparam);
 }
 
-function main() -> int32 {
+fn main() -> int32 {
   if (ui_init() == 0) {
     return 1;
   }
 
-  var hwnd: int64 = ui_window_create(cstr("Hello World"), 200, 200, 480, 240, &window_proc);
+  var hwnd: int64 = ui_window_create("Hello World", 200, 200, 480, 240, &window_proc);
   if (hwnd == 0) {
     return 2;
   }

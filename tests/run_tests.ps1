@@ -1692,6 +1692,46 @@ $cases = @(
     )
   },
   @{ Name = "err_use_before_init"; Path = "tests/err_use_before_init.mettle"; ShouldSucceed = $false; Pattern = "before initialization" },
+  @{
+    # Widen silently, narrow loudly. Every position a value lands in has to
+    # report -- a declaration, an argument, a return, a field, an element --
+    # and the widenings in the same file have to stay silent, which is what
+    # pins the rule rather than a blanket refusal.
+    Name          = "err_narrowing_needs_cast"
+    Path          = "tests/err_narrowing_needs_cast.mettle"
+    ShouldSucceed = $false
+    OutputMustMatch = @(
+      "error\[M0119\]: Narrowing conversion from 'int64' to 'int32' needs a cast",
+      "error\[M0119\]: Narrowing conversion from 'uint64' to 'int64' needs a cast",
+      "help: cast explicitly: \(int32\)value\. 'int32' holds -2147483648\.\.2147483647"
+    )
+  },
+  @{
+    # A compile-time integer that does not fit names the value and the range.
+    # The constants that DO fit must not report, including a folded `1 << 7`.
+    Name          = "err_integer_out_of_range"
+    Path          = "tests/err_integer_out_of_range.mettle"
+    ShouldSucceed = $false
+    OutputMustMatch = @(
+      "error\[M0118\]: Integer 2654435761 is out of range for 'int32'",
+      "error\[M0118\]: Integer -1 is out of range for 'uint32'",
+      "error\[M0118\]: Integer 256 is out of range for 'uint8'",
+      "help: 'uint8' holds 0\.\.255\."
+    )
+  },
+  @{
+    # A rawptr names no element, so index/dereference/offset are refused and
+    # the help says to give the address a type first.
+    Name          = "err_rawptr_no_element"
+    Path          = "tests/err_rawptr_no_element.mettle"
+    ShouldSucceed = $false
+    OutputMustMatch = @(
+      "cannot index a 'rawptr'",
+      "cannot dereference a 'rawptr'",
+      "cannot offset a 'rawptr'",
+      "help: give the address a type first"
+    )
+  },
   @{ Name = "err_array_index_oob_const"; Path = "tests/err_array_index_oob_const.mettle"; ShouldSucceed = $false; Pattern = "out of bounds" },
   @{ Name = "err_array_index_oob_const_negative"; Path = "tests/err_array_index_oob_const_negative.mettle"; ShouldSucceed = $false; Pattern = "out of bounds" },
   @{ Name = "err_null_deref_const"; Path = "tests/err_null_deref_const.mettle"; ShouldSucceed = $false; Pattern = "Null pointer dereference" },
@@ -1877,6 +1917,16 @@ $cases = @(
      OutputMustNotMatch = @("test test_pass") },
   @{ Name = "comptime_tests_dropped_in_build"; Path = "tests/comptime_tests_demo.mettle"; ShouldSucceed = $true
      OutputMustNotMatch = @("assertion failed") },
+  # The interpreter must wrap a narrow integer where a register does. Six
+  # products read their answer from it, and a disagreement here makes the
+  # differential gates report a miscompile that is really a difference of
+  # opinion about what int32 means. Runs with no codegen, so it pins the
+  # interpreter's arithmetic and nothing else.
+  @{ Name = "interp_narrow_widths"; Path = "tests/test_interp_narrow_widths.mettle"; ShouldSucceed = $true
+     Args = @("test")
+     SkipBinaryCheck = $true
+     OutputMustMatch = @("4 passed")
+     OutputMustNotMatch = @("failed") },
   @{ Name = "err_assert_outside_test"; Path = "tests/err_assert_outside_test.mettle"; ShouldSucceed = $false
      Pattern = "only be called inside a @test function" },
   # Zero-run PGO: interpreted profile marks the oversized callee hot, which
@@ -3192,6 +3242,92 @@ catch {
   Write-CaseResult -Name "native_heap_threads" -Passed $false -Reason $_.Exception.Message
 }
 
+# The surface the friction report changed: implicit widening, the constant
+# range check, rawptr allocation, and the string/cstring boundary. Both build
+# modes, because the two release miscompiles this test found -- an aggregate
+# local aliased to its initializer, and a string literal propagated between
+# positions that read it differently -- were invisible in debug.
+foreach ($surfaceMode in @("debug", "release")) {
+  $total++
+  try {
+    $exePath = Join-Path $tmpDir ("surface_conversions_{0}.exe" -f $surfaceMode)
+    if (Test-Path $exePath) { Remove-Item -Path $exePath -Force -ErrorAction SilentlyContinue }
+    $surfaceFlags = @("--build", "--linker", "internal")
+    if ($surfaceMode -eq "release") { $surfaceFlags += "--release" }
+    $buildOut = & $CompilerPath @surfaceFlags "tests\test_surface_conversions.mettle" -o $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "surface conversions build ($surfaceMode) failed: $buildOut" }
+    $runOut = & $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "surface conversions ($surfaceMode) exited with $LASTEXITCODE`: $runOut" }
+    if ($runOut -notmatch "SURFACE OK") { throw "surface conversions ($surfaceMode) marker missing: $runOut" }
+    Write-CaseResult -Name ("surface_conversions_" + $surfaceMode) -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name ("surface_conversions_" + $surfaceMode) -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# The float-suffixed math the owned runtime exports (sqrtf/expf/logf/powf/
+# sinf/cosf/tanhf). Nothing else provides them -- std/math implements the
+# double forms in Mettle -- so a program that binds one at the C boundary is
+# reading these series. Checked against independently computed constants.
+foreach ($mathMode in @("debug", "release")) {
+  $total++
+  try {
+    $exePath = Join-Path $tmpDir ("runtime_float_math_{0}.exe" -f $mathMode)
+    if (Test-Path $exePath) { Remove-Item -Path $exePath -Force -ErrorAction SilentlyContinue }
+    $mathFlags = @("--build", "--linker", "internal")
+    if ($mathMode -eq "release") { $mathFlags += "--release" }
+    $buildOut = & $CompilerPath @mathFlags "tests\test_runtime_float_math.mettle" -o $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "runtime float math build ($mathMode) failed: $buildOut" }
+    $runOut = & $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "runtime float math ($mathMode) exited with $LASTEXITCODE`: $runOut" }
+    if ($runOut -notmatch "RUNTIME MATH OK") { throw "runtime float math ($mathMode) marker missing: $runOut" }
+    Write-CaseResult -Name ("runtime_float_math_" + $mathMode) -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name ("runtime_float_math_" + $mathMode) -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# The same two miscompiles reached through the older coercion corpus. Both
+# files passed in debug and misbehaved under --release for as long as they
+# existed, because nothing ran them optimized. The property is agreement
+# between the two builds, not a particular exit code: these programs return a
+# computed value.
+foreach ($coercionProgram in @("tests\test_string_cstring_coercions.mettle",
+                               "tests\test_extern_string_auto_cstring.mettle")) {
+  $total++
+  $coercionName = "release_parity_" + [System.IO.Path]::GetFileNameWithoutExtension($coercionProgram)
+  try {
+    $debugExe = Join-Path $tmpDir ($coercionName + "_d.exe")
+    $releaseExe = Join-Path $tmpDir ($coercionName + "_r.exe")
+    foreach ($stale in @($debugExe, $releaseExe)) {
+      if (Test-Path $stale) { Remove-Item -Path $stale -Force -ErrorAction SilentlyContinue }
+    }
+    $buildOut = & $CompilerPath --build --linker internal $coercionProgram -o $debugExe 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "debug build failed: $buildOut" }
+    $buildOut = & $CompilerPath --build --linker internal --release $coercionProgram -o $releaseExe 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "release build failed: $buildOut" }
+    $debugOut = & $debugExe 2>&1 | Out-String
+    $debugExit = $LASTEXITCODE
+    $releaseOut = & $releaseExe 2>&1 | Out-String
+    $releaseExit = $LASTEXITCODE
+    if ($debugExit -ne $releaseExit) {
+      throw "exit code diverged: debug $debugExit vs release $releaseExit"
+    }
+    if ($debugOut -ne $releaseOut) {
+      throw "output diverged: debug '$debugOut' vs release '$releaseOut'"
+    }
+    Write-CaseResult -Name $coercionName -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name $coercionName -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # Allocator reliability: double-free / bogus-free rejection (no free-list
 # corruption). Exercises std/alloc directly; no flag needed.
 $total++
@@ -3989,8 +4125,7 @@ try {
 import "std/io";
 
 fn main() -> int32 {
-  var msg: string = "Bundled stdlib works";
-  println(cstr(msg));
+  println("Bundled stdlib works");
   return 0;
 }
 '@ | Set-Content -Path $nativeStdlibSource -Encoding ASCII

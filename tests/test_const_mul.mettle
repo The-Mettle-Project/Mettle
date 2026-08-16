@@ -52,13 +52,13 @@ fn check_unsigned(x: uint64, k: int32, r: uint64) -> int64 {
 
 fn main() -> int32 {
   var nm: int32 = 14;
-  var muls: int64* = (int64*)malloc((int64)nm * 8);
+  var muls: int64* = malloc((int64)nm * 8);
   muls[0] = 3; muls[1] = 5; muls[2] = 6; muls[3] = 7; muls[4] = 9;
   muls[5] = 10; muls[6] = 15; muls[7] = 17; muls[8] = 24; muls[9] = 63;
   muls[10] = 255; muls[11] = 1000; muls[12] = 65537; muls[13] = 1103515245;
 
   var nx: int32 = 14;
-  var xs: int64* = (int64*)malloc((int64)nx * 8);
+  var xs: int64* = malloc((int64)nx * 8);
   xs[0] = 0; xs[1] = 1; xs[2] = -1; xs[3] = 2; xs[4] = -2;
   xs[5] = 12345; xs[6] = -12345; xs[7] = 2147483647; xs[8] = -2147483648;
   xs[9] = 9223372036854775807; xs[10] = -9223372036854775807 - 1;
@@ -79,8 +79,8 @@ fn main() -> int32 {
     k = k + 1;
   }
 
-  free((cstring)muls);
-  free((cstring)xs);
+  free(muls);
+  free(xs);
 
   if (fails == 0) {
     println("const_mul OK");
