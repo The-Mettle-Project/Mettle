@@ -1033,7 +1033,7 @@ silently.
 
 Implementation: `src/ir/optimizer/ir_optimize_value_range.c`.
 
-A family of rewrites needs the same fact -- *what can this value be here?* --
+A family of rewrites needs the same fact (*what can this value be here?*)
 and the optimizer used to derive it one shape at a time: a loop-shaped pass
 proved a symbol positive only when a `while (x > 1)` guarded it, and a
 use-shaped pass turned `x % 2^k` into a mask only when the result was compared
@@ -1047,7 +1047,7 @@ interpretation** of an operand at a program point, from:
   deliberately left unbounded, because its upper half is negative as a
   `long long`);
 - the producing instruction of a temp, or the reaching definition of a symbol
-  in the same straight-line region -- but only across a call, store, or inline
+  in the same straight-line region, but only across a call, store, or inline
   assembly when the symbol is a local or parameter of this function whose
   address never escapes;
 - the operator: a comparison is `[0,1]`, `&` with a non-negative operand cannot
@@ -1069,21 +1069,21 @@ address-taken set, and the memoized counter and label verdicts) are built on
 the first question and skipped entirely for a function nothing asks about.
 
 The rewrites that spend the answer are split by what they need. Those that are
-ordinary algebraic identities gated on a proof -- power-of-two divide into a
-shift, remainder into a mask -- are **rows in the identity table** below, which
+ordinary algebraic identities gated on a proof (power-of-two divide into a
+shift, remainder into a mask) are **rows in the identity table** below, which
 reaches into the analysis through its `P_NONNEG` operand pattern. Those that
 need the computed bounds themselves live in `ir_value_range_simplify`:
 whole-operation folds (`x / c` is `0` and `x % c` is `x` when `0 <= x < c`),
-removal of a mask that covers every reachable bit -- or of the whole operation
-when it covers none -- comparisons the bounds already decide, and branches they
+removal of a mask that covers every reachable bit (or of the whole operation
+when it covers none), comparisons the bounds already decide, and branches they
 already resolve. Teaching the analysis a new source of bounds strengthens every
 one of them at once.
 
 One relative of these rewrites deliberately does **not** go through the range
 analysis: `x % 2^k` whose only consumer is a test against zero becomes
 `x & (2^k-1)` for any sign of `x`. That is a use-context rewrite, not a value
-rewrite -- the two expressions differ when `x` is negative and agree only on
-the question being asked -- so it needs no proof about the dividend at all.
+rewrite (the two expressions differ when `x` is negative and agree only on
+the question being asked) so it needs no proof about the dividend at all.
 
 ## 5.3 Declarative algebraic rewriting
 
@@ -1092,14 +1092,14 @@ Implementation: `src/ir/optimizer/ir_optimize_rewrite.c`.
 Two tables, each with a shared driver, hold everything the optimizer knows
 about integer algebra that does not depend on where the instruction sits:
 
-- `g_binary_identities` -- one row per identity on a single `dest = lhs op rhs`
+- `g_binary_identities`: one row per identity on a single `dest = lhs op rhs`
   (`x + 0`, `x * 2^k`, `x - x`, `x | -1`, ...), matched by operator text plus a
   pattern per operand slot, with commutativity handled by the driver. Most
   patterns match on operand shape and so hold everywhere; `P_NONNEG` instead
   asks the range analysis whether the operand can be negative at this
   instruction, which is how `x / 2^k -> x >> k` and `x % 2^k -> x & m` are
   table rows rather than a bespoke pass.
-- `g_const_chains` -- one row per two-instruction chain `(x op c1) op c2` that
+- `g_const_chains`: one row per two-instruction chain `(x op c1) op c2` that
   collapses to `x op K`: additive (with subtraction normalized into a signed
   sum), multiplicative, the three bitwise merges, and width-bounded shifts.
   Every row is bit-exact under two's-complement wraparound at every operand
@@ -1135,8 +1135,8 @@ semantic GPU transforms (async staging promotion, and tensor accumulator-chain
 and residency formation). It forms no SIMD opcodes, fuses no x86 rotates, and
 introduces no host memory intrinsics or prefetch.
 
-Both entries that carry the value-range work -- algebraic and branch
-simplification, and constant reassociation -- are on this schedule, so ARM64,
+Both entries that carry the value-range work (algebraic and branch
+simplification, and constant reassociation) are on this schedule, so ARM64,
 PTX, and SPIR-V get the divide-into-shift, remainder-into-mask, mask removal,
 and decided comparisons on the same terms x86-64 does. That is a direct
 consequence of expressing the transform as a target-neutral analysis plus
@@ -1688,7 +1688,7 @@ through a caller buffer whose address rides in x8, the AAPCS64 indirect-result
 register), while a composite that fits in a register travels packed. A `string`
 is a 16-byte { chars, length } record, so a string literal used as a value is
 the address of such a record, and the IR's bare aggregate-local names read as
-addresses only in load/store address positions -- everywhere else the frontend
+addresses only in load/store address positions, everywhere else the frontend
 has already chosen how the value travels. Local names reused across sibling
 scopes with different types are re-classified at each declaration; the maps are
 not first-declaration-wins.

@@ -45,7 +45,7 @@ Two claims, and they depend on each other:
    entirely on synthetic functions because of it.
 
    On the shape-key held-out split this looked like a large win. It was not, and
-   the correction is the most important thing in this document -- see
+   the correction is the most important thing in this document. See
    [Where this fails](#where-this-fails-out-of-distribution) below. The
    held-out split separates function bodies within one codebase; it does not
    separate codebases, and the delete-precision result turned out to be fitted to
@@ -65,8 +65,8 @@ Two claims, and they depend on each other:
    the new data). What does not survive is the precision claim.
 
    One sub-claim has to be retired before it is made, though. The obvious
-   headline -- "the model predicts which of its own proposals the validator will
-   reject" -- does not survive its own control. Predicting rejection from the
+   headline, "the model predicts which of its own proposals the validator will
+   reject", does not survive its own control. Predicting rejection from the
    **instruction kind alone**, ten empirical rates fitted on train and applied to
    held-out, scores **0.963 AUC** (`risk_baseline.py`). Stores in
    `mem_copy`-shaped code are nearly always rejected, and that single fact
@@ -98,7 +98,7 @@ One confound, stated rather than buried: being slower, it hit the 100-minute
 wall-clock budget at ~22 epochs where the others ran 30, so some of the gap is
 undertraining. The gap is wide enough that undertraining is unlikely to explain
 all of it, but a matched-epoch rerun would be needed to say so. The premise was
-wrong either way -- parameter count is not what the compile-time bill is
+wrong either way, parameter count is not what the compile-time bill is
 denominated in.
 
 ## Where this fails: out of distribution
@@ -108,7 +108,7 @@ the toolchain's own tests, examples, and stdlib. That split stops a function bod
 appearing on both sides. It does not stop a model learning one project's idioms
 and being scored on the same project's idioms.
 
-MettleWarband is the first evaluation from outside that distribution -- 17 441
+MettleWarband is the first evaluation from outside that distribution, 17 441
 lines, 18 modules, a Vulkan renderer with networking and AI, 863 functions in the
 post-classical IR, in a different repository that was never harvested.
 `dist_overlap.py` puts a number on the difference:
@@ -139,11 +139,11 @@ Three readings, in order of importance:
    which sites in the toolchain get rejected and went quiet on unfamiliar code;
    `oracle_C`'s node identity is structural, so it kept proposing. That ordering
    is the clearest evidence the architecture does something the data alone does
-   not -- it just does not do enough to beat the shipped model.
+   not. It just does not do enough to beat the shipped model.
 
 The model-free path is the one that holds up. On the same unseen codebase,
 `sem_probe.py` proposes 820 semantic-only reuse candidates, none overlapping the
-shipped pass, and the gate validates **103 against 17 rejections** -- more sound
+shipped pass, and the gate validates **103 against 17 rejections**, more sound
 rewrites in one application than the 111 found across roughly 500 toolchain
 programs. Precision falls out of distribution (14.2% rejected against 0.9%),
 which is exactly what eight probes of evidence should do on unfamiliar code, and
@@ -310,7 +310,7 @@ A candidate is not a rewrite, so counting candidates proves nothing on its own.
 `sem_probe.py` settles it end to end and without any network: compile with
 `--ml-opt` to get the post-classical IR, compute the semantic-only dominating
 pairs on exactly that IR, emit each as a `COPY` disposition, and recompile with
-`METTLE_ML_DISP` so those proposals -- and nothing else -- go through the
+`METTLE_ML_DISP` so those proposals (and nothing else) go through the
 interpreter differential.
 
 ```
@@ -345,11 +345,11 @@ validated, 1 rejected, 0 applied unadjudicated.**
 On magnitude, honestly: 111 rewrites across roughly 500 programs is about one
 validated rewrite per five programs, not a transformative win. The classical
 optimizer is good and most of this redundancy is already gone. What is new is the
-*class* -- these are cases no syntactic analysis in the pipeline can see -- not
+*class* (these are cases no syntactic analysis in the pipeline can see), not
 the volume.
 
 Nothing was applied without adjudication. Reaching that state required a fix to
-the pass itself, described next -- the first run of this probe silently applied
+the pass itself, described next, the first run of this probe silently applied
 116 rows unvalidated.
 
 #### A soundness gap the pointer head would walk straight into
@@ -384,7 +384,7 @@ default. `ml_gnn.c` scores every (node, dominating candidate) pair with the
 trained bilinear head over the union of the dominating same-expression and
 dominating same-value relations, and slot 0 is "decline". A node whose best slot
 is `decline` keeps whatever the sound analysis chose, so the head can only add
-proposals or redirect ones the analysis already wanted to make -- and anything it
+proposals or redirect ones the analysis already wanted to make, and anything it
 chooses that the analysis did not is emitted as `COPY?`, so it faces the
 interpreter gate even on functions the gate would otherwise wave through.
 `ptr_probe.py` counts what happens to exactly those proposals.
@@ -413,7 +413,7 @@ programs with >=1 validated semantic rewrite : 47
 ```
 
 This is the cleanest statement of the contribution, because it has no model in
-it. The feature alone -- semantic node identity plus the gate -- finds real
+it. The feature alone (semantic node identity plus the gate) finds real
 optimizations this compiler was leaving on the floor. What a trained model adds
 on top is a separate question, and the bake-off's job.
 
@@ -442,7 +442,7 @@ Worth stating plainly, because it is the most likely thing to be misread. Pointe
 labels come from `gvn_targets`, which mirrors the *syntactic* available-
 expressions analysis in `gvn.py`. The candidate set, however, is the union of the
 syntactic and semantic dominating relations. So every semantically-equal but
-syntactically-different pair -- the entire gap measured above -- is labelled
+syntactically-different pair (the entire gap measured above) is labelled
 "decline". The head is currently being taught to ignore exactly the redundancy
 OBS was built to expose.
 
@@ -467,9 +467,9 @@ head learns to decline, which is useful training but not the payoff.
 **Measured, and it came out exactly as predicted.** With the trained variant C
 running in the compiler under `METTLE_ML_PTR=1` across 70 example programs
 (`ptr_probe.py`), the head produced **one** proposal the sound analysis had not
-already made. Not because it is inaccurate -- it is 99.3% correct across 1805
+already made. Not because it is inaccurate, it is 99.3% correct across 1805
 candidate sites and 90.2% correct at naming the target on the 51 sites that have
-one -- but because it reproduces its teacher. Trained to imitate a syntactic
+one, but because it reproduces its teacher. Trained to imitate a syntactic
 analysis, it does not exceed a syntactic analysis.
 
 This is the cleanest possible demonstration that the two contributions are
@@ -535,7 +535,7 @@ it avoid and how many sound rewrites does it lose? At threshold 0.3:
 
 The GNN keeps *more* proposals than the kind baseline, at *half* its rejection
 rate, and retains 43 more sound rewrites. That is a real margin and it is the
-number worth quoting -- not the 0.9876 AUC, which sits only 0.025 above ten
+number worth quoting, not the 0.9876 AUC, which sits only 0.025 above ten
 hand-counted rates.
 
 Read plainly: the pass could skip roughly two thirds of its speculative
@@ -557,7 +557,7 @@ of the harvested corpus. It was still not enough, which only became visible by
 measuring it (`split_audit.py`, which reports each held-out body's maximum
 similarity to any training body over abstracted instruction shapes). After
 body-hash splitting, **32.5% of held-out bodies still had a training twin with an
-identical instruction shape** -- the same source function inlined at a second
+identical instruction shape**, the same source function inlined at a second
 call site, differing only in temp numbering and inlined-parameter names, so its
 canonical text differs and its hash does not collide. `write_i32_le` appeared on
 both sides under its own name.
@@ -629,7 +629,7 @@ is localized rather than mysterious:
   and C dominator computations are separate implementations.
 
 The disagreeing node is `@i <- 0` in a real loop, with a top-two logit margin of
-0.124 -- too wide to be floating-point noise, so it is a genuine graph
+0.124, too wide to be floating-point noise, so it is a genuine graph
 difference, not a rounding artifact. One node in 17043 is 0.006%, which is worth
 naming precisely rather than rounding away.
 
@@ -657,7 +657,7 @@ its `^(\S+)\s*(=|<-)` pattern happily backtracks onto the `=` inside the argumen
 list, and `ml_gnn.c` reaches a different conclusion. The feature difference is
 real but small enough that a trained model's margins absorb it entirely.
 
-It is also **not** introduced by any of this work -- the baseline variant, using
+It is also **not** introduced by any of this work, the baseline variant, using
 only the nine original features and eight original edges, shows it too. Fixing it
 properly means making the assignment-operator search ignore `=` inside
 parentheses on both sides, which changes what `gnn_genius.bin` predicts and so is
@@ -692,14 +692,14 @@ formats. A v1 blob takes exactly the v1 path.
 
 Implemented end to end:
 
-- `obs.py`, `obs_golden.py`, `obs_gap.py` -- featurizer, C parity vectors, gap analysis
-- `gnn_oracle.py` -- graph builder and the four variants
-- `train_oracle.py`, `eval_oracle.py`, `bakeoff.py` -- multi-task training, evaluation, driver
-- `harvest.py` and the `METTLE_ML_TRACE` hook in `ml_opt.c` -- the data engine
-- `export_oracle.py` -- the v2 blob writer
-- `src/ir/ml_obs.c` -- the C featurizer, verified against the golden vectors by
+- `obs.py`, `obs_golden.py`, `obs_gap.py`, featurizer, C parity vectors, gap analysis
+- `gnn_oracle.py`, graph builder and the four variants
+- `train_oracle.py`, `eval_oracle.py`, `bakeoff.py`, multi-task training, evaluation, driver
+- `harvest.py` and the `METTLE_ML_TRACE` hook in `ml_opt.c`, the data engine
+- `export_oracle.py`, the v2 blob writer
+- `src/ir/ml_obs.c`, the C featurizer, verified against the golden vectors by
   `tests/ml_obs_parity_test.c` (regression case `ml_obs_python_parity`)
-- `src/ir/ml_gnn.c` -- v2 loader, OBS features, value edges, and the recurrent
+- `src/ir/ml_gnn.c`, v2 loader, OBS features, value edges, and the recurrent
   forward pass with ACT halting
 
 Verified:
@@ -717,7 +717,7 @@ Not done:
   waits on evidence from `ptr_probe.py` that the targets it names actually clear
   the gate.
 - **true DAgger converged after one round, with no gain.** `dagger_round.py` did
-  the real thing -- exported variant C, compiled the corpus with it in the loop,
+  the real thing, exported variant C, compiled the corpus with it in the loop,
   and trained on the gate's verdicts about the proposals *that* model made. Every
   metric came back flat or marginally worse (acc 0.9918 to 0.9916, DELETE F1
   0.624 to 0.619).
@@ -736,8 +736,8 @@ Not done:
   the harvest only labels sites the model actually proposed, so it can teach
   precision and never recall. No number of rounds will surface a sound rewrite
   the model declines to propose, and the semantic probe shows 111 of those exist.
-  Going further needs *exploration* during harvesting -- proposing past the
-  model's own confidence to manufacture new failure modes -- which is a different
+  Going further needs *exploration* during harvesting, proposing past the
+  model's own confidence to manufacture new failure modes, which is a different
   mechanism, not more of this one.
 - **no end-to-end compile-time result yet.** Every number below is held-out
   classification, not measured optimization quality on real builds.

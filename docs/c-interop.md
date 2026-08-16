@@ -54,7 +54,7 @@ or vendor DLL, pass it with `--link-arg -lname` or an import library path.
 `cstring` is an alias for `uint8*`: a pointer to bytes a C function reads up to
 a NUL. Use it for C `char*`. `cstring` and `uint8*` are interchangeable.
 
-`rawptr` is an address with no element type -- C's `void*`, and what an
+`rawptr` is an address with no element type, C's `void*`, and what an
 allocator hands out. It converts to and from every pointer type in both
 directions, so `var p: int32* = malloc(n);` and `free(p)` both need no cast.
 It cannot be indexed, dereferenced, or offset, because it names no element.
@@ -83,7 +83,7 @@ var fp: cstring = fopen(path, "rb");
 
 `cstr` returns 0 when the allocator does. For a C function that takes a pointer
 and a length rather than a terminated string, pass `s.chars` and `s.length`
-directly -- no copy is needed.
+directly, no copy is needed.
 
 ## Passing Structs to C
 

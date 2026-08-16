@@ -87,7 +87,7 @@ nothing else.
 
 Being a call costs a second thing, and it is subtler. The allocator has to
 assume a call happens, so every value live across one needs a register the call
-would not clobber -- and there are seven of those. A nested loop carrying two
+would not clobber, and there are seven of those. A nested loop carrying two
 pointers, two counters, two resolved spans and two indices has spent them all
 before it reaches the value it just loaded, which then goes to the stack on
 every iteration; a float accumulator has nowhere to live at all, because no XMM
@@ -95,7 +95,7 @@ register survives a call on both calling conventions. So the two runtime calls
 the checking machinery puts in loops give some registers back. The check saves
 and restores RAX and the volatile XMM lanes around itself, which costs nothing
 because it is entered only when the comparison in front of it fails. The span
-resolution saves the XMM lanes, which costs eight instructions -- but the
+resolution saves the XMM lanes, which costs eight instructions, but the
 compiler hoisted it in front of the loop, so that is once per loop against once
 per element. Where the allocator ends up using none of the registers this hands
 back, the saving is dropped again rather than paid for nothing. `transpose` and

@@ -230,7 +230,7 @@ free(a);
 ```
 
 needs no cast either way. Because it names no element, it cannot be indexed,
-dereferenced, or offset -- give the address a type first. Use `rawptr` for an
+dereferenced, or offset, give the address a type first. Use `rawptr` for an
 opaque pointer or a `void*` at a C boundary.
 
 `string` is a built-in struct with two fields: `.chars` (pointer to the
@@ -241,7 +241,7 @@ never scans for a NUL.
 
 NUL-termination is a property of the C boundary, not of the type. A string
 *literal* already sits in rodata with a terminator the compiler emitted, so it
-flows straight into a `cstring` parameter -- `fopen("data.txt", "rb")`
+flows straight into a `cstring` parameter, `fopen("data.txt", "rb")`
 allocates nothing. For a string built at run time, `cstr(s, alloc)` from
 `std/io` produces the terminated copy, and takes the allocator it comes from so
 the copy is visible in the signature:
@@ -438,7 +438,7 @@ Generated code that cannot be read cannot be reviewed, so expansion is inspectab
 
 Where a node has no faithful source spelling the printer says so inline, as a marked comment, and reports on stderr that the output is not a complete program. It does not guess: a printer that silently misrepresents generated code is worse than none, because it is believed.
 
-`--report-expansion` prints what each site cost, and `--expansion-budget=N` makes that a contract -- over budget fails the build and names the site responsible:
+`--report-expansion` prints what each site cost, and `--expansion-budget=N` makes that a contract: over budget fails the build and names the site responsible:
 
 ```
 comptime expansion: 2 sites, 84 nodes generated
@@ -521,8 +521,8 @@ fn bump<T>(x: T) -> T where T: Incrementable {
 **Widen silently. Narrow loudly.** An integer conversion happens on its own
 only when every value of the source type is representable in the destination:
 `int32` to `int64`, `uint32` to `int64`, `bool` to any integer. A conversion
-that can change the value -- `int64` to `int32`, `uint64` to `int64`, `int32`
-to `uint32` -- is a narrowing and needs a cast at the site, where a reader can
+that can change the value (`int64` to `int32`, `uint64` to `int64`, `int32`
+to `uint32`) is a narrowing and needs a cast at the site, where a reader can
 see it. Narrowing without one is [M0119](diagnostics.md).
 
 ```mettle
@@ -539,7 +539,7 @@ known: `var b: uint8 = 200;` is fine, and `var h: int32 = 2654435761;` is
 destinations sit outside the rule because they are not range conversions:
 `bool` is a truth coercion (a comparison yields `int32`, and
 `var b: bool = x > y;` stores it), and an enum names a set. An enum flowing the
-other way is checked exactly -- it converts implicitly when every declared
+other way is checked exactly, it converts implicitly when every declared
 member fits.
 
 Floating-point conversions (`float32` to `float64` and back) remain implicit in
