@@ -135,6 +135,33 @@ MtlcIntrinsic ir_intrinsic_from_name(const char *name) {
   return MTLC_INTRINSIC_NONE;
 }
 
+const char *ir_gpu_only_construct_name(IROpcode op) {
+  switch (op) {
+  case IR_OP_ADDRESS_SPACE_ALLOC:
+    return "workgroup/private device storage";
+  case IR_OP_BARRIER:
+    return "barrier";
+  case IR_OP_ASYNC_COPY:
+    return "async_copy";
+  case IR_OP_ASYNC_COMMIT:
+    return "async_commit";
+  case IR_OP_ASYNC_WAIT:
+    return "async_wait";
+  case IR_OP_TENSOR_TRANSFER:
+    return "tensor_transfer";
+  case IR_OP_TENSOR_MMA:
+    return "tensor_mma";
+  case IR_OP_TENSOR_MATMUL:
+    return "tensor_matmul";
+  case IR_OP_TENSOR_EPILOGUE:
+    return "tensor_epilogue";
+  case IR_OP_TENSOR_COMMIT:
+    return "tensor_commit";
+  default:
+    return NULL;
+  }
+}
+
 const char *ir_intrinsic_name(MtlcIntrinsic intrinsic) {
   for (size_t i = 0; i < sizeof(g_ir_intrinsics) / sizeof(g_ir_intrinsics[0]);
        i++) {

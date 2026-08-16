@@ -1,0 +1,13 @@
+// A kernel using a GPU-only construct is a user error when it is compiled for
+// a CPU target, not a compiler bug. The construct reaches the host backend,
+// which has no translation for it; the driver must say so and name the flag
+// that does compile it, instead of reporting an internal compiler error.
+
+kernel gemm_tile(a: uint16*, b: uint16*, c: float32*, d: float32*) {
+  tensor_mma(a, b, c, d,
+             shape: m16n16k16,
+             input_type: f16,
+             output_type: f32,
+             a_layout: row, b_layout: col,
+             c_layout: row, d_layout: row);
+}

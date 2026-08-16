@@ -3560,10 +3560,17 @@ static int compile_optimize_ir(IRProgram *ir_program, ASTNode *ast_program,
 
 static int compile_generate_code(CodeGenerator *code_generator) {
   if (!code_generator_generate_program(code_generator)) {
-    fprintf(stderr, "Code generation error: %s\n",
-            (code_generator && code_generator->error_message)
-                ? code_generator->error_message
-                : "Unknown error");
+    const char *message = (code_generator && code_generator->error_message)
+                              ? code_generator->error_message
+                              : "Unknown error";
+    /* A GPU-only construct compiled for a CPU target is the programmer's
+     * mistake, phrased for them at the point it was found; don't bury it
+     * under a generic internal-error report. */
+    if (code_generator && code_generator->has_user_error) {
+      fprintf(stderr, "error: %s\n", message);
+      return 0;
+    }
+    fprintf(stderr, "Code generation error: %s\n", message);
     mettle_compiler_ice_report("Code generation failed",
                                code_generator && code_generator->error_message
                                    ? code_generator->error_message

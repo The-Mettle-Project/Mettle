@@ -18,6 +18,10 @@ typedef struct {
   int generate_stack_trace_support;
   int eliminate_unreachable_functions;
   int has_error;
+  /* The failure in error_message is the programmer's, already phrased for them
+     (today: a GPU-only construct compiled for a CPU target). The driver prints
+     it and skips the generic internal-error report. */
+  int has_user_error;
   char *error_message;
   IRProgram *ir_program;
   size_t last_runtime_location_line;

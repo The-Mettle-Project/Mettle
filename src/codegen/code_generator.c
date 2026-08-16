@@ -23,6 +23,7 @@ CodeGenerator *code_generator_create(void) {
   generator->generate_stack_trace_support = 0;
   generator->eliminate_unreachable_functions = 0;
   generator->has_error = 0;
+  generator->has_user_error = 0;
   generator->error_message = NULL;
   generator->ir_program = NULL;
   generator->last_runtime_location_line = 0;

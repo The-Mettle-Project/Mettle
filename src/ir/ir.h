@@ -526,6 +526,9 @@ typedef struct {
 /* Compatibility mapping used at frontend/public-call boundaries. It is the
  * only place legacy source spellings become semantic GPU operations. */
 MtlcIntrinsic ir_intrinsic_from_name(const char *name);
+/* Source spelling of a GPU-only opcode, for the diagnostic a CPU backend
+ * raises when one reaches it. NULL when the opcode is not GPU-only. */
+const char *ir_gpu_only_construct_name(IROpcode op);
 const char *ir_intrinsic_name(MtlcIntrinsic intrinsic);
 int ir_intrinsic_arity(MtlcIntrinsic intrinsic);
 int ir_intrinsic_is_atomic(MtlcIntrinsic intrinsic);

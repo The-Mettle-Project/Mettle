@@ -1848,6 +1848,9 @@ $cases = @(
   @{ Name = "err_gpu_tensor_transfer_spirv_profile"; Path = "tests/gpu/tensor_transfer.mettle"; ShouldSucceed = $false; Args = @("--emit-spirv"); Pattern = "SPIR-V OpenCL 2.0 profile has no multidimensional workgroup-transfer lowering" },
   @{ Name = "err_gpu_async_copy_outside_kernel"; Path = "tests/err_gpu_async_copy_outside_kernel.mettle"; ShouldSucceed = $false; Pattern = "Asynchronous workgroup copies are only legal directly inside a GPU kernel" },
   @{ Name = "err_gpu_async_copy_transaction"; Path = "tests/err_gpu_async_copy_transaction.mettle"; ShouldSucceed = $false; Pattern = "async copy byte span must be divisible by its transaction size" },
+  @{ Name = "err_gpu_kernel_on_host_target"; Path = "tests/err_gpu_kernel_on_host_target.mettle"; ShouldSucceed = $false;
+     OutputMustMatch = @("'tensor_mma' in function 'gemm_tile' runs on a GPU", "--emit-ptx") ;
+     OutputMustNotMatch = @("internal compiler error") },
   @{ Name = "err_gpu_async_copy_unbalanced"; Path = "tests/err_gpu_async_copy_unbalanced.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "invalid asynchronous-copy contract or unbalanced group" },
   @{ Name = "err_gpu_async_copy_space"; Path = "tests/err_gpu_async_copy_space.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "invalid asynchronous-copy contract or unbalanced group" },
   @{ Name = "gpu_uniform_collectives"; Path = "tests/gpu/uniform_collectives.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx") },

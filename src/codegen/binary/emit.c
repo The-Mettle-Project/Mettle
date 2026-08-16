@@ -5782,13 +5782,26 @@ int code_generator_binary_emit_instruction(
     return code_generator_binary_emit_simd_outer_lane_f64(generator, context,
                                                           instruction);
 
-  default:
+  default: {
+    const char *gpu_construct = ir_gpu_only_construct_name(instruction->op);
+    if (gpu_construct) {
+      generator->has_user_error = 1;
+      code_generator_set_error(
+          generator,
+          "'%s' in function '%s' runs on a GPU and has no CPU translation. "
+          "Compile the module that defines this kernel with --emit-ptx "
+          "(NVIDIA) or --emit-spirv (OpenCL), and keep it out of the host "
+          "program",
+          gpu_construct, context->function_name);
+      return 0;
+    }
     code_generator_set_error(
         generator,
         "Direct object backend does not yet support IR opcode %d in "
         "function '%s'",
         (int)instruction->op, context->function_name);
     return 0;
+  }
   }
 }
 
