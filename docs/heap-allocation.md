@@ -13,6 +13,11 @@ the result before use.
 `std/alloc` adds explicit heaps, size classes, and statistics in Mettle code.
 `--native-heap` routes generated heap calls through that standard library heap.
 
+Both surfaces are typed with `rawptr`: an allocator hands out an address with
+no element type, and a deallocator takes one. `rawptr` converts to and from
+every pointer type, so neither `var a: int32* = malloc(n)` nor `free(a)` needs
+a cast.
+
 Memory has an explicit lifetime. Free a buffer with the API that created it.
 Do not free stack storage or an OS handle. The runtime checks its own allocation
 headers but does not add automatic object lifetime or tracing.

@@ -13,11 +13,11 @@ AArch64 uses AAPCS64.
 
 ```mettle
 extern fn puts(msg: cstring) -> int32 = "puts";
-extern fn malloc(size: int64) -> cstring = "malloc";
+extern fn malloc(size: int64) -> rawptr = "malloc";
 
 fn main() -> int32 {
   puts("Hello");
-  var p: cstring = malloc(100);
+  var p: int32* = malloc(100);
   return 0;
 }
 ```
@@ -49,9 +49,41 @@ The default native import set includes `kernel32`, `user32`, `gdi32`,
 `advapi32`, and `ws2_32`. It excludes UCRT and MSVCRT. If you call another OS
 or vendor DLL, pass it with `--link-arg -lname` or an import library path.
 
-## cstring
+## cstring and rawptr
 
-`cstring` is an alias for `uint8*`. Use it for C `char*`, `void*`, or opaque pointers. `cstring` and `uint8*` are interchangeable. When passing a Mettle `string` to a C function that expects `char*`, use `s.chars` or the `cstr` helper from `std/io`.
+`cstring` is an alias for `uint8*`: a pointer to bytes a C function reads up to
+a NUL. Use it for C `char*`. `cstring` and `uint8*` are interchangeable.
+
+`rawptr` is an address with no element type -- C's `void*`, and what an
+allocator hands out. It converts to and from every pointer type in both
+directions, so `var p: int32* = malloc(n);` and `free(p)` both need no cast.
+It cannot be indexed, dereferenced, or offset, because it names no element.
+
+### Passing a Mettle string to C
+
+A `string` is a pointer and a length with **no terminator**. NUL-termination is
+a property of this boundary, not of the type.
+
+A string *literal* is already terminated in rodata, so it flows straight into a
+`cstring` parameter and allocates nothing:
+
+```mettle
+var fp: cstring = fopen("data.txt", "rb");
+```
+
+Anything built at run time needs a terminated copy, and `cstr` from `std/io` is
+where that copy happens. It takes the allocator it comes from, so the cost is
+in the signature rather than in the punctuation at the call:
+
+```mettle
+var path: cstring = cstr(name, &malloc);
+defer free(path);
+var fp: cstring = fopen(path, "rb");
+```
+
+`cstr` returns 0 when the allocator does. For a C function that takes a pointer
+and a length rather than a terminated string, pass `s.chars` and `s.length`
+directly -- no copy is needed.
 
 ## Passing Structs to C
 

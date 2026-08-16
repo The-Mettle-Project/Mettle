@@ -216,9 +216,41 @@ An array may be initialized with an [aggregate literal](expressions.md#aggregate
 
 ## Built-in Alias Types
 
-`cstring` is an alias for `uint8*`. It is used for C interop: null-terminated strings, `void*`, and opaque pointers. `cstring` and `uint8*` are interchangeable. Use `cstring` when calling C functions that expect `char*` or `void*`.
+`cstring` is an alias for `uint8*`: a pointer to bytes a C function will read
+up to a NUL. `cstring` and `uint8*` are interchangeable. Use `cstring` when
+calling C functions that expect `char*`.
 
-`string` is a built-in struct with two fields: `.chars` (pointer to the character data) and `.length` (uint64, byte count). String literals have type `string`. The `string` type is distinct from `cstring`; use `s.chars` or the `cstr` helper from `std/io` to obtain a `cstring` for C calls.
+`rawptr` is an address with no element type: what an allocator hands out and
+what a deallocator takes. It converts to and from every pointer type in both
+directions, so
+
+```mettle
+var a: int32* = malloc(n * 4);
+free(a);
+```
+
+needs no cast either way. Because it names no element, it cannot be indexed,
+dereferenced, or offset -- give the address a type first. Use `rawptr` for an
+opaque pointer or a `void*` at a C boundary.
+
+`string` is a built-in struct with two fields: `.chars` (pointer to the
+character data) and `.length` (uint64, byte count). It is a borrowed view: a
+pointer, a length, and **no terminator**. String literals have type `string`,
+and `print`/`println` take one, so `println("done")` writes `length` bytes and
+never scans for a NUL.
+
+NUL-termination is a property of the C boundary, not of the type. A string
+*literal* already sits in rodata with a terminator the compiler emitted, so it
+flows straight into a `cstring` parameter -- `fopen("data.txt", "rb")`
+allocates nothing. For a string built at run time, `cstr(s, alloc)` from
+`std/io` produces the terminated copy, and takes the allocator it comes from so
+the copy is visible in the signature:
+
+```mettle
+var path: cstring = cstr(name, &malloc);
+defer free(path);
+var fp: cstring = fopen(path, "rb");
+```
 
 **Creating strings at runtime:** There is no built-in constructor. To build a `string` from a `cstring` and length, assign the fields: `s.chars = ptr; s.length = len`. The `string` does not own the buffer; the caller is responsible for the lifetime of the data pointed to by `.chars`.
 
@@ -484,7 +516,34 @@ fn bump<T>(x: T) -> T where T: Incrementable {
 
 ## Type Conversions
 
-Widening conversions (e.g. `int32` to `int64`, `float32` to `float64`) are implicit. Narrowing conversions (e.g. `int32` to `int16`, `int64` to `int8`) are allowed implicitly for integer-to-integer and float-to-float. There is no implicit conversion between integers and floats, or between pointers and integers, except that `0` is valid as a null pointer initializer and in pointer comparisons.
+**Widen silently. Narrow loudly.** An integer conversion happens on its own
+only when every value of the source type is representable in the destination:
+`int32` to `int64`, `uint32` to `int64`, `bool` to any integer. A conversion
+that can change the value -- `int64` to `int32`, `uint64` to `int64`, `int32`
+to `uint32` -- is a narrowing and needs a cast at the site, where a reader can
+see it. Narrowing without one is [M0119](diagnostics.md).
+
+```mettle
+fn f(n: int64) {
+  var wide:   int64 = 1;
+  var narrow: int32 = n;          // M0119
+  var meant:  int32 = (int32)n;   // says the wrap is intended
+}
+```
+
+A compile-time constant is checked rather than refused, because its value is
+known: `var b: uint8 = 200;` is fine, and `var h: int32 = 2654435761;` is
+[M0118](diagnostics.md), naming the value and the range it missed. Two
+destinations sit outside the rule because they are not range conversions:
+`bool` is a truth coercion (a comparison yields `int32`, and
+`var b: bool = x > y;` stores it), and an enum names a set. An enum flowing the
+other way is checked exactly -- it converts implicitly when every declared
+member fits.
+
+Floating-point conversions (`float32` to `float64` and back) remain implicit in
+both directions. There is no implicit conversion between integers and floats, or
+between pointers and integers, except that `0` is valid as a null pointer
+initializer and in pointer comparisons.
 
 **Explicit casts:** Mettle provides an explicit cast syntax `(Type)expr`. This can be used to convert between numeric types, pointer types, and between integers and pointers. It is especially useful for pointer reinterpretation (e.g. treating `int32*` as `uint8*` for byte access) or converting floats to integers:
 

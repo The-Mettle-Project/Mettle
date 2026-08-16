@@ -56,6 +56,9 @@ help: for more about this error, run `mettle explain E0003`
   aliased forms, where one allocation is reachable under two names and freeing
   through either invalidates both; the message names the alias rather than
   using a separate code.
+- Integer range errors (`M0118`, `M0119`): a compile-time integer that does
+  not fit where it is stored, and a narrowing conversion written without a
+  cast. See [Type conversions](types.md).
 
 ## `mettle explain <CODE>`
 
@@ -92,6 +95,8 @@ Diagnostic codes are stable across compiler versions:
 | E0006 | I/O error |
 | E0007 | Internal compiler error |
 | M0101..M0117 | Memory-safety findings (`mettle explain list`) |
+| M0118 | Integer out of range for its destination |
+| M0119 | Narrowing conversion needs a cast |
 
 A memory finding reports under its own `M` code rather than the generic
 `E0003`, so `mettle explain M0107` works on the diagnostic in front of you.

@@ -21,7 +21,7 @@ not link a POSIX or pthread library.
 
 ## std/io
 
-Console and file I/O. `puts` writes a null-terminated string and appends a newline; `putchar` writes a single character; `getchar` reads one. `print` and `println` write a cstring (println adds a newline). `print_err` and `println_err` write to stderr (for error messages). `print_int` and `println_int` write an integer in decimal. `cstr(s: string) -> cstring` converts a Mettle string to a C string for passing to C functions. File operations: `fopen`, `fclose`, `fread`, `fwrite`, `fputs`, `fgets`, `fflush`. File handles are `cstring` (opaque `FILE*`). Stream accessors: `get_stdin`, `get_stdout`, `get_stderr`.
+Console and file I/O. `print` and `println` take a `string` and write its `length` bytes -- they never scan for a terminator, so `println("done")` costs one write. `print_err` and `println_err` do the same to stderr. `print_cstr` and `println_cstr` are the boundary forms, for a NUL-terminated pointer that came from C or from a byte buffer the program terminated itself. `print_int` and `println_int` write an integer in decimal; `putchar` writes one character and `getchar` reads one; `puts` is the raw C-shaped write. `cstr(s: string, alloc: fn(int64) -> rawptr) -> cstring` marshals a string into a NUL-terminated copy for a C call, taking the allocator so the copy is visible in the signature (a string literal needs none of this -- it is already terminated in rodata). File operations: `fopen`, `fclose`, `fread`, `fwrite`, `fputs`, `fgets`, `fflush`. File handles are `cstring` (opaque `FILE*`). Stream accessors: `get_stdin`, `get_stdout`, `get_stderr`.
 
 ## std/mem
 
@@ -29,6 +29,17 @@ Memory management. The owned runtime exports `malloc`, `calloc`, `realloc`,
 `free`, `memset`, `memcpy`, `memmove`, and `memcmp`. Helpers include
 `alloc_zeroed` and `buf_dup`. `new` uses the same owned zeroed allocator. See
 [Heap Allocation](heap-allocation.md).
+
+Allocation is typed: these hand out and take `rawptr`, an address with no
+element type that converts to and from any pointer. So
+
+```mettle
+var a: int32* = malloc(n * 4);
+defer free(a);
+```
+
+needs no cast in either direction, and releasing an `int32` buffer does not
+require claiming it holds characters.
 
 ## std/math
 

@@ -37,7 +37,7 @@ Numeric literals: decimal (`42`), hexadecimal (`0xFF`), binary (`0b1010`), float
 
 **Negative literals:** A leading minus is not part of the literal. The expression `-17` is parsed as the unary minus operator applied to the literal `17`. This matters for boundary values: `var x: int8 = -128` is valid because the literal `128` is negated to `-128`, which fits in `int8`. If `-128` were a literal, some implementations might reject it.
 
-**Literal default types:** A bare integer literal like `42` has type `int32` when the context does not require a specific type. Floating-point literals default to `float64`. In expressions like `var x: int64 = 42`, the literal is implicitly converted to the expected type. See [Types](types.md) for conversion rules.
+**Literal default types:** A bare integer literal like `42` has type `int32` when the context does not require a specific type. Floating-point literals default to `float64`. Where a literal is stored somewhere narrower, its value is checked rather than its type, so `var b: uint8 = 200;` needs no cast and `var h: int32 = 2654435761;` is reported as out of range. See [Types](types.md) for conversion rules.
 
 ## Aggregate Literals
 

@@ -779,20 +779,20 @@ import "std/mem";
 import "std/gpu";
 
 fn main() -> int32 {
-  if (gpu_init() == 0) { println(cstr("GPU init failed")); return 1; }
+  if (gpu_init() == 0) { println("GPU init failed"); return 1; }
 
   // load the emitted PTX and resolve the kernel
-  var fp: cstring = fopen(cstr("kernels.ptx"), cstr("rb"));
-  var ptx: uint8* = (uint8*)malloc(65536);
+  var fp: cstring = fopen("kernels.ptx", "rb");
+  var ptx: uint8* = malloc(65536);
   var len: int64 = fread((cstring)ptx, 1, 65535, fp); fclose(fp); ptx[len] = 0;
   var mod: int64 = gpu_module(ptx);
-  var vadd: int64 = gpu_func(mod, cstr("vadd"));
+  var vadd: int64 = gpu_func(mod, "vadd");
 
   var n: int32 = 1 << 20;
   var bytes: int64 = (int64)n * 4;
-  var ha: float32* = (float32*)malloc(bytes);
-  var hb: float32* = (float32*)malloc(bytes);
-  var hc: float32* = (float32*)malloc(bytes);
+  var ha: float32* = malloc(bytes);
+  var hb: float32* = malloc(bytes);
+  var hc: float32* = malloc(bytes);
   var i: int32 = 0;
   while (i < n) { ha[i] = (float32)i; hb[i] = (float32)(2 * i); i = i + 1; }
 

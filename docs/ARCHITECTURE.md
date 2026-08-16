@@ -632,7 +632,7 @@ System V AMD64 on Linux. Mettle-calls-C struct-by-value follows the MS x64
 aggregate rule; the System V aggregate classifier is not implemented, so prefer
 pointer parameters there. Because the internal PE linker probes common Win32
 DLLs directly, calling into Windows needs no import libraries at all. Passing a
-Mettle `string` to C goes through `s.chars` or the `cstr()` helper in
+Mettle `string` to C goes through `s.chars` or the `` helper in
 `std/io`, since `string` is a two-field struct rather than a pointer.
 
 **GPU.** Two-stage and explicit: kernels compile separately with `--emit-ptx`

@@ -182,11 +182,11 @@ fn add(a: int32, b: int32) -> int32 {
 
 ## Extern Functions
 
-Extern functions are implemented in C or another language. They are declared with `extern fn` and an optional link name after `=`. If the link name is omitted, the Mettle name is used. Parameters and return types must match the C ABI. Use `cstring` for C `char*` or `void*`.
+Extern functions are implemented in C or another language. They are declared with `extern fn` and an optional link name after `=`. If the link name is omitted, the Mettle name is used. Parameters and return types must match the C ABI. Use `cstring` for C `char*` and `rawptr` for `void*`.
 
 ```mettle
 extern fn puts(msg: cstring) -> int32 = "puts";
-extern fn malloc(size: int64) -> cstring = "malloc";
+extern fn malloc(size: int64) -> rawptr = "malloc";
 extern fn my_func(x: int32) -> int32;  // link name = my_func
 ```
 
