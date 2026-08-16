@@ -750,8 +750,12 @@ bounds. The first of those is the precondition for everything in Part III.
 
 **Before the runtime grows:**
 
-- Each component independently excisable, with the absence provable.
-  *(V.3.2)*
+- ~~Each component independently excisable, with the absence provable.~~
+  *(V.3.2)* **Landed.** The safety runtime, crash handler, profiler and debug
+  hook server are each absent from a binary that did not request them, and
+  `runtime_components_excisable` proves it on every build by searching the
+  emitted binary for a string only that component carries. It checks both
+  directions, since an absence that is never present proves nothing.
 - Written in Mettle, in the same debugger, in the same profiler. *(V.3.3)*
 - The Part V.5 test applied to every single addition, individually, with no
   aggregate exceptions.

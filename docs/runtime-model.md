@@ -94,3 +94,30 @@ A new native target is not complete until it has all four parts:
 
 This rule applies to the reference compiler, libmtlc embedders, generated
 programs, optional diagnostics, and both internal and external linker paths.
+
+## Excision is gated, not claimed
+
+Every optional runtime component is absent from a binary that did not ask for
+it, and the absence is checked on every build rather than asserted:
+
+| Component | Present only with |
+|---|---|
+| Safety runtime | `--safe` |
+| Crash handler and backtrace | `-s` / `--stack-trace` |
+| Runtime profiler | `--profile-runtime` |
+| Debug hook server | `--debug-hooks` |
+
+The `runtime_components_excisable` case builds `tests/runtime_excision_probe.mettle`
+twice per component and searches the emitted binary for a string only that
+component contains. Absent without the flag, present with it.
+
+The second direction is the point. An absence check on its own passes when the
+marker never appears at all, which would make the gate a decoration; requiring
+the same marker to appear when the feature *is* requested is what gives the
+absence meaning. The size difference is the same story in another form: the
+probe links at 67 KB plain and 141 KB under `--safe`.
+
+This is the property that has to hold before the runtime grows. What is
+excisable is optional; what is optional is a feature; what is mandatory is a
+tax. A component that cannot be left out has stopped being optional, and this
+gate is what would notice.

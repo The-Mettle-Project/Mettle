@@ -2531,6 +2531,55 @@ catch {
   Write-CaseResult -Name "expand_prints_module_scope_asserts" -Passed $false -Reason $_.Exception.Message
 }
 
+# Runtime excision: each optional component has to be absent from a binary that
+# did not ask for it, and the absence has to be checkable rather than asserted.
+# What is excisable is optional; what is mandatory is a tax, so this is the
+# gate that keeps the runtime honest as it grows.
+#
+# Each component is checked in both directions. Absence alone would pass if the
+# marker never appeared at all, so the same marker must be present when the
+# feature IS requested. Without that pairing the test proves nothing.
+$total++
+try {
+  $probe = "tests\runtime_excision_probe.mettle"
+  $components = @(
+    @{ Name = "safety";        Flag = "--safe";            Marker = "memory access outside its allocation" },
+    @{ Name = "crash_handler"; Flag = "-s";                Marker = "Fatal error: null pointer dereference" },
+    @{ Name = "profile";       Flag = "--profile-runtime"; Marker = "total_us    avg_ns" },
+    @{ Name = "debug_hooks";   Flag = "--debug-hooks";     Marker = "not a variable in this frame" }
+  )
+
+  function Test-BinaryContains($path, $marker) {
+    $bytes = [IO.File]::ReadAllBytes($path)
+    return [Text.Encoding]::ASCII.GetString($bytes).Contains($marker)
+  }
+
+  foreach ($c in $components) {
+    $offExe = Join-Path $tmpDir ("excise_off_" + $c.Name + ".exe")
+    $onExe  = Join-Path $tmpDir ("excise_on_"  + $c.Name + ".exe")
+
+    $out = & $CompilerPath --build $probe -o $offExe 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "baseline build failed: $out" }
+    if (Test-BinaryContains $offExe $c.Marker) {
+      throw ("$($c.Name) was linked into a binary that did not ask for it: " +
+             "found '$($c.Marker)' without $($c.Flag)")
+    }
+
+    $out = & $CompilerPath $c.Flag --build $probe -o $onExe 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "$($c.Name) build with $($c.Flag) failed: $out" }
+    if (-not (Test-BinaryContains $onExe $c.Marker)) {
+      throw ("$($c.Name) marker '$($c.Marker)' is absent even with $($c.Flag); " +
+             "the absence check above proves nothing until this passes")
+    }
+  }
+
+  Write-CaseResult -Name "runtime_components_excisable" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "runtime_components_excisable" -Passed $false -Reason $_.Exception.Message
+}
+
 # `mettle swap-check` points the differential harness at two functions instead
 # of at one function before and after a pass. Four verdicts have to hold: an
 # equivalent rewrite passes, a divergence inside the generated inputs is caught

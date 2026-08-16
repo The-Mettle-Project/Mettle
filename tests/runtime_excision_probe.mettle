@@ -1,0 +1,13 @@
+// Probe for the runtime excision gate. Deliberately plain: it indexes an array
+// and returns, so it needs none of the optional runtime components. Anything
+// from crash handling, profiling, the debug hook server or the safety runtime
+// appearing in this binary appeared because it was linked unasked.
+fn main() -> int32 {
+    var a: int32[4];
+    var i: int32 = 0;
+    while (i < 4) {
+        a[i] = i;
+        i = i + 1;
+    }
+    return a[3];
+}
