@@ -899,8 +899,8 @@ int type_checker_declare_expansion_binding(TypeChecker *checker,
     return 1;
   }
 
-  Symbol *symbol = symbol_create((char *)entry->binding_name, SYMBOL_CONSTANT,
-                                 checker->builtin_field);
+  Symbol *symbol = binding_symbol(checker, entry->binding_name,
+                                  entry->binding_value, entry->origin);
   if (!symbol) {
     type_checker_set_error_at_location(
         checker, block->location,
@@ -908,12 +908,6 @@ int type_checker_declare_expansion_binding(TypeChecker *checker,
         entry->binding_name);
     return 0;
   }
-  symbol->comptime_value = entry->binding_value;
-  symbol->is_initialized = 1;
-  symbol->is_immutable = 1;
-  symbol->decl_line = entry->origin.line;
-  symbol->decl_column = entry->origin.column;
-  symbol->decl_file = entry->origin.filename;
 
   if (!symbol_table_declare(checker->symbol_table, symbol)) {
     symbol_destroy(symbol);
@@ -972,14 +966,15 @@ static int expand_one_round(TypeChecker *checker, ASTNode *block,
     ASTNode **owned = NULL;
     size_t incoming = 1;
 
-    /* A directive this expansion generated is expanded under the binding that
-     * generated it, so a nested `comptime for` at module scope can still read
-     * the outer field. Inside a block the enclosing scope does this; a module
-     * has no such scope, so the binding is pushed around the round. */
-    ComptimeDeclScope outer;
-    type_checker_enter_expansion_decl(checker, child, &outer);
+    ComptimeDeclScope outer = {0, 0};
 
     if (child && child->type == AST_COMPTIME_FOR) {
+      /* A directive this expansion generated is expanded under the binding
+       * that generated it, so a nested `comptime for` at module scope can
+       * still read the outer field. Inside a block the enclosing scope does
+       * this; a module has no such scope, so it is pushed around the round. */
+      type_checker_enter_expansion_decl(checker, child, &outer);
+
       ComptimeForStatement *directive = (ComptimeForStatement *)child->data;
       Type *owner =
           directive ? resolve_field_sequence(checker, directive->sequence)
