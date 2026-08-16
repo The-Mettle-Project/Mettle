@@ -5054,7 +5054,8 @@ try {
   if ($LASTEXITCODE -ne 0) {
     throw "predicated-accumulate coverage build failed: $coverOut"
   }
-  foreach ($fn in @("count_matches", "sum_negatives", "weighted_hits")) {
+  foreach ($fn in @("count_matches", "sum_negatives", "weighted_hits",
+                    "count_nonzero", "weigh_nonzero")) {
     if ($coverOut -notmatch "$fn \(loop @ line \d+\): vectorized") {
       throw "$fn no longer vectorizes; the predicated accumulate stopped converting"
     }

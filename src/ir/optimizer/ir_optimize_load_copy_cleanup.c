@@ -543,6 +543,37 @@ static int ir_accum_condition_is_boolean(const IRFunction *function, size_t at,
          strcmp(p->text, "==") == 0 || strcmp(p->text, "!=") == 0;
 }
 
+/* `if (a[i] != 0)` reaches here as a bare `branch_zero` on the loaded value:
+ * an earlier peephole folds `t = x != 0; branch_zero t` to `branch_zero x`,
+ * which is right for scalar code and erases the comparison this pass needs.
+ * The value is an int32 that may be any number, so `c = c + x` would count 5
+ * for a 5. Putting the comparison back makes it a boolean again.
+ *
+ * Only an integer LOAD qualifies. A guard on a computed value (`if (x & 6)`)
+ * is left alone: rewriting it would be correct, and it is the shape the
+ * reader most likely meant to spell as a comparison, so a silent conversion
+ * would hide a real question about their code behind a speed win.
+ *
+ * The slot the folded comparison vacated is still there as a NOP, so the
+ * comparison goes back where it was and nothing moves. */
+static int ir_accum_condition_is_nonzero_load(const IRFunction *function,
+                                              size_t at, const char *temp) {
+  const IRInstruction *p = ir_find_temp_producer_before(function, at, temp);
+  return p && p->op == IR_OP_LOAD && !p->is_float;
+}
+
+/* The NOP nearest the branch, searching back to the loop header. Returns 0
+ * when the region holds none. */
+static size_t ir_accum_free_nop_slot(const IRFunction *function, size_t header,
+                                     size_t before) {
+  for (size_t i = before; i > header + 1; i--) {
+    if (function->instructions[i - 1].op == IR_OP_NOP) {
+      return i - 1;
+    }
+  }
+  return 0;
+}
+
 /* Structural equality of two operands, and of the chains that compute two
  * temps. Used to prove one load reads exactly what another already read. */
 static int ir_accum_operand_same(const IROperand *a, const IROperand *b) {
@@ -657,6 +688,7 @@ int ir_if_convert_accumulate_pass(IRFunction *function, int *changed) {
     for (size_t i = header + 1; i < latch; i++) {
       const IRInstruction *br = &function->instructions[i];
       size_t add_index = 0, jump = 0, else_label = 0, end_label = 0;
+      size_t rematerialize_at = 0;
       const char *cond = NULL;
       const char *acc = NULL;
 
@@ -665,8 +697,17 @@ int ir_if_convert_accumulate_pass(IRFunction *function, int *changed) {
         continue;
       }
       cond = br->lhs.name;
+      /* Set when the guard reached here as a folded `!= 0` and the comparison
+         has to be put back before the addend can be multiplied by it. */
+      rematerialize_at = 0;
       if (!ir_accum_condition_is_boolean(function, i, cond)) {
-        continue;
+        if (!ir_accum_condition_is_nonzero_load(function, i, cond)) {
+          continue;
+        }
+        rematerialize_at = ir_accum_free_nop_slot(function, header, i);
+        if (!rematerialize_at) {
+          continue;
+        }
       }
       /* The arm writes one symbol, the accumulator. Everything else in it must
        * be arithmetic into temps, and any load must be one the condition
@@ -756,6 +797,27 @@ int ir_if_convert_accumulate_pass(IRFunction *function, int *changed) {
         IRInstruction *add = &function->instructions[add_index];
         int addend_is_one =
             add->rhs.kind == IR_OPERAND_INT && add->rhs.int_value == 1;
+        char boolean[64];
+
+        /* Put the folded `!= 0` back, in the slot it was folded out of, and
+         * multiply by that instead of by the raw loaded value. */
+        if (rematerialize_at) {
+          IRInstruction cmp = {0};
+          snprintf(boolean, sizeof(boolean), ".ifne%zu", rematerialize_at);
+          cmp.op = IR_OP_BINARY;
+          cmp.location = function->instructions[i].location;
+          cmp.text = mettle_strdup("!=");
+          cmp.dest = ir_operand_temp(boolean);
+          cmp.lhs = ir_operand_temp(cond);
+          cmp.rhs = ir_operand_int(0);
+          if (!cmp.text || !cmp.dest.name || !cmp.lhs.name) {
+            ir_instruction_destroy_storage(&cmp);
+            return 0;
+          }
+          ir_instruction_destroy_storage(&function->instructions[rematerialize_at]);
+          function->instructions[rematerialize_at] = cmp;
+          cond = boolean;
+        }
 
         /* `cond` points into the branch's own operand, and retiring an
          * instruction frees its operands. The branch is therefore NOPed only
