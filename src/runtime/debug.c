@@ -444,7 +444,10 @@ typedef enum {
 static volatile LONG g_active = 0;     /* hooks early-out when 0 */
 static DWORD g_main_thread = 0;
 static HANDLE g_pipe = INVALID_HANDLE_VALUE;
-static HANDLE g_reader_thread = NULL;
+/* 0 rather than NULL: the POSIX arm types HANDLE as an int, and clang rejects
+ * a pointer initializer for it where gcc only warns. 0 is a null pointer
+ * constant for the Win32 arm and plain zero here. */
+static HANDLE g_reader_thread = 0;
 
 /* The big tables live on the heap (allocated in dbg_try_init): the internal
  * PE linker rejects runtime objects with very large .bss sections, and with
