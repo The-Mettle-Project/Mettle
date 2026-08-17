@@ -1071,6 +1071,33 @@ static int mir_call_is_supported(CodeGenerator *g,
   MtlcType *ret = callee->data.function.return_type
                   ? callee->data.function.return_type
                   : callee->type;
+  /* An aggregate crossing to a foreign function on SysV has to be classified
+   * into eightbytes: 16 bytes or less travels in registers, and a float-only
+   * eightbyte travels in an XMM. MIR knows only the Microsoft rule, so those
+   * calls go to the baseline emitter, which does classify them. Calls between
+   * Mettle functions keep the fast path: both sides agree on the convention
+   * whatever it is, and `string` is a 16-byte aggregate that would otherwise
+   * drag most of the standard library off MIR. */
+  {
+    const BinaryAbi *sysv_probe = code_generator_binary_active_abi();
+    if (sysv_probe->counts_classes_separately && callee->is_extern) {
+      size_t a = 0;
+      if (ret && code_generator_type_is_aggregate(ret)) {
+        mir_call_trace("sysv_extern_aggregate_ret");
+        return 0;
+      }
+      for (a = 0; a < in->argument_count; a++) {
+        MtlcType *pt = callee->data.function.parameter_types
+                           ? callee->data.function.parameter_types[a]
+                           : NULL;
+        if (pt && code_generator_type_is_aggregate(pt)) {
+          mir_call_trace("sysv_extern_aggregate_arg");
+          return 0;
+        }
+      }
+    }
+  }
+
   int hidden = 0;
   if (ret && code_generator_abi_classify(ret) == ABI_PASS_INDIRECT) {
     /* struct-by-value return: the caller passes a hidden out-pointer as the

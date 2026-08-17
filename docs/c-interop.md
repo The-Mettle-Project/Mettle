@@ -95,9 +95,17 @@ On Windows, Mettle follows the Microsoft x64 aggregate rule for struct-by-value 
 - all other aggregate sizes pass indirectly by pointer
 - indirect returns use a hidden first argument in RCX, and the callee returns that pointer in RAX
 
-The rules above are the Microsoft x64 ones, and this is covered for Mettle calling C functions that take or return structs by value **on Windows**, including `--emit-obj` builds linked with Mettle's internal linker. On Linux the same call is wrong, because System V classifies a small struct into eightbytes and passes it in a register pair rather than by pointer. C calling exported Mettle functions with struct-by-value arguments or returns is not yet documented as supported.
+On Linux, Mettle follows the System V AMD64 rule instead. System V cuts the struct into 8-byte chunks and gives each one a class:
 
-When a C API expects a pointer to a struct, pass `&my_struct` or a `T*` variable. For portable Linux/macOS C interop, prefer pointer parameters until the System V AMD64 aggregate classifier is implemented.
+- 16 bytes or less passes in registers, one per eightbyte: a general register for an eightbyte holding any integer or pointer field, an XMM register for one holding only floats. A `{int64, double}` therefore arrives as one of each, and a `{double, double}` as two XMMs
+- anything larger is MEMORY: the caller copies the bytes into the outgoing stack area by value, rather than passing a pointer
+- a struct of 16 bytes or less is *returned* the same way, in RAX/RDX or XMM0/XMM1, so no hidden pointer is involved
+
+Both rules are covered for Mettle calling C functions that take or return structs by value, including `--emit-obj` builds linked with Mettle's internal linker. C calling exported Mettle functions with struct-by-value arguments or returns is not yet supported: that needs the same classification on the callee side.
+
+Calls between two Mettle functions use Mettle's own convention rather than the platform ABI. Both sides agree, so it makes no difference to a Mettle program, and it is why the platform rule is applied to `extern` callees specifically.
+
+When a C API expects a pointer to a struct, pass `&my_struct` or a `T*` variable.
 
 ```mettle
 struct SockAddrIn {

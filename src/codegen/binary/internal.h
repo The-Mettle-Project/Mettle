@@ -352,6 +352,43 @@ typedef struct {
 const BinaryAbi *code_generator_binary_active_abi(void);
 void code_generator_binary_select_abi(BinaryTargetFormat format);
 
+/* System V AMD64 aggregate classification.
+ *
+ * MS-x64 asks one question of an aggregate: does it fit in a register (1, 2, 4
+ * or 8 bytes) or not. SysV asks a different one. It cuts the aggregate into
+ * 8-byte chunks and gives each chunk its own class, so a 12-byte struct of
+ * integers travels in a register PAIR where MS-x64 would pass a pointer, and a
+ * {double,double} travels in two XMM registers. Anything over 16 bytes is
+ * MEMORY, which the caller copies onto the stack by value rather than passing
+ * by reference.
+ *
+ * Only the two-eightbyte window matters here: the classes array is sized for
+ * the 16-byte limit above which everything is MEMORY. */
+typedef enum {
+  BINARY_EIGHTBYTE_NONE = 0,
+  BINARY_EIGHTBYTE_INTEGER,
+  BINARY_EIGHTBYTE_SSE,
+} BinaryEightbyteClass;
+
+typedef struct {
+  /* MEMORY class: the caller copies the bytes into the outgoing stack area.
+   * When set, eightbyte_count is 0. */
+  int in_memory;
+  size_t size;
+  size_t eightbyte_count; /* 0, 1 or 2 */
+  BinaryEightbyteClass classes[2];
+  /* Filled by the caller, not the classifier: where this argument's first
+   * slot sits in the expanded layout array, since an aggregate can consume
+   * two entries where a scalar consumes one. */
+  size_t first_slot;
+} BinarySysvAggregate;
+
+/* Classifies an aggregate under SysV. Returns 0 when `type` is not an
+ * aggregate the classifier handles, in which case *out is left zeroed and the
+ * caller should treat the type as an ordinary scalar. */
+int code_generator_binary_classify_sysv_aggregate(MtlcType *type,
+                                                  BinarySysvAggregate *out);
+
 /* Where a single argument or parameter is passed under the active ABI. */
 typedef enum {
   BINARY_ARG_IN_GP_REGISTER,
@@ -379,6 +416,26 @@ int code_generator_binary_compute_arg_layout(const BinaryAbi *abi,
                                               const int *is_float, size_t count,
                                               BinaryArgLocation *locations_out,
                                               int *stack_bytes_out);
+
+/* As above, with two additions SysV aggregates need.
+ *
+ * force_stack[i], when nonzero, keeps slot i out of the register pools and
+ * gives it a stack home even when registers remain. That is the MEMORY class,
+ * which travels on the stack by value.
+ *
+ * stack_slots[i] is how many 8-byte slots slot i occupies once it is on the
+ * stack, so a MEMORY aggregate reserves its whole width rather than one word.
+ * Pass 0 or NULL to mean one slot.
+ *
+ * Either array may be NULL, in which case this behaves exactly like the plain
+ * form above. */
+int code_generator_binary_compute_arg_layout_ex(const BinaryAbi *abi,
+                                                const int *is_float,
+                                                const int *force_stack,
+                                                const size_t *stack_slots,
+                                                size_t count,
+                                                BinaryArgLocation *locations_out,
+                                                int *stack_bytes_out);
 
 extern BinaryGlobalConstTable g_binary_global_consts;
 extern BinaryIRFunctionIndex g_binary_ir_function_index;

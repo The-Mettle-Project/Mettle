@@ -20,6 +20,30 @@ extern fn c_make_three(a: int32, b: int32, c: int32) -> ThreeI32 = "mettle_struc
 extern fn c_sum_odd3(o: Odd3) -> int32 = "mettle_struct_abi_c_sum_odd3";
 extern fn c_make_odd3(a: uint8, b: uint8, c: uint8) -> Odd3 = "mettle_struct_abi_c_make_odd3";
 
+// SysV classifies each eightbyte, so these three shapes each travel a
+// different way: Big32 is MEMORY (stack by value), TwoF64 is two SSE
+// eightbytes (two XMM registers), and MixedI64F64 is one integer eightbyte
+// and one SSE. Microsoft x64 passes all three by pointer, so the same source
+// exercises both rules.
+struct Big32 {
+  a: int32; b: int32; c: int32; d: int32;
+  e: int32; f: int32; g: int32; h: int32;
+}
+
+struct TwoF64 {
+  x: float64;
+  y: float64;
+}
+
+struct MixedI64F64 {
+  i: int64;
+  d: float64;
+}
+
+extern fn c_sum_big32(v: Big32) -> int32 = "mettle_struct_abi_c_sum_big32";
+extern fn c_sum_two_f64(v: TwoF64) -> int32 = "mettle_struct_abi_c_sum_two_f64";
+extern fn c_sum_mixed(v: MixedI64F64) -> int32 = "mettle_struct_abi_c_sum_mixed";
+
 fn write_s(s: cstring) {
   if (s != 0) {
     fputs(s, get_stdout());
@@ -58,6 +82,21 @@ fn main() -> int32 {
 
   var o: Odd3 = c_make_odd3(7, 8, 9);
   line_i64("c_make_odd3_sum", (int64)c_sum_odd3(o));
+
+  var big: Big32;
+  big.a = 1; big.b = 2; big.c = 3; big.d = 4;
+  big.e = 5; big.f = 6; big.g = 7; big.h = 8;
+  line_i64("c_sum_big32", (int64)c_sum_big32(big));
+
+  var pair: TwoF64;
+  pair.x = 10.5;
+  pair.y = 21.5;
+  line_i64("c_sum_two_f64", (int64)c_sum_two_f64(pair));
+
+  var mixed: MixedI64F64;
+  mixed.i = 100;
+  mixed.d = 7.0;
+  line_i64("c_sum_mixed", (int64)c_sum_mixed(mixed));
 
   return 0;
 }

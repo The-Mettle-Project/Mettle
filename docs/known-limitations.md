@@ -137,7 +137,7 @@ Structs work normally as **locals**: field access, whole-struct assignment, and 
 **Practical guidance:**
 
 - Struct-by-value **arguments and returns** are safe in the native object backend.
-- For C interop, the backend follows the platform C ABI: Microsoft x64 on Windows (COFF) and System V AMD64 on Linux (ELF). Scalar and pointer arguments, return values, register-and-stack argument passing, and the hidden struct-return pointer all match the target convention. Struct-by-value passing and returning is covered for the Mettle-calls-C direction **on Windows only**; System V's eightbyte classification is not implemented, so a by-value struct crossing to C is wrong on Linux (see the Platform Support note below). See [C Interoperability - Passing Structs to C](c-interop.md).
+- For C interop, the backend follows the platform C ABI: Microsoft x64 on Windows (COFF) and System V AMD64 on Linux (ELF). Scalar and pointer arguments, return values, register-and-stack argument passing, and the hidden struct-return pointer all match the target convention. Struct-by-value passing and returning is covered for the Mettle-calls-C direction on both platforms, each under its own rule: the Microsoft over-8-bytes-by-pointer rule on Windows, and System V's eightbyte classification on Linux. See [C Interoperability - Passing Structs to C](c-interop.md).
 - With `--linker internal`, raw COFF `.o` / `.obj` files can be supplied through `--link-arg`; the final executable link remains inside Mettle.
 
 Arrays follow the same rule as in [Types - Array Types](types.md#array-types): they are not passed by value; use `&arr[0]` or a `T`* parameter.
@@ -197,15 +197,21 @@ Arrays follow the same rule as in [Types - Array Types](types.md#array-types): t
   Linux. Rename the function; `mettle_`-prefixed and `mt_`-prefixed names are
   reserved to the runtime and are always safe to avoid.
 
-- Passing or returning a struct **by value across the C boundary** works on
-  Windows and is wrong on Linux. System V AMD64 classifies a struct into
-  eightbytes and passes a small one in a register pair, where Microsoft x64
-  passes anything over 8 bytes as a pointer. The backend implements the
-  Microsoft rule and the hidden return pointer, and no eightbyte
-  classification, so a 12-byte `{int32 a, b, c}` handed to a C function reads
-  garbage on Linux. Struct-by-value between Mettle functions is unaffected on
-  both platforms, as are scalars and pointers at the C boundary. Pass a pointer
-  to the struct when calling C from Linux.
+- Passing or returning a struct **by value across the C boundary** follows the
+  target's own rule on both platforms. Microsoft x64 passes anything over 8
+  bytes as a pointer. System V AMD64 cuts the struct into eightbytes and
+  classifies each one, so 16 bytes or less travels in registers (a pair of
+  general registers, a pair of XMMs when both eightbytes are float-only, or one
+  of each) and anything larger travels on the stack by value. A struct of 16
+  bytes or less also comes *back* from a C function in registers on Linux.
+  What is not implemented is the other direction: a C caller handing a struct
+  by value to an **exported Mettle** function, which needs the same
+  classification on the callee side.
+
+  Calls between two Mettle functions use Mettle's own convention on both
+  platforms rather than the platform ABI. Both sides agree, so this is
+  invisible, and it is why the eightbyte rule applies only to `extern`
+  callees.
 
 - `--debug-hooks` and the editor debugging built on it are Windows-only.
   `src/runtime/debug.c` carries the protocol over a named pipe on Windows and

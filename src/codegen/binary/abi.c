@@ -1882,7 +1882,22 @@ int code_generator_binary_prepare_function_context(
                   ? callee->data.function.return_type
                   : callee->type;
     }
-    if (code_generator_abi_classify(ret_t) != ABI_PASS_INDIRECT) continue;
+    /* A SysV aggregate of 16 bytes or less comes back in registers and is
+     * spilled into one of these slots, so it needs one reserved even though it
+     * takes no hidden out-pointer. Keep this in step with the matching test in
+     * the call emitter or the cursor and the plan disagree. */
+    {
+      BinarySysvAggregate ret_agg;
+      int sysv_register_return =
+          callee && callee->is_extern &&
+          code_generator_binary_active_abi()->counts_classes_separately &&
+          code_generator_binary_classify_sysv_aggregate(ret_t, &ret_agg) &&
+          !ret_agg.in_memory && ret_agg.eightbyte_count > 0;
+      if (!sysv_register_return &&
+          code_generator_abi_classify(ret_t) != ABI_PASS_INDIRECT) {
+        continue;
+      }
+    }
     size_t sz = code_generator_abi_type_size(ret_t);
     int slot_bytes = (int)((sz + 15u) & ~(size_t)15);
     int slot_base_offset =

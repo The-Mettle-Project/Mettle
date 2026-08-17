@@ -3462,6 +3462,29 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
                              "Out of memory planning indirect args");
     return 0;
   }
+  /* SysV carries an aggregate itself rather than a pointer to one: up to two
+   * eightbytes in registers, or the whole thing on the stack past 16 bytes.
+   * Classified per argument here and consumed by the layout and the emission
+   * loops below. Zeroed entries mean "not a SysV aggregate", which is every
+   * argument on MS-x64. */
+  /* Only calls that leave the language need the platform's aggregate rule. Two
+   * Mettle functions agree on Mettle's own convention whatever it is, and the
+   * callee side of the eightbyte rule is not implemented, so applying it to an
+   * internal call would have the caller read a register pair the callee never
+   * filled. */
+  const BinaryAbi *call_abi = code_generator_binary_active_abi();
+  int callee_is_foreign = function_symbol && function_symbol->is_extern;
+  BinarySysvAggregate *sysv_agg =
+      argument_count > 0 ? calloc(argument_count, sizeof(*sysv_agg)) : NULL;
+  if (argument_count > 0 && !sysv_agg) {
+    free(is_indirect_arg);
+    free(indirect_arg_offset);
+    free(indirect_arg_size);
+    code_generator_set_error(generator,
+                             "Out of memory classifying SysV aggregates");
+    return 0;
+  }
+
   int indirect_temp_region = 0;
   for (size_t i = 0; i < argument_count; i++) {
     MtlcType *param_t =
@@ -3469,6 +3492,10 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
                 function_symbol->data.function.parameter_types
             ? function_symbol->data.function.parameter_types[i]
             : NULL;
+    if (callee_is_foreign && call_abi->counts_classes_separately &&
+        code_generator_binary_classify_sysv_aggregate(param_t, &sysv_agg[i])) {
+      continue;
+    }
     if (code_generator_abi_classify(param_t) == ABI_PASS_INDIRECT) {
       is_indirect_arg[i] = 1;
       size_t sz = code_generator_abi_type_size(param_t);
@@ -3489,17 +3516,34 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
                            ? function_symbol->data.function.return_type
                            : function_symbol->type;
   }
+  /* SysV hands back an aggregate of 16 bytes or less in registers, so those
+   * take no hidden out-pointer. Only the MEMORY class does. */
+  BinarySysvAggregate sysv_return = {0};
+  int return_in_sysv_registers =
+      callee_is_foreign && call_abi->counts_classes_separately &&
+      code_generator_binary_classify_sysv_aggregate(call_return_type,
+                                                    &sysv_return) &&
+      !sysv_return.in_memory && sysv_return.eightbyte_count > 0;
   int return_is_indirect =
-      (code_generator_abi_classify(call_return_type) == ABI_PASS_INDIRECT) ? 1
-                                                                           : 0;
+      return_in_sysv_registers
+          ? 0
+          : ((code_generator_abi_classify(call_return_type) ==
+              ABI_PASS_INDIRECT)
+                 ? 1
+                 : 0);
   size_t hidden_arg_count = return_is_indirect ? 1 : 0;
+  /* Both dispositions land the result in a frame slot and hand its address to
+   * the shared code below. The indirect callee writes the slot itself; a
+   * register return is spilled into it after the call. */
+  int return_uses_slot = return_is_indirect || return_in_sysv_registers;
   int return_slot_rbp_offset = 0;
-  if (return_is_indirect) {
+  if (return_uses_slot) {
     if (context->indirect_return_slot_cursor >=
         context->indirect_return_slot_count) {
       free(is_indirect_arg);
       free(indirect_arg_offset);
       free(indirect_arg_size);
+      free(sysv_agg);
       code_generator_set_error(
           generator,
           "Indirect-return frame slot not assigned for call '%s'",
@@ -3514,20 +3558,43 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
    * per-argument layout under the active convention; the hidden out-pointer is
    * a leading integer argument. */
   const BinaryAbi *abi = code_generator_binary_active_abi();
-  size_t effective_arg_count = argument_count + hidden_arg_count;
+  /* One slot per argument, except a SysV aggregate in registers, which takes
+   * one per eightbyte. */
+  size_t effective_arg_count = hidden_arg_count;
+  for (size_t i = 0; i < argument_count; i++) {
+    sysv_agg[i].first_slot = effective_arg_count;
+    effective_arg_count +=
+        (sysv_agg[i].size > 0 && !sysv_agg[i].in_memory &&
+         sysv_agg[i].eightbyte_count > 0)
+            ? sysv_agg[i].eightbyte_count
+            : 1u;
+  }
   int *arg_is_float = effective_arg_count > 0
                           ? calloc(effective_arg_count, sizeof(int))
                           : NULL;
+  int *arg_force_stack = effective_arg_count > 0
+                             ? calloc(effective_arg_count, sizeof(int))
+                             : NULL;
+  size_t *arg_stack_slots = effective_arg_count > 0
+                                ? calloc(effective_arg_count, sizeof(size_t))
+                                : NULL;
   BinaryArgLocation *arg_locations =
       effective_arg_count > 0
           ? calloc(effective_arg_count, sizeof(BinaryArgLocation))
           : NULL;
-  if (effective_arg_count > 0 && (!arg_is_float || !arg_locations)) {
+  if (effective_arg_count > 0 &&
+      (!arg_is_float || !arg_locations || !arg_force_stack ||
+       !arg_stack_slots)) {
     free(is_indirect_arg);
     free(indirect_arg_offset);
     free(indirect_arg_size);
     free(arg_is_float);
+    free(arg_force_stack);
+    free(arg_stack_slots);
+    free(arg_force_stack);
+    free(arg_stack_slots);
     free(arg_locations);
+    free(sysv_agg);
     code_generator_set_error(generator, "Out of memory planning call layout");
     return 0;
   }
@@ -3537,24 +3604,41 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
                 function_symbol->data.function.parameter_types
             ? function_symbol->data.function.parameter_types[i]
             : NULL;
+    size_t slot = sysv_agg[i].first_slot;
+
+    if (sysv_agg[i].size > 0 && sysv_agg[i].in_memory) {
+      /* MEMORY: the bytes themselves go on the stack, rounded up to words. */
+      arg_force_stack[slot] = 1;
+      arg_stack_slots[slot] = (sysv_agg[i].size + 7u) / 8u;
+      continue;
+    }
+    if (sysv_agg[i].size > 0 && sysv_agg[i].eightbyte_count > 0) {
+      for (size_t e = 0; e < sysv_agg[i].eightbyte_count; e++) {
+        arg_is_float[slot + e] =
+            (sysv_agg[i].classes[e] == BINARY_EIGHTBYTE_SSE) ? 1 : 0;
+      }
+      continue;
+    }
     /* INDIRECT args pass a pointer (integer class). */
-    arg_is_float[i + hidden_arg_count] =
-        (!is_indirect_arg[i] &&
-         code_generator_binary_resolved_type_float_bits(param_t))
-            ? 1
-            : 0;
+    arg_is_float[slot] = (!is_indirect_arg[i] &&
+                          code_generator_binary_resolved_type_float_bits(param_t))
+                             ? 1
+                             : 0;
   }
 
   int stack_bytes = 0;
   if (effective_arg_count > 0 &&
-      !code_generator_binary_compute_arg_layout(abi, arg_is_float,
-                                                effective_arg_count,
-                                                arg_locations, &stack_bytes)) {
+      !code_generator_binary_compute_arg_layout_ex(
+          abi, arg_is_float, arg_force_stack, arg_stack_slots,
+          effective_arg_count, arg_locations, &stack_bytes)) {
     free(is_indirect_arg);
     free(indirect_arg_offset);
     free(indirect_arg_size);
     free(arg_is_float);
+    free(arg_force_stack);
+    free(arg_stack_slots);
     free(arg_locations);
+    free(sysv_agg);
     code_generator_set_error(generator, "Failed to compute call layout");
     return 0;
   }
@@ -3563,7 +3647,10 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
     free(indirect_arg_offset);
     free(indirect_arg_size);
     free(arg_is_float);
+    free(arg_force_stack);
+    free(arg_stack_slots);
     free(arg_locations);
+    free(sysv_agg);
     code_generator_set_error(generator,
                              "Too many call arguments in function '%s'",
                              context->function_name);
@@ -3579,7 +3666,10 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
     free(indirect_arg_offset);
     free(indirect_arg_size);
     free(arg_is_float);
+    free(arg_force_stack);
+    free(arg_stack_slots);
     free(arg_locations);
+    free(sysv_agg);
     code_generator_set_error(generator,
                              "Call frame too large in function '%s'",
                              context->function_name);
@@ -3592,7 +3682,10 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
     free(indirect_arg_offset);
     free(indirect_arg_size);
     free(arg_is_float);
+    free(arg_force_stack);
+    free(arg_stack_slots);
     free(arg_locations);
+    free(sysv_agg);
     code_generator_set_error(generator,
                              "Out of memory while emitting call frame");
     return 0;
@@ -3608,7 +3701,10 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
       free(indirect_arg_offset);
       free(indirect_arg_size);
       free(arg_is_float);
+      free(arg_force_stack);
+      free(arg_stack_slots);
       free(arg_locations);
+      free(sysv_agg);
       return 0;
     }
     /* dst = lea rdx, [rsp + offset] (offset within indirect_temp_region) */
@@ -3622,7 +3718,10 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
       free(indirect_arg_offset);
       free(indirect_arg_size);
       free(arg_is_float);
+      free(arg_force_stack);
+      free(arg_stack_slots);
       free(arg_locations);
+      free(sysv_agg);
       code_generator_set_error(generator,
                                "Out of memory copying INDIRECT call arg");
       return 0;
@@ -3633,9 +3732,38 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
    * home is the indirect-temp region, then shadow space, then the layout's
    * outgoing offset. */
   for (size_t i = 0; i < argument_count; i++) {
-    const BinaryArgLocation *loc = &arg_locations[i + hidden_arg_count];
+    const BinaryArgLocation *loc = &arg_locations[sysv_agg[i].first_slot];
     if (loc->kind != BINARY_ARG_ON_STACK) continue;
     int slot_offset = abi->shadow_space_size + loc->stack_offset;
+
+    /* A SysV aggregate on the stack travels by value: copy the bytes into the
+     * outgoing area rather than writing a pointer to them. This is the MEMORY
+     * class, and also an in-register class that ran out of registers. */
+    if (sysv_agg[i].size > 0) {
+      if (!code_generator_binary_emit_indirect_source_address(
+              generator, context, &instruction->arguments[i], BINARY_GP_RAX) ||
+          !binary_emit_lea_reg_mem(&context->code, BINARY_GP_RDX, BINARY_GP_RSP,
+                                   slot_offset) ||
+          !code_generator_binary_emit_rep_movsb(generator, context,
+                                                BINARY_GP_RAX, BINARY_GP_RDX,
+                                                sysv_agg[i].size)) {
+        free(is_indirect_arg);
+        free(indirect_arg_offset);
+        free(indirect_arg_size);
+        free(arg_is_float);
+        free(arg_force_stack);
+        free(arg_stack_slots);
+        free(arg_locations);
+        free(sysv_agg);
+        if (!generator->has_error) {
+          code_generator_set_error(generator,
+                                   "Out of memory copying SysV stack aggregate");
+        }
+        return 0;
+      }
+      continue;
+    }
+
     if (is_indirect_arg[i]) {
       /* Place &temp into the stack slot. */
       if (!binary_emit_lea_reg_mem(&context->code, BINARY_GP_RAX,
@@ -3647,7 +3775,10 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
         free(indirect_arg_offset);
         free(indirect_arg_size);
         free(arg_is_float);
+        free(arg_force_stack);
+        free(arg_stack_slots);
         free(arg_locations);
+        free(sysv_agg);
         code_generator_set_error(generator,
                                  "Out of memory writing INDIRECT stack arg");
         return 0;
@@ -3668,7 +3799,10 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
       free(indirect_arg_offset);
       free(indirect_arg_size);
       free(arg_is_float);
+      free(arg_force_stack);
+      free(arg_stack_slots);
       free(arg_locations);
+      free(sysv_agg);
       if (!generator->has_error) {
         code_generator_set_error(generator,
                                  "Out of memory while materializing call args");
@@ -3679,8 +3813,53 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
 
   /* Register args: arguments the layout placed in a GP or XMM register. */
   for (size_t i = 0; i < argument_count; i++) {
-    const BinaryArgLocation *loc = &arg_locations[i + hidden_arg_count];
+    const BinaryArgLocation *loc = &arg_locations[sysv_agg[i].first_slot];
     if (loc->kind == BINARY_ARG_ON_STACK) continue;
+
+    /* A SysV aggregate in registers: one load per eightbyte, straight out of
+     * the value's own storage. A trailing partial eightbyte still reads a full
+     * word, which is why the source has to be addressable rather than packed
+     * against the end of the frame. */
+    if (sysv_agg[i].size > 0 && sysv_agg[i].eightbyte_count > 0) {
+      int ok = code_generator_binary_emit_indirect_source_address(
+          generator, context, &instruction->arguments[i], BINARY_GP_RAX);
+      for (size_t e = 0; ok && e < sysv_agg[i].eightbyte_count; e++) {
+        const BinaryArgLocation *eloc =
+            &arg_locations[sysv_agg[i].first_slot + e];
+        int disp = (int)(e * 8u);
+        if (eloc->kind == BINARY_ARG_IN_XMM_REGISTER) {
+          /* No XMM-from-memory encoder here, so the eightbyte goes through a
+           * scratch general register. R11 is caller-saved on both ABIs and is
+           * not an argument register on either. */
+          ok = binary_emit_mov_reg_mem(&context->code, BINARY_GP_R11,
+                                       BINARY_GP_RAX, disp) &&
+               binary_emit_movq_xmm_reg(&context->code, eloc->xmm_register,
+                                        BINARY_GP_R11);
+        } else if (eloc->kind == BINARY_ARG_IN_GP_REGISTER) {
+          ok = binary_emit_mov_reg_mem(&context->code, eloc->gp_register,
+                                       BINARY_GP_RAX, disp);
+        } else {
+          ok = 0;
+        }
+      }
+      if (!ok) {
+        free(is_indirect_arg);
+        free(indirect_arg_offset);
+        free(indirect_arg_size);
+        free(arg_is_float);
+        free(arg_force_stack);
+        free(arg_stack_slots);
+        free(arg_locations);
+        free(sysv_agg);
+        if (!generator->has_error) {
+          code_generator_set_error(
+              generator, "Out of memory loading SysV aggregate arg registers");
+        }
+        return 0;
+      }
+      continue;
+    }
+
     if (is_indirect_arg[i]) {
       /* INDIRECT args always pass a pointer in a GP register. */
       if (loc->kind != BINARY_ARG_IN_GP_REGISTER ||
@@ -3691,7 +3870,10 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
         free(indirect_arg_offset);
         free(indirect_arg_size);
         free(arg_is_float);
+        free(arg_force_stack);
+        free(arg_stack_slots);
         free(arg_locations);
+        free(sysv_agg);
         code_generator_set_error(generator,
                                  "Out of memory loading INDIRECT arg ptr");
         return 0;
@@ -3717,7 +3899,10 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
       free(indirect_arg_offset);
       free(indirect_arg_size);
       free(arg_is_float);
+      free(arg_force_stack);
+      free(arg_stack_slots);
       free(arg_locations);
+      free(sysv_agg);
       return 0;
     }
   }
@@ -3725,7 +3910,10 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
   /* The layout is fully consumed; the hidden out-pointer is loaded below from
    * the ABI's dedicated register, not the layout. */
   free(arg_is_float);
+  free(arg_force_stack);
+  free(arg_stack_slots);
   free(arg_locations);
+  free(sysv_agg);
   arg_is_float = NULL;
   arg_locations = NULL;
 
@@ -3777,10 +3965,41 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
     return 0;
   }
 
+  /* A SysV register return arrives in RAX/RDX or XMM0/XMM1, in eightbyte
+   * order with the two classes counted separately. Spill it into the same
+   * frame slot the indirect path uses so the disposition below is shared.
+   * R10 carries the slot address because RAX and RDX still hold the result. */
+  if (return_in_sysv_registers) {
+    size_t int_taken = 0;
+    size_t sse_taken = 0;
+    int ok = binary_emit_lea_reg_mem(&context->code, BINARY_GP_R10,
+                                     BINARY_GP_RBP, -return_slot_rbp_offset);
+    for (size_t e = 0; ok && e < sysv_return.eightbyte_count; e++) {
+      int disp = (int)(e * 8u);
+      if (sysv_return.classes[e] == BINARY_EIGHTBYTE_SSE) {
+        BinaryXmmRegister src = sse_taken == 0 ? BINARY_XMM0 : BINARY_XMM1;
+        sse_taken++;
+        ok = binary_emit_movq_reg_xmm(&context->code, BINARY_GP_R11, src) &&
+             binary_emit_mov_mem_reg(&context->code, BINARY_GP_R10, disp,
+                                     BINARY_GP_R11);
+      } else {
+        BinaryGpRegister src =
+            int_taken == 0 ? BINARY_GP_RAX : BINARY_GP_RDX;
+        int_taken++;
+        ok = binary_emit_mov_mem_reg(&context->code, BINARY_GP_R10, disp, src);
+      }
+    }
+    if (!ok) {
+      code_generator_set_error(
+          generator, "Out of memory spilling SysV register-returned aggregate");
+      return 0;
+    }
+  }
+
   /* INDIRECT return: rax should hold the slot address by ABI; re-materialize
    * from our known frame slot for safety (some callees may not preserve
    * exactly; the slot lives in our frame so the lea is always correct). */
-  if (return_is_indirect) {
+  if (return_uses_slot) {
     if (!binary_emit_lea_reg_mem(&context->code, BINARY_GP_RAX, BINARY_GP_RBP,
                                  -return_slot_rbp_offset)) {
       code_generator_set_error(generator,

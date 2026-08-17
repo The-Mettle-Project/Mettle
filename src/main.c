@@ -1048,10 +1048,6 @@ static int mettle_link_elf_executable(const char *object_filename,
 
       for (i = 0u; i < sizeof(on_demand) / sizeof(on_demand[0]); i++) {
         char *candidate = NULL;
-        if (getenv("METTLE_TRACE_AUTOLINK")) {
-          fprintf(stderr, "autolink: %s on '%s' -> %d\n", on_demand[i].file,
-                  object_filename, on_demand[i].needed(object_filename));
-        }
         if (!on_demand[i].needed(object_filename)) {
           continue;
         }

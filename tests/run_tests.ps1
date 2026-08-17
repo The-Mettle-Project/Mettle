@@ -6731,20 +6731,14 @@ $structAbiExternExpected = @(
   "struct abi extern c",
   "c_sum_three 66",
   "c_make_three_sum 12",
-  "c_make_odd3_sum 24"
+  "c_make_odd3_sum 24",
+  "c_sum_big32 36",
+  "c_sum_two_f64 32",
+  "c_sum_mixed 107"
 ) -join "`n"
 
 foreach ($mode in @("binary")) {
   $caseName = "internal_link_struct_abi_extern_c_$mode"
-  # Crossing to C by value needs SysV's eightbyte classification, which puts a
-  # 12-byte integer struct in a register PAIR where Win64 passes a pointer. The
-  # backend has no such classification, so this reports wrong values on Linux.
-  # A known gap, recorded in docs/known-limitations.md.
-  if (-not $script:OnWindows) {
-    Skip-WindowsOnly $caseName `
-      "known gap: SysV eightbyte struct classification is not implemented"
-    continue
-  }
   $total++
   try {
     $gccCmd = Get-Command gcc -ErrorAction SilentlyContinue

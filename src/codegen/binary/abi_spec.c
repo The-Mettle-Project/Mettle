@@ -55,10 +55,123 @@ void code_generator_binary_select_abi(BinaryTargetFormat format) {
 
 const BinaryAbi *code_generator_binary_active_abi(void) { return g_active_abi; }
 
+/* SysV merges two classes for the same eightbyte by taking the stronger one.
+ * INTEGER beats SSE, which is why a struct holding an int and a float in the
+ * same 8 bytes travels in a general register. */
+static BinaryEightbyteClass binary_merge_eightbyte(BinaryEightbyteClass a,
+                                                   BinaryEightbyteClass b) {
+  if (a == b) {
+    return a;
+  }
+  if (a == BINARY_EIGHTBYTE_NONE) {
+    return b;
+  }
+  if (b == BINARY_EIGHTBYTE_NONE) {
+    return a;
+  }
+  return BINARY_EIGHTBYTE_INTEGER;
+}
+
+/* Walks every scalar leaf of `type` at `base` and folds its class into the
+ * eightbyte it lands in. Arrays and nested structs recurse; a leaf wider than
+ * its own eightbyte (nothing the frontend builds today) still marks both. */
+static void binary_classify_fields(MtlcType *type, size_t base,
+                                   BinaryEightbyteClass *classes,
+                                   size_t eightbyte_count) {
+  size_t i = 0;
+
+  if (!type) {
+    return;
+  }
+
+  if (type->kind == MTLC_TYPE_STRUCT && type->field_count > 0 &&
+      type->field_types && type->field_offsets) {
+    for (i = 0; i < type->field_count; i++) {
+      binary_classify_fields(type->field_types[i],
+                             base + type->field_offsets[i], classes,
+                             eightbyte_count);
+    }
+    return;
+  }
+
+  if (type->kind == MTLC_TYPE_ARRAY && type->base_type &&
+      type->base_type->size > 0) {
+    for (i = 0; i < type->array_size; i++) {
+      binary_classify_fields(type->base_type, base + i * type->base_type->size,
+                             classes, eightbyte_count);
+    }
+    return;
+  }
+
+  {
+    /* A scalar leaf. Floats classify SSE, everything else INTEGER. A tagged
+     * enum carries a discriminant, so it is INTEGER whatever the payload is. */
+    BinaryEightbyteClass leaf =
+        (type->kind == MTLC_TYPE_FLOAT32 || type->kind == MTLC_TYPE_FLOAT64)
+            ? BINARY_EIGHTBYTE_SSE
+            : BINARY_EIGHTBYTE_INTEGER;
+    size_t first = base / 8u;
+    size_t last = type->size > 0 ? (base + type->size - 1u) / 8u : first;
+
+    for (i = first; i <= last && i < eightbyte_count; i++) {
+      classes[i] = binary_merge_eightbyte(classes[i], leaf);
+    }
+  }
+}
+
+int code_generator_binary_classify_sysv_aggregate(MtlcType *type,
+                                                  BinarySysvAggregate *out) {
+  size_t size = 0;
+  size_t i = 0;
+
+  if (!out) {
+    return 0;
+  }
+  out->in_memory = 0;
+  out->size = 0;
+  out->eightbyte_count = 0;
+  out->classes[0] = BINARY_EIGHTBYTE_NONE;
+  out->classes[1] = BINARY_EIGHTBYTE_NONE;
+
+  if (!type || !code_generator_type_is_aggregate(type)) {
+    return 0;
+  }
+
+  size = code_generator_abi_type_size(type);
+  out->size = size;
+  if (size == 0) {
+    return 0;
+  }
+  if (size > 16u) {
+    out->in_memory = 1;
+    return 1;
+  }
+
+  out->eightbyte_count = (size + 7u) / 8u;
+  binary_classify_fields(type, 0u, out->classes, out->eightbyte_count);
+
+  /* An eightbyte no field reached is padding. Nothing reads it, so INTEGER is
+   * the cheaper carrier. */
+  for (i = 0; i < out->eightbyte_count; i++) {
+    if (out->classes[i] == BINARY_EIGHTBYTE_NONE) {
+      out->classes[i] = BINARY_EIGHTBYTE_INTEGER;
+    }
+  }
+  return 1;
+}
+
 int code_generator_binary_compute_arg_layout(const BinaryAbi *abi,
                                              const int *is_float, size_t count,
                                              BinaryArgLocation *locations_out,
                                              int *stack_bytes_out) {
+  return code_generator_binary_compute_arg_layout_ex(
+      abi, is_float, NULL, NULL, count, locations_out, stack_bytes_out);
+}
+
+int code_generator_binary_compute_arg_layout_ex(
+    const BinaryAbi *abi, const int *is_float, const int *force_stack,
+    const size_t *stack_slots, size_t count,
+    BinaryArgLocation *locations_out, int *stack_bytes_out) {
   if (!abi || (!is_float && count > 0) || (!locations_out && count > 0)) {
     return 0;
   }
@@ -71,7 +184,18 @@ int code_generator_binary_compute_arg_layout(const BinaryAbi *abi,
 
   for (size_t i = 0; i < count; i++) {
     int wants_float = is_float[i] ? 1 : 0;
+    int wants_stack = force_stack && force_stack[i];
+    size_t slots = (stack_slots && stack_slots[i] > 0) ? stack_slots[i] : 1u;
     BinaryArgLocation *loc = &locations_out[i];
+
+    if (wants_stack) {
+      /* MEMORY class: on the stack by value, whatever registers are left. */
+      loc->kind = BINARY_ARG_ON_STACK;
+      loc->stack_offset = stack_cursor;
+      stack_cursor += (int)(slots * BINARY_FUNCTION_STACK_SLOT_SIZE);
+      positional++;
+      continue;
+    }
 
     if (abi->counts_classes_separately) {
       /* SysV: each class draws from its own register pool; overflow spills to
@@ -91,7 +215,7 @@ int code_generator_binary_compute_arg_layout(const BinaryAbi *abi,
       }
       loc->kind = BINARY_ARG_ON_STACK;
       loc->stack_offset = stack_cursor;
-      stack_cursor += BINARY_FUNCTION_STACK_SLOT_SIZE;
+      stack_cursor += (int)(slots * BINARY_FUNCTION_STACK_SLOT_SIZE);
     } else {
       /* MS-x64: one positional slot indexes both register files; slots beyond
        * the register count go on the stack at (slot - regcount) * 8. The int
