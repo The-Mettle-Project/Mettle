@@ -2819,12 +2819,7 @@ try {
        OnProbe = "tests/runtime_excision_safety_probe.mettle" },
     @{ Name = "crash_handler"; Flag = "-s";                Marker = "Fatal error: null pointer dereference" },
     @{ Name = "profile";       Flag = "--profile-runtime"; Marker = "total_us    avg_ns" },
-    # --debug-hooks needs a transport to carry the protocol. src/runtime/debug.c
-    # has one on Windows (a named pipe) and stubs the four hooks to no-ops
-    # elsewhere, so there is no runtime for the ELF link to pull in and nothing
-    # to check either way. See docs/known-limitations.md.
-    @{ Name = "debug_hooks";   Flag = "--debug-hooks";     Marker = "not a variable in this frame"
-       WindowsOnly = $true }
+    @{ Name = "debug_hooks";   Flag = "--debug-hooks";     Marker = "not a variable in this frame" }
   )
 
   function Test-BinaryContains($path, $marker) {
