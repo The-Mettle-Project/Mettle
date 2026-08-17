@@ -597,18 +597,41 @@ static char *replace_extension(const char *path, const char *extension) {
   return result;
 }
 
+/* Does this host emit ELF? Ask this rather than comparing against one ELF
+ * format: a native AArch64 Linux build reports ELF_ARM64, and a test written
+ * against ELF_X64 alone quietly hands it the Windows answer. */
+static int host_target_is_elf(void) {
+  BinaryTargetFormat format = binary_target_format_host_default();
+  return format == BINARY_TARGET_FORMAT_ELF_X64 ||
+         format == BINARY_TARGET_FORMAT_ELF_ARM64;
+}
+
+/* Where `--build` writes when the caller passed no -o. COFF hosts name the
+ * product `.exe`; an ELF host has no such suffix, so the product takes the
+ * source's stem. Returns NULL when that stem would be the source file itself,
+ * because the caller named a source with no extension and writing the product
+ * over it would destroy their input. */
 static char *default_executable_filename(const char *input_filename) {
   if (!input_filename || input_filename[0] == '\0') {
     return NULL;
   }
 
-  return replace_extension(input_filename, ".exe");
+  if (!host_target_is_elf()) {
+    return replace_extension(input_filename, ".exe");
+  }
+
+  {
+    char *stem = replace_extension(input_filename, "");
+    if (stem && strcmp(stem, input_filename) == 0) {
+      free(stem);
+      return NULL;
+    }
+    return stem;
+  }
 }
 
 static const char *default_object_output_filename(void) {
-  return binary_target_format_host_default() == BINARY_TARGET_FORMAT_ELF_X64
-             ? "output.o"
-             : "output.obj";
+  return host_target_is_elf() ? "output.o" : "output.obj";
 }
 
 static const char *linker_mode_name(LinkerMode mode) {
@@ -825,7 +848,7 @@ cleanup:
 
 static int object_needs_runtime_object(const char *object_path,
                                        const char *prefix) {
-  if (binary_target_format_host_default() == BINARY_TARGET_FORMAT_ELF_X64) {
+  if (host_target_is_elf()) {
     return elf_object_has_undefined_symbol_prefix(object_path, prefix);
   }
   return object_has_undefined_symbol_prefix(object_path, prefix);
@@ -2942,9 +2965,7 @@ int main(int argc, char *argv[]) {
 #else
       const char *host = "x86_64";
       const char *target =
-          binary_target_format_host_default() == BINARY_TARGET_FORMAT_ELF_X64
-              ? "x86_64-linux (ELF)"
-              : "x86_64-windows (COFF)";
+          host_target_is_elf() ? "x86_64-linux (ELF)" : "x86_64-windows (COFF)";
 #endif
       printf("mettle %s\n", METTLE_VERSION);
       printf("host: %s\n", host);
@@ -3484,7 +3505,12 @@ int main(int argc, char *argv[]) {
       build_output_filename = default_executable_filename(options.input_filename);
     }
     if (!build_output_filename) {
-      fprintf(stderr, "Error: Failed to determine executable output path\n");
+      /* On an ELF host the product takes the source's stem, so a source with
+       * no extension leaves nowhere to put it that is not the source. */
+      fprintf(stderr,
+              "Error: Could not choose an output name for '%s'. Pass -o "
+              "<name>\n",
+              options.input_filename ? options.input_filename : "");
       free((void *)options.import_directories);
       free((void *)options.link_arguments);
       free(auto_stdlib_directory);
@@ -4250,7 +4276,7 @@ int compile_file(const char *input_filename, const char *output_filename,
    * Windows compiler produces them. */
   import_options.target_is_elf =
       (options && (options->emit_arm64 || options->emit_arm64_obj)) ||
-      binary_target_format_host_default() == BINARY_TARGET_FORMAT_ELF_X64;
+      host_target_is_elf();
 
   // Auto-inject the standard prelude only when --prelude was specified, and
   // std/alloc when --native-heap was specified (it provides the mettle_heap_*

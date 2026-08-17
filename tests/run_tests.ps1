@@ -6926,6 +6926,65 @@ catch {
   Write-CaseResult -Name "runtime_name_collision" -Passed $false -Reason $_.Exception.Message
 }
 
+# `--build` with no -o has to name the product the way the platform does: a
+# COFF host adds .exe, an ELF host has no such suffix and takes the source's
+# stem. A source with no extension has nowhere to put the product except over
+# itself, so that is refused rather than destroying the input.
+$total++
+try {
+  $nameDir = Join-Path $tmpDir "default-output-name"
+  if (Test-Path $nameDir) { Remove-Item -Recurse -Force $nameDir }
+  New-Item -ItemType Directory -Path $nameDir | Out-Null
+  Copy-Item "tests/ok_global_int.mettle" (Join-Path $nameDir "hello.mettle") -Force
+
+  # Resolve before moving: the compiler path is relative to the repo root.
+  $nameCompiler = (Resolve-Path $CompilerPath).Path
+  Push-Location $nameDir
+  try {
+    $nameOut = & $nameCompiler --build "hello.mettle" 2>&1 | Out-String
+    $nameExit = $LASTEXITCODE
+  }
+  finally { Pop-Location }
+  if ($nameExit -ne 0) { throw "default-name build failed: $nameOut" }
+
+  $expected = if ($script:OnWindows) { "hello.exe" } else { "hello" }
+  $unexpected = if ($script:OnWindows) { "hello" } else { "hello.exe" }
+  if (-not (Test-Path (Join-Path $nameDir $expected))) {
+    throw "expected the product at '$expected'; directory holds: " +
+          ((Get-ChildItem $nameDir | ForEach-Object { $_.Name }) -join ", ")
+  }
+  if (Test-Path (Join-Path $nameDir $unexpected)) {
+    throw "the product was also written as '$unexpected', which is the other platform's name"
+  }
+
+  # A source with no extension: the stem is the source, so refuse.
+  Copy-Item "tests/ok_global_int.mettle" (Join-Path $nameDir "noext") -Force
+  $before = (Get-Item (Join-Path $nameDir "noext")).Length
+  Push-Location $nameDir
+  try {
+    $refuseOut = & $nameCompiler --build "noext" 2>&1 | Out-String
+    $refuseExit = $LASTEXITCODE
+  }
+  finally { Pop-Location }
+  if ($script:OnWindows) {
+    # .exe is appended, so there is no clash and the build succeeds.
+    if ($refuseExit -ne 0) { throw "extensionless source should still build on Windows: $refuseOut" }
+  }
+  else {
+    if ($refuseExit -eq 0) { throw "extensionless source built instead of being refused" }
+    if ($refuseOut -notmatch "Pass -o") { throw "refusal did not say how to proceed: $refuseOut" }
+    if ((Get-Item (Join-Path $nameDir "noext")).Length -ne $before) {
+      throw "the source was overwritten by its own product"
+    }
+  }
+
+  Write-CaseResult -Name "default_output_name" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "default_output_name" -Passed $false -Reason $_.Exception.Message
+}
+
 # of every line would be brittle if write_i64 formatting ever shifts.
 foreach ($mode in @("binary")) {
   $total++
