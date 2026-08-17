@@ -2657,6 +2657,33 @@ foreach ($strEqMode in @("debug", "release")) {
   }
 }
 
+# `string` moves like the two-field record it is: copied whole, returned
+# through a hidden pointer, stored inline in an aggregate. It used to be a
+# pointer in some places and the record in others, and the disagreements were
+# silent. Both backends, because the fallback and MIR paths each decide this
+# for themselves, and @noinline inside the fixture so an inlined call cannot
+# hide a broken boundary.
+foreach ($sbvMode in @("debug", "release")) {
+  $total++
+  try {
+    $exe = Join-Path $tmpDir "string_byvalue_$sbvMode.exe"
+    $buildArgs = @()
+    if ($sbvMode -eq "release") { $buildArgs += "--release" }
+    $buildArgs += @("--build", "tests\test_string_by_value.mettle", "-o", $exe)
+    $out = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "string by value ($sbvMode) build failed: $out" }
+    & $exe *> $null
+    if ($LASTEXITCODE -ne 66) {
+      throw "string by value ($sbvMode) returned $LASTEXITCODE (expected 66; the code names the shape)"
+    }
+    Write-CaseResult -Name "string_by_value_$sbvMode" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "string_by_value_$sbvMode" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # String comparison is opt-in by use: a program that never compares strings
 # never names mettle_string_ and never links it.
 $total++

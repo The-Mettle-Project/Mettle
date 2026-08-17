@@ -306,7 +306,11 @@ int ir_try_emit_aggregate_symbol_memcpy(
       value->kind != IR_OPERAND_SYMBOL || !value->name) {
     return 0;
   }
-  if (!dest_type || dest_type->kind != TYPE_STRUCT) {
+  /* `string` copies whole, like the struct it is: sixteen bytes, not the one
+   * word a plain store would move, which would leave the length reading
+   * whatever happened to sit beside the pointer. */
+  if (!dest_type ||
+      (dest_type->kind != TYPE_STRUCT && dest_type->kind != TYPE_STRING)) {
     return 0;
   }
   if (dest_type->size == 0 || dest_type->size > (size_t)INT_MAX) {
@@ -376,7 +380,12 @@ static int ir_spill_aggregate_value_to_local(IRLoweringContext *context,
   if (value->kind == IR_OPERAND_SYMBOL) {
     return 0;               /* already addressable */
   }
-  if (value->kind != IR_OPERAND_TEMP || !dest_type->name) {
+  /* A string literal is a value with no address of its own here, the same
+   * problem a call result has. Giving it a local makes `h.name = "x"` a
+   * sixteen-byte copy like every other whole-record assignment, instead of a
+   * one-word store that leaves the length beside it untouched. */
+  if ((value->kind != IR_OPERAND_TEMP && value->kind != IR_OPERAND_STRING) ||
+      !dest_type->name) {
     return 0;
   }
 
@@ -435,7 +444,11 @@ int ir_try_emit_aggregate_address_memcpy(IRLoweringContext *context,
   if (!context || !function || !dest_addr || !value) {
     return 0;
   }
-  if (!dest_type || dest_type->kind != TYPE_STRUCT) {
+  /* `string` copies whole, like the struct it is: sixteen bytes, not the one
+   * word a plain store would move, which would leave the length reading
+   * whatever happened to sit beside the pointer. */
+  if (!dest_type ||
+      (dest_type->kind != TYPE_STRUCT && dest_type->kind != TYPE_STRING)) {
     return 0;
   }
   if (dest_type->size == 0 || dest_type->size > (size_t)INT_MAX) {
@@ -886,15 +899,14 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
         return 0;
       }
       object_type = object_type->base_type;
-    } else if (object_type && object_type->kind == TYPE_STRING) {
-      // String values are represented as pointers to {chars, length} records.
-      // Member access must operate on that value pointer, not on the variable's
-      // stack slot address.
-      if (!ir_lower_expression(context, function, member->object,
-                               &object_address)) {
-        return 0;
-      }
     } else {
+      /* `string` takes the struct path. It is a {chars, length} record, so the
+       * fields are measured from the record's address, and that is what the
+       * lvalue walk yields for a local, a parameter, or a field of another
+       * aggregate alike. Reading the object as a VALUE here was the other half
+       * of the two-representations problem: it worked for a parameter, whose
+       * slot happens to hold a pointer, and read a local's own first eight
+       * bytes as the base address. */
       if (!ir_lower_lvalue_address(context, function, member->object,
                                    &object_address, &object_type)) {
         return 0;
@@ -1168,7 +1180,8 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
      * `var t: S = make_point(); t.x`, just without the source-level name. */
     Type *value_type = ir_infer_expression_type(context, expression);
     if (!value_type || !value_type->name ||
-        (value_type->kind != TYPE_STRUCT && value_type->kind != TYPE_ARRAY)) {
+        (value_type->kind != TYPE_STRUCT && value_type->kind != TYPE_ARRAY &&
+         value_type->kind != TYPE_STRING)) {
       ir_set_error(context, "Expression is not assignable in IR lowering");
       return 0;
     }

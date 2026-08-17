@@ -1568,7 +1568,8 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
      * Instead copy the whole aggregate into a fresh named local via the
      * wide-STORE memcpy path and yield that local as the value. */
     if (value_type->name &&
-        (value_type->kind == TYPE_STRUCT || value_type->kind == TYPE_ARRAY) &&
+        (value_type->kind == TYPE_STRUCT || value_type->kind == TYPE_ARRAY ||
+         value_type->kind == TYPE_STRING) &&
         value_type->size > 8 && value_type->size <= (size_t)INT_MAX) {
       char *agg_name = ir_new_label_name(context, "agg_byval");
       IROperand dest_addr = ir_operand_none();

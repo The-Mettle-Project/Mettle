@@ -350,49 +350,28 @@ static int code_generator_binary_emit_global_aggregate_image(
       target = chars_label;
 
       if (reloc->string_wants_record) {
-        char *record_label =
-            code_generator_generate_label(generator, "str_struct");
-        size_t record_offset = 0;
-        BinarySection *section = NULL;
+        /* The field IS the {chars, length} record, sixteen bytes at the
+         * field's own offset: the relocation below fills the pointer half and
+         * the length is written beside it here.
+         *
+         * This used to emit a separate record in rodata and point the field at
+         * it, which made a string field of a constant the one place a string
+         * was still a pointer after the type became an ordinary aggregate.
+         * Reading such a field then produced the record's ADDRESS where every
+         * other site expected its contents. */
+        BinarySection *image_section =
+            binary_emitter_get_section(emitter, data_section);
         uint64_t encoded_length = (uint64_t)length;
-
-        if (!record_label) {
-          code_generator_set_error(generator,
-                                   "Out of memory building string record");
+        size_t length_at = image_offset + reloc->offset + 8;
+        if (!image_section || !image_section->data ||
+            length_at + sizeof(encoded_length) > image_section->size) {
+          code_generator_set_error(
+              generator, "String field does not fit its aggregate image");
           free(chars_label);
           return 0;
         }
-        if (!binary_emitter_align_section(emitter, rdata_section, 8, 0) ||
-            !binary_emitter_append_zeros(emitter, rdata_section, 16,
-                                         &record_offset) ||
-            !binary_emitter_define_symbol(emitter, record_label,
-                                          BINARY_SYMBOL_LOCAL, rdata_section,
-                                          record_offset, 16) ||
-            !binary_emitter_add_relocation(emitter, rdata_section,
-                                           record_offset,
-                                           BINARY_RELOCATION_ADDR64,
-                                           chars_label, 0)) {
-          code_generator_set_error(generator, "%s",
-                                   binary_emitter_get_error(emitter)
-                                       ? binary_emitter_get_error(emitter)
-                                       : "Failed to emit string record");
-          free(record_label);
-          free(chars_label);
-          return 0;
-        }
-        section = binary_emitter_get_section(emitter, rdata_section);
-        if (!section || !section->data || record_offset + 16 > section->size) {
-          code_generator_set_error(generator,
-                                   "Failed to access emitted string record");
-          free(record_label);
-          free(chars_label);
-          return 0;
-        }
-        memcpy(section->data + record_offset + 8, &encoded_length,
+        memcpy(image_section->data + length_at, &encoded_length,
                sizeof(encoded_length));
-        free(chars_label);
-        chars_label = record_label;
-        target = record_label;
       }
     } else if (generator->ir_program) {
       /* Relocate against the referenced symbol's linkage name, which may

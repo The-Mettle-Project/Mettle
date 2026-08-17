@@ -640,6 +640,14 @@ int code_generator_binary_emit_indirect_source_address(
     return binary_emit_lea_reg_mem(&context->code, target_register,
                                    BINARY_GP_RBP, -offset);
   }
+  /* A string literal is an aggregate the compiler already laid out: the
+   * {chars, length} record sits in rodata beside its bytes, so passing one
+   * indirectly is just its address. */
+  if (operand->kind == IR_OPERAND_STRING) {
+    return code_generator_binary_emit_string_literal_value_address(
+        generator, context, operand->name ? operand->name : "",
+        target_register);
+  }
   code_generator_set_error(
       generator, "Indirect call argument must be a struct value (kind=%d)",
       operand->kind);

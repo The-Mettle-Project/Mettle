@@ -316,8 +316,18 @@ int code_generator_type_is_aggregate(const MtlcType *type) {
   if (!type) {
     return 0;
   }
+  /* `string` is a two-field record, {chars, length}, and it is an aggregate on
+   * exactly the same terms as a struct a programmer writes with those fields.
+   *
+   * It used to be excluded, which gave the type two representations at once: a
+   * value was a pointer to the record, a local was the record. Every site that
+   * moved a string had to know which it was holding, several disagreed, and
+   * returning one built in the callee wrote its fields through an
+   * uninitialized pointer. A struct with the identical two fields worked,
+   * because the aggregate machinery already answers all of this. */
   return type->kind == MTLC_TYPE_STRUCT || type->kind == MTLC_TYPE_ARRAY ||
-         type->kind == MTLC_TYPE_TAGGED_ENUM;
+         type->kind == MTLC_TYPE_TAGGED_ENUM ||
+         type->kind == MTLC_TYPE_STRING;
 }
 
 size_t code_generator_abi_type_size(const MtlcType *type) {

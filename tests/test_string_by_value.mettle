@@ -1,0 +1,83 @@
+// `string` is a two-field record, {chars, length}, and it moves like the struct
+// it is: copied whole, returned through a hidden pointer, stored inline in an
+// aggregate.
+//
+// It used to have two representations at once. A value was a pointer to the
+// record; a local was the record. Every site that moved a string had to know
+// which it held, several disagreed, and the disagreements were invisible:
+// returning one built in the callee wrote its fields through an uninitialized
+// pointer, and a struct with the identical two fields worked fine. Nothing in
+// the corpus returned a string, so nothing caught it.
+//
+// Each check returns its own code so a failure names the shape that broke.
+
+struct Holder {
+    s: string
+    n: int32
+}
+
+const CONST_HOLDER: Holder = { s: "folded", n: 7 };
+
+fn slice(s: string, start: int64, n: int64) -> string {
+    var out: string;
+    out.chars = s.chars + start;
+    out.length = (uint64)n;
+    return out;
+}
+
+// @noinline matters: inlining hides a broken call boundary by removing it.
+@noinline fn echo(s: string) -> string {
+    return s;
+}
+
+@noinline fn build(p: uint8*, n: uint64) -> string {
+    var s: string;
+    s.chars = p;
+    s.length = n;
+    return s;
+}
+
+fn pick(a: string, b: string, which: int32) -> string {
+    if (which == 0) { return a; }
+    return b;
+}
+
+fn field_of_param(h: Holder) -> string {
+    return h.s;
+}
+
+fn main() -> int32 {
+    var src: string = "hello world";
+
+    // Returning a string built in the callee: the case that crashed.
+    if (build(src.chars, (uint64)5) != "hello") { return 1; }
+    if (slice(src, 6, 5) != "world") { return 2; }
+    if (slice(src, 0, 5) != "hello") { return 3; }
+
+    // Returning a parameter, and a literal argument through a call boundary.
+    if (echo(src) != "hello world") { return 4; }
+    if (echo("abc") != "abc") { return 5; }
+    if (pick("x", "y", 0) != "x") { return 6; }
+    if (pick("x", "y", 1) != "y") { return 7; }
+
+    // A string field of a struct: written, read back, and returned out.
+    var h: Holder;
+    h.s = "nested";
+    h.n = 3;
+    if (h.s != "nested") { return 8; }
+    if (h.n != 3) { return 9; }          // the field beside it is undisturbed
+    if (field_of_param(h) != "nested") { return 10; }
+
+    // A string field of a folded constant is the record inline, not a pointer
+    // to one parked in rodata.
+    if (CONST_HOLDER.s != "folded") { return 11; }
+    if ((int32)CONST_HOLDER.s.length != 6) { return 12; }
+    if (CONST_HOLDER.n != 7) { return 13; }
+
+    // Chained returns, and a heap-built string crossing a boundary.
+    if (echo(echo(slice(src, 6, 5))) != "world") { return 14; }
+    var joined: string = "a" + "bc";
+    if (echo(joined) != "abc") { return 15; }
+
+    return 66;
+}
