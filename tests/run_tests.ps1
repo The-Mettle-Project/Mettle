@@ -4455,6 +4455,7 @@ catch {
 
 # Debugger instrumentation: a --debug-hooks build must run NORMALLY when no
 # debugger is attached (every hook is an early-out; METTLE_DBG_PIPE unset).
+if (-not $script:OnWindows) { Skip-WindowsOnly "debug_hooks_standalone" "Windows-only: --debug-hooks is refused where the transport is unimplemented" } else {
 $total++
 try {
   $exePath = Join-Path $tmpDir "debug_hooks_standalone.exe"
@@ -4474,6 +4475,7 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "debug_hooks_standalone" -Passed $false -Reason $_.Exception.Message
+}
 }
 
 # --explain "since last build" diffing + --explain-json: recompiling unchanged

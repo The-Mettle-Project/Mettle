@@ -216,10 +216,11 @@ Arrays follow the same rule as in [Types - Array Types](types.md#array-types): t
 - `--debug-hooks` and the editor debugging built on it are Windows-only.
   `src/runtime/debug.c` carries the protocol over a named pipe on Windows and
   compiles the four hooks (`mettle_dbg_enter`, `_exit`, `_local`, `_line`) to
-  no-ops everywhere else, so a Linux build accepts the flag and reports nothing.
-  Crash traces (`-s`), stack traces (`-d`) and `--profile-runtime` do work on
-  Linux. The protocol itself is platform-neutral; what is missing is a POSIX
-  transport (a FIFO or a Unix socket) behind the same four I/O calls.
+  no-ops everywhere else. The flag is **refused** off Windows rather than
+  accepted into a binary that would report nothing. Crash traces (`-s`), stack
+  traces (`-d`) and `--profile-runtime` do work on Linux. The protocol itself
+  is platform-neutral; what is missing is a POSIX transport (a FIFO or a Unix
+  socket) behind the same four I/O calls.
 
 - The internal PE linker lets a program override a runtime symbol, binding the
   program's definition and leaving the runtime's own internal calls on the
