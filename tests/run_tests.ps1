@@ -9059,18 +9059,19 @@ catch {
   Write-CaseResult -Name "profile_runtime_ops" -Passed $false -Reason $_.Exception.Message
 }
 
-if (-not $script:OnWindows) {
-  # The harness links the compiler sources against glibc, and the owned host
-  # layer they call (mettle_install_signal_handler, mettle_thread_current_id)
-  # does not coexist with it. The report itself is exercised on Linux by the
-  # compiler binary, which carries the same crash reporter.
-  Skip-WindowsOnly "compiler_ice_report" `
-    "Windows-only harness: it links compiler sources against glibc"
-} else {
+$total++
 try {
-  $total++
   $iceExe = Join-Path $tmpDir "compiler_ice_report_test.exe"
-  $iceCompile = & gcc -Wall -Wextra -std=c99 -g -O0 -Isrc -Iinclude tests/compiler_ice_report_test.c src/common.c src/lexer/lexer.c src/compiler/compiler_context.c src/compiler/compiler_crash.c src/runtime/crash_handler.c src/ir/ir.c -o $iceExe -ldbghelp 2>&1 | Out-String
+  # dbghelp backs the Windows symbolizer; POSIX resolves through the dynamic
+  # loader, so it links -ldl and -pthread in its place. -D_GNU_SOURCE for
+  # strdup, which C99 alone does not declare on glibc.
+  $iceLibs = if ($script:OnWindows) { @("-ldbghelp") } else { @("-ldl", "-pthread") }
+  $iceArgs = @("-Wall", "-Wextra", "-std=c99", "-g", "-O0", "-D_GNU_SOURCE",
+               "-Isrc", "-Iinclude", "tests/compiler_ice_report_test.c",
+               "src/common.c", "src/lexer/lexer.c",
+               "src/compiler/compiler_context.c", "src/compiler/compiler_crash.c",
+               "src/runtime/crash_handler.c", "src/ir/ir.c", "-o", $iceExe) + $iceLibs
+  $iceCompile = & gcc @iceArgs 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "compiler ICE report harness compile failed: $iceCompile"
   }
@@ -9098,7 +9099,6 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "compiler_ice_report" -Passed $false -Reason $_.Exception.Message
-}
 }
 
 # PTX backend validity gate. Emission and structural/profile checks always run.

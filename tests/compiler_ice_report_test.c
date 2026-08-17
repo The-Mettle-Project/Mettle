@@ -18,6 +18,36 @@ void mettle_crash_write_stderr(const char *text) {
   mettle_crash_write_stderr_bytes(text, strlen(text));
 }
 
+#if !defined(_WIN32) && !defined(_WIN64)
+/* Three more of the same: the POSIX arm of the owned runtime backs these for
+ * a real compiler, and this harness is a hosted build without it. The report
+ * under test is raised deliberately rather than by a fault, so the signal
+ * installer is never armed and the readability probe is only consulted while
+ * symbolizing. */
+#include <signal.h>
+#include <pthread.h>
+
+int mettle_install_signal_handler(int signal_number,
+                                  void (*handler)(int, void *, void *));
+unsigned int mettle_thread_current_id(void);
+int mettle_address_is_readable(const void *address, unsigned long long length);
+
+int mettle_install_signal_handler(int signal_number,
+                                  void (*handler)(int, void *, void *)) {
+  (void)signal_number;
+  (void)handler;
+  return 1;
+}
+
+unsigned int mettle_thread_current_id(void) {
+  return (unsigned int)(unsigned long)pthread_self();
+}
+
+int mettle_address_is_readable(const void *address, unsigned long long length) {
+  return address != 0 && length > 0;
+}
+#endif
+
 int main(void) {
   IRInstruction instruction = {0};
   char line[256];
