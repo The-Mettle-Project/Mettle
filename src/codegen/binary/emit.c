@@ -1870,6 +1870,29 @@ static int code_generator_binary_emit_realloc_call_inline(
     return 0;
   }
 
+  /* The owned realloc already answers a null pointer with an allocation and a
+   * zero size with a free, so SysV needs none of the branching the Win32 heap
+   * triple below has to do for itself. */
+  if (code_generator_binary_active_abi()->counts_classes_separately) {
+    const BinaryAbi *abi = code_generator_binary_active_abi();
+    size_t displacement_offset = 0;
+
+    if (!code_generator_binary_declare_external_symbol(generator, "realloc") ||
+        !code_generator_binary_emit_operand_load(generator, context,
+                                                 &instruction->arguments[0],
+                                                 abi->int_param_registers[0]) ||
+        !code_generator_binary_emit_operand_load(generator, context,
+                                                 &instruction->arguments[1],
+                                                 abi->int_param_registers[1]) ||
+        !binary_emit_call_placeholder(&context->code, &displacement_offset) ||
+        !binary_call_relocation_table_add(&context->call_relocations, "realloc",
+                                          displacement_offset)) {
+      return 0;
+    }
+    return code_generator_binary_emit_destination_store(
+        generator, context, &instruction->dest, BINARY_GP_RAX);
+  }
+
   malloc_label = code_generator_generate_label(generator, "realloc_malloc");
   free_label = code_generator_generate_label(generator, "realloc_free");
   done_label = code_generator_generate_label(generator, "realloc_done");
@@ -6096,6 +6119,7 @@ int code_generator_binary_emit_profile_enter(
     CodeGenerator *generator, BinaryFunctionContext *context, uint32_t fn_id) {
   size_t displacement_offset = 0;
   const char *symbol = "mettle_profile_enter";
+  const BinaryAbi *abi = code_generator_binary_active_abi();
 
   if (!generator || !context) {
     return 0;
@@ -6105,15 +6129,18 @@ int code_generator_binary_emit_profile_enter(
     return 0;
   }
 
-  if (!binary_emit_mov_reg_imm32_zero_extend(&context->code, BINARY_GP_RCX,
+  /* The function id and the shadow reservation both come from the active ABI:
+   * RCX plus 32 bytes on MS-x64, RDI and nothing on SysV. Passing it in RCX
+   * everywhere left the Linux runtime reading whatever RDI held, so the
+   * report attributed calls to the wrong function or to none. */
+  if (!binary_emit_mov_reg_imm32_zero_extend(&context->code,
+                                             abi->int_param_registers[0],
                                              fn_id) ||
-      !binary_emit_sub_rsp_imm32(&context->code,
-                                 BINARY_WIN64_SHADOW_SPACE_SIZE) ||
+      !binary_emit_sub_rsp_imm32(&context->code, abi->shadow_space_size) ||
       !binary_emit_call_placeholder(&context->code, &displacement_offset) ||
       !binary_call_relocation_table_add(&context->call_relocations, symbol,
                                         displacement_offset) ||
-      !binary_emit_add_rsp_imm32(&context->code,
-                                 BINARY_WIN64_SHADOW_SPACE_SIZE)) {
+      !binary_emit_add_rsp_imm32(&context->code, abi->shadow_space_size)) {
     if (!generator->has_error) {
       code_generator_set_error(
           generator,
@@ -6130,6 +6157,7 @@ int code_generator_binary_emit_profile_exit(CodeGenerator *generator,
                                             BinaryFunctionContext *context) {
   size_t displacement_offset = 0;
   const char *symbol = "mettle_profile_exit";
+  int shadow = code_generator_binary_active_abi()->shadow_space_size;
 
   if (!generator || !context) {
     return 0;
@@ -6140,13 +6168,11 @@ int code_generator_binary_emit_profile_exit(CodeGenerator *generator,
   }
 
   if (!binary_emit_push_reg(&context->code, BINARY_GP_RAX) ||
-      !binary_emit_sub_rsp_imm32(&context->code,
-                                 BINARY_WIN64_SHADOW_SPACE_SIZE) ||
+      !binary_emit_sub_rsp_imm32(&context->code, shadow) ||
       !binary_emit_call_placeholder(&context->code, &displacement_offset) ||
       !binary_call_relocation_table_add(&context->call_relocations, symbol,
                                         displacement_offset) ||
-      !binary_emit_add_rsp_imm32(&context->code,
-                                 BINARY_WIN64_SHADOW_SPACE_SIZE) ||
+      !binary_emit_add_rsp_imm32(&context->code, shadow) ||
       !binary_emit_pop_reg(&context->code, BINARY_GP_RAX)) {
     if (!generator->has_error) {
       code_generator_set_error(
@@ -6165,6 +6191,7 @@ int code_generator_binary_emit_profile_op(CodeGenerator *generator,
                                           uint32_t op_class, uint64_t amount) {
   size_t displacement_offset = 0;
   const char *symbol = "mettle_profile_op";
+  const BinaryAbi *abi = code_generator_binary_active_abi();
 
   if (!generator || !context) {
     return 0;
@@ -6174,17 +6201,17 @@ int code_generator_binary_emit_profile_op(CodeGenerator *generator,
     return 0;
   }
 
-  if (!binary_emit_mov_reg_imm32_zero_extend(&context->code, BINARY_GP_RCX,
+  if (!binary_emit_mov_reg_imm32_zero_extend(&context->code,
+                                             abi->int_param_registers[0],
                                              op_class) ||
-      !binary_emit_mov_reg_imm32_zero_extend(&context->code, BINARY_GP_RDX,
+      !binary_emit_mov_reg_imm32_zero_extend(&context->code,
+                                             abi->int_param_registers[1],
                                              (uint32_t)amount) ||
-      !binary_emit_sub_rsp_imm32(&context->code,
-                                 BINARY_WIN64_SHADOW_SPACE_SIZE) ||
+      !binary_emit_sub_rsp_imm32(&context->code, abi->shadow_space_size) ||
       !binary_emit_call_placeholder(&context->code, &displacement_offset) ||
       !binary_call_relocation_table_add(&context->call_relocations, symbol,
                                         displacement_offset) ||
-      !binary_emit_add_rsp_imm32(&context->code,
-                                 BINARY_WIN64_SHADOW_SPACE_SIZE)) {
+      !binary_emit_add_rsp_imm32(&context->code, abi->shadow_space_size)) {
     if (!generator->has_error) {
       code_generator_set_error(
           generator,

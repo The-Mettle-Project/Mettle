@@ -137,7 +137,7 @@ Structs work normally as **locals**: field access, whole-struct assignment, and 
 **Practical guidance:**
 
 - Struct-by-value **arguments and returns** are safe in the native object backend.
-- For C interop, the backend follows the platform C ABI: Microsoft x64 on Windows (COFF) and System V AMD64 on Linux (ELF). Scalar and pointer arguments, return values, register-and-stack argument passing, and the hidden struct-return pointer all match the target convention. Struct-by-value passing and returning is covered for the Mettle-calls-C direction. See [C Interoperability - Passing Structs to C](c-interop.md).
+- For C interop, the backend follows the platform C ABI: Microsoft x64 on Windows (COFF) and System V AMD64 on Linux (ELF). Scalar and pointer arguments, return values, register-and-stack argument passing, and the hidden struct-return pointer all match the target convention. Struct-by-value passing and returning is covered for the Mettle-calls-C direction **on Windows only**; System V's eightbyte classification is not implemented, so a by-value struct crossing to C is wrong on Linux (see the Platform Support note below). See [C Interoperability - Passing Structs to C](c-interop.md).
 - With `--linker internal`, raw COFF `.o` / `.obj` files can be supplied through `--link-arg`; the final executable link remains inside Mettle.
 
 Arrays follow the same rule as in [Types - Array Types](types.md#array-types): they are not passed by value; use `&arr[0]` or a `T`* parameter.
@@ -185,3 +185,38 @@ Arrays follow the same rule as in [Types - Array Types](types.md#array-types): t
 - `std/net` works on Windows and Linux from one import. Windows binds Winsock2.
   Linux selects `std/net.linux` and uses owned socket system calls. No thread or
   C library is added.
+
+- On Linux a top-level function name collides with the owned runtime if it
+  matches one of the POSIX names that runtime exports, and the link fails with
+  `multiple definition`. The names are the ones `std/net.linux` and
+  `std/io.linux` bind by name, so they have to be spelled the way the system
+  spells them: `close`, `read`, `write`, `send`, `recv`, `socket`, `bind`,
+  `listen`, `accept`, `stat`, `access`, `remove`, `clock`, `system`, `abort`,
+  `exit`, `rand`, the `str*`/`mem*` family, and the `malloc` family. Windows
+  exports a smaller set, so a program that links there can fail to link on
+  Linux. Rename the function; `mettle_`-prefixed and `mt_`-prefixed names are
+  reserved to the runtime and are always safe to avoid.
+
+- Passing or returning a struct **by value across the C boundary** works on
+  Windows and is wrong on Linux. System V AMD64 classifies a struct into
+  eightbytes and passes a small one in a register pair, where Microsoft x64
+  passes anything over 8 bytes as a pointer. The backend implements the
+  Microsoft rule and the hidden return pointer, and no eightbyte
+  classification, so a 12-byte `{int32 a, b, c}` handed to a C function reads
+  garbage on Linux. Struct-by-value between Mettle functions is unaffected on
+  both platforms, as are scalars and pointers at the C boundary. Pass a pointer
+  to the struct when calling C from Linux.
+
+- `--debug-hooks` and the editor debugging built on it are Windows-only.
+  `src/runtime/debug.c` carries the protocol over a named pipe on Windows and
+  compiles the four hooks (`mettle_dbg_enter`, `_exit`, `_local`, `_line`) to
+  no-ops everywhere else, so a Linux build accepts the flag and reports nothing.
+  Crash traces (`-s`), stack traces (`-d`) and `--profile-runtime` do work on
+  Linux. The protocol itself is platform-neutral; what is missing is a POSIX
+  transport (a FIFO or a Unix socket) behind the same four I/O calls.
+
+- The internal PE linker lets a program override a runtime symbol, binding the
+  program's definition and leaving the runtime's own internal calls on the
+  runtime's. GNU ld rejects the duplicate instead, so that override is a
+  Windows capability rather than a language one. This is why `std/conv` exports
+  `cstr_len` rather than `strlen`.

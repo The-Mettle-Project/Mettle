@@ -87,7 +87,7 @@ NM ?= nm
 LIBMTLC = $(BINDIR)/libmtlc.a
 TARGET = $(BINDIR)/mettle
 
-.PHONY: all clean test install install-libmtlc dist-libmtlc bundle-stdlib bundle-runtime libmtlc
+.PHONY: all clean test check install install-libmtlc dist-libmtlc bundle-stdlib bundle-runtime libmtlc
 
 all: $(TARGET) bundle-stdlib bundle-runtime
 libmtlc: $(LIBMTLC)
@@ -157,10 +157,12 @@ bundle-runtime: $(HOST_STARTUP_OBJECT) $(TARGET) | $(BINDIR)
 		-c $(RUNTIMEDIR)/atomics.c -o $(OBJDIR)/runtime/atomics.o
 	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/crash_handler.c -o $(OBJDIR)/runtime/crash_handler.o
 	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/safety.c        -o $(OBJDIR)/runtime/safety.o
+	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/debug.c         -o $(OBJDIR)/runtime/debug.o
 	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/profile.c       -o $(OBJDIR)/runtime/profile.o
 	cp $(OBJDIR)/runtime/atomics.o       $(BINDIR)/runtime/atomics.o
 	cp $(OBJDIR)/runtime/crash_handler.o $(BINDIR)/runtime/crash_handler.o
 	cp $(OBJDIR)/runtime/safety.o        $(BINDIR)/runtime/safety.o
+	cp $(OBJDIR)/runtime/debug.o         $(BINDIR)/runtime/debug.o
 	$(TARGET) --release --emit-obj $(RUNTIMEDIR)/swap.mettle -o $(BINDIR)/runtime/swap.o
 	$(TARGET) --release --emit-obj $(RUNTIMEDIR)/string.mettle -o $(BINDIR)/runtime/string.o
 	cp $(OBJDIR)/runtime/profile.o       $(BINDIR)/runtime/profile.o
@@ -202,6 +204,15 @@ test: $(TARGET) bundle-runtime
 		if test -n "$$($(NM) -u $$product)"; then \
 			echo "error: $$product has unresolved symbols"; exit 1; fi; \
 	done
+
+# The same suite the Windows build gates on, run through PowerShell Core.
+# `test` above stays the quick owned-runtime check; this is the full gate.
+check: $(TARGET) bundle-stdlib bundle-runtime
+	@command -v pwsh >/dev/null 2>&1 || { \
+		echo "error: pwsh is required for the test suite"; \
+		echo "  install PowerShell Core: https://aka.ms/powershell"; \
+		exit 1; }
+	pwsh -NoProfile -File tests/run_tests.ps1 -CompilerPath $(TARGET)
 
 # Install the full reference toolchain (the mettle driver + stdlib + runtime).
 install: $(TARGET) bundle-stdlib bundle-runtime

@@ -594,17 +594,24 @@ static int ir_explain_use_unicode(void) {
     cached = 0;
   }
 #else
-  const char *locale = getenv("LC_ALL");
-  if (!locale || !locale[0]) {
-    locale = getenv("LC_CTYPE");
+  int fd = explain_fileno(stderr);
+  /* A report going to a file or a pipe reads as ASCII, matching the Windows
+   * arm above. Only a terminal that asked for UTF-8 gets the glyphs. */
+  if (fd >= 0 && explain_isatty(fd)) {
+    const char *locale = getenv("LC_ALL");
+    if (!locale || !locale[0]) {
+      locale = getenv("LC_CTYPE");
+    }
+    if (!locale || !locale[0]) {
+      locale = getenv("LANG");
+    }
+    cached = (locale && (strstr(locale, "UTF-8") || strstr(locale, "utf8") ||
+                         strstr(locale, "UTF8")))
+                 ? 1
+                 : 0;
+  } else {
+    cached = 0;
   }
-  if (!locale || !locale[0]) {
-    locale = getenv("LANG");
-  }
-  cached = (locale && (strstr(locale, "UTF-8") || strstr(locale, "utf8") ||
-                       strstr(locale, "UTF8")))
-               ? 1
-               : 0;
 #endif
   return cached;
 }

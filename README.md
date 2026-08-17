@@ -129,9 +129,11 @@ reading and writing live variables over `--debug-hooks`, with no gdb, no PDB and
 no DWARF. Build with `-s` and a fault reports what the bad address was, such as a
 null field or a freed block.
 
-Windows is the most complete target, with an internal PE linker and `std/ui` for
-windows and controls. Linux builds, links against libc, and fully supports
-compiler development. See [what is missing](docs/known-limitations.md).
+Windows and Linux are both first-class targets, built from one source tree and
+gated by one test suite. Each owns its runtime: Windows links its own PE images,
+Linux emits ELF and reaches the kernel through direct system calls, so neither
+product carries a libc. What Windows has and Linux does not is `std/ui` for
+windows and controls. See [what is missing](docs/known-limitations.md).
 
 ## Build from source
 
@@ -150,8 +152,13 @@ Linux:
 
 ```bash
 make -j"$(nproc)"
-bash tools/test-elf-native.sh
+make check
 ```
+
+`make check` runs the same `tests/run_tests.ps1` the Windows build gates on, so
+a test written for either platform is a test both platforms answer. It needs
+[PowerShell Core](https://aka.ms/powershell). Without it, `bash
+tools/test-elf-native.sh` still covers the owned-ELF product on its own.
 
 For the backend alone, the archive another frontend links against:
 

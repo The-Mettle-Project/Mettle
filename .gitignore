@@ -1,5 +1,8 @@
 ﻿bin/
 obj/
+bin-linux/
+obj-linux/
+obj_lnx/
 dist/
 .claude/
 .cursor/

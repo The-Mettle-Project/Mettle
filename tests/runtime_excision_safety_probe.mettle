@@ -1,0 +1,24 @@
+// Positive control for the safety half of the runtime excision gate.
+//
+// The plain probe next to this one indexes a fixed local array, so --safe
+// proves every access in bounds and lowers what is left to an inline trap. It
+// calls nothing, which is the correct outcome and also the reason it cannot
+// show that asking for the safety runtime brings it in.
+//
+// This one allocates on the heap and indexes by argc. The block has to be
+// registered with the shadow map and the access has to be checked against it,
+// so mettle_safety_register and mettle_safety_check are really called and the
+// runtime really has to be linked.
+struct Row {
+  values: int32[4];
+}
+
+fn main(argc: int32, argv: int8**) -> int32 {
+  var row: Row* = new Row;
+  var i: int32 = 0;
+  while (i < 4) {
+    row->values[i] = i;
+    i = i + 1;
+  }
+  return row->values[argc];
+}

@@ -178,6 +178,12 @@ jobs:
       - name: Native ELF backend tests
         run: bash tools/test-elf-native.sh
 
+      # A tag ships only if the same suite that gates the Windows package
+      # passes here too.
+      - name: Full test suite
+        shell: bash
+        run: pwsh -NoProfile -File tests/run_tests.ps1 -CompilerPath ./bin/mettle
+
       - name: Stage release bundle
         id: stage
         shell: bash

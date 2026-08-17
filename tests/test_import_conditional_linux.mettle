@@ -1,0 +1,14 @@
+// The Linux-host counterpart of test_import_conditional.mettle. The guards are
+// swapped, so on this build the `if linux` import resolves normally while the
+// `if windows` import naming a nonexistent module is dropped before resolution
+// and never looked up. Returns 7.
+//
+// The compiler targets its host, so proving "a guarded import for the other
+// platform is never resolved" needs one fixture per host. Keep the two in step.
+
+import "std/core" if linux;
+import "std/this_module_does_not_exist_on_purpose" if windows;
+
+fn main() -> int32 {
+  return 7;
+}

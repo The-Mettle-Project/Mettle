@@ -183,6 +183,13 @@ jobs:
       - name: Native ELF backend tests
         run: bash tools/test-elf-native.sh
 
+      # The same tests/run_tests.ps1 the Windows job gates on. PowerShell Core
+      # is preinstalled on ubuntu-latest, so Linux and Windows assert against
+      # one case table and a test added for either lands on both.
+      - name: Full test suite
+        shell: bash
+        run: pwsh -NoProfile -File tests/run_tests.ps1 -CompilerPath ./bin/mettle
+
   # Native AArch64 gate for the DGX Spark toolchain path: compiler bootstrap,
   # relocatable host objects and external linking, the 11-argument CUDA launch
   # ABI, portable/GB10 PTX, SPIR-V, and the legacy self-contained smoke product.

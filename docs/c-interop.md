@@ -95,7 +95,7 @@ On Windows, Mettle follows the Microsoft x64 aggregate rule for struct-by-value 
 - all other aggregate sizes pass indirectly by pointer
 - indirect returns use a hidden first argument in RCX, and the callee returns that pointer in RAX
 
-This is covered for Mettle calling C functions that take or return structs by value, including `--emit-obj` builds linked with Mettle's internal linker. C calling exported Mettle functions with struct-by-value arguments or returns is not yet documented as supported.
+The rules above are the Microsoft x64 ones, and this is covered for Mettle calling C functions that take or return structs by value **on Windows**, including `--emit-obj` builds linked with Mettle's internal linker. On Linux the same call is wrong, because System V classifies a small struct into eightbytes and passes it in a register pair rather than by pointer. C calling exported Mettle functions with struct-by-value arguments or returns is not yet documented as supported.
 
 When a C API expects a pointer to a struct, pass `&my_struct` or a `T*` variable. For portable Linux/macOS C interop, prefer pointer parameters until the System V AMD64 aggregate classifier is implemented.
 
