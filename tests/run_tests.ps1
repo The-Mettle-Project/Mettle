@@ -32,6 +32,15 @@ function Get-ExpectedExitCode {
   return ($Expected -band 0xFF)
 }
 
+# A PC-relative reference to a symbol, which both object formats express under
+# their own name. `objdump -r` reads either one, so the tests that assert the
+# backend emitted a call or a data reference differ only in this pattern.
+$script:RelocPcRel = if ($script:OnWindows) {
+  "IMAGE_REL_AMD64_REL32"
+} else {
+  "R_X86_64_(?:PC32|PLT32)"
+}
+
 # The intermediate object `--build` leaves beside its product, and the name
 # `--dump-ir` hangs its sidecar off.
 $script:ObjExt = if ($script:OnWindows) { ".obj" } else { ".o" }
@@ -5038,7 +5047,6 @@ catch {
 }
 
 # Direct object backend relocation test: internal call lowered to REL32 relocation
-if (-not $script:OnWindows) { Skip-WindowsOnly "direct_object_call_return" "Windows-only: inspects the COFF relocation table" } else {
 $total++
 try {
   $objPath = Join-Path $tmpDir "test_direct_object_call_return.obj"
@@ -5056,7 +5064,7 @@ try {
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object relocation dump failed"
   }
-  if ($relocs -notmatch "IMAGE_REL_AMD64_REL32\s+callee") {
+  if ($relocs -notmatch "$script:RelocPcRel\s+callee") {
     throw "Direct object relocation table did not contain a REL32 call to callee"
   }
 
@@ -5078,7 +5086,6 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "direct_object_call_return" -Passed $false -Reason $_.Exception.Message
-}
 }
 
 # Closed-form reduction equivalence: the constant-bound loop unroller must not
@@ -8033,7 +8040,6 @@ catch {
   Write-CaseResult -Name "direct_object_global_string" -Passed $false -Reason $_.Exception.Message
 }
 
-if (-not $script:OnWindows) { Skip-WindowsOnly "direct_object_extern_global_link_name" "Windows-only: inspects the COFF relocation table" } else {
 $total++
 try {
   $objPath = Join-Path $tmpDir "direct_object_extern_global_link_name.obj"
@@ -8058,7 +8064,7 @@ try {
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object extern-global-link-name relocation dump failed"
   }
-  if ($relocs -notmatch "IMAGE_REL_AMD64_REL32" -or $relocs -notmatch "errno") {
+  if ($relocs -notmatch "$script:RelocPcRel" -or $relocs -notmatch "errno") {
     throw "Direct object extern-global-link-name object is missing REL32 relocations to 'errno'"
   }
 
@@ -8067,7 +8073,6 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "direct_object_extern_global_link_name" -Passed $false -Reason $_.Exception.Message
-}
 }
 
 # Direct object backend pointer-param-address test: address of parameter slot survives load/store
@@ -8300,7 +8305,6 @@ catch {
 }
 
 # Direct object backend function-pointer test: addr_of function plus indirect call
-if (-not $script:OnWindows) { Skip-WindowsOnly "direct_object_function_pointer" "Windows-only: inspects the COFF relocation table" } else {
 $total++
 try {
   $objPath = Join-Path $tmpDir "test_direct_object_function_pointer.obj"
@@ -8318,10 +8322,10 @@ try {
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object function-pointer relocation dump failed"
   }
-  if ($relocs -notmatch "IMAGE_REL_AMD64_REL32\s+add") {
+  if ($relocs -notmatch "$script:RelocPcRel\s+add") {
     throw "Direct object function-pointer relocations did not contain add"
   }
-  if ($relocs -notmatch "IMAGE_REL_AMD64_REL32\s+multiply") {
+  if ($relocs -notmatch "$script:RelocPcRel\s+multiply") {
     throw "Direct object function-pointer relocations did not contain multiply"
   }
 
@@ -8343,7 +8347,6 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "direct_object_function_pointer" -Passed $false -Reason $_.Exception.Message
-}
 }
 
 # Direct object backend runtime trap test: null deref lowers and links through the trap helper
