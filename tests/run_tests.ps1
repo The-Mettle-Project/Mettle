@@ -1,5 +1,5 @@
 param(
-  [string]$CompilerPath = ".\bin\mettle.exe",
+  [string]$CompilerPath = "",
   [switch]$BuildCompiler,
   [switch]$SkipRuntime,
   [switch]$SkipDeterminism,
@@ -7,6 +7,37 @@ param(
 )
 
 $ErrorActionPreference = "Continue"
+
+# Host platform. Windows PowerShell 5.1 predates the $IsWindows automatic
+# variable and only ever runs on Windows, so a null reading means Windows.
+$script:OnWindows = if ($null -eq $IsWindows) { $true } else { [bool]$IsWindows }
+
+# The compiler the Makefile and build.bat each produce.
+if ([string]::IsNullOrWhiteSpace($CompilerPath)) {
+  $CompilerPath = if ($script:OnWindows) { ".\bin/mettle.exe" } else { "./bin/mettle" }
+}
+
+# Product names keep their .exe suffix on both platforms. The suffix is
+# meaningless to the Linux loader, and holding it constant keeps one set of
+# artifact names -- and so one code path -- across the suite. It also keeps
+# `-o <name>.exe` clear of the compiler's own intermediate `<name>.o`, which a
+# bare `-o <name>.o` on Linux would collide with.
+
+# Windows-only coverage: the internal PE linker, COFF readers, PE import
+# tables, and the Win32 libraries reached through them. Every skip is counted
+# and listed at the end of the run so the Linux gate states what it did not
+# check rather than passing silently.
+$script:SkippedWindowsOnly = New-Object System.Collections.Generic.List[string]
+function Skip-WindowsOnly {
+  param([string]$Name, [string]$Why = "Windows-only: PE/COFF toolchain")
+  $script:SkippedWindowsOnly.Add("$Name ($Why)")
+  Write-Host "[SKIP] $Name :: $Why"
+}
+
+# `--linker internal` selects the internal PE linker, which exists only on
+# Windows. On Linux the native ELF path is the default, so the switch is
+# dropped and the same program is built through the platform's own linker.
+$script:InternalLinkerArgs = if ($script:OnWindows) { @("--linker", "internal") } else { @() }
 
 function Write-CaseResult {
   param(
@@ -114,7 +145,7 @@ function Test-DisassemblyOutput {
 
 if ($BuildCompiler) {
   Write-Host "Building compiler..."
-  & .\build.bat
+  if ($script:OnWindows) { & .\build.bat } else { & make -j"$(nproc)" }
   if ($LASTEXITCODE -ne 0) {
     Write-Error "Build failed."
     exit 1
@@ -126,7 +157,7 @@ if (-not (Test-Path $CompilerPath)) {
   exit 1
 }
 
-$tmpDir = Join-Path $env:TEMP "Mettle-test-artifacts"
+$tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "Mettle-test-artifacts"
 if (-not (Test-Path $tmpDir)) {
   New-Item -Path $tmpDir -ItemType Directory | Out-Null
 }
@@ -2344,7 +2375,7 @@ $total++
 try {
   $exePath = Join-Path $tmpDir "comptime_for_fields.exe"
   if (Test-Path $exePath) { Remove-Item -Path $exePath -Force -ErrorAction SilentlyContinue }
-  $buildOut = & $CompilerPath --build --release "tests\test_comptime_for_fields.mettle" -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --release "tests/test_comptime_for_fields.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "build failed: $buildOut" }
   & $exePath *> $null
   if ($LASTEXITCODE -ne 0) {
@@ -2368,7 +2399,7 @@ foreach ($fieldofMode in @("debug", "release")) {
     if (Test-Path $exePath) { Remove-Item -Path $exePath -Force -ErrorAction SilentlyContinue }
     $buildArgs = @()
     if ($fieldofMode -eq "release") { $buildArgs += "--release" }
-    $buildArgs += @("--build", "tests\test_fieldof.mettle", "-o", $exePath)
+    $buildArgs += @("--build", "tests/test_fieldof.mettle", "-o", $exePath)
     $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw "fieldof ($fieldofMode) build failed: $buildOut" }
     & $exePath *> $null
@@ -2393,7 +2424,7 @@ foreach ($strCmpMode in @("debug", "release")) {
     if (Test-Path $exePath) { Remove-Item -Path $exePath -Force -ErrorAction SilentlyContinue }
     $buildArgs = @()
     if ($strCmpMode -eq "release") { $buildArgs += "--release" }
-    $buildArgs += @("--build", "tests\test_comptime_string_compare.mettle", "-o", $exePath)
+    $buildArgs += @("--build", "tests/test_comptime_string_compare.mettle", "-o", $exePath)
     $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw "string compare ($strCmpMode) build failed: $buildOut" }
     & $exePath *> $null
@@ -2415,7 +2446,7 @@ $total++
 try {
   $exePath = Join-Path $tmpDir "comptime_for_declarations.exe"
   if (Test-Path $exePath) { Remove-Item -Path $exePath -Force -ErrorAction SilentlyContinue }
-  $buildOut = & $CompilerPath --build --release "tests\test_comptime_for_declarations.mettle" -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --release "tests/test_comptime_for_declarations.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "build failed: $buildOut" }
   & $exePath *> $null
   if ($LASTEXITCODE -ne 0) {
@@ -2432,7 +2463,7 @@ catch {
 # none: `@test` on one runs, and `@noalloc` on one fails the build.
 $total++
 try {
-  $out = & $CompilerPath test "tests\test_comptime_for_declarations.mettle" 2>&1 | Out-String
+  $out = & $CompilerPath test "tests/test_comptime_for_declarations.mettle" 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "generated tests failed: $out" }
   foreach ($expected in @("test offset_is_ordered_kind", "test offset_is_ordered_payload", "3 passed")) {
     if ($out -notmatch [regex]::Escape($expected)) { throw "missing '$expected' in: $out" }
@@ -2467,7 +2498,7 @@ catch {
 # generated blocks, and the ledger must count a module-scope site.
 $total++
 try {
-  $out = & $CompilerPath expand "tests\test_comptime_for_declarations.mettle" 2>&1 | Out-String
+  $out = & $CompilerPath expand "tests/test_comptime_for_declarations.mettle" 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "expand failed: $out" }
   foreach ($expected in @(
       "fn end_of_kind(base: int64) -> int64",
@@ -2479,7 +2510,7 @@ try {
   if ($out -match "ident\(") { throw "expand still shows an unresolved composed name: $out" }
   if ($out -match "comptime for") { throw "expand still shows an unexpanded directive: $out" }
 
-  $used = & $CompilerPath --report-expansion "tests\test_comptime_for_declarations.mettle" 2>&1 | Out-String
+  $used = & $CompilerPath --report-expansion "tests/test_comptime_for_declarations.mettle" 2>&1 | Out-String
   if ($used -notmatch "3 iterations") { throw "ledger missing the module-scope site: $used" }
   Write-CaseResult -Name "expand_shows_generated_declarations" -Passed $true
 }
@@ -2492,7 +2523,7 @@ catch {
 # the iteration that produced it, with the same note a diagnostic would carry.
 $total++
 try {
-  $out = & $CompilerPath expand "tests\test_comptime_for_fields.mettle" 2>&1 | Out-String
+  $out = & $CompilerPath expand "tests/test_comptime_for_fields.mettle" 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "expand failed: $out" }
   foreach ($expected in @(
       "expanded from comptime-for iteration 1 (field ``kind``)",
@@ -2520,7 +2551,7 @@ catch {
 # reached the instructions the interpreter walks.
 $total++
 try {
-  $out = & $CompilerPath trace "tests\test_comptime_for_fields.mettle" main 2>&1 | Out-String
+  $out = & $CompilerPath trace "tests/test_comptime_for_fields.mettle" main 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "trace failed: $out" }
   foreach ($expected in @('(field `kind`) total = 100',
                           '(field `seq`) total = 505',
@@ -2550,7 +2581,7 @@ catch {
 # made expand disclaim the whole file as an incomplete program.
 $total++
 try {
-  $out = & $CompilerPath expand "tests\test_fieldof.mettle" 2>&1 | Out-String
+  $out = & $CompilerPath expand "tests/test_fieldof.mettle" 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "expand failed: $out" }
   if ($out -match "no source form") {
     throw "expand reported a declaration as unprintable: $out"
@@ -2575,7 +2606,7 @@ catch {
 # survive to a running program without emitting anything.
 $total++
 try {
-  $swapSrc = "tests\test_swappable_quiesce.mettle"
+  $swapSrc = "tests/test_swappable_quiesce.mettle"
   $out = & $CompilerPath --release --explain $swapSrc -o (Join-Path $tmpDir "swq.obj") 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "build failed: $out" }
   if ($out -notmatch "call to ``policy``[^\r\n]*NOT inlined") {
@@ -2618,7 +2649,7 @@ foreach ($swapMode in @("debug", "release")) {
     $exe = Join-Path $tmpDir "hotswap_$swapMode.exe"
     $buildArgs = @()
     if ($swapMode -eq "release") { $buildArgs += "--release" }
-    $buildArgs += @("--build", "tests\test_hot_swap.mettle", "-o", $exe)
+    $buildArgs += @("--build", "tests/test_hot_swap.mettle", "-o", $exe)
     $out = & $CompilerPath @buildArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw "hot swap ($swapMode) build failed: $out" }
     & $exe *> $null
@@ -2642,7 +2673,7 @@ foreach ($strEqMode in @("debug", "release")) {
     $exe = Join-Path $tmpDir "stringeq_$strEqMode.exe"
     $buildArgs = @()
     if ($strEqMode -eq "release") { $buildArgs += "--release" }
-    $buildArgs += @("--build", "tests\test_string_equality.mettle", "-o", $exe)
+    $buildArgs += @("--build", "tests/test_string_equality.mettle", "-o", $exe)
     $out = & $CompilerPath @buildArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw "string equality ($strEqMode) build failed: $out" }
     & $exe *> $null
@@ -2667,7 +2698,7 @@ foreach ($sopsMode in @("debug", "release")) {
     $exe = Join-Path $tmpDir "std_string_ops_$sopsMode.exe"
     $buildArgs = @()
     if ($sopsMode -eq "release") { $buildArgs += "--release" }
-    $buildArgs += @("--build", "tests\test_std_string_ops.mettle", "-o", $exe)
+    $buildArgs += @("--build", "tests/test_std_string_ops.mettle", "-o", $exe)
     $out = & $CompilerPath @buildArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw "std string ops ($sopsMode) build failed: $out" }
     & $exe *> $null
@@ -2694,7 +2725,7 @@ foreach ($sbvMode in @("debug", "release")) {
     $exe = Join-Path $tmpDir "string_byvalue_$sbvMode.exe"
     $buildArgs = @()
     if ($sbvMode -eq "release") { $buildArgs += "--release" }
-    $buildArgs += @("--build", "tests\test_string_by_value.mettle", "-o", $exe)
+    $buildArgs += @("--build", "tests/test_string_by_value.mettle", "-o", $exe)
     $out = & $CompilerPath @buildArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw "string by value ($sbvMode) build failed: $out" }
     & $exe *> $null
@@ -2714,7 +2745,7 @@ foreach ($sbvMode in @("debug", "release")) {
 $total++
 try {
   $exe = Join-Path $tmpDir "string_excision.exe"
-  $out = & $CompilerPath --build "tests\runtime_excision_probe.mettle" -o $exe 2>&1 | Out-String
+  $out = & $CompilerPath --build "tests/runtime_excision_probe.mettle" -o $exe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "probe build failed: $out" }
   $bytes = [IO.File]::ReadAllBytes($exe)
   if ([Text.Encoding]::ASCII.GetString($bytes).Contains("mettle_string_eq")) {
@@ -2732,7 +2763,7 @@ catch {
 $total++
 try {
   $exe = Join-Path $tmpDir "swap_excision.exe"
-  $out = & $CompilerPath --build "tests\runtime_excision_probe.mettle" -o $exe 2>&1 | Out-String
+  $out = & $CompilerPath --build "tests/runtime_excision_probe.mettle" -o $exe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "probe build failed: $out" }
   $bytes = [IO.File]::ReadAllBytes($exe)
   # mettle_swap_apply is called only by `quiesce;`, so its absence here is the
@@ -2757,7 +2788,7 @@ catch {
 # feature IS requested. Without that pairing the test proves nothing.
 $total++
 try {
-  $probe = "tests\runtime_excision_probe.mettle"
+  $probe = "tests/runtime_excision_probe.mettle"
   $components = @(
     @{ Name = "safety";        Flag = "--safe";            Marker = "memory access outside its allocation" },
     @{ Name = "crash_handler"; Flag = "-s";                Marker = "Fatal error: null pointer dereference" },
@@ -2803,7 +2834,7 @@ catch {
 # and a passing verdict says it is a test rather than a proof.
 $total++
 try {
-  $swapFile = "tests\swap_check_pairs.mettle"
+  $swapFile = "tests/swap_check_pairs.mettle"
 
   $out = & $CompilerPath swap-check $swapFile --old scale_v1 --new scale_v2 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "equivalent rewrite should pass: $out" }
@@ -2843,19 +2874,19 @@ catch {
 # Expansion keeps a ledger, and a budget is a contract that fails the build.
 $total++
 try {
-  $used = & $CompilerPath --report-expansion "tests\test_comptime_for_fields.mettle" 2>&1 | Out-String
+  $used = & $CompilerPath --report-expansion "tests/test_comptime_for_fields.mettle" 2>&1 | Out-String
   if ($used -notmatch "comptime expansion: 2 sites") { throw "ledger wrong: $used" }
   if ($used -notmatch "3 iterations") { throw "ledger missing iteration count: $used" }
 
   # A program that expands nothing must say so: an absence you can point at.
-  $none = & $CompilerPath --report-expansion "tests\test_type_table_enum.mettle" 2>&1 | Out-String
+  $none = & $CompilerPath --report-expansion "tests/test_type_table_enum.mettle" 2>&1 | Out-String
   if ($none -notmatch "no sites; nothing generated") { throw "absence not reported: $none" }
 
-  $over = & $CompilerPath --expansion-budget=10 "tests\test_comptime_for_fields.mettle" 2>&1 | Out-String
+  $over = & $CompilerPath --expansion-budget=10 "tests/test_comptime_for_fields.mettle" 2>&1 | Out-String
   if ($LASTEXITCODE -eq 0) { throw "budget of 10 should have failed the build" }
   if ($over -notmatch "over the budget of 10") { throw "budget error unclear: $over" }
 
-  & $CompilerPath --expansion-budget=100000 "tests\test_comptime_for_fields.mettle" *> $null
+  & $CompilerPath --expansion-budget=100000 "tests/test_comptime_for_fields.mettle" *> $null
   if ($LASTEXITCODE -ne 0) { throw "a budget above the real cost should compile" }
   Write-CaseResult -Name "expansion_ledger_and_budget" -Passed $true
 }
@@ -2870,7 +2901,7 @@ $total++
 try {
   $exePath = Join-Path $tmpDir "type_names.exe"
   if (Test-Path $exePath) { Remove-Item -Path $exePath -Force -ErrorAction SilentlyContinue }
-  $buildOut = & $CompilerPath --build "tests\test_type_names.mettle" -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build "tests/test_type_names.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "build failed: $buildOut" }
   $runOut = & $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "name lengths wrong; program returned $LASTEXITCODE`: $runOut" }
@@ -2889,19 +2920,19 @@ catch {
 $simdRuntimeCases = @(
   @{
     Name            = "simd_correctness_int"
-    Path            = "tests\simd_correctness\simd_int_check.mettle"
+    Path            = "tests/simd_correctness/simd_int_check.mettle"
     OutputMustMatch = "INT SIMD: ALL OK"
     IrMustMatch     = @("sum_i32", "dot_i32", "scale_i32", "clamp_i32", "reverse_copy_i32", "minmax_i32")
   },
   @{
     Name            = "simd_correctness_float"
-    Path            = "tests\simd_correctness\simd_float_check.mettle"
+    Path            = "tests/simd_correctness/simd_float_check.mettle"
     OutputMustMatch = "FLOAT SIMD: ALL OK"
     IrMustMatch     = @("simd_sum_f64", "simd_sum_f32", "simd_dot_f64", "simd_dot_f32", "simd_affine_map_f64", "simd_affine_map_f32", "simd_vloop_f64")
   },
   @{
     Name            = "simd_correctness_byte"
-    Path            = "tests\simd_correctness\simd_byte_check.mettle"
+    Path            = "tests/simd_correctness/simd_byte_check.mettle"
     OutputMustMatch = "BYTE SIMD: ALL OK"
     IrMustMatch     = @("simd_byte_map", "simd_sum_u8")
   }
@@ -2966,7 +2997,7 @@ try {
     }
   }
 
-  $buildOut = & $CompilerPath --build --linker internal --release --dump-ir "tests\test_decorators.mettle" -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --linker internal --release --dump-ir "tests/test_decorators.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "decorators build failed: $buildOut"
   }
@@ -3009,7 +3040,7 @@ catch {
 $total++
 try {
   $mlBase = Join-Path $tmpDir "ml_gate_base.exe"
-  $buildOut = & $CompilerPath --build --release "tests\ml_gate.mettle" -o $mlBase 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --release "tests/ml_gate.mettle" -o $mlBase 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "ml_gate baseline build failed: $buildOut"
   }
@@ -3017,7 +3048,7 @@ try {
   $mlBaseExit = $LASTEXITCODE
 
   $mlExe = Join-Path $tmpDir "ml_gate_ml.exe"
-  $buildOut = & $CompilerPath --build --release --ml-opt "tests\ml_gate.mettle" -o $mlExe 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --release --ml-opt "tests/ml_gate.mettle" -o $mlExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "ml_gate --ml-opt build failed: $buildOut"
   }
@@ -3030,7 +3061,7 @@ try {
   }
 
   $mlSpec = Join-Path $tmpDir "ml_gate_spec.exe"
-  $buildOut = & $CompilerPath --build --release --ml-opt-speculative "tests\ml_gate.mettle" -o $mlSpec 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --release --ml-opt-speculative "tests/ml_gate.mettle" -o $mlSpec 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "ml_gate --ml-opt-speculative build failed: $buildOut"
   }
@@ -3058,7 +3089,7 @@ try {
   "mix $badIdx CONST 271828`nsignbit $negIdx NOP" | Out-File -Encoding ascii $dispPath
   $env:METTLE_ML_DISP = $dispPath
   $badExe = Join-Path $tmpDir "ml_gate_bad.exe"
-  $buildOut = & $CompilerPath --build --release --ml-opt "tests\ml_gate.mettle" -o $badExe 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --release --ml-opt "tests/ml_gate.mettle" -o $badExe 2>&1 | Out-String
   $env:METTLE_ML_DISP = $null
   if ($LASTEXITCODE -ne 0) {
     throw "ml_gate bad-disposition build failed: $buildOut"
@@ -3084,7 +3115,7 @@ try {
   "mix $badIdx CONST? 271828" | Out-File -Encoding ascii $dispPath2
   $env:METTLE_ML_DISP = $dispPath2
   $unpExe = Join-Path $tmpDir "ml_gate_unproven.exe"
-  $buildOut = & $CompilerPath --build --release --ml-opt "tests\ml_gate.mettle" -o $unpExe 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --release --ml-opt "tests/ml_gate.mettle" -o $unpExe 2>&1 | Out-String
   $env:METTLE_ML_DISP = $null
   if ($LASTEXITCODE -ne 0) {
     throw "ml_gate unproven-disposition build failed: $buildOut"
@@ -3113,7 +3144,7 @@ $total++
 try {
   $env:METTLE_ML_SABOTAGE = "1"
   $sabExe = Join-Path $tmpDir "ml_gate_sab.exe"
-  $buildOut = & $CompilerPath --build --release --ml-opt "examples\explain_demo\explain_demo.mettle" -o $sabExe 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --release --ml-opt "examples/explain_demo/explain_demo.mettle" -o $sabExe 2>&1 | Out-String
   $env:METTLE_ML_SABOTAGE = $null
   if ($LASTEXITCODE -ne 0) {
     throw "sabotaged --ml-opt build failed: $buildOut"
@@ -3143,12 +3174,12 @@ catch {
 # golden vectors so that failure mode is a build error instead.
 $total++
 try {
-  $obsExe = "bin\ml_obs_parity_test.exe"
-  & gcc -Wall -Wextra -std=c11 -g -O1 -Isrc -Iinclude tests\ml_obs_parity_test.c src\ir\ml_obs.c -o $obsExe -lm
+  $obsExe = "bin/ml_obs_parity_test.exe"
+  & gcc -Wall -Wextra -std=c11 -g -O1 -Isrc -Iinclude tests/ml_obs_parity_test.c src/ir/ml_obs.c -o $obsExe -lm
   if ($LASTEXITCODE -ne 0) {
     throw "Failed to compile OBS parity test"
   }
-  $obsOutput = & $obsExe "tools\mlopt\obs_golden.txt" 2>&1 | Out-String
+  $obsOutput = & $obsExe "tools/mlopt/obs_golden.txt" 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "OBS parity test failed:`n$obsOutput"
   }
@@ -3171,7 +3202,7 @@ catch {
 $total++
 try {
   $safetyExe = Join-Path $tmpDir "safety_runtime_test.exe"
-  $compileSafety = & gcc -Wall -Wextra -std=c99 -g -O1 -D_GNU_SOURCE -Isrc tests\safety_runtime_test.c src\runtime\safety.c -o $safetyExe 2>&1 | Out-String
+  $compileSafety = & gcc -Wall -Wextra -std=c99 -g -O1 -D_GNU_SOURCE -Isrc tests/safety_runtime_test.c src/runtime/safety.c -o $safetyExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Safety runtime harness compile failed: $compileSafety"
   }
@@ -3198,7 +3229,7 @@ catch {
 $total++
 try {
   $safeClean = Join-Path $tmpDir "safe_clean.exe"
-  & $CompilerPath --build --safe --release tests\test_safe_clean.mettle -o $safeClean 2>&1 | Out-Null
+  & $CompilerPath --build --safe --release tests/test_safe_clean.mettle -o $safeClean 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "--safe build of test_safe_clean failed"
   }
@@ -3209,7 +3240,7 @@ try {
 
   foreach ($case in @("test_safe_bounds_overflow", "test_safe_bounds_negative")) {
     $safeExe = Join-Path $tmpDir "$case.safe.exe"
-    & $CompilerPath --build --safe --release "tests\$case.mettle" -o $safeExe 2>&1 | Out-Null
+    & $CompilerPath --build --safe --release "tests/$case.mettle" -o $safeExe 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
       throw "--safe build of $case failed"
     }
@@ -3222,7 +3253,7 @@ try {
     }
 
     $baseExe = Join-Path $tmpDir "$case.base.exe"
-    & $CompilerPath --build --release "tests\$case.mettle" -o $baseExe 2>&1 | Out-Null
+    & $CompilerPath --build --release "tests/$case.mettle" -o $baseExe 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
       throw "baseline build of $case failed"
     }
@@ -3253,7 +3284,7 @@ try {
     $extra = $allocators[$allocator]
 
     $cleanExe = Join-Path $tmpDir "safe_heap_clean.$allocator.exe"
-    & $CompilerPath --build --safe --release @extra tests\test_safe_heap_clean.mettle -o $cleanExe 2>&1 | Out-Null
+    & $CompilerPath --build --safe --release @extra tests/test_safe_heap_clean.mettle -o $cleanExe 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
       throw "--safe build of test_safe_heap_clean failed on $allocator"
     }
@@ -3269,7 +3300,7 @@ try {
     }
     foreach ($case in $bad.Keys) {
       $exe = Join-Path $tmpDir "$case.$allocator.exe"
-      & $CompilerPath --build --safe --release @extra "tests\$case.mettle" -o $exe 2>&1 | Out-Null
+      & $CompilerPath --build --safe --release @extra "tests/$case.mettle" -o $exe 2>&1 | Out-Null
       if ($LASTEXITCODE -ne 0) {
         throw "--safe build of $case failed on $allocator"
       }
@@ -3298,7 +3329,7 @@ catch {
 $total++
 try {
   $globalCleanExe = Join-Path $tmpDir "safe_global_clean.exe"
-  & $CompilerPath --build --safe --release tests\test_safe_global_clean.mettle -o $globalCleanExe 2>&1 | Out-Null
+  & $CompilerPath --build --safe --release tests/test_safe_global_clean.mettle -o $globalCleanExe 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "--safe build of test_safe_global_clean failed"
   }
@@ -3308,7 +3339,7 @@ try {
   }
 
   $globalBadExe = Join-Path $tmpDir "safe_global_pointer.exe"
-  & $CompilerPath --build --safe --release tests\test_safe_global_pointer.mettle -o $globalBadExe 2>&1 | Out-Null
+  & $CompilerPath --build --safe --release tests/test_safe_global_pointer.mettle -o $globalBadExe 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "--safe build of test_safe_global_pointer failed"
   }
@@ -3318,7 +3349,7 @@ try {
   }
 
   $globalBaseExe = Join-Path $tmpDir "safe_global_pointer.base.exe"
-  & $CompilerPath --build --release tests\test_safe_global_pointer.mettle -o $globalBaseExe 2>&1 | Out-Null
+  & $CompilerPath --build --release tests/test_safe_global_pointer.mettle -o $globalBaseExe 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "baseline build of test_safe_global_pointer failed"
   }
@@ -3348,7 +3379,7 @@ catch {
 $total++
 try {
   $stackCleanExe = Join-Path $tmpDir "safe_stack_clean.exe"
-  & $CompilerPath --build --safe --release tests\test_safe_stack_clean.mettle -o $stackCleanExe 2>&1 | Out-Null
+  & $CompilerPath --build --safe --release tests/test_safe_stack_clean.mettle -o $stackCleanExe 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "--safe build of test_safe_stack_clean failed"
   }
@@ -3360,7 +3391,7 @@ try {
   $stackBad = @("test_safe_stack_pointer", "test_safe_stack_neighbours")
   foreach ($case in $stackBad) {
     $safeExe = Join-Path $tmpDir "$case.safe.exe"
-    & $CompilerPath --build --safe --release "tests\$case.mettle" -o $safeExe 2>&1 | Out-Null
+    & $CompilerPath --build --safe --release "tests/$case.mettle" -o $safeExe 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
       throw "--safe build of $case failed"
     }
@@ -3370,7 +3401,7 @@ try {
     }
 
     $baseExe = Join-Path $tmpDir "$case.base.exe"
-    & $CompilerPath --build --release "tests\$case.mettle" -o $baseExe 2>&1 | Out-Null
+    & $CompilerPath --build --release "tests/$case.mettle" -o $baseExe 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
       throw "baseline build of $case failed"
     }
@@ -3394,7 +3425,7 @@ catch {
 # loud in the other (a correct program accused), so both are pinned here.
 try {
   $hoistExe = Join-Path $tmpDir "test_safe_hoist_branchy.exe"
-  & $CompilerPath --build --safe --release "tests\test_safe_hoist_branchy.mettle" -o $hoistExe 2>&1 | Out-Null
+  & $CompilerPath --build --safe --release "tests/test_safe_hoist_branchy.mettle" -o $hoistExe 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "--safe build of test_safe_hoist_branchy failed"
   }
@@ -3409,7 +3440,7 @@ try {
   )
   foreach ($case in $hoistClean) {
     $exe = Join-Path $tmpDir "$($case.Name).exe"
-    & $CompilerPath --build --safe --release "tests\$($case.Name).mettle" -o $exe 2>&1 | Out-Null
+    & $CompilerPath --build --safe --release "tests/$($case.Name).mettle" -o $exe 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
       throw "--safe build of $($case.Name) failed"
     }
@@ -3437,7 +3468,7 @@ catch {
 # from the loops it exists for, so each shape is also walked one past the end.
 try {
   $affineClean = Join-Path $tmpDir "safe_affine_clean.exe"
-  & $CompilerPath --build --safe --release tests\test_safe_affine_clean.mettle -o $affineClean 2>&1 | Out-Null
+  & $CompilerPath --build --safe --release tests/test_safe_affine_clean.mettle -o $affineClean 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "--safe build of test_safe_affine_clean failed"
   }
@@ -3447,7 +3478,7 @@ try {
   }
 
   $affineShort = Join-Path $tmpDir "safe_affine_short.exe"
-  & $CompilerPath --build --safe --release tests\test_safe_affine_short.mettle -o $affineShort 2>&1 | Out-Null
+  & $CompilerPath --build --safe --release tests/test_safe_affine_short.mettle -o $affineShort 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "--safe build of test_safe_affine_short failed"
   }
@@ -3483,7 +3514,7 @@ catch {
 # reports the use-after-free -- getting that one wrong is completely silent.
 try {
   $callClean = Join-Path $tmpDir "safe_call_clean.exe"
-  & $CompilerPath --build --safe --release tests\test_safe_call_clean.mettle -o $callClean 2>&1 | Out-Null
+  & $CompilerPath --build --safe --release tests/test_safe_call_clean.mettle -o $callClean 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "--safe build of test_safe_call_clean failed"
   }
@@ -3493,7 +3524,7 @@ try {
   }
 
   $callShort = Join-Path $tmpDir "safe_call_short.exe"
-  & $CompilerPath --build --safe --release tests\test_safe_call_short.mettle -o $callShort 2>&1 | Out-Null
+  & $CompilerPath --build --safe --release tests/test_safe_call_short.mettle -o $callShort 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "--safe build of test_safe_call_short failed"
   }
@@ -3503,7 +3534,7 @@ try {
   }
 
   $callFrees = Join-Path $tmpDir "safe_call_frees.exe"
-  & $CompilerPath --build --safe --release tests\test_safe_call_frees.mettle -o $callFrees 2>&1 | Out-Null
+  & $CompilerPath --build --safe --release tests/test_safe_call_frees.mettle -o $callFrees 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "--safe build of test_safe_call_frees failed"
   }
@@ -3588,7 +3619,7 @@ try {
               "test_safe_vec_map")
   foreach ($shape in $shapes) {
     $safeExe = Join-Path $tmpDir "$shape.safe.exe"
-    & $CompilerPath --build --safe --release "tests\$shape.mettle" -o $safeExe 2>&1 | Out-Null
+    & $CompilerPath --build --safe --release "tests/$shape.mettle" -o $safeExe 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
       throw "--safe build of $shape failed"
     }
@@ -3601,7 +3632,7 @@ try {
     }
 
     $baseExe = Join-Path $tmpDir "$shape.base.exe"
-    & $CompilerPath --build --release "tests\$shape.mettle" -o $baseExe 2>&1 | Out-Null
+    & $CompilerPath --build --release "tests/$shape.mettle" -o $baseExe 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
       throw "baseline build of $shape failed"
     }
@@ -3626,7 +3657,7 @@ catch {
 $total++
 try {
   $hoistExe = Join-Path $tmpDir "safe_hoist_clean.exe"
-  & $CompilerPath --build --safe --release tests\test_safe_hoist_clean.mettle -o $hoistExe 2>&1 | Out-Null
+  & $CompilerPath --build --safe --release tests/test_safe_hoist_clean.mettle -o $hoistExe 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "--safe build of test_safe_hoist_clean failed"
   }
@@ -3641,7 +3672,7 @@ try {
   # needs, so a range one byte too large rejects a correct program, and the
   # short version proves a range one byte too small would miss the overrun.
   $exactExe = Join-Path $tmpDir "safe_hoist_counters.exe"
-  & $CompilerPath --build --safe --release tests\test_safe_hoist_counters.mettle -o $exactExe 2>&1 | Out-Null
+  & $CompilerPath --build --safe --release tests/test_safe_hoist_counters.mettle -o $exactExe 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "--safe build of test_safe_hoist_counters failed"
   }
@@ -3651,7 +3682,7 @@ try {
   }
 
   $shortExe = Join-Path $tmpDir "safe_hoist_counters_short.exe"
-  & $CompilerPath --build --safe --release tests\test_safe_hoist_counters_short.mettle -o $shortExe 2>&1 | Out-Null
+  & $CompilerPath --build --safe --release tests/test_safe_hoist_counters_short.mettle -o $shortExe 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "--safe build of test_safe_hoist_counters_short failed"
   }
@@ -3667,7 +3698,7 @@ try {
   # not from any loop counter, and the table is exactly the size the mask
   # allows, so a range one byte too large rejects a correct program.
   $maskExe = Join-Path $tmpDir "safe_masked_index.exe"
-  & $CompilerPath --build --safe --release tests\test_safe_masked_index.mettle -o $maskExe 2>&1 | Out-Null
+  & $CompilerPath --build --safe --release tests/test_safe_masked_index.mettle -o $maskExe 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "--safe build of test_safe_masked_index failed"
   }
@@ -3677,7 +3708,7 @@ try {
   }
 
   $maskShortExe = Join-Path $tmpDir "safe_masked_index_short.exe"
-  & $CompilerPath --build --safe --release tests\test_safe_masked_index_short.mettle -o $maskShortExe 2>&1 | Out-Null
+  & $CompilerPath --build --safe --release tests/test_safe_masked_index_short.mettle -o $maskShortExe 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "--safe build of test_safe_masked_index_short failed"
   }
@@ -3707,7 +3738,7 @@ try {
     }
   }
 
-  $buildOut = & $CompilerPath --build --linker internal --release --native-heap --dump-ir "tests\test_native_heap.mettle" -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --linker internal --release --native-heap --dump-ir "tests/test_native_heap.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "native-heap build failed: $buildOut"
   }
@@ -3750,7 +3781,7 @@ try {
     }
   }
 
-  $buildOut = & $CompilerPath --build --linker internal --release "tests\test_native_heap_threads.mettle" -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --linker internal --release "tests/test_native_heap_threads.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "native-heap threads build failed: $buildOut"
   }
@@ -3780,7 +3811,7 @@ foreach ($surfaceMode in @("debug", "release")) {
     if (Test-Path $exePath) { Remove-Item -Path $exePath -Force -ErrorAction SilentlyContinue }
     $surfaceFlags = @("--build", "--linker", "internal")
     if ($surfaceMode -eq "release") { $surfaceFlags += "--release" }
-    $buildOut = & $CompilerPath @surfaceFlags "tests\test_surface_conversions.mettle" -o $exePath 2>&1 | Out-String
+    $buildOut = & $CompilerPath @surfaceFlags "tests/test_surface_conversions.mettle" -o $exePath 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw "surface conversions build ($surfaceMode) failed: $buildOut" }
     $runOut = & $exePath 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw "surface conversions ($surfaceMode) exited with $LASTEXITCODE`: $runOut" }
@@ -3804,7 +3835,7 @@ foreach ($mathMode in @("debug", "release")) {
     if (Test-Path $exePath) { Remove-Item -Path $exePath -Force -ErrorAction SilentlyContinue }
     $mathFlags = @("--build", "--linker", "internal")
     if ($mathMode -eq "release") { $mathFlags += "--release" }
-    $buildOut = & $CompilerPath @mathFlags "tests\test_runtime_float_math.mettle" -o $exePath 2>&1 | Out-String
+    $buildOut = & $CompilerPath @mathFlags "tests/test_runtime_float_math.mettle" -o $exePath 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw "runtime float math build ($mathMode) failed: $buildOut" }
     $runOut = & $exePath 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw "runtime float math ($mathMode) exited with $LASTEXITCODE`: $runOut" }
@@ -3822,8 +3853,8 @@ foreach ($mathMode in @("debug", "release")) {
 # existed, because nothing ran them optimized. The property is agreement
 # between the two builds, not a particular exit code: these programs return a
 # computed value.
-foreach ($coercionProgram in @("tests\test_string_cstring_coercions.mettle",
-                               "tests\test_extern_string_auto_cstring.mettle")) {
+foreach ($coercionProgram in @("tests/test_string_cstring_coercions.mettle",
+                               "tests/test_extern_string_auto_cstring.mettle")) {
   $total++
   $coercionName = "release_parity_" + [System.IO.Path]::GetFileNameWithoutExtension($coercionProgram)
   try {
@@ -3860,7 +3891,7 @@ $total++
 try {
   $exePath = Join-Path $tmpDir "alloc_doublefree.exe"
   if (Test-Path $exePath) { Remove-Item -Path $exePath -Force -ErrorAction SilentlyContinue }
-  $buildOut = & $CompilerPath --build --linker internal --release "tests\test_alloc_doublefree.mettle" -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --linker internal --release "tests/test_alloc_doublefree.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "alloc doublefree build failed: $buildOut" }
   $runOut = & $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "alloc doublefree exited with $LASTEXITCODE`: $runOut" }
@@ -3879,20 +3910,20 @@ catch {
 # observable behavior. This is the broad reliability proof that the rewrite is
 # correct across many real programs, not just the dedicated cases above.
 $nativeHeapParityPrograms = @(
-  "tests\test_gc_alloc.mettle",
-  "tests\test_gc_alloc_fixed.mettle",
-  "tests\test_generics_new_heap.mettle",
-  "tests\test_generics_full.mettle",
-  "tests\test_generics_return_struct.mettle",
-  "tests\test_generics_nested_struct.mettle",
-  "tests\test_generics_in_control_flow.mettle",
-  "tests\test_generics_float.mettle",
-  "tests\test_large_db_cache_loop.mettle",
-  "tests\test_arena_basic.mettle",
-  "tests\test_arena_oversized.mettle",
-  "tests\test_arena_savepoint.mettle",
-  "tests\test_arena_reset_reuse.mettle",
-  "tests\test_arena_align.mettle"
+  "tests/test_gc_alloc.mettle",
+  "tests/test_gc_alloc_fixed.mettle",
+  "tests/test_generics_new_heap.mettle",
+  "tests/test_generics_full.mettle",
+  "tests/test_generics_return_struct.mettle",
+  "tests/test_generics_nested_struct.mettle",
+  "tests/test_generics_in_control_flow.mettle",
+  "tests/test_generics_float.mettle",
+  "tests/test_large_db_cache_loop.mettle",
+  "tests/test_arena_basic.mettle",
+  "tests/test_arena_oversized.mettle",
+  "tests/test_arena_savepoint.mettle",
+  "tests/test_arena_reset_reuse.mettle",
+  "tests/test_arena_align.mettle"
 )
 foreach ($prog in $nativeHeapParityPrograms) {
   $total++
@@ -3927,18 +3958,18 @@ foreach ($prog in $nativeHeapParityPrograms) {
 $total++
 try {
   $genericRuntimeCases = @(
-    @{ Path = "tests\test_generics_nested_struct.mettle"; ExitCode = 99; Label = "nested-struct" },
-    @{ Path = "tests\test_generics_generic_enum.mettle"; ExitCode = 42; Label = "generic-enum" },
-    @{ Path = "tests\test_generics_return_struct.mettle"; ExitCode = 30; Label = "return-struct" },
-    @{ Path = "tests\test_generics_float.mettle"; ExitCode = 4; Label = "float" },
-    @{ Path = "tests\test_generics_new_heap.mettle"; ExitCode = 42; Label = "new-heap" },
-    @{ Path = "tests\test_generics_full.mettle"; ExitCode = 30; Label = "full" },
-    @{ Path = "tests\test_generics_in_control_flow.mettle"; ExitCode = 24; Label = "control-flow" },
-    @{ Path = "tests\test_generics_struct_methods.mettle"; ExitCode = 155; Label = "struct-methods" },
-    @{ Path = "tests\test_generics_method_body_instantiation.mettle"; ExitCode = 42; Label = "method-body-instantiation" },
-    @{ Path = "tests\test_method_pointer_receiver.mettle"; ExitCode = 42; Label = "pointer-receiver" },
-    @{ Path = "tests\test_generics_struct_field.mettle"; ExitCode = 42; Label = "struct-field-ordering" },
-    @{ Path = "tests\test_trait_methods_generic_dispatch.mettle"; ExitCode = 42; Label = "trait-dispatch" }
+    @{ Path = "tests/test_generics_nested_struct.mettle"; ExitCode = 99; Label = "nested-struct" },
+    @{ Path = "tests/test_generics_generic_enum.mettle"; ExitCode = 42; Label = "generic-enum" },
+    @{ Path = "tests/test_generics_return_struct.mettle"; ExitCode = 30; Label = "return-struct" },
+    @{ Path = "tests/test_generics_float.mettle"; ExitCode = 4; Label = "float" },
+    @{ Path = "tests/test_generics_new_heap.mettle"; ExitCode = 42; Label = "new-heap" },
+    @{ Path = "tests/test_generics_full.mettle"; ExitCode = 30; Label = "full" },
+    @{ Path = "tests/test_generics_in_control_flow.mettle"; ExitCode = 24; Label = "control-flow" },
+    @{ Path = "tests/test_generics_struct_methods.mettle"; ExitCode = 155; Label = "struct-methods" },
+    @{ Path = "tests/test_generics_method_body_instantiation.mettle"; ExitCode = 42; Label = "method-body-instantiation" },
+    @{ Path = "tests/test_method_pointer_receiver.mettle"; ExitCode = 42; Label = "pointer-receiver" },
+    @{ Path = "tests/test_generics_struct_field.mettle"; ExitCode = 42; Label = "struct-field-ordering" },
+    @{ Path = "tests/test_trait_methods_generic_dispatch.mettle"; ExitCode = 42; Label = "trait-dispatch" }
   )
 
   foreach ($case in $genericRuntimeCases) {
@@ -3974,10 +4005,10 @@ try {
     $label = if ($mode -eq "") { "debug" } else { "release" }
     $exePath = Join-Path $tmpDir ("global_aggregates_and_fnptr_{0}.exe" -f $label)
     if ($mode -eq "") {
-      $buildOut = & $CompilerPath --build --linker internal "tests\test_global_aggregates_and_fnptr.mettle" -o $exePath 2>&1 | Out-String
+      $buildOut = & $CompilerPath --build --linker internal "tests/test_global_aggregates_and_fnptr.mettle" -o $exePath 2>&1 | Out-String
     }
     else {
-      $buildOut = & $CompilerPath --build --linker internal --release "tests\test_global_aggregates_and_fnptr.mettle" -o $exePath 2>&1 | Out-String
+      $buildOut = & $CompilerPath --build --linker internal --release "tests/test_global_aggregates_and_fnptr.mettle" -o $exePath 2>&1 | Out-String
     }
     if ($LASTEXITCODE -ne 0) {
       throw "global aggregates $label build failed: $buildOut"
@@ -4004,7 +4035,7 @@ catch {
 $total++
 try {
   $exePath = Join-Path $tmpDir "runtime_symbol_override.exe"
-  $buildOut = & $CompilerPath --build --linker internal -I tests/lib "tests\test_runtime_symbol_override.mettle" -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --linker internal -I tests/lib "tests/test_runtime_symbol_override.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "runtime symbol override build failed: $buildOut"
   }
@@ -4052,10 +4083,10 @@ try {
     $label = if ($mode -eq "") { "debug" } else { "release" }
     $exePath = Join-Path $tmpDir ("word_sized_global_aggregate_{0}.exe" -f $label)
     if ($mode -eq "") {
-      $buildOut = & $CompilerPath --build --linker internal "tests\test_word_sized_global_aggregate.mettle" -o $exePath 2>&1 | Out-String
+      $buildOut = & $CompilerPath --build --linker internal "tests/test_word_sized_global_aggregate.mettle" -o $exePath 2>&1 | Out-String
     }
     else {
-      $buildOut = & $CompilerPath --build --linker internal --release "tests\test_word_sized_global_aggregate.mettle" -o $exePath 2>&1 | Out-String
+      $buildOut = & $CompilerPath --build --linker internal --release "tests/test_word_sized_global_aggregate.mettle" -o $exePath 2>&1 | Out-String
     }
     if ($LASTEXITCODE -ne 0) {
       throw "word-sized global aggregate $label build failed: $buildOut"
@@ -4083,10 +4114,10 @@ try {
     $label = if ($mode -eq "") { "debug" } else { "release" }
     $exePath = Join-Path $tmpDir ("aggregate_literals_{0}.exe" -f $label)
     if ($mode -eq "") {
-      $buildOut = & $CompilerPath --build --linker internal "tests\test_aggregate_literals.mettle" -o $exePath 2>&1 | Out-String
+      $buildOut = & $CompilerPath --build --linker internal "tests/test_aggregate_literals.mettle" -o $exePath 2>&1 | Out-String
     }
     else {
-      $buildOut = & $CompilerPath --build --linker internal --release "tests\test_aggregate_literals.mettle" -o $exePath 2>&1 | Out-String
+      $buildOut = & $CompilerPath --build --linker internal --release "tests/test_aggregate_literals.mettle" -o $exePath 2>&1 | Out-String
     }
     if ($LASTEXITCODE -ne 0) {
       throw "aggregate literals $label build failed: $buildOut"
@@ -4112,10 +4143,10 @@ try {
     $label = if ($mode -eq "") { "debug" } else { "release" }
     $exePath = Join-Path $tmpDir ("struct_return_to_field_{0}.exe" -f $label)
     if ($mode -eq "") {
-      $buildOut = & $CompilerPath --build --linker internal "tests\test_struct_return_to_field.mettle" -o $exePath 2>&1 | Out-String
+      $buildOut = & $CompilerPath --build --linker internal "tests/test_struct_return_to_field.mettle" -o $exePath 2>&1 | Out-String
     }
     else {
-      $buildOut = & $CompilerPath --build --linker internal --release "tests\test_struct_return_to_field.mettle" -o $exePath 2>&1 | Out-String
+      $buildOut = & $CompilerPath --build --linker internal --release "tests/test_struct_return_to_field.mettle" -o $exePath 2>&1 | Out-String
     }
     if ($LASTEXITCODE -ne 0) {
       throw "struct-return $label build failed: $buildOut"
@@ -4142,10 +4173,10 @@ try {
     $label = if ($mode -eq "") { "debug" } else { "release" }
     $exePath = Join-Path $tmpDir ("opt_nested_loop_variable_bound_{0}.exe" -f $label)
     if ($mode -eq "") {
-      $buildOut = & $CompilerPath --build --linker internal "tests\test_opt_nested_loop_variable_bound.mettle" -o $exePath 2>&1 | Out-String
+      $buildOut = & $CompilerPath --build --linker internal "tests/test_opt_nested_loop_variable_bound.mettle" -o $exePath 2>&1 | Out-String
     }
     else {
-      $buildOut = & $CompilerPath --build --linker internal --release "tests\test_opt_nested_loop_variable_bound.mettle" -o $exePath 2>&1 | Out-String
+      $buildOut = & $CompilerPath --build --linker internal --release "tests/test_opt_nested_loop_variable_bound.mettle" -o $exePath 2>&1 | Out-String
     }
     if ($LASTEXITCODE -ne 0) {
       throw "nested-loop unroll $label build failed: $buildOut"
@@ -4172,10 +4203,10 @@ try {
     $label = if ($mode -eq "") { "debug" } else { "release" }
     $exePath = Join-Path $tmpDir ("std_math_{0}.exe" -f $label)
     if ($mode -eq "") {
-      $buildOut = & $CompilerPath --build --linker internal "tests\test_std_math.mettle" -o $exePath 2>&1 | Out-String
+      $buildOut = & $CompilerPath --build --linker internal "tests/test_std_math.mettle" -o $exePath 2>&1 | Out-String
     }
     else {
-      $buildOut = & $CompilerPath --build --linker internal --release "tests\test_std_math.mettle" -o $exePath 2>&1 | Out-String
+      $buildOut = & $CompilerPath --build --linker internal --release "tests/test_std_math.mettle" -o $exePath 2>&1 | Out-String
     }
     if ($LASTEXITCODE -ne 0) {
       throw "std/math $label build failed: $buildOut"
@@ -4202,7 +4233,7 @@ catch {
 $total++
 try {
   $exePath = Join-Path $tmpDir "opt_fused_loop_threaded_exit.exe"
-  $buildOut = & $CompilerPath --build --release "tests\test_opt_fused_loop_threaded_exit.mettle" -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --release "tests/test_opt_fused_loop_threaded_exit.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "threaded-exit regression build failed: $buildOut"
   }
@@ -4224,7 +4255,7 @@ catch {
 $total++
 try {
   $exePath = Join-Path $tmpDir "regalloc_argreg_call_pressure.exe"
-  $buildOut = & $CompilerPath --build --release "tests\test_regalloc_argreg_call_pressure.mettle" -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --release "tests/test_regalloc_argreg_call_pressure.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "argreg pressure build failed: $buildOut"
   }
@@ -4249,7 +4280,7 @@ catch {
 $total++
 try {
   $exePath = Join-Path $tmpDir "call_many_args_frame.exe"
-  $buildOut = & $CompilerPath --build "tests\test_call_many_args_frame.mettle" -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build "tests/test_call_many_args_frame.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "wide-call frame build failed: $buildOut"
   }
@@ -4276,7 +4307,7 @@ foreach ($globalFloatMode in @("debug", "release")) {
     $exePath = Join-Path $tmpDir "global_float_var_$globalFloatMode.exe"
     $buildArgs = @()
     if ($globalFloatMode -eq "release") { $buildArgs += "--release" }
-    $buildArgs += @("--build", "tests\test_global_float_var.mettle", "-o", $exePath)
+    $buildArgs += @("--build", "tests/test_global_float_var.mettle", "-o", $exePath)
     $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
       throw "Global float var ($globalFloatMode) build failed: $buildOut"
@@ -4300,7 +4331,7 @@ foreach ($globalFloatMode in @("debug", "release")) {
 $total++
 try {
   $exePath = Join-Path $tmpDir "switch_range.exe"
-  $buildOut = & $CompilerPath --build "tests\test_switch_range.mettle" -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build "tests/test_switch_range.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Switch range build failed: $buildOut"
   }
@@ -4324,7 +4355,7 @@ catch {
 $total++
 try {
   $exePath = Join-Path $tmpDir "crash_null_offset.exe"
-  $buildOut = & $CompilerPath --build "tests\debug_crash.mettle" -o $exePath -s 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build "tests/debug_crash.mettle" -o $exePath -s 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "Build failed: $buildOut" }
   $runOut = & $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -eq 0) { throw "Expected the program to crash" }
@@ -4345,7 +4376,7 @@ catch {
 $total++
 try {
   $exePath = Join-Path $tmpDir "crash_uaf_large.exe"
-  $buildOut = & $CompilerPath --build "tests\crash_uaf_large.mettle" -o $exePath -s --native-heap 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build "tests/crash_uaf_large.mettle" -o $exePath -s --native-heap 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "Build failed: $buildOut" }
   $runOut = & $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -eq 0) { throw "Expected the program to crash" }
@@ -4364,7 +4395,7 @@ catch {
 $total++
 try {
   $exePath = Join-Path $tmpDir "crash_waf_small.exe"
-  $buildOut = & $CompilerPath --build "tests\crash_waf_small.mettle" -o $exePath --native-heap 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build "tests/crash_waf_small.mettle" -o $exePath --native-heap 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "Build failed: $buildOut" }
   $runOut = & $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 134) { throw "Expected exit 134, got $LASTEXITCODE" }
@@ -4383,7 +4414,7 @@ catch {
 $total++
 try {
   $exePath = Join-Path $tmpDir "debug_hooks_standalone.exe"
-  $buildOut = & $CompilerPath --build "tests\debug_demo.mettle" -o $exePath --debug-hooks 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build "tests/debug_demo.mettle" -o $exePath --debug-hooks 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Debug-hooks build failed: $buildOut"
   }
@@ -4411,20 +4442,20 @@ try {
   # the harness tmp dir persists across suite runs: a stale baseline would
   # make the "first build" assertion see a changes section
   Get-ChildItem $exDir -File -ErrorAction SilentlyContinue | Remove-Item -Force -Confirm:$false
-  Copy-Item "tests\explain_demo.mettle" "$exDir\demo.mettle" -Force
+  Copy-Item "tests/explain_demo.mettle" "$exDir/demo.mettle" -Force
   $exOut = Join-Path $exDir "demo.obj"
   $env:METTLE_EXPLAIN_REPORT_LINES = "0"
-  $run1 = cmd /c "`"$((Resolve-Path $CompilerPath).Path)`" -i `"$exDir\demo.mettle`" -o `"$exOut`" --release --explain-json 2>&1" | Out-String
+  $run1 = cmd /c "`"$((Resolve-Path $CompilerPath).Path)`" -i `"$exDir/demo.mettle`" -o `"$exOut`" --release --explain-json 2>&1" | Out-String
   if ($run1 -match 'changes since the last explain build') {
     throw "First build must not have a changes section"
   }
-  $run2 = cmd /c "`"$((Resolve-Path $CompilerPath).Path)`" -i `"$exDir\demo.mettle`" -o `"$exOut`" --release --explain-json 2>&1" | Out-String
+  $run2 = cmd /c "`"$((Resolve-Path $CompilerPath).Path)`" -i `"$exDir/demo.mettle`" -o `"$exOut`" --release --explain-json 2>&1" | Out-String
   if ($run2 -notmatch 'no optimization changes since the last explain build') {
     throw "Identical rebuild must report no changes"
   }
-  (Get-Content "$exDir\demo.mettle" -Raw) -replace 'fn scale\(x: float32\)', '@noinline fn scale(x: float32)' |
-    Set-Content "$exDir\demo.mettle" -Encoding ascii -NoNewline
-  $run3 = cmd /c "`"$((Resolve-Path $CompilerPath).Path)`" -i `"$exDir\demo.mettle`" -o `"$exOut`" --release --explain-json 2>&1" | Out-String
+  (Get-Content "$exDir/demo.mettle" -Raw) -replace 'fn scale\(x: float32\)', '@noinline fn scale(x: float32)' |
+    Set-Content "$exDir/demo.mettle" -Encoding ascii -NoNewline
+  $run3 = cmd /c "`"$((Resolve-Path $CompilerPath).Path)`" -i `"$exDir/demo.mettle`" -o `"$exOut`" --release --explain-json 2>&1" | Out-String
   if ($run3 -notmatch 'REGRESSED' -or $run3 -notmatch 'was vectorized, now scalar') {
     throw "De-inlined scale must report a loop regression. Output: $($run3.Substring(0, [Math]::Min(600, $run3.Length)))"
   }
@@ -4512,7 +4543,7 @@ try {
   New-Item -ItemType Directory $exDir -Force | Out-Null
   $exOut = Join-Path $exDir "borrow.obj"
   $env:METTLE_EXPLAIN_REPORT_LINES = "0"
-  $memRun = & $CompilerPath -i "tests\warn_borrow_scope.mettle" -o $exOut --release --explain --explain-json 2>&1 | Out-String
+  $memRun = & $CompilerPath -i "tests/warn_borrow_scope.mettle" -o $exOut --release --explain --explain-json 2>&1 | Out-String
   if ($memRun -notmatch '-- memory report:') {
     throw "Prose memory report section missing. Output: $($memRun.Substring(0, [Math]::Min(600, $memRun.Length)))"
   }
@@ -4539,7 +4570,7 @@ catch {
 $total++
 try {
   $exePath = Join-Path $tmpDir "const_top_level.exe"
-  $buildOut = & $CompilerPath --build "tests\test_const_top_level.mettle" -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build "tests/test_const_top_level.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Const top-level build failed: $buildOut"
   }
@@ -4561,7 +4592,7 @@ catch {
 $total++
 try {
   $exePath = Join-Path $tmpDir "const_local_float_string.exe"
-  $buildOut = & $CompilerPath --build "tests\test_const_local_float_string.mettle" -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build "tests/test_const_local_float_string.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Local non-integer const build failed: $buildOut"
   }
@@ -4585,7 +4616,7 @@ catch {
 $total++
 try {
   $exePath = Join-Path $tmpDir "const_global_float_string.exe"
-  $buildOut = & $CompilerPath --build "tests\test_const_global_float_string.mettle" -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build "tests/test_const_global_float_string.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Global non-integer const build failed: $buildOut"
   }
@@ -4607,7 +4638,7 @@ catch {
 $total++
 try {
   $exePath = Join-Path $tmpDir "import_conditional.exe"
-  $buildOut = & $CompilerPath --build "tests\test_import_conditional.mettle" -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build "tests/test_import_conditional.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Conditional import build failed: $buildOut"
   }
@@ -4629,7 +4660,7 @@ catch {
 $total++
 try {
   $exePath = Join-Path $tmpDir "defer_by_value.exe"
-  $buildOut = & $CompilerPath --build "tests\test_defer_by_value.mettle" -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build "tests/test_defer_by_value.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Defer by-value build failed: $buildOut"
   }
@@ -4745,7 +4776,7 @@ try {
   $depsSource = Join-Path $depsProjectDir "main.mettle"
   $depsObj = Join-Path $depsProjectDir "main.obj"
   $depsFile = Join-Path $depsProjectDir "mettle.deps"
-  $packageRoot = Join-Path $repoRoot "tests\lib"
+  $packageRoot = Join-Path $repoRoot "tests/lib"
 
   "testpkg=$packageRoot" | Set-Content -Path $depsFile -Encoding ASCII
   @'
@@ -4784,7 +4815,7 @@ $total++
 try {
   $fpExe = Join-Path $tmpDir "test_function_pointer.exe"
 
-  $fpOut = & $CompilerPath --build tests\test_function_pointer.mettle -o $fpExe 2>&1 | Out-String
+  $fpOut = & $CompilerPath --build tests/test_function_pointer.mettle -o $fpExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Function pointer build failed: $fpOut"
   }
@@ -4806,7 +4837,7 @@ $total++
 try {
   $structNewExe = Join-Path $tmpDir "test_struct_new_zeroed.exe"
 
-  $structNewOut = & $CompilerPath --build --linker internal tests\test_struct_new_zeroed.mettle -o $structNewExe 2>&1 | Out-String
+  $structNewOut = & $CompilerPath --build --linker internal tests/test_struct_new_zeroed.mettle -o $structNewExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Struct new build failed: $structNewOut"
   }
@@ -4833,7 +4864,7 @@ try {
   $objPath = Join-Path $tmpDir "test_direct_object_return_const.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_return_const.exe"
 
-  $objOut = & $CompilerPath --emit-obj tests\test_direct_object_return_const.mettle -o $objPath 2>&1 | Out-String
+  $objOut = & $CompilerPath --emit-obj tests/test_direct_object_return_const.mettle -o $objPath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object compile failed: $objOut"
   }
@@ -4849,7 +4880,7 @@ try {
     throw "Direct object symbol table did not contain main"
   }
 
-  $buildOut = & $CompilerPath --build --emit-obj tests\test_direct_object_return_const.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --emit-obj tests/test_direct_object_return_const.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object build failed: $buildOut"
   }
@@ -4875,7 +4906,7 @@ try {
   $objPath = Join-Path $tmpDir "test_direct_object_call_return.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_call_return.exe"
 
-  $objOut = & $CompilerPath --emit-obj tests\test_direct_object_call_return.mettle -o $objPath 2>&1 | Out-String
+  $objOut = & $CompilerPath --emit-obj tests/test_direct_object_call_return.mettle -o $objPath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object call compile failed: $objOut"
   }
@@ -4891,7 +4922,7 @@ try {
     throw "Direct object relocation table did not contain a REL32 call to callee"
   }
 
-  $buildOut = & $CompilerPath --build --emit-obj tests\test_direct_object_call_return.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --emit-obj tests/test_direct_object_call_return.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object call build failed: $buildOut"
   }
@@ -4923,7 +4954,7 @@ foreach ($relFlag in @($true, $false)) {
     $exePath = Join-Path $tmpDir "test_opt_closed_form_sum_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($relFlag) { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_opt_closed_form_sum.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_opt_closed_form_sum.mettle", "-o", $exePath)
 
     $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
@@ -4961,7 +4992,7 @@ foreach ($relFlag in @($true, $false)) {
     $exePath = Join-Path $tmpDir "test_opt_ptr_induction_two_loops_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($relFlag) { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_opt_ptr_induction_two_loops.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_opt_ptr_induction_two_loops.mettle", "-o", $exePath)
 
     $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
@@ -5001,7 +5032,7 @@ foreach ($relFlag in @($true, $false)) {
     $exePath = Join-Path $tmpDir "test_mir_rotate_backedge_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($relFlag) { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_mir_rotate_backedge.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_mir_rotate_backedge.mettle", "-o", $exePath)
 
     $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
@@ -5040,7 +5071,7 @@ foreach ($relFlag in @($true, $false)) {
     $exePath = Join-Path $tmpDir "test_local_shadows_global_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($relFlag) { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_local_shadows_global.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_local_shadows_global.mettle", "-o", $exePath)
 
     $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
@@ -5074,7 +5105,7 @@ foreach ($relFlag in @($true, $false)) {
     $exePath = Join-Path $tmpDir "test_scoped_shadowing_$variant.exe"
     $buildArgs = @("--build")
     if ($relFlag) { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_scoped_shadowing.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_scoped_shadowing.mettle", "-o", $exePath)
 
     $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
@@ -5108,7 +5139,7 @@ foreach ($relFlag in @($true, $false)) {
     $exePath = Join-Path $tmpDir "test_mir_scratch_clobber_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($relFlag) { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_mir_scratch_clobber.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_mir_scratch_clobber.mettle", "-o", $exePath)
 
     $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
@@ -5142,7 +5173,7 @@ foreach ($relFlag in @($true, $false)) {
     $exePath = Join-Path $tmpDir "test_opt_tail_recursion_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($relFlag) { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_opt_tail_recursion.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_opt_tail_recursion.mettle", "-o", $exePath)
 
     $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
@@ -5177,7 +5208,7 @@ foreach ($relFlag in @($true, $false)) {
     $exePath = Join-Path $tmpDir "test_opt_readonly_global_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($relFlag) { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_opt_readonly_global.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_opt_readonly_global.mettle", "-o", $exePath)
 
     $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
@@ -5210,7 +5241,7 @@ foreach ($relFlag in @($true, $false)) {
     $exePath = Join-Path $tmpDir "test_opt_gather_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($relFlag) { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_opt_gather.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_opt_gather.mettle", "-o", $exePath)
 
     $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
@@ -5244,7 +5275,7 @@ foreach ($relFlag in @($true, $false)) {
     $exePath = Join-Path $tmpDir "test_opt_layout_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($relFlag) { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_opt_layout.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_opt_layout.mettle", "-o", $exePath)
 
     $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
@@ -5280,7 +5311,7 @@ foreach ($relFlag in @($true, $false)) {
     $exePath = Join-Path $tmpDir "test_float32_narrowing_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($relFlag) { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_float32_narrowing.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_float32_narrowing.mettle", "-o", $exePath)
 
     $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
@@ -5315,7 +5346,7 @@ foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")
     $exePath = Join-Path $tmpDir "test_shared_scaled_index_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -like "release*") { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_shared_scaled_index.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_shared_scaled_index.mettle", "-o", $exePath)
 
     if ($variant -like "*_fallback") { $env:METTLE_MIR = "0" }
     try {
@@ -5353,7 +5384,7 @@ foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")
     $exePath = Join-Path $tmpDir "test_float_narrowing_paths_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -like "release*") { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_float_narrowing_paths.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_float_narrowing_paths.mettle", "-o", $exePath)
 
     # *_fallback routes every function to the legacy backend; the
     # inliner-param shape only miscompiled there (release_fallback = the
@@ -5394,7 +5425,7 @@ foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")
     $exePath = Join-Path $tmpDir "test_mir_float_call_args_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -like "release*") { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_mir_float_call_args.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_mir_float_call_args.mettle", "-o", $exePath)
 
     if ($variant -like "*_fallback") { $env:METTLE_MIR = "0" }
     try {
@@ -5430,7 +5461,7 @@ foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")
     $exePath = Join-Path $tmpDir "test_mir_fill_passthrough_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -like "release*") { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_mir_fill_passthrough.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_mir_fill_passthrough.mettle", "-o", $exePath)
 
     if ($variant -like "*_fallback") { $env:METTLE_MIR = "0" }
     try {
@@ -5468,7 +5499,7 @@ foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")
     $exePath = Join-Path $tmpDir "test_mir_global_aggregate_addr_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -like "release*") { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_mir_global_aggregate_addr.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_mir_global_aggregate_addr.mettle", "-o", $exePath)
 
     if ($variant -like "*_fallback") { $env:METTLE_MIR = "0" }
     try {
@@ -5504,7 +5535,7 @@ foreach ($variant in @("release", "debug", "no_vec", "no_accum", "no_hoist", "no
     $exePath = Join-Path $tmpDir "test_vloop_select_stress_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -ne "debug") { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_vloop_select_stress.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_vloop_select_stress.mettle", "-o", $exePath)
 
     $skip = $null
     if ($variant -eq "no_vec") { $skip = "auto_vectorize_int" }
@@ -5542,7 +5573,7 @@ foreach ($variant in @("release", "debug", "release_scalar")) {
     $exePath = Join-Path $tmpDir "test_predicated_accumulate_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -like "release*") { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_predicated_accumulate.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_predicated_accumulate.mettle", "-o", $exePath)
 
     if ($variant -eq "release_scalar") { $env:METTLE_SKIP_PASS = "if_convert_accumulate" }
     try {
@@ -5573,7 +5604,7 @@ $total++
 try {
   $exePath = Join-Path $tmpDir "test_predicated_accumulate_cover.exe"
   $coverOut = & $CompilerPath "--build" "--emit-obj" "--linker" "internal" "--release" `
-    "--explain" "tests\test_predicated_accumulate.mettle" "-o" $exePath 2>&1 | Out-String
+    "--explain" "tests/test_predicated_accumulate.mettle" "-o" $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "predicated-accumulate coverage build failed: $coverOut"
   }
@@ -5604,7 +5635,7 @@ foreach ($variant in @("release", "debug")) {
     $exePath = Join-Path $tmpDir "test_compare_as_value_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -eq "release") { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_compare_as_value.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_compare_as_value.mettle", "-o", $exePath)
     $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
       throw "compare-as-value build ($variant) failed: $buildOut"
@@ -5625,7 +5656,7 @@ $total++
 try {
   $exePath = Join-Path $tmpDir "test_compare_as_value_cover.exe"
   $coverOut = & $CompilerPath "--build" "--emit-obj" "--linker" "internal" "--release" `
-    "--explain" "tests\test_compare_as_value.mettle" "-o" $exePath 2>&1 | Out-String
+    "--explain" "tests/test_compare_as_value.mettle" "-o" $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "compare-as-value coverage build failed: $coverOut"
   }
@@ -5651,7 +5682,7 @@ foreach ($variant in @("release", "debug")) {
     $exePath = Join-Path $tmpDir "test_sum_base_any_name_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -eq "release") { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_sum_base_any_name.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_sum_base_any_name.mettle", "-o", $exePath)
     $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
       throw "sum-base-any-name build ($variant) failed: $buildOut"
@@ -5672,7 +5703,7 @@ $total++
 try {
   $exePath = Join-Path $tmpDir "test_sum_base_any_name_cover.exe"
   $coverOut = & $CompilerPath "--build" "--emit-obj" "--linker" "internal" "--release" `
-    "--explain" "tests\test_sum_base_any_name.mettle" "-o" $exePath 2>&1 | Out-String
+    "--explain" "tests/test_sum_base_any_name.mettle" "-o" $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "sum-base-any-name coverage build failed: $coverOut"
   }
@@ -5697,7 +5728,7 @@ foreach ($variant in @("release", "debug", "release_scalar")) {
     $exePath = Join-Path $tmpDir "test_hoist_global_bases_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -like "release*") { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_hoist_global_bases.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_hoist_global_bases.mettle", "-o", $exePath)
 
     if ($variant -eq "release_scalar") { $env:METTLE_SKIP_PASS = "hoist_global_bases" }
     try {
@@ -5728,7 +5759,7 @@ $total++
 try {
   $exePath = Join-Path $tmpDir "test_hoist_global_bases_cover.exe"
   $coverOut = & $CompilerPath "--build" "--emit-obj" "--linker" "internal" "--release" `
-    "--explain" "tests\test_hoist_global_bases.mettle" "-o" $exePath 2>&1 | Out-String
+    "--explain" "tests/test_hoist_global_bases.mettle" "-o" $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "hoist-global-bases coverage build failed: $coverOut"
   }
@@ -5755,7 +5786,7 @@ foreach ($variant in @("release", "debug", "release_scalar")) {
     $exePath = Join-Path $tmpDir "test_vloop_if_conversion_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -like "release*") { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_vloop_if_conversion.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_vloop_if_conversion.mettle", "-o", $exePath)
 
     if ($variant -eq "release_scalar") { $env:METTLE_SKIP_PASS = "auto_vectorize_int" }
     try {
@@ -5788,7 +5819,7 @@ $total++
 try {
   $exePath = Join-Path $tmpDir "test_vloop_if_conversion_cover.exe"
   $coverOut = & $CompilerPath "--build" "--emit-obj" "--linker" "internal" "--release" `
-    "--explain" "tests\test_vloop_if_conversion.mettle" "-o" $exePath 2>&1 | Out-String
+    "--explain" "tests/test_vloop_if_conversion.mettle" "-o" $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "vloop-if-conversion coverage build failed: $coverOut"
   }
@@ -5824,7 +5855,7 @@ foreach ($variant in @("release", "debug", "release_scalar")) {
     $exePath = Join-Path $tmpDir "test_vloop_select_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -like "release*") { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_vloop_select.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_vloop_select.mettle", "-o", $exePath)
 
     if ($variant -eq "release_scalar") { $env:METTLE_SKIP_PASS = "auto_vectorize_int" }
     try {
@@ -5856,7 +5887,7 @@ $total++
 try {
   $exePath = Join-Path $tmpDir "test_vloop_select_cover.exe"
   $coverOut = & $CompilerPath "--build" "--emit-obj" "--linker" "internal" "--release" `
-    "--explain" "tests\test_vloop_select.mettle" "-o" $exePath 2>&1 | Out-String
+    "--explain" "tests/test_vloop_select.mettle" "-o" $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "vloop-select coverage build failed: $coverOut"
   }
@@ -5880,7 +5911,7 @@ try {
   $env:METTLE_MIR_TRACE = "1"
   try {
     $coverOut = & $CompilerPath "--build" "--emit-obj" "--linker" "internal" "--release" `
-      "tests\test_mir_global_aggregate_addr.mettle" "-o" $exePath 2>&1 | Out-String
+      "tests/test_mir_global_aggregate_addr.mettle" "-o" $exePath 2>&1 | Out-String
   }
   finally {
     Remove-Item Env:\METTLE_MIR_TRACE -ErrorAction SilentlyContinue
@@ -5915,7 +5946,7 @@ foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")
     $exePath = Join-Path $tmpDir "test_mir_affine_map_passthrough_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -like "release*") { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_mir_affine_map_passthrough.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_mir_affine_map_passthrough.mettle", "-o", $exePath)
 
     if ($variant -like "*_fallback") { $env:METTLE_MIR = "0" }
     try {
@@ -5950,7 +5981,7 @@ foreach ($variant in @("release", "debug", "debug_fallback")) {
     $exePath = Join-Path $tmpDir "test_struct_copy_odd_size_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -eq "release") { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_struct_copy_odd_size.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_struct_copy_odd_size.mettle", "-o", $exePath)
 
     if ($variant -eq "debug_fallback") { $env:METTLE_MIR = "0" }
     try {
@@ -5984,7 +6015,7 @@ foreach ($variant in @("release", "debug")) {
     $exePath = Join-Path $tmpDir "test_mir_inline_struct_copy_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -eq "release") { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_mir_inline_struct_copy.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_mir_inline_struct_copy.mettle", "-o", $exePath)
 
     $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
@@ -6017,7 +6048,7 @@ foreach ($relFlag in @($true, $false)) {
     $exePath = Join-Path $tmpDir "test_const_divmod_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($relFlag) { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_const_divmod.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_const_divmod.mettle", "-o", $exePath)
 
     $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
@@ -6051,7 +6082,7 @@ foreach ($relFlag in @($true, $false)) {
     $exePath = Join-Path $tmpDir "test_const_mul_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($relFlag) { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_const_mul.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_const_mul.mettle", "-o", $exePath)
 
     $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
@@ -6085,7 +6116,7 @@ foreach ($relFlag in @($true, $false)) {
     $exePath = Join-Path $tmpDir "test_sroa_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($relFlag) { $buildArgs += "--release" }
-    $buildArgs += @("tests\test_sroa.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_sroa.mettle", "-o", $exePath)
 
     $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
@@ -6118,22 +6149,22 @@ try {
   $gccSourcePath = Join-Path $tmpDir "coff_reader_gcc_input.c"
   $gccObjPath = Join-Path $tmpDir "coff_reader_gcc_input.o"
 
-  $compileHarness = & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests\coff_reader_test.c src\common.c src\lexer\lexer.c src\error\error_reporter.c src\linker\coff_reader.c -Isrc -o $coffReaderExe 2>&1 | Out-String
+  $compileHarness = & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests/coff_reader_test.c src/common.c src/lexer/lexer.c src/error/error_reporter.c src/linker/coff_reader.c -Isrc -o $coffReaderExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "COFF reader harness compile failed: $compileHarness"
   }
 
-  $basicOut = & $CompilerPath --emit-obj tests\test_direct_object_return_const.mettle -o $basicObjPath 2>&1 | Out-String
+  $basicOut = & $CompilerPath --emit-obj tests/test_direct_object_return_const.mettle -o $basicObjPath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "COFF reader basic object compile failed: $basicOut"
   }
 
-  $relocOut = & $CompilerPath --emit-obj tests\test_direct_object_call_return.mettle -o $relocObjPath 2>&1 | Out-String
+  $relocOut = & $CompilerPath --emit-obj tests/test_direct_object_call_return.mettle -o $relocObjPath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "COFF reader relocation object compile failed: $relocOut"
   }
 
-  $longOut = & $CompilerPath --emit-obj tests\test_direct_object_long_symbol_name.mettle -o $longObjPath 2>&1 | Out-String
+  $longOut = & $CompilerPath --emit-obj tests/test_direct_object_long_symbol_name.mettle -o $longObjPath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "COFF reader long-symbol object compile failed: $longOut"
   }
@@ -6179,21 +6210,21 @@ try {
   $dupBObj = Join-Path $tmpDir "linker_duplicate_b.obj"
   $unresolvedObj = Join-Path $tmpDir "linker_unresolved_entry.obj"
 
-  $compileHarness = & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests\symbol_resolve_test.c src\common.c src\lexer\lexer.c src\error\error_reporter.c src\linker\coff_reader.c src\linker\symbol_resolve.c src\codegen\binary_emitter.c src\codegen\elf_emitter.c -Isrc -Isrc\codegen -o $symbolResolveExe 2>&1 | Out-String
+  $compileHarness = & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests/symbol_resolve_test.c src/common.c src/lexer/lexer.c src/error/error_reporter.c src/linker/coff_reader.c src/linker/symbol_resolve.c src/codegen/binary_emitter.c src/codegen/elf_emitter.c -Isrc -Isrc\codegen -o $symbolResolveExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Symbol-resolve harness compile failed: $compileHarness"
   }
 
   $cases = @(
-    @{ Path = "tests\test_linker_merge_entry.mettle"; Out = $fnEntryObj; Label = "function-entry" },
-    @{ Path = "tests\test_linker_merge_provider.mettle"; Out = $fnProviderObj; Label = "function-provider" },
-    @{ Path = "tests\test_linker_merge_data_entry.mettle"; Out = $dataEntryObj; Label = "data-entry" },
-    @{ Path = "tests\test_linker_merge_data_provider.mettle"; Out = $dataProviderObj; Label = "data-provider" },
-    @{ Path = "tests\test_linker_merge_bss_entry.mettle"; Out = $bssEntryObj; Label = "bss-entry" },
-    @{ Path = "tests\test_linker_merge_bss_provider.mettle"; Out = $bssProviderObj; Label = "bss-provider" },
-    @{ Path = "tests\test_linker_duplicate_a.mettle"; Out = $dupAObj; Label = "duplicate-a" },
-    @{ Path = "tests\test_linker_duplicate_b.mettle"; Out = $dupBObj; Label = "duplicate-b" },
-    @{ Path = "tests\test_linker_unresolved_entry.mettle"; Out = $unresolvedObj; Label = "unresolved-entry" }
+    @{ Path = "tests/test_linker_merge_entry.mettle"; Out = $fnEntryObj; Label = "function-entry" },
+    @{ Path = "tests/test_linker_merge_provider.mettle"; Out = $fnProviderObj; Label = "function-provider" },
+    @{ Path = "tests/test_linker_merge_data_entry.mettle"; Out = $dataEntryObj; Label = "data-entry" },
+    @{ Path = "tests/test_linker_merge_data_provider.mettle"; Out = $dataProviderObj; Label = "data-provider" },
+    @{ Path = "tests/test_linker_merge_bss_entry.mettle"; Out = $bssEntryObj; Label = "bss-entry" },
+    @{ Path = "tests/test_linker_merge_bss_provider.mettle"; Out = $bssProviderObj; Label = "bss-provider" },
+    @{ Path = "tests/test_linker_duplicate_a.mettle"; Out = $dupAObj; Label = "duplicate-a" },
+    @{ Path = "tests/test_linker_duplicate_b.mettle"; Out = $dupBObj; Label = "duplicate-b" },
+    @{ Path = "tests/test_linker_unresolved_entry.mettle"; Out = $unresolvedObj; Label = "unresolved-entry" }
   )
 
   foreach ($case in $cases) {
@@ -6223,7 +6254,7 @@ $total++
 try {
   $relocationExe = Join-Path $tmpDir "relocation_test.exe"
 
-  $compileHarness = & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests\relocation_test.c src\common.c src\lexer\lexer.c src\error\error_reporter.c src\linker\coff_reader.c src\linker\symbol_resolve.c src\linker\relocation.c src\codegen\binary_emitter.c src\codegen\elf_emitter.c -Isrc -Isrc\codegen -o $relocationExe 2>&1 | Out-String
+  $compileHarness = & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests/relocation_test.c src/common.c src/lexer/lexer.c src/error/error_reporter.c src/linker/coff_reader.c src/linker/symbol_resolve.c src/linker/relocation.c src/codegen/binary_emitter.c src/codegen/elf_emitter.c -Isrc -Isrc\codegen -o $relocationExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Relocation harness compile failed: $compileHarness"
   }
@@ -6245,7 +6276,7 @@ $total++
 try {
   $peEmitterExe = Join-Path $tmpDir "pe_emitter_test.exe"
 
-  $compileHarness = & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests\pe_emitter_test.c src\common.c src\lexer\lexer.c src\error\error_reporter.c src\linker\coff_reader.c src\linker\symbol_resolve.c src\linker\relocation.c src\linker\pe_emitter.c src\linker\import_lib.c src\codegen\binary_emitter.c src\codegen\elf_emitter.c -Isrc -Isrc\codegen -o $peEmitterExe 2>&1 | Out-String
+  $compileHarness = & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests/pe_emitter_test.c src/common.c src/lexer/lexer.c src/error/error_reporter.c src/linker/coff_reader.c src/linker/symbol_resolve.c src/linker/relocation.c src/linker/pe_emitter.c src/linker/import_lib.c src/codegen/binary_emitter.c src/codegen/elf_emitter.c -Isrc -Isrc\codegen -o $peEmitterExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "PE-emitter harness compile failed: $compileHarness"
   }
@@ -6267,7 +6298,7 @@ $total++
 try {
   $exePath = Join-Path $tmpDir "internal_link_return_const.exe"
 
-  $buildOut = & $CompilerPath --build --emit-obj --linker internal tests\test_direct_object_return_const.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --emit-obj --linker internal tests/test_direct_object_return_const.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Internal linker basic build failed: $buildOut"
   }
@@ -6293,7 +6324,7 @@ try {
   $binaryExePath = Join-Path $tmpDir "internal_link_float_negative_comparison.exe"
   $objExePath = Join-Path $tmpDir "internal_link_emit_obj_float_negative_comparison.exe"
 
-  $buildOut = & $CompilerPath --build --linker internal tests\test_float_negative_comparison.mettle -o $binaryExePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --linker internal tests/test_float_negative_comparison.mettle -o $binaryExePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Internal linker float-negative binary build failed: $buildOut"
   }
@@ -6306,7 +6337,7 @@ try {
     throw "Internal linker float-negative binary executable exited with $LASTEXITCODE (expected 0)"
   }
 
-  $buildOut = & $CompilerPath --build --linker internal tests\test_float_negative_comparison.mettle -o $objExePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --linker internal tests/test_float_negative_comparison.mettle -o $objExePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Internal linker float-negative emit-obj build failed: $buildOut"
   }
@@ -6330,7 +6361,7 @@ catch {
 $total++
 try {
   $exePath = Join-Path $tmpDir "internal_link_abi_float_return.exe"
-  $buildOut = & $CompilerPath --build --linker internal tests\test_abi_float_return.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --linker internal tests/test_abi_float_return.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Internal linker ABI float-return build failed: $buildOut"
   }
@@ -6375,7 +6406,7 @@ $fixAdvicePairs = @(
 
 $total++
 try {
-  $fixOut = & $CompilerPath tests\test_explain_fix_advice.mettle --release --explain 2>&1 | Out-String
+  $fixOut = & $CompilerPath tests/test_explain_fix_advice.mettle --release --explain 2>&1 | Out-String
   $problems = @()
   foreach ($pair in $fixAdvicePairs) {
     $beforeLine = ($fixOut -split "`n" | Where-Object { $_ -match "\b$($pair.Name)_before \(loop" }) -join ""
@@ -6440,7 +6471,7 @@ foreach ($deferMode in @("debug", "release")) {
     $exePath = Join-Path $tmpDir "$caseName.exe"
     $extraArgs = @()
     if ($deferMode -eq "release") { $extraArgs = @("--release") }
-    $buildOut = & $CompilerPath --build --linker internal @extraArgs tests\test_defer_exit_paths.mettle -o $exePath 2>&1 | Out-String
+    $buildOut = & $CompilerPath --build --linker internal @extraArgs tests/test_defer_exit_paths.mettle -o $exePath 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
       throw "defer exit-path build failed ($deferMode): $buildOut"
     }
@@ -6478,7 +6509,7 @@ foreach ($mode in @("binary")) {
   $caseName = "internal_link_struct_copy_$mode"
   try {
     $exePath = Join-Path $tmpDir "$caseName.exe"
-      $buildOut = & $CompilerPath --build --linker internal tests\test_struct_copy.mettle -o $exePath 2>&1 | Out-String
+      $buildOut = & $CompilerPath --build --linker internal tests/test_struct_copy.mettle -o $exePath 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
       throw "Struct copy build failed ($mode): $buildOut"
     }
@@ -6521,7 +6552,7 @@ foreach ($mode in @("binary")) {
   $caseName = "internal_link_struct_pass_by_value_$mode"
   try {
     $exePath = Join-Path $tmpDir "$caseName.exe"
-      $buildOut = & $CompilerPath --build --linker internal tests\test_struct_pass_by_value.mettle -o $exePath 2>&1 | Out-String
+      $buildOut = & $CompilerPath --build --linker internal tests/test_struct_pass_by_value.mettle -o $exePath 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
       throw "Struct pass-by-value build failed ($mode): $buildOut"
     }
@@ -6567,7 +6598,7 @@ foreach ($mode in @("binary")) {
   $caseName = "internal_link_struct_return_by_value_$mode"
   try {
     $exePath = Join-Path $tmpDir "$caseName.exe"
-      $buildOut = & $CompilerPath --build --linker internal tests\test_struct_return_by_value.mettle -o $exePath 2>&1 | Out-String
+      $buildOut = & $CompilerPath --build --linker internal tests/test_struct_return_by_value.mettle -o $exePath 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
       throw "Struct return-by-value build failed ($mode): $buildOut"
     }
@@ -6608,7 +6639,7 @@ foreach ($mode in @("binary")) {
   $caseName = "internal_link_struct_abi_matrix_$mode"
   try {
     $exePath = Join-Path $tmpDir "$caseName.exe"
-      $buildOut = & $CompilerPath --build --linker internal tests\test_struct_abi_matrix.mettle -o $exePath 2>&1 | Out-String
+      $buildOut = & $CompilerPath --build --linker internal tests/test_struct_abi_matrix.mettle -o $exePath 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
       throw "Struct ABI matrix build failed ($mode): $buildOut"
     }
@@ -6653,13 +6684,13 @@ foreach ($mode in @("binary")) {
     }
 
     $cObjPath = Join-Path $tmpDir "$caseName.c.o"
-    $cOut = & gcc -c tests\struct_abi_c_shim.c -o $cObjPath 2>&1 | Out-String
+    $cOut = & gcc -c tests/struct_abi_c_shim.c -o $cObjPath 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
       throw "Struct ABI C shim compile failed ($mode): $cOut"
     }
 
     $exePath = Join-Path $tmpDir "$caseName.exe"
-      $buildOut = & $CompilerPath --build --linker internal tests\test_struct_abi_extern_c.mettle -o $exePath --link-arg $cObjPath 2>&1 | Out-String
+      $buildOut = & $CompilerPath --build --linker internal tests/test_struct_abi_extern_c.mettle -o $exePath --link-arg $cObjPath 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
       throw "Struct ABI extern C build failed ($mode): $buildOut"
     }
@@ -6692,7 +6723,7 @@ foreach ($mode in @("binary")) {
   $caseName = "internal_link_struct_float_$mode"
   try {
     $exePath = Join-Path $tmpDir "$caseName.exe"
-      $buildOut = & $CompilerPath --build --linker internal tests\test_struct_float.mettle -o $exePath 2>&1 | Out-String
+      $buildOut = & $CompilerPath --build --linker internal tests/test_struct_float.mettle -o $exePath 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
       throw "Struct/float build failed ($mode): $buildOut"
     }
@@ -6729,7 +6760,7 @@ try {
   }
   else {
     $exeGcc = Join-Path $tmpDir "direct_object_emit_obj_gcc_link.exe"
-    $buildGccOut = & $CompilerPath --build --emit-obj --linker gcc tests\test_direct_object_return_const.mettle -o $exeGcc 2>&1 | Out-String
+    $buildGccOut = & $CompilerPath --build --emit-obj --linker gcc tests/test_direct_object_return_const.mettle -o $exeGcc 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
       throw "emit-obj gcc link build failed: $buildGccOut"
     }
@@ -6753,7 +6784,7 @@ $total++
 try {
   $exePath = Join-Path $tmpDir "internal_link_ws2_32.exe"
 
-  $buildOut = & $CompilerPath --build --emit-obj --linker internal tests\test_internal_link_ws2_32.mettle -o $exePath --link-arg -lws2_32 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --emit-obj --linker internal tests/test_internal_link_ws2_32.mettle -o $exePath --link-arg -lws2_32 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Internal linker ws2_32 build failed: $buildOut"
   }
@@ -6778,7 +6809,7 @@ $total++
 try {
   $exePath = Join-Path $tmpDir "internal_link_win32_user32.exe"
 
-  $buildOut = & $CompilerPath --build --emit-obj --linker internal tests\test_internal_link_win32_user32.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --emit-obj --linker internal tests/test_internal_link_win32_user32.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Internal linker Win32 build failed: $buildOut"
   }
@@ -6803,7 +6834,7 @@ $total++
 try {
   $exePath = Join-Path $tmpDir "internal_link_ui.exe"
 
-  $buildOut = & $CompilerPath --build --emit-obj --linker internal tests\test_internal_link_ui.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --emit-obj --linker internal tests/test_internal_link_ui.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Internal linker UI build failed: $buildOut"
   }
@@ -6829,7 +6860,7 @@ $total++
 try {
   $exePath = Join-Path $tmpDir "internal_link_std_io.exe"
 
-  $buildOut = & $CompilerPath --build --emit-obj --linker internal tests\test_std_io.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --emit-obj --linker internal tests/test_std_io.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Internal linker std-io build failed: $buildOut"
   }
@@ -6858,7 +6889,7 @@ catch {
 $total++
 try {
   $dirExe = Join-Path $tmpDir "owned_dir.exe"
-  $dirBuild = & $CompilerPath --build tests\test_owned_dir.mettle -o $dirExe 2>&1 | Out-String
+  $dirBuild = & $CompilerPath --build tests/test_owned_dir.mettle -o $dirExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "Owned directory build failed: $dirBuild" }
   $dirOut = & $dirExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0 -or $dirOut -notmatch "DIR OWNED OK") {
@@ -6880,7 +6911,7 @@ $total++
 try {
   $exePath = Join-Path $tmpDir "internal_link_thread_atomics.exe"
 
-  $buildOut = & $CompilerPath --build --emit-obj --linker internal tests\test_internal_link_thread_atomics.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --emit-obj --linker internal tests/test_internal_link_thread_atomics.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Internal linker thread-atomics build failed: $buildOut"
   }
@@ -6910,7 +6941,7 @@ try {
   $originalPath = $env:PATH
   try {
     $env:PATH = $system32Dir
-    $buildOut = & $compilerFullPath --build --emit-obj tests\test_direct_object_return_const.mettle -o $exePath 2>&1 | Out-String
+    $buildOut = & $compilerFullPath --build --emit-obj tests/test_direct_object_return_const.mettle -o $exePath 2>&1 | Out-String
   }
   finally {
     $env:PATH = $originalPath
@@ -6968,7 +6999,7 @@ int fallback_value(void) {
     throw "Static-library archive build failed: $arOut"
   }
 
-  $buildOut = & $CompilerPath --build --linker auto tests\test_auto_link_fallback_static_lib.mettle -o $exePath --link-arg $libPath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --linker auto tests/test_auto_link_fallback_static_lib.mettle -o $exePath --link-arg $libPath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Auto linker fallback build failed: $buildOut"
   }
@@ -6997,7 +7028,7 @@ try {
   $objPath = Join-Path $tmpDir "test_direct_object_params.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_params.exe"
 
-  $objOut = & $CompilerPath --emit-obj tests\test_direct_object_params.mettle -o $objPath 2>&1 | Out-String
+  $objOut = & $CompilerPath --emit-obj tests/test_direct_object_params.mettle -o $objPath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object params compile failed: $objOut"
   }
@@ -7005,7 +7036,7 @@ try {
     throw "Direct object params compile did not produce an object file"
   }
 
-  $buildOut = & $CompilerPath --build --emit-obj tests\test_direct_object_params.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --emit-obj tests/test_direct_object_params.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object params build failed: $buildOut"
   }
@@ -7031,7 +7062,7 @@ try {
   $objPath = Join-Path $tmpDir "test_direct_object_control_flow.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_control_flow.exe"
 
-  $objOut = & $CompilerPath --emit-obj tests\test_direct_object_control_flow.mettle -o $objPath 2>&1 | Out-String
+  $objOut = & $CompilerPath --emit-obj tests/test_direct_object_control_flow.mettle -o $objPath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object control-flow compile failed: $objOut"
   }
@@ -7039,7 +7070,7 @@ try {
     throw "Direct object control-flow compile did not produce an object file"
   }
 
-  $buildOut = & $CompilerPath --build --emit-obj tests\test_direct_object_control_flow.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --emit-obj tests/test_direct_object_control_flow.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object control-flow build failed: $buildOut"
   }
@@ -7065,7 +7096,7 @@ try {
   $objPath = Join-Path $tmpDir "test_direct_object_abi_return_int.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_abi_return_int.exe"
 
-  $objOut = & $CompilerPath --emit-obj tests\test_abi_return_int.mettle -o $objPath 2>&1 | Out-String
+  $objOut = & $CompilerPath --emit-obj tests/test_abi_return_int.mettle -o $objPath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object ABI-return-int compile failed: $objOut"
   }
@@ -7073,7 +7104,7 @@ try {
     throw "Direct object ABI-return-int compile did not produce an object file"
   }
 
-  $buildOut = & $CompilerPath --build --emit-obj tests\test_abi_return_int.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --emit-obj tests/test_abi_return_int.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object ABI-return-int build failed: $buildOut"
   }
@@ -7099,7 +7130,7 @@ try {
   $objPath = Join-Path $tmpDir "test_direct_object_signed_arithmetic.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_signed_arithmetic.exe"
 
-  $objOut = & $CompilerPath --emit-obj tests\test_signed_arithmetic.mettle -o $objPath 2>&1 | Out-String
+  $objOut = & $CompilerPath --emit-obj tests/test_signed_arithmetic.mettle -o $objPath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object signed-arithmetic compile failed: $objOut"
   }
@@ -7107,7 +7138,7 @@ try {
     throw "Direct object signed-arithmetic compile did not produce an object file"
   }
 
-  $buildOut = & $CompilerPath --build --emit-obj tests\test_signed_arithmetic.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --emit-obj tests/test_signed_arithmetic.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object signed-arithmetic build failed: $buildOut"
   }
@@ -7133,7 +7164,7 @@ try {
   $objPath = Join-Path $tmpDir "test_direct_object_structured_control_flow.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_structured_control_flow.exe"
 
-  $objOut = & $CompilerPath --emit-obj tests\test_control_flow.mettle -o $objPath 2>&1 | Out-String
+  $objOut = & $CompilerPath --emit-obj tests/test_control_flow.mettle -o $objPath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object structured control-flow compile failed: $objOut"
   }
@@ -7141,7 +7172,7 @@ try {
     throw "Direct object structured control-flow compile did not produce an object file"
   }
 
-  $buildOut = & $CompilerPath --build --emit-obj tests\test_control_flow.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --emit-obj tests/test_control_flow.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object structured control-flow build failed: $buildOut"
   }
@@ -7167,7 +7198,7 @@ try {
   $objPath = Join-Path $tmpDir "test_direct_object_integer_matrix.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_integer_matrix.exe"
 
-  $objOut = & $CompilerPath --emit-obj tests\test_direct_object_integer_matrix.mettle -o $objPath 2>&1 | Out-String
+  $objOut = & $CompilerPath --emit-obj tests/test_direct_object_integer_matrix.mettle -o $objPath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object integer-matrix compile failed: $objOut"
   }
@@ -7175,7 +7206,7 @@ try {
     throw "Direct object integer-matrix compile did not produce an object file"
   }
 
-  $buildOut = & $CompilerPath --build --emit-obj tests\test_direct_object_integer_matrix.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --emit-obj tests/test_direct_object_integer_matrix.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object integer-matrix build failed: $buildOut"
   }
@@ -7202,7 +7233,7 @@ try {
   $objPath = Join-Path $tmpDir "test_direct_object_codegen_fastpaths.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_codegen_fastpaths.exe"
 
-  $objOut = & $CompilerPath --emit-obj --release tests\test_codegen_ir_fastpaths.mettle -o $objPath 2>&1 | Out-String
+  $objOut = & $CompilerPath --emit-obj --release tests/test_codegen_ir_fastpaths.mettle -o $objPath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object codegen-fastpaths compile failed: $objOut"
   }
@@ -7231,7 +7262,7 @@ try {
     }
   }
 
-  $buildOut = & $CompilerPath --build --emit-obj --linker internal --release tests\test_codegen_ir_fastpaths.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --emit-obj --linker internal --release tests/test_codegen_ir_fastpaths.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object codegen-fastpaths build failed: $buildOut"
   }
@@ -7257,7 +7288,7 @@ try {
   $objPath = Join-Path $tmpDir "test_direct_object_scalar_casts.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_scalar_casts.exe"
 
-  $objOut = & $CompilerPath --emit-obj tests\test_direct_object_scalar_casts.mettle -o $objPath 2>&1 | Out-String
+  $objOut = & $CompilerPath --emit-obj tests/test_direct_object_scalar_casts.mettle -o $objPath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object scalar-casts compile failed: $objOut"
   }
@@ -7265,7 +7296,7 @@ try {
     throw "Direct object scalar-casts compile did not produce an object file"
   }
 
-  $buildOut = & $CompilerPath --build --emit-obj tests\test_direct_object_scalar_casts.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --emit-obj tests/test_direct_object_scalar_casts.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object scalar-casts build failed: $buildOut"
   }
@@ -7729,7 +7760,7 @@ try {
   $objPath = Join-Path $tmpDir "direct_object_ok_global_int.obj"
   $exePath = Join-Path $tmpDir "direct_object_ok_global_int.exe"
 
-  $objOut = & $CompilerPath --emit-obj tests\ok_global_int.mettle -o $objPath 2>&1 | Out-String
+  $objOut = & $CompilerPath --emit-obj tests/ok_global_int.mettle -o $objPath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object ok-global-int compile failed: $objOut"
   }
@@ -7737,7 +7768,7 @@ try {
     throw "Direct object ok-global-int compile did not produce an object file"
   }
 
-  $buildOut = & $CompilerPath --build --emit-obj tests\ok_global_int.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --emit-obj tests/ok_global_int.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object ok-global-int build failed: $buildOut"
   }
@@ -7762,7 +7793,7 @@ try {
   $objPath = Join-Path $tmpDir "direct_object_global_string.obj"
   $exePath = Join-Path $tmpDir "direct_object_global_string.exe"
 
-  $objOut = & $CompilerPath --emit-obj tests\test_direct_object_global_string.mettle -o $objPath 2>&1 | Out-String
+  $objOut = & $CompilerPath --emit-obj tests/test_direct_object_global_string.mettle -o $objPath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object global-string compile failed: $objOut"
   }
@@ -7770,7 +7801,7 @@ try {
     throw "Direct object global-string compile did not produce an object file"
   }
 
-  $buildOut = & $CompilerPath --build --emit-obj tests\test_direct_object_global_string.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --emit-obj tests/test_direct_object_global_string.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object global-string build failed: $buildOut"
   }
@@ -7794,7 +7825,7 @@ $total++
 try {
   $objPath = Join-Path $tmpDir "direct_object_extern_global_link_name.obj"
 
-  $objOut = & $CompilerPath --emit-obj tests\test_extern_global_link_name.mettle -o $objPath 2>&1 | Out-String
+  $objOut = & $CompilerPath --emit-obj tests/test_extern_global_link_name.mettle -o $objPath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object extern-global-link-name compile failed: $objOut"
   }
@@ -7831,7 +7862,7 @@ try {
   $objPath = Join-Path $tmpDir "test_direct_object_pointer_param_address.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_pointer_param_address.exe"
 
-  $objOut = & $CompilerPath --emit-obj tests\test_pointer_param_address.mettle -o $objPath 2>&1 | Out-String
+  $objOut = & $CompilerPath --emit-obj tests/test_pointer_param_address.mettle -o $objPath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object pointer-param-address compile failed: $objOut"
   }
@@ -7839,7 +7870,7 @@ try {
     throw "Direct object pointer-param-address compile did not produce an object file"
   }
 
-  $buildOut = & $CompilerPath --build --emit-obj tests\test_pointer_param_address.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --emit-obj tests/test_pointer_param_address.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object pointer-param-address build failed: $buildOut"
   }
@@ -7865,7 +7896,7 @@ try {
   $objPath = Join-Path $tmpDir "test_direct_object_struct_method_calls.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_struct_method_calls.exe"
 
-  $objOut = & $CompilerPath --emit-obj tests\test_direct_object_struct_method_calls.mettle -o $objPath 2>&1 | Out-String
+  $objOut = & $CompilerPath --emit-obj tests/test_direct_object_struct_method_calls.mettle -o $objPath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object struct-method compile failed: $objOut"
   }
@@ -7873,7 +7904,7 @@ try {
     throw "Direct object struct-method compile did not produce an object file"
   }
 
-  $buildOut = & $CompilerPath --build --emit-obj tests\test_direct_object_struct_method_calls.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --emit-obj tests/test_direct_object_struct_method_calls.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object struct-method build failed: $buildOut"
   }
@@ -7899,7 +7930,7 @@ try {
   $objPath = Join-Path $tmpDir "test_direct_object_pointer_memory.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_pointer_memory.exe"
 
-  $objOut = & $CompilerPath --emit-obj tests\test_direct_object_pointer_memory.mettle -o $objPath 2>&1 | Out-String
+  $objOut = & $CompilerPath --emit-obj tests/test_direct_object_pointer_memory.mettle -o $objPath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object pointer-memory compile failed: $objOut"
   }
@@ -7907,7 +7938,7 @@ try {
     throw "Direct object pointer-memory compile did not produce an object file"
   }
 
-  $buildOut = & $CompilerPath --build --emit-obj tests\test_direct_object_pointer_memory.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --emit-obj tests/test_direct_object_pointer_memory.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object pointer-memory build failed: $buildOut"
   }
@@ -7933,7 +7964,7 @@ try {
   $objPath = Join-Path $tmpDir "test_direct_object_byte_load_store_alias.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_byte_load_store_alias.exe"
 
-  $objOut = & $CompilerPath --emit-obj --release tests\test_direct_object_byte_load_store_alias.mettle -o $objPath 2>&1 | Out-String
+  $objOut = & $CompilerPath --emit-obj --release tests/test_direct_object_byte_load_store_alias.mettle -o $objPath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object byte-load-store-alias compile failed: $objOut"
   }
@@ -7941,7 +7972,7 @@ try {
     throw "Direct object byte-load-store-alias compile did not produce an object file"
   }
 
-  $buildOut = & $CompilerPath --build --emit-obj --linker internal --release tests\test_direct_object_byte_load_store_alias.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --emit-obj --linker internal --release tests/test_direct_object_byte_load_store_alias.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object byte-load-store-alias build failed: $buildOut"
   }
@@ -7966,7 +7997,7 @@ $total++
 try {
   $exePath = Join-Path $tmpDir "test_opt_memcpy_const.exe"
 
-  $buildOut = & $CompilerPath --build --emit-obj --linker internal --release tests\test_opt_memcpy_const.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --emit-obj --linker internal --release tests/test_opt_memcpy_const.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object memcpy-live-registers build failed: $buildOut"
   }
@@ -7992,7 +8023,7 @@ try {
   $objPath = Join-Path $tmpDir "test_direct_object_struct_field_offset.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_struct_field_offset.exe"
 
-  $objOut = & $CompilerPath --emit-obj tests\test_struct_field_offset.mettle -o $objPath 2>&1 | Out-String
+  $objOut = & $CompilerPath --emit-obj tests/test_struct_field_offset.mettle -o $objPath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object struct-field-offset compile failed: $objOut"
   }
@@ -8000,7 +8031,7 @@ try {
     throw "Direct object struct-field-offset compile did not produce an object file"
   }
 
-  $buildOut = & $CompilerPath --build --emit-obj tests\test_struct_field_offset.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --emit-obj tests/test_struct_field_offset.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object struct-field-offset build failed: $buildOut"
   }
@@ -8026,7 +8057,7 @@ try {
   $objPath = Join-Path $tmpDir "test_direct_object_array_struct_stride.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_array_struct_stride.exe"
 
-  $objOut = & $CompilerPath --emit-obj tests\test_array_struct_stride.mettle -o $objPath 2>&1 | Out-String
+  $objOut = & $CompilerPath --emit-obj tests/test_array_struct_stride.mettle -o $objPath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object array-struct-stride compile failed: $objOut"
   }
@@ -8034,7 +8065,7 @@ try {
     throw "Direct object array-struct-stride compile did not produce an object file"
   }
 
-  $buildOut = & $CompilerPath --build --emit-obj tests\test_array_struct_stride.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --emit-obj tests/test_array_struct_stride.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object array-struct-stride build failed: $buildOut"
   }
@@ -8060,7 +8091,7 @@ try {
   $objPath = Join-Path $tmpDir "test_direct_object_function_pointer.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_function_pointer.exe"
 
-  $objOut = & $CompilerPath --emit-obj tests\test_function_pointer.mettle -o $objPath 2>&1 | Out-String
+  $objOut = & $CompilerPath --emit-obj tests/test_function_pointer.mettle -o $objPath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object function-pointer compile failed: $objOut"
   }
@@ -8079,7 +8110,7 @@ try {
     throw "Direct object function-pointer relocations did not contain multiply"
   }
 
-  $buildOut = & $CompilerPath --build --emit-obj tests\test_function_pointer.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --emit-obj tests/test_function_pointer.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object function-pointer build failed: $buildOut"
   }
@@ -8104,7 +8135,7 @@ $total++
 try {
   $exePath = Join-Path $tmpDir "test_direct_object_runtime_null_deref.exe"
 
-  $buildOut = & $CompilerPath --build --emit-obj tests\test_runtime_null_deref_check.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build --emit-obj tests/test_runtime_null_deref_check.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object runtime-null build failed: $buildOut"
   }
@@ -8132,7 +8163,7 @@ $total++
 try {
   $objPath = Join-Path $tmpDir "test_direct_object_stack_trace_support.obj"
 
-  $objOut = & $CompilerPath --emit-obj -s tests\test_runtime_null_deref_check.mettle -o $objPath 2>&1 | Out-String
+  $objOut = & $CompilerPath --emit-obj -s tests/test_runtime_null_deref_check.mettle -o $objPath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object stack-trace compile failed: $objOut"
   }
@@ -8170,7 +8201,7 @@ $total++
 try {
   $exePath = Join-Path $tmpDir "test_runtime_null_trace_coff.exe"
 
-  $buildOut = & $CompilerPath --build -s tests\test_runtime_null_deref_check.mettle -o $exePath 2>&1 | Out-String
+  $buildOut = & $CompilerPath --build -s tests/test_runtime_null_deref_check.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object runtime null trace build failed: $buildOut"
   }
@@ -8212,7 +8243,7 @@ catch {
 $total++
 try {
   $boundsExe = Join-Path $tmpDir "test_runtime_bounds_trace_coff.exe"
-  $boundsBuild = & $CompilerPath --build -s tests\test_crash_bounds_context.mettle -o $boundsExe 2>&1 | Out-String
+  $boundsBuild = & $CompilerPath --build -s tests/test_crash_bounds_context.mettle -o $boundsExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object runtime bounds trace build failed: $boundsBuild"
   }
@@ -8245,7 +8276,7 @@ catch {
 $total++
 try {
   $avExe = Join-Path $tmpDir "test_runtime_av_trace_coff.exe"
-  $avBuild = & $CompilerPath --build -s tests\test_runtime_av_trace_coff.mettle -o $avExe 2>&1 | Out-String
+  $avBuild = & $CompilerPath --build -s tests/test_runtime_av_trace_coff.mettle -o $avExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Direct object runtime access-violation trace build failed: $avBuild"
   }
@@ -8279,7 +8310,7 @@ $total++
 try {
   $avExe = Join-Path $tmpDir "test_main_argc_argv.exe"
 
-  $avOut = & $CompilerPath --build tests\test_main_argc_argv.mettle -o $avExe 2>&1 | Out-String
+  $avOut = & $CompilerPath --build tests/test_main_argc_argv.mettle -o $avExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "main(argc,argv) build failed: $avOut"
   }
@@ -8306,7 +8337,7 @@ $total++
 try {
   $buildArgvExe = Join-Path $tmpDir "test_main_argc_argv_build.exe"
 
-  $buildArgvOut = & $CompilerPath --build tests\test_main_argc_argv.mettle -o $buildArgvExe 2>&1 | Out-String
+  $buildArgvOut = & $CompilerPath --build tests/test_main_argc_argv.mettle -o $buildArgvExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "main(argc,argv) --build compile failed: $buildArgvOut"
   }
@@ -8332,7 +8363,7 @@ $total++
 try {
   $nullExe = Join-Path $tmpDir "test_runtime_null_trace.exe"
 
-  $nullOut = & $CompilerPath --build -s tests\test_runtime_null_deref_check.mettle -o $nullExe 2>&1 | Out-String
+  $nullOut = & $CompilerPath --build -s tests/test_runtime_null_deref_check.mettle -o $nullExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "Runtime null trace build failed: $nullOut"
   }
@@ -8376,8 +8407,8 @@ catch {
 # since the test is pure 32-bit math that runs on the build host.
 $total++
 try {
-  $arm64Exe = "bin\arm64_encode_test.exe"
-  & gcc -Wall -Wextra -std=c99 -g -O0 -Isrc -Iinclude tests\arm64_encode_test.c src\codegen\binary\arm64_encode.c src\codegen\binary\arm64_disasm.c src\codegen\binary\arm64_abi.c -o $arm64Exe
+  $arm64Exe = "bin/arm64_encode_test.exe"
+  & gcc -Wall -Wextra -std=c99 -g -O0 -Isrc -Iinclude tests/arm64_encode_test.c src/codegen/binary/arm64_encode.c src/codegen/binary/arm64_disasm.c src/codegen/binary/arm64_abi.c -o $arm64Exe
   if ($LASTEXITCODE -ne 0) {
     throw "Failed to compile AArch64 encoder test"
   }
@@ -8408,8 +8439,8 @@ catch {
 # skipped (not failed) when no emulator is present, like the ptxas gate.
 $total++
 try {
-  $arm64EmitExe = "bin\arm64_emit_test.exe"
-  & gcc -Wall -Wextra -std=c99 -g -O0 -Isrc -Iinclude tests\arm64_emit_test.c src\codegen\binary\arm64_encode.c src\codegen\binary\arm64_emit.c src\codegen\binary\arm64_disasm.c src\codegen\binary\arm64_mir_encode.c -o $arm64EmitExe
+  $arm64EmitExe = "bin/arm64_emit_test.exe"
+  & gcc -Wall -Wextra -std=c99 -g -O0 -Isrc -Iinclude tests/arm64_emit_test.c src/codegen/binary/arm64_encode.c src/codegen/binary/arm64_emit.c src/codegen/binary/arm64_disasm.c src/codegen/binary/arm64_mir_encode.c -o $arm64EmitExe
   if ($LASTEXITCODE -ne 0) {
     throw "Failed to compile AArch64 emit test"
   }
@@ -8470,12 +8501,12 @@ $total++
 try {
   $elfDir = Join-Path $tmpDir "arm64src"
   New-Item -ItemType Directory -Force -Path $elfDir | Out-Null
-  Copy-Item tests\arm64\expected.txt (Join-Path $elfDir "manifest.txt") -Force
-  $names = Get-Content tests\arm64\expected.txt |
+  Copy-Item tests/arm64/expected.txt (Join-Path $elfDir "manifest.txt") -Force
+  $names = Get-Content tests/arm64/expected.txt |
     ForEach-Object { ($_ -split ' ')[0] } | Where-Object { $_ }
   foreach ($n in $names) {
     $elf = Join-Path $elfDir "$n.elf"
-    & $CompilerPath --emit-arm64 "tests\arm64\$n.mettle" -o $elf 2>&1 | Out-Null
+    & $CompilerPath --emit-arm64 "tests/arm64\$n.mettle" -o $elf 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $elf)) {
       throw "mettle --emit-arm64 failed on $n.mettle"
     }
@@ -8484,13 +8515,13 @@ try {
   # I/O fixtures: compile and stage each with its expected-stdout .out sidecar.
   $ioDir = Join-Path $tmpDir "arm64io"
   New-Item -ItemType Directory -Force -Path $ioDir | Out-Null
-  Get-ChildItem tests\arm64\io\*.mettle | ForEach-Object {
+  Get-ChildItem tests/arm64\io\*.mettle | ForEach-Object {
     $elf = Join-Path $ioDir ($_.BaseName + ".elf")
     & $CompilerPath --emit-arm64 $_.FullName -o $elf 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $elf)) {
       throw "mettle --emit-arm64 failed on io/$($_.Name)"
     }
-    Copy-Item (Join-Path "tests\arm64\io" ($_.BaseName + ".out")) `
+    Copy-Item (Join-Path "tests/arm64\io" ($_.BaseName + ".out")) `
       (Join-Path $ioDir ($_.BaseName + ".out")) -Force
   }
 
@@ -8568,11 +8599,11 @@ try {
 
   $objDir = Join-Path $tmpDir "arm64obj"
   New-Item -ItemType Directory -Force -Path $objDir | Out-Null
-  $names = Get-Content tests\arm64\expected.txt |
+  $names = Get-Content tests/arm64/expected.txt |
     ForEach-Object { ($_ -split '\s+')[0] } | Where-Object { $_ }
   foreach ($n in $names) {
     $obj = Join-Path $objDir "$n.o"
-    & $CompilerPath --emit-arm64-obj "tests\arm64\$n.mettle" -o $obj 2>&1 | Out-Null
+    & $CompilerPath --emit-arm64-obj "tests/arm64\$n.mettle" -o $obj 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
       throw "mettle --emit-arm64-obj failed on $n.mettle"
     }
@@ -8589,7 +8620,7 @@ try {
   # A call to an undefined external has to leave a relocation behind for the
   # linker; native_link.mettle calls the owned putchar ABI.
   $extObj = Join-Path $objDir "native_link.o"
-  & $CompilerPath --emit-arm64-obj tests\arm64\native_link.mettle -o $extObj 2>&1 | Out-Null
+  & $CompilerPath --emit-arm64-obj tests/arm64/native_link.mettle -o $extObj 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "mettle --emit-arm64-obj failed on native_link.mettle"
   }
@@ -8602,7 +8633,7 @@ try {
   # Cross output chooses its target OS standard library, not the compiler host.
   # A Windows hosted compiler must put Linux stream symbols in an AArch64 ELF.
   $crossStdObj = Join-Path $objDir "owned_dir_linux_std.o"
-  & $CompilerPath --emit-arm64-obj tests\test_owned_dir.mettle -o $crossStdObj 2>&1 | Out-Null
+  & $CompilerPath --emit-arm64-obj tests/test_owned_dir.mettle -o $crossStdObj 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "AArch64 owned directory object failed"
   }
@@ -8632,13 +8663,13 @@ $total++
 try {
   $relDir = Join-Path $tmpDir "arm64rel"
   New-Item -ItemType Directory -Force -Path $relDir | Out-Null
-  $relNames = Get-Content tests\arm64\expected.txt |
+  $relNames = Get-Content tests/arm64/expected.txt |
     Where-Object { $_ -and ($_ -split '\s+')[0] -ne "trapnull" }
   Set-Content -Encoding ascii (Join-Path $relDir "manifest.txt") $relNames
   foreach ($line in $relNames) {
     $n = ($line -split '\s+')[0]
     $elf = Join-Path $relDir "$n.elf"
-    & $CompilerPath --emit-arm64 --release "tests\arm64\$n.mettle" -o $elf 2>&1 | Out-Null
+    & $CompilerPath --emit-arm64 --release "tests/arm64\$n.mettle" -o $elf 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $elf)) {
       throw "mettle --emit-arm64 --release failed on $n.mettle"
     }
@@ -8684,9 +8715,9 @@ catch {
 # forms are asserted so a miscompiled unroll is caught, not just a crash.
 $total++
 try {
-  $reduExe = "bin\test_opt_reduction_unroll.exe"
+  $reduExe = "bin/test_opt_reduction_unroll.exe"
   $reduBuild = & $CompilerPath --build --emit-obj --linker internal --release `
-    tests\test_opt_reduction_unroll.mettle -o $reduExe 2>&1 | Out-String
+    tests/test_opt_reduction_unroll.mettle -o $reduExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "reduction-unroll build failed: $reduBuild"
   }
@@ -8705,7 +8736,7 @@ try {
   }
   # The unroll must actually have fired (synthetic accumulators in the IR).
   $reduCheckObj = Join-Path $tmpDir "redu_check.obj"
-  $reduIr = & $CompilerPath --release --dump-ir tests\test_opt_reduction_unroll.mettle `
+  $reduIr = & $CompilerPath --release --dump-ir tests/test_opt_reduction_unroll.mettle `
     -o $reduCheckObj 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "reduction-unroll IR check compile failed"
@@ -8730,7 +8761,7 @@ $total++
 try {
   $profileExe = Join-Path $tmpDir "test_profile_runtime.exe"
   $profileBuild = & $CompilerPath --build --emit-obj --linker internal --profile-runtime `
-    tests\test_profile_runtime.mettle -o $profileExe 2>&1 | Out-String
+    tests/test_profile_runtime.mettle -o $profileExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "profile-runtime build failed: $profileBuild"
   }
@@ -8775,7 +8806,7 @@ $total++
 try {
   $profileOpsExe = Join-Path $tmpDir "test_profile_runtime_ops.exe"
   $profileOpsBuild = & $CompilerPath --build --emit-obj --linker internal --profile-runtime-ops `
-    tests\test_profile_runtime.mettle -o $profileOpsExe 2>&1 | Out-String
+    tests/test_profile_runtime.mettle -o $profileOpsExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "profile-runtime-ops build failed: $profileOpsBuild"
   }
@@ -8810,7 +8841,7 @@ catch {
 try {
   $total++
   $iceExe = Join-Path $tmpDir "compiler_ice_report_test.exe"
-  $iceCompile = & gcc -Wall -Wextra -std=c99 -g -O0 -Isrc -Iinclude tests\compiler_ice_report_test.c src\common.c src\lexer\lexer.c src\compiler\compiler_context.c src\compiler\compiler_crash.c src\runtime\crash_handler.c src\ir\ir.c -o $iceExe -ldbghelp 2>&1 | Out-String
+  $iceCompile = & gcc -Wall -Wextra -std=c99 -g -O0 -Isrc -Iinclude tests/compiler_ice_report_test.c src/common.c src/lexer/lexer.c src/compiler/compiler_context.c src/compiler/compiler_crash.c src/runtime/crash_handler.c src/ir/ir.c -o $iceExe -ldbghelp 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "compiler ICE report harness compile failed: $iceCompile"
   }
@@ -11365,8 +11396,8 @@ $calcGcc = Get-Command gcc -ErrorAction SilentlyContinue
 if (-not $calcGcc) {
   Write-Host "[SKIP] calc_frontend (gcc not found)"
 }
-elseif (-not (Test-Path "bin\mtlc.lib")) {
-  Write-Host "[SKIP] calc_frontend (bin\mtlc.lib not present)"
+elseif (-not (Test-Path "bin/mtlc.lib")) {
+  Write-Host "[SKIP] calc_frontend (bin/mtlc.lib not present)"
 }
 else {
   $total++
@@ -11403,8 +11434,8 @@ else {
 if (-not $calcGcc) {
   Write-Host "[SKIP] optimizer_float_copy (gcc not found)"
 }
-elseif (-not (Test-Path "bin\mtlc.lib")) {
-  Write-Host "[SKIP] optimizer_float_copy (bin\mtlc.lib not present)"
+elseif (-not (Test-Path "bin/mtlc.lib")) {
+  Write-Host "[SKIP] optimizer_float_copy (bin/mtlc.lib not present)"
 }
 else {
   $total++
@@ -11439,8 +11470,8 @@ else {
 if (-not $calcGcc) {
   Write-Host "[SKIP] public_api (gcc not found)"
 }
-elseif (-not (Test-Path "bin\mtlc.lib")) {
-  Write-Host "[SKIP] public_api (bin\mtlc.lib not present)"
+elseif (-not (Test-Path "bin/mtlc.lib")) {
+  Write-Host "[SKIP] public_api (bin/mtlc.lib not present)"
 }
 else {
   $total++
@@ -11528,13 +11559,13 @@ $nmCmd = Get-Command nm -ErrorAction SilentlyContinue
 if (-not $nmCmd) {
   Write-Host "[SKIP] libmtlc_selfcontained (nm not found)"
 }
-elseif (-not (Test-Path "bin\mtlc.lib")) {
-  Write-Host "[SKIP] libmtlc_selfcontained (bin\mtlc.lib not present)"
+elseif (-not (Test-Path "bin/mtlc.lib")) {
+  Write-Host "[SKIP] libmtlc_selfcontained (bin/mtlc.lib not present)"
 }
 else {
   $total++
   try {
-    $nmLines = & $nmCmd.Source "bin\mtlc.lib" 2>$null
+    $nmLines = & $nmCmd.Source "bin/mtlc.lib" 2>$null
     $defined = New-Object System.Collections.Generic.HashSet[string]
     $undef = New-Object System.Collections.Generic.HashSet[string]
     foreach ($ln in $nmLines) {
@@ -11550,7 +11581,7 @@ else {
       }
     }
     if ($bad.Count -gt 0) {
-      throw ("bin\mtlc.lib contains forbidden unresolved symbols: " +
+      throw ("bin/mtlc.lib contains forbidden unresolved symbols: " +
              (($bad | Sort-Object) -join ', '))
     }
     Write-CaseResult -Name "libmtlc_selfcontained" -Passed $true

@@ -650,6 +650,225 @@ static int parse_linker_mode(const char *text, LinkerMode *mode_out) {
   return 0;
 }
 
+/* Which bundled runtime objects a finished program actually references.
+ * Both link paths, PE and ELF, ask these, so they sit above the platform
+ * split rather than inside either arm of it. */
+static int object_has_undefined_symbol_prefix(const char *object_path,
+                                              const char *prefix) {
+  CoffObject *object = NULL;
+  char *error_message = NULL;
+  size_t i = 0u;
+  int found = 0;
+
+  if (!object_path || !prefix) {
+    return 0;
+  }
+
+  if (!coff_object_read(object_path, &object, &error_message)) {
+    free(error_message);
+    return 1;
+  }
+
+  for (i = 0u; i < object->symbol_count; i++) {
+    const CoffSymbol *symbol = &object->symbols[i];
+    if (symbol->is_auxiliary || symbol->section_number != 0 || !symbol->name) {
+      continue;
+    }
+    if (strncmp(symbol->name, prefix, strlen(prefix)) == 0) {
+      found = 1;
+      break;
+    }
+  }
+
+  free(error_message);
+  coff_object_destroy(object);
+  return found;
+}
+
+static unsigned short read_u16_le(const unsigned char *p) {
+  return (unsigned short)((unsigned)p[0] | ((unsigned)p[1] << 8));
+}
+
+static unsigned int read_u32_le(const unsigned char *p) {
+  return (unsigned int)p[0] | ((unsigned int)p[1] << 8) |
+         ((unsigned int)p[2] << 16) | ((unsigned int)p[3] << 24);
+}
+
+static unsigned long long read_u64_le(const unsigned char *p) {
+  return (unsigned long long)read_u32_le(p) |
+         ((unsigned long long)read_u32_le(p + 4) << 32);
+}
+
+/* Reads an ELF64 relocatable object and reports whether it leaves any symbol
+ * undefined whose name starts with `prefix`. This is the ELF counterpart of
+ * the COFF scan above, and it decides the same thing: which bundled runtime
+ * objects a program actually references, so the link pulls in only those.
+ * Unreadable or malformed input answers 1, which links the object rather than
+ * risking an undefined symbol at link time. */
+static int elf_object_has_undefined_symbol_prefix(const char *object_path,
+                                                  const char *prefix) {
+  static const unsigned char elf_magic[4] = {0x7f, 'E', 'L', 'F'};
+  FILE *file = NULL;
+  unsigned char *data = NULL;
+  long file_size = 0;
+  size_t prefix_length = 0u;
+  size_t section_count = 0u;
+  size_t section_offset = 0u;
+  size_t section_header_size = 0u;
+  size_t i = 0u;
+  int found = 1;
+
+  if (!object_path || !prefix) {
+    return 1;
+  }
+
+  file = fopen(object_path, "rb");
+  if (!file) {
+    return 1;
+  }
+  if (fseek(file, 0, SEEK_END) != 0) {
+    fclose(file);
+    return 1;
+  }
+  file_size = ftell(file);
+  if (file_size < 64 || fseek(file, 0, SEEK_SET) != 0) {
+    fclose(file);
+    return 1;
+  }
+  data = malloc((size_t)file_size);
+  if (!data) {
+    fclose(file);
+    return 1;
+  }
+  if (fread(data, 1, (size_t)file_size, file) != (size_t)file_size) {
+    goto cleanup;
+  }
+
+  /* ELFCLASS64 little-endian relocatable objects only; the backend emits no
+   * other shape, and anything else falls through to the conservative answer. */
+  if (memcmp(data, elf_magic, sizeof(elf_magic)) != 0 || data[4] != 2 ||
+      data[5] != 1) {
+    goto cleanup;
+  }
+
+  section_offset = (size_t)read_u64_le(data + 0x28);
+  section_header_size = (size_t)read_u16_le(data + 0x3a);
+  section_count = (size_t)read_u16_le(data + 0x3c);
+  if (section_header_size < 64u || section_count == 0u ||
+      section_offset + section_count * section_header_size >
+          (size_t)file_size) {
+    goto cleanup;
+  }
+
+  prefix_length = strlen(prefix);
+  found = 0;
+
+  for (i = 0u; i < section_count; i++) {
+    const unsigned char *header = data + section_offset + i * section_header_size;
+    size_t symbol_table_offset = 0u;
+    size_t symbol_table_size = 0u;
+    size_t entry_size = 0u;
+    size_t string_index = 0u;
+    size_t string_offset = 0u;
+    size_t string_size = 0u;
+    size_t symbol = 0u;
+
+    if (read_u32_le(header + 4) != 2u) { /* SHT_SYMTAB */
+      continue;
+    }
+    symbol_table_offset = (size_t)read_u64_le(header + 0x18);
+    symbol_table_size = (size_t)read_u64_le(header + 0x20);
+    string_index = (size_t)read_u32_le(header + 0x28);
+    entry_size = (size_t)read_u64_le(header + 0x38);
+    if (entry_size < 24u || string_index >= section_count ||
+        symbol_table_offset + symbol_table_size > (size_t)file_size) {
+      found = 1;
+      goto cleanup;
+    }
+
+    {
+      const unsigned char *string_header =
+          data + section_offset + string_index * section_header_size;
+      string_offset = (size_t)read_u64_le(string_header + 0x18);
+      string_size = (size_t)read_u64_le(string_header + 0x20);
+      if (string_offset + string_size > (size_t)file_size) {
+        found = 1;
+        goto cleanup;
+      }
+    }
+
+    for (symbol = 0u; symbol + entry_size <= symbol_table_size;
+         symbol += entry_size) {
+      const unsigned char *entry = data + symbol_table_offset + symbol;
+      size_t name_offset = (size_t)read_u32_le(entry);
+      const char *name = NULL;
+
+      if (read_u16_le(entry + 6) != 0u) { /* st_shndx != SHN_UNDEF */
+        continue;
+      }
+      if (name_offset == 0u || name_offset >= string_size) {
+        continue;
+      }
+      name = (const char *)(data + string_offset + name_offset);
+      if (strncmp(name, prefix, prefix_length) == 0) {
+        found = 1;
+        goto cleanup;
+      }
+    }
+  }
+
+cleanup:
+  free(data);
+  fclose(file);
+  return found;
+}
+
+static int object_needs_runtime_object(const char *object_path,
+                                       const char *prefix) {
+  if (binary_target_format_host_default() == BINARY_TARGET_FORMAT_ELF_X64) {
+    return elf_object_has_undefined_symbol_prefix(object_path, prefix);
+  }
+  return object_has_undefined_symbol_prefix(object_path, prefix);
+}
+
+static int object_needs_crash_handler(const char *object_path) {
+  return object_needs_runtime_object(object_path, "mettle_crash_");
+}
+
+static int object_needs_atomics(const char *object_path) {
+  return object_needs_runtime_object(object_path, "mettle_atomic_");
+}
+
+static int object_needs_profile_runtime(const char *object_path) {
+  return object_needs_runtime_object(object_path, "mettle_profile_");
+}
+
+static int object_needs_debug_runtime(const char *object_path) {
+  return object_needs_runtime_object(object_path, "mettle_dbg_");
+}
+
+static int object_needs_safety_runtime(const char *object_path) {
+  return object_needs_runtime_object(object_path, "mettle_safety_");
+}
+
+/* `quiesce;` lowers to mettle_swap_apply, and staging reaches
+ * mettle_swap_stage. A program with no swap point names neither and does not
+ * link this object, which is the whole of what opting in costs. */
+static int object_needs_swap_runtime(const char *object_path) {
+  return object_needs_runtime_object(object_path, "mettle_swap_");
+}
+
+/* `==` and `!=` on strings compare contents through mettle_string_eq. A
+ * program that never compares strings never names it. */
+static int object_needs_string_runtime(const char *object_path) {
+  return object_needs_runtime_object(object_path, "mettle_string_");
+}
+
+static int object_needs_tracy_helpers(const char *object_path) {
+  return object_needs_runtime_object(object_path, "mettle_tracy_");
+}
+
+
 #ifndef _WIN32
 #define METTLE_ELF_DYNAMIC_LINKER "/lib64/ld-linux-x86-64.so.2"
 
@@ -725,15 +944,17 @@ static int mettle_link_elf_direct(const char *startup_object,
                                   const char *object_filename,
                                   const char *executable_filename,
                                   const char *freestanding_object,
-                                  const char *crash_handler_object,
-                                  const char *profile_object,
+                                  const char *const *extra_objects,
+                                  size_t extra_object_count,
                                   int strip_symbols) {
-  const char *argv_list[24];
+  const char *argv_list[32];
   size_t argc_used = 0u;
+  size_t i = 0u;
   int result = 1;
 
   if (!startup_object || !object_filename || !executable_filename ||
-      !freestanding_object) {
+      !freestanding_object ||
+      extra_object_count > sizeof(argv_list) / sizeof(argv_list[0]) - 12u) {
     return 1;
   }
 
@@ -751,11 +972,10 @@ static int mettle_link_elf_direct(const char *startup_object,
   argv_list[argc_used++] = startup_object;
   argv_list[argc_used++] = freestanding_object;
   argv_list[argc_used++] = object_filename;
-  if (crash_handler_object) {
-    argv_list[argc_used++] = crash_handler_object;
-  }
-  if (profile_object) {
-    argv_list[argc_used++] = profile_object;
+  for (i = 0u; i < extra_object_count; i++) {
+    if (extra_objects[i]) {
+      argv_list[argc_used++] = extra_objects[i];
+    }
   }
   argv_list[argc_used] = NULL;
 
@@ -780,11 +1000,19 @@ static int mettle_link_elf_executable(const char *object_filename,
   char *profile_object = NULL;
   char *freestanding_object = NULL;
   char *startup_object = NULL;
+  /* string, swap, safety, debug, atomics, crash_handler, profile. */
+  char *extra_objects[8];
+  size_t extra_object_count = 0u;
+  size_t on_demand_object_count = 0u;
+  size_t extra_index = 0u;
   const char *cc = "gcc";
   int result = 1;
   int profile_runtime =
       options && compiler_options_use_profile_runtime(options) ? 1 : 0;
   int stack_trace = options && options->generate_stack_trace_support ? 1 : 0;
+  int needs_safety = 0;
+
+  memset(extra_objects, 0, sizeof(extra_objects));
 
   /* The bundled runtime owns the Linux ABI used by the standard library. Its
    * threads use clone and futex. Its files, clocks, sockets, and processes use
@@ -792,11 +1020,52 @@ static int mettle_link_elf_executable(const char *object_filename,
    */
   if (runtime_directory) {
     freestanding_object = join_paths(runtime_directory, "freestanding.o");
-    if (stack_trace || profile_runtime) {
+
+    /* Same on-demand rule the Windows link follows: an object joins the link
+     * only when the program leaves one of its symbols undefined. Naming none
+     * of them is what makes a bare compute program cost nothing. */
+    needs_safety = object_needs_safety_runtime(object_filename);
+    if (stack_trace || profile_runtime || needs_safety ||
+        object_needs_crash_handler(object_filename)) {
       crash_handler_object = join_paths(runtime_directory, "crash_handler.o");
     }
     if (profile_runtime) {
       profile_object = join_paths(runtime_directory, "profile.o");
+    }
+
+    {
+      static const struct {
+        const char *file;
+        int (*needed)(const char *);
+      } on_demand[] = {
+          {"string.o", object_needs_string_runtime},
+          {"swap.o", object_needs_swap_runtime},
+          {"safety.o", object_needs_safety_runtime},
+          {"debug.o", object_needs_debug_runtime},
+          {"atomics.o", object_needs_atomics},
+      };
+      size_t i = 0u;
+
+      for (i = 0u; i < sizeof(on_demand) / sizeof(on_demand[0]); i++) {
+        char *candidate = NULL;
+        if (!on_demand[i].needed(object_filename)) {
+          continue;
+        }
+        candidate = join_paths(runtime_directory, on_demand[i].file);
+        if (!candidate) {
+          continue;
+        }
+        if (access(candidate, F_OK) != 0) {
+          fprintf(stderr,
+                  "Error: Program references the %s runtime but '%s' is not in "
+                  "'%s'\n",
+                  on_demand[i].file, on_demand[i].file, runtime_directory);
+          free(candidate);
+          goto cleanup;
+        }
+        extra_objects[extra_object_count++] = candidate;
+        on_demand_object_count = extra_object_count;
+      }
     }
   }
 
@@ -831,11 +1100,25 @@ static int mettle_link_elf_executable(const char *object_filename,
     goto cleanup;
   }
 
+  /* Everything appended past on_demand_object_count is owned by its own
+   * variable, so cleanup frees only what the on-demand loop allocated. */
+
+  /* crash_handler and profile join the same list so both link paths carry one
+   * ordered set of runtime objects. safety.o calls into the crash handler, so
+   * it must precede it here. */
+  if (crash_handler_object) {
+    extra_objects[extra_object_count++] = crash_handler_object;
+  }
+  if (profile_object) {
+    extra_objects[extra_object_count++] = profile_object;
+  }
+
   /* Use ld directly when no caller link arguments need driver parsing. */
   if (!(options && options->link_argument_count > 0) &&
       mettle_link_elf_direct(startup_object, object_filename,
                              executable_filename, freestanding_object,
-                             crash_handler_object, profile_object,
+                             (const char *const *)extra_objects,
+                             extra_object_count,
                              !mettle_elf_keep_symbols(options)) == 0) {
     result = 0;
   }
@@ -850,7 +1133,7 @@ static int mettle_link_elf_executable(const char *object_filename,
   if (result != 0) {
     /* Upper bound for controls, output, runtime objects, caller arguments,
      * and the NULL terminator. */
-    size_t max_args = 20u + 6u + 1u +
+    size_t max_args = 20u + 8u + 6u + 1u +
                        (options ? options->link_argument_count : 0u);
     size_t argc_used = 0u;
 
@@ -877,11 +1160,10 @@ static int mettle_link_elf_executable(const char *object_filename,
     argv_list[argc_used++] = startup_object;
     argv_list[argc_used++] = freestanding_object;
     argv_list[argc_used++] = (char *)object_filename;
-    if (crash_handler_object) {
-      argv_list[argc_used++] = crash_handler_object;
-    }
-    if (profile_object) {
-      argv_list[argc_used++] = profile_object;
+    for (extra_index = 0u; extra_index < extra_object_count; extra_index++) {
+      if (extra_objects[extra_index]) {
+        argv_list[argc_used++] = extra_objects[extra_index];
+      }
     }
     argv_list[argc_used++] = (char *)"-o";
     argv_list[argc_used++] = (char *)executable_filename;
@@ -906,6 +1188,9 @@ static int mettle_link_elf_executable(const char *object_filename,
 cleanup:
   if (startup_object) {
     unlink(startup_object);
+  }
+  for (extra_index = 0u; extra_index < on_demand_object_count; extra_index++) {
+    free(extra_objects[extra_index]);
   }
   free(argv_list);
   free(crash_handler_object);
@@ -1254,80 +1539,6 @@ static int append_internal_link_object_args(const CompilerOptions *options,
   }
 
   return 1;
-}
-
-static int object_has_undefined_symbol_prefix(const char *object_path,
-                                              const char *prefix) {
-  CoffObject *object = NULL;
-  char *error_message = NULL;
-  size_t i = 0u;
-  int found = 0;
-
-  if (!object_path || !prefix) {
-    return 0;
-  }
-
-  if (!coff_object_read(object_path, &object, &error_message)) {
-    free(error_message);
-    return 1;
-  }
-
-  for (i = 0u; i < object->symbol_count; i++) {
-    const CoffSymbol *symbol = &object->symbols[i];
-    if (symbol->is_auxiliary || symbol->section_number != 0 || !symbol->name) {
-      continue;
-    }
-    if (strncmp(symbol->name, prefix, strlen(prefix)) == 0) {
-      found = 1;
-      break;
-    }
-  }
-
-  free(error_message);
-  coff_object_destroy(object);
-  return found;
-}
-
-static int object_needs_runtime_object(const char *object_path,
-                                       const char *prefix) {
-  return object_has_undefined_symbol_prefix(object_path, prefix);
-}
-
-static int object_needs_crash_handler(const char *object_path) {
-  return object_needs_runtime_object(object_path, "mettle_crash_");
-}
-
-static int object_needs_atomics(const char *object_path) {
-  return object_needs_runtime_object(object_path, "mettle_atomic_");
-}
-
-static int object_needs_profile_runtime(const char *object_path) {
-  return object_needs_runtime_object(object_path, "mettle_profile_");
-}
-
-static int object_needs_debug_runtime(const char *object_path) {
-  return object_needs_runtime_object(object_path, "mettle_dbg_");
-}
-
-static int object_needs_safety_runtime(const char *object_path) {
-  return object_needs_runtime_object(object_path, "mettle_safety_");
-}
-
-/* `quiesce;` lowers to mettle_swap_apply, and staging reaches
- * mettle_swap_stage. A program with no swap point names neither and does not
- * link this object, which is the whole of what opting in costs. */
-static int object_needs_swap_runtime(const char *object_path) {
-  return object_needs_runtime_object(object_path, "mettle_swap_");
-}
-
-/* `==` and `!=` on strings compare contents through mettle_string_eq. A
- * program that never compares strings never names it. */
-static int object_needs_string_runtime(const char *object_path) {
-  return object_needs_runtime_object(object_path, "mettle_string_");
-}
-
-static int object_needs_tracy_helpers(const char *object_path) {
-  return object_needs_runtime_object(object_path, "mettle_tracy_");
 }
 
 static int compiler_options_use_tracy(const CompilerOptions *options) {
