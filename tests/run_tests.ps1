@@ -4478,20 +4478,49 @@ catch {
 
 # The transport itself: with an adapter listening on METTLE_DBG_PIPE, the
 # runtime has to announce itself and hand over the file and function tables.
-# Driven over the POSIX FIFO, which is the arm that had no implementation
-# until now; the Windows named pipe is what the editor extension has always
-# spoken and is exercised by attaching from it.
-if ($script:OnWindows) {
-  Skip-WindowsOnly "debug_transport" `
-    "POSIX-only check: the Windows pipe is driven by the editor adapter"
-} else {
+# Windows carries it over a named pipe and POSIX over a FIFO, so the check
+# stands up whichever the platform uses and reads the announcement back.
 $total++
 try {
   $dbgExe = Join-Path $tmpDir "debug_transport.exe"
   $buildOut = & $CompilerPath --build "tests/debug_demo.mettle" -o $dbgExe --debug-hooks 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "debug-hooks build failed: $buildOut" }
 
-  {
+  if ($script:OnWindows) {
+    # Asynchronous so the waits below can time out instead of wedging the run.
+    $pipeLeaf = "mettle-dbg-test-$PID"
+    $server = New-Object System.IO.Pipes.NamedPipeServerStream(
+      $pipeLeaf, [System.IO.Pipes.PipeDirection]::InOut, 1,
+      [System.IO.Pipes.PipeTransmissionMode]::Byte,
+      [System.IO.Pipes.PipeOptions]::Asynchronous)
+    $env:METTLE_DBG_PIPE = "\\.\pipe\$pipeLeaf"
+    $proc = $null
+    $reader = $null
+    try {
+      $proc = Start-Process -FilePath $dbgExe -PassThru -WindowStyle Hidden
+      $connected = $server.WaitForConnectionAsync()
+      if (-not $connected.Wait(15000)) {
+        throw "the runtime never connected to the pipe"
+      }
+      $reader = New-Object System.IO.StreamReader($server)
+      $announced = ""
+      for ($i = 0; $i -lt 12; $i++) {
+        $pending = $reader.ReadLineAsync()
+        if (-not $pending.Wait(3000)) { break }
+        if ($null -eq $pending.Result) { break }
+        $announced += "$($pending.Result)`n"
+      }
+    }
+    finally {
+      # Kill first: the runtime pauses once attached, so disposing a pipe it
+      # still owns can block instead of returning.
+      if ($proc -and -not $proc.HasExited) { $proc.Kill(); $proc.WaitForExit(2000) | Out-Null }
+      if ($reader) { $reader.Dispose() }
+      $server.Dispose()
+      Remove-Item Env:\METTLE_DBG_PIPE -ErrorAction SilentlyContinue
+    }
+  }
+  else {
     # bash drives the FIFO: the shell can hold both ends open, which the
     # runtime needs so its own open does not see EOF.
     $script = Join-Path $tmpDir "debug_transport.sh"
@@ -4534,7 +4563,6 @@ exit 0
 catch {
   $failed++
   Write-CaseResult -Name "debug_transport" -Passed $false -Reason $_.Exception.Message
-}
 }
 
 # --explain "since last build" diffing + --explain-json: recompiling unchanged
