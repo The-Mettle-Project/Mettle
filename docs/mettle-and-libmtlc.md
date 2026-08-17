@@ -53,6 +53,45 @@ The Makefile is where that boundary is written down. `BACKEND_SOURCES` and
 `FRONTEND_SOURCES` are two disjoint lists, and the backend list is what goes
 into the archive. Adding a translation unit means deciding which list it joins.
 
+## Is libmtlc still a separate artifact?
+
+**Yes.** Living in this repository changed how it is *developed*, not how it is
+*consumed*. Every release attaches a backend-only asset,
+`libmtlc-<tag>-<target>.zip` on Windows and `.tar.gz` on Linux, carrying the
+`include/mtlc/` headers, the static archive, and the freestanding runtime
+object. Nothing in it is Mettle-specific and nothing in it needs this
+repository.
+
+```bash
+# Linux
+curl -fsSL https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/get-libmtlc.sh | sh
+```
+
+```powershell
+# Windows
+irm https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/get-libmtlc.ps1 | iex
+```
+
+Both accept `LIBMTLC_VERSION` to pin a tag and `LIBMTLC_DIR` to choose where it
+lands. From a checkout, `make install-libmtlc` does a system install with a
+pkg-config file, so a consumer builds with
+`cc $(pkg-config --cflags --libs libmtlc) app.c` and never mentions Mettle.
+
+What did change: libmtlc is no longer a **separately versioned dependency** of
+this repository. There used to be a `libmtlc.version` pin here and a fetch step
+that pulled a matching build; both are gone, and the backend is compiled from
+`src/` along with everything else. So the two versions are no longer
+independent. The toolchain carries the release version, and the backend reports
+its own API version through `mtlc_version()`, currently `libmtlc 0.2.0`, which
+is what a pkg-config `Requires:` should be written against.
+
+For an adopter the practical consequences are:
+
+- The asset still exists at every release and the fetchers still work.
+- The public surface is still `include/mtlc/`, unchanged by the merge.
+- The API version moves on its own schedule and is not the toolchain version.
+- Its self-containment is enforced per build, not assumed: see below.
+
 ## Building the backend alone
 
 ```powershell
