@@ -4455,7 +4455,6 @@ catch {
 
 # Debugger instrumentation: a --debug-hooks build must run NORMALLY when no
 # debugger is attached (every hook is an early-out; METTLE_DBG_PIPE unset).
-if (-not $script:OnWindows) { Skip-WindowsOnly "debug_hooks_standalone" "Windows-only: --debug-hooks is refused where the transport is unimplemented" } else {
 $total++
 try {
   $exePath = Join-Path $tmpDir "debug_hooks_standalone.exe"
@@ -4475,6 +4474,66 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "debug_hooks_standalone" -Passed $false -Reason $_.Exception.Message
+}
+
+# The transport itself: with an adapter listening on METTLE_DBG_PIPE, the
+# runtime has to announce itself and hand over the file and function tables.
+# Driven over the POSIX FIFO, which is the arm that had no implementation
+# until now; the Windows named pipe is what the editor extension has always
+# spoken and is exercised by attaching from it.
+if ($script:OnWindows) {
+  Skip-WindowsOnly "debug_transport" `
+    "POSIX-only check: the Windows pipe is driven by the editor adapter"
+} else {
+$total++
+try {
+  $dbgExe = Join-Path $tmpDir "debug_transport.exe"
+  $buildOut = & $CompilerPath --build "tests/debug_demo.mettle" -o $dbgExe --debug-hooks 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "debug-hooks build failed: $buildOut" }
+
+  {
+    # bash drives the FIFO: the shell can hold both ends open, which the
+    # runtime needs so its own open does not see EOF.
+    $script = Join-Path $tmpDir "debug_transport.sh"
+    @'
+set -u
+exe="$1"; work="$2"
+fifo="$work/dbg.fifo"
+rm -f "$fifo"; mkfifo "$fifo"
+( timeout 12 cat "$fifo" > "$work/announced.txt" ) &
+drain=$!
+sleep 0.3
+exec 8> "$fifo"
+METTLE_DBG_PIPE="$fifo" "$exe" > "$work/prog.txt" 2>&1 &
+prog=$!
+sleep 2
+printf 'continue\n' >&8
+sleep 1
+printf 'detach\n' >&8
+sleep 1
+kill -9 $prog 2>/dev/null
+exec 8>&-
+wait $drain 2>/dev/null
+exit 0
+'@ -replace "`r`n", "`n" | ForEach-Object {
+      [System.IO.File]::WriteAllText($script, $_)
+    }
+    & bash $script $dbgExe $tmpDir 2>&1 | Out-Null
+    $announcedPath = Join-Path $tmpDir "announced.txt"
+    $announced = if (Test-Path $announcedPath) { Get-Content $announcedPath -Raw } else { "" }
+  }
+
+  if ($announced -notmatch 'hello') {
+    throw "the runtime never announced itself to the adapter"
+  }
+  if ($announced -notmatch 'debug_demo') {
+    throw "the runtime never sent its file table: $announced"
+  }
+  Write-CaseResult -Name "debug_transport" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "debug_transport" -Passed $false -Reason $_.Exception.Message
 }
 }
 

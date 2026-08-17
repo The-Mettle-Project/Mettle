@@ -3325,18 +3325,7 @@ int main(int argc, char *argv[]) {
       options.profile_blocks = 1;
       options.profile_runtime = 1;
     } else if (strcmp(argv[i], "--debug-hooks") == 0) {
-#ifndef _WIN32
-      /* The hooks compile to no-ops without a transport to carry the protocol,
-       * and src/runtime/debug.c has one only on Windows. Accepting the flag
-       * would produce a binary that reports nothing and says nothing about
-       * why. */
-      fprintf(stderr,
-              "Error: --debug-hooks is not available on this platform: the "
-              "debug transport is implemented for Windows only\n");
-      return 1;
-#else
       options.debug_hooks = 1;
-#endif
     } else if (strcmp(argv[i], "--safe") == 0) {
       options.safe = 1;
     } else if (strcmp(argv[i], "--native-heap") == 0) {

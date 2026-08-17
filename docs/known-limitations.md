@@ -213,14 +213,12 @@ Arrays follow the same rule as in [Types - Array Types](types.md#array-types): t
   invisible, and it is why the eightbyte rule applies only to `extern`
   callees.
 
-- `--debug-hooks` and the editor debugging built on it are Windows-only.
-  `src/runtime/debug.c` carries the protocol over a named pipe on Windows and
-  compiles the four hooks (`mettle_dbg_enter`, `_exit`, `_local`, `_line`) to
-  no-ops everywhere else. The flag is **refused** off Windows rather than
-  accepted into a binary that would report nothing. Crash traces (`-s`), stack
-  traces (`-d`) and `--profile-runtime` do work on Linux. The protocol itself
-  is platform-neutral; what is missing is a POSIX transport (a FIFO or a Unix
-  socket) behind the same four I/O calls.
+- `--debug-hooks` works on both platforms. `src/runtime/debug.c` carries one
+  protocol over a named pipe on Windows and over a FIFO on Linux, where
+  `METTLE_DBG_PIPE` names the FIFO the adapter creates. The Linux arm reaches
+  threads, futexes and the file descriptor through the owned runtime, so a
+  debuggable build still links no libc. What is Windows-only is the editor
+  extension that drives the adapter end.
 
 - The internal PE linker lets a program override a runtime symbol, binding the
   program's definition and leaving the runtime's own internal calls on the

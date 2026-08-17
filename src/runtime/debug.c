@@ -21,8 +21,12 @@
  *
  * Single-threaded model: only the thread that performs the first
  * mettle_dbg_enter (main) is debugged; hooks from other threads return
- * immediately. Windows-complete; on other platforms the hooks are no-ops
- * for now. */
+ * immediately.
+ *
+ * The protocol and everything above it is platform-neutral. What differs is
+ * the surface underneath: a named pipe and Win32 synchronization on Windows,
+ * a FIFO and the owned runtime's threads, futexes and system calls
+ * everywhere else. Both are provided under one set of names below. */
 
 /* Keep MinGW headers from redirecting these calls to compiler library
  * wrappers. Mettle's owned runtime provides the selected ABI symbols. */
@@ -83,6 +87,201 @@ extern uint64_t dbg_owned_strtoui64(const char *str, char **end, int base)
 #undef _strtoui64
 #define _strtoi64 dbg_owned_strtoi64
 #define _strtoui64 dbg_owned_strtoui64
+
+#else /* POSIX */
+
+/* The protocol below is platform-neutral: frames, locals, breakpoints, the
+ * command queue and the wire format say nothing about how bytes move or how
+ * threads wait. Only the surface underneath differs, so it is provided here
+ * under the same names and the body compiles unchanged.
+ *
+ * Everything called here is exported by the owned runtime, which reaches the
+ * kernel directly. No libc appears on the link line on this platform either.
+ * METTLE_DBG_PIPE names a FIFO the adapter creates, standing in for the
+ * Windows named pipe. */
+
+typedef int HANDLE;
+typedef long LONG;
+typedef unsigned long DWORD;
+#define INVALID_HANDLE_VALUE (-1)
+#define INFINITE 0xFFFFFFFFul
+
+extern long read(int fd, void *buffer, unsigned long count);
+extern long write(int fd, const void *buffer, unsigned long count);
+extern int close(int fd);
+extern int ioctl(int fd, unsigned long request, void *argument);
+extern void usleep(unsigned long microseconds);
+extern unsigned int mettle_thread_current_id(void);
+extern int32_t mettle_atomic_exchange_i32(int32_t *target, int32_t value);
+/* Same argument order as InterlockedCompareExchange, and it returns the old
+ * value too, so the mapping below is a rename. */
+extern int32_t mettle_atomic_compare_exchange_i32(int32_t *target,
+                                                  int32_t exchange,
+                                                  int32_t comparand);
+extern int pthread_create(void *thread, const void *attr,
+                          void *(*start)(void *), void *argument);
+extern int pthread_mutex_init(void *mutex, const void *attr);
+extern int pthread_mutex_lock(void *mutex);
+extern int pthread_mutex_unlock(void *mutex);
+extern int pthread_cond_init(void *cond, const void *attr);
+extern int pthread_cond_wait(void *cond, void *mutex);
+extern int pthread_cond_broadcast(void *cond);
+
+/* Opaque storage sized past glibc's pthread_mutex_t (40) and pthread_cond_t
+ * (48); the owned runtime's own types are smaller. */
+typedef struct { unsigned char opaque[64]; } CRITICAL_SECTION;
+typedef struct { unsigned char opaque[64]; } CONDITION_VARIABLE;
+
+#define InitializeCriticalSection(cs) pthread_mutex_init((cs), 0)
+#define EnterCriticalSection(cs) pthread_mutex_lock((cs))
+#define LeaveCriticalSection(cs) pthread_mutex_unlock((cs))
+#define InitializeConditionVariable(cv) pthread_cond_init((cv), 0)
+#define WakeAllConditionVariable(cv) pthread_cond_broadcast((cv))
+#define SleepConditionVariableCS(cv, cs, ms) pthread_cond_wait((cv), (cs))
+#define GetCurrentThreadId() ((DWORD)mettle_thread_current_id())
+#define Sleep(ms) usleep((unsigned long)(ms) * 1000ul)
+#define InterlockedExchange(target, value)                                     \
+  ((LONG)mettle_atomic_exchange_i32((int32_t *)(target), (int32_t)(value)))
+#define InterlockedCompareExchange(target, exchange, comparand)                \
+  ((LONG)mettle_atomic_compare_exchange_i32(                                   \
+      (int32_t *)(target), (int32_t)(exchange), (int32_t)(comparand)))
+
+static int dbg_posix_write(HANDLE fd, const void *buffer, DWORD count,
+                           DWORD *written, void *unused) {
+  long n;
+  (void)unused;
+  n = write(fd, buffer, (unsigned long)count);
+  if (written) *written = n > 0 ? (DWORD)n : 0;
+  return n >= 0;
+}
+
+static int dbg_posix_read(HANDLE fd, void *buffer, DWORD count, DWORD *got,
+                          void *unused) {
+  long n;
+  (void)unused;
+  n = read(fd, buffer, (unsigned long)count);
+  if (got) *got = n > 0 ? (DWORD)n : 0;
+  return n > 0;
+}
+
+/* FIONREAD reports what can be read without blocking, which is what
+ * PeekNamedPipe is used for: never block the reader while the program thread
+ * may be writing the next event. */
+#define DBG_FIONREAD 0x541Bul
+
+static int dbg_posix_peek(HANDLE fd, void *a, DWORD b, void *c, DWORD *avail,
+                          void *d) {
+  int pending = 0;
+  (void)a; (void)b; (void)c; (void)d;
+  if (ioctl(fd, DBG_FIONREAD, &pending) != 0) {
+    return 0;
+  }
+  if (avail) *avail = pending > 0 ? (DWORD)pending : 0;
+  return 1;
+}
+
+static HANDLE dbg_posix_open(const char *path) {
+  FILE *stream = fopen(path, "r+b");
+  return stream ? fileno(stream) : INVALID_HANDLE_VALUE;
+}
+
+/* glibc's headers redirect the string conversions to versioned symbols
+ * (__isoc23_strtoul and friends) that the owned runtime does not export. Bind
+ * the plain names it does, the same way the Windows arm binds around MinGW. */
+extern unsigned long dbg_owned_strtoul(const char *str, char **end, int base)
+    __asm__("strtoul");
+extern long long dbg_owned_strtoll(const char *str, char **end, int base)
+    __asm__("strtoll");
+extern unsigned long long dbg_owned_strtoull(const char *str, char **end,
+                                             int base) __asm__("strtoull");
+extern double dbg_owned_strtod_posix(const char *str, char **end)
+    __asm__("strtod");
+extern int dbg_owned_sscanf(const char *input, const char *format, ...)
+    __asm__("sscanf");
+#undef sscanf
+#define sscanf dbg_owned_sscanf
+#undef strtoul
+#undef strtoll
+#undef strtoull
+#undef strtod
+#define strtoul dbg_owned_strtoul
+#define strtoll dbg_owned_strtoll
+#define strtoull dbg_owned_strtoull
+#define strtod dbg_owned_strtod_posix
+
+/* The parser reaches for the MSVC-spelled 64-bit conversions. */
+#define _strtoi64 dbg_owned_strtoll
+#define _strtoui64 dbg_owned_strtoull
+
+/* The owned runtime already answers "may I read this address" for the crash
+ * handler; the debugger asks the same question before dereferencing a local. */
+extern int mettle_address_is_readable(const void *address,
+                                      unsigned long long length);
+extern int mettle_install_signal_handler(int signal_number,
+                                         void (*handler)(int, void *, void *));
+/* The owned runtime exports no getpid; on Linux the main thread's id is the
+ * process id, and dbg_try_init runs on the main thread. */
+#define GetCurrentProcessId() ((DWORD)mettle_thread_current_id())
+
+static DWORD dbg_posix_getenv(const char *name, char *buffer, DWORD cap) {
+  const char *value = getenv(name);
+  DWORD i = 0;
+  if (!value || !buffer || cap == 0) return 0;
+  while (value[i] && i + 1 < cap) {
+    buffer[i] = value[i];
+    i++;
+  }
+  buffer[i] = '\0';
+  return i;
+}
+
+/* pthreads wants void *(*)(void *) where Win32 wants DWORD (*)(LPVOID), so the
+ * reader routine is held here and reached through a trampoline of the right
+ * shape. */
+typedef DWORD (*DbgThreadStart)(void *);
+static DbgThreadStart g_dbg_thread_start = 0;
+
+static void *dbg_posix_thread_trampoline(void *argument) {
+  if (g_dbg_thread_start) {
+    (void)g_dbg_thread_start(argument);
+  }
+  return 0;
+}
+
+static HANDLE dbg_posix_spawn(DbgThreadStart start) {
+  /* pthread_t is one word on every target the owned runtime supports. */
+  unsigned long thread = 0;
+  g_dbg_thread_start = start;
+  if (pthread_create(&thread, 0, dbg_posix_thread_trampoline, 0) != 0) {
+    return 0;
+  }
+  /* Only tested against 0, so any nonzero value stands for "running". */
+  return 1;
+}
+
+#define CreateThread(sec, stack, start, arg, flags, id)                        \
+  dbg_posix_spawn((start))
+
+#define GENERIC_READ 0
+#define GENERIC_WRITE 0
+#define OPEN_EXISTING 0
+#define CreateFileA(path, access, share, sec, disp, flags, tmpl)               \
+  dbg_posix_open((path))
+
+#define WriteFile(h, buf, n, wr, ov) dbg_posix_write((h), (buf), (n), (wr), (ov))
+#define ReadFile(h, buf, n, got, ov) dbg_posix_read((h), (buf), (n), (got), (ov))
+#define PeekNamedPipe(h, a, b, c, avail, d)                                    \
+  dbg_posix_peek((h), (a), (b), (c), (avail), (d))
+#define CloseHandle(h) close((h))
+#define GetEnvironmentVariableA(name, buf, cap)                                \
+  dbg_posix_getenv((name), (buf), (cap))
+
+/* pthreads hands the start routine a void* and takes one back; the Win32
+ * spelling below is kept so the reader thread reads the same on both. */
+#define WINAPI
+typedef void *LPVOID;
+
+#endif /* platform surface */
 
 extern uint64_t mettle_profile_name_count;
 extern const char *mettle_profile_names[];
@@ -296,6 +495,7 @@ static void dbg_sendf(const char *format, ...) {
 /* --- memory probing -------------------------------------------------------------- */
 
 static int dbg_mem_readable(const void *ptr, size_t size) {
+#if defined(_WIN32) || defined(_WIN64)
   MEMORY_BASIC_INFORMATION info;
   if (!ptr) return 0;
   if (VirtualQuery(ptr, &info, sizeof(info)) == 0) return 0;
@@ -304,6 +504,10 @@ static int dbg_mem_readable(const void *ptr, size_t size) {
   /* conservative: require the whole range inside this region */
   return (const char *)ptr + size <=
          (const char *)info.BaseAddress + info.RegionSize;
+#else
+  if (!ptr) return 0;
+  return mettle_address_is_readable(ptr, (unsigned long long)size);
+#endif
 }
 
 /* --- value rendering ----------------------------------------------------------------- */
@@ -1001,6 +1205,42 @@ static void dbg_pause_here(const char *reason) {
  * EXCEPTION_CONTINUE_SEARCH, handing the fault to the default handling
  * (the crash trace, then process death) -- a fault is not resumable. */
 
+#if !defined(_WIN32) && !defined(_WIN64)
+
+/* POSIX arm of the same idea: a fault stops the program where it happened and
+ * hands it to the adapter, so the stack and every variable are inspectable at
+ * that moment. Reported through the signal handler the owned runtime installs
+ * for the crash tracer, then returned so the default handling still runs: a
+ * fault is not resumable. */
+static void dbg_signal_handler(int signal_number, void *address, void *context) {
+  static LONG in_handler = 0;
+  (void)context;
+  if (!g_active || GetCurrentThreadId() != g_main_thread) {
+    return;
+  }
+  if (InterlockedCompareExchange(&in_handler, 1, 0) != 0) {
+    return;
+  }
+  g_exc_code = (DWORD)signal_number;
+  g_exc_addr = (uint64_t)(uintptr_t)address;
+  EnterCriticalSection(&g_lock);
+  g_mode = DBG_RUN;
+  LeaveCriticalSection(&g_lock);
+  dbg_pause_here("exception");
+  InterlockedExchange(&in_handler, 0);
+}
+
+/* SIGSEGV, SIGFPE, SIGILL, SIGBUS. Stack overflow is left alone for the same
+ * reason as on Windows: no stack remains to pause on. */
+static void dbg_install_fault_handlers(void) {
+  static const int signals[] = {11, 8, 4, 7};
+  for (size_t i = 0; i < sizeof(signals) / sizeof(signals[0]); i++) {
+    (void)mettle_install_signal_handler(signals[i], dbg_signal_handler);
+  }
+}
+
+#else
+
 static LONG WINAPI dbg_vectored_handler(EXCEPTION_POINTERS *info) {
   static LONG in_handler = 0;
   DWORD code;
@@ -1030,6 +1270,8 @@ static LONG WINAPI dbg_vectored_handler(EXCEPTION_POINTERS *info) {
   InterlockedExchange(&in_handler, 0);
   return EXCEPTION_CONTINUE_SEARCH;
 }
+
+#endif /* fault handler */
 
 /* --- initialization ----------------------------------------------------------------------- */
 
@@ -1068,7 +1310,11 @@ static void dbg_try_init(void) {
     g_pipe = INVALID_HANDLE_VALUE;
     return;
   }
+#if defined(_WIN32) || defined(_WIN64)
   AddVectoredExceptionHandler(1, dbg_vectored_handler);
+#else
+  dbg_install_fault_handlers();
+#endif
   InterlockedExchange(&g_active, 1);
 }
 
@@ -1192,13 +1438,3 @@ void mettle_dbg_line(uint32_t line) {
   }
 }
 
-#else /* non-Windows: hooks are no-ops until the POSIX transport lands */
-
-void mettle_dbg_enter(uint32_t fn_id) { (void)fn_id; }
-void mettle_dbg_exit(void) {}
-void mettle_dbg_local(int64_t local_id, void *ptr, int64_t is_param) {
-  (void)local_id; (void)ptr; (void)is_param;
-}
-void mettle_dbg_line(uint32_t line) { (void)line; }
-
-#endif
