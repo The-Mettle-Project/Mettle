@@ -612,6 +612,11 @@ typedef struct {
    * function without the decorator pays nothing. */
   int is_swappable;
   int is_kernel;          // GPU entry point; ordinary functions are not entries
+  /* `export fn`: visible outside this compilation. Two things follow. Its
+   * object symbol stays global where an internal function's is local, and it
+   * is reached under the platform's C ABI rather than Mettle's own internal
+   * convention, because whatever calls it may not be Mettle. */
+  int is_exported;
   /* `kernel(block = ...)`: the launch block shape this kernel requires.
    * All zero when undeclared. PTX emits .reqntid so the driver rejects a
    * mismatched launch instead of running it with a garbage lane mapping;

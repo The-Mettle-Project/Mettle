@@ -1,0 +1,37 @@
+struct ThreeI32 { a: int32; b: int32; c: int32; }
+struct TwoF64 { x: float64; y: float64; }
+struct MixedI64F64 { i: int64; d: float64; }
+struct Big32 {
+  a: int32; b: int32; c: int32; d: int32;
+  e: int32; f: int32; g: int32; h: int32;
+}
+
+export fn mettle_take_three(t: ThreeI32) -> int32 {
+  return t.a + t.b + t.c;
+}
+
+export fn mettle_make_three(a: int32, b: int32, c: int32) -> ThreeI32 {
+  var t: ThreeI32;
+  t.a = a;
+  t.b = b;
+  t.c = c;
+  return t;
+}
+
+export fn mettle_take_two_f64(v: TwoF64) -> int32 {
+  return (int32)(v.x + v.y);
+}
+
+export fn mettle_take_mixed(v: MixedI64F64) -> int32 {
+  return (int32)(v.i + (int64)v.d);
+}
+
+export fn mettle_take_big32(v: Big32) -> int32 {
+  return v.a + v.b + v.c + v.d + v.e + v.f + v.g + v.h;
+}
+
+extern fn mettle_c_driver_check() -> int32;
+
+fn main() -> int32 {
+  return mettle_c_driver_check();
+}

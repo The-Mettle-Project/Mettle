@@ -3467,13 +3467,14 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
    * Classified per argument here and consumed by the layout and the emission
    * loops below. Zeroed entries mean "not a SysV aggregate", which is every
    * argument on MS-x64. */
-  /* Only calls that leave the language need the platform's aggregate rule. Two
-   * Mettle functions agree on Mettle's own convention whatever it is, and the
-   * callee side of the eightbyte rule is not implemented, so applying it to an
-   * internal call would have the caller read a register pair the callee never
-   * filled. */
+  /* A callee reachable from outside this compilation is reached under the
+   * platform's rule, because whatever calls it may not be Mettle. Purely
+   * internal calls keep Mettle's own convention: both sides agree, and it
+   * keeps `string`, a 16-byte aggregate, off the slow path. Caller and callee
+   * both ask this of the callee, so they never disagree. */
   const BinaryAbi *call_abi = code_generator_binary_active_abi();
-  int callee_is_foreign = function_symbol && function_symbol->is_extern;
+  int callee_is_foreign = code_generator_binary_function_is_abi_public(
+      generator, instruction->text);
   BinarySysvAggregate *sysv_agg =
       argument_count > 0 ? calloc(argument_count, sizeof(*sysv_agg)) : NULL;
   if (argument_count > 0 && !sysv_agg) {
@@ -3492,6 +3493,14 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
                 function_symbol->data.function.parameter_types
             ? function_symbol->data.function.parameter_types[i]
             : NULL;
+    /* A helper the lowering synthesizes, such as the string comparison behind
+     * `==`, is called by name with no declared signature. The argument still
+     * has a type, and it is the same type the callee declared, so classify
+     * from that when the parameter type is missing. */
+    if (!param_t) {
+      param_t = code_generator_binary_get_operand_type_in_context(
+          generator, context, &instruction->arguments[i]);
+    }
     if (callee_is_foreign && call_abi->counts_classes_separately &&
         code_generator_binary_classify_sysv_aggregate(param_t, &sysv_agg[i])) {
       continue;
@@ -5858,6 +5867,60 @@ int code_generator_binary_emit_instruction(
 
   case IR_OP_RETURN: {
     size_t displacement_offset = 0;
+
+    /* SysV register return: load the aggregate's eightbytes straight into the
+     * registers the caller will read, in eightbyte order with the two classes
+     * counted separately. */
+    if (context->returns_sysv_registers &&
+        instruction->lhs.kind != IR_OPERAND_NONE) {
+      const BinarySysvAggregate *rc = &context->sysv_return_class;
+      /* Each class counts independently, so resolve every eightbyte's carrier
+       * up front rather than inferring it while emitting. */
+      BinaryGpRegister gp_for[2] = {BINARY_GP_RAX, BINARY_GP_RAX};
+      BinaryXmmRegister xmm_for[2] = {BINARY_XMM0, BINARY_XMM0};
+      size_t int_taken = 0;
+      size_t sse_taken = 0;
+      int ok = 1;
+
+      for (size_t e = 0; e < rc->eightbyte_count; e++) {
+        if (rc->classes[e] == BINARY_EIGHTBYTE_SSE) {
+          xmm_for[e] = sse_taken == 0 ? BINARY_XMM0 : BINARY_XMM1;
+          sse_taken++;
+        } else {
+          gp_for[e] = int_taken == 0 ? BINARY_GP_RAX : BINARY_GP_RDX;
+          int_taken++;
+        }
+      }
+
+      ok = code_generator_binary_emit_indirect_source_address(
+          generator, context, &instruction->lhs, BINARY_GP_R10);
+      for (size_t e = 0; ok && e < rc->eightbyte_count; e++) {
+        int disp = (int)(e * 8u);
+        if (rc->classes[e] == BINARY_EIGHTBYTE_SSE) {
+          ok = binary_emit_mov_reg_mem(&context->code, BINARY_GP_R11,
+                                       BINARY_GP_R10, disp) &&
+               binary_emit_movq_xmm_reg(&context->code, xmm_for[e],
+                                        BINARY_GP_R11);
+        } else {
+          ok = binary_emit_mov_reg_mem(&context->code, gp_for[e],
+                                       BINARY_GP_R10, disp);
+        }
+      }
+      if (!ok) {
+        code_generator_set_error(generator,
+                                 "Out of memory emitting SysV register return");
+        return 0;
+      }
+      if (!binary_emit_jmp_placeholder(&context->code, &displacement_offset) ||
+          !binary_offset_table_add(&context->return_fixups,
+                                   displacement_offset)) {
+        code_generator_set_error(
+            generator, "Out of memory while emitting function return");
+        return 0;
+      }
+      return 1;
+    }
+
     /* INDIRECT return: memcpy the source struct through the hidden out-ptr
      * stored at [rbp - 8], then put that pointer into rax. */
     if (context->returns_indirect &&
@@ -6212,30 +6275,89 @@ int code_generator_binary_emit_prologue(CodeGenerator *generator,
    * float-ness. The layout tells us each argument's register or stack home
    * under the active convention. */
   size_t hidden = context->returns_indirect ? 1u : 0u;
-  size_t layout_count = context->ir_function->parameter_count + hidden;
+  size_t parameter_count = context->ir_function->parameter_count;
+
+  /* A function reachable from outside receives aggregates the way the platform
+   * says. On SysV that means up to two eightbytes in registers, so a parameter
+   * can consume two layout slots. */
+  int abi_public = code_generator_binary_function_is_abi_public(
+      generator, context->ir_function->name);
+  BinarySysvAggregate *param_agg =
+      parameter_count > 0 ? calloc(parameter_count, sizeof(*param_agg)) : NULL;
+  if (parameter_count > 0 && !param_agg) {
+    code_generator_set_error(generator,
+                             "Out of memory classifying parameter aggregates");
+    return 0;
+  }
+
+  size_t layout_count = hidden;
+  for (size_t i = 0; i < parameter_count; i++) {
+    MtlcType *pt = code_generator_binary_get_resolved_type(
+        generator,
+        context->ir_function->parameter_types
+            ? context->ir_function->parameter_types[i]
+            : NULL,
+        0);
+    param_agg[i].first_slot = layout_count;
+    if (abi_public && abi->counts_classes_separately &&
+        code_generator_binary_classify_sysv_aggregate(pt, &param_agg[i])) {
+      /* MEMORY keeps one slot, but the slot holds the bytes rather than a
+       * pointer to them, so it still needs its full width reserved. */
+      layout_count +=
+          param_agg[i].in_memory ? 1u : param_agg[i].eightbyte_count;
+      continue;
+    }
+    /* Not an aggregate the platform rule touches: one ordinary slot. */
+    param_agg[i].size = 0;
+    param_agg[i].eightbyte_count = 0;
+    param_agg[i].in_memory = 0;
+    layout_count += 1u;
+  }
+
   if (layout_count > 0) {
     int *is_float = calloc(layout_count, sizeof(int));
+    int *force_stack = calloc(layout_count, sizeof(int));
+    size_t *stack_slots = calloc(layout_count, sizeof(size_t));
     BinaryArgLocation *locations =
         calloc(layout_count, sizeof(BinaryArgLocation));
-    if (!is_float || !locations) {
+    if (!is_float || !locations || !force_stack || !stack_slots) {
       free(is_float);
+      free(force_stack);
+      free(stack_slots);
       free(locations);
+      free(param_agg);
       code_generator_set_error(generator,
                                "Out of memory computing parameter layout");
       return 0;
     }
     /* Hidden out-pointer is integer (is_float[0] already 0). */
-    for (size_t i = 0; i < context->ir_function->parameter_count; i++) {
+    for (size_t i = 0; i < parameter_count; i++) {
+      if (param_agg[i].in_memory) {
+        force_stack[param_agg[i].first_slot] = 1;
+        stack_slots[param_agg[i].first_slot] = (param_agg[i].size + 7u) / 8u;
+        continue;
+      }
+      if (param_agg[i].eightbyte_count > 0) {
+        for (size_t e = 0; e < param_agg[i].eightbyte_count; e++) {
+          is_float[param_agg[i].first_slot + e] =
+              (param_agg[i].classes[e] == BINARY_EIGHTBYTE_SSE) ? 1 : 0;
+        }
+        continue;
+      }
       int fbits = code_generator_binary_named_type_float_bits(
           generator, context->ir_function->parameter_types
                          ? context->ir_function->parameter_types[i]
                          : NULL);
-      is_float[i + hidden] = fbits ? 1 : 0;
+      is_float[param_agg[i].first_slot] = fbits ? 1 : 0;
     }
-    if (!code_generator_binary_compute_arg_layout(abi, is_float, layout_count,
-                                                  locations, NULL)) {
+    if (!code_generator_binary_compute_arg_layout_ex(abi, is_float, force_stack,
+                                                     stack_slots, layout_count,
+                                                     locations, NULL)) {
       free(is_float);
+      free(force_stack);
+      free(stack_slots);
       free(locations);
+      free(param_agg);
       code_generator_set_error(generator, "Failed to compute parameter layout");
       return 0;
     }
@@ -6254,7 +6376,10 @@ int code_generator_binary_emit_prologue(CodeGenerator *generator,
           code_generator_binary_get_parameter_offset(context, parameter_name);
       if (home_offset <= 0) {
         free(is_float);
+        free(force_stack);
+        free(stack_slots);
         free(locations);
+        free(param_agg);
         code_generator_set_error(
             generator, "Missing parameter home for '%s' in function '%s'",
             parameter_name ? parameter_name : "<unnamed>",
@@ -6262,7 +6387,7 @@ int code_generator_binary_emit_prologue(CodeGenerator *generator,
         return 0;
       }
 
-      const BinaryArgLocation *loc = &locations[i + hidden];
+      const BinaryArgLocation *loc = &locations[param_agg[i].first_slot];
       /* Callee-side address of a stack argument: above saved rbp + return
        * address (16) and the callee-owned shadow space, then the layout's
        * outgoing offset. */
@@ -6270,6 +6395,135 @@ int code_generator_binary_emit_prologue(CodeGenerator *generator,
           16 + abi->shadow_space_size + loc->stack_offset;
 
       int home_ok = 1;
+
+      /* MEMORY: the caller left the bytes in the incoming argument area, so
+       * the home points straight at them. No copy: the area belongs to this
+       * call and outlives the body. */
+      if (param_agg[i].in_memory) {
+        home_ok = binary_emit_lea_reg_mem(&context->code, BINARY_GP_RAX,
+                                          BINARY_GP_RBP,
+                                          incoming_stack_offset) &&
+                  binary_emit_mov_mem_reg(&context->code, BINARY_GP_RBP,
+                                          -home_offset, BINARY_GP_RAX);
+        if (parameter_in_register) {
+          home_ok = home_ok && binary_emit_mov_reg_reg(&context->code,
+                                                       assigned_register,
+                                                       BINARY_GP_RAX);
+        }
+        if (!home_ok) {
+          free(is_float);
+          free(force_stack);
+          free(stack_slots);
+          free(locations);
+          free(param_agg);
+          code_generator_set_error(
+              generator, "Out of memory homing MEMORY aggregate parameter");
+          return 0;
+        }
+        continue;
+      }
+
+      /* An aggregate SysV handed over in registers: rebuild it in its frame
+       * storage and point the home slot at it, so every later access sees the
+       * pointer-in-home shape an INDIRECT parameter already has. */
+      if (param_agg[i].eightbyte_count > 0) {
+        int spill = (i < context->incoming_aggregate_count)
+                        ? context->incoming_aggregate_offsets[i]
+                        : 0;
+
+        /* A DIRECT-shaped aggregate keeps its value in the home slot. Only its
+         * carrier differs: a float-only eightbyte arrives in an XMM. */
+        if (spill == 0) {
+          if (loc->kind == BINARY_ARG_IN_XMM_REGISTER) {
+            home_ok = binary_emit_movq_reg_xmm(&context->code, BINARY_GP_RAX,
+                                               loc->xmm_register) &&
+                      binary_emit_mov_mem_reg(&context->code, BINARY_GP_RBP,
+                                              -home_offset, BINARY_GP_RAX);
+          } else if (loc->kind == BINARY_ARG_IN_GP_REGISTER) {
+            home_ok = binary_emit_mov_mem_reg(&context->code, BINARY_GP_RBP,
+                                              -home_offset, loc->gp_register) &&
+                      binary_emit_mov_reg_reg(&context->code, BINARY_GP_RAX,
+                                              loc->gp_register);
+          } else {
+            home_ok = binary_emit_mov_reg_mem(&context->code, BINARY_GP_RAX,
+                                              BINARY_GP_RBP,
+                                              incoming_stack_offset) &&
+                      binary_emit_mov_mem_reg(&context->code, BINARY_GP_RBP,
+                                              -home_offset, BINARY_GP_RAX);
+          }
+          if (parameter_in_register) {
+            home_ok = home_ok && binary_emit_mov_reg_reg(&context->code,
+                                                         assigned_register,
+                                                         BINARY_GP_RAX);
+          }
+          if (!home_ok) {
+            free(is_float);
+            free(force_stack);
+            free(stack_slots);
+            free(locations);
+            free(param_agg);
+            code_generator_set_error(
+                generator, "Out of memory homing small SysV aggregate param");
+            return 0;
+          }
+          continue;
+        }
+        if (spill < 0) {
+          free(is_float);
+          free(force_stack);
+          free(stack_slots);
+          free(locations);
+          free(param_agg);
+          code_generator_set_error(
+              generator,
+              "Missing aggregate parameter storage for '%s' in function '%s'",
+              parameter_name ? parameter_name : "<unnamed>",
+              context->function_name);
+          return 0;
+        }
+        for (size_t e = 0; home_ok && e < param_agg[i].eightbyte_count; e++) {
+          const BinaryArgLocation *eloc =
+              &locations[param_agg[i].first_slot + e];
+          int at = -spill + (int)(e * 8u);
+          if (eloc->kind == BINARY_ARG_IN_XMM_REGISTER) {
+            home_ok = binary_emit_movq_reg_xmm(&context->code, BINARY_GP_RAX,
+                                               eloc->xmm_register) &&
+                      binary_emit_mov_mem_reg(&context->code, BINARY_GP_RBP, at,
+                                              BINARY_GP_RAX);
+          } else if (eloc->kind == BINARY_ARG_IN_GP_REGISTER) {
+            home_ok = binary_emit_mov_mem_reg(&context->code, BINARY_GP_RBP, at,
+                                              eloc->gp_register);
+          } else {
+            home_ok = binary_emit_mov_reg_mem(&context->code, BINARY_GP_RAX,
+                                              BINARY_GP_RBP,
+                                              incoming_stack_offset +
+                                                  (int)(e * 8u)) &&
+                      binary_emit_mov_mem_reg(&context->code, BINARY_GP_RBP, at,
+                                              BINARY_GP_RAX);
+          }
+        }
+        home_ok = home_ok &&
+                  binary_emit_lea_reg_mem(&context->code, BINARY_GP_RAX,
+                                          BINARY_GP_RBP, -spill) &&
+                  binary_emit_mov_mem_reg(&context->code, BINARY_GP_RBP,
+                                          -home_offset, BINARY_GP_RAX);
+        if (parameter_in_register) {
+          home_ok = home_ok && binary_emit_mov_reg_reg(&context->code,
+                                                       assigned_register,
+                                                       BINARY_GP_RAX);
+        }
+        if (!home_ok) {
+          free(is_float);
+          free(force_stack);
+          free(stack_slots);
+          free(locations);
+          free(param_agg);
+          code_generator_set_error(
+              generator, "Out of memory homing SysV aggregate parameter");
+          return 0;
+        }
+        continue;
+      }
       if (parameter_in_register) {
         /* Symbol pinned to a specific GP register by the allocator. */
         if (loc->kind == BINARY_ARG_IN_GP_REGISTER) {
@@ -6290,7 +6544,10 @@ int code_generator_binary_emit_prologue(CodeGenerator *generator,
         }
         if (!home_ok) {
           free(is_float);
+          free(force_stack);
+          free(stack_slots);
           free(locations);
+          free(param_agg);
           code_generator_set_error(
               generator, "Out of memory while homing register parameters");
           return 0;
@@ -6320,7 +6577,10 @@ int code_generator_binary_emit_prologue(CodeGenerator *generator,
       }
       if (!home_ok) {
         free(is_float);
+        free(force_stack);
+        free(stack_slots);
         free(locations);
+        free(param_agg);
         code_generator_set_error(generator,
                                  "Out of memory while homing parameters");
         return 0;
@@ -6328,7 +6588,10 @@ int code_generator_binary_emit_prologue(CodeGenerator *generator,
     }
 
     free(is_float);
+    free(force_stack);
+    free(stack_slots);
     free(locations);
+    free(param_agg);
   }
 
   return 1;

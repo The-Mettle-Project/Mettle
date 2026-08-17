@@ -1080,7 +1080,8 @@ static int mir_call_is_supported(CodeGenerator *g,
    * drag most of the standard library off MIR. */
   {
     const BinaryAbi *sysv_probe = code_generator_binary_active_abi();
-    if (sysv_probe->counts_classes_separately && callee->is_extern) {
+    if (sysv_probe->counts_classes_separately &&
+        code_generator_binary_function_is_abi_public(g, in->text)) {
       size_t a = 0;
       if (ret && code_generator_type_is_aggregate(ret)) {
         mir_call_trace("sysv_extern_aggregate_ret");
@@ -1235,6 +1236,34 @@ int mir_function_is_eligible(CodeGenerator *generator,
   if (generator->generate_debug_info || generator->generate_stack_trace_support ||
       generator->profile_runtime) {
     return 0;
+  }
+  /* A function reached from outside under SysV takes and returns aggregates by
+   * eightbyte. That prologue and that return live in the baseline emitter, so
+   * the whole function goes there. */
+  if (code_generator_binary_active_abi()->counts_classes_separately &&
+      code_generator_binary_function_is_abi_public(generator,
+                                                   ir_function->name)) {
+    BinarySysvAggregate agg;
+    if (code_generator_binary_classify_sysv_aggregate(
+            code_generator_binary_get_resolved_type(
+                generator, ir_function->return_type_name, 1),
+            &agg)) {
+      mir_trace_bail(ir_function, "sysv_public_aggregate_ret");
+      return 0;
+    }
+    for (size_t i = 0; i < ir_function->parameter_count; i++) {
+      if (code_generator_binary_classify_sysv_aggregate(
+              code_generator_binary_get_resolved_type(
+                  generator,
+                  ir_function->parameter_types
+                      ? ir_function->parameter_types[i]
+                      : NULL,
+                  0),
+              &agg)) {
+        mir_trace_bail(ir_function, "sysv_public_aggregate_param");
+        return 0;
+      }
+    }
   }
   /* Signature: <=4 GP params, GP-or-void return, no indirect return. */
   if (ir_function->parameter_count > MIR_MAX_PARAMS) {

@@ -1442,8 +1442,22 @@ int code_generator_binary_prepare_function_context(
           ? code_generator_binary_get_resolved_type(
                 generator, ir_function->return_type_name, 1)
           : NULL;
+  /* Reached from outside under SysV, an aggregate of 16 bytes or less goes
+   * back in registers and takes no hidden out-pointer. */
+  context->returns_sysv_registers =
+      code_generator_binary_active_abi()->counts_classes_separately &&
+      code_generator_binary_function_is_abi_public(generator,
+                                                   ir_function->name) &&
+      code_generator_binary_classify_sysv_aggregate(
+          fn_return_type, &context->sysv_return_class) &&
+      !context->sysv_return_class.in_memory &&
+      context->sysv_return_class.eightbyte_count > 0;
+
   int has_hidden_return =
-      (code_generator_abi_classify(fn_return_type) == ABI_PASS_INDIRECT) ? 1 : 0;
+      (!context->returns_sysv_registers &&
+       code_generator_abi_classify(fn_return_type) == ABI_PASS_INDIRECT)
+          ? 1
+          : 0;
   if (has_hidden_return) {
     /* Account for the extra home slot in parameter_home_size so the frame
      * layout includes room for the hidden pointer. */
@@ -1889,7 +1903,8 @@ int code_generator_binary_prepare_function_context(
     {
       BinarySysvAggregate ret_agg;
       int sysv_register_return =
-          callee && callee->is_extern &&
+          code_generator_binary_function_is_abi_public(generator,
+                                                       pp_insn->text) &&
           code_generator_binary_active_abi()->counts_classes_separately &&
           code_generator_binary_classify_sysv_aggregate(ret_t, &ret_agg) &&
           !ret_agg.in_memory && ret_agg.eightbyte_count > 0;
@@ -1926,18 +1941,59 @@ int code_generator_binary_prepare_function_context(
     indirect_return_total += slot_bytes;
   }
 
+  /* Rebuild space for aggregate parameters SysV hands over in registers. The
+   * same predicate and classification the prologue uses, so the two agree on
+   * which parameters need it. */
+  int incoming_aggregate_total = 0;
+  if (ir_function->parameter_count > 0) {
+    context->incoming_aggregate_offsets =
+        calloc(ir_function->parameter_count, sizeof(int));
+    if (!context->incoming_aggregate_offsets) {
+      code_generator_set_error(generator,
+                               "Out of memory reserving aggregate parameter "
+                               "storage in function '%s'",
+                               ir_function->name);
+      binary_function_context_destroy(context);
+      return 0;
+    }
+    context->incoming_aggregate_count = ir_function->parameter_count;
+  }
+  if (code_generator_binary_active_abi()->counts_classes_separately &&
+      code_generator_binary_function_is_abi_public(generator,
+                                                   ir_function->name)) {
+    for (size_t i = 0; i < ir_function->parameter_count; i++) {
+      BinarySysvAggregate agg;
+      MtlcType *pt = code_generator_binary_get_resolved_type(
+          generator,
+          ir_function->parameter_types ? ir_function->parameter_types[i] : NULL,
+          0);
+      /* Only the shapes whose home holds a pointer need rebuilding. A small
+       * aggregate the backend already calls DIRECT keeps its value in the home
+       * slot exactly as before. */
+      if (!code_generator_binary_classify_sysv_aggregate(pt, &agg) ||
+          agg.in_memory || agg.eightbyte_count == 0 ||
+          code_generator_abi_classify(pt) != ABI_PASS_INDIRECT) {
+        continue;
+      }
+      incoming_aggregate_total += (int)((agg.size + 15u) & ~(size_t)15);
+      context->incoming_aggregate_offsets[i] =
+          parameter_home_size + local_home_size + temp_home_size +
+          indirect_return_total + incoming_aggregate_total;
+    }
+  }
+
   int saved_register_home_size =
       (int)(context->saved_register_count * BINARY_FUNCTION_STACK_SLOT_SIZE);
   for (size_t i = 0; i < context->saved_register_count; i++) {
     context->saved_register_offsets[i] =
         parameter_home_size + local_home_size + temp_home_size +
-        indirect_return_total +
+        indirect_return_total + incoming_aggregate_total +
         (int)((i + 1) * BINARY_FUNCTION_STACK_SLOT_SIZE);
   }
 
   context->raw_frame_size = parameter_home_size + local_home_size +
                             temp_home_size + indirect_return_total +
-                            saved_register_home_size;
+                            incoming_aggregate_total + saved_register_home_size;
   if (!binary_align_up_int(context->raw_frame_size, 16, &context->frame_size)) {
     code_generator_set_error(generator,
                              "Stack frame too large in function '%s'",

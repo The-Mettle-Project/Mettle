@@ -432,9 +432,22 @@ mir_shared_append:
     return 0;
   }
 
+  /* Only a function the outside can name gets a global symbol. An internal
+   * one is local, so an ordinary name like `close` or `read` no longer
+   * collides with the identically-named service the owned runtime exports for
+   * the standard library to bind. Kernels and swappable functions are reached
+   * by name from outside the object, so they stay global. */
   function_offset = section->size;
+  BinarySymbolBinding function_binding =
+      (!generator->whole_program ||
+       code_generator_binary_function_is_abi_public(generator,
+                                                    ir_function->name) ||
+       ir_function->is_kernel || ir_function->is_swappable ||
+       generator->generate_stack_trace_support || generator->debug_hooks)
+          ? BINARY_SYMBOL_GLOBAL
+          : BINARY_SYMBOL_LOCAL;
   if (!binary_emitter_define_symbol(emitter, ir_function->name,
-                                    BINARY_SYMBOL_GLOBAL, text_section,
+                                    function_binding, text_section,
                                     function_offset, context.code.size) ||
       !binary_emitter_append_bytes(emitter, text_section, context.code.data,
                                    context.code.size, NULL)) {

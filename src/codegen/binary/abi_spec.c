@@ -5,6 +5,7 @@
 #include "codegen/binary/internal.h"
 
 #include <stddef.h>
+#include <string.h>
 
 /* MS-x64: first four args by position in RCX/RDX/R8/R9 (or XMM0..3), 32-byte
  * shadow space, INDIRECT out-pointer in RCX. */
@@ -54,6 +55,35 @@ void code_generator_binary_select_abi(BinaryTargetFormat format) {
 }
 
 const BinaryAbi *code_generator_binary_active_abi(void) { return g_active_abi; }
+
+int code_generator_binary_function_is_abi_public(CodeGenerator *generator,
+                                                 const char *name) {
+  const CgSym *symbol = NULL;
+  IRFunction *function = NULL;
+
+  if (!name) {
+    return 0;
+  }
+  /* The startup object calls main, and a C caller may too. */
+  if (strcmp(name, "main") == 0) {
+    return 1;
+  }
+
+  symbol = code_generator_lookup_symbol(generator, name);
+  if (symbol && symbol->is_extern) {
+    return 1;
+  }
+
+  /* No body in this compilation means the definition is on the other side of
+   * a link, whether it was spelled `extern` or synthesized for a runtime
+   * helper. Either way the platform's rule is the only one both sides can
+   * agree on. */
+  function = code_generator_find_ir_function_binary(generator, name);
+  if (!function) {
+    return 1;
+  }
+  return function->is_exported;
+}
 
 /* SysV merges two classes for the same eightbyte by taking the stronger one.
  * INTEGER beats SSE, which is why a struct holding an int and a float in the

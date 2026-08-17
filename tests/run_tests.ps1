@@ -6783,6 +6783,60 @@ foreach ($mode in @("binary")) {
 # Companion repro: large structs containing float64 fields and engine-style
 # layouts (float64-first, trailing int32) plus heap allocation. Just verify the
 # repro builds and runs cleanly under both link modes; full byte-level scrutiny
+# The other direction across the C boundary: a C caller hands structs by value
+# to exported Mettle functions and reads one back. Microsoft x64 passes all of
+# these by pointer; System V splits them into eightbytes, so the same source
+# exercises whichever rule the host uses. 253 is the sum the driver checks.
+$total++
+try {
+  $gccCmd = Get-Command gcc -ErrorAction SilentlyContinue
+  if (-not $gccCmd) {
+    Write-CaseResult -Name "struct_abi_c_calls_mettle" -Passed $true `
+      -Reason "skipped: gcc not on PATH"
+  }
+  else {
+    $cObj = Join-Path $tmpDir "struct_abi_c_caller.o"
+    $cOut = & gcc -c tests/struct_abi_c_caller.c -o $cObj 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "C caller compile failed: $cOut" }
+
+    $exePath = Join-Path $tmpDir "struct_abi_c_calls_mettle.exe"
+    $buildOut = & $CompilerPath --build tests/test_struct_abi_c_calls_mettle.mettle `
+      -o $exePath --link-arg $cObj 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "build failed: $buildOut" }
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 253) {
+      throw "C caller got $LASTEXITCODE (expected 253); the sum names which shape is wrong"
+    }
+    Write-CaseResult -Name "struct_abi_c_calls_mettle" -Passed $true
+  }
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "struct_abi_c_calls_mettle" -Passed $false -Reason $_.Exception.Message
+}
+
+# A program may name its own functions `close`, `read`, `write` and so on. The
+# owned Linux runtime exports those same names for the standard library to bind,
+# so an internal function has to take local linkage or the link fails on a
+# duplicate.
+$total++
+try {
+  $exePath = Join-Path $tmpDir "runtime_name_collision.exe"
+  $buildOut = & $CompilerPath --build tests/test_runtime_name_collision.mettle -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "build failed: $buildOut"
+  }
+  & $exePath 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 63) {
+    throw "runtime-name program returned $LASTEXITCODE (expected 63)"
+  }
+  Write-CaseResult -Name "runtime_name_collision" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "runtime_name_collision" -Passed $false -Reason $_.Exception.Message
+}
+
 # of every line would be brittle if write_i64 formatting ever shifts.
 foreach ($mode in @("binary")) {
   $total++

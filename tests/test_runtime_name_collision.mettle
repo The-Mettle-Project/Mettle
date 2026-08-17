@@ -1,0 +1,12 @@
+// Ordinary names that the owned Linux runtime also exports. A program is
+// entitled to use them for its own functions.
+fn close(handle: int32) -> int32 { return handle + 1; }
+fn read(n: int32) -> int32 { return n + 2; }
+fn write(n: int32) -> int32 { return n + 4; }
+fn send(n: int32) -> int32 { return n + 8; }
+fn stat(n: int32) -> int32 { return n + 16; }
+fn abort(n: int32) -> int32 { return n + 32; }
+
+fn main() -> int32 {
+  return close(0) + read(0) + write(0) + send(0) + stat(0) + abort(0);
+}

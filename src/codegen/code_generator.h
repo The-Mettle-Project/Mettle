@@ -17,6 +17,10 @@ typedef struct {
   int generate_debug_info;
   int generate_stack_trace_support;
   int eliminate_unreachable_functions;
+  /* The whole program is in this object, so a function nothing outside names
+   * can take local linkage. A separately compiled object keeps every symbol
+   * global, because whoever links it may be calling in. */
+  int whole_program;
   int has_error;
   /* The failure in error_message is the programmer's, already phrased for them
      (today: a GPU-only construct compiled for a CPU target). The driver prints

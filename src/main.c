@@ -4229,6 +4229,7 @@ int compile_file(const char *input_filename, const char *output_filename,
                                          ? 1
                                          : 0);
   code_generator_set_debug_hooks(code_generator, options->debug_hooks ? 1 : 0);
+  code_generator->whole_program = options->building_executable ? 1 : 0;
   compiler_profile_add(&profile, PROFILE_PHASE_INIT, phase_start);
 
   int result = 0;

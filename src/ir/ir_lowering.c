@@ -144,6 +144,7 @@ IRFunction *ir_lower_function(IRLoweringContext *context,
   function->is_inline = function_data->is_inline;
   function->is_inline_contract = function_data->is_inline_contract;
   function->is_swappable = function_data->is_swappable;
+  function->is_exported = function_data->is_exported;
   /* The swap redirects a call, so the call must still exist at run time. This
    * is the cost the decorator buys, and it is why swappability is opt-in. */
   function->is_noinline =

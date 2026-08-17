@@ -5244,6 +5244,11 @@ int ir_program_eliminate_dead_functions(IRProgram *program) {
         live[i] = 1;
         worklist[worklist_count++] = i;
         found_main = 1;
+      } else if (program->functions[i]->is_exported) {
+        /* `export fn` says something outside this program may call it, so
+         * reachability from main does not decide whether it is needed. */
+        live[i] = 1;
+        worklist[worklist_count++] = i;
       }
     }
   }

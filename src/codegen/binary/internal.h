@@ -60,6 +60,37 @@ typedef enum {
   BINARY_XMM15 = 15,
 } BinaryXmmRegister;
 
+/* System V AMD64 aggregate classification.
+ *
+ * MS-x64 asks one question of an aggregate: does it fit in a register (1, 2, 4
+ * or 8 bytes) or not. SysV asks a different one. It cuts the aggregate into
+ * 8-byte chunks and gives each chunk its own class, so a 12-byte struct of
+ * integers travels in a register PAIR where MS-x64 would pass a pointer, and a
+ * {double,double} travels in two XMM registers. Anything over 16 bytes is
+ * MEMORY, which the caller copies onto the stack by value rather than passing
+ * by reference.
+ *
+ * Only the two-eightbyte window matters here: the classes array is sized for
+ * the 16-byte limit above which everything is MEMORY. */
+typedef enum {
+  BINARY_EIGHTBYTE_NONE = 0,
+  BINARY_EIGHTBYTE_INTEGER,
+  BINARY_EIGHTBYTE_SSE,
+} BinaryEightbyteClass;
+
+typedef struct {
+  /* MEMORY class: the caller copies the bytes into the outgoing stack area.
+   * When set, eightbyte_count is 0. */
+  int in_memory;
+  size_t size;
+  size_t eightbyte_count; /* 0, 1 or 2 */
+  BinaryEightbyteClass classes[2];
+  /* Filled by the caller, not the classifier: where this argument's first
+   * slot sits in the expanded layout array, since an aggregate can consume
+   * two entries where a scalar consumes one. */
+  size_t first_slot;
+} BinarySysvAggregate;
+
 typedef struct {
   unsigned char *data;
   size_t size;
@@ -242,6 +273,11 @@ typedef struct {
   int returns_indirect;
   /* Byte count of the INDIRECT return struct (0 if not INDIRECT). */
   size_t indirect_return_size;
+  /* Set when this function is reached under SysV and hands back an aggregate
+   * of 16 bytes or less, which travels in RAX/RDX or XMM0/XMM1 with no hidden
+   * out-pointer. Mutually exclusive with returns_indirect. */
+  int returns_sysv_registers;
+  BinarySysvAggregate sysv_return_class;
   /* FIFO of caller-side return-slot rbp offsets, one per IR_OP_CALL whose
    * callee returns INDIRECT. Populated in the function pre-pass, consumed
    * in instruction order by emit_call. */
@@ -249,6 +285,13 @@ typedef struct {
   size_t indirect_return_slot_count;
   size_t indirect_return_slot_capacity;
   size_t indirect_return_slot_cursor;
+  /* Storage for an aggregate parameter that SysV delivers in registers. The
+   * home slot holds one word, so a two-eightbyte struct is rebuilt here and
+   * the home is pointed at it, which is the shape the rest of the backend
+   * already expects from an INDIRECT parameter. One rbp offset per parameter;
+   * 0 means the parameter did not arrive that way. */
+  int *incoming_aggregate_offsets;
+  size_t incoming_aggregate_count;
   /* Side-table: which IR temps currently hold a POINTER to an indirect-
    * returned struct, with the byte size of that struct. Names are interned IR
    * strings (borrowed). */
@@ -352,42 +395,19 @@ typedef struct {
 const BinaryAbi *code_generator_binary_active_abi(void);
 void code_generator_binary_select_abi(BinaryTargetFormat format);
 
-/* System V AMD64 aggregate classification.
- *
- * MS-x64 asks one question of an aggregate: does it fit in a register (1, 2, 4
- * or 8 bytes) or not. SysV asks a different one. It cuts the aggregate into
- * 8-byte chunks and gives each chunk its own class, so a 12-byte struct of
- * integers travels in a register PAIR where MS-x64 would pass a pointer, and a
- * {double,double} travels in two XMM registers. Anything over 16 bytes is
- * MEMORY, which the caller copies onto the stack by value rather than passing
- * by reference.
- *
- * Only the two-eightbyte window matters here: the classes array is sized for
- * the 16-byte limit above which everything is MEMORY. */
-typedef enum {
-  BINARY_EIGHTBYTE_NONE = 0,
-  BINARY_EIGHTBYTE_INTEGER,
-  BINARY_EIGHTBYTE_SSE,
-} BinaryEightbyteClass;
-
-typedef struct {
-  /* MEMORY class: the caller copies the bytes into the outgoing stack area.
-   * When set, eightbyte_count is 0. */
-  int in_memory;
-  size_t size;
-  size_t eightbyte_count; /* 0, 1 or 2 */
-  BinaryEightbyteClass classes[2];
-  /* Filled by the caller, not the classifier: where this argument's first
-   * slot sits in the expanded layout array, since an aggregate can consume
-   * two entries where a scalar consumes one. */
-  size_t first_slot;
-} BinarySysvAggregate;
 
 /* Classifies an aggregate under SysV. Returns 0 when `type` is not an
  * aggregate the classifier handles, in which case *out is left zeroed and the
  * caller should treat the type as an ordinary scalar. */
 int code_generator_binary_classify_sysv_aggregate(MtlcType *type,
                                                   BinarySysvAggregate *out);
+
+/* Is this function reached from outside the compilation, and therefore under
+ * the platform's C ABI rather than Mettle's internal convention? True for
+ * `extern` declarations, `export fn` definitions, and main. Both sides of a
+ * call ask this of the CALLEE, so caller and callee always agree. */
+int code_generator_binary_function_is_abi_public(CodeGenerator *generator,
+                                                 const char *name);
 
 /* Where a single argument or parameter is passed under the active ABI. */
 typedef enum {
