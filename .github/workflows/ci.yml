@@ -313,6 +313,38 @@ jobs:
           gcc -std=c11 -O2 -Wall -Wextra -Werror tests/tensor_matmul_oracle.c -o /tmp/mettle-tensor-matmul-oracle
           /tmp/mettle-tensor-matmul-oracle | grep -q 'structured 2:4, FP8/FP6/FP4 block scales, packed streams, K=0, and no-op bounds OK'
 
+      # This host reports ELF_ARM64, and code that asks "is the target ELF" by
+      # comparing against ELF_X64 alone answers "no" here and quietly takes the
+      # Windows branch: .obj outputs, the COFF symbol scanner on ELF objects,
+      # and an import resolver picking io.mettle over io.linux.mettle. Nothing
+      # else in CI runs the compiler on an ELF host that is not x86-64, so
+      # these three assertions are the only thing standing under that.
+      - name: Host target reporting on a non-x86 ELF host
+        run: |
+          ./bin/mettle --version | tee /tmp/mettle-version.txt
+          grep -q 'host: aarch64' /tmp/mettle-version.txt
+          grep -qi 'elf' /tmp/mettle-version.txt
+          if grep -qi 'windows\|COFF' /tmp/mettle-version.txt; then
+            echo "an ELF host reported a COFF target"; exit 1
+          fi
+
+          # No -o: the default object name follows the target's convention.
+          work="$(mktemp -d)"
+          cp tests/ok_global_int.mettle "$work/prog.mettle"
+          ( cd "$work" && "$GITHUB_WORKSPACE/bin/mettle" prog.mettle )
+          test -f "$work/output.o"
+          if [ -f "$work/output.obj" ]; then
+            echo "an ELF host wrote a COFF object name"; exit 1
+          fi
+
+          # The resolver has to pick the .linux standard library. The Windows
+          # one binds the MSVCRT stdio handle helper, so its name appearing
+          # among the undefined symbols means the wrong module was selected.
+          ./bin/mettle tests/test_std_io.mettle -o /tmp/mettle-arm64-stdio.o
+          if nm -u /tmp/mettle-arm64-stdio.o | grep -q '__acrt_iob_func'; then
+            echo "the Windows standard library was selected on an ELF host"; exit 1
+          fi
+
       - name: Execute AArch64 backend smoke test natively
         run: |
           ./bin/mettle --emit-arm64 tests/arm64/sum.mettle -o /tmp/mettle-arm64-sum
