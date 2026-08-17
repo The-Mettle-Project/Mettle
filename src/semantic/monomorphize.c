@@ -94,6 +94,27 @@ static char *mangle_name(const char *base, char **type_args,
   return result;
 }
 
+static char *written_generic_name(const char *base, char **type_args,
+                                  size_t type_arg_count) {
+  size_t len = strlen(base) + 3;
+  for (size_t i = 0; i < type_arg_count; i++) {
+    len += strlen(type_args[i]) + 2;
+  }
+
+  char *result = malloc(len);
+  if (!result)
+    return NULL;
+
+  size_t pos = (size_t)snprintf(result, len, "%s<", base);
+  for (size_t i = 0; i < type_arg_count; i++) {
+    pos += (size_t)snprintf(result + pos, len - pos, "%s%s", i ? ", " : "",
+                            type_args[i]);
+  }
+  snprintf(result + pos, len - pos, ">");
+
+  return result;
+}
+
 static void mono_report_error(MonoContext *ctx, SourceLocation location,
                               const char *message) {
   if (!ctx) {
@@ -1552,10 +1573,16 @@ static void rewrite_generic_references(ASTNode *node, MonoContext *ctx) {
   case AST_FUNCTION_CALL: {
     CallExpression *ce = (CallExpression *)node->data;
     if (ce && ce->type_arg_count > 0 && ce->function_name) {
+      char *written = written_generic_name(ce->function_name, ce->type_args,
+                                           ce->type_arg_count);
       char *mangled =
           mangle_name(ce->function_name, ce->type_args, ce->type_arg_count);
       mettle_free_string(ce->function_name);
       ce->function_name = mangled;
+      if (written) {
+        mettle_free_string(ce->written_name);
+        ce->written_name = written;
+      }
       for (size_t i = 0; i < ce->type_arg_count; i++)
         mettle_free_string(ce->type_args[i]);
       free(ce->type_args);
@@ -2085,6 +2112,9 @@ static int mono_rewrite_trait_method_call(MonoContext *ctx, ASTNode *node,
   call->argument_count++;
   ast_add_child(node, self_arg);
 
+  if (!call->written_name) {
+    call->written_name = strdup(call->function_name);
+  }
   mettle_free_string(call->function_name);
   call->function_name = mangled;
   call->object = NULL;

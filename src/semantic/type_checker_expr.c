@@ -2331,8 +2331,10 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
     Symbol *func_symbol =
         symbol_table_lookup(checker->symbol_table, call->function_name);
     if (!func_symbol) {
-      type_checker_report_undefined_symbol(checker, expression->location,
-                                           call->function_name, "function");
+      type_checker_report_undefined_symbol(
+          checker, expression->location,
+          call->written_name ? call->written_name : call->function_name,
+          "function");
       return NULL;
     }
 

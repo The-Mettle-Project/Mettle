@@ -268,6 +268,7 @@ ASTNode *ast_clone_node(ASTNode *node) {
     dst->tensor_epilogue_bias_stride_argument =
         src->tensor_epilogue_bias_stride_argument;
     dst->type_arg_count = src->type_arg_count;
+    dst->written_name = ast_intern_string(src->written_name);
     dst->is_indirect_call = src->is_indirect_call;
     dst->callee_closure_env = src->callee_closure_env;
     dst->object = src->object ? ast_clone_node(src->object) : NULL;
@@ -1123,6 +1124,7 @@ void ast_destroy_node(ASTNode *node) {
         ast_free_string(call_expr->type_args[i]);
       }
       free(call_expr->type_args);
+      ast_free_string(call_expr->written_name);
       free(call_expr);
     }
     break;
@@ -1790,6 +1792,7 @@ ASTNode *ast_create_call_expression(const char *function_name,
   call_expr->object = NULL;
   call_expr->type_args = NULL;
   call_expr->type_arg_count = 0;
+  call_expr->written_name = NULL;
   call_expr->is_indirect_call = 0;
   call_expr->callee_closure_env = NULL;
   call_expr->is_gpu_index = 0;
@@ -2252,6 +2255,7 @@ ASTNode *ast_create_method_call(ASTNode *object, const char *method_name,
   call_expr->object = object;
   call_expr->type_args = NULL;
   call_expr->type_arg_count = 0;
+  call_expr->written_name = NULL;
   call_expr->is_indirect_call = 0;
   call_expr->callee_closure_env = NULL;
   call_expr->is_gpu_index = 0;
@@ -2468,6 +2472,7 @@ int ast_fold_call_to_identifier(ASTNode *node, const char *name) {
       ast_free_string(call->type_args[i]);
     }
     free(call->type_args);
+    ast_free_string(call->written_name);
     free(call);
   }
   node->type = AST_IDENTIFIER;

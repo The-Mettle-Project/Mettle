@@ -260,6 +260,10 @@ typedef struct {
   ASTNode *object; // Non-null for method calls (obj.method(args))
   char **type_args;
   size_t type_arg_count;
+  /* Monomorphization overwrites function_name with the mangled instance name
+   * and drops type_args, so diagnostics have nothing left to quote. This keeps
+   * the callee as written. */
+  char *written_name;
   int is_indirect_call; // 1 if callee is a variable with function pointer type
   struct Type *callee_closure_env; // non-NULL if the callee is a capturing
                                    // closure; set by the type checker
