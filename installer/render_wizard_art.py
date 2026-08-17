@@ -5,7 +5,7 @@ rather than hand-drawn: every size is laid out from the same proportions and
 the same palette the site uses, and text is drawn at each size instead of
 scaled up from one bitmap.
 
-    python installer/render_wizard_art.py --version=0.16.0
+    python installer/render_wizard_art.py --version=0.16.1
 
 Writes installer/art/*.png plus version.isi, which Mettle.iss includes to
 refuse a build whose version does not match the one drawn on the banner.
@@ -46,7 +46,7 @@ def version():
     for arg in sys.argv[1:]:
         if arg.startswith("--version="):
             return arg.split("=", 1)[1]
-    return "0.16.0"
+    return "0.16.1"
 
 
 def mix(a, b, t):
