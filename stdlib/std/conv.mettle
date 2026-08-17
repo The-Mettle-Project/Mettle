@@ -70,7 +70,182 @@ export fn to_upper(c: int32) -> int32 {
   return c;
 }
 
-// ─── String utilities ───────────────────────────────────────────────────────
+// ─── Strings ────────────────────────────────────────────────────────────────
+//
+// These work on `string`, which is a borrowed view: a pointer and a length,
+// no terminator. Every function here that returns a `string` returns a view
+// INTO ITS INPUT. Nothing allocates, nothing copies, and nothing outlives the
+// bytes it points at, so a view of a heap string dies with the buffer.
+//
+// Equality is the language's own `==`, which compares contents, so there is no
+// str_eq here. The `cstr_*` and `atoi`/`atol` functions below are the C
+// boundary and take `cstring` because that is what a C library will read.
+
+// The view of `s` starting at `start` and running `len` bytes, clamped to what
+// `s` actually holds. A start past the end gives an empty view rather than a
+// pointer past the buffer, so a slice computed from a search that failed is
+// harmless instead of wild.
+export fn str_slice(s: string, start: int64, len: int64) -> string {
+  var out: string;
+  var n: int64 = (int64)s.length;
+  var from: int64 = start;
+  var take: int64 = len;
+
+  if (from < 0) { from = 0; }
+  if (from > n) { from = n; }
+  if (take < 0) { take = 0; }
+  if (from + take > n) { take = n - from; }
+
+  out.chars = s.chars + from;
+  out.length = (uint64)take;
+  return out;
+}
+
+// Whether the bytes of `needle` sit at `offset`. Out of range answers 0: a
+// needle cannot match where there is nothing to match against.
+export fn str_eq_at(s: string, offset: int64, needle: string) -> int32 {
+  var n: int64 = (int64)s.length;
+  var m: int64 = (int64)needle.length;
+
+  if (offset < 0) { return 0; }
+  if (offset + m > n) { return 0; }
+
+  var i: int64 = 0;
+  while (i < m) {
+    if (s.chars[offset + i] != needle.chars[i]) { return 0; }
+    i = i + 1;
+  }
+  return 1;
+}
+
+export fn str_starts_with(s: string, prefix: string) -> int32 {
+  return str_eq_at(s, 0, prefix);
+}
+
+export fn str_ends_with(s: string, suffix: string) -> int32 {
+  return str_eq_at(s, (int64)s.length - (int64)suffix.length, suffix);
+}
+
+// The index of the first occurrence of `needle`, or -1. An empty needle
+// matches at 0, which is what makes `str_find(s, "") == 0` agree with
+// `str_starts_with(s, "")`.
+export fn str_find(s: string, needle: string) -> int64 {
+  var n: int64 = (int64)s.length;
+  var m: int64 = (int64)needle.length;
+
+  if (m > n) { return -1; }
+
+  var i: int64 = 0;
+  while (i + m <= n) {
+    if (str_eq_at(s, i, needle) == 1) { return i; }
+    i = i + 1;
+  }
+  return -1;
+}
+
+export fn str_contains(s: string, needle: string) -> int32 {
+  if (str_find(s, needle) < 0) { return 0; }
+  return 1;
+}
+
+// The index of the first byte equal to `c`, or -1. Cheaper than str_find for
+// the single-byte case, which is most of them.
+export fn str_find_byte(s: string, c: int32) -> int64 {
+  var n: int64 = (int64)s.length;
+  var i: int64 = 0;
+  while (i < n) {
+    if ((int32)s.chars[i] == c) { return i; }
+    i = i + 1;
+  }
+  return -1;
+}
+
+export fn str_trim_start(s: string) -> string {
+  var n: int64 = (int64)s.length;
+  var i: int64 = 0;
+  while (i < n) {
+    if (is_space((int32)s.chars[i]) == 0) { break; }
+    i = i + 1;
+  }
+  return str_slice(s, i, n - i);
+}
+
+export fn str_trim_end(s: string) -> string {
+  var n: int64 = (int64)s.length;
+  while (n > 0) {
+    if (is_space((int32)s.chars[n - 1]) == 0) { break; }
+    n = n - 1;
+  }
+  return str_slice(s, 0, n);
+}
+
+export fn str_trim(s: string) -> string {
+  return str_trim_start(str_trim_end(s));
+}
+
+// Split at the first `sep`. Returns the part before it, the part after it, and
+// 1 when the separator was found. When it was not, the whole string comes back
+// as the head with 0, so a caller that ignores the flag still sees every byte
+// exactly once.
+export fn str_split_once(s: string, sep: string) -> (string, string, int32) {
+  var at: int64 = str_find(s, sep);
+  if (at < 0) {
+    return (s, str_slice(s, (int64)s.length, 0), 0);
+  }
+  var after: int64 = at + (int64)sep.length;
+  return (str_slice(s, 0, at), str_slice(s, after, (int64)s.length - after), 1);
+}
+
+// Parse a decimal integer, with an optional leading sign. Returns the value
+// and whether the WHOLE view was digits: a partial parse is a failure here,
+// because a caller that wanted a prefix can slice one first. Unlike atoi this
+// needs no terminator, so it reads a field out of a buffer without copying.
+export fn str_to_i64(s: string) -> (int64, int32) {
+  var n: int64 = (int64)s.length;
+  if (n == 0) { return (0, 0); }
+
+  var i: int64 = 0;
+  var negative: int32 = 0;
+  if ((int32)s.chars[0] == 45) {
+    negative = 1;
+    i = 1;
+  } else if ((int32)s.chars[0] == 43) {
+    i = 1;
+  }
+  if (i >= n) { return (0, 0); }
+
+  var value: int64 = 0;
+  while (i < n) {
+    var c: int32 = (int32)s.chars[i];
+    if (is_digit(c) == 0) { return (0, 0); }
+    value = value * 10 + (int64)char_to_digit(c);
+    i = i + 1;
+  }
+
+  if (negative == 1) { return (0 - value, 1); }
+  return (value, 1);
+}
+
+// Write `n` as decimal into `buf` and return a view of what was written. The
+// caller owns the bytes, so the view lives exactly as long as the buffer does.
+// 21 bytes hold any int64 including the sign. An undersized buffer yields an
+// empty view rather than a truncated number, since a truncated number reads
+// as a different number.
+export fn i64_to_str(n: int64, buf: uint8*, buf_len: int64) -> string {
+  var out: string;
+  out.chars = buf;
+  out.length = (uint64)0;
+  if (buf_len < 21) { return out; }
+
+  var written: int32 = int_to_dec(buf, n);
+  out.length = (uint64)written;
+  return out;
+}
+
+// ─── C string boundary ──────────────────────────────────────────────────────
+//
+// These take `cstring` because a C library reads up to a NUL. Mettle code
+// working in Mettle should reach for the `str_*` functions above.
 
 // Return the length of a null-terminated C string.
 // Named cstr_len, not strlen: the freestanding runtime is linked into every
@@ -86,7 +261,7 @@ export fn cstr_len(s: cstring) -> int64 {
 
 // Convert an integer to decimal ASCII in buf and append a trailing NUL.
 // Returns the number of digits written, excluding the trailing NUL.
-export fn int_to_dec(buf: cstring, n: int64) -> int32 {
+export fn int_to_dec(buf: uint8*, n: int64) -> int32 {
   var tmp: int32[32];
   var value: int64 = n;
   var digits: int32 = 0;
@@ -134,7 +309,7 @@ export fn int_to_dec(buf: cstring, n: int64) -> int32 {
 // Copy pattern into buf, replacing %d with the decimal form of value.
 // Returns the number of bytes written excluding the trailing NUL, or -1 if the
 // output would not fit.
-export fn format_i64(buf: cstring, buf_len: int32, pattern: string, value: int64) -> int32 {
+export fn format_i64(buf: uint8*, buf_len: int32, pattern: string, value: int64) -> int32 {
   var num_buf: uint8[32];
   var num_len: int32 = int_to_dec(&num_buf[0], value);
   var src: int32 = 0;
@@ -197,7 +372,7 @@ export fn streq(a: cstring, b: cstring) -> int32 {
 
 // Compare buf[offset..] with a string, bounded by buf_len.
 // Returns 0 on exact match, non-zero otherwise.
-export fn cstr_ncmp(buf: cstring, offset: int32, needle: string, buf_len: int32) -> int32 {
+export fn cstr_ncmp(buf: uint8*, offset: int32, needle: string, buf_len: int32) -> int32 {
   if (offset < 0) { return -1; }
   if (buf_len < 0) { return -1; }
   if (offset > buf_len) { return -1; }

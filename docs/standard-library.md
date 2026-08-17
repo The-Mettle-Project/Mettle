@@ -75,8 +75,57 @@ Accuracy: kernels carry enough terms that truncation error sits below the roundi
 
 ## std/conv
 
-Conversions and character classification. The owned runtime supplies `atoi` and
-`atol`. The rest of the module uses Mettle code.
+Conversions, character classification, and string operations. The owned runtime
+supplies `atoi` and `atol`. The rest of the module is Mettle code.
+
+### Strings
+
+These take and return `string`, which is a borrowed view of a pointer and a
+length. **Every function that returns a `string` returns a view into its
+input.** Nothing allocates, nothing copies, and a view dies with the bytes it
+was cut from, so a view of a heap string is invalid once that buffer is freed.
+
+| | |
+|---|---|
+| `str_slice(s, start, len)` | the view at `start`, clamped to what `s` holds |
+| `str_starts_with(s, prefix)` / `str_ends_with(s, suffix)` | 1 or 0 |
+| `str_eq_at(s, offset, needle)` | whether `needle`'s bytes sit at `offset` |
+| `str_find(s, needle)` | first index, or -1 |
+| `str_find_byte(s, c)` | first index of a byte, or -1 |
+| `str_contains(s, needle)` | 1 or 0 |
+| `str_trim(s)` / `str_trim_start(s)` / `str_trim_end(s)` | whitespace removed |
+| `str_split_once(s, sep)` | `(head, tail, found)` |
+| `str_to_i64(s)` | `(value, ok)`; needs no terminator |
+| `i64_to_str(n, buf, buf_len)` | writes into `buf`, returns a view of it |
+
+There is no `str_eq`: `==` and `!=` compare contents (see
+[Types](types.md#comparison)).
+
+`str_slice` clamps rather than trusting its arguments, so a slice taken from a
+search that returned -1 is an empty view instead of a pointer past the buffer.
+`str_to_i64` requires the whole view to be digits, because a caller who wanted
+a prefix can slice one first, and a partial parse that silently succeeds is the
+harder bug. `i64_to_str` returns an empty view when the buffer cannot hold the
+number, since a truncated number reads as a different number.
+
+```mettle
+var head: string = "";
+var tail: string = "";
+var found: int32 = 0;
+(head, tail, found) = str_split_once("id=907", "=");
+
+var value: int64 = 0;
+var ok: int32 = 0;
+(value, ok) = str_to_i64(tail);        // 907, no allocation anywhere
+```
+
+### The C boundary
+
+`atoi`, `atol`, `cstr_len`, `streq`, and `cstr_ncmp` take `cstring` because a C
+library reads up to a NUL. Mettle code working in Mettle should use the `str_*`
+functions above. `int_to_dec` and `format_i64` write into a caller buffer and
+take `uint8*`, which is what that buffer is; they append a terminator so the
+result can be handed to C.
 
 String helpers are named `cstr_len` and `cstr_ncmp` rather than `strlen` and
 `strncmp`. The freestanding runtime is linked into every program and defines the

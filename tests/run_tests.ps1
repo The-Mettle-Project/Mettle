@@ -2657,6 +2657,31 @@ foreach ($strEqMode in @("debug", "release")) {
   }
 }
 
+# std/conv's string-native half: slicing, searching, trimming, splitting and
+# parsing, all on `string` and all returning views into the input. Every
+# returned view crosses a call boundary, so this also exercises string
+# return-by-value at scale rather than in isolation.
+foreach ($sopsMode in @("debug", "release")) {
+  $total++
+  try {
+    $exe = Join-Path $tmpDir "std_string_ops_$sopsMode.exe"
+    $buildArgs = @()
+    if ($sopsMode -eq "release") { $buildArgs += "--release" }
+    $buildArgs += @("--build", "tests\test_std_string_ops.mettle", "-o", $exe)
+    $out = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "std string ops ($sopsMode) build failed: $out" }
+    & $exe *> $null
+    if ($LASTEXITCODE -ne 88) {
+      throw "std string ops ($sopsMode) returned $LASTEXITCODE (expected 88; the code names the function)"
+    }
+    Write-CaseResult -Name "std_string_ops_$sopsMode" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "std_string_ops_$sopsMode" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # `string` moves like the two-field record it is: copied whole, returned
 # through a hidden pointer, stored inline in an aggregate. It used to be a
 # pointer in some places and the record in others, and the disagreements were

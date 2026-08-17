@@ -1,0 +1,95 @@
+// The string-native half of std/conv. These take and return `string`, which is
+// a borrowed view, so every returned value points into the input: nothing here
+// allocates, and nothing outlives the bytes it was cut from.
+//
+// Each check returns its own code so a failure names the function that broke.
+
+import "std/conv"
+
+fn main() -> int32 {
+    var s: string = "hello world";
+
+    // Slicing, with the clamping that keeps a bad index from producing a wild
+    // pointer.
+    if (str_slice(s, 0, 5) != "hello") { return 1; }
+    if (str_slice(s, 6, 5) != "world") { return 2; }
+    if (str_slice(s, 6, 999) != "world") { return 3; }   // length clamped
+    if (str_slice(s, 99, 5) != "") { return 4; }         // start past the end
+    if (str_slice(s, 0 - 3, 5) != "hello") { return 5; } // negative start
+
+    // Prefix, suffix, and position.
+    if (str_starts_with(s, "hello") != 1) { return 6; }
+    if (str_starts_with(s, "world") != 0) { return 7; }
+    if (str_ends_with(s, "world") != 1) { return 8; }
+    if (str_ends_with(s, "hello") != 0) { return 9; }
+    if (str_find(s, "o") != 4) { return 10; }
+    if (str_find(s, "world") != 6) { return 11; }
+    if (str_find(s, "zebra") != 0 - 1) { return 12; }
+    if (str_find_byte(s, 32) != 5) { return 13; }        // the space
+    if (str_contains(s, "lo w") != 1) { return 14; }
+    if (str_contains(s, "lo  w") != 0) { return 15; }
+
+    // A needle longer than the haystack cannot match, and must not read past.
+    if (str_find("ab", "abc") != 0 - 1) { return 16; }
+    // An empty needle matches at the start, agreeing with starts_with.
+    if (str_find(s, "") != 0) { return 17; }
+    if (str_starts_with(s, "") != 1) { return 18; }
+
+    // Trimming, including strings that are all space or empty.
+    if (str_trim("  padded  ") != "padded") { return 19; }
+    if (str_trim_start("  x") != "x") { return 20; }
+    if (str_trim_end("x  ") != "x") { return 21; }
+    if (str_trim("     ") != "") { return 22; }
+    if (str_trim("") != "") { return 23; }
+    if (str_trim("none") != "none") { return 24; }
+
+    // Splitting. The head/tail cover every byte exactly once either way.
+    var head: string = "";
+    var tail: string = "";
+    var found: int32 = 0;
+    (head, tail, found) = str_split_once("key=value", "=");
+    if (found != 1) { return 25; }
+    if (head != "key") { return 26; }
+    if (tail != "value") { return 27; }
+
+    (head, tail, found) = str_split_once("novalue", "=");
+    if (found != 0) { return 28; }
+    if (head != "novalue") { return 29; }
+    if (tail != "") { return 30; }
+
+    // Parsing, with no terminator anywhere in sight.
+    var value: int64 = 0;
+    var ok: int32 = 0;
+    (value, ok) = str_to_i64("1234");
+    if (ok != 1 || value != 1234) { return 31; }
+    (value, ok) = str_to_i64("-42");
+    if (ok != 1 || value != 0 - 42) { return 32; }
+    (value, ok) = str_to_i64("+7");
+    if (ok != 1 || value != 7) { return 33; }
+    (value, ok) = str_to_i64("12a");
+    if (ok != 0) { return 34; }                          // partial is a failure
+    (value, ok) = str_to_i64("");
+    if (ok != 0) { return 35; }
+    (value, ok) = str_to_i64("-");
+    if (ok != 0) { return 36; }
+
+    // Parsing a field sliced straight out of a larger buffer.
+    var record: string = "id=907;";
+    (head, tail, found) = str_split_once(record, "=");
+    (value, ok) = str_to_i64(str_slice(tail, 0, (int64)tail.length - 1));
+    if (ok != 1 || value != 907) { return 37; }
+
+    // Formatting into a caller-owned buffer, returned as a view of it.
+    var buf: uint8[32];
+    if (i64_to_str(4096, &buf[0], 32) != "4096") { return 38; }
+    if (i64_to_str(0 - 5, &buf[0], 32) != "-5") { return 39; }
+    if (i64_to_str(0, &buf[0], 32) != "0") { return 40; }
+    // Too small a buffer yields nothing rather than a truncated number.
+    if (i64_to_str(4096, &buf[0], 4) != "") { return 41; }
+
+    // Round trip.
+    (value, ok) = str_to_i64(i64_to_str(0 - 987654, &buf[0], 32));
+    if (ok != 1 || value != 0 - 987654) { return 42; }
+
+    return 88;
+}
