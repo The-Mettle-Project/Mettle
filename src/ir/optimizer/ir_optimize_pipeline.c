@@ -37,7 +37,18 @@ typedef struct {
  * driver stops the build if the form fails to converge, so a recognizer never
  * matches against a shape the compiler has not finished normalizing. */
 #define IR_OPT_CANONICAL_MAX_ITERATIONS 6
-#define IR_OPT_RECOGNIZER_MAX_ITERATIONS 3
+/* Two, because a third sweep was measured to change nothing.
+ *
+ * The worklist re-offers a recognizer whenever the IR moved after it last
+ * came back clean, so the bound is only reached when the previous sweep
+ * actually changed something. Two sweeps give every pass the second chance
+ * the old array hand-coded by listing seven of them twice. A third produced
+ * byte-identical object code across all 78 examples and test inputs, while
+ * costing up to 36% on a function holding hundreds of loops, where one claim
+ * un-cleans every other recognizer and forces a full re-scan. Raising this
+ * again is fine, but measure the output, not just the runtime: if the bytes
+ * do not move, the sweep is pure cost. */
+#define IR_OPT_RECOGNIZER_MAX_ITERATIONS 2
 
 #define IR_GATE_LOOP {IR_OPT_LABEL_JUMP, IR_OPT_REQUIRE_NONE}
 #define IR_GATE_LOOP_LOAD                                                     \
@@ -339,8 +350,8 @@ static int ir_loop_fp_enabled(void) {
 
 static int ir_loop_fp_snapshot(IRFunction *function, IRLoopFpEntry *entries) {
   int count = 0;
-  for (size_t i = 0; i < function->instruction_count && count < IR_FP_MAX_LOOPS;
-       i++) {
+  int total = 0;
+  for (size_t i = 0; i < function->instruction_count; i++) {
     const IRInstruction *ins = &function->instructions[i];
     if (ins->op != IR_OP_LABEL || !ir_label_is_while_header(ins->text)) {
       continue;
@@ -349,9 +360,22 @@ static int ir_loop_fp_snapshot(IRFunction *function, IRLoopFpEntry *entries) {
     if (!ir_affine_model_loop(function, i, &loop)) {
       continue;
     }
+    total++;
+    if (count >= IR_FP_MAX_LOOPS) {
+      continue; /* keep counting so the cap can be reported honestly */
+    }
     entries[count].label = ins->text;
     entries[count].fp = ir_affine_loop_fingerprint(function, &loop);
     count++;
+  }
+  /* A gate that quietly covered a prefix of the loops would read as a clean
+   * run. Say what was left out instead. */
+  if (total > count) {
+    fprintf(stderr,
+            "[loop-fp] NOTE function=%s has %d modelled loops but the cap is "
+            "%d; %d are unchecked\n",
+            function->name ? function->name : "<anonymous>", total,
+            IR_FP_MAX_LOOPS, total - count);
   }
   return count;
 }

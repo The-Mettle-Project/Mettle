@@ -173,28 +173,46 @@ typedef struct {
   const char *exit_label;
 } IRWhileLoopBounds;
 
-/* The shared affine loop model (ir_optimize_affine.c): the structural facts
- * every loop recognizer gates on, computed once per loop. */
+/* The shared affine loop model (ir_optimize_affine.c).
+ *
+ * Modelling a loop fills the cheap structural fields directly. The facts that
+ * cost a scan are computed on demand by the accessors below and cached in the
+ * struct, because a recognizer typically rejects a loop on its own kernel
+ * shape long before it needs to know whether the counter starts at zero, and
+ * a model that computed everything eagerly would charge every recognizer for
+ * every other recognizer's preconditions. Ask for what you gate on. */
 typedef struct {
   IRWhileLoopBounds bounds;
+  IRFunction *function; /* the loop's function, for the lazy queries */
   size_t header_index;
   const char *iv;      /* counter symbol of `while (iv < bound)` */
   IROperand bound;     /* symbol or integer literal */
   size_t body_start;   /* first body instruction (after the guard branch) */
   size_t body_end;     /* the back-edge jump */
-  long long step;      /* counter step when recognized (currently 1) */
-  size_t step_index;   /* the increment instruction when unit_step */
-  int unit_step;       /* body contains `iv = iv + 1` */
-  int starts_at_zero;  /* proven by ir_iv_zero_at_header */
-  int straight_line_body; /* no interior control flow, calls, or prefetch */
-  int bound_invariant; /* bound is a literal or unwritten in the body */
-  /* Body holds a nested loop or a --safe check, so a recognizer that replaced
-   * it wholesale would delete instructions the shape does not account for. */
-  int body_unclaimable;
+  long long step;      /* counter step, valid once ir_affine_unit_step asked */
+  size_t step_index;   /* the increment instruction, same condition */
+  /* Cached lazy answers: -1 not yet asked, else 0/1. */
+  signed char c_unit_step;
+  signed char c_starts_at_zero;
+  signed char c_straight_line;
+  signed char c_bound_invariant;
+  signed char c_unclaimable;
 } IRAffineLoop;
 
 int ir_affine_model_loop(IRFunction *function, size_t header_index,
                          IRAffineLoop *out);
+/* Body contains `iv = iv + 1` (fills step / step_index when true). */
+int ir_affine_unit_step(IRAffineLoop *loop);
+/* The counter provably holds 0 on entry to the header. */
+int ir_affine_starts_at_zero(IRAffineLoop *loop);
+/* No interior control flow, call, or prefetch in the body. */
+int ir_affine_straight_line_body(IRAffineLoop *loop);
+/* The bound is a literal, or a symbol the body never writes. */
+int ir_affine_bound_invariant(IRAffineLoop *loop);
+/* Body holds a nested loop or a --safe check, so a recognizer that replaced
+ * it wholesale would delete instructions its shape does not account for.
+ * Forgetting to ask this is how a vectorizer erases a bounds check. */
+int ir_affine_body_unclaimable(IRAffineLoop *loop);
 int ir_affine_index_decompose(const IRFunction *function, size_t before,
                               const IROperand *index, const char **name_out,
                               long long *coeff_out, long long *addend_out);

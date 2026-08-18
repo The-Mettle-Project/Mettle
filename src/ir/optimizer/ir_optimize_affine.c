@@ -49,7 +49,6 @@ int ir_affine_model_loop(IRFunction *function, size_t header_index,
   if (!ir_find_while_loop_bounds(function, header_index, &out->bounds)) {
     return 0;
   }
-  out->header_index = header_index;
 
   const IRInstruction *compare =
       &function->instructions[out->bounds.compare_index];
@@ -59,53 +58,96 @@ int ir_affine_model_loop(IRFunction *function, size_t header_index,
       compare->rhs.kind != IR_OPERAND_INT) {
     return 0;
   }
+  out->function = function;
+  out->header_index = header_index;
   out->iv = compare->lhs.name;
   out->bound = compare->rhs;
   out->body_start = out->bounds.branch_index + 1;
   out->body_end = out->bounds.jump_index;
-
-  out->straight_line_body = 1;
-  for (size_t i = out->body_start; i < out->body_end; i++) {
-    IROpcode op = function->instructions[i].op;
-    if (op == IR_OP_LABEL || op == IR_OP_JUMP || op == IR_OP_BRANCH_ZERO ||
-        op == IR_OP_BRANCH_EQ || op == IR_OP_CALL ||
-        op == IR_OP_CALL_INDIRECT || op == IR_OP_PREFETCH) {
-      out->straight_line_body = 0;
-      break;
-    }
-  }
-
-  out->unit_step = 0;
-  out->step = 0;
-  for (size_t i = out->body_start; i < out->body_end; i++) {
-    if (ir_try_parse_direct_unit_increment(&function->instructions[i],
-                                           out->iv)) {
-      out->unit_step = 1;
-      out->step = 1;
-      out->step_index = i;
-      break;
-    }
-  }
-
-  /* Is the body off limits to a recognizer that would replace it wholesale?
-   * A nested loop is the long-standing reason; a --safe check is the one that
-   * matters more, because a recognizer that matched anyway would erase the
-   * check along with the body and leave the program unchecked in exactly the
-   * hot loop the mode exists to cover. Every recognizer had to remember to
-   * ask this separately, and forgetting it is silent. Asking it here means a
-   * recognizer reading the model has the answer in front of it. */
-  out->body_unclaimable =
-      ir_loop_body_is_unclaimable(function, out->body_start, out->body_end)
-          ? 1
-          : 0;
-
-  out->starts_at_zero =
-      ir_iv_zero_at_header(function, header_index, out->iv) ? 1 : 0;
-  out->bound_invariant =
-      out->bound.kind == IR_OPERAND_INT ||
-      !ir_affine_symbol_written_in(function, out->body_start, out->body_end,
-                                   out->bound.name);
+  out->c_unit_step = -1;
+  out->c_starts_at_zero = -1;
+  out->c_straight_line = -1;
+  out->c_bound_invariant = -1;
+  out->c_unclaimable = -1;
   return 1;
+}
+
+int ir_affine_unit_step(IRAffineLoop *loop) {
+  if (!loop || !loop->function) {
+    return 0;
+  }
+  if (loop->c_unit_step < 0) {
+    loop->c_unit_step = 0;
+    for (size_t i = loop->body_start; i < loop->body_end; i++) {
+      if (ir_try_parse_direct_unit_increment(&loop->function->instructions[i],
+                                             loop->iv)) {
+        loop->c_unit_step = 1;
+        loop->step = 1;
+        loop->step_index = i;
+        break;
+      }
+    }
+  }
+  return loop->c_unit_step;
+}
+
+int ir_affine_starts_at_zero(IRAffineLoop *loop) {
+  if (!loop || !loop->function) {
+    return 0;
+  }
+  if (loop->c_starts_at_zero < 0) {
+    loop->c_starts_at_zero =
+        ir_iv_zero_at_header(loop->function, loop->header_index, loop->iv) ? 1
+                                                                          : 0;
+  }
+  return loop->c_starts_at_zero;
+}
+
+int ir_affine_straight_line_body(IRAffineLoop *loop) {
+  if (!loop || !loop->function) {
+    return 0;
+  }
+  if (loop->c_straight_line < 0) {
+    loop->c_straight_line = 1;
+    for (size_t i = loop->body_start; i < loop->body_end; i++) {
+      IROpcode op = loop->function->instructions[i].op;
+      if (op == IR_OP_LABEL || op == IR_OP_JUMP || op == IR_OP_BRANCH_ZERO ||
+          op == IR_OP_BRANCH_EQ || op == IR_OP_CALL ||
+          op == IR_OP_CALL_INDIRECT || op == IR_OP_PREFETCH) {
+        loop->c_straight_line = 0;
+        break;
+      }
+    }
+  }
+  return loop->c_straight_line;
+}
+
+int ir_affine_bound_invariant(IRAffineLoop *loop) {
+  if (!loop || !loop->function) {
+    return 0;
+  }
+  if (loop->c_bound_invariant < 0) {
+    loop->c_bound_invariant =
+        (loop->bound.kind == IR_OPERAND_INT ||
+         !ir_affine_symbol_written_in(loop->function, loop->body_start,
+                                      loop->body_end, loop->bound.name))
+            ? 1
+            : 0;
+  }
+  return loop->c_bound_invariant;
+}
+
+int ir_affine_body_unclaimable(IRAffineLoop *loop) {
+  if (!loop || !loop->function) {
+    return 1;
+  }
+  if (loop->c_unclaimable < 0) {
+    loop->c_unclaimable = ir_loop_body_is_unclaimable(
+                              loop->function, loop->body_start, loop->body_end)
+                              ? 1
+                              : 0;
+  }
+  return loop->c_unclaimable;
 }
 
 /* Overflow-checked composition of the decomposition arithmetic.

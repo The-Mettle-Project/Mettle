@@ -390,7 +390,7 @@ static int ir_try_vectorize_simd_minmax_i32_at(IRFunction *function,
   {
     IRAffineLoop loop;
     if (!function || !ir_affine_model_loop(function, header_index, &loop) ||
-        loop.body_unclaimable) {
+        ir_affine_body_unclaimable(&loop)) {
       return 1;
     }
     bounds = loop.bounds;
@@ -510,7 +510,7 @@ static int ir_try_fuse_prefix_sum_i32_at(IRFunction *function,
   {
     IRAffineLoop loop;
     if (!function || !ir_affine_model_loop(function, header_index, &loop) ||
-        loop.body_unclaimable) {
+        ir_affine_body_unclaimable(&loop)) {
       return 1;
     }
     bounds = loop.bounds;
@@ -689,7 +689,7 @@ static int ir_try_vectorize_simd_minmax_ptr_at(IRFunction *function,
   {
     IRAffineLoop loop;
     if (!function || !ir_affine_model_loop(function, header_index, &loop) ||
-        loop.body_unclaimable) {
+        ir_affine_body_unclaimable(&loop)) {
       return 1;
     }
     bounds = loop.bounds;
@@ -753,7 +753,7 @@ static int ir_try_fuse_prefix_sum_ptr_at(IRFunction *function,
   {
     IRAffineLoop loop;
     if (!function || !ir_affine_model_loop(function, header_index, &loop) ||
-        loop.body_unclaimable) {
+        ir_affine_body_unclaimable(&loop)) {
       return 1;
     }
     bounds = loop.bounds;

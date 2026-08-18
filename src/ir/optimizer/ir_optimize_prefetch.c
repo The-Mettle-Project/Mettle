@@ -238,8 +238,8 @@ static int ir_prefetch_plan_loop(IRFunction *function, size_t header_index,
    * hold still while the loop runs. All read off the shared model. */
   IRAffineLoop loop;
   if (!ir_affine_model_loop(function, header_index, &loop) ||
-      !loop.straight_line_body || !loop.unit_step || !loop.starts_at_zero ||
-      !loop.bound_invariant) {
+      !ir_affine_straight_line_body(&loop) || !ir_affine_unit_step(&loop) ||
+      !ir_affine_starts_at_zero(&loop) || !ir_affine_bound_invariant(&loop)) {
     return 0;
   }
   const IRInstruction *compare =
