@@ -12,31 +12,10 @@ typedef struct {
 
 typedef struct {
   const char *name;
-  const IROptNamedPass *passes;
-  size_t pass_count;
-  const char *failure_message;
-} IROptNamedStage;
-
-typedef struct {
-  const char *name;
   const IROptScheduledPass *passes;
   size_t pass_count;
   int max_iterations;
 } IROptFixpointStage;
-
-typedef enum {
-  IR_OPT_FEATURE_LABEL = 1u << 0,
-  IR_OPT_FEATURE_WHILE_LABEL = 1u << 1,
-  IR_OPT_FEATURE_JUMP = 1u << 2,
-  IR_OPT_FEATURE_BRANCH_ZERO = 1u << 3,
-  IR_OPT_FEATURE_BRANCH_EQ = 1u << 4,
-  IR_OPT_FEATURE_CALL = 1u << 5,
-  IR_OPT_FEATURE_LOAD = 1u << 6,
-  IR_OPT_FEATURE_ASSIGN = 1u << 7,
-  IR_OPT_FEATURE_TEMP_WRITE = 1u << 8,
-  IR_OPT_FEATURE_BINARY = 1u << 9,
-  IR_OPT_FEATURE_DIV = 1u << 10
-} IROptFeatureFlag;
 
 #define IR_OPT_REQUIRE_NONE 0u
 #define IR_OPT_FIXPOINT_MAX_ITERATIONS 8
@@ -50,83 +29,106 @@ typedef enum {
 #define IR_OPT_PASS_WHEN_ALL_ANY(id, fn, all_features, any_features)           \
   { IR_OPT_PASS_##id, fn, {all_features, any_features} }
 
-static const IROptNamedPass g_ir_pre_inline_passes[] = {
-    /* Ahead of every recognizer in every later stage: a global array's base is
-     * computed inside the body, where none of them reads it as a base. Runs
-     * again after inlining, which plants fresh bodies of its own. */
-    {"hoist_global_bases", ir_hoist_global_bases_pass},
-    {"if_convert_accumulate", ir_if_convert_accumulate_pass},
-    {"scan_from_first", ir_normalize_scan_from_first_pass},
-    {"simd_minmax_i32", ir_simd_minmax_i32_pass},
-    {"prefix_sum_i32", ir_prefix_sum_i32_pass},
-    {"induction_pointer", ir_pointer_induction_pass},
-    {"simd_dot_i32", ir_simd_dot_i32_pass},
-    {"simd_dot_i8", ir_simd_dot_i8_pass},
-    {"simd_insertion_sort_i32", ir_simd_insertion_sort_i32_pass},
-    {"simd_minmax_i32", ir_simd_minmax_i32_pass},
-    {"lower_bound_i32", ir_lower_bound_i32_pass},
-    {"prefix_sum_i32", ir_prefix_sum_i32_pass},
+/* Loop canonical form. The recognizers behind these read loop bodies, and
+ * each of these rewrites a shape that would otherwise hide the body from all
+ * of them: a declaration sitting inside the body, a global array's base
+ * computed where no recognizer reads it as a base, a conditional accumulator,
+ * a scan seeded from its first element. They run to a checked fixpoint; the
+ * driver stops the build if the form fails to converge, so a recognizer never
+ * matches against a shape the compiler has not finished normalizing. */
+#define IR_OPT_CANONICAL_MAX_ITERATIONS 6
+#define IR_OPT_RECOGNIZER_MAX_ITERATIONS 3
+
+#define IR_GATE_LOOP {IR_OPT_LABEL_JUMP, IR_OPT_REQUIRE_NONE}
+#define IR_GATE_LOOP_LOAD                                                     \
+  {IR_OPT_LABEL_JUMP | IR_OPT_FEATURE_LOAD, IR_OPT_REQUIRE_NONE}
+#define IR_GATE_LOOP_BRANCH                                                   \
+  {IR_OPT_LABEL_JUMP, IR_OPT_FEATURE_BRANCH_ZERO | IR_OPT_FEATURE_BRANCH_EQ}
+
+static const IROptNamedPass g_ir_pre_inline_canonical[] = {
+    {"hoist_global_bases", ir_hoist_global_bases_pass, IR_GATE_LOOP},
+    {"if_convert_accumulate", ir_if_convert_accumulate_pass,
+     IR_GATE_LOOP_BRANCH},
+    {"scan_from_first", ir_normalize_scan_from_first_pass, IR_GATE_LOOP_LOAD},
 };
 
-static const IROptNamedPass g_ir_post_fixpoint_passes[] = {
-    /* First, and after inlining: every recognizer below reads loop bodies, and
-     * a declaration sitting in one hides the shape from all of them. Inlining
-     * plants a fresh one per parameter of every call it folded into a body, so
-     * this has to run downstream of it. */
-    {"hoist_body_locals", ir_hoist_body_locals_pass},
-    /* Beside it, and for the same reason: a global array's base is computed
-     * inside the body, where no recognizer reads it as a base. */
-    {"hoist_global_bases", ir_hoist_global_bases_pass},
-    /* And a counted-under-a-condition accumulator, which no reduction kernel
-     * reads either. Both leave a straight-line body behind them. */
-    {"if_convert_accumulate", ir_if_convert_accumulate_pass},
-    /* Before the extremum recognizer, which needs the counter to start at 0. */
-    {"scan_from_first", ir_normalize_scan_from_first_pass},
-    /* Before pointer induction, which rewrites an int32 scan's counter into a
-     * walking pointer -- the extremum diamond then indexes off something no
-     * longer recognizable as the loop counter. */
-    {"simd_minmax_reduce", ir_simd_minmax_reduce_pass},
-    {"induction_pointer", ir_pointer_induction_pass},
-    /* After pointer induction so range-for fills (already converted to the
-     * pointer-walk form) and while-loop fills (still indexed) both match. */
-    {"simd_fill", ir_simd_fill_pass},
-    {"prefix_sum_i32", ir_prefix_sum_i32_pass},
-    {"simd_minmax_i32", ir_simd_minmax_i32_pass},
-    {"simd_affine_map_float", ir_simd_affine_map_float_pass},
-    {"simd_exp_f32", ir_simd_exp_f32_pass},
-    {"simd_silu_f32", ir_simd_silu_f32_pass},
-    {"simd_lcg", ir_simd_lcg_pass},
-    {"simd_i2f_reduce", ir_simd_i2f_reduce_pass},
-    {"simd_dot_float", ir_simd_dot_float_pass},
-    {"simd_sum_float", ir_simd_sum_float_pass},
-    {"auto_vectorize", ir_auto_vectorize_pass},
-    {"auto_vectorize_int", ir_auto_vectorize_int_pass},
-    {"auto_vectorize_find", ir_auto_vectorize_find_pass},
-    {"outer_vectorize", ir_outer_vectorize_pass},
-    {"simd_memory_map", ir_simd_memory_map_pass},
-    {"lower_bound_i32", ir_lower_bound_i32_pass},
-    {"detect_shift_loops", ir_detect_shift_loops_pass},
-    {"eliminate_congruent_ivs", ir_eliminate_congruent_ivs_pass},
-    /* After congruent-IV merge so parallel lane indices appear as base+J. */
-    {"simd_slp_mac_i32", ir_simd_slp_mac_i32_pass},
-    {"simd_slp_mac_i8", ir_simd_slp_mac_i8_pass},
-    /* After every recognizer: collapses register-only data-dependent
-     * diamonds to branchless selects. Runs before prefetch (which only
-     * touches loop headers) and after vectorizers (whose loop bodies are
-     * straight-line and thus unaffected). */
-    {"if_convert", ir_if_convert_pass},
-    /* LAST: inserts control flow into loop bodies, which would defeat every
-     * recognizer above. Only fires on loops with indirect (load-fed) accesses
-     * -- shapes no vectorizer can claim. */
-    {"prefetch_indirect", ir_prefetch_indirect_pass},
+/* Recognizers, each listed once in dependency order. The worklist driver
+ * re-offers a pass whenever a later one changes the IR, which is what the
+ * old duplicated entries did by hand. simd_minmax_i32 runs before
+ * induction_pointer because the latter rewrites an int32 scan's counter into
+ * a walking pointer, after which the extremum diamond indexes off something
+ * no longer recognizable as the loop counter. */
+static const IROptNamedPass g_ir_pre_inline_recognizers[] = {
+    {"simd_minmax_i32", ir_simd_minmax_i32_pass, IR_GATE_LOOP_LOAD},
+    {"prefix_sum_i32", ir_prefix_sum_i32_pass, IR_GATE_LOOP_LOAD},
+    {"induction_pointer", ir_pointer_induction_pass, IR_GATE_LOOP},
+    {"simd_dot_i32", ir_simd_dot_i32_pass, IR_GATE_LOOP_LOAD},
+    {"simd_dot_i8", ir_simd_dot_i8_pass, IR_GATE_LOOP_LOAD},
+    {"simd_insertion_sort_i32", ir_simd_insertion_sort_i32_pass,
+     IR_GATE_LOOP_LOAD},
+    {"lower_bound_i32", ir_lower_bound_i32_pass, IR_GATE_LOOP_LOAD},
 };
 
-static const IROptNamedStage g_ir_pre_inline_stage = {
-    "pre-inline canonicalization",
-    g_ir_pre_inline_passes,
-    IR_ARRAY_COUNT(g_ir_pre_inline_passes),
-    "IR optimization pre-inline pass failed",
+/* Post-inline loop canonical form. hoist_body_locals joins here because
+ * inlining plants a fresh declaration per parameter of every call it folded
+ * into a body. */
+static const IROptNamedPass g_ir_loop_canonical_passes[] = {
+    {"hoist_body_locals", ir_hoist_body_locals_pass, IR_GATE_LOOP},
+    {"hoist_global_bases", ir_hoist_global_bases_pass, IR_GATE_LOOP},
+    {"if_convert_accumulate", ir_if_convert_accumulate_pass,
+     IR_GATE_LOOP_BRANCH},
+    {"scan_from_first", ir_normalize_scan_from_first_pass, IR_GATE_LOOP_LOAD},
 };
+
+/* Recognizers, each listed once in dependency order; the worklist driver
+ * re-offers earlier passes when later ones change the IR. The two orderings
+ * that matter: simd_minmax_reduce before induction_pointer (a rewritten
+ * counter is no longer recognizable to the extremum diamond), and simd_fill
+ * after induction_pointer (so range-for fills, already in pointer-walk form,
+ * and while-loop fills, still indexed, both match). */
+static const IROptNamedPass g_ir_recognizer_passes[] = {
+    {"simd_minmax_reduce", ir_simd_minmax_reduce_pass, IR_GATE_LOOP_LOAD},
+    {"induction_pointer", ir_pointer_induction_pass, IR_GATE_LOOP},
+    {"simd_fill", ir_simd_fill_pass, IR_GATE_LOOP},
+    {"prefix_sum_i32", ir_prefix_sum_i32_pass, IR_GATE_LOOP_LOAD},
+    {"simd_minmax_i32", ir_simd_minmax_i32_pass, IR_GATE_LOOP_LOAD},
+    {"simd_affine_map_float", ir_simd_affine_map_float_pass, IR_GATE_LOOP},
+    {"simd_exp_f32", ir_simd_exp_f32_pass, IR_GATE_LOOP},
+    {"simd_silu_f32", ir_simd_silu_f32_pass, IR_GATE_LOOP},
+    {"simd_lcg", ir_simd_lcg_pass, IR_GATE_LOOP},
+    {"simd_i2f_reduce", ir_simd_i2f_reduce_pass, IR_GATE_LOOP},
+    {"simd_dot_float", ir_simd_dot_float_pass, IR_GATE_LOOP_LOAD},
+    {"simd_sum_float", ir_simd_sum_float_pass, IR_GATE_LOOP_LOAD},
+    {"auto_vectorize", ir_auto_vectorize_pass, IR_GATE_LOOP},
+    {"auto_vectorize_int", ir_auto_vectorize_int_pass, IR_GATE_LOOP},
+    {"auto_vectorize_find", ir_auto_vectorize_find_pass, IR_GATE_LOOP},
+    {"outer_vectorize", ir_outer_vectorize_pass, IR_GATE_LOOP},
+    {"simd_memory_map", ir_simd_memory_map_pass, IR_GATE_LOOP},
+    {"lower_bound_i32", ir_lower_bound_i32_pass, IR_GATE_LOOP_LOAD},
+    {"detect_shift_loops", ir_detect_shift_loops_pass, IR_GATE_LOOP},
+    {"eliminate_congruent_ivs", ir_eliminate_congruent_ivs_pass,
+     IR_GATE_LOOP},
+    /* After congruent-IV merge so parallel lane indices appear as base+J.
+     * SLP matches straight-line chains, so no loop gate. */
+    {"simd_slp_mac_i32", ir_simd_slp_mac_i32_pass,
+     {IR_OPT_FEATURE_LOAD, IR_OPT_REQUIRE_NONE}},
+    {"simd_slp_mac_i8", ir_simd_slp_mac_i8_pass,
+     {IR_OPT_FEATURE_LOAD, IR_OPT_REQUIRE_NONE}},
+};
+
+/* Run once, in order, after the recognizer worklist has converged. Both
+ * mutate loop bodies in ways that would defeat every recognizer above:
+ * if_convert collapses register-only diamonds to branchless selects, and
+ * prefetch_indirect inserts control flow into loops with load-fed accesses
+ * -- shapes no vectorizer can claim. Keeping them out of the worklist is
+ * what keeps the recognizers from ever seeing their output. */
+static const IROptNamedPass g_ir_post_recognizer_tail[] = {
+    {"if_convert", ir_if_convert_pass,
+     {IR_OPT_FEATURE_LABEL,
+      IR_OPT_FEATURE_BRANCH_ZERO | IR_OPT_FEATURE_BRANCH_EQ}},
+    {"prefetch_indirect", ir_prefetch_indirect_pass, IR_GATE_LOOP_LOAD},
+};
+
 
 /* SROA runs after copy/coalesce fold inlined struct copies into clean
  * symbol-to-symbol form, and before CSE/dead-temp cleanup. */
@@ -294,65 +296,46 @@ static const IROptFixpointStage g_ir_portable_fixpoint_stage = {
     IR_OPT_FIXPOINT_MAX_ITERATIONS,
 };
 
-static const IROptNamedStage g_ir_post_fixpoint_stage = {
-    "post-fixpoint idiom recognition",
-    g_ir_post_fixpoint_passes,
-    IR_ARRAY_COUNT(g_ir_post_fixpoint_passes),
-    "IR optimization pass failed",
-};
-
-static int ir_run_named_stage(IRFunction *function,
-                              const IROptNamedStage *stage) {
-  if (!stage || !stage->passes) {
+int ir_optimize_pre_inline_function(IRFunction *function) {
+  mettle_compiler_ctx_set_pass_name("pre-inline canonicalization");
+  if (!ir_run_named_stage_fixpoint(
+          function, g_ir_pre_inline_canonical,
+          IR_ARRAY_COUNT(g_ir_pre_inline_canonical),
+          IR_OPT_CANONICAL_MAX_ITERATIONS, "pre-inline loop canonical form",
+          "IR optimization pre-inline pass failed", 1)) {
     return 0;
   }
-
-  mettle_compiler_ctx_set_pass_name(stage->name);
-  mettle_compiler_ctx_set_fixpoint_iteration(0);
-  return ir_run_named_pass_sequence(
-      function, stage->passes, stage->pass_count, stage->failure_message);
+  mettle_compiler_ctx_set_pass_name("pre-inline idiom recognition");
+  return ir_run_named_stage_fixpoint(
+      function, g_ir_pre_inline_recognizers,
+      IR_ARRAY_COUNT(g_ir_pre_inline_recognizers),
+      IR_OPT_RECOGNIZER_MAX_ITERATIONS, "pre-inline idiom recognition",
+      "IR optimization pre-inline pass failed", 0);
 }
 
-int ir_optimize_pre_inline_function(IRFunction *function) {
-  return ir_run_named_stage(function, &g_ir_pre_inline_stage);
-}
-
-static unsigned ir_opt_feature_flags(const IROptFunctionFeatures *features) {
-  unsigned flags = 0;
-  if (features->has_label) {
-    flags |= IR_OPT_FEATURE_LABEL;
+/* Canonical form (checked fixpoint) -> recognizer worklist -> tail. */
+static int ir_run_post_fixpoint_stages(IRFunction *function) {
+  mettle_compiler_ctx_set_pass_name("loop canonical form");
+  if (!ir_run_named_stage_fixpoint(
+          function, g_ir_loop_canonical_passes,
+          IR_ARRAY_COUNT(g_ir_loop_canonical_passes),
+          IR_OPT_CANONICAL_MAX_ITERATIONS, "loop canonical form",
+          "IR optimization pass failed", 1)) {
+    return 0;
   }
-  if (features->has_while_label) {
-    flags |= IR_OPT_FEATURE_WHILE_LABEL;
+  mettle_compiler_ctx_set_pass_name("post-fixpoint idiom recognition");
+  if (!ir_run_named_stage_fixpoint(
+          function, g_ir_recognizer_passes,
+          IR_ARRAY_COUNT(g_ir_recognizer_passes),
+          IR_OPT_RECOGNIZER_MAX_ITERATIONS, "post-fixpoint idiom recognition",
+          "IR optimization pass failed", 0)) {
+    return 0;
   }
-  if (features->has_jump) {
-    flags |= IR_OPT_FEATURE_JUMP;
-  }
-  if (features->has_branch_zero) {
-    flags |= IR_OPT_FEATURE_BRANCH_ZERO;
-  }
-  if (features->has_branch_eq) {
-    flags |= IR_OPT_FEATURE_BRANCH_EQ;
-  }
-  if (features->has_call) {
-    flags |= IR_OPT_FEATURE_CALL;
-  }
-  if (features->has_load) {
-    flags |= IR_OPT_FEATURE_LOAD;
-  }
-  if (features->has_assign) {
-    flags |= IR_OPT_FEATURE_ASSIGN;
-  }
-  if (features->has_temp_write) {
-    flags |= IR_OPT_FEATURE_TEMP_WRITE;
-  }
-  if (features->has_binary) {
-    flags |= IR_OPT_FEATURE_BINARY;
-  }
-  if (features->has_div) {
-    flags |= IR_OPT_FEATURE_DIV;
-  }
-  return flags;
+  mettle_compiler_ctx_set_pass_name("post-recognizer tail");
+  return ir_run_named_stage_fixpoint(
+      function, g_ir_post_recognizer_tail,
+      IR_ARRAY_COUNT(g_ir_post_recognizer_tail), 1, "post-recognizer tail",
+      "IR optimization pass failed", 0);
 }
 
 static int ir_scheduled_pass_is_enabled(const IROptScheduledPass *pass,
@@ -422,7 +405,7 @@ int ir_optimize_function_pipeline(IRFunction *function) {
     return 0;
   }
 
-  if (!ir_run_named_stage(function, &g_ir_post_fixpoint_stage)) {
+  if (!ir_run_post_fixpoint_stages(function)) {
     return 0;
   }
 
@@ -452,7 +435,7 @@ int ir_optimize_function_revectorize(IRFunction *function) {
   if (!ir_run_fixpoint_stage(function, &g_ir_fixpoint_stage)) {
     return 0;
   }
-  return ir_run_named_stage(function, &g_ir_post_fixpoint_stage);
+  return ir_run_post_fixpoint_stages(function);
 }
 
 static void ir_set_current_function_context(IRFunction *function) {

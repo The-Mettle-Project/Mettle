@@ -1,5 +1,42 @@
 #include "ir_optimize_internal.h"
 
+unsigned ir_opt_feature_flags(const IROptFunctionFeatures *features) {
+  unsigned flags = 0;
+  if (features->has_label) {
+    flags |= IR_OPT_FEATURE_LABEL;
+  }
+  if (features->has_while_label) {
+    flags |= IR_OPT_FEATURE_WHILE_LABEL;
+  }
+  if (features->has_jump) {
+    flags |= IR_OPT_FEATURE_JUMP;
+  }
+  if (features->has_branch_zero) {
+    flags |= IR_OPT_FEATURE_BRANCH_ZERO;
+  }
+  if (features->has_branch_eq) {
+    flags |= IR_OPT_FEATURE_BRANCH_EQ;
+  }
+  if (features->has_call) {
+    flags |= IR_OPT_FEATURE_CALL;
+  }
+  if (features->has_load) {
+    flags |= IR_OPT_FEATURE_LOAD;
+  }
+  if (features->has_assign) {
+    flags |= IR_OPT_FEATURE_ASSIGN;
+  }
+  if (features->has_temp_write) {
+    flags |= IR_OPT_FEATURE_TEMP_WRITE;
+  }
+  if (features->has_binary) {
+    flags |= IR_OPT_FEATURE_BINARY;
+  }
+  if (features->has_div) {
+    flags |= IR_OPT_FEATURE_DIV;
+  }
+  return flags;
+}
 
 void ir_collect_function_features(const IRFunction *function,
                                          IROptFunctionFeatures *features) {

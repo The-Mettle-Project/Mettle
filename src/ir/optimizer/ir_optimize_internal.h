@@ -318,9 +318,32 @@ typedef enum {
 
 typedef int (*IROptFunctionPass)(IRFunction *function, int *changed);
 
+/* Cheap per-function feature bits (ir_collect_function_features). A pass
+ * gate declares which of these its matcher requires; the drivers skip the
+ * pass when the function cannot satisfy it. */
+typedef enum {
+  IR_OPT_FEATURE_LABEL = 1u << 0,
+  IR_OPT_FEATURE_WHILE_LABEL = 1u << 1,
+  IR_OPT_FEATURE_JUMP = 1u << 2,
+  IR_OPT_FEATURE_BRANCH_ZERO = 1u << 3,
+  IR_OPT_FEATURE_BRANCH_EQ = 1u << 4,
+  IR_OPT_FEATURE_CALL = 1u << 5,
+  IR_OPT_FEATURE_LOAD = 1u << 6,
+  IR_OPT_FEATURE_ASSIGN = 1u << 7,
+  IR_OPT_FEATURE_TEMP_WRITE = 1u << 8,
+  IR_OPT_FEATURE_BINARY = 1u << 9,
+  IR_OPT_FEATURE_DIV = 1u << 10
+} IROptFeatureFlag;
+
+typedef struct {
+  unsigned all; /* every listed feature must be present */
+  unsigned any; /* when nonzero, at least one must be present */
+} IROptPassGate;
+
 typedef struct {
   const char *name;
   IROptFunctionPass run;
+  IROptPassGate gate; /* zero-initialized gate = always eligible */
 } IROptNamedPass;
 
 extern const char *g_ir_pass_names[IR_OPT_PASS_COUNT];
@@ -780,6 +803,21 @@ int ir_run_named_pass_sequence(IRFunction *function,
                                       const IROptNamedPass *passes,
                                       size_t pass_count,
                                       const char *failure_message);
+unsigned ir_opt_feature_flags(const IROptFunctionFeatures *features);
+/* Worklist driver for a named-pass stage: runs the sequence to a fixpoint
+ * with the same version-based redundant-run skipping as ir_run_fixpoint_pass,
+ * so a pass re-runs only when the IR changed after it last came back clean.
+ * Order within an iteration is the array order; duplicate entries (same
+ * function pointer) share one cleanliness slot. When require_convergence is
+ * set, failing to reach a clean sweep inside max_iterations is an ICE naming
+ * the stage: the stage's output is a normal form later passes rely on, and
+ * non-convergence means the form does not hold. */
+int ir_run_named_stage_fixpoint(IRFunction *function,
+                                const IROptNamedPass *passes,
+                                size_t pass_count, int max_iterations,
+                                const char *stage_name,
+                                const char *failure_message,
+                                int require_convergence);
 int ir_run_fixpoint_pass(IRFunction *function, IROptPassId pass_id,
                          IROptFunctionPass pass, int enabled,
                          unsigned long long *version,

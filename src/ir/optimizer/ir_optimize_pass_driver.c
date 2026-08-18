@@ -231,8 +231,12 @@ static int ir_no_simd_enabled(void) {
 }
 
 static int ir_run_named_pass(IRFunction *function, const IROptNamedPass *pass,
-                             const char *failure_message) {
+                             const char *failure_message, int *changed_out) {
   int changed = 0;
+
+  if (changed_out) {
+    *changed_out = 0;
+  }
 
   if (!pass || !pass->name || !pass->run) {
     return 0;
@@ -272,6 +276,9 @@ static int ir_run_named_pass(IRFunction *function, const IROptNamedPass *pass,
 
   ir_trace_pass_event(pass->name, changed ? "changed" : "clean", NULL,
                       changed);
+  if (changed_out) {
+    *changed_out = changed;
+  }
   return 1;
 }
 
@@ -280,9 +287,109 @@ int ir_run_named_pass_sequence(IRFunction *function,
                                size_t pass_count,
                                const char *failure_message) {
   for (size_t i = 0; i < pass_count; i++) {
-    if (!ir_run_named_pass(function, &passes[i], failure_message)) {
+    if (!ir_run_named_pass(function, &passes[i], failure_message, NULL)) {
       return 0;
     }
+  }
+
+  return 1;
+}
+
+/* Worklist driver for named-pass stages (see the header comment). Cleanliness
+ * is tracked per unique pass function at the stage's IR version, exactly as
+ * ir_run_fixpoint_pass tracks the fixpoint passes: a pass whose clean version
+ * is still current is looking at the same instruction array it already
+ * declined, so it is skipped without running its matcher. */
+#define IR_NAMED_STAGE_MAX_PASSES 64
+
+int ir_run_named_stage_fixpoint(IRFunction *function,
+                                const IROptNamedPass *passes,
+                                size_t pass_count, int max_iterations,
+                                const char *stage_name,
+                                const char *failure_message,
+                                int require_convergence) {
+  if (!function || !passes || pass_count == 0 || max_iterations <= 0 ||
+      pass_count > IR_NAMED_STAGE_MAX_PASSES) {
+    return 0;
+  }
+
+  /* Duplicate entries (same run pointer) share one cleanliness slot, so an
+   * array that still lists a pass twice behaves as one pass offered twice. */
+  size_t slot[IR_NAMED_STAGE_MAX_PASSES];
+  unsigned long long clean_version[IR_NAMED_STAGE_MAX_PASSES];
+  for (size_t i = 0; i < pass_count; i++) {
+    slot[i] = i;
+    clean_version[i] = 0;
+    for (size_t j = 0; j < i; j++) {
+      if (passes[j].run == passes[i].run) {
+        slot[i] = slot[j];
+        break;
+      }
+    }
+  }
+
+  unsigned long long version = 1;
+  int converged = 0;
+
+  for (int iteration = 0; iteration < max_iterations && !converged;
+       iteration++) {
+    int iteration_changed = 0;
+    IROptFunctionFeatures features;
+
+    mettle_compiler_ctx_set_fixpoint_iteration(iteration + 1);
+    ir_collect_function_features(function, &features);
+    unsigned feature_flags = ir_opt_feature_flags(&features);
+
+    for (size_t i = 0; i < pass_count; i++) {
+      const IROptNamedPass *pass = &passes[i];
+      unsigned all = pass->gate.all;
+      unsigned any = pass->gate.any;
+
+      if ((feature_flags & all) != all ||
+          (any != 0 && (feature_flags & any) == 0)) {
+        ir_trace_pass_event(pass->name, "disabled", &version, -1);
+        clean_version[slot[i]] = version;
+        continue;
+      }
+      if (clean_version[slot[i]] == version) {
+        ir_trace_pass_event(pass->name, "already_clean", &version, -1);
+        continue;
+      }
+
+      int changed = 0;
+      if (!ir_run_named_pass(function, pass, failure_message, &changed)) {
+        return 0;
+      }
+      if (changed) {
+        version++;
+        iteration_changed = 1;
+        /* A structural change can add or remove features (a claimed loop
+         * loses its labels); refresh so later gates read the truth. */
+        ir_collect_function_features(function, &features);
+        feature_flags = ir_opt_feature_flags(&features);
+      } else {
+        clean_version[slot[i]] = version;
+      }
+    }
+
+    if (!iteration_changed) {
+      converged = 1;
+    }
+  }
+
+  mettle_compiler_ctx_set_fixpoint_iteration(0);
+
+  if (require_convergence && !converged) {
+    /* The stage's output is a normal form the passes behind it rely on.
+     * Still changing at the cap means the form does not hold: some pass is
+     * oscillating or feeding another, and every recognizer downstream would
+     * be matching against shapes it cannot trust. Stop loudly. */
+    fprintf(stderr,
+            "mettle: internal error: stage '%s' did not converge on function "
+            "'%s' after %d iterations\n",
+            stage_name ? stage_name : "<unnamed>",
+            function->name ? function->name : "<anonymous>", max_iterations);
+    mettle_compiler_ice("IR normal-form stage failed to converge");
   }
 
   return 1;
