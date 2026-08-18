@@ -1651,6 +1651,7 @@ static int mir_op_pure_def(MirOpcode op) {
   case MIR_LEA_GLOBAL:
   case MIR_LEA_FUNC:
   case MIR_LEA_CSTR:
+  case MIR_LEA_STRLIT:
   case MIR_ADD:
   case MIR_SUB:
   case MIR_AND:

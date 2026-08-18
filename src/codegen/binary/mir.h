@@ -177,6 +177,12 @@ typedef enum {
                      lea into a .rdata cstring). Carries no vreg source, so the
                      allocator ignores it. Used to pass a string-literal call
                      argument. */
+  MIR_LEA_STRLIT, /* dst(reg) <- address of the string literal a.sym's
+                     {chars,length} record in .rdata (the fat `string` value, as
+                     opposed to MIR_LEA_CSTR's bare character bytes). Used as
+                     the copy source when a literal is passed to a `string`
+                     (INDIRECT aggregate) parameter or assigned to a string
+                     local. */
   MIR_MOVZX,      /* dst <- zero-extend a (width from a.mem/src width to dst) */
   MIR_MOVSX,      /* dst <- sign-extend a */
   MIR_LOAD_GLOBAL,/* dst <- value of global scalar a(SYMBOL); width/is_unsigned

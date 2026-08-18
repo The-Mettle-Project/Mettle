@@ -668,7 +668,8 @@ static void cost_model(const MirFunction *fn, const MirInst *in, int *lat,
   case MIR_CQO: case MIR_XOR_RDX:
     *kind = "alu"; mask = M_ALU4; centi = 25; break;
   case MIR_LEA: case MIR_LEA_LOCAL: case MIR_LEA_GLOBAL:
-  case MIR_LEA_FUNC: case MIR_LEA_CSTR: case MIR_LEA_OUTARG: {
+  case MIR_LEA_FUNC: case MIR_LEA_CSTR: case MIR_LEA_STRLIT:
+  case MIR_LEA_OUTARG: {
     int scaled = in->a.kind == MIR_OPK_MEM && in->a.mem.index != MIR_VREG_NONE;
     *kind = "lea";
     if (scaled) { *ports = "p1"; mask = M_P1; centi = 100; *lat = 3; }

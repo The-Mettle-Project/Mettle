@@ -764,6 +764,35 @@ static int mir_operand_struct_home_size(CodeGenerator *g,
   return 0;
 }
 
+/* True if NAME is a by-reference (INDIRECT aggregate) PARAMETER: its value IS
+ * the struct's address, so it can source an indirect copy without a home. */
+static int mir_name_is_indirect_param(CodeGenerator *g,
+                                      const IRFunction *ir_function,
+                                      const char *name) {
+  int is_param = 0;
+  MtlcType *t = mir_local_or_param_type(g, ir_function, name, &is_param);
+  return t && is_param && code_generator_type_is_aggregate(t) &&
+         code_generator_abi_classify(t) == ABI_PASS_INDIRECT;
+}
+
+/* An operand that can SOURCE an INDIRECT (by-value) aggregate copy: a struct
+ * LOCAL or struct TEMP (LEA-able home), a by-ref aggregate PARAM (its value is
+ * the address), or a string LITERAL (its {chars,length} record is in .rdata).
+ * This is the eligibility-side mirror of the fallback's
+ * emit_indirect_source_address, minus global aggregates (still deferred). */
+static int mir_indirect_source_is_supported(CodeGenerator *g,
+                                            const IRFunction *irf,
+                                            const IROperand *op) {
+  if (op->kind == IR_OPERAND_STRING) {
+    return 1;
+  }
+  if (mir_operand_struct_home_size(g, irf, op) > 0) {
+    return 1;
+  }
+  return op->kind == IR_OPERAND_SYMBOL && op->name &&
+         mir_name_is_indirect_param(g, irf, op->name);
+}
+
 /* True if temp `name` holds a float value, judged from the producing
  * instruction's is_float flag (transitively through assign chains and call
  * return types). Uses IR structure only, so it is safe in eligibility (no
@@ -997,11 +1026,10 @@ static MirAddrofKind mir_addressof_kind(CodeGenerator *g,
     return mir_name_is_global_variable(g, in->lhs.name) ? MIR_ADDROF_GLOBAL
                                                         : MIR_ADDROF_UNSUPPORTED;
   }
-  if (t->kind == MTLC_TYPE_STRING) {
-    return MIR_ADDROF_UNSUPPORTED; /* string has its own (fat-pointer) address form */
-  }
   /* An INDIRECT-aggregate parameter is passed by reference: the parameter value
-   * already IS the struct's address, so &@p just yields that pointer. */
+   * already IS the struct's address, so &@p just yields that pointer. `string`
+   * is an aggregate on exactly a struct's terms ({chars,length}, 16 bytes,
+   * INDIRECT), so string params and locals take these same two paths. */
   if (is_param && code_generator_type_is_aggregate(t) &&
       code_generator_abi_classify(t) == ABI_PASS_INDIRECT) {
     return MIR_ADDROF_INDIRECT_PARAM;
@@ -1162,10 +1190,10 @@ static int mir_call_is_supported(CodeGenerator *g,
     }
     if (code_generator_abi_classify(pt) == ABI_PASS_INDIRECT) {
       /* struct passed BY VALUE: the caller copies it to an outgoing temp and
-       * passes the temp's address. The source must hold the struct in a LEA-able
-       * home, a struct LOCAL or a struct TEMP; a by-ref param source is
-       * deferred (its home holds a pointer, not the struct). */
-      if (mir_operand_struct_home_size(g, ir_function, arg) == 0) {
+       * passes the temp's address. The copy can source from a struct LOCAL or
+       * TEMP's home, a by-ref param's pointer, or a string literal's .rdata
+       * record. */
+      if (!mir_indirect_source_is_supported(g, ir_function, arg)) {
         mir_call_trace("arg_struct_nonlocal");
         return 0;
       }
@@ -1459,21 +1487,26 @@ int mir_function_is_eligible(CodeGenerator *generator,
         int allowed =
             (in->op == IR_OP_DECLARE_LOCAL && o == &in->dest) ||
             (in->op == IR_OP_ADDRESS_OF && o == &in->lhs) ||
+            /* `return @local` copies from the local's home; `return @p` of a
+             * by-ref param copies from the address the param holds. */
             (in->op == IR_OP_RETURN && o == &in->lhs &&
-             mir_name_is_indirect_struct_local(generator, ir_function, o->name)) ||
+             (mir_name_is_indirect_struct_local(generator, ir_function,
+                                                o->name) ||
+              mir_name_is_indirect_param(generator, ir_function, o->name))) ||
             /* `@local = f()` for a struct-returning callee: the call writes the
              * struct directly into the dest local's home via the hidden return
              * pointer (mir_call_is_supported validates the callee returns
              * INDIRECT). */
             (in->op == IR_OP_CALL && o == &in->dest &&
              mir_name_is_indirect_struct_local(generator, ir_function, o->name)) ||
-            /* Whole-struct ASSIGN `@a <- @b` / `@a <- %t` / `%t <- @a`: a struct
-             * COPY between two LEA-able struct homes (lowered via rep-movsb), so
-             * both operands may name a struct symbol. */
+            /* Whole-struct ASSIGN into a LEA-able struct home (rep-movsb): the
+             * source may be another home, a by-ref param (copy through its
+             * pointer), or a string literal (copy from its .rdata record). */
             (in->op == IR_OP_ASSIGN && (o == &in->dest || o == &in->lhs) &&
              mir_operand_struct_home_size(generator, ir_function, &in->dest) >
                  0 &&
-             mir_operand_struct_home_size(generator, ir_function, &in->lhs) > 0);
+             mir_indirect_source_is_supported(generator, ir_function,
+                                              &in->lhs));
         if (!allowed) {
           return mir_trace_bail(ir_function, "indirect_agg_byname");
         }
@@ -1483,12 +1516,12 @@ int mir_function_is_eligible(CodeGenerator *generator,
             in->arguments[a].name &&
             mir_name_is_indirect_aggregate(generator, ir_function,
                                            in->arguments[a].name) &&
-            /* A struct LOCAL passed by value is allowed (Link 4 copies it to an
-             * outgoing temp; mir_call_is_supported validates the callee param).
-             * A by-ref param source is still rejected. */
+            /* A struct passed by value is allowed when Link 4 can source the
+             * outgoing copy: a struct LOCAL's home, or a by-ref param's
+             * pointer (mir_call_is_supported validates the callee param). */
             !(in->op == IR_OP_CALL &&
-              mir_name_is_indirect_struct_local(generator, ir_function,
-                                                in->arguments[a].name))) {
+              mir_indirect_source_is_supported(generator, ir_function,
+                                               &in->arguments[a]))) {
           return mir_trace_bail(ir_function, "indirect_agg_byname");
         }
       }
@@ -1548,6 +1581,13 @@ int mir_function_is_eligible(CodeGenerator *generator,
       }
       if (in->lhs.kind != IR_OPERAND_TEMP && in->lhs.kind != IR_OPERAND_SYMBOL &&
           in->lhs.kind != IR_OPERAND_INT && in->lhs.kind != IR_OPERAND_FLOAT) {
+        /* `@s <- "lit"`: a string literal into a string local/temp is a
+         * 16-byte copy from the literal's .rdata record (MIR_LEA_STRLIT). */
+        if (in->lhs.kind == IR_OPERAND_STRING &&
+            mir_operand_struct_home_size(generator, ir_function, &in->dest) >
+                0) {
+          break;
+        }
         return 0;
       }
       break;
@@ -1679,15 +1719,17 @@ int mir_function_is_eligible(CodeGenerator *generator,
           in->lhs.kind != IR_OPERAND_SYMBOL && in->lhs.kind != IR_OPERAND_INT) {
         return 0;
       }
-      /* An INDIRECT-returning function only handles `return @struct_local`: the
-       * RETURN lowering copies from the local's home into the hidden slot. Any
-       * other shape (returning a temp, a by-ref param, or a struct-returning
-       * call result) is deferred to the fallback. */
+      /* An INDIRECT-returning function handles `return @struct_local` (copy
+       * from the local's home into the hidden slot) and `return @p` of a
+       * by-ref param (copy through the param's pointer). Other shapes (a
+       * struct temp, a struct-returning call result) defer to the fallback. */
       if (mir_type_is_indirect_aggregate(generator,
                                          ir_function->return_type_name) &&
           !(in->lhs.kind == IR_OPERAND_SYMBOL &&
-            mir_name_is_indirect_struct_local(generator, ir_function,
-                                              in->lhs.name))) {
+            (mir_name_is_indirect_struct_local(generator, ir_function,
+                                               in->lhs.name) ||
+             mir_name_is_indirect_param(generator, ir_function,
+                                        in->lhs.name)))) {
         return mir_trace_bail(ir_function, "return:indirect_nonlocal");
       }
       break;
@@ -2409,6 +2451,54 @@ static int mir_emit_struct_copy(MirFunction *fn, MirVregId dst_base,
   return 1;
 }
 
+/* Materialize the ADDRESS of an INDIRECT-aggregate copy SOURCE into a fresh
+ * vreg: a struct LOCAL/TEMP leas its home (marking it memory-resident at least
+ * `sz` bytes), a by-ref aggregate PARAM's value is already the address (plain
+ * MOV), and a string LITERAL leas its {chars,length} record. The MIR mirror of
+ * the fallback's emit_indirect_source_address; eligibility has vetted the
+ * operand via mir_indirect_source_is_supported. Returns MIR_VREG_NONE on
+ * failure. */
+static MirVregId mir_emit_indirect_source_addr(MirFunction *fn,
+                                               CodeGenerator *g,
+                                               BinaryFunctionContext *ctx,
+                                               MirNameMap *map,
+                                               const IRFunction *irf,
+                                               const IROperand *op, int sz) {
+  MirVregId base = mir_new_vreg(fn, MIR_RC_GP, 8);
+  if (base == MIR_VREG_NONE) {
+    return MIR_VREG_NONE;
+  }
+  if (op->kind == IR_OPERAND_STRING) {
+    const char *s = op->name ? op->name : "";
+    if (!mir_emit1(fn, MIR_LEA_STRLIT, mir_op_vreg(base), mir_op_symbol(s),
+                   mir_op_none(), 8, 0, 0)) {
+      return MIR_VREG_NONE;
+    }
+    return base;
+  }
+  MirOperand v = mir_value_operand(fn, g, ctx, map, op);
+  if (v.kind != MIR_OPK_VREG) {
+    fn->has_error = 1;
+    return MIR_VREG_NONE;
+  }
+  if (op->kind == IR_OPERAND_SYMBOL && op->name &&
+      mir_name_is_indirect_param(g, irf, op->name)) {
+    if (!mir_emit1(fn, MIR_MOV, mir_op_vreg(base), v, mir_op_none(), 8, 0, 0)) {
+      return MIR_VREG_NONE;
+    }
+    return base;
+  }
+  fn->vregs[v.vreg].address_taken = 1;
+  if (fn->vregs[v.vreg].home_bytes < ((sz + 7) & ~7)) {
+    fn->vregs[v.vreg].home_bytes = (sz + 7) & ~7;
+  }
+  if (!mir_emit1(fn, MIR_LEA_LOCAL, mir_op_vreg(base), v, mir_op_none(), 8, 0,
+                 0)) {
+    return MIR_VREG_NONE;
+  }
+  return base;
+}
+
 /* A width-tagged float register move (xmm copy). */
 static int mir_emit_fmov(MirFunction *fn, MirOperand dst, MirOperand src,
                          int width) {
@@ -2935,8 +3025,7 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
       int ssz = mir_operand_struct_home_size(g, airf, &in->dest);
       if (ssz > 0) {
         MirOperand dsym = mir_value_operand(fn, g, ctx, map, &in->dest);
-        MirOperand ssym = mir_value_operand(fn, g, ctx, map, &in->lhs);
-        if (dsym.kind != MIR_OPK_VREG || ssym.kind != MIR_OPK_VREG) {
+        if (dsym.kind != MIR_OPK_VREG) {
           fn->has_error = 1;
           return 0;
         }
@@ -2944,16 +3033,11 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
         if (fn->vregs[dsym.vreg].home_bytes < ssz) {
           fn->vregs[dsym.vreg].home_bytes = ssz;
         }
-        fn->vregs[ssym.vreg].address_taken = 1;
-        if (fn->vregs[ssym.vreg].home_bytes < ssz) {
-          fn->vregs[ssym.vreg].home_bytes = ssz;
-        }
+        MirVregId sb = mir_emit_indirect_source_addr(fn, g, ctx, map, airf,
+                                                     &in->lhs, ssz);
         MirVregId db = mir_new_vreg(fn, MIR_RC_GP, 8);
-        MirVregId sb = mir_new_vreg(fn, MIR_RC_GP, 8);
-        if (db == MIR_VREG_NONE || sb == MIR_VREG_NONE ||
+        if (sb == MIR_VREG_NONE || db == MIR_VREG_NONE ||
             !mir_emit1(fn, MIR_LEA_LOCAL, mir_op_vreg(db), dsym, mir_op_none(), 8,
-                       0, 0) ||
-            !mir_emit1(fn, MIR_LEA_LOCAL, mir_op_vreg(sb), ssym, mir_op_none(), 8,
                        0, 0) ||
             !mir_emit_struct_copy(fn, db, sb, ssz)) {
           return 0;
@@ -3339,25 +3423,21 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
 
   case IR_OP_RETURN: {
     if (fn->returns_indirect && in->lhs.kind == IR_OPERAND_SYMBOL) {
-      /* INDIRECT struct return: copy the struct local into the caller's hidden
-       * slot (whose pointer the prologue homed into indirect_return_vreg), then
-       * leave that pointer in RAX as the Win64/SysV ABI requires. The source is
-       * the struct local's stack home; LEA it like any &@local. */
-      MirOperand structv = mir_value_operand(fn, g, ctx, map, &in->lhs);
-      if (structv.kind != MIR_OPK_VREG ||
-          fn->indirect_return_vreg == MIR_VREG_NONE) {
+      /* INDIRECT struct return: copy the struct into the caller's hidden slot
+       * (whose pointer the prologue homed into indirect_return_vreg), then
+       * leave that pointer in RAX as the Win64/SysV ABI requires. The source
+       * is a struct local's stack home or a by-ref param's pointer. */
+      const IRFunction *rirf =
+          ctx && ctx->function_name
+              ? code_generator_find_ir_function_binary(g, ctx->function_name)
+              : NULL;
+      if (fn->indirect_return_vreg == MIR_VREG_NONE) {
         fn->has_error = 1;
         return 0;
       }
-      fn->vregs[structv.vreg].address_taken = 1;
-      if (fn->vregs[structv.vreg].home_bytes < fn->indirect_return_size) {
-        fn->vregs[structv.vreg].home_bytes =
-            (fn->indirect_return_size + 7) & ~7;
-      }
-      MirVregId src_base = mir_new_vreg(fn, MIR_RC_GP, 8);
+      MirVregId src_base = mir_emit_indirect_source_addr(
+          fn, g, ctx, map, rirf, &in->lhs, fn->indirect_return_size);
       if (src_base == MIR_VREG_NONE ||
-          !mir_emit1(fn, MIR_LEA_LOCAL, mir_op_vreg(src_base), structv,
-                     mir_op_none(), 8, 0, 0) ||
           !mir_emit_struct_copy(fn, fn->indirect_return_vreg, src_base,
                                 fn->indirect_return_size)) {
         return 0;
@@ -3521,6 +3601,10 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
     int indirect_off[MIR_MAX_PARAMS] = {0}; /* slot offset, or -1 if not indirect */
     const CgSym *call_callee =
         g->ir_program ? code_generator_lookup_symbol(g, in->text) : NULL;
+    const IRFunction *cirf =
+        ctx && ctx->function_name
+            ? code_generator_find_ir_function_binary(g, ctx->function_name)
+            : NULL;
     int indirect_region = 0;
     for (size_t a = 0; a < in->argument_count; a++) {
       indirect_off[a] = -1;
@@ -3534,21 +3618,12 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
       int sz = (int)code_generator_abi_type_size(pt);
       indirect_off[a] = indirect_region;
       indirect_region += (sz + 7) & ~7;
-      /* Copy the struct from its local home into the slot. */
-      MirOperand structv = mir_value_operand(fn, g, ctx, map, &in->arguments[a]);
-      if (structv.kind != MIR_OPK_VREG) {
-        fn->has_error = 1;
-        return 0;
-      }
-      fn->vregs[structv.vreg].address_taken = 1;
-      if (fn->vregs[structv.vreg].home_bytes < ((sz + 7) & ~7)) {
-        fn->vregs[structv.vreg].home_bytes = (sz + 7) & ~7;
-      }
-      MirVregId src_base = mir_new_vreg(fn, MIR_RC_GP, 8);
+      /* Copy the struct into the slot: from a local/temp home, through a
+       * by-ref param's pointer, or from a string literal's .rdata record. */
+      MirVregId src_base = mir_emit_indirect_source_addr(
+          fn, g, ctx, map, cirf, &in->arguments[a], sz);
       MirVregId dst_base = mir_new_vreg(fn, MIR_RC_GP, 8);
       if (src_base == MIR_VREG_NONE || dst_base == MIR_VREG_NONE ||
-          !mir_emit1(fn, MIR_LEA_LOCAL, mir_op_vreg(src_base), structv,
-                     mir_op_none(), 8, 0, 0) ||
           !mir_emit1(fn, MIR_LEA_OUTARG, mir_op_vreg(dst_base),
                      mir_op_imm(indirect_off[a]), mir_op_none(), 8, 0, 0) ||
           !mir_emit_struct_copy(fn, dst_base, src_base, sz)) {
