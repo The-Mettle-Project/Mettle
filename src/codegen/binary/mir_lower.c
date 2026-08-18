@@ -1985,16 +1985,28 @@ int mir_function_is_eligible(CodeGenerator *generator,
        * (wide) index so the pointer math is plain 64-bit -- an int32 offset would
        * need the fallback's sign-extension to match exactly. */
       if (fill_mode == 0) {
-        if (!(in->arguments[3].kind == IR_OPERAND_INT &&
-              in->arguments[3].int_value == 0)) {
-          return mir_trace_bail(ir_function, "simd_fill:start");
-        }
+        int start_zero = (in->arguments[3].kind == IR_OPERAND_INT &&
+                          in->arguments[3].int_value == 0);
         int offset_zero = (in->arguments[4].kind == IR_OPERAND_INT &&
                            in->arguments[4].int_value == 0);
+        int wide = in->argument_count > 5 &&
+                   in->arguments[5].kind == IR_OPERAND_INT &&
+                   in->arguments[5].int_value == 64;
+        /* A nonzero start folds into the base and the count; a nonzero offset
+         * folds into the base. An int32 start subtracts at 32 bits and
+         * sign-extends (matching the fallback's movsxd); combining a narrow
+         * start with a runtime offset still defers. */
+        if (!start_zero) {
+          if (!wide && !offset_zero) {
+            return mir_trace_bail(ir_function, "simd_fill:start");
+          }
+          if (in->arguments[3].kind != IR_OPERAND_TEMP &&
+              in->arguments[3].kind != IR_OPERAND_SYMBOL &&
+              in->arguments[3].kind != IR_OPERAND_INT) {
+            return mir_trace_bail(ir_function, "simd_fill:start");
+          }
+        }
         if (!offset_zero) {
-          int wide = in->argument_count > 5 &&
-                     in->arguments[5].kind == IR_OPERAND_INT &&
-                     in->arguments[5].int_value == 64;
           if (!wide) {
             return mir_trace_bail(ir_function, "simd_fill:offset_width");
           }
@@ -4580,33 +4592,90 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
     MirOperand val = mir_value_operand(fn, g, ctx, map, &in->arguments[2]);
     long long size = in->arguments[0].int_value;
     long long mode = in->arguments[1].int_value;
-    /* Mode-0 runtime offset (`base[offset + i]`, start 0, int64 index): fold the
-     * effective base `base + offset*size` here in 64-bit MIR so the kernel runs
-     * the plain element loop. The count (rhs) is the element length unchanged. */
-    if (mode == 0 && !(in->arguments[4].kind == IR_OPERAND_INT &&
-                       in->arguments[4].int_value == 0)) {
-      MirOperand off = mir_value_operand(fn, g, ctx, map, &in->arguments[4]);
-      MirVregId scaled = mir_new_vreg(fn, MIR_RC_GP, 8);
-      if (scaled == MIR_VREG_NONE) {
-        return 0;
+    /* Mode-0 with a runtime offset and/or nonzero start (int64 index): fold
+     * `base + (offset+start)*size` in 64-bit MIR, and elements = bound-start,
+     * so the kernel runs the plain element loop. */
+    MirOperand m0_start = mir_op_imm(0);
+    int m0_start_zero = 1;
+    if (mode == 0) {
+      m0_start_zero = (in->arguments[3].kind == IR_OPERAND_INT &&
+                       in->arguments[3].int_value == 0);
+      int m0_off_zero = (in->arguments[4].kind == IR_OPERAND_INT &&
+                         in->arguments[4].int_value == 0);
+      if (!m0_start_zero) {
+        int m0_wide = in->argument_count > 5 &&
+                      in->arguments[5].kind == IR_OPERAND_INT &&
+                      in->arguments[5].int_value == 64;
+        m0_start = mir_value_operand(fn, g, ctx, map, &in->arguments[3]);
+        if (cnt.kind != MIR_OPK_VREG) {
+          MirVregId lc = mir_new_vreg(fn, MIR_RC_GP, 8);
+          if (lc == MIR_VREG_NONE ||
+              !mir_emit1(fn, MIR_MOV, mir_op_vreg(lc), cnt, mir_op_none(), 8, 0,
+                         0)) {
+            return 0;
+          }
+          cnt = mir_op_vreg(lc);
+        }
+        MirVregId nc = mir_new_vreg(fn, MIR_RC_GP, 8);
+        if (nc == MIR_VREG_NONE ||
+            !mir_emit1(fn, MIR_SUB, mir_op_vreg(nc), cnt, m0_start,
+                       m0_wide ? 8 : 4, 0, 0)) {
+          return 0;
+        }
+        if (!m0_wide &&
+            !mir_emit1(fn, MIR_MOVSX, mir_op_vreg(nc), mir_op_vreg(nc),
+                       mir_op_none(), 4, 0, 0)) {
+          return 0;
+        }
+        cnt = mir_op_vreg(nc);
       }
-      int shift = (size == 8) ? 3 : (size == 4) ? 2 : (size == 2) ? 1 : 0;
-      if (shift > 0) {
-        if (!mir_emit1(fn, MIR_SHL, mir_op_vreg(scaled), off, mir_op_imm(shift),
+      if (!m0_off_zero || !m0_start_zero) {
+        MirOperand eff;
+        if (m0_off_zero) {
+          eff = m0_start;
+        } else if (m0_start_zero) {
+          eff = mir_value_operand(fn, g, ctx, map, &in->arguments[4]);
+        } else {
+          MirOperand off = mir_value_operand(fn, g, ctx, map, &in->arguments[4]);
+          MirVregId sum = mir_new_vreg(fn, MIR_RC_GP, 8);
+          if (sum == MIR_VREG_NONE ||
+              !mir_emit1(fn, MIR_ADD, mir_op_vreg(sum), off, m0_start, 8, 0,
+                         0)) {
+            return 0;
+          }
+          eff = mir_op_vreg(sum);
+        }
+        if (eff.kind == MIR_OPK_IMM) {
+          MirVregId ev = mir_new_vreg(fn, MIR_RC_GP, 8);
+          if (ev == MIR_VREG_NONE ||
+              !mir_emit1(fn, MIR_MOV, mir_op_vreg(ev), eff, mir_op_none(), 8, 0,
+                         0)) {
+            return 0;
+          }
+          eff = mir_op_vreg(ev);
+        }
+        MirVregId scaled = mir_new_vreg(fn, MIR_RC_GP, 8);
+        if (scaled == MIR_VREG_NONE) {
+          return 0;
+        }
+        int shift = (size == 8) ? 3 : (size == 4) ? 2 : (size == 2) ? 1 : 0;
+        if (shift > 0) {
+          if (!mir_emit1(fn, MIR_SHL, mir_op_vreg(scaled), eff,
+                         mir_op_imm(shift), 8, 0, 0)) {
+            return 0;
+          }
+        } else if (!mir_emit1(fn, MIR_MOV, mir_op_vreg(scaled), eff,
+                              mir_op_none(), 8, 0, 0)) {
+          return 0;
+        }
+        MirVregId adj = mir_new_vreg(fn, MIR_RC_GP, 8);
+        if (adj == MIR_VREG_NONE ||
+            !mir_emit1(fn, MIR_ADD, mir_op_vreg(adj), base, mir_op_vreg(scaled),
                        8, 0, 0)) {
           return 0;
         }
-      } else if (!mir_emit1(fn, MIR_MOV, mir_op_vreg(scaled), off, mir_op_none(),
-                            8, 0, 0)) {
-        return 0;
+        base = mir_op_vreg(adj);
       }
-      MirVregId adj = mir_new_vreg(fn, MIR_RC_GP, 8);
-      if (adj == MIR_VREG_NONE ||
-          !mir_emit1(fn, MIR_ADD, mir_op_vreg(adj), base, mir_op_vreg(scaled), 8,
-                     0, 0)) {
-        return 0;
-      }
-      base = mir_op_vreg(adj);
     }
     /* Mode-2 byte-offset walk: fold `base + start` and the byte length
      * `bound - start` here in 64-bit MIR (the kernel receives the length
@@ -4656,15 +4725,29 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
      * branchlessly as `cnt & ~(cnt >> 63)` so a later use of the counter reads
      * the right value -- matching the fallback's cmov write-back exactly. */
     if (mode == 0 && in->dest.kind == IR_OPERAND_SYMBOL) {
+      /* Final iv = start + max(bound-start, 0); cnt already holds bound-start
+       * (or the plain bound when start is 0). */
       MirOperand iv = mir_value_operand(fn, g, ctx, map, &in->dest);
       MirVregId mask = mir_new_vreg(fn, MIR_RC_GP, 8);
       if (mask == MIR_VREG_NONE ||
           !mir_emit1(fn, MIR_SAR, mir_op_vreg(mask), cnt, mir_op_imm(63), 8, 0,
                      0) ||
           !mir_emit1(fn, MIR_NOT, mir_op_vreg(mask), mir_op_vreg(mask),
-                     mir_op_none(), 8, 0, 0) ||
-          !mir_emit1(fn, MIR_AND, iv, cnt, mir_op_vreg(mask), 8, 0, 0)) {
+                     mir_op_none(), 8, 0, 0)) {
         return 0;
+      }
+      if (m0_start_zero) {
+        if (!mir_emit1(fn, MIR_AND, iv, cnt, mir_op_vreg(mask), 8, 0, 0)) {
+          return 0;
+        }
+      } else {
+        MirVregId w = mir_new_vreg(fn, MIR_RC_GP, 8);
+        if (w == MIR_VREG_NONE ||
+            !mir_emit1(fn, MIR_AND, mir_op_vreg(w), cnt, mir_op_vreg(mask), 8,
+                       0, 0) ||
+            !mir_emit1(fn, MIR_ADD, iv, mir_op_vreg(w), m0_start, 8, 0, 0)) {
+          return 0;
+        }
       }
     }
     /* Mode-2 live iv: the scalar loop leaves iv = start when the walk is
