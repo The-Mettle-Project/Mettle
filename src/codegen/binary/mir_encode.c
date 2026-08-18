@@ -2087,6 +2087,29 @@ int mir_encode(MirFunction *fn) {
     case MIR_NOT:
       ok = encode_neg_not(fn, in);
       break;
+    case MIR_POPCNT: {
+      BinaryGpRegister D;
+      if (dst_is_reg(fn, &in->dst, &D)) {
+        if (!operand_in_phys(fn, &in->a, D) && !materialize_into(fn, &in->a, D)) {
+          ok = 0;
+          break;
+        }
+        if (!wcs_popcnt(&ctx->code, D, D)) {
+          ok = enc_err(fn, "out of memory in popcnt");
+        }
+        break;
+      }
+      if (!materialize_into(fn, &in->a, SCRATCH_A)) {
+        ok = 0;
+        break;
+      }
+      if (!wcs_popcnt(&ctx->code, SCRATCH_A, SCRATCH_A)) {
+        ok = enc_err(fn, "out of memory in popcnt");
+        break;
+      }
+      ok = store_from(fn, &in->dst, SCRATCH_A);
+      break;
+    }
     case MIR_IDIV:
       ok = encode_div(fn, in);
       break;

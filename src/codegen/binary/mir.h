@@ -183,6 +183,7 @@ typedef enum {
                      the copy source when a literal is passed to a `string`
                      (INDIRECT aggregate) parameter or assigned to a string
                      local. */
+  MIR_POPCNT,     /* dst <- popcount(a), 64-bit. */
   MIR_HEAP_NEW,   /* Win64 zeroed heap allocation (IR_OP_NEW): byte size
                      marshalled into R8 by a preceding MIR_MOV; the encoder
                      emits the self-contained GetProcessHeap +

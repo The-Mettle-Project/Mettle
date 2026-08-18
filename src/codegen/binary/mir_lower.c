@@ -1638,6 +1638,13 @@ int mir_function_is_eligible(CodeGenerator *generator,
             (in->op == IR_OP_LOAD && o == &in->dest &&
              in->rhs.kind == IR_OPERAND_INT && in->rhs.int_value == 8 &&
              (mir_name_is_string_local(generator, ir_function, o->name) ||
+              mir_name_is_indirect_param(generator, ir_function, o->name))) ||
+            /* `*@s [w]` / `*@s <- v [w]`: the name used as a memory ADDRESS.
+             * A string local's address is its home (mir_address_operand leas
+             * it); a by-ref param's value already is the address. */
+            (((in->op == IR_OP_LOAD && o == &in->lhs) ||
+              (in->op == IR_OP_STORE && o == &in->dest)) &&
+             (mir_name_is_string_local(generator, ir_function, o->name) ||
               mir_name_is_indirect_param(generator, ir_function, o->name)));
         if (!allowed) {
           return mir_trace_bail(ir_function, "indirect_agg_byname");
@@ -1776,7 +1783,8 @@ int mir_function_is_eligible(CodeGenerator *generator,
           return mir_trace_bail(ir_function, "unary:float_or_unsupported");
         }
       } else if (strcmp(in->text, "-") != 0 && strcmp(in->text, "~") != 0 &&
-                 strcmp(in->text, "+") != 0 && strcmp(in->text, "!") != 0) {
+                 strcmp(in->text, "+") != 0 && strcmp(in->text, "!") != 0 &&
+                 strcmp(in->text, "popcnt") != 0) {
         return mir_trace_bail(ir_function, "unary:float_or_unsupported");
       }
       if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
@@ -2798,6 +2806,14 @@ static MirOperand mir_address_operand(MirFunction *fn, CodeGenerator *g,
         ctx && ctx->function_name
             ? code_generator_find_ir_function_binary(g, ctx->function_name)
             : NULL;
+    if (mir_name_is_string_local(g, irf, op->name)) {
+      MirVregId a = mir_emit_indirect_source_addr(fn, g, ctx, map, irf, op, 16);
+      if (a == MIR_VREG_NONE) {
+        fn->has_error = 1;
+        return mir_op_none();
+      }
+      return mir_op_vreg(a);
+    }
     if (mir_name_is_global_aggregate(g, irf, op->name)) {
       MirVregId a = mir_new_vreg(fn, MIR_RC_GP, 8);
       const CgSym *s =
@@ -3602,6 +3618,9 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
       unsigned char cc = 0;
       mir_setcc_opcode("==", 0, &cc);
       return mir_emit1(fn, MIR_SETCC, dst, a, mir_op_imm(0), 8, 0, cc);
+    }
+    if (strcmp(op, "popcnt") == 0) {
+      return mir_emit1(fn, MIR_POPCNT, dst, a, mir_op_none(), 8, 0, 0);
     }
     fn->has_error = 1;
     return 0;

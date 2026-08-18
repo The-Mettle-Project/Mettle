@@ -1662,6 +1662,7 @@ static int mir_op_pure_def(MirOpcode op) {
   case MIR_IMUL:
   case MIR_NEG:
   case MIR_NOT:
+  case MIR_POPCNT:
   case MIR_SHL:
   case MIR_SHR:
   case MIR_SAR:
