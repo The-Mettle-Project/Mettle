@@ -320,6 +320,270 @@ static int link_resolution_load_objects(LinkResolution *resolution,
   return 1;
 }
 
+/* Section garbage collection: the runtime objects are compiled with
+ * -ffunction-sections/-fdata-sections, so every function and global lives in
+ * its own `.text$name`/`.data$name` section. Only those granular sections are
+ * collectable; plain sections (all Mettle-emitted code among them) are roots.
+ * Reachability follows relocations, binding locally when the referenced
+ * symbol is defined in the same object and by name otherwise, with the same
+ * runtime-default-loses precedence the real symbol resolution applies. */
+
+typedef struct {
+  const char *name;
+  size_t object_index;
+  size_t section_index;
+  int is_runtime_default;
+} GcDefinition;
+
+typedef struct {
+  size_t object_index;
+  size_t section_index;
+} GcWorkItem;
+
+static int link_section_is_gc_eligible(const CoffSection *section) {
+  if (!section->name || !strchr(section->name, '$')) {
+    return 0;
+  }
+  switch (section->kind) {
+  case COFF_SECTION_KIND_TEXT:
+  case COFF_SECTION_KIND_RDATA:
+  case COFF_SECTION_KIND_DATA:
+  case COFF_SECTION_KIND_BSS:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+static size_t gc_hash_name(const char *name) {
+  size_t hash = 1469598103934665603u;
+  while (*name) {
+    hash ^= (unsigned char)*name++;
+    hash *= 1099511628211u;
+  }
+  return hash;
+}
+
+static const GcDefinition *gc_find_definition(const GcDefinition *table,
+                                              size_t bucket_count,
+                                              const char *name) {
+  size_t slot = gc_hash_name(name) & (bucket_count - 1u);
+  while (table[slot].name) {
+    if (strcmp(table[slot].name, name) == 0) {
+      return &table[slot];
+    }
+    slot = (slot + 1u) & (bucket_count - 1u);
+  }
+  return NULL;
+}
+
+static void gc_insert_definition(GcDefinition *table, size_t bucket_count,
+                                 const GcDefinition *definition) {
+  size_t slot = gc_hash_name(definition->name) & (bucket_count - 1u);
+  while (table[slot].name) {
+    if (strcmp(table[slot].name, definition->name) == 0) {
+      if (table[slot].is_runtime_default && !definition->is_runtime_default) {
+        table[slot] = *definition;
+      }
+      return;
+    }
+    slot = (slot + 1u) & (bucket_count - 1u);
+  }
+  table[slot] = *definition;
+}
+
+static void gc_mark(unsigned char **live, GcWorkItem *worklist,
+                    size_t *worklist_count, size_t object_index,
+                    size_t section_index) {
+  if (live[object_index][section_index]) {
+    return;
+  }
+  live[object_index][section_index] = 1;
+  worklist[*worklist_count].object_index = object_index;
+  worklist[*worklist_count].section_index = section_index;
+  (*worklist_count)++;
+}
+
+static int link_resolution_gc_sections(LinkResolution *resolution,
+                                       const LinkResolutionOptions *options,
+                                       char **error_message_out) {
+  size_t object_index = 0;
+  size_t total_sections = 0;
+  size_t definition_count = 0;
+  size_t bucket_count = 64;
+  GcDefinition *table = NULL;
+  unsigned char **live = NULL;
+  GcWorkItem *worklist = NULL;
+  size_t worklist_count = 0;
+  size_t processed = 0;
+  int ok = 0;
+
+  for (object_index = 0; object_index < resolution->object_count;
+       object_index++) {
+    const CoffObject *object = resolution->objects[object_index].object;
+    if (!object) {
+      continue;
+    }
+    total_sections += object->section_count;
+    definition_count += object->symbol_count;
+  }
+  if (total_sections == 0u) {
+    return 1;
+  }
+
+  while (bucket_count < definition_count * 2u) {
+    bucket_count *= 2u;
+  }
+
+  table = calloc(bucket_count, sizeof(GcDefinition));
+  live = calloc(resolution->object_count, sizeof(unsigned char *));
+  worklist = malloc(total_sections * sizeof(GcWorkItem));
+  if (!table || !live || !worklist) {
+    mettle_set_error(error_message_out,
+                     "Out of memory during section garbage collection");
+    goto cleanup;
+  }
+
+  for (object_index = 0; object_index < resolution->object_count;
+       object_index++) {
+    LinkedInputObject *input = &resolution->objects[object_index];
+    const CoffObject *object = input->object;
+    size_t i = 0;
+
+    if (!object) {
+      continue;
+    }
+    live[object_index] = calloc(object->section_count ? object->section_count : 1u,
+                                sizeof(unsigned char));
+    input->symbol_gc_referenced =
+        calloc(object->symbol_count ? object->symbol_count : 1u,
+               sizeof(unsigned char));
+    if (!live[object_index] || !input->symbol_gc_referenced) {
+      mettle_set_error(error_message_out,
+                       "Out of memory during section garbage collection");
+      goto cleanup;
+    }
+
+    for (i = 0; i < object->symbol_count; i++) {
+      const CoffSymbol *symbol = &object->symbols[i];
+      GcDefinition definition = {0};
+
+      if (symbol->is_auxiliary || !symbol->name ||
+          symbol->storage_class != COFF_STORAGE_CLASS_EXTERNAL ||
+          symbol->section_number <= 0 ||
+          (size_t)symbol->section_number > object->section_count) {
+        continue;
+      }
+      definition.name = symbol->name;
+      definition.object_index = object_index;
+      definition.section_index = (size_t)(symbol->section_number - 1);
+      definition.is_runtime_default = input->is_runtime_default;
+      gc_insert_definition(table, bucket_count, &definition);
+    }
+  }
+
+  for (object_index = 0; object_index < resolution->object_count;
+       object_index++) {
+    const CoffObject *object = resolution->objects[object_index].object;
+    size_t i = 0;
+
+    if (!object) {
+      continue;
+    }
+    for (i = 0; i < object->section_count; i++) {
+      const CoffSection *section = &object->sections[i];
+      if (section->kind == COFF_SECTION_KIND_UNKNOWN) {
+        continue;
+      }
+      if (!link_section_is_gc_eligible(section)) {
+        gc_mark(live, worklist, &worklist_count, object_index, i);
+      }
+    }
+  }
+
+  if (options && options->entry_symbol_name && options->entry_symbol_name[0]) {
+    const GcDefinition *entry =
+        gc_find_definition(table, bucket_count, options->entry_symbol_name);
+    if (entry) {
+      gc_mark(live, worklist, &worklist_count, entry->object_index,
+              entry->section_index);
+    }
+  }
+
+  while (processed < worklist_count) {
+    GcWorkItem item = worklist[processed++];
+    LinkedInputObject *input = &resolution->objects[item.object_index];
+    const CoffObject *object = input->object;
+    const CoffSection *section = &object->sections[item.section_index];
+    size_t r = 0;
+
+    for (r = 0; r < section->relocation_count; r++) {
+      uint32_t symbol_index = section->relocations[r].symbol_table_index;
+      const CoffSymbol *symbol = NULL;
+
+      if (symbol_index >= object->symbol_count) {
+        continue;
+      }
+      input->symbol_gc_referenced[symbol_index] = 1;
+      symbol = &object->symbols[symbol_index];
+      if (symbol->is_auxiliary) {
+        continue;
+      }
+      if (symbol->section_number > 0 &&
+          (size_t)symbol->section_number <= object->section_count) {
+        gc_mark(live, worklist, &worklist_count, item.object_index,
+                (size_t)(symbol->section_number - 1));
+      } else if (symbol->section_number == 0 && symbol->name) {
+        const GcDefinition *definition =
+            gc_find_definition(table, bucket_count, symbol->name);
+        if (definition) {
+          gc_mark(live, worklist, &worklist_count, definition->object_index,
+                  definition->section_index);
+        }
+      }
+    }
+  }
+
+  for (object_index = 0; object_index < resolution->object_count;
+       object_index++) {
+    LinkedInputObject *input = &resolution->objects[object_index];
+    const CoffObject *object = input->object;
+    size_t i = 0;
+
+    if (!object) {
+      continue;
+    }
+    input->section_gc_dead =
+        calloc(object->section_count ? object->section_count : 1u,
+               sizeof(unsigned char));
+    if (!input->section_gc_dead) {
+      mettle_set_error(error_message_out,
+                       "Out of memory during section garbage collection");
+      goto cleanup;
+    }
+    for (i = 0; i < object->section_count; i++) {
+      if (!live[object_index][i] &&
+          link_section_is_gc_eligible(&object->sections[i])) {
+        input->section_gc_dead[i] = 1;
+      }
+    }
+  }
+
+  ok = 1;
+
+cleanup:
+  if (live) {
+    for (object_index = 0; object_index < resolution->object_count;
+         object_index++) {
+      free(live[object_index]);
+    }
+  }
+  free(live);
+  free(table);
+  free(worklist);
+  return ok;
+}
+
 static int link_resolution_merge_sections(LinkResolution *resolution,
                                           size_t fallback_alignment,
                                           char **error_message_out) {
@@ -358,6 +622,9 @@ static int link_resolution_merge_sections(LinkResolution *resolution,
 
       input->section_merged_indices[section_index] = LINKED_SECTION_INDEX_NONE;
       if (merged_index == LINKED_SECTION_INDEX_NONE) {
+        continue;
+      }
+      if (input->section_gc_dead && input->section_gc_dead[section_index]) {
         continue;
       }
 
@@ -662,6 +929,19 @@ static int link_resolution_build_symbols(LinkResolution *resolution,
         }
       }
 
+      if (symbol->section_number > 0 && input->section_gc_dead &&
+          input->section_gc_dead[(size_t)(symbol->section_number - 1)]) {
+        continue;
+      }
+      /* An undefined external nothing retained relocates against is dropped
+       * rather than recorded, so it neither fails resolution nor becomes a
+       * DLL import. Mettle objects declare every extern a module names, used
+       * or not, and the runtime's dead code names libc symbols. */
+      if (symbol->section_number == 0 && input->symbol_gc_referenced &&
+          !input->symbol_gc_referenced[symbol_index]) {
+        continue;
+      }
+
       if (resolved->is_external && resolved->name) {
         if (!link_resolution_record_global_symbol(resolution, input, resolved,
                                                   error_message_out)) {
@@ -814,7 +1094,8 @@ int link_resolution_build(const char **object_paths, size_t object_count,
     }
   }
 
-  if (!link_resolution_merge_sections(resolution, section_alignment,
+  if (!link_resolution_gc_sections(resolution, options, error_message_out) ||
+      !link_resolution_merge_sections(resolution, section_alignment,
                                       error_message_out) ||
       !link_resolution_build_symbols(resolution, error_message_out) ||
       !link_resolution_assign_virtual_addresses(resolution, section_alignment) ||
@@ -859,6 +1140,8 @@ void link_resolution_destroy(LinkResolution *resolution) {
     free(input->section_merged_sizes);
     free(input->section_alignments);
     free(input->symbols);
+    free(input->section_gc_dead);
+    free(input->symbol_gc_referenced);
     coff_object_destroy(input->object);
   }
 

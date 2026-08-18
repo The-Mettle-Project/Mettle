@@ -28,7 +28,11 @@ static int write_object(BinaryEmitter *emitter, const char *path) {
 static int create_imp_symbol_object(const char *path) {
   BinaryEmitter *emitter = NULL;
   size_t text = 0u;
-  static const unsigned char code[] = {0x31u, 0xC0u, 0xC3u};
+  /* call rel32; mov rax, [rip+disp32]; ret -- the externals must be
+   * relocated against, or the linker's section GC drops them as unused. */
+  static const unsigned char code[] = {0xE8u, 0x00u, 0x00u, 0x00u, 0x00u,
+                                       0x48u, 0x8Bu, 0x05u, 0x00u, 0x00u,
+                                       0x00u, 0x00u, 0xC3u};
   int ok = 0;
 
   emitter = binary_emitter_create(BINARY_TARGET_FORMAT_COFF_WIN64);
@@ -43,7 +47,11 @@ static int create_imp_symbol_object(const char *path) {
       !binary_emitter_define_symbol(emitter, TEST_ENTRY_SYMBOL, BINARY_SYMBOL_GLOBAL,
                                     text, 0u, sizeof(code)) ||
       !binary_emitter_declare_external(emitter, "GetCurrentProcessId") ||
-      !binary_emitter_declare_external(emitter, "__imp_GetCurrentProcessId")) {
+      !binary_emitter_declare_external(emitter, "__imp_GetCurrentProcessId") ||
+      !binary_emitter_add_relocation(emitter, text, 1u, BINARY_RELOCATION_REL32,
+                                     "GetCurrentProcessId", 0) ||
+      !binary_emitter_add_relocation(emitter, text, 8u, BINARY_RELOCATION_REL32,
+                                     "__imp_GetCurrentProcessId", 0)) {
     goto cleanup;
   }
 

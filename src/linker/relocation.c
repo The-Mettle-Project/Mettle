@@ -128,6 +128,9 @@ int link_apply_relocations(LinkResolution *resolution,
       if (source_section->relocation_count == 0u) {
         continue;
       }
+      if (input->section_gc_dead && input->section_gc_dead[section_index]) {
+        continue;
+      }
       if (merged_section_index == LINKED_SECTION_INDEX_NONE) {
         if (relocation_section_is_debug_only(source_section)) {
           continue;

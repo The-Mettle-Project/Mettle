@@ -57,6 +57,14 @@ typedef struct {
   /* A bundled runtime object: its definitions are defaults a program object may
    * replace. See object_is_runtime_default in LinkResolutionOptions. */
   int is_runtime_default;
+  /* Per-section: 1 marks a granular (-ffunction-sections/-fdata-sections)
+   * section proven unreachable from any retained section; it is left out of
+   * the merged image entirely. */
+  unsigned char *section_gc_dead;
+  /* Per-symbol: 1 marks a symbol-table entry some retained section relocates
+   * against. Undefined externals nothing retained references are not recorded
+   * globally, so they neither fail resolution nor become DLL imports. */
+  unsigned char *symbol_gc_referenced;
 } LinkedInputObject;
 
 typedef struct {
