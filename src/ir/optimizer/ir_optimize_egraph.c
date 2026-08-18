@@ -15,6 +15,16 @@
  * Gated on METTLE_EGRAPH=1 and registered as an ordinary fixpoint pass, so
  * every change it makes runs under the translation-validation snapshot
  * harness (--verify), and METTLE_SKIP_PASS=egraph_simplify turns it off.
+ *
+ * What it measured, which is the point of building it as a pilot: on IR the
+ * ordinary pipeline has already optimized, saturation finds almost nothing.
+ * The destructive passes reach the easy equivalences first, and what is left
+ * is rarely a cheaper form of a single instruction. Disabling reassociation
+ * makes it visible -- the non-adjacent constant chains the const-chain table
+ * cannot see collapse here -- which is the honest shape of the result: the
+ * value of an e-graph in this compiler is subsuming the destructive rules and
+ * extracting per target, not finding extra folds on x86. Keep that in mind
+ * before spending a quarter on the full version.
  * ==========================================================================*/
 
 #define EG_MAX_NODES 512
@@ -260,45 +270,7 @@ static int eg_saturate_round(EGraph *g) {
   return changed;
 }
 
-/* Extraction cost: how many "instruction units" the cheapest form of this
- * class costs. Leaves are free (already materialized), constants free. */
-static int eg_class_cost(EGraph *g, int c, int depth);
-
-static int eg_node_cost(EGraph *g, const EgNode *n, int depth) {
-  switch (n->kind) {
-  case EG_CONST:
-  case EG_LEAF:
-    return 0;
-  case EG_BIN: {
-    int op_cost = (n->op == '*' && n->op2 == 0) ? 4 : 1;
-    int ca = eg_class_cost(g, n->a, depth + 1);
-    int cb = eg_class_cost(g, n->b, depth + 1);
-    if (ca > 1000 || cb > 1000) {
-      return 100000;
-    }
-    return op_cost + ca + cb;
-  }
-  }
-  return 100000;
-}
-
-static int eg_class_cost(EGraph *g, int c, int depth) {
-  if (depth > 8) {
-    return 100000;
-  }
-  c = eg_find(g, c);
-  int best = 100000;
-  for (int i = 0; i < g->node_count; i++) {
-    if (eg_find(g, g->node_class[i]) != c) {
-      continue;
-    }
-    int cost = eg_node_cost(g, &g->nodes[i], depth);
-    if (cost < best) {
-      best = cost;
-    }
-  }
-  return best;
-}
+static int eg_class_leaf_node(EGraph *g, int c);
 
 /* The cheapest node of the class whose children are leaves or constants (so
  * it can replace one instruction in place). Returns node index or -1. */
@@ -311,31 +283,16 @@ static int eg_class_best_shallow(EGraph *g, int c) {
       continue;
     }
     const EgNode *n = &g->nodes[i];
-    int cost;
+    int cost = 0;
     if (n->kind == EG_BIN) {
-      long long tmp;
-      int a_shallow =
-          eg_class_const(g, n->a, &tmp) || eg_find(g, n->a) < g->node_count;
-      (void)a_shallow;
-      /* children must themselves extract as leaf/const */
-      int ca_leaf = 0, cb_leaf = 0;
-      for (int j = 0; j < g->node_count && !(ca_leaf && cb_leaf); j++) {
-        int jc = eg_find(g, g->node_class[j]);
-        if (g->nodes[j].kind != EG_BIN) {
-          if (jc == eg_find(g, n->a)) {
-            ca_leaf = 1;
-          }
-          if (jc == eg_find(g, n->b)) {
-            cb_leaf = 1;
-          }
-        }
-      }
-      if (!ca_leaf || !cb_leaf) {
+      /* Both children have to extract as a leaf or a constant for this node
+       * to replace one instruction in place. Asked through the same helper
+       * the rewrite below uses to fetch them, so "there is one" and "here it
+       * is" can never disagree. */
+      if (eg_class_leaf_node(g, n->a) < 0 || eg_class_leaf_node(g, n->b) < 0) {
         continue;
       }
       cost = (n->op == '*' && n->op2 == 0) ? 4 : 1;
-    } else {
-      cost = 0;
     }
     if (cost < best_cost) {
       best_cost = cost;
