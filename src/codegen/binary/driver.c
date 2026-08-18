@@ -397,24 +397,29 @@ mir_shared_append:
     return 0;
   }
 
-  /* On COFF each function gets its own `.text$name` section so the linker's
-   * section GC can drop the ones nothing reachable calls; the merged result
-   * lays out identically to one shared .text. A COFF section count is a
-   * uint16, so enormous programs fall back to the shared section. The ELF
-   * path keeps one .text: those objects go through external linkers whose
-   * scripts are not asked to collect. */
+  /* Each function gets its own text section (`.text$name` on COFF,
+   * `.text.name` on ELF) so section GC, internal or ld's, can drop the ones
+   * nothing reachable calls; the merged result lays out identically to one
+   * shared .text. A COFF section count is a uint16, so enormous programs
+   * fall back to the shared section. */
   {
     const char *text_name = ".text";
     char granular_name[512];
     uint32_t text_characteristics = 0;
+    int granular_format =
+        emitter->target_format == BINARY_TARGET_FORMAT_COFF_WIN64 ||
+        emitter->target_format == BINARY_TARGET_FORMAT_ELF_X64;
 
-    if (emitter->target_format == BINARY_TARGET_FORMAT_COFF_WIN64 &&
-        emitter->section_count < 60000u &&
+    if (granular_format && emitter->section_count < 60000u &&
         strlen(ir_function->name) + 7u <= sizeof(granular_name)) {
-      snprintf(granular_name, sizeof(granular_name), ".text$%s",
+      snprintf(granular_name, sizeof(granular_name),
+               emitter->target_format == BINARY_TARGET_FORMAT_COFF_WIN64
+                   ? ".text$%s"
+                   : ".text.%s",
                ir_function->name);
       text_name = granular_name;
-      if (context.wants_wide_loop_alignment) {
+      if (emitter->target_format == BINARY_TARGET_FORMAT_COFF_WIN64 &&
+          context.wants_wide_loop_alignment) {
         text_characteristics = 0x60000020u | 0x00600000u;
       }
     }
