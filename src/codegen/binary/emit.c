@@ -175,8 +175,25 @@ int code_generator_binary_emit_string_literal_value_address(
     goto cleanup;
   }
 
-  rdata_section = binary_emitter_get_or_create_section(
-      emitter, ".rdata", BINARY_SECTION_RDATA, 0, 8);
+  /* Each literal gets its own `.rdata$label` section on COFF so the ones only
+   * collected functions named are collected with them; the chars and the
+   * struct share the section, bound by a local relocation. The section-count
+   * guard keeps enormous programs under the COFF uint16 section limit. */
+  {
+    const char *rdata_name = ".rdata";
+    char granular_name[128];
+    uint32_t rdata_characteristics = 0;
+
+    if (emitter->target_format == BINARY_TARGET_FORMAT_COFF_WIN64 &&
+        emitter->section_count < 60000u &&
+        strlen(struct_label) + 8u <= sizeof(granular_name)) {
+      snprintf(granular_name, sizeof(granular_name), ".rdata$%s", struct_label);
+      rdata_name = granular_name;
+      rdata_characteristics = 0x40000040u | 0x00400000u;
+    }
+    rdata_section = binary_emitter_get_or_create_section(
+        emitter, rdata_name, BINARY_SECTION_RDATA, rdata_characteristics, 8);
+  }
   if (rdata_section == (size_t)-1) {
     code_generator_set_error(generator, "%s",
                              binary_emitter_get_error(emitter)

@@ -409,7 +409,7 @@ mir_shared_append:
     uint32_t text_characteristics = 0;
 
     if (emitter->target_format == BINARY_TARGET_FORMAT_COFF_WIN64 &&
-        generator->ir_program->function_count < 20000u &&
+        emitter->section_count < 60000u &&
         strlen(ir_function->name) + 7u <= sizeof(granular_name)) {
       snprintf(granular_name, sizeof(granular_name), ".text$%s",
                ir_function->name);
