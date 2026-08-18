@@ -805,11 +805,30 @@ static int mir_name_is_indirect_param(CodeGenerator *g,
          code_generator_abi_classify(t) == ABI_PASS_INDIRECT;
 }
 
+/* True if NAME is a module-level AGGREGATE variable (struct/array/string
+ * global, or an extern one): not a local/param, not scalar-accessible (small
+ * DIRECT global aggregates are cached like scalars and stay off this path).
+ * Such a global is never register-cached; memory is authoritative and its
+ * address is a RIP-relative LEA. */
+static int mir_name_is_global_aggregate(CodeGenerator *g,
+                                        const IRFunction *irf,
+                                        const char *name) {
+  if (!g || !name || mir_local_or_param_type(g, irf, name, NULL)) {
+    return 0;
+  }
+  if (!mir_name_is_global_variable(g, name)) {
+    return 0;
+  }
+  const CgSym *s = code_generator_lookup_symbol(g, name);
+  return s && s->type && code_generator_type_is_aggregate(s->type) &&
+         !code_generator_binary_symbol_is_scalar_accessible(g, name);
+}
+
 /* An operand that can SOURCE an INDIRECT (by-value) aggregate copy: a struct
  * LOCAL or struct TEMP (LEA-able home), a by-ref aggregate PARAM (its value is
- * the address), or a string LITERAL (its {chars,length} record is in .rdata).
- * This is the eligibility-side mirror of the fallback's
- * emit_indirect_source_address, minus global aggregates (still deferred). */
+ * the address), a global aggregate (RIP-relative LEA; memory authoritative),
+ * or a string LITERAL (its {chars,length} record is in .rdata). This is the
+ * eligibility-side mirror of the fallback's emit_indirect_source_address. */
 static int mir_indirect_source_is_supported(CodeGenerator *g,
                                             const IRFunction *irf,
                                             const IROperand *op) {
@@ -820,7 +839,8 @@ static int mir_indirect_source_is_supported(CodeGenerator *g,
     return 1;
   }
   return op->kind == IR_OPERAND_SYMBOL && op->name &&
-         mir_name_is_indirect_param(g, irf, op->name);
+         (mir_name_is_indirect_param(g, irf, op->name) ||
+          mir_name_is_global_aggregate(g, irf, op->name));
 }
 
 /* True if temp `name` holds a float value, judged from the producing
@@ -1009,6 +1029,11 @@ static int mir_call_indirect_is_supported(CodeGenerator *g,
     if (arg->kind != IR_OPERAND_TEMP && arg->kind != IR_OPERAND_SYMBOL &&
         arg->kind != IR_OPERAND_INT && arg->kind != IR_OPERAND_STRING) {
       mir_call_trace("indirect_arg_operand_kind");
+      return 0;
+    }
+    if (arg->kind == IR_OPERAND_SYMBOL && arg->name &&
+        mir_name_is_global_aggregate(g, ir_function, arg->name)) {
+      mir_call_trace("indirect_arg_aggregate_value");
       return 0;
     }
     if (arg->kind == IR_OPERAND_STRING &&
@@ -1234,6 +1259,14 @@ static int mir_call_is_supported(CodeGenerator *g,
       mir_call_trace("arg_operand_kind");
       return 0;
     }
+    /* A global AGGREGATE has no cached value vreg; it may only feed an
+     * INDIRECT param (handled above, by address). Reaching here with one
+     * means a scalar param, which the value path cannot serve. */
+    if (arg->kind == IR_OPERAND_SYMBOL && arg->name &&
+        mir_name_is_global_aggregate(g, ir_function, arg->name)) {
+      mir_call_trace("arg_aggregate_scalar_param");
+      return 0;
+    }
     if (arg->kind == IR_OPERAND_STRING &&
         !code_generator_binary_type_is_cstring(pt)) {
       /* A string literal is only lowered to a bare cstring (char* in one GP
@@ -1439,11 +1472,17 @@ int mir_function_is_eligible(CodeGenerator *generator,
           break;
         }
       }
-      if (!found && !mir_name_is_global_scalar(generator, in->dest.name)) {
+      /* STORE's dest is an ADDRESS operand: `*@g <- v` stores through a global
+       * aggregate's memory (never cached, so it is not a cache write). */
+      int agg_addr_dest =
+          !found && in->op == IR_OP_STORE &&
+          mir_name_is_global_aggregate(generator, ir_function, in->dest.name);
+      if (!found && !agg_addr_dest &&
+          !mir_name_is_global_scalar(generator, in->dest.name)) {
         globals_ok = 0;
         break;
       }
-      if (!found) {
+      if (!found && !agg_addr_dest) {
         has_global_write = 1;
         int seen = 0;
         for (size_t j = 0; j < gw_count; j++) {
@@ -1476,14 +1515,29 @@ int mir_function_is_eligible(CodeGenerator *generator,
           }
         }
         if (!found && !mir_name_is_global_scalar(generator, reads[k]->name)) {
-          globals_ok = 0;
-          break;
+          /* A global AGGREGATE name is usable in the positions where the
+           * lowering materializes its RIP-relative address instead of a
+           * cached value: a LOAD/PREFETCH address (`*@g [w]`), or the source
+           * of a whole-struct ASSIGN into a LEA-able home. */
+          int agg_ok =
+              mir_name_is_global_aggregate(generator, ir_function,
+                                           reads[k]->name) &&
+              (((in->op == IR_OP_LOAD || in->op == IR_OP_PREFETCH) &&
+                reads[k] == &in->lhs) ||
+               (in->op == IR_OP_ASSIGN && reads[k] == &in->lhs &&
+                mir_operand_struct_home_size(generator, ir_function,
+                                             &in->dest) > 0));
+          if (!agg_ok) {
+            globals_ok = 0;
+            break;
+          }
         }
       }
     }
     /* Undefined SYMBOL call arguments are global reads too (e.g. f(g)). They
-     * must be scalar globals so the entry-load pass can cache them; otherwise
-     * the value path would map them to an undefined vreg. */
+     * must be scalar globals so the entry-load pass can cache them, or global
+     * aggregates a CALL copies from by address (mir_call_is_supported vets the
+     * parameter match; CALL_INDIRECT rejects aggregate args in its own gate). */
     for (size_t a = 0; a < in->argument_count && globals_ok; a++) {
       const IROperand *arg = &in->arguments[a];
       if (arg->kind != IR_OPERAND_SYMBOL || !arg->name) {
@@ -1496,7 +1550,9 @@ int mir_function_is_eligible(CodeGenerator *generator,
           break;
         }
       }
-      if (!found && !mir_name_is_global_scalar(generator, arg->name)) {
+      if (!found && !mir_name_is_global_scalar(generator, arg->name) &&
+          !((in->op == IR_OP_CALL || in->op == IR_OP_CALL_INDIRECT) &&
+            mir_name_is_global_aggregate(generator, ir_function, arg->name))) {
         globals_ok = 0;
         break;
       }
@@ -2642,6 +2698,17 @@ static MirVregId mir_emit_indirect_source_addr(MirFunction *fn,
     }
     return base;
   }
+  if (op->kind == IR_OPERAND_SYMBOL && op->name &&
+      mir_name_is_global_aggregate(g, irf, op->name)) {
+    const CgSym *s =
+        g->ir_program ? code_generator_lookup_symbol(g, op->name) : NULL;
+    int is_extern = (s && s->is_extern) ? 1 : 0;
+    if (!mir_emit1(fn, MIR_LEA_GLOBAL, mir_op_vreg(base),
+                   mir_op_symbol(op->name), mir_op_none(), 8, is_extern, 0)) {
+      return MIR_VREG_NONE;
+    }
+    return base;
+  }
   MirOperand v = mir_value_operand(fn, g, ctx, map, op);
   if (v.kind != MIR_OPK_VREG) {
     fn->has_error = 1;
@@ -2663,6 +2730,35 @@ static MirVregId mir_emit_indirect_source_addr(MirFunction *fn,
     return MIR_VREG_NONE;
   }
   return base;
+}
+
+/* Resolve an operand used as a memory ADDRESS: a global aggregate's name
+ * materializes its RIP-relative address into a fresh vreg (it has no cached
+ * value vreg; memory is authoritative), anything else is the plain value
+ * operand (a pointer temp/local, or a cached scalar's vreg). */
+static MirOperand mir_address_operand(MirFunction *fn, CodeGenerator *g,
+                                      BinaryFunctionContext *ctx,
+                                      MirNameMap *map, const IROperand *op) {
+  if (op->kind == IR_OPERAND_SYMBOL && op->name) {
+    const IRFunction *irf =
+        ctx && ctx->function_name
+            ? code_generator_find_ir_function_binary(g, ctx->function_name)
+            : NULL;
+    if (mir_name_is_global_aggregate(g, irf, op->name)) {
+      MirVregId a = mir_new_vreg(fn, MIR_RC_GP, 8);
+      const CgSym *s =
+          g->ir_program ? code_generator_lookup_symbol(g, op->name) : NULL;
+      int is_extern = (s && s->is_extern) ? 1 : 0;
+      if (a == MIR_VREG_NONE ||
+          !mir_emit1(fn, MIR_LEA_GLOBAL, mir_op_vreg(a),
+                     mir_op_symbol(op->name), mir_op_none(), 8, is_extern, 0)) {
+        fn->has_error = 1;
+        return mir_op_none();
+      }
+      return mir_op_vreg(a);
+    }
+  }
+  return mir_value_operand(fn, g, ctx, map, op);
 }
 
 /* A width-tagged float register move (xmm copy). */
@@ -3498,9 +3594,9 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
                        8, 0, 0);
     }
     MirOperand dst = mir_value_operand(fn, g, ctx, map, &in->dest);
-    MirOperand addr = mir_value_operand(fn, g, ctx, map, &in->lhs);
+    MirOperand addr = mir_address_operand(fn, g, ctx, map, &in->lhs);
     int size = code_generator_binary_get_access_size(g, ctx, &in->rhs);
-    if (size <= 0) {
+    if (size <= 0 || addr.kind != MIR_OPK_VREG) {
       fn->has_error = 1;
       return 0;
     }
@@ -3517,9 +3613,9 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
   }
 
   case IR_OP_STORE: {
-    MirOperand addr = mir_value_operand(fn, g, ctx, map, &in->dest);
+    MirOperand addr = mir_address_operand(fn, g, ctx, map, &in->dest);
     int size = code_generator_binary_get_access_size(g, ctx, &in->rhs);
-    if (size <= 0) {
+    if (size <= 0 || addr.kind != MIR_OPK_VREG) {
       fn->has_error = 1;
       return 0;
     }
@@ -3546,7 +3642,7 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
   }
 
   case IR_OP_PREFETCH: {
-    MirOperand addr = mir_value_operand(fn, g, ctx, map, &in->lhs);
+    MirOperand addr = mir_address_operand(fn, g, ctx, map, &in->lhs);
     if (addr.kind != MIR_OPK_VREG) {
       fn->has_error = 1;
       return 0;
