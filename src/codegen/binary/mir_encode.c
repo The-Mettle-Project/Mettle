@@ -2189,6 +2189,37 @@ int mir_encode(MirFunction *fn) {
       }
       break;
     }
+    case MIR_HEAP_NEW: {
+      /* Zeroed Win64 heap allocation (IR_OP_NEW): the byte size arrived in R8
+       * via a preceding MIR_MOV. Self-contained rsp bubble: 48 bytes keeps the
+       * statement-point 16-alignment, gives both calls fresh shadow space at
+       * [rsp,32), and parks the size at [rsp+40] across GetProcessHeap. The
+       * result pointer lands in RAX for the following MIR_MOV to consume. */
+      size_t d1 = 0;
+      size_t d2 = 0;
+      if (!code_generator_binary_declare_external_symbol(fn->generator,
+                                                         "GetProcessHeap") ||
+          !code_generator_binary_declare_external_symbol(fn->generator,
+                                                         "HeapAlloc") ||
+          !binary_emit_sub_rsp_imm32(&ctx->code, 48) ||
+          !binary_emit_mov_mem_reg(&ctx->code, BINARY_GP_RSP, 40,
+                                   BINARY_GP_R8) ||
+          !binary_emit_call_placeholder(&ctx->code, &d1) ||
+          !binary_call_relocation_table_add(&ctx->call_relocations,
+                                            "GetProcessHeap", d1) ||
+          !binary_emit_mov_reg_reg(&ctx->code, BINARY_GP_RCX, BINARY_GP_RAX) ||
+          !binary_emit_mov_reg_imm64(&ctx->code, BINARY_GP_RDX,
+                                     8 /* HEAP_ZERO_MEMORY */) ||
+          !binary_emit_mov_reg_mem(&ctx->code, BINARY_GP_R8, BINARY_GP_RSP,
+                                   40) ||
+          !binary_emit_call_placeholder(&ctx->code, &d2) ||
+          !binary_call_relocation_table_add(&ctx->call_relocations, "HeapAlloc",
+                                            d2) ||
+          !binary_emit_add_rsp_imm32(&ctx->code, 48)) {
+        ok = enc_err(fn, "out of memory emitting heap allocation");
+      }
+      break;
+    }
     case MIR_REP_MOVSB:
     case MIR_REP_STOSB: {
       /* The argument marshalling ran already, so the first three integer

@@ -84,8 +84,9 @@ static const BinaryGpRegister MIR_GP_EXTRA[] = {
  * leave the destination in RAX and run the counter down in RCX, and neither is
  * an operand the clobber index can see. */
 static int mir_op_is_call_barrier(MirOpcode op) {
-  return op == MIR_CALL || op == MIR_CALL_INDIRECT || op == MIR_REP_MOVSB ||
-         op == MIR_REP_STOSB || mir_op_is_inline_kernel(op);
+  return op == MIR_CALL || op == MIR_CALL_INDIRECT || op == MIR_HEAP_NEW ||
+         op == MIR_REP_MOVSB || op == MIR_REP_STOSB ||
+         mir_op_is_inline_kernel(op);
 }
 
 static int mir_fn_has_calls(const MirFunction *fn) {
@@ -212,6 +213,7 @@ static int mir_fn_has_preserving_call(const MirFunction *fn, int xmm) {
 static int mir_fn_has_real_calls(const MirFunction *fn) {
   for (size_t i = 0; i < fn->insn_count; i++) {
     if (fn->insns[i].op == MIR_CALL || fn->insns[i].op == MIR_CALL_INDIRECT ||
+        fn->insns[i].op == MIR_HEAP_NEW ||
         fn->insns[i].op == MIR_REP_MOVSB ||
         fn->insns[i].op == MIR_REP_STOSB) {
       return 1;

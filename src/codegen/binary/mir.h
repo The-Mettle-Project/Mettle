@@ -183,6 +183,14 @@ typedef enum {
                      the copy source when a literal is passed to a `string`
                      (INDIRECT aggregate) parameter or assigned to a string
                      local. */
+  MIR_HEAP_NEW,   /* Win64 zeroed heap allocation (IR_OP_NEW): byte size
+                     marshalled into R8 by a preceding MIR_MOV; the encoder
+                     emits the self-contained GetProcessHeap +
+                     HeapAlloc(HEAP_ZERO_MEMORY) sequence (own rsp bubble, so
+                     it composes with the pre-reserved outgoing area); result
+                     lands in RAX. A call barrier for the allocator, exactly
+                     like MIR_CALL. SysV lowers IR_OP_NEW to a plain MIR_CALL
+                     of calloc instead. */
   MIR_MOVZX,      /* dst <- zero-extend a (width from a.mem/src width to dst) */
   MIR_MOVSX,      /* dst <- sign-extend a */
   MIR_LOAD_GLOBAL,/* dst <- value of global scalar a(SYMBOL); width/is_unsigned

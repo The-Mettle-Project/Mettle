@@ -203,6 +203,7 @@ const char *mir_opcode_name(MirOpcode op) {
   case MIR_LEA_FUNC: return "lea_func";
   case MIR_LEA_CSTR: return "lea_cstr";
   case MIR_LEA_STRLIT: return "lea_strlit";
+  case MIR_HEAP_NEW: return "heap_new";
   case MIR_MOVZX: return "movzx";
   case MIR_MOVSX: return "movsx";
   case MIR_LOAD_GLOBAL: return "ldglobal";

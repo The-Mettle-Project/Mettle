@@ -1798,6 +1798,19 @@ int mir_function_is_eligible(CodeGenerator *generator,
         return mir_trace_bail(ir_function, "prefetch:addr");
       }
       break;
+    case IR_OP_NEW:
+      /* Zeroed heap allocation: size is a compile-time INT, absent (defaults
+       * to 8), or a runtime GP value; the result pointer lands in a
+       * TEMP/SYMBOL. Win64 lowers to the inline GetProcessHeap+HeapAlloc
+       * sequence (MIR_HEAP_NEW), SysV to a plain calloc call. */
+      if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
+        return mir_trace_bail(ir_function, "new:dest");
+      }
+      if (in->rhs.kind != IR_OPERAND_NONE && in->rhs.kind != IR_OPERAND_INT &&
+          in->rhs.kind != IR_OPERAND_TEMP && in->rhs.kind != IR_OPERAND_SYMBOL) {
+        return mir_trace_bail(ir_function, "new:size");
+      }
+      break;
     case IR_OP_SELECT: {
       /* dest = (cond != 0) ? then : else. Each of cond/then/else may be a
        * temp/symbol/int; the dest is a temp/symbol. */
@@ -3681,6 +3694,49 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
     }
     return mir_emit1(fn, MIR_MOV, dest, mir_op_vreg(res_r), mir_op_none(), 8, 0,
                      0);
+  }
+
+  case IR_OP_NEW: {
+    /* Zeroed heap allocation. Size: compile-time INT (>0), defaulted 8 (NONE
+     * or <=0), or a runtime GP value. Win64: marshal size->R8 and emit the
+     * inline GetProcessHeap+HeapAlloc(HEAP_ZERO_MEMORY) sequence; SysV:
+     * calloc(1, size). Result moves out of RAX into the dest. */
+    const BinaryAbi *nabi = code_generator_binary_active_abi();
+    MirOperand sz;
+    if (in->rhs.kind == IR_OPERAND_INT && in->rhs.int_value > 0) {
+      sz = mir_op_imm(in->rhs.int_value);
+    } else if (in->rhs.kind == IR_OPERAND_NONE ||
+               in->rhs.kind == IR_OPERAND_INT) {
+      sz = mir_op_imm(8);
+    } else {
+      sz = mir_value_operand(fn, g, ctx, map, &in->rhs);
+    }
+    if (nabi->shadow_space_size > 0) {
+      if (!mir_emit1(fn, MIR_MOV, mir_op_phys(BINARY_GP_R8, MIR_RC_GP), sz,
+                     mir_op_none(), 8, 0, 0) ||
+          !mir_emit1(fn, MIR_HEAP_NEW, mir_op_none(), mir_op_none(),
+                     mir_op_none(), 8, 0, 0)) {
+        return 0;
+      }
+    } else {
+      if (!code_generator_binary_declare_external_symbol(g, "calloc")) {
+        fn->has_error = 1;
+        return 0;
+      }
+      if (!mir_emit1(fn, MIR_MOV,
+                     mir_op_phys(nabi->int_param_registers[0], MIR_RC_GP),
+                     mir_op_imm(1), mir_op_none(), 8, 0, 0) ||
+          !mir_emit1(fn, MIR_MOV,
+                     mir_op_phys(nabi->int_param_registers[1], MIR_RC_GP), sz,
+                     mir_op_none(), 8, 0, 0) ||
+          !mir_emit1(fn, MIR_CALL, mir_op_symbol("calloc"), mir_op_none(),
+                     mir_op_none(), 8, 0, 0)) {
+        return 0;
+      }
+    }
+    MirOperand ndst = mir_value_operand(fn, g, ctx, map, &in->dest);
+    return mir_emit1(fn, MIR_MOV, ndst, mir_op_phys(BINARY_GP_RAX, MIR_RC_GP),
+                     mir_op_none(), 8, 0, 0);
   }
 
   case IR_OP_RETURN: {
