@@ -963,7 +963,9 @@ static IRFunction *mir_find_ir_function_named(CodeGenerator *g,
 static int mir_call_indirect_is_supported(CodeGenerator *g,
                                           const IRFunction *ir_function,
                                           const IRInstruction *in) {
-  if (!in || in->lhs.kind != IR_OPERAND_SYMBOL || !in->lhs.name) {
+  if (!in ||
+      (in->lhs.kind != IR_OPERAND_SYMBOL && in->lhs.kind != IR_OPERAND_TEMP) ||
+      !in->lhs.name) {
     mir_call_trace("indirect_no_symbol");
     return 0;
   }
@@ -973,8 +975,41 @@ static int mir_call_indirect_is_supported(CodeGenerator *g,
   }
   MtlcType *ft = mir_indirect_call_type(g, ir_function, in);
   if (!ft) {
-    mir_call_trace("indirect_no_type");
-    return 0;
+    /* Callee through a TEMP (closure thunks): the fn-ptr type is unknown, so
+     * classify every argument as GP -- exactly what the fallback does with a
+     * NULL callee type. Anything float-valued or aggregate-valued must defer,
+     * since the GP marshalling can't carry it. */
+    if (in->lhs.kind != IR_OPERAND_TEMP ||
+        mir_temp_is_float(g, (IRFunction *)ir_function, in->lhs.name, 0)) {
+      mir_call_trace("indirect_no_type");
+      return 0;
+    }
+    for (size_t a = 0; a < in->argument_count; a++) {
+      const IROperand *arg = &in->arguments[a];
+      if (arg->kind != IR_OPERAND_TEMP && arg->kind != IR_OPERAND_SYMBOL &&
+          arg->kind != IR_OPERAND_INT) {
+        mir_call_trace("indirect_untyped_arg_kind");
+        return 0;
+      }
+      if (mir_arg_float_bits(g, ir_function, arg) != 0 ||
+          (arg->kind == IR_OPERAND_TEMP &&
+           mir_temp_is_float(g, (IRFunction *)ir_function, arg->name, 0))) {
+        mir_call_trace("indirect_untyped_arg_float");
+        return 0;
+      }
+      if (arg->kind == IR_OPERAND_SYMBOL && arg->name &&
+          (mir_name_is_global_aggregate(g, ir_function, arg->name) ||
+           mir_name_is_indirect_aggregate(g, ir_function, arg->name))) {
+        mir_call_trace("indirect_untyped_arg_aggregate");
+        return 0;
+      }
+    }
+    if (in->dest.kind != IR_OPERAND_NONE && in->dest.kind != IR_OPERAND_TEMP &&
+        in->dest.kind != IR_OPERAND_SYMBOL) {
+      mir_call_trace("indirect_dest_kind");
+      return 0;
+    }
+    return 1;
   }
   if (in->argument_count != ft->fn_param_count) {
     mir_call_trace("indirect_arity_mismatch");
@@ -1015,9 +1050,14 @@ static int mir_call_indirect_is_supported(CodeGenerator *g,
       return 0;
     }
     if (code_generator_binary_resolved_type_float_bits(pt) != 0) {
-      if (mir_arg_float_bits(g, ir_function, arg) == 0 &&
-          arg->kind != IR_OPERAND_INT) {
-        mir_call_trace("indirect_arg_float_nonfloat_src");
+      if (arg->kind != IR_OPERAND_TEMP && arg->kind != IR_OPERAND_SYMBOL &&
+          arg->kind != IR_OPERAND_INT && arg->kind != IR_OPERAND_FLOAT) {
+        mir_call_trace("indirect_arg_float_operand_kind");
+        return 0;
+      }
+      if (arg->kind == IR_OPERAND_SYMBOL && arg->name &&
+          mir_name_is_global_aggregate(g, ir_function, arg->name)) {
+        mir_call_trace("indirect_arg_aggregate_value");
         return 0;
       }
       continue;
@@ -1209,13 +1249,16 @@ static int mir_call_is_supported(CodeGenerator *g,
       return 0;
     }
     if (code_generator_binary_resolved_type_float_bits(pt) != 0) {
-      /* Float parameter: the argument must be a float value or an INT literal
-       * (folded to a float constant at the parameter's width); a runtime
-       * int->float conversion at the call site still defers. It must land in
-       * an XMM register, not a stack slot. */
-      if (mir_arg_float_bits(g, ir_function, arg) == 0 &&
-          arg->kind != IR_OPERAND_INT) {
-        mir_call_trace("arg_float_nonfloat_src");
+      /* Float parameter: any scalar source works (literals fold, float values
+       * width-convert, int values cvtsi2sd -- coerce_float_operand). */
+      if (arg->kind != IR_OPERAND_TEMP && arg->kind != IR_OPERAND_SYMBOL &&
+          arg->kind != IR_OPERAND_INT && arg->kind != IR_OPERAND_FLOAT) {
+        mir_call_trace("arg_float_operand_kind");
+        return 0;
+      }
+      if (arg->kind == IR_OPERAND_SYMBOL && arg->name &&
+          mir_name_is_global_aggregate(g, ir_function, arg->name)) {
+        mir_call_trace("arg_aggregate_scalar_param");
         return 0;
       }
       continue;
@@ -2791,37 +2834,19 @@ static MirOperand mir_float_const_operand(MirFunction *fn, double value,
 
 /* Store a float call argument into its outgoing stack slot, converted to the
  * parameter's width. */
+static MirOperand coerce_float_operand(MirFunction *fn, CodeGenerator *g,
+                                       BinaryFunctionContext *ctx,
+                                       MirNameMap *map, const IROperand *op,
+                                       int target_bytes);
+
 static int mir_emit_float_stack_arg(MirFunction *fn, CodeGenerator *g,
                                     BinaryFunctionContext *ctx, MirNameMap *map,
                                     const IROperand *arg_op, int pfb,
                                     int slot) {
-  int sfb;
-  MirOperand fv;
-  if (arg_op->kind == IR_OPERAND_INT) {
-    sfb = pfb;
-    fv = mir_float_const_operand(fn, (double)arg_op->int_value, pfb / 8);
-  } else if (arg_op->kind == IR_OPERAND_FLOAT) {
-    sfb = arg_op->float_bits == 32 ? 32 : 64;
-    fv = mir_value_operand(fn, g, ctx, map, arg_op);
-  } else {
-    sfb = code_generator_binary_operand_float_bits(g, ctx, arg_op);
-    if (sfb != 32 && sfb != 64) {
-      sfb = pfb;
-    }
-    fv = mir_value_operand(fn, g, ctx, map, arg_op);
-  }
+  MirOperand fv = coerce_float_operand(fn, g, ctx, map, arg_op, pfb / 8);
   if (fv.kind == MIR_OPK_FIMM) {
-    MirVregId t = mir_new_vreg(fn, MIR_RC_XMM, sfb / 8);
-    if (t == MIR_VREG_NONE || !mir_emit_fmov(fn, mir_op_vreg(t), fv, sfb / 8)) {
-      return 0;
-    }
-    fv = mir_op_vreg(t);
-  }
-  if (sfb != pfb) {
     MirVregId t = mir_new_vreg(fn, MIR_RC_XMM, pfb / 8);
-    if (t == MIR_VREG_NONE ||
-        !mir_emit1(fn, MIR_CVTF2F, mir_op_vreg(t), fv, mir_op_none(), pfb / 8,
-                   0, 0)) {
+    if (t == MIR_VREG_NONE || !mir_emit_fmov(fn, mir_op_vreg(t), fv, pfb / 8)) {
       return 0;
     }
     fv = mir_op_vreg(t);
@@ -4182,41 +4207,19 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
       if (pfb != 32 && pfb != 64) {
         pfb = 64;
       }
-      const IROperand *arg_op = &in->arguments[a];
-      int sfb;
-      MirOperand val;
-      if (arg_op->kind == IR_OPERAND_INT) {
-        /* Int literal to a float param: fold to a float constant. */
-        sfb = pfb;
-        val = mir_float_const_operand(fn, (double)arg_op->int_value, pfb / 8);
-      } else if (arg_op->kind == IR_OPERAND_FLOAT) {
-        sfb = arg_op->float_bits == 32 ? 32 : 64;
-        val = mir_value_operand(fn, g, ctx, map, arg_op);
-      } else {
-        sfb = code_generator_binary_operand_float_bits(g, ctx, arg_op);
-        if (sfb != 32 && sfb != 64) {
-          sfb = pfb;
-        }
-        val = mir_value_operand(fn, g, ctx, map, arg_op);
-      }
+      /* coerce handles every source: literals at the param width, float
+       * values width-converted, int values via cvtsi2sd. */
+      MirOperand val =
+          coerce_float_operand(fn, g, ctx, map, &in->arguments[a], pfb / 8);
       if (val.kind == MIR_OPK_FIMM) {
-        /* A float immediate cannot move straight into a physical register; stage
-         * it (at its own precision) in a vreg first. */
-        MirVregId t = mir_new_vreg(fn, MIR_RC_XMM, sfb / 8);
+        /* A float immediate cannot move straight into a physical register;
+         * stage it in a vreg first. */
+        MirVregId t = mir_new_vreg(fn, MIR_RC_XMM, pfb / 8);
         if (t == MIR_VREG_NONE ||
-            !mir_emit_fmov(fn, mir_op_vreg(t), val, sfb / 8)) {
+            !mir_emit_fmov(fn, mir_op_vreg(t), val, pfb / 8)) {
           return 0;
         }
         val = mir_op_vreg(t);
-      }
-      if (sfb != pfb) {
-        MirVregId t2 = mir_new_vreg(fn, MIR_RC_XMM, pfb / 8);
-        if (t2 == MIR_VREG_NONE ||
-            !mir_emit1(fn, MIR_CVTF2F, mir_op_vreg(t2), val, mir_op_none(),
-                       pfb / 8, 0, 0)) {
-          return 0;
-        }
-        val = mir_op_vreg(t2);
       }
       if (!mir_emit_fmov(fn, mir_op_phys(xreg, MIR_RC_XMM), val, pfb / 8)) {
         return 0;
@@ -4312,7 +4315,7 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
             ? code_generator_find_ir_function_binary(g, ctx->function_name)
             : NULL;
     MtlcType *ft = mir_indirect_call_type(g, irf, in);
-    if (!ft) {
+    if (!ft && in->lhs.kind != IR_OPERAND_TEMP) {
       fn->has_error = 1;
       return 0;
     }
@@ -4321,7 +4324,8 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
     BinaryArgLocation locs[MIR_MAX_PARAMS];
     int stack_bytes = 0;
     for (size_t a = 0; a < in->argument_count; a++) {
-      MtlcType *pt = ft->fn_param_types ? ft->fn_param_types[a] : NULL;
+      MtlcType *pt =
+          (ft && ft->fn_param_types) ? ft->fn_param_types[a] : NULL;
       arg_is_float[a] =
           code_generator_binary_resolved_type_float_bits(pt) != 0;
     }
@@ -4344,7 +4348,8 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
       }
       int slot = abi->shadow_space_size + locs[a].stack_offset;
       if (arg_is_float[a]) {
-        MtlcType *fpt = ft->fn_param_types ? ft->fn_param_types[a] : NULL;
+        MtlcType *fpt =
+            (ft && ft->fn_param_types) ? ft->fn_param_types[a] : NULL;
         int pfb = fpt ? code_generator_binary_resolved_type_float_bits(fpt) : 0;
         if (pfb != 32 && pfb != 64) {
           pfb = 64;
@@ -4400,43 +4405,21 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
       }
       fn->has_xmm_arg_call = 1;
       BinaryXmmRegister xreg = locs[a].xmm_register;
-      MtlcType *pt = ft->fn_param_types ? ft->fn_param_types[a] : NULL;
+      MtlcType *pt =
+          (ft && ft->fn_param_types) ? ft->fn_param_types[a] : NULL;
       int pfb = code_generator_binary_resolved_type_float_bits(pt);
       if (pfb != 32 && pfb != 64) {
         pfb = 64;
       }
-      const IROperand *arg_op = &in->arguments[a];
-      int sfb;
-      MirOperand val;
-      if (arg_op->kind == IR_OPERAND_INT) {
-        sfb = pfb;
-        val = mir_float_const_operand(fn, (double)arg_op->int_value, pfb / 8);
-      } else if (arg_op->kind == IR_OPERAND_FLOAT) {
-        sfb = arg_op->float_bits == 32 ? 32 : 64;
-        val = mir_value_operand(fn, g, ctx, map, arg_op);
-      } else {
-        sfb = code_generator_binary_operand_float_bits(g, ctx, arg_op);
-        if (sfb != 32 && sfb != 64) {
-          sfb = pfb;
-        }
-        val = mir_value_operand(fn, g, ctx, map, arg_op);
-      }
+      MirOperand val =
+          coerce_float_operand(fn, g, ctx, map, &in->arguments[a], pfb / 8);
       if (val.kind == MIR_OPK_FIMM) {
-        MirVregId t = mir_new_vreg(fn, MIR_RC_XMM, sfb / 8);
+        MirVregId t = mir_new_vreg(fn, MIR_RC_XMM, pfb / 8);
         if (t == MIR_VREG_NONE ||
-            !mir_emit_fmov(fn, mir_op_vreg(t), val, sfb / 8)) {
+            !mir_emit_fmov(fn, mir_op_vreg(t), val, pfb / 8)) {
           return 0;
         }
         val = mir_op_vreg(t);
-      }
-      if (sfb != pfb) {
-        MirVregId t2 = mir_new_vreg(fn, MIR_RC_XMM, pfb / 8);
-        if (t2 == MIR_VREG_NONE ||
-            !mir_emit1(fn, MIR_CVTF2F, mir_op_vreg(t2), val, mir_op_none(),
-                       pfb / 8, 0, 0)) {
-          return 0;
-        }
-        val = mir_op_vreg(t2);
       }
       if (!mir_emit_fmov(fn, mir_op_phys(xreg, MIR_RC_XMM), val, pfb / 8)) {
         return 0;
@@ -4449,7 +4432,9 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
     }
 
     if (in->dest.kind == IR_OPERAND_TEMP || in->dest.kind == IR_OPERAND_SYMBOL) {
-      int rfb = code_generator_binary_resolved_type_float_bits(ft->fn_return_type);
+      int rfb = ft ? code_generator_binary_resolved_type_float_bits(
+                         ft->fn_return_type)
+                   : 0;
       MirOperand dst = mir_value_operand(fn, g, ctx, map, &in->dest);
       if (rfb) {
         return mir_emit_fmov(fn, dst, mir_op_phys(BINARY_XMM0, MIR_RC_XMM),
