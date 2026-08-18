@@ -1020,22 +1020,6 @@ static int mir_call_indirect_is_supported(CodeGenerator *g,
         mir_call_trace("indirect_arg_float_nonfloat_src");
         return 0;
       }
-      if (call_abi->counts_classes_separately) {
-        size_t fbefore = 0;
-        for (size_t b = 0; b < a; b++) {
-          MtlcType *bt = ft->fn_param_types ? ft->fn_param_types[b] : NULL;
-          if (bt && code_generator_binary_resolved_type_float_bits(bt) != 0) {
-            fbefore++;
-          }
-        }
-        if (fbefore >= (size_t)call_abi->float_param_count) {
-          mir_call_trace("indirect_arg_float_stack");
-          return 0;
-        }
-      } else if (a >= (size_t)call_abi->int_param_count) {
-        mir_call_trace("indirect_arg_float_stack");
-        return 0;
-      }
       continue;
     }
     if (arg->kind != IR_OPERAND_TEMP && arg->kind != IR_OPERAND_SYMBOL &&
@@ -1234,26 +1218,6 @@ static int mir_call_is_supported(CodeGenerator *g,
         mir_call_trace("arg_float_nonfloat_src");
         return 0;
       }
-      size_t slot = a + (size_t)hidden;
-      if (call_abi->counts_classes_separately) {
-        /* SysV: floats draw from their own register file in argument order. */
-        size_t fbefore = 0;
-        for (size_t b = 0; b < a; b++) {
-          MtlcType *bt = callee->data.function.parameter_types
-                         ? callee->data.function.parameter_types[b]
-                         : NULL;
-          if (bt && code_generator_binary_resolved_type_float_bits(bt) != 0) {
-            fbefore++;
-          }
-        }
-        if (fbefore >= (size_t)call_abi->float_param_count) {
-          mir_call_trace("arg_float_stack");
-          return 0;
-        }
-      } else if (slot >= (size_t)call_abi->int_param_count) {
-        mir_call_trace("arg_float_stack");
-        return 0;
-      }
       continue;
     }
     if (code_generator_abi_classify(pt) == ABI_PASS_INDIRECT) {
@@ -1414,12 +1378,6 @@ int mir_function_is_eligible(CodeGenerator *generator,
       if (!code_generator_binary_compute_arg_layout(abi, aug_float, n, locs,
                                                     NULL)) {
         return mir_trace_bail(ir_function, "sig:arg_layout");
-      }
-      for (size_t i = 0; i < ir_function->parameter_count; i++) {
-        if (pis_float[i] &&
-            locs[i + (size_t)hidden].kind == BINARY_ARG_ON_STACK) {
-          return mir_trace_bail(ir_function, "sig:float_stack_param");
-        }
       }
     }
   }
@@ -2828,6 +2786,57 @@ static int mir_emit_fmov(MirFunction *fn, MirOperand dst, MirOperand src,
   return mir_emit(fn, &in);
 }
 
+static MirOperand mir_float_const_operand(MirFunction *fn, double value,
+                                          int width_bytes);
+
+/* Store a float call argument into its outgoing stack slot, converted to the
+ * parameter's width. */
+static int mir_emit_float_stack_arg(MirFunction *fn, CodeGenerator *g,
+                                    BinaryFunctionContext *ctx, MirNameMap *map,
+                                    const IROperand *arg_op, int pfb,
+                                    int slot) {
+  int sfb;
+  MirOperand fv;
+  if (arg_op->kind == IR_OPERAND_INT) {
+    sfb = pfb;
+    fv = mir_float_const_operand(fn, (double)arg_op->int_value, pfb / 8);
+  } else if (arg_op->kind == IR_OPERAND_FLOAT) {
+    sfb = arg_op->float_bits == 32 ? 32 : 64;
+    fv = mir_value_operand(fn, g, ctx, map, arg_op);
+  } else {
+    sfb = code_generator_binary_operand_float_bits(g, ctx, arg_op);
+    if (sfb != 32 && sfb != 64) {
+      sfb = pfb;
+    }
+    fv = mir_value_operand(fn, g, ctx, map, arg_op);
+  }
+  if (fv.kind == MIR_OPK_FIMM) {
+    MirVregId t = mir_new_vreg(fn, MIR_RC_XMM, sfb / 8);
+    if (t == MIR_VREG_NONE || !mir_emit_fmov(fn, mir_op_vreg(t), fv, sfb / 8)) {
+      return 0;
+    }
+    fv = mir_op_vreg(t);
+  }
+  if (sfb != pfb) {
+    MirVregId t = mir_new_vreg(fn, MIR_RC_XMM, pfb / 8);
+    if (t == MIR_VREG_NONE ||
+        !mir_emit1(fn, MIR_CVTF2F, mir_op_vreg(t), fv, mir_op_none(), pfb / 8,
+                   0, 0)) {
+      return 0;
+    }
+    fv = mir_op_vreg(t);
+  }
+  MirInst st;
+  memset(&st, 0, sizeof(st));
+  st.op = MIR_STORE_OUTARG;
+  st.is_float = 1;
+  st.a = fv;
+  st.b = mir_op_imm(slot);
+  st.width = pfb / 8;
+  st.ir_index = -1;
+  return mir_emit(fn, &st);
+}
+
 /* Raw IEEE-754 bits of a double value at the given float width (4 or 8). */
 static uint64_t mir_float_bits_at(double value, int width_bytes) {
   if (width_bytes == 4) {
@@ -4077,6 +4086,21 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
         continue;
       }
       int slot = abi->shadow_space_size + locs[a + hidden].stack_offset;
+      if (indirect_off[a] < 0 && arg_is_float[a + (size_t)hidden]) {
+        MtlcType *fpt = (call_callee && call_callee->kind == CG_SYM_FUNCTION &&
+                         call_callee->data.function.parameter_types)
+                            ? call_callee->data.function.parameter_types[a]
+                            : NULL;
+        int pfb = fpt ? code_generator_binary_resolved_type_float_bits(fpt) : 0;
+        if (pfb != 32 && pfb != 64) {
+          pfb = 64;
+        }
+        if (!mir_emit_float_stack_arg(fn, g, ctx, map, &in->arguments[a], pfb,
+                                      slot)) {
+          return 0;
+        }
+        continue;
+      }
       MirOperand val;
       if (indirect_off[a] >= 0) {
         /* INDIRECT struct arg: pass &copy_slot. */
@@ -4319,6 +4343,18 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
         continue;
       }
       int slot = abi->shadow_space_size + locs[a].stack_offset;
+      if (arg_is_float[a]) {
+        MtlcType *fpt = ft->fn_param_types ? ft->fn_param_types[a] : NULL;
+        int pfb = fpt ? code_generator_binary_resolved_type_float_bits(fpt) : 0;
+        if (pfb != 32 && pfb != 64) {
+          pfb = 64;
+        }
+        if (!mir_emit_float_stack_arg(fn, g, ctx, map, &in->arguments[a], pfb,
+                                      slot)) {
+          return 0;
+        }
+        continue;
+      }
       MirOperand val;
       if (in->arguments[a].kind == IR_OPERAND_STRING) {
         const char *s = in->arguments[a].name ? in->arguments[a].name : "";

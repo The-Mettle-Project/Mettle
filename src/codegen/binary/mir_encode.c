@@ -1,5 +1,6 @@
 #include "codegen/binary/mir.h"
 #include "codegen/binary/mir_annotate.h"
+#include "codegen/binary/simd_internal.h"
 #include "codegen/code_generator_internal.h"
 
 #include <stdlib.h>
@@ -1681,6 +1682,9 @@ static int mir_home_parameters(MirFunction *fn) {
 
   MirXmmMove xm[MIR_MAX_PARAMS];
   int nxm = 0;
+  const MirParam *fstack[MIR_MAX_PARAMS];
+  int fstack_off[MIR_MAX_PARAMS];
+  int nfstack = 0;
   for (size_t i = 0; i < pc; i++) {
     const MirParam *p = &fn->params[i];
     if (!fn->vregs[p->vreg].assigned) {
@@ -1701,6 +1705,14 @@ static int mir_home_parameters(MirFunction *fn) {
         return enc_err(fn, "unsupported parameter location");
       }
     } else {
+      if (loc->kind == BINARY_ARG_ON_STACK) {
+        /* 5th+ float param. Deferred below: its destination register could be
+         * an XMM0-3 still holding a not-yet-homed incoming arg. */
+        fstack[nfstack] = p;
+        fstack_off[nfstack] = 16 + abi->shadow_space_size + loc->stack_offset;
+        nfstack++;
+        continue;
+      }
       if (loc->kind != BINARY_ARG_IN_XMM_REGISTER) {
         return enc_err(fn, "unsupported float parameter location");
       }
@@ -1718,7 +1730,32 @@ static int mir_home_parameters(MirFunction *fn) {
       nxm++;
     }
   }
-  return mir_home_float_params(fn, xm, nxm);
+  if (!mir_home_float_params(fn, xm, nxm)) {
+    return 0;
+  }
+  for (int i = 0; i < nfstack; i++) {
+    const MirParam *p = fstack[i];
+    MirVreg *vr = &fn->vregs[p->vreg];
+    int ok;
+    if (vr->in_register) {
+      ok = (p->width == 4)
+               ? wcs_movss_xmm_mem(&fn->context->code, vr->phys, frame_base(fn),
+                                   frame_disp(fn, fstack_off[i]))
+               : wcs_movsd_xmm_mem(&fn->context->code, vr->phys, frame_base(fn),
+                                   frame_disp(fn, fstack_off[i]));
+    } else {
+      ok = binary_emit_mov_reg_mem(&fn->context->code, SCRATCH_A,
+                                   frame_base(fn),
+                                   frame_disp(fn, fstack_off[i])) &&
+           binary_emit_mov_mem_reg(&fn->context->code, frame_base(fn),
+                                   frame_disp(fn, -vr->spill_offset),
+                                   SCRATCH_A);
+    }
+    if (!ok) {
+      return enc_err(fn, "out of memory homing float stack parameter");
+    }
+  }
+  return 1;
 }
 
 static int mir_emit_prologue(MirFunction *fn) {
@@ -2414,14 +2451,37 @@ int mir_encode(MirFunction *fn) {
     case MIR_STORE_OUTARG: {
       /* Store an outgoing stack call argument to [rsp + b.imm]. rsp is fixed
        * after the prologue and the outgoing region is reserved there, so this
-       * is a plain rsp-relative store. */
-      int ok;
-      BinaryGpRegister r = value_reg(fn, &in->a, SCRATCH_A, &ok);
-      if (!ok) {
-        break;
+       * is a plain rsp-relative store. A float value's bits bounce through the
+       * GP scratch (movq/movd from its XMM, or a plain load from its spill). */
+      int ok = 1;
+      BinaryGpRegister r = SCRATCH_A;
+      if (in->is_float && in->a.kind == MIR_OPK_VREG) {
+        const MirVreg *v = &fn->vregs[in->a.vreg];
+        if (v->in_register) {
+          ok = (in->width == 4)
+                   ? binary_emit_movd_reg_xmm(&ctx->code, SCRATCH_A,
+                                              (BinaryXmmRegister)v->phys)
+                   : binary_emit_movq_reg_xmm(&ctx->code, SCRATCH_A,
+                                              (BinaryXmmRegister)v->phys);
+        } else {
+          ok = binary_emit_mov_reg_mem(&ctx->code, SCRATCH_A, frame_base(fn),
+                                       frame_disp(fn, -v->spill_offset));
+        }
+        if (!ok) {
+          ok = enc_err(fn, "out of memory staging float stack argument");
+          break;
+        }
+      } else {
+        r = value_reg(fn, &in->a, SCRATCH_A, &ok);
+        if (!ok) {
+          break;
+        }
       }
-      if (!binary_emit_mov_mem_reg(&ctx->code, BINARY_GP_RSP, (int)in->b.imm,
-                                   r)) {
+      if (in->is_float && in->width == 4
+              ? !binary_emit_mov_mem_reg32(&ctx->code, BINARY_GP_RSP,
+                                           (int)in->b.imm, r)
+              : !binary_emit_mov_mem_reg(&ctx->code, BINARY_GP_RSP,
+                                         (int)in->b.imm, r)) {
         ok = enc_err(fn, "out of memory storing outgoing call argument");
       }
       break;

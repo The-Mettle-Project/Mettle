@@ -811,12 +811,10 @@ $cases = @(
     )
   },
   @{
-    # Every gate reason code has to reach the reader as a sentence about their
-    # code, never a bare "reason code:". Vectorized reductions and
-    # scalar-reading maps now run through the allocator's kernel bridge, so
-    # freduce64 must report as vectorized with no gate remark at all; the
-    # float-stack-param reason still bails and must render as its sentence
-    # with its fix.
+    # Anti-rot: every function in this file (vectorized reductions,
+    # scalar-reading maps, float stack params) is covered by the allocated
+    # backend now. If any of them fall off, the report stops saying 100% and
+    # this catches it; a bare "reason code:" must never come back either.
     Name          = "explain_backend_gate_reasons"
     Path          = "tests/test_vloop_general.mettle"
     ShouldSucceed = $true
@@ -824,15 +822,13 @@ $cases = @(
     Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
     OutputMustMatch = @(
       "freduce64 \(loop @ line \d+\): vectorized -> 4-wide float64 '\+' reduction",
-      'takes a float argument past the register-argument slots',
-      'fix: pass the floats in a struct, or reorder the parameters',
-      'fmap32_ref \(\d+\)'
+      '\d+/\d+ functions reaching codegen \(after inlining\) compiled with the register-allocating backend',
+      '100\.0% of the program''s \d+ optimized IR instructions are in register-allocated code'
     )
     OutputMustNotMatch = @(
       'reason code: vloop',
-      "covers element-wise maps only",
-      # the plan honours the selector: main's fallback is not what was asked for
-      'spills main'
+      'covers element-wise maps only',
+      'use baseline \(spill-everything\) codegen'
     )
   },
   @{
