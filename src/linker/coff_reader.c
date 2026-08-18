@@ -388,6 +388,23 @@ static int coff_reader_parse_sections(CoffObject *object,
         section->relocations[r].type = linker_read_u16(relocation + 8);
       }
     }
+
+    /* MinGW gcc with -fdata-sections emits zero-initialized statics as
+     * `.data$name` sections whose raw data is present but entirely zero.
+     * Those bytes would be copied into the image verbatim; carry them as
+     * .bss instead so they cost nothing on disk. Only safe when nothing
+     * relocates within the section. */
+    if (section->kind == COFF_SECTION_KIND_DATA &&
+        section->relocation_count == 0u && section->size_of_raw_data > 0u &&
+        section->raw_data) {
+      size_t b = 0;
+      while (b < section->size_of_raw_data && section->raw_data[b] == 0) {
+        b++;
+      }
+      if (b == section->size_of_raw_data) {
+        section->kind = COFF_SECTION_KIND_BSS;
+      }
+    }
   }
 
   return 1;
