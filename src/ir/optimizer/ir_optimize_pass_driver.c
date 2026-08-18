@@ -363,10 +363,16 @@ int ir_run_named_stage_fixpoint(IRFunction *function,
       if (changed) {
         version++;
         iteration_changed = 1;
-        /* A structural change can add or remove features (a claimed loop
-         * loses its labels); refresh so later gates read the truth. */
-        ir_collect_function_features(function, &features);
-        feature_flags = ir_opt_feature_flags(&features);
+        /* A structural change can remove features (a claimed loop loses its
+         * labels); refresh so later gates read the truth. A saturated mask
+         * needs no refresh: re-scanning could only clear bits, and a stale
+         * set bit costs one matcher call that declines, where a stale clear
+         * bit would skip a pass that had work. Erring toward running is both
+         * cheaper here and the safe direction. */
+        if (feature_flags != IR_OPT_FEATURE_ALL) {
+          ir_collect_function_features(function, &features);
+          feature_flags = ir_opt_feature_flags(&features);
+        }
       } else {
         clean_version[slot[i]] = version;
       }

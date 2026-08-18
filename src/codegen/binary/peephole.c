@@ -1,3 +1,4 @@
+#include "codegen/binary/strength_rules.h"
 #include "codegen/binary/internal.h"
 
 #include <limits.h>
@@ -455,60 +456,25 @@ int code_generator_binary_try_emit_reg_multiply_immediate(
  * Produces (magic, shift, add) such that n/d == ((n*magic)>>64 corrected)>>shift,
  * where `add` signals the overflow-correction path is needed. Returns 0 to
  * decline (divisor out of range), 1 on success. */
+/* Granlund-Montgomery parameters for a constant divisor. Both of these are
+ * thin wrappers over the shared table's implementation (strength_rules.c):
+ * the decision and the magic math are target-neutral and live in one place,
+ * while the guards below stay here because they describe what THIS emitter
+ * was written to encode. */
 static int binary_unsigned_divisor_magic(unsigned long long divisor,
                                           unsigned long long *magic_out,
                                           unsigned char *shift_out,
                                           int *add_out) {
-  typedef unsigned __int128 BinaryU128;
-
   if (!magic_out || !shift_out || !add_out || divisor < 2) {
     return 0;
   }
 
-  BinaryU128 d = (BinaryU128)divisor;
-  BinaryU128 two64 = (BinaryU128)1 << 64;
-  BinaryU128 nc = two64 - 1 - (two64 - d) % d; /* largest n with n%d == d-1, mod 2^64 */
-  BinaryU128 q1 = (two64 >> 1) / nc;           /* 2^63 / nc */
-  BinaryU128 r1 = (two64 >> 1) - q1 * nc;
-  BinaryU128 q2 = ((two64 >> 1) - 1) / d;      /* (2^63 - 1) / d */
-  BinaryU128 r2 = ((two64 >> 1) - 1) - q2 * d;
-  unsigned int p = 63;
+  uint64_t magic = 0;
+  int shift = 0;
   int add = 0;
-
-  for (;;) {
-    BinaryU128 delta;
-    p++;
-
-    if (r1 >= nc - r1) {
-      q1 = 2 * q1 + 1;
-      r1 = 2 * r1 - nc;
-    } else {
-      q1 = 2 * q1;
-      r1 = 2 * r1;
-    }
-
-    if (r2 + 1 >= d - r2) {
-      if (q2 >= ((two64 >> 1) - 1)) {
-        add = 1;
-      }
-      q2 = 2 * q2 + 1;
-      r2 = 2 * r2 + 1 - d;
-    } else {
-      if (q2 >= (two64 >> 1)) {
-        add = 1;
-      }
-      q2 = 2 * q2;
-      r2 = 2 * r2 + 1;
-    }
-
-    delta = d - 1 - r2;
-    if (p >= 128 || !(q1 < delta || (q1 == delta && r1 == 0))) {
-      break;
-    }
-  }
-
-  *magic_out = (unsigned long long)(q2 + 1);
-  *shift_out = (unsigned char)(p - 64);
+  cg_magic_u64((uint64_t)divisor, &magic, &shift, &add);
+  *magic_out = (unsigned long long)magic;
+  *shift_out = (unsigned char)shift;
   *add_out = add;
   return 1;
 }
@@ -590,47 +556,15 @@ int code_generator_binary_try_emit_unsigned_const_divmod(
 
 static int binary_signed_divisor_magic(long long divisor, long long *magic_out,
                                        unsigned char *shift_out) {
-  typedef unsigned __int128 BinaryU128;
-
   if (!magic_out || !shift_out || divisor <= 1 || divisor > INT32_MAX) {
     return 0;
   }
 
-  BinaryU128 ad = (BinaryU128)(unsigned long long)divisor;
-  BinaryU128 two63 = (BinaryU128)1 << 63;
-  BinaryU128 anc = two63 - 1 - ((two63 - 1) % ad);
-  BinaryU128 q1 = two63 / anc;
-  BinaryU128 r1 = two63 - q1 * anc;
-  BinaryU128 q2 = two63 / ad;
-  BinaryU128 r2 = two63 - q2 * ad;
-  unsigned int p = 63;
-
-  for (;;) {
-    BinaryU128 delta;
-    p++;
-
-    q1 *= 2;
-    r1 *= 2;
-    if (r1 >= anc) {
-      q1++;
-      r1 -= anc;
-    }
-
-    q2 *= 2;
-    r2 *= 2;
-    if (r2 >= ad) {
-      q2++;
-      r2 -= ad;
-    }
-
-    delta = ad - r2;
-    if (q1 > delta || (q1 == delta && r1 != 0)) {
-      break;
-    }
-  }
-
-  *magic_out = (long long)(unsigned long long)(q2 + 1);
-  *shift_out = (unsigned char)(p - 64);
+  int64_t magic = 0;
+  int shift = 0;
+  cg_magic_s64((int64_t)divisor, &magic, &shift);
+  *magic_out = (long long)magic;
+  *shift_out = (unsigned char)shift;
   return 1;
 }
 

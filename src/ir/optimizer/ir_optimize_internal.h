@@ -361,6 +361,15 @@ typedef enum {
   IR_OPT_FEATURE_DIV = 1u << 10
 } IROptFeatureFlag;
 
+/* Every bit the scan can set. Saturated means no further instruction can
+ * change the answer, which is what lets the scan stop early and the named
+ * stage skip re-scanning. */
+#define IR_OPT_FEATURE_ALL                                                    \
+  (IR_OPT_FEATURE_LABEL | IR_OPT_FEATURE_WHILE_LABEL | IR_OPT_FEATURE_JUMP |  \
+   IR_OPT_FEATURE_BRANCH_ZERO | IR_OPT_FEATURE_BRANCH_EQ |                    \
+   IR_OPT_FEATURE_CALL | IR_OPT_FEATURE_LOAD | IR_OPT_FEATURE_ASSIGN |        \
+   IR_OPT_FEATURE_TEMP_WRITE | IR_OPT_FEATURE_BINARY | IR_OPT_FEATURE_DIV)
+
 typedef struct {
   unsigned all; /* every listed feature must be present */
   unsigned any; /* when nonzero, at least one must be present */

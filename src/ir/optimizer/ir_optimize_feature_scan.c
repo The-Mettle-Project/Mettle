@@ -49,47 +49,68 @@ void ir_collect_function_features(const IRFunction *function,
     return;
   }
 
+  /* Saturating scan: every bit this can set is set by some instruction, so
+   * once all of them are set the rest of the walk cannot change the answer.
+   * The drivers call this per fixpoint iteration and, in a named stage, after
+   * every pass that changed the IR, so on the multi-thousand-instruction
+   * functions inlining produces the early exit is most of the cost. */
+  unsigned seen = 0;
   for (size_t i = 0; i < function->instruction_count; i++) {
     const IRInstruction *instruction = &function->instructions[i];
+    if (seen == IR_OPT_FEATURE_ALL) {
+      break;
+    }
     switch (instruction->op) {
     case IR_OP_LABEL:
       features->has_label = 1;
+      seen |= IR_OPT_FEATURE_LABEL;
       if (instruction->text &&
           strncmp(instruction->text, "ir_while_", 9) == 0) {
         features->has_while_label = 1;
+        seen |= IR_OPT_FEATURE_WHILE_LABEL;
       }
       break;
     case IR_OP_JUMP:
       features->has_jump = 1;
+      seen |= IR_OPT_FEATURE_JUMP;
       break;
     case IR_OP_BRANCH_ZERO:
       features->has_branch_zero = 1;
+      seen |= IR_OPT_FEATURE_BRANCH_ZERO;
       break;
     case IR_OP_BRANCH_EQ:
       features->has_branch_eq = 1;
+      seen |= IR_OPT_FEATURE_BRANCH_EQ;
       break;
     case IR_OP_CALL:
     case IR_OP_CALL_INDIRECT:
       features->has_call = 1;
+      seen |= IR_OPT_FEATURE_CALL;
       break;
     case IR_OP_LOAD:
       features->has_load = 1;
+      seen |= IR_OPT_FEATURE_LOAD;
       break;
     case IR_OP_ASSIGN:
       features->has_assign = 1;
+      seen |= IR_OPT_FEATURE_ASSIGN;
       break;
     case IR_OP_BINARY:
       features->has_binary = 1;
+      seen |= IR_OPT_FEATURE_BINARY;
       if (instruction->text && strcmp(instruction->text, "/") == 0) {
         features->has_div = 1;
+        seen |= IR_OPT_FEATURE_DIV;
       }
       break;
     default:
       break;
     }
 
-    if (ir_instruction_writes_temp(instruction)) {
+    if (!(seen & IR_OPT_FEATURE_TEMP_WRITE) &&
+        ir_instruction_writes_temp(instruction)) {
       features->has_temp_write = 1;
+      seen |= IR_OPT_FEATURE_TEMP_WRITE;
     }
   }
 }

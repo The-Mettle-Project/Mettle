@@ -8678,6 +8678,38 @@ catch {
   Write-CaseResult -Name "runtime_access_violation_trace" -Passed $false -Reason $_.Exception.Message
 }
 
+# Strength-reduction table gate. Every backend takes its "is there a cheaper
+# form of x <op> C" answer from one table, so the table itself is proven here
+# rather than trusted: each rewrite kind is simulated exactly as a backend
+# emits it and compared against the operation it replaces, over exhaustive
+# small divisors, the power-of-two neighbours where the shift and magic rows
+# meet, and a sparse sweep past the 32-bit boundary. The run also asserts
+# every rewrite kind was actually exercised, so the gate cannot silently
+# cover nothing. This is what lets a backend delete its private copy of the
+# Granlund-Montgomery math.
+$total++
+try {
+  $srExe = "bin/strength_rules_test.exe"
+  & gcc -Wall -Wextra -std=c99 -g -O1 -Isrc -Iinclude tests/strength_rules_test.c src/codegen/binary/strength_rules.c -o $srExe
+  if ($LASTEXITCODE -ne 0) {
+    throw "Failed to compile strength-rules test"
+  }
+
+  $srOutput = & $srExe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "Strength-rules test failed:`n$srOutput"
+  }
+  if ($srOutput -notmatch "RESULT: PASS") {
+    throw "Strength-rules test did not report PASS"
+  }
+
+  Write-CaseResult -Name "strength_rules" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "strength_rules" -Passed $false -Reason $_.Exception.Message
+}
+
 # AArch64 encoder validity gate. Compiles and runs the from-scratch A64
 # instruction encoder against ground-truth constants from the ARM Architecture
 # Reference Manual (RET=0xD65F03C0, the stp x29,x30,[sp,#-16]! prologue, ...)
