@@ -397,8 +397,31 @@ mir_shared_append:
     return 0;
   }
 
-  text_section = binary_emitter_get_or_create_section(
-      emitter, ".text", BINARY_SECTION_TEXT, 0, BINARY_TEXT_SECTION_ALIGNMENT);
+  /* On COFF each function gets its own `.text$name` section so the linker's
+   * section GC can drop the ones nothing reachable calls; the merged result
+   * lays out identically to one shared .text. A COFF section count is a
+   * uint16, so enormous programs fall back to the shared section. The ELF
+   * path keeps one .text: those objects go through external linkers whose
+   * scripts are not asked to collect. */
+  {
+    const char *text_name = ".text";
+    char granular_name[512];
+    uint32_t text_characteristics = 0;
+
+    if (emitter->target_format == BINARY_TARGET_FORMAT_COFF_WIN64 &&
+        generator->ir_program->function_count < 20000u &&
+        strlen(ir_function->name) + 7u <= sizeof(granular_name)) {
+      snprintf(granular_name, sizeof(granular_name), ".text$%s",
+               ir_function->name);
+      text_name = granular_name;
+      if (context.wants_wide_loop_alignment) {
+        text_characteristics = 0x60000020u | 0x00600000u;
+      }
+    }
+    text_section = binary_emitter_get_or_create_section(
+        emitter, text_name, BINARY_SECTION_TEXT, text_characteristics,
+        BINARY_TEXT_SECTION_ALIGNMENT);
+  }
   if (text_section == (size_t)-1) {
     code_generator_set_error(generator, "%s",
                              binary_emitter_get_error(emitter)

@@ -377,19 +377,32 @@ static const GcDefinition *gc_find_definition(const GcDefinition *table,
   return NULL;
 }
 
-static void gc_insert_definition(GcDefinition *table, size_t bucket_count,
-                                 const GcDefinition *definition) {
+/* Mirrors link_resolution_record_global_symbol: a runtime default loses to a
+ * program definition, and two same-precedence definitions are an error even
+ * when both would be collected, so a duplicate never links silently. */
+static int gc_insert_definition(GcDefinition *table, size_t bucket_count,
+                                const GcDefinition *definition,
+                                char **error_message_out) {
   size_t slot = gc_hash_name(definition->name) & (bucket_count - 1u);
   while (table[slot].name) {
     if (strcmp(table[slot].name, definition->name) == 0) {
+      if (table[slot].is_runtime_default == definition->is_runtime_default) {
+        mettle_set_error(error_message_out,
+                         "Duplicate external symbol '%s' in object index %zu "
+                         "and object index %zu",
+                         definition->name, table[slot].object_index,
+                         definition->object_index);
+        return 0;
+      }
       if (table[slot].is_runtime_default && !definition->is_runtime_default) {
         table[slot] = *definition;
       }
-      return;
+      return 1;
     }
     slot = (slot + 1u) & (bucket_count - 1u);
   }
   table[slot] = *definition;
+  return 1;
 }
 
 static void gc_mark(unsigned char **live, GcWorkItem *worklist,
@@ -478,7 +491,10 @@ static int link_resolution_gc_sections(LinkResolution *resolution,
       definition.object_index = object_index;
       definition.section_index = (size_t)(symbol->section_number - 1);
       definition.is_runtime_default = input->is_runtime_default;
-      gc_insert_definition(table, bucket_count, &definition);
+      if (!gc_insert_definition(table, bucket_count, &definition,
+                                error_message_out)) {
+        goto cleanup;
+      }
     }
   }
 
