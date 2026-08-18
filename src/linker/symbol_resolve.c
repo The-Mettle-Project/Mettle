@@ -585,6 +585,30 @@ static int link_resolution_gc_sections(LinkResolution *resolution,
     }
   }
 
+  if (getenv("METTLE_LINK_GC_REPORT")) {
+    for (object_index = 0; object_index < resolution->object_count;
+         object_index++) {
+      const LinkedInputObject *input = &resolution->objects[object_index];
+      const CoffObject *object = input->object;
+      size_t i = 0;
+
+      if (!object) {
+        continue;
+      }
+      for (i = 0; i < object->section_count; i++) {
+        const CoffSection *section = &object->sections[i];
+        if (section->kind == COFF_SECTION_KIND_UNKNOWN ||
+            section->size_of_raw_data == 0u) {
+          continue;
+        }
+        fprintf(stderr, "gc %s %s %s %u\n",
+                input->section_gc_dead[i] ? "dead" : "live",
+                input->path ? input->path : "<unknown>", section->name,
+                section->size_of_raw_data);
+      }
+    }
+  }
+
   ok = 1;
 
 cleanup:

@@ -127,7 +127,7 @@ RUNTIME_OBJ_CFLAGS = $(FREESTANDING_CFLAGS) -D_GNU_SOURCE -Isrc
 FREESTANDING_CFLAGS = -std=c99 -O2 -ffreestanding -fno-builtin \
 	-fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables \
 	-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
-	-ffunction-sections -fdata-sections $(ARCH_CFLAGS)
+	-ffunction-sections -fdata-sections -fno-jump-tables $(ARCH_CFLAGS)
 HOST_BACKEND_CFLAGS = -ffreestanding -fno-builtin -fno-stack-protector \
 	-fno-asynchronous-unwind-tables -fno-unwind-tables \
 	-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
