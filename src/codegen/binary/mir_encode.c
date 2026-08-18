@@ -2280,11 +2280,13 @@ int mir_encode(MirFunction *fn) {
       int fok = code_generator_binary_emit_simd_fill_splat(&ctx->code,
                                                            in->dst.imm);
       if (fok) {
+        /* Mode 1 computes the byte length as R8-RCX inside the kernel; mode 2
+         * arrives with R8 = byte length precomputed by the lowering. */
         fok = (in->a.imm == 0)
                   ? code_generator_binary_emit_simd_fill_loop_mode0(&ctx->code,
                                                                     in->dst.imm)
                   : code_generator_binary_emit_simd_fill_loop_bytewalk(
-                        &ctx->code, in->dst.imm, 1);
+                        &ctx->code, in->dst.imm, (int)in->a.imm);
       }
       if (!fok) {
         ok = enc_err(fn, "out of memory emitting inline fill kernel");

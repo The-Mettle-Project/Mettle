@@ -1790,12 +1790,11 @@ int mir_function_is_eligible(CodeGenerator *generator,
       break;
     }
     case IR_OP_SIMD_FILL: {
-      /* Inline fill passthrough, restricted to the element-counted (mode 0),
-       * no-start, no-offset, no-live-iv-writeback subset with a compile-time
-       * integer value -- the frame-clear / `a[i] = c` shape. Every other fill
-       * form (byte-walk modes, runtime/float value, hoisted offset, or a live
-       * induction variable that needs a final write-back) stays in the fallback,
-       * which handles them all. */
+      /* Inline fill passthrough: element-counted (mode 0), begin->end byte
+       * walk (mode 1), and byte-offset walk (mode 2, the mem_zero/mem_fill
+       * word loop), with a compile-time or runtime-invariant GP value. What
+       * still defers: float-valued fills, mode-1 pointer-iv write-backs, and
+       * mode-0 nonzero starts. */
       if (in->argument_count < 5 ||
           in->arguments[0].kind != IR_OPERAND_INT ||
           (in->arguments[0].int_value != 1 && in->arguments[0].int_value != 2 &&
@@ -1804,11 +1803,17 @@ int mir_function_is_eligible(CodeGenerator *generator,
           in->arguments[1].kind != IR_OPERAND_INT) {
         return mir_trace_bail(ir_function, "simd_fill:shape");
       }
-      /* Mode 0 (element-counted) and mode 1 (begin->end byte walk) only; mode 2
-       * (byte-offset walk with a start and a live-iv write-back) defers. */
+      /* Mode 0 (element-counted), mode 1 (begin->end byte walk), and mode 2
+       * (byte-offset walk: the lowering folds base+start and bound-start in
+       * 64-bit MIR, and writes the live iv back as start + bytes walked). */
       long long fill_mode = in->arguments[1].int_value;
-      if (fill_mode != 0 && fill_mode != 1) {
+      if (fill_mode != 0 && fill_mode != 1 && fill_mode != 2) {
         return mir_trace_bail(ir_function, "simd_fill:mode");
+      }
+      if (fill_mode == 2 && in->arguments[3].kind != IR_OPERAND_TEMP &&
+          in->arguments[3].kind != IR_OPERAND_SYMBOL &&
+          in->arguments[3].kind != IR_OPERAND_INT) {
+        return mir_trace_bail(ir_function, "simd_fill:start");
       }
       /* Mode 0 must start the induction variable at 0 (a nonzero start adjusts
        * both the base and the count; deferred). A nonzero/runtime OFFSET (the
@@ -1838,11 +1843,12 @@ int mir_function_is_eligible(CodeGenerator *generator,
         }
       }
       /* A live induction variable (dest = the iv symbol) needs a final
-       * write-back. Mode 0 with start 0 leaves iv = max(count, 0), folded in MIR
-       * after the kernel -- but only when the iv is a LOCAL/PARAM (resolvable to
-       * a vreg). Mode 1's pointer iv and a global iv stay in the fallback. */
+       * write-back, folded in MIR after the kernel: mode 0 (start 0) leaves
+       * iv = max(count, 0); mode 2 leaves iv = start + bytes walked. Either
+       * needs the iv to be a LOCAL/PARAM (resolvable to a vreg); mode 1's
+       * pointer iv and a global iv stay in the fallback. */
       if (in->dest.kind == IR_OPERAND_SYMBOL) {
-        if (fill_mode != 0 ||
+        if ((fill_mode != 0 && fill_mode != 2) ||
             !mir_local_or_param_type(generator, ir_function, in->dest.name,
                                      NULL)) {
           return mir_trace_bail(ir_function, "simd_fill:writeback");
@@ -1855,8 +1861,18 @@ int mir_function_is_eligible(CodeGenerator *generator,
           in->rhs.kind != IR_OPERAND_INT) {
         return mir_trace_bail(ir_function, "simd_fill:count");
       }
+      /* The fill value: a compile-time INT, or a runtime invariant GP value
+       * (mem_fill's splatted word). A float-valued symbol would resolve to an
+       * XMM vreg the RAX marshalling cannot take, so it stays deferred. */
       if (in->arguments[2].kind != IR_OPERAND_INT) {
-        return mir_trace_bail(ir_function, "simd_fill:value");
+        if ((in->arguments[2].kind != IR_OPERAND_TEMP &&
+             in->arguments[2].kind != IR_OPERAND_SYMBOL) ||
+            mir_arg_float_bits(generator, ir_function, &in->arguments[2]) != 0 ||
+            (in->arguments[2].kind == IR_OPERAND_TEMP &&
+             mir_temp_is_float(generator, ir_function, in->arguments[2].name,
+                               0))) {
+          return mir_trace_bail(ir_function, "simd_fill:value");
+        }
       }
       break;
     }
@@ -4086,11 +4102,11 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
   }
 
   case IR_OP_SIMD_FILL: {
-    /* Inline element-counted fill (gated to the mode-0/no-offset/no-writeback,
-     * integer-value subset). Marshal base->RCX, element count->R8, value->RAX,
-     * then emit the kernel. The value is parked into RAX LAST so it cannot
-     * clobber a base/count source that the allocator happened to place in RAX
-     * (the only poolable register among the three targets). */
+    /* Inline fill. Marshal base->RCX, element count (mode 0) / end pointer
+     * (mode 1) / byte length (mode 2)->R8, value->RAX, then emit the kernel.
+     * The value is parked into RAX LAST so it cannot clobber a base/count
+     * source that the allocator happened to place in RAX (the only poolable
+     * register among the three targets). */
     MirOperand base = mir_value_operand(fn, g, ctx, map, &in->lhs);
     MirOperand cnt = mir_value_operand(fn, g, ctx, map, &in->rhs);
     MirOperand val = mir_value_operand(fn, g, ctx, map, &in->arguments[2]);
@@ -4124,6 +4140,36 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
       }
       base = mir_op_vreg(adj);
     }
+    /* Mode-2 byte-offset walk: fold `base + start` and the byte length
+     * `bound - start` here in 64-bit MIR (the kernel receives the length
+     * precomputed); keep the length vreg for the live-iv write-back below. */
+    MirOperand m2_start = mir_op_imm(0);
+    int m2_start_zero = 1;
+    if (mode == 2) {
+      m2_start_zero = (in->arguments[3].kind == IR_OPERAND_INT &&
+                       in->arguments[3].int_value == 0);
+      if (cnt.kind != MIR_OPK_VREG) {
+        MirVregId lc = mir_new_vreg(fn, MIR_RC_GP, 8);
+        if (lc == MIR_VREG_NONE ||
+            !mir_emit1(fn, MIR_MOV, mir_op_vreg(lc), cnt, mir_op_none(), 8, 0,
+                       0)) {
+          return 0;
+        }
+        cnt = mir_op_vreg(lc);
+      }
+      if (!m2_start_zero) {
+        m2_start = mir_value_operand(fn, g, ctx, map, &in->arguments[3]);
+        MirVregId ab = mir_new_vreg(fn, MIR_RC_GP, 8);
+        MirVregId lb = mir_new_vreg(fn, MIR_RC_GP, 8);
+        if (ab == MIR_VREG_NONE || lb == MIR_VREG_NONE ||
+            !mir_emit1(fn, MIR_ADD, mir_op_vreg(ab), base, m2_start, 8, 0, 0) ||
+            !mir_emit1(fn, MIR_SUB, mir_op_vreg(lb), cnt, m2_start, 8, 0, 0)) {
+          return 0;
+        }
+        base = mir_op_vreg(ab);
+        cnt = mir_op_vreg(lb);
+      }
+    }
     if (!mir_emit1(fn, MIR_MOV, mir_op_phys(BINARY_GP_RCX, MIR_RC_GP), base,
                    mir_op_none(), 8, 0, 0) ||
         !mir_emit1(fn, MIR_MOV, mir_op_phys(BINARY_GP_R8, MIR_RC_GP), cnt,
@@ -4150,6 +4196,46 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
           !mir_emit1(fn, MIR_NOT, mir_op_vreg(mask), mir_op_vreg(mask),
                      mir_op_none(), 8, 0, 0) ||
           !mir_emit1(fn, MIR_AND, iv, cnt, mir_op_vreg(mask), 8, 0, 0)) {
+        return 0;
+      }
+    }
+    /* Mode-2 live iv: the scalar loop leaves iv = start when the walk is
+     * empty (len <= 0), else start + len rounded up to the stride (the tail
+     * store overshoots exactly as `i += size` does). Fold branchlessly:
+     * walked = ((len + size-1) & -size) & ~(len >> 63); iv = start + walked. */
+    if (mode == 2 && in->dest.kind == IR_OPERAND_SYMBOL) {
+      MirOperand iv = mir_value_operand(fn, g, ctx, map, &in->dest);
+      MirOperand walked = cnt;
+      if (size > 1) {
+        MirVregId w1 = mir_new_vreg(fn, MIR_RC_GP, 8);
+        MirVregId w2 = mir_new_vreg(fn, MIR_RC_GP, 8);
+        if (w1 == MIR_VREG_NONE || w2 == MIR_VREG_NONE ||
+            !mir_emit1(fn, MIR_ADD, mir_op_vreg(w1), cnt, mir_op_imm(size - 1),
+                       8, 0, 0) ||
+            !mir_emit1(fn, MIR_AND, mir_op_vreg(w2), mir_op_vreg(w1),
+                       mir_op_imm(-size), 8, 0, 0)) {
+          return 0;
+        }
+        walked = mir_op_vreg(w2);
+      }
+      MirVregId mask = mir_new_vreg(fn, MIR_RC_GP, 8);
+      MirVregId wm = mir_new_vreg(fn, MIR_RC_GP, 8);
+      if (mask == MIR_VREG_NONE || wm == MIR_VREG_NONE ||
+          !mir_emit1(fn, MIR_SAR, mir_op_vreg(mask), cnt, mir_op_imm(63), 8, 0,
+                     0) ||
+          !mir_emit1(fn, MIR_NOT, mir_op_vreg(mask), mir_op_vreg(mask),
+                     mir_op_none(), 8, 0, 0) ||
+          !mir_emit1(fn, MIR_AND, mir_op_vreg(wm), walked, mir_op_vreg(mask), 8,
+                     0, 0)) {
+        return 0;
+      }
+      if (m2_start_zero) {
+        if (!mir_emit1(fn, MIR_MOV, iv, mir_op_vreg(wm), mir_op_none(), 8, 0,
+                       0)) {
+          return 0;
+        }
+      } else if (!mir_emit1(fn, MIR_ADD, iv, mir_op_vreg(wm), m2_start, 8, 0,
+                            0)) {
         return 0;
       }
     }
