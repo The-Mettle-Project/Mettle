@@ -131,6 +131,32 @@ static int mir_name_is_global_variable(CodeGenerator *g, const char *name) {
          s->scope->type == CG_SCOPE_GLOBAL;
 }
 
+/* True if `name`'s address escapes through a module-level initializer: another
+ * global holds &name (init_symbol_ref), or an aggregate initializer embeds it
+ * (init_relocs). Such a global is aliasable by a pointer the function body
+ * never visibly creates, so its cache vreg must ride the address-taken
+ * flush/reload discipline even though no IR_OP_ADDRESS_OF names it. */
+static int mir_global_address_escapes_via_initializer(CodeGenerator *g,
+                                                      const char *name) {
+  if (!g || !g->ir_program || !name) {
+    return 0;
+  }
+  const IRProgram *p = g->ir_program;
+  for (size_t i = 0; i < p->module_symbol_count; i++) {
+    const IRModuleSymbol *s = &p->module_symbols[i];
+    if (s->init_symbol_ref && strcmp(s->init_symbol_ref, name) == 0) {
+      return 1;
+    }
+    for (size_t r = 0; r < s->init_reloc_count; r++) {
+      if (s->init_relocs[r].symbol &&
+          strcmp(s->init_relocs[r].symbol, name) == 0) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
 /* True if `name` resolves to a read-accessible global scalar, a value we can
  * cache in a register at function entry (used by both the eligibility gate and
  * the entry-load emitter, so they agree exactly on what counts as cacheable). */
@@ -299,6 +325,10 @@ typedef struct {
                        pointer LOAD/STORE, reload after a pointer STORE, so a
                        store through the alias and a by-name access stay coherent */
   size_t at_count;
+  /* Per-IR-instruction dirty masks over names[] (bit j = names[j] possibly
+   * written since the last cleaning point on some path reaching that
+   * instruction). NULL = no analysis, flush the whole written set. */
+  const unsigned long long *dirty;
 } MirGlobalWriteback;
 
 /* ---- operand mapping ---------------------------------------------------- */
@@ -1366,6 +1396,9 @@ int mir_function_is_eligible(CodeGenerator *generator,
   int globals_ok = 1;
   int has_global_write = 0;
   int has_call = 0;
+  const char *gw_names[64];
+  size_t gw_count = 0;
+  int gw_overflow = 0;
   for (size_t i = 0; i < ir_function->parameter_count; i++) {
     if (ir_function->parameter_names[i]) {
       mir_name_map_get_or_add(&defined, &scratch_fn,
@@ -1412,6 +1445,20 @@ int mir_function_is_eligible(CodeGenerator *generator,
       }
       if (!found) {
         has_global_write = 1;
+        int seen = 0;
+        for (size_t j = 0; j < gw_count; j++) {
+          if (strcmp(gw_names[j], in->dest.name) == 0) {
+            seen = 1;
+            break;
+          }
+        }
+        if (!seen) {
+          if (gw_count < 64) {
+            gw_names[gw_count++] = in->dest.name;
+          } else {
+            gw_overflow = 1;
+          }
+        }
       }
     }
     /* An undefined SYMBOL read must be a global scalar. */
@@ -1460,12 +1507,14 @@ int mir_function_is_eligible(CodeGenerator *generator,
   if (!globals_ok) {
     return mir_trace_bail(ir_function, "global_access");
   }
-  /* The global cache writes every changed global before each call. A cache
-   * value that was reloaded after a prior call is clean, and writing it before
-   * the next call can overwrite another thread's newer value before a lock is
-   * acquired. Keep functions that mix global writes and calls on the baseline
-   * path, which reads and writes global memory at each source operation. */
-  if (has_global_write && has_call) {
+  /* Mixing global writes with calls is fine now that the flush before each
+   * call/return is flow-sensitive: only globals actually dirtied since the
+   * last cleaning point are stored back, so a clean cached value can never
+   * stomp another thread's write between a reload and the next call (the
+   * lock()/unlock() hazard that used to force these functions to the
+   * fallback). The dirty analysis tracks at most 64 written globals; past
+   * that it degrades to flush-everything, so such functions stay deferred. */
+  if (has_global_write && has_call && gw_overflow) {
     return mir_trace_bail(ir_function, "global_write_with_call");
   }
 
@@ -2306,16 +2355,117 @@ static int mir_emit_global_reload_names(MirFunction *fn, CodeGenerator *g,
   return 1;
 }
 
-/* Flush the written cached globals back to memory. Called before each MIR_RET
+/* Flush the DIRTY cached globals back to memory. Called before each MIR_RET
  * (so memory is consistent on every exit) and before a call (so the callee sees
- * current values). */
+ * current values). With the dirty analysis available, only globals actually
+ * written since the last cleaning point are stored: writing a merely-cached
+ * (clean) value back would race a concurrent writer that updated the global
+ * between our reload and this flush -- the lock()/unlock() idiom, where the
+ * synchronizing calls are exactly the boundaries a stale store-back must not
+ * cross. */
 static int mir_emit_global_writebacks(MirFunction *fn, CodeGenerator *g,
                                       MirNameMap *map,
                                       const MirGlobalWriteback *wb) {
   if (!wb) {
     return 1;
   }
+  if (wb->dirty && fn->cur_ir_index >= 0) {
+    unsigned long long m = wb->dirty[fn->cur_ir_index];
+    for (size_t j = 0; j < wb->count && j < 64; j++) {
+      if ((m >> j) & 1ull) {
+        if (!mir_emit_global_flush_names(fn, g, map, &wb->names[j], 1)) {
+          return 0;
+        }
+      }
+    }
+    return 1;
+  }
   return mir_emit_global_flush_names(fn, g, map, wb->names, wb->count);
+}
+
+/* Flow-sensitive dirty-global analysis over the IR CFG. Returns a malloc'd
+ * array of instruction_count masks: mask[i] bit j set = names[j] was possibly
+ * written (cache newer than memory) on some path reaching instruction i, with
+ * function entry clean and every call a cleaning point (its flush-before /
+ * reload-after leaves cache == memory). Forward may-analysis to fixpoint;
+ * unreachable code keeps an empty mask. Returns NULL when the analysis does
+ * not apply (no instructions, no written globals, more than 64 of them, or a
+ * malformed branch target); the caller then flushes the whole set. */
+static unsigned long long *mir_compute_global_dirty_masks(
+    const IRFunction *irf, const char **names, size_t count) {
+  size_t n = irf->instruction_count;
+  if (n == 0 || count == 0 || count > 64) {
+    return NULL;
+  }
+  unsigned long long *mask =
+      (unsigned long long *)calloc(n, sizeof(*mask));
+  int *target = (int *)malloc(n * sizeof(*target));
+  if (!mask || !target) {
+    free(mask);
+    free(target);
+    return NULL;
+  }
+  for (size_t i = 0; i < n; i++) {
+    const IRInstruction *in = &irf->instructions[i];
+    target[i] = -1;
+    if ((in->op == IR_OP_JUMP || in->op == IR_OP_BRANCH_ZERO ||
+         in->op == IR_OP_BRANCH_EQ) &&
+        in->text) {
+      for (size_t k = 0; k < n; k++) {
+        const IRInstruction *lk = &irf->instructions[k];
+        if (lk->op == IR_OP_LABEL && lk->text &&
+            strcmp(lk->text, in->text) == 0) {
+          target[i] = (int)k;
+          break;
+        }
+      }
+      if (target[i] < 0) {
+        free(mask);
+        free(target);
+        return NULL;
+      }
+    }
+  }
+  int changed = 1;
+  while (changed) {
+    changed = 0;
+    for (size_t i = 0; i < n; i++) {
+      const IRInstruction *in = &irf->instructions[i];
+      unsigned long long s = mask[i];
+      if (in->op == IR_OP_CALL || in->op == IR_OP_CALL_INDIRECT) {
+        s = 0; /* kill first: the flush+reload cleans, THEN a @g=f() dest
+                  capture re-dirties below */
+      }
+      if (in->dest.kind == IR_OPERAND_SYMBOL && in->dest.name &&
+          in->op != IR_OP_DECLARE_LOCAL) {
+        for (size_t j = 0; j < count; j++) {
+          if (strcmp(names[j], in->dest.name) == 0) {
+            s |= 1ull << j;
+            break;
+          }
+        }
+      }
+      if (in->op == IR_OP_RETURN) {
+        continue;
+      }
+      if (target[i] >= 0) {
+        size_t t = (size_t)target[i];
+        if ((mask[t] | s) != mask[t]) {
+          mask[t] |= s;
+          changed = 1;
+        }
+        if (in->op == IR_OP_JUMP) {
+          continue;
+        }
+      }
+      if (i + 1 < n && (mask[i + 1] | s) != mask[i + 1]) {
+        mask[i + 1] |= s;
+        changed = 1;
+      }
+    }
+  }
+  free(target);
+  return mask;
 }
 
 /* Reload every cached global EXCEPT `except` (borrowed name). Used after a call
@@ -6302,6 +6452,7 @@ int code_generator_binary_emit_function_via_mir(
   size_t wb_cap = 0;
   size_t wb_all_cap = 0;
   size_t wb_at_cap = 0;
+  unsigned long long *dirty_masks = NULL;
 
   /* MIR owns saved registers and the frame; discard anything the legacy
    * promoter left in the context. */
@@ -6532,6 +6683,45 @@ int code_generator_binary_emit_function_via_mir(
     }
     wb.at[wb.at_count++] = in->lhs.name;
   }
+  /* A cached global can also be aliased by a pointer built at MODULE scope
+   * (`var p: int32* = &g;`): no IR_OP_ADDRESS_OF appears in any function, but
+   * a pointer LOAD/STORE can still reach its memory. Give those the same
+   * address-taken flush/reload discipline. */
+  for (size_t i = 0; i < wb.all_count; i++) {
+    if (!mir_global_address_escapes_via_initializer(generator, wb.all[i])) {
+      continue;
+    }
+    int present = 0;
+    for (size_t j = 0; j < wb.at_count; j++) {
+      if (strcmp(wb.at[j], wb.all[i]) == 0) {
+        present = 1;
+        break;
+      }
+    }
+    if (present) {
+      continue;
+    }
+    if (wb.at_count >= wb_at_cap) {
+      size_t nc = wb_at_cap ? wb_at_cap * 2 : 4;
+      const char **grown = (const char **)realloc(wb.at, nc * sizeof(*grown));
+      if (!grown) {
+        goto oom;
+      }
+      wb.at = grown;
+      wb_at_cap = nc;
+    }
+    wb.at[wb.at_count++] = wb.all[i];
+  }
+
+  /* Dirty-global flow analysis: lets the flush before each call/return write
+   * only the globals actually dirtied since the last cleaning point, instead
+   * of the whole written set (whose clean members a flush could stomp under
+   * concurrency). A NULL result (no writes, >64 written globals, malformed
+   * CFG) degrades to flushing everything -- but eligibility bails the
+   * write+call combination in that case, so calls never see the degraded
+   * flush. */
+  dirty_masks = mir_compute_global_dirty_masks(ir_function, wb.names, wb.count);
+  wb.dirty = dirty_masks;
 
   /* Hoist loop-invariant constants into pooled vregs. Their materialization
    * starts here and is relocated to hot-loop preheaders after MIR layout. */
@@ -6736,6 +6926,7 @@ int code_generator_binary_emit_function_via_mir(
   }
   mir_annotate_end_function();
 
+  free(dirty_masks);
   free(wb.names);
   free(wb.all);
   free(wb.at);
@@ -6750,6 +6941,7 @@ oom:
                              "emitting MIR for function '%s'",
                              ir_function->name ? ir_function->name : "?");
   }
+  free(dirty_masks);
   free(wb.names);
   free(wb.all);
   free(wb.at);
