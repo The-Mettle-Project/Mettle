@@ -376,11 +376,6 @@ static void ir_loop_fp_report(const IRFunction *function,
 
 /* Canonical form (checked fixpoint) -> recognizer worklist -> tail. */
 static int ir_run_post_fixpoint_stages(IRFunction *function) {
-  IRLoopFpEntry fp_entries[IR_FP_MAX_LOOPS];
-  int fp_count = 0;
-  if (ir_loop_fp_enabled()) {
-    fp_count = ir_loop_fp_snapshot(function, fp_entries);
-  }
   mettle_compiler_ctx_set_pass_name("loop canonical form");
   if (!ir_run_named_stage_fixpoint(
           function, g_ir_loop_canonical_passes,
@@ -419,9 +414,6 @@ static int ir_run_post_fixpoint_stages(IRFunction *function) {
           IR_ARRAY_COUNT(g_ir_post_recognizer_tail), 1, "post-recognizer tail",
           "IR optimization pass failed", 0)) {
     return 0;
-  }
-  if (fp_count > 0) {
-    ir_loop_fp_report(function, fp_entries, fp_count);
   }
   return 1;
 }
@@ -489,12 +481,27 @@ int ir_optimize_function_pipeline(IRFunction *function) {
     }
   }
 
+  /* Snapshot ahead of the main fixpoint, not just ahead of the post-fixpoint
+   * worklist: the sum, dot, byte-map and SLP recognizers run as fixpoint
+   * passes, so a loop one of them claims has already lost its header by the
+   * time the worklist starts. Sampling here is what makes the gate cover
+   * every recognizer instead of most of them. */
+  IRLoopFpEntry fp_entries[IR_FP_MAX_LOOPS];
+  int fp_count = 0;
+  if (ir_loop_fp_enabled()) {
+    fp_count = ir_loop_fp_snapshot(function, fp_entries);
+  }
+
   if (!ir_run_fixpoint_stage(function, &g_ir_fixpoint_stage)) {
     return 0;
   }
 
   if (!ir_run_post_fixpoint_stages(function)) {
     return 0;
+  }
+
+  if (fp_count > 0) {
+    ir_loop_fp_report(function, fp_entries, fp_count);
   }
 
   /* Enforce `@simd` contracts now that every vectorizer has had its chance,

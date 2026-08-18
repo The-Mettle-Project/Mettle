@@ -1,0 +1,19 @@
+# Recognizer-claim baseline. Regenerate with tools/regen-loop-claims.ps1.
+# Columns: kernel  fingerprint  claimed(1=a recognizer took the loop)
+# A claim regressing 1 -> 0 fails the build; read every diff here.
+rc_call_in_body a41a875c1fa987d7 1
+rc_clamp_i32 6f2f264b0854edb3 1
+rc_cmp_as_value c6d5993564424a06 1
+rc_count_gt 813cda2fb911e7dc 1
+rc_dot_f32 ff2f2a3f6fddb4c9 1
+rc_dot_i32 700091bcd442ba12 1
+rc_fill_i32 7c517adf898c1220 1
+rc_find_i32 b730ca956df7408a 0
+rc_max_i32 79a957982eb1d8c3 1
+rc_min_i32 966b8f62c9af45da 1
+rc_saxpy_f32 716653c3ecd55e08 1
+rc_scale_i32 826042d0c135bbb7 1
+rc_serial_recurrence 45ec4d5a1f58e355 0
+rc_sum_f32 abc5a3e6e4298f57 1
+rc_sum_i32 99ba359679cff24a 1
+rc_sum_u8 de0f1833056739c9 1

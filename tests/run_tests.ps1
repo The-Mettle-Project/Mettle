@@ -8678,6 +8678,93 @@ catch {
   Write-CaseResult -Name "runtime_access_violation_trace" -Passed $false -Reason $_.Exception.Message
 }
 
+# Recognizer-rot gate. Compiles a corpus of kernels whose loops the
+# vectorizers are supposed to claim and compares the outcome against a checked-
+# in baseline. A claim regressing from taken to untaken fails the build: that is
+# lost vectorization, and it is otherwise invisible until someone benchmarks.
+# The loop's dataflow fingerprint says WHICH kind of regression it is -- an
+# unchanged fingerprint means the loop is identical and the recognizer stopped
+# matching it (rot), a moved one means the IR reaching the recognizer changed
+# upstream. Regenerate the baseline with tools/regen-loop-claims.ps1 and read
+# the diff; a regeneration that quietly turns a 1 into a 0 is the regression
+# this gate exists to report.
+$total++
+try {
+  $rotCorpus = "tests/loop_rot_corpus.mettle"
+  $rotBaselinePath = "tests/loop_claims.baseline"
+  if (-not (Test-Path $rotCorpus)) { throw "missing $rotCorpus" }
+  if (-not (Test-Path $rotBaselinePath)) { throw "missing $rotBaselinePath" }
+
+  $rotDir = Join-Path $tmpDir "looprot"
+  New-Item -ItemType Directory -Force -Path $rotDir | Out-Null
+  $rotExe = Join-Path $rotDir "corpus.exe"
+
+  $prevFp = $env:METTLE_LOOP_FINGERPRINT
+  $env:METTLE_LOOP_FINGERPRINT = "1"
+  $rotOut = & $CompilerPath --release --build $rotCorpus -o $rotExe 2>&1 | Out-String
+  $rotCode = $LASTEXITCODE
+  if ($null -eq $prevFp) { Remove-Item Env:\METTLE_LOOP_FINGERPRINT -ErrorAction SilentlyContinue }
+  else { $env:METTLE_LOOP_FINGERPRINT = $prevFp }
+  if ($rotCode -ne 0) { throw "rot corpus failed to build" }
+
+  # The corpus must also still compute what it computed, so a recognizer
+  # cannot keep its claim by miscompiling the kernel.
+  $rotRan = (& $rotExe 2>&1 | Out-String).Trim()
+  if ($rotRan -notmatch "corpus acc = ") {
+    throw "rot corpus did not run: $rotRan"
+  }
+
+  $current = @{}
+  foreach ($line in ($rotOut -split "`r?`n")) {
+    if ($line -match '^\[loop-fp\] function=(\S+) loop=\S+ fp=(\S+) claimed=(\d)') {
+      if ($Matches[1] -like 'rc_*') {
+        $current[$Matches[1]] = @{ Fp = $Matches[2]; Claimed = $Matches[3] }
+      }
+    }
+  }
+  if ($current.Count -eq 0) {
+    throw "no corpus loops reported; the fingerprint hook is not firing"
+  }
+
+  $problems = @()
+  $improved = @()
+  $baseCount = 0
+  foreach ($line in (Get-Content $rotBaselinePath)) {
+    if ($line -match '^\s*#' -or $line -match '^\s*$') { continue }
+    $parts = $line -split '\s+'
+    if ($parts.Count -lt 3) { continue }
+    $baseCount++
+    $fn = $parts[0]; $fp = $parts[1]; $claimed = $parts[2]
+    if (-not $current.ContainsKey($fn)) {
+      $problems += "$fn vanished from the corpus output (baseline stale?)"
+      continue
+    }
+    $now = $current[$fn]
+    if ($claimed -eq '1' -and $now.Claimed -eq '0') {
+      if ($now.Fp -eq $fp) {
+        $problems += "$fn LOST its claim with an identical loop fingerprint ($fp): a recognizer stopped matching"
+      } else {
+        $problems += "$fn LOST its claim and its fingerprint moved ($fp -> $($now.Fp)): the IR reaching the recognizer changed"
+      }
+    }
+    elseif ($claimed -eq '0' -and $now.Claimed -eq '1') {
+      $improved += "$fn is now claimed (baseline says it was not)"
+    }
+  }
+  if ($baseCount -eq 0) { throw "baseline file has no rows" }
+
+  foreach ($i in $improved) { Write-Host "  [note] $i" }
+  if ($problems.Count -gt 0) {
+    throw ("recognizer claims regressed:`n  " + ($problems -join "`n  "))
+  }
+
+  Write-CaseResult -Name "recognizer_rot" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "recognizer_rot" -Passed $false -Reason $_.Exception.Message
+}
+
 # Canonical-form guard liveness. The pipeline checks structurally, before the
 # recognizers run, that no declaration survives inside a loop body -- the
 # invariant the canonicalizers establish. A guard nobody can see fire is

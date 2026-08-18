@@ -1,0 +1,166 @@
+// Corpus for the recognizer-rot gate.
+//
+// One loop per function, each a shape some recognizer is supposed to claim,
+// plus shapes nothing should claim. The gate records each loop's dataflow
+// fingerprint alongside whether a recognizer took it, and fails when a claim
+// flips while the fingerprint holds still: same loop, different outcome, which
+// is a recognizer that stopped matching.
+//
+// Add a kernel here when you add a recognizer. Regenerate the baseline with
+// tools/regen-loop-claims.ps1 and read the diff before committing it.
+
+import "std/io";
+
+fn rc_sum_i32(a: int32*, n: int32) -> int32 {
+  var s: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) { s = s + a[i]; i = i + 1; }
+  return s;
+}
+
+fn rc_dot_i32(a: int32*, b: int32*, n: int32) -> int32 {
+  var s: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) { s = s + a[i] * b[i]; i = i + 1; }
+  return s;
+}
+
+fn rc_max_i32(a: int32*, n: int32) -> int32 {
+  var m: int32 = a[0];
+  var i: int32 = 1;
+  while (i < n) { if (a[i] > m) { m = a[i]; } i = i + 1; }
+  return m;
+}
+
+fn rc_min_i32(a: int32*, n: int32) -> int32 {
+  var m: int32 = a[0];
+  var i: int32 = 1;
+  while (i < n) { if (a[i] < m) { m = a[i]; } i = i + 1; }
+  return m;
+}
+
+fn rc_fill_i32(a: int32*, n: int32, v: int32) {
+  var i: int32 = 0;
+  while (i < n) { a[i] = v; i = i + 1; }
+}
+
+fn rc_scale_i32(a: int32*, n: int32) {
+  var i: int32 = 0;
+  while (i < n) { a[i] = a[i] * 3; i = i + 1; }
+}
+
+fn rc_count_gt(a: int32*, n: int32, t: int32) -> int32 {
+  var c: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) { if (a[i] > t) { c = c + 1; } i = i + 1; }
+  return c;
+}
+
+fn rc_clamp_i32(a: int32*, n: int32) {
+  var i: int32 = 0;
+  while (i < n) {
+    var v: int32 = a[i];
+    if (v > 100) { v = 100; }
+    if (v < 0) { v = 0; }
+    a[i] = v;
+    i = i + 1;
+  }
+}
+
+fn rc_cmp_as_value(a: int32*, n: int32, t: int32) -> int32 {
+  var c: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) { c = c + (a[i] > t); i = i + 1; }
+  return c;
+}
+
+fn rc_sum_f32(a: float32*, n: int32) -> float32 {
+  var s: float32 = 0.0;
+  var i: int32 = 0;
+  while (i < n) { s = s + a[i]; i = i + 1; }
+  return s;
+}
+
+fn rc_dot_f32(a: float32*, b: float32*, n: int32) -> float32 {
+  var s: float32 = 0.0;
+  var i: int32 = 0;
+  while (i < n) { s = s + a[i] * b[i]; i = i + 1; }
+  return s;
+}
+
+fn rc_saxpy_f32(a: float32*, b: float32*, n: int32, k: float32) {
+  var i: int32 = 0;
+  while (i < n) { a[i] = a[i] + k * b[i]; i = i + 1; }
+  return;
+}
+
+fn rc_sum_u8(a: uint8*, n: int32) -> int64 {
+  var s: int64 = 0;
+  var i: int32 = 0;
+  while (i < n) { s = s + (int64)a[i]; i = i + 1; }
+  return s;
+}
+
+fn rc_find_i32(a: int32*, n: int32, key: int32) -> int32 {
+  var i: int32 = 0;
+  while (i < n) { if (a[i] == key) { return i; } i = i + 1; }
+  return -1;
+}
+
+// Shapes nothing should claim. A recognizer that starts claiming one of these
+// is over-eager, and that flips the bit in the other direction.
+fn rc_serial_recurrence(a: int32*, n: int32) -> int32 {
+  var s: int32 = 1;
+  var i: int32 = 0;
+  while (i < n) { s = s * a[i] + s; i = i + 1; }
+  return s;
+}
+
+fn rc_helper(x: int32) -> int32 { return x * x + 1; }
+
+fn rc_call_in_body(a: int32*, n: int32) -> int32 {
+  var s: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) { s = s + rc_helper(a[i]); i = i + 1; }
+  return s;
+}
+
+fn main() -> int32 {
+  var ia: int32[64];
+  var ib: int32[64];
+  var fa: float32[64];
+  var fb: float32[64];
+  var ba: uint8[64];
+  var i: int32 = 0;
+  while (i < 64) {
+    ia[i] = i + 1;
+    ib[i] = 64 - i;
+    fa[i] = (float32)i;
+    fb[i] = 2.0;
+    ba[i] = (uint8)(i & 255);
+    i = i + 1;
+  }
+
+  var acc: int64 = 0;
+  acc = acc + (int64)rc_sum_i32(&ia[0], 64);
+  acc = acc + (int64)rc_dot_i32(&ia[0], &ib[0], 64);
+  acc = acc + (int64)rc_max_i32(&ia[0], 64);
+  acc = acc + (int64)rc_min_i32(&ia[0], 64);
+  rc_fill_i32(&ib[0], 64, 2);
+  rc_scale_i32(&ib[0], 64);
+  acc = acc + (int64)rc_count_gt(&ia[0], 64, 10);
+  rc_clamp_i32(&ia[0], 64);
+  acc = acc + (int64)rc_cmp_as_value(&ia[0], 64, 5);
+  acc = acc + (int64)rc_sum_f32(&fa[0], 64);
+  acc = acc + (int64)rc_dot_f32(&fa[0], &fb[0], 64);
+  rc_saxpy_f32(&fa[0], &fb[0], 64, 3.0);
+  acc = acc + rc_sum_u8(&ba[0], 64);
+  acc = acc + (int64)rc_find_i32(&ia[0], 64, 7);
+  acc = acc + (int64)rc_serial_recurrence(&ia[0], 8);
+  acc = acc + (int64)rc_call_in_body(&ia[0], 64);
+
+  print("corpus acc = ");
+  print_int(acc);
+  newline();
+  return 0;
+}
