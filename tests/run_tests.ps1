@@ -8678,6 +8678,74 @@ catch {
   Write-CaseResult -Name "runtime_access_violation_trace" -Passed $false -Reason $_.Exception.Message
 }
 
+# Canonical-form guard liveness. The pipeline checks structurally, before the
+# recognizers run, that no declaration survives inside a loop body -- the
+# invariant the canonicalizers establish. A guard nobody can see fire is
+# indistinguishable from one that was silently disabled, so this drives the
+# exact failure it exists to catch: METTLE_SKIP_PASS stops the hoister, which
+# is what a rotted matcher looks like from the outside, and the build must
+# stop and name the declaration and its loop. It must also compile cleanly
+# with the hoister running, so the guard is proven to discriminate rather
+# than to fire always.
+$total++
+try {
+  $canonDir = Join-Path $tmpDir "canonform"
+  New-Item -ItemType Directory -Force -Path $canonDir | Out-Null
+  $canonSrc = Join-Path $canonDir "canon.mettle"
+  @'
+import "std/io";
+fn total(a: int32*, n: int32) -> int32 {
+  var s: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    var v: int32 = a[i] * 2;
+    s = s + v;
+    i = i + 1;
+  }
+  return s;
+}
+fn main() -> int32 {
+  var b: int32[4] = [1, 2, 3, 4];
+  print_int(total(&b[0], 4));
+  newline();
+  return 0;
+}
+'@ | Set-Content -Encoding ascii $canonSrc
+
+  $canonExe = Join-Path $canonDir "canon.exe"
+  & $CompilerPath --release --build $canonSrc -o $canonExe *> $null
+  if ($LASTEXITCODE -ne 0) {
+    throw "canonical-form sample failed to build with the hoister running"
+  }
+  $canonRan = (& $canonExe 2>&1 | Out-String).Trim()
+  if ($canonRan -ne "20") {
+    throw "canonical-form sample printed '$canonRan', expected 20"
+  }
+
+  $prevSkip = $env:METTLE_SKIP_PASS
+  $env:METTLE_SKIP_PASS = "hoist_body_locals"
+  $guardOut = & $CompilerPath --release --build $canonSrc -o (Join-Path $canonDir "canon2.exe") 2>&1 | Out-String
+  $guardCode = $LASTEXITCODE
+  if ($null -eq $prevSkip) { Remove-Item Env:\METTLE_SKIP_PASS -ErrorAction SilentlyContinue }
+  else { $env:METTLE_SKIP_PASS = $prevSkip }
+
+  if ($guardCode -eq 0) {
+    throw "canonical-form guard did not fire with the hoister disabled"
+  }
+  if ($guardOut -notmatch "loop canonical form does not hold") {
+    throw "guard fired without naming the violated invariant:`n$guardOut"
+  }
+  if ($guardOut -notmatch "declaration of 'v'") {
+    throw "guard did not name the offending declaration:`n$guardOut"
+  }
+
+  Write-CaseResult -Name "canonical_form_guard" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "canonical_form_guard" -Passed $false -Reason $_.Exception.Message
+}
+
 # Strength-reduction table gate. Every backend takes its "is there a cheaper
 # form of x <op> C" answer from one table, so the table itself is proven here
 # rather than trusted: each rewrite kind is simulated exactly as a backend

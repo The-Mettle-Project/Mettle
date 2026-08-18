@@ -389,6 +389,22 @@ static int ir_run_post_fixpoint_stages(IRFunction *function) {
           "IR optimization pass failed", 1)) {
     return 0;
   }
+  /* The recognizers start here, and every one of them assumes the form the
+   * stage above was supposed to establish. Check it structurally before they
+   * run: a canonicalizer whose matcher stopped firing converges just as
+   * quietly as one with nothing to do, and this is the difference. */
+  {
+    char detail[192];
+    detail[0] = '\0';
+    if (!ir_verify_loop_canonical_form(function, detail, sizeof(detail))) {
+      fprintf(stderr,
+              "mettle: internal error: loop canonical form does not hold in "
+              "function '%s': %s\n",
+              function->name ? function->name : "<anonymous>", detail);
+      mettle_compiler_ice("IR loop canonical form violated");
+    }
+  }
+
   mettle_compiler_ctx_set_pass_name("post-fixpoint idiom recognition");
   if (!ir_run_named_stage_fixpoint(
           function, g_ir_recognizer_passes,

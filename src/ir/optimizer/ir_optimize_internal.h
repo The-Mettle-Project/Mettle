@@ -197,6 +197,10 @@ int ir_affine_index_decompose(const IRFunction *function, size_t before,
                               long long *coeff_out, long long *addend_out);
 int ir_affine_symbol_written_in(const IRFunction *function, size_t start,
                                 size_t end, const char *symbol);
+/* Structural check that the loop canonical form holds, written independently
+ * of the passes that establish it (see the comment at the definition). */
+int ir_verify_loop_canonical_form(const IRFunction *function, char *detail,
+                                  size_t detail_size);
 
 #define IR_PTR_BIND_MAX 4
 

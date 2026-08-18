@@ -114,6 +114,57 @@ int ir_hoist_body_locals_pass(IRFunction *function, int *changed) {
   return 1;
 }
 
+/* Does the loop canonical form actually hold?
+ *
+ * The stage driver proves the canonicalizers CONVERGED, which is a statement
+ * about the passes rather than about the IR. It is satisfied by a matcher that
+ * has quietly stopped recognizing its shape: the pass reports clean, the stage
+ * settles, and every recognizer downstream then fails to match for a reason
+ * nothing reports. That is exactly how a recognizer rots.
+ *
+ * So this states the property independently of the pass that establishes it.
+ * The redundancy is the point: two separate statements of one invariant, and a
+ * disagreement means the hoister stopped doing its job. It asserts only what
+ * ir_hoist_body_locals_pass guarantees unconditionally -- no declaration
+ * survives inside a loop body -- because the global-base hoister legitimately
+ * declines (a base whose pointer type is unknown, a temp that escapes), and a
+ * verifier that reports those would be crying wolf about correct output.
+ *
+ * Returns 1 when the form holds. On failure fills `detail` with the loop and
+ * the symbol, which is the whole diagnostic value: it names what to look at. */
+int ir_verify_loop_canonical_form(const IRFunction *function, char *detail,
+                                  size_t detail_size) {
+  if (!function) {
+    return 1;
+  }
+  for (size_t header = 0; header < function->instruction_count; header++) {
+    const IRInstruction *label = &function->instructions[header];
+    size_t latch = 0;
+    if (label->op != IR_OP_LABEL ||
+        !ir_cleanup_label_is_loop_header(label->text)) {
+      continue;
+    }
+    latch = ir_cleanup_loop_latch(function, header, label->text);
+    if (!latch) {
+      continue;
+    }
+    for (size_t i = header + 1; i < latch; i++) {
+      const IRInstruction *ins = &function->instructions[i];
+      if (ins->op == IR_OP_DECLARE_LOCAL &&
+          ins->dest.kind == IR_OPERAND_SYMBOL) {
+        if (detail && detail_size) {
+          snprintf(detail, detail_size,
+                   "declaration of '%s' still inside loop '%s'",
+                   ins->dest.name ? ins->dest.name : "?",
+                   label->text ? label->text : "?");
+        }
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
 static const char *ir_hoist_element_pointer_type(const IRInstruction *mem) {
   if (mem->rhs.kind != IR_OPERAND_INT) {
     return NULL;
