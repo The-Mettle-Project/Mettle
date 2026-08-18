@@ -58,21 +58,6 @@ static long long ir_prefetch_distance_for_loop(const IRFunction *function,
                                           IR_PREFETCH_DEFAULT_DIST);
 }
 
-/* Is `name` written anywhere in [start, end)? Loop-invariant bases must not
- * change between the real access and the look-ahead clone. */
-static int ir_prefetch_symbol_written_in(const IRFunction *function,
-                                         size_t start, size_t end,
-                                         const char *name) {
-  for (size_t i = start; i < end; i++) {
-    const IRInstruction *ins = &function->instructions[i];
-    if (ir_instruction_writes_destination(ins) &&
-        ir_operand_is_symbol_named(&ins->dest, name)) {
-      return 1;
-    }
-  }
-  return 0;
-}
-
 typedef struct {
   size_t indices[IR_PREFETCH_MAX_SLICE];
   size_t count;
@@ -141,7 +126,7 @@ static int ir_prefetch_collect_slice(const IRFunction *function,
       if (strcmp(op->name, iv_symbol) == 0) {
         continue;
       }
-      if (!ir_prefetch_symbol_written_in(function, body_start, body_end,
+      if (!ir_affine_symbol_written_in(function, body_start, body_end,
                                          op->name)) {
         continue; /* loop-invariant base (array pointer, bound, scale) */
       }
@@ -247,53 +232,22 @@ typedef struct {
  * plan's instruction sequence is filled and 1 is returned. */
 static int ir_prefetch_plan_loop(IRFunction *function, size_t header_index,
                                  IRPrefetchPlan *plan) {
-  IRWhileLoopBounds bounds;
-  if (!ir_find_while_loop_bounds(function, header_index, &bounds)) {
+  /* Straight-line body: an early exit or interior branch could make the
+   * cloned B-load read an element the loop never touches. Unit increment +
+   * iv from 0 keeps i+D bounded by n+D with no wrap, and the bound has to
+   * hold still while the loop runs. All read off the shared model. */
+  IRAffineLoop loop;
+  if (!ir_affine_model_loop(function, header_index, &loop) ||
+      !loop.straight_line_body || !loop.unit_step || !loop.starts_at_zero ||
+      !loop.bound_invariant) {
     return 0;
   }
-  const IRInstruction *compare = &function->instructions[bounds.compare_index];
-  if (compare->op != IR_OP_BINARY || compare->is_float || !compare->text ||
-      strcmp(compare->text, "<") != 0 ||
-      compare->lhs.kind != IR_OPERAND_SYMBOL || !compare->lhs.name) {
-    return 0;
-  }
-  if (compare->rhs.kind != IR_OPERAND_SYMBOL &&
-      compare->rhs.kind != IR_OPERAND_INT) {
-    return 0;
-  }
-  const char *iv_symbol = compare->lhs.name;
-  size_t body_start = bounds.branch_index + 1;
-  size_t body_end = bounds.jump_index;
-
-  /* Straight-line body only: an early exit or interior branch could make the
-   * cloned B-load read an element the loop never touches. */
-  for (size_t i = body_start; i < body_end; i++) {
-    IROpcode op = function->instructions[i].op;
-    if (op == IR_OP_LABEL || op == IR_OP_JUMP || op == IR_OP_BRANCH_ZERO ||
-        op == IR_OP_BRANCH_EQ || op == IR_OP_CALL ||
-        op == IR_OP_CALL_INDIRECT || op == IR_OP_PREFETCH) {
-      return 0;
-    }
-  }
-  /* Unit increment + iv from 0 (keeps i+D bounded by n+D, no wrap). */
-  int has_increment = 0;
-  for (size_t i = body_start; i < body_end; i++) {
-    if (ir_try_parse_direct_unit_increment(&function->instructions[i],
-                                           iv_symbol)) {
-      has_increment = 1;
-      break;
-    }
-  }
-  if (!has_increment ||
-      !ir_iv_zero_at_header(function, header_index, iv_symbol)) {
-    return 0;
-  }
-  /* The bound must be loop-invariant. */
-  if (compare->rhs.kind == IR_OPERAND_SYMBOL &&
-      ir_prefetch_symbol_written_in(function, body_start, body_end,
-                                    compare->rhs.name)) {
-    return 0;
-  }
+  const IRInstruction *compare =
+      &function->instructions[loop.bounds.compare_index];
+  const char *iv_symbol = loop.iv;
+  size_t body_start = loop.body_start;
+  size_t body_end = loop.body_end;
+  IRWhileLoopBounds bounds = loop.bounds;
 
   /* Find the indirect load: a LOAD whose address slice contains exactly one
    * interior load and depends on the iv. Take the first such. */

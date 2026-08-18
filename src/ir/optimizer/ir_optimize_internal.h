@@ -173,6 +173,31 @@ typedef struct {
   const char *exit_label;
 } IRWhileLoopBounds;
 
+/* The shared affine loop model (ir_optimize_affine.c): the structural facts
+ * every loop recognizer gates on, computed once per loop. */
+typedef struct {
+  IRWhileLoopBounds bounds;
+  size_t header_index;
+  const char *iv;      /* counter symbol of `while (iv < bound)` */
+  IROperand bound;     /* symbol or integer literal */
+  size_t body_start;   /* first body instruction (after the guard branch) */
+  size_t body_end;     /* the back-edge jump */
+  long long step;      /* counter step when recognized (currently 1) */
+  size_t step_index;   /* the increment instruction when unit_step */
+  int unit_step;       /* body contains `iv = iv + 1` */
+  int starts_at_zero;  /* proven by ir_iv_zero_at_header */
+  int straight_line_body; /* no interior control flow, calls, or prefetch */
+  int bound_invariant; /* bound is a literal or unwritten in the body */
+} IRAffineLoop;
+
+int ir_affine_model_loop(IRFunction *function, size_t header_index,
+                         IRAffineLoop *out);
+int ir_affine_index_decompose(const IRFunction *function, size_t before,
+                              const IROperand *index, const char **name_out,
+                              long long *coeff_out, long long *addend_out);
+int ir_affine_symbol_written_in(const IRFunction *function, size_t start,
+                                size_t end, const char *symbol);
+
 #define IR_PTR_BIND_MAX 4
 
 typedef struct {

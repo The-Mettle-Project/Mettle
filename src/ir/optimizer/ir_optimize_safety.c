@@ -351,43 +351,24 @@ static int safety_prove_constant(const IRFunction *function, size_t check_index,
 }
 
 /* Read an index as `variable + constant`, which is how `a[i]` and `a[i + 2]`
- * both arrive. A bare variable is the same thing with a zero constant. */
+ * both arrive. A bare variable is the same thing with a zero constant. The
+ * decomposition itself is the shared affine one; the elision proofs here
+ * reason about the variable's own bounds, so only the coeff == 1 slice of
+ * the general `coeff * name + addend` form is wanted. */
 static int safety_index_is_affine(const IRFunction *function, size_t before,
                                   const IROperand *index, const char **name_out,
                                   long long *addend_out) {
-  if (index->kind == IR_OPERAND_SYMBOL && index->name) {
-    *name_out = index->name;
-    *addend_out = 0;
-    return 1;
-  }
-  if (index->kind != IR_OPERAND_TEMP || !index->name) {
+  const char *name = NULL;
+  long long coeff = 0;
+  long long addend = 0;
+  if (!ir_affine_index_decompose(function, before, index, &name, &coeff,
+                                 &addend) ||
+      !name || coeff != 1) {
     return 0;
   }
-  const IRInstruction *producer =
-      ir_find_temp_producer_before(function, before, index->name);
-  if (!producer || producer->is_float) {
-    return 0;
-  }
-  if (producer->op == IR_OP_ASSIGN) {
-    return safety_index_is_affine(function, before, &producer->lhs, name_out,
-                                  addend_out);
-  }
-  if (producer->op != IR_OP_BINARY || !producer->text ||
-      producer->lhs.kind != IR_OPERAND_SYMBOL || !producer->lhs.name ||
-      producer->rhs.kind != IR_OPERAND_INT) {
-    return 0;
-  }
-  if (strcmp(producer->text, "+") == 0) {
-    *name_out = producer->lhs.name;
-    *addend_out = producer->rhs.int_value;
-    return 1;
-  }
-  if (strcmp(producer->text, "-") == 0) {
-    *name_out = producer->lhs.name;
-    *addend_out = -producer->rhs.int_value;
-    return 1;
-  }
-  return 0;
+  *name_out = name;
+  *addend_out = addend;
+  return 1;
 }
 
 /* The largest value an index can take, when that follows from the arithmetic

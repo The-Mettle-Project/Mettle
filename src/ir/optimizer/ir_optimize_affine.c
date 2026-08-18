@@ -1,0 +1,205 @@
+#include "ir_optimize_internal.h"
+
+/* ============================================================================
+ * The shared affine loop model.
+ *
+ * Every loop recognizer asks the same questions before it asks its own: is
+ * this a counted `while (iv < bound)` loop, is the body straight-line, does
+ * the counter start at zero and step by one, is the bound loop-invariant, and
+ * is this index an affine function of a symbol. Each recognizer used to
+ * answer them privately, against the exact instruction shapes it happened to
+ * be written for, which is where recognizer rot comes from: the shape
+ * drifts, the private matcher silently stops matching.
+ *
+ * This module answers them once, against the model. A recognizer that
+ * consumes IRAffineLoop matches semantics (a counted loop with these
+ * properties) and keeps only its kernel-specific matching for itself.
+ * ==========================================================================*/
+
+/* True when `symbol` is written anywhere in [start, end). */
+int ir_affine_symbol_written_in(const IRFunction *function, size_t start,
+                                size_t end, const char *symbol) {
+  if (!function || !symbol) {
+    return 1;
+  }
+  for (size_t i = start; i < end && i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ir_instruction_writes_destination(ins) &&
+        ir_operand_is_symbol_named(&ins->dest, symbol)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Model the counted loop whose header label sits at header_index. Fills the
+ * structural facts every recognizer gates on; each is computed once, here,
+ * so a recognizer never re-derives one against its own idea of the shape.
+ * Returns 0 when the loop is not a counted `while (iv < bound)` loop at all.
+ * The boolean facts (straight_line_body, starts_at_zero, bound_invariant,
+ * unit_step) are reported, not required: a recognizer that tolerates an
+ * interior branch reads the model and decides for itself. */
+int ir_affine_model_loop(IRFunction *function, size_t header_index,
+                         IRAffineLoop *out) {
+  if (!function || !out) {
+    return 0;
+  }
+  memset(out, 0, sizeof(*out));
+
+  if (!ir_find_while_loop_bounds(function, header_index, &out->bounds)) {
+    return 0;
+  }
+  out->header_index = header_index;
+
+  const IRInstruction *compare =
+      &function->instructions[out->bounds.compare_index];
+  /* ir_find_while_loop_bounds already proved: integer BINARY `<` with a
+   * symbol lhs feeding the branch. */
+  if (compare->rhs.kind != IR_OPERAND_SYMBOL &&
+      compare->rhs.kind != IR_OPERAND_INT) {
+    return 0;
+  }
+  out->iv = compare->lhs.name;
+  out->bound = compare->rhs;
+  out->body_start = out->bounds.branch_index + 1;
+  out->body_end = out->bounds.jump_index;
+
+  out->straight_line_body = 1;
+  for (size_t i = out->body_start; i < out->body_end; i++) {
+    IROpcode op = function->instructions[i].op;
+    if (op == IR_OP_LABEL || op == IR_OP_JUMP || op == IR_OP_BRANCH_ZERO ||
+        op == IR_OP_BRANCH_EQ || op == IR_OP_CALL ||
+        op == IR_OP_CALL_INDIRECT || op == IR_OP_PREFETCH) {
+      out->straight_line_body = 0;
+      break;
+    }
+  }
+
+  out->unit_step = 0;
+  out->step = 0;
+  for (size_t i = out->body_start; i < out->body_end; i++) {
+    if (ir_try_parse_direct_unit_increment(&function->instructions[i],
+                                           out->iv)) {
+      out->unit_step = 1;
+      out->step = 1;
+      out->step_index = i;
+      break;
+    }
+  }
+
+  out->starts_at_zero =
+      ir_iv_zero_at_header(function, header_index, out->iv) ? 1 : 0;
+  out->bound_invariant =
+      out->bound.kind == IR_OPERAND_INT ||
+      !ir_affine_symbol_written_in(function, out->body_start, out->body_end,
+                                   out->bound.name);
+  return 1;
+}
+
+/* Decompose an index operand as `coeff * name + addend`, following producer
+ * chains: a bare symbol is (1*name + 0), an integer is (0*NULL + c), and
+ * ASSIGN copies, +/- constants, * constants, and << constants compose. This
+ * is the one answer to "is this index affine in something", shared by the
+ * safety elision and any recognizer that reads indices. Depth-capped: an
+ * index that takes more than a handful of steps to decompose is not one of
+ * the shapes anything here optimizes. */
+static int ir_affine_decompose_rec(const IRFunction *function, size_t before,
+                                   const IROperand *index, int depth,
+                                   const char **name_out, long long *coeff_out,
+                                   long long *addend_out) {
+  if (depth > 6) {
+    return 0;
+  }
+  if (index->kind == IR_OPERAND_INT) {
+    *name_out = NULL;
+    *coeff_out = 0;
+    *addend_out = index->int_value;
+    return 1;
+  }
+  if (index->kind == IR_OPERAND_SYMBOL && index->name) {
+    *name_out = index->name;
+    *coeff_out = 1;
+    *addend_out = 0;
+    return 1;
+  }
+  if (index->kind != IR_OPERAND_TEMP || !index->name) {
+    return 0;
+  }
+  const IRInstruction *producer =
+      ir_find_temp_producer_before(function, before, index->name);
+  if (!producer || producer->is_float) {
+    return 0;
+  }
+  if (producer->op == IR_OP_ASSIGN) {
+    return ir_affine_decompose_rec(function, before, &producer->lhs, depth + 1,
+                                   name_out, coeff_out, addend_out);
+  }
+  if (producer->op != IR_OP_BINARY || !producer->text) {
+    return 0;
+  }
+
+  const char *ln = NULL, *rn = NULL;
+  long long lc = 0, la = 0, rc = 0, ra = 0;
+  if (!ir_affine_decompose_rec(function, before, &producer->lhs, depth + 1,
+                               &ln, &lc, &la)) {
+    return 0;
+  }
+  if (!ir_affine_decompose_rec(function, before, &producer->rhs, depth + 1,
+                               &rn, &rc, &ra)) {
+    return 0;
+  }
+
+  if (strcmp(producer->text, "+") == 0) {
+    if (ln && rn) {
+      return 0; /* two symbols: not affine in one */
+    }
+    *name_out = ln ? ln : rn;
+    *coeff_out = lc + rc;
+    *addend_out = la + ra;
+    return 1;
+  }
+  if (strcmp(producer->text, "-") == 0) {
+    if (rn) {
+      return 0; /* subtracting a symbol flips its sign; no consumer wants it */
+    }
+    *name_out = ln;
+    *coeff_out = lc;
+    *addend_out = la - ra;
+    return 1;
+  }
+  if (strcmp(producer->text, "*") == 0) {
+    if (ln && rn) {
+      return 0;
+    }
+    if (rn) { /* const * name */
+      *name_out = rn;
+      *coeff_out = rc * la;
+      *addend_out = ra * la;
+      return 1;
+    }
+    *name_out = ln;
+    *coeff_out = lc * ra;
+    *addend_out = la * ra;
+    return 1;
+  }
+  if (strcmp(producer->text, "<<") == 0) {
+    if (rn || ra < 0 || ra > 32) {
+      return 0;
+    }
+    *name_out = ln;
+    *coeff_out = lc << ra;
+    *addend_out = la << ra;
+    return 1;
+  }
+  return 0;
+}
+
+int ir_affine_index_decompose(const IRFunction *function, size_t before,
+                              const IROperand *index, const char **name_out,
+                              long long *coeff_out, long long *addend_out) {
+  if (!function || !index || !name_out || !coeff_out || !addend_out) {
+    return 0;
+  }
+  return ir_affine_decompose_rec(function, before, index, 0, name_out,
+                                 coeff_out, addend_out);
+}
