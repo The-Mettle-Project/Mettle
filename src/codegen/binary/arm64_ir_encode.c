@@ -1,4 +1,5 @@
 #include "codegen/binary/arm64_ir.h"
+#include "codegen/binary/strength_rules.h"
 #include "codegen/binary_emitter.h"
 #include "codegen/binary_emitter_internal.h"
 
@@ -1281,6 +1282,45 @@ static void lower_binary(Arm64Emit *e, SlotMap *s, const StrSet *fs,
 
   int uns = binary_is_unsigned(us, in);
   Arm64Reg a = load_into(e, s, &in->lhs, R_LHS);
+
+  /* Strength-reduce `x <op> C` through the shared rule table before spending
+   * a mul or a divide. The kinds this backend does not handle fall through to
+   * the general instruction below. Shifting a canonically-extended value is
+   * exact: a multiply agrees with a shift mod 2^64, and an unsigned home
+   * holds its zero-extended value, so lsr and the mask read it directly. */
+  if (in->rhs.kind == IR_OPERAND_INT && op[0] != '\0' && op[1] == '\0') {
+    CgStrengthRewrite rw;
+    if (cg_strength_classify(op[0], in->rhs.int_value, uns, &rw)) {
+      switch (rw.kind) {
+      case CG_SR_MUL_SHL:
+        arm64_emit_word(e, arm64_lsl_imm(1, R_RES, a, rw.shift));
+        store_dest(e, s, &in->dest, R_RES);
+        return;
+      case CG_SR_MUL_SHL_ADD:
+        arm64_emit_word(e, arm64_lsl_imm(1, R_AUX, a, rw.shift));
+        arm64_emit_word(e, arm64_add_reg(1, R_RES, R_AUX, a));
+        store_dest(e, s, &in->dest, R_RES);
+        return;
+      case CG_SR_MUL_SHL_SUB:
+        arm64_emit_word(e, arm64_lsl_imm(1, R_AUX, a, rw.shift));
+        arm64_emit_word(e, arm64_sub_reg(1, R_RES, R_AUX, a));
+        store_dest(e, s, &in->dest, R_RES);
+        return;
+      case CG_SR_UDIV_SHR:
+        arm64_emit_word(e, arm64_lsr_imm(1, R_RES, a, rw.shift));
+        store_dest(e, s, &in->dest, R_RES);
+        return;
+      case CG_SR_UREM_AND:
+        emit_imm(e, R_AUX, (uint64_t)rw.mask);
+        arm64_emit_word(e, arm64_and_reg(1, R_RES, a, R_AUX));
+        store_dest(e, s, &in->dest, R_RES);
+        return;
+      default:
+        break; /* signed pow2 fixups and magic divides keep sdiv/udiv */
+      }
+    }
+  }
+
   Arm64Reg b = load_into(e, s, &in->rhs, R_RHS);
   int cc = cmp_cond(op) < 0 ? -1 : (uns ? cmp_cond_unsigned(op) : cmp_cond(op));
   if (cc >= 0) {

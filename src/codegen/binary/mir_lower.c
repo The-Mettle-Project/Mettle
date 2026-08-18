@@ -1,4 +1,5 @@
 #include "codegen/binary/mir.h"
+#include "codegen/binary/strength_rules.h"
 
 #include "codegen/binary/mir_annotate.h"
 #include "common.h"
@@ -1973,60 +1974,6 @@ static int mir_emit1(MirFunction *fn, MirOpcode op, MirOperand dst,
 
 /* ---- constant-divisor strength reduction (magic multiply) --------------- */
 
-/* Granlund-Montgomery magic number for SIGNED 64-bit division by `d` (|d| >= 2).
- * The divide `n / d` becomes MULHS(n, M) [+/- n] >> s [+ sign bit]. (Hacker's
- * Delight, Fig. 10-1, widened to 64-bit.) */
-static void mir_magic_s64(int64_t d, int64_t *Mout, int *sout) {
-  const uint64_t two63 = 0x8000000000000000ULL;
-  uint64_t ad = (uint64_t)(d < 0 ? -d : d);
-  uint64_t t = two63 + ((uint64_t)d >> 63);
-  uint64_t anc = t - 1 - t % ad; /* |nc| */
-  int p = 63;
-  uint64_t q1 = two63 / anc, r1 = two63 - q1 * anc;
-  uint64_t q2 = two63 / ad, r2 = two63 - q2 * ad;
-  uint64_t delta;
-  do {
-    p++;
-    q1 <<= 1; r1 <<= 1;
-    if (r1 >= anc) { q1++; r1 -= anc; }
-    q2 <<= 1; r2 <<= 1;
-    if (r2 >= ad) { q2++; r2 -= ad; }
-    delta = ad - r2;
-  } while (q1 < delta || (q1 == delta && r1 == 0));
-  int64_t M = (int64_t)(q2 + 1);
-  if (d < 0) M = -M;
-  *Mout = M;
-  *sout = p - 64;
-}
-
-/* Magic number for UNSIGNED 64-bit division by `d` (d >= 1, not a power of two).
- * `*addout` selects the overflow-safe reconstruction. (Hacker's Delight, Fig.
- * 10-3, widened to 64-bit.) */
-static void mir_magic_u64(uint64_t d, uint64_t *Mout, int *sout, int *addout) {
-  const uint64_t two63 = 0x8000000000000000ULL;
-  *addout = 0;
-  uint64_t nc = (uint64_t)(-1) - ((uint64_t)0 - d) % d;
-  int p = 63;
-  uint64_t q1 = two63 / nc, r1 = two63 - q1 * nc;
-  uint64_t q2 = (two63 - 1) / d, r2 = (two63 - 1) - q2 * d;
-  uint64_t delta;
-  do {
-    p++;
-    if (r1 >= nc - r1) { q1 = 2 * q1 + 1; r1 = 2 * r1 - nc; }
-    else { q1 = 2 * q1; r1 = 2 * r1; }
-    if (r2 + 1 >= d - r2) {
-      if (q2 >= two63 - 1) *addout = 1;
-      q2 = 2 * q2 + 1; r2 = 2 * r2 + 1 - d;
-    } else {
-      if (q2 >= two63) *addout = 1;
-      q2 = 2 * q2; r2 = 2 * r2 + 1;
-    }
-    delta = d - 1 - r2;
-  } while (p < 128 && (q1 < delta || (q1 == delta && r1 == 0)));
-  *Mout = q2 + 1;
-  *sout = p - 64;
-}
-
 /* The pooled GP vreg for a loop-invariant 64-bit integer constant, or NONE. */
 static MirVregId mir_iconst_lookup(MirFunction *fn, int64_t value) {
   for (size_t i = 0; i < fn->iconst_count; i++) {
@@ -2080,24 +2027,11 @@ static MirOperand mir_iconst_operand(MirFunction *fn, int64_t value) {
  * mir_emit_const_divmod so the magic can be pre-pooled and hoisted out of a
  * loop. */
 static int mir_divmod_magic(int64_t C, int uns, int64_t *Mout) {
-  if (C == 0 || C == 1 || (!uns && C == -1)) {
-    return 0;
+  CgStrengthRewrite rw;
+  if (!cg_strength_classify('/', C, uns, &rw) || rw.kind != CG_SR_DIV_MAGIC) {
+    return 0; /* trivial or power-of-two divisors lower without a MULHI */
   }
-  uint64_t ad = uns ? (uint64_t)C : (uint64_t)(C < 0 ? -C : C);
-  if ((ad & (ad - 1)) == 0) {
-    return 0; /* power of two -> shift, no MULHI */
-  }
-  if (uns) {
-    uint64_t M;
-    int s, add;
-    mir_magic_u64(ad, &M, &s, &add);
-    *Mout = (int64_t)M;
-  } else {
-    int64_t M;
-    int s;
-    mir_magic_s64(C, &M, &s);
-    *Mout = M;
-  }
+  *Mout = rw.magic;
   return 1;
 }
 
@@ -2180,7 +2114,7 @@ static int mir_emit_const_divmod(MirFunction *fn, MirOperand dst, MirOperand a,
   } else if (uns) {
     uint64_t M;
     int s, add;
-    mir_magic_u64(ad, &M, &s, &add);
+    cg_magic_u64(ad, &M, &s, &add);
     MirVregId tv = mir_new_vreg(fn, MIR_RC_GP, 8);
     if (tv == MIR_VREG_NONE ||
         !mir_emit1(fn, MIR_MULHI, mir_op_vreg(tv), A,
@@ -2209,7 +2143,7 @@ static int mir_emit_const_divmod(MirFunction *fn, MirOperand dst, MirOperand a,
   } else {
     int64_t M;
     int s;
-    mir_magic_s64(C, &M, &s);
+    cg_magic_s64(C, &M, &s);
     if (!mir_emit1(fn, MIR_MULHI, Q, A, mir_iconst_operand(fn, M), 8, 0, 0)) {
       return 0;
     }
