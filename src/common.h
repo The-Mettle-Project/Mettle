@@ -28,6 +28,14 @@ typedef ptrdiff_t ssize_t;
  * thread pointer setup on Linux, so this does not pull in a thread library. */
 #if defined(_MSC_VER)
 #define MTLC_THREAD_LOCAL __declspec(thread)
+#elif defined(_WIN32) && defined(__GNUC__) && !defined(__clang__) && \
+    __GNUC__ >= 16
+/* MSYS2's gcc 16 emits native PE TLS (_tls_index + a loader TLS directory)
+ * with no emutls fallback left. The freestanding host supplies only
+ * __emutls_get_address, and the internal linker builds no TLS directory, so
+ * native TLS cannot link self-contained. Degrade to plain statics: one
+ * compile per process on this toolchain. */
+#define MTLC_THREAD_LOCAL
 #else
 #define MTLC_THREAD_LOCAL __thread
 #endif
