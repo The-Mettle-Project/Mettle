@@ -332,7 +332,8 @@ typedef struct {
   X(SIMD_SLP_MAC_I32, "simd_slp_mac_i32")                                    \
   X(SIMD_SLP_MAC_I8, "simd_slp_mac_i8")                                      \
   X(SIMD_INSERTION_SORT_I32, "simd_insertion_sort_i32")                      \
-  X(SROA, "sroa")
+  X(SROA, "sroa")                                                             \
+  X(EGRAPH_SIMPLIFY, "egraph_simplify")
 
 typedef enum {
 #define IR_OPT_PASS_ENUM(id, name) IR_OPT_PASS_##id,
@@ -829,6 +830,9 @@ int ir_run_named_pass_sequence(IRFunction *function,
                                       size_t pass_count,
                                       const char *failure_message);
 unsigned ir_opt_feature_flags(const IROptFunctionFeatures *features);
+int ir_egraph_simplify_pass(IRFunction *function, int *changed);
+unsigned long long ir_affine_loop_fingerprint(const IRFunction *function,
+                                              const IRAffineLoop *loop);
 /* Worklist driver for a named-pass stage: runs the sequence to a fixpoint
  * with the same version-based redundant-run skipping as ir_run_fixpoint_pass,
  * so a pass re-runs only when the IR changed after it last came back clean.

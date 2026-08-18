@@ -203,3 +203,105 @@ int ir_affine_index_decompose(const IRFunction *function, size_t before,
   return ir_affine_decompose_rec(function, before, index, 0, name_out,
                                  coeff_out, addend_out);
 }
+
+/* ---- loop fingerprint ---------------------------------------------------
+ *
+ * A stable hash of a loop body's dataflow, independent of the names the
+ * frontend happened to generate: symbols and temps hash as their order of
+ * first appearance, and the operands of commutative operators combine
+ * order-free. Two compiles of the same source produce the same fingerprint,
+ * and most refactors that preserve the body's dataflow do too, so CI can
+ * pair fingerprints with --explain claims across compiler versions: a loop
+ * whose fingerprint held still while its claim flipped from vectorized to
+ * scalar is recognizer rot, caught without a benchmark. */
+
+#define IR_FP_MAX_NAMES 160
+
+typedef struct {
+  const char *names[IR_FP_MAX_NAMES];
+  int count;
+} IRFpNames;
+
+static unsigned long long ir_fp_mix(unsigned long long h,
+                                    unsigned long long v) {
+  h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+  return h * 0x100000001b3ull;
+}
+
+static unsigned long long ir_fp_string(const char *s) {
+  unsigned long long h = 0xcbf29ce484222325ull;
+  while (s && *s) {
+    h = (h ^ (unsigned char)*s++) * 0x100000001b3ull;
+  }
+  return h;
+}
+
+static unsigned long long ir_fp_name(IRFpNames *names, const char *name) {
+  for (int i = 0; i < names->count; i++) {
+    if (strcmp(names->names[i], name) == 0) {
+      return (unsigned long long)i + 1;
+    }
+  }
+  if (names->count < IR_FP_MAX_NAMES) {
+    names->names[names->count] = name;
+    return (unsigned long long)(++names->count);
+  }
+  return ir_fp_string(name); /* overflow: still deterministic */
+}
+
+static unsigned long long ir_fp_operand(IRFpNames *names,
+                                        const IROperand *op) {
+  switch (op->kind) {
+  case IR_OPERAND_INT:
+    return ir_fp_mix(2, (unsigned long long)op->int_value);
+  case IR_OPERAND_SYMBOL:
+    return ir_fp_mix(3, op->name ? ir_fp_name(names, op->name) : 0);
+  case IR_OPERAND_TEMP:
+    return ir_fp_mix(5, op->name ? ir_fp_name(names, op->name) : 0);
+  default:
+    return ir_fp_mix(7, (unsigned long long)op->kind);
+  }
+}
+
+static int ir_fp_op_commutative(const IRInstruction *ins) {
+  if (ins->op != IR_OP_BINARY || !ins->text) {
+    return 0;
+  }
+  const char *t = ins->text;
+  return (t[1] == 0 && (t[0] == '+' || t[0] == '*' || t[0] == '&' ||
+                        t[0] == '|' || t[0] == '^')) ||
+         (t[2] == 0 && (strcmp(t, "==") == 0 || strcmp(t, "!=") == 0));
+}
+
+unsigned long long ir_affine_loop_fingerprint(const IRFunction *function,
+                                              const IRAffineLoop *loop) {
+  IRFpNames names;
+  names.count = 0;
+  unsigned long long h = 0xcbf29ce484222325ull;
+  if (!function || !loop) {
+    return 0;
+  }
+  for (size_t i = loop->body_start;
+       i < loop->body_end && i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_NOP) {
+      continue;
+    }
+    h = ir_fp_mix(h, (unsigned long long)ins->op);
+    h = ir_fp_mix(h, (unsigned long long)ins->is_float);
+    if (ins->text) {
+      h = ir_fp_mix(h, ir_fp_string(ins->text));
+    }
+    unsigned long long lh = ir_fp_operand(&names, &ins->lhs);
+    unsigned long long rh = ir_fp_operand(&names, &ins->rhs);
+    if (ir_fp_op_commutative(ins)) {
+      h = ir_fp_mix(h, lh + rh);
+      h = ir_fp_mix(h, lh ^ rh);
+    } else {
+      h = ir_fp_mix(h, lh);
+      h = ir_fp_mix(h, rh);
+    }
+    h = ir_fp_mix(h, ir_fp_operand(&names, &ins->dest));
+  }
+  return h;
+}

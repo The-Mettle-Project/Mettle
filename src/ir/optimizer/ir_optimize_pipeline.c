@@ -174,6 +174,10 @@ static const IROptScheduledPass g_ir_fixpoint_passes[] = {
                        ir_constant_and_branch_simplify_pass),
     IR_OPT_PASS_WHEN_ALL(REASSOCIATE_CONSTANTS, ir_reassociate_constants_pass,
                          IR_OPT_FEATURE_BINARY),
+    /* E-class pilot (METTLE_EGRAPH=1): inert by default; when enabled it
+     * rides this driver's verify snapshot like any other pass. */
+    IR_OPT_PASS_WHEN_ALL(EGRAPH_SIMPLIFY, ir_egraph_simplify_pass,
+                         IR_OPT_FEATURE_BINARY),
     IR_OPT_PASS_WHEN_ALL(COUNT_WORD_STARTS, ir_count_word_starts_pass,
                          IR_OPT_LABEL_JUMP | IR_OPT_FEATURE_BRANCH_ZERO |
                              IR_OPT_FEATURE_LOAD),
@@ -313,8 +317,70 @@ int ir_optimize_pre_inline_function(IRFunction *function) {
       "IR optimization pre-inline pass failed", 0);
 }
 
+/* METTLE_LOOP_FINGERPRINT=1: pair every counted loop's dataflow fingerprint
+ * with whether a recognizer claimed it (its header label is gone after the
+ * stages). CI diffs these lines across compiler versions; a fingerprint that
+ * held still while its claim flipped is recognizer rot. */
+#define IR_FP_MAX_LOOPS 64
+
+typedef struct {
+  const char *label;
+  unsigned long long fp;
+} IRLoopFpEntry;
+
+static int ir_loop_fp_enabled(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    const char *spec = getenv("METTLE_LOOP_FINGERPRINT");
+    cached = (spec && spec[0] != '\0' && strcmp(spec, "0") != 0) ? 1 : 0;
+  }
+  return cached;
+}
+
+static int ir_loop_fp_snapshot(IRFunction *function, IRLoopFpEntry *entries) {
+  int count = 0;
+  for (size_t i = 0; i < function->instruction_count && count < IR_FP_MAX_LOOPS;
+       i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op != IR_OP_LABEL || !ir_label_is_while_header(ins->text)) {
+      continue;
+    }
+    IRAffineLoop loop;
+    if (!ir_affine_model_loop(function, i, &loop)) {
+      continue;
+    }
+    entries[count].label = ins->text;
+    entries[count].fp = ir_affine_loop_fingerprint(function, &loop);
+    count++;
+  }
+  return count;
+}
+
+static void ir_loop_fp_report(const IRFunction *function,
+                              const IRLoopFpEntry *entries, int count) {
+  for (int e = 0; e < count; e++) {
+    int survives = 0;
+    for (size_t i = 0; i < function->instruction_count; i++) {
+      const IRInstruction *ins = &function->instructions[i];
+      if (ins->op == IR_OP_LABEL && ins->text &&
+          strcmp(ins->text, entries[e].label) == 0) {
+        survives = 1;
+        break;
+      }
+    }
+    fprintf(stderr, "[loop-fp] function=%s loop=%s fp=%016llx claimed=%d\n",
+            function->name ? function->name : "<anonymous>", entries[e].label,
+            entries[e].fp, survives ? 0 : 1);
+  }
+}
+
 /* Canonical form (checked fixpoint) -> recognizer worklist -> tail. */
 static int ir_run_post_fixpoint_stages(IRFunction *function) {
+  IRLoopFpEntry fp_entries[IR_FP_MAX_LOOPS];
+  int fp_count = 0;
+  if (ir_loop_fp_enabled()) {
+    fp_count = ir_loop_fp_snapshot(function, fp_entries);
+  }
   mettle_compiler_ctx_set_pass_name("loop canonical form");
   if (!ir_run_named_stage_fixpoint(
           function, g_ir_loop_canonical_passes,
@@ -332,10 +398,16 @@ static int ir_run_post_fixpoint_stages(IRFunction *function) {
     return 0;
   }
   mettle_compiler_ctx_set_pass_name("post-recognizer tail");
-  return ir_run_named_stage_fixpoint(
-      function, g_ir_post_recognizer_tail,
-      IR_ARRAY_COUNT(g_ir_post_recognizer_tail), 1, "post-recognizer tail",
-      "IR optimization pass failed", 0);
+  if (!ir_run_named_stage_fixpoint(
+          function, g_ir_post_recognizer_tail,
+          IR_ARRAY_COUNT(g_ir_post_recognizer_tail), 1, "post-recognizer tail",
+          "IR optimization pass failed", 0)) {
+    return 0;
+  }
+  if (fp_count > 0) {
+    ir_loop_fp_report(function, fp_entries, fp_count);
+  }
+  return 1;
 }
 
 static int ir_scheduled_pass_is_enabled(const IROptScheduledPass *pass,
