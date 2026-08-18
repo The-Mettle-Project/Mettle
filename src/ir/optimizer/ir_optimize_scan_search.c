@@ -387,12 +387,13 @@ static int ir_try_vectorize_simd_minmax_i32_at(IRFunction *function,
   long long iv_start = 0;
   IRInstruction fused = {0};
 
-  if (!function || !ir_find_while_loop_bounds(function, header_index, &bounds)) {
-    return 1;
-  }
-  if (ir_loop_body_is_unclaimable(function, bounds.branch_index + 1,
-                                    bounds.jump_index)) {
-    return 1;
+  {
+    IRAffineLoop loop;
+    if (!function || !ir_affine_model_loop(function, header_index, &loop) ||
+        loop.body_unclaimable) {
+      return 1;
+    }
+    bounds = loop.bounds;
   }
 
   compare = &function->instructions[bounds.compare_index];
@@ -506,12 +507,13 @@ static int ir_try_fuse_prefix_sum_i32_at(IRFunction *function,
   long long iv_start = 0;
   IRInstruction fused = {0};
 
-  if (!function || !ir_find_while_loop_bounds(function, header_index, &bounds)) {
-    return 1;
-  }
-  if (ir_loop_body_is_unclaimable(function, bounds.branch_index + 1,
-                                    bounds.jump_index)) {
-    return 1;
+  {
+    IRAffineLoop loop;
+    if (!function || !ir_affine_model_loop(function, header_index, &loop) ||
+        loop.body_unclaimable) {
+      return 1;
+    }
+    bounds = loop.bounds;
   }
 
   compare = &function->instructions[bounds.compare_index];
@@ -684,12 +686,13 @@ static int ir_try_vectorize_simd_minmax_ptr_at(IRFunction *function,
   const char *maxv_symbol = NULL;
   IRInstruction fused = {0};
 
-  if (!function || !ir_find_while_loop_bounds(function, header_index, &bounds)) {
-    return 1;
-  }
-  if (ir_loop_body_is_unclaimable(function, bounds.branch_index + 1,
-                                    bounds.jump_index)) {
-    return 1;
+  {
+    IRAffineLoop loop;
+    if (!function || !ir_affine_model_loop(function, header_index, &loop) ||
+        loop.body_unclaimable) {
+      return 1;
+    }
+    bounds = loop.bounds;
   }
 
   compare = &function->instructions[bounds.compare_index];
@@ -747,12 +750,13 @@ static int ir_try_fuse_prefix_sum_ptr_at(IRFunction *function,
   IROperand len = {0};
   IRInstruction fused = {0};
 
-  if (!function || !ir_find_while_loop_bounds(function, header_index, &bounds)) {
-    return 1;
-  }
-  if (ir_loop_body_is_unclaimable(function, bounds.branch_index + 1,
-                                    bounds.jump_index)) {
-    return 1;
+  {
+    IRAffineLoop loop;
+    if (!function || !ir_affine_model_loop(function, header_index, &loop) ||
+        loop.body_unclaimable) {
+      return 1;
+    }
+    bounds = loop.bounds;
   }
 
   compare = &function->instructions[bounds.compare_index];

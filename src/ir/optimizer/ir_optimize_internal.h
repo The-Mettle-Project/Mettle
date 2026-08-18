@@ -188,6 +188,9 @@ typedef struct {
   int starts_at_zero;  /* proven by ir_iv_zero_at_header */
   int straight_line_body; /* no interior control flow, calls, or prefetch */
   int bound_invariant; /* bound is a literal or unwritten in the body */
+  /* Body holds a nested loop or a --safe check, so a recognizer that replaced
+   * it wholesale would delete instructions the shape does not account for. */
+  int body_unclaimable;
 } IRAffineLoop;
 
 int ir_affine_model_loop(IRFunction *function, size_t header_index,

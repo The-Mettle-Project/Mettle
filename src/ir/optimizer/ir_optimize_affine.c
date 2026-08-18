@@ -87,6 +87,18 @@ int ir_affine_model_loop(IRFunction *function, size_t header_index,
     }
   }
 
+  /* Is the body off limits to a recognizer that would replace it wholesale?
+   * A nested loop is the long-standing reason; a --safe check is the one that
+   * matters more, because a recognizer that matched anyway would erase the
+   * check along with the body and leave the program unchecked in exactly the
+   * hot loop the mode exists to cover. Every recognizer had to remember to
+   * ask this separately, and forgetting it is silent. Asking it here means a
+   * recognizer reading the model has the answer in front of it. */
+  out->body_unclaimable =
+      ir_loop_body_is_unclaimable(function, out->body_start, out->body_end)
+          ? 1
+          : 0;
+
   out->starts_at_zero =
       ir_iv_zero_at_header(function, header_index, out->iv) ? 1 : 0;
   out->bound_invariant =
@@ -94,6 +106,67 @@ int ir_affine_model_loop(IRFunction *function, size_t header_index,
       !ir_affine_symbol_written_in(function, out->body_start, out->body_end,
                                    out->bound.name);
   return 1;
+}
+
+/* Overflow-checked composition of the decomposition arithmetic.
+ *
+ * These matter more than they look. The safe-mode elision consumes the
+ * result to decide a bounds check is unnecessary, so a coefficient that
+ * wrapped is not a missed optimization, it is a check removed on the strength
+ * of a wrong number. Signed overflow is also undefined, which means the
+ * compiler building THIS compiler is entitled to assume it never happens.
+ * Every composition below refuses rather than wraps, and refusing costs only
+ * the optimization. */
+static int ir_affine_add(long long a, long long b, long long *out) {
+  if ((b > 0 && a > LLONG_MAX - b) || (b < 0 && a < LLONG_MIN - b)) {
+    return 0;
+  }
+  *out = a + b;
+  return 1;
+}
+
+static int ir_affine_sub(long long a, long long b, long long *out) {
+  if ((b < 0 && a > LLONG_MAX + b) || (b > 0 && a < LLONG_MIN + b)) {
+    return 0;
+  }
+  *out = a - b;
+  return 1;
+}
+
+static int ir_affine_mul(long long a, long long b, long long *out) {
+  if (a == 0 || b == 0) {
+    *out = 0;
+    return 1;
+  }
+  if (a == -1) {
+    if (b == LLONG_MIN) {
+      return 0;
+    }
+    *out = -b;
+    return 1;
+  }
+  if (b == -1) {
+    if (a == LLONG_MIN) {
+      return 0;
+    }
+    *out = -a;
+    return 1;
+  }
+  if (a > 0 ? (b > 0 ? a > LLONG_MAX / b : b < LLONG_MIN / a)
+            : (b > 0 ? a < LLONG_MIN / b : a < LLONG_MAX / b)) {
+    return 0;
+  }
+  *out = a * b;
+  return 1;
+}
+
+/* Left shift of a negative value is undefined, so this routes through the
+ * multiply rather than shifting. */
+static int ir_affine_shl(long long a, long long s, long long *out) {
+  if (s < 0 || s > 62) {
+    return 0;
+  }
+  return ir_affine_mul(a, 1LL << s, out);
 }
 
 /* Decompose an index operand as `coeff * name + addend`, following producer
@@ -153,18 +226,22 @@ static int ir_affine_decompose_rec(const IRFunction *function, size_t before,
     if (ln && rn) {
       return 0; /* two symbols: not affine in one */
     }
+    if (!ir_affine_add(lc, rc, coeff_out) ||
+        !ir_affine_add(la, ra, addend_out)) {
+      return 0;
+    }
     *name_out = ln ? ln : rn;
-    *coeff_out = lc + rc;
-    *addend_out = la + ra;
     return 1;
   }
   if (strcmp(producer->text, "-") == 0) {
     if (rn) {
       return 0; /* subtracting a symbol flips its sign; no consumer wants it */
     }
+    if (!ir_affine_sub(la, ra, addend_out)) {
+      return 0;
+    }
     *name_out = ln;
     *coeff_out = lc;
-    *addend_out = la - ra;
     return 1;
   }
   if (strcmp(producer->text, "*") == 0) {
@@ -172,23 +249,29 @@ static int ir_affine_decompose_rec(const IRFunction *function, size_t before,
       return 0;
     }
     if (rn) { /* const * name */
+      if (!ir_affine_mul(rc, la, coeff_out) ||
+          !ir_affine_mul(ra, la, addend_out)) {
+        return 0;
+      }
       *name_out = rn;
-      *coeff_out = rc * la;
-      *addend_out = ra * la;
       return 1;
     }
-    *name_out = ln;
-    *coeff_out = lc * ra;
-    *addend_out = la * ra;
-    return 1;
-  }
-  if (strcmp(producer->text, "<<") == 0) {
-    if (rn || ra < 0 || ra > 32) {
+    if (!ir_affine_mul(lc, ra, coeff_out) ||
+        !ir_affine_mul(la, ra, addend_out)) {
       return 0;
     }
     *name_out = ln;
-    *coeff_out = lc << ra;
-    *addend_out = la << ra;
+    return 1;
+  }
+  if (strcmp(producer->text, "<<") == 0) {
+    if (rn) {
+      return 0;
+    }
+    if (!ir_affine_shl(lc, ra, coeff_out) ||
+        !ir_affine_shl(la, ra, addend_out)) {
+      return 0;
+    }
+    *name_out = ln;
     return 1;
   }
   return 0;
