@@ -1822,6 +1822,20 @@ int mir_function_is_eligible(CodeGenerator *generator,
         return mir_trace_bail(ir_function, "prefetch:addr");
       }
       break;
+    case IR_OP_ROTATE_ADD:
+      /* next = a + b; a = b; b = next. Writes lhs and rhs too, which the
+       * written-global tracking only covers for dest, so a and b must be
+       * locals/params. */
+      if (in->dest.kind != IR_OPERAND_SYMBOL ||
+          in->lhs.kind != IR_OPERAND_SYMBOL ||
+          in->rhs.kind != IR_OPERAND_SYMBOL || in->is_float ||
+          !mir_local_or_param_type(generator, ir_function, in->lhs.name,
+                                   NULL) ||
+          !mir_local_or_param_type(generator, ir_function, in->rhs.name,
+                                   NULL)) {
+        return 0;
+      }
+      break;
     case IR_OP_NEW:
       /* Zeroed heap allocation: size is a compile-time INT, absent (defaults
        * to 8), or a runtime GP value; the result pointer lands in a
@@ -3775,6 +3789,23 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
     }
     return mir_emit1(fn, MIR_MOV, dest, mir_op_vreg(res_r), mir_op_none(), 8, 0,
                      0);
+  }
+
+  case IR_OP_ROTATE_ADD: {
+    MirOperand next = mir_value_operand(fn, g, ctx, map, &in->dest);
+    MirOperand a = mir_value_operand(fn, g, ctx, map, &in->lhs);
+    MirOperand b = mir_value_operand(fn, g, ctx, map, &in->rhs);
+    if (!mir_emit1(fn, MIR_ADD, next, a, b, 8, 0, 0)) {
+      return 0;
+    }
+    int signed_home = 0;
+    int cw = mir_dest_integer_narrow_width(g, ctx, &in->dest, &signed_home);
+    if (cw && !mir_emit1(fn, signed_home ? MIR_MOVSX : MIR_MOVZX, next, next,
+                         mir_op_none(), cw, !signed_home, 0)) {
+      return 0;
+    }
+    return mir_emit1(fn, MIR_MOV, a, b, mir_op_none(), 8, 0, 0) &&
+           mir_emit1(fn, MIR_MOV, b, next, mir_op_none(), 8, 0, 0);
   }
 
   case IR_OP_NEW: {

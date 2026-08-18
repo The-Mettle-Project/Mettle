@@ -104,6 +104,19 @@ static const MirIrKernel kMirIrKernels[] = {
      code_generator_binary_emit_simd_vloop_unmarshaled, 0},
     {IR_OP_SIMD_VLOOP_I32, "simd_vloop_i32",
      code_generator_binary_emit_simd_vloop_unmarshaled, 0},
+
+    /* Audited load-prologue/store-epilogue kernels within ymm0-5 + volatile
+     * GPs. insertion_sort stores nothing back by name (it sorts through a
+     * pointer), which is fine: the bridge's read-back of an input slot is a
+     * no-op. */
+    {IR_OP_SIMD_INSERTION_SORT_I32, "simd_insertion_sort_i32",
+     code_generator_binary_emit_simd_insertion_sort_i32, 0},
+    {IR_OP_SIMD_I2F_REDUCE_F64, "simd_i2f_reduce_f64",
+     code_generator_binary_emit_simd_i2f_reduce_f64, 0},
+    {IR_OP_SIMD_EXP_F32, "simd_exp_f32",
+     code_generator_binary_emit_simd_exp_f32, 0},
+    {IR_OP_SIMD_OUTER_LANE_F64, "simd_outer_lane_f64",
+     code_generator_binary_emit_simd_outer_lane_f64, 0},
 };
 
 #define MIR_IR_KERNEL_COUNT \
