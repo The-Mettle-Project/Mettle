@@ -812,24 +812,25 @@ $cases = @(
   },
   @{
     # Every gate reason code has to reach the reader as a sentence about their
-    # code. `vloop:reduce` used to print as "declined by the eligibility gate
-    # (reason code: vloop:shape)", which names nothing anyone can act on. It
-    # must say which shape, name the loop, and -- on a function this small --
-    # say plainly that the spills are not worth chasing.
+    # code, never a bare "reason code:". Vectorized reductions and
+    # scalar-reading maps now run through the allocator's kernel bridge, so
+    # freduce64 must report as vectorized with no gate remark at all; the
+    # float-stack-param reason still bails and must render as its sentence
+    # with its fix.
     Name          = "explain_backend_gate_reasons"
     Path          = "tests/test_vloop_general.mettle"
     ShouldSucceed = $true
     Args          = @("--release", "--explain=freduce64")
     Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
     OutputMustMatch = @(
-      "contains a vectorized '\+' reduction \(``s = s \+ expr``\); the allocator's inline passthrough covers element-wise maps only",
-      'freduce64 \(\d+, loop @ line \d+\)',
-      'note: nothing worth doing at this size',
-      # a large fallback in another function keeps its actionable fix
-      'fix: move the vectorized loop into a function of its own'
+      "freduce64 \(loop @ line \d+\): vectorized -> 4-wide float64 '\+' reduction",
+      'takes a float argument past the register-argument slots',
+      'fix: pass the floats in a struct, or reorder the parameters',
+      'fmap32_ref \(\d+\)'
     )
     OutputMustNotMatch = @(
       'reason code: vloop',
+      "covers element-wise maps only",
       # the plan honours the selector: main's fallback is not what was asked for
       'spills main'
     )

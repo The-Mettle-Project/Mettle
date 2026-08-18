@@ -780,6 +780,7 @@ int code_generator_binary_emit_simd_affine_map_f64( CodeGenerator *generator, Bi
 int code_generator_binary_emit_simd_affine_map_f32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_i2f_reduce_f64( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_vloop_f64( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction, int operands_marshaled);
+int code_generator_binary_emit_simd_vloop_unmarshaled( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 /* Distinct base operands of a vloop in kGp order; shared by the kernel and the
  * MIR passthrough lowering. names/srcs must hold VLOOP_KERNEL_MAX_BASES (4). */
 int code_generator_vloop_collect_dist(const IRInstruction *in, int is_reduce, const char *names[4], const IROperand *srcs[4], int *n_out);

@@ -2051,14 +2051,10 @@ int mir_function_is_eligible(CodeGenerator *generator,
     }
     case IR_OP_SIMD_VLOOP_I32:
     case IR_OP_SIMD_VLOOP_F64: {
-      /* Inline general-vectorized-loop passthrough, for MAPS of any lane width.
-       * The DAG is carried by reference at lowering; here we only gate the
-       * marshalling: a map (not a reduction) and <=3 distinct base pointers, so
-       * the element count still fits in an ABI arg register (RCX/RDX/R8/R9)
-       * alongside them. The kernel emitter reads the lane kind off the opcode
-       * and float_bits, so f64x4, f32x8, i32x8 and byte elements all share this
-       * path. Reductions stay in the fallback: their result lands in an
-       * accumulator this marshalling does not carry back. */
+      /* Inline general-vectorized-loop passthrough. Maps marshal <=3 distinct
+       * base pointers + count through RCX/RDX/R8/R9; reductions go through
+       * the generic kernel bridge (staged frame slots), which also carries
+       * their accumulator and any invariant scalars. */
       const char *vnames[4];
       const IROperand *vsrcs[4];
       const int vi32 = (in->op == IR_OP_SIMD_VLOOP_I32);
@@ -2066,25 +2062,33 @@ int mir_function_is_eligible(CodeGenerator *generator,
       if (in->argument_count < 7 || !in->arguments) {
         return mir_trace_bail(ir_function, "vloop:shape");
       }
-      /* Split by cause: --explain can name the source construct behind an
-       * uncovered shape only if the gate says which one it was. */
-      if (in->arguments[0].int_value != 0 /* reduce_op: maps only */) {
-        return mir_trace_bail(ir_function, "vloop:reduce");
-      }
       if (vi32 ? (in->float_bits != 32 && in->float_bits != 8)
                : (in->float_bits != 64 && in->float_bits != 32)) {
         return mir_trace_bail(ir_function, "vloop:width");
       }
-      /* A runtime invariant scalar is broadcast by reading the symbol from its
-       * stack home, and an allocated frame need never have written one. Only
-       * the bases and the count are marshalled through registers, so a DAG that
-       * reads a scalar by name belongs in the fallback until they are too. */
-      if (in->arguments[5].int_value != 0) {
-        return mir_trace_bail(ir_function, "vloop:scalars");
-      }
-      if (code_generator_vloop_collect_dist(in, 0, vnames, vsrcs, &vn) < 0 ||
-          vn > 3) {
-        return mir_trace_bail(ir_function, "vloop:bases");
+      /* Reductions, scalar-reading DAGs, and 4-base maps run through the
+       * generic kernel bridge (staged slots); plain maps with <=3 bases take
+       * the marshalled fast path. */
+      {
+        const int vreduce = in->arguments[0].int_value != 0;
+        int bridge = vreduce || in->arguments[5].int_value != 0;
+        if (!vreduce) {
+          if (code_generator_vloop_collect_dist(in, 0, vnames, vsrcs, &vn) <
+              0) {
+            return mir_trace_bail(ir_function, "vloop:bases");
+          }
+          if (vn > 3) {
+            bridge = 1;
+          }
+        }
+        if (bridge) {
+          int slots = mir_kernel_slot_estimate(in);
+          if (slots < 0 || slots > MIR_KERNEL_MAX_SLOTS) {
+            return mir_trace_bail(ir_function,
+                                  vreduce ? "vloop:reduce" : "vloop:scalars");
+          }
+          break;
+        }
       }
       for (int vk = 0; vk < vn; vk++) {
         if (!vsrcs[vk] || (vsrcs[vk]->kind != IR_OPERAND_TEMP &&
@@ -4696,6 +4700,21 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
 
   case IR_OP_SIMD_VLOOP_I32:
   case IR_OP_SIMD_VLOOP_F64: {
+    {
+      int bridge = in->argument_count > 5 &&
+                   (in->arguments[0].int_value != 0 ||
+                    in->arguments[5].int_value != 0);
+      if (!bridge) {
+        const char *bn[4];
+        const IROperand *bs[4];
+        int bvn = 0;
+        bridge = code_generator_vloop_collect_dist(in, 0, bn, bs, &bvn) >= 0 &&
+                 bvn > 3;
+      }
+      if (bridge) {
+        return mir_lower_ir_kernel(fn, g, ctx, map, in);
+      }
+    }
     /* Inline general vloop (any lane width, maps only): marshal the <=3 distinct
      * base pointers into RCX/RDX/R8/R9 (kGp order, matching the kernel's dist)
      * and the element count into the next arg register; the kernel reads its DAG

@@ -821,6 +821,15 @@ int code_generator_vloop_collect_dist(const IRInstruction *in, int is_reduce,
   return 0;
 }
 
+/* Table-shaped entry for the MIR kernel bridge: reductions run against staged
+ * frame slots (operands_marshaled=0), unlike the map passthrough. */
+int code_generator_binary_emit_simd_vloop_unmarshaled(
+    CodeGenerator *generator, BinaryFunctionContext *context,
+    const IRInstruction *instruction) {
+  return code_generator_binary_emit_simd_vloop_f64(generator, context,
+                                                   instruction, 0);
+}
+
 int code_generator_binary_emit_simd_vloop_f64(
     CodeGenerator *generator, BinaryFunctionContext *context,
     const IRInstruction *instruction, int operands_marshaled) {

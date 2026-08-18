@@ -96,6 +96,14 @@ static const MirIrKernel kMirIrKernels[] = {
     /* Block move. */
     {IR_OP_MEMCPY_INLINE, "memcpy_inline",
      code_generator_binary_emit_memcpy_inline, 0},
+
+    /* Vloop REDUCTIONS only (maps take the marshalled MIR_SIMD_VLOOP path;
+     * the explicit gate/lowering cases route by reduce_op). Registers: ymm0-5,
+     * kGp + R10/R11/RAX -- all volatile. */
+    {IR_OP_SIMD_VLOOP_F64, "simd_vloop_f64",
+     code_generator_binary_emit_simd_vloop_unmarshaled, 0},
+    {IR_OP_SIMD_VLOOP_I32, "simd_vloop_i32",
+     code_generator_binary_emit_simd_vloop_unmarshaled, 0},
 };
 
 #define MIR_IR_KERNEL_COUNT \
