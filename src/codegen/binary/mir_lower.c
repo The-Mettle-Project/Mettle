@@ -824,6 +824,17 @@ static int mir_name_is_global_aggregate(CodeGenerator *g,
          !code_generator_binary_symbol_is_scalar_accessible(g, name);
 }
 
+/* True if NAME is a string-typed LOCAL (not a by-ref param). Under the
+ * backend's string convention an 8-byte string VALUE is a pointer to the
+ * {chars,length} record, so a string local used by value yields the ADDRESS
+ * of its 16-byte home (the fallback's emit_operand_load does the same LEA). */
+static int mir_name_is_string_local(CodeGenerator *g, const IRFunction *irf,
+                                    const char *name) {
+  int is_param = 0;
+  MtlcType *t = mir_local_or_param_type(g, irf, name, &is_param);
+  return t && !is_param && t->kind == MTLC_TYPE_STRING;
+}
+
 /* An operand that can SOURCE an INDIRECT (by-value) aggregate copy: a struct
  * LOCAL or struct TEMP (LEA-able home), a by-ref aggregate PARAM (its value is
  * the address), a global aggregate (RIP-relative LEA; memory authoritative),
@@ -1592,12 +1603,11 @@ int mir_function_is_eligible(CodeGenerator *generator,
         int allowed =
             (in->op == IR_OP_DECLARE_LOCAL && o == &in->dest) ||
             (in->op == IR_OP_ADDRESS_OF && o == &in->lhs) ||
-            /* `return @local` copies from the local's home; `return @p` of a
-             * by-ref param copies from the address the param holds. */
+            /* RETURN copies from any supported indirect source: a local or
+             * temp home, a by-ref param's pointee, or a global aggregate. */
             (in->op == IR_OP_RETURN && o == &in->lhs &&
-             (mir_name_is_indirect_struct_local(generator, ir_function,
-                                                o->name) ||
-              mir_name_is_indirect_param(generator, ir_function, o->name))) ||
+             mir_indirect_source_is_supported(generator, ir_function,
+                                              &in->lhs)) ||
             /* `@local = f()` for a struct-returning callee: the call writes the
              * struct directly into the dest local's home via the hidden return
              * pointer (mir_call_is_supported validates the callee returns
@@ -1611,7 +1621,21 @@ int mir_function_is_eligible(CodeGenerator *generator,
              mir_operand_struct_home_size(generator, ir_function, &in->dest) >
                  0 &&
              mir_indirect_source_is_supported(generator, ir_function,
-                                              &in->lhs));
+                                              &in->lhs)) ||
+            /* An 8-byte string VALUE is a record pointer: storing a string
+             * local stores its home's address, storing a by-ref param stores
+             * the pointer it holds (both mirror emit_operand_load). */
+            (in->op == IR_OP_STORE && o == &in->lhs &&
+             in->rhs.kind == IR_OPERAND_INT && in->rhs.int_value == 8 &&
+             (mir_name_is_string_local(generator, ir_function, o->name) ||
+              mir_name_is_indirect_param(generator, ir_function, o->name))) ||
+            /* `@s <- *addr [8]` with a string dest: the loaded pointer is
+             * deref-copied into the local's home (a by-ref param dest just
+             * takes the pointer as its new value). */
+            (in->op == IR_OP_LOAD && o == &in->dest &&
+             in->rhs.kind == IR_OPERAND_INT && in->rhs.int_value == 8 &&
+             (mir_name_is_string_local(generator, ir_function, o->name) ||
+              mir_name_is_indirect_param(generator, ir_function, o->name)));
         if (!allowed) {
           return mir_trace_bail(ir_function, "indirect_agg_byname");
         }
@@ -1837,17 +1861,13 @@ int mir_function_is_eligible(CodeGenerator *generator,
           in->lhs.kind != IR_OPERAND_SYMBOL && in->lhs.kind != IR_OPERAND_INT) {
         return 0;
       }
-      /* An INDIRECT-returning function handles `return @struct_local` (copy
-       * from the local's home into the hidden slot) and `return @p` of a
-       * by-ref param (copy through the param's pointer). Other shapes (a
-       * struct temp, a struct-returning call result) defer to the fallback. */
+      /* An INDIRECT-returning function returns anything the indirect-copy
+       * machinery can source: a struct LOCAL or TEMP home (a call result
+       * lands in the temp's home via the hidden pointer), a by-ref param's
+       * pointee, a global aggregate, or a string literal. */
       if (mir_type_is_indirect_aggregate(generator,
                                          ir_function->return_type_name) &&
-          !(in->lhs.kind == IR_OPERAND_SYMBOL &&
-            (mir_name_is_indirect_struct_local(generator, ir_function,
-                                               in->lhs.name) ||
-             mir_name_is_indirect_param(generator, ir_function,
-                                        in->lhs.name)))) {
+          !mir_indirect_source_is_supported(generator, ir_function, &in->lhs)) {
         return mir_trace_bail(ir_function, "return:indirect_nonlocal");
       }
       break;
@@ -3606,13 +3626,46 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
       return mir_emit1(fn, MIR_LEA_CSTR, dst, mir_op_symbol(s), mir_op_none(),
                        8, 0, 0);
     }
-    MirOperand dst = mir_value_operand(fn, g, ctx, map, &in->dest);
     MirOperand addr = mir_address_operand(fn, g, ctx, map, &in->lhs);
     int size = code_generator_binary_get_access_size(g, ctx, &in->rhs);
     if (size <= 0 || addr.kind != MIR_OPK_VREG) {
       fn->has_error = 1;
       return 0;
     }
+    /* `@s <- *addr [8]` with a string-local dest: the loaded 8 bytes are a
+     * record POINTER (the backend's string value convention); deref-copy the
+     * 16-byte record into the local's home, mirroring the fallback's
+     * emit_local_string_store. */
+    if (size == 8 && in->dest.kind == IR_OPERAND_SYMBOL && in->dest.name) {
+      const IRFunction *lirf =
+          ctx && ctx->function_name
+              ? code_generator_find_ir_function_binary(g, ctx->function_name)
+              : NULL;
+      if (mir_name_is_string_local(g, lirf, in->dest.name)) {
+        MirVregId ptr = mir_new_vreg(fn, MIR_RC_GP, 8);
+        MirOperand dsym = mir_value_operand(fn, g, ctx, map, &in->dest);
+        if (ptr == MIR_VREG_NONE || dsym.kind != MIR_OPK_VREG) {
+          fn->has_error = 1;
+          return 0;
+        }
+        fn->vregs[dsym.vreg].address_taken = 1;
+        if (fn->vregs[dsym.vreg].home_bytes < 16) {
+          fn->vregs[dsym.vreg].home_bytes = 16;
+        }
+        MirVregId db = mir_new_vreg(fn, MIR_RC_GP, 8);
+        if (db == MIR_VREG_NONE ||
+            !mir_emit1(fn, MIR_MOV, mir_op_vreg(ptr),
+                       mir_op_mem_vreg(addr.vreg, MIR_VREG_NONE, 1, 0),
+                       mir_op_none(), 8, 1, 0) ||
+            !mir_emit1(fn, MIR_LEA_LOCAL, mir_op_vreg(db), dsym, mir_op_none(),
+                       8, 0, 0) ||
+            !mir_emit_struct_copy(fn, db, ptr, 16)) {
+          return 0;
+        }
+        return 1;
+      }
+    }
+    MirOperand dst = mir_value_operand(fn, g, ctx, map, &in->dest);
     MirOperand mem = mir_op_mem_vreg(addr.vreg, MIR_VREG_NONE, 1, 0);
     if (in->is_float) {
       int fb = code_generator_binary_instruction_result_float_bits(g, ctx, in);
@@ -3649,6 +3702,30 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
       MirOperand fval =
           coerce_float_operand(fn, g, ctx, map, &in->lhs, size);
       return mir_emit_fmov(fn, mem, fval, size);
+    }
+    /* `*addr <- @s [8]` with a string-local value: the stored 8 bytes are the
+     * local's home ADDRESS (a record pointer, the string value convention). A
+     * by-ref param's plain vreg already holds its pointer, so it takes the
+     * generic path below. */
+    if (size == 8 &&
+        (in->lhs.kind == IR_OPERAND_SYMBOL || in->lhs.kind == IR_OPERAND_TEMP) &&
+        in->lhs.name) {
+      const IRFunction *sirf =
+          ctx && ctx->function_name
+              ? code_generator_find_ir_function_binary(g, ctx->function_name)
+              : NULL;
+      int hsz = (in->lhs.kind == IR_OPERAND_SYMBOL)
+                    ? (mir_name_is_string_local(g, sirf, in->lhs.name) ? 16 : 0)
+                    : mir_struct_temp_size(g, sirf, in->lhs.name);
+      if (hsz > 0) {
+        MirVregId sb =
+            mir_emit_indirect_source_addr(fn, g, ctx, map, sirf, &in->lhs, hsz);
+        if (sb == MIR_VREG_NONE) {
+          return 0;
+        }
+        return mir_emit1(fn, MIR_MOV, mem, mir_op_vreg(sb), mir_op_none(), 8, 0,
+                         0);
+      }
     }
     MirOperand val = mir_value_operand(fn, g, ctx, map, &in->lhs);
     return mir_emit1(fn, MIR_MOV, mem, val, mir_op_none(), size, 0, 0);
@@ -3740,7 +3817,8 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
   }
 
   case IR_OP_RETURN: {
-    if (fn->returns_indirect && in->lhs.kind == IR_OPERAND_SYMBOL) {
+    if (fn->returns_indirect && (in->lhs.kind == IR_OPERAND_SYMBOL ||
+                                 in->lhs.kind == IR_OPERAND_TEMP)) {
       /* INDIRECT struct return: copy the struct into the caller's hidden slot
        * (whose pointer the prologue homed into indirect_return_vreg), then
        * leave that pointer in RAX as the Win64/SysV ABI requires. The source
@@ -5433,13 +5511,59 @@ static int mir_lower_folded_access(MirFunction *fn, CodeGenerator *g,
     fn->has_error = 1;
     return 0;
   }
+  /* String value convention (same as the unfolded LOAD/STORE paths): an
+   * 8-byte string value is a record pointer, so a string-local dest deref-
+   * copies and a string-local source stores its home's address. */
+  const IRFunction *sirf =
+      ctx && ctx->function_name
+          ? code_generator_find_ir_function_binary(g, ctx->function_name)
+          : NULL;
   if (in->op == IR_OP_LOAD) {
+    if (size == 8 && in->dest.kind == IR_OPERAND_SYMBOL && in->dest.name &&
+        mir_name_is_string_local(g, sirf, in->dest.name)) {
+      MirVregId ptr = mir_new_vreg(fn, MIR_RC_GP, 8);
+      MirOperand dsym = mir_value_operand(fn, g, ctx, map, &in->dest);
+      if (ptr == MIR_VREG_NONE || dsym.kind != MIR_OPK_VREG) {
+        fn->has_error = 1;
+        return 0;
+      }
+      fn->vregs[dsym.vreg].address_taken = 1;
+      if (fn->vregs[dsym.vreg].home_bytes < 16) {
+        fn->vregs[dsym.vreg].home_bytes = 16;
+      }
+      MirVregId db = mir_new_vreg(fn, MIR_RC_GP, 8);
+      if (db == MIR_VREG_NONE ||
+          !mir_emit1(fn, MIR_MOV, mir_op_vreg(ptr), mem, mir_op_none(), 8, 1,
+                     0) ||
+          !mir_emit1(fn, MIR_LEA_LOCAL, mir_op_vreg(db), dsym, mir_op_none(), 8,
+                     0, 0) ||
+          !mir_emit_struct_copy(fn, db, ptr, 16)) {
+        return 0;
+      }
+      return 1;
+    }
     MirOperand dst = mir_value_operand(fn, g, ctx, map, &in->dest);
     int sign_ext = !in->is_unsigned &&
                    code_generator_binary_load_needs_sign_extend(g, ctx,
                                                                &in->dest, size);
     return mir_emit1(fn, MIR_MOV, dst, mem, mir_op_none(), size,
                      sign_ext ? 0 : 1, 0);
+  }
+  if (size == 8 &&
+      (in->lhs.kind == IR_OPERAND_SYMBOL || in->lhs.kind == IR_OPERAND_TEMP) &&
+      in->lhs.name) {
+    int hsz = (in->lhs.kind == IR_OPERAND_SYMBOL)
+                  ? (mir_name_is_string_local(g, sirf, in->lhs.name) ? 16 : 0)
+                  : mir_struct_temp_size(g, sirf, in->lhs.name);
+    if (hsz > 0) {
+      MirVregId sb =
+          mir_emit_indirect_source_addr(fn, g, ctx, map, sirf, &in->lhs, hsz);
+      if (sb == MIR_VREG_NONE) {
+        return 0;
+      }
+      return mir_emit1(fn, MIR_MOV, mem, mir_op_vreg(sb), mir_op_none(), 8, 0,
+                       0);
+    }
   }
   MirOperand val = mir_value_operand(fn, g, ctx, map, &in->lhs);
   return mir_emit1(fn, MIR_MOV, mem, val, mir_op_none(), size, 0, 0);
