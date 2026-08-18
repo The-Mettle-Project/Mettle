@@ -1015,7 +1015,8 @@ static int mir_call_indirect_is_supported(CodeGenerator *g,
       return 0;
     }
     if (code_generator_binary_resolved_type_float_bits(pt) != 0) {
-      if (mir_arg_float_bits(g, ir_function, arg) == 0) {
+      if (mir_arg_float_bits(g, ir_function, arg) == 0 &&
+          arg->kind != IR_OPERAND_INT) {
         mir_call_trace("indirect_arg_float_nonfloat_src");
         return 0;
       }
@@ -1224,11 +1225,12 @@ static int mir_call_is_supported(CodeGenerator *g,
       return 0;
     }
     if (code_generator_binary_resolved_type_float_bits(pt) != 0) {
-      /* Float parameter: homeable when (1) the argument is itself a float value
-       * (a float temp/local/param or a float literal), an int->float implicit
-       * conversion at the call site is left to the fallback, and (2) it lands in
+      /* Float parameter: the argument must be a float value or an INT literal
+       * (folded to a float constant at the parameter's width); a runtime
+       * int->float conversion at the call site still defers. It must land in
        * an XMM register, not a stack slot. */
-      if (mir_arg_float_bits(g, ir_function, arg) == 0) {
+      if (mir_arg_float_bits(g, ir_function, arg) == 0 &&
+          arg->kind != IR_OPERAND_INT) {
         mir_call_trace("arg_float_nonfloat_src");
         return 0;
       }
@@ -4158,15 +4160,21 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
       }
       const IROperand *arg_op = &in->arguments[a];
       int sfb;
-      if (arg_op->kind == IR_OPERAND_FLOAT) {
+      MirOperand val;
+      if (arg_op->kind == IR_OPERAND_INT) {
+        /* Int literal to a float param: fold to a float constant. */
+        sfb = pfb;
+        val = mir_float_const_operand(fn, (double)arg_op->int_value, pfb / 8);
+      } else if (arg_op->kind == IR_OPERAND_FLOAT) {
         sfb = arg_op->float_bits == 32 ? 32 : 64;
+        val = mir_value_operand(fn, g, ctx, map, arg_op);
       } else {
         sfb = code_generator_binary_operand_float_bits(g, ctx, arg_op);
         if (sfb != 32 && sfb != 64) {
           sfb = pfb;
         }
+        val = mir_value_operand(fn, g, ctx, map, arg_op);
       }
-      MirOperand val = mir_value_operand(fn, g, ctx, map, arg_op);
       if (val.kind == MIR_OPK_FIMM) {
         /* A float immediate cannot move straight into a physical register; stage
          * it (at its own precision) in a vreg first. */
@@ -4363,15 +4371,20 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
       }
       const IROperand *arg_op = &in->arguments[a];
       int sfb;
-      if (arg_op->kind == IR_OPERAND_FLOAT) {
+      MirOperand val;
+      if (arg_op->kind == IR_OPERAND_INT) {
+        sfb = pfb;
+        val = mir_float_const_operand(fn, (double)arg_op->int_value, pfb / 8);
+      } else if (arg_op->kind == IR_OPERAND_FLOAT) {
         sfb = arg_op->float_bits == 32 ? 32 : 64;
+        val = mir_value_operand(fn, g, ctx, map, arg_op);
       } else {
         sfb = code_generator_binary_operand_float_bits(g, ctx, arg_op);
         if (sfb != 32 && sfb != 64) {
           sfb = pfb;
         }
+        val = mir_value_operand(fn, g, ctx, map, arg_op);
       }
-      MirOperand val = mir_value_operand(fn, g, ctx, map, arg_op);
       if (val.kind == MIR_OPK_FIMM) {
         MirVregId t = mir_new_vreg(fn, MIR_RC_XMM, sfb / 8);
         if (t == MIR_VREG_NONE ||
