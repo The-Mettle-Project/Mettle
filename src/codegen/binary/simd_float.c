@@ -331,6 +331,37 @@ int code_generator_binary_emit_simd_dot_f64(
                                                       BINARY_GP_RAX);
 }
 
+/* One scalar float64 element of the affine map, advancing both pointers.
+ * Shared by the alignment peel and the remainder tail. */
+static int wcs_affine_f64_scalar_step(BinaryCodeBuffer *b, int b_is_one,
+                                      int b_is_zero, int c_is_zero) {
+  if (!wcs_movsd_xmm_mem(b, 0, BINARY_GP_RCX, 0) ||
+      !wcs_movsd_xmm_mem(b, 1, BINARY_GP_RDX, 0)) {
+    return 0;
+  }
+  if (b_is_one && c_is_zero) {
+    if (!wcs_fmadd231sd(b, 1, 0, 4) ||
+        !wcs_movsd_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM1)) {
+      return 0;
+    }
+  } else {
+    if (!binary_emit_mulsd_xmm_xmm(b, BINARY_XMM0, BINARY_XMM4)) {
+      return 0;
+    }
+    if (!b_is_zero && !wcs_fmadd231sd(b, 0, 5, 1)) {
+      return 0;
+    }
+    if (!c_is_zero && !binary_emit_addsd_xmm_xmm(b, BINARY_XMM0, BINARY_XMM3)) {
+      return 0;
+    }
+    if (!wcs_movsd_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM0)) {
+      return 0;
+    }
+  }
+  return wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 8) &&
+         wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 8);
+}
+
 /* The vectorized + scalar-tail loop of the float64 affine map, factored so the
  * fallback lowering and the MIR inline passthrough (MIR_SIMD_AFFINE_MAP_F64)
  * share one kernel. Assumes RCX = src (iterated), RDX = dst (output), R9 = src
@@ -452,31 +483,7 @@ int code_generator_binary_emit_simd_affine_map_f64_loop(BinaryCodeBuffer *b,
   }
   {
     size_t scalar_top = b->size;
-    if (!wcs_movsd_xmm_mem(b, 0, BINARY_GP_RCX, 0) ||
-        !wcs_movsd_xmm_mem(b, 1, BINARY_GP_RDX, 0)) {
-      return 0;
-    }
-    if (b_is_one && c_is_zero) {
-      if (!wcs_fmadd231sd(b, 1, 0, 4) ||
-          !wcs_movsd_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM1)) {
-        return 0;
-      }
-    } else {
-      if (!binary_emit_mulsd_xmm_xmm(b, BINARY_XMM0, BINARY_XMM4)) {
-        return 0;
-      }
-      if (!b_is_zero && !wcs_fmadd231sd(b, 0, 5, 1)) {
-        return 0;
-      }
-      if (!c_is_zero && !binary_emit_addsd_xmm_xmm(b, BINARY_XMM0, BINARY_XMM3)) {
-        return 0;
-      }
-      if (!wcs_movsd_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM0)) {
-        return 0;
-      }
-    }
-    if (!wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 8) ||
-        !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 8) ||
+    if (!wcs_affine_f64_scalar_step(b, b_is_one, b_is_zero, c_is_zero) ||
         !binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9)) {
       return 0;
     }
