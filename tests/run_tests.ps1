@@ -5317,6 +5317,43 @@ foreach ($relFlag in @($true, $false)) {
   }
 }
 
+# Scaled stores at every width, run twice: as the encoder normally emits them,
+# and with METTLE_MIR_ADDR_STORE forcing the address-first fallback the encoder
+# takes when base, index and value cannot all be staged through a scratch. That
+# exhaustion needs pressure the default self-inlining caps do not reach, so
+# without the forced variant the fallback ships untested.
+foreach ($variant in @("debug", "release", "release_addr_store")) {
+  $total++
+  try {
+    $exePath = Join-Path $tmpDir "test_mir_addr_store_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($variant -ne "debug") { $buildArgs += "--release" }
+    $buildArgs += @("tests/test_mir_addr_store.mettle", "-o", $exePath)
+
+    $prevAddrStore = $env:METTLE_MIR_ADDR_STORE
+    if ($variant -eq "release_addr_store") { $env:METTLE_MIR_ADDR_STORE = "1" }
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    $env:METTLE_MIR_ADDR_STORE = $prevAddrStore
+    if ($LASTEXITCODE -ne 0) {
+      throw "mir addr-store build ($variant) failed: $buildOut"
+    }
+    $runOut = & $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "mir addr-store ($variant) failed (exit $LASTEXITCODE): $runOut"
+    }
+    if ($runOut -notmatch "mir_addr_store OK") {
+      throw "mir addr-store ($variant) did not print OK: $runOut"
+    }
+
+    Write-CaseResult -Name "mir_addr_store_$variant" -Passed $true
+  }
+  catch {
+    $env:METTLE_MIR_ADDR_STORE = $prevAddrStore
+    $failed++
+    Write-CaseResult -Name "mir_addr_store_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # Tail-recursion elimination: pure (`return self(...)`), void (`self(...);
 # return`), and accumulator (`return E + self(...)`) forms must preserve
 # semantics, including the MIR back-edge-to-entry liveness fix (params must

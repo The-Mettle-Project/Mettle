@@ -230,6 +230,19 @@ static int mir_pick_scratch(const MirFunction *fn, size_t idx,
   return 0;
 }
 
+/* Force every scaled store down the form-the-address-first path, which a
+ * scaled store only takes when the three-scratch staging runs dry. That needs
+ * register pressure deep self-recursion expansion produces and the default
+ * inlining caps do not, so the path would otherwise ship untested. getenv is
+ * slow on Windows and this sits in the encoder, so snapshot it once. */
+static int mir_env_addr_store(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    cached = getenv("METTLE_MIR_ADDR_STORE") ? 1 : 0;
+  }
+  return cached;
+}
+
 /* Return the physical register currently holding `op`'s value, materializing
  * into `scratch` when the operand is a spill/immediate/home. */
 static BinaryGpRegister value_reg(MirFunction *fn, const MirOperand *op,
@@ -1338,21 +1351,67 @@ static int encode_mov(MirFunction *fn, const MirInst *in) {
         return 0;
       }
       taken[tn++] = index_reg;
-      if (!(in->width == 1 || in->width == 2 || in->width == 4 ||
-            in->width == 8)) {
+      int scalar_width = (in->width == 1 || in->width == 2 ||
+                          in->width == 4 || in->width == 8);
+      if (!scalar_width) {
         /* The aggregate path below leas the address into SCRATCH_B after
          * reading base and index, so the value may not live there. */
         taken[tn++] = SCRATCH_B;
       }
-      if (!mir_pick_scratch(fn, idx, SCRATCH_A, taken, tn, NULL, 0, &val_scratch)) {
-        return enc_err(fn, "no free scratch register for a scaled store value");
+      BinaryGpRegister val;
+      if (mir_env_addr_store() ||
+          !mir_pick_scratch(fn, idx, SCRATCH_A, taken, tn, NULL, 0,
+                            &val_scratch)) {
+        /* Three operands, two encoder scratches: base and index each took one
+         * and RDX was unavailable, so nothing is left to stage the value in.
+         * Form the address first instead. lea reads base and index and writes
+         * afterwards, so once it retires both staging registers are dead and
+         * one of them carries the value; the store drops its index and becomes
+         * a plain [addr]. Deep self-recursion expansion reaches this. */
+        BinaryGpRegister addr = SCRATCH_B;
+        BinaryGpRegister val_stage = SCRATCH_A;
+        BinaryGpRegister val_fixed;
+        if (mir_operand_fixed_reg(fn, &in->a, &val_fixed) &&
+            val_fixed == addr) {
+          addr = SCRATCH_A;
+          val_stage = SCRATCH_B;
+        }
+        if (!binary_emit_lea_reg_base_index_scale_disp(
+                &ctx->code, addr, base_reg, index_reg, in->dst.mem.scale,
+                in->dst.mem.disp)) {
+          return enc_err(fn, "out of memory in scaled store address");
+        }
+        val = value_reg(fn, &in->a, val_stage, &ok1);
+        if (!ok1) {
+          return 0;
+        }
+        if (!scalar_width) {
+          if (!code_generator_binary_emit_store_to_address(g, ctx, addr,
+                                                           in->width, val)) {
+            return enc_err(fn, "out of memory in store");
+          }
+          return 1;
+        }
+        int prefix66 = in->width == 2;
+        int rexw = in->width == 8;
+        unsigned char op = in->width == 1 ? 0x88 : 0x89;
+        int done =
+            (in->width == 1 && val >= BINARY_GP_RSP && val <= BINARY_GP_RDI)
+                ? binary_emit_memory_access_ex_forced(&ctx->code, prefix66,
+                                                      rexw, op, 0, 0, val, addr,
+                                                      0)
+                : binary_emit_memory_access_ex(&ctx->code, prefix66, rexw, op,
+                                               0, 0, val, addr, 0);
+        if (!done) {
+          return enc_err(fn, "out of memory in scaled store");
+        }
+        return 1;
       }
-      BinaryGpRegister val = value_reg(fn, &in->a, val_scratch, &ok1);
+      val = value_reg(fn, &in->a, val_scratch, &ok1);
       if (!ok1) {
         return 0;
       }
-      if (in->width == 1 || in->width == 2 || in->width == 4 ||
-          in->width == 8) {
+      if (scalar_width) {
         int prefix66 = in->width == 2;
         int rexw = in->width == 8;
         unsigned char op = in->width == 1 ? 0x88 : 0x89;

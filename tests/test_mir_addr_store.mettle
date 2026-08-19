@@ -1,0 +1,115 @@
+import "std/io";
+import "std/mem";
+
+// Scaled stores `dst[base + idx] = v` at every width, with runtime indices so
+// the encoder sees a real [base + index*scale] form. Under
+// METTLE_MIR_ADDR_STORE the encoder collapses the address into one register
+// first and stores through [addr], the shape it falls back to when base, index
+// and value cannot all be staged. Both encodings have to agree with the oracle.
+struct Trip {
+  a: int64;
+  b: int64;
+  c: int64;
+}
+
+fn fill_u8(dst: uint8*, n: int64) {
+  var i: int64 = 0;
+  while (i < n) {
+    dst[i] = (uint8)((i * 37 + 11) & 0xFF);
+    i = i + 1;
+  }
+}
+
+fn fill_u16(dst: uint16*, n: int64) {
+  var i: int64 = 0;
+  while (i < n) {
+    dst[i] = (uint16)((i * 1103 + 7) & 0xFFFF);
+    i = i + 1;
+  }
+}
+
+fn fill_i32(dst: int32*, n: int64) {
+  var i: int64 = 0;
+  while (i < n) {
+    dst[i] = (int32)(i * 2654435 + 13);
+    i = i + 1;
+  }
+}
+
+fn fill_i64(dst: int64*, n: int64) {
+  var i: int64 = 0;
+  while (i < n) {
+    dst[i] = i * 6364136223 + 1442695;
+    i = i + 1;
+  }
+}
+
+fn fill_trip(dst: Trip*, n: int64) {
+  var i: int64 = 0;
+  while (i < n) {
+    var t: Trip;
+    t.a = i * 3 + 1;
+    t.b = i * 5 + 2;
+    t.c = i * 7 + 3;
+    dst[i] = t;
+    i = i + 1;
+  }
+}
+
+fn main() -> int32 {
+  var n: int64 = 64;
+  var bad: int32 = 0;
+
+  var u8s: uint8* = malloc(n);
+  fill_u8(u8s, n);
+  var i: int64 = 0;
+  while (i < n) {
+    if ((int32)u8s[i] != (int32)((i * 37 + 11) & 0xFF)) { bad = bad + 1; }
+    i = i + 1;
+  }
+
+  var u16s: uint16* = malloc(n * 2);
+  fill_u16(u16s, n);
+  i = 0;
+  while (i < n) {
+    if ((int64)u16s[i] != ((i * 1103 + 7) & 0xFFFF)) { bad = bad + 1; }
+    i = i + 1;
+  }
+
+  var i32s: int32* = malloc(n * 4);
+  fill_i32(i32s, n);
+  i = 0;
+  while (i < n) {
+    if (i32s[i] != (int32)(i * 2654435 + 13)) { bad = bad + 1; }
+    i = i + 1;
+  }
+
+  var i64s: int64* = malloc(n * 8);
+  fill_i64(i64s, n);
+  i = 0;
+  while (i < n) {
+    if (i64s[i] != i * 6364136223 + 1442695) { bad = bad + 1; }
+    i = i + 1;
+  }
+
+  var trips: Trip* = malloc(n * 24);
+  fill_trip(trips, n);
+  i = 0;
+  while (i < n) {
+    if (trips[i].a != i * 3 + 1) { bad = bad + 1; }
+    if (trips[i].b != i * 5 + 2) { bad = bad + 1; }
+    if (trips[i].c != i * 7 + 3) { bad = bad + 1; }
+    i = i + 1;
+  }
+
+  if (bad != 0) {
+    print("mir_addr_store MISMATCH count=");
+    print_int(bad);
+    newline();
+    fflush(get_stdout());
+    return 1;
+  }
+  println("mir_addr_store OK");
+  fflush(get_stdout());
+  return 0;
+}
