@@ -6261,6 +6261,36 @@ foreach ($variant in @("release", "debug")) {
   }
 }
 
+# Float literal conversion: every literal must land on the exact IEEE-754
+# double gcc produces for the same text. The owned strtod used to scale by one
+# rounding multiply per exponent step and 3.141592653589793 came out five ulp
+# high, forking checksums between Mettle and C builds of the same program.
+foreach ($variant in @("release", "debug")) {
+  $total++
+  try {
+    $exePath = Join-Path $tmpDir "test_float_literal_parse_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($variant -eq "release") { $buildArgs += "--release" }
+    $buildArgs += @("tests/test_float_literal_parse.mettle", "-o", $exePath)
+
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "float-literal-parse build ($variant) failed: $buildOut"
+    }
+
+    $runOut = & $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "float-literal-parse ($variant) has inexact literals (exit $LASTEXITCODE): $runOut"
+    }
+
+    Write-CaseResult -Name "float_literal_parse_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "float_literal_parse_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # MIR wide-store regression: release inlines a struct-returning helper, then
 # copies a 24-byte struct by value. The executable returns the folded checksum.
 foreach ($variant in @("release", "debug")) {

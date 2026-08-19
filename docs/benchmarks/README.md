@@ -97,7 +97,12 @@ application actually spends time on is on the clock.
    rounded when it is parsed, and two front ends need not round it the same way,
    which would fork the checksum before the program ran. `physics_grid` sticks
    to integers and dyadic fractions, and its collision response is written in
-   the sqrt-free form so both sides run the identical IEEE sequence.
+   the sqrt-free form so both sides run the identical IEEE sequence. Writing
+   this suite caught Mettle's own conversion rounding per scaling step; the
+   owned strtod now converts exactly on every path and
+   `tests/test_float_literal_parse.mettle` pins 49 literals to the bit patterns
+   gcc produces. The rule stays as a guard against toolchains that round
+   differently.
 
 All runtime programs print `Time: <N> us` using QueryPerformanceCounter
 (`examples/bench_time.h`, `stdlib/std/bench.mettle`).

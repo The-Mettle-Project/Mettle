@@ -1,0 +1,78 @@
+// Float literals must land on the same double every other toolchain produces.
+//
+// The decimal-to-binary conversion used to scale the mantissa by one rounding
+// multiply per exponent step: 3.141592653589793 came out five ulp high. The
+// owned strtod now converts on an exact decimal digit array, and this test
+// pins 49 literals (DBL_MAX, the smallest subnormal, a halfway case at 2^53+1,
+// overflow to infinity, and underflow to zero included) to the IEEE-754 bit
+// patterns the C toolchain produces for the same text.
+
+import "std/io";
+import "std/math";
+
+fn check(text: string, value: float64, expected: int64, failures: int32*) {
+  var actual: int64 = f64_bits(value);
+  if (actual != expected) {
+    println("FAIL {text}: got {actual} want {expected}");
+    *failures = *failures + 1;
+  }
+}
+
+fn main() -> int32 {
+  var failures: int32 = 0;
+  check("0.0", 0.0, 0, &failures);
+  check("1.0", 1.0, 4607182418800017408, &failures);
+  check("0.5", 0.5, 4602678819172646912, &failures);
+  check("0.1", 0.1, 4591870180066957722, &failures);
+  check("0.2", 0.2, 4596373779694328218, &failures);
+  check("0.3", 0.3, 4599075939470750515, &failures);
+  check("0.35", 0.35, 4599976659396224614, &failures);
+  check("0.01", 0.01, 4576918229304087675, &failures);
+  check("0.001", 0.001, 4562254508917369340, &failures);
+  check("1.5", 1.5, 4609434218613702656, &failures);
+  check("2.75", 2.75, 4613374868287651840, &failures);
+  check("3.14159", 3.14159, 4614256650576692846, &failures);
+  check("3.141592653589793", 3.141592653589793, 4614256656552045848, &failures);
+  check("2.718281828459045", 2.718281828459045, 4613303445314885481, &failures);
+  check("1.4142135623730951", 1.4142135623730951, 4609047870845172685, &failures);
+  check("0.6931471805599453", 0.6931471805599453, 4604418534313441775, &failures);
+  check("1e0", 1e0, 4607182418800017408, &failures);
+  check("1e1", 1e1, 4621819117588971520, &failures);
+  check("1e10", 1e10, 4756540486875873280, &failures);
+  check("1e22", 1e22, 4936209963552724370, &failures);
+  check("1e23", 1e23, 4950912855330343670, &failures);
+  check("1e100", 1e100, 6103021453049119613, &failures);
+  check("1e-100", 1e-100, 3110860544497550640, &failures);
+  check("1e300", 1e300, 9094988921128908188, &failures);
+  check("1e-300", 1e-300, 118622047889322841, &failures);
+  check("1e308", 1e308, 9214871658872686752, &failures);
+  check("1e-308", 1e-308, 2024022533073106, &failures);
+  check("5e-324", 5e-324, 1, &failures);
+  check("1.7976931348623157e308", 1.7976931348623157e308, 9218868437227405311, &failures);
+  check("2.2250738585072014e-308", 2.2250738585072014e-308, 4503599627370496, &failures);
+  check("6.02214076e23", 6.02214076e23, 4962933279127225623, &failures);
+  check("1.602176634e-19", 1.602176634e-19, 4325607224011134547, &failures);
+  check("9.109383701528e-31", 9.109383701528e-31, 4157519395183588958, &failures);
+  check("1.5e+10", 1.5e+10, 4759161926875873280, &failures);
+  check("2.5e-3", 2.5e-3, 4567911030049346683, &failures);
+  check("123456789.123456789", 123456789.123456789, 4728057454355442549, &failures);
+  check("0.000000000000000000001", 0.000000000000000000001, 4292743757239851855, &failures);
+  check("12345678901234567.0", 12345678901234567.0, 4847542438873900484, &failures);
+  check("98765432109876543210.0", 98765432109876543210.0, 4905944558160024730, &failures);
+  check("0.30000000000000004", 0.30000000000000004, 4599075939470750516, &failures);
+  check("1234.5678", 1234.5678, 4653144502051863213, &failures);
+  check("0.7071067811865476", 0.7071067811865476, 4604544271217802189, &failures);
+  check("255.255", 255.255, 4643185003461775196, &failures);
+  check("1e-45", 1e-45, 3933566627244108473, &failures);
+  check("3.4028234663852886e38", 3.4028234663852886e38, 5183643170566569984, &failures);
+  check("1.1920928955078125e-07", 1.1920928955078125e-07, 4503599627370496000, &failures);
+  check("9007199254740993.0", 9007199254740993.0, 4845873199050653696, &failures);
+  check("1e309", 1e309, 9218868437227405312, &failures);
+  check("1e-400", 1e-400, 0, &failures);
+  if (failures != 0) {
+    println("float literal parsing: {failures} failed");
+    return 1;
+  }
+  println("float literal parsing: all 49 literals exact");
+  return 0;
+}

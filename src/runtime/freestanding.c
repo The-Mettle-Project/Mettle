@@ -3003,12 +3003,408 @@ mt_i64 _strtoi64(const char *text, char **end, int base) {
   return strtoll(text, end, base);
 }
 
+/* Decimal to binary conversion, correctly rounded on every path.
+
+   The previous conversion scaled the mantissa once per exponent step, and
+   each of those multiplies rounds: 3.141592653589793 landed five ulp away
+   from the double gcc produces for the same text. Every float literal in a
+   Mettle program flows through this one function (the parser binds atof to
+   it through the host redirect; comptime, the debugger, and linked programs
+   call it at run time), so one wrong bit here forks a program's arithmetic
+   from the same program built by any other toolchain.
+
+   Two paths, both exact. When the digits fit in 53 bits and the power of
+   ten is one a double holds exactly, a single multiply or divide performs
+   the only rounding (Clinger's fast case). Every other input converts on a
+   decimal digit array scaled by powers of two, where each step is exact and
+   the one rounding happens at the final 53-bit extraction; digits past the
+   array feed a sticky flag, which is all round-to-nearest-even needs from
+   them. */
+
+static const double MT_POW10_F64[23] = {
+    1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,  1e10, 1e11,
+    1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22};
+
+static const mt_u64 MT_POW10_U64[20] = {1ULL,
+                                        10ULL,
+                                        100ULL,
+                                        1000ULL,
+                                        10000ULL,
+                                        100000ULL,
+                                        1000000ULL,
+                                        10000000ULL,
+                                        100000000ULL,
+                                        1000000000ULL,
+                                        10000000000ULL,
+                                        100000000000ULL,
+                                        1000000000000ULL,
+                                        10000000000000ULL,
+                                        100000000000000ULL,
+                                        1000000000000000ULL,
+                                        10000000000000000ULL,
+                                        100000000000000000ULL,
+                                        1000000000000000000ULL,
+                                        10000000000000000000ULL};
+
+#define MT_F64_EXACT_INT 9007199254740992ULL /* 2^53 */
+#define MT_F64_INF_BITS 0x7FF0000000000000ULL
+
+static double mt_f64_from_bits(mt_u64 bits) {
+  union {
+    mt_u64 u;
+    double f;
+  } pun;
+  pun.u = bits;
+  return pun.f;
+}
+
+/* mant * 10^exp when both convert exactly, so the one multiply or divide is
+   the only rounding. Returns 0 when that cannot be guaranteed. */
+static int mt_pow10_exact(mt_u64 mant, int exp, double *out) {
+  if (mant > MT_F64_EXACT_INT) {
+    return 0;
+  }
+  if (exp >= 0) {
+    if (exp <= 22) {
+      *out = (double)mant * MT_POW10_F64[exp];
+      return 1;
+    }
+    if (exp <= 22 + 19) {
+      int lift = exp - 22;
+      if (mant <= MT_F64_EXACT_INT / MT_POW10_U64[lift]) {
+        *out = (double)(mant * MT_POW10_U64[lift]) * MT_POW10_F64[22];
+        return 1;
+      }
+    }
+    return 0;
+  }
+  if (exp >= -22) {
+    *out = (double)mant / MT_POW10_F64[-exp];
+    return 1;
+  }
+  return 0;
+}
+
+/* Arbitrary-precision decimal: value = 0.d[0]d[1]... * 10^dp. 800 digits
+   covers the longest string that can distinguish two doubles (767); anything
+   dropped past the end only sets `truncated`. */
+#define MT_BIGDEC_DIGITS 800
+#define MT_BIGDEC_MAX_SHIFT 60
+
+typedef struct {
+  unsigned char d[MT_BIGDEC_DIGITS]; /* digit values 0..9 */
+  int nd;
+  int dp;
+  int truncated;
+} mt_bigdec;
+
+static void mt_bigdec_trim(mt_bigdec *a) {
+  while (a->nd > 0 && a->d[a->nd - 1] == 0) {
+    a->nd--;
+  }
+  if (a->nd == 0) {
+    a->dp = 0;
+  }
+}
+
+/* Divide by 2^k, 0 < k <= 60. Digits stream left to right through a binary
+   accumulator, so every kept digit is exact. */
+static void mt_bigdec_right_shift(mt_bigdec *a, int k) {
+  int r = 0;
+  int w = 0;
+  mt_u64 n = 0;
+  mt_u64 mask = ((mt_u64)1 << k) - 1;
+
+  for (; (n >> k) == 0; r++) {
+    if (r >= a->nd) {
+      if (n == 0) {
+        a->nd = 0;
+        return;
+      }
+      while ((n >> k) == 0) {
+        n = n * 10ULL;
+        r++;
+      }
+      break;
+    }
+    n = n * 10ULL + a->d[r];
+  }
+  a->dp -= r - 1;
+
+  for (; r < a->nd; r++) {
+    unsigned char c = a->d[r];
+    a->d[w++] = (unsigned char)(n >> k);
+    n = (n & mask) * 10ULL + c;
+  }
+  while (n > 0) {
+    unsigned char dig = (unsigned char)(n >> k);
+    if (w < MT_BIGDEC_DIGITS) {
+      a->d[w++] = dig;
+    } else if (dig != 0) {
+      a->truncated = 1;
+    }
+    n = (n & mask) * 10ULL;
+  }
+  a->nd = w;
+  mt_bigdec_trim(a);
+}
+
+/* Multiplying by 2^k adds `delta` digits when the leading digits are at or
+   above the decimal expansion of 5^k, and delta-1 digits below it. */
+typedef struct {
+  int delta;
+  const char *cutoff;
+} mt_bigdec_cheat;
+
+static const mt_bigdec_cheat MT_BIGDEC_LSHIFT[MT_BIGDEC_MAX_SHIFT + 1] = {
+    {0, ""},
+    {1, "5"},
+    {1, "25"},
+    {1, "125"},
+    {2, "625"},
+    {2, "3125"},
+    {2, "15625"},
+    {3, "78125"},
+    {3, "390625"},
+    {3, "1953125"},
+    {4, "9765625"},
+    {4, "48828125"},
+    {4, "244140625"},
+    {4, "1220703125"},
+    {5, "6103515625"},
+    {5, "30517578125"},
+    {5, "152587890625"},
+    {6, "762939453125"},
+    {6, "3814697265625"},
+    {6, "19073486328125"},
+    {7, "95367431640625"},
+    {7, "476837158203125"},
+    {7, "2384185791015625"},
+    {7, "11920928955078125"},
+    {8, "59604644775390625"},
+    {8, "298023223876953125"},
+    {8, "1490116119384765625"},
+    {9, "7450580596923828125"},
+    {9, "37252902984619140625"},
+    {9, "186264514923095703125"},
+    {10, "931322574615478515625"},
+    {10, "4656612873077392578125"},
+    {10, "23283064365386962890625"},
+    {10, "116415321826934814453125"},
+    {11, "582076609134674072265625"},
+    {11, "2910383045673370361328125"},
+    {11, "14551915228366851806640625"},
+    {12, "72759576141834259033203125"},
+    {12, "363797880709171295166015625"},
+    {12, "1818989403545856475830078125"},
+    {13, "9094947017729282379150390625"},
+    {13, "45474735088646411895751953125"},
+    {13, "227373675443232059478759765625"},
+    {13, "1136868377216160297393798828125"},
+    {14, "5684341886080801486968994140625"},
+    {14, "28421709430404007434844970703125"},
+    {14, "142108547152020037174224853515625"},
+    {15, "710542735760100185871124267578125"},
+    {15, "3552713678800500929355621337890625"},
+    {15, "17763568394002504646778106689453125"},
+    {16, "88817841970012523233890533447265625"},
+    {16, "444089209850062616169452667236328125"},
+    {16, "2220446049250313080847263336181640625"},
+    {16, "11102230246251565404236316680908203125"},
+    {17, "55511151231257827021181583404541015625"},
+    {17, "277555756156289135105907917022705078125"},
+    {17, "1387778780781445675529539585113525390625"},
+    {18, "6938893903907228377647697925567626953125"},
+    {18, "34694469519536141888238489627838134765625"},
+    {18, "173472347597680709441192448139190673828125"},
+    {19, "867361737988403547205962240695953369140625"},
+};
+
+static int mt_bigdec_prefix_less(const mt_bigdec *a, const char *s) {
+  int i;
+  for (i = 0; s[i] != 0; i++) {
+    if (i >= a->nd) {
+      return 1;
+    }
+    if (a->d[i] != (unsigned char)(s[i] - '0')) {
+      return a->d[i] < (unsigned char)(s[i] - '0');
+    }
+  }
+  return 0;
+}
+
+/* Multiply by 2^k, 0 < k <= 60. Digits stream right to left. */
+static void mt_bigdec_left_shift(mt_bigdec *a, int k) {
+  int delta = MT_BIGDEC_LSHIFT[k].delta;
+  int r = a->nd - 1;
+  int w;
+  mt_u64 n = 0;
+
+  if (mt_bigdec_prefix_less(a, MT_BIGDEC_LSHIFT[k].cutoff)) {
+    delta--;
+  }
+  w = a->nd + delta;
+
+  for (; r >= 0; r--) {
+    mt_u64 quo;
+    n += (mt_u64)a->d[r] << k;
+    quo = n / 10ULL;
+    w--;
+    if (w < MT_BIGDEC_DIGITS) {
+      a->d[w] = (unsigned char)(n - 10ULL * quo);
+    } else if (n != 10ULL * quo) {
+      a->truncated = 1;
+    }
+    n = quo;
+  }
+  while (n > 0) {
+    mt_u64 quo = n / 10ULL;
+    w--;
+    if (w < MT_BIGDEC_DIGITS) {
+      a->d[w] = (unsigned char)(n - 10ULL * quo);
+    } else if (n != 10ULL * quo) {
+      a->truncated = 1;
+    }
+    n = quo;
+  }
+  a->nd += delta;
+  if (a->nd > MT_BIGDEC_DIGITS) {
+    a->nd = MT_BIGDEC_DIGITS;
+  }
+  a->dp += delta;
+  mt_bigdec_trim(a);
+}
+
+static void mt_bigdec_shift(mt_bigdec *a, int k) {
+  if (a->nd == 0) {
+    return;
+  }
+  while (k > MT_BIGDEC_MAX_SHIFT) {
+    mt_bigdec_left_shift(a, MT_BIGDEC_MAX_SHIFT);
+    k -= MT_BIGDEC_MAX_SHIFT;
+  }
+  while (k < -MT_BIGDEC_MAX_SHIFT) {
+    mt_bigdec_right_shift(a, MT_BIGDEC_MAX_SHIFT);
+    k += MT_BIGDEC_MAX_SHIFT;
+    if (a->nd == 0) {
+      return;
+    }
+  }
+  if (k > 0) {
+    mt_bigdec_left_shift(a, k);
+  } else if (k < 0) {
+    mt_bigdec_right_shift(a, -k);
+  }
+}
+
+/* Round-half-even at digit position nd. The sticky flag settles the case
+   where the stored digits alone read as exactly halfway. */
+static int mt_bigdec_round_up(const mt_bigdec *a, int nd) {
+  if (nd < 0 || nd >= a->nd) {
+    return 0;
+  }
+  if (a->d[nd] == 5 && nd + 1 == a->nd) {
+    if (a->truncated) {
+      return 1;
+    }
+    return nd > 0 && (a->d[nd - 1] & 1) != 0;
+  }
+  return a->d[nd] >= 5;
+}
+
+static mt_u64 mt_bigdec_rounded_integer(const mt_bigdec *a) {
+  mt_u64 n = 0;
+  int i = 0;
+  if (a->dp > 20) {
+    return 0xFFFFFFFFFFFFFFFFULL;
+  }
+  for (; i < a->dp && i < a->nd; i++) {
+    n = n * 10ULL + a->d[i];
+  }
+  for (; i < a->dp; i++) {
+    n *= 10ULL;
+  }
+  if (mt_bigdec_round_up(a, a->dp)) {
+    n++;
+  }
+  return n;
+}
+
+static double mt_bigdec_to_double(mt_bigdec *a) {
+  /* powtab[i]: the largest k with 2^k <= 10^i, so one shift never overshoots
+     the [0.5, 1) target. */
+  static const int powtab[9] = {1, 3, 6, 9, 13, 16, 19, 23, 26};
+  int exp2 = 0;
+  mt_u64 mant;
+  mt_u64 bits;
+
+  if (a->nd == 0) {
+    return 0.0;
+  }
+  if (a->dp > 310) {
+    return mt_f64_from_bits(MT_F64_INF_BITS);
+  }
+  if (a->dp < -330) {
+    return 0.0;
+  }
+
+  while (a->dp > 0) {
+    int n = a->dp >= 9 ? 27 : powtab[a->dp];
+    mt_bigdec_shift(a, -n);
+    exp2 += n;
+    if (a->nd == 0) {
+      return 0.0;
+    }
+  }
+  while (a->dp < 0 || (a->dp == 0 && a->d[0] < 5)) {
+    int n = -a->dp >= 9 ? 27 : powtab[-a->dp];
+    mt_bigdec_shift(a, n);
+    exp2 -= n;
+    if (a->nd == 0) {
+      return 0.0;
+    }
+  }
+  /* Value is in [0.5, 1) times 2^exp2; renormalize to [1, 2). */
+  exp2--;
+
+  if (exp2 < -1022) {
+    int n = -1022 - exp2;
+    mt_bigdec_shift(a, -n);
+    exp2 += n;
+  }
+  if (exp2 + 1023 >= 0x7FF) {
+    return mt_f64_from_bits(MT_F64_INF_BITS);
+  }
+
+  mt_bigdec_shift(a, 53);
+  mant = mt_bigdec_rounded_integer(a);
+  if (mant == (2ULL << 52)) {
+    mant >>= 1;
+    exp2++;
+    if (exp2 + 1023 >= 0x7FF) {
+      return mt_f64_from_bits(MT_F64_INF_BITS);
+    }
+  }
+  if ((mant & (1ULL << 52)) == 0) {
+    exp2 = -1023; /* subnormal: exponent field 0 */
+  }
+  bits = mant & ((1ULL << 52) - 1);
+  bits |= (mt_u64)((exp2 + 1023) & 0x7FF) << 52;
+  return mt_f64_from_bits(bits);
+}
+
 double strtod(const char *text, char **end) {
   const char *start = text;
-  int negative = 0;
+  mt_bigdec dec;
   double value = 0.0;
-  int exponent = 0;
+  int negative = 0;
   int saw_digit = 0;
+  int sig_seen = 0;
+
+  dec.nd = 0;
+  dec.dp = 0;
+  dec.truncated = 0;
+
   while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n') {
     text++;
   }
@@ -3016,15 +3412,34 @@ double strtod(const char *text, char **end) {
     negative = *text++ == '-';
   }
   while (*text >= '0' && *text <= '9') {
-    value = value * 10.0 + (double)(*text++ - '0');
+    int c = *text++ - '0';
     saw_digit = 1;
+    if (c == 0 && !sig_seen) {
+      continue;
+    }
+    sig_seen = 1;
+    dec.dp++;
+    if (dec.nd < MT_BIGDEC_DIGITS) {
+      dec.d[dec.nd++] = (unsigned char)c;
+    } else if (c != 0) {
+      dec.truncated = 1;
+    }
   }
   if (*text == '.') {
     text++;
     while (*text >= '0' && *text <= '9') {
-      value = value * 10.0 + (double)(*text++ - '0');
-      exponent--;
+      int c = *text++ - '0';
       saw_digit = 1;
+      if (c == 0 && !sig_seen) {
+        dec.dp--;
+        continue;
+      }
+      sig_seen = 1;
+      if (dec.nd < MT_BIGDEC_DIGITS) {
+        dec.d[dec.nd++] = (unsigned char)c;
+      } else if (c != 0) {
+        dec.truncated = 1;
+      }
     }
   }
   if (saw_digit && (*text == 'e' || *text == 'E')) {
@@ -3043,21 +3458,30 @@ double strtod(const char *text, char **end) {
       exp_digits = 1;
     }
     if (exp_digits) {
-      exponent += exp_negative ? -exp_value : exp_value;
+      dec.dp += exp_negative ? -exp_value : exp_value;
     } else {
       text = mark;
     }
   }
+
   if (!saw_digit) {
     text = start;
   } else {
-    while (exponent > 0) {
-      value *= 10.0;
-      exponent--;
-    }
-    while (exponent < 0) {
-      value *= 0.1;
-      exponent++;
+    mt_bigdec_trim(&dec);
+    if (dec.nd > 0) {
+      int have = 0;
+      if (!dec.truncated && dec.nd <= 19) {
+        mt_u64 mant = 0;
+        int i = 0;
+        while (i < dec.nd) {
+          mant = mant * 10ULL + (mt_u64)dec.d[i];
+          i++;
+        }
+        have = mt_pow10_exact(mant, dec.dp - dec.nd, &value);
+      }
+      if (!have) {
+        value = mt_bigdec_to_double(&dec);
+      }
     }
   }
   if (end) {
