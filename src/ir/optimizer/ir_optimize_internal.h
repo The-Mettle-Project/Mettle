@@ -445,6 +445,9 @@ int ir_eliminate_unreachable_straightline_pass(IRFunction *function,
                                                        int *changed);
 int ir_hoist_body_locals_pass(IRFunction *function, int *changed);
 int ir_hoist_global_bases_pass(IRFunction *function, int *changed);
+/* `m[r + i]` with invariant `r`: hoist `r`'s scaled term into a row pointer
+ * ahead of the loop so the in-loop index is the counter alone. */
+int ir_hoist_row_pointers_pass(IRFunction *function, int *changed);
 int ir_if_convert_accumulate_pass(IRFunction *function, int *changed);
 int ir_normalize_scan_from_first_pass(IRFunction *function, int *changed);
 int ir_find_label_index(const IRFunction *function, const char *label,

@@ -466,6 +466,344 @@ int ir_hoist_global_bases_pass(IRFunction *function, int *changed) {
   return 1;
 }
 
+/* Is `sym` written by any instruction in [lo, hi)? */
+static int ir_row_symbol_written(const IRFunction *function, size_t lo,
+                                 size_t hi, const char *sym) {
+  for (size_t i = lo; i < hi && i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ir_instruction_writes_destination(ins) &&
+        ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name &&
+        strcmp(ins->dest.name, sym) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* The pointer type `sym` carries in this function: a local's declared type or
+ * a parameter's. NULL unless it actually is a pointer. */
+static const char *ir_row_symbol_pointer_type(const IRFunction *function,
+                                              const char *sym) {
+  const char *t = ir_function_local_declared_type(function, sym);
+  if (!t) {
+    for (size_t p = 0; p < function->parameter_count; p++) {
+      if (function->parameter_names[p] &&
+          strcmp(function->parameter_names[p], sym) == 0) {
+        t = function->parameter_types[p];
+        break;
+      }
+    }
+  }
+  if (!t) {
+    return NULL;
+  }
+  size_t len = strlen(t);
+  if ((len > 0 && t[len - 1] == '*') || strcmp(t, "cstring") == 0 ||
+      strcmp(t, "rawptr") == 0) {
+    return t;
+  }
+  return NULL;
+}
+
+/* Does `ins` read the temp named `name` anywhere: lhs/rhs, a store's address,
+ * or a call/SIMD argument? */
+static int ir_row_instruction_reads_temp(const IRInstruction *ins,
+                                         const char *name) {
+  if (ir_operand_is_temp_named(&ins->lhs, name) ||
+      ir_operand_is_temp_named(&ins->rhs, name)) {
+    return 1;
+  }
+  if (ins->op == IR_OP_STORE && ir_operand_is_temp_named(&ins->dest, name)) {
+    return 1;
+  }
+  for (size_t a = 0; a < ins->argument_count; a++) {
+    if (ir_operand_is_temp_named(&ins->arguments[a], name)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* One side of an index add that the loop never changes: a symbol neither
+ * written inside [lo, hi) nor aliasable through a taken address. A literal
+ * deliberately does NOT count: `a[i + 3]` is the straight-line shape the SLP
+ * matcher and the backend's constant-displacement fold already consume, and
+ * splitting its base away breaks their view of adjacent accesses. */
+static int ir_row_operand_invariant(const IRFunction *function, size_t lo,
+                                    size_t hi, const IROperand *op) {
+  return op->kind == IR_OPERAND_SYMBOL && op->name &&
+         !ir_row_symbol_written(function, lo, hi, op->name) &&
+         !ir_symbol_address_taken(function, op->name);
+}
+
+#define IR_ROW_MAX_CONSUMERS 8
+
+/* Hoist the invariant half of an indexed access out of the loop.
+ *
+ * `m[r + i]` with `r` fixed across the loop lowers to
+ *     %idx = r + i ; %sh = %idx << k ; %addr = m + %sh
+ * and every recognizer reads a base indexed by the counter alone, so the sum
+ * hid the access from all of them: the row-major inner loop, a windowed dot,
+ * any offset slice. Rewriting it as
+ *     row = m + (r << k)              (before the loop)
+ *     %sh = i << k ; %addr = row + %sh
+ * is the edit `--explain` has been prescribing ("bind the row to a pointer
+ * before the loop"), made by the compiler. The addresses agree (both orders
+ * are equal modulo 2^64), the loop saves an add per access, and the result is
+ * the one address form every kernel reads.
+ *
+ * Soundness gates: the hoisted half and each pointer base must be
+ * loop-invariant (never written in the loop, address never taken), the
+ * counter half must not be rewritten between the index add and the shift, and
+ * EVERY reader of the shifted index must be a `base + %sh` add this rewrite
+ * also retargets. One consumer left behind would compute an address missing
+ * the hoisted term. */
+int ir_hoist_row_pointers_pass(IRFunction *function, int *changed) {
+  static int g_row_counter;
+  if (!function) {
+    return 0;
+  }
+  for (size_t header = 0; header < function->instruction_count; header++) {
+    size_t latch = 0;
+    {
+      const IRInstruction *label = &function->instructions[header];
+      if (label->op != IR_OP_LABEL ||
+          !ir_cleanup_label_is_loop_header(label->text)) {
+        continue;
+      }
+      latch = ir_cleanup_loop_latch(function, header, label->text);
+    }
+    if (!latch) {
+      continue;
+    }
+
+    for (size_t s = header + 1; s < latch; s++) {
+      long long k = 0;
+      size_t idx_pos = 0;
+      size_t consumers[IR_ROW_MAX_CONSUMERS];
+      size_t consumer_count = 0;
+      IROperand inv = {0};
+      IROperand var = {0};
+      char sh_name[128];
+      int bad = 0;
+
+      {
+        const IRInstruction *shl = &function->instructions[s];
+        if (!(shl->op == IR_OP_BINARY && !shl->is_float && shl->text &&
+              strcmp(shl->text, "<<") == 0 &&
+              shl->rhs.kind == IR_OPERAND_INT && shl->rhs.int_value >= 1 &&
+              shl->rhs.int_value <= 3 && shl->lhs.kind == IR_OPERAND_TEMP &&
+              shl->lhs.name && shl->dest.kind == IR_OPERAND_TEMP &&
+              shl->dest.name &&
+              snprintf(sh_name, sizeof(sh_name), "%s", shl->dest.name) <
+                  (int)sizeof(sh_name))) {
+          continue;
+        }
+        k = shl->rhs.int_value;
+
+        /* The shifted value must be `invariant + counter`, defined in-loop. */
+        const IRInstruction *idx = NULL;
+        for (size_t j = s; j-- > header + 1;) {
+          const IRInstruction *cand = &function->instructions[j];
+          if (ir_instruction_writes_destination(cand) &&
+              cand->dest.kind == IR_OPERAND_TEMP && cand->dest.name &&
+              strcmp(cand->dest.name, shl->lhs.name) == 0) {
+            idx = cand;
+            idx_pos = j;
+            break;
+          }
+        }
+        if (!idx || idx->op != IR_OP_BINARY || idx->is_float || !idx->text ||
+            strcmp(idx->text, "+") != 0) {
+          continue;
+        }
+        int lhs_inv =
+            ir_row_operand_invariant(function, header + 1, latch, &idx->lhs);
+        int rhs_inv =
+            ir_row_operand_invariant(function, header + 1, latch, &idx->rhs);
+        if (lhs_inv == rhs_inv) {
+          continue; /* both fixed is plain LICM; both moving has no hoist. */
+        }
+        const IROperand *inv_side = lhs_inv ? &idx->lhs : &idx->rhs;
+        const IROperand *var_side = lhs_inv ? &idx->rhs : &idx->lhs;
+        if ((var_side->kind != IR_OPERAND_SYMBOL &&
+             var_side->kind != IR_OPERAND_TEMP) ||
+            !var_side->name) {
+          continue;
+        }
+        if (inv_side->kind == IR_OPERAND_INT && inv_side->int_value == 0) {
+          continue;
+        }
+        /* The moving half must still hold the index add's value at the
+         * shift: nothing may redefine it in between. */
+        int redefined = 0;
+        for (size_t j = idx_pos + 1; j < s; j++) {
+          const IRInstruction *mid = &function->instructions[j];
+          if (ir_instruction_writes_destination(mid) &&
+              mid->dest.kind == var_side->kind && mid->dest.name &&
+              strcmp(mid->dest.name, var_side->name) == 0) {
+            redefined = 1;
+            break;
+          }
+        }
+        if (redefined) {
+          continue;
+        }
+        inv = ir_operand_copy(inv_side);
+        var = ir_operand_copy(var_side);
+      }
+
+      /* Every reader of the shifted index, in or out of the loop, must be a
+       * rewritable `base + %sh` add inside this loop; and nothing else may
+       * define the same temp. */
+      for (size_t j = 0; j < function->instruction_count && !bad; j++) {
+        const IRInstruction *ins = &function->instructions[j];
+        if (j != s && ir_instruction_writes_destination(ins) &&
+            ins->dest.kind == IR_OPERAND_TEMP && ins->dest.name &&
+            strcmp(ins->dest.name, sh_name) == 0) {
+          bad = 1;
+          break;
+        }
+        if (j == s || !ir_row_instruction_reads_temp(ins, sh_name)) {
+          continue;
+        }
+        if (j <= s || j >= latch || consumer_count >= IR_ROW_MAX_CONSUMERS) {
+          bad = 1;
+          break;
+        }
+        if (!(ins->op == IR_OP_BINARY && !ins->is_float && ins->text &&
+              strcmp(ins->text, "+") == 0 &&
+              ins->lhs.kind == IR_OPERAND_SYMBOL && ins->lhs.name &&
+              ir_operand_is_temp_named(&ins->rhs, sh_name) &&
+              ins->dest.kind == IR_OPERAND_TEMP)) {
+          bad = 1;
+          break;
+        }
+        if (!ir_row_symbol_pointer_type(function, ins->lhs.name) ||
+            ir_row_symbol_written(function, header + 1, latch, ins->lhs.name) ||
+            ir_symbol_address_taken(function, ins->lhs.name)) {
+          bad = 1;
+          break;
+        }
+        consumers[consumer_count++] = j;
+      }
+      if (bad || consumer_count == 0) {
+        ir_operand_destroy(&inv);
+        ir_operand_destroy(&var);
+        continue;
+      }
+
+      /* Capture each consumer's base and its pointer type before touching
+       * anything, then rewrite in place (inserting reallocates the array). */
+      char base_names[IR_ROW_MAX_CONSUMERS][128];
+      char ptr_types[IR_ROW_MAX_CONSUMERS][64];
+      char row_names[IR_ROW_MAX_CONSUMERS][48];
+      char off_name[48];
+      int need_off_temp = inv.kind != IR_OPERAND_INT;
+      for (size_t c = 0; c < consumer_count && !bad; c++) {
+        const IRInstruction *addr = &function->instructions[consumers[c]];
+        const char *pt = ir_row_symbol_pointer_type(function, addr->lhs.name);
+        if (!pt ||
+            snprintf(base_names[c], sizeof(base_names[c]), "%s",
+                     addr->lhs.name) >= (int)sizeof(base_names[c]) ||
+            snprintf(ptr_types[c], sizeof(ptr_types[c]), "%s", pt) >=
+                (int)sizeof(ptr_types[c])) {
+          bad = 1;
+        }
+      }
+      if (bad) {
+        ir_operand_destroy(&inv);
+        ir_operand_destroy(&var);
+        continue;
+      }
+
+      snprintf(off_name, sizeof(off_name), "__rowoff_%d", g_row_counter);
+      for (size_t c = 0; c < consumer_count; c++) {
+        snprintf(row_names[c], sizeof(row_names[c]), "__rowp_%d_%zu",
+                 g_row_counter, c);
+        IRInstruction *addr = &function->instructions[consumers[c]];
+        ir_operand_destroy(&addr->lhs);
+        addr->lhs = ir_operand_symbol(row_names[c]);
+      }
+      g_row_counter++;
+      {
+        IRInstruction *shl = &function->instructions[s];
+        ir_operand_destroy(&shl->lhs);
+        shl->lhs = var;
+        var = ir_operand_none();
+      }
+
+      /* Preheader, inserted at the header label: declarations, the scaled
+       * offset when the hoisted half is a runtime symbol, then one add per
+       * row. Build each instruction with owned storage; insertion copies. */
+      size_t at = header;
+      size_t inserted = 0;
+      int failed = 0;
+      for (size_t c = 0; c < consumer_count && !failed; c++) {
+        IRInstruction decl = {0};
+        decl.op = IR_OP_DECLARE_LOCAL;
+        decl.dest = ir_operand_symbol(row_names[c]);
+        decl.text = mettle_strdup(ptr_types[c]);
+        if (!decl.dest.name || !decl.text ||
+            !ir_function_insert_instruction(function, at, &decl)) {
+          failed = 1;
+        }
+        ir_instruction_destroy_storage(&decl);
+        if (!failed) {
+          at++;
+          inserted++;
+        }
+      }
+      if (!failed && need_off_temp) {
+        IRInstruction off = {0};
+        off.op = IR_OP_BINARY;
+        off.text = mettle_strdup("<<");
+        off.dest = ir_operand_temp(off_name);
+        off.lhs = ir_operand_copy(&inv);
+        off.rhs = ir_operand_int(k);
+        if (!off.text || !off.dest.name ||
+            !ir_function_insert_instruction(function, at, &off)) {
+          failed = 1;
+        }
+        ir_instruction_destroy_storage(&off);
+        if (!failed) {
+          at++;
+          inserted++;
+        }
+      }
+      for (size_t c = 0; c < consumer_count && !failed; c++) {
+        IRInstruction add = {0};
+        add.op = IR_OP_BINARY;
+        add.text = mettle_strdup("+");
+        add.dest = ir_operand_symbol(row_names[c]);
+        add.lhs = ir_operand_symbol(base_names[c]);
+        add.rhs = need_off_temp ? ir_operand_temp(off_name)
+                                : ir_operand_int(inv.int_value << k);
+        if (!add.text || !add.dest.name || !add.lhs.name ||
+            !ir_function_insert_instruction(function, at, &add)) {
+          failed = 1;
+        }
+        ir_instruction_destroy_storage(&add);
+        if (!failed) {
+          at++;
+          inserted++;
+        }
+      }
+      ir_operand_destroy(&inv);
+      if (failed) {
+        return 0;
+      }
+      header += inserted;
+      s += inserted;
+      latch += inserted;
+      if (changed) {
+        *changed = 1;
+      }
+    }
+  }
+  return 1;
+}
+
 /* `base + (iv << k)`, the address of `base[iv]`. Fills the base symbol and the
  * element width the shift implies. */
 static int ir_scan_decode_indexed(const IRFunction *function, size_t before,

@@ -58,6 +58,7 @@ typedef struct {
 
 static const IROptNamedPass g_ir_pre_inline_canonical[] = {
     {"hoist_global_bases", ir_hoist_global_bases_pass, IR_GATE_LOOP},
+    {"hoist_row_pointers", ir_hoist_row_pointers_pass, IR_GATE_LOOP},
     {"if_convert_accumulate", ir_if_convert_accumulate_pass,
      IR_GATE_LOOP_BRANCH},
     {"scan_from_first", ir_normalize_scan_from_first_pass, IR_GATE_LOOP_LOAD},
@@ -86,6 +87,7 @@ static const IROptNamedPass g_ir_pre_inline_recognizers[] = {
 static const IROptNamedPass g_ir_loop_canonical_passes[] = {
     {"hoist_body_locals", ir_hoist_body_locals_pass, IR_GATE_LOOP},
     {"hoist_global_bases", ir_hoist_global_bases_pass, IR_GATE_LOOP},
+    {"hoist_row_pointers", ir_hoist_row_pointers_pass, IR_GATE_LOOP},
     {"if_convert_accumulate", ir_if_convert_accumulate_pass,
      IR_GATE_LOOP_BRANCH},
     {"scan_from_first", ir_normalize_scan_from_first_pass, IR_GATE_LOOP_LOAD},
