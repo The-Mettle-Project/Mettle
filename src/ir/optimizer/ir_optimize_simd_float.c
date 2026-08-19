@@ -142,7 +142,12 @@ static int ir_decode_byte_indexed_load(IRFunction *function, size_t before,
                                       base_out)) {
     return 0;
   }
-  *unsigned_out = load->is_unsigned ? 1 : 0;
+  /* A byte load's lane value is the zero-extended byte regardless of the
+   * element's declared signedness: every scalar backend loads bytes with
+   * movzx (int8 -56 in memory reads back as 200). Honoring is_unsigned here
+   * made the kernel pick vpmovsxbd for int8 arrays, and a release-only
+   * clamp `if ((int32)a[i] > 100)` saw -106 where debug saw 150. */
+  *unsigned_out = 1;
   return 1;
 }
 
@@ -3662,7 +3667,9 @@ static int vloop_resolve_def_int(IRFunction *function, const IRInstruction *def,
     if (d->elem_bits == 8 && def->rhs.int_value == 1 &&
         ir_decode_byte_indexed_address(function, def_idx, def->lhs.name, iv,
                                        &base)) {
-      int is_unsigned = def->is_unsigned ? 1 : 0;
+      /* Byte lanes are zero-extended regardless of declared signedness (the
+       * movzx convention; see ir_decode_byte_indexed_load). */
+      int is_unsigned = 1;
       if (d->elem_unsigned < 0) {
         d->elem_unsigned = is_unsigned;
       }

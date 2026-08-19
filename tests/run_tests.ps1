@@ -6163,6 +6163,36 @@ foreach ($variant in @("release", "debug", "debug_fallback")) {
   }
 }
 
+# Byte-map lane widening: int8 arrays vectorized by the general byte map must
+# zero-extend into their int32 lanes (the movzx convention every scalar
+# backend follows). Release picked vpmovsxbd off the load's signedness flag
+# and a clamp over bytes >= 128 diverged from debug.
+foreach ($variant in @("release", "debug")) {
+  $total++
+  try {
+    $exePath = Join-Path $tmpDir "test_byte_vloop_zero_extend_$variant.exe"
+    $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
+    if ($variant -eq "release") { $buildArgs += "--release" }
+    $buildArgs += @("tests/test_byte_vloop_zero_extend.mettle", "-o", $exePath)
+
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "byte-vloop-zero-extend build ($variant) failed: $buildOut"
+    }
+
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 1) {
+      throw "byte-vloop-zero-extend ($variant) miscompiled (exit $LASTEXITCODE)"
+    }
+
+    Write-CaseResult -Name "byte_vloop_zero_extend_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "byte_vloop_zero_extend_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # MIR wide-store regression: release inlines a struct-returning helper, then
 # copies a 24-byte struct by value. The executable returns the folded checksum.
 foreach ($variant in @("release", "debug")) {
