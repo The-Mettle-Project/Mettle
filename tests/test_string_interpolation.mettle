@@ -1,0 +1,57 @@
+// "{expr}" inside a string literal desugars in the parser to '+' concatenation
+// with a conversion call per expression part. Every value class the checker
+// admits is exercised, plus the escape and adjacency shapes the splitter has
+// to get right. Each check returns its own code so a failure names the shape
+// that broke.
+
+fn main() -> int32 {
+    var n: int32 = 42;
+    if ("n={n}" != "n=42") { return 1; }
+
+    var neg: int64 = -7;
+    if ("{neg}" != "-7") { return 2; }
+
+    var big: uint64 = (uint64)18446744073709551615;
+    if ("{big}" != "18446744073709551615") { return 3; }
+
+    var zero: int64 = 0;
+    if ("{zero}" != "0") { return 4; }
+
+    var flag: bool = true;
+    if ("{flag}" != "true") { return 5; }
+    flag = false;
+    if ("{flag}" != "false") { return 6; }
+
+    var name: string = "world";
+    if ("hello {name}!" != "hello world!") { return 7; }
+
+    // Expressions, parenthesized and adjacent parts with no literal between.
+    if ("{n + 8}" != "50") { return 8; }
+    if ("{(n * 2)}" != "84") { return 9; }
+    if ("{n}{n}" != "4242") { return 10; }
+
+    // Only '{' is special; '{{' is a literal '{' and '}' is a plain character.
+    if ("a {{n}} b" != "a " + "{{" + "n}} b") { return 11; }
+    var closing: string = "}";
+    if (closing.length != (uint64)1) { return 12; }
+
+    // Floats: fixed form with six fractional digits, trailing zeros trimmed to
+    // at least one; scientific past 1e17 and below 1e-4.
+    var f: float64 = 3.5;
+    if ("{f}" != "3.5") { return 13; }
+    var w: float64 = 2.0;
+    if ("{w}" != "2.0") { return 14; }
+    var g: float32 = 2.5;
+    if ("{g}" != "2.5") { return 15; }
+    var third: float64 = 1.0 / 3.0;
+    if ("{third}" != "0.333333") { return 16; }
+    var tiny: float64 = 0.00001;
+    if ("{tiny}" != "1.0e-5") { return 17; }
+
+    // An interpolated string is an ordinary string value.
+    var built: string = "sum={n + 8}";
+    if (built.length != (uint64)6) { return 18; }
+    if (built != "sum=50") { return 19; }
+
+    return 66;
+}

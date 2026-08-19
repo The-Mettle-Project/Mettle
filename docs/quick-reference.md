@@ -23,6 +23,22 @@ fn main() -> int32 {
 
 See [Imports](imports.md) for path resolution and `import_str`.
 
+## String Interpolation
+
+```mettle
+import "std/io";
+
+fn main() -> int32 {
+  var n: int32 = 42;
+  var who: string = "world";
+  println("hello {who}, n={n}, twice={n * 2}");
+  return 0;
+}
+```
+
+`{expr}` in any string literal splices integers, `bool`, floats, and strings;
+`{{` is a literal `{`. See [Expressions](expressions.md#string-interpolation).
+
 ## With Prelude
 
 ```mettle

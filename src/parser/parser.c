@@ -2996,6 +2996,191 @@ static void parser_error_expected_expression(Parser *parser) {
                                   "expected an expression here");
 }
 
+/* String interpolation. "{expr}" inside a literal desugars right here, at the
+ * token, into '+' concatenation over the split parts, so no later stage sees
+ * interpolation as a distinct feature. Each expression part is wrapped in a
+ * __mtl_interp() call; the type checker types that name and IR lowering
+ * rewrites it to the matching mettle_string_from_* runtime conversion.
+ *
+ * Only '{' is special. '{{' is a literal '{'; '}' is a plain character except
+ * while scanning for the end of an interpolation, where braces nest so struct
+ * literals and blocks inside the expression survive. */
+static void parser_interp_patch_locations(ASTNode *node,
+                                          SourceLocation location) {
+  if (!node)
+    return;
+  node->location = location;
+  for (size_t i = 0; i < node->child_count; i++) {
+    parser_interp_patch_locations(node->children[i], location);
+  }
+}
+
+static ASTNode *parser_interp_append(ASTNode *chain, ASTNode *part,
+                                     SourceLocation location) {
+  if (!chain)
+    return part;
+  ASTNode *joined = ast_create_binary_expression(chain, "+", part, location);
+  if (!joined) {
+    ast_destroy_node(chain);
+    ast_destroy_node(part);
+  }
+  return joined;
+}
+
+static ASTNode *parser_interp_parse_fragment(Parser *parser,
+                                             const char *fragment,
+                                             SourceLocation location) {
+  Lexer *sub_lexer = lexer_create(fragment);
+  Parser *sub_parser = sub_lexer ? parser_create(sub_lexer) : NULL;
+  ASTNode *expr = sub_parser ? parser_parse_expression(sub_parser) : NULL;
+
+  if (expr && sub_parser) {
+    while (sub_parser->current_token.type == TOKEN_NEWLINE ||
+           sub_parser->current_token.type == TOKEN_SEMICOLON) {
+      parser_advance(sub_parser);
+    }
+    if (sub_parser->current_token.type != TOKEN_EOF) {
+      ast_destroy_node(expr);
+      expr = NULL;
+    }
+  }
+  if (sub_parser && sub_parser->has_error && expr) {
+    ast_destroy_node(expr);
+    expr = NULL;
+  }
+  if (!expr) {
+    char message[512];
+    const char *detail =
+        sub_parser && sub_parser->error_message ? sub_parser->error_message
+                                                : "expected one expression";
+    snprintf(message, sizeof(message),
+             "Invalid expression in string interpolation '{%s}': %s", fragment,
+             detail);
+    parser_destroy(sub_parser);
+    lexer_destroy(sub_lexer);
+    parser_set_error(parser, message);
+    return NULL;
+  }
+  parser_destroy(sub_parser);
+  lexer_destroy(sub_lexer);
+  parser_interp_patch_locations(expr, location);
+  return expr;
+}
+
+static ASTNode *parser_parse_interpolated_string(Parser *parser,
+                                                 const char *value,
+                                                 SourceLocation location) {
+  size_t length = strlen(value);
+  char *literal = malloc(length + 1);
+  size_t literal_length = 0;
+  ASTNode *chain = NULL;
+  int has_expression_part = 0;
+  size_t i = 0;
+
+  if (!literal) {
+    parser_set_error(parser, "Out of memory in string interpolation");
+    return NULL;
+  }
+
+  while (i < length) {
+    char c = value[i];
+    if (c == '{' && i + 1 < length && value[i + 1] == '{') {
+      literal[literal_length++] = '{';
+      i += 2;
+      continue;
+    }
+    if (c != '{') {
+      literal[literal_length++] = c;
+      i++;
+      continue;
+    }
+
+    size_t start = ++i;
+    int depth = 1;
+    while (i < length) {
+      if (value[i] == '{') {
+        depth++;
+      } else if (value[i] == '}' && --depth == 0) {
+        break;
+      }
+      i++;
+    }
+    if (depth != 0) {
+      parser_set_error(parser,
+                       "Unterminated '{' in string literal; write '{{' for a "
+                       "literal brace");
+      goto fail;
+    }
+    size_t expr_length = i - start;
+    i++;
+    if (expr_length == 0) {
+      parser_set_error(parser, "Empty '{}' in string literal");
+      goto fail;
+    }
+
+    if (literal_length > 0) {
+      literal[literal_length] = '\0';
+      ASTNode *part = ast_create_string_literal(literal, location);
+      if (!part)
+        goto fail;
+      chain = parser_interp_append(chain, part, location);
+      if (!chain)
+        goto fail;
+      literal_length = 0;
+    }
+
+    char *fragment = malloc(expr_length + 1);
+    if (!fragment) {
+      parser_set_error(parser, "Out of memory in string interpolation");
+      goto fail;
+    }
+    memcpy(fragment, value + start, expr_length);
+    fragment[expr_length] = '\0';
+    ASTNode *expr = parser_interp_parse_fragment(parser, fragment, location);
+    free(fragment);
+    if (!expr)
+      goto fail;
+
+    ASTNode *argument[1];
+    argument[0] = expr;
+    ASTNode *converted =
+        ast_create_call_expression("__mtl_interp", argument, 1, location);
+    if (!converted) {
+      ast_destroy_node(expr);
+      goto fail;
+    }
+    has_expression_part = 1;
+    chain = parser_interp_append(chain, converted, location);
+    if (!chain)
+      goto fail;
+  }
+
+  literal[literal_length] = '\0';
+  if (!has_expression_part) {
+    ASTNode *only = ast_create_string_literal(literal, location);
+    free(literal);
+    return only;
+  }
+  if (literal_length > 0) {
+    ASTNode *part = ast_create_string_literal(literal, location);
+    if (!part)
+      goto fail;
+    chain = parser_interp_append(chain, part, location);
+    if (!chain)
+      goto fail;
+  }
+  free(literal);
+  return chain;
+
+fail:
+  if (!parser->has_error) {
+    parser_set_error(parser, "Out of memory in string interpolation");
+  }
+  ast_destroy_node(chain);
+  free(literal);
+  return NULL;
+}
+
 ASTNode *parser_parse_primary_expression(Parser *parser) {
   if (!parser)
     return NULL;
@@ -3049,8 +3234,15 @@ ASTNode *parser_parse_primary_expression(Parser *parser) {
     return result;
   }
   case TOKEN_STRING: {
-    ASTNode *result =
-        ast_create_string_literal(parser->current_token.value, location);
+    ASTNode *result;
+    if (parser->current_token.value &&
+        strchr(parser->current_token.value, '{')) {
+      result = parser_parse_interpolated_string(
+          parser, parser->current_token.value, location);
+    } else {
+      result =
+          ast_create_string_literal(parser->current_token.value, location);
+    }
     parser_advance(parser);
     return result;
   }

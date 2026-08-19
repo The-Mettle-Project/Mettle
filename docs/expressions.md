@@ -202,3 +202,34 @@ Comparison operators (`==`, `!=`, `<`, `<=`, `>`, `>=`) produce `int32` with val
 **Concatenation:** The `+` operator concatenates two `string` values. Both operands must be `string`; the result is a heap-backed string whose `.chars` points to a freshly allocated buffer and whose `.length` is the sum of the operand lengths. The allocation is emitted as a direct `calloc(1, size)` call.
 
 **Indexing:** Use `s.chars[i]` to access the i-th byte of a string. The `.chars` field is a pointer; indexing advances by 1 byte (element size of `uint8`). Pointer indexing is not bounds-checked; ensure `i < s.length` to avoid undefined behavior.
+
+## String Interpolation
+
+`{expr}` inside a string literal embeds the expression's value:
+
+```mettle
+var n: int32 = 42;
+var who: string = "world";
+println("hello {who}, n={n}, twice={n * 2}");
+```
+
+The parser splits the literal and desugars it to `+` concatenation, so an
+interpolated literal is an ordinary `string` expression. Each `{...}` holds one
+full expression, parsed with the normal grammar; braces inside it nest, so an
+expression that itself contains braces survives the scan.
+
+Accepted value types: every integer type, `bool` (prints `true`/`false`),
+`float32`/`float64`, and `string` (spliced as-is). Any other type is a compile
+error naming the type. Conversions run through the string runtime
+(`mettle_string_from_int` / `_uint` / `_bool` / `_f64` in
+`src/runtime/string.mettle`), linked only by programs that interpolate.
+
+Floats print in fixed form with up to six fractional digits, trailing zeros
+trimmed to at least one (`2.0`, `3.5`, `0.333333`). At or above 1e17, and below
+1e-4, the form switches to a decimal exponent (`1.234568e20`, `1.0e-5`).
+Non-finite values print `nan`, `inf`, `-inf`. Formatting is deterministic; it
+is not shortest-round-trip.
+
+Escapes: only `{` is special. `{{` produces a literal `{`; `}` is an ordinary
+character everywhere except as the terminator of an open interpolation.
+`{}` (empty) and an unterminated `{` are compile errors.

@@ -19,6 +19,121 @@
 // A program that never compares strings never names this symbol and never
 // links this object.
 
+// Value-to-string conversions, for "{expr}" interpolation. IR lowering picks
+// one per interpolated type; a program that never interpolates names none of
+// them and links none of this.
+//
+// Digits are written back-to-front into one heap-allocated scratch block. The
+// block must outlive the returned view, so it is `new` storage, never a stack
+// local, which the escape checker would rightly reject.
+
+struct MettleStringScratch {
+    bytes: uint8[32]
+}
+
+export fn mettle_string_from_uint(value: uint64) -> string {
+    var scratch: MettleStringScratch* = new MettleStringScratch;
+    var pos: int64 = 32;
+    var v: uint64 = value;
+    if (v == 0) {
+        pos = pos - 1;
+        scratch->bytes[pos] = (uint8)48;
+    }
+    while (v > 0) {
+        pos = pos - 1;
+        scratch->bytes[pos] = (uint8)(48 + (v % 10));
+        v = v / 10;
+    }
+    var s: string;
+    s.chars = &scratch->bytes[pos];
+    s.length = (uint64)(32 - pos);
+    return s;
+}
+
+export fn mettle_string_from_int(value: int64) -> string {
+    if (value >= 0) {
+        return mettle_string_from_uint((uint64)value);
+    }
+    var magnitude: uint64 = (uint64)0 - (uint64)value;
+    return "-" + mettle_string_from_uint(magnitude);
+}
+
+export fn mettle_string_from_bool(value: int64) -> string {
+    if (value != 0) {
+        return "true";
+    }
+    return "false";
+}
+
+// Fixed-point rendering with six fractional digits, trailing zeros trimmed to
+// at least one. Values at or above 1e17 and positive values below 1e-4 render
+// as d.dddddd with a decimal exponent instead, because past those points the
+// fixed form is either wider than it is honest or all zeros. Not
+// shortest-round-trip; six significant fractional digits is the contract.
+fn mettle_string_f64_fixed(value: float64) -> string {
+    var int_part: int64 = (int64)value;
+    var frac: float64 = value - (float64)int_part;
+    var scaled: int64 = (int64)(frac * 1000000.0 + 0.5);
+    if (scaled >= 1000000) {
+        scaled = scaled - 1000000;
+        int_part = int_part + 1;
+    }
+    // 1000000 + scaled prints as "1xxxxxx"; dropping the '1' leaves the six
+    // fractional digits zero-padded without a padding loop.
+    var padded: string = mettle_string_from_uint((uint64)(1000000 + scaled));
+    var frac_str: string;
+    frac_str.chars = padded.chars + 1;
+    frac_str.length = padded.length - 1;
+    while (frac_str.length > 1) {
+        if (frac_str.chars[frac_str.length - 1] != 48) {
+            break;
+        }
+        frac_str.length = frac_str.length - 1;
+    }
+    return mettle_string_from_uint((uint64)int_part) + "." + frac_str;
+}
+
+// Takes the raw IEEE-754 bits in a GP register. The call is injected at IR
+// lowering with no frontend symbol, so the caller's argument marshaling has no
+// declared parameter type to route an XMM value by; bits in an integer
+// register need no routing at all.
+export fn mettle_string_from_f64(bits: int64) -> string {
+    var tmp: int64 = bits;
+    var reinterpret: float64* = (float64*)(&tmp);
+    var value: float64 = *reinterpret;
+    if (value != value) {
+        return "nan";
+    }
+    var v: float64 = value;
+    var sign: string = "";
+    if (v < 0.0) {
+        sign = "-";
+        v = 0.0 - v;
+    }
+    // Only zero and infinity survive halving unchanged.
+    if (v * 0.5 == v) {
+        if (v != 0.0) {
+            return sign + "inf";
+        }
+        return sign + "0.0";
+    }
+    var upper: float64 = 100000000000000000.0;
+    var lower: float64 = 0.0001;
+    if (v >= upper || v < lower) {
+        var exponent: int64 = 0;
+        while (v >= 10.0) {
+            v = v / 10.0;
+            exponent = exponent + 1;
+        }
+        while (v < 1.0) {
+            v = v * 10.0;
+            exponent = exponent - 1;
+        }
+        return sign + mettle_string_f64_fixed(v) + "e" + mettle_string_from_int(exponent);
+    }
+    return sign + mettle_string_f64_fixed(v);
+}
+
 export fn mettle_string_eq(a: string, b: string) -> int32 {
     if (a.length != b.length) {
         return 0;

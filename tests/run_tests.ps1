@@ -2780,6 +2780,36 @@ foreach ($sbvMode in @("debug", "release")) {
   }
 }
 
+# "{expr}" interpolation desugars to concat plus a mettle_string_from_*
+# conversion per part; the conversions live in the string runtime as Mettle
+# source. Both backends, and the concat-chain fixture separately because the
+# binary-expression chain fuser once claimed a string '+' pair as integer
+# arithmetic.
+foreach ($interpCase in @(
+    @{ Name = "string_interpolation"; File = "tests/test_string_interpolation.mettle" },
+    @{ Name = "string_concat_chain"; File = "tests/test_string_concat_chain.mettle" })) {
+  foreach ($interpMode in @("debug", "release")) {
+    $total++
+    try {
+      $exe = Join-Path $tmpDir "$($interpCase.Name)_$interpMode.exe"
+      $buildArgs = @()
+      if ($interpMode -eq "release") { $buildArgs += "--release" }
+      $buildArgs += @("--build", $interpCase.File, "-o", $exe)
+      $out = & $CompilerPath @buildArgs 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) { throw "$($interpCase.Name) ($interpMode) build failed: $out" }
+      & $exe *> $null
+      if ($LASTEXITCODE -ne 66) {
+        throw "$($interpCase.Name) ($interpMode) returned $LASTEXITCODE (expected 66; the code names the shape)"
+      }
+      Write-CaseResult -Name "$($interpCase.Name)_$interpMode" -Passed $true
+    }
+    catch {
+      $failed++
+      Write-CaseResult -Name "$($interpCase.Name)_$interpMode" -Passed $false -Reason $_.Exception.Message
+    }
+  }
+}
+
 # String comparison is opt-in by use: a program that never compares strings
 # never names mettle_string_ and never links it.
 $total++

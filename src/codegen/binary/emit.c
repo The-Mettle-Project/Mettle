@@ -3541,6 +3541,12 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
     call_return_type = function_symbol->data.function.return_type
                            ? function_symbol->data.function.return_type
                            : function_symbol->type;
+  } else if (instruction->value_type) {
+    /* A runtime call injected at IR lowering (no frontend symbol) carries its
+     * return type on the instruction; without this a string-returning helper
+     * would be classified as a plain register return and its hidden
+     * out-pointer never passed. */
+    call_return_type = instruction->value_type;
   }
   /* SysV hands back an aggregate of 16 bytes or less in registers, so those
    * take no hidden out-pointer. Only the MEMORY class does. */
@@ -4547,6 +4553,12 @@ static int binary_emit_string_concat(CodeGenerator *generator,
       !binary_emit_mov_reg_imm64(&context->code, BINARY_GP_RCX, 0) ||
       !binary_emit_mov_mem_reg8(&context->code, BINARY_GP_R8, 0,
                                 BINARY_GP_RCX) ||
+      /* The dest temp holds the record's ADDRESS, the same disposition as an
+       * INDIRECT call return. Register it in the same side table so aggregate
+       * argument marshaling dereferences the temp instead of copying the slot
+       * itself as if the record were inline. */
+      (instruction->dest.kind == IR_OPERAND_TEMP && instruction->dest.name &&
+       !binary_indirect_temp_add(context, instruction->dest.name, 16)) ||
       !code_generator_binary_emit_destination_store(generator, context,
                                                     &instruction->dest,
                                                     BINARY_GP_RAX)) {

@@ -1735,6 +1735,10 @@ int mir_function_is_eligible(CodeGenerator *generator,
       if (!in->text) {
         return 0;
       }
+      /* String '+' is the concat kernel; only the fallback emitter has it. */
+      if (in->value_type && in->value_type->kind == MTLC_TYPE_STRING) {
+        return mir_trace_bail(ir_function, "binary:string");
+      }
       if (in->is_float) {
         /* Float arithmetic, or an ordered float comparison (<,<=,>,>=). */
         int sw;

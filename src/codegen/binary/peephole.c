@@ -2478,6 +2478,16 @@ int code_generator_binary_try_emit_binary_expression_chain(
     return 0;
   }
 
+  /* A string '+' is a concat kernel, never chainable integer arithmetic.
+   * Fusing one here emitted the record-pointer sum of the two operands, which
+   * downstream then dereferenced. */
+  if ((producer->value_type &&
+       producer->value_type->kind == MTLC_TYPE_STRING) ||
+      (consumer->value_type &&
+       consumer->value_type->kind == MTLC_TYPE_STRING)) {
+    return 0;
+  }
+
   if (code_generator_binary_operand_uses_temp(&consumer->lhs,
                                               producer->dest.name)) {
     rhs = &consumer->rhs;

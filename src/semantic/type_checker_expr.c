@@ -2243,6 +2243,46 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
                    : NULL;
       }
 
+      /* String interpolation conversion, synthesized by the parser for each
+       * "{expr}" part. It types as string for every value the runtime can
+       * render; IR lowering picks the mettle_string_from_* helper. */
+      if (strcmp(call->function_name, "__mtl_interp") == 0) {
+        if (call->argument_count != 1 || !call->arguments ||
+            !call->arguments[0]) {
+          type_checker_set_error_at_location(
+              checker, expression->location,
+              "String interpolation takes exactly one value");
+          return NULL;
+        }
+        Type *value_type =
+            type_checker_infer_type(checker, call->arguments[0]);
+        if (!value_type) {
+          return NULL;
+        }
+        switch (value_type->kind) {
+        case TYPE_INT8:
+        case TYPE_INT16:
+        case TYPE_INT32:
+        case TYPE_INT64:
+        case TYPE_UINT8:
+        case TYPE_UINT16:
+        case TYPE_UINT32:
+        case TYPE_UINT64:
+        case TYPE_BOOL:
+        case TYPE_FLOAT32:
+        case TYPE_FLOAT64:
+        case TYPE_STRING:
+          return checker->builtin_string;
+        default:
+          type_checker_set_error_at_location(
+              checker, call->arguments[0]->location,
+              "Cannot interpolate a value of type '%s' into a string; "
+              "interpolation takes integers, booleans, floats, and strings",
+              value_type->name ? value_type->name : "?");
+          return NULL;
+        }
+      }
+
     }
 
     {

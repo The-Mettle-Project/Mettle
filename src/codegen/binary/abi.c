@@ -1895,6 +1895,11 @@ int code_generator_binary_prepare_function_context(
       ret_t = callee->data.function.return_type
                   ? callee->data.function.return_type
                   : callee->type;
+    } else if (pp_insn->value_type) {
+      /* Symbol-less runtime call injected at IR lowering: the return type
+       * lives on the instruction. Keep in step with the call emitter's
+       * call_return_type fallback or the cursor and the plan disagree. */
+      ret_t = pp_insn->value_type;
     }
     /* A SysV aggregate of 16 bytes or less comes back in registers and is
      * spilled into one of these slots, so it needs one reserved even though it

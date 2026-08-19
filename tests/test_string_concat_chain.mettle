@@ -1,0 +1,38 @@
+// Chained '+' on strings, where at least one operand is a TEMP rather than a
+// named local. The binary-expression chain fuser used to claim the pair as
+// integer arithmetic and emit the sum of the two record pointers, which
+// downstream dereferenced; and a concat result temp passed by value used to be
+// copied as if the record were inline in the temp's slot. @noinline keeps the
+// call boundaries real.
+
+@noinline fn make(tag: string) -> string {
+    return tag + "!";
+}
+
+@noinline fn take(s: string) -> int32 {
+    return (int32)s.length;
+}
+
+fn main() -> int32 {
+    // Two literal concats back to back: both operands of the outer '+' are
+    // temps by the time codegen sees them.
+    var abc: string = "a" + "b" + "c";
+    if (abc != "abc") { return 1; }
+    if (abc.length != (uint64)3) { return 2; }
+
+    // Right-nested grouping.
+    var nested: string = "a" + ("b" + "c");
+    if (nested != "abc") { return 3; }
+
+    // A call result as a concat operand, and a concat result fed straight to a
+    // call with no named local in between.
+    if ("say " + make("hi") != "say hi!") { return 4; }
+    if (take("xx" + "yy" + "zz") != 6) { return 5; }
+
+    // Longer chain with a variable in the middle.
+    var mid: string = "midpoint";
+    var long_chain: string = "<" + "[" + mid + "]" + ">";
+    if (long_chain != "<[midpoint]>") { return 6; }
+
+    return 66;
+}
