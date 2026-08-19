@@ -20,7 +20,9 @@ export fn print(msg: string) {
 }
 
 // Write a string followed by a newline.
-export fn println(msg: string) {
+// @inline: two calls trip the inliner's call-count cap, and this wrapper is
+// exactly the case the decorator exists for.
+@inline export fn println(msg: string) {
   print(msg);
   putchar(10);
 }
@@ -102,7 +104,7 @@ export fn print_err(msg: string) {
 }
 
 // Write message to stderr followed by newline
-export fn println_err(msg: string) {
+@inline export fn println_err(msg: string) {
   print_err(msg);
   fwrite("\n".chars, 1, 1, get_stderr());
 }

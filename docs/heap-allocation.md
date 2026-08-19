@@ -18,6 +18,19 @@ no element type, and a deallocator takes one. `rawptr` converts to and from
 every pointer type, so neither `var a: int32* = malloc(n)` nor `free(a)` needs
 a cast.
 
+Sizes are `int64`. Literals, `sizeof(T)`, arithmetic over them, and every
+integer type up through `uint32` pass with no cast; those conversions widen.
+The one argument type that needs a cast is `uint64`, because `uint64` to
+`int64` can change the value, and Mettle narrows loudly. In practice this
+means `string.length`:
+
+```mettle
+var copy: rawptr = malloc((int64)s.length + 1);
+```
+
+A `uint64` signature would move the cast to the common side: `int64` and
+`int32` arguments would then need one, on the same rule.
+
 Memory has an explicit lifetime. Free a buffer with the API that created it.
 Do not free stack storage or an OS handle. The runtime checks its own allocation
 headers but does not add automatic object lifetime or tracing.
