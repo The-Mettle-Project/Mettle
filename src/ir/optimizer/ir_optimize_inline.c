@@ -965,9 +965,8 @@ static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
  * multiplies the work done per real call: depth 1 turns each call into ~the
  * work of a small subtree, cutting the dynamic call count by the subtree
  * size. Growth is bounded by a body-size cap, so deep expansion stops on its
- * own. Loop-bearing recursive functions are excluded: the inliner's
- * structural loop guards exist to sidestep a latent optimizer bug, and the
- * combination is rare enough not to be worth the risk. */
+ * own. Loop-bearing recursive bodies (a quicksort partition, a merge) expand
+ * too: the label-rename map keeps each clone's loops disjoint. */
 static int ir_function_is_self_inline_candidate(const IRFunction *function,
                                                 size_t *self_call_count_out) {
   if (!function || !function->name || function->instruction_count == 0 ||
@@ -988,11 +987,6 @@ static int ir_function_is_self_inline_candidate(const IRFunction *function,
     }
     if (instruction->op == IR_OP_INLINE_ASM ||
         instruction->op == IR_OP_CALL_INDIRECT) {
-      return 0;
-    }
-    if (instruction->op == IR_OP_LABEL && instruction->text &&
-        (strncmp(instruction->text, "ir_while_", 9) == 0 ||
-         strstr(instruction->text, "_lbl_ir_while_") != NULL)) {
       return 0;
     }
     if (instruction->op == IR_OP_CALL && instruction->text &&
