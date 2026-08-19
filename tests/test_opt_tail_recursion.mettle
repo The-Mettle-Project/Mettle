@@ -60,7 +60,7 @@ fn main() -> int32 {
   while (i < n) {
     if (data[i - 1] > data[i]) {
       print("qsr NOT SORTED at ");
-      println_int((int64)i);
+      println("{(int64)i}");
       return 2;
     }
     i = i + 1;

@@ -105,7 +105,7 @@ fn main() -> int32 {
     } else {
       println(correct);
       print(guesses_label);
-      println_int(guesses);
+      println("{guesses}");
       return 0;
     }
   }

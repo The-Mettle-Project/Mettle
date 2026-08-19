@@ -443,7 +443,7 @@ Two sharp edges:
 - `errdefer` is **function-only and convention-based**: returning `0` runs only
   the defers; returning any non-zero value runs defers *and* errdefers.
 - **Argument capture differs by call shape.** A deferred *direct call*
-  snapshots its argument values at the defer point, so `defer print_int(i)` in
+  snapshots its argument values at the defer point, so `defer print("{i}")` in
   a loop prints 0, 1, 2. A deferred *method call* or *function-pointer call*
   re-evaluates its operands at scope exit. Snapshot into a local first when
   that matters.

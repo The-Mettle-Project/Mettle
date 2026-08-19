@@ -11,23 +11,23 @@ L	weighted_sum	0	S	69
 L	sum_array	0	S	79
 C	main	fill_data	0	R	97
 C	main	println	0	R	99
-C	main	copy_array	0	R	101
-C	main	radix_sort	0	R	102
+C	main	copy_array	0	I	101
+C	main	radix_sort	0	I	102
 C	main	weighted_sum	0	R	103
-C	main	print	0	R	104
-C	main	println_int	0	R	105
+C	main	print	0	I	104
+C	main	println_int	0	I	105
 C	main	println	1	R	107
-C	main	bench_time_us	0	R	109
+C	main	bench_time_us	0	I	109
 L	main	0	S	112
-C	main	copy_array	1	R	113
-C	main	radix_sort	1	R	114
+C	main	copy_array	1	I	113
+C	main	radix_sort	1	I	114
 C	main	sum_array	0	R	115
-C	main	bench_time_us	1	R	118
-C	main	print	1	R	120
-C	main	println_int	1	R	121
-C	main	print	2	R	122
+C	main	bench_time_us	1	I	118
+C	main	print	1	I	120
+C	main	println_int	1	I	121
+C	main	print	2	I	122
 C	main	print_int	0	R	123
 C	main	println	2	R	124
-C	main	print	3	R	127
+C	main	print	3	I	127
 C	main	print_int	1	R	128
 C	main	println	3	R	129

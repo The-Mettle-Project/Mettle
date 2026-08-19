@@ -38,7 +38,7 @@ fn main() -> int32 {
   }
   if (owned_count != 4000) {
     println("PTHREAD OWNED FAIL: count");
-    println_int(owned_count);
+    println("{owned_count}");
     return 1;
   }
   if (mutex_destroy_posix(owned_mutex) != 0) {

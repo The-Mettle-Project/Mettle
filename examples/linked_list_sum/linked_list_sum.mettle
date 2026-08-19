@@ -85,7 +85,7 @@ fn main() -> int32 {
 
   var check: int64 = sum_chase(nodes, head);
   print("Checksum = ");
-  println_int(check);
+  println("{check}");
 
   var passes: int32 = 200;
   println("Benchmark: 200 passes (linked_list_sum)");
@@ -100,14 +100,14 @@ fn main() -> int32 {
   var elapsed_us: int64 = bench_time_us() - t0;
 
   print("Bench sum = ");
-  println_int(bench_sum);
+  println("{bench_sum}");
   print("Time: ");
-  print_int(elapsed_us);
+  print("{elapsed_us}");
   println(" us");
 
   var per_pass: int64 = elapsed_us / passes;
   print("Per pass: ~");
-  print_int(per_pass);
+  print("{per_pass}");
   println(" us");
 
   free(nodes);

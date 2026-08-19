@@ -99,6 +99,6 @@ fn main() -> int32 {
     clean_consume_once();
     clean_kept_elsewhere();
     clean_kept_through_helper();
-    println_int(total);
+    println("{total}");
     return 0;
 }

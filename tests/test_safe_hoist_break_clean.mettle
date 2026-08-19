@@ -31,6 +31,6 @@ fn main() -> int32 {
   // 1 + 2 + ... + 8 = 36, so it breaks on the eighth element, still in bounds.
   var got: int32 = walk(&small[0], 1000);
   print("walk=");
-  println_int((int64)got);
+  println("{(int64)got}");
   return 0;
 }

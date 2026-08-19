@@ -175,7 +175,7 @@ fn main() -> int32 {
   if (eq64(max_f64(pd, 40), max_f64_ref(pd, 40)) == 0) { bad = bad + 1; }
   if (eq64(min_f64(pd, 40), min_f64_ref(pd, 40)) == 0) { bad = bad + 1; }
 
-  print_int(bad);
+  print("{bad}");
   newline();
   return bad;
 }

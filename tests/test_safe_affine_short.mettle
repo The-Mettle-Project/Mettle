@@ -89,7 +89,7 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   }
 
   print("unreached=");
-  println_int((int64)got);
+  println("{(int64)got}");
   free(m);
   return 0;
 }

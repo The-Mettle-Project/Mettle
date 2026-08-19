@@ -1,4 +1,5 @@
 import "std/io"
+import "std/mem"
 
 fn double_all(a: int32*, n: int32) {
     for i in 0..n { a[i] = a[i] * 2; }
@@ -9,6 +10,8 @@ fn main() -> int32 {
     var i: int32 = 0;
     while (i < 32) { v[i] = i; i = i + 1; }
     double_all(&v[0], 32);
-    print_int(v[5]);
+    var p: cstring = cstr("copy me", &malloc);
+    free(p);
+    print("{v[5]}");
     return 0;
 }

@@ -78,7 +78,7 @@ fn k_min(arr: int32*, n: int64) -> int32 {
 var g_fail: int32 = 0;
 
 fn fail(label: string, len: int64) -> int32 {
-  print("FAIL "); print(label); print(" n="); print_int(len);
+  print("FAIL "); print(label); print(" n="); print("{len}");
   println("");
   g_fail = g_fail + 1;
   return 0;
@@ -164,6 +164,6 @@ fn main() -> int32 {
   while (k < 32) { run_len(lens[k]); k = k + 1; }
 
   if (g_fail == 0) { println("INT SIMD: ALL OK"); return 0; }
-  print("INT SIMD FAILURES: "); print_int((int64)g_fail); println("");
+  print("INT SIMD FAILURES: "); print("{(int64)g_fail}"); println("");
   return 1;
 }

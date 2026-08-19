@@ -31,9 +31,9 @@ fn main() -> int32 {
   var elapsed_us: int64 = bench_time_us() - t0;
 
   print("Checksum = ");
-  println_int(acc);
+  println("{acc}");
   print("Time: ");
-  print_int(elapsed_us);
+  print("{elapsed_us}");
   println(" us");
   return 0;
 }

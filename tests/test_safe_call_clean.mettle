@@ -79,7 +79,7 @@ fn main() -> int32 {
   got = got + against_library(p, q, bytes); // 16
 
   print("calls=");
-  println_int(got);
+  println("{got}");
   free(a);
   free(p);
   free(q);

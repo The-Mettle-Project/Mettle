@@ -33,6 +33,6 @@ fn main() -> int32 {
   }
 
   var s: int64 = dot(a, b, n + 64);
-  println_int(s);
+  println("{s}");
   return (int32)(s % 128);
 }

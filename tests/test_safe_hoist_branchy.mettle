@@ -27,6 +27,6 @@ fn main() -> int32 {
     i = i + 1;
   }
   // 100 elements out of an 8-element array.
-  println_int((int64)total(&small[0], 100));
+  println("{(int64)total(&small[0], 100)}");
   return 0;
 }

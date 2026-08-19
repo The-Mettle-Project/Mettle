@@ -27,6 +27,6 @@ fn main() -> int32 {
     i = i + 1;
   }
   print("guarded=");
-  println_int((int64)guarded(&small[0], 1000));
+  println("{(int64)guarded(&small[0], 1000)}");
   return 0;
 }

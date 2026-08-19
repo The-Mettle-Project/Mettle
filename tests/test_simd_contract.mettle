@@ -21,7 +21,7 @@ fn main() -> int32 {
     a[i] = (int8)2;
     b[i] = (int8)3;
   }
-  print_int((int64)qdot(a, b, n)); // 64 * 6 = 384
+  print("{(int64)qdot(a, b, n)}"); // 64 * 6 = 384
   println("");
   return 0;
 }

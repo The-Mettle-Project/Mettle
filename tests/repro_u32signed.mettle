@@ -63,11 +63,11 @@ fn main() -> int32 {
       var ref: uint32 = x / y + x % y + (x >> 3);
       if (hc[i] != ref) { ok = 0; }
       // print to see actual values
-      print("x="); print_int((int64)x);
-      print(" x/y="); print_int((int64)(x / y));
-      print(" x%y="); print_int((int64)(x % y));
-      print(" x>>3="); print_int((int64)(x >> 3));
-      print(" castx="); print_int((int64)x);
+      print("x="); print("{(int64)x}");
+      print(" x/y="); print("{(int64)(x / y)}");
+      print(" x%y="); print("{(int64)(x % y)}");
+      print(" x>>3="); print("{(int64)(x >> 3)}");
+      print(" castx="); print("{(int64)x}");
       println("");
       i = i + 1;
     }
@@ -76,6 +76,6 @@ fn main() -> int32 {
     free(ha); free(hb); free(hc);
   }
 
-  print("fails="); print_int((int64)fails); println("");
+  print("fails="); print("{(int64)fails}"); println("");
   return 0;
 }

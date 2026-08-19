@@ -25,7 +25,7 @@ fn main() -> int32 {
         p[i] = (int16)i;
     }
 
-    print_int(row_energy(p, 32, 3));
+    print("{row_energy(p, 32, 3)}");
     newline();
     return 0;
 }

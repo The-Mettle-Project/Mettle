@@ -25,7 +25,7 @@ fn main() -> int32 {
 
   var result: int64 = sum_squares(100000);
   print("Sum = ");
-  println_int(result);
+  println("{result}");
 
   var passes: int32 = 200;
   println("Benchmark: 200 passes (sum_squares 100000 each)");
@@ -40,15 +40,15 @@ fn main() -> int32 {
   var elapsed_us: int64 = bench_time_us() - t0;
 
   print("Bench sum = ");
-  println_int(bench_sum);
+  println("{bench_sum}");
 
   print("Time: ");
-  print_int(elapsed_us);
+  print("{elapsed_us}");
   println(" us");
 
   var per_pass: int64 = elapsed_us / passes;
   print("Per pass: ~");
-  print_int(per_pass);
+  print("{per_pass}");
   println(" us");
 
   return 0;

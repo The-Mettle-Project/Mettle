@@ -131,7 +131,7 @@ fn vmap_sqdiff_f32(out: float32*, a: float32*, b: float32*,
 
 var g_fail: int32 = 0;
 fn fail(label: string, len: int64) -> int32 {
-  print("FAIL "); print(label); print(" n="); print_int(len);
+  print("FAIL "); print(label); print(" n="); print("{len}");
   println("");
   g_fail = g_fail + 1;
   return 0;
@@ -231,6 +231,6 @@ fn main() -> int32 {
   while (k < 32) { run_len(lens[k]); k = k + 1; }
 
   if (g_fail == 0) { println("FLOAT SIMD: ALL OK"); return 0; }
-  print("FLOAT SIMD FAILURES: "); print_int((int64)g_fail); println("");
+  print("FLOAT SIMD FAILURES: "); print("{(int64)g_fail}"); println("");
   return 1;
 }

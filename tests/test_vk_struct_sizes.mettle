@@ -166,25 +166,25 @@ import "std/io";
 
 export fn main() -> int32 {
   print("StageInfo ");
-  print_int((int64)sizeof(VkPipelineShaderStageCreateInfo));
+  print("{(int64)sizeof(VkPipelineShaderStageCreateInfo)}");
   newline();
   print("GraphicsPipeline ");
-  print_int((int64)sizeof(VkGraphicsPipelineCreateInfo));
+  print("{(int64)sizeof(VkGraphicsPipelineCreateInfo)}");
   newline();
   print("DepthStencil ");
-  print_int((int64)sizeof(VkPipelineDepthStencilStateCreateInfo));
+  print("{(int64)sizeof(VkPipelineDepthStencilStateCreateInfo)}");
   newline();
   print("Raster ");
-  print_int((int64)sizeof(VkPipelineRasterizationStateCreateInfo));
+  print("{(int64)sizeof(VkPipelineRasterizationStateCreateInfo)}");
   newline();
   print("ColorBlend ");
-  print_int((int64)sizeof(VkPipelineColorBlendStateCreateInfo));
+  print("{(int64)sizeof(VkPipelineColorBlendStateCreateInfo)}");
   newline();
   print("VertexInput ");
-  print_int((int64)sizeof(VkPipelineVertexInputStateCreateInfo));
+  print("{(int64)sizeof(VkPipelineVertexInputStateCreateInfo)}");
   newline();
   print("Layout ");
-  print_int((int64)sizeof(VkPipelineLayoutCreateInfo));
+  print("{(int64)sizeof(VkPipelineLayoutCreateInfo)}");
   newline();
   return 0;
 }

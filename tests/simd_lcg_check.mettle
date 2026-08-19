@@ -39,7 +39,7 @@ fn main() -> int32 {
   total = total + check_one(456, 100000);
   total = total + check_one(789, 999983);
   print("LCG check = ");
-  println_int(total);
+  println("{total}");
   // Golden value: identical for the --release (IR_OP_SIMD_LCG_U32 vectorized)
   // and -O0 (scalar) builds; verified bit-exact. A kernel regression (wrong
   // A^8 / lane offset / widening / tail) changes this and fails the test.

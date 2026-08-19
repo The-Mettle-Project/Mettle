@@ -45,10 +45,10 @@ fn count_to(n: int64) -> int64 {
 
 fn main() -> int32 {
   print("lin=");
-  println_int(sum_linear(1000));      // 500500
+  println("{sum_linear(1000)}");      // 500500
   print("aff=");
-  println_int(sum_affine(1003));      // 1517539
+  println("{sum_affine(1003)}");      // 1517539
   print("cnt=");
-  println_int(count_to(777));         // 777
+  println("{count_to(777)}");         // 777
   return 0;
 }

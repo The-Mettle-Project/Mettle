@@ -42,39 +42,8 @@ export fn newline() {
   putchar(10);
 }
 
-// Print an integer to stdout (base 10, handles negatives)
-export fn print_int(n: int64) {
-  var buf: uint8[22];
-  var pos: int32 = 21;
-  var neg: int32 = 0;
-  buf[21] = 0;
-  if (n < 0) {
-    neg = 1;
-    n = 0 - n;
-  }
-  if (n == 0) {
-    buf[0] = 48;
-    buf[1] = 0;
-    fputs(&buf[0], get_stdout());
-    return;
-  }
-  while (n > 0) {
-    pos = pos - 1;
-    buf[pos] = (uint8)(48 + n - (n / 10) * 10);
-    n = n / 10;
-  }
-  if (neg != 0) {
-    pos = pos - 1;
-    buf[pos] = 45;
-  }
-  fputs(&buf[pos], get_stdout());
-}
-
-// Print an integer followed by a newline
-export fn println_int(n: int64) {
-  print_int(n);
-  putchar(10);
-}
+// Values print through interpolation: println("{n}"). The print_int family
+// this file used to carry is gone; one pair of printers, one way to do it.
 
 // ─── File I/O ───────────────────────────────────────────────────────────────
 // FILE* is represented as cstring (opaque pointer)

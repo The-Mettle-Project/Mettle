@@ -160,7 +160,7 @@ fn main() -> int32 {
   acc = acc + (int64)rc_call_in_body(&ia[0], 64);
 
   print("corpus acc = ");
-  print_int(acc);
+  print("{acc}");
   newline();
   return 0;
 }

@@ -147,16 +147,16 @@ fn main() -> int32 {
     var cls: int32 = argmax(out_logits, OUT);
 
     print("sample ");
-    print_int((int64)sample);
+    print("{(int64)sample}");
     print(": logits [ ");
     var c: int64 = 0;
     while (c < OUT) {
-      print_int((int64)out_logits[c]);
+      print("{(int64)out_logits[c]}");
       print(" ");
       c = c + 1;
     }
     print("] -> class ");
-    println_int((int64)cls);
+    println("{(int64)cls}");
 
     sample = sample + 1;
   }

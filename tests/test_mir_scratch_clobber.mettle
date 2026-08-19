@@ -107,7 +107,7 @@ fn main() -> int32 {
 
   if (bad != 0) {
     print("mir_scratch_clobber MISMATCH count=");
-    print_int(bad);
+    print("{bad}");
     newline();
     fflush(get_stdout());
     return 1;

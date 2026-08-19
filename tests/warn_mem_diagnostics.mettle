@@ -98,6 +98,6 @@ fn main() -> int32 {
     while (k < 8) { values[k] = k; k = k + 1; }
     var total: int32 = double_free_then_use() + leak_sixty_four() + clean(3) + null_deref() + over_shift(1) + wild_pointer() + clean_guarded_null(0) + clean_loop(&values[0]) + clean_loop_with_break(4);
     stash_stack_address();
-    println_int(total);
+    println("{total}");
     return 0;
 }

@@ -98,7 +98,7 @@ fn main() -> int32 {
   matmul(&a[0], &b[0], &c[0]);
   var check: int64 = trace_matrix(&c[0]);
   print("Trace = ");
-  println_int(check);
+  println("{check}");
 
   println("Benchmark: 200 passes (matmul)");
 
@@ -113,15 +113,15 @@ fn main() -> int32 {
   var elapsed_us: int64 = bench_time_us() - t0;
 
   print("Bench sum = ");
-  println_int(bench_sum);
+  println("{bench_sum}");
 
   print("Time: ");
-  print_int(elapsed_us);
+  print("{elapsed_us}");
   println(" us");
 
   var per_pass: int64 = elapsed_us / passes;
   print("Per pass: ~");
-  print_int(per_pass);
+  print("{per_pass}");
   println(" us");
 
   return 0;

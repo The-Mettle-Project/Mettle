@@ -43,6 +43,6 @@ fn main() -> int32 {
     i = i + 1;
   }
   print("unreached=");
-  println_int((int64)walk(a, n));
+  println("{(int64)walk(a, n)}");
   return 0;
 }

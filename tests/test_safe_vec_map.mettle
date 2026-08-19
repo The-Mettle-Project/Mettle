@@ -23,6 +23,6 @@ fn main() -> int32 {
   }
 
   scale(dst, src, n + 64);
-  println_int((int64)dst[0]);
+  println("{(int64)dst[0]}");
   return (int32)dst[0];
 }

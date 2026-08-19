@@ -17,11 +17,11 @@ fn forward(off: int64) {
   while (l < 1) {
     load_f32(off, 3840, SNW);
     print("[forward] SNW[0..3]*1e4= "); var z: int64 = 0;
-    while (z < 4) { print_int((int64)(SNW[z]*10000.0)); print(" "); z = z + 1; }
+    while (z < 4) { print("{(int64)(SNW[z]*10000.0)}"); print(" "); z = z + 1; }
     println("");
     l = l + 1;
   }
-  print_int(a+b+c+d+e+f+g+h); println("");
+  print("{a+b+c+d+e+f+g+h}"); println("");
 }
 
 fn main() -> int32 {
@@ -31,11 +31,11 @@ fn main() -> int32 {
   var off: int64 = 830194688;
   var p: float32* = (float32*)(&WR[off]);
   p[0] = 17.875; p[1] = 30.375; p[2] = 0.0; p[3] = 16.125;
-  print("[main] WR="); print_int((int64)WR); println("");
+  print("[main] WR="); print("{(int64)WR}"); println("");
 
   load_f32(off, 3840, SNW);
   print("[main] load_f32 SNW[0..3]*1e4= "); var z: int64 = 0;
-  while (z < 4) { print_int((int64)(SNW[z]*10000.0)); print(" "); z = z + 1; }
+  while (z < 4) { print("{(int64)(SNW[z]*10000.0)}"); print(" "); z = z + 1; }
   println("");
 
   forward(off);

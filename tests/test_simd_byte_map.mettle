@@ -138,7 +138,7 @@ fn main() -> int32 {
     k = k + 1;
   }
 
-  print_int(bad);
+  print("{bad}");
   newline();
   return bad;
 }

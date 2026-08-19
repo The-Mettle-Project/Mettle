@@ -66,20 +66,20 @@ fn main() -> int32 {
   println("Word count: 256 KB buffer (a b pattern)");
 
   print("Words = ");
-  println_int(wc);
+  println("{wc}");
 
   println("Benchmark: 200 passes (word_count)");
 
   print("Total words = ");
-  println_int(total);
+  println("{total}");
 
   print("Time: ");
-  print_int(elapsed_us);
+  print("{elapsed_us}");
   println(" us");
 
   var per_pass: int64 = elapsed_us / passes;
   print("Per pass: ~");
-  print_int(per_pass);
+  print("{per_pass}");
   println(" us");
 
   free(buf);

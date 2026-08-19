@@ -100,11 +100,11 @@ fn report<T>(label: cstring, obj: T*, names: cstring*, bounds: Range*, n: int32)
   print(": ");
   print_cstr(names[bad]);
   print(" = ");
-  print_int((int64)values[bad]);
+  print("{(int64)values[bad]}");
   print(" is outside ");
-  print_int((int64)bounds[bad].lo);
+  print("{(int64)bounds[bad].lo}");
   print("..");
-  print_int((int64)bounds[bad].hi);
+  print("{(int64)bounds[bad].hi}");
   println("");
 }
 

@@ -14,10 +14,10 @@ fn work(off: int64, dst: int32*) {
   var e: int64 = 5; var f: int64 = 6; var g: int64 = 7; var h: int64 = 8;
   rdf(off, 3840, dst);
   print("[work] dst[0..3]= "); var z: int64 = 0;
-  while (z < 4) { print_int((int64)dst[z]); print(" "); z = z + 1; }
+  while (z < 4) { print("{(int64)dst[z]}"); print(" "); z = z + 1; }
   println("");
   // keep locals live
-  print_int(a+b+c+d+e+f+g+h);
+  print("{a+b+c+d+e+f+g+h}");
   println("");
 }
 
@@ -29,17 +29,17 @@ fn main() -> int32 {
   // write sentinels
   var p: int32* = (int32*)(&G[off]);
   p[0] = 111; p[1] = 222; p[2] = 333; p[3] = 444;
-  print("[main] G="); print_int((int64)G); print(" addr="); print_int((int64)p); println("");
+  print("[main] G="); print("{(int64)G}"); print(" addr="); print("{(int64)p}"); println("");
   // inline read-back
   var pr: int32* = (int32*)(&G[off]);
   print("[main] inline readback[0..3]= "); var zz: int64 = 0;
-  while (zz < 4) { print_int((int64)pr[zz]); print(" "); zz = zz + 1; }
+  while (zz < 4) { print("{(int64)pr[zz]}"); print(" "); zz = zz + 1; }
   println("");
 
   var d1: int32* = malloc(4*4096);
   rdf(off, 3840, d1);
   print("[main] rdf dst[0..3]= "); var z: int64 = 0;
-  while (z < 4) { print_int((int64)d1[z]); print(" "); z = z + 1; }
+  while (z < 4) { print("{(int64)d1[z]}"); print(" "); z = z + 1; }
   println("");
 
   var d2: int32* = malloc(4*4096);

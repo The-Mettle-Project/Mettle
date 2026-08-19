@@ -89,7 +89,7 @@ fn main() -> int32 {
   got = got + from_runtime(&m[0], cells - DIM, DIM); // 8
 
   print("affine=");
-  println_int((int64)got);
+  println("{(int64)got}");
   free(m);
   return 0;
 }

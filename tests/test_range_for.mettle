@@ -19,7 +19,7 @@ fn main() -> int32 {
     d = d + 1;
   }                                      // 10
 
-  print_int((int64)(a + b) + c + (int64)d); // 10+15+6+10 = 41
+  print("{(int64)(a + b) + c + (int64)d}"); // 10+15+6+10 = 41
   println("");
   return 0;
 }

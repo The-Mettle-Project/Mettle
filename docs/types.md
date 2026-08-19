@@ -132,7 +132,7 @@ import "std/io"
 fn main() -> int32 {
   var base: int32 = 10;
   var add: Fn(int32) -> int32 = fn(x: int32) -> int32 { return x + base; };  // captures base
-  print_int(add(5));    // 15
+  print("{add(5)}");    // 15
   return 0;
 }
 ```
@@ -144,8 +144,8 @@ fn counter(start: int32) -> Fn() -> int32 {
   return fn() -> int32 { start = start + 1; return start; };
 }
 var next: Fn() -> int32 = counter(0);
-println_int(next());   // 1
-println_int(next());   // 2 - state persists in the closure's environment
+println("{next()}");   // 1
+println("{next()}");   // 2 - state persists in the closure's environment
 ```
 
 Because a closure carries state, its type is distinct from a plain function pointer. A closure type is written with a capital **`Fn`**: `Fn(int32) -> int32`. A plain `fn(...)->R` stays a thin, C-compatible function pointer; `Fn(...)->R` is a stateful closure.
@@ -165,8 +165,8 @@ fn apply_twice(f: Fn(int32) -> int32, v: int32) -> int32 {
 
 fn main() -> int32 {
   var add: Fn(int32) -> int32 = make_adder(10);
-  println_int(add(5));            // 15
-  println_int(apply_twice(add, 0)); // 20
+  println("{add(5)}");            // 15
+  println("{apply_twice(add, 0)}"); // 20
   println_int(make_adder(3)(5));  // 8 - the returned closure is called directly
   return 0;
 }
@@ -183,9 +183,9 @@ fn main() -> int32 {
   var weight: int32 = 2;
   var h: Handler;
   h.on_event = fn(ev: int32) -> int32 { return ev * weight; };
-  println_int(h.on_event(21));   // 42
+  println("{h.on_event(21)}");   // 42
   var hp: Handler* = &h;
-  println_int(hp.on_event(5));   // 10
+  println("{hp.on_event(5)}");   // 10
   return 0;
 }
 ```
@@ -200,9 +200,9 @@ fn apply_twice(f: Fn(int32) -> int32, v: int32) -> int32 { return f(f(v)); }
 fn plus_one(x: int32) -> int32 { return x + 1; }
 
 fn main() -> int32 {
-  println_int(apply_twice(&plus_one, 5));   // 7 - a plain function, adapted
+  println("{apply_twice(&plus_one, 5)}");   // 7 - a plain function, adapted
   var f: Fn(int32) -> int32 = &plus_one;    // var-decl adaptation
-  println_int(f(10));                       // 11
+  println("{f(10)}");                       // 11
   return 0;
 }
 ```

@@ -45,8 +45,8 @@ fn main() -> int32 {
 
   var ok: int32 = 1; i = 0;
   while (i < n) { if (hc[i] != (float32)(3 * i)) { ok = 0; } i = i + 1; }
-  print("c[1]="); print_int((int64)hc[1]);
-  print("  c[n-1]="); print_int((int64)hc[n - 1]); println("");
+  print("c[1]="); print("{(int64)hc[1]}");
+  print("  c[n-1]="); print("{(int64)hc[n - 1]}"); println("");
   if (ok == 1) { println("GPU vadd correct (kernel + dispatch)"); }
   else { println("MISMATCH"); }
 

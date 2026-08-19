@@ -5,7 +5,7 @@ import "std/io";
 
 fn main() -> int32 {
   @simd! for i in 0..10 {
-    print_int(i);
+    print("{i}");
   }
   return 0;
 }

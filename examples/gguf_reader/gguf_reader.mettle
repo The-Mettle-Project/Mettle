@@ -82,7 +82,7 @@ fn print_ggml_type(t: int64) {
   if (t == 12) { print("Q4_K"); return; }
   if (t == 14) { print("Q6_K"); return; }
   if (t == 15) { print("Q8_K"); return; }
-  print("type#"); print_int(t);
+  print("type#"); print("{t}");
 }
 
 fn main() -> int32 {
@@ -110,9 +110,9 @@ fn main() -> int32 {
   var n_tensors: int64 = read_u64v(fp, b);
   var n_kv: int64 = read_u64v(fp, b);
 
-  print("GGUF version "); print_int(version);
-  print(",  "); print_int(n_tensors);
-  print(" tensors,  "); print_int(n_kv);
+  print("GGUF version "); print("{version}");
+  print(",  "); print("{n_tensors}");
+  print(" tensors,  "); print("{n_kv}");
   println(" metadata entries");
   println("------------------------------------------------------------");
 
@@ -132,8 +132,8 @@ fn main() -> int32 {
     } else if (vtype == 9) {                // array
       var et: int64 = read_u32v(fp, b);
       var cnt: int64 = read_u64v(fp, b);
-      print("[array of "); print_int(cnt);
-      print(" x type#"); print_int(et); println("]");
+      print("[array of "); print("{cnt}");
+      print(" x type#"); print("{et}"); println("]");
       // skip the elements
       if (et == 8) {
         var k: int64 = 0;
@@ -153,7 +153,7 @@ fn main() -> int32 {
       else if (sz == 4) { v = le_u32(b); }
       else if (sz == 2) { v = (int64)b[0] | ((int64)b[1] << 8); }
       else { v = (int64)b[0]; }
-      println_int(v);
+      println("{v}");
     } else {                                // float scalar (f32/f64)
       skip_bytes(fp, scr, scalar_size(vtype));
       println("(float)");
@@ -188,8 +188,8 @@ fn main() -> int32 {
       print("  ");
       print_cstr((cstring)key);
       print("  [");
-      print_int(d0);
-      if (ndim > 1) { print(" x "); print_int(d1); }
+      print("{d0}");
+      if (ndim > 1) { print(" x "); print("{d1}"); }
       print("]  ");
       print_ggml_type(gt);
       println("");
@@ -205,7 +205,7 @@ fn main() -> int32 {
       print("  ");
       print_ggml_type(h);
       print(": ");
-      println_int(hist[h]);
+      println("{hist[h]}");
     }
     h = h + 1;
   }

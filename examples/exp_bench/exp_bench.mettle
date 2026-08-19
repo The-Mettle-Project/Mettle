@@ -26,7 +26,7 @@ fn main() -> int32 {
     p = p + 1;
   }
   var elapsed: int64 = bench_time_us() - t0;
-  print("a0 x1e6 = "); println_int((int64)(a[0] * 1000000.0));
-  print("Time: "); print_int(elapsed); println(" us");
+  print("a0 x1e6 = "); println("{(int64)(a[0] * 1000000.0)}");
+  print("Time: "); print("{elapsed}"); println(" us");
   return 0;
 }

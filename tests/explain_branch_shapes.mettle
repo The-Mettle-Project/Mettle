@@ -93,7 +93,7 @@ fn main() -> int32 {
     acc = acc + clamp_all(pb, 64, 5.0);
     acc = acc + green_sum(pg, 64);
     acc = acc + row_sum(pg, 8, 3);
-    print_int(acc);
+    print("{acc}");
     newline();
     return 0;
 }

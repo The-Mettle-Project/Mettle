@@ -26,15 +26,15 @@ fn forward(off: int64) {
   while (l < 1) {
     load_f32(off, 3840, SNW);
     print("[fwd] snw after load[0..3]*1e4: "); var zz: int64 = 0;
-    while (zz < 4) { print_int((int64)(SNW[zz]*10000.0)); print(" "); zz = zz + 1; }
+    while (zz < 4) { print("{(int64)(SNW[zz]*10000.0)}"); print(" "); zz = zz + 1; }
     println("");
     rmsnorm(SX, SNW, SXN, 3840);
     print("[fwd] snw after rmsnorm[0..3]*1e4: "); zz = 0;
-    while (zz < 4) { print_int((int64)(SNW[zz]*10000.0)); print(" "); zz = zz + 1; }
+    while (zz < 4) { print("{(int64)(SNW[zz]*10000.0)}"); print(" "); zz = zz + 1; }
     println("");
     l = l + 1;
   }
-  print_int(a+b+c+d); println("");
+  print("{a+b+c+d}"); println("");
 }
 
 fn main() -> int32 {

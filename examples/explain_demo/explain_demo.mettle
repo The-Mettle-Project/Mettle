@@ -98,11 +98,11 @@ fn main() -> int32 {
   var shuffled: int64 = shuffle(blended);
   var divisor: int64 = gcd(blended, shuffled) + lo_byte(shuffled);
 
-  print("array_sum  = "); println_int(total);
-  print("step       = "); println_int(mixed);
-  print("bit_blend  = "); println_int(blended);
-  print("shuffle    = "); println_int(shuffled);
-  print("gcd+lo     = "); println_int(divisor);
+  print("array_sum  = "); println("{total}");
+  print("step       = "); println("{mixed}");
+  print("bit_blend  = "); println("{blended}");
+  print("shuffle    = "); println("{shuffled}");
+  print("gcd+lo     = "); println("{divisor}");
 
   // Small benchmark so the example does real work and reports a time.
   var passes: int32 = 2000;
@@ -115,8 +115,8 @@ fn main() -> int32 {
   }
   var elapsed_us: int64 = bench_time_us() - t0;
 
-  print("Bench sum  = "); println_int(bench_sum);
-  print("Time: "); print_int(elapsed_us); println(" us");
+  print("Bench sum  = "); println("{bench_sum}");
+  print("Time: "); print("{elapsed_us}"); println(" us");
 
   free(a);
   return 0;

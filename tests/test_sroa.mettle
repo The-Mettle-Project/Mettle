@@ -82,6 +82,6 @@ fn main() -> int32 {
     return 1;
   }
   print("sroa MISMATCHES: ");
-  println_int(fails);
+  println("{fails}");
   return 0;
 }

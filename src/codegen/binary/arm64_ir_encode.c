@@ -112,6 +112,7 @@ static const IRModuleSymbol *module_variable(const SlotMap *slots,
 typedef enum {
   STUB_MALLOC, STUB_CALLOC, STUB_FREE, STUB_PUTS, STUB_PUTCHAR, STUB_WRITE,
   STUB_STRLEN, STUB_MEMCPY, STUB_MEMMOVE, STUB_MEMSET, STUB_EXIT, STUB_ABORT,
+  STUB_STR_FROM_INT, STUB_STR_FROM_UINT, STUB_STR_FROM_BOOL,
   STUB_COUNT
 } Arm64StubId;
 
@@ -122,6 +123,8 @@ static const struct {
     {"malloc", 0},  {"calloc", 1},  {"free", 0},    {"puts", 0},
     {"putchar", 0}, {"write", 0},   {"strlen", 0},  {"memcpy", 0},
     {"memmove", 0}, {"memset", 0},  {"exit", 0},    {"abort", 0},
+    {"mettle_string_from_int", 1},  {"mettle_string_from_uint", 1},
+    {"mettle_string_from_bool", 1},
 };
 
 /* Index of the runtime stub named `name`, or -1. `mettle_heap_zeroed` is the
@@ -1697,9 +1700,14 @@ static void load_call_argument(Arm64Emit *e, SlotMap *slots,
                                const IRProgram *prog,
                                const IRInstruction *call, const IROperand *arg,
                                Arm64Reg dest) {
-  int is_stub = call->text && io_stub_intrinsic(call->text, NULL, NULL);
+  int stub_is_string = 0;
+  int is_stub =
+      call->text && io_stub_intrinsic(call->text, NULL, &stub_is_string);
+  /* A TEMP argument to a string stub is a record address too (a concat or
+   * "{expr}" conversion result), so it takes the same single dereference. */
   if (is_stub &&
       (arg->kind == IR_OPERAND_STRING ||
+       (stub_is_string && arg->kind == IR_OPERAND_TEMP) ||
        (arg->kind == IR_OPERAND_SYMBOL &&
         agg_size_of(slots->aggregates, arg->name) > 8))) {
     load_into(e, slots, arg, dest); /* record address */
@@ -2443,9 +2451,9 @@ int arm64_ir_encode_function(Arm64Emit *e, const IRFunction *fn) {
 
 /* I/O intrinsics we provide as hand-written AArch64 stubs (a direct write(2)
  * syscall) instead of compiling the std/io body, which bottoms out in
- * OS-specific externs/strings. `with_newline` distinguishes the println forms;
- * `is_string` distinguishes the cstring printers (print/println) from the int
- * printers (print_int/println_int). cstr is handled inline, not via a stub. */
+ * OS-specific externs/strings. `with_newline` distinguishes the println form.
+ * Values print through "{expr}" interpolation, whose conversions are runtime
+ * stubs of their own. cstr is handled inline, not via a stub. */
 static int io_stub_intrinsic(const char *name, int *with_newline,
                              int *is_string) {
   if (!name) {
@@ -2454,8 +2462,7 @@ static int io_stub_intrinsic(const char *name, int *with_newline,
   struct {
     const char *n;
     int nl, str;
-  } table[] = {{"println_int", 1, 0}, {"print_int", 0, 0},
-               {"println", 1, 1},     {"print", 0, 1}};
+  } table[] = {{"println", 1, 1}, {"print", 0, 1}};
   for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
     if (strcmp(name, table[i].n) == 0) {
       if (with_newline) *with_newline = table[i].nl;
@@ -2471,60 +2478,6 @@ static int io_stub_intrinsic(const char *name, int *with_newline,
 static int io_leaf(const char *name) {
   return io_stub_intrinsic(name, NULL, NULL) ||
          (name && strcmp(name, "cstr") == 0);
-}
-
-/* Emit a leaf that prints the signed int64 in x0 as decimal (then a newline if
- * with_newline) via the AArch64 Linux write syscall. Builds the digits into a
- * 32-byte stack buffer back-to-front, then write(1, start, len). */
-static void emit_int_print(Arm64Emit *e, int with_newline) {
-  int l_pos = arm64_new_label(e);
-  int l_loop = arm64_new_label(e);
-  int l_sign = arm64_new_label(e);
-  int l_write = arm64_new_label(e);
-
-  arm64_emit_prologue(e, 32, NULL, 0); /* [sp,#0..31] scratch buffer */
-  arm64_emit_word(e, arm64_mov_reg(1, ARM64_X9, ARM64_X0));        /* n */
-  arm64_emit_word(e, arm64_add_imm(1, ARM64_X10, ARM64_SP, 31, 0));/* ptr */
-  if (with_newline) {
-    arm64_emit_word(e, arm64_movz(1, ARM64_X11, 10, 0));           /* '\n' */
-    arm64_emit_word(e, arm64_strb_imm(ARM64_X11, ARM64_X10, 0));
-    arm64_emit_word(e, arm64_sub_imm(1, ARM64_X10, ARM64_X10, 1, 0));
-  }
-  arm64_emit_word(e, arm64_movz(1, ARM64_X12, 0, 0));              /* neg=0 */
-  arm64_emit_word(e, arm64_cmp_imm(1, ARM64_X9, 0, 0));
-  arm64_emit_bcond(e, ARM64_GE, l_pos);
-  arm64_emit_word(e, arm64_movz(1, ARM64_X12, 1, 0));              /* neg=1 */
-  arm64_emit_word(e, arm64_neg(1, ARM64_X9, ARM64_X9));
-  arm64_bind_label(e, l_pos);
-  /* n == 0 -> emit '0' and skip the divide loop */
-  arm64_emit_cbnz(e, 1, ARM64_X9, l_loop);
-  arm64_emit_word(e, arm64_movz(1, ARM64_X11, 48, 0));            /* '0' */
-  arm64_emit_word(e, arm64_strb_imm(ARM64_X11, ARM64_X10, 0));
-  arm64_emit_word(e, arm64_sub_imm(1, ARM64_X10, ARM64_X10, 1, 0));
-  arm64_emit_b(e, l_sign);
-  arm64_bind_label(e, l_loop);
-  arm64_emit_cbz(e, 1, ARM64_X9, l_sign);
-  arm64_emit_word(e, arm64_movz(1, ARM64_X13, 10, 0));
-  arm64_emit_word(e, arm64_udiv(1, ARM64_X14, ARM64_X9, ARM64_X13));
-  arm64_emit_word(e, arm64_msub(1, ARM64_X15, ARM64_X14, ARM64_X13, ARM64_X9));
-  arm64_emit_word(e, arm64_mov_reg(1, ARM64_X9, ARM64_X14));      /* n /= 10 */
-  arm64_emit_word(e, arm64_add_imm(1, ARM64_X15, ARM64_X15, 48, 0)); /* +'0' */
-  arm64_emit_word(e, arm64_strb_imm(ARM64_X15, ARM64_X10, 0));
-  arm64_emit_word(e, arm64_sub_imm(1, ARM64_X10, ARM64_X10, 1, 0));
-  arm64_emit_b(e, l_loop);
-  arm64_bind_label(e, l_sign);
-  arm64_emit_cbz(e, 1, ARM64_X12, l_write);
-  arm64_emit_word(e, arm64_movz(1, ARM64_X11, 45, 0));            /* '-' */
-  arm64_emit_word(e, arm64_strb_imm(ARM64_X11, ARM64_X10, 0));
-  arm64_emit_word(e, arm64_sub_imm(1, ARM64_X10, ARM64_X10, 1, 0));
-  arm64_bind_label(e, l_write);
-  arm64_emit_word(e, arm64_add_imm(1, ARM64_X1, ARM64_X10, 1, 0));  /* buf */
-  arm64_emit_word(e, arm64_add_imm(1, ARM64_X2, ARM64_SP, 32, 0));  /* end */
-  arm64_emit_word(e, arm64_sub_reg(1, ARM64_X2, ARM64_X2, ARM64_X1)); /* len */
-  arm64_emit_word(e, arm64_movz(1, ARM64_X0, 1, 0));               /* fd=stdout */
-  arm64_emit_word(e, arm64_movz(1, ARM64_X8, SYS_WRITE, 0));
-  arm64_emit_word(e, ARM64_SVC0);
-  arm64_emit_epilogue(e, 32, NULL, 0);
 }
 
 /* Emit a leaf that writes the NUL-terminated cstring in x0 to stdout (then a
@@ -2753,6 +2706,96 @@ static void emit_stub_memset(Arm64Emit *e) {
   arm64_emit_epilogue(e, 0, NULL, 0);
 }
 
+/* x0 = mettle_string_from_int/uint(x0): a fresh heap string record of the
+ * value's decimal digits, so "{n}" interpolation works on the self-contained
+ * target. Block layout matches the concat kernel: the record at the block's
+ * start, characters after it. 48 bytes holds record(16) + sign + 20 digits
+ * with room to spare, and bump memory is fresh-zero, so the byte after the
+ * last digit is already the cosmetic NUL. Digits go in back-to-front ending
+ * at block+46, the same loop emit_int_print uses. */
+static void emit_string_from_value(Arm64Emit *e, int malloc_label,
+                                   int is_signed) {
+  int l_pos = arm64_new_label(e);
+  int l_loop = arm64_new_label(e);
+  int l_sign = arm64_new_label(e);
+  int l_done = arm64_new_label(e);
+
+  arm64_emit_prologue(e, 16, NULL, 0);
+  arm64_emit_word(e, arm64_str_imm(1, ARM64_X0, ARM64_SP, 0));      /* value */
+  arm64_emit_word(e, arm64_movz(1, ARM64_X0, 48, 0));
+  arm64_emit_bl(e, malloc_label);
+  arm64_emit_word(e, arm64_ldr_imm(1, ARM64_X9, ARM64_SP, 0));      /* value */
+  arm64_emit_word(e, arm64_add_imm(1, ARM64_X10, ARM64_X0, 46, 0)); /* ptr */
+  arm64_emit_word(e, arm64_movz(1, ARM64_X12, 0, 0));               /* neg=0 */
+  if (is_signed) {
+    arm64_emit_word(e, arm64_cmp_imm(1, ARM64_X9, 0, 0));
+    arm64_emit_bcond(e, ARM64_GE, l_pos);
+    arm64_emit_word(e, arm64_movz(1, ARM64_X12, 1, 0));             /* neg=1 */
+    arm64_emit_word(e, arm64_neg(1, ARM64_X9, ARM64_X9));
+  }
+  arm64_bind_label(e, l_pos);
+  arm64_emit_cbnz(e, 1, ARM64_X9, l_loop);
+  arm64_emit_word(e, arm64_movz(1, ARM64_X11, 48, 0));              /* '0' */
+  arm64_emit_word(e, arm64_strb_imm(ARM64_X11, ARM64_X10, 0));
+  arm64_emit_word(e, arm64_sub_imm(1, ARM64_X10, ARM64_X10, 1, 0));
+  arm64_emit_b(e, l_sign);
+  arm64_bind_label(e, l_loop);
+  arm64_emit_cbz(e, 1, ARM64_X9, l_sign);
+  arm64_emit_word(e, arm64_movz(1, ARM64_X13, 10, 0));
+  arm64_emit_word(e, arm64_udiv(1, ARM64_X14, ARM64_X9, ARM64_X13));
+  arm64_emit_word(e, arm64_msub(1, ARM64_X15, ARM64_X14, ARM64_X13, ARM64_X9));
+  arm64_emit_word(e, arm64_mov_reg(1, ARM64_X9, ARM64_X14));        /* /=10 */
+  arm64_emit_word(e, arm64_add_imm(1, ARM64_X15, ARM64_X15, 48, 0));/* +'0' */
+  arm64_emit_word(e, arm64_strb_imm(ARM64_X15, ARM64_X10, 0));
+  arm64_emit_word(e, arm64_sub_imm(1, ARM64_X10, ARM64_X10, 1, 0));
+  arm64_emit_b(e, l_loop);
+  arm64_bind_label(e, l_sign);
+  arm64_emit_cbz(e, 1, ARM64_X12, l_done);
+  arm64_emit_word(e, arm64_movz(1, ARM64_X11, 45, 0));              /* '-' */
+  arm64_emit_word(e, arm64_strb_imm(ARM64_X11, ARM64_X10, 0));
+  arm64_emit_word(e, arm64_sub_imm(1, ARM64_X10, ARM64_X10, 1, 0));
+  arm64_bind_label(e, l_done);
+  /* chars = ptr+1; length = (block+46) - ptr; the record is the block. */
+  arm64_emit_word(e, arm64_add_imm(1, ARM64_X13, ARM64_X10, 1, 0));
+  arm64_emit_word(e, arm64_str_imm(1, ARM64_X13, ARM64_X0, 0));
+  arm64_emit_word(e, arm64_add_imm(1, ARM64_X11, ARM64_X0, 46, 0));
+  arm64_emit_word(e, arm64_sub_reg(1, ARM64_X11, ARM64_X11, ARM64_X10));
+  arm64_emit_word(e, arm64_str_imm(1, ARM64_X11, ARM64_X0, 8));
+  arm64_emit_epilogue(e, 16, NULL, 0);
+}
+
+/* x0 = mettle_string_from_bool(x0): "true" or "false" as a heap record. */
+static void emit_string_from_bool(Arm64Emit *e, int malloc_label) {
+  int l_true = arm64_new_label(e);
+  int l_store = arm64_new_label(e);
+  static const char k_false[] = "false";
+  static const char k_true[] = "true";
+
+  arm64_emit_prologue(e, 16, NULL, 0);
+  arm64_emit_word(e, arm64_str_imm(1, ARM64_X0, ARM64_SP, 0));      /* value */
+  arm64_emit_word(e, arm64_movz(1, ARM64_X0, 32, 0));
+  arm64_emit_bl(e, malloc_label);
+  arm64_emit_word(e, arm64_ldr_imm(1, ARM64_X9, ARM64_SP, 0));
+  arm64_emit_cbnz(e, 1, ARM64_X9, l_true);
+  for (int i = 0; i < 5; i++) {
+    arm64_emit_word(e, arm64_movz(1, ARM64_X11, (uint16_t)k_false[i], 0));
+    arm64_emit_word(e, arm64_strb_imm(ARM64_X11, ARM64_X0, 16 + i));
+  }
+  arm64_emit_word(e, arm64_movz(1, ARM64_X12, 5, 0));
+  arm64_emit_b(e, l_store);
+  arm64_bind_label(e, l_true);
+  for (int i = 0; i < 4; i++) {
+    arm64_emit_word(e, arm64_movz(1, ARM64_X11, (uint16_t)k_true[i], 0));
+    arm64_emit_word(e, arm64_strb_imm(ARM64_X11, ARM64_X0, 16 + i));
+  }
+  arm64_emit_word(e, arm64_movz(1, ARM64_X12, 4, 0));
+  arm64_bind_label(e, l_store);
+  arm64_emit_word(e, arm64_add_imm(1, ARM64_X13, ARM64_X0, 16, 0));
+  arm64_emit_word(e, arm64_str_imm(1, ARM64_X13, ARM64_X0, 0));
+  arm64_emit_word(e, arm64_str_imm(1, ARM64_X12, ARM64_X0, 8));
+  arm64_emit_epilogue(e, 16, NULL, 0);
+}
+
 /* exit(x0) / abort(): leave through the exit syscall, which never returns. */
 static void emit_stub_exit(Arm64Emit *e, int fixed_status) {
   if (fixed_status >= 0) {
@@ -2776,6 +2819,9 @@ static void emit_runtime_stub(Arm64Emit *e, int id, int malloc_label) {
   case STUB_MEMSET: emit_stub_memset(e); break;
   case STUB_EXIT: emit_stub_exit(e, -1); break;
   case STUB_ABORT: emit_stub_exit(e, 134); break;
+  case STUB_STR_FROM_INT: emit_string_from_value(e, malloc_label, 1); break;
+  case STUB_STR_FROM_UINT: emit_string_from_value(e, malloc_label, 0); break;
+  case STUB_STR_FROM_BOOL: emit_string_from_bool(e, malloc_label); break;
   default: arm64_fail(e, "internal: no runtime stub %d", id); break;
   }
 }
@@ -3195,13 +3241,9 @@ int arm64_ir_encode_program(Arm64Emit *e, const IRProgram *prog,
       continue;
     }
     arm64_bind_label(e, label_for(e, &fns, fn->name));
-    int with_newline = 0, is_string = 0;
-    if (io_stub_intrinsic(fn->name, &with_newline, &is_string)) {
-      if (is_string) {
-        emit_str_print(e, with_newline, 0);
-      } else {
-        emit_int_print(e, with_newline);
-      }
+    int with_newline = 0;
+    if (io_stub_intrinsic(fn->name, &with_newline, NULL)) {
+      emit_str_print(e, with_newline, 0);
     } else if (!encode_function(e, fn, &fns, prog, retf, NULL, &data)) {
       break;
     }

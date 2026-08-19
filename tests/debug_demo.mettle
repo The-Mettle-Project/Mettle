@@ -40,6 +40,6 @@ fn main() -> int32 {
         i = i + 1;
     }
     print("total=");
-    println_int(total);
+    println("{total}");
     return corner.x - corner.x;
 }

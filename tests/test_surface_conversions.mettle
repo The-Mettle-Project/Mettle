@@ -25,9 +25,9 @@ fn expect(what: string, got: int64, want: int64) {
     print("FAIL ");
     print(what);
     print(" got=");
-    print_int(got);
+    print("{got}");
     print(" want=");
-    println_int(want);
+    println("{want}");
     g_fail = g_fail + 1;
   }
 }
@@ -168,7 +168,7 @@ fn main() -> int32 {
 
   if (g_fail != 0) {
     print("SURFACE FAILURES: ");
-    println_int((int64)g_fail);
+    println("{(int64)g_fail}");
     return 1;
   }
   println("SURFACE OK");

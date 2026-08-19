@@ -330,7 +330,7 @@ errdefer rollback();      // a call, on a non-zero return
 ```
 
 A deferred direct call copies its argument values where the `defer` is written.
-In a loop, `defer print_int(i)` records `i` as it stands on that iteration, so
+In a loop, `defer print("{i}")` records `i` as it stands on that iteration, so
 the calls print `0`, `1`, `2`. Method calls and calls through a function pointer
 read their operands at scope exit, so copy the value into a local first if you
 need the one from the defer point:

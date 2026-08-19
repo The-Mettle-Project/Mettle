@@ -40,9 +40,9 @@ fn main() -> int32 {
   while (i < count - 1) {
     if (node_next(nodes, i) != i + 1) {
       print("MISMATCH at ");
-      print_int((int64)i);
+      print("{(int64)i}");
       print(": ");
-      println_int((int64)node_next(nodes, i));
+      println("{(int64)node_next(nodes, i)}");
       return 2;
     }
     i = i + 1;

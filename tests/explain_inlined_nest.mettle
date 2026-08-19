@@ -33,7 +33,7 @@ fn main() -> int32 {
         pass = pass + 1;
     }
 
-    print_int(repeated);
+    print("{repeated}");
     newline();
     return 0;
 }

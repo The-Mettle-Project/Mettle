@@ -26,7 +26,7 @@ fn main() -> int32 {
   bump();
   if (COUNTER != 102) {
     print("COUNTER wrongly folded: ");
-    println_int(COUNTER);
+    println("{COUNTER}");
     return 2;
   }
 

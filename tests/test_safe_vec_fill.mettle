@@ -16,6 +16,6 @@ fn main() -> int32 {
   var data: int32* = malloc(n * 4);
 
   fill(data, n + 64, 7);
-  println_int((int64)data[0]);
+  println("{(int64)data[0]}");
   return (int32)data[0];
 }

@@ -51,10 +51,10 @@ fn main() -> int32 {
   var elapsed: int64 = bench_time_us() - t0;
 
   println("Sieve");
-  print("  result   = "); println_int((int64)last);
+  print("  result   = "); println("{(int64)last}");
   println("  expected = 669");
-  print("  iters    = "); println_int((int64)passes);
-  print("  time_us  = "); println_int((int64)elapsed);
+  print("  iters    = "); println("{(int64)passes}");
+  print("  time_us  = "); println("{(int64)elapsed}");
   if (last != 669) {
     println("  FAILED");
     return 1;

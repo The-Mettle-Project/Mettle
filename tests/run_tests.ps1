@@ -702,11 +702,11 @@ $cases = @(
     Args          = @("--release", "--explain")
     Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
     OutputMustMatch = @(
-      'call to `print_int` .* NOT inlined'
+      'call to `cstr` .* NOT inlined'
     )
     OutputMustNotMatch = @(
-      'print_int \(loop',
-      'print_int \(call to'
+      'cstr \(loop',
+      'cstr \(call to'
     )
   },
   @{
@@ -8901,7 +8901,7 @@ fn total(a: int32*, n: int32) -> int32 {
 }
 fn main() -> int32 {
   var b: int32[4] = [1, 2, 3, 4];
-  print_int(total(&b[0], 4));
+  print("{total(&b[0], 4)}");
   newline();
   return 0;
 }

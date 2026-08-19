@@ -73,7 +73,7 @@ fn main() -> int32 {
 
   var out_len: int64 = base64_encode(buf, buf_size, out, alpha);
   print("Encoded len = ");
-  println_int(out_len);
+  println("{out_len}");
 
   var passes: int32 = 200;
   println("Benchmark: 200 passes (base64_encode)");
@@ -88,14 +88,14 @@ fn main() -> int32 {
   var elapsed_us: int64 = bench_time_us() - t0;
 
   print("Bench sum = ");
-  println_int(bench_sum);
+  println("{bench_sum}");
   print("Time: ");
-  print_int(elapsed_us);
+  print("{elapsed_us}");
   println(" us");
 
   var per_pass: int64 = elapsed_us / passes;
   print("Per pass: ~");
-  print_int(per_pass);
+  print("{per_pass}");
   println(" us");
 
   free(buf);

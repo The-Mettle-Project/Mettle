@@ -16,7 +16,7 @@ fn main() -> int32 {
   if (v < 1.49 || v > 1.51) { println("shadow_global shadowing WRONG"); return 5; }
   if (gcounter != 7) {
     print("shadow_global CLOBBERED gcounter=");
-    print_int(gcounter);
+    print("{gcounter}");
     newline();
     fflush(get_stdout());
     return 6;
@@ -26,7 +26,7 @@ fn main() -> int32 {
   bump(6);
   if (gcounter != 18) {
     print("shadow_global promotion BROKEN gcounter=");
-    print_int(gcounter);
+    print("{gcounter}");
     newline();
     fflush(get_stdout());
     return 7;

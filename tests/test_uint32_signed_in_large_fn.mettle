@@ -198,6 +198,6 @@ fn main() -> int32 {
 
   println("==========================================================");
   if (FAILS == 0) { println("ALL HOST UINT32 SIGNEDNESS CHECKS PASS"); }
-  else { print("FAILURES: "); print_int((int64)FAILS); println(""); }
+  else { print("FAILURES: "); print("{(int64)FAILS}"); println(""); }
   return FAILS;   // exit 0 on success; non-zero == a uint32-as-signed miscompile
 }

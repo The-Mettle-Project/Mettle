@@ -139,13 +139,13 @@ fn main() -> int32 {
   while (j < 8) { buf[j] = j + 1; j = j + 1; }
   var total: int64 = sum_arr(&buf[0], 8);
 
-  print("ps="); print_int((int64)ps); println("");
-  print("mc="); print_int((int64)mc); println("");
-  print("pps="); print_int((int64)pps); println("");
-  print("anh="); print_int((int64)anh); println("");
-  print("grn="); print_int((int64)grn); println("");
-  print("gwn="); print_int((int64)gwn); println("");
-  print("sum="); print_int(total); println("");
+  print("ps="); print("{(int64)ps}"); println("");
+  print("mc="); print("{(int64)mc}"); println("");
+  print("pps="); print("{(int64)pps}"); println("");
+  print("anh="); print("{(int64)anh}"); println("");
+  print("grn="); print("{(int64)grn}"); println("");
+  print("gwn="); print("{(int64)gwn}"); println("");
+  print("sum="); print("{total}"); println("");
 
   if (ps == 49000 && mc == 3 && pps == 60 && anh == 10 && grn == 65 &&
       gwn == 5 && total == 36) {

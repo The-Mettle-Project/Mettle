@@ -18,6 +18,6 @@ fn main() -> int32 {
         free(q);
         i = i + 1;
     }
-    println_int((int32)1);
+    println("{(int32)1}");
     return 0;
 }

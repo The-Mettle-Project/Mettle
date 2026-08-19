@@ -152,11 +152,11 @@ fn main() -> int32 {
 
   var seq_a: int64 = 0;
   var seq_b: int64 = 1;
-  print_int(seq_a);
+  print("{seq_a}");
   var n: int32 = 1;
   while (n <= 35) {
     print(" ");
-    print_int(seq_b);
+    print("{seq_b}");
     var next: int64 = seq_a + seq_b;
     seq_a = seq_b;
     seq_b = next;
@@ -167,18 +167,18 @@ fn main() -> int32 {
   println("Benchmark: fib(35) x 10,000,000");
 
   print("fib(35) = ");
-  println_int(check);
+  println("{check}");
 
   print("Bench sum mod check = ");
-  println_int(bench_sum % check);
+  println("{bench_sum % check}");
 
   print("Time: ");
-  print_int(elapsed_us);
+  print("{elapsed_us}");
   println(" us");
 
   var per_call: int64 = elapsed_us * 1000 / iter;
   print("Per call: ~");
-  print_int(per_call);
+  print("{per_call}");
   println(" ns");
 
   var t2: int64 = bench_time_us();
@@ -189,7 +189,7 @@ fn main() -> int32 {
   }
 
   print("Time (looped fib, vs C): ");
-  print_int(t3 - t2);
+  print("{t3 - t2}");
   println(" us");
 
   return 0;

@@ -70,7 +70,7 @@ fn main() -> int32 {
     i = i + 1;
   }
   qmatmul(a, b, c);
-  print("Trace = "); println_int(trace_c(c));
+  print("Trace = "); println("{trace_c(c)}");
   var t0: int64 = bench_time_us();
   var bench_sum: int64 = 0;
   var p: int32 = 0;
@@ -80,7 +80,7 @@ fn main() -> int32 {
     p = p + 1;
   }
   var elapsed: int64 = bench_time_us() - t0;
-  print("Bench sum = "); println_int(bench_sum);
-  print("Time: "); print_int(elapsed); println(" us");
+  print("Bench sum = "); println("{bench_sum}");
+  print("Time: "); print("{elapsed}"); println(" us");
   return 0;
 }

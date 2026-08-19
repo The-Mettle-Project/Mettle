@@ -88,7 +88,7 @@ fn main() -> int32 {
   }
 
   if (fails == 0) { println("MATMUL SIMD: ALL OK (1024 cells)"); }
-  else { print("MATMUL FAILURES: "); print_int((int64)fails); println(""); }
+  else { print("MATMUL FAILURES: "); print("{(int64)fails}"); println(""); }
 
   free(a); free(b); free(c); free(cref);
   if (fails == 0) { return 0; }

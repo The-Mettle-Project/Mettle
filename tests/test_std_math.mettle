@@ -15,9 +15,9 @@ fn report(name: string, got: float64, want: float64) {
   print("FAIL ");
   print(name);
   print(" got*1e12=");
-  print_int((int64)(got * 1000000000000.0));
+  print("{(int64)(got * 1000000000000.0)}");
   print(" want*1e12=");
-  print_int((int64)(want * 1000000000000.0));
+  print("{(int64)(want * 1000000000000.0)}");
   println("");
 }
 
@@ -32,9 +32,9 @@ fn check_int(name: string, got: int64, want: int64) {
     print("FAIL ");
     print(name);
     print(" got=");
-    print_int(got);
+    print("{got}");
     print(" want=");
-    print_int(want);
+    print("{want}");
     println("");
   }
 }
@@ -282,7 +282,7 @@ fn main() -> int32 {
     return 0;
   }
   print("MATH: ");
-  print_int((int64)g_failures);
+  print("{(int64)g_failures}");
   println(" FAILURES");
   return 1;
 }

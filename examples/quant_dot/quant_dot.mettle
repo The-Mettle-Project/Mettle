@@ -35,7 +35,7 @@ fn main() -> int32 {
     p = p + 1;
   }
   var elapsed: int64 = bench_time_us() - t0;
-  print("qdot sum = "); println_int(acc);
-  print("Time: "); print_int(elapsed); println(" us");
+  print("qdot sum = "); println("{acc}");
+  print("Time: "); print("{elapsed}"); println(" us");
   return 0;
 }
