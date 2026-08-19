@@ -2,7 +2,7 @@
 ;
 ; Build locally:
 ;   iscc Mettle.iss
-; Stamp a version: iscc /DMyAppVersion=0.16.2 Mettle.iss
+; Stamp a version: iscc /DMyAppVersion=0.16.3 Mettle.iss
 ; CI builds this in release.yml and attaches Mettle-Setup.exe to the Release.
 ;
 ; The wizard is dressed in the palette the site uses: paper #f2ebd8 and ink
@@ -17,7 +17,7 @@
 ; constants and the HKA registry root.
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.16.2"
+  #define MyAppVersion "0.16.3"
 #endif
 
 #define MyAppName "Mettle"
