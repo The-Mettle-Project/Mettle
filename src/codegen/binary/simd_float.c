@@ -342,6 +342,54 @@ int code_generator_binary_emit_simd_affine_map_f64_loop(BinaryCodeBuffer *b,
                                                         int c_is_zero) {
   size_t loop_top = 0, j_done = 0, j_scalar = 0;
 
+  /* The dst += a*src form first runs a 64-byte (8 doubles) unrolled loop: its
+   * body is only load/load/fma/store twice, so at one chunk per iteration the
+   * loop bookkeeping (two pointer adds, compare, branch) was a third of the
+   * instruction stream. ymm2/ymm3 are free here (b and c are folded away in
+   * this form), so the second chunk overlaps the first with no spill. Any
+   * remaining 32-byte chunk falls through to the single-chunk loop below,
+   * which then runs at most once, and the scalar tail is shared. */
+  if (b_is_one && c_is_zero) {
+    size_t j_skip64 = 0, top64 = 0;
+    if (!binary_emit_mov_reg_reg(b, BINARY_GP_R11, BINARY_GP_R9) ||
+        !binary_emit_alu_reg_reg(b, 0x29, BINARY_GP_R11, BINARY_GP_RCX) ||
+        !wcs_shift_reg_imm(b, BINARY_GP_R11, 1 /* shr */, 6) ||
+        !wcs_shift_reg_imm(b, BINARY_GP_R11, 0 /* shl */, 6) ||
+        !wcs_add_reg_reg64(b, BINARY_GP_R11, BINARY_GP_RCX)) {
+      return 0;
+    }
+    if (!binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R11) ||
+        !wcs_jcc(b, 0x83 /* jae */, &j_skip64)) {
+      return 0;
+    }
+    top64 = b->size;
+    if (!wcs_avx_vmovups_ymm_mem(b, 0, BINARY_GP_RCX, 0) ||
+        !wcs_avx_vmovups_ymm_mem(b, 1, BINARY_GP_RDX, 0) ||
+        !wcs_avx_vfmadd231pd_ymm(b, 1, 0, 4) ||
+        !wcs_avx_vmovups_mem_ymm(b, BINARY_GP_RDX, 0, 1) ||
+        !wcs_avx_vmovups_ymm_mem(b, 2, BINARY_GP_RCX, 32) ||
+        !wcs_avx_vmovups_ymm_mem(b, 3, BINARY_GP_RDX, 32) ||
+        !wcs_avx_vfmadd231pd_ymm(b, 3, 2, 4) ||
+        !wcs_avx_vmovups_mem_ymm(b, BINARY_GP_RDX, 32, 3)) {
+      return 0;
+    }
+    if (!wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 64) ||
+        !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 64) ||
+        !binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R11)) {
+      return 0;
+    }
+    {
+      size_t j_back = 0;
+      if (!wcs_jcc(b, 0x82 /* jb */, &j_back) ||
+          !wcs_patch_to(b, j_back, top64)) {
+        return 0;
+      }
+    }
+    if (!wcs_patch_here(b, j_skip64)) {
+      return 0;
+    }
+  }
+
   /* vec_end (r11) = src_start + (src_end - src_start) rounded down to a 32-byte
    * multiple (4 doubles/chunk). Hoisting the strip-mine bound out of the loop
    * keeps the hot vector body free of the per-iteration remainder recompute. */
