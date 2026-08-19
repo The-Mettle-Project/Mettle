@@ -1,9 +1,11 @@
 #include "ir_optimize_internal.h"
+#include "../../common.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-/* `@pure` loop-invariant call hoisting.
+/* Loop-invariant call hoisting: declared `@pure` and inferred read-only.
  *
  * `@pure` is a user contract asserting a function is free of side effects AND
  * safe to evaluate speculatively (it neither writes observable state nor
@@ -11,6 +13,14 @@
  * contract a call to a pure function whose arguments do not change across a
  * loop returns the same value on every iteration, so we evaluate it once in the
  * loop preheader and reuse the result.
+ *
+ * Undecorated functions get the weaker inferred grade: a whole-program
+ * fixpoint marks every function that provably writes nothing (no store, no
+ * allocation, no global write, no unknown or indirect call, transitively).
+ * Such a call is still not speculatable -- it may fault through a pointer
+ * argument -- so its hoisted copy runs under a clone of the loop's entry test
+ * and is skipped when the loop would not run; the guard makes the hoist exact,
+ * not speculative.
  *
  * Soundness rules (all required before a call is hoisted):
  *   - the callee is a defined function carrying `@pure`;
@@ -100,6 +110,84 @@ static int pure_licm_writes_global(const IRFunction *function,
   return ir_function_local_declared_type(function, inst->dest.name) == NULL;
 }
 
+/* ---- inferred read-only functions --------------------------------------- */
+
+/* One body sweep of the read-only fixpoint: every instruction must be free of
+ * observable writes -- no STORE, no allocation, no global write, no indirect
+ * call, no call to an unknown/extern function, and every direct callee must
+ * itself still hold the read-only bit (a function's own bit is set while it is
+ * being examined, so direct and mutual recursion pass through here and only a
+ * genuine write anywhere in the cycle strips it). Loads are fine: "read-only",
+ * not "const". */
+static int pure_licm_body_is_readonly(IRProgram *program,
+                                      const IRFunction *function) {
+  for (size_t k = 0; k < function->instruction_count; k++) {
+    const IRInstruction *inst = &function->instructions[k];
+    if (pure_licm_writes_global(function, inst)) {
+      return 0;
+    }
+    switch (inst->op) {
+    case IR_OP_NOP:
+    case IR_OP_LABEL:
+    case IR_OP_JUMP:
+    case IR_OP_BRANCH_ZERO:
+    case IR_OP_BRANCH_EQ:
+    case IR_OP_DECLARE_LOCAL:
+    case IR_OP_ASSIGN:
+    case IR_OP_ADDRESS_OF:
+    case IR_OP_LOAD:
+    case IR_OP_BINARY:
+    case IR_OP_UNARY:
+    case IR_OP_ROTATE_ADD:
+    case IR_OP_CAST:
+    case IR_OP_RETURN:
+      break;
+    case IR_OP_CALL: {
+      if (pure_licm_is_runtime_trap_call(inst)) {
+        break;
+      }
+      IRFunction *callee =
+          inst->text ? ir_program_find_function(program, inst->text) : NULL;
+      if (!callee || !callee->is_readonly_inferred) {
+        return 0;
+      }
+      break;
+    }
+    default:
+      return 0;
+    }
+  }
+  return 1;
+}
+
+/* Optimistic greatest-fixpoint over the program: start every defined function
+ * read-only, strip the bit from any whose body disproves it, and repeat until
+ * a full sweep strips nothing (each round must strip at least one function to
+ * continue, so rounds are bounded by the function count and in practice by the
+ * call-graph depth of the impurity). */
+static void pure_licm_infer_readonly(IRProgram *program) {
+  for (size_t i = 0; i < program->function_count; i++) {
+    IRFunction *fn = program->functions[i];
+    if (fn) {
+      fn->is_readonly_inferred = 1;
+    }
+  }
+  int changed = 1;
+  while (changed) {
+    changed = 0;
+    for (size_t i = 0; i < program->function_count; i++) {
+      IRFunction *fn = program->functions[i];
+      if (!fn || !fn->is_readonly_inferred) {
+        continue;
+      }
+      if (!pure_licm_body_is_readonly(program, fn)) {
+        fn->is_readonly_inferred = 0;
+        changed = 1;
+      }
+    }
+  }
+}
+
 /* Every instruction in [lo, hi) of `function` must be free of side effects that
  * could perturb a pure callee's memory reads or be unsafe to evaluate once up
  * front: no memory STORE, allocation, inline-asm, indirect call, call to a
@@ -138,7 +226,7 @@ static int pure_licm_range_side_effect_free(IRProgram *program,
       }
       IRFunction *callee =
           inst->text ? ir_program_find_function(program, inst->text) : NULL;
-      if (!callee || !callee->is_pure) {
+      if (!callee || (!callee->is_pure && !callee->is_readonly_inferred)) {
         return 0; /* impure or unresolved call: memory may change. */
       }
       break;
@@ -180,6 +268,71 @@ static size_t pure_licm_find_backedge(const IRFunction *function,
   return backedge;
 }
 
+/* Is a label with this name defined inside [lo, hi] of `function`? */
+static int pure_licm_label_inside(const IRFunction *function, size_t lo,
+                                  size_t hi, const char *name) {
+  for (size_t k = lo; k <= hi && k < function->instruction_count; k++) {
+    const IRInstruction *inst = &function->instructions[k];
+    if (inst->op == IR_OP_LABEL && inst->text &&
+        strcmp(inst->text, name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* The loop's entry-condition prefix: starting right after the header label, a
+ * run of side-effect-free value ops and loop-exit branches (BRANCH_* whose
+ * target label is not defined inside the loop). Returns the index of the LAST
+ * exit branch of that run, or 0 for "no usable guard".
+ *
+ * The prefix must cover the WHOLE condition for the guard to be exact, so the
+ * scan aborts (returns 0) if it meets a branch to a label inside the loop
+ * before ending: that is either an `||` (whose exit branches continue past an
+ * interior join, making any prefix guard weaker than loop entry) or a body
+ * that opens with an `if` (where we cannot tell condition from body). Ending
+ * at a non-value op (a call, store, jump, label -- the body's first real
+ * statement) means every exit branch seen belongs to the condition.
+ *
+ * Cloning this prefix ahead of the header is safe: it holds no store, call, or
+ * global write, and the header evaluates the same instructions with the same
+ * inputs immediately after, whether or not the loop is entered. */
+static size_t pure_licm_cond_prefix_end(const IRFunction *function,
+                                        size_t header, size_t backedge) {
+  size_t last_exit_branch = 0;
+  size_t limit = header + 25;
+  for (size_t k = header + 1; k < backedge; k++) {
+    if (k > limit) {
+      return 0; /* condition too long to clone: skip the guard. */
+    }
+    const IRInstruction *inst = &function->instructions[k];
+    switch (inst->op) {
+    case IR_OP_NOP:
+    case IR_OP_ASSIGN:
+    case IR_OP_LOAD:
+    case IR_OP_BINARY:
+    case IR_OP_UNARY:
+    case IR_OP_ROTATE_ADD:
+    case IR_OP_CAST:
+    case IR_OP_ADDRESS_OF:
+      continue;
+    case IR_OP_BRANCH_ZERO:
+    case IR_OP_BRANCH_EQ:
+      if (!inst->text) {
+        return 0;
+      }
+      if (pure_licm_label_inside(function, header, backedge, inst->text)) {
+        return 0; /* `||` or leading `if`: guard would not match loop entry. */
+      }
+      last_exit_branch = k;
+      continue;
+    default:
+      return last_exit_branch; /* body begins: condition fully covered. */
+    }
+  }
+  return last_exit_branch;
+}
+
 /* Perform at most one hoist in `function`. Returns 1 if it hoisted (the caller
  * re-runs to expose further opportunities), 0 if nothing was hoisted. */
 static int pure_licm_hoist_one(IRProgram *program, IRFunction *function) {
@@ -208,14 +361,26 @@ static int pure_licm_hoist_one(IRProgram *program, IRFunction *function) {
         continue; /* no reusable result to bind. */
       }
       IRFunction *callee = ir_program_find_function(program, call->text);
-      if (!callee || !callee->is_pure) {
+      if (!callee) {
         continue;
       }
-      /* Don't trust `@pure` blindly: if the callee's own body has a side
-       * effect (notably a global mutation), hoisting changes how often it
-       * runs. Keep the call in the loop. */
-      if (!pure_licm_callee_hoistable(program, callee)) {
-        continue;
+      /* Two grades of eligibility. A `@pure` callee (still verified against
+       * its body: a mislabeled global mutation must not change how often the
+       * effect runs) hoists unconditionally under the contract's speculation
+       * guarantee. An inferred read-only callee may fault (a load through a
+       * pointer), so it hoists only under a clone of the loop's entry test;
+       * a loop whose condition yields no usable guard keeps the call. */
+      int unconditional =
+          callee->is_pure && pure_licm_callee_hoistable(program, callee);
+      size_t guard_end = 0;
+      if (!unconditional) {
+        if (!callee->is_readonly_inferred) {
+          continue;
+        }
+        guard_end = pure_licm_cond_prefix_end(function, i, backedge);
+        if (guard_end == 0 || guard_end >= c) {
+          continue;
+        }
       }
       int all_invariant = 1;
       for (size_t a = 0; a < call->argument_count; a++) {
@@ -232,6 +397,9 @@ static int pure_licm_hoist_one(IRProgram *program, IRFunction *function) {
       char temp_name[32];
       snprintf(temp_name, sizeof(temp_name), "licm_pure_%d",
                g_pure_licm_counter++);
+      char skip_name[48];
+      snprintf(skip_name, sizeof(skip_name), "licm_skip_%d",
+               g_pure_licm_counter - 1);
 
       /* 1. Clone the call for the preheader and retarget it to the temp. */
       IRInstruction hoisted;
@@ -247,7 +415,44 @@ static int pure_licm_hoist_one(IRProgram *program, IRFunction *function) {
       snprintf(hoisted_callee, sizeof(hoisted_callee), "%s",
                hoisted.text ? hoisted.text : "?");
 
-      /* 2. Rewrite the in-loop call into `dest <- %temp`, keeping dest. */
+      /* 2. For a guarded hoist, clone the condition prefix [i+1, guard_end]
+       * and retarget its exit branches at the skip label. All cloning happens
+       * before any mutation: inserting reallocates the instruction array and
+       * invalidates every pointer into it, and a half-done rewrite must not
+       * leave the loop reading an undefined temp. */
+      size_t guard_count = unconditional ? 0 : guard_end - i;
+      IRInstruction *guard_clones = NULL;
+      if (guard_count > 0) {
+        guard_clones = calloc(guard_count, sizeof(IRInstruction));
+        if (!guard_clones) {
+          ir_instruction_destroy_storage(&hoisted);
+          return 0;
+        }
+        for (size_t k = 0; k < guard_count; k++) {
+          int ok = ir_clone_instruction_plain(&function->instructions[i + 1 + k],
+                                              &guard_clones[k]);
+          if (ok && (guard_clones[k].op == IR_OP_BRANCH_ZERO ||
+                     guard_clones[k].op == IR_OP_BRANCH_EQ)) {
+            char *copy = mettle_strdup(skip_name);
+            if (copy) {
+              mettle_free_string(guard_clones[k].text);
+              guard_clones[k].text = copy;
+            } else {
+              ok = 0;
+            }
+          }
+          if (!ok) {
+            for (size_t d = 0; d <= k; d++) {
+              ir_instruction_destroy_storage(&guard_clones[d]);
+            }
+            free(guard_clones);
+            ir_instruction_destroy_storage(&hoisted);
+            return 0;
+          }
+        }
+      }
+
+      /* 3. Rewrite the in-loop call into `dest <- %temp`, keeping dest. */
       IROperand dest_copy = ir_operand_copy(&call->dest);
       int saved_is_float = call->is_float;
       int saved_float_bits = call->float_bits;
@@ -261,17 +466,46 @@ static int pure_licm_hoist_one(IRProgram *program, IRFunction *function) {
       call->float_bits = saved_float_bits;
       call->location = saved_loc;
 
-      /* 3. Insert the hoisted call in the preheader: before the header label
-       * and before any `@simd` begin-markers bracketing it, so the call never
-       * lands inside the contract verifier's marked region. */
+      /* 4. Insert the preheader block: before the header label and before any
+       * `@simd` begin-markers bracketing it, so nothing lands inside the
+       * contract verifier's marked region. Unconditional hoists insert just
+       * the call; guarded hoists insert
+       *     <condition clone> ; call -> %temp ; label skip
+       * Entering the loop means every cloned exit branch fell through, so the
+       * temp is defined on every path that reads it; when the loop would not
+       * run, the call is skipped, never speculated. */
       size_t insert_idx = i;
       while (insert_idx > 0 && pure_licm_is_simd_marker(
                                    &function->instructions[insert_idx - 1])) {
         insert_idx--;
       }
+      for (size_t k = 0; k < guard_count; k++) {
+        if (!ir_instruction_insert_move(function, insert_idx, &guard_clones[k])) {
+          for (size_t d = k; d < guard_count; d++) {
+            ir_instruction_destroy_storage(&guard_clones[d]);
+          }
+          free(guard_clones);
+          ir_instruction_destroy_storage(&hoisted);
+          return 0;
+        }
+        insert_idx++;
+      }
+      free(guard_clones);
       if (!ir_instruction_insert_move(function, insert_idx, &hoisted)) {
         ir_instruction_destroy_storage(&hoisted);
         return 0;
+      }
+      insert_idx++;
+      if (guard_count > 0) {
+        IRInstruction skip_label = {0};
+        skip_label.op = IR_OP_LABEL;
+        skip_label.location = saved_loc;
+        skip_label.text = mettle_strdup(skip_name);
+        if (!skip_label.text ||
+            !ir_instruction_insert_move(function, insert_idx, &skip_label)) {
+          ir_instruction_destroy_storage(&skip_label);
+          return 0;
+        }
       }
       if (ir_explain_enabled()) {
         char entity[160];
@@ -279,8 +513,13 @@ static int pure_licm_hoist_one(IRProgram *program, IRFunction *function) {
         ir_explain_remark(
             function->name, entity, saved_loc, 1,
             "hoisted out of the loop (runs once, not every iteration)",
-            "`@pure` + loop-invariant arguments enable loop-invariant code "
-            "motion",
+            unconditional
+                ? "`@pure` + loop-invariant arguments enable loop-invariant "
+                  "code motion"
+                : "the callee is inferred read-only (it writes nothing "
+                  "anywhere it can reach) and every argument is "
+                  "loop-invariant; the hoisted call runs under a copy of the "
+                  "loop's entry test",
             NULL, NULL);
         ir_explain_remark_code("hoisted");
       }
@@ -294,6 +533,7 @@ int ir_hoist_pure_calls_pass(IRProgram *program, int *changed) {
   if (!program) {
     return 0;
   }
+  pure_licm_infer_readonly(program);
   for (size_t i = 0; i < program->function_count; i++) {
     IRFunction *function = program->functions[i];
     if (!function) {

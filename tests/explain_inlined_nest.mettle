@@ -29,7 +29,7 @@ fn main() -> int32 {
     var pass: int32 = 0;
 
     while (pass < 8) {
-        repeated = repeated + sum_bytes(p, 128);
+        repeated = repeated + sum_bytes(p, 120 + pass);
         pass = pass + 1;
     }
 

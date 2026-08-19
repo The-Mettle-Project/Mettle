@@ -603,6 +603,13 @@ typedef struct {
   int is_inline_contract; // `@inline!` : every call inlines or compile error
   int is_noinline;        // `@noinline`: never inline this function
   int is_pure;            // `@pure`    : side-effect-free; enables call LICM
+  /* Inferred, not declared: no instruction in this function (or in anything it
+   * can reach through direct calls) writes observable state -- no store, no
+   * allocation, no global write, no indirect or unknown call. Loads are
+   * allowed, so unlike `@pure` the call may still fault and is never
+   * speculated: LICM hoists it only under a clone of the loop's entry test.
+   * Computed by the pure-call LICM pass; meaningless before it runs. */
+  int is_readonly_inferred;
   int is_noalloc;         // `@noalloc` : proven allocation-free or error
   int is_test;            // `@test`    : compile-time unit test (mettle test)
   /* `@swappable`: may be replaced in a running process at a `quiesce` point.

@@ -684,6 +684,25 @@ int ir_optimize_program_pipeline(IRProgram *program,
     ir_pass_time_end("pre_inline [stage]", t0);
   }
 
+  /* Loop-invariant call hoisting, first run: BEFORE inlining. Inlining a
+   * read-only callee into a loop body dissolves the single invariant-arg call
+   * into residual calls whose arguments vary per iteration (a recursive
+   * callee's self-calls, say), which no later pass can lift. Hoisting first
+   * sees the call while its arguments are still the caller's loop-invariant
+   * locals; the inliner then treats the hoisted preheader site like any other
+   * call. The post-inline run below still catches calls a round of inlining
+   * exposes. */
+  if (!ir_pass_name_is_skipped("hoist_pure_calls")) {
+    int pure_licm_changed = 0;
+    mettle_compiler_ctx_set_pass_name("hoist_pure_calls");
+    mettle_compiler_ctx_set_fixpoint_iteration(0);
+    double t0 = ir_pass_time_begin();
+    if (!ir_hoist_pure_calls_pass(program, &pure_licm_changed)) {
+      mettle_compiler_ice("IR optimization pure-call hoisting pass failed");
+    }
+    ir_pass_time_end("hoist_pure_calls_pre_inline [program]", t0);
+  }
+
   /* Tail-recursion elimination before any inlining: converting the tail
    * self call into a loop first means the regular inliner sees a loop-shaped
    * callee and the bounded self-recursion expander only has the remaining
