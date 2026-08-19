@@ -1,0 +1,111 @@
+// Anti-rot coverage for the compile-time interpreter's memory and call model:
+// string literals with real bytes, string/struct/enum locals, mutable globals
+// with initializers, aggregate by-value calls and returns, closures through
+// function-address tokens, zero-extending byte loads, and the modeled string
+// externs. Every assertion here was once an "unsupported construct" bail or a
+// silent divergence from native.
+import "std/io";
+import "std/mem";
+
+extern fn strlen(s: cstring) -> int64;
+extern fn strcmp(a: cstring, b: cstring) -> int32;
+extern fn strcpy(d: cstring, s: cstring) -> cstring;
+extern fn strcat(d: cstring, s: cstring) -> cstring;
+
+struct Pair { a: int64; b: int64; }
+
+enum Color { RED = 1, GREEN = 2, BLUE = 3 }
+
+var g_counter: int64 = 7;
+var g_arr: int64[4];
+
+fn make_pair(x: int64) -> Pair {
+  var p: Pair;
+  p.a = x;
+  p.b = x * 2;
+  return p;
+}
+
+fn sum_pair(p: Pair) -> int64 {
+  return p.a + p.b;
+}
+
+fn clobber(p: Pair) {
+  p.a = 999;
+}
+
+fn bump(p: int64*) {
+  *p = *p + 1;
+}
+
+fn add1(x: int64) -> int64 { return x + 1; }
+
+fn apply(f: fn(int64) -> int64, v: int64) -> int64 {
+  return f(v);
+}
+
+@test fn string_literals_have_bytes() {
+  var s: string = "hello world";
+  assert_eq((int64)s.length, 11);
+  assert_eq(strlen("hello"), 5);
+  var buf: cstring = malloc(32);
+  strcpy(buf, "abc");
+  strcat(buf, "def");
+  assert_eq(strcmp(buf, "abcdef"), 0);
+  free(buf);
+}
+
+@test fn aggregates_and_globals() {
+  var p: Pair = make_pair(5);
+  assert_eq(sum_pair(p), 15);
+  clobber(p);
+  assert_eq(p.a, 5);
+  g_counter = g_counter + 1;
+  g_arr[2] = g_counter;
+  assert_eq(g_arr[2], 8);
+  var c: Color = Color.GREEN;
+  assert(c == Color.GREEN);
+}
+
+@test fn param_addresses_and_tokens() {
+  var x: int64 = 41;
+  bump(&x);
+  assert_eq(x, 42);
+  assert_eq(apply(&add1, 9), 10);
+}
+
+@test fn byte_loads_zero_extend() {
+  var b: int8* = malloc(4);
+  b[0] = (int8)(0 - 56);
+  assert_eq((int64)(int32)b[0], 200);
+  var h: int16* = malloc(8);
+  h[0] = (int16)65000;
+  assert_eq((int64)(int32)h[0], 65000);
+  var local: int8 = (int8)(0 - 56);
+  assert(local < 0);
+  free(b);
+  free(h);
+}
+
+@test fn loop_locals_do_not_exhaust() {
+  var acc: int64 = 0;
+  var i: int64 = 0;
+  while (i < 5000) {
+    var tmp: int64 = i;
+    bump(&tmp);
+    var v: Pair = make_pair(tmp);
+    acc = acc + v.b - v.a * 2;
+    i = i + 1;
+  }
+  assert_eq(acc, 0);
+}
+
+// Deliberate failure so the harness sees the nonzero test-mode exit it
+// expects (the same canary pattern comptime_tests_demo uses).
+@test fn canary_fails() {
+  assert_eq(1, 2);
+}
+
+fn main() -> int32 {
+  return 0;
+}

@@ -2020,6 +2020,19 @@ $cases = @(
      OutputMustNotMatch = @("test test_pass") },
   @{ Name = "comptime_tests_dropped_in_build"; Path = "tests/comptime_tests_demo.mettle"; ShouldSucceed = $true
      OutputMustNotMatch = @("assertion failed") },
+  # Interpreter memory/call model: string literals with real bytes, aggregate
+  # locals + by-value calls, mutable globals, &param homes, closures/function
+  # tokens, zero-extending byte loads, string extern models, local slot reuse.
+  @{ Name = "comptime_interp_coverage"; Path = "tests/comptime_interp_coverage.mettle"; ShouldSucceed = $false
+     Args = @("test")
+     Pattern = "5 passed, 1 failed"
+     OutputMustMatch = @("test string_literals_have_bytes \.\.\. ok",
+                         "test aggregates_and_globals \.\.\. ok",
+                         "test param_addresses_and_tokens \.\.\. ok",
+                         "test byte_loads_zero_extend \.\.\. ok",
+                         "test loop_locals_do_not_exhaust \.\.\. ok",
+                         "left: 1, right: 2")
+     OutputMustNotMatch = @("unsupported", "leaked") },
   # The interpreter must wrap a narrow integer where a register does. Six
   # products read their answer from it, and a disagreement here makes the
   # differential gates report a miscompile that is really a difference of

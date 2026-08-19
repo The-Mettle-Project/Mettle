@@ -479,7 +479,17 @@ static IRVParamInfo irv_classify_param(const char *type) {
         return info;
       }
     }
-    return info; /* pointer to struct/unknown: unsupported */
+    if (strchr(base, '*') == NULL) {
+      /* Pointer to a struct: a seeded byte region compared byte-for-byte,
+       * synthesized in 8-byte units so a few whole records fit. A rewrite
+       * that disturbs any field's bytes still diverges. Pointer-to-pointer
+       * stays unsupported: seeded bytes are not valid addresses to chase. */
+      info.kind = IRV_PARAM_BUFFER;
+      info.elem_size = 8;
+      info.elem_float = 0;
+      return info;
+    }
+    return info; /* pointer to pointer: unsupported */
   }
   if (strcmp(type, "float32") == 0 || strcmp(type, "float64") == 0) {
     info.kind = IRV_PARAM_FLOAT;

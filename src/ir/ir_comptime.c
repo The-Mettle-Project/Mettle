@@ -338,6 +338,25 @@ static void ict_trace_hook(void *ctx, size_t line, const char *name,
   }
 }
 
+/* Size of a by-value aggregate parameter (struct/array/tagged enum), from the
+ * module symbol table; 0 for scalars, pointers, and strings. */
+static long long ict_param_aggregate_size(IRProgram *program,
+                                          const char *function_name,
+                                          size_t index) {
+  const IRModuleSymbol *sym =
+      ir_program_lookup_symbol(program, function_name);
+  if (!sym || !sym->param_types || index >= sym->param_count) {
+    return 0;
+  }
+  const MtlcType *pt = sym->param_types[index];
+  if (!pt || pt->size == 0 ||
+      (pt->kind != MTLC_TYPE_STRUCT && pt->kind != MTLC_TYPE_ARRAY &&
+       pt->kind != MTLC_TYPE_TAGGED_ENUM)) {
+    return 0;
+  }
+  return (long long)pt->size;
+}
+
 static IRFunction *ict_find_function(IRProgram *program, const char *name) {
   size_t name_len = strlen(name);
   IRFunction *suffix_match = NULL;
@@ -445,6 +464,16 @@ int ir_comptime_trace(IRProgram *program, ErrorReporter *reporter,
       call_args[p].is_float = 0;
       snprintf(arg_display[p], sizeof(arg_display[0]), "<buf:%lld x %.*s>",
                elems, (int)(type_len - 1), type);
+    } else if (ict_param_aggregate_size(program, function_name, p) > 0) {
+      /* By-value aggregate parameter: synthesize zeroed storage of the
+       * type's size; the value convention passes its address. */
+      long long bytes = ict_param_aggregate_size(program, function_name, p);
+      unsigned long long addr = ir_interp_add_buffer(machine, NULL, bytes);
+      call_args[p].i = (long long)addr;
+      call_args[p].f = 0;
+      call_args[p].is_float = 0;
+      snprintf(arg_display[p], sizeof(arg_display[0]), "<%s: %lld zero bytes>",
+               type, bytes);
     } else {
       if (cli_index >= arg_count) {
         fprintf(stderr,
