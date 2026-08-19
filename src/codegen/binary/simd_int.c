@@ -2015,6 +2015,85 @@ int code_generator_binary_emit_prefix_sum_i32(
     return 0;
   }
 
+  /* Vector body, 4 lanes per step. The stored prefixes are exact mod 2^32
+   * (identical to the scalar (int32) truncation), computed by the classic
+   * in-register scan network: x += x<<32bits, x += x<<64bits, then a lane
+   * broadcast of the running carry. The RETURNED sum must be exact int64, so
+   * each chunk's elements are also sign-extended and accumulated in 64-bit
+   * lanes (one widening load + one vpaddq), and the horizontal fold lands in
+   * r8 before the scalar tail continues with it. The tail's stores stay
+   * consistent because r8 mod 2^32 equals the carry. */
+  {
+    size_t j_novec = 0;
+    size_t j_dist_ok = 0;
+    size_t vec_top = 0;
+    /* A chunk reads its 16 source bytes before writing any of its 16
+     * destination bytes, where the scalar order interleaves them; the results
+     * differ only when the destination sits 1..15 bytes ahead of the source
+     * (a store then lands on a source byte the scalar loop had yet to read).
+     * That sliver of overlap keeps the scalar loop. */
+    if (!binary_emit_mov_reg_reg(b, BINARY_GP_R10, BINARY_GP_RDX) ||
+        !binary_emit_alu_reg_reg(b, 0x29, BINARY_GP_R10, BINARY_GP_RCX) ||
+        !binary_emit_test_reg_reg(b, BINARY_GP_R10) ||
+        !wcs_jcc(b, 0x84 /* jz */, &j_dist_ok) ||
+        !binary_emit_cmp_reg_imm32(b, BINARY_GP_R10, 16) ||
+        !wcs_jcc(b, 0x82 /* jb, unsigned */, &j_novec)) {
+      return 0;
+    }
+    if (!wcs_patch_here(b, j_dist_ok) ||
+        !binary_emit_mov_reg_reg(b, BINARY_GP_R10, BINARY_GP_R9) ||
+        !binary_emit_alu_reg_reg(b, 0x29, BINARY_GP_R10, BINARY_GP_RCX) ||
+        !wcs_shift_reg_imm(b, BINARY_GP_R10, 1 /* shr */, 4) ||
+        !wcs_shift_reg_imm(b, BINARY_GP_R10, 0 /* shl */, 4) ||
+        !wcs_add_reg_reg64(b, BINARY_GP_R10, BINARY_GP_RCX)) {
+      return 0;
+    }
+    if (!binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R10) ||
+        !wcs_jcc(b, 0x83 /* jae */, &j_novec)) {
+      return 0;
+    }
+    if (!wcs_avx_vpxor_ymm(b, 5, 5, 5) ||
+        !wcs_broadcast_i32_to_ymm(b, 2, BINARY_GP_R8)) {
+      return 0;
+    }
+    vec_top = b->size;
+    if (!wcs_avx_vmovdqu_xmm_mem(b, 0, BINARY_GP_RCX, 0) ||
+        !wcs_avx_vpmovsxdq_ymm_mem(b, 4, BINARY_GP_RCX, 0) ||
+        !wcs_avx_vpaddq_ymm(b, 5, 5, 4) ||
+        !wcs_avx_vpslldq_xmm(b, 1, 0, 4) ||
+        !wcs_avx_vpaddd_xmm(b, 0, 0, 1) ||
+        !wcs_avx_vpslldq_xmm(b, 1, 0, 8) ||
+        !wcs_avx_vpaddd_xmm(b, 0, 0, 1) ||
+        !wcs_avx_vpaddd_xmm(b, 0, 0, 2) ||
+        !wcs_avx_vmovdqu_mem_xmm(b, BINARY_GP_RDX, 0, 0) ||
+        !wcs_avx_vpshufd_xmm(b, 2, 0, 0xFF) ||
+        !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 16) ||
+        !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 16) ||
+        !binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R10)) {
+      return 0;
+    }
+    {
+      size_t j_back = 0;
+      if (!wcs_jcc(b, 0x82 /* jb */, &j_back) ||
+          !wcs_patch_to(b, j_back, vec_top)) {
+        return 0;
+      }
+    }
+    if (!wcs_avx_vextracti128(b, 4, 5, 1) ||
+        !wcs_avx_vpaddq_xmm(b, 5, 5, 4) ||
+        !binary_emit_movq_reg_xmm(b, BINARY_GP_R10, BINARY_XMM5) ||
+        !wcs_avx_vpshufd_xmm(b, 5, 5, 0x4E) ||
+        !binary_emit_movq_reg_xmm(b, BINARY_GP_R11, BINARY_XMM5) ||
+        !wcs_add_reg_reg64(b, BINARY_GP_R8, BINARY_GP_R10) ||
+        !wcs_add_reg_reg64(b, BINARY_GP_R8, BINARY_GP_R11) ||
+        !wcs_avx_vzeroupper(b)) {
+      return 0;
+    }
+    if (!wcs_patch_here(b, j_novec)) {
+      return 0;
+    }
+  }
+
   loop_top = b->size;
   if (!binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9) ||
       !wcs_jcc(b, 0x83 /* jae */, &j_done)) {

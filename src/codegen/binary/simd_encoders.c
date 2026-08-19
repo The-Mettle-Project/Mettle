@@ -566,6 +566,31 @@ int wcs_avx_vpunpckhbw_xmm(BinaryCodeBuffer *b, int d, int s1, int s2) {
 int wcs_avx_vpackuswb_xmm(BinaryCodeBuffer *b, int d, int s1, int s2) {
   return wcs_avx128_66_0f_rr(b, 0x67, d, s1, s2);
 }
+int wcs_avx_vpaddd_xmm(BinaryCodeBuffer *b, int d, int s1, int s2) {
+  return wcs_avx128_66_0f_rr(b, 0xFE, d, s1, s2);
+}
+int wcs_avx_vpaddq_xmm(BinaryCodeBuffer *b, int d, int s1, int s2) {
+  return wcs_avx128_66_0f_rr(b, 0xD4, d, s1, s2);
+}
+/* vpshufd xmm, xmm, imm8, VEX.128.66.0F.WIG 70 /r ib. */
+int wcs_avx_vpshufd_xmm(BinaryCodeBuffer *b, int dst, int src,
+                        unsigned char imm) {
+  return wcs_vex3(b, 1, 1, 0, 0, dst, src, 0) &&
+         binary_code_buffer_append_u8(b, 0x70) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (src & 7))) &&
+         binary_code_buffer_append_u8(b, imm);
+}
+/* vpslldq xmm_dst, xmm_src, imm8 (byte shift left), VEX.128.66.0F.WIG 73 /7
+ * ib. The destination rides in vvvv; ModRM.reg carries the /7 subopcode. */
+int wcs_avx_vpslldq_xmm(BinaryCodeBuffer *b, int dst, int src,
+                        unsigned char imm) {
+  return wcs_vex3(b, 1, 1, 0, 0, 7, src, dst) &&
+         binary_code_buffer_append_u8(b, 0x73) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | (7 << 3) | (src & 7))) &&
+         binary_code_buffer_append_u8(b, imm);
+}
 
 /* vmovdqu xmm, [base+disp], VEX.128.F3.0F.WIG 6F /r. */
 int wcs_avx_vmovdqu_xmm_mem(BinaryCodeBuffer *b, int dst, int base, int disp) {

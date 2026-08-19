@@ -41,6 +41,12 @@ int wcs_avx_vpsubb_xmm(BinaryCodeBuffer *b, int d, int s1, int s2);
 int wcs_avx_vpand_xmm(BinaryCodeBuffer *b, int d, int s1, int s2);
 int wcs_avx_vpor_xmm(BinaryCodeBuffer *b, int d, int s1, int s2);
 int wcs_avx_vpxor_xmm(BinaryCodeBuffer *b, int d, int s1, int s2);
+int wcs_avx_vpaddd_xmm(BinaryCodeBuffer *b, int d, int s1, int s2);
+int wcs_avx_vpaddq_xmm(BinaryCodeBuffer *b, int d, int s1, int s2);
+int wcs_avx_vpshufd_xmm(BinaryCodeBuffer *b, int dst, int src,
+                        unsigned char imm);
+int wcs_avx_vpslldq_xmm(BinaryCodeBuffer *b, int dst, int src,
+                        unsigned char imm);
 int wcs_avx_vpmullw_xmm(BinaryCodeBuffer *b, int d, int s1, int s2);
 int wcs_avx_vpunpcklbw_xmm(BinaryCodeBuffer *b, int d, int s1, int s2);
 int wcs_avx_vpunpckhbw_xmm(BinaryCodeBuffer *b, int d, int s1, int s2);
