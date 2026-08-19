@@ -1,0 +1,49 @@
+// Tagged-enum payloads whose type is not a plain signed integer. The binding
+// load in match lowering used to carry no type: a float64 payload traveled
+// the integer paths (returned from an arm it went out in RAX while the caller
+// read XMM0), and constructing with a float literal hit a MIR operand the
+// encoder refused. @noinline keeps the call boundary real.
+
+enum Shape {
+    Circle(float64),
+    Rect(float64),
+}
+
+enum Tag {
+    Big(uint32),
+    Small(uint32),
+}
+
+@noinline fn area(s: Shape) -> float64 {
+    match (s) {
+        case Circle(r): { return 3.14159 * r * r; }
+        case Rect(side): { return side * side; }
+    }
+}
+
+@noinline fn tag_value(t: Tag) -> uint32 {
+    match (t) {
+        case Big(v): { return v; }
+        case Small(v): { return v; }
+    }
+}
+
+fn main() -> int32 {
+    var c: Shape = Shape.Circle(2.0);
+    var r: Shape = Shape.Rect(3.0);
+    var total: float64 = area(c) + area(r);
+    if (total < 21.56 || total > 21.57) { return 1; }
+
+    // Expression-form match binds the payload the same way.
+    var picked: float64 = match (c) {
+        case Circle(radius): radius * 10.0,
+        default: 0.0
+    };
+    if (picked != 20.0) { return 2; }
+
+    // A uint32 payload with the top bit set must not sign-extend.
+    var t: Tag = Tag.Big((uint32)4000000000);
+    if (tag_value(t) != (uint32)4000000000) { return 3; }
+
+    return 66;
+}

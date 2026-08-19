@@ -524,6 +524,12 @@ int ir_lower_match_statement(IRLoweringContext *context,
         load.dest = payload_value;
         load.lhs = payload_address;
         load.rhs = ir_operand_int(payload_size);
+        /* Type the load like every other load: a float payload read without
+         * is_float travels the integer paths, and a float64 binding returned
+         * from the arm went out in RAX while the caller read XMM0. */
+        ir_load_apply_float_type(&load, payload_type);
+        ir_load_apply_unsigned(&load, payload_type);
+        payload_value.float_bits = load.dest.float_bits;
         if (!ir_emit(context, function, &load) ||
             !ir_emit_symbol_assignment(context, function, arm->binding_name,
                                        &payload_value, statement->location)) {
@@ -825,6 +831,10 @@ int ir_lower_match_expression(IRLoweringContext *context,
         load.dest = payload_value;
         load.lhs = payload_address;
         load.rhs = ir_operand_int(payload_size);
+        /* Same typing as the statement form above; see that comment. */
+        ir_load_apply_float_type(&load, payload_type);
+        ir_load_apply_unsigned(&load, payload_type);
+        payload_value.float_bits = load.dest.float_bits;
         if (!ir_emit(context, function, &load) ||
             !ir_emit_symbol_assignment(context, function, arm->binding_name,
                                        &payload_value,

@@ -2787,7 +2787,8 @@ foreach ($sbvMode in @("debug", "release")) {
 # arithmetic.
 foreach ($interpCase in @(
     @{ Name = "string_interpolation"; File = "tests/test_string_interpolation.mettle" },
-    @{ Name = "string_concat_chain"; File = "tests/test_string_concat_chain.mettle" })) {
+    @{ Name = "string_concat_chain"; File = "tests/test_string_concat_chain.mettle" },
+    @{ Name = "enum_float_payload"; File = "tests/test_enum_float_payload.mettle" })) {
   foreach ($interpMode in @("debug", "release")) {
     $total++
     try {

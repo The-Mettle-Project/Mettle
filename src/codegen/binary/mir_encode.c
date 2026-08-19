@@ -260,6 +260,11 @@ static BinaryGpRegister value_reg(MirFunction *fn, const MirOperand *op,
   case MIR_OPK_PHYS:
     return (BinaryGpRegister)op->phys;
   case MIR_OPK_IMM:
+  /* A float immediate as a raw VALUE is its IEEE-754 bits (that is the FIMM
+   * contract), so a GP materialization is the bits themselves. This is what a
+   * memory store of a float constant needs; anything arithmetic goes through
+   * the XMM staging path and never lands here. */
+  case MIR_OPK_FIMM:
     *ok = binary_emit_mov_reg_imm64(&fn->context->code, scratch,
                                     (uint64_t)op->imm);
     return scratch;
