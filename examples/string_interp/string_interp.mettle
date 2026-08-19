@@ -1,0 +1,25 @@
+// String interpolation: "{expr}" inside a string literal embeds the value.
+//
+// The parser desugars the literal to '+' concatenation with one runtime
+// conversion per expression part, so an interpolated literal is an ordinary
+// string expression. Integers, bool, floats, and strings interpolate; '{{'
+// writes a literal '{'.
+//
+// Build: mettle --build string_interp.mettle -o string_interp.exe
+
+import "std/io";
+
+fn main() -> int32 {
+    var who: string = "world";
+    var n: int32 = 42;
+    var pi: float64 = 3.14159;
+    var big: uint64 = (uint64)18446744073709551615;
+    var ok: bool = true;
+
+    println("hello {who}!");
+    println("n={n}, doubled={n * 2}, ok={ok}");
+    println("pi={pi}, big={big}");
+    println("small={0.00001}, large={123456789012345678901.0}");
+    println("a literal brace: {{n} prints as-is");
+    return 0;
+}

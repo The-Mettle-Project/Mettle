@@ -491,6 +491,63 @@ static int ii_string_literal(IRInterpMachine *machine, const char *text,
   return 1;
 }
 
+/* A fresh heap string record, the shape the concat kernel and the
+ * mettle_string_from_* conversions produce at runtime: bytes, a NUL the type
+ * does not count, then the {chars, length} record. Returns the record address,
+ * 0 on failure. */
+static unsigned long long ii_make_string(IRInterpMachine *machine,
+                                         const char *bytes, size_t length) {
+  size_t record_offset = (length + 1 + 7u) & ~(size_t)7u;
+  unsigned long long addr =
+      ir_interp_add_buffer(machine, NULL, (long long)(record_offset + 16u));
+  if (!addr) {
+    return 0;
+  }
+  IIBuffer *buf = &machine->buffers[machine->buffer_count - 1];
+  if (bytes && length > 0) {
+    memcpy(buf->data, bytes, length);
+  }
+  unsigned long long chars = addr;
+  unsigned long long chars_length = (unsigned long long)length;
+  memcpy(buf->data + record_offset, &chars, 8);
+  memcpy(buf->data + record_offset + 8, &chars_length, 8);
+  return addr + record_offset;
+}
+
+/* Resolve a string VALUE (the address of a {chars, length} record) to its
+ * bytes. Returns 0 when either the record or the byte range is not interpreter
+ * memory. */
+static int ii_read_string(IRInterpMachine *machine,
+                          unsigned long long record_addr,
+                          const unsigned char **bytes_out, size_t *length_out) {
+  long long record_offset = 0;
+  IIBuffer *record_buf =
+      ii_addr_to_buffer(machine, record_addr, 16, &record_offset);
+  if (!record_buf) {
+    return 0;
+  }
+  unsigned long long chars = 0, length = 0;
+  memcpy(&chars, record_buf->data + record_offset, 8);
+  memcpy(&length, record_buf->data + record_offset + 8, 8);
+  if (length > (unsigned long long)II_MAX_BUFFER_SIZE) {
+    return 0;
+  }
+  if (length == 0) {
+    *bytes_out = (const unsigned char *)"";
+    *length_out = 0;
+    return 1;
+  }
+  long long chars_offset = 0;
+  IIBuffer *chars_buf =
+      ii_addr_to_buffer(machine, chars, (long long)length, &chars_offset);
+  if (!chars_buf) {
+    return 0;
+  }
+  *bytes_out = chars_buf->data + chars_offset;
+  *length_out = (size_t)length;
+  return 1;
+}
+
 /* ---------------- function-address tokens ---------------- */
 
 static unsigned long long ii_function_token(IRInterpMachine *machine,
@@ -1242,6 +1299,38 @@ static int ii_binary(IRInterpMachine *machine, const IRInstruction *insn,
                      IRInterpValue *out) {
   const char *op = insn->text ? insn->text : "?";
 
+  /* String '+' concatenates contents, matching the backend's concat kernel.
+   * Without this the generic path summed the two record addresses. */
+  if (insn->value_type && insn->value_type->kind == MTLC_TYPE_STRING &&
+      strcmp(op, "+") == 0) {
+    const unsigned char *left_bytes = NULL, *right_bytes = NULL;
+    size_t left_length = 0, right_length = 0;
+    if (!ii_read_string(machine, (unsigned long long)ii_as_int(a),
+                        &left_bytes, &left_length) ||
+        !ii_read_string(machine, (unsigned long long)ii_as_int(b),
+                        &right_bytes, &right_length) ||
+        left_length > (size_t)II_MAX_BUFFER_SIZE - right_length) {
+      ii_fail(machine, IR_INTERP_TRAP, "string concat operand");
+      return 0;
+    }
+    char *joined = malloc(left_length + right_length + 1);
+    if (!joined) {
+      ii_fail(machine, IR_INTERP_TRAP, "out of memory");
+      return 0;
+    }
+    memcpy(joined, left_bytes, left_length);
+    memcpy(joined + left_length, right_bytes, right_length);
+    unsigned long long record =
+        ii_make_string(machine, joined, left_length + right_length);
+    free(joined);
+    if (!record) {
+      ii_fail(machine, IR_INTERP_TRAP, "string concat storage");
+      return 0;
+    }
+    *out = ii_int_value((long long)record);
+    return 1;
+  }
+
   if (insn->is_float) {
     double x = ii_as_float(a);
     double y = ii_as_float(b);
@@ -1859,6 +1948,117 @@ static int ii_extern_call(IRInterpMachine *machine, const char *name,
   if (strncmp(name, "mettle_crash_trap", 17) == 0) {
     ii_fail(machine, IR_INTERP_GUARD_TRAP, name);
     return -1;
+  }
+
+  /* The string runtime, modeled so interpreted string programs mean what they
+   * mean natively. mettle_string_from_f64 mirrors the Mettle implementation in
+   * src/runtime/string.mettle operation for operation; a change there without
+   * one here shows up as an interp-vs-native output difference. */
+  if (strcmp(name, "mettle_string_eq") == 0 && arg_count == 2) {
+    const unsigned char *left_bytes = NULL, *right_bytes = NULL;
+    size_t left_length = 0, right_length = 0;
+    if (!ii_read_string(machine, (unsigned long long)ii_as_int(&args[0]),
+                        &left_bytes, &left_length) ||
+        !ii_read_string(machine, (unsigned long long)ii_as_int(&args[1]),
+                        &right_bytes, &right_length)) {
+      return -1;
+    }
+    *result = ii_int_value(left_length == right_length &&
+                           (left_length == 0 ||
+                            memcmp(left_bytes, right_bytes, left_length) == 0));
+    return 1;
+  }
+  if ((strcmp(name, "mettle_string_from_uint") == 0 ||
+       strcmp(name, "mettle_string_from_int") == 0) &&
+      arg_count == 1) {
+    char digits[24];
+    int written =
+        name[19] == 'u'
+            ? snprintf(digits, sizeof digits, "%llu",
+                       (unsigned long long)ii_as_int(&args[0]))
+            : snprintf(digits, sizeof digits, "%lld",
+                       (long long)ii_as_int(&args[0]));
+    unsigned long long record =
+        written > 0 ? ii_make_string(machine, digits, (size_t)written) : 0;
+    if (!record) {
+      return -1;
+    }
+    *result = ii_int_value((long long)record);
+    return 1;
+  }
+  if (strcmp(name, "mettle_string_from_bool") == 0 && arg_count == 1) {
+    const char *text = ii_as_int(&args[0]) != 0 ? "true" : "false";
+    unsigned long long record = ii_make_string(machine, text, strlen(text));
+    if (!record) {
+      return -1;
+    }
+    *result = ii_int_value((long long)record);
+    return 1;
+  }
+  if (strcmp(name, "mettle_string_from_f64") == 0 && arg_count == 1) {
+    double value = 0.0;
+    if (args[0].is_float) {
+      value = args[0].f;
+    } else {
+      long long raw_bits = args[0].i;
+      memcpy(&value, &raw_bits, 8);
+    }
+    char text[64];
+    size_t text_length = 0;
+    if (value != value) {
+      text_length = (size_t)snprintf(text, sizeof text, "nan");
+    } else {
+      const char *sign = "";
+      if (value < 0.0) {
+        sign = "-";
+        value = 0.0 - value;
+      }
+      if (value * 0.5 == value) {
+        text_length = (size_t)snprintf(text, sizeof text, "%s%s", sign,
+                                       value != 0.0 ? "inf" : "0.0");
+      } else {
+        long long exponent = 0;
+        int scientific = value >= 100000000000000000.0 || value < 0.0001;
+        if (scientific) {
+          while (value >= 10.0) {
+            value = value / 10.0;
+            exponent = exponent + 1;
+          }
+          while (value < 1.0) {
+            value = value * 10.0;
+            exponent = exponent - 1;
+          }
+        }
+        long long int_part = (long long)value;
+        double frac = value - (double)int_part;
+        long long scaled = (long long)(frac * 1000000.0 + 0.5);
+        if (scaled >= 1000000) {
+          scaled = scaled - 1000000;
+          int_part = int_part + 1;
+        }
+        char frac_digits[8];
+        snprintf(frac_digits, sizeof frac_digits, "%06lld", scaled);
+        size_t frac_length = 6;
+        while (frac_length > 1 && frac_digits[frac_length - 1] == '0') {
+          frac_length--;
+        }
+        if (scientific) {
+          text_length = (size_t)snprintf(text, sizeof text, "%s%lld.%.*se%lld",
+                                         sign, int_part, (int)frac_length,
+                                         frac_digits, exponent);
+        } else {
+          text_length = (size_t)snprintf(text, sizeof text, "%s%lld.%.*s",
+                                         sign, int_part, (int)frac_length,
+                                         frac_digits);
+        }
+      }
+    }
+    unsigned long long record = ii_make_string(machine, text, text_length);
+    if (!record) {
+      return -1;
+    }
+    *result = ii_int_value((long long)record);
+    return 1;
   }
 
   /* Unknown extern: pure model (returns 0), but the call is traced so a pass
@@ -3589,9 +3789,14 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
             ii_extern_call(machine, insn->text, call_args, call_arg_count,
                            &call_result);
         /* Attribute any heap allocation the extern model made (malloc,
-         * calloc, realloc) to this call site for leak reporting. */
-        for (size_t bi = buffers_before; bi < machine->buffer_count; bi++) {
-          machine->buffers[bi].alloc_line = insn->location.line;
+         * calloc, realloc) to this call site for leak reporting. String
+         * runtime records stay unattributed: string storage has no free story
+         * yet, exactly like the concat records ii_binary makes, so reporting
+         * one and not the other would flag every interpolation as a leak. */
+        if (strncmp(insn->text, "mettle_string_", 14) != 0) {
+          for (size_t bi = buffers_before; bi < machine->buffer_count; bi++) {
+            machine->buffers[bi].alloc_line = insn->location.line;
+          }
         }
         if (handled < 0 || machine->status != IR_INTERP_OK) {
           if (machine->status == IR_INTERP_OK) {
