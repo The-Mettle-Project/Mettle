@@ -3021,6 +3021,12 @@ $simdRuntimeCases = @(
     Path            = "tests/simd_correctness/simd_byte_check.mettle"
     OutputMustMatch = "BYTE SIMD: ALL OK"
     IrMustMatch     = @("simd_byte_map", "simd_sum_u8")
+  },
+  @{
+    Name            = "simd_correctness_find_bases"
+    Path            = "tests/simd_correctness/simd_find_base_check.mettle"
+    OutputMustMatch = "FIND SIMD: ALL OK"
+    IrMustMatch     = @("simd_find")
   }
 )
 

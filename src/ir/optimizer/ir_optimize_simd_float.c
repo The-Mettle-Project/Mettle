@@ -4615,6 +4615,34 @@ static int ir_try_vectorize_find_at(IRFunction *function, size_t header_index,
     return 1;
   }
 
+  /* The kernel replaces the zero-init, so everything it reads must already
+   * hold its loop-entry value THERE. `run = 0; a = src + cand; while (run <
+   * limit && a[run] == b[run])` puts the bases after the init, and the kernel
+   * would scan the previous iteration's buffers -- or uninitialized ones on
+   * the first pass. */
+  {
+    const char *reads[4];
+    size_t read_count = 0;
+    reads[read_count++] = a_base;
+    if (b_base) {
+      reads[read_count++] = b_base;
+    }
+    if (rhs_arg.kind == IR_OPERAND_SYMBOL && rhs_arg.name) {
+      reads[read_count++] = rhs_arg.name;
+    }
+    if (bound.kind == IR_OPERAND_SYMBOL && bound.name) {
+      reads[read_count++] = bound.name;
+    }
+    for (size_t r = 0; r < read_count; r++) {
+      if (reads[r] && vfind_symbol_written_in(function, init_index + 1,
+                                              header_index, reads[r])) {
+        ir_operand_destroy(&bound);
+        ir_operand_destroy(&rhs_arg);
+        return 1;
+      }
+    }
+  }
+
   if (claimed_out) {
     *claimed_out = 1;
   }

@@ -1,0 +1,92 @@
+// Correctness harness for the mismatch-scan kernel (IR_OP_SIMD_FIND).
+//
+// The kernel is installed in place of the counter's zero-init, so every base
+// it reads has to hold its loop-entry value at that point. `run = 0; a = ...;
+// while (run < n && a[run] == b[run])` writes the bases AFTER the init, and a
+// kernel planted there scanned the previous call's buffers. Both orders are
+// checked here against a reference the recognizers cannot claim, and the
+// pre-init order must still vectorize (IrMustMatch on simd_find).
+
+import "std/io";
+import "std/mem";
+
+var g_fail: int32 = 0;
+
+fn fail(tag: cstring, n: int32) -> void {
+  g_fail = g_fail + 1;
+  print("FIND FAIL ");
+  print_cstr(tag);
+  print(" n=");
+  println("{n}");
+}
+
+// Bases bound BEFORE the counter's init: the shape the kernel is meant for.
+fn match_before(src: uint8*, i: int32, j: int32, limit: int32) -> int32 {
+  var a: uint8* = src + i;
+  var b: uint8* = src + j;
+  var run: int32 = 0;
+  while (run < limit && a[run] == b[run]) {
+    run = run + 1;
+  }
+  return run;
+}
+
+// Bases bound AFTER it: same meaning, and the kernel must decline.
+fn match_after(src: uint8*, i: int32, j: int32, limit: int32) -> int32 {
+  var run: int32 = 0;
+  var a: uint8* = src + i;
+  var b: uint8* = src + j;
+  while (run < limit && a[run] == b[run]) {
+    run = run + 1;
+  }
+  return run;
+}
+
+// Reference: a second exit flag in the body keeps every recognizer off it.
+fn match_ref(src: uint8*, i: int32, j: int32, limit: int32) -> int32 {
+  var run: int32 = 0;
+  var stop: int32 = 0;
+  while (run < limit && stop == 0) {
+    var x: int32 = (int32)src[i + run];
+    var y: int32 = (int32)src[j + run];
+    if (x != y) {
+      stop = 1;
+    } else {
+      run = run + 1;
+    }
+  }
+  return run;
+}
+
+fn main() -> int32 {
+  var n: int32 = 4096;
+  var buf: uint8* = malloc((int64)n);
+  var seed: int64 = 2246822519;
+
+  var k: int32 = 0;
+  while (k < n) {
+    seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF;
+    buf[k] = (uint8)((seed >> 7) % 5);
+    k = k + 1;
+  }
+
+  // Lengths straddle the 32-byte vector width and its tail.
+  var limit: int32 = 1;
+  while (limit <= 70) {
+    var i: int32 = 0;
+    while (i < 512) {
+      var j: int32 = i + 1 + (i % 37);
+      var want: int32 = match_ref(buf, i, j, limit);
+      if (match_before(buf, i, j, limit) != want) { fail("before", limit); }
+      if (match_after(buf, i, j, limit) != want) { fail("after", limit); }
+      i = i + 7;
+    }
+    limit = limit + 1;
+  }
+
+  free(buf);
+  if (g_fail == 0) { println("FIND SIMD: ALL OK"); return 0; }
+  print("FIND SIMD FAILURES: ");
+  println("{g_fail}");
+  return 1;
+}
