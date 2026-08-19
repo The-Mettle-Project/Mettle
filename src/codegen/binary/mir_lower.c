@@ -6903,6 +6903,7 @@ int code_generator_binary_emit_function_via_mir(
     IRFunction *ir_function, BinaryFunctionContext *context) {
   MirFunction fn;
   MirNameMap map;
+  void *vr_oracle = NULL;
   mir_function_init(&fn, context);
   fn.generator = generator;
   memset(&map, 0, sizeof(map));
@@ -7322,7 +7323,22 @@ int code_generator_binary_emit_function_via_mir(
                                       (1ull << bits);
             }
           }
-          if (cw && !literal_canonical && !fn.has_error) {
+          /* Range-proven elision: when the operand ranges show the exact
+           * 64-bit result already fits the home's width, the computed bits
+           * ARE canonical and the re-extension is dropped. This is what takes
+           * the `movsx` off every int32 loop counter's step (`i = i + 1`
+           * under an `i < n` guard cannot leave int32). */
+          int range_canonical = 0;
+          if (cw && !literal_canonical && !fn.has_error &&
+              (cin->op == IR_OP_BINARY || cin->op == IR_OP_ASSIGN)) {
+            if (!vr_oracle) {
+              vr_oracle = ir_value_range_oracle_create(ir_function);
+            }
+            range_canonical =
+                vr_oracle && ir_value_range_result_is_narrow(
+                                 vr_oracle, i, cw * 8, !signed_home);
+          }
+          if (cw && !literal_canonical && !range_canonical && !fn.has_error) {
             MirOperand cd =
                 mir_value_operand(&fn, generator, context, &map, &cin->dest);
             if (cd.kind == MIR_OPK_VREG &&
@@ -7394,6 +7410,7 @@ int code_generator_binary_emit_function_via_mir(
   free(wb.at);
   mir_name_map_destroy(&map);
   mir_function_destroy(&fn);
+  ir_value_range_oracle_destroy(vr_oracle);
   return 1;
 
 oom:
@@ -7409,5 +7426,6 @@ oom:
   free(wb.at);
   mir_name_map_destroy(&map);
   mir_function_destroy(&fn);
+  ir_value_range_oracle_destroy(vr_oracle);
   return 0;
 }

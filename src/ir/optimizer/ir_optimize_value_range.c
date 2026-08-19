@@ -1220,3 +1220,77 @@ int ir_remainder_zero_test_to_mask_pass(IRFunction *function, int *changed) {
   ir_temp_use_map_destroy(&uses);
   return 1;
 }
+
+/* ---- backend canonicalization oracle ------------------------------------ */
+/* The MIR lowering keeps every narrow integer home canonical (sign- or
+ * zero-extended to 64 bits) by re-extending after each write, because MIR
+ * computes in 64 bits and an int32 add may mathematically overflow its type.
+ * When the ranges of the operands prove the exact 64-bit result already fits
+ * the home's width, the wrap can never happen, the 64-bit bits ARE the
+ * canonical form, and the re-extension is pure cost -- one instruction per
+ * loop-counter step in every int32-indexed loop. The backend cannot see IR
+ * ranges, so it borrows this oracle through an opaque handle. */
+
+void *ir_value_range_oracle_create(const IRFunction *function) {
+  IRValueRangeCtx *ctx = (IRValueRangeCtx *)calloc(1, sizeof(IRValueRangeCtx));
+  if (ctx) {
+    ir_value_range_ctx_init(ctx, function);
+  }
+  return ctx;
+}
+
+void ir_value_range_oracle_destroy(void *oracle) {
+  if (!oracle) {
+    return;
+  }
+  ir_value_range_ctx_destroy((IRValueRangeCtx *)oracle);
+  free(oracle);
+}
+
+static int vr_oracle_bounds_fit(long long lo, long long hi, int bits,
+                                int is_unsigned) {
+  if (bits <= 0 || bits >= 64) {
+    return 0;
+  }
+  if (is_unsigned) {
+    return lo >= 0 && hi <= (long long)((1ull << bits) - 1);
+  }
+  return lo >= -(1ll << (bits - 1)) && hi <= (1ll << (bits - 1)) - 1;
+}
+
+int ir_value_range_result_is_narrow(void *oracle, size_t at, int bits,
+                                    int is_unsigned) {
+  IRValueRangeCtx *ctx = (IRValueRangeCtx *)oracle;
+  if (!ctx || !ctx->function || at >= ctx->function->instruction_count) {
+    return 0;
+  }
+  const IRInstruction *in = &ctx->function->instructions[at];
+  IRIntRange a, b;
+  if (in->op == IR_OP_ASSIGN) {
+    if (in->lhs.kind != IR_OPERAND_TEMP && in->lhs.kind != IR_OPERAND_SYMBOL &&
+        in->lhs.kind != IR_OPERAND_INT) {
+      return 0;
+    }
+    ir_value_range_of(ctx, at, &in->lhs, &a);
+    return vr_oracle_bounds_fit(a.lo, a.hi, bits, is_unsigned);
+  }
+  if (in->op != IR_OP_BINARY || in->is_float || !in->text) {
+    return 0;
+  }
+  int is_add = strcmp(in->text, "+") == 0;
+  int is_sub = strcmp(in->text, "-") == 0;
+  if (!is_add && !is_sub) {
+    return 0;
+  }
+  ir_value_range_of(ctx, at, &in->lhs, &a);
+  ir_value_range_of(ctx, at, &in->rhs, &b);
+  /* Exact interval arithmetic; anything near the 64-bit edge is rejected so
+   * the bound computation itself cannot wrap. */
+  const long long LIM = 1ll << 62;
+  if (a.lo <= -LIM || a.hi >= LIM || b.lo <= -LIM || b.hi >= LIM) {
+    return 0;
+  }
+  long long lo = is_add ? a.lo + b.lo : a.lo - b.hi;
+  long long hi = is_add ? a.hi + b.hi : a.hi - b.lo;
+  return vr_oracle_bounds_fit(lo, hi, bits, is_unsigned);
+}

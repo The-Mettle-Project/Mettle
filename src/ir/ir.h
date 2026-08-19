@@ -794,6 +794,15 @@ int ir_function_append_instruction(IRFunction *function,
 int ir_function_insert_instruction(IRFunction *function, size_t index,
                                    const IRInstruction *instruction);
 int ir_program_register_scalar_pointer_types(IRProgram *program);
+/* Opaque handle over the optimizer's integer value-range analysis, for the
+ * backend's narrow-home canonicalization: when the 64-bit arithmetic result
+ * of the BINARY/ASSIGN at `at` provably fits `bits` (signed or unsigned), the
+ * re-extension after it is redundant. Create per function; queries are
+ * individually cost-capped and the tables build lazily on the first one. */
+void *ir_value_range_oracle_create(const IRFunction *function);
+void ir_value_range_oracle_destroy(void *oracle);
+int ir_value_range_result_is_narrow(void *oracle, size_t at, int bits,
+                                    int is_unsigned);
 void ir_function_clear_cfg(IRFunction *function);
 int ir_function_rebuild_cfg(IRFunction *function);
 const IRBasicBlock *ir_function_blocks(IRFunction *function,
