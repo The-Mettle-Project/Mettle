@@ -335,7 +335,8 @@ int ir_optimize_pre_inline_function(IRFunction *function) {
 #define IR_FP_MAX_LOOPS 64
 
 typedef struct {
-  const char *label;
+  char *label; /* owned copy: a recognizer that claims the loop frees the
+                  label instruction's text before the report runs */
   unsigned long long fp;
 } IRLoopFpEntry;
 
@@ -364,7 +365,10 @@ static int ir_loop_fp_snapshot(IRFunction *function, IRLoopFpEntry *entries) {
     if (count >= IR_FP_MAX_LOOPS) {
       continue; /* keep counting so the cap can be reported honestly */
     }
-    entries[count].label = ins->text;
+    entries[count].label = mettle_strdup(ins->text);
+    if (!entries[count].label) {
+      continue;
+    }
     entries[count].fp = ir_affine_loop_fingerprint(function, &loop);
     count++;
   }
@@ -395,6 +399,12 @@ static void ir_loop_fp_report(const IRFunction *function,
     fprintf(stderr, "[loop-fp] function=%s loop=%s fp=%016llx claimed=%d\n",
             function->name ? function->name : "<anonymous>", entries[e].label,
             entries[e].fp, survives ? 0 : 1);
+  }
+}
+
+static void ir_loop_fp_destroy(IRLoopFpEntry *entries, int count) {
+  for (int e = 0; e < count; e++) {
+    free(entries[e].label);
   }
 }
 
@@ -517,16 +527,19 @@ int ir_optimize_function_pipeline(IRFunction *function) {
   }
 
   if (!ir_run_fixpoint_stage(function, &g_ir_fixpoint_stage)) {
+    ir_loop_fp_destroy(fp_entries, fp_count);
     return 0;
   }
 
   if (!ir_run_post_fixpoint_stages(function)) {
+    ir_loop_fp_destroy(fp_entries, fp_count);
     return 0;
   }
 
   if (fp_count > 0) {
     ir_loop_fp_report(function, fp_entries, fp_count);
   }
+  ir_loop_fp_destroy(fp_entries, fp_count);
 
   /* Enforce `@simd` contracts now that every vectorizer has had its chance,
    * then strip the markers before CFG rebuild / codegen. */

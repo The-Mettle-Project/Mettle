@@ -1,5 +1,7 @@
 #include "codegen/binary/strength_rules.h"
 
+#include <stddef.h>
+
 /* ============================================================================
  * Declarative strength-reduction table.
  *
