@@ -14,7 +14,6 @@
 # - `.exe` suffixes in harness.json are stripped for the Linux binaries.
 # - `-lkernel32` in c_flags is dropped; `-lm` is appended (after the source
 #   file, where GNU ld requires libraries).
-# - The HTML report is only generated when `pwsh` is on PATH.
 #
 # Requires: bash, jq, gcc (or clang with --clang), a built bin/mettle.
 #
@@ -23,6 +22,7 @@
 #   ./tools/benchmark/run-benchmarks.sh --build-compiler
 #   ./tools/benchmark/run-benchmarks.sh --runs 7 --warmup 2
 #   ./tools/benchmark/run-benchmarks.sh --benchmark fib,grep
+#   ./tools/benchmark/run-benchmarks.sh --suite 3
 #   ./tools/benchmark/run-benchmarks.sh --compile-only
 #   ./tools/benchmark/run-benchmarks.sh --skip-compile-benchmarks
 #   ./tools/benchmark/run-benchmarks.sh --cflags "-O3 -march=native"
@@ -38,13 +38,12 @@ BUILD_COMPILER=0
 COMPILE_ONLY=0
 SKIP_COMPILE_BENCHMARKS=0
 QUIET=0
-NO_REPORT=0
-OPEN_REPORT=0
 USE_CLANG=0
 USE_GCC=0
 CONFIG_PATH="docs/benchmarks/harness.json"
 COMPILER_PATH=""
 BENCH_FILTER=()
+SUITE_FILTER=()
 USER_CFLAGS=()
 RUNS=0
 WARMUP=-1
@@ -59,8 +58,6 @@ while [[ $# -gt 0 ]]; do
         --compile-only) COMPILE_ONLY=1 ;;
         --skip-compile-benchmarks) SKIP_COMPILE_BENCHMARKS=1 ;;
         --quiet) QUIET=1 ;;
-        --no-report) NO_REPORT=1 ;;
-        --open-report) OPEN_REPORT=1 ;;
         --clang) USE_CLANG=1 ;;
         --gcc) USE_GCC=1 ;;
         --config) CONFIG_PATH="$2"; shift ;;
@@ -68,6 +65,10 @@ while [[ $# -gt 0 ]]; do
         --benchmark)
             IFS=',' read -r -a _parts <<<"$2"
             BENCH_FILTER+=("${_parts[@]}")
+            shift ;;
+        --suite)
+            IFS=',' read -r -a _parts <<<"$2"
+            SUITE_FILTER+=("${_parts[@]}")
             shift ;;
         --cflags)
             # shellcheck disable=SC2206
@@ -108,6 +109,15 @@ bench_selected() {
     [[ ${#BENCH_FILTER[@]} -eq 0 ]] && return 0
     for item in "${BENCH_FILTER[@]}"; do
         [[ "$item" == "$name" ]] && return 0
+    done
+    return 1
+}
+
+suite_selected() {
+    local suite="$1" item
+    [[ ${#SUITE_FILTER[@]} -eq 0 ]] && return 0
+    for item in "${SUITE_FILTER[@]}"; do
+        [[ "$item" == "$suite" ]] && return 0
     done
     return 1
 }
@@ -439,7 +449,9 @@ fi
 for ((bi = 0; bi < bench_count; bi++)); do
     bench=$(jq -c ".benchmarks[$bi]" <<<"$CONFIG")
     name=$(jq -r '.name' <<<"$bench")
+    suite=$(jq -r '.suite // 1' <<<"$bench")
     bench_selected "$name" || continue
+    suite_selected "$suite" || continue
 
     kind=$(jq -r '.kind // "runtime"' <<<"$bench")
     description=$(jq -r '.description // ""' <<<"$bench")
@@ -562,6 +574,7 @@ for ((bi = 0; bi < bench_count; bi++)); do
     jq -n -c \
         --arg name "$name" \
         --arg kind "$kind" \
+        --argjson suite "$suite" \
         --arg description "$description" \
         --argjson mettle_us "$([[ -n "$mettle_us" ]] && awk -v v="$mettle_us" 'BEGIN{printf "%.0f", v}' || echo null)" \
         --argjson c_us "$([[ -n "$c_us" ]] && awk -v v="$c_us" 'BEGIN{printf "%.0f", v}' || echo null)" \
@@ -580,7 +593,7 @@ for ((bi = 0; bi < bench_count; bi++)); do
         --argjson c_exe_bytes "${c_exe_bytes:-null}" \
         --argjson size_relative "$size_ratio" \
         '{
-            name: $name, kind: $kind, description: $description,
+            name: $name, kind: $kind, suite: $suite, description: $description,
             mettle_us: $mettle_us, c_us: $c_us, c_noinline_us: $c_noinline_us,
             mettle_runs_us: $mettle_runs_us, c_runs_us: $c_runs_us,
             mettle_stats: $mettle_stats, c_stats: $c_stats,
@@ -679,17 +692,21 @@ SUMMARY_JSON=$(jq -c '
 if [[ $QUIET -eq 0 ]]; then
     echo ""
     echo "=== Runtime summary (Mettle vs C, median) ==="
-    printf '%-14s %12s %12s %8s %8s %8s\n' "benchmark" "mettle" "c" "runtime" "compile" "size"
-    jq -r '.[] | [
-        .name,
-        (if .mettle_ms != null then (.mettle_ms | tostring) + " ms" else "FAIL" end),
-        (if .c_ms != null then (.c_ms | tostring) + " ms" else "FAIL" end),
-        (if .relative != null then (.relative | tostring) + "x" else "FAIL" end),
-        (if .compile_relative != null then (.compile_relative | tostring) + "x" else "FAIL" end),
-        (if .size_relative != null then (.size_relative | tostring) + "x" else "FAIL" end)
-    ] | @tsv' <<<"$RESULTS_JSON" |
-    while IFS=$'\t' read -r n m c r cr sr; do
-        printf '%-14s %12s %12s %8s %8s %8s\n' "$n" "$m" "$c" "$r" "$cr" "$sr"
+    for suite_num in $(jq -r '[.[] | (.suite // 1)] | unique | .[]' <<<"$RESULTS_JSON"); do
+        echo ""
+        echo "--- Suite $suite_num ---"
+        printf '%-16s %12s %12s %8s %8s %8s\n' "benchmark" "mettle" "c" "runtime" "compile" "size"
+        jq -r --argjson want "$suite_num" '.[] | select((.suite // 1) == $want) | [
+            .name,
+            (if .mettle_ms != null then (.mettle_ms | tostring) + " ms" else "FAIL" end),
+            (if .c_ms != null then (.c_ms | tostring) + " ms" else "FAIL" end),
+            (if .relative != null then (.relative | tostring) + "x" else "FAIL" end),
+            (if .compile_relative != null then (.compile_relative | tostring) + "x" else "FAIL" end),
+            (if .size_relative != null then (.size_relative | tostring) + "x" else "FAIL" end)
+        ] | @tsv' <<<"$RESULTS_JSON" |
+        while IFS=$'\t' read -r n m c r cr sr; do
+            printf '%-16s %12s %12s %8s %8s %8s\n' "$n" "$m" "$c" "$r" "$cr" "$sr"
+        done
     done
 
     if [[ $(jq 'length' <<<"$COMPILE_JSON") -gt 0 ]]; then
@@ -752,22 +769,6 @@ fi
 log ""
 log "Wrote $primary_path"
 [[ -n "$mirror_rel" ]] && log "Mirrored to $mirror_path"
-
-# --- HTML report (needs PowerShell Core) -------------------------------------
-
-if [[ $NO_REPORT -eq 0 ]]; then
-    if command -v pwsh >/dev/null 2>&1; then
-        report_rel=$(jq -r '.outputs.report_html // ""' <<<"$CONFIG")
-        [[ -z "$report_rel" ]] && report_rel="${primary_rel%.json}.html"
-        report_args=(-File "$SCRIPT_DIR/generate-report.ps1" -InputPath "$primary_rel" -OutputPath "$report_rel")
-        [[ $OPEN_REPORT -eq 1 ]] && report_args+=(-OpenReport)
-        if ! pwsh "${report_args[@]}"; then
-            log "Report generation failed."
-        fi
-    else
-        log "HTML report skipped (pwsh not on PATH); JSON output is complete."
-    fi
-fi
 
 if [[ $QUIET -eq 0 && $(jq '.runtime_geomean != null' <<<"$SUMMARY_JSON") == "true" ]]; then
     echo ""

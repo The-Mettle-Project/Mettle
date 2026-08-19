@@ -1,0 +1,326 @@
+// Mettle Huffman codec benchmark (Suite 3)
+//
+// A whole compressor: histogram a 128 KB skewed buffer, build the Huffman tree
+// through a binary min-heap, assign codes by walking the tree, bit-pack the
+// input, then decode the bitstream one bit at a time and verify the roundtrip.
+// The encode and decode loops carry a serial bit accumulator and a data
+// dependent tree walk, so neither widens into a vector.
+//
+// Build: build.bat
+// Run: huffman.exe
+
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+const SRC_LEN: int32 = 131072;
+const OUT_CAP: int64 = 262144;
+const NODE_CAP: int32 = 512;
+const PASSES: int32 = 6;
+
+struct HNode {
+  freq: int64;
+  left: int32;
+  right: int32;
+}
+
+struct Codec {
+  nodes: HNode*;
+  node_count: int32;
+  root: int32;
+  heap: int32*;
+  heap_size: int32;
+  code_bits: uint32*;
+  code_len: int32*;
+  max_len: int32;
+}
+
+fn gen_source(dst: uint8*) {
+  var state: uint32 = 1103515245;
+  var i: int32 = 0;
+  while (i < SRC_LEN) {
+    state = state ^ (state << 13);
+    state = state ^ (state >> 17);
+    state = state ^ (state << 5);
+    var roll: uint32 = state % 1000;
+    var value: uint32 = 0;
+    if (roll < 400) {
+      value = state % 8;
+    } else if (roll < 700) {
+      value = (uint32)8 + state % 24;
+    } else if (roll < 900) {
+      value = (uint32)32 + state % 64;
+    } else {
+      value = state % 256;
+    }
+    dst[i] = (uint8)value;
+    i += 1;
+  }
+}
+
+fn heap_less(c: Codec*, a: int32, b: int32) -> int32 {
+  if (c->nodes[a].freq < c->nodes[b].freq) {
+    return 1;
+  }
+  if (c->nodes[a].freq > c->nodes[b].freq) {
+    return 0;
+  }
+  if (a < b) {
+    return 1;
+  }
+  return 0;
+}
+
+fn heap_push(c: Codec*, node: int32) {
+  var i: int32 = c->heap_size;
+  c->heap[i] = node;
+  c->heap_size += 1;
+  while (i > 0) {
+    var parent: int32 = (i - 1) / 2;
+    if (heap_less(c, c->heap[i], c->heap[parent]) == 0) {
+      break;
+    }
+    var tmp: int32 = c->heap[i];
+    c->heap[i] = c->heap[parent];
+    c->heap[parent] = tmp;
+    i = parent;
+  }
+}
+
+fn heap_pop(c: Codec*) -> int32 {
+  var top: int32 = c->heap[0];
+  c->heap_size -= 1;
+  c->heap[0] = c->heap[c->heap_size];
+  var i: int32 = 0;
+  for (;;) {
+    var left: int32 = i * 2 + 1;
+    var right: int32 = left + 1;
+    var best: int32 = i;
+    if (left < c->heap_size && heap_less(c, c->heap[left], c->heap[best]) != 0) {
+      best = left;
+    }
+    if (right < c->heap_size && heap_less(c, c->heap[right], c->heap[best]) != 0) {
+      best = right;
+    }
+    if (best == i) {
+      break;
+    }
+    var tmp: int32 = c->heap[i];
+    c->heap[i] = c->heap[best];
+    c->heap[best] = tmp;
+    i = best;
+  }
+  return top;
+}
+
+fn build_tree(c: Codec*, freq: int64*) {
+  c->node_count = 256;
+  c->heap_size = 0;
+  var s: int32 = 0;
+  while (s < 256) {
+    c->nodes[s].freq = freq[s];
+    c->nodes[s].left = -1;
+    c->nodes[s].right = -1;
+    if (freq[s] > 0) {
+      heap_push(c, s);
+    }
+    s += 1;
+  }
+  while (c->heap_size > 1) {
+    var a: int32 = heap_pop(c);
+    var b: int32 = heap_pop(c);
+    var idx: int32 = c->node_count;
+    c->node_count += 1;
+    c->nodes[idx].freq = c->nodes[a].freq + c->nodes[b].freq;
+    c->nodes[idx].left = a;
+    c->nodes[idx].right = b;
+    heap_push(c, idx);
+  }
+  c->root = heap_pop(c);
+}
+
+fn assign_codes(c: Codec*, node: int32, bits: uint32, len: int32) {
+  if (c->nodes[node].left < 0) {
+    c->code_bits[node] = bits;
+    c->code_len[node] = len;
+    if (len > c->max_len) {
+      c->max_len = len;
+    }
+    return;
+  }
+  assign_codes(c, c->nodes[node].left, bits << 1, len + 1);
+  assign_codes(c, c->nodes[node].right, (bits << 1) | 1, len + 1);
+}
+
+fn encode(c: Codec*, src: uint8*, len: int32, out: uint8*) -> int64 {
+  var acc: uint32 = 0;
+  var nbits: int32 = 0;
+  var opos: int32 = 0;
+  var total: int64 = 0;
+  var i: int32 = 0;
+  while (i < len) {
+    var sym: int32 = (int32)src[i];
+    var code: uint32 = c->code_bits[sym];
+    var clen: int32 = c->code_len[sym];
+    total = total + (int64)clen;
+    while (clen > 0) {
+      clen -= 1;
+      acc = (acc << 1) | ((code >> (uint32)clen) & 1);
+      nbits += 1;
+      if (nbits == 8) {
+        out[opos] = (uint8)acc;
+        opos += 1;
+        nbits = 0;
+        acc = 0;
+      }
+    }
+    i += 1;
+  }
+  if (nbits > 0) {
+    out[opos] = (uint8)(acc << (uint32)(8 - nbits));
+  }
+  return total;
+}
+
+fn decode(c: Codec*, packed: uint8*, bit_count: int64, out: uint8*) -> int32 {
+  var node: int32 = c->root;
+  var produced: int32 = 0;
+  var bit: int64 = 0;
+  while (bit < bit_count) {
+    var byte: int32 = (int32)packed[(int32)(bit >> 3)];
+    var value: int32 = (byte >> (7 - (int32)(bit & 7))) & 1;
+    if (value != 0) {
+      node = c->nodes[node].right;
+    } else {
+      node = c->nodes[node].left;
+    }
+    if (c->nodes[node].left < 0) {
+      out[produced] = (uint8)node;
+      produced += 1;
+      node = c->root;
+    }
+    bit += 1;
+  }
+  return produced;
+}
+
+fn roundtrip(c: Codec*, src: uint8*, packed: uint8*, plain: uint8*, freq: int64*,
+             out_bits: int64*, out_mismatch: int32*) -> uint64 {
+  var s: int32 = 0;
+  while (s < 256) {
+    freq[s] = 0;
+    c->code_bits[s] = 0;
+    c->code_len[s] = 0;
+    s += 1;
+  }
+  var i: int32 = 0;
+  while (i < SRC_LEN) {
+    freq[(int32)src[i]] = freq[(int32)src[i]] + 1;
+    i += 1;
+  }
+  c->max_len = 0;
+  build_tree(c, freq);
+  assign_codes(c, c->root, 0, 0);
+
+  var bits: int64 = encode(c, src, SRC_LEN, packed);
+  var produced: int32 = decode(c, packed, bits, plain);
+
+  var mismatch: int32 = 0;
+  i = 0;
+  while (i < SRC_LEN) {
+    if (plain[i] != src[i]) {
+      mismatch += 1;
+    }
+    i += 1;
+  }
+  if (produced != SRC_LEN) {
+    mismatch += 1;
+  }
+
+  var h: uint64 = 14695981039346656037;
+  s = 0;
+  while (s < 256) {
+    h = h * 1000003 + (uint64)(c->code_len[s] * (s + 1));
+    h = h ^ (uint64)c->code_bits[s];
+    s += 1;
+  }
+  h = h * 31 + (uint64)bits;
+  *out_bits = bits;
+  *out_mismatch = mismatch;
+  return h;
+}
+
+fn main() -> int32 {
+  var src: uint8* = malloc((int64)SRC_LEN);
+  var packed: uint8* = malloc(OUT_CAP);
+  var plain: uint8* = malloc((int64)SRC_LEN + 8);
+  var freq: int64* = malloc(256 * 8);
+  var nodes: HNode* = malloc((int64)NODE_CAP * sizeof(HNode));
+  var heap: int32* = malloc((int64)NODE_CAP * 4);
+  var code_bits: uint32* = malloc(256 * 4);
+  var code_len: int32* = malloc(256 * 4);
+  if (src == 0 || packed == 0 || plain == 0 || freq == 0 || nodes == 0 || heap == 0 ||
+      code_bits == 0 || code_len == 0) {
+    println("malloc failed");
+    return 1;
+  }
+
+  gen_source(src);
+
+  var c: Codec;
+  c.nodes = nodes;
+  c.node_count = 0;
+  c.root = -1;
+  c.heap = heap;
+  c.heap_size = 0;
+  c.code_bits = code_bits;
+  c.code_len = code_len;
+  c.max_len = 0;
+
+  println("Huffman codec: {SRC_LEN} byte buffer");
+
+  var bits: int64 = 0;
+  var mismatch: int32 = 0;
+  var check: uint64 = roundtrip(&c, src, packed, plain, freq, &bits, &mismatch);
+  var packed_bytes: int64 = (bits + 7) / 8;
+  println("Packed = {packed_bytes} bytes, longest code = {c.max_len} bits, mismatches = {mismatch}");
+  println("Checksum = {check}");
+
+  println("Benchmark: {PASSES} passes (histogram + tree + encode + decode)");
+
+  var t0: int64 = bench_time_us();
+  var bench_hash: uint64 = 0;
+  var total_bits: int64 = 0;
+  var total_mismatch: int64 = 0;
+  var pass: int32 = 0;
+  while (pass < PASSES) {
+    var pass_bits: int64 = 0;
+    var pass_mismatch: int32 = 0;
+    bench_hash = bench_hash * 1000003 + roundtrip(&c, src, packed, plain, freq, &pass_bits, &pass_mismatch);
+    total_bits = total_bits + pass_bits;
+    total_mismatch = total_mismatch + (int64)pass_mismatch;
+    pass += 1;
+  }
+  var elapsed_us: int64 = bench_time_us() - t0;
+
+  println("Bench hash = {bench_hash}");
+  println("Bits coded = {total_bits} mismatches = {total_mismatch}");
+  print("Time: ");
+  print("{elapsed_us}");
+  println(" us");
+
+  var per_pass: int64 = elapsed_us / PASSES;
+  print("Per pass: ~");
+  print("{per_pass}");
+  println(" us");
+
+  free(src);
+  free(packed);
+  free(plain);
+  free(freq);
+  free(nodes);
+  free(heap);
+  free(code_bits);
+  free(code_len);
+  return 0;
+}

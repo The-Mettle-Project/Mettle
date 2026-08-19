@@ -1,0 +1,754 @@
+// Mettle AST interpreter benchmark (Suite 3)
+//
+// A complete small-language pipeline: generate an ~80 KB program text, lex it
+// into a token array, parse the tokens into an AST arena with precedence
+// climbing, then walk the tree to run it. Every pass redoes all three phases,
+// so the time is split between byte scanning, recursive descent, and
+// switch-dispatched evaluation rather than sitting in one loop.
+//
+// Build: build.bat
+// Run: interp_ast.exe
+
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+const BLOCKS: int32 = 800;
+const SRC_CAP: int64 = 262144;
+const TOKEN_CAP: int32 = 131072;
+const NODE_CAP: int32 = 131072;
+const NAME_CAP: int32 = 64;
+const PASSES: int32 = 20;
+const MODULUS: int64 = 1000003;
+
+const T_EOF: int32 = 0;
+const T_NUM: int32 = 1;
+const T_IDENT: int32 = 2;
+const T_OP: int32 = 3;
+const T_PUNCT: int32 = 4;
+const T_IF: int32 = 5;
+const T_ELSE: int32 = 6;
+const T_WHILE: int32 = 7;
+
+const OP_ADD: int32 = 1;
+const OP_SUB: int32 = 2;
+const OP_MUL: int32 = 3;
+const OP_DIV: int32 = 4;
+const OP_MOD: int32 = 5;
+const OP_LT: int32 = 6;
+const OP_LE: int32 = 7;
+const OP_GT: int32 = 8;
+const OP_GE: int32 = 9;
+const OP_EQ: int32 = 10;
+const OP_NE: int32 = 11;
+const OP_AND: int32 = 12;
+const OP_OR: int32 = 13;
+const OP_XOR: int32 = 14;
+const OP_SHL: int32 = 15;
+const OP_SHR: int32 = 16;
+const OP_LAND: int32 = 17;
+const OP_LOR: int32 = 18;
+const OP_ASSIGN: int32 = 19;
+const OP_NOT: int32 = 20;
+const OP_NEG: int32 = 21;
+
+const N_NUM: int32 = 0;
+const N_VAR: int32 = 1;
+const N_ASSIGN: int32 = 2;
+const N_BIN: int32 = 3;
+const N_UN: int32 = 4;
+const N_IF: int32 = 5;
+const N_WHILE: int32 = 6;
+const N_BLOCK: int32 = 7;
+
+struct Token {
+  ival: int64;
+  kind: int32;
+  op: int32;
+}
+
+struct AstNode {
+  ival: int64;
+  kind: int32;
+  op: int32;
+  a: int32;
+  b: int32;
+  c: int32;
+  next: int32;
+}
+
+struct Ctx {
+  src: uint8*;
+  src_len: int32;
+  toks: Token*;
+  tok_count: int32;
+  nodes: AstNode*;
+  node_count: int32;
+  name_off: int32*;
+  name_len: int32*;
+  name_count: int32;
+  pos: int32;
+  failed: int32;
+}
+
+fn emit_cstr(dst: uint8*, pos: int32, s: cstring) -> int32 {
+  var i: int32 = 0;
+  while (s[i] != 0) {
+    dst[pos + i] = (uint8)s[i];
+    i += 1;
+  }
+  return pos + i;
+}
+
+fn emit_int(dst: uint8*, pos: int32, v: int32) -> int32 {
+  var tmp: uint8[24];
+  if (v < 0) {
+    dst[pos] = 45;
+    pos += 1;
+    v = -v;
+  }
+  if (v == 0) {
+    dst[pos] = 48;
+    return pos + 1;
+  }
+  var n: int32 = 0;
+  while (v > 0) {
+    tmp[n] = (uint8)(48 + v % 10);
+    v = v / 10;
+    n += 1;
+  }
+  while (n > 0) {
+    n -= 1;
+    dst[pos] = tmp[n];
+    pos += 1;
+  }
+  return pos;
+}
+
+fn emit_var(dst: uint8*, pos: int32, which: int32) -> int32 {
+  dst[pos] = 118;
+  dst[pos + 1] = (uint8)(48 + which % 7);
+  return pos + 2;
+}
+
+// A literal '{' has to be doubled: a lone brace opens a string interpolation.
+fn gen_source(dst: uint8*) -> int32 {
+  var pos: int32 = 0;
+  var v: int32 = 0;
+  while (v < 7) {
+    pos = emit_var(dst, pos, v);
+    pos = emit_cstr(dst, pos, " = ");
+    pos = emit_int(dst, pos, v + 1);
+    pos = emit_cstr(dst, pos, ";\n");
+    v += 1;
+  }
+  pos = emit_cstr(dst, pos, "k = 0;\n");
+
+  var b: int32 = 0;
+  while (b < BLOCKS) {
+    var a_var: int32 = b % 7;
+    var b_var: int32 = (b * 3 + 1) % 7;
+    var c_var: int32 = (b * 5 + 2) % 7;
+    var k1: int32 = 1 + b % 9;
+    var k2: int32 = 2 + b % 5;
+    var k3: int32 = 3 + b % 11;
+    var k4: int32 = 3 + b % 5;
+    var k5: int32 = 7 + b % 13;
+
+    pos = emit_var(dst, pos, c_var);
+    pos = emit_cstr(dst, pos, " = (");
+    pos = emit_var(dst, pos, a_var);
+    pos = emit_cstr(dst, pos, " + ");
+    pos = emit_var(dst, pos, b_var);
+    pos = emit_cstr(dst, pos, " * ");
+    pos = emit_int(dst, pos, k1);
+    pos = emit_cstr(dst, pos, ") % ");
+    pos = emit_int(dst, pos, (int32)MODULUS);
+    pos = emit_cstr(dst, pos, ";\n");
+
+    pos = emit_cstr(dst, pos, "if (");
+    pos = emit_var(dst, pos, a_var);
+    pos = emit_cstr(dst, pos, " % ");
+    pos = emit_int(dst, pos, k2);
+    pos = emit_cstr(dst, pos, " == 0) {{\n  ");
+    pos = emit_var(dst, pos, b_var);
+    pos = emit_cstr(dst, pos, " = (");
+    pos = emit_var(dst, pos, b_var);
+    pos = emit_cstr(dst, pos, " + ");
+    pos = emit_var(dst, pos, c_var);
+    pos = emit_cstr(dst, pos, ") % ");
+    pos = emit_int(dst, pos, (int32)MODULUS);
+    pos = emit_cstr(dst, pos, ";\n} else {{\n  ");
+    pos = emit_var(dst, pos, b_var);
+    pos = emit_cstr(dst, pos, " = (");
+    pos = emit_var(dst, pos, b_var);
+    pos = emit_cstr(dst, pos, " + ");
+    pos = emit_int(dst, pos, (int32)MODULUS);
+    pos = emit_cstr(dst, pos, " - ");
+    pos = emit_var(dst, pos, c_var);
+    pos = emit_cstr(dst, pos, " % ");
+    pos = emit_int(dst, pos, k3);
+    pos = emit_cstr(dst, pos, ") % ");
+    pos = emit_int(dst, pos, (int32)MODULUS);
+    pos = emit_cstr(dst, pos, ";\n}\n");
+
+    pos = emit_cstr(dst, pos, "k = 0;\nwhile (k < ");
+    pos = emit_int(dst, pos, k4);
+    pos = emit_cstr(dst, pos, ") {{\n  ");
+    pos = emit_var(dst, pos, a_var);
+    pos = emit_cstr(dst, pos, " = (");
+    pos = emit_var(dst, pos, a_var);
+    pos = emit_cstr(dst, pos, " + ((");
+    pos = emit_var(dst, pos, c_var);
+    pos = emit_cstr(dst, pos, " ^ k) % ");
+    pos = emit_int(dst, pos, k5);
+    pos = emit_cstr(dst, pos, ")) % ");
+    pos = emit_int(dst, pos, (int32)MODULUS);
+    pos = emit_cstr(dst, pos, ";\n  k = k + 1;\n}\n");
+    b += 1;
+  }
+
+  dst[pos] = 0;
+  return pos;
+}
+
+fn intern(ctx: Ctx*, off: int32, len: int32) -> int32 {
+  var i: int32 = 0;
+  while (i < ctx->name_count) {
+    if (ctx->name_len[i] == len) {
+      var k: int32 = 0;
+      var same: int32 = 1;
+      while (k < len) {
+        if (ctx->src[ctx->name_off[i] + k] != ctx->src[off + k]) {
+          same = 0;
+          break;
+        }
+        k += 1;
+      }
+      if (same != 0) {
+        return i;
+      }
+    }
+    i += 1;
+  }
+  if (ctx->name_count >= NAME_CAP) {
+    ctx->failed = 1;
+    return 0;
+  }
+  var idx: int32 = ctx->name_count;
+  ctx->name_off[idx] = off;
+  ctx->name_len[idx] = len;
+  ctx->name_count += 1;
+  return idx;
+}
+
+fn span_equals(ctx: Ctx*, off: int32, len: int32, word: cstring) -> int32 {
+  var i: int32 = 0;
+  while (i < len) {
+    if (word[i] == 0 || (int32)ctx->src[off + i] != (int32)word[i]) {
+      return 0;
+    }
+    i += 1;
+  }
+  if (word[len] != 0) {
+    return 0;
+  }
+  return 1;
+}
+
+fn push_token(ctx: Ctx*, kind: int32, op: int32, ival: int64) {
+  if (ctx->tok_count >= TOKEN_CAP) {
+    ctx->failed = 1;
+    return;
+  }
+  ctx->toks[ctx->tok_count].kind = kind;
+  ctx->toks[ctx->tok_count].op = op;
+  ctx->toks[ctx->tok_count].ival = ival;
+  ctx->tok_count += 1;
+}
+
+fn lex(ctx: Ctx*) {
+  var i: int32 = 0;
+  ctx->tok_count = 0;
+  ctx->name_count = 0;
+  while (i < ctx->src_len) {
+    var c: int32 = (int32)ctx->src[i];
+    if (c == 32 || c == 9 || c == 10 || c == 13) {
+      i += 1;
+      continue;
+    }
+    if (c >= 48 && c <= 57) {
+      var value: int64 = 0;
+      while (i < ctx->src_len) {
+        var d: int32 = (int32)ctx->src[i];
+        if (d < 48 || d > 57) {
+          break;
+        }
+        value = value * 10 + (int64)(d - 48);
+        i += 1;
+      }
+      push_token(ctx, T_NUM, 0, value);
+      continue;
+    }
+    if ((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95) {
+      var start: int32 = i;
+      while (i < ctx->src_len) {
+        var d: int32 = (int32)ctx->src[i];
+        if ((d >= 97 && d <= 122) || (d >= 65 && d <= 90) || (d >= 48 && d <= 57) || d == 95) {
+          i += 1;
+        } else {
+          break;
+        }
+      }
+      var len: int32 = i - start;
+      if (span_equals(ctx, start, len, "if") != 0) {
+        push_token(ctx, T_IF, 0, 0);
+      } else if (span_equals(ctx, start, len, "else") != 0) {
+        push_token(ctx, T_ELSE, 0, 0);
+      } else if (span_equals(ctx, start, len, "while") != 0) {
+        push_token(ctx, T_WHILE, 0, 0);
+      } else {
+        push_token(ctx, T_IDENT, intern(ctx, start, len), 0);
+      }
+      continue;
+    }
+    var next: int32 = 0;
+    if (i + 1 < ctx->src_len) {
+      next = (int32)ctx->src[i + 1];
+    }
+    if (c == 61 && next == 61) {
+      push_token(ctx, T_OP, OP_EQ, 0);
+      i += 2;
+      continue;
+    }
+    if (c == 33 && next == 61) {
+      push_token(ctx, T_OP, OP_NE, 0);
+      i += 2;
+      continue;
+    }
+    if (c == 60 && next == 61) {
+      push_token(ctx, T_OP, OP_LE, 0);
+      i += 2;
+      continue;
+    }
+    if (c == 62 && next == 61) {
+      push_token(ctx, T_OP, OP_GE, 0);
+      i += 2;
+      continue;
+    }
+    if (c == 60 && next == 60) {
+      push_token(ctx, T_OP, OP_SHL, 0);
+      i += 2;
+      continue;
+    }
+    if (c == 62 && next == 62) {
+      push_token(ctx, T_OP, OP_SHR, 0);
+      i += 2;
+      continue;
+    }
+    if (c == 38 && next == 38) {
+      push_token(ctx, T_OP, OP_LAND, 0);
+      i += 2;
+      continue;
+    }
+    if (c == 124 && next == 124) {
+      push_token(ctx, T_OP, OP_LOR, 0);
+      i += 2;
+      continue;
+    }
+    i += 1;
+    switch (c) {
+      case 43: push_token(ctx, T_OP, OP_ADD, 0); continue;
+      case 45: push_token(ctx, T_OP, OP_SUB, 0); continue;
+      case 42: push_token(ctx, T_OP, OP_MUL, 0); continue;
+      case 47: push_token(ctx, T_OP, OP_DIV, 0); continue;
+      case 37: push_token(ctx, T_OP, OP_MOD, 0); continue;
+      case 60: push_token(ctx, T_OP, OP_LT, 0); continue;
+      case 62: push_token(ctx, T_OP, OP_GT, 0); continue;
+      case 38: push_token(ctx, T_OP, OP_AND, 0); continue;
+      case 124: push_token(ctx, T_OP, OP_OR, 0); continue;
+      case 94: push_token(ctx, T_OP, OP_XOR, 0); continue;
+      case 33: push_token(ctx, T_OP, OP_NOT, 0); continue;
+      case 61: push_token(ctx, T_OP, OP_ASSIGN, 0); continue;
+      default: push_token(ctx, T_PUNCT, c, 0); continue;
+    }
+  }
+  push_token(ctx, T_EOF, 0, 0);
+}
+
+fn precedence(op: int32) -> int32 {
+  switch (op) {
+    case 18: return 1;
+    case 17: return 2;
+    case 13: return 3;
+    case 14: return 4;
+    case 12: return 5;
+    case 10: return 6;
+    case 11: return 6;
+    case 6: return 7;
+    case 7: return 7;
+    case 8: return 7;
+    case 9: return 7;
+    case 15: return 8;
+    case 16: return 8;
+    case 1: return 9;
+    case 2: return 9;
+    case 3: return 10;
+    case 4: return 10;
+    case 5: return 10;
+    default: return 0;
+  }
+}
+
+fn new_node(ctx: Ctx*, kind: int32) -> int32 {
+  if (ctx->node_count >= NODE_CAP) {
+    ctx->failed = 1;
+    return 0;
+  }
+  var idx: int32 = ctx->node_count;
+  ctx->node_count += 1;
+  ctx->nodes[idx].ival = 0;
+  ctx->nodes[idx].kind = kind;
+  ctx->nodes[idx].op = 0;
+  ctx->nodes[idx].a = -1;
+  ctx->nodes[idx].b = -1;
+  ctx->nodes[idx].c = -1;
+  ctx->nodes[idx].next = -1;
+  return idx;
+}
+
+fn peek_kind(ctx: Ctx*) -> int32 {
+  return ctx->toks[ctx->pos].kind;
+}
+
+fn peek_op(ctx: Ctx*) -> int32 {
+  return ctx->toks[ctx->pos].op;
+}
+
+fn expect_punct(ctx: Ctx*, ch: int32) {
+  if (ctx->toks[ctx->pos].kind != T_PUNCT || ctx->toks[ctx->pos].op != ch) {
+    ctx->failed = 1;
+    return;
+  }
+  ctx->pos += 1;
+}
+
+fn parse_primary(ctx: Ctx*) -> int32 {
+  var kind: int32 = peek_kind(ctx);
+  if (kind == T_NUM) {
+    var idx: int32 = new_node(ctx, N_NUM);
+    ctx->nodes[idx].ival = ctx->toks[ctx->pos].ival;
+    ctx->pos += 1;
+    return idx;
+  }
+  if (kind == T_IDENT) {
+    var idx: int32 = new_node(ctx, N_VAR);
+    ctx->nodes[idx].op = ctx->toks[ctx->pos].op;
+    ctx->pos += 1;
+    return idx;
+  }
+  if (kind == T_PUNCT && peek_op(ctx) == 40) {
+    ctx->pos += 1;
+    var inner: int32 = parse_expr(ctx, 1);
+    expect_punct(ctx, 41);
+    return inner;
+  }
+  if (kind == T_OP && (peek_op(ctx) == OP_SUB || peek_op(ctx) == OP_NOT)) {
+    var unop: int32 = OP_NEG;
+    if (peek_op(ctx) == OP_NOT) {
+      unop = OP_NOT;
+    }
+    ctx->pos += 1;
+    var idx: int32 = new_node(ctx, N_UN);
+    ctx->nodes[idx].op = unop;
+    ctx->nodes[idx].a = parse_primary(ctx);
+    return idx;
+  }
+  ctx->failed = 1;
+  ctx->pos += 1;
+  return new_node(ctx, N_NUM);
+}
+
+fn parse_expr(ctx: Ctx*, min_prec: int32) -> int32 {
+  var left: int32 = parse_primary(ctx);
+  for (;;) {
+    if (peek_kind(ctx) != T_OP) {
+      return left;
+    }
+    var op: int32 = peek_op(ctx);
+    var prec: int32 = precedence(op);
+    if (prec < min_prec || prec == 0) {
+      return left;
+    }
+    ctx->pos += 1;
+    var right: int32 = parse_expr(ctx, prec + 1);
+    var idx: int32 = new_node(ctx, N_BIN);
+    ctx->nodes[idx].op = op;
+    ctx->nodes[idx].a = left;
+    ctx->nodes[idx].b = right;
+    left = idx;
+  }
+}
+
+fn parse_block(ctx: Ctx*) -> int32 {
+  expect_punct(ctx, 123);
+  var head: int32 = -1;
+  var tail: int32 = -1;
+  while (peek_kind(ctx) != T_EOF && ctx->failed == 0) {
+    if (peek_kind(ctx) == T_PUNCT && peek_op(ctx) == 125) {
+      ctx->pos += 1;
+      break;
+    }
+    var stmt: int32 = parse_stmt(ctx);
+    if (head < 0) {
+      head = stmt;
+    } else {
+      ctx->nodes[tail].next = stmt;
+    }
+    tail = stmt;
+  }
+  var idx: int32 = new_node(ctx, N_BLOCK);
+  ctx->nodes[idx].a = head;
+  return idx;
+}
+
+fn parse_stmt(ctx: Ctx*) -> int32 {
+  var kind: int32 = peek_kind(ctx);
+  if (kind == T_IF) {
+    ctx->pos += 1;
+    expect_punct(ctx, 40);
+    var cond: int32 = parse_expr(ctx, 1);
+    expect_punct(ctx, 41);
+    var then_block: int32 = parse_block(ctx);
+    var else_block: int32 = -1;
+    if (peek_kind(ctx) == T_ELSE) {
+      ctx->pos += 1;
+      else_block = parse_block(ctx);
+    }
+    var idx: int32 = new_node(ctx, N_IF);
+    ctx->nodes[idx].a = cond;
+    ctx->nodes[idx].b = then_block;
+    ctx->nodes[idx].c = else_block;
+    return idx;
+  }
+  if (kind == T_WHILE) {
+    ctx->pos += 1;
+    expect_punct(ctx, 40);
+    var cond: int32 = parse_expr(ctx, 1);
+    expect_punct(ctx, 41);
+    var body: int32 = parse_block(ctx);
+    var idx: int32 = new_node(ctx, N_WHILE);
+    ctx->nodes[idx].a = cond;
+    ctx->nodes[idx].b = body;
+    return idx;
+  }
+  if (kind == T_PUNCT && peek_op(ctx) == 123) {
+    return parse_block(ctx);
+  }
+  if (kind != T_IDENT) {
+    ctx->failed = 1;
+    ctx->pos += 1;
+    return new_node(ctx, N_BLOCK);
+  }
+  var slot: int32 = ctx->toks[ctx->pos].op;
+  ctx->pos += 1;
+  if (peek_kind(ctx) != T_OP || peek_op(ctx) != OP_ASSIGN) {
+    ctx->failed = 1;
+    return new_node(ctx, N_BLOCK);
+  }
+  ctx->pos += 1;
+  var value: int32 = parse_expr(ctx, 1);
+  expect_punct(ctx, 59);
+  var idx: int32 = new_node(ctx, N_ASSIGN);
+  ctx->nodes[idx].op = slot;
+  ctx->nodes[idx].a = value;
+  return idx;
+}
+
+fn parse_program(ctx: Ctx*) -> int32 {
+  ctx->pos = 0;
+  ctx->node_count = 0;
+  var head: int32 = -1;
+  var tail: int32 = -1;
+  while (peek_kind(ctx) != T_EOF && ctx->failed == 0) {
+    var stmt: int32 = parse_stmt(ctx);
+    if (head < 0) {
+      head = stmt;
+    } else {
+      ctx->nodes[tail].next = stmt;
+    }
+    tail = stmt;
+  }
+  var idx: int32 = new_node(ctx, N_BLOCK);
+  ctx->nodes[idx].a = head;
+  return idx;
+}
+
+fn eval(ctx: Ctx*, idx: int32, env: int64*) -> int64 {
+  var kind: int32 = ctx->nodes[idx].kind;
+  if (kind == N_NUM) {
+    return ctx->nodes[idx].ival;
+  }
+  if (kind == N_VAR) {
+    return env[ctx->nodes[idx].op];
+  }
+  if (kind == N_UN) {
+    var v: int64 = eval(ctx, ctx->nodes[idx].a, env);
+    if (ctx->nodes[idx].op == OP_NEG) {
+      return -v;
+    }
+    if (v == 0) {
+      return 1;
+    }
+    return 0;
+  }
+  var op: int32 = ctx->nodes[idx].op;
+  if (op == OP_LAND) {
+    if (eval(ctx, ctx->nodes[idx].a, env) == 0) {
+      return 0;
+    }
+    if (eval(ctx, ctx->nodes[idx].b, env) == 0) {
+      return 0;
+    }
+    return 1;
+  }
+  if (op == OP_LOR) {
+    if (eval(ctx, ctx->nodes[idx].a, env) != 0) {
+      return 1;
+    }
+    if (eval(ctx, ctx->nodes[idx].b, env) != 0) {
+      return 1;
+    }
+    return 0;
+  }
+  var l: int64 = eval(ctx, ctx->nodes[idx].a, env);
+  var r: int64 = eval(ctx, ctx->nodes[idx].b, env);
+  switch (op) {
+    case 1: return l + r;
+    case 2: return l - r;
+    case 3: return l * r;
+    case 4: if (r == 0) { return 0; } return l / r;
+    case 5: if (r == 0) { return 0; } return l % r;
+    case 6: if (l < r) { return 1; } return 0;
+    case 7: if (l <= r) { return 1; } return 0;
+    case 8: if (l > r) { return 1; } return 0;
+    case 9: if (l >= r) { return 1; } return 0;
+    case 10: if (l == r) { return 1; } return 0;
+    case 11: if (l != r) { return 1; } return 0;
+    case 12: return l & r;
+    case 13: return l | r;
+    case 14: return l ^ r;
+    case 15: return l << r;
+    case 16: return l >> r;
+    default: return 0;
+  }
+}
+
+fn exec(ctx: Ctx*, idx: int32, env: int64*, steps: int64*) {
+  var node: int32 = idx;
+  while (node >= 0) {
+    var kind: int32 = ctx->nodes[node].kind;
+    *steps = *steps + 1;
+    if (kind == N_ASSIGN) {
+      env[ctx->nodes[node].op] = eval(ctx, ctx->nodes[node].a, env);
+    } else if (kind == N_BLOCK) {
+      if (ctx->nodes[node].a >= 0) {
+        exec(ctx, ctx->nodes[node].a, env, steps);
+      }
+    } else if (kind == N_IF) {
+      if (eval(ctx, ctx->nodes[node].a, env) != 0) {
+        exec(ctx, ctx->nodes[node].b, env, steps);
+      } else if (ctx->nodes[node].c >= 0) {
+        exec(ctx, ctx->nodes[node].c, env, steps);
+      }
+    } else if (kind == N_WHILE) {
+      while (eval(ctx, ctx->nodes[node].a, env) != 0) {
+        exec(ctx, ctx->nodes[node].b, env, steps);
+        *steps = *steps + 1;
+      }
+    }
+    node = ctx->nodes[node].next;
+  }
+}
+
+fn run_once(ctx: Ctx*, env: int64*, steps: int64*) -> int64 {
+  lex(ctx);
+  var root: int32 = parse_program(ctx);
+  var i: int32 = 0;
+  while (i < NAME_CAP) {
+    env[i] = 0;
+    i += 1;
+  }
+  exec(ctx, root, env, steps);
+  var h: int64 = 0;
+  i = 0;
+  while (i < ctx->name_count) {
+    h = (h * 131 + env[i] + (int64)(i + 1)) % 2147483647;
+    i += 1;
+  }
+  return h;
+}
+
+fn main() -> int32 {
+  var src: uint8* = malloc(SRC_CAP);
+  var toks: Token* = malloc((int64)TOKEN_CAP * sizeof(Token));
+  var nodes: AstNode* = malloc((int64)NODE_CAP * sizeof(AstNode));
+  var name_off: int32* = malloc((int64)NAME_CAP * 4);
+  var name_len: int32* = malloc((int64)NAME_CAP * 4);
+  var env: int64* = malloc((int64)NAME_CAP * 8);
+  if (src == 0 || toks == 0 || nodes == 0 || name_off == 0 || name_len == 0 || env == 0) {
+    println("malloc failed");
+    return 1;
+  }
+
+  var ctx: Ctx;
+  ctx.src = src;
+  ctx.src_len = gen_source(src);
+  ctx.toks = toks;
+  ctx.tok_count = 0;
+  ctx.nodes = nodes;
+  ctx.node_count = 0;
+  ctx.name_off = name_off;
+  ctx.name_len = name_len;
+  ctx.name_count = 0;
+  ctx.pos = 0;
+  ctx.failed = 0;
+
+  println("AST interpreter: {ctx.src_len} byte program, {BLOCKS} blocks");
+
+  var steps: int64 = 0;
+  var check: int64 = run_once(&ctx, env, &steps);
+  println("Tokens = {ctx.tok_count} nodes = {ctx.node_count} names = {ctx.name_count} failed = {ctx.failed}");
+  println("Result = {check} steps = {steps}");
+
+  println("Benchmark: {PASSES} passes (lex + parse + eval)");
+
+  var t0: int64 = bench_time_us();
+  var bench_sum: int64 = 0;
+  var total_steps: int64 = 0;
+  var pass: int32 = 0;
+  while (pass < PASSES) {
+    bench_sum = bench_sum + run_once(&ctx, env, &total_steps);
+    pass += 1;
+  }
+  var elapsed_us: int64 = bench_time_us() - t0;
+
+  println("Bench sum = {bench_sum}");
+  println("Steps = {total_steps}");
+  print("Time: ");
+  print("{elapsed_us}");
+  println(" us");
+
+  var per_pass: int64 = elapsed_us / PASSES;
+  print("Per pass: ~");
+  print("{per_pass}");
+  println(" us");
+
+  free(src);
+  free(toks);
+  free(nodes);
+  free(name_off);
+  free(name_len);
+  free(env);
+  return 0;
+}

@@ -1,0 +1,287 @@
+// Mettle LZ77 compressor benchmark (Suite 3)
+//
+// The match finder a real deflate-class compressor uses: a 3-byte rolling hash
+// into a head table, hash chains through a 32 KB window, and a bounded chain
+// walk that compares candidate strings byte by byte. Compresses a 256 KB
+// redundant buffer, decompresses it back with overlapping copies, and verifies.
+// Every candidate visit depends on the previous one, so the search is a pointer
+// chase with an unpredictable exit.
+//
+// Build: build.bat
+// Run: lz77.exe
+
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+const SRC_TARGET: int32 = 262144;
+const SRC_CAP: int64 = 327680;
+const OUT_CAP: int64 = 786432;
+const WINDOW: int32 = 32768;
+const HASH_SIZE: int32 = 65536;
+const MIN_MATCH: int32 = 3;
+const MAX_MATCH: int32 = 258;
+const MAX_CHAIN: int32 = 32;
+const PASSES: int32 = 4;
+
+struct Lz {
+  head: int32*;
+  prev: int32*;
+  literals: int32;
+  matches: int32;
+  longest: int32;
+}
+
+fn make_word(dst: uint8*, pos: int32, idx: int32) -> int32 {
+  var len: int32 = 3 + idx % 6;
+  var v: int32 = idx;
+  var k: int32 = 0;
+  while (k < len) {
+    dst[pos + k] = (uint8)(97 + v % 26);
+    v = v / 26 + k * 5 + 2;
+    k += 1;
+  }
+  return pos + len;
+}
+
+fn gen_source(dst: uint8*) -> int32 {
+  var state: uint32 = 88675123;
+  var pos: int32 = 0;
+  while (pos < SRC_TARGET) {
+    state = state ^ (state << 13);
+    state = state ^ (state >> 17);
+    state = state ^ (state << 5);
+    var roll: int32 = (int32)(state % 100);
+    if (roll < 12 && pos > 4096) {
+      var from: int32 = (int32)(state % (uint32)(pos - 1024));
+      var chunk: int32 = 16 + (int32)(state % 112);
+      if (pos + chunk > SRC_TARGET) {
+        chunk = SRC_TARGET - pos;
+      }
+      var k: int32 = 0;
+      while (k < chunk) {
+        dst[pos + k] = dst[from + k];
+        k += 1;
+      }
+      pos += chunk;
+    } else {
+      pos = make_word(dst, pos, (int32)(state % 1024));
+      dst[pos] = 32;
+      if (roll > 95) {
+        dst[pos] = 10;
+      }
+      pos += 1;
+    }
+  }
+  return pos;
+}
+
+fn hash3(src: uint8*, pos: int32) -> int32 {
+  var a: int32 = (int32)src[pos];
+  var b: int32 = (int32)src[pos + 1];
+  var c: int32 = (int32)src[pos + 2];
+  return ((a << 10) ^ (b << 5) ^ c) & (HASH_SIZE - 1);
+}
+
+fn compress(z: Lz*, src: uint8*, len: int32, out: uint8*) -> int32 {
+  var i: int32 = 0;
+  while (i < HASH_SIZE) {
+    z->head[i] = -1;
+    i += 1;
+  }
+  i = 0;
+  while (i < WINDOW) {
+    z->prev[i] = -1;
+    i += 1;
+  }
+  z->literals = 0;
+  z->matches = 0;
+  z->longest = 0;
+
+  var mask: int32 = WINDOW - 1;
+  var opos: int32 = 0;
+  var pos: int32 = 0;
+  while (pos < len) {
+    var best_len: int32 = 0;
+    var best_dist: int32 = 0;
+    if (pos + MIN_MATCH <= len) {
+      var limit: int32 = len - pos;
+      if (limit > MAX_MATCH) {
+        limit = MAX_MATCH;
+      }
+      var h: int32 = hash3(src, pos);
+      var cand: int32 = z->head[h];
+      var chain: int32 = 0;
+      while (cand >= 0 && chain < MAX_CHAIN) {
+        var dist: int32 = pos - cand;
+        if (dist <= 0 || dist > WINDOW) {
+          break;
+        }
+        var run: int32 = 0;
+        while (run < limit && src[cand + run] == src[pos + run]) {
+          run += 1;
+        }
+        if (run > best_len) {
+          best_len = run;
+          best_dist = dist;
+          if (run >= limit) {
+            break;
+          }
+        }
+        cand = z->prev[cand & mask];
+        chain += 1;
+      }
+    }
+
+    if (best_len >= MIN_MATCH) {
+      out[opos] = 1;
+      out[opos + 1] = (uint8)(best_dist & 255);
+      out[opos + 2] = (uint8)((best_dist >> 8) & 255);
+      out[opos + 3] = (uint8)(best_len - MIN_MATCH);
+      opos += 4;
+      z->matches += 1;
+      if (best_len > z->longest) {
+        z->longest = best_len;
+      }
+      var k: int32 = 0;
+      while (k < best_len) {
+        if (pos + k + MIN_MATCH <= len) {
+          var hh: int32 = hash3(src, pos + k);
+          z->prev[(pos + k) & mask] = z->head[hh];
+          z->head[hh] = pos + k;
+        }
+        k += 1;
+      }
+      pos += best_len;
+    } else {
+      out[opos] = 0;
+      out[opos + 1] = src[pos];
+      opos += 2;
+      z->literals += 1;
+      if (pos + MIN_MATCH <= len) {
+        var hh: int32 = hash3(src, pos);
+        z->prev[pos & mask] = z->head[hh];
+        z->head[hh] = pos;
+      }
+      pos += 1;
+    }
+  }
+  return opos;
+}
+
+fn decompress(packed: uint8*, packed_len: int32, out: uint8*) -> int32 {
+  var ipos: int32 = 0;
+  var opos: int32 = 0;
+  while (ipos < packed_len) {
+    if (packed[ipos] == 0) {
+      out[opos] = packed[ipos + 1];
+      opos += 1;
+      ipos += 2;
+    } else {
+      var dist: int32 = (int32)packed[ipos + 1] | ((int32)packed[ipos + 2] << 8);
+      var run: int32 = (int32)packed[ipos + 3] + MIN_MATCH;
+      var from: int32 = opos - dist;
+      var k: int32 = 0;
+      while (k < run) {
+        out[opos + k] = out[from + k];
+        k += 1;
+      }
+      opos += run;
+      ipos += 4;
+    }
+  }
+  return opos;
+}
+
+fn roundtrip(z: Lz*, src: uint8*, len: int32, packed: uint8*, plain: uint8*,
+             out_packed: int32*, out_mismatch: int32*) -> uint64 {
+  var packed_len: int32 = compress(z, src, len, packed);
+  var produced: int32 = decompress(packed, packed_len, plain);
+
+  var mismatch: int32 = 0;
+  var i: int32 = 0;
+  while (i < len) {
+    if (plain[i] != src[i]) {
+      mismatch += 1;
+    }
+    i += 1;
+  }
+  if (produced != len) {
+    mismatch += 1;
+  }
+
+  var h: uint64 = 14695981039346656037;
+  i = 0;
+  while (i < packed_len) {
+    h = (h ^ (uint64)packed[i]) * 1099511628211;
+    i += 1;
+  }
+  h = h * 31 + (uint64)(z->matches * 7 + z->literals);
+  *out_packed = packed_len;
+  *out_mismatch = mismatch;
+  return h;
+}
+
+fn main() -> int32 {
+  var src: uint8* = malloc(SRC_CAP);
+  var packed: uint8* = malloc(OUT_CAP);
+  var plain: uint8* = malloc(SRC_CAP);
+  var head: int32* = malloc((int64)HASH_SIZE * 4);
+  var prev: int32* = malloc((int64)WINDOW * 4);
+  if (src == 0 || packed == 0 || plain == 0 || head == 0 || prev == 0) {
+    println("malloc failed");
+    return 1;
+  }
+
+  var src_len: int32 = gen_source(src);
+
+  var z: Lz;
+  z.head = head;
+  z.prev = prev;
+  z.literals = 0;
+  z.matches = 0;
+  z.longest = 0;
+
+  println("LZ77: {src_len} byte buffer, {WINDOW} byte window, chain limit {MAX_CHAIN}");
+
+  var packed_len: int32 = 0;
+  var mismatch: int32 = 0;
+  var check: uint64 = roundtrip(&z, src, src_len, packed, plain, &packed_len, &mismatch);
+  println("Packed = {packed_len} bytes, literals = {z.literals}, matches = {z.matches}, longest = {z.longest}");
+  println("Mismatches = {mismatch} checksum = {check}");
+
+  println("Benchmark: {PASSES} passes (compress + decompress + verify)");
+
+  var t0: int64 = bench_time_us();
+  var bench_hash: uint64 = 0;
+  var total_packed: int64 = 0;
+  var total_mismatch: int64 = 0;
+  var pass: int32 = 0;
+  while (pass < PASSES) {
+    var pass_packed: int32 = 0;
+    var pass_mismatch: int32 = 0;
+    bench_hash = bench_hash * 1000003 + roundtrip(&z, src, src_len, packed, plain, &pass_packed, &pass_mismatch);
+    total_packed = total_packed + (int64)pass_packed;
+    total_mismatch = total_mismatch + (int64)pass_mismatch;
+    pass += 1;
+  }
+  var elapsed_us: int64 = bench_time_us() - t0;
+
+  println("Bench hash = {bench_hash}");
+  println("Packed bytes = {total_packed} mismatches = {total_mismatch}");
+  print("Time: ");
+  print("{elapsed_us}");
+  println(" us");
+
+  var per_pass: int64 = elapsed_us / PASSES;
+  print("Per pass: ~");
+  print("{per_pass}");
+  println(" us");
+
+  free(src);
+  free(packed);
+  free(plain);
+  free(head);
+  free(prev);
+  return 0;
+}

@@ -1,0 +1,364 @@
+// Mettle A* pathfinding benchmark (Suite 3)
+//
+// Grows a 192x192 cave with a cellular automaton, assigns terrain costs, then
+// runs sixteen A* searches over it with a binary min-heap open set and lazy
+// deletion, reconstructing each path through its parent chain. Node expansion
+// order depends on the frontier, so the loads scatter across the grid and the
+// heap sift path is branch-unpredictable.
+//
+// Build: build.bat
+// Run: astar_grid.exe
+
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+const DIM: int32 = 192;
+const CELLS: int32 = 36864;
+const QUERIES: int32 = 16;
+const SMOOTH_STEPS: int32 = 3;
+const INF: int32 = 2000000000;
+const PASSES: int32 = 3;
+
+struct Grid {
+  wall: uint8*;
+  cost: uint8*;
+  g: int32*;
+  parent: int32*;
+  closed: uint8*;
+  heap_key: int32*;
+  heap_node: int32*;
+  heap_size: int32;
+  expanded: int32;
+}
+
+fn gen_grid(gr: Grid*, scratch: uint8*) {
+  var state: uint32 = 1973272912;
+  var i: int32 = 0;
+  while (i < CELLS) {
+    state = state ^ (state << 13);
+    state = state ^ (state >> 17);
+    state = state ^ (state << 5);
+    if (state % 100 < 42) {
+      gr->wall[i] = 1;
+    } else {
+      gr->wall[i] = 0;
+    }
+    i += 1;
+  }
+
+  var step: int32 = 0;
+  while (step < SMOOTH_STEPS) {
+    var y: int32 = 0;
+    while (y < DIM) {
+      var x: int32 = 0;
+      while (x < DIM) {
+        var neighbours: int32 = 0;
+        var dy: int32 = -1;
+        while (dy <= 1) {
+          var dx: int32 = -1;
+          while (dx <= 1) {
+            var ny: int32 = y + dy;
+            var nx: int32 = x + dx;
+            if (nx < 0 || ny < 0 || nx >= DIM || ny >= DIM) {
+              neighbours += 1;
+            } else if (gr->wall[ny * DIM + nx] != 0) {
+              neighbours += 1;
+            }
+            dx += 1;
+          }
+          dy += 1;
+        }
+        if (neighbours >= 5) {
+          scratch[y * DIM + x] = 1;
+        } else {
+          scratch[y * DIM + x] = 0;
+        }
+        x += 1;
+      }
+      y += 1;
+    }
+    i = 0;
+    while (i < CELLS) {
+      gr->wall[i] = scratch[i];
+      i += 1;
+    }
+    step += 1;
+  }
+
+  var y2: int32 = 0;
+  while (y2 < DIM) {
+    var x2: int32 = 0;
+    while (x2 < DIM) {
+      gr->cost[y2 * DIM + x2] = (uint8)(1 + (x2 * 7 + y2 * 13) % 4);
+      x2 += 1;
+    }
+    y2 += 1;
+  }
+}
+
+fn find_open(gr: Grid*, from: int32) -> int32 {
+  var idx: int32 = from;
+  var tries: int32 = 0;
+  while (tries < CELLS) {
+    if (gr->wall[idx] == 0) {
+      return idx;
+    }
+    idx += 1;
+    if (idx >= CELLS) {
+      idx = 0;
+    }
+    tries += 1;
+  }
+  return 0;
+}
+
+fn heuristic(node: int32, goal: int32) -> int32 {
+  var nx: int32 = node % DIM;
+  var ny: int32 = node / DIM;
+  var gx: int32 = goal % DIM;
+  var gy: int32 = goal / DIM;
+  var dx: int32 = nx - gx;
+  if (dx < 0) {
+    dx = -dx;
+  }
+  var dy: int32 = ny - gy;
+  if (dy < 0) {
+    dy = -dy;
+  }
+  return dx + dy;
+}
+
+fn heap_push(gr: Grid*, key: int32, node: int32) {
+  var i: int32 = gr->heap_size;
+  gr->heap_key[i] = key;
+  gr->heap_node[i] = node;
+  gr->heap_size += 1;
+  while (i > 0) {
+    var parent: int32 = (i - 1) / 2;
+    var swap: int32 = 0;
+    if (gr->heap_key[i] < gr->heap_key[parent]) {
+      swap = 1;
+    } else if (gr->heap_key[i] == gr->heap_key[parent] && gr->heap_node[i] < gr->heap_node[parent]) {
+      swap = 1;
+    }
+    if (swap == 0) {
+      break;
+    }
+    var tk: int32 = gr->heap_key[i];
+    var tn: int32 = gr->heap_node[i];
+    gr->heap_key[i] = gr->heap_key[parent];
+    gr->heap_node[i] = gr->heap_node[parent];
+    gr->heap_key[parent] = tk;
+    gr->heap_node[parent] = tn;
+    i = parent;
+  }
+}
+
+fn heap_pop(gr: Grid*) -> int32 {
+  var top: int32 = gr->heap_node[0];
+  gr->heap_size -= 1;
+  gr->heap_key[0] = gr->heap_key[gr->heap_size];
+  gr->heap_node[0] = gr->heap_node[gr->heap_size];
+  var i: int32 = 0;
+  for (;;) {
+    var left: int32 = i * 2 + 1;
+    var right: int32 = left + 1;
+    var best: int32 = i;
+    if (left < gr->heap_size) {
+      if (gr->heap_key[left] < gr->heap_key[best] ||
+          (gr->heap_key[left] == gr->heap_key[best] && gr->heap_node[left] < gr->heap_node[best])) {
+        best = left;
+      }
+    }
+    if (right < gr->heap_size) {
+      if (gr->heap_key[right] < gr->heap_key[best] ||
+          (gr->heap_key[right] == gr->heap_key[best] && gr->heap_node[right] < gr->heap_node[best])) {
+        best = right;
+      }
+    }
+    if (best == i) {
+      break;
+    }
+    var tk: int32 = gr->heap_key[i];
+    var tn: int32 = gr->heap_node[i];
+    gr->heap_key[i] = gr->heap_key[best];
+    gr->heap_node[i] = gr->heap_node[best];
+    gr->heap_key[best] = tk;
+    gr->heap_node[best] = tn;
+    i = best;
+  }
+  return top;
+}
+
+fn relax(gr: Grid*, node: int32, nb: int32, goal: int32) {
+  if (gr->wall[nb] != 0 || gr->closed[nb] != 0) {
+    return;
+  }
+  var tentative: int32 = gr->g[node] + (int32)gr->cost[nb];
+  if (tentative < gr->g[nb]) {
+    gr->g[nb] = tentative;
+    gr->parent[nb] = node;
+    heap_push(gr, tentative + heuristic(nb, goal), nb);
+  }
+}
+
+fn astar(gr: Grid*, start: int32, goal: int32) -> int32 {
+  var i: int32 = 0;
+  while (i < CELLS) {
+    gr->g[i] = INF;
+    gr->parent[i] = -1;
+    gr->closed[i] = 0;
+    i += 1;
+  }
+  gr->heap_size = 0;
+  gr->expanded = 0;
+  gr->g[start] = 0;
+  heap_push(gr, heuristic(start, goal), start);
+
+  while (gr->heap_size > 0) {
+    var node: int32 = heap_pop(gr);
+    if (gr->closed[node] != 0) {
+      continue;
+    }
+    gr->closed[node] = 1;
+    gr->expanded += 1;
+    if (node == goal) {
+      return gr->g[goal];
+    }
+    var x: int32 = node % DIM;
+    var y: int32 = node / DIM;
+    if (x > 0) {
+      relax(gr, node, node - 1, goal);
+    }
+    if (x + 1 < DIM) {
+      relax(gr, node, node + 1, goal);
+    }
+    if (y > 0) {
+      relax(gr, node, node - DIM, goal);
+    }
+    if (y + 1 < DIM) {
+      relax(gr, node, node + DIM, goal);
+    }
+  }
+  return -1;
+}
+
+fn path_hash(gr: Grid*, start: int32, goal: int32, steps: int32*) -> uint64 {
+  var h: uint64 = 14695981039346656037;
+  var node: int32 = goal;
+  var count: int32 = 0;
+  while (node >= 0 && count <= CELLS) {
+    h = h * 1000003 + (uint64)(node + 1);
+    if (node == start) {
+      break;
+    }
+    node = gr->parent[node];
+    count += 1;
+  }
+  *steps = count;
+  return h;
+}
+
+fn run_queries(gr: Grid*) -> uint64 {
+  var state: uint32 = 305419896;
+  var h: uint64 = 14695981039346656037;
+  var q: int32 = 0;
+  while (q < QUERIES) {
+    state = state ^ (state << 13);
+    state = state ^ (state >> 17);
+    state = state ^ (state << 5);
+    var start: int32 = find_open(gr, (int32)(state % (uint32)CELLS));
+    state = state ^ (state << 13);
+    state = state ^ (state >> 17);
+    state = state ^ (state << 5);
+    var goal: int32 = find_open(gr, (int32)(state % (uint32)CELLS));
+
+    var cost: int32 = astar(gr, start, goal);
+    var steps: int32 = 0;
+    var ph: uint64 = 0;
+    if (cost >= 0) {
+      ph = path_hash(gr, start, goal, &steps);
+    }
+    h = h * 1000003 + (uint64)(int64)cost;
+    h = h * 31 + (uint64)gr->expanded;
+    h = h * 31 + (uint64)steps;
+    h = h ^ ph;
+    q += 1;
+  }
+  return h;
+}
+
+fn main() -> int32 {
+  var wall: uint8* = malloc((int64)CELLS);
+  var scratch: uint8* = malloc((int64)CELLS);
+  var cost: uint8* = malloc((int64)CELLS);
+  var g: int32* = malloc((int64)CELLS * 4);
+  var parent: int32* = malloc((int64)CELLS * 4);
+  var closed: uint8* = malloc((int64)CELLS);
+  var heap_key: int32* = malloc((int64)CELLS * 16);
+  var heap_node: int32* = malloc((int64)CELLS * 16);
+  if (wall == 0 || scratch == 0 || cost == 0 || g == 0 || parent == 0 || closed == 0 ||
+      heap_key == 0 || heap_node == 0) {
+    println("malloc failed");
+    return 1;
+  }
+
+  var gr: Grid;
+  gr.wall = wall;
+  gr.cost = cost;
+  gr.g = g;
+  gr.parent = parent;
+  gr.closed = closed;
+  gr.heap_key = heap_key;
+  gr.heap_node = heap_node;
+  gr.heap_size = 0;
+  gr.expanded = 0;
+
+  gen_grid(&gr, scratch);
+
+  var open_cells: int32 = 0;
+  var i: int32 = 0;
+  while (i < CELLS) {
+    if (wall[i] == 0) {
+      open_cells += 1;
+    }
+    i += 1;
+  }
+
+  println("A* pathfinding: {DIM}x{DIM} grid, {open_cells} open cells, {QUERIES} queries");
+
+  var check: uint64 = run_queries(&gr);
+  println("Checksum = {check}");
+
+  println("Benchmark: {PASSES} passes ({QUERIES} searches each)");
+
+  var t0: int64 = bench_time_us();
+  var bench_hash: uint64 = 0;
+  var pass: int32 = 0;
+  while (pass < PASSES) {
+    bench_hash = bench_hash * 1000003 + run_queries(&gr);
+    pass += 1;
+  }
+  var elapsed_us: int64 = bench_time_us() - t0;
+
+  println("Bench hash = {bench_hash}");
+  print("Time: ");
+  print("{elapsed_us}");
+  println(" us");
+
+  var per_pass: int64 = elapsed_us / PASSES;
+  print("Per pass: ~");
+  print("{per_pass}");
+  println(" us");
+
+  free(wall);
+  free(scratch);
+  free(cost);
+  free(g);
+  free(parent);
+  free(closed);
+  free(heap_key);
+  free(heap_node);
+  return 0;
+}

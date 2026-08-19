@@ -14,23 +14,19 @@
 #   .\tools\benchmark\run-benchmarks.ps1 -BuildCompiler
 #   .\tools\benchmark\run-benchmarks.ps1 -Runs 7 -Warmup 2
 #   .\tools\benchmark\run-benchmarks.ps1 -Benchmark fib,grep
-#   .\tools\benchmark\run-benchmarks.ps1 -Suite 2          # Suite 2 only (new benchmark set)
+#   .\tools\benchmark\run-benchmarks.ps1 -Suite 3          # one suite only
 #   .\tools\benchmark\run-benchmarks.ps1 -Clang            # clang instead of gcc (mingw target)
 #   .\tools\benchmark\run-benchmarks.ps1 -Clang -ClangTarget ""   # clang with its own default target
 #   .\tools\benchmark\run-benchmarks.ps1 -MlOpt        # compile Mettle with --ml-opt
 #   .\tools\benchmark\run-benchmarks.ps1 -CompileOnly
 #   .\tools\benchmark\run-benchmarks.ps1 -SkipCompileBenchmarks
 #   .\tools\benchmark\run-benchmarks.ps1 -Quiet
-#   .\tools\benchmark\run-benchmarks.ps1 -OpenReport
-#   .\tools\benchmark\run-benchmarks.ps1 -NoReport
 
 param(
     [switch]$BuildCompiler,
     [switch]$CompileOnly,
     [switch]$SkipCompileBenchmarks,
     [switch]$Quiet,
-    [switch]$NoReport,
-    [switch]$OpenReport,
     [switch]$Gcc,
     [switch]$Clang,
     [switch]$MlOpt,
@@ -1018,31 +1014,6 @@ Write-Log ""
 Write-Log "Wrote $primaryOutputPath"
 if (-not [string]::IsNullOrWhiteSpace($mirrorOutput)) {
     Write-Log "Mirrored to $(Join-Path $Root $mirrorOutput)"
-}
-
-if (-not $NoReport) {
-    $reportOutput = if ($null -ne $config.outputs.report_html -and -not [string]::IsNullOrWhiteSpace([string]$config.outputs.report_html)) {
-        [string]$config.outputs.report_html
-    } else {
-        [System.IO.Path]::ChangeExtension($primaryOutput, ".html")
-    }
-
-    $reportScript = Join-Path $PSScriptRoot "generate-report.ps1"
-    if (Test-Path $reportScript) {
-        $reportArgs = @{
-            InputPath = $primaryOutput
-            OutputPath = $reportOutput
-        }
-        if ($OpenReport) {
-            $reportArgs.OpenReport = $true
-        }
-        & $reportScript @reportArgs
-        if ($LASTEXITCODE -ne 0) {
-            Write-Log "Report generation failed."
-        }
-    } else {
-        Write-Log "Report generator not found: $reportScript"
-    }
 }
 
 if (-not $Quiet -and $null -ne $summary.runtime_geomean) {

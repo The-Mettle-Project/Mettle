@@ -3,8 +3,7 @@
   "mode": "mettle-vs-c",
   "outputs": {
     "primary": "docs/benchmarks/latest.json",
-    "mirror_web": "web/benchmarks.json",
-    "report_html": "docs/benchmarks/latest.html"
+    "mirror_web": "web/benchmarks.json"
   },
   "defaults": {
     "c_flags": [
@@ -565,6 +564,94 @@
       "c_source": "examples/bst_insert/bst_insert.c",
       "c_exe": "examples/bst_insert/bst_insert_c.exe",
       "build_script": "examples/bst_insert/build.bat"
+    },
+    {
+      "name": "json_parse",
+      "kind": "runtime",
+      "suite": 3,
+      "description": "JSON parse: 330 KB generated document into a node arena + tree walk x 30 (recursive descent, escapes, exponents)",
+      "mettle_source": "examples/json_parse/json_parse.mettle",
+      "mettle_exe": "examples/json_parse/json_parse.exe",
+      "c_source": "examples/json_parse/json_parse.c",
+      "c_exe": "examples/json_parse/json_parse_c.exe",
+      "build_script": "examples/json_parse/build.bat"
+    },
+    {
+      "name": "interp_ast",
+      "kind": "runtime",
+      "suite": 3,
+      "description": "AST interpreter: lex + parse + run a 165 KB generated program x 20 (token array, precedence climbing, tree walk)",
+      "mettle_source": "examples/interp_ast/interp_ast.mettle",
+      "mettle_exe": "examples/interp_ast/interp_ast.exe",
+      "c_source": "examples/interp_ast/interp_ast.c",
+      "c_exe": "examples/interp_ast/interp_ast_c.exe",
+      "build_script": "examples/interp_ast/build.bat"
+    },
+    {
+      "name": "word_freq",
+      "kind": "runtime",
+      "suite": 3,
+      "description": "Word frequency: tokenize 1 MB, count in a growing open-addressing map, top 16 x 15 (probe chains, rehash)",
+      "mettle_source": "examples/word_freq/word_freq.mettle",
+      "mettle_exe": "examples/word_freq/word_freq.exe",
+      "c_source": "examples/word_freq/word_freq.c",
+      "c_exe": "examples/word_freq/word_freq_c.exe",
+      "build_script": "examples/word_freq/build.bat"
+    },
+    {
+      "name": "huffman",
+      "kind": "runtime",
+      "suite": 3,
+      "description": "Huffman codec: histogram + heap tree + code assignment + bit encode/decode roundtrip over 128 KB x 6",
+      "mettle_source": "examples/huffman/huffman.mettle",
+      "mettle_exe": "examples/huffman/huffman.exe",
+      "c_source": "examples/huffman/huffman.c",
+      "c_exe": "examples/huffman/huffman_c.exe",
+      "build_script": "examples/huffman/build.bat"
+    },
+    {
+      "name": "lz77",
+      "kind": "runtime",
+      "suite": 3,
+      "description": "LZ77: hash-chain match finder over 256 KB with a 32 KB window, decompress + verify x 4 (candidate pointer chase)",
+      "mettle_source": "examples/lz77/lz77.mettle",
+      "mettle_exe": "examples/lz77/lz77.exe",
+      "c_source": "examples/lz77/lz77.c",
+      "c_exe": "examples/lz77/lz77_c.exe",
+      "build_script": "examples/lz77/build.bat"
+    },
+    {
+      "name": "astar_grid",
+      "kind": "runtime",
+      "suite": 3,
+      "description": "A* pathfinding: 16 searches over a 192x192 generated cave with a binary-heap open set x 3 (scattered frontier)",
+      "mettle_source": "examples/astar_grid/astar_grid.mettle",
+      "mettle_exe": "examples/astar_grid/astar_grid.exe",
+      "c_source": "examples/astar_grid/astar_grid.c",
+      "c_exe": "examples/astar_grid/astar_grid_c.exe",
+      "build_script": "examples/astar_grid/build.bat"
+    },
+    {
+      "name": "regex_match",
+      "kind": "runtime",
+      "suite": 3,
+      "description": "Regex: 5 backtracking patterns matched at every offset of 4000 log lines x 3 (recursive greedy quantifiers)",
+      "mettle_source": "examples/regex_match/regex_match.mettle",
+      "mettle_exe": "examples/regex_match/regex_match.exe",
+      "c_source": "examples/regex_match/regex_match.c",
+      "c_exe": "examples/regex_match/regex_match_c.exe",
+      "build_script": "examples/regex_match/build.bat"
+    },
+    {
+      "name": "physics_grid",
+      "kind": "runtime",
+      "suite": 3,
+      "description": "Particle sim: 8192 bodies bucketed into a 64x64 grid, neighbour collisions + integrate, 20 steps x 2",
+      "mettle_source": "examples/physics_grid/physics_grid.mettle",
+      "mettle_exe": "examples/physics_grid/physics_grid.exe",
+      "c_source": "examples/physics_grid/physics_grid.c",
+      "c_exe": "examples/physics_grid/physics_grid_c.exe",
+      "build_script": "examples/physics_grid/build.bat"
     }
   ],
   "compile_benchmarks": [

@@ -1,0 +1,537 @@
+// Mettle JSON document parser benchmark (Suite 3)
+//
+// Builds a ~350 KB JSON catalogue in memory, then tokenizes and parses it with
+// a recursive-descent parser into a node arena and walks the resulting tree.
+// The document carries escaped strings, exponent-form numbers, ragged arrays,
+// nulls, and irregular whitespace, so no phase reduces to a uniform scan.
+//
+// Build: build.bat
+// Run: json_parse.exe
+
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+const REC_COUNT: int32 = 3000;
+const DOC_CAP: int64 = 1048576;
+const NODE_CAP: int32 = 65536;
+const PASSES: int32 = 30;
+
+const K_NULL: int32 = 0;
+const K_FALSE: int32 = 1;
+const K_TRUE: int32 = 2;
+const K_NUM: int32 = 3;
+const K_STR: int32 = 4;
+const K_ARR: int32 = 5;
+const K_OBJ: int32 = 6;
+
+struct Node {
+  num: float64;
+  kind: int32;
+  key_off: int32;
+  key_len: int32;
+  val_off: int32;
+  val_len: int32;
+  first: int32;
+  next: int32;
+}
+
+struct Parser {
+  text: uint8*;
+  len: int32;
+  pos: int32;
+  nodes: Node*;
+  count: int32;
+  failed: int32;
+}
+
+fn emit_cstr(dst: uint8*, pos: int32, s: cstring) -> int32 {
+  var i: int32 = 0;
+  while (s[i] != 0) {
+    dst[pos + i] = (uint8)s[i];
+    i += 1;
+  }
+  return pos + i;
+}
+
+fn emit_int(dst: uint8*, pos: int32, v: int32) -> int32 {
+  var tmp: uint8[24];
+  if (v < 0) {
+    dst[pos] = 45;
+    pos += 1;
+    v = -v;
+  }
+  if (v == 0) {
+    dst[pos] = 48;
+    return pos + 1;
+  }
+  var n: int32 = 0;
+  while (v > 0) {
+    tmp[n] = (uint8)(48 + v % 10);
+    v = v / 10;
+    n += 1;
+  }
+  while (n > 0) {
+    n -= 1;
+    dst[pos] = tmp[n];
+    pos += 1;
+  }
+  return pos;
+}
+
+fn emit_fixed2(dst: uint8*, pos: int32, hundredths: int32) -> int32 {
+  pos = emit_int(dst, pos, hundredths / 100);
+  dst[pos] = 46;
+  pos += 1;
+  var frac: int32 = hundredths % 100;
+  dst[pos] = (uint8)(48 + frac / 10);
+  dst[pos + 1] = (uint8)(48 + frac % 10);
+  return pos + 2;
+}
+
+fn emit_tag(dst: uint8*, pos: int32, which: int32) -> int32 {
+  switch (which) {
+    case 0: return emit_cstr(dst, pos, "\"alpha\"");
+    case 1: return emit_cstr(dst, pos, "\"beta-two\"");
+    case 2: return emit_cstr(dst, pos, "\"gamma ray\"");
+    default: return emit_cstr(dst, pos, "\"delta\\\\core\"");
+  }
+}
+
+// A literal '{' has to be doubled: a lone brace opens a string interpolation.
+fn gen_doc(dst: uint8*) -> int32 {
+  var pos: int32 = 0;
+  pos = emit_cstr(dst, pos, "{{\"meta\":{{\"version\":3,\"source\":\"synthetic\",\"records\":");
+  pos = emit_int(dst, pos, REC_COUNT);
+  pos = emit_cstr(dst, pos, "},\n\"records\":[\n");
+
+  var i: int32 = 0;
+  while (i < REC_COUNT) {
+    var spaced: int32 = i % 2;
+    pos = emit_cstr(dst, pos, "{{\"id\":");
+    if (spaced != 0) {
+      dst[pos] = 32;
+      pos += 1;
+    }
+    pos = emit_int(dst, pos, i);
+    pos = emit_cstr(dst, pos, ",\"name\":\"");
+    if (i % 7 == 0) {
+      pos = emit_cstr(dst, pos, "it\\\"em\\\"-");
+    } else {
+      pos = emit_cstr(dst, pos, "item-");
+    }
+    pos = emit_int(dst, pos, i);
+    pos = emit_cstr(dst, pos, "\",\"tags\":[");
+    var tag_count: int32 = i % 4;
+    var t: int32 = 0;
+    while (t < tag_count) {
+      if (t > 0) {
+        dst[pos] = 44;
+        pos += 1;
+      }
+      pos = emit_tag(dst, pos, (i + t) % 4);
+      t += 1;
+    }
+    pos = emit_cstr(dst, pos, "],\"score\":");
+    if (i % 11 == 0) {
+      pos = emit_fixed2(dst, pos, (i * 37) % 1000);
+      pos = emit_cstr(dst, pos, "e2");
+    } else if (i % 5 == 0) {
+      pos = emit_cstr(dst, pos, "-");
+      pos = emit_fixed2(dst, pos, (i * 37) % 1000);
+    } else {
+      pos = emit_fixed2(dst, pos, (i * 37) % 1000);
+    }
+    pos = emit_cstr(dst, pos, ",\"active\":");
+    if (i % 3 != 0) {
+      pos = emit_cstr(dst, pos, "true");
+    } else {
+      pos = emit_cstr(dst, pos, "false");
+    }
+    if (i % 13 == 0) {
+      pos = emit_cstr(dst, pos, ",\"extra\":null");
+    }
+    pos = emit_cstr(dst, pos, ",\"dims\":{{\"w\":");
+    pos = emit_int(dst, pos, 4 + i % 97);
+    pos = emit_cstr(dst, pos, ",\"h\":");
+    pos = emit_int(dst, pos, 3 + (i * 7) % 61);
+    pos = emit_cstr(dst, pos, "}}");
+    if (i + 1 < REC_COUNT) {
+      dst[pos] = 44;
+      pos += 1;
+    }
+    dst[pos] = 10;
+    pos += 1;
+    i += 1;
+  }
+
+  pos = emit_cstr(dst, pos, "]}");
+  dst[pos] = 0;
+  return pos;
+}
+
+fn skip_ws(p: Parser*) {
+  while (p->pos < p->len) {
+    var c: int32 = (int32)p->text[p->pos];
+    if (c == 32 || c == 9 || c == 10 || c == 13) {
+      p->pos += 1;
+    } else {
+      return;
+    }
+  }
+}
+
+fn new_node(p: Parser*, kind: int32) -> int32 {
+  if (p->count >= NODE_CAP) {
+    p->failed = 1;
+    return -1;
+  }
+  var idx: int32 = p->count;
+  p->count += 1;
+  p->nodes[idx].num = 0.0;
+  p->nodes[idx].kind = kind;
+  p->nodes[idx].key_off = 0;
+  p->nodes[idx].key_len = 0;
+  p->nodes[idx].val_off = 0;
+  p->nodes[idx].val_len = 0;
+  p->nodes[idx].first = -1;
+  p->nodes[idx].next = -1;
+  return idx;
+}
+
+fn scan_string(p: Parser*, out_off: int32*, out_len: int32*) -> int32 {
+  if (p->pos >= p->len || p->text[p->pos] != 34) {
+    p->failed = 1;
+    return 0;
+  }
+  p->pos += 1;
+  var start: int32 = p->pos;
+  var escapes: int32 = 0;
+  while (p->pos < p->len) {
+    var c: int32 = (int32)p->text[p->pos];
+    if (c == 92) {
+      escapes += 1;
+      p->pos += 2;
+    } else if (c == 34) {
+      *out_off = start;
+      *out_len = p->pos - start - escapes;
+      p->pos += 1;
+      return 1;
+    } else {
+      p->pos += 1;
+    }
+  }
+  p->failed = 1;
+  return 0;
+}
+
+fn pow10(exp: int32) -> float64 {
+  var scale: float64 = 1.0;
+  var e: int32 = exp;
+  if (e < 0) {
+    e = -e;
+    while (e > 0) {
+      scale = scale / 10.0;
+      e -= 1;
+    }
+    return scale;
+  }
+  while (e > 0) {
+    scale = scale * 10.0;
+    e -= 1;
+  }
+  return scale;
+}
+
+fn scan_number(p: Parser*) -> float64 {
+  var sign: float64 = 1.0;
+  if (p->pos < p->len && p->text[p->pos] == 45) {
+    sign = -1.0;
+    p->pos += 1;
+  }
+  var value: float64 = 0.0;
+  while (p->pos < p->len) {
+    var c: int32 = (int32)p->text[p->pos];
+    if (c < 48 || c > 57) {
+      break;
+    }
+    value = value * 10.0 + (float64)(c - 48);
+    p->pos += 1;
+  }
+  if (p->pos < p->len && p->text[p->pos] == 46) {
+    p->pos += 1;
+    var scale: float64 = 0.1;
+    while (p->pos < p->len) {
+      var c: int32 = (int32)p->text[p->pos];
+      if (c < 48 || c > 57) {
+        break;
+      }
+      value = value + (float64)(c - 48) * scale;
+      scale = scale * 0.1;
+      p->pos += 1;
+    }
+  }
+  if (p->pos < p->len && (p->text[p->pos] == 101 || p->text[p->pos] == 69)) {
+    p->pos += 1;
+    var esign: int32 = 1;
+    if (p->pos < p->len && p->text[p->pos] == 43) {
+      p->pos += 1;
+    } else if (p->pos < p->len && p->text[p->pos] == 45) {
+      esign = -1;
+      p->pos += 1;
+    }
+    var exp: int32 = 0;
+    while (p->pos < p->len) {
+      var c: int32 = (int32)p->text[p->pos];
+      if (c < 48 || c > 57) {
+        break;
+      }
+      exp = exp * 10 + (c - 48);
+      p->pos += 1;
+    }
+    value = value * pow10(esign * exp);
+  }
+  return sign * value;
+}
+
+fn match_word(p: Parser*, word: cstring) -> int32 {
+  var i: int32 = 0;
+  while (word[i] != 0) {
+    if (p->pos + i >= p->len || (int32)p->text[p->pos + i] != (int32)word[i]) {
+      p->failed = 1;
+      return 0;
+    }
+    i += 1;
+  }
+  p->pos += i;
+  return 1;
+}
+
+fn parse_array(p: Parser*) -> int32 {
+  var idx: int32 = new_node(p, K_ARR);
+  if (idx < 0) {
+    return -1;
+  }
+  p->pos += 1;
+  skip_ws(p);
+  if (p->pos < p->len && p->text[p->pos] == 93) {
+    p->pos += 1;
+    return idx;
+  }
+  var tail: int32 = -1;
+  for (;;) {
+    var child: int32 = parse_value(p);
+    if (child < 0) {
+      return -1;
+    }
+    if (tail < 0) {
+      p->nodes[idx].first = child;
+    } else {
+      p->nodes[tail].next = child;
+    }
+    tail = child;
+    skip_ws(p);
+    if (p->pos >= p->len) {
+      p->failed = 1;
+      return -1;
+    }
+    var c: int32 = (int32)p->text[p->pos];
+    p->pos += 1;
+    if (c == 93) {
+      return idx;
+    }
+    if (c != 44) {
+      p->failed = 1;
+      return -1;
+    }
+  }
+}
+
+fn parse_object(p: Parser*) -> int32 {
+  var idx: int32 = new_node(p, K_OBJ);
+  if (idx < 0) {
+    return -1;
+  }
+  p->pos += 1;
+  skip_ws(p);
+  if (p->pos < p->len && p->text[p->pos] == 125) {
+    p->pos += 1;
+    return idx;
+  }
+  var tail: int32 = -1;
+  for (;;) {
+    skip_ws(p);
+    var key_off: int32 = 0;
+    var key_len: int32 = 0;
+    if (scan_string(p, &key_off, &key_len) == 0) {
+      return -1;
+    }
+    skip_ws(p);
+    if (p->pos >= p->len || p->text[p->pos] != 58) {
+      p->failed = 1;
+      return -1;
+    }
+    p->pos += 1;
+    var child: int32 = parse_value(p);
+    if (child < 0) {
+      return -1;
+    }
+    p->nodes[child].key_off = key_off;
+    p->nodes[child].key_len = key_len;
+    if (tail < 0) {
+      p->nodes[idx].first = child;
+    } else {
+      p->nodes[tail].next = child;
+    }
+    tail = child;
+    skip_ws(p);
+    if (p->pos >= p->len) {
+      p->failed = 1;
+      return -1;
+    }
+    var c: int32 = (int32)p->text[p->pos];
+    p->pos += 1;
+    if (c == 125) {
+      return idx;
+    }
+    if (c != 44) {
+      p->failed = 1;
+      return -1;
+    }
+  }
+}
+
+fn parse_value(p: Parser*) -> int32 {
+  skip_ws(p);
+  if (p->pos >= p->len || p->failed != 0) {
+    p->failed = 1;
+    return -1;
+  }
+  var c: int32 = (int32)p->text[p->pos];
+  if (c == 123) {
+    return parse_object(p);
+  }
+  if (c == 91) {
+    return parse_array(p);
+  }
+  if (c == 34) {
+    var sidx: int32 = new_node(p, K_STR);
+    if (sidx < 0) {
+      return -1;
+    }
+    var off: int32 = 0;
+    var len: int32 = 0;
+    scan_string(p, &off, &len);
+    p->nodes[sidx].val_off = off;
+    p->nodes[sidx].val_len = len;
+    return sidx;
+  }
+  if (c == 116) {
+    var tidx: int32 = new_node(p, K_TRUE);
+    match_word(p, "true");
+    return tidx;
+  }
+  if (c == 102) {
+    var fidx: int32 = new_node(p, K_FALSE);
+    match_word(p, "false");
+    return fidx;
+  }
+  if (c == 110) {
+    var nidx: int32 = new_node(p, K_NULL);
+    match_word(p, "null");
+    return nidx;
+  }
+  var idx: int32 = new_node(p, K_NUM);
+  if (idx < 0) {
+    return -1;
+  }
+  p->nodes[idx].num = scan_number(p);
+  return idx;
+}
+
+fn walk(p: Parser*, idx: int32, depth: int32, acc: uint64*) {
+  var node: int32 = idx;
+  while (node >= 0) {
+    var kind: int32 = p->nodes[node].kind;
+    var h: uint64 = *acc;
+    h = h * 1000003 + (uint64)(kind + 1);
+    h = h * 31 + (uint64)(p->nodes[node].key_len * 7 + depth);
+    if (kind == K_NUM) {
+      h = h + (uint64)(int64)(p->nodes[node].num * 100.0);
+    } else if (kind == K_STR) {
+      var off: int32 = p->nodes[node].val_off;
+      var len: int32 = p->nodes[node].val_len;
+      var s: int32 = 0;
+      var k: int32 = 0;
+      while (k < len) {
+        s = s + (int32)p->text[off + k] * (k + 1);
+        k += 1;
+      }
+      h = h + (uint64)s;
+    }
+    *acc = h;
+    if (p->nodes[node].first >= 0) {
+      walk(p, p->nodes[node].first, depth + 1, acc);
+    }
+    node = p->nodes[node].next;
+  }
+}
+
+fn main() -> int32 {
+  var doc: uint8* = malloc(DOC_CAP);
+  var nodes: Node* = malloc((int64)NODE_CAP * sizeof(Node));
+  if (doc == 0 || nodes == 0) {
+    println("malloc failed");
+    return 1;
+  }
+
+  var doc_len: int32 = gen_doc(doc);
+  println("JSON parse: {doc_len} byte document, {REC_COUNT} records");
+
+  var p: Parser;
+  p.text = doc;
+  p.len = doc_len;
+  p.pos = 0;
+  p.nodes = nodes;
+  p.count = 0;
+  p.failed = 0;
+
+  var root: int32 = parse_value(&p);
+  var check: uint64 = 14695981039346656037;
+  walk(&p, root, 0, &check);
+  println("Nodes = {p.count} failed = {p.failed} checksum = {check}");
+
+  println("Benchmark: {PASSES} passes (parse + walk)");
+
+  var t0: int64 = bench_time_us();
+  var bench_hash: uint64 = 0;
+  var nodes_seen: int64 = 0;
+  var pass: int32 = 0;
+  while (pass < PASSES) {
+    p.pos = 0;
+    p.count = 0;
+    p.failed = 0;
+    var r: int32 = parse_value(&p);
+    var h: uint64 = 14695981039346656037;
+    walk(&p, r, 0, &h);
+    bench_hash = bench_hash * 1000003 + h;
+    nodes_seen = nodes_seen + (int64)p.count;
+    pass += 1;
+  }
+  var elapsed_us: int64 = bench_time_us() - t0;
+
+  println("Bench hash = {bench_hash}");
+  println("Nodes seen = {nodes_seen}");
+  print("Time: ");
+  print("{elapsed_us}");
+  println(" us");
+
+  var per_pass: int64 = elapsed_us / PASSES;
+  print("Per pass: ~");
+  print("{per_pass}");
+  println(" us");
+
+  free(doc);
+  free(nodes);
+  return 0;
+}

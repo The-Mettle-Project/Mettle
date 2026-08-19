@@ -13,6 +13,11 @@ only the library, lowering its own parse into libmtlc IR and compiling it to a
 native executable. See [`calc/README.md`](calc/README.md) and
 [docs/embedding.md](../docs/embedding.md).
 
+## Bindings and graphics
+
+[`raylib/`](raylib/) binds raylib 5.5 with nothing but `extern fn` declarations
+and draws a rotating, lit sphere at ~8,600 fps. See [`raylib/README.md`](raylib/README.md).
+
 ## Benchmark examples
 
 Each directory below contains `*.mettle`, `*.c`, `*.rs`, and `build.bat`. They are wired into [`docs/benchmarks/harness.json`](../docs/benchmarks/harness.json) and run via [`tools/benchmark/run-benchmarks.ps1`](../tools/benchmark/run-benchmarks.ps1). Every benchmark entry carries a `suite` number; benchmarks without one default to Suite 1.
@@ -33,7 +38,7 @@ Each directory below contains `*.mettle`, `*.c`, `*.rs`, and `build.bat`. They a
 
 The full Suite 1 roster (including microbenchmarks like `saxpy`, `memcpy_bench`, `dot_product`, etc.) is listed in [`docs/benchmarks/harness.json`](../docs/benchmarks/harness.json).
 
-### Suite 2 (new)
+### Suite 2 (data structures and codecs)
 
 | Directory | Description |
 |-----------|-------------|
@@ -48,6 +53,25 @@ The full Suite 1 roster (including microbenchmarks like `saxpy`, `memcpy_bench`,
 | [`rle_encode/`](rle_encode/) | Run-length encoding of a 256 KB buffer |
 | [`bst_insert/`](bst_insert/) | Binary-search-tree build + recursive in-order traversal, 4096 nodes |
 
+### Suite 3 (applications)
+
+Small complete programs rather than kernels: each one generates its own input,
+transforms it, and verifies the result, so no single loop owns the measurement.
+The Mettle and C sources are structural mirrors, neither side hand tuned, and a
+pair is accepted only when both print the same checksum. The rules the suite is
+written to are in [`docs/benchmarks/README.md`](../docs/benchmarks/README.md).
+
+| Directory | Description |
+|-----------|-------------|
+| [`json_parse/`](json_parse/) | Recursive-descent JSON parser over a generated 330 KB document, into a node arena |
+| [`interp_ast/`](interp_ast/) | Lexer, precedence-climbing parser, and tree-walking interpreter for a 165 KB program |
+| [`word_freq/`](word_freq/) | Word counting through an open-addressing hash map that grows and rehashes, then a top-16 select |
+| [`huffman/`](huffman/) | Huffman codec: histogram, min-heap tree build, code assignment, bit-pack, decode, verify |
+| [`lz77/`](lz77/) | LZ77 hash-chain match finder over a 32 KB window, with decompression and verification |
+| [`astar_grid/`](astar_grid/) | A* pathfinding with a binary-heap open set over a generated 192×192 cave |
+| [`regex_match/`](regex_match/) | Backtracking regex engine: five compiled patterns over 4000 log lines |
+| [`physics_grid/`](physics_grid/) | Particle simulation: uniform-grid bucketing, neighbour collisions, integration |
+
 Shared timing helpers live in [`bench_time.h`](bench_time.h) (C) and [`bench_time.rs`](bench_time.rs) (Rust). Mettle programs import `std/bench`.
 
 Build one example manually:
@@ -57,7 +81,7 @@ examples\fib\build.bat
 examples\fib\fib.exe
 ```
 
-Run the full Mettle-vs-C suite (both Suite 1 and Suite 2):
+Run the full Mettle-vs-C suite (all three suites):
 
 ```powershell
 .\tools\benchmark\run-benchmarks.ps1
@@ -68,6 +92,7 @@ Run a single suite:
 ```powershell
 .\tools\benchmark\run-benchmarks.ps1 -Suite 1
 .\tools\benchmark\run-benchmarks.ps1 -Suite 2
+.\tools\benchmark\run-benchmarks.ps1 -Suite 3
 ```
 
 ## Mettle vs Rust demo
