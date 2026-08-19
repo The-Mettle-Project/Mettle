@@ -26,6 +26,15 @@ typedef struct {
   size_t alloc_line; /* NEW/malloc source line; 0 for harness inputs */
 } IIBuffer;
 
+/* A materialized string literal: the characters (NUL-terminated) and the
+ * { chars, length } record a fat `string` value points at, both inside one
+ * buffer, laid out the way the backend parks them in .rdata. */
+typedef struct {
+  const char *text; /* not owned; lives as long as the IR */
+  unsigned long long chars;
+  unsigned long long record;
+} IILiteral;
+
 typedef struct {
   const char *key; /* not owned; lives as long as the IR */
   IRInterpValue value;
@@ -65,6 +74,10 @@ struct IRInterpMachine {
   IIBuffer *buffers;
   size_t buffer_count;
   size_t buffer_capacity;
+
+  IILiteral *literals;
+  size_t literal_count;
+  size_t literal_capacity;
 
   IIEnv globals;
 
@@ -203,6 +216,7 @@ void ir_interp_destroy(IRInterpMachine *machine) {
     free(machine->buffers[i].data);
   }
   free(machine->buffers);
+  free(machine->literals);
   free(machine->trace);
   for (size_t i = 0; i < machine->count_table_count; i++) {
     free(machine->count_tables[i].counts);
@@ -338,6 +352,62 @@ static IIBuffer *ii_addr_to_buffer(IRInterpMachine *machine,
   }
   *offset_out = offset;
   return buf;
+}
+
+/* Give a string literal real bytes, so a callee that reads them (`print`
+ * loading msg.length, `strlen` scanning for the terminator) sees memory rather
+ * than a made-up token. One buffer holds the characters, a NUL, and the
+ * 16-byte { chars, length } record; the address handed to a call is the record
+ * for a fat `string` parameter and the characters for a `cstring` one, exactly
+ * as the backend chooses between them. Cached per literal so the same call in
+ * a loop does not exhaust the buffer table. */
+static int ii_string_literal(IRInterpMachine *machine, const char *text,
+                             unsigned long long *chars_out,
+                             unsigned long long *record_out) {
+  if (!text) {
+    text = "";
+  }
+  for (size_t i = 0; i < machine->literal_count; i++) {
+    if (strcmp(machine->literals[i].text, text) == 0) {
+      *chars_out = machine->literals[i].chars;
+      *record_out = machine->literals[i].record;
+      return 1;
+    }
+  }
+  size_t length = strlen(text);
+  size_t record_offset = (length + 1 + 7u) & ~(size_t)7u;
+  unsigned long long addr =
+      ir_interp_add_buffer(machine, NULL, (long long)(record_offset + 16u));
+  if (!addr) {
+    ii_fail(machine, IR_INTERP_TRAP, "string literal storage");
+    return 0;
+  }
+  IIBuffer *buf = &machine->buffers[machine->buffer_count - 1];
+  memcpy(buf->data, text, length);
+  unsigned long long chars = addr;
+  unsigned long long chars_length = (unsigned long long)length;
+  memcpy(buf->data + record_offset, &chars, 8);
+  memcpy(buf->data + record_offset + 8, &chars_length, 8);
+
+  if (machine->literal_count == machine->literal_capacity) {
+    size_t grown = machine->literal_capacity ? machine->literal_capacity * 2 : 8;
+    IILiteral *table =
+        (IILiteral *)realloc(machine->literals, grown * sizeof(IILiteral));
+    if (!table) {
+      ii_fail(machine, IR_INTERP_TRAP, "out of memory");
+      return 0;
+    }
+    machine->literals = table;
+    machine->literal_capacity = grown;
+  }
+  machine->literals[machine->literal_count].text = text;
+  machine->literals[machine->literal_count].chars = addr;
+  machine->literals[machine->literal_count].record = addr + record_offset;
+  machine->literal_count++;
+
+  *chars_out = addr;
+  *record_out = addr + record_offset;
+  return 1;
 }
 
 static int ii_mem_read(IRInterpMachine *machine, unsigned long long addr,
@@ -670,8 +740,18 @@ static int ii_fetch(IRInterpMachine *machine, IIFrame *frame,
     }
     return ii_var_read(machine, var, out);
   }
+  case IR_OPERAND_STRING: {
+    /* A string literal used as a value IS the address of its fat record, the
+     * same thing the backend's operand load produces. */
+    unsigned long long chars = 0, record = 0;
+    if (!ii_string_literal(machine, operand->name, &chars, &record)) {
+      return 0;
+    }
+    *out = ii_int_value((long long)record);
+    return 1;
+  }
   default:
-    ii_fail(machine, IR_INTERP_UNSUPPORTED, "string/label operand as value");
+    ii_fail(machine, IR_INTERP_UNSUPPORTED, "label operand as value");
     return 0;
   }
 }
@@ -941,6 +1021,30 @@ static IRFunction *ii_find_function(IRInterpMachine *machine,
     }
   }
   return NULL;
+}
+
+/* Mirrors the backend's cstring test: a pointer named `cstring`, or a pointer
+ * to bytes. Everything else takes a string literal as the fat record. */
+static int ii_type_is_cstring(const MtlcType *type) {
+  if (!type || type->kind != MTLC_TYPE_POINTER) {
+    return 0;
+  }
+  if (type->name && strcmp(type->name, "cstring") == 0) {
+    return 1;
+  }
+  return type->base_type && type->base_type->name &&
+         strcmp(type->base_type->name, "uint8") == 0;
+}
+
+static int ii_callee_param_is_cstring(IRInterpMachine *machine,
+                                      const char *callee, size_t index) {
+  const IRModuleSymbol *sym =
+      machine->program ? ir_program_lookup_symbol(machine->program, callee)
+                       : NULL;
+  if (!sym || !sym->param_types || index >= sym->param_count) {
+    return 0;
+  }
+  return ii_type_is_cstring(sym->param_types[index]);
 }
 
 static long long ii_buffer_size_at(IRInterpMachine *machine,
@@ -2579,9 +2683,14 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
       for (size_t i = 0; i < call_arg_count; i++) {
         const IROperand *arg = &insn->arguments[i];
         if (arg->kind == IR_OPERAND_STRING) {
-          /* Trace-visible token for a string literal argument. */
+          unsigned long long chars = 0, record = 0;
+          if (!ii_string_literal(machine, arg->name, &chars, &record)) {
+            goto done;
+          }
           call_args[i] = ii_int_value(
-              (long long)(ii_hash(arg->name ? arg->name : "") | 1ULL));
+              (long long)(ii_callee_param_is_cstring(machine, insn->text, i)
+                              ? chars
+                              : record));
           continue;
         }
         if (!ii_fetch(machine, &frame, arg, &call_args[i])) {
