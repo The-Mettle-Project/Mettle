@@ -531,6 +531,10 @@ int binary_emit_memory_access(BinaryCodeBuffer *buffer, unsigned char opcode, Bi
 int binary_emit_memory_access_ex(BinaryCodeBuffer *buffer, int operand_size_prefix, int rex_w, unsigned char opcode1, int has_opcode2, unsigned char opcode2, BinaryGpRegister reg, BinaryGpRegister base, int displacement);
 int binary_emit_prefetcht0_mem(BinaryCodeBuffer *buffer, BinaryGpRegister base, int displacement);
 int binary_emit_memory_access_sib(BinaryCodeBuffer *buffer, int operand_size_prefix, int rex_w, unsigned char opcode1, int has_opcode2, unsigned char opcode2, BinaryGpRegister reg, BinaryGpRegister base, BinaryGpRegister index, int scale, int displacement);
+/* Forced-REX variants for byte ops: a register operand encoding 4..7 names
+ * SPL/BPL/SIL/DIL only under a REX prefix (AH/CH/DH/BH without). */
+int binary_emit_memory_access_sib_forced(BinaryCodeBuffer *buffer, int operand_size_prefix, int rex_w, unsigned char opcode1, int has_opcode2, unsigned char opcode2, BinaryGpRegister reg, BinaryGpRegister base, BinaryGpRegister index, int scale, int displacement);
+int binary_emit_memory_access_ex_forced(BinaryCodeBuffer *buffer, int operand_size_prefix, int rex_w, unsigned char opcode1, int has_opcode2, unsigned char opcode2, BinaryGpRegister reg, BinaryGpRegister base, int displacement);
 int binary_emit_mov_eax_eax(BinaryCodeBuffer *buffer);
 /* Loop-top alignment, shared by both x86-64 backends.
  *

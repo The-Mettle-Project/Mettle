@@ -474,6 +474,21 @@ int binary_emit_memory_access_ex(BinaryCodeBuffer *buffer,
       base, displacement, 0);
 }
 
+/* Like binary_emit_memory_access_ex, but forcing an (empty) REX prefix. A byte
+ * op whose register operand encodes as 4..7 means SPL/BPL/SIL/DIL only under a
+ * REX prefix; without one those encodings name AH/CH/DH/BH. */
+int binary_emit_memory_access_ex_forced(BinaryCodeBuffer *buffer,
+                                        int operand_size_prefix, int rex_w,
+                                        unsigned char opcode1, int has_opcode2,
+                                        unsigned char opcode2,
+                                        BinaryGpRegister reg,
+                                        BinaryGpRegister base,
+                                        int displacement) {
+  return binary_emit_memory_access_ex_internal(
+      buffer, operand_size_prefix, rex_w, opcode1, has_opcode2, opcode2, reg,
+      base, displacement, 1);
+}
+
 /* prefetcht0 [base + disp]: 0F 18 /1. Advisory -- never faults, so a bad
  * (speculative, out-of-range) address costs nothing but the hint. */
 int binary_emit_prefetcht0_mem(BinaryCodeBuffer *buffer,
@@ -485,12 +500,11 @@ int binary_emit_prefetcht0_mem(BinaryCodeBuffer *buffer,
 /* Like binary_emit_memory_access_ex but with a scaled-index SIB address
  * [base + index*scale + disp]. `reg` is the ModRM.reg operand (load dest or
  * store source). scale must be 1/2/4/8 and index must not be RSP. */
-int binary_emit_memory_access_sib(BinaryCodeBuffer *buffer,
-                                  int operand_size_prefix, int rex_w,
-                                  unsigned char opcode1, int has_opcode2,
-                                  unsigned char opcode2, BinaryGpRegister reg,
-                                  BinaryGpRegister base, BinaryGpRegister index,
-                                  int scale, int displacement) {
+static int binary_emit_memory_access_sib_internal(
+    BinaryCodeBuffer *buffer, int operand_size_prefix, int rex_w,
+    unsigned char opcode1, int has_opcode2, unsigned char opcode2,
+    BinaryGpRegister reg, BinaryGpRegister base, BinaryGpRegister index,
+    int scale, int displacement, int force_rex) {
   if (!buffer || index == BINARY_GP_RSP) {
     return 0;
   }
@@ -511,7 +525,8 @@ int binary_emit_memory_access_sib(BinaryCodeBuffer *buffer,
     mod = use_disp8 ? 1 : 2;
   }
   if ((operand_size_prefix && !binary_code_buffer_append_u8(buffer, 0x66)) ||
-      !binary_emit_rex(buffer, rex_w, reg >> 3, index >> 3, base >> 3) ||
+      !binary_emit_rex_maybe_forced(buffer, rex_w, reg >> 3, index >> 3,
+                                    base >> 3, force_rex) ||
       !binary_code_buffer_append_u8(buffer, opcode1) ||
       (has_opcode2 && !binary_code_buffer_append_u8(buffer, opcode2)) ||
       !binary_code_buffer_append_u8(
@@ -530,6 +545,30 @@ int binary_emit_memory_access_sib(BinaryCodeBuffer *buffer,
                                          (uint32_t)(int32_t)displacement);
   }
   return 1;
+}
+
+int binary_emit_memory_access_sib(BinaryCodeBuffer *buffer,
+                                  int operand_size_prefix, int rex_w,
+                                  unsigned char opcode1, int has_opcode2,
+                                  unsigned char opcode2, BinaryGpRegister reg,
+                                  BinaryGpRegister base, BinaryGpRegister index,
+                                  int scale, int displacement) {
+  return binary_emit_memory_access_sib_internal(
+      buffer, operand_size_prefix, rex_w, opcode1, has_opcode2, opcode2, reg,
+      base, index, scale, displacement, 0);
+}
+
+/* Forced-REX variant: a byte op whose register operand encodes as 4..7 means
+ * SPL/BPL/SIL/DIL only under a REX prefix; without one those encodings name
+ * AH/CH/DH/BH. */
+int binary_emit_memory_access_sib_forced(
+    BinaryCodeBuffer *buffer, int operand_size_prefix, int rex_w,
+    unsigned char opcode1, int has_opcode2, unsigned char opcode2,
+    BinaryGpRegister reg, BinaryGpRegister base, BinaryGpRegister index,
+    int scale, int displacement) {
+  return binary_emit_memory_access_sib_internal(
+      buffer, operand_size_prefix, rex_w, opcode1, has_opcode2, opcode2, reg,
+      base, index, scale, displacement, 1);
 }
 
 int binary_emit_memory_access(BinaryCodeBuffer *buffer,

@@ -1303,8 +1303,9 @@ static int encode_mov(MirFunction *fn, const MirInst *in) {
   if (in->dst.kind == MIR_OPK_MEM) {
     int ok1, ok2;
     if (in->dst.mem.index != MIR_VREG_NONE) {
-      /* For 4/8-byte stores emit one direct SIB `mov [base+idx*scale], val`;
-       * narrower widths lea the address into SCRATCH_B and store through it.
+      /* One direct SIB `mov [base+idx*scale+disp], val` at every width. A
+       * byte store whose value register encodes as 4..7 needs a forced REX so
+       * the operand reads SPL..DIL rather than AH..BH.
        * Spilled operands stage through SCRATCH_B / RDX / SCRATCH_A. */
       MirOperand bop = mir_op_vreg(in->dst.mem.base);
       MirOperand iop = mir_op_vreg(in->dst.mem.index);
@@ -1313,7 +1314,6 @@ static int encode_mov(MirFunction *fn, const MirInst *in) {
        * operands are already resident in -- staging over a resident value
        * destroys it before its read. Seed the set from all three up front,
        * since base is staged before the value is even looked at. */
-      int needs_lea = !(in->width == 4 || in->width == 8);
       BinaryGpRegister taken[6];
       int tn = 0;
       mir_note_fixed_reg(fn, &bop, taken, &tn);
@@ -1330,8 +1330,6 @@ static int encode_mov(MirFunction *fn, const MirInst *in) {
         return 0;
       }
       taken[tn++] = base_reg;
-      /* The narrow-width path leas the address into SCRATCH_B after reading base
-       * and index, so those two may live there but the value may not. */
       if (!mir_pick_scratch(fn, idx, BINARY_GP_RDX, taken, tn, NULL, 0, &index_scratch)) {
         return enc_err(fn, "no free scratch register for a scaled store index");
       }
@@ -1340,7 +1338,10 @@ static int encode_mov(MirFunction *fn, const MirInst *in) {
         return 0;
       }
       taken[tn++] = index_reg;
-      if (needs_lea) {
+      if (!(in->width == 1 || in->width == 2 || in->width == 4 ||
+            in->width == 8)) {
+        /* The aggregate path below leas the address into SCRATCH_B after
+         * reading base and index, so the value may not live there. */
         taken[tn++] = SCRATCH_B;
       }
       if (!mir_pick_scratch(fn, idx, SCRATCH_A, taken, tn, NULL, 0, &val_scratch)) {
@@ -1350,10 +1351,20 @@ static int encode_mov(MirFunction *fn, const MirInst *in) {
       if (!ok1) {
         return 0;
       }
-      if (in->width == 4 || in->width == 8) {
-        if (!binary_emit_memory_access_sib(
-                &ctx->code, 0, in->width == 8 ? 1 : 0, 0x89, 0, 0, val,
-                base_reg, index_reg, in->dst.mem.scale, in->dst.mem.disp)) {
+      if (in->width == 1 || in->width == 2 || in->width == 4 ||
+          in->width == 8) {
+        int prefix66 = in->width == 2;
+        int rexw = in->width == 8;
+        unsigned char op = in->width == 1 ? 0x88 : 0x89;
+        int done =
+            (in->width == 1 && val >= BINARY_GP_RSP && val <= BINARY_GP_RDI)
+                ? binary_emit_memory_access_sib_forced(
+                      &ctx->code, prefix66, rexw, op, 0, 0, val, base_reg,
+                      index_reg, in->dst.mem.scale, in->dst.mem.disp)
+                : binary_emit_memory_access_sib(
+                      &ctx->code, prefix66, rexw, op, 0, 0, val, base_reg,
+                      index_reg, in->dst.mem.scale, in->dst.mem.disp);
+        if (!done) {
           return enc_err(fn, "out of memory in scaled store");
         }
         return 1;
@@ -1378,10 +1389,28 @@ static int encode_mov(MirFunction *fn, const MirInst *in) {
     if (!ok2) {
       return 0;
     }
+    if (in->width == 1 || in->width == 2 || in->width == 4 || in->width == 8) {
+      /* Direct `mov [addr+disp], val` at scalar widths; the displacement folds
+       * into the store itself, with no lea detour. */
+      int prefix66 = in->width == 2;
+      int rexw = in->width == 8;
+      unsigned char op = in->width == 1 ? 0x88 : 0x89;
+      int done =
+          (in->width == 1 && val >= BINARY_GP_RSP && val <= BINARY_GP_RDI)
+              ? binary_emit_memory_access_ex_forced(&ctx->code, prefix66, rexw,
+                                                    op, 0, 0, val, addr,
+                                                    in->dst.mem.disp)
+              : binary_emit_memory_access_ex(&ctx->code, prefix66, rexw, op, 0,
+                                             0, val, addr, in->dst.mem.disp);
+      if (!done) {
+        return enc_err(fn, "out of memory in store");
+      }
+      return 1;
+    }
     if (in->dst.mem.disp != 0) {
-      /* Constant-index access: fold the byte displacement into the address.
-       * lea into SCRATCH_B so a base held in a live vreg register is preserved
-       * (value_reg returns that register directly when the base is not spilled). */
+      /* Aggregate-width store: fold the displacement with a lea and hand the
+       * copy to the width-general helper. lea into SCRATCH_B so a base held in
+       * a live vreg register is preserved. */
       if (!binary_emit_lea_reg_mem(&ctx->code, SCRATCH_B, addr,
                                    in->dst.mem.disp)) {
         return enc_err(fn, "out of memory in store address");
