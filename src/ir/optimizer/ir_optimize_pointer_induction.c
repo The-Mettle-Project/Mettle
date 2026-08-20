@@ -492,7 +492,6 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
   long long iv_start = 0;
 
   if (!function || !ir_find_while_loop_bounds(function, header_index, &bounds)) {
-    if (getenv("METTLE_PI_TRACE")) fprintf(stderr, "[pi] bail L%d fn=%s hdr=%s\n", __LINE__, function->name?function->name:"?", function->instructions[header_index].text);
     return 1;
   }
 
@@ -508,7 +507,6 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
       !compare->rhs.name ||
       !ir_symbol_is_loop_bound(function, compare->rhs.name, header_index,
                                bounds.jump_index)) {
-    if (getenv("METTLE_PI_TRACE")) fprintf(stderr, "[pi] bail L%d fn=%s hdr=%s\n", __LINE__, function->name?function->name:"?", function->instructions[header_index].text);
     return 1;
   }
   bound_symbol = compare->rhs.name;
@@ -516,7 +514,6 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
   if (!ir_ptr_induction_iv_start_value(function, header_index, iv_symbol,
                                        &iv_start) ||
       iv_start != 0) {
-    if (getenv("METTLE_PI_TRACE")) fprintf(stderr, "[pi] bail L%d fn=%s hdr=%s\n", __LINE__, function->name?function->name:"?", function->instructions[header_index].text);
     return 1;
   }
 
@@ -529,12 +526,10 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
   }
   if (!ir_try_parse_direct_unit_increment(
           &function->instructions[increment_index], iv_symbol)) {
-    if (getenv("METTLE_PI_TRACE")) fprintf(stderr, "[pi] bail L%d fn=%s hdr=%s\n", __LINE__, function->name?function->name:"?", function->instructions[header_index].text);
     return 1;
   }
 
   if (ir_loop_body_is_unclaimable(function, body_start, body_end)) {
-    if (getenv("METTLE_PI_TRACE")) fprintf(stderr, "[pi] bail L%d fn=%s hdr=%s\n", __LINE__, function->name?function->name:"?", function->instructions[header_index].text);
     return 1;
   }
 
@@ -562,7 +557,6 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
       }
     }
     if (loop_has_reduction && !loop_has_store) {
-      if (getenv("METTLE_PI_TRACE")) fprintf(stderr, "[pi] bail L%d fn=%s hdr=%s\n", __LINE__, function->name?function->name:"?", function->instructions[header_index].text);
       return 1;
     }
   }
@@ -574,14 +568,12 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
    * refuses (division, casts to narrow ints, over-budget DAGs, ...) still
    * get the pointer walk. */
   if (ir_auto_vectorize_int_claimable(function, header_index)) {
-    if (getenv("METTLE_PI_TRACE")) fprintf(stderr, "[pi] bail L%d fn=%s hdr=%s\n", __LINE__, function->name?function->name:"?", function->instructions[header_index].text);
     return 1;
   }
 
   /* Same for early-exit search loops the find skip-ahead claims: it needs the
    * indexed `a + (iv << 2)` / `a + iv` form to recognize the predicate. */
   if (ir_auto_vectorize_find_claimable(function, header_index)) {
-    if (getenv("METTLE_PI_TRACE")) fprintf(stderr, "[pi] bail L%d fn=%s hdr=%s\n", __LINE__, function->name?function->name:"?", function->instructions[header_index].text);
     return 1;
   }
 
@@ -656,10 +648,6 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
         !ir_ptr_iv_chain_dies_in_drops(function, body_start, body_end,
                                        bindings, binding_count, iv_symbol,
                                        ins, 0)) {
-      if (getenv("METTLE_PI_TRACE")) {
-        fprintf(stderr, "[pi] keeping iv: reader at %zu op=%d text=%s\n",
-                i, (int)ins->op, ins->text ? ins->text : "-");
-      }
       keep_iv = 1;
     }
   }
@@ -667,7 +655,6 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
 
 
   if (binding_count == 0) {
-    if (getenv("METTLE_PI_TRACE")) fprintf(stderr, "[pi] bail L%d fn=%s hdr=%s\n", __LINE__, function->name?function->name:"?", function->instructions[header_index].text);
     return 1;
   }
 
@@ -841,7 +828,6 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
   if (changed) {
     *changed = 1;
   }
-  if (getenv("METTLE_PI_TRACE")) fprintf(stderr, "[pi] bail L%d fn=%s hdr=%s\n", __LINE__, function->name?function->name:"?", function->instructions[header_index].text);
   return 1;
 }
 
@@ -849,13 +835,6 @@ int ir_pointer_induction_pass(IRFunction *function, int *changed) {
   if (!function) {
     return 0;
   }
-  if (getenv("METTLE_PI_TRACE")) {
-    fprintf(stderr, "[pi] PASS ENTRY fn=%s skipflag=%d env=%s\n",
-            function->name ? function->name : "?",
-            ir_pass_name_is_skipped("induction_pointer"),
-            getenv("METTLE_SKIP_PASS") ? getenv("METTLE_SKIP_PASS") : "-");
-  }
-
   for (int iteration = 0; iteration < 16; iteration++) {
     int any_changed = 0;
 

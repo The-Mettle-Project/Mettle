@@ -6691,33 +6691,6 @@ static int mir_slp_can_cross(const MirFunction *fn, const int *def_count,
   return 1;
 }
 
-static void mir_slp_dump_chain(const MirFunction *fn, const int *def_count,
-                               const size_t *def_at, MirVregId v, int depth) {
-  fprintf(stderr, "%*sv%d", depth * 2 + 8, "", (int)v);
-  if ((size_t)v >= fn->vreg_count || def_count[v] != 1) {
-    fprintf(stderr, " defs=%d STOP\n",
-            (size_t)v < fn->vreg_count ? def_count[v] : -1);
-    return;
-  }
-  const MirInst *d = &fn->insns[def_at[v]];
-  fprintf(stderr, " := op%d ak%d bk%d imm=%lld disp=%d\n", (int)d->op,
-          (int)d->a.kind, (int)d->b.kind,
-          d->b.kind == MIR_OPK_IMM ? (long long)d->b.imm : 0LL,
-          d->a.kind == MIR_OPK_MEM ? d->a.mem.disp : -1);
-  if (depth > 3) {
-    return;
-  }
-  if (d->a.kind == MIR_OPK_VREG) {
-    mir_slp_dump_chain(fn, def_count, def_at, d->a.vreg, depth + 1);
-  }
-  if (d->a.kind == MIR_OPK_MEM) {
-    mir_slp_dump_chain(fn, def_count, def_at, d->a.mem.base, depth + 1);
-  }
-  if (d->b.kind == MIR_OPK_VREG) {
-    mir_slp_dump_chain(fn, def_count, def_at, d->b.vreg, depth + 1);
-  }
-}
-
 /* Normalize an address to (root, disp): the lowering splits `p + 8` into its
  * own ADD as often as it folds it into the displacement, so both spellings
  * must compare equal. Follows single-def `ADD vreg, imm` and register copies. */
@@ -6761,21 +6734,9 @@ static int mir_slp_find_node(const MirSlpGraph *g, MirVregId lo, MirVregId hi) {
  * -1 when the lanes cannot run in lockstep. */
 static int mir_slp_pair_value(MirSlpGraph *g, MirVregId lo, MirVregId hi) {
   MirFunction *fn = g->fn;
-  int dbg = getenv("METTLE_SLP_TRACE") != NULL;
   int found = mir_slp_find_node(g, lo, hi);
   if (found >= 0) {
     return found;
-  }
-  if (dbg) {
-    fprintf(stderr, "[slp]   pair_value v%d/v%d defs %d/%d ops %d/%d w %d/%d reg %zu..%zu\n",
-            (int)lo, (int)hi,
-            (size_t)lo < fn->vreg_count ? g->def_count[lo] : -1,
-            (size_t)hi < fn->vreg_count ? g->def_count[hi] : -1,
-            (size_t)lo < fn->vreg_count && g->def_count[lo] == 1 ? (int)fn->insns[g->def_at[lo]].op : -1,
-            (size_t)hi < fn->vreg_count && g->def_count[hi] == 1 ? (int)fn->insns[g->def_at[hi]].op : -1,
-            (size_t)lo < fn->vreg_count && g->def_count[lo] == 1 ? fn->insns[g->def_at[lo]].width : -1,
-            (size_t)hi < fn->vreg_count && g->def_count[hi] == 1 ? fn->insns[g->def_at[hi]].width : -1,
-            g->region_lo, g->region_hi);
   }
   if (g->node_count >= MIR_SLP_MAX_NODES) {
     return -1;
@@ -7197,19 +7158,6 @@ static void mir_slp_pair_f64(MirFunction *fn) {
       if (!mir_slp_is_f64_store(a)) {
         continue;
       }
-      if (dbg) {
-        MirVregId bb = a->dst.mem.base;
-        int dc = (size_t)bb < n_vregs ? def_count[bb] : -1;
-        const MirInst *bd = dc == 1 ? &fn->insns[def_at[bb]] : NULL;
-        fprintf(stderr, "[slp] st @%zu base=v%d disp=%d bdefs=%d bop=%d ak=%d av=%d bk=%d bv=%d\n",
-                i, (int)bb, a->dst.mem.disp, dc, bd ? (int)bd->op : -1,
-                bd ? (int)bd->a.kind : -1,
-                bd && bd->a.kind == MIR_OPK_VREG ? (int)bd->a.vreg : -1,
-                bd ? (int)bd->b.kind : -1,
-                bd && bd->b.kind == MIR_OPK_VREG ? (int)bd->b.vreg : -1);
-        mir_slp_dump_chain(fn, def_count, def_at, bb, 0);
-      }
-
       for (size_t j = i + 1; j < fn->insn_count && j < i + 24; j++) {
         const MirInst *b = &fn->insns[j];
         if (b->op == MIR_LABEL || b->op == MIR_JMP || b->op == MIR_JCC ||

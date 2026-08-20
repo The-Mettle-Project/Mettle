@@ -253,12 +253,6 @@ static int ir_run_named_pass(IRFunction *function, const IROptNamedPass *pass,
     ir_trace_pass_event(pass->name, "skipped", NULL, -1);
     return 1;
   }
-  if (getenv("METTLE_PI_TRACE") && strcmp(pass->name, "induction_pointer") == 0) {
-    fprintf(stderr, "[drv] running %s skipflag=%d env=%s\n", pass->name,
-            ir_pass_name_is_skipped(pass->name),
-            getenv("METTLE_SKIP_PASS") ? getenv("METTLE_SKIP_PASS") : "-");
-  }
-
   if (ir_verify_pass_quarantined(function, pass->name)) {
     ir_trace_pass_event(pass->name, "quarantined", NULL, -1);
     return 1;
