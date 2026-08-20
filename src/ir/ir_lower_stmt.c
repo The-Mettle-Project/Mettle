@@ -401,6 +401,13 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
                                &value)) {
         return 0;
       }
+      if (ir_should_decay_array_to_address(decl_type,
+                                           declaration->initializer) &&
+          !ir_decay_array_operand_to_address(
+              context, function, &value, declaration->initializer->location)) {
+        ir_operand_destroy(&value);
+        return 0;
+      }
       if (ir_should_coerce_string_to_cstring(context, decl_type,
                                              declaration->initializer) &&
           !ir_coerce_string_operand_to_cstring(

@@ -140,6 +140,13 @@ int ir_coerce_string_operand_to_cstring(IRLoweringContext *context,
                                                IROperand *value,
                                                SourceLocation location);
 
+int ir_should_decay_array_to_address(Type *target_type,
+                                     ASTNode *value_expression);
+
+int ir_decay_array_operand_to_address(IRLoweringContext *context,
+                                      IRFunction *function, IROperand *value,
+                                      SourceLocation location);
+
 int ir_lower_statement_or_expression(IRLoweringContext *context,
                                             IRFunction *function,
                                             ASTNode *node);

@@ -1,0 +1,50 @@
+import "std/mem";
+
+var G_BUF: uint8[8];
+
+@noinline fn addr_of(p: uint8*) -> int64 { return (int64)p; }
+@noinline fn addr_of_raw(p: rawptr) -> int64 { return (int64)p; }
+@noinline fn stamp(p: uint8*) { p[0] = 65; p[3] = 68; }
+
+fn main() -> int32 {
+  var buf: uint8[8];
+  mem_zero(buf, 8);
+
+  // A bare array argument is the array's address, not its first eight bytes.
+  if (addr_of(buf) != (int64)&buf[0]) { return 1; }
+  if (addr_of_raw(buf) != (int64)&buf[0]) { return 2; }
+
+  // A pointer bound to a bare array names the same storage.
+  var p: uint8* = buf;
+  var q: rawptr = buf;
+  if ((int64)p != (int64)&buf[0]) { return 3; }
+  if ((int64)q != (int64)&buf[0]) { return 4; }
+
+  // Writes through the decayed pointer land in the array.
+  stamp(buf);
+  if (buf[0] != 65 || buf[3] != 68) { return 5; }
+  p[1] = 66;
+  if (buf[1] != 66) { return 6; }
+
+  // Contents survive: the decay must not have handed the callee the bytes.
+  buf[0] = 1; buf[1] = 2; buf[2] = 3; buf[3] = 4;
+  buf[4] = 5; buf[5] = 6; buf[6] = 7; buf[7] = 8;
+  if (addr_of(buf) == 578437695752307201) { return 7; }
+  if (addr_of(buf) != (int64)&buf[0]) { return 8; }
+
+  // A global array decays the same way.
+  mem_zero(G_BUF, 8);
+  stamp(G_BUF);
+  if (G_BUF[0] != 65 || G_BUF[3] != 68) { return 9; }
+  if (addr_of(G_BUF) != (int64)&G_BUF[0]) { return 10; }
+
+  // The guard: an array on the right of a binding of array type still copies
+  // its bytes. Only a pointer destination takes the address.
+  var a3: uint8[3] = [7, 8, 9];
+  var b3: uint8[3] = a3;
+  if (b3[0] != 7 || b3[1] != 8 || b3[2] != 9) { return 11; }
+  a3[0] = 99;
+  if (b3[0] != 7) { return 12; }
+
+  return 0;
+}

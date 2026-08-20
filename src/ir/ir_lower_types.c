@@ -26,6 +26,41 @@ int ir_should_coerce_string_to_cstring(IRLoweringContext *context,
          ir_expression_is_string(context, value_expression);
 }
 
+/* An array flowing into a pointer is its base address. The type checker decays
+ * `T[N]` into a `T*` parameter or binding, but a bare array name lowers to the
+ * symbol naming the storage, so the consumer read the array's first eight
+ * bytes and used them as the pointer: `fgets(buf, 64, get_stdin())` wrote
+ * through whatever those bytes spelled, and a zeroed buffer spells null, which
+ * reads as the call silently doing nothing.
+ *
+ * The test is on the DESTINATION. A bare array name anywhere else still means
+ * the storage: the right side of `var b: T[N] = a;` copies bytes, and the GPU
+ * emitters reject an address-of on a device local. */
+int ir_should_decay_array_to_address(Type *target_type,
+                                     ASTNode *value_expression) {
+  return target_type && target_type->kind == TYPE_POINTER &&
+         value_expression && value_expression->resolved_type &&
+         value_expression->resolved_type->kind == TYPE_ARRAY;
+}
+
+int ir_decay_array_operand_to_address(IRLoweringContext *context,
+                                      IRFunction *function, IROperand *value,
+                                      SourceLocation location) {
+  IROperand address = ir_operand_none();
+
+  if (!context || !function || !value ||
+      value->kind != IR_OPERAND_SYMBOL || !value->name) {
+    return 0;
+  }
+  if (!ir_emit_address_of_symbol(context, function, value->name, location,
+                                 &address)) {
+    return 0;
+  }
+  ir_operand_destroy(value);
+  *value = address;
+  return 1;
+}
+
 int ir_coerce_string_operand_to_cstring(IRLoweringContext *context,
                                                IRFunction *function,
                                                IROperand *value,

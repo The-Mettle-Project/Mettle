@@ -11749,6 +11749,8 @@ $runFixtures = @(
      What = "a bool crossed a call boundary wrong" },
   @{ Name = "odd_size_aggregates"; Path = "tests/codegen/odd_size_aggregates.mettle"
      What = "a 3/5/6/7-byte aggregate copied wrong" },
+  @{ Name = "array_decay"; Path = "tests/codegen/array_decay.mettle"
+     What = "an array reached a pointer as its first eight bytes instead of its address, or an array-to-array copy took the address instead of the bytes" },
   @{ Name = "abi_mixed_args"; Path = "tests/codegen/abi_mixed_args.mettle"
      What = "an argument crossed the ABI boundary wrong" },
   @{ Name = "abi_struct_args"; Path = "tests/codegen/abi_struct_args.mettle"

@@ -660,6 +660,19 @@ int ir_lower_call_expression(IRLoweringContext *context,
       Type *ptype = callee_symbol->data.function.parameter_types
                         ? callee_symbol->data.function.parameter_types[i]
                         : NULL;
+      if (ir_should_decay_array_to_address(ptype, call->arguments[i])) {
+        if (!ir_decay_array_operand_to_address(
+                context, function, &arguments[i],
+                call->arguments[i]->location)) {
+          for (size_t j = 0; j < call->argument_count; j++) {
+            ir_operand_destroy(&arguments[j]);
+          }
+          free(arguments);
+          ir_operand_destroy(&destination);
+          return 0;
+        }
+        continue;
+      }
       if (ir_should_coerce_string_to_cstring(context, ptype,
                                              call->arguments[i])) {
         if (!ir_coerce_string_operand_to_cstring(
