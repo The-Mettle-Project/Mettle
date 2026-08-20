@@ -1986,6 +1986,15 @@ static int ii_extern_call(IRInterpMachine *machine, const char *name,
     *result = ii_int_value((long long)record);
     return 1;
   }
+  if (strcmp(name, "mettle_string_from_char") == 0 && arg_count == 1) {
+    char byte = (char)(unsigned char)ii_as_int(&args[0]);
+    unsigned long long record = ii_make_string(machine, &byte, 1);
+    if (!record) {
+      return -1;
+    }
+    *result = ii_int_value((long long)record);
+    return 1;
+  }
   if (strcmp(name, "mettle_string_from_bool") == 0 && arg_count == 1) {
     const char *text = ii_as_int(&args[0]) != 0 ? "true" : "false";
     unsigned long long record = ii_make_string(machine, text, strlen(text));

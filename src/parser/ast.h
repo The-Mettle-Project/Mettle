@@ -373,6 +373,10 @@ typedef struct {
     double float_value;
   };
   int is_float;
+  /* Written `'a'`. The lexer folds a character literal to its code point and
+   * hands back a number, so this is what tells the two apart afterwards: it
+   * is what types the literal `char` rather than an integer. */
+  int is_char;
   /* TOKEN_NUMBER source radix for default integer type (2, 10, 16); 10 for
    * synthesized literals. */
   unsigned char int_radix;

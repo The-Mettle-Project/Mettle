@@ -252,7 +252,7 @@ int ir_emit_local_declaration(IRLoweringContext *context,
   local.op = IR_OP_DECLARE_LOCAL;
   local.location = location;
   local.dest = ir_operand_symbol(name);
-  local.text = (char *)type_name;
+  local.text = (char *)ir_backend_type_name(type_name);
   if (!local.dest.name) {
     ir_set_error(context, "Out of memory while declaring IR local '%s'", name);
     return 0;
@@ -983,15 +983,23 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
 
     Type *array_type =
         ir_infer_expression_type(context, index_expression->array);
-    if (!array_type ||
-        (array_type->kind != TYPE_ARRAY && array_type->kind != TYPE_POINTER) ||
-        !array_type->base_type) {
+    /* `s[i]` reads the i'th character. A string is a pointer and a length, so
+     * the base is its `chars` field and the stride is one byte. The view is
+     * borrowed and may point into rodata, so this is a read: the type checker
+     * rejects assignment through it before lowering sees the expression. */
+    int base_is_string = array_type && array_type->kind == TYPE_STRING;
+    Type *element_type = base_is_string
+                             ? ir_resolve_named_type(context, "char")
+                             : (array_type ? array_type->base_type : NULL);
+    if (!array_type || !element_type ||
+        (!base_is_string && array_type->kind != TYPE_ARRAY &&
+         array_type->kind != TYPE_POINTER)) {
       ir_set_error(context, "Index lvalue requires array or pointer type");
       return 0;
     }
 
     if (out_type) {
-      *out_type = array_type->base_type;
+      *out_type = element_type;
     }
 
     IROperand base = ir_operand_none();
@@ -1000,7 +1008,12 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
     int is_address_space_allocation =
         ir_expression_is_address_space_allocation(function,
                                                   index_expression->array);
-    if (array_type->kind == TYPE_ARRAY && is_address_space_allocation) {
+    if (base_is_string) {
+      lowered_base = ir_lower_expression(context, function,
+                                         index_expression->array, &base) &&
+                     ir_coerce_string_operand_to_cstring(
+                         context, function, &base, expression->location);
+    } else if (array_type->kind == TYPE_ARRAY && is_address_space_allocation) {
       /* Workgroup/private arrays lower to pointer-valued storage bindings. */
       lowered_base =
           ir_lower_expression(context, function, index_expression->array, &base);
@@ -1050,7 +1063,7 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
       return 0;
     }
 
-    int element_size = ir_type_array_element_stride(array_type->base_type);
+    int element_size = ir_type_array_element_stride(element_type);
     IRInstruction multiply = {0};
     multiply.op = IR_OP_BINARY;
     multiply.location = expression->location;

@@ -139,7 +139,8 @@ IRFunction *ir_lower_function(IRLoweringContext *context,
   }
   function->location = declaration->location;
   if (function_data->return_type) {
-    function->return_type_name = mettle_strdup(function_data->return_type);
+    function->return_type_name =
+        mettle_strdup(ir_backend_type_name(function_data->return_type));
   }
   function->is_inline = function_data->is_inline;
   function->is_inline_contract = function_data->is_inline_contract;

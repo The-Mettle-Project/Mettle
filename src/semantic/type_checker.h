@@ -37,6 +37,7 @@ typedef struct {
   Type *builtin_uint32;
   Type *builtin_uint64;
   Type *builtin_bool;
+  Type *builtin_char;
   Type *builtin_float32;
   Type *builtin_float64;
   Type *builtin_string;

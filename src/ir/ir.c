@@ -989,6 +989,13 @@ IRFunction *ir_function_create(const char *name) {
   return function;
 }
 
+const char *ir_backend_type_name(const char *source_name) {
+  if (source_name && strcmp(source_name, "char") == 0) {
+    return "uint8";
+  }
+  return source_name;
+}
+
 int ir_function_set_parameters(IRFunction *function, const char **parameter_names,
                                const char **parameter_types,
                                size_t parameter_count) {
@@ -1021,7 +1028,7 @@ int ir_function_set_parameters(IRFunction *function, const char **parameter_name
     }
 
     if (parameter_types && parameter_types[i]) {
-      type_copies[i] = mettle_strdup(parameter_types[i]);
+      type_copies[i] = mettle_strdup(ir_backend_type_name(parameter_types[i]));
       if (!type_copies[i]) {
         goto fail;
       }

@@ -164,6 +164,12 @@ int ir_lower_call_expression(IRLoweringContext *context,
       helper = "mettle_string_from_bool";
       widen_to = "int64";
       break;
+    /* The whole reason `char` is its own type: "{c}" writes the character,
+     * where the uint8 holding the same byte would write its number. */
+    case TYPE_CHAR:
+      helper = "mettle_string_from_char";
+      widen_to = "int64";
+      break;
     case TYPE_INT8:
     case TYPE_INT16:
     case TYPE_INT32:
@@ -1839,7 +1845,7 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
     instruction.location = expression->location;
     instruction.dest = destination;
     instruction.rhs = ir_operand_int(allocation_size);
-    instruction.text = new_expression->type_name;
+    instruction.text = (char *)ir_backend_type_name(new_expression->type_name);
     if (!ir_emit(context, function, &instruction)) {
       ir_operand_destroy(&destination);
       return 0;
@@ -1872,7 +1878,7 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
     instruction.location = expression->location;
     instruction.dest = destination;
     instruction.lhs = operand;
-    instruction.text = cast_expr->type_name;
+    instruction.text = (char *)ir_backend_type_name(cast_expr->type_name);
     instruction.is_float =
         ir_expression_is_floating(context, cast_expr->operand);
     if (instruction.is_float) {

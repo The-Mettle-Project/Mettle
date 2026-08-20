@@ -3228,6 +3228,14 @@ ASTNode *parser_parse_primary_expression(Parser *parser) {
       if (!result) {
         return NULL;
       }
+      /* The lexer folded `'a'` to 97 and handed back a number. The lexeme
+       * still opens with a quote, which is the only surviving trace that the
+       * program wrote a character. */
+      if (parser->current_token.lexeme.data &&
+          parser->current_token.lexeme.length > 0 &&
+          parser->current_token.lexeme.data[0] == '\'') {
+        ((NumberLiteral *)result->data)->is_char = 1;
+      }
     }
 
     parser_advance(parser);
@@ -5910,6 +5918,204 @@ ASTNode *parser_parse_continue_statement(Parser *parser) {
 // `for`/`while` semantics. Hoist a call-valued bound yourself if that matters.
 // `in` is a contextual keyword (a plain identifier elsewhere), so adding this
 // form breaks no existing program that uses `in` as a name.
+/* Builds the block above. Takes ownership of `var_name`, `type_name` and
+ * `subject` whatever happens, so the caller is done with all three. */
+static ASTNode *parser_finish_string_for(Parser *parser, SourceLocation location,
+                                         char *var_name, char *type_name,
+                                         ASTNode *subject) {
+  static int serial = 0;
+  char subject_name[32];
+  char index_name[32];
+  ASTNode *block = NULL;
+  ASTNode *subject_decl = NULL;
+  ASTNode *index_decl = NULL;
+  ASTNode *condition = NULL;
+  ASTNode *increment = NULL;
+  ASTNode *element_decl = NULL;
+  ASTNode *body = NULL;
+  ASTNode *loop = NULL;
+  int subject_is_named = 0;
+
+  serial++;
+  snprintf(index_name, sizeof(index_name), ".fori%d", serial);
+  /* A subject that is already a name needs no home of its own: naming it is
+   * the whole of evaluating it. Anything else -- a call, a concatenation --
+   * gets a hidden local so `for c in read_line(buf)` reads one line rather
+   * than one per character. A body that reassigns the named subject is
+   * therefore observed by the loop, the same way the range form re-reads its
+   * bound each iteration. */
+  if (subject && subject->type == AST_IDENTIFIER) {
+    Identifier *named = (Identifier *)subject->data;
+    if (named && named->name &&
+        strlen(named->name) < sizeof(subject_name)) {
+      snprintf(subject_name, sizeof(subject_name), "%s", named->name);
+      ast_destroy_node(subject);
+      subject = NULL;
+      subject_is_named = 1;
+    }
+  }
+  if (!subject_is_named) {
+    snprintf(subject_name, sizeof(subject_name), ".fors%d", serial);
+  }
+
+  body = (parser->current_token.type == TOKEN_LBRACE)
+             ? parser_parse_block(parser)
+             : parser_parse_statement(parser);
+  if (!body) {
+    goto fail;
+  }
+
+  if (!subject_is_named) {
+    subject_decl =
+        ast_create_var_declaration(subject_name, NULL, subject, location);
+    if (!subject_decl) {
+      goto fail;
+    }
+    subject = NULL;
+    ((VarDeclaration *)subject_decl->data)->structural_type = 1;
+  }
+
+  /* var c[: type] = .fors[.fori];  -- the element, named as the program asked.
+   * Its type is structural when unannotated: it is whatever indexing answers,
+   * which for a string is `char`. */
+  element_decl = ast_create_var_declaration(
+      var_name, type_name,
+      ast_create_array_index_expression(
+          ast_create_identifier(subject_name, location),
+          ast_create_identifier(index_name, location), location),
+      location);
+  if (!element_decl) {
+    goto fail;
+  }
+  if (!type_name) {
+    ((VarDeclaration *)element_decl->data)->structural_type = 1;
+  }
+
+  /* The element declaration has to run before the body, and the body may be a
+   * single statement rather than a block, so wrap both either way. */
+  {
+    ASTNode *inner = ast_create_program();
+    Program *inner_data = inner ? (Program *)inner->data : NULL;
+    ASTNode **grown =
+        inner_data ? realloc(inner_data->declarations, 2 * sizeof(ASTNode *))
+                   : NULL;
+    if (!grown) {
+      if (inner) {
+        ast_destroy_node(inner);
+      }
+      goto fail;
+    }
+    inner_data->declarations = grown;
+    inner_data->declarations[0] = element_decl;
+    inner_data->declarations[1] = body;
+    inner_data->declaration_count = 2;
+    ast_add_child(inner, element_decl);
+    ast_add_child(inner, body);
+    element_decl = NULL;
+    body = inner;
+  }
+
+  index_decl = ast_create_var_declaration(
+      index_name, NULL, ast_create_number_literal(0, location, 10), location);
+  if (!index_decl) {
+    goto fail;
+  }
+  ((VarDeclaration *)index_decl->data)->structural_type = 1;
+
+  /* .fori < (int64).fors.length -- the cast keeps the counter's signed
+   * comparison from meeting the unsigned length. */
+  condition = ast_create_binary_expression(
+      ast_create_identifier(index_name, location), "<",
+      ast_create_cast_expression(
+          "int64",
+          ast_create_member_access(
+              ast_create_identifier(subject_name, location), "length",
+              location),
+          location),
+      location);
+  increment = ast_create_assignment(
+      index_name,
+      ast_create_binary_expression(
+          ast_create_identifier(index_name, location), "+",
+          ast_create_number_literal(1, location, 10), location),
+      location);
+  if (!condition || !increment) {
+    goto fail;
+  }
+
+  loop = ast_create_for_statement(index_decl, condition, increment, body,
+                                  location);
+  if (!loop) {
+    goto fail;
+  }
+  index_decl = NULL;
+  condition = NULL;
+  increment = NULL;
+  body = NULL;
+
+  if (subject_is_named) {
+    free(var_name);
+    free(type_name);
+    return loop;
+  }
+
+  block = ast_create_program();
+  {
+    Program *block_data = block ? (Program *)block->data : NULL;
+    ASTNode **grown =
+        block_data ? realloc(block_data->declarations, 2 * sizeof(ASTNode *))
+                   : NULL;
+    if (!grown) {
+      goto fail;
+    }
+    block_data->declarations = grown;
+    block_data->declarations[0] = subject_decl;
+    block_data->declarations[1] = loop;
+    block_data->declaration_count = 2;
+    ast_add_child(block, subject_decl);
+    ast_add_child(block, loop);
+  }
+
+  free(var_name);
+  free(type_name);
+  return block;
+
+fail:
+  if (!parser->has_error) {
+    parser_set_error(parser, "Out of memory desugaring 'for' over a string");
+  }
+  free(var_name);
+  free(type_name);
+  if (subject) {
+    ast_destroy_node(subject);
+  }
+  if (subject_decl) {
+    ast_destroy_node(subject_decl);
+  }
+  if (element_decl) {
+    ast_destroy_node(element_decl);
+  }
+  if (index_decl) {
+    ast_destroy_node(index_decl);
+  }
+  if (condition) {
+    ast_destroy_node(condition);
+  }
+  if (increment) {
+    ast_destroy_node(increment);
+  }
+  if (body) {
+    ast_destroy_node(body);
+  }
+  if (loop) {
+    ast_destroy_node(loop);
+  }
+  if (block) {
+    ast_destroy_node(block);
+  }
+  return NULL;
+}
+
 static ASTNode *parser_parse_range_for(Parser *parser, SourceLocation location) {
   if (!parser_is_identifier_like(parser->current_token.type)) {
     parser_set_error(parser, "Expected '(' or a loop variable after 'for'");
@@ -5964,12 +6170,25 @@ static ASTNode *parser_parse_range_for(Parser *parser, SourceLocation location) 
     return NULL;
   }
 
+  /* `for c in s` over a string. No '..' followed the subject, so this is the
+   * character form rather than a range, and it desugars into the counted loop
+   * the rest of the compiler already handles:
+   *
+   *   {
+   *     var .fors: string = s;
+   *     for .fori in 0 .. (int64).fors.length {
+   *       var c: char = .fors[.fori];
+   *       <body>
+   *     }
+   *   }
+   *
+   * The subject gets a hidden local so it is evaluated once: `for c in
+   * read_line(buf)` must not read a line per character. The hidden names start
+   * with a dot, which no source identifier can, so neither can collide with a
+   * name the program chose or with a nested loop's own pair. */
   if (parser->current_token.type != TOKEN_DOT_DOT) {
-    parser_set_error(parser, "Expected '..' or '..=' in range-based for loop");
-    free(var_name);
-    free(type_name);
-    ast_destroy_node(start);
-    return NULL;
+    return parser_finish_string_for(parser, location, var_name, type_name,
+                                    start);
   }
   parser_advance(parser); // consume '..'
   int inclusive = 0;

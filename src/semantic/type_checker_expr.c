@@ -1796,6 +1796,11 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
       // Floating literals default to float64
       return checker->builtin_float64;
     }
+    /* `'a'` is a character, not the number 97. It still widens into every
+     * integer silently, so `var code: int32 = 'a';` needs no cast. */
+    if (literal->is_char) {
+      return checker->builtin_char;
+    }
 
     return type_checker_default_integer_literal_type(checker, literal);
   }
@@ -2269,6 +2274,7 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
         case TYPE_UINT32:
         case TYPE_UINT64:
         case TYPE_BOOL:
+        case TYPE_CHAR:
         case TYPE_FLOAT32:
         case TYPE_FLOAT64:
         case TYPE_STRING:
@@ -2277,7 +2283,8 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
           type_checker_set_error_at_location(
               checker, call->arguments[0]->location,
               "Cannot interpolate a value of type '%s' into a string; "
-              "interpolation takes integers, booleans, floats, and strings",
+              "interpolation takes integers, characters, booleans, floats, "
+              "and strings",
               value_type->name ? value_type->name : "?");
           return NULL;
         }
@@ -2912,6 +2919,13 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
         }
       }
       return array_type->base_type;
+    }
+
+    /* `s[i]` is the i'th character. A string is a borrowed view of bytes, so
+     * this reads one and answers a `char`; writing through it is not offered,
+     * because the view may point at a literal in rodata. */
+    if (array_type->kind == TYPE_STRING) {
+      return checker->builtin_char;
     }
 
     type_checker_set_error_at_location(checker, expression->location,

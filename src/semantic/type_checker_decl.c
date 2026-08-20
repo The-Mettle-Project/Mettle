@@ -1728,6 +1728,22 @@ int type_checker_process_declaration(TypeChecker *checker,
         if (!target_array_type) {
           return 0;
         }
+        /* `s[i]` reads a character; it is not a place to put one. A string
+         * is a borrowed view, and the bytes it points at are as likely to be
+         * a literal in read-only memory as a buffer the program owns. Reach
+         * the bytes through `s.chars` when they are genuinely writable. */
+        if (target_array_type->kind == TYPE_STRING) {
+          type_checker_set_error_at_location(
+              checker, assignment->target->location,
+              "Cannot assign through a string index: a string is a borrowed "
+              "view and its bytes may be read-only");
+          if (checker->error_reporter) {
+            error_reporter_set_last_label(
+                checker->error_reporter,
+                "write through 's.chars' when the bytes are yours to change");
+          }
+          return 0;
+        }
         if (target_array_type->kind == TYPE_ARRAY) {
           long long constant_index = 0;
           if (type_checker_eval_integer_constant(target_index->index,

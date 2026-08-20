@@ -58,6 +58,18 @@ export fn mettle_string_from_int(value: int64) -> string {
     return "-" + mettle_string_from_uint(magnitude);
 }
 
+// One character, as a view of one byte. The byte needs a home that outlives
+// the view, so it comes from the same heap scratch the digits use rather than
+// from a stack local the escape checker would reject.
+export fn mettle_string_from_char(value: int64) -> string {
+    var scratch: MettleStringScratch* = new MettleStringScratch;
+    scratch->bytes[0] = (uint8)value;
+    var s: string;
+    s.chars = &scratch->bytes[0];
+    s.length = (uint64)1;
+    return s;
+}
+
 export fn mettle_string_from_bool(value: int64) -> string {
     if (value != 0) {
         return "true";

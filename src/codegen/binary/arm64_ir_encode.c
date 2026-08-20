@@ -113,6 +113,7 @@ typedef enum {
   STUB_MALLOC, STUB_CALLOC, STUB_FREE, STUB_PUTS, STUB_PUTCHAR, STUB_WRITE,
   STUB_STRLEN, STUB_MEMCPY, STUB_MEMMOVE, STUB_MEMSET, STUB_EXIT, STUB_ABORT,
   STUB_STR_FROM_INT, STUB_STR_FROM_UINT, STUB_STR_FROM_BOOL,
+  STUB_STR_FROM_CHAR,
   STUB_COUNT
 } Arm64StubId;
 
@@ -125,6 +126,7 @@ static const struct {
     {"memmove", 0}, {"memset", 0},  {"exit", 0},    {"abort", 0},
     {"mettle_string_from_int", 1},  {"mettle_string_from_uint", 1},
     {"mettle_string_from_bool", 1},
+    {"mettle_string_from_char", 1},
 };
 
 /* Index of the runtime stub named `name`, or -1. `mettle_heap_zeroed` is the
@@ -2764,6 +2766,21 @@ static void emit_string_from_value(Arm64Emit *e, int malloc_label,
   arm64_emit_epilogue(e, 16, NULL, 0);
 }
 
+/* x0 = mettle_string_from_char(x0): the low byte as a one-character record. */
+static void emit_string_from_char(Arm64Emit *e, int malloc_label) {
+  arm64_emit_prologue(e, 16, NULL, 0);
+  arm64_emit_word(e, arm64_str_imm(1, ARM64_X0, ARM64_SP, 0));      /* value */
+  arm64_emit_word(e, arm64_movz(1, ARM64_X0, 32, 0));
+  arm64_emit_bl(e, malloc_label);
+  arm64_emit_word(e, arm64_ldr_imm(1, ARM64_X9, ARM64_SP, 0));
+  arm64_emit_word(e, arm64_strb_imm(ARM64_X9, ARM64_X0, 16));
+  arm64_emit_word(e, arm64_add_imm(1, ARM64_X13, ARM64_X0, 16, 0));
+  arm64_emit_word(e, arm64_str_imm(1, ARM64_X13, ARM64_X0, 0));
+  arm64_emit_word(e, arm64_movz(1, ARM64_X12, 1, 0));
+  arm64_emit_word(e, arm64_str_imm(1, ARM64_X12, ARM64_X0, 8));
+  arm64_emit_epilogue(e, 16, NULL, 0);
+}
+
 /* x0 = mettle_string_from_bool(x0): "true" or "false" as a heap record. */
 static void emit_string_from_bool(Arm64Emit *e, int malloc_label) {
   int l_true = arm64_new_label(e);
@@ -2822,6 +2839,7 @@ static void emit_runtime_stub(Arm64Emit *e, int id, int malloc_label) {
   case STUB_STR_FROM_INT: emit_string_from_value(e, malloc_label, 1); break;
   case STUB_STR_FROM_UINT: emit_string_from_value(e, malloc_label, 0); break;
   case STUB_STR_FROM_BOOL: emit_string_from_bool(e, malloc_label); break;
+  case STUB_STR_FROM_CHAR: emit_string_from_char(e, malloc_label); break;
   default: arm64_fail(e, "internal: no runtime stub %d", id); break;
   }
 }

@@ -313,17 +313,18 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     /* Bind before anything is emitted: a name already declared in this
      * function at a different type gets one of its own, so the two do not
      * share a frame slot (and a type) in the backends. */
-    const char *decl_type_text = declaration->type_name;
+    const char *decl_type_text = ir_backend_type_name(declaration->type_name);
     if (!decl_type_text && declaration->initializer &&
         declaration->initializer->resolved_type) {
-      decl_type_text = declaration->initializer->resolved_type->name;
+      decl_type_text = ir_backend_type_name(
+          declaration->initializer->resolved_type->name);
     }
     const char *local_name =
         ir_local_bind(context, declaration->name, decl_type_text);
     local.op = IR_OP_DECLARE_LOCAL;
     local.location = statement->location;
     local.dest = ir_operand_symbol(local_name);
-    local.text = declaration->type_name;
+    local.text = (char *)ir_backend_type_name(declaration->type_name);
     local.value_type = mtlc_type_from_frontend(decl_type);
     if (declaration->address_space != AST_ADDRESS_SPACE_DEFAULT) {
       int is_static_storage =
@@ -373,7 +374,8 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     // never freed by the IR. Leaving it NULL is harmless for the asm backend.
     if (!local.text && declaration->initializer &&
         declaration->initializer->resolved_type) {
-      local.text = declaration->initializer->resolved_type->name;
+      local.text = (char *)ir_backend_type_name(
+          declaration->initializer->resolved_type->name);
     }
     if (!local.dest.name) {
       ir_set_error(context,

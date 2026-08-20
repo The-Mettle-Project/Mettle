@@ -564,6 +564,13 @@ void type_checker_init_builtin_types(TypeChecker *checker) {
     checker->builtin_bool->alignment = 1;
   }
 
+  // Create first-class char type (1-byte character, distinct from uint8)
+  checker->builtin_char = type_create(TYPE_CHAR, "char");
+  if (checker->builtin_char) {
+    checker->builtin_char->size = 1;
+    checker->builtin_char->alignment = 1;
+  }
+
   // Create built-in floating-point types
   checker->builtin_float32 = type_create(TYPE_FLOAT32, "float32");
   checker->builtin_float64 = type_create(TYPE_FLOAT64, "float64");
@@ -678,6 +685,8 @@ Type *type_checker_get_type_by_name(TypeChecker *checker, const char *name) {
   // Check built-in types by name
   if (strcmp(name, "bool") == 0)
     return checker->builtin_bool;
+  if (strcmp(name, "char") == 0)
+    return checker->builtin_char;
   if (strcmp(name, "int8") == 0)
     return checker->builtin_int8;
   if (strcmp(name, "int16") == 0)
@@ -792,6 +801,7 @@ int type_checker_is_integer_type(Type *type) {
   case TYPE_UINT32:
   case TYPE_UINT64:
   case TYPE_BOOL:
+  case TYPE_CHAR:
   case TYPE_ENUM:
     return 1;
   default:
@@ -830,6 +840,18 @@ Type *type_checker_promote_types(TypeChecker *checker, Type *left, Type *right,
       strcmp(operator, "<") == 0 || strcmp(operator, "<=") == 0 ||
       strcmp(operator, ">") == 0 || strcmp(operator, ">=") == 0) {
     return checker->builtin_int32;
+  }
+
+  /* Character arithmetic promotes to int32, the way C promotes a char. `c -
+   * 'a'` is an index and `c + 1` is the next code point; neither is a
+   * character, and leaving them as one would print the answer as text.
+   * Comparison is unaffected: it returned above, and `c == 'h'` still asks
+   * whether two characters match. */
+  if (left->kind == TYPE_CHAR) {
+    left = checker->builtin_int32;
+  }
+  if (right->kind == TYPE_CHAR) {
+    right = checker->builtin_int32;
   }
 
   // For arithmetic operators, promote to larger type
@@ -879,6 +901,7 @@ int type_checker_get_type_rank(Type *type) {
   switch (type->kind) {
   case TYPE_INT8:
   case TYPE_UINT8:
+  case TYPE_CHAR:
     return 1;
   case TYPE_INT16:
   case TYPE_UINT16:
@@ -1075,6 +1098,7 @@ int type_checker_integer_bounds(const Type *type, long long *out_min,
   case TYPE_INT32:  min = INT32_MIN; max = INT32_MAX;  break;
   case TYPE_INT64:  min = INT64_MIN; max = INT64_MAX;  break;
   case TYPE_UINT8:  min = 0;         max = UINT8_MAX;  break;
+  case TYPE_CHAR:   min = 0;         max = UINT8_MAX;  break;
   case TYPE_UINT16: min = 0;         max = UINT16_MAX; break;
   case TYPE_UINT32: min = 0;         max = UINT32_MAX; break;
   case TYPE_UINT64: min = 0;         max = UINT64_MAX; break;

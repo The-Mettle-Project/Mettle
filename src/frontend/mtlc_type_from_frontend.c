@@ -104,6 +104,12 @@ static MtlcTypeKind translate_kind(TypeKind kind) {
     return MTLC_TYPE_UINT64;
   case TYPE_BOOL:
     return MTLC_TYPE_BOOL;
+  /* A char is a byte below this line. Everything the backend does with one --
+   * its load and store width, its register class, how it crosses an ABI
+   * boundary -- is what it does with a uint8; only interpolation, which is
+   * decided in the frontend, tells them apart. */
+  case TYPE_CHAR:
+    return MTLC_TYPE_UINT8;
   case TYPE_FLOAT32:
     return MTLC_TYPE_FLOAT32;
   case TYPE_FLOAT64:

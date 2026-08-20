@@ -17,6 +17,11 @@ typedef enum {
   TYPE_UINT32,
   TYPE_UINT64,
   TYPE_BOOL,
+  /* A one-byte character. Byte-identical to uint8 and it widens into every
+   * wider integer the same way, so character arithmetic needs no ceremony.
+   * The distinction is what interpolation reads: "{c}" writes the character,
+   * where a uint8 would write its number. */
+  TYPE_CHAR,
   TYPE_FLOAT32,
   TYPE_FLOAT64,
   TYPE_STRING,

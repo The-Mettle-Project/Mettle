@@ -806,6 +806,14 @@ IROperand ir_operand_copy(const IROperand *operand);
 void ir_operand_destroy(IROperand *operand);
 
 IRFunction *ir_function_create(const char *name);
+/* The name a source type carries into the IR. `char` is a byte with a
+ * printing convention, and everything below this line -- the optimizer's width
+ * tables, the verifier, the backends' load and store widths, the debug type
+ * codes -- wants the byte. Keeping the distinction in the frontend means the
+ * new type kind costs no entry in twenty scattered string tables, each of
+ * which would quietly stop recognizing a loop the day it was missed. */
+const char *ir_backend_type_name(const char *source_name);
+
 int ir_function_set_parameters(IRFunction *function, const char **parameter_names,
                                const char **parameter_types,
                                size_t parameter_count);

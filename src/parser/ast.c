@@ -2057,6 +2057,7 @@ ASTNode *ast_create_number_literal(long long int_value,
 
   number_literal->int_value = int_value;
   number_literal->is_float = 0;
+  number_literal->is_char = 0;
   number_literal->int_radix =
       (int_radix == 2u || int_radix == 16u) ? int_radix : 10u;
   node->data = number_literal;
@@ -2077,6 +2078,7 @@ ASTNode *ast_create_float_literal(double float_value, SourceLocation location) {
 
   number_literal->float_value = float_value;
   number_literal->is_float = 1;
+  number_literal->is_char = 0;
   number_literal->int_radix = 10;
   node->data = number_literal;
 
@@ -2412,6 +2414,7 @@ int ast_fold_member_access_to_int(ASTNode *node, long long value) {
   }
   literal->int_value = value;
   literal->is_float = 0;
+  literal->is_char = 0;
   literal->int_radix = 10;
 
   for (size_t i = 0; i < node->child_count; i++) {

@@ -94,7 +94,8 @@ int ir_defer_capture_call(IRLoweringContext *context,
   }
 
   for (size_t i = 0; i < call->argument_count; i++) {
-    const char *type_name = call->arguments[i]->resolved_type->name;
+    const char *type_name =
+        ir_backend_type_name(call->arguments[i]->resolved_type->name);
     char *temp_name = ir_new_label_name(context, "defer_cap");
     if (!temp_name) {
       goto fail;
@@ -105,7 +106,7 @@ int ir_defer_capture_call(IRLoweringContext *context,
     decl.op = IR_OP_DECLARE_LOCAL;
     decl.location = defer_node->location;
     decl.dest = ir_operand_symbol(temp_name);
-    decl.text = (char *)type_name;
+    decl.text = (char *)ir_backend_type_name(type_name);
     if (!decl.dest.name || !ir_emit(context, function, &decl)) {
       ir_operand_destroy(&decl.dest);
       goto fail;
