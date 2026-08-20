@@ -1047,50 +1047,50 @@ static int sse_arith(MirFunction *fn, MirOpcode op, int width,
   }
 }
 
+/* Scalar float arithmetic in the VEX 3-operand form: v<op>s{s,d} D, A, B.
+ * The legacy SSE forms are two-address (addsd D,b computes D = D OP b), which
+ * forced a movaps copy of A into D whenever the allocator could not coalesce
+ * them; the VEX form names all three registers, so no copy exists to elide.
+ * VEX.128/LIG writes zero the upper lanes, so mixing with the surrounding
+ * legacy-SSE code carries no transition penalty. */
+static int vex_scalar_arith(MirFunction *fn, MirOpcode op, int width,
+                            BinaryXmmRegister dst, BinaryXmmRegister a,
+                            BinaryXmmRegister b) {
+  unsigned char opcode;
+  switch (op) {
+  case MIR_FADD: opcode = 0x58; break;
+  case MIR_FSUB: opcode = 0x5C; break;
+  case MIR_FMUL: opcode = 0x59; break;
+  case MIR_FDIV: opcode = 0x5E; break;
+  default: return 0;
+  }
+  BinaryCodeBuffer *code = &fn->context->code;
+  /* map 0F, pp = F3 (ss) / F2 (sd), L=0, W=0; reg = dst, vvvv = a, rm = b. */
+  return wcs_vex3(code, 1, width == 4 ? 2 : 3, 0, 0, (int)dst, (int)b,
+                  (int)a) &&
+         binary_code_buffer_append_u8(code, opcode) &&
+         binary_code_buffer_append_u8(
+             code, (unsigned char)(0xC0 | ((dst & 7) << 3) | (b & 7)));
+}
+
 static int encode_fbinop(MirFunction *fn, const MirInst *in) {
   int w = in->width;
-  int commutative = (in->op == MIR_FADD || in->op == MIR_FMUL);
   BinaryXmmRegister D;
   int ok;
 
-  if (dst_is_xmm_reg(fn, &in->dst, &D)) {
-    if (xmm_operand_in_phys(fn, &in->b, D)) {
-      if (!commutative) {
-        /* D = a OP b, b in D: stage a in scratch, op b, move back to D. */
-        if (!materialize_xmm_into(fn, &in->a, FSCRATCH_A, w) ||
-            !sse_arith(fn, in->op, w, FSCRATCH_A, D) ||
-            !xmm_mov(&fn->context->code, D, FSCRATCH_A, w)) {
-          return enc_err(fn, "out of memory in float op");
-        }
-        return 1;
-      }
-      /* commutative: D = D OP a. */
-      BinaryXmmRegister aval = xmm_value(fn, &in->a, FSCRATCH_A, w, &ok);
-      if (!ok || !sse_arith(fn, in->op, w, D, aval)) {
-        return enc_err(fn, "out of memory in float op");
-      }
-      return 1;
-    }
-    if (!xmm_operand_in_phys(fn, &in->a, D) &&
-        !materialize_xmm_into(fn, &in->a, D, w)) {
-      return enc_err(fn, "out of memory in float op");
-    }
-    BinaryXmmRegister bval = xmm_value(fn, &in->b, FSCRATCH_A, w, &ok);
-    if (!ok || !sse_arith(fn, in->op, w, D, bval)) {
-      return enc_err(fn, "out of memory in float op");
-    }
-    return 1;
+  int dst_in_reg = dst_is_xmm_reg(fn, &in->dst, &D);
+  if (!dst_in_reg) {
+    D = FSCRATCH_A;
   }
-
-  /* Spilled destination: compute in FSCRATCH_A (b may stage in FSCRATCH_B). */
-  if (!materialize_xmm_into(fn, &in->a, FSCRATCH_A, w)) {
-    return 0;
-  }
-  BinaryXmmRegister bval = xmm_value(fn, &in->b, FSCRATCH_B, w, &ok);
-  if (!ok || !sse_arith(fn, in->op, w, FSCRATCH_A, bval)) {
+  BinaryXmmRegister aval = xmm_value(fn, &in->a, FSCRATCH_A, w, &ok);
+  if (!ok) {
     return enc_err(fn, "out of memory in float op");
   }
-  return xmm_store(fn, &in->dst, FSCRATCH_A, w);
+  BinaryXmmRegister bval = xmm_value(fn, &in->b, FSCRATCH_B, w, &ok);
+  if (!ok || !vex_scalar_arith(fn, in->op, w, D, aval, bval)) {
+    return enc_err(fn, "out of memory in float op");
+  }
+  return dst_in_reg ? 1 : xmm_store(fn, &in->dst, FSCRATCH_A, w);
 }
 
 /* int -> float: dst(xmm) = cvtsi2sd/ss(a gp). in->width is the float width. */
