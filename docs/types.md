@@ -55,6 +55,31 @@ for c in s {
 
 `char` is ASCII-oriented: it holds one byte, so a multi-byte UTF-8 sequence is that many `char` values. `s.length` counts bytes.
 
+**Character:** `char` is a built-in 1-byte type. A character literal has this type, so `'a'` is a `char`. It is a byte, and it behaves like one: it widens into every wider integer with no cast, and arithmetic on it promotes to `int32`, because `c - 'a'` is an index and `c + 1` is the next code point, neither of which is a character. Going the other way needs a cast.
+
+What the distinct type buys is printing. Interpolation writes a `char` as the character and a `uint8` as its number, which is the difference between `h` and `104`:
+
+```mettle
+var c: char = 'h';
+println("{c}");           // h
+println("{(uint8)c}");    // 104
+
+var code: int32 = c;             // widens, no cast
+var offset: int32 = c - 'a';     // 7, an index
+var next: char = (char)(c + 1);  // narrows, cast required
+```
+
+**A string is a view of bytes.** `s.length` counts BYTES, `s[i]` reads the byte at `i`, and `for c in s` walks bytes. For ASCII those are the same as characters. For anything else they are not:
+
+```mettle
+var s: string = "héllo";
+s.length          // 6, not 5: the e-acute is two bytes
+```
+
+That is the right pair for protocol and buffer work, which is most of what a string is for here, and it is deliberately not an encoding. Reading the same bytes as text is a library operation: `std/utf8` decodes them into Unicode scalar values. See the standard library reference.
+
+`s[i]` is a read. A `string` is a borrowed view and its bytes are as likely to be a literal in read-only memory as a buffer the program owns, so assigning through the index is rejected; write through `s.chars` when the bytes are yours.
+
 **Boolean:** `bool` is a built-in 1-byte type with the two built-in constants `true` and `false`. It is distinct from `uint8`: a `switch` over a `bool` must cover both `true` and `false` unless it has a `default`. Note that comparison operators do not produce `bool`; they produce an `int32` that is 0 or 1, and conditions in `if`, `while`, and `for` accept any numeric type rather than requiring `bool`.
 
 ```mettle

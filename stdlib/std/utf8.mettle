@@ -1,0 +1,232 @@
+// Mettle standard library: UTF-8
+//
+// A `string` is bytes and a `char` is one byte, which is the right pair for
+// protocol and buffer work and the wrong one for text. This module is the
+// other half: it reads those bytes as UTF-8 and hands back Unicode scalar
+// values.
+//
+// A scalar value is an `int32`. It needs no type of its own -- it is a number
+// between 0 and 0x10FFFF, `getchar` already returns one shaped that way, and
+// giving it a type would make every byte-oriented function in std/conv choose
+// a side it has no business choosing. What it needs is a decoder, which is
+// what this is.
+//
+// The two readings of a string sit side by side, and you tell them apart by
+// reading them:
+//
+//     for b in s { ... }                    // bytes, one `char` each
+//
+//     var i: int64 = 0;                     // characters, one int32 each
+//     while (i < (int64)s.length) {
+//       var cp: int32 = utf8_at(s, i);
+//       i = i + utf8_span(s, i);
+//     }
+//
+// The second is a loop rather than a form of its own on purpose. Reading a
+// string is a string operation, so it belongs in a library that can be read,
+// changed and ignored, not in the parser.
+//
+// Malformed input never stops the program and never stalls it. A bad byte
+// decodes to U+FFFD and spans exactly one byte, so a walk always advances and
+// garbage reads as garbage instead of being invented into text. What UTF-8
+// says is not a character is refused with it: an over-long encoding (the trick
+// that smuggles a NUL or a `/` past a naive check), a surrogate half, and
+// anything above U+10FFFF.
+
+import "std/conv";
+
+// The replacement character, U+FFFD. What a byte that is not valid UTF-8
+// decodes to.
+const UTF8_REPLACEMENT: int32 = 65533;
+
+// The largest scalar value Unicode defines.
+const UTF8_MAX: int32 = 1114111;
+
+// ─── Decoding ───────────────────────────────────────────────────────────────
+
+// How many bytes the character starting at BYTE offset `i` spans. Always at
+// least 1, so a walk stepping by this always advances.
+export fn utf8_span(s: string, i: int64) -> int64 {
+  var n: int64 = (int64)s.length;
+  if (i < 0 || i >= n) {
+    return 1;
+  }
+  var b0: int32 = (int32)s.chars[i];
+  if (b0 < 128) {
+    return 1;
+  }
+  var need: int64 = 0;
+  if (b0 >= 240) {
+    if (b0 >= 248) { return 1; }
+    need = 4;
+  } else if (b0 >= 224) {
+    need = 3;
+  } else if (b0 >= 192) {
+    need = 2;
+  } else {
+    return 1;
+  }
+  if (i + need > n) {
+    return 1;
+  }
+  var k: int64 = 1;
+  while (k < need) {
+    var b: int32 = (int32)s.chars[i + k];
+    if (b < 128 || b >= 192) {
+      return 1;
+    }
+    k = k + 1;
+  }
+  if (utf8_scalar(s, i, need) < 0) {
+    return 1;
+  }
+  return need;
+}
+
+// The scalar value of the `need`-byte sequence at `i`, or -1 when UTF-8
+// refuses it. Continuation bytes have already been checked by the caller.
+fn utf8_scalar(s: string, i: int64, need: int64) -> int32 {
+  if (need == 2) {
+    var v2: int32 = (((int32)s.chars[i] - 192) * 64 +
+                     ((int32)s.chars[i + 1] - 128));
+    if (v2 < 128) { return -1; }
+    return v2;
+  }
+  if (need == 3) {
+    var v3: int32 = (((int32)s.chars[i] - 224) * 4096 +
+                     ((int32)s.chars[i + 1] - 128) * 64 +
+                     ((int32)s.chars[i + 2] - 128));
+    if (v3 < 2048) { return -1; }
+    if (v3 >= 55296 && v3 <= 57343) { return -1; }
+    return v3;
+  }
+  var v4: int32 = (((int32)s.chars[i] - 240) * 262144 +
+                   ((int32)s.chars[i + 1] - 128) * 4096 +
+                   ((int32)s.chars[i + 2] - 128) * 64 +
+                   ((int32)s.chars[i + 3] - 128));
+  if (v4 < 65536) { return -1; }
+  if (v4 > UTF8_MAX) { return -1; }
+  return v4;
+}
+
+// The character starting at BYTE offset `i`. U+FFFD when the bytes there are
+// not one. Paired with utf8_span it is the walk over characters:
+//
+//     var i: int64 = 0;
+//     while (i < (int64)s.length) {
+//       var cp: int32 = utf8_at(s, i);
+//       i = i + utf8_span(s, i);
+//     }
+export fn utf8_at(s: string, i: int64) -> int32 {
+  var n: int64 = (int64)s.length;
+  if (i < 0 || i >= n) {
+    return UTF8_REPLACEMENT;
+  }
+  var b0: int32 = (int32)s.chars[i];
+  if (b0 < 128) {
+    return b0;
+  }
+  var need: int64 = utf8_span(s, i);
+  if (need == 1) {
+    return UTF8_REPLACEMENT;
+  }
+  return utf8_scalar(s, i, need);
+}
+
+// How many characters `s` holds. Walks the whole view, so it is O(length):
+// `s.length` is the constant-time answer to the other question, how many
+// BYTES, which is what slicing and every buffer call are measured in.
+export fn utf8_count(s: string) -> int64 {
+  var n: int64 = (int64)s.length;
+  var i: int64 = 0;
+  var count: int64 = 0;
+  while (i < n) {
+    i = i + utf8_span(s, i);
+    count = count + 1;
+  }
+  return count;
+}
+
+// Whether every byte in `s` is part of a well-formed sequence.
+export fn utf8_valid(s: string) -> bool {
+  var n: int64 = (int64)s.length;
+  var i: int64 = 0;
+  while (i < n) {
+    if ((int32)s.chars[i] >= 128 && utf8_span(s, i) == 1) {
+      return false;
+    }
+    i = i + utf8_span(s, i);
+  }
+  return true;
+}
+
+// The byte offset where character number `index` begins, or the length when
+// there are fewer characters than that. O(length), because finding the n'th
+// character in UTF-8 means counting the ones before it -- which is the reason
+// `s[i]` indexes bytes and there is no character index.
+export fn utf8_offset(s: string, index: int64) -> int64 {
+  var n: int64 = (int64)s.length;
+  var i: int64 = 0;
+  var seen: int64 = 0;
+  while (i < n && seen < index) {
+    i = i + utf8_span(s, i);
+    seen = seen + 1;
+  }
+  return i;
+}
+
+// ─── Encoding ───────────────────────────────────────────────────────────────
+
+// How many bytes `cp` encodes to. 3 for anything Unicode refuses, which is
+// what utf8_encode writes for it.
+export fn utf8_len(cp: int32) -> int64 {
+  if (cp < 0 || cp > UTF8_MAX || (cp >= 55296 && cp <= 57343)) {
+    return 3;
+  }
+  if (cp < 128) { return 1; }
+  if (cp < 2048) { return 2; }
+  if (cp < 65536) { return 3; }
+  return 4;
+}
+
+// Write `cp` as UTF-8 into `buf` and return how many bytes it took. `buf` must
+// have room for utf8_len(cp), at most 4. A value outside Unicode is written as
+// U+FFFD rather than as bytes no decoder would accept back, so the output of
+// an encode is always something a decode can read.
+export fn utf8_encode(buf: cstring, cp: int32) -> int64 {
+  var v: int32 = cp;
+  if (v < 0 || v > UTF8_MAX || (v >= 55296 && v <= 57343)) {
+    v = UTF8_REPLACEMENT;
+  }
+  if (v < 128) {
+    buf[0] = (uint8)v;
+    return 1;
+  }
+  if (v < 2048) {
+    buf[0] = (uint8)(192 + v / 64);
+    buf[1] = (uint8)(128 + v % 64);
+    return 2;
+  }
+  if (v < 65536) {
+    buf[0] = (uint8)(224 + v / 4096);
+    buf[1] = (uint8)(128 + (v / 64) % 64);
+    buf[2] = (uint8)(128 + v % 64);
+    return 3;
+  }
+  buf[0] = (uint8)(240 + v / 262144);
+  buf[1] = (uint8)(128 + (v / 4096) % 64);
+  buf[2] = (uint8)(128 + (v / 64) % 64);
+  buf[3] = (uint8)(128 + v % 64);
+  return 4;
+}
+
+// One character as a view of `buf`. The view borrows, so it lives as long as
+// the buffer does; `buf` needs 4 bytes. This is how a scalar value reaches
+// `print`, which takes bytes and knows nothing about code points:
+//
+//     var buf: uint8[4];
+//     print(utf8_string(&buf[0], cp));
+export fn utf8_string(buf: cstring, cp: int32) -> string {
+  var n: int64 = utf8_encode(buf, cp);
+  return str_from_bytes(buf, n);
+}

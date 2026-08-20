@@ -1,0 +1,93 @@
+import "std/utf8";
+import "std/conv";
+
+// "héllo" is 6 bytes and 5 characters: the e-acute is C3 A9.
+var MIXED: string = "héllo";
+// Three characters, three bytes each.
+var JP: string = "日本語";
+// One character, four bytes.
+var EMOJI: string = "🎉";
+
+fn main() -> int32 {
+  // A string measures bytes. That is what slicing and every buffer call want,
+  // and it is not the number of characters.
+  if ((int32)MIXED.length != 6) { return 1; }
+  if ((int32)utf8_count(MIXED) != 5) { return 2; }
+  if ((int32)JP.length != 9 || (int32)utf8_count(JP) != 3) { return 3; }
+  if ((int32)EMOJI.length != 4 || (int32)utf8_count(EMOJI) != 1) { return 4; }
+
+  // Decoding, one character at a time, by byte offset.
+  if (utf8_at(MIXED, 0) != 104) { return 5; }        // 'h'
+  if (utf8_at(MIXED, 1) != 233) { return 6; }        // U+00E9
+  if (utf8_span(MIXED, 0) != 1 || utf8_span(MIXED, 1) != 2) { return 7; }
+  if (utf8_at(MIXED, 3) != 108) { return 8; }        // 'l', after the 2-byte
+  if (utf8_at(JP, 0) != 26085) { return 9; }         // U+65E5
+  if (utf8_at(EMOJI, 0) != 127881) { return 10; }    // U+1F389
+
+  // The walk: every character once, in order, and it always terminates.
+  var seen: int32 = 0;
+  var last: int32 = 0;
+  var i: int64 = 0;
+  while (i < (int64)MIXED.length) {
+    last = utf8_at(MIXED, i);
+    i = i + utf8_span(MIXED, i);
+    seen = seen + 1;
+  }
+  if (seen != 5 || last != 111) { return 11; }       // 'o'
+
+  // Byte offsets of characters, and the end when there are fewer.
+  if (utf8_offset(MIXED, 0) != 0) { return 12; }
+  if (utf8_offset(MIXED, 1) != 1) { return 13; }
+  if (utf8_offset(MIXED, 2) != 3) { return 14; }     // past the 2-byte
+  if (utf8_offset(MIXED, 99) != 6) { return 15; }
+
+  if (!utf8_valid(MIXED) || !utf8_valid(JP) || !utf8_valid(EMOJI)) {
+    return 16;
+  }
+
+  // Round trip: encode what was decoded and get the same bytes back.
+  var buf: uint8[8];
+  if (utf8_len(104) != 1 || utf8_len(233) != 2) { return 17; }
+  if (utf8_len(26085) != 3 || utf8_len(127881) != 4) { return 18; }
+  if (utf8_encode(&buf[0], 233) != 2) { return 19; }
+  if (buf[0] != 195 || buf[1] != 169) { return 20; }
+  if (utf8_string(&buf[0], 26085) != "日") { return 21; }
+  if (utf8_string(&buf[0], 127881) != "🎉") { return 22; }
+
+  // Malformed bytes decode to U+FFFD and span one byte, so a walk over
+  // garbage still advances and still terminates. A lone continuation byte and
+  // a truncated sequence are both refused.
+  var bad: uint8[4];
+  bad[0] = 104; bad[1] = 169; bad[2] = 195; bad[3] = 108;
+  var junk: string = str_from_bytes(&bad[0], 4);
+  if (utf8_at(junk, 1) != 65533 || utf8_span(junk, 1) != 1) { return 23; }
+  if (utf8_at(junk, 2) != 65533 || utf8_span(junk, 2) != 1) { return 24; }
+  if (utf8_valid(junk)) { return 25; }
+  if ((int32)utf8_count(junk) != 4) { return 26; }
+
+  // What UTF-8 calls not a character is refused, not decoded. C0 80 is an
+  // over-long NUL, the encoding that smuggles a terminator past a naive check.
+  var overlong: uint8[2];
+  overlong[0] = 192; overlong[1] = 128;
+  var sneak: string = str_from_bytes(&overlong[0], 2);
+  if (utf8_at(sneak, 0) != 65533 || utf8_span(sneak, 0) != 1) { return 27; }
+
+  // A surrogate half, encoded as if it were a character.
+  var sur: uint8[3];
+  sur[0] = 237; sur[1] = 160; sur[2] = 128;
+  if (utf8_at(str_from_bytes(&sur[0], 3), 0) != 65533) { return 28; }
+
+  // Encoding refuses the same values, writing U+FFFD rather than bytes no
+  // decoder would accept back, so an encode always produces something a
+  // decode can read.
+  if (utf8_encode(&buf[0], 55296) != 3) { return 29; }
+  if (utf8_at(str_from_bytes(&buf[0], 3), 0) != 65533) { return 30; }
+  if (utf8_encode(&buf[0], 1114112) != 3) { return 31; }
+  if (utf8_at(str_from_bytes(&buf[0], 3), 0) != 65533) { return 32; }
+
+  // An empty view has no characters and no bytes.
+  var empty: string = str_from_bytes(&buf[0], 0);
+  if ((int32)utf8_count(empty) != 0 || !utf8_valid(empty)) { return 33; }
+
+  return 0;
+}

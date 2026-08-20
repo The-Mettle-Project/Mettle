@@ -8,7 +8,7 @@ The compiler and standard library support Windows x86_64, Linux x86_64, and
 Linux AArch64. libmtlc emits native COFF and ELF64 objects with no external
 assembler. Use `make` on Linux and `build.bat` on Windows.
 
-**Cross platform modules:** `std/io`, `std/mem`, `std/math`, `std/conv`,
+**Cross platform modules:** `std/io`, `std/mem`, `std/math`, `std/conv`, `std/utf8`,
 `std/process`, `std/dir`, `std/net`, and `std/thread` bind to Mettle's owned
 runtime and work on Windows and Linux.
 
@@ -84,6 +84,48 @@ Mathematics, implemented entirely in Mettle. Nothing in this module binds a C ma
 **float32 helpers.** `f32_abs`, `f32_min`, `f32_max`, `f32_clamp`, `f32_lerp`, `f32_sqrt`.
 
 Accuracy: kernels carry enough terms that truncation error sits below the rounding error, giving roughly 1 ulp across the normal range. Trigonometric argument reduction uses a two-part split of pi/2, which holds full precision to about |x| = 1e8 and degrades beyond that. `tests/test_std_math.mettle` checks the module against independently computed reference values and identity sweeps, at both optimization levels.
+
+## std/utf8
+
+Reads a string's bytes as UTF-8. A `string` is a view of bytes and a `char` is
+one byte, which is the right pair for protocol and buffer work and the wrong
+one for text; this is the other half.
+
+A scalar value is an `int32`. It needs no type of its own: it is a number
+between 0 and 0x10FFFF, and giving it one would make every byte-oriented
+function in `std/conv` choose a side it has no business choosing.
+
+The two readings of a string sit side by side, and you tell them apart by
+reading them:
+
+```mettle
+for b in s { ... }                    // bytes, one `char` each
+
+var i: int64 = 0;                     // characters, one int32 each
+while (i < (int64)s.length) {
+  var cp: int32 = utf8_at(s, i);
+  i = i + utf8_span(s, i);
+}
+```
+
+Decoding: `utf8_at(s, i)` is the character starting at BYTE offset `i`,
+`utf8_span(s, i)` is how many bytes it occupies (always at least 1, so a walk
+always advances), `utf8_count(s)` is how many characters `s` holds, and
+`utf8_valid(s)` is whether every byte is part of a well-formed sequence.
+`utf8_offset(s, n)` is the byte offset where character `n` begins, which is
+O(length) because finding the n'th character means counting the ones before it.
+
+Encoding: `utf8_len(cp)` is how many bytes `cp` needs, `utf8_encode(buf, cp)`
+writes them and returns the count, and `utf8_string(buf, cp)` returns a view of
+what it wrote, which is how a scalar value reaches `print`.
+
+Malformed input never stops the program and never stalls it. A bad byte decodes
+to U+FFFD and spans exactly one byte, so a walk always terminates and garbage
+reads as garbage rather than being invented into text. What UTF-8 says is not a
+character is refused with it: an over-long encoding (the trick that smuggles a
+NUL or a `/` past a naive check), a surrogate half, and anything above
+U+10FFFF. Encoding refuses the same values and writes U+FFFD, so the output of
+an encode is always something a decode can read.
 
 ## std/conv
 
