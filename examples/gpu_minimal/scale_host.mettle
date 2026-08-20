@@ -1,0 +1,46 @@
+// mettle --build scale_host.mettle -o scale_host.exe \
+//   --link-arg "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.9/lib/x64/cuda.lib"
+
+import "std/io";
+import "std/mem";
+import "std/gpu";
+
+extern kernel(block = 256) scale(x: float32*, k: float32, n: int32);
+
+fn main() -> int32 {
+  if (gpu_init() == 0) { println("no CUDA device"); return 1; }
+
+  var fp: cstring = fopen("scale.ptx", "rb");
+  if (fp == 0) { println("scale.ptx is missing; emit it first"); return 1; }
+  var ptx: uint8* = malloc(65536);
+  var len: int64 = fread((cstring)ptx, 1, 65535, fp);
+  fclose(fp);
+  ptx[len] = 0;
+  if (gpu_module(ptx) == 0) { println("the PTX module would not load"); return 1; }
+
+  var n: int32 = 1024;
+  var bytes: int64 = (int64)n * 4;
+  var host: float32* = malloc(bytes);
+  var i: int32 = 0;
+  while (i < n) { host[i] = (float32)i; i = i + 1; }
+
+  var dev: int64 = gpu_malloc(bytes);
+  gpu_to_device(dev, (uint8*)host, bytes);
+
+  dispatch scale[work: n](dev, (float32)3.0, n);
+
+  // The blocking copy back is what orders the read after the launch.
+  gpu_to_host((uint8*)host, dev, bytes);
+
+  var ok: int32 = 1;
+  i = 0;
+  while (i < n) {
+    if (host[i] != (float32)(3 * i)) { ok = 0; }
+    i = i + 1;
+  }
+  println("host[7] = {(int32)host[7]}, host[1023] = {(int32)host[1023]}");
+  if (ok == 1) { println("scaled on the GPU"); } else { println("MISMATCH"); }
+
+  gpu_free(dev);
+  return 0;
+}

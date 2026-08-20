@@ -30,7 +30,7 @@ fn main() -> int32 {
   var i: int32 = 0;
   while (i < n) { ha[i] = (float32)i; hb[i] = (float32)(2 * i); i = i + 1; }
 
-  // device buffers (explicit -- you own VRAM)
+  // device buffers (explicit as you own VRAM)
   var da: int64 = gpu_malloc(bytes);
   var db: int64 = gpu_malloc(bytes);
   var dc: int64 = gpu_malloc(bytes);

@@ -1,0 +1,270 @@
+struct Vector2 {
+  x: float32;
+  y: float32;
+}
+
+struct Vector3 {
+  x: float32;
+  y: float32;
+  z: float32;
+}
+
+struct Vector4 {
+  x: float32;
+  y: float32;
+  z: float32;
+  w: float32;
+}
+
+struct Matrix {
+  m0: float32;  m4: float32;  m8: float32;   m12: float32;
+  m1: float32;  m5: float32;  m9: float32;   m13: float32;
+  m2: float32;  m6: float32;  m10: float32;  m14: float32;
+  m3: float32;  m7: float32;  m11: float32;  m15: float32;
+}
+
+struct Color {
+  r: uint8;
+  g: uint8;
+  b: uint8;
+  a: uint8;
+}
+
+struct Rectangle {
+  x: float32;
+  y: float32;
+  width: float32;
+  height: float32;
+}
+
+struct Image {
+  data: rawptr;
+  width: int32;
+  height: int32;
+  mipmaps: int32;
+  format: int32;
+}
+
+struct Texture2D {
+  id: uint32;
+  width: int32;
+  height: int32;
+  mipmaps: int32;
+  format: int32;
+}
+
+struct Camera3D {
+  position: Vector3;
+  target: Vector3;
+  up: Vector3;
+  fovy: float32;
+  projection: int32;
+}
+
+struct Mesh {
+  vertexCount: int32;
+  triangleCount: int32;
+  vertices: float32*;
+  texcoords: float32*;
+  texcoords2: float32*;
+  normals: float32*;
+  tangents: float32*;
+  colors: uint8*;
+  indices: uint16*;
+  animVertices: float32*;
+  animNormals: float32*;
+  boneIds: uint8*;
+  boneWeights: float32*;
+  boneMatrices: Matrix*;
+  boneCount: int32;
+  vaoId: uint32;
+  vboId: uint32*;
+}
+
+struct Shader {
+  id: uint32;
+  locs: int32*;
+}
+
+struct MaterialMap {
+  texture: Texture2D;
+  color: Color;
+  value: float32;
+}
+
+struct Material {
+  shader: Shader;
+  maps: MaterialMap*;
+  params: float32[4];
+}
+
+struct Model {
+  transform: Matrix;
+  meshCount: int32;
+  materialCount: int32;
+  meshes: Mesh*;
+  materials: Material*;
+  meshMaterial: int32*;
+  boneCount: int32;
+  bones: rawptr;
+  bindPose: rawptr;
+}
+
+const FLAG_FULLSCREEN_MODE    = 0x00000002;
+const FLAG_WINDOW_RESIZABLE   = 0x00000004;
+const FLAG_WINDOW_UNDECORATED = 0x00000008;
+const FLAG_MSAA_4X_HINT       = 0x00000020;
+const FLAG_VSYNC_HINT         = 0x00000040;
+const FLAG_WINDOW_HIDDEN      = 0x00000080;
+
+const LOG_ALL     = 0;
+const LOG_INFO    = 3;
+const LOG_WARNING = 4;
+const LOG_ERROR   = 5;
+const LOG_NONE    = 7;
+
+const CAMERA_PERSPECTIVE  = 0;
+const CAMERA_ORTHOGRAPHIC = 1;
+
+const KEY_SPACE  = 32;
+const KEY_ONE    = 49;
+const KEY_TWO    = 50;
+const KEY_THREE  = 51;
+const KEY_S      = 83;
+const KEY_T      = 84;
+const KEY_V      = 86;
+const KEY_W      = 87;
+const KEY_ESCAPE = 256;
+const KEY_ENTER  = 257;
+const KEY_RIGHT  = 262;
+const KEY_LEFT   = 263;
+const KEY_DOWN   = 264;
+const KEY_UP     = 265;
+
+const PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 = 7;
+
+const MATERIAL_MAP_DIFFUSE = 0;
+
+const TEXTURE_FILTER_POINT     = 0;
+const TEXTURE_FILTER_BILINEAR  = 1;
+const TEXTURE_FILTER_TRILINEAR = 2;
+
+const SHADER_UNIFORM_FLOAT = 0;
+const SHADER_UNIFORM_VEC2  = 1;
+const SHADER_UNIFORM_VEC3  = 2;
+const SHADER_UNIFORM_VEC4  = 3;
+const SHADER_UNIFORM_INT   = 4;
+
+extern fn InitWindow(width: int32, height: int32, title: cstring) = "InitWindow";
+extern fn CloseWindow() = "CloseWindow";
+extern fn WindowShouldClose() -> uint8 = "WindowShouldClose";
+extern fn SetWindowTitle(title: cstring) = "SetWindowTitle";
+extern fn SetWindowState(flags: uint32) = "SetWindowState";
+extern fn ClearWindowState(flags: uint32) = "ClearWindowState";
+extern fn SetConfigFlags(flags: uint32) = "SetConfigFlags";
+extern fn SetTraceLogLevel(level: int32) = "SetTraceLogLevel";
+extern fn GetScreenWidth() -> int32 = "GetScreenWidth";
+extern fn GetScreenHeight() -> int32 = "GetScreenHeight";
+extern fn GetCurrentMonitor() -> int32 = "GetCurrentMonitor";
+extern fn GetMonitorRefreshRate(monitor: int32) -> int32 = "GetMonitorRefreshRate";
+extern fn TakeScreenshot(file_name: cstring) = "TakeScreenshot";
+
+extern fn MemAlloc(size: uint32) -> rawptr = "MemAlloc";
+extern fn MemFree(ptr: rawptr) = "MemFree";
+
+extern fn SetTargetFPS(fps: int32) = "SetTargetFPS";
+extern fn GetFPS() -> int32 = "GetFPS";
+extern fn GetFrameTime() -> float32 = "GetFrameTime";
+extern fn GetTime() -> float64 = "GetTime";
+
+extern fn IsKeyDown(key: int32) -> uint8 = "IsKeyDown";
+extern fn IsKeyPressed(key: int32) -> uint8 = "IsKeyPressed";
+extern fn IsMouseButtonDown(button: int32) -> uint8 = "IsMouseButtonDown";
+extern fn GetMousePosition() -> Vector2 = "GetMousePosition";
+extern fn GetMouseDelta() -> Vector2 = "GetMouseDelta";
+extern fn GetMouseWheelMove() -> float32 = "GetMouseWheelMove";
+
+extern fn BeginDrawing() = "BeginDrawing";
+extern fn EndDrawing() = "EndDrawing";
+extern fn ClearBackground(color: Color) = "ClearBackground";
+extern fn BeginMode3D(camera: Camera3D) = "BeginMode3D";
+extern fn EndMode3D() = "EndMode3D";
+extern fn BeginShaderMode(shader: Shader) = "BeginShaderMode";
+extern fn EndShaderMode() = "EndShaderMode";
+
+extern fn DrawText(text: cstring, x: int32, y: int32, font_size: int32, color: Color) = "DrawText";
+extern fn DrawFPS(x: int32, y: int32) = "DrawFPS";
+extern fn MeasureText(text: cstring, font_size: int32) -> int32 = "MeasureText";
+extern fn DrawRectangle(x: int32, y: int32, width: int32, height: int32, color: Color) = "DrawRectangle";
+extern fn DrawRectangleLines(x: int32, y: int32, width: int32, height: int32, color: Color) = "DrawRectangleLines";
+
+extern fn DrawSphere(center: Vector3, radius: float32, color: Color) = "DrawSphere";
+extern fn DrawSphereEx(center: Vector3, radius: float32, rings: int32, slices: int32, color: Color) = "DrawSphereEx";
+extern fn DrawSphereWires(center: Vector3, radius: float32, rings: int32, slices: int32, color: Color) = "DrawSphereWires";
+extern fn DrawCube(position: Vector3, width: float32, height: float32, length: float32, color: Color) = "DrawCube";
+extern fn DrawGrid(slices: int32, spacing: float32) = "DrawGrid";
+
+extern fn GenMeshSphere(radius: float32, rings: int32, slices: int32) -> Mesh = "GenMeshSphere";
+extern fn GenMeshCube(width: float32, height: float32, length: float32) -> Mesh = "GenMeshCube";
+extern fn UploadMesh(mesh: Mesh*, is_dynamic: uint8) = "UploadMesh";
+extern fn UnloadMesh(mesh: Mesh) = "UnloadMesh";
+extern fn DrawMesh(mesh: Mesh, material: Material, transform: Matrix) = "DrawMesh";
+extern fn DrawMeshInstanced(mesh: Mesh, material: Material, transforms: Matrix*, instances: int32) = "DrawMeshInstanced";
+
+extern fn LoadMaterialDefault() -> Material = "LoadMaterialDefault";
+extern fn SetMaterialTexture(material: Material*, map_type: int32, texture: Texture2D) = "SetMaterialTexture";
+extern fn LoadModelFromMesh(mesh: Mesh) -> Model = "LoadModelFromMesh";
+extern fn UnloadModel(model: Model) = "UnloadModel";
+extern fn DrawModel(model: Model, position: Vector3, scale: float32, tint: Color) = "DrawModel";
+extern fn DrawModelEx(model: Model, position: Vector3, rotation_axis: Vector3, rotation_angle: float32, scale: Vector3, tint: Color) = "DrawModelEx";
+extern fn DrawModelWires(model: Model, position: Vector3, scale: float32, tint: Color) = "DrawModelWires";
+
+extern fn LoadTextureFromImage(image: Image) -> Texture2D = "LoadTextureFromImage";
+extern fn UnloadTexture(texture: Texture2D) = "UnloadTexture";
+extern fn GenTextureMipmaps(texture: Texture2D*) = "GenTextureMipmaps";
+extern fn SetTextureFilter(texture: Texture2D, filter: int32) = "SetTextureFilter";
+
+extern fn LoadShaderFromMemory(vs_code: cstring, fs_code: cstring) -> Shader = "LoadShaderFromMemory";
+extern fn GetShaderLocation(shader: Shader, uniform_name: cstring) -> int32 = "GetShaderLocation";
+extern fn SetShaderValue(shader: Shader, loc_index: int32, value: rawptr, uniform_type: int32) = "SetShaderValue";
+extern fn UnloadShader(shader: Shader) = "UnloadShader";
+
+fn vec2(x: float32, y: float32) -> Vector2 {
+  var v: Vector2;
+  v.x = x;
+  v.y = y;
+  return v;
+}
+
+fn vec3(x: float32, y: float32, z: float32) -> Vector3 {
+  var v: Vector3;
+  v.x = x;
+  v.y = y;
+  v.z = z;
+  return v;
+}
+
+fn rgba(r: uint8, g: uint8, b: uint8, a: uint8) -> Color {
+  var c: Color;
+  c.r = r;
+  c.g = g;
+  c.b = b;
+  c.a = a;
+  return c;
+}
+
+fn rgb(r: uint8, g: uint8, b: uint8) -> Color {
+  return rgba(r, g, b, 255);
+}
+
+fn RAYWHITE() -> Color  { return rgb(245, 245, 245); }
+fn WHITE() -> Color     { return rgb(255, 255, 255); }
+fn BLACK() -> Color     { return rgb(0, 0, 0); }
+fn RED() -> Color       { return rgb(230, 41, 55); }
+fn GREEN() -> Color     { return rgb(0, 228, 48); }
+fn BLUE() -> Color      { return rgb(0, 121, 241); }
+fn GOLD() -> Color      { return rgb(255, 203, 0); }
+fn ORANGE() -> Color    { return rgb(255, 161, 0); }
+fn SKYBLUE() -> Color   { return rgb(102, 191, 255); }
+fn DARKGRAY() -> Color  { return rgb(80, 80, 80); }
+fn LIGHTGRAY() -> Color { return rgb(200, 200, 200); }

@@ -1,0 +1,488 @@
+// A rotating, lit, textured sphere drawn through the raylib bindings.
+//
+//   examples\raylib\build.bat
+//   examples\raylib\sphere.exe
+//   examples\raylib\sphere.exe --bench=10 --rings=192 --slices=192
+//
+// The mesh is generated here rather than by GenMeshSphere, so the tessellation
+// is a runtime knob and the vertex/index buffers are Mettle's own work. The
+// model matrix is built here too: raymath is header-only C, so nothing in it is
+// callable across the ABI, which turns out to be a two-function loss.
+//
+// Flags:
+//   --bench[=SECONDS]   run uncapped for SECONDS and print frame statistics
+//   --rings=N --slices=N  sphere tessellation (default 128)
+//   --width=N --height=N  window size (default 1280x720)
+//   --spheres=N         draw an NxN grid of spheres instead of one
+//   --vsync             wait for the display refresh
+//   --plain             use raylib's default shader instead of sphere.fs
+//   --hud               keep the overlay on while benchmarking
+//   --nomsaa            drop the 4x MSAA hint
+//   --empty             draw no geometry, to measure raylib's frame floor
+//   --shot=FILE.png     write a screenshot after the first second
+//
+// Keys: V vsync, T shader, UP/DOWN tessellation, S screenshot, ESC quit.
+
+import "raylib";
+import "std/io";
+import "std/mem";
+import "std/conv";
+import "std/math";
+
+const MAX_RINGS = 254;
+const HIST_SIZE = 262144;   // one bucket per microsecond of frame time
+
+var g_width: int32 = 1280;
+var g_height: int32 = 720;
+var g_rings: int32 = 128;
+var g_slices: int32 = 128;
+var g_grid: int32 = 1;
+var g_bench: float64 = 0.0;
+var g_vsync: int32 = 0;
+var g_plain: int32 = 0;
+var g_hud_always: int32 = 0;
+var g_msaa: int32 = 1;
+var g_empty: int32 = 0;
+var g_shot: string;
+var g_want_shot: int32 = 0;
+
+var g_hud: uint8* = 0;
+var g_hist: int32* = 0;
+
+// ---------------------------------------------------------------------------
+// Mesh generation
+//
+// A UV sphere with a duplicated seam column so the texture coordinate can wrap.
+// Vertex count is (rings+1)*(slices+1), which the 16-bit index buffer caps at
+// 65535, so the tessellation knob stops at 254.
+// ---------------------------------------------------------------------------
+
+fn build_sphere(rings: int32, slices: int32) -> Mesh {
+  var mesh: Mesh;
+  mem_zero((cstring)&mesh, sizeof(Mesh));
+
+  var vertex_count: int32 = (rings + 1) * (slices + 1);
+  var triangle_count: int32 = rings * slices * 2;
+
+  mesh.vertexCount = vertex_count;
+  mesh.triangleCount = triangle_count;
+  mesh.vertices = (float32*)MemAlloc((uint32)(vertex_count * 3 * 4));
+  mesh.normals = (float32*)MemAlloc((uint32)(vertex_count * 3 * 4));
+  mesh.texcoords = (float32*)MemAlloc((uint32)(vertex_count * 2 * 4));
+  mesh.indices = (uint16*)MemAlloc((uint32)(triangle_count * 3 * 2));
+
+  var ring: int32 = 0;
+  var v: int32 = 0;
+  while (ring <= rings) {
+    var lat: float64 = (float64)ring / (float64)rings;
+    var theta: float64 = lat * PI();
+    var sin_theta: float64 = sin(theta);
+    var cos_theta: float64 = cos(theta);
+
+    var slice: int32 = 0;
+    while (slice <= slices) {
+      var lon: float64 = (float64)slice / (float64)slices;
+      var phi: float64 = lon * TAU();
+      var nx: float64 = sin_theta * cos(phi);
+      var ny: float64 = cos_theta;
+      var nz: float64 = sin_theta * sin(phi);
+
+      mesh.vertices[v * 3 + 0] = (float32)nx;
+      mesh.vertices[v * 3 + 1] = (float32)ny;
+      mesh.vertices[v * 3 + 2] = (float32)nz;
+      mesh.normals[v * 3 + 0] = (float32)nx;
+      mesh.normals[v * 3 + 1] = (float32)ny;
+      mesh.normals[v * 3 + 2] = (float32)nz;
+      mesh.texcoords[v * 2 + 0] = (float32)lon;
+      mesh.texcoords[v * 2 + 1] = (float32)lat;
+      v = v + 1;
+      slice = slice + 1;
+    }
+    ring = ring + 1;
+  }
+
+  var stride: int32 = slices + 1;
+  var index: int32 = 0;
+  ring = 0;
+  while (ring < rings) {
+    var slice: int32 = 0;
+    while (slice < slices) {
+      var a: int32 = ring * stride + slice;
+      var b: int32 = a + stride;
+
+      mesh.indices[index + 0] = (uint16)a;
+      mesh.indices[index + 1] = (uint16)(a + 1);
+      mesh.indices[index + 2] = (uint16)b;
+      mesh.indices[index + 3] = (uint16)(a + 1);
+      mesh.indices[index + 4] = (uint16)(b + 1);
+      mesh.indices[index + 5] = (uint16)b;
+      index = index + 6;
+      slice = slice + 1;
+    }
+    ring = ring + 1;
+  }
+
+  UploadMesh(&mesh, 0);
+  return mesh;
+}
+
+// ---------------------------------------------------------------------------
+// Model matrix
+//
+// raylib's Matrix stores row 0 as m0, m4, m8, m12. This is Rx(pitch)*Ry(yaw)
+// scaled uniformly, with the translation in the last column.
+// ---------------------------------------------------------------------------
+
+fn model_matrix(yaw: float64, pitch: float64, scale: float64,
+                tx: float64, ty: float64, tz: float64) -> Matrix {
+  var cy: float64 = cos(yaw);
+  var sy: float64 = sin(yaw);
+  var cp: float64 = cos(pitch);
+  var sp: float64 = sin(pitch);
+
+  var m: Matrix;
+  m.m0 = (float32)(scale * cy);
+  m.m4 = 0.0;
+  m.m8 = (float32)(scale * sy);
+  m.m12 = (float32)tx;
+
+  m.m1 = (float32)(scale * sp * sy);
+  m.m5 = (float32)(scale * cp);
+  m.m9 = (float32)(scale * (0.0 - sp) * cy);
+  m.m13 = (float32)ty;
+
+  m.m2 = (float32)(scale * (0.0 - cp) * sy);
+  m.m6 = (float32)(scale * sp);
+  m.m10 = (float32)(scale * cp * cy);
+  m.m14 = (float32)tz;
+
+  m.m3 = 0.0;
+  m.m7 = 0.0;
+  m.m11 = 0.0;
+  m.m15 = 1.0;
+  return m;
+}
+
+// ---------------------------------------------------------------------------
+// Small text helpers: raylib takes NUL-terminated text, so the HUD lines are
+// assembled into one reused buffer.
+// ---------------------------------------------------------------------------
+
+fn hud(label: string, value: int64, suffix: string) -> cstring {
+  var n: int32 = 0;
+  var i: int64 = 0;
+  while (i < (int64)label.length) {
+    g_hud[n] = label.chars[i];
+    n = n + 1;
+    i = i + 1;
+  }
+  n = n + int_to_dec(g_hud + n, value);
+  i = 0;
+  while (i < (int64)suffix.length) {
+    g_hud[n] = suffix.chars[i];
+    n = n + 1;
+    i = i + 1;
+  }
+  g_hud[n] = 0;
+  return g_hud;
+}
+
+fn arg_value(arg: cstring, prefix: string) -> int64 {
+  var s: string;
+  s.chars = arg;
+  s.length = (uint64)cstr_len(arg);
+  if (str_starts_with(s, prefix) == 0) {
+    return -1;
+  }
+  var tail: string = str_slice(s, (int64)prefix.length,
+                               (int64)s.length - (int64)prefix.length);
+  var value: int64 = 0;
+  var ok: int32 = 0;
+  (value, ok) = str_to_i64(tail);
+  if (ok == 0) {
+    return -1;
+  }
+  return value;
+}
+
+fn arg_is(arg: cstring, name: string) -> int32 {
+  var s: string;
+  s.chars = arg;
+  s.length = (uint64)cstr_len(arg);
+  if (s == name) {
+    return 1;
+  }
+  return 0;
+}
+
+fn parse_args(argc: int32, argv: cstring*) {
+  var i: int32 = 1;
+  while (i < argc) {
+    var arg: cstring = argv[i];
+    var value: int64 = 0;
+
+    if (arg_is(arg, "--bench") == 1) {
+      g_bench = 10.0;
+    } else if (arg_is(arg, "--vsync") == 1) {
+      g_vsync = 1;
+    } else if (arg_is(arg, "--plain") == 1) {
+      g_plain = 1;
+    } else if (arg_is(arg, "--hud") == 1) {
+      g_hud_always = 1;
+    } else if (arg_is(arg, "--nomsaa") == 1) {
+      g_msaa = 0;
+    } else if (arg_is(arg, "--empty") == 1) {
+      g_empty = 1;
+    } else {
+      value = arg_value(arg, "--bench=");
+      if (value >= 0) { g_bench = (float64)value; }
+      value = arg_value(arg, "--rings=");
+      if (value > 0) { g_rings = (int32)value; }
+      value = arg_value(arg, "--slices=");
+      if (value > 0) { g_slices = (int32)value; }
+      value = arg_value(arg, "--width=");
+      if (value > 0) { g_width = (int32)value; }
+      value = arg_value(arg, "--height=");
+      if (value > 0) { g_height = (int32)value; }
+      value = arg_value(arg, "--spheres=");
+      if (value > 0) { g_grid = (int32)value; }
+
+      var s: string;
+      s.chars = arg;
+      s.length = (uint64)cstr_len(arg);
+      if (str_starts_with(s, "--shot=") == 1) {
+        g_shot = str_slice(s, 7, (int64)s.length - 7);
+        g_want_shot = 1;
+      }
+    }
+    i = i + 1;
+  }
+
+  if (g_rings > MAX_RINGS) { g_rings = MAX_RINGS; }
+  if (g_slices > MAX_RINGS) { g_slices = MAX_RINGS; }
+  if (g_rings < 3) { g_rings = 3; }
+  if (g_slices < 3) { g_slices = 3; }
+}
+
+// ---------------------------------------------------------------------------
+// Frame time statistics: one bucket per microsecond, so a percentile is a walk
+// over the histogram rather than a sort of every frame.
+// ---------------------------------------------------------------------------
+
+fn percentile_us(total_frames: int64, fraction: float64) -> int64 {
+  var target: int64 = (int64)((float64)total_frames * fraction);
+  var seen: int64 = 0;
+  var i: int32 = 0;
+  while (i < HIST_SIZE) {
+    seen = seen + (int64)g_hist[i];
+    if (seen >= target) {
+      return (int64)i;
+    }
+    i = i + 1;
+  }
+  return (int64)(HIST_SIZE - 1);
+}
+
+fn print_fps(label: string, frames: int64, seconds: float64) {
+  if (seconds <= 0.0) { return; }
+  var fps_tenths: int64 = (int64)((float64)frames / seconds * 10.0);
+  var whole: int64 = fps_tenths / 10;
+  var frac: int64 = fps_tenths % 10;
+  println("{label}{whole}.{frac} fps");
+}
+
+fn print_frame_time(label: string, microseconds: int64) {
+  var whole: int64 = microseconds / 1000;
+  var frac: int64 = microseconds % 1000;
+  if (frac < 10) {
+    println("{label}{whole}.00{frac} ms");
+  } else if (frac < 100) {
+    println("{label}{whole}.0{frac} ms");
+  } else {
+    println("{label}{whole}.{frac} ms");
+  }
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  parse_args(argc, argv);
+
+  g_hud = (uint8*)malloc(256);
+  g_hist = (int32*)calloc((int64)HIST_SIZE, 4);
+
+  SetTraceLogLevel(LOG_WARNING);
+  if (g_vsync == 1) {
+    SetConfigFlags(FLAG_VSYNC_HINT);
+  }
+  if (g_msaa == 1) {
+    SetConfigFlags(FLAG_MSAA_4X_HINT);
+  }
+  InitWindow(g_width, g_height, "Mettle + raylib - rotating sphere");
+
+  var shader: Shader = LoadShaderFromMemory((import_str "sphere.vs").chars,
+                                            (import_str "sphere.fs").chars);
+  var loc_view_pos: int32 = GetShaderLocation(shader, "viewPos");
+  var loc_light_dir: int32 = GetShaderLocation(shader, "lightDir");
+
+  var mesh: Mesh = build_sphere(g_rings, g_slices);
+  var material: Material = LoadMaterialDefault();
+  var default_shader: Shader = material.shader;
+  if (g_plain == 0) {
+    material.shader = shader;
+  }
+
+  var camera: Camera3D;
+  camera.position = vec3(0.0, 1.5, 6.2);
+  camera.target = vec3(0.0, 0.0, 0.0);
+  camera.up = vec3(0.0, 1.0, 0.0);
+  camera.fovy = 45.0;
+  camera.projection = CAMERA_PERSPECTIVE;
+
+  var light: Vector3 = vec3(-0.55, -0.62, -0.56);
+  SetShaderValue(shader, loc_light_dir, &light, SHADER_UNIFORM_VEC3);
+  SetShaderValue(shader, loc_view_pos, &camera.position, SHADER_UNIFORM_VEC3);
+
+  var start: float64 = GetTime();
+  var previous: float64 = start;
+  var frames: int64 = 0;
+  var worst_us: int64 = 0;
+  var best_us: int64 = 1000000;
+  var shot_taken: int32 = 0;
+
+  while (WindowShouldClose() == 0) {
+    var now: float64 = GetTime();
+    var elapsed: float64 = now - start;
+    var frame_us: int64 = (int64)((now - previous) * 1000000.0);
+    previous = now;
+
+    if (frames > 0) {
+      if (frame_us < 0) { frame_us = 0; }
+      if (frame_us >= (int64)HIST_SIZE) { frame_us = (int64)(HIST_SIZE - 1); }
+      g_hist[(int32)frame_us] = g_hist[(int32)frame_us] + 1;
+      if (frame_us > worst_us) { worst_us = frame_us; }
+      if (frame_us < best_us) { best_us = frame_us; }
+    }
+
+    var yaw: float64 = elapsed * 0.6;
+    var pitch: float64 = 0.35 + sin(elapsed * 0.31) * 0.18;
+
+    BeginDrawing();
+    ClearBackground(rgb(16, 18, 26));
+    BeginMode3D(camera);
+
+    if (g_empty == 1) {
+      // nothing: measures raylib's own per-frame floor
+    } else if (g_grid <= 1) {
+      DrawMesh(mesh, material, model_matrix(yaw, pitch, 1.7, 0.0, 0.0, 0.0));
+    } else {
+      var spacing: float64 = 2.4;
+      var offset: float64 = (float64)(g_grid - 1) * spacing * 0.5;
+      var row: int32 = 0;
+      while (row < g_grid) {
+        var col: int32 = 0;
+        while (col < g_grid) {
+          var x: float64 = (float64)col * spacing - offset;
+          var z: float64 = (float64)row * spacing - offset;
+          DrawMesh(mesh, material,
+                   model_matrix(yaw + x, pitch, 0.9, x, 0.0, z));
+          col = col + 1;
+        }
+        row = row + 1;
+      }
+    }
+
+    EndMode3D();
+
+    if (g_bench == 0.0 || g_hud_always == 1) {
+      DrawRectangle(16, 16, 296, 150, rgba(10, 12, 18, 190));
+      DrawRectangleLines(16, 16, 296, 150, rgba(90, 110, 150, 140));
+      DrawText(hud("", (int64)GetFPS(), " fps"), 30, 28, 34, GOLD());
+      DrawText(hud("frame  ", (int64)(GetFrameTime() * 1000000.0), " us"),
+               30, 70, 18, RAYWHITE());
+      DrawText(hud("verts  ", (int64)mesh.vertexCount, ""), 30, 92, 18, RAYWHITE());
+      DrawText(hud("tris   ", (int64)mesh.triangleCount * (int64)(g_grid * g_grid), ""),
+               30, 114, 18, RAYWHITE());
+      if (g_vsync == 1) {
+        DrawText("vsync  on", 30, 136, 18, SKYBLUE());
+      } else {
+        DrawText("vsync  off", 30, 136, 18, SKYBLUE());
+      }
+      DrawText("V vsync   T shader   UP/DOWN detail   S shot   ESC quit",
+               16, g_height - 28, 18, rgba(150, 160, 180, 200));
+    }
+
+    EndDrawing();
+    frames = frames + 1;
+
+    if (g_want_shot == 1 && shot_taken == 0 && elapsed > 1.0) {
+      TakeScreenshot(g_shot.chars);
+      shot_taken = 1;
+    }
+
+    if (g_bench > 0.0 && elapsed >= g_bench) {
+      break;
+    }
+
+    if (IsKeyPressed(KEY_V) != 0) {
+      if (g_vsync == 1) {
+        ClearWindowState(FLAG_VSYNC_HINT);
+        g_vsync = 0;
+      } else {
+        SetWindowState(FLAG_VSYNC_HINT);
+        g_vsync = 1;
+      }
+    }
+    if (IsKeyPressed(KEY_T) != 0) {
+      if (g_plain == 0) {
+        material.shader = default_shader;
+        g_plain = 1;
+      } else {
+        material.shader = shader;
+        g_plain = 0;
+      }
+    }
+    if (IsKeyPressed(KEY_S) != 0) {
+      TakeScreenshot("sphere.png");
+    }
+    if (IsKeyPressed(KEY_UP) != 0 && g_rings < MAX_RINGS) {
+      g_rings = g_rings + 16;
+      g_slices = g_slices + 16;
+      if (g_rings > MAX_RINGS) { g_rings = MAX_RINGS; }
+      if (g_slices > MAX_RINGS) { g_slices = MAX_RINGS; }
+      UnloadMesh(mesh);
+      mesh = build_sphere(g_rings, g_slices);
+    }
+    if (IsKeyPressed(KEY_DOWN) != 0 && g_rings > 8) {
+      g_rings = g_rings - 16;
+      g_slices = g_slices - 16;
+      if (g_rings < 8) { g_rings = 8; }
+      if (g_slices < 8) { g_slices = 8; }
+      UnloadMesh(mesh);
+      mesh = build_sphere(g_rings, g_slices);
+    }
+  }
+
+  var total: float64 = GetTime() - start;
+  var spheres: int64 = (int64)(g_grid * g_grid);
+  var vertices: int64 = (int64)mesh.vertexCount;
+  var tris: int64 = (int64)mesh.triangleCount * spheres;
+
+  UnloadMesh(mesh);
+  UnloadShader(shader);
+  CloseWindow();
+
+  println("");
+  println("Mettle + raylib, rotating sphere");
+  println("  resolution   {g_width}x{g_height}");
+  println("  spheres      {spheres}");
+  println("  vertices     {vertices} per sphere");
+  println("  triangles    {tris} per frame");
+  println("  frames       {frames}");
+  print_fps("  average      ", frames, total);
+  if (frames > 2) {
+    print_frame_time("  best frame   ", best_us);
+    print_frame_time("  median       ", percentile_us(frames - 1, 0.5));
+    print_frame_time("  99th pct     ", percentile_us(frames - 1, 0.99));
+    print_frame_time("  worst frame  ", worst_us);
+  }
+  return 0;
+}

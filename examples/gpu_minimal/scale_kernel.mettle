@@ -1,0 +1,8 @@
+// mettle --emit-ptx --gpu-arch=sm_120 scale_kernel.mettle -o scale.ptx
+
+kernel scale(x: float32*, k: float32, n: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < n) {
+    x[i] = x[i] * k;
+  }
+}
