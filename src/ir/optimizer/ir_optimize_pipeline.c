@@ -139,10 +139,18 @@ static const IROptNamedPass g_ir_post_recognizer_tail[] = {
     {"if_convert", ir_if_convert_pass,
      {IR_OPT_FEATURE_LABEL,
       IR_OPT_FEATURE_BRANCH_ZERO | IR_OPT_FEATURE_BRANCH_EQ}},
-    /* Redundancy elimination runs here rather than in the fixpoint stage
-     * because rewriting a load to a copy erases the indexed shape every
-     * recognizer above reads. The two cleanups behind it retire the copies it
-     * leaves; nothing later in the pipeline would. */
+    {"prefetch_indirect", ir_prefetch_indirect_pass, IR_GATE_LOOP_LOAD},
+};
+
+/* Lowering cleanups. Each erases a shape a recognizer reads -- a load becomes
+ * a copy, two arms become one, a widening cast disappears -- so they run after
+ * every recognizer has had its chance AND outside the stage --explain re-runs
+ * to test a hypothesis, which would otherwise measure the cleaned-up body
+ * instead of the one the programmer wrote. The two general passes behind them
+ * retire the copies they leave; nothing later in the pipeline would. */
+static const IROptNamedPass g_ir_lowering_cleanup[] = {
+    {"widen_subword_cast", ir_widen_subword_load_cast_pass,
+     {IR_OPT_FEATURE_LOAD, IR_OPT_REQUIRE_NONE}},
     {"select_field_load", ir_select_adjacent_field_pass,
      {IR_OPT_FEATURE_LOAD | IR_OPT_FEATURE_BRANCH_ZERO, IR_OPT_REQUIRE_NONE}},
     {"redundancy_elim", ir_redundancy_elimination_pass,
@@ -150,7 +158,6 @@ static const IROptNamedPass g_ir_post_recognizer_tail[] = {
     {"redundancy_copy_prop", ir_copy_and_constant_propagation_pass, {0, 0}},
     {"redundancy_dead_temps", ir_eliminate_dead_temp_writes_pass,
      {IR_OPT_FEATURE_TEMP_WRITE, IR_OPT_REQUIRE_NONE}},
-    {"prefetch_indirect", ir_prefetch_indirect_pass, IR_GATE_LOOP_LOAD},
 };
 
 
@@ -562,10 +569,22 @@ int ir_optimize_function_pipeline(IRFunction *function) {
   }
   ir_pass_time_end("verify_simd_contracts [stage]", t0);
 
+  /* Weigh the body --explain reports on before the lowering cleanups touch it:
+   * its fix simulations re-run the recognizers on a clone, and a cleanup has
+   * already erased the shapes they read. */
+  ir_explain_function_after(function);
+
+  mettle_compiler_ctx_set_pass_name("lowering cleanup");
+  if (!ir_run_named_stage_fixpoint(
+          function, g_ir_lowering_cleanup,
+          IR_ARRAY_COUNT(g_ir_lowering_cleanup), 1, "lowering cleanup",
+          "IR optimization pass failed", 0)) {
+    return 0;
+  }
+
   t0 = ir_pass_time_begin();
   int ok = ir_function_rebuild_cfg(function);
   ir_pass_time_end("rebuild_cfg [stage]", t0);
-  ir_explain_function_after(function);
   return ok;
 }
 

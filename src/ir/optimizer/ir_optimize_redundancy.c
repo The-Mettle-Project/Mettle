@@ -1422,3 +1422,74 @@ int ir_select_adjacent_field_pass(IRFunction *function, int *changed) {
   ir_temp_value_map_destroy(&addr_taken);
   return 1;
 }
+
+/* -------------------------------------------------------------------------- */
+/* Widening a byte that is already wide                                        */
+/*                                                                             */
+/* A sub-word load zero-extends into the whole register, so `(int32)buf[i]` on  */
+/* a uint8 or uint16 buffer names a value the register already holds. The cast  */
+/* still lowered to a movsxd, one instruction per byte in every scanner in the  */
+/* suite. Rewriting it to a copy lets copy propagation retire it.               */
+/*                                                                             */
+/* Only unsigned sources qualify: a signed narrow element has to sign-extend    */
+/* from its own width, which is not what the register holds.                    */
+/* -------------------------------------------------------------------------- */
+
+static int subword_target_is_wider(const char *type_name, long long load_size) {
+  if (!type_name) {
+    return 0;
+  }
+  if (strcmp(type_name, "int32") == 0 || strcmp(type_name, "uint32") == 0 ||
+      strcmp(type_name, "int64") == 0 || strcmp(type_name, "uint64") == 0) {
+    return 1;
+  }
+  if (load_size == 1 &&
+      (strcmp(type_name, "int16") == 0 || strcmp(type_name, "uint16") == 0)) {
+    return 1;
+  }
+  return 0;
+}
+
+int ir_widen_subword_load_cast_pass(IRFunction *function, int *changed) {
+  REDefs defs = {0};
+  IRTempValueMap addr_taken;
+
+  if (!function || function->instruction_count == 0) {
+    return 1;
+  }
+  if (!ir_temp_value_map_init(&addr_taken)) {
+    return 1;
+  }
+  defs.function = function;
+  defs.addr_taken = &addr_taken;
+  if (ir_addr_taken_set_build(function, &addr_taken) &&
+      re_collect_defs(function, &defs)) {
+    for (size_t i = 0; i < function->instruction_count; i++) {
+      IRInstruction *ins = &function->instructions[i];
+      const IRInstruction *src;
+      if (ins->op != IR_OP_CAST || ins->is_float ||
+          ins->lhs.kind != IR_OPERAND_TEMP || !ins->lhs.name) {
+        continue;
+      }
+      src = re_unique_def(function, &defs, IR_OPERAND_TEMP, ins->lhs.name);
+      if (!src || src->op != IR_OP_LOAD || src->is_float || !src->is_unsigned ||
+          src->rhs.kind != IR_OPERAND_INT ||
+          (src->rhs.int_value != 1 && src->rhs.int_value != 2)) {
+        continue;
+      }
+      if (!subword_target_is_wider(ins->text, src->rhs.int_value)) {
+        continue;
+      }
+      {
+        IROperand value = ir_operand_copy(&ins->lhs);
+        ir_rewrite_to_assign_operand(ins, &value, changed);
+        ir_operand_destroy(&value);
+      }
+    }
+  }
+
+  re_map_destroy(&defs.defs);
+  re_map_destroy(&defs.def_at);
+  ir_temp_value_map_destroy(&addr_taken);
+  return 1;
+}
