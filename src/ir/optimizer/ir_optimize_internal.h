@@ -450,6 +450,9 @@ int ir_hoist_global_bases_pass(IRFunction *function, int *changed);
 int ir_hoist_row_pointers_pass(IRFunction *function, int *changed);
 int ir_if_convert_accumulate_pass(IRFunction *function, int *changed);
 int ir_normalize_scan_from_first_pass(IRFunction *function, int *changed);
+/* Cross-block redundancy elimination: a dominator-tree walk that also admits
+ * loads, which the block-local CSE does not. */
+int ir_redundancy_elimination_pass(IRFunction *function, int *changed);
 int ir_find_label_index(const IRFunction *function, const char *label,
                                size_t *out_index);
 int ir_find_last_writer_before(const IRFunction *function, size_t before_index,

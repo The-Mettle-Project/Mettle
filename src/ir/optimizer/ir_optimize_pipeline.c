@@ -139,6 +139,15 @@ static const IROptNamedPass g_ir_post_recognizer_tail[] = {
     {"if_convert", ir_if_convert_pass,
      {IR_OPT_FEATURE_LABEL,
       IR_OPT_FEATURE_BRANCH_ZERO | IR_OPT_FEATURE_BRANCH_EQ}},
+    /* Redundancy elimination runs here rather than in the fixpoint stage
+     * because rewriting a load to a copy erases the indexed shape every
+     * recognizer above reads. The two cleanups behind it retire the copies it
+     * leaves; nothing later in the pipeline would. */
+    {"redundancy_elim", ir_redundancy_elimination_pass,
+     {IR_OPT_FEATURE_LOAD, IR_OPT_REQUIRE_NONE}},
+    {"redundancy_copy_prop", ir_copy_and_constant_propagation_pass, {0, 0}},
+    {"redundancy_dead_temps", ir_eliminate_dead_temp_writes_pass,
+     {IR_OPT_FEATURE_TEMP_WRITE, IR_OPT_REQUIRE_NONE}},
     {"prefetch_indirect", ir_prefetch_indirect_pass, IR_GATE_LOOP_LOAD},
 };
 
