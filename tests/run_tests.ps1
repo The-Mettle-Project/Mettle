@@ -369,14 +369,13 @@ $cases = @(
       # required changes
       'use int32 elements and declare the accumulator as int64',
       'verified: simulated that fix and re-ran the optimizer: this loop then vectorizes -> vpaddd',
-      # call-in-body where the advice is DISPROVEN: @inline overrides the
-      # loop-shape guard, so the simulation really inlines the callee, finds
-      # the loop nested, withdraws the suggestion, and says the driver loop is
-      # correctly scalar
-      'each iteration calls `row_scale`; even with it inlined, its loops would land in this body',
+      # call-in-body resolved by the inliner itself: a small loop-bearing
+      # callee inlines for real now, and the report explains the nest that
+      # results rather than simulating a fix
+      'the call to `row_scale` on line 78 was inlined, so that callee''s loop \(line 69\) now sits in this body',
       # advice that says there is nothing to change is labelled a note,
       # not a fix, and never reaches the "where to start" ranking
-      'note: nothing to change on this line: this loop is a driver'
+      'note: nothing to change on this line: this loop drives the work'
     )
     OutputMustNotMatch = @(
       # the withdrawn advice must not survive anywhere in the report
@@ -703,7 +702,9 @@ $cases = @(
     Args          = @("--release", "--explain")
     Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
     OutputMustMatch = @(
-      'call to `cstr` .* NOT inlined'
+      # the user call site into the stdlib is reported (cstr now inlines --
+      # a small loop-bearing callee is within the inline budget)
+      'call to `cstr` .*: inlined'
     )
     OutputMustNotMatch = @(
       'cstr \(loop',
@@ -1481,7 +1482,9 @@ $cases = @(
     Path          = "tests/test_optimize_popcount_buffer_fuse.mettle"
     ShouldSucceed = $true
     Args          = @("--build", "--emit-obj", "--linker", "internal", "--release", "--profile-runtime-ops", "--dump-ir")
-    IrMustMatch   = @("%pbf[0-9]+_raw <-", "@total = @total \+ %pbf")
+    # popcount_buffer itself inlines now, so the accumulator carries the
+    # inliner's local prefix
+    IrMustMatch   = @("%pbf[0-9]+_raw <-", "total = @\S*total \+ %pbf")
     IrMustNotMatch = @("%\.?t[0-9]+ = popcount_byte", "__inl_popcount_byte", "local_count")
   },
   @{
@@ -1489,7 +1492,7 @@ $cases = @(
     Path          = "tests/test_optimize_popcount_buffer_fuse.mettle"
     ShouldSucceed = $true
     Args          = @("--build", "--emit-obj", "--linker", "internal", "--release", "--dump-ir")
-    IrMustMatch   = @("%pbf[0-9]+_raw <-", "@total = @total \+ %pbf")
+    IrMustMatch   = @("%pbf[0-9]+_raw <-", "total = @\S*total \+ %pbf")
     IrMustNotMatch = @("%\.?t[0-9]+ = popcount_byte", "__inl_popcount_byte", "local_count")
   },
   @{

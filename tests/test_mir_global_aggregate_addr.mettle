@@ -1,5 +1,7 @@
 // A global array or struct is reached through its address, so the whole
-// function used to fall to spill-everything codegen. Every value below is
+// function used to fall to spill-everything codegen. The helpers are
+// @noinline because the harness asserts the GATE's verdict on each one;
+// inlined into main (a direct-object function) there is no gate to observe. Every value below is
 // checked against its hand-computed result, and the harness separately asserts
 // the register-allocating backend took all of these functions.
 
@@ -13,7 +15,7 @@ var SCALAR: int32 = 5;
 var BYTES: uint8[32];
 var REALS: float64[8];
 
-fn fill_src(n: int32) {
+@noinline fn fill_src(n: int32) {
   var i: int32 = 0;
   while (i < n) {
     SRC[i] = i * 3 + 1;
@@ -21,7 +23,7 @@ fn fill_src(n: int32) {
   }
 }
 
-fn map_src(n: int32) -> int64 {
+@noinline fn map_src(n: int32) -> int64 {
   var sum: int64 = 0;
   var i: int32 = 0;
   while (i < n) {
@@ -33,7 +35,7 @@ fn map_src(n: int32) -> int64 {
   return sum;
 }
 
-fn fill_structs() -> int32 {
+@noinline fn fill_structs() -> int32 {
   ORIGIN.x = 11;
   ORIGIN.y = 22;
   var i: int32 = 0;
@@ -45,7 +47,7 @@ fn fill_structs() -> int32 {
   return ORIGIN.x + ORIGIN.y + GRID[7].y;
 }
 
-fn fill_bytes() -> int32 {
+@noinline fn fill_bytes() -> int32 {
   var i: int32 = 0;
   while (i < 32) {
     BYTES[i] = (uint8)(i * 7);
@@ -60,7 +62,7 @@ fn fill_bytes() -> int32 {
   return acc;
 }
 
-fn fill_reals() -> float64 {
+@noinline fn fill_reals() -> float64 {
   var i: int32 = 0;
   while (i < 8) {
     REALS[i] = (float64)i * 0.5;
@@ -77,7 +79,7 @@ fn fill_reals() -> float64 {
 
 // A scalar global keeps its register cache; an aliasing pointer must still see
 // and publish writes through that cache.
-fn scalar_alias() -> int32 {
+@noinline fn scalar_alias() -> int32 {
   var p: int32* = &SCALAR;
   *p = SCALAR + 3;
   return SCALAR;

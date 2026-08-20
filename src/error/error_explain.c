@@ -672,10 +672,11 @@ static const DecisionDoc DECISIONS[] = {
      "\n"
      "A structural guard: @inline does not override it.\n"},
     {"callee-has-loop", DECISION_INLINE_REFUSAL,
-     "The callee contains a loop the inliner declines by default",
-     "A heuristic standing in for a latent optimizer bug. Lifting it costs\n"
-     "vectorization: inlining runs before the recognizers, and several\n"
-     "exact-shape kernels stop matching a loop that arrives inlined.\n"
+     "The callee's loop body is over the inline size budget",
+     "A small loop-bearing callee inlines, because that is what exposes its\n"
+     "loop to values the caller already holds in registers. Past the budget\n"
+     "the call is noise next to the loop it reaches, and the caller growth\n"
+     "is not repaid. The budget doubles at sites two or more loops deep.\n"
      "\n"
      "@inline inlines it anyway. Where the loop is hot, look at its own\n"
      "remark first: that is usually where the time goes.\n"},

@@ -261,26 +261,30 @@ static int ir_function_is_inline_candidate_at(const IRFunction *function,
     }
   }
 
-  /* A loop-bearing callee is refused when its body mentions `-`, `*`, or both
-   * `<` and `>`: a textual proxy for a latent optimizer bug, kept because
-   * lifting it costs vectorization. Inlining runs before the recognizers, and
-   * a claimed loop that arrives already inlined stops matching several of the
-   * exact-shape kernels (minmax_i32, scale_i32, byte_map all went scalar when
-   * this was replaced by a size budget).
-   *
-   * `@inline` now overrides it, which is what the decorator documents. The
-   * guard is a heuristic standing in for a bug, so it belongs with the
-   * discretionary caps rather than with inline-asm and the missing-return
-   * rule. */
-  if (!forced && !getenv("METTLE_INLINE_LOOPS") &&
-      ((has_while_label && has_less_compare && has_greater_compare) ||
-       (has_while_label && has_subtract) || (has_while_label && has_multiply))) {
+  /* A loop-bearing callee inlines when it is small: that is what exposes its
+   * loop to values the caller already holds in registers, which measured as
+   * word_freq spending 44% of its time in a hash and a compare clang folds
+   * into the caller. Past the budget the call really is noise next to the
+   * loop it reaches. The old textual denylist (`-`, `*`, or `<` and `>` next
+   * to a while label) guarded two things that are both gone: recognizers that
+   * matched parameter NAMES and went scalar on inlined loops (they now accept
+   * any settled base), and a pass-skip cache that the freestanding getenv's
+   * shared buffer corrupted into half-applied passes. */
+  if (!forced && has_while_label &&
+      non_nop_count > (site_loop_depth >= 2
+                           ? 2u * IR_INLINE_LOOP_BODY_INSTRUCTIONS
+                           : IR_INLINE_LOOP_BODY_INSTRUCTIONS)) {
     IR_INLINE_WHY(why_not, "callee-has-loop",
-                  "the callee contains a loop the inliner declines by default "
-                  "(the call itself costs little next to the loop inside it)");
+                  "the callee's loop body is over the inline size budget for "
+                  "a loop-bearing callee (the call itself costs little next "
+                  "to the loop inside it)");
     *fix = "mark the callee @inline to inline it anyway";
     return 0;
   }
+  (void)has_less_compare;
+  (void)has_greater_compare;
+  (void)has_subtract;
+  (void)has_multiply;
   if (!has_return) {
     IR_INLINE_WHY(why_not, "callee-no-return",
                   "the callee has no return instruction the inliner can rewrite");

@@ -21,6 +21,10 @@
  * a tiny leaf's body costs about as much caller growth as the call sequence
  * it replaces. */
 #define IR_INLINE_TINY_LEAF_NON_NOP_INSTRUCTIONS 16
+/* A loop-bearing callee inlines while its body is short enough that the call
+ * sequence and the per-iteration field reloads it forces are a real share of
+ * the work; doubled when the call site sits two or more loops deep. */
+#define IR_INLINE_LOOP_BODY_INSTRUCTIONS 80
 /* Self-recursion inlining: expand direct self-call sites with the current
  * body up to MAX_DEPTH rounds, stopping early once the body outgrows the
  * instruction cap (so the depth is effectively size-bounded). */
