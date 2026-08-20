@@ -193,12 +193,11 @@ int ir_symbol_is_i32_ptr_param(IRFunction *function,
     }
     return type && strcmp(type, "int32*") == 0;
   }
-  {
-    const char *type = ir_function_local_declared_type(function, symbol_name);
-    if (type && strcmp(type, "int32*") == 0 &&
-        ir_symbol_contains(symbol_name, "_param_")) {
-      return 1;
-    }
+  /* A local nothing reassigns holds one value for the whole function, which
+   * is all a walking base needs. The `_param_` name checks this replaces were
+   * the inliner-era spelling of the same property. */
+  if (ir_symbol_is_settled_local(function, symbol_name, "int32*")) {
+    return 1;
   }
   return ir_function_symbol_is_inlined_param(function, symbol_name, "int32*",
                                              "_param_src") ||
@@ -406,21 +405,44 @@ static int ir_try_vectorize_simd_scale_i32_at(IRFunction *function,
   }
 
   compare = &function->instructions[bounds.compare_index];
-  if (!ir_symbol_contains(compare->lhs.name, "_src_p") ||
-      !ir_symbol_contains(compare->rhs.name, "_src_end")) {
+  /* Pointer induction names its walkers `__ptr_<hdr>_<base>_p` against
+   * `__ptr_<hdr>_<base>_end`. The base tag carries the source's parameter
+   * NAME, so matching on `_src_p` only fired when the parameter was literally
+   * called `src`; every semantic property (loads only through src_p, stores
+   * only through dst_p, both stepped by 4, resolvable init bases) is checked
+   * below, so the names only need to prove induction created the pair. */
+  if (!ir_symbol_contains(compare->lhs.name, "__ptr_") ||
+      !ir_symbol_contains(compare->rhs.name, "__ptr_") ||
+      !ir_symbol_contains(compare->rhs.name, "_end")) {
     return 1;
   }
   src_p = compare->lhs.name;
 
-  dst_p = ir_find_ptr_step_with_suffix(function, bounds.branch_index + 1,
-                                       bounds.jump_index, 4, "_dst_p");
-  if (!dst_p || !ir_symbol_contains(dst_p, "_dst_p")) {
+  /* Exactly two pointers step by 4 in the body: the source, and the walker
+   * that must be the destination. */
+  for (size_t i = bounds.branch_index + 1; i < bounds.jump_index; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_BINARY && ins->text && strcmp(ins->text, "+") == 0 &&
+        ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name &&
+        ir_operand_is_symbol_named(&ins->lhs, ins->dest.name) &&
+        ir_operand_is_int_value(&ins->rhs, 4) &&
+        ir_symbol_contains(ins->dest.name, "__ptr_")) {
+      if (strcmp(ins->dest.name, src_p) == 0) {
+        continue;
+      }
+      if (dst_p && strcmp(dst_p, ins->dest.name) != 0) {
+        return 1;
+      }
+      dst_p = ins->dest.name;
+    }
+  }
+  if (!dst_p) {
     return 1;
   }
   {
     const char *stepped_src =
         ir_find_ptr_step_with_suffix(function, bounds.branch_index + 1,
-                                     bounds.jump_index, 4, "_src_p");
+                                     bounds.jump_index, 4, src_p);
     if (!stepped_src || strcmp(stepped_src, src_p) != 0) {
       return 1;
     }

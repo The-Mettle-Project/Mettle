@@ -271,6 +271,15 @@ static int ir_verify_minmax_preloop_init(const IRFunction *function,
       }
       continue;
     }
+    /* A pure write to a temp cannot disturb the seeds, the base, or the
+     * counter. Inlining leaves the argument's address math here (`%t <-
+     * &@arr` ahead of the parameter copy), which used to fail the walk. */
+    if (ins->dest.kind == IR_OPERAND_TEMP &&
+        (ins->op == IR_OP_ASSIGN || ins->op == IR_OP_ADDRESS_OF ||
+         ins->op == IR_OP_BINARY || ins->op == IR_OP_UNARY ||
+         ins->op == IR_OP_CAST)) {
+      continue;
+    }
     if (ir_instruction_writes_destination(ins) &&
         !ir_operand_is_symbol_named(&ins->dest, iv)) {
       return 0;
@@ -399,7 +408,8 @@ static int ir_try_vectorize_simd_minmax_i32_at(IRFunction *function,
   compare = &function->instructions[bounds.compare_index];
   iv_symbol = compare->lhs.name;
   if (!iv_symbol || !compare->rhs.name ||
-      !ir_symbol_is_sum_loop_bound(function, compare->rhs.name)) {
+      !ir_symbol_is_loop_bound(function, compare->rhs.name, header_index,
+                               bounds.jump_index)) {
     return 1;
   }
   if (!ir_ptr_induction_iv_start_value(function, header_index, iv_symbol,
@@ -519,7 +529,8 @@ static int ir_try_fuse_prefix_sum_i32_at(IRFunction *function,
   compare = &function->instructions[bounds.compare_index];
   iv_symbol = compare->lhs.name;
   if (!iv_symbol || !compare->rhs.name ||
-      !ir_symbol_is_sum_loop_bound(function, compare->rhs.name)) {
+      !ir_symbol_is_loop_bound(function, compare->rhs.name, header_index,
+                               bounds.jump_index)) {
     return 1;
   }
   if (!ir_ptr_induction_iv_start_value(function, header_index, iv_symbol,
@@ -971,10 +982,6 @@ static int ir_try_vectorize_dot_i32_at(IRFunction *function, size_t header_index
   if (!ir_operand_clone(&compare->rhs, &len)) {
     return 0;
   }
-  if (!ir_symbol_is_sum_loop_bound(function, compare->rhs.name)) {
-    ir_operand_destroy(&len);
-    return 1;
-  }
 
   for (size_t i = branch_index + 1; i < function->instruction_count; i++) {
     if (function->instructions[i].op == IR_OP_JUMP &&
@@ -989,7 +996,9 @@ static int ir_try_vectorize_dot_i32_at(IRFunction *function, size_t header_index
       break;
     }
   }
-  if (jump_index == (size_t)-1) {
+  if (jump_index == (size_t)-1 ||
+      !ir_symbol_is_loop_bound(function, compare->rhs.name, header_index,
+                               jump_index)) {
     ir_operand_destroy(&len);
     return 1;
   }
@@ -1146,10 +1155,6 @@ static int ir_try_vectorize_dot_i8_at(IRFunction *function, size_t header_index,
   if (!ir_operand_clone(&compare->rhs, &len)) {
     return 0;
   }
-  if (!ir_symbol_is_sum_loop_bound(function, compare->rhs.name)) {
-    ir_operand_destroy(&len);
-    return 1;
-  }
 
   for (size_t i = branch_index + 1; i < function->instruction_count; i++) {
     if (function->instructions[i].op == IR_OP_JUMP &&
@@ -1164,7 +1169,9 @@ static int ir_try_vectorize_dot_i8_at(IRFunction *function, size_t header_index,
       break;
     }
   }
-  if (jump_index == (size_t)-1) {
+  if (jump_index == (size_t)-1 ||
+      !ir_symbol_is_loop_bound(function, compare->rhs.name, header_index,
+                               jump_index)) {
     ir_operand_destroy(&len);
     return 1;
   }

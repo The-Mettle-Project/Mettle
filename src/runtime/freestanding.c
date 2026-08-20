@@ -446,15 +446,54 @@ __asm__(".text\n"
         "ret\n");
 #endif
 
-static char mt_environment_value[32768];
+/* One slot per distinct NAME, not one shared buffer for every call: callers
+ * routinely cache getenv's pointer (POSIX allows the value to be overwritten
+ * by a later getenv, but every real CRT keeps it stable per name, and the
+ * compiler's own pass-skip cache relied on that). The single shared buffer
+ * this replaces meant any later getenv of ANY variable silently rewrote what
+ * a cached pointer read -- METTLE_SKIP_PASS came back holding the value of
+ * whichever variable was asked for last. */
+#define MT_ENV_SLOTS 64
+#define MT_ENV_NAME_MAX 128
+#define MT_ENV_VALUE_MAX 32768
+static struct {
+  char name[MT_ENV_NAME_MAX];
+  char *value; /* heap; grows to MT_ENV_VALUE_MAX at most */
+} mt_environment_slots[MT_ENV_SLOTS];
+static mt_size mt_environment_slot_count;
 
 char *getenv(const char *name) {
-  mt_u32 length = GetEnvironmentVariableA(name, mt_environment_value,
-                                           sizeof(mt_environment_value));
-  if (length == 0 || length >= sizeof(mt_environment_value)) {
+  if (!name || strlen(name) >= MT_ENV_NAME_MAX) {
     return MT_NULL;
   }
-  return mt_environment_value;
+  mt_size slot = mt_environment_slot_count;
+  for (mt_size i = 0; i < mt_environment_slot_count; i++) {
+    if (strcmp(mt_environment_slots[i].name, name) == 0) {
+      slot = i;
+      break;
+    }
+  }
+  if (slot == mt_environment_slot_count) {
+    if (slot >= MT_ENV_SLOTS) {
+      return MT_NULL; /* more distinct names than any build ever asks for */
+    }
+  }
+  if (!mt_environment_slots[slot].value) {
+    mt_environment_slots[slot].value = malloc(MT_ENV_VALUE_MAX);
+    if (!mt_environment_slots[slot].value) {
+      return MT_NULL;
+    }
+  }
+  mt_u32 length = GetEnvironmentVariableA(name, mt_environment_slots[slot].value,
+                                          MT_ENV_VALUE_MAX);
+  if (length == 0 || length >= MT_ENV_VALUE_MAX) {
+    return MT_NULL;
+  }
+  if (slot == mt_environment_slot_count) {
+    strcpy(mt_environment_slots[slot].name, name);
+    mt_environment_slot_count++;
+  }
+  return mt_environment_slots[slot].value;
 }
 
 int putenv(char *setting) {

@@ -272,7 +272,7 @@ static int ir_function_is_inline_candidate_at(const IRFunction *function,
    * guard is a heuristic standing in for a bug, so it belongs with the
    * discretionary caps rather than with inline-asm and the missing-return
    * rule. */
-  if (!forced &&
+  if (!forced && !getenv("METTLE_INLINE_LOOPS") &&
       ((has_while_label && has_less_compare && has_greater_compare) ||
        (has_while_label && has_subtract) || (has_while_label && has_multiply))) {
     IR_INLINE_WHY(why_not, "callee-has-loop",

@@ -2478,3 +2478,88 @@ int ir_promote_loop_memory_pass(IRFunction *function, int *changed) {
   }
   return 1;
 }
+
+/* -------------------------------------------------------------------------- */
+/* One spelling per inlined parameter                                          */
+/*                                                                             */
+/* The inliner materializes `local @p; @p <- %t`, and block-local copy         */
+/* propagation then rewrites the reads of @p that share the entry block back   */
+/* to %t while the loop keeps reading @p. The recognizers compare bases by     */
+/* name, so the split spelling hides the loop from every one of them: the      */
+/* pre-loop `minv <- arr[0]` init reads %t while the body reads @p, and the    */
+/* minmax kernel sees two different arrays. Rewriting every later read of %t   */
+/* to @p restores one name. Sound because @p holds %t's value from the copy    */
+/* onward and neither is ever written again.                                   */
+/* -------------------------------------------------------------------------- */
+
+static void re_rewrite_operand_temp_to_symbol(IROperand *operand,
+                                              const char *temp,
+                                              const char *symbol,
+                                              int *changed) {
+  if (operand->kind == IR_OPERAND_TEMP && operand->name &&
+      strcmp(operand->name, temp) == 0) {
+    ir_operand_destroy(operand);
+    *operand = ir_operand_symbol(symbol);
+    if (changed) {
+      *changed = 1;
+    }
+  }
+}
+
+int ir_unify_param_copy_spelling_pass(IRFunction *function, int *changed) {
+  REDefs defs = {0};
+  IRTempValueMap addr_taken;
+
+  if (!function || function->instruction_count == 0) {
+    return 1;
+  }
+  if (!ir_temp_value_map_init(&addr_taken)) {
+    return 1;
+  }
+  defs.function = function;
+  defs.addr_taken = &addr_taken;
+  if (ir_addr_taken_set_build(function, &addr_taken) &&
+      re_collect_defs(function, &defs)) {
+    for (size_t i = 0; i < function->instruction_count; i++) {
+      const IRInstruction *copy = &function->instructions[i];
+      if (copy->op != IR_OP_ASSIGN || copy->dest.kind != IR_OPERAND_SYMBOL ||
+          !copy->dest.name || copy->lhs.kind != IR_OPERAND_TEMP ||
+          !copy->lhs.name) {
+        continue;
+      }
+      if (re_def_count(&defs, IR_OPERAND_SYMBOL, copy->dest.name) != 1 ||
+          re_def_count(&defs, IR_OPERAND_TEMP, copy->lhs.name) != 1 ||
+          re_symbol_is_aliasable(&defs, copy->dest.name)) {
+        continue;
+      }
+      char symbol[RE_NAME_MAX];
+      char temp[RE_NAME_MAX];
+      if (snprintf(symbol, sizeof(symbol), "%s", copy->dest.name) >=
+              (int)sizeof(symbol) ||
+          snprintf(temp, sizeof(temp), "%s", copy->lhs.name) >=
+              (int)sizeof(temp)) {
+        continue;
+      }
+      for (size_t j = i + 1; j < function->instruction_count; j++) {
+        IRInstruction *ins = &function->instructions[j];
+        if (ins->op == IR_OP_NOP) {
+          continue;
+        }
+        re_rewrite_operand_temp_to_symbol(&ins->lhs, temp, symbol, changed);
+        re_rewrite_operand_temp_to_symbol(&ins->rhs, temp, symbol, changed);
+        if (ins->op == IR_OP_STORE) {
+          re_rewrite_operand_temp_to_symbol(&ins->dest, temp, symbol, changed);
+        }
+        for (size_t a = 0; a < ins->argument_count; a++) {
+          re_rewrite_operand_temp_to_symbol(&ins->arguments[a], temp, symbol,
+                                            changed);
+        }
+      }
+    }
+  }
+
+  re_map_destroy(&defs.defs);
+  re_map_destroy(&defs.def_at);
+  ir_temp_value_map_destroy(&addr_taken);
+  return 1;
+}

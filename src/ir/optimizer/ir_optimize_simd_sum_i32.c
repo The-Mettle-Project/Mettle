@@ -82,9 +82,9 @@ static int ir_symbol_assigned_once(const IRFunction *function,
   return writes == 1;
 }
 
-static int ir_symbol_is_settled_local(const IRFunction *function,
-                                      const char *symbol_name,
-                                      const char *expected_type) {
+int ir_symbol_is_settled_local(const IRFunction *function,
+                               const char *symbol_name,
+                               const char *expected_type) {
   const char *type = ir_function_local_declared_type(function, symbol_name);
   if (!type || (expected_type && strcmp(type, expected_type) != 0)) {
     return 0;
@@ -97,6 +97,35 @@ int ir_symbol_is_sum_loop_bound(const IRFunction *function,
   return ir_function_symbol_is_parameter(function, symbol_name) ||
          ir_symbol_is_settled_local(function, symbol_name, "int32") ||
          ir_symbol_is_settled_local(function, symbol_name, "int64");
+}
+
+/* The per-loop version: a bound only has to hold still for THIS loop's
+ * duration. A counter the enclosing loop advances between entries -- the
+ * usual shape of a length-sweeping test driver -- is a perfectly good bound
+ * for the inner loop it feeds, and the fused kernel reads it at the same
+ * point the scalar compare would have. */
+int ir_symbol_is_loop_bound(const IRFunction *function,
+                            const char *symbol_name, size_t header_index,
+                            size_t jump_index) {
+  if (ir_symbol_is_sum_loop_bound(function, symbol_name)) {
+    return 1;
+  }
+  {
+    const char *type = ir_function_local_declared_type(function, symbol_name);
+    if (!type || (strcmp(type, "int32") != 0 && strcmp(type, "int64") != 0)) {
+      return 0;
+    }
+  }
+  for (size_t i = header_index; i <= jump_index &&
+                                i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ir_instruction_writes_destination(ins) &&
+        ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name &&
+        strcmp(ins->dest.name, symbol_name) == 0) {
+      return 0;
+    }
+  }
+  return 1;
 }
 
 int ir_symbol_is_sum_array_base(const IRFunction *function,
@@ -233,11 +262,8 @@ static int ir_try_vectorize_sum_i32_at(IRFunction *function, size_t header_index
   exit_label = branch->text;
 
   /* A literal trip count is as good a bound as a symbol: the kernel takes
-   * the count as an operand either way. */
-  if (compare->rhs.kind == IR_OPERAND_SYMBOL &&
-      !ir_symbol_is_sum_loop_bound(function, compare->rhs.name)) {
-    return 1;
-  }
+   * the count as an operand either way. The bound only has to hold still for
+   * THIS loop, so the range-aware check runs once the latch is known. */
 
   for (size_t i = branch_index + 1; i < function->instruction_count; i++) {
     if (function->instructions[i].op == IR_OP_JUMP &&
@@ -253,6 +279,11 @@ static int ir_try_vectorize_sum_i32_at(IRFunction *function, size_t header_index
     }
   }
   if (jump_index == (size_t)-1) {
+    return 1;
+  }
+  if (compare->rhs.kind == IR_OPERAND_SYMBOL &&
+      !ir_symbol_is_loop_bound(function, compare->rhs.name, header_index,
+                               jump_index)) {
     return 1;
   }
   if (!ir_fused_loop_exit_is_adjacent(function, jump_index, exit_label)) {
@@ -581,11 +612,8 @@ static int ir_try_vectorize_sum_u8_at(IRFunction *function, size_t header_index,
   exit_label = branch->text;
 
   /* A literal trip count is as good a bound as a symbol: the kernel takes
-   * the count as an operand either way. */
-  if (compare->rhs.kind == IR_OPERAND_SYMBOL &&
-      !ir_symbol_is_sum_loop_bound(function, compare->rhs.name)) {
-    return 1;
-  }
+   * the count as an operand either way. The bound only has to hold still for
+   * THIS loop, so the range-aware check runs once the latch is known. */
   if (!ir_iv_zero_at_header(function, header_index, iv_symbol)) {
     return 1;
   }
@@ -604,6 +632,11 @@ static int ir_try_vectorize_sum_u8_at(IRFunction *function, size_t header_index,
     }
   }
   if (jump_index == (size_t)-1) {
+    return 1;
+  }
+  if (compare->rhs.kind == IR_OPERAND_SYMBOL &&
+      !ir_symbol_is_loop_bound(function, compare->rhs.name, header_index,
+                               jump_index)) {
     return 1;
   }
   if (!ir_fused_loop_exit_is_adjacent(function, jump_index, exit_label)) {
@@ -822,11 +855,8 @@ static int ir_try_vectorize_byte_map_at(IRFunction *function,
   exit_label = branch->text;
 
   /* A literal trip count is as good a bound as a symbol: the kernel takes
-   * the count as an operand either way. */
-  if (compare->rhs.kind == IR_OPERAND_SYMBOL &&
-      !ir_symbol_is_sum_loop_bound(function, compare->rhs.name)) {
-    return 1;
-  }
+   * the count as an operand either way. The bound only has to hold still for
+   * THIS loop, so the range-aware check runs once the latch is known. */
   if (!ir_iv_zero_at_header(function, header_index, iv_symbol)) {
     return 1;
   }
@@ -846,6 +876,11 @@ static int ir_try_vectorize_byte_map_at(IRFunction *function,
   }
   if (jump_index == (size_t)-1 ||
       ir_loop_body_is_unclaimable(function, branch_index + 1, jump_index)) {
+    return 1;
+  }
+  if (compare->rhs.kind == IR_OPERAND_SYMBOL &&
+      !ir_symbol_is_loop_bound(function, compare->rhs.name, header_index,
+                               jump_index)) {
     return 1;
   }
   if (!ir_fused_loop_exit_is_adjacent(function, jump_index, exit_label)) {

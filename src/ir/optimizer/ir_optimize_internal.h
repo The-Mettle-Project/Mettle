@@ -463,6 +463,9 @@ int ir_widen_subword_load_cast_pass(IRFunction *function, int *changed);
 int ir_hoist_invariant_loads_pass(IRFunction *function, int *changed);
 /* Run a loop's only may-aliased memory word in a local; store back on exit. */
 int ir_promote_loop_memory_pass(IRFunction *function, int *changed);
+/* Spell every later read of an inlined parameter copy's source temp through
+ * the parameter local, so recognizers see one base name. */
+int ir_unify_param_copy_spelling_pass(IRFunction *function, int *changed);
 int ir_find_label_index(const IRFunction *function, const char *label,
                                size_t *out_index);
 int ir_find_last_writer_before(const IRFunction *function, size_t before_index,
@@ -955,6 +958,14 @@ int ir_symbol_is_i32_ptr_param(IRFunction *function,
                                       const char *symbol_name);
 int ir_symbol_is_sum_array_base(const IRFunction *function,
                                        const char *symbol_name);
+/* A local of `expected_type` assigned exactly once: holds one value for the
+ * whole function, like a parameter. */
+int ir_symbol_is_settled_local(const IRFunction *function,
+                               const char *symbol_name,
+                               const char *expected_type);
+int ir_symbol_is_loop_bound(const IRFunction *function,
+                            const char *symbol_name, size_t header_index,
+                            size_t jump_index);
 int ir_symbol_is_sum_loop_bound(const IRFunction *function,
                                        const char *symbol_name);
 int ir_symbol_read_after(const IRFunction *function, size_t start_index,

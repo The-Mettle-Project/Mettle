@@ -85,6 +85,8 @@ static const IROptNamedPass g_ir_pre_inline_recognizers[] = {
  * inlining plants a fresh declaration per parameter of every call it folded
  * into a body. */
 static const IROptNamedPass g_ir_loop_canonical_passes[] = {
+    {"unify_param_copy_spelling", ir_unify_param_copy_spelling_pass,
+     IR_GATE_LOOP},
     {"hoist_body_locals", ir_hoist_body_locals_pass, IR_GATE_LOOP},
     {"hoist_global_bases", ir_hoist_global_bases_pass, IR_GATE_LOOP},
     {"hoist_row_pointers", ir_hoist_row_pointers_pass, IR_GATE_LOOP},

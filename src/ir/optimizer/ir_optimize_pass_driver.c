@@ -169,7 +169,10 @@ static int ir_skip_spec_matches(const char *id_text, const char *pass_name) {
   static const char *spec = NULL;
   static int fetched = 0;
   if (!fetched) {
-    spec = getenv("METTLE_SKIP_PASS");
+    /* Own the string: POSIX lets a later getenv overwrite the buffer, and the
+     * freestanding runtime's used to. */
+    const char *raw = getenv("METTLE_SKIP_PASS");
+    spec = raw ? mettle_strdup(raw) : NULL;
     fetched = 1;
   }
   if (!spec || !*spec) {
@@ -249,6 +252,11 @@ static int ir_run_named_pass(IRFunction *function, const IROptNamedPass *pass,
   if (ir_pass_name_is_skipped(pass->name)) {
     ir_trace_pass_event(pass->name, "skipped", NULL, -1);
     return 1;
+  }
+  if (getenv("METTLE_PI_TRACE") && strcmp(pass->name, "induction_pointer") == 0) {
+    fprintf(stderr, "[drv] running %s skipflag=%d env=%s\n", pass->name,
+            ir_pass_name_is_skipped(pass->name),
+            getenv("METTLE_SKIP_PASS") ? getenv("METTLE_SKIP_PASS") : "-");
   }
 
   if (ir_verify_pass_quarantined(function, pass->name)) {

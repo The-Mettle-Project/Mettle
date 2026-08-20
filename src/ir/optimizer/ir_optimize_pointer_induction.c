@@ -356,15 +356,23 @@ static int ir_ptr_induction_rewrite_instruction(
   return 1;
 }
 
+/* `keep_iv` converts the bound accesses while leaving the counter machinery
+ * in place: the increment and the iv-fed shifts stay, and whatever becomes
+ * unread dies in the ordinary dead-temp sweep. The sound way to convert a
+ * loop where something else still reads the counter (a reversed index, a
+ * stored counter value); deleting the increment used to freeze it. */
 static int ir_ptr_induction_should_drop_body_insn(
     const IRInstruction *ins, const IRPtrBaseBinding *bindings,
-    size_t binding_count, const char *iv_symbol) {
+    size_t binding_count, const char *iv_symbol, int keep_iv) {
   if (!ins || !iv_symbol) {
     return 0;
   }
   if (ins->dest.kind == IR_OPERAND_TEMP && ins->dest.name &&
       ir_ptr_lookup_addr_temp(bindings, binding_count, ins->dest.name)) {
     return 1;
+  }
+  if (keep_iv) {
+    return 0;
   }
   if (ins->op == IR_OP_BINARY && ins->text && strcmp(ins->text, "<<") == 0 &&
       ir_operand_is_symbol_named(&ins->lhs, iv_symbol)) {
@@ -376,6 +384,93 @@ static int ir_ptr_induction_should_drop_body_insn(
     return 1;
   }
   return 0;
+}
+
+/* True when this instruction's value can only reach the address temps the
+ * transform deletes: a pure temp-producer whose every reader, transitively,
+ * is dropped or is such a producer itself. Anything observable -- a symbol
+ * write, a store of the value, a read outside the loop -- keeps the counter
+ * alive and refuses the conversion. */
+static int ir_ptr_iv_chain_dies_in_drops(const IRFunction *function,
+                                         size_t body_start, size_t body_end,
+                                         const IRPtrBaseBinding *bindings,
+                                         size_t binding_count,
+                                         const char *iv_symbol,
+                                         const IRInstruction *producer,
+                                         int depth) {
+  if (depth > 8) {
+    return 0;
+  }
+  if (producer->dest.kind != IR_OPERAND_TEMP || !producer->dest.name) {
+    return 0;
+  }
+  switch (producer->op) {
+  case IR_OP_BINARY:
+  case IR_OP_UNARY:
+  case IR_OP_CAST:
+  case IR_OP_ASSIGN:
+    break;
+  default:
+    return 0;
+  }
+  const char *temp = producer->dest.name;
+  for (size_t j = 0; j < function->instruction_count; j++) {
+    const IRInstruction *reader = &function->instructions[j];
+    int reads = (reader->lhs.kind == IR_OPERAND_TEMP && reader->lhs.name &&
+                 strcmp(reader->lhs.name, temp) == 0) ||
+                (reader->rhs.kind == IR_OPERAND_TEMP && reader->rhs.name &&
+                 strcmp(reader->rhs.name, temp) == 0) ||
+                (reader->op == IR_OP_STORE &&
+                 reader->dest.kind == IR_OPERAND_TEMP && reader->dest.name &&
+                 strcmp(reader->dest.name, temp) == 0);
+    for (size_t a = 0; !reads && a < reader->argument_count; a++) {
+      reads = reader->arguments[a].kind == IR_OPERAND_TEMP &&
+              reader->arguments[a].name &&
+              strcmp(reader->arguments[a].name, temp) == 0;
+    }
+    if (!reads || reader == producer) {
+      continue;
+    }
+    if (j < body_start || j >= body_end) {
+      return 0; /* the value escapes the loop */
+    }
+    /* A store is never dropped, only retargeted: its ADDRESS read disappears
+     * when the address is a bound temp, but its VALUE is observable. */
+    if (reader->op == IR_OP_STORE) {
+      int as_value =
+          (reader->lhs.kind == IR_OPERAND_TEMP && reader->lhs.name &&
+           strcmp(reader->lhs.name, temp) == 0);
+      int as_bound_address =
+          (reader->dest.kind == IR_OPERAND_TEMP && reader->dest.name &&
+           strcmp(reader->dest.name, temp) == 0 &&
+           ir_ptr_lookup_addr_temp(bindings, binding_count,
+                                   reader->dest.name) != NULL);
+      if (as_value || !as_bound_address) {
+        return 0;
+      }
+      continue;
+    }
+    /* Same for a load: its address read is replaced when bound. */
+    if (reader->op == IR_OP_LOAD) {
+      if (reader->lhs.kind == IR_OPERAND_TEMP && reader->lhs.name &&
+          strcmp(reader->lhs.name, temp) == 0 &&
+          ir_ptr_lookup_addr_temp(bindings, binding_count,
+                                  reader->lhs.name) != NULL) {
+        continue;
+      }
+      return 0;
+    }
+    if (ir_ptr_induction_should_drop_body_insn(reader, bindings, binding_count,
+                                               iv_symbol, 0)) {
+      continue;
+    }
+    if (!ir_ptr_iv_chain_dies_in_drops(function, body_start, body_end,
+                                       bindings, binding_count, iv_symbol,
+                                       reader, depth + 1)) {
+      return 0;
+    }
+  }
+  return 1;
 }
 
 static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index,
@@ -397,6 +492,7 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
   long long iv_start = 0;
 
   if (!function || !ir_find_while_loop_bounds(function, header_index, &bounds)) {
+    if (getenv("METTLE_PI_TRACE")) fprintf(stderr, "[pi] bail L%d fn=%s hdr=%s\n", __LINE__, function->name?function->name:"?", function->instructions[header_index].text);
     return 1;
   }
 
@@ -410,7 +506,9 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
   iv_symbol = compare->lhs.name;
   if (!iv_symbol || compare->rhs.kind != IR_OPERAND_SYMBOL ||
       !compare->rhs.name ||
-      !ir_symbol_is_sum_loop_bound(function, compare->rhs.name)) {
+      !ir_symbol_is_loop_bound(function, compare->rhs.name, header_index,
+                               bounds.jump_index)) {
+    if (getenv("METTLE_PI_TRACE")) fprintf(stderr, "[pi] bail L%d fn=%s hdr=%s\n", __LINE__, function->name?function->name:"?", function->instructions[header_index].text);
     return 1;
   }
   bound_symbol = compare->rhs.name;
@@ -418,6 +516,7 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
   if (!ir_ptr_induction_iv_start_value(function, header_index, iv_symbol,
                                        &iv_start) ||
       iv_start != 0) {
+    if (getenv("METTLE_PI_TRACE")) fprintf(stderr, "[pi] bail L%d fn=%s hdr=%s\n", __LINE__, function->name?function->name:"?", function->instructions[header_index].text);
     return 1;
   }
 
@@ -430,10 +529,12 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
   }
   if (!ir_try_parse_direct_unit_increment(
           &function->instructions[increment_index], iv_symbol)) {
+    if (getenv("METTLE_PI_TRACE")) fprintf(stderr, "[pi] bail L%d fn=%s hdr=%s\n", __LINE__, function->name?function->name:"?", function->instructions[header_index].text);
     return 1;
   }
 
   if (ir_loop_body_is_unclaimable(function, body_start, body_end)) {
+    if (getenv("METTLE_PI_TRACE")) fprintf(stderr, "[pi] bail L%d fn=%s hdr=%s\n", __LINE__, function->name?function->name:"?", function->instructions[header_index].text);
     return 1;
   }
 
@@ -461,6 +562,7 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
       }
     }
     if (loop_has_reduction && !loop_has_store) {
+      if (getenv("METTLE_PI_TRACE")) fprintf(stderr, "[pi] bail L%d fn=%s hdr=%s\n", __LINE__, function->name?function->name:"?", function->instructions[header_index].text);
       return 1;
     }
   }
@@ -472,12 +574,14 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
    * refuses (division, casts to narrow ints, over-budget DAGs, ...) still
    * get the pointer walk. */
   if (ir_auto_vectorize_int_claimable(function, header_index)) {
+    if (getenv("METTLE_PI_TRACE")) fprintf(stderr, "[pi] bail L%d fn=%s hdr=%s\n", __LINE__, function->name?function->name:"?", function->instructions[header_index].text);
     return 1;
   }
 
   /* Same for early-exit search loops the find skip-ahead claims: it needs the
    * indexed `a + (iv << 2)` / `a + iv` form to recognize the predicate. */
   if (ir_auto_vectorize_find_claimable(function, header_index)) {
+    if (getenv("METTLE_PI_TRACE")) fprintf(stderr, "[pi] bail L%d fn=%s hdr=%s\n", __LINE__, function->name?function->name:"?", function->instructions[header_index].text);
     return 1;
   }
 
@@ -526,13 +630,44 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
       }
     }
   }
-
-  if (has_unconvertible_iv_access) {
-    ir_ptr_bindings_destroy(bindings, binding_count);
-    return 1;
+  /* The counter is deleted along with its increment, so nothing may read it
+   * except computation that dies into the dropped address temps. When
+   * something else DOES read it -- a reversed index chain, a stored counter
+   * value -- the loop still converts, but in keep-the-counter mode: the
+   * increment and iv-fed shifts stay, and only the bound address producers
+   * are dropped. Previously such loops either froze the counter (a stored
+   * `i * 2` went stale: the gather test's silent miscompile) or bailed. */
+  int keep_iv = has_unconvertible_iv_access;
+  for (size_t i = body_start; i < body_end && !keep_iv; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_NOP ||
+        ir_ptr_induction_should_drop_body_insn(ins, bindings, binding_count,
+                                               iv_symbol, 0)) {
+      continue;
+    }
+    int reads_iv = ir_operand_is_symbol_named(&ins->lhs, iv_symbol) ||
+                   ir_operand_is_symbol_named(&ins->rhs, iv_symbol) ||
+                   (ins->op == IR_OP_STORE &&
+                    ir_operand_is_symbol_named(&ins->dest, iv_symbol));
+    for (size_t a = 0; !reads_iv && a < ins->argument_count; a++) {
+      reads_iv = ir_operand_is_symbol_named(&ins->arguments[a], iv_symbol);
+    }
+    if (reads_iv &&
+        !ir_ptr_iv_chain_dies_in_drops(function, body_start, body_end,
+                                       bindings, binding_count, iv_symbol,
+                                       ins, 0)) {
+      if (getenv("METTLE_PI_TRACE")) {
+        fprintf(stderr, "[pi] keeping iv: reader at %zu op=%d text=%s\n",
+                i, (int)ins->op, ins->text ? ins->text : "-");
+      }
+      keep_iv = 1;
+    }
   }
 
+
+
   if (binding_count == 0) {
+    if (getenv("METTLE_PI_TRACE")) fprintf(stderr, "[pi] bail L%d fn=%s hdr=%s\n", __LINE__, function->name?function->name:"?", function->instructions[header_index].text);
     return 1;
   }
 
@@ -679,7 +814,8 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
 
     if (i >= body_start && i < body_end &&
         ir_ptr_induction_should_drop_body_insn(&rewritten, bindings,
-                                               binding_count, iv_symbol)) {
+                                               binding_count, iv_symbol,
+                                               keep_iv)) {
       ir_instruction_destroy_storage(&rewritten);
       continue;
     }
@@ -705,12 +841,19 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
   if (changed) {
     *changed = 1;
   }
+  if (getenv("METTLE_PI_TRACE")) fprintf(stderr, "[pi] bail L%d fn=%s hdr=%s\n", __LINE__, function->name?function->name:"?", function->instructions[header_index].text);
   return 1;
 }
 
 int ir_pointer_induction_pass(IRFunction *function, int *changed) {
   if (!function) {
     return 0;
+  }
+  if (getenv("METTLE_PI_TRACE")) {
+    fprintf(stderr, "[pi] PASS ENTRY fn=%s skipflag=%d env=%s\n",
+            function->name ? function->name : "?",
+            ir_pass_name_is_skipped("induction_pointer"),
+            getenv("METTLE_SKIP_PASS") ? getenv("METTLE_SKIP_PASS") : "-");
   }
 
   for (int iteration = 0; iteration < 16; iteration++) {
