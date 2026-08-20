@@ -672,12 +672,13 @@ static const DecisionDoc DECISIONS[] = {
      "\n"
      "A structural guard: @inline does not override it.\n"},
     {"callee-has-loop", DECISION_INLINE_REFUSAL,
-     "The callee contains a loop the inliner declines",
-     "A compiler limitation, not a problem in your code.\n"
+     "The callee contains a loop the inliner declines by default",
+     "A heuristic standing in for a latent optimizer bug. Lifting it costs\n"
+     "vectorization: inlining runs before the recognizers, and several\n"
+     "exact-shape kernels stop matching a loop that arrives inlined.\n"
      "\n"
-     "The cost is small either way: next to a loop, the call that reaches it\n"
-     "is noise. Where the loop is hot, look at its own remark instead. That is\n"
-     "where the time goes.\n"},
+     "@inline inlines it anyway. Where the loop is hot, look at its own\n"
+     "remark first: that is usually where the time goes.\n"},
     {"callee-no-return",  DECISION_INLINE_REFUSAL,
      "The callee has no return instruction to rewrite",
      "Inlining works by rewriting the callee's returns into assignments in the\n"

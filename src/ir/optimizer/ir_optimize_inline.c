@@ -149,11 +149,10 @@ static int ir_function_is_inline_candidate(const IRFunction *function,
     *fix = "remove @noinline if inlining is wanted here";
     return 0;
   }
-  /* `@inline` forces the function past the discretionary heuristics below
-   * (the name denylist, the parameter/size/call-count caps), but never past
-   * the structural correctness guards: inline-asm, the loop-shape guards that
-   * work around a latent optimizer bug, and the must-have-a-return rule still
-   * apply. */
+  /* `@inline` forces the function past the discretionary heuristics below --
+   * the name denylist, the parameter/size/call-count caps, and the loop-shape
+   * guard -- but never past the structural correctness guards: inline-asm and
+   * the must-have-a-return rule still apply. */
   int forced = function->is_inline;
   size_t body_budget = ir_opt_inline_body_budget(function);
   size_t nested_call_budget = ir_opt_inline_nested_call_budget(function);
@@ -251,16 +250,24 @@ static int ir_function_is_inline_candidate(const IRFunction *function,
     }
   }
 
-  /* The original errdefer-label/branch caps were rejecting useful inlines
-   * (notably pattern_matches inside the grep loop). The labels and branches
-   * inline correctly via the generic label-rename map; the cap was just
-   * working around a latent bug elsewhere in the optimizer. */
-  if ((has_while_label && has_less_compare && has_greater_compare) ||
-      (has_while_label && has_subtract) || (has_while_label && has_multiply)) {
+  /* A loop-bearing callee is refused when its body mentions `-`, `*`, or both
+   * `<` and `>`: a textual proxy for a latent optimizer bug, kept because
+   * lifting it costs vectorization. Inlining runs before the recognizers, and
+   * a claimed loop that arrives already inlined stops matching several of the
+   * exact-shape kernels (minmax_i32, scale_i32, byte_map all went scalar when
+   * this was replaced by a size budget).
+   *
+   * `@inline` now overrides it, which is what the decorator documents. The
+   * guard is a heuristic standing in for a bug, so it belongs with the
+   * discretionary caps rather than with inline-asm and the missing-return
+   * rule. */
+  if (!forced &&
+      ((has_while_label && has_less_compare && has_greater_compare) ||
+       (has_while_label && has_subtract) || (has_while_label && has_multiply))) {
     IR_INLINE_WHY(why_not, "callee-has-loop",
-                  "the callee contains a loop the inliner currently declines "
-                  "(a compiler limitation, not a problem in your code; the call "
-                  "itself costs little next to the loop inside it)");
+                  "the callee contains a loop the inliner declines by default "
+                  "(the call itself costs little next to the loop inside it)");
+    *fix = "mark the callee @inline to inline it anyway";
     return 0;
   }
   if (!has_return) {

@@ -369,10 +369,11 @@ $cases = @(
       # required changes
       'use int32 elements and declare the accumulator as int64',
       'verified: simulated that fix and re-ran the optimizer: this loop then vectorizes -> vpaddd',
-      # call-in-body where the advice is DISPROVEN: the callee contains a
-      # loop the inliner structurally declines, so the simulation withdraws
-      # the @inline suggestion and says the driver loop is correctly scalar
-      'each iteration calls `row_scale`, and `@inline` cannot help: the callee contains a loop',
+      # call-in-body where the advice is DISPROVEN: @inline overrides the
+      # loop-shape guard, so the simulation really inlines the callee, finds
+      # the loop nested, withdraws the suggestion, and says the driver loop is
+      # correctly scalar
+      'each iteration calls `row_scale`; even with it inlined, its loops would land in this body',
       # advice that says there is nothing to change is labelled a note,
       # not a fix, and never reaches the "where to start" ranking
       'note: nothing to change on this line: this loop is a driver'
