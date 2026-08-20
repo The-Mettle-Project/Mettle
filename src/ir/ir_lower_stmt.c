@@ -504,6 +504,22 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
       if (!assign_type && assignment->value) {
         assign_type = assignment->value->resolved_type;
       }
+      /* The decay reads the target's DECLARED type, which the fallback above
+       * cannot supply: a local's scope is gone by lowering time, so the symbol
+       * lookup misses and `assign_type` becomes the value's own type, which
+       * for an array is the array and would hide the decay. The binding keeps
+       * the declared spelling. */
+      Type *decay_target =
+          ir_lookup_symbol_type(context, assignment->variable_name);
+      if (!decay_target && binding) {
+        decay_target = ir_resolve_named_type(context, binding->type_text);
+      }
+      if (ir_should_decay_array_to_address(decay_target, assignment->value) &&
+          !ir_decay_array_operand_to_address(context, function, &value,
+                                             assignment->value->location)) {
+        ir_operand_destroy(&value);
+        return 0;
+      }
       if (ir_should_coerce_string_to_cstring(context, assign_type,
                                              assignment->value) &&
           !ir_coerce_string_operand_to_cstring(
@@ -577,6 +593,14 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
       ir_operand_destroy(&address);
       ir_operand_destroy(&value);
       ir_set_error(context, "Cannot assign to unknown target type");
+      return 0;
+    }
+
+    if (ir_should_decay_array_to_address(target_type, assignment->value) &&
+        !ir_decay_array_operand_to_address(context, function, &value,
+                                           assignment->value->location)) {
+      ir_operand_destroy(&address);
+      ir_operand_destroy(&value);
       return 0;
     }
 
@@ -840,6 +864,12 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
       }
       Type *return_type =
           ir_resolve_named_type(context, context->current_return_type_name);
+      if (ir_should_decay_array_to_address(return_type, ret->value) &&
+          !ir_decay_array_operand_to_address(context, function, &value,
+                                             ret->value->location)) {
+        ir_operand_destroy(&value);
+        return 0;
+      }
       if (ir_should_coerce_string_to_cstring(context, return_type,
                                              ret->value) &&
           !ir_coerce_string_operand_to_cstring(context, function, &value,

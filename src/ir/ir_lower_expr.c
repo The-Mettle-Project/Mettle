@@ -653,13 +653,31 @@ int ir_lower_call_expression(IRLoweringContext *context,
 
   /* Give width-less float literal arguments the declared parameter precision
    * so a float32 parameter receives a single-precision value, not a truncated
-   * double. Only direct calls expose declared parameter types. */
+   * double, and hand an array argument its address rather than its bytes. */
+  Type **call_param_types = NULL;
+  size_t call_param_count = 0;
   if (callee_symbol && callee_symbol->kind == SYMBOL_FUNCTION) {
-    size_t typed = callee_symbol->data.function.parameter_count;
+    call_param_types = callee_symbol->data.function.parameter_types;
+    call_param_count = callee_symbol->data.function.parameter_count;
+  } else if (is_func_ptr_var) {
+    /* A call through a function-pointer variable names no callee symbol, so
+     * the signature comes from the variable's own type. A local's scope is
+     * gone by lowering time, so its declared spelling comes from the binding. */
+    const IRLocalBinding *fp_binding =
+        ir_local_binding_find(context, call->function_name);
+    Type *fp_type = ir_lookup_symbol_type(context, call->function_name);
+    if (!fp_type && fp_binding) {
+      fp_type = ir_resolve_named_type(context, fp_binding->type_text);
+    }
+    if (fp_type && fp_type->kind == TYPE_FUNCTION_POINTER) {
+      call_param_types = fp_type->fn_param_types;
+      call_param_count = fp_type->fn_param_count;
+    }
+  }
+  if (call_param_types) {
+    size_t typed = call_param_count;
     for (size_t i = 0; i < call->argument_count && i < typed; i++) {
-      Type *ptype = callee_symbol->data.function.parameter_types
-                        ? callee_symbol->data.function.parameter_types[i]
-                        : NULL;
+      Type *ptype = call_param_types[i];
       if (ir_should_decay_array_to_address(ptype, call->arguments[i])) {
         if (!ir_decay_array_operand_to_address(
                 context, function, &arguments[i],
@@ -1942,6 +1960,19 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
       for (size_t i = 0; i < fp_call->argument_count &&
                          i < func_type->fn_param_count;
            i++) {
+        if (ir_should_decay_array_to_address(func_type->fn_param_types[i],
+                                             fp_call->arguments[i]) &&
+            !ir_decay_array_operand_to_address(
+                context, function, &arguments[i],
+                fp_call->arguments[i]->location)) {
+          for (size_t j = 0; j < fp_call->argument_count; j++) {
+            ir_operand_destroy(&arguments[j]);
+          }
+          free(arguments);
+          ir_operand_destroy(&func_ptr);
+          ir_operand_destroy(&destination);
+          return 0;
+        }
         if (ir_should_coerce_string_to_cstring(
                 context, func_type->fn_param_types[i], fp_call->arguments[i]) &&
             !ir_coerce_string_operand_to_cstring(
