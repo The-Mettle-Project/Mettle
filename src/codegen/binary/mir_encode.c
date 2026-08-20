@@ -947,7 +947,8 @@ static int mir_emit_preserve_volatiles(MirFunction *fn, const MirInst *in,
  * scalar-memory SSE encoders are needed. */
 static int xmm_spill_load(MirFunction *fn, const MirVreg *v,
                           BinaryXmmRegister target) {
-  unsigned char prefix = (v->width == 4) ? 0xF3 : 0xF2;
+  unsigned char prefix =
+      (v->width == 16) ? 0x66 : ((v->width == 4) ? 0xF3 : 0xF2);
   return simd_emit_prefixed_xmm_mem_disp(&fn->context->code, prefix, 0x10,
                                          target, frame_base(fn),
                                          frame_disp(fn, -v->spill_offset));
@@ -955,7 +956,8 @@ static int xmm_spill_load(MirFunction *fn, const MirVreg *v,
 
 static int xmm_spill_store(MirFunction *fn, const MirVreg *v,
                            BinaryXmmRegister src) {
-  unsigned char prefix = (v->width == 4) ? 0xF3 : 0xF2;
+  unsigned char prefix =
+      (v->width == 16) ? 0x66 : ((v->width == 4) ? 0xF3 : 0xF2);
   return simd_emit_prefixed_xmm_mem_disp(&fn->context->code, prefix, 0x11, src,
                                          frame_base(fn),
                                          frame_disp(fn, -v->spill_offset));
@@ -1053,6 +1055,17 @@ static int sse_arith(MirFunction *fn, MirOpcode op, int width,
  * them; the VEX form names all three registers, so no copy exists to elide.
  * VEX.128/LIG writes zero the upper lanes, so mixing with the surrounding
  * legacy-SSE code carries no transition penalty. */
+/* One VEX.128 xmm three-operand instruction: reg = dst, vvvv = a, rm = b. */
+static int vex_xmm_3op(MirFunction *fn, int pp, unsigned char opcode,
+                       BinaryXmmRegister dst, BinaryXmmRegister a,
+                       BinaryXmmRegister b) {
+  BinaryCodeBuffer *code = &fn->context->code;
+  return wcs_vex3(code, 1, pp, 0, 0, (int)dst, (int)b, (int)a) &&
+         binary_code_buffer_append_u8(code, opcode) &&
+         binary_code_buffer_append_u8(
+             code, (unsigned char)(0xC0 | ((dst & 7) << 3) | (b & 7)));
+}
+
 static int vex_scalar_arith(MirFunction *fn, MirOpcode op, int width,
                             BinaryXmmRegister dst, BinaryXmmRegister a,
                             BinaryXmmRegister b) {
@@ -1064,13 +1077,9 @@ static int vex_scalar_arith(MirFunction *fn, MirOpcode op, int width,
   case MIR_FDIV: opcode = 0x5E; break;
   default: return 0;
   }
-  BinaryCodeBuffer *code = &fn->context->code;
-  /* map 0F, pp = F3 (ss) / F2 (sd), L=0, W=0; reg = dst, vvvv = a, rm = b. */
-  return wcs_vex3(code, 1, width == 4 ? 2 : 3, 0, 0, (int)dst, (int)b,
-                  (int)a) &&
-         binary_code_buffer_append_u8(code, opcode) &&
-         binary_code_buffer_append_u8(
-             code, (unsigned char)(0xC0 | ((dst & 7) << 3) | (b & 7)));
+  /* pp: F3 (ss) at width 4, F2 (sd) at width 8, 66 (pd, both lanes) at 16. */
+  return vex_xmm_3op(fn, width == 16 ? 1 : (width == 4 ? 2 : 3), opcode, dst,
+                     a, b);
 }
 
 static int encode_fbinop(MirFunction *fn, const MirInst *in) {
@@ -1206,7 +1215,8 @@ static int encode_mov(MirFunction *fn, const MirInst *in) {
   if (in->is_float) {
     int ok;
     int w = in->width;
-    unsigned char prefix = (w == 4) ? 0xF3 : 0xF2; /* movss / movsd */
+    /* movss / movsd; movupd for a 16-byte pair (unaligned-safe). */
+    unsigned char prefix = (w == 16) ? 0x66 : ((w == 4) ? 0xF3 : 0xF2);
     if (in->a.kind == MIR_OPK_MEM) {
       /* float LOAD: movss/movsd dst <- [base + disp], straight into dst's
        * register. This path has no scaled-index form; the lowering never builds
@@ -2234,6 +2244,32 @@ int mir_encode(MirFunction *fn) {
     case MIR_STORE_GLOBAL:
       ok = encode_store_global(fn, in);
       break;
+    case MIR_FDUP:
+    case MIR_FEXTHI: {
+      /* vmovddup dst,a / vunpckhpd dst,a,a: whole-register writes, so a
+       * spilled destination stages through FSCRATCH_A like any float op. */
+      int lok;
+      BinaryXmmRegister D;
+      int dst_in_reg = dst_is_xmm_reg(fn, &in->dst, &D);
+      if (!dst_in_reg) {
+        D = FSCRATCH_A;
+      }
+      BinaryXmmRegister aval = xmm_value(fn, &in->a, FSCRATCH_B, in->width,
+                                         &lok);
+      if (!lok) {
+        ok = enc_err(fn, "out of memory in lane op");
+        break;
+      }
+      int done = (in->op == MIR_FDUP)
+                     ? vex_xmm_3op(fn, 3, 0x12, D, 0, aval)
+                     : vex_xmm_3op(fn, 1, 0x15, D, aval, aval);
+      if (!done) {
+        ok = enc_err(fn, "out of memory in lane op");
+        break;
+      }
+      ok = dst_in_reg ? 1 : xmm_store(fn, &in->dst, FSCRATCH_A, in->width);
+      break;
+    }
     case MIR_FADD:
     case MIR_FSUB:
     case MIR_FMUL:

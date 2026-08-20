@@ -1417,7 +1417,7 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
     }
     uint32_t avail = mask[v] & ~used;
     if (avail == 0) {
-      *next_spill += 8;
+      *next_spill += vr->width > 8 ? 16 : 8;
       vr->assigned = 1;
       vr->in_register = 0;
       vr->spill_offset = *next_spill;
@@ -1672,6 +1672,8 @@ static int mir_op_pure_def(MirOpcode op) {
   case MIR_FSUB:
   case MIR_FMUL:
   case MIR_FDIV:
+  case MIR_FDUP:
+  case MIR_FEXTHI:
   case MIR_CVTSI2F:
   case MIR_CVTF2SI:
   case MIR_CVTF2F:
@@ -2041,7 +2043,7 @@ int mir_regalloc(MirFunction *fn) {
     /* Cross-call values that found no callee-saved register simply spill, they
      * must not steal a volatile register (it would be clobbered by the call). */
     if (cv->crosses_call) {
-      next_spill_offset += 8;
+      next_spill_offset += cv->width > 8 ? 16 : 8;
       cv->assigned = 1;
       cv->in_register = 0;
       cv->spill_offset = next_spill_offset;
@@ -2100,7 +2102,7 @@ int mir_regalloc(MirFunction *fn) {
       /* Steal the victim's register; spill the victim. */
       MirVreg *vv = &fn->vregs[spill_victim];
       int reg = vv->phys;
-      next_spill_offset += 8;
+      next_spill_offset += vv->width > 8 ? 16 : 8;
       vv->in_register = 0;
       vv->assigned = 1;
       vv->spill_offset = next_spill_offset;
@@ -2121,7 +2123,7 @@ int mir_regalloc(MirFunction *fn) {
       }
     } else {
       /* Spill current. */
-      next_spill_offset += 8;
+      next_spill_offset += cv->width > 8 ? 16 : 8;
       cv->assigned = 1;
       cv->in_register = 0;
       cv->spill_offset = next_spill_offset;

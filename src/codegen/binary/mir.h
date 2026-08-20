@@ -280,6 +280,12 @@ typedef enum {
   MIR_FSUB,
   MIR_FMUL,
   MIR_FDIV,
+  /* f64x2 lane ops for the pair vectorizer (vreg width 16). Three-address:
+   * dst is written whole, a/b are read. FDUP broadcasts a's low lane to both
+   * lanes (vmovddup); FEXTHI copies a's high lane into dst's low lane
+   * (vunpckhpd dst,a,a), so a scalar consumer can read lane 1. */
+  MIR_FDUP,
+  MIR_FEXTHI,
   MIR_CVTSI2F,    /* xmm dst <- int a */
   MIR_CVTF2SI,    /* gp dst  <- float a (truncating) */
   MIR_CVTF2F,     /* float width convert (sd<->ss) */

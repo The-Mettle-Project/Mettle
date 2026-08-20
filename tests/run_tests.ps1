@@ -3043,6 +3043,14 @@ $simdRuntimeCases = @(
     Path            = "tests/promote_loop_memory_check.mettle"
     OutputMustMatch = "PROMOTE LOOP MEMORY: ALL OK"
     IrMustMatch     = @("__prom_")
+  },
+  @{
+    # MIR-level pass, so no IR pattern exists; the runtime check is the guard
+    # (the reference lane-shape must stay scalar and agree bit for bit).
+    Name            = "slp_pair_f64"
+    Path            = "tests/slp_pair_f64_check.mettle"
+    OutputMustMatch = "SLP PAIR F64: ALL OK"
+    IrMustMatch     = @("step_pair")
   }
 )
 

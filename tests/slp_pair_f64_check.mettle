@@ -1,0 +1,77 @@
+// Guard for the float64 pair vectorizer (@noinline keeps the pair function
+// standalone: main is a direct-object function the MIR pipeline skips): statement pairs over adjacent .x/.y
+// fields, reached through a pointer the function holds in a register, fuse
+// into packed operations. Checked bit-for-bit against a reference shape the
+// pass cannot claim (an extra scalar op breaks lane isomorphism), across
+// values including negative zero, infinities, and NaN payload survivors.
+
+import "std/io";
+import "std/mem";
+
+struct Vec2 {
+  x: float64;
+  y: float64;
+}
+
+var g_fail: int32 = 0;
+
+@noinline fn step_pair(p: Vec2*, d: Vec2*, f: float64) {
+  var nx: float64 = p.x + d.x * f;
+  var ny: float64 = p.y + d.y * f;
+  p.x = nx;
+  p.y = ny;
+}
+
+// Reference: same values, different lane shapes. The y lane swaps the
+// commutative operands (bit-identical results, including NaN and signed
+// zero on x86, where the quieted NaN comes from the single NaN operand),
+// which breaks the isomorphism the vectorizer needs.
+@noinline fn step_ref(p: Vec2*, d: Vec2*, f: float64) {
+  var nx: float64 = p.x + d.x * f;
+  var ny: float64 = d.y * f + p.y;
+  p.x = nx;
+  p.y = ny;
+}
+
+fn bits_of(v: float64) -> uint64 {
+  var slot: float64[1];
+  slot[0] = v;
+  var view: uint64* = (uint64*)&slot[0];
+  return view[0];
+}
+
+fn main() -> int32 {
+  var a: Vec2;
+  var b: Vec2;
+  var d: Vec2;
+
+  var trial: int32 = 0;
+  while (trial < 64) {
+    var base_x: float64 = (float64)(trial * 3 - 90) * 0.125;
+    var base_y: float64 = (float64)(trial * 7 - 200) * 0.25;
+    a.x = base_x;
+    a.y = base_y;
+    b.x = base_x;
+    b.y = base_y;
+    d.x = (float64)(trial - 31) * 0.5;
+    d.y = (float64)(trial * trial % 17 - 8) * 0.75;
+    var f: float64 = (float64)(trial % 9 - 4) * 1.5;
+    if (trial == 60) { d.x = 0.0 / 0.0; }
+    if (trial == 61) { d.y = 1.0 / 0.0; }
+    if (trial == 62) { f = -0.0; }
+
+    step_pair(&a, &d, f);
+    step_ref(&b, &d, f);
+    if (bits_of(a.x) != bits_of(b.x) || bits_of(a.y) != bits_of(b.y)) {
+      g_fail = g_fail + 1;
+    }
+    trial = trial + 1;
+  }
+
+  if (g_fail == 0) {
+    println("SLP PAIR F64: ALL OK");
+    return 0;
+  }
+  println("SLP PAIR FAILURES: {g_fail}");
+  return 1;
+}

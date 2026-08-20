@@ -6444,6 +6444,814 @@ static void mir_cse_loads(MirFunction *fn) {
   free(snap_seen);
 }
 
+
+/* ---- float64 pair vectorizer (SLP) --------------------------------------- */
+/*
+ * Structs of the form {x, y, ...} in float64 produce statement pairs that
+ * differ only in the field offset: `p.vx += f*dx; p.vy += f*dy` is two loads,
+ * two multiplies, two adds and two stores that clang runs as one movupd,
+ * mulpd, addpd, movupd. This pass finds ADJACENT float64 store pairs (same
+ * base register, displacements 8 apart), grows the operation DAG upward while
+ * both lanes stay isomorphic, and rewrites the pair lanes into one width-16
+ * instruction each: loads become movupd, arithmetic becomes the packed VEX
+ * form, a scalar appearing in both lanes becomes one vmovddup.
+ *
+ * Soundness rules:
+ *  - Everything stays inside one straight-line region (no labels, branches,
+ *    or calls between the earliest and latest instruction touched).
+ *  - The fused instruction sits at the LATER lane's original index, so each
+ *    earlier lane conceptually moves down: any memory access strictly between
+ *    the two lanes must be provably disjoint (same base register with
+ *    non-overlapping displacements). A different base register may alias and
+ *    refuses the pair.
+ *  - An original whose value is read outside the graph is KEPT (the pair
+ *    recomputes its lanes); only fully-internal originals are dropped. That
+ *    trades a little duplicate scalar work for never needing lane extraction,
+ *    and the dead-code sweep already removes what turns out unread.
+ */
+
+#define MIR_SLP_MAX_NODES 24
+
+typedef struct {
+  MirVregId lo;      /* lane-0 value (MIR_VREG_NONE for a store node) */
+  MirVregId hi;
+  size_t lo_at;      /* defining instruction indices */
+  size_t hi_at;
+  MirVregId pair;    /* the width-16 vreg carrying both lanes */
+  int kind;          /* 0 load, 1 binop, 2 dup, 3 store */
+  MirOpcode op;      /* for binops */
+  int child_a;       /* node indices, -1 = none */
+  int child_b;
+  int keep_originals;
+} MirSlpNode;
+
+typedef struct {
+  MirFunction *fn;
+  const int *def_count;  /* per-vreg definition count */
+  const size_t *def_at;  /* index of the single def (valid when count==1) */
+  const int *use_count;  /* per-vreg read count */
+  MirSlpNode nodes[MIR_SLP_MAX_NODES];
+  int node_count;
+  size_t region_lo;
+  size_t region_hi;
+} MirSlpGraph;
+
+static int mir_slp_region_ok(const MirFunction *fn, size_t lo, size_t hi) {
+  for (size_t i = lo; i <= hi; i++) {
+    switch (fn->insns[i].op) {
+    case MIR_LABEL:
+    case MIR_JMP:
+    case MIR_JCC:
+    case MIR_CMPBR:
+    case MIR_FCMPBR:
+    case MIR_CALL:
+    case MIR_CALL_INDIRECT:
+    case MIR_RET:
+      return 0;
+    default:
+      break;
+    }
+  }
+  return 1;
+}
+
+static int mir_slp_is_f64_load(const MirInst *in) {
+  return in->op == MIR_MOV && in->is_float && in->width == 8 &&
+         in->a.kind == MIR_OPK_MEM && in->a.mem.index == MIR_VREG_NONE &&
+         in->dst.kind == MIR_OPK_VREG;
+}
+
+static int mir_slp_is_f64_store(const MirInst *in) {
+  return in->op == MIR_MOV && in->is_float && in->width == 8 &&
+         in->dst.kind == MIR_OPK_MEM && in->dst.mem.index == MIR_VREG_NONE &&
+         in->a.kind == MIR_OPK_VREG;
+}
+
+static int mir_slp_is_f64_binop(const MirInst *in) {
+  /* the opcode is float by definition; is_float is not set uniformly */
+  return (in->op == MIR_FADD || in->op == MIR_FSUB || in->op == MIR_FMUL ||
+          in->op == MIR_FDIV) &&
+         in->width == 8 && in->dst.kind == MIR_OPK_VREG &&
+         in->a.kind == MIR_OPK_VREG && in->b.kind == MIR_OPK_VREG;
+}
+
+/* Address bases are equal when they are the same register, or when both are
+ * single-def registers computed by the same operation over equal operands:
+ * the lowering recomputes `live + i*32` per field access, so the .x and .y
+ * addresses arrive in different vregs holding one value. */
+static int mir_slp_same_base(const MirFunction *fn, const int *def_count,
+                             const size_t *def_at, MirVregId a, MirVregId b,
+                             int depth);
+static int mir_slp_mem_disjoint(const MirFunction *fn, const int *def_count,
+                                const size_t *def_at, const MirOperand *acc,
+                                MirVregId base, int disp, int depth);
+
+static int mir_slp_operand_equal(const MirFunction *fn, const int *def_count,
+                                 const size_t *def_at, const MirOperand *x,
+                                 const MirOperand *y, int depth) {
+  if (x->kind != y->kind) {
+    return 0;
+  }
+  switch (x->kind) {
+  case MIR_OPK_VREG:
+    return mir_slp_same_base(fn, def_count, def_at, x->vreg, y->vreg, depth);
+  case MIR_OPK_IMM:
+    return x->imm == y->imm;
+  case MIR_OPK_NONE:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+static int mir_slp_same_base(const MirFunction *fn, const int *def_count,
+                             const size_t *def_at, MirVregId a, MirVregId b,
+                             int depth) {
+  if (a == b) {
+    return 1;
+  }
+  if (depth > 4 || a == MIR_VREG_NONE || b == MIR_VREG_NONE ||
+      (size_t)a >= fn->vreg_count || (size_t)b >= fn->vreg_count ||
+      def_count[a] != 1 || def_count[b] != 1) {
+    return 0;
+  }
+  const MirInst *da = &fn->insns[def_at[a]];
+  const MirInst *db = &fn->insns[def_at[b]];
+  if (da->op != db->op || da->width != db->width ||
+      da->is_float != db->is_float) {
+    return 0;
+  }
+  switch (da->op) {
+  case MIR_MOV:
+    if (da->a.kind == MIR_OPK_VREG && db->a.kind == MIR_OPK_VREG) {
+      return mir_slp_same_base(fn, def_count, def_at, da->a.vreg, db->a.vreg,
+                               depth + 1);
+    }
+    /* Two loads of one location are one value when nothing can have written
+     * it in between: same width, same address (base equivalence + equal
+     * displacement, no index), and every store between the two positions is
+     * provably disjoint from it. The lowering reloads `w->live` per field
+     * access, so every address chain bottoms out here. */
+    if (da->a.kind == MIR_OPK_MEM && db->a.kind == MIR_OPK_MEM &&
+        da->a.mem.index == MIR_VREG_NONE && db->a.mem.index == MIR_VREG_NONE &&
+        da->a.mem.disp == db->a.mem.disp &&
+        mir_slp_same_base(fn, def_count, def_at, da->a.mem.base,
+                          db->a.mem.base, depth + 1)) {
+      size_t lo_at = def_at[a] < def_at[b] ? def_at[a] : def_at[b];
+      size_t hi_at = def_at[a] < def_at[b] ? def_at[b] : def_at[a];
+      for (size_t i = lo_at + 1; i < hi_at; i++) {
+        const MirInst *in = &fn->insns[i];
+        switch (in->op) {
+        case MIR_LABEL:
+        case MIR_JMP:
+        case MIR_JCC:
+        case MIR_CMPBR:
+        case MIR_FCMPBR:
+        case MIR_CALL:
+        case MIR_CALL_INDIRECT:
+        case MIR_RET:
+          return 0;
+        default:
+          break;
+        }
+        if (in->dst.kind == MIR_OPK_MEM &&
+            !mir_slp_mem_disjoint(fn, def_count, def_at, &in->dst,
+                                  da->a.mem.base, da->a.mem.disp,
+                                  depth + 1)) {
+          return 0;
+        }
+      }
+      return 1;
+    }
+    return 0;
+  case MIR_ADD:
+  case MIR_SHL:
+  case MIR_IMUL:
+  case MIR_LEA:
+    return mir_slp_operand_equal(fn, def_count, def_at, &da->a, &db->a,
+                                 depth + 1) &&
+           mir_slp_operand_equal(fn, def_count, def_at, &da->b, &db->b,
+                                 depth + 1);
+  default:
+    return 0;
+  }
+}
+
+/* mem accesses [base+disp, +8) provably disjoint: equal base value, ranges
+ * apart. A base that may differ may alias. */
+static void mir_slp_resolve_addr(const MirFunction *fn, const int *def_count,
+                                 const size_t *def_at, MirVregId base,
+                                 int disp, MirVregId *root_out, int *disp_out);
+
+static int mir_slp_mem_disjoint(const MirFunction *fn, const int *def_count,
+                                const size_t *def_at, const MirOperand *acc,
+                                MirVregId base, int disp, int depth) {
+  MirVregId acc_root, base_root;
+  int acc_disp, base_disp;
+  if (depth > 6 || acc->mem.index != MIR_VREG_NONE) {
+    return 0;
+  }
+  mir_slp_resolve_addr(fn, def_count, def_at, acc->mem.base, acc->mem.disp,
+                       &acc_root, &acc_disp);
+  mir_slp_resolve_addr(fn, def_count, def_at, base, disp, &base_root,
+                       &base_disp);
+  if (!mir_slp_same_base(fn, def_count, def_at, acc_root, base_root, depth)) {
+    return 0;
+  }
+  return acc_disp + 8 <= base_disp || base_disp + 8 <= acc_disp;
+}
+
+/* The earlier lane at `from` conceptually moves down to `to`: every memory
+ * access strictly between must be disjoint with (base, disp). Accesses that
+ * belong to the graph itself are checked too -- the graph's own lanes are
+ * same-base-adjacent pairs, and adjacent is NOT disjoint, so partner lanes are
+ * skipped by index. */
+/* moving_is_store: a moving STORE conflicts with both reads and writes of its
+ * location; a moving LOAD conflicts only with writes (loads reorder freely
+ * against loads). */
+static int mir_slp_can_cross(const MirFunction *fn, const int *def_count,
+                             const size_t *def_at, size_t from, size_t to,
+                             MirVregId base, int disp, size_t partner,
+                             int moving_is_store) {
+  for (size_t i = from + 1; i < to; i++) {
+    const MirInst *in = &fn->insns[i];
+    if (i == partner) {
+      continue;
+    }
+    if (moving_is_store && in->a.kind == MIR_OPK_MEM &&
+        !mir_slp_mem_disjoint(fn, def_count, def_at, &in->a, base, disp, 0)) {
+      return 0;
+    }
+    if (in->dst.kind == MIR_OPK_MEM &&
+        !mir_slp_mem_disjoint(fn, def_count, def_at, &in->dst, base, disp,
+                              0)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static void mir_slp_dump_chain(const MirFunction *fn, const int *def_count,
+                               const size_t *def_at, MirVregId v, int depth) {
+  fprintf(stderr, "%*sv%d", depth * 2 + 8, "", (int)v);
+  if ((size_t)v >= fn->vreg_count || def_count[v] != 1) {
+    fprintf(stderr, " defs=%d STOP\n",
+            (size_t)v < fn->vreg_count ? def_count[v] : -1);
+    return;
+  }
+  const MirInst *d = &fn->insns[def_at[v]];
+  fprintf(stderr, " := op%d ak%d bk%d imm=%lld disp=%d\n", (int)d->op,
+          (int)d->a.kind, (int)d->b.kind,
+          d->b.kind == MIR_OPK_IMM ? (long long)d->b.imm : 0LL,
+          d->a.kind == MIR_OPK_MEM ? d->a.mem.disp : -1);
+  if (depth > 3) {
+    return;
+  }
+  if (d->a.kind == MIR_OPK_VREG) {
+    mir_slp_dump_chain(fn, def_count, def_at, d->a.vreg, depth + 1);
+  }
+  if (d->a.kind == MIR_OPK_MEM) {
+    mir_slp_dump_chain(fn, def_count, def_at, d->a.mem.base, depth + 1);
+  }
+  if (d->b.kind == MIR_OPK_VREG) {
+    mir_slp_dump_chain(fn, def_count, def_at, d->b.vreg, depth + 1);
+  }
+}
+
+/* Normalize an address to (root, disp): the lowering splits `p + 8` into its
+ * own ADD as often as it folds it into the displacement, so both spellings
+ * must compare equal. Follows single-def `ADD vreg, imm` and register copies. */
+static void mir_slp_resolve_addr(const MirFunction *fn, const int *def_count,
+                                 const size_t *def_at, MirVregId base,
+                                 int disp, MirVregId *root_out,
+                                 int *disp_out) {
+  for (int depth = 0; depth < 6; depth++) {
+    if (base == MIR_VREG_NONE || (size_t)base >= fn->vreg_count ||
+        def_count[base] != 1) {
+      break;
+    }
+    const MirInst *d = &fn->insns[def_at[base]];
+    if (d->op == MIR_ADD && d->width == 8 && !d->is_float &&
+        d->a.kind == MIR_OPK_VREG && d->b.kind == MIR_OPK_IMM) {
+      disp += (int)d->b.imm;
+      base = d->a.vreg;
+      continue;
+    }
+    if (d->op == MIR_MOV && !d->is_float && d->width == 8 &&
+        d->a.kind == MIR_OPK_VREG) {
+      base = d->a.vreg;
+      continue;
+    }
+    break;
+  }
+  *root_out = base;
+  *disp_out = disp;
+}
+
+static int mir_slp_find_node(const MirSlpGraph *g, MirVregId lo, MirVregId hi) {
+  for (int i = 0; i < g->node_count; i++) {
+    if (g->nodes[i].kind != 3 && g->nodes[i].lo == lo && g->nodes[i].hi == hi) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+/* Build (or find) the pair node for lanes (lo, hi). Returns the node index or
+ * -1 when the lanes cannot run in lockstep. */
+static int mir_slp_pair_value(MirSlpGraph *g, MirVregId lo, MirVregId hi) {
+  MirFunction *fn = g->fn;
+  int dbg = getenv("METTLE_SLP_TRACE") != NULL;
+  int found = mir_slp_find_node(g, lo, hi);
+  if (found >= 0) {
+    return found;
+  }
+  if (dbg) {
+    fprintf(stderr, "[slp]   pair_value v%d/v%d defs %d/%d ops %d/%d w %d/%d reg %zu..%zu\n",
+            (int)lo, (int)hi,
+            (size_t)lo < fn->vreg_count ? g->def_count[lo] : -1,
+            (size_t)hi < fn->vreg_count ? g->def_count[hi] : -1,
+            (size_t)lo < fn->vreg_count && g->def_count[lo] == 1 ? (int)fn->insns[g->def_at[lo]].op : -1,
+            (size_t)hi < fn->vreg_count && g->def_count[hi] == 1 ? (int)fn->insns[g->def_at[hi]].op : -1,
+            (size_t)lo < fn->vreg_count && g->def_count[lo] == 1 ? fn->insns[g->def_at[lo]].width : -1,
+            (size_t)hi < fn->vreg_count && g->def_count[hi] == 1 ? fn->insns[g->def_at[hi]].width : -1,
+            g->region_lo, g->region_hi);
+  }
+  if (g->node_count >= MIR_SLP_MAX_NODES) {
+    return -1;
+  }
+
+  /* One scalar feeding both lanes broadcasts. Zero definitions is a
+   * parameter: defined at entry, stable everywhere. More than one is a
+   * mutable local and refuses. */
+  if (lo == hi) {
+    if (g->def_count[lo] > 1) {
+      return -1;
+    }
+    int n = g->node_count++;
+    g->nodes[n].lo = lo;
+    g->nodes[n].hi = hi;
+    g->nodes[n].lo_at = g->def_count[lo] == 1 ? g->def_at[lo] : 0;
+    g->nodes[n].hi_at = g->nodes[n].lo_at;
+    g->nodes[n].pair = MIR_VREG_NONE;
+    g->nodes[n].kind = 2;
+    g->nodes[n].child_a = -1;
+    g->nodes[n].child_b = -1;
+    g->nodes[n].keep_originals = 1; /* the scalar def always stays */
+    return n;
+  }
+
+  if (g->def_count[lo] != 1 || g->def_count[hi] != 1) {
+    return -1;
+  }
+  size_t la = g->def_at[lo];
+  size_t ha = g->def_at[hi];
+  if (la < g->region_lo || ha < g->region_lo || la > g->region_hi ||
+      ha > g->region_hi || la == ha) {
+    return -1;
+  }
+  const MirInst *li = &fn->insns[la];
+  const MirInst *hi_in = &fn->insns[ha];
+
+  /* Adjacent loads: lane 0 at [base+d], lane 1 at [base+d+8]. The fused load
+   * runs at the EARLIER lane's slot, so the LATER lane conceptually moves up:
+   * everything between must be provably disjoint from the later lane's
+   * address (its own lane may legitimately be stored to in between -- the
+   * scalar code loaded before that store, and so does the fused load). */
+  MirVregId lo_root = MIR_VREG_NONE, hi_root = MIR_VREG_NONE;
+  int lo_disp = 0, hi_disp = 0;
+  if (mir_slp_is_f64_load(li) && mir_slp_is_f64_load(hi_in)) {
+    mir_slp_resolve_addr(fn, g->def_count, g->def_at, li->a.mem.base,
+                         li->a.mem.disp, &lo_root, &lo_disp);
+    mir_slp_resolve_addr(fn, g->def_count, g->def_at, hi_in->a.mem.base,
+                         hi_in->a.mem.disp, &hi_root, &hi_disp);
+  }
+  if (mir_slp_is_f64_load(li) && mir_slp_is_f64_load(hi_in) &&
+      hi_disp == lo_disp + 8 &&
+      mir_slp_same_base(fn, g->def_count, g->def_at, lo_root, hi_root, 0)) {
+    size_t early = la < ha ? la : ha;
+    size_t late = la < ha ? ha : la;
+    const MirInst *late_in = &fn->insns[late];
+    if (!mir_slp_can_cross(fn, g->def_count, g->def_at, early, late,
+                           late_in->a.mem.base, late_in->a.mem.disp, early,
+                           0)) {
+      return -1;
+    }
+    int n = g->node_count++;
+    g->nodes[n].lo = lo;
+    g->nodes[n].hi = hi;
+    g->nodes[n].lo_at = la;
+    g->nodes[n].hi_at = ha;
+    g->nodes[n].pair = MIR_VREG_NONE;
+    g->nodes[n].kind = 0;
+    g->nodes[n].child_a = -1;
+    g->nodes[n].child_b = -1;
+    g->nodes[n].keep_originals = 0;
+    return n;
+  }
+
+  /* Isomorphic binops: same opcode, lanes pair recursively. FDIV pairs too --
+   * both lanes divide, so the packed form raises exactly the same traps. */
+  if (mir_slp_is_f64_binop(li) && mir_slp_is_f64_binop(hi_in) &&
+      li->op == hi_in->op && la < ha) {
+    int ca = mir_slp_pair_value(g, li->a.vreg, hi_in->a.vreg);
+    if (ca < 0) {
+      return -1;
+    }
+    int cb = mir_slp_pair_value(g, li->b.vreg, hi_in->b.vreg);
+    if (cb < 0) {
+      return -1;
+    }
+    int n = g->node_count++;
+    g->nodes[n].lo = lo;
+    g->nodes[n].hi = hi;
+    g->nodes[n].lo_at = la;
+    g->nodes[n].hi_at = ha;
+    g->nodes[n].pair = MIR_VREG_NONE;
+    g->nodes[n].kind = 1;
+    g->nodes[n].op = li->op;
+    g->nodes[n].child_a = ca;
+    g->nodes[n].child_b = cb;
+    g->nodes[n].keep_originals = 0;
+    return n;
+  }
+
+  return -1;
+}
+
+/* Internal uses: reads of a node's lanes by other graph originals. A lane
+ * read anywhere else forces the originals to stay. */
+static void mir_slp_mark_escapes(MirSlpGraph *g, size_t st_lo, size_t st_hi) {
+  MirFunction *fn = g->fn;
+  for (int n = 0; n < g->node_count; n++) {
+    MirSlpNode *node = &g->nodes[n];
+    if (node->kind == 2 || node->kind == 3 || node->keep_originals) {
+      continue;
+    }
+    int internal_lo = 0;
+    int internal_hi = 0;
+    /* the two original stores read the root's lanes and are dropped */
+    if (fn->insns[st_lo].a.kind == MIR_OPK_VREG &&
+        fn->insns[st_lo].a.vreg == node->lo) {
+      internal_lo++;
+    }
+    if (fn->insns[st_hi].a.kind == MIR_OPK_VREG &&
+        fn->insns[st_hi].a.vreg == node->hi) {
+      internal_hi++;
+    }
+    for (int m = 0; m < g->node_count; m++) {
+      if (m == n || g->nodes[m].keep_originals) {
+        continue;
+      }
+      const MirInst *ml = &fn->insns[g->nodes[m].lo_at];
+      const MirInst *mh = &fn->insns[g->nodes[m].hi_at];
+      const MirInst *pair[2] = {ml, mh};
+      for (int k = 0; k < 2; k++) {
+        const MirInst *in = pair[k];
+        if (in->a.kind == MIR_OPK_VREG && in->a.vreg == node->lo) {
+          internal_lo++;
+        }
+        if (in->b.kind == MIR_OPK_VREG && in->b.vreg == node->lo) {
+          internal_lo++;
+        }
+        if (in->a.kind == MIR_OPK_VREG && in->a.vreg == node->hi) {
+          internal_hi++;
+        }
+        if (in->b.kind == MIR_OPK_VREG && in->b.vreg == node->hi) {
+          internal_hi++;
+        }
+      }
+    }
+    if (g->use_count[node->lo] != internal_lo ||
+        g->use_count[node->hi] != internal_hi) {
+      node->keep_originals = 1;
+    }
+  }
+  /* Keeping a parent's originals means its lanes still read the children's
+   * lanes, so the children's originals must stay too. Propagate down. */
+  int changed = 1;
+  while (changed) {
+    changed = 0;
+    for (int n = 0; n < g->node_count; n++) {
+      const MirSlpNode *node = &g->nodes[n];
+      if (!node->keep_originals || node->kind != 1) {
+        continue;
+      }
+      int kids[2] = {node->child_a, node->child_b};
+      for (int k = 0; k < 2; k++) {
+        if (kids[k] >= 0 && !g->nodes[kids[k]].keep_originals &&
+            g->nodes[kids[k]].kind != 2) {
+          g->nodes[kids[k]].keep_originals = 1;
+          changed = 1;
+        }
+      }
+    }
+  }
+}
+
+/* One emitted pair instruction, targeted at a slot in the original stream:
+ * it is inserted immediately before whatever remains at that index. Loads
+ * anchor at the EARLIER lane (later lane proved able to move up); arithmetic
+ * anchors at the LATER lane (its inputs' anchors are strictly earlier);
+ * broadcasts anchor with their first consumer. */
+typedef struct {
+  size_t at;
+  MirInst inst;
+} MirSlpEmit;
+
+static int mir_slp_emit_node(MirSlpGraph *g, int n, size_t consumer_anchor,
+                             MirSlpEmit *out, int *out_count,
+                             size_t *anchor_out) {
+  MirFunction *fn = g->fn;
+  MirSlpNode *node = &g->nodes[n];
+  size_t anchor;
+  if (node->pair != MIR_VREG_NONE) {
+    if (anchor_out) {
+      *anchor_out = node->lo_at; /* already placed; anchor irrelevant */
+    }
+    return 1;
+  }
+  switch (node->kind) {
+  case 0:
+    anchor = node->lo_at < node->hi_at ? node->lo_at : node->hi_at;
+    break;
+  case 1:
+    anchor = node->lo_at > node->hi_at ? node->lo_at : node->hi_at;
+    break;
+  default:
+    anchor = consumer_anchor;
+    /* the broadcast scalar must exist by then (parameters exist at entry) */
+    if (g->def_count[node->lo] == 1 && g->def_at[node->lo] >= anchor) {
+      return 0;
+    }
+    break;
+  }
+  if (node->child_a >= 0 &&
+      !mir_slp_emit_node(g, node->child_a, anchor, out, out_count, NULL)) {
+    return 0;
+  }
+  if (node->child_b >= 0 &&
+      !mir_slp_emit_node(g, node->child_b, anchor, out, out_count, NULL)) {
+    return 0;
+  }
+  node->pair = mir_new_vreg(fn, MIR_RC_XMM, 16);
+  if (node->pair == MIR_VREG_NONE) {
+    return 0;
+  }
+  MirSlpEmit *slot = &out[(*out_count)++];
+  MirInst *in = &slot->inst;
+  slot->at = anchor;
+  memset(in, 0, sizeof(*in));
+  in->is_float = 1;
+  in->width = 16;
+  in->ir_index = -1;
+  switch (node->kind) {
+  case 0: { /* load pair: movupd from lane 0's (lower) address */
+    const MirInst *l0 = &fn->insns[node->lo_at];
+    in->op = MIR_MOV;
+    in->dst = mir_op_vreg(node->pair);
+    in->a = l0->a;
+    break;
+  }
+  case 1:
+    in->op = node->op;
+    in->dst = mir_op_vreg(node->pair);
+    in->a = mir_op_vreg(g->nodes[node->child_a].pair);
+    in->b = mir_op_vreg(g->nodes[node->child_b].pair);
+    break;
+  case 2:
+    in->op = MIR_FDUP;
+    in->dst = mir_op_vreg(node->pair);
+    in->a = mir_op_vreg(node->lo);
+    break;
+  default:
+    return 0;
+  }
+  if (anchor_out) {
+    *anchor_out = anchor;
+  }
+  return 1;
+}
+
+/* Try to vectorize the store pair at (s_lo, s_hi). Returns 1 and fills the
+ * rewrite plan when the whole graph pairs. */
+static int mir_slp_try_store_pair(MirFunction *fn, const int *def_count,
+                                  const size_t *def_at, const int *use_count,
+                                  size_t s_lo, size_t s_hi, int *changed) {
+  MirSlpGraph g = {0};
+  g.fn = fn;
+  g.def_count = def_count;
+  g.def_at = def_at;
+  g.use_count = use_count;
+
+  const MirInst *st_lo = &fn->insns[s_lo];
+  const MirInst *st_hi = &fn->insns[s_hi];
+
+  int root = -1;
+  {
+    /* Region: from the earliest def the graph can reach back to, up to the
+     * later store. Start wide (the enclosing straight-line run). */
+    size_t lo = s_lo;
+    while (lo > 0 && mir_slp_region_ok(fn, lo - 1, lo - 1)) {
+      lo--;
+    }
+    g.region_lo = lo;
+    g.region_hi = s_hi;
+    if (!mir_slp_region_ok(fn, s_lo, s_hi)) {
+      return 0;
+    }
+    root = mir_slp_pair_value(&g, st_lo->a.vreg, st_hi->a.vreg);
+  }
+  if (root < 0) {
+    return 0;
+  }
+  /* The earlier store moves down to the later one. */
+  if (!mir_slp_can_cross(fn, def_count, def_at, s_lo, s_hi,
+                         st_lo->dst.mem.base, st_lo->dst.mem.disp, s_hi, 1)) {
+    return 0;
+  }
+  /* A store pair with a bare broadcast root gains nothing. */
+  if (g.nodes[root].kind == 2) {
+    return 0;
+  }
+
+  mir_slp_mark_escapes(&g, s_lo, s_hi);
+
+  /* Emit the pair chain, each instruction targeted at its own slot. */
+  MirSlpEmit emitted[MIR_SLP_MAX_NODES + 2];
+  int emitted_count = 0;
+  size_t root_anchor = 0;
+  if (!mir_slp_emit_node(&g, root, s_hi, emitted, &emitted_count,
+                         &root_anchor)) {
+    return 0;
+  }
+  if (root_anchor >= s_hi) {
+    return 0; /* the root value must exist before the fused store runs */
+  }
+  {
+    MirSlpEmit *slot = &emitted[emitted_count++];
+    MirInst *st = &slot->inst;
+    slot->at = s_hi;
+    memset(st, 0, sizeof(*st));
+    st->op = MIR_MOV;
+    st->is_float = 1;
+    st->width = 16;
+    st->ir_index = -1;
+    st->dst = st_lo->dst; /* lane 0 = the lower resolved address */
+    st->a = mir_op_vreg(g.nodes[root].pair);
+  }
+
+  /* Rebuild: droppable originals disappear, each emitted instruction lands
+   * just before whatever remains at its slot. */
+  unsigned char *drop = calloc(fn->insn_count, 1);
+  if (!drop) {
+    return 0;
+  }
+  drop[s_lo] = 1;
+  drop[s_hi] = 1;
+  for (int n = 0; n < g.node_count; n++) {
+    if (!g.nodes[n].keep_originals && g.nodes[n].kind != 2) {
+      drop[g.nodes[n].lo_at] = 1;
+      drop[g.nodes[n].hi_at] = 1;
+    }
+  }
+
+  size_t new_cap = fn->insn_count + (size_t)emitted_count;
+  MirInst *rebuilt = malloc(new_cap * sizeof(MirInst));
+  if (!rebuilt) {
+    free(drop);
+    return 0;
+  }
+  size_t w = 0;
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    for (int e = 0; e < emitted_count; e++) {
+      if (emitted[e].at == i) {
+        rebuilt[w++] = emitted[e].inst;
+      }
+    }
+    if (drop[i]) {
+      continue;
+    }
+    rebuilt[w++] = fn->insns[i];
+  }
+  free(fn->insns);
+  fn->insns = rebuilt;
+  fn->insn_count = w;
+  fn->insn_capacity = new_cap;
+  free(drop);
+  if (changed) {
+    *changed = 1;
+  }
+  return 1;
+}
+
+/* Pair adjacent float64 stores and the operation DAGs behind them. One
+ * rewrite per scan; def/use tables go stale at the first change. */
+static void mir_slp_pair_f64(MirFunction *fn) {
+  if (!fn || fn->insn_count < 4) {
+    return;
+  }
+  for (int round = 0; round < 8; round++) {
+    size_t n_vregs = fn->vreg_count;
+    int *def_count = calloc(n_vregs, sizeof(int));
+    size_t *def_at = calloc(n_vregs, sizeof(size_t));
+    int *use_count = calloc(n_vregs, sizeof(int));
+    if (!def_count || !def_at || !use_count) {
+      free(def_count);
+      free(def_at);
+      free(use_count);
+      return;
+    }
+    for (size_t i = 0; i < fn->insn_count; i++) {
+      const MirInst *in = &fn->insns[i];
+      if (in->dst.kind == MIR_OPK_VREG) {
+        if (def_count[in->dst.vreg]++ == 0) {
+          def_at[in->dst.vreg] = i;
+        }
+      }
+      const MirOperand *reads[3] = {&in->a, &in->b,
+                                    in->dst.kind == MIR_OPK_MEM ? &in->dst
+                                                                : NULL};
+      for (int k = 0; k < 3; k++) {
+        const MirOperand *op = reads[k];
+        if (!op) {
+          continue;
+        }
+        if (op->kind == MIR_OPK_VREG) {
+          use_count[op->vreg]++;
+        } else if (op->kind == MIR_OPK_MEM) {
+          if (op->mem.base != MIR_VREG_NONE) {
+            use_count[op->mem.base]++;
+          }
+          if (op->mem.index != MIR_VREG_NONE) {
+            use_count[op->mem.index]++;
+          }
+        }
+      }
+    }
+
+    int changed = 0;
+    int dbg = getenv("METTLE_SLP_TRACE") != NULL;
+    for (size_t i = 0; i + 1 < fn->insn_count && !changed; i++) {
+      const MirInst *a = &fn->insns[i];
+      if (!mir_slp_is_f64_store(a)) {
+        continue;
+      }
+      if (dbg) {
+        MirVregId bb = a->dst.mem.base;
+        int dc = (size_t)bb < n_vregs ? def_count[bb] : -1;
+        const MirInst *bd = dc == 1 ? &fn->insns[def_at[bb]] : NULL;
+        fprintf(stderr, "[slp] st @%zu base=v%d disp=%d bdefs=%d bop=%d ak=%d av=%d bk=%d bv=%d\n",
+                i, (int)bb, a->dst.mem.disp, dc, bd ? (int)bd->op : -1,
+                bd ? (int)bd->a.kind : -1,
+                bd && bd->a.kind == MIR_OPK_VREG ? (int)bd->a.vreg : -1,
+                bd ? (int)bd->b.kind : -1,
+                bd && bd->b.kind == MIR_OPK_VREG ? (int)bd->b.vreg : -1);
+        mir_slp_dump_chain(fn, def_count, def_at, bb, 0);
+      }
+
+      for (size_t j = i + 1; j < fn->insn_count && j < i + 24; j++) {
+        const MirInst *b = &fn->insns[j];
+        if (b->op == MIR_LABEL || b->op == MIR_JMP || b->op == MIR_JCC ||
+            b->op == MIR_CMPBR || b->op == MIR_FCMPBR || b->op == MIR_CALL ||
+            b->op == MIR_CALL_INDIRECT || b->op == MIR_RET) {
+          break;
+        }
+        MirVregId ar = MIR_VREG_NONE, br = MIR_VREG_NONE;
+        int adp = 0, bdp = 0;
+        if (mir_slp_is_f64_store(b)) {
+          mir_slp_resolve_addr(fn, def_count, def_at, a->dst.mem.base,
+                               a->dst.mem.disp, &ar, &adp);
+          mir_slp_resolve_addr(fn, def_count, def_at, b->dst.mem.base,
+                               b->dst.mem.disp, &br, &bdp);
+        }
+        if (mir_slp_is_f64_store(b) && bdp == adp + 8 &&
+            mir_slp_same_base(fn, def_count, def_at, ar, br, 0)) {
+          if (dbg) {
+            fprintf(stderr, "[slp] pair candidate @%zu/@%zu disp %d/%d\n", i,
+                    j, a->dst.mem.disp, b->dst.mem.disp);
+          }
+          /* lane order == program order: the .x store first, .y second */
+          if (mir_slp_try_store_pair(fn, def_count, def_at, use_count, i, j,
+                                     &changed)) {
+            if (dbg) {
+              fprintf(stderr, "[slp] FUSED @%zu/@%zu\n", i, j);
+            }
+            break;
+          }
+        }
+      }
+    }
+
+    free(def_count);
+    free(def_at);
+    free(use_count);
+    if (!changed) {
+      return;
+    }
+  }
+}
+
 static void mir_rotate_loops(MirFunction *fn) {
   if (!fn || fn->insn_count < 3) {
     return;
@@ -7427,6 +8235,7 @@ int code_generator_binary_emit_function_via_mir(
   mir_narrow_zero_extended_ops(&fn);
   mir_fold_address_offsets(&fn);
   mir_cse_loads(&fn);
+  mir_slp_pair_f64(&fn);
   mir_rotate_loops(&fn);
   mir_thread_branch_over_jump(&fn);
   mir_sink_cold_exits(&fn);
