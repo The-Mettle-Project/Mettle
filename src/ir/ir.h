@@ -521,6 +521,11 @@ typedef struct {
    * the target type; for IR_OP_DECLARE_LOCAL the local's type. NULL when not
    * applicable or synthesized by the optimizer. */
   MtlcType *value_type;
+  /* Which class of value a LOAD or STORE moves, for the whole-program alias
+   * analysis (ir_optimize_alias.c). Deliberately NOT value_type: that field
+   * feeds ABI classification and the GPU emitters, and a load's POINTEE type
+   * is not the "result type" they read it as. 0 = unrecorded. */
+  unsigned char alias_class;
   /* Which `comptime for` iteration generated this instruction, already
    * formatted the way a diagnostic says it ("iteration 1 (field `kind`)").
    * NULL for anything the programmer wrote directly.
@@ -577,6 +582,22 @@ typedef struct {
   size_t *predecessors;
   size_t predecessor_count;
 } IRBasicBlock;
+
+/* Value classes the alias analysis distinguishes. Two accesses of different
+ * classes touch different memory unless the program is punning, which the
+ * analysis checks for directly. Kept here so lowering and the optimizer agree
+ * on the numbering. */
+typedef enum {
+  IR_ALIAS_CLASS_NONE = 0,
+  IR_ALIAS_CLASS_POINTER,
+  IR_ALIAS_CLASS_I8,
+  IR_ALIAS_CLASS_I16,
+  IR_ALIAS_CLASS_I32,
+  IR_ALIAS_CLASS_I64,
+  IR_ALIAS_CLASS_F32,
+  IR_ALIAS_CLASS_F64,
+  IR_ALIAS_CLASS_COUNT
+} IRAliasClassId;
 
 typedef struct {
   char *name;

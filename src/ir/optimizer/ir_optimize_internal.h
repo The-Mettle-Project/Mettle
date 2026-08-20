@@ -535,6 +535,20 @@ int ir_fold_readonly_globals_pass(IRProgram *program,
 IRFunction *ir_program_find_function(IRProgram *program, const char *name);
 /* `@pure` loop-invariant call hoisting (program-level; runs after inlining). */
 int ir_hoist_pure_calls_pass(IRProgram *program, int *changed);
+
+/* Whole-program alias facts (ir_optimize_alias.c). Built once after inlining
+ * has settled the call graph; queried by the memory passes. */
+void ir_alias_facts_build(IRProgram *program);
+void ir_alias_facts_reset(void);
+/* Do these two resolved bases provably reach different allocations? Bases are
+ * spelled the way re_resolve_addr spells them: '&' + variable, 's' + symbol,
+ * 't' + temp. Conservative: 0 means "unproven", never "they alias". */
+int ir_alias_bases_distinct(const IRFunction *function, const char *base_a,
+                            const char *base_b);
+/* Do these two access classes (IRAliasClassId, recorded by lowering) name
+ * memory the program never views as both? Conservative: 0 whenever either is
+ * unrecorded, or either class is punned anywhere in the program. */
+int ir_alias_classes_distinct(unsigned a, unsigned b);
 void ir_instruction_clear_arguments(IRInstruction *instruction);
 void ir_instruction_destroy_storage(IRInstruction *instruction);
 int ir_instruction_has_side_effect(const IRInstruction *instruction);

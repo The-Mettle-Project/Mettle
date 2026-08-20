@@ -198,6 +198,54 @@ void ir_assign_apply_float_bits(IRInstruction *instruction,
 /* Mark a LOAD instruction (and its destination temp) as floating when the
  * loaded type is float32/float64, recording the width. Backends key off this
  * to pick movss/cvtss* vs movsd/cvtsd* and 4- vs 8-byte memory access. */
+/* Record WHICH class of value a load or store moves, alongside the float and
+ * unsigned flags that only say how wide it is and how to extend it. The
+ * whole-program alias analysis reads this to tell a slot holding a pointer
+ * from a slot holding an integer of the same width, which no size can tell
+ * apart. It goes in its own field: value_type feeds ABI classification and the
+ * GPU emitters, which read it as the instruction's result type, and a load's
+ * pointee type is a different thing. */
+void ir_access_apply_alias_class(IRInstruction *access, Type *accessed_type) {
+  if (!access || !accessed_type) {
+    return;
+  }
+  switch (accessed_type->kind) {
+  case TYPE_POINTER:
+  case TYPE_FUNCTION_POINTER:
+  case TYPE_STRING:
+    access->alias_class = IR_ALIAS_CLASS_POINTER;
+    break;
+  case TYPE_INT8:
+  case TYPE_UINT8:
+  case TYPE_BOOL:
+    access->alias_class = IR_ALIAS_CLASS_I8;
+    break;
+  case TYPE_INT16:
+  case TYPE_UINT16:
+    access->alias_class = IR_ALIAS_CLASS_I16;
+    break;
+  case TYPE_INT32:
+  case TYPE_UINT32:
+    access->alias_class = IR_ALIAS_CLASS_I32;
+    break;
+  case TYPE_INT64:
+  case TYPE_UINT64:
+    access->alias_class = IR_ALIAS_CLASS_I64;
+    break;
+  case TYPE_FLOAT32:
+    access->alias_class = IR_ALIAS_CLASS_F32;
+    break;
+  case TYPE_FLOAT64:
+    access->alias_class = IR_ALIAS_CLASS_F64;
+    break;
+  default:
+    /* Aggregates carry their members' storage; a whole-aggregate move is not
+     * a typed scalar access and never disambiguates. */
+    access->alias_class = IR_ALIAS_CLASS_NONE;
+    break;
+  }
+}
+
 void ir_load_apply_float_type(IRInstruction *load, Type *loaded_type) {
   if (!load || !loaded_type) {
     return;

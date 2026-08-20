@@ -825,6 +825,17 @@ int ir_optimize_program_pipeline(IRProgram *program,
     ir_pass_time_end("layout_factor [program]", t0);
   }
 
+  /* Whole-program alias facts, built once the call graph has settled: the
+   * memory passes in the per-function stage ask which parameters can reach
+   * the same allocation, and the answer comes from every call site at once.
+   * After inlining, because an inlined body's arguments are the caller's own
+   * values and no longer a question about parameters. */
+  if (!ir_pass_name_is_skipped("alias_facts")) {
+    double t0 = ir_pass_time_begin();
+    ir_alias_facts_build(program);
+    ir_pass_time_end("alias_facts [program]", t0);
+  }
+
   /* Give the per-function contract verifier program access for the duration
    * of the stage: the call-in-body fix simulation re-runs the inliner on a
    * caller clone, which needs callee lookup. */
@@ -832,6 +843,7 @@ int ir_optimize_program_pipeline(IRProgram *program,
   if (!ir_run_program_stage_for_each_function(
           program, ir_optimize_function_pipeline)) {
     ir_explain_set_program(NULL);
+    ir_alias_facts_reset();
     /* A violated `@simd!` contract already printed a user diagnostic; don't
      * dress it up as an internal compiler error. */
     if (!ir_optimize_had_user_error()) {
@@ -841,6 +853,9 @@ int ir_optimize_program_pipeline(IRProgram *program,
     return 0;
   }
   ir_explain_set_program(NULL);
+  /* The facts index functions by pointer; nothing may consult them once the
+   * program can be rewritten or freed. */
+  ir_alias_facts_reset();
 
   /* Function-level contracts, now that every optimization that could satisfy
    * them has run. `@inline!` is skipped when function boundaries are pinned

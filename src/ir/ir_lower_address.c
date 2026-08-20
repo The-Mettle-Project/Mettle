@@ -185,6 +185,7 @@ int ir_emit_aggregate_literal_copy(IRLoweringContext *context,
   store.dest = ir_clone_operand_local(dest_address);
   store.lhs = value;
   store.rhs = ir_operand_int((long long)dest_type->size);
+  ir_access_apply_alias_class(&store, dest_type);
   int ok = ir_emit(context, function, &store);
   ir_operand_destroy(&store.dest);
   ir_operand_destroy(&value);

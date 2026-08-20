@@ -63,6 +63,7 @@ static int ir_lower_multi_return_value(IRLoweringContext *context,
     store.dest = field_address;
     store.lhs = component;
     store.rhs = ir_operand_int(ir_type_storage_size(field_type));
+    ir_access_apply_alias_class(&store, field_type);
     if (field_type->kind == TYPE_FLOAT32 || field_type->kind == TYPE_FLOAT64) {
       ir_assign_apply_float_bits(&store, &store.lhs,
                                  ir_type_float_bits(field_type));
@@ -158,6 +159,7 @@ static int ir_lower_multi_assignment(IRLoweringContext *context,
     load.rhs = ir_operand_int(ir_type_storage_size(field_type));
     ir_load_apply_float_type(&load, field_type);
     ir_load_apply_unsigned(&load, field_type);
+    ir_access_apply_alias_class(&load, field_type);
     if (!ir_emit(context, function, &load)) {
       goto cleanup;
     }
@@ -597,6 +599,7 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     store.dest = address;
     store.lhs = value;
     store.rhs = ir_operand_int(ir_type_storage_size(target_type));
+    ir_access_apply_alias_class(&store, target_type);
     if (target_type->kind == TYPE_FLOAT32 ||
         target_type->kind == TYPE_FLOAT64) {
       ir_assign_apply_float_bits(&store, &store.lhs,

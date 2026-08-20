@@ -376,6 +376,7 @@ int ir_local_declared_float_bits(IRLoweringContext *context,
 void ir_assign_apply_float_bits(IRInstruction *instruction,
                                        IROperand *value, int bits);
 
+void ir_access_apply_alias_class(IRInstruction *access, Type *accessed_type);
 void ir_load_apply_float_type(IRInstruction *load, Type *loaded_type);
 
 void ir_load_apply_unsigned(IRInstruction *load, Type *loaded_type);

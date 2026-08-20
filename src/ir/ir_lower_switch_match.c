@@ -529,6 +529,7 @@ int ir_lower_match_statement(IRLoweringContext *context,
          * from the arm went out in RAX while the caller read XMM0. */
         ir_load_apply_float_type(&load, payload_type);
         ir_load_apply_unsigned(&load, payload_type);
+        ir_access_apply_alias_class(&load, payload_type);
         payload_value.float_bits = load.dest.float_bits;
         if (!ir_emit(context, function, &load) ||
             !ir_emit_symbol_assignment(context, function, arm->binding_name,
@@ -834,6 +835,7 @@ int ir_lower_match_expression(IRLoweringContext *context,
         /* Same typing as the statement form above; see that comment. */
         ir_load_apply_float_type(&load, payload_type);
         ir_load_apply_unsigned(&load, payload_type);
+        ir_access_apply_alias_class(&load, payload_type);
         payload_value.float_bits = load.dest.float_bits;
         if (!ir_emit(context, function, &load) ||
             !ir_emit_symbol_assignment(context, function, arm->binding_name,

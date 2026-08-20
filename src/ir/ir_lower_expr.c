@@ -1590,6 +1590,7 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
       load.rhs = ir_operand_int(ir_type_storage_size(target_type));
       ir_load_apply_float_type(&load, target_type);
       ir_load_apply_unsigned(&load, target_type);
+      ir_access_apply_alias_class(&load, target_type);
       if (!ir_emit(context, function, &load)) {
         ir_operand_destroy(&destination);
         ir_operand_destroy(&address);
@@ -1750,6 +1751,7 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
     load.rhs = ir_operand_int(ir_type_storage_size(value_type));
     ir_load_apply_float_type(&load, value_type);
     ir_load_apply_unsigned(&load, value_type);
+    ir_access_apply_alias_class(&load, value_type);
     if (!ir_emit(context, function, &load)) {
       ir_operand_destroy(&destination);
       ir_operand_destroy(&address);

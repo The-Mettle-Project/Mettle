@@ -478,6 +478,9 @@ typedef struct {
   char *base; /* NULL = every location */
   long long off;
   long long size;
+  /* What class of value the access moves, so a store of one class can be told
+   * from a slot holding another. 0 when lowering did not record it. */
+  unsigned char alias_class;
 } REMemRegion;
 
 typedef struct {
@@ -497,7 +500,7 @@ static void re_kills_destroy(REKillLog *log) {
 }
 
 static int re_kills_append(REKillLog *log, const char *base, long long off,
-                           long long size) {
+                           unsigned alias_class, long long size) {
   if (log->count == log->capacity) {
     size_t capacity = log->capacity ? log->capacity * 2 : 16;
     REMemRegion *grown = realloc(log->items, capacity * sizeof(REMemRegion));
@@ -514,13 +517,15 @@ static int re_kills_append(REKillLog *log, const char *base, long long off,
   }
   slot->off = off;
   slot->size = size;
+  slot->alias_class = (unsigned char)alias_class;
   log->count++;
   return 1;
 }
 
 /* Does a write to `kill` invalidate a value read from `mem`? */
-static int re_kill_hits(const REMemRegion *kill, const char *mem_base,
-                        long long mem_off, long long mem_size) {
+static int re_kill_hits(const IRFunction *function, const REMemRegion *kill,
+                        const char *mem_base, long long mem_off,
+                        long long mem_size, unsigned mem_class) {
   if (!kill->base || !mem_base) {
     return 1;
   }
@@ -529,6 +534,16 @@ static int re_kill_hits(const REMemRegion *kill, const char *mem_base,
   }
   if (kill->base[0] == '&' && mem_base[0] == '&') {
     return 0; /* two distinct variables cannot overlap */
+  }
+  /* Different classes, in a program that never views one address as both. */
+  if (ir_alias_classes_distinct(kill->alias_class, mem_class)) {
+    return 0;
+  }
+  /* Two pointers the whole program proves reach different allocations. This is
+   * the rule above carried across a call: the caller knew the arguments were
+   * distinct variables, and the callee sees only parameters. */
+  if (ir_alias_bases_distinct(function, kill->base, mem_base)) {
+    return 0;
   }
   return 1;
 }
@@ -540,6 +555,7 @@ typedef struct {
   char *mem_base; /* what the value was read from; NULL = anywhere */
   long long mem_off;
   long long mem_size;
+  unsigned char mem_class;
   size_t kill_pos;      /* kill-log length when recorded */
   unsigned merge_epoch; /* merge count when recorded */
   int survives_summary; /* no store anywhere in the function can change it */
@@ -590,8 +606,9 @@ static void re_table_truncate(RETable *table, size_t mark) {
 static int re_table_push(RETable *table, const char *key, const char *value,
                          const char *dep0, const char *dep1, int volatile_value,
                          const char *mem_base, long long mem_off,
-                         long long mem_size, size_t kill_pos,
-                         unsigned merge_epoch, int survives_summary) {
+                         long long mem_size, unsigned mem_class,
+                         size_t kill_pos, unsigned merge_epoch,
+                         int survives_summary) {
   if (table->count == table->capacity) {
     size_t capacity = table->capacity ? table->capacity * 2 : 32;
     REEntry *grown = realloc(table->items, capacity * sizeof(REEntry));
@@ -615,6 +632,7 @@ static int re_table_push(RETable *table, const char *key, const char *value,
   }
   entry->mem_off = mem_off;
   entry->mem_size = mem_size;
+  entry->mem_class = (unsigned char)mem_class;
   entry->kill_pos = kill_pos;
   entry->merge_epoch = merge_epoch;
   entry->survives_summary = survives_summary;
@@ -627,8 +645,8 @@ static int re_table_push(RETable *table, const char *key, const char *value,
  * recorded overlaps what it read: not one of the targeted kills behind it in
  * the log, and, if a merge has been crossed (a path this walk never visited
  * joins back in), nothing the whole function can store. */
-static int re_entry_valid(const REEntry *entry, const REKillLog *kills,
-                          unsigned merge_epoch) {
+static int re_entry_valid(const IRFunction *function, const REEntry *entry,
+                          const REKillLog *kills, unsigned merge_epoch) {
   if (!entry->volatile_value) {
     return 1;
   }
@@ -636,20 +654,21 @@ static int re_entry_valid(const REEntry *entry, const REKillLog *kills,
     return 0;
   }
   for (size_t k = entry->kill_pos; k < kills->count; k++) {
-    if (re_kill_hits(&kills->items[k], entry->mem_base, entry->mem_off,
-                     entry->mem_size)) {
+    if (re_kill_hits(function, &kills->items[k], entry->mem_base,
+                     entry->mem_off, entry->mem_size, entry->mem_class)) {
       return 0;
     }
   }
   return 1;
 }
 
-static const char *re_table_lookup(const RETable *table, const char *key,
+static const char *re_table_lookup(const IRFunction *function,
+                                   const RETable *table, const char *key,
                                    const REKillLog *kills,
                                    unsigned merge_epoch) {
   for (size_t i = table->count; i-- > 0;) {
     const REEntry *entry = &table->items[i];
-    if (!re_entry_valid(entry, kills, merge_epoch)) {
+    if (!re_entry_valid(function, entry, kills, merge_epoch)) {
       continue;
     }
     if (strcmp(entry->key, key) == 0) {
@@ -845,10 +864,11 @@ static int re_instruction_write_region(const IRFunction *function,
                                        const IRTempValueMap *addr_taken,
                                        const IRInstruction *ins, char *base,
                                        size_t base_size, long long *off,
-                                       long long *size) {
+                                       long long *size, unsigned *klass) {
   base[0] = '\0';
   *off = 0;
   *size = RE_MEM_WHOLE;
+  *klass = ins->op == IR_OP_STORE ? ins->alias_class : IR_ALIAS_CLASS_NONE;
 
   if (ins->op == IR_OP_STORE) {
     REAddr addr = {0};
@@ -991,12 +1011,14 @@ static void re_replace_with_copy(IRInstruction *ins, const char *value,
 /* Would any store the function makes, anywhere, hit this region? Decides
  * whether an entry may outlive a merge point. */
 static int re_survives_summary(const REWalk *walk, const char *mem_base,
-                               long long mem_off, long long mem_size) {
+                               long long mem_off, long long mem_size,
+                               unsigned mem_class) {
   if (walk->summary_unknown || !mem_base) {
     return walk->summary.count == 0 && !walk->summary_unknown && mem_base;
   }
   for (size_t k = 0; k < walk->summary.count; k++) {
-    if (re_kill_hits(&walk->summary.items[k], mem_base, mem_off, mem_size)) {
+    if (re_kill_hits(walk->function, &walk->summary.items[k], mem_base,
+                     mem_off, mem_size, mem_class)) {
       return 0;
     }
   }
@@ -1065,9 +1087,11 @@ static void re_process_block(REWalk *walk, size_t block_index,
           }
         }
         const char *hit =
-            re_table_lookup(&walk->local, key, &walk->kills, walk->merge_epoch);
+            re_table_lookup(walk->function, &walk->local, key, &walk->kills,
+                            walk->merge_epoch);
         if (!hit) {
-          hit = re_table_lookup(&walk->global, key, &walk->kills,
+          hit = re_table_lookup(walk->function, &walk->global, key,
+                                &walk->kills,
                                 walk->merge_epoch);
         }
         if (hit && ins->dest.name && strcmp(hit, ins->dest.name) != 0) {
@@ -1083,13 +1107,16 @@ static void re_process_block(REWalk *walk, size_t block_index,
           const char *dep0 = is_load ? (addr.is_address_of ? NULL : addr.name)
                                      : re_dep_name(&ins->lhs);
           const char *dep1 = is_load ? NULL : re_dep_name(&ins->rhs);
+          unsigned mem_class =
+              is_load ? ins->alias_class : IR_ALIAS_CLASS_NONE;
           int survives =
-              volatile_value
-                  ? re_survives_summary(walk, mem_base, mem_off, mem_size)
-                  : 1;
+              volatile_value ? re_survives_summary(walk, mem_base, mem_off,
+                                                   mem_size, mem_class)
+                             : 1;
           if (!re_table_push(&walk->local, key, ins->dest.name, dep0, dep1,
                              volatile_value, mem_base, mem_off, mem_size,
-                             walk->kills.count, walk->merge_epoch, survives)) {
+                             mem_class, walk->kills.count, walk->merge_epoch,
+                             survives)) {
             walk->failed = 1;
             return;
           }
@@ -1100,7 +1127,8 @@ static void re_process_block(REWalk *walk, size_t block_index,
               re_def_count(walk->defs, IR_OPERAND_TEMP, ins->dest.name) == 1 &&
               !re_table_push(&walk->global, key, ins->dest.name, NULL, NULL,
                              volatile_value, mem_base, mem_off, mem_size,
-                             walk->kills.count, walk->merge_epoch, survives)) {
+                             mem_class, walk->kills.count, walk->merge_epoch,
+                             survives)) {
             walk->failed = 1;
             return;
           }
@@ -1111,10 +1139,11 @@ static void re_process_block(REWalk *walk, size_t block_index,
     {
       char wbase[RE_NAME_MAX + 1];
       long long woff, wsize;
+      unsigned wtype = IR_ALIAS_CLASS_NONE;
       if (re_instruction_write_region(walk->function, walk->defs,
                                       walk->addr_taken, ins, wbase,
-                                      sizeof(wbase), &woff, &wsize) &&
-          !re_kills_append(&walk->kills, wbase[0] ? wbase : NULL, woff,
+                                      sizeof(wbase), &woff, &wsize, &wtype) &&
+          !re_kills_append(&walk->kills, wbase[0] ? wbase : NULL, woff, wtype,
                            wsize)) {
         walk->failed = 1;
         return;
@@ -1182,15 +1211,17 @@ int ir_redundancy_elimination_pass(IRFunction *function, int *changed) {
     for (size_t i = 0; i < function->instruction_count; i++) {
       char wbase[RE_NAME_MAX + 1];
       long long woff, wsize;
+      unsigned wtype = IR_ALIAS_CLASS_NONE;
       const IRInstruction *ins = &function->instructions[i];
       if (ins->op == IR_OP_NOP ||
           !re_instruction_write_region(function, &defs, &addr_taken, ins,
-                                       wbase, sizeof(wbase), &woff, &wsize)) {
+                                       wbase, sizeof(wbase), &woff, &wsize,
+                                       &wtype)) {
         continue;
       }
       if (!wbase[0]) {
         walk.summary_unknown = 1;
-      } else if (!re_kills_append(&walk.summary, wbase, woff, wsize)) {
+      } else if (!re_kills_append(&walk.summary, wbase, woff, wtype, wsize)) {
         walk.failed = 1;
         break;
       }
@@ -1776,23 +1807,26 @@ static int re_collect_loop_writes(const IRFunction *function,
   for (size_t i = lo; i <= hi; i++) {
     char wbase[RE_NAME_MAX + 1];
     long long woff, wsize;
+    unsigned wtype = IR_ALIAS_CLASS_NONE;
     const IRInstruction *ins = &function->instructions[i];
     if (ins->op == IR_OP_NOP ||
         !re_instruction_write_region(function, defs, addr_taken, ins, wbase,
-                                     sizeof(wbase), &woff, &wsize)) {
+                                     sizeof(wbase), &woff, &wsize, &wtype)) {
       continue;
     }
-    if (!wbase[0] || !re_kills_append(log, wbase, woff, wsize)) {
+    if (!wbase[0] || !re_kills_append(log, wbase, woff, wtype, wsize)) {
       return 0;
     }
   }
   return 1;
 }
 
-static int re_region_survives_log(const REKillLog *log, const char *base,
-                                  long long off, long long size) {
+static int re_region_survives_log(const IRFunction *function,
+                                  const REKillLog *log, const char *base,
+                                  long long off, long long size,
+                                  unsigned klass) {
   for (size_t k = 0; k < log->count; k++) {
-    if (re_kill_hits(&log->items[k], base, off, size)) {
+    if (re_kill_hits(function, &log->items[k], base, off, size, klass)) {
       return 0;
     }
   }
@@ -1869,8 +1903,8 @@ static int re_try_hoist_one_load(IRFunction *function, const REDefs *defs_in,
       if (snprintf(membuf, sizeof(membuf), "%c%s",
                    addr.is_address_of ? '&' : 's',
                    addr.name) >= (int)sizeof(membuf) ||
-          !re_region_survives_log(&writes, membuf, addr.offset,
-                                  load->rhs.int_value)) {
+          !re_region_survives_log(function, &writes, membuf, addr.offset,
+                                  load->rhs.int_value, load->alias_class)) {
         continue;
       }
 
@@ -2131,8 +2165,10 @@ static int re_try_promote_one(IRFunction *function, const REDefs *defs_in,
                        a.name) < (int)sizeof(abase);
           long long asize =
               ins->rhs.kind == IR_OPERAND_INT ? ins->rhs.int_value : RE_MEM_WHOLE;
-          REMemRegion probe = {resolvable ? abase : NULL, a.offset, asize};
-          if (!re_kill_hits(&probe, region_base, region.offset, size)) {
+          REMemRegion probe = {resolvable ? abase : NULL, a.offset, asize,
+                               ins->alias_class};
+          if (!re_kill_hits(function, &probe, region_base, region.offset, size,
+                            seed->alias_class)) {
             continue; /* provably elsewhere */
           }
           /* it may touch the region: it must BE the region, exactly */
@@ -2170,11 +2206,14 @@ static int re_try_promote_one(IRFunction *function, const REDefs *defs_in,
         {
           char wbase[RE_NAME_MAX + 1];
           long long woff, wsize;
+          unsigned wtype = IR_ALIAS_CLASS_NONE;
           if (re_instruction_write_region(function, &defs, addr_taken, ins,
-                                          wbase, sizeof(wbase), &woff,
-                                          &wsize)) {
-            REMemRegion probe = {wbase[0] ? wbase : NULL, woff, wsize};
-            if (re_kill_hits(&probe, region_base, region.offset, size)) {
+                                          wbase, sizeof(wbase), &woff, &wsize,
+                                          &wtype)) {
+            REMemRegion probe = {wbase[0] ? wbase : NULL, woff, wsize,
+                                 (unsigned char)wtype};
+            if (re_kill_hits(function, &probe, region_base, region.offset, size,
+                             seed->alias_class)) {
               viable = 0;
               break;
             }
