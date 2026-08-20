@@ -5489,6 +5489,14 @@ static void mir_compute_const_compare_skips(CodeGenerator *g,
   }
 }
 
+/* What can carry a memory operand's base: a temp, or a pointer-valued symbol
+ * (a parameter or local the allocator keeps in a register). */
+static int mir_addr_base_operand_kind(const IROperand *operand) {
+  return operand && operand->name &&
+         (operand->kind == IR_OPERAND_TEMP ||
+          operand->kind == IR_OPERAND_SYMBOL);
+}
+
 static void mir_compute_address_folds(const IRFunction *f,
                                       const MirTempUseIndex *uses, char *skip,
                                       MirAddrFold *folds) {
@@ -5640,17 +5648,24 @@ static void mir_compute_address_folds(const IRFunction *f,
       const IROperand *o1 = &padd->rhs;
       const IROperand *base = NULL;
       const IROperand *cst = NULL;
-      if (o0->kind == IR_OPERAND_TEMP && o0->name && o1->kind == IR_OPERAND_INT) {
+      int base_is_symbol = 0;
+      if (mir_addr_base_operand_kind(o0) && o1->kind == IR_OPERAND_INT) {
         base = o0;
         cst = o1;
-      } else if (o1->kind == IR_OPERAND_TEMP && o1->name &&
+      } else if (mir_addr_base_operand_kind(o1) &&
                  o0->kind == IR_OPERAND_INT) {
         base = o1;
         cst = o0;
       }
+      base_is_symbol = base && base->kind == IR_OPERAND_SYMBOL;
+      /* A symbol base is re-read at the access rather than at the add, so it
+       * has to survive the gap even when there is only one access; a temp is
+       * written once and cannot. `p->field` through a pointer parameter is the
+       * shape this reaches, and it was materializing the address into a
+       * register for every field read in the function. */
       if (base && cst->int_value >= -2147483648LL &&
           cst->int_value <= 2147483647LL &&
-          (addr_reads == 1 ||
+          ((addr_reads == 1 && !base_is_symbol) ||
            mir_addr_fold_multiuse_safe(f, (size_t)ai, addr->name, base, cst,
                                        addr_reads))) {
         folds[i].valid = 1;
