@@ -887,6 +887,13 @@ static int xmm_mov(BinaryCodeBuffer *code, BinaryXmmRegister dst,
 static int xmm_load_fimm(MirFunction *fn, uint64_t bits,
                          BinaryXmmRegister target, int width) {
   BinaryCodeBuffer *code = &fn->context->code;
+  /* +0.0 is the one constant with no bits to move: pxor is shorter, needs no
+   * general register, and breaks the dependence on the target's old value.
+   * Comparing against zero and zero-initializing an accumulator are the two
+   * places it turns up, and both are common in float code. */
+  if (bits == 0) {
+    return binary_emit_pxor_xmm_xmm(code, target, target);
+  }
   if (width == 4) {
     return binary_emit_mov_reg_imm32_zero_extend(code, SCRATCH_A,
                                                  (uint32_t)bits) &&

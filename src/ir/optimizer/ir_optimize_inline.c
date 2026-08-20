@@ -125,9 +125,17 @@ static MTLC_THREAD_LOCAL const char *g_inline_refusal_code = NULL;
 /* When `why_not`/`fix` are non-NULL they receive a user-facing reason and an
  * actionable suggestion (static strings) every time this returns 0; --explain
  * reports them verbatim. A NULL fix means there is nothing actionable. */
-static int ir_function_is_inline_candidate(const IRFunction *function,
-                                           const char **why_not,
-                                           const char **fix) {
+/* `site_loop_depth` is how many of the caller's loops enclose the call, which
+ * is how many trip counts its call sequence multiplies by. A site nested two
+ * deep or more doubles the callee size budget: a callee just over the cap that
+ * an inner loop reaches every iteration is exactly the one worth copying in,
+ * and copying it is what exposes its field reads to values the caller already
+ * holds. One loop is not enough on its own -- that is the case --pgo exists to
+ * measure. */
+static int ir_function_is_inline_candidate_at(const IRFunction *function,
+                                              int site_loop_depth,
+                                              const char **why_not,
+                                              const char **fix) {
   const char *unused;
   if (!why_not) {
     why_not = &unused;
@@ -155,6 +163,9 @@ static int ir_function_is_inline_candidate(const IRFunction *function,
    * the must-have-a-return rule still apply. */
   int forced = function->is_inline;
   size_t body_budget = ir_opt_inline_body_budget(function);
+  if (site_loop_depth >= 2) {
+    body_budget *= 2u;
+  }
   size_t nested_call_budget = ir_opt_inline_nested_call_budget(function);
 
   if (!forced && ir_function_name_is_inline_denylisted(function->name)) {
@@ -276,6 +287,12 @@ static int ir_function_is_inline_candidate(const IRFunction *function,
     return 0;
   }
   return 1;
+}
+
+static int ir_function_is_inline_candidate(const IRFunction *function,
+                                           const char **why_not,
+                                           const char **fix) {
+  return ir_function_is_inline_candidate_at(function, 0, why_not, fix);
 }
 
 static size_t ir_function_non_nop_instruction_count(const IRFunction *function) {
@@ -788,9 +805,11 @@ static int ir_call_site_is_in_loop(const IRFunction *function, size_t site) {
 /* Bitmap form of ir_call_site_is_in_loop for the inliner's walk over an
  * over-budget caller: marks every [header, last back-jump] range once,
  * instead of re-deriving loop membership per call site (which was quadratic
- * on machine-generated functions with hundreds of loops and calls). Returns
- * NULL on allocation failure or when the function has no loops -- callers
- * fall back to the per-site scan. */
+ * on machine-generated functions with hundreds of loops and calls). Each byte
+ * counts the loops enclosing that instruction, so a nonzero byte answers
+ * "inside a loop" and the value answers "how deep". Returns NULL on allocation
+ * failure or when the function has no loops -- callers fall back to the
+ * per-site scan. */
 static char *ir_build_in_loop_bitmap(const IRFunction *function) {
   char *in_loop = NULL;
   for (size_t h = 0; h < function->instruction_count; h++) {
@@ -818,7 +837,14 @@ static char *ir_build_in_loop_bitmap(const IRFunction *function) {
         return NULL;
       }
     }
-    memset(in_loop + h, 1, last - h + 1);
+    /* Accumulate rather than set: the byte ends up holding how many loops
+     * enclose the instruction, which is how many trip counts a call sitting
+     * there multiplies by. */
+    for (size_t k = h; k <= last; k++) {
+      if ((unsigned char)in_loop[k] < 255) {
+        in_loop[k] = (char)(in_loop[k] + 1);
+      }
+    }
   }
   return in_loop;
 }
@@ -860,7 +886,10 @@ static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
    * which cost nothing measurable as real calls. */
   int caller_over_budget = ir_function_non_nop_instruction_count(function) >
                            ir_opt_inline_caller_budget(function);
-  char *in_loop = caller_over_budget ? ir_build_in_loop_bitmap(function) : NULL;
+  /* Built for every caller, not just over-budget ones: the callee size budget
+   * reads it too, so a loop-resident site can take a callee a one-shot site
+   * would not. */
+  char *in_loop = ir_build_in_loop_bitmap(function);
 
   /* Pre-scan: find the first call site that will actually inline. Callers with
    * none (the common case once the program stabilizes) skip the rebuild -- the
@@ -879,7 +908,8 @@ static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
            ir_function_is_tiny_leaf(callee) || ir_opt_function_is_hot(callee) ||
            ir_opt_site_is_hot(function, instruction->location) ||
            (in_loop && in_loop[i])) &&
-          ir_function_is_inline_candidate(callee, NULL, NULL)) {
+          ir_function_is_inline_candidate_at(callee, in_loop ? in_loop[i] : 0,
+                                             NULL, NULL)) {
         first_inline = i;
         break;
       }
@@ -910,7 +940,8 @@ static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
            ir_function_is_tiny_leaf(callee) || ir_opt_function_is_hot(callee) ||
            ir_opt_site_is_hot(function, instruction->location) ||
            (in_loop && in_loop[i])) &&
-          ir_function_is_inline_candidate(callee, NULL, NULL)) {
+          ir_function_is_inline_candidate_at(callee, in_loop ? in_loop[i] : 0,
+                                             NULL, NULL)) {
         if (ir_explain_enabled()) {
           char entity[160];
           size_t weight = ir_function_non_nop_instruction_count(callee);
@@ -1124,6 +1155,24 @@ static int ir_function_contains_simd_kernel(const IRFunction *function) {
   return 0;
 }
 
+/* Loop depth of one call site, for the report to agree with the decision. */
+static int ir_inline_site_loop_depth(IRFunction *caller,
+                                     const IRInstruction *instruction) {
+  char *depths;
+  int depth = 0;
+  if (!caller || instruction < caller->instructions ||
+      (size_t)(instruction - caller->instructions) >=
+          caller->instruction_count) {
+    return 0;
+  }
+  depths = ir_build_in_loop_bitmap(caller);
+  if (depths) {
+    depth = (unsigned char)depths[instruction - caller->instructions];
+    free(depths);
+  }
+  return depth;
+}
+
 static void ir_inline_site_reason(IRFunction *caller,
                                   const IRInstruction *instruction,
                                   IRFunction *callee, const char **reason,
@@ -1168,7 +1217,9 @@ static void ir_inline_site_reason(IRFunction *caller,
     IR_INLINE_WHY(reason, "argument-count",
                   "the call's argument count doesn't match what the inliner "
                   "handles for this callee");
-  } else if (ir_function_is_inline_candidate(callee, reason, fix)) {
+  } else if (ir_function_is_inline_candidate_at(
+                 callee, ir_inline_site_loop_depth(caller, instruction), reason,
+                 fix)) {
     /* Candidate-eligible but still here: the call site appeared late (a
      * nested inline in the final round) or rounds hit their cap. */
     IR_INLINE_WHY(reason, "rounds-exhausted",
