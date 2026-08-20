@@ -231,6 +231,10 @@ static const char *token_type_to_string(TokenType type) {
     return "'+'";
   case TOKEN_MINUS:
     return "'-'";
+  case TOKEN_PLUS_PLUS:
+    return "'++'";
+  case TOKEN_MINUS_MINUS:
+    return "'--'";
   case TOKEN_MULTIPLY:
     return "'*'";
   case TOKEN_AMPERSAND:
@@ -279,6 +283,14 @@ int parser_expect_statement_end(Parser *parser) {
   if (parser_match(parser, TOKEN_SEMICOLON)) {
     parser_advance(parser);
     return 1;
+  }
+
+  if (parser_match(parser, TOKEN_PLUS_PLUS) ||
+      parser_match(parser, TOKEN_MINUS_MINUS)) {
+    parser_set_error(parser,
+                     "'++' and '--' are statements, not expressions: they "
+                     "produce no value to use here");
+    return 0;
   }
 
   parser_set_error(parser,
@@ -1033,8 +1045,20 @@ static const char *parser_compound_assign_op(TokenType type) {
   }
 }
 
+/* `i++` and `i--` are statements, exactly like `i += 1` and `i -= 1`. They
+ * carry no value, so there is no order-of-evaluation question to answer and no
+ * prefix/postfix distinction to observe: both spellings mean the same step. */
+static const char *parser_increment_op(TokenType type) {
+  switch (type) {
+  case TOKEN_PLUS_PLUS:   return "+";
+  case TOKEN_MINUS_MINUS: return "-";
+  default:                return NULL;
+  }
+}
+
 int parser_is_assignment_token(TokenType type) {
-  return type == TOKEN_EQUALS || parser_compound_assign_op(type) != NULL;
+  return type == TOKEN_EQUALS || parser_compound_assign_op(type) != NULL ||
+         parser_increment_op(type) != NULL;
 }
 
 static ASTNode *parser_parse_assignment_from_target(Parser *parser,
@@ -1051,9 +1075,22 @@ static ASTNode *parser_parse_assignment_from_target(Parser *parser,
 
   TokenType assign_token = parser->current_token.type;
   const char *compound_op = parser_compound_assign_op(assign_token);
+  const char *increment_op = parser_increment_op(assign_token);
+  ASTNode *value = NULL;
 
-  parser_advance(parser); // consume '=' or compound assignment operator
-  ASTNode *value = parser_parse_expression(parser);
+  if (increment_op) {
+    compound_op = increment_op;
+  }
+
+  parser_advance(parser); // consume '=', a compound operator, or '++' / '--'
+
+  if (increment_op) {
+    /* The step is the only operand `++` can have, so it is synthesized here
+     * rather than parsed. */
+    value = ast_create_number_literal(1, target->location, 10);
+  } else {
+    value = parser_parse_expression(parser);
+  }
   if (!value) {
     ast_destroy_node(target);
     return NULL;
@@ -1077,6 +1114,70 @@ static ASTNode *parser_parse_assignment_from_target(Parser *parser,
       return NULL;
     }
     value = combined;
+  }
+
+  if (target->type == AST_IDENTIFIER) {
+    Identifier *id = (Identifier *)target->data;
+    if (!id || !id->name) {
+      ast_destroy_node(target);
+      ast_destroy_node(value);
+      parser_set_error(parser, "Invalid assignment target");
+      return NULL;
+    }
+
+    ASTNode *assign = ast_create_assignment(id->name, value, target->location);
+    ast_destroy_node(target);
+    return assign;
+  }
+
+  return ast_create_field_assignment(target, value, target->location);
+}
+
+/* `++target` and `--target` in statement position. The step is identical to the
+ * postfix spelling above; only the order the two tokens are read in differs. */
+static ASTNode *parser_parse_prefix_increment(Parser *parser) {
+  if (!parser) {
+    return NULL;
+  }
+
+  const char *op = parser_increment_op(parser->current_token.type);
+  if (!op) {
+    return NULL;
+  }
+
+  parser_advance(parser); // consume '++' or '--'
+
+  ASTNode *target = parser_parse_expression(parser);
+  if (!target) {
+    return NULL;
+  }
+  if (!parser_is_assignment_target(target)) {
+    parser_set_error(parser, "Invalid assignment target");
+    ast_destroy_node(target);
+    return NULL;
+  }
+
+  ASTNode *target_clone = ast_clone_node(target);
+  if (!target_clone) {
+    parser_set_error(parser, "Out of memory cloning increment target");
+    ast_destroy_node(target);
+    return NULL;
+  }
+
+  ASTNode *step = ast_create_number_literal(1, target->location, 10);
+  if (!step) {
+    ast_destroy_node(target);
+    ast_destroy_node(target_clone);
+    return NULL;
+  }
+
+  ASTNode *value =
+      ast_create_binary_expression(target_clone, op, step, target->location);
+  if (!value) {
+    ast_destroy_node(target);
+    ast_destroy_node(target_clone);
+    ast_destroy_node(step);
+    return NULL;
   }
 
   if (target->type == AST_IDENTIFIER) {
@@ -1667,6 +1768,9 @@ ASTNode *parser_parse_statement(Parser *parser) {
   }
 
   switch (parser->current_token.type) {
+  case TOKEN_PLUS_PLUS:
+  case TOKEN_MINUS_MINUS:
+    return parser_parse_prefix_increment(parser);
   case TOKEN_EXTERN:
     return parser_parse_declaration(parser);
   case TOKEN_VAR:

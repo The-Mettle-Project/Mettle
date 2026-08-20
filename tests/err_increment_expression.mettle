@@ -1,0 +1,7 @@
+// `++` carries no value, so it cannot appear where one is expected. The
+// diagnostic has to say that rather than complain about a missing semicolon.
+fn main() -> int32 {
+  var i: int32 = 0;
+  var j: int32 = i++;
+  return j;
+}

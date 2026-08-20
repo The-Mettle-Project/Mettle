@@ -94,9 +94,18 @@ Multiline strings are supported. A newline inside the quotes is stored as a lite
 
 ## Operators and Punctuation
 
-Assignment `=`. Compound assignment `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`. Comparison `==`, `!=`, `<`, `>`, `<=`, `>=`. Logical `&&`, `||`. Arithmetic `+`, `-`, `*`, `/`, `%`. Unary `-` (negation), `*` (dereference), `&` (address-of). Member access `.`. Arrow `->`. Range `..` (exclusive) and `..=` (inclusive), used in `for i in lo..hi`. Brackets `( )`, `{ }`, `[ ]`. Delimiters `:`, `;`, `,`. The `@` sigil introduces a loop attribute (`@simd` / `@simd!`); see [Control Flow](control-flow.md#vectorization-contracts).
+Assignment `=`. Compound assignment `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`. Increment `++` and decrement `--`. Comparison `==`, `!=`, `<`, `>`, `<=`, `>=`. Logical `&&`, `||`. Arithmetic `+`, `-`, `*`, `/`, `%`. Unary `-` (negation), `*` (dereference), `&` (address-of). Member access `.`. Arrow `->`. Range `..` (exclusive) and `..=` (inclusive), used in `for i in lo..hi`. Brackets `( )`, `{ }`, `[ ]`. Delimiters `:`, `;`, `,`. The `@` sigil introduces a loop attribute (`@simd` / `@simd!`); see [Control Flow](control-flow.md#vectorization-contracts).
 
 **Compound assignment:** `target OP= value` is exact syntactic sugar for `target = target OP value`, where `OP` is one of `+ - * / % & | ^ << >>`. The target is evaluated as an ordinary assignment target (identifier, struct field, array element, or pointer dereference) and must be a valid lvalue. For example, `count += 1` is identical to `count = count + 1`, and `mask &= 0xFF` is identical to `mask = mask & 0xFF`. Compound assignment is a statement (also valid as a `for`-loop initializer or increment), not an expression, so it does not produce a value. See [Expressions](expressions.md).
+
+**Increment and decrement:** `target++` and `target--` are the one-step forms of `+=` and `-=`, taking the same targets and desugaring the same way: `i++` is `i = i + 1`. They are statements, so they yield no value, and `++target` and `--target` mean exactly what the postfix spellings mean. Nothing observes the order, because there is nothing to observe: a step that produces no value cannot be read before or after itself, so `a[i++] = i++` is not a question Mettle has to answer. Using one where a value is expected is an error that says so. A sub-word target needs the same cast `+=` needs, because the step promotes to `int32` before it is stored back: `u++` on a `uint8` is [M0119](diagnostics.md), and `u = (uint8)(u + 1)` is how it is written.
+
+```mettle
+i++;              // i = i + 1
+--count;          // count = count - 1
+a[2]++;           // any assignment target works
+for (var k: int32 = 0; k < 5; k++) { total += k; }
+```
 
 **Operator precedence:** every binary operator is left-associative. From tightest to loosest: multiplicative (`*`, `/`, `%`), additive (`+`, `-`), shifts (`<<`, `>>`), relational (`<`, `<=`, `>`, `>=`), equality (`==`, `!=`), bitwise AND (`&`), bitwise XOR (`^`), bitwise OR (`|`), logical AND (`&&`), logical OR (`||`). Postfix forms (call, member access, indexing), then unary operators, then casts all bind tighter than any binary operator. So `a + b * c` parses as `a + (b * c)`, `a << 1 < b` parses as `(a << 1) < b`, and `a < b == c` parses as `(a < b) == c`. See [Expressions](expressions.md) for the full table. Use parentheses to override.
 

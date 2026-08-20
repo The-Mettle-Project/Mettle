@@ -14,6 +14,8 @@ arr[i] = x;
 
 **Compound assignment** (`+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`) is syntactic sugar for `target = target OP value`, where `OP` is the corresponding binary operator. The left side must be the same kind of lvalue as for plain assignment. Compound assignment is a statement. It produces no value for use in a larger expression. It is valid in `for`-loop initializers and increments.
 
+**Increment and decrement** (`++`, `--`) are the one-step forms of `+=` and `-=` over the same targets: `i++` is `i = i + 1`, `--count` is `count = count - 1`. They are statements like the compound assignments they stand for, so the prefix and postfix spellings are the same statement, and neither yields a value to read.
+
 ```mettle
 count += 1;
 arr[i] *= 2;

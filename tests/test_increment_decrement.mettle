@@ -1,0 +1,72 @@
+// `++` and `--` are statements that desugar to `+= 1` and `-= 1`, so every
+// assignment target has to accept them and both spellings have to mean the same
+// step. Exits 42 when all of that holds.
+
+struct Counter {
+  hits: int32;
+  misses: int32;
+}
+
+fn main() -> int32 {
+  var i: int32 = 0;
+  i++;
+  i++;
+  ++i;
+  if (i != 3) { return 1; }
+
+  var d: int32 = 10;
+  d--;
+  --d;
+  if (d != 8) { return 2; }
+
+  var a: int32[4];
+  a[2] = 5;
+  a[2]++;
+  --a[2];
+  if (a[2] != 5) { return 3; }
+
+  var c: Counter;
+  c.hits = 100;
+  c.misses = 0;
+  c.hits--;
+  ++c.misses;
+  if (c.hits != 99 || c.misses != 1) { return 4; }
+
+  var p: int32* = &a[0];
+  *p = 7;
+  (*p)++;
+  if (a[0] != 8) { return 5; }
+
+  var f: float64 = 1.5;
+  f++;
+  f--;
+  f--;
+  if (f != 0.5) { return 6; }
+
+  // A sub-word target needs the cast that `w = w + 1` would need, since the
+  // step promotes to int32 exactly as it does for `+=`. See
+  // err_increment_narrow.mettle for the diagnostic when the cast is missing.
+  var w: uint8 = 254;
+  w = (uint8)(w + 1);
+  if (w != 255) { return 7; }
+
+  var u: uint32 = 4294967294;
+  u++;
+  if (u != 4294967295) { return 10; }
+
+  var total: int32 = 0;
+  for (var k: int32 = 0; k < 5; k++) {
+    total += k;
+  }
+  if (total != 10) { return 8; }
+
+  var down: int32 = 0;
+  var n: int32 = 4;
+  while (n > 0) {
+    n--;
+    down++;
+  }
+  if (down != 4 || n != 0) { return 9; }
+
+  return 42;
+}

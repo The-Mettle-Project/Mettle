@@ -961,6 +961,15 @@ Token lexer_next_token(Lexer *lexer) {
       lexer->column += 2;
       return token;
     }
+    if (lexer->position + 1 < lexer->length &&
+        lexer->source[lexer->position + 1] == '+') {
+      token.type = TOKEN_PLUS_PLUS;
+      token_set_static_value(&token, "++");
+      token_set_lexeme(&token, &lexer->source[lexer->position], 2);
+      lexer->position += 2;
+      lexer->column += 2;
+      return token;
+    }
     token.type = TOKEN_PLUS;
     break;
   case '*':
@@ -1086,6 +1095,16 @@ Token lexer_next_token(Lexer *lexer) {
       lexer->source[lexer->position + 1] == '>') {
     token.type = TOKEN_ARROW;
     token_set_static_value(&token, "->");
+    token_set_lexeme(&token, &lexer->source[lexer->position], 2);
+    lexer->position += 2;
+    lexer->column += 2;
+    return token;
+  }
+
+  if (current == '-' && lexer->position + 1 < lexer->length &&
+      lexer->source[lexer->position + 1] == '-') {
+    token.type = TOKEN_MINUS_MINUS;
+    token_set_static_value(&token, "--");
     token_set_lexeme(&token, &lexer->source[lexer->position], 2);
     lexer->position += 2;
     lexer->column += 2;
