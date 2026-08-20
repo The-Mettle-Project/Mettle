@@ -6775,6 +6775,41 @@ static void mir_place_const_pool(MirFunction *fn) {
  * pure relabel + relocate of a straight-line exit block, so it is value- and
  * control-equivalent regardless of the branch's real probability; the loop gate
  * only restricts WHERE it pays off. */
+/* `jcc A; jmp B; A:` is a branch over a branch: five bytes of unconditional
+ * jump on one of the two ways through every if/else and every rotated loop
+ * exit that lands here. Inverting the condition reaches both targets with one
+ * branch: `j!cc B; A:`. x86 condition inversion is the exact complement
+ * (opcode ^ 1), and for the float branches the complement also routes the
+ * unordered (NaN) case to the side the original fall-through took, so the
+ * rewrite is value-equivalent for every input including NaN. */
+static void mir_thread_branch_over_jump(MirFunction *fn) {
+  if (!fn || fn->insn_count < 3) {
+    return;
+  }
+  for (size_t p = 0; p + 2 < fn->insn_count; p++) {
+    MirInst *br = &fn->insns[p];
+    MirInst *jmp = &fn->insns[p + 1];
+    const MirInst *label = &fn->insns[p + 2];
+    if ((br->op != MIR_JCC && br->op != MIR_CMPBR && br->op != MIR_FCMPBR) ||
+        br->dst.kind != MIR_OPK_LABEL || !br->dst.sym) {
+      continue;
+    }
+    if (jmp->op != MIR_JMP || jmp->dst.kind != MIR_OPK_LABEL || !jmp->dst.sym) {
+      continue;
+    }
+    if (label->op != MIR_LABEL || label->dst.kind != MIR_OPK_LABEL ||
+        !label->dst.sym || strcmp(label->dst.sym, br->dst.sym) != 0 ||
+        strcmp(jmp->dst.sym, br->dst.sym) == 0) {
+      continue;
+    }
+    br->cc ^= 1;
+    br->dst = jmp->dst;
+    memset(jmp, 0, sizeof(*jmp));
+    jmp->op = MIR_NOP;
+    jmp->ir_index = -1;
+  }
+}
+
 static void mir_sink_cold_exits(MirFunction *fn) {
   if (!fn || fn->insn_count < 4) {
     return;
@@ -7393,6 +7428,7 @@ int code_generator_binary_emit_function_via_mir(
   mir_fold_address_offsets(&fn);
   mir_cse_loads(&fn);
   mir_rotate_loops(&fn);
+  mir_thread_branch_over_jump(&fn);
   mir_sink_cold_exits(&fn);
   mir_place_const_pool(&fn);
 
