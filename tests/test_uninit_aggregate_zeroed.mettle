@@ -1,0 +1,125 @@
+// An aggregate local declared without an initializer starts zeroed, which is
+// what docs/declarations.md promises and what the definite-assignment checker
+// assumes when it exempts aggregates from the used-before-initialized error.
+//
+// dirty() runs first and fills the same stack region with a recognizable
+// pattern, because a probe run in a fresh frame reads zeros whether or not the
+// compiler emitted anything: without the dirty pass this test passes for the
+// wrong reason. Exits 42 when every probe reads back zero.
+
+struct Inner {
+  a: int32;
+  b: int32;
+}
+
+struct Outer {
+  n: int32;
+  inner: Inner;
+  tail: uint8[6];
+}
+
+fn dirty() -> int32 {
+  var junk: int64[48];
+  var i: int32 = 0;
+  while (i < 48) {
+    junk[i] = 0x5A5A5A5A + (int64)i;
+    i = i + 1;
+  }
+  return (int32)junk[7];
+}
+
+fn probe_array() -> int64 {
+  var a: int64[16];
+  var sum: int64 = 0;
+  var i: int32 = 0;
+  while (i < 16) {
+    sum = sum + a[i];
+    i = i + 1;
+  }
+  return sum;
+}
+
+fn probe_struct() -> int32 {
+  var c: Inner;
+  return c.a + c.b;
+}
+
+fn probe_nested() -> int32 {
+  var o: Outer;
+  var sum: int32 = o.n + o.inner.a + o.inner.b;
+  var i: int32 = 0;
+  while (i < 6) {
+    sum = sum + (int32)o.tail[i];
+    i = i + 1;
+  }
+  return sum;
+}
+
+// A declaration inside a loop is a fresh object each iteration, so it has to
+// start zeroed each iteration rather than once on entry.
+fn probe_loop_scoped() -> int32 {
+  var total: int32 = 0;
+  var i: int32 = 0;
+  while (i < 4) {
+    var c: Inner;
+    total = total + c.a + c.b;
+    c.a = 900;
+    c.b = 900;
+    i = i + 1;
+  }
+  return total;
+}
+
+// `string` is exempt from the used-before-initialized check along with the
+// other aggregates, so an uninitialized one has to be the empty string rather
+// than a garbage length over a wild pointer.
+fn probe_string() -> int64 {
+  var s: string;
+  var total: int64 = (int64)s.length;
+  if (s.chars != 0) {
+    total = total + 1;
+  }
+  return total;
+}
+
+// The fill is skipped when every byte is written before anything reads it, so
+// the read-ahead that decides has to see a read through a method receiver --
+// which is not one of the call's arguments. Writing both fields afterwards
+// would otherwise look like full coverage and elide the fill this read needs.
+fn Inner_total(self: Inner) -> int32 {
+  return self.a + self.b;
+}
+
+fn probe_receiver_read() -> int32 {
+  var v: Inner;
+  var seen: int32 = v.total();
+  v.a = 1;
+  v.b = 2;
+  return seen;
+}
+
+// The elided shape: every byte written before any read. The values have to come
+// out right with no fill emitted at all.
+fn probe_fully_written() -> int32 {
+  var v: Inner;
+  v.a = 20;
+  v.b = 22;
+  return v.a + v.b;
+}
+
+fn main() -> int32 {
+  if (dirty() == 0) { return 1; }
+  if (probe_array() != 0) { return 2; }
+  if (dirty() == 0) { return 3; }
+  if (probe_struct() != 0) { return 4; }
+  if (dirty() == 0) { return 5; }
+  if (probe_nested() != 0) { return 6; }
+  if (dirty() == 0) { return 7; }
+  if (probe_loop_scoped() != 0) { return 8; }
+  if (dirty() == 0) { return 9; }
+  if (probe_string() != 0) { return 10; }
+  if (dirty() == 0) { return 11; }
+  if (probe_receiver_read() != 0) { return 12; }
+  if (probe_fully_written() != 42) { return 13; }
+  return 42;
+}

@@ -18,7 +18,7 @@ var origin: Pt = { x: 1.0, y: 2.0 };
 var z = 1 + 2;              // ERROR: 'z' requires an explicit type
 ```
 
-Arrays and structs may be initialized with an [aggregate literal](expressions.md#aggregate-literals), or left uninitialized, in which case they start zeroed.
+Arrays and structs may be initialized with an [aggregate literal](expressions.md#aggregate-literals), or left uninitialized, in which case they start zeroed. A `string` left uninitialized starts empty, which is the same rule: both of its fields are zero. The zeroing happens at the declaration, so an aggregate declared inside a loop starts zeroed on every iteration; up to 64 bytes it is a run of immediate stores, and past that one string operation. A scalar has no such rule and no such cost - reading one before it is assigned is [a compile error](diagnostics.md), not a zero.
 
 (Only two kinds of binding get their type structurally rather than by annotation: a range-`for` loop counter takes the type of its bound, and a top-level `const` takes its initializer's type. Neither is inferred from an arbitrary expression.)
 

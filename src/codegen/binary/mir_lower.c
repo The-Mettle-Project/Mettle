@@ -927,6 +927,30 @@ static int mir_call_is_runtime_trap(const IRInstruction *in) {
                       strcmp(in->text, "mettle_crash_trap") == 0);
 }
 
+/* The zero-fill lowering emits for an aggregate local declared without an
+ * initializer. It names memset, which the call lowering turns into an inline
+ * rep stos rather than a call, so nothing about it needs a declared callee --
+ * and requiring one would drop every function holding an uninitialized struct
+ * off the register-allocating backend. A user's own memset comes with an
+ * `extern fn` declaration and takes the ordinary known-callee path. */
+static int mir_call_is_inline_zero_fill(const IRInstruction *in) {
+  size_t a = 0;
+
+  if (!in->text || strcmp(in->text, "memset") != 0 ||
+      in->argument_count != 3 || !in->arguments ||
+      in->dest.kind != IR_OPERAND_NONE) {
+    return 0;
+  }
+  for (a = 0; a < 3; a++) {
+    if (in->arguments[a].kind != IR_OPERAND_TEMP &&
+        in->arguments[a].kind != IR_OPERAND_SYMBOL &&
+        in->arguments[a].kind != IR_OPERAND_INT) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 static int mir_arg_float_bits(CodeGenerator *g, const IRFunction *ir_function,
                               const IROperand *op);
 
@@ -1176,6 +1200,9 @@ static int mir_call_is_supported(CodeGenerator *g,
   /* Runtime safety-check traps are terminal and lowered specially (MIR_TRAP),
    * so they bypass the normal known-function / argument-shape requirements. */
   if (mir_call_is_runtime_trap(in)) {
+    return 1;
+  }
+  if (mir_call_is_inline_zero_fill(in)) {
     return 1;
   }
   if (in->argument_count > MIR_MAX_PARAMS) {

@@ -84,6 +84,12 @@ typedef struct {
   size_t local_binding_capacity;
   int local_scope_depth;
   int local_rename_serial;
+  /* The statement list the current statement belongs to, and its position in
+   * it. An aggregate declared without an initializer reads ahead through these
+   * to find out whether its zero-fill is dead before it is emitted. */
+  ASTNode **block_statements;
+  size_t block_statement_count;
+  size_t block_statement_index;
 } IRLoweringContext;
 
 typedef struct {
@@ -191,6 +197,10 @@ int ir_emit_aggregate_literal_copy_to_symbol(IRLoweringContext *context,
                                              ASTNode *literal_node,
                                              Type *dest_type,
                                              SourceLocation location);
+
+int ir_emit_zero_fill_local(IRLoweringContext *context, IRFunction *function,
+                            const char *local_name, Type *type,
+                            SourceLocation location);
 
 int ir_try_emit_aggregate_address_memcpy(IRLoweringContext *context,
                                          IRFunction *function,

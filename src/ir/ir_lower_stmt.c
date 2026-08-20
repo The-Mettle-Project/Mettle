@@ -203,6 +203,244 @@ static int ir_lower_multi_assignment(IRLoweringContext *context,
   return ok;
 }
 
+/* Does this expression name `target`? Written so that an unrecognized node
+ * answers yes: a missed case then costs a zero-fill that was not needed, where
+ * the other way round it would elide one that was. */
+static int ir_expression_names(const ASTNode *node, const char *target) {
+  if (!node || !target) {
+    return node ? 1 : 0;
+  }
+
+  switch (node->type) {
+  case AST_IDENTIFIER: {
+    const Identifier *identifier = (const Identifier *)node->data;
+    return identifier && identifier->name &&
+           strcmp(identifier->name, target) == 0;
+  }
+  case AST_NUMBER_LITERAL:
+  case AST_STRING_LITERAL:
+    return 0;
+  case AST_BINARY_EXPRESSION: {
+    const BinaryExpression *binary = (const BinaryExpression *)node->data;
+    return !binary || ir_expression_names(binary->left, target) ||
+           ir_expression_names(binary->right, target);
+  }
+  case AST_UNARY_EXPRESSION: {
+    const UnaryExpression *unary = (const UnaryExpression *)node->data;
+    return !unary || ir_expression_names(unary->operand, target);
+  }
+  case AST_MEMBER_ACCESS: {
+    const MemberAccess *member = (const MemberAccess *)node->data;
+    return !member || ir_expression_names(member->object, target);
+  }
+  case AST_INDEX_EXPRESSION: {
+    const ArrayIndexExpression *index =
+        (const ArrayIndexExpression *)node->data;
+    return !index || ir_expression_names(index->array, target) ||
+           ir_expression_names(index->index, target);
+  }
+  case AST_CAST_EXPRESSION: {
+    const CastExpression *cast = (const CastExpression *)node->data;
+    return !cast || ir_expression_names(cast->operand, target);
+  }
+  case AST_FUNCTION_CALL: {
+    const CallExpression *call = (const CallExpression *)node->data;
+    if (!call) {
+      return 1;
+    }
+    /* `v.method()` reads v through the receiver, which is not one of the
+     * arguments. */
+    if (call->object && ir_expression_names(call->object, target)) {
+      return 1;
+    }
+    for (size_t i = 0; i < call->argument_count; i++) {
+      if (ir_expression_names(call->arguments[i], target)) {
+        return 1;
+      }
+    }
+    return 0;
+  }
+  default:
+    return 1;
+  }
+}
+
+/* Resolve an assignment target to the byte range it writes within `root`, or
+ * return 0 when the shape is anything else. Only constant paths qualify: a
+ * field chain, a constant index, or the whole variable. */
+static int ir_lvalue_byte_range(const ASTNode *target, const char *root_name,
+                                Type *root_type, size_t *offset_out,
+                                size_t *size_out, Type **type_out) {
+  if (!target || !root_name || !root_type) {
+    return 0;
+  }
+
+  switch (target->type) {
+  case AST_IDENTIFIER: {
+    const Identifier *identifier = (const Identifier *)target->data;
+    if (!identifier || !identifier->name ||
+        strcmp(identifier->name, root_name) != 0) {
+      return 0;
+    }
+    *offset_out = 0;
+    *size_out = root_type->size;
+    *type_out = root_type;
+    return 1;
+  }
+  case AST_MEMBER_ACCESS: {
+    const MemberAccess *member = (const MemberAccess *)target->data;
+    size_t base_offset = 0;
+    size_t base_size = 0;
+    Type *base_type = NULL;
+    if (!member || !member->member ||
+        !ir_lvalue_byte_range(member->object, root_name, root_type,
+                              &base_offset, &base_size, &base_type) ||
+        !base_type || base_type->kind != TYPE_STRUCT ||
+        !base_type->field_names || !base_type->field_offsets ||
+        !base_type->field_types) {
+      return 0;
+    }
+    for (size_t i = 0; i < base_type->field_count; i++) {
+      if (!base_type->field_names[i] ||
+          strcmp(base_type->field_names[i], member->member) != 0) {
+        continue;
+      }
+      Type *field_type = base_type->field_types[i];
+      if (!field_type || field_type->size == 0) {
+        return 0;
+      }
+      *offset_out = base_offset + base_type->field_offsets[i];
+      *size_out = field_type->size;
+      *type_out = field_type;
+      return 1;
+    }
+    return 0;
+  }
+  case AST_INDEX_EXPRESSION: {
+    const ArrayIndexExpression *index =
+        (const ArrayIndexExpression *)target->data;
+    size_t base_offset = 0;
+    size_t base_size = 0;
+    Type *base_type = NULL;
+    if (!index || !index->index ||
+        index->index->type != AST_NUMBER_LITERAL ||
+        !ir_lvalue_byte_range(index->array, root_name, root_type, &base_offset,
+                              &base_size, &base_type) ||
+        !base_type || base_type->kind != TYPE_ARRAY || !base_type->base_type ||
+        base_type->base_type->size == 0) {
+      return 0;
+    }
+    const NumberLiteral *literal = (const NumberLiteral *)index->index->data;
+    if (!literal || literal->is_float || literal->int_value < 0 ||
+        (size_t)literal->int_value >= base_type->array_size) {
+      return 0;
+    }
+    *offset_out =
+        base_offset + (size_t)literal->int_value * base_type->base_type->size;
+    *size_out = base_type->base_type->size;
+    *type_out = base_type->base_type;
+    return 1;
+  }
+  default:
+    return 0;
+  }
+}
+
+/* Is the zero-fill for `name` dead -- is every byte of it written before
+ * anything reads it? Reads ahead through the rest of the enclosing block,
+ * stopping at the first statement it cannot account for. A `var v: Vector3;`
+ * whose three fields are assigned on the next three lines needs no fill, and
+ * that shape is most of what constructors are made of.
+ *
+ * Every unhandled shape stops the walk and keeps the fill. */
+static int ir_zero_fill_is_dead(IRLoweringContext *context, const char *name,
+                                Type *type) {
+  if (!context || !name || !type || type->size == 0 || type->size > 4096u ||
+      !context->block_statements ||
+      context->block_statement_index >= context->block_statement_count) {
+    return 0;
+  }
+
+  unsigned char *covered = calloc(type->size, 1);
+  size_t remaining = type->size;
+  int dead = 0;
+
+  if (!covered) {
+    return 0;
+  }
+
+  for (size_t i = context->block_statement_index + 1;
+       i < context->block_statement_count && !dead; i++) {
+    ASTNode *statement = context->block_statements[i];
+    if (!statement) {
+      break;
+    }
+
+    if (statement->type == AST_VAR_DECLARATION) {
+      /* A redeclaration of the same name would make the writes below belong to
+       * a different object. */
+      const VarDeclaration *declaration =
+          (const VarDeclaration *)statement->data;
+      if (!declaration || !declaration->name ||
+          strcmp(declaration->name, name) == 0 ||
+          ir_expression_names(declaration->initializer, name)) {
+        break;
+      }
+      continue;
+    }
+
+    if (statement->type != AST_ASSIGNMENT) {
+      if (ir_expression_names(statement, name)) {
+        break;
+      }
+      continue;
+    }
+
+    const Assignment *assignment = (const Assignment *)statement->data;
+    if (!assignment || assignment->target_count > 0) {
+      break;
+    }
+    /* The value is evaluated before the store lands, so a read of the variable
+     * on the right is a read of bytes the fill was responsible for. */
+    if (ir_expression_names(assignment->value, name)) {
+      break;
+    }
+
+    size_t offset = 0;
+    size_t width = 0;
+    Type *written_type = NULL;
+    if (assignment->target) {
+      if (!ir_expression_names(assignment->target, name)) {
+        continue; /* writes some other variable */
+      }
+      if (!ir_lvalue_byte_range(assignment->target, name, type, &offset, &width,
+                                &written_type)) {
+        break;
+      }
+    } else if (assignment->variable_name &&
+               strcmp(assignment->variable_name, name) == 0) {
+      offset = 0;
+      width = type->size;
+    } else {
+      continue; /* writes some other variable */
+    }
+
+    if (offset > type->size || width > type->size - offset) {
+      break;
+    }
+    for (size_t b = offset; b < offset + width; b++) {
+      if (!covered[b]) {
+        covered[b] = 1;
+        remaining--;
+      }
+    }
+    dead = remaining == 0;
+  }
+
+  free(covered);
+  return dead;
+}
+
 int ir_lower_statement_with_defers(IRLoweringContext *context,
                                           IRFunction *function,
                                           ASTNode *statement,
@@ -232,6 +470,9 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     if (!defers) {
       ir_local_scope_enter(context);
       for (size_t i = 0; i < program->declaration_count; i++) {
+        context->block_statements = program->declarations;
+        context->block_statement_count = program->declaration_count;
+        context->block_statement_index = i;
         if (!ir_lower_statement_with_defers(context, function,
                                             program->declarations[i], NULL)) {
           ir_local_scope_leave(context);
@@ -248,6 +489,9 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     block_scope.parent = defers;
     ir_local_scope_enter(context);
     for (size_t i = 0; i < program->declaration_count; i++) {
+      context->block_statements = program->declarations;
+      context->block_statement_count = program->declaration_count;
+      context->block_statement_index = i;
       if (!ir_lower_statement_with_defers(
               context, function, program->declarations[i], &block_scope)) {
         ir_defer_stack_free(&block_scope.stack);
@@ -387,6 +631,32 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
       return 0;
     }
     ir_operand_destroy(&local.dest);
+
+    /* No initializer: an aggregate still has to start zeroed. `string` is in
+     * the list because the used-before-initialized check exempts it with the
+     * other aggregates, and an uninitialized one is a wild pointer carrying a
+     * garbage length -- zeroed, it is the empty string. GPU locals are left
+     * alone: their storage is not a host stack frame and the device paths have
+     * no memset to lower the fill to. */
+    if (!declaration->initializer && decl_type &&
+        (decl_type->kind == TYPE_ARRAY || decl_type->kind == TYPE_STRUCT ||
+         decl_type->kind == TYPE_STRING) &&
+        declaration->address_space == AST_ADDRESS_SPACE_DEFAULT &&
+        !function->is_kernel) {
+      /* The read-ahead is only valid when the tracked position really is this
+       * statement: a body lowered outside a block loop leaves the fields
+       * pointing at some enclosing list. */
+      int position_is_tracked =
+          context->block_statements &&
+          context->block_statement_index < context->block_statement_count &&
+          context->block_statements[context->block_statement_index] == statement;
+      if (!(position_is_tracked &&
+            ir_zero_fill_is_dead(context, declaration->name, decl_type)) &&
+          !ir_emit_zero_fill_local(context, function, local_name, decl_type,
+                                   statement->location)) {
+        return 0;
+      }
+    }
 
     if (declaration->initializer &&
         declaration->initializer->type == AST_AGGREGATE_LITERAL) {
