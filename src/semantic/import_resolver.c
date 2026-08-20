@@ -1820,6 +1820,44 @@ static int rewrite_node_names(ASTNode *node, const NameRewrite *rewrites,
   }
 }
 
+/* Renaming an imported declaration must not rename the symbol a foreign
+ * declaration links against: `extern fn putchar(...)` still has to resolve to
+ * putchar after the import gives it a namespaced or private name. Pin the
+ * original spelling as the link name before the rewrite runs. */
+static int preserve_extern_link_name(ASTNode *decl) {
+  char **link_name = NULL;
+  const char *decl_name = NULL;
+
+  if (!decl || !decl->data) {
+    return 1;
+  }
+
+  if (decl->type == AST_FUNCTION_DECLARATION) {
+    FunctionDeclaration *func = (FunctionDeclaration *)decl->data;
+    if (!func->is_extern) {
+      return 1;
+    }
+    link_name = &func->link_name;
+    decl_name = func->name;
+  } else if (decl->type == AST_VAR_DECLARATION) {
+    VarDeclaration *var = (VarDeclaration *)decl->data;
+    if (!var->is_extern) {
+      return 1;
+    }
+    link_name = &var->link_name;
+    decl_name = var->name;
+  } else {
+    return 1;
+  }
+
+  if (!decl_name || (*link_name && (*link_name)[0] != ' ')) {
+    return 1;
+  }
+
+  *link_name = strdup(decl_name);
+  return *link_name != NULL;
+}
+
 static int collect_namespaced_rewrites(NameRewrite **rewrites,
                                        size_t *rewrite_count,
                                        size_t *rewrite_capacity,
@@ -1829,6 +1867,10 @@ static int collect_namespaced_rewrites(NameRewrite **rewrites,
 
   if (!decl || !alias) {
     return 1;
+  }
+
+  if (!preserve_extern_link_name(decl)) {
+    return 0;
   }
 
   decl_name = get_declaration_name(decl);
@@ -1955,6 +1997,10 @@ static int collect_private_dependency_rewrites(
 
   if (!decl) {
     return 1;
+  }
+
+  if (!preserve_extern_link_name(decl)) {
+    return 0;
   }
 
   decl_name = get_declaration_name(decl);
