@@ -1,7 +1,12 @@
 @echo off
 REM Windows build script for Mettle
-REM Usage: build.bat [gcc|clang] [--skip-tests] [--backend-only]
+REM Usage: build.bat [gcc|clang] [--skip-tests] [--backend-only] [--clean] [--jobs N]
 REM   Or set CC=clang before invoking (defaults to gcc).
+REM
+REM The build is incremental: every compile unit is recorded into a plan file
+REM and tools\ccbuild.ps1 rebuilds only the objects whose source, headers or
+REM compile flags changed, in parallel. --clean forces the old behaviour of
+REM starting from an empty object tree.
 REM
 REM --backend-only stops after archiving bin\mtlc.lib: the libmtlc backend
 REM alone, with none of the reference frontend. That is what a downstream
@@ -13,6 +18,8 @@ setlocal
 REM Select compiler: args override CC env var; default gcc.
 set "SKIP_TESTS="
 set "BACKEND_ONLY="
+set "CLEAN="
+set "JOBS=0"
 :parse_args
 if "%~1"=="" goto args_done
 if /I "%~1"=="clang" (
@@ -45,8 +52,24 @@ if /I "%~1"=="--libmtlc-only" (
     shift
     goto parse_args
 )
+if /I "%~1"=="--clean" (
+    set "CLEAN=1"
+    shift
+    goto parse_args
+)
+if /I "%~1"=="--rebuild" (
+    set "CLEAN=1"
+    shift
+    goto parse_args
+)
+if /I "%~1"=="--jobs" (
+    set "JOBS=%~2"
+    shift
+    shift
+    goto parse_args
+)
 echo Error: unknown argument '%~1'
-echo Usage: build.bat [gcc^|clang] [--skip-tests] [--backend-only]
+echo Usage: build.bat [gcc^|clang] [--skip-tests] [--backend-only] [--clean] [--jobs N]
 exit /b 1
 
 :args_done
@@ -107,9 +130,11 @@ if %ERRORLEVEL% NEQ 0 (
 
 echo Building with %CC%...
 
-REM Start from a clean object tree so stale scratch objects cannot
-REM accidentally participate in the final link.
-if exist obj rmdir /S /Q obj
+REM --clean restores the from-scratch build: an empty object tree and no
+REM up-to-date stamps, so every stage below runs again.
+if defined CLEAN (
+    if exist obj rmdir /S /Q obj
+)
 
 REM Create directories
 if not exist obj mkdir obj
@@ -128,218 +153,136 @@ if not exist obj\runtime mkdir obj\runtime
 if not exist obj\frontend mkdir obj\frontend
 if not exist bin mkdir bin
 
-REM Compile source files
-echo Compiling common utilities...
-%CC% %CFLAGS% -c src\common.c -o obj\common.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
+REM ---------------------------------------------------------------------------
+REM Record the compile plan. Nothing is compiled here: :cc appends one
+REM "source;object;flags" line per unit and ccbuild.ps1 decides what is stale.
+REM ---------------------------------------------------------------------------
+set "PLAN=obj\build_plan.txt"
+if exist "%PLAN%" del /Q "%PLAN%"
 
-REM Everything from here to :compile_ir is the reference frontend, which a
+call :cc src\common.c obj\common.o
+
+REM Everything from here to :plan_ir is the reference frontend, which a
 REM backend-only build has no use for.
-if defined BACKEND_ONLY goto compile_ir
+if defined BACKEND_ONLY goto plan_ir
 
-echo Compiling lexer...
-%CC% %CFLAGS% -c src\lexer\lexer.c -o obj\lexer\lexer.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
+call :cc src\lexer\lexer.c obj\lexer\lexer.o
+call :cc src\parser\ast.c obj\parser\ast.o
+call :cc src\parser\parser.c obj\parser\parser.o
+call :cc src\parser\ast_print.c obj\parser\ast_print.o
+call :cc src\semantic\symbol_table.c obj\semantic\symbol_table.o
+call :cc src\semantic\comptime_value.c obj\semantic\comptime_value.o
+call :cc src\semantic\type_layout.c obj\semantic\type_layout.o
+call :cc src\semantic\comptime_expand.c obj\semantic\comptime_expand.o
+call :cc src\semantic\type_query.c obj\semantic\type_query.o
+call :cc src\semantic\type_checker.c obj\semantic\type_checker.o
+call :cc src\semantic\type_checker_types.c obj\semantic\type_checker_types.o
+call :cc src\semantic\type_checker_errors.c obj\semantic\type_checker_errors.o
+call :cc src\semantic\type_checker_safety.c obj\semantic\type_checker_safety.o
+call :cc src\semantic\type_checker_init_tracker.c obj\semantic\type_checker_init_tracker.o
+call :cc src\semantic\type_checker_decl.c obj\semantic\type_checker_decl.o
+call :cc src\semantic\type_checker_match.c obj\semantic\type_checker_match.o
+call :cc src\semantic\type_checker_stmt.c obj\semantic\type_checker_stmt.o
+call :cc src\semantic\type_checker_expr.c obj\semantic\type_checker_expr.o
+call :cc src\semantic\type_checker_aggregate.c obj\semantic\type_checker_aggregate.o
+call :cc src\semantic\type_checker_tensor_epilogue.c obj\semantic\type_checker_tensor_epilogue.o
+call :cc src\semantic\type_checker_memory.c obj\semantic\type_checker_memory.o
+call :cc src\semantic\register_allocator.c obj\semantic\register_allocator.o
+call :cc src\semantic\import_resolver.c obj\semantic\import_resolver.o
+call :cc src\semantic\monomorphize.c obj\semantic\monomorphize.o
 
-echo Compiling parser...
-%CC% %CFLAGS% -c src\parser\ast.c -o obj\parser\ast.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
+:plan_ir
+for %%f in (src\ir\*.c) do call :cc "%%f" "obj\ir\%%~nf.o"
+for %%f in (src\ir\optimizer\*.c) do call :cc "%%f" "obj\ir\optimizer\%%~nf.o"
 
-%CC% %CFLAGS% -c src\parser\parser.c -o obj\parser\parser.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
+for %%f in (src\codegen\binary_emitter.c src\codegen\code_generator.c src\codegen\elf_emitter.c src\codegen\ptx_emitter.c src\codegen\spirv_emitter.c) do call :cc "%%f" "obj\codegen\%%~nf.o"
+for %%f in (src\codegen\binary\*.c) do call :cc "%%f" "obj\codegen\binary\%%~nf.o"
+for %%f in (src\linker\*.c) do call :cc "%%f" "obj\linker\%%~nf.o"
 
-echo Compiling semantic analysis...
-%CC% %CFLAGS% -c src\semantic\symbol_table.c -o obj\semantic\symbol_table.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
+call :cc src\debug\debug_info.c obj\debug\debug_info.o
 
-%CC% %CFLAGS% -c src\semantic\comptime_value.c -o obj\semantic\comptime_value.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-%CC% %CFLAGS% -c src\semantic\type_layout.c -o obj\semantic\type_layout.o
-%CC% %CFLAGS% -c src\semantic\comptime_expand.c -o obj\semantic\comptime_expand.o
-%CC% %CFLAGS% -c src\semantic\type_query.c -o obj\semantic\type_query.o
-%CC% %CFLAGS% -c src\parser\ast_print.c -o obj\parser\ast_print.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-%CC% %CFLAGS% -c src\semantic\type_checker.c -o obj\semantic\type_checker.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-%CC% %CFLAGS% -c src\semantic\type_checker_types.c -o obj\semantic\type_checker_types.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-%CC% %CFLAGS% -c src\semantic\type_checker_errors.c -o obj\semantic\type_checker_errors.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-%CC% %CFLAGS% -c src\semantic\type_checker_safety.c -o obj\semantic\type_checker_safety.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-%CC% %CFLAGS% -c src\semantic\type_checker_init_tracker.c -o obj\semantic\type_checker_init_tracker.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-%CC% %CFLAGS% -c src\semantic\type_checker_decl.c -o obj\semantic\type_checker_decl.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-%CC% %CFLAGS% -c src\semantic\type_checker_match.c -o obj\semantic\type_checker_match.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-%CC% %CFLAGS% -c src\semantic\type_checker_stmt.c -o obj\semantic\type_checker_stmt.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-%CC% %CFLAGS% -c src\semantic\type_checker_expr.c -o obj\semantic\type_checker_expr.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-%CC% %CFLAGS% -c src\semantic\type_checker_aggregate.c -o obj\semantic\type_checker_aggregate.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-%CC% %CFLAGS% -c src\semantic\type_checker_tensor_epilogue.c -o obj\semantic\type_checker_tensor_epilogue.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-%CC% %CFLAGS% -c src\semantic\type_checker_memory.c -o obj\semantic\type_checker_memory.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-%CC% %CFLAGS% -c src\semantic\register_allocator.c -o obj\semantic\register_allocator.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-%CC% %CFLAGS% -c src\semantic\import_resolver.c -o obj\semantic\import_resolver.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-%CC% %CFLAGS% -c src\semantic\monomorphize.c -o obj\semantic\monomorphize.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-:compile_ir
-echo Compiling IR...
-for %%f in (src\ir\*.c) do (
-    echo   %%~nxf
-    %CC% %CFLAGS% -c %%f -o obj\ir\%%~nf.o
-    if errorlevel 1 exit /b 1
-)
-for %%f in (src\ir\optimizer\*.c) do (
-    echo   optimizer\%%~nxf
-    %CC% %CFLAGS% -c %%f -o obj\ir\optimizer\%%~nf.o
-    if errorlevel 1 exit /b 1
-)
-
-echo Compiling code generator modules...
-for %%f in (code_generator_calls code_generator_flow code_generator_inline_debug code_generator_ir code_generator_ops code_generator_stack code_generator_variables) do (
-    if exist obj\codegen\%%f.o del /Q obj\codegen\%%f.o
-)
-for %%f in (src\codegen\binary_emitter.c src\codegen\code_generator.c src\codegen\elf_emitter.c src\codegen\ptx_emitter.c src\codegen\spirv_emitter.c) do (
-    echo   %%~nxf
-    %CC% %CFLAGS% -c %%f -o obj\\codegen\\%%~nf.o
-    if errorlevel 1 exit /b 1
-)
-
-echo Compiling binary object backend...
-for %%f in (src\\codegen\\binary\\*.c) do (
-    echo   binary\\%%~nxf
-    %CC% %CFLAGS% -c %%f -o obj\\codegen\\binary\\%%~nf.o
-    if errorlevel 1 exit /b 1
-)
-
-echo Compiling linker modules...
-for %%f in (src\\linker\\*.c) do (
-    echo   %%~nxf
-    %CC% %CFLAGS% -c %%f -o obj\\linker\\%%~nf.o
-    if errorlevel 1 exit /b 1
-)
-
-echo Compiling debug info...
-%CC% %CFLAGS% -c src\debug\debug_info.c -o obj\debug\debug_info.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-echo Compiling required freestanding program runtime...
-%CC% %RUNTIME_CFLAGS% -c src\runtime\freestanding.c -o obj\runtime\freestanding.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-echo Compiling owned host runtime and startup...
-%CC% %RUNTIME_CFLAGS% -include src/runtime/host_prefix.h -c src\runtime\freestanding.c -o obj\runtime\host_runtime.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-%CC% %RUNTIME_CFLAGS% -c src\runtime\host_startup.c -o obj\runtime\host_startup.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
+REM The freestanding program runtime, the owned host runtime and the startup
+REM stub are built with the runtime flag set, not the compiler's.
+call :cc src\runtime\freestanding.c obj\runtime\freestanding.o "%RUNTIME_CFLAGS%"
+call :cc src\runtime\freestanding.c obj\runtime\host_runtime.o "%RUNTIME_CFLAGS% -include src/runtime/host_prefix.h"
+call :cc src\runtime\host_startup.c obj\runtime\host_startup.o "%RUNTIME_CFLAGS%"
 
 REM The language runtime, the Tracy shim and the driver's allocator all belong
 REM to the frontend side; skip them for a backend-only build.
-if defined BACKEND_ONLY goto compile_diagnostics
+if defined BACKEND_ONLY goto plan_diagnostics
 
-echo Compiling crash-handler runtime (opt-in: -d / -s / -g / IR trap)...
-%CC% %RUNTIME_CFLAGS% -c src\runtime\crash_handler.c -o obj\runtime\crash_handler.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-echo Compiling memory-safety runtime (opt-in: --safe)...
-%CC% %RUNTIME_CFLAGS% -c src\runtime\safety.c -o obj\runtime\safety.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
+REM Opt-in runtimes: crash handler (-d / -s / -g / IR trap), memory safety
+REM (--safe), atomics (std/thread), profiling (--profile-runtime), debug hooks
+REM (--debug-hooks) and the Tracy stubs (std/tracy without --tracy).
+call :cc src\runtime\crash_handler.c obj\runtime\crash_handler.o "%RUNTIME_CFLAGS%"
+call :cc src\runtime\safety.c obj\runtime\safety.o "%RUNTIME_CFLAGS%"
+call :cc src\runtime\atomics.c obj\runtime\atomics.o "%RUNTIME_CFLAGS% -DMETTLE_ATOMICS_IN_FREESTANDING"
+call :cc src\runtime\profile.c obj\runtime\profile.o "%RUNTIME_CFLAGS%"
+call :cc src\runtime\debug.c obj\runtime\debug.o "%RUNTIME_CFLAGS%"
+call :cc stdlib\tracy_helpers.c obj\runtime\tracy_helpers.o "%RUNTIME_CFLAGS%"
+call :cc src\tracy_build.c obj\tracy_build.o
 
 rem The swap runtime is written in Mettle and compiled by the compiler this
 rem build produces, so it is staged after bin\mettle.exe exists.
 
-echo Compiling atomics helpers (opt-in: std/thread)...
-%CC% %RUNTIME_CFLAGS% -DMETTLE_ATOMICS_IN_FREESTANDING -c src\runtime\atomics.c -o obj\runtime\atomics.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-echo Compiling profile runtime (opt-in: --profile-runtime)...
-%CC% %RUNTIME_CFLAGS% -c src\runtime\profile.c -o obj\runtime\profile.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-echo Compiling debug runtime (opt-in: --debug-hooks)...
-%CC% %RUNTIME_CFLAGS% -c src\runtime\debug.c -o obj\runtime\debug.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-echo Compiling Tracy helper stubs (opt-in: std/tracy without --tracy)...
-%CC% %RUNTIME_CFLAGS% -c stdlib\tracy_helpers.c -o obj\runtime\tracy_helpers.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-echo Compiling Tracy build support...
-%CC% %CFLAGS% -c src\tracy_build.c -o obj\tracy_build.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-:compile_diagnostics
-echo Compiling error reporter...
-%CC% %CFLAGS% -c src\error\error_reporter.c -o obj\error\error_reporter.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
+:plan_diagnostics
+call :cc src\error\error_reporter.c obj\error\error_reporter.o
 REM error_explain.c renders the driver's optimization report: frontend-side.
-if not defined BACKEND_ONLY (
-    %CC% %CFLAGS% -c src\error\error_explain.c -o obj\error\error_explain.o
-    if errorlevel 1 exit /b 1
+if not defined BACKEND_ONLY call :cc src\error\error_explain.c obj\error\error_explain.o
+
+call :cc src\compiler\compiler_context.c obj\compiler\compiler_context.o
+call :cc src\compiler\compiler_crash.c obj\compiler\compiler_crash.o
+
+call :cc src\mtlc_api.c obj\mtlc_api.o
+call :cc src\mtlc_build.c obj\mtlc_build.o
+call :cc src\mtlc_lib_fallbacks.c obj\mtlc_lib_fallbacks.o
+call :cc src\mtlc_crash_fallback.c obj\mtlc_crash_fallback.o
+call :cc src\runtime\verify_owned.c obj\runtime\verify_owned.o
+
+if defined BACKEND_ONLY goto compile_plan
+
+call :cc src\frontend\mtlc_type_from_frontend.c obj\frontend\mtlc_type_from_frontend.o
+call :cc src\frontend\mtlc_lower_module.c obj\frontend\mtlc_lower_module.o
+call :cc src\main.c obj\main.o
+
+:compile_plan
+REM Orphan objects would still be swept into libmtlc by the wildcards below, so
+REM a full build prunes anything the plan does not claim. A backend-only plan
+REM covers only part of the tree and must not prune the rest.
+set "PRUNE=-Prune"
+if defined BACKEND_ONLY set "PRUNE="
+powershell -ExecutionPolicy Bypass -NoProfile -File tools\ccbuild.ps1 -Plan "%PLAN%" -CC "%CC%" -Jobs %JOBS% %PRUNE%
+set "CCRC=%ERRORLEVEL%"
+if "%CCRC%"=="1" (
+    echo Build failed!
+    exit /b 1
 )
 
-echo Compiling compiler diagnostics...
-%CC% %CFLAGS% -c src\compiler\compiler_context.c -o obj\compiler\compiler_context.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-%CC% %CFLAGS% -c src\compiler\compiler_crash.c -o obj\compiler\compiler_crash.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-echo Compiling libmtlc public API...
-%CC% %CFLAGS% -c src\mtlc_api.c -o obj\mtlc_api.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-%CC% %CFLAGS% -c src\mtlc_build.c -o obj\mtlc_build.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-%CC% %CFLAGS% -c src\mtlc_lib_fallbacks.c -o obj\mtlc_lib_fallbacks.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-%CC% %CFLAGS% -c src\mtlc_crash_fallback.c -o obj\mtlc_crash_fallback.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-%CC% %CFLAGS% -c src\runtime\verify_owned.c -o obj\runtime\verify_owned.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-if defined BACKEND_ONLY goto archive_libmtlc
-
-echo Compiling frontend-to-backend type adapter...
-%CC% %CFLAGS% -c src\frontend\mtlc_type_from_frontend.c -o obj\frontend\mtlc_type_from_frontend.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-%CC% %CFLAGS% -c src\frontend\mtlc_lower_module.c -o obj\frontend\mtlc_lower_module.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-echo Compiling main...
-%CC% %CFLAGS% -c src\main.c -o obj\main.o
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
-:archive_libmtlc
+REM ccbuild reports 2 when it rebuilt something and 0 when every object was
+REM already current. Nothing downstream needs redoing in the second case, as
+REM long as the previous run got all the way through its stamp.
+set "RELINK=1"
+if "%CCRC%"=="0" set "RELINK="
+if defined BACKEND_ONLY (
+    if not exist bin\mtlc.lib set "RELINK=1"
+    if not exist obj\lib.ok set "RELINK=1"
+) else (
+    if not exist bin\mettle.exe set "RELINK=1"
+    if not exist obj\link.ok set "RELINK=1"
+)
+if not defined RELINK (
+    echo Everything up to date.
+    if defined BACKEND_ONLY goto backend_only_done
+    goto run_tests
+)
 
 REM ---------------------------------------------------------------------------
 REM Archive the standalone backend into libmtlc, then link the reference frontend
 REM (this driver) against it. libmtlc = the IR core, optimizer + GNN, code
 REM generators, and native linker. The AST->IR lowering TUs (ir_lowering,
 REM ir_lower_*) are a FRONTEND concern and link into the driver, not the archive.
-REM ar does not expand wildcards, so add objects via a cmd FOR loop (which does).
+REM ar does not expand wildcards, so gather objects with a cmd FOR loop (which
+REM does) and hand each group to one ar invocation.
 REM ---------------------------------------------------------------------------
 set "AR=ar"
 where %AR% >nul 2>&1
@@ -353,20 +296,36 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo Archiving libmtlc ^(backend: IR core, optimizer, codegen, linker^)...
+if exist obj\lib.ok del /Q obj\lib.ok
+if exist obj\link.ok del /Q obj\link.ok
 if exist bin\mtlc.lib del /Q bin\mtlc.lib
 REM Backend IR core -- explicitly listed to EXCLUDE the lowering TUs below.
-for %%o in (ir ir_comptime ir_debug_hooks ir_interp ir_optimize ir_pgo ir_profile ir_verify ml_gnn ml_obs ml_opt mtlc_type) do %AR% rcs bin\mtlc.lib obj\ir\%%o.o
-for %%o in (obj\ir\optimizer\*.o) do %AR% rcs bin\mtlc.lib %%o
-for %%o in (obj\codegen\binary_emitter.o obj\codegen\code_generator.o obj\codegen\elf_emitter.o obj\codegen\ptx_emitter.o obj\codegen\spirv_emitter.o) do %AR% rcs bin\mtlc.lib %%o
-for %%o in (obj\codegen\binary\*.o) do %AR% rcs bin\mtlc.lib %%o
-for %%o in (obj\linker\*.o) do %AR% rcs bin\mtlc.lib %%o
-%AR% rcs bin\mtlc.lib obj\debug\debug_info.o
+set "AROBJS="
+for %%o in (ir ir_comptime ir_debug_hooks ir_interp ir_optimize ir_pgo ir_profile ir_verify ml_gnn ml_obs ml_opt mtlc_type) do call set "AROBJS=%%AROBJS%% obj\ir\%%o.o"
+%AR% rcs bin\mtlc.lib %AROBJS%
+if errorlevel 1 exit /b 1
+
+set "AROBJS="
+for %%o in (obj\ir\optimizer\*.o) do call set "AROBJS=%%AROBJS%% %%o"
+%AR% rcs bin\mtlc.lib %AROBJS%
+if errorlevel 1 exit /b 1
+
+set "AROBJS=obj\codegen\binary_emitter.o obj\codegen\code_generator.o obj\codegen\elf_emitter.o obj\codegen\ptx_emitter.o obj\codegen\spirv_emitter.o"
+for %%o in (obj\codegen\binary\*.o) do call set "AROBJS=%%AROBJS%% %%o"
+%AR% rcs bin\mtlc.lib %AROBJS%
+if errorlevel 1 exit /b 1
+
+set "AROBJS="
+for %%o in (obj\linker\*.o) do call set "AROBJS=%%AROBJS%% %%o"
+for %%o in (obj\compiler\*.o) do call set "AROBJS=%%AROBJS%% %%o"
 REM The diagnostics reporter is frontend-neutral (raw source text + SourceLocation,
 REM no AST) and the backend comptime interpreter reports through it -> libmtlc.
-%AR% rcs bin\mtlc.lib obj\error\error_reporter.o
-for %%o in (obj\compiler\*.o) do %AR% rcs bin\mtlc.lib %%o
-%AR% rcs bin\mtlc.lib obj\common.o obj\mtlc_api.o obj\mtlc_build.o obj\mtlc_lib_fallbacks.o obj\mtlc_crash_fallback.o obj\runtime\verify_owned.o
-%AR% rcs bin\mtlc.lib obj\runtime\host_runtime.o
+%AR% rcs bin\mtlc.lib %AROBJS% obj\debug\debug_info.o obj\error\error_reporter.o
+if errorlevel 1 exit /b 1
+
+%AR% rcs bin\mtlc.lib obj\common.o obj\mtlc_api.o obj\mtlc_build.o obj\mtlc_lib_fallbacks.o obj\mtlc_crash_fallback.o obj\runtime\verify_owned.o obj\runtime\host_runtime.o
+if errorlevel 1 exit /b 1
+
 if not exist bin\mtlc.lib (
     echo Build failed: bin\mtlc.lib was not created.
     exit /b 1
@@ -388,21 +347,26 @@ if not errorlevel 1 (
     nm -u obj\runtime\libmtlc-closure.o
     exit /b 1
 )
+echo ok> obj\lib.ok
+
+if not defined BACKEND_ONLY goto link_frontend
 
 REM A backend-only build is done here: the archive plus include\mtlc is
-REM everything a frontend links against.
-if defined BACKEND_ONLY (
-    if exist bin\runtime rmdir /S /Q bin\runtime
-    xcopy src\runtime bin\runtime\ /E /I /Y >nul
-    copy /Y obj\runtime\freestanding.o bin\runtime\freestanding.o >nul
-    copy /Y obj\runtime\freestanding.o bin\runtime\freestanding.obj >nul
-    echo.
-    echo libmtlc built: bin\mtlc.lib
-    echo   headers: include\mtlc ^(public API^), src ^(backend internals^)
-    echo   runtime: bin\runtime\freestanding.obj
-    exit /b 0
-)
+REM everything a frontend links against. The staging below is reached whether
+REM or not the archive had to be rebuilt, so an up-to-date run still leaves a
+REM complete tree for the consumer.
+:backend_only_done
+if exist bin\runtime rmdir /S /Q bin\runtime
+xcopy src\runtime bin\runtime\ /E /I /Y >nul
+copy /Y obj\runtime\freestanding.o bin\runtime\freestanding.o >nul
+copy /Y obj\runtime\freestanding.o bin\runtime\freestanding.obj >nul
+echo.
+echo libmtlc built: bin\mtlc.lib
+echo   headers: include\mtlc ^(public API^), src ^(backend internals^)
+echo   runtime: bin\runtime\freestanding.obj
+exit /b 0
 
+:link_frontend
 echo Linking mettle ^(reference frontend^) against libmtlc...
 set "LDFLAGS=%LDFLAGS% -Wl,--disable-runtime-pseudo-reloc"
 %CC% %CCTARGET% -nostdlib -nostartfiles -nodefaultlibs -Wl,--entry,mettle_start -Wl,--subsystem,console obj\runtime\host_startup.o obj\lexer\lexer.o obj\parser\ast.o obj\parser\ast_print.o obj\parser\parser.o obj\semantic\symbol_table.o obj\semantic\comptime_value.o obj\semantic\type_layout.o obj\semantic\comptime_expand.o obj\semantic\type_query.o obj\semantic\type_checker.o obj\semantic\type_checker_types.o obj\semantic\type_checker_errors.o obj\semantic\type_checker_safety.o obj\semantic\type_checker_init_tracker.o obj\semantic\type_checker_decl.o obj\semantic\type_checker_match.o obj\semantic\type_checker_stmt.o obj\semantic\type_checker_expr.o obj\semantic\type_checker_aggregate.o obj\semantic\type_checker_tensor_epilogue.o obj\semantic\type_checker_memory.o obj\semantic\register_allocator.o obj\semantic\import_resolver.o obj\semantic\monomorphize.o obj\ir\ir_lowering.o obj\ir\ir_lower_address.o obj\ir\ir_lower_defer.o obj\ir\ir_lower_expr.o obj\ir\ir_lower_stmt.o obj\ir\ir_lower_support.o obj\ir\ir_lower_switch_match.o obj\ir\ir_lower_types.o obj\frontend\mtlc_type_from_frontend.o obj\frontend\mtlc_lower_module.o obj\error\error_explain.o obj\tracy_build.o obj\main.o bin\mtlc.lib -o bin\mettle.exe -lkernel32 -ldbghelp %LDFLAGS%
@@ -463,16 +427,37 @@ if exist tools\mlopt\gf2_lib1.txt copy /Y tools\mlopt\gf2_lib1.txt bin\mlopt\gf2
 echo Rendering README.html for the installer docs shortcut...
 where python >nul 2>&1 && python installer\render_readme.py
 
+REM Every post-link stage got through: the next run may skip all of this when
+REM no object changed.
+echo ok> obj\link.ok
+
 echo Build successful! Executable created at bin\mettle.exe
+
+:run_tests
 if defined SKIP_TESTS (
     echo Tests skipped.
     exit /b 0
 )
 echo.
 echo Running tests...
-powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1
+REM -Parallel runs the suite as several sharded child processes; failures land
+REM in tests\test-failures.txt as well as on the console.
+powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -Parallel
 if %ERRORLEVEL% NEQ 0 (
-    echo Tests failed!
+    echo Tests failed! See tests\test-failures.txt
     exit /b 1
 )
 echo All tests passed.
+exit /b 0
+
+REM ---------------------------------------------------------------------------
+REM :cc <source> <object> [flags]   -- record one compile unit. Defaults to the
+REM compiler's own CFLAGS; the runtime TUs pass their own flag set.
+REM ---------------------------------------------------------------------------
+:cc
+setlocal
+set "UFLAGS=%~3"
+if not defined UFLAGS set "UFLAGS=%CFLAGS%"
+>>"%PLAN%" echo %~1;%~2;%UFLAGS%
+endlocal
+exit /b 0

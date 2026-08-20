@@ -3,7 +3,12 @@ param(
   [switch]$BuildCompiler,
   [switch]$SkipRuntime,
   [switch]$SkipDeterminism,
-  [int]$FuzzCount = 60
+  [int]$FuzzCount = 60,
+  [int]$Jobs = 0,
+  [string]$FailureLog = "tests/test-failures.txt",
+  [switch]$Parallel,
+  [int]$Shards = 1,
+  [int]$Shard = 0
 )
 
 $ErrorActionPreference = "Continue"
@@ -61,12 +66,35 @@ function Skip-WindowsOnly {
 # dropped and the same program is built through the platform's own linker.
 $script:InternalLinkerArgs = if ($script:OnWindows) { @("--linker", "internal") } else { @() }
 
+# Every failure in the suite is reported through Write-CaseResult, so this is
+# the one place that has to remember them for the failure log written at the end
+# of the run. A long green scrollback buries the handful of lines that matter.
+$script:Failures = New-Object System.Collections.Generic.List[object]
+
 function Write-CaseResult {
   param(
     [string]$Name,
     [bool]$Passed,
-    [string]$Reason = ""
+    [string]$Reason = "",
+    [string]$Detail = ""
   )
+
+  # A case belonging to another shard threw its way out of the body and landed
+  # in the catch that reports it. It is not a failure and it is not this run's
+  # to count: back out the two counters the case had already bumped.
+  if ($Reason -and $Reason.Contains($script:ShardSkip)) {
+    $script:total--
+    $script:failed--
+    return
+  }
+
+  if (-not $Passed) {
+    $script:Failures.Add([pscustomobject]@{
+      Name   = $Name
+      Reason = $Reason
+      Detail = $Detail
+    })
+  }
 
   if ($Passed) {
     if ($Reason) {
@@ -179,7 +207,132 @@ if (-not (Test-Path $CompilerPath)) {
   exit 1
 }
 
+# ---------------------------------------------------------------------------
+# Sharding. Most of this suite is a long sequence of one-off cases, each of
+# which drives the compiler, links a program and runs it -- work that keeps one
+# core busy and the other nineteen idle. -Parallel re-runs this same script as
+# several child processes, each executing one shard of the cases, and merges
+# what they report.
+#
+# Shards are separate processes on purpose: a case that sets an environment
+# variable for one compiler run, or that writes a scratch file next to the
+# repo, cannot then be seen by a case running beside it.
+#
+# Cases are numbered in the order they execute and handed out in contiguous
+# blocks, so a case that depends on one just before it (a baseline exit code, a
+# program another case built) almost always lands in the same shard as the case
+# it depends on. A dependency that does get split fails loudly rather than
+# passing on stale state, and the driver checks that the shards between them
+# ran every case the suite has.
+# ---------------------------------------------------------------------------
+$script:ShardSkip = "MTL_CASE_NOT_IN_SHARD"
+$script:CaseOrdinal = 0
+$script:CaseBlock = 24
+
+function Test-CaseIsMine {
+  $ordinal = $script:CaseOrdinal
+  $script:CaseOrdinal = $ordinal + 1
+  if ($Shards -le 1) { return $true }
+  return ((([int][Math]::Floor($ordinal / $script:CaseBlock)) % $Shards) -eq $Shard)
+}
+
+if ($Parallel) {
+  if ($Shards -le 1) {
+    # Past a dozen shards the host spends more on process startup and on
+    # oversubscribed compiles than the extra concurrency wins back.
+    $cpu = [int]$env:NUMBER_OF_PROCESSORS
+    if ($cpu -le 0) { $cpu = 4 }
+    $Shards = [Math]::Max(2, [Math]::Min(12, [int][Math]::Round($cpu * 0.6)))
+  }
+  $selfPath = $MyInvocation.MyCommand.Path
+  $jobBudget = $Jobs
+  if ($jobBudget -le 0) { $jobBudget = [int]$env:NUMBER_OF_PROCESSORS }
+  if ($jobBudget -le 0) { $jobBudget = 4 }
+  $childJobs = [Math]::Max(2, [int][Math]::Ceiling([double]$jobBudget / $Shards))
+  $shardLogDir = Join-Path ([System.IO.Path]::GetTempPath()) "Mettle-test-shards"
+  if (-not (Test-Path $shardLogDir)) { New-Item -Path $shardLogDir -ItemType Directory | Out-Null }
+
+  Write-Host "Running the suite across $Shards shards ($childJobs jobs each)..."
+  $children = @()
+  for ($i = 0; $i -lt $Shards; $i++) {
+    $childArgs = @(
+      "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $selfPath,
+      "-CompilerPath", $CompilerPath,
+      "-Shards", $Shards, "-Shard", $i,
+      "-Jobs", $childJobs,
+      "-FuzzCount", $FuzzCount,
+      "-FailureLog", (Join-Path $shardLogDir "failures-$i.txt")
+    )
+    if ($SkipRuntime) { $childArgs += "-SkipRuntime" }
+    if ($SkipDeterminism) { $childArgs += "-SkipDeterminism" }
+    $outPath = Join-Path $shardLogDir "shard-$i.out"
+    $proc = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList $childArgs `
+      -NoNewWindow -PassThru -RedirectStandardOutput $outPath `
+      -RedirectStandardError (Join-Path $shardLogDir "shard-$i.err")
+    # Touching the handle is what makes the object cache the exit code; without
+    # it ExitCode reads back null once the child is gone.
+    $null = $proc.Handle
+    $children += [pscustomobject]@{ Index = $i; Proc = $proc; Out = $outPath; Log = (Join-Path $shardLogDir "failures-$i.txt") }
+  }
+
+  $mergedTotal = 0
+  $mergedFailed = 0
+  $anyFailed = $false
+  $mergedLog = New-Object System.Collections.Generic.List[string]
+  foreach ($child in $children) {
+    $child.Proc.WaitForExit()
+    Write-Host ""
+    Write-Host "----- shard $($child.Index) -----"
+    if (Test-Path $child.Out) { Get-Content -LiteralPath $child.Out | Write-Host }
+    $errPath = Join-Path $shardLogDir "shard-$($child.Index).err"
+    if ((Test-Path $errPath) -and (Get-Item $errPath).Length -gt 0) {
+      Get-Content -LiteralPath $errPath | Write-Host
+    }
+    $childCode = $child.Proc.ExitCode
+    $shardFailed = 0
+    $summary = Select-String -Path $child.Out -Pattern '^SHARD-RESULT total=(\d+) failed=(\d+)$' | Select-Object -Last 1
+    if ($summary) {
+      $mergedTotal += [int]$summary.Matches[0].Groups[1].Value
+      $shardFailed = [int]$summary.Matches[0].Groups[2].Value
+      $mergedFailed += $shardFailed
+    }
+    else {
+      $anyFailed = $true
+      $mergedLog.Add("[FAIL] shard $($child.Index) did not report a result")
+    }
+    # A shard that dies without reporting anything is itself the failure.
+    if ($null -ne $childCode -and $childCode -ne 0 -and $shardFailed -eq 0) {
+      $anyFailed = $true
+      $mergedLog.Add("[FAIL] shard $($child.Index) exited $childCode with no failing case")
+    }
+    if ($shardFailed -gt 0 -and (Test-Path $child.Log)) {
+      $mergedLog.Add("----- shard $($child.Index) -----")
+      $mergedLog.AddRange([string[]](Get-Content -LiteralPath $child.Log | Select-Object -Skip 4))
+    }
+  }
+
+  Write-Host ""
+  Write-Host "Test summary: $($mergedTotal - $mergedFailed)/$mergedTotal passed across $Shards shards"
+  if ($FailureLog) {
+    if ($mergedLog.Count -eq 0) { $mergedLog.Add("No failures.") }
+    $header = @("Mettle test run $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
+                "Compiler: $CompilerPath",
+                "Result: $($mergedTotal - $mergedFailed)/$mergedTotal passed, $mergedFailed failed ($Shards shards)",
+                "")
+    Set-Content -LiteralPath $FailureLog -Value ($header + $mergedLog) -Encoding UTF8
+    if ($mergedFailed -eq 0 -and -not $anyFailed) {
+      Write-Host "Failure log: $FailureLog (no failures)"
+    }
+    else {
+      Write-Host "Failures written to $FailureLog"
+    }
+  }
+  if ($anyFailed -or $mergedFailed -ne 0) { exit 1 }
+  exit 0
+}
+
 $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "Mettle-test-artifacts"
+if ($Shards -gt 1) { $tmpDir = "$tmpDir-s$Shard" }
 if (-not (Test-Path $tmpDir)) {
   New-Item -Path $tmpDir -ItemType Directory | Out-Null
 }
@@ -2083,6 +2236,9 @@ $cases = @(
   @{ Name = "err_syntax_c_for_header"; Path = "tests/err_syntax_c_for_header.mettle"; ShouldSucceed = $false; Pattern = "A 'for' header needs 'in' or parentheses" },
   @{ Name = "err_syntax_c_for_header_once"; Path = "tests/err_syntax_c_for_header.mettle"; ShouldSucceed = $false; Pattern = "due to 1 previous error" },
   @{ Name = "err_syntax_lexical_no_cascade"; Path = "tests/err_syntax_lexical_no_cascade.mettle"; ShouldSucceed = $false; Pattern = "due to 1 previous error" },
+  @{ Name = "err_increment_expression"; Path = "tests/err_increment_expression.mettle"; ShouldSucceed = $false; Pattern = "are statements, not expressions" },
+  @{ Name = "err_increment_expression_once"; Path = "tests/err_increment_expression.mettle"; ShouldSucceed = $false; Pattern = "due to 1 previous error" },
+  @{ Name = "err_increment_narrow"; Path = "tests/err_increment_narrow.mettle"; ShouldSucceed = $false; Pattern = "Narrowing conversion from 'int32' to 'uint8'" },
   # A `<` comparison whose right side makes the speculative type-argument parse
   # fail must backtrack without leaving the abandoned parse's diagnostic behind.
   @{ Name = "generic_call_lt_ambiguity"; Path = "tests/generic_call_lt_ambiguity.mettle"; ShouldSucceed = $true
@@ -2159,15 +2315,126 @@ $cases = @(
 $total = 0
 $failed = 0
 
-foreach ($case in $cases) {
-  $caseName = $case.Name
-  try {
-    $total++
-    $outFile = Join-Path $tmpDir ("{0}.obj" -f $case.Name)
-    if (Test-Path $outFile) {
-      Remove-Item -Path $outFile -Force -ErrorAction SilentlyContinue
-    }
+if ($Jobs -le 0) {
+  $Jobs = [int]$env:NUMBER_OF_PROCESSORS
+  if ($Jobs -le 0) { $Jobs = 4 }
+}
+$script:TestJobs = $Jobs
 
+# ---------------------------------------------------------------------------
+# The table above is the longest phase of the suite and the only one that is
+# trivially concurrent: each case is one compiler invocation (two when the
+# determinism check applies) whose artifacts are named after the case, and the
+# only thing cases share is the read-only source tree. The invocations run
+# through a pool of processes here; every assertion still runs afterwards, in
+# table order, against the captured result. Nothing about what a case checks
+# changes -- only when the compiler ran.
+# ---------------------------------------------------------------------------
+
+# ProcessStartInfo on .NET Framework takes one command-line string, so each
+# argument is quoted the way CommandLineToArgvW will take it apart again.
+function ConvertTo-CommandLine {
+  param([string[]]$Arguments)
+  $parts = @()
+  foreach ($arg in $Arguments) {
+    if ($arg -match '[\s"]') {
+      $escaped = $arg -replace '(\\*)"', '$1$1\"'
+      $escaped = $escaped -replace '(\\+)$', '$1$1'
+      $parts += '"' + $escaped + '"'
+    }
+    else {
+      $parts += $arg
+    }
+  }
+  return ($parts -join ' ')
+}
+
+$script:CompilerFullPath = (Resolve-Path -LiteralPath $CompilerPath).ProviderPath
+
+function Start-ExternalProcess {
+  param([string]$FilePath, [string[]]$Arguments, $CaseEnv)
+
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = $FilePath
+  $psi.Arguments = ConvertTo-CommandLine $Arguments
+  $psi.WorkingDirectory = $repoRoot
+  $psi.UseShellExecute = $false
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+  $psi.CreateNoWindow = $true
+  # Per-case variables go to the child alone, so concurrent cases cannot see
+  # each other's settings the way a process-wide assignment would let them.
+  if ($CaseEnv) {
+    foreach ($k in $CaseEnv.Keys) {
+      $psi.EnvironmentVariables[$k] = [string]$CaseEnv[$k]
+    }
+  }
+  $proc = [System.Diagnostics.Process]::Start($psi)
+  # Both pipes are drained while the child runs: a compiler that fills one of
+  # them would otherwise block forever waiting for a reader.
+  return [pscustomobject]@{
+    Proc = $proc
+    Out  = $proc.StandardOutput.ReadToEndAsync()
+    Err  = $proc.StandardError.ReadToEndAsync()
+  }
+}
+
+function Start-CompilerProcess {
+  param([string[]]$Arguments, $CaseEnv)
+  return Start-ExternalProcess -FilePath $script:CompilerFullPath -Arguments $Arguments -CaseEnv $CaseEnv
+}
+
+function Complete-CompilerProcess {
+  param($Handle)
+  $out = $Handle.Out.Result
+  $err = $Handle.Err.Result
+  $Handle.Proc.WaitForExit()
+  $code = $Handle.Proc.ExitCode
+  $Handle.Proc.Dispose()
+  return [pscustomobject]@{ ExitCode = $code; Output = ($out + $err) }
+}
+
+# A batch of independent commands, run through the same pool and reported back
+# in the order they were given. Cases built as a loop over fixtures use this to
+# do their builds in one wave and their runs in the next; the comparisons that
+# follow are unchanged and still happen in fixture order.
+function Invoke-InParallel {
+  param([object[]]$Commands, [int]$Jobs = 0)
+
+  if ($Jobs -le 0) { $Jobs = $script:TestJobs }
+  $results = New-Object object[] $Commands.Count
+  $next = 0
+  $active = New-Object System.Collections.ArrayList
+
+  while ($next -lt $Commands.Count -or $active.Count -gt 0) {
+    while ($next -lt $Commands.Count -and $active.Count -lt $Jobs) {
+      $cmd = $Commands[$next]
+      $handle = Start-ExternalProcess -FilePath $cmd.File -Arguments @($cmd.Args) -CaseEnv $cmd.Env
+      [void]$active.Add([pscustomobject]@{ Index = $next; Handle = $handle })
+      $next++
+    }
+    if ($active.Count -eq 0) { break }
+    $done = $null
+    while ($null -eq $done) {
+      foreach ($job in $active) {
+        if ($job.Handle.Proc.HasExited) { $done = $job; break }
+      }
+      if ($null -eq $done) { Start-Sleep -Milliseconds 5 }
+    }
+    $active.Remove($done)
+    $results[$done.Index] = Complete-CompilerProcess $done.Handle
+  }
+
+  return $results
+}
+
+function Invoke-TableCases {
+  param($Cases, [int]$Jobs)
+
+  $results = @{}
+  $pending = New-Object System.Collections.Generic.Queue[object]
+
+  foreach ($case in $Cases) {
     $caseArgs = @()
     if ($case.ContainsKey("Args") -and $case.Args) {
       $caseArgs = @($case.Args)
@@ -2180,23 +2447,130 @@ foreach ($case in $cases) {
       $caseArgs += "--dump-ir"
     }
 
-    # Per-case environment variables (restored right after the invocation).
-    $savedEnv = @{}
-    if ($case.ContainsKey("Env") -and $case.Env) {
-      foreach ($k in $case.Env.Keys) {
-        $savedEnv[$k] = [Environment]::GetEnvironmentVariable($k)
-        [Environment]::SetEnvironmentVariable($k, $case.Env[$k])
+    # Whether the determinism rebuild applies is decided from the case alone, so
+    # the second compile can be queued behind the first without waiting for the
+    # assertions. Its verdict is still only consulted when everything else about
+    # the case passed.
+    $wantsDeterminism = ($case.ShouldSucceed -and -not $SkipDeterminism -and
+      -not ($case.ContainsKey("SkipBinaryCheck") -and $case.SkipBinaryCheck) -and
+      -not ($case.ContainsKey("SkipDeterminism") -and $case.SkipDeterminism))
+
+    $outFile = Join-Path $tmpDir ("{0}.obj" -f $case.Name)
+    $results[$case.Name] = [pscustomobject]@{
+      Args        = $caseArgs
+      Output      = ""
+      ExitCode    = 0
+      DetRan      = $false
+      DetExitCode = 0
+      DetOutput   = ""
+      Hash1       = ""
+      Hash2       = ""
+      Error       = ""
+    }
+    $pending.Enqueue([pscustomobject]@{
+      Case        = $case
+      Args        = $caseArgs
+      OutFile     = $outFile
+      KeepFile    = Join-Path $tmpDir ("{0}.first.obj" -f $case.Name)
+      WantsDet    = $wantsDeterminism
+      Stage       = 0
+      Handle      = $null
+      Result      = $results[$case.Name]
+    })
+  }
+
+  $active = New-Object System.Collections.ArrayList
+  while ($pending.Count -gt 0 -or $active.Count -gt 0) {
+    while ($pending.Count -gt 0 -and $active.Count -lt $Jobs) {
+      $job = $pending.Dequeue()
+      try {
+        if (Test-Path -LiteralPath $job.OutFile) {
+          Remove-Item -LiteralPath $job.OutFile -Force -ErrorAction SilentlyContinue
+        }
+        $job.Stage = 1
+        $job.Handle = Start-CompilerProcess -Arguments (@($job.Args) + @($job.Case.Path, "-o", $job.OutFile)) -CaseEnv $job.Case.Env
+        [void]$active.Add($job)
+      }
+      catch {
+        $job.Result.Error = $_.Exception.Message
       }
     }
 
-    # -Width 4096: keep each diagnostic on one logical line so multi-word
-    # Pattern matches aren't broken by console-width line wrapping.
-    $output = & $CompilerPath @caseArgs $case.Path -o $outFile 2>&1 | Out-String -Width 4096
-    $exitCode = $LASTEXITCODE
+    if ($active.Count -eq 0) { break }
 
-    foreach ($k in $savedEnv.Keys) {
-      [Environment]::SetEnvironmentVariable($k, $savedEnv[$k])
+    $done = $null
+    while ($null -eq $done) {
+      foreach ($job in $active) {
+        if ($job.Handle.Proc.HasExited) { $done = $job; break }
+      }
+      if ($null -eq $done) { Start-Sleep -Milliseconds 5 }
     }
+    $active.Remove($done)
+
+    $finished = Complete-CompilerProcess $done.Handle
+    if ($done.Stage -eq 1) {
+      $done.Result.ExitCode = $finished.ExitCode
+      $done.Result.Output = $finished.Output
+      # Rebuild over the SAME output path. GNU ld records each input object's
+      # name in .symtab, and `--build` names its intermediate object after the
+      # output, so a second build to a second path differs by that name alone
+      # and says nothing about determinism. The first product is set aside and
+      # put back so the assertions still see it.
+      if ($done.WantsDet -and $finished.ExitCode -eq 0 -and (Test-Path -LiteralPath $done.OutFile)) {
+        try {
+          Copy-Item -LiteralPath $done.OutFile -Destination $done.KeepFile -Force
+          $done.Result.Hash1 = Get-Sha256FileHash -Path $done.KeepFile
+          Remove-Item -LiteralPath $done.OutFile -Force -ErrorAction SilentlyContinue
+          $done.Stage = 2
+          $done.Handle = Start-CompilerProcess -Arguments (@($done.Args) + @($done.Case.Path, "-o", $done.OutFile)) -CaseEnv $done.Case.Env
+          [void]$active.Add($done)
+        }
+        catch {
+          $done.Result.Error = $_.Exception.Message
+        }
+      }
+    }
+    else {
+      $done.Result.DetRan = $true
+      $done.Result.DetExitCode = $finished.ExitCode
+      $done.Result.DetOutput = $finished.Output
+      if ($finished.ExitCode -eq 0 -and (Test-Path -LiteralPath $done.OutFile)) {
+        $done.Result.Hash2 = Get-Sha256FileHash -Path $done.OutFile
+      }
+      if (-not (Test-Path -LiteralPath $done.OutFile)) {
+        Copy-Item -LiteralPath $done.KeepFile -Destination $done.OutFile -Force
+      }
+      Remove-Item -LiteralPath $done.KeepFile -Force -ErrorAction SilentlyContinue
+    }
+  }
+
+  return $results
+}
+
+if ($Shards -gt 1) {
+  $mine = @()
+  for ($i = 0; $i -lt $cases.Count; $i++) {
+    if (((([int][Math]::Floor($i / $script:CaseBlock)) % $Shards)) -eq $Shard) {
+      $mine += $cases[$i]
+    }
+  }
+  $cases = $mine
+}
+
+Write-Host "Running $($cases.Count) compile cases across $Jobs jobs..."
+$caseRuns = Invoke-TableCases -Cases $cases -Jobs $Jobs
+
+foreach ($case in $cases) {
+  $caseName = $case.Name
+  try {
+    $total++
+    $outFile = Join-Path $tmpDir ("{0}.obj" -f $case.Name)
+
+    $run = $caseRuns[$case.Name]
+    if ($run.Error) { throw $run.Error }
+    $caseArgs = @($run.Args)
+    $output = $run.Output
+    $exitCode = $run.ExitCode
 
     $passed = $true
     $reason = ""
@@ -2321,38 +2695,20 @@ foreach ($case in $cases) {
             }
           }
         }
-        if ($passed -and -not $SkipDeterminism -and -not $skipBinaryCheck -and
-            -not ($case.ContainsKey("SkipDeterminism") -and $case.SkipDeterminism)) {
-          # Rebuild over the SAME output path. GNU ld records each input object's
-          # name in .symtab, and `--build` names its intermediate object after
-          # the output, so a second build to a second path differs by that name
-          # alone and says nothing about determinism. The first product is set
-          # aside and put back so later assertions still see it.
-          $outFileKeep = Join-Path $tmpDir ("{0}.first.obj" -f $case.Name)
-          Copy-Item -LiteralPath $outFile -Destination $outFileKeep -Force
-          $hash1 = Get-Sha256FileHash -Path $outFileKeep
-
-          Remove-Item -LiteralPath $outFile -Force -ErrorAction SilentlyContinue
-          $output2 = & $CompilerPath @caseArgs $case.Path -o $outFile 2>&1 | Out-String
-          $exitCode2 = $LASTEXITCODE
-          if ($exitCode2 -ne 0) {
+        # The determinism rebuild already ran alongside the first compile; its
+        # verdict counts only once everything else about the case has passed.
+        if ($passed -and $run.DetRan) {
+          if ($run.DetExitCode -ne 0) {
             $passed = $false
-            $reason = "Determinism compile failed with exit code $exitCode2"
-            if ($output2) {
-              $output = $output + [Environment]::NewLine + $output2
+            $reason = "Determinism compile failed with exit code $($run.DetExitCode)"
+            if ($run.DetOutput) {
+              $output = $output + [Environment]::NewLine + $run.DetOutput
             }
           }
-          else {
-            $hash2 = Get-Sha256FileHash -Path $outFile
-            if ($hash1 -ne $hash2) {
-              $passed = $false
-              $reason = "Determinism check failed: outputs differ between identical runs"
-            }
+          elseif ($run.Hash1 -ne $run.Hash2) {
+            $passed = $false
+            $reason = "Determinism check failed: outputs differ between identical runs"
           }
-          if (-not (Test-Path $outFile)) {
-            Copy-Item -LiteralPath $outFileKeep -Destination $outFile -Force
-          }
-          Remove-Item -LiteralPath $outFileKeep -Force -ErrorAction SilentlyContinue
         }
       }
     }
@@ -2395,7 +2751,7 @@ foreach ($case in $cases) {
 
     if (-not $passed) {
       $failed++
-      Write-CaseResult -Name $case.Name -Passed $false -Reason $reason
+      Write-CaseResult -Name $case.Name -Passed $false -Reason $reason -Detail $output
       if ($output) {
         Write-Host ($output.TrimEnd())
       }
@@ -2417,6 +2773,7 @@ foreach ($case in $cases) {
 # the accumulated total itself and returns non-zero if any field is wrong.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "comptime_for_fields.exe"
   if (Test-Path $exePath) { Remove-Item -Path $exePath -Force -ErrorAction SilentlyContinue }
   $buildOut = & $CompilerPath --build --release "tests/test_comptime_for_fields.mettle" -o $exePath 2>&1 | Out-String
@@ -2439,6 +2796,7 @@ catch {
 foreach ($fieldofMode in @("debug", "release")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "fieldof_$fieldofMode.exe"
     if (Test-Path $exePath) { Remove-Item -Path $exePath -Force -ErrorAction SilentlyContinue }
     $buildArgs = @()
@@ -2464,6 +2822,7 @@ foreach ($fieldofMode in @("debug", "release")) {
 foreach ($strCmpMode in @("debug", "release")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "comptime_string_compare_$strCmpMode.exe"
     if (Test-Path $exePath) { Remove-Item -Path $exePath -Force -ErrorAction SilentlyContinue }
     $buildArgs = @()
@@ -2488,6 +2847,7 @@ foreach ($strCmpMode in @("debug", "release")) {
 # returns non-zero if any of them carries the wrong field.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "comptime_for_declarations.exe"
   if (Test-Path $exePath) { Remove-Item -Path $exePath -Force -ErrorAction SilentlyContinue }
   $buildOut = & $CompilerPath --build --release "tests/test_comptime_for_declarations.mettle" -o $exePath 2>&1 | Out-String
@@ -2507,6 +2867,7 @@ catch {
 # none: `@test` on one runs, and `@noalloc` on one fails the build.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $out = & $CompilerPath test "tests/test_comptime_for_declarations.mettle" 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "generated tests failed: $out" }
   foreach ($expected in @("test offset_is_ordered_kind", "test offset_is_ordered_payload", "3 passed")) {
@@ -2542,6 +2903,7 @@ catch {
 # generated blocks, and the ledger must count a module-scope site.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $out = & $CompilerPath expand "tests/test_comptime_for_declarations.mettle" 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "expand failed: $out" }
   foreach ($expected in @(
@@ -2567,6 +2929,7 @@ catch {
 # the iteration that produced it, with the same note a diagnostic would carry.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $out = & $CompilerPath expand "tests/test_comptime_for_fields.mettle" 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "expand failed: $out" }
   foreach ($expected in @(
@@ -2595,6 +2958,7 @@ catch {
 # reached the instructions the interpreter walks.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $out = & $CompilerPath trace "tests/test_comptime_for_fields.mettle" main 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "trace failed: $out" }
   foreach ($expected in @('(field `kind`) total = 100',
@@ -2625,6 +2989,7 @@ catch {
 # made expand disclaim the whole file as an incomplete program.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $out = & $CompilerPath expand "tests/test_fieldof.mettle" 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "expand failed: $out" }
   if ($out -match "no source form") {
@@ -2650,6 +3015,7 @@ catch {
 # survive to a running program without emitting anything.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $swapSrc = "tests/test_swappable_quiesce.mettle"
   $out = & $CompilerPath --release --explain $swapSrc -o (Join-Path $tmpDir "swq.obj") 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "build failed: $out" }
@@ -2690,6 +3056,7 @@ catch {
 foreach ($swapMode in @("debug", "release")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exe = Join-Path $tmpDir "hotswap_$swapMode.exe"
     $buildArgs = @()
     if ($swapMode -eq "release") { $buildArgs += "--release" }
@@ -2714,6 +3081,7 @@ foreach ($swapMode in @("debug", "release")) {
 foreach ($strEqMode in @("debug", "release")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exe = Join-Path $tmpDir "stringeq_$strEqMode.exe"
     $buildArgs = @()
     if ($strEqMode -eq "release") { $buildArgs += "--release" }
@@ -2739,6 +3107,7 @@ foreach ($strEqMode in @("debug", "release")) {
 foreach ($sopsMode in @("debug", "release")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exe = Join-Path $tmpDir "std_string_ops_$sopsMode.exe"
     $buildArgs = @()
     if ($sopsMode -eq "release") { $buildArgs += "--release" }
@@ -2766,6 +3135,7 @@ foreach ($sopsMode in @("debug", "release")) {
 foreach ($sbvMode in @("debug", "release")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exe = Join-Path $tmpDir "string_byvalue_$sbvMode.exe"
     $buildArgs = @()
     if ($sbvMode -eq "release") { $buildArgs += "--release" }
@@ -2796,6 +3166,7 @@ foreach ($interpCase in @(
   foreach ($interpMode in @("debug", "release")) {
     $total++
     try {
+      if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
       $exe = Join-Path $tmpDir "$($interpCase.Name)_$interpMode.exe"
       $buildArgs = @()
       if ($interpMode -eq "release") { $buildArgs += "--release" }
@@ -2819,6 +3190,7 @@ foreach ($interpCase in @(
 # never names mettle_string_ and never links it.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exe = Join-Path $tmpDir "string_excision.exe"
   $out = & $CompilerPath --build "tests/runtime_excision_probe.mettle" -o $exe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "probe build failed: $out" }
@@ -2837,6 +3209,7 @@ catch {
 # quiesce point never names mettle_swap_ and never links it.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exe = Join-Path $tmpDir "swap_excision.exe"
   $out = & $CompilerPath --build "tests/runtime_excision_probe.mettle" -o $exe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "probe build failed: $out" }
@@ -2863,6 +3236,7 @@ catch {
 # feature IS requested. Without that pairing the test proves nothing.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $probe = "tests/runtime_excision_probe.mettle"
   # OnProbe overrides the source used for the present-when-asked-for half.
   # --safe on the plain probe proves every access in bounds and calls nothing,
@@ -2924,6 +3298,7 @@ catch {
 # and a passing verdict says it is a test rather than a proof.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $swapFile = "tests/swap_check_pairs.mettle"
 
   $out = & $CompilerPath swap-check $swapFile --old scale_v1 --new scale_v2 2>&1 | Out-String
@@ -2964,6 +3339,7 @@ catch {
 # Expansion keeps a ledger, and a budget is a contract that fails the build.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $used = & $CompilerPath --report-expansion "tests/test_comptime_for_fields.mettle" 2>&1 | Out-String
   if ($used -notmatch "comptime expansion: 2 sites") { throw "ledger wrong: $used" }
   if ($used -notmatch "3 iterations") { throw "ledger missing iteration count: $used" }
@@ -2989,6 +3365,7 @@ catch {
 # check the qualification is to run the program and read what it printed.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "type_names.exe"
   if (Test-Path $exePath) { Remove-Item -Path $exePath -Force -ErrorAction SilentlyContinue }
   $buildOut = & $CompilerPath --build "tests/test_type_names.mettle" -o $exePath 2>&1 | Out-String
@@ -3057,6 +3434,7 @@ $simdRuntimeCases = @(
 foreach ($case in $simdRuntimeCases) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir ("{0}.exe" -f $case.Name)
     $objPath = [System.IO.Path]::ChangeExtension($exePath, $script:ObjExt)
     $irPath = "$objPath.ir"
@@ -3104,6 +3482,7 @@ foreach ($case in $simdRuntimeCases) {
 # Confirm the IR shows each transform and that the program is still correct.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "decorators.exe"
   $objPath = [System.IO.Path]::ChangeExtension($exePath, $script:ObjExt)
   $irPath = "$objPath.ir"
@@ -3155,6 +3534,7 @@ catch {
 # counterexample while the binary stays correct.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $mlBase = Join-Path $tmpDir "ml_gate_base.exe"
   $buildOut = & $CompilerPath --build --release "tests/ml_gate.mettle" -o $mlBase 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
@@ -3258,6 +3638,7 @@ catch {
 # discard it - the ml-opt twin of verify_sabotage_caught.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $env:METTLE_ML_SABOTAGE = "1"
   $sabExe = Join-Path $tmpDir "ml_gate_sab.exe"
   $buildOut = & $CompilerPath --build --release --ml-opt "examples/explain_demo/explain_demo.mettle" -o $sabExe 2>&1 | Out-String
@@ -3290,6 +3671,7 @@ catch {
 # golden vectors so that failure mode is a build error instead.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $obsExe = "bin/ml_obs_parity_test.exe"
   & gcc -Wall -Wextra -std=c11 -g -O1 -Isrc -Iinclude tests/ml_obs_parity_test.c src/ir/ml_obs.c -o $obsExe -lm
   if ($LASTEXITCODE -ne 0) {
@@ -3317,6 +3699,7 @@ catch {
 # compiler involvement, so it is tested on its own.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $safetyExe = Join-Path $tmpDir "safety_runtime_test.exe"
   $compileSafety = & gcc -Wall -Wextra -std=c99 -g -O1 -D_GNU_SOURCE -Isrc tests/safety_runtime_test.c src/runtime/safety.c -o $safetyExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
@@ -3344,6 +3727,7 @@ catch {
 # some unrelated change in codegen.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $safeClean = Join-Path $tmpDir "safe_clean.exe"
   & $CompilerPath --build --safe --release tests/test_safe_clean.mettle -o $safeClean 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) {
@@ -3395,6 +3779,7 @@ catch {
 # checked on both paths rather than one.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $allocators = @{ "libc" = @(); "native" = @("--native-heap") }
   foreach ($allocator in $allocators.Keys) {
     $extra = $allocators[$allocator]
@@ -3444,6 +3829,7 @@ catch {
 # in the described range would show.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $globalCleanExe = Join-Path $tmpDir "safe_global_clean.exe"
   & $CompilerPath --build --safe --release tests/test_safe_global_clean.mettle -o $globalCleanExe 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) {
@@ -3494,6 +3880,7 @@ catch {
 # layout it happened to get.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $stackCleanExe = Join-Path $tmpDir "safe_stack_clean.exe"
   & $CompilerPath --build --safe --release tests/test_safe_stack_clean.mettle -o $stackCleanExe 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) {
@@ -3681,27 +4068,42 @@ catch {
 # a time.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $corpus = @("dot_product", "base64_encode", "heapsort", "crc32",
               "binary_search", "sort_insertion", "transpose", "aos_sum")
-  foreach ($name in $corpus) {
+  $present = @($corpus | Where-Object { Test-Path "examples/$_/$_.mettle" })
+
+  $builds = @()
+  foreach ($name in $present) {
     $src = "examples/$name/$name.mettle"
-    if (-not (Test-Path $src)) { continue }
-
-    $baseExe = Join-Path $tmpDir "corpus_$name.base.exe"
-    $safeExe = Join-Path $tmpDir "corpus_$name.safe.exe"
-    & $CompilerPath --build --release $src -o $baseExe 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-      throw "baseline build of $name failed"
+    $builds += @{ File = $script:CompilerFullPath
+                  Args = @("--build", "--release", $src, "-o", (Join-Path $tmpDir "corpus_$name.base.exe")) }
+    $builds += @{ File = $script:CompilerFullPath
+                  Args = @("--build", "--release", "--safe", $src, "-o", (Join-Path $tmpDir "corpus_$name.safe.exe")) }
+  }
+  $buildResults = Invoke-InParallel -Commands $builds
+  for ($i = 0; $i -lt $present.Count; $i++) {
+    if ($buildResults[2 * $i].ExitCode -ne 0) {
+      throw "baseline build of $($present[$i]) failed"
     }
-    & $CompilerPath --build --release --safe $src -o $safeExe 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-      throw "--safe build of $name failed"
+    if ($buildResults[2 * $i + 1].ExitCode -ne 0) {
+      throw "--safe build of $($present[$i]) failed"
     }
+  }
 
-    $baseOut = & $baseExe 2>&1 | Out-String
-    $baseCode = $LASTEXITCODE
-    $safeOut = & $safeExe 2>&1 | Out-String
-    $safeCode = $LASTEXITCODE
+  $runs = @()
+  foreach ($name in $present) {
+    $runs += @{ File = (Join-Path $tmpDir "corpus_$name.base.exe"); Args = @() }
+    $runs += @{ File = (Join-Path $tmpDir "corpus_$name.safe.exe"); Args = @() }
+  }
+  $runResults = Invoke-InParallel -Commands $runs
+
+  for ($i = 0; $i -lt $present.Count; $i++) {
+    $name = $present[$i]
+    $baseOut = $runResults[2 * $i].Output
+    $baseCode = $runResults[2 * $i].ExitCode
+    $safeOut = $runResults[2 * $i + 1].Output
+    $safeCode = $runResults[2 * $i + 1].ExitCode
     if ($baseCode -ne $safeCode) {
       throw "$name exited $baseCode without --safe and $safeCode with it:`n$safeOut"
     }
@@ -3732,29 +4134,44 @@ catch {
 # forgets to check whether the body is claimable fails here.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $shapes = @("test_safe_vec_dot", "test_safe_vec_sum", "test_safe_vec_fill",
               "test_safe_vec_map")
+
+  $builds = @()
   foreach ($shape in $shapes) {
-    $safeExe = Join-Path $tmpDir "$shape.safe.exe"
-    & $CompilerPath --build --safe --release "tests/$shape.mettle" -o $safeExe 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-      throw "--safe build of $shape failed"
+    $builds += @{ File = $script:CompilerFullPath
+                  Args = @("--build", "--safe", "--release", "tests/$shape.mettle", "-o", (Join-Path $tmpDir "$shape.safe.exe")) }
+    $builds += @{ File = $script:CompilerFullPath
+                  Args = @("--build", "--release", "tests/$shape.mettle", "-o", (Join-Path $tmpDir "$shape.base.exe")) }
+  }
+  $buildResults = Invoke-InParallel -Commands $builds
+  for ($i = 0; $i -lt $shapes.Count; $i++) {
+    if ($buildResults[2 * $i].ExitCode -ne 0) {
+      throw "--safe build of $($shapes[$i]) failed"
     }
-    $safeOut = & $safeExe 2>&1 | Out-String
-    if ($LASTEXITCODE -eq 0) {
+    if ($buildResults[2 * $i + 1].ExitCode -ne 0) {
+      throw "baseline build of $($shapes[$i]) failed"
+    }
+  }
+
+  $runs = @()
+  foreach ($shape in $shapes) {
+    $runs += @{ File = (Join-Path $tmpDir "$shape.safe.exe"); Args = @() }
+    $runs += @{ File = (Join-Path $tmpDir "$shape.base.exe"); Args = @() }
+  }
+  $runResults = Invoke-InParallel -Commands $runs
+
+  for ($i = 0; $i -lt $shapes.Count; $i++) {
+    $shape = $shapes[$i]
+    $safeRun = $runResults[2 * $i]
+    if ($safeRun.ExitCode -eq 0) {
       throw "$shape ran to completion under --safe --release; a recognizer claimed the loop body and erased the check"
     }
-    if ($safeOut -notmatch "outside its allocation") {
-      throw "$shape trapped for the wrong reason:`n$safeOut"
+    if ($safeRun.Output -notmatch "outside its allocation") {
+      throw "$shape trapped for the wrong reason:`n$($safeRun.Output)"
     }
-
-    $baseExe = Join-Path $tmpDir "$shape.base.exe"
-    & $CompilerPath --build --release "tests/$shape.mettle" -o $baseExe 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-      throw "baseline build of $shape failed"
-    }
-    $baseOut = & $baseExe 2>&1 | Out-String
-    if ($baseOut -match "outside its allocation") {
+    if ($runResults[2 * $i + 1].Output -match "outside its allocation") {
       throw "$shape trapped without --safe, so the case proves nothing about the check"
     }
   }
@@ -3773,6 +4190,7 @@ catch {
 # loop would look at it anyway.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $hoistExe = Join-Path $tmpDir "safe_hoist_clean.exe"
   & $CompilerPath --build --safe --release tests/test_safe_hoist_clean.mettle -o $hoistExe 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) {
@@ -3846,6 +4264,7 @@ catch {
 # at runtime, and do NOT emit the Win32 HeapAlloc/calloc path for `new`.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "native_heap.exe"
   $objPath = [System.IO.Path]::ChangeExtension($exePath, $script:ObjExt)
   $irPath = "$objPath.ir"
@@ -3890,6 +4309,7 @@ catch {
 # per-heap spinlock must keep every allocation counted (20000) with no leak.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "native_heap_threads.exe"
   $objPath = [System.IO.Path]::ChangeExtension($exePath, $script:ObjExt)
   foreach ($artifactPath in @($exePath, $objPath)) {
@@ -3924,6 +4344,7 @@ catch {
 foreach ($surfaceMode in @("debug", "release")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir ("surface_conversions_{0}.exe" -f $surfaceMode)
     if (Test-Path $exePath) { Remove-Item -Path $exePath -Force -ErrorAction SilentlyContinue }
     $surfaceFlags = @("--build", "--linker", "internal")
@@ -3948,6 +4369,7 @@ foreach ($surfaceMode in @("debug", "release")) {
 foreach ($mathMode in @("debug", "release")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir ("runtime_float_math_{0}.exe" -f $mathMode)
     if (Test-Path $exePath) { Remove-Item -Path $exePath -Force -ErrorAction SilentlyContinue }
     $mathFlags = @("--build", "--linker", "internal")
@@ -3975,6 +4397,7 @@ foreach ($coercionProgram in @("tests/test_string_cstring_coercions.mettle",
   $total++
   $coercionName = "release_parity_" + [System.IO.Path]::GetFileNameWithoutExtension($coercionProgram)
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $debugExe = Join-Path $tmpDir ($coercionName + "_d.exe")
     $releaseExe = Join-Path $tmpDir ($coercionName + "_r.exe")
     foreach ($stale in @($debugExe, $releaseExe)) {
@@ -4006,6 +4429,7 @@ foreach ($coercionProgram in @("tests/test_string_cstring_coercions.mettle",
 # corruption). Exercises std/alloc directly; no flag needed.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "alloc_doublefree.exe"
   if (Test-Path $exePath) { Remove-Item -Path $exePath -Force -ErrorAction SilentlyContinue }
   $buildOut = & $CompilerPath --build --linker internal --release "tests/test_alloc_doublefree.mettle" -o $exePath 2>&1 | Out-String
@@ -4046,6 +4470,7 @@ foreach ($prog in $nativeHeapParityPrograms) {
   $total++
   $caseName = "native_heap_parity_" + [System.IO.Path]::GetFileNameWithoutExtension($prog).Replace("test_", "")
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $baseExe = Join-Path $tmpDir ("nhp_base_{0}.exe" -f [System.IO.Path]::GetFileNameWithoutExtension($prog))
     $nhExe   = Join-Path $tmpDir ("nhp_nh_{0}.exe"   -f [System.IO.Path]::GetFileNameWithoutExtension($prog))
     foreach ($e in @($baseExe, $nhExe)) { if (Test-Path $e) { Remove-Item -Path $e -Force -ErrorAction SilentlyContinue } }
@@ -4074,6 +4499,7 @@ foreach ($prog in $nativeHeapParityPrograms) {
 # Generics runtime: compile with --build and verify monomorphized return values.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $genericRuntimeCases = @(
     @{ Path = "tests/test_generics_nested_struct.mettle"; ExitCode = 99; Label = "nested-struct" },
     @{ Path = "tests/test_generics_generic_enum.mettle"; ExitCode = 42; Label = "generic-enum" },
@@ -4118,6 +4544,7 @@ catch {
 # referenced function alive through dead-function elimination). 55 = all intact.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   foreach ($mode in @("", "--release")) {
     $label = if ($mode -eq "") { "debug" } else { "release" }
     $exePath = Join-Path $tmpDir ("global_aggregates_and_fnptr_{0}.exe" -f $label)
@@ -4152,6 +4579,7 @@ catch {
 if (-not $script:OnWindows) { Skip-WindowsOnly "runtime_symbol_override" "Windows-only: symbol override is an internal-PE-linker capability; GNU ld rejects the duplicate" } else {
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "runtime_symbol_override.exe"
   $buildOut = & $CompilerPath --build --linker internal -I tests/lib "tests/test_runtime_symbol_override.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
@@ -4198,6 +4626,7 @@ catch {
 # read sees what was written.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   foreach ($mode in @("", "--release")) {
     $label = if ($mode -eq "") { "debug" } else { "release" }
     $exePath = Join-Path $tmpDir ("word_sized_global_aggregate_{0}.exe" -f $label)
@@ -4229,6 +4658,7 @@ catch {
 # relocations. 55 = every form intact.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   foreach ($mode in @("", "--release")) {
     $label = if ($mode -eq "") { "debug" } else { "release" }
     $exePath = Join-Path $tmpDir ("aggregate_literals_{0}.exe" -f $label)
@@ -4258,6 +4688,7 @@ catch {
 # first machine word. 55 = every destination form intact.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   foreach ($mode in @("", "--release")) {
     $label = if ($mode -eq "") { "debug" } else { "release" }
     $exePath = Join-Path $tmpDir ("struct_return_to_field_{0}.exe" -f $label)
@@ -4288,6 +4719,7 @@ catch {
 # handling the bound froze at its pre-loop value. 55 = every shape correct.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   foreach ($mode in @("", "--release")) {
     $label = if ($mode -eq "") { "debug" } else { "release" }
     $exePath = Join-Path $tmpDir ("opt_nested_loop_variable_bound_{0}.exe" -f $label)
@@ -4318,6 +4750,7 @@ catch {
 # reinterprets doubles through pointer casts, which --release must not disturb.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   foreach ($mode in @("", "--release")) {
     $label = if ($mode -eq "") { "debug" } else { "release" }
     $exePath = Join-Path $tmpDir ("std_math_{0}.exe" -f $label)
@@ -4351,6 +4784,7 @@ catch {
 # at --release: 55 = fused and reference results match, 1 = divergence.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "opt_fused_loop_threaded_exit.exe"
   $buildOut = & $CompilerPath --build --release "tests/test_opt_fused_loop_threaded_exit.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
@@ -4373,6 +4807,7 @@ catch {
 # --release: 55 = checksum matches, 1 = a homing move clobbered a live source.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "regalloc_argreg_call_pressure.exe"
   $buildOut = & $CompilerPath --build --release "tests/test_regalloc_argreg_call_pressure.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
@@ -4398,6 +4833,7 @@ catch {
 # the C99 frontend and lives in the frontend's tests/diff/many_args.c.)
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "call_many_args_frame.exe"
   $buildOut = & $CompilerPath --build "tests/test_call_many_args_frame.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
@@ -4423,6 +4859,7 @@ catch {
 foreach ($globalFloatMode in @("debug", "release")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "global_float_var_$globalFloatMode.exe"
     $buildArgs = @()
     if ($globalFloatMode -eq "release") { $buildArgs += "--release" }
@@ -4449,6 +4886,7 @@ foreach ($globalFloatMode in @("debug", "release")) {
 # Switch range cases: compile with --build and verify inclusive-interval dispatch.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "switch_range.exe"
   $buildOut = & $CompilerPath --build "tests/test_switch_range.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
@@ -4473,6 +4911,7 @@ catch {
 # null), with the faulting line and a stack trace.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "crash_null_offset.exe"
   $buildOut = & $CompilerPath --build "tests/debug_crash.mettle" -o $exePath -s 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "Build failed: $buildOut" }
@@ -4494,6 +4933,7 @@ catch {
 # crash handler classifies the address as a freed heap block.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "crash_uaf_large.exe"
   $buildOut = & $CompilerPath --build "tests/crash_uaf_large.mettle" -o $exePath -s --native-heap 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "Build failed: $buildOut" }
@@ -4513,6 +4953,7 @@ catch {
 # quarantine poison and is reported when the block leaves quarantine.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "crash_waf_small.exe"
   $buildOut = & $CompilerPath --build "tests/crash_waf_small.mettle" -o $exePath --native-heap 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "Build failed: $buildOut" }
@@ -4532,6 +4973,7 @@ catch {
 # debugger is attached (every hook is an early-out; METTLE_DBG_PIPE unset).
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "debug_hooks_standalone.exe"
   $buildOut = & $CompilerPath --build "tests/debug_demo.mettle" -o $exePath --debug-hooks 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
@@ -4557,6 +4999,7 @@ catch {
 # stands up whichever the platform uses and reads the announcement back.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $dbgExe = Join-Path $tmpDir "debug_transport.exe"
   $buildOut = & $CompilerPath --build "tests/debug_demo.mettle" -o $dbgExe --debug-hooks 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "debug-hooks build failed: $buildOut" }
@@ -4645,6 +5088,7 @@ catch {
 # with_call loop as REGRESSED; the .explain.json sidecar parses and agrees.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exDir = Join-Path $tmpDir "explain_changes"
   New-Item -ItemType Directory $exDir -Force | Out-Null
   # the harness tmp dir persists across suite runs: a stale baseline would
@@ -4747,6 +5191,7 @@ catch {
 # Memory tab can render them.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exDir = Join-Path $tmpDir "explain_memory"
   New-Item -ItemType Directory $exDir -Force | Out-Null
   $exOut = Join-Path $exDir "borrow.obj"
@@ -4777,6 +5222,7 @@ catch {
 # Top-level constants: compile with --build and verify folded compile-time value.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "const_top_level.exe"
   $buildOut = & $CompilerPath --build "tests/test_const_top_level.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
@@ -4796,9 +5242,66 @@ catch {
   Write-CaseResult -Name "const_top_level_runtime" -Passed $false -Reason $_.Exception.Message
 }
 
+# Uninitialized aggregate locals start zeroed (docs/declarations.md). Run in
+# both modes: the frame-dirtying pass inside the test is what makes the probes
+# meaningful, since a fresh frame reads zeros either way.
+foreach ($zeroMode in @(@{ Name = "debug"; Args = @() }, @{ Name = "release"; Args = @("--release") })) {
+  $total++
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    $exePath = Join-Path $tmpDir ("uninit_zero_" + $zeroMode.Name + ".exe")
+    $zeroArgs = @("--build") + $zeroMode.Args + @("tests/test_uninit_aggregate_zeroed.mettle", "-o", $exePath)
+    $buildOut = & $CompilerPath @zeroArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "Uninitialized-aggregate build failed: $buildOut"
+    }
+    if (-not (Test-Path $exePath)) {
+      throw "Uninitialized-aggregate build did not produce an executable"
+    }
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 42) {
+      throw "Uninitialized-aggregate test exited with $LASTEXITCODE (expected 42; a probe read nonzero stack bytes)"
+    }
+    Write-CaseResult -Name ("uninit_aggregate_zeroed_" + $zeroMode.Name) -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name ("uninit_aggregate_zeroed_" + $zeroMode.Name) -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# Increment and decrement statements: --build in debug and release, then verify
+# the runtime value. Both spellings desugar to the compound-assignment path, so
+# this also guards that every assignment target still accepts them.
+foreach ($incMode in @(@{ Name = "debug"; Args = @() }, @{ Name = "release"; Args = @("--release") })) {
+  $total++
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    $exePath = Join-Path $tmpDir ("increment_" + $incMode.Name + ".exe")
+    $incArgs = @("--build") + $incMode.Args + @("tests/test_increment_decrement.mettle", "-o", $exePath)
+    $buildOut = & $CompilerPath @incArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "Increment build failed: $buildOut"
+    }
+    if (-not (Test-Path $exePath)) {
+      throw "Increment build did not produce an executable"
+    }
+    & $exePath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 42) {
+      throw "Increment test exited with $LASTEXITCODE (expected 42)"
+    }
+    Write-CaseResult -Name ("increment_decrement_runtime_" + $incMode.Name) -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name ("increment_decrement_runtime_" + $incMode.Name) -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # Local non-integer consts (float + string): --build and verify runtime value.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "const_local_float_string.exe"
   $buildOut = & $CompilerPath --build "tests/test_const_local_float_string.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
@@ -4823,6 +5326,7 @@ catch {
 # longer rejected; the string global must emit and link like any global.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "const_global_float_string.exe"
   $buildOut = & $CompilerPath --build "tests/test_const_global_float_string.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
@@ -4845,6 +5349,7 @@ catch {
 # Conditional imports: --build and verify off-target guarded imports are dropped.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "import_conditional.exe"
   # The fixture names a nonexistent module under the guard for the OTHER
   # platform, so which fixture proves the point depends on the host.
@@ -4874,6 +5379,7 @@ catch {
 # Deferred calls capture arguments by value at the defer point.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "defer_by_value.exe"
   $buildOut = & $CompilerPath --build "tests/test_defer_by_value.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
@@ -4896,6 +5402,7 @@ catch {
 # Bundled stdlib resolution test: compile from a project directory with no local stdlib.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $compilerFullPath = (Resolve-Path $CompilerPath).Path
   $nativeStdlibDir = Join-Path $tmpDir "native-stdlib-project"
   if (Test-Path $nativeStdlibDir) {
@@ -4941,6 +5448,7 @@ catch {
 # Set-Content -Encoding utf8, Notepad default) must compile cleanly.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $compilerFullPath = (Resolve-Path $CompilerPath).Path
   $bomDir = Join-Path $tmpDir "utf8-bom-project"
   if (Test-Path $bomDir) {
@@ -4983,6 +5491,7 @@ catch {
 # mettle.deps package resolution test: compile from a temp project using a package alias.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $compilerFullPath = (Resolve-Path $CompilerPath).Path
   $depsProjectDir = Join-Path $tmpDir "mettle-deps-project"
   if (Test-Path $depsProjectDir) {
@@ -5030,6 +5539,7 @@ catch {
 # Function pointer test: build and run
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $fpExe = Join-Path $tmpDir "test_function_pointer.exe"
 
   $fpOut = & $CompilerPath --build tests/test_function_pointer.mettle -o $fpExe 2>&1 | Out-String
@@ -5052,6 +5562,7 @@ catch {
 # Struct new runtime test: verifies `new Struct` allocates full struct size.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $structNewExe = Join-Path $tmpDir "test_struct_new_zeroed.exe"
 
   $structNewOut = & $CompilerPath --build --linker internal tests/test_struct_new_zeroed.mettle -o $structNewExe 2>&1 | Out-String
@@ -5078,6 +5589,7 @@ catch {
 # Direct object backend test: emit COFF object directly, then build and run
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $objPath = Join-Path $tmpDir "test_direct_object_return_const.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_return_const.exe"
 
@@ -5120,6 +5632,7 @@ catch {
 # Direct object backend relocation test: internal call lowered to REL32 relocation
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $objPath = Join-Path $tmpDir "test_direct_object_call_return.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_call_return.exe"
 
@@ -5168,6 +5681,7 @@ foreach ($relFlag in @($true, $false)) {
   $total++
   $variant = if ($relFlag) { "release" } else { "debug" }
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_opt_closed_form_sum_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($relFlag) { $buildArgs += "--release" }
@@ -5206,6 +5720,7 @@ foreach ($relFlag in @($true, $false)) {
   $total++
   $variant = if ($relFlag) { "release" } else { "debug" }
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_opt_ptr_induction_two_loops_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($relFlag) { $buildArgs += "--release" }
@@ -5246,6 +5761,7 @@ foreach ($relFlag in @($true, $false)) {
   $total++
   $variant = if ($relFlag) { "release" } else { "debug" }
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_mir_rotate_backedge_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($relFlag) { $buildArgs += "--release" }
@@ -5285,6 +5801,7 @@ foreach ($relFlag in @($true, $false)) {
   $total++
   $variant = if ($relFlag) { "release" } else { "debug" }
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_local_shadows_global_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($relFlag) { $buildArgs += "--release" }
@@ -5319,6 +5836,7 @@ foreach ($relFlag in @($true, $false)) {
   $total++
   $variant = if ($relFlag) { "release" } else { "debug" }
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_scoped_shadowing_$variant.exe"
     $buildArgs = @("--build")
     if ($relFlag) { $buildArgs += "--release" }
@@ -5353,6 +5871,7 @@ foreach ($relFlag in @($true, $false)) {
   $total++
   $variant = if ($relFlag) { "release" } else { "debug" }
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_mir_scratch_clobber_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($relFlag) { $buildArgs += "--release" }
@@ -5386,6 +5905,7 @@ foreach ($relFlag in @($true, $false)) {
 foreach ($variant in @("debug", "release", "release_addr_store")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_mir_addr_store_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -ne "debug") { $buildArgs += "--release" }
@@ -5424,6 +5944,7 @@ foreach ($relFlag in @($true, $false)) {
   $total++
   $variant = if ($relFlag) { "release" } else { "debug" }
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_opt_tail_recursion_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($relFlag) { $buildArgs += "--release" }
@@ -5459,6 +5980,7 @@ foreach ($relFlag in @($true, $false)) {
   $total++
   $variant = if ($relFlag) { "release" } else { "debug" }
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_opt_readonly_global_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($relFlag) { $buildArgs += "--release" }
@@ -5492,6 +6014,7 @@ foreach ($relFlag in @($true, $false)) {
   $total++
   $variant = if ($relFlag) { "release" } else { "debug" }
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_opt_gather_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($relFlag) { $buildArgs += "--release" }
@@ -5526,6 +6049,7 @@ foreach ($relFlag in @($true, $false)) {
   $total++
   $variant = if ($relFlag) { "release" } else { "debug" }
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_opt_layout_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($relFlag) { $buildArgs += "--release" }
@@ -5562,6 +6086,7 @@ foreach ($relFlag in @($true, $false)) {
   $total++
   $variant = if ($relFlag) { "release" } else { "debug" }
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_float32_narrowing_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($relFlag) { $buildArgs += "--release" }
@@ -5597,6 +6122,7 @@ foreach ($relFlag in @($true, $false)) {
 foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_shared_scaled_index_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -like "release*") { $buildArgs += "--release" }
@@ -5635,6 +6161,7 @@ foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")
 foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_float_narrowing_paths_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -like "release*") { $buildArgs += "--release" }
@@ -5676,6 +6203,7 @@ foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")
 foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_mir_float_call_args_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -like "release*") { $buildArgs += "--release" }
@@ -5712,6 +6240,7 @@ foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")
 foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_mir_fill_passthrough_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -like "release*") { $buildArgs += "--release" }
@@ -5750,6 +6279,7 @@ foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")
 foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_mir_global_aggregate_addr_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -like "release*") { $buildArgs += "--release" }
@@ -5786,6 +6316,7 @@ foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")
 foreach ($variant in @("release", "debug", "no_vec", "no_accum", "no_hoist", "no_scan")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_vloop_select_stress_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -ne "debug") { $buildArgs += "--release" }
@@ -5824,6 +6355,7 @@ foreach ($variant in @("release", "debug", "no_vec", "no_accum", "no_hoist", "no
 foreach ($variant in @("release", "debug", "release_scalar")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_predicated_accumulate_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -like "release*") { $buildArgs += "--release" }
@@ -5856,6 +6388,7 @@ foreach ($variant in @("release", "debug", "release_scalar")) {
 # where the branch added 1, and the arithmetic would still look plausible.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "test_predicated_accumulate_cover.exe"
   $coverOut = & $CompilerPath "--build" "--emit-obj" "--linker" "internal" "--release" `
     "--explain" "tests/test_predicated_accumulate.mettle" "-o" $exePath 2>&1 | Out-String
@@ -5886,6 +6419,7 @@ catch {
 foreach ($variant in @("release", "debug")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_compare_as_value_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -eq "release") { $buildArgs += "--release" }
@@ -5908,6 +6442,7 @@ foreach ($variant in @("release", "debug")) {
 
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "test_compare_as_value_cover.exe"
   $coverOut = & $CompilerPath "--build" "--emit-obj" "--linker" "internal" "--release" `
     "--explain" "tests/test_compare_as_value.mettle" "-o" $exePath 2>&1 | Out-String
@@ -5933,6 +6468,7 @@ catch {
 foreach ($variant in @("release", "debug")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_sum_base_any_name_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -eq "release") { $buildArgs += "--release" }
@@ -5955,6 +6491,7 @@ foreach ($variant in @("release", "debug")) {
 
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "test_sum_base_any_name_cover.exe"
   $coverOut = & $CompilerPath "--build" "--emit-obj" "--linker" "internal" "--release" `
     "--explain" "tests/test_sum_base_any_name.mettle" "-o" $exePath 2>&1 | Out-String
@@ -5979,6 +6516,7 @@ catch {
 foreach ($variant in @("release", "debug", "release_scalar")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_hoist_global_bases_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -like "release*") { $buildArgs += "--release" }
@@ -6011,6 +6549,7 @@ foreach ($variant in @("release", "debug", "release_scalar")) {
 # Anti-rot guard: without the hoist these loops are still correct, just scalar.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "test_hoist_global_bases_cover.exe"
   $coverOut = & $CompilerPath "--build" "--emit-obj" "--linker" "internal" "--release" `
     "--explain" "tests/test_hoist_global_bases.mettle" "-o" $exePath 2>&1 | Out-String
@@ -6037,6 +6576,7 @@ catch {
 foreach ($variant in @("release", "debug", "release_scalar")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_vloop_if_conversion_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -like "release*") { $buildArgs += "--release" }
@@ -6071,6 +6611,7 @@ foreach ($variant in @("release", "debug", "release_scalar")) {
 # require a vectorized verdict for it.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "test_vloop_if_conversion_cover.exe"
   $coverOut = & $CompilerPath "--build" "--emit-obj" "--linker" "internal" "--release" `
     "--explain" "tests/test_vloop_if_conversion.mettle" "-o" $exePath 2>&1 | Out-String
@@ -6106,6 +6647,7 @@ catch {
 foreach ($variant in @("release", "debug", "release_scalar")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_vloop_select_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -like "release*") { $buildArgs += "--release" }
@@ -6139,6 +6681,7 @@ foreach ($variant in @("release", "debug", "release_scalar")) {
 # just slower, so name the loops and require a vectorized verdict.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "test_vloop_select_cover.exe"
   $coverOut = & $CompilerPath "--build" "--emit-obj" "--linker" "internal" "--release" `
     "--explain" "tests/test_vloop_select.mettle" "-o" $exePath 2>&1 | Out-String
@@ -6161,6 +6704,7 @@ catch {
 # path from the fallback, so assert the coverage the gate is supposed to give.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "test_mir_global_aggregate_addr_cover.exe"
   $env:METTLE_MIR_TRACE = "1"
   try {
@@ -6197,6 +6741,7 @@ catch {
 foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_mir_affine_map_passthrough_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -like "release*") { $buildArgs += "--release" }
@@ -6232,6 +6777,7 @@ foreach ($variant in @("release", "debug", "release_fallback", "debug_fallback")
 foreach ($variant in @("release", "debug", "debug_fallback")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_struct_copy_odd_size_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -eq "release") { $buildArgs += "--release" }
@@ -6268,6 +6814,7 @@ foreach ($variant in @("release", "debug", "debug_fallback")) {
 foreach ($variant in @("release", "debug")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_byte_vloop_zero_extend_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -eq "release") { $buildArgs += "--release" }
@@ -6298,6 +6845,7 @@ foreach ($variant in @("release", "debug")) {
 foreach ($variant in @("release", "debug")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_float_literal_parse_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -eq "release") { $buildArgs += "--release" }
@@ -6326,6 +6874,7 @@ foreach ($variant in @("release", "debug")) {
 foreach ($variant in @("release", "debug")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_mir_inline_struct_copy_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -eq "release") { $buildArgs += "--release" }
@@ -6359,6 +6908,7 @@ foreach ($relFlag in @($true, $false)) {
   $total++
   $variant = if ($relFlag) { "release" } else { "debug" }
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_const_divmod_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($relFlag) { $buildArgs += "--release" }
@@ -6393,6 +6943,7 @@ foreach ($relFlag in @($true, $false)) {
   $total++
   $variant = if ($relFlag) { "release" } else { "debug" }
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_const_mul_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($relFlag) { $buildArgs += "--release" }
@@ -6427,6 +6978,7 @@ foreach ($relFlag in @($true, $false)) {
   $total++
   $variant = if ($relFlag) { "release" } else { "debug" }
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "test_sroa_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($relFlag) { $buildArgs += "--release" }
@@ -6457,6 +7009,7 @@ foreach ($relFlag in @($true, $false)) {
 if (-not $script:OnWindows) { Skip-WindowsOnly "coff_reader" "Windows-only: reads COFF objects, the ELF build emits ELF" } else {
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $coffReaderExe = Join-Path $tmpDir "coff_reader_test.exe"
   $basicObjPath = Join-Path $tmpDir "coff_reader_basic.obj"
   $relocObjPath = Join-Path $tmpDir "coff_reader_reloc.obj"
@@ -6516,6 +7069,7 @@ catch {
 if (-not $script:OnWindows) { Skip-WindowsOnly "symbol_resolve" "Windows-only: resolves symbols across COFF objects" } else {
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $symbolResolveExe = Join-Path $tmpDir "symbol_resolve_test.exe"
   $fnEntryObj = Join-Path $tmpDir "linker_merge_entry.obj"
   $fnProviderObj = Join-Path $tmpDir "linker_merge_provider.obj"
@@ -6570,6 +7124,7 @@ catch {
 # Linker relocation test: apply merged-image relocations for REL32, ADDR64, ADDR32NB, and SECREL
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $relocationExe = Join-Path $tmpDir "relocation_test.exe"
 
   $compileHarness = & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests/relocation_test.c src/common.c src/lexer/lexer.c src/error/error_reporter.c src/linker/coff_reader.c src/linker/symbol_resolve.c src/linker/relocation.c src/codegen/binary_emitter.c src/codegen/elf_emitter.c -Isrc -Isrc/codegen -o $relocationExe 2>&1 | Out-String
@@ -6593,6 +7148,7 @@ catch {
 if (-not $script:OnWindows) { Skip-WindowsOnly "pe_emitter" "Windows-only: PE emission probes DLL exports" } else {
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $peEmitterExe = Join-Path $tmpDir "pe_emitter_test.exe"
 
   $compileHarness = & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests/pe_emitter_test.c src/common.c src/lexer/lexer.c src/error/error_reporter.c src/linker/coff_reader.c src/linker/symbol_resolve.c src/linker/relocation.c src/linker/pe_emitter.c src/linker/import_lib.c src/codegen/binary_emitter.c src/codegen/elf_emitter.c -Isrc -Isrc/codegen -o $peEmitterExe 2>&1 | Out-String
@@ -6616,6 +7172,7 @@ catch {
 # Internal linker basic test: direct object build uses native PE emission for default imports
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "internal_link_return_const.exe"
 
   $buildOut = & $CompilerPath --build --emit-obj --linker internal tests/test_direct_object_return_const.mettle -o $exePath 2>&1 | Out-String
@@ -6641,6 +7198,7 @@ catch {
 # Float comparisons must use numeric FP ordering, not raw IEEE bit ordering.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $binaryExePath = Join-Path $tmpDir "internal_link_float_negative_comparison.exe"
   $objExePath = Join-Path $tmpDir "internal_link_emit_obj_float_negative_comparison.exe"
 
@@ -6680,6 +7238,7 @@ catch {
 # Runtime coverage for float returns through the binary object backend.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "internal_link_abi_float_return.exe"
   $buildOut = & $CompilerPath --build --linker internal tests/test_abi_float_return.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
@@ -6726,6 +7285,7 @@ $fixAdvicePairs = @(
 
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $fixOut = & $CompilerPath tests/test_explain_fix_advice.mettle --release --explain 2>&1 | Out-String
   $problems = @()
   foreach ($pair in $fixAdvicePairs) {
@@ -6788,6 +7348,7 @@ foreach ($deferMode in @("debug", "release")) {
   $total++
   $caseName = "defer_exit_paths_$deferMode"
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "$caseName.exe"
     $extraArgs = @()
     if ($deferMode -eq "release") { $extraArgs = @("--release") }
@@ -6828,6 +7389,7 @@ foreach ($mode in @("binary")) {
   $total++
   $caseName = "internal_link_struct_copy_$mode"
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "$caseName.exe"
       $buildOut = & $CompilerPath --build --linker internal tests/test_struct_copy.mettle -o $exePath 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
@@ -6871,6 +7433,7 @@ foreach ($mode in @("binary")) {
   $total++
   $caseName = "internal_link_struct_pass_by_value_$mode"
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "$caseName.exe"
       $buildOut = & $CompilerPath --build --linker internal tests/test_struct_pass_by_value.mettle -o $exePath 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
@@ -6917,6 +7480,7 @@ foreach ($mode in @("binary")) {
   $total++
   $caseName = "internal_link_struct_return_by_value_$mode"
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "$caseName.exe"
       $buildOut = & $CompilerPath --build --linker internal tests/test_struct_return_by_value.mettle -o $exePath 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
@@ -6958,6 +7522,7 @@ foreach ($mode in @("binary")) {
   $total++
   $caseName = "internal_link_struct_abi_matrix_$mode"
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "$caseName.exe"
       $buildOut = & $CompilerPath --build --linker internal tests/test_struct_abi_matrix.mettle -o $exePath 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
@@ -7000,6 +7565,7 @@ foreach ($mode in @("binary")) {
   $caseName = "internal_link_struct_abi_extern_c_$mode"
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $gccCmd = Get-Command gcc -ErrorAction SilentlyContinue
     if (-not $gccCmd) {
       Write-CaseResult -Name $caseName -Passed $true -Reason "skipped: gcc not on PATH"
@@ -7046,6 +7612,7 @@ foreach ($mode in @("binary")) {
 # exercises whichever rule the host uses. 253 is the sum the driver checks.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $gccCmd = Get-Command gcc -ErrorAction SilentlyContinue
   if (-not $gccCmd) {
     Write-CaseResult -Name "struct_abi_c_calls_mettle" -Passed $true `
@@ -7078,6 +7645,7 @@ catch {
 # duplicate.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "runtime_name_collision.exe"
   $buildOut = & $CompilerPath --build tests/test_runtime_name_collision.mettle -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
@@ -7100,6 +7668,7 @@ catch {
 # itself, so that is refused rather than destroying the input.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $nameDir = Join-Path $tmpDir "default-output-name"
   if (Test-Path $nameDir) { Remove-Item -Recurse -Force $nameDir }
   New-Item -ItemType Directory -Path $nameDir | Out-Null
@@ -7158,6 +7727,7 @@ foreach ($mode in @("binary")) {
   $total++
   $caseName = "internal_link_struct_float_$mode"
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "$caseName.exe"
       $buildOut = & $CompilerPath --build --linker internal tests/test_struct_float.mettle -o $exePath 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
@@ -7190,6 +7760,7 @@ foreach ($mode in @("binary")) {
 # Native object + MinGW GCC link with no startup or default libraries.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $gccCmd = Get-Command gcc -ErrorAction SilentlyContinue
   if (-not $gccCmd) {
     Write-CaseResult -Name "direct_object_emit_obj_gcc_link" -Passed $true -Reason "skipped: gcc not on PATH"
@@ -7219,6 +7790,7 @@ catch {
 if (-not $script:OnWindows) { Skip-WindowsOnly "internal_link_ws2_32" "Windows-only: internal PE linker and ws2_32" } else {
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "internal_link_ws2_32.exe"
 
   $buildOut = & $CompilerPath --build --emit-obj --linker internal tests/test_internal_link_ws2_32.mettle -o $exePath --link-arg -lws2_32 2>&1 | Out-String
@@ -7246,6 +7818,7 @@ catch {
 if (-not $script:OnWindows) { Skip-WindowsOnly "internal_link_win32_user32" "Windows-only: internal PE linker and user32" } else {
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "internal_link_win32_user32.exe"
 
   $buildOut = & $CompilerPath --build --emit-obj --linker internal tests/test_internal_link_win32_user32.mettle -o $exePath 2>&1 | Out-String
@@ -7273,6 +7846,7 @@ catch {
 if (-not $script:OnWindows) { Skip-WindowsOnly "internal_link_ui" "Windows-only: std/ui is a Win32 surface" } else {
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "internal_link_ui.exe"
 
   $buildOut = & $CompilerPath --build --emit-obj --linker internal tests/test_internal_link_ui.mettle -o $exePath 2>&1 | Out-String
@@ -7300,6 +7874,7 @@ catch {
 # from the bundled runtime and the output must import no C runtime.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "internal_link_std_io.exe"
 
   $buildOut = & $CompilerPath --build --emit-obj --linker internal tests/test_std_io.mettle -o $exePath 2>&1 | Out-String
@@ -7330,6 +7905,7 @@ catch {
 # recursive Markdown scans without a helper C object.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $dirExe = Join-Path $tmpDir "owned_dir.exe"
   $dirBuild = & $CompilerPath --build tests/test_owned_dir.mettle -o $dirExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "Owned directory build failed: $dirBuild" }
@@ -7351,6 +7927,7 @@ catch {
 # Internal linker kernel32 atomics test: std/thread uses exported Interlocked* names
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "internal_link_thread_atomics.exe"
 
   $buildOut = & $CompilerPath --build --emit-obj --linker internal tests/test_internal_link_thread_atomics.mettle -o $exePath 2>&1 | Out-String
@@ -7377,6 +7954,7 @@ catch {
 if (-not $script:OnWindows) { Skip-WindowsOnly "auto_link_internal_only_path" "Windows-only: internal PE linker path" } else {
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "auto_link_internal_only.exe"
   $compilerFullPath = (Resolve-Path $CompilerPath).Path
   $system32Dir = Join-Path $env:SystemRoot "System32"
@@ -7414,6 +7992,7 @@ catch {
 if (-not $script:OnWindows) { Skip-WindowsOnly "auto_link_fallback_static_lib" "Windows-only: internal PE linker fallback" } else {
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $cSourcePath = Join-Path $tmpDir "phase6_fallback_static_lib.c"
   $cObjectPath = Join-Path $tmpDir "phase6_fallback_static_lib.o"
   $libPath = Join-Path $tmpDir "phase6_fallback_static_lib.a"
@@ -7471,6 +8050,7 @@ catch {
 # Direct object backend parameter test: integer arg passed into callee home slot
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $objPath = Join-Path $tmpDir "test_direct_object_params.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_params.exe"
 
@@ -7505,6 +8085,7 @@ catch {
 # Direct object backend control-flow test: labels and conditional branches lower directly
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $objPath = Join-Path $tmpDir "test_direct_object_control_flow.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_control_flow.exe"
 
@@ -7539,6 +8120,7 @@ catch {
 # Direct object backend local-slot test: locals plus call result materialization
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $objPath = Join-Path $tmpDir "test_direct_object_abi_return_int.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_abi_return_int.exe"
 
@@ -7573,6 +8155,7 @@ catch {
 # Direct object backend arithmetic test: locals plus unary/binary integer lowering
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $objPath = Join-Path $tmpDir "test_direct_object_signed_arithmetic.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_signed_arithmetic.exe"
 
@@ -7607,6 +8190,7 @@ catch {
 # Direct object backend structured control-flow test: locals, comparisons, loops, and switch lowering
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $objPath = Join-Path $tmpDir "test_direct_object_structured_control_flow.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_structured_control_flow.exe"
 
@@ -7641,6 +8225,7 @@ catch {
 # Direct object backend scalar matrix test: integer ops plus stack args
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $objPath = Join-Path $tmpDir "test_direct_object_integer_matrix.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_integer_matrix.exe"
 
@@ -7676,6 +8261,7 @@ catch {
 # and hot local promotion should show up in the object code, not just binary object code.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $objPath = Join-Path $tmpDir "test_direct_object_codegen_fastpaths.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_codegen_fastpaths.exe"
 
@@ -7731,6 +8317,7 @@ catch {
 # Direct object backend scalar cast test: integer truncation/extension and pointer reinterpretation
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $objPath = Join-Path $tmpDir "test_direct_object_scalar_casts.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_scalar_casts.exe"
 
@@ -7782,6 +8369,7 @@ $directObjectScalarCases = @(
 foreach ($case in $directObjectScalarCases) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $objPath = Join-Path $tmpDir ($case.Name + ".obj")
     $exePath = Join-Path $tmpDir ($case.Name + ".exe")
 
@@ -7819,6 +8407,7 @@ foreach ($case in $directObjectScalarCases) {
 # it. Re-run the same regression at --release so the optimized path is covered.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "uint32_signed_in_large_fn_release.exe"
   $buildOut = & $CompilerPath --build --release "tests/test_uint32_signed_in_large_fn.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "release build failed: $buildOut" }
@@ -7839,6 +8428,7 @@ catch {
 # at --release (exit 0 == within f32 tolerance).
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "saxpy_vectorized.exe"
   $buildOut = & $CompilerPath --build --release "tests/test_saxpy_vectorized.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "release build failed: $buildOut" }
@@ -7860,6 +8450,7 @@ catch {
 # a closed-form value. Covers affine map, in-place scale, and sum/dot for f32+f64.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "float_vectorizers.exe"
   $buildOut = & $CompilerPath --build --release "tests/test_float_vectorizers.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "release build failed (a @simd! kernel stopped vectorizing?): $buildOut" }
@@ -7884,6 +8475,7 @@ catch {
 # iv-start-zero fix (a j=3..n reduction must not be replayed as 0..n).
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "vloop_general.exe"
   $buildOut = & $CompilerPath --build --release "tests/test_vloop_general.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "release build failed (a @simd! kernel stopped vectorizing?): $buildOut" }
@@ -7907,6 +8499,7 @@ catch {
 # build asserts they vectorize; references iterate backwards and stay scalar.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "minmax_reduce.exe"
   $buildOut = & $CompilerPath --build --release "tests/test_simd_minmax_reduce.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "release build failed (a @simd! kernel stopped vectorizing?): $buildOut" }
@@ -7932,6 +8525,7 @@ catch {
 # build asserts they vectorize; references iterate backwards and stay scalar.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "byte_map.exe"
   $buildOut = & $CompilerPath --build --release "tests/test_simd_byte_map.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "release build failed (a @simd! kernel stopped vectorizing?): $buildOut" }
@@ -7955,6 +8549,7 @@ catch {
 # positions; one for-range kernel is @simd! so the build asserts recognition.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "vloop_find.exe"
   $buildOut = & $CompilerPath --build --release "tests/test_vloop_find.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "release build failed (the @simd! find kernel stopped vectorizing?): $buildOut" }
@@ -7979,6 +8574,7 @@ catch {
 # explicit NaN bit patterns); a clean exit 0 means neither miscompile is present.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "affine_nan_typeconf.exe"
   $buildOut = & $CompilerPath --build --release "tests/test_affine_map_nan_typeconfusion.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "release build failed: $buildOut" }
@@ -7998,6 +8594,7 @@ catch {
 # the dst==src mov32 encoder skip. Self-checking: exit code is a failure mask.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "u32_canonical_dbg.exe"
   $buildOut = & $CompilerPath --build "tests/test_u32_canonical.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "debug build failed: $buildOut" }
@@ -8027,6 +8624,7 @@ catch {
 foreach ($variant in @("debug", "release", "debug_fallback", "release_fallback")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "i32_canonical_$variant.exe"
     $buildArgs = @("--build")
     if ($variant -like "release*") { $buildArgs += "--release" }
@@ -8071,6 +8669,7 @@ foreach ($variant in @("debug", "release", "debug_fallback", "release_fallback")
 foreach ($variant in @("debug", "release", "debug_fallback", "release_fallback")) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $exePath = Join-Path $tmpDir "algebraic_rewrites_$variant.exe"
     $buildArgs = @("--build")
     if ($variant -like "release*") { $buildArgs += "--release" }
@@ -8114,6 +8713,7 @@ foreach ($variant in @("debug", "release", "debug_fallback", "release_fallback")
 # runtime-checked against values a 0-start replay cannot produce.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "nonzero_start_loops.exe"
   $buildOut = & $CompilerPath --build --release "tests/test_nonzero_start_loops.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "release build failed: $buildOut" }
@@ -8135,6 +8735,7 @@ catch {
 # release-only recognizers are checked against the scalar baseline.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   foreach ($variant in @("debug", "release")) {
     $exePath = Join-Path $tmpDir ("simd_scan_search_liveness_{0}.exe" -f $variant)
     $buildArgs = @("--build")
@@ -8161,6 +8762,7 @@ catch {
 # stress the signed widening).
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "int_sum_nocast.exe"
   $buildOut = & $CompilerPath --build --release "tests/test_int_sum_nocast.mettle" -o $exePath 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "release build failed: $buildOut" }
@@ -8180,6 +8782,7 @@ catch {
 # that exercise every scalar-remainder length.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   foreach ($variant in @("release", "debug")) {
     $exePath = Join-Path $tmpDir "lcg_check_$variant.exe"
     $buildArgs = @("--build")
@@ -8203,6 +8806,7 @@ catch {
 # Direct object backend globals: scalar definitions plus extern-global symbol emission
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $objPath = Join-Path $tmpDir "direct_object_ok_global_int.obj"
   $exePath = Join-Path $tmpDir "direct_object_ok_global_int.exe"
 
@@ -8236,6 +8840,7 @@ catch {
 
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $objPath = Join-Path $tmpDir "direct_object_global_string.obj"
   $exePath = Join-Path $tmpDir "direct_object_global_string.exe"
 
@@ -8269,6 +8874,7 @@ catch {
 
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $objPath = Join-Path $tmpDir "direct_object_extern_global_link_name.obj"
 
   $objOut = & $CompilerPath --emit-obj tests/test_extern_global_link_name.mettle -o $objPath 2>&1 | Out-String
@@ -8305,6 +8911,7 @@ catch {
 # Direct object backend pointer-param-address test: address of parameter slot survives load/store
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $objPath = Join-Path $tmpDir "test_direct_object_pointer_param_address.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_pointer_param_address.exe"
 
@@ -8339,6 +8946,7 @@ catch {
 # Direct object backend struct method calls: receiver desugars to a first arg
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $objPath = Join-Path $tmpDir "test_direct_object_struct_method_calls.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_struct_method_calls.exe"
 
@@ -8373,6 +8981,7 @@ catch {
 # Direct object backend pointer-memory test: new, addr_of, load, store, and pointer args
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $objPath = Join-Path $tmpDir "test_direct_object_pointer_memory.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_pointer_memory.exe"
 
@@ -8407,6 +9016,7 @@ catch {
 # Direct object backend release test: a reused byte-address temp must survive load+store fusion
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $objPath = Join-Path $tmpDir "test_direct_object_byte_load_store_alias.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_byte_load_store_alias.exe"
 
@@ -8441,6 +9051,7 @@ catch {
 # Direct object backend release test: inline memcpy must preserve live RSI/RDI values
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "test_opt_memcpy_const.exe"
 
   $buildOut = & $CompilerPath --build --emit-obj --linker internal --release tests/test_opt_memcpy_const.mettle -o $exePath 2>&1 | Out-String
@@ -8466,6 +9077,7 @@ catch {
 # Direct object backend aggregate-local test: stack-allocated struct addressed and passed by pointer
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $objPath = Join-Path $tmpDir "test_direct_object_struct_field_offset.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_struct_field_offset.exe"
 
@@ -8500,6 +9112,7 @@ catch {
 # Direct object: local array of struct ??? index scale must be sizeof(element), not 8
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $objPath = Join-Path $tmpDir "test_direct_object_array_struct_stride.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_array_struct_stride.exe"
 
@@ -8534,6 +9147,7 @@ catch {
 # Direct object backend function-pointer test: addr_of function plus indirect call
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $objPath = Join-Path $tmpDir "test_direct_object_function_pointer.obj"
   $exePath = Join-Path $tmpDir "test_direct_object_function_pointer.exe"
 
@@ -8579,6 +9193,7 @@ catch {
 # Direct object backend runtime trap test: null deref lowers and links through the trap helper
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "test_direct_object_runtime_null_deref.exe"
 
   $buildOut = & $CompilerPath --build --emit-obj tests/test_runtime_null_deref_check.mettle -o $exePath 2>&1 | Out-String
@@ -8607,6 +9222,7 @@ catch {
 # Direct object backend stack-trace metadata: -s emits embedded debug tables and crash startup.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $objPath = Join-Path $tmpDir "test_direct_object_stack_trace_support.obj"
 
   $objOut = & $CompilerPath --emit-obj -s tests/test_runtime_null_deref_check.mettle -o $objPath 2>&1 | Out-String
@@ -8645,6 +9261,7 @@ catch {
 # Direct object backend runtime null trace: --build -s produces symbolized backtraces.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $exePath = Join-Path $tmpDir "test_runtime_null_trace_coff.exe"
 
   $buildOut = & $CompilerPath --build -s tests/test_runtime_null_deref_check.mettle -o $exePath 2>&1 | Out-String
@@ -8688,6 +9305,7 @@ catch {
 # Direct object backend bounds trap context: --build -s reports index and length.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $boundsExe = Join-Path $tmpDir "test_runtime_bounds_trace_coff.exe"
   $boundsBuild = & $CompilerPath --build -s tests/test_crash_bounds_context.mettle -o $boundsExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
@@ -8722,6 +9340,7 @@ catch {
 if (-not $script:OnWindows) { Skip-WindowsOnly "runtime_access_violation_trace_coff" "Windows-only: COFF access-violation trace" } else {
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $avExe = Join-Path $tmpDir "test_runtime_av_trace_coff.exe"
   $avBuild = & $CompilerPath --build -s tests/test_runtime_av_trace_coff.mettle -o $avExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
@@ -8756,6 +9375,7 @@ catch {
 # main(argc, argv) test: startup uses the owned command line parser.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $avExe = Join-Path $tmpDir "test_main_argc_argv.exe"
 
   $avOut = & $CompilerPath --build tests/test_main_argc_argv.mettle -o $avExe 2>&1 | Out-String
@@ -8783,6 +9403,7 @@ catch {
 # The normal build path must retain the same runtime independence.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $buildArgvExe = Join-Path $tmpDir "test_main_argc_argv_build.exe"
 
   $buildArgvOut = & $CompilerPath --build tests/test_main_argc_argv.mettle -o $buildArgvExe 2>&1 | Out-String
@@ -8809,6 +9430,7 @@ catch {
 
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $nullExe = Join-Path $tmpDir "test_runtime_null_trace.exe"
 
   $nullOut = & $CompilerPath --build -s tests/test_runtime_null_deref_check.mettle -o $nullExe 2>&1 | Out-String
@@ -8839,6 +9461,7 @@ catch {
 
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   Write-CaseResult -Name "runtime_access_violation_trace" -Passed $true -Reason "skipped: inline assembly is not supported by the binary backend"
 }
 catch {
@@ -8858,6 +9481,7 @@ catch {
 # this gate exists to report.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $rotCorpus = "tests/loop_rot_corpus.mettle"
   $rotBaselinePath = "tests/loop_claims.baseline"
   if (-not (Test-Path $rotCorpus)) { throw "missing $rotCorpus" }
@@ -8944,6 +9568,7 @@ catch {
 # than to fire always.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $canonDir = Join-Path $tmpDir "canonform"
   New-Item -ItemType Directory -Force -Path $canonDir | Out-Null
   $canonSrc = Join-Path $canonDir "canon.mettle"
@@ -9012,6 +9637,7 @@ catch {
 # Granlund-Montgomery math.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $srExe = "bin/strength_rules_test.exe"
   & gcc -Wall -Wextra -std=c99 -g -O1 -Isrc -Iinclude tests/strength_rules_test.c src/codegen/binary/strength_rules.c -o $srExe
   if ($LASTEXITCODE -ne 0) {
@@ -9042,6 +9668,7 @@ catch {
 # since the test is pure 32-bit math that runs on the build host.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $arm64Exe = "bin/arm64_encode_test.exe"
   & gcc -Wall -Wextra -std=c99 -g -O0 -Isrc -Iinclude tests/arm64_encode_test.c src/codegen/binary/arm64_encode.c src/codegen/binary/arm64_disasm.c src/codegen/binary/arm64_abi.c -o $arm64Exe
   if ($LASTEXITCODE -ne 0) {
@@ -9074,10 +9701,32 @@ catch {
 # skipped (not failed) when no emulator is present, like the ptxas gate.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $arm64EmitExe = "bin/arm64_emit_test.exe"
-  & gcc -Wall -Wextra -std=c99 -g -O0 -Isrc -Iinclude tests/arm64_emit_test.c src/codegen/binary/arm64_encode.c src/codegen/binary/arm64_emit.c src/codegen/binary/arm64_disasm.c src/codegen/binary/arm64_mir_encode.c -o $arm64EmitExe
+  # gcc walks its inputs one at a time; the five translation units here are
+  # independent, so they are compiled in one wave and linked afterwards.
+  $arm64Srcs = @("tests/arm64_emit_test.c", "src/codegen/binary/arm64_encode.c",
+                 "src/codegen/binary/arm64_emit.c", "src/codegen/binary/arm64_disasm.c",
+                 "src/codegen/binary/arm64_mir_encode.c")
+  $arm64ObjDir = Join-Path $tmpDir "arm64obj"
+  New-Item -ItemType Directory -Force -Path $arm64ObjDir | Out-Null
+  $arm64Cfg = @("-Wall", "-Wextra", "-std=c99", "-g", "-O0", "-Isrc", "-Iinclude")
+  $arm64Objs = @()
+  $arm64Cmds = @()
+  foreach ($src in $arm64Srcs) {
+    $obj = Join-Path $arm64ObjDir ([System.IO.Path]::GetFileNameWithoutExtension($src) + ".o")
+    $arm64Objs += $obj
+    $arm64Cmds += @{ File = "gcc"; Args = ($arm64Cfg + @("-c", $src, "-o", $obj)) }
+  }
+  $arm64Results = Invoke-InParallel -Commands $arm64Cmds
+  for ($i = 0; $i -lt $arm64Srcs.Count; $i++) {
+    if ($arm64Results[$i].ExitCode -ne 0) {
+      throw "Failed to compile AArch64 emit test ($($arm64Srcs[$i])):`n$($arm64Results[$i].Output)"
+    }
+  }
+  & gcc @arm64Objs -o $arm64EmitExe
   if ($LASTEXITCODE -ne 0) {
-    throw "Failed to compile AArch64 emit test"
+    throw "Failed to link AArch64 emit test"
   }
 
   $elfDir = Join-Path $tmpDir "arm64elf"
@@ -9134,6 +9783,7 @@ catch {
 # compiles to AArch64 and executes. Execution skips like the ptxas gate.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $elfDir = Join-Path $tmpDir "arm64src"
   New-Item -ItemType Directory -Force -Path $elfDir | Out-Null
   Copy-Item tests/arm64/expected.txt (Join-Path $elfDir "manifest.txt") -Force
@@ -9213,6 +9863,7 @@ catch {
 # expected relocation -- because this host has no linker that could take one.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   # ELF64 header: e_type at 0x10, e_machine at 0x12; section headers at e_shoff
   # with e_shnum entries of e_shentsize, names in section e_shstrndx.
   function Get-ElfSectionSize([byte[]]$bytes, [string]$wanted) {
@@ -9296,6 +9947,7 @@ catch {
 # x86 release build faults on it too.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $relDir = Join-Path $tmpDir "arm64rel"
   New-Item -ItemType Directory -Force -Path $relDir | Out-Null
   $relNames = Get-Content tests/arm64/expected.txt |
@@ -9350,6 +10002,7 @@ catch {
 # forms are asserted so a miscompiled unroll is caught, not just a crash.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $reduExe = "bin/test_opt_reduction_unroll.exe"
   $reduBuild = & $CompilerPath --build --emit-obj --linker internal --release `
     tests/test_opt_reduction_unroll.mettle -o $reduExe 2>&1 | Out-String
@@ -9394,6 +10047,7 @@ catch {
 # Runtime profile mode: function entry/exit instrumentation and exit report
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $profileExe = Join-Path $tmpDir "test_profile_runtime.exe"
   $profileBuild = & $CompilerPath --build --emit-obj --linker internal --profile-runtime `
     tests/test_profile_runtime.mettle -o $profileExe 2>&1 | Out-String
@@ -9439,6 +10093,7 @@ catch {
 
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $profileOpsExe = Join-Path $tmpDir "test_profile_runtime_ops.exe"
   $profileOpsBuild = & $CompilerPath --build --emit-obj --linker internal --profile-runtime-ops `
     tests/test_profile_runtime.mettle -o $profileOpsExe 2>&1 | Out-String
@@ -9475,6 +10130,7 @@ catch {
 
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $iceExe = Join-Path $tmpDir "compiler_ice_report_test.exe"
   # dbghelp backs the Windows symbolizer; POSIX resolves through the dynamic
   # loader, so it links -ldl and -pthread in its place. -D_GNU_SOURCE for
@@ -9539,6 +10195,7 @@ foreach ($src in @("tests/gpu/compute_kernels.mettle",
   $total++
   $name = "ptx_emit_" + [System.IO.Path]::GetFileNameWithoutExtension($src)
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $ptxPath = Join-Path $tmpDir ($name + ".ptx")
     $cubin = Join-Path $tmpDir ($name + ".cubin")
     $emitOut = & $CompilerPath -O --emit-ptx --gpu-arch=portable $src -o $ptxPath 2>&1 | Out-String
@@ -9944,12 +10601,20 @@ foreach ($src in @("tests/gpu/compute_kernels.mettle",
 # nontrivial controls through the cross-host AArch64 object backend.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $hostGcc = Get-Command gcc -ErrorAction SilentlyContinue
   if (-not $hostGcc) {
     Write-Host "[SKIP] gpu_dispatch_host_abi_runtime (gcc not found)"
   } else {
-    $dispatchObj = Join-Path $tmpDir "gpu_dispatch_host_abi.obj"
-    $dispatchExe = Join-Path $tmpDir "gpu_dispatch_host_abi.exe"
+    # Emitted here rather than reused from the table case of the same name, so
+    # this case owns every input it links.
+    $dispatchObj = Join-Path $tmpDir "gpu_dispatch_host_abi_runtime.obj"
+    $dispatchExe = Join-Path $tmpDir "gpu_dispatch_host_abi_runtime.exe"
+    $emitOut = & $CompilerPath --emit-obj tests/test_gpu_dispatch_host_abi.mettle `
+      -o $dispatchObj 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "emitting the launch ABI object failed: $emitOut"
+    }
     $linkOut = & $hostGcc.Source $dispatchObj tests/gpu_dispatch_checked_stub.c `
       -o $dispatchExe 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
@@ -9975,6 +10640,7 @@ catch {
 # driver/device.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $hostGcc = Get-Command gcc -ErrorAction SilentlyContinue
   if (-not $hostGcc) {
     Write-Host "[SKIP] tensor_matmul_cpu_oracle (gcc not found)"
@@ -10003,6 +10669,7 @@ catch {
 # cubin produced here is ever loaded or executed.
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $matmulPtx = Join-Path $tmpDir "tensor_matmul_sm121a.ptx"
   $matmulBudgetPtx = Join-Path $tmpDir "tensor_matmul_budget1.ptx"
   $matmulTransposePtx = Join-Path $tmpDir "tensor_matmul_transpose_sm121a.ptx"
@@ -10271,6 +10938,7 @@ catch {
 
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $gb10Ptx = Join-Path $tmpDir "ptx_emit_gb10.ptx"
   $gb10Cubin = Join-Path $tmpDir "ptx_emit_gb10.cubin"
   $emitOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
@@ -10308,6 +10976,7 @@ catch {
 
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $gb10AsyncPtx = Join-Path $tmpDir "ptx_emit_gb10_async_copy.ptx"
   $gb10AsyncCubin = Join-Path $tmpDir "ptx_emit_gb10_async_copy.cubin"
   $gb10AutoPtx = Join-Path $tmpDir "ptx_emit_gb10_auto_staging.ptx"
@@ -10362,6 +11031,7 @@ catch {
 
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $gb10TensorPtx = Join-Path $tmpDir "ptx_emit_gb10_tensor.ptx"
   $gb10TensorCubin = Join-Path $tmpDir "ptx_emit_gb10_tensor.cubin"
   $gb10ChainPtx = Join-Path $tmpDir "ptx_emit_gb10_tensor_chain.ptx"
@@ -10428,6 +11098,7 @@ catch {
 
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $gb10Fp8Ptx = Join-Path $tmpDir "ptx_emit_gb10_tensor_fp8.ptx"
   $gb10Fp8Cubin = Join-Path $tmpDir "ptx_emit_gb10_tensor_fp8.cubin"
   $fp8EmitOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
@@ -10551,6 +11222,7 @@ catch {
 
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $gb10Fp4Ptx = Join-Path $tmpDir "ptx_emit_gb10_tensor_fp4.ptx"
   $gb10Fp4Cubin = Join-Path $tmpDir "ptx_emit_gb10_tensor_fp4.cubin"
   $fp4EmitOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
@@ -10749,6 +11421,7 @@ catch {
 
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $gb10Fp6Ptx = Join-Path $tmpDir "ptx_emit_gb10_tensor_fp6.ptx"
   $gb10Fp6Cubin = Join-Path $tmpDir "ptx_emit_gb10_tensor_fp6.cubin"
   $fp6EmitOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `
@@ -10884,6 +11557,7 @@ catch {
 
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   # Sparse A and its uint8 occupancy masks are frontend/IR semantics. PTX alone
   # translates those masks into ordered warp metadata and sanitizes every
   # dynamic group before it can reach an instruction with undefined encodings.
@@ -10955,6 +11629,7 @@ catch {
 
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   # Large logical dense tiles remain one frontend/shared-IR operation. PTX
   # selects a stable physical WMMA grid, reuses the cheaper input fragment,
   # and applies the same tuple policy to every resident output subtile.
@@ -11109,6 +11784,7 @@ catch {
 
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   # Epilogues are a separate neutral collective so activation never changes an
   # MMA chain's exact composition. PTX currently emits synchronized logical
   # memory replay, not a fictional addressable view of opaque WMMA fragments.
@@ -11182,6 +11858,7 @@ catch {
 
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   # A backend may consume adjacent verified neutral MMA/commit + epilogue
   # operations, or a uniquely reached loop-exit epilogue. Opaque fragment
   # mappings, bypass edges, and tuple pressure must fall back to the already-
@@ -11326,6 +12003,7 @@ catch {
 
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   # The source and shared IR expose only a rank/geometry/storage contract.  This
   # gate proves that GB10 selects TMA while the exact same program remains
   # executable as cooperative scalar replay on the baseline portable profile.
@@ -11507,6 +12185,7 @@ catch {
 
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   # Native TMA is not part of the ordinary real-device suite until it has
   # passed on a disposable/recoverable host.  Keep both runners and direct
   # harness invocation fail-closed so an offline assembler success cannot
@@ -11557,6 +12236,7 @@ catch {
 
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   # Pure host parser coverage for the offline resource-profile tool.  This test
   # does not invoke ptxas, load a module, query a driver, or touch a GPU.
   $profilePython = Get-Command python -ErrorAction SilentlyContinue
@@ -11584,6 +12264,7 @@ catch {
 
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   # Pure host coverage for deterministic occupancy bounds and Pareto selection.
   # The selector consumes JSON only and has no ptxas/driver/device code path.
   $selectorPython = Get-Command python -ErrorAction SilentlyContinue
@@ -11611,6 +12292,7 @@ catch {
 
 $total++
 try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $gb10PipelinePtx = Join-Path $tmpDir "ptx_emit_gb10_tensor_pipeline.ptx"
   $gb10PipelineCubin = Join-Path $tmpDir "ptx_emit_gb10_tensor_pipeline.cubin"
   $gb10Pipeline4Ptx = Join-Path $tmpDir "ptx_emit_gb10_tensor_pipeline4.ptx"
@@ -11830,6 +12512,7 @@ foreach ($fixture in $runFixtures) {
     $caseName = "$($fixture.Name)_$($mode.Name)"
     try {
       $total++
+      if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
       $fixtureExe = Join-Path $tmpDir "$caseName.exe"
       $fixtureOut = & $CompilerPath --build @($mode.Args) `
         $fixture.Path -o $fixtureExe 2>&1 | Out-String
@@ -12010,6 +12693,7 @@ foreach ($src in @("tests/gpu/compute_kernels.mettle",
   $total++
   $name = "spirv_emit_" + [System.IO.Path]::GetFileNameWithoutExtension($src)
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $spvPath = Join-Path $tmpDir ($name + ".spv")
     $emitOut = & $CompilerPath -O --emit-spirv $src -o $spvPath 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw "emit failed: $emitOut" }
@@ -12052,6 +12736,7 @@ elseif (-not (Test-Path "bin/mtlc.lib")) {
 else {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $calcExe = Join-Path $tmpDir "calc.exe"
     $buildOut = & $calcGcc.Source -Wall -Wextra -std=c99 -Iinclude `
       examples/calc/calc.c bin/mtlc.lib -o $calcExe -ldbghelp 2>&1 | Out-String
@@ -12090,6 +12775,7 @@ elseif (-not (Test-Path "bin/mtlc.lib")) {
 else {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $floatCopyExe = Join-Path $tmpDir "optimizer_float_copy_test.exe"
     $buildOut = & $calcGcc.Source -Wall -Wextra -std=c99 -Isrc -Iinclude `
       tests/optimizer_float_copy_test.c bin/mtlc.lib -o $floatCopyExe -ldbghelp 2>&1 | Out-String
@@ -12126,6 +12812,7 @@ elseif (-not (Test-Path "bin/mtlc.lib")) {
 else {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $pubExe = Join-Path $tmpDir "public_api_test.exe"
     $pubOut = Join-Path $tmpDir "pubapi"
     New-Item -ItemType Directory -Force $pubOut | Out-Null
@@ -12215,6 +12902,7 @@ elseif (-not (Test-Path "bin/mtlc.lib")) {
 else {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $nmLines = & $nmCmd.Source "bin/mtlc.lib" 2>$null
     $defined = New-Object System.Collections.Generic.HashSet[string]
     $undef = New-Object System.Collections.Generic.HashSet[string]
@@ -12249,6 +12937,7 @@ else {
 if ($FuzzCount -gt 0) {
   $total++
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $python = (Get-Command python -ErrorAction SilentlyContinue)
     if (-not $python) {
       $python = (Get-Command python3 -ErrorAction SilentlyContinue)
@@ -12286,6 +12975,61 @@ if ($script:SkippedWindowsOnly.Count -gt 0) {
   foreach ($entry in $script:SkippedWindowsOnly) {
     Write-Host "  - $entry"
   }
+}
+
+# The failure log. Written on every run, green ones included, so it never
+# reports a failure the current run does not have. Concurrent cases interleave
+# their console output; this file is the ordered account of what broke.
+if ($FailureLog) {
+  $lines = New-Object System.Collections.Generic.List[string]
+  $lines.Add("Mettle test run $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+  $lines.Add("Compiler: $CompilerPath")
+  $lines.Add("Result: $($total - $failed)/$total passed, $($script:Failures.Count) failed")
+  $lines.Add("")
+  if ($script:Failures.Count -eq 0) {
+    $lines.Add("No failures.")
+  }
+  else {
+    foreach ($entry in $script:Failures) {
+      $lines.Add("[FAIL] $($entry.Name)")
+      if ($entry.Reason) { $lines.Add("  reason: $($entry.Reason)") }
+      if ($entry.Detail) {
+        $lines.Add("  output:")
+        foreach ($detailLine in ($entry.Detail.TrimEnd() -split "`r?`n")) {
+          $lines.Add("    $detailLine")
+        }
+      }
+      $lines.Add("")
+    }
+  }
+  if ($script:SkippedWindowsOnly.Count -gt 0) {
+    $lines.Add("Skipped $($script:SkippedWindowsOnly.Count) Windows-only cases:")
+    foreach ($entry in $script:SkippedWindowsOnly) {
+      $lines.Add("  - $entry")
+    }
+  }
+  try {
+    $logDir = Split-Path -Parent $FailureLog
+    if ($logDir -and -not (Test-Path -LiteralPath $logDir)) {
+      New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    }
+    Set-Content -LiteralPath $FailureLog -Value $lines -Encoding UTF8
+    Write-Host ""
+    if ($script:Failures.Count -eq 0) {
+      Write-Host "Failure log: $FailureLog (no failures)"
+    }
+    else {
+      Write-Host "Failures written to $FailureLog"
+    }
+  }
+  catch {
+    Write-Host "Could not write failure log '$FailureLog': $($_.Exception.Message)"
+  }
+}
+
+# The line the -Parallel driver reads back out of each shard.
+if ($Shards -gt 1) {
+  Write-Host "SHARD-RESULT total=$total failed=$failed"
 }
 
 if ($failed -ne 0) {
