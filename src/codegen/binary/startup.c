@@ -320,6 +320,7 @@ int binary_write_program_startup_object_for_target(
   size_t text_section = 0;
   size_t function_offset = 0;
   size_t crash_startup_offset = 0;
+  size_t runtime_startup_offset = 0;
   size_t main_call_offset = 0;
   size_t report_call_offset = 0;
   size_t exit_call_offset = 0;
@@ -335,6 +336,23 @@ int binary_write_program_startup_object_for_target(
   }
 
   if (!binary_emit_sub_rsp_imm32(&code, BINARY_WIN64_SHADOW_SPACE_SIZE + 8)) {
+    goto cleanup;
+  }
+
+  /* Give the runtime its chance to run before main, the same as the ELF entry
+   * points do. Only they called it, so anything the Windows runtime wanted to
+   * set up at startup was written and never reached -- the console output code
+   * page among it, which is why a program printing UTF-8 drew mojibake.
+   *
+   * The arguments are zeroed rather than forwarded: on Windows the entry point
+   * is handed no argument block, and the runtime reads the command line itself
+   * through mettle_rt_getmainargs below. The parameters are there so one
+   * declaration serves both platforms. */
+  if (!binary_emit_mov_reg_imm32_zero_extend(&code, BINARY_GP_RCX, 0) ||
+      !binary_emit_mov_reg_imm32_zero_extend(&code, BINARY_GP_RDX, 0) ||
+      !binary_emit_call_placeholder(&code, &runtime_startup_offset) ||
+      !binary_call_relocation_table_add(&relocations, "mettle_rt_startup",
+                                        runtime_startup_offset)) {
     goto cleanup;
   }
 
@@ -403,6 +421,7 @@ int binary_write_program_startup_object_for_target(
       !binary_emitter_append_bytes(emitter, text_section, code.data, code.size,
                                    NULL) ||
       !binary_emitter_declare_external(emitter, "main") ||
+      !binary_emitter_declare_external(emitter, "mettle_rt_startup") ||
       !binary_emitter_declare_external(emitter, "ExitProcess")) {
     goto cleanup;
   }

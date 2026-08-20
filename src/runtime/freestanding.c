@@ -386,6 +386,9 @@ MT_DLLIMPORT int SetFilePointerEx(void *file, mt_i64 distance,
                                   mt_i64 *new_position, mt_u32 method);
 MT_DLLIMPORT int DeleteFileA(const char *path);
 MT_DLLIMPORT int GetConsoleMode(void *handle, mt_u32 *mode);
+#define MT_CP_UTF8 65001u
+MT_DLLIMPORT int SetConsoleOutputCP(mt_u32 code_page);
+MT_DLLIMPORT mt_u32 GetConsoleOutputCP(void);
 MT_DLLIMPORT char *GetCommandLineA(void);
 MT_DLLIMPORT mt_u32 GetEnvironmentVariableA(const char *name, char *buffer,
                                              mt_u32 size);
@@ -513,9 +516,24 @@ int putenv(char *setting) {
   return SetEnvironmentVariableA(name, equals + 1) ? 0 : -1;
 }
 
+/* Mettle strings are bytes, and a string literal carries whatever bytes the
+ * source file held, which is UTF-8. The Windows console decodes what it is
+ * given using its output code page, and that still defaults to a regional
+ * legacy page on most machines. So a program printing an accented letter wrote
+ * the correct two bytes and the console drew two wrong characters, one per
+ * byte. The bytes were never wrong; the console had been told to read them as
+ * something else.
+ *
+ * Saying so at startup is the whole fix. A program that writes UTF-8 should
+ * declare it rather than hope the user ran chcp first. This touches only the
+ * console: redirected output is bytes either way, and the input code page is
+ * left alone because nothing here reads console input as text. */
 void mettle_rt_startup(mt_i64 argc, char **argv) {
   (void)argc;
   (void)argv;
+  if (GetConsoleOutputCP() != MT_CP_UTF8) {
+    SetConsoleOutputCP(MT_CP_UTF8);
+  }
 }
 
 void __main(void) {}
