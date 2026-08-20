@@ -1,0 +1,100 @@
+// Guard for the adjacent-field select: two arms that read neighbouring fields
+// of one object become a single load at a selected offset. Checked against a
+// reference the recognizer cannot claim (the arms differ in more than the
+// offset), over both orders of the condition and both field widths.
+
+import "std/io";
+import "std/mem";
+
+struct Pair {
+  left: int32;
+  right: int32;
+}
+
+struct WidePair {
+  tag: int64;
+  a: int64;
+  b: int64;
+}
+
+var g_fail: int32 = 0;
+
+fn pick(p: Pair*, i: int32, bit: int32) -> int32 {
+  var v: int32 = 0;
+  if (bit != 0) {
+    v = p[i].right;
+  } else {
+    v = p[i].left;
+  }
+  return v;
+}
+
+fn pick_inverted(p: Pair*, i: int32, bit: int32) -> int32 {
+  var v: int32 = 0;
+  if (bit == 0) {
+    v = p[i].right;
+  } else {
+    v = p[i].left;
+  }
+  return v;
+}
+
+fn pick_wide(w: WidePair*, i: int32, bit: int32) -> int64 {
+  var v: int64 = 0;
+  if (bit != 0) {
+    v = w[i].b;
+  } else {
+    v = w[i].a;
+  }
+  return v;
+}
+
+// Reference: the arms differ by an extra operation, so nothing merges them.
+fn pick_ref(p: Pair*, i: int32, bit: int32) -> int32 {
+  var v: int32 = 0;
+  if (bit != 0) {
+    v = p[i].right;
+    v = v + 0;
+  } else {
+    v = p[i].left;
+    v = v - 0;
+  }
+  return v;
+}
+
+fn main() -> int32 {
+  var n: int32 = 64;
+  var p: Pair* = malloc((int64)n * sizeof(Pair));
+  var w: WidePair* = malloc((int64)n * sizeof(WidePair));
+  var i: int32 = 0;
+  while (i < n) {
+    p[i].left = i * 3 + 1;
+    p[i].right = i * 7 + 2;
+    w[i].tag = (int64)i;
+    w[i].a = (int64)i * 11 + 3;
+    w[i].b = (int64)i * 13 + 5;
+    i = i + 1;
+  }
+
+  var acc: int64 = 0;
+  i = 0;
+  while (i < n) {
+    var bit: int32 = (i * 37) & 1;
+    if (pick(p, i, bit) != pick_ref(p, i, bit)) { g_fail = g_fail + 1; }
+    if (pick_inverted(p, i, bit) != pick_ref(p, i, 1 - bit)) { g_fail = g_fail + 1; }
+    var want: int64 = w[i].a;
+    if (bit != 0) { want = w[i].b; }
+    if (pick_wide(w, i, bit) != want) { g_fail = g_fail + 1; }
+    acc = acc + (int64)pick(p, i, bit) + pick_wide(w, i, bit);
+    i = i + 1;
+  }
+
+  free(p);
+  free(w);
+  if (g_fail == 0) {
+    println("SELECT FIELD: ALL OK acc={acc}");
+    return 0;
+  }
+  println("SELECT FIELD FAILURES: {g_fail}");
+  return 1;
+}

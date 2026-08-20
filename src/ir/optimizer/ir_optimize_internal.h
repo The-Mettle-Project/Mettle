@@ -453,6 +453,9 @@ int ir_normalize_scan_from_first_pass(IRFunction *function, int *changed);
 /* Cross-block redundancy elimination: a dominator-tree walk that also admits
  * loads, which the block-local CSE does not. */
 int ir_redundancy_elimination_pass(IRFunction *function, int *changed);
+/* Two arms that differ only in which neighbouring field they read: select the
+ * field offset instead of the path. */
+int ir_select_adjacent_field_pass(IRFunction *function, int *changed);
 int ir_find_label_index(const IRFunction *function, const char *label,
                                size_t *out_index);
 int ir_find_last_writer_before(const IRFunction *function, size_t before_index,

@@ -968,3 +968,457 @@ int ir_redundancy_elimination_pass(IRFunction *function, int *changed) {
   ir_temp_value_map_destroy(&addr_taken);
   return 1;
 }
+
+/* -------------------------------------------------------------------------- */
+/* Selecting between two fields of one object                                  */
+/*                                                                             */
+/* A Huffman decoder walks its tree with                                       */
+/*     if (bit != 0) node = t[node].right; else node = t[node].left;           */
+/* and the bit is random by construction, so the branch mispredicts about half  */
+/* the time. Both arms compute the same address and read the same width; they   */
+/* differ in one constant, because the two fields are neighbours. Selecting the */
+/* constant in place of the path turns the pair into a single load at           */
+/* `base + else_offset + bit * (then_offset - else_offset)`, which is the form  */
+/* clang reaches through `bt` and `setb`.                                       */
+/*                                                                             */
+/* The match is structural: the two arms have to be isomorphic instruction for  */
+/* instruction, pure apart from the one value they both produce, and differ in  */
+/* exactly one integer operand. Nothing here reads a field offset or a type, so  */
+/* it fires on any two-way choice of a single constant.                         */
+/* -------------------------------------------------------------------------- */
+
+#define SEL_MAX_ARM 24
+
+typedef struct {
+  size_t index[SEL_MAX_ARM];
+  size_t count;
+} SelArm;
+
+static int sel_collect(const IRFunction *function, size_t lo, size_t hi,
+                       SelArm *arm) {
+  arm->count = 0;
+  for (size_t i = lo; i < hi; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_NOP) {
+      continue;
+    }
+    if (arm->count >= SEL_MAX_ARM) {
+      return 0;
+    }
+    arm->index[arm->count++] = i;
+  }
+  return 1;
+}
+
+/* Pure, and free of anything that could be observed if the other arm ran. */
+static int sel_instruction_is_speculatable(const IRInstruction *ins) {
+  switch (ins->op) {
+  case IR_OP_LOAD:
+  case IR_OP_BINARY:
+  case IR_OP_UNARY:
+  case IR_OP_CAST:
+  case IR_OP_ASSIGN:
+  case IR_OP_ADDRESS_OF:
+    break;
+  default:
+    return 0;
+  }
+  if (ins->op == IR_OP_UNARY && ins->text &&
+      (strcmp(ins->text, "*") == 0 || strcmp(ins->text, "&") == 0)) {
+    return 0;
+  }
+  /* Division traps, so the arm that would not have run must not divide. */
+  if (ins->op == IR_OP_BINARY && ins->text &&
+      (strcmp(ins->text, "/") == 0 || strcmp(ins->text, "%") == 0)) {
+    return 0;
+  }
+  return 1;
+}
+
+/* Operand equality under a renaming of the temporaries each arm defines. */
+static int sel_operand_matches(const IROperand *a, const IROperand *b,
+                               const REMap *rename) {
+  if (a->kind != b->kind) {
+    return 0;
+  }
+  switch (a->kind) {
+  case IR_OPERAND_TEMP: {
+    char key[RE_NAME_MAX];
+    if (!a->name || !b->name) {
+      return 0;
+    }
+    if (strcmp(a->name, b->name) == 0) {
+      return 1;
+    }
+    if (!re_name_key(key, sizeof(key), IR_OPERAND_TEMP, b->name)) {
+      return 0;
+    }
+    return re_map_get(rename, key) == 1;
+  }
+  case IR_OPERAND_SYMBOL:
+  case IR_OPERAND_STRING:
+  case IR_OPERAND_LABEL:
+    return a->name && b->name && strcmp(a->name, b->name) == 0;
+  case IR_OPERAND_INT:
+    return a->int_value == b->int_value;
+  case IR_OPERAND_FLOAT:
+    return a->float_value == b->float_value && a->float_bits == b->float_bits;
+  default:
+    return 1;
+  }
+}
+
+static int sel_text_equal(const char *a, const char *b) {
+  if (!a && !b) {
+    return 1;
+  }
+  return a && b && strcmp(a, b) == 0;
+}
+
+/* True when the condition provably holds 0 or 1, so the select needs no
+ * compare of its own. */
+static int sel_condition_is_boolean(const IRFunction *function,
+                                    const REDefs *defs,
+                                    const IROperand *cond) {
+  const IRInstruction *def;
+  if (cond->kind != IR_OPERAND_TEMP && cond->kind != IR_OPERAND_SYMBOL) {
+    return 0;
+  }
+  def = re_unique_def(function, defs, cond->kind, cond->name);
+  if (!def || def->op != IR_OP_BINARY || def->is_float || !def->text) {
+    return 0;
+  }
+  if (strcmp(def->text, "&") == 0) {
+    return def->rhs.kind == IR_OPERAND_INT && def->rhs.int_value == 1;
+  }
+  return strcmp(def->text, "<") == 0 || strcmp(def->text, ">") == 0 ||
+         strcmp(def->text, "<=") == 0 || strcmp(def->text, ">=") == 0 ||
+         strcmp(def->text, "==") == 0 || strcmp(def->text, "!=") == 0;
+}
+
+static int sel_label_index(const IRFunction *function, const char *label,
+                           size_t from, size_t *out) {
+  if (!label) {
+    return 0;
+  }
+  for (size_t i = from; i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_LABEL && ins->text && strcmp(ins->text, label) == 0) {
+      *out = i;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Any other reference to the label means the arm has a second entry. */
+static int sel_label_referenced_elsewhere(const IRFunction *function,
+                                          const char *label, size_t except) {
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (i == except) {
+      continue;
+    }
+    if ((ins->op == IR_OP_JUMP || ins->op == IR_OP_BRANCH_ZERO ||
+         ins->op == IR_OP_BRANCH_EQ) &&
+        ins->text && strcmp(ins->text, label) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int sel_reads_temp(const IRInstruction *ins, const char *name) {
+  const IROperand *slots[3];
+  slots[0] = &ins->lhs;
+  slots[1] = &ins->rhs;
+  slots[2] = (ins->op == IR_OP_STORE) ? &ins->dest : NULL;
+  for (int k = 0; k < 3; k++) {
+    if (slots[k] && slots[k]->kind == IR_OPERAND_TEMP && slots[k]->name &&
+        strcmp(slots[k]->name, name) == 0) {
+      return 1;
+    }
+  }
+  for (size_t a = 0; a < ins->argument_count; a++) {
+    if (ins->arguments[a].kind == IR_OPERAND_TEMP && ins->arguments[a].name &&
+        strcmp(ins->arguments[a].name, name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int sel_temp_escapes(const IRFunction *function, size_t lo, size_t hi,
+                            const char *name) {
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    if (i >= lo && i < hi) {
+      continue;
+    }
+    if (sel_reads_temp(&function->instructions[i], name)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+typedef struct {
+  size_t branch;
+  size_t else_label;
+  size_t end_label;
+  SelArm then_arm; /* without its trailing jump */
+  SelArm else_arm;
+  size_t diff_at; /* position within each arm */
+  long long then_const;
+  long long else_const;
+} SelMatch;
+
+static int sel_match_at(const IRFunction *function, size_t branch,
+                        SelMatch *out) {
+  const IRInstruction *br = &function->instructions[branch];
+  const IRInstruction *tail;
+  const IRInstruction *diff_a;
+  const IRInstruction *diff_b;
+  const IRInstruction *last_a;
+  SelArm then_arm;
+  SelArm else_arm;
+  REMap rename = {0};
+  size_t else_label = 0;
+  size_t end_label = 0;
+  size_t diff_count = 0;
+  size_t diff_at = 0;
+  int ok = 1;
+
+  if (br->op != IR_OP_BRANCH_ZERO || !br->text) {
+    return 0;
+  }
+  if (!sel_label_index(function, br->text, branch + 1, &else_label) ||
+      sel_label_referenced_elsewhere(function, br->text, branch)) {
+    return 0;
+  }
+  if (!sel_collect(function, branch + 1, else_label, &then_arm) ||
+      then_arm.count < 3) {
+    return 0;
+  }
+  tail = &function->instructions[then_arm.index[then_arm.count - 1]];
+  if (tail->op != IR_OP_JUMP || !tail->text) {
+    return 0;
+  }
+  if (!sel_label_index(function, tail->text, else_label + 1, &end_label)) {
+    return 0;
+  }
+  then_arm.count--; /* drop the jump */
+
+  if (!sel_collect(function, else_label + 1, end_label, &else_arm) ||
+      else_arm.count != then_arm.count) {
+    return 0;
+  }
+
+  for (size_t k = 0; k < then_arm.count && ok; k++) {
+    const IRInstruction *a = &function->instructions[then_arm.index[k]];
+    const IRInstruction *b = &function->instructions[else_arm.index[k]];
+    const IROperand *slots_a[2];
+    const IROperand *slots_b[2];
+    if (a->op != b->op || !sel_text_equal(a->text, b->text) ||
+        a->is_float != b->is_float || a->float_bits != b->float_bits ||
+        a->is_unsigned != b->is_unsigned || a->argument_count != 0 ||
+        b->argument_count != 0 || !sel_instruction_is_speculatable(a)) {
+      ok = 0;
+      break;
+    }
+    slots_a[0] = &a->lhs;
+    slots_a[1] = &a->rhs;
+    slots_b[0] = &b->lhs;
+    slots_b[1] = &b->rhs;
+    for (int s = 0; s < 2 && ok; s++) {
+      if (sel_operand_matches(slots_a[s], slots_b[s], &rename)) {
+        continue;
+      }
+      if (s == 1 && slots_a[s]->kind == IR_OPERAND_INT &&
+          slots_b[s]->kind == IR_OPERAND_INT && diff_count == 0) {
+        diff_count = 1;
+        diff_at = k;
+        continue;
+      }
+      ok = 0;
+    }
+    if (!ok) {
+      break;
+    }
+    if (a->dest.kind != b->dest.kind) {
+      ok = 0;
+      break;
+    }
+    if (a->dest.kind == IR_OPERAND_TEMP) {
+      char key[RE_NAME_MAX];
+      if (!a->dest.name || !b->dest.name ||
+          !re_name_key(key, sizeof(key), IR_OPERAND_TEMP, b->dest.name) ||
+          !re_map_set(&rename, key, 1)) {
+        ok = 0;
+      }
+    } else if (a->dest.kind != IR_OPERAND_NONE) {
+      /* The one shared result, and it has to be the last thing either arm
+       * does. */
+      if (!a->dest.name || !b->dest.name ||
+          strcmp(a->dest.name, b->dest.name) != 0 || k + 1 != then_arm.count) {
+        ok = 0;
+      }
+    }
+  }
+  re_map_destroy(&rename);
+  if (!ok || diff_count != 1) {
+    return 0;
+  }
+
+  /* The differing operand has to sit where a temporary can replace it. */
+  diff_a = &function->instructions[then_arm.index[diff_at]];
+  diff_b = &function->instructions[else_arm.index[diff_at]];
+  if (diff_a->op != IR_OP_BINARY || diff_a->is_float || !diff_a->text ||
+      strcmp(diff_a->text, "+") != 0 ||
+      diff_a->rhs.int_value == diff_b->rhs.int_value) {
+    return 0;
+  }
+
+  last_a = &function->instructions[then_arm.index[then_arm.count - 1]];
+  if (last_a->dest.kind != IR_OPERAND_SYMBOL || !last_a->dest.name) {
+    return 0;
+  }
+  for (size_t k = 0; k + 1 < then_arm.count; k++) {
+    const IRInstruction *a = &function->instructions[then_arm.index[k]];
+    const IRInstruction *b = &function->instructions[else_arm.index[k]];
+    if (a->dest.kind != IR_OPERAND_TEMP || !a->dest.name ||
+        b->dest.kind != IR_OPERAND_TEMP || !b->dest.name) {
+      return 0;
+    }
+    if (sel_temp_escapes(function, branch + 1, else_label, a->dest.name) ||
+        sel_temp_escapes(function, else_label + 1, end_label, b->dest.name)) {
+      return 0;
+    }
+  }
+
+  /* Room for the compare, the two instructions that build the selected
+   * constant, and the arm itself, all inside the slots the arms occupied. */
+  if (else_label - branch < then_arm.count + 3) {
+    return 0;
+  }
+
+  out->branch = branch;
+  out->else_label = else_label;
+  out->end_label = end_label;
+  out->then_arm = then_arm;
+  out->else_arm = else_arm;
+  out->diff_at = diff_at;
+  out->then_const = diff_a->rhs.int_value;
+  out->else_const = diff_b->rhs.int_value;
+  return 1;
+}
+
+static void sel_apply(IRFunction *function, const REDefs *defs,
+                      const SelMatch *m, int *changed) {
+  static int counter;
+  IRInstruction body[SEL_MAX_ARM];
+  IRInstruction *br = &function->instructions[m->branch];
+  IROperand cond = ir_operand_copy(&br->lhs);
+  SourceLocation location = br->location;
+  int cond_is_boolean = sel_condition_is_boolean(function, defs, &br->lhs);
+  long long delta = m->then_const - m->else_const;
+  size_t body_count = m->then_arm.count;
+  size_t at;
+  char sel_name[48];
+  char scaled_name[48];
+  char offset_name[48];
+
+  snprintf(sel_name, sizeof(sel_name), "__fsel_%d", counter);
+  snprintf(scaled_name, sizeof(scaled_name), "__fselm_%d", counter);
+  snprintf(offset_name, sizeof(offset_name), "__fselk_%d", counter);
+  counter++;
+
+  /* Move the arm out before its slots are reused. */
+  for (size_t k = 0; k < body_count; k++) {
+    body[k] = function->instructions[m->then_arm.index[k]];
+    memset(&function->instructions[m->then_arm.index[k]], 0,
+           sizeof(IRInstruction));
+    function->instructions[m->then_arm.index[k]].op = IR_OP_NOP;
+  }
+  for (size_t i = m->branch; i < m->else_label; i++) {
+    ir_instruction_make_nop(&function->instructions[i]);
+  }
+  for (size_t i = m->else_label + 1; i < m->end_label; i++) {
+    ir_instruction_make_nop(&function->instructions[i]);
+  }
+
+  at = m->branch;
+  {
+    IRInstruction *slot = &function->instructions[at++];
+    slot->location = location;
+    slot->dest = ir_operand_temp(sel_name);
+    slot->lhs = cond;
+    if (cond_is_boolean) {
+      slot->op = IR_OP_ASSIGN;
+    } else {
+      slot->op = IR_OP_BINARY;
+      slot->text = mettle_strdup("!=");
+      slot->rhs = ir_operand_int(0);
+    }
+  }
+  {
+    IRInstruction *slot = &function->instructions[at++];
+    slot->op = IR_OP_BINARY;
+    slot->location = location;
+    slot->text = mettle_strdup("*");
+    slot->dest = ir_operand_temp(scaled_name);
+    slot->lhs = ir_operand_temp(sel_name);
+    slot->rhs = ir_operand_int(delta);
+  }
+  {
+    IRInstruction *slot = &function->instructions[at++];
+    slot->op = IR_OP_BINARY;
+    slot->location = location;
+    slot->text = mettle_strdup("+");
+    slot->dest = ir_operand_temp(offset_name);
+    slot->lhs = ir_operand_temp(scaled_name);
+    slot->rhs = ir_operand_int(m->else_const);
+  }
+  for (size_t k = 0; k < body_count; k++) {
+    if (k == m->diff_at) {
+      ir_operand_destroy(&body[k].rhs);
+      body[k].rhs = ir_operand_temp(offset_name);
+    }
+    function->instructions[at++] = body[k];
+  }
+
+  if (changed) {
+    *changed = 1;
+  }
+}
+
+int ir_select_adjacent_field_pass(IRFunction *function, int *changed) {
+  REDefs defs = {0};
+  IRTempValueMap addr_taken;
+
+  if (!function || function->instruction_count == 0) {
+    return 1;
+  }
+  if (!ir_temp_value_map_init(&addr_taken)) {
+    return 1;
+  }
+  defs.function = function;
+  defs.addr_taken = &addr_taken;
+  if (ir_addr_taken_set_build(function, &addr_taken) &&
+      re_collect_defs(function, &defs)) {
+    for (size_t i = 0; i < function->instruction_count; i++) {
+      SelMatch match;
+      if (function->instructions[i].op != IR_OP_BRANCH_ZERO) {
+        continue;
+      }
+      if (sel_match_at(function, i, &match)) {
+        sel_apply(function, &defs, &match, changed);
+        i = match.end_label;
+      }
+    }
+  }
+
+  re_map_destroy(&defs.defs);
+  re_map_destroy(&defs.def_at);
+  ir_temp_value_map_destroy(&addr_taken);
+  return 1;
+}

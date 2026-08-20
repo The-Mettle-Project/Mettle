@@ -143,6 +143,8 @@ static const IROptNamedPass g_ir_post_recognizer_tail[] = {
      * because rewriting a load to a copy erases the indexed shape every
      * recognizer above reads. The two cleanups behind it retire the copies it
      * leaves; nothing later in the pipeline would. */
+    {"select_field_load", ir_select_adjacent_field_pass,
+     {IR_OPT_FEATURE_LOAD | IR_OPT_FEATURE_BRANCH_ZERO, IR_OPT_REQUIRE_NONE}},
     {"redundancy_elim", ir_redundancy_elimination_pass,
      {IR_OPT_FEATURE_LOAD, IR_OPT_REQUIRE_NONE}},
     {"redundancy_copy_prop", ir_copy_and_constant_propagation_pass, {0, 0}},

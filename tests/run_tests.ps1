@@ -3027,6 +3027,12 @@ $simdRuntimeCases = @(
     Path            = "tests/simd_correctness/simd_find_base_check.mettle"
     OutputMustMatch = "FIND SIMD: ALL OK"
     IrMustMatch     = @("simd_find")
+  },
+  @{
+    Name            = "select_adjacent_field"
+    Path            = "tests/select_field_check.mettle"
+    OutputMustMatch = "SELECT FIELD: ALL OK"
+    IrMustMatch     = @("__fsel")
   }
 )
 
