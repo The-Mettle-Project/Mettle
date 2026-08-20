@@ -78,6 +78,54 @@ export fn print_err(msg: string) {
   fwrite("\n".chars, 1, 1, get_stderr());
 }
 
+// ─── Reading a line ─────────────────────────────────────────────────────────
+
+// Read one line from `fp` into `buf` and return a view of it, without the
+// newline. `cap` is the buffer's size in bytes, and the view is never longer
+// than `cap - 1` characters, because the underlying read reserves one byte for
+// a terminator. A line longer than that comes back in pieces across calls,
+// each piece a complete view.
+//
+// The view borrows `buf`, so it lives as long as the buffer and no longer, and
+// the next call overwrites it. Copy out what you need to keep:
+//
+//     var buf: uint8[256];
+//     var line: string = read_line(&buf[0], 256, get_stdin());
+//     if (line.length == (uint64)0 && at_eof) { ... }
+//     for c in line { ... }
+//
+// An empty view means either an empty line or end of input; `feof`-style
+// disambiguation is the caller's, via the same buffer coming back untouched.
+export fn read_line(buf: cstring, cap: int32, fp: cstring) -> string {
+  var empty: string;
+  empty.chars = buf;
+  empty.length = (uint64)0;
+  if (buf == 0 || cap <= 1) {
+    return empty;
+  }
+  buf[0] = 0;
+  if (fgets(buf, cap, fp) == 0) {
+    return empty;
+  }
+  var n: int64 = 0;
+  while (n < (int64)cap && buf[n] != 0) {
+    n = n + 1;
+  }
+  // Both line endings, so a file written on Windows reads the same here.
+  while (n > 0 && (buf[n - 1] == 10 || buf[n - 1] == 13)) {
+    n = n - 1;
+  }
+  var out: string;
+  out.chars = buf;
+  out.length = (uint64)n;
+  return out;
+}
+
+// The same, from standard input.
+export fn read_line_stdin(buf: cstring, cap: int32) -> string {
+  return read_line(buf, cap, get_stdin());
+}
+
 // ─── FFI string marshalling ─────────────────────────────────────────────────
 //
 // See std/io: `cstr` produces the NUL-terminated copy a C function needs, and

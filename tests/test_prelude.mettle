@@ -11,8 +11,8 @@ fn main() -> int32 {
   var c: int64 = clamp(50, 0, 100);
 
   // std/conv: is_digit, to_lower
-  var d: int32 = is_digit(57);
-  var e: int32 = to_lower(65);
+  var d: bool = is_digit('9');
+  var e: char = to_lower('A');
 
   return 0;
 }

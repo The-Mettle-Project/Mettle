@@ -329,26 +329,57 @@ static MLDisp *parse_disps(char *text, int *out_n) {
   return d;
 }
 
-/* METTLE_ML_SABOTAGE: corrupt the first COPY/CONST disposition into a wrong
- * constant, proving end to end that the validator catches and discards a bad
- * model proposal - the ml-opt twin of METTLE_VERIFY_BREAK. */
-static void maybe_sabotage(MLDisp *d, int n) {
+/* METTLE_ML_SABOTAGE: corrupt a COPY/CONST disposition into a wrong constant,
+ * proving end to end that the validator catches and discards a bad model
+ * proposal - the ml-opt twin of METTLE_VERIFY_BREAK.
+ *
+ * It has to land on a function the validator can actually snapshot. A CONST is
+ * proven by construction and stands on that proof wherever the gate cannot run,
+ * so arming one on an unsnapshottable function -- anything calling out to an
+ * extern, say -- applies the wrong constant and reports nothing, which reads as
+ * the gate failing when it was never consulted. That is a self-test claiming
+ * the opposite of what it measured, so the candidate is checked here rather
+ * than taken in list order. */
+static void maybe_sabotage(IRProgram *program, MLDisp *d, int n) {
   const char *spec = getenv("METTLE_ML_SABOTAGE");
   if (!spec || !spec[0] || strcmp(spec, "0") == 0) {
     return;
   }
   for (int i = 0; i < n; i++) {
-    if (d[i].kind == MLK_COPY || d[i].kind == MLK_CONST) {
-      free(d[i].arg);
-      d[i].kind = MLK_CONST;
-      d[i].arg = strdup("271828");
-      fprintf(stderr,
-              "ml-opt: SABOTAGE armed: disposition for '%s' ir#%lld forced to "
-              "CONST 271828\n",
-              d[i].fn, d[i].gidx);
-      return;
+    if (d[i].kind != MLK_COPY && d[i].kind != MLK_CONST) {
+      continue;
     }
+    IRFunction *fn = find_func(program, d[i].fn);
+    IRVerifySnapshot *snap = fn ? ir_verify_snapshot_capture(fn) : NULL;
+    char why[192], cex[320], skip[160];
+    IRVerifyRewriteVerdict dry;
+    if (!snap) {
+      continue;
+    }
+    /* Ask the gate about this function while nothing has been changed. A
+     * function still identical to its snapshot must come back VALIDATED; the
+     * only other answer it can give is that it cannot run the function at all,
+     * which is the case to skip. Nothing is mutated, so this costs a run and
+     * decides nothing else. */
+    dry = ir_verify_check_rewrite(program, fn, snap, why, sizeof(why), cex,
+                                  sizeof(cex), skip, sizeof(skip));
+    if (dry != IR_VERIFY_REWRITE_VALIDATED) {
+      ir_verify_snapshot_free(snap);
+      continue;
+    }
+    ir_verify_snapshot_free(snap);
+    free(d[i].arg);
+    d[i].kind = MLK_CONST;
+    d[i].arg = strdup("271828");
+    fprintf(stderr,
+            "ml-opt: SABOTAGE armed: disposition for '%s' ir#%lld forced to "
+            "CONST 271828\n",
+            d[i].fn, d[i].gidx);
+    return;
   }
+  fprintf(stderr,
+          "ml-opt: SABOTAGE could not arm: no COPY/CONST disposition sits on a "
+          "function the validator can run\n");
 }
 
 /* Apply one disposition. Returns 1 when the IR changed (the disposition now
@@ -753,7 +784,7 @@ int ir_apply_ml_opt(IRProgram *program, MLOptStats *stats) {
   if (!d) {
     return 0;
   }
-  maybe_sabotage(d, n);
+  maybe_sabotage(program, d, n);
   stats->proposals = n;
 
   /* Group by function, preserving first-seen order. Apply order inside a

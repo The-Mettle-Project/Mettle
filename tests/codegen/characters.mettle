@@ -1,0 +1,105 @@
+import "std/conv";
+
+var G_MSG: string = "Mettle";
+
+@noinline fn shout(c: char) -> char { return to_upper(c); }
+@noinline fn code_of(c: char) -> int32 { return c; }
+
+struct Token { kind: char; count: int32; }
+
+fn main() -> int32 {
+  // A character literal is a character, and it widens into an integer with no
+  // cast in sight.
+  var c: char = 'h';
+  var code: int32 = c;
+  if (code != 104) { return 1; }
+  if (c != 'h') { return 2; }
+  if (c == 'H') { return 3; }
+
+  // Arithmetic promotes to int32: `c - 'a'` is an index, not a character.
+  var offset: int32 = 'e' - 'a';
+  if (offset != 4) { return 4; }
+  if ((int32)((char)('a' + 1)) != 98) { return 5; }
+
+  // Indexing a string reads one character.
+  var s: string = "hello";
+  if (s[0] != 'h' || s[4] != 'o') { return 6; }
+  if ((int32)s.length != 5) { return 7; }
+
+  // Iteration walks every character, in order, once.
+  var seen: int32 = 0;
+  var ells: int32 = 0;
+  for ch in s {
+    seen = seen + 1;
+    if (ch == 'l') { ells = ells + 1; }
+  }
+  if (seen != 5 || ells != 2) { return 8; }
+
+  // An empty string iterates zero times.
+  for ch in "" { return 9; }
+
+  // Nested loops keep their own counters.
+  var pairs: int32 = 0;
+  for a in "xy" {
+    for b in "123" {
+      if (a != 'x' && a != 'y') { return 10; }
+      if (b < '1' || b > '3') { return 11; }
+      pairs = pairs + 1;
+    }
+  }
+  if (pairs != 6) { return 12; }
+
+  // A character crosses a call boundary in both directions.
+  if (shout('q') != 'Q') { return 13; }
+  if (code_of('A') != 65) { return 14; }
+
+  // Characters live in structs and arrays like any other byte.
+  var t: Token;
+  t.kind = '+';
+  t.count = 7;
+  if (t.kind != '+' || t.count != 7) { return 15; }
+  var buf: char[3];
+  buf[0] = 'a'; buf[1] = 'b'; buf[2] = 'c';
+  if (buf[0] != 'a' || buf[2] != 'c') { return 16; }
+
+  // Interpolation writes the character; the byte holding it writes a number.
+  // This is the whole reason the type is distinct, so it is pinned here.
+  var as_char: string = "{c}";
+  var as_byte: string = "{(uint8)c}";
+  if (as_char != "h") { return 17; }
+  if (as_byte != "104") { return 18; }
+  if ("{s[1]}{s[2]}" != "el") { return 19; }
+
+  // Classification answers bool, and reads as the question it is.
+  if (!is_digit('7') || is_digit('x')) { return 20; }
+  if (!is_alpha('x') || is_alpha('7')) { return 21; }
+  if (!is_space(' ') || !is_space('\n') || is_space('x')) { return 22; }
+  if (!is_upper('A') || !is_lower('a')) { return 23; }
+  if (!is_alnum('7') || !is_alnum('x') || is_alnum('!')) { return 24; }
+  if (to_upper('a') != 'A' || to_lower('Z') != 'z') { return 25; }
+  if (to_upper('!') != '!') { return 26; }
+  if (char_to_digit('9') != 9) { return 27; }
+  if (digit_to_char(3) != '3') { return 28; }
+
+  // Bytes become a view without copying or scanning.
+  var raw: uint8[8];
+  raw[0] = 'h'; raw[1] = 'i'; raw[2] = 0;
+  var from_bytes: string = str_from_bytes(&raw[0], 2);
+  var from_cstr: string = str_from_cstr(&raw[0]);
+  if (from_bytes != "hi" || from_cstr != "hi") { return 29; }
+  if ((int32)str_from_cstr(0).length != 0) { return 30; }
+  if ((int32)str_from_bytes(&raw[0], -1).length != 0) { return 31; }
+
+  // A global string indexes and iterates the same as a local one.
+  if (G_MSG[0] != 'M') { return 32; }
+  var global_seen: int32 = 0;
+  for ch in G_MSG { global_seen = global_seen + 1; }
+  if (global_seen != 6) { return 33; }
+
+  // The character views compose with the rest of std/conv.
+  var trimmed: string = str_trim("  padded  ");
+  if (trimmed != "padded") { return 34; }
+  if (trimmed[0] != 'p') { return 35; }
+
+  return 0;
+}

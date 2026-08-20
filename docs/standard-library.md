@@ -23,6 +23,18 @@ not link a POSIX or pthread library.
 
 Console and file I/O. `print` and `println` take a `string` and write its `length` bytes (they never scan for a terminator, so `println("done")` costs one write. `print_err` and `println_err` do the same to stderr. `print_cstr` and `println_cstr` are the boundary forms, for a NUL-terminated pointer that came from C or from a byte buffer the program terminated itself. Values print through interpolation: `println("{n}")`. `putchar` writes one character and `getchar` reads one; `puts` is the raw C-shaped write. `cstr(s: string, alloc: fn(int64) -> rawptr) -> cstring` marshals a string into a NUL-terminated copy for a C call, taking the allocator so the copy is visible in the signature (a string literal needs none of this) it is already terminated in rodata). File operations: `fopen`, `fclose`, `fread`, `fwrite`, `fputs`, `fgets`, `fflush`. File handles are `cstring` (opaque `FILE*`). Stream accessors: `get_stdin`, `get_stdout`, `get_stderr`.
 
+`read_line(buf, cap, fp)` reads one line into `buf` and returns a view of it
+without the newline, handling both line endings; `read_line_stdin(buf, cap)` is
+the same from standard input. The view borrows `buf`, so it lives as long as
+the buffer and the next call overwrites it. An empty view means an empty line
+or end of input.
+
+```mettle
+var buf: uint8[256];
+var line: string = read_line_stdin(buf, 256);
+for c in line { ... }
+```
+
 ## std/mem
 
 Memory management. The owned runtime exports `malloc`, `calloc`, `realloc`,
@@ -77,6 +89,32 @@ Accuracy: kernels carry enough terms that truncation error sits below the roundi
 
 Conversions, character classification, and string operations. The owned runtime
 supplies `atoi` and `atol`. The rest of the module is Mettle code.
+
+### Characters
+
+`is_digit`, `is_upper`, `is_lower`, `is_alpha`, `is_alnum` and `is_space` take
+a `char` and answer `bool`, so they read as the questions they are:
+
+```mettle
+for c in line {
+  if (is_alpha(c) || is_digit(c)) { ... }
+}
+```
+
+`to_upper` and `to_lower` return the other case, or the character unchanged
+when it has no other case. `char_to_digit` gives the value of a digit character
+and `digit_to_char` gives the character for a value; neither validates, so ask
+`is_digit` first when the input is not already known good. All of these are
+ASCII: a byte above 127 is part of some multi-byte encoding this module does
+not decode, and calling it a letter would be a guess.
+
+### Bytes to string
+
+`str_from_bytes(p, n)` is the view of `n` bytes at `p`, and `str_from_cstr(s)`
+is the view of a NUL-terminated pointer up to its terminator. Neither copies,
+so the buffer has to outlive the view. These are the bridge from bytes that
+arrived from the outside world -- a `read`, an FFI return -- to everything
+below.
 
 ### Strings
 

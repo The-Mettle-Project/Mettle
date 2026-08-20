@@ -8,7 +8,7 @@ The following sizes and alignments apply on x86-64. Use these when laying out st
 
 | Type | Size | Alignment |
 |------|------|-----------|
-| `int8`, `uint8`, `bool` | 1 | 1 |
+| `int8`, `uint8`, `bool`, `char` | 1 | 1 |
 | `int16`, `uint16` | 2 | 2 |
 | `int32`, `uint32`, `float32` | 4 | 4 |
 | `int64`, `uint64`, `float64`, pointers, plain enums | 8 | 8 |
@@ -19,11 +19,41 @@ Struct and array sizes are derived from their fields and element types. Pointers
 
 ## Primitive Types
 
-Signed integers: `int8`, `int16`, `int32`, `int64` (1, 2, 4, 8 bytes). Unsigned integers: `uint8`, `uint16`, `uint32`, `uint64` (1, 2, 4, 8 bytes). Floating-point: `float32`, `float64` (4, 8 bytes, IEEE 754). Sizes and representations follow the target platform (x86-64).
+Signed integers: `int8`, `int16`, `int32`, `int64` (1, 2, 4, 8 bytes). Unsigned integers: `uint8`, `uint16`, `uint32`, `uint64` (1, 2, 4, 8 bytes). Floating-point: `float32`, `float64` (4, 8 bytes, IEEE 754). One character: `char` (1 byte). Sizes and representations follow the target platform (x86-64).
 
 **Integer overflow:** The compiler emits native x86-64 arithmetic instructions. Signed integer overflow wraps (two's complement); there is no trap or runtime check. Unsigned overflow wraps modulo 2^n. Assembly programmers can rely on wrap-around behavior.
 
 **Integer literal default type:** When the context does not disambiguate, integer literals default to `int32`. Floating-point literals default to `float64`. Examples: `42` has type `int32`; `3.14` has type `float64`. In expressions like `var x: int64 = 42`, the literal is implicitly converted to the expected type.
+
+**Character:** `char` is a built-in 1-byte type holding one character. A character literal has this type, so `'a'` is a `char` and not the number 97.
+
+It is a byte, and it behaves like one wherever that is what you want. It widens into every wider integer with no cast, and arithmetic on it promotes to `int32`, because `c - 'a'` is an index and `c + 1` is the next code point; neither is a character. Going the other way needs a cast, the same as any narrowing.
+
+What the distinct type buys is printing. Interpolation writes a `char` as the character and a `uint8` as its number, which is the difference between `h` and `104`:
+
+```mettle
+var c: char = 'h';
+println("{c}");           // h
+println("{(uint8)c}");    // 104
+
+var code: int32 = c;      // widens, no cast
+var offset: int32 = c - 'a';   // 7, an index
+var next: char = (char)(c + 1);  // narrows, cast required
+```
+
+Indexing a string reads a character, and `for c in s` walks one:
+
+```mettle
+var s: string = "hello";
+var first: char = s[0];        // 'h'
+for c in s {
+  if (is_alpha(c)) { ... }
+}
+```
+
+`s[i]` is a read. A `string` is a borrowed view and its bytes are as likely to be a literal in read-only memory as a buffer the program owns, so assigning through the index is rejected; write through `s.chars` when the bytes are yours. `for c in s` evaluates its subject once, so `for c in read_line(buf, 256, f)` reads one line rather than one per character.
+
+`char` is ASCII-oriented: it holds one byte, so a multi-byte UTF-8 sequence is that many `char` values. `s.length` counts bytes.
 
 **Boolean:** `bool` is a built-in 1-byte type with the two built-in constants `true` and `false`. It is distinct from `uint8`: a `switch` over a `bool` must cover both `true` and `false` unless it has a `default`. Note that comparison operators do not produce `bool`; they produce an `int32` that is 0 or 1, and conditions in `if`, `while`, and `for` accept any numeric type rather than requiring `bool`.
 

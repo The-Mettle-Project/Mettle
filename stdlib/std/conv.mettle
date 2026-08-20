@@ -9,65 +9,89 @@ export extern fn atol(s: cstring) -> int64 = "atol";
 
 // ─── Integer ↔ character helpers ────────────────────────────────────────────
 
-// Convert a single digit (0–9) to its ASCII character code
-export fn digit_to_char(d: int32) -> int32 {
-  return d + 48;
+// The digit character for 0-9, and the value of a digit character. Neither
+// validates: ask is_digit first when the input is not already known good.
+export fn digit_to_char(d: int32) -> char {
+  return (char)(d + 48);
 }
 
-// Convert an ASCII digit character to its numeric value (no validation)
-export fn char_to_digit(c: int32) -> int32 {
-  return c - 48;
+export fn char_to_digit(c: char) -> int32 {
+  return c - '0';
 }
 
 // ─── Character classification ───────────────────────────────────────────────
+//
+// These answer `bool`, so they read as the questions they are:
+//
+//     if (is_digit(c) && !is_space(c)) { ... }
+//
+// ASCII only. A byte above 127 is part of some multi-byte encoding this
+// library does not decode, and claiming it is a letter would be a guess.
 
-export fn is_digit(c: int32) -> int32 {
-  if (c >= 48) { if (c <= 57) { return 1; } }
-  return 0;
+export fn is_digit(c: char) -> bool {
+  return c >= '0' && c <= '9';
 }
 
-export fn is_upper(c: int32) -> int32 {
-  if (c >= 65) { if (c <= 90) { return 1; } }
-  return 0;
+export fn is_upper(c: char) -> bool {
+  return c >= 'A' && c <= 'Z';
 }
 
-export fn is_lower(c: int32) -> int32 {
-  if (c >= 97) { if (c <= 122) { return 1; } }
-  return 0;
+export fn is_lower(c: char) -> bool {
+  return c >= 'a' && c <= 'z';
 }
 
-export fn is_alpha(c: int32) -> int32 {
-  if (is_upper(c) == 1) { return 1; }
-  if (is_lower(c) == 1) { return 1; }
-  return 0;
+export fn is_alpha(c: char) -> bool {
+  return is_upper(c) || is_lower(c);
 }
 
-export fn is_alnum(c: int32) -> int32 {
-  if (is_alpha(c) == 1) { return 1; }
-  if (is_digit(c) == 1) { return 1; }
-  return 0;
+export fn is_alnum(c: char) -> bool {
+  return is_alpha(c) || is_digit(c);
 }
 
-export fn is_space(c: int32) -> int32 {
-  if (c == 32) { return 1; }
-  if (c == 9)  { return 1; }
-  if (c == 10) { return 1; }
-  if (c == 13) { return 1; }
-  if (c == 12) { return 1; }
-  if (c == 11) { return 1; }
-  return 0;
+export fn is_space(c: char) -> bool {
+  return (c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+          c == (char)12 || c == (char)11);
 }
 
 // ─── Case conversion ────────────────────────────────────────────────────────
 
-export fn to_lower(c: int32) -> int32 {
-  if (is_upper(c) == 1) { return c + 32; }
+export fn to_lower(c: char) -> char {
+  if (is_upper(c)) { return (char)(c + 32); }
   return c;
 }
 
-export fn to_upper(c: int32) -> int32 {
-  if (is_lower(c) == 1) { return c - 32; }
+export fn to_upper(c: char) -> char {
+  if (is_lower(c)) { return (char)(c - 32); }
   return c;
+}
+
+// ─── Bytes → string ─────────────────────────────────────────────────────────
+//
+// A `string` is a pointer and a length. Bytes arrive from the outside world
+// with neither shape: `fgets` fills a buffer and terminates it, `read` hands
+// back a count. These two build the view, and because a view borrows, the
+// buffer has to outlive it -- a view of a stack array dies with the frame it
+// was declared in, exactly like a slice of any other string.
+
+// The view of `n` bytes at `p`. Nothing is scanned and nothing is copied.
+export fn str_from_bytes(p: cstring, n: int64) -> string {
+  var out: string;
+  out.chars = p;
+  out.length = (uint64)n;
+  if (p == 0 || n < 0) {
+    out.length = (uint64)0;
+  }
+  return out;
+}
+
+// The view of a NUL-terminated pointer, up to but not including the
+// terminator. This is the one that costs a scan, which is why `print` takes a
+// `string` and `print_cstr` exists separately.
+export fn str_from_cstr(s: cstring) -> string {
+  if (s == 0) {
+    return str_from_bytes(s, 0);
+  }
+  return str_from_bytes(s, cstr_len(s));
 }
 
 // ─── Strings ────────────────────────────────────────────────────────────────
@@ -164,7 +188,7 @@ export fn str_trim_start(s: string) -> string {
   var n: int64 = (int64)s.length;
   var i: int64 = 0;
   while (i < n) {
-    if (is_space((int32)s.chars[i]) == 0) { break; }
+    if (!is_space(s[i])) { break; }
     i = i + 1;
   }
   return str_slice(s, i, n - i);
@@ -173,7 +197,7 @@ export fn str_trim_start(s: string) -> string {
 export fn str_trim_end(s: string) -> string {
   var n: int64 = (int64)s.length;
   while (n > 0) {
-    if (is_space((int32)s.chars[n - 1]) == 0) { break; }
+    if (!is_space(s[n - 1])) { break; }
     n = n - 1;
   }
   return str_slice(s, 0, n);
@@ -206,18 +230,18 @@ export fn str_to_i64(s: string) -> (int64, int32) {
 
   var i: int64 = 0;
   var negative: int32 = 0;
-  if ((int32)s.chars[0] == 45) {
+  if (s[0] == '-') {
     negative = 1;
     i = 1;
-  } else if ((int32)s.chars[0] == 43) {
+  } else if (s[0] == '+') {
     i = 1;
   }
   if (i >= n) { return (0, 0); }
 
   var value: int64 = 0;
   while (i < n) {
-    var c: int32 = (int32)s.chars[i];
-    if (is_digit(c) == 0) { return (0, 0); }
+    var c: char = s[i];
+    if (!is_digit(c)) { return (0, 0); }
     value = value * 10 + (int64)char_to_digit(c);
     i = i + 1;
   }
