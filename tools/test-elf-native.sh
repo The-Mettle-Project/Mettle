@@ -98,12 +98,15 @@ run_case_out() {
   fi
 }
 
-# std/io console output via the write syscall (no libc): println + print_int.
+# std/io console output via the write syscall (no libc): print, println, and an
+# interpolated integer.
 run_case_out stdio_console 0 'value=42
 -7' 'import "std/io";
 fn main() -> int32 {
-  print("value="); print_int(42); newline();
-  print_int(-7); newline();
+  var a: int32 = 42;
+  var b: int32 = -7;
+  print("value="); println("{a}");
+  println("{b}");
   return 0;
 }'
 
