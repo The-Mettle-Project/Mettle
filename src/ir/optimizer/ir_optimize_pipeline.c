@@ -149,6 +149,8 @@ static const IROptNamedPass g_ir_post_recognizer_tail[] = {
  * instead of the one the programmer wrote. The two general passes behind them
  * retire the copies they leave; nothing later in the pipeline would. */
 static const IROptNamedPass g_ir_lowering_cleanup[] = {
+    {"promote_loop_memory", ir_promote_loop_memory_pass,
+     {IR_OPT_FEATURE_LOAD | IR_OPT_FEATURE_LABEL, IR_OPT_REQUIRE_NONE}},
     {"hoist_invariant_loads", ir_hoist_invariant_loads_pass,
      {IR_OPT_FEATURE_LOAD | IR_OPT_FEATURE_LABEL, IR_OPT_REQUIRE_NONE}},
     {"widen_subword_cast", ir_widen_subword_load_cast_pass,

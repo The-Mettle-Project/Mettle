@@ -3034,6 +3034,12 @@ $simdRuntimeCases = @(
     Path            = "tests/select_field_check.mettle"
     OutputMustMatch = "SELECT FIELD: ALL OK"
     IrMustMatch     = @("__fsel")
+  },
+  @{
+    Name            = "promote_loop_memory"
+    Path            = "tests/promote_loop_memory_check.mettle"
+    OutputMustMatch = "PROMOTE LOOP MEMORY: ALL OK"
+    IrMustMatch     = @("__prom_")
   }
 )
 

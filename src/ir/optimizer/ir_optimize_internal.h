@@ -461,6 +461,8 @@ int ir_select_adjacent_field_pass(IRFunction *function, int *changed);
 int ir_widen_subword_load_cast_pass(IRFunction *function, int *changed);
 /* Move a load no store in its loop can change into the preheader. */
 int ir_hoist_invariant_loads_pass(IRFunction *function, int *changed);
+/* Run a loop's only may-aliased memory word in a local; store back on exit. */
+int ir_promote_loop_memory_pass(IRFunction *function, int *changed);
 int ir_find_label_index(const IRFunction *function, const char *label,
                                size_t *out_index);
 int ir_find_last_writer_before(const IRFunction *function, size_t before_index,

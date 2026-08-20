@@ -1,0 +1,62 @@
+// Guard for loop-memory promotion: a counter that lives in a struct runs the
+// loop in a local and is stored back on the exit edge. The value after the
+// loop must be what the unpromoted loop leaves (checked against a shape the
+// pass refuses: the byte load through a second pointer may alias the counter).
+
+import "std/io";
+import "std/mem";
+
+struct Cursor {
+  pos: int32;
+  len: int32;
+}
+
+fn walk_promoted(c: Cursor*, step: int32) -> int32 {
+  var total: int32 = 0;
+  while (c->pos < c->len) {
+    c->pos = c->pos + step;
+    total = total + 1;
+  }
+  return total;
+}
+
+// Reference: the byte buffer may alias the Cursor, so promotion must refuse
+// this one and the loop keeps its loads and stores.
+fn walk_ref(c: Cursor*, buf: uint8*, step: int32) -> int32 {
+  var total: int32 = 0;
+  while (c->pos < c->len) {
+    c->pos = c->pos + step + (int32)buf[0] * 0;
+    total = total + 1;
+  }
+  return total;
+}
+
+fn main() -> int32 {
+  var a: Cursor;
+  var b: Cursor;
+  var buf: uint8* = malloc(16);
+  buf[0] = 0;
+  var fail: int32 = 0;
+
+  var step: int32 = 1;
+  while (step <= 7) {
+    a.pos = 3;
+    a.len = 1000;
+    b.pos = 3;
+    b.len = 1000;
+    var got: int32 = walk_promoted(&a, step);
+    var want: int32 = walk_ref(&b, buf, step);
+    if (got != want || a.pos != b.pos) {
+      fail = fail + 1;
+    }
+    step = step + 1;
+  }
+
+  free(buf);
+  if (fail == 0) {
+    println("PROMOTE LOOP MEMORY: ALL OK");
+    return 0;
+  }
+  println("PROMOTE FAILURES: {fail}");
+  return 1;
+}

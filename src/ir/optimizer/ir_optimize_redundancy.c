@@ -314,6 +314,32 @@ static void re_resolve_addr(const IRFunction *function, const REDefs *defs,
   }
 
   if (operand->kind == IR_OPERAND_SYMBOL && operand->name) {
+    /* A local written exactly once is as good as a temp: look through its one
+     * definition. Inlining rewrites every pointer parameter into this shape
+     * (`@__inl_N_param_p <- %t`), and stopping here made every inlined body
+     * opaque to the loop passes. */
+    const IRInstruction *def =
+        re_unique_def(function, defs, IR_OPERAND_SYMBOL, operand->name);
+    if (def && !re_symbol_is_aliasable(defs, operand->name)) {
+      if (def->op == IR_OP_ASSIGN && (def->lhs.kind == IR_OPERAND_TEMP ||
+                                      def->lhs.kind == IR_OPERAND_SYMBOL)) {
+        re_resolve_addr(function, defs, &def->lhs, out, depth + 1);
+        if (out->valid) {
+          return;
+        }
+      }
+      if (def->op == IR_OP_ADDRESS_OF && def->lhs.kind == IR_OPERAND_SYMBOL &&
+          def->lhs.name) {
+        out->valid = 1;
+        out->is_address_of = 1;
+        out->kind = IR_OPERAND_SYMBOL;
+        out->name = def->lhs.name;
+        out->offset = 0;
+        out->portable = 1;
+        out->aliasable = 0;
+        return;
+      }
+    }
     out->valid = 1;
     out->is_address_of = 0;
     out->kind = IR_OPERAND_SYMBOL;
@@ -1964,6 +1990,484 @@ int ir_hoist_invariant_loads_pass(IRFunction *function, int *changed) {
     if (ir_addr_taken_set_build(function, &addr_taken) &&
         re_collect_defs(function, &defs)) {
       moved = re_try_hoist_one_load(function, &defs, &addr_taken, changed);
+    }
+    re_map_destroy(&defs.defs);
+    re_map_destroy(&defs.def_at);
+    ir_temp_value_map_destroy(&addr_taken);
+    if (!moved) {
+      break;
+    }
+  }
+  return 1;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Promoting a loop-resident memory word to a local                            */
+/*                                                                             */
+/* Every parser in the suite walks `p->pos` through its loops: load it, test    */
+/* it, bump it, store it back, every iteration, because the counter lives in    */
+/* the Parser rather than in a register. When one region is the loop's only     */
+/* may-aliased traffic, the loop can run on a local instead: load once in the   */
+/* preheader, rewrite every load and store of the region to the local, and      */
+/* store back once on every exit edge.                                          */
+/*                                                                             */
+/* Sound when: the base is never reassigned; every write in the loop that       */
+/* could alias the region IS a store to exactly the region; no call or kernel   */
+/* sits in the loop; and the region is dereferenced unconditionally in the      */
+/* header prefix (the preheader load must be safe to execute when the loop      */
+/* body would never have run). Exit edges are split so the store-back runs      */
+/* once, on leaving, never per iteration.                                       */
+/* -------------------------------------------------------------------------- */
+
+typedef struct {
+  size_t at;      /* instruction index of the exiting branch/return */
+  int is_return;
+} REExit;
+
+#define RE_PROMOTE_MAX_EXITS 16
+#define RE_PROMOTE_MAX_SITES 48
+
+static int re_label_index_of(const IRFunction *function, const char *label,
+                             size_t *out) {
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_LABEL && ins->text && strcmp(ins->text, label) == 0) {
+      *out = i;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* One promotion per scan, same discipline as the load hoister: insertions
+ * stale the def-index map. Returns 1 when something moved. */
+static int re_try_promote_one(IRFunction *function, const REDefs *defs_in,
+                              const IRTempValueMap *addr_taken, int *changed) {
+  const REDefs defs = *defs_in;
+  static int counter;
+
+  for (size_t header = 0; header < function->instruction_count; header++) {
+    const IRInstruction *label = &function->instructions[header];
+    if (label->op != IR_OP_LABEL || !re_label_is_loop_header(label->text)) {
+      continue;
+    }
+    size_t latch = re_loop_latch(function, header);
+    if (!latch) {
+      continue;
+    }
+    if (header > 0) {
+      const IRInstruction *prev = &function->instructions[header - 1];
+      size_t p = header - 1;
+      while (p > 0 && prev->op == IR_OP_NOP) {
+        prev = &function->instructions[--p];
+      }
+      if (prev->op == IR_OP_JUMP || prev->op == IR_OP_RETURN ||
+          prev->op == IR_OP_BRANCH_ZERO || prev->op == IR_OP_BRANCH_EQ) {
+        continue;
+      }
+    }
+
+    /* Candidate regions are the stores' targets. Try each stored region whose
+     * base is a stable symbol. */
+    for (size_t s = header + 1; s < latch; s++) {
+      const IRInstruction *seed = &function->instructions[s];
+      REAddr region = {0};
+      if (seed->op != IR_OP_STORE || seed->rhs.kind != IR_OPERAND_INT) {
+        continue;
+      }
+      re_resolve_addr(function, &defs, &seed->dest, &region, 0);
+      if (getenv("METTLE_PROM_TRACE")) {
+        fprintf(stderr, "[prom] %s store@%zu valid=%d name=%s port=%d off=%lld kind=%d ao=%d\n",
+                function->name ? function->name : "?", s, region.valid,
+                region.name ? region.name : "-", region.portable,
+                region.offset, (int)region.kind, region.is_address_of);
+      }
+      if (!region.valid || !region.name || !region.portable ||
+          region.offset < 0 || region.offset >= 4096 ||
+          (region.kind == IR_OPERAND_TEMP && !region.is_address_of)) {
+        continue;
+      }
+      long long size = seed->rhs.int_value;
+      char region_base[RE_NAME_MAX + 1];
+      if (snprintf(region_base, sizeof(region_base), "%c%s",
+                   region.is_address_of ? '&' : 's',
+                   region.name) >= (int)sizeof(region_base)) {
+        continue;
+      }
+
+      /* Sweep the loop: every access that could alias the region must be a
+       * load or store of exactly the region; nothing else may write memory in
+       * a way that reaches it, and the loop takes no calls at all (a call
+       * could read the region through an escaped pointer AND would clobber
+       * the promoted local's freshness for it). */
+      size_t loads[RE_PROMOTE_MAX_SITES];
+      size_t stores[RE_PROMOTE_MAX_SITES];
+      size_t load_count = 0;
+      size_t store_count = 0;
+      REExit exits[RE_PROMOTE_MAX_EXITS];
+      size_t exit_count = 0;
+      int header_exit = -1;
+      int viable = 1;
+      int is_float = 0;
+      int float_bits = 0;
+      int is_unsigned = 0;
+      MtlcType *value_type = NULL;
+
+      for (size_t i = header + 1; i < latch && viable; i++) {
+        const IRInstruction *ins = &function->instructions[i];
+        if (ins->op == IR_OP_NOP) {
+          continue;
+        }
+        if (ins->op == IR_OP_LOAD || ins->op == IR_OP_STORE) {
+          REAddr a = {0};
+          const IROperand *ao =
+              ins->op == IR_OP_LOAD ? &ins->lhs : &ins->dest;
+          re_resolve_addr(function, &defs, ao, &a, 0);
+          char abase[RE_NAME_MAX + 1];
+          int resolvable =
+              a.valid && a.name &&
+              snprintf(abase, sizeof(abase), "%c%s",
+                       a.is_address_of ? '&' : 's',
+                       a.name) < (int)sizeof(abase);
+          long long asize =
+              ins->rhs.kind == IR_OPERAND_INT ? ins->rhs.int_value : RE_MEM_WHOLE;
+          REMemRegion probe = {resolvable ? abase : NULL, a.offset, asize};
+          if (!re_kill_hits(&probe, region_base, region.offset, size)) {
+            continue; /* provably elsewhere */
+          }
+          /* it may touch the region: it must BE the region, exactly */
+          if (!resolvable || strcmp(abase, region_base) != 0 ||
+              a.offset != region.offset || asize != size ||
+              ins->is_float != (load_count || store_count ? is_float
+                                                          : ins->is_float)) {
+            viable = 0;
+            break;
+          }
+          if (ins->op == IR_OP_LOAD) {
+            if (ins->dest.kind != IR_OPERAND_TEMP || !ins->dest.name ||
+                load_count >= RE_PROMOTE_MAX_SITES) {
+              viable = 0;
+              break;
+            }
+            loads[load_count++] = i;
+          } else {
+            if (store_count >= RE_PROMOTE_MAX_SITES) {
+              viable = 0;
+              break;
+            }
+            stores[store_count++] = i;
+          }
+          is_float = ins->is_float;
+          float_bits = ins->float_bits;
+          if (ins->op == IR_OP_LOAD) {
+            is_unsigned = ins->is_unsigned;
+            if (ins->value_type) {
+              value_type = ins->value_type;
+            }
+          }
+          continue;
+        }
+        {
+          char wbase[RE_NAME_MAX + 1];
+          long long woff, wsize;
+          if (re_instruction_write_region(function, &defs, addr_taken, ins,
+                                          wbase, sizeof(wbase), &woff,
+                                          &wsize)) {
+            REMemRegion probe = {wbase[0] ? wbase : NULL, woff, wsize};
+            if (re_kill_hits(&probe, region_base, region.offset, size)) {
+              viable = 0;
+              break;
+            }
+          }
+        }
+        if (ins->op == IR_OP_CALL || ins->op == IR_OP_CALL_INDIRECT) {
+          viable = 0;
+          break;
+        }
+        /* exits */
+        if (ins->op == IR_OP_RETURN) {
+          if (exit_count >= RE_PROMOTE_MAX_EXITS) {
+            viable = 0;
+            break;
+          }
+          exits[exit_count].at = i;
+          exits[exit_count].is_return = 1;
+          exit_count++;
+        } else if ((ins->op == IR_OP_JUMP || ins->op == IR_OP_BRANCH_ZERO ||
+                    ins->op == IR_OP_BRANCH_EQ) &&
+                   ins->text) {
+          size_t target = 0;
+          if (!re_label_index_of(function, ins->text, &target)) {
+            viable = 0;
+            break;
+          }
+          if (target <= header || target > latch) {
+            if (exit_count >= RE_PROMOTE_MAX_EXITS) {
+              viable = 0;
+              break;
+            }
+            exits[exit_count].at = i;
+            exits[exit_count].is_return = 0;
+            if ((size_t)i <= header) {
+              viable = 0;
+              break;
+            }
+            exit_count++;
+          }
+        }
+      }
+      if (getenv("METTLE_PROM_TRACE")) {
+        fprintf(stderr, "[prom]   viable=%d loads=%zu stores=%zu exits=%zu float=%d\n",
+                viable, load_count, store_count, exit_count, is_float);
+      }
+      /* One load and one store per iteration already pay: the load leaves
+       * the loop entirely and the store becomes a register move. */
+      if (!viable || store_count == 0 || load_count == 0 || exit_count == 0 ||
+          is_float) {
+        continue; /* float promotion left for later; int is the parser case */
+      }
+      (void)header_exit;
+      {
+        /* Split edges append their tails at the end of the function, which
+         * must therefore be unreachable by fall-through. */
+        size_t last = function->instruction_count;
+        while (last > 0 && function->instructions[last - 1].op == IR_OP_NOP) {
+          last--;
+        }
+        if (last == 0 ||
+            (function->instructions[last - 1].op != IR_OP_RETURN &&
+             function->instructions[last - 1].op != IR_OP_JUMP)) {
+      if (getenv("METTLE_PROM_TRACE")) {
+        fprintf(stderr, "[prom]   bail: no-terminator\n");
+      }
+          continue;
+        }
+      }
+
+      /* Preheader safety: the region itself must be dereferenced
+       * unconditionally in the header prefix. */
+      size_t prefix_end = latch;
+      for (size_t i = header + 1; i <= latch; i++) {
+        IROpcode op = function->instructions[i].op;
+        if (op == IR_OP_BRANCH_ZERO || op == IR_OP_BRANCH_EQ ||
+            op == IR_OP_JUMP || op == IR_OP_LABEL || op == IR_OP_RETURN) {
+          prefix_end = i;
+          break;
+        }
+      }
+      int safe = 0;
+      for (size_t k = 0; k < load_count && !safe; k++) {
+        safe = loads[k] < prefix_end;
+      }
+      for (size_t k = 0; k < store_count && !safe; k++) {
+        safe = stores[k] < prefix_end;
+      }
+      if (!safe) {
+      if (getenv("METTLE_PROM_TRACE")) {
+        fprintf(stderr, "[prom]   bail: prefix-unsafe\n");
+      }
+        continue;
+      }
+
+      /* Build the pieces. Local + address + initial load before the header;
+       * loads and stores in the loop become ASSIGNs; each exit edge gets a
+       * store-back (before a RETURN, or on a split edge for a branch). */
+      char local_name[48];
+      char addr_name[48];
+      snprintf(local_name, sizeof(local_name), "__prom_%d", counter);
+      snprintf(addr_name, sizeof(addr_name), "__proma_%d", counter);
+      counter++;
+
+      const char *type_name =
+          size == 8 ? "int64" : (is_unsigned ? "uint32" : "int32");
+      if (size != 4 && size != 8) {
+      if (getenv("METTLE_PROM_TRACE")) {
+        fprintf(stderr, "[prom]   bail: size\n");
+      }
+        continue;
+      }
+
+      IRInstruction pieces[4];
+      memset(pieces, 0, sizeof(pieces));
+      pieces[0].op = IR_OP_DECLARE_LOCAL;
+      pieces[0].dest = ir_operand_symbol(local_name);
+      pieces[0].text = mettle_strdup(type_name);
+      if (region.is_address_of) {
+        pieces[1].op = IR_OP_ADDRESS_OF;
+        pieces[1].dest = ir_operand_temp(addr_name);
+        pieces[1].lhs = ir_operand_symbol(region.name);
+        pieces[2].op = IR_OP_BINARY;
+        pieces[2].text = mettle_strdup("+");
+        pieces[2].dest = ir_operand_temp(addr_name);
+        pieces[2].lhs = ir_operand_temp(addr_name);
+        pieces[2].rhs = ir_operand_int(region.offset);
+      } else {
+        pieces[1].op = IR_OP_BINARY;
+        pieces[1].text = mettle_strdup("+");
+        pieces[1].dest = ir_operand_temp(addr_name);
+        pieces[1].lhs = ir_operand_symbol(region.name);
+        pieces[1].rhs = ir_operand_int(region.offset);
+        pieces[2].op = IR_OP_NOP;
+      }
+      pieces[3].op = IR_OP_LOAD;
+      pieces[3].dest = ir_operand_symbol(local_name);
+      pieces[3].lhs = ir_operand_temp(addr_name);
+      pieces[3].rhs = ir_operand_int(size);
+      pieces[3].is_unsigned = is_unsigned;
+      pieces[3].float_bits = float_bits;
+      pieces[3].value_type = value_type;
+      for (int k = 0; k < 4; k++) {
+        pieces[k].location = function->instructions[header].location;
+      }
+
+      size_t inserted = 0;
+      int failed = 0;
+      for (int k = 0; k < 4 && !failed; k++) {
+        if (pieces[k].op == IR_OP_NOP) {
+          continue;
+        }
+        if (!ir_function_insert_instruction(function, header + inserted,
+                                            &pieces[k])) {
+          failed = 1;
+        }
+        ir_instruction_destroy_storage(&pieces[k]);
+        if (!failed) {
+          inserted++;
+        }
+      }
+      if (failed) {
+        return 0;
+      }
+      header += inserted;
+      latch += inserted;
+      for (size_t k = 0; k < load_count; k++) {
+        loads[k] += inserted;
+      }
+      for (size_t k = 0; k < store_count; k++) {
+        stores[k] += inserted;
+      }
+      for (size_t k = 0; k < exit_count; k++) {
+        exits[k].at += inserted;
+      }
+
+      /* Rewrite the in-loop accesses. */
+      for (size_t k = 0; k < load_count; k++) {
+        IRInstruction *ld = &function->instructions[loads[k]];
+        IROperand dest = ir_operand_temp(ld->dest.name);
+        int keep_unsigned = ld->is_unsigned;
+        int keep_float_bits = ld->float_bits;
+        MtlcType *keep_type = ld->value_type;
+        ir_instruction_destroy_storage(ld);
+        memset(ld, 0, sizeof(*ld));
+        ld->op = IR_OP_ASSIGN;
+        ld->dest = dest;
+        ld->lhs = ir_operand_symbol(local_name);
+        ld->is_unsigned = keep_unsigned;
+        ld->float_bits = keep_float_bits;
+        ld->value_type = keep_type;
+      }
+      for (size_t k = 0; k < store_count; k++) {
+        IRInstruction *st = &function->instructions[stores[k]];
+        IROperand value = ir_operand_copy(&st->lhs);
+        ir_instruction_destroy_storage(st);
+        memset(st, 0, sizeof(*st));
+        st->op = IR_OP_ASSIGN;
+        st->dest = ir_operand_symbol(local_name);
+        st->lhs = value;
+      }
+
+      /* Store-backs. Returns take theirs inline; branch exits are split: the
+       * branch is retargeted to a fresh tail label that stores and jumps on.
+       * Inserting the tails at the end never disturbs loop indices. */
+      for (size_t k = 0; k < exit_count; k++) {
+        IRInstruction st = {0};
+        st.op = IR_OP_STORE;
+        st.dest = ir_operand_temp(addr_name);
+        st.lhs = ir_operand_symbol(local_name);
+        st.rhs = ir_operand_int(size);
+        st.location = function->instructions[exits[k].at].location;
+
+        if (exits[k].is_return) {
+          if (!ir_function_insert_instruction(function, exits[k].at, &st)) {
+            failed = 1;
+          }
+          ir_instruction_destroy_storage(&st);
+          if (failed) {
+            return 0;
+          }
+          /* shift every later site */
+          for (size_t m = 0; m < exit_count; m++) {
+            if (exits[m].at >= exits[k].at) {
+              exits[m].at++;
+            }
+          }
+          latch++;
+          continue;
+        }
+
+        IRInstruction *br = &function->instructions[exits[k].at];
+        char tail_name[64];
+        snprintf(tail_name, sizeof(tail_name), "__promx_%d_%zu", counter - 1,
+                 k);
+        char *old_target = mettle_strdup(br->text);
+        if (!old_target) {
+          ir_instruction_destroy_storage(&st);
+          return 0;
+        }
+        mettle_free_string(br->text);
+        br->text = mettle_strdup(tail_name);
+        if (!br->text) {
+          free(old_target);
+          ir_instruction_destroy_storage(&st);
+          return 0;
+        }
+
+        IRInstruction tail_label = {0};
+        IRInstruction tail_jump = {0};
+        tail_label.op = IR_OP_LABEL;
+        tail_label.text = mettle_strdup(tail_name);
+        tail_jump.op = IR_OP_JUMP;
+        tail_jump.text = old_target; /* takes ownership */
+        size_t end = function->instruction_count;
+        if (!tail_label.text ||
+            !ir_function_insert_instruction(function, end, &tail_label) ||
+            !ir_function_insert_instruction(function, end + 1, &st) ||
+            !ir_function_insert_instruction(function, end + 2, &tail_jump)) {
+          failed = 1;
+        }
+        ir_instruction_destroy_storage(&tail_label);
+        ir_instruction_destroy_storage(&st);
+        ir_instruction_destroy_storage(&tail_jump);
+        if (failed) {
+          return 0;
+        }
+      }
+
+      if (changed) {
+        *changed = 1;
+      }
+      return 1;
+    }
+  }
+  return 0;
+}
+
+int ir_promote_loop_memory_pass(IRFunction *function, int *changed) {
+  if (!function || function->instruction_count == 0) {
+    return 1;
+  }
+  for (;;) {
+    REDefs defs = {0};
+    IRTempValueMap addr_taken;
+    int moved = 0;
+    if (!ir_temp_value_map_init(&addr_taken)) {
+      return 1;
+    }
+    defs.function = function;
+    defs.addr_taken = &addr_taken;
+    if (ir_addr_taken_set_build(function, &addr_taken) &&
+        re_collect_defs(function, &defs)) {
+      moved = re_try_promote_one(function, &defs, &addr_taken, changed);
     }
     re_map_destroy(&defs.defs);
     re_map_destroy(&defs.def_at);
