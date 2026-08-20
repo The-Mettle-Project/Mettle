@@ -167,7 +167,7 @@ fn main() -> int32 {
   var add: Fn(int32) -> int32 = make_adder(10);
   println("{add(5)}");            // 15
   println("{apply_twice(add, 0)}"); // 20
-  println_int(make_adder(3)(5));  // 8 - the returned closure is called directly
+  println("{make_adder(3)(5)}");  // 8 - the returned closure is called directly
   return 0;
 }
 ```

@@ -38,9 +38,7 @@ fn fib(n: int32) -> int64 {
 }
 
 fn main() -> int32 {
-  print("fib(10) = ");
-  print_int(fib(10));
-  newline();
+  println("fib(10) = {fib(10)}");
   return 0;
 }
 ```

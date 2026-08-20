@@ -528,7 +528,7 @@ var add: fn(int32, int32) -> int32 = fn(x: int32, y: int32) -> int32 { return x 
 fn make_adder(n: int32) -> Fn(int32) -> int32 {
   return fn(x: int32) -> int32 { return x + n; };
 }
-println_int(make_adder(3)(5));   // 8
+println("{make_adder(3)(5)}");   // 8
 
 fn counter(start: int32) -> Fn() -> int32 {
   return fn() -> int32 { start = start + 1; return start; };   // persistent state
