@@ -13,10 +13,12 @@
  *     one the function never writes (a parameter, or the address of a local).
  *     Nothing can invalidate such an entry, so the walk back up the tree needs
  *     no un-invalidation.
- *   - Loads carry a memory generation. Anything that might write memory bumps
- *     it, and so does entering a block with more than one predecessor: a store
- *     on a path this walk never visits has to reach a merge that dominates the
- *     use, and the merge is where it gets accounted for.
+ *   - Every value read from memory carries the region it was read from, and
+ *     every write appends the region it wrote to a kill log. A store through
+ *     one base invalidates only what it can reach: same base and overlapping
+ *     offsets, or a base that might alias. Entering a block with more than one
+ *     predecessor accounts for the paths this walk never visits by requiring
+ *     survivors to be untouched by ANY store the function makes.
  *
  * Addresses are canonicalized to (base, byte offset) through the `%t = base +
  * k` chains the frontend emits for field access, so two reads of one field
@@ -440,12 +442,82 @@ static const char *re_dep_name(const IROperand *operand) {
 
 /* ------------------------------------------------------------- entry tables */
 
+#define RE_MEM_WHOLE (1LL << 40)
+
+/* One byte range of memory, named by the base it is reached through: '&name'
+ * is the storage of a variable, 's'/'t' + name is memory addressed by a
+ * pointer-valued symbol or temp. Two '&' bases with different names are
+ * distinct objects; every other pair may alias. */
+typedef struct {
+  char *base; /* NULL = every location */
+  long long off;
+  long long size;
+} REMemRegion;
+
+typedef struct {
+  REMemRegion *items;
+  size_t count;
+  size_t capacity;
+} REKillLog;
+
+static void re_kills_destroy(REKillLog *log) {
+  for (size_t i = 0; i < log->count; i++) {
+    free(log->items[i].base);
+  }
+  free(log->items);
+  log->items = NULL;
+  log->count = 0;
+  log->capacity = 0;
+}
+
+static int re_kills_append(REKillLog *log, const char *base, long long off,
+                           long long size) {
+  if (log->count == log->capacity) {
+    size_t capacity = log->capacity ? log->capacity * 2 : 16;
+    REMemRegion *grown = realloc(log->items, capacity * sizeof(REMemRegion));
+    if (!grown) {
+      return 0;
+    }
+    log->items = grown;
+    log->capacity = capacity;
+  }
+  REMemRegion *slot = &log->items[log->count];
+  slot->base = base ? mettle_strdup(base) : NULL;
+  if (base && !slot->base) {
+    return 0;
+  }
+  slot->off = off;
+  slot->size = size;
+  log->count++;
+  return 1;
+}
+
+/* Does a write to `kill` invalidate a value read from `mem`? */
+static int re_kill_hits(const REMemRegion *kill, const char *mem_base,
+                        long long mem_off, long long mem_size) {
+  if (!kill->base || !mem_base) {
+    return 1;
+  }
+  if (strcmp(kill->base, mem_base) == 0) {
+    return kill->off < mem_off + mem_size && mem_off < kill->off + kill->size;
+  }
+  if (kill->base[0] == '&' && mem_base[0] == '&') {
+    return 0; /* two distinct variables cannot overlap */
+  }
+  return 1;
+}
+
 typedef struct {
   char *key;
-  char *value;         /* the temp that already holds this value */
-  char *dep[2];        /* names the entry reads, for block-local invalidation */
-  unsigned generation; /* memory generation this entry was recorded at */
-  int volatile_value;  /* a memory write can change it: load, or aliasable read */
+  char *value;    /* the temp that already holds this value */
+  char *dep[2];   /* names the entry reads, for block-local invalidation */
+  char *mem_base; /* what the value was read from; NULL = anywhere */
+  long long mem_off;
+  long long mem_size;
+  size_t kill_pos;      /* kill-log length when recorded */
+  unsigned merge_epoch; /* merge count when recorded */
+  int survives_summary; /* no store anywhere in the function can change it */
+  int volatile_value;   /* a memory write can change it: load, aliasable read */
 } REEntry;
 
 /* Entries own their strings. A name borrowed from an operand dies the moment
@@ -455,10 +527,12 @@ static void re_entry_release(REEntry *entry) {
   free(entry->value);
   free(entry->dep[0]);
   free(entry->dep[1]);
+  free(entry->mem_base);
   entry->key = NULL;
   entry->value = NULL;
   entry->dep[0] = NULL;
   entry->dep[1] = NULL;
+  entry->mem_base = NULL;
 }
 
 typedef struct {
@@ -488,8 +562,10 @@ static void re_table_truncate(RETable *table, size_t mark) {
 }
 
 static int re_table_push(RETable *table, const char *key, const char *value,
-                         const char *dep0, const char *dep1,
-                         unsigned generation, int volatile_value) {
+                         const char *dep0, const char *dep1, int volatile_value,
+                         const char *mem_base, long long mem_off,
+                         long long mem_size, size_t kill_pos,
+                         unsigned merge_epoch, int survives_summary) {
   if (table->count == table->capacity) {
     size_t capacity = table->capacity ? table->capacity * 2 : 32;
     REEntry *grown = realloc(table->items, capacity * sizeof(REEntry));
@@ -505,22 +581,49 @@ static int re_table_push(RETable *table, const char *key, const char *value,
   entry->value = mettle_strdup(value);
   entry->dep[0] = dep0 ? mettle_strdup(dep0) : NULL;
   entry->dep[1] = dep1 ? mettle_strdup(dep1) : NULL;
+  entry->mem_base = mem_base ? mettle_strdup(mem_base) : NULL;
   if (!entry->key || !entry->value || (dep0 && !entry->dep[0]) ||
-      (dep1 && !entry->dep[1])) {
+      (dep1 && !entry->dep[1]) || (mem_base && !entry->mem_base)) {
     re_entry_release(entry);
     return 0;
   }
-  entry->generation = generation;
+  entry->mem_off = mem_off;
+  entry->mem_size = mem_size;
+  entry->kill_pos = kill_pos;
+  entry->merge_epoch = merge_epoch;
+  entry->survives_summary = survives_summary;
   entry->volatile_value = volatile_value;
   table->count++;
   return 1;
 }
 
+/* A volatile entry still holds its value when nothing written since it was
+ * recorded overlaps what it read: not one of the targeted kills behind it in
+ * the log, and, if a merge has been crossed (a path this walk never visited
+ * joins back in), nothing the whole function can store. */
+static int re_entry_valid(const REEntry *entry, const REKillLog *kills,
+                          unsigned merge_epoch) {
+  if (!entry->volatile_value) {
+    return 1;
+  }
+  if (entry->merge_epoch != merge_epoch && !entry->survives_summary) {
+    return 0;
+  }
+  for (size_t k = entry->kill_pos; k < kills->count; k++) {
+    if (re_kill_hits(&kills->items[k], entry->mem_base, entry->mem_off,
+                     entry->mem_size)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 static const char *re_table_lookup(const RETable *table, const char *key,
-                                   unsigned generation) {
+                                   const REKillLog *kills,
+                                   unsigned merge_epoch) {
   for (size_t i = table->count; i-- > 0;) {
     const REEntry *entry = &table->items[i];
-    if (entry->volatile_value && entry->generation != generation) {
+    if (!re_entry_valid(entry, kills, merge_epoch)) {
       continue;
     }
     if (strcmp(entry->key, key) == 0) {
@@ -701,12 +804,44 @@ typedef struct {
   size_t block_count;
   RETable global;
   RETable local;
-  unsigned generation;
+  REKillLog kills;      /* every write the walk has passed, in order */
+  REKillLog summary;    /* every targeted write anywhere in the function */
+  int summary_unknown;  /* the function has a write no region describes */
+  unsigned merge_epoch;
   int *changed;
   int failed;
 } REWalk;
 
-static int re_writes_memory(const REWalk *walk, const IRInstruction *ins) {
+/* What this instruction writes: 0 = nothing, 1 = the region in `out`
+ * (base NULL when it could be anywhere). */
+static int re_instruction_write_region(const IRFunction *function,
+                                       const REDefs *defs,
+                                       const IRTempValueMap *addr_taken,
+                                       const IRInstruction *ins, char *base,
+                                       size_t base_size, long long *off,
+                                       long long *size) {
+  base[0] = '\0';
+  *off = 0;
+  *size = RE_MEM_WHOLE;
+
+  if (ins->op == IR_OP_STORE) {
+    REAddr addr = {0};
+    re_resolve_addr(function, defs, &ins->dest, &addr, 0);
+    if (!addr.valid || !addr.name ||
+        snprintf(base, base_size, "%c%s",
+                 addr.is_address_of
+                     ? '&'
+                     : (addr.kind == IR_OPERAND_SYMBOL ? 's' : 't'),
+                 addr.name) >= (int)base_size) {
+      base[0] = '\0'; /* a store to somewhere: kill everything */
+      return 1;
+    }
+    *off = addr.offset;
+    *size = ins->rhs.kind == IR_OPERAND_INT ? ins->rhs.int_value
+                                            : RE_MEM_WHOLE;
+    return 1;
+  }
+
   switch (ins->op) {
   case IR_OP_NOP:
   case IR_OP_LABEL:
@@ -721,16 +856,21 @@ static int re_writes_memory(const REWalk *walk, const IRInstruction *ins) {
   case IR_OP_BINARY:
   case IR_OP_UNARY:
   case IR_OP_CAST:
-    break;
+    /* Writing a variable a pointer can reach (a global, or a local whose
+     * address escaped) is a store to that variable's storage. */
+    if (ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name &&
+        (ir_temp_value_map_lookup(addr_taken, ins->dest.name) ||
+         (!ir_function_symbol_is_parameter(function, ins->dest.name) &&
+          ir_function_local_declared_type(function, ins->dest.name) == NULL))) {
+      if (snprintf(base, base_size, "&%s", ins->dest.name) >= (int)base_size) {
+        base[0] = '\0';
+      }
+      return 1;
+    }
+    return 0;
   default:
-    return 1;
+    return 1; /* calls, kernels: anywhere */
   }
-  /* Writing a local whose address escaped is a memory write a load can see. */
-  if (ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name &&
-      ir_temp_value_map_lookup(walk->addr_taken, ins->dest.name)) {
-    return 1;
-  }
-  return 0;
 }
 
 static int re_load_key(const REWalk *walk, const IRInstruction *ins,
@@ -822,6 +962,21 @@ static void re_replace_with_copy(IRInstruction *ins, const char *value,
   ins->is_unsigned = is_unsigned;
 }
 
+/* Would any store the function makes, anywhere, hit this region? Decides
+ * whether an entry may outlive a merge point. */
+static int re_survives_summary(const REWalk *walk, const char *mem_base,
+                               long long mem_off, long long mem_size) {
+  if (walk->summary_unknown || !mem_base) {
+    return walk->summary.count == 0 && !walk->summary_unknown && mem_base;
+  }
+  for (size_t k = 0; k < walk->summary.count; k++) {
+    if (re_kill_hits(&walk->summary.items[k], mem_base, mem_off, mem_size)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 static void re_process_block(REWalk *walk, size_t block_index,
                              const REDom *dom) {
   if (walk->failed) {
@@ -832,9 +987,10 @@ static void re_process_block(REWalk *walk, size_t block_index,
   re_table_truncate(&walk->local, 0);
 
   /* A store on a path this walk never took has to reach a merge that dominates
-   * the use; the merge is here. */
+   * the use; the merge is here. Only entries no store in the whole function
+   * can touch may cross one. */
   if (block->predecessor_count != 1) {
-    walk->generation++;
+    walk->merge_epoch++;
   }
 
   for (size_t i = 0; i < block->instruction_count; i++) {
@@ -847,6 +1003,10 @@ static void re_process_block(REWalk *walk, size_t block_index,
         ins->op == IR_OP_UNARY || ins->op == IR_OP_CAST ||
         ins->op == IR_OP_ADDRESS_OF) {
       char key[RE_KEY_MAX];
+      char membuf[RE_NAME_MAX + 1];
+      const char *mem_base = NULL;
+      long long mem_off = 0;
+      long long mem_size = RE_MEM_WHOLE;
       REAddr addr = {0};
       int is_load = ins->op == IR_OP_LOAD;
       int portable = 0;
@@ -857,13 +1017,32 @@ static void re_process_block(REWalk *walk, size_t block_index,
       if (have_key) {
         if (is_load) {
           portable = addr.portable;
+          if (snprintf(membuf, sizeof(membuf), "%c%s",
+                       addr.is_address_of
+                           ? '&'
+                           : (addr.kind == IR_OPERAND_SYMBOL ? 's' : 't'),
+                       addr.name) < (int)sizeof(membuf)) {
+            mem_base = membuf;
+            mem_off = addr.offset;
+            mem_size = ins->rhs.int_value;
+          }
         } else {
-          volatile_value = re_operand_aliasable(walk->defs, &ins->lhs) ||
-                           re_operand_aliasable(walk->defs, &ins->rhs);
+          int lhs_alias = re_operand_aliasable(walk->defs, &ins->lhs);
+          int rhs_alias = re_operand_aliasable(walk->defs, &ins->rhs);
+          volatile_value = lhs_alias || rhs_alias;
+          if (lhs_alias != rhs_alias) {
+            const char *name = lhs_alias ? ins->lhs.name : ins->rhs.name;
+            if (snprintf(membuf, sizeof(membuf), "&%s", name) <
+                (int)sizeof(membuf)) {
+              mem_base = membuf;
+            }
+          }
         }
-        const char *hit = re_table_lookup(&walk->local, key, walk->generation);
+        const char *hit =
+            re_table_lookup(&walk->local, key, &walk->kills, walk->merge_epoch);
         if (!hit) {
-          hit = re_table_lookup(&walk->global, key, walk->generation);
+          hit = re_table_lookup(&walk->global, key, &walk->kills,
+                                walk->merge_epoch);
         }
         if (hit && ins->dest.name && strcmp(hit, ins->dest.name) != 0) {
           char *dest = mettle_strdup(ins->dest.name);
@@ -878,8 +1057,13 @@ static void re_process_block(REWalk *walk, size_t block_index,
           const char *dep0 = is_load ? (addr.is_address_of ? NULL : addr.name)
                                      : re_dep_name(&ins->lhs);
           const char *dep1 = is_load ? NULL : re_dep_name(&ins->rhs);
+          int survives =
+              volatile_value
+                  ? re_survives_summary(walk, mem_base, mem_off, mem_size)
+                  : 1;
           if (!re_table_push(&walk->local, key, ins->dest.name, dep0, dep1,
-                             walk->generation, volatile_value)) {
+                             volatile_value, mem_base, mem_off, mem_size,
+                             walk->kills.count, walk->merge_epoch, survives)) {
             walk->failed = 1;
             return;
           }
@@ -889,7 +1073,8 @@ static void re_process_block(REWalk *walk, size_t block_index,
           if (is_load && portable &&
               re_def_count(walk->defs, IR_OPERAND_TEMP, ins->dest.name) == 1 &&
               !re_table_push(&walk->global, key, ins->dest.name, NULL, NULL,
-                             walk->generation, volatile_value)) {
+                             volatile_value, mem_base, mem_off, mem_size,
+                             walk->kills.count, walk->merge_epoch, survives)) {
             walk->failed = 1;
             return;
           }
@@ -897,8 +1082,17 @@ static void re_process_block(REWalk *walk, size_t block_index,
       }
     }
 
-    if (re_writes_memory(walk, ins)) {
-      walk->generation++;
+    {
+      char wbase[RE_NAME_MAX + 1];
+      long long woff, wsize;
+      if (re_instruction_write_region(walk->function, walk->defs,
+                                      walk->addr_taken, ins, wbase,
+                                      sizeof(wbase), &woff, &wsize) &&
+          !re_kills_append(&walk->kills, wbase[0] ? wbase : NULL, woff,
+                           wsize)) {
+        walk->failed = 1;
+        return;
+      }
     }
     if (ir_instruction_writes_destination(ins) && ins->dest.name &&
         (ins->dest.kind == IR_OPERAND_TEMP ||
@@ -957,9 +1151,31 @@ int ir_redundancy_elimination_pass(IRFunction *function, int *changed) {
     walk.blocks = blocks;
     walk.block_count = block_count;
     walk.changed = changed;
-    re_process_block(&walk, function->entry_block, &dom);
+    /* The function-wide write summary: what a value must survive to be
+     * trusted across a merge point. */
+    for (size_t i = 0; i < function->instruction_count; i++) {
+      char wbase[RE_NAME_MAX + 1];
+      long long woff, wsize;
+      const IRInstruction *ins = &function->instructions[i];
+      if (ins->op == IR_OP_NOP ||
+          !re_instruction_write_region(function, &defs, &addr_taken, ins,
+                                       wbase, sizeof(wbase), &woff, &wsize)) {
+        continue;
+      }
+      if (!wbase[0]) {
+        walk.summary_unknown = 1;
+      } else if (!re_kills_append(&walk.summary, wbase, woff, wsize)) {
+        walk.failed = 1;
+        break;
+      }
+    }
+    if (!walk.failed) {
+      re_process_block(&walk, function->entry_block, &dom);
+    }
     re_table_destroy(&walk.global);
     re_table_destroy(&walk.local);
+    re_kills_destroy(&walk.kills);
+    re_kills_destroy(&walk.summary);
   }
 
   re_dom_destroy(&dom);
@@ -1491,5 +1707,270 @@ int ir_widen_subword_load_cast_pass(IRFunction *function, int *changed) {
   re_map_destroy(&defs.defs);
   re_map_destroy(&defs.def_at);
   ir_temp_value_map_destroy(&addr_taken);
+  return 1;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Hoisting loop-invariant loads                                               */
+/*                                                                             */
+/* skip_ws reads p->len and p->text every iteration, and no store in the loop   */
+/* can change either: the loop's one store goes to p->pos, a different offset   */
+/* off the same base. CSE cannot help -- there is only one load instruction,    */
+/* executed once per iteration -- so the load moves to the preheader.           */
+/*                                                                             */
+/* Soundness is the kill rule again: the load's region must survive every       */
+/* write between the header and the latch. Execution safety is separate: a      */
+/* hoisted load runs even when the loop body would not have, so the base must   */
+/* already be dereferenced by an access that runs unconditionally in the        */
+/* header's straight-line prefix, and the offset stays within a page of it.     */
+/* -------------------------------------------------------------------------- */
+
+static int re_label_is_loop_header(const char *text) {
+  return text && (strncmp(text, "ir_while_", 9) == 0 ||
+                  strstr(text, "_lbl_ir_while_") != NULL);
+}
+
+static size_t re_loop_latch(const IRFunction *function, size_t header) {
+  const char *label = function->instructions[header].text;
+  size_t latch = 0;
+  for (size_t i = header + 1; i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_JUMP && ins->text && strcmp(ins->text, label) == 0) {
+      latch = i;
+    }
+  }
+  return latch;
+}
+
+/* The writes the loop makes, as kill regions. 0 = something unknowable. */
+static int re_collect_loop_writes(const IRFunction *function,
+                                  const REDefs *defs,
+                                  const IRTempValueMap *addr_taken, size_t lo,
+                                  size_t hi, REKillLog *log) {
+  for (size_t i = lo; i <= hi; i++) {
+    char wbase[RE_NAME_MAX + 1];
+    long long woff, wsize;
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_NOP ||
+        !re_instruction_write_region(function, defs, addr_taken, ins, wbase,
+                                     sizeof(wbase), &woff, &wsize)) {
+      continue;
+    }
+    if (!wbase[0] || !re_kills_append(log, wbase, woff, wsize)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int re_region_survives_log(const REKillLog *log, const char *base,
+                                  long long off, long long size) {
+  for (size_t k = 0; k < log->count; k++) {
+    if (re_kill_hits(&log->items[k], base, off, size)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+/* One hoist per scan: an insertion moves every instruction behind it, which
+ * stales the def-index map the address resolver walks, so the caller rebuilds
+ * and rescans after each success. Returns 1 when a load moved. */
+static int re_try_hoist_one_load(IRFunction *function, const REDefs *defs_in,
+                                 const IRTempValueMap *addr_taken,
+                                 int *changed) {
+  const REDefs defs = *defs_in;
+  static int counter;
+
+  for (size_t header = 0; header < function->instruction_count; header++) {
+    const IRInstruction *label = &function->instructions[header];
+    if (label->op != IR_OP_LABEL || !re_label_is_loop_header(label->text)) {
+      continue;
+    }
+    size_t latch = re_loop_latch(function, header);
+    if (!latch) {
+      continue;
+    }
+    /* Control has to fall into the header for a preheader to exist. */
+    if (header > 0) {
+      const IRInstruction *prev = &function->instructions[header - 1];
+      size_t p = header - 1;
+      while (p > 0 && prev->op == IR_OP_NOP) {
+        prev = &function->instructions[--p];
+      }
+      if (prev->op == IR_OP_JUMP || prev->op == IR_OP_RETURN ||
+          prev->op == IR_OP_BRANCH_ZERO || prev->op == IR_OP_BRANCH_EQ) {
+        continue;
+      }
+    }
+
+    REKillLog writes = {0};
+    if (!re_collect_loop_writes(function, &defs, addr_taken, header + 1, latch,
+                                &writes)) {
+      re_kills_destroy(&writes);
+      continue;
+    }
+
+    /* The header's straight-line prefix runs on every entry to the loop; a
+     * base it dereferences is a base a hoisted load may touch. */
+    size_t prefix_end = latch;
+    for (size_t i = header + 1; i <= latch; i++) {
+      IROpcode op = function->instructions[i].op;
+      if (op == IR_OP_BRANCH_ZERO || op == IR_OP_BRANCH_EQ ||
+          op == IR_OP_JUMP || op == IR_OP_LABEL || op == IR_OP_RETURN) {
+        prefix_end = i;
+        break;
+      }
+    }
+
+    for (size_t i = header + 1; i < latch; i++) {
+      IRInstruction *load = &function->instructions[i];
+      REAddr addr = {0};
+      char membuf[RE_NAME_MAX + 1];
+      if (load->op != IR_OP_LOAD || load->dest.kind != IR_OPERAND_TEMP ||
+          !load->dest.name || load->rhs.kind != IR_OPERAND_INT) {
+        continue;
+      }
+      re_resolve_addr(function, &defs, &load->lhs, &addr, 0);
+      if (!addr.valid || !addr.name || !addr.portable || addr.offset < 0 ||
+          addr.offset >= 4096 ||
+          (addr.kind == IR_OPERAND_TEMP && !addr.is_address_of)) {
+        continue;
+      }
+      if (re_def_count(&defs, IR_OPERAND_TEMP, load->dest.name) != 1) {
+        continue;
+      }
+      if (snprintf(membuf, sizeof(membuf), "%c%s",
+                   addr.is_address_of ? '&' : 's',
+                   addr.name) >= (int)sizeof(membuf) ||
+          !re_region_survives_log(&writes, membuf, addr.offset,
+                                  load->rhs.int_value)) {
+        continue;
+      }
+
+      /* Dereferenceability: the prefix already touches this base, or this
+       * load IS in the prefix. */
+      int safe = i < prefix_end;
+      for (size_t k = header + 1; k < prefix_end && !safe; k++) {
+        const IRInstruction *acc = &function->instructions[k];
+        const IROperand *ao = acc->op == IR_OP_LOAD    ? &acc->lhs
+                              : acc->op == IR_OP_STORE ? &acc->dest
+                                                       : NULL;
+        REAddr pa = {0};
+        if (!ao) {
+          continue;
+        }
+        re_resolve_addr(function, &defs, ao, &pa, 0);
+        safe = pa.valid && pa.name && pa.is_address_of == addr.is_address_of &&
+               pa.kind == addr.kind && strcmp(pa.name, addr.name) == 0;
+      }
+      if (!safe) {
+        continue;
+      }
+
+      /* Preheader: %addr = base + off ; dest <- *%addr. The original load and
+       * its in-loop address chain go to the cleanups behind this pass. */
+      char addr_name[48];
+      snprintf(addr_name, sizeof(addr_name), "__licm_%d", counter++);
+      IRInstruction lead = {0};
+      IRInstruction body = {0};
+      size_t inserted = 0;
+      int failed = 0;
+
+      if (addr.is_address_of) {
+        lead.op = IR_OP_ADDRESS_OF;
+        lead.dest = ir_operand_temp(addr_name);
+        lead.lhs = ir_operand_symbol(addr.name);
+      } else {
+        lead.op = IR_OP_BINARY;
+        lead.text = mettle_strdup("+");
+        lead.dest = ir_operand_temp(addr_name);
+        lead.lhs = ir_operand_symbol(addr.name);
+        lead.rhs = ir_operand_int(0);
+      }
+      lead.location = load->location;
+      if (!ir_function_insert_instruction(function, header, &lead)) {
+        failed = 1;
+      }
+      ir_instruction_destroy_storage(&lead);
+      if (!failed) {
+        inserted++;
+        IRInstruction *moved = &function->instructions[i + inserted];
+        body.op = IR_OP_LOAD;
+        body.location = moved->location;
+        body.dest = ir_operand_temp(moved->dest.name);
+        body.lhs = ir_operand_temp(addr_name);
+        body.rhs = ir_operand_int(moved->rhs.int_value);
+        body.is_float = moved->is_float;
+        body.float_bits = moved->float_bits;
+        body.is_unsigned = moved->is_unsigned;
+        body.value_type = moved->value_type;
+        if (addr.offset != 0) {
+          /* fold the offset into the lead add */
+          IRInstruction *lead_in = &function->instructions[header];
+          if (lead_in->op == IR_OP_BINARY) {
+            lead_in->rhs.int_value = addr.offset;
+          } else {
+            /* address-of base: append the offset with a second add */
+            IRInstruction add = {0};
+            add.op = IR_OP_BINARY;
+            add.text = mettle_strdup("+");
+            add.dest = ir_operand_temp(addr_name);
+            add.lhs = ir_operand_temp(addr_name);
+            add.rhs = ir_operand_int(addr.offset);
+            add.location = body.location;
+            if (!ir_function_insert_instruction(function, header + 1, &add)) {
+              failed = 1;
+            }
+            ir_instruction_destroy_storage(&add);
+            if (!failed) {
+              inserted++;
+            }
+          }
+        }
+      }
+      if (!failed &&
+          ir_function_insert_instruction(function, header + inserted, &body)) {
+        inserted++;
+        ir_instruction_make_nop(&function->instructions[i + inserted]);
+        if (changed) {
+          *changed = 1;
+        }
+      }
+      ir_instruction_destroy_storage(&body);
+      re_kills_destroy(&writes);
+      return failed ? 0 : 1;
+    }
+    re_kills_destroy(&writes);
+  }
+  return 0;
+}
+
+int ir_hoist_invariant_loads_pass(IRFunction *function, int *changed) {
+  if (!function || function->instruction_count == 0) {
+    return 1;
+  }
+  /* Bounded: every hoist moves one load out of at least one loop, and a load
+   * can only move outward as many times as loops enclose it. */
+  for (;;) {
+    REDefs defs = {0};
+    IRTempValueMap addr_taken;
+    int moved = 0;
+    if (!ir_temp_value_map_init(&addr_taken)) {
+      return 1;
+    }
+    defs.function = function;
+    defs.addr_taken = &addr_taken;
+    if (ir_addr_taken_set_build(function, &addr_taken) &&
+        re_collect_defs(function, &defs)) {
+      moved = re_try_hoist_one_load(function, &defs, &addr_taken, changed);
+    }
+    re_map_destroy(&defs.defs);
+    re_map_destroy(&defs.def_at);
+    ir_temp_value_map_destroy(&addr_taken);
+    if (!moved) {
+      break;
+    }
+  }
   return 1;
 }
