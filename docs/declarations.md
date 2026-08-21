@@ -124,6 +124,12 @@ effect only under `-O` / `--release` (a note reminds you when contracts go
 unverified in a debug build); `@test` is the exception, since it changes what
 is compiled in every build.
 
+Decorators do **not** reach device code. In a GPU module (`--emit-ptx` /
+`--emit-spirv`) they are parsed and type-checked, but the device pipeline does
+not run the inliner, so `@inline` has no effect and `@inline!` passes while its
+call site survives. See
+[GPU Offload](gpu.md#decorators-do-not-reach-device-code-yet).
+
 ### `@pure` and loop-invariant call hoisting
 
 When a `@pure` function is called inside a loop with arguments that do not

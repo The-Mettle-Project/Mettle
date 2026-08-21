@@ -68,6 +68,21 @@ external calls, host launches from device code, and calling a kernel as a normal
 function are rejected by a shared IR call-graph verifier, so the rule is the
 same for every frontend and GPU backend.
 
+### Decorators do not reach device code yet
+
+[Function decorators](declarations.md#function-decorators) are parsed and
+type-checked in a GPU module, but the device pipeline does not act on them. A
+device helper is emitted as a `.func` and called through `call.uni` whether or
+not it carries `@inline`, and `@inline!` — which fails the build at any
+surviving call site on the host — currently passes while the call site
+survives. Do not read a clean `--emit-ptx` of an `@inline!` helper as proof it
+was inlined.
+
+This matters more on the device than the host: a `.func` call means the PTX
+call ABI's parameter space and a register allocation that stops at the call
+boundary, paid per work item. Until it is wired up, write device helpers small
+enough that you do not mind the call, or inline them by hand.
+
 ### Static and launch-sized workgroup memory, private memory, and barriers
 
 Kernels can allocate statically sized scalar arrays in semantic address spaces:

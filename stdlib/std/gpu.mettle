@@ -78,7 +78,7 @@ extern fn __mtlc_gpu_release(block: uint8*) = "free";
 
 // std/gpu depends on the driver and Mettle's runtime, so it converts its string
 // literals rather than importing std/io for cstr.
-fn __mtlc_gpu_cstr(s: string) -> cstring { return s.chars; }
+@inline fn __mtlc_gpu_cstr(s: string) -> cstring { return s.chars; }
 
 fn __mtlc_gpu_note(text: string) {
   __mtlc_gpu_fputs(text.chars, __mtlc_gpu_iob(2));
@@ -296,7 +296,7 @@ export fn gpu_module_ex(ptx_image: uint8*, status_out: int32*) -> int64 {
 
 // The driver's JIT log from the last gpu_module/gpu_module_ex call, or an
 // empty string when the load succeeded quietly.
-export fn gpu_jit_log() -> cstring { return (cstring)&g_gpu_jit_log[0]; }
+@inline export fn gpu_jit_log() -> cstring { return (cstring)&g_gpu_jit_log[0]; }
 
 // Read a PTX file and load it. This is the boilerplate every host program was
 // writing by hand -- open, size, read, terminate, load -- with each failure
@@ -348,7 +348,7 @@ export fn gpu_malloc(bytes: int64) -> int64 {
   if (cuMemAlloc_v2(&dptr, bytes) != 0) { return 0; }
   return dptr;
 }
-export fn gpu_free(dptr: int64) -> int32 { return cuMemFree_v2(dptr); }
+@inline export fn gpu_free(dptr: int64) -> int32 { return cuMemFree_v2(dptr); }
 
 // Managed memory is especially important on integrated UMA systems such as
 // GB10: this returns one pointer value usable by both the Arm host and kernels.
@@ -359,7 +359,7 @@ export fn gpu_managed_malloc(bytes: int64) -> uint8* {
   if (cuMemAllocManaged(&ptr, bytes, 1) != 0) { return (uint8*)0; }
   return (uint8*)ptr;
 }
-export fn gpu_managed_free(ptr: uint8*) -> int32 {
+@inline export fn gpu_managed_free(ptr: uint8*) -> int32 {
   return cuMemFree_v2((int64)ptr);
 }
 
@@ -370,7 +370,7 @@ export fn gpu_malloc_async(bytes: int64, stream: int64) -> int64 {
   if (cuMemAllocAsync(&ptr, bytes, stream) != 0) { return 0; }
   return ptr;
 }
-export fn gpu_free_async(ptr: int64, stream: int64) -> int32 {
+@inline export fn gpu_free_async(ptr: int64, stream: int64) -> int32 {
   return cuMemFreeAsync(ptr, stream);
 }
 export fn gpu_host_mapped_malloc(bytes: int64, dev_ptr_out: int64*) -> uint8* {
@@ -385,31 +385,31 @@ export fn gpu_host_mapped_malloc(bytes: int64, dev_ptr_out: int64*) -> uint8* {
   dev_ptr_out[0] = dp;
   return (uint8*)hp;
 }
-export fn gpu_host_free(ptr: uint8*) -> int32 { return cuMemFreeHost((int64)ptr); }
-export fn gpu_to_device(dst: int64, src: uint8*, bytes: int64) -> int32 {
+@inline export fn gpu_host_free(ptr: uint8*) -> int32 { return cuMemFreeHost((int64)ptr); }
+@inline export fn gpu_to_device(dst: int64, src: uint8*, bytes: int64) -> int32 {
   return cuMemcpyHtoD_v2(dst, src, bytes);
 }
-export fn gpu_to_host(dst: uint8*, src: int64, bytes: int64) -> int32 {
+@inline export fn gpu_to_host(dst: uint8*, src: int64, bytes: int64) -> int32 {
   return cuMemcpyDtoH_v2(dst, src, bytes);
 }
-export fn gpu_sync() -> int32 { return cuCtxSynchronize(); }
+@inline export fn gpu_sync() -> int32 { return cuCtxSynchronize(); }
 
 export fn gpu_stream_create() -> int64 {
   var stream: int64 = 0;
   if (cuStreamCreate(&stream, 1) != 0) { return 0; } // CU_STREAM_NON_BLOCKING
   return stream;
 }
-export fn gpu_stream_destroy(stream: int64) -> int32 {
+@inline export fn gpu_stream_destroy(stream: int64) -> int32 {
   return cuStreamDestroy_v2(stream);
 }
-export fn gpu_stream_sync(stream: int64) -> int32 {
+@inline export fn gpu_stream_sync(stream: int64) -> int32 {
   return cuStreamSynchronize(stream);
 }
-export fn gpu_to_device_async(dst: int64, src: uint8*, bytes: int64,
+@inline export fn gpu_to_device_async(dst: int64, src: uint8*, bytes: int64,
                               stream: int64) -> int32 {
   return cuMemcpyHtoDAsync_v2(dst, src, bytes, stream);
 }
-export fn gpu_to_host_async(dst: uint8*, src: int64, bytes: int64,
+@inline export fn gpu_to_host_async(dst: uint8*, src: int64, bytes: int64,
                             stream: int64) -> int32 {
   return cuMemcpyDtoHAsync_v2(dst, src, bytes, stream);
 }
@@ -419,24 +419,24 @@ export fn gpu_event_create() -> int64 {
   if (cuEventCreate(&event, 0) != 0) { return 0; }
   return event;
 }
-export fn gpu_event_destroy(event: int64) -> int32 {
+@inline export fn gpu_event_destroy(event: int64) -> int32 {
   return cuEventDestroy_v2(event);
 }
-export fn gpu_event_record(event: int64, stream: int64) -> int32 {
+@inline export fn gpu_event_record(event: int64, stream: int64) -> int32 {
   return cuEventRecord(event, stream);
 }
-export fn gpu_event_sync(event: int64) -> int32 {
+@inline export fn gpu_event_sync(event: int64) -> int32 {
   return cuEventSynchronize(event);
 }
-export fn gpu_stream_wait_event(stream: int64, event: int64) -> int32 {
+@inline export fn gpu_stream_wait_event(stream: int64, event: int64) -> int32 {
   return cuStreamWaitEvent(stream, event, 0);
 }
-export fn gpu_event_elapsed_ms(start: int64, finish: int64,
+@inline export fn gpu_event_elapsed_ms(start: int64, finish: int64,
                                ms_out: float32*) -> int32 {
   return cuEventElapsedTime(ms_out, start, finish);
 }
 
-export fn gpu_device_attribute(device: int32, attribute: int32,
+@inline export fn gpu_device_attribute(device: int32, attribute: int32,
                                value_out: int32*) -> int32 {
   return cuDeviceGetAttribute(value_out, attribute, device);
 }
@@ -444,7 +444,7 @@ export fn gpu_device_attribute(device: int32, attribute: int32,
 // Low-level 1-D status-returning helper. The semantic `dispatch` path uses the
 // checked 3-D provider ABI below; call this directly when the host wants to
 // inspect CUDA's status itself.
-export fn gpu_launch(f: int64, grid: int32, block: int32,
+@inline export fn gpu_launch(f: int64, grid: int32, block: int32,
                           params: int64*, nargs: int32) -> int32 {
   return cuLaunchKernel(f, (uint32)grid, 1, 1, (uint32)block, 1, 1,
                         0, 0, params, (int64*)0);
@@ -452,7 +452,7 @@ export fn gpu_launch(f: int64, grid: int32, block: int32,
 
 // Backend-neutral launch shape used by runtime/frontends that need full CUDA,
 // HIP, or SPIR-V dimensionality. This CUDA provider maps it to cuLaunchKernel.
-export fn gpu_launch_3d(f: int64,
+@inline export fn gpu_launch_3d(f: int64,
                         gx: int32, gy: int32, gz: int32,
                         bx: int32, by: int32, bz: int32,
                         shared_bytes: int32, stream: int64,
@@ -486,7 +486,7 @@ export fn mtlc_gpu_launch_checked(f: int64,
   __mtlc_gpu_process_exit(rc);
 }
 
-export fn gpu_launch_on(f: int64, grid: int32, block: int32,
+@inline export fn gpu_launch_on(f: int64, grid: int32, block: int32,
                         stream: int64, params: int64*, nargs: int32) -> int32 {
   return gpu_launch_3d(f, grid, 1, 1, block, 1, 1, 0, stream,
                        params, nargs);
@@ -512,7 +512,7 @@ export fn gpu_launch_on(f: int64, grid: int32, block: int32,
 // makes one capture serve every token.
 
 // Begin capturing `stream`. Returns 0 on success, the driver status otherwise.
-export fn gpu_graph_capture_begin(stream: int64) -> int32 {
+@inline export fn gpu_graph_capture_begin(stream: int64) -> int32 {
   return cuStreamBeginCapture_v2(stream, 1); // THREAD_LOCAL
 }
 
@@ -530,11 +530,11 @@ export fn gpu_graph_capture_end(stream: int64) -> int64 {
   return exec;
 }
 
-export fn gpu_graph_launch(exec: int64, stream: int64) -> int32 {
+@inline export fn gpu_graph_launch(exec: int64, stream: int64) -> int32 {
   return cuGraphLaunch(exec, stream);
 }
 
-export fn gpu_graph_destroy(exec: int64) -> int32 {
+@inline export fn gpu_graph_destroy(exec: int64) -> int32 {
   return cuGraphExecDestroy(exec);
 }
 
@@ -566,7 +566,7 @@ export fn gpu_module_bind(mod: int64) -> int64 {
   return previous;
 }
 
-export fn gpu_module_bound() -> int64 { return g_gpu_bound_module; }
+@inline export fn gpu_module_bound() -> int64 { return g_gpu_bound_module; }
 
 // Resolve (and cache) a kernel handle for typed dispatch. Terminates the
 // process on failure: a launch of a kernel the module does not define cannot
