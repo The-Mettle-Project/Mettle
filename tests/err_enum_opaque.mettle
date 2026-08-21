@@ -1,0 +1,17 @@
+enum Color { Red, Green, Blue }
+enum Role { User, Admin }
+
+fn take(c: Color) -> int32 { return 1; }
+
+fn main() -> int32 {
+  var n: int32 = Green;
+  var c: Color = 2;
+  var r: Role = Red;
+  var k: int32 = take(Admin);
+  var m: int32 = Red + 1;
+  var same: bool = Red == User;
+  var ok_cast: int32 = (int32)Blue;
+  var ok_back: Color = (Color)1;
+  var ok_cmp: bool = c == Blue;
+  return n + k + m + ok_cast + (int32)ok_back;
+}

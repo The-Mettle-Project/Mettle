@@ -118,6 +118,11 @@ int type_checker_are_compatible(Type *type1, Type *type2);
 void type_checker_init_builtin_types(TypeChecker *checker);
 Type *type_checker_get_type_by_name(TypeChecker *checker, const char *name);
 int type_checker_is_integer_type(Type *type);
+int type_checker_is_discrete_type(Type *type);
+int type_checker_register_variant_constructor(TypeChecker *checker, Type *te,
+                                              const char *enum_name,
+                                              const char *variant_name,
+                                              size_t index);
 int type_checker_is_floating_type(Type *type);
 int type_checker_is_numeric_type(Type *type);
 

@@ -3,11 +3,11 @@ import "enum_module";
 fn main() -> int32 {
   var c: Color = Green;
   switch (c) {
-    case 0:
+    case Red:
       return 0;
-    case 1:
+    case Green:
       return 1;
-    case 2:
+    case Blue:
       return 0;
     default:
       return 0;

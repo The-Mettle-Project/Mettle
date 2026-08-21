@@ -347,19 +347,62 @@ int type_checker_process_tagged_enum(TypeChecker *checker,
     return 0;
   }
 
-  // Register a constructor symbol for each variant
   for (size_t i = 0; i < enum_decl->variant_count; i++) {
-    Symbol *ctor = symbol_create(enum_decl->variants[i].name,
-                                 SYMBOL_TAGGED_ENUM_CONSTRUCTOR, te);
-    if (!ctor)
+    if (!type_checker_register_variant_constructor(
+            checker, te, enum_decl->name, enum_decl->variants[i].name, i)) {
       return 0;
-    ctor->data.constructor.enum_type = te;
-    ctor->data.constructor.tag_value = (int)i;
-    ctor->data.constructor.payload_type = te->tagged_variant_payloads[i];
-    ctor->is_initialized = 1;
-    symbol_table_insert(checker->symbol_table, ctor);
+    }
   }
 
+  return 1;
+}
+
+static Symbol *type_checker_make_variant_constructor(Type *te,
+                                                     const char *name,
+                                                     size_t index) {
+  Symbol *ctor = symbol_create(name, SYMBOL_TAGGED_ENUM_CONSTRUCTOR, te);
+  if (!ctor) {
+    return NULL;
+  }
+  ctor->data.constructor.enum_type = te;
+  ctor->data.constructor.tag_value = (int)index;
+  ctor->data.constructor.payload_type = te->tagged_variant_payloads[index];
+  ctor->is_initialized = 1;
+  return ctor;
+}
+
+/* Every variant gets two constructor symbols. `Enum__Variant` is unique to
+ * its enum and is what a qualified `Enum.Variant(...)` resolves to. The bare
+ * `Variant` is a convenience that belongs to whichever enum declared it
+ * first, so a second enum reusing the name keeps its own qualified symbol and
+ * leaves the bare one alone. */
+int type_checker_register_variant_constructor(TypeChecker *checker, Type *te,
+                                              const char *enum_name,
+                                              const char *variant_name,
+                                              size_t index) {
+  size_t qualified_len = strlen(enum_name) + 2 + strlen(variant_name) + 1;
+  char *qualified = malloc(qualified_len);
+  if (!qualified) {
+    return 0;
+  }
+  snprintf(qualified, qualified_len, "%s__%s", enum_name, variant_name);
+  if (!symbol_table_lookup(checker->symbol_table, qualified)) {
+    Symbol *ctor = type_checker_make_variant_constructor(te, qualified, index);
+    if (!ctor) {
+      free(qualified);
+      return 0;
+    }
+    symbol_table_insert(checker->symbol_table, ctor);
+  }
+  free(qualified);
+  if (!symbol_table_lookup(checker->symbol_table, variant_name)) {
+    Symbol *ctor =
+        type_checker_make_variant_constructor(te, variant_name, index);
+    if (!ctor) {
+      return 0;
+    }
+    symbol_table_insert(checker->symbol_table, ctor);
+  }
   return 1;
 }
 
@@ -459,22 +502,11 @@ Type *type_checker_instantiate_generic_enum(TypeChecker *checker,
   }
   symbol_table_insert(checker->symbol_table, enum_sym);
 
-  // Constructors use variant-qualified names: mangled__VariantName
   for (size_t i = 0; i < tmpl->variant_count; i++) {
-    // Also register bare variant names if not already in scope
-    // (bare names are variant constructors for the first instantiation seen)
-    Symbol *existing_ctor = symbol_table_lookup(
-        checker->symbol_table, tmpl->variants[i].name);
-    if (!existing_ctor) {
-      Symbol *ctor = symbol_create(tmpl->variants[i].name,
-                                   SYMBOL_TAGGED_ENUM_CONSTRUCTOR, te);
-      if (ctor) {
-        ctor->data.constructor.enum_type = te;
-        ctor->data.constructor.tag_value = (int)i;
-        ctor->data.constructor.payload_type = te->tagged_variant_payloads[i];
-        ctor->is_initialized = 1;
-        symbol_table_insert(checker->symbol_table, ctor);
-      }
+    if (!type_checker_register_variant_constructor(
+            checker, te, te->name, tmpl->variants[i].name, i)) {
+      type_destroy(te);
+      return NULL;
     }
   }
 

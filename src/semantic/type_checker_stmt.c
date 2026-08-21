@@ -613,7 +613,7 @@ int type_checker_check_switch_statement(TypeChecker *checker,
           checker, switch_stmt->expression->location, switch_type)) {
     return 0;
   }
-  if (!type_checker_is_integer_type(switch_type)) {
+  if (!type_checker_is_discrete_type(switch_type)) {
     type_checker_report_type_mismatch(checker,
                                       switch_stmt->expression->location,
                                       "integer type", switch_type->name);
@@ -695,7 +695,7 @@ int type_checker_check_switch_statement(TypeChecker *checker,
         free(case_values);
         return 0;
       }
-      if (!type_checker_is_integer_type(case_type)) {
+      if (!type_checker_is_discrete_type(case_type)) {
         type_checker_report_type_mismatch(checker,
                                           case_clause->value->location,
                                           "integer type", case_type->name);
@@ -771,7 +771,7 @@ int type_checker_check_switch_statement(TypeChecker *checker,
           free(case_values);
           return 0;
         }
-        if (!type_checker_is_integer_type(high_type) ||
+        if (!type_checker_is_discrete_type(high_type) ||
             !type_checker_is_assignable_from(checker, switch_type, high_type,
                                              case_clause->value_high)) {
           type_checker_report_assign_mismatch(checker, case_clause->value_high,

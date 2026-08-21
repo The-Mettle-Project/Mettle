@@ -374,7 +374,7 @@ var b: Direction = East;
 
 **Underlying type:** Enums use `int64` as the underlying representation. This affects struct layout and C interop: a struct field of enum type is 8 bytes, aligned to 8.
 
-**Casting integers to enums:** Implicit narrowing allows assigning an integer to an enum variable when the types are compatible (e.g. `var d: Direction = 2`). For values read from C APIs or switch results, assign directly when the integer type narrows to the enum or use an explicit cast (e.g. `(Direction)val`) to force the conversion.
+**Enums are opaque.** An enum is its own type, distinct from every integer type and from every other enum. Nothing converts implicitly in either direction: `var n: int32 = North;`, `var d: Direction = 2;`, `North + 1`, and `if (d == 0)` are all compile errors, and so is passing a `Direction` where a `Color` is expected or comparing the two. A `switch` on an enum takes variant names as its cases. The only way across the boundary is a written cast: `(int64)d` reads the variant's value, and `(Direction)val` builds an enum from an integer read from a C API or a file. The cast is the one place where a reader can see that a number is being trusted to be a member of the set.
 
 Enums can be compared with integers and used in `switch` cases. They can be exported for use in other modules (see [Declarations](declarations.md)).
 
@@ -746,9 +746,8 @@ known: `var b: uint8 = 200;` is fine, and `var h: int32 = 2654435761;` is
 [M0118](diagnostics.md), naming the value and the range it missed. Two
 destinations sit outside the rule because they are not range conversions:
 `bool` is a truth coercion (a comparison yields `int32`, and
-`var b: bool = x > y;` stores it), and an enum names a set. An enum flowing the
-other way is checked exactly, it converts implicitly when every declared
-member fits.
+`var b: bool = x > y;` stores it), and an enum names a set, so it takes part
+in no integer conversion at all; see [Enum Types](#enum-types).
 
 Floating-point conversions (`float32` to `float64` and back) remain implicit in
 both directions. There is no implicit conversion between integers and floats, or

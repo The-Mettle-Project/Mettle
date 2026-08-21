@@ -1929,6 +1929,7 @@ $cases = @(
   @{ Name = "err_continue_in_switch"; Path = "tests/err_continue_in_switch.mettle"; ShouldSucceed = $false; Pattern = "'continue' can only be used inside a loop" },
   @{ Name = "err_switch_range_inverted"; Path = "tests/err_switch_range_inverted.mettle"; ShouldSucceed = $false; Pattern = "Range lower bound" },
   @{ Name = "err_switch_duplicate_case"; Path = "tests/err_switch_duplicate_case.mettle"; ShouldSucceed = $false; Pattern = "Duplicate case value|duplicate case" },
+  @{ Name = "err_enum_opaque"; Path = "tests/err_enum_opaque.mettle"; ShouldSucceed = $false; Pattern = "(?s)expected 'int32', found 'Color'.*expected 'Color', found 'int32'.*expected 'Role', found 'Color'.*expected 'Color', found 'Role'.*expected 'numeric type', found 'Color'.*Cannot compare 'Color' with 'Role'" },
   @{ Name = "err_switch_nonconst_case"; Path = "tests/err_switch_nonconst_case.mettle"; ShouldSucceed = $false; Pattern = "compile-time integer constant expression" },
   @{ Name = "err_forward_decl_mismatch"; Path = "tests/err_forward_decl_mismatch.mettle"; ShouldSucceed = $false; Pattern = "does not match existing declaration" },
   @{ Name = "err_forward_decl_pointer_mismatch"; Path = "tests/err_forward_decl_pointer_mismatch.mettle"; ShouldSucceed = $false; Pattern = "does not match existing declaration" },

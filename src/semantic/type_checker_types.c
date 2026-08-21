@@ -503,6 +503,8 @@ int type_checker_types_equal(const Type *lhs, const Type *rhs) {
     return lhs->array_size == rhs->array_size &&
            type_checker_types_equal(lhs->base_type, rhs->base_type);
   case TYPE_STRUCT:
+  case TYPE_ENUM:
+  case TYPE_TAGGED_ENUM:
     if (lhs->name && rhs->name) {
       return strcmp(lhs->name, rhs->name) == 0;
     }
@@ -802,11 +804,15 @@ int type_checker_is_integer_type(Type *type) {
   case TYPE_UINT64:
   case TYPE_BOOL:
   case TYPE_CHAR:
-  case TYPE_ENUM:
     return 1;
   default:
     return 0;
   }
+}
+
+int type_checker_is_discrete_type(Type *type) {
+  return type_checker_is_integer_type(type) ||
+         (type && type->kind == TYPE_ENUM);
 }
 
 int type_checker_is_floating_type(Type *type) {
@@ -940,6 +946,11 @@ int type_checker_is_cast_valid(Type *from, Type *to) {
   // Numeric <-> numeric
   if (type_checker_is_numeric_type(from) && type_checker_is_numeric_type(to))
     return 1;
+
+  if ((from->kind == TYPE_ENUM && type_checker_is_integer_type(to)) ||
+      (type_checker_is_integer_type(from) && to->kind == TYPE_ENUM)) {
+    return 1;
+  }
 
   // Pointer <-> pointer
   if (from->kind == TYPE_POINTER && to->kind == TYPE_POINTER)
@@ -1191,7 +1202,7 @@ int type_checker_is_implicitly_convertible(Type *from_type, Type *to_type) {
    * y;` stores), and an enum names a set rather than a range. */
   if (type_checker_is_integer_type(from_type) &&
       type_checker_is_integer_type(to_type)) {
-    if (to_type->kind == TYPE_BOOL || to_type->kind == TYPE_ENUM) {
+    if (to_type->kind == TYPE_BOOL) {
       return 1;
     }
     return type_checker_int_conversion_is_value_preserving(from_type, to_type);

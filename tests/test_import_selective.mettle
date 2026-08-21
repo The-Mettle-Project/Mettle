@@ -2,6 +2,6 @@ import { answer, make_pair, total, Pair, Magic } from "namespaced_math";
 
 fn main() -> int32 {
   var kind: Magic = FortyTwo;
-  var pair: Pair* = make_pair(answer(), kind - 40);
+  var pair: Pair* = make_pair(answer(), (int32)kind - 40);
   return total(pair);
 }

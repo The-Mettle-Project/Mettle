@@ -12,5 +12,5 @@ static_assert(Green == 2);
 static_assert(Blue == 10);
 
 fn main() -> int32 {
-  return (int32)(Red + Green + Blue);
+  return (int32)Red + (int32)Green + (int32)Blue;
 }

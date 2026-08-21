@@ -2352,8 +2352,24 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
       if (recv_id && recv_id->name) {
         Symbol *recv_sym = type_checker_resolve_identifier(checker, recv_id);
         if (recv_sym && recv_sym->kind == SYMBOL_ENUM) {
-          /* Drop the receiver, leak-free: the identifier node is owned by
-           * the AST tree and freed when the program is freed. */
+          const char *enum_name =
+              recv_sym->type && recv_sym->type->name ? recv_sym->type->name
+                                                     : recv_sym->name;
+          size_t qualified_len =
+              strlen(enum_name) + 2 + strlen(call->function_name) + 1;
+          char *qualified = malloc(qualified_len);
+          if (!qualified) {
+            return NULL;
+          }
+          snprintf(qualified, qualified_len, "%s__%s", enum_name,
+                   call->function_name);
+          if (symbol_table_lookup(checker->symbol_table, qualified)) {
+            if (!string_is_interned(call->function_name)) {
+              free(call->function_name);
+            }
+            call->function_name = (char *)string_intern(qualified);
+          }
+          free(qualified);
           call->object = NULL;
         }
       }

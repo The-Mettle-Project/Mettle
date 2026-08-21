@@ -2,7 +2,7 @@ import "namespaced_math" as math;
 
 fn main() -> int32 {
   var kind: math.Magic = math.FortyTwo;
-  var pair: math.Pair* = math.make_pair(math.answer(), math.FortyTwo - 40);
+  var pair: math.Pair* = math.make_pair(math.answer(), (int32)math.FortyTwo - 40);
 
   if (kind != math.FortyTwo) {
     return 0;
