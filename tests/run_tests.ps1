@@ -10225,6 +10225,50 @@ catch {
   Write-CaseResult -Name "gpu_detect_target_agrees" -Passed $false -Reason $_.Exception.Message
 }
 
+# Decorators have to mean the same thing on the device as on the host. A device
+# helper left out of line is a PTX `.func` reached by `call.uni` -- parameter
+# space and a register allocation that stops at the call, paid per work item --
+# so `@inline` matters more here, and `@inline!` cannot claim to fail a build on
+# one target and shrug on another.
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $decPtx = Join-Path $tmpDir "device_decorators.ptx"
+  $decOut = & $CompilerPath -O --emit-ptx --gpu-arch=portable `
+    "tests/gpu/device_decorators.mettle" -o $decPtx 2>&1 | Out-String
+  # `@inline!` fails the build at any surviving call site, so getting here at
+  # all is half the assertion.
+  if ($LASTEXITCODE -ne 0) { throw "device decorators did not compile: $decOut" }
+  $decText = Get-Content -Raw $decPtx
+  foreach ($absorbed in @("inline_helper", "contract_helper")) {
+    if ($decText -match "\.func[^\r\n]*$absorbed\(") {
+      throw "$absorbed was left out of line despite its inline decorator"
+    }
+    if ($decText -match "call\.uni[^\r\n]*$absorbed") {
+      throw "$absorbed still has a device call site"
+    }
+  }
+  if ($decText -notmatch "\.func[^\r\n]*kept_helper\(" -or
+      $decText -notmatch "call\.uni[^\r\n]*kept_helper") {
+    throw "@noinline did not keep kept_helper as a device call"
+  }
+  # Without -O the decorators are inert, exactly as on the host: the helpers
+  # stay real device functions.
+  $plainPtx = Join-Path $tmpDir "device_decorators_plain.ptx"
+  $plainOut = & $CompilerPath --emit-ptx --gpu-arch=portable `
+    "tests/gpu/device_decorators.mettle" -o $plainPtx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "unoptimized device decorators failed: $plainOut" }
+  $plainText = Get-Content -Raw $plainPtx
+  if ($plainText -notmatch "\.func[^\r\n]*inline_helper\(") {
+    throw "an unoptimized build inlined a device helper"
+  }
+  Write-CaseResult -Name "gpu_device_decorators" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "gpu_device_decorators" -Passed $false -Reason $_.Exception.Message
+}
+
 # `--emit-kernel-decls` writes the host-side declaration of every kernel it
 # compiled. The point of generating them is that a host cannot drift from the
 # module it launches, so the generated text has to be Mettle a host can

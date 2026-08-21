@@ -657,7 +657,68 @@ static int ir_optimize_portable_program_pipeline(
   }
 
   ir_explain_set_program(program);
-  for (size_t i = 0; i < program->function_count; i++) {
+
+  /* Inlining, for device modules only. It matters more here than on the host:
+   * a helper left out of line is a PTX `.func` reached by `call.uni`, which
+   * means the call ABI's parameter space plus a register allocation that stops
+   * at the call boundary -- a cost every work item pays. The GPU call-graph
+   * verifier above has already rejected recursion and indirect calls, so what
+   * reaches this point is a DAG of direct calls.
+   *
+   * Restricted to `gpu_only` rather than every target-neutral compile: the
+   * AArch64 path shares this pipeline, and its inlining policy is its own
+   * question. */
+  if (gpu_only && (!options || !options->preserve_function_boundaries) &&
+      !ir_pass_name_is_skipped("inline_small_functions")) {
+    int inlining_changed = 0;
+    mettle_compiler_ctx_set_pass_name("inline_small_functions");
+    mettle_compiler_ctx_set_fixpoint_iteration(0);
+    double t0 = ir_pass_time_begin();
+    if (!ir_inline_small_functions_pass(program, &inlining_changed)) {
+      mettle_compiler_ice("IR optimization inlining pass failed");
+    }
+    ir_pass_time_end("inline_small_functions [program]", t0);
+
+    if (inlining_changed) {
+      /* Inlining rewrites bodies, so every derived structure is stale. The
+       * per-function stage below reads the CFG, and the reachability filter
+       * reads the call graph: a helper every caller absorbed has no callers
+       * left and is no longer device code. Rebuild both before either is
+       * consulted again. */
+      for (size_t i = 0; i < program->function_count; i++) {
+        if (program->functions[i] &&
+            !ir_function_rebuild_cfg(program->functions[i])) {
+          ok = 0;
+        }
+      }
+      ir_gpu_call_graph_destroy(&graph);
+      memset(&graph, 0, sizeof(graph));
+      graph_error = NULL;
+      if (ok &&
+          !ir_program_build_gpu_call_graph(program, &graph, &graph_error)) {
+        fprintf(stderr, "GPU optimization eligibility failed: %s\n",
+                graph_error ? graph_error : "invalid device module");
+        free(graph_error);
+        ir_optimize_note_user_error();
+        ok = 0;
+      }
+    }
+  }
+
+  /* `@pure` loop-invariant call hoisting, after inlining so a body the caller
+   * absorbed is hoisted as ordinary loop-invariant code instead. */
+  if (ok && gpu_only && !ir_pass_name_is_skipped("hoist_pure_calls")) {
+    int pure_licm_changed = 0;
+    mettle_compiler_ctx_set_pass_name("hoist_pure_calls");
+    mettle_compiler_ctx_set_fixpoint_iteration(0);
+    double t0 = ir_pass_time_begin();
+    if (!ir_hoist_pure_calls_pass(program, &pure_licm_changed)) {
+      mettle_compiler_ice("IR optimization pure-call hoisting pass failed");
+    }
+    ir_pass_time_end("hoist_pure_calls [program]", t0);
+  }
+
+  for (size_t i = 0; ok && i < program->function_count; i++) {
     if (gpu_only && (!graph.reachable || !graph.reachable[i])) continue;
     IRFunction *function = program->functions[i];
     ir_set_current_function_context(function);
@@ -667,6 +728,15 @@ static int ir_optimize_portable_program_pipeline(
       break;
     }
   }
+
+  /* `@inline!` is a contract: a surviving call site fails the build. It cannot
+   * mean that on one target and nothing on another. */
+  if (ok && gpu_only && (!options || !options->preserve_function_boundaries) &&
+      !ir_inline_enforce_contracts(program)) {
+    ir_optimize_note_user_error();
+    ok = 0;
+  }
+
   ir_explain_set_program(NULL);
   ir_gpu_call_graph_destroy(&graph);
   ir_explain_flush();

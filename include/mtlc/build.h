@@ -169,6 +169,36 @@ int mtlc_builder_declare_function(MtlcBuilder *builder, const char *name,
                                   const MtlcType *const *param_types,
                                   size_t param_count);
 
+/* ---- inlining policy ----
+ *
+ * The optimizer decides for itself which calls to inline. These say otherwise,
+ * and are the neutral form of the reference frontend's `@inline` / `@inline!` /
+ * `@noinline` / `@pure` decorators. Each returns 1 on success, 0 for a NULL or
+ * failed `fn`. They take effect only when the module is optimized.
+ *
+ * They matter most in a GPU module, where a helper left out of line becomes a
+ * device function reached by a real call: the call ABI's parameter space plus a
+ * register allocation that stops at the call boundary, paid once per work item.
+ */
+
+/* Force `fn` past the inliner's size, parameter-count and call-count
+ * heuristics. Structural refusals (recursion above all) still apply. */
+int mtlc_fn_set_inline(MtlcFn *fn);
+
+/* As mtlc_fn_set_inline, and a contract: a surviving call site fails the
+ * build. */
+int mtlc_fn_set_inline_required(MtlcFn *fn);
+
+/* Never inline `fn`. This is how a helper is kept as a real call -- a device
+ * function in a GPU module, its own symbol on the host. */
+int mtlc_fn_set_noinline(MtlcFn *fn);
+
+/* Assert that `fn` is free of side effects and safe to evaluate
+ * speculatively, which lets the optimizer hoist a loop-invariant call out of
+ * a loop and reuse the one result. Trusted, not verified: asserting it of a
+ * function that writes observable state is a program error. */
+int mtlc_fn_set_pure(MtlcFn *fn);
+
 /* Define a GPU entry-point function. Kernel entry points always return void
  * and accept only POD scalar parameters or pointers to POD scalars. Unlike an
  * ordinary mtlc_builder_function definition, a kernel is exported as a device

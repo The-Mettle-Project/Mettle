@@ -606,6 +606,9 @@ static MtlcModule *build_gpu_module(void) {
   mtlc_return(scale_value,
               mtlc_binary(scale_value, "*", mtlc_fn_param(scale_value, 0),
                           mtlc_const_float(scale_value, f32, 2.0), f32));
+  /* Asserted below to reach PTX as a device function with a real call
+   * site, so the case has to say it must stay out of line. */
+  mtlc_fn_set_noinline(scale_value);
 
   const char *load_names[] = {"p"};
   const MtlcType *load_types[] = {pf32};
@@ -614,6 +617,9 @@ static MtlcModule *build_gpu_module(void) {
   MtlcValue loaded = mtlc_load(load_scaled, mtlc_fn_param(load_scaled, 0), f32);
   mtlc_return(load_scaled,
               mtlc_call(load_scaled, "scale_value", &loaded, 1, f32));
+  /* Asserted below to reach PTX as a device function with a real call
+   * site, so the case has to say it must stay out of line. */
+  mtlc_fn_set_noinline(load_scaled);
 
   const char *store_names[] = {"p", "x"};
   const MtlcType *store_types[] = {pf32, f32};
@@ -622,16 +628,25 @@ static MtlcModule *build_gpu_module(void) {
   mtlc_store(store_value, mtlc_fn_param(store_value, 0),
              mtlc_fn_param(store_value, 1), f32);
   mtlc_return(store_value, MTLC_NO_VALUE);
+  /* Asserted below to reach PTX as a device function with a real call
+   * site, so the case has to say it must stay out of line. */
+  mtlc_fn_set_noinline(store_value);
 
   const char *narrow_names[] = {"x"};
   const MtlcType *i8_types[] = {i8};
   MtlcFn *identity_i8 = mtlc_builder_function(
       b, "identity_i8", i8, narrow_names, i8_types, 1, 0);
   mtlc_return(identity_i8, mtlc_fn_param(identity_i8, 0));
+  /* Asserted below to reach PTX as a device function with a real call
+   * site, so the case has to say it must stay out of line. */
+  mtlc_fn_set_noinline(identity_i8);
   const MtlcType *u16_types[] = {u16};
   MtlcFn *identity_u16 = mtlc_builder_function(
       b, "identity_u16", u16, narrow_names, u16_types, 1, 0);
   mtlc_return(identity_u16, mtlc_fn_param(identity_u16, 0));
+  /* Asserted below to reach PTX as a device function with a real call
+   * site, so the case has to say it must stay out of line. */
+  mtlc_fn_set_noinline(identity_u16);
 
   /* A collective inside an ordinary helper remains frontend-neutral. The
    * shared call-graph verifier propagates the uniform flag from every call
@@ -649,6 +664,9 @@ static MtlcModule *build_gpu_module(void) {
                  &reduced_value, 1, u32);
   mtlc_label(conditional_reduce, "collective_skip");
   mtlc_return(conditional_reduce, MTLC_NO_VALUE);
+  /* Asserted below to reach PTX as a device function with a real call
+   * site, so the case has to say it must stay out of line. */
+  mtlc_fn_set_noinline(conditional_reduce);
 
   MtlcFn *k = mtlc_builder_kernel(b, "scale2", pn, pt, 3);
   /* Explicit semantic intrinsic: proves a non-Mettle frontend never has to

@@ -568,7 +568,13 @@ int ir_instruction_vector_append_move(IRInstructionVector *vector,
   }
 
   vector->items[vector->count++] = *instruction;
-  /* A move: the vector now owns the tensor block, so the source must not. */
+  /* A move: the vector now owns every heap block the instruction carried, so
+   * the source must not. `argument_types` is one of them -- it is a separate
+   * allocation from `arguments`, and leaving it behind here left the moved
+   * copy pointing at memory the caller's destroy sweep then freed. Only a
+   * frontend that supplies typed call arguments (the public builder does;
+   * Mettle source does not) ever fills that array, which is why the dangling
+   * read stayed hidden. */
   instruction->tensor = NULL;
   instruction->op = IR_OP_NOP;
   instruction->dest = ir_operand_none();
@@ -576,6 +582,7 @@ int ir_instruction_vector_append_move(IRInstructionVector *vector,
   instruction->rhs = ir_operand_none();
   instruction->text = NULL;
   instruction->arguments = NULL;
+  instruction->argument_types = NULL;
   instruction->argument_count = 0;
   instruction->is_float = 0;
   instruction->ast_ref = NULL;

@@ -68,20 +68,34 @@ external calls, host launches from device code, and calling a kernel as a normal
 function are rejected by a shared IR call-graph verifier, so the rule is the
 same for every frontend and GPU backend.
 
-### Decorators do not reach device code yet
+### Decorators on device code
 
-[Function decorators](declarations.md#function-decorators) are parsed and
-type-checked in a GPU module, but the device pipeline does not act on them. A
-device helper is emitted as a `.func` and called through `call.uni` whether or
-not it carries `@inline`, and `@inline!` — which fails the build at any
-surviving call site on the host — currently passes while the call site
-survives. Do not read a clean `--emit-ptx` of an `@inline!` helper as proof it
-was inlined.
+[Function decorators](declarations.md#function-decorators) apply to device
+helpers under `-O`, and they buy more here than on the host. A helper left out
+of line becomes a PTX `.func` reached by `call.uni`: the call ABI's parameter
+space, plus a register allocation that stops at the call boundary, paid once
+per work item.
 
-This matters more on the device than the host: a `.func` call means the PTX
-call ABI's parameter space and a register allocation that stops at the call
-boundary, paid per work item. Until it is wired up, write device helpers small
-enough that you do not mind the call, or inline them by hand.
+```mettle
+@inline fn scale(alpha: float32, x: float32) -> float32 { return alpha * x; }
+
+@noinline fn table_lookup(table: float32*, k: int32) -> float32 { /* ... */ }
+```
+
+`@inline` absorbs the helper into every kernel that calls it; `@inline!` fails
+the build at any call site that survives, the same contract it carries on the
+host; and `@noinline` is how a helper stays a real device call. Recursion and
+indirect calls are already rejected in device code, so what the inliner sees is
+a plain DAG of direct calls.
+
+`@pure` hoists a loop-invariant call out of a kernel's loop. A helper that
+writes nothing gets the same treatment by inference, so `@pure` is what you
+write when the callee could fault — a load through a pointer — and you want it
+hoisted anyway.
+
+A frontend driving libmtlc directly reaches all four through
+`mtlc_fn_set_inline`, `mtlc_fn_set_inline_required`, `mtlc_fn_set_noinline`,
+and `mtlc_fn_set_pure`.
 
 ### Static and launch-sized workgroup memory, private memory, and barriers
 

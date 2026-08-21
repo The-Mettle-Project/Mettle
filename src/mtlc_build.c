@@ -31,6 +31,7 @@ typedef struct {
   int is_kernel;
 } FnDecl;
 
+
 struct MtlcFn {
   IRFunction *ir;      /* borrowed; owned by the program */
   MtlcBuilder *builder;
@@ -222,6 +223,36 @@ const char *mtlc_builder_error(const MtlcBuilder *builder) {
 
 int mtlc_fn_ok(const MtlcFn *fn) {
   return fn && fn->builder && !fn->builder->error;
+}
+
+/* Inlining policy, the neutral form of the reference frontend's decorators.
+ * `@inline` and `@noinline` are opposites, so each clears the other rather
+ * than leaving the optimizer to arbitrate between two contradictory flags. */
+int mtlc_fn_set_inline(MtlcFn *fn) {
+  if (!mtlc_fn_ok(fn) || !fn->ir) return 0;
+  fn->ir->is_inline = 1;
+  fn->ir->is_noinline = 0;
+  return 1;
+}
+
+int mtlc_fn_set_inline_required(MtlcFn *fn) {
+  if (!mtlc_fn_set_inline(fn)) return 0;
+  fn->ir->is_inline_contract = 1;
+  return 1;
+}
+
+int mtlc_fn_set_noinline(MtlcFn *fn) {
+  if (!mtlc_fn_ok(fn) || !fn->ir) return 0;
+  fn->ir->is_noinline = 1;
+  fn->ir->is_inline = 0;
+  fn->ir->is_inline_contract = 0;
+  return 1;
+}
+
+int mtlc_fn_set_pure(MtlcFn *fn) {
+  if (!mtlc_fn_ok(fn) || !fn->ir) return 0;
+  fn->ir->is_pure = 1;
+  return 1;
 }
 
 void mtlc_builder_global(MtlcBuilder *builder, const char *name,

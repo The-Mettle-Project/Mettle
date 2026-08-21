@@ -20,8 +20,11 @@ extern fn gpu_barrier() = "gpu_barrier";
 fn ordinary_function_not_entry(x: int32) -> int32 { return x + 1; }
 
 // Ordinary functions become device-callable only when reached by a kernel.
-// No backend-specific source annotation is required.
-fn scale_value(alpha: float32, x: float32) -> float32 {
+// No backend-specific source annotation is required. `@noinline` is what keeps
+// this one a call at all: device code is inlined like host code under -O, so
+// without it the helper would vanish into saxpy and the case would no longer
+// prove that a helper can be lowered as a PTX `.func`.
+@noinline fn scale_value(alpha: float32, x: float32) -> float32 {
   return alpha * x;
 }
 

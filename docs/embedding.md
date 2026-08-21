@@ -78,6 +78,21 @@ mtlc_optimize(ctx, module);
 /* optional: mtlc_context_set_ml_opt(ctx, 1); mtlc_apply_ml_opt(ctx, module, NULL); */
 ```
 
+The optimizer decides for itself which calls to inline. Four builder calls
+override that, and they are the neutral form of the reference frontend's
+decorators:
+
+```c
+mtlc_fn_set_inline(helper);           /* past the size/count heuristics */
+mtlc_fn_set_inline_required(helper);  /* and fail the build on a surviving call */
+mtlc_fn_set_noinline(helper);         /* keep it a real call */
+mtlc_fn_set_pure(helper);             /* hoist loop-invariant calls out of loops */
+```
+
+They matter most in a GPU module: a device helper left out of line becomes a
+call whose ABI cost every work item pays. `mtlc_fn_set_noinline` is how a
+frontend keeps one deliberately.
+
 ## 3. Emit code
 
 Emit a relocatable object, or go all the way to a native executable (on Windows
