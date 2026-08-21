@@ -1,0 +1,39 @@
+// Hardware-free guard for the std/gpu host surface: bring-up, the module
+// loaders that report why a load failed, driver-status text, and the device
+// queries a server sizes its launches from. Nothing here runs a kernel; the
+// point is that every one of these still compiles and type-checks, because a
+// stdlib that stops compiling is a GPU story that stops existing.
+import "std/gpu";
+
+fn main() -> int32 {
+  // Bring-up, on the default device and on a chosen one.
+  var context: int64 = gpu_init();
+  var second: int64 = gpu_init_on(1);
+  if (context == 0 && second == 0) { return 0; }
+
+  // The one-call form, and the pieces it is made of.
+  var ready: int32 = gpu_open("kernels.ptx");
+  var also: int32 = gpu_open_on(0, "kernels.ptx");
+  var module: int64 = gpu_module_file("kernels.ptx");
+  var status: int32 = 0;
+  var image: uint8[16];
+  var direct: int64 = gpu_module_ex(&image[0], &status);
+  var log: cstring = gpu_jit_log();
+  var name: cstring = gpu_error_name(status);
+  var text: cstring = gpu_error_text(status);
+  if (ready + also == 0 && module + direct == 0 && log == 0 && name == 0 && text == 0) {
+    return 1;
+  }
+
+  // What this machine has, asked at run time.
+  var buffer: uint8[128];
+  var device: string = gpu_device_name(0, &buffer[0], 128);
+  var total: int64 = gpu_total_memory(0);
+  var counted: int32 = gpu_device_count() + gpu_sm_count(0) + gpu_warp_size(0);
+  counted = counted + gpu_max_threads_per_block(0);
+  counted = counted + gpu_max_shared_memory_per_block(0);
+  counted = counted + gpu_is_integrated(0) + gpu_compute_capability(0);
+  counted = counted + gpu_driver_version();
+  if (device.length > (uint64)0 && total > 0 && counted > 0) { return 0; }
+  return 0;
+}

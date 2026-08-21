@@ -6,7 +6,7 @@
 //   block_dim.x   blockDim.x       grid_dim.x    gridDim.x
 // (they lower to target-neutral index intrinsics; no declaration is required).
 
-kernel vadd(a: float32*, b: float32*, c: float32*, n: int32) {
+kernel(block = 256) vadd(a: float32*, b: float32*, c: float32*, n: int32) {
   var i: int32 = block.x * block_dim.x + thread.x;
   if (i < n) {
     c[i] = a[i] + b[i];

@@ -415,9 +415,37 @@ Raw bindings cover context/device queries, module loading, device/managed and
 stream-ordered allocation, blocking/asynchronous copies, streams, events,
 kernel launch, and synchronization.
 
+Getting running (`gpu_open` is the whole of bring-up; each failure below it
+writes what happened to stderr):
+
+- `gpu_open(ptx_path: cstring) -> int32`: initialize CUDA on device 0, load the
+  PTX file, and bind its kernel names for `dispatch`. `1` when ready, `0` after
+  reporting why not. `gpu_open_on(ordinal, path)` chooses the device.
+- `gpu_module_file(path: cstring) -> int64`: read a PTX file and load it,
+  naming a missing file, an empty one, or a JIT failure.
+- `gpu_module_ex(image: uint8*, status_out: int32*) -> int64`: the same load
+  with the driver's status handed back instead of reported.
+- `gpu_jit_log() -> cstring`: the driver's PTX JIT log from the last load.
+- `gpu_error_name(status) -> cstring` / `gpu_error_text(status) -> cstring`:
+  a `CUresult` as `CUDA_ERROR_INVALID_PTX` and as the driver's own sentence.
+
+What this machine has, at run time (`mettle --gpu-info` answers the same
+questions at build time):
+
+- `gpu_device_count()`, `gpu_sm_count(ordinal)`, `gpu_warp_size(ordinal)`,
+  `gpu_max_threads_per_block(ordinal)`,
+  `gpu_max_shared_memory_per_block(ordinal)`, `gpu_is_integrated(ordinal)`,
+  `gpu_driver_version()`.
+- `gpu_compute_capability(ordinal) -> int32`: `major * 10 + minor`, so `120`
+  is `sm_120`.
+- `gpu_total_memory(ordinal) -> int64`.
+- `gpu_device_name(ordinal, buffer: uint8*, capacity: int32) -> string`: the
+  name, as a borrowed view over `buffer`.
+
 Helpers (return handles directly; `0` on failure):
 
 - `gpu_init() -> int64`: initialize CUDA on device 0 and create a context.
+  `gpu_init_on(ordinal)` chooses the device.
 - `gpu_module(ptx_image: uint8*) -> int64`: load a module from a
   null-terminated PTX image in host memory.
 - `gpu_func(mod: int64, name: cstring) -> int64`: resolve a kernel by name.
@@ -432,7 +460,8 @@ Helpers (return handles directly; `0` on failure):
 - `gpu_sync()`: wraps `cuCtxSynchronize`.
 - `mtlc_gpu_launch_checked`: stable checked provider ABI used by semantic
   [`dispatch`](gpu.md); the CUDA provider maps its 3-D launch descriptor to
-  `cuLaunchKernel` and terminates on enqueue failure.
+  `cuLaunchKernel`, and a refused enqueue names the kernel, the grid and block
+  it was given, and the driver's status before terminating.
 - `gpu_launch(f, grid, block, params, nargs)`: low-level asynchronous 1-D
   helper returning CUDA's status for manual error handling.
 - `gpu_launch_on` and `gpu_launch_3d`: explicit stream, 3-D geometry, and

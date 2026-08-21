@@ -1166,6 +1166,17 @@ int mettle_run_process(const char *program, const char *const *arguments) {
   return (int)status;
 }
 
+/* CreateProcessA does not consult PATH for its application-name argument, so
+ * the shell has to be resolved to a real path before the child is asked for.
+ * COMSPEC first, then a PATH search, so an unusual but working environment is
+ * honoured before the conventional one. */
+static int mt_resolve_command_shell(char *buffer, mt_u32 size) {
+  mt_u32 length = GetEnvironmentVariableA("COMSPEC", buffer, size);
+  if (length > 0 && length < size) return 1;
+  length = SearchPathA(MT_NULL, "cmd.exe", MT_NULL, size, buffer, MT_NULL);
+  return length > 0 && length < size;
+}
+
 void *popen(const char *command, const char *mode) {
   void *read_pipe = MT_NULL;
   void *write_pipe = MT_NULL;
@@ -1174,8 +1185,10 @@ void *popen(const char *command, const char *mode) {
   MtProcessInfo process;
   MtFile *file = MT_NULL;
   char *command_line = MT_NULL;
+  char shell[512];
   const char prefix[] = "cmd.exe /S /C ";
   if (!command || !mode || mode[0] != 'r' || mode[1] != 0) return MT_NULL;
+  if (!mt_resolve_command_shell(shell, sizeof(shell))) return MT_NULL;
 
   attributes.size = sizeof(attributes);
   attributes.security_descriptor = MT_NULL;
@@ -1206,7 +1219,7 @@ void *popen(const char *command, const char *mode) {
   startup.input = GetStdHandle(MT_STD_INPUT_HANDLE);
   startup.output = write_pipe;
   startup.error = write_pipe;
-  if (!CreateProcessA("cmd.exe", command_line, MT_NULL, MT_NULL, 1, 0,
+  if (!CreateProcessA(shell, command_line, MT_NULL, MT_NULL, 1, 0,
                       MT_NULL, MT_NULL, &startup, &process)) {
     free(command_line);
     free(file);

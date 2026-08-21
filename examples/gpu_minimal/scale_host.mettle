@@ -1,3 +1,4 @@
+// mettle --emit-ptx scale_kernel.mettle -o scale.ptx
 // mettle --build scale_host.mettle -o scale_host.exe \
 //   --link-arg "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.9/lib/x64/cuda.lib"
 
@@ -8,15 +9,10 @@ import "std/gpu";
 extern kernel(block = 256) scale(x: float32*, k: float32, n: int32);
 
 fn main() -> int32 {
-  if (gpu_init() == 0) { println("no CUDA device"); return 1; }
-
-  var fp: cstring = fopen("scale.ptx", "rb");
-  if (fp == 0) { println("scale.ptx is missing; emit it first"); return 1; }
-  var ptx: uint8* = malloc(65536);
-  var len: int64 = fread((cstring)ptx, 1, 65535, fp);
-  fclose(fp);
-  ptx[len] = 0;
-  if (gpu_module(ptx) == 0) { println("the PTX module would not load"); return 1; }
+  // Driver up, module loaded, kernel names bound. A failure here has already
+  // said what it was -- a missing file, a driver that would not start, or the
+  // PTX JIT's own line-numbered complaint.
+  if (gpu_open("scale.ptx") == 0) { return 1; }
 
   var n: int32 = 1024;
   var bytes: int64 = (int64)n * 4;

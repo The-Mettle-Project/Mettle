@@ -1,6 +1,9 @@
-// mettle --emit-ptx --gpu-arch=sm_120 scale_kernel.mettle -o scale.ptx
+// mettle --emit-ptx scale_kernel.mettle -o scale.ptx
+//
+// No target flag: --emit-ptx asks the local driver which GPU is here.
+// `mettle --gpu-info` prints the answer it gets.
 
-kernel scale(x: float32*, k: float32, n: int32) {
+kernel(block = 256) scale(x: float32*, k: float32, n: int32) {
   var i: int32 = block.x * block_dim.x + thread.x;
   if (i < n) {
     x[i] = x[i] * k;

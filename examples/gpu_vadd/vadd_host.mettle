@@ -2,24 +2,29 @@
 // launches the Mettle-emitted vadd kernel with the `dispatch` statement.
 //
 // Build (links the CUDA driver import stub; adjust the path to your toolkit):
-//   mettle --emit-ptx --gpu-arch=gb10 vadd_kernel.mettle -o vadd_kernel.ptx
+//   mettle --emit-ptx vadd_kernel.mettle -o vadd_kernel.ptx \
+//     --emit-kernel-decls=vadd_decls.mettle
 //   mettle --build vadd_host.mettle -o vadd_host.exe \
 //     --link-arg "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.9/lib/x64/cuda.lib"
+//
+// The kernel build needs no target flag: `mettle --gpu-info` shows which one
+// this machine's driver gets, and --emit-ptx picks it.
 import "std/io";
 import "std/mem";
 import "std/gpu";
 
-fn main() -> int32 {
-  if (gpu_init() == 0) { println("GPU init failed"); return 1; }
+// The kernel declarations come from the kernel file itself, written by
+// `--emit-kernel-decls`. A host that imports them cannot disagree with the
+// module it launches about an argument or a block shape.
+import "vadd_decls";
 
-  // load the emitted PTX module and resolve the kernel
-  var fp: cstring = fopen("vadd_kernel.ptx", "rb");
-  if (fp == 0) { println("open vadd_kernel.ptx failed (emit it first)"); return 1; }
-  var ptx: uint8* = malloc(65536);
-  var pl: int64 = fread((cstring)ptx, 1, 65535, fp); fclose(fp); ptx[pl] = 0;
-  var mod: int64 = gpu_module(ptx);
-  var vadd: int64 = gpu_func(mod, "vadd");
-  if (vadd == 0) { println("kernel 'vadd' not found"); return 1; }
+fn main() -> int32 {
+  // Initialize the driver and load the module. Every failure below this line
+  // names itself, including the driver's own PTX JIT log.
+  if (gpu_open("vadd_kernel.ptx") == 0) { return 1; }
+
+  var buffer: uint8[128];
+  println("running on {gpu_device_name(0, &buffer[0], 128)} ({gpu_sm_count(0)} SMs)");
 
   // host data: a[i]=i, b[i]=2i  ->  expect c[i]=3i
   var n: int32 = 1 << 20;
@@ -37,16 +42,16 @@ fn main() -> int32 {
   gpu_to_device(da, (uint8*)ha, bytes);
   gpu_to_device(db, (uint8*)hb, bytes);
 
-  // launch: one line instead of parameter packing + cuLaunchKernel. The
-  // following blocking copy supplies the required completion ordering.
-  dispatch vadd[(n + 255) / 256, 256](da, db, dc, n);
+  // launch: one line instead of parameter packing + cuLaunchKernel. `work: n`
+  // means "one thread per element" and computes the grid from the declared
+  // block. The following blocking copy supplies the completion ordering.
+  dispatch vadd[work: n](da, db, dc, n);
 
   gpu_to_host((uint8*)hc, dc, bytes);
 
   var ok: int32 = 1; i = 0;
   while (i < n) { if (hc[i] != (float32)(3 * i)) { ok = 0; } i = i + 1; }
-  print("c[1]="); print("{(int64)hc[1]}");
-  print("  c[n-1]="); print("{(int64)hc[n - 1]}"); println("");
+  println("c[1]={(int64)hc[1]}  c[n-1]={(int64)hc[n - 1]}");
   if (ok == 1) { println("GPU vadd correct (kernel + dispatch)"); }
   else { println("MISMATCH"); }
 

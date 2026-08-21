@@ -18,6 +18,15 @@ export extern fn cuDeviceGet(dev: int32*, ordinal: int32) -> int32 = "cuDeviceGe
 export extern fn cuDeviceGetAttribute(value: int32*, attribute: int32, dev: int32) -> int32 = "cuDeviceGetAttribute";
 export extern fn cuCtxCreate_v2(pctx: int64*, flags: uint32, dev: int32) -> int32 = "cuCtxCreate_v2";
 export extern fn cuModuleLoadData(modOut: int64*, image: uint8*) -> int32 = "cuModuleLoadData";
+export extern fn cuModuleLoadDataEx(modOut: int64*, image: uint8*, count: uint32,
+                                    options: int32*, values: int64*) -> int32 = "cuModuleLoadDataEx";
+export extern fn cuModuleUnload(mod: int64) -> int32 = "cuModuleUnload";
+export extern fn cuGetErrorName(code: int32, out: cstring*) -> int32 = "cuGetErrorName";
+export extern fn cuGetErrorString(code: int32, out: cstring*) -> int32 = "cuGetErrorString";
+export extern fn cuDriverGetVersion(version: int32*) -> int32 = "cuDriverGetVersion";
+export extern fn cuDeviceGetCount(count: int32*) -> int32 = "cuDeviceGetCount";
+export extern fn cuDeviceGetName(name: cstring, length: int32, dev: int32) -> int32 = "cuDeviceGetName";
+export extern fn cuDeviceTotalMem_v2(bytes: int64*, dev: int32) -> int32 = "cuDeviceTotalMem_v2";
 export extern fn cuModuleGetFunction(kfOut: int64*, mod: int64, name: cstring) -> int32 = "cuModuleGetFunction";
 export extern fn cuMemAlloc_v2(dptr: int64*, bytes: int64) -> int32 = "cuMemAlloc_v2";
 export extern fn cuMemAllocManaged(dptr: int64*, bytes: int64, flags: uint32) -> int32 = "cuMemAllocManaged";
@@ -58,10 +67,22 @@ extern fn __mtlc_gpu_process_exit(code: int32) = "exit";
 // imported so this module depends only on the driver and Mettle's runtime.
 extern fn __mtlc_gpu_fputs(text: cstring, stream: cstring) -> int32 = "fputs";
 extern fn __mtlc_gpu_iob(index: int32) -> cstring = "__acrt_iob_func";
+// Enough of stdio to read a PTX file without pulling std/io in behind it.
+extern fn __mtlc_gpu_fopen(path: cstring, mode: cstring) -> cstring = "fopen";
+extern fn __mtlc_gpu_fclose(fp: cstring) -> int32 = "fclose";
+extern fn __mtlc_gpu_fread(buf: uint8*, size: int64, count: int64, fp: cstring) -> int64 = "fread";
+extern fn __mtlc_gpu_fseek(fp: cstring, offset: int64, whence: int32) -> int32 = "fseek";
+extern fn __mtlc_gpu_ftell(fp: cstring) -> int64 = "ftell";
+extern fn __mtlc_gpu_malloc(bytes: int64) -> uint8* = "malloc";
+extern fn __mtlc_gpu_release(block: uint8*) = "free";
 
 // std/gpu depends on the driver and Mettle's runtime, so it converts its string
 // literals rather than importing std/io for cstr.
 fn __mtlc_gpu_cstr(s: string) -> cstring { return s.chars; }
+
+fn __mtlc_gpu_note(text: string) {
+  __mtlc_gpu_fputs(text.chars, __mtlc_gpu_iob(2));
+}
 
 fn __mtlc_gpu_fail(part1: cstring, part2: cstring, part3: cstring) {
   var err: cstring = __mtlc_gpu_iob(2);
@@ -72,26 +93,245 @@ fn __mtlc_gpu_fail(part1: cstring, part2: cstring, part3: cstring) {
   __mtlc_gpu_process_exit(1);
 }
 
+// ---- driver status codes as text ----
+//
+// A CUresult printed as a bare integer tells nobody anything. Every helper
+// below that reports a failure names the status and quotes the driver's own
+// sentence about it.
+
+// "CUDA_ERROR_INVALID_PTX" and the like.
+export fn gpu_error_name(status: int32) -> cstring {
+  var text: cstring = 0;
+  if (cuGetErrorName(status, &text) != 0 || text == 0) {
+    return __mtlc_gpu_cstr("CUDA_ERROR_UNKNOWN");
+  }
+  return text;
+}
+
+// The driver's readable sentence, for example "a PTX JIT compilation failed".
+export fn gpu_error_text(status: int32) -> cstring {
+  var text: cstring = 0;
+  if (cuGetErrorString(status, &text) != 0 || text == 0) {
+    return __mtlc_gpu_cstr("unrecognized CUDA status");
+  }
+  return text;
+}
+
+fn __mtlc_gpu_report(what: string, status: int32) {
+  var err: cstring = __mtlc_gpu_iob(2);
+  __mtlc_gpu_fputs(what.chars, err);
+  __mtlc_gpu_fputs(__mtlc_gpu_cstr(": "), err);
+  __mtlc_gpu_fputs(gpu_error_name(status), err);
+  __mtlc_gpu_fputs(__mtlc_gpu_cstr(" ("), err);
+  __mtlc_gpu_fputs(gpu_error_text(status), err);
+  __mtlc_gpu_fputs(__mtlc_gpu_cstr(")\n"), err);
+}
+
 // ---- ergonomic helpers (return handles directly; 0 on failure) ----
 
 // Initialize CUDA on device 0 and create a context. Returns the context handle
 // (nonzero) or 0 on failure.
-export fn gpu_init() -> int64 {
-  if (cuInit(0) != 0) { return 0; }
+export fn gpu_init() -> int64 { return gpu_init_on(0); }
+
+// The same, on a chosen device ordinal. An inference process that owns two
+// cards initializes one context per card and binds each before its launches.
+export fn gpu_init_on(ordinal: int32) -> int64 {
+  var status: int32 = cuInit(0);
+  if (status != 0) {
+    __mtlc_gpu_report("mettle: no usable CUDA driver", status);
+    return 0;
+  }
+  var count: int32 = 0;
+  if (cuDeviceGetCount(&count) == 0 && ordinal >= count) {
+    __mtlc_gpu_note("mettle: GPU {ordinal} was asked for, but this machine has {count}\n");
+    return 0;
+  }
   var dev: int32 = 0;
-  if (cuDeviceGet(&dev, 0) != 0) { return 0; }
+  status = cuDeviceGet(&dev, ordinal);
+  if (status != 0) {
+    __mtlc_gpu_report("mettle: no such GPU", status);
+    return 0;
+  }
   var ctx: int64 = 0;
-  if (cuCtxCreate_v2(&ctx, 8, dev) != 0) { return 0; }  // CU_CTX_MAP_HOST
+  status = cuCtxCreate_v2(&ctx, 8, dev);      // CU_CTX_MAP_HOST
+  if (status != 0) {
+    __mtlc_gpu_report("mettle: could not create a GPU context", status);
+    return 0;
+  }
   return ctx;
 }
 
-// Load a module from a null-terminated PTX image in host memory. 0 on failure.
+// ---- what this machine has ----
+//
+// The compiler answers the same questions at build time (`mettle --gpu-info`);
+// these answer them at run time, which is what a server sizing its launches
+// to the card it actually landed on needs.
+
+export fn gpu_device_count() -> int32 {
+  var count: int32 = 0;
+  if (cuDeviceGetCount(&count) != 0) { return 0; }
+  return count;
+}
+
+fn __mtlc_gpu_attribute(ordinal: int32, attribute: int32) -> int32 {
+  var dev: int32 = 0;
+  if (cuDeviceGet(&dev, ordinal) != 0) { return 0; }
+  var value: int32 = 0;
+  if (cuDeviceGetAttribute(&value, attribute, dev) != 0) { return 0; }
+  return value;
+}
+
+// Multiprocessor count: the number a grid has to cover to fill the card.
+export fn gpu_sm_count(ordinal: int32) -> int32 {
+  return __mtlc_gpu_attribute(ordinal, 16);
+}
+export fn gpu_warp_size(ordinal: int32) -> int32 {
+  return __mtlc_gpu_attribute(ordinal, 10);
+}
+export fn gpu_max_threads_per_block(ordinal: int32) -> int32 {
+  return __mtlc_gpu_attribute(ordinal, 1);
+}
+export fn gpu_max_shared_memory_per_block(ordinal: int32) -> int32 {
+  return __mtlc_gpu_attribute(ordinal, 8);
+}
+// 1 when host and device share memory, as on GB10: a copy is a formality
+// there, and managed allocations are the natural choice.
+export fn gpu_is_integrated(ordinal: int32) -> int32 {
+  return __mtlc_gpu_attribute(ordinal, 18);
+}
+// Compute capability as major * 10 + minor, so 120 is sm_120.
+export fn gpu_compute_capability(ordinal: int32) -> int32 {
+  var major: int32 = __mtlc_gpu_attribute(ordinal, 75);
+  return major * 10 + __mtlc_gpu_attribute(ordinal, 76);
+}
+export fn gpu_total_memory(ordinal: int32) -> int64 {
+  var dev: int32 = 0;
+  if (cuDeviceGet(&dev, ordinal) != 0) { return 0; }
+  var bytes: int64 = 0;
+  if (cuDeviceTotalMem_v2(&bytes, dev) != 0) { return 0; }
+  return bytes;
+}
+// 12090 means CUDA 12.9.
+export fn gpu_driver_version() -> int32 {
+  var version: int32 = 0;
+  if (cuDriverGetVersion(&version) != 0) { return 0; }
+  return version;
+}
+// The device's marketing name, written into `buffer` and returned as a view
+// over it, the same borrowed-string convention `read_line` uses. An empty
+// view means the driver would not answer.
+export fn gpu_device_name(ordinal: int32, buffer: uint8*, capacity: int32) -> string {
+  var name: string;
+  name.chars = (cstring)buffer;
+  name.length = (uint64)0;
+  if (buffer == (uint8*)0 || capacity <= 1) { return name; }
+  buffer[0] = 0;
+  var dev: int32 = 0;
+  if (cuDeviceGet(&dev, ordinal) != 0) { return name; }
+  if (cuDeviceGetName((cstring)buffer, capacity, dev) != 0) { return name; }
+  var n: int64 = 0;
+  while (n < (int64)capacity && buffer[n] != 0) { n = n + 1; }
+  name.length = (uint64)n;
+  return name;
+}
+
+// ---- one call to get running ----
+
+// Initialize CUDA on device 0, load `ptx_path`, and bind it for `dispatch`.
+// Returns 1 when the GPU is ready, 0 after reporting what went wrong.
+export fn gpu_open(ptx_path: cstring) -> int32 {
+  return gpu_open_on(0, ptx_path);
+}
+
+export fn gpu_open_on(ordinal: int32, ptx_path: cstring) -> int32 {
+  if (gpu_init_on(ordinal) == 0) { return 0; }
+  if (gpu_module_file(ptx_path) == 0) { return 0; }
+  return 1;
+}
+
+// The driver writes its PTX JIT diagnostics here. A module that fails to
+// compile is the single most common GPU bring-up failure, and the driver's
+// message names the line and the instruction; without this buffer all a
+// program ever sees is a status code.
+var g_gpu_jit_log: uint8[8192];
+
+// Load a module from a null-terminated PTX image in host memory. 0 on failure,
+// with the driver's status and its JIT log written to stderr.
 export fn gpu_module(ptx_image: uint8*) -> int64 {
+  var status: int32 = 0;
+  var mod: int64 = gpu_module_ex(ptx_image, &status);
+  if (mod == 0) {
+    __mtlc_gpu_report("mettle: the GPU module would not load", status);
+    if (g_gpu_jit_log[0] != 0) {
+      __mtlc_gpu_note("--- CUDA PTX JIT log ---\n");
+      __mtlc_gpu_fputs((cstring)&g_gpu_jit_log[0], __mtlc_gpu_iob(2));
+      __mtlc_gpu_note("\n------------------------\n");
+    }
+    return 0;
+  }
+  return mod;
+}
+
+// Load a PTX image and hand back the driver's status rather than reporting it.
+// Use this when the caller wants to decide what a failure means; gpu_module is
+// the same load with the diagnostics already written.
+export fn gpu_module_ex(ptx_image: uint8*, status_out: int32*) -> int64 {
+  var options: int32[2];
+  var values: int64[2];
+  options[0] = 5;                             // CU_JIT_ERROR_LOG_BUFFER
+  values[0] = (int64)&g_gpu_jit_log[0];
+  options[1] = 6;                             // ..._SIZE_BYTES
+  values[1] = 8192;
+  g_gpu_jit_log[0] = 0;
   var mod: int64 = 0;
-  if (cuModuleLoadData(&mod, ptx_image) != 0) { return 0; }
+  var status: int32 = cuModuleLoadDataEx(&mod, ptx_image, 2, &options[0],
+                                         &values[0]);
+  status_out[0] = status;
+  if (status != 0) { return 0; }
   // Typed `dispatch` resolves declared kernel names against the module loaded
   // most recently; gpu_module_bind overrides that when several are live.
   gpu_module_bind(mod);
+  return mod;
+}
+
+// The driver's JIT log from the last gpu_module/gpu_module_ex call, or an
+// empty string when the load succeeded quietly.
+export fn gpu_jit_log() -> cstring { return (cstring)&g_gpu_jit_log[0]; }
+
+// Read a PTX file and load it. This is the boilerplate every host program was
+// writing by hand -- open, size, read, terminate, load -- with each failure
+// named. 0 on failure.
+export fn gpu_module_file(path: cstring) -> int64 {
+  var fp: cstring = __mtlc_gpu_fopen(path, __mtlc_gpu_cstr("rb"));
+  if (fp == 0) {
+    __mtlc_gpu_note("mettle: cannot open the GPU module '");
+    __mtlc_gpu_fputs(path, __mtlc_gpu_iob(2));
+    __mtlc_gpu_note("'; emit it first with `mettle --emit-ptx`\n");
+    return 0;
+  }
+  __mtlc_gpu_fseek(fp, 0, 2);                 // SEEK_END
+  var size: int64 = __mtlc_gpu_ftell(fp);
+  __mtlc_gpu_fseek(fp, 0, 0);                 // SEEK_SET
+  if (size <= 0) {
+    __mtlc_gpu_fclose(fp);
+    __mtlc_gpu_note("mettle: the GPU module '");
+    __mtlc_gpu_fputs(path, __mtlc_gpu_iob(2));
+    __mtlc_gpu_note("' is empty\n");
+    return 0;
+  }
+  // cuModuleLoadData reads PTX as a C string, so the image needs its
+  // terminator alongside the file's own bytes.
+  var image: uint8* = __mtlc_gpu_malloc(size + 1);
+  if (image == (uint8*)0) {
+    __mtlc_gpu_fclose(fp);
+    __mtlc_gpu_note("mettle: out of memory reading the GPU module\n");
+    return 0;
+  }
+  var read: int64 = __mtlc_gpu_fread(image, 1, size, fp);
+  __mtlc_gpu_fclose(fp);
+  image[read] = 0;
+  var mod: int64 = gpu_module(image);
+  __mtlc_gpu_release(image);
   return mod;
 }
 
@@ -233,7 +473,17 @@ export fn mtlc_gpu_launch_checked(f: int64,
                                   params: int64*, nargs: int32) {
   var rc: int32 = gpu_launch_3d(f, gx, gy, gz, bx, by, bz, shared_bytes,
                                 stream, params, nargs);
-  if (rc != 0) { __mtlc_gpu_process_exit(rc); }
+  if (rc == 0) { return; }
+  // The launch shape is what an enqueue failure is nearly always about, so
+  // print it next to the status. The handle came from the name cache when the
+  // dispatch was typed, which is how the kernel gets named here without
+  // widening the provider ABI every backend implements.
+  var err: cstring = __mtlc_gpu_iob(2);
+  __mtlc_gpu_fputs(__mtlc_gpu_cstr("mettle: GPU launch of "), err);
+  __mtlc_gpu_fputs(__mtlc_gpu_kernel_name(f), err);
+  __mtlc_gpu_note(" failed with grid {gx}x{gy}x{gz}, block {bx}x{by}x{bz}, {shared_bytes} shared bytes\n");
+  __mtlc_gpu_report("  driver status", rc);
+  __mtlc_gpu_process_exit(rc);
 }
 
 export fn gpu_launch_on(f: int64, grid: int32, block: int32,
@@ -344,6 +594,19 @@ export fn mtlc_gpu_kernel_handle(name: cstring) -> int64 {
     g_gpu_kernel_count = g_gpu_kernel_count + 1;
   }
   return handle;
+}
+
+// Name a kernel handle by walking the resolution cache backwards. Only the
+// failure paths call this, so a linear scan is the right shape.
+fn __mtlc_gpu_kernel_name(handle: int64) -> cstring {
+  var i: int32 = 0;
+  while (i < g_gpu_kernel_count) {
+    if (g_gpu_kernel_handles[i] == handle) {
+      return (cstring)g_gpu_kernel_names[i];
+    }
+    i = i + 1;
+  }
+  return __mtlc_gpu_cstr("an untyped kernel handle");
 }
 
 // Synchronous launch helper for diagnostics or one-off kernels where immediate

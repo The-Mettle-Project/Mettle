@@ -768,6 +768,45 @@ attention, general quantized matmul
 generation, low-precision scalar types, measurement collection/autotuning, and
 GB10 benchmark evidence remain required.
 
+## Which GPU, and what it gets built for
+
+`mettle --gpu-info` reports what the machine has and which target `--emit-ptx`
+would pick, without compiling anything:
+
+```
+$ mettle --gpu-info
+Mettle GPU target report
+  Driver            CUDA 12.9 (cuda-driver)
+  Devices           1
+  [0] NVIDIA GeForce RTX 5060 Ti
+      compute capability   12.0  ->  sm_120a
+      multiprocessors      36
+      warp size            32
+      max threads / block  1024
+      shared mem / block   48 KiB
+      global memory        15.9 GiB
+  Assembler         ptxas 12.9 (sm_120a supported)
+  Default target    sm_120a, PTX ISA 8.8
+```
+
+The answer comes from the CUDA driver itself, loaded on demand: the compiler
+links no CUDA library and starts normally on a machine with no NVIDIA driver at
+all. Detection settles two things `--emit-ptx` would otherwise have to guess:
+
+- **The `.target`.** The compute capability the driver reports, taking the
+  architecture-specific `sm_NNa` form from compute capability 9.0 onward when
+  the installed `ptxas` confirms that form exists.
+- **The `.version`.** A PTX ISA above what the local driver understands fails
+  inside `cuModuleLoadData` at run time with nothing but a status code to
+  explain it, so the emitted ISA is capped at what this driver can load.
+
+Nothing is detected when no driver answers: the GB10 profile
+(`sm_121a`, PTX 8.8) stays the default, which is what makes building on a
+laptop for a DGX Spark work. `--gpu-arch=native` asks for the local card by
+name and fails rather than falling back, which is what a build that is meant
+for this machine wants. Exit status is 0 when a device was found and 1 when
+none was, so `mettle --gpu-info` also works as a check in a script.
+
 ## Launching from the host
 
 The host is a normal Mettle program. Import `std/gpu`, set up device buffers
@@ -778,15 +817,13 @@ import "std/io";
 import "std/mem";
 import "std/gpu";
 
-fn main() -> int32 {
-  if (gpu_init() == 0) { println("GPU init failed"); return 1; }
+// Declaring the kernel host-side is what makes `dispatch` check its arguments.
+extern kernel(block = 256) vadd(a: float32*, b: float32*, c: float32*, n: int32);
 
-  // load the emitted PTX and resolve the kernel
-  var fp: cstring = fopen("kernels.ptx", "rb");
-  var ptx: uint8* = malloc(65536);
-  var len: int64 = fread((cstring)ptx, 1, 65535, fp); fclose(fp); ptx[len] = 0;
-  var mod: int64 = gpu_module(ptx);
-  var vadd: int64 = gpu_func(mod, "vadd");
+fn main() -> int32 {
+  // Driver up, module loaded, kernel names bound. Each failure names itself,
+  // including the driver's own PTX JIT log.
+  if (gpu_open("kernels.ptx") == 0) { return 1; }
 
   var n: int32 = 1 << 20;
   var bytes: int64 = (int64)n * 4;
@@ -804,13 +841,88 @@ fn main() -> int32 {
   gpu_to_device(db, (uint8*)hb, bytes);
 
   // launch: one line replaces param-packing + cuLaunchKernel + sync
-  dispatch vadd[(n + 255) / 256, 256](da, db, dc, n);
+  dispatch vadd[work: n](da, db, dc, n);
 
   gpu_to_host((uint8*)hc, dc, bytes);
   gpu_free(da); gpu_free(db); gpu_free(dc);
   return 0;
 }
 ```
+
+### Declarations the host cannot get wrong
+
+`dispatch` checks a launch against a host-side `extern kernel` declaration, so
+a hand-written declaration is one more thing to keep in step with the kernel.
+`--emit-kernel-decls` writes them instead:
+
+```bash
+mettle --emit-ptx kernels.mettle -o kernels.ptx \
+  --emit-kernel-decls=kernel_decls.mettle
+```
+
+```mettle
+// kernel_decls.mettle, generated
+extern kernel(block = 256) vadd(a: float32*, b: float32*, c: float32*, n: int32);
+```
+
+The host imports that file rather than restating it:
+
+```mettle
+import "std/gpu";
+import "kernel_decls";
+```
+
+Every launch is now checked against the kernels as they were actually
+compiled, block shape included. Change a kernel's signature, re-emit, and the
+host stops compiling until it agrees -- which is the whole point. With no
+`=path`, the declarations land beside the PTX as `<output>.mettle`.
+
+### When something goes wrong
+
+The two failures that dominate GPU bring-up are a module that will not compile
+and a launch the driver refuses, and both used to arrive as a bare zero or a
+bare status code. They now say what happened.
+
+A module that fails to JIT prints the driver's own log, line numbers included:
+
+```
+mettle: the GPU module would not load: CUDA_ERROR_INVALID_PTX (a PTX JIT compilation failed)
+--- CUDA PTX JIT log ---
+ptxas application ptx input, line 5; error   : Not a name of any known instruction: 'bogus'
+ptxas fatal   : Ptx assembly aborted due to errors
+------------------------
+```
+
+A launch the driver rejects names the kernel and the shape it was given:
+
+```
+mettle: GPU launch of scale failed with grid 0x1x1, block 256x1x1, 0 shared bytes
+  driver status: CUDA_ERROR_INVALID_VALUE (invalid argument)
+```
+
+`gpu_module_ex` returns the status instead of reporting it, for a caller that
+wants to decide what a failure means; `gpu_jit_log` hands back the last log;
+`gpu_error_name` and `gpu_error_text` turn any `CUresult` into words.
+
+### Asking the device about itself
+
+The same facts `--gpu-info` prints at build time are available at run time, so
+a server can size its launches to the card it actually landed on:
+
+```mettle
+var buffer: uint8[128];
+println("{gpu_device_name(0, &buffer[0], 128)}: {gpu_sm_count(0)} SMs");
+
+var blocks: int32 = gpu_sm_count(0) * 4;   // four blocks per multiprocessor
+dispatch resident[blocks, 256](state, n);
+```
+
+`gpu_device_count`, `gpu_sm_count`, `gpu_warp_size`,
+`gpu_max_threads_per_block`, `gpu_max_shared_memory_per_block`,
+`gpu_compute_capability` (as `major * 10 + minor`), `gpu_total_memory`,
+`gpu_is_integrated`, and `gpu_driver_version` cover the rest. `gpu_init_on`
+and `gpu_open_on` take a device ordinal for a process that owns more than one
+card.
 
 ### The `dispatch` statement
 
@@ -825,7 +937,10 @@ dispatch KERNEL[
 ](arg0, arg1, ...);
 ```
 
-- `KERNEL` is a handle (the `int64` returned by `gpu_func`).
+- `KERNEL` is either the name of a host-side `extern kernel` declaration, in
+  which case the arguments and the block shape are checked at compile time and
+  the handle is resolved by name, or a raw handle (the `int64` returned by
+  `gpu_func`), in which case nothing is checked.
 - The compact form supplies one integer grid and block dimension; the other
   axes are one and dynamic shared bytes/stream are zero.
 - The named form requires exactly three integer dimensions in both `grid` and
@@ -840,9 +955,10 @@ lowering marshals the argument cells and calls the stable
 `mtlc_gpu_launch_checked` runtime-provider ABI. The bundled CUDA provider maps
 that ABI to `cuLaunchKernel`; another frontend uses `mtlc_gpu_launch` to build
 the same operation without depending on Mettle syntax. A failed enqueue is not
-silently discarded: the checked statement contract terminates the process with
-the provider error code. Use `gpu_launch_3d` directly when code needs to inspect
-and recover from the returned status. Allocation and copies remain explicit.
+silently discarded: the checked statement contract names the kernel, the grid
+and block it was given, and the driver's status, then terminates. Use
+`gpu_launch_3d` directly when code needs to inspect and recover from the
+returned status. Allocation and copies remain explicit.
 
 For explicit concurrency, `std/gpu` also exposes nonblocking streams, events,
 asynchronous copies, stream-ordered allocation/free, managed memory, and
@@ -852,9 +968,15 @@ yet constitute a hardware-validated scheduler or graph implementation.
 ## Building
 
 ```bash
+# 0. see what this machine has, and what step 1 will target
+mettle --gpu-info
+
 # 1. compile optimized kernels for the local GPU (auto-detected via the
 #    driver; falls back to the DGX Spark GB10 profile when no GPU is visible)
 mettle -O --emit-ptx kernels.mettle -o kernels.ptx
+
+# The same, but refuse to build at all if this machine has no GPU:
+mettle -O --emit-ptx --gpu-arch=native kernels.mettle -o kernels.ptx
 
 # Or pin a profile explicitly, for example DGX Spark GB10:
 mettle -O --emit-ptx --gpu-arch=gb10 kernels.mettle -o kernels.ptx
@@ -875,6 +997,8 @@ the PTX to SASS for the installed GPU.
 
 | Flag | Effect |
 | --- | --- |
+| `--gpu-info` | Reports the local GPUs, the driver, `ptxas`, and the target `--emit-ptx` would pick. Takes no input file |
+| `--emit-kernel-decls[=F]` | With `--emit-ptx`, also writes each kernel's host-side `extern kernel` declaration, so an importing host cannot drift from the module it launches |
 | `--report-launches` | Lists every dispatch site with the grid and block the compiler can fold, and the kernel each one names |
 | `--report-occupancy` | With `--emit-ptx`, runs `ptxas -v` on the emitted module and prints each kernel's registers per thread and the occupancy ceiling they imply |
 | `--sms=N` | SM count used for the whole-card fill thresholds in that report. Defaults to asking the local driver, and the thresholds are omitted when no driver answers |

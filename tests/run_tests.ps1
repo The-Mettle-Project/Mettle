@@ -363,6 +363,12 @@ $cases = @(
     Args          = @("--emit-obj")
   },
   @{
+    Name          = "gpu_host_surface"
+    Path          = "tests/test_gpu_host_surface.mettle"
+    ShouldSucceed = $true
+    Args          = @("--emit-obj")
+  },
+  @{
     Name          = "simd_contract"
     Path          = "tests/test_simd_contract.mettle"
     ShouldSucceed = $true
@@ -10172,6 +10178,89 @@ catch {
 }
 
 # PTX backend validity gate. Emission and structural/profile checks always run.
+# `--gpu-info` and `--emit-ptx` have to name the same target. They read the
+# same detection, so a disagreement means one of them silently stopped asking
+# -- which is exactly how kernels come to be built for a card that is not in
+# the machine. The case is meaningful on both kinds of host: with an NVIDIA
+# driver the two must agree on the local card, and without one the report has
+# to say so while --emit-ptx keeps the cross-compile default.
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $infoOut = & $CompilerPath --gpu-info 2>&1 | Out-String
+  if ($infoOut -notmatch "Mettle GPU target report") {
+    throw "--gpu-info printed no report: $infoOut"
+  }
+  if ($infoOut -notmatch "Default target\s+(\S+),") {
+    throw "--gpu-info named no default target: $infoOut"
+  }
+  $announced = $Matches[1]
+  $hasDevice = $infoOut -notmatch "Local devices\s+none"
+  $ptxPath = Join-Path $tmpDir "gpu_detect_probe.ptx"
+  $emitOut = & $CompilerPath --emit-ptx "examples/gpu_vadd/vadd_kernel.mettle" -o $ptxPath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "--emit-ptx failed: $emitOut" }
+  $targetLine = Select-String -Path $ptxPath -Pattern '^\.target\s+(\S+)' | Select-Object -First 1
+  if (-not $targetLine) { throw "emitted PTX carries no .target directive" }
+  $emitted = $targetLine.Matches[0].Groups[1].Value
+  if ($emitted -ne $announced) {
+    throw "--gpu-info announced '$announced' but --emit-ptx wrote '.target $emitted'"
+  }
+  # Named explicitly, the local target must resolve on a machine that has one
+  # and refuse rather than guess on a machine that does not.
+  $nativeOut = & $CompilerPath --emit-ptx --gpu-arch=native "examples/gpu_vadd/vadd_kernel.mettle" -o $ptxPath 2>&1 | Out-String
+  if ($hasDevice) {
+    if ($LASTEXITCODE -ne 0) { throw "--gpu-arch=native failed on a host with a device: $nativeOut" }
+    $nativeLine = Select-String -Path $ptxPath -Pattern '^\.target\s+(\S+)' | Select-Object -First 1
+    if ($nativeLine.Matches[0].Groups[1].Value -ne $announced) {
+      throw "--gpu-arch=native disagreed with --gpu-info ('$announced')"
+    }
+  }
+  elseif ($LASTEXITCODE -eq 0) {
+    throw "--gpu-arch=native succeeded on a host with no NVIDIA device"
+  }
+  Write-CaseResult -Name "gpu_detect_target_agrees" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "gpu_detect_target_agrees" -Passed $false -Reason $_.Exception.Message
+}
+
+# `--emit-kernel-decls` writes the host-side declaration of every kernel it
+# compiled. The point of generating them is that a host cannot drift from the
+# module it launches, so the generated text has to be Mettle a host can
+# actually import, and it has to carry the block shape the kernel declared.
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $declPtx = Join-Path $tmpDir "kernel_decls.ptx"
+  $declPath = Join-Path $tmpDir "kernel_decls.mettle"
+  $emitOut = & $CompilerPath --emit-ptx "examples/gpu_vadd/vadd_kernel.mettle" `
+    -o $declPtx "--emit-kernel-decls=$declPath" 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "--emit-kernel-decls failed: $emitOut" }
+  $decls = Get-Content -LiteralPath $declPath -Raw
+  if ($decls -notmatch "extern kernel\(block = 256\) vadd\(a: float32\*, b: float32\*, c: float32\*, n: int32\);") {
+    throw "generated declaration does not match the kernel: $decls"
+  }
+  # Valid Mettle, or a host could not import it.
+  $declObj = Join-Path $tmpDir "kernel_decls.obj"
+  $declBuild = & $CompilerPath --emit-obj $declPath -o $declObj 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "generated declarations do not compile: $declBuild" }
+  # Many kernels in one module, each declared once.
+  $manyPath = Join-Path $tmpDir "kernel_decls_many.mettle"
+  $manyOut = & $CompilerPath --emit-ptx "tests/gpu/compute_kernels.mettle" `
+    -o (Join-Path $tmpDir "kernel_decls_many.ptx") "--emit-kernel-decls=$manyPath" 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "multi-kernel --emit-kernel-decls failed: $manyOut" }
+  $declared = (Select-String -Path $manyPath -Pattern '^extern kernel').Count
+  if ($declared -lt 10) {
+    throw "expected a declaration per kernel, got $declared"
+  }
+  Write-CaseResult -Name "gpu_emit_kernel_decls" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "gpu_emit_kernel_decls" -Passed $false -Reason $_.Exception.Message
+}
+
 # When NVIDIA's ptxas is installed, each portable module is assembled too; a
 # second GB10-specific gate assembles sm_121a when the installed toolkit knows
 # that target. This keeps non-NVIDIA CI useful without weakening the DGX Spark

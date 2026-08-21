@@ -32,6 +32,10 @@ typedef struct {
   int dump_ir;
   int ml_opt; /* --ml-opt: run the learned ML optimizer pass on the IR */
   int emit_ptx; /* --emit-ptx: lower declared kernels to PTX .entry, no object */
+  /* --emit-kernel-decls[=path]: alongside the PTX, write the host-side
+     `extern kernel` declaration for every kernel, so a host that imports it
+     cannot disagree with the module it launches. */
+  const char *emit_kernel_decls;
   const char *ptx_target; /* backend-only target such as sm_121a */
   int ptx_isa_major;
   int ptx_isa_minor;

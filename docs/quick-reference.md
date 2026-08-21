@@ -272,8 +272,11 @@ kernel vadd(a: float32*, b: float32*, c: float32*, n: int32) {
 ```mettle
 // host.mettle  ->  mettle --build host.mettle -o host --link-arg .../cuda.lib
 import "std/gpu";
-// ... gpu_init, gpu_module, gpu_func, gpu_malloc, gpu_to_device ...
-dispatch vadd[(n + 255) / 256, 256](da, db, dc, n);
+extern kernel(block = 256) vadd(a: float32*, b: float32*, c: float32*, n: int32);
+
+if (gpu_open("kernels.ptx") == 0) { return 1; }
+// ... gpu_malloc, gpu_to_device ...
+dispatch vadd[work: n](da, db, dc, n);
 
 dispatch gemm[grid: (tiles_n, tiles_m, batch),
               block: (32, 1, 1),
@@ -281,8 +284,13 @@ dispatch gemm[grid: (tiles_n, tiles_m, batch),
               stream: compute_stream](a, b, c, d, m, n, k);
 ```
 
-Here `vadd` is the runtime function handle returned by `gpu_func`, not a
-compile-time reference to the source kernel declaration. `dispatch` preserves
+`mettle --gpu-info` reports the local card, the driver, and the `.target`
+`--emit-ptx` picks for it; `--gpu-arch=native` demands that card rather than
+falling back to the cross-compile default.
+
+Declared with `extern kernel`, `vadd` is checked against the declaration and
+resolved by name; written as a plain `int64` it is the runtime handle
+`gpu_func` returns and nothing is checked. `dispatch` preserves
 a typed, target-neutral launch in IR; the host backend alone marshals it for
 the selected runtime provider. The compact form supplies 1-D grid/block sizes.
 The named form requires `grid: (x,y,z)` and `block: (x,y,z)` and optionally

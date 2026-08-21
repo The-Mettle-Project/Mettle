@@ -195,7 +195,7 @@ call :cc src\semantic\monomorphize.c obj\semantic\monomorphize.o
 for %%f in (src\ir\*.c) do call :cc "%%f" "obj\ir\%%~nf.o"
 for %%f in (src\ir\optimizer\*.c) do call :cc "%%f" "obj\ir\optimizer\%%~nf.o"
 
-for %%f in (src\codegen\binary_emitter.c src\codegen\code_generator.c src\codegen\elf_emitter.c src\codegen\ptx_emitter.c src\codegen\spirv_emitter.c) do call :cc "%%f" "obj\codegen\%%~nf.o"
+for %%f in (src\codegen\binary_emitter.c src\codegen\code_generator.c src\codegen\elf_emitter.c src\codegen\gpu_detect.c src\codegen\ptx_emitter.c src\codegen\spirv_emitter.c) do call :cc "%%f" "obj\codegen\%%~nf.o"
 for %%f in (src\codegen\binary\*.c) do call :cc "%%f" "obj\codegen\binary\%%~nf.o"
 for %%f in (src\linker\*.c) do call :cc "%%f" "obj\linker\%%~nf.o"
 
@@ -310,7 +310,7 @@ for %%o in (obj\ir\optimizer\*.o) do call set "AROBJS=%%AROBJS%% %%o"
 %AR% rcs bin\mtlc.lib %AROBJS%
 if errorlevel 1 exit /b 1
 
-set "AROBJS=obj\codegen\binary_emitter.o obj\codegen\code_generator.o obj\codegen\elf_emitter.o obj\codegen\ptx_emitter.o obj\codegen\spirv_emitter.o"
+set "AROBJS=obj\codegen\binary_emitter.o obj\codegen\code_generator.o obj\codegen\elf_emitter.o obj\codegen\gpu_detect.o obj\codegen\ptx_emitter.o obj\codegen\spirv_emitter.o"
 for %%o in (obj\codegen\binary\*.o) do call set "AROBJS=%%AROBJS%% %%o"
 %AR% rcs bin\mtlc.lib %AROBJS%
 if errorlevel 1 exit /b 1
