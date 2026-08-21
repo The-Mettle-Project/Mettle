@@ -1,0 +1,32 @@
+import "std/core";
+
+struct File { handle: int32; }
+
+fn open(n: int32) -> Result<File*, int32> {
+  if (n < 0) { return Err(-n); }
+  var f: File* = new File;
+  f->handle = n;
+  return Ok(f);
+}
+
+fn unwrap_or(r: Result<int32, string>, fallback: int32) -> int32 {
+  return match (r) { case Ok(v): v, case Err(_): fallback };
+}
+
+fn main() -> int32 {
+  var good: Result<File*, int32> = open(7);
+  var bad: Result<File*, int32> = open(-3);
+  var total: int32 = 0;
+  match (good) {
+    case Ok(f): { total = total + f->handle; }
+    case Err(code): { total = total + 1000; }
+  }
+  match (bad) {
+    case Ok(f): { total = total + 1000; }
+    case Err(code): { total = total + code; }
+  }
+  var s: Result<int32, string> = Err("no");
+  var t: Result<int32, string> = Ok(4);
+  total = total + unwrap_or(s, 20) + unwrap_or(t, 20);
+  return total;
+}

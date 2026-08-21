@@ -1073,7 +1073,9 @@ int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
 
       ASTNode *value = ret_stmt->values ? ret_stmt->values[0] : ret_stmt->value;
       // Check if return value type matches function return type
+      checker->aggregate_target_type = func_return_type;
       Type *value_type = type_checker_infer_type(checker, value);
+      checker->aggregate_target_type = NULL;
       if (!value_type) {
         // Error already reported by type_checker_infer_type if it failed
         // Only set generic error if no specific error was set

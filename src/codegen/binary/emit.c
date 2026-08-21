@@ -453,7 +453,8 @@ int code_generator_binary_emit_store_to_address(
           size, context->function_name);
       return 0;
     }
-    return binary_emit_push_reg(&context->code, BINARY_GP_RSI) &&
+    return binary_emit_push_reg(&context->code, BINARY_GP_RCX) &&
+           binary_emit_push_reg(&context->code, BINARY_GP_RSI) &&
            binary_emit_push_reg(&context->code, BINARY_GP_RDI) &&
            binary_emit_mov_reg_from_saved_string_source(
                &context->code, BINARY_GP_RSI, source_register) &&
@@ -463,7 +464,8 @@ int code_generator_binary_emit_store_to_address(
            binary_code_buffer_append_u8(&context->code, 0xF3) &&
            binary_code_buffer_append_u8(&context->code, 0xA4) &&
            binary_emit_pop_reg(&context->code, BINARY_GP_RDI) &&
-           binary_emit_pop_reg(&context->code, BINARY_GP_RSI);
+           binary_emit_pop_reg(&context->code, BINARY_GP_RSI) &&
+           binary_emit_pop_reg(&context->code, BINARY_GP_RCX);
   }
   }
 }
@@ -672,8 +674,9 @@ int code_generator_binary_emit_indirect_source_address(
 }
 
 /* Emit `rep movsb` of `size` bytes from [src_addr_reg] to [dst_addr_reg].
- * Preserves RSI/RDI because the register promoter may keep live values there;
- * RCX is consumed as the string count. */
+ * Preserves RSI/RDI because the register promoter may keep live values there,
+ * and RCX because the allocator hands it out like any other register while
+ * the string count has to sit in it. */
 int code_generator_binary_emit_rep_movsb(
     CodeGenerator *generator, BinaryFunctionContext *context,
     BinaryGpRegister src_addr_reg, BinaryGpRegister dst_addr_reg, size_t size) {

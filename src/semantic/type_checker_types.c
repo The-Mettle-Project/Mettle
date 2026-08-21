@@ -764,11 +764,8 @@ Type *type_checker_get_type_by_name(TypeChecker *checker, const char *name) {
     if (base_name) {
       memcpy(base_name, name, base_len);
       base_name[base_len] = '\0';
-      // Extract the single type argument (first one, up to ',' or '>')
       const char *arg_start = lt + 1;
-      const char *arg_end = strchr(arg_start, ',');
-      if (!arg_end)
-        arg_end = name + strlen(name) - 1; // points to '>'
+      const char *arg_end = name + strlen(name) - 1;
       size_t arg_len = (size_t)(arg_end - arg_start);
       char *arg_str = malloc(arg_len + 1);
       if (arg_str) {

@@ -1784,6 +1784,49 @@ Type *type_checker_infer_type(TypeChecker *checker, ASTNode *expression) {
   return type;
 }
 
+/* A bare constructor name belongs to whichever enum declared it first. When
+ * the value is flowing into a declared destination that is a different tagged
+ * enum carrying the same variant, the destination wins: the name is rewritten
+ * to that enum's qualified constructor so the checker and the lowering agree
+ * on which instantiation was meant. The rewrite touches only the name, so a
+ * destination that lacks the variant leaves the first-declared reading in
+ * place and the ordinary mismatch diagnostic follows. */
+static Symbol *type_checker_retarget_constructor(TypeChecker *checker,
+                                                 Symbol *ctor, Type *target,
+                                                 const char *variant,
+                                                 char **name_slot) {
+  if (!ctor || !target || target->kind != TYPE_TAGGED_ENUM ||
+      ctor->data.constructor.enum_type == target || !target->name) {
+    return ctor;
+  }
+  int found = 0;
+  for (size_t i = 0; i < target->tagged_variant_count; i++) {
+    if (strcmp(target->tagged_variant_names[i], variant) == 0) {
+      found = 1;
+      break;
+    }
+  }
+  if (!found) {
+    return ctor;
+  }
+  size_t len = strlen(target->name) + 2 + strlen(variant) + 1;
+  char *qualified = malloc(len);
+  if (!qualified) {
+    return ctor;
+  }
+  snprintf(qualified, len, "%s__%s", target->name, variant);
+  Symbol *resolved = symbol_table_lookup(checker->symbol_table, qualified);
+  if (resolved && resolved->kind == SYMBOL_TAGGED_ENUM_CONSTRUCTOR) {
+    if (!string_is_interned(*name_slot)) {
+      free(*name_slot);
+    }
+    *name_slot = (char *)string_intern(qualified);
+    ctor = resolved;
+  }
+  free(qualified);
+  return ctor;
+}
+
 Type *type_checker_infer_type_internal(TypeChecker *checker,
                                               ASTNode *expression) {
   if (!checker || !expression)
@@ -1821,6 +1864,12 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
   case AST_IDENTIFIER: {
     Identifier *id = (Identifier *)expression->data;
     Symbol *symbol = type_checker_resolve_identifier(checker, id);
+    if (symbol && symbol->kind == SYMBOL_TAGGED_ENUM_CONSTRUCTOR && id) {
+      Type *ident_target = checker->aggregate_target_type;
+      checker->aggregate_target_type = NULL;
+      symbol = type_checker_retarget_constructor(checker, symbol, ident_target,
+                                                 id->name, &id->name);
+    }
     if (!symbol) {
       Type *named = id && id->name
                         ? type_checker_get_type_by_name(checker, id->name)
@@ -2192,6 +2241,8 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
   }
 
   case AST_FUNCTION_CALL: {
+    Type *call_target = checker->aggregate_target_type;
+    checker->aggregate_target_type = NULL;
     CallExpression *call = (CallExpression *)expression->data;
     if (call && call->function_name) {
       if (strcmp(call->function_name, "sizeof") == 0) {
@@ -2444,6 +2495,9 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
     }
 
     if (func_symbol->kind == SYMBOL_TAGGED_ENUM_CONSTRUCTOR) {
+      func_symbol = type_checker_retarget_constructor(
+          checker, func_symbol, call_target, call->function_name,
+          &call->function_name);
       Type *enum_type = func_symbol->data.constructor.enum_type;
       Type *payload_type = func_symbol->data.constructor.payload_type;
       size_t expected_args = payload_type ? 1 : 0;

@@ -1,3 +1,8 @@
+export enum Result<T, E> {
+  Ok(T),
+  Err(E)
+}
+
 export fn std_ok() -> int32 {
   return 0;
 }

@@ -406,39 +406,99 @@ int type_checker_register_variant_constructor(TypeChecker *checker, Type *te,
   return 1;
 }
 
-// ---------------------------------------------------------------------------
-// Instantiate a generic enum template for a concrete type argument string.
-// e.g. "Option<int32>" -> creates and registers Option__int32 if needed.
-// ---------------------------------------------------------------------------
+static size_t type_checker_split_type_args(const char *text, char ***out) {
+  size_t count = 0;
+  size_t depth = 0;
+  const char *start = text;
+  char **args = NULL;
+  for (const char *p = text;; p++) {
+    if (*p == '<' || *p == '[') {
+      depth++;
+    } else if (*p == '>' || *p == ']') {
+      if (depth > 0) depth--;
+    } else if ((*p == ',' && depth == 0) || *p == '\0') {
+      const char *a = start;
+      const char *b = p;
+      while (a < b && (*a == ' ' || *a == '\t')) a++;
+      while (b > a && (b[-1] == ' ' || b[-1] == '\t')) b--;
+      char **grown = realloc(args, (count + 1) * sizeof(char *));
+      if (!grown) {
+        for (size_t i = 0; i < count; i++) free(args[i]);
+        free(args);
+        return 0;
+      }
+      args = grown;
+      args[count] = malloc((size_t)(b - a) + 1);
+      if (!args[count]) {
+        for (size_t i = 0; i < count; i++) free(args[i]);
+        free(args);
+        return 0;
+      }
+      memcpy(args[count], a, (size_t)(b - a));
+      args[count][b - a] = '\0';
+      count++;
+      start = p + 1;
+      if (*p == '\0') break;
+    }
+  }
+  *out = args;
+  return count;
+}
+
+static char *type_checker_mangle_generic_enum_name(const char *base,
+                                                   char **args,
+                                                   size_t count) {
+  size_t len = strlen(base) + 1;
+  for (size_t i = 0; i < count; i++) len += 2 + strlen(args[i]) * 4;
+  char *result = malloc(len);
+  if (!result) return NULL;
+  size_t pos = strlen(base);
+  memcpy(result, base, pos);
+  for (size_t i = 0; i < count; i++) {
+    result[pos++] = '_';
+    result[pos++] = '_';
+    for (const char *p = args[i]; *p; p++) {
+      if (*p == '*') {
+        memcpy(result + pos, "_ptr", 4);
+        pos += 4;
+      } else if (*p == '<' || *p == '>' || *p == ',' || *p == ' ') {
+        result[pos++] = '_';
+      } else {
+        result[pos++] = *p;
+      }
+    }
+  }
+  result[pos] = '\0';
+  return result;
+}
+
 Type *type_checker_instantiate_generic_enum(TypeChecker *checker,
                                                     const char *generic_name,
                                                     const char *type_arg_str) {
   if (!checker || !generic_name || !type_arg_str)
     return NULL;
 
-  // Build mangled name  e.g. Option__int32
-  size_t mangled_len =
-      strlen(generic_name) + 2 + strlen(type_arg_str) + 1;
-  char *mangled = malloc(mangled_len);
-  if (!mangled)
+  char **args = NULL;
+  size_t arg_count = type_checker_split_type_args(type_arg_str, &args);
+  if (arg_count == 0)
     return NULL;
-  snprintf(mangled, mangled_len, "%s__%s", generic_name, type_arg_str);
 
-  // Return cached type if already instantiated
+  char *mangled =
+      type_checker_mangle_generic_enum_name(generic_name, args, arg_count);
+  if (!mangled) {
+    for (size_t i = 0; i < arg_count; i++) free(args[i]);
+    free(args);
+    return NULL;
+  }
+
   Type *existing = type_checker_get_type_by_name(checker, mangled);
   if (existing) {
+    for (size_t i = 0; i < arg_count; i++) free(args[i]);
+    free(args);
     free(mangled);
     return existing;
   }
 
-  // Resolve the type argument
-  Type *arg_type = type_checker_get_type_by_name(checker, type_arg_str);
-  if (!arg_type) {
-    free(mangled);
-    return NULL;
-  }
-
-  // Find the matching generic enum template
   ASTNode *template_node = NULL;
   for (size_t i = 0; i < checker->generic_enum_template_count; i++) {
     ASTNode *n = checker->generic_enum_templates[i];
@@ -449,30 +509,42 @@ Type *type_checker_instantiate_generic_enum(TypeChecker *checker,
       break;
     }
   }
-  if (!template_node) {
+  EnumDeclaration *tmpl =
+      template_node ? (EnumDeclaration *)template_node->data : NULL;
+  if (!tmpl || tmpl->type_param_count != arg_count) {
+    for (size_t i = 0; i < arg_count; i++) free(args[i]);
+    free(args);
     free(mangled);
     return NULL;
   }
 
-  EnumDeclaration *tmpl = (EnumDeclaration *)template_node->data;
+  for (size_t i = 0; i < arg_count; i++) {
+    if (!type_checker_get_type_by_name(checker, args[i])) {
+      for (size_t j = 0; j < arg_count; j++) free(args[j]);
+      free(args);
+      free(mangled);
+      return NULL;
+    }
+  }
 
-  // Build a transient EnumDeclaration with T substituted by the concrete type
   EnumVariant *concrete_variants =
       malloc(tmpl->variant_count * sizeof(EnumVariant));
   if (!concrete_variants) {
+    for (size_t i = 0; i < arg_count; i++) free(args[i]);
+    free(args);
     free(mangled);
     return NULL;
   }
   for (size_t i = 0; i < tmpl->variant_count; i++) {
     concrete_variants[i].name = tmpl->variants[i].name;
     concrete_variants[i].value = NULL;
-    // Substitute type parameter: if payload_type == type_param[0] -> use arg
     const char *orig_pt = tmpl->variants[i].payload_type;
-    if (orig_pt && tmpl->type_param_count > 0 &&
-        strcmp(orig_pt, tmpl->type_params[0]) == 0) {
-      concrete_variants[i].payload_type = (char *)type_arg_str;
-    } else {
-      concrete_variants[i].payload_type = (char *)orig_pt;
+    concrete_variants[i].payload_type = (char *)orig_pt;
+    for (size_t k = 0; orig_pt && k < arg_count; k++) {
+      if (strcmp(orig_pt, tmpl->type_params[k]) == 0) {
+        concrete_variants[i].payload_type = args[k];
+        break;
+      }
     }
   }
 
@@ -487,6 +559,8 @@ Type *type_checker_instantiate_generic_enum(TypeChecker *checker,
   Type *te =
       type_checker_build_tagged_enum_type(checker, mangled, &concrete_decl);
   free(concrete_variants);
+  for (size_t i = 0; i < arg_count; i++) free(args[i]);
+  free(args);
 
   if (!te) {
     free(mangled);
@@ -813,8 +887,11 @@ int type_checker_process_declaration(TypeChecker *checker,
        * type. Without one there is nothing to check it against, and the
        * literal reports that itself. */
       checker->aggregate_target_type =
-          var_decl->initializer->type == AST_AGGREGATE_LITERAL ? var_type
-                                                               : NULL;
+          var_decl->initializer->type == AST_AGGREGATE_LITERAL ||
+                  var_decl->initializer->type == AST_FUNCTION_CALL ||
+                  var_decl->initializer->type == AST_IDENTIFIER
+              ? var_type
+              : NULL;
       Type *init_type = type_checker_infer_type(checker, var_decl->initializer);
       checker->aggregate_target_type = NULL;
       if (!init_type) {

@@ -1,0 +1,16 @@
+struct Slot { tag: int32; text: string; }
+
+fn main() -> int32 {
+  var total: int32 = 0;
+  var i: int32 = 0;
+  var slot: Slot;
+  var p: Slot* = &slot;
+  while (i < 4) {
+    total = total + i + 1;
+    p->tag = i;
+    p->text = "abc";
+    total = total + p->tag;
+    i = i + 1;
+  }
+  return total - 16;
+}
