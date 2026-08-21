@@ -398,14 +398,39 @@ var b: Option = None();
 
 **Representation:** A tagged enum stores a discriminant tag plus storage for the largest payload among its variants. Its size is not fixed like a plain enum, so avoid assuming it is 8 bytes in C interop or manual layout code.
 
-Tagged enums can also be generic:
+Tagged enums can also be generic, with one or more type parameters:
 
 ```mettle
-enum Result<T> {
+enum Result<T, E> {
   Ok(T),
-  Err
+  Err(E)
 }
 ```
+
+`std/core` declares exactly that `Result<T, E>`, so a fallible function names
+its success and failure payloads in its signature and a caller takes them
+apart with `match`:
+
+```mettle
+import "std/core";
+
+fn open(path: string) -> Result<File*, int32> {
+  if (missing) { return Err(2); }
+  return Ok(f);
+}
+
+var r: Result<File*, int32> = open(p);
+match (r) {
+  case Ok(f): { use(f); }
+  case Err(code): { report(code); }
+}
+```
+
+A bare constructor such as `Ok(f)` takes its instantiation from the
+declaration, assignment, or return it flows into, so two `Result` types with
+different payloads can sit in one function. Where there is no destination to
+read, qualify it: `Result.Ok(f)` is not a type, but `MyEnum.Variant(x)` picks
+the variant of a named non-generic enum.
 
 ## Generic Type Parameters
 
