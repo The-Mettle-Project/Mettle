@@ -19,11 +19,6 @@ ARCH_CFLAGS := $(shell $(CC) -mno-outline-atomics -E -x c /dev/null > /dev/null 
 CFLAGS += $(ARCH_CFLAGS)
 endif
 LDFLAGS =
-# The CUDA driver is loaded at run time (src/codegen/gpu_detect.c) so that a
-# compiler built on a machine with no NVIDIA driver still starts.
-ifeq ($(shell uname -s),Linux)
-LDFLAGS += -ldl
-endif
 SRCDIR = src
 OBJDIR = obj
 BINDIR = bin

@@ -108,6 +108,7 @@ Run a single suite:
 | [`ui_demo/`](ui_demo/) | Win32 UI demo (`std/ui`); see [ui_demo/README.md](ui_demo/README.md) |
 | [`tracy_demo/`](tracy_demo/) | Tracy profiler demo (`std/tracy`); see [tracy_demo/README.md](tracy_demo/README.md) |
 | [`gpu_vadd/`](gpu_vadd/) | GPU offload demo: a `kernel` compiled to PTX (or SPIR-V with `--emit-spirv`) and launched with `dispatch` (`std/gpu`); see [docs/gpu.md](../docs/gpu.md) |
+| [`gpu_inference/`](gpu_inference/) | A transformer feed-forward block on the GPU: rmsnorm, warp-per-row matvec, SwiGLU, softmax; checked against a CPU reference and timed against a captured launch graph |
 | [`guessing-game/`](guessing-game/) | Simple interactive game |
 | [`direct_object_smoke/`](direct_object_smoke/) | Direct object backend smoke test |
 

@@ -768,6 +768,11 @@ attention, general quantized matmul
 generation, low-precision scalar types, measurement collection/autotuning, and
 GB10 benchmark evidence remain required.
 
+A worked example of the whole path -- kernels, generated declarations, a
+checked result, and a captured launch graph -- is
+[`examples/gpu_inference/`](../examples/gpu_inference/), which runs one
+transformer feed-forward block on the GPU.
+
 ## Which GPU, and what it gets built for
 
 `mettle --gpu-info` reports what the machine has and which target `--emit-ptx`

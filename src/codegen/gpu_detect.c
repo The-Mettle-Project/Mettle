@@ -29,6 +29,7 @@ typedef int (*GpuCuDeviceTotalMem)(size_t *, int);
 #define GPU_ATTR_COMPUTE_CAPABILITY_MINOR 76
 
 #if defined(_WIN32)
+#define GPU_DETECT_CAN_LOAD_DRIVER 1
 
 __declspec(dllimport) void *LoadLibraryA(const char *name);
 __declspec(dllimport) void *GetProcAddress(void *module, const char *name);
@@ -42,19 +43,11 @@ static void *gpu_driver_symbol(void *library, const char *name) {
 }
 
 #else
-
-#include <dlfcn.h>
-
-static void *gpu_load_driver(void) {
-  void *library = dlopen("libcuda.so.1", RTLD_LAZY);
-  if (!library) library = dlopen("libcuda.so", RTLD_LAZY);
-  return library;
-}
-
-static void *gpu_driver_symbol(void *library, const char *name) {
-  return dlsym(library, name);
-}
-
+/* The Linux compiler links statically and carries no dynamic loader, by
+ * design, so it cannot open libcuda however much it would like to. The
+ * nvidia-smi path below answers there instead: it settles the `.target` and
+ * the ISA ceiling, which are the two things codegen turns on, and leaves the
+ * multiprocessor count to `--sms=N`. */
 #endif
 
 static int gpu_driver_attribute(GpuCuDeviceGetAttribute get, int device,
@@ -65,6 +58,7 @@ static int gpu_driver_attribute(GpuCuDeviceGetAttribute get, int device,
 }
 
 /* Ask the driver. Returns 1 when at least one device answered. */
+#if defined(GPU_DETECT_CAN_LOAD_DRIVER)
 static int gpu_detect_via_driver(GpuDetectResult *out) {
   void *library = gpu_load_driver();
   if (!library) return 0;
@@ -144,6 +138,12 @@ static int gpu_detect_via_driver(GpuDetectResult *out) {
   out->source = "cuda-driver";
   return 1;
 }
+#else
+static int gpu_detect_via_driver(GpuDetectResult *out) {
+  (void)out;
+  return 0;
+}
+#endif
 
 /* Run `command` and copy its first line into `line`. Returns 1 when the
  * command exited successfully and wrote something. */
@@ -170,13 +170,27 @@ static int gpu_read_command_line(const char *command, char *line,
   return length > 0;
 }
 
-/* No driver library, but possibly still a GPU: nvidia-smi reports the name and
- * compute capability. It cannot report a multiprocessor count, so occupancy's
- * whole-card threshold stays unavailable on this path. */
+/* Field `index` of a comma-separated line, trimmed, or NULL. */
+static const char *gpu_csv_field(const char *line, int index) {
+  const char *cursor = line;
+  for (int at = 0; at < index; at++) {
+    cursor = strchr(cursor, ',');
+    if (!cursor) return NULL;
+    cursor++;
+  }
+  while (*cursor == ' ') cursor++;
+  return cursor;
+}
+
+/* The driver library is out of reach: nvidia-smi reports the capability, the
+ * name and the memory, which settles the `.target`. It has no field for the
+ * multiprocessor count, so occupancy's whole-card threshold needs `--sms=N`
+ * on this path. */
 static int gpu_detect_via_nvidia_smi(GpuDetectResult *out) {
-  char line[256];
+  char line[512];
   if (!gpu_read_command_line(
-          "nvidia-smi --query-gpu=compute_cap,name --format=csv,noheader",
+          "nvidia-smi --query-gpu=compute_cap,name,memory.total "
+          "--format=csv,noheader,nounits",
           line, sizeof(line))) {
     return 0;
   }
@@ -190,12 +204,35 @@ static int gpu_detect_via_nvidia_smi(GpuDetectResult *out) {
   slot->compute_major = major;
   slot->compute_minor = minor;
   slot->warp_size = 32;
-  const char *comma = strchr(line, ',');
-  if (comma) {
-    const char *name = comma + 1;
-    while (*name == ' ') name++;
+  const char *name = gpu_csv_field(line, 1);
+  if (name) {
     snprintf(slot->name, sizeof(slot->name), "%s", name);
+    char *comma = strchr(slot->name, ',');
+    if (comma) *comma = '\0';
   }
+  const char *memory = gpu_csv_field(line, 2);
+  long long mebibytes = 0;
+  if (memory && sscanf(memory, "%lld", &mebibytes) == 1 && mebibytes > 0) {
+    slot->total_memory = mebibytes * 1024 * 1024;
+  }
+
+  /* `nvidia-smi -q` names the newest CUDA this driver supports, which is what
+   * caps the PTX ISA. Without it the ISA stays at the compiler's default. */
+  char report[512];
+  if (gpu_read_command_line(
+#if defined(_WIN32)
+          "nvidia-smi -q 2>nul | findstr /C:\"CUDA Version\"",
+#else
+          "nvidia-smi -q 2>/dev/null | grep -m1 'CUDA Version'",
+#endif
+          report, sizeof(report))) {
+    const char *colon = strchr(report, ':');
+    int cuda_major = 0, cuda_minor = 0;
+    if (colon && sscanf(colon + 1, "%d.%d", &cuda_major, &cuda_minor) == 2) {
+      out->driver_version = cuda_major * 1000 + cuda_minor * 10;
+    }
+  }
+
   out->device_count = 1;
   out->available = 1;
   out->source = "nvidia-smi";

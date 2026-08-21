@@ -1,0 +1,136 @@
+// The four kernels a transformer decode step is mostly made of, written in
+// Mettle and compiled straight to PTX -- no nvcc, no cudart, no LLVM:
+//
+//   mettle -O --emit-ptx decode_kernels.mettle -o decode_kernels.ptx \
+//     --emit-kernel-decls=decode_decls.mettle --report-occupancy
+//
+// No --gpu-arch: the target comes from the driver on this machine. Run
+// `mettle --gpu-info` to see which one that is.
+
+extern fn rsqrtf(x: float32) -> float32 = "rsqrtf";
+extern fn expf(x: float32) -> float32 = "expf";
+
+// RMS normalization over one `dim`-long vector, in a single block. Each thread
+// strides the vector, each subgroup reduces its own partial, and the block's
+// subgroups meet once in workgroup memory. Everything is uniform across the
+// block, so the barrier is reached by every thread.
+kernel(block = 256) rmsnorm(x: float32*, weight: float32*, out: float32*,
+                            dim: int32) {
+  workgroup var partial: float32[32];
+  var lane: int32 = (int32)subgroup_local_id();
+  var subgroup: int32 = (int32)(thread.x / subgroup_size());
+  var subgroups: int32 = (int32)(block_dim.x / subgroup_size());
+  var stride: int32 = (int32)block_dim.x;
+
+  var squares: float32 = (float32)0.0;
+  var i: int32 = (int32)thread.x;
+  while (i < dim) {
+    var v: float32 = x[i];
+    squares = squares + v * v;
+    i = i + stride;
+  }
+  var subgroup_total: float32 = subgroup_reduce_add(squares);
+  if (lane == 0) { partial[subgroup] = subgroup_total; }
+  barrier(workgroup, acq_rel);
+
+  var total: float32 = (float32)0.0;
+  var s: int32 = 0;
+  while (s < subgroups) {
+    total = total + partial[s];
+    s = s + 1;
+  }
+  var scale: float32 = rsqrtf(total / (float32)dim + (float32)0.00001);
+
+  i = (int32)thread.x;
+  while (i < dim) {
+    out[i] = x[i] * scale * weight[i];
+    i = i + stride;
+  }
+}
+
+// One row of the weight matrix per subgroup: the lanes stride the row, and the
+// subgroup reduction turns 32 partial products into the dot product. `per =
+// warp` tells `dispatch matvec[work: rows]` that one work item costs a whole
+// subgroup, so the grid divides by subgroups per block rather than by threads.
+kernel(block = 256, per = warp) matvec(w: float32*, x: float32*, out: float32*,
+                                       rows: int32, cols: int32) {
+  var width: int32 = (int32)subgroup_size();
+  var subgroups: int32 = (int32)(block_dim.x / subgroup_size());
+  var row: int32 = block.x * subgroups + (int32)(thread.x / subgroup_size());
+  // Subgroup-uniform, so the reduction below is still reached by whole
+  // subgroups: an out-of-range row retires all 32 of its lanes together.
+  if (row >= rows) { return; }
+
+  var lane: int32 = (int32)subgroup_local_id();
+  var base: int32 = row * cols;
+  var acc: float32 = (float32)0.0;
+  var c: int32 = lane;
+  while (c < cols) {
+    acc = acc + w[base + c] * x[c];
+    c = c + width;
+  }
+  var dot: float32 = subgroup_reduce_add(acc);
+  if (lane == 0) { out[row] = dot; }
+}
+
+// SwiGLU's activation half: silu(gate) * up, elementwise.
+kernel(block = 256) silu_mul(gate: float32*, up: float32*, out: float32*,
+                             n: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < n) {
+    var g: float32 = gate[i];
+    out[i] = g / ((float32)1.0 + expf(-g)) * up[i];
+  }
+}
+
+// Softmax over one `n`-long vector in a single block: the maximum first, so
+// the exponentials cannot overflow, then the sum, then the divide. Two
+// meetings in workgroup memory, two barriers, every thread at both.
+kernel(block = 256) softmax(x: float32*, out: float32*, n: int32) {
+  workgroup var partial: float32[32];
+  var lane: int32 = (int32)subgroup_local_id();
+  var subgroup: int32 = (int32)(thread.x / subgroup_size());
+  var subgroups: int32 = (int32)(block_dim.x / subgroup_size());
+  var stride: int32 = (int32)block_dim.x;
+
+  var largest: float32 = (float32)-3.0e38;
+  var i: int32 = (int32)thread.x;
+  while (i < n) {
+    if (x[i] > largest) { largest = x[i]; }
+    i = i + stride;
+  }
+  var subgroup_max: float32 = subgroup_reduce_max(largest);
+  if (lane == 0) { partial[subgroup] = subgroup_max; }
+  barrier(workgroup, acq_rel);
+  var block_max: float32 = partial[0];
+  var s: int32 = 1;
+  while (s < subgroups) {
+    if (partial[s] > block_max) { block_max = partial[s]; }
+    s = s + 1;
+  }
+  barrier(workgroup, acq_rel);
+
+  var sum: float32 = (float32)0.0;
+  i = (int32)thread.x;
+  while (i < n) {
+    var e: float32 = expf(x[i] - block_max);
+    out[i] = e;
+    sum = sum + e;
+    i = i + stride;
+  }
+  var subgroup_sum: float32 = subgroup_reduce_add(sum);
+  if (lane == 0) { partial[subgroup] = subgroup_sum; }
+  barrier(workgroup, acq_rel);
+  var total: float32 = (float32)0.0;
+  s = 0;
+  while (s < subgroups) {
+    total = total + partial[s];
+    s = s + 1;
+  }
+
+  i = (int32)thread.x;
+  while (i < n) {
+    out[i] = out[i] / total;
+    i = i + stride;
+  }
+}

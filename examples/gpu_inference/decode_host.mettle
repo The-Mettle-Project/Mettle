@@ -1,0 +1,232 @@
+// One transformer feed-forward block, on the GPU, in Mettle.
+//
+//   mettle -O --emit-ptx decode_kernels.mettle -o decode_kernels.ptx \
+//     --emit-kernel-decls=decode_decls.mettle
+//   mettle --build --release decode_host.mettle -o decode_host.exe \
+//     --link-arg "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.9/lib/x64/cuda.lib"
+//
+// The chain is rmsnorm -> gate/up projections -> SwiGLU -> down projection ->
+// softmax: five launches whose shapes never change from one token to the next.
+// That is the case launch graphs exist for, so the same chain is measured
+// twice, once launched per step and once replayed from a single capture.
+import "std/io";
+import "std/mem";
+import "std/gpu";
+import "decode_decls";
+
+// The CPU reference needs the same two functions the kernels use; Mettle's
+// runtime carries both, so the host declares them and links nothing extra.
+extern fn sqrtf(x: float32) -> float32 = "sqrtf";
+extern fn expf(x: float32) -> float32 = "expf";
+
+// A decode step's weights, sized like a small Llama-shaped block.
+const DIM: int32 = 1024;
+const HIDDEN: int32 = 2816;
+const STEPS: int32 = 200;
+
+fn cpu_rmsnorm(x: float32*, weight: float32*, out: float32*, dim: int32) {
+  var squares: float32 = (float32)0.0;
+  for i in 0..dim {
+    squares = squares + x[i] * x[i];
+  }
+  var mean: float32 = squares / (float32)dim + (float32)0.00001;
+  var scale: float32 = (float32)1.0 / sqrtf(mean);
+  for i in 0..dim {
+    out[i] = x[i] * scale * weight[i];
+  }
+}
+
+fn cpu_matvec(w: float32*, x: float32*, out: float32*, rows: int32, cols: int32) {
+  for r in 0..rows {
+    var acc: float32 = (float32)0.0;
+    var base: int32 = r * cols;
+    for c in 0..cols {
+      acc = acc + w[base + c] * x[c];
+    }
+    out[r] = acc;
+  }
+}
+
+fn cpu_silu_mul(gate: float32*, up: float32*, out: float32*, n: int32) {
+  for i in 0..n {
+    var g: float32 = gate[i];
+    out[i] = g / ((float32)1.0 + expf(-g)) * up[i];
+  }
+}
+
+// A cheap deterministic filler: no RNG dependency, but not so smooth that a
+// wrong index would still land near the right answer.
+fn fill(buffer: float32*, n: int32, seed: int32) {
+  var state: int32 = seed;
+  for i in 0..n {
+    state = state * 1103515245 + 12345;
+    var bits: int32 = (state >> 16) & 1023;
+    buffer[i] = ((float32)bits / (float32)512.0) - (float32)1.0;
+  }
+}
+
+fn main() -> int32 {
+  if (gpu_open("decode_kernels.ptx") == 0) { return 1; }
+
+  var name: uint8[128];
+  println("device   {gpu_device_name(0, &name[0], 128)}");
+  println("         {gpu_sm_count(0)} SMs, compute {gpu_compute_capability(0)}, CUDA {gpu_driver_version() / 1000}.{(gpu_driver_version() % 1000) / 10}");
+  println("layer    dim {DIM} -> hidden {HIDDEN}, {STEPS} steps");
+  println("");
+
+  var vector_bytes: int64 = (int64)DIM * 4;
+  var hidden_bytes: int64 = (int64)HIDDEN * 4;
+  var projection_bytes: int64 = (int64)HIDDEN * (int64)DIM * 4;
+
+  // Host-side weights and the reference the GPU has to match.
+  var h_x: float32* = malloc(vector_bytes);
+  var h_norm_weight: float32* = malloc(vector_bytes);
+  var h_gate_w: float32* = malloc(projection_bytes);
+  var h_up_w: float32* = malloc(projection_bytes);
+  var h_down_w: float32* = malloc(projection_bytes);
+  fill(h_x, DIM, 1);
+  fill(h_norm_weight, DIM, 2);
+  fill(h_gate_w, HIDDEN * DIM, 3);
+  fill(h_up_w, HIDDEN * DIM, 4);
+  fill(h_down_w, HIDDEN * DIM, 5);
+
+  // Device buffers. VRAM is explicit here, the way it is in any real engine.
+  var d_x: int64 = gpu_malloc(vector_bytes);
+  var d_norm_weight: int64 = gpu_malloc(vector_bytes);
+  var d_normed: int64 = gpu_malloc(vector_bytes);
+  var d_gate_w: int64 = gpu_malloc(projection_bytes);
+  var d_up_w: int64 = gpu_malloc(projection_bytes);
+  var d_down_w: int64 = gpu_malloc(projection_bytes);
+  var d_gate: int64 = gpu_malloc(hidden_bytes);
+  var d_up: int64 = gpu_malloc(hidden_bytes);
+  var d_activated: int64 = gpu_malloc(hidden_bytes);
+  var d_down: int64 = gpu_malloc(vector_bytes);
+  var d_out: int64 = gpu_malloc(vector_bytes);
+  if (d_out == 0) { println("out of device memory"); return 1; }
+
+  gpu_to_device(d_x, (uint8*)h_x, vector_bytes);
+  gpu_to_device(d_norm_weight, (uint8*)h_norm_weight, vector_bytes);
+  gpu_to_device(d_gate_w, (uint8*)h_gate_w, projection_bytes);
+  gpu_to_device(d_up_w, (uint8*)h_up_w, projection_bytes);
+  gpu_to_device(d_down_w, (uint8*)h_down_w, projection_bytes);
+
+  var stream: int64 = gpu_stream_create();
+
+  // ---- one step, checked against the CPU ----
+  //
+  // `work:` sizes each grid from the kernel's own declared block. matvec was
+  // declared `per = warp`, so its grid divides by subgroups per block: one
+  // output row per subgroup, not per thread.
+  dispatch rmsnorm[1, 256](d_x, d_norm_weight, d_normed, DIM) on stream;
+  dispatch matvec[work: HIDDEN](d_gate_w, d_normed, d_gate, HIDDEN, DIM) on stream;
+  dispatch matvec[work: HIDDEN](d_up_w, d_normed, d_up, HIDDEN, DIM) on stream;
+  dispatch silu_mul[work: HIDDEN](d_gate, d_up, d_activated, HIDDEN) on stream;
+  dispatch matvec[work: DIM](d_down_w, d_activated, d_down, DIM, HIDDEN) on stream;
+  dispatch softmax[1, 256](d_down, d_out, DIM) on stream;
+  gpu_stream_sync(stream);
+
+  var gpu_out: float32* = malloc(vector_bytes);
+  gpu_to_host((uint8*)gpu_out, d_out, vector_bytes);
+
+  var ref_normed: float32* = malloc(vector_bytes);
+  var ref_gate: float32* = malloc(hidden_bytes);
+  var ref_up: float32* = malloc(hidden_bytes);
+  var ref_activated: float32* = malloc(hidden_bytes);
+  var ref_down: float32* = malloc(vector_bytes);
+  cpu_rmsnorm(h_x, h_norm_weight, ref_normed, DIM);
+  cpu_matvec(h_gate_w, ref_normed, ref_gate, HIDDEN, DIM);
+  cpu_matvec(h_up_w, ref_normed, ref_up, HIDDEN, DIM);
+  cpu_silu_mul(ref_gate, ref_up, ref_activated, HIDDEN);
+  cpu_matvec(h_down_w, ref_activated, ref_down, DIM, HIDDEN);
+
+  // The GPU softmaxed the last projection; softmax the reference the same way
+  // and compare the distributions.
+  var largest: float32 = ref_down[0];
+  for i in 0..DIM {
+    if (ref_down[i] > largest) { largest = ref_down[i]; }
+  }
+  var total: float32 = (float32)0.0;
+  for i in 0..DIM {
+    ref_down[i] = expf(ref_down[i] - largest);
+    total = total + ref_down[i];
+  }
+
+  // Reduction order differs between 32 lanes and one CPU loop, so the check is
+  // a relative one over a chain that has already crossed 3M multiply-adds.
+  var worst: float32 = (float32)0.0;
+  var worst_at: int32 = 0;
+  for i in 0..DIM {
+    var expected: float32 = ref_down[i] / total;
+    var got: float32 = gpu_out[i];
+    var delta: float32 = got - expected;
+    if (delta < (float32)0.0) { delta = -delta; }
+    var scale: float32 = expected;
+    if (scale < (float32)0.0) { scale = -scale; }
+    if (scale < (float32)0.000001) { scale = (float32)0.000001; }
+    var relative: float32 = delta / scale;
+    if (relative > worst) { worst = relative; worst_at = i; }
+  }
+  if (worst > (float32)0.002) {
+    println("MISMATCH: worst relative error {worst} at {worst_at}");
+    return 1;
+  }
+  println("correct  worst relative error {worst} over {DIM} outputs");
+
+  // ---- the same chain, timed two ways ----
+
+  var start: int64 = gpu_event_create();
+  var finish: int64 = gpu_event_create();
+
+  gpu_event_record(start, stream);
+  for step in 0..STEPS {
+    dispatch rmsnorm[1, 256](d_x, d_norm_weight, d_normed, DIM) on stream;
+    dispatch matvec[work: HIDDEN](d_gate_w, d_normed, d_gate, HIDDEN, DIM) on stream;
+    dispatch matvec[work: HIDDEN](d_up_w, d_normed, d_up, HIDDEN, DIM) on stream;
+    dispatch silu_mul[work: HIDDEN](d_gate, d_up, d_activated, HIDDEN) on stream;
+    dispatch matvec[work: DIM](d_down_w, d_activated, d_down, DIM, HIDDEN) on stream;
+    dispatch softmax[1, 256](d_down, d_out, DIM) on stream;
+  }
+  gpu_event_record(finish, stream);
+  gpu_event_sync(finish);
+  var launched_ms: float32 = (float32)0.0;
+  gpu_event_elapsed_ms(start, finish, &launched_ms);
+
+  // A capture records the sequence rather than running it. Buffer addresses
+  // are baked in, contents are not, which is what lets one capture serve every
+  // token. Nothing between begin and end may synchronize.
+  if (gpu_graph_capture_begin(stream) != 0) {
+    println("stream capture unavailable");
+    return 1;
+  }
+  dispatch rmsnorm[1, 256](d_x, d_norm_weight, d_normed, DIM) on stream;
+  dispatch matvec[work: HIDDEN](d_gate_w, d_normed, d_gate, HIDDEN, DIM) on stream;
+  dispatch matvec[work: HIDDEN](d_up_w, d_normed, d_up, HIDDEN, DIM) on stream;
+  dispatch silu_mul[work: HIDDEN](d_gate, d_up, d_activated, HIDDEN) on stream;
+  dispatch matvec[work: DIM](d_down_w, d_activated, d_down, DIM, HIDDEN) on stream;
+  dispatch softmax[1, 256](d_down, d_out, DIM) on stream;
+  var graph: int64 = gpu_graph_capture_end(stream);
+  if (graph == 0) { println("graph instantiation failed"); return 1; }
+
+  gpu_event_record(start, stream);
+  for step in 0..STEPS {
+    gpu_graph_launch(graph, stream);
+  }
+  gpu_event_record(finish, stream);
+  gpu_event_sync(finish);
+  var replayed_ms: float32 = (float32)0.0;
+  gpu_event_elapsed_ms(start, finish, &replayed_ms);
+
+  println("");
+  println("per step launched   {launched_ms / (float32)STEPS} ms");
+  println("per step replayed   {replayed_ms / (float32)STEPS} ms  (one captured graph)");
+
+  gpu_graph_destroy(graph);
+  gpu_event_destroy(start);
+  gpu_event_destroy(finish);
+  gpu_stream_destroy(stream);
+  gpu_free(d_x); gpu_free(d_norm_weight); gpu_free(d_normed);
+  gpu_free(d_gate_w); gpu_free(d_up_w); gpu_free(d_down_w);
+  gpu_free(d_gate); gpu_free(d_up); gpu_free(d_activated);
+  gpu_free(d_down); gpu_free(d_out);
+  return 0;
+}

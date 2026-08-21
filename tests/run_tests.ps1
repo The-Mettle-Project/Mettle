@@ -10280,6 +10280,7 @@ foreach ($src in @("tests/gpu/compute_kernels.mettle",
                    "tests/gpu/tensor_pipeline4.mettle",
                    "tests/gpu/tensor_pipeline_no_residency.mettle",
                    "tests/gpu/tensor_epilogue_portable.mettle",
+                   "examples/gpu_inference/decode_kernels.mettle",
                    "examples/gpu_vadd/vadd_kernel.mettle")) {
   $total++
   $name = "ptx_emit_" + [System.IO.Path]::GetFileNameWithoutExtension($src)
