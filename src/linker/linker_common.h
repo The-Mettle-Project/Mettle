@@ -6,9 +6,18 @@
 
 /* COFF AMD64 relocation types */
 #define COFF_RELOC_AMD64_ADDR64   1
+#define COFF_RELOC_AMD64_ADDR32   2
 #define COFF_RELOC_AMD64_ADDR32NB 3
 #define COFF_RELOC_AMD64_REL32    4
 #define COFF_RELOC_AMD64_SECREL   11
+
+#define COFF_STORAGE_CLASS_EXTERNAL      2u
+#define COFF_STORAGE_CLASS_STATIC        3u
+#define COFF_STORAGE_CLASS_WEAK_EXTERNAL 105u
+
+#define COFF_SECTION_NUMBER_UNDEFINED 0
+#define COFF_SECTION_NUMBER_ABSOLUTE  (-1)
+#define COFF_SECTION_NUMBER_DEBUG     (-2)
 
 static inline uint16_t linker_read_u16(const unsigned char *data) {
   return (uint16_t)(data[0] | ((uint16_t)data[1] << 8));
