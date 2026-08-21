@@ -1,0 +1,12 @@
+fn mk() -> (int32[3], int32) {
+  var a: int32[3];
+  a[0] = 1;
+  return (a, 9);
+}
+
+fn main() -> int32 {
+  var a: int32[3];
+  var n: int32 = 0;
+  (a, n) = mk();
+  return a[0] + n;
+}

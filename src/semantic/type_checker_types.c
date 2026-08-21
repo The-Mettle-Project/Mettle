@@ -100,7 +100,8 @@ Type *type_checker_parse_array_type(TypeChecker *checker,
 }
 
 int type_checker_ensure_multi_return_type(TypeChecker *checker,
-                                          FunctionDeclaration *function) {
+                                          FunctionDeclaration *function,
+                                          SourceLocation location) {
   if (!checker || !function || function->return_type_count < 2 ||
       !function->return_type) {
     return 0;
@@ -123,6 +124,24 @@ int type_checker_ensure_multi_return_type(TypeChecker *checker,
   for (size_t i = 0; i < function->return_type_count; i++) {
     field_types[i] = type_checker_get_type_by_name(
         checker, function->return_types[i]);
+    /* Every other type is copied whole into the tuple and back out again. An
+     * array is not: it would decay to its first element's address and the
+     * caller would read a slot that has already been reused. Reject it here,
+     * where the function's own signature is what the message can point at. */
+    if (field_types[i] && field_types[i]->kind == TYPE_ARRAY) {
+      type_checker_set_error_at_location(
+          checker, location,
+          "Function '%s' returns an array as value %zu of %zu; return a "
+          "pointer to it, or wrap it in a struct",
+          function->name ? function->name : "?", i + 1,
+          function->return_type_count);
+      for (size_t j = 0; j <= i; j++) {
+        free(field_names[j]);
+      }
+      free(field_names);
+      free(field_types);
+      return 0;
+    }
     field_names[i] = malloc(32);
     if (!field_types[i] || !field_names[i]) {
       for (size_t j = 0; j <= i; j++) {

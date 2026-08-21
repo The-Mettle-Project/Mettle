@@ -1337,11 +1337,16 @@ int type_checker_process_declaration(TypeChecker *checker,
     // Resolve return type
     Type *return_type = NULL;
     if (func_decl->return_type_count > 0 &&
-        !type_checker_ensure_multi_return_type(checker, func_decl)) {
-      type_checker_set_error_at_location(
-          checker, declaration->location,
-          "Could not build the multiple return type for function '%s'",
-          func_decl->name);
+        !type_checker_ensure_multi_return_type(checker, func_decl,
+                                               declaration->location)) {
+      /* Only speak in generalities when nothing more specific was said: the
+       * builder names the offending return value when it can. */
+      if (!checker->has_error) {
+        type_checker_set_error_at_location(
+            checker, declaration->location,
+            "Could not build the multiple return type for function '%s'",
+            func_decl->name);
+      }
       return 0;
     }
     if (func_decl->return_type) {

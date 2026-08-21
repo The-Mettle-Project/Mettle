@@ -195,7 +195,8 @@ int type_checker_register_function_signature(TypeChecker *checker,
     return 0;
 
   if (func_decl->return_type_count > 0 &&
-      !type_checker_ensure_multi_return_type(checker, func_decl)) {
+      !type_checker_ensure_multi_return_type(checker, func_decl,
+                                             declaration->location)) {
     return 0;
   }
 

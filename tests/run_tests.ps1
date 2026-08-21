@@ -1931,6 +1931,7 @@ $cases = @(
   @{ Name = "err_switch_range_inverted"; Path = "tests/err_switch_range_inverted.mettle"; ShouldSucceed = $false; Pattern = "Range lower bound" },
   @{ Name = "err_switch_duplicate_case"; Path = "tests/err_switch_duplicate_case.mettle"; ShouldSucceed = $false; Pattern = "Duplicate case value|duplicate case" },
   @{ Name = "err_enum_opaque"; Path = "tests/err_enum_opaque.mettle"; ShouldSucceed = $false; Pattern = "(?s)expected 'int32', found 'Color'.*expected 'Color', found 'int32'.*expected 'Role', found 'Color'.*expected 'Color', found 'Role'.*expected 'numeric type', found 'Color'.*Cannot compare 'Color' with 'Role'" },
+  @{ Name = "err_multi_return_array"; Path = "tests/err_multi_return_array.mettle"; ShouldSucceed = $false; Pattern = "returns an array as value 1 of 2" },
   @{ Name = "err_switch_nonconst_case"; Path = "tests/err_switch_nonconst_case.mettle"; ShouldSucceed = $false; Pattern = "compile-time integer constant expression" },
   @{ Name = "err_forward_decl_mismatch"; Path = "tests/err_forward_decl_mismatch.mettle"; ShouldSucceed = $false; Pattern = "does not match existing declaration" },
   @{ Name = "err_forward_decl_pointer_mismatch"; Path = "tests/err_forward_decl_pointer_mismatch.mettle"; ShouldSucceed = $false; Pattern = "does not match existing declaration" },
@@ -12603,6 +12604,8 @@ $runFixtures = @(
      What = "a codegen check failed" },
   @{ Name = "aggregate_copy_keeps_rcx"; Path = "tests/codegen/aggregate_copy_keeps_rcx.mettle"
      What = "a rep movsb aggregate copy clobbered a value the allocator kept in RCX" },
+  @{ Name = "multi_return_aggregates"; Path = "tests/codegen/multi_return_aggregates.mettle"
+     What = "a string or struct returned among several values lost everything past its first word" },
   @{ Name = "pointers"; Path = "tests/codegen/pointers.mettle"
      What = "a codegen check failed" },
   @{ Name = "casts"; Path = "tests/codegen/casts.mettle"

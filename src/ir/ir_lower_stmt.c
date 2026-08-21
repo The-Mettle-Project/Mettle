@@ -33,8 +33,18 @@ static int ir_lower_multi_return_value(IRLoweringContext *context,
     IRInstruction add = {0};
     IRInstruction store = {0};
 
-    if (!field_type || field_type->kind == TYPE_STRUCT ||
-        field_type->kind == TYPE_ARRAY ||
+    /* An array field has no whole-value copy here: the block-copy helper
+     * takes a struct or a string, and falling through to a word-sized store
+     * would keep the first element and leave the rest undefined. Say so
+     * rather than failing the lowering with no reason attached. */
+    if (field_type && field_type->kind == TYPE_ARRAY) {
+      ir_set_error(context,
+                   "An array cannot be one of several return values; return a "
+                   "pointer to it, or wrap it in a struct");
+      free(tuple_name);
+      return 0;
+    }
+    if (!field_type ||
         !ir_lower_expression(context, function, source, &component) ||
         !ir_emit_address_of_symbol(context, function, tuple_name, location,
                                    &base) ||
@@ -57,6 +67,19 @@ static int ir_lower_multi_return_value(IRLoweringContext *context,
       ir_operand_destroy(&base);
       free(tuple_name);
       return 0;
+    }
+    /* A field wider than a register word is copied whole. Sizing this store
+     * with ir_type_storage_size() collapsed a `string` to its first eight
+     * bytes, so a returned view kept its pointer and read its length from
+     * whatever sat beside it -- which is why `return (s, "", 0)` handed back
+     * an empty first string. */
+    if (ir_try_emit_aggregate_address_memcpy(context, function, &field_address,
+                                             &component, field_type,
+                                             location)) {
+      ir_operand_destroy(&component);
+      ir_operand_destroy(&field_address);
+      ir_operand_destroy(&base);
+      continue;
     }
     store.op = IR_OP_STORE;
     store.location = location;
@@ -131,10 +154,11 @@ static int ir_lower_multi_assignment(IRLoweringContext *context,
     IRInstruction store = {0};
 
     if (!target || target->type != AST_IDENTIFIER || !identifier ||
-        !identifier->name || !field_type || field_type->kind == TYPE_STRUCT ||
+        !identifier->name || !field_type ||
         field_type->kind == TYPE_ARRAY) {
       ir_set_error(context,
-                   "Multiple return assignment currently needs scalar targets");
+                   "This multiple-return assignment needs a plain variable for "
+                   "each value, and no value may be an array");
       goto cleanup;
     }
     if (!ir_emit_address_of_symbol(context, function, tuple_name, location,
@@ -151,6 +175,34 @@ static int ir_lower_multi_assignment(IRLoweringContext *context,
     if (!ir_emit(context, function, &add) ||
         !ir_make_temp_operand(context, &field_value)) {
       goto cleanup;
+    }
+    /* The backend loads at most one machine word, so a wide field is moved
+     * into the target by address instead of through a register. */
+    if (field_type->size > 8 && field_type->size <= (size_t)INT_MAX) {
+      IROperand target_address = ir_operand_none();
+      IRInstruction copy = {0};
+      int copied = 0;
+
+      if (!ir_emit_address_of_symbol(context, function,
+                                     ir_local_ir_name(context,
+                                                      identifier->name),
+                                     location, &target_address)) {
+        goto cleanup;
+      }
+      copy.op = IR_OP_STORE;
+      copy.location = location;
+      copy.dest = target_address;
+      copy.lhs = field_address;
+      copy.rhs = ir_operand_int((long long)field_type->size);
+      copied = ir_emit(context, function, &copy);
+      ir_operand_destroy(&target_address);
+      if (!copied) {
+        goto cleanup;
+      }
+      ir_operand_destroy(&field_value);
+      ir_operand_destroy(&field_address);
+      ir_operand_destroy(&base);
+      continue;
     }
     load.op = IR_OP_LOAD;
     load.location = location;

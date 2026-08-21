@@ -1,0 +1,75 @@
+import "std/conv";
+
+struct P { x: int32; y: int32; z: int32; }
+
+fn mk() -> string { return "made"; }
+
+fn head_tail(s: string) -> (string, string) {
+  return (str_slice(s, 0, 3), str_slice(s, 3, 99));
+}
+
+fn mixed(s: string) -> (string, float64, string, int32, string) {
+  return (s, 2.5, "mid", 7, mk());
+}
+
+fn sources() -> (string, string, string) {
+  var local: string = "loc";
+  return ("lit", local, mk());
+}
+
+fn with_struct() -> (P, int32, string) {
+  var p: P;
+  p.x = 1; p.y = 2; p.z = 3;
+  return (p, 9, "tail");
+}
+
+fn main() -> int32 {
+  var a: string = "";
+  var b: string = "";
+  (a, b) = head_tail("abcdef");
+  if (a != "abc") { return 1; }
+  if (b != "def") { return 2; }
+
+  var s1: string = "";
+  var d: float64 = 0.0;
+  var s2: string = "";
+  var n: int32 = 0;
+  var s3: string = "";
+  (s1, d, s2, n, s3) = mixed("first");
+  if (s1 != "first") { return 3; }
+  if (d != 2.5) { return 4; }
+  if (s2 != "mid") { return 5; }
+  if (n != 7) { return 6; }
+  if (s3 != "made") { return 7; }
+
+  var x: string = "";
+  var y: string = "";
+  var z: string = "";
+  (x, y, z) = sources();
+  if (x != "lit") { return 8; }
+  if (y != "loc") { return 9; }
+  if (z != "made") { return 10; }
+
+  var p: P;
+  var k: int32 = 0;
+  var t: string = "";
+  (p, k, t) = with_struct();
+  if (p.x != 1 || p.y != 2 || p.z != 3) { return 11; }
+  if (k != 9) { return 12; }
+  if (t != "tail") { return 13; }
+
+  var h: string = "";
+  var tl: string = "";
+  var found: int32 = 0;
+  (h, tl, found) = str_split_once("key=value", "=");
+  if (found != 1) { return 14; }
+  if (h != "key") { return 15; }
+  if (tl != "value") { return 16; }
+
+  (h, tl, found) = str_split_once("novalue", "=");
+  if (found != 0) { return 17; }
+  if (h != "novalue") { return 18; }
+  if (tl != "") { return 19; }
+
+  return 0;
+}
