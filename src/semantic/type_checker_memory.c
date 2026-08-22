@@ -110,6 +110,8 @@ typedef struct {
   int escaped;     /* returned, stored, kept by a callee, or address taken */
   int ever_freed;  /* a free of this pointer appears ANYWHERE (defers count) */
   const char *points_to_stack; /* stack local whose address it holds, or NULL */
+  size_t points_to_slot; /* that local's index plus one; 0 when unrecorded */
+  int out_of_scope; /* its lexical block has exited; a later `&name` is not it */
   int scope_level; /* lexical block depth where this local was declared */
   const char *borrows_heap;    /* heap-pointer local this points into via
                                   `&buf[i]`; NULL when not a heap borrow */
@@ -270,9 +272,17 @@ static void mem_summary_index_put(MemSummaryTable *table, size_t slot) {
 
 /* ---- local table ------------------------------------------------------------- */
 
+static MemLocal *mem_referent(MemCtx *ctx, MemLocal *borrow);
+
 static MemLocal *mem_find_local(MemCtx *ctx, const char *name) {
   if (!name) {
     return NULL;
+  }
+  for (size_t i = ctx->local_count; i > 0; i--) {
+    if (!ctx->locals[i - 1].out_of_scope &&
+        strcmp(ctx->locals[i - 1].name, name) == 0) {
+      return &ctx->locals[i - 1];
+    }
   }
   for (size_t i = ctx->local_count; i > 0; i--) {
     if (strcmp(ctx->locals[i - 1].name, name) == 0) {
@@ -280,6 +290,17 @@ static MemLocal *mem_find_local(MemCtx *ctx, const char *name) {
     }
   }
   return NULL;
+}
+
+static MemLocal *mem_referent(MemCtx *ctx, MemLocal *borrow) {
+  if (!ctx || !borrow || !borrow->points_to_stack) {
+    return NULL;
+  }
+  if (borrow->points_to_slot > 0 &&
+      borrow->points_to_slot <= ctx->local_count) {
+    return &ctx->locals[borrow->points_to_slot - 1];
+  }
+  return mem_find_local(ctx, borrow->points_to_stack);
 }
 
 static MemLocal *mem_add_local(MemCtx *ctx, const char *name,
@@ -874,7 +895,7 @@ static long long mem_dest_capacity(MemCtx *ctx, ASTNode *dest,
   if (dest->type == AST_IDENTIFIER) {
     MemLocal *local = mem_expr_as_local(ctx, dest);
     if (local && local->points_to_stack) {
-      MemLocal *target = mem_find_local(ctx, local->points_to_stack);
+      MemLocal *target = mem_referent(ctx, local);
       if (target &&
           mem_array_extent(ctx, target->type_name, &count, &elem_size)) {
         *array_name_out = target->name;
@@ -953,7 +974,7 @@ static void mem_check_const_index(MemCtx *ctx, ASTNode *expr) {
    * types to match (no reinterpreting casts). */
   if (local->is_pointer && local->points_to_stack &&
       local->points_to_offset >= 0) {
-    MemLocal *target = mem_find_local(ctx, local->points_to_stack);
+    MemLocal *target = mem_referent(ctx, local);
     if (!target ||
         !mem_array_extent(ctx, target->type_name, &count, &elem_size)) {
       return;
@@ -1570,6 +1591,7 @@ static void mem_apply_assignment(MemCtx *ctx, const char *name, ASTNode *value,
       local->freed_alias = NULL;
       local->holds_alloc = 0;
       local->points_to_stack = NULL;
+      local->points_to_slot = 0;
       local->points_to_offset = -1;
       local->borrows_heap = NULL;
       local->borrow_dangling = BORROW_OK; /* re-derivation clears a stale borrow */
@@ -1607,6 +1629,7 @@ static void mem_apply_assignment(MemCtx *ctx, const char *name, ASTNode *value,
         /* spine only: a branch assignment may not have happened, so alias
          * knowledge from it would make false bounds claims */
         local->points_to_stack = stack_target->name;
+        local->points_to_slot = (size_t)(stack_target - ctx->locals) + 1;
         local->points_to_offset = stack_offset;
       }
       MemLocal *heap_target = mem_addr_of_heap_at(ctx, value, NULL);
@@ -1624,6 +1647,7 @@ static void mem_apply_assignment(MemCtx *ctx, const char *name, ASTNode *value,
         source->escaped = 1;
         if (ctx->depth == 0 && !ctx->in_defer) {
           local->points_to_stack = source->points_to_stack;
+          local->points_to_slot = source->points_to_slot;
           local->points_to_offset = source->points_to_offset;
           mem_alias_join(ctx, local, source);
         }
@@ -1689,11 +1713,16 @@ static void mem_scope_exit_check(MemCtx *ctx, int level) {
     if (!p->points_to_stack || p->scope_level >= level) {
       continue;
     }
-    MemLocal *referent = mem_find_local(ctx, p->points_to_stack);
+    MemLocal *referent = mem_referent(ctx, p);
     if (referent && referent->is_stack && referent->scope_level >= level) {
       p->borrow_dangling = BORROW_SCOPE;
       p->borrow_killed_loc = referent->decl_loc;
       p->borrow_killed_via = referent->name;
+    }
+  }
+  for (size_t i = 0; i < ctx->local_count; i++) {
+    if (ctx->locals[i].scope_level >= level) {
+      ctx->locals[i].out_of_scope = 1;
     }
   }
 }
@@ -1779,7 +1808,7 @@ static void mem_walk_statement(MemCtx *ctx, ASTNode *statement) {
       if (!stack_target) {
         MemLocal *local = mem_expr_as_local(ctx, ret->value);
         if (local && local->points_to_stack) {
-          stack_target = mem_find_local(ctx, local->points_to_stack);
+          stack_target = mem_referent(ctx, local);
           via = local->name;
         }
       }

@@ -1,0 +1,19 @@
+import "std/io";
+
+fn main() -> int32 {
+  var v: int64 = 100;
+  var addr: int64* = &v;
+
+  {
+    var v: string = "inner";
+    println("{v}");
+  }
+
+  {
+    var v: int64 = 9;
+    println("{v}");
+  }
+
+  println("{*addr}");
+  return 0;
+}

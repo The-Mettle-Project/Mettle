@@ -2158,6 +2158,8 @@ $cases = @(
      OutputMustMatch = @("unused variable 'scratch'", "rename it to '_scratch'")
      OutputMustNotMatch = @("unused variable '_intentional'", "unused variable 'used'",
                             "unused variable 'captured'") },
+  @{ Name = "diag_borrow_shadowed_scope"; Path = "tests/diag_borrow_shadowed_scope.mettle"; ShouldSucceed = $true
+     OutputMustNotMatch = @("M0110", "dangling") },
   @{ Name = "diag_json_format"; Path = "tests/diag_json_format.mettle"; ShouldSucceed = $false
      Args = @("--error-format=json")
      Pattern = '"severity":"error"'
