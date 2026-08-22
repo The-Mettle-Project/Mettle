@@ -1776,27 +1776,27 @@ static int binary_emit_windows_heap_free_value(
 
   return binary_emit_push_reg(&context->code, ptr_register) &&
          binary_emit_sub_rsp_imm32(&context->code,
-                                   BINARY_WIN64_SHADOW_SPACE_SIZE) &&
+                                   BINARY_WIN64_SHADOW_SPACE_SIZE + 8) &&
          binary_emit_call_placeholder(&context->code,
                                       &get_heap_displacement_offset) &&
          binary_call_relocation_table_add(&context->call_relocations,
                                           "GetProcessHeap",
                                           get_heap_displacement_offset) &&
          binary_emit_add_rsp_imm32(&context->code,
-                                   BINARY_WIN64_SHADOW_SPACE_SIZE) &&
+                                   BINARY_WIN64_SHADOW_SPACE_SIZE + 8) &&
          binary_emit_pop_reg(&context->code, BINARY_GP_R8) &&
          binary_emit_mov_reg_reg(&context->code, BINARY_GP_RCX,
                                  BINARY_GP_RAX) &&
          binary_emit_mov_reg_imm64(&context->code, BINARY_GP_RDX, 0) &&
          binary_emit_sub_rsp_imm32(&context->code,
-                                   BINARY_WIN64_SHADOW_SPACE_SIZE + 8) &&
+                                   BINARY_WIN64_SHADOW_SPACE_SIZE) &&
          binary_emit_call_placeholder(&context->code,
                                       &heap_free_displacement_offset) &&
          binary_call_relocation_table_add(&context->call_relocations,
                                           "HeapFree",
                                           heap_free_displacement_offset) &&
          binary_emit_add_rsp_imm32(&context->code,
-                                   BINARY_WIN64_SHADOW_SPACE_SIZE + 8);
+                                   BINARY_WIN64_SHADOW_SPACE_SIZE);
 }
 
 static int code_generator_binary_emit_malloc_call_inline(
@@ -1957,27 +1957,27 @@ static int code_generator_binary_emit_realloc_call_inline(
       !binary_emit_push_reg(&context->code, BINARY_GP_R10) ||
       !binary_emit_push_reg(&context->code, BINARY_GP_R11) ||
       !binary_emit_sub_rsp_imm32(&context->code,
-                                 BINARY_WIN64_SHADOW_SPACE_SIZE + 8) ||
+                                 BINARY_WIN64_SHADOW_SPACE_SIZE) ||
       !binary_emit_call_placeholder(&context->code,
                                     &get_heap_displacement_offset) ||
       !binary_call_relocation_table_add(&context->call_relocations,
                                         "GetProcessHeap",
                                         get_heap_displacement_offset) ||
       !binary_emit_add_rsp_imm32(&context->code,
-                                 BINARY_WIN64_SHADOW_SPACE_SIZE + 8) ||
+                                 BINARY_WIN64_SHADOW_SPACE_SIZE) ||
       !binary_emit_pop_reg(&context->code, BINARY_GP_R9) ||
       !binary_emit_pop_reg(&context->code, BINARY_GP_R8) ||
       !binary_emit_mov_reg_reg(&context->code, BINARY_GP_RCX, BINARY_GP_RAX) ||
       !binary_emit_mov_reg_imm64(&context->code, BINARY_GP_RDX, 0) ||
       !binary_emit_sub_rsp_imm32(&context->code,
-                                 BINARY_WIN64_SHADOW_SPACE_SIZE + 8) ||
+                                 BINARY_WIN64_SHADOW_SPACE_SIZE) ||
       !binary_emit_call_placeholder(&context->code,
                                     &heap_realloc_displacement_offset) ||
       !binary_call_relocation_table_add(&context->call_relocations,
                                         "HeapReAlloc",
                                         heap_realloc_displacement_offset) ||
       !binary_emit_add_rsp_imm32(&context->code,
-                                 BINARY_WIN64_SHADOW_SPACE_SIZE + 8) ||
+                                 BINARY_WIN64_SHADOW_SPACE_SIZE) ||
       !binary_emit_jmp_placeholder(&context->code, &fixup) ||
       !binary_label_fixup_table_add(&context->label_fixups, done_label,
                                     fixup) ||
@@ -3044,26 +3044,26 @@ static int binary_emit_windows_heap_alloc(
 
   if (!binary_emit_push_reg(&context->code, size_register) ||
       !binary_emit_sub_rsp_imm32(&context->code,
-                                 BINARY_WIN64_SHADOW_SPACE_SIZE) ||
+                                 BINARY_WIN64_SHADOW_SPACE_SIZE + 8) ||
       !binary_emit_call_placeholder(&context->code,
                                     &get_heap_displacement_offset) ||
       !binary_call_relocation_table_add(&context->call_relocations,
                                         "GetProcessHeap",
                                         get_heap_displacement_offset) ||
       !binary_emit_add_rsp_imm32(&context->code,
-                                 BINARY_WIN64_SHADOW_SPACE_SIZE) ||
+                                 BINARY_WIN64_SHADOW_SPACE_SIZE + 8) ||
       !binary_emit_pop_reg(&context->code, BINARY_GP_R8) ||
       !binary_emit_mov_reg_reg(&context->code, BINARY_GP_RCX, BINARY_GP_RAX) ||
       !binary_emit_mov_reg_imm64(&context->code, BINARY_GP_RDX, flags) ||
       !binary_emit_sub_rsp_imm32(&context->code,
-                                 BINARY_WIN64_SHADOW_SPACE_SIZE + 8) ||
+                                 BINARY_WIN64_SHADOW_SPACE_SIZE) ||
       !binary_emit_call_placeholder(&context->code,
                                     &heap_alloc_displacement_offset) ||
       !binary_call_relocation_table_add(&context->call_relocations,
                                         "HeapAlloc",
                                         heap_alloc_displacement_offset) ||
       !binary_emit_add_rsp_imm32(&context->code,
-                                 BINARY_WIN64_SHADOW_SPACE_SIZE + 8)) {
+                                 BINARY_WIN64_SHADOW_SPACE_SIZE)) {
     return 0;
   }
 
@@ -4583,7 +4583,7 @@ static int binary_emit_string_concat(CodeGenerator *generator,
                                8) ||
       !binary_emit_alu_reg_reg(&context->code, 0x01, BINARY_GP_RCX,
                                BINARY_GP_RDX) ||
-      !binary_emit_sub_rsp_imm32(&context->code, 24) ||
+      !binary_emit_sub_rsp_imm32(&context->code, 32) ||
       !binary_emit_mov_mem_reg(&context->code, BINARY_GP_RSP, 0,
                                BINARY_GP_R10) ||
       !binary_emit_mov_mem_reg(&context->code, BINARY_GP_RSP, 8,
@@ -4599,7 +4599,7 @@ static int binary_emit_string_concat(CodeGenerator *generator,
                                8) ||
       !binary_emit_mov_reg_mem(&context->code, BINARY_GP_R10, BINARY_GP_RSP,
                                0) ||
-      !binary_emit_add_rsp_imm32(&context->code, 24) ||
+      !binary_emit_add_rsp_imm32(&context->code, 32) ||
       !binary_emit_lea_reg_mem(&context->code, BINARY_GP_R8, BINARY_GP_RAX,
                                16) ||
       !binary_emit_mov_mem_reg(&context->code, BINARY_GP_RAX, 0,
