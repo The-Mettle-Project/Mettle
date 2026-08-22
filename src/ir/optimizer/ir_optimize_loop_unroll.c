@@ -861,28 +861,18 @@ static int ir_vec_clone_body_inst(const IRInstruction *src, IRInstruction *out,
 /* Try to recognize and unroll a reduction loop whose header label is at index
  * `h`. On success rewrites `function` and sets *changed. Always returns 1
  * unless a hard (OOM) error occurs (returns 0). */
+/* `J` is the back-edge jumping to the label at `h`, resolved by the caller from
+ * the whole-function index. Finding it here meant scanning to the end of the
+ * function for every label that has no back-edge, which is all of them in code
+ * built out of if/else. */
 static int ir_vec_try_unroll_reduction_at(IRFunction *function, size_t h,
-                                           int *changed) {
+                                           size_t J, int *changed) {
   IRInstruction *head = &function->instructions[h];
   if (head->op != IR_OP_LABEL || !head->text) {
     return 1;
   }
   const char *head_label = head->text;
 
-  /* locate back-jump J -> head, no nested header in between */
-  size_t J = (size_t)-1;
-  for (size_t k = h + 1; k < function->instruction_count; k++) {
-    IRInstruction *p = &function->instructions[k];
-    if (p->op == IR_OP_JUMP && p->text && strcmp(p->text, head_label) == 0) {
-      J = k;
-      break;
-    }
-    if (p->op == IR_OP_LABEL) {
-      /* a label inside is fine only if it is not another loop's header that
-       * also back-jumps; conservatively allow forward-only labels by not
-       * breaking, but a second header is rare here. */
-    }
-  }
   if (J == (size_t)-1 || J < h + 5) {
     return 1;
   }
@@ -1337,23 +1327,42 @@ oom:
 #undef MKLBL
 }
 
+static int ir_unroll_mark_loop_headers(const IRFunction *function,
+                                      IRNameIndex *headers);
+
 int ir_reduction_unroll_pass(IRFunction *function, int *changed) {
+  IRNameIndex back_edges;
+
   if (!function) {
     return 1;
   }
+  if (!ir_unroll_mark_loop_headers(function, &back_edges)) {
+    return 0;
+  }
   for (size_t h = 0; h + 5 < function->instruction_count; h++) {
-    if (function->instructions[h].op != IR_OP_LABEL) {
+    size_t back_edge = (size_t)-1;
+    size_t before = function->instruction_count;
+    if (function->instructions[h].op != IR_OP_LABEL ||
+        !function->instructions[h].text ||
+        !ir_name_index_find(&back_edges, function->instructions[h].text,
+                            &back_edge)) {
       continue;
     }
-    size_t before = function->instruction_count;
-    if (!ir_vec_try_unroll_reduction_at(function, h, changed)) {
+    if (!ir_vec_try_unroll_reduction_at(function, h, back_edge, changed)) {
+      ir_name_index_destroy(&back_edges);
       return 0;
     }
     if (function->instruction_count != before) {
-      /* structure changed; restart scan to stay safe */
+      /* structure changed; the index describes the old shape, so rebuild it
+       * and restart the scan to stay safe */
+      ir_name_index_destroy(&back_edges);
+      if (!ir_unroll_mark_loop_headers(function, &back_edges)) {
+        return 0;
+      }
       h = (size_t)-1;
     }
   }
+  ir_name_index_destroy(&back_edges);
   return 1;
 }
 
@@ -1390,7 +1399,10 @@ static int ir_unroll_mark_loop_headers(const IRFunction *function,
     }
     if (ir_name_index_find(&labels, instruction->text, &target) &&
         target < i) {
-      ir_name_index_insert(headers, instruction->text, target);
+      /* Jumps are visited in order and the index keeps its first insertion, so
+       * this is the nearest back-edge, which is the one a scan from the header
+       * would have stopped at. */
+      ir_name_index_insert(headers, instruction->text, i);
     }
   }
   ir_name_index_destroy(&labels);

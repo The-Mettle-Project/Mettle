@@ -1289,20 +1289,82 @@ static int ir_cfg_append_edge(IRFunction *function, size_t from, size_t to) {
                                       &target->predecessor_count, from);
 }
 
-static int ir_cfg_find_label_block(const IRLabelBlock *labels,
-                                   size_t label_count, const char *label,
-                                   size_t *out_block) {
-  if (!labels || !label || !out_block) {
+/* Label name -> its block, open addressed.
+ *
+ * Resolving a branch's target by scanning the label list is quadratic in the
+ * number of blocks, and the CFG is rebuilt several times per function. On a
+ * body built out of if/else, where nearly every block starts with a label, that
+ * was the largest remaining cost in optimizing one. Slots hold label_index + 1
+ * so zero stays "empty". */
+typedef struct {
+  size_t *slots;
+  size_t capacity;
+} IRCfgLabelIndex;
+
+static void ir_cfg_label_index_destroy(IRCfgLabelIndex *index) {
+  free(index->slots);
+  index->slots = NULL;
+  index->capacity = 0;
+}
+
+static int ir_cfg_label_index_build(IRCfgLabelIndex *index,
+                                    const IRLabelBlock *labels,
+                                    size_t label_count) {
+  size_t capacity = 16;
+  size_t mask;
+
+  index->slots = NULL;
+  index->capacity = 0;
+  if (label_count == 0) {
+    return 1;
+  }
+  while (capacity < label_count * 2) {
+    capacity *= 2;
+  }
+  index->slots = (size_t *)calloc(capacity, sizeof(*index->slots));
+  if (!index->slots) {
     return 0;
   }
-
+  index->capacity = capacity;
+  mask = capacity - 1;
   for (size_t i = 0; i < label_count; i++) {
-    if (labels[i].label && strcmp(labels[i].label, label) == 0) {
-      *out_block = labels[i].block_index;
-      return 1;
+    size_t slot;
+    if (!labels[i].label) {
+      continue;
+    }
+    slot = (size_t)mettle_fnv1a_hash(labels[i].label) & mask;
+    while (index->slots[slot]) {
+      if (strcmp(labels[index->slots[slot] - 1].label, labels[i].label) == 0) {
+        break; /* the first block for a name wins, as the scan did */
+      }
+      slot = (slot + 1) & mask;
+    }
+    if (!index->slots[slot]) {
+      index->slots[slot] = i + 1;
     }
   }
+  return 1;
+}
 
+static int ir_cfg_find_label_block(const IRCfgLabelIndex *index,
+                                   const IRLabelBlock *labels,
+                                   const char *label, size_t *out_block) {
+  size_t mask;
+  size_t slot;
+
+  if (!index || !index->capacity || !labels || !label || !out_block) {
+    return 0;
+  }
+  mask = index->capacity - 1;
+  slot = (size_t)mettle_fnv1a_hash(label) & mask;
+  while (index->slots[slot]) {
+    const IRLabelBlock *candidate = &labels[index->slots[slot] - 1];
+    if (candidate->label && strcmp(candidate->label, label) == 0) {
+      *out_block = candidate->block_index;
+      return 1;
+    }
+    slot = (slot + 1) & mask;
+  }
   return 0;
 }
 
@@ -1401,6 +1463,14 @@ int ir_function_rebuild_cfg(IRFunction *function) {
     start = end;
   }
 
+  IRCfgLabelIndex label_index;
+  if (!ir_cfg_label_index_build(&label_index, labels, label_count)) {
+    free(blocks);
+    free(labels);
+    free(block_starts);
+    return 0;
+  }
+
   function->blocks = blocks;
   function->block_count = block_count;
   function->entry_block = 0;
@@ -1411,6 +1481,7 @@ int ir_function_rebuild_cfg(IRFunction *function) {
     if (!ir_cfg_block_last_non_nop(block, &last_offset)) {
       if (i + 1 < block_count && !ir_cfg_append_edge(function, i, i + 1)) {
         ir_function_clear_cfg(function);
+        ir_cfg_label_index_destroy(&label_index);
         free(labels);
         free(block_starts);
         return 0;
@@ -1421,24 +1492,27 @@ int ir_function_rebuild_cfg(IRFunction *function) {
     IRInstruction *last = &block->instructions[last_offset];
     if (last->op == IR_OP_JUMP) {
       size_t target = 0;
-      if (ir_cfg_find_label_block(labels, label_count, last->text, &target) &&
+      if (ir_cfg_find_label_block(&label_index, labels, last->text, &target) &&
           !ir_cfg_append_edge(function, i, target)) {
         ir_function_clear_cfg(function);
+        ir_cfg_label_index_destroy(&label_index);
         free(labels);
         free(block_starts);
         return 0;
       }
     } else if (ir_instruction_is_branch(last)) {
       size_t target = 0;
-      if (ir_cfg_find_label_block(labels, label_count, last->text, &target) &&
+      if (ir_cfg_find_label_block(&label_index, labels, last->text, &target) &&
           !ir_cfg_append_edge(function, i, target)) {
         ir_function_clear_cfg(function);
+        ir_cfg_label_index_destroy(&label_index);
         free(labels);
         free(block_starts);
         return 0;
       }
       if (i + 1 < block_count && !ir_cfg_append_edge(function, i, i + 1)) {
         ir_function_clear_cfg(function);
+        ir_cfg_label_index_destroy(&label_index);
         free(labels);
         free(block_starts);
         return 0;
@@ -1446,6 +1520,7 @@ int ir_function_rebuild_cfg(IRFunction *function) {
     } else if (last->op != IR_OP_RETURN) {
       if (i + 1 < block_count && !ir_cfg_append_edge(function, i, i + 1)) {
         ir_function_clear_cfg(function);
+        ir_cfg_label_index_destroy(&label_index);
         free(labels);
         free(block_starts);
         return 0;
@@ -1454,6 +1529,7 @@ int ir_function_rebuild_cfg(IRFunction *function) {
   }
 
   function->cfg_valid = 1;
+  ir_cfg_label_index_destroy(&label_index);
   free(labels);
   free(block_starts);
   return 1;
